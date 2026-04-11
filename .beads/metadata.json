@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "PRRO_GATE",
+  "project_id": "b5661d42-10e9-4979-b7d2-27d849c48fb3"
+}
