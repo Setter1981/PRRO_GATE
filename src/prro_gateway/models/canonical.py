@@ -13,7 +13,7 @@ from .common import StrictModel
 class Discount(StrictModel):
     type: str
     mode: str
-    value: int
+    value: int = Field(ge=0)
     name: str | None = None
     tax_code: str | None = None
     tax_codes: list[str] = Field(default_factory=list)

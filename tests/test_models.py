@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from prro_gateway.models.canonical import CanonicalFiscalCommand, CanonicalReceipt
+from prro_gateway.models.canonical import CanonicalFiscalCommand, CanonicalReceipt, Discount
 from prro_gateway.models.cloud import HubDocumentEnvelope
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,3 +56,27 @@ def test_roundtrip_command_json_identity():
     dumped = json.loads(model.model_dump_json())
     assert dumped["request_id"] == data["request_id"]
     assert dumped["schema_version"] == "1.0.1"
+
+
+# ---------------------------------------------------------------------------
+# Discount.value constraints
+# ---------------------------------------------------------------------------
+
+def test_discount_value_negative_rejected():
+    with pytest.raises(ValidationError):
+        Discount(type="DISCOUNT", mode="VALUE", value=-1)
+
+
+def test_discount_value_zero_accepted():
+    d = Discount(type="DISCOUNT", mode="VALUE", value=0)
+    assert d.value == 0
+
+
+def test_discount_value_positive_accepted():
+    d = Discount(type="DISCOUNT", mode="VALUE", value=500)
+    assert d.value == 500
+
+
+def test_extra_charge_value_negative_rejected():
+    with pytest.raises(ValidationError):
+        Discount(type="EXTRA_CHARGE", mode="PERCENT", value=-10)
