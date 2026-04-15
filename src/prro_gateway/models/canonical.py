@@ -34,6 +34,8 @@ class CanonicalReceiptItem(StrictModel):
     sum: int = Field(ge=0)
     header: str | None = None
     footer: str | None = None
+    tax_id: int | None = None
+    tax_id_2: int | None = None
     discounts: list[Discount] = Field(default_factory=list)
     item_attributes: dict[str, Any] | None = None
     is_return: bool | None = None
