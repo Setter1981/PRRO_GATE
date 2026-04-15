@@ -71,6 +71,7 @@
         "email": "buyer@example.com"
       },
       "rounding_enabled": true,
+      "discounts": [],
       "totals": {
         "total_sum": 5000,
         "round_sum": 0,
@@ -79,8 +80,8 @@
       }
     }
   },
-  "payload_json": "{\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":1,\"payments_count\":1,\"receipt\":{\"delivery\":{\"email\":\"buyer@example.com\"},\"goods\":[{\"barcode\":\"4820000000012\",\"code\":\"PARKING\",\"discounts\":[],\"excise_barcodes\":[],\"footer\":null,\"good_id\":null,\"header\":null,\"is_return\":true,\"item_attributes\":null,\"item_id\":\"item-1\",\"item_no\":1,\"name\":\"Parking service\",\"price\":5000,\"quantity\":1000,\"sum\":5000,\"tax_id\":null,\"tax_id_2\":null,\"uktzed\":null}],\"payments\":[{\"acquirer_and_seller\":null,\"acquiring_payload_json\":null,\"acquiring_source\":\"MANUAL_FRONT\",\"amount\":5000,\"auth_code\":null,\"bank_name\":null,\"card_mask\":null,\"commission\":null,\"label\":\"CARD\",\"owner_name\":null,\"payment_code\":null,\"payment_id\":\"payment-1\",\"payment_system\":null,\"payment_type\":\"CASHLESS\",\"provider_type\":null,\"receipt_no\":null,\"rrn\":null,\"signature_required\":null,\"tapxphone_terminal\":null,\"terminal\":null}],\"previous_receipt_id\":null,\"related_receipt_id\":\"rcpt-0001\",\"rounding_enabled\":true,\"technical_return\":null,\"totals\":{\"discounts_sum\":0,\"extra_charge_sum\":0,\"round_sum\":0,\"total_sum\":5000},\"type\":\"RETURN\"}}",
-  "payload_sha256": "f0d2549e4527916a0ed317036718c75567b9bb0faecf88b005aab1893c4ec8bd",
+  "payload_json": "{\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":1,\"payments_count\":1,\"receipt\":{\"delivery\":{\"email\":\"buyer@example.com\"},\"discounts\":[],\"goods\":[{\"barcode\":\"4820000000012\",\"code\":\"PARKING\",\"discounts\":[],\"excise_barcodes\":[],\"footer\":null,\"good_id\":null,\"header\":null,\"is_return\":true,\"item_attributes\":null,\"item_id\":\"item-1\",\"item_no\":1,\"name\":\"Parking service\",\"price\":5000,\"quantity\":1000,\"sum\":5000,\"tax_id\":null,\"tax_id_2\":null,\"uktzed\":null}],\"payments\":[{\"acquirer_and_seller\":null,\"acquiring_payload_json\":null,\"acquiring_source\":\"MANUAL_FRONT\",\"amount\":5000,\"auth_code\":null,\"bank_name\":null,\"card_mask\":null,\"commission\":null,\"label\":\"CARD\",\"owner_name\":null,\"payment_code\":null,\"payment_id\":\"payment-1\",\"payment_system\":null,\"payment_type\":\"CASHLESS\",\"provider_type\":null,\"receipt_no\":null,\"rrn\":null,\"signature_required\":null,\"tapxphone_terminal\":null,\"terminal\":null}],\"previous_receipt_id\":null,\"related_receipt_id\":\"rcpt-0001\",\"rounding_enabled\":true,\"technical_return\":null,\"totals\":{\"discounts_sum\":0,\"extra_charge_sum\":0,\"round_sum\":0,\"total_sum\":5000},\"type\":\"RETURN\"}}",
+  "payload_sha256": "d2a20b2efe27b1624051c104fdefb04404155c287836e020d73af2f069ead616",
   "trace_context": {
     "source_ip": "192.168.1.50",
     "source_port": 53010,

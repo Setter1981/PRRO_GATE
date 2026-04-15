@@ -68,6 +68,7 @@
       "technical_return": null,
       "delivery": null,
       "rounding_enabled": null,
+      "discounts": [],
       "totals": {
         "total_sum": 5000,
         "round_sum": null,
@@ -76,8 +77,8 @@
       }
     }
   },
-  "payload_json": "{\"cashier_id\":\"cashier-03\",\"command\":\"SALE\",\"currency\":\"UAH\",\"goods_count\":1,\"payments_count\":1,\"receipt\":{\"delivery\":null,\"goods\":[{\"barcode\":null,\"code\":\"PARKING\",\"discounts\":[],\"excise_barcodes\":[],\"footer\":null,\"good_id\":null,\"header\":null,\"is_return\":null,\"item_attributes\":null,\"item_id\":\"item-1\",\"item_no\":1,\"name\":\"Parking service\",\"price\":5000,\"quantity\":1000,\"sum\":5000,\"uktzed\":null}],\"payments\":[{\"acquirer_and_seller\":null,\"acquiring_payload_json\":null,\"acquiring_source\":\"MANUAL_FRONT\",\"amount\":5000,\"auth_code\":null,\"bank_name\":null,\"card_mask\":null,\"commission\":null,\"label\":\"CARD\",\"owner_name\":null,\"payment_code\":null,\"payment_id\":\"payment-1\",\"payment_system\":null,\"payment_type\":\"CASHLESS\",\"provider_type\":null,\"receipt_no\":null,\"rrn\":null,\"signature_required\":null,\"tapxphone_terminal\":null,\"terminal\":null}],\"previous_receipt_id\":null,\"related_receipt_id\":null,\"rounding_enabled\":null,\"technical_return\":null,\"totals\":{\"discounts_sum\":null,\"extra_charge_sum\":null,\"round_sum\":null,\"total_sum\":5000},\"type\":\"SELL\"}}",
-  "payload_sha256": "5e0a784eb88fa313067d2f67b7548307fedbd760fb9c8c49e35f8636788daece",
+  "payload_json": "{\"cashier_id\":\"cashier-03\",\"command\":\"SALE\",\"currency\":\"UAH\",\"goods_count\":1,\"payments_count\":1,\"receipt\":{\"delivery\":null,\"discounts\":[],\"goods\":[{\"barcode\":null,\"code\":\"PARKING\",\"discounts\":[],\"excise_barcodes\":[],\"footer\":null,\"good_id\":null,\"header\":null,\"is_return\":null,\"item_attributes\":null,\"item_id\":\"item-1\",\"item_no\":1,\"name\":\"Parking service\",\"price\":5000,\"quantity\":1000,\"sum\":5000,\"uktzed\":null}],\"payments\":[{\"acquirer_and_seller\":null,\"acquiring_payload_json\":null,\"acquiring_source\":\"MANUAL_FRONT\",\"amount\":5000,\"auth_code\":null,\"bank_name\":null,\"card_mask\":null,\"commission\":null,\"label\":\"CARD\",\"owner_name\":null,\"payment_code\":null,\"payment_id\":\"payment-1\",\"payment_system\":null,\"payment_type\":\"CASHLESS\",\"provider_type\":null,\"receipt_no\":null,\"rrn\":null,\"signature_required\":null,\"tapxphone_terminal\":null,\"terminal\":null}],\"previous_receipt_id\":null,\"related_receipt_id\":null,\"rounding_enabled\":null,\"technical_return\":null,\"totals\":{\"discounts_sum\":null,\"extra_charge_sum\":null,\"round_sum\":null,\"total_sum\":5000},\"type\":\"SELL\"}}",
+  "payload_sha256": "17e7c3cf62cb0c093432791758b1b0bf6a048f1562168b5aab7a5c6f3529b456",
   "trace_context": {
     "source_ip": "192.168.1.52",
     "source_port": 53212,

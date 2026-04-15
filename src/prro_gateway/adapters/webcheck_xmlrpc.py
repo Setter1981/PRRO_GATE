@@ -59,6 +59,7 @@ class WebCheckXmlRpcAdapter:
                 "technical_return": params.get("technical_return"),
                 "delivery": params.get("delivery"),
                 "rounding_enabled": params.get("rounding"),
+                "discounts": list(params.get("discounts") or []),
                 "totals": self._build_totals(params, goods, payments),
             },
         }

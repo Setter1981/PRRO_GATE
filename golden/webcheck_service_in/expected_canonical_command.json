@@ -26,6 +26,7 @@
       "technical_return": null,
       "delivery": null,
       "rounding_enabled": null,
+      "discounts": [],
       "totals": {
         "total_sum": 0,
         "round_sum": null,
@@ -35,8 +36,8 @@
     },
     "service_sum": 12000
   },
-  "payload_json": "{\"cashier_id\":\"cashier-02\",\"currency\":\"UAH\",\"goods_count\":0,\"method\":\"ServiceIn\",\"payments_count\":0,\"receipt\":{\"delivery\":null,\"goods\":[],\"payments\":[],\"previous_receipt_id\":null,\"related_receipt_id\":null,\"rounding_enabled\":null,\"technical_return\":null,\"totals\":{\"discounts_sum\":null,\"extra_charge_sum\":null,\"round_sum\":null,\"total_sum\":0},\"type\":\"SERVICE_IN\"},\"service_sum\":12000}",
-  "payload_sha256": "16215750b88e0d47a588bab6f9d5cff575ba8c262ad090b5d036218b620d862f",
+  "payload_json": "{\"cashier_id\":\"cashier-02\",\"currency\":\"UAH\",\"goods_count\":0,\"method\":\"ServiceIn\",\"payments_count\":0,\"receipt\":{\"delivery\":null,\"discounts\":[],\"goods\":[],\"payments\":[],\"previous_receipt_id\":null,\"related_receipt_id\":null,\"rounding_enabled\":null,\"technical_return\":null,\"totals\":{\"discounts_sum\":null,\"extra_charge_sum\":null,\"round_sum\":null,\"total_sum\":0},\"type\":\"SERVICE_IN\"},\"service_sum\":12000}",
+  "payload_sha256": "0163a8ea029e9f29ae8581c54a937aa2bfc41365b27590f97bd52e460e55f58b",
   "trace_context": {
     "source_ip": "192.168.1.51",
     "source_port": 53111,

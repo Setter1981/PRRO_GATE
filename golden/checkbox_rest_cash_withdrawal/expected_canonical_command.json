@@ -48,6 +48,7 @@
       "technical_return": null,
       "delivery": null,
       "rounding_enabled": null,
+      "discounts": [],
       "totals": {
         "total_sum": 7000,
         "round_sum": null,
@@ -57,8 +58,8 @@
     },
     "cash_withdrawal_sum": 7000
   },
-  "payload_json": "{\"cash_withdrawal_sum\":7000,\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":0,\"payments_count\":1,\"receipt\":{\"delivery\":null,\"goods\":[],\"payments\":[{\"acquirer_and_seller\":\"BANK+MERCHANT\",\"acquiring_payload_json\":null,\"acquiring_source\":\"MANUAL_FRONT\",\"amount\":7000,\"auth_code\":\"AUTH77\",\"bank_name\":null,\"card_mask\":null,\"commission\":null,\"label\":\"CARD\",\"owner_name\":null,\"payment_code\":null,\"payment_id\":\"payment-1\",\"payment_system\":null,\"payment_type\":\"CASHLESS\",\"provider_type\":null,\"receipt_no\":\"RCP-77\",\"rrn\":\"123456789012\",\"signature_required\":null,\"tapxphone_terminal\":null,\"terminal\":\"TERM-01\"}],\"previous_receipt_id\":null,\"related_receipt_id\":null,\"rounding_enabled\":null,\"technical_return\":null,\"totals\":{\"discounts_sum\":null,\"extra_charge_sum\":null,\"round_sum\":null,\"total_sum\":7000},\"type\":\"CASH_WITHDRAWAL\"}}",
-  "payload_sha256": "2f2e311042bd0480a226749a90f1c47220412ec7fef80f651ceea81f84372b8c",
+  "payload_json": "{\"cash_withdrawal_sum\":7000,\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":0,\"payments_count\":1,\"receipt\":{\"delivery\":null,\"discounts\":[],\"goods\":[],\"payments\":[{\"acquirer_and_seller\":\"BANK+MERCHANT\",\"acquiring_payload_json\":null,\"acquiring_source\":\"MANUAL_FRONT\",\"amount\":7000,\"auth_code\":\"AUTH77\",\"bank_name\":null,\"card_mask\":null,\"commission\":null,\"label\":\"CARD\",\"owner_name\":null,\"payment_code\":null,\"payment_id\":\"payment-1\",\"payment_system\":null,\"payment_type\":\"CASHLESS\",\"provider_type\":null,\"receipt_no\":\"RCP-77\",\"rrn\":\"123456789012\",\"signature_required\":null,\"tapxphone_terminal\":null,\"terminal\":\"TERM-01\"}],\"previous_receipt_id\":null,\"related_receipt_id\":null,\"rounding_enabled\":null,\"technical_return\":null,\"totals\":{\"discounts_sum\":null,\"extra_charge_sum\":null,\"round_sum\":null,\"total_sum\":7000},\"type\":\"CASH_WITHDRAWAL\"}}",
+  "payload_sha256": "9d284d69524c4343c15d75c22d100e13785e76c21b322ec275bcd4d2a51560a9",
   "trace_context": {
     "source_ip": "192.168.1.50",
     "source_port": 53010,

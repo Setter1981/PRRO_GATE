@@ -50,6 +50,7 @@ class CheckboxRestAdapter:
                 "technical_return": request.get("technical_return"),
                 "delivery": request.get("delivery"),
                 "rounding_enabled": request.get("rounding"),
+                "discounts": list(request.get("discounts") or []),
                 "totals": self._build_totals(request, goods, payments),
             },
         }

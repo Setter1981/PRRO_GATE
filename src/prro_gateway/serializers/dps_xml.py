@@ -157,6 +157,7 @@ def _build_check(*, fiscal_number: str, tax_number: str, local_number: int,
     payments_xml = ''
     item_no = 1
     total_sum = 0
+    p_item_numbers: list[int] = []  # N values of <P> elements — for check-level discount <NI>
     # Aggregate sums per tax group for <E> <TX> blocks
     group_sums: dict[str, int] = {}  # tax_id → sum of item amounts
 
@@ -190,6 +191,7 @@ def _build_check(*, fiscal_number: str, tax_number: str, local_number: int,
             excise_marks = g.get('excise_barcodes') or []
             ca_xml = ''.join(_tag('CA', {'CA': m}) for m in excise_marks)
             p_item_no = item_no
+            p_item_numbers.append(item_no)
             items_xml += _tag('P', p_attrs, ca_xml)
             item_no += 1
             # Accumulate per-group sums
@@ -226,6 +228,33 @@ def _build_check(*, fiscal_number: str, tax_number: str, local_number: int,
                 if d.get('tax_code'):
                     d_attrs['TX'] = d['tax_code']
                 discounts_xml += _tag(xml_tag, d_attrs)
+                item_no += 1
+
+        # Check-level (receipt) discounts → <D TR="1"> with <NI> sub-elements
+        check_discounts = receipt.get('discounts') or []
+        if check_discounts and p_item_numbers:
+            goods_total = sum(int(g.get('sum', 0)) for g in goods if isinstance(g, dict))
+            for d in check_discounts:
+                if not isinstance(d, dict):
+                    continue
+                d_value = int(d.get('value', 0))
+                if d_value == 0:
+                    continue
+                d_type = d.get('type', 'DISCOUNT')
+                d_mode = d.get('mode', 'VALUE')
+                xml_tag = 'D' if d_type != 'EXTRA_CHARGE' else 'S'
+                ni_xml = ''.join(_tag('NI', {'NI': n}) for n in p_item_numbers)
+                d_attrs: dict[str, object] = {'N': item_no, 'TR': 1}
+                if d_mode == 'PERCENT':
+                    d_attrs['TY'] = 1
+                    d_attrs['PR'] = f'{d_value:.2f}'
+                    d_attrs['SM'] = round(goods_total * d_value / 100)
+                else:
+                    d_attrs['TY'] = 0
+                    d_attrs['SM'] = d_value
+                if d.get('name'):
+                    d_attrs['NM'] = d['name']
+                discounts_xml += _tag(xml_tag, d_attrs, ni_xml)
                 item_no += 1
 
         total_sum = totals.get('total_sum', 0) or 0

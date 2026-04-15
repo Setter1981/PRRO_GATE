@@ -59,6 +59,7 @@ class MariaTcpAdapter:
                 "technical_return": fields.get("technical_return"),
                 "delivery": fields.get("delivery"),
                 "rounding_enabled": fields.get("rounding"),
+                "discounts": list(fields.get("discounts") or []),
                 "totals": self._build_totals(fields, goods, payments),
             },
         }
