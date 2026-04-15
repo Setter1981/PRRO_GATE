@@ -503,11 +503,13 @@ def _build_e_element(*, item_no: int, total_sum: int, fiscal_number: str,
                      tax_groups: dict | None) -> str:
     """Build <E> closing element with optional <TX> sub-elements.
 
-    Without tax_groups: minimal <E N="..." SM="..."/>
-    With tax_groups: full <E NO="..." SM="..." FN="..." TS="..."><TX .../></E>
+    Always emits FN, N, NO, SM, TS per ФСКО spec Table 23.
+    Without tax_groups (or no matching groups): full attributes, no <TX> children.
+    With tax_groups: full attributes + <TX> sub-elements per group.
     """
     if not tax_groups or not group_sums:
-        return _tag('E', {'N': item_no, 'SM': total_sum})
+        return _tag('E', {'FN': fiscal_number, 'N': item_no, 'NO': local_number,
+                          'SM': total_sum, 'TS': ts_str})
 
     tx_xml = ''
     for tax_id, group_sum in sorted(group_sums.items()):

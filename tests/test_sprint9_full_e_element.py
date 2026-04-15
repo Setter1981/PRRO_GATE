@@ -31,7 +31,7 @@ def _group(tax_id, name='A', tax_rate=20.0, additional_rate=0.0, tax_algorithm=0
 # FE1 — no tax_groups → minimal <E>
 # ---------------------------------------------------------------------------
 
-def test_fe1_minimal_e_without_groups() -> None:
+def test_fe1_e_without_groups_has_full_attrs() -> None:
     xml = build_dps_xml(
         operation_type=OperationType.SELL,
         fiscal_number='FN-001', local_number=1,
@@ -42,7 +42,11 @@ def test_fe1_minimal_e_without_groups() -> None:
                              'totals': {'total_sum': 1000}}},
         tax_number='TN',
     )
-    assert '<E N="3" SM="1000"></E>' in xml
+    # Even without tax_groups, <E> must carry FN, NO, SM, TS per ФСКО spec
+    assert 'FN="FN-001"' in xml
+    assert 'NO="1"' in xml
+    assert 'SM="1000"' in xml
+    assert 'TS=' in xml
     assert '<TX ' not in xml
 
 
