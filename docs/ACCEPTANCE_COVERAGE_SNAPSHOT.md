@@ -2,8 +2,8 @@
 
 ## Multi-Protocol PRRO Gateway — Snapshot покриття вимог тестами
 
-**Версія:** Sprint 9 post-review snapshot, 2026-04-14  
-**Baseline тести:** `pytest -q` → **514 passed, 0 failed**  
+**Версія:** Sprint 10 snapshot, 2026-04-14  
+**Baseline тести:** `pytest -q` → **563 passed, 0 failed**  
 **Версія коду:** `1.4.1`  
 **Джерела вимог:** `docs/LEGAL_INVARIANTS.md`, `docs/PROJECT_DOCUMENTATION_AND_SPRINT_PLAN.md`, ФСКО протокол v2.2.3  
 **Authoritative DPS contract:** `transports/proto/fiscal_server.proto` + `docs/dps_protocol/262576_(1).md` (gRPC API)  
@@ -99,7 +99,7 @@
 
 ---
 
-### Gate 3 — Offline Viability
+### Gate 3 — DPS Fiscal Compliance
 
 | Вимога | Тести | Статус |
 |---|---|---|
@@ -114,7 +114,7 @@
 
 ---
 
-### Gate 4 — Storage Safety (Storage Gates в цьому проекті)
+### Gate 4 — Offline Viability
 
 | Вимога | Тести | Статус |
 |---|---|---|

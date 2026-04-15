@@ -98,12 +98,10 @@ Implemented foundations:
 - admin endpoints for manual document retry and crypto breaker reset;
 - extensive pytest gate suite.
 
-Known baseline issue observed on 2026-04-10:
+Baseline test state (2026-04-14, Sprint 10):
 
-- `pytest -q` result: `236 passed, 4 failed`;
-- failures are date-sensitive offline tests that seed `started_at` on 2026-03-29 and now exceed the 36-hour continuous offline limit;
-- affected tests: `test_gate1p_offline_idempotency.py`, `test_gate1q_offline_reconciliation.py`;
-- this should be fixed by making fixtures use relative current time or by injecting a test clock.
+- `pytest -q` result: `563 passed, 0 failed`;
+- date-sensitive offline test failures (gate1p/gate1q) have been resolved — fixtures now use relative current time.
 
 ## 5. High-Level Architecture
 

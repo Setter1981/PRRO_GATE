@@ -1,5 +1,7 @@
 # ROADMAP v2.1: Multi-Protocol PRRO Gateway
 
+> **[HISTORICAL]** Цей документ є архівним. Актуальний roadmap: `ROADMAP_v3_PILOT.md`.
+
 ## Переработанная версия после архитектурной критики
 
 **Назначение документа:** усилить roadmap v2 так, чтобы ранние этапы доказывали не только «живой happy path», но и инженерную состоятельность ядра под реальными рисками: crypto latency, restart/recovery, stateful ingress, single-writer concurrency и будущий offline contour.
