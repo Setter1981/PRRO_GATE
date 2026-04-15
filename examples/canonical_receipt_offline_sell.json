@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0.1",
+  "receipt_id": "doc-offline-001",
+  "receipt_type": "SELL",
+  "fiscal_number": "FN-DEV-0001",
+  "shift_id": "shift-002",
+  "status": "SIGNED",
+  "business_ts": "2026-03-28T12:00:00Z",
+  "created_offline": true,
+  "offline_fiscal_code": 1201,
+  "offline_fiscal_date": "2026-03-28T12:00:00Z",
+  "goods": [
+    {
+      "item_id": "item-o1",
+      "item_no": 1,
+      "name": "Parking",
+      "price": 10000,
+      "quantity": 1000,
+      "sum": 10000,
+      "is_return": false,
+      "excise_barcodes": [],
+      "discounts": []
+    }
+  ],
+  "payments": [
+    {
+      "payment_id": "pay-o1",
+      "payment_type": "CASHLESS",
+      "amount": 10000,
+      "terminal": "TERM-01",
+      "rrn": "123456789012",
+      "auth_code": "A1B2C3"
+    }
+  ],
+  "totals": {
+    "total_sum": 10000,
+    "round_sum": 0,
+    "discounts_sum": 0,
+    "extra_charge_sum": 0
+  }
+}

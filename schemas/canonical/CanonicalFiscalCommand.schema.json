@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/canonical/CanonicalFiscalCommand.schema.json",
+  "title": "CanonicalFiscalCommand",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_id",
+    "idempotency_key",
+    "protocol",
+    "operation_type",
+    "fiscal_number",
+    "business_ts",
+    "payload",
+    "payload_sha256"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "idempotency_key": {
+      "type": "string"
+    },
+    "protocol": {
+      "type": "string",
+      "enum": [
+        "CHECKBOX_REST",
+        "WEBCHECK_XMLRPC",
+        "MARIA_TCP",
+        "INTERNAL"
+      ]
+    },
+    "operation_type": {
+      "type": "string",
+      "enum": [
+        "SHIFT_OPEN",
+        "SHIFT_CLOSE",
+        "SELL",
+        "RETURN",
+        "SERVICE_IN",
+        "SERVICE_OUT",
+        "CASH_WITHDRAWAL",
+        "X_REPORT",
+        "Z_REPORT",
+        "GO_OFFLINE",
+        "GO_ONLINE",
+        "ASK_OFFLINE_CODES",
+        "GET_STATUS",
+        "PING",
+        "CUSTOM_PROTOCOL_METHOD"
+      ]
+    },
+    "fiscal_number": {
+      "type": "string"
+    },
+    "route_key": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "backend_profile_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "transport_profile_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "channel_owner": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "external_request_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "business_ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "payload": {
+      "type": "object"
+    },
+    "payload_json": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "deprecated": true,
+      "description": "Deprecated redundant serialized representation. Canonical flow should use payload object."
+    },
+    "payload_sha256": {
+      "type": "string"
+    },
+    "trace_context": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "requires_signature": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "requires_shift": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "requires_fiscal_number": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "requires_offline_code": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "correlation_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

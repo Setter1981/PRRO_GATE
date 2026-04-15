@@ -1,0 +1,17 @@
+{
+  "name": "sidecar",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "gost89": "^0.1.11",
+    "jksreader": "^1.0.0",
+    "jkurwa": "^1.21.2"
+  }
+}

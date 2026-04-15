@@ -1,0 +1,9 @@
+{
+  "code": "SHIFT_CHANNEL_SWITCH_FORBIDDEN",
+  "message": "Active shift is locked to another channel.",
+  "retryable": false,
+  "details": {
+    "expected_channel": "CHECKBOX_REST",
+    "actual_channel": "MARIA_TCP"
+  }
+}

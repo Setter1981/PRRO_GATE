@@ -1,0 +1,23 @@
+{
+  "context": {
+    "request_id": "cmd-201",
+    "fiscal_number": "FN300000001",
+    "route_key": "POS-02",
+    "backend_profile_id": "backend_checkbox_default",
+    "transport_profile_id": "transport_checkbox_rest_default",
+    "channel_owner": "front.webcheck.client",
+    "business_ts": "2026-03-28T11:25:00Z",
+    "trace_context": {
+      "source_ip": "192.168.1.51",
+      "source_port": 53111,
+      "session_id": "sess-201",
+      "correlation_id": "corr-201"
+    }
+  },
+  "method": "ServiceIn",
+  "params": {
+    "value": 12000,
+    "cashier_id": "cashier-02",
+    "doc_id": "wb-201"
+  }
+}

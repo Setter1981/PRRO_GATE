@@ -1,0 +1,5 @@
+interface:
+  display_name: "Migration Keeper"
+  short_description: "Guard PRRO schema and persistence"
+  default_prompt: "Use $migration-keeper to review this PRRO persistence or migration change."
+

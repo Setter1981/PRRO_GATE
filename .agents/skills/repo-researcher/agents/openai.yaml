@@ -1,0 +1,5 @@
+interface:
+  display_name: "Repo Researcher"
+  short_description: "Map PRRO code paths quickly"
+  default_prompt: "Use $repo-researcher to map the smallest relevant code surface for this PRRO task."
+

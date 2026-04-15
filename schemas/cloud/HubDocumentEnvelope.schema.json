@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/cloud/HubDocumentEnvelope.schema.json",
+  "title": "HubDocumentEnvelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "fiscal_number",
+    "artifact_class",
+    "aggregate_type",
+    "aggregate_id",
+    "sequence_no",
+    "idempotency_key",
+    "payload",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "fiscal_number": {
+      "type": "string"
+    },
+    "artifact_class": {
+      "type": "string",
+      "enum": [
+        "DOCUMENT",
+        "REPORT",
+        "TRACE",
+        "ARCHIVE"
+      ]
+    },
+    "aggregate_type": {
+      "type": "string",
+      "enum": [
+        "DOCUMENT",
+        "SHIFT",
+        "OFFLINE_SESSION",
+        "REPORT",
+        "ARCHIVE"
+      ]
+    },
+    "aggregate_id": {
+      "type": "string"
+    },
+    "sequence_no": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "idempotency_key": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "payload": {
+      "type": "object"
+    }
+  }
+}

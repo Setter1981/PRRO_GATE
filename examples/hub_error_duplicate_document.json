@@ -1,0 +1,5 @@
+{
+  "hub_error_code": "DUPLICATE_DOCUMENT",
+  "retryable": false,
+  "message": "Document already received by hub."
+}

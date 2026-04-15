@@ -1,0 +1,92 @@
+{
+  "schema_version": "1.0.1",
+  "request_id": "cmd-003",
+  "idempotency_key": "sell:fn300000001:maria-001",
+  "protocol": "MARIA_TCP",
+  "operation_type": "SELL",
+  "fiscal_number": "FN300000001",
+  "route_key": "POS-03",
+  "backend_profile_id": "backend_checkbox_default",
+  "transport_profile_id": "transport_checkbox_rest_default",
+  "channel_owner": "front.maria.driver",
+  "external_request_id": "maria-001",
+  "business_ts": "2026-03-28T10:25:00Z",
+  "payload": {
+    "command": "SALE",
+    "currency": "UAH",
+    "cashier_id": "cashier-03",
+    "goods_count": 1,
+    "payments_count": 1,
+    "receipt": {
+      "type": "SELL",
+      "goods": [
+        {
+          "item_id": "item-1",
+          "item_no": 1,
+          "code": "PARKING",
+          "good_id": null,
+          "name": "Parking service",
+          "uktzed": null,
+          "barcode": null,
+          "excise_barcodes": [],
+          "price": 5000,
+          "quantity": 1000,
+          "sum": 5000,
+          "header": null,
+          "footer": null,
+          "discounts": [],
+          "item_attributes": null,
+          "is_return": null
+        }
+      ],
+      "payments": [
+        {
+          "payment_id": "payment-1",
+          "payment_type": "CASHLESS",
+          "provider_type": null,
+          "label": "CARD",
+          "payment_code": null,
+          "amount": 5000,
+          "commission": null,
+          "card_mask": null,
+          "bank_name": null,
+          "auth_code": null,
+          "rrn": null,
+          "payment_system": null,
+          "owner_name": null,
+          "terminal": null,
+          "acquirer_and_seller": null,
+          "receipt_no": null,
+          "signature_required": null,
+          "tapxphone_terminal": null,
+          "acquiring_source": "MANUAL_FRONT",
+          "acquiring_payload_json": null
+        }
+      ],
+      "related_receipt_id": null,
+      "previous_receipt_id": null,
+      "technical_return": null,
+      "delivery": null,
+      "rounding_enabled": null,
+      "totals": {
+        "total_sum": 5000,
+        "round_sum": null,
+        "discounts_sum": null,
+        "extra_charge_sum": null
+      }
+    }
+  },
+  "payload_json": "{\"cashier_id\":\"cashier-03\",\"command\":\"SALE\",\"currency\":\"UAH\",\"goods_count\":1,\"payments_count\":1,\"receipt\":{\"delivery\":null,\"goods\":[{\"barcode\":null,\"code\":\"PARKING\",\"discounts\":[],\"excise_barcodes\":[],\"footer\":null,\"good_id\":null,\"header\":null,\"is_return\":null,\"item_attributes\":null,\"item_id\":\"item-1\",\"item_no\":1,\"name\":\"Parking service\",\"price\":5000,\"quantity\":1000,\"sum\":5000,\"uktzed\":null}],\"payments\":[{\"acquirer_and_seller\":null,\"acquiring_payload_json\":null,\"acquiring_source\":\"MANUAL_FRONT\",\"amount\":5000,\"auth_code\":null,\"bank_name\":null,\"card_mask\":null,\"commission\":null,\"label\":\"CARD\",\"owner_name\":null,\"payment_code\":null,\"payment_id\":\"payment-1\",\"payment_system\":null,\"payment_type\":\"CASHLESS\",\"provider_type\":null,\"receipt_no\":null,\"rrn\":null,\"signature_required\":null,\"tapxphone_terminal\":null,\"terminal\":null}],\"previous_receipt_id\":null,\"related_receipt_id\":null,\"rounding_enabled\":null,\"technical_return\":null,\"totals\":{\"discounts_sum\":null,\"extra_charge_sum\":null,\"round_sum\":null,\"total_sum\":5000},\"type\":\"SELL\"}}",
+  "payload_sha256": "5e0a784eb88fa313067d2f67b7548307fedbd760fb9c8c49e35f8636788daece",
+  "trace_context": {
+    "source_ip": "192.168.1.52",
+    "source_port": 53212,
+    "session_id": "sess-003",
+    "correlation_id": "corr-003"
+  },
+  "requires_signature": true,
+  "requires_shift": true,
+  "requires_fiscal_number": true,
+  "requires_offline_code": false,
+  "correlation_id": "corr-003"
+}

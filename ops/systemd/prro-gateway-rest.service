@@ -1,0 +1,12 @@
+[Unit]
+Description=PRRO Gateway REST Runtime
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/prro-gateway
+Environment=PRRO_GATEWAY_CONFIG=/opt/prro-gateway/ops/config.example.yaml
+ExecStart=/usr/bin/python3 scripts/run_rest.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

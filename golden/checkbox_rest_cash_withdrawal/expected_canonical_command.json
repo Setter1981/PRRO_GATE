@@ -1,0 +1,73 @@
+{
+  "schema_version": "1.0.1",
+  "request_id": "cmd-102",
+  "idempotency_key": "cash_withdrawal:fn300000001:ext-102",
+  "protocol": "CHECKBOX_REST",
+  "operation_type": "CASH_WITHDRAWAL",
+  "fiscal_number": "FN300000001",
+  "route_key": "POS-01",
+  "backend_profile_id": "backend_checkbox_default",
+  "transport_profile_id": "transport_checkbox_rest_default",
+  "channel_owner": "front.cashdesk.app",
+  "external_request_id": "ext-102",
+  "business_ts": "2026-03-28T11:20:00Z",
+  "payload": {
+    "currency": "UAH",
+    "cashier_id": "cashier-01",
+    "goods_count": 0,
+    "payments_count": 1,
+    "receipt": {
+      "type": "CASH_WITHDRAWAL",
+      "goods": [],
+      "payments": [
+        {
+          "payment_id": "payment-1",
+          "payment_type": "CASHLESS",
+          "provider_type": null,
+          "label": "CARD",
+          "payment_code": null,
+          "amount": 7000,
+          "commission": null,
+          "card_mask": null,
+          "bank_name": null,
+          "auth_code": "AUTH77",
+          "rrn": "123456789012",
+          "payment_system": null,
+          "owner_name": null,
+          "terminal": "TERM-01",
+          "acquirer_and_seller": "BANK+MERCHANT",
+          "receipt_no": "RCP-77",
+          "signature_required": null,
+          "tapxphone_terminal": null,
+          "acquiring_source": "MANUAL_FRONT",
+          "acquiring_payload_json": null
+        }
+      ],
+      "related_receipt_id": null,
+      "previous_receipt_id": null,
+      "technical_return": null,
+      "delivery": null,
+      "rounding_enabled": null,
+      "totals": {
+        "total_sum": 7000,
+        "round_sum": null,
+        "discounts_sum": null,
+        "extra_charge_sum": null
+      }
+    },
+    "cash_withdrawal_sum": 7000
+  },
+  "payload_json": "{\"cash_withdrawal_sum\":7000,\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":0,\"payments_count\":1,\"receipt\":{\"delivery\":null,\"goods\":[],\"payments\":[{\"acquirer_and_seller\":\"BANK+MERCHANT\",\"acquiring_payload_json\":null,\"acquiring_source\":\"MANUAL_FRONT\",\"amount\":7000,\"auth_code\":\"AUTH77\",\"bank_name\":null,\"card_mask\":null,\"commission\":null,\"label\":\"CARD\",\"owner_name\":null,\"payment_code\":null,\"payment_id\":\"payment-1\",\"payment_system\":null,\"payment_type\":\"CASHLESS\",\"provider_type\":null,\"receipt_no\":\"RCP-77\",\"rrn\":\"123456789012\",\"signature_required\":null,\"tapxphone_terminal\":null,\"terminal\":\"TERM-01\"}],\"previous_receipt_id\":null,\"related_receipt_id\":null,\"rounding_enabled\":null,\"technical_return\":null,\"totals\":{\"discounts_sum\":null,\"extra_charge_sum\":null,\"round_sum\":null,\"total_sum\":7000},\"type\":\"CASH_WITHDRAWAL\"}}",
+  "payload_sha256": "2f2e311042bd0480a226749a90f1c47220412ec7fef80f651ceea81f84372b8c",
+  "trace_context": {
+    "source_ip": "192.168.1.50",
+    "source_port": 53010,
+    "session_id": "sess-102",
+    "correlation_id": "corr-102"
+  },
+  "requires_signature": true,
+  "requires_shift": true,
+  "requires_fiscal_number": true,
+  "requires_offline_code": false,
+  "correlation_id": "corr-102"
+}

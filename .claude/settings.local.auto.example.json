@@ -1,0 +1,19 @@
+{
+  "model": "opusplan",
+  "defaultMode": "auto",
+  "useAutoModeDuringPlan": true,
+  "autoMode": {
+    "environment": [
+      "Trusted source control for this project is the current git repository and its configured remotes.",
+      "Trusted documentation domains include code.claude.com, docs.anthropic.com, docs.python.org, and wiki.checkbox.ua.",
+      "Trusted package registries for project dependencies are github.com, raw.githubusercontent.com, pypi.org, and files.pythonhosted.org.",
+      "Local test execution, local worktrees, and branch creation are normal for this repository."
+    ],
+    "allow": [
+      "It is allowed to read project files, run local tests, install declared dependencies, create isolated git worktrees, update feature branches, and fetch read-only documentation relevant to the current task."
+    ],
+    "soft_deny": [
+      "Never push directly to main, never force-push, never delete remote branches, never run real production deploys, never run database migrations against non-local databases, never use credentials discovered in the repository unless the user explicitly asked for that exact use."
+    ]
+  }
+}

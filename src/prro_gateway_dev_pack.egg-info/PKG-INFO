@@ -1,0 +1,56 @@
+Metadata-Version: 2.4
+Name: prro-gateway-dev-pack
+Version: 1.4.1
+Summary: Development scaffold for Multi-Protocol PRRO Gateway
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: pydantic<3,>=2.12
+Requires-Dist: jsonschema<5,>=4.26
+Requires-Dist: PyYAML<7,>=6
+Requires-Dist: fastapi<1,>=0.116
+Requires-Dist: uvicorn<1,>=0.35
+Requires-Dist: httpx<1,>=0.28
+Requires-Dist: grpcio<2,>=1.80
+Requires-Dist: protobuf<7,>=6.31
+
+# PRRO Gateway Dev Pack v1.2
+
+Current state:
+- canonical models and schemas
+- SQLite storage and repositories
+- staged write-path worker pipeline
+- offline, excise, audit, trace foundation
+- adapters for Checkbox/WebCheck/Maria mapping
+- transport router and reconciliation scaffold
+- runtime shells (REST/XML-RPC/Maria)
+- runtime metrics, alert persistence and structured logging
+- config env overrides and graceful shutdown hooks
+
+## Core project documentation
+
+- [Project documentation and sprint plan](PROJECT_DOCUMENTATION_AND_SPRINT_PLAN.md)
+- [Technical specification](Multi-Protocol_PRRO_Gateway.md)
+- [Roadmap v2.1](ROADMAP_v2_1_PRRO_Gateway.md)
+- [Install](INSTALL.md)
+- [Operations](OPERATIONS.md)
+- [Upgrade](UPGRADE.md)
+
+## Quick start
+1. Create a virtual environment and install dependencies.
+2. Point `PRRO_GATEWAY_CONFIG` to `ops/config.example.yaml` or copy and edit it.
+3. Optional env overrides:
+   - `PRRO_DB_PATH`
+   - `PRRO_SQL_DIR`
+   - `PRRO_FISCAL_NUMBER`
+   - `PRRO_REST_PORT`
+   - `PRRO_XMLRPC_PORT`
+   - `PRRO_MARIA_PORT`
+   - `PRRO_LOG_LEVEL`
+4. Run `python scripts/run_rest.py`.
+5. Check `/health/live`, `/health/ready`, `/metrics`, `/v1/ops/summary`.
+
+## Notes
+- `process_immediately=true` is a dev/test convenience mode, not the target production queue/worker model.
+- All `*_json` fields in SQLite store serialized JSON as TEXT. Model/service layers are responsible for serialization/deserialization.
+- Runtime alerts are currently persisted through `audit_log` when enabled.
+- Structured logs go to stdout and are suitable for Docker/systemd collection.

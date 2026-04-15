@@ -1,0 +1,50 @@
+{
+  "schema_version": "1.0.1",
+  "request_id": "cmd-301",
+  "idempotency_key": "shift_open:fn300000001:maria-open-301",
+  "protocol": "MARIA_TCP",
+  "operation_type": "SHIFT_OPEN",
+  "fiscal_number": "FN300000001",
+  "route_key": "POS-03",
+  "backend_profile_id": "backend_checkbox_default",
+  "transport_profile_id": "transport_checkbox_rest_default",
+  "channel_owner": "front.maria.driver",
+  "external_request_id": "maria-open-301",
+  "business_ts": "2026-03-28T11:30:00Z",
+  "payload": {
+    "command": "OPEN_SHIFT",
+    "currency": "UAH",
+    "cashier_id": "cashier-03",
+    "goods_count": 0,
+    "payments_count": 0,
+    "receipt": {
+      "type": "SHIFT_OPEN",
+      "goods": [],
+      "payments": [],
+      "related_receipt_id": null,
+      "previous_receipt_id": null,
+      "technical_return": null,
+      "delivery": null,
+      "rounding_enabled": null,
+      "totals": {
+        "total_sum": 0,
+        "round_sum": null,
+        "discounts_sum": null,
+        "extra_charge_sum": null
+      }
+    }
+  },
+  "payload_json": "{\"cashier_id\":\"cashier-03\",\"command\":\"OPEN_SHIFT\",\"currency\":\"UAH\",\"goods_count\":0,\"payments_count\":0,\"receipt\":{\"delivery\":null,\"goods\":[],\"payments\":[],\"previous_receipt_id\":null,\"related_receipt_id\":null,\"rounding_enabled\":null,\"technical_return\":null,\"totals\":{\"discounts_sum\":null,\"extra_charge_sum\":null,\"round_sum\":null,\"total_sum\":0},\"type\":\"SHIFT_OPEN\"}}",
+  "payload_sha256": "255d796c4a66852daac4a89fc3c4601811b4c5940066991afc712f2a246f6ea8",
+  "trace_context": {
+    "source_ip": "192.168.1.52",
+    "source_port": 53212,
+    "session_id": "sess-301",
+    "correlation_id": "corr-301"
+  },
+  "requires_signature": true,
+  "requires_shift": false,
+  "requires_fiscal_number": true,
+  "requires_offline_code": false,
+  "correlation_id": "corr-301"
+}

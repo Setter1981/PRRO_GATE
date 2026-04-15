@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/common/CanonicalError.schema.json",
+  "title": "CanonicalError",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "code",
+    "message",
+    "retryable"
+  ],
+  "properties": {
+    "code": {
+      "type": "string",
+      "enum": [
+        "SHIFT_ALREADY_OPEN",
+        "SHIFT_NOT_OPEN",
+        "SHIFT_CHANNEL_SWITCH_FORBIDDEN",
+        "OFFLINE_LIMIT_REACHED",
+        "OFFLINE_CODES_EXHAUSTED",
+        "OFFLINE_MODE_REQUIRED",
+        "DUPLICATE_IDEMPOTENCY_KEY",
+        "DUPLICATE_EXCISE_MARK",
+        "UNSUPPORTED_METHOD",
+        "UNKNOWN_METHOD",
+        "UNSUPPORTED_BY_BACKEND",
+        "INVALID_PAYMENT_DATA",
+        "INVALID_ACQUIRING_DATA",
+        "INVALID_RECEIPT_SEQUENCE",
+        "INVALID_FISCAL_DATE",
+        "BACKEND_TEMPORARY_UNAVAILABLE",
+        "TRANSPORT_RETRYABLE_ERROR",
+        "CRYPTO_PROVIDER_UNAVAILABLE",
+        "WORKER_BUSY_TIMEOUT"
+      ]
+    },
+    "message": {
+      "type": "string"
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "retry_after_seconds": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "details": {
+      "type": [
+        "object",
+        "null"
+      ]
+    }
+  }
+}

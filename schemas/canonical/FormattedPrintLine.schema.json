@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/canonical/FormattedPrintLine.schema.json",
+  "title": "FormattedPrintLine",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "line_type",
+    "content",
+    "alignment",
+    "font_style",
+    "max_width"
+  ],
+  "properties": {
+    "line_type": {
+      "type": "string",
+      "enum": [
+        "HEADER",
+        "TEXT",
+        "FISCAL",
+        "SEPARATOR",
+        "BARCODE",
+        "QR",
+        "FOOTER"
+      ]
+    },
+    "content": {
+      "type": "string"
+    },
+    "alignment": {
+      "type": "string",
+      "enum": [
+        "LEFT",
+        "CENTER",
+        "RIGHT"
+      ]
+    },
+    "font_style": {
+      "type": "string",
+      "enum": [
+        "NORMAL",
+        "BOLD",
+        "DOUBLE_WIDTH",
+        "DOUBLE_HEIGHT"
+      ]
+    },
+    "max_width": {
+      "type": "integer",
+      "minimum": 20,
+      "maximum": 80
+    }
+  }
+}

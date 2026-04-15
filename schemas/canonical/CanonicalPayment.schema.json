@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/canonical/CanonicalPayment.schema.json",
+  "title": "CanonicalPayment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "payment_id",
+    "payment_type",
+    "amount"
+  ],
+  "properties": {
+    "payment_id": {
+      "type": "string"
+    },
+    "payment_type": {
+      "type": "string",
+      "enum": [
+        "CASH",
+        "CASHLESS",
+        "MIXED",
+        "OTHER"
+      ]
+    },
+    "provider_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "label": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "payment_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "amount": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Always non-negative in canonical flow. Direction is defined by receipt_type."
+    },
+    "commission": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "card_mask": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "bank_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "auth_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "rrn": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "payment_system": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "owner_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "terminal": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "acquirer_and_seller": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "receipt_no": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "signature_required": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "tapxphone_terminal": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "acquiring_source": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "MANUAL_FRONT",
+        "ERP",
+        "POS_INTEGRATION",
+        "BACKEND_ENRICHED",
+        null
+      ]
+    },
+    "acquiring_payload_json": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Serialized acquiring payload as received from integration source."
+    }
+  }
+}

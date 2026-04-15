@@ -1,0 +1,5 @@
+interface:
+  display_name: "PRRO Invariants"
+  short_description: "Carry core PRRO engineering rules"
+  default_prompt: "Use $prro-invariants to review this PRRO task against the project invariants and hot zones."
+

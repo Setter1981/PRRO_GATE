@@ -1,0 +1,5 @@
+interface:
+  display_name: "Acceptance Gate"
+  short_description: "Give a PRRO go/no-go verdict"
+  default_prompt: "Use $acceptance-gate to review this PRRO milestone and give a structured go/no-go answer."
+

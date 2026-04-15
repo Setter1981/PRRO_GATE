@@ -1,0 +1,8 @@
+pydantic<3,>=2.12
+jsonschema<5,>=4.26
+PyYAML<7,>=6
+fastapi<1,>=0.116
+uvicorn<1,>=0.35
+httpx<1,>=0.28
+grpcio<2,>=1.80
+protobuf<7,>=6.31

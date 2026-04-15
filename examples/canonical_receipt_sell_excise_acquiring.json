@@ -1,0 +1,53 @@
+{
+  "schema_version": "1.0.1",
+  "receipt_id": "doc-excise-001",
+  "receipt_type": "SELL",
+  "fiscal_number": "FN-DEV-0001",
+  "shift_id": "shift-001",
+  "status": "ACK",
+  "business_ts": "2026-03-28T13:00:00Z",
+  "goods": [
+    {
+      "item_id": "item-e1",
+      "item_no": 1,
+      "name": "Wine 0.75L",
+      "price": 159900,
+      "quantity": 1000,
+      "sum": 159900,
+      "is_return": false,
+      "barcode": "4820000000001",
+      "excise_barcodes": [
+        "AB1234567890"
+      ],
+      "discounts": [],
+      "item_attributes": {
+        "volume_l": 0.75,
+        "package_barcode": "PKG-4820000000001"
+      }
+    }
+  ],
+  "payments": [
+    {
+      "payment_id": "pay-e1",
+      "payment_type": "CASHLESS",
+      "amount": 159900,
+      "card_mask": "****1234",
+      "bank_name": "Bank UA",
+      "auth_code": "AUTH99",
+      "rrn": "998877665544",
+      "payment_system": "VISA",
+      "terminal": "TERM-ALC-01",
+      "acquirer_and_seller": "ACQ01/MRC01",
+      "receipt_no": "SLIP-001",
+      "signature_required": false,
+      "acquiring_source": "POS_INTEGRATION",
+      "acquiring_payload_json": "{\"merchant_id\":\"MRC01\"}"
+    }
+  ],
+  "totals": {
+    "total_sum": 159900,
+    "round_sum": 0,
+    "discounts_sum": 0,
+    "extra_charge_sum": 0
+  }
+}

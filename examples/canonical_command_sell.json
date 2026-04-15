@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.0.1",
+  "request_id": "cmd-001",
+  "idempotency_key": "sell:fn300000001:ext-001",
+  "protocol": "CHECKBOX_REST",
+  "operation_type": "SELL",
+  "fiscal_number": "FN300000001",
+  "route_key": "POS-01",
+  "backend_profile_id": "backend_checkbox_default",
+  "transport_profile_id": "transport_checkbox_rest_default",
+  "channel_owner": "front.cashdesk.app",
+  "external_request_id": "ext-001",
+  "business_ts": "2026-03-28T10:15:00Z",
+  "payload": {
+    "cashier_id": "cashier-01",
+    "currency": "UAH",
+    "goods_count": 1,
+    "payments_count": 1
+  },
+  "payload_json": "{\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":1,\"payments_count\":1}",
+  "payload_sha256": "9f3bca6c5df16d6eb3c7ad5f5e6810f76f7733ce4ae6d8bc7d482cf4159060f6",
+  "trace_context": {
+    "source_ip": "192.168.1.50",
+    "source_port": 53010,
+    "session_id": "sess-001",
+    "correlation_id": "corr-001"
+  },
+  "requires_signature": true,
+  "requires_shift": true,
+  "requires_fiscal_number": true,
+  "requires_offline_code": false,
+  "correlation_id": "corr-001"
+}

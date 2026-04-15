@@ -1,0 +1,5 @@
+interface:
+  display_name: "Docs Packager"
+  short_description: "Document verified PRRO behavior"
+  default_prompt: "Use $docs-packager to update PRRO docs after the verified code change."
+

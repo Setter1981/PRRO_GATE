@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/canonical/CanonicalReceiptItem.schema.json",
+  "title": "CanonicalReceiptItem",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "item_id",
+    "item_no",
+    "name",
+    "price",
+    "quantity",
+    "sum"
+  ],
+  "properties": {
+    "item_id": {
+      "type": "string"
+    },
+    "item_no": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "good_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "uktzed": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "barcode": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "excise_barcodes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "price": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Quantity in thousandths"
+    },
+    "sum": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "header": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "footer": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "discounts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "mode",
+          "value"
+        ],
+        "properties": {
+          "type": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "value": {
+            "type": "integer"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tax_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tax_codes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "privilege": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "default": []
+    },
+    "item_attributes": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "is_return": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": false
+    }
+  }
+}

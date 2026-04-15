@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prro-gateway-dev-pack"
+version = "1.4.1"
+description = "Development scaffold for Multi-Protocol PRRO Gateway"
+readme = "docs/README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.12,<3",
+  "jsonschema>=4.26,<5",
+  "PyYAML>=6,<7",
+  "fastapi>=0.116,<1",
+  "uvicorn>=0.35,<1",
+  "httpx>=0.28,<1",
+  "grpcio>=1.80,<2",
+  "protobuf>=6.31,<7"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

@@ -1,0 +1,242 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/canonical/CanonicalReceipt.schema.json",
+  "title": "CanonicalReceipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "receipt_id",
+    "receipt_type",
+    "fiscal_number",
+    "status",
+    "business_ts",
+    "goods",
+    "payments",
+    "schema_version"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "receipt_id": {
+      "type": "string"
+    },
+    "receipt_type": {
+      "type": "string",
+      "enum": [
+        "SHIFT_OPEN",
+        "SHIFT_CLOSE",
+        "SELL",
+        "RETURN",
+        "SERVICE_IN",
+        "SERVICE_OUT",
+        "CASH_WITHDRAWAL",
+        "X_REPORT",
+        "Z_REPORT"
+      ]
+    },
+    "fiscal_number": {
+      "type": "string"
+    },
+    "shift_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "PREPARED",
+        "SIGNED",
+        "ENCRYPTED",
+        "SENT",
+        "KVT1",
+        "KVT2",
+        "ACK",
+        "REJECTED",
+        "CANCELLED",
+        "ERROR_RETRYABLE",
+        "REQUIRES_MANUAL_RECONCILIATION"
+      ]
+    },
+    "business_ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "created_offline": {
+      "type": "boolean",
+      "default": false
+    },
+    "offline_fiscal_code": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "offline_fiscal_date": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "fiscal_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "fiscal_date": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "serial": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "control_number": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "related_receipt_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "previous_receipt_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "technical_return": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "header": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "footer": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "barcode": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "delivery": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "email": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "email"
+        },
+        "emails": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "email"
+          }
+        },
+        "phone": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "rounding_enabled": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "goods": {
+      "type": "array",
+      "items": {
+        "$ref": "CanonicalReceiptItem.schema.json"
+      }
+    },
+    "payments": {
+      "type": "array",
+      "items": {
+        "$ref": "CanonicalPayment.schema.json"
+      }
+    },
+    "formatted_print_lines": {
+      "type": "array",
+      "items": {
+        "$ref": "FormattedPrintLine.schema.json"
+      }
+    },
+    "totals": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "total_sum": {
+          "type": "integer"
+        },
+        "round_sum": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "discounts_sum": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "extra_charge_sum": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      }
+    },
+    "previous_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "channel_lock_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

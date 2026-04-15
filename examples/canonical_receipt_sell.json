@@ -1,0 +1,66 @@
+{
+  "schema_version": "1.0.1",
+  "receipt_id": "rcpt_sell_001",
+  "receipt_type": "SELL",
+  "fiscal_number": "4000000001",
+  "shift_id": "shift_001",
+  "status": "ACK",
+  "business_ts": "2026-03-28T10:15:30Z",
+  "created_offline": false,
+  "fiscal_code": "FC00001234",
+  "fiscal_date": "2026-03-28T10:15:32Z",
+  "serial": "SRL-001",
+  "control_number": "CN-0001",
+  "header": "My Store",
+  "footer": "Thank you",
+  "previous_hash": "prev_hash_0001",
+  "channel_lock_ref": "CHECKBOX_REST_TRANSPORT:checkbox_client",
+  "goods": [
+    {
+      "item_id": "item_1",
+      "item_no": 1,
+      "code": "PARKING",
+      "name": "Parking 1h",
+      "price": 5000,
+      "quantity": 1000,
+      "sum": 5000,
+      "is_return": false
+    }
+  ],
+  "payments": [
+    {
+      "payment_id": "pay_1",
+      "payment_type": "CASH",
+      "amount": 5000
+    }
+  ],
+  "formatted_print_lines": [
+    {
+      "line_type": "HEADER",
+      "content": "My Store",
+      "alignment": "CENTER",
+      "font_style": "BOLD",
+      "max_width": 32
+    },
+    {
+      "line_type": "TEXT",
+      "content": "Parking 1h 50.00",
+      "alignment": "LEFT",
+      "font_style": "NORMAL",
+      "max_width": 32
+    },
+    {
+      "line_type": "FISCAL",
+      "content": "FC00001234",
+      "alignment": "CENTER",
+      "font_style": "NORMAL",
+      "max_width": 32
+    }
+  ],
+  "totals": {
+    "total_sum": 5000,
+    "round_sum": 0,
+    "discounts_sum": 0,
+    "extra_charge_sum": 0
+  }
+}

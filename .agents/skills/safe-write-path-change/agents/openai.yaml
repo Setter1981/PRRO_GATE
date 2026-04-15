@@ -1,0 +1,5 @@
+interface:
+  display_name: "Safe Write Path Change"
+  short_description: "Checklist for risky PRRO backend edits"
+  default_prompt: "Use $safe-write-path-change to sanity-check this risky PRRO backend change before editing."
+

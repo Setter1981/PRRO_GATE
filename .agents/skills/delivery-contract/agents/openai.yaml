@@ -1,0 +1,5 @@
+interface:
+  display_name: "Delivery Contract"
+  short_description: "Enforce structured PRRO closeout"
+  default_prompt: "Use $delivery-contract to format this PRRO completion report with explicit verification and risks."
+

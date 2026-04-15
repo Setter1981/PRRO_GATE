@@ -1,0 +1,5 @@
+interface:
+  display_name: "Arch Planner"
+  short_description: "Plan risky PRRO changes safely"
+  default_prompt: "Use $arch-planner to map the smallest safe change for this PRRO task before coding."
+

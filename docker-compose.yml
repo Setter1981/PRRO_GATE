@@ -1,0 +1,9 @@
+services:
+  prro-gateway-rest:
+    build: .
+    environment:
+      PRRO_GATEWAY_CONFIG: /app/ops/config.example.yaml
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./var:/app/var

@@ -1,0 +1,54 @@
+[package]
+name = "prro_crypto"
+version = "0.1.0-alpha.1"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "Ukrainian DSTU 4145 crypto for PRRO fiscal gateway"
+authors = ["PRRO_GATE contributors"]
+repository = "https://github.com/prro-gateway/prro-crypto"
+keywords = ["cryptography", "dstu", "dstu4145", "ukraine", "fiscal"]
+categories = ["cryptography"]
+readme = "README.md"
+
+[lib]
+name = "prro_crypto"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+num-bigint = "0.4"
+num-traits = "0.2"
+sha1 = "0.10"
+thiserror = "1.0"
+# CMS/CAdES-BES builder (Phase 4 Sprint 1)
+cms = { version = "0.2", features = ["builder"] }
+x509-cert = { version = "0.2", features = ["pem"] }
+const-oid = "0.9"
+der = { version = "0.7", features = ["oid", "alloc"] }
+spki = { version = "0.7", features = ["alloc"] }
+# CSPRNG for per-sign rand_e. `getrandom` is the backend; `rand_core`
+# gives us the OsRng facade. Locked 2026-04-15 per expert review B1.
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[features]
+default = []
+python = ["pyo3"]
+# DANGEROUS: enables deterministic rand_e from a user-supplied seed.
+# ONLY for test vectors / reproducible fuzzing. MUST NOT be enabled in
+# production builds — it trivially breaks DSTU 4145 security proof.
+dangerous_deterministic_k_for_tests = []
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "crypto"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

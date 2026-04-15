@@ -1,0 +1,5 @@
+interface:
+  display_name: "Coordinator"
+  short_description: "Decompose and steer PRRO work"
+  default_prompt: "Use $coordinator to break this PRRO task into research, implementation, testing, and review."
+

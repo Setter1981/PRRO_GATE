@@ -1,0 +1,51 @@
+{
+  "schema_version": "1.0.1",
+  "request_id": "cmd-201",
+  "idempotency_key": "service_in:fn300000001:wb-201",
+  "protocol": "WEBCHECK_XMLRPC",
+  "operation_type": "SERVICE_IN",
+  "fiscal_number": "FN300000001",
+  "route_key": "POS-02",
+  "backend_profile_id": "backend_checkbox_default",
+  "transport_profile_id": "transport_checkbox_rest_default",
+  "channel_owner": "front.webcheck.client",
+  "external_request_id": "wb-201",
+  "business_ts": "2026-03-28T11:25:00Z",
+  "payload": {
+    "method": "ServiceIn",
+    "currency": "UAH",
+    "cashier_id": "cashier-02",
+    "goods_count": 0,
+    "payments_count": 0,
+    "receipt": {
+      "type": "SERVICE_IN",
+      "goods": [],
+      "payments": [],
+      "related_receipt_id": null,
+      "previous_receipt_id": null,
+      "technical_return": null,
+      "delivery": null,
+      "rounding_enabled": null,
+      "totals": {
+        "total_sum": 0,
+        "round_sum": null,
+        "discounts_sum": null,
+        "extra_charge_sum": null
+      }
+    },
+    "service_sum": 12000
+  },
+  "payload_json": "{\"cashier_id\":\"cashier-02\",\"currency\":\"UAH\",\"goods_count\":0,\"method\":\"ServiceIn\",\"payments_count\":0,\"receipt\":{\"delivery\":null,\"goods\":[],\"payments\":[],\"previous_receipt_id\":null,\"related_receipt_id\":null,\"rounding_enabled\":null,\"technical_return\":null,\"totals\":{\"discounts_sum\":null,\"extra_charge_sum\":null,\"round_sum\":null,\"total_sum\":0},\"type\":\"SERVICE_IN\"},\"service_sum\":12000}",
+  "payload_sha256": "16215750b88e0d47a588bab6f9d5cff575ba8c262ad090b5d036218b620d862f",
+  "trace_context": {
+    "source_ip": "192.168.1.51",
+    "source_port": 53111,
+    "session_id": "sess-201",
+    "correlation_id": "corr-201"
+  },
+  "requires_signature": true,
+  "requires_shift": true,
+  "requires_fiscal_number": true,
+  "requires_offline_code": false,
+  "correlation_id": "corr-201"
+}

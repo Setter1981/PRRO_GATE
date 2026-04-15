@@ -1,0 +1,5 @@
+interface:
+  display_name: "Python Implementer"
+  short_description: "Apply minimal-diff PRRO edits"
+  default_prompt: "Use $python-implementer to implement this approved PRRO change with the smallest safe diff."
+

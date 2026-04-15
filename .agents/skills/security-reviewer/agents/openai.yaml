@@ -1,0 +1,5 @@
+interface:
+  display_name: "Security Reviewer"
+  short_description: "Review PRRO invariants and risks"
+  default_prompt: "Use $security-reviewer to review this PRRO change for invariant drift and operational risk."
+

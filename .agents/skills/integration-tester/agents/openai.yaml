@@ -1,0 +1,5 @@
+interface:
+  display_name: "Integration Tester"
+  short_description: "Run targeted PRRO verification"
+  default_prompt: "Use $integration-tester to run the narrowest useful checks for this PRRO change."
+

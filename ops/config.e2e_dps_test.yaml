@@ -1,0 +1,46 @@
+app_name: prro-gateway-e2e-dps-test
+version: 1.4.1
+database:
+  db_path: ./var/e2e_dps_test.sqlite3
+  sql_dir: ./sql
+  auto_migrate: true
+defaults:
+  fiscal_number: "4000162280"
+  backend_profile_id: backend_dps_direct
+  transport_profile_id: transport_dps_grpc_test
+  channel_owner: runtime
+  tax_number: "13667753"
+runtime:
+  environment: test
+  process_immediately: true
+  worker_lease_owner: runtime-worker
+  startup_ready: true
+  reconcile_on_startup: false
+  startup_phase2_budget_seconds: 300
+  graceful_shutdown_timeout_seconds: 30
+crypto:
+  provider: sidecar
+  sidecar_url: http://localhost:8091
+  timeout_seconds: 30
+  breaker_threshold: 5
+  sidecar_connect_timeout: 5
+  sidecar_read_timeout: 30
+ingress:
+  rest:
+    enabled: true
+    host: 127.0.0.1
+    port: 8080
+    response_timeout_seconds: 60
+  xmlrpc:
+    enabled: false
+  maria:
+    enabled: false
+logging:
+  level: DEBUG
+  json_logs: false
+metrics:
+  enabled: true
+  include_process: true
+alerts:
+  enabled: true
+  persist_to_audit: true

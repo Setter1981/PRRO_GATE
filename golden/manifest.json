@@ -1,0 +1,87 @@
+{
+  "examples": [
+    {
+      "path": "examples/canonical_command_sell.json",
+      "schema": "schemas/canonical/CanonicalFiscalCommand.schema.json"
+    },
+    {
+      "path": "examples/canonical_receipt_sell.json",
+      "schema": "schemas/canonical/CanonicalReceipt.schema.json"
+    },
+    {
+      "path": "examples/canonical_receipt_return.json",
+      "schema": "schemas/canonical/CanonicalReceipt.schema.json"
+    },
+    {
+      "path": "examples/canonical_receipt_offline_sell.json",
+      "schema": "schemas/canonical/CanonicalReceipt.schema.json"
+    },
+    {
+      "path": "examples/canonical_receipt_sell_excise_acquiring.json",
+      "schema": "schemas/canonical/CanonicalReceipt.schema.json"
+    },
+    {
+      "path": "examples/canonical_error_shift_channel_switch.json",
+      "schema": "schemas/common/CanonicalError.schema.json"
+    },
+    {
+      "path": "examples/hub_error_duplicate_document.json",
+      "schema": "schemas/cloud/HubError.schema.json"
+    },
+    {
+      "path": "examples/hub_document_envelope.json",
+      "schema": "schemas/cloud/HubDocumentEnvelope.schema.json"
+    }
+  ],
+  "golden": [
+    {
+      "name": "checkbox_rest_sell_online",
+      "adapter": "CHECKBOX_REST",
+      "raw_request": "golden/checkbox_rest_sell_online/raw_request.json",
+      "expected_canonical": "golden/checkbox_rest_sell_online/expected_canonical_command.json",
+      "canonical_schema": "schemas/canonical/CanonicalFiscalCommand.schema.json"
+    },
+    {
+      "name": "checkbox_rest_return",
+      "adapter": "CHECKBOX_REST",
+      "raw_request": "golden/checkbox_rest_return/raw_request.json",
+      "expected_canonical": "golden/checkbox_rest_return/expected_canonical_command.json",
+      "canonical_schema": "schemas/canonical/CanonicalFiscalCommand.schema.json"
+    },
+    {
+      "name": "checkbox_rest_cash_withdrawal",
+      "adapter": "CHECKBOX_REST",
+      "raw_request": "golden/checkbox_rest_cash_withdrawal/raw_request.json",
+      "expected_canonical": "golden/checkbox_rest_cash_withdrawal/expected_canonical_command.json",
+      "canonical_schema": "schemas/canonical/CanonicalFiscalCommand.schema.json"
+    },
+    {
+      "name": "webcheck_sell_online",
+      "adapter": "WEBCHECK_XMLRPC",
+      "raw_request": "golden/webcheck_sell_online/raw_request.json",
+      "expected_canonical": "golden/webcheck_sell_online/expected_canonical_command.json",
+      "canonical_schema": "schemas/canonical/CanonicalFiscalCommand.schema.json"
+    },
+    {
+      "name": "webcheck_service_in",
+      "adapter": "WEBCHECK_XMLRPC",
+      "raw_request": "golden/webcheck_service_in/raw_request.json",
+      "expected_canonical": "golden/webcheck_service_in/expected_canonical_command.json",
+      "canonical_schema": "schemas/canonical/CanonicalFiscalCommand.schema.json"
+    },
+    {
+      "name": "maria_sell_online",
+      "adapter": "MARIA_TCP",
+      "raw_request": "golden/maria_sell_online/raw_request.json",
+      "expected_canonical": "golden/maria_sell_online/expected_canonical_command.json",
+      "canonical_schema": "schemas/canonical/CanonicalFiscalCommand.schema.json"
+    },
+    {
+      "name": "maria_shift_open",
+      "adapter": "MARIA_TCP",
+      "raw_request": "golden/maria_shift_open/raw_request.json",
+      "expected_canonical": "golden/maria_shift_open/expected_canonical_command.json",
+      "canonical_schema": "schemas/canonical/CanonicalFiscalCommand.schema.json"
+    }
+  ]
+}

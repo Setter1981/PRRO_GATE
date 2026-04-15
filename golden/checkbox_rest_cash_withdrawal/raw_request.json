@@ -1,0 +1,34 @@
+{
+  "context": {
+    "request_id": "cmd-102",
+    "fiscal_number": "FN300000001",
+    "route_key": "POS-01",
+    "backend_profile_id": "backend_checkbox_default",
+    "transport_profile_id": "transport_checkbox_rest_default",
+    "channel_owner": "front.cashdesk.app",
+    "business_ts": "2026-03-28T11:20:00Z",
+    "trace_context": {
+      "source_ip": "192.168.1.50",
+      "source_port": 53010,
+      "session_id": "sess-102",
+      "correlation_id": "corr-102"
+    }
+  },
+  "operation": "CASH_WITHDRAWAL",
+  "request": {
+    "payments": [
+      {
+        "type": "CASHLESS",
+        "value": 7000,
+        "label": "CARD",
+        "rrn": "123456789012",
+        "auth_code": "AUTH77",
+        "terminal": "TERM-01",
+        "acquirer_and_seller": "BANK+MERCHANT",
+        "receipt_no": "RCP-77"
+      }
+    ],
+    "cashier_id": "cashier-01",
+    "external_request_id": "ext-102"
+  }
+}

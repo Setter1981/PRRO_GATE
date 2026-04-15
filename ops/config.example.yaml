@@ -1,0 +1,42 @@
+app_name: prro-gateway
+version: 1.4.1
+database:
+  db_path: ./var/prro_gateway.sqlite3
+  sql_dir: ./sql
+  auto_migrate: true
+defaults:
+  fiscal_number: FN-DEFAULT
+  backend_profile_id: backend_checkbox_default
+  transport_profile_id: transport_checkbox_rest_default
+  channel_owner: runtime
+runtime:
+  process_immediately: false
+  worker_lease_owner: runtime-worker
+  startup_ready: true
+  reconcile_on_startup: true
+  startup_phase2_budget_seconds: 300
+  graceful_shutdown_timeout_seconds: 30
+ingress:
+  rest:
+    enabled: true
+    host: 127.0.0.1
+    port: 8080
+    response_timeout_seconds: 60
+  xmlrpc:
+    enabled: true
+    host: 127.0.0.1
+    port: 8090
+  maria:
+    enabled: true
+    host: 127.0.0.1
+    port: 8100
+    line_delimited_json: true
+logging:
+  level: INFO
+  json_logs: true
+metrics:
+  enabled: true
+  include_process: true
+alerts:
+  enabled: true
+  persist_to_audit: true

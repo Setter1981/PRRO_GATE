@@ -1,0 +1,37 @@
+{
+  "context": {
+    "request_id": "cmd-002",
+    "fiscal_number": "FN300000001",
+    "route_key": "POS-02",
+    "backend_profile_id": "backend_checkbox_default",
+    "transport_profile_id": "transport_checkbox_rest_default",
+    "channel_owner": "front.webcheck.client",
+    "business_ts": "2026-03-28T10:20:00Z",
+    "trace_context": {
+      "source_ip": "192.168.1.51",
+      "source_port": 53111,
+      "session_id": "sess-002",
+      "correlation_id": "corr-002"
+    }
+  },
+  "method": "SellCheck",
+  "params": {
+    "rows": [
+      {
+        "code": "PARKING",
+        "name": "Parking service",
+        "price": 5000,
+        "quantity": 1000
+      }
+    ],
+    "payments": [
+      {
+        "type": "CASHLESS",
+        "value": 5000,
+        "label": "CARD"
+      }
+    ],
+    "cashier_id": "cashier-02",
+    "doc_id": "wb-001"
+  }
+}
