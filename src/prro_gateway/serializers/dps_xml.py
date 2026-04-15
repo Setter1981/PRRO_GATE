@@ -152,9 +152,11 @@ def _build_check(*, fiscal_number: str, tax_number: str, local_number: int,
     When tax_groups is provided, builds full <E> with <TX> sub-elements
     containing calculated TXSM/DTSM per ФСКО protocol.
     """
+    header_xml = ''
     items_xml = ''
     discounts_xml = ''
     payments_xml = ''
+    footer_xml = ''
     item_no = 1
     total_sum = 0
     p_item_numbers: list[int] = []  # N values of <P> elements — for check-level discount <NI>
@@ -166,6 +168,18 @@ def _build_check(*, fiscal_number: str, tax_number: str, local_number: int,
         goods = receipt.get('goods', []) if isinstance(receipt.get('goods'), list) else []
         payments = receipt.get('payments', []) if isinstance(receipt.get('payments'), list) else []
         totals = receipt.get('totals', {}) if isinstance(receipt.get('totals'), dict) else {}
+
+        # Header text lines → <L> elements before first <P>
+        receipt_header = receipt.get('header') or ''
+        for line in receipt_header.split('\n'):
+            line = line.strip()
+            if line:
+                header_xml += _tag('L', {'N': item_no, 'NM': line})
+                item_no += 1
+
+        # Footer text lines → collected, emitted after payments before <E>
+        receipt_footer = receipt.get('footer') or ''
+        footer_lines = [ln.strip() for ln in receipt_footer.split('\n') if ln.strip()]
 
         for g in goods:
             if not isinstance(g, dict):
@@ -293,6 +307,11 @@ def _build_check(*, fiscal_number: str, tax_number: str, local_number: int,
             payments_xml += _tag('M', m_attrs)
             item_no += 1
 
+        # Footer text lines → <L> after all payments, before <E>
+        for line in footer_lines:
+            footer_xml += _tag('L', {'N': item_no, 'NM': line})
+            item_no += 1
+
     # Build <E> element
     total_xml = _build_e_element(
         item_no=item_no, total_sum=total_sum, fiscal_number=fiscal_number,
@@ -301,7 +320,8 @@ def _build_check(*, fiscal_number: str, tax_number: str, local_number: int,
 
     return _tag('RQ', rq_attrs or {'V': '1'},
         _tag('DAT', {'DI': local_number, 'FN': fiscal_number, 'TN': tax_number, 'V': '1', 'ZN': z_number},
-            _tag('C', {'T': check_xml_type}, items_xml + discounts_xml + payments_xml + total_xml)
+            _tag('C', {'T': check_xml_type},
+                 header_xml + items_xml + discounts_xml + payments_xml + footer_xml + total_xml)
             + _tag('TS', content=ts_str)
         ) + _tag('MAC', content=previous_hash)
     )
@@ -317,15 +337,27 @@ def _build_service(*, fiscal_number: str, tax_number: str, local_number: int,
     T="0" = cash. No <P> or <M> elements.
     """
     service_sum = '0'
+    header_xml = ''
+    item_no = 1
     if isinstance(payload, dict):
         service_sum = str(payload.get('service_sum', 0))
+        receipt = payload.get('receipt') if isinstance(payload.get('receipt'), dict) else {}
+        receipt_header = (receipt.get('header') or '') if isinstance(receipt, dict) else ''
+        for line in receipt_header.split('\n'):
+            line = line.strip()
+            if line:
+                header_xml += _tag('L', {'N': item_no, 'NM': line})
+                item_no += 1
 
     io_tag = 'I' if direction == 'IN' else 'O'
+    io_n = item_no
+    e_n = item_no + 1
     return _tag('RQ', rq_attrs or {'V': '1'},
         _tag('DAT', {'DI': local_number, 'FN': fiscal_number, 'TN': tax_number, 'V': '1', 'ZN': z_number},
             _tag('C', {'T': '2'},
-                _tag(io_tag, {'N': '1', 'NM': 'ГОТІВКА', 'SM': service_sum, 'T': '0'})
-                + _tag('E', {'N': '2'})
+                header_xml
+                + _tag(io_tag, {'N': io_n, 'NM': 'ГОТІВКА', 'SM': service_sum, 'T': '0'})
+                + _tag('E', {'N': e_n})
             ) + _tag('TS', content=ts_str)
         ) + _tag('MAC', content=previous_hash)
     )
@@ -448,6 +480,15 @@ def _build_z_report(*, fiscal_number: str, tax_number: str, local_number: int,
     check_count = z_data.get('check_count', {})
     if isinstance(check_count, dict):
         z_content += _tag('NC', {'NI': check_count.get('ni', 0), 'NO': check_count.get('no', 0)})
+
+    # <EPZ> — summary of cash withdrawals via ЕПЗ (electronic payment instruments)
+    epz_sums = z_data.get('epz_sums')
+    if isinstance(epz_sums, dict) and epz_sums:
+        z_content += _tag('EPZ', {
+            'EPC': epz_sums.get('epc', 0),
+            'EPCS': epz_sums.get('epcs', 0),
+            'EPSM': epz_sums.get('epsm', 0),
+        })
 
     return _tag('RQ', rq_attrs or {'V': '1'},
         _tag('DAT', {'DI': local_number, 'FN': fiscal_number, 'TN': tax_number, 'V': '1', 'ZN': z_number},
