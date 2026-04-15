@@ -153,6 +153,7 @@ def _build_check(*, fiscal_number: str, tax_number: str, local_number: int,
     containing calculated TXSM/DTSM per ФСКО protocol.
     """
     items_xml = ''
+    discounts_xml = ''
     payments_xml = ''
     item_no = 1
     total_sum = 0
@@ -188,12 +189,44 @@ def _build_check(*, fiscal_number: str, tax_number: str, local_number: int,
                 p_attrs['TX1'] = g['tax_id_2']
             excise_marks = g.get('excise_barcodes') or []
             ca_xml = ''.join(_tag('CA', {'CA': m}) for m in excise_marks)
+            p_item_no = item_no
             items_xml += _tag('P', p_attrs, ca_xml)
             item_no += 1
             # Accumulate per-group sums
             g_tax_id = g.get('tax_id')
             if g_tax_id is not None:
                 group_sums[str(g_tax_id)] = group_sums.get(str(g_tax_id), 0) + int(g.get('sum', 0))
+
+            # Per-item discounts → <D> (знижка) or <S> (націнка)
+            for d in (g.get('discounts') or []):
+                if not isinstance(d, dict):
+                    continue
+                d_value = int(d.get('value', 0))
+                if d_value == 0:
+                    continue
+                d_type = d.get('type', 'DISCOUNT')
+                d_mode = d.get('mode', 'VALUE')
+                xml_tag = 'D' if d_type != 'EXTRA_CHARGE' else 'S'
+                d_attrs: dict[str, object] = {
+                    'N': item_no,
+                    'NI': p_item_no,
+                    'TR': 0,
+                }
+                if d_mode == 'PERCENT':
+                    d_attrs['TY'] = 1
+                    d_attrs['PR'] = f'{d_value:.2f}'
+                    d_attrs['SM'] = round(int(g.get('sum', 0)) * d_value / 100)
+                else:
+                    d_attrs['TY'] = 0
+                    d_attrs['SM'] = d_value
+                if d.get('name'):
+                    d_attrs['NM'] = d['name']
+                if d.get('privilege'):
+                    d_attrs['DN'] = d['privilege']
+                if d.get('tax_code'):
+                    d_attrs['TX'] = d['tax_code']
+                discounts_xml += _tag(xml_tag, d_attrs)
+                item_no += 1
 
         total_sum = totals.get('total_sum', 0) or 0
         all_payments_sum = sum(int(p.get('amount', 0)) for p in payments if isinstance(p, dict))
@@ -239,7 +272,7 @@ def _build_check(*, fiscal_number: str, tax_number: str, local_number: int,
 
     return _tag('RQ', rq_attrs or {'V': '1'},
         _tag('DAT', {'DI': local_number, 'FN': fiscal_number, 'TN': tax_number, 'V': '1', 'ZN': z_number},
-            _tag('C', {'T': check_xml_type}, items_xml + payments_xml + total_xml)
+            _tag('C', {'T': check_xml_type}, items_xml + discounts_xml + payments_xml + total_xml)
             + _tag('TS', content=ts_str)
         ) + _tag('MAC', content=previous_hash)
     )
