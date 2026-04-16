@@ -242,12 +242,15 @@ def test_gate3i_breaker_open_gives_error_retryable_with_message(tmp_path: Path) 
         f'Gate 3i: breaker-open response must be 200: got {r2.status_code}. {r2.text}'
     )
     body = r2.json()
-    assert body.get('document_state') == 'ERROR_RETRYABLE', (
-        f'Gate 3i: breaker-open must give ERROR_RETRYABLE: got {body.get("document_state")!r}'
+    # C1 fast-path guard: CRYPTO_DEGRADED rejects before document creation,
+    # so document_state is None (no LND consumed — correct behavior).
+    assert body.get('document_state') is None, (
+        f'Gate 3i: CRYPTO_DEGRADED fast-path must not create a document: got {body.get("document_state")!r}'
     )
-    assert body.get('canonical_error_code') == 'CRYPTO_PROVIDER_UNAVAILABLE', (
-        f'Gate 3i: canonical_error_code must be CRYPTO_PROVIDER_UNAVAILABLE: '
-        f'got {body.get("canonical_error_code")!r}'
+    # C1 fast-path: no document created → response uses 'error_code' (not 'canonical_error_code')
+    assert body.get('error_code') == 'CRYPTO_PROVIDER_UNAVAILABLE', (
+        f'Gate 3i: error_code must be CRYPTO_PROVIDER_UNAVAILABLE: '
+        f'got {body.get("error_code")!r}'
     )
     assert 'circuit breaker' in (body.get('error_message') or ''), (
         f'Gate 3i: error_message must mention circuit breaker: got {body.get("error_message")!r}'
@@ -259,13 +262,14 @@ def test_gate3i_breaker_open_gives_error_retryable_with_message(tmp_path: Path) 
         f'got {provider.call_count}'
     )
 
-    doc_id = body.get('document_id')
+    # C1 fast-path: second request has no document (no LND consumed).
+    assert body.get('document_id') is None, (
+        f'Gate 3i: CRYPTO_DEGRADED fast-path must not set document_id: got {body.get("document_id")!r}'
+    )
     with c.connect() as conn:
-        doc = FiscalDocumentRepository.get_by_id(conn, doc_id)
         prepared = conn.execute(
             "SELECT document_id FROM fiscal_documents WHERE state='PREPARED'"
         ).fetchall()
-    assert doc.state == DocumentState.ERROR_RETRYABLE
     assert len(prepared) == 0, f'Gate 3i: no doc must remain in PREPARED: {prepared}'
 
 

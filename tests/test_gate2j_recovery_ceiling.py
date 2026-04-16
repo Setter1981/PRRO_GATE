@@ -233,9 +233,10 @@ def test_gate2j_ceiling_hit_transitions_to_manual(tmp_path: Path) -> None:
 def test_gate2j_manual_state_excluded_from_reconciliation(tmp_path: Path) -> None:
     """
     After doc reaches REQUIRES_MANUAL_RECONCILIATION:
-    - Next reconciliation startup selects 0 candidates (checked==0)
-    - The doc is not retried, not counted as still_pending
-    - doc.state remains REQUIRES_MANUAL_RECONCILIATION (no accidental transition)
+    - Next reconciliation startup polls the doc (checked==1) — auto-close on DPS ACK/REJECTED is now supported
+    - When DPS returns retryable (doc has no transport_request_id → no HTTP call), the doc is counted as still_pending
+    - doc.state remains REQUIRES_MANUAL_RECONCILIATION (no accidental transition on retryable response)
+    - recovery_attempts must not increase after state leaves standard retryable loop
     """
     MAX = 2
     db_name = 'gate2j_b.sqlite3'
@@ -262,13 +263,15 @@ def test_gate2j_manual_state_excluded_from_reconciliation(tmp_path: Path) -> Non
         pass
 
     report = c_post.last_startup_report
-    assert report.reconciliation_checked == 0, (
-        f'REQUIRES_MANUAL_RECONCILIATION doc must not be a reconciliation candidate: '
+    assert report.reconciliation_checked == 1, (
+        f'REQUIRES_MANUAL_RECONCILIATION doc must be polled (auto-close on ACK/REJECTED): '
         f'checked={report.reconciliation_checked}'
+    )
+    assert report.reconciliation_still_pending == 1, (
+        f'Retryable DPS response must count as still_pending: got {report.reconciliation_still_pending}'
     )
     assert report.reconciliation_retryable == 0
     assert report.reconciliation_manual == 0
-    assert report.reconciliation_still_pending == 0
 
     with c_post.connect() as conn:
         doc_after = FiscalDocumentRepository.get_by_id(conn, sell_doc_id)

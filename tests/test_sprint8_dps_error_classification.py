@@ -190,7 +190,7 @@ def test_ec7_mac_recovery_resends_and_acks(conn) -> None:
     class _MacRecoveryCrypto:
         def sign(self, *, payload_json, **kw):
             return f'SIGNED::{payload_json[:40]}'
-        def sign_raw(self, *, data):
+        def sign_raw(self, *, data, document_id=None):
             return b'\x30\x82SIGNED_RAW'
 
     class _MacRecoveryTransport:
@@ -271,7 +271,7 @@ def test_ec8_mac_recovery_persists_seed(conn) -> None:
     call_count = 0
 
     class _Crypto:
-        def sign_raw(self, *, data):
+        def sign_raw(self, *, data, document_id=None):
             return b'\x30\x82SIGNED'
 
     class _Transport:
@@ -349,7 +349,7 @@ def test_ec9_second_failure_is_retryable_not_loop(conn) -> None:
     call_count = 0
 
     class _Crypto:
-        def sign_raw(self, *, data):
+        def sign_raw(self, *, data, document_id=None):
             return b'\x30\x82SIGNED'
 
     class _AlwaysFailTransport:
@@ -436,7 +436,7 @@ def test_ec10_next_doc_mac_uses_recovered_xml(conn) -> None:
     signed_xmls = []  # capture what crypto signs for the second doc
 
     class _SpyCrypto:
-        def sign_raw(self, *, data):
+        def sign_raw(self, *, data, document_id=None):
             signed_xmls.append(data)
             return b'\x30\x82SIGNED_RAW'
 
@@ -575,7 +575,7 @@ def test_rl2_write_path_rate_limit_status(conn) -> None:
     conn.commit()
 
     class _Crypto:
-        def sign_raw(self, *, data):
+        def sign_raw(self, *, data, document_id=None):
             return b'\x30\x82SIGNED'
 
     class _RateLimitedTransport:
@@ -648,7 +648,7 @@ def test_rl3_retry_after_in_canonical_error(conn) -> None:
     conn.commit()
 
     class _Crypto:
-        def sign_raw(self, *, data):
+        def sign_raw(self, *, data, document_id=None):
             return b'\x30\x82SIGNED'
 
     class _RateLimitedTransport:

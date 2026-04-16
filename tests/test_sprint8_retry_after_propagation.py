@@ -65,7 +65,7 @@ def _create_rate_limited_doc(conn, *, doc_suffix: str, lnd_offset: int = 99) -> 
 
     class _Crypto:
         def sign(self, **kw): return 'signed'
-        def sign_raw(self, *, data): return b'\x30\x82SIGNED'
+        def sign_raw(self, *, data, document_id=None): return b'\x30\x82SIGNED'
 
     class _RateLimitTransport:
         def send(self, **kw):
@@ -124,7 +124,7 @@ def test_ra1_rate_limited_persists_submission_status(conn) -> None:
     conn.commit()
 
     class _Crypto:
-        def sign_raw(self, *, data): return b'\x30\x82SIGNED'
+        def sign_raw(self, *, data, document_id=None): return b'\x30\x82SIGNED'
 
     class _RateLimitTransport:
         def send(self, **kw):
@@ -243,7 +243,7 @@ def test_ra5_post_ingress_retry_after(tmp_path) -> None:
 
     class _Crypto:
         def sign(self, **kw): return 'signed'
-        def sign_raw(self, *, data): return b'\x30\x82SIGNED'
+        def sign_raw(self, *, data, document_id=None): return b'\x30\x82SIGNED'
 
     class _RateLimitTransport:
         def send(self, **kw):
@@ -288,7 +288,7 @@ def test_ra6_get_document_retry_after(tmp_path) -> None:
 
     class _Crypto:
         def sign(self, **kw): return 'signed'
-        def sign_raw(self, *, data): return b'\x30\x82SIGNED'
+        def sign_raw(self, *, data, document_id=None): return b'\x30\x82SIGNED'
 
     class _RateLimitTransport:
         def send(self, **kw):
@@ -344,7 +344,7 @@ def test_ra7_non_default_retry_after_propagated(tmp_path) -> None:
 
     class _Crypto:
         def sign(self, **kw): return 'signed'
-        def sign_raw(self, *, data): return b'\x30\x82SIGNED'
+        def sign_raw(self, *, data, document_id=None): return b'\x30\x82SIGNED'
 
     class _RateLimit600:
         def send(self, **kw):

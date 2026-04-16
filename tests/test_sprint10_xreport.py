@@ -21,7 +21,7 @@ from starlette.testclient import TestClient
 
 class _Crypto:
     def sign(self, **kw): return 'signed'
-    def sign_raw(self, *, data): return b'\x30\x82SIGNED'
+    def sign_raw(self, *, data, document_id=None): return b'\x30\x82SIGNED'
 
 
 class _OkTransport:

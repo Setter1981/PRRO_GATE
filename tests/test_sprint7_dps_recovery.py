@@ -82,7 +82,7 @@ def test_dr1_reconciliation_lastchk_acks_sent_dps_doc(conn) -> None:
     class _MockCrypto:
         def sign(self, *, document_id, payload_json):
             return payload_json
-        def sign_raw(self, *, data):
+        def sign_raw(self, *, data, document_id=None):
             return b'SIGNED::' + data
 
     svc = ReconciliationService(

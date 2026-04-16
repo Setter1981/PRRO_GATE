@@ -95,7 +95,7 @@ class _Crypto:
     def sign(self, **kw):
         self.call_count += 1
         return 'signed'
-    def sign_raw(self, *, data):
+    def sign_raw(self, *, data, document_id=None):
         self.call_count += 1
         return b'\x30\x82SIGNED'
 

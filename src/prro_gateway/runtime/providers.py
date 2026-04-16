@@ -65,19 +65,26 @@ class SidecarCryptoClient:
             ) from exc
 
 
-    def sign_raw(self, *, data: bytes) -> bytes:
+    def sign_raw(self, *, data: bytes, document_id: str | None = None) -> bytes:
         """Sign arbitrary bytes and return CMS/PKCS#7 SignedData (DER).
 
         Sidecar contract:
           POST {base_url}/sign_raw
-          Request body (JSON): {"payload_base64": str}
+          Request body (JSON): {"payload_base64": str, "document_id": str | null}
           Response body (JSON): {"signed_base64": str}
+
+        document_id is an optional idempotency hint (M4): sidecars that support it
+        can deduplicate concurrent sign_raw calls for the same document (e.g. after
+        a timeout+retry). Sidecars that do not recognise the field must ignore it.
         """
         import base64
+        body: dict = {'payload_base64': base64.b64encode(data).decode('ascii')}
+        if document_id is not None:
+            body['document_id'] = document_id
         try:
             resp = self._http.post(
                 f'{self.base_url}/sign_raw',
-                json={'payload_base64': base64.b64encode(data).decode('ascii')},
+                json=body,
             )
             resp.raise_for_status()
             result = resp.json()
@@ -105,9 +112,9 @@ class SidecarCryptoProvider:
     def sign(self, *, document_id: str, payload_json: str) -> str:
         return self.client.sign(document_id=document_id, payload_json=payload_json)
 
-    def sign_raw(self, *, data: bytes) -> bytes:
+    def sign_raw(self, *, data: bytes, document_id: str | None = None) -> bytes:
         """Sign arbitrary bytes via sidecar's /sign_raw endpoint. Returns CMS/PKCS#7 DER bytes."""
-        return self.client.sign_raw(data=data)
+        return self.client.sign_raw(data=data, document_id=document_id)
 
 
 __all__ = ["PassthroughCryptoProvider", "SidecarCryptoClient", "SidecarCryptoProvider"]

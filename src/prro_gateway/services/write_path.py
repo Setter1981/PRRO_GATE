@@ -33,6 +33,7 @@ from ..repositories import (
     DuplicateExciseMarkError,
     ExciseRepository,
     FiscalDocumentRepository,
+    FiscalNumberConfigRepository,
     InboxRepository,
     NodeStateRepository,
     OfflineRepository,
@@ -59,6 +60,10 @@ class WorkerProcessResult(StrictModel):
     change: int | None = None
     rounded_sum: int | None = None
     rounding: int | None = None
+    # M3: non-zero when X_REPORT was served while offline backlog is unsynced.
+    # The totals in the report reflect only DPS-confirmed documents; the operator
+    # must be aware that the figures are incomplete until sync completes.
+    offline_backlog_warning: int | None = None
 
 
 @dataclass
@@ -83,16 +88,25 @@ class WritePathWorker:
     MAX_OFFLINE_CONTINUOUS_SECONDS = 36 * 60 * 60
     MAX_OFFLINE_MONTH_SECONDS = 168 * 60 * 60
 
-    def __init__(self, *, crypto_provider: CryptoProvider, transport_client: TransportClient, lease_timeout_seconds: int = DEFAULT_LEASE_TIMEOUT_SECONDS, crypto_timeout_seconds: float | None = None, crypto_breaker_threshold: int = 0, tax_number: str = '', require_return_linkage: bool = True, validate_timestamps: bool = False) -> None:
+    def __init__(self, *, crypto_provider: CryptoProvider, transport_client: TransportClient, lease_timeout_seconds: int = DEFAULT_LEASE_TIMEOUT_SECONDS, crypto_timeout_seconds: float | None = None, crypto_breaker_threshold: int = 0, crypto_breaker_recovery_successes: int = 1, tax_number: str = '', require_return_linkage: bool = True, validate_timestamps: bool = False, cert_watch_service=None, max_sign_retries: int = 5) -> None:
         self.crypto_provider = crypto_provider
         self.transport_client = transport_client
         self.tax_number = tax_number
         self.lease_timeout_seconds = lease_timeout_seconds
         self.crypto_timeout_seconds = crypto_timeout_seconds
         self.crypto_breaker_threshold = crypto_breaker_threshold
+        # Number of consecutive successful signs required before the failure counter is reset.
+        # Default 1 = current behaviour (any single success closes the breaker).
+        # Set to 3+ to tolerate flapping sidecars without prematurely re-opening.
+        self.crypto_breaker_recovery_successes = crypto_breaker_recovery_successes
         self.require_return_linkage = require_return_linkage
         self.validate_timestamps = validate_timestamps
+        # cert_watch: optional side-channel for certificate revocation
+        # (Sprint 13). Hooks are no-ops when the service isn't wired.
+        self.cert_watch_service = cert_watch_service
+        self.max_sign_retries = max_sign_retries
         self._crypto_consecutive_failures: int = 0
+        self._crypto_consecutive_successes: int = 0
         self.logger = get_logger("prro_gateway.write_path")
 
     @property
@@ -100,9 +114,14 @@ class WritePathWorker:
         return self.crypto_breaker_threshold > 0 and self._crypto_consecutive_failures >= self.crypto_breaker_threshold
 
     def reset_crypto_breaker(self) -> int:
-        """Reset consecutive failure counter to 0. Returns the previous value."""
+        """Reset consecutive failure counter to 0. Returns the previous value.
+
+        Also resets the consecutive-success counter so hysteresis starts fresh
+        on the next probe cycle (explicit operator reset bypasses hysteresis).
+        """
         previous = self._crypto_consecutive_failures
         self._crypto_consecutive_failures = 0
+        self._crypto_consecutive_successes = 0
         return previous
 
     def process_next(self, conn: sqlite3.Connection, *, fiscal_number: str, lease_owner: str = 'worker-1') -> WorkerProcessResult:
@@ -118,7 +137,10 @@ class WritePathWorker:
             return result
 
         assert ctx.inbox is not None and ctx.command is not None and ctx.document is not None
-        if self._requires_local_sign(conn, ctx):
+        if ctx.document.state in {DocumentState.SIGNED, DocumentState.ENCRYPTED}:
+            # Crash-resume: signature already persisted — skip _stage_sign entirely.
+            self.logger.info("stage_sign_skipped_resume", extra={"extra_fields": {"document_id": ctx.document.document_id, "state": ctx.document.state}})
+        elif self._requires_local_sign(conn, ctx):
             ctx, result = self._stage_sign(conn, ctx)
             if result is not None:
                 return result
@@ -152,12 +174,66 @@ class WritePathWorker:
             return ctx, result
         ctx.command = command
 
+        # STOP_MODE fast-path: DB integrity check failed — reject everything except GET_STATUS.
+        node_state = NodeStateRepository.get_state(conn, ctx.fiscal_number)
+        if node_state is not None and node_state.mode == NodeMode.STOP_MODE and command.operation_type not in {OperationType.GET_STATUS}:
+            result = self._mark_error_locked(
+                conn, ctx=ctx,
+                error=build_canonical_error(CanonicalErrorCode.STOP_MODE_ACTIVE),
+                document_id=None, state=None,
+            )
+            return ctx, result
+
+        # CRYPTO_DEGRADED fast-path: signing is broken — reject all fiscal ops that require
+        # a document (anything except management operations). This prevents LND allocation
+        # and document creation that would be immediately discarded when _stage_sign fails.
+        # Guard only fires when the breaker is actually open (counter >= threshold).
+        # When the counter has been reset to 0 (half-open probe), the request is allowed
+        # through so _stage_sign can probe the sidecar and recover mode automatically.
+        if (
+            node_state is not None
+            and node_state.mode == NodeMode.CRYPTO_DEGRADED
+            and self.crypto_breaker_open
+            and command.operation_type not in {OperationType.GO_OFFLINE, OperationType.GO_ONLINE, OperationType.ASK_OFFLINE_CODES, OperationType.GET_STATUS}
+        ):
+            result = self._mark_error_locked(
+                conn, ctx=ctx,
+                error=build_canonical_error(CanonicalErrorCode.CRYPTO_PROVIDER_UNAVAILABLE, message='Node is CRYPTO_DEGRADED: crypto circuit breaker is open.'),
+                document_id=None, state=None,
+            )
+            # Emit same audit event as _stage_sign breaker path so operator audit trail is consistent.
+            conn.execute('BEGIN IMMEDIATE')
+            AuditRepository.log_event(
+                conn,
+                entity_type='CRYPTO',
+                entity_id='breaker',
+                event_type='CRYPTO_BREAKER_BLOCKED',
+                severity='ERROR',
+                event_payload_json=dumps_json({
+                    'consecutive_failures': self._crypto_consecutive_failures,
+                    'threshold': self.crypto_breaker_threshold,
+                    'fiscal_number': ctx.fiscal_number,
+                    'document_id': None,
+                }),
+            )
+            conn.commit()
+            return ctx, result
+
+        # BLOCKED fast-path: reject all fiscal ops before receipt validation — invariant 5.
+        if node_state is not None and node_state.mode == NodeMode.BLOCKED and command.operation_type not in {OperationType.GO_OFFLINE, OperationType.GO_ONLINE, OperationType.ASK_OFFLINE_CODES, OperationType.GET_STATUS}:
+            result = self._mark_error_locked(
+                conn, ctx=ctx,
+                error=build_canonical_error(CanonicalErrorCode.OFFLINE_LIMIT_REACHED, message='Node is BLOCKED: monthly offline time limit reached.'),
+                document_id=None, state=None,
+            )
+            return ctx, result
+
         guard_error = self._guard_preconditions(conn, inbox=inbox, command=command)
         if guard_error is not None:
             result = self._mark_error_locked(conn, ctx=ctx, error=guard_error, document_id=None, state=None)
             return ctx, result
 
-        node_state = NodeStateRepository.get_state(conn, ctx.fiscal_number)
+        # node_state already read above for STOP_MODE / BLOCKED fast-paths; reuse within same transaction.
         active_shift = ShiftRepository.get_active_shift(conn, ctx.fiscal_number)
         if node_state is None:
             result = self._mark_error_locked(
@@ -195,6 +271,39 @@ class WritePathWorker:
             result = self._mark_error_locked(conn, ctx=ctx, error=err, document_id=None, state=None)
             return ctx, result
 
+        # Management commands: no fiscal document, no LND, no sign/send.
+        if command.operation_type in {OperationType.GO_OFFLINE, OperationType.GO_ONLINE, OperationType.ASK_OFFLINE_CODES, OperationType.GET_STATUS}:
+            return self._handle_management_command_locked(conn, ctx=ctx)
+
+        # Sign-retry resume: if a prior attempt failed at sign stage (ERROR_RETRYABLE,
+        # transport_request_id IS NULL — never sent), reuse the existing document so that
+        # any already-allocated sequence numbers (lnd, z_report_number) are preserved.
+        # This prevents Z-number gaps when the sidecar is temporarily unavailable.
+        _existing = FiscalDocumentRepository.get_by_request_id(conn, inbox.request_id)
+        if (
+            _existing is not None
+            and _existing.state == DocumentState.ERROR_RETRYABLE
+            and _existing.transport_request_id is None
+        ):
+            FiscalDocumentRepository.update_state(conn, document_id=_existing.document_id, state=DocumentState.PREPARED)
+            ctx.document = FiscalDocumentRepository.get_by_id(conn, _existing.document_id)
+            conn.commit()
+            return ctx, None
+        elif _existing is not None and _existing.state in {DocumentState.SIGNED, DocumentState.ENCRYPTED}:
+            # Crash-resume: process crashed after SIGNED commit but before SENT commit.
+            # The document already has a valid signature — restore it and skip re-sign so that
+            # no new LND is allocated and no duplicate document is created.
+            ctx.document = _existing
+            _signed_bytes = DocumentFilesRepository.get_content(
+                conn, document_id=_existing.document_id, file_kind=FileKind.SIGNED_XML
+            )
+            # Restore signed artifact: bytes for DPS (CMS/PKCS#7), str for canonical JSON path.
+            # _stage_send_or_offline handles both via isinstance checks.
+            if _signed_bytes is not None:
+                ctx.signed_payload = _signed_bytes  # type: ignore[assignment]
+            conn.commit()
+            return ctx, None
+
         fs_mode = 'ONLINE'
         offline_session_id: str | None = None
         offline_fiscal_no: int | None = None
@@ -204,8 +313,14 @@ class WritePathWorker:
             if offline_session is None:
                 result = self._mark_error_locked(conn, ctx=ctx, error=build_canonical_error(CanonicalErrorCode.OFFLINE_MODE_REQUIRED, message='Node is OFFLINE but no open offline session exists.'), document_id=None, state=None)
                 return ctx, result
-            offline_limit_error = self._check_offline_limits(node_state=node_state, offline_session=offline_session)
+            _fn_cfg = FiscalNumberConfigRepository.get_or_default(conn, ctx.fiscal_number)
+            offline_limit_error, _should_block = self._check_offline_limits(
+                node_state=node_state, offline_session=offline_session, fn_config=_fn_cfg,
+            )
             if offline_limit_error is not None:
+                if _should_block:
+                    # Update mode within the active outer transaction; _mark_error_locked commits it.
+                    NodeStateRepository.update_mode(conn, fiscal_number=ctx.fiscal_number, mode=NodeMode.BLOCKED)
                 result = self._mark_error_locked(conn, ctx=ctx, error=offline_limit_error, document_id=None, state=None)
                 return ctx, result
             try:
@@ -278,10 +393,7 @@ class WritePathWorker:
                 config = {}
             if isinstance(config, dict) and 'require_local_sign' in config:
                 return bool(config['require_local_sign'])
-        backend_profile = BackendProfileRepository.get_by_id(conn, ctx.document.backend_profile_id)
-        if backend_profile is not None and backend_profile.backend_type == BackendType.CHECKBOX_CLOUD_COMPAT:
-            return True
-        return True
+        return True  # default: sign unless explicitly disabled via require_local_sign: false in transport profile config
 
     def _resolve_dps_mac(self, conn: sqlite3.Connection, ctx: WorkerContext) -> str:
         """Compute authoritative MAC for DPS XML: SHA-256 of previous document's unsigned XML payload.
@@ -370,6 +482,7 @@ class WritePathWorker:
     def _stage_sign(self, conn: sqlite3.Connection, ctx: WorkerContext) -> tuple[WorkerContext, WorkerProcessResult | None]:
         assert ctx.document is not None and ctx.inbox is not None and ctx.command is not None
         if self.crypto_breaker_threshold > 0 and self._crypto_consecutive_failures >= self.crypto_breaker_threshold:
+            # H2: new_node_mode ensures document error + mode update are atomic.
             result = self._mark_document_and_inbox_error(
                 conn,
                 ctx=ctx,
@@ -379,6 +492,7 @@ class WritePathWorker:
                     CanonicalErrorCode.CRYPTO_PROVIDER_UNAVAILABLE,
                     message=f'crypto circuit breaker open after {self._crypto_consecutive_failures} consecutive failures',
                 ),
+                new_node_mode=NodeMode.CRYPTO_DEGRADED,
             )
             # Audit every blocked doc so operator sees full impact (after error tx committed)
             conn.execute('BEGIN IMMEDIATE')
@@ -404,10 +518,13 @@ class WritePathWorker:
         try:
             if is_dps_xml and hasattr(self.crypto_provider, 'sign_raw'):
                 # DPS path: use sign_raw() → returns bytes (CMS/PKCS#7 DER)
+                # M4: pass document_id as idempotency hint so sidecar can deduplicate
+                # concurrent calls from timeout+retry scenarios.
                 sign_data = sign_input.encode('utf-8')
+                _doc_id = ctx.document.document_id
                 if self.crypto_timeout_seconds is not None:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _executor:
-                        _future = _executor.submit(self.crypto_provider.sign_raw, data=sign_data)
+                        _future = _executor.submit(self.crypto_provider.sign_raw, data=sign_data, document_id=_doc_id)
                         try:
                             signed_payload = _future.result(timeout=self.crypto_timeout_seconds)
                         except concurrent.futures.TimeoutError:
@@ -415,7 +532,7 @@ class WritePathWorker:
                                 f'crypto sign_raw() timed out after {self.crypto_timeout_seconds}s'
                             )
                 else:
-                    signed_payload = self.crypto_provider.sign_raw(data=sign_data)
+                    signed_payload = self.crypto_provider.sign_raw(data=sign_data, document_id=_doc_id)
             else:
                 # Non-DPS path: use sign() → returns str
                 if self.crypto_timeout_seconds is not None:
@@ -435,28 +552,67 @@ class WritePathWorker:
                     signed_payload = self.crypto_provider.sign(document_id=ctx.document.document_id, payload_json=sign_input)
         except CryptoProviderUnavailableError as exc:
             self._crypto_consecutive_failures += 1
+            self._crypto_consecutive_successes = 0  # reset hysteresis on any failure
+            _should_requeue = (
+                ctx.inbox is not None
+                and ctx.inbox.requeue_count < self.max_sign_retries
+            )
+            _threshold_reached = (
+                self.crypto_breaker_threshold > 0
+                and self._crypto_consecutive_failures >= self.crypto_breaker_threshold
+            )
+            # H2: pass new_node_mode so document error + mode update commit atomically.
             result = self._mark_document_and_inbox_error(
                 conn,
                 ctx=ctx,
                 document_id=ctx.document.document_id,
                 state=DocumentState.ERROR_RETRYABLE,
                 error=build_canonical_error(CanonicalErrorCode.CRYPTO_PROVIDER_UNAVAILABLE, message=str(exc)),
+                requeue_inbox=_should_requeue,
+                new_node_mode=NodeMode.CRYPTO_DEGRADED if _threshold_reached else None,
             )
             return ctx, result
         except Exception as exc:
             self._crypto_consecutive_failures += 1
+            self._crypto_consecutive_successes = 0  # reset hysteresis on any failure
+            _should_requeue = (
+                ctx.inbox is not None
+                and ctx.inbox.requeue_count < self.max_sign_retries
+            )
+            _threshold_reached = (
+                self.crypto_breaker_threshold > 0
+                and self._crypto_consecutive_failures >= self.crypto_breaker_threshold
+            )
+            # H2: pass new_node_mode so document error + mode update commit atomically.
             result = self._mark_document_and_inbox_error(
                 conn,
                 ctx=ctx,
                 document_id=ctx.document.document_id,
                 state=DocumentState.ERROR_RETRYABLE,
                 error=build_canonical_error(CanonicalErrorCode.CRYPTO_PROVIDER_UNAVAILABLE, message=f'{type(exc).__name__}: {exc}'),
+                requeue_inbox=_should_requeue,
+                new_node_mode=NodeMode.CRYPTO_DEGRADED if _threshold_reached else None,
             )
             return ctx, result
 
-        self._crypto_consecutive_failures = 0
+        # Hysteresis: require N consecutive successes before closing the breaker.
+        # Prevents flapping sidecar (fail-success-fail) from resetting the counter
+        # after a single lucky success. Default recovery_successes=1 preserves the
+        # original single-success close behaviour.
+        self._crypto_consecutive_successes += 1
+        _recovery_confirmed = (
+            self._crypto_consecutive_successes >= self.crypto_breaker_recovery_successes
+        )
+        if _recovery_confirmed:
+            self._crypto_consecutive_failures = 0
+            self._crypto_consecutive_successes = 0
+
         ctx.signed_payload = signed_payload
         conn.execute('BEGIN IMMEDIATE')
+        # C1: reset CRYPTO_DEGRADED → ONLINE only once recovery threshold is met.
+        _ns = NodeStateRepository.get_state(conn, ctx.fiscal_number)
+        if _recovery_confirmed and _ns is not None and _ns.mode == NodeMode.CRYPTO_DEGRADED:
+            NodeStateRepository.update_mode(conn, fiscal_number=ctx.fiscal_number, mode=NodeMode.ONLINE)
         ctx.document = FiscalDocumentRepository.update_state(conn, document_id=ctx.document.document_id, state=DocumentState.SIGNED)
         # Persist unsigned DPS XML payload for MAC chain (only for DPS profiles)
         if sign_input != (ctx.inbox.payload_json if ctx.inbox else ''):
@@ -544,6 +700,10 @@ class WritePathWorker:
                 error=build_canonical_error(CanonicalErrorCode.BACKEND_TEMPORARY_UNAVAILABLE, message=str(exc)),
                 technical_status='REJECTED',
             )
+            # Sprint 13 cert_watch: side-channel trigger if DPS rejected us
+            # for cert-related reasons. Runs after the DB write completed
+            # (own connection inside the service); never blocks this doc.
+            self._notify_cert_watch_on_error(ctx.fiscal_number, exc)
             return ctx, result
 
         ctx.send_result = send_result
@@ -632,7 +792,7 @@ class WritePathWorker:
         # 3. Re-sign (outside DB transaction)
         try:
             if hasattr(self.crypto_provider, 'sign_raw'):
-                signed_payload = self.crypto_provider.sign_raw(data=sign_input.encode('utf-8'))
+                signed_payload = self.crypto_provider.sign_raw(data=sign_input.encode('utf-8'), document_id=ctx.document.document_id)
             else:
                 signed_payload = self.crypto_provider.sign(document_id=ctx.document.document_id, payload_json=sign_input)
         except Exception as exc:
@@ -838,6 +998,13 @@ class WritePathWorker:
                 rounding = enriched_rounding
                 rounded_sum = total_sum + enriched_rounding
 
+        # M3: warn on X_REPORT when offline backlog is unsynced — figures are incomplete.
+        offline_backlog_warning = None
+        if ctx.command.operation_type == OperationType.X_REPORT:
+            pending = FiscalDocumentRepository.count_pending_for_offline_sync(conn, fiscal_number=ctx.fiscal_number)
+            if pending > 0:
+                offline_backlog_warning = pending
+
         return WorkerProcessResult(
             outcome=outcome,
             request_id=ctx.inbox.request_id,
@@ -848,6 +1015,7 @@ class WritePathWorker:
             change=change,
             rounded_sum=rounded_sum,
             rounding=rounding,
+            offline_backlog_warning=offline_backlog_warning,
         )
 
     def _apply_shift_side_effects_locked(self, conn: sqlite3.Connection, *, ctx: WorkerContext, target_state: DocumentState) -> None:
@@ -993,7 +1161,15 @@ class WritePathWorker:
         technical_status: str | None = None,
         submission_status: str | None = None,
         response_json: str | None = None,
+        requeue_inbox: bool = False,
+        new_node_mode: NodeMode | None = None,
     ) -> WorkerProcessResult:
+        """Mark document and inbox as error, committing in a single transaction.
+
+        new_node_mode: if provided, updates node_state.mode atomically in the same
+        transaction (H2: eliminates the two-commit window where a crash between the
+        document error commit and the mode update commit would lose the breaker state).
+        """
         assert ctx.inbox is not None and ctx.command is not None
         conn.execute('BEGIN IMMEDIATE')
         document = FiscalDocumentRepository.update_state(
@@ -1005,13 +1181,21 @@ class WritePathWorker:
             submission_status=submission_status,
             response_json=response_json,
         )
-        updated = InboxRepository.mark_error(
-            conn,
-            request_id=ctx.inbox.request_id,
-            lease_token=ctx.lease_token,
-            canonical_error_code=error.code.value,
-            error_message=error.message,
-        )
+        if requeue_inbox:
+            updated = InboxRepository.requeue(
+                conn,
+                request_id=ctx.inbox.request_id,
+                lease_token=ctx.lease_token,
+                error_message=error.message,
+            )
+        else:
+            updated = InboxRepository.mark_error(
+                conn,
+                request_id=ctx.inbox.request_id,
+                lease_token=ctx.lease_token,
+                canonical_error_code=error.code.value,
+                error_message=error.message,
+            )
         AuditRepository.log_events(
             conn,
             events=[('DOCUMENT', document_id, 'DOCUMENT_ERROR', 'ERROR', dumps_json({'state': state.value, 'code': error.code.value, 'message': error.message}))],
@@ -1019,9 +1203,15 @@ class WritePathWorker:
         self._log_protocol_event(conn, inbox=ctx.inbox, command=ctx.command, result_code=error.code.value, error=error)
         if document is not None:
             transport_profile = TransportProfileRepository.get_by_id(conn, document.transport_profile_id)
+            _attempt = ctx.inbox.requeue_count if ctx.inbox is not None else 0
+            _trace_id = (
+                f'{document.document_id}-transport-error-{_attempt + 1}'
+                if (requeue_inbox or _attempt > 0)
+                else f'{document.document_id}-transport-error'
+            )
             TransportTraceRepository.log_event(
                 conn,
-                trace_id=f'{document.document_id}-transport-error',
+                trace_id=_trace_id,
                 fiscal_number=ctx.fiscal_number,
                 backend_profile_id=document.backend_profile_id,
                 transport_profile_id=document.transport_profile_id,
@@ -1031,6 +1221,12 @@ class WritePathWorker:
                 business_status=error.code.value,
                 correlation_id=ctx.command.correlation_id,
             )
+        # H2: update node mode atomically in the same transaction to eliminate
+        # the two-commit window that would lose breaker state on a crash.
+        if new_node_mode is not None:
+            _ns = NodeStateRepository.get_state(conn, ctx.fiscal_number)
+            if _ns is not None and _ns.mode == NodeMode.ONLINE:
+                NodeStateRepository.update_mode(conn, fiscal_number=ctx.fiscal_number, mode=new_node_mode)
         conn.commit()
         return WorkerProcessResult(
             outcome='ERROR',
@@ -1061,8 +1257,8 @@ class WritePathWorker:
             if not related:
                 return build_canonical_error(CanonicalErrorCode.RETURN_LINKAGE_REQUIRED)
 
-        # Timestamp sanity: not in future, not older than 24h
-        if self.validate_timestamps and command.business_ts is not None:
+        # Timestamp sanity: not in future, not older than 24h (skip for management ops)
+        if self.validate_timestamps and command.business_ts is not None and op not in {OperationType.GO_OFFLINE, OperationType.GO_ONLINE, OperationType.ASK_OFFLINE_CODES}:
             now = datetime.now(UTC)
             bts = command.business_ts
             if bts.tzinfo is None:
@@ -1112,6 +1308,11 @@ class WritePathWorker:
         active_shift = ShiftRepository.get_active_shift(conn, inbox.fiscal_number)
         if op == OperationType.SHIFT_OPEN and active_shift is not None:
             return build_canonical_error(CanonicalErrorCode.SHIFT_ALREADY_OPEN)
+        # Sprint 13 cert_watch: cache-only revocation check at shift-open.
+        if op == OperationType.SHIFT_OPEN and self.cert_watch_service is not None:
+            cert_err = self._guard_cert_watch(inbox.fiscal_number)
+            if cert_err is not None:
+                return cert_err
         if op == OperationType.SHIFT_CLOSE and active_shift is None:
             return build_canonical_error(CanonicalErrorCode.SHIFT_NOT_OPEN)
         if op in {OperationType.SELL, OperationType.RETURN, OperationType.SERVICE_IN, OperationType.SERVICE_OUT, OperationType.CASH_WITHDRAWAL, OperationType.X_REPORT, OperationType.Z_REPORT} and active_shift is None:
@@ -1153,7 +1354,9 @@ class WritePathWorker:
                         message=f'SHIFT_CLOSE blocked: linked Z_REPORT ({active_shift.z_report_document_id}) is {zr_doc.state.value}, must be ACK before closing shift',
                     )
 
-        if active_shift is not None:
+        # Management commands are not fiscal operations — channel lock does not apply.
+        _MANAGEMENT_OPS = {OperationType.GO_OFFLINE, OperationType.GO_ONLINE, OperationType.ASK_OFFLINE_CODES, OperationType.GET_STATUS}
+        if active_shift is not None and op not in _MANAGEMENT_OPS:
             lock = ShiftRepository.get_channel_lock(conn, inbox.fiscal_number)
             if lock is not None and not self._channel_matches(lock=lock, inbox=inbox, command=command):
                 return build_canonical_error(CanonicalErrorCode.SHIFT_CHANNEL_SWITCH_FORBIDDEN)
@@ -1216,6 +1419,49 @@ class WritePathWorker:
 
         return None
 
+    def _notify_cert_watch_on_error(self, fiscal_number: str, exc: Exception) -> None:
+        """Fire-and-forget cert_watch side-channel when DPS rejects us.
+
+        The service decides whether the error is cert-related. We never
+        raise from here — the current document's retry/reconciliation
+        logic runs unaffected.
+        """
+        if self.cert_watch_service is None:
+            return
+        try:
+            self.cert_watch_service.check_on_dps_error(fiscal_number, str(exc))
+        except Exception as side_exc:
+            self.logger.debug(
+                'cert_watch.dps_hook_error',
+                extra={'extra_fields': {'fiscal_number': fiscal_number, 'error': str(side_exc)}},
+            )
+
+    def _guard_cert_watch(self, fiscal_number: str) -> CanonicalError | None:
+        """Cached-only revocation guard for SHIFT_OPEN.
+
+        We are inside a BEGIN IMMEDIATE transaction here (invariant FI-1):
+        the cert_watch service MUST NOT do network I/O from this path.
+        `check_on_shift_open_cached_only` only reads the cache row.
+        """
+        from .cert_watch import ShiftBlockedError
+        if self.cert_watch_service is None:
+            return None
+        try:
+            self.cert_watch_service.check_on_shift_open_cached_only(fiscal_number)
+        except ShiftBlockedError as exc:
+            return build_canonical_error(
+                CanonicalErrorCode.CRYPTO_PROVIDER_UNAVAILABLE,
+                message=f'Signing certificate revoked at CA: {exc.status.status}',
+                details={'cert_status': exc.status.status},
+            )
+        except Exception as exc:
+            # Defensive: a bug in cert_watch must not break shift_open.
+            self.logger.warning(
+                'cert_watch.guard_error',
+                extra={'extra_fields': {'fiscal_number': fiscal_number, 'error': str(exc)}},
+            )
+        return None
+
     @staticmethod
     def _channel_matches(*, lock, inbox: InboxRecord, command: CanonicalFiscalCommand) -> bool:
         backend_profile_id = command.backend_profile_id or inbox.backend_profile_id
@@ -1229,12 +1475,17 @@ class WritePathWorker:
         )
 
     @classmethod
-    def _check_offline_limits(cls, *, node_state, offline_session) -> CanonicalError | None:
+    def _check_offline_limits(cls, *, node_state, offline_session, fn_config=None) -> tuple[CanonicalError | None, bool]:
+        """Return (error_or_None, should_set_blocked_mode).
+
+        should_set_blocked_mode=True only when monthly limit is exceeded AND
+        fn_config.enforce_blocked_mode is enabled (DEFAULT=False/0 — wartime exemption).
+        """
         now = datetime.now(UTC)
         try:
             started_at = datetime.fromisoformat(offline_session.started_at)
         except ValueError:
-            return build_canonical_error(CanonicalErrorCode.OFFLINE_LIMIT_REACHED, message='Offline session has invalid started_at timestamp.')
+            return build_canonical_error(CanonicalErrorCode.OFFLINE_LIMIT_REACHED, message='Offline session has invalid started_at timestamp.'), False
         if started_at.tzinfo is None:
             started_at = started_at.replace(tzinfo=UTC)
         continuous_seconds = max(0, int((now - started_at).total_seconds()))
@@ -1243,26 +1494,197 @@ class WritePathWorker:
         session_month_seconds = offline_session.accumulated_month_seconds
         if started_at.strftime('%Y-%m') == current_month_bucket:
             session_month_seconds += continuous_seconds
-        monthly_seconds = max(node_month_seconds, session_month_seconds)
+        # Sum closed-session seconds + current session seconds for true monthly total.
+        # node_month_seconds accumulates only at GO_ONLINE (closed sessions); session_month_seconds
+        # adds the ongoing session's duration. max() was a bug — it understated the total when
+        # several sessions together exceed the limit but none individually does.
+        monthly_seconds = node_month_seconds + session_month_seconds
 
         if continuous_seconds >= cls.MAX_OFFLINE_CONTINUOUS_SECONDS:
             return build_canonical_error(
                 CanonicalErrorCode.OFFLINE_LIMIT_REACHED,
                 message='Continuous offline time limit exceeded.',
                 details={'continuous_seconds': continuous_seconds, 'limit_seconds': cls.MAX_OFFLINE_CONTINUOUS_SECONDS},
-            )
+            ), False
         if monthly_seconds >= cls.MAX_OFFLINE_MONTH_SECONDS:
+            should_block = bool(fn_config and fn_config.enforce_blocked_mode)
             return build_canonical_error(
                 CanonicalErrorCode.OFFLINE_LIMIT_REACHED,
                 message='Monthly offline time limit exceeded.',
                 details={'monthly_seconds': monthly_seconds, 'limit_seconds': cls.MAX_OFFLINE_MONTH_SECONDS},
-            )
-        return None
+            ), should_block
+        return None, False
 
     @staticmethod
     def _normalize_excise_mark(raw: object | None) -> str:
         from ..repositories.excise import normalize_excise_mark
         return normalize_excise_mark(raw)
+
+    def _handle_management_command_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        ctx: WorkerContext,
+    ) -> tuple[WorkerContext, WorkerProcessResult]:
+        """Handle GO_OFFLINE / GO_ONLINE / ASK_OFFLINE_CODES without creating a fiscal document."""
+        assert ctx.inbox is not None and ctx.command is not None and ctx.node_state is not None
+        inbox = ctx.inbox
+        command = ctx.command
+        op = command.operation_type
+        now = datetime.now(UTC)
+
+        if op == OperationType.GET_STATUS:
+            # Read-only: return current node state without any side effects or LND allocation.
+            updated = InboxRepository.mark_done(
+                conn,
+                request_id=inbox.request_id,
+                lease_token=ctx.lease_token,
+                result_document_id=None,
+            )
+            conn.commit()
+            return ctx, WorkerProcessResult(
+                outcome='ACK',
+                request_id=inbox.request_id,
+                document_id=None,
+                inbox_status=updated.status.value if updated else 'DONE',
+            )
+
+        if op == OperationType.GO_OFFLINE:
+            if ctx.node_state.mode == NodeMode.BLOCKED:
+                # H3: BLOCKED fast-path passes GO_OFFLINE through, but going offline while
+                # blocked is not meaningful — node is blocked due to monthly limit.
+                err = build_canonical_error(
+                    CanonicalErrorCode.OFFLINE_LIMIT_REACHED,
+                    message='Cannot go offline: node is BLOCKED due to monthly offline time limit.',
+                )
+                result = self._mark_error_locked(conn, ctx=ctx, error=err, document_id=None, state=None)
+                return ctx, result
+            if ctx.node_state.mode != NodeMode.ONLINE:
+                err = build_canonical_error(CanonicalErrorCode.NODE_ALREADY_OFFLINE)
+                result = self._mark_error_locked(conn, ctx=ctx, error=err, document_id=None, state=None)
+                return ctx, result
+            # B1: require an active offline code range before entering offline mode
+            active_range = OfflineRepository.get_active_range(conn, ctx.fiscal_number)
+            if active_range is None:
+                err = build_canonical_error(
+                    CanonicalErrorCode.OFFLINE_CODES_EXHAUSTED,
+                    message='Cannot go offline: no active offline code range. Use ASK_OFFLINE_CODES first.',
+                )
+                result = self._mark_error_locked(conn, ctx=ctx, error=err, document_id=None, state=None)
+                return ctx, result
+            # B2: watermark check — warn if remaining codes fall below configured minimum
+            fn_config = FiscalNumberConfigRepository.get_or_default(conn, ctx.fiscal_number)
+            if fn_config.min_offline_codes > 0:
+                codes_remaining = active_range.last_fiscal_no - active_range.next_fiscal_no + 1
+                if codes_remaining < fn_config.min_offline_codes:
+                    AuditRepository.log_event(
+                        conn,
+                        entity_type='OFFLINE',
+                        entity_id=ctx.fiscal_number,
+                        event_type='OFFLINE_CODES_BELOW_WATERMARK',
+                        severity='WARNING',
+                        event_payload_json=dumps_json({
+                            'codes_remaining': codes_remaining,
+                            'min_offline_codes': fn_config.min_offline_codes,
+                            'max_offline_codes': fn_config.max_offline_codes,
+                        }),
+                    )
+            session_id = f'offline-{ctx.fiscal_number}-{int(now.timestamp() * 1000)}'
+            reason = command.payload.get('reason') if isinstance(command.payload, dict) else None
+            OfflineRepository.create_open_session(
+                conn,
+                offline_session_id=session_id,
+                fiscal_number=ctx.fiscal_number,
+                started_at=now.isoformat(),
+                reason=str(reason) if reason else None,
+            )
+            NodeStateRepository.update_mode(conn, fiscal_number=ctx.fiscal_number, mode=NodeMode.OFFLINE)
+
+        elif op == OperationType.GO_ONLINE:
+            if ctx.node_state.mode not in (NodeMode.OFFLINE, NodeMode.BLOCKED):
+                err = build_canonical_error(CanonicalErrorCode.NODE_NOT_OFFLINE)
+                result = self._mark_error_locked(conn, ctx=ctx, error=err, document_id=None, state=None)
+                return ctx, result
+            # Check offline backlog — operator must sync before going online
+            pending = FiscalDocumentRepository.count_pending_for_offline_sync(conn, fiscal_number=ctx.fiscal_number)
+            if pending > 0:
+                err = build_canonical_error(
+                    CanonicalErrorCode.OFFLINE_BACKLOG_NOT_SYNCED,
+                    message=f'GO_ONLINE blocked: {pending} offline document(s) pending DPS sync.',
+                )
+                result = self._mark_error_locked(conn, ctx=ctx, error=err, document_id=None, state=None)
+                return ctx, result
+            session = OfflineRepository.get_open_session(conn, ctx.fiscal_number)
+            if session is not None:
+                try:
+                    started_at = datetime.fromisoformat(session.started_at)
+                    if started_at.tzinfo is None:
+                        started_at = started_at.replace(tzinfo=UTC)
+                    continuous_seconds = max(0, int((now - started_at).total_seconds()))
+                except ValueError:
+                    continuous_seconds = 0
+                OfflineRepository.close_session(
+                    conn,
+                    offline_session_id=session.offline_session_id,
+                    ended_at=now.isoformat(),
+                    continuous_seconds=continuous_seconds,
+                )
+                month_bucket = now.strftime('%Y-%m')
+                NodeStateRepository.update_offline_seconds(
+                    conn,
+                    fiscal_number=ctx.fiscal_number,
+                    month_bucket=month_bucket,
+                    seconds_delta=continuous_seconds,
+                )
+            NodeStateRepository.update_mode(conn, fiscal_number=ctx.fiscal_number, mode=NodeMode.ONLINE)
+
+        elif op == OperationType.ASK_OFFLINE_CODES:
+            payload = command.payload if isinstance(command.payload, dict) else {}
+            try:
+                first_no = int(payload['first_fiscal_no'])
+                last_no = int(payload['last_fiscal_no'])
+            except (KeyError, TypeError, ValueError):
+                err = build_canonical_error(
+                    CanonicalErrorCode.INVALID_RECEIPT_DATA,
+                    message='ASK_OFFLINE_CODES requires first_fiscal_no and last_fiscal_no.',
+                )
+                result = self._mark_error_locked(conn, ctx=ctx, error=err, document_id=None, state=None)
+                return ctx, result
+            if first_no >= last_no:
+                err = build_canonical_error(
+                    CanonicalErrorCode.INVALID_RECEIPT_DATA,
+                    message='first_fiscal_no must be less than last_fiscal_no.',
+                )
+                result = self._mark_error_locked(conn, ctx=ctx, error=err, document_id=None, state=None)
+                return ctx, result
+            if OfflineRepository.has_overlapping_range(conn, fiscal_number=ctx.fiscal_number, first_fiscal_no=first_no, last_fiscal_no=last_no):
+                err = build_canonical_error(CanonicalErrorCode.OFFLINE_RANGE_CONFLICT)
+                result = self._mark_error_locked(conn, ctx=ctx, error=err, document_id=None, state=None)
+                return ctx, result
+            import uuid
+            OfflineRepository.create_range(
+                conn,
+                range_id=str(uuid.uuid4()),
+                fiscal_number=ctx.fiscal_number,
+                first_fiscal_no=first_no,
+                last_fiscal_no=last_no,
+                issued_at=now.isoformat(),
+                source_payload_json=None,
+            )
+
+        updated = InboxRepository.mark_done(
+            conn,
+            request_id=inbox.request_id,
+            lease_token=ctx.lease_token,
+            result_document_id=None,
+        )
+        conn.commit()
+        return ctx, WorkerProcessResult(
+            outcome='ACK',
+            request_id=inbox.request_id,
+            document_id=None,
+            inbox_status=updated.status.value if updated else 'DONE',
+        )
 
     @staticmethod
     def _operation_supports_offline(operation_type: OperationType) -> bool:

@@ -296,6 +296,74 @@ def test_worker_capability_gate_cash_withdrawal(conn):
 
 
 
+# ---------------------------------------------------------------------------
+# C1: CRYPTO_DEGRADED fast-path guard
+#
+# When node.mode == CRYPTO_DEGRADED, all fiscal operations must be rejected
+# immediately (before LND allocation) with CRYPTO_PROVIDER_UNAVAILABLE.
+# Management operations (GET_STATUS, GO_ONLINE) must still pass through.
+# ---------------------------------------------------------------------------
+
+def test_worker_crypto_degraded_rejects_fiscal_ops_without_lnd(conn):
+    """CRYPTO_DEGRADED mode: SELL is rejected before any document or LND is created."""
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        _open_shift(conn)
+        _accept_sell_command(conn, request_id='req-crypto-degraded')
+        conn.execute("UPDATE node_state SET mode = 'CRYPTO_DEGRADED' WHERE fiscal_number = 'FN-DEV-0001'")
+        conn.commit()
+
+        # Threshold=3, failures=3 → breaker is open. This mirrors real CRYPTO_DEGRADED state.
+        worker = WritePathWorker(crypto_provider=StubCryptoProvider(conn=conn), transport_client=StubTransportClient(conn=conn), crypto_breaker_threshold=3)
+        worker._crypto_consecutive_failures = 3
+        result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
+
+        assert result.outcome == 'ERROR'
+        assert result.canonical_error is not None
+        assert result.canonical_error.code == CanonicalErrorCode.CRYPTO_PROVIDER_UNAVAILABLE
+
+        # No LND consumed — no fiscal_document must exist
+        doc_count = conn.execute('SELECT COUNT(*) FROM fiscal_documents').fetchone()[0]
+        assert doc_count == 0, "CRYPTO_DEGRADED must not allocate LND or create a document"
+
+        # Inbox row must be marked ERROR
+        row = conn.execute(
+            "SELECT status, canonical_error_code FROM ingress_inbox WHERE request_id = 'req-crypto-degraded'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == 'ERROR'
+        assert row[1] == 'CRYPTO_PROVIDER_UNAVAILABLE'
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# H3: BLOCKED + GO_OFFLINE returns correct error code OFFLINE_LIMIT_REACHED
+# (not the misleading NODE_ALREADY_OFFLINE)
+# ---------------------------------------------------------------------------
+
+def test_worker_blocked_go_offline_returns_offline_limit_reached(conn):
+    """When node is BLOCKED, GO_OFFLINE must return OFFLINE_LIMIT_REACHED, not NODE_ALREADY_OFFLINE."""
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        _open_shift(conn)
+        _accept_command(conn, request_id='req-blocked-go-offline', operation_type=OperationType.GO_OFFLINE,
+                        payload={'receipt': {'type': 'GO_OFFLINE'}})
+        conn.execute("UPDATE node_state SET mode = 'BLOCKED' WHERE fiscal_number = 'FN-DEV-0001'")
+        conn.commit()
+
+        worker = WritePathWorker(crypto_provider=StubCryptoProvider(conn=conn), transport_client=StubTransportClient(conn=conn))
+        result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
+
+        assert result.outcome == 'ERROR'
+        assert result.canonical_error is not None
+        assert result.canonical_error.code == CanonicalErrorCode.OFFLINE_LIMIT_REACHED, (
+            f"Expected OFFLINE_LIMIT_REACHED, got {result.canonical_error.code}"
+        )
+    finally:
+        conn.close()
+
+
 def test_accept_command_returns_existing_on_duplicate_idempotency_key(conn):
     try:
         conn.execute('BEGIN IMMEDIATE')
@@ -549,5 +617,76 @@ def test_worker_shift_close_marks_active_shift_closed_on_ack(conn):
         shift = conn.execute("SELECT state FROM shifts WHERE shift_id = 'shift-1'").fetchone()
         assert tuple(shift) == ('CLOSED',)
         assert crypto.calls == 0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# C2: crash-resume when document is already in SIGNED state
+#
+# Scenario: process crashed after SIGNED commit but before SENT commit.
+# On retry, _stage_sign must be skipped (no new LND, no re-sign call),
+# the persisted signed artifact must be reused, and the document must
+# proceed to send → ACK exactly once.
+# ---------------------------------------------------------------------------
+
+def test_worker_signed_crash_resume_skips_resign_and_sends(conn):
+    """After a crash-resume where document.state == SIGNED:
+    - crypto.sign() must NOT be called again
+    - transport.send() must be called exactly once
+    - result.outcome must be ACK
+    - exactly one fiscal_document in DB (no duplicate LND)
+    """
+    import uuid
+    from prro_gateway.enums import DocumentState, FileKind
+    from prro_gateway.repositories.fiscal_documents import FiscalDocumentRepository
+    from prro_gateway.repositories.document_files import DocumentFilesRepository
+    from prro_gateway.repositories.node_state import NodeStateRepository
+
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        _open_shift(conn)
+        _accept_sell_command(conn, request_id='req-signed-resume')
+        conn.commit()
+
+        # Step 1: first pass — sign succeeds, transport will fail (retryable)
+        #         → leaves document in SIGNED state after crash simulation
+        crypto = StubCryptoProvider(conn=conn)
+        transport_fail = StubTransportClient(fail_retryable=True, conn=conn)
+        worker = WritePathWorker(crypto_provider=crypto, transport_client=transport_fail)
+        result1 = worker.process_next(conn, fiscal_number='FN-DEV-0001')
+        # Transport failed → document should be ERROR_RETRYABLE
+        assert result1.outcome == 'ERROR'
+        assert crypto.calls == 1  # signed once
+
+        # Simulate crash-after-SIGNED: manually set document state back to SIGNED
+        # (this mimics what would happen if the process crashed between SIGNED
+        # commit and SENT commit — transport hadn't even been called yet)
+        doc_id = result1.document_id
+        assert doc_id is not None
+        conn.execute(
+            "UPDATE fiscal_documents SET state = 'SIGNED', transport_request_id = NULL WHERE document_id = ?",
+            (doc_id,),
+        )
+        conn.execute(
+            "UPDATE ingress_inbox SET status = 'NEW', canonical_error_code = NULL, requeue_count = 0 WHERE request_id = 'req-signed-resume'",
+        )
+        conn.commit()
+
+        # Step 2: retry — crypto must NOT be called, transport must succeed
+        crypto2 = StubCryptoProvider(conn=conn)  # fresh counter
+        transport_ok = StubTransportClient(conn=conn)
+        worker2 = WritePathWorker(crypto_provider=crypto2, transport_client=transport_ok)
+        result2 = worker2.process_next(conn, fiscal_number='FN-DEV-0001')
+
+        assert result2.outcome == 'ACK', f"Expected ACK, got {result2.outcome}: {result2.canonical_error}"
+        assert crypto2.calls == 0, "crypto.sign() must not be called on SIGNED-state resume"
+        assert transport_ok.calls == 1, "transport.send() must be called exactly once on resume"
+
+        # Exactly one fiscal_document (no duplicate LND allocated)
+        doc_count = conn.execute('SELECT COUNT(*) FROM fiscal_documents').fetchone()[0]
+        assert doc_count == 1, f"Expected 1 fiscal_document, got {doc_count} (duplicate LND!)"
+
+        assert result2.document_id == doc_id, "Must reuse existing document_id, not create a new one"
     finally:
         conn.close()

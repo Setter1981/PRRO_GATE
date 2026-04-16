@@ -132,6 +132,14 @@
 
 ---
 
+### R15 — require_local_sign=false bypass in production
+
+**Ризик:** `require_local_sign: false` в transport profile config silently bypasses local signing навіть якщо `crypto.provider=sidecar`. `_enforce_production_crypto_gate` перевіряє тільки тип CryptoProvider, але не конфігурацію профілів. Профіль з `require_local_sign=false` в production DB відправить документ без підпису.
+
+**Питання:** Чи є будь-який транспортний профіль в production DB з `require_local_sign=false`? `_enforce_production_sign_gate` блокує startup якщо знаходить такий профіль — перевірено що startup проходить?
+
+---
+
 ### R14 — Connection lifecycle: no pooling
 
 **Ризик:** Нова `sqlite3.connect()` per context-manager + `PRAGMA synchronous = FULL` per connection. 70 concurrent requests = 70 simultaneous connections з PRAGMA overhead.

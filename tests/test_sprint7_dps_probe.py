@@ -69,7 +69,7 @@ class _MockProbeStub:
 
 
 class _MockCrypto:
-    def sign_raw(self, *, data):
+    def sign_raw(self, *, data, document_id=None):
         return b'SIGNED::' + data
 
     def sign(self, *, document_id, payload_json):

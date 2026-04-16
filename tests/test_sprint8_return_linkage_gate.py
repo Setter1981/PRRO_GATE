@@ -57,7 +57,7 @@ def _setup_shift_and_enqueue(conn, *, rid: str, op: OperationType, payload: dict
 
 class _Crypto:
     def sign(self, **kw): return 'signed'
-    def sign_raw(self, *, data): return b'\x30\x82SIGNED'
+    def sign_raw(self, *, data, document_id=None): return b'\x30\x82SIGNED'
 
 
 class _OkTransport:

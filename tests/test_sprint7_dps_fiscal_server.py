@@ -270,7 +270,7 @@ def test_fs11_poll_status_lastchk_match_ack() -> None:
             return _MockResponse(id='DPS-001', status=1)
 
     class _MockCrypto:
-        def sign_raw(self, *, data):
+        def sign_raw(self, *, data, document_id=None):
             return b'SIGNED::' + data
 
     stub = _LastChkStub()
@@ -295,7 +295,7 @@ def test_fs11b_poll_status_lastchk_mismatch_retryable() -> None:
             return _MockResponse(id='DPS-OTHER', status=1)
 
     class _MockCrypto:
-        def sign_raw(self, *, data):
+        def sign_raw(self, *, data, document_id=None):
             return data
 
     stub = _MismatchStub()

@@ -36,6 +36,8 @@ class RuntimeConfig(StrictModel):
     startup_phase2_budget_seconds: int = 300
     graceful_shutdown_timeout_seconds: int = 30
     max_recovery_attempts: int = 5
+    ops_loop_enabled: bool = True
+    ops_loop_interval_seconds: int = 60
 
 
 class RestIngressConfig(StrictModel):
@@ -92,6 +94,23 @@ class CryptoConfig(StrictModel):
     sidecar_connect_timeout: float = 5.0
     sidecar_read_timeout: float = 10.0
     breaker_threshold: int = 5  # consecutive failures before breaker opens; 0 = disabled
+    breaker_probe_interval_seconds: int = 60  # how often to probe sidecar while CRYPTO_DEGRADED
+    breaker_recovery_successes: int = 3  # consecutive successes needed to close breaker; prevents flapping
+
+
+class BackupConfig(StrictModel):
+    enabled: bool = True
+    backup_dir: str = "./var/backups"
+    keep_count: int = 7        # number of backup files to retain
+    interval_hours: float = 24.0  # how often to run a backup
+
+
+class RetentionConfig(StrictModel):
+    enabled: bool = True
+    audit_ttl_days: int = 90   # DELETE audit_log rows older than N days
+    trace_ttl_days: int = 30   # DELETE protocol/transport trace rows older than N days
+    inbox_ttl_days: int = 90   # DELETE completed ingress_inbox rows older than N days
+    interval_hours: float = 24.0  # how often to run retention purge
 
 
 class AppConfig(StrictModel):
@@ -106,6 +125,8 @@ class AppConfig(StrictModel):
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     checkbox: CheckboxTransportOverridesConfig = Field(default_factory=CheckboxTransportOverridesConfig)
     crypto: CryptoConfig = Field(default_factory=CryptoConfig)
+    backup: BackupConfig = Field(default_factory=BackupConfig)
+    retention: RetentionConfig = Field(default_factory=RetentionConfig)
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "AppConfig":
@@ -178,5 +199,7 @@ __all__ = [
     "AlertsConfig",
     "CheckboxTransportOverridesConfig",
     "CryptoConfig",
+    "BackupConfig",
+    "RetentionConfig",
     "AppConfig",
 ]

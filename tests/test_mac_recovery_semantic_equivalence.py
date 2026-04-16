@@ -82,7 +82,7 @@ def test_mrs1_recovery_has_tax_groups_in_xml(conn) -> None:
     captured_payloads = []
 
     class _Crypto:
-        def sign_raw(self, *, data):
+        def sign_raw(self, *, data, document_id=None):
             captured_payloads.append(data)
             return b'\x30\x82SIGNED'
 
@@ -135,7 +135,7 @@ def test_mrs2_recovery_preserves_related_receipt_id(conn) -> None:
     captured_kwargs = []
 
     class _Crypto:
-        def sign_raw(self, *, data):
+        def sign_raw(self, *, data, document_id=None):
             return b'\x30\x82SIGNED'
 
     class _CapturingTransport:
@@ -186,7 +186,7 @@ def test_mrs3_recovery_xml_matches_normal_structure(conn) -> None:
     captured_payloads = []
 
     class _Crypto:
-        def sign_raw(self, *, data):
+        def sign_raw(self, *, data, document_id=None):
             captured_payloads.append(data)
             return b'\x30\x82SIGNED'
 
@@ -255,7 +255,7 @@ def test_mrs4_zreport_recovery_preserves_aggregation(conn) -> None:
     captured_payloads = []
 
     class _Crypto:
-        def sign_raw(self, *, data):
+        def sign_raw(self, *, data, document_id=None):
             captured_payloads.append(data)
             return b'\x30\x82SIGNED'
 

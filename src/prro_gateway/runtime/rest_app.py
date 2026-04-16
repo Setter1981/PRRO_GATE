@@ -186,7 +186,7 @@ def create_app(container: RuntimeContainer) -> FastAPI:
                     response["retry_after_seconds"] = canonical_error.retry_after_seconds
         # Sprint 10 Step 10: canonical layer fields from live process_result (non-None only)
         if not replay_fields_needed and process_result is not None:
-            for field in ('cash_balance', 'change', 'rounded_sum', 'rounding'):
+            for field in ('cash_balance', 'change', 'rounded_sum', 'rounding', 'offline_backlog_warning'):
                 value = getattr(process_result, field, None)
                 if value is not None:
                     response[field] = value
@@ -294,7 +294,19 @@ def create_app(container: RuntimeContainer) -> FastAPI:
         previous = worker.reset_crypto_breaker()
         was_open = worker.crypto_breaker_threshold > 0 and previous >= worker.crypto_breaker_threshold
         if was_open:
+            from ..enums import NodeMode
+            from ..repositories.node_state import NodeStateRepository
             with container.connect() as audit_conn:
+                # Reset CRYPTO_DEGRADED → ONLINE for all fiscal_numbers so that
+                # the C1 fast-path guard allows sign attempts again.
+                rows = audit_conn.execute(
+                    "SELECT fiscal_number FROM node_state WHERE mode = 'CRYPTO_DEGRADED'"
+                ).fetchall()
+                if rows:
+                    audit_conn.execute('BEGIN IMMEDIATE')
+                    for (fn,) in rows:
+                        NodeStateRepository.update_mode(audit_conn, fiscal_number=fn, mode=NodeMode.ONLINE)
+                    audit_conn.commit()
                 AuditRepository.log_event(
                     audit_conn,
                     entity_type='CRYPTO',
@@ -320,6 +332,49 @@ def create_app(container: RuntimeContainer) -> FastAPI:
             "consecutive_failures": 0,
             "breaker_was_open": was_open,
             "threshold": worker.crypto_breaker_threshold,
+        })
+
+    @app.post("/v1/admin/reconciliation/trigger")
+    async def admin_reconciliation_trigger(request: Request) -> JSONResponse:
+        """Manually trigger reconciliation for one or all fiscal numbers.
+
+        Polls DPS status for PENDING documents and updates their state.
+        Body: {"fiscal_number": "FN-..."} for a specific FN, or {} for all.
+        """
+        if container.reconciliation_service is None:
+            return JSONResponse(status_code=503,
+                content={"detail": "reconciliation_service not available"})
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        fiscal_number = body.get("fiscal_number") or None  # "" → None
+        try:
+            with container.connect() as conn:
+                result = container.reconciliation_service.reconcile_pending(
+                    conn, fiscal_number=fiscal_number
+                )
+        except Exception as exc:
+            logger.error("reconciliation_trigger_error", exc_info=True, extra={"extra_fields": {
+                "fiscal_number": fiscal_number, "error": str(exc),
+            }})
+            return JSONResponse(status_code=500, content={"detail": "reconciliation failed"})
+        logger.info("admin_reconciliation_triggered", extra={"extra_fields": {
+            "fiscal_number": fiscal_number,
+            "checked": result.checked,
+            "acked": result.acked,
+            "manual": result.manual,
+        }})
+        return JSONResponse(status_code=200, content={
+            "fiscal_number": fiscal_number,
+            "checked": result.checked,
+            "acked": result.acked,
+            "rejected": result.rejected,
+            "retryable": result.retryable,
+            "still_pending": result.still_pending,
+            "manual": result.manual,
         })
 
     @app.post("/v1/admin/offline-sync")
@@ -514,6 +569,104 @@ def create_app(container: RuntimeContainer) -> FastAPI:
             },
             "cash_balance": balance,
             "cash_withdrawal": cw,
+        })
+
+    @app.get("/v1/admin/node-state")
+    def admin_node_state(fiscal_number: str) -> JSONResponse:
+        from ..repositories.node_state import NodeStateRepository
+        from ..repositories.offline import OfflineRepository
+        from ..repositories.fn_config import FiscalNumberConfigRepository
+        with container.connect() as conn:
+            ns = NodeStateRepository.get_state(conn, fiscal_number)
+            if ns is None:
+                return JSONResponse(status_code=404, content={"detail": "fiscal_number not found"})
+            active_range = OfflineRepository.get_active_range(conn, fiscal_number)
+            fn_cfg = FiscalNumberConfigRepository.get_or_default(conn, fiscal_number)
+        codes_remaining = None
+        if active_range is not None:
+            codes_remaining = active_range.last_fiscal_no - active_range.next_fiscal_no + 1
+        worker = container.command_processor
+        crypto_breaker_open = bool(
+            isinstance(worker, WritePathWorker) and
+            worker.crypto_breaker_threshold > 0 and
+            worker._crypto_consecutive_failures >= worker.crypto_breaker_threshold
+        )
+        return JSONResponse(status_code=200, content={
+            "fiscal_number": fiscal_number,
+            "mode": ns.mode.value,
+            "shift_state": ns.shift_state.value,
+            "current_month_offline_seconds": ns.current_month_offline_seconds,
+            "codes_remaining": codes_remaining,
+            "active_range_id": active_range.range_id if active_range else None,
+            "active_offline_session_id": ns.current_offline_session_id,
+            "crypto_breaker_open": crypto_breaker_open,
+            "enforce_blocked_mode": bool(fn_cfg.enforce_blocked_mode),
+            "min_offline_codes": fn_cfg.min_offline_codes,
+            "max_offline_codes": fn_cfg.max_offline_codes,
+        })
+
+    @app.get("/v1/admin/offline-ranges")
+    def admin_offline_ranges(fiscal_number: str) -> JSONResponse:
+        with container.connect() as conn:
+            rows = conn.execute(
+                "SELECT range_id, first_fiscal_no, last_fiscal_no, next_fiscal_no, status, issued_at "
+                "FROM offline_ranges WHERE fiscal_number = ? ORDER BY created_at ASC",
+                (fiscal_number,),
+            ).fetchall()
+        ranges = []
+        total_remaining = 0
+        for row in rows:
+            remaining = max(0, row[2] - row[3] + 1) if row[4] != 'EXHAUSTED' else 0
+            total_remaining += remaining
+            ranges.append({
+                "range_id": row[0],
+                "first_fiscal_no": row[1],
+                "last_fiscal_no": row[2],
+                "next_fiscal_no": row[3],
+                "codes_remaining": remaining,
+                "status": row[4],
+                "issued_at": row[5],
+            })
+        return JSONResponse(status_code=200, content={
+            "fiscal_number": fiscal_number,
+            "ranges": ranges,
+            "total_remaining": total_remaining,
+        })
+
+    @app.get("/v1/admin/offline-sessions")
+    def admin_offline_sessions(fiscal_number: str) -> JSONResponse:
+        from ..repositories.node_state import NodeStateRepository
+        from ..repositories.offline import OfflineRepository
+        from datetime import UTC, datetime as dt
+        with container.connect() as conn:
+            ns = NodeStateRepository.get_state(conn, fiscal_number)
+            if ns is None:
+                return JSONResponse(status_code=404, content={"detail": "fiscal_number not found"})
+            session = OfflineRepository.get_open_session(conn, fiscal_number)
+        active_session = None
+        if session is not None:
+            elapsed = 0
+            try:
+                started = dt.fromisoformat(session.started_at)
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=UTC)
+                elapsed = max(0, int((dt.now(UTC) - started).total_seconds()))
+            except ValueError:
+                pass
+            active_session = {
+                "offline_session_id": session.offline_session_id,
+                "started_at": session.started_at,
+                "elapsed_seconds": elapsed,
+                "accumulated_month_seconds": session.accumulated_month_seconds,
+                "status": session.status.value,
+                "reason": session.reason,
+            }
+        return JSONResponse(status_code=200, content={
+            "fiscal_number": fiscal_number,
+            "active_session": active_session,
+            "current_month_offline_seconds": ns.current_month_offline_seconds,
+            "month_limit_seconds": WritePathWorker.MAX_OFFLINE_MONTH_SECONDS,
+            "continuous_limit_seconds": WritePathWorker.MAX_OFFLINE_CONTINUOUS_SECONDS,
         })
 
     return app
