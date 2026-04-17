@@ -36,3 +36,8 @@ rust/prro_crypto/target/
 prro_crypto_chunks/
 prro_crypto-*.tar.gz
 prro_crypto-*.zip
+
+# Crypto keys and certificates (never commit)
+*.ZS2
+*.dat
+czo_test/
