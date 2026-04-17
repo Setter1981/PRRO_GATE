@@ -98,10 +98,12 @@ Implemented foundations:
 - admin endpoints for manual document retry and crypto breaker reset;
 - extensive pytest gate suite.
 
-Baseline test state (2026-04-14, Sprint 10):
+Baseline test state (2026-04-15, Sprint 10 wave 2):
 
-- `pytest -q` result: `563 passed, 0 failed`;
-- date-sensitive offline test failures (gate1p/gate1q) have been resolved — fixtures now use relative current time.
+- `pytest -q` result: `586 passed, 0 failed`;
+- ФСКО protocol complete: `<D>/<S>` discounts, `<L>` comments, `<EPZ>` Z-report, `<E>` full attrs, `<CA>`, `<CZD>`;
+- all P0 legal gaps closed: `OFFLINE_LOCAL_ACK`, `OfflineSyncService`, Z-report offline backlog guard, receipt validator;
+- full fiscal lifecycle E2E test: SHIFT_OPEN → SELL → SELL → SERVICE_IN → SERVICE_OUT → RETURN → Z_REPORT.
 
 ## 5. High-Level Architecture
 
@@ -659,6 +661,130 @@ Acceptance criteria:
 - known gaps are explicit and signed off;
 - no test failures in mandatory suite.
 
+### Sprint 11: Offline Full Lifecycle
+
+Duration: 2 weeks.
+
+Goal:
+
+- close all remaining offline-state gaps in one vertical slice.
+
+Scope:
+
+- implement API-driven GO_OFFLINE flow (not manual DB seed);
+- add E2E test for offline code range request: ASK_OFFLINE_CODES → store → use → exhaust;
+- add LND crash+recovery scenario test: crash during offline session, restart, assert LND remains monotonic;
+- add channel-failover guard test: channel switch attempt with open shift = REJECTED;
+- ensure offline sync test suite covers ordered delivery, retry, rejection, crash recovery.
+
+Deliverables:
+
+- API-driven GO_OFFLINE test;
+- offline range request E2E;
+- LND crash recovery test;
+- channel failover guard test.
+
+Acceptance criteria:
+
+- GO_OFFLINE and GO_ONLINE are triggered through API, not DB seed;
+- offline number is requested, stored, and spent atomically — one number per document enforced;
+- LND after crash+recovery is strictly monotonic — no gaps, no duplicates;
+- channel switch during open shift is rejected unconditionally with explicit error code.
+
+---
+
+### Sprint 12: Fiscal Compliance Completeness
+
+Duration: 1–2 weeks.
+
+Goal:
+
+- close remaining fiscal accuracy gaps for excise goods and cash balance.
+
+Scope:
+
+- complete excise goods E2E pipeline: adapter → write-path → DPS XML (УКТЗЕД + excise mark);
+- implement cash balance carry-over between shifts;
+- serialize cash balance into shift-open DPS XML payload.
+
+Deliverables:
+
+- excise pipeline E2E test (adapter → serializer);
+- cash balance carry-over in shift open/close flow;
+- DPS XML includes opening cash balance.
+
+Acceptance criteria:
+
+- excise good with УКТЗЕД and mark passes full pipeline to XML without error;
+- attempt to sell excise good without УКТЗЕД = REJECTED before sign;
+- opening cash balance of new shift equals closing balance of previous shift;
+- DPS XML shift-open payload includes correct cash balance field.
+
+---
+
+### Sprint 13: Production Infrastructure
+
+Duration: 2–3 weeks.
+
+Goal:
+
+- make the system production-deployable.
+
+Scope:
+
+- crypto sidecar: add TLS with mutual auth, graceful shutdown, multi-threaded request handling;
+- implement `DPS_UNIFIED_WINDOW` transport handler (`transports/dps_unified_window.py`);
+- add ingress rate limiting (REST + XML-RPC);
+- add request size limits.
+
+Deliverables:
+
+- production-hardened sidecar with TLS;
+- `DPS_UNIFIED_WINDOW` transport with mock DPS integration tests;
+- rate limit middleware with 429 response and audit event.
+
+Acceptance criteria:
+
+- sidecar rejects requests without valid client certificate;
+- `DPS_UNIFIED_WINDOW` successfully submits a mock fiscal document;
+- ingress rejects rate-limit excess with HTTP 429 and audit log entry;
+- channel routing config distinguishes DPS_UNIFIED_WINDOW from DPS_PRRO_FISCAL_SERVER.
+
+---
+
+### Sprint 14: Operational Safety And Pilot
+
+Duration: 2 weeks.
+
+Goal:
+
+- operational correctness, data lifecycle, pilot readiness.
+
+Scope:
+
+- SQLite backup job + corruption detection → STOP_MODE trigger;
+- retention/purge policy for audit/trace/archive tables (configurable TTL);
+- write four missing operational docs: `PROTOCOL_SHAPE_AUDIT.md`, `DPS_TRANSPORT.md`, `OFFLINE_SYNC.md`, `ARCHIVE_POLICY.md`;
+- add pytest markers: `unit`, `integration`, `e2e`;
+- run full pilot acceptance matrix (see §10).
+
+Deliverables:
+
+- backup job + runbook;
+- retention config + purge script;
+- four operational docs;
+- pytest marker taxonomy.
+
+Acceptance criteria:
+
+- automatic backup runs on schedule and verifies integrity;
+- SQLite corruption transitions node to STOP_MODE with visible health signal;
+- old audit/trace records are purged according to configured TTL;
+- all four docs exist and match current code behavior;
+- `pytest -m unit` / `pytest -m integration` / `pytest -m e2e` each select disjoint subsets.
+
+---
+
 ### Phase 1.1 Candidate Slice: Key Inspection And PRRO Onboarding
 
 Goal:
@@ -786,28 +912,28 @@ For every sprint:
 
 High risks:
 
-- offline local ACK currently resembles final ACK too closely;
-- real DPS transport is not implemented;
-- production crypto readiness is not enforced strongly enough;
-- receipt legal validation is incomplete;
-- archive/control tape contour is not yet production-grade;
-- rate limiting is required by the original architecture but not yet implemented;
-- tests currently contain date-sensitive offline fixtures.
+- `DPS_UNIFIED_WINDOW` transport not implemented — second DPS contour missing;
+- `GO_OFFLINE` triggered by manual DB state rather than API flow — offline E2E not fully automated;
+- crypto sidecar is single-threaded PoC without TLS or auth — not production-safe;
+- rate limiting absent — ingress unthrottled under abusive local clients.
 
 Medium risks:
 
+- cash balance not carried over between shifts in DPS XML — fiscal rounding exposure;
+- excise goods E2E pipeline (adapter → write-path → XML) not fully tested;
+- `ASK_OFFLINE_CODES` API-flow untested — offline range request may surface edge cases;
 - Maria/WebCheck may require session aggregation beyond simple command mapping;
-- repository/schema changes can affect many tests;
-- channel lock must remain enforced in worker transaction, not only ingress;
-- reconciliation must not mutate terminal states incorrectly.
+- channel lock must remain enforced in worker transaction, not only ingress.
 
 Low risks:
 
-- docs/version labels are inconsistent in some existing files;
-- root README describes the Claude autonomy kit more than the PRRO product.
+- `signed_payload` type annotation drift (`str` vs `bytes`) in DPS path;
+- pytest markers absent — unit/integration/e2e not distinguished in CI;
+- four required operational docs still missing (`PROTOCOL_SHAPE_AUDIT.md`, `DPS_TRANSPORT.md`, `OFFLINE_SYNC.md`, `ARCHIVE_POLICY.md`).
 
 ## 14. Recommended Immediate Next Step
 
-Start with Sprint 0, then Sprint 1.
+**Sprint 11: Offline Full Lifecycle** — closes the highest-severity remaining block.
+See `docs/ACCEPTANCE_COVERAGE_SNAPSHOT.md` §10 for full sprint breakdown (Sprint 11–14).
 
 Do not implement DPS transport before correcting offline state semantics. The legal risk of confusing local offline receipt creation with fiscal server acknowledgement is more important than adding another transport.
