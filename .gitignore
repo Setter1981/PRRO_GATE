@@ -41,3 +41,6 @@ prro_crypto-*.zip
 *.ZS2
 *.dat
 czo_test/
+
+# Git worktrees (local workspace isolation)
+.worktrees/
