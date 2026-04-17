@@ -338,6 +338,69 @@ class DpsFiscalServerTransport:
         return stub
 
 
+    def ping(self, *, fiscal_number: str, transport_profile=None) -> bool:
+        """Ping DPS fiscal server (T=111). Returns True if reachable, False on any error."""
+        try:
+            from .proto import fiscal_server_pb2 as pb
+            effective_endpoint = self._default_endpoint
+            tls_root_certs = self._tls_root_certs
+            if transport_profile is not None:
+                effective_endpoint = getattr(transport_profile, 'endpoint', None) or effective_endpoint
+            stub = self._get_stub(endpoint=effective_endpoint, tls_root_certs=tls_root_certs)
+            request = pb.Check(
+                rro_fn=fiscal_number,
+                date_time=_kyiv_local_epoch(datetime.now(UTC)),
+                check_sign=b'',
+                local_number=0,
+                check_type=CHECK_TYPE_SERVICECHK,
+            )
+            response = stub.ping(request)
+            return response.status == 1
+        except Exception as exc:
+            logger.debug('dps_ping_failed', extra={'extra_fields': {'fiscal_number': fiscal_number, 'error': str(exc)}})
+            return False
+
+    def request_offline_codes(
+        self,
+        *,
+        fiscal_number: str,
+        qty: int,
+        signed_payload: bytes | str,
+        transport_profile=None,
+    ) -> list[int]:
+        """Request offline fiscal number codes from DPS via T=112.
+
+        signed_payload: CMS-signed T=112 XML (same convention as send()).
+        Returns sorted list of allocated fiscal number integers.
+        Raises TransportRetryableError on transport or server error.
+        """
+        try:
+            from .proto import fiscal_server_pb2 as pb
+            effective_endpoint = self._default_endpoint
+            tls_root_certs = self._tls_root_certs
+            if transport_profile is not None:
+                effective_endpoint = getattr(transport_profile, 'endpoint', None) or effective_endpoint
+            stub = self._get_stub(endpoint=effective_endpoint, tls_root_certs=tls_root_certs)
+            check_sign_bytes = signed_payload if isinstance(signed_payload, bytes) else signed_payload.encode('utf-8')
+            request = pb.Check(
+                rro_fn=fiscal_number,
+                date_time=_kyiv_local_epoch(datetime.now(UTC)),
+                check_sign=check_sign_bytes,
+                local_number=0,
+                check_type=CHECK_TYPE_SERVICECHK,
+            )
+            response = stub.sendChkV2(request)
+        except TransportRetryableError:
+            raise
+        except Exception as exc:
+            raise TransportRetryableError(f'DPS offline codes request failed: {exc}') from exc
+
+        if response.status != 1:
+            raise TransportRetryableError(
+                f'DPS offline codes rejected: status={response.status}, error={response.error_message}'
+            )
+        return _parse_fns_data(response.fns_data)
+
     def probe_status(self, *, fiscal_number: str, crypto_provider, endpoint: str | None = None,
                       tls_root_certs: bytes | None = None) -> dict:
         """Call statusRro — explicit ops probe, NOT automatic polling."""
@@ -376,6 +439,30 @@ class DpsFiscalServerTransport:
             'tins': response.tins,
             'error_message': response.error_message,
         }
+
+
+# --- Offline codes response parsing -------------------------------------------
+
+def _parse_fns_data(fns_data: str) -> list[int]:
+    """Parse fns_data field from DPS T=112 CheckResponse into sorted list of integers.
+
+    Attempts XML <ID> element parsing first, then whitespace/comma split.
+    """
+    if not fns_data:
+        return []
+    # Try XML: <ID>12345</ID> elements
+    try:
+        import xml.etree.ElementTree as ET
+        # fns_data may be a fragment without a root element — wrap it
+        root = ET.fromstring(fns_data if fns_data.strip().startswith('<') else f'<R>{fns_data}</R>')
+        ids = [el.text.strip() for el in root.iter('ID') if el.text and el.text.strip()]
+        if ids:
+            return sorted(int(i) for i in ids if i.isdigit())
+    except Exception:
+        pass
+    # Fallback: comma or whitespace separated numbers
+    parts = fns_data.replace(',', ' ').split()
+    return sorted(int(p) for p in parts if p.strip().isdigit())
 
 
 # --- DPS error classification (evidence-based, live-proven codes only) --------

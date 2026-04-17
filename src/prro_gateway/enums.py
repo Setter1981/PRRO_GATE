@@ -80,6 +80,9 @@ class ShiftState(StrEnum):
 
 
 class OfflineSessionState(StrEnum):
+    # NOTE: OPENING and CLOSING are defined for schema compatibility but are intentionally
+    # never written by the implementation. Sessions are created as OPEN and closed as CLOSED
+    # atomically. Do not add writes for these values without also adding startup recovery.
     OPENING = "OPENING"
     OPEN = "OPEN"
     CLOSING = "CLOSING"
@@ -89,6 +92,10 @@ class OfflineSessionState(StrEnum):
 
 class NodeMode(StrEnum):
     ONLINE = "ONLINE"
+    # NOTE: GOING_OFFLINE and GOING_ONLINE are defined for schema compatibility but are
+    # intentionally never written by the implementation. The ONLINE→OFFLINE transition is
+    # atomic (single commit). No transitional state is persisted. Do not add writes for
+    # these values without also adding startup-supervisor recovery and fast-path guards.
     GOING_OFFLINE = "GOING_OFFLINE"
     OFFLINE = "OFFLINE"
     GOING_ONLINE = "GOING_ONLINE"
@@ -157,6 +164,10 @@ class CanonicalErrorCode(StrEnum):
     OFFLINE_BACKLOG_NOT_SYNCED = "OFFLINE_BACKLOG_NOT_SYNCED"
     INVALID_RECEIPT_DATA = "INVALID_RECEIPT_DATA"
     RETURN_LINKAGE_REQUIRED = "RETURN_LINKAGE_REQUIRED"
+    NODE_ALREADY_OFFLINE = "NODE_ALREADY_OFFLINE"
+    NODE_NOT_OFFLINE = "NODE_NOT_OFFLINE"
+    OFFLINE_RANGE_CONFLICT = "OFFLINE_RANGE_CONFLICT"
+    STOP_MODE_ACTIVE = "STOP_MODE_ACTIVE"
 
     @property
     def retryable(self) -> bool:
@@ -196,6 +207,10 @@ _CANONICAL_ERROR_MESSAGES = {
     CanonicalErrorCode.OFFLINE_BACKLOG_NOT_SYNCED: "Operation blocked: unsynced offline documents pending DPS submission.",
     CanonicalErrorCode.INVALID_RECEIPT_DATA: "Receipt data failed fiscal validation.",
     CanonicalErrorCode.RETURN_LINKAGE_REQUIRED: "RETURN requires related_receipt_id (original receipt reference). Missing linkage is a compliance risk.",
+    CanonicalErrorCode.NODE_ALREADY_OFFLINE: "Node is already in OFFLINE mode.",
+    CanonicalErrorCode.NODE_NOT_OFFLINE: "Node is not in OFFLINE mode.",
+    CanonicalErrorCode.OFFLINE_RANGE_CONFLICT: "Offline range conflicts with an existing active range.",
+    CanonicalErrorCode.STOP_MODE_ACTIVE: "Node is in STOP_MODE: DB integrity check failed. Contact operator.",
 }
 
 

@@ -247,6 +247,66 @@ class PaymentTypeDefRecord(StrictModel):
     updated_at: str | None = None
 
 
+class FiscalNumberConfigRecord(StrictModel):
+    fiscal_number: str
+    enforce_blocked_mode: int = Field(default=0, ge=0, le=1)
+    min_offline_codes: int = Field(default=0, ge=0)
+    max_offline_codes: int = Field(default=0, ge=0)
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class CertStatusCacheRecord(StrictModel):
+    fiscal_number: str
+    cert_fingerprint: str
+    status: str  # 'good' | 'revoked' | 'unknown' | 'unreachable'
+    revoked_at: str | None = None
+    this_update: str
+    next_update: str | None = None
+    last_checked_at: str
+    last_error: str | None = None
+    source: str  # 'ocsp' | 'crl' | 'admin_refresh' | 'cached'
+
+
+class CertWatchConfigRecord(StrictModel):
+    id: int = Field(default=1, ge=1, le=1)
+    enabled: int = Field(default=0, ge=0, le=1)
+    polling_interval_seconds: int = Field(default=1800, ge=1)
+    request_timeout_seconds: int = Field(default=5, ge=1)
+    ocsp_url_override: str | None = None
+    fallback_to_crl: int = Field(default=1, ge=0, le=1)
+    updated_at: str | None = None
+
+
+class OperatorCertRecord(StrictModel):
+    """Resolved end-entity signing certificate for a PRRO fiscal_number.
+
+    Populated by the cert_provisioning service at onboarding and kept
+    fresh by `refresh_expiring_certs`. Consumed by the signing path.
+    """
+    fiscal_number: str
+    cert_fingerprint: str
+    ski_hex: str
+    cert_der: bytes
+    subject_dn: str | None = None
+    issuer_dn: str | None = None
+    valid_from: str | None = None
+    valid_to: str | None = None
+    fetched_at: str
+    source: str  # 'container' | 'cmp' | 'manual'
+    last_refresh_at: str | None = None
+
+
+class CertProvisioningConfigRecord(StrictModel):
+    id: int = Field(default=1, ge=1, le=1)
+    primary_cmp_url: str = 'http://acskidd.gov.ua:80'
+    fallback_cmp_url: str | None = None
+    timeout_seconds: int = Field(default=10, ge=1)
+    cache_ttl_seconds: int = Field(default=3600, ge=0)
+    refresh_within_days: int = Field(default=30, ge=0)
+    updated_at: str | None = None
+
+
 class AuditLogRecord(StrictModel):
     audit_id: int
     created_at: datetime | None = None
@@ -282,6 +342,18 @@ class ProtocolTraceRecord(StrictModel):
     source_port: int | None = None
 
 
+class CaEndpointRecord(StrictModel):
+    id: int | None = None
+    name: str
+    cmp_url: str | None = None
+    tsp_url: str | None = None
+    ocsp_url: str | None = None
+    issuer_pattern: str | None = None
+    priority: int = 100
+    enabled: int = 1
+    created_at: datetime | None = None
+
+
 class TransportTraceRecord(StrictModel):
     trace_id: str
     created_at: datetime | None = None
@@ -303,6 +375,8 @@ class TransportTraceRecord(StrictModel):
 __all__ = [
     'InboxRecord', 'FiscalDocumentRecord', 'ChannelLock', 'ShiftRecord', 'NodeStateRecord',
     'OfflineRangeRecord', 'OfflineSessionRecord', 'BackendProfileRecord', 'TransportProfileRecord',
-    'DocumentFileRecord', 'ExciseMarkRecord', 'PaymentTypeDefRecord',
+    'DocumentFileRecord', 'ExciseMarkRecord', 'PaymentTypeDefRecord', 'FiscalNumberConfigRecord',
+    'CertStatusCacheRecord', 'CertWatchConfigRecord',
+    'OperatorCertRecord', 'CertProvisioningConfigRecord', 'CaEndpointRecord',
     'AuditLogRecord', 'ProtocolTraceRecord', 'TransportTraceRecord',
 ]

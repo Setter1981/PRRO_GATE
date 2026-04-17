@@ -27,8 +27,8 @@ class ReconciliationService:
         self.max_recovery_attempts = max_recovery_attempts
         self.crypto_provider = crypto_provider
 
-    def reconcile_pending(self, conn) -> ReconciliationRunResult:
-        docs = FiscalDocumentRepository.get_pending_for_reconciliation(conn)
+    def reconcile_pending(self, conn, fiscal_number: str | None = None) -> ReconciliationRunResult:
+        docs = FiscalDocumentRepository.get_pending_for_reconciliation(conn, fiscal_number=fiscal_number)
         result = ReconciliationRunResult(checked=len(docs))
         for doc in docs:
             # Skip rate-limited docs whose cooldown has not expired
@@ -145,6 +145,12 @@ class ReconciliationService:
                 conn.commit()
                 result.rejected += 1
             elif poll.retryable or poll.state == DocumentState.ERROR_RETRYABLE.value:
+                # REQUIRES_MANUAL_RECONCILIATION + DPS still not ready: keep state as-is.
+                # Auto-close happens only on ACK/REJECTED (above). Retryable response means
+                # DPS is still processing — operator is already aware, no state change needed.
+                if doc.state == DocumentState.REQUIRES_MANUAL_RECONCILIATION:
+                    result.still_pending += 1
+                    continue
                 conn.execute('BEGIN IMMEDIATE')
                 current = FiscalDocumentRepository.get_by_id(conn, doc.document_id)
                 attempts = (current.recovery_attempts if current else 0) + 1
