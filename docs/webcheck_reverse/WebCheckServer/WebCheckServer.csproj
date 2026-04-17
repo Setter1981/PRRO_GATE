@@ -1,0 +1,114 @@
+<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
+  <PropertyGroup>
+    <AssemblyName>WebCheckServer</AssemblyName>
+    <GenerateAssemblyInfo>False</GenerateAssemblyInfo>
+    <UseWindowsForms>True</UseWindowsForms>
+    <TargetFramework>net461</TargetFramework>
+    <PlatformTarget>x86</PlatformTarget>
+  </PropertyGroup>
+  <PropertyGroup>
+    <LangVersion>11.0</LangVersion>
+    <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <PropertyGroup />
+  <ItemGroup />
+  <ItemGroup>
+    <Reference Include="Microsoft.VisualBasic" />
+    <Reference Include="WebCheck1">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck1.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck2">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck2.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck3">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck3.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck4">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck4.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck5">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck5.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck6">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck6.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck7">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck7.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck8">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck8.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck9">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck9.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck10">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck10.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck11">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck11.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck12">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck12.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck13">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck13.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck14">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck14.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck15">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck15.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck16">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck16.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck17">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck17.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck18">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck18.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck19">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck19.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck20">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck20.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck21">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck21.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck22">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck22.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck23">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck23.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck24">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck24.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck25">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck25.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck26">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck26.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck27">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck27.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck28">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck28.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck29">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck29.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck30">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck30.dll</HintPath>
+    </Reference>
+    <Reference Include="System.Xml">
+      <HintPath>../../../../../../home/setter/.dotnet/shared/Microsoft.NETCore.App/6.0.36/System.Xml.dll</HintPath>
+    </Reference>
+    <Reference Include="WebCheck">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/WebCheck.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>
