@@ -2,8 +2,8 @@
 
 ## Multi-Protocol PRRO Gateway — Snapshot покриття вимог тестами
 
-**Версія:** Sprint 10 snapshot, 2026-04-14  
-**Baseline тести:** `pytest -q` → **563 passed, 0 failed**  
+**Версія:** Sprint 12 QA coverage sprint snapshot, 2026-04-17  
+**Baseline тести:** `pytest -q` → **837 passed, 0 failed** (+106 vs Sprint 12 baseline 731)  
 **Версія коду:** `1.4.1`  
 **Джерела вимог:** `docs/LEGAL_INVARIANTS.md`, `docs/PROJECT_DOCUMENTATION_AND_SPRINT_PLAN.md`, ФСКО протокол v2.2.3  
 **Authoritative DPS contract:** `transports/proto/fiscal_server.proto` + `docs/dps_protocol/262576_(1).md` (gRPC API)  
@@ -11,6 +11,7 @@
 **Sprint 7 live proof:** SHIFT_OPEN→SELL→Z_REPORT on `cabinet.tax.gov.ua:9443`  
 **Sprint 8 live proof:** Full REST→write-path→sidecar→DPS e2e + RETURN  
 **Sprint 9:** SERVICE_IN/OUT, CASH_WITHDRAWAL, tax groups, canonical XML, excise compliance guards  
+**Sprint 10:** ФСКО повний протокол (D/S/L/EPZ/E), знижки, E2E lifecycle  
 **Post-review fixes:** PRRO_GATE-lp3 (MAC recovery semantic), PRRO_GATE-4wi (offline replay fields), PRRO_GATE-r2c (DPS status classification)
 
 ---
@@ -31,9 +32,9 @@
 | INV-10 | Офлайн ≤ 168 год/місяць | `test_gate1d_offline_limits.py` | ✅ Покрито |
 | INV-11 | Офлайн вимагає виданого діапазону | `test_gate1c_offline.py`, `test_gate1o_offline_field_consistency.py` | ✅ Покрито |
 | INV-12 | Один офлайн-номер — один документ | `test_gate1p_offline_idempotency.py`, `test_gate1o_offline_field_consistency.py` | ✅ Покрито |
-| INV-13 | Офлайн-чек ≠ фінальний DPS ACK | — | ❌ КРИТИЧНИЙ GAP (Sprint 1) |
-| INV-14 | Офлайн-документи зберігаються до DPS ACK | — | ❌ GAP (Sprint 2) |
-| INV-15 | Z-звіт блокується при pending offline | — | ❌ GAP (Sprint 2+) |
+| INV-13 | Офлайн-чек ≠ фінальний DPS ACK | `services/write_path.py:717` (`OFFLINE_LOCAL_ACK`) | ✅ Покрито |
+| INV-14 | Офлайн-документи зберігаються до DPS ACK | `services/offline_sync.py` — `OfflineSyncService.sync_pending()` | ✅ Покрито |
+| INV-15 | Z-звіт блокується при pending offline | `write_path.py:1174-1190` — guard `OFFLINE_BACKLOG_NOT_SYNCED` | ✅ Покрито |
 | INV-16 | Акцизні товари: УКТЗЕД + марка | `test_gate1i_adapter_schema.py` (partial) | ⚠️ Часткове |
 | INV-17 | Passthrough заборонено в production | `test_gate3a_crypto_seam.py`, `test_gate3c_crypto_config_seam.py`, `test_sprint6_crypto_gate.py` | ✅ Покрито (startup gate Sprint 6) |
 | INV-18 | Crypto/network поза SQLite-транзакцією | `test_gate3a_crypto_seam.py`, `test_gate3d_crypto_timeout.py` | ✅ Покрито |
@@ -48,13 +49,13 @@
 
 | Вимога | Статус | Примітка |
 |---|---|---|
-| CI / test layers | ✅ | pytest, 393 тестів (Sprint 7) |
+| CI / test layers | ✅ | pytest, 586 тестів (Sprint 10 wave 2) |
 | Baseline architecture map | ✅ | `docs/Multi-Protocol_PRRO_Gateway.md`, `docs/PROJECT_DOCUMENTATION_AND_SPRINT_PLAN.md` |
 | Acceptance coverage snapshot | ✅ | Цей документ |
 | Тести розділені unit/integration/e2e | ⚠️ | Всі тести в `tests/`, без явних маркерів. Функціонально інтеграційні. |
 | Зовнішні залежності задокументовані | ✅ | `requirements-dev.txt`, `pyproject.toml` |
 | Legal invariants зафіксовані | ✅ | `docs/LEGAL_INVARIANTS.md` |
-| Green baseline suite | ✅ | 393/393 passed (Sprint 7, 2026-04-13) |
+| Green baseline suite | ✅ | 586/586 passed (Sprint 10 wave 2, 2026-04-15) |
 
 **Висновок Gate 0:** Закритий з відміткою ⚠️ на відсутність pytest-маркерів unit/integration/e2e.
 
@@ -108,9 +109,9 @@
 | Offline ranges / limits / watermarks | `test_gate1d_offline_limits.py`, `test_gate1c_offline.py` | ✅ Limits покрито |
 | Reconnect reconcile | `test_gate1q_offline_reconciliation.py` | ✅ |
 | LND sequence recovery after offline crash | `test_gate1l_lnd_integrity.py` (partial) | ⚠️ Часткове |
-| Offline state model correction | — | ❌ КРИТИЧНИЙ GAP (Sprint 1) |
+| Offline state model correction | `write_path.py:717` (`OFFLINE_LOCAL_ACK`) | ✅ Закрито |
 
-**Висновок Gate 3:** Не закритий. Критичний gap: офлайн-чек неправильно повертає `ACK` замість `OFFLINE_LOCAL_ACK`.
+**Висновок Gate 3:** Закритий. `OFFLINE-STATE-01` закритий у `write_path.py:717` (`OFFLINE_LOCAL_ACK`). `OFFLINE-SYNC-01` закритий у `services/offline_sync.py`. `SHIFT-CLOSE-01` закритий у `write_path.py:1174-1190` (guard `OFFLINE_BACKLOG_NOT_SYNCED`). Залишається gap: `ASK_OFFLINE_CODES` API-flow не покрито тестами.
 
 ---
 
@@ -131,12 +132,12 @@
 
 ### P0 — Critical Legal Gaps (Sprint 1–2)
 
-| Gap | Опис | Sprint |
-|---|---|---|
-| **OFFLINE-STATE-01** | Офлайн-документ повертає `ACK` замість `OFFLINE_LOCAL_ACK`. Юридично помилково. | Sprint 1 |
-| **OFFLINE-SYNC-01** | `OfflineSyncService` відсутній. Офлайн-документи ніколи не передаються в DPS. | Sprint 2 |
-| **SHIFT-CLOSE-01** | `SHIFT_CLOSE` не перевіряє наявність pending offline-документів. | Sprint 2+ |
-| **RECEIPT-VAL-01** | Немає Ukrainian fiscal receipt validator (обов'язкові поля за документ-типом). | P0 |
+| Gap | Опис | Sprint | Статус |
+|---|---|---|---|
+| **OFFLINE-STATE-01** | Офлайн-документ повертає `ACK` замість `OFFLINE_LOCAL_ACK`. | Sprint 1 | ✅ Closed — `write_path.py:717` |
+| **OFFLINE-SYNC-01** | `OfflineSyncService` відсутній. | Sprint 2 | ✅ Closed — `services/offline_sync.py` |
+| **SHIFT-CLOSE-01** | `SHIFT_CLOSE` не перевіряє pending offline-документи. | Sprint 2 | ✅ Closed — `write_path.py:1174-1190` |
+| **RECEIPT-VAL-01** | Ukrainian fiscal receipt validator. | Sprint 3 | ✅ Closed — `validators/ua_receipt.py`, `test_sprint3_ua_receipt_validator.py` |
 
 ### P1 — Production Readiness Gaps
 
@@ -246,6 +247,17 @@
 | `test_reconciliation.py` | Reconciliation service |
 | `test_perf_ops.py` | Performance smoke |
 | `test_manifest_validation.py` | Schema manifest |
+| `test_sprint10_payment_types.py` | Payment type config, CASHLESS guard |
+| `test_sprint10_cash_balance.py` | Cash balance carry-over between shifts |
+| `test_sprint10_change.py` | Решта (PAID − total_sum) |
+| `test_sprint10_rounding.py` | Fiscal rounding rules |
+| `test_sprint10_epz.py` | CASH_WITHDRAWAL через ЕПЗ |
+| `test_sprint10_xreport.py` | X-звіт (проміжний без закриття) |
+| `test_sprint10_canonical_layer.py` | Canonical model coverage (discounts, tax_id) |
+| `test_sprint10_discounts.py` | `<D>`/`<S>` discount/surcharge serialization |
+| `test_sprint10_wave2_l_epz.py` | `<L>` text comment, `<EPZ>` Z-report element |
+| `test_sprint9_full_e_element.py` | `<E>` з FN/NO/SM/TS, `<TX>` blocks, _calc_tax |
+| `test_e2e_lifecycle.py` | Full fiscal lifecycle E2E (7 операцій, ACK, LND) |
 
 ---
 
@@ -360,7 +372,7 @@
 | TXAL=0 (ПДВ в ціні) | FE4 | ✅ |
 | TXAL=2 (акциз на ціну з ПДВ) | FE5 | ✅ |
 | tax_groups з DB до `<E>` через pipeline | FE6 | ✅ |
-| Backward compat (без tax_groups → мінімальний E) | FE1 | ✅ |
+| Без tax_groups → `<E>` з повними атрибутами FN/NO/SM/TS (без `<TX>`) | FE1 | ✅ |
 
 ### Full Z-звіт (Sprint 9 step 5):
 
@@ -382,7 +394,7 @@
 | **DPS-XML-CA-01** | ✅ Closed | `<CA>` серіалізується в XML (Sprint 9 step 6) |
 | **DPS-XML-CZD-01** | ✅ Closed | CZD серіалізується в XML (Sprint 9 step 6) |
 | **CASH-BALANCE-01** | P1 | Залишок готівки не трекається / не переноситься між змінами |
-| **OFFLINE-STATE-01** | P1 | OFFLINE_LOCAL_ACK повертає ACK замість правильного стану |
+| **OFFLINE-STATE-01** | ✅ Closed | `write_path.py:717` (`OFFLINE_LOCAL_ACK`) — закритий |
 | **DPS-SIDECAR-PROD-01** | P1 | Sidecar PoC: single-threaded, no TLS |
 | **DPS-UNIFIED-01** | P1 | DPS_UNIFIED_WINDOW transport — stub |
 | **CASH-WITHDRAWAL-01** | ✅ Closed | CASH_WITHDRAWAL T=8 реалізований (Sprint 9 step 7) |
@@ -414,4 +426,133 @@
 
 ---
 
-*Snapshot оновлений на дату Sprint 9 post-review (2026-04-14). Повинен оновлюватись після кожного Sprint.*
+## 9. Sprint 10 — ФСКО Full Protocol + Discounts + E2E (completed)
+
+**Sprint 10 wave 1** (canonical layer, payment types, cash balance, X-report, EPZ):
+
+| Deliverable | Tests | Status |
+|---|---|---|
+| Payment type config (per FN) | `test_sprint10_payment_types.py` | ✅ |
+| Cash balance carry-over | `test_sprint10_cash_balance.py` | ✅ |
+| Решта (PAID − total_sum) serialization | `test_sprint10_change.py` | ✅ |
+| Fiscal rounding rules | `test_sprint10_rounding.py` | ✅ |
+| CASH_WITHDRAWAL (T=8) via ЕПЗ | `test_sprint10_epz.py` | ✅ |
+| X-звіт (X_REPORT — проміжний) | `test_sprint10_xreport.py` | ✅ |
+| Canonical layer (discounts, tax_id/tax_id_2) | `test_sprint10_canonical_layer.py` | ✅ |
+
+**Sprint 10 wave 2** (ФСКО protocol elements + E2E lifecycle):
+
+| Feature | Tests | Code | Status |
+|---|---|---|---|
+| `<D>/<S>` — знижка/надбавка на `<P>` | `test_sprint10_discounts.py` | `dps_xml.py` | ✅ |
+| `<L>` — текстовий коментар (header/footer) | L1-L5 | `dps_xml.py:_build_check/_build_service` | ✅ |
+| `<EPZ>` — підсумки ЕПЗ у Z-звіті | EPZ1-EPZ3 | `dps_xml.py:_build_z_report` | ✅ |
+| `<E>` завжди з FN/NO/SM/TS (без tax_groups) | FE1 | `dps_xml.py:_build_e_element` | ✅ |
+| `Discount.value ge=0` в canonical model | `test_models.py` | `models/canonical.py` | ✅ |
+| `tax_id`/`tax_id_2` в `CanonicalReceiptItem` | `test_sprint10_canonical_layer.py` | `models/canonical.py` | ✅ |
+| Full E2E lifecycle (7 ops, ACK, LND, outbox) | `test_e2e_lifecycle.py` | `services/write_path.py` | ✅ |
+
+### Sprint 10 — Known Gaps
+
+| Gap | Severity | Notes |
+|---|---|---|
+| **CASH-BALANCE-01** | P1 | Cash balance не переноситься в DPS XML (тільки локально) |
+| **ASK-OFFLINE-CODES-01** | P1 | API-flow запиту діапазону офлайн-кодів не покрито E2E |
+| **RATE-LIMIT-01** | P2 | Rate limiting для ingress відсутній |
+| **BACKUP-01** | P2 | Backup / corruption stop mode відсутній |
+
+---
+
+## 10. Roadmap — Sprint 11–14
+
+> Детальний покроковий план: `docs/SPRINT_11_14_DETAILED_PLAN.md`
+
+### Sprint 11 — Offline Full Lifecycle
+
+**Мета:** закрити всі offline-state gap-и одним вертикальним зрізом.
+
+| Gap | Що закриває | Пріоритет |
+|---|---|---|
+| **INV-08** | API-driven GO_OFFLINE flow (не manual DB seed) | P1 |
+| **ASK-OFFLINE-CODES-01** | E2E тест: запит діапазону → зберігання → використання | P1 |
+| **LND-OFFLINE-CRASH-01** | LND crash+recovery під час офлайн-сесії | P1 |
+| **INV-06 / CHANNEL-FAILOVER-01** | Тест: failover заборонений під час активної зміни | P1 |
+
+**Deliverables:** тести для GO_OFFLINE API-flow, offline code range request E2E, LND crash recovery scenario, channel failover guard test.
+
+**Acceptance criteria:**
+- GO_OFFLINE і GO_ONLINE ініціюються через API, а не через DB seed;
+- offline номер запитується, зберігається і витрачається атомарно;
+- LND після crash + recovery залишається монотонним;
+- спроба channel switch з відкритою зміною = explicit rejected.
+
+---
+
+### Sprint 12 — Fiscal Compliance Completeness
+
+**Мета:** закрити залишкові фіскальні accuracy gap-и.
+
+| Gap | Що закриває | Пріоритет |
+|---|---|---|
+| **INV-16** | Акцизні товари: adapter → write-path → XML (УКТЗЕД + марка) E2E | P1 |
+| **CASH-BALANCE-01** | Залишок готівки: carry-over між змінами + серіалізація в DPS XML | P1 |
+
+**Deliverables:** повний excise pipeline тест (adapter→serializer), cash balance carry-over в shift open/close flow.
+
+**Acceptance criteria:**
+- підакцизний товар з УКТЗЕД і маркою проходить повний pipeline до XML без помилок;
+- залишок готівки на початку зміни відображає кінець попередньої;
+- спроба продати підакцизний товар без УКТЗЕД = rejected до sign.
+
+---
+
+### Sprint 13 — Production Infrastructure
+
+**Мета:** зробити систему production-deployable.
+
+| Gap | Що закриває | Пріоритет |
+|---|---|---|
+| **DPS-SIDECAR-PROD-01** | Crypto sidecar: TLS, auth, graceful shutdown | P1 |
+| **DPS-UNIFIED-01** | `DPS_UNIFIED_WINDOW` transport (другий DPS контур) | P1 |
+| **RATE-LIMIT-01** | Ingress rate limiting (REST + XML-RPC) | P2 |
+
+**Deliverables:** sidecar з TLS і mutual auth, DPS_UNIFIED_WINDOW transport handler, rate limit middleware.
+
+**Acceptance criteria:**
+- sidecar відхиляє запити без клієнтського сертифіката;
+- DPS_UNIFIED_WINDOW успішно подає mock fiscal document;
+- ingress відхиляє перевищення rate limit з 429 і audit event.
+
+---
+
+### Sprint 14 — Operational Safety + Pilot
+
+**Мета:** operational correctness, data lifecycle, pilot readiness.
+
+| Gap | Що закриває | Пріоритет |
+|---|---|---|
+| **BACKUP-01** | SQLite snapshot job + corruption → STOP_MODE | P2 |
+| **RETENTION-01** | Retention/purge policy для audit/trace/archive | P2 |
+| **DOCS-MISSING-01** | `PROTOCOL_SHAPE_AUDIT.md`, `DPS_TRANSPORT.md`, `OFFLINE_SYNC.md`, `ARCHIVE_POLICY.md` | P2 |
+| **TEST-MARKER-01** | Pytest markers `unit / integration / e2e` | low |
+
+**Deliverables:** backup job + runbook, retention config + purge script, операційні docs, pytest marker taxonomy.
+
+**Acceptance criteria:**
+- автоматичний backup запускається за розкладом і перевіряє цілісність;
+- корупція SQLite переводить ноду в STOP_MODE з видимим health signal;
+- старі audit/trace записи purge'уються за configured TTL;
+- всі 4 docs написані та відповідають поточному коду.
+
+---
+
+### Hygiene (continuous)
+
+| Gap | Severity | Дія |
+|---|---|---|
+| **DPS-TYPING-01** | P3 | `signed_payload: bytes` annotation у DPS transport path |
+| **DPS-STATUSRRO-POST-01** | P3 | post-cleanup `statusRro` probe (JKS не в репо — lower priority) |
+
+---
+
+*Snapshot оновлений на дату Sprint 10 wave 2 (2026-04-15). Повинен оновлюватись після кожного Sprint.*

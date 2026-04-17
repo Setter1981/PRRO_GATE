@@ -286,3 +286,132 @@ def test_gate1h_shutdown_drains_in_flight_sell_no_stuck_processing(tmp_path: Pat
     assert sell_doc[0] == 'ACK', (
         f'SELL document must be ACK after drain-completed shutdown, got {sell_doc[0]!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Scenario C — two pending docs, no stuck PROCESSING after shutdown
+# ---------------------------------------------------------------------------
+
+def _mock_handler_fast(request: httpx.Request) -> httpx.Response:
+    """Fast (non-blocking) mock — all paths return immediately."""
+    path = request.url.path
+    if path.endswith('/cashier/signinPinCode'):
+        return httpx.Response(200, json={'access_token': 'mock-token-gate1h-c'})
+    if path.endswith('/shifts'):
+        return httpx.Response(200, json={
+            'id': 'gate1h-c-shift-001',
+            'status': 'OPENED',
+            'fiscal_code': 'SHIFT-GATE1H-C-001',
+            'updated_at': '2026-03-29T18:00:00+00:00',
+        })
+    if path.endswith('/receipts/sell'):
+        return httpx.Response(200, json={
+            'id': 'gate1h-c-receipt',
+            'status': 'DONE',
+            'fiscal_code': 'RCPT-GATE1H-C',
+            'updated_at': '2026-03-29T18:01:00+00:00',
+        })
+    raise AssertionError(f'gate1h_c_mock: unexpected {request.method} {request.url}')
+
+
+def _config_c(tmp_path: Path) -> AppConfig:
+    return AppConfig.from_mapping({
+        'database': {
+            'db_path': str(tmp_path / 'gate1h_c.sqlite3'),
+            'sql_dir': str(ROOT / 'sql'),
+            'auto_migrate': True,
+        },
+        'defaults': {
+            'fiscal_number': FISCAL_NUMBER,
+            'backend_profile_id': BACKEND_PROFILE,
+            'transport_profile_id': TRANSPORT_PROFILE,
+            'channel_owner': 'gate1h-c',
+        },
+        'runtime': {
+            'process_immediately': True,
+            'graceful_shutdown_timeout_seconds': 10,
+        },
+        'checkbox': {
+            'endpoint': 'https://api.checkbox.mock/api/v1',
+            'license_key': 'GATE1H-C-LIC',
+            'cashier_pin': '0000',
+        },
+    })
+
+
+def test_shutdown_no_stuck_processing_with_two_pending(tmp_path: Path) -> None:
+    """After shutdown, no documents remain in PROCESSING (2 pending docs)."""
+    cfg = _config_c(tmp_path)
+    transport_client = httpx.Client(transport=httpx.MockTransport(_mock_handler_fast))
+    container = RuntimeContainer(cfg, transport_http_client=transport_client)
+
+    with TestClient(create_app(container)) as client:
+        # Open shift first
+        r_shift = client.post('/v1/ingress/checkbox', json={
+            'context': {
+                'request_id': 'gate1h-c-open',
+                'fiscal_number': FISCAL_NUMBER,
+                'backend_profile_id': BACKEND_PROFILE,
+                'transport_profile_id': TRANSPORT_PROFILE,
+                'channel_owner': 'gate1h-c',
+                'business_ts': '2026-03-29T18:00:00Z',
+            },
+            'operation': 'SHIFT_OPEN',
+            'request': {
+                'external_request_id': 'ext-open-gate1h-c',
+                'cashier_id': 'cashier-gate1h-c',
+            },
+        })
+        assert r_shift.status_code == 200, f'SHIFT_OPEN failed: {r_shift.text}'
+        assert r_shift.json().get('document_state') == 'ACK', (
+            f'SHIFT_OPEN not ACK: {r_shift.json()}'
+        )
+
+        # Send 2 SELL requests sequentially (process_immediately=True ensures they complete)
+        for i in range(2):
+            r_sell = client.post('/v1/ingress/checkbox', json={
+                'context': {
+                    'request_id': f'gate1h-c-sell-{i:03d}',
+                    'fiscal_number': FISCAL_NUMBER,
+                    'backend_profile_id': BACKEND_PROFILE,
+                    'transport_profile_id': TRANSPORT_PROFILE,
+                    'channel_owner': 'gate1h-c',
+                    'business_ts': f'2026-03-29T18:0{i+1}:00Z',
+                },
+                'operation': 'SELL',
+                'request': {
+                    'external_request_id': f'ext-sell-gate1h-c-{i}',
+                    'cashier_id': 'cashier-gate1h-c',
+                    'goods': [{'name': 'Widget', 'price': 500, 'quantity': 1000}],
+                    'payments': [{'type': 'CASH', 'amount': 500}],
+                },
+            })
+            assert r_sell.status_code == 200, f'SELL {i} failed: {r_sell.text}'
+
+        # Exit the `with` block → shutdown() fires
+    # shutdown() has returned here
+
+    assert container.ingress_service.active_operations == 0, (
+        'active_operations must be 0 after shutdown'
+    )
+    assert container.health.live is False, 'health.live must be False after shutdown'
+
+    with container.connect() as conn:
+        processing_count = conn.execute(
+            "SELECT COUNT(*) FROM ingress_inbox WHERE status = 'PROCESSING'"
+        ).fetchone()[0]
+        sell_docs = conn.execute(
+            "SELECT state FROM fiscal_documents WHERE doc_type = 'SELL'"
+        ).fetchall()
+
+    assert processing_count == 0, (
+        f'No inbox records must remain in PROCESSING after shutdown, '
+        f'found {processing_count}'
+    )
+    assert len(sell_docs) == 2, (
+        f'Expected 2 SELL documents, got {len(sell_docs)}: {sell_docs}'
+    )
+    non_ack = [row[0] for row in sell_docs if row[0] != 'ACK']
+    assert non_ack == [], (
+        f'SELL documents must be ACK after graceful shutdown, non-ACK states: {non_ack}'
+    )
