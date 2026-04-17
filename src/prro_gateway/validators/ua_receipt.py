@@ -72,14 +72,51 @@ def validate_sell_return_receipt(payload: dict[str, Any]) -> list[str]:
     has_goods = isinstance(goods, list) and len(goods) > 0
     has_payments = isinstance(payments, list) and len(payments) > 0
 
+    if has_goods:
+        goods_sum = sum(int(item.get('sum', 0)) for item in goods if isinstance(item, dict))
+        total_discounts = 0
+        total_extra_charges = 0
+        
+        # Line-level discounts
+        for item in goods:
+            if not isinstance(item, dict):
+                continue
+            line_sum = int(item.get('sum', 0))
+            for d in (item.get('discounts') or []):
+                if not isinstance(d, dict):
+                    continue
+                v = int(d.get('value', 0))
+                d_mode = d.get('mode', 'VALUE')
+                d_sm = round(line_sum * v / 100) if d_mode == 'PERCENT' else v
+                if d.get('type', 'DISCOUNT') == 'EXTRA_CHARGE':
+                    total_extra_charges += d_sm
+                else:
+                    total_discounts += d_sm
+                    
+        # Check-level discounts
+        check_discounts = receipt.get('discounts') or []
+        for d in check_discounts:
+            if not isinstance(d, dict):
+                continue
+            v = int(d.get('value', 0))
+            d_mode = d.get('mode', 'VALUE')
+            d_sm = round(goods_sum * v / 100) if d_mode == 'PERCENT' else v
+            if d.get('type', 'DISCOUNT') == 'EXTRA_CHARGE':
+                total_extra_charges += d_sm
+            else:
+                total_discounts += d_sm
+                
+        expected_total_sum = goods_sum - total_discounts + total_extra_charges
+    else:
+        expected_total_sum = 0
+
     if has_totals:
         total_sum = totals['total_sum']
 
         if has_goods:
-            goods_sum = sum(int(item.get('sum', 0)) for item in goods if isinstance(item, dict))
-            if goods_sum != total_sum:
+            if expected_total_sum != total_sum:
                 errors.append(
-                    f'totals.total_sum={total_sum} != sum(goods.sum)={goods_sum}'
+                    f'totals.total_sum={total_sum} != goods_sum({goods_sum}) - discounts({total_discounts}) + extra({total_extra_charges}) = {expected_total_sum}'
                 )
 
         if has_payments:
@@ -91,12 +128,11 @@ def validate_sell_return_receipt(payload: dict[str, Any]) -> list[str]:
                     f'underpayment: totals.total_sum={total_sum} > sum(payments.amount)={payments_sum}'
                 )
     elif has_goods and has_payments:
-        # Fallback: no totals — payments must not be less than goods sum
-        goods_sum = sum(int(item.get('sum', 0)) for item in goods if isinstance(item, dict))
+        # Fallback: no totals — payments must not be less than expected_total_sum
         payments_sum = sum(int(item.get('amount', 0)) for item in payments if isinstance(item, dict))
-        if payments_sum < goods_sum:
+        if payments_sum < expected_total_sum:
             errors.append(
-                f'underpayment: sum(payments.amount)={payments_sum} < sum(goods.sum)={goods_sum} (no totals provided)'
+                f'underpayment: sum(payments.amount)={payments_sum} < expected_total={expected_total_sum} (no totals provided)'
             )
 
     return errors

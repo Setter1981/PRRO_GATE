@@ -133,7 +133,7 @@ def test_v6b_payments_goods_mismatch_without_totals() -> None:
         },
     }
     errors = validate_sell_return_receipt(payload)
-    assert any('payments' in e and 'goods' in e for e in errors), (
+    assert any('underpayment' in e for e in errors), (
         f'Goods/payments mismatch without totals must fail: {errors}'
     )
 
