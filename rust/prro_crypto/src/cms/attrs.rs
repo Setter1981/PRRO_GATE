@@ -10,10 +10,11 @@
 //! (not raw content). This module builds the SET and returns the DER bytes.
 
 use crate::cms::{oids, profile::CmsProfile};
-use der::{asn1::{OctetString, SetOfVec}, Decode, Encode, Sequence};
+use der::{asn1::OctetString, Decode, Encode};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum AttrsError {
     #[error("DER encode failure: {0}")]
     Der(String),
@@ -43,6 +44,19 @@ pub fn build_signed_attrs(
     profile: CmsProfile,
     content_digest: &[u8],
     cert_der: &[u8],
+) -> Result<SignedAttrsBlob, AttrsError> {
+    build_signed_attrs_with_time(profile, content_digest, cert_der, None)
+}
+
+/// Variant of [`build_signed_attrs`] that optionally embeds a
+/// `signingTime` attribute (UTCTIME) — present in the official ЦЗО
+/// CAdES-BES samples. Pass `Some(SystemTime::now())` for production
+/// signing or a fixed `SystemTime` for reproducible test vectors.
+pub fn build_signed_attrs_with_time(
+    profile: CmsProfile,
+    content_digest: &[u8],
+    cert_der: &[u8],
+    signing_time: Option<std::time::SystemTime>,
 ) -> Result<SignedAttrsBlob, AttrsError> {
     if content_digest.len() != profile.digest_len() {
         return Err(AttrsError::DigestLen {
@@ -74,10 +88,24 @@ pub fn build_signed_attrs(
         value_der: scv2_der,
     };
 
+    // 4. signingTime attribute (optional). UTCTIME yyMMddHHmmssZ. Per
+    //    CAdES-BES, range 1950–2049 must use UTCTIME, 2050+ must switch
+    //    to GeneralizedTime. We hard-fail past 2049 to surface the
+    //    issue when the rollover gets close, rather than emit an
+    //    invalid attribute silently.
+    let signing_time_attr = match signing_time {
+        None => None,
+        Some(t) => Some(Attribute {
+            oid: oids::ID_SIGNING_TIME,
+            value_der: encode_signing_time_utc(t)?,
+        }),
+    };
+
     Ok(SignedAttrsBlob {
         content_type,
         message_digest,
         signing_cert_v2,
+        signing_time: signing_time_attr,
     })
 }
 
@@ -87,6 +115,10 @@ pub struct SignedAttrsBlob {
     pub content_type: Attribute,
     pub message_digest: Attribute,
     pub signing_cert_v2: Attribute,
+    /// Optional `signingTime` per RFC 5652 §11.3. Included by every
+    /// official ЦЗО CAdES-BES sample we examined; emitting it makes
+    /// `prro_crypto` output structurally indistinguishable from those.
+    pub signing_time: Option<Attribute>,
 }
 
 impl SignedAttrsBlob {
@@ -95,14 +127,14 @@ impl SignedAttrsBlob {
     /// Note: for signing purposes CMS uses IMPLICIT [0] tagged form,
     /// but the DIGEST input is always the explicit SET OF form bytes.
     pub fn to_der_set_of(&self) -> Result<Vec<u8>, AttrsError> {
-        // Build individual attribute DER encodings, then wrap in SET OF.
-        let a1 = self.content_type.to_der()?;
-        let a2 = self.message_digest.to_der()?;
-        let a3 = self.signing_cert_v2.to_der()?;
-
-        // Manual SET OF assembly: SET tag 0x31, length, sorted contents.
-        // In DER SET OF, elements must be sorted by byte representation.
-        let mut elements = vec![a1, a2, a3];
+        let mut elements: Vec<Vec<u8>> = Vec::with_capacity(4);
+        elements.push(self.content_type.to_der()?);
+        elements.push(self.message_digest.to_der()?);
+        elements.push(self.signing_cert_v2.to_der()?);
+        if let Some(ref st) = self.signing_time {
+            elements.push(st.to_der()?);
+        }
+        // DER SET OF requires elements sorted by their byte encoding.
         elements.sort();
 
         let total_len: usize = elements.iter().map(|e| e.len()).sum();
@@ -114,6 +146,64 @@ impl SignedAttrsBlob {
         }
         Ok(out)
     }
+}
+
+/// Encode a `SystemTime` as the DER bytes of a `signingTime` attribute
+/// VALUE (the UTCTIME inside the SET OF wrapper). UTCTIME format is
+/// `yyMMddHHmmssZ` — 13 ASCII bytes. Years 2050+ would require
+/// GeneralizedTime instead and are explicitly rejected here so we
+/// surface the rollover well before it bites.
+fn encode_signing_time_utc(t: std::time::SystemTime) -> Result<Vec<u8>, AttrsError> {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| AttrsError::Der("signing_time before UNIX epoch".into()))?
+        .as_secs();
+    let (year, month, day, hour, minute, second) = unix_secs_to_utc(secs);
+    if !(1950..=2049).contains(&year) {
+        return Err(AttrsError::Der(format!(
+            "signingTime year {} outside UTCTIME range 1950..=2049 — \
+             switch to GeneralizedTime is required",
+            year
+        )));
+    }
+    let yy = year % 100;
+    let s = format!(
+        "{:02}{:02}{:02}{:02}{:02}{:02}Z",
+        yy, month, day, hour, minute, second
+    );
+    let bytes = s.as_bytes();
+    debug_assert_eq!(bytes.len(), 13);
+
+    // UTCTIME tag = 0x17, length = 13, then ASCII content.
+    let mut out = Vec::with_capacity(15);
+    out.push(0x17);
+    out.push(bytes.len() as u8);
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
+/// Convert UNIX seconds-since-epoch into broken-down UTC components.
+/// Hand-rolled to avoid pulling in `chrono` for one tiny use case.
+fn unix_secs_to_utc(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    // Seconds-of-day.
+    let days = secs / 86_400;
+    let sod = (secs % 86_400) as u32;
+    let hour = sod / 3600;
+    let minute = (sod % 3600) / 60;
+    let second = sod % 60;
+
+    // Date from days-since-1970-01-01 via Howard Hinnant's algorithm.
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (mp + if mp < 10 { 3 } else { -9i64 as u64 }) as u32;
+    let year = (y + if month <= 2 { 1 } else { 0 }) as u32;
+    (year, month, day, hour, minute, second)
 }
 
 /// Single Attribute: `SEQUENCE { type OID, values SET OF ANY }`.
@@ -176,7 +266,7 @@ fn encode_length(n: usize, out: &mut Vec<u8>) {
 fn compute_cert_hash(profile: CmsProfile, cert_der: &[u8]) -> Vec<u8> {
     match profile {
         CmsProfile::Dstu4145WithGost34311Pb => {
-            crate::hash::gost_34_311_95(cert_der).to_vec()
+            crate::core::hash::gost_34_311_95(cert_der).to_vec()
         }
     }
 }
@@ -354,7 +444,7 @@ mod tests {
     fn load_test_cert() -> Option<Vec<u8>> {
         let path = "/mnt/d/PRRO_GATE/key_13667753_13667753 (2).jks";
         let data = std::fs::read(path).ok()?;
-        let entry = crate::jks::read_jks(&data, "Jrcfyf123").ok()?;
+        let entry = crate::interop::prro::jks::read_jks(&data, "Jrcfyf123").ok()?;
         entry.certs.into_iter().next()
     }
 

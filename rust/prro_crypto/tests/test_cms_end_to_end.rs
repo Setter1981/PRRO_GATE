@@ -10,7 +10,7 @@
 
 use prro_crypto::{
     cms::{CmsProfile, CmsSigner, DstuInProcessSigner},
-    der, jks,
+    interop::prro::{der, jks},
 };
 
 fn load_signing_material() -> Option<(Vec<u8>, Vec<u8>)> {
@@ -23,7 +23,7 @@ fn load_signing_material() -> Option<(Vec<u8>, Vec<u8>)> {
     Some((cert, d_bytes))
 }
 
-fn bytes_le_to_field(bytes: &[u8], mod_words: usize) -> prro_crypto::field::FieldEl {
+fn bytes_le_to_field(bytes: &[u8], mod_words: usize) -> prro_crypto::core::field::FieldEl {
     let mut words = vec![0u32; mod_words];
     for (i, b) in bytes.iter().enumerate() {
         let wi = i / 4;
@@ -33,7 +33,7 @@ fn bytes_le_to_field(bytes: &[u8], mod_words: usize) -> prro_crypto::field::Fiel
         }
         words[wi] |= (*b as u32) << (bi * 8);
     }
-    prro_crypto::field::FieldEl::from_words(words)
+    prro_crypto::core::field::FieldEl::from_words(words)
 }
 
 #[test]

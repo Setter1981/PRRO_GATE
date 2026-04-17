@@ -1,43 +1,78 @@
-//! prro_crypto — Ukrainian DSTU 4145 cryptography for PRRO fiscal gateway.
+//! `prro_crypto` — DSTU 4145 cryptography and CMS/CAdES pipeline for
+//! Ukrainian fiscal-signing workflows.
 //!
-//! Replaces the Node.js jkurwa sidecar used by Multi-Protocol PRRO Gateway
-//! with a native Rust implementation, exposed via PyO3 for Python callers
-//! and JNI for Android.
+//! The crate is layered so application concerns do not leak into the
+//! cryptographic core:
 //!
-//! ## Phase 2 progress
-//! - Step 1: GF(2^m) polynomial arithmetic — DONE
-//! - Step 2: EC curve params + point operations — DONE
-//! - Step 3: DSTU 4145 sign/verify — pending
-//! - Step 4: GOST 28147-89 cipher — pending
-//! - Step 5: JKS / Key-6.dat / PFX key containers — pending
-//! - Step 6: CMS/PKCS#7 SignedData builder — pending
-//! - Step 7: PyO3 bindings for Python API — pending
+//! - [`core`] — field / curve / scalar arithmetic, constant-time
+//!   DSTU 4145-LE sign + verify (with full public-point validation),
+//!   GOST 34.311-95 hash, CPU-feature-dispatched backends. Knows
+//!   nothing about fiscal documents, ДПС, PRRO, containers, or any
+//!   wire format.
+//! - [`cms`] — CMS/CAdES pipeline on top of `core`: **BES** (RFC 5652),
+//!   **T** (RFC 3161 signature-timestamp), **LT** (RFC 5126
+//!   revocation-values). Also: EnvelopedData decrypt (ECDH cofactor-DH
+//!   through the constant-time ladder), TSP / OCSP / CRL / IIT
+//!   cert-lookup-by-SKI HTTP clients under the `tsp_http` feature,
+//!   shared bounded DER primitives (`asn1_util`). CMS is still
+//!   PRRO-agnostic — any caller with a DSTU cert can use it.
+//! - [`profiles`] — catalogue of (signature-alg, hash-alg) profiles.
+//! - [`interop`] — adapters for specific deployment targets. Today:
+//!   [`interop::prro`] — JKS / PFX / ZS2 / Key-6.dat container readers
+//!   and GOST PBE primitives. Anything Ukraine-fiscal-specific lives
+//!   here.
+//! - [`containers`] — higher-level document wrappers (PDF, XML).
+//!   Placeholder today; future work.
+//!
+//! ## What the crate DOES speak over HTTP
+//!
+//! Under the `tsp_http` feature (default on) the CMS layer ships
+//! blocking HTTP clients for Ukrainian CA-facing services: TSP
+//! (RFC 3161), OCSP (RFC 6960), CRL download, and the IIT proprietary
+//! cert-lookup-by-SKI protocol used by every Ukrainian CSP at
+//! `/services/cmp/`. These are narrowly scoped to CA interaction and
+//! do NOT verify the returned signatures — trust anchoring is TLS to
+//! the CA plus caller-side validation. See `SECURITY.md` at the crate
+//! root for the full trust model and known compromises.
+//!
+//! ## What the crate does NOT ship
+//!
+//! HTTP transport to ДПС itself (sendChkV2 / fiscal-document submit),
+//! fiscal state machines, retry / idempotency policy, PDF or XML
+//! packaging, PKI lifecycle (cert issuance, revocation). Those live
+//! in the application (gateway) layer.
 
-pub mod gf2m;
-pub mod field;
-pub mod fe;          // Phase 2 / Commit 1: fixed-size field types
-pub mod gf2m_257;    // Phase 2 / Commit 2: specialized DSTU PB-257 backend
-pub mod scalar;      // Phase 2 / Commit 4: 256-bit scalar mod n (no BigUint)
-pub mod backend;     // Phase 3 / SIMD dispatch (PCLMULQDQ on x86_64)
-pub mod cms;         // Phase 4 / Sprint 1: CAdES-BES detached builder (v1 skeleton)
-pub mod hash;        // Phase 4 / Sprint 1.1: GOST 34.311 (+ later Kupyna)
-pub mod curve;
-pub mod point;
-pub mod wnaf;
-pub mod proj;
-pub mod fixed_base;  // Phase 2 / Commit 6: fixed-base scalar mul for G
-pub mod sign;
-pub mod jks;
-pub mod der;
+pub mod core;
+pub mod cms;
+pub mod containers;
+pub mod interop;
+pub mod profiles;
 
 #[cfg(feature = "python")]
 mod python;
 
-// Low-level GF(2^m) primitives (public for Rust callers and tests).
-pub use gf2m::{blength, fmod, fmul, fsqr, finv, mul_1x1, mul_2x2, shift_right};
+// ─── Top-level re-exports for convenient downstream `use`. ──────────────────
+//
+// These are the headline types an integrator imports. They do not
+// replace the layered `core::...` path — anything more specialized
+// must still be reached through the layered namespace.
 
-// High-level types.
-pub use field::FieldEl;
-pub use curve::Curve;
-pub use point::Point;
-pub use sign::{sign, verify, truncate, Signature};
+pub use core::curve::Curve;
+pub use core::field::FieldEl;
+pub use core::point::Point;
+pub use core::sign::{sign, truncate, verify, Signature};
+
+/// Prime the backend dispatch so the first `sign()` in a process does
+/// not pay the one-time `CPUID` probing cost. Operational helper, not
+/// a cryptographic requirement — see `core::backend::warm_up` for the
+/// full rationale.
+pub use core::backend::warm_up;
+
+// Low-level GF(2^m) primitives (`blength`, `fmod`, `fmul`, `fsqr`,
+// `finv`, `mul_1x1`, `mul_2x2`, `shift_right`) are intentionally NOT
+// re-exported at the crate root. Sprint 2.2 API tightening (Expert-2
+// review): public surface is kept to the headline `FieldEl/Curve/Point/
+// sign/verify/warm_up` types so downstream code is not encouraged to
+// build on the variable-time / legacy primitives that still live in
+// `core::gf2m::`. Reach them through `prro_crypto::core::gf2m::…` if
+// genuinely needed for interop or testing.

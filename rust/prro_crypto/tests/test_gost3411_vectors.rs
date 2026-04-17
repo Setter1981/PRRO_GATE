@@ -5,7 +5,7 @@
 
 use serde::Deserialize;
 
-use prro_crypto::hash::gost_34_311_95;
+use prro_crypto::core::hash::gost_34_311_95;
 
 #[derive(Debug, Deserialize)]
 struct Vector {

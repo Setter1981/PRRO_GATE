@@ -1,0 +1,13 @@
+/target
+/Cargo.lock
+**/*.rs.bk
+
+# Large regenerable test vector files (the committed `sign_jkurwa.json`
+# is the small smoke set; `sign_jkurwa_10k.json` is the acceptance-gate
+# file at ~4 MB and is produced by
+# `node scripts/extract_sign_vectors_bulk.js 10000 > …`).
+tests/vectors/sign_jkurwa_10k.json
+tests/vectors/sign_jkurwa_*k.json
+
+# Emitted asm from the CT spot-check script.
+target/release/deps/*.s

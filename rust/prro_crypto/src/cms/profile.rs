@@ -19,9 +19,10 @@ use const_oid::ObjectIdentifier;
 
 /// v1 profile variants.
 ///
-/// All variants are CAdES-BES (basic electronic signature, baseline B-B),
-/// detached content, single signer, certificate embedded. See
-/// `THREAT_MODEL.md` and the Phase 4 CMS plan for scope rationale.
+/// All variants start from CAdES-BES (basic electronic signature,
+/// baseline B-B) — the builder can then uplift to T (timestamp) or
+/// LT (revocation-values) depending on the caller's options.
+/// See `SECURITY.md` for the full threat model and scope rationale.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CmsProfile {

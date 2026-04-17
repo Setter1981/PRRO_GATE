@@ -9,7 +9,7 @@
 
 use serde::Deserialize;
 
-use prro_crypto::{blength, fmod, fmul, finv, mul_2x2};
+use prro_crypto::core::gf2m::{blength, finv, fmod, fmul, mul_2x2};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op")]
