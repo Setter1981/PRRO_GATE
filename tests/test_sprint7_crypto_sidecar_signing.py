@@ -106,7 +106,7 @@ def test_cs4_transport_passes_bytes_directly() -> None:
         def __init__(self):
             self.captured_check_sign = None
 
-        def sendChkV2(self, request):
+        def sendChkV2(self, request, *, timeout=None):
             self.captured_check_sign = request.check_sign
             return _MockResponse()
 
@@ -142,7 +142,7 @@ def test_cs4b_transport_does_not_mangle_string_signed_payload() -> None:
         def __init__(self):
             self.captured_check_sign = None
 
-        def sendChkV2(self, request):
+        def sendChkV2(self, request, *, timeout=None):
             self.captured_check_sign = request.check_sign
             return _MockResponse()
 

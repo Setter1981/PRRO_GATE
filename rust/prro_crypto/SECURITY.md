@@ -12,7 +12,8 @@
 
 - DSTU 4145 signing / verify
 - GOST 34.311-95 hashing
-- CMS/CAdES signing pipeline
+- Kupyna-256/512 (DSTU 7564) hashing
+- CMS/CAdES signing pipeline (auto-detect profile from certificate)
 - container import для задокументованих форматів
 - certificate/SPKI parsing на публічних boundary
 - envelope decrypt path у межах поточного threat model
@@ -53,6 +54,9 @@
 
 - **`parse_ocsp_status()` не прив'язує відповідь до конкретного серійного номера.**
   Парсер бере перший `SingleResponse` з `BasicOCSPResponse` без порівняння `CertID.serialNumber`. У multi-response або reordered сценарії caller може отримати статус не того сертифіката. Для production cert-watch рекомендується додатково перевіряти serial на стороні Python-caller'а.
+
+- **Verify-path кеші мають configurable cap (default 256).**
+  `verify()` кешує: (a) validated pubkeys (HashSet, 33 байти на запис), (b) precomputed EC point tables (HashMap, ~1.2 KB на запис). Обидва кеші обмежені — при досягненні cap очищуються повністю. Default 512 записів = ~600 KB max. Для серверних deployment'ів де через `verify()` проходять тисячі різних pubkeys, cap слід збільшити через `set_verify_cache_capacity(n)` на старті процесу. Без цього — cache miss кожні 512 ключів (re-validation ~150µs per key, не crash). Кеші містять тільки **публічні** дані (compressed pubkey + precomputed multiples публічної точки), секретний матеріал в кешах відсутній.
 
 Ці обмеження прийняті для поточного продуктового scope і threat model. Якщо threat model еволюціонує до сценаріїв, де атакувальник може цілеспрямовано підміняти контейнерні байти на диску або в каналі доставки, ці механізми мають бути реалізовані повністю.
 

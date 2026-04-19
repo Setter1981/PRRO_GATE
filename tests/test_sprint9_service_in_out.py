@@ -84,7 +84,7 @@ def test_sv4_transport_service_in_servicechk() -> None:
     captured = {}
 
     class _CapStub:
-        def sendChkV2(self, req):
+        def sendChkV2(self, req, *, timeout=None):
             captured['check_type'] = req.check_type
 
             class _R:
@@ -117,7 +117,7 @@ def test_sv5_transport_service_out_servicechk() -> None:
     captured = {}
 
     class _CapStub:
-        def sendChkV2(self, req):
+        def sendChkV2(self, req, *, timeout=None):
             captured['check_type'] = req.check_type
 
             class _R:

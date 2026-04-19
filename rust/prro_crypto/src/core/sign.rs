@@ -21,9 +21,102 @@
 //!   pointR = s*G + r*(-d*G) = (s - d*r)*G = e*G = eG
 //! so r1 = truncate(eG.x * hash) == r when sign was correct.
 
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+
 use crate::core::curve::Curve;
 use crate::core::field::FieldEl;
 use crate::core::point::Point;
+
+/// Default cap for the pubkey validation cache.
+/// Override at runtime via [`set_verify_cache_capacity`].
+static VERIFY_CACHE_CAP: AtomicUsize = AtomicUsize::new(512);
+
+/// Set the maximum number of cached validated pubkeys and Q-precompute
+/// tables. Prevents unbounded memory growth on server-side deployments
+/// where many distinct pubkeys pass through `verify()`.
+///
+/// Default: 512 (~600 KB total). For high-throughput servers verifying
+/// thousands of distinct keys, increase to match the expected key
+/// population. For embedded/PRRO: the default is more than enough.
+///
+/// When the cache reaches capacity, it is cleared and rebuilt
+/// organically from subsequent verify calls.
+pub fn set_verify_cache_capacity(cap: usize) {
+    let cap = cap.max(1); // at least 1
+    VERIFY_CACHE_CAP.store(cap, Ordering::Relaxed);
+    crate::core::proj::set_q_cache_capacity(cap);
+}
+
+/// Cache of validated public keys. Key = compressed pubkey bytes (33 bytes
+/// for DSTU PB-257). Once a pubkey passes the full validation (on-curve +
+/// cofactor + subgroup order check), it's added here. Subsequent verify
+/// calls with the same pubkey skip the expensive `n·Q == O` scalar mul.
+///
+/// Capped at [`MAX_VALIDATED_PUBKEYS`] — when full, the cache is cleared
+/// and rebuilt organically. Simple and effective: in real deployments
+/// there are 1-10 keys; only an attacker would hit the cap.
+static VALIDATED_PUBKEYS: Mutex<Option<HashSet<[u8; 33]>>> = Mutex::new(None);
+
+/// Compress a pubkey to 33 bytes for cache lookup (cheap — no field inversion,
+/// just serialize x-coordinate + parity bit).
+fn pubkey_cache_key(pub_q: &Point, curve: &Curve) -> [u8; 33] {
+    let compressed = crate::core::point::compress_point(pub_q, curve);
+    let mut key = [0u8; 33];
+    let len = compressed.len().min(33);
+    key[..len].copy_from_slice(&compressed[..len]);
+    key
+}
+
+/// Check if a pubkey is already validated; if not, validate and cache it.
+/// Returns false if validation fails.
+fn ensure_pubkey_validated(pub_q: &Point, curve: &Curve) -> bool {
+    if pub_q.is_zero() {
+        return false;
+    }
+    if !curve.contains(&pub_q.x, &pub_q.y) {
+        return false;
+    }
+
+    let cache_key = pubkey_cache_key(pub_q, curve);
+
+    // Check cache
+    {
+        let guard = VALIDATED_PUBKEYS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref set) = *guard {
+            if set.contains(&cache_key) {
+                return true;
+            }
+        }
+    }
+
+    // Not cached — run full validation
+    // Cofactor check
+    {
+        let mut h_words = vec![0u32; curve.mod_words];
+        h_words[0] = curve.kofactor;
+        let h_fe = FieldEl::from_words(h_words);
+        if crate::core::proj::mul_proj_wnaf_fe(pub_q, &h_fe, curve).is_zero() {
+            return false;
+        }
+    }
+    // Full subgroup check: n·Q == O (Fe-based, ~150µs instead of ~300µs)
+    if !crate::core::proj::mul_proj_wnaf_fe(pub_q, &curve.order, curve).is_zero() {
+        return false;
+    }
+
+    // Cache the validated pubkey (with cap to prevent DoS via memory growth)
+    {
+        let mut guard = VALIDATED_PUBKEYS.lock().unwrap_or_else(|e| e.into_inner());
+        let set = guard.get_or_insert_with(HashSet::new);
+        if set.len() >= VERIFY_CACHE_CAP.load(Ordering::Relaxed) {
+            set.clear();
+        }
+        set.insert(cache_key);
+    }
+    true
+}
 
 /// Returns `true` when the 256-bit value encoded in `fe_words[0..8]` was
 /// already ≥ the curve order and had to be canonicalised by
@@ -147,12 +240,13 @@ pub fn sign(
     }
     let mut e_scalar = Scalar::from_fe_truncated(e_words);
 
-    // `mul_base_x_ct` returns only the x-coordinate of k·G — sufficient
-    // for DSTU 4145 sign, which never needs y(k·G). The ladder uses the
-    // same `rand_e` that `e_scalar` was derived from (word 8 is proven
-    // zero above, so the 288-bit ladder result equals the 256-bit
-    // `e_scalar` value — no domain mismatch).
-    let eg_x = crate::core::mladder::mul_base_x_ct(rand_e, curve)?;
+    // Comb scalar multiplication: k·G using a precomputed 16-point table
+    // for the base point G. ~1.6× faster than the Montgomery ladder while
+    // retaining constant-time execution (CT table lookup, no branches on
+    // scalar bits). The comb uses the same `rand_e` that `e_scalar` was
+    // derived from (word 8 is proven zero above, so all 256 scalar bits
+    // are consistent between the two paths).
+    let eg_x = crate::core::comb::mul_base_comb_x_ct(rand_e, curve)?;
     if eg_x.is_zero_ct() {
         return None;
     }
@@ -207,50 +301,10 @@ pub fn sign(
 pub fn verify(curve: &Curve, pub_q: &Point, hash: &FieldEl, signature: &Signature) -> bool {
     use crate::core::scalar::Scalar;
 
-    // Public-key validation (Sprint-hardening audit 2026-04-16). Without
-    // these checks, a caller can pass a point off the curve or in the
-    // wrong subgroup and coerce `verify` into accepting forged signatures
-    // (DSTU 4145 §5.2 and the generic small-subgroup attack).
-    //
-    // We check:
-    //   (a) Q != O  — the point at infinity obviously can't verify anything.
-    //   (b) Q lies on the curve equation y² + xy = x³ + ax² + b.
-    //   (c) cofactor·Q != O — cheap "not in a small subgroup" check; the
-    //       full `n·Q == O` assertion would require scalar mul with the
-    //       order, which doubles verify cost for a threat that doesn't
-    //       apply in our deployment (DSTU PB-257 has cofactor 4, and keys
-    //       from the Ukrainian CAs are generated with the order-clearing
-    //       step already done). Multiplying by the cofactor rules out
-    //       the 2-torsion / 4-torsion subgroup points, which is what a
-    //       small-subgroup attacker would try to feed us.
-    if pub_q.is_zero() {
-        return false;
-    }
-    if !curve.contains(&pub_q.x, &pub_q.y) {
-        return false;
-    }
-    // Small-subgroup fast path: if `cofactor·Q == O`, Q sits in the
-    // kernel of the cofactor map (2-/4-torsion etc.) and can't be a
-    // valid long-term public key. Cheap short-circuit before the full
-    // order check below.
-    {
-        let mut h_words = vec![0u32; curve.mod_words];
-        h_words[0] = curve.kofactor;
-        let h_fe = FieldEl::from_words(h_words);
-        if pub_q.mul(&h_fe, curve).is_zero() {
-            return false;
-        }
-    }
-    // Full subgroup check: `n · Q == O`. Guarantees Q lies in the
-    // prime-order subgroup and closes the remaining small-subgroup
-    // / invalid-curve attack surface reachable through the public
-    // Python `verify_dstu_pb_257(pub_x, pub_y, ...)` entry point.
-    //
-    // `curve.order` is public, so wNAF scalar-mul here is fine
-    // (no secret-timing concerns). Adds ~10 ms per verify against
-    // the cofactor fast path — acceptable for verify, which runs off
-    // the hot fiscal signing path.
-    if !pub_q.mul(&curve.order, curve).is_zero() {
+    // Public-key validation: on-curve, cofactor, full subgroup check.
+    // Results are cached per compressed pubkey — first verify with a new
+    // key pays ~150µs for validation, subsequent calls skip it entirely.
+    if !ensure_pubkey_validated(pub_q, curve) {
         return false;
     }
 
@@ -295,11 +349,10 @@ pub fn verify(curve: &Curve, pub_q: &Point, hash: &FieldEl, signature: &Signatur
         return false;
     }
 
-    // pointR = s*G + r*Q
+    // pointR = s*G + r*Q  — Shamir's trick: single wNAF pass, halving
+    // the number of point doublings compared to two separate scalar muls.
     let g = Point::new(curve.base_x.clone(), curve.base_y.clone());
-    let mul_s = g.mul(s, curve);
-    let mul_q = pub_q.mul(r, curve);
-    let point_r = mul_s.add(&mul_q, curve);
+    let point_r = crate::core::proj::mul_shamir_wnaf(s, &g, r, pub_q, curve);
 
     if point_r.is_zero() {
         return false;

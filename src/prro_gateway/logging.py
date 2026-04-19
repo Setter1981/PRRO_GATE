@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import UTC, datetime
+from logging.handlers import RotatingFileHandler
 from typing import Any
 
 
@@ -42,18 +44,42 @@ class BoundLoggerAdapter(logging.LoggerAdapter):
 _configured = False
 
 
-def configure_logging(*, level: str = "INFO", json_logs: bool = True) -> None:
+def configure_logging(
+    *,
+    level: str = "INFO",
+    json_logs: bool = True,
+    log_file: str | None = None,
+    log_file_max_bytes: int = 10 * 1024 * 1024,
+    log_file_backup_count: int = 5,
+) -> None:
     global _configured
     root = logging.getLogger()
     for handler in list(root.handlers):
         root.removeHandler(handler)
-    handler = logging.StreamHandler()
-    if json_logs:
-        handler.setFormatter(JsonLogFormatter())
-    else:
-        handler.setFormatter(PlainLogFormatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-    root.addHandler(handler)
-    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    numeric_level = getattr(logging, level.upper(), logging.INFO)
+
+    def _make_formatter() -> logging.Formatter:
+        if json_logs:
+            return JsonLogFormatter()
+        return PlainLogFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(_make_formatter())
+    root.addHandler(stream_handler)
+
+    if log_file:
+        os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=log_file_max_bytes,
+            backupCount=log_file_backup_count,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(_make_formatter())
+        root.addHandler(file_handler)
+
+    root.setLevel(numeric_level)
     _configured = True
 
 

@@ -13,6 +13,21 @@ from ..ports import PollResult, SendResult, TransportRejectedError, TransportRet
 from ..models.storage import TransportProfileRecord
 
 
+def _make_default_http_client() -> httpx.Client:
+    """Default outbound HTTP client with HTTP/2 when available.
+
+    HTTP/2 multiplexes requests over one TCP/TLS connection — verified to give
+    ~6× lower per-request overhead vs HTTP/1.1 in scripts/bench_transport.py
+    (B9 vs B10). Requires the optional `h2` package; falls back to HTTP/1.1
+    if absent so this module stays importable in minimal prod environments.
+    """
+    try:
+        import h2  # noqa: F401
+        return httpx.Client(http2=True)
+    except ImportError:
+        return httpx.Client()
+
+
 class CheckboxAuthSession:
     def __init__(
         self,
@@ -38,7 +53,7 @@ class CheckboxAuthSession:
         self.cashier_password = cashier_password
         self.connect_timeout = connect_timeout
         self.request_timeout = request_timeout
-        self.http_client = http_client or httpx.Client()
+        self.http_client = http_client or _make_default_http_client()
         self.verify_tls = verify_tls
         self._access_token: str | None = None
 
@@ -141,7 +156,7 @@ class CheckboxAuthSession:
 
 class CheckboxRestTransport:
     def __init__(self, *, http_client: httpx.Client | None = None, sleep_func = time.sleep) -> None:
-        self.http_client = http_client or httpx.Client()
+        self.http_client = http_client or _make_default_http_client()
         self.sleep_func = sleep_func
         self._sessions: dict[str, CheckboxAuthSession] = {}
 

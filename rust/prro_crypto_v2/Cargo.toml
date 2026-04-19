@@ -1,0 +1,19 @@
+[package]
+name = "prro_crypto_v2"
+version = "0.1.0"
+edition = "2021"
+description = "DSTU 4145 crypto v2 with TauNaf policy dispatch (DSTU PB-257 core only)"
+
+[dependencies]
+subtle = "2"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+thiserror = "1.0"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "crypto_v2"
+harness = false

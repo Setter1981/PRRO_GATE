@@ -33,10 +33,11 @@ pub mod point;
 // external code would lock their signatures in for semver — they're
 // inherently algorithm-plumbing that may restructure as we add
 // curves or backends.
-pub(crate) mod proj;
+pub mod proj; // pub for benches — TODO: move bench inside crate
 pub(crate) mod wnaf;
 pub(crate) mod fixed_base;
 pub(crate) mod mladder;
+pub(crate) mod comb;
 pub mod sign;
 pub mod hash;
 pub mod backend;

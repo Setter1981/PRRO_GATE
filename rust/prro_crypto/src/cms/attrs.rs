@@ -268,6 +268,9 @@ fn compute_cert_hash(profile: CmsProfile, cert_der: &[u8]) -> Vec<u8> {
         CmsProfile::Dstu4145WithGost34311Pb => {
             crate::core::hash::gost_34_311_95(cert_der).to_vec()
         }
+        CmsProfile::Dstu4145WithDstu7564Pb => {
+            crate::core::hash::kupyna_256(cert_der).to_vec()
+        }
     }
 }
 

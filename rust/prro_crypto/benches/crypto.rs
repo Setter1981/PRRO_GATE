@@ -9,9 +9,10 @@ use prro_crypto::{
         fe::Fe,
         field::FieldEl,
         gf2m::{blength, finv, fmod, fmul},
+        hash::{kupyna_256, kupyna_512, gost_34_311_95},
         point::Point,
         proj::ProjPoint,
-        sign::sign,
+        sign::{sign, verify},
     },
     Curve,
 };
@@ -191,6 +192,17 @@ fn bench_sign(c: &mut Criterion) {
         });
     });
 
+    // Verify benchmark: produce a valid signature, then measure verify
+    let sig = sign(&curve, &d, &hash, &rand_e).expect("sign must succeed for bench inputs");
+    let base_g = Point::new(curve.base_x.clone(), curve.base_y.clone());
+    let pub_q = base_g.mul(&d, &curve).negate();
+
+    g.bench_function("verify_full", |bench| {
+        bench.iter(|| {
+            black_box(verify(&curve, &pub_q, &hash, &sig));
+        });
+    });
+
     g.finish();
 }
 
@@ -263,12 +275,54 @@ fn bench_pclmul_primitives(c: &mut Criterion) {
 #[cfg(not(target_arch = "x86_64"))]
 fn bench_pclmul_primitives(_c: &mut Criterion) {}
 
+fn bench_hash(c: &mut Criterion) {
+    let mut g = c.benchmark_group("hash");
+
+    // 64-byte message (typical fiscal receipt hash input)
+    let msg_64: Vec<u8> = (0x00u8..=0x3F).collect();
+    // 256-byte message
+    let msg_256: Vec<u8> = (0..256).map(|i| (i & 0xFF) as u8).collect();
+    // 1 KB message
+    let msg_1k = vec![0xABu8; 1024];
+
+    g.bench_function("gost3411_64B", |bench| {
+        bench.iter(|| black_box(gost_34_311_95(black_box(&msg_64))));
+    });
+
+    g.bench_function("kupyna256_64B", |bench| {
+        bench.iter(|| black_box(kupyna_256(black_box(&msg_64))));
+    });
+
+    g.bench_function("kupyna512_64B", |bench| {
+        bench.iter(|| black_box(kupyna_512(black_box(&msg_64))));
+    });
+
+    g.bench_function("gost3411_256B", |bench| {
+        bench.iter(|| black_box(gost_34_311_95(black_box(&msg_256))));
+    });
+
+    g.bench_function("kupyna256_256B", |bench| {
+        bench.iter(|| black_box(kupyna_256(black_box(&msg_256))));
+    });
+
+    g.bench_function("gost3411_1KB", |bench| {
+        bench.iter(|| black_box(gost_34_311_95(black_box(&msg_1k))));
+    });
+
+    g.bench_function("kupyna256_1KB", |bench| {
+        bench.iter(|| black_box(kupyna_256(black_box(&msg_1k))));
+    });
+
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_gf2m,
     bench_field,
     bench_point,
     bench_sign,
+    bench_hash,
     bench_pclmul_primitives
 );
 criterion_main!(benches);

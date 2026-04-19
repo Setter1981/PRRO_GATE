@@ -69,6 +69,9 @@ class IngressConfig(StrictModel):
 class LoggingConfig(StrictModel):
     level: str = "INFO"
     json_logs: bool = True
+    log_file: str | None = None
+    log_file_max_bytes: int = 10 * 1024 * 1024  # 10 MB
+    log_file_backup_count: int = 5
 
 
 class MetricsConfig(StrictModel):
@@ -113,6 +116,10 @@ class RetentionConfig(StrictModel):
     interval_hours: float = 24.0  # how often to run retention purge
 
 
+class ReconciliationConfig(StrictModel):
+    concurrency: int = 1  # parallel fiscal_number groups; 1 = legacy serial behaviour
+
+
 class AppConfig(StrictModel):
     app_name: str = "prro-gateway"
     version: str = "1.4.1"
@@ -127,6 +134,7 @@ class AppConfig(StrictModel):
     crypto: CryptoConfig = Field(default_factory=CryptoConfig)
     backup: BackupConfig = Field(default_factory=BackupConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
+    reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "AppConfig":
@@ -174,6 +182,7 @@ class AppConfig(StrictModel):
         set_if("PRRO_XMLRPC_PORT", ("ingress", "xmlrpc", "port"), int)
         set_if("PRRO_MARIA_PORT", ("ingress", "maria", "port"), int)
         set_if("PRRO_LOG_LEVEL", ("logging", "level"))
+        set_if("PRRO_LOG_FILE", ("logging", "log_file"))
         set_if("PRRO_RUNTIME_ENVIRONMENT", ("runtime", "environment"))
         set_if("PRRO_PROCESS_IMMEDIATELY", ("runtime", "process_immediately"), lambda v: v.lower() in {"1", "true", "yes", "on"})
         set_if("PRRO_CHECKBOX_ENDPOINT", ("checkbox", "endpoint"))
@@ -183,6 +192,7 @@ class AppConfig(StrictModel):
         set_if("PRRO_CRYPTO_SIDECAR_URL", ("crypto", "sidecar_url"))
         set_if("PRRO_CRYPTO_SIDECAR_CONNECT_TIMEOUT", ("crypto", "sidecar_connect_timeout"), float)
         set_if("PRRO_CRYPTO_SIDECAR_READ_TIMEOUT", ("crypto", "sidecar_read_timeout"), float)
+        set_if("PRRO_RECONCILE_CONCURRENCY", ("reconciliation", "concurrency"), int)
         return cls.from_mapping(data)
 
 
@@ -201,5 +211,6 @@ __all__ = [
     "CryptoConfig",
     "BackupConfig",
     "RetentionConfig",
+    "ReconciliationConfig",
     "AppConfig",
 ]

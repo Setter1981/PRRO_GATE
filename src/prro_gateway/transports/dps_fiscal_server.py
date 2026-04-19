@@ -102,6 +102,12 @@ def _create_grpc_channel(endpoint: str, *, tls_root_certs: bytes | None = None):
 
     Parses endpoint from transport profile format (https://host:port) to host:port.
     Uses system trust store by default; optional PEM root certs for custom CA.
+
+    Channel options tuned for DPS: empirically the server holds idle TLS sockets
+    for 60–120 s and emits HTTP/2 PING frames ~every 30 s (verified via
+    scripts/probe_dps_keepalive.py). Our client-side PING every 30 s keeps
+    firewall/NAT state alive and surfaces silent network breakage within 10 s
+    instead of hanging indefinitely.
     """
     import grpc
     # Normalize endpoint: strip protocol prefix
@@ -111,7 +117,13 @@ def _create_grpc_channel(endpoint: str, *, tls_root_certs: bytes | None = None):
             host_port = host_port[len(prefix):]
             break
     credentials = grpc.ssl_channel_credentials(root_certificates=tls_root_certs)
-    return grpc.secure_channel(host_port, credentials)
+    options = [
+        ('grpc.keepalive_time_ms', 30_000),
+        ('grpc.keepalive_timeout_ms', 10_000),
+        ('grpc.keepalive_permit_without_calls', 1),
+        ('grpc.http2.max_pings_without_data', 0),
+    ]
+    return grpc.secure_channel(host_port, credentials, options=options)
 
 
 class DpsFiscalServerTransport:
@@ -209,7 +221,7 @@ class DpsFiscalServerTransport:
                 id_offline=id_offline,
                 id_cancel=id_cancel,
             )
-            response = stub.sendChkV2(request)
+            response = stub.sendChkV2(request, timeout=30.0)
         except TransportRejectedError:
             raise
         except TransportRetryableError:
@@ -289,7 +301,7 @@ class DpsFiscalServerTransport:
                     except OSError:
                         pass
             stub = self._get_stub(endpoint=effective_endpoint, tls_root_certs=tls_root_certs)
-            response = stub.lastChk(request)
+            response = stub.lastChk(request, timeout=15.0)
         except Exception as exc:
             logger.warning('dps_lastchk_failed', extra={'extra_fields': {'error': str(exc), 'fiscal_number': fiscal_number}})
             return PollResult(

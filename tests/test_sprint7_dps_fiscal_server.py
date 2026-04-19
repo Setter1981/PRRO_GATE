@@ -53,13 +53,14 @@ class _MockStub:
         self._server_id = server_id
         self._error_message = error_message
 
-    def sendChkV2(self, request):
+    def sendChkV2(self, request, *, timeout: float | None = None):
         self.calls.append({
             'rro_fn': request.rro_fn,
             'date_time': request.date_time,
             'check_sign': request.check_sign,
             'local_number': request.local_number,
             'check_type': request.check_type,
+            'timeout': timeout,
         })
         return _MockResponse(id=self._server_id, status=self._status, error_message=self._error_message)
 
@@ -265,8 +266,8 @@ def test_fs11_poll_status_lastchk_match_ack() -> None:
     """poll_status with lastChk: when response.id matches transport_request_id → ACK."""
 
     class _LastChkStub(_MockStub):
-        def lastChk(self, request):
-            self.calls.append({'rro_fn_sign': request.rro_fn_sign})
+        def lastChk(self, request, *, timeout: float | None = None):
+            self.calls.append({'rro_fn_sign': request.rro_fn_sign, 'timeout': timeout})
             return _MockResponse(id='DPS-001', status=1)
 
     class _MockCrypto:
@@ -291,7 +292,7 @@ def test_fs11b_poll_status_lastchk_mismatch_retryable() -> None:
     """poll_status: when response.id doesn't match → retryable, not fake ACK."""
 
     class _MismatchStub(_MockStub):
-        def lastChk(self, request):
+        def lastChk(self, request, *, timeout: float | None = None):
             return _MockResponse(id='DPS-OTHER', status=1)
 
     class _MockCrypto:

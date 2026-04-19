@@ -229,7 +229,7 @@ fn cms_sign_detached<'py>(
     let cms_signer = CmsSigner {
         cert_der,
         signer: &signer,
-        profile: CmsProfile::default(),
+        profile: CmsProfile::from_cert_der(&cert_der),
     };
 
     let signing_time = match signing_time_unix {
@@ -522,7 +522,7 @@ fn cms_sign_detached_with_tsp<'py>(
     let cms_signer = CmsSigner {
         cert_der,
         signer: &signer,
-        profile: CmsProfile::default(),
+        profile: CmsProfile::from_cert_der(&cert_der),
     };
 
     let signing_time = match signing_time_unix {
@@ -576,7 +576,7 @@ fn cms_sign_detached_with_tst<'py>(
     let cms_signer = CmsSigner {
         cert_der,
         signer: &signer,
-        profile: CmsProfile::default(),
+        profile: CmsProfile::from_cert_der(&cert_der),
     };
     let signing_time = match signing_time_unix {
         Some(t) if t < 0 => return Err(PyValueError::new_err(
@@ -750,7 +750,7 @@ fn cms_sign_detached_cades_lt<'py>(
     let cms_signer = CmsSigner {
         cert_der,
         signer: &signer,
-        profile: CmsProfile::default(),
+        profile: CmsProfile::from_cert_der(&cert_der),
     };
     let signing_time = match signing_time_unix {
         Some(t) if t < 0 => return Err(PyValueError::new_err(

@@ -89,7 +89,7 @@ def test_rt3_transport_accepts_return() -> None:
         error_message = ''
 
     class _MockStub:
-        def sendChkV2(self, req):
+        def sendChkV2(self, req, *, timeout=None):
             return _MockResp()
 
     transport = DpsFiscalServerTransport(grpc_stub=_MockStub())
@@ -115,7 +115,7 @@ def test_rt4_return_check_type_is_chk() -> None:
     captured = {}
 
     class _CapStub:
-        def sendChkV2(self, req):
+        def sendChkV2(self, req, *, timeout=None):
             captured['check_type'] = req.check_type
             captured['local_number'] = req.local_number
 
@@ -149,7 +149,7 @@ def test_rt6_return_id_cancel_from_related_receipt() -> None:
     captured = {}
 
     class _CapStub:
-        def sendChkV2(self, req):
+        def sendChkV2(self, req, *, timeout=None):
             captured['id_cancel'] = req.id_cancel
 
             class _R:
@@ -181,7 +181,7 @@ def test_rt7_sell_id_cancel_empty() -> None:
     captured = {}
 
     class _CapStub:
-        def sendChkV2(self, req):
+        def sendChkV2(self, req, *, timeout=None):
             captured['id_cancel'] = req.id_cancel
 
             class _R:

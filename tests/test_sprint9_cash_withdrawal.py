@@ -54,7 +54,7 @@ def test_cw2_transport_accepts() -> None:
     captured = {}
 
     class _CapStub:
-        def sendChkV2(self, req):
+        def sendChkV2(self, req, *, timeout=None):
             captured['check_type'] = req.check_type
 
             class _R:

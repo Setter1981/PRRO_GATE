@@ -60,7 +60,7 @@ mod python;
 pub use core::curve::Curve;
 pub use core::field::FieldEl;
 pub use core::point::Point;
-pub use core::sign::{sign, truncate, verify, Signature};
+pub use core::sign::{set_verify_cache_capacity, sign, truncate, verify, Signature};
 
 /// Prime the backend dispatch so the first `sign()` in a process does
 /// not pay the one-time `CPUID` probing cost. Operational helper, not

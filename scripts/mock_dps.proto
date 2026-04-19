@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package mockdps;
+
+service FiscalService {
+  rpc Submit (Receipt) returns (ReceiptAck);
+}
+
+message Receipt {
+  string fiscal_number = 1;
+  string idempotency_key = 2;
+  string receipt_type = 3;
+  bytes payload = 4;
+}
+
+message ReceiptAck {
+  string status = 1;
+  string fiscal_code = 2;
+  string timestamp = 3;
+  string error_message = 4;
+}

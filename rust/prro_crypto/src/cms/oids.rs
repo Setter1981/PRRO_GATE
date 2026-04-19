@@ -52,6 +52,19 @@ pub const DSTU_4145_WITH_GOST_34311_PB: ObjectIdentifier =
 pub const GOST_34_311_95: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.804.2.1.1.1.1.2.1");
 
+/// Kupyna-256 (DSTU 7564:2014, hash length 256 bits).
+/// Ukrainian national hash standard, replacement for GOST 34.311-95.
+/// OID: `1.2.804.2.1.1.1.1.2.2.1` per Ukrainian crypto OID registry.
+pub const KUPYNA_256: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.804.2.1.1.1.1.2.2.1");
+
+/// `Dstu4145WithDstu7564-256(pb)` — DSTU 4145 signature using
+/// polynomial-basis curves with Kupyna-256 hash.
+/// OID: `1.2.804.2.1.1.1.1.3.6.1.1` per UAPKI `oids.h` line 206.
+/// Note: Kupyna branch is `3.6`, NOT `3.1.2` (GOST is `3.1`).
+pub const DSTU_4145_WITH_DSTU_7564_PB: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.804.2.1.1.1.1.3.6.1.1");
+
 // ─── DSTU curve OIDs ────────────────────────────────────────────────────────
 
 /// DSTU_PB_257 — the only curve ДПС uses for fiscal signing.

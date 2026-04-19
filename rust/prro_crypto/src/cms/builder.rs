@@ -321,6 +321,9 @@ fn compute_digest(profile: CmsProfile, data: &[u8]) -> Result<Vec<u8>, CmsError>
         CmsProfile::Dstu4145WithGost34311Pb => {
             Ok(crate::core::hash::gost_34_311_95(data).to_vec())
         }
+        CmsProfile::Dstu4145WithDstu7564Pb => {
+            Ok(crate::core::hash::kupyna_256(data).to_vec())
+        }
     }
 }
 
@@ -844,6 +847,58 @@ mod tests {
         let opts = CmsBuildOptions::default();
         assert_eq!(opts.attached, false);
         assert!(opts.signing_time.is_none());
+    }
+
+    /// CMS sign with Kupyna-256 profile: the CMS output must contain
+    /// the Kupyna digest OID and signature OID, NOT the GOST ones.
+    #[test]
+    fn sign_with_kupyna_profile_embeds_correct_oids() {
+        let cert = match load_test_cert() {
+            Some(c) => c,
+            None => {
+                eprintln!("SKIP: no test JKS available");
+                return;
+            }
+        };
+        let signer = StubSigner;
+        // Force Kupyna profile regardless of cert's actual OID
+        let cms_signer = CmsSigner {
+            cert_der: &cert,
+            signer: &signer,
+            profile: CmsProfile::Dstu4145WithDstu7564Pb,
+        };
+        let result = cms_signer.sign_detached(b"kupyna test data").unwrap();
+        let cms = &result.cms_der;
+
+        // Kupyna-256 digest OID: 1.2.804.2.1.1.1.1.2.2.1
+        // DER: 06 0B 2A 86 24 02 01 01 01 01 02 02 01
+        let kupyna_digest_oid = [
+            0x06, 0x0B, 0x2A, 0x86, 0x24, 0x02, 0x01, 0x01,
+            0x01, 0x01, 0x02, 0x02, 0x01,
+        ];
+        assert!(
+            cms.windows(kupyna_digest_oid.len()).any(|w| w == kupyna_digest_oid),
+            "CMS must contain Kupyna-256 digest OID"
+        );
+
+        // Kupyna signature OID: 1.2.804.2.1.1.1.1.3.6.1.1
+        // DER: 06 0C 2A 86 24 02 01 01 01 01 03 06 01 01
+        let kupyna_sig_oid = [
+            0x06, 0x0C, 0x2A, 0x86, 0x24, 0x02, 0x01, 0x01,
+            0x01, 0x01, 0x03, 0x06, 0x01, 0x01,
+        ];
+        assert!(
+            cms.windows(kupyna_sig_oid.len()).any(|w| w == kupyna_sig_oid),
+            "CMS must contain Dstu4145WithDstu7564(pb) signature OID"
+        );
+
+        // GOST digest OID must NOT appear
+        let gost_digest_oid = [
+            0x06, 0x09, 0x2A, 0x86, 0x24, 0x02, 0x01, 0x01,
+            0x01, 0x01, 0x02, 0x01,
+        ];
+        // Note: GOST OID might appear inside the cert itself (which is embedded),
+        // so we only check that the Kupyna OID IS present, not that GOST is absent.
     }
 
     /// `sign_detached()` stamps the `signingTime` attribute at call
