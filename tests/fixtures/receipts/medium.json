@@ -1,0 +1,163 @@
+{
+  "schema_version": "1.0.1",
+  "receipt_id": "fixture-medium-0001",
+  "receipt_type": "SELL",
+  "fiscal_number": "9999999999",
+  "shift_id": "shift-0001",
+  "status": "PREPARED",
+  "business_ts": "2026-04-18T10:05:00+03:00",
+  "created_offline": false,
+  "fiscal_code": null,
+  "fiscal_date": null,
+  "header": "ТОВ ТЕСТ УКРАЇНА | ФН 9999999999 | ПРРО v1.0",
+  "footer": "Дякуємо за покупку! Чек є податковим документом.",
+  "rounding_enabled": true,
+  "goods": [
+    {
+      "item_id": "item-0001",
+      "item_no": 1,
+      "code": "SKU-0001",
+      "name": "Товар тестовий А (ПДВ 20%)",
+      "uktzed": "12345678",
+      "price": 12000,
+      "quantity": 2000,
+      "sum": 24000,
+      "tax_id": 1,
+      "discounts": []
+    },
+    {
+      "item_id": "item-0002",
+      "item_no": 2,
+      "code": "SKU-0002",
+      "name": "Товар тестовий Б (ПДВ 20%)",
+      "price": 8500,
+      "quantity": 3000,
+      "sum": 25500,
+      "tax_id": 1,
+      "discounts": []
+    },
+    {
+      "item_id": "item-0003",
+      "item_no": 3,
+      "code": "SKU-0003",
+      "name": "Товар тестовий В (ПДВ 7%)",
+      "price": 5500,
+      "quantity": 1000,
+      "sum": 5500,
+      "tax_id": 2,
+      "discounts": []
+    },
+    {
+      "item_id": "item-0004",
+      "item_no": 4,
+      "code": "SKU-0004",
+      "name": "Товар тестовий Г (ПДВ 7%)",
+      "price": 3200,
+      "quantity": 4000,
+      "sum": 12800,
+      "tax_id": 2,
+      "discounts": []
+    },
+    {
+      "item_id": "item-0005",
+      "item_no": 5,
+      "code": "SKU-0005",
+      "name": "Акцизний товар (ПДВ 20% + акциз)",
+      "uktzed": "22030000",
+      "excise_barcodes": ["UA-EXCISE-0001-2026"],
+      "price": 15000,
+      "quantity": 1000,
+      "sum": 15000,
+      "tax_id": 1,
+      "tax_id_2": 3,
+      "discounts": []
+    },
+    {
+      "item_id": "item-0006",
+      "item_no": 6,
+      "code": "SKU-0006",
+      "name": "Товар без ПДВ (нульова ставка)",
+      "price": 2000,
+      "quantity": 5000,
+      "sum": 10000,
+      "tax_id": 4,
+      "discounts": []
+    },
+    {
+      "item_id": "item-0007",
+      "item_no": 7,
+      "code": "SKU-0007",
+      "name": "Товар зі знижкою (ПДВ 20%)",
+      "price": 9000,
+      "quantity": 2000,
+      "sum": 18000,
+      "tax_id": 1,
+      "discounts": [
+        {
+          "type": "DISCOUNT",
+          "mode": "PERCENT",
+          "value": 1000,
+          "name": "Знижка 10%",
+          "tax_code": "A",
+          "tax_codes": ["A"]
+        }
+      ]
+    },
+    {
+      "item_id": "item-0008",
+      "item_no": 8,
+      "code": "SKU-0008",
+      "name": "Товар тестовий З (ПДВ 20%)",
+      "price": 4750,
+      "quantity": 3000,
+      "sum": 14250,
+      "tax_id": 1,
+      "discounts": []
+    },
+    {
+      "item_id": "item-0009",
+      "item_no": 9,
+      "code": "SKU-0009",
+      "name": "Товар тестовий И (ПДВ 7%)",
+      "price": 6300,
+      "quantity": 1000,
+      "sum": 6300,
+      "tax_id": 2,
+      "discounts": []
+    },
+    {
+      "item_id": "item-0010",
+      "item_no": 10,
+      "code": "SKU-0010",
+      "name": "Товар тестовий К (ПДВ 20%)",
+      "price": 11000,
+      "quantity": 2000,
+      "sum": 22000,
+      "tax_id": 1,
+      "discounts": []
+    }
+  ],
+  "payments": [
+    {
+      "payment_id": "pay-0001",
+      "payment_type": "CASHLESS",
+      "amount": 153350,
+      "card_mask": "****1234",
+      "bank_name": "Test Bank UA",
+      "auth_code": "AUTH123456",
+      "rrn": "RRN-0001-2026"
+    }
+  ],
+  "totals": {
+    "total_sum": 153350,
+    "round_sum": null,
+    "discounts_sum": 1800,
+    "extra_charge_sum": null
+  },
+  "delivery": {
+    "email": "test@example.com",
+    "emails": [],
+    "phone": null
+  },
+  "formatted_print_lines": []
+}

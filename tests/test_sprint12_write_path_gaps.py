@@ -435,3 +435,26 @@ def test_monthly_limit_sum_across_sessions(conn: sqlite3.Connection) -> None:
     assert r.canonical_error is not None
     assert r.canonical_error.code == CanonicalErrorCode.OFFLINE_LIMIT_REACHED.value, \
         f"Expected OFFLINE_LIMIT_REACHED, got {r.canonical_error.code}"
+
+
+# ===========================================================================
+# A2 — X_REPORT management command
+# ===========================================================================
+
+def test_a2_x_report_ack(conn: sqlite3.Connection) -> None:
+    """X_REPORT via write_path produces ACK and creates a fiscal document."""
+    _open_shift(conn, 'shift-xreport')
+    _enqueue(conn, OperationType.X_REPORT)
+    result = _worker().process_next(conn, fiscal_number=FN)
+    assert result.outcome == 'ACK', (
+        f"Expected ACK, got {result.outcome}: "
+        f"{result.canonical_error}"
+    )
+    # X_REPORT is a fiscal operation — it allocates LND and creates a fiscal document.
+    assert result.document_id is not None, "Expected a fiscal document to be created for X_REPORT"
+    from prro_gateway.enums import DocumentState
+    from prro_gateway.repositories.fiscal_documents import FiscalDocumentRepository
+    doc = FiscalDocumentRepository.get_by_id(conn, result.document_id)
+    assert doc is not None, f"Fiscal document {result.document_id} not found"
+    assert doc.state == DocumentState.ACK, f"Expected DocumentState.ACK, got {doc.state}"
+    assert doc.doc_type == 'X_REPORT', f"Expected doc_type X_REPORT, got {doc.doc_type}"

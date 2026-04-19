@@ -61,10 +61,10 @@ class _MockProbeStub:
         return _MockInfoResponse()
 
     # Keep send/lastChk stubs for transport compat
-    def sendChkV2(self, request):
+    def sendChkV2(self, request, *, timeout=None):
         pass
 
-    def lastChk(self, request):
+    def lastChk(self, request, *, timeout=None):
         pass
 
 

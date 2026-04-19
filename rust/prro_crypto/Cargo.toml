@@ -29,14 +29,39 @@ spki = { version = "0.7", features = ["alloc"] }
 # CSPRNG for per-sign rand_e. `getrandom` is the backend; `rand_core`
 # gives us the OsRng facade. Locked 2026-04-15 per expert review B1.
 rand_core = { version = "0.6", features = ["getrandom"] }
+# Constant-time primitive wrappers. Sprint 2.1c5.2: cswap_fe and the
+# masked-select helpers route through `subtle::ConditionallySelectable`
+# so the CT story survives future compiler updates that might otherwise
+# re-derive "this branch was always taken" and restore a conditional
+# form. `subtle` also inserts its own opacity barriers inside `Choice`
+# operations — belt-and-braces on top of our own masked-XOR patterns.
+subtle = { version = "2.6", default-features = false }
+# Secret wiping. `FieldEl`, `Scalar`, and `DstuInProcessSigner` call
+# `zeroize` on drop so raw key material doesn't linger on the heap
+# after use. `zeroize` uses `core::ptr::write_volatile` under a compiler
+# fence — see the crate's security notes for why this survives LLVM
+# optimisation passes that would otherwise elide the clear.
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+# Blocking HTTP client for TSP (RFC 3161) round-trips. Gated behind the
+# `tsp_http` feature so anyone who wants a crypto-only build (say, Python
+# caller does the HTTP themselves) can skip the transitive network stack.
+# `rustls` instead of native-tls to avoid OpenSSL on the build machine.
+ureq = { version = "2.10", default-features = false, features = ["tls"], optional = true }
 
 [features]
-default = []
+default = ["tsp_http"]
 python = ["pyo3"]
+# Enables `cms::tsp::fetch_timestamp` — a blocking HTTP TSP client.
+# Turn off for no-network embeddings (the ASN.1 encoder/parser stays
+# available either way).
+tsp_http = ["dep:ureq"]
 # DANGEROUS: enables deterministic rand_e from a user-supplied seed.
 # ONLY for test vectors / reproducible fuzzing. MUST NOT be enabled in
 # production builds — it trivially breaks DSTU 4145 security proof.
 dangerous_deterministic_k_for_tests = []
+# Legacy jkurwa short_sign wire format adapter. Off by default.
+# Enable only when a relying party still expects pre-CMS jkurwa output.
+legacy_jkurwa_interop = []
 
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }

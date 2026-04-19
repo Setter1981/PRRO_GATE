@@ -113,7 +113,7 @@ def test_dx5_transport_shift_open_sends_zero() -> None:
         id = 'X'; status = 1; error_message = ''
     class _Stub:
         def __init__(self): self.calls = []
-        def sendChkV2(self, req):
+        def sendChkV2(self, req, *, timeout=None):
             self.calls.append({'local_number': req.local_number, 'check_type': req.check_type})
             return _MockResp()
 
@@ -550,7 +550,7 @@ def test_dx10_date_time_matches_xml_ts() -> None:
         id = 'X'; status = 1; error_message = ''
     class _CapStub:
         def __init__(self): self.captured_dt = None
-        def sendChkV2(self, req):
+        def sendChkV2(self, req, *, timeout=None):
             self.captured_dt = req.date_time
             return _MockResp()
 

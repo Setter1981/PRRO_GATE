@@ -22,90 +22,95 @@ pip install target/wheels/prro_crypto-*.whl
 ```python
 import prro_crypto
 
-# Read a JKS keystore (Ukrainian production-format)
-d_hex = prro_crypto.read_jks_param_d("key.jks", "password")
+# ── Load a key from ANY supported container (JKS / PFX / ZS2 / Key-6.dat) ──
+data = open("key.zs2", "rb").read()
+fmt  = prro_crypto.detect_container_format(data)       # "jks" | "key6" | "pfx" | None
+ek   = prro_crypto.extract_private_key(data, "password")
+# ek = {"format": "pfx", "param_d_hex": "…", "certs": [b"…", …]}
 
-# Compute public key Q = -d*G (jkurwa convention)
-pub_x, pub_y = prro_crypto.pubkey_dstu_pb_257(d_hex)
+# ── Production CMS/CAdES-BES detached signature ────────────────────────────
+p7s = prro_crypto.cms_sign_detached(
+    param_d_hex = ek["param_d_hex"],
+    cert_der    = ek["certs"][0],
+    content     = b"receipt payload",
+)
 
-# Sign a hash with caller-supplied random scalar
-r, s = prro_crypto.sign_dstu_pb_257(d_hex, hash_hex, rand_e_hex)
+# ── EnvelopedData decrypt (for reading ДПС responses) ──────────────────────
+plain = prro_crypto.cms_decrypt_envelope(
+    param_d_hex         = ek["param_d_hex"],
+    envelope_der        = open("response.p7", "rb").read(),
+    originator_cert_der = sender_cert_bytes,
+)
 
-# Verify a signature
-ok = prro_crypto.verify_dstu_pb_257(pub_x, pub_y, hash_hex, r, s)
+# ── Auto-fetch signing cert from Ukrainian CA by SKI ───────────────────────
+qx, qy = prro_crypto.pubkey_dstu_pb_257(ek["param_d_hex"])
+compressed = prro_crypto.compress_pubkey(qx, qy)
+ski = prro_crypto.compute_ski(compressed)
+cert = prro_crypto.fetch_cert_by_ski("http://acskidd.gov.ua/services/cmp/", ski)
 
-# Read certificate chain from JKS
-alias, certs_der = prro_crypto.read_jks_certs("key.jks", "password")
+# ── Low-level: sign + verify ───────────────────────────────────────────────
+r, s = prro_crypto.sign_with_osrng(ek["param_d_hex"], hash_hex)
+ok   = prro_crypto.verify_dstu_pb_257(pub_x, pub_y, hash_hex, r, s)
 ```
 
 ## Status
 
-| Step | Module | Status |
-|------|--------|--------|
-| 1 | GF(2^m) polynomial arithmetic (`gf2m`) | ✅ 170 jkurwa byte-identical vectors |
-| 2 | Field wrapper, DSTU curve params, point arithmetic | ✅ 14 jkurwa vectors + algebraic n*G=∞ |
-| 3 | DSTU 4145 sign/verify | ✅ 6 byte-identical vs jkurwa |
-| 4 | JKS reader + DER parser | ✅ Reads real production JKS |
-| 5 | **End-to-end JKS → sign with real key** | ✅ Byte-identical (r,s) vs jkurwa |
-| 6 | **Optimization: specialized fsqr (bit-spreading)** | ✅ **12x speedup for mod_sqr** |
-| 7 | **Constant-time field equality** | ✅ Side-channel safe comparison |
-| 8 | **PyO3 Python bindings** | ✅ Drop-in Python module |
-| 9 | GOST 28147-89 cipher (for Key-6.dat / PFX) | Pending |
-| 10 | CMS/PKCS#7 SignedData builder | Pending |
-| 11 | Production-grade constant-time scalar mul | Pending |
-| 12 | Scalar blinding, fault attack defense | Pending |
+Current version is `0.1.0-alpha.1` — **production-pilot-acceptable under the documented threat model and scope** (see [`SECURITY.md`](SECURITY.md) and "Known limitations" below). Not a general-purpose Ukrainian crypto toolkit.
 
-## Performance benchmarks
+**Implemented and covered by tests + live round-trips:**
 
-Measured on a single core (i9-class CPU equivalent, WSL2):
+- DSTU 4145 sign/verify with byte-identical output vs jkurwa on the shipped vector set
+- GOST 34.311-95 hash
+- GOST 28147-89 block cipher (ECB + CFB) with DSTU DKU S-box
+- CMS/CAdES — **BES** (detached + attached), **T** (TSP timestamp), **LT** (revocation-values)
+- EnvelopedData decrypt (ECDH cofactor-DH + GOST key-unwrap + CFB)
+- Container readers: JKS (Privat), PFX including `.zs2` (АЦСК "Україна"), Key-6.dat (ІІТ/ДПС)
+- IIT cert-lookup-by-SKI client (reverse-engineered from `dstucrypt/agent`), live-tested against **acskidd.gov.ua**, **uakey.com.ua**, **acsk.privatbank.ua**
+- TSP / OCSP / CRL HTTP clients
+- Constant-time scalar multiplication (López-Dahab x-only Montgomery ladder) for both base-point and arbitrary-point paths — covers signing `rand_e` and ECDH `d·h` secret scalars
+- Public-point validation (on-curve + prime-order subgroup + infinity) in `verify()` and ECDH
+- `zeroize`-on-drop for all secret-bearing types (`FieldEl`, `Scalar`, `DstuInProcessSigner`, `PfxParsed`, `Key6Parsed`, `ExtractedKey`, `JksEntry`)
+- PyO3 bindings with GIL released across all HTTP round-trips and heavy crypto
 
-| Operation | Baseline | Round 2 | Speedup |
-|-----------|----------|---------|---------|
-| `gf2m::fmul` (257-bit) | 1.97 µs | 1.97 µs | — |
-| `gf2m::fmod` (257-bit) | 144 ns | 144 ns | — |
-| `gf2m::finv` (257-bit) | 22.5 µs | 22.5 µs | — |
-| `field::mod_sqr` | 2.65 µs | **226 ns** | **12x** (fsqr bit-spread) |
-| `field::mod_mul` | 1.87 µs | 1.87 µs | — |
-| `field::invert` | 22.2 µs | 22.2 µs | — |
-| `point::twice` (affine) | 30.3 µs | 30.3 µs | — |
-| `point::add` (affine) | 28.4 µs | 28.4 µs | — |
-| **`point::mul`** (full 256-bit scalar) | **11.7 ms** | **4.25 ms** | **2.7x** (Lopez-Dahab proj + wNAF) |
-| **`sign::sign_full`** | **11.0 ms** | **4.6 ms** | **2.4x** |
+**Deliberately NOT implemented** — see "Known limitations":
 
-Single-thread throughput: **~220 signs/sec** through the full Python wheel.
-For per-cashdesk gateway (1 sign per ~30s) this is ~6500x more than required.
+- Kupyna (DSTU 7564) hash — parked until a real Kupyna-issued key reaches a user
+- Full PKI lifecycle (cert issuance, revocation, cross-certification)
+- OCSP/CRL/TSP response signature verification — the crate embeds bytes, callers validate
+- Key-6 MAC verification and PFX `macData` verification (intentional compromises documented in `SECURITY.md`)
 
-Optimizations applied in Round 2:
-- **Specialized `fsqr`** — bit-spreading O(n) instead of `mul(x, x)` O(n²)
-- **wNAF scalar mul** (window 4) — ~50% fewer additions
-- **Lopez-Dahab projective coordinates** — eliminates per-step inversions
-- **Constant-time field equality** — side-channel safe comparison
+## Performance
 
-Future targets (Round 3): SIMD (PCLMULQDQ on x86, PMULL on AArch64) for fmul,
-constant-time scalar mul (Montgomery ladder), Itoh-Tsujii inverse, scalar
-blinding. Estimated: sign < 1 ms with constant-time guarantees.
+Run benchmarks on the pinned toolchain:
 
-## Security status
+```bash
+cargo bench --bench crypto
+```
 
-**This crate is `0.1.0-alpha`. Use for development and testing only.**
+Key number for production sizing: a full CMS-BES sign (GOST 34.311
+digest + constant-time scalar mul + DER assembly) takes ~4-6 ms on a
+modern x86_64 core. For a per-cashdesk gateway signing one receipt
+every ~30 s, this is several thousand times headroom.
 
-Production deployment requires:
-- Constant-time scalar multiplication (Montgomery ladder)
-- Constant-time field inversion (Itoh-Tsujii)
-- Scalar blinding (defense vs fault injection)
-- Audit by qualified cryptographer
+The CT Montgomery ladder costs roughly 2x vs the variable-time wNAF
+path — a deliberate trade for side-channel safety. Future targets:
+PCLMULQDQ SIMD backend (already shipped in portable/x86 dispatch) and
+an optional ARM64 PMULL backend for POS-class hardware.
 
-Currently in place:
-- Constant-time field equality (`FieldEl::equals`, `is_zero_ct`)
-- No `unsafe` code
-- Pure Rust (no system OpenSSL)
-- Test vector parity with reference implementation
+## Security posture
 
-Currently NOT in place:
-- Variable-time scalar mul (timing leaks bits of private key)
-- Variable-time field invert (timing leaks bits of intermediate values)
-- No protection against fault attacks
-- No protection against malformed input on JKS / DER parsers (fuzz needed)
+Full threat model, acceptance scope, and known compromises are in [`SECURITY.md`](SECURITY.md). Summary:
+
+- Constant-time Montgomery ladder for secret-scalar × point multiplication on the **signing** (`rand_e × G`) and **ECDH** (`d·h × Q`) hot paths only. Other helpers that touch the private scalar — notably `pubkey_dstu_pb_257(d_hex)` — use the **variable-time** wNAF path and are **explicitly outside the CT scope**.
+- **Not CT-protected:** `pubkey_dstu_pb_257()` computes `Q = -d·G` via wNAF. The private scalar `d` traverses variable-time table lookups. This is a measurable timing side-channel on `d` during the call. The function is intended for onboarding / provisioning (called once per key lifetime), not for the per-receipt signing hot path — but it does expose `d` to timing observation for the duration of that single call. Callers in timing-sensitive environments should be aware of this limitation.
+- Itoh-Tsujii constant-time field inversion on the hot paths.
+- Masked conditional-swap via `subtle::ConditionallySelectable`.
+- `rust-toolchain.toml` pins `rustc` so the CT guarantees don't drift across compiler versions.
+- dudect harness (`cargo test --release --test test_dudect_sign_ct -- --ignored`) with `|t| < 3.5` on three independent sessions at three input classes.
+- `#[non_exhaustive]` on every public error enum; `zeroize` + redacted custom `Debug` on every secret-bearing type. **Caveat:** `Scalar` is `Copy` (required by the ladder's pass-by-value semantics), which precludes `Drop`-based auto-wipe. It implements `Zeroize` for manual `.zeroize()` calls but secret `Scalar` temporaries on the stack are NOT auto-zeroed — they rely on the OS zeroing freed stack frames, which is best-effort. `FieldEl` and container output structs (`PfxParsed`, `Key6Parsed`, `ExtractedKey`, `JksEntry`) do auto-wipe via `Zeroizing<…>` / `ZeroizeOnDrop`.
+- `unsafe` exists only in `core::backend::x86_pclmul.rs` for the PCLMULQDQ SIMD intrinsics behind a CPUID guard. The rest of the crate is safe Rust. No system OpenSSL.
+
+Three consecutive internal audit passes + a final product-risk sweep (2026-04-16). All critical / high findings closed; audit log lives in `../../prro_crypto_chunks/PHASE_4_BACKLOG.md` for traceability.
 
 ## Build
 
@@ -124,29 +129,78 @@ cargo test --release --features python
 
 ## Test coverage
 
-41 tests across 6 suites:
+226 unit tests + integration tests + 3 live CA round-trips, all green on the pinned toolchain. Live tests are `#[ignore]`-gated so CI doesn't depend on external CAs. Run them explicitly when validating a release:
 
-- **gf2m**: 11 unit + 170 jkurwa byte-identical vectors
-- **field**: 4 unit
-- **curve**: 2 unit
-- **point**: 5 unit + 14 jkurwa vectors + algebraic n*G=∞ proof
-- **sign**: 4 unit + 6 jkurwa byte-identical vectors
-- **jks + der**: 5 unit + real production JKS load
-- **e2e**: real JKS → Rust sign produces byte-identical (r,s) with jkurwa
+```bash
+cargo test --release
+cargo test --release --features legacy_jkurwa_interop
+cargo test --release --no-default-features --features python
+cargo test --release --lib live_ -- --ignored  # network required
+```
+
+Test families:
+
+- **core::gf2m / fe / scalar / field** — arithmetic primitives + jkurwa vector replay
+- **core::point / mladder / wnaf / proj** — EC primitives + ladder differential vs wNAF on random valid Q
+- **core::sign** — sign/verify roundtrip + audit-driven regressions (off-curve Q, oversized scalar, malformed width)
+- **core::hash** — GOST 34.311 vector replay
+- **cms::*** — TLV primitives, DER roundtrip, EnvelopedData decrypt against jkurwa fixture → `"123"`, CAdES-T/LT attribute embedding, IIT CMP wire format
+- **interop::prro::*** — JKS / PFX / ZS2 / Key-6 parse + cross-validation of param_d between containers for the same key
+- **live CA (ignored)** — round-trip cert lookup against acskidd / uakey / acsk.privatbank
 
 ## Architecture
 
 ```
-prro_crypto/
-├── gf2m       — low-level GF(2^m) primitives (mul, fmod, finv, fsqr, blength)
-├── field      — FieldEl struct: hex/word ctors, mod ops, invert, trace
-├── curve      — Curve struct with DSTU_PB_257 hardcoded parameters
-├── point      — Point + add/twice/negate/mul (affine, double-and-add)
-├── sign       — DSTU 4145 sign/verify + truncate
-├── jks        — JKS keystore reader (binary + SHA1 keystream)
-├── der        — Minimal ASN.1 DER reader (just enough for DSTU privkey)
-└── python     — PyO3 bindings (when feature = python)
+prro_crypto/src/
+├── core/           — universal DSTU 4145 primitives
+│   ├── gf2m        — low-level GF(2^m) polynomial arithmetic
+│   ├── field       — FieldEl (GF(2^m) element wrapper)
+│   ├── fe          — fixed-size PB-257 specialisation
+│   ├── scalar      — 256-bit scalar arithmetic mod curve order (Barrett)
+│   ├── curve       — DSTU_PB_257 parameters
+│   ├── point       — affine points + checked decompression
+│   ├── mladder     — López-Dahab x-only Montgomery ladder (CT, secret scalars)
+│   ├── sign        — DSTU 4145 sign + verify with full pubkey validation
+│   ├── hash        — GOST 34.311-95
+│   └── backend     — CPU-feature-dispatched multiplication (PCLMULQDQ + portable)
+├── cms/            — CMS/CAdES + IIT-Ukrainian network protocols
+│   ├── builder     — BES / T / LT assembly
+│   ├── envelope    — EnvelopedData parse + decrypt (ECDH + keywrap + CFB)
+│   ├── tsp         — RFC 3161 TimeStamp client (feature = tsp_http)
+│   ├── revocation  — OCSP + CRL ASN.1 + HTTP clients
+│   ├── cmp         — IIT proprietary cert-lookup-by-SKI (reverse-engineered)
+│   ├── asn1_util   — shared bounded DER primitives used across cms/*
+│   └── ...
+├── interop/prro/   — Ukrainian-specific container / encoding support
+│   ├── jks / pfx / key6   — encrypted container readers
+│   ├── containers         — unified dispatcher
+│   └── pbe                — GOST PBKDF2 / CFB / keywrap / MAC
+└── python.rs       — PyO3 bindings (feature = python)
 ```
+
+## Known limitations
+
+Поточна версія має кілька свідомо прийнятих обмежень:
+
+- **Key-6 MAC не верифікується.**
+  Неправильний пароль або пошкоджений вміст зазвичай виявляються на етапі внутрішнього ASN.1/DER parse, але це не є повною перевіркою цілісності контейнера.
+
+- **PFX `macData` наразі ігнорується.**
+  Тому import PFX не слід трактувати як повну зовнішню integrity verification контейнера.
+
+- **Бібліотека не покриває повний PKI lifecycle.**
+  Scope обмежений crypto/CMS/container/interop задачами, потрібними для прикладних workflow.
+
+- **Підтримка зосереджена на задокументованих українських workflow.**
+  Нестандартні, історичні або vendor-specific edge cases поза цим scope можуть працювати в режимі best effort або не підтримуватись.
+
+- **Transport layer не входить у security scope crate.**
+  Бібліотека повертає криптографічні артефакти та helper-функції; мережевий протокол, retry/logging/idempotency/operational policy живуть у верхньому шарі.
+
+- **Це не універсальна "українська криптоплатформа на всі випадки життя".**
+  Це вузько сфокусований стек для реальних бізнес-флоу, насамперед PRRO та суміжних сценаріїв.
+
+Розширений security policy і threat model — див. [`SECURITY.md`](SECURITY.md).
 
 ## License
 

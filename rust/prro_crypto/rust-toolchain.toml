@@ -1,0 +1,19 @@
+# Pin the rustc version for the CT signing path.
+#
+# Rationale (Expert-1 audit caveat, Sprint 2.1c5 closure):
+# The constant-time claim for `sign()` rests on a specific LLVM lowering
+# — masked-XOR patterns compiling to branch-free ALU or `cmov`, the
+# Montgomery ladder inlining into the caller, etc. An uncontrolled
+# compiler upgrade could re-introduce a `jcc` on the secret-data path
+# and invalidate that claim without any source change.
+#
+# When bumping this pin:
+#   1. Rerun `cargo test --release` (correctness)
+#   2. Rerun `scripts/asm_ct_check.sh` (asm spot-check for each CT primitive)
+#   3. Rerun `cargo test --release --test test_dudect_sign_ct -- --ignored`
+#   4. Record the new version, date, and pass/fail in the project
+#      audit log (PHASE_4_BACKLOG.md or equivalent).
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+profile = "default"

@@ -5,12 +5,15 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 use prro_crypto::{
-    blength, finv, fmod, fmul,
-    fe::Fe,
-    field::FieldEl,
-    point::Point,
-    proj::ProjPoint,
-    sign::sign,
+    core::{
+        fe::Fe,
+        field::FieldEl,
+        gf2m::{blength, finv, fmod, fmul},
+        hash::{kupyna_256, kupyna_512, gost_34_311_95},
+        point::Point,
+        proj::ProjPoint,
+        sign::{sign, verify},
+    },
     Curve,
 };
 
@@ -178,7 +181,10 @@ fn bench_sign(c: &mut Criterion) {
     let curve = Curve::dstu_pb_257();
     let d = FieldEl::from_words(make_words(0xD1D));
     let hash = FieldEl::from_words(make_words(0xA3FF));
-    let rand_e = FieldEl::from_words(make_words(0xE12E));
+    // Keep bit 256 zero to satisfy the Sprint 2.2 sign() contract.
+    let mut rand_words = make_words(0xE12E);
+    rand_words[8] = 0;
+    let rand_e = FieldEl::from_words(rand_words);
 
     g.bench_function("sign_full", |bench| {
         bench.iter(|| {
@@ -186,8 +192,137 @@ fn bench_sign(c: &mut Criterion) {
         });
     });
 
+    // Verify benchmark: produce a valid signature, then measure verify
+    let sig = sign(&curve, &d, &hash, &rand_e).expect("sign must succeed for bench inputs");
+    let base_g = Point::new(curve.base_x.clone(), curve.base_y.clone());
+    let pub_q = base_g.mul(&d, &curve).negate();
+
+    g.bench_function("verify_full", |bench| {
+        bench.iter(|| {
+            black_box(verify(&curve, &pub_q, &hash, &sig));
+        });
+    });
+
     g.finish();
 }
 
-criterion_group!(benches, bench_gf2m, bench_field, bench_point, bench_sign);
+/// Per-primitive micro-benches for the PCLMULQDQ backend (Sprint 2.3
+/// x86 polish). Expose the cost of the building blocks (`clmul64`,
+/// `clmul128`, `fmul_packed`) alongside the public `fmul_257` entry
+/// point, so any regression after a compiler or SIMD-layout change
+/// shows up at the right level of granularity.
+#[cfg(target_arch = "x86_64")]
+fn bench_pclmul_primitives(c: &mut Criterion) {
+    use prro_crypto::core::backend;
+    use prro_crypto::core::backend::pack::pack_fe;
+    use prro_crypto::core::fe::FeWide;
+
+    if !std::is_x86_feature_detected!("pclmulqdq") {
+        return;
+    }
+
+    let mut g = c.benchmark_group("pclmul");
+
+    let a_words = make_words(0xAAAA);
+    let b_words = make_words(0x5555);
+    let a_fe = Fe(<[u32; 9]>::try_from(a_words.as_slice()).unwrap());
+    let b_fe = Fe(<[u32; 9]>::try_from(b_words.as_slice()).unwrap());
+    let a_packed = pack_fe(&a_fe);
+    let b_packed = pack_fe(&b_fe);
+    let a64 = ((a_words[1] as u64) << 32) | a_words[0] as u64;
+    let b64 = ((b_words[1] as u64) << 32) | b_words[0] as u64;
+    let a128 = [a_packed.0[0], a_packed.0[1]];
+    let b128 = [b_packed.0[0], b_packed.0[1]];
+
+    g.bench_function("clmul64", |bench| {
+        bench.iter(|| unsafe {
+            black_box(backend::x86_pclmul::clmul64(
+                black_box(a64),
+                black_box(b64),
+            ));
+        });
+    });
+
+    g.bench_function("clmul128_karatsuba", |bench| {
+        bench.iter(|| unsafe {
+            black_box(backend::x86_pclmul::clmul128(
+                black_box(a128),
+                black_box(b128),
+            ));
+        });
+    });
+
+    g.bench_function("fmul_packed", |bench| {
+        bench.iter(|| unsafe {
+            black_box(backend::x86_pclmul::fmul_packed(
+                black_box(&a_packed),
+                black_box(&b_packed),
+            ));
+        });
+    });
+
+    g.bench_function("fmul_257_full_dispatch", |bench| {
+        let mut out = FeWide::ZERO;
+        bench.iter(|| {
+            backend::fmul_257(black_box(&a_fe), black_box(&b_fe), &mut out);
+            black_box(&out);
+        });
+    });
+
+    g.finish();
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn bench_pclmul_primitives(_c: &mut Criterion) {}
+
+fn bench_hash(c: &mut Criterion) {
+    let mut g = c.benchmark_group("hash");
+
+    // 64-byte message (typical fiscal receipt hash input)
+    let msg_64: Vec<u8> = (0x00u8..=0x3F).collect();
+    // 256-byte message
+    let msg_256: Vec<u8> = (0..256).map(|i| (i & 0xFF) as u8).collect();
+    // 1 KB message
+    let msg_1k = vec![0xABu8; 1024];
+
+    g.bench_function("gost3411_64B", |bench| {
+        bench.iter(|| black_box(gost_34_311_95(black_box(&msg_64))));
+    });
+
+    g.bench_function("kupyna256_64B", |bench| {
+        bench.iter(|| black_box(kupyna_256(black_box(&msg_64))));
+    });
+
+    g.bench_function("kupyna512_64B", |bench| {
+        bench.iter(|| black_box(kupyna_512(black_box(&msg_64))));
+    });
+
+    g.bench_function("gost3411_256B", |bench| {
+        bench.iter(|| black_box(gost_34_311_95(black_box(&msg_256))));
+    });
+
+    g.bench_function("kupyna256_256B", |bench| {
+        bench.iter(|| black_box(kupyna_256(black_box(&msg_256))));
+    });
+
+    g.bench_function("gost3411_1KB", |bench| {
+        bench.iter(|| black_box(gost_34_311_95(black_box(&msg_1k))));
+    });
+
+    g.bench_function("kupyna256_1KB", |bench| {
+        bench.iter(|| black_box(kupyna_256(black_box(&msg_1k))));
+    });
+
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_gf2m,
+    bench_field,
+    bench_point,
+    bench_sign,
+    bench_hash,
+    bench_pclmul_primitives
+);
 criterion_main!(benches);

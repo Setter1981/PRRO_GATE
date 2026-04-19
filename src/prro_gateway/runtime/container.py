@@ -83,7 +83,13 @@ class RuntimeContainer:
         return Path(self.config.database.sql_dir)
 
     def initialize(self) -> None:
-        configure_logging(level=self.config.logging.level, json_logs=self.config.logging.json_logs)
+        configure_logging(
+            level=self.config.logging.level,
+            json_logs=self.config.logging.json_logs,
+            log_file=self.config.logging.log_file,
+            log_file_max_bytes=self.config.logging.log_file_max_bytes,
+            log_file_backup_count=self.config.logging.log_file_backup_count,
+        )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._ensure_persistent_pragmas()
@@ -589,6 +595,8 @@ class RuntimeContainer:
                 transport_status_client=self.transport_router,
                 max_recovery_attempts=self.config.runtime.max_recovery_attempts,
                 crypto_provider=self.crypto_provider or self._resolve_crypto_provider(),
+                concurrency=self.config.reconciliation.concurrency,
+                cancel_event=self._ops_loop_stop,
             )
         if self.offline_sync_service is None and self.transport_router is not None:
             self.offline_sync_service = OfflineSyncService(

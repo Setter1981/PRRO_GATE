@@ -111,12 +111,24 @@ class FiscalDocumentRepository:
     def get_by_request_id(conn: sqlite3.Connection, request_id: str) -> FiscalDocumentRecord | None:
         return fetchone_model(conn, f'SELECT {columns_clause(FiscalDocumentRecord)} FROM fiscal_documents WHERE request_id = ?', (request_id,), FiscalDocumentRecord)
 
-    def get_pending_for_reconciliation(conn: sqlite3.Connection) -> list[FiscalDocumentRecord]:
+    def get_pending_for_reconciliation(conn: sqlite3.Connection, fiscal_number: str | None = None) -> list[FiscalDocumentRecord]:
+        if fiscal_number is not None:
+            return fetchall_model(
+                conn,
+                f"""
+                SELECT {columns_clause(FiscalDocumentRecord)} FROM fiscal_documents
+                WHERE state IN ('SENT','KVT1','KVT2','ERROR_RETRYABLE','REQUIRES_MANUAL_RECONCILIATION')
+                  AND fiscal_number = ?
+                ORDER BY created_at
+                """,
+                (fiscal_number,),
+                FiscalDocumentRecord,
+            )
         return fetchall_model(
             conn,
             f"""
             SELECT {columns_clause(FiscalDocumentRecord)} FROM fiscal_documents
-            WHERE state IN ('SENT','KVT1','KVT2','ERROR_RETRYABLE')
+            WHERE state IN ('SENT','KVT1','KVT2','ERROR_RETRYABLE','REQUIRES_MANUAL_RECONCILIATION')
             ORDER BY created_at
             """,
             (),

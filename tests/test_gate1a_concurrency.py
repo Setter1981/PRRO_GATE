@@ -204,3 +204,63 @@ def test_gate1a_concurrent_sell_single_fiscal_number(tmp_path: Path) -> None:
             f'Shift state after {CONCURRENCY} concurrent SELLs: {shift[0]} '
             f'(expected OPENED)'
         )
+
+
+def test_three_concurrent_workers_unique_lnds(tmp_path: Path) -> None:
+    """Three concurrent workers must produce unique LNDs (Invariant 2)."""
+    N = 3
+    cfg = _config(tmp_path)
+    transport_client = httpx.Client(transport=httpx.MockTransport(_mock_handler))
+    container = RuntimeContainer(cfg, transport_http_client=transport_client)
+
+    with TestClient(create_app(container)) as client:
+        # Open shift first
+        open_resp = client.post('/v1/ingress/checkbox', json={
+            'context': {**_ctx('3w-open'), 'business_ts': '2026-03-29T10:00:00Z'},
+            'operation': 'SHIFT_OPEN',
+            'request': {
+                'external_request_id': '3w-ext-open',
+                'cashier_id': 'cashier-3w',
+            },
+        })
+        assert open_resp.status_code == 200, f'SHIFT_OPEN failed: {open_resp.text}'
+        assert open_resp.json().get('document_state') == 'ACK', (
+            f'SHIFT_OPEN not ACK: {open_resp.json()}'
+        )
+
+        # Enqueue N SELLs via 3 concurrent threads
+        payloads = [_sell_payload(f'3w-sell-{i:03d}') for i in range(N)]
+        responses: list = []
+        thread_errors: list[Exception] = []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=N) as executor:
+            futures = {
+                executor.submit(client.post, '/v1/ingress/checkbox', json=payload): i
+                for i, payload in enumerate(payloads)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    responses.append(future.result())
+                except Exception as exc:
+                    thread_errors.append(exc)
+
+    assert thread_errors == [], (
+        f'Thread exception(s) in 3-worker concurrent SELL: {thread_errors}'
+    )
+
+    non_200 = [(r.status_code, r.text[:200]) for r in responses if r.status_code != 200]
+    assert non_200 == [], f'Non-200 responses: {non_200}'
+
+    # Verify unique LNDs via document_ids (doc_id encodes LND)
+    with container.connect() as conn:
+        sell_docs = conn.execute(
+            "SELECT document_id FROM fiscal_documents WHERE doc_type = 'SELL'"
+        ).fetchall()
+
+        assert len(sell_docs) == N, (
+            f'Expected {N} SELL docs, got {len(sell_docs)}: {sell_docs}'
+        )
+        doc_ids = [row[0] for row in sell_docs]
+        assert len(doc_ids) == len(set(doc_ids)), (
+            f'Duplicate document_ids — LND collision detected: {doc_ids}'
+        )

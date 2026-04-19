@@ -43,6 +43,12 @@ class StartupSupervisor:
         self.health.last_error = None
         self.migrate()
         self.health.phase = 'PHASE1_COMPLETE'
+        # M1: reset OPEN offline session started_at to now so that process downtime is not
+        # counted as offline time against the monthly/continuous limit.  The session was not
+        # actively serving receipts during the outage; accumulated_month_seconds already
+        # captures any time that was accrued up to the last ops_tick before the crash.
+        with self.connect_factory() as conn:
+            self._reset_open_offline_sessions(conn, now=started)
         if self.startup_ready:
             self.health.ready = True
         phase2_attempted = False
@@ -72,6 +78,28 @@ class StartupSupervisor:
             reconciliation_still_pending=recon_result.still_pending,
             reconciliation_manual=recon_result.manual,
         )
+
+
+    def _reset_open_offline_sessions(self, conn: sqlite3.Connection, now: datetime) -> None:
+        """Reset started_at for any OPEN offline sessions to exclude process downtime.
+
+        When the process crashes while in OFFLINE mode, the session's started_at continues
+        to age even though no receipts were being served. Resetting it to now() on startup
+        ensures only actual offline-service time counts against the monthly limit.
+        """
+        now_iso = now.isoformat()
+        rows = conn.execute(
+            "SELECT offline_session_id, fiscal_number FROM offline_sessions WHERE status = 'OPEN'"
+        ).fetchall()
+        if not rows:
+            return
+        conn.execute('BEGIN IMMEDIATE')
+        for (session_id, fiscal_number) in rows:
+            conn.execute(
+                "UPDATE offline_sessions SET started_at = ? WHERE offline_session_id = ?",
+                (now_iso, session_id),
+            )
+        conn.commit()
 
 
 __all__ = ['StartupSupervisor', 'StartupRunReport']

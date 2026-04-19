@@ -1,0 +1,43 @@
+{
+  "schema_version": "1.0.1",
+  "receipt_id": "fixture-small-0001",
+  "receipt_type": "SELL",
+  "fiscal_number": "9999999999",
+  "shift_id": "shift-0001",
+  "status": "PREPARED",
+  "business_ts": "2026-04-18T10:00:00+03:00",
+  "created_offline": false,
+  "fiscal_code": null,
+  "fiscal_date": null,
+  "header": "ТОВ ТЕСТ | PRRO 9999999999",
+  "footer": "Дякуємо за покупку!",
+  "rounding_enabled": false,
+  "goods": [
+    {
+      "item_id": "item-0001",
+      "item_no": 1,
+      "code": "SKU-0001",
+      "name": "Товар тестовий 1",
+      "price": 10000,
+      "quantity": 1000,
+      "sum": 10000,
+      "tax_id": 1,
+      "discounts": []
+    }
+  ],
+  "payments": [
+    {
+      "payment_id": "pay-0001",
+      "payment_type": "CASH",
+      "amount": 10000
+    }
+  ],
+  "totals": {
+    "total_sum": 10000,
+    "round_sum": null,
+    "discounts_sum": null,
+    "extra_charge_sum": null
+  },
+  "delivery": null,
+  "formatted_print_lines": []
+}

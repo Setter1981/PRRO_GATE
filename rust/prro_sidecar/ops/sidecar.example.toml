@@ -1,0 +1,40 @@
+# prro_sidecar configuration — copy to sidecar.toml and edit.
+# See ops/README.md for ship-time master-pubkey swap instructions.
+
+[sidecar]
+bind      = "127.0.0.1:8090"    # HTTP listener
+log_level = "info"              # trace / debug / info / warn / error
+
+[db]
+path = "var/prro.db"            # SQLite (same file as Python gateway)
+
+[license]
+# Optional. If unset sidecar starts in DEMO mode (500 UAH/check, no offline).
+path = "ops/license.json"
+
+[security]
+# credentials_mode = "xor_soft"  # default — XOR obfuscation via SHA-256(valid_to+name[1])
+# credentials_mode = "plain"     # opt-out for WebCheck migration / debug
+
+[dps.prod]
+endpoint           = "https://prro.tax.gov.ua:443"
+ca_bundle          = "ops/prro-tax-gov-ua-chain.pem"
+connect_timeout_ms = 10000
+request_timeout_ms = 90000
+
+[dps.test]
+endpoint           = "https://cabinet.tax.gov.ua:9443"
+ca_bundle          = "ops/prro-tax-gov-ua-chain.pem"
+connect_timeout_ms = 10000
+request_timeout_ms = 90000
+
+[tsp]
+# RFC 3161 timestamp — used when a FN has tsp_enabled = 1 in fiscal_number_config.
+# URL resolved from ca_endpoints table by issuer_pattern matching; override here if needed.
+# url        = "http://acskidd.gov.ua/services/tsp/"
+timeout_ms = 5000
+
+[dev]
+# ONLY for local testing. Requires DEBUG_INSECURE_MODE=1 env var to activate.
+skip_sign = false
+skip_dps  = false

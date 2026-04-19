@@ -1,42 +1,54 @@
-//! CMS/CAdES-BES detached signature builder for DSTU 4145.
+//! CMS/CAdES pipeline for DSTU 4145 + GOST 34.311-95.
 //!
-//! Entry point for Phase 4 Sprint 1 work. Produces .p7s-compatible
-//! output that closes the drop-in replacement gap for the Node.js
-//! sidecar.
+//! Produces `.p7s`-compatible output at three CAdES levels:
 //!
-//! ## Scope (v1)
+//! - **BES** (baseline) — detached or attached encapsulation; signed
+//!   attributes include `content-type`, `message-digest`,
+//!   `signing-certificate-v2` (with full `IssuerSerial`), optional
+//!   `signingTime` (UTCTIME).
+//! - **T** (timestamped) — BES + `id-aa-signatureTimeStampToken` as an
+//!   unsigned attribute. TSP client (RFC 3161, feature `tsp_http`)
+//!   handles the HTTP round-trip; callers may also embed a pre-fetched
+//!   TST via [`builder::CmsSigner::sign_with_tst`].
+//! - **LT** (long-term) — T + `id-aa-ets-revocationValues` carrying
+//!   CRLs and/or OCSP responses.
 //!
-//! - detached CAdES-BES (baseline B-B)
-//! - single signer
-//! - signed attributes: content-type, message-digest, signing-certificate-v2
-//! - certificate embedded in `certificates`
-//! - DSTU 4145-LE signature algorithm
-//! - GOST 34.311-95 digest (Kupyna deferred to later minor version)
+//! Additionally:
 //!
-//! ## NOT in v1
+//! - **EnvelopedData decrypt** — ECDH cofactor-DH through the CT
+//!   Montgomery ladder + GOST key-unwrap + CFB content decrypt.
+//! - **IIT cert-lookup-by-SKI** — reverse-engineered proprietary
+//!   binary protocol shared by all Ukrainian CSPs; live-tested against
+//!   acskidd / uakey / acsk.privatbank.
+//! - **OCSP / CRL fetchers** — bounded, redirects-off, per-call agents.
 //!
-//! - timestamps (CAdES-T/LT/LTA)
-//! - multiple signers / countersignatures
-//! - revocation info
-//! - attached content (encapsulated)
+//! ## Not implemented
 //!
-//! ## Current status (post-Sprint-1, post-expert-review 2026-04-15)
-//!
-//! Functional CMS builder with real GOST 34.311 hashing, real cert parsing,
-//! OsRng-driven rand_e. Remaining release blockers tracked in
-//! `PHASE_4_BACKLOG.md`: ESSCertIDv2.issuerSerial (B3), DPS differential (B4).
+//! - Multiple signers / countersignatures.
+//! - CAdES-LTA (archive-timestamp-v3) — for >7-year archival.
+//! - Kupyna (DSTU 7564) digest — parked until first Kupyna-keyed cert
+//!   appears in the field.
+//! - Response signature verification (TSP/OCSP/CRL/CMP) — the crate
+//!   embeds bytes as-delivered; callers validate at their layer.
 
+pub mod asn1_util;
 pub mod attrs;
 pub mod builder;
+pub mod cmp;
 pub mod der_writer;
+pub mod envelope;
+// Legacy jkurwa interop lives in `interop::prro::legacy_sign`, NOT in
+// cms/. The `#[cfg(feature = "legacy_jkurwa_interop")] pub mod interop;`
+// line that was here previously referenced a non-existent file
+// (`src/cms/interop.rs`) and broke `--all-features` builds.
 pub mod oids;
 pub mod profile;
+pub mod revocation;
 pub mod signer;
+pub mod tsp;
 
 pub use builder::{
     sign_detached_with_content_digest, CmsError, CmsSigner, DetachedSignature,
 };
-#[allow(deprecated)]
-pub use builder::sign_detached_prehashed;
 pub use profile::CmsProfile;
-pub use signer::{to_jkurwa_short_sign, DstuInProcessSigner, RawSigner, SignerError};
+pub use signer::{DstuInProcessSigner, RawSigner, SignerError};

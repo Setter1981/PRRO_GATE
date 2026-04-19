@@ -167,7 +167,7 @@ def test_ofr5_proto_id_offline_set() -> None:
     captured = {}
 
     class _CapStub:
-        def sendChkV2(self, req):
+        def sendChkV2(self, req, *, timeout=None):
             captured['id_offline'] = req.id_offline
             captured['id_cancel'] = req.id_cancel
 

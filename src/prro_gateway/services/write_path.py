@@ -4,6 +4,7 @@ import concurrent.futures
 import hashlib
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -132,7 +133,10 @@ class WritePathWorker:
             lease_owner=lease_owner,
         )
 
+        _t0 = time.perf_counter()
+
         ctx, result = self._stage_acquire_and_validate(conn, ctx)
+        _t1 = time.perf_counter()
         if result is not None:
             return result
 
@@ -140,17 +144,32 @@ class WritePathWorker:
         if ctx.document.state in {DocumentState.SIGNED, DocumentState.ENCRYPTED}:
             # Crash-resume: signature already persisted — skip _stage_sign entirely.
             self.logger.info("stage_sign_skipped_resume", extra={"extra_fields": {"document_id": ctx.document.document_id, "state": ctx.document.state}})
+            _t2 = _t1
         elif self._requires_local_sign(conn, ctx):
             ctx, result = self._stage_sign(conn, ctx)
+            _t2 = time.perf_counter()
             if result is not None:
                 return result
         else:
             self.logger.info("stage_sign_skipped", extra={"extra_fields": {"document_id": ctx.document.document_id, "transport_profile_id": ctx.document.transport_profile_id}})
+            _t2 = _t1
         ctx, result = self._stage_send_or_offline(conn, ctx)
+        _t3 = time.perf_counter()
         if result is not None:
             return result
 
-        return self._stage_finalize_ack(conn, ctx)
+        result = self._stage_finalize_ack(conn, ctx)
+        _t4 = time.perf_counter()
+        self.logger.info("write_path_timings_ms", extra={"extra_fields": {
+            "document_id": ctx.document.document_id,
+            "fiscal_number": ctx.fiscal_number,
+            "acquire_ms":   round((_t1 - _t0) * 1000, 1),
+            "sign_ms":      round((_t2 - _t1) * 1000, 1),
+            "send_ms":      round((_t3 - _t2) * 1000, 1),
+            "finalize_ms":  round((_t4 - _t3) * 1000, 1),
+            "total_ms":     round((_t4 - _t0) * 1000, 1),
+        }})
+        return result
 
     def _stage_acquire_and_validate(self, conn: sqlite3.Connection, ctx: WorkerContext) -> tuple[WorkerContext, WorkerProcessResult | None]:
         conn.execute('BEGIN IMMEDIATE')

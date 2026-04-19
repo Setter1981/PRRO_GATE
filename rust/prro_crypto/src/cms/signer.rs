@@ -9,6 +9,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SignerError {
     #[error("DSTU sign failed: {0}")]
     SignFailed(String),
@@ -40,7 +41,13 @@ pub enum SignerError {
 /// Interop adapters (e.g. for consumers that expect the legacy jkurwa
 /// `short_sign` form of `[0x04, len, r, s]`) should wrap the raw bytes
 /// at the adapter layer, not inside the trait.
-pub trait RawSigner {
+/// `Send + Sync` bound lets the builder run inside
+/// `Python::allow_threads(|| ...)` — the pyo3 bindings release the GIL
+/// across full CMS sign and the signer reference has to cross into the
+/// thread-external closure. All in-process signers we ship today
+/// (`DstuInProcessSigner`) are naturally thread-safe; remote/HSM
+/// signers must uphold the same bound.
+pub trait RawSigner: Send + Sync {
     /// Sign a pre-hashed digest.
     ///
     /// `digest` is the hash of the DER-encoded signedAttrs SET.
@@ -51,6 +58,7 @@ pub trait RawSigner {
 }
 
 /// Source of per-signature ephemeral scalar `rand_e`.
+#[derive(Debug)]
 enum RandESource {
     /// Production path: `rand_core::OsRng`. Each `sign_digest()` call draws
     /// fresh entropy from the OS.
@@ -69,14 +77,30 @@ enum RandESource {
 ///
 /// Output is `r_le(32) || s_le(32)` — raw signature value octets for
 /// direct placement into SignerInfo.signature (see RawSigner trait docs).
+///
+/// # Secret handling
+///
+/// `d` is a [`FieldEl`] which auto-zeroes on drop (see that type's
+/// `ZeroizeOnDrop` impl). `Debug` is explicitly NOT derived — the
+/// manual impl below prints only a placeholder so operator logs can
+/// safely format the signer without leaking the private key.
 pub struct DstuInProcessSigner {
-    d: crate::field::FieldEl,
+    d: crate::core::field::FieldEl,
     rand_e: RandESource,
+}
+
+impl std::fmt::Debug for DstuInProcessSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DstuInProcessSigner")
+            .field("d", &"<redacted>")
+            .field("rand_e", &self.rand_e)
+            .finish()
+    }
 }
 
 impl DstuInProcessSigner {
     /// Production constructor: `rand_e` is drawn from `OsRng` per call.
-    pub fn new(d: crate::field::FieldEl) -> Self {
+    pub fn new(d: crate::core::field::FieldEl) -> Self {
         Self { d, rand_e: RandESource::Os }
     }
 
@@ -87,16 +111,33 @@ impl DstuInProcessSigner {
     /// two signatures sharing the same `rand_e` leak the private key. Only
     /// compile this constructor under the explicit test feature.
     #[cfg(feature = "dangerous_deterministic_k_for_tests")]
-    pub fn with_deterministic_seed_for_tests(d: crate::field::FieldEl, seed: u64) -> Self {
+    pub fn with_deterministic_seed_for_tests(d: crate::core::field::FieldEl, seed: u64) -> Self {
         Self { d, rand_e: RandESource::Deterministic(seed) }
     }
 }
 
 impl RawSigner for DstuInProcessSigner {
     fn sign_digest(&self, digest: &[u8]) -> Result<Vec<u8>, SignerError> {
-        use crate::curve::Curve;
+        use crate::core::curve::Curve;
 
         let curve = Curve::dstu_pb_257();
+
+        // Enforce the documented digest-length contract: GOST 34.311
+        // produces exactly 32 bytes; anything else is either a
+        // truncated input, a wrong-hash domain, or an upstream bug.
+        // Signing a non-32-byte blob "works" mathematically (it just
+        // pads/truncates in `bytes_to_field_el`) but produces a
+        // signature over an unintended value.
+        const GOST_34311_DIGEST_LEN: usize = 32;
+        if digest.len() != GOST_34311_DIGEST_LEN {
+            return Err(SignerError::SignFailed(format!(
+                "digest length {} != {} (GOST 34.311 output width); \
+                 check that the correct hash was applied before signing",
+                digest.len(),
+                GOST_34311_DIGEST_LEN
+            )));
+        }
+
         let hash_field = bytes_to_field_el(digest, curve.mod_words);
 
         // Retry budget for the rare case `rand_e` produces a degenerate
@@ -119,7 +160,7 @@ impl RawSigner for DstuInProcessSigner {
                 }
             };
 
-            match crate::sign::sign(&curve, &self.d, &hash_field, &rand_e) {
+            match crate::core::sign::sign(&curve, &self.d, &hash_field, &rand_e) {
                 Some(sig) => {
                     let r_bytes = fe_to_bytes_le(&sig.r, 32);
                     let s_bytes = fe_to_bytes_le(&sig.s, 32);
@@ -142,34 +183,90 @@ impl RawSigner for DstuInProcessSigner {
     }
 }
 
-/// Draw a fresh `rand_e` from `OsRng`.
+/// Draw a fresh `rand_e` scalar from `OsRng`, guaranteed to lie in
+/// `[1, curve.order)` and packed into a `mod_words`-wide `FieldEl`
+/// with bit 256 and above explicitly zero.
 ///
-/// Fills `mod_words * 4` bytes of entropy and packs them as a FieldEl.
-/// The bias toward values >= n is ~2^-256 for PB-257 — negligible. A
-/// rare degenerate output is handled by the retry loop in the caller.
-fn draw_rand_e_os(mod_words: usize) -> Result<crate::field::FieldEl, SignerError> {
+/// Sprint 2.2: this helper used to draw the full `mod_words * 32` bits
+/// of entropy and return an unreduced FieldEl. That violated the
+/// `sign()` contract that `rand_e < curve.order`, because the
+/// Montgomery ladder then processed all 288 bits while the
+/// scalar-domain code only saw the low 256 — producing signatures that
+/// failed verification. The fix is rejection sampling on 32 bytes:
+/// draw uniformly in `[0, 2^256)`, reduce via `Scalar::from_le_bytes`,
+/// reject zero, repack as a canonical 9-word `FieldEl` whose high word
+/// is zero by construction. `n ≈ 2^255.7` so the rejection rate is
+/// ~1 zero in 2^255 draws — effectively never in practice.
+/// Draw a uniformly random non-zero scalar in `[1, n)` from `OsRng`
+/// using **true rejection sampling**.
+///
+/// # Why rejection sampling, not modular reduction
+///
+/// The previous implementation fed a 256-bit random sample through
+/// `Scalar::from_le_bytes`, which is a single-subtract Barrett
+/// canonicalizer. Because `n ≈ 2^255.5`, roughly half the 256-bit
+/// space is `≥ n` and wraps to `raw − n`, making residues in
+/// `[0, 2^256 − n)` occur **twice as often** as the rest.
+///
+/// For DSTU 4145 (ECDSA-class), a biased ephemeral scalar is
+/// key-recovery material given enough signatures (Bleichenbacher
+/// lattice attack). The fix: draw raw 256-bit samples, **reject**
+/// any `≥ n` or `== 0`, and use the survivors as-is. Expected draws
+/// per accepted sample ≈ 2 (acceptable for OsRng throughput).
+fn draw_rand_e_os(mod_words: usize) -> Result<crate::core::field::FieldEl, SignerError> {
+    use crate::core::scalar::Scalar;
     use rand_core::RngCore;
+
     let mut rng = rand_core::OsRng;
-    let mut buf = vec![0u8; mod_words * 4];
-    rng.try_fill_bytes(&mut buf)
-        .map_err(|e| SignerError::Rng(e.to_string()))?;
-    Ok(bytes_to_field_el(&buf, mod_words))
+    loop {
+        let mut buf = [0u8; 32];
+        rng.try_fill_bytes(&mut buf)
+            .map_err(|e| SignerError::Rng(e.to_string()))?;
+
+        // Build raw u256 from LE bytes WITHOUT canonicalization.
+        // `Scalar::from_limbs` is a direct wrap — it does not reduce.
+        let limbs = [
+            u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]),
+            u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]),
+            u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]),
+            u64::from_le_bytes([buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]]),
+        ];
+        let candidate = Scalar::from_limbs(limbs);
+
+        // Reject if >= n (not canonical) or == 0.
+        if !candidate.is_canonical() || candidate.is_zero() {
+            continue;
+        }
+        // Wipe the raw buffer before returning.
+        use zeroize::Zeroize;
+        buf.zeroize();
+        return Ok(scalar_to_fieldel(&candidate, mod_words));
+    }
 }
 
-/// Interop adapter: wraps a raw signature value (from RawSigner) in the
-/// legacy jkurwa "short_sign" form `[0x04, len, r_le, s_le]`.
-///
-/// Only use when the relying party specifically expects this format.
-/// By default, CMS SignerInfo.signature takes the raw bytes directly.
-pub fn to_jkurwa_short_sign(raw_sig: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + raw_sig.len());
-    out.push(0x04);
-    out.push(raw_sig.len() as u8);
-    out.extend_from_slice(raw_sig);
-    out
+/// Convert a canonical `Scalar` (guaranteed `< order < 2^256`) into a
+/// `mod_words`-wide `FieldEl`. The high words past the scalar's 256-bit
+/// payload are explicitly zero, so every caller — including the
+/// Montgomery ladder that iterates all `mod_words * 32` bits — sees
+/// exactly the same scalar value.
+fn scalar_to_fieldel(
+    scalar: &crate::core::scalar::Scalar,
+    mod_words: usize,
+) -> crate::core::field::FieldEl {
+    let bytes = scalar.to_le_bytes(); // 32 little-endian bytes
+    let mut words = vec![0u32; mod_words];
+    for i in 0..8.min(mod_words) {
+        words[i] = u32::from_le_bytes([
+            bytes[4 * i],
+            bytes[4 * i + 1],
+            bytes[4 * i + 2],
+            bytes[4 * i + 3],
+        ]);
+    }
+    crate::core::field::FieldEl::from_words(words)
 }
 
-fn bytes_to_field_el(bytes: &[u8], mod_words: usize) -> crate::field::FieldEl {
+pub(crate) fn bytes_to_field_el(bytes: &[u8], mod_words: usize) -> crate::core::field::FieldEl {
     let mut words = vec![0u32; mod_words];
     for (i, &b) in bytes.iter().enumerate() {
         let word_idx = i / 4;
@@ -179,10 +276,10 @@ fn bytes_to_field_el(bytes: &[u8], mod_words: usize) -> crate::field::FieldEl {
         }
         words[word_idx] |= (b as u32) << (byte_idx * 8);
     }
-    crate::field::FieldEl::from_words(words)
+    crate::core::field::FieldEl::from_words(words)
 }
 
-fn fe_to_bytes_le(fe: &crate::field::FieldEl, target_len: usize) -> Vec<u8> {
+fn fe_to_bytes_le(fe: &crate::core::field::FieldEl, target_len: usize) -> Vec<u8> {
     let mut out = vec![0u8; target_len];
     for (word_idx, word) in fe.bytes.iter().enumerate() {
         for byte_offset in 0..4 {
@@ -201,7 +298,7 @@ fn derive_deterministic_e(
     seed: u64,
     digest: &[u8],
     mod_words: usize,
-) -> crate::field::FieldEl {
+) -> crate::core::field::FieldEl {
     use sha1::{Digest, Sha1};
     let mut hasher = Sha1::new();
     hasher.update(seed.to_le_bytes());
@@ -223,7 +320,7 @@ fn derive_deterministic_e(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field::FieldEl;
+    use crate::core::field::FieldEl;
 
     /// Two signatures over the same digest must differ when OsRng is in use.
     /// If they matched, `rand_e` would be reused across signatures — the

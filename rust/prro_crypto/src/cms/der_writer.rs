@@ -14,6 +14,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum DerWriterError {
     #[error("integer too large for u64 encoding")]
     IntegerOverflow,

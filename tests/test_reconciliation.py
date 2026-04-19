@@ -262,4 +262,130 @@ def test_reconciliation_promotes_shift_open_pending_to_opened(conn):
         assert shift is not None
         assert shift.state == ShiftState.OPENED
     finally:
-        conn.close()
+        pass  # conn lifecycle owned by conftest fixture
+
+
+# ---------------------------------------------------------------------------
+# Task 9 additions
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_all_fiscal_numbers_when_fn_is_none(conn):
+    """fiscal_number=None must scan all FNs and ACK any SENT doc found."""
+    _seed_shift(conn)
+    _accept_sell(conn)
+    # Process through write_path to create a SENT document
+    handler = FakeHandler(
+        send_result=SendResult(
+            transport_request_id='req-none-fn',
+            submission_status='SENT',
+            sent_at=datetime.now(UTC),
+            response_json='{}',
+        ),
+        poll_result=PollResult(
+            state=DocumentState.ACK.value,
+            submission_status='ACK',
+            ack_at=datetime.now(UTC),
+            response_json='{"status": "ACK"}',
+        ),
+    )
+    router = ProfileAwareTransportRouter.from_connection(conn, handlers={TransportKind.CHECKBOX_REST_TRANSPORT: handler})
+    worker = WritePathWorker(crypto_provider=FakeCrypto(), transport_client=router)
+    process_result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
+    assert process_result.outcome == 'ACK'
+
+    # Reset doc to SENT to simulate crash-before-ACK scenario
+    doc = FiscalDocumentRepository.get_by_id(conn, process_result.document_id)
+    conn.execute(
+        "UPDATE fiscal_documents SET state='SENT', ack_at=NULL, response_json=NULL WHERE document_id=?",
+        (doc.document_id,),
+    )
+    conn.commit()
+
+    # Reconcile with fiscal_number=None (global scan)
+    svc = ReconciliationService(transport_status_client=router)
+    result = svc.reconcile_pending(conn, fiscal_number=None)
+
+    assert result.acked >= 1, f"Expected at least 1 ACK from global scan, got {result}"
+
+
+def test_rate_limit_cooldown_skips_document(conn):
+    """A DPS_RATE_LIMITED doc within its cooldown window must be skipped (still_pending)."""
+    _seed_shift(conn)
+    _accept_sell(conn)
+    handler = FakeHandler(
+        send_result=SendResult(
+            transport_request_id='req-rl',
+            submission_status='SENT',
+            sent_at=datetime.now(UTC),
+        ),
+        poll_result=PollResult(
+            state=DocumentState.ACK.value,
+            submission_status='ACK',
+            ack_at=datetime.now(UTC),
+            response_json='{}',
+        ),
+    )
+    router = ProfileAwareTransportRouter.from_connection(conn, handlers={TransportKind.CHECKBOX_REST_TRANSPORT: handler})
+    worker = WritePathWorker(crypto_provider=FakeCrypto(), transport_client=router)
+    process_result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
+    assert process_result.outcome == 'ACK'
+
+    doc_id = process_result.document_id
+    # Simulate a rate-limited doc: SENT state but submission_status=DPS_RATE_LIMITED
+    # with updated_at=NOW (cooldown window active)
+    conn.execute(
+        """UPDATE fiscal_documents
+           SET state='SENT', ack_at=NULL,
+               submission_status='DPS_RATE_LIMITED',
+               response_json=?,
+               updated_at=CURRENT_TIMESTAMP
+           WHERE document_id=?""",
+        ('{"retry_after_seconds": 600}', doc_id),
+    )
+    conn.commit()
+
+    svc = ReconciliationService(transport_status_client=router)
+    result = svc.reconcile_pending(conn, fiscal_number='FN-DEV-0001')
+
+    # Document is within cooldown window — must be skipped
+    assert result.acked == 0, "Rate-limited doc within cooldown must not be ACK'd"
+    assert result.still_pending >= 1, "Skipped doc must appear in still_pending"
+
+
+def test_reconcile_returns_correct_counts(conn):
+    """After reconciliation of 1 SENT doc with ACK poll, checked>=1 and acked>=1."""
+    _seed_shift(conn)
+    _accept_sell(conn)
+    handler = FakeHandler(
+        send_result=SendResult(
+            transport_request_id='req-counts',
+            submission_status='SENT',
+            sent_at=datetime.now(UTC),
+            response_json='{}',
+        ),
+        poll_result=PollResult(
+            state=DocumentState.ACK.value,
+            submission_status='ACK',
+            ack_at=datetime.now(UTC),
+            response_json='{"status": "ACK"}',
+        ),
+    )
+    router = ProfileAwareTransportRouter.from_connection(conn, handlers={TransportKind.CHECKBOX_REST_TRANSPORT: handler})
+    worker = WritePathWorker(crypto_provider=FakeCrypto(), transport_client=router)
+    process_result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
+    assert process_result.outcome == 'ACK'
+
+    doc = FiscalDocumentRepository.get_by_id(conn, process_result.document_id)
+    conn.execute(
+        "UPDATE fiscal_documents SET state='SENT', ack_at=NULL, response_json=NULL WHERE document_id=?",
+        (doc.document_id,),
+    )
+    conn.commit()
+
+    svc = ReconciliationService(transport_status_client=router)
+    result = svc.reconcile_pending(conn, fiscal_number='FN-DEV-0001')
+
+    assert result.checked >= 1, f"checked must be >= 1, got {result.checked}"
+    assert result.acked >= 1, f"acked must be >= 1, got {result.acked}"
+    assert result.still_pending == 0, f"still_pending must be 0, got {result.still_pending}"

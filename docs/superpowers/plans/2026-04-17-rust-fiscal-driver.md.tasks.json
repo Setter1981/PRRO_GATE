@@ -1,0 +1,40 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-17-rust-fiscal-driver.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: Cargo.toml sidecar feature + proto schema + module skeleton",
+      "status": "pending",
+      "description": "**Goal:** Establish the build scaffolding so `cargo check --features sidecar` compiles cleanly and the proto file is in place.\n\n**Files:**\n- Modify: `rust/prro_crypto/Cargo.toml`\n- Create: `rust/prro_crypto/build.rs`\n- Create: `rust/prro_crypto/proto/check.proto`\n- Create: `rust/prro_crypto/src/fiscal/mod.rs`\n- Create: `rust/prro_crypto/src/bin/prro_sidecar.rs` (stub)\n- Modify: `rust/prro_crypto/src/lib.rs`\n\n**Acceptance Criteria:**\n- [ ] `cargo check` (no feature) still passes\n- [ ] `cargo check --features sidecar` passes\n- [ ] `proto/check.proto` present with all 7 fields of Check\n- [ ] module stubs created\n\n**Verify:** `cd rust/prro_crypto && cargo check && cargo check --features sidecar`\n\n```json:metadata\n{\"files\": [\"rust/prro_crypto/Cargo.toml\", \"rust/prro_crypto/build.rs\", \"rust/prro_crypto/proto/check.proto\", \"rust/prro_crypto/src/fiscal/mod.rs\", \"rust/prro_crypto/src/bin/prro_sidecar.rs\", \"rust/prro_crypto/src/lib.rs\"], \"verifyCommand\": \"cd rust/prro_crypto && cargo check && cargo check --features sidecar\", \"acceptanceCriteria\": [\"cargo check (no feature) passes\", \"cargo check --features sidecar passes\", \"proto/check.proto exists with Check message\", \"src/fiscal/mod.rs created\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: LoadedKey public API + DpsGrpcClient",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Expose `load_signing_key()` from `interop::prro` and implement a persistent-channel tonic gRPC client.\n\n**Files:**\n- Modify: `rust/prro_crypto/src/interop/prro/mod.rs`\n- Create: `rust/prro_crypto/src/fiscal/grpc_client.rs`\n\n**Acceptance Criteria:**\n- [ ] `load_signing_key(data, password)` is public and returns `LoadedKey { signer, cert_der }`\n- [ ] `DpsGrpcClient::new(endpoint, tls_root_certs)` creates tonic channel with keep-alive\n- [ ] `DpsGrpcClient::send_chk_v2(check)` returns CheckResponse\n- [ ] `DpsGrpcClient::ping_warmup()` exists\n- [ ] `cargo build --features sidecar` exits 0\n\n**Verify:** `cd rust/prro_crypto && cargo build --features sidecar`\n\n```json:metadata\n{\"files\": [\"rust/prro_crypto/src/interop/prro/mod.rs\", \"rust/prro_crypto/src/fiscal/grpc_client.rs\"], \"verifyCommand\": \"cd rust/prro_crypto && cargo build --features sidecar\", \"acceptanceCriteria\": [\"load_signing_key() is pub in interop::prro\", \"DpsGrpcClient::new() builds persistent channel with keep_alive_while_idle\", \"send_chk_v2() returns CheckResponse\", \"cargo build --features sidecar exits 0\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: prro_sidecar binary — axum server + sign_and_send handler",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Full `prro_sidecar` binary: key load at startup, warmup ping, POST /fiscal/sign_and_send (cp1251 encode → CMS sign → gRPC), GET /health.\n\n**Files:**\n- Replace: `rust/prro_crypto/src/bin/prro_sidecar.rs`\n- Modify: `rust/prro_crypto/Cargo.toml` (add base64 dep)\n\n**Acceptance Criteria:**\n- [ ] `cargo build --release --features sidecar` produces `target/release/prro_sidecar`\n- [ ] GET /health returns 200\n- [ ] POST /fiscal/sign_and_send: cp1251 encoding via WINDOWS_1251.encode()\n- [ ] POST /fiscal/sign_and_send: CMS sign via CmsSigner::sign_detached()\n- [ ] check_sign in gRPC = CMS DER bytes\n- [ ] Startup loads SIDECAR_KEY_PATH + SIDECAR_KEY_PASSWORD env vars\n\n**Verify:** `cd rust/prro_crypto && cargo build --release --features sidecar && ls target/release/prro_sidecar`\n\n```json:metadata\n{\"files\": [\"rust/prro_crypto/src/bin/prro_sidecar.rs\", \"rust/prro_crypto/Cargo.toml\"], \"verifyCommand\": \"cd rust/prro_crypto && cargo build --release --features sidecar && ls target/release/prro_sidecar\", \"acceptanceCriteria\": [\"binary produced at target/release/prro_sidecar\", \"WINDOWS_1251.encode() used for cp1251 encoding\", \"CmsSigner::sign_detached() called on cp1251 bytes\", \"check_sign = cms_der bytes\", \"SIDECAR_KEY_PATH env var loaded at startup\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Python FiscalSidecarTransport + runtime wiring",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Add FiscalSidecarTransport to Python transport layer and wire into the container.\n\n**Files:**\n- Modify: `src/prro_gateway/enums.py`\n- Create: `src/prro_gateway/transports/fiscal_sidecar.py`\n- Modify: `src/prro_gateway/transports/__init__.py`\n- Modify: `src/prro_gateway/runtime/container.py`\n- Create: `tests/test_fiscal_sidecar_transport.py`\n\n**Acceptance Criteria:**\n- [ ] TransportKind.DPS_PRRO_FISCAL_SIDECAR exists\n- [ ] send() posts {xml_b64, fiscal_number, date_time, local_number, check_type, offline_id, cancel_id}\n- [ ] status==1 returns SendResult(state=ACK, transport_request_id=fiscal_id)\n- [ ] status<0 raises TransportRejectedError\n- [ ] pytest tests/ passes with no regressions\n- [ ] 3 new tests in test_fiscal_sidecar_transport.py pass\n\n**Verify:** `pytest tests/ -x -q && pytest tests/test_fiscal_sidecar_transport.py -v`\n\n```json:metadata\n{\"files\": [\"src/prro_gateway/enums.py\", \"src/prro_gateway/transports/fiscal_sidecar.py\", \"src/prro_gateway/transports/__init__.py\", \"src/prro_gateway/runtime/container.py\", \"tests/test_fiscal_sidecar_transport.py\"], \"verifyCommand\": \"pytest tests/ -x -q && pytest tests/test_fiscal_sidecar_transport.py -v\", \"acceptanceCriteria\": [\"TransportKind.DPS_PRRO_FISCAL_SIDECAR added\", \"send() posts xml_b64 base64-encoded\", \"status==1 returns ACK SendResult\", \"status<0 raises TransportRejectedError\", \"all existing tests pass\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4 (Phase 2 — deferred): XML builder in Rust",
+      "status": "pending",
+      "blockedBy": [2, 3],
+      "description": "**Goal:** Move dps_xml.py logic into src/fiscal/xml_builder.rs so the sidecar accepts canonical JSON at /fiscal/canonical_send.\n\n**Status:** DEFERRED — Phase 1 must be stable in production first.\n\n**Files:**\n- Create: `rust/prro_crypto/src/fiscal/xml_builder.rs`\n- Modify: `rust/prro_crypto/src/bin/prro_sidecar.rs` (add /fiscal/canonical_send)\n- Modify: `src/prro_gateway/transports/fiscal_sidecar.py` (canonical_send mode)\n\n**Acceptance Criteria:**\n- [ ] build_dps_xml_cp1251() produces byte-identical output to Python dps_xml.py golden files\n- [ ] All 7 operation types covered\n- [ ] /fiscal/canonical_send endpoint works end-to-end\n\n**Verify:** `cd rust/prro_crypto && cargo test --features sidecar --test test_xml_builder`\n\n```json:metadata\n{\"files\": [\"rust/prro_crypto/src/fiscal/xml_builder.rs\", \"rust/prro_crypto/src/bin/prro_sidecar.rs\", \"src/prro_gateway/transports/fiscal_sidecar.py\"], \"verifyCommand\": \"cd rust/prro_crypto && cargo test --features sidecar --test test_xml_builder\", \"acceptanceCriteria\": [\"XML output byte-identical to Python golden files\", \"All 7 operation types implemented\", \"/fiscal/canonical_send endpoint works\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-04-17T00:00:00Z"
+}

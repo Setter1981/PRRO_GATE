@@ -15,6 +15,7 @@ dependencies = [
   "fastapi>=0.116,<1",
   "uvicorn>=0.35,<1",
   "httpx>=0.28,<1",
+  "h2>=4.0,<5",
   "grpcio>=1.80,<2",
   "protobuf>=6.31,<7"
 ]
@@ -28,3 +29,4 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+norecursedirs = [".beads", ".git", ".venv", ".pytest_cache", ".agents", ".claude"]

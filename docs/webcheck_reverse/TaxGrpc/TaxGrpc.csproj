@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>TaxGrpc</AssemblyName>
+    <GenerateAssemblyInfo>False</GenerateAssemblyInfo>
+    <TargetFramework>net461</TargetFramework>
+  </PropertyGroup>
+  <PropertyGroup>
+    <LangVersion>11.0</LangVersion>
+    <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <PropertyGroup />
+  <ItemGroup />
+  <ItemGroup>
+    <Reference Include="Google.Protobuf">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/Google.Protobuf.dll</HintPath>
+    </Reference>
+    <Reference Include="Grpc.Core.Api">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/Grpc.Core.Api.dll</HintPath>
+    </Reference>
+    <Reference Include="Grpc.Core">
+      <HintPath>../../../../../c/Program Files (x86)/WebCheck/PRRO32/Grpc.Core.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>

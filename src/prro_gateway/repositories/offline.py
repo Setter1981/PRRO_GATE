@@ -76,5 +76,81 @@ class OfflineRepository:
         )
         return OfflineRepository.get_open_session(conn, fiscal_number)
 
+    def close_session(
+        conn: sqlite3.Connection,
+        *,
+        offline_session_id: str,
+        ended_at: str,
+        continuous_seconds: int,
+    ) -> None:
+        """Close an offline session and persist its duration."""
+        conn.execute(
+            """
+            UPDATE offline_sessions
+            SET status = 'CLOSED',
+                ended_at = ?,
+                accumulated_month_seconds = accumulated_month_seconds + ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE offline_session_id = ?
+            """,
+            (ended_at, max(0, continuous_seconds), offline_session_id),
+        )
+
+    def create_range(
+        conn: sqlite3.Connection,
+        *,
+        range_id: str,
+        fiscal_number: str,
+        first_fiscal_no: int,
+        last_fiscal_no: int,
+        issued_at: str,
+        source_payload_json: str | None = None,
+    ) -> OfflineRangeRecord:
+        """Insert a new ACTIVE offline range for this fiscal_number."""
+        conn.execute(
+            """
+            INSERT INTO offline_ranges
+                (range_id, fiscal_number, first_fiscal_no, last_fiscal_no,
+                 next_fiscal_no, issued_at, status, source_payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?)
+            """,
+            (range_id, fiscal_number, first_fiscal_no, last_fiscal_no,
+             first_fiscal_no, issued_at, source_payload_json),
+        )
+        return OfflineRepository.get_active_range(conn, fiscal_number)
+
+    def has_overlapping_range(
+        conn: sqlite3.Connection,
+        *,
+        fiscal_number: str,
+        first_fiscal_no: int,
+        last_fiscal_no: int,
+    ) -> bool:
+        """Return True if any ACTIVE range overlaps the given interval."""
+        row = conn.execute(
+            """
+            SELECT 1 FROM offline_ranges
+            WHERE fiscal_number = ?
+              AND status = 'ACTIVE'
+              AND first_fiscal_no <= ?
+              AND last_fiscal_no >= ?
+            LIMIT 1
+            """,
+            (fiscal_number, last_fiscal_no, first_fiscal_no),
+        ).fetchone()
+        return row is not None
+
+    def count_available(conn: sqlite3.Connection, fiscal_number: str) -> int:
+        """Count total unused offline fiscal number codes across all ACTIVE ranges."""
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(last_fiscal_no - next_fiscal_no + 1), 0)
+            FROM offline_ranges
+            WHERE fiscal_number = ? AND status = 'ACTIVE'
+            """,
+            (fiscal_number,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
 
 __all__ = ['OfflineRepository']
