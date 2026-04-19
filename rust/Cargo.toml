@@ -3,4 +3,5 @@ resolver = "2"
 members = [
     "prro_crypto",
     "prro_crypto_v2",
+    "prro_sidecar",
 ]
