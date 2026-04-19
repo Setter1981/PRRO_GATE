@@ -39,6 +39,9 @@ encoding_rs        = "0.8"
 # Hashing (XOR-soft credential obfuscation key derivation)
 sha2               = "0.10"
 
+# CSPRNG for license key generation (matches version used by prro_crypto)
+rand_core          = { version = "0.6", features = ["getrandom"] }
+
 # Observability
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3",  features = ["env-filter", "json"] }

@@ -1771,6 +1771,7 @@ dependencies = [
  "prost",
  "protoc-bin-vendored",
  "prro_crypto",
+ "rand_core 0.6.4",
  "reqwest",
  "rusqlite",
  "serde",
