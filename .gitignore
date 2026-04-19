@@ -8,6 +8,7 @@ __pycache__/
 
 # Local environments / tool state
 .venv/
+.venv_wsl/
 .codex
 var/
 tmp_*.sqlite3
@@ -18,6 +19,7 @@ tmp_*.sqlite3-wal
 .claude/agent-memory/
 .claude/settings.local.json
 .claude/settings.json.bak
+.claude/worktrees/
 
 # Beads / Dolt files (added by bd init)
 .dolt/
@@ -31,6 +33,17 @@ sidecar/node_modules/
 
 # Rust build artifacts
 rust/prro_crypto/target/
+rust/target/
+rust/rustup-init.exe
+
+# Local bench artifacts (third-party sources, secrets, binaries)
+rust/prro_crypto/.tmp_bench/
+rust/prro_crypto/bench_cryptonite/
+rust/prro_crypto/node_modules/
+rust/prro_crypto/nul
+rust/prro_crypto/*.exe
+bench_results/
+bench_standalone
 
 # Build archives / binary distributions
 prro_crypto_chunks/
