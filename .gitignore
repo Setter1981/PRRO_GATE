@@ -36,12 +36,17 @@ rust/prro_crypto/target/
 rust/target/
 rust/rustup-init.exe
 
-# Local bench artifacts (third-party sources, secrets, binaries)
+# Local bench artifacts (third-party sources, secrets, binaries, ad-hoc scripts)
 rust/prro_crypto/.tmp_bench/
 rust/prro_crypto/bench_cryptonite/
 rust/prro_crypto/node_modules/
 rust/prro_crypto/nul
 rust/prro_crypto/*.exe
+rust/prro_crypto/bench_*.ps1
+rust/prro_crypto/bench_*.cs
+rust/prro_crypto/bench_*.js
+rust/prro_crypto/package.json
+rust/prro_crypto/package-lock.json
 bench_results/
 bench_standalone
 
