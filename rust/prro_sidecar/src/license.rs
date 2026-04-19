@@ -49,7 +49,7 @@ pub enum LicenseState {
     Grace   { days_left: i32 },
     Expired,
     Demo    { limits: DemoLimits },
-    TinMismatch     { expected: String, actual: String },
+    TinMismatch     { in_license: String, requested: String },
     FnNotLicensed   { fn_: String },
     SignatureInvalid,
 }
@@ -178,8 +178,8 @@ fn verify_inner(
     if let Some(tin) = tin {
         if payload.tin != tin {
             return Ok(LicenseState::TinMismatch {
-                expected: payload.tin,
-                actual:   tin.into(),
+                in_license: payload.tin,
+                requested:  tin.into(),
             });
         }
     }
@@ -386,7 +386,7 @@ mod tests {
         let now     = datetime!(2026-04-19 12:00:00 UTC);
         let state   = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("9999999999"), now);
         assert!(
-            matches!(state, LicenseState::TinMismatch { ref actual, .. } if actual == "9999999999"),
+            matches!(state, LicenseState::TinMismatch { ref requested, .. } if requested == "9999999999"),
             "expected TinMismatch, got {state:?}"
         );
     }

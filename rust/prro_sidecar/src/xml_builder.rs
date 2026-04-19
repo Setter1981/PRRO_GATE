@@ -62,7 +62,7 @@ pub fn build(cmd: &CanonicalCommand, ctx: &BuildContext) -> Result<Vec<u8>, Side
 // ── Router ────────────────────────────────────────────────────────────────────
 
 fn build_xml(cmd: &CanonicalCommand, ctx: &BuildContext) -> Result<String, SidecarError> {
-    let ts_str = format_ts(&cmd.business_ts);
+    let ts_str = format_ts(&cmd.business_ts)?;
     let rq_attrs = vec![
         ("NDv", ctx.device_name.to_string()),
         ("PrV", ctx.device_version.to_string()),
@@ -89,22 +89,25 @@ fn build_xml(cmd: &CanonicalCommand, ctx: &BuildContext) -> Result<String, Sidec
 /// Parse ISO-8601 UTC timestamp and format as `YYYYMMDDHHMMSS` in Kyiv time (UTC+3).
 ///
 /// Ukraine has been on permanent UTC+3 since 2022-02-26.
-/// Falls back to current UTC+3 time if the string cannot be parsed.
-fn format_ts(business_ts: &str) -> String {
+/// Returns `BadRequest` if the string cannot be parsed — the DPS MAC chain
+/// depends on deterministic document content; a silent clock substitution
+/// would break replay determinism and produce fiscally incorrect timestamps.
+fn format_ts(business_ts: &str) -> Result<String, SidecarError> {
     let kyiv = UtcOffset::from_hms(3, 0, 0).expect("UTC+3 is always valid");
 
     let odt: OffsetDateTime = OffsetDateTime::parse(business_ts, &Rfc3339)
         .or_else(|_| {
-            // Try appending 'Z' for bare ISO-8601 without timezone
-            let with_z = format!("{business_ts}Z");
-            OffsetDateTime::parse(&with_z, &Rfc3339)
+            // Accept bare ISO-8601 without explicit timezone (append Z = UTC)
+            OffsetDateTime::parse(&format!("{business_ts}Z"), &Rfc3339)
         })
-        .unwrap_or_else(|_| OffsetDateTime::now_utc())
+        .map_err(|_| SidecarError::BadRequest(format!(
+            "invalid business_ts {business_ts:?}; expected ISO-8601 UTC"
+        )))?
         .to_offset(kyiv);
 
     let fmt = format_description::parse("[year][month][day][hour][minute][second]")
         .expect("static format string is valid");
-    odt.format(&fmt).unwrap_or_else(|_| "00000000000000".to_string())
+    Ok(odt.format(&fmt).expect("YYYYMMDDHHMMSS format is infallible for a valid OffsetDateTime"))
 }
 
 // ── SHIFT_OPEN ────────────────────────────────────────────────────────────────
@@ -132,6 +135,9 @@ fn build_shift_open(
     let dat_content = tag(
         "DAT",
         vec![
+            // DPS ФСКО v2.2.3 §3.1: SHIFT_OPEN (T=108) always carries DI=0.
+            // The local document counter starts from 1 with the first SELL/RETURN
+            // after shift open. ctx.local_number is intentionally not used here.
             ("DI", "0".to_string()),
             ("FN", cmd.fiscal_number.clone()),
             ("TN", ctx.tax_number.to_string()),
@@ -1031,7 +1037,13 @@ mod tests {
     #[test]
     fn test_format_ts_utc_to_kyiv() {
         // UTC 09:00 → Kyiv 12:00 (UTC+3)
-        assert_eq!(format_ts("2026-04-19T09:00:00Z"), "20260419120000");
+        assert_eq!(format_ts("2026-04-19T09:00:00Z").unwrap(), "20260419120000");
+    }
+
+    #[test]
+    fn test_format_ts_invalid_returns_bad_request() {
+        let err = format_ts("not-a-date").unwrap_err();
+        assert!(matches!(err, SidecarError::BadRequest(_)), "expected BadRequest, got {err:?}");
     }
 
     #[test]

@@ -13,7 +13,6 @@ use crate::generated::{
     chk_income_service_client::ChkIncomeServiceClient,
     Check, CheckRequest, CheckResponse, StatusResponse, RroInfoResponse,
 };
-use crate::generated::check_response::Status as ChkStatus;
 
 // ─── Error ────────────────────────────────────────────────────────────────────
 
@@ -40,9 +39,24 @@ pub enum DpsErrorCategory {
 
 pub fn classify_dps_status(status: i32) -> Option<DpsErrorCategory> {
     match status {
-        1 => None, // OK
-        -3 | -4 | -12 => Some(DpsErrorCategory::Transient), // ERROR_SAVE, ERROR_UNKNOWN, ERROR_BAD_HASH_PREV
-        _ => Some(DpsErrorCategory::Permanent),
+        1  => None,                            // OK
+        -3 => Some(DpsErrorCategory::Transient), // ERROR_SAVE — DB write race; retry
+        -4 => Some(DpsErrorCategory::Transient), // ERROR_UNKNOWN — server-side transient; retry
+        -12 => Some(DpsErrorCategory::Transient), // ERROR_BAD_HASH_PREV — chain gap; retry after resync
+        -1  => Some(DpsErrorCategory::Permanent), // ERROR_VEREFY — signature verification failed
+        -2  => Some(DpsErrorCategory::Permanent), // ERROR_CHECK — cert/auth check failed
+        -5  => Some(DpsErrorCategory::Permanent), // ERROR_TYPE — unknown doc type
+        -6  => Some(DpsErrorCategory::Permanent), // ERROR_NOT_PREV_ZREPORT — prev Z-report missing
+        -7  => Some(DpsErrorCategory::Permanent), // ERROR_XML — XML malformed
+        -8  => Some(DpsErrorCategory::Permanent), // ERROR_XML_DATE — date field invalid
+        -9  => Some(DpsErrorCategory::Permanent), // ERROR_XML_CHK — check XML invalid
+        -10 => Some(DpsErrorCategory::Permanent), // ERROR_XML_ZREPORT — Z-report XML invalid
+        -11 => Some(DpsErrorCategory::Permanent), // ERROR_OFFLINE_168 — offline >168h limit
+        -13 => Some(DpsErrorCategory::Permanent), // ERROR_NOT_REGISTERED_RRO — RRO not registered
+        -14 => Some(DpsErrorCategory::Permanent), // ERROR_NOT_REGISTERED_SIGNER — signer not registered
+        -15 => Some(DpsErrorCategory::Permanent), // ERROR_NOT_OPEN_SHIFT — shift not open
+        -16 => Some(DpsErrorCategory::Permanent), // ERROR_OFFLINE_ID — offline doc ID conflict
+        _   => Some(DpsErrorCategory::Permanent), // 0 = UNKNOWN or any future code
     }
 }
 
@@ -57,14 +71,14 @@ pub struct DpsGrpcPool {
 }
 
 impl DpsGrpcPool {
-    /// Construct and connect both channels eagerly.
-    /// Warmup ping failure is logged but does not prevent construction.
-    pub async fn new(
+    /// Build pool with lazy-connected channels — actual TCP handshake deferred to first RPC.
+    /// Construction succeeds even if DPS endpoints are temporarily unreachable.
+    pub fn new(
         prod_cfg: &DpsEndpoint,
         test_cfg: &DpsEndpoint,
     ) -> Result<Self, GrpcError> {
-        let prod_ch = build_channel(prod_cfg).await?;
-        let test_ch = build_channel(test_cfg).await?;
+        let prod_ch = build_channel(prod_cfg)?;
+        let test_ch = build_channel(test_cfg)?;
         Ok(Self {
             prod: ChkIncomeServiceClient::new(prod_ch),
             test: ChkIncomeServiceClient::new(test_ch),
@@ -80,7 +94,7 @@ impl DpsGrpcPool {
     }
 }
 
-async fn build_channel(cfg: &DpsEndpoint) -> Result<Channel, GrpcError> {
+fn build_channel(cfg: &DpsEndpoint) -> Result<Channel, GrpcError> {
     use std::time::Duration;
 
     let mut ep = Endpoint::from_shared(cfg.endpoint.clone())?
@@ -99,7 +113,8 @@ async fn build_channel(cfg: &DpsEndpoint) -> Result<Channel, GrpcError> {
     };
 
     ep = ep.tls_config(tls).map_err(|e: tonic::transport::Error| GrpcError::Tls(e.to_string()))?;
-    Ok(ep.connect().await?)
+    // connect_lazy defers TCP handshake to first RPC — construction never fails due to network
+    Ok(ep.connect_lazy())
 }
 
 // ─── RPC wrappers ─────────────────────────────────────────────────────────────

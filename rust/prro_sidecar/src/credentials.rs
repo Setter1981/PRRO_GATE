@@ -4,9 +4,10 @@
 //!          stored = hex(XOR(password_bytes, key[i % 32]))
 //! Plain:   raw password string — opt-out for WebCheck migration / debug.
 //!
-//! Phase 4.4 implements full logic; this is a Phase 0 stub.
-
-#![allow(dead_code)]
+//! XOR-soft is obfuscation, not encryption. The salt entropy is one Unicode
+//! character from position 1 of the operator name plus the cert expiry date.
+//! Two operators sharing the same second character and cert expiry produce the
+//! same key — acceptable for obfuscation, not for secrecy guarantees.
 
 use sha2::{Digest, Sha256};
 

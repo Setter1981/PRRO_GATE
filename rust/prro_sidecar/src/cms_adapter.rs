@@ -4,7 +4,7 @@
 //! TSP URL is resolved from `ca_endpoints` table by substring-matching
 //! the cert issuer DN — never passed directly by the caller.
 
-use prro_crypto::cms::{builder::{CmsBuildOptions, CmsError, CmsSigner}, signer::{DstuInProcessSigner, RawSigner, SignerError}, tsp::fetch_timestamp, CmsProfile};
+use prro_crypto::cms::{builder::{CmsBuildOptions, CmsError, CmsSigner}, signer::{DstuInProcessSigner, RawSigner, SignerError}, CmsProfile};
 use rusqlite::OptionalExtension;
 
 // ─── Error ────────────────────────────────────────────────────────────────────
@@ -70,22 +70,10 @@ pub fn sign_content(
 
         let issuer_dn = extract_issuer_dn(cert_der)?;
         let tsp_url   = resolve_tsp_url(conn, &issuer_dn)?;
-
-        // First sign without TST to get the signature bytes, then stamp
-        let sig = cms_signer.sign_with(content, opts)?;
-        let timeout = std::time::Duration::from_millis(ctx.tsp_timeout_ms);
-
-        // Hash the signature value for the TSP request
-        let sig_hash = prro_crypto::core::hash::gost_34_311_95(&sig.cms_der);
-        let tst_der  = fetch_timestamp(&tsp_url, &sig_hash, timeout)
-            .map_err(|e| CmsAdapterError::Tsp(e.to_string()))?;
-
-        let sig_with_tst = cms_signer.sign_with_tst(
-            content,
-            CmsBuildOptions { attached: false, signing_time },
-            &tst_der,
-        )?;
-        Ok(sig_with_tst.cms_der)
+        let timeout   = std::time::Duration::from_millis(ctx.tsp_timeout_ms);
+        // sign_with_tsp correctly hashes signature_value (not full CMS DER) for TSP messageImprint
+        let sig = cms_signer.sign_with_tsp(content, opts, &tsp_url, timeout)?;
+        Ok(sig.cms_der)
     } else {
         let sig = cms_signer.sign_with(content, opts)?;
         Ok(sig.cms_der)
@@ -107,7 +95,7 @@ pub fn resolve_tsp_url(
         "SELECT tsp_url FROM ca_endpoints
           WHERE enabled = 1
             AND tsp_url IS NOT NULL
-            AND lower(?) LIKE '%' || lower(issuer_pattern) || '%'
+            AND INSTR(?, lower(issuer_pattern)) > 0
           ORDER BY priority ASC
           LIMIT 1",
         rusqlite::params![lower_dn],
@@ -168,8 +156,13 @@ fn extract_issuer_dn(cert_der: &[u8]) -> Result<String, CmsAdapterError> {
         };
         if let Ok((val_end, val_inner)) = a1::read_tlv(cert_der, oid_end) {
             if val_inner < val_end && val_end <= cert_der.len() {
-                if let Ok(s) = std::str::from_utf8(&cert_der[val_inner..val_end]) {
+                let bytes = &cert_der[val_inner..val_end];
+                if let Ok(s) = std::str::from_utf8(bytes) {
                     dn_parts.push(s.to_string());
+                } else {
+                    // CP1251 fallback for legacy Ukrainian CAs that encode RDN values in Windows-1251
+                    let (cow, _, _) = encoding_rs::WINDOWS_1251.decode(bytes);
+                    dn_parts.push(cow.into_owned());
                 }
             }
             let _ = atv_end;

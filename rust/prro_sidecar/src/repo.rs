@@ -91,15 +91,63 @@ pub struct CertMetadata {
     pub subject_dn:       Option<String>,
     pub issuer_dn:        Option<String>,
     pub valid_from:       Option<String>,
+    /// ISO-8601 UTC. The `operator_certs` table has no `active` column —
+    /// callers MUST call `is_valid_at(now)` before using this cert for
+    /// signing; signing with an expired cert is a fiscal protocol violation.
     pub valid_to:         Option<String>,
     pub source:           String,
+}
+
+impl CertMetadata {
+    /// Returns true when `now` falls within [valid_from, valid_to].
+    /// Returns true when `valid_to` is absent (cert has no stated expiry).
+    pub fn is_valid_at(&self, now: time::OffsetDateTime) -> bool {
+        let parse = |s: &str| {
+            time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+        };
+        if let Some(vt) = self.valid_to.as_deref().and_then(parse) {
+            if now > vt { return false; }
+        }
+        if let Some(vf) = self.valid_from.as_deref().and_then(parse) {
+            if now < vf { return false; }
+        }
+        true
+    }
+}
+
+/// Severity for `audit_log` entries — mirrors the DB CHECK constraint.
+/// Using an enum prevents silent insertion of invalid strings that would
+/// produce an opaque `SidecarError::Db` at runtime instead of a compile error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditSeverity {
+    Info,
+    Warning,
+    Error,
+    Critical,
+}
+
+impl AuditSeverity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Info     => "INFO",
+            Self::Warning  => "WARNING",
+            Self::Error    => "ERROR",
+            Self::Critical => "CRITICAL",
+        }
+    }
+}
+
+impl rusqlite::types::ToSql for AuditSeverity {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::from(self.as_str()))
+    }
 }
 
 pub struct AuditEntry<'a> {
     pub entity_type:        &'a str,
     pub entity_id:          &'a str,
     pub event_type:         &'a str,
-    pub severity:           &'a str,   // "INFO" | "WARNING" | "ERROR" | "CRITICAL"
+    pub severity:           AuditSeverity,
     pub event_payload_json: Option<&'a str>,
 }
 
@@ -487,7 +535,7 @@ mod tests {
             entity_type:        "license",
             entity_id:          "1",
             event_type:         "VERIFIED",
-            severity:           "INFO",
+            severity:           AuditSeverity::Info,
             event_payload_json: Some(r#"{"tier":"pro"}"#),
         })
         .unwrap();
@@ -499,16 +547,12 @@ mod tests {
     }
 
     #[test]
-    fn audit_log_invalid_severity_rejected() {
-        let repo = make_repo();
-        let result = repo.audit_log_insert(&AuditEntry {
-            entity_type:        "test",
-            entity_id:          "1",
-            event_type:         "X",
-            severity:           "VERBOSE",   // not in CHECK constraint
-            event_payload_json: None,
-        });
-        assert!(result.is_err());
+    fn audit_severity_as_str_matches_db_constraint() {
+        // Verify the enum serializes to the exact strings the DB CHECK allows.
+        assert_eq!(AuditSeverity::Info.as_str(),     "INFO");
+        assert_eq!(AuditSeverity::Warning.as_str(),  "WARNING");
+        assert_eq!(AuditSeverity::Error.as_str(),    "ERROR");
+        assert_eq!(AuditSeverity::Critical.as_str(), "CRITICAL");
     }
 
     #[test]
@@ -619,7 +663,7 @@ mod tests {
             entity_type:        "sidecar",
             entity_id:          "boot",
             event_type:         "STARTUP",
-            severity:           "INFO",
+            severity:           AuditSeverity::Info,
             event_payload_json: None,
         }).unwrap();
         let conn = repo.conn.lock().unwrap();

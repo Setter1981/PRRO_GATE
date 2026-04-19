@@ -140,6 +140,13 @@ impl SidecarConfig {
             return Err(ConfigError::Validation("dps.test.endpoint must not be empty".into()));
         }
 
+        // dev.skip_sign bypasses CMS signing — only allowed when DEV_MODE env var is set
+        if self.dev.skip_sign && std::env::var("DEV_MODE").is_err() {
+            return Err(ConfigError::Validation(
+                "dev.skip_sign = true requires DEV_MODE env var to be set".into(),
+            ));
+        }
+
         Ok(())
     }
 }

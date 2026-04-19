@@ -92,8 +92,8 @@ fn main() {
             json!({"state":"Expired","tier":tier_str,"tin":payload.tin,"expires_at":payload.expires_at}),
             1,
         ),
-        LicenseState::TinMismatch { expected, actual } => (
-            json!({"state":"TinMismatch","expected":expected,"actual":actual}),
+        LicenseState::TinMismatch { in_license, requested } => (
+            json!({"state":"TinMismatch","in_license":in_license,"requested":requested}),
             1,
         ),
         LicenseState::FnNotLicensed { fn_ } => (

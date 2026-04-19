@@ -52,6 +52,14 @@ struct Cli {
     out_dir: Option<PathBuf>,
 }
 
+/// Reject TIN values that could escape the output directory path.
+fn validate_tin(tin: &str, row: usize) {
+    if tin.is_empty() || tin.contains(['/', '\\', '.', '\0']) {
+        eprintln!("row {row}: invalid TIN {tin:?} — must not be empty or contain path characters");
+        std::process::exit(1);
+    }
+}
+
 fn parse_tier(s: &str) -> Result<LicenseTier, String> {
     match s {
         "demo"       => Ok(LicenseTier::Demo),
@@ -159,6 +167,7 @@ fn process_csv(csv_path: &PathBuf, out_dir: &PathBuf, d_bytes: &[u8]) {
             std::process::exit(1);
         }
         let tin        = fields[0].trim().to_string();
+        validate_tin(&tin, i + 2);
         let fn_numbers: Vec<String> = fields[1].trim().trim_matches('"')
             .split(';').map(str::trim).map(String::from).collect();
         let expires_at = fields[2].trim().to_string();

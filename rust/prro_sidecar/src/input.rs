@@ -29,8 +29,15 @@ pub enum OperationType {
 impl OperationType {
     /// Returns false for op types that the sidecar recognizes but does not execute.
     /// The HTTP handler should return 400 before touching any DB or crypto.
+    ///
+    /// `ShiftClose` is recognized (so deserialization succeeds) but is NOT
+    /// supported yet: the SHIFT_CLOSE XML (T="101") builder requires closing
+    /// totals from the shift summary which is not yet wired in Phase 5.
     pub fn is_sidecar_supported(&self) -> bool {
-        !matches!(self, Self::XReport | Self::GoOffline | Self::GoOnline)
+        !matches!(
+            self,
+            Self::ShiftClose | Self::XReport | Self::GoOffline | Self::GoOnline
+        )
     }
 }
 
@@ -299,7 +306,7 @@ mod tests {
 
     #[test]
     fn unsupported_op_types_deserialize_but_rejected() {
-        for op in ["X_REPORT", "GO_OFFLINE", "GO_ONLINE"] {
+        for op in ["SHIFT_CLOSE", "X_REPORT", "GO_OFFLINE", "GO_ONLINE"] {
             let json = serde_json::json!({
                 "schema_version":"1.0","request_id":"r","idempotency_key":"k",
                 "operation_type": op, "fiscal_number":"fn","business_ts":"ts",
@@ -316,8 +323,8 @@ mod tests {
 
     #[test]
     fn supported_op_types_accepted() {
-        for op in ["SHIFT_OPEN","SHIFT_CLOSE","SELL","RETURN",
-                   "SERVICE_IN","SERVICE_OUT","CASH_WITHDRAWAL","Z_REPORT"] {
+        // SHIFT_CLOSE / X_REPORT / GO_OFFLINE / GO_ONLINE are not yet implemented (Phase 5)
+        for op in ["SHIFT_OPEN","SELL","RETURN","SERVICE_IN","SERVICE_OUT","CASH_WITHDRAWAL","Z_REPORT"] {
             let json = serde_json::json!({
                 "schema_version":"1.0","request_id":"r","idempotency_key":"k",
                 "operation_type": op, "fiscal_number":"fn","business_ts":"ts",
@@ -331,6 +338,7 @@ mod tests {
             );
         }
     }
+
 
     #[test]
     fn has_card_rrn_uses_raw_json_no_double_parse() {
