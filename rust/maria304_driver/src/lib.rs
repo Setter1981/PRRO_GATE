@@ -17,7 +17,10 @@
 //!   single-connection exclusion gate + 3s cooldown + idle timeout.
 //! * [`observability`] — M8: JSON tracing subscriber helper,
 //!   per-session frame-trace ring buffer, atomic metrics counters.
+//! * [`admin`] — M10: minimal axum HTTP API exposing
+//!   per-FN + per-session state and aggregate metrics.
 
+pub mod admin;
 pub mod bridge;
 pub mod listener;
 pub mod observability;
