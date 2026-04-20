@@ -126,7 +126,13 @@ def test_protocol_is_maria_304_native() -> None:
 def test_command_type_maps_to_operation_type(
     rust_cmd_type: str, expected_op: OperationType,
 ) -> None:
-    cmd = ADAPTER.map_command(_cmd(command_type=rust_cmd_type))
+    raw = _cmd(command_type=rust_cmd_type)
+    # SERVICE_IN/SERVICE_OUT require a matching CAIO raw_frame for the
+    # sum parser — inject one.
+    if rust_cmd_type in {"SERVICE_IN", "SERVICE_OUT"}:
+        opcode = "CAIOI" if rust_cmd_type == "SERVICE_IN" else "CAIOO"
+        raw["payload"] = _payload(raw_frames=[{"opcode": opcode, "body": "0000000001"}])
+    cmd = ADAPTER.map_command(raw)
     assert cmd.operation_type == expected_op
 
 
@@ -317,7 +323,11 @@ def test_channel_owner_marks_maria304_driver() -> None:
 def test_requires_shift_flag_matches_operation_semantics(
     rust_cmd_type: str, requires_shift_expected: bool,
 ) -> None:
-    cmd = ADAPTER.map_command(_cmd(command_type=rust_cmd_type))
+    raw = _cmd(command_type=rust_cmd_type)
+    if rust_cmd_type in {"SERVICE_IN", "SERVICE_OUT"}:
+        opcode = "CAIOI" if rust_cmd_type == "SERVICE_IN" else "CAIOO"
+        raw["payload"] = _payload(raw_frames=[{"opcode": opcode, "body": "0000000001"}])
+    cmd = ADAPTER.map_command(raw)
     assert cmd.requires_shift is requires_shift_expected
 
 
@@ -577,3 +587,191 @@ def test_empty_totals_dict_is_preserved_as_empty_dict() -> None:
     # Review finding N3: {} must not be silently coerced with None.
     cmd = ADAPTER.map_command(_cmd(payload=_payload(totals={})))
     assert cmd.payload["receipt"]["totals"] == {}
+
+
+# ─── 15. SERVICE_IN / SERVICE_OUT sum parsing from CAIO raw_frames ────
+#
+# The Rust driver's wire opcodes `CAIOI` and `CAIOO` carry the sum as a
+# 10-char ASCII-digit prefix in the frame body: `D10` = zero-padded
+# kopecks.  The adapter must parse this out and inject
+# payload["service_sum"] so `validate_service_receipt` passes.
+
+
+def _service_cmd(opcode: str, sum_kopecks: int, desc: str = "") -> dict[str, Any]:
+    operation = "SERVICE_IN" if opcode == "CAIOI" else "SERVICE_OUT"
+    body = f"{sum_kopecks:010d}{desc}"
+    return _cmd(
+        command_type=operation,
+        idempotency_key=f"maria304:FN-DEV-0001:sess:{opcode}-{sum_kopecks}",
+        payload=_payload(raw_frames=[{"opcode": opcode, "body": body}]),
+    )
+
+
+def test_service_in_parses_sum_from_caioi_body() -> None:
+    cmd = ADAPTER.map_command(_service_cmd("CAIOI", 50_000, "Каса ранок"))
+    assert cmd.operation_type == OperationType.SERVICE_IN
+    assert cmd.payload["service_sum"] == 50_000
+
+
+def test_service_out_parses_sum_from_caioo_body() -> None:
+    cmd = ADAPTER.map_command(_service_cmd("CAIOO", 12_345, "Інкасація"))
+    assert cmd.operation_type == OperationType.SERVICE_OUT
+    assert cmd.payload["service_sum"] == 12_345
+
+
+def test_service_sum_preserves_leading_zeros_from_wire() -> None:
+    # Wire body "0000050000" must parse as 50000, not crash on leading
+    # zeros.
+    cmd = ADAPTER.map_command(_service_cmd("CAIOI", 1))
+    assert cmd.payload["service_sum"] == 1
+
+
+def test_service_with_cyrillic_description_parses_sum_correctly() -> None:
+    # The 10-char sum prefix must be read by character index, not byte
+    # index — Cyrillic multibyte descriptions follow without breaking
+    # the parser.
+    cmd = ADAPTER.map_command(_service_cmd("CAIOI", 999, "підкасовий залишок"))
+    assert cmd.payload["service_sum"] == 999
+
+
+def test_service_without_raw_frames_raises_validation_error() -> None:
+    raw = _cmd(command_type="SERVICE_IN",
+               payload=_payload(raw_frames=[]))
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_service_with_non_caio_opcode_raises() -> None:
+    raw = _cmd(command_type="SERVICE_IN",
+               payload=_payload(raw_frames=[{"opcode": "FOO", "body": "0000050000"}]))
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_service_with_short_body_raises() -> None:
+    raw = _cmd(command_type="SERVICE_IN",
+               payload=_payload(raw_frames=[{"opcode": "CAIOI", "body": "12345"}]))
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_service_with_non_numeric_sum_raises() -> None:
+    raw = _cmd(command_type="SERVICE_IN",
+               payload=_payload(raw_frames=[{"opcode": "CAIOI", "body": "XXXXXXXXXXdesc"}]))
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_service_in_out_must_not_be_treated_as_sell() -> None:
+    # Negative control: a SELL command must not get service_sum.
+    cmd = ADAPTER.map_command(_cmd(command_type="SELL"))
+    assert "service_sum" not in cmd.payload
+
+
+def test_z_report_does_not_get_service_sum_even_with_caioi_frame() -> None:
+    # Regression guard: the enrichment must key off operation_type,
+    # not on opcode presence.  A Z_REPORT that happens to have a stray
+    # CAIOI frame in raw_frames must NOT be treated as SERVICE_IN.
+    raw = _cmd(
+        command_type="Z_REPORT",
+        idempotency_key="maria304:FN-DEV-0001:sess:z:1",
+        payload=_payload(raw_frames=[{"opcode": "CAIOI", "body": "0000010000stray"}]),
+    )
+    cmd = ADAPTER.map_command(raw)
+    assert "service_sum" not in cmd.payload
+
+
+def test_service_description_is_preserved_in_receipt() -> None:
+    cmd = ADAPTER.map_command(_service_cmd("CAIOI", 100, "Ранкова зміна"))
+    assert cmd.payload["receipt"]["service_description"] == "Ранкова зміна"
+
+
+def test_service_description_is_empty_string_when_body_is_exactly_10_chars() -> None:
+    # Edge: body has just the sum, no description — parser must not
+    # crash and must store empty string.
+    raw = _cmd(
+        command_type="SERVICE_IN",
+        idempotency_key="maria304:F:sess:caioi-no-desc",
+        payload=_payload(raw_frames=[{"opcode": "CAIOI", "body": "0000000100"}]),
+    )
+    cmd = ADAPTER.map_command(raw)
+    assert cmd.payload["service_sum"] == 100
+    assert cmd.payload["receipt"]["service_description"] == ""
+
+
+def test_service_in_with_caioo_frame_is_rejected() -> None:
+    # Operation/opcode mismatch guard: SERVICE_IN must have CAIOI, not
+    # CAIOO.
+    raw = _cmd(
+        command_type="SERVICE_IN",
+        idempotency_key="maria304:F:sess:mismatch",
+        payload=_payload(raw_frames=[{"opcode": "CAIOO", "body": "0000000100desc"}]),
+    )
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_service_with_nine_digits_and_letter_is_rejected() -> None:
+    # Boundary: '000000000A' — 9 digits + 1 ASCII letter.  Must be
+    # rejected (isdigit returns False for mixed).
+    raw = _cmd(
+        command_type="SERVICE_IN",
+        idempotency_key="maria304:F:sess:mixed-digit",
+        payload=_payload(raw_frames=[{"opcode": "CAIOI", "body": "000000000A"}]),
+    )
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_service_with_unicode_digit_is_rejected() -> None:
+    # Review finding R1: Arabic-Indic digits satisfy .isdigit() but
+    # desync from the wire's ASCII representation.  Adapter must
+    # reject these.
+    raw = _cmd(
+        command_type="SERVICE_IN",
+        idempotency_key="maria304:F:sess:unicode-digit",
+        payload=_payload(raw_frames=[{"opcode": "CAIOI", "body": "٠٠٠٠٠٠٠٠٠١"}]),
+    )
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_service_max_sum_ten_nines_is_accepted() -> None:
+    # Upper bound of the 10-digit space: 9_999_999_999 kopecks = 99.99M UAH.
+    cmd = ADAPTER.map_command(_service_cmd("CAIOI", 9_999_999_999))
+    assert cmd.payload["service_sum"] == 9_999_999_999
+
+
+def test_service_parses_correctly_with_leading_zeros_preserving_decimal_value() -> None:
+    # Guard the "octal interpretation" regression: "0000000010" must
+    # parse as decimal 10, not octal 8.
+    raw = _cmd(
+        command_type="SERVICE_IN",
+        idempotency_key="maria304:F:sess:octal-guard",
+        payload=_payload(raw_frames=[{"opcode": "CAIOI", "body": "0000000010"}]),
+    )
+    cmd = ADAPTER.map_command(raw)
+    assert cmd.payload["service_sum"] == 10  # NOT 8
+
+
+def test_service_with_multiple_frames_takes_only_first() -> None:
+    # Documented behaviour: only raw_frames[0] is parsed.  Any trailing
+    # frames are preserved but do not influence the sum.
+    raw = _cmd(
+        command_type="SERVICE_IN",
+        idempotency_key="maria304:F:sess:multi-frame",
+        payload=_payload(raw_frames=[
+            {"opcode": "CAIOI", "body": "0000000555desc"},
+            {"opcode": "CAIOI", "body": "0000099999junk"},
+        ]),
+    )
+    cmd = ADAPTER.map_command(raw)
+    assert cmd.payload["service_sum"] == 555
+    assert len(cmd.payload["receipt"]["raw_frames"]) == 2

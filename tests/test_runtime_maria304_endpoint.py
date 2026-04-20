@@ -590,6 +590,74 @@ def test_bearer_empty_token_value_returns_401(tmp_path: Path) -> None:
     assert r.status_code == 401
 
 
+def test_service_in_with_caio_frame_passes_validator(tmp_path: Path) -> None:
+    # Integration proof for M7-Py-3a: adapter enriches service_sum
+    # from raw_frames, and the enriched payload — once pulled back
+    # from the inbox row — passes `validate_service_receipt`.
+    # Does NOT rely on the full write-path being runnable (shift state
+    # is not set up; process_immediately is off), but does prove the
+    # precise downstream-consumer contract: the validator that would
+    # otherwise reject this payload no longer does.
+    import json
+    from prro_gateway.validators.ua_receipt import validate_service_receipt
+
+    container = RuntimeContainer(_config(tmp_path))
+    raw = {
+        "schema_version": "1.0",
+        "fiscal_number": "FN-DEV-0001",
+        "command_type": "SERVICE_IN",
+        "idempotency_key": "maria304:FN-DEV-0001:sess:caioi-e2e",
+        "cashier_id": "csh1",
+        "department": None,
+        "return_check_number": None,
+        "payload": {
+            "direction": "SALE",
+            "goods": [],
+            "payments": [],
+            "dual_tax_mode": None,
+            "totals": {"sale_kopecks": 0, "return_kopecks": 0},
+            "raw_frames": [{"opcode": "CAIOI", "body": "0000050000Каса ранок"}],
+        },
+    }
+    with TestClient(create_app(container)) as client:
+        r = client.post("/v1/ingress/maria304", json=raw, headers=_auth_headers())
+    assert r.status_code in (200, 503)
+    # Pull canonical command back from the inbox and run the exact
+    # validator that write_path would call.
+    with container.connect() as conn:
+        row = conn.execute(
+            "SELECT payload_json FROM ingress_inbox WHERE protocol = 'MARIA_304_NATIVE' "
+            "ORDER BY created_at DESC LIMIT 1",
+        ).fetchone()
+    assert row is not None
+    payload = json.loads(row[0])["payload"]
+    assert payload["service_sum"] == 50000
+    assert payload["receipt"]["service_description"] == "Каса ранок"
+    # The proof: validator now accepts this payload because the
+    # adapter injected service_sum from the CAIO raw_frame.
+    violations = validate_service_receipt(payload)
+    assert violations == [], (
+        f"service_sum enrichment did not satisfy validator: {violations}"
+    )
+
+
+def test_service_in_without_caio_frame_would_still_fail_validator(tmp_path: Path) -> None:
+    # Negative control for the integration proof: confirm the
+    # validator would reject if the adapter had NOT enriched — i.e.,
+    # the enrichment is what saves the day, not a loose validator.
+    from prro_gateway.validators.ua_receipt import validate_service_receipt
+    empty_payload = {
+        "cashier_id": "csh1",
+        "receipt": {
+            "direction": "SALE", "goods": [], "payments": [],
+            "totals": {}, "raw_frames": [],
+        },
+        # no service_sum
+    }
+    violations = validate_service_receipt(empty_payload)
+    assert violations, "precondition: validator must reject empty service payload"
+
+
 def test_external_request_id_propagates_to_inbox(tmp_path: Path) -> None:
     # Invariant #4: the Rust-side idempotency_key must reach
     # ingress_inbox.external_request_id verbatim, so replay and audit

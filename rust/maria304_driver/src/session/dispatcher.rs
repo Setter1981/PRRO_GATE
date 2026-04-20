@@ -360,8 +360,32 @@ pub fn dispatch(
         Command::Dbeg => done("DBEG", session),
         Command::Prtx => done("PRTX", session),
 
-        // ── Cash deposit / withdrawal (stub only; M4 buffers them) ─
-        Command::Caioi { .. } | Command::Caioo { .. } => done("CAIO", session),
+        // ── Cash deposit (CAIOI) / service withdrawal (CAIOO) ──────
+        // Both are standalone fiscal operations — must not fire while
+        // a receipt is open.  The wire body `<D10 sum><description>` is
+        // preserved verbatim into raw_frames so the Python adapter can
+        // parse the sum (see adapters/maria304_native.py::
+        // _enrich_service_payload).
+        Command::Caioi { sum_kopecks, description } => {
+            if session.receipt_open() {
+                return err(ErrorCode::SoftCheck);
+            }
+            let body = format!("{sum_kopecks:010}{description}");
+            submit_report(
+                session, identity, bridge, correlation,
+                CommandType::ServiceIn, "CAIOI", body,
+            )
+        }
+        Command::Caioo { sum_kopecks, description } => {
+            if session.receipt_open() {
+                return err(ErrorCode::SoftCheck);
+            }
+            let body = format!("{sum_kopecks:010}{description}");
+            submit_report(
+                session, identity, bridge, correlation,
+                CommandType::ServiceOut, "CAIOO", body,
+            )
+        }
 
         // ── Setup / configuration + display / misc passthrough ──
         // All of these simply acknowledge — the opcode is reflected

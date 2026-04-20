@@ -292,10 +292,10 @@ class WritePathWorker:
         ):
             from ..validators.ua_receipt import validate_excise_marks
             violations.extend(validate_excise_marks(command.payload))
-        elif (
-            command.operation_type in {OperationType.SERVICE_IN, OperationType.SERVICE_OUT}
-            and not maria304_bypass
-        ):
+        elif command.operation_type in {OperationType.SERVICE_IN, OperationType.SERVICE_OUT}:
+            # MARIA_304_NATIVE adapter parses sum from CAIO raw_frames
+            # and injects `service_sum` so this validator passes (see
+            # adapters/maria304_native.py::_enrich_service_payload).
             from ..validators.ua_receipt import validate_service_receipt
             violations = validate_service_receipt(command.payload)
         elif (

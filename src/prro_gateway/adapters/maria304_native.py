@@ -68,6 +68,17 @@ _REQUIRES_SHIFT_OPS: frozenset[OperationType] = frozenset({
 
 _IDEMPOTENCY_KEY_PATTERN = re.compile(r"^maria304:[A-Za-z0-9_\-:]{3,256}$")
 
+_CAIO_OPCODE_FOR_OPERATION: dict[OperationType, str] = {
+    OperationType.SERVICE_IN: "CAIOI",
+    OperationType.SERVICE_OUT: "CAIOO",
+}
+
+# Wire format: `<D10 sum_kopecks><description>`.  D10 = 10 zero-padded
+# ASCII digits.  `description` is CP866-encoded by the driver before
+# framing; at this layer we see it as a UTF-8 str already.
+_CAIO_SUM_PREFIX_CHARS = 10
+_CAIO_DESCRIPTION_MAX_CHARS = 60
+
 # Safety caps — generous but bounded.  A 2000-frame receipt is three
 # orders of magnitude above a realistic grocery-basket ceiling; anything
 # above this is either abuse or a driver bug.
@@ -109,6 +120,8 @@ class Maria304NativeAdapter:
         operation_type = _COMMAND_TO_OPERATION[command_type]
 
         payload = self._build_payload(raw_request, receipt_payload)
+        if operation_type in _CAIO_OPCODE_FOR_OPERATION:
+            self._enrich_service_payload(payload, operation_type)
         now_utc = datetime.now(UTC)
         context = AdapterContext(
             request_id=self._build_request_id(fiscal_number, now_utc),
@@ -127,6 +140,50 @@ class Maria304NativeAdapter:
             requires_shift=requires_shift,
             requires_offline_code=False,
         )
+
+    @staticmethod
+    def _enrich_service_payload(
+        payload: dict[str, Any], operation_type: OperationType,
+    ) -> None:
+        """Parse SERVICE_IN/SERVICE_OUT sum from the CAIO raw_frame.
+
+        The Rust driver captures `CAIOI<D10 sum><desc>` / `CAIOO<...>`
+        verbatim into `raw_frames[0]`.  The canonical write-path
+        validator expects `payload["service_sum"]` — this method
+        extracts it, plus stashes the description under the receipt
+        for audit.
+        """
+        frames = payload.get("receipt", {}).get("raw_frames") or []
+        if not frames:
+            raise AdapterMappingError(
+                "SERVICE_IN/SERVICE_OUT requires at least one raw_frame",
+                code="PAYLOAD_VALIDATION_FAILED",
+            )
+        first = frames[0]
+        expected_opcode = _CAIO_OPCODE_FOR_OPERATION[operation_type]
+        if not isinstance(first, dict) or first.get("opcode") != expected_opcode:
+            raise AdapterMappingError(
+                f"First raw_frame must be {expected_opcode} for {operation_type.value}",
+                code="PAYLOAD_VALIDATION_FAILED",
+            )
+        body = first.get("body", "")
+        if not isinstance(body, str) or len(body) < _CAIO_SUM_PREFIX_CHARS:
+            raise AdapterMappingError(
+                f"{expected_opcode} body must contain a 10-char sum prefix",
+                code="PAYLOAD_VALIDATION_FAILED",
+            )
+        sum_chars = body[:_CAIO_SUM_PREFIX_CHARS]
+        # Pin ASCII: int() also accepts Unicode digits (Arabic-Indic
+        # ٠-٩, etc.) which would desync from the wire bytes the DPS
+        # signer will hash.  Review finding R1.
+        if not (sum_chars.isascii() and sum_chars.isdigit()):
+            raise AdapterMappingError(
+                f"{expected_opcode} sum prefix must be 10 ASCII digits",
+                code="PAYLOAD_VALIDATION_FAILED",
+            )
+        description = body[_CAIO_SUM_PREFIX_CHARS:_CAIO_SUM_PREFIX_CHARS + _CAIO_DESCRIPTION_MAX_CHARS]
+        payload["service_sum"] = int(sum_chars)
+        payload["receipt"]["service_description"] = description
 
     @staticmethod
     def _build_request_id(fiscal_number: str, now: datetime) -> str:
