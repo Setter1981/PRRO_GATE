@@ -14,6 +14,7 @@
 pub mod dto;
 pub mod http_client;
 pub mod mock;
+pub mod retry;
 
 pub use dto::{
     AcquirerSlip, CanonicalCommand, CanonicalPayment, CanonicalResponse, CommandType,
@@ -21,6 +22,7 @@ pub use dto::{
 };
 pub use http_client::HttpBridge;
 pub use mock::MockBridge;
+pub use retry::{RetryBridge, RetryPolicy, Sleeper, ThreadSleeper};
 
 /// Errors surfaced by a [`Bridge`] implementation.
 #[derive(Debug, thiserror::Error)]
