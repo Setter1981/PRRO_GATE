@@ -895,11 +895,17 @@ class RuntimeContainer:
             TransportKind.CHECKBOX_REST_TRANSPORT: CheckboxRestTransport(http_client=self.transport_http_client),
             TransportKind.DPS_PRRO_GRPC_ECABINET: DpsFiscalServerTransport() if self.config.runtime.environment != 'development' else DpsGrpcEcabinetTransportStub(),
             TransportKind.DPS_PRRO_XML_UNIFIED_WINDOW: DpsXmlUnifiedWindowTransportStub(),
-            TransportKind.DPS_PRRO_FISCAL_SIDECAR_V2: FiscalSidecarTransport(
-                sidecar_url=self.config.crypto.sidecar_url or 'http://127.0.0.1:8765',
-                http_client=self.transport_http_client,
-                crypto_provider=self.config.crypto.provider or 'passthrough',
-            ),
+            # FiscalSidecarTransport only wired when crypto.provider=passthrough.
+            # With any other provider the Python layer would double-sign the payload
+            # (Rust sidecar signs internally from its own JKS store).
+            # Profiles with kind=DPS_PRRO_FISCAL_SIDECAR_V2 are silently unroutable
+            # when this handler is absent — correct, because the config is inconsistent.
+            **({
+                TransportKind.DPS_PRRO_FISCAL_SIDECAR_V2: FiscalSidecarTransport(
+                    sidecar_url=self.config.crypto.sidecar_url or 'http://127.0.0.1:8765',
+                    http_client=self.transport_http_client,
+                )
+            } if (self.config.crypto.provider or 'passthrough') == 'passthrough' else {}),
         }
         handlers.update(self.transport_handlers)
         return handlers
