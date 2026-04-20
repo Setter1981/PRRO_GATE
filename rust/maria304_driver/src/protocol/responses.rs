@@ -58,15 +58,21 @@ impl Response {
     /// deferring them to [`Self::to_wire`] — closes the "silent
     /// invalid response" landmine flagged in the M2 review.
     ///
+    /// Validation is a cheap char-count check; every glyph in the
+    /// supported CP866 table encodes to exactly one byte, so
+    /// `s.chars().count()` equals `cp866::encode(&s).len()` for any
+    /// admissible payload, and the wire codec's byte-length bounds
+    /// translate directly to char-length bounds.
+    ///
     /// # Errors
-    /// [`FrameError::InvalidCmdLen`] if the CP866-encoded length of
-    /// `payload` falls outside the protocol-defined 4..=252-byte range.
+    /// [`FrameError::InvalidCmdLen`] if the payload char count falls
+    /// outside the protocol-defined 4..=252 range.
     pub fn data(payload: impl Into<String>) -> Result<Self, FrameError> {
         let s = payload.into();
-        // The wire codec validates byte length after CP866 conversion.
-        // Running through encode_frame is the most direct proof that
-        // the payload is admissible — we just discard the bytes.
-        let _probe = encode_frame(&s, false)?;
+        let char_count = s.chars().count();
+        if !(MIN_CMD_LEN..=MAX_CMD_LEN).contains(&char_count) {
+            return Err(FrameError::InvalidCmdLen(char_count));
+        }
         Ok(Self::Data(s))
     }
 
@@ -102,6 +108,9 @@ impl Response {
 /// coupling in inlined formatters.  If this value ever changes upstream
 /// the test in `tests/wire_vectors.rs` will fail.
 const MIN_CMD_LEN: usize = 4;
+
+/// Maximum command length accepted by the wire codec (see same note).
+const MAX_CMD_LEN: usize = 252;
 
 /// Pad a short identifier up to [`MIN_CMD_LEN`] bytes with NUL.  The
 /// real firmware uses trailing NULs for 3-char opcodes like `WRK`/`PRN`
