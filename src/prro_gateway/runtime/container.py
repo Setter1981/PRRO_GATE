@@ -594,13 +594,14 @@ class RuntimeContainer:
             self.reconciliation_service = ReconciliationService(
                 transport_status_client=self.transport_router,
                 max_recovery_attempts=self.config.runtime.max_recovery_attempts,
-                crypto_provider=self.crypto_provider or self._resolve_crypto_provider(),
+                crypto_provider=self.crypto_provider if self.crypto_provider is not None else self._resolve_crypto_provider(),
                 concurrency=self.config.reconciliation.concurrency,
                 cancel_event=self._ops_loop_stop,
             )
         if self.offline_sync_service is None and self.transport_router is not None:
             self.offline_sync_service = OfflineSyncService(
                 transport_client=self.transport_router,
+                crypto_provider=self.crypto_provider if self.crypto_provider is not None else self._resolve_crypto_provider(),
                 max_recovery_attempts=self.config.runtime.max_recovery_attempts,
             )
         if self.command_processor is None and self.config.runtime.process_immediately and self.transport_router is not None:

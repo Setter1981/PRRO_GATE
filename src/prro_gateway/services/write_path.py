@@ -530,8 +530,40 @@ class WritePathWorker:
             )
             conn.commit()
             return ctx, result
+        # Approach B: DPS offline docs — defer signing to offline_sync for correct MAC chain.
+        # Only PAYLOAD_XML is stored now; offline_sync will inject the correct MAC and sign
+        # immediately before each DPS submission, building the proper sequential chain.
+        if ctx.document.fs_mode == 'OFFLINE':
+            sign_input = self._resolve_sign_input(conn, ctx)
+            is_dps_xml = sign_input.startswith('<RQ')
+            if is_dps_xml:
+                conn.execute('BEGIN IMMEDIATE')
+                ctx.document = FiscalDocumentRepository.update_state(
+                    conn, document_id=ctx.document.document_id, state=DocumentState.SIGNED,
+                )
+                DocumentFilesRepository.add_file(
+                    conn,
+                    file_id=f'{ctx.document.document_id}-payload-xml',
+                    document_id=ctx.document.document_id,
+                    file_kind=FileKind.PAYLOAD_XML,
+                    path=f'/archive/{ctx.fiscal_number}/{ctx.document.document_id}/payload.xml',
+                    content=sign_input,
+                )
+                AuditRepository.log_events(
+                    conn,
+                    events=[('DOCUMENT', ctx.document.document_id, 'DOCUMENT_SIGN_DEFERRED', 'INFO',
+                             dumps_json({'state': 'SIGNED', 'reason': 'offline_deferred_sign'}))],
+                )
+                conn.commit()
+                ctx.signed_payload = sign_input  # pass-through unsigned; offline_sync will sign
+                self.logger.info("stage_sign_deferred", extra={"extra_fields": {
+                    "document_id": ctx.document.document_id, "mode": "offline_deferred",
+                }})
+                return ctx, None
+        else:
+            sign_input = self._resolve_sign_input(conn, ctx)
+
         # Determine what artifact to sign: DPS XML for fiscal-server profiles, canonical JSON otherwise
-        sign_input = self._resolve_sign_input(conn, ctx)
         is_dps_xml = sign_input.startswith('<RQ')
 
         try:
