@@ -18,9 +18,11 @@ pub mod comp_response;
 pub mod error_codes;
 pub mod identity;
 pub mod responses;
+pub mod uktzed;
 
 pub use commands::Command;
 pub use comp_response::CompBuilder;
 pub use error_codes::ErrorCode;
 pub use identity::{ConfBuilder, ConfMode, ExpectedCmd, SysKey};
 pub use responses::Response;
+pub use uktzed::{split_uktzed_prefix, UktzedSplit};
