@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hmac
+import uuid
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 import time
 
 from fastapi import FastAPI, HTTPException, Request
@@ -17,6 +19,7 @@ from ..repositories.audit import AuditRepository
 from ..repositories.outbox import OutboxRepository
 from ..services.ingress import AdapterMappingError
 from ..services.write_path import WritePathWorker
+from .maria304_periodic import handle_periodic_report as _handle_periodic_report
 from ..utils.json_codec import dumps_json
 
 import json as _json
@@ -258,6 +261,13 @@ def create_app(container: RuntimeContainer) -> FastAPI:
     async def ingress_maria304(request: Request) -> JSONResponse:
         _require_maria304_token(request)
         raw = await request.json()
+        # PERIODIC_REPORT is a read-only aggregation over fiscal_documents
+        # — no inbox insert, no FiscalDocument, no DPS round-trip.  We
+        # intercept here BEFORE accept_maria304 so the canonical write
+        # path is not touched.  See plan 2026-04-21-maria304-python-
+        # adapter.md §5a (R4-deferred) and §M7-Py-3c.
+        if isinstance(raw, dict) and raw.get("command_type") == "PERIODIC_REPORT":
+            return _handle_periodic_report(container, raw)
         started = time.monotonic()
         try:
             with container.connect() as conn:
