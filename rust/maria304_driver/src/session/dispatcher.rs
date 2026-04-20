@@ -294,12 +294,65 @@ pub fn dispatch(
             }
         }
 
-        // ── Reports (synchronous stub — M5 replaces) ─────────────
-        Command::Zrep => done("ZREP", session),
-        Command::Nrep => done("NREP", session),
-        Command::NrepLowercase => done("nrep", session),
-        Command::Firn { .. } | Command::Iren { .. }
-        | Command::Firp { .. } | Command::Irep { .. } => done("FIRN", session),
+        // ── Fiscal reports (M5 — submit via bridge) ──────────────
+        Command::Zrep => submit_report(
+            session, identity, bridge, correlation,
+            CommandType::XReport, "ZREP", String::new(),
+        ),
+        Command::Nrep => {
+            if session.receipt_open() {
+                return err(ErrorCode::SoftCheck);
+            }
+            submit_report(
+                session, identity, bridge, correlation,
+                CommandType::ZReport, "NREP", String::new(),
+            )
+        }
+        Command::NrepLowercase => submit_report(
+            session, identity, bridge, correlation,
+            CommandType::ShiftOpen, "nrep", String::new(),
+        ),
+        Command::Firn { first, last } => {
+            if session.receipt_open() {
+                return err(ErrorCode::SoftCheck);
+            }
+            submit_report(
+                session, identity, bridge, correlation,
+                CommandType::PeriodicReport, "FIRN",
+                format!("{first:04}{last:04}"),
+            )
+        }
+        Command::Iren { first, last } => {
+            if session.receipt_open() {
+                return err(ErrorCode::SoftCheck);
+            }
+            submit_report(
+                session, identity, bridge, correlation,
+                CommandType::PeriodicReport, "IREN",
+                format!("{first:04}{last:04}"),
+            )
+        }
+        Command::Firp { ref from, ref to } => {
+            if session.receipt_open() {
+                return err(ErrorCode::SoftCheck);
+            }
+            submit_report(
+                session, identity, bridge, correlation,
+                CommandType::PeriodicReport, "FIRP",
+                format!("{from}{to}"),
+            )
+        }
+        Command::Irep { ref from, ref to } => {
+            if session.receipt_open() {
+                return err(ErrorCode::SoftCheck);
+            }
+            submit_report(
+                session, identity, bridge, correlation,
+                CommandType::PeriodicReport, "IREP",
+                format!("{from}{to}"),
+            )
+        }
+        // Local-only reports — no bridge call, no state change.
         Command::Artz => done("ARTZ", session),
         Command::Dizv => done("DIZV", session),
         Command::Null => done("NULL", session),
@@ -509,6 +562,52 @@ fn build_canonical(
         department,
         return_check_number,
         payload,
+    }
+}
+
+/// Submit a report-style command to the bridge and compose the
+/// response frame sequence.  The canonical envelope carries a single
+/// `raw_frames` entry with the opcode + body so the Python adapter
+/// can extract date ranges / Z-numbers / etc.
+///
+/// On success: `DONE + READY`.  On bridge error: the mapped `SOFT*`
+/// frame (and no subsequent frames).
+fn submit_report(
+    session: &mut Session,
+    identity: &Identity,
+    bridge: &dyn Bridge,
+    correlation: &mut Correlation,
+    command_type: CommandType,
+    opcode: &str,
+    body: String,
+) -> Vec<Response> {
+    let envelope = CanonicalCommand {
+        schema_version: "1.0".to_string(),
+        fiscal_number: identity.fiscal_number.clone(),
+        command_type,
+        idempotency_key: format!(
+            "maria304:{}:{}:{}:{}",
+            identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq, opcode,
+        ),
+        cashier_id: session.cashier_id.clone(),
+        department: None,
+        return_check_number: None,
+        payload: ReceiptPayload {
+            raw_frames: vec![RawFrame { opcode: opcode.to_string(), body }],
+            ..Default::default()
+        },
+    };
+    match bridge.submit(&envelope) {
+        Ok(_) => {
+            session.mark_command_ok(opcode);
+            // Every report increments the correlation sequence so
+            // replays use a fresh idempotency_key.  Z-report
+            // additionally signals "new fiscal day" — M7 will track
+            // this via the response but for now just bump the seq.
+            correlation.receipt_seq = correlation.receipt_seq.saturating_add(1);
+            ok(None)
+        }
+        Err(bridge_err) => err(map_bridge_error(&bridge_err)),
     }
 }
 
