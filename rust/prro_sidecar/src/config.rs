@@ -11,6 +11,8 @@ pub struct SidecarConfig {
     pub db:       DbSection,
     pub dps:      DpsProfiles,
     #[serde(default)]
+    pub certs:    CertsSection,
+    #[serde(default)]
     pub security: SecuritySection,
     pub tsp:      Option<TspSection>,
     #[serde(default)]
@@ -33,6 +35,45 @@ pub struct SidecarSection {
 }
 
 fn default_log_level() -> String { "info".into() }
+
+// ─── Certs section ───────────────────────────────────────────────────────────
+
+/// Paths to certificate files used by the sidecar.
+///
+/// Both files are updated independently (e.g. via a weekly cron/systemd timer):
+///   tls_chain  — `openssl s_client -connect prro.tax.gov.ua:443 -showcerts`
+///   ca_bundle  — downloaded from https://acskidd.gov.ua/CACertificates.p7b
+///
+/// Per-endpoint overrides in [dps.prod] / [dps.test] take precedence over
+/// these globals (DpsEndpoint.ca_bundle).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CertsSection {
+    /// PEM certificate chain for the DPS gRPC TLS connection.
+    /// Mirrors `C:\ProgramData\WebCheck\prro-tax-gov-ua-chain.pem`.
+    #[serde(default = "default_tls_chain")]
+    pub tls_chain: String,
+    /// ACSK CA certificates bundle (p7b or PEM) for EDS chain validation.
+    /// Primary source: acskidd.gov.ua (DPS's own CA).
+    #[serde(default = "default_ca_bundle")]
+    pub ca_bundle: String,
+}
+
+impl Default for CertsSection {
+    fn default() -> Self {
+        Self {
+            tls_chain: default_tls_chain(),
+            ca_bundle: default_ca_bundle(),
+        }
+    }
+}
+
+fn default_tls_chain() -> String {
+    "/var/lib/prro_sidecar/certs/prro-tax-gov-ua-chain.pem".into()
+}
+
+fn default_ca_bundle() -> String {
+    "/var/lib/prro_sidecar/certs/CACertificates.p7b".into()
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DbSection {
@@ -181,6 +222,10 @@ endpoint = "https://cabinet.tax.gov.ua:9443"
 [dps.test]
 endpoint = "https://dev-cabinet.tax.gov.ua:9443"
 
+[certs]
+tls_chain = "/var/lib/prro_sidecar/certs/prro-tax-gov-ua-chain.pem"
+ca_bundle = "/var/lib/prro_sidecar/certs/CACertificates.p7b"
+
 [security]
 credentials_mode = "xor_soft"
 
@@ -232,6 +277,29 @@ endpoint = "https://test.example.com:9443"
         assert_eq!(cfg.security.credentials_mode, CredentialsMode::XorSoft);
         assert!(cfg.tsp.is_none());
         assert!(!cfg.dev.skip_sign);
+        // cert defaults
+        assert_eq!(cfg.certs.tls_chain, "/var/lib/prro_sidecar/certs/prro-tax-gov-ua-chain.pem");
+        assert_eq!(cfg.certs.ca_bundle, "/var/lib/prro_sidecar/certs/CACertificates.p7b");
+    }
+
+    #[test]
+    fn certs_section_overridable() {
+        let toml = r#"
+[sidecar]
+bind = "127.0.0.1:8765"
+[db]
+path = "/tmp/prro.db"
+[dps.prod]
+endpoint = "https://prod.example.com:9443"
+[dps.test]
+endpoint = "https://test.example.com:9443"
+[certs]
+tls_chain = "/opt/certs/dps-chain.pem"
+ca_bundle = "/opt/certs/acsk-ca.p7b"
+"#;
+        let cfg = SidecarConfig::from_toml_str(toml).expect("parse");
+        assert_eq!(cfg.certs.tls_chain, "/opt/certs/dps-chain.pem");
+        assert_eq!(cfg.certs.ca_bundle, "/opt/certs/acsk-ca.p7b");
     }
 
     #[test]
