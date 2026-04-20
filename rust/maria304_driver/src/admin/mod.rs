@@ -15,5 +15,5 @@
 pub mod registry;
 pub mod server;
 
-pub use registry::{FnSnapshot, MetricsSummary, Registry, SessionSnapshot};
+pub use registry::{FnSnapshot, MetricsSummary, RegisteredFn, Registry, SessionSnapshot};
 pub use server::{serve_admin, AdminConfig};

@@ -1,0 +1,48 @@
+# Maria 304 Driver — example configuration.
+#
+# Copy to /etc/maria304_driver/config.yaml before starting.  Every
+# field is documented inline — see also docs/maria304/INSTALL.md.
+
+bridge:
+  # Python PRRO Gateway endpoint.  Loopback is recommended for
+  # single-host deployments.
+  gateway_url: "http://127.0.0.1:8000/v1/ingress/maria304"
+  shared_token: "${MARIA304_BRIDGE_TOKEN}"
+  connect_timeout_ms: 5000
+  request_timeout_ms: 15000
+  retry:
+    max_attempts: 3
+    initial_backoff_ms: 500
+
+observability:
+  log_format: "json"
+
+admin:
+  bind: "127.0.0.1:9202"
+  auth_token: "${MARIA304_ADMIN_TOKEN}"
+
+deployment:
+  mode: "live"   # live | shadow | dry-run
+  graceful_shutdown_timeout_s: 30
+
+listeners:
+  - fiscal_number: "3001234567"
+    bind: "0.0.0.0:9100"
+    idle_timeout_s: 300
+    post_disconnect_cooldown_s: 3
+    cashier_password: "1111111111"
+    identity:
+      serial_number: "MRY304-001"
+      model: "304T-2"
+      software_version: "4.1.2"
+      build_date: "20250115"
+
+  - fiscal_number: "3001234568"
+    bind: "0.0.0.0:9101"
+    idle_timeout_s: 300
+    post_disconnect_cooldown_s: 3
+    cashier_password: "1111111111"
+    identity:
+      serial_number: "MRY304-002"
+      software_version: "4.1.2"
+      build_date: "20250115"

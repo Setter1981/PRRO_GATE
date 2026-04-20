@@ -1,0 +1,42 @@
+[Unit]
+Description=Maria 304 Virtual Fiscal Register Driver
+Documentation=https://github.com/Setter1981/PRRO_GATE/tree/main/docs/maria304
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=maria304
+Group=maria304
+WorkingDirectory=/opt/maria304
+Environment=MARIA304_CONFIG=/etc/maria304_driver/config.yaml
+Environment=MARIA304_LOG=info
+ExecStart=/opt/maria304/maria304_driver
+Restart=on-failure
+RestartSec=5s
+# Graceful-shutdown grace period — matches
+# deployment.graceful_shutdown_timeout_s in config.
+TimeoutStopSec=30
+
+# Basic hardening.  No privileged ports needed (Maria ports default
+# to 9100+); no filesystem writes needed; no new privileges.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/maria304
+PrivateTmp=true
+PrivateDevices=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+
+[Install]
+WantedBy=multi-user.target
