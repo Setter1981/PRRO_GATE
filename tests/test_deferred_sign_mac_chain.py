@@ -21,9 +21,12 @@ from unittest.mock import patch
 
 import pytest
 
-from prro_gateway.enums import DocumentState, FileKind
+from types import SimpleNamespace
+
+from prro_gateway.enums import DocumentState, FileKind, Protocol, ShiftState
 from prro_gateway.ports import SendResult
 from prro_gateway.repositories import DocumentFilesRepository, FiscalDocumentRepository
+from prro_gateway.repositories.shifts import ShiftRepository
 from prro_gateway.services.offline_sync import OfflineSyncService
 
 
@@ -163,11 +166,10 @@ def test_dsc1_inject_mac_replaces_placeholder():
     assert 'OLD_VALUE' not in result
 
 
-def test_dsc1_inject_mac_no_match_logs_warning(caplog):
+def test_dsc1_inject_mac_no_match_raises_value_error():
     xml = '<RQ><SN>1</SN></RQ>'
-    with caplog.at_level(logging.WARNING, logger='prro_gateway.offline_sync'):
+    with pytest.raises(ValueError, match='<MAC> element not found'):
         OfflineSyncService._inject_mac(xml, 'deadbeef')
-    assert 'offline_sync_mac_element_not_found' in caplog.text
 
 
 def test_dsc1_inject_mac_duplicate_logs_warning(caplog):
@@ -456,3 +458,99 @@ def test_dsc11_lnd_ordering_governs_mac_chain(conn):
     assert f'<MAC>{expected_mac_91}</MAC>' in second_signed_xml, (
         f'MAC chain must follow lnd order. Expected SHA256(lnd=90), got: {second_signed_xml[:200]}'
     )
+
+
+# ---------------------------------------------------------------------------
+# A3 (H-2) — shift state guard in _apply_shift_side_effects_locked
+# ---------------------------------------------------------------------------
+
+def _fake_shift_doc(doc_type: str = 'SHIFT_OPEN') -> object:
+    return SimpleNamespace(
+        doc_type=doc_type,
+        fiscal_number='FN-DSC-0001',
+        document_id='doc-shift-test',
+        fs_mode='OFFLINE',
+        backend_profile_id='backend_checkbox_default',
+        transport_profile_id='transport_dps_grpc_default',
+        request_id='req-shift-test',
+        ack_at=None,
+    )
+
+
+def _create_shift(conn, shift_id: str, state: ShiftState) -> None:
+    conn.execute('BEGIN IMMEDIATE')
+    ShiftRepository.create_shift(
+        conn,
+        shift_id=shift_id,
+        fiscal_number='FN-DSC-0001',
+        state=state,
+        open_mode='ONLINE',
+        backend_profile_id='backend_checkbox_default',
+        transport_profile_id='transport_dps_grpc_default',
+        protocol=Protocol('CHECKBOX_REST'),
+        integration_owner='test',
+        channel_lock_acquired_at='2026-01-01T10:00:00+00:00',
+    )
+    conn.commit()
+
+
+def test_a3_shift_in_closing_not_moved_to_opened(conn, caplog):
+    """A3 (H-2): CLOSING shift must stay CLOSING on deferred SHIFT_OPEN ACK — not transitioned to OPENED."""
+    _create_shift(conn, 'shift-a3-closing', ShiftState.CLOSING)
+
+    with caplog.at_level(logging.WARNING, logger='prro_gateway.offline_sync'):
+        OfflineSyncService._apply_shift_side_effects_locked(
+            conn, doc=_fake_shift_doc('SHIFT_OPEN'), target_state=DocumentState.ACK,
+        )
+
+    shift = ShiftRepository.get_by_id(conn, 'shift-a3-closing')
+    assert shift.state == ShiftState.CLOSING, 'CLOSING shift must not be moved to OPENED'
+    assert 'offline_sync_shift_invalid_state_for_open' in caplog.text
+
+
+def test_a3_shift_opening_transitions_to_opened(conn):
+    """A3 (H-2): OPENING shift IS correctly transitioned to OPENED."""
+    _create_shift(conn, 'shift-a3-opening', ShiftState.OPENING)
+
+    OfflineSyncService._apply_shift_side_effects_locked(
+        conn, doc=_fake_shift_doc('SHIFT_OPEN'), target_state=DocumentState.ACK,
+    )
+
+    shift = ShiftRepository.get_by_id(conn, 'shift-a3-opening')
+    assert shift.state == ShiftState.OPENED, 'OPENING shift must be moved to OPENED on ACK'
+
+
+def test_a3_shift_close_ignored_when_already_closed(conn):
+    """A3 (H-2): SHIFT_CLOSE on an already-CLOSED shift (not active) is a no-op."""
+    # CLOSED is not returned by get_active_shift → no update attempted
+    conn.execute('BEGIN IMMEDIATE')
+    conn.execute("""
+        INSERT INTO shifts (
+            shift_id, fiscal_number, state, open_mode,
+            opened_via_backend_profile_id, opened_via_transport_profile_id,
+            opened_via_protocol, opened_via_integration_owner, channel_lock_acquired_at
+        ) VALUES ('shift-a3-closed', 'FN-DSC-0001', 'CLOSED', 'ONLINE',
+                  'backend_checkbox_default', 'transport_dps_grpc_default',
+                  'CHECKBOX_REST', 'test', '2026-01-01T10:00:00+00:00')
+    """)
+    conn.commit()
+
+    # Should complete without error — get_active_shift returns None for CLOSED
+    OfflineSyncService._apply_shift_side_effects_locked(
+        conn, doc=_fake_shift_doc('SHIFT_CLOSE'), target_state=DocumentState.ACK,
+    )
+    shift = ShiftRepository.get_by_id(conn, 'shift-a3-closed')
+    assert shift.state == ShiftState.CLOSED, 'CLOSED shift must remain CLOSED'
+
+
+# ---------------------------------------------------------------------------
+# A9 (M-4) — unknown op type logs warning in _apply_shift_side_effects_locked
+# ---------------------------------------------------------------------------
+
+def test_a9_unknown_op_type_logs_warning(conn, caplog):
+    """A9 (M-4): unknown doc_type must log a WARNING instead of silently returning."""
+    with caplog.at_level(logging.WARNING, logger='prro_gateway.offline_sync'):
+        OfflineSyncService._apply_shift_side_effects_locked(
+            conn, doc=_fake_shift_doc('UNKNOWN_OP_XYZ'), target_state=DocumentState.ACK,
+        )
+    assert 'offline_sync_shift_unknown_op_type' in caplog.text

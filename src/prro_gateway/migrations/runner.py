@@ -76,6 +76,8 @@ def apply_migrations_to_connection(conn: sqlite3.Connection, sql_dir: Path, dry_
             except Exception:
                 conn.rollback()
                 raise
+            # Restore FK enforcement disabled by migrations that use PRAGMA foreign_keys=OFF.
+            conn.execute('PRAGMA foreign_keys=ON')
         executed.append(sql_file.name)
     return executed
 

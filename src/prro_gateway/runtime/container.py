@@ -905,6 +905,7 @@ class RuntimeContainer:
                 TransportKind.DPS_PRRO_FISCAL_SIDECAR_V2: FiscalSidecarTransport(
                     sidecar_url=self.config.crypto.sidecar_url or 'http://127.0.0.1:8765',
                     http_client=self.transport_http_client,
+                    crypto_provider=self.config.crypto.provider or 'passthrough',
                 )
             } if (self.config.crypto.provider or 'passthrough') == 'passthrough' else {}),
         }

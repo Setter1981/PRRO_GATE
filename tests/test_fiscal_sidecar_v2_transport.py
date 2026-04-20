@@ -234,7 +234,7 @@ def test_transport_profile_endpoint_override():
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     transport = FiscalSidecarTransport(
-        sidecar_url='http://default-host:8765',
+        sidecar_url='http://127.0.0.1:8765',
         http_client=client,
     )
 
@@ -252,3 +252,56 @@ def test_transport_profile_endpoint_override():
     assert len(captured_urls) == 1
     assert 'override-host:9999' in captured_urls[0]
     assert 'default-host' not in captured_urls[0]
+
+
+# ── C1 (H-5): URL validation — non-loopback HTTP raises ValueError ────────────
+
+@pytest.mark.parametrize('bad_url', [
+    'http://0.0.0.0:8765',
+    'http://192.168.1.1:8765',
+    'http://sidecar.internal:8765',
+    'http://10.0.0.1:9000',
+])
+def test_non_loopback_http_url_raises(bad_url: str) -> None:
+    with pytest.raises(ValueError, match='loopback'):
+        FiscalSidecarTransport(sidecar_url=bad_url)
+
+
+@pytest.mark.parametrize('good_url', [
+    'http://127.0.0.1:8765',
+    'http://127.0.0.2:9000',
+    'http://localhost:8765',
+    'http://[::1]:8765',
+    'https://sidecar.internal:8765',
+    'https://10.0.0.1:9000',
+])
+def test_safe_urls_are_accepted(good_url: str) -> None:
+    t = FiscalSidecarTransport(sidecar_url=good_url)
+    assert t is not None
+
+
+# ── C2 (H-6): DPS rate-limit status=-4 → TransportRetryableError ─────────────
+
+@pytest.mark.parametrize('dps_status', [-4, -16])
+def test_dps_retryable_statuses(dps_status: int) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={'status': dps_status, 'fiscal_id': '', 'error_message': 'transient'})
+
+    with pytest.raises(TransportRetryableError, match=f'status={dps_status}'):
+        _send(_transport_with(handler))
+
+
+def test_dps_status_minus_1_is_rejected_not_retryable() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={'status': -1, 'fiscal_id': '', 'error_message': 'bad sig'})
+
+    with pytest.raises(TransportRejectedError):
+        _send(_transport_with(handler))
+
+
+# ── C3 (M-7): logger name must match module path ──────────────────────────────
+
+def test_logger_name() -> None:
+    import logging
+    from prro_gateway.transports import fiscal_sidecar as _mod
+    assert _mod.logger.name == 'prro_gateway.transports.fiscal_sidecar'

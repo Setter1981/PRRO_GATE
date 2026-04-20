@@ -129,6 +129,10 @@ class OfflineSyncService:
                                 path=f'/archive/{doc.fiscal_number}/{doc.document_id}/payload.xml',
                                 content=corrected_bytes,
                             )
+                            conn.execute(
+                                'DELETE FROM document_files WHERE document_id = ? AND file_kind = ?',
+                                (doc.document_id, FileKind.SIGNED_XML.value),
+                            )
                             DocumentFilesRepository.add_file(
                                 conn,
                                 file_id=f'{doc.document_id}-signed',
@@ -188,6 +192,9 @@ class OfflineSyncService:
                 transport_error = exc
             except TransportRejectedError as exc:
                 transport_error = exc
+            except ValueError as exc:
+                transport_error = TransportRetryableError(f'MAC injection failed: {exc}')
+                _mac_chain_broken = True
 
             # Parse DPS state BEFORE opening the transaction to prevent ValueError
             # from DocumentState() landing inside an open BEGIN IMMEDIATE and leaving
@@ -362,59 +369,67 @@ class OfflineSyncService:
                             f'Unexpected DPS state for offline sync: {send_state.value!r}'
                         )
                         send_result = None
-                        # Handle inline: same ceiling logic as the main error path.
-                        current = FiscalDocumentRepository.get_by_id(conn, doc.document_id)
-                        attempts = (current.recovery_attempts if current else 0) + 1
-                        is_terminal = attempts >= self.max_recovery_attempts
+                        # Handle inline: wrap in own try so a DB error here
+                        # does not kill the rest of the batch via outer except.
+                        try:
+                            current = FiscalDocumentRepository.get_by_id(conn, doc.document_id)
+                            attempts = (current.recovery_attempts if current else 0) + 1
+                            is_terminal = attempts >= self.max_recovery_attempts
 
-                        conn.execute('BEGIN IMMEDIATE')
-                        if is_terminal:
-                            updated = FiscalDocumentRepository.update_state(
-                                conn,
-                                document_id=doc.document_id,
-                                state=DocumentState.REQUIRES_MANUAL_RECONCILIATION,
-                                error_message=str(transport_error),
-                                expected_states=(DocumentState.OFFLINE_LOCAL_ACK,),
+                            conn.execute('BEGIN IMMEDIATE')
+                            if is_terminal:
+                                updated = FiscalDocumentRepository.update_state(
+                                    conn,
+                                    document_id=doc.document_id,
+                                    state=DocumentState.REQUIRES_MANUAL_RECONCILIATION,
+                                    error_message=str(transport_error),
+                                    expected_states=(DocumentState.OFFLINE_LOCAL_ACK,),
+                                )
+                                if updated is None:
+                                    conn.rollback()
+                                    continue
+                                event_type = 'OFFLINE_SYNC_FAILED_TERMINAL'
+                                severity = 'ERROR'
+                            else:
+                                event_type = 'OFFLINE_SYNC_FAILED_RETRYABLE'
+                                severity = 'WARNING'
+
+                            FiscalDocumentRepository.set_recovery_attempts(
+                                conn, document_id=doc.document_id, recovery_attempts=attempts,
                             )
-                            if updated is None:
-                                conn.rollback()
-                                continue
-                            event_type = 'OFFLINE_SYNC_FAILED_TERMINAL'
-                            severity = 'ERROR'
-                        else:
-                            event_type = 'OFFLINE_SYNC_FAILED_RETRYABLE'
-                            severity = 'WARNING'
-
-                        FiscalDocumentRepository.set_recovery_attempts(
-                            conn, document_id=doc.document_id, recovery_attempts=attempts,
-                        )
-                        AuditRepository.log_event(
-                            conn,
-                            entity_type='DOCUMENT',
-                            entity_id=doc.document_id,
-                            event_type=event_type,
-                            severity=severity,
-                            event_payload_json=dumps_json({
-                                'error': str(transport_error),
-                                'recovery_attempts': attempts,
-                                'offline_fiscal_no': doc.offline_fiscal_no,
-                            }),
-                        )
-                        TransportTraceRepository.log_event(
-                            conn,
-                            trace_id=f'{doc.document_id}-offline-sync-unexpected-{attempts}',
-                            fiscal_number=doc.fiscal_number,
-                            backend_profile_id=doc.backend_profile_id,
-                            transport_profile_id=doc.transport_profile_id,
-                            direction='OUT',
-                            technical_status='OFFLINE_SYNC_UNEXPECTED_STATE',
-                            business_status=str(transport_error),
-                        )
-                        conn.commit()
-                        if is_terminal:
-                            result.manual += 1
-                        else:
-                            result.retryable += 1
+                            AuditRepository.log_event(
+                                conn,
+                                entity_type='DOCUMENT',
+                                entity_id=doc.document_id,
+                                event_type=event_type,
+                                severity=severity,
+                                event_payload_json=dumps_json({
+                                    'error': str(transport_error),
+                                    'recovery_attempts': attempts,
+                                    'offline_fiscal_no': doc.offline_fiscal_no,
+                                }),
+                            )
+                            TransportTraceRepository.log_event(
+                                conn,
+                                trace_id=f'{doc.document_id}-offline-sync-unexpected-{attempts}',
+                                fiscal_number=doc.fiscal_number,
+                                backend_profile_id=doc.backend_profile_id,
+                                transport_profile_id=doc.transport_profile_id,
+                                direction='OUT',
+                                technical_status='OFFLINE_SYNC_UNEXPECTED_STATE',
+                                business_status=str(transport_error),
+                            )
+                            conn.commit()
+                            if is_terminal:
+                                result.manual += 1
+                            else:
+                                result.retryable += 1
+                        except Exception as inner_exc:
+                            conn.rollback()
+                            logging.getLogger('prro_gateway.offline_sync').error(
+                                'offline_sync_unexpected_state_persist_failed',
+                                extra={'extra_fields': {'document_id': doc.document_id, 'error': str(inner_exc)}},
+                            )
                         continue
 
                 else:
@@ -490,11 +505,8 @@ class OfflineSyncService:
         """Replace <MAC>...</MAC> content with mac_hex in DPS XML."""
         result, n = re.subn(r'<MAC>[^<]*</MAC>', f'<MAC>{mac_hex}</MAC>', xml)
         if n == 0:
-            logging.getLogger('prro_gateway.offline_sync').warning(
-                'offline_sync_mac_element_not_found',
-                extra={'extra_fields': {'xml_prefix': xml[:120]}},
-            )
-        elif n > 1:
+            raise ValueError(f'<MAC> element not found in DPS XML (prefix: {xml[:120]!r})')
+        if n > 1:
             logging.getLogger('prro_gateway.offline_sync').warning(
                 'offline_sync_mac_element_duplicate',
                 extra={'extra_fields': {'count': n, 'xml_prefix': xml[:120]}},
@@ -507,9 +519,8 @@ class OfflineSyncService:
         row = conn.execute(
             """SELECT d.document_id FROM fiscal_documents d
                WHERE d.fiscal_number = ? AND d.state = 'ACK'
-                 AND d.transport_profile_id = ?
                ORDER BY d.lnd DESC LIMIT 1""",
-            (doc.fiscal_number, doc.transport_profile_id),
+            (doc.fiscal_number,),
         ).fetchone()
         if row is not None:
             content = DocumentFilesRepository.get_content(conn, document_id=row[0], file_kind=FileKind.PAYLOAD_XML)
@@ -544,6 +555,10 @@ class OfflineSyncService:
         try:
             op = OperationType(doc.doc_type)
         except ValueError:
+            logging.getLogger('prro_gateway.offline_sync').warning(
+                'offline_sync_shift_unknown_op_type',
+                extra={'extra_fields': {'document_id': doc.document_id, 'doc_type': doc.doc_type}},
+            )
             return
         if op == OperationType.SHIFT_OPEN and target_state == DocumentState.ACK:
             active_shift = ShiftRepository.get_active_shift(conn, doc.fiscal_number)
@@ -570,14 +585,20 @@ class OfflineSyncService:
                     channel_lock_acquired_at=doc.ack_at or datetime.now(UTC).isoformat(),
                     open_document_id=doc.document_id,
                 )
-            elif active_shift.state != ShiftState.OPENED:
+            elif active_shift.state in (ShiftState.OPENING, ShiftState.CREATED):
                 ShiftRepository.update_state(conn, shift_id=active_shift.shift_id, state=ShiftState.OPENED)
                 ShiftRepository.link_document(conn, shift_id=active_shift.shift_id, open_document_id=doc.document_id)
-            elif active_shift.open_document_id is None:
-                ShiftRepository.link_document(conn, shift_id=active_shift.shift_id, open_document_id=doc.document_id)
+            elif active_shift.state == ShiftState.OPENED:
+                if active_shift.open_document_id is None:
+                    ShiftRepository.link_document(conn, shift_id=active_shift.shift_id, open_document_id=doc.document_id)
+            else:
+                logging.getLogger('prro_gateway.offline_sync').warning(
+                    'offline_sync_shift_invalid_state_for_open',
+                    extra={'extra_fields': {'shift_id': active_shift.shift_id, 'state': active_shift.state.value}},
+                )
         elif op == OperationType.SHIFT_CLOSE and target_state == DocumentState.ACK:
             active_shift = ShiftRepository.get_active_shift(conn, doc.fiscal_number)
-            if active_shift is not None:
+            if active_shift is not None and active_shift.state in (ShiftState.OPENED, ShiftState.CLOSING):
                 ShiftRepository.update_state(conn, shift_id=active_shift.shift_id, state=ShiftState.CLOSED)
                 ShiftRepository.link_document(conn, shift_id=active_shift.shift_id, close_document_id=doc.document_id)
 

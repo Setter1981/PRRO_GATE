@@ -21,16 +21,37 @@ from __future__ import annotations
 
 import json
 import logging
+import re as _re
 
 import httpx
 
 from ..enums import DocumentState
 from ..ports import SendResult, TransportRejectedError, TransportRetryableError
 
-logger = logging.getLogger('prro_gateway.transports.fiscal_sidecar_v2')
+logger = logging.getLogger('prro_gateway.transports.fiscal_sidecar')
 
 # HTTP status codes that indicate a transient upstream problem — safe to retry.
 _RETRYABLE_HTTP = {429, 500, 502, 503, 504}
+
+# DPS status codes that are transient — rate-limit or offline-session expiry.
+# -4:  ERROR_TAX (server overloaded / rate-limited)
+# -16: ERROR_OFFLINE_ID (DPS online but offline session expired — retry after reconnect)
+_RETRYABLE_DPS_STATUSES = {-4, -16}
+
+# sidecar_url must be loopback HTTP or any HTTPS — plain HTTP to non-loopback
+# would transmit fiscal payloads unencrypted across the network.
+_SAFE_URL_RE = _re.compile(
+    r'^https://'
+    r'|^http://(127\.\d+\.\d+\.\d+|localhost|\[::1\]|::1)(:\d+)?(/|$)',
+    _re.IGNORECASE,
+)
+
+
+def _validate_sidecar_url(url: str) -> None:
+    if not _SAFE_URL_RE.match(url):
+        raise ValueError(
+            f'sidecar_url must be a loopback http:// or any https:// URL, got {url!r}'
+        )
 
 
 class FiscalSidecarTransport:
@@ -49,6 +70,7 @@ class FiscalSidecarTransport:
                 f'got {crypto_provider!r}. Combining with the Python crypto sidecar '
                 f'would double-sign the payload.'
             )
+        _validate_sidecar_url(sidecar_url)
         self._base = sidecar_url.rstrip('/')
         self._client = http_client or httpx.Client(timeout=120.0)
 
@@ -125,6 +147,10 @@ def _map_dps_response(data: dict, document_id: str) -> SendResult:
         )
 
     msg = error_msg or f'DPS status={status}'
+    if status in _RETRYABLE_DPS_STATUSES:
+        raise TransportRetryableError(
+            f'DPS transient error for document {document_id}: {msg} (status={status})'
+        )
     raise TransportRejectedError(
         f'DPS rejected document {document_id}: {msg} (status={status})'
     )

@@ -538,9 +538,17 @@ class WritePathWorker:
             is_dps_xml = sign_input.startswith('<RQ')
             if is_dps_xml:
                 conn.execute('BEGIN IMMEDIATE')
+                doc_id = ctx.document.document_id
                 ctx.document = FiscalDocumentRepository.update_state(
-                    conn, document_id=ctx.document.document_id, state=DocumentState.SIGNED,
+                    conn, document_id=doc_id, state=DocumentState.SIGNED,
+                    expected_states=(DocumentState.PREPARED,),
                 )
+                if ctx.document is None:
+                    conn.rollback()
+                    self.logger.info("stage_sign_deferred_idempotent", extra={"extra_fields": {
+                        "document_id": doc_id,
+                    }})
+                    return ctx, None
                 DocumentFilesRepository.add_file(
                     conn,
                     file_id=f'{ctx.document.document_id}-payload-xml',
