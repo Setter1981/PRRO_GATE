@@ -13,12 +13,25 @@
 //! Only the characters that can legitimately appear in receipt item
 //! names, department labels, cashier names and error messages are
 //! mapped.  Anything else is replaced with `?` (0x3F).
+//!
+//! # Unicode normalization
+//!
+//! The encoder expects its input in **NFC** (canonical composed form).
+//! All Ukrainian and Russian glyphs in this table are single code-points;
+//! a decomposed `и + U+0306` (combining breve) sequence would be treated
+//! as two separate characters — `и` encodes correctly, the combining
+//! mark falls through to `?`.  The Resonance OLE Manager DLL emits NFC
+//! exclusively, so this matches production behaviour.  Callers that
+//! bridge from non-NFC sources must normalise upstream.
 
 /// Encode a Unicode string into a Maria-compatible CP866 byte sequence.
 ///
 /// Unknown glyphs are substituted with `?` (0x3F) to keep the output
 /// length predictable — the firmware accepts any ASCII-printable
 /// fallback.
+///
+/// Input must be in Unicode NFC (canonical composed form); see module
+/// docs.
 #[must_use]
 pub fn encode(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
@@ -34,7 +47,6 @@ pub fn decode(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| decode_byte(b)).collect()
 }
 
-#[allow(clippy::too_many_lines)]
 fn encode_char(ch: char) -> u8 {
     // ASCII — straight mapping.
     if (ch as u32) < 0x80 {
@@ -78,7 +90,6 @@ fn encode_char(ch: char) -> u8 {
     }
 }
 
-#[allow(clippy::match_same_arms)]
 fn decode_byte(b: u8) -> char {
     if b < 0x80 {
         return b as char;
@@ -185,6 +196,23 @@ mod tests {
         let russian_lower = "абвгдежзийклмнопрстуфхцчшщъыьэюя";
         let expected: Vec<u8> = (0xA0..=0xAF).chain(0xE0..=0xEF).collect();
         assert_eq!(encode(russian_lower), expected);
+    }
+
+    // NFC contract: precomposed `й` (U+0439) encodes as one byte;
+    // decomposed `и` + U+0306 is treated as two characters, with the
+    // combining mark falling through to `?`.  This documents the
+    // expectation explicitly so any regression flips the test.
+    #[test]
+    fn nfc_precomposed_yi_encodes_as_single_byte() {
+        let nfc = "й"; // precomposed U+0439
+        assert_eq!(encode(nfc), vec![0xA9]);
+    }
+
+    #[test]
+    fn nfd_decomposed_form_loses_combining_mark() {
+        // NFD form: base `и` + combining breve U+0306.
+        let nfd = "\u{0438}\u{0306}";
+        assert_eq!(encode(nfd), vec![0xA8, b'?']);
     }
 
     #[test]

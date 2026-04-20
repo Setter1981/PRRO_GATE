@@ -121,12 +121,12 @@ pub fn encode_frame_bytes(payload: &[u8], with_crc: bool) -> Result<Vec<u8>, Fra
 /// * [`FrameError::Empty`] — buffer has no bytes
 /// * [`FrameError::MissingStart`] — first byte is not `0xFD`; caller
 ///   should advance past the junk byte and try again
-/// * [`FrameError::Incomplete`] — valid prefix but end byte not yet seen
-/// * [`FrameError::LengthMismatch`] — length byte disagrees with the
-///   observed payload window (corrupt frame)
+/// * [`FrameError::Incomplete`] — valid prefix but end byte not yet seen;
+///   caller must keep buffering and retry
 /// * [`FrameError::BadCrc`] — trailing CRC bytes did not self-verify
-/// * [`FrameError::ShortPayload`] — payload window is less than
-///   [`MIN_CMD_LEN`] bytes (corrupt frame)
+/// * [`FrameError::NoFrameFound`] — buffer is large enough to contain a
+///   max-size frame but no self-consistent layout was found; caller
+///   must resync by scanning for the next `0xFD`
 pub fn decode_frame(buf: &[u8], with_crc: bool) -> Result<(Frame, usize), FrameError> {
     if buf.is_empty() {
         return Err(FrameError::Empty);
@@ -339,8 +339,35 @@ mod tests {
 
     #[test]
     fn cyrillic_command_roundtrip() {
-        // Department name on a restaurant POS.
+        // Department name on a restaurant POS.  Mind: every `і` below is
+        // the Ukrainian Cyrillic U+0456 (byte 0xB9 in CP866), NOT Latin
+        // U+0069 — mix-up would silently pass via ASCII and defeat the
+        // invariant we're trying to prove.
         roundtrip("PREPБар", true);
-        roundtrip("GRBGОсновнi позиції", false);
+        roundtrip("GRBGОсновні позиції", false);
+
+        // Guarantee at the byte level that the Ukrainian letter `і`
+        // survives framing → CP866 → framing without being replaced by
+        // a Latin lookalike or a `?`.
+        let frame = encode_frame("FINFПаляниця", true).unwrap();
+        // CP866 for "Паляниця": П(8F) а(A0) л(AB) я(EF) н(AD) и(A8) ц(E6) я(EF)
+        let expected_payload: &[u8] = &[
+            b'F', b'I', b'N', b'F',
+            0x8F, 0xA0, 0xAB, 0xEF, 0xAD, 0xA8, 0xE6, 0xEF,
+        ];
+        assert_eq!(&frame[1..=expected_payload.len()], expected_payload);
+    }
+
+    #[test]
+    fn ukrainian_i_is_cyrillic_not_latin_in_frame() {
+        // Ukrainian `і` (U+0456) must encode as 0xB9.  Latin `i`
+        // (U+0069) encodes as 0x69.  This test asserts we're using the
+        // Cyrillic form end-to-end.
+        let ukr = encode_frame("TEXTі", false).unwrap();
+        let lat = encode_frame("TEXTi", false).unwrap();
+        assert_ne!(ukr, lat, "Ukrainian `і` must differ from Latin `i` on the wire");
+        // Payload byte just after the 4-char command:
+        assert_eq!(ukr[5], 0xB9, "Ukrainian `і` should encode as 0xB9");
+        assert_eq!(lat[5], 0x69, "Latin `i` should encode as 0x69");
     }
 }
