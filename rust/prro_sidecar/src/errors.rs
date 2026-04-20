@@ -1,7 +1,4 @@
 //! `SidecarError` — unified error enum for the fiscal driver pipeline.
-//! Phase 0 stub; filled in Phase 1.
-
-#![allow(dead_code)]
 
 #[derive(Debug, thiserror::Error)]
 pub enum SidecarError {
@@ -17,10 +14,30 @@ pub enum SidecarError {
     CmsSign(String),
     #[error("grpc: {0}")]
     Grpc(String),
-    #[error("tsp failed: {0}")]
-    Tsp(String),
     #[error("db: {0}")]
     Db(#[from] rusqlite::Error),
     #[error("internal: {0}")]
     Internal(String),
+}
+
+impl axum::response::IntoResponse for SidecarError {
+    fn into_response(self) -> axum::response::Response {
+        use axum::http::StatusCode;
+        use axum::Json;
+        // Log full diagnostic before sanitizing for the HTTP response.
+        // Credentials / Db / Internal details must NOT reach the wire — they may
+        // contain key-encoding hints, SQL fragments, or file paths.
+        tracing::error!(error = %self, "fiscal handler error");
+        let (status, msg) = match &self {
+            Self::BadRequest(m)  => (StatusCode::BAD_REQUEST,           m.clone()),
+            Self::NotFound(m)    => (StatusCode::NOT_FOUND,             m.clone()),
+            Self::License(m)     => (StatusCode::FORBIDDEN,             m.clone()),
+            Self::Credentials(_) => (StatusCode::INTERNAL_SERVER_ERROR, "credential error".into()),
+            Self::CmsSign(m)     => (StatusCode::BAD_GATEWAY,           m.clone()),
+            Self::Grpc(m)        => (StatusCode::BAD_GATEWAY,           m.clone()),
+            Self::Db(_)          => (StatusCode::INTERNAL_SERVER_ERROR, "database error".into()),
+            Self::Internal(_)    => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()),
+        };
+        (status, Json(serde_json::json!({"error": msg}))).into_response()
+    }
 }

@@ -1,86 +1,22 @@
-//! Thin adapter over `prro_crypto::cms::CmsSigner` — signs cp1251 XML bytes
-//! using DSTU 4145-2002, optionally adding RFC 3161 TSP timestamp.
+//! Helpers for TSP URL resolution and cert issuer DN extraction.
 //!
-//! TSP URL is resolved from `ca_endpoints` table by substring-matching
+//! TSP URL is resolved from `ca_endpoints` by substring-matching
 //! the cert issuer DN — never passed directly by the caller.
 
-use prro_crypto::cms::{builder::{CmsBuildOptions, CmsError, CmsSigner}, signer::{DstuInProcessSigner, RawSigner, SignerError}, CmsProfile};
 use rusqlite::OptionalExtension;
 
 // ─── Error ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
 pub enum CmsAdapterError {
-    #[error("CMS sign error: {0}")]
-    Cms(#[from] CmsError),
-    #[error("TSP fetch error: {0}")]
-    Tsp(String),
     #[error("no TSP endpoint found for issuer DN {issuer_dn:?}")]
     NoTspMapping { issuer_dn: String },
     #[error("cert issuer DN extraction failed: {0}")]
     CertParse(String),
     #[error("DB query: {0}")]
     Db(#[from] rusqlite::Error),
-    #[error("signing: {0}")]
-    Sign(#[from] SignerError),
 }
 
-// ─── Context ─────────────────────────────────────────────────────────────────
-
-pub struct CmsSignCtx<'a> {
-    /// When true, a TSP timestamp is added; URL resolved via ca_endpoints.
-    pub tsp_enabled:    bool,
-    /// TSP request timeout in milliseconds.
-    pub tsp_timeout_ms: u64,
-    /// Signing time to embed in signedAttrs.
-    pub now:            time::OffsetDateTime,
-    /// Open DB connection for ca_endpoints lookup (required iff tsp_enabled).
-    pub conn:           Option<&'a rusqlite::Connection>,
-}
-
-// ─── Public API ───────────────────────────────────────────────────────────────
-
-/// Sign `content` (cp1251 XML bytes) and return CAdES-BES or CAdES-T DER.
-///
-/// When `ctx.tsp_enabled = true`, the TSP URL is resolved from the
-/// `ca_endpoints` table by matching a substring of the cert issuer DN.
-pub fn sign_content(
-    content:  &[u8],
-    signer:   &DstuInProcessSigner,
-    cert_der: &[u8],
-    ctx:      &CmsSignCtx<'_>,
-) -> Result<Vec<u8>, CmsAdapterError> {
-    let profile = CmsProfile::default(); // DSTU 4145 + GOST 34.311-95
-
-    let signing_time = Some(std::time::UNIX_EPOCH
-        + std::time::Duration::from_secs(ctx.now.unix_timestamp() as u64));
-
-    let cms_signer = CmsSigner {
-        cert_der,
-        signer: signer as &dyn RawSigner,
-        profile,
-    };
-
-    let opts = CmsBuildOptions { attached: false, signing_time };
-
-    if ctx.tsp_enabled {
-        let conn = ctx.conn.ok_or_else(|| CmsAdapterError::Db(
-            rusqlite::Error::InvalidParameterName("conn required when tsp_enabled".into())
-        ))?;
-
-        let issuer_dn = extract_issuer_dn(cert_der)?;
-        let tsp_url   = resolve_tsp_url(conn, &issuer_dn)?;
-        let timeout   = std::time::Duration::from_millis(ctx.tsp_timeout_ms);
-        // sign_with_tsp correctly hashes signature_value (not full CMS DER) for TSP messageImprint
-        let sig = cms_signer.sign_with_tsp(content, opts, &tsp_url, timeout)?;
-        Ok(sig.cms_der)
-    } else {
-        let sig = cms_signer.sign_with(content, opts)?;
-        Ok(sig.cms_der)
-    }
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Query `ca_endpoints` for a TSP URL matching the cert's issuer DN.
 ///
@@ -107,7 +43,7 @@ pub fn resolve_tsp_url(
 
 /// Extract the issuer DN string from a DER-encoded X.509 certificate.
 /// Uses a minimal ASN.1 walk — no dependency on an X.509 library.
-fn extract_issuer_dn(cert_der: &[u8]) -> Result<String, CmsAdapterError> {
+pub fn extract_issuer_dn(cert_der: &[u8]) -> Result<String, CmsAdapterError> {
     use prro_crypto::cms::asn1_util as a1;
 
     let err = |msg: &str| CmsAdapterError::CertParse(msg.to_string());

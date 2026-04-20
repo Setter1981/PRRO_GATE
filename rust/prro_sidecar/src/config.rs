@@ -26,6 +26,10 @@ pub struct SidecarSection {
     pub bind:      String,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Device name embedded in DPS XML <NDv> tag (default: "ПРО_каса")
+    pub device_name:    Option<String>,
+    /// Device version embedded in DPS XML <PrV> tag (default: "1.1")
+    pub device_version: Option<String>,
 }
 
 fn default_log_level() -> String { "info".into() }

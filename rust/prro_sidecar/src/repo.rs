@@ -105,11 +105,17 @@ impl CertMetadata {
         let parse = |s: &str| {
             time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
         };
-        if let Some(vt) = self.valid_to.as_deref().and_then(parse) {
-            if now > vt { return false; }
+        if let Some(valid_to_str) = self.valid_to.as_deref() {
+            match parse(valid_to_str) {
+                Some(vt) => { if now > vt { return false; } }
+                None     => return false, // present but unparseable → fail-closed
+            }
         }
-        if let Some(vf) = self.valid_from.as_deref().and_then(parse) {
-            if now < vf { return false; }
+        if let Some(valid_from_str) = self.valid_from.as_deref() {
+            match parse(valid_from_str) {
+                Some(vf) => { if now < vf { return false; } }
+                None     => return false, // present but unparseable → fail-closed
+            }
         }
         true
     }
@@ -163,7 +169,14 @@ impl Repo {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
-             PRAGMA busy_timeout=5000;",
+             PRAGMA busy_timeout=5000;
+             -- Per-FN document sequencing, survived across restarts.
+             -- previous_hash is the <MAC> value from the last accepted DPS response.
+             CREATE TABLE IF NOT EXISTS local_sequences (
+                 fiscal_number TEXT PRIMARY KEY,
+                 last          INTEGER NOT NULL DEFAULT 0,
+                 previous_hash TEXT    NOT NULL DEFAULT ''
+             );",
         )?;
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -304,6 +317,80 @@ impl Repo {
         })
     }
 
+    /// Atomically increment and return the per-FN local document number.
+    /// Persisted in SQLite — survives sidecar restarts within a shift.
+    pub fn next_local_number(&self, fiscal_number: &str) -> Result<i32, SidecarError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO local_sequences (fiscal_number, last) VALUES (?1, 1)
+             ON CONFLICT(fiscal_number) DO UPDATE SET last = last + 1",
+            params![fiscal_number],
+        )?;
+        let n: i32 = conn.query_row(
+            "SELECT last FROM local_sequences WHERE fiscal_number = ?1",
+            params![fiscal_number],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Return the `<MAC>` hash from the last successfully accepted DPS document.
+    /// Returns empty string if no document has been accepted yet (fresh RRO).
+    pub fn load_previous_hash(&self, fiscal_number: &str) -> Result<String, SidecarError> {
+        let conn = self.lock()?;
+        match conn.query_row(
+            "SELECT previous_hash FROM local_sequences WHERE fiscal_number = ?1",
+            params![fiscal_number],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(h) => Ok(h),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(String::new()),
+            Err(e) => Err(SidecarError::Db(e)),
+        }
+    }
+
+    /// Persist the `<MAC>` hash from a successfully accepted DPS document.
+    /// Called after each successful `send_chk_v2` response.
+    pub fn store_previous_hash(&self, fiscal_number: &str, hash: &str) -> Result<(), SidecarError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO local_sequences (fiscal_number, previous_hash) VALUES (?1, ?2)
+             ON CONFLICT(fiscal_number) DO UPDATE SET previous_hash = excluded.previous_hash",
+            params![fiscal_number, hash],
+        )?;
+        Ok(())
+    }
+
+    /// Load raw cert DER bytes for the given fiscal_number.
+    /// Used when `ExtractedKey.certs` is empty (Key6Dat containers).
+    pub fn load_cert_der_for_fn(&self, fiscal_number: &str) -> Result<Vec<u8>, SidecarError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT cert_der FROM operator_certs WHERE fiscal_number = ?1",
+            params![fiscal_number],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                SidecarError::NotFound(format!("operator_certs cert_der: {fiscal_number}"))
+            }
+            other => SidecarError::Db(other),
+        })
+    }
+
+    /// Resolve TSP URL by substring-matching `issuer_dn` against `ca_endpoints.issuer_pattern`.
+    /// Delegates to `cms_adapter::resolve_tsp_url` — single source of truth for the SQL.
+    /// Short lock — query only, no network inside the mutex.
+    pub fn load_tsp_url_by_issuer_dn(&self, issuer_dn: &str) -> Result<String, SidecarError> {
+        let conn = self.lock()?;
+        crate::cms_adapter::resolve_tsp_url(&conn, issuer_dn).map_err(|e| match e {
+            crate::cms_adapter::CmsAdapterError::NoTspMapping { .. } => {
+                SidecarError::NotFound(format!("no TSP endpoint for issuer DN: {issuer_dn}"))
+            }
+            other => SidecarError::Internal(other.to_string()),
+        })
+    }
+
     pub fn audit_log_insert(&self, entry: &AuditEntry<'_>) -> Result<(), SidecarError> {
         let conn = self.lock()?;
         conn.execute(
@@ -402,6 +489,12 @@ mod tests {
                  event_type          TEXT NOT NULL,
                  severity            TEXT NOT NULL CHECK (severity IN ('INFO','WARNING','ERROR','CRITICAL')),
                  event_payload_json  TEXT
+             );
+
+             CREATE TABLE local_sequences (
+                 fiscal_number TEXT PRIMARY KEY,
+                 last          INTEGER NOT NULL DEFAULT 0,
+                 previous_hash TEXT    NOT NULL DEFAULT ''
              );",
         )
         .unwrap();
@@ -845,8 +938,8 @@ mod tests {
     }
 
     #[test]
-    fn cert_is_valid_at_unparseable_valid_to_treated_as_no_constraint() {
-        // Corrupted DB value: valid_to is not ISO-8601. parse returns None → constraint skipped → valid.
+    fn cert_is_valid_at_unparseable_valid_to_fails_closed() {
+        // Corrupted DB value: valid_to is not ISO-8601 → fail-closed (treat as invalid).
         let meta = CertMetadata {
             fiscal_number:    "FN1".into(),
             cert_fingerprint: "fp".into(),
@@ -858,7 +951,7 @@ mod tests {
             issuer_dn:  None,
         };
         let now = time::OffsetDateTime::now_utc();
-        assert!(meta.is_valid_at(now), "unparseable valid_to must not block access");
+        assert!(!meta.is_valid_at(now), "unparseable valid_to must block access (fail-closed)");
     }
 
     // ── Multiple active operators — ORDER BY id DESC determinism (3 rows) ─────
@@ -931,6 +1024,162 @@ mod tests {
         };
         let result = row.fn_numbers();
         assert!(result.is_err(), "numeric array elements must fail serde_json::from_str::<Vec<String>>");
+    }
+
+    // ── local_sequences / next_local_number ──────────────────────────────────
+
+    #[test]
+    fn next_local_number_starts_at_one_for_fresh_fn() {
+        let repo = make_repo();
+        let n = repo.next_local_number("FN_NEW").unwrap();
+        assert_eq!(n, 1, "first call must return 1");
+    }
+
+    #[test]
+    fn next_local_number_increments_monotonically() {
+        let repo = make_repo();
+        let a = repo.next_local_number("FN_A").unwrap();
+        let b = repo.next_local_number("FN_A").unwrap();
+        let c = repo.next_local_number("FN_A").unwrap();
+        assert_eq!(a, 1);
+        assert_eq!(b, 2);
+        assert_eq!(c, 3);
+    }
+
+    #[test]
+    fn next_local_number_is_independent_per_fiscal_number() {
+        let repo = make_repo();
+        repo.next_local_number("FN_X").unwrap();
+        repo.next_local_number("FN_X").unwrap();
+        let y = repo.next_local_number("FN_Y").unwrap();
+        assert_eq!(y, 1, "FN_Y counter must start at 1 regardless of FN_X count");
+    }
+
+    // ── previous_hash ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn load_previous_hash_returns_empty_string_for_unknown_fn() {
+        let repo = make_repo();
+        let h = repo.load_previous_hash("NO_SUCH_FN").unwrap();
+        assert!(h.is_empty(), "unknown FN must return empty string, not error");
+    }
+
+    #[test]
+    fn store_and_load_previous_hash_roundtrip() {
+        let repo = make_repo();
+        repo.store_previous_hash("FN_HASH", "aabbccddeeff").unwrap();
+        let h = repo.load_previous_hash("FN_HASH").unwrap();
+        assert_eq!(h, "aabbccddeeff");
+    }
+
+    #[test]
+    fn store_previous_hash_overwrites_existing_value() {
+        let repo = make_repo();
+        repo.store_previous_hash("FN_OVER", "first_hash").unwrap();
+        repo.store_previous_hash("FN_OVER", "second_hash").unwrap();
+        let h = repo.load_previous_hash("FN_OVER").unwrap();
+        assert_eq!(h, "second_hash", "second store must overwrite first");
+    }
+
+    #[test]
+    fn next_local_number_does_not_reset_previous_hash() {
+        let repo = make_repo();
+        repo.store_previous_hash("FN_MIX", "some_hash").unwrap();
+        repo.next_local_number("FN_MIX").unwrap();
+        let h = repo.load_previous_hash("FN_MIX").unwrap();
+        assert_eq!(h, "some_hash", "next_local_number must not clobber previous_hash");
+    }
+
+    // ── load_cert_der_for_fn ──────────────────────────────────────────────────
+
+    #[test]
+    fn load_cert_der_for_fn_returns_blob() {
+        let repo = make_repo();
+        insert_fn(&repo, "FN_CERT");
+        {
+            let conn = repo.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO operator_certs
+                     (fiscal_number, cert_fingerprint, ski_hex, cert_der, fetched_at, source)
+                 VALUES ('FN_CERT', 'FINGERPRINT1', 'SKIHEX1', X'0102030405', '2026-01-01', 'container')",
+                [],
+            ).unwrap();
+        }
+        let der = repo.load_cert_der_for_fn("FN_CERT").unwrap();
+        assert_eq!(der, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
+    }
+
+    #[test]
+    fn load_cert_der_for_fn_not_found_returns_not_found_error() {
+        let repo = make_repo();
+        let err = repo.load_cert_der_for_fn("NO_CERT_FN").unwrap_err();
+        assert!(
+            matches!(err, SidecarError::NotFound(_)),
+            "missing cert must be NotFound, got: {err:?}"
+        );
+    }
+
+    // ── load_tsp_url_by_issuer_dn ─────────────────────────────────────────────
+
+    fn make_repo_with_ca_endpoints() -> Repo {
+        let repo = make_repo();
+        {
+            let conn = repo.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE ca_endpoints (
+                     id             INTEGER PRIMARY KEY,
+                     name           TEXT NOT NULL UNIQUE,
+                     cmp_url        TEXT,
+                     tsp_url        TEXT,
+                     ocsp_url       TEXT,
+                     issuer_pattern TEXT,
+                     priority       INTEGER NOT NULL DEFAULT 100,
+                     enabled        INTEGER NOT NULL DEFAULT 1
+                 );
+                 INSERT INTO ca_endpoints VALUES
+                     (1, 'acskidd', NULL, 'http://acsk.gov.ua/tsp/', NULL, 'ацск іддс', 10, 1),
+                     (2, 'privat',  NULL, 'https://acsk.privat.ua/tsp/', NULL, 'приватбанк', 20, 1),
+                     (3, 'disabled', NULL, 'http://disabled.example.com/tsp/', NULL, 'disabled_ca', 30, 0);",
+            ).unwrap();
+        }
+        repo
+    }
+
+    #[test]
+    fn load_tsp_url_by_issuer_dn_matches_pattern() {
+        let repo = make_repo_with_ca_endpoints();
+        let url = repo.load_tsp_url_by_issuer_dn("CN=АЦСК ІДДС, OU=Trust").unwrap();
+        assert_eq!(url, "http://acsk.gov.ua/tsp/");
+    }
+
+    #[test]
+    fn load_tsp_url_by_issuer_dn_priority_ordering() {
+        // 'acskidd' has priority=10, 'privat' has priority=20.
+        // A DN matching both should return the lower-priority (higher precedence) entry.
+        let repo = make_repo_with_ca_endpoints();
+        // Construct a DN that matches both patterns — verify the lower priority number wins.
+        let url = repo.load_tsp_url_by_issuer_dn("АЦСК ІДДС").unwrap();
+        assert_eq!(url, "http://acsk.gov.ua/tsp/", "priority=10 must win over priority=20");
+    }
+
+    #[test]
+    fn load_tsp_url_disabled_endpoint_not_returned() {
+        let repo = make_repo_with_ca_endpoints();
+        let result = repo.load_tsp_url_by_issuer_dn("disabled_ca");
+        assert!(
+            matches!(result, Err(SidecarError::NotFound(_))),
+            "disabled endpoint must not be returned"
+        );
+    }
+
+    #[test]
+    fn load_tsp_url_unknown_issuer_returns_not_found() {
+        let repo = make_repo_with_ca_endpoints();
+        let result = repo.load_tsp_url_by_issuer_dn("Unknown CA Ltd");
+        assert!(
+            matches!(result, Err(SidecarError::NotFound(_))),
+            "unknown issuer must be NotFound"
+        );
     }
 
     // ── Mutex poison ──────────────────────────────────────────────────────────
