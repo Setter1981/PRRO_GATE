@@ -6,18 +6,20 @@
 //! gateway over HTTP.  The gateway is the single source of truth for
 //! canonical data, DPS submission, and archival.
 //!
-//! Sprint M4 lands only the trait + DTOs + an in-memory mock
-//! suitable for integration tests.  The real reqwest-based HTTP
-//! client arrives in M7 together with the Python `maria304_native.py`
-//! adapter + `/v1/ingress/maria304` endpoint.
+//! Sprint M4 landed the trait + DTOs + an in-memory mock for tests.
+//! Sprint M7 adds the real blocking reqwest client; the Python-side
+//! `/v1/ingress/maria304` endpoint + `maria304_native.py` adapter
+//! land alongside.
 
 pub mod dto;
+pub mod http_client;
 pub mod mock;
 
 pub use dto::{
     AcquirerSlip, CanonicalCommand, CanonicalPayment, CanonicalResponse, CommandType,
     DualTaxMode, FiscalLine, PaymentKind, RawFrame, ReceiptDirection, ReceiptPayload, Totals,
 };
+pub use http_client::HttpBridge;
 pub use mock::MockBridge;
 
 /// Errors surfaced by a [`Bridge`] implementation.
