@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 from contextlib import asynccontextmanager
 import time
 
@@ -191,6 +192,151 @@ def create_app(container: RuntimeContainer) -> FastAPI:
                 if value is not None:
                     response[field] = value
         return response
+
+    def _require_maria304_token(request: Request) -> None:
+        """Bearer-token check for the Maria 304 Rust ingress endpoint.
+
+        Raises:
+            HTTPException(503) — if shared_token is empty (misconfigured
+                gateway); refuse rather than accepting a blank token as
+                valid (which would let any client in).
+            HTTPException(401) — if Authorization header is missing or
+                not `Bearer <token>`.
+            HTTPException(403) — if the presented token does not match
+                the configured shared_token.  Comparison is
+                constant-time to prevent timing oracles.
+        """
+        configured = container.config.ingress.maria304.shared_token
+        if not configured:
+            raise HTTPException(
+                status_code=503,
+                detail={"ok": False, "error_code": "SOFT_MISCONFIGURED",
+                        "error_message": "maria304 shared_token is not configured"},
+            )
+        header = request.headers.get("Authorization", "")
+        scheme, _, presented = header.partition(" ")
+        if scheme.lower() != "bearer" or not presented:
+            raise HTTPException(
+                status_code=401,
+                detail={"ok": False, "error_code": "SOFT_UNAUTHORIZED",
+                        "error_message": "Bearer token required"},
+            )
+        if not hmac.compare_digest(presented, configured):
+            raise HTTPException(
+                status_code=403,
+                detail={"ok": False, "error_code": "SOFT_FORBIDDEN",
+                        "error_message": "invalid bearer token"},
+            )
+
+    def _maria304_fiscal_ts(doc: object) -> str:
+        """Resolve an ISO8601 timestamp for the Rust CanonicalResponse."""
+        for attr in ("server_fiscal_date", "business_ts", "created_at"):
+            value = getattr(doc, attr, None)
+            if value is not None:
+                return value.isoformat() if hasattr(value, "isoformat") else str(value)
+        return ""
+
+    def _maria304_totals(doc: object) -> tuple[int, int]:
+        total = int(getattr(doc, "total_sum", 0) or 0)
+        # RETURN documents carry totals in the return bucket from the
+        # Rust driver's perspective; SELL/everything-else in the sale
+        # bucket.  Rust's COMP builder reads these two scalars.
+        receipt_type = getattr(doc, "receipt_type", None) or getattr(doc, "doc_type", None)
+        if receipt_type == "RETURN":
+            return 0, total
+        return total, 0
+
+    def _maria304_error_code(canonical_code: str) -> str:
+        # Rust maps any non-SOFT* prefix to SoftBlock, so we always
+        # prefix.  The DPS-side canonical codes already carry enough
+        # information; we just shape the wire-compatibility prefix.
+        if canonical_code.startswith("SOFT"):
+            return canonical_code
+        return f"SOFT_{canonical_code}"
+
+    @app.post("/v1/ingress/maria304")
+    async def ingress_maria304(request: Request) -> JSONResponse:
+        _require_maria304_token(request)
+        raw = await request.json()
+        started = time.monotonic()
+        try:
+            with container.connect() as conn:
+                inbox, command, process_result, is_replay = container.ingress_service.accept_maria304(
+                    conn,
+                    raw_request=raw,
+                    response_timeout_seconds=container.config.ingress.maria304.response_timeout_seconds,
+                )
+        except AdapterMappingError as exc:
+            container.metrics.inc("ingress.maria304.error")
+            logger.warning(
+                "maria304_adapter_error",
+                extra={"extra_fields": {"code": getattr(exc, "code", "INVALID_REQUEST")}},
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error_code": "SOFT_UNSUPPORTED",
+                    "error_message": getattr(exc, "message", str(exc)),
+                },
+            )
+        except (KeyError, ValueError) as exc:
+            container.metrics.inc("ingress.maria304.error")
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error_code": "SOFT_BAD_REQUEST",
+                    "error_message": str(exc),
+                },
+            )
+
+        duration_ms = round((time.monotonic() - started) * 1000, 3)
+        logger.info(
+            "maria304_accept_ok",
+            extra={"extra_fields": {
+                "request_id": inbox.request_id,
+                "fiscal_number": inbox.fiscal_number,
+                "operation_type": command.operation_type.value,
+                "is_replay": is_replay,
+                "duration_ms": duration_ms,
+            }},
+        )
+        container.metrics.inc("ingress.maria304.accepted")
+
+        doc_id = getattr(process_result, "document_id", None)
+        if not doc_id and is_replay:
+            doc_id = getattr(inbox, "result_document_id", None)
+        if doc_id:
+            with container.connect() as conn:
+                doc = FiscalDocumentRepository.get_by_id(conn, doc_id)
+            if doc is not None:
+                sale_k, ret_k = _maria304_totals(doc)
+                return JSONResponse(status_code=200, content={
+                    "ok": True,
+                    "document_id": doc.document_id,
+                    "fiscal_id": doc.server_fiscal_no or "",
+                    "fiscal_ts": _maria304_fiscal_ts(doc),
+                    "document_state": doc.state.value,
+                    "sale_total_kopecks": sale_k,
+                    "return_total_kopecks": ret_k,
+                })
+
+        if process_result is not None:
+            canonical_error = getattr(process_result, "canonical_error", None)
+            if canonical_error is not None:
+                return JSONResponse(status_code=400, content={
+                    "ok": False,
+                    "error_code": _maria304_error_code(canonical_error.code.value),
+                    "error_message": canonical_error.message,
+                })
+
+        # Worker has not yet produced a verdict — Rust side retries.
+        return JSONResponse(status_code=503, content={
+            "ok": False,
+            "error_code": "SOFT_PROCESSING",
+            "error_message": "worker pending",
+        })
 
     @app.get("/v1/admin/documents/manual")
     def list_manual_documents() -> JSONResponse:

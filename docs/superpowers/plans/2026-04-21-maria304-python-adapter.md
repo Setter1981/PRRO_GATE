@@ -189,6 +189,12 @@ Rust очікує `error_code` починається з `"SOFT"` — інакш
 
 Рекомендую (2) — найменший діф, чіткий контракт, raw_frames лишаються джерелом правди для аудиту. Вибір остаточно — перед стартом M7-Py-2.
 
+## 5b. Відкладені optional-hardening (виявлено у M7-Py-2 2-го ревю)
+
+Жодне не required для мерджа; у списку на наступний sprint:
+- **N1** — тест `test_empty_goods_from_maria304_bypasses_receipt_validator` віддзеркалює production guard (копія if-expression у тесті). Рекомендовано замінити на e2e через `WritePathWorker.process_next` з налаштованим shift, щоб tight-coupling тесту до коду прибрати.
+- **N2** — `hmac.compare_digest(presented, configured)` може злити довжину presented через timing. Недолік мінімальний (токен — opaque з високою ентропією), але варто hash-then-compare для belt-and-braces: `hmac.compare_digest(sha256(p).digest(), sha256(c).digest())`.
+
 ## 6. Ризики
 
 1. **Rust-сторона шле поле, якого немає в мапінгу** → адаптер падає з `KeyError`. **Мітігація:** у `map_command` використовуємо `.get(...)` з явними дефолтами; невідомі поля в `payload["receipt"]["extras"]`.

@@ -7,9 +7,14 @@ from typing import Any, Protocol as TypingProtocol
 
 from ..adapters.base import AdapterContext, AdapterMappingError
 from ..adapters.checkbox_rest import CheckboxRestAdapter
+from ..adapters.maria304_native import Maria304NativeAdapter
 from ..adapters.maria_tcp import MariaTcpAdapter
 from ..adapters.webcheck_xmlrpc import WebCheckXmlRpcAdapter
-from ..constants import DEFAULT_RESPONSE_TIMEOUT_MARIA_SECONDS, DEFAULT_RESPONSE_TIMEOUT_REST_SECONDS
+from ..constants import (
+    DEFAULT_RESPONSE_TIMEOUT_MARIA304_SECONDS,
+    DEFAULT_RESPONSE_TIMEOUT_MARIA_SECONDS,
+    DEFAULT_RESPONSE_TIMEOUT_REST_SECONDS,
+)
 from ..models.canonical import CanonicalFiscalCommand, TraceContext
 from ..models.storage import InboxRecord
 from ..repositories import InboxRepository
@@ -24,6 +29,7 @@ class IngressAcceptService:
         self.checkbox_adapter = CheckboxRestAdapter()
         self.webcheck_adapter = WebCheckXmlRpcAdapter()
         self.maria_adapter = MariaTcpAdapter()
+        self.maria304_adapter = Maria304NativeAdapter()
         self.command_processor = command_processor
         self.worker_lease_owner = worker_lease_owner
         self._active_operations = 0
@@ -46,6 +52,20 @@ class IngressAcceptService:
         inbox, _ = self._store_command(conn, command=command, response_timeout_seconds=response_timeout_seconds)
         self._maybe_process(conn, fiscal_number=command.fiscal_number)
         return inbox, command
+
+    def accept_maria304(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        raw_request: dict[str, Any],
+        response_timeout_seconds: int = DEFAULT_RESPONSE_TIMEOUT_MARIA304_SECONDS,
+    ) -> tuple[InboxRecord, CanonicalFiscalCommand, Any, bool]:
+        command = self.maria304_adapter.map_command(raw_request)
+        inbox, is_replay = self._store_command(
+            conn, command=command, response_timeout_seconds=response_timeout_seconds,
+        )
+        process_result = self._maybe_process(conn, fiscal_number=command.fiscal_number)
+        return inbox, command, process_result, is_replay
 
 
     @property

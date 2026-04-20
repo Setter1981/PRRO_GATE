@@ -269,17 +269,39 @@ class WritePathWorker:
         ctx.excise_marks = self._extract_excise_marks(command)
 
         # Receipt validation — before offline allocation and document creation.
+        # MARIA_304_NATIVE is exempt from the receipt-shape validators:
+        # the Rust driver's M4 envelope preserves the receipt verbatim
+        # under `payload.receipt.raw_frames` (one entry per wire command)
+        # and does not populate canonical `goods`/`payments`/`service_sum`.
+        # Audit uses raw_frames; rich structural parse is a separate
+        # future sprint.  CASH_WITHDRAWAL is not emitted by the Rust
+        # driver at all, so its bypass branch is unreachable but kept
+        # uniform for readability.
         violations: list[str] = []
-        if command.operation_type in {OperationType.SELL, OperationType.RETURN}:
+        maria304_bypass = command.protocol == Protocol.MARIA_304_NATIVE
+        if (
+            command.operation_type in {OperationType.SELL, OperationType.RETURN}
+            and not maria304_bypass
+        ):
             from ..validators.ua_receipt import validate_sell_return_receipt
             violations = validate_sell_return_receipt(command.payload)
-        if command.operation_type in {OperationType.SELL, OperationType.RETURN} and not violations:
+        if (
+            command.operation_type in {OperationType.SELL, OperationType.RETURN}
+            and not maria304_bypass
+            and not violations
+        ):
             from ..validators.ua_receipt import validate_excise_marks
             violations.extend(validate_excise_marks(command.payload))
-        elif command.operation_type in {OperationType.SERVICE_IN, OperationType.SERVICE_OUT}:
+        elif (
+            command.operation_type in {OperationType.SERVICE_IN, OperationType.SERVICE_OUT}
+            and not maria304_bypass
+        ):
             from ..validators.ua_receipt import validate_service_receipt
             violations = validate_service_receipt(command.payload)
-        elif command.operation_type == OperationType.CASH_WITHDRAWAL:
+        elif (
+            command.operation_type == OperationType.CASH_WITHDRAWAL
+            and not maria304_bypass
+        ):
             from ..validators.ua_receipt import validate_cash_withdrawal_receipt
             violations = validate_cash_withdrawal_receipt(command.payload)
         if violations:
