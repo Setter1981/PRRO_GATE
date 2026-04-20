@@ -77,7 +77,6 @@ pub enum SysKey {
 }
 
 impl SysKey {
-    #[must_use]
     fn code(self) -> u8 {
         match self {
             Self::Off => 0,
@@ -103,7 +102,6 @@ pub enum ExpectedCmd {
 }
 
 impl ExpectedCmd {
-    #[must_use]
     fn as_char(self) -> char {
         match self {
             Self::Idle => ' ',

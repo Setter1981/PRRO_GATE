@@ -61,16 +61,22 @@ pub enum ErrorCode {
     /// Device is locked (service-limit, day-limit, crypto issue).
     SoftLocked,
     /// Vendor-specific or not-yet-enumerated wire code.
-    Custom(&'static str),
+    ///
+    /// Owns its string so `ErrorCode::parse` cannot leak memory under
+    /// adversarial input (cf. DRV-1: the driver must not grow
+    /// unboundedly from untrusted peers).
+    Custom(String),
 }
 
 impl ErrorCode {
     /// Wire identifier — what goes inside the response frame payload.
     ///
     /// The payload for an error frame is just this identifier (4–10
-    /// ASCII bytes), framing is added by the wire codec.
+    /// ASCII bytes), framing is added by the wire codec.  Returned as
+    /// `&str` which borrows from either the enum's static table or the
+    /// owned `String` inside [`Self::Custom`].
     #[must_use]
-    pub fn as_wire(&self) -> &'static str {
+    pub fn as_wire(&self) -> &str {
         match self {
             Self::SoftBlock => "SOFTBLOCK",
             Self::SoftBadCs => "SOFTBADCS",
@@ -86,7 +92,7 @@ impl ErrorCode {
             Self::SoftOfflBufFull => "SOFTOFFLBF",
             Self::SoftOfflDup => "SOFTOFFLDP",
             Self::SoftLocked => "SOFTLOCKED",
-            Self::Custom(s) => s,
+            Self::Custom(s) => s.as_str(),
         }
     }
 
@@ -94,7 +100,8 @@ impl ErrorCode {
     ///
     /// Returns `None` when the identifier is empty or shorter than the
     /// 4-char `SOFT` prefix.  Unknown but well-formed identifiers are
-    /// accepted as [`ErrorCode::Custom`].
+    /// accepted as [`ErrorCode::Custom`] and own a cloned `String` — no
+    /// heap leak, unlike the previous `Box::leak`-based impl.
     #[must_use]
     pub fn parse(wire: &str) -> Option<Self> {
         if wire.len() < 4 {
@@ -121,12 +128,7 @@ impl ErrorCode {
                 return Some(code.clone());
             }
         }
-        // Unknown SOFT* variant — keep as Custom so the session layer
-        // can still react meaningfully.
-        // The leaked `&'static str` allocation is one-per-unknown-code
-        // and survives the process lifetime — acceptable for an edge
-        // path that should be rare.
-        Some(Self::Custom(Box::leak(wire.to_string().into_boxed_str())))
+        Some(Self::Custom(wire.to_string()))
     }
 
     /// Whether the higher-level caller should consider the underlying
@@ -233,7 +235,44 @@ mod tests {
     #[test]
     fn display_uses_wire_identifier() {
         assert_eq!(format!("{}", ErrorCode::SoftBlock), "SOFTBLOCK");
-        assert_eq!(format!("{}", ErrorCode::Custom("SOFTX")), "SOFTX");
+        assert_eq!(
+            format!("{}", ErrorCode::Custom("SOFTX".to_string())),
+            "SOFTX",
+        );
+    }
+
+    // Regression test for the Box::leak landmine removed in M2 review —
+    // parsing the same unknown code 1000 times must not grow heap
+    // unboundedly.  We cannot measure allocator state directly in a
+    // unit test, but we CAN prove the ownership model changed: the
+    // previous `Custom(&'static str)` meant every leak survived for
+    // the process lifetime; now `Custom(String)` means each parse call
+    // owns its string and drops normally when the value is dropped.
+    #[test]
+    fn custom_variant_owns_its_string() {
+        let s: String = "SOFTREGRESS".to_string();
+        let code = ErrorCode::parse(&s).unwrap();
+        // Drop the source — if Custom borrowed, this wouldn't compile.
+        drop(s);
+        assert_eq!(code.as_wire(), "SOFTREGRESS");
+    }
+
+    #[test]
+    fn repeated_parsing_of_same_unknown_produces_equal_values() {
+        // Cheap canary against regressions that would make each call
+        // mint a unique identity (e.g. accidental interning with
+        // counter suffix).
+        let a = ErrorCode::parse("SOFTFOOBAR").unwrap();
+        let b = ErrorCode::parse("SOFTFOOBAR").unwrap();
+        let c = ErrorCode::parse("SOFTFOOBAR").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn parse_ascii_digits_in_custom_preserves_exact_bytes() {
+        let got = ErrorCode::parse("SOFTX999").unwrap();
+        assert_eq!(got.as_wire(), "SOFTX999");
     }
 
     #[test]

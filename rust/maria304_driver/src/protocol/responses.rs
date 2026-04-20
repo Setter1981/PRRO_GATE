@@ -41,18 +41,42 @@ pub enum Response {
     Error(ErrorCode),
     /// Command-specific data payload (e.g. `CONF` state dump, `COMP`
     /// fiscal numbers).  The string is the full frame payload
-    /// including the 4-char command echo (e.g. `"CONF<194-char body>"`).
+    /// including the 4-char command echo (e.g. `"CONF<148-char body>"`).
+    ///
+    /// Construct with [`Response::data`] — the public constructor
+    /// validates length at construction time.  The enum variant is
+    /// intentionally public so tests and `admin replay` can feed raw
+    /// captured bytes, but production code should go through the
+    /// checked constructor.
     Data(String),
 }
 
 impl Response {
+    /// Construct a validated [`Response::Data`].
+    ///
+    /// Surfaces wire-framing errors at construction time instead of
+    /// deferring them to [`Self::to_wire`] — closes the "silent
+    /// invalid response" landmine flagged in the M2 review.
+    ///
+    /// # Errors
+    /// [`FrameError::InvalidCmdLen`] if the CP866-encoded length of
+    /// `payload` falls outside the protocol-defined 4..=252-byte range.
+    pub fn data(payload: impl Into<String>) -> Result<Self, FrameError> {
+        let s = payload.into();
+        // The wire codec validates byte length after CP866 conversion.
+        // Running through encode_frame is the most direct proof that
+        // the payload is admissible — we just discard the bytes.
+        let _probe = encode_frame(&s, false)?;
+        Ok(Self::Data(s))
+    }
+
     /// Produce the exact byte sequence for the wire.
     ///
     /// # Errors
     /// [`FrameError::InvalidCmdLen`] if the payload would fall outside
-    /// the protocol-defined 4..=252-byte range.  This can only happen
-    /// for [`Response::Data`] with a caller-supplied payload; the other
-    /// variants are internally bounded.
+    /// the protocol-defined 4..=252-byte range.  For variants other
+    /// than [`Self::Data`] this is impossible — their payloads are
+    /// internally bounded to 3..=10 chars plus NUL padding.
     pub fn to_wire(&self, with_crc: bool) -> Result<Vec<u8>, FrameError> {
         encode_frame(&self.as_payload_string(), with_crc)
     }
@@ -127,7 +151,7 @@ mod tests {
 
     #[test]
     fn error_wire_padded_for_short_custom_codes() {
-        let short = Response::Error(ErrorCode::Custom("ERR"));
+        let short = Response::Error(ErrorCode::Custom("ERR".to_string()));
         assert_eq!(short.as_payload_string(), "ERR\0");
     }
 
@@ -157,7 +181,7 @@ mod tests {
             Response::Done,
             Response::Error(ErrorCode::SoftBlock),
             Response::Error(ErrorCode::SoftBadArt),
-            Response::Error(ErrorCode::Custom("SOFTX")),
+            Response::Error(ErrorCode::Custom("SOFTX".to_string())),
         ] {
             for with_crc in [false, true] {
                 let text = roundtrip(&resp, with_crc);
@@ -193,6 +217,40 @@ mod tests {
             FrameError::InvalidCmdLen(253) => {}
             other => panic!("expected InvalidCmdLen(253), got {other:?}"),
         }
+    }
+
+    // ── Data() validated-constructor tests (post-M2 review) ─────────
+
+    #[test]
+    fn data_constructor_accepts_valid_payload() {
+        // 4 bytes is the minimum accepted by the wire codec.
+        let r = Response::data("COMP").expect("minimum 4-char payload must validate");
+        assert_eq!(r.as_payload_string(), "COMP");
+    }
+
+    #[test]
+    fn data_constructor_rejects_short_payload_at_construction() {
+        // Rejects at construction time instead of deferring to to_wire.
+        let err = Response::data("abc").unwrap_err();
+        match err {
+            FrameError::InvalidCmdLen(3) => {}
+            other => panic!("expected InvalidCmdLen(3), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn data_constructor_rejects_over_252_char_payload() {
+        let err = Response::data("x".repeat(253)).unwrap_err();
+        match err {
+            FrameError::InvalidCmdLen(253) => {}
+            other => panic!("expected InvalidCmdLen(253), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn data_constructor_exact_boundary_252_bytes_accepted() {
+        let r = Response::data("y".repeat(252)).expect("252-byte payload must validate");
+        assert_eq!(r.as_payload_string().len(), 252);
     }
 
     #[test]

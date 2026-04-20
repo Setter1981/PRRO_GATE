@@ -183,6 +183,44 @@ pub enum Command {
         opcode: String,
         body: String,
     },
+    /// Opcode recognised but parameters are malformed — wrong length,
+    /// bad encoding, etc.  Dispatcher replies with the opcode-specific
+    /// `SOFT*` error rather than a blanket `DONE` (which is what
+    /// `Unknown` gets).
+    InvalidParams {
+        opcode: String,
+        body: String,
+    },
+}
+
+/// Split a `&str` after the first `n` *characters* (not bytes).
+///
+/// Returns `None` when the input has fewer than `n` chars — caller
+/// decides whether that's an error.  Never panics on multi-byte UTF-8,
+/// unlike `body[..n]` byte slicing.
+fn split_at_nth_char(s: &str, n: usize) -> Option<(&str, &str)> {
+    if n == 0 {
+        return Some(("", s));
+    }
+    let mut iter = s.char_indices();
+    for _ in 0..n - 1 {
+        iter.next()?;
+    }
+    // At this point iter.next() yields the nth char; we want the byte
+    // offset *after* that char — use char_indices position of (n+1)th,
+    // or fall through to end-of-string if the nth is the last.
+    match iter.nth(1) {
+        Some((idx, _)) => Some(s.split_at(idx)),
+        None => {
+            // Confirm we actually consumed n chars (guards against
+            // fewer-than-n inputs that happen to align to n-1).
+            if s.chars().count() == n {
+                Some((s, ""))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 impl Command {
@@ -208,10 +246,25 @@ impl Command {
     #[must_use]
     #[allow(clippy::too_many_lines)] // Large dispatch is the point of the function.
     pub fn parse_text(text: &str) -> Self {
-        if text.len() < 4 {
-            return Self::Unknown { opcode: text.to_string(), body: String::new() };
+        // Char-count guard (not byte-count) — protects against a 3-char
+        // multi-byte input (6 bytes) whose byte-level `.len() >= 4`
+        // would pass but `split_at(4)` would panic on a char boundary.
+        let char_count = text.chars().count();
+        if char_count < 4 {
+            return Self::Unknown {
+                opcode: text.to_string(),
+                body: String::new(),
+            };
         }
-        let (opcode, body) = text.split_at(4);
+        // All opcodes in the Maria protocol are ASCII 4-char — if the
+        // first 4 chars contain non-ASCII, it cannot be a real opcode,
+        // so treat the whole thing as Unknown safely.
+        let Some((opcode, body)) = split_at_nth_char(text, 4) else {
+            return Self::Unknown {
+                opcode: text.to_string(),
+                body: String::new(),
+            };
+        };
         let body_owned = body.to_string();
 
         match opcode {
@@ -221,18 +274,38 @@ impl Command {
                 _ => Self::Unknown { opcode: opcode.into(), body: body_owned },
             },
             "SYNC" => Self::Sync,
-            "UPAS" if body.len() >= 10 => Self::Upas {
-                password: body[..10].to_string(),
-                cashier_id: body[10..].to_string(),
-            },
-            "SVSL" if !body.is_empty() => Self::Svsl {
-                mode: body.chars().next().unwrap(),
-                password: if body.len() >= 5 {
-                    Some(body[1..5].to_string())
+            "UPAS" => {
+                // Password is 10 ASCII chars per protocol §5.1; cashier_id
+                // is arbitrary (may be Cyrillic).  Char-split is used to
+                // survive malformed non-ASCII passwords (fuzz input).
+                if let Some((password, cashier_id)) = split_at_nth_char(body, 10) {
+                    Self::Upas {
+                        password: password.to_string(),
+                        cashier_id: cashier_id.to_string(),
+                    }
                 } else {
-                    None
-                },
-            },
+                    Self::InvalidParams {
+                        opcode: opcode.into(),
+                        body: body_owned,
+                    }
+                }
+            }
+            "SVSL" => {
+                let mut chars = body.chars();
+                match chars.next() {
+                    Some(mode) => {
+                        // Remaining body after the mode char — safe char-based offset.
+                        let after_mode = chars.as_str();
+                        let password = split_at_nth_char(after_mode, 4)
+                            .map(|(pwd, _)| pwd.to_string());
+                        Self::Svsl { mode, password }
+                    }
+                    None => Self::InvalidParams {
+                        opcode: opcode.into(),
+                        body: body_owned,
+                    },
+                }
+            }
 
             "CONF" => Self::Conf,
             "CONf" => Self::ConfLower,
@@ -245,12 +318,23 @@ impl Command {
 
             "PREP" => Self::Prep(body_owned),
             "BCHN" => Self::Bchn(body_owned),
-            "CVAR" => Self::Cvar(body_owned),
+            "CVAL" => Self::Cvar(body_owned),
             "GRBG" => Self::Grbg(body_owned),
-            "GREN" => Self::Gren {
-                discount_name: if body.len() >= 22 { Some(body[..22].to_string()) } else { None },
-                upcount_name: if body.len() > 22 { Some(body[22..].to_string()) } else { None },
-            },
+            "GREN" => {
+                // Discount & upcount names are CHAR-count-bounded (22 symbols
+                // per protocol) and may contain Cyrillic — we must never
+                // byte-slice here.
+                match split_at_nth_char(body, 22) {
+                    Some((discount, upcount)) => Self::Gren {
+                        discount_name: if discount.is_empty() { None } else { Some(discount.to_string()) },
+                        upcount_name: if upcount.is_empty() { None } else { Some(upcount.to_string()) },
+                    },
+                    None => Self::Gren {
+                        discount_name: if body.is_empty() { None } else { Some(body_owned.clone()) },
+                        upcount_name: None,
+                    },
+                }
+            }
             "COMP" => Self::Comp(body_owned),
             "CANC" => Self::Cnac,
             "CTXT" => Self::Ctxt,
@@ -275,38 +359,67 @@ impl Command {
             "PSDt" => Self::Psdt(body_owned),
             "CSHG" => Self::Cshg(body_owned),
 
-            "CAIO" if body.len() >= 11 => {
-                // CAIO is the real 4-char opcode; first body char is
-                // direction ('I' = in, 'O' = out), next 10 chars are
-                // decimal sum, rest is description.
-                let dir = body.chars().next().unwrap();
-                let sum: u64 = body[1..11].parse().unwrap_or(0);
-                let desc = body[11..].to_string();
+            "CAIO" => {
+                // Body layout: <direction 1 char ASCII><sum 10 ASCII digits><desc ...>
+                // Use char-split so a malformed non-ASCII description cannot
+                // panic the parser via byte slicing mid-char.
+                let Some((direction_and_sum, description)) = split_at_nth_char(body, 11) else {
+                    return Self::InvalidParams {
+                        opcode: opcode.into(),
+                        body: body_owned,
+                    };
+                };
+                let mut prefix_chars = direction_and_sum.chars();
+                let Some(dir) = prefix_chars.next() else {
+                    return Self::InvalidParams {
+                        opcode: opcode.into(),
+                        body: body_owned,
+                    };
+                };
+                let sum_str: String = prefix_chars.collect();
+                let sum: u64 = sum_str.parse().unwrap_or(0);
+                let desc = description.to_string();
                 match dir {
                     'I' => Self::Caioi { sum_kopecks: sum, description: desc },
                     'O' => Self::Caioo { sum_kopecks: sum, description: desc },
-                    _ => Self::Unknown { opcode: opcode.into(), body: body_owned },
+                    _ => Self::InvalidParams { opcode: opcode.into(), body: body_owned },
                 }
             }
             "ZREP" => Self::Zrep,
             "NREP" => Self::Nrep,
             "nrep" => Self::NrepLowercase,
-            "FIRN" if body.len() >= 8 => Self::Firn {
-                first: body[..4].parse().unwrap_or(0),
-                last: body[4..8].parse().unwrap_or(0),
-            },
-            "FIRP" if body.len() >= 16 => Self::Firp {
-                from: body[..8].to_string(),
-                to: body[8..16].to_string(),
-            },
-            "IREN" if body.len() >= 8 => Self::Iren {
-                first: body[..4].parse().unwrap_or(0),
-                last: body[4..8].parse().unwrap_or(0),
-            },
-            "IREP" if body.len() >= 16 => Self::Irep {
-                from: body[..8].to_string(),
-                to: body[8..16].to_string(),
-            },
+            "FIRN" | "IREN" => {
+                // Body: two D4 decimal Z-report numbers (8 ASCII chars).
+                match split_at_nth_char(body, 4)
+                    .and_then(|(a, rest)| split_at_nth_char(rest, 4).map(|(b, _)| (a, b)))
+                {
+                    Some((a, b)) => {
+                        let first = a.parse().unwrap_or(0);
+                        let last = b.parse().unwrap_or(0);
+                        if opcode == "FIRN" {
+                            Self::Firn { first, last }
+                        } else {
+                            Self::Iren { first, last }
+                        }
+                    }
+                    None => Self::InvalidParams { opcode: opcode.into(), body: body_owned },
+                }
+            }
+            "FIRP" | "IREP" => {
+                // Body: two yyyyMMdd strings (16 ASCII chars).
+                match split_at_nth_char(body, 8)
+                    .and_then(|(from, rest)| split_at_nth_char(rest, 8).map(|(to, _)| (from, to)))
+                {
+                    Some((from, to)) => {
+                        if opcode == "FIRP" {
+                            Self::Firp { from: from.to_string(), to: to.to_string() }
+                        } else {
+                            Self::Irep { from: from.to_string(), to: to.to_string() }
+                        }
+                    }
+                    None => Self::InvalidParams { opcode: opcode.into(), body: body_owned },
+                }
+            }
             "ARTZ" => Self::Artz,
             "DIZV" => Self::Dizv,
             "NULL" => Self::Null,
@@ -380,9 +493,15 @@ mod tests {
     }
 
     #[test]
-    fn upas_short_password_falls_through_to_unknown() {
-        let c = parse("UPASshort"); // only 9 chars after opcode
-        assert!(matches!(c, Command::Unknown { .. }));
+    fn upas_short_password_surfaces_as_invalid_params() {
+        let c = parse("UPASshort"); // only 5 chars after opcode
+        match c {
+            Command::InvalidParams { opcode, body } => {
+                assert_eq!(opcode, "UPAS");
+                assert_eq!(body, "short");
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
     }
 
     #[test]
@@ -493,6 +612,167 @@ mod tests {
         assert_eq!(parse("nrep"), Command::NrepLowercase);
     }
 
+    // ── UTF-8 safety regression tests (post-M2 review) ────────────
+
+    #[test]
+    fn upas_with_cyrillic_cashier_id_does_not_panic() {
+        // This was a panic vector in the first M2 draft: byte-slicing
+        // `body[..10]` would split multi-byte UTF-8 char boundaries on
+        // a non-ASCII cashier suffix.
+        let c = parse("UPAS1111111111Касир");
+        match c {
+            Command::Upas { password, cashier_id } => {
+                assert_eq!(password, "1111111111");
+                assert_eq!(cashier_id, "Касир");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn upas_with_malformed_non_ascii_password_does_not_panic() {
+        // Buggy / adversarial client sends Cyrillic in the password
+        // position.  Driver must not crash — the char-based split
+        // preserves the original bytes verbatim.
+        let c = parse("UPAS123456789Кextra"); // 9 ASCII + 'К' (2 bytes) + 'extra'
+        match c {
+            Command::Upas { password, cashier_id } => {
+                // 10 chars taken — password = 9 ASCII digits + 'К'
+                assert_eq!(password.chars().count(), 10);
+                assert!(password.starts_with("123456789"));
+                assert_eq!(cashier_id, "extra");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn upas_fewer_than_10_chars_is_invalid_params_not_panic() {
+        let c = parse("UPAS1234");
+        match c {
+            Command::InvalidParams { opcode, .. } => assert_eq!(opcode, "UPAS"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn gren_with_22_cyrillic_chars_splits_correctly() {
+        // 22 Cyrillic chars = 44 UTF-8 bytes.  Byte-slicing would crash
+        // or produce half-length strings; char-splitting gets it right.
+        let twenty_two_cyrillic = "ддддддддддддддддддддддУ"; // 22 'д' + 'У' as upcount start
+        assert_eq!(twenty_two_cyrillic.chars().count(), 23);
+        let input = format!("GREN{twenty_two_cyrillic}");
+        let c = parse(&input);
+        match c {
+            Command::Gren { discount_name, upcount_name } => {
+                // First 22 chars of body → discount; remainder ('У') → upcount.
+                assert_eq!(
+                    discount_name.as_deref(),
+                    Some("дддддддддддддддддддддд"),
+                );
+                assert_eq!(upcount_name.as_deref(), Some("У"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn gren_with_fewer_than_22_chars_lands_full_body_in_discount() {
+        let c = parse("GRENshort");
+        match c {
+            Command::Gren { discount_name, upcount_name } => {
+                assert_eq!(discount_name.as_deref(), Some("short"));
+                assert_eq!(upcount_name, None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn svsl_with_cyrillic_mode_char_does_not_panic() {
+        // Protocol says mode is ASCII.  Malformed client may send
+        // Cyrillic — we must not crash.
+        let c = parse("SVSLА"); // 'А' = U+0410 = 2 UTF-8 bytes
+        match c {
+            Command::Svsl { mode, password } => {
+                assert_eq!(mode, 'А');
+                // Body after mode is empty, so password is None.
+                assert_eq!(password, None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn caio_with_cyrillic_description_does_not_panic() {
+        // Description after the 11 ASCII header chars may be Cyrillic.
+        let c = parse("CAIOI0000050000Каса ранок");
+        match c {
+            Command::Caioi { sum_kopecks, description } => {
+                assert_eq!(sum_kopecks, 50_000);
+                assert_eq!(description, "Каса ранок");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn caio_body_shorter_than_11_chars_is_invalid_params() {
+        let c = parse("CAIOI12345"); // only 6 chars after 'CAIO'
+        match c {
+            Command::InvalidParams { opcode, .. } => assert_eq!(opcode, "CAIO"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn caio_with_invalid_direction_char_surfaces_as_invalid_params() {
+        let c = parse("CAIOX0000050000desc");
+        match c {
+            Command::InvalidParams { opcode, .. } => assert_eq!(opcode, "CAIO"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn three_char_cyrillic_input_does_not_panic() {
+        // "абв" = 3 chars / 6 UTF-8 bytes.  The old `text.len() < 4`
+        // byte-level guard would pass (6 >= 4) and then `split_at(4)`
+        // would panic on a multi-byte boundary.  Char-level guard
+        // prevents this.
+        let c = parse("абв");
+        assert!(matches!(c, Command::Unknown { .. }));
+    }
+
+    #[test]
+    fn firn_with_bad_body_length_surfaces_as_invalid_params() {
+        let c = parse("FIRN0001"); // only 4 chars body, need 8
+        match c {
+            Command::InvalidParams { opcode, .. } => assert_eq!(opcode, "FIRN"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn firp_with_bad_body_length_surfaces_as_invalid_params() {
+        let c = parse("FIRP2026");
+        match c {
+            Command::InvalidParams { opcode, .. } => assert_eq!(opcode, "FIRP"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn cval_opcode_matches_decompiled_reference_not_cvar() {
+        // Resonance OLE DLL uses `CVAL` (currency setup).  An earlier
+        // draft of this parser mistyped it as `CVAR`.  This test pins
+        // the correct opcode so a regression trips immediately.
+        let c = parse("CVAL2USD1.00000000");
+        assert!(matches!(c, Command::Cvar(_)), "CVAL must parse, not fall through");
+    }
+
+    // ── Inventory guard (unchanged) ───────────────────────────────
+
     #[test]
     fn every_real_opcode_parses_to_a_non_unknown_variant() {
         // Inventory check — this list must include every opcode the
@@ -501,7 +781,7 @@ mod tests {
         for opcode in [
             "CSIN1", "SYNC", "UPAS1111111111", "SVSL1",
             "CONF", "CONf", "GETD", "GLCN", "CCAS", "CFIS", "CNAL", "ARTD0001",
-            "PREP1", "BCHN123", "GRBG grp",
+            "PREP1", "BCHN123", "CVAL2USD1.00000000", "GRBG grp",
             "GREN                      ", // 26 chars body
             "COMP0000000000000000000000000000000000000000000000000000000000",
             "CANC", "CTXT", "FINF name", "TGCD 123456789",
