@@ -230,4 +230,147 @@ mod tests {
         let err = map_status(status);
         assert!(matches!(err, GrpcError::Status { .. }));
     }
+
+    // ── A. Invalid endpoint URI ────────────────────────────────────────────────
+
+    #[test]
+    fn build_channel_invalid_uri_returns_transport_error() {
+        // Endpoint::from_shared rejects non-URI strings immediately.
+        // DpsGrpcPool::new is sync (uses connect_lazy), so no async runtime needed.
+        use crate::config::DpsEndpoint;
+        let bad_cfg = DpsEndpoint {
+            endpoint:  "not a valid uri at all !!!".to_string(),
+            ca_bundle: None,
+        };
+        let valid_cfg = DpsEndpoint {
+            endpoint:  "https://example.com:9443".to_string(),
+            ca_bundle: None,
+        };
+        let result = DpsGrpcPool::new(&bad_cfg, &valid_cfg);
+        assert!(
+            result.is_err(),
+            "invalid URI must produce Err from DpsGrpcPool::new, got Ok"
+        );
+        // Endpoint::from_shared produces tonic::transport::Error which maps via From impl
+        // to GrpcError::Transport.
+        // Use .err().unwrap() to avoid the T: Debug bound that unwrap_err() requires.
+        let err = result.err().unwrap();
+        assert!(
+            matches!(err, GrpcError::Transport(_)),
+            "invalid URI error must be GrpcError::Transport, got: {err}"
+        );
+    }
+
+    // ── B. connect_lazy succeeds with unreachable endpoints ───────────────────
+
+    #[tokio::test]
+    async fn build_pool_succeeds_even_if_endpoints_unreachable() {
+        // connect_lazy() defers TCP handshake but internally registers with the
+        // Tokio reactor — a runtime context is required even for construction.
+        // Construction must succeed for valid URI format even when no server is listening.
+        use crate::config::DpsEndpoint;
+        let cfg_prod = DpsEndpoint {
+            endpoint:  "https://127.0.0.1:19999".to_string(), // nothing listening here
+            ca_bundle: None,
+        };
+        let cfg_test = DpsEndpoint {
+            endpoint:  "https://127.0.0.1:19998".to_string(), // nothing listening here
+            ca_bundle: None,
+        };
+        let result = DpsGrpcPool::new(&cfg_prod, &cfg_test);
+        assert!(
+            result.is_ok(),
+            "connect_lazy must allow construction without a live server"
+        );
+    }
+
+    // ── C. classify_dps_status edge cases — all named codes individually ──────
+
+    #[test]
+    fn classify_all_named_dps_codes_individually() {
+        // Verify each named code produces the correct category.
+        // Catches accidental regressions if match arms are reordered.
+        let transient_codes = [-3i32, -4, -12];
+        let permanent_codes = [-1i32, -2, -5, -6, -7, -8, -9, -10, -11, -13, -14, -15, -16];
+
+        for &code in &transient_codes {
+            assert_eq!(
+                classify_dps_status(code),
+                Some(DpsErrorCategory::Transient),
+                "code {code} must be Transient"
+            );
+        }
+        for &code in &permanent_codes {
+            assert_eq!(
+                classify_dps_status(code),
+                Some(DpsErrorCategory::Permanent),
+                "code {code} must be Permanent"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_extreme_negative_code_is_permanent() {
+        // Future/unknown codes fall to the wildcard arm — must be Permanent (no retry).
+        assert_eq!(
+            classify_dps_status(-999),
+            Some(DpsErrorCategory::Permanent),
+            "unknown code -999 must be Permanent via wildcard"
+        );
+        assert_eq!(
+            classify_dps_status(i32::MIN),
+            Some(DpsErrorCategory::Permanent),
+            "i32::MIN must be Permanent via wildcard"
+        );
+        assert_eq!(
+            classify_dps_status(999),
+            Some(DpsErrorCategory::Permanent),
+            "positive unknown code 999 must be Permanent"
+        );
+    }
+
+    #[test]
+    fn classify_status_2_is_permanent() {
+        // Status 2 is not in the named list — falls to wildcard.
+        assert_eq!(
+            classify_dps_status(2),
+            Some(DpsErrorCategory::Permanent)
+        );
+    }
+
+    // ── D. map_status for specific gRPC codes ─────────────────────────────────
+
+    #[test]
+    fn cancelled_status_maps_to_status_variant_not_deadline() {
+        // Only DeadlineExceeded maps to GrpcError::Deadline — Cancelled must NOT.
+        let status = tonic::Status::cancelled("operation cancelled");
+        let err = map_status(status);
+        assert!(
+            matches!(err, GrpcError::Status { .. }),
+            "Cancelled must map to Status, not Deadline"
+        );
+    }
+
+    #[test]
+    fn internal_status_maps_to_status_variant() {
+        let status = tonic::Status::internal("internal server error");
+        let err = map_status(status);
+        assert!(matches!(err, GrpcError::Status { .. }));
+    }
+
+    #[test]
+    fn status_variant_preserves_code_and_message() {
+        let status = tonic::Status::not_found("fiscal number not registered");
+        let err = map_status(status);
+        match err {
+            GrpcError::Status { code, message } => {
+                assert!(code != 0, "code must be non-zero for non-OK status");
+                assert!(
+                    message.contains("fiscal number not registered"),
+                    "message must be preserved, got: {message}"
+                );
+            }
+            other => panic!("expected Status variant, got {other:?}"),
+        }
+    }
 }

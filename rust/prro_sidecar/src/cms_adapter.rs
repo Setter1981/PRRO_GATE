@@ -238,4 +238,167 @@ mod tests {
         let url = resolve_tsp_url(&conn, "O=АЦСК ІДДС").unwrap();
         assert_eq!(url, "http://acskidd.gov.ua/services/tsp/");
     }
+
+    // ── A. TSP URL NULL in database — row must not match ─────────────────────
+
+    #[test]
+    fn resolve_tsp_null_tsp_url_not_matched() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ca_endpoints (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                cmp_url TEXT, tsp_url TEXT, ocsp_url TEXT,
+                issuer_pattern TEXT,
+                priority INTEGER NOT NULL DEFAULT 100,
+                enabled INTEGER NOT NULL DEFAULT 1
+            );
+            -- Row with NULL tsp_url: must NOT be returned even if pattern matches
+            INSERT INTO ca_endpoints VALUES
+                (1,'null_tsp',NULL,NULL,NULL,'testissuer',10,1);",
+        ).unwrap();
+
+        let err = resolve_tsp_url(&conn, "CN=Test, O=TestIssuer, C=UA").unwrap_err();
+        assert!(
+            matches!(err, CmsAdapterError::NoTspMapping { .. }),
+            "NULL tsp_url must not be returned: got {err}"
+        );
+    }
+
+    // ── B. Empty issuer_pattern matches ANY issuer ────────────────────────────
+
+    #[test]
+    fn resolve_tsp_empty_pattern_matches_any_issuer() {
+        // INSTR(haystack, '') is always 1 in SQLite — empty string always found.
+        // An empty issuer_pattern is an overly-broad match — verify this behavior.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ca_endpoints (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                cmp_url TEXT, tsp_url TEXT, ocsp_url TEXT,
+                issuer_pattern TEXT,
+                priority INTEGER NOT NULL DEFAULT 100,
+                enabled INTEGER NOT NULL DEFAULT 1
+            );
+            INSERT INTO ca_endpoints VALUES
+                (1,'catch_all',NULL,'https://catch-all.example.com/tsp/',NULL,'',10,1);",
+        ).unwrap();
+
+        // Any issuer DN must match the empty pattern
+        let url = resolve_tsp_url(&conn, "CN=Anyone, O=AnyOrg, C=UA").unwrap();
+        assert_eq!(
+            url, "https://catch-all.example.com/tsp/",
+            "empty issuer_pattern must match any issuer DN via INSTR"
+        );
+    }
+
+    // ── C. extract_issuer_dn with empty bytes ─────────────────────────────────
+
+    #[test]
+    fn extract_issuer_dn_empty_input_returns_error() {
+        let result = extract_issuer_dn(&[]);
+        assert!(
+            result.is_err(),
+            "empty DER input must return CertParse error"
+        );
+        assert!(
+            matches!(result.unwrap_err(), CmsAdapterError::CertParse(_)),
+            "error type must be CertParse"
+        );
+    }
+
+    // ── D. extract_issuer_dn with truncated DER ───────────────────────────────
+
+    #[test]
+    fn extract_issuer_dn_truncated_to_few_bytes_returns_error() {
+        // A real X.509 cert DER starts with SEQUENCE tag (0x30) followed by length.
+        // Truncated to just 4 bytes cannot contain a valid TBS structure.
+        let truncated = [0x30u8, 0x82, 0x04, 0x00]; // SEQUENCE header only, no content
+        let result = extract_issuer_dn(&truncated);
+        assert!(
+            result.is_err(),
+            "truncated DER (4 bytes) must return error, got Ok"
+        );
+    }
+
+    // ── E. issuer_pattern with LIKE metacharacters — INSTR treats them literally
+
+    #[test]
+    fn resolve_tsp_issuer_pattern_with_like_metacharacters_does_not_inject() {
+        // With INSTR, "%" is treated literally — only matches if '%' appears in the issuer DN.
+        // (With the old LIKE approach, issuer_pattern = "%" would match everything.)
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ca_endpoints (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                cmp_url TEXT, tsp_url TEXT, ocsp_url TEXT,
+                issuer_pattern TEXT,
+                priority INTEGER NOT NULL DEFAULT 100,
+                enabled INTEGER NOT NULL DEFAULT 1
+            );
+            -- Pattern with LIKE wildcard — with INSTR this must only match if '%' is in the DN
+            INSERT INTO ca_endpoints VALUES
+                (1,'percent_ca',NULL,'https://percent.example.com/tsp/',NULL,'%',10,1);",
+        ).unwrap();
+
+        // A normal issuer DN (no '%') must NOT match this pattern with INSTR
+        let result = resolve_tsp_url(&conn, "CN=Normal CA, O=NormalOrg, C=UA");
+        assert!(
+            result.is_err(),
+            "LIKE metachar '%' in issuer_pattern must not match via INSTR (treated literally)"
+        );
+    }
+
+    #[test]
+    fn resolve_tsp_issuer_dn_with_percent_char_matches_percent_pattern() {
+        // Inverse: if the issuer DN literally contains '%', the pattern '%' matches.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ca_endpoints (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                cmp_url TEXT, tsp_url TEXT, ocsp_url TEXT,
+                issuer_pattern TEXT,
+                priority INTEGER NOT NULL DEFAULT 100,
+                enabled INTEGER NOT NULL DEFAULT 1
+            );
+            INSERT INTO ca_endpoints VALUES
+                (1,'percent_ca',NULL,'https://percent.example.com/tsp/',NULL,'%',10,1);",
+        ).unwrap();
+
+        // Issuer DN that literally contains '%' must match the '%' pattern
+        let url = resolve_tsp_url(&conn, "CN=CA 100% Trusted, O=Org, C=UA");
+        assert!(url.is_ok(), "DN containing '%' must match pattern '%' via INSTR");
+    }
+
+    // ── F. Priority ordering: lower number wins ───────────────────────────────
+
+    #[test]
+    fn resolve_tsp_multiple_matching_patterns_lowest_priority_wins() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ca_endpoints (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                cmp_url TEXT, tsp_url TEXT, ocsp_url TEXT,
+                issuer_pattern TEXT,
+                priority INTEGER NOT NULL DEFAULT 100,
+                enabled INTEGER NOT NULL DEFAULT 1
+            );
+            -- Two rows where both patterns match the same issuer DN:
+            -- 'test' appears in 'testcorp' and 'corp' also appears in 'testcorp'
+            INSERT INTO ca_endpoints VALUES
+                (1,'high_priority',NULL,'https://first.example.com/tsp/',NULL,'test',10,1),
+                (2,'low_priority', NULL,'https://second.example.com/tsp/',NULL,'corp',20,1);",
+        ).unwrap();
+
+        // priority=10 wins over priority=20 (ORDER BY priority ASC → smallest first)
+        let url = resolve_tsp_url(&conn, "testcorp").unwrap();
+        assert_eq!(
+            url, "https://first.example.com/tsp/",
+            "priority=10 must beat priority=20 (ASC order, smaller = higher priority)"
+        );
+    }
 }

@@ -729,4 +729,229 @@ mod tests {
         // The second insert has a higher id — must win.
         assert_eq!(op.operator_inn, "2222222222", "ORDER BY id DESC must return last inserted");
     }
+
+    // ── FiscalMode::Prod from DB ──────────────────────────────────────────────
+
+    #[test]
+    fn fiscal_mode_prod_variant_loaded() {
+        let repo = make_repo();
+        {
+            let conn = repo.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO fiscal_number_config
+                     (fiscal_number, tax_number, fiscal_mode,
+                      national_check_enabled, offline_enabled, tsp_enabled)
+                 VALUES ('FN_PROD', '1234567890', 'prod', 0, 1, 0)",
+                [],
+            ).unwrap();
+        }
+        let cfg = repo.load_fn_config("FN_PROD").unwrap();
+        assert_eq!(cfg.fiscal_mode, FiscalMode::Prod);
+    }
+
+    // ── CertMetadata::is_valid_at — full boundary matrix ─────────────────────
+
+    #[test]
+    fn cert_is_valid_at_within_valid_window() {
+        let meta = CertMetadata {
+            fiscal_number:    "FN1".into(),
+            cert_fingerprint: "fp".into(),
+            ski_hex:    "aa".into(),
+            source:     "local".into(),
+            valid_from: Some("2026-01-01T00:00:00Z".into()),
+            valid_to:   Some("2027-01-01T00:00:00Z".into()),
+            subject_dn: None,
+            issuer_dn:  None,
+        };
+        let now = time::OffsetDateTime::parse("2026-06-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339).unwrap();
+        assert!(meta.is_valid_at(now), "now within [valid_from, valid_to] must be true");
+    }
+
+    #[test]
+    fn cert_is_valid_at_expired() {
+        let meta = CertMetadata {
+            fiscal_number:    "FN1".into(),
+            cert_fingerprint: "fp".into(),
+            ski_hex:    "aa".into(),
+            source:     "local".into(),
+            valid_from: Some("2025-01-01T00:00:00Z".into()),
+            valid_to:   Some("2026-01-01T00:00:00Z".into()),
+            subject_dn: None,
+            issuer_dn:  None,
+        };
+        let now = time::OffsetDateTime::parse("2026-01-02T00:00:00Z",
+            &time::format_description::well_known::Rfc3339).unwrap();
+        assert!(!meta.is_valid_at(now), "now > valid_to must be false");
+    }
+
+    #[test]
+    fn cert_is_valid_at_exact_expiry_boundary_invalid() {
+        let meta = CertMetadata {
+            fiscal_number:    "FN1".into(),
+            cert_fingerprint: "fp".into(),
+            ski_hex:    "aa".into(),
+            source:     "local".into(),
+            valid_from: None,
+            valid_to:   Some("2026-04-20T12:00:00Z".into()),
+            subject_dn: None,
+            issuer_dn:  None,
+        };
+        // Exactly at valid_to — the condition is now > valid_to (exclusive)
+        // so exactly AT valid_to should still be valid (not yet expired)
+        let now_at = time::OffsetDateTime::parse("2026-04-20T12:00:00Z",
+            &time::format_description::well_known::Rfc3339).unwrap();
+        assert!(meta.is_valid_at(now_at), "exactly at valid_to should still be valid (> not >=)");
+        // One second past must be invalid
+        let now_past = time::OffsetDateTime::parse("2026-04-20T12:00:01Z",
+            &time::format_description::well_known::Rfc3339).unwrap();
+        assert!(!meta.is_valid_at(now_past), "one second past valid_to must be invalid");
+    }
+
+    #[test]
+    fn cert_is_valid_at_not_yet_valid() {
+        let meta = CertMetadata {
+            fiscal_number:    "FN1".into(),
+            cert_fingerprint: "fp".into(),
+            ski_hex:    "aa".into(),
+            source:     "local".into(),
+            valid_from: Some("2027-01-01T00:00:00Z".into()),
+            valid_to:   None,
+            subject_dn: None,
+            issuer_dn:  None,
+        };
+        let now = time::OffsetDateTime::parse("2026-12-31T23:59:59Z",
+            &time::format_description::well_known::Rfc3339).unwrap();
+        assert!(!meta.is_valid_at(now), "now < valid_from must be false");
+    }
+
+    #[test]
+    fn cert_is_valid_at_no_dates_always_valid() {
+        let meta = CertMetadata {
+            fiscal_number:    "FN1".into(),
+            cert_fingerprint: "fp".into(),
+            ski_hex:    "aa".into(),
+            source:     "local".into(),
+            valid_from: None,
+            valid_to:   None,
+            subject_dn: None,
+            issuer_dn:  None,
+        };
+        let now_past   = time::OffsetDateTime::UNIX_EPOCH;
+        let now_future = time::OffsetDateTime::parse("2099-12-31T23:59:59Z",
+            &time::format_description::well_known::Rfc3339).unwrap();
+        assert!(meta.is_valid_at(now_past),   "no dates: valid at UNIX epoch");
+        assert!(meta.is_valid_at(now_future), "no dates: valid in far future");
+    }
+
+    #[test]
+    fn cert_is_valid_at_unparseable_valid_to_treated_as_no_constraint() {
+        // Corrupted DB value: valid_to is not ISO-8601. parse returns None → constraint skipped → valid.
+        let meta = CertMetadata {
+            fiscal_number:    "FN1".into(),
+            cert_fingerprint: "fp".into(),
+            ski_hex:    "aa".into(),
+            source:     "local".into(),
+            valid_from: None,
+            valid_to:   Some("not-a-date".into()),
+            subject_dn: None,
+            issuer_dn:  None,
+        };
+        let now = time::OffsetDateTime::now_utc();
+        assert!(meta.is_valid_at(now), "unparseable valid_to must not block access");
+    }
+
+    // ── Multiple active operators — ORDER BY id DESC determinism (3 rows) ─────
+
+    #[test]
+    fn load_active_operator_three_rows_returns_highest_id() {
+        let repo = make_repo();
+        insert_fn(&repo, "FN1");
+        {
+            let conn = repo.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sidecar_operators
+                     (fiscal_number, operator_inn, jks_path, jks_password, operator_name, active)
+                 VALUES ('FN1', '11111', 'a.jks', 'pw1', 'Operator1', 1)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO sidecar_operators
+                     (fiscal_number, operator_inn, jks_path, jks_password, operator_name, active)
+                 VALUES ('FN1', '22222', 'b.jks', 'pw2', 'Operator2', 1)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO sidecar_operators
+                     (fiscal_number, operator_inn, jks_path, jks_password, operator_name, active)
+                 VALUES ('FN1', '33333', 'c.jks', 'pw3', 'Operator3', 1)",
+                [],
+            ).unwrap();
+        }
+        let op = repo.load_active_operator("FN1").unwrap();
+        // ORDER BY id DESC → last inserted (id=3, Operator3) must win
+        assert_eq!(op.operator_name.as_deref(), Some("Operator3"),
+            "ORDER BY id DESC must return highest-id row among multiple active operators");
+        assert_eq!(op.jks_path, "c.jks");
+    }
+
+    // ── fn_numbers / LicenseRow edge cases ───────────────────────────────────
+
+    #[test]
+    fn fn_numbers_empty_array_parses_to_empty_vec() {
+        let row = LicenseRow {
+            id:               1,
+            tin:              "1234567890".into(),
+            fn_numbers_json:  "[]".into(),
+            issued_at:        "2026-01-01T00:00:00Z".into(),
+            expires_at:       "2027-01-01T00:00:00Z".into(),
+            tier:             "demo".into(),
+            org_name:         None,
+            demo_limits_json: None,
+            payload_b64:      "x".into(),
+            signature_b64:    "y".into(),
+        };
+        let fns = row.fn_numbers().unwrap();
+        assert!(fns.is_empty(), "[] must parse to empty Vec");
+    }
+
+    #[test]
+    fn fn_numbers_json_with_numeric_elements_returns_error() {
+        let row = LicenseRow {
+            id:               1,
+            tin:              "1234567890".into(),
+            fn_numbers_json:  "[1, 2, 3]".into(),
+            issued_at:        "2026-01-01T00:00:00Z".into(),
+            expires_at:       "2027-01-01T00:00:00Z".into(),
+            tier:             "demo".into(),
+            org_name:         None,
+            demo_limits_json: None,
+            payload_b64:      "x".into(),
+            signature_b64:    "y".into(),
+        };
+        let result = row.fn_numbers();
+        assert!(result.is_err(), "numeric array elements must fail serde_json::from_str::<Vec<String>>");
+    }
+
+    // ── Mutex poison ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn mutex_poisoned_by_panic_returns_internal_error() {
+        use std::sync::Arc;
+        // Create a fresh repo, then poison its mutex by panicking inside a thread that holds the lock.
+        let repo = Arc::new(make_repo());
+        let repo2 = Arc::clone(&repo);
+        let _ = std::thread::spawn(move || {
+            let _guard = repo2.conn.lock().unwrap();
+            panic!("deliberate poison");
+        }).join(); // join returns Err because thread panicked
+
+        // Now the mutex is poisoned — any lock() call through the public API must
+        // surface as SidecarError::Internal (not a panic, not a hang).
+        let result = repo.load_fn_config("ANYTHING");
+        assert!(
+            matches!(result, Err(SidecarError::Internal(_))),
+            "poisoned mutex must produce SidecarError::Internal, got {result:?}"
+        );
+    }
 }

@@ -156,6 +156,12 @@ impl SidecarConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate process-wide env vars (DEV_MODE).
+    /// Rust test threads share the same process; concurrent env mutation causes
+    /// non-deterministic failures when the remove_var and set_var calls interleave.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     const EXAMPLE_TOML: &str = r#"
 [sidecar]
@@ -270,5 +276,175 @@ credentials_mode = "plain"
 "#;
         let cfg = SidecarConfig::from_toml_str(toml).expect("parse");
         assert_eq!(cfg.security.credentials_mode, CredentialsMode::Plain);
+    }
+
+    // ── dev.skip_sign guard ───────────────────────────────────────────────────
+
+    #[test]
+    fn dev_skip_sign_without_dev_mode_env_rejected() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("DEV_MODE");
+        let toml = r#"
+[sidecar]
+bind = "127.0.0.1:8765"
+[db]
+path = "/tmp/prro.db"
+[dps.prod]
+endpoint = "https://prod.example.com:9443"
+[dps.test]
+endpoint = "https://test.example.com:9443"
+[dev]
+skip_sign = true
+"#;
+        let err = SidecarConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation(_)),
+            "skip_sign=true without DEV_MODE must produce Validation error, got {err}"
+        );
+        assert!(
+            err.to_string().contains("DEV_MODE"),
+            "error must mention DEV_MODE, got: {err}"
+        );
+    }
+
+    #[test]
+    fn dev_skip_sign_with_dev_mode_env_accepted() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("DEV_MODE", "1");
+        let toml = r#"
+[sidecar]
+bind = "127.0.0.1:8765"
+[db]
+path = "/tmp/prro.db"
+[dps.prod]
+endpoint = "https://prod.example.com:9443"
+[dps.test]
+endpoint = "https://test.example.com:9443"
+[dev]
+skip_sign = true
+"#;
+        let result = SidecarConfig::from_toml_str(toml);
+        std::env::remove_var("DEV_MODE"); // cleanup
+        assert!(result.is_ok(), "skip_sign=true WITH DEV_MODE must succeed: {result:?}");
+        assert!(result.unwrap().dev.skip_sign);
+    }
+
+    // ── db.path validation ────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_db_path_rejected() {
+        let toml = r#"
+[sidecar]
+bind = "127.0.0.1:8765"
+[db]
+path = ""
+[dps.prod]
+endpoint = "https://prod.example.com:9443"
+[dps.test]
+endpoint = "https://test.example.com:9443"
+"#;
+        let err = SidecarConfig::from_toml_str(toml).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)), "empty db.path must be rejected: {err}");
+    }
+
+    #[test]
+    fn whitespace_only_db_path_rejected() {
+        let toml = r#"
+[sidecar]
+bind = "127.0.0.1:8765"
+[db]
+path = "   "
+[dps.prod]
+endpoint = "https://prod.example.com:9443"
+[dps.test]
+endpoint = "https://test.example.com:9443"
+"#;
+        let err = SidecarConfig::from_toml_str(toml).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)), "whitespace db.path must be rejected: {err}");
+    }
+
+    // ── dps endpoint validation ───────────────────────────────────────────────
+
+    #[test]
+    fn empty_dps_prod_endpoint_rejected() {
+        let toml = r#"
+[sidecar]
+bind = "127.0.0.1:8765"
+[db]
+path = "/tmp/prro.db"
+[dps.prod]
+endpoint = ""
+[dps.test]
+endpoint = "https://test.example.com:9443"
+"#;
+        let err = SidecarConfig::from_toml_str(toml).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)), "empty prod endpoint must be rejected: {err}");
+    }
+
+    #[test]
+    fn empty_dps_test_endpoint_rejected() {
+        let toml = r#"
+[sidecar]
+bind = "127.0.0.1:8765"
+[db]
+path = "/tmp/prro.db"
+[dps.prod]
+endpoint = "https://prod.example.com:9443"
+[dps.test]
+endpoint = ""
+"#;
+        let err = SidecarConfig::from_toml_str(toml).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)), "empty test endpoint must be rejected: {err}");
+    }
+
+    // ── bind address parsing ──────────────────────────────────────────────────
+
+    #[test]
+    fn bind_address_without_port_rejected() {
+        let toml = r#"
+[sidecar]
+bind = "127.0.0.1"
+[db]
+path = "/tmp/prro.db"
+[dps.prod]
+endpoint = "https://prod.example.com:9443"
+[dps.test]
+endpoint = "https://test.example.com:9443"
+"#;
+        let err = SidecarConfig::from_toml_str(toml).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)), "bind without port must be rejected: {err}");
+    }
+
+    #[test]
+    fn bind_address_port_out_of_range_rejected() {
+        // Port 99999 > 65535 — SocketAddr parse must fail.
+        let toml = r#"
+[sidecar]
+bind = "127.0.0.1:99999"
+[db]
+path = "/tmp/prro.db"
+[dps.prod]
+endpoint = "https://prod.example.com:9443"
+[dps.test]
+endpoint = "https://test.example.com:9443"
+"#;
+        let err = SidecarConfig::from_toml_str(toml).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)), "port >65535 must be rejected: {err}");
+    }
+
+    #[test]
+    fn bind_ipv6_loopback_accepted() {
+        let toml = r#"
+[sidecar]
+bind = "[::1]:8765"
+[db]
+path = "/tmp/prro.db"
+[dps.prod]
+endpoint = "https://prod.example.com:9443"
+[dps.test]
+endpoint = "https://test.example.com:9443"
+"#;
+        let cfg = SidecarConfig::from_toml_str(toml).expect("IPv6 loopback must be accepted");
+        assert_eq!(cfg.sidecar.bind, "[::1]:8765");
     }
 }

@@ -471,4 +471,198 @@ mod tests {
         let jcs = String::from_utf8(payload.to_canonical_bytes()).unwrap();
         assert!(jcs.contains("ТОВ «Магазин» 商店"), "Unicode must not be percent-escaped in JCS");
     }
+
+    #[test]
+    fn grace_boundary_exactly_14_days_before_expiry() {
+        // now = expires_at - 14 days exactly → should be in Grace period (not Valid)
+        // Grace window: [expires_at - 14d, expires_at)
+        let (d, pub_k) = test_keypair();
+        let expires_at = datetime!(2026-05-03 00:00:00 UTC); // 14 days after 2026-04-19
+        let payload = pro_payload("2026-05-03T00:00:00Z");
+        let now      = datetime!(2026-04-19 00:00:00 UTC); // exactly 14d before expiry
+        let state    = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
+        assert!(
+            matches!(state, LicenseState::Grace { days_left: 14 }),
+            "exactly 14 days before expiry must be Grace(14), got {state:?}"
+        );
+        let _ = expires_at;
+    }
+
+    #[test]
+    fn grace_boundary_15_days_before_expiry_is_still_valid() {
+        // 15 days before expiry is before grace window → Valid
+        let (d, pub_k) = test_keypair();
+        let payload = pro_payload("2026-05-04T00:00:00Z"); // 15 days after 2026-04-19
+        let now     = datetime!(2026-04-19 00:00:00 UTC);
+        let state   = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
+        assert!(
+            matches!(state, LicenseState::Valid),
+            "15 days before expiry must be Valid, got {state:?}"
+        );
+    }
+
+    #[test]
+    fn expired_at_exact_expiry_timestamp() {
+        // now == expires_at exactly → condition is now >= expires → Expired
+        let (d, pub_k) = test_keypair();
+        let payload = pro_payload("2026-04-19T12:00:00Z");
+        let now     = datetime!(2026-04-19 12:00:00 UTC); // exactly at expiry
+        let state   = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
+        assert!(
+            matches!(state, LicenseState::Expired),
+            "now == expires_at must be Expired (>= boundary), got {state:?}"
+        );
+    }
+
+    #[test]
+    fn expired_one_second_before_exact_timestamp_is_grace() {
+        // One second before expiry → still Grace (just barely)
+        let (d, pub_k) = test_keypair();
+        let payload = pro_payload("2026-04-19T12:00:00Z");
+        let now     = datetime!(2026-04-19 11:59:59 UTC);
+        let state   = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
+        assert!(
+            matches!(state, LicenseState::Grace { .. }),
+            "1 second before expiry must be Grace, got {state:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_expires_at_returns_date_parse_error() {
+        // Malformed expires_at should surface as LicenseError::DateParse
+        let (d, pub_k) = test_keypair();
+        let mut payload = pro_payload("2026-05-01T00:00:00Z");
+        payload.expires_at = "2026-13-45T00:00:00Z".into(); // month 13 is invalid
+
+        let p_b64 = B64.encode(payload.to_canonical_bytes());
+        let s_b64 = sign_payload(&payload, &d);
+        let result = verify_inner(&p_b64, &s_b64, None, None,
+                                   datetime!(2026-04-19 00:00:00 UTC), &[&pub_k]);
+        assert!(
+            matches!(result, Err(LicenseError::DateParse(ref s, _)) if s.contains("2026-13-45")),
+            "invalid month in expires_at must produce DateParse, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn empty_fn_numbers_makes_any_fn_not_licensed() {
+        // payload.fn_numbers = [] — no FN is authorized
+        let (d, pub_k) = test_keypair();
+        let mut payload = pro_payload("2027-04-19T00:00:00Z");
+        payload.fn_numbers = vec![];
+
+        let now   = datetime!(2026-04-19 12:00:00 UTC);
+        let state = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
+        assert!(
+            matches!(state, LicenseState::FnNotLicensed { ref fn_ } if fn_ == "3001234567"),
+            "empty fn_numbers must return FnNotLicensed, got {state:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_fn_numbers_match_any_in_list() {
+        // FN must be found by .any() — check the LAST element is also matched
+        let (d, pub_k) = test_keypair();
+        let mut payload = pro_payload("2027-04-19T00:00:00Z");
+        payload.fn_numbers = vec!["3001234567".into(), "3001234568".into(), "9999999999".into()];
+
+        let now   = datetime!(2026-04-19 12:00:00 UTC);
+        let state = do_verify(&payload, &d, &pub_k, Some("9999999999"), Some("1234567890"), now);
+        assert!(
+            matches!(state, LicenseState::Valid),
+            "last element in fn_numbers must still match, got {state:?}"
+        );
+    }
+
+    #[test]
+    fn signature_too_short_returns_invalid() {
+        // sig_bytes.len() != 64 → verify_detached returns false → SignatureInvalid
+        let (d, pub_k) = test_keypair();
+        let payload = pro_payload("2027-04-19T00:00:00Z");
+        let p_b64   = B64.encode(payload.to_canonical_bytes());
+        // 32 bytes (half a signature) — wrong length
+        let short_sig = B64.encode(&[0xAB_u8; 32]);
+        let state = verify_inner(&p_b64, &short_sig, None, None,
+                                  datetime!(2026-04-19 12:00:00 UTC), &[&pub_k])
+            .unwrap();
+        assert!(
+            matches!(state, LicenseState::SignatureInvalid),
+            "32-byte sig (should be 64) must return SignatureInvalid, got {state:?}"
+        );
+        let _ = d;
+    }
+
+    #[test]
+    fn pubkey_wrong_length_returns_invalid() {
+        // pubkey_compressed.len() != 33 → verify_detached returns false → SignatureInvalid
+        let (d, _) = test_keypair();
+        let wrong_pubkey = vec![0x04_u8; 65]; // uncompressed point, not 33-byte compressed
+
+        let payload = pro_payload("2027-04-19T00:00:00Z");
+        let p_b64   = B64.encode(payload.to_canonical_bytes());
+        let s_b64   = sign_payload(&payload, &d);
+        let state   = verify_inner(&p_b64, &s_b64, None, None,
+                                    datetime!(2026-04-19 12:00:00 UTC), &[&wrong_pubkey])
+            .unwrap();
+        assert!(
+            matches!(state, LicenseState::SignatureInvalid),
+            "65-byte pubkey (should be 33) must return SignatureInvalid, got {state:?}"
+        );
+    }
+
+    #[test]
+    fn payload_invalid_base64_returns_error() {
+        // Base64 decode error surfaces as LicenseError::Base64
+        let result = verify_inner("not!!valid!!base64===", "AAAA", None, None,
+                                   datetime!(2026-04-19 12:00:00 UTC), &[&[0u8; 33]]);
+        assert!(
+            matches!(result, Err(LicenseError::Base64(_))),
+            "invalid payload base64 must return Base64 error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn signature_invalid_base64_returns_error() {
+        let (_, pub_k) = test_keypair();
+        // Valid payload b64 (just needs to decode to valid JSON)
+        let payload = pro_payload("2027-04-19T00:00:00Z");
+        let p_b64   = B64.encode(payload.to_canonical_bytes());
+        let result  = verify_inner(&p_b64, "!!!not_base64===", None, None,
+                                    datetime!(2026-04-19 12:00:00 UTC), &[&pub_k]);
+        assert!(
+            matches!(result, Err(LicenseError::Base64(_))),
+            "invalid signature base64 must return Base64 error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn tin_mismatch_stores_correct_fields() {
+        // in_license = what the license says; requested = what the caller passed
+        let (d, pub_k) = test_keypair();
+        let payload = pro_payload("2027-04-19T00:00:00Z"); // tin = "1234567890"
+        let now     = datetime!(2026-04-19 12:00:00 UTC);
+        let state   = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("9999999999"), now);
+        match state {
+            LicenseState::TinMismatch { ref in_license, ref requested } => {
+                assert_eq!(in_license, "1234567890", "in_license must be the payload TIN");
+                assert_eq!(requested,  "9999999999", "requested must be the caller-supplied TIN");
+            }
+            other => panic!("expected TinMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn basic_and_enterprise_tiers_parse_and_verify() {
+        let (d, pub_k) = test_keypair();
+        let now = datetime!(2026-04-19 12:00:00 UTC);
+        for tier in [LicenseTier::Basic, LicenseTier::Enterprise] {
+            let mut payload = pro_payload("2027-04-19T00:00:00Z");
+            payload.tier = tier;
+            let state = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
+            assert!(
+                matches!(state, LicenseState::Valid),
+                "tier {tier:?} must produce Valid within expiry, got {state:?}"
+            );
+        }
+    }
 }

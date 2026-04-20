@@ -549,4 +549,157 @@ mod tests {
         assert!(p.rrn.is_none());
         assert!(p.commission.is_none());
     }
+
+    // ── New evidential tests ──────────────────────────────────────────────────
+
+    /// Truly unknown operation_type strings not in the enum must fail deserialization.
+    #[test]
+    fn unknown_operation_type_fails_deserialization() {
+        let json = serde_json::json!({
+            "schema_version":"1.0","request_id":"r","idempotency_key":"k",
+            "operation_type":"UNKNOWN_FISCAL_OP",
+            "fiscal_number":"fn","business_ts":"ts",
+            "payload_sha256":"x","payload":{}
+        });
+        let result = serde_json::from_value::<CanonicalCommand>(json);
+        assert!(result.is_err(), "unknown operation_type must fail deserialization");
+    }
+
+    /// amount=0 is accepted at the deserialization layer (domain validation is downstream).
+    #[test]
+    fn payment_amount_zero_accepted() {
+        let json = serde_json::json!({
+            "schema_version":"1.0","request_id":"r","idempotency_key":"k",
+            "operation_type":"SELL","fiscal_number":"fn","business_ts":"ts",
+            "payload_sha256":"x",
+            "payload":{"receipt":{"payments":[{"type":"CASH","amount":0}]}}
+        });
+        let cmd: CanonicalCommand = serde_json::from_value(json)
+            .expect("amount=0 must deserialize");
+        let receipt = cmd.receipt().unwrap();
+        assert_eq!(receipt.payments[0].amount, 0);
+    }
+
+    /// Negative amounts are accepted at this layer — domain validation is downstream
+    /// (DPS returns ERROR_XML on fiscally invalid amounts).
+    #[test]
+    fn payment_amount_negative_accepted_no_domain_validation_at_deserialize() {
+        let json = serde_json::json!({
+            "schema_version":"1.0","request_id":"r","idempotency_key":"k",
+            "operation_type":"SELL","fiscal_number":"fn","business_ts":"ts",
+            "payload_sha256":"x",
+            "payload":{"receipt":{"payments":[{"type":"CASH","amount":-5000}]}}
+        });
+        let cmd: CanonicalCommand = serde_json::from_value(json)
+            .expect("negative amount must deserialize (domain validation is downstream)");
+        let receipt = cmd.receipt().unwrap();
+        assert_eq!(receipt.payments[0].amount, -5000);
+    }
+
+    /// Missing required `payload` field must fail deserialization.
+    #[test]
+    fn missing_payload_field_fails_deserialization() {
+        let json = serde_json::json!({
+            "schema_version":"1.0","request_id":"r","idempotency_key":"k",
+            "operation_type":"SELL","fiscal_number":"fn","business_ts":"ts",
+            "payload_sha256":"x"
+            // no "payload" key
+        });
+        let result = serde_json::from_value::<CanonicalCommand>(json);
+        assert!(result.is_err(), "missing payload field must fail deserialization");
+    }
+
+    /// Receipt with empty goods/payments/discounts arrays must deserialize correctly.
+    #[test]
+    fn receipt_with_empty_goods_and_payments_deserializes() {
+        let json = serde_json::json!({
+            "schema_version":"1.0","request_id":"r","idempotency_key":"k",
+            "operation_type":"SELL","fiscal_number":"fn","business_ts":"ts",
+            "payload_sha256":"x",
+            "payload":{"receipt":{"goods":[],"payments":[],"discounts":[]}}
+        });
+        let cmd: CanonicalCommand = serde_json::from_value(json)
+            .expect("empty arrays must deserialize");
+        let receipt = cmd.receipt().unwrap();
+        assert!(receipt.goods.is_empty(), "goods must be empty");
+        assert!(receipt.payments.is_empty(), "payments must be empty");
+        assert!(receipt.discounts.is_empty(), "discounts must be empty");
+    }
+
+    /// RRN as a JSON number (not string) must return false from has_card_rrn.
+    /// The method uses `.as_str()` on the raw JSON value — a number returns None.
+    #[test]
+    fn has_card_rrn_with_numeric_rrn_value_returns_false() {
+        let json = serde_json::json!({
+            "schema_version":"1.0","request_id":"r","idempotency_key":"k",
+            "operation_type":"SELL","fiscal_number":"fn","business_ts":"ts",
+            "payload_sha256":"x",
+            "payload":{"receipt":{"payments":[{"type":"CARD","amount":100,"rrn":123456}]}}
+        });
+        // payload is raw serde_json::Value — deserializes fine even with numeric rrn
+        let cmd: CanonicalCommand = serde_json::from_value(json)
+            .expect("numeric rrn must deserialize at the envelope level");
+        assert!(
+            !cmd.has_card_rrn(),
+            "numeric RRN value (not string) must return false — .as_str() returns None"
+        );
+    }
+
+    /// operation_type must be SCREAMING_SNAKE_CASE; lowercase must fail.
+    #[test]
+    fn lowercase_operation_type_fails_deserialization() {
+        let json = serde_json::json!({
+            "schema_version":"1.0","request_id":"r","idempotency_key":"k",
+            "operation_type":"sell",   // lowercase — must not match
+            "fiscal_number":"fn","business_ts":"ts",
+            "payload_sha256":"x","payload":{}
+        });
+        let result = serde_json::from_value::<CanonicalCommand>(json);
+        assert!(result.is_err(), "lowercase operation_type must fail (SCREAMING_SNAKE_CASE required)");
+    }
+
+    /// Good struct: only required fields present → all optional fields are None/empty.
+    /// Required: name, price, quantity, sum. Optional: code, barcode, uktzed, tax_id,
+    /// tax_id_2, excise_barcodes (default []), discounts (default []).
+    #[test]
+    fn good_required_fields_only_deserializes_with_correct_defaults() {
+        let json = r#"{"name":"Хліб","price":2500,"quantity":2000,"sum":5000}"#;
+        let g: Good = serde_json::from_str(json).unwrap();
+        assert_eq!(g.name, "Хліб");
+        assert_eq!(g.price, 2500);
+        assert_eq!(g.quantity, 2000);
+        assert_eq!(g.sum, 5000);
+        assert!(g.code.is_none(), "code must default to None");
+        assert!(g.barcode.is_none(), "barcode must default to None");
+        assert!(g.uktzed.is_none(), "uktzed must default to None");
+        assert!(g.tax_id.is_none(), "tax_id must default to None");
+        assert!(g.tax_id_2.is_none(), "tax_id_2 must default to None");
+        assert!(g.excise_barcodes.is_empty(), "excise_barcodes must default to []");
+        assert!(g.discounts.is_empty(), "discounts must default to []");
+    }
+
+    /// Z_REPORT deserialization succeeds even with no sub-fields.
+    #[test]
+    fn z_report_data_all_fields_none_when_payload_absent() {
+        let json = serde_json::json!({
+            "schema_version":"1.0","request_id":"r","idempotency_key":"k",
+            "operation_type":"Z_REPORT","fiscal_number":"fn","business_ts":"ts",
+            "payload_sha256":"x","payload":{}
+        });
+        let cmd: CanonicalCommand = serde_json::from_value(json).unwrap();
+        assert!(cmd.z_report_data().is_none(), "missing z_report_data → None");
+    }
+
+    /// Missing fiscal_number field must fail deserialization.
+    #[test]
+    fn missing_fiscal_number_fails_deserialization() {
+        let json = serde_json::json!({
+            "schema_version":"1.0","request_id":"r","idempotency_key":"k",
+            "operation_type":"SELL","business_ts":"ts",
+            "payload_sha256":"x","payload":{}
+            // fiscal_number absent
+        });
+        let result = serde_json::from_value::<CanonicalCommand>(json);
+        assert!(result.is_err(), "missing fiscal_number must fail deserialization");
+    }
 }

@@ -129,4 +129,100 @@ mod tests {
             encode_password(pw, vt, name),
         );
     }
+
+    #[test]
+    fn decode_xor_result_non_utf8_returns_error() {
+        // XOR key byte 0 = SHA256("2026-12-31?")[0]
+        // We need a password whose first byte XOR key[0] produces a non-UTF8 byte.
+        // Strategy: encode the byte 0xFF as the first password byte, then check if decode fails.
+        // derive_key("2026-12-31", "") → sha256("2026-12-31?")
+        let vt = "2026-12-31";
+        let name = ""; // operator_name: uses '?' fallback char
+        let key = {
+            use sha2::{Digest, Sha256};
+            let salt = format!("{}?", vt);
+            let hash: [u8; 32] = Sha256::digest(salt.as_bytes()).into();
+            hash
+        };
+        // Craft a hex string whose first decoded byte XOR key[0] == 0x80 (invalid UTF-8 start byte)
+        // key[0] XOR target[0] = 0x80 → target[0] = key[0] ^ 0x80
+        let bad_byte = key[0] ^ 0x80;
+        // Use a 1-byte "password" that decodes to 0x80 (invalid UTF-8 continuation byte alone)
+        let hex_str = hex::encode([bad_byte]);
+        let result = decode_password(&hex_str, vt, name);
+        assert!(
+            result.is_err(),
+            "XOR result producing 0x80 (lone continuation byte) must fail UTF-8 validation, got {result:?}"
+        );
+        assert!(
+            result.unwrap_err().contains("utf8"),
+            "error message must mention utf8"
+        );
+    }
+
+    #[test]
+    fn decode_hex_uppercase_accepted() {
+        // hex crate decodes both upper and lowercase hex. Verify we accept uppercase output
+        // from external tools (e.g. if stored in DB as uppercase).
+        let pw   = "TestPass";
+        let vt   = "2026-12-31";
+        let name = "Тестовий";
+        let encoded_lower = encode_password(pw, vt, name); // returns lowercase hex
+        let encoded_upper = encoded_lower.to_uppercase();  // simulate DB storing uppercase
+        let decoded = decode_password(&encoded_upper, vt, name)
+            .expect("uppercase hex must decode correctly");
+        assert_eq!(decoded, pw, "uppercase hex must roundtrip to original password");
+    }
+
+    #[test]
+    fn encode_password_single_unicode_char() {
+        // Single-char operator name: nth(1) returns None → '?' used as fallback.
+        // Single UTF-8 multi-byte char: "А" is 2 bytes but 1 char — nth(1) returns None.
+        let pw   = "secret";
+        let vt   = "2026-12-31";
+        let name = "А"; // 1 char, 2 UTF-8 bytes
+
+        let encoded = encode_password(pw, vt, name);
+        let decoded = decode_password(&encoded, vt, name).unwrap();
+        assert_eq!(decoded, pw, "single-char name roundtrip must succeed");
+
+        // Must match empty-name encoding (both use '?' fallback)
+        let empty_encoded = encode_password(pw, vt, "");
+        assert_eq!(
+            encoded, empty_encoded,
+            "single-char name uses same '?' fallback as empty name"
+        );
+    }
+
+    #[test]
+    fn encode_with_null_byte_in_password_roundtrips() {
+        // Rust strings allow null bytes — verify XOR handles them correctly.
+        let pw   = "pass\x00word"; // contains null byte
+        let vt   = "2026-12-31";
+        let name = "Тест";
+        let encoded = encode_password(pw, vt, name);
+        let decoded = decode_password(&encoded, vt, name)
+            .expect("null byte in password must roundtrip");
+        assert_eq!(decoded, pw, "null byte in password must survive encode/decode");
+    }
+
+    #[test]
+    fn encode_all_ascii_printable_characters_roundtrip() {
+        // Stress-test with full printable ASCII range
+        let pw: String = (0x20u8..=0x7E).map(|b| b as char).collect();
+        let vt   = "2026-12-31";
+        let name = "Оператор";
+        let encoded = encode_password(&pw, vt, name);
+        let decoded = decode_password(&encoded, vt, name)
+            .expect("full printable ASCII must roundtrip");
+        assert_eq!(decoded, pw);
+    }
+
+    #[test]
+    fn decode_odd_length_hex_returns_error() {
+        // hex::decode requires even-length string (each pair = 1 byte)
+        let result = decode_password("abc", "2026-12-31", "Тест");
+        assert!(result.is_err(), "odd-length hex must fail");
+        assert!(result.unwrap_err().contains("hex decode"));
+    }
 }

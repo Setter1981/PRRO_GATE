@@ -1233,4 +1233,163 @@ mod tests {
             other => panic!("expected BadRequest, got {:?}", other),
         }
     }
+
+    // ── New evidential tests ──────────────────────────────────────────────────
+
+    /// Tax algorithm 2: additional rate extracted from gross, then primary on remainder.
+    ///
+    /// Formula (from calc_tax branch 2):
+    ///   dtsm = py_round(10500 * 5.0 / (100.0 + 5.0)) = py_round(500.0) = 500
+    ///   txsm = py_round((10500 - 500) * 20.0 / (100.0 + 20.0)) = py_round(10000 * 20/120)
+    ///        = py_round(1666.666...) = 1667
+    #[test]
+    fn calc_tax_al2_additional_rate() {
+        let (txsm, dtsm) = calc_tax(10500, 20.0, 5.0, 2);
+        assert_eq!(dtsm, 500, "algo2: additional portion dtsm must be 500");
+        assert_eq!(txsm, 1667, "algo2: primary tax txsm on remainder must be 1667");
+    }
+
+    /// algo2 with zero primary rate: only additional rate applies.
+    ///   dtsm = py_round(12000 * 5.0 / 105.0) = py_round(571.428...) = 571
+    ///   txsm = 0 (prc == 0.0)
+    #[test]
+    fn calc_tax_al2_zero_primary_rate() {
+        let (txsm, dtsm) = calc_tax(12000, 0.0, 5.0, 2);
+        assert_eq!(dtsm, 571, "algo2: additional only dtsm must be 571");
+        assert_eq!(txsm, 0, "algo2: zero primary rate → txsm must be 0");
+    }
+
+    /// algo2 with both rates zero: no tax.
+    #[test]
+    fn calc_tax_al2_both_rates_zero() {
+        let (txsm, dtsm) = calc_tax(10000, 0.0, 0.0, 2);
+        assert_eq!(dtsm, 0, "algo2 zero rates: dtsm=0");
+        assert_eq!(txsm, 0, "algo2 zero rates: txsm=0");
+    }
+
+    /// Timestamp without Z suffix must be treated as UTC and converted to Kyiv (UTC+3).
+    ///   "2026-04-19T09:00:00" → append Z → UTC 09:00 → Kyiv 12:00.
+    #[test]
+    fn format_ts_without_z_suffix_parsed_via_fallback() {
+        let result = format_ts("2026-04-19T09:00:00");
+        assert_eq!(
+            result.unwrap(),
+            "20260419120000",
+            "bare ISO-8601 without Z must be treated as UTC and converted to Kyiv (UTC+3)"
+        );
+    }
+
+    /// SELL with empty goods list must produce no `<P ` tags.
+    #[test]
+    fn sell_with_empty_goods_list_produces_no_p_tags() {
+        let cmd = make_cmd("SELL", json!({
+            "receipt": {
+                "goods": [],
+                "payments": [{"type": "CASH", "amount": 0}],
+                "totals": {"total_sum": 0}
+            }
+        }));
+        let ctx = default_ctx();
+        let xml = xml_from(&cmd, &ctx);
+        assert!(
+            !xml.contains("<P "),
+            "SELL with empty goods must produce no <P tags; got: {xml}"
+        );
+        assert!(xml.contains("<M "), "payment M tag must still be present");
+        assert!(xml.contains("<E "), "totals E tag must still be present");
+    }
+
+    /// SERVICE_IN: I tag amount must match payload["service_sum"].
+    #[test]
+    fn service_in_sum_matches_payload_field() {
+        let cmd = make_cmd("SERVICE_IN", json!({"service_sum": 87654}));
+        let ctx = default_ctx();
+        let xml = xml_from(&cmd, &ctx);
+        assert!(
+            xml.contains(r#"SM="87654""#),
+            "SERVICE_IN: SM attribute must equal service_sum 87654; got: {xml}"
+        );
+        assert!(xml.contains("<I "), "SERVICE_IN must produce an I tag");
+    }
+
+    /// SERVICE_OUT: O tag amount must match payload["service_sum"].
+    #[test]
+    fn service_out_sum_matches_payload_field() {
+        let cmd = make_cmd("SERVICE_OUT", json!({"service_sum": 33333}));
+        let ctx = default_ctx();
+        let xml = xml_from(&cmd, &ctx);
+        assert!(
+            xml.contains(r#"SM="33333""#),
+            "SERVICE_OUT: SM attribute must equal service_sum 33333; got: {xml}"
+        );
+        assert!(xml.contains("<O "), "SERVICE_OUT must produce an O tag");
+    }
+
+    /// Large value overflow guard: calc_tax on a fiscal-maximum sum must not panic.
+    ///   sum=9_999_999_999, algo=0, 20% ПДВ:
+    ///   txsm = py_round(9_999_999_999 * 20.0 / 120.0)
+    ///        = py_round(1_666_666_666.5) → floor=1666666666 (even) → 1666666666
+    ///   dtsm = 0 (algo 0 does not set additional)
+    #[test]
+    fn py_round_large_values_no_overflow() {
+        let (txsm, dtsm) = calc_tax(9_999_999_999i64, 20.0, 0.0, 0);
+        assert_eq!(txsm, 1_666_666_666, "large-sum tax must equal 1_666_666_666 (banker round of .5 to even)");
+        assert_eq!(dtsm, 0, "algo=0 must produce dtsm=0");
+        assert!(txsm > 0, "tax on large sum must be positive");
+        assert!(
+            dtsm + txsm <= 9_999_999_999i64 + 1,
+            "components must not exceed original plus rounding tolerance"
+        );
+    }
+
+    /// Zero sum produces zero tax regardless of rate.
+    #[test]
+    fn py_round_zero_sum_produces_zero_tax() {
+        let (txsm, dtsm) = calc_tax(0, 20.0, 0.0, 0);
+        assert_eq!(dtsm, 0, "tax on zero sum must be zero");
+        assert_eq!(txsm, 0, "net on zero sum must be zero");
+    }
+
+    /// Z_REPORT with no payment_sums key must produce no M tags.
+    #[test]
+    fn z_report_with_no_payments_has_no_m_tags() {
+        let cmd = make_cmd("Z_REPORT", json!({
+            "z_report_data": {
+                "check_count": {"ni": 3, "no": 0}
+                // payment_sums intentionally absent
+            }
+        }));
+        let ctx = default_ctx();
+        let xml = xml_from(&cmd, &ctx);
+        assert!(
+            !xml.contains("<M "),
+            "Z_REPORT with no payment_sums must produce no M tags; got: {xml}"
+        );
+        assert!(xml.contains("<NC "), "check count NC tag must be present");
+    }
+
+    /// Z_REPORT with empty payment_sums object must produce no M tags.
+    #[test]
+    fn z_report_with_empty_payment_sums_has_no_m_tags() {
+        let cmd = make_cmd("Z_REPORT", json!({
+            "z_report_data": {
+                "payment_sums": {},
+                "check_count": {"ni": 0, "no": 0}
+            }
+        }));
+        let ctx = default_ctx();
+        let xml = xml_from(&cmd, &ctx);
+        assert!(
+            !xml.contains("<M "),
+            "Z_REPORT with empty payment_sums must produce no M tags; got: {xml}"
+        );
+    }
+
+    /// Unknown tax algorithm (e.g. 99) must silently produce (0, 0) — no crash.
+    #[test]
+    fn calc_tax_unknown_algo_returns_zero() {
+        let (txsm, dtsm) = calc_tax(10000, 20.0, 5.0, 99);
+        assert_eq!(txsm, 0, "unknown tax algo must return txsm=0");
+        assert_eq!(dtsm, 0, "unknown tax algo must return dtsm=0");
+    }
 }
