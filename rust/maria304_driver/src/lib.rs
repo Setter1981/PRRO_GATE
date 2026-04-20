@@ -11,7 +11,10 @@
 //!   builders, error-code catalogue.
 //! * [`session`]  — M3: per-connection state machine + dispatcher
 //!   + stub responses for every non-fiscal opcode.
+//! * [`bridge`]   — M4: canonical envelope DTOs + `Bridge` trait
+//!   + in-memory `MockBridge` for integration tests.
 
+pub mod bridge;
 pub mod protocol;
 pub mod session;
 pub mod wire;
