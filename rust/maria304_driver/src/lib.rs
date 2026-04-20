@@ -9,6 +9,9 @@
 //! * [`wire`]     — M1: frame codec, custom CRC-16, CP866, LLV.
 //! * [`protocol`] — M2: typed commands, responses, `COMP`/`CONF`
 //!   builders, error-code catalogue.
+//! * [`session`]  — M3: per-connection state machine + dispatcher
+//!   + stub responses for every non-fiscal opcode.
 
 pub mod protocol;
+pub mod session;
 pub mod wire;
