@@ -112,7 +112,10 @@ def _map_dps_response(data: dict, document_id: str) -> SendResult:
     fiscal_id = data.get('fiscal_id', '')
     error_msg = data.get('error_message')
 
-    # status=1 is the only DPS-defined success value; 0 and negative are rejections.
+    # status=1 (CheckResponse.Status.OK) is the only DPS-defined success code.
+    # status=0 is UNKNOWN (proto placeholder, never returned by real DPS).
+    # status=-1..-16 are named error codes (ERROR_VEREFY … ERROR_OFFLINE_ID).
+    # Confirmed against official proto at cabinet.tax.gov.ua/help/api.html — no status>1 exists.
     if status == 1:
         return SendResult(
             state=DocumentState.ACK,
