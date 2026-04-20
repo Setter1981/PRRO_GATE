@@ -1,0 +1,5 @@
+-- sql/014_placeholder.sql
+-- Migration 014 was intentionally skipped during development.
+-- This placeholder preserves sequential numbering so the runner's
+-- applied-set remains consistent across all deployments.
+-- No schema changes; only the schema_migrations record is written.

@@ -28,7 +28,7 @@ from ..services.backup import BackupService
 from ..services.reconciliation import ReconciliationService
 from ..services.retention import RetentionService
 from ..services.write_path import WritePathWorker
-from ..transports import CheckboxRestTransport, DpsFiscalServerTransport, ProfileAwareTransportRouter
+from ..transports import CheckboxRestTransport, DpsFiscalServerTransport, FiscalSidecarTransport, ProfileAwareTransportRouter
 from ..transports.stubs import CheckboxRestTransportStub, DpsGrpcEcabinetTransportStub, DpsXmlUnifiedWindowTransportStub
 
 
@@ -594,13 +594,14 @@ class RuntimeContainer:
             self.reconciliation_service = ReconciliationService(
                 transport_status_client=self.transport_router,
                 max_recovery_attempts=self.config.runtime.max_recovery_attempts,
-                crypto_provider=self.crypto_provider or self._resolve_crypto_provider(),
+                crypto_provider=self.crypto_provider if self.crypto_provider is not None else self._resolve_crypto_provider(),
                 concurrency=self.config.reconciliation.concurrency,
                 cancel_event=self._ops_loop_stop,
             )
         if self.offline_sync_service is None and self.transport_router is not None:
             self.offline_sync_service = OfflineSyncService(
                 transport_client=self.transport_router,
+                crypto_provider=self.crypto_provider if self.crypto_provider is not None else self._resolve_crypto_provider(),
                 max_recovery_attempts=self.config.runtime.max_recovery_attempts,
             )
         if self.command_processor is None and self.config.runtime.process_immediately and self.transport_router is not None:
@@ -895,6 +896,18 @@ class RuntimeContainer:
             TransportKind.CHECKBOX_REST_TRANSPORT: CheckboxRestTransport(http_client=self.transport_http_client),
             TransportKind.DPS_PRRO_GRPC_ECABINET: DpsFiscalServerTransport() if self.config.runtime.environment != 'development' else DpsGrpcEcabinetTransportStub(),
             TransportKind.DPS_PRRO_XML_UNIFIED_WINDOW: DpsXmlUnifiedWindowTransportStub(),
+            # FiscalSidecarTransport only wired when crypto.provider=passthrough.
+            # With any other provider the Python layer would double-sign the payload
+            # (Rust sidecar signs internally from its own JKS store).
+            # Profiles with kind=DPS_PRRO_FISCAL_SIDECAR_V2 are silently unroutable
+            # when this handler is absent — correct, because the config is inconsistent.
+            **({
+                TransportKind.DPS_PRRO_FISCAL_SIDECAR_V2: FiscalSidecarTransport(
+                    sidecar_url=self.config.crypto.sidecar_url or 'http://127.0.0.1:8765',
+                    http_client=self.transport_http_client,
+                    crypto_provider=self.config.crypto.provider or 'passthrough',
+                )
+            } if (self.config.crypto.provider or 'passthrough') == 'passthrough' else {}),
         }
         handlers.update(self.transport_handlers)
         return handlers

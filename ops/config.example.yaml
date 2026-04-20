@@ -40,3 +40,17 @@ metrics:
 alerts:
   enabled: true
   persist_to_audit: true
+
+# ── Fiscal Sidecar V2 (Rust prro_sidecar) ──────────────────────────────
+# Uncomment to route fiscal documents through the Rust signing sidecar.
+# The sidecar owns: canonical JSON → cp1251 XML → CMS sign → DPS gRPC.
+#
+# Required conditions:
+#   1. crypto.provider = passthrough  (Python layer must NOT sign — sidecar signs internally)
+#   2. prro_sidecar binary running on sidecar_url
+#   3. Transport profile transport_sidecar_v2_default active in DB (seeded by migration 018)
+#   4. prro_bindings for the fiscal_number pointing at transport_sidecar_v2_default
+#
+# crypto:
+#   provider: passthrough
+#   sidecar_url: http://127.0.0.1:8765  # also used as FiscalSidecarTransport base URL

@@ -441,6 +441,61 @@ def test_monthly_limit_sum_across_sessions(conn: sqlite3.Connection) -> None:
 # A2 — X_REPORT management command
 # ===========================================================================
 
+# ===========================================================================
+# B1 — deferred-sign expected_states guard (H-4)
+# ===========================================================================
+
+def test_b1_update_state_signed_expected_states_guard(conn: sqlite3.Connection) -> None:
+    """B1 (H-4): update_state(SIGNED, expected_states=(PREPARED,)) on a SIGNED doc returns None.
+
+    This is the underlying mechanism the write_path stage_sign fix relies on.
+    A doc already in SIGNED state must not be silently moved back to SIGNED
+    (which could advance an ACKed doc backward in a crash-recovery replay).
+    """
+    from prro_gateway.enums import DocumentState
+    from prro_gateway.repositories.fiscal_documents import FiscalDocumentRepository
+
+    # Enqueue and process one step to get a fiscal document into SIGNED state.
+    _enqueue(conn, OperationType.SELL)
+    # The stub transport returns ACK, so after processing the doc will be ACK.
+    # Instead, let's use the repository directly to insert a doc in SIGNED state.
+    conn.execute('BEGIN IMMEDIATE')
+    req_id = _nid('req-b1')
+    conn.execute("""
+        INSERT OR IGNORE INTO ingress_inbox (
+            request_id, idempotency_key, protocol, operation_type, fiscal_number,
+            backend_profile_id, transport_profile_id, channel_owner,
+            payload_json, payload_sha256, status, response_deadline_at
+        ) VALUES (?, ?, 'CHECKBOX_REST', 'SELL', ?,
+                  ?, ?, 'test', '{}', 'sha256stub', 'DONE', '2099-01-01T00:00:00Z')
+    """, (req_id, _nid('idem-b1'), FN, BACKEND, TRANSPORT))
+    conn.execute("""
+        INSERT INTO fiscal_documents (
+            document_id, request_id, fiscal_number, doc_type, state, fs_mode,
+            lnd, backend_profile_id, transport_profile_id,
+            submission_status, payload_json, payload_sha256, business_ts
+        ) VALUES (?, ?, ?, 'SELL', 'SIGNED', 'OFFLINE',
+            1, ?, ?, 'PENDING', '{}', 'sha256stub', '2026-04-15T10:00:00+00:00')
+    """, (_nid('doc-b1'), req_id, FN, BACKEND, TRANSPORT))
+    conn.commit()
+
+    doc_id = conn.execute(
+        "SELECT document_id FROM fiscal_documents WHERE state='SIGNED' AND fiscal_number=?", (FN,)
+    ).fetchone()[0]
+
+    # Try to "update" to SIGNED with expected_states=(PREPARED,) — must return None (guard fires)
+    conn.execute('BEGIN IMMEDIATE')
+    result = FiscalDocumentRepository.update_state(
+        conn, document_id=doc_id, state=DocumentState.SIGNED,
+        expected_states=(DocumentState.PREPARED,),
+    )
+    conn.rollback()
+
+    assert result is None, (
+        f"B1: update_state(SIGNED, expected=(PREPARED,)) must return None for a SIGNED doc; got {result}"
+    )
+
+
 def test_a2_x_report_ack(conn: sqlite3.Connection) -> None:
     """X_REPORT via write_path produces ACK and creates a fiscal document."""
     _open_shift(conn, 'shift-xreport')
