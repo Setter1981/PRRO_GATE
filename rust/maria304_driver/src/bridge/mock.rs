@@ -4,63 +4,103 @@
 //! so tests can assert on the full envelope shape.  Optionally emits
 //! a canned [`CanonicalResponse`] (default: ACK with `fiscal_id`
 //! `"0000000001"` incrementing per submit).
+//!
+//! Uses `std::sync::Mutex` so the mock is `Send + Sync` — the M6+
+//! async listener shares it across tokio tasks.
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use super::{Bridge, BridgeError, CanonicalCommand, CanonicalResponse};
 
-/// In-memory bridge.  Not thread-safe — tests run single-threaded.
+/// In-memory bridge.
 #[derive(Debug, Default)]
 pub struct MockBridge {
-    submitted: RefCell<Vec<CanonicalCommand>>,
-    next_fiscal_id: RefCell<u64>,
+    submitted: Mutex<Vec<CanonicalCommand>>,
+    next_fiscal_id: Mutex<u64>,
     /// If set, every submit returns this error instead of a canned ACK.
-    forced_error: RefCell<Option<BridgeError>>,
+    forced_error: Mutex<Option<BridgeError>>,
 }
 
 impl MockBridge {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            submitted: RefCell::default(),
-            next_fiscal_id: RefCell::new(1),
-            forced_error: RefCell::default(),
+            submitted: Mutex::default(),
+            next_fiscal_id: Mutex::new(1),
+            forced_error: Mutex::default(),
         }
     }
 
-    /// Force every subsequent submit to fail with the given error.
+    /// Force the next submit to fail with the given error.  Consumed
+    /// on first use (like a one-shot fuse).
+    ///
+    /// # Panics
+    /// If a concurrent submit poisoned the mutex.
     pub fn force_error(&self, err: BridgeError) {
-        *self.forced_error.borrow_mut() = Some(err);
+        *self.forced_error.lock().expect("MockBridge mutex poisoned") = Some(err);
     }
 
     /// Snapshot of all envelopes submitted so far.
+    ///
+    /// # Panics
+    /// If a concurrent submit poisoned the mutex.
     #[must_use]
     pub fn submitted(&self) -> Vec<CanonicalCommand> {
-        self.submitted.borrow().clone()
+        self.submitted
+            .lock()
+            .expect("MockBridge mutex poisoned")
+            .clone()
     }
 
     /// Count of submits — convenience for assertions.
+    ///
+    /// # Panics
+    /// If a concurrent submit poisoned the mutex.
     #[must_use]
     pub fn call_count(&self) -> usize {
-        self.submitted.borrow().len()
+        self.submitted
+            .lock()
+            .expect("MockBridge mutex poisoned")
+            .len()
     }
 
     /// Last submitted envelope, if any.
+    ///
+    /// # Panics
+    /// If a concurrent submit poisoned the mutex.
     #[must_use]
     pub fn last(&self) -> Option<CanonicalCommand> {
-        self.submitted.borrow().last().cloned()
+        self.submitted
+            .lock()
+            .expect("MockBridge mutex poisoned")
+            .last()
+            .cloned()
     }
 }
 
 impl Bridge for MockBridge {
     fn submit(&self, command: &CanonicalCommand) -> Result<CanonicalResponse, BridgeError> {
-        if let Some(err) = self.forced_error.borrow_mut().take() {
+        if let Some(err) = self
+            .forced_error
+            .lock()
+            .expect("MockBridge mutex poisoned")
+            .take()
+        {
             return Err(err);
         }
-        self.submitted.borrow_mut().push(command.clone());
-        let mut n = self.next_fiscal_id.borrow_mut();
-        let fiscal_id = format!("{:010}", *n);
-        *n += 1;
+        self.submitted
+            .lock()
+            .expect("MockBridge mutex poisoned")
+            .push(command.clone());
+        let fiscal_id = {
+            let mut n = self
+                .next_fiscal_id
+                .lock()
+                .expect("MockBridge mutex poisoned");
+            let id = format!("{:010}", *n);
+            *n += 1;
+            id
+        };
 
         let (sale, ret) = (
             command.payload.totals.sale_kopecks,
@@ -143,7 +183,6 @@ mod tests {
         let err = b.submit(&sample_cmd()).unwrap_err();
         assert!(matches!(err, BridgeError::Transport(_)));
         assert_eq!(b.call_count(), 0, "failed submit must not be logged");
-        // Next call succeeds.
         let ok = b.submit(&sample_cmd()).unwrap();
         assert_eq!(ok.fiscal_id, "0000000001");
     }
@@ -168,5 +207,11 @@ mod tests {
         second.idempotency_key = "second".to_string();
         b.submit(&second).unwrap();
         assert_eq!(b.last().unwrap().idempotency_key, "second");
+    }
+
+    #[test]
+    fn mock_bridge_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<MockBridge>();
     }
 }

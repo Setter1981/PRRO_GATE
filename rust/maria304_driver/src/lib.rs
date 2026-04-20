@@ -13,8 +13,11 @@
 //!   + stub responses for every non-fiscal opcode.
 //! * [`bridge`]   — M4: canonical envelope DTOs + `Bridge` trait
 //!   + in-memory `MockBridge` for integration tests.
+//! * [`listener`] — M6: tokio TCP listener per `fiscal_number` +
+//!   single-connection exclusion gate + 3s cooldown + idle timeout.
 
 pub mod bridge;
+pub mod listener;
 pub mod protocol;
 pub mod session;
 pub mod wire;
