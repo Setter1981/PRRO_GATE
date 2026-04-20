@@ -456,10 +456,16 @@ fn cyrillic_tax_to_group(ch: char) -> u8 {
 
 fn map_bridge_error(err: &BridgeError) -> ErrorCode {
     match err {
-        BridgeError::Rejected { code, .. } => {
-            ErrorCode::parse(code).unwrap_or(ErrorCode::SoftBlock)
+        // Only accept SOFT-prefixed codes from the bridge — anything
+        // else is a protocol violation by the Python adapter and we
+        // fall back to SOFTBLOCK so the caller sees a retryable signal.
+        BridgeError::Rejected { code, .. } if code.starts_with("SOFT") => {
+            match ErrorCode::parse(code) {
+                Some(ErrorCode::Custom(_)) | None => ErrorCode::SoftBlock,
+                Some(known) => known,
+            }
         }
-        BridgeError::Transport(_) => ErrorCode::SoftBlock,
+        _ => ErrorCode::SoftBlock,
     }
 }
 

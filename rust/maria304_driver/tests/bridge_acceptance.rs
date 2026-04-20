@@ -185,6 +185,95 @@ fn idempotency_key_changes_per_receipt_sequence() {
 }
 
 #[test]
+fn comp_retry_after_bridge_failure_submits_same_canonical_envelope() {
+    // Invariant: a COMP that failed because the bridge was down should
+    // be retryable as-is.  Receipt state must survive the first COMP,
+    // so the second COMP produces an identical envelope except for
+    // the outcome.
+    let (mut session, bridge, mut correlation) = logged_in_session();
+    bridge.force_error(BridgeError::Transport("network blip".to_string()));
+
+    run(&mut session, &bridge, &mut correlation, Command::Prep("X".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Fisc("line".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Psdt("102ACQ".to_string()));
+
+    // First COMP — fails.
+    let out = run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+    assert_eq!(out, vec![Response::Error(ErrorCode::SoftBlock)]);
+    assert_eq!(bridge.call_count(), 0, "failed submit must not be logged");
+    assert!(session.receipt_open(), "receipt must stay open after failure");
+
+    // Second COMP — bridge recovered, same envelope submits cleanly.
+    let out = run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+    assert_eq!(out.len(), 3); // Data + Done + Ready
+    assert_eq!(bridge.call_count(), 1, "recovered submit is logged");
+    assert!(!session.receipt_open());
+
+    // Frame order in the canonical envelope: what we sent + BOTH COMPs
+    // (because the first COMP also appended to raw_frames before failure).
+    let env = bridge.last().unwrap();
+    let opcodes: Vec<&str> = env.payload.raw_frames.iter().map(|f| f.opcode.as_str()).collect();
+    assert_eq!(opcodes, vec!["FISC", "PSDt", "COMP", "COMP"]);
+}
+
+#[test]
+fn session_psdt_sequence_stays_in_sync_with_receipt_psdt_sequence() {
+    // Regression guard for the Session/OpenReceipt duplication.
+    let (mut session, bridge, mut correlation) = logged_in_session();
+
+    run(&mut session, &bridge, &mut correlation, Command::Prep("X".to_string()));
+    for _ in 0..3 {
+        run(&mut session, &bridge, &mut correlation, Command::Psdt("slip".to_string()));
+    }
+    assert_eq!(session.psdt_sequence, 3);
+    match &session.state {
+        maria304_driver::session::SessionState::ReceiptOpen(r) => {
+            assert_eq!(r.psdt_sequence, 3, "OpenReceipt counter must mirror Session");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn bridge_rejection_with_unknown_code_falls_back_to_softblock() {
+    // Defensive: if the Python gateway returns a code we don't know
+    // (or that's malformed), fall back to SOFTBLOCK so the caller
+    // gets a retryable signal instead of crashing.
+    let (mut session, bridge, mut correlation) = logged_in_session();
+    bridge.force_error(BridgeError::Rejected {
+        code: "NONSENSE".to_string(),
+        message: "x".to_string(),
+    });
+
+    run(&mut session, &bridge, &mut correlation, Command::Prep("X".to_string()));
+    let out = run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+    assert_eq!(out, vec![Response::Error(ErrorCode::SoftBlock)]);
+}
+
+#[test]
+fn cancelled_then_reopened_receipt_starts_with_fresh_raw_frames() {
+    // After CANC, the next PREP must start with an empty accumulator —
+    // otherwise leftover frames would contaminate the next receipt.
+    let (mut session, bridge, mut correlation) = logged_in_session();
+
+    run(&mut session, &bridge, &mut correlation, Command::Prep("X".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Fisc("leftover".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Cnac);
+
+    run(&mut session, &bridge, &mut correlation, Command::Prep("Y".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Fisc("fresh".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+
+    let env = bridge.last().unwrap();
+    let bodies: Vec<&str> = env.payload.raw_frames.iter().map(|f| f.body.as_str()).collect();
+    assert_eq!(bodies, vec!["fresh", ""]); // FISC body + COMP body
+    assert!(
+        !env.payload.raw_frames.iter().any(|f| f.body == "leftover"),
+        "cancelled receipt frames must not leak into the next",
+    );
+}
+
+#[test]
 fn return_receipt_command_type_is_return_not_sell() {
     let (mut session, bridge, mut correlation) = logged_in_session();
 
