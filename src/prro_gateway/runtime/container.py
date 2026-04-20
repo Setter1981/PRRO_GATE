@@ -28,7 +28,7 @@ from ..services.backup import BackupService
 from ..services.reconciliation import ReconciliationService
 from ..services.retention import RetentionService
 from ..services.write_path import WritePathWorker
-from ..transports import CheckboxRestTransport, DpsFiscalServerTransport, ProfileAwareTransportRouter
+from ..transports import CheckboxRestTransport, DpsFiscalServerTransport, FiscalSidecarTransport, ProfileAwareTransportRouter
 from ..transports.stubs import CheckboxRestTransportStub, DpsGrpcEcabinetTransportStub, DpsXmlUnifiedWindowTransportStub
 
 
@@ -895,6 +895,10 @@ class RuntimeContainer:
             TransportKind.CHECKBOX_REST_TRANSPORT: CheckboxRestTransport(http_client=self.transport_http_client),
             TransportKind.DPS_PRRO_GRPC_ECABINET: DpsFiscalServerTransport() if self.config.runtime.environment != 'development' else DpsGrpcEcabinetTransportStub(),
             TransportKind.DPS_PRRO_XML_UNIFIED_WINDOW: DpsXmlUnifiedWindowTransportStub(),
+            TransportKind.DPS_PRRO_FISCAL_SIDECAR_V2: FiscalSidecarTransport(
+                sidecar_url=self.config.crypto.sidecar_url or 'http://127.0.0.1:8765',
+                http_client=self.transport_http_client,
+            ),
         }
         handlers.update(self.transport_handlers)
         return handlers
