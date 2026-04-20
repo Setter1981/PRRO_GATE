@@ -321,13 +321,12 @@ impl Repo {
     /// Persisted in SQLite — survives sidecar restarts within a shift.
     pub fn next_local_number(&self, fiscal_number: &str) -> Result<i32, SidecarError> {
         let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO local_sequences (fiscal_number, last) VALUES (?1, 1)
-             ON CONFLICT(fiscal_number) DO UPDATE SET last = last + 1",
-            params![fiscal_number],
-        )?;
+        // Single statement: UPSERT + RETURNING closes the read-your-own-write gap
+        // that a separate SELECT would introduce under concurrent callers.
         let n: i32 = conn.query_row(
-            "SELECT last FROM local_sequences WHERE fiscal_number = ?1",
+            "INSERT INTO local_sequences (fiscal_number, last) VALUES (?1, 1)
+             ON CONFLICT(fiscal_number) DO UPDATE SET last = last + 1
+             RETURNING last",
             params![fiscal_number],
             |row| row.get(0),
         )?;
@@ -339,11 +338,23 @@ impl Repo {
     pub fn load_previous_hash(&self, fiscal_number: &str) -> Result<String, SidecarError> {
         let conn = self.lock()?;
         match conn.query_row(
-            "SELECT previous_hash FROM local_sequences WHERE fiscal_number = ?1",
+            "SELECT previous_hash, last FROM local_sequences WHERE fiscal_number = ?1",
             params![fiscal_number],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?)),
         ) {
-            Ok(h) => Ok(h),
+            Ok((h, last)) => {
+                // Empty hash after at least one document suggests a MAC bootstrap gap
+                // (DB seeded from outside, or previous_hash never stored after sendChkV2).
+                if h.is_empty() && last > 0 {
+                    tracing::warn!(
+                        fiscal_number,
+                        last,
+                        "load_previous_hash: empty previous_hash with last={last} — \
+                         possible MAC chain gap; DPS may reject next document"
+                    );
+                }
+                Ok(h)
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(String::new()),
             Err(e) => Err(SidecarError::Db(e)),
         }
@@ -1088,6 +1099,56 @@ mod tests {
         repo.next_local_number("FN_MIX").unwrap();
         let h = repo.load_previous_hash("FN_MIX").unwrap();
         assert_eq!(h, "some_hash", "next_local_number must not clobber previous_hash");
+    }
+
+    // M-4: store_previous_hash must not touch `last`
+    #[test]
+    fn store_previous_hash_does_not_touch_last() {
+        let repo = make_repo();
+        // Advance the counter to a known value.
+        assert_eq!(repo.next_local_number("FN_SEQ").unwrap(), 1);
+        assert_eq!(repo.next_local_number("FN_SEQ").unwrap(), 2);
+        assert_eq!(repo.next_local_number("FN_SEQ").unwrap(), 3);
+        // Storing hash must not reset or increment `last`.
+        repo.store_previous_hash("FN_SEQ", "hash_abc").unwrap();
+        // Next increment must continue from 3 → 4, not reset to 1.
+        let n = repo.next_local_number("FN_SEQ").unwrap();
+        assert_eq!(n, 4, "store_previous_hash must not modify last (expected 4, got {n})");
+        // And the hash must still be there.
+        let h = repo.load_previous_hash("FN_SEQ").unwrap();
+        assert_eq!(h, "hash_abc", "previous_hash must survive next_local_number call");
+    }
+
+    // next_local_number: RETURNING guarantees read-your-own-write
+    #[test]
+    fn next_local_number_returning_matches_actual_last() {
+        let repo = make_repo();
+        // Call three times — RETURNING value must match what a subsequent SELECT would see.
+        for expected in 1_i32..=5 {
+            let returned = repo.next_local_number("FN_RET").unwrap();
+            assert_eq!(returned, expected,
+                "RETURNING must equal post-UPSERT last (expected {expected}, got {returned})");
+        }
+    }
+
+    // load_previous_hash: empty hash with last>0 is a MAC bootstrap gap (warn path).
+    // We can't assert on the log output here, but we verify the function still
+    // returns Ok with the empty string (not an error) so callers can proceed.
+    #[test]
+    fn load_previous_hash_empty_with_last_gt0_returns_ok() {
+        let repo = make_repo();
+        // Manually insert a row with last=5 but empty previous_hash.
+        {
+            let conn = repo.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO local_sequences (fiscal_number, last, previous_hash)
+                 VALUES ('FN_GAP', 5, '')",
+                [],
+            ).unwrap();
+        }
+        // Must succeed (not error) — caller gets empty string and can decide what to do.
+        let h = repo.load_previous_hash("FN_GAP").unwrap();
+        assert!(h.is_empty(), "gap condition must still return Ok(\"\"), not error");
     }
 
     // ── load_cert_der_for_fn ──────────────────────────────────────────────────

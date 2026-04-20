@@ -164,6 +164,8 @@ async fn fiscal_send_inner(
     // non-production builds — returns raw XML size, never calls DPS.
     if st.config.dev.skip_sign {
         warn!(fn_id, "dev.skip_sign=true: bypassing CMS sign and DPS send");
+        // build_dev_xml loads fn_config internally because the normal path
+        // (step 3 below) would bail before reaching here in non-dev mode.
         let xml_bytes = build_dev_xml(st, fn_id, &cmd)?;
         return Ok(FiscalSendResponse {
             status:        1, // synthetic OK
@@ -247,6 +249,10 @@ async fn fiscal_send_inner(
     };
 
     // ── 9. Allocate local_number and load previous_hash (two short locks) ─────
+    // local_num is incremented here — before CMS signing (step 11) and gRPC (step 12).
+    // If either step fails, the counter has already advanced: the gap in the sequence
+    // is visible in the audit log. This is an inherent trade-off of SQLite + gRPC
+    // without 2PC. DPS does not require a gapless sequence; it only validates monotonicity.
     let local_num     = st.repo.next_local_number(fn_id)?;
     let previous_hash = st.repo.load_previous_hash(fn_id)?;
 

@@ -52,8 +52,9 @@ enum Cmd {
         fiscal_number: String,
         operator_inn:  String,
         jks_path:      String,
-        /// JKS password. Prefer PRRO_JKS_PASSWORD env var over --jks-password
-        /// to avoid process-args exposure.
+        /// JKS password. Prefer PRRO_JKS_PASSWORD env var: --jks-password is
+        /// visible in ps/audit logs; the env var is not. CLI arg takes precedence
+        /// over the env var when both are provided (clap 4.x default).
         #[arg(long, env = "PRRO_JKS_PASSWORD", hide_env_values = true)]
         jks_password: Option<String>,
         #[arg(long)]
@@ -305,13 +306,27 @@ fn cmd_deactivate(
     operator_id: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let changed = conn.execute(
-        "UPDATE sidecar_operators SET active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+        "UPDATE sidecar_operators SET active = 0, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1 AND active = 1",
         params![operator_id],
     )?;
     if changed == 0 {
-        return Err(format!("operator id={operator_id} not found").into());
+        // Distinguish "row exists but already inactive" from "row does not exist at all".
+        let exists: bool = conn.query_row(
+            "SELECT 1 FROM sidecar_operators WHERE id = ?1",
+            params![operator_id],
+            |_| Ok(true),
+        ).unwrap_or(false);
+        if exists {
+            // Idempotent: calling deactivate twice is not an error (exit 0),
+            // but we warn so the operator knows no state change occurred.
+            eprintln!("operator id={operator_id} is already inactive");
+        } else {
+            return Err(format!("operator id={operator_id} not found").into());
+        }
+    } else {
+        println!("deactivated operator id={operator_id}");
     }
-    println!("deactivated operator id={operator_id}");
     Ok(())
 }
 
@@ -341,6 +356,8 @@ fn cmd_load_license(
         LicenseState::Grace { days_left } => {
             eprintln!("warning: license in grace period ({days_left} days left)");
         }
+        // TinMismatch and FnNotLicensed are never returned by verify_signature_only
+        // (which does not check TIN/FN scope — only cryptographic validity + expiry).
         _ => {}
     }
 

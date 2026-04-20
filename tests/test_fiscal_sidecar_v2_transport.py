@@ -159,3 +159,96 @@ def test_bytes_payload_parsed():
         transport_profile_id='tp-1',
     )
     assert result.state == DocumentState.ACK
+
+
+# ── H-3: 429 rate-limit → retryable (boundary: in _RETRYABLE_HTTP set) ───────
+
+def test_send_rate_limited_is_retryable():
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={'error': 'too many requests'})
+
+    with pytest.raises(TransportRetryableError, match='429'):
+        _send(_transport_with(handler))
+
+
+# ── Retryable boundary: 500 and 503 also retryable ───────────────────────────
+
+@pytest.mark.parametrize('status_code', [500, 503, 504])
+def test_5xx_codes_are_retryable(status_code: int):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={'error': 'server error'})
+
+    with pytest.raises(TransportRetryableError, match=str(status_code)):
+        _send(_transport_with(handler))
+
+
+# ── Non-retryable boundary: 400 and 404 are rejected, not retried ─────────────
+
+@pytest.mark.parametrize('status_code', [400, 404])
+def test_4xx_non_retryable_codes_are_rejected(status_code: int):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={'error': 'bad'})
+
+    with pytest.raises(TransportRejectedError, match=str(status_code)):
+        _send(_transport_with(handler))
+
+
+# ── C-1: crypto_provider guard — ValueError if not passthrough ────────────────
+
+def test_non_passthrough_crypto_provider_raises():
+    with pytest.raises(ValueError, match='passthrough'):
+        FiscalSidecarTransport(
+            sidecar_url=_SIDECAR_URL,
+            crypto_provider='sidecar',
+        )
+
+
+def test_passthrough_crypto_provider_is_accepted():
+    # Must not raise — passthrough is the only valid value.
+    transport = FiscalSidecarTransport(
+        sidecar_url=_SIDECAR_URL,
+        crypto_provider='passthrough',
+    )
+    assert transport is not None
+
+
+# ── L-1: status=0 is rejected, not silently ignored (boundary case) ───────────
+
+def test_dps_status_zero_is_rejected():
+    # status=0 is not a DPS-defined success; _map_dps_response must raise.
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={'status': 0, 'fiscal_id': ''})
+
+    with pytest.raises(TransportRejectedError, match='status=0'):
+        _send(_transport_with(handler))
+
+
+# ── transport_profile.endpoint overrides constructor URL ─────────────────────
+
+def test_transport_profile_endpoint_override():
+    captured_urls: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured_urls.append(str(req.url))
+        return httpx.Response(200, json={'status': 1, 'fiscal_id': 'FIS-OVR'})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    transport = FiscalSidecarTransport(
+        sidecar_url='http://default-host:8765',
+        http_client=client,
+    )
+
+    class FakeProfile:
+        endpoint = 'http://override-host:9999'
+
+    transport.send(
+        document_id='doc-ovr',
+        signed_payload=json.dumps(_CANONICAL),
+        fiscal_number='3001234567',
+        backend_profile_id='bp-1',
+        transport_profile_id='tp-1',
+        transport_profile=FakeProfile(),
+    )
+    assert len(captured_urls) == 1
+    assert 'override-host:9999' in captured_urls[0]
+    assert 'default-host' not in captured_urls[0]

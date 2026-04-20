@@ -21,15 +21,11 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING
 
 import httpx
 
 from ..enums import DocumentState
 from ..ports import SendResult, TransportRejectedError, TransportRetryableError
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger('prro_gateway.transports.fiscal_sidecar_v2')
 
@@ -40,7 +36,19 @@ _RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 class FiscalSidecarTransport:
     """Thin httpx client that posts canonical JSON to the Rust prro_sidecar."""
 
-    def __init__(self, *, sidecar_url: str, http_client: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        sidecar_url: str,
+        http_client: httpx.Client | None = None,
+        crypto_provider: str = 'passthrough',
+    ) -> None:
+        if crypto_provider != 'passthrough':
+            raise ValueError(
+                f'FiscalSidecarTransport requires crypto.provider=passthrough, '
+                f'got {crypto_provider!r}. Combining with the Python crypto sidecar '
+                f'would double-sign the payload.'
+            )
         self._base = sidecar_url.rstrip('/')
         self._client = http_client or httpx.Client(timeout=120.0)
 
@@ -104,6 +112,7 @@ def _map_dps_response(data: dict, document_id: str) -> SendResult:
     fiscal_id = data.get('fiscal_id', '')
     error_msg = data.get('error_message')
 
+    # status=1 is the only DPS-defined success value; 0 and negative are rejections.
     if status == 1:
         return SendResult(
             state=DocumentState.ACK,

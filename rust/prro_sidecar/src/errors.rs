@@ -33,8 +33,8 @@ impl axum::response::IntoResponse for SidecarError {
             Self::NotFound(m)    => (StatusCode::NOT_FOUND,             m.clone()),
             Self::License(m)     => (StatusCode::FORBIDDEN,             m.clone()),
             Self::Credentials(_) => (StatusCode::INTERNAL_SERVER_ERROR, "credential error".into()),
-            Self::CmsSign(m)     => (StatusCode::BAD_GATEWAY,           m.clone()),
-            Self::Grpc(m)        => (StatusCode::BAD_GATEWAY,           m.clone()),
+            Self::CmsSign(_)     => (StatusCode::BAD_GATEWAY,           "cms sign failed".into()),
+            Self::Grpc(_)        => (StatusCode::BAD_GATEWAY,           "dps unavailable".into()),
             Self::Db(_)          => (StatusCode::INTERNAL_SERVER_ERROR, "database error".into()),
             Self::Internal(_)    => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()),
         };
