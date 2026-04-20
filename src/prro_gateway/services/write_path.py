@@ -298,10 +298,10 @@ class WritePathWorker:
             # adapters/maria304_native.py::_enrich_service_payload).
             from ..validators.ua_receipt import validate_service_receipt
             violations = validate_service_receipt(command.payload)
-        elif (
-            command.operation_type == OperationType.CASH_WITHDRAWAL
-            and not maria304_bypass
-        ):
+        elif command.operation_type == OperationType.CASH_WITHDRAWAL:
+            # MARIA_304_NATIVE adapter parses 19-param CSHG body from
+            # raw_frames and synthesises cash_withdrawal_sum + CASHLESS
+            # payment (see _enrich_cashwithdrawal_payload).
             from ..validators.ua_receipt import validate_cash_withdrawal_receipt
             violations = validate_cash_withdrawal_receipt(command.payload)
         if violations:

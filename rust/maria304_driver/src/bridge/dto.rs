@@ -47,6 +47,7 @@ pub enum CommandType {
     ZReport,
     ServiceIn,
     ServiceOut,
+    CashWithdrawal,
     PeriodicReport,
 }
 

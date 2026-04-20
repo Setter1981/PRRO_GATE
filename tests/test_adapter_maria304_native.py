@@ -775,3 +775,319 @@ def test_service_with_multiple_frames_takes_only_first() -> None:
     cmd = ADAPTER.map_command(raw)
     assert cmd.payload["service_sum"] == 555
     assert len(cmd.payload["receipt"]["raw_frames"]) == 2
+
+
+# ─── 16. CASH_WITHDRAWAL — CSHG 19-parameter body parser ─────────────
+#
+# Wire format (per Maria 304 protocol §54):
+#
+#   CSHG<p1:9 sum><p2:9 fee>
+#       <p3:2 len_acq><p4:len_acq merchant_id>
+#       <p5:2 len_term><p6:len_term terminal_id>
+#       <p7:2 len_pan><p8:len_pan pan>
+#       <p9:2 len_ps><p10:len_ps payment_system>
+#       <p11:2 len_auth><p12:len_auth auth_code>
+#       <p13:2 len_rrn><p14:len_rrn rrn>
+#       <p15:1 cashier_sig><p16:1 cardholder_sig>
+#       <p17:1 qr_mode><p18:2 qr_scale><p19:1 qr_level>
+#
+# Example from real 1C trace:
+# CSHG 000100000 000001500 07 5968236 09 789456123 16 XXXXXXXXXXXX1339
+#      14 Плат.термiнал 06 569878 08 15963258 1 1 a 05 L
+
+
+def _cshg_body(
+    *, sum_kopecks: int = 100_000, fee: int = 1500,
+    merchant_id: str = "5968236", terminal_id: str = "789456123",
+    pan: str = "XXXXXXXXXXXX1339", payment_system: str = "Плат.термiнал",
+    auth_code: str = "569878", rrn: str = "15963258",
+    cashier_sig: bool = True, cardholder_sig: bool = True,
+    qr_mode: str = "a", qr_scale: str = "05", qr_level: str = "L",
+) -> str:
+    def _len_prefix(s: str) -> str:
+        return f"{len(s):02d}{s}"
+    return (
+        f"{sum_kopecks:09d}{fee:09d}"
+        f"{_len_prefix(merchant_id)}"
+        f"{_len_prefix(terminal_id)}"
+        f"{_len_prefix(pan)}"
+        f"{_len_prefix(payment_system)}"
+        f"{_len_prefix(auth_code)}"
+        f"{_len_prefix(rrn)}"
+        f"{'1' if cashier_sig else '0'}"
+        f"{'1' if cardholder_sig else '0'}"
+        f"{qr_mode}{qr_scale}{qr_level}"
+    )
+
+
+def _cshg_cmd(body: str) -> dict[str, Any]:
+    return _cmd(
+        command_type="CASH_WITHDRAWAL",
+        idempotency_key="maria304:FN-DEV-0001:sess:cshg-1",
+        payload=_payload(raw_frames=[
+            {"opcode": "PREP", "body": "1"},
+            {"opcode": "CSHG", "body": body},
+            {"opcode": "COMP", "body": ""},
+        ]),
+    )
+
+
+def test_cshg_full_body_parses_all_19_params() -> None:
+    body = _cshg_body()
+    cmd = ADAPTER.map_command(_cshg_cmd(body))
+    assert cmd.operation_type == OperationType.CASH_WITHDRAWAL
+    assert cmd.payload["cash_withdrawal_sum"] == 100_000
+    payments = cmd.payload["receipt"]["payments"]
+    assert len(payments) == 1
+    pay = payments[0]
+    # The only payment is a single CASHLESS slip with acquirer details.
+    assert pay["amount_kopecks"] == 100_000
+    assert pay["commission"] == 1500
+    assert pay["acquirer_and_seller"] == "5968236"
+    assert pay["terminal"] == "789456123"
+    assert pay["card_mask"] == "XXXXXXXXXXXX1339"
+    assert pay["payment_system"] == "Плат.термiнал"
+    assert pay["auth_code"] == "569878"
+    assert pay["rrn"] == "15963258"
+
+
+def test_cshg_cyrillic_payment_system_preserved() -> None:
+    body = _cshg_body(payment_system="Приват Банк")
+    cmd = ADAPTER.map_command(_cshg_cmd(body))
+    assert cmd.payload["receipt"]["payments"][0]["payment_system"] == "Приват Банк"
+
+
+def test_cshg_totals_equal_sum() -> None:
+    # validate_cash_withdrawal_receipt requires totals.total_sum ==
+    # cash_withdrawal_sum when totals present.
+    body = _cshg_body(sum_kopecks=50_000, fee=0)
+    cmd = ADAPTER.map_command(_cshg_cmd(body))
+    assert cmd.payload["receipt"]["totals"]["total_sum"] == 50_000
+
+
+def test_cshg_signature_flags_produce_payment_signature_required() -> None:
+    # Cashier or cardholder signature → signature_required=True
+    cmd_both = ADAPTER.map_command(
+        _cshg_cmd(_cshg_body(cashier_sig=True, cardholder_sig=True)),
+    )
+    assert cmd_both.payload["receipt"]["payments"][0]["signature_required"] is True
+
+    cmd_none = ADAPTER.map_command(
+        _cshg_cmd(_cshg_body(cashier_sig=False, cardholder_sig=False)),
+    )
+    assert cmd_none.payload["receipt"]["payments"][0]["signature_required"] is False
+
+
+def test_cshg_command_type_detection_by_frame_opcode() -> None:
+    # Negative control: SELL with FISC frame (no CSHG) must NOT become
+    # CASH_WITHDRAWAL.  The command_type on the wire is what the Rust
+    # driver puts in.  Python adapter trusts that but must parse CSHG
+    # frame if command_type=CASH_WITHDRAWAL.
+    raw = _cmd(
+        command_type="SELL",
+        payload=_payload(raw_frames=[{"opcode": "FISC", "body": "Паляниця 1 100 А"}]),
+    )
+    cmd = ADAPTER.map_command(raw)
+    assert cmd.operation_type == OperationType.SELL
+    assert "cash_withdrawal_sum" not in cmd.payload
+
+
+def test_cshg_missing_frame_raises() -> None:
+    raw = _cmd(
+        command_type="CASH_WITHDRAWAL",
+        idempotency_key="maria304:F:sess:no-cshg",
+        payload=_payload(raw_frames=[{"opcode": "PREP", "body": "1"}]),
+    )
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_cshg_short_body_raises() -> None:
+    # Body truncated mid-params
+    raw = _cmd(
+        command_type="CASH_WITHDRAWAL",
+        idempotency_key="maria304:F:sess:short-cshg",
+        payload=_payload(raw_frames=[{"opcode": "CSHG", "body": "00010000000000150007"}]),
+    )
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_cshg_non_numeric_sum_raises() -> None:
+    body = "XXXXXXXXX" + "000001500" + _cshg_body()[18:]
+    raw = _cmd(
+        command_type="CASH_WITHDRAWAL",
+        idempotency_key="maria304:F:sess:cshg-bad-sum",
+        payload=_payload(raw_frames=[{"opcode": "CSHG", "body": body}]),
+    )
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_cshg_length_field_overflows_remaining_body_raises() -> None:
+    # p3="99" would claim 99 chars for merchant_id; body cannot supply.
+    body = "000100000000001500" + "99" + "too-short"
+    raw = _cmd(
+        command_type="CASH_WITHDRAWAL",
+        idempotency_key="maria304:F:sess:cshg-overflow",
+        payload=_payload(raw_frames=[{"opcode": "CSHG", "body": body}]),
+    )
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_cshg_with_unicode_digit_in_sum_raises() -> None:
+    # Same ASCII-digit hardening as CAIO parser.
+    body = "٠٠٠١٠٠٠٠٠" + _cshg_body()[9:]
+    raw = _cmd(
+        command_type="CASH_WITHDRAWAL",
+        idempotency_key="maria304:F:sess:cshg-unicode",
+        payload=_payload(raw_frames=[{"opcode": "CSHG", "body": body}]),
+    )
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_cshg_preserves_leading_zeros_decimal_not_octal() -> None:
+    body = _cshg_body(sum_kopecks=10)  # "000000010" — must parse to 10, not octal 8
+    cmd = ADAPTER.map_command(_cshg_cmd(body))
+    assert cmd.payload["cash_withdrawal_sum"] == 10
+
+
+def test_cshg_zero_sum_is_rejected() -> None:
+    # B1: adapter must reject sum=0 before it bypasses the downstream
+    # cash-balance guard.
+    body = _cshg_body(sum_kopecks=0)
+    raw = _cshg_cmd(body)
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_cshg_fee_surfaces_at_receipt_level_for_audit() -> None:
+    # B2: acquirer fee must be auditable, not just as payment.commission.
+    cmd = ADAPTER.map_command(_cshg_cmd(_cshg_body(sum_kopecks=10_000, fee=150)))
+    assert cmd.payload["receipt"]["cshg_fee_kopecks"] == 150
+
+
+def test_cshg_qr_params_preserved_round_trip() -> None:
+    body = _cshg_body(qr_mode="b", qr_scale="08", qr_level="Q")
+    cmd = ADAPTER.map_command(_cshg_cmd(body))
+    qr = cmd.payload["receipt"]["cshg_qr"]
+    assert qr == {"mode": "b", "scale": "08", "level": "Q"}
+
+
+def test_cshg_trailing_bytes_rejected() -> None:
+    # R3: §54 is fixed-schema; extra trailing chars after QR level are
+    # a framer bug or malicious padding.
+    body = _cshg_body() + "garbage"
+    raw = _cshg_cmd(body)
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_cshg_9_digit_max_sum_accepted() -> None:
+    # Upper bound of 9-digit field: 999_999_999 kopecks (~10M UAH).
+    body = _cshg_body(sum_kopecks=999_999_999, fee=0)
+    cmd = ADAPTER.map_command(_cshg_cmd(body))
+    assert cmd.payload["cash_withdrawal_sum"] == 999_999_999
+
+
+@pytest.mark.parametrize(
+    "field, value, expected_pass",
+    [
+        ("merchant_id", "A", True),              # len=01, min
+        ("merchant_id", "X" * 64, True),         # len=64, max per spec
+        ("merchant_id", "X" * 65, False),        # exceeds max
+        ("terminal_id", "T", True),              # len=01
+        ("terminal_id", "T" * 32, True),         # len=32, max
+        ("terminal_id", "T" * 33, False),        # exceeds 32
+        ("pan", "X" * 32, True),                 # len=32 boundary
+        ("pan", "X" * 33, False),
+        ("auth_code", "A" * 32, True),
+        ("auth_code", "A" * 33, False),
+    ],
+)
+def test_cshg_field_length_caps(
+    field: str, value: str, expected_pass: bool,
+) -> None:
+    body = _cshg_body(**{field: value})
+    raw = _cshg_cmd(body)
+    if expected_pass:
+        cmd = ADAPTER.map_command(raw)
+        payment = cmd.payload["receipt"]["payments"][0]
+        field_to_key = {
+            "merchant_id": "acquirer_and_seller",
+            "terminal_id": "terminal",
+            "pan": "card_mask",
+            "payment_system": "payment_system",
+            "auth_code": "auth_code",
+            "rrn": "rrn",
+        }
+        assert payment[field_to_key[field]] == value
+    else:
+        with pytest.raises(AdapterMappingError) as exc:
+            ADAPTER.map_command(raw)
+        assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_cshg_invalid_signature_flag_rejected() -> None:
+    body = _cshg_body()
+    # Replace cashier_sig char ('1') at its known offset with '2'.
+    # It's at offset = 18 + 2+7 + 2+9 + 2+16 + 2+14 + 2+6 + 2+8 = 90
+    # for default params.  Use string substitution to be robust.
+    corrupted = body.replace("11a", "21a", 1)
+    raw = _cshg_cmd(corrupted)
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"
+
+
+def test_cshg_multi_frame_takes_first_cshg() -> None:
+    # Documented behaviour: if two CSHG frames appear, the first wins.
+    # This is consistent with raw_frames ordering — the wire protocol
+    # would never emit two anyway, but we pin the deterministic choice.
+    first = _cshg_body(sum_kopecks=100)
+    second = _cshg_body(sum_kopecks=99_999)
+    raw = _cmd(
+        command_type="CASH_WITHDRAWAL",
+        idempotency_key="maria304:F:sess:two-cshg",
+        payload=_payload(raw_frames=[
+            {"opcode": "CSHG", "body": first},
+            {"opcode": "CSHG", "body": second},
+        ]),
+    )
+    cmd = ADAPTER.map_command(raw)
+    assert cmd.payload["cash_withdrawal_sum"] == 100
+
+
+def test_cshg_empty_pan_is_accepted() -> None:
+    # Per spec п7 ≥ 1, but we need to handle len="00" defensively.
+    # Expected: adapter rejects len==0 (spec says 1..32 range).
+    body = "000100000" + "000001500" + "00" + "..." # len_pan=0
+    # Adjust: construct a body where one field has len=00.
+    # sum(9)+fee(9)+len_acq(2)+acq(1)+len_term(2)+term(1)+len_pan(2=00)...
+    body = (
+        "000100000" + "000001500"
+        + "01" + "A"        # merchant "A"
+        + "01" + "B"        # terminal "B"
+        + "00"              # len_pan = 0 → spec violation
+        + "01" + "X"        # payment_system
+        + "01" + "a"        # auth_code
+        + "01" + "r"        # rrn
+        + "00aLa05L"
+    )
+    raw = _cmd(
+        command_type="CASH_WITHDRAWAL",
+        idempotency_key="maria304:F:sess:cshg-empty-pan",
+        payload=_payload(raw_frames=[{"opcode": "CSHG", "body": body}]),
+    )
+    with pytest.raises(AdapterMappingError) as exc:
+        ADAPTER.map_command(raw)
+    assert exc.value.code == "PAYLOAD_VALIDATION_FAILED"

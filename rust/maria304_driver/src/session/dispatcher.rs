@@ -563,6 +563,11 @@ fn build_canonical(
             ),
             _ => unreachable!("build_canonical called outside ReceiptOpen state"),
         };
+    // A receipt that carries a CSHG frame is a cashback/ATM-style
+    // withdrawal (per Maria 304 protocol §54 — always its own receipt).
+    // Override Sell/Return with CashWithdrawal so the Python adapter
+    // selects the correct canonical operation path.
+    let has_cshg = raw_frames.iter().any(|f| f.opcode == "CSHG");
     let payload = ReceiptPayload {
         direction,
         goods: Vec::new(),
@@ -571,13 +576,18 @@ fn build_canonical(
         totals,
         raw_frames,
     };
+    let command_type = if has_cshg {
+        CommandType::CashWithdrawal
+    } else {
+        match direction {
+            crate::bridge::ReceiptDirection::Sale => CommandType::Sell,
+            crate::bridge::ReceiptDirection::Return => CommandType::Return,
+        }
+    };
     CanonicalCommand {
         schema_version: "1.0".to_string(),
         fiscal_number: identity.fiscal_number.clone(),
-        command_type: match direction {
-            crate::bridge::ReceiptDirection::Sale => CommandType::Sell,
-            crate::bridge::ReceiptDirection::Return => CommandType::Return,
-        },
+        command_type,
         idempotency_key: format!(
             "maria304:{}:{}:{}",
             identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq,

@@ -641,6 +641,65 @@ def test_service_in_with_caio_frame_passes_validator(tmp_path: Path) -> None:
     )
 
 
+def test_cash_withdrawal_with_cshg_frame_passes_validator(tmp_path: Path) -> None:
+    # Integration proof for M7-Py-3b: adapter parses 19-param CSHG
+    # body and synthesises cash_withdrawal_sum + CASHLESS payment
+    # matching the sum; validator passes on the enriched payload.
+    import json
+    from prro_gateway.validators.ua_receipt import validate_cash_withdrawal_receipt
+
+    def _cshg_body() -> str:
+        def _lp(s: str) -> str:
+            return f"{len(s):02d}{s}"
+        return (
+            "000050000" + "000000500"
+            + _lp("5968236") + _lp("789456123") + _lp("XXXXXXXXXXXX1339")
+            + _lp("Плат.термiнал") + _lp("569878") + _lp("15963258")
+            + "11a05L"
+        )
+
+    container = RuntimeContainer(_config(tmp_path))
+    raw = {
+        "schema_version": "1.0",
+        "fiscal_number": "FN-DEV-0001",
+        "command_type": "CASH_WITHDRAWAL",
+        "idempotency_key": "maria304:FN-DEV-0001:sess:cshg-e2e",
+        "cashier_id": "csh1",
+        "department": None,
+        "return_check_number": None,
+        "payload": {
+            "direction": "SALE",
+            "goods": [],
+            "payments": [],
+            "dual_tax_mode": None,
+            "totals": {"sale_kopecks": 0, "return_kopecks": 0},
+            "raw_frames": [
+                {"opcode": "PREP", "body": "1"},
+                {"opcode": "CSHG", "body": _cshg_body()},
+                {"opcode": "COMP", "body": ""},
+            ],
+        },
+    }
+    with TestClient(create_app(container)) as client:
+        r = client.post("/v1/ingress/maria304", json=raw, headers=_auth_headers())
+    assert r.status_code in (200, 503)
+    with container.connect() as conn:
+        row = conn.execute(
+            "SELECT payload_json FROM ingress_inbox WHERE protocol = 'MARIA_304_NATIVE' "
+            "AND operation_type = 'CASH_WITHDRAWAL' ORDER BY created_at DESC LIMIT 1",
+        ).fetchone()
+    assert row is not None
+    payload = json.loads(row[0])["payload"]
+    assert payload["cash_withdrawal_sum"] == 50000
+    assert payload["receipt"]["cshg_fee_kopecks"] == 500
+    assert len(payload["receipt"]["payments"]) == 1
+    # The proof: validator accepts the enriched payload.
+    violations = validate_cash_withdrawal_receipt(payload)
+    assert violations == [], (
+        f"CSHG enrichment did not satisfy validator: {violations}"
+    )
+
+
 def test_service_in_without_caio_frame_would_still_fail_validator(tmp_path: Path) -> None:
     # Negative control for the integration proof: confirm the
     # validator would reject if the adapter had NOT enriched — i.e.,

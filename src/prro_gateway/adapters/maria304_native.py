@@ -40,7 +40,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from ..enums import OperationType, Protocol
+from ..enums import AcquiringSource, OperationType, PaymentType, Protocol
 from .base import AdapterContext, AdapterMappingError, CanonicalEnvelopeBuilder
 
 _COMMAND_TO_OPERATION: dict[str, OperationType] = {
@@ -52,6 +52,7 @@ _COMMAND_TO_OPERATION: dict[str, OperationType] = {
     "Z_REPORT": OperationType.Z_REPORT,
     "SERVICE_IN": OperationType.SERVICE_IN,
     "SERVICE_OUT": OperationType.SERVICE_OUT,
+    "CASH_WITHDRAWAL": OperationType.CASH_WITHDRAWAL,
 }
 
 _UNSUPPORTED_COMMANDS: frozenset[str] = frozenset({"PERIODIC_REPORT"})
@@ -78,6 +79,31 @@ _CAIO_OPCODE_FOR_OPERATION: dict[OperationType, str] = {
 # framing; at this layer we see it as a UTF-8 str already.
 _CAIO_SUM_PREFIX_CHARS = 10
 _CAIO_DESCRIPTION_MAX_CHARS = 60
+
+# CSHG wire format (per Maria 304 protocol §54):
+# `<sum:9><fee:9><L:2 ACQ><L:2 TERM><L:2 PAN><L:2 PS><L:2 AUTH><L:2 RRN>
+#  <cashier_sig:1><cardholder_sig:1><qr_mode:1><qr_scale:2><qr_level:1>`
+# All numeric fields are ASCII digits; length prefixes are 2 digits.
+# The Rust driver decodes CP866 to UTF-8 at the wire layer
+# (rust/maria304_driver/src/wire/cp866.rs) before shipping the body to
+# us, so Python str codepoint indexing matches the length prefix count.
+_CSHG_SUM_CHARS = 9
+_CSHG_FEE_CHARS = 9
+_CSHG_LENGTH_FIELD_CHARS = 2
+_CSHG_TAIL_CHARS = 1 + 1 + 1 + 2 + 1  # flags + QR mode/scale/level
+
+# Per-field length caps per Maria 304 protocol §54 (CSHG command).
+# acquirer_id allows 1..64 chars; the rest 1..32.  Tighter caps catch
+# malformed frames + prevent downstream printer/buffer overruns.
+# Review finding R1.
+_CSHG_FIELD_LIMITS: dict[str, tuple[int, int]] = {
+    "merchant_id":    (1, 64),
+    "terminal_id":    (1, 32),
+    "pan":            (1, 32),
+    "payment_system": (1, 32),
+    "auth_code":      (1, 32),
+    "rrn":            (1, 32),
+}
 
 # Safety caps — generous but bounded.  A 2000-frame receipt is three
 # orders of magnitude above a realistic grocery-basket ceiling; anything
@@ -122,6 +148,8 @@ class Maria304NativeAdapter:
         payload = self._build_payload(raw_request, receipt_payload)
         if operation_type in _CAIO_OPCODE_FOR_OPERATION:
             self._enrich_service_payload(payload, operation_type)
+        elif operation_type == OperationType.CASH_WITHDRAWAL:
+            self._enrich_cashwithdrawal_payload(payload)
         now_utc = datetime.now(UTC)
         context = AdapterContext(
             request_id=self._build_request_id(fiscal_number, now_utc),
@@ -184,6 +212,62 @@ class Maria304NativeAdapter:
         description = body[_CAIO_SUM_PREFIX_CHARS:_CAIO_SUM_PREFIX_CHARS + _CAIO_DESCRIPTION_MAX_CHARS]
         payload["service_sum"] = int(sum_chars)
         payload["receipt"]["service_description"] = description
+
+    @staticmethod
+    def _enrich_cashwithdrawal_payload(payload: dict[str, Any]) -> None:
+        """Parse CSHG 19-parameter body and synthesise the canonical
+        CASH_WITHDRAWAL payload.
+
+        The Rust driver does NOT parse CSHG — it captures the body
+        verbatim into `raw_frames`.  Here we walk the 19 fields in
+        order, extract the acquirer slip details, and build a single
+        CASHLESS payment entry that matches `cash_withdrawal_sum` so
+        `validate_cash_withdrawal_receipt` passes downstream.
+        """
+        frames = payload.get("receipt", {}).get("raw_frames") or []
+        cshg_body: str | None = None
+        for frame in frames:
+            if isinstance(frame, dict) and frame.get("opcode") == "CSHG":
+                candidate = frame.get("body")
+                if isinstance(candidate, str):
+                    cshg_body = candidate
+                    break
+        if cshg_body is None:
+            raise AdapterMappingError(
+                "CASH_WITHDRAWAL requires a CSHG frame in raw_frames",
+                code="PAYLOAD_VALIDATION_FAILED",
+            )
+        parsed = _parse_cshg_body(cshg_body)
+        payment = {
+            "payment_id": "maria304-cshg-1",
+            "payment_type": PaymentType.CASHLESS.value,
+            "amount_kopecks": parsed["sum_kopecks"],
+            "amount": parsed["sum_kopecks"],
+            "commission": parsed["fee"],
+            "acquirer_and_seller": parsed["merchant_id"],
+            "terminal": parsed["terminal_id"],
+            "card_mask": parsed["pan"],
+            "payment_system": parsed["payment_system"],
+            "auth_code": parsed["auth_code"],
+            "rrn": parsed["rrn"],
+            "signature_required": parsed["cashier_sig"] or parsed["cardholder_sig"],
+            "acquiring_source": AcquiringSource.POS_INTEGRATION.value,
+        }
+        payload["cash_withdrawal_sum"] = parsed["sum_kopecks"]
+        payload["receipt"]["payments"] = [payment]
+        # Keep totals.total_sum consistent with the CSHG sum so the
+        # validator's cross-check passes.
+        totals = payload["receipt"].get("totals") or {}
+        totals["total_sum"] = parsed["sum_kopecks"]
+        payload["receipt"]["totals"] = totals
+        # Surface CSHG-specific metadata at receipt level for audit /
+        # reconciliation with acquirer statements (review finding B2).
+        payload["receipt"]["cshg_fee_kopecks"] = parsed["fee"]
+        payload["receipt"]["cshg_qr"] = {
+            "mode": parsed["qr_mode"],
+            "scale": parsed["qr_scale"],
+            "level": parsed["qr_level"],
+        }
 
     @staticmethod
     def _build_request_id(fiscal_number: str, now: datetime) -> str:
@@ -317,6 +401,108 @@ def _validate_raw_frames(frames: list[Any]) -> None:
                 f"raw_frames[{idx}].opcode must be a string",
                 code="PAYLOAD_VALIDATION_FAILED",
             )
+
+
+def _read_ascii_digits(body: str, offset: int, length: int, field: str) -> int:
+    end = offset + length
+    if len(body) < end:
+        raise AdapterMappingError(
+            f"CSHG body truncated at {field}",
+            code="PAYLOAD_VALIDATION_FAILED",
+        )
+    chunk = body[offset:end]
+    if not (chunk.isascii() and chunk.isdigit()):
+        raise AdapterMappingError(
+            f"CSHG {field} must be {length} ASCII digits; got {chunk!r}",
+            code="PAYLOAD_VALIDATION_FAILED",
+        )
+    return int(chunk)
+
+
+def _read_length_prefixed(body: str, offset: int, field: str) -> tuple[str, int]:
+    length = _read_ascii_digits(body, offset, _CSHG_LENGTH_FIELD_CHARS, f"{field}_len")
+    low, high = _CSHG_FIELD_LIMITS[field]
+    if length < low or length > high:
+        raise AdapterMappingError(
+            f"CSHG {field} length {length} out of [{low},{high}]",
+            code="PAYLOAD_VALIDATION_FAILED",
+        )
+    value_start = offset + _CSHG_LENGTH_FIELD_CHARS
+    value_end = value_start + length
+    if len(body) < value_end:
+        raise AdapterMappingError(
+            f"CSHG body truncated in {field} value (claimed length {length})",
+            code="PAYLOAD_VALIDATION_FAILED",
+        )
+    return body[value_start:value_end], value_end
+
+
+def _parse_cshg_body(body: str) -> dict[str, Any]:
+    if not isinstance(body, str):
+        raise AdapterMappingError(
+            "CSHG body must be a string",
+            code="PAYLOAD_VALIDATION_FAILED",
+        )
+    offset = 0
+    sum_kopecks = _read_ascii_digits(body, offset, _CSHG_SUM_CHARS, "sum")
+    offset += _CSHG_SUM_CHARS
+    fee = _read_ascii_digits(body, offset, _CSHG_FEE_CHARS, "fee")
+    offset += _CSHG_FEE_CHARS
+
+    merchant_id, offset = _read_length_prefixed(body, offset, "merchant_id")
+    terminal_id, offset = _read_length_prefixed(body, offset, "terminal_id")
+    pan, offset = _read_length_prefixed(body, offset, "pan")
+    payment_system, offset = _read_length_prefixed(body, offset, "payment_system")
+    auth_code, offset = _read_length_prefixed(body, offset, "auth_code")
+    rrn, offset = _read_length_prefixed(body, offset, "rrn")
+
+    tail_end = offset + _CSHG_TAIL_CHARS
+    if len(body) < tail_end:
+        raise AdapterMappingError(
+            "CSHG body truncated in trailing flags/QR params",
+            code="PAYLOAD_VALIDATION_FAILED",
+        )
+    # Strict: reject trailing garbage after the 19-param sequence.
+    # Review finding R3 — §54 is a fixed-schema frame, not extensible.
+    if len(body) > tail_end:
+        raise AdapterMappingError(
+            f"CSHG body has {len(body) - tail_end} trailing chars after params",
+            code="PAYLOAD_VALIDATION_FAILED",
+        )
+    cashier_sig_char = body[offset]
+    cardholder_sig_char = body[offset + 1]
+    if cashier_sig_char not in ("0", "1") or cardholder_sig_char not in ("0", "1"):
+        raise AdapterMappingError(
+            "CSHG signature flags must be '0' or '1'",
+            code="PAYLOAD_VALIDATION_FAILED",
+        )
+    qr_mode = body[offset + 2]
+    qr_scale = body[offset + 3:offset + 5]
+    qr_level = body[offset + 5]
+
+    # Zero-sum CSHG violates fiscal invariant (no real withdrawal).
+    # Reject at adapter boundary — review finding B1.
+    if sum_kopecks <= 0:
+        raise AdapterMappingError(
+            "CSHG sum must be > 0",
+            code="PAYLOAD_VALIDATION_FAILED",
+        )
+
+    return {
+        "sum_kopecks": sum_kopecks,
+        "fee": fee,
+        "merchant_id": merchant_id,
+        "terminal_id": terminal_id,
+        "pan": pan,
+        "payment_system": payment_system,
+        "auth_code": auth_code,
+        "rrn": rrn,
+        "cashier_sig": cashier_sig_char == "1",
+        "cardholder_sig": cardholder_sig_char == "1",
+        "qr_mode": qr_mode,
+        "qr_scale": qr_scale,
+        "qr_level": qr_level,
+    }
 
 
 __all__ = ["Maria304NativeAdapter"]
