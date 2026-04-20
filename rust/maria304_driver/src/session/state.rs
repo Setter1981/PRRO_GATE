@@ -29,9 +29,14 @@ pub enum SessionState {
     ReceiptOpen(OpenReceipt),
 }
 
-/// Placeholder for the in-flight receipt buffer.  M3 only tracks
-/// presence/absence; M4 extends this with goods, payments, slips,
-/// excise stamps, dual-tax mode, etc.
+/// In-flight receipt buffer.
+///
+/// M3 only tracked presence/absence; M4 extends this with raw wire
+/// commands the driver has accumulated since `PREP`.  Rich parsing
+/// of the fiscal-line format lives on the Python side (invariant
+/// DRV-1) — the driver keeps command bodies verbatim plus the
+/// scattered bits of metadata that CANC / COMP need to reset or
+/// serialise.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OpenReceipt {
     /// Department name from `PREP`.
@@ -39,7 +44,31 @@ pub struct OpenReceipt {
     /// Optional return-check number staged by `SetReturnCheckNumber`
     /// (`BCHN` on the wire) before `PREP`.
     pub return_check_number: Option<String>,
+    /// Direction flag — `Return` when the receipt opened via
+    /// `OpenReturnCheck` (internal — no wire opcode) or driver saw a
+    /// `SetCurrentCheckDirection` signal.  Session layer currently
+    /// always sets `Sale`; M7 adapter may flip it when the Python
+    /// gateway requests.
+    pub direction: ReceiptDirection,
+    /// Every accumulated FISC/BFIS/ARFI/ARBF/FICD/BFCD/TGCD/FINF/
+    /// GRBG/GREN/NLPR/ACLD/PSDt/CVAL/CSHG frame, in submission order.
+    pub raw_frames: Vec<super::super::bridge::RawFrame>,
+    /// Dual-tax mode set via `NLPR` — propagated into the canonical
+    /// envelope for the Python side to apply at every affected line.
+    pub dual_tax_mode: Option<DualTaxMode>,
+    /// Total sums provided via `SetCheckTotals` or derived from COMP.
+    pub totals: Totals,
+    /// Count of `PSDt` acquirer-slip frames already submitted — used
+    /// to stamp the `n` field on the wire.  Mirrored in [`Session`]
+    /// for dispatcher convenience; the receipt copy is the source of
+    /// truth across COMP.
+    pub psdt_sequence: u8,
 }
+
+// Re-export the small bridge-side types the receipt needs — keeps
+// callers from having to reach into `crate::bridge::*` when working
+// purely with session state.
+pub use super::super::bridge::{DualTaxMode, ReceiptDirection, Totals};
 
 /// Everything the session needs to answer a command.
 #[derive(Debug, Clone)]
