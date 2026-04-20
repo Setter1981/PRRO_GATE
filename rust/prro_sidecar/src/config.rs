@@ -41,8 +41,17 @@ fn default_log_level() -> String { "info".into() }
 /// Paths to certificate files used by the sidecar.
 ///
 /// Both files are updated independently (e.g. via a weekly cron/systemd timer):
-///   tls_chain  — `openssl s_client -connect prro.tax.gov.ua:443 -showcerts`
-///   ca_bundle  — downloaded from https://acskidd.gov.ua/CACertificates.p7b
+///
+///   tls_chain — TLS certificate chain of the DPS gRPC server.
+///     Obtain directly (no vendor dependency):
+///       openssl s_client -connect prro.tax.gov.ua:443 -showcerts \
+///         2>/dev/null | awk '/BEGIN CERT/,/END CERT/' > prro-tax-gov-ua-chain.pem
+///
+///   ca_bundle — Consolidated bundle of ALL accredited Ukrainian CA certificates
+///     (АЦСК ІДД ДПС, ПриватБанк, МастерКей, UAKey, К-Системс, Мін'юст,
+///      УСС, УкрСибБанк, DepositSign та ін.).
+///     Maintained by ІІТ (EUSignCP vendor) — the same bundle WebCheck uses:
+///       curl -O https://iit.com.ua/download/productfiles/CACertificates.p7b
 ///
 /// Per-endpoint overrides in [dps.prod] / [dps.test] take precedence over
 /// these globals (DpsEndpoint.ca_bundle).
@@ -52,8 +61,8 @@ pub struct CertsSection {
     /// Mirrors `C:\ProgramData\WebCheck\prro-tax-gov-ua-chain.pem`.
     #[serde(default = "default_tls_chain")]
     pub tls_chain: String,
-    /// ACSK CA certificates bundle (p7b or PEM) for EDS chain validation.
-    /// Primary source: acskidd.gov.ua (DPS's own CA).
+    /// Consolidated ACSK CA bundle (p7b) for EDS certificate chain validation.
+    /// Covers all accredited Ukrainian CAs — source: iit.com.ua/download/productfiles/CACertificates.p7b
     #[serde(default = "default_ca_bundle")]
     pub ca_bundle: String,
 }
