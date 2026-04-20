@@ -5,10 +5,10 @@
 //! (1C, BAS, etc.) which address the Resonance OLE Manager DLL
 //! cannot tell our virtual device apart from real hardware.
 //!
-//! Sprint M1 — wire layer only:
-//!   * [`wire::codec`] frame encode/decode
-//!   * [`wire::crc`]   custom CRC-16 (Maria polynomial)
-//!   * [`wire::cp866`] CP866 encoding bridge
-//!   * [`wire::llv`]   length-prefixed string encoder
+//! Sprint layout:
+//! * [`wire`]     — M1: frame codec, custom CRC-16, CP866, LLV.
+//! * [`protocol`] — M2: typed commands, responses, `COMP`/`CONF`
+//!   builders, error-code catalogue.
 
+pub mod protocol;
 pub mod wire;
