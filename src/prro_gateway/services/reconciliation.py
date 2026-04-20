@@ -398,14 +398,20 @@ class ReconciliationService:
                         channel_lock_acquired_at=doc.ack_at or doc.sent_at or datetime.now(UTC).isoformat(),
                         open_document_id=doc.document_id,
                     )
-                elif active_shift.state != ShiftState.OPENED:
+                elif active_shift.state in (ShiftState.OPENING, ShiftState.CREATED):
                     ShiftRepository.update_state(conn, shift_id=active_shift.shift_id, state=ShiftState.OPENED)
                     ShiftRepository.link_document(conn, shift_id=active_shift.shift_id, open_document_id=doc.document_id)
-                elif active_shift.open_document_id is None:
-                    ShiftRepository.link_document(conn, shift_id=active_shift.shift_id, open_document_id=doc.document_id)
+                elif active_shift.state == ShiftState.OPENED:
+                    if active_shift.open_document_id is None:
+                        ShiftRepository.link_document(conn, shift_id=active_shift.shift_id, open_document_id=doc.document_id)
+                else:
+                    logger.warning(
+                        'reconciliation_shift_invalid_state_for_open',
+                        extra={'extra_fields': {'shift_id': active_shift.shift_id, 'state': active_shift.state.value}},
+                    )
         elif op == OperationType.SHIFT_CLOSE and target_state == DocumentState.ACK:
             active_shift = ShiftRepository.get_active_shift(conn, doc.fiscal_number)
-            if active_shift is not None:
+            if active_shift is not None and active_shift.state in (ShiftState.OPENED, ShiftState.CLOSING):
                 ShiftRepository.update_state(conn, shift_id=active_shift.shift_id, state=ShiftState.CLOSED)
                 ShiftRepository.link_document(conn, shift_id=active_shift.shift_id, close_document_id=doc.document_id)
         elif op == OperationType.Z_REPORT and target_state == DocumentState.ACK:

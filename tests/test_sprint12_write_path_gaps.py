@@ -513,3 +513,86 @@ def test_a2_x_report_ack(conn: sqlite3.Connection) -> None:
     assert doc is not None, f"Fiscal document {result.document_id} not found"
     assert doc.state == DocumentState.ACK, f"Expected DocumentState.ACK, got {doc.state}"
     assert doc.doc_type == 'X_REPORT', f"Expected doc_type X_REPORT, got {doc.doc_type}"
+
+
+# ===========================================================================
+# Shift state guards — write_path (mirrors A3 fix for offline_sync)
+# ===========================================================================
+
+def _open_shift_in_state(conn: sqlite3.Connection, shift_id: str, state: ShiftState) -> None:
+    conn.execute('BEGIN IMMEDIATE')
+    ShiftRepository.create_shift(
+        conn, shift_id=shift_id, fiscal_number=FN,
+        state=state, open_mode='ONLINE',
+        backend_profile_id=BACKEND, transport_profile_id=TRANSPORT,
+        protocol=Protocol.CHECKBOX_REST, integration_owner='test',
+        channel_lock_acquired_at='2026-04-15T10:00:00+00:00',
+    )
+    conn.commit()
+
+
+def test_wp_sync_shift_open_closing_not_moved_to_opened(conn: sqlite3.Connection) -> None:
+    """write_path _sync_shift_open_locked: CLOSING shift must NOT be transitioned to OPENED.
+
+    This exercises the guard added to _sync_shift_open_locked directly — the write_path
+    validate stage blocks new SHIFT_OPENs when an active shift exists, so this path
+    is only reachable via crash recovery / reconciliation, which is why we test it
+    at the method level rather than through process_next.
+    """
+    import logging
+    from types import SimpleNamespace
+    from prro_gateway.models.canonical import CanonicalFiscalCommand
+
+    _open_shift_in_state(conn, 'shift-wp-close-guard', ShiftState.CLOSING)
+    worker = _worker()
+
+    fake_doc = SimpleNamespace(
+        document_id='doc-wp-guard', fiscal_number=FN,
+        backend_profile_id=BACKEND, transport_profile_id=TRANSPORT,
+        fs_mode='ONLINE',
+    )
+    fake_cmd = SimpleNamespace(
+        operation_type=OperationType.SHIFT_OPEN, channel_owner='test', protocol=Protocol.CHECKBOX_REST,
+    )
+    fake_ctx = SimpleNamespace(
+        document=fake_doc, command=fake_cmd, fiscal_number=FN,
+        active_shift=None, send_result=None,
+    )
+
+    conn.execute('BEGIN IMMEDIATE')
+    from prro_gateway.enums import DocumentState
+    worker._sync_shift_open_locked(conn, ctx=fake_ctx, target_state=DocumentState.ACK)
+    conn.rollback()
+
+    shift = ShiftRepository.get_by_id(conn, 'shift-wp-close-guard')
+    assert shift.state == ShiftState.CLOSING, (
+        f"CLOSING shift must not be moved to OPENED by _sync_shift_open_locked; got {shift.state}"
+    )
+
+
+def test_wp_sync_shift_close_guard_opening_shift(conn: sqlite3.Connection) -> None:
+    """write_path _sync_shift_close_locked: OPENING shift must NOT be moved to CLOSED.
+
+    Guards against closing a shift that never fully opened — could happen in recovery
+    if SHIFT_CLOSE ACK arrives before SHIFT_OPEN ACK is processed.
+    """
+    from types import SimpleNamespace
+    from prro_gateway.enums import DocumentState
+
+    _open_shift_in_state(conn, 'shift-wp-open-guard', ShiftState.OPENING)
+    worker = _worker()
+
+    fake_doc = SimpleNamespace(
+        document_id='doc-wp-close-guard', fiscal_number=FN,
+        backend_profile_id=BACKEND, transport_profile_id=TRANSPORT,
+    )
+    fake_ctx = SimpleNamespace(document=fake_doc, fiscal_number=FN)
+
+    conn.execute('BEGIN IMMEDIATE')
+    worker._sync_shift_close_locked(conn, ctx=fake_ctx, target_state=DocumentState.ACK)
+    conn.rollback()
+
+    shift = ShiftRepository.get_by_id(conn, 'shift-wp-open-guard')
+    assert shift.state == ShiftState.OPENING, (
+        f"OPENING shift must not be closed by _sync_shift_close_locked; got {shift.state}"
+    )

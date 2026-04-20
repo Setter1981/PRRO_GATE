@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from prro_gateway.enums import DocumentState, OperationType, Protocol, ShiftState, TransportKind
 from prro_gateway.models.canonical import CanonicalFiscalCommand, TraceContext
@@ -389,3 +391,76 @@ def test_reconcile_returns_correct_counts(conn):
     assert result.checked >= 1, f"checked must be >= 1, got {result.checked}"
     assert result.acked >= 1, f"acked must be >= 1, got {result.acked}"
     assert result.still_pending == 0, f"still_pending must be 0, got {result.still_pending}"
+
+
+# ---------------------------------------------------------------------------
+# Shift state guard — reconciliation (mirrors offline_sync A3 tests)
+# ---------------------------------------------------------------------------
+
+def _recon_fake_doc(doc_type: str) -> object:
+    return SimpleNamespace(
+        doc_type=doc_type,
+        fiscal_number='FN-DEV-0001',
+        document_id='doc-recon-guard',
+        fs_mode='ONLINE',
+        backend_profile_id='backend_checkbox_default',
+        transport_profile_id='transport_checkbox_rest_default',
+        request_id='req-recon-guard',
+        ack_at=datetime.now(UTC).isoformat(),
+        sent_at=None,
+    )
+
+
+def _create_recon_shift(conn, shift_id: str, state: ShiftState) -> None:
+    conn.execute('BEGIN IMMEDIATE')
+    ShiftRepository.create_shift(
+        conn,
+        shift_id=shift_id,
+        fiscal_number='FN-DEV-0001',
+        state=state,
+        open_mode='ONLINE',
+        backend_profile_id='backend_checkbox_default',
+        transport_profile_id='transport_checkbox_rest_default',
+        protocol=Protocol.CHECKBOX_REST,
+        integration_owner='test',
+        channel_lock_acquired_at=datetime.now(UTC).isoformat(),
+    )
+    conn.commit()
+
+
+def test_recon_shift_closing_not_moved_to_opened(conn, caplog) -> None:
+    """Reconciliation: CLOSING shift must NOT be transitioned to OPENED on SHIFT_OPEN ACK."""
+    _create_recon_shift(conn, 'shift-recon-closing', ShiftState.CLOSING)
+
+    with caplog.at_level(logging.WARNING, logger='prro_gateway.services.reconciliation'):
+        ReconciliationService._apply_shift_side_effects_locked(
+            conn, doc=_recon_fake_doc('SHIFT_OPEN'), target_state=DocumentState.ACK,
+        )
+
+    shift = ShiftRepository.get_by_id(conn, 'shift-recon-closing')
+    assert shift.state == ShiftState.CLOSING, 'CLOSING shift must not be moved to OPENED by reconciliation'
+    assert 'reconciliation_shift_invalid_state_for_open' in caplog.text
+
+
+def test_recon_shift_opening_transitions_to_opened(conn) -> None:
+    """Reconciliation: OPENING shift IS correctly transitioned to OPENED on SHIFT_OPEN ACK."""
+    _create_recon_shift(conn, 'shift-recon-opening', ShiftState.OPENING)
+
+    ReconciliationService._apply_shift_side_effects_locked(
+        conn, doc=_recon_fake_doc('SHIFT_OPEN'), target_state=DocumentState.ACK,
+    )
+
+    shift = ShiftRepository.get_by_id(conn, 'shift-recon-opening')
+    assert shift.state == ShiftState.OPENED, 'OPENING shift must be transitioned to OPENED'
+
+
+def test_recon_shift_close_guard_on_opening_shift(conn) -> None:
+    """Reconciliation: OPENING shift must NOT be moved to CLOSED on SHIFT_CLOSE ACK."""
+    _create_recon_shift(conn, 'shift-recon-close-guard', ShiftState.OPENING)
+
+    ReconciliationService._apply_shift_side_effects_locked(
+        conn, doc=_recon_fake_doc('SHIFT_CLOSE'), target_state=DocumentState.ACK,
+    )
+
+    shift = ShiftRepository.get_by_id(conn, 'shift-recon-close-guard')
+    assert shift.state == ShiftState.OPENING, 'OPENING shift must not be closed by reconciliation SHIFT_CLOSE'
