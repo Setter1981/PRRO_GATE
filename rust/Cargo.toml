@@ -4,4 +4,5 @@ members = [
     "prro_crypto",
     "prro_crypto_v2",
     "prro_sidecar",
+    "maria304_driver",
 ]
