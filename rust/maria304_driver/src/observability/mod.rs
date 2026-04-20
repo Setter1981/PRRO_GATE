@@ -18,4 +18,4 @@ pub mod metrics;
 
 pub use frame_trace::{FrameTrace, FrameTraceEntry, FrameTraceKind};
 pub use init::init_json_subscriber;
-pub use metrics::SessionMetrics;
+pub use metrics::{MetricsSnapshot, SessionMetrics};
