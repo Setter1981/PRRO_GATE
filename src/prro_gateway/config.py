@@ -60,10 +60,17 @@ class MariaIngressConfig(StrictModel):
     line_delimited_json: bool = True
 
 
+class Maria304IngressConfig(StrictModel):
+    enabled: bool = False
+    shared_token: str = ""
+    response_timeout_seconds: int = 10
+
+
 class IngressConfig(StrictModel):
     rest: RestIngressConfig = Field(default_factory=RestIngressConfig)
     xmlrpc: XmlRpcIngressConfig = Field(default_factory=XmlRpcIngressConfig)
     maria: MariaIngressConfig = Field(default_factory=MariaIngressConfig)
+    maria304: Maria304IngressConfig = Field(default_factory=Maria304IngressConfig)
 
 
 class LoggingConfig(StrictModel):

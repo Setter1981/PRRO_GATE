@@ -21,21 +21,56 @@
 - Повна петля: CSIN1→SHIFT_OPEN→SELL→Z_REPORT через Rust-бінар, Python дає `ACK/KVT2` назад.
 
 ### Не входить
-- CANCEL-операція. Rust може надіслати `command_type="CANCEL"`, але на нашому боці це не сюрвайвить write-path (немає `OperationType.CANCEL`). **Тимчасове рішення:** адаптер відхиляє CANCEL з `UNSUPPORTED_METHOD`. Rust-сторона і так сама очищає незафіскалений чек локально — CANC не повинен долітати до Python. Перевірити в M7-Py-4.
+- **CANCEL-операція** — перевірено по `rust/maria304_driver/src/bridge/dto.rs`: `CommandType` = {Sell, Return, ShiftOpen, ShiftClose, XReport, ZReport, ServiceIn, ServiceOut, PeriodicReport}. **CANCEL Rust не шле** — CANC опкод у session dispatcher лише локально чистить receipt state без побудови envelope. Пункт M7-Py-4 закритий до старту.
 - `dual_tax_mode` — лишаємо як annotation у `payload["receipt"]["dual_tax_mode"]`, write-path його не читає. Якщо в пілоті з'явиться вимога читати — окремий sprint.
+- **Rich parse `raw_frames` → canonical goods/payments** — у M4 Rust надсилає `goods: []`, `payments: []` (порожні), повна інформація лише в `raw_frames`. Адаптер зберігає raw_frames у payload як є; нормалізації FISC/ARFI/... у canonical goods НЕ робимо. Це окремий sprint M7-Py-5+, якщо з'явиться потреба.
 - Admin API розширення (force-close, listener reload) — окремо.
-- Маппінг `raw_frames` на локальний архів/трейс — у пілоті тримаємо їх у `payload["receipt"]["raw_frames"]`, не піднімаємо в окрему таблицю.
 
 ---
 
-## 2. Нерозв'язані питання (вирішити перед стартом)
+## 2. Точний контракт (звірено з Rust DTO)
 
-1. **Bearer token: де живе?**
-   - Варіант A: `config.ingress.maria304.shared_token` у YAML + env-override `${MARIA304_BRIDGE_TOKEN}`. Один токен на весь gateway. ✅ моя рекомендація — дзеркалить Rust-конфіг.
-   - Варіант B: per-FN у таблиці `fn_config`. Гнучкіше, але зайве для пілоту 1–5 кас.
-2. **Форма відповіді.** Rust чекає поля: `status` (ACK/REJECTED/SOFTBLOCK/ERROR_*), `document_state` (KVT1/KVT2/…), `fiscal_doc_number`, `message`, `correlation_id`. Що віддаємо, якщо `_maybe_process` повертає inbox у статусі `NEW` (воркер ще не дожував)?
-   - Пропозиція: якщо `process_result is None` або документ ще не у фінальному стані → `status="SOFTBLOCK"`, `message="pending"`. Rust це коректно трансформує в `SOFT_PROCESSING` фрейм і 1С повторить.
-3. **CANCEL.** Чи Rust-дрівер **реально** шле `command_type="CANCEL"` у HTTP, чи тільки чистить локально? Потрібно прочитати `rust/maria304_driver/src/session/dispatcher.rs::build_canonical` — якщо там гілка `CommandType::Cancel` будує envelope, то адаптер має хоч щось із ним робити, не просто `UNSUPPORTED_METHOD`.
+**Запит (Rust → Python):** поля `CanonicalCommand` з `rust/maria304_driver/src/bridge/dto.rs`:
+```
+schema_version: str                  # "1.0"
+fiscal_number: str
+command_type: str                    # SELL | RETURN | SHIFT_OPEN | SHIFT_CLOSE | X_REPORT | Z_REPORT | SERVICE_IN | SERVICE_OUT | PERIODIC_REPORT
+idempotency_key: str                 # "maria304:{fn}:{session_uuid}:{receipt_seq}[:opcode]"
+cashier_id: str | None
+department: str | None
+return_check_number: str | None
+payload: {
+  direction: "SALE" | "RETURN"
+  goods: [FiscalLine]                # порожні у M4, заповнюються пізніше
+  payments: [CanonicalPayment]       # те саме
+  dual_tax_mode: {tax_group_1, tax_group_2} | null
+  totals: {sale_kopecks, return_kopecks}
+  raw_frames: [{opcode, body}]       # завжди заповнені
+}
+```
+Auth: `Authorization: Bearer <shared_token>`.
+
+**Відповідь успіху (Python → Rust, 200 OK):** `CanonicalResponse`:
+```
+ok: bool                             # true
+document_id: str                     # наш UUID/req_id
+fiscal_id: str                       # DPS fiscal number (порожній якщо недоступний)
+fiscal_ts: str                       # ISO8601
+document_state: str                  # "ACK" | "KVT1" | "KVT2" | ...
+sale_total_kopecks: u64              # для COMP payload; 0 для reports
+return_total_kopecks: u64            # те саме
+```
+
+**Відповідь помилки (non-2xx):** body:
+```
+{"ok": false, "error_code": "SOFT_*", "error_message": "..."}
+```
+Rust очікує `error_code` починається з `"SOFT"` — інакше мапить у `SoftBlock`. Pending/voркер не дожував → відповідаємо 503 з `error_code="SOFT_PROCESSING"`.
+
+### Вирішено до старту
+1. **Bearer token** = `config.ingress.maria304.shared_token` у YAML + env-override `${MARIA304_BRIDGE_TOKEN}`. Один токен на весь gateway.
+2. **Pending case** (`process_result` None або не фінальний стан) → HTTP 503 з `{"ok": false, "error_code": "SOFT_PROCESSING", "error_message": "worker pending"}`. 1С повторить через 3с cooldown.
+3. **CANCEL** — знято зі скоупу, Rust не шле (звірено з CommandType enum у DTO).
 
 ---
 
@@ -46,21 +81,25 @@
 - `config.py`: `Maria304IngressConfig(BaseModel)` з полями `shared_token: SecretStr`, `response_timeout_seconds: int = 10`; додати у `IngressConfig`.
 - `adapters/maria304_native.py`: `Maria304NativeAdapter.map_command(raw) -> CanonicalFiscalCommand`.
   - `raw` = декодований Rust `CanonicalCommand` (див. `rust/maria304_driver/src/bridge/dto.rs`).
+  - Context будуємо всередині адаптера з полів Rust (немає окремого `context` блоку, як у checkbox):
+    - `AdapterContext(request_id=idempotency_key, fiscal_number=raw["fiscal_number"], business_ts=now_utc(), channel_owner="maria304-driver")`.
   - Мапінг:
-    - `command_type` → `OperationType` (SELL/RETURN/SHIFT_OPEN/SHIFT_CLOSE/X_REPORT/Z_REPORT). CANCEL → `AdapterMappingError(code="UNSUPPORTED_METHOD")`.
-    - `fiscal_number`, `correlation_id` → `AdapterContext`.
-    - `receipt.payment_kind` ({"CASH","CASHLESS_1","CASHLESS_2",…}) → `PaymentType` (CASH/CASHLESS/MIXED/OTHER).
-    - `receipt.totals` → `payload["receipt"]["totals"]`.
-    - `receipt.raw_frames` → `payload["receipt"]["raw_frames"]` (зберігаємо для аудиту).
-    - `receipt.dual_tax_mode` → `payload["receipt"]["dual_tax_mode"]`.
-    - `identity` → `payload["identity"]`.
-    - `external_request_id` = `correlation_id` (використовуємо як idempotency-hint).
-- **Юніт-тести** (`tests/adapters/test_maria304_native.py`):
-  - SHIFT_OPEN/CLOSE → правильний `OperationType` і мінімальний `payload`.
-  - SELL із товарами + CASH payment → `payload` має `receipt.goods`, `receipt.payments`, `raw_frames`.
-  - RETURN без `related_receipt_id` → пропускаємо (DPS теж пускає); перевіряємо що envelope валідний.
-  - CANCEL → `AdapterMappingError("UNSUPPORTED_METHOD")`.
-  - schema_version стемпнутий, idempotency_key детермінистичний від `correlation_id`.
+    - `command_type` → `OperationType` через просту таблицю (SELL→SELL, SHIFT_OPEN→SHIFT_OPEN, X_REPORT→X_REPORT, Z_REPORT→Z_REPORT, SERVICE_IN→SERVICE_IN, SERVICE_OUT→SERVICE_OUT, PERIODIC_REPORT→`AdapterMappingError(code="UNSUPPORTED_METHOD")` поки не wire-нули).
+    - `idempotency_key` з Rust → `external_request_id` (вже префіксований `"maria304:"` на Rust-боці; зберігаємо префікс).
+    - `payload` (Rust ReceiptPayload) → `payload["receipt"]` плюс cashier_id/department/return_check_number на верхньому рівні `payload`.
+    - `payload["receipt"]["raw_frames"]`, `payload["receipt"]["direction"]`, `payload["receipt"]["totals"]`, `payload["receipt"]["dual_tax_mode"]` — прямо з Rust.
+    - `payload["receipt"]["goods"]`, `payload["receipt"]["payments"]` — прямо з Rust (у M4 порожні; залишаємо, не падаємо).
+- **Юніт-тести** (`tests/test_adapter_maria304_native.py` — паттерн інших adapter-тестів):
+  - SELL із порожніми goods/payments, але заповненим raw_frames → валідний envelope, protocol=`MARIA_304_NATIVE`, operation_type=`SELL`, raw_frames передані.
+  - SELL із непорожніми goods+payments → зберігаються в payload.
+  - RETURN → operation_type=`RETURN`.
+  - SHIFT_OPEN/SHIFT_CLOSE/X_REPORT/Z_REPORT/SERVICE_IN/SERVICE_OUT → правильний OperationType; payload["receipt"] залишається (бо Rust завжди його шле).
+  - PERIODIC_REPORT → `AdapterMappingError(code="UNSUPPORTED_METHOD")`.
+  - Невідомий command_type ("ZZZZ") → `AdapterMappingError`.
+  - idempotency_key з Rust → в `external_request_id`, `CanonicalEnvelopeBuilder` формує canonical idempotency як `{op}:{fiscal}:{external_request_id}`.
+  - `schema_version` (з глобальної константи) стемпнутий на envelope незалежно від Rust-`schema_version` (Rust-`schema_version` — це версія Maria-протоколу, не canonical).
+  - `dual_tax_mode` передається як є або лишається `None`.
+  - Валідний мінімум: відсутність `cashier_id`/`department` не валить адаптер.
 
 **Acceptance M7-Py-1:** `pytest tests/adapters/test_maria304_native.py -v` зелене, `mypy src/prro_gateway/adapters/maria304_native.py` чисто.
 
@@ -71,17 +110,19 @@
   - `DEFAULT_RESPONSE_TIMEOUT_MARIA304_SECONDS` у `constants.py` (дефолт 10с, як у Rust бріджа request_timeout).
 - `runtime/rest_app.py`:
   - `_require_maria304_token(request: Request) -> None` (FastAPI Depends). Читає `Authorization: Bearer <token>`, compare з `container.config.ingress.maria304.shared_token` через `hmac.compare_digest`. Відхиляє 401 якщо відсутній, 403 якщо не збігається.
-  - `@app.post("/v1/ingress/maria304")` — віддає JSON у формі Rust `CanonicalResponse` (fields: `status`, `document_state`, `fiscal_doc_number`, `correlation_id`, `message`).
+  - `@app.post("/v1/ingress/maria304")` — віддає JSON у формі Rust `CanonicalResponse`:
+    - `ok: bool`, `document_id: str`, `fiscal_id: str`, `fiscal_ts: str` (ISO8601), `document_state: str`, `sale_total_kopecks: int`, `return_total_kopecks: int`.
   - Мапінг `process_result` → відповідь:
-    - Документ у `KVT2/ACK` → `status="ACK"`, `document_state="KVT2"`, `fiscal_doc_number=document.server_fiscal_no`.
-    - `REJECTED/CANCELLED` → `status="REJECTED"`, `document_state=state`, `message=error`.
-    - `ERROR_RETRYABLE` або inbox у `NEW/PROCESSING` → `status="SOFTBLOCK"`, `message="pending"`.
+    - Документ у `KVT2/ACK` → 200, `ok=true`, `document_id=inbox.request_id`, `fiscal_id=document.server_fiscal_no or ""`, `document_state="KVT2"/"ACK"`, суми з документа.
+    - `REJECTED/CANCELLED` → 400, `{"ok": false, "error_code": "SOFT_<...>", "error_message": ...}` (mapping codes→SOFT_*).
+    - `ERROR_RETRYABLE` або inbox у `NEW/PROCESSING` → 503, `{"ok": false, "error_code": "SOFT_PROCESSING", "error_message": "worker pending"}`.
+    - Адаптер кинув `AdapterMappingError` → 400, `{"ok": false, "error_code": "SOFT_UNSUPPORTED", "error_message": str}`.
 - `runtime/container.py`: нічого не міняємо (`IngressAcceptService` уже живе в контейнері).
 - **Контракт-тести** (`tests/runtime/test_maria304_endpoint.py`, FastAPI `TestClient`):
   - 401 без заголовка, 403 на невалідному токені (constant-time).
   - 200 + правильна shape на SHIFT_OPEN-happy.
   - 400 + `UNSUPPORTED_METHOD` на CANCEL.
-  - idempotency: повторний POST з тим же `correlation_id` → той самий `inbox.request_id`, `is_replay=true` не ламає відповідь.
+  - idempotency: повторний POST з тим же `idempotency_key` → той самий `document_id`, `is_replay=true` не ламає відповідь.
 
 **Acceptance M7-Py-2:** `pytest tests/runtime/test_maria304_endpoint.py -v` зелене, `mypy` на зміненому коді чисто, ручний `curl -H "Authorization: Bearer …" … /v1/ingress/maria304` на запущеному gateway повертає 200 з очікуваною shape.
 
@@ -95,9 +136,8 @@
 
 **Acceptance M7-Py-3:** повна послідовність пройшла, Python-архів має 3 документи в `KVT2`.
 
-### M7-Py-4 — ревізія CANCEL
-- Прочитати `rust/maria304_driver/src/session/dispatcher.rs` гілку CANC → якщо Rust реально шле CANCEL у HTTP (а не тільки очищає локально), запроєктувати окрему під-задачу: `OperationType.CANCEL`, обробник у `write_path`, або гарантувати на Rust-боці що CANC ніколи не конвертується в CanonicalCommand.
-- Це гілка "якщо": в кращому разі пункт закривається одним коміт-правкою на Rust-стороні (не будувати envelope для CANC).
+### ~~M7-Py-4 — ревізія CANCEL~~ (знято)
+Звірено до старту: CANC опкод у Rust dispatcher лише локально скидає receipt state, не будує envelope. CANCEL відсутній у `CommandType` enum. Фази 3.
 
 ---
 
@@ -137,6 +177,17 @@
 - `ops/config.example.yaml` — секція `ingress.maria304`
 
 ---
+
+## 5a. Блокер M7-Py-2 (виявлено security-review у фазі M7-Py-1)
+
+`services/write_path.py` маршрутизує SELL/RETURN через `validators/ua_receipt.py::validate_sell_return_receipt`, який відхиляє envelope із порожнім `receipt.goods` з `INVALID_RECEIPT_DATA`. У M4 Rust-драйвер шле `goods: []` (rich parse у Python поки не реалізовано). Без додаткової роботи всі SELL/RETURN від Maria 304 впадуть на validator-stage.
+
+**Варіанти перед М7-Py-2:**
+1. **Rich parse raw_frames → canonical goods** у адаптері (найчесніший, але великий обсяг: опкоди FISC/BFIS/ARFI/ARBF/FICD/BFCD/FINF/TGCD/GRBG/ACLD/PSDt/CSHG + агрегація в CanonicalReceiptItem).
+2. **Protocol-aware validator dispatch** у `write_path.py`: якщо `protocol == MARIA_304_NATIVE`, пропускати goods-validator, бо аудит вже в raw_frames.
+3. **Compromise:** синтетичний single-item `"[Maria 304 receipt — see raw_frames]"` у адаптері, сума = totals.sale_kopecks, tax_group з dual_tax_mode[0].
+
+Рекомендую (2) — найменший діф, чіткий контракт, raw_frames лишаються джерелом правди для аудиту. Вибір остаточно — перед стартом M7-Py-2.
 
 ## 6. Ризики
 
