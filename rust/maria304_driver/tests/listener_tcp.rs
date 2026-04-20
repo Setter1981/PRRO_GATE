@@ -57,7 +57,7 @@ async fn spawn_listener(fn_id: &str, cooldown: Duration) -> (String, Arc<MockBri
 /// `read_frame` calls on the same stream don't lose bytes between
 /// frames delivered in a single TCP read.
 struct Reader {
-    buf: Vec<u8>,
+    pub buf: Vec<u8>,
     scratch: [u8; 128],
 }
 
@@ -154,6 +154,30 @@ async fn post_disconnect_cooldown_rejects_immediate_reconnect() {
     third.write_all(&req).await.unwrap();
     let r = third_reader.next_frame(&mut third).await;
     assert_eq!(r, "DONE");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn csin1_response_is_sent_without_crc_matching_request_mode() {
+    // Protocol semantics: a CSIN1 request is sent with CRC=off, and
+    // its DONE/READY response MUST also be without CRC — the toggle
+    // takes effect starting from the NEXT command.  The original
+    // M6 draft flipped the flag before writing CSIN1's own response,
+    // which made the client read extra CRC bytes as junk.
+    let (addr, _bridge) = spawn_listener("FN-CRC", Duration::from_millis(10)).await;
+    let mut client = TcpStream::connect(&addr).await.unwrap();
+    let mut reader = Reader::new();
+
+    client.write_all(&encode_frame("CSIN1", false).unwrap()).await.unwrap();
+    assert_eq!(reader.next_frame(&mut client).await, "DONE");
+    assert_eq!(reader.next_frame(&mut client).await, "READY");
+    // reader.buf must be empty — if the server had sent CRC bytes
+    // the reader would have 2 leftover bytes that decode_frame
+    // cannot interpret.
+    assert!(
+        reader.buf.is_empty(),
+        "CSIN1 response must not carry trailing CRC bytes, got {:02X?}",
+        reader.buf,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

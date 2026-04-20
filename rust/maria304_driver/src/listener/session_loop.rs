@@ -61,11 +61,18 @@ pub async fn run_connection(
     let mut scratch = [0u8; 1024];
 
     loop {
+        // Capture the CRC flag BEFORE dispatch runs.  CSIN1 flips
+        // the flag during its dispatch arm, but its own response
+        // (DONE + READY) must be sent using the flag value that was
+        // active when the incoming CSIN1 was parsed — otherwise the
+        // client, which read CSIN1's response with CRC=off, would
+        // see extra CRC bytes as junk bytes on the wire.
+        let crc_for_write = session.crc_enabled;
         if let Some(responses) =
             try_handle_buffered(&mut buf, &mut session, &identity, &bridge, &*clock_src, &mut correlation)
         {
             for resp in responses {
-                write_response(&mut stream, &resp, session.crc_enabled).await?;
+                write_response(&mut stream, &resp, crc_for_write).await?;
             }
             continue;
         }

@@ -106,6 +106,24 @@ impl FnListener {
     }
 }
 
+/// RAII guard — releases the gate and starts the cooldown timer no
+/// matter how `handle_incoming` exits: normal return, I/O error, or
+/// panic inside the inner async task.  A plain sequential
+/// `gate.release()` at the end of `handle_incoming` would leak the
+/// gate forever if anything above it panicked, making the FN
+/// permanently unreachable until the process restarts.
+struct SlotGuard {
+    gate: Arc<ConnectionGate>,
+    cooldown: Arc<Cooldown>,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+        self.cooldown.start_now();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_incoming(
     mut stream: TcpStream,
@@ -127,6 +145,10 @@ async fn handle_incoming(
         reject_with_softblock(&mut stream).await;
         return;
     }
+    // Only AFTER we have successfully acquired the slot do we arm
+    // the drop guard — otherwise a reject path would mistakenly
+    // release something that was never held.
+    let _slot = SlotGuard { gate, cooldown };
     let session_uuid = session_uuid();
     tracing::info!(%peer, uuid = %session_uuid, "session accepted");
     let run = run_connection(stream, identity, bridge, clock, session_uuid.clone(), idle).await;
@@ -135,8 +157,8 @@ async fn handle_incoming(
     } else {
         tracing::info!(%peer, uuid = %session_uuid, "session ended");
     }
-    gate.release();
-    cooldown.start_now();
+    // _slot drops here — equivalent to the previous explicit
+    // release()+start_now(), but now also runs during unwind.
 }
 
 /// Emit a `SOFTBLOCK` frame without CRC (CRC is not yet enabled at
