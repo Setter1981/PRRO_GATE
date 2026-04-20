@@ -1,0 +1,17 @@
+[package]
+name = "maria304_driver"
+version = "0.1.0"
+edition = "2021"
+description = "Virtual Maria 304 fiscal register TCP emulator — ingress bridge to PRRO Gateway"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "1.0"
+
+[dev-dependencies]
+hex = "0.4"
+
+[lints.clippy]
+pedantic = "warn"
