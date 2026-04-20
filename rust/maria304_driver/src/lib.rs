@@ -15,9 +15,12 @@
 //!   + in-memory `MockBridge` for integration tests.
 //! * [`listener`] — M6: tokio TCP listener per `fiscal_number` +
 //!   single-connection exclusion gate + 3s cooldown + idle timeout.
+//! * [`observability`] — M8: JSON tracing subscriber helper,
+//!   per-session frame-trace ring buffer, atomic metrics counters.
 
 pub mod bridge;
 pub mod listener;
+pub mod observability;
 pub mod protocol;
 pub mod session;
 pub mod wire;
