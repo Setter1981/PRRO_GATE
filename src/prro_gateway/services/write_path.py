@@ -304,7 +304,10 @@ class WritePathWorker:
             and _existing.state == DocumentState.ERROR_RETRYABLE
             and _existing.transport_request_id is None
         ):
-            FiscalDocumentRepository.update_state(conn, document_id=_existing.document_id, state=DocumentState.PREPARED)
+            FiscalDocumentRepository.update_state(
+                conn, document_id=_existing.document_id, state=DocumentState.PREPARED,
+                expected_states=(DocumentState.ERROR_RETRYABLE,),
+            )
             ctx.document = FiscalDocumentRepository.get_by_id(conn, _existing.document_id)
             conn.commit()
             return ctx, None
@@ -672,7 +675,15 @@ class WritePathWorker:
         _ns = NodeStateRepository.get_state(conn, ctx.fiscal_number)
         if _recovery_confirmed and _ns is not None and _ns.mode == NodeMode.CRYPTO_DEGRADED:
             NodeStateRepository.update_mode(conn, fiscal_number=ctx.fiscal_number, mode=NodeMode.ONLINE)
-        ctx.document = FiscalDocumentRepository.update_state(conn, document_id=ctx.document.document_id, state=DocumentState.SIGNED)
+        _doc_id = ctx.document.document_id
+        ctx.document = FiscalDocumentRepository.update_state(
+            conn, document_id=_doc_id, state=DocumentState.SIGNED,
+            expected_states=(DocumentState.PREPARED,),
+        )
+        if ctx.document is None:
+            conn.rollback()
+            self.logger.info('stage_sign_idempotent', extra={'extra_fields': {'document_id': _doc_id}})
+            return ctx, None
         # Persist unsigned DPS XML payload for MAC chain (only for DPS profiles)
         if sign_input != (ctx.inbox.payload_json if ctx.inbox else ''):
             DocumentFilesRepository.add_file(
@@ -1119,11 +1130,16 @@ class WritePathWorker:
                     channel_lock_acquired_at=ctx.send_result.ack_at.isoformat() if ctx.send_result and ctx.send_result.ack_at else datetime.now(UTC).isoformat(),  # send_result is None for OFFLINE path; guard falls to now()
                     open_document_id=ctx.document.document_id,
                 )
-            elif active_shift.state != ShiftState.OPENED:
+            elif active_shift.state in (ShiftState.OPENING, ShiftState.CREATED):
                 ShiftRepository.update_state(conn, shift_id=active_shift.shift_id, state=ShiftState.OPENED)
                 ShiftRepository.link_document(conn, shift_id=active_shift.shift_id, open_document_id=ctx.document.document_id)
-            elif active_shift.open_document_id is None:
-                ShiftRepository.link_document(conn, shift_id=active_shift.shift_id, open_document_id=ctx.document.document_id)
+            elif active_shift.state == ShiftState.OPENED:
+                if active_shift.open_document_id is None:
+                    ShiftRepository.link_document(conn, shift_id=active_shift.shift_id, open_document_id=ctx.document.document_id)
+            else:
+                self.logger.warning('write_path_shift_invalid_state_for_open', extra={'extra_fields': {
+                    'shift_id': active_shift.shift_id, 'state': active_shift.state.value,
+                }})
             return
         if target_state in {DocumentState.SENT, DocumentState.KVT1, DocumentState.KVT2} and active_shift is None:
             ShiftRepository.create_shift(
@@ -1145,8 +1161,9 @@ class WritePathWorker:
         if active_shift is None:
             return
         if target_state in {DocumentState.ACK, DocumentState.OFFLINE_LOCAL_ACK}:
-            ShiftRepository.update_state(conn, shift_id=active_shift.shift_id, state=ShiftState.CLOSED)
-            ShiftRepository.link_document(conn, shift_id=active_shift.shift_id, close_document_id=ctx.document.document_id)
+            if active_shift.state in (ShiftState.OPENED, ShiftState.CLOSING):
+                ShiftRepository.update_state(conn, shift_id=active_shift.shift_id, state=ShiftState.CLOSED)
+                ShiftRepository.link_document(conn, shift_id=active_shift.shift_id, close_document_id=ctx.document.document_id)
             return
         if target_state in {DocumentState.SENT, DocumentState.KVT1, DocumentState.KVT2}:
             if active_shift.state != ShiftState.CLOSING:
