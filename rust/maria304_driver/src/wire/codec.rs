@@ -23,20 +23,27 @@ pub const MAX_CMD_LEN: usize = 252;
 /// Errors raised by the codec.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FrameError {
+    /// Command byte-length is outside the `[MIN_CMD_LEN, MAX_CMD_LEN]` range.
     #[error("command must be between {MIN_CMD_LEN} and {MAX_CMD_LEN} bytes (got {0})")]
     InvalidCmdLen(usize),
+    /// Caller passed an empty buffer.
     #[error("frame buffer is empty")]
     Empty,
+    /// First byte of the buffer is not `0xFD`.  Caller should advance
+    /// past the junk byte and retry.
     #[error("no start byte 0xFD in the buffer prefix")]
     MissingStart,
+    /// Partial frame — valid prefix but end byte not yet reached.
+    /// Caller must keep buffering and retry.
     #[error("no end byte 0xFE reached — partial frame, need more bytes")]
     Incomplete,
-    #[error("length byte ({len}) does not match payload window ({expected})")]
-    LengthMismatch { len: u8, expected: u8 },
+    /// Buffer contained `MAX_CMD_LEN + overhead` bytes but no self-consistent
+    /// frame was found — the stream is corrupt or the peer is mis-behaving.
+    #[error("no self-consistent frame found within max-cmd-len window")]
+    NoFrameFound,
+    /// Trailing CRC bytes did not validate against the payload.
     #[error("CRC mismatch — frame is corrupt")]
     BadCrc,
-    #[error("payload too short for declared length")]
-    ShortPayload,
 }
 
 /// A single decoded frame.
@@ -59,32 +66,39 @@ pub struct Frame {
 ///
 /// # Errors
 /// [`FrameError::InvalidCmdLen`] if the command is not 4..=252 bytes.
+pub fn encode_frame(cmd: &str, with_crc: bool) -> Result<Vec<u8>, FrameError> {
+    let payload = cp866::encode(cmd);
+    encode_frame_bytes(&payload, with_crc)
+}
+
+/// Encode an already-byte-encoded payload into a wire frame.
+///
+/// This is the lower-level entry point used by [`encode_frame`] after
+/// running CP866 conversion.  It is public so tests can prove the
+/// reserved-byte sanitization branch: CP866 never produces `0xFE`/`0xFF`,
+/// so the sanitizer is unreachable via [`encode_frame`] and must be
+/// exercised by feeding raw bytes directly.
+///
+/// # Errors
+/// [`FrameError::InvalidCmdLen`] if the payload is not 4..=252 bytes.
 ///
 /// # Panics
 /// Never — `sanitized.len() + 1` is bounded by `MAX_CMD_LEN + 1 == 253`
 /// and therefore always fits in `u8`.
-pub fn encode_frame(cmd: &str, with_crc: bool) -> Result<Vec<u8>, FrameError> {
-    let payload = cp866::encode(cmd);
+pub fn encode_frame_bytes(payload: &[u8], with_crc: bool) -> Result<Vec<u8>, FrameError> {
     if payload.len() < MIN_CMD_LEN || payload.len() > MAX_CMD_LEN {
         return Err(FrameError::InvalidCmdLen(payload.len()));
     }
 
-    // Strip reserved bytes from the payload (matches
-    // Resonance.EKKR.Message.GetBytes — not a theoretical edge: any
-    // CP866 glyph that maps to 0xFE/0xFF would otherwise collide with
-    // framing markers and desynchronise the parser).
-    let mut sanitized = payload;
-    for b in &mut sanitized {
-        if *b >= END {
-            *b = SANITIZE_BYTE;
-        }
-    }
-
-    let mut out = Vec::with_capacity(3 + sanitized.len() + if with_crc { 2 } else { 0 });
+    let mut out = Vec::with_capacity(3 + payload.len() + if with_crc { 2 } else { 0 });
     out.push(START);
-    out.extend_from_slice(&sanitized);
-    // SAFETY: sanitized.len() is bounded by MAX_CMD_LEN (252), so +1 fits in u8.
-    out.push(u8::try_from(sanitized.len() + 1).expect("len+1 ≤ 253"));
+    // Strip reserved bytes from the payload (matches
+    // Resonance.EKKR.Message.GetBytes): any 0xFE/0xFF would otherwise
+    // collide with framing markers and desynchronise the parser.
+    for &b in payload {
+        out.push(if b >= END { SANITIZE_BYTE } else { b });
+    }
+    out.push(u8::try_from(payload.len() + 1).expect("payload.len()+1 ≤ 253 by MAX_CMD_LEN"));
     out.push(END);
 
     if with_crc {
@@ -159,21 +173,23 @@ pub fn decode_frame(buf: &[u8], with_crc: bool) -> Result<(Frame, usize), FrameE
                     return Err(FrameError::BadCrc);
                 }
             }
+            // INVARIANT: payload.len() = end_idx - 2 ≥ MIN_CMD_LEN is
+            // guaranteed by the loop bound `1 + MIN_CMD_LEN + 1` below.
             let payload = &buf[1..end_idx - 1];
-            if payload.len() < MIN_CMD_LEN {
-                return Err(FrameError::ShortPayload);
-            }
+            debug_assert!(payload.len() >= MIN_CMD_LEN);
             let text = cp866::decode(payload);
             let consumed = end_idx + 1 + if with_crc { 2 } else { 0 };
             return Ok((Frame { text, had_crc: with_crc }, consumed));
         }
     }
 
-    // No END within MAX_CMD_LEN — either incomplete or corrupt.
+    // No self-consistent frame in the scan range.  Two cases:
+    //   * We've not yet buffered enough bytes — caller retries later.
+    //   * The stream is definitely corrupt — caller must resync.
     if buf.len() < 1 + MAX_CMD_LEN + 2 + if with_crc { 2 } else { 0 } {
         Err(FrameError::Incomplete)
     } else {
-        Err(FrameError::LengthMismatch { len: 0, expected: 0 })
+        Err(FrameError::NoFrameFound)
     }
 }
 
@@ -242,14 +258,30 @@ mod tests {
 
     #[test]
     fn payload_bytes_fe_ff_are_sanitized_to_space() {
-        // This is defensive — valid CP866 never produces 0xFE/0xFF, but
-        // the sanitizer protects the wire if someone stuffs raw bytes.
-        // We can't trigger 0xFE via the CP866 encoder, but the sanitize
-        // loop must not alter legitimate bytes.
-        let encoded = encode_frame("FISC", false).unwrap();
-        for b in &encoded[1..encoded.len() - 2] {
-            assert!(*b != END && *b != RESERVED_FF, "no reserved byte in payload");
-        }
+        // Direct proof: feed raw bytes containing 0xFE and 0xFF via the
+        // lower-level `encode_frame_bytes` entry point.  Both must be
+        // rewritten to 0x20 (space) — that is the exact behavior of
+        // Resonance.EKKR.Message.GetBytes.
+        let raw: &[u8] = &[b'A', 0xFE, b'B', 0xFF];
+        let encoded = encode_frame_bytes(raw, false).unwrap();
+        // Layout: [0xFD] [A][0x20][B][0x20] [len=5] [0xFE]
+        assert_eq!(
+            encoded,
+            vec![0xFD, b'A', 0x20, b'B', 0x20, 0x05, 0xFE],
+            "sanitizer drifted from reference — 0xFE/0xFF must become 0x20",
+        );
+    }
+
+    #[test]
+    fn sanitized_frame_still_decodes_to_valid_text() {
+        // After sanitization the roundtrip obviously changes the text
+        // (original bytes are lost), but the frame must still be
+        // structurally valid and decode without error.
+        let raw = vec![b'X', 0xFE, 0xFF, b'Y'];
+        let encoded = encode_frame_bytes(&raw, true).unwrap();
+        let (frame, n) = decode_frame(&encoded, true).unwrap();
+        assert_eq!(frame.text, "X  Y", "sanitized bytes should decode as spaces");
+        assert_eq!(n, encoded.len());
     }
 
     #[test]

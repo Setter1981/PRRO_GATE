@@ -70,20 +70,11 @@ impl fmt::Display for Llv {
     }
 }
 
-impl<S: Into<String>> From<Option<S>> for Llv {
-    /// Lossy constructor — long strings will be rejected at `to_wire` time
-    /// via `LlvTooLong`.  Prefer [`Llv::new`] or [`Llv::from_opt`] for
-    /// explicit error handling.
-    fn from(value: Option<S>) -> Self {
-        match value {
-            Some(v) => {
-                let s: String = v.into();
-                Self(Some(s))
-            }
-            None => Self::null(),
-        }
-    }
-}
+// NOTE: intentionally NO `From<Option<S>> for Llv` impl.
+// A lossy `From` would bypass the 99-char length check, and `to_wire()`
+// would silently serialize an invalid frame (length byte becomes 3 digits,
+// misaligning the downstream decoder).  Callers must go through
+// [`Llv::new`] or [`Llv::from_opt`] which return `Result`.
 
 #[cfg(test)]
 mod tests {
@@ -144,5 +135,66 @@ mod tests {
         let rrn = Llv::new("234567890123").unwrap();
         let composed = format!("{merchant}{terminal}{pan}{rrn}");
         assert_eq!(composed, "10MERCHANT4207TERM00116411111******111112234567890123");
+    }
+
+    #[test]
+    fn display_trait_matches_to_wire() {
+        // `to_wire` is the single source of truth; Display must go
+        // through it so `format!("{llv}")` and `llv.to_wire()` never
+        // diverge.
+        for raw in ["", "x", "RRN123", "хост"] {
+            let v = Llv::new(raw).unwrap();
+            assert_eq!(format!("{v}"), v.to_wire());
+        }
+    }
+
+    #[test]
+    fn from_opt_some_validates_length() {
+        let err = Llv::from_opt(Some("z".repeat(100))).unwrap_err();
+        assert_eq!(err.0, 100);
+    }
+
+    #[test]
+    fn equality_follows_content() {
+        assert_eq!(Llv::new("abc").unwrap(), Llv::new("abc").unwrap());
+        assert_ne!(Llv::new("abc").unwrap(), Llv::new("abd").unwrap());
+        assert_ne!(Llv::new("").unwrap(), Llv::null());
+    }
+
+    #[test]
+    fn len_2_digit_is_padded_for_all_lengths_1_to_9() {
+        for (raw, expected_prefix) in [
+            ("a",     "01"),
+            ("ab",    "02"),
+            ("abc",   "03"),
+            ("abcd",  "04"),
+            ("abcde", "05"),
+            ("abcdef", "06"),
+            ("abcdefg", "07"),
+            ("abcdefgh", "08"),
+            ("abcdefghi", "09"),
+            ("abcdefghij", "10"),
+        ] {
+            let v = Llv::new(raw).unwrap().to_wire();
+            assert!(
+                v.starts_with(expected_prefix),
+                "expected prefix {expected_prefix:?} for {raw:?}, got {v:?}",
+            );
+        }
+    }
+
+    // No `From<Option<S>>` impl exists (by design — see note in llv.rs).
+    // This test freezes that as an invariant: attempting a lossy `.into()`
+    // must fail to compile.  We can't easily express "negative compile"
+    // in plain `#[test]`, so instead assert that the only legal path
+    // produces a `Result` typed value.
+    #[test]
+    fn only_fallible_constructors_exist() {
+        let _: Result<Llv, LlvTooLong> = Llv::new("x");
+        let _: Result<Llv, LlvTooLong> = Llv::from_opt(Some("x"));
+        let _: Result<Llv, LlvTooLong> = Llv::from_opt(None::<&str>);
+        // Llv::null() is the only infallible entry, and it cannot
+        // produce an out-of-range value by construction.
+        let _: Llv = Llv::null();
     }
 }

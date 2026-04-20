@@ -125,26 +125,66 @@ mod tests {
     }
 
     #[test]
-    fn ukrainian_glyphs_roundtrip() {
-        for ch in ['і', 'ї', 'є', 'ґ', 'І', 'Ї', 'Є', 'Ґ'] {
-            let s: String = ch.to_string();
+    fn ukrainian_glyphs_have_stable_byte_values() {
+        // Byte-level table — if any of these change, downstream firmware
+        // will mis-render the chars on the receipt.  Pin to concrete values.
+        let cases: &[(char, u8)] = &[
+            ('І', 0xB8), ('і', 0xB9),
+            ('Ґ', 0xBA), ('ґ', 0xBB),
+            ('Є', 0xF2), ('є', 0xF3),
+            ('Ї', 0xF4), ('ї', 0xF5),
+        ];
+        for &(ch, expected) in cases {
+            let s = ch.to_string();
             let bytes = encode(&s);
-            assert_eq!(decode(&bytes), s, "roundtrip failed for {ch}");
+            assert_eq!(bytes, vec![expected], "{ch} → expected 0x{expected:02X}, got {bytes:02X?}");
+            assert_eq!(decode(&bytes), s, "decode({expected:02X}) != {ch}");
         }
     }
 
     #[test]
     fn unknown_glyph_falls_back_to_question_mark() {
-        let s = "𝕏";
-        assert_eq!(encode(s), b"?");
+        // Emoji, Chinese, anything outside the CP866 table.
+        for s in ["𝕏", "中", "😀", "é"] {
+            let encoded = encode(s);
+            assert!(
+                encoded.iter().all(|&b| b == b'?'),
+                "unknown glyph {s:?} encoded to unexpected bytes {encoded:02X?}"
+            );
+        }
     }
 
+    // Byte-exact reference vector for a mixed Ukrainian sentence.
+    // Guards against any accidental reshuffling of the encoding table.
     #[test]
-    fn mixed_ukrainian_sentence() {
+    fn mixed_ukrainian_sentence_matches_byte_reference() {
         let s = "Ґроно ягід";
         let encoded = encode(s);
-        let decoded = decode(&encoded);
-        assert_eq!(decoded, s);
+        assert_eq!(
+            encoded,
+            vec![
+                0xBA,           // Ґ
+                0xE0,           // р
+                0xAE,           // о
+                0xAD,           // н
+                0xAE,           // о
+                0x20,           // space
+                0xEF,           // я
+                0xA3,           // г
+                0xB9,           // і
+                0xA4,           // д
+            ],
+            "byte-level reference drift",
+        );
+        assert_eq!(decode(&encoded), s, "roundtrip via hand-verified bytes");
+    }
+
+    // Every lowercase Russian letter encodes to the expected IBM-866 slot.
+    #[test]
+    fn russian_lowercase_slot_positions() {
+        let russian_lower = "абвгдежзийклмнопрстуфхцчшщъыьэюя";
+        let expected: Vec<u8> = (0xA0..=0xAF).chain(0xE0..=0xEF).collect();
+        assert_eq!(encode(russian_lower), expected);
     }
 
     #[test]

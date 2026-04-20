@@ -77,12 +77,50 @@ mod tests {
         assert_eq!(crc16(&with_crc), 0, "self-check must be zero");
     }
 
-    // Deterministic across runs.
+    // Explicit byte-level reference vector for a 3-byte input.
+    // Hand-traced through the C algorithm:
+    //   byte 'A' (0x41):
+    //     crc = 0 ^ 0x41 = 0x0041
+    //     a = (0x0041 ^ 0x0410) & 0xFF = 0x0451 & 0xFF = 0x51
+    //     crc = (0x0041 >> 8) ^ (0x51 << 8) ^ (0x51 << 3) ^ (0x51 >> 4)
+    //         = 0x00 ^ 0x5100 ^ 0x0288 ^ 0x0005
+    //         = 0x538D
+    //   byte 'B' (0x42):
+    //     crc = 0x538D ^ 0x0042 = 0x53CF
+    //     a = (0x53CF ^ 0x3CF0) & 0xFF = 0x6F3F & 0xFF = 0x3F
+    //     crc = (0x53CF >> 8) ^ (0x3F << 8) ^ (0x3F << 3) ^ (0x3F >> 4)
+    //         = 0x53 ^ 0x3F00 ^ 0x01F8 ^ 0x0003
+    //         = 0x3EA8
+    //   byte 'C' (0x43):
+    //     crc = 0x3EA8 ^ 0x0043 = 0x3EEB
+    //     a = (0x3EEB ^ 0xEEB0) & 0xFF = 0xD05B & 0xFF = 0x5B
+    //     crc = (0x3EEB >> 8) ^ (0x5B << 8) ^ (0x5B << 3) ^ (0x5B >> 4)
+    //         = 0x3E ^ 0x5B00 ^ 0x02D8 ^ 0x0005
+    //         = 0x59E3
     #[test]
-    fn stable_value_for_classic_abc() {
-        let abc = crc16(b"ABC");
-        assert_eq!(abc, crc16(b"ABC"));
-        // And distinct inputs map to distinct values (weak but useful)
-        assert_ne!(abc, crc16(b"ABD"));
+    fn three_byte_abc_matches_hand_trace() {
+        assert_eq!(crc16(b"ABC"), 0x59E3);
+    }
+
+    // Sensitivity: single-bit flip in input produces a different CRC.
+    // Strong check against accidental early-return or constant-zero bugs.
+    #[test]
+    fn single_bit_flip_changes_crc() {
+        for cmd in [b"PREP" as &[u8], b"CANC", b"COMP1234567890", b"UPAS1111111111"] {
+            let base = crc16(cmd);
+            for i in 0..cmd.len() {
+                let mut flipped = cmd.to_vec();
+                flipped[i] ^= 0x01;
+                assert_ne!(crc16(&flipped), base, "bit flip at pos {i} in {cmd:?} did not change CRC");
+            }
+        }
+    }
+
+    // Input sensitivity to byte ORDER: "AB" != "BA".  Guards against
+    // accidentally using a polynomial / shift that commutes over input.
+    #[test]
+    fn byte_order_affects_crc() {
+        assert_ne!(crc16(b"AB"), crc16(b"BA"));
+        assert_ne!(crc16(b"PREP1"), crc16(b"PREP2"));
     }
 }

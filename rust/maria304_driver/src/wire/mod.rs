@@ -33,6 +33,6 @@ pub mod cp866;
 pub mod crc;
 pub mod llv;
 
-pub use codec::{decode_frame, encode_frame, Frame, FrameError};
+pub use codec::{decode_frame, encode_frame, encode_frame_bytes, Frame, FrameError};
 pub use crc::crc16;
 pub use llv::Llv;
