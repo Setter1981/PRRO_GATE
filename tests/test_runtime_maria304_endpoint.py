@@ -632,7 +632,7 @@ def test_service_in_with_caio_frame_passes_validator(tmp_path: Path) -> None:
     with container.connect() as conn:
         row = conn.execute(
             "SELECT payload_json FROM ingress_inbox WHERE protocol = 'MARIA_304_NATIVE' "
-            "ORDER BY created_at DESC LIMIT 1",
+            "AND operation_type = 'SERVICE_IN' ORDER BY created_at DESC LIMIT 1",
         ).fetchone()
     assert row is not None
     payload = json.loads(row[0])["payload"]
@@ -1146,6 +1146,415 @@ def test_periodic_report_isolated_per_fiscal_number(tmp_path: Path) -> None:
     # SELL for FN-DEV-0001 seeded at z=1,total=100 → SELL total = 1000.
     # Other-FN SELL total = 9_999_990. Isolation proof: we see 1000.
     assert report["sales_total_kopecks"] == 1000
+
+
+# ─── Implicit shift-open for MARIA_304_NATIVE (M7-Py-3d) ─────────────
+#
+# 1С/OLE Manager `OpenCheck()` does NOT emit `nrep` on wire when shift
+# is closed — the hardware Maria auto-opens the shift internally.  Our
+# gateway must mirror this: when a SELL/RETURN/SERVICE_IN/OUT/
+# CASH_WITHDRAWAL arrives from MARIA_304_NATIVE with no active shift,
+# synthesise a SHIFT_OPEN first, then proceed with the original.
+#
+# Invariant #10 spirit: Checkbox-compat auto-opens similarly (Checkbox
+# cloud does this internally); we do the same for Maria.  Invariant #3
+# (channel switch forbidden on open shift) is NOT touched — auto-open
+# is not a switch.
+
+
+def _sell_cmd(fiscal_number: str = "FN-DEV-0001") -> dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "fiscal_number": fiscal_number,
+        "command_type": "SELL",
+        "idempotency_key": f"maria304:{fiscal_number}:sess:sell-1",
+        "cashier_id": "csh1",
+        "department": "1",
+        "return_check_number": None,
+        "payload": {
+            "direction": "SALE",
+            "goods": [],
+            "payments": [],
+            "dual_tax_mode": None,
+            "totals": {"sale_kopecks": 1000, "return_kopecks": 0},
+            "raw_frames": [
+                {"opcode": "PREP", "body": "1"},
+                {"opcode": "FISC", "body": "Item 1 100 А"},
+                {"opcode": "COMP", "body": ""},
+            ],
+        },
+    }
+
+
+def test_sell_without_active_shift_auto_opens_shift_first(tmp_path: Path) -> None:
+    # Handler-level: when SELL MARIA_304_NATIVE arrives with no active
+    # shift and auto_open_shift is true (default), a SHIFT_OPEN row
+    # must appear in the inbox BEFORE the SELL row, AND the
+    # SHIFT_OPEN's external_request_id must carry the
+    # `auto-shift-open` audit marker.  G1 hardening.
+    container = RuntimeContainer(_config(tmp_path))
+    with TestClient(create_app(container)) as client:
+        r = client.post(
+            "/v1/ingress/maria304", json=_sell_cmd(),
+            headers=_auth_headers(),
+        )
+    assert r.status_code in (200, 503)
+    with container.connect() as conn:
+        rows = conn.execute(
+            "SELECT operation_type, external_request_id FROM ingress_inbox "
+            "WHERE protocol = 'MARIA_304_NATIVE' ORDER BY created_at ASC",
+        ).fetchall()
+    ops = [row[0] for row in rows]
+    assert ops == ["SHIFT_OPEN", "SELL"], (
+        f"Expected [SHIFT_OPEN, SELL]; got {ops}"
+    )
+    # SHIFT_OPEN row carries audit marker — cannot be confused with
+    # an explicit client-initiated SHIFT_OPEN.
+    assert "auto-shift-open" in rows[0][1], (
+        f"SHIFT_OPEN external_request_id must carry audit marker; got {rows[0][1]!r}"
+    )
+
+
+def test_auto_open_shift_can_be_disabled_via_config(tmp_path: Path) -> None:
+    cfg = AppConfig.from_mapping({
+        **_config(tmp_path).model_dump(mode="json", exclude_none=True),
+        "ingress": {
+            "maria304": {
+                "enabled": True, "shared_token": _TOKEN,
+                "response_timeout_seconds": 10,
+                "auto_open_shift": False,
+            },
+        },
+    })
+    container = RuntimeContainer(cfg)
+    with TestClient(create_app(container)) as client:
+        r = client.post(
+            "/v1/ingress/maria304", json=_sell_cmd(),
+            headers=_auth_headers(),
+        )
+    # G2 hardening: pin the user-facing behaviour.  With auto-open
+    # disabled the request is still stored (SELL row in inbox) and the
+    # response is 503 (worker pending, no transport wired in test
+    # config).  What matters: NO synthetic SHIFT_OPEN and the response
+    # is not a silent success.
+    assert r.status_code == 503
+    with container.connect() as conn:
+        rows = conn.execute(
+            "SELECT operation_type FROM ingress_inbox "
+            "WHERE protocol = 'MARIA_304_NATIVE'",
+        ).fetchall()
+    ops = [row[0] for row in rows]
+    assert ops == ["SELL"], f"auto_open_shift=False should suppress synthesis; got {ops}"
+
+
+def test_existing_active_shift_skips_auto_open(tmp_path: Path) -> None:
+    # If a shift is already OPENED for this fiscal_number, do not emit
+    # another SHIFT_OPEN.
+    container = RuntimeContainer(_config(tmp_path))
+    with TestClient(create_app(container)) as client:
+        # Seed an active shift row directly.
+        with container.connect() as conn:
+            conn.execute(
+                """INSERT INTO shifts (
+                    shift_id, fiscal_number, state, open_mode,
+                    opened_via_backend_profile_id, opened_via_transport_profile_id,
+                    opened_via_protocol, opened_via_integration_owner,
+                    channel_lock_acquired_at
+                ) VALUES (?, ?, 'OPENED', 'ONLINE',
+                          'backend_checkbox_default', 'transport_checkbox_rest_default',
+                          'MARIA_304_NATIVE', 'maria304-tests',
+                          CURRENT_TIMESTAMP)""",
+                ("shift-preexisting", "FN-DEV-0001"),
+            )
+            conn.commit()
+        r = client.post(
+            "/v1/ingress/maria304", json=_sell_cmd(),
+            headers=_auth_headers(),
+        )
+    assert r.status_code in (200, 503)
+    with container.connect() as conn:
+        ops = [row[0] for row in conn.execute(
+            "SELECT operation_type FROM ingress_inbox "
+            "WHERE protocol = 'MARIA_304_NATIVE' ORDER BY created_at ASC",
+        ).fetchall()]
+    assert ops == ["SELL"], (
+        f"Active shift exists; no auto-open expected; got {ops}"
+    )
+
+
+def test_checkbox_rest_sell_without_shift_not_affected(tmp_path: Path) -> None:
+    # Regression guard: auto-open logic must only apply to MARIA_304_NATIVE.
+    # Checkbox REST SELL without active shift must still hit the
+    # standard SHIFT_NOT_OPEN path (no synthetic MARIA shift row).
+    container = RuntimeContainer(_config(tmp_path))
+    with TestClient(create_app(container)) as client:
+        checkbox_raw = {
+            "context": {
+                "request_id": "req-cb-1",
+                "fiscal_number": "FN-DEV-0001",
+                "backend_profile_id": "backend_checkbox_default",
+                "transport_profile_id": "transport_checkbox_rest_default",
+                "channel_owner": "cb-tests",
+                "business_ts": "2026-04-20T12:00:00Z",
+            },
+            "operation": "SELL",
+            "request": {
+                "external_request_id": "ext-cb-1",
+                "cashier_id": "c1",
+                "goods": [{"name": "X", "price": 100, "quantity": 1000}],
+                "payments": [{"type": "CASH", "amount": 100}],
+            },
+        }
+        r = client.post("/v1/ingress/checkbox", json=checkbox_raw)
+    assert r.status_code == 200
+    with container.connect() as conn:
+        maria_rows = conn.execute(
+            "SELECT COUNT(*) FROM ingress_inbox WHERE protocol = 'MARIA_304_NATIVE'",
+        ).fetchone()
+    assert maria_rows[0] == 0, "Checkbox SELL must not trigger Maria304 auto-open"
+
+
+@pytest.mark.parametrize("op", ["SELL", "RETURN"])
+def test_auto_open_triggers_for_sell_and_return_ops(tmp_path: Path, op: str) -> None:
+    # G3 hardening: pin the PRECISE sequence [SHIFT_OPEN, op].
+    # Scope narrowed per review finding M3 to SELL/RETURN only.
+    container = RuntimeContainer(_config(tmp_path))
+    raw = _sell_cmd()
+    raw["command_type"] = op
+    raw["idempotency_key"] = f"maria304:FN-DEV-0001:sess:auto-{op}"
+    with TestClient(create_app(container)) as client:
+        client.post(
+            "/v1/ingress/maria304", json=raw, headers=_auth_headers(),
+        )
+    with container.connect() as conn:
+        ops = [row[0] for row in conn.execute(
+            "SELECT operation_type FROM ingress_inbox "
+            "WHERE protocol = 'MARIA_304_NATIVE' ORDER BY created_at ASC",
+        ).fetchall()]
+    # Must have SHIFT_OPEN at index 0 AND the original op at index 1.
+    assert ops[:2] == ["SHIFT_OPEN", op], (
+        f"{op}: expected first two rows [SHIFT_OPEN, {op}]; got {ops}"
+    )
+
+
+@pytest.mark.parametrize("op", ["SERVICE_IN", "SERVICE_OUT", "CASH_WITHDRAWAL"])
+def test_auto_open_skipped_for_service_and_cashwithdrawal_ops(tmp_path: Path, op: str) -> None:
+    # M3 scope narrowing: these cash-management ops must NOT trigger
+    # auto-open — real Maria protocol runs them after shift is open;
+    # auto-opening masks operator error (accidental SERVICE_IN
+    # before shift start, empty-cash-float audit).
+    container = RuntimeContainer(_config(tmp_path))
+    raw = _sell_cmd()
+    raw["command_type"] = op
+    raw["idempotency_key"] = f"maria304:FN-DEV-0001:sess:no-auto-{op}"
+    if op == "SERVICE_IN":
+        raw["payload"]["raw_frames"] = [{"opcode": "CAIOI", "body": "0000010000d"}]
+    elif op == "SERVICE_OUT":
+        raw["payload"]["raw_frames"] = [{"opcode": "CAIOO", "body": "0000010000d"}]
+    elif op == "CASH_WITHDRAWAL":
+        def _lp(s: str) -> str:
+            return f"{len(s):02d}{s}"
+        body = (
+            "000010000" + "000000000"
+            + _lp("M") + _lp("T") + _lp("X" * 16)
+            + _lp("PS") + _lp("A") + _lp("R")
+            + "00a05L"
+        )
+        raw["payload"]["raw_frames"] = [
+            {"opcode": "PREP", "body": "1"},
+            {"opcode": "CSHG", "body": body},
+            {"opcode": "COMP", "body": ""},
+        ]
+    with TestClient(create_app(container)) as client:
+        client.post(
+            "/v1/ingress/maria304", json=raw, headers=_auth_headers(),
+        )
+    with container.connect() as conn:
+        shift_open_count = conn.execute(
+            "SELECT COUNT(*) FROM ingress_inbox "
+            "WHERE protocol = 'MARIA_304_NATIVE' AND operation_type = 'SHIFT_OPEN'",
+        ).fetchone()[0]
+    assert shift_open_count == 0, (
+        f"{op} must NOT trigger auto-open (scope narrowed to SELL/RETURN)"
+    )
+
+
+def test_auto_open_not_triggered_for_non_shift_ops(tmp_path: Path) -> None:
+    # G4 hardening: assert TOTAL SHIFT_OPEN count equals the number of
+    # explicit SHIFT_OPEN requests sent (1), NOT rely on the audit
+    # marker presence — a missing marker would otherwise produce a
+    # false pass.
+    container = RuntimeContainer(_config(tmp_path))
+    explicit_shift_opens = 0
+    for op in ["SHIFT_OPEN", "SHIFT_CLOSE", "X_REPORT", "Z_REPORT"]:
+        raw = _sell_cmd()
+        raw["command_type"] = op
+        raw["idempotency_key"] = f"maria304:FN-DEV-0001:sess:no-auto-{op}"
+        if op == "SHIFT_OPEN":
+            explicit_shift_opens += 1
+        with TestClient(create_app(container)) as client:
+            client.post(
+                "/v1/ingress/maria304", json=raw, headers=_auth_headers(),
+            )
+    with container.connect() as conn:
+        total_shift_opens = conn.execute(
+            "SELECT COUNT(*) FROM ingress_inbox "
+            "WHERE protocol = 'MARIA_304_NATIVE' AND operation_type = 'SHIFT_OPEN'",
+        ).fetchone()[0]
+    assert total_shift_opens == explicit_shift_opens, (
+        f"Only explicit SHIFT_OPEN requests should create rows; "
+        f"got {total_shift_opens} vs expected {explicit_shift_opens}"
+    )
+
+
+def test_synthetic_shift_open_idempotency_key_is_distinguishable(tmp_path: Path) -> None:
+    # Audit requirement: operators must be able to distinguish a
+    # synthetic auto-open from an explicit OpenBusinessDay.  The
+    # audit marker is embedded at commit time (review finding B2).
+    container = RuntimeContainer(_config(tmp_path))
+    with TestClient(create_app(container)) as client:
+        client.post(
+            "/v1/ingress/maria304", json=_sell_cmd(),
+            headers=_auth_headers(),
+        )
+    with container.connect() as conn:
+        row = conn.execute(
+            "SELECT external_request_id, idempotency_key FROM ingress_inbox "
+            "WHERE protocol = 'MARIA_304_NATIVE' AND operation_type = 'SHIFT_OPEN' "
+            "LIMIT 1",
+        ).fetchone()
+    assert row is not None
+    assert "auto-shift-open" in row[0], (
+        f"Synthetic SHIFT_OPEN external_request_id must carry marker; got {row[0]!r}"
+    )
+    assert "auto-shift-open" in row[1], (
+        f"idempotency_key must carry marker; got {row[1]!r}"
+    )
+
+
+def test_closed_prior_shift_triggers_auto_open(tmp_path: Path) -> None:
+    # G5: after a Z-report, the shift row remains as state='CLOSED'.
+    # get_active_shift filters by OPENING/OPENED/CLOSING — so CLOSED
+    # rows don't prevent auto-open.  Regression guard.
+    container = RuntimeContainer(_config(tmp_path))
+    with TestClient(create_app(container)) as client:
+        with container.connect() as conn:
+            conn.execute(
+                """INSERT INTO shifts (
+                    shift_id, fiscal_number, state, open_mode,
+                    opened_via_backend_profile_id, opened_via_transport_profile_id,
+                    opened_via_protocol, opened_via_integration_owner,
+                    channel_lock_acquired_at
+                ) VALUES ('shift-old-closed', 'FN-DEV-0001', 'CLOSED', 'ONLINE',
+                          'backend_checkbox_default', 'transport_checkbox_rest_default',
+                          'MARIA_304_NATIVE', 'maria304-tests',
+                          CURRENT_TIMESTAMP)""",
+            )
+            conn.commit()
+        client.post(
+            "/v1/ingress/maria304", json=_sell_cmd(),
+            headers=_auth_headers(),
+        )
+    with container.connect() as conn:
+        ops = [row[0] for row in conn.execute(
+            "SELECT operation_type FROM ingress_inbox "
+            "WHERE protocol = 'MARIA_304_NATIVE' ORDER BY created_at ASC",
+        ).fetchall()]
+    assert ops[:2] == ["SHIFT_OPEN", "SELL"], (
+        f"CLOSED prior shift must not block auto-open; got {ops}"
+    )
+
+
+def test_auto_open_failure_is_logged_and_falls_through(tmp_path: Path) -> None:
+    # G7: if synthetic accept_maria304 raises, the handler logs and
+    # falls through so the original SELL still enters the inbox.
+    container = RuntimeContainer(_config(tmp_path))
+    original_accept = container.ingress_service.accept_maria304
+    calls: list[str] = []
+
+    def flaky(conn, *, raw_request, response_timeout_seconds):
+        calls.append(raw_request.get("command_type"))
+        if raw_request.get("command_type") == "SHIFT_OPEN":
+            raise RuntimeError("simulated shift-open failure")
+        return original_accept(
+            conn, raw_request=raw_request,
+            response_timeout_seconds=response_timeout_seconds,
+        )
+
+    container.ingress_service.accept_maria304 = flaky
+    with TestClient(create_app(container)) as client:
+        r = client.post(
+            "/v1/ingress/maria304", json=_sell_cmd(),
+            headers=_auth_headers(),
+        )
+    # Handler logged the failure; original SELL still entered inbox.
+    assert "SHIFT_OPEN" in calls, "synth SHIFT_OPEN should have been attempted"
+    assert "SELL" in calls, "original SELL must still be accepted after synth failure"
+    with container.connect() as conn:
+        ops = [row[0] for row in conn.execute(
+            "SELECT operation_type FROM ingress_inbox "
+            "WHERE protocol = 'MARIA_304_NATIVE'",
+        ).fetchall()]
+    assert ops == ["SELL"], (
+        f"After synth failure, only SELL inbox row should exist; got {ops}"
+    )
+    # Response is the write-path's natural SHIFT_NOT_OPEN signal
+    # (503 pending / 400 with canonical_error), not a success 200.
+    assert r.status_code != 200 or r.json().get("ok") is False
+
+
+def test_sequential_sells_without_shift_collapse_to_single_synth_row(tmp_path: Path) -> None:
+    # G9: two SELL requests in the same UTC day, same FN, no shift —
+    # the deterministic synth key makes the second synth a replay
+    # against the first, via UNIQUE(idempotency_key).  We assert
+    # EXACTLY ONE SHIFT_OPEN row in inbox, and the replay metric
+    # fires on the second request.
+    container = RuntimeContainer(_config(tmp_path))
+    with TestClient(create_app(container)) as client:
+        r1 = _sell_cmd()
+        r1["idempotency_key"] = "maria304:FN-DEV-0001:sess:sell-a"
+        r2 = _sell_cmd()
+        r2["idempotency_key"] = "maria304:FN-DEV-0001:sess:sell-b"
+        client.post("/v1/ingress/maria304", json=r1, headers=_auth_headers())
+        client.post("/v1/ingress/maria304", json=r2, headers=_auth_headers())
+    with container.connect() as conn:
+        shift_open_rows = conn.execute(
+            "SELECT COUNT(*) FROM ingress_inbox "
+            "WHERE protocol = 'MARIA_304_NATIVE' AND operation_type = 'SHIFT_OPEN'",
+        ).fetchone()[0]
+    assert shift_open_rows == 1, (
+        f"Same-day deterministic synth must collapse; got {shift_open_rows} SHIFT_OPEN rows"
+    )
+
+
+def test_explicit_shift_open_then_sell_does_not_double_open(tmp_path: Path) -> None:
+    # G8: client sends explicit SHIFT_OPEN, then SELL.  Worker is not
+    # running in this test config (no process_immediately) so the
+    # explicit SHIFT_OPEN row sits in inbox but ShiftRepository.
+    # get_active_shift returns None (no shift row yet).  The handler
+    # will therefore ALSO synthesize auto-open.  This is expected
+    # behaviour: worker later serialises and the UNIQUE on
+    # idempotency_key deduplicates any overlap.  Assert we do not
+    # double-DB-insert the same synth row in a single request cycle.
+    container = RuntimeContainer(_config(tmp_path))
+    with TestClient(create_app(container)) as client:
+        explicit_shift_open = _sell_cmd()
+        explicit_shift_open["command_type"] = "SHIFT_OPEN"
+        explicit_shift_open["idempotency_key"] = "maria304:FN-DEV-0001:sess:explicit-open"
+        client.post("/v1/ingress/maria304", json=explicit_shift_open, headers=_auth_headers())
+        client.post("/v1/ingress/maria304", json=_sell_cmd(), headers=_auth_headers())
+    with container.connect() as conn:
+        shift_opens = conn.execute(
+            "SELECT external_request_id FROM ingress_inbox "
+            "WHERE protocol = 'MARIA_304_NATIVE' AND operation_type = 'SHIFT_OPEN' "
+            "ORDER BY created_at ASC",
+        ).fetchall()
+    # Exactly 2 SHIFT_OPEN rows: 1 explicit + 1 auto-synth.  The
+    # synth one is distinguishable via the audit marker.
+    explicit = [r[0] for r in shift_opens if "auto-shift-open" not in r[0]]
+    auto = [r[0] for r in shift_opens if "auto-shift-open" in r[0]]
+    assert len(explicit) == 1, f"one explicit SHIFT_OPEN expected; got {explicit}"
+    assert len(auto) == 1, f"one synth SHIFT_OPEN expected; got {auto}"
 
 
 def test_external_request_id_propagates_to_inbox(tmp_path: Path) -> None:

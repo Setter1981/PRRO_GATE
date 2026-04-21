@@ -64,6 +64,13 @@ class Maria304IngressConfig(StrictModel):
     enabled: bool = False
     shared_token: str = ""
     response_timeout_seconds: int = 10
+    # Auto-open the fiscal shift when SELL/RETURN/SERVICE_IN/OUT/
+    # CASH_WITHDRAWAL arrives without an active shift (matches how
+    # hardware Maria opens shift implicitly on first PREP — see
+    # docs/superpowers/plans/2026-04-21-maria304-python-adapter.md).
+    # Disable only for consumers that strictly require explicit
+    # OpenBusinessDay.
+    auto_open_shift: bool = True
 
 
 class IngressConfig(StrictModel):

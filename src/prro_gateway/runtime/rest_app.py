@@ -17,6 +17,7 @@ from ..enums import DocumentState
 from ..repositories.fiscal_documents import FiscalDocumentRepository
 from ..repositories.audit import AuditRepository
 from ..repositories.outbox import OutboxRepository
+from ..repositories.shifts import ShiftRepository
 from ..services.ingress import AdapterMappingError
 from ..services.write_path import WritePathWorker
 from .maria304_periodic import handle_periodic_report as _handle_periodic_report
@@ -196,6 +197,102 @@ def create_app(container: RuntimeContainer) -> FastAPI:
                     response[field] = value
         return response
 
+    # Review finding M3: narrow scope to the two operations that
+    # map directly to "sale receipt" semantics.  Real Maria hardware
+    # opens shift on first PREP (SELL/RETURN); SERVICE_*/CASH_WITHDRAWAL
+    # are cash-management ops that should come AFTER an open shift —
+    # auto-opening for them can mask operator error (e.g. accidental
+    # service-in before shift start).
+    _MARIA304_AUTO_OPEN_OPS: frozenset[str] = frozenset({"SELL", "RETURN"})
+
+    def _maybe_auto_open_shift(container: RuntimeContainer, raw: dict[str, object]) -> None:
+        """If SELL/RETURN arrives without an active shift and the
+        config allows, synthesise a SHIFT_OPEN canonical request and
+        push it through `accept_maria304` BEFORE the original.  The
+        single-writer-per-FN lease + UNIQUE idempotency_key together
+        serialise concurrent synths into a single row.
+
+        Best-effort: any failure logs and falls through to the original
+        request (which will then hit SHIFT_NOT_OPEN naturally and
+        surface a clear error to the caller).
+        """
+        if not container.config.ingress.maria304.auto_open_shift:
+            return
+        op = raw.get("command_type")
+        if op not in _MARIA304_AUTO_OPEN_OPS:
+            return
+        fiscal_number = raw.get("fiscal_number")
+        if not isinstance(fiscal_number, str) or not fiscal_number:
+            return
+        with container.connect() as conn:
+            active = ShiftRepository.get_active_shift(conn, fiscal_number)
+        if active is not None:
+            return
+        # Review finding B1/B2: deterministic idempotency_key keyed on
+        # (fiscal_number, UTC date).  Two concurrent synths for the
+        # same FN on the same day collapse to a replay on the UNIQUE
+        # idempotency_key index — exactly what we want.  The full
+        # external_request_id prefix is embedded up-front so the
+        # audit row is correct on first commit (no post-hoc UPDATE).
+        # UTC date as the partitioning key — one synth row per FN per
+        # UTC day.  Local-time operators working across midnight are
+        # unaffected: if the previous shift is still OPENED at the
+        # boundary, `get_active_shift` returns non-None and no synth
+        # happens; if it is CLOSED, day N+1 gets its own key and row.
+        today_utc = datetime.now(UTC).strftime("%Y%m%d")
+        # Embed the `auto-shift-open` marker directly into the
+        # idempotency_key so the audit row carries it on first commit
+        # (review finding B2).  Shape still satisfies the adapter-layer
+        # regex `^maria304:[A-Za-z0-9_\-:]{3,256}$`.
+        synth_key = f"maria304:auto-shift-open:{fiscal_number}:{today_utc}"
+        synth = {
+            "schema_version": "1.0",
+            "fiscal_number": fiscal_number,
+            "command_type": "SHIFT_OPEN",
+            "idempotency_key": synth_key,
+            "cashier_id": raw.get("cashier_id"),
+            "department": raw.get("department"),
+            "return_check_number": None,
+            "payload": {
+                "direction": "SALE",
+                "goods": [],
+                "payments": [],
+                "dual_tax_mode": None,
+                "totals": {"sale_kopecks": 0, "return_kopecks": 0},
+                "raw_frames": [],
+            },
+        }
+        try:
+            with container.connect() as conn:
+                inbox, _cmd, _pr, is_replay = container.ingress_service.accept_maria304(
+                    conn,
+                    raw_request=synth,
+                    response_timeout_seconds=container.config.ingress.maria304.response_timeout_seconds,
+                )
+            if is_replay:
+                container.metrics.inc("ingress.maria304.auto_shift_open_replay")
+            else:
+                container.metrics.inc("ingress.maria304.auto_shift_opened")
+            logger.info(
+                "maria304_auto_shift_opened",
+                extra={"extra_fields": {
+                    "fiscal_number": fiscal_number,
+                    "triggered_by": op,
+                    "is_replay": is_replay,
+                    "inbox_request_id": inbox.request_id,
+                }},
+            )
+        except Exception as exc:  # noqa: BLE001
+            container.metrics.inc("ingress.maria304.auto_shift_open_error")
+            logger.warning(
+                "maria304_auto_shift_open_failed",
+                extra={"extra_fields": {
+                    "fiscal_number": fiscal_number,
+                    "triggered_by": op,
+                    "error": str(exc),
+                }},
+            )
+
     def _require_maria304_token(request: Request) -> None:
         """Bearer-token check for the Maria 304 Rust ingress endpoint.
 
@@ -268,6 +365,12 @@ def create_app(container: RuntimeContainer) -> FastAPI:
         # adapter.md §5a (R4-deferred) and §M7-Py-3c.
         if isinstance(raw, dict) and raw.get("command_type") == "PERIODIC_REPORT":
             return _handle_periodic_report(container, raw)
+        # Implicit shift-open (M7-Py-3d): 1C/OLE Manager's OpenCheck()
+        # does NOT emit `nrep` on wire when shift is closed — real
+        # hardware opens shift internally on first PREP.  Mirror this
+        # by synthesising SHIFT_OPEN before the incoming SELL/etc.
+        # See plan 2026-04-21-maria304-python-adapter.md §5b.
+        _maybe_auto_open_shift(container, raw)
         started = time.monotonic()
         try:
             with container.connect() as conn:
