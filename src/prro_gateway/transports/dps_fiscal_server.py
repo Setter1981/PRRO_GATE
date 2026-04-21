@@ -56,17 +56,28 @@ def _kyiv_local_epoch(utc_dt) -> int:
 
     DPS expects date_time to match the XML <TS> which uses Kyiv local time.
     We interpret the local time digits as if they were UTC to produce the epoch value.
+
+    Raises:
+        RuntimeError — if `Europe/Kyiv` zoneinfo is missing (e.g., stripped
+            container image, PyInstaller without tzdata).  Previously this
+            silently fell back to the raw UTC timestamp, which produced a
+            wrong-but-non-crashing value that DPS rejected at signature
+            check — a confusing failure mode.  Rust's `kyiv_local_epoch`
+            also errors explicitly; this keeps Python↔Rust symmetric.
     """
     try:
         from zoneinfo import ZoneInfo
         kyiv = ZoneInfo('Europe/Kyiv')
-        local = utc_dt.astimezone(kyiv)
-        from datetime import timezone
-        fake = datetime(local.year, local.month, local.day,
-                        local.hour, local.minute, local.second, tzinfo=timezone.utc)
-        return int(fake.timestamp())
-    except Exception:
-        return int(utc_dt.timestamp())
+    except Exception as exc:
+        raise RuntimeError(
+            "Europe/Kyiv zoneinfo is unavailable — install tzdata "
+            "(`pip install tzdata` or ensure IANA zoneinfo in container)"
+        ) from exc
+    from datetime import timezone
+    local = utc_dt.astimezone(kyiv)
+    fake = datetime(local.year, local.month, local.day,
+                    local.hour, local.minute, local.second, tzinfo=timezone.utc)
+    return int(fake.timestamp())
 
 
 # Official proto check_type enum values

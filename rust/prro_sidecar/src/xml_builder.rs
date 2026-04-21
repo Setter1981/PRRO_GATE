@@ -9,11 +9,10 @@
 
 use std::collections::HashMap;
 
-use time::{OffsetDateTime, UtcOffset, format_description, format_description::well_known::Rfc3339};
-
 use crate::cp1251::encode_cp1251;
 use crate::errors::SidecarError;
 use crate::input::{CanonicalCommand, OperationType};
+use crate::time_utils::kyiv_local_yyyymmddhhmmss;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -86,28 +85,13 @@ fn build_xml(cmd: &CanonicalCommand, ctx: &BuildContext) -> Result<String, Sidec
 
 // ── Timestamp ─────────────────────────────────────────────────────────────────
 
-/// Parse ISO-8601 UTC timestamp and format as `YYYYMMDDHHMMSS` in Kyiv time (UTC+3).
-///
-/// Ukraine has been on permanent UTC+3 since 2022-02-26.
-/// Returns `BadRequest` if the string cannot be parsed — the DPS MAC chain
-/// depends on deterministic document content; a silent clock substitution
-/// would break replay determinism and produce fiscally incorrect timestamps.
+/// Parse ISO-8601 UTC timestamp and format as `YYYYMMDDHHMMSS` in Kyiv
+/// local time.  Uses IANA tzdata via `time_utils::kyiv_local_yyyymmddhhmmss`
+/// so DST transitions match Python `zoneinfo('Europe/Kyiv')` byte-for-byte.
+/// Previously hardcoded UTC+3 — this created a winter (Oct–Mar) divergence
+/// between the XML `<TS>` element and `Check.date_time` at the gRPC boundary.
 fn format_ts(business_ts: &str) -> Result<String, SidecarError> {
-    let kyiv = UtcOffset::from_hms(3, 0, 0).expect("UTC+3 is always valid");
-
-    let odt: OffsetDateTime = OffsetDateTime::parse(business_ts, &Rfc3339)
-        .or_else(|_| {
-            // Accept bare ISO-8601 without explicit timezone (append Z = UTC)
-            OffsetDateTime::parse(&format!("{business_ts}Z"), &Rfc3339)
-        })
-        .map_err(|_| SidecarError::BadRequest(format!(
-            "invalid business_ts {business_ts:?}; expected ISO-8601 UTC"
-        )))?
-        .to_offset(kyiv);
-
-    let fmt = format_description::parse("[year][month][day][hour][minute][second]")
-        .expect("static format string is valid");
-    Ok(odt.format(&fmt).expect("YYYYMMDDHHMMSS format is infallible for a valid OffsetDateTime"))
+    kyiv_local_yyyymmddhhmmss(business_ts)
 }
 
 // ── SHIFT_OPEN ────────────────────────────────────────────────────────────────

@@ -48,6 +48,10 @@ tracing-subscriber = { version = "0.3",  features = ["env-filter", "json"] }
 
 # Time
 time               = { version = "0.3",  features = ["macros", "formatting", "parsing"] }
+# DST-aware Kyiv timezone conversions (matches Python zoneinfo("Europe/Kyiv")).
+# Permanent-UTC+3 assumption is incorrect for winter months (UTC+2) — Python
+# zoneinfo still applies DST per IANA tzdata.  time-tz wraps IANA zones.
+time-tz            = { version = "2",    features = ["db"] }
 
 # Per-FN operator key cache (cleared on SIGHUP)
 dashmap            = "6"

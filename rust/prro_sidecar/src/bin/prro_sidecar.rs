@@ -312,9 +312,18 @@ async fn fiscal_send_inner(
         OperationType::ZReport                      => CheckType::Zreport as i32,
         _                                           => CheckType::Servicechk as i32,
     };
+    // Check.date_time must match the signed XML `<TS>` digits so DPS
+    // can cross-validate the envelope against the document body.
+    // Python's transport path uses `_kyiv_local_epoch(business_ts)`
+    // — we do the same here to keep both crypto-provider code paths
+    // (passthrough vs sidecar) bit-identical.  Previously this used
+    // `now.unix_timestamp()` which silently diverged from the Python
+    // path under any build-to-send delay (audit M7-Py-4a).
+    let kyiv_epoch = prro_sidecar::time_utils::kyiv_local_epoch(&cmd.business_ts)
+        .map_err(|e| SidecarError::BadRequest(format!("business_ts: {e}")))?;
     let check = Check {
         rro_fn:       fn_id.clone(),
-        date_time:    now.unix_timestamp(),
+        date_time:    kyiv_epoch,
         check_sign:   cms_der,
         local_number: local_num,
         check_type,
