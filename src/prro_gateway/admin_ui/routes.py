@@ -8,6 +8,10 @@ cookie.
 from __future__ import annotations
 
 import hmac
+import json
+import logging
+import secrets
+import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit
@@ -24,7 +28,94 @@ if TYPE_CHECKING:
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 _SESSION_AUTH_KEY = "admin_authenticated"
+_SESSION_CSRF_KEY = "admin_csrf_token"
 _MIN_SESSION_SECRET_LEN = 16
+
+# Per-field length ceilings for admin-UI form inputs — must match the
+# `maxlength=` attributes in the template and not exceed storage column
+# widths. A missing ceiling would let a logged-in operator post an
+# unbounded body and waste memory.
+_MAX_LEN = {
+    "org_name": 256,
+    "point_name": 256,
+    "point_address": 256,
+    "operator_name": 256,
+    "operator_inn": 10,
+    "jks_path": 512,
+    "jks_password": 512,
+}
+
+_log = logging.getLogger(__name__)
+
+
+_ALLOWED_FISCAL_MODES = {"test", "prod"}
+
+
+def _get_or_create_csrf(request: "Request") -> str:
+    token = request.session.get(_SESSION_CSRF_KEY)
+    if not token:
+        token = secrets.token_urlsafe(32)
+        request.session[_SESSION_CSRF_KEY] = token
+    return token
+
+
+def _check_csrf(request: "Request", submitted: str) -> bool:
+    expected = request.session.get(_SESSION_CSRF_KEY, "")
+    if not expected or not submitted:
+        return False
+    return hmac.compare_digest(expected, submitted)
+
+
+def _validate_new_fn(form: dict[str, str]) -> list[str]:
+    errors: list[str] = []
+
+    # Length caps — defense-in-depth; template has `maxlength=` but that
+    # is client-side only.
+    for field, cap in _MAX_LEN.items():
+        if len(form.get(field, "")) > cap:
+            errors.append(f"Поле {field}: максимум {cap} символів.")
+
+    fn = form.get("fiscal_number", "")
+    if len(fn) != 10 or not fn.isdigit():
+        errors.append("Невірний формат фіскального номера (рівно 10 цифр).")
+
+    tin = form.get("tax_number", "")
+    if not tin or not tin.isdigit() or len(tin) not in (8, 10):
+        errors.append("Невірний ЄДРПОУ / ІПН (8 або 10 цифр).")
+
+    mode = form.get("fiscal_mode", "")
+    if mode not in _ALLOWED_FISCAL_MODES:
+        errors.append("Режим має бути 'test' або 'prod'.")
+
+    for name in ("min_offline_codes", "max_offline_codes"):
+        raw = form.get(name, "0") or "0"
+        try:
+            val = int(raw)
+            if val < 0:
+                raise ValueError
+        except ValueError:
+            errors.append(f"Поле {name} має бути невід'ємним цілим.")
+            form[name] = "0"
+
+    try:
+        if int(form.get("max_offline_codes", "0") or "0") < int(
+            form.get("min_offline_codes", "0") or "0"
+        ):
+            errors.append("max_offline_codes не може бути меншим за min_offline_codes.")
+    except ValueError:
+        pass  # already reported above
+
+    cashier_any = any(
+        form.get(k) for k in ("operator_name", "operator_inn", "jks_path")
+    )
+    if cashier_any:
+        inn = form.get("operator_inn", "")
+        if not inn or not inn.isdigit() or len(inn) != 10:
+            errors.append("ІНН касира має бути рівно 10 цифр.")
+        if not form.get("jks_path"):
+            errors.append("Шлях до ключа касира обов'язковий.")
+
+    return errors
 
 
 def _redact_url_userinfo(url: str | None) -> str:
@@ -198,6 +289,151 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
                    FROM fiscal_number_config ORDER BY fiscal_number"""
             ).fetchall()
         return _render_settings("settings_fns.html.j2", request, active="fns", fns=rows)
+
+    @app.get("/admin/ui/settings/fns/new", include_in_schema=False, response_model=None)
+    async def new_fn_form(request: Request):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+        return _render_settings(
+            "settings_fn_new.html.j2", request, active="fns",
+            form={}, errors=[], csrf_token=_get_or_create_csrf(request),
+        )
+
+    @app.post("/admin/ui/settings/fns/new", include_in_schema=False, response_model=None)
+    async def new_fn_submit(
+        request: Request,
+        csrf_token: str = Form(""),
+        fiscal_number: str = Form(""),
+        tax_number: str = Form(""),
+        fiscal_mode: str = Form("test"),
+        org_name: str = Form(""),
+        point_name: str = Form(""),
+        point_address: str = Form(""),
+        tsp_enabled: str = Form("0"),
+        offline_enabled: str = Form("1"),
+        min_offline_codes: str = Form("0"),
+        max_offline_codes: str = Form("0"),
+        operator_name: str = Form(""),
+        operator_inn: str = Form(""),
+        jks_path: str = Form(""),
+        jks_password: str = Form(""),
+    ):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+
+        # CSRF guard — reject forged cross-origin form POSTs even if the
+        # session cookie is replayed (SameSite=Lax permits top-level POST).
+        if not _check_csrf(request, csrf_token):
+            return HTMLResponse(
+                content="<h1>CSRF validation failed</h1>",
+                status_code=403,
+            )
+
+        form = {
+            "fiscal_number": fiscal_number.strip(),
+            "tax_number": tax_number.strip(),
+            "fiscal_mode": fiscal_mode.strip(),
+            "org_name": org_name.strip(),
+            "point_name": point_name.strip(),
+            "point_address": point_address.strip(),
+            "tsp_enabled": tsp_enabled.strip(),
+            "offline_enabled": offline_enabled.strip(),
+            "min_offline_codes": min_offline_codes.strip(),
+            "max_offline_codes": max_offline_codes.strip(),
+            "operator_name": operator_name.strip(),
+            "operator_inn": operator_inn.strip(),
+            "jks_path": jks_path.strip(),
+            # Password intentionally NOT echoed back to the re-render and
+            # never returned to the template dict.
+        }
+        errors = _validate_new_fn(form)
+
+        def _bad(status: int) -> HTMLResponse:
+            return HTMLResponse(
+                content=env.get_template("settings_fn_new.html.j2").render(
+                    request=request,
+                    authenticated=True,
+                    active_tab="fns",
+                    tabs=_SETTINGS_TABS,
+                    form=form,
+                    errors=errors,
+                    csrf_token=_get_or_create_csrf(request),
+                ),
+                status_code=status,
+            )
+
+        if errors:
+            return _bad(400)
+
+        cashier_provided = any((operator_name, operator_inn, jks_path, jks_password))
+        audit_payload = json.dumps(
+            {
+                "fiscal_mode": form["fiscal_mode"],
+                "has_cashier": cashier_provided,
+                "org_name": form["org_name"] or None,
+                "point_name": form["point_name"] or None,
+            },
+            ensure_ascii=False,
+        )
+
+        try:
+            with container.connect() as conn:
+                # Explicit transaction boundary — do not rely on
+                # close-without-commit semantics. `with conn:` commits
+                # on success, rolls back on exception.
+                with conn:
+                    conn.execute(
+                        """INSERT INTO fiscal_number_config (
+                                fiscal_number, tax_number, fiscal_mode,
+                                tsp_enabled, offline_enabled,
+                                org_name, org_address,
+                                min_offline_codes, max_offline_codes
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            form["fiscal_number"], form["tax_number"], form["fiscal_mode"],
+                            1 if form["tsp_enabled"] == "1" else 0,
+                            1 if form["offline_enabled"] == "1" else 0,
+                            form["org_name"] or None,
+                            form["point_address"] or None,
+                            int(form["min_offline_codes"]),
+                            int(form["max_offline_codes"]),
+                        ),
+                    )
+                    if cashier_provided:
+                        conn.execute(
+                            """INSERT INTO sidecar_operators (
+                                    fiscal_number, operator_name, operator_inn,
+                                    jks_path, jks_password, active
+                               ) VALUES (?, ?, ?, ?, ?, 1)""",
+                            (
+                                form["fiscal_number"], operator_name or None,
+                                operator_inn, jks_path, jks_password,
+                            ),
+                        )
+                    conn.execute(
+                        """INSERT INTO audit_log (
+                                entity_type, entity_id, event_type, severity,
+                                event_payload_json
+                           ) VALUES (?, ?, 'fn_registered', 'INFO', ?)""",
+                        (
+                            "fiscal_number_config",
+                            form["fiscal_number"],
+                            audit_payload,
+                        ),
+                    )
+        except sqlite3.IntegrityError as exc:
+            _log.warning("add_fn_integrity_error fn=%s err=%s",
+                         form["fiscal_number"], exc)
+            errors = ["Такий фіскальний номер вже зареєстровано."]
+            return _bad(409)
+        except sqlite3.DatabaseError:
+            _log.exception("add_fn_db_error fn=%s", form["fiscal_number"])
+            errors = ["Помилка збереження. Зверніться до адміністратора (логи сервера)."]
+            return _bad(500)
+
+        return RedirectResponse("/admin/ui/settings/fns", status_code=303)
 
     @app.get("/admin/ui/settings/operators", include_in_schema=False, response_model=None)
     async def settings_operators(request: Request):
