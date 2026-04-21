@@ -1,0 +1,34 @@
+{% extends "_base.html.j2" %}
+{% block title %}Касири — Налаштування{% endblock %}
+{% block content %}
+<h1>Налаштування</h1>
+{% include "_settings_tabs.html.j2" %}
+
+<h2>Касири / Оператори</h2>
+{% if operators %}
+<table>
+  <thead>
+    <tr>
+      <th>ФН ПРРО</th>
+      <th>SKI (hex)</th>
+      <th>Subject DN</th>
+      <th>Джерело</th>
+      <th>Завантажено</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in operators %}
+    <tr>
+      <td>{{ row[0] }}</td>
+      <td><code>{{ (row[1][:16] + '…') if row[1] and row[1]|length > 16 else row[1] }}</code></td>
+      <td class="muted">{{ row[2] or '—' }}</td>
+      <td><span class="badge-ok">{{ row[3] }}</span></td>
+      <td class="muted">{{ row[4] }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">Касирів поки не зареєстровано.</p>
+{% endif %}
+{% endblock %}

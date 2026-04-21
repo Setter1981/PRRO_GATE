@@ -10,6 +10,7 @@ from __future__ import annotations
 import hmac
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -24,6 +25,25 @@ if TYPE_CHECKING:
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 _SESSION_AUTH_KEY = "admin_authenticated"
 _MIN_SESSION_SECRET_LEN = 16
+
+
+def _redact_url_userinfo(url: str | None) -> str:
+    if not url:
+        return "—"
+    try:
+        parts = urlsplit(url)
+        username = parts.username
+        password = parts.password
+    except ValueError:
+        # Malformed userinfo/port — redact entirely rather than leak or 500.
+        return "***"
+    if not username and not password:
+        return url
+    netloc = parts.netloc
+    at = netloc.rfind("@")
+    host_port = netloc[at + 1:] if at >= 0 else netloc
+    redacted_netloc = f"***@{host_port}" if host_port else "***"
+    return urlunsplit((parts.scheme, redacted_netloc, parts.path, parts.query, parts.fragment))
 
 
 def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
@@ -144,6 +164,92 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
                    LIMIT 50"""
             ).fetchall()
         return _render("document_list.html.j2", request, documents=rows)
+
+    # ── Settings (Phase 5 — read-only) ──────────────────────────────
+    _SETTINGS_TABS = [
+        ("fns",       "/admin/ui/settings/fns",       "Фіскальні номери"),
+        ("operators", "/admin/ui/settings/operators", "Касири"),
+        ("node",      "/admin/ui/settings/node",      "Стан вузла"),
+        ("dps",       "/admin/ui/settings/dps",       "ДПС"),
+    ]
+
+    def _render_settings(template: str, request: Request, active: str, **ctx) -> HTMLResponse:
+        return _render(template, request, active_tab=active, tabs=_SETTINGS_TABS, **ctx)
+
+    @app.get("/admin/ui/settings/", include_in_schema=False, response_model=None)
+    @app.get("/admin/ui/settings", include_in_schema=False, response_model=None)
+    async def settings_landing(request: Request):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+        return _render_settings("settings_landing.html.j2", request, active="")
+
+    @app.get("/admin/ui/settings/fns", include_in_schema=False, response_model=None)
+    async def settings_fns(request: Request):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+        with container.connect() as conn:
+            rows = conn.execute(
+                """SELECT fiscal_number, tax_number, fiscal_mode,
+                          tsp_enabled, offline_enabled,
+                          COALESCE(org_name, ''),
+                          min_offline_codes, max_offline_codes
+                   FROM fiscal_number_config ORDER BY fiscal_number"""
+            ).fetchall()
+        return _render_settings("settings_fns.html.j2", request, active="fns", fns=rows)
+
+    @app.get("/admin/ui/settings/operators", include_in_schema=False, response_model=None)
+    async def settings_operators(request: Request):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+        with container.connect() as conn:
+            rows = conn.execute(
+                """SELECT fiscal_number, ski_hex,
+                          COALESCE(subject_dn, ''),
+                          source,
+                          COALESCE(fetched_at, '—')
+                   FROM operator_certs
+                   ORDER BY fiscal_number"""
+            ).fetchall()
+        return _render_settings("settings_operators.html.j2", request,
+                                 active="operators", operators=rows)
+
+    @app.get("/admin/ui/settings/node", include_in_schema=False, response_model=None)
+    async def settings_node(request: Request):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+        with container.connect() as conn:
+            rows = conn.execute(
+                """SELECT fiscal_number, mode, shift_state,
+                          next_lnd,
+                          current_month_offline_seconds,
+                          COALESCE(last_fs_ping_at, '—')
+                   FROM node_state ORDER BY fiscal_number"""
+            ).fetchall()
+        return _render_settings("settings_node.html.j2", request,
+                                 active="node", nodes=rows)
+
+    @app.get("/admin/ui/settings/dps", include_in_schema=False, response_model=None)
+    async def settings_dps(request: Request):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+        cfg = container.config
+        return _render_settings(
+            "settings_dps.html.j2",
+            request,
+            active="dps",
+            crypto_provider=cfg.crypto.provider,
+            crypto_sidecar_url=_redact_url_userinfo(cfg.crypto.sidecar_url),
+            rest_port=cfg.ingress.rest.port,
+            maria304_enabled=cfg.ingress.maria304.enabled,
+            # shared_token redacted — show presence only (review finding).
+            maria304_token_configured=bool(cfg.ingress.maria304.shared_token),
+            maria304_auto_open_shift=cfg.ingress.maria304.auto_open_shift,
+        )
 
     @app.get("/admin/ui/documents/{document_id}", include_in_schema=False, response_model=None)
     async def document_detail(

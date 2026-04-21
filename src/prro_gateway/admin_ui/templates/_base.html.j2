@@ -122,6 +122,21 @@
     a.link { color: #1f3b4d; text-decoration: none; }
     a.link:hover { text-decoration: underline; }
     .muted { color: #8098a8; font-size: 12px; }
+    .tabs { display: flex; border-bottom: 1px solid #dde2e8; margin-bottom: 16px; }
+    .tabs a {
+      padding: 8px 18px;
+      color: #617b8c;
+      text-decoration: none;
+      border-bottom: 2px solid transparent;
+      font-weight: 500;
+    }
+    .tabs a.active { color: #1f3b4d; border-bottom-color: #1f3b4d; }
+    .tabs a:hover { color: #1f3b4d; }
+    dl.kv { display: grid; grid-template-columns: 240px 1fr; row-gap: 6px; }
+    dl.kv dt { color: #617b8c; }
+    dl.kv dd { margin: 0; font-weight: 500; }
+    .badge-ok { background: #d4edda; color: #155724; padding: 2px 8px; border-radius: 3px; font-size: 11px; }
+    .badge-warn { background: #fff3cd; color: #856404; padding: 2px 8px; border-radius: 3px; font-size: 11px; }
   </style>
 </head>
 <body>
@@ -131,6 +146,7 @@
     <nav>
       <a href="/admin/ui/">Панель</a>
       <a href="/admin/ui/documents/">Документи</a>
+      <a href="/admin/ui/settings/">Налаштування</a>
     </nav>
     <span class="spacer"></span>
     <span class="user">

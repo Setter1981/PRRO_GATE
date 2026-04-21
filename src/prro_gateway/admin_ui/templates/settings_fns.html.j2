@@ -1,0 +1,38 @@
+{% extends "_base.html.j2" %}
+{% block title %}Фіскальні номери — Налаштування{% endblock %}
+{% block content %}
+<h1>Налаштування</h1>
+{% include "_settings_tabs.html.j2" %}
+
+<h2>Фіскальні номери ПРРО</h2>
+{% if fns %}
+<table>
+  <thead>
+    <tr>
+      <th>Фіскальний номер</th>
+      <th>ЄДРПОУ / ІПН</th>
+      <th>Режим</th>
+      <th>TSP</th>
+      <th>Offline</th>
+      <th>Організація</th>
+      <th>Offline-коди (min / max)</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in fns %}
+    <tr>
+      <td>{{ row[0] }}</td>
+      <td>{{ row[1] or '—' }}</td>
+      <td><span class="state state-{{ row[2] | upper }}">{{ row[2] }}</span></td>
+      <td>{% if row[3] %}<span class="badge-ok">Так</span>{% else %}<span class="muted">Ні</span>{% endif %}</td>
+      <td>{% if row[4] %}<span class="badge-ok">Так</span>{% else %}<span class="muted">Ні</span>{% endif %}</td>
+      <td class="muted">{{ row[5] or '—' }}</td>
+      <td>{{ row[6] }} / {{ row[7] }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">Жодного фіскального номера не зареєстровано. Додайте через <code>fiscal_number_config</code> table + перезапуск.</p>
+{% endif %}
+{% endblock %}

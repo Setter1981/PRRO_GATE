@@ -1,0 +1,19 @@
+{% extends "_base.html.j2" %}
+{% block title %}Налаштування — PRRO Gateway{% endblock %}
+{% block content %}
+<h1>Налаштування</h1>
+{% include "_settings_tabs.html.j2" %}
+<p class="muted">
+  Перегляд поточної конфігурації gateway.  Редагування — через
+  конфігураційний файл <code>ops/config.yaml</code> + перезапуск
+  службі.  Онлайн-редагування буде додано наступними етапами.
+</p>
+<div class="cards">
+{% for _, url, label in tabs %}
+  <a class="card" href="{{ url }}" style="text-decoration:none;">
+    <div class="label">Розділ</div>
+    <div class="value" style="font-size:16px;">{{ label }}</div>
+  </a>
+{% endfor %}
+</div>
+{% endblock %}

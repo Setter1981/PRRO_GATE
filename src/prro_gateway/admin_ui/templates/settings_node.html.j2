@@ -1,0 +1,36 @@
+{% extends "_base.html.j2" %}
+{% block title %}Стан вузла — Налаштування{% endblock %}
+{% block content %}
+<h1>Налаштування</h1>
+{% include "_settings_tabs.html.j2" %}
+
+<h2>Стан фіскальних вузлів</h2>
+{% if nodes %}
+<table>
+  <thead>
+    <tr>
+      <th>ФН</th>
+      <th>Режим</th>
+      <th>Стан зміни</th>
+      <th>Next LND</th>
+      <th>Офлайн за місяць (сек)</th>
+      <th>Останній ping ДПС</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in nodes %}
+    <tr>
+      <td>{{ row[0] }}</td>
+      <td><span class="state state-{{ row[1] }}">{{ row[1] }}</span></td>
+      <td>{{ row[2] }}</td>
+      <td>{{ row[3] }}</td>
+      <td>{{ row[4] }}</td>
+      <td class="muted">{{ row[5] }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">Жоден ФН ще не реєструвався у вузлі.</p>
+{% endif %}
+{% endblock %}

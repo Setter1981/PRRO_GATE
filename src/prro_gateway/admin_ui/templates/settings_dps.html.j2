@@ -1,0 +1,43 @@
+{% extends "_base.html.j2" %}
+{% block title %}ДПС — Налаштування{% endblock %}
+{% block content %}
+<h1>Налаштування</h1>
+{% include "_settings_tabs.html.j2" %}
+
+<h2>Налаштування ДПС / Crypto</h2>
+
+<dl class="kv">
+  <dt>Crypto provider</dt>
+  <dd><code>{{ crypto_provider }}</code></dd>
+
+  <dt>Sidecar URL</dt>
+  <dd><code>{{ crypto_sidecar_url }}</code></dd>
+
+  <dt>REST ingress port</dt>
+  <dd>{{ rest_port }}</dd>
+</dl>
+
+<h2>Maria 304 native ingress</h2>
+<dl class="kv">
+  <dt>Enabled</dt>
+  <dd>{% if maria304_enabled %}<span class="badge-ok">Так</span>{% else %}<span class="muted">Ні</span>{% endif %}</dd>
+
+  <dt>Shared token</dt>
+  <dd>
+    {% if maria304_token_configured %}
+      <span class="badge-ok">Налаштовано</span>
+      <span class="muted">(значення приховано з міркувань безпеки)</span>
+    {% else %}
+      <span class="badge-warn">Не налаштовано</span>
+    {% endif %}
+  </dd>
+
+  <dt>Auto-open shift на SELL</dt>
+  <dd>{% if maria304_auto_open_shift %}<span class="badge-ok">Так</span>{% else %}<span class="muted">Ні</span>{% endif %}</dd>
+</dl>
+
+<p class="muted">
+  Секретні значення (токени, паролі) не відображаються у веб-інтерфейсі.
+  Редагування — через <code>ops/config.yaml</code> + перезапуск службі.
+</p>
+{% endblock %}

@@ -1,0 +1,5 @@
+<div class="tabs">
+  {% for key, url, label in tabs %}
+  <a href="{{ url }}"{% if key == active_tab %} class="active"{% endif %}>{{ label }}</a>
+  {% endfor %}
+</div>
