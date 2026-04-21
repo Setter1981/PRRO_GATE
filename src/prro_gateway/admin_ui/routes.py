@@ -840,6 +840,346 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
 
         return RedirectResponse("/admin/ui/settings/fns", status_code=303)
 
+    # ── Cashier (sidecar_operators) CRUD — Phase 12a ─────────────
+    def _validate_cashier(form: dict[str, str]) -> list[str]:
+        errors: list[str] = []
+        for field, cap in (("operator_name", 256), ("jks_path", 512),
+                           ("jks_password", 512)):
+            if len(form.get(field, "")) > cap:
+                errors.append(f"Поле {field}: максимум {cap} символів.")
+        inn = form.get("operator_inn", "")
+        if not inn or not inn.isdigit() or len(inn) != 10:
+            errors.append("ІНН касира має бути рівно 10 цифр.")
+        if not form.get("jks_path", "").strip():
+            errors.append("Шлях до ключа обов'язковий.")
+        return errors
+
+    def _load_cashier(op_id: int) -> dict[str, object] | None:
+        with container.connect() as conn:
+            row = conn.execute(
+                """SELECT id, fiscal_number, COALESCE(operator_name,''),
+                          operator_inn, jks_path, active
+                   FROM sidecar_operators WHERE id = ?""",
+                (op_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0], "fiscal_number": row[1],
+            "operator_name": row[2], "operator_inn": row[3],
+            "jks_path": row[4], "active": row[5],
+        }
+
+    def _fn_exists(fn: str) -> bool:
+        with container.connect() as conn:
+            r = conn.execute(
+                "SELECT 1 FROM fiscal_number_config WHERE fiscal_number = ?",
+                (fn,),
+            ).fetchone()
+        return r is not None
+
+    # Shift states that block cashier mutations that change signing
+    # identity (add isn't blocked — registering a new cashier is
+    # always safe; edit/delete of an ACTIVE row that would take
+    # effect mid-shift must wait for Z-close).
+    _CASHIER_MUTATION_BLOCKING_STATES = ("OPENING", "OPENED", "CLOSING")
+
+    def _fn_shift_state(fn: str) -> str | None:
+        with container.connect() as conn:
+            r = conn.execute(
+                "SELECT shift_state FROM node_state WHERE fiscal_number = ?",
+                (fn,),
+            ).fetchone()
+        return r[0] if r else None
+
+    @app.get("/admin/ui/settings/fns/{fn}/operators/new",
+             include_in_schema=False, response_model=None)
+    async def cashier_new_form(request: Request, fn: str):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+        if not _fn_exists(fn):
+            raise HTTPException(status_code=404, detail="FN not found")
+        return _render_settings(
+            "settings_cashier_new.html.j2", request, active="operators",
+            fn=fn, form={}, errors=[], csrf_token=_get_or_create_csrf(request),
+        )
+
+    @app.post("/admin/ui/settings/fns/{fn}/operators/new",
+              include_in_schema=False, response_model=None)
+    async def cashier_new_submit(
+        request: Request,
+        fn: str,
+        csrf_token: str = Form(""),
+        operator_name: str = Form(""),
+        operator_inn: str = Form(""),
+        jks_path: str = Form(""),
+        jks_password: str = Form(""),
+    ):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+        if not _check_csrf(request, csrf_token):
+            return HTMLResponse("<h1>CSRF validation failed</h1>",
+                                status_code=403)
+        if not _fn_exists(fn):
+            raise HTTPException(status_code=404, detail="FN not found")
+
+        form = {
+            "operator_name": operator_name.strip(),
+            "operator_inn": operator_inn.strip(),
+            "jks_path": jks_path.strip(),
+            # jks_password intentionally NOT stored in form dict echoed
+            # back to the template on re-render.
+        }
+        errors = _validate_cashier({**form, "jks_password": jks_password})
+
+        def _bad(status: int) -> HTMLResponse:
+            return HTMLResponse(
+                env.get_template("settings_cashier_new.html.j2").render(
+                    request=request, authenticated=True,
+                    active_tab="operators", tabs=_SETTINGS_TABS,
+                    fn=fn, form=form, errors=errors,
+                    csrf_token=_get_or_create_csrf(request),
+                ),
+                status_code=status,
+            )
+        if errors:
+            return _bad(400)
+
+        audit_payload = json.dumps({
+            "fiscal_number": fn,
+            "operator_inn": form["operator_inn"],
+            "has_name": bool(form["operator_name"]),
+        }, ensure_ascii=False)
+
+        try:
+            with container.connect() as conn:
+                with conn:
+                    cur = conn.execute(
+                        """INSERT INTO sidecar_operators (
+                                fiscal_number, operator_name, operator_inn,
+                                jks_path, jks_password, active
+                           ) VALUES (?, ?, ?, ?, ?, 1)""",
+                        (fn, form["operator_name"] or None,
+                         form["operator_inn"], form["jks_path"], jks_password),
+                    )
+                    op_id = cur.lastrowid
+                    conn.execute(
+                        """INSERT INTO audit_log (
+                                entity_type, entity_id, event_type, severity,
+                                event_payload_json
+                           ) VALUES ('sidecar_operators', ?,
+                                     'cashier_registered', 'INFO', ?)""",
+                        (str(op_id), audit_payload),
+                    )
+        except sqlite3.IntegrityError:
+            # Partial unique index (migration 021) rejected a duplicate
+            # active (fiscal_number, operator_inn) pair — invariant #10
+            # demands an unambiguous signer, so we refuse with 409.
+            errors = [
+                "Касир з таким ІНН вже зареєстрований на цей ФН. "
+                "Деактивуйте існуючого перш ніж додавати дубль."
+            ]
+            return _bad(409)
+        except sqlite3.DatabaseError:
+            _log.exception("cashier_new_db_error fn=%s", fn)
+            errors = ["Помилка збереження. Зверніться до адміністратора."]
+            return _bad(500)
+
+        return RedirectResponse("/admin/ui/settings/operators",
+                                status_code=303)
+
+    @app.get("/admin/ui/settings/operators/{op_id}/edit",
+             include_in_schema=False, response_model=None)
+    async def cashier_edit_form(request: Request, op_id: int):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+        cashier = _load_cashier(op_id)
+        if cashier is None:
+            raise HTTPException(status_code=404, detail="Cashier not found")
+        return _render_settings(
+            "settings_cashier_edit.html.j2", request, active="operators",
+            cashier=cashier, form=cashier, errors=[],
+            csrf_token=_get_or_create_csrf(request),
+        )
+
+    @app.post("/admin/ui/settings/operators/{op_id}/edit",
+              include_in_schema=False, response_model=None)
+    async def cashier_edit_submit(
+        request: Request,
+        op_id: int,
+        csrf_token: str = Form(""),
+        operator_name: str = Form(""),
+        operator_inn: str = Form(""),
+        jks_path: str = Form(""),
+        jks_password: str = Form(""),
+    ):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+        if not _check_csrf(request, csrf_token):
+            return HTMLResponse("<h1>CSRF validation failed</h1>",
+                                status_code=403)
+        existing = _load_cashier(op_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Cashier not found")
+
+        form = {
+            "id": op_id,
+            "fiscal_number": existing["fiscal_number"],
+            "operator_name": operator_name.strip(),
+            "operator_inn": operator_inn.strip(),
+            "jks_path": jks_path.strip(),
+        }
+        errors = _validate_cashier({**form, "jks_password": jks_password})
+
+        def _bad(status: int) -> HTMLResponse:
+            return HTMLResponse(
+                env.get_template("settings_cashier_edit.html.j2").render(
+                    request=request, authenticated=True,
+                    active_tab="operators", tabs=_SETTINGS_TABS,
+                    cashier=existing, form=form, errors=errors,
+                    csrf_token=_get_or_create_csrf(request),
+                ),
+                status_code=status,
+            )
+        if errors:
+            return _bad(400)
+
+        # Empty password → keep old (operator editing just a name
+        # should not have to retype the JKS password every time).
+        password_changed = bool(jks_password)
+
+        # Invariants #3 + #8: signer-identity mutations (INN / key
+        # path) during an active shift can produce mid-shift profile
+        # drift.  Pure rename is allowed.
+        inn_changed = form["operator_inn"] != existing["operator_inn"]
+        path_changed = form["jks_path"] != existing["jks_path"]
+        if (inn_changed or path_changed) and _fn_shift_state(
+            str(existing["fiscal_number"])
+        ) in _CASHIER_MUTATION_BLOCKING_STATES:
+            errors = [
+                "Зміна ІНН або шляху до ключа заборонена при відкритій зміні. "
+                "Закрийте Z-звітом поточну зміну і повторіть."
+            ]
+            return _bad(409)
+
+        audit_payload = json.dumps({
+            "fiscal_number": existing["fiscal_number"],
+            "previous_operator_inn": existing["operator_inn"],
+            "operator_inn": form["operator_inn"],
+            "previous_jks_path": existing["jks_path"],
+            "jks_path": form["jks_path"],
+            "inn_changed": inn_changed,
+            "path_changed": path_changed,
+            "password_changed": password_changed,
+        }, ensure_ascii=False)
+
+        try:
+            with container.connect() as conn:
+                with conn:
+                    if password_changed:
+                        conn.execute(
+                            """UPDATE sidecar_operators
+                               SET operator_name=?, operator_inn=?,
+                                   jks_path=?, jks_password=?,
+                                   updated_at=CURRENT_TIMESTAMP
+                               WHERE id=?""",
+                            (form["operator_name"] or None,
+                             form["operator_inn"], form["jks_path"],
+                             jks_password, op_id),
+                        )
+                    else:
+                        conn.execute(
+                            """UPDATE sidecar_operators
+                               SET operator_name=?, operator_inn=?,
+                                   jks_path=?, updated_at=CURRENT_TIMESTAMP
+                               WHERE id=?""",
+                            (form["operator_name"] or None,
+                             form["operator_inn"], form["jks_path"], op_id),
+                        )
+                    conn.execute(
+                        """INSERT INTO audit_log (
+                                entity_type, entity_id, event_type, severity,
+                                event_payload_json
+                           ) VALUES ('sidecar_operators', ?,
+                                     'cashier_updated', 'INFO', ?)""",
+                        (str(op_id), audit_payload),
+                    )
+        except sqlite3.IntegrityError:
+            errors = [
+                "Касир з таким ІНН вже зареєстрований на цей ФН."
+            ]
+            return _bad(409)
+        except sqlite3.DatabaseError:
+            _log.exception("cashier_edit_db_error op_id=%s", op_id)
+            errors = ["Помилка збереження."]
+            return _bad(500)
+
+        return RedirectResponse("/admin/ui/settings/operators",
+                                status_code=303)
+
+    @app.post("/admin/ui/settings/operators/{op_id}/delete",
+              include_in_schema=False, response_model=None)
+    async def cashier_delete_submit(
+        request: Request,
+        op_id: int,
+        csrf_token: str = Form(""),
+    ):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+        if not _check_csrf(request, csrf_token):
+            return HTMLResponse("<h1>CSRF validation failed</h1>",
+                                status_code=403)
+        existing = _load_cashier(op_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Cashier not found")
+
+        # Invariants #3 + #8: cannot swap signer identity mid-shift.
+        if _fn_shift_state(
+            str(existing["fiscal_number"])
+        ) in _CASHIER_MUTATION_BLOCKING_STATES:
+            return HTMLResponse(
+                "<h1>Деактивація касира заборонена при відкритій зміні. "
+                "Закрийте Z-звітом і повторіть.</h1>",
+                status_code=409,
+            )
+
+        audit_payload = json.dumps({
+            "fiscal_number": existing["fiscal_number"],
+            "operator_inn": existing["operator_inn"],
+            "was_active": bool(existing["active"]),
+        }, ensure_ascii=False)
+
+        try:
+            with container.connect() as conn:
+                with conn:
+                    conn.execute(
+                        """UPDATE sidecar_operators
+                           SET active = 0, updated_at = CURRENT_TIMESTAMP
+                           WHERE id = ?""",
+                        (op_id,),
+                    )
+                    conn.execute(
+                        """INSERT INTO audit_log (
+                                entity_type, entity_id, event_type, severity,
+                                event_payload_json
+                           ) VALUES ('sidecar_operators', ?,
+                                     'cashier_deleted', 'INFO', ?)""",
+                        (str(op_id), audit_payload),
+                    )
+        except sqlite3.DatabaseError:
+            _log.exception("cashier_delete_db_error op_id=%s", op_id)
+            return HTMLResponse(
+                "<h1>Помилка видалення</h1>", status_code=500,
+            )
+
+        return RedirectResponse("/admin/ui/settings/operators",
+                                status_code=303)
+
     @app.get("/admin/ui/settings/operators", include_in_schema=False, response_model=None)
     async def settings_operators(request: Request):
         redirect = _require_auth(request)
@@ -854,8 +1194,20 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
                    FROM operator_certs
                    ORDER BY fiscal_number"""
             ).fetchall()
+            cashiers = conn.execute(
+                """SELECT id, fiscal_number, COALESCE(operator_name,''),
+                          operator_inn, jks_path, active
+                   FROM sidecar_operators
+                   ORDER BY fiscal_number, id"""
+            ).fetchall()
+            fns = conn.execute(
+                "SELECT fiscal_number FROM fiscal_number_config ORDER BY fiscal_number"
+            ).fetchall()
         return _render_settings("settings_operators.html.j2", request,
-                                 active="operators", operators=rows)
+                                 active="operators", operators=rows,
+                                 cashiers=cashiers,
+                                 fns=[r[0] for r in fns],
+                                 csrf_token=_get_or_create_csrf(request))
 
     @app.get("/admin/ui/settings/node", include_in_schema=False, response_model=None)
     async def settings_node(request: Request):

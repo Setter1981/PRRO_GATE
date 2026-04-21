@@ -4,7 +4,67 @@
 <h1>Налаштування</h1>
 {% include "_settings_tabs.html.j2" %}
 
-<h2>Касири / Оператори</h2>
+<h2>Касири (sidecar-операторы)</h2>
+<p class="muted">
+  Зареєстровані у sidecar-таблиці — ПІБ, ІНН, шлях до ключа.
+  Один ФН може мати кількох касирів.
+</p>
+
+{% if fns %}
+<p>
+  <strong>Додати касира до:</strong>
+  {% for fn in fns %}
+    <a class="btn-add" href="/admin/ui/settings/fns/{{ fn }}/operators/new"
+       style="margin-right:6px;">+ {{ fn }}</a>
+  {% endfor %}
+</p>
+{% else %}
+<p class="muted">Спочатку додайте ФН у вкладці "Фіскальні номери".</p>
+{% endif %}
+
+{% if cashiers %}
+<table>
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>ФН</th>
+      <th>ПІБ</th>
+      <th>ІНН</th>
+      <th>Шлях ключа</th>
+      <th>Стан</th>
+      <th>Дії</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for c in cashiers %}
+    <tr>
+      <td>{{ c[0] }}</td>
+      <td>{{ c[1] }}</td>
+      <td>{{ c[2] or '—' }}</td>
+      <td><code>{{ c[3] }}</code></td>
+      <td class="muted">{{ c[4] }}</td>
+      <td>
+        {% if c[5] %}<span class="badge-ok">Активний</span>
+        {% else %}<span class="muted">Деактивовано</span>{% endif %}
+      </td>
+      <td>
+        {% if c[5] %}
+          <a class="link" href="/admin/ui/settings/operators/{{ c[0] }}/edit">✎ Редагувати</a>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">Касирів ще не додано.</p>
+{% endif %}
+
+<h2>Кеш сертифікатів (operator_certs)</h2>
+<p class="muted">
+  Публічні identifiers сертифікатів, що підтягуються з контейнерів або
+  через CMP після першого підпису.
+</p>
 {% if operators %}
 <table>
   <thead>
@@ -29,6 +89,6 @@
   </tbody>
 </table>
 {% else %}
-<p class="muted">Касирів поки не зареєстровано.</p>
+<p class="muted">Кешу сертифікатів ще немає.</p>
 {% endif %}
 {% endblock %}

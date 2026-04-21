@@ -1,0 +1,61 @@
+{% extends "_base.html.j2" %}
+{% block title %}Редагувати касира — Налаштування{% endblock %}
+{% block content %}
+<h1>Налаштування</h1>
+{% include "_settings_tabs.html.j2" %}
+
+<h2>Редагувати касира #{{ cashier.id }}
+    <span class="muted">(ФН {{ cashier.fiscal_number }})</span></h2>
+
+{% if errors %}
+<div class="alert-error">
+  <strong>Помилки:</strong>
+  <ul>{% for err in errors %}<li>{{ err }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
+<form method="post"
+      action="/admin/ui/settings/operators/{{ cashier.id }}/edit"
+      autocomplete="off">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+  <fieldset>
+    <legend>Дані касира</legend>
+    <label>
+      ПІБ касира
+      <input type="text" name="operator_name" maxlength="256"
+             value="{{ form.operator_name | default('') }}">
+    </label>
+    <label>
+      ІНН касира (10 цифр)
+      <input type="text" name="operator_inn" maxlength="10" pattern="[0-9]{10}"
+             required value="{{ form.operator_inn | default('') }}">
+    </label>
+    <label>
+      Шлях до ключа
+      <input type="text" name="jks_path" maxlength="512"
+             required value="{{ form.jks_path | default('') }}">
+    </label>
+    <label>
+      Пароль ключа (порожньо = не змінювати)
+      <input type="password" name="jks_password" autocomplete="new-password">
+    </label>
+  </fieldset>
+
+  <div class="form-actions">
+    <button type="submit">Зберегти зміни</button>
+    <a class="btn-cancel" href="/admin/ui/settings/operators">Скасувати</a>
+  </div>
+</form>
+
+<form method="post"
+      action="/admin/ui/settings/operators/{{ cashier.id }}/delete"
+      style="margin-top:16px"
+      onsubmit="return confirm('Деактивувати касира #{{ cashier.id }}?');">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit" class="alert-error"
+          style="border:none;padding:8px 16px;border-radius:4px;cursor:pointer;">
+    🗑 Деактивувати касира
+  </button>
+</form>
+{% endblock %}
