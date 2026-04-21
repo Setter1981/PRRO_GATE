@@ -35,6 +35,83 @@ except ImportError:
     _prro_crypto_module = None  # type: ignore[assignment]
 
 _MAX_KEY_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
+_KEY_EXTENSIONS = frozenset({".jks", ".pfx", ".p12", ".zs2", ".dat", ".pk8"})
+
+
+def _resolve_keys_dir(cfg_value: str | None) -> Path | None:
+    """Return the absolute keys_dir path if the config points at an
+    existing readable directory; otherwise None.
+
+    Non-existent path is a soft miss — the UI shows an empty dropdown
+    rather than failing startup — because operators often configure
+    the path before creating the directory.
+    """
+    if not cfg_value:
+        return None
+    try:
+        p = Path(cfg_value).expanduser().resolve()
+    except (OSError, ValueError):
+        return None
+    if not p.is_dir():
+        return None
+    return p
+
+
+def _list_server_keys(keys_dir: Path | None) -> list[dict[str, str]]:
+    if keys_dir is None:
+        return []
+    try:
+        entries = sorted(keys_dir.iterdir(), key=lambda p: p.name.lower())
+    except OSError:
+        return []
+    out: list[dict[str, str]] = []
+    for entry in entries:
+        # Skip symlinks even if they resolve inside keys_dir — we don't
+        # want the listing to include an entry that _read_server_key
+        # might later refuse, and symlinks are not how operators stage
+        # fiscal keys.
+        if entry.is_symlink():
+            continue
+        if not entry.is_file():
+            continue
+        if entry.suffix.lower() not in _KEY_EXTENSIONS:
+            continue
+        out.append({"name": entry.name})
+    return out
+
+
+def _read_server_key(keys_dir: Path | None, basename: str) -> bytes:
+    """Read key bytes from keys_dir by basename.
+
+    Raises `ValueError` on every path that is not a simple whitelisted
+    basename resolving under `keys_dir` — caller turns that into 400.
+    """
+    if keys_dir is None:
+        raise ValueError("keys_dir not configured")
+    if not basename:
+        raise ValueError("empty basename")
+    # Reject anything that is not a flat name.  `Path(basename).name`
+    # would silently strip path components, so check textually.
+    if (
+        "/" in basename
+        or "\\" in basename
+        or basename in ("", ".", "..")
+        or basename.startswith(".")
+    ):
+        raise ValueError("invalid basename")
+    if Path(basename).suffix.lower() not in _KEY_EXTENSIONS:
+        raise ValueError("extension not in whitelist")
+    candidate = (keys_dir / basename).resolve()
+    # Belt-and-braces: candidate must be a direct child of keys_dir.
+    try:
+        candidate.relative_to(keys_dir)
+    except ValueError as exc:
+        raise ValueError("path escapes keys_dir") from exc
+    if candidate.parent != keys_dir:
+        raise ValueError("path not a direct child")
+    if not candidate.is_file():
+        raise ValueError("file not found")
+    return candidate.read_bytes()
 
 if TYPE_CHECKING:
     from ..runtime.container import RuntimeContainer
@@ -459,6 +536,15 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
 
         return RedirectResponse("/admin/ui/settings/fns", status_code=303)
 
+    @app.get("/admin/ui/settings/keys/list",
+             include_in_schema=False, response_model=None)
+    async def keys_list(request: Request):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+        kd = _resolve_keys_dir(container.config.admin_ui.keys_dir)
+        return JSONResponse({"keys": _list_server_keys(kd)})
+
     @app.post("/admin/ui/settings/fns/parse-key", include_in_schema=False, response_model=None)
     async def parse_key(request: Request):
         # Auth FIRST — before touching the multipart body.  A declarative
@@ -492,18 +578,33 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
             return JSONResponse({"error": "csrf"}, status_code=403)
 
         password = str(form.get("password") or "")
+        key_path = str(form.get("key_path") or "").strip()
         key_file = form.get("key_file")
-        if key_file is None or not hasattr(key_file, "read"):
-            return JSONResponse(
-                {"error": "key_file missing"}, status_code=400,
-            )
 
-        raw = await key_file.read(_MAX_KEY_UPLOAD_BYTES + 1)
-        if len(raw) > _MAX_KEY_UPLOAD_BYTES:
-            return JSONResponse(
-                {"error": f"file too large (> {_MAX_KEY_UPLOAD_BYTES} bytes)"},
-                status_code=400,
-            )
+        if key_path:
+            # Server-side key selected from keys_dir dropdown — no
+            # multipart upload needed.
+            kd = _resolve_keys_dir(container.config.admin_ui.keys_dir)
+            try:
+                raw = _read_server_key(kd, key_path)
+            except ValueError as exc:
+                _log.info("parse_key_keypath_rejected reason=%s",
+                          type(exc).__name__)
+                return JSONResponse(
+                    {"error": "Неприпустимий шлях до ключа або файл не знайдено."},
+                    status_code=400,
+                )
+        else:
+            if key_file is None or not hasattr(key_file, "read"):
+                return JSONResponse(
+                    {"error": "key_file missing"}, status_code=400,
+                )
+            raw = await key_file.read(_MAX_KEY_UPLOAD_BYTES + 1)
+            if len(raw) > _MAX_KEY_UPLOAD_BYTES:
+                return JSONResponse(
+                    {"error": f"file too large (> {_MAX_KEY_UPLOAD_BYTES} bytes)"},
+                    status_code=400,
+                )
         try:
             parsed = crypto_mod.extract_private_key(raw, password)
         except Exception as exc:  # noqa: BLE001 — library exception, opaque

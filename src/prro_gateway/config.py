@@ -84,6 +84,12 @@ class AdminUiConfig(StrictModel):
     session_secret: str = ""
     session_cookie: str = "session"
     session_max_age_seconds: int = 8 * 3600
+    # Optional directory containing operator key containers.  When set,
+    # the import-key dialog shows a dropdown of files whose extension is
+    # in the signing-format whitelist (.jks / .pfx / .p12 / .zs2 / .dat /
+    # .pk8).  Handler enforces basename-only access + extension check
+    # to block path traversal.
+    keys_dir: str | None = None
 
 
 class IngressConfig(StrictModel):

@@ -28,7 +28,14 @@
   </p>
   <form method="dialog" id="key_dialog_form">
     <label>
-      Файл ключа
+      Існуючий ключ (з папки сервера)
+      <select id="import_key_path">
+        <option value="">— обрати з серверної теки —</option>
+      </select>
+    </label>
+    <p class="muted">або ↓</p>
+    <label>
+      Завантажити файл ключа
       <input type="file" id="import_key_file"
              accept=".jks,.pfx,.p12,.zs2,.dat,.pk8">
     </label>
@@ -153,8 +160,30 @@
   const statusEl = document.getElementById("import_key_status");
   if (!dialog || !openBtn || !parseBtn || !statusEl) return;
 
-  openBtn.addEventListener("click", () => {
+  const keyPathSel = document.getElementById("import_key_path");
+  let keysLoaded = false;
+
+  async function populateKeysDropdown() {
+    if (keysLoaded) return;
+    try {
+      const r = await fetch("/admin/ui/settings/keys/list");
+      if (!r.ok) return;
+      const data = await r.json();
+      for (const k of (data.keys || [])) {
+        const opt = document.createElement("option");
+        opt.value = k.name;
+        opt.textContent = k.name;
+        keyPathSel.appendChild(opt);
+      }
+      keysLoaded = true;
+    } catch (_) {
+      // Silent: dropdown just remains with only the placeholder.
+    }
+  }
+
+  openBtn.addEventListener("click", async () => {
     statusEl.textContent = "";
+    await populateKeysDropdown();
     if (typeof dialog.showModal === "function") {
       dialog.showModal();
     } else {
@@ -179,14 +208,20 @@
   parseBtn.addEventListener("click", async () => {
     const fileEl = document.getElementById("import_key_file");
     const pwEl = document.getElementById("import_key_password");
-    if (!fileEl.files || fileEl.files.length === 0) {
-      statusEl.textContent = "Оберіть файл ключа.";
+    const selectedPath = keyPathSel ? keyPathSel.value : "";
+    const hasFile = fileEl.files && fileEl.files.length > 0;
+    if (!selectedPath && !hasFile) {
+      statusEl.textContent = "Оберіть ключ з серверної теки або завантажте файл.";
       return;
     }
     const fd = new FormData();
     fd.append("csrf_token", csrfValue);
     fd.append("password", pwEl.value || "");
-    fd.append("key_file", fileEl.files[0]);
+    if (selectedPath) {
+      fd.append("key_path", selectedPath);
+    } else {
+      fd.append("key_file", fileEl.files[0]);
+    }
     statusEl.textContent = "Читаю ключ…";
     parseBtn.disabled = true;
     let success = false;
