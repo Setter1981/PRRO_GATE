@@ -12,6 +12,7 @@ libraries that work identically on Windows, Linux, and macOS.
 """
 from .formatter import format_receipt
 from .html_renderer import render_html
+from .pdf_renderer import render_pdf
 from .models import (
     ReceiptItem,
     ReceiptLines,
@@ -23,6 +24,7 @@ from .models import (
 __all__ = [
     "format_receipt",
     "render_html",
+    "render_pdf",
     "ReceiptItem",
     "ReceiptLines",
     "ReceiptPayment",

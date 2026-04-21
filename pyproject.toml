@@ -19,11 +19,19 @@ dependencies = [
   "grpcio>=1.80,<2",
   "protobuf>=6.31,<7",
   "Jinja2>=3.1,<4",
-  "qrcode[pil]>=8,<9"
+  "qrcode[pil]>=8,<9",
+  "reportlab>=4.4,<5"
 ]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+"prro_gateway.rendering" = [
+    "templates/*.j2",
+    "fonts/*.ttf",
+    "fonts/LICENSE.txt",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

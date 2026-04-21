@@ -1,0 +1,22 @@
+DejaVu Sans Mono — Bitstream Vera Fonts Copyright notice
+========================================================
+
+Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved.  Bitstream
+Vera is a trademark of Bitstream, Inc.
+
+DejaVu changes are in public domain.  Source fonts are Bitstream
+Vera under the Bitstream Vera Fonts Copyright — permission granted to
+any person obtaining a copy of the fonts to reproduce and distribute
+the font software, including modified versions, subject to conditions
+detailed in the full license text.
+
+Full license: https://dejavu-fonts.github.io/License.html
+Upstream: https://dejavu-fonts.github.io/
+
+Files bundled here:
+- DejaVuSansMono.ttf      (Regular)
+- DejaVuSansMono-Bold.ttf (Bold)
+
+Bundled to guarantee Cyrillic rendering in PDF receipts regardless of
+host-OS font availability (pilot systems may run on minimal Windows /
+Linux / macOS images).
