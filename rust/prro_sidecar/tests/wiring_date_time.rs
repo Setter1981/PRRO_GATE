@@ -53,6 +53,38 @@ fn sidecar_check_date_time_comes_from_business_ts_not_now() {
 
 
 #[test]
+fn sidecar_emits_pipeline_delay_metrics() {
+    // M7-Py-4a-2: ops must be able to alert on abnormal gaps between
+    // build/sign/send stages (TSP hang, gRPC pool contention, slow
+    // business_ts drift).  Enforce the three tracing events exist.
+    let src = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/bin/prro_sidecar.rs"
+    ))
+    .expect("prro_sidecar.rs is readable");
+
+    for needle in [
+        "sidecar_build_sign_timed",
+        "sidecar_grpc_send_done",
+        "sidecar_sign_failed",
+        "sidecar_grpc_send_failed",
+        "business_ts_drift_ms",
+        "business_ts_parse_failed_for_drift_metric",
+        "build_ms",
+        "sign_ms",
+        "send_ms",
+    ] {
+        assert!(
+            src.contains(needle),
+            "expected sidecar to emit metric field/event {:?}; \
+             removal would blind ops to pipeline-delay regressions",
+            needle,
+        );
+    }
+}
+
+
+#[test]
 fn xml_builder_format_ts_uses_iana_kyiv_tz_not_fixed_utc_plus_3() {
     // Source-level guard: xml_builder::format_ts must delegate to
     // time_utils::kyiv_local_yyyymmddhhmmss (which uses IANA

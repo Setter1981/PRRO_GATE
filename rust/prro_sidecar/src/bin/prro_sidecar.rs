@@ -268,7 +268,9 @@ async fn fiscal_send_inner(
         device_name,
         device_version,
     };
+    let t_build_start = std::time::Instant::now();
     let xml_bytes = xml_builder::build(&cmd, &build_ctx)?;
+    let t_build_done = std::time::Instant::now();
 
     // ── 11. CMS sign ──────────────────────────────────────────────────────────
     // Invariant (1): TSP URL resolved in a short separate DB lock BEFORE the
@@ -287,23 +289,40 @@ async fn fiscal_send_inner(
         profile,
     };
 
-    let cms_der = if fn_config.tsp_enabled {
+    let t_sign_start = std::time::Instant::now();
+    // Wrap sign stage so timing metrics are emitted on BOTH success
+    // and failure paths (review finding: error-path observability is
+    // the most critical time to measure — TSP/CMS hangs manifest as
+    // errors).
+    let sign_result: Result<Vec<u8>, SidecarError> = if fn_config.tsp_enabled {
         let issuer_dn = cms_adapter::extract_issuer_dn(&cert_der)
             .map_err(|e| SidecarError::CmsSign(e.to_string()))?;
-        // Short lock: resolve TSP URL, release, then make HTTP call outside any lock.
         let tsp_url = st.repo.load_tsp_url_by_issuer_dn(&issuer_dn)?;
         let timeout = Duration::from_millis(
             st.config.tsp.as_ref().map(|t| t.timeout_ms).unwrap_or(5_000),
         );
         cms_signer
             .sign_with_tsp(&xml_bytes, opts, &tsp_url, timeout)
-            .map_err(|e| SidecarError::CmsSign(e.to_string()))?
-            .cms_der
+            .map(|r| r.cms_der)
+            .map_err(|e| SidecarError::CmsSign(e.to_string()))
     } else {
         cms_signer
             .sign_with(&xml_bytes, opts)
-            .map_err(|e| SidecarError::CmsSign(e.to_string()))?
-            .cms_der
+            .map(|r| r.cms_der)
+            .map_err(|e| SidecarError::CmsSign(e.to_string()))
+    };
+    let sign_ms_val = t_sign_start.elapsed().as_millis() as u64;
+    let cms_der = match sign_result {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                fn_id,
+                sign_ms = sign_ms_val,
+                error = %e,
+                "sidecar_sign_failed",
+            );
+            return Err(e);
+        }
     };
 
     // ── 12. Send to DPS via gRPC ──────────────────────────────────────────────
@@ -312,6 +331,8 @@ async fn fiscal_send_inner(
         OperationType::ZReport                      => CheckType::Zreport as i32,
         _                                           => CheckType::Servicechk as i32,
     };
+    let t_sign_done = std::time::Instant::now();
+
     // Check.date_time must match the signed XML `<TS>` digits so DPS
     // can cross-validate the envelope against the document body.
     // Python's transport path uses `_kyiv_local_epoch(business_ts)`
@@ -321,6 +342,41 @@ async fn fiscal_send_inner(
     // path under any build-to-send delay (audit M7-Py-4a).
     let kyiv_epoch = prro_sidecar::time_utils::kyiv_local_epoch(&cmd.business_ts)
         .map_err(|e| SidecarError::BadRequest(format!("business_ts: {e}")))?;
+
+    // Pipeline-delay metrics for ops visibility (M7-Py-4a-2).
+    // Emitted as tracing structured fields so the ops team can alert
+    // on abnormal gaps (e.g., TSP server slow, gRPC pool contention).
+    // business_ts_drift_ms measures freshness — if ingest→send takes
+    // longer than DPS's acceptance window, DPS rejects with freshness
+    // error even though our timestamps are internally consistent.
+    //
+    // Parse failure on `business_ts` is explicit: emit a WARNING
+    // instead of silently substituting 0.  A drift of 0 would mask
+    // the exact upstream-clock bug this metric exists to catch
+    // (review finding: silent fallback is anti-observability).
+    let business_ts_drift_ms: Option<i64> =
+        match prro_sidecar::time_utils::parse_business_ts(&cmd.business_ts) {
+            Ok(odt) => Some(
+                ((now.unix_timestamp_nanos() - odt.unix_timestamp_nanos()) / 1_000_000) as i64,
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    fn_id,
+                    business_ts = %cmd.business_ts,
+                    error = %e,
+                    "business_ts_parse_failed_for_drift_metric",
+                );
+                None
+            }
+        };
+    tracing::info!(
+        fn_id,
+        build_ms = t_build_done.duration_since(t_build_start).as_millis() as u64,
+        sign_ms = t_sign_done.duration_since(t_sign_start).as_millis() as u64,
+        business_ts_drift_ms = ?business_ts_drift_ms,
+        "sidecar_build_sign_timed",
+    );
+    let t_send_start = std::time::Instant::now();
     let check = Check {
         rro_fn:       fn_id.clone(),
         date_time:    kyiv_epoch,
@@ -330,11 +386,31 @@ async fn fiscal_send_inner(
         id_offline:   String::new(),
         id_cancel:    String::new(),
     };
-    let resp = st
+    let send_result = st
         .grpc_pool
         .send_chk_v2(&fn_config.fiscal_mode, check)
-        .await
-        .map_err(|e| SidecarError::Grpc(e.to_string()))?;
+        .await;
+    let send_ms_val = t_send_start.elapsed().as_millis() as u64;
+    let resp = match send_result {
+        Ok(r) => {
+            tracing::info!(
+                fn_id,
+                send_ms = send_ms_val,
+                dps_status = r.status,
+                "sidecar_grpc_send_done",
+            );
+            r
+        }
+        Err(e) => {
+            tracing::warn!(
+                fn_id,
+                send_ms = send_ms_val,
+                error = %e,
+                "sidecar_grpc_send_failed",
+            );
+            return Err(SidecarError::Grpc(e.to_string()));
+        }
+    };
 
     // ── 13. Persist MAC hash only for DPS-accepted documents ─────────────────
     // data_sign from an error response MUST NOT be stored — using a rejected
