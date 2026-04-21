@@ -95,6 +95,8 @@ def _read_server_key(keys_dir: Path | None, basename: str) -> bytes:
     if (
         "/" in basename
         or "\\" in basename
+        or "\x00" in basename          # NUL-byte injection guard
+        or len(basename) > 255         # FS layer protection
         or basename in ("", ".", "..")
         or basename.startswith(".")
     ):
