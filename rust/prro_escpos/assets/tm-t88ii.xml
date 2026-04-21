@@ -1,0 +1,369 @@
+﻿<?xml version="1.0"?>
+<printer>
+	<!-- ******************************************************************************* -->
+	<!--                             имя и параметры принтера                            --> 
+	<!-- ******************************************************************************* -->
+	<info>
+		<name>TM-T88II</name>
+		<fullname>Epson TM-T88 II Series</fullname>
+		<version>0.2.10</version>
+	</info>
+	<hardware>
+		<interface>COM,LPT,LAN</interface>
+		<speed>19200</speed>
+
+		<ibuffer size="512" time="50"/>
+	</hardware>
+	<!-- ******************************************************************************* -->
+	<!--                  кол-во символов в строке для разных шрифтов                    --> 
+	<!-- ******************************************************************************* -->
+	<charsperline>
+		<font size="0"></font>
+		<font size="1"></font>
+		<font size="2"></font>
+	</charsperline>
+	<!-- ******************************************************************************* -->
+	<!--                               команды принтера                                  --> 
+	<!-- ******************************************************************************* -->
+	<language>
+		<!-- =============================================================================== -->
+		<!--                                        INIT                                     --> 
+		<!-- =============================================================================== -->
+		<!-- состояние принтера (стр.70) -->
+		<command name="PrinterStatus" code="100401"	length="3" >
+			<answer name="OK" 	 hvalue="16" msg="0"/>
+			<answer name="ERROR" hvalue="08" msg="4"/>
+			<!-- для LPT -->
+			<answer name="ERROR" hvalue="04" msg="1"/>
+			<answer name="ERROR" hvalue="D0" msg="5"/>
+			<answer name="OK" 	 hvalue="80" msg="0"/>
+		</command>
+		<command name="PrinterOffLine" code="100402"	length="3" >
+			<answer name="OK" 	 hvalue="12" msg="0"/>
+			<answer name="ERROR" hvalue="20" msg="1"/>
+			<answer name="ERROR" hvalue="04" msg="2"/>
+		</command>
+		<command name="PrinterError" code="100403"	length="3" >
+			<answer name="OK" 	 hvalue="12" msg="0"/>
+		</command>
+		<command name="PrinterSensor" code="100404"	length="3" >
+			<answer name="OK" 	 hvalue="12" msg="0"/>
+			<answer name="ERROR" hvalue="60" msg="3"/>
+		</command>
+		<!-- очистка линейного буфера(стр.68) CAN -->
+		<command name="ClearBuffer" code="18"	length="1" /> 
+		<!-- инициализация принтера ( сброс всех параметров по умолчанию ) (стр.33) -->
+		<command name="Init" code="1B40"	length="2" /> 
+
+		<!-- =============================================================================== -->
+		<!--                               auxiliary commands                                --> 
+		<!-- =============================================================================== -->
+		<!-- звонок  (стр.16)-->
+		<command name="BuzzerOn" 	code="1D6F011B6F" 	length="5" />
+		<!-- внешний сигнал -->
+		<command name="ExtSignal" 	code="1B70005000" 	length="5" >
+			<value byte="2" name="DEFAULT"	hvalue="00" />
+			<value byte="2" name="0"		hvalue="00" />
+			<value byte="2" name="1"		hvalue="01" />
+		</command>
+		<!-- назад к печати (стр.8)-->
+		<command name="CR"			code="0D" 		length="1" />
+		<!-- печать из буфера принтера (стр.7)-->
+		<command name="LF" 			code="0A" 		length="1" />
+		<!-- печать и перевод строки -->
+		<command name="CRLF" 		code="0D0A" 	length="2" />
+		<!-- горизонтальный отступ (стр.6)-->
+		<command name="TAB"			code="09" 		length="1" />
+		<!--нуль байт -->
+		<command name="NUL" 		code="00" 		length="1" />
+
+		<!-- =============================================================================== -->
+		<!--                                       mode                                      --> 
+		<!-- =============================================================================== -->
+		<!-- режим PAGE MODE (стр.38)-->
+		<command name="PageMode" 		code="1B4C" 	length="2" />
+		<!-- режим STANDART MODE (стр.41) -->
+		<command name="StandartMode" 	code="1B53" 	length="2" />
+		<!-- направление печати в режиме PAGE MODE (стр.42)-->
+		<command name="PageModeDirection" code="1B5400" 	length="3" >
+			<value byte="2" name="LeftToRight"	hvalue="00" />
+			<value byte="2" name="BottonToTop"	hvalue="01" />
+			<value byte="2" name="RightToLeft"	hvalue="02" />
+			<value byte="2" name="TopToBottom"	hvalue="03" />
+		</command>
+		<!-- область печати для режима PAGE MODE (стр.44)-->
+		<command name="PrintArea" code="1B54" 	length="2" />
+		<!-- задаем X = (xL+xH*256)*pitch (стр.44)-->
+		<command name="xL" code="00" 	length="1" />
+		<command name="xH" code="00" 	length="1" />
+		<!-- задаем Y = (yL+yH*256)*pitch (стр.44)-->
+		<command name="yL" code="00" 	length="1" />
+		<command name="yH" code="00" 	length="1" />
+		<!-- задаем dX = (dxL+dxH*256)*pitch (стр.44)-->
+		<command name="dxL" code="00" 	length="1" />
+		<command name="dxH" code="00" 	length="1" />
+		<!-- задаем dY = (dyL+dyH*256)*pitch (стр.44)-->
+		<command name="dyL" code="00" 	length="1" />
+		<command name="dyH" code="00" 	length="1" />
+		
+		<!-- =============================================================================== -->
+		<!--                             printing options                                    --> 
+		<!-- =============================================================================== -->
+			
+		<command name="Cut" code="1D5600" 	length="3" >
+			<value byte="2" name="DEFAULT"		dvalue="1" />
+			<value byte="2" name="PAPERFEED"	dvalue="66" />
+		</command>
+		<command name="CutPaperFeed" code="00" 	length="1" >
+			<value byte="0" name="DEFAULT"		dvalue="1" />
+		</command>
+		<!-- =============================================================================== -->
+		<!--                           Aligning the characters                               --> 
+		<!-- =============================================================================== -->
+		<!-- выравнивание по левому краю (стр.47)-->
+		<command name="Left" 		code="1B6100" 	length="3" /> 
+		<!-- выравнивание по центру (стр.47)-->
+		<command name="Center" 		code="1B6101" 	length="3" /> 
+		<!-- выравнивание по правому краю (стр.47)-->
+		<command name="Right" 		code="1B6102" 	length="3" /> 
+		
+		<!-- =============================================================================== -->
+		<!--                                      coding                                     --> 
+		<!-- =============================================================================== -->
+		<!-- кодовая страница (стр.53)-->
+		<command name="CodePage"	code="1B7400" 	length="3"> 
+			<value byte="2" name="437" 				hvalue="00" />
+			<value byte="2" name="Katakana" 		hvalue="01" />
+			<value byte="2" name="850" 				hvalue="02" />
+			<value byte="2" name="860" 				hvalue="03" />
+			<value byte="2" name="863" 				hvalue="04" />
+			<value byte="2" name="865" 				hvalue="05" />
+			<value byte="2" name="866" 				hvalue="11" />
+			<value byte="2" name="858" 				hvalue="19" />
+		</command>
+		<!-- набор символов (стр.40)-->
+		<command name="CharSet" 	code="1B5200" 	length="3" > 
+			<value byte="2" name="USA"			hvalue="00" />
+			<value byte="2" name="France"		hvalue="01" />
+			<value byte="2" name="Germany"		hvalue="02" />
+			<value byte="2" name="UK"			hvalue="03" />
+			<value byte="2" name="DenmarkI" 	hvalue="04" />
+			<value byte="2" name="Sweden"		hvalue="05" />
+			<value byte="2" name="Italy" 		hvalue="06" />
+			<value byte="2" name="SpainI" 		hvalue="07" />
+			<value byte="2" name="Japan" 		hvalue="08" />
+			<value byte="2" name="Norway" 		hvalue="09" />
+			<value byte="2" name="DenmarkII" 	hvalue="0A" />
+			<value byte="2" name="SpainII" 		hvalue="0B" />
+			<value byte="2" name="LatinAmerica" hvalue="0C" />
+			<value byte="2" name="Korea" 		hvalue="0D" />
+		</command>	
+
+		<!-- =============================================================================== -->
+		<!--                                       font                                      --> 
+		<!-- =============================================================================== -->
+		<!-- размер шрифта (стр.55)-->
+		<command name="FontSize" 	code="1D2100"	length="3" > 
+			<value byte="2" name="0" 	hvalue="00" />
+			<value byte="2" name="1" 	hvalue="01" />
+			<value byte="2" name="2" 	hvalue="02" />
+			<value byte="2" name="3" 	hvalue="03" />
+			<value byte="2" name="4" 	hvalue="04" />
+			<value byte="2" name="5" 	hvalue="05" />
+			<value byte="2" name="6" 	hvalue="06" />
+			<value byte="2" name="7" 	hvalue="07" />
+			<value byte="2" name="11" 	hvalue="10" />
+			<value byte="2" name="12" 	hvalue="20" />
+			<value byte="2" name="13" 	hvalue="30" />
+			<value byte="2" name="14" 	hvalue="40" />
+			<value byte="2" name="15" 	hvalue="50" />
+			<value byte="2" name="16" 	hvalue="60" />
+			<value byte="2" name="17" 	hvalue="70" />
+		</command>
+		<!-- шрифт по умолчанию (стр.19)-->
+		<command name="FONTDEFAULT" 	code="1B2100" 	length="3" /> 
+		<!-- шрифт подстрочный (стр.19)-->
+		<command name="FONTSUBSCRIPT" 	code="1B2101" 	length="3" /> 
+		<!-- шрифт жирный (стр.19)-->
+		<command name="FONTBOLD" 		code="1B2108" 	length="3" /> 
+		<!-- шрифт двойная высота (стр.19)-->
+		<command name="FONTDBLHEIGHT" 	code="1B2110" 	length="3" /> 
+		<!-- шрифт двойная ширина (стр.19)-->
+		<command name="FONTDBLWIDTH" 	code="1B2120" 	length="3" /> 
+		<!-- шрифт подчеркивания (стр.19)-->
+		<command name="FONTUNDERLINE" 	code="1B2180" 	length="3" /> 
+		
+		<!-- расстояние между символами	 (стр.17)-->		
+		<command name="CharSpacing" 	code="1B2000" 	length="3" >
+			<value byte="2" name="DEFAULT" 	hvalue="00" />
+		</command> 
+		<!-- инвертированный цвет печать (стр.63)-->
+		<command name="InvertedPrint" 	code="1D4200" 	length="3" > 
+			<value byte="2" name="NO"	dvalue="00" />
+			<value byte="2" name="YES"	dvalue="01" />
+		</command>	
+		<!-- повернуть текст на 90гр (стр.43)-->
+		<command name="RightTurn" 	code="1B5600" 	length="3" > 
+			<value byte="2" name="NO"	dvalue="00" />
+			<value byte="2" name="YES"	dvalue="01" />
+		</command>
+		<!-- повернуть текст на 180гр (стр.54)-->
+		<command name="MirrorTurn" 	code="1B7B00" 	length="3" > 
+			<value byte="2" name="NO"	dvalue="00" />
+			<value byte="2" name="YES"	dvalue="01" />
+		</command>	
+		<!-- =============================================================================== -->
+		<!--                                      bitmap                                     --> 
+		<!-- =============================================================================== -->
+		<!-- режим битмапа (стр.26)-->
+		<command name="BitMapMode" 	code="1B2A00" 	length="3"> 
+			<value byte="2" name="DEFAULT" 	hvalue="01" /> 	<!-- 288х8 точек -->
+			<value byte="2" name="QUAD" 	hvalue="00" /> 	<!-- 288х8 точек -->
+			<value byte="2" name="0" 	hvalue="00" /> 	<!-- 288х8 точек -->
+			<value byte="2" name="1" 	hvalue="01" />	<!-- 576х8 точек -->
+			<value byte="2" name="2" 	hvalue="32" />	<!-- 288х24 точек-->
+			<value byte="2" name="3" 	hvalue="33" />	<!-- 576х24 точек-->
+		</command>
+		<!-- массив байтов (к) картинки определяется командами BitMapModeN1 и BitMapModeN2
+		для DPI67x101 и DPI67x203  к = BitMapModeN1+256*BitMapModeN2
+		для DPI203x101 и DPI203x203  к = (BitMapModeN1+256*BitMapModeN2)*3 -->
+		<command name="BitMapModeN1" 	code="00" 	length="1"/> <!-- (стр.26)-->
+		<command name="BitMapModeN2" 	code="00" 	length="1"/> <!-- (стр.26)-->
+
+		<!-- 0- MODE, 1- N1, 2- N2, 3- DATA-->
+		<procedure name="PrintImageLine" title="MODE,N1,N2,DATA">
+			<prm parameter="0" command="BitMapMode"/>
+			<prm parameter="1" command="BitMapModeN1"/>
+			<prm parameter="2" command="BitMapModeN2"/>
+			<prm parameter="3" command="BitMapArray"/>
+		</procedure>
+
+		<!-- загрузить Bit Image (стр.58)-->		
+		<command name="DownloadBitImage" 	code="1D2A" 	length="2"/>
+		<!-- колво точек по горизонтали NumberOfDotsH*8 (стр.58)-->
+		<command name="NumberOfDotsH" 		code="01" 		length="1"/>
+		<!-- колво точек по вертикали NumberOfDotsY*8 (стр.58)-->
+		<command name="NumberOfDotsV" 		code="01" 		length="1"/>
+		<!-- массив точек определяется NumberOfDotsH*NumberOfDotsV*8 (стр.58)-->
+		<command name="BitMapArray"			code="0" 		length="0" />
+		<!-- Напечатать загруженный Bit Image (стр.58) -->
+		<command name="PrintDownloadBitImage"		code="1D2F00" 	length="3" >
+			<value byte="2" name="NORMAL" 		dvalue="48" />
+			<value byte="2" name="DOUBLEWIDTH" 	dvalue="49" />
+			<value byte="2" name="DOUBLEHEIGHT" dvalue="50" />
+			<value byte="2" name="QUAD" 		dvalue="51" />
+		</command>
+
+		<!-- =============================================================================== -->
+		<!--                                 line feed rate                                  --> 
+		<!-- =============================================================================== -->
+		<!-- межсточное расстояние (стр.30)-->
+		<command name="LineSpacing" 		code="1b3300" 	length="3" /> 
+		<!-- межсточное расстояние по умолчанию(стр.29)-->
+		<command name="LineSpacingDef" 	code="1b32" 	length="2" /> 
+		<!-- отступ между строк на N линий (стр.51) -->
+		<command name="FeedingThePaperByNLines" code="1B6400" 	length="3" /> 
+
+		<!-- =============================================================================== -->
+		<!--                                    barcode                                      --> 
+		<!-- =============================================================================== -->
+		<!--позиция текста штрихкода (стр.64)-->
+		<command name="HRIPosition" 	code="1D4800" 	length="3" > 
+			<value byte="2" name="NO" 		hvalue="00" />
+			<value byte="2" name="ABOVE" 	hvalue="01" />
+			<value byte="2" name="BELOW" 	hvalue="02" />
+			<value byte="2" name="BOTH" 	hvalue="03" />
+		</command>
+		<!-- шрифт текста штрихкода (стр.79)-->
+		<command name="HRIFont" 	code="1D6600" 	length="3" > 
+			<value byte="2" name="FONTA" 	hvalue="00" />
+			<value byte="2" name="FONTB" 	hvalue="01" />
+			<value byte="2" name="0" 		hvalue="00" />
+			<value byte="2" name="1" 		hvalue="01" />
+		</command>
+		<!-- высота штрихкода (стр.80)-->
+		<command name="BarCodeHeight" 	code="1D6800" 	length="3" > 
+			<value byte="2" name="DEFAULT" 	dvalue="162" />
+		</command>
+		<!-- ширина штрихкода (стр.94)-->
+		<command name="BarCodeWidth" 	code="1D7700" 	length="3" > 
+			<value byte="2" name="DEFAULT" 	dvalue="3" />
+			<value byte="2" name="1" 	dvalue="2" />
+			<value byte="2" name="2" 	dvalue="3" />
+			<value byte="2" name="3" 	dvalue="4" />
+			<value byte="2" name="4" 	dvalue="5" />
+			<value byte="2" name="5" 	dvalue="6" />
+		</command>
+		<!-- печать штрихкода (стр.81)-->
+		<command name="BarCode" 	code="1D6B00" 	length="3" > 
+			<value byte="2" name="UPCA" 		dvalue="65" />
+			<value byte="2" name="UPCE" 		dvalue="66" />
+			<value byte="2" name="EAN13" 		dvalue="67" />
+			<value byte="2" name="EAN8" 		dvalue="68" />
+			<value byte="2" name="CODE39" 		dvalue="69" />
+			<value byte="2" name="ITF" 			dvalue="70" />
+			<value byte="2" name="CODABAR" 		dvalue="71" />
+			<value byte="2" name="CODE93" 		dvalue="72" />
+			<value byte="2" name="CODE128" 		dvalue="73" />
+		</command>
+		<!-- для второго варианта (стр.81)-->
+		<command name="BarCodeLength" 	code="00" 	length="1" /> 
+		<!-- BarCode Data -->
+		<command name="BarCodeData" 	code="00" 	length="0" /> 
+		<!-- 0- TYPE, 1- WIDTH, 2- HEIGHT, 3- FONTTYPE, 4- FONTPOS, 5- DATA, 6- LENGTH, 7- STROB -->
+		<procedure name="PrintBarCode" title="TYPE,WIDTH,HEIGHT,FONTTYPE,FONTPOS,DATA,LENGTH,STROB">
+			<prm parameter="3" command="HRIFont"/>
+			<prm parameter="4" command="HRIPosition"/>
+			<prm parameter="2" command="BarCodeHeight"/>
+			<prm parameter="1" command="BarCodeWidth"/>
+			<prm parameter="0" command="BarCode"/>
+			<prm parameter="6" command="BarCodeLength"/>			
+			<prm parameter="5" command="BarCodeData"/>			
+			<prm parameter="7" command=""/>			
+		</procedure>
+
+		<!-- =============================================================================== -->
+		<!--                              обязательные команды                               --> 
+		<!-- =============================================================================== -->
+		<command name="Font" 		code="1B2100" 	length="3" /> <!-- -->
+		<command name="Text"		code="0" 		length="0" /> <!-- -->
+		<command name="Array"		code="0" 		length="0" /> <!-- -->
+		<command name="Mode"		code="0" 		length="0" /> <!-- -->
+		<command name="Align"		code="0" 		length="0" /> <!-- -->
+
+		<command name="Underline" 		code="0" 	length="0" />
+		<command name="SlashZero" 		code="0" 	length="0" />
+		<command name="Emphasis" 		code="0" 	length="0" />
+		<command name="CharFont" 		code="0" 	length="0" />
+		<command name="FontDblHeight" 	code="0" 	length="0" /> 
+		<command name="FontDblWidth" 	code="0" 	length="0" />
+		<command name="Upperline" 		code="0" 	length="0" /> 
+		<!-- подчеркивание текста -->		
+		<!--command name="Underline" 	code="1B2D00" 	length="3" >
+			<value byte="2" name="NO" 			hvalue="00" />
+			<value byte="2" name="ONEDOT" 		hvalue="01" />
+			<value byte="2" name="DOUBLEDOT" 	hvalue="02" />
+		</command--> 
+		<!-- выделенный текст -->		
+		<!--command name="Emphasis" 	code="1B4500" 	length="3" >
+			<value byte="2" name="NO" 	hvalue="00" />
+			<value byte="2" name="YES" 	hvalue="01" />
+		</command--> 
+		<!-- шрифт текста -->		
+		<!--command name="CharFont" 	code="1B4D00" 	length="3" >
+			<value byte="2" name="FONTA" 	hvalue="00" />
+			<value byte="2" name="FONTB" 	hvalue="01" />
+		</command--> 
+	</language>
+
+	<!-- ******************************************************************************* -->
+	<!--                 текстовые информационные сообщения принтера                     --> 
+	<!-- ******************************************************************************* -->
+	<messages>
+		<msg>Готов к печати...</msg>
+		<msg>Нет бумаги...</msg>
+		<msg>Открыт лоток...</msg>
+		<msg>Закончилась бумага...</msg>
+		<msg>Нет связи с принтером...</msg>
+	</messages>
+</printer>
