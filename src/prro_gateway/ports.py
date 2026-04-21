@@ -29,7 +29,18 @@ class TransportRateLimitedError(TransportRetryableError):
 
 
 class TransportRejectedError(RuntimeError):
-    pass
+    """Non-retryable rejection by the fiscal backend.
+
+    Optional `dps_status` carries the original gRPC `CheckResponse.Status`
+    integer (check.proto) so the worker can map it to a specific
+    `CanonicalErrorCode` instead of collapsing all rejections into a
+    generic "backend unavailable".  Defaults to `None` for legacy call
+    sites that don't carry a status (non-DPS transports).
+    """
+
+    def __init__(self, message: str, *, dps_status: int | None = None) -> None:
+        super().__init__(message)
+        self.dps_status = dps_status
 
 
 class DpsMacRecoveryError(TransportRejectedError):
@@ -40,9 +51,8 @@ class DpsMacRecoveryError(TransportRejectedError):
     """
 
     def __init__(self, message: str, *, expected_mac: str, dps_status: int) -> None:
-        super().__init__(message)
+        super().__init__(message, dps_status=dps_status)
         self.expected_mac = expected_mac
-        self.dps_status = dps_status
 
 
 class SendResult(StrictModel):

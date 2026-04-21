@@ -784,12 +784,21 @@ class WritePathWorker:
             )
             return ctx, result
         except TransportRejectedError as exc:
+            # M7-Py-4c: prefer the DPS-specific canonical code when the
+            # exception carries `dps_status` (gRPC CheckResponse.Status).
+            # Fallback to BACKEND_TEMPORARY_UNAVAILABLE for non-DPS
+            # transports where dps_status is None.
+            if getattr(exc, 'dps_status', None) is not None:
+                from ..transports.dps_fiscal_server import canonical_error_from_dps_status
+                canonical_code = canonical_error_from_dps_status(exc.dps_status)
+            else:
+                canonical_code = CanonicalErrorCode.BACKEND_TEMPORARY_UNAVAILABLE
             result = self._mark_document_and_inbox_error(
                 conn,
                 ctx=ctx,
                 document_id=ctx.document.document_id,
                 state=DocumentState.REJECTED,
-                error=build_canonical_error(CanonicalErrorCode.BACKEND_TEMPORARY_UNAVAILABLE, message=str(exc)),
+                error=build_canonical_error(canonical_code, message=str(exc)),
                 technical_status='REJECTED',
             )
             # Sprint 13 cert_watch: side-channel trigger if DPS rejected us

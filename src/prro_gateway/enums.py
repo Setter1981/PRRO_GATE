@@ -170,6 +170,23 @@ class CanonicalErrorCode(StrEnum):
     NODE_NOT_OFFLINE = "NODE_NOT_OFFLINE"
     OFFLINE_RANGE_CONFLICT = "OFFLINE_RANGE_CONFLICT"
     STOP_MODE_ACTIVE = "STOP_MODE_ACTIVE"
+    # ── DPS gRPC CheckResponse.Status error codes ────────────────────
+    # Imported from rust/prro_sidecar/proto/check.proto so 1С sees the
+    # specific DPS-side reason instead of a generic "backend error".
+    DPS_SIGNATURE_VERIFICATION_FAILED = "DPS_SIGNATURE_VERIFICATION_FAILED"  # -1 ERROR_VEREFY
+    DPS_CHECK_FAILED = "DPS_CHECK_FAILED"                                    # -2 ERROR_CHECK
+    DPS_SAVE_FAILED = "DPS_SAVE_FAILED"                                      # -3 ERROR_SAVE
+    DPS_UNKNOWN_ERROR = "DPS_UNKNOWN_ERROR"                                  # -4 ERROR_UNKNOWN
+    DPS_TYPE_ERROR = "DPS_TYPE_ERROR"                                        # -5 ERROR_TYPE
+    PREVIOUS_ZREPORT_MISSING = "PREVIOUS_ZREPORT_MISSING"                    # -6 ERROR_NOT_PREV_ZREPORT
+    INVALID_XML = "INVALID_XML"                                              # -7 ERROR_XML
+    INVALID_XML_CHECK = "INVALID_XML_CHECK"                                  # -9 ERROR_XML_CHK
+    INVALID_XML_ZREPORT = "INVALID_XML_ZREPORT"                              # -10 ERROR_XML_ZREPORT
+    OFFLINE_168_HOUR_LIMIT = "OFFLINE_168_HOUR_LIMIT"                        # -11 ERROR_OFFLINE_168
+    PREVIOUS_HASH_MISMATCH = "PREVIOUS_HASH_MISMATCH"                        # -12 ERROR_BAD_HASH_PREV
+    RRO_NOT_REGISTERED = "RRO_NOT_REGISTERED"                                # -13 ERROR_NOT_REGISTERED_RRO
+    SIGNER_NOT_REGISTERED = "SIGNER_NOT_REGISTERED"                          # -14 ERROR_NOT_REGISTERED_SIGNER
+    OFFLINE_ID_INVALID = "OFFLINE_ID_INVALID"                                # -16 ERROR_OFFLINE_ID
 
     @property
     def retryable(self) -> bool:
@@ -213,6 +230,21 @@ _CANONICAL_ERROR_MESSAGES = {
     CanonicalErrorCode.NODE_NOT_OFFLINE: "Node is not in OFFLINE mode.",
     CanonicalErrorCode.OFFLINE_RANGE_CONFLICT: "Offline range conflicts with an existing active range.",
     CanonicalErrorCode.STOP_MODE_ACTIVE: "Node is in STOP_MODE: DB integrity check failed. Contact operator.",
+    # DPS gRPC CheckResponse.Status reason messages (Ukrainian — surfaced to 1С).
+    CanonicalErrorCode.DPS_SIGNATURE_VERIFICATION_FAILED: "ДПС не змогла перевірити підпис документа (ERROR_VEREFY).",
+    CanonicalErrorCode.DPS_CHECK_FAILED: "ДПС відхилила документ після перевірки (ERROR_CHECK).",
+    CanonicalErrorCode.DPS_SAVE_FAILED: "ДПС не змогла зберегти документ (ERROR_SAVE) — повторіть пізніше.",
+    CanonicalErrorCode.DPS_UNKNOWN_ERROR: "ДПС повернула невідому помилку (ERROR_UNKNOWN).",
+    CanonicalErrorCode.DPS_TYPE_ERROR: "Невідповідний тип документа для ДПС (ERROR_TYPE).",
+    CanonicalErrorCode.PREVIOUS_ZREPORT_MISSING: "Відсутній попередній Z-звіт у ланцюжку документів.",
+    CanonicalErrorCode.INVALID_XML: "XML документа не пройшов структурну перевірку ДПС.",
+    CanonicalErrorCode.INVALID_XML_CHECK: "XML чека не відповідає схемі ДПС.",
+    CanonicalErrorCode.INVALID_XML_ZREPORT: "XML Z-звіту не відповідає схемі ДПС.",
+    CanonicalErrorCode.OFFLINE_168_HOUR_LIMIT: "Перевищено ліміт 168 годин роботи в офлайн-режимі — необхідно перейти в онлайн.",
+    CanonicalErrorCode.PREVIOUS_HASH_MISMATCH: "Попередній MAC-хеш документа не збігається з очікуваним у ДПС.",
+    CanonicalErrorCode.RRO_NOT_REGISTERED: "ПРРО не зареєстрований або фіскальний номер недійсний.",
+    CanonicalErrorCode.SIGNER_NOT_REGISTERED: "Сертифікат підписувача не зареєстрований у ДПС.",
+    CanonicalErrorCode.OFFLINE_ID_INVALID: "Недійсний ідентифікатор офлайн-сесії.",
 }
 
 

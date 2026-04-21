@@ -46,6 +46,7 @@ from datetime import UTC, datetime
 import re
 
 from ..enums import DocumentState, OperationType
+from ..enums import CanonicalErrorCode
 from ..ports import DpsMacRecoveryError, SendResult, TransportRateLimitedError, TransportRejectedError, TransportRetryableError
 
 logger = logging.getLogger('prro_gateway.transports.dps_fiscal_server')
@@ -529,14 +530,60 @@ def _raise_classified_dps_error(status: int, error_message: str) -> None:
     """
     msg = f'DPS fiscal server rejected: status={status}, error={error_message}'
 
+    # Proto default value `UNKNOWN = 0` is semantically "no decision"
+    # — treat as transport-level anomaly (retryable), not a terminal
+    # DPS business rejection.  Review finding M7-Py-4c C.
+    if status == 0:
+        raise TransportRetryableError(
+            f'DPS returned proto-default UNKNOWN status (0), error={error_message}'
+        )
+
     # MAC recovery: only for ERROR_BAD_HASH_PREV with extractable expected hash
     if status == -12:
         expected = _extract_expected_mac(error_message)
         if expected:
             raise DpsMacRecoveryError(msg, expected_mac=expected, dps_status=status)
 
-    # All negative proto statuses — DPS business/protocol rejection (terminal)
-    raise TransportRejectedError(msg)
+    # All negative proto statuses — DPS business/protocol rejection (terminal).
+    # Carry `dps_status` so the worker can map to a specific
+    # CanonicalErrorCode (see `canonical_error_from_dps_status`).
+    raise TransportRejectedError(msg, dps_status=status)
+
+
+# ─── M7-Py-4c: DPS gRPC CheckResponse.Status → CanonicalErrorCode ─────
+#
+# Before this mapping, every terminal DPS rejection (16 distinct gRPC
+# codes per check.proto) collapsed into BACKEND_TEMPORARY_UNAVAILABLE
+# in write_path's exception handler.  Now the specific reason surfaces
+# to 1С so operators can fix the root cause (invalid cert, unregistered
+# signer, 168-hour offline limit, previous-hash mismatch, etc.).
+_DPS_STATUS_TO_CANONICAL: dict[int, CanonicalErrorCode] = {
+    -1:  CanonicalErrorCode.DPS_SIGNATURE_VERIFICATION_FAILED,
+    -2:  CanonicalErrorCode.DPS_CHECK_FAILED,
+    -3:  CanonicalErrorCode.DPS_SAVE_FAILED,
+    -4:  CanonicalErrorCode.DPS_UNKNOWN_ERROR,
+    -5:  CanonicalErrorCode.DPS_TYPE_ERROR,
+    -6:  CanonicalErrorCode.PREVIOUS_ZREPORT_MISSING,
+    -7:  CanonicalErrorCode.INVALID_XML,
+    -8:  CanonicalErrorCode.INVALID_FISCAL_DATE,       # reuse existing
+    -9:  CanonicalErrorCode.INVALID_XML_CHECK,
+    -10: CanonicalErrorCode.INVALID_XML_ZREPORT,
+    -11: CanonicalErrorCode.OFFLINE_168_HOUR_LIMIT,
+    -12: CanonicalErrorCode.PREVIOUS_HASH_MISMATCH,
+    -13: CanonicalErrorCode.RRO_NOT_REGISTERED,
+    -14: CanonicalErrorCode.SIGNER_NOT_REGISTERED,
+    -15: CanonicalErrorCode.SHIFT_NOT_OPEN,             # reuse existing
+    -16: CanonicalErrorCode.OFFLINE_ID_INVALID,
+}
+
+
+def canonical_error_from_dps_status(status: int) -> CanonicalErrorCode:
+    """Map a DPS gRPC `CheckResponse.Status` integer to a canonical code.
+
+    Unknown / unmapped statuses fall back to `DPS_UNKNOWN_ERROR` so
+    the worker never crashes on a future proto extension.
+    """
+    return _DPS_STATUS_TO_CANONICAL.get(status, CanonicalErrorCode.DPS_UNKNOWN_ERROR)
 
 
 __all__ = ['DpsFiscalServerTransport']
