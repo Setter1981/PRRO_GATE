@@ -28,7 +28,10 @@
       <td>{{ doc[4] or '—' }}</td>
       <td>{% if doc[5] %}{{ '%.2f' % (doc[5] / 100) }}{% else %}—{% endif %}</td>
       <td class="muted">{{ doc[6] }}</td>
-      <td><a class="btn btn-sm" href="/admin/ui/documents/{{ doc[0] }}">Деталі</a></td>
+      <td>
+        <a class="btn btn-sm" href="/admin/ui/documents/{{ doc[0] }}">Деталі</a>
+        <a class="btn btn-sm" href="/admin/ui/documents/{{ doc[0] }}/receipt.html">Чек</a>
+      </td>
     </tr>
     {% endfor %}
   </tbody>

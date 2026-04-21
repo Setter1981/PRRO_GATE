@@ -21,6 +21,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from starlette.middleware.sessions import SessionMiddleware
 
+from ..rendering import format_receipt, render_html
+from ..rendering.context_builder import build_render_context
 from ..repositories.fiscal_documents import FiscalDocumentRepository
 
 if TYPE_CHECKING:
@@ -682,6 +684,19 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
         if doc is None:
             raise HTTPException(status_code=404, detail="Document not found")
         return _render("document_detail.html.j2", request, doc=doc)
+
+    @app.get("/admin/ui/documents/{document_id}/receipt.html",
+             include_in_schema=False, response_model=None)
+    async def document_receipt_html(request: Request, document_id: str):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+        with container.connect() as conn:
+            ctx = build_render_context(conn, document_id)
+        if ctx is None:
+            raise HTTPException(status_code=404, detail="Document not found")
+        lines = format_receipt(ctx)
+        return HTMLResponse(content=render_html(lines))
 
 
 __all__ = ["register_admin_ui"]
