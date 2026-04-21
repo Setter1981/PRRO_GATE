@@ -15,6 +15,27 @@
 </div>
 {% endif %}
 
+<fieldset>
+  <legend>🔑 Імпорт з ключа (опціонально)</legend>
+  <p class="muted">
+    Оберіть файл ключа (.jks / .pfx / .zs2 / .dat), введіть пароль — поля ЄДРПОУ,
+    назва організації та ІНН касира заповняться автоматично.
+  </p>
+  <label>
+    Файл ключа
+    <input type="file" id="import_key_file"
+           accept=".jks,.pfx,.p12,.zs2,.dat,.pk8">
+  </label>
+  <label>
+    Пароль до ключа
+    <input type="password" id="import_key_password" autocomplete="new-password">
+  </label>
+  <div class="form-actions">
+    <button type="button" id="import_key_btn">Імпорт з ключа</button>
+    <span id="import_key_status" class="muted"></span>
+  </div>
+</fieldset>
+
 <form method="post" action="/admin/ui/settings/fns/new" autocomplete="off">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
@@ -107,4 +128,43 @@
     <a class="btn-cancel" href="/admin/ui/settings/fns">Скасувати</a>
   </div>
 </form>
+
+<script>
+(function () {
+  const btn = document.getElementById("import_key_btn");
+  const statusEl = document.getElementById("import_key_status");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    const fileEl = document.getElementById("import_key_file");
+    const pwEl = document.getElementById("import_key_password");
+    if (!fileEl.files || fileEl.files.length === 0) {
+      statusEl.textContent = "Оберіть файл ключа.";
+      return;
+    }
+    const fd = new FormData();
+    fd.append("csrf_token", "{{ csrf_token }}");
+    fd.append("password", pwEl.value || "");
+    fd.append("key_file", fileEl.files[0]);
+    statusEl.textContent = "Читаю ключ…";
+    try {
+      const resp = await fetch("/admin/ui/settings/fns/parse-key", {
+        method: "POST", body: fd,
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        statusEl.textContent = data.error || "Помилка імпорту.";
+        return;
+      }
+      const form = document.querySelector("form[action='/admin/ui/settings/fns/new']");
+      if (data.edrpou) form.elements["tax_number"].value = data.edrpou;
+      if (data.org_name) form.elements["org_name"].value = data.org_name;
+      if (data.operator_name) form.elements["operator_name"].value = data.operator_name;
+      if (data.drfo) form.elements["operator_inn"].value = data.drfo;
+      statusEl.textContent = "Заповнено з ключа. Перевірте та збережіть.";
+    } catch (e) {
+      statusEl.textContent = "Мережева помилка: " + e;
+    }
+  });
+})();
+</script>
 {% endblock %}

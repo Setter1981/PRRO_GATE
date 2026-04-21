@@ -16,14 +16,25 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit
 
-from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from starlette.middleware.sessions import SessionMiddleware
 
 from ..rendering import format_receipt, render_html
 from ..rendering.context_builder import build_render_context
 from ..repositories.fiscal_documents import FiscalDocumentRepository
+from ..services.onboarding_key_identity import (
+    KeyIdentity,
+    extract_identity_from_cert,
+)
+
+try:
+    import prro_crypto as _prro_crypto_module  # optional Rust wheel
+except ImportError:
+    _prro_crypto_module = None  # type: ignore[assignment]
+
+_MAX_KEY_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
 
 if TYPE_CHECKING:
     from ..runtime.container import RuntimeContainer
@@ -436,6 +447,85 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
             return _bad(500)
 
         return RedirectResponse("/admin/ui/settings/fns", status_code=303)
+
+    @app.post("/admin/ui/settings/fns/parse-key", include_in_schema=False, response_model=None)
+    async def parse_key(request: Request):
+        # Auth FIRST — before touching the multipart body.  A declarative
+        # `UploadFile = File(...)` parameter would force Starlette to
+        # parse the body during dependency injection, making the body
+        # read occur BEFORE this guard.  Reading `request.form()`
+        # manually after auth/CSRF closes that window (1st-review HIGH).
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+
+        crypto_mod = globals().get("_prro_crypto_module")
+        if crypto_mod is None:
+            # Short-circuit before reading body — no need to buffer a
+            # 5 MB upload just to tell the operator the wheel is missing.
+            return JSONResponse(
+                {"error": "prro_crypto wheel is not installed; "
+                          "key parsing unavailable on this host."},
+                status_code=503,
+            )
+
+        try:
+            form = await request.form(max_files=1, max_fields=10)
+        except Exception:  # noqa: BLE001 — malformed multipart
+            return JSONResponse(
+                {"error": "malformed multipart body"}, status_code=400,
+            )
+
+        csrf_token = str(form.get("csrf_token") or "")
+        if not _check_csrf(request, csrf_token):
+            return JSONResponse({"error": "csrf"}, status_code=403)
+
+        password = str(form.get("password") or "")
+        key_file = form.get("key_file")
+        if key_file is None or not hasattr(key_file, "read"):
+            return JSONResponse(
+                {"error": "key_file missing"}, status_code=400,
+            )
+
+        raw = await key_file.read(_MAX_KEY_UPLOAD_BYTES + 1)
+        if len(raw) > _MAX_KEY_UPLOAD_BYTES:
+            return JSONResponse(
+                {"error": f"file too large (> {_MAX_KEY_UPLOAD_BYTES} bytes)"},
+                status_code=400,
+            )
+        try:
+            parsed = crypto_mod.extract_private_key(raw, password)
+        except Exception as exc:  # noqa: BLE001 — library exception, opaque
+            _log.info("parse_key_rejected reason=%s",
+                      type(exc).__name__)
+            return JSONResponse(
+                {"error": "Неможливо відкрити контейнер: перевірте пароль та формат файлу."},
+                status_code=400,
+            )
+        certs = parsed.get("certs") if isinstance(parsed, dict) else None
+        if not isinstance(certs, list) or not certs:
+            # Key-6.dat and similar: no embedded cert chain.
+            return JSONResponse(
+                {"error": "Контейнер не містить сертифіката (Key-6.dat / zs2 without chain). "
+                          "Завантажте .cer окремо або оберіть інший контейнер."},
+                status_code=400,
+            )
+        first_cert = certs[0]
+        if not isinstance(first_cert, (bytes, bytearray)):
+            return JSONResponse(
+                {"error": "cert payload is not bytes"}, status_code=400,
+            )
+        ident: KeyIdentity = extract_identity_from_cert(bytes(first_cert))
+        # This route performs NO DB writes by design — a pre-fill attempt
+        # is not a fiscal event and does not go in audit_log.
+        return JSONResponse({
+            "subject_dn": ident.subject_dn,
+            "org_name": ident.org_name,
+            "edrpou": ident.edrpou,
+            "drfo": ident.drfo,
+            "operator_name": ident.operator_name,
+            "is_legal_entity": ident.is_legal_entity,
+        })
 
     def _load_fn_row(fn: str) -> dict[str, object] | None:
         with container.connect() as conn:

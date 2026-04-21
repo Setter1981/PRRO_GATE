@@ -752,6 +752,12 @@ _ATTR_LABELS: dict[str, str] = {
     '2.5.4.42': 'GN',
     '2.5.4.5': 'serialNumber',
     '1.2.840.113549.1.9.1': 'emailAddress',
+    # Keys Ukrainian CAs populate.  Kept as raw OID strings so the
+    # onboarding extractor (services/onboarding_key_identity.py) can
+    # look them up without locale-sensitive label drift.
+    '1.2.804.2.1.1.1.11.1.4.1.1':  '1.2.804.2.1.1.1.11.1.4.1.1',   # EDRPOU
+    '1.2.804.2.1.1.1.11.1.4.2.1':  '1.2.804.2.1.1.1.11.1.4.2.1',   # DRFO
+    '1.2.804.2.1.1.1.11.1.4.11.1': '1.2.804.2.1.1.1.11.1.4.11.1',  # DRFO alt
 }
 
 
