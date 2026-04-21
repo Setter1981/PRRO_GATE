@@ -15,26 +15,36 @@
 </div>
 {% endif %}
 
-<fieldset>
-  <legend>🔑 Імпорт з ключа (опціонально)</legend>
+<p>
+  <button type="button" id="key_dialog_open_btn" class="btn-add">🔑 Обрати ключ</button>
+  <span class="muted">Пре-заповнити ЄДРПОУ, назву організації та ІНН касира з сертифіката.</span>
+</p>
+
+<dialog id="key_import_dialog">
+  <h2>🔑 Імпорт з ключа</h2>
   <p class="muted">
-    Оберіть файл ключа (.jks / .pfx / .zs2 / .dat), введіть пароль — поля ЄДРПОУ,
-    назва організації та ІНН касира заповняться автоматично.
+    Файл .jks / .pfx / .zs2 / .dat і пароль до нього. Поля основної форми
+    заповняться автоматично значеннями з сертифіката.
   </p>
-  <label>
-    Файл ключа
-    <input type="file" id="import_key_file"
-           accept=".jks,.pfx,.p12,.zs2,.dat,.pk8">
-  </label>
-  <label>
-    Пароль до ключа
-    <input type="password" id="import_key_password" autocomplete="new-password">
-  </label>
-  <div class="form-actions">
-    <button type="button" id="import_key_btn">Імпорт з ключа</button>
-    <span id="import_key_status" class="muted"></span>
-  </div>
-</fieldset>
+  <form method="dialog" id="key_dialog_form">
+    <label>
+      Файл ключа
+      <input type="file" id="import_key_file"
+             accept=".jks,.pfx,.p12,.zs2,.dat,.pk8">
+    </label>
+    <label>
+      Пароль до ключа
+      <input type="password" id="import_key_password" autocomplete="new-password">
+    </label>
+    <p><span id="import_key_status" class="muted"></span></p>
+    <div class="form-actions">
+      <button type="button" id="import_key_btn">Прочитати ключ</button>
+      <button type="submit" id="key_dialog_cancel_btn"
+              class="btn-cancel" formmethod="dialog"
+              value="cancel">Скасувати</button>
+    </div>
+  </form>
+</dialog>
 
 <form method="post" action="/admin/ui/settings/fns/new" autocomplete="off">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -131,10 +141,36 @@
 
 <script>
 (function () {
-  const btn = document.getElementById("import_key_btn");
+  const dialog = document.getElementById("key_import_dialog");
+  const openBtn = document.getElementById("key_dialog_open_btn");
+  const parseBtn = document.getElementById("import_key_btn");
   const statusEl = document.getElementById("import_key_status");
-  if (!btn) return;
-  btn.addEventListener("click", async () => {
+  if (!dialog || !openBtn || !parseBtn || !statusEl) return;
+
+  openBtn.addEventListener("click", () => {
+    statusEl.textContent = "";
+    if (typeof dialog.showModal === "function") {
+      dialog.showModal();
+    } else {
+      // Browser has no modal <dialog> support — refuse rather than
+      // render inline (no backdrop/focus-trap = user could interact
+      // with the form beneath while thinking the dialog is modal).
+      alert("Ваш браузер не підтримує модальний діалог. " +
+            "Оновіть до актуальної версії Chrome / Edge / Firefox.");
+    }
+  });
+
+  // Read CSRF once from the main form's hidden input — avoids quoting
+  // issues if the token generator ever emits `"` / `\` and eliminates
+  // the server-side interpolation surface inside JS.
+  const mainForm = document.querySelector(
+    "form[action='/admin/ui/settings/fns/new']"
+  );
+  const csrfValue = mainForm
+    ? (mainForm.elements["csrf_token"] || {}).value || ""
+    : "";
+
+  parseBtn.addEventListener("click", async () => {
     const fileEl = document.getElementById("import_key_file");
     const pwEl = document.getElementById("import_key_password");
     if (!fileEl.files || fileEl.files.length === 0) {
@@ -142,10 +178,12 @@
       return;
     }
     const fd = new FormData();
-    fd.append("csrf_token", "{{ csrf_token }}");
+    fd.append("csrf_token", csrfValue);
     fd.append("password", pwEl.value || "");
     fd.append("key_file", fileEl.files[0]);
     statusEl.textContent = "Читаю ключ…";
+    parseBtn.disabled = true;
+    let success = false;
     try {
       const resp = await fetch("/admin/ui/settings/fns/parse-key", {
         method: "POST", body: fd,
@@ -155,15 +193,26 @@
         statusEl.textContent = data.error || "Помилка імпорту.";
         return;
       }
-      const form = document.querySelector("form[action='/admin/ui/settings/fns/new']");
-      if (data.edrpou) form.elements["tax_number"].value = data.edrpou;
-      if (data.org_name) form.elements["org_name"].value = data.org_name;
-      if (data.operator_name) form.elements["operator_name"].value = data.operator_name;
-      if (data.drfo) form.elements["operator_inn"].value = data.drfo;
-      statusEl.textContent = "Заповнено з ключа. Перевірте та збережіть.";
+      if (data.edrpou) mainForm.elements["tax_number"].value = data.edrpou;
+      if (data.org_name) mainForm.elements["org_name"].value = data.org_name;
+      if (data.operator_name) mainForm.elements["operator_name"].value = data.operator_name;
+      if (data.drfo) mainForm.elements["operator_inn"].value = data.drfo;
+      success = true;
     } catch (e) {
-      statusEl.textContent = "Мережева помилка: " + e;
+      statusEl.textContent = "Мережева помилка. Спробуйте ще раз.";
+    } finally {
+      // Always wipe the password input — cleartext must not linger
+      // after the request regardless of success or failure.
+      if (pwEl) pwEl.value = "";
+      parseBtn.disabled = false;
+      if (success) dialog.close();
     }
+  });
+
+  // Defensive: wipe password on dialog close (ESC / Cancel / backdrop).
+  dialog.addEventListener("close", () => {
+    const pwEl = document.getElementById("import_key_password");
+    if (pwEl) pwEl.value = "";
   });
 })();
 </script>

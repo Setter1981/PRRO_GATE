@@ -169,6 +169,21 @@
       border: 1px solid #f5c6cb; border-radius: 4px; margin-bottom: 16px;
     }
     .alert-error ul { margin: 4px 0 0 16px; padding: 0; }
+    dialog {
+      border: 1px solid #dde2e8; border-radius: 8px;
+      padding: 20px 24px; min-width: 420px; max-width: 560px;
+      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.15);
+    }
+    dialog::backdrop { background: rgba(31, 59, 77, 0.35); }
+    dialog h2 { margin-top: 0; color: #1f3b4d; font-size: 18px; }
+    dialog label {
+      display: grid; grid-template-columns: 140px 1fr;
+      align-items: center; gap: 8px; margin: 10px 0;
+    }
+    dialog input[type="file"], dialog input[type="password"] {
+      padding: 6px 8px; border: 1px solid #ccd3da; border-radius: 4px;
+      font-size: 13px;
+    }
   </style>
 </head>
 <body>
