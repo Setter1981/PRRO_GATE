@@ -56,6 +56,7 @@ _MAX_LEN = {
     "operator_inn": 10,
     "jks_path": 512,
     "jks_password": 512,
+    "vat_payer_inn": 12,
 }
 
 _log = logging.getLogger(__name__)
@@ -99,6 +100,10 @@ def _validate_new_fn(form: dict[str, str]) -> list[str]:
     mode = form.get("fiscal_mode", "")
     if mode not in _ALLOWED_FISCAL_MODES:
         errors.append("Режим має бути 'test' або 'prod'.")
+
+    vat = form.get("vat_payer_inn", "") or ""
+    if vat and (not vat.isdigit() or len(vat) != 12):
+        errors.append("ІПН платника ПДВ має бути рівно 12 цифр (або порожньо).")
 
     for name in ("min_offline_codes", "max_offline_codes"):
         raw = form.get(name, "0") or "0"
@@ -298,7 +303,8 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
                 """SELECT fiscal_number, tax_number, fiscal_mode,
                           tsp_enabled, offline_enabled,
                           COALESCE(org_name, ''),
-                          min_offline_codes, max_offline_codes
+                          min_offline_codes, max_offline_codes,
+                          COALESCE(vat_payer_inn, '')
                    FROM fiscal_number_config ORDER BY fiscal_number"""
             ).fetchall()
         return _render_settings("settings_fns.html.j2", request, active="fns", fns=rows)
@@ -331,6 +337,7 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
         operator_inn: str = Form(""),
         jks_path: str = Form(""),
         jks_password: str = Form(""),
+        vat_payer_inn: str = Form(""),
     ):
         redirect = _require_auth(request)
         if redirect:
@@ -358,6 +365,7 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
             "operator_name": operator_name.strip(),
             "operator_inn": operator_inn.strip(),
             "jks_path": jks_path.strip(),
+            "vat_payer_inn": vat_payer_inn.strip(),
             # Password intentionally NOT echoed back to the re-render and
             # never returned to the template dict.
         }
@@ -387,6 +395,7 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
                 "has_cashier": cashier_provided,
                 "org_name": form["org_name"] or None,
                 "point_name": form["point_name"] or None,
+                "vat_payer_inn_set": bool(form["vat_payer_inn"]),
             },
             ensure_ascii=False,
         )
@@ -402,8 +411,9 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
                                 fiscal_number, tax_number, fiscal_mode,
                                 tsp_enabled, offline_enabled,
                                 org_name, org_address,
-                                min_offline_codes, max_offline_codes
-                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                min_offline_codes, max_offline_codes,
+                                vat_payer_inn
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             form["fiscal_number"], form["tax_number"], form["fiscal_mode"],
                             1 if form["tsp_enabled"] == "1" else 0,
@@ -412,6 +422,7 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
                             form["point_address"] or None,
                             int(form["min_offline_codes"]),
                             int(form["max_offline_codes"]),
+                            form["vat_payer_inn"] or None,
                         ),
                     )
                     if cashier_provided:
@@ -534,7 +545,8 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
                           tsp_enabled, offline_enabled,
                           COALESCE(org_name, '') AS org_name,
                           COALESCE(org_address, '') AS org_address,
-                          min_offline_codes, max_offline_codes
+                          min_offline_codes, max_offline_codes,
+                          COALESCE(vat_payer_inn, '') AS vat_payer_inn
                    FROM fiscal_number_config WHERE fiscal_number = ?""",
                 (fn,),
             ).fetchone()
@@ -551,6 +563,7 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
             "point_name": "",          # no schema column yet — accepted, audited, lost
             "min_offline_codes": str(row[7]),
             "max_offline_codes": str(row[8]),
+            "vat_payer_inn": row[9],
         }
 
     # States that block a mode flip:
@@ -579,7 +592,6 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
         request: Request,
         fn: str,
         csrf_token: str = Form(""),
-        tax_number: str = Form(""),
         fiscal_mode: str = Form("test"),
         org_name: str = Form(""),
         point_name: str = Form(""),
@@ -588,6 +600,7 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
         offline_enabled: str = Form("1"),
         min_offline_codes: str = Form("0"),
         max_offline_codes: str = Form("0"),
+        vat_payer_inn: str = Form(""),
     ):
         redirect = _require_auth(request)
         if redirect:
@@ -602,8 +615,12 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
             raise HTTPException(status_code=404, detail="FN not found")
 
         form = {
-            "fiscal_number": fn,  # NEVER from POST body — keyed by URL path
-            "tax_number": tax_number.strip(),
+            # Primary-identity fields are sourced from the existing DB
+            # row — NEVER from the POST body.  fiscal_number is keyed
+            # by URL; tax_number is the legal-entity code which does
+            # not change over the life of a PRRO.
+            "fiscal_number": fn,
+            "tax_number": str(existing["tax_number"]),
             "fiscal_mode": fiscal_mode.strip(),
             "org_name": org_name.strip(),
             "point_name": point_name.strip(),
@@ -612,6 +629,7 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
             "offline_enabled": offline_enabled.strip(),
             "min_offline_codes": min_offline_codes.strip(),
             "max_offline_codes": max_offline_codes.strip(),
+            "vat_payer_inn": vat_payer_inn.strip(),
             "operator_name": "",
             "operator_inn": "",
             "jks_path": "",
@@ -636,6 +654,9 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
             return _bad(400)
 
         mode_flipping = form["fiscal_mode"] != existing["fiscal_mode"]
+        prev_vat = str(existing.get("vat_payer_inn") or "") or None
+        new_vat = form["vat_payer_inn"] or None
+        vat_changed = prev_vat != new_vat
         audit_payload = json.dumps(
             {
                 "previous_fiscal_mode": existing["fiscal_mode"],
@@ -643,6 +664,9 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
                 "org_name": form["org_name"] or None,
                 "point_name": form["point_name"] or None,
                 "mode_flipped": mode_flipping,
+                "previous_vat_payer_inn": prev_vat,
+                "vat_payer_inn": new_vat,
+                "vat_changed": vat_changed,
             },
             ensure_ascii=False,
         )
@@ -670,21 +694,25 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
                             return _bad(409)
 
                     conn.execute(
+                        # tax_number intentionally excluded — identity of
+                        # the legal entity is immutable post-registration.
                         """UPDATE fiscal_number_config
-                           SET tax_number = ?, fiscal_mode = ?,
+                           SET fiscal_mode = ?,
                                tsp_enabled = ?, offline_enabled = ?,
                                org_name = ?, org_address = ?,
                                min_offline_codes = ?, max_offline_codes = ?,
+                               vat_payer_inn = ?,
                                updated_at = CURRENT_TIMESTAMP
                            WHERE fiscal_number = ?""",
                         (
-                            form["tax_number"], form["fiscal_mode"],
+                            form["fiscal_mode"],
                             1 if form["tsp_enabled"] == "1" else 0,
                             1 if form["offline_enabled"] == "1" else 0,
                             form["org_name"] or None,
                             form["point_address"] or None,
                             int(form["min_offline_codes"]),
                             int(form["max_offline_codes"]),
+                            form["vat_payer_inn"] or None,
                             fn,
                         ),
                     )

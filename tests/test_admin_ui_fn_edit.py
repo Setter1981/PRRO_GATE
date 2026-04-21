@@ -242,12 +242,23 @@ def test_post_edit_preserves_fiscal_number_even_if_submitted(tmp_path: Path) -> 
 # ─── 3. Validation ───────────────────────────────────────────────────
 
 
-def test_post_edit_rejects_bad_tin(tmp_path: Path) -> None:
+def test_post_edit_ignores_tax_number_body_value(tmp_path: Path) -> None:
+    # Phase 9 changed tax_number from editable-with-validation to
+    # immutable-sourced-from-DB.  A malformed tax_number in the body
+    # is silently dropped (not even a 400) because the handler never
+    # reads it.  Dedicated immutability test for this behaviour lives
+    # in test_admin_ui_vat_and_readonly_tin.py.
     container = RuntimeContainer(_config(tmp_path))
     client = _logged_in_with_fn(container)
     try:
         r = _submit_edit(client, "4000000100", tax_number="abc")
-        assert r.status_code == 400
+        assert r.status_code in (302, 303)
+        with container.connect() as conn:
+            tin = conn.execute(
+                "SELECT tax_number FROM fiscal_number_config WHERE fiscal_number=?",
+                ("4000000100",),
+            ).fetchone()[0]
+        assert tin == "12345678"
     finally:
         client.__exit__(None, None, None)
 

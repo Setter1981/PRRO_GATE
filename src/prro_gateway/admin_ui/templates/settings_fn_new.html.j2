@@ -62,6 +62,12 @@
              required value="{{ form.tax_number | default('') }}">
     </label>
     <label>
+      ІПН платника ПДВ (12 цифр, опціонально)
+      <input type="text" name="vat_payer_inn" maxlength="12" pattern="[0-9]{12}"
+             value="{{ form.vat_payer_inn | default('') }}"
+             placeholder="лише для платників ПДВ">
+    </label>
+    <label>
       Назва організації
       <input type="text" name="org_name" maxlength="256"
              value="{{ form.org_name | default('') }}">

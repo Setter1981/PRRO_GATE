@@ -16,6 +16,7 @@
       <th>TSP</th>
       <th>Offline</th>
       <th>Організація</th>
+      <th>ПДВ</th>
       <th>Offline-коди (min / max)</th>
       <th>Дії</th>
     </tr>
@@ -29,6 +30,7 @@
       <td>{% if row[3] %}<span class="badge-ok">Так</span>{% else %}<span class="muted">Ні</span>{% endif %}</td>
       <td>{% if row[4] %}<span class="badge-ok">Так</span>{% else %}<span class="muted">Ні</span>{% endif %}</td>
       <td class="muted">{{ row[5] or '—' }}</td>
+      <td class="muted">{{ row[8] or '—' }}</td>
       <td>{{ row[6] }} / {{ row[7] }}</td>
       <td><a class="link" href="/admin/ui/settings/fns/{{ row[0] }}/edit">✎ Редагувати</a></td>
     </tr>

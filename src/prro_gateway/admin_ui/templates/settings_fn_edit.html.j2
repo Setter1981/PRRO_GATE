@@ -25,9 +25,16 @@
       <input type="text" value="{{ form.fiscal_number }}" readonly disabled>
     </label>
     <label>
-      ЄДРПОУ / ІПН
-      <input type="text" name="tax_number" maxlength="10" pattern="[0-9]{8,10}"
-             required value="{{ form.tax_number | default('') }}">
+      ЄДРПОУ / ІПН (не можна змінити)
+      <input type="text" name="tax_number"
+             value="{{ form.tax_number | default('') }}"
+             readonly disabled>
+    </label>
+    <label>
+      ІПН платника ПДВ (12 цифр, опціонально)
+      <input type="text" name="vat_payer_inn" maxlength="12" pattern="[0-9]{12}"
+             value="{{ form.vat_payer_inn | default('') }}"
+             placeholder="лише для платників ПДВ">
     </label>
     <label>
       Назва організації
