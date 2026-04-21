@@ -435,6 +435,188 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
 
         return RedirectResponse("/admin/ui/settings/fns", status_code=303)
 
+    def _load_fn_row(fn: str) -> dict[str, object] | None:
+        with container.connect() as conn:
+            row = conn.execute(
+                """SELECT fiscal_number, tax_number, fiscal_mode,
+                          tsp_enabled, offline_enabled,
+                          COALESCE(org_name, '') AS org_name,
+                          COALESCE(org_address, '') AS org_address,
+                          min_offline_codes, max_offline_codes
+                   FROM fiscal_number_config WHERE fiscal_number = ?""",
+                (fn,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "fiscal_number": row[0],
+            "tax_number": row[1],
+            "fiscal_mode": row[2],
+            "tsp_enabled": "1" if row[3] else "0",
+            "offline_enabled": "1" if row[4] else "0",
+            "org_name": row[5],
+            "point_address": row[6],   # stored as org_address; rendered as point_address
+            "point_name": "",          # no schema column yet — accepted, audited, lost
+            "min_offline_codes": str(row[7]),
+            "max_offline_codes": str(row[8]),
+        }
+
+    # States that block a mode flip:
+    # - OPENING/OPENED/CLOSING: an active shift is inconsistent with a
+    #   channel switch (frozen invariant #3).
+    # - ERROR: recovery is pending; flipping profiles would silently
+    #   violate invariant #8 (recovery safety) — operator must reconcile
+    #   or manually reset before switching.
+    _MODE_FLIP_BLOCKING_STATES = ("OPENING", "OPENED", "CLOSING", "ERROR")
+
+    @app.get("/admin/ui/settings/fns/{fn}/edit", include_in_schema=False, response_model=None)
+    async def edit_fn_form(request: Request, fn: str):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+        existing = _load_fn_row(fn)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="FN not found")
+        return _render_settings(
+            "settings_fn_edit.html.j2", request, active="fns",
+            form=existing, errors=[], csrf_token=_get_or_create_csrf(request),
+        )
+
+    @app.post("/admin/ui/settings/fns/{fn}/edit", include_in_schema=False, response_model=None)
+    async def edit_fn_submit(
+        request: Request,
+        fn: str,
+        csrf_token: str = Form(""),
+        tax_number: str = Form(""),
+        fiscal_mode: str = Form("test"),
+        org_name: str = Form(""),
+        point_name: str = Form(""),
+        point_address: str = Form(""),
+        tsp_enabled: str = Form("0"),
+        offline_enabled: str = Form("1"),
+        min_offline_codes: str = Form("0"),
+        max_offline_codes: str = Form("0"),
+    ):
+        redirect = _require_auth(request)
+        if redirect:
+            return redirect
+        if not _check_csrf(request, csrf_token):
+            return HTMLResponse(
+                content="<h1>CSRF validation failed</h1>", status_code=403,
+            )
+
+        existing = _load_fn_row(fn)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="FN not found")
+
+        form = {
+            "fiscal_number": fn,  # NEVER from POST body — keyed by URL path
+            "tax_number": tax_number.strip(),
+            "fiscal_mode": fiscal_mode.strip(),
+            "org_name": org_name.strip(),
+            "point_name": point_name.strip(),
+            "point_address": point_address.strip(),
+            "tsp_enabled": tsp_enabled.strip(),
+            "offline_enabled": offline_enabled.strip(),
+            "min_offline_codes": min_offline_codes.strip(),
+            "max_offline_codes": max_offline_codes.strip(),
+            "operator_name": "",
+            "operator_inn": "",
+            "jks_path": "",
+        }
+        errors = _validate_new_fn(form)
+
+        def _bad(status: int) -> HTMLResponse:
+            return HTMLResponse(
+                content=env.get_template("settings_fn_edit.html.j2").render(
+                    request=request,
+                    authenticated=True,
+                    active_tab="fns",
+                    tabs=_SETTINGS_TABS,
+                    form=form,
+                    errors=errors,
+                    csrf_token=_get_or_create_csrf(request),
+                ),
+                status_code=status,
+            )
+
+        if errors:
+            return _bad(400)
+
+        mode_flipping = form["fiscal_mode"] != existing["fiscal_mode"]
+        audit_payload = json.dumps(
+            {
+                "previous_fiscal_mode": existing["fiscal_mode"],
+                "fiscal_mode": form["fiscal_mode"],
+                "org_name": form["org_name"] or None,
+                "point_name": form["point_name"] or None,
+                "mode_flipped": mode_flipping,
+            },
+            ensure_ascii=False,
+        )
+
+        try:
+            with container.connect() as conn:
+                # BEGIN IMMEDIATE acquires a RESERVED lock up-front so
+                # the shift-state check and the UPDATE see the same
+                # consistent snapshot — closing the read-after-check
+                # race on invariant #3 (channel switch forbidden with
+                # open shift).
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if mode_flipping:
+                        r = conn.execute(
+                            "SELECT shift_state FROM node_state WHERE fiscal_number = ?",
+                            (fn,),
+                        ).fetchone()
+                        if r is not None and r[0] in _MODE_FLIP_BLOCKING_STATES:
+                            conn.execute("ROLLBACK")
+                            errors = [
+                                "Зміна режиму test↔prod заборонена при відкритій/нестабільній зміні "
+                                f"(shift_state={r[0]}). Закрийте Z-звітом і повторіть."
+                            ]
+                            return _bad(409)
+
+                    conn.execute(
+                        """UPDATE fiscal_number_config
+                           SET tax_number = ?, fiscal_mode = ?,
+                               tsp_enabled = ?, offline_enabled = ?,
+                               org_name = ?, org_address = ?,
+                               min_offline_codes = ?, max_offline_codes = ?,
+                               updated_at = CURRENT_TIMESTAMP
+                           WHERE fiscal_number = ?""",
+                        (
+                            form["tax_number"], form["fiscal_mode"],
+                            1 if form["tsp_enabled"] == "1" else 0,
+                            1 if form["offline_enabled"] == "1" else 0,
+                            form["org_name"] or None,
+                            form["point_address"] or None,
+                            int(form["min_offline_codes"]),
+                            int(form["max_offline_codes"]),
+                            fn,
+                        ),
+                    )
+                    conn.execute(
+                        """INSERT INTO audit_log (
+                                entity_type, entity_id, event_type, severity,
+                                event_payload_json
+                           ) VALUES (
+                                'fiscal_number_config', ?, 'fn_updated',
+                                'INFO', ?
+                           )""",
+                        (fn, audit_payload),
+                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+        except sqlite3.DatabaseError:
+            _log.exception("edit_fn_db_error fn=%s", fn)
+            errors = ["Помилка збереження. Зверніться до адміністратора (логи сервера)."]
+            return _bad(500)
+
+        return RedirectResponse("/admin/ui/settings/fns", status_code=303)
+
     @app.get("/admin/ui/settings/operators", include_in_schema=False, response_model=None)
     async def settings_operators(request: Request):
         redirect = _require_auth(request)

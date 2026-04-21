@@ -1,0 +1,90 @@
+{% extends "_base.html.j2" %}
+{% block title %}Редагувати ФН — Налаштування{% endblock %}
+{% block content %}
+<h1>Налаштування</h1>
+{% include "_settings_tabs.html.j2" %}
+
+<h2>Редагувати фіскальний номер <code>{{ form.fiscal_number }}</code></h2>
+
+{% if errors %}
+<div class="alert-error">
+  <strong>Помилки:</strong>
+  <ul>
+    {% for err in errors %}<li>{{ err }}</li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+<form method="post" action="/admin/ui/settings/fns/{{ form.fiscal_number }}/edit" autocomplete="off">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+  <fieldset>
+    <legend>Організація</legend>
+    <label>
+      ФН (не можна змінити)
+      <input type="text" value="{{ form.fiscal_number }}" readonly disabled>
+    </label>
+    <label>
+      ЄДРПОУ / ІПН
+      <input type="text" name="tax_number" maxlength="10" pattern="[0-9]{8,10}"
+             required value="{{ form.tax_number | default('') }}">
+    </label>
+    <label>
+      Назва організації
+      <input type="text" name="org_name" maxlength="256"
+             value="{{ form.org_name | default('') }}">
+    </label>
+    <label>
+      Назва торгової точки
+      <input type="text" name="point_name" maxlength="256"
+             value="{{ form.point_name | default('') }}">
+    </label>
+    <label>
+      Адреса торгової точки
+      <input type="text" name="point_address" maxlength="256"
+             value="{{ form.point_address | default('') }}">
+    </label>
+    <label>
+      Режим
+      <select name="fiscal_mode" required>
+        <option value="test" {% if form.fiscal_mode == "test" %}selected{% endif %}>test</option>
+        <option value="prod" {% if form.fiscal_mode == "prod" %}selected{% endif %}>prod</option>
+      </select>
+    </label>
+    <label>
+      TSP
+      <select name="tsp_enabled">
+        <option value="0" {% if form.tsp_enabled != "1" %}selected{% endif %}>Ні</option>
+        <option value="1" {% if form.tsp_enabled == "1" %}selected{% endif %}>Так</option>
+      </select>
+    </label>
+    <label>
+      Offline дозволений
+      <select name="offline_enabled">
+        <option value="1" {% if form.offline_enabled != "0" %}selected{% endif %}>Так</option>
+        <option value="0" {% if form.offline_enabled == "0" %}selected{% endif %}>Ні</option>
+      </select>
+    </label>
+    <label>
+      Offline коди (min)
+      <input type="number" name="min_offline_codes" min="0"
+             value="{{ form.min_offline_codes | default('0') }}">
+    </label>
+    <label>
+      Offline коди (max)
+      <input type="number" name="max_offline_codes" min="0"
+             value="{{ form.max_offline_codes | default('0') }}">
+    </label>
+  </fieldset>
+
+  <p class="muted">
+    Додавати/редагувати касирів — через окремий екран (заплановано).
+    Зміна режиму test↔prod можлива лише при закритій зміні.
+  </p>
+
+  <div class="form-actions">
+    <button type="submit">Зберегти зміни</button>
+    <a class="btn-cancel" href="/admin/ui/settings/fns">Скасувати</a>
+  </div>
+</form>
+{% endblock %}
