@@ -11,6 +11,7 @@ GDI+ / iTextSharp stack, this module is OS-agnostic and uses only
 libraries that work identically on Windows, Linux, and macOS.
 """
 from .formatter import format_receipt
+from .html_renderer import render_html
 from .models import (
     ReceiptItem,
     ReceiptLines,
@@ -21,6 +22,7 @@ from .models import (
 
 __all__ = [
     "format_receipt",
+    "render_html",
     "ReceiptItem",
     "ReceiptLines",
     "ReceiptPayment",

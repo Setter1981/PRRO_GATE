@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Фіскальний чек</title>
+  <style>
+    /* Base — screen preview */
+    body {
+      margin: 0;
+      padding: 12px;
+      background: #e5e5e5;
+      font-family: Consolas, "Liberation Mono", Courier, monospace;
+      font-size: 11pt;
+      color: #000;
+    }
+    .receipt {
+      width: {{ paper_width_mm }}mm;
+      margin: 0 auto;
+      padding: 6mm 4mm;
+      background: #ffffff;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+      box-sizing: border-box;
+    }
+    .receipt pre {
+      margin: 0;
+      padding: 0;
+      font-family: inherit;
+      font-size: inherit;
+      white-space: pre;
+      word-break: normal;
+      overflow-wrap: normal;
+    }
+    .receipt .qr {
+      display: block;
+      margin: 8px auto 0 auto;
+      width: {{ qr_size_mm }}mm;
+      height: {{ qr_size_mm }}mm;
+      image-rendering: pixelated;
+    }
+
+    /* Print — 80мм thermal paper */
+    @media print {
+      body {
+        background: #ffffff;
+        padding: 0;
+      }
+      .receipt {
+        width: {{ paper_width_mm }}mm;
+        padding: 2mm;
+        box-shadow: none;
+      }
+      @page {
+        size: {{ paper_width_mm }}mm auto;
+        margin: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="receipt">
+    <pre>{% for line in header %}{{ line }}
+{% endfor %}{% for line in body %}{{ line }}
+{% endfor %}{% for line in footer %}{{ line }}
+{% endfor %}</pre>
+    {% if qr_data_uri %}
+    <img class="qr" src="{{ qr_data_uri }}" alt="QR-код чека">
+    {% endif %}
+  </div>
+</body>
+</html>
