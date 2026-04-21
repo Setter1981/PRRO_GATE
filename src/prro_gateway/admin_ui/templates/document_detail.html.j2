@@ -1,0 +1,25 @@
+{% extends "_base.html.j2" %}
+{% block title %}Документ {{ doc.document_id }} — PRRO Gateway{% endblock %}
+{% block content %}
+<h1>Документ {{ doc.document_id }}</h1>
+
+<table>
+  <tr><th>Document ID</th><td>{{ doc.document_id }}</td></tr>
+  <tr><th>Фіскальний номер ПРРО</th><td>{{ doc.fiscal_number }}</td></tr>
+  <tr><th>Фіск. номер (DPS)</th><td>{{ doc.server_fiscal_no or '—' }}</td></tr>
+  <tr><th>Тип</th><td>{{ doc.doc_type }}</td></tr>
+  <tr><th>Стан</th><td><span class="state state-{{ doc.state.value }}">{{ doc.state.value }}</span></td></tr>
+  <tr><th>ЛНД</th><td>{{ doc.lnd }}</td></tr>
+  <tr><th>Сума</th><td>{% if doc.total_sum %}{{ '%.2f' % (doc.total_sum / 100) }}{% else %}—{% endif %}</td></tr>
+  <tr><th>Business ts</th><td>{{ doc.business_ts }}</td></tr>
+  <tr><th>Backend profile</th><td>{{ doc.backend_profile_id }}</td></tr>
+  <tr><th>Transport profile</th><td>{{ doc.transport_profile_id }}</td></tr>
+  <tr><th>Submission status</th><td>{{ doc.submission_status or '—' }}</td></tr>
+  <tr><th>KVT1 received</th><td>{{ doc.kvt1_received_at or '—' }}</td></tr>
+  <tr><th>KVT2 received</th><td>{{ doc.kvt2_received_at or '—' }}</td></tr>
+  <tr><th>Canonical error</th><td>{{ doc.canonical_error_code or '—' }}</td></tr>
+  <tr><th>Error message</th><td>{{ doc.error_message or '—' }}</td></tr>
+</table>
+
+<p><a class="link" href="/admin/ui/documents/">← Назад до списку</a></p>
+{% endblock %}

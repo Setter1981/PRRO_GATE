@@ -1,0 +1,25 @@
+{% extends "_base.html.j2" %}
+{% block title %}Панель — PRRO Gateway{% endblock %}
+{% block content %}
+<h1>Панель керування</h1>
+
+<div class="cards">
+  <div class="card">
+    <div class="label">Усього документів</div>
+    <div class="value">{{ total_docs }}</div>
+  </div>
+  <div class="card">
+    <div class="label">Нових у черзі</div>
+    <div class="value">{{ inbox_new }}</div>
+  </div>
+  <div class="card">
+    <div class="label">Потребують ручної реконсиляції</div>
+    <div class="value">{{ manual_count }}</div>
+  </div>
+</div>
+
+<h2>Швидкі дії</h2>
+<p>
+  <a class="btn" href="/admin/ui/documents/">Список документів</a>
+</p>
+{% endblock %}

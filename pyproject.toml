@@ -20,7 +20,10 @@ dependencies = [
   "protobuf>=6.31,<7",
   "Jinja2>=3.1,<4",
   "qrcode[pil]>=8,<9",
-  "reportlab>=4.4,<5"
+  "reportlab>=4.4,<5",
+  # Admin UI session auth + form parsing.
+  "itsdangerous>=2,<3",
+  "python-multipart>=0.0.20,<1"
 ]
 
 [tool.setuptools]
@@ -31,6 +34,9 @@ package-dir = {"" = "src"}
     "templates/*.j2",
     "fonts/*.ttf",
     "fonts/LICENSE.txt",
+]
+"prro_gateway.admin_ui" = [
+    "templates/*.j2",
 ]
 
 [tool.setuptools.packages.find]

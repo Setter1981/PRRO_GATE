@@ -73,6 +73,19 @@ class Maria304IngressConfig(StrictModel):
     auto_open_shift: bool = True
 
 
+class AdminUiConfig(StrictModel):
+    """Admin web UI (operator console) configuration.
+
+    Session-based auth over HTTPS.  Skip UI in deployments that
+    administer via YAML + CLI only (set enabled=False).
+    """
+    enabled: bool = False
+    password: str = ""
+    session_secret: str = ""
+    session_cookie: str = "session"
+    session_max_age_seconds: int = 8 * 3600
+
+
 class IngressConfig(StrictModel):
     rest: RestIngressConfig = Field(default_factory=RestIngressConfig)
     xmlrpc: XmlRpcIngressConfig = Field(default_factory=XmlRpcIngressConfig)
@@ -149,6 +162,7 @@ class AppConfig(StrictModel):
     backup: BackupConfig = Field(default_factory=BackupConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
+    admin_ui: AdminUiConfig = Field(default_factory=AdminUiConfig)
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "AppConfig":

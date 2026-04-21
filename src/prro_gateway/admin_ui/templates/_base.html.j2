@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}PRRO Gateway — Адмін{% endblock %}</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, Oxygen, Cantarell, sans-serif;
+      font-size: 14px;
+      color: #222;
+      background: #f5f6f8;
+    }
+    header {
+      background: #1f3b4d;
+      color: #fff;
+      padding: 10px 18px;
+      display: flex;
+      align-items: center;
+      gap: 20px;
+    }
+    header .brand {
+      font-weight: 600;
+      font-size: 16px;
+      margin-right: 12px;
+    }
+    header nav a {
+      color: #cfe3ed;
+      text-decoration: none;
+      padding: 4px 10px;
+      border-radius: 3px;
+    }
+    header nav a:hover { background: #2a5068; color: #fff; }
+    header nav a.active { background: #ffffff22; color: #fff; }
+    header .spacer { flex: 1; }
+    header .user a {
+      color: #ffcf99;
+      text-decoration: none;
+      padding: 4px 10px;
+    }
+    main { padding: 20px 24px; max-width: 1200px; margin: 0 auto; }
+    h1 { margin-top: 0; font-size: 22px; color: #1f3b4d; }
+    h2 { font-size: 18px; color: #1f3b4d; margin-top: 24px; }
+    .cards { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 24px; }
+    .card {
+      background: #fff;
+      border: 1px solid #dde2e8;
+      border-radius: 6px;
+      padding: 14px 18px;
+      min-width: 180px;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+    }
+    .card .label { color: #617b8c; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .card .value { font-size: 24px; font-weight: 600; color: #1f3b4d; margin-top: 4px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      border: 1px solid #dde2e8;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #eef1f4; font-size: 13px; }
+    th { background: #f0f4f7; font-weight: 600; color: #1f3b4d; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #fafbfc; }
+    .state {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 3px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+    .state-ACK, .state-KVT2 { background: #d4edda; color: #155724; }
+    .state-REJECTED { background: #f8d7da; color: #721c24; }
+    .state-ERROR_RETRYABLE { background: #fff3cd; color: #856404; }
+    .state-OFFLINE_LOCAL_ACK { background: #cce5ff; color: #004085; }
+    .form-box {
+      background: #fff;
+      border: 1px solid #dde2e8;
+      border-radius: 6px;
+      padding: 24px;
+      max-width: 360px;
+      margin: 40px auto;
+    }
+    .form-box h1 { text-align: center; font-size: 18px; }
+    .form-box label { display: block; margin: 12px 0 4px; font-weight: 500; }
+    .form-box input[type="password"] {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #ccd3da;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+    .form-box button {
+      width: 100%;
+      padding: 10px;
+      background: #1f3b4d;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      cursor: pointer;
+      margin-top: 16px;
+    }
+    .form-box button:hover { background: #2a5068; }
+    .error { color: #721c24; background: #f8d7da; padding: 8px 12px; border-radius: 4px; margin-top: 12px; }
+    a.btn {
+      display: inline-block;
+      padding: 6px 12px;
+      background: #1f3b4d;
+      color: #fff;
+      border-radius: 4px;
+      text-decoration: none;
+      font-size: 13px;
+    }
+    a.btn:hover { background: #2a5068; }
+    a.btn-sm { padding: 3px 8px; font-size: 12px; }
+    a.link { color: #1f3b4d; text-decoration: none; }
+    a.link:hover { text-decoration: underline; }
+    .muted { color: #8098a8; font-size: 12px; }
+  </style>
+</head>
+<body>
+  {% if authenticated %}
+  <header>
+    <span class="brand">PRRO Gateway</span>
+    <nav>
+      <a href="/admin/ui/">Панель</a>
+      <a href="/admin/ui/documents/">Документи</a>
+    </nav>
+    <span class="spacer"></span>
+    <span class="user">
+      <a href="/admin/ui/logout">Вихід</a>
+    </span>
+  </header>
+  {% endif %}
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

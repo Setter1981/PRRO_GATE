@@ -1,0 +1,39 @@
+{% extends "_base.html.j2" %}
+{% block title %}Документи — PRRO Gateway{% endblock %}
+{% block content %}
+<h1>Фіскальні документи</h1>
+<p class="muted">Останні 50 записів.</p>
+
+{% if documents %}
+<table>
+  <thead>
+    <tr>
+      <th>Document ID</th>
+      <th>ФН</th>
+      <th>Тип</th>
+      <th>Стан</th>
+      <th>Фіск. №</th>
+      <th>Сума</th>
+      <th>Дата</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for doc in documents %}
+    <tr>
+      <td><a class="link" href="/admin/ui/documents/{{ doc[0] }}">{{ doc[0][:14] }}…</a></td>
+      <td>{{ doc[1] }}</td>
+      <td>{{ doc[2] }}</td>
+      <td><span class="state state-{{ doc[3] }}">{{ doc[3] }}</span></td>
+      <td>{{ doc[4] or '—' }}</td>
+      <td>{% if doc[5] %}{{ '%.2f' % (doc[5] / 100) }}{% else %}—{% endif %}</td>
+      <td class="muted">{{ doc[6] }}</td>
+      <td><a class="btn btn-sm" href="/admin/ui/documents/{{ doc[0] }}">Деталі</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">Поки що немає документів.</p>
+{% endif %}
+{% endblock %}

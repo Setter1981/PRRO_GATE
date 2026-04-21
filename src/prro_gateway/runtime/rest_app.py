@@ -17,6 +17,7 @@ from ..enums import DocumentState
 from ..repositories.fiscal_documents import FiscalDocumentRepository
 from ..repositories.audit import AuditRepository
 from ..repositories.outbox import OutboxRepository
+from ..admin_ui import register_admin_ui
 from ..repositories.shifts import ShiftRepository
 from ..services.ingress import AdapterMappingError
 from ..services.write_path import WritePathWorker
@@ -56,6 +57,9 @@ def create_app(container: RuntimeContainer) -> FastAPI:
             container.shutdown()
 
     app = FastAPI(title=container.config.app_name, version=container.config.version, lifespan=lifespan)
+
+    # Admin UI (optional, enabled via config.admin_ui.enabled).
+    register_admin_ui(app, container)
 
     @app.get("/health/live")
     def live() -> dict[str, str]:
