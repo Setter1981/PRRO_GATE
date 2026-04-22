@@ -164,36 +164,44 @@ mod envelope_integrity {
 
 #[cfg(test)]
 mod idempotency {
-    use prro_sidecar::repo::Repo;
+    use prro_sidecar::repo::{PendingInsertResult, Repo};
 
     fn make_repo() -> Repo { Repo::open(":memory:").expect("in-memory repo") }
 
     #[test]
-    fn fresh_key_returns_none() {
+    fn fresh_key_returns_inserted() {
         let repo = make_repo();
-        assert!(repo.find_idempotent_response("key-1").unwrap().is_none());
+        let r = repo.insert_pending_request("key-1", "FN001").unwrap();
+        assert!(matches!(r, PendingInsertResult::Inserted));
     }
 
     #[test]
-    fn recorded_key_returns_json() {
+    fn accepted_key_returns_cached_json() {
         let repo = make_repo();
-        repo.record_idempotent_response("key-1", "FN001", r#"{"status":1}"#).unwrap();
-        let found = repo.find_idempotent_response("key-1").unwrap();
-        assert_eq!(found.as_deref(), Some(r#"{"status":1}"#));
+        repo.insert_pending_request("key-1", "FN001").unwrap();
+        repo.accept_request("key-1", r#"{"status":1}"#).unwrap();
+        match repo.insert_pending_request("key-1", "FN001").unwrap() {
+            PendingInsertResult::DuplicateAccepted(json) => {
+                assert_eq!(json, r#"{"status":1}"#);
+            }
+            other => panic!("expected DuplicateAccepted, got {other:?}"),
+        }
     }
 
     #[test]
-    fn different_key_returns_none() {
+    fn different_key_returns_inserted() {
         let repo = make_repo();
-        repo.record_idempotent_response("key-A", "FN001", r#"{"status":1}"#).unwrap();
-        assert!(repo.find_idempotent_response("key-B").unwrap().is_none());
+        repo.insert_pending_request("key-A", "FN001").unwrap();
+        repo.accept_request("key-A", r#"{"status":1}"#).unwrap();
+        let r = repo.insert_pending_request("key-B", "FN001").unwrap();
+        assert!(matches!(r, PendingInsertResult::Inserted));
     }
 
     #[test]
     fn fiscal_send_inner_contains_idempotency_wiring() {
         let src = include_str!("../src/bin/prro_sidecar.rs");
-        assert!(src.contains("find_idempotent_response"), "must call find_idempotent_response");
-        assert!(src.contains("record_idempotent_response"), "must call record_idempotent_response");
+        assert!(src.contains("insert_pending_request"), "must call insert_pending_request");
+        assert!(src.contains("accept_request"), "must call accept_request");
     }
 }
 

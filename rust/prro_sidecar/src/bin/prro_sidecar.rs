@@ -40,7 +40,7 @@ use prro_sidecar::{
     grpc_client::DpsGrpcPool,
     input::{CanonicalCommand, OperationType},
     license::LicenseState,
-    repo::Repo,
+    repo::{PendingInsertResult, Repo},
     validate_envelope,
     xml_builder::{self, BuildContext},
 };
@@ -124,6 +124,23 @@ async fn main() {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 reconcile_degraded_once(&reconcile_state).await;
+            }
+        });
+    }
+
+    // C2: cleanup stale 'pending' idempotency rows every 60 s.
+    // Rows older than 120 s represent ambiguous DPS calls (timeout / crash) —
+    // removing them restores the ability to retry after the ambiguity window.
+    {
+        let cleanup_repo = Arc::clone(&state.repo);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                match cleanup_repo.cleanup_stale_pending(120) {
+                    Ok(n) if n > 0 => tracing::info!(n, "cleared stale pending idempotency rows"),
+                    Err(e) => tracing::warn!(err = %e, "cleanup_stale_pending failed"),
+                    _ => {}
+                }
             }
         });
     }
@@ -323,16 +340,28 @@ async fn fiscal_send_inner(
         return Err(SidecarError::FnDegraded(fn_id.to_string()));
     }
 
-    // ── S4: idempotency check — return cached response on duplicate key ──────────
-    // Must run inside the fn_lock so a concurrent first-send that is still
-    // in-flight does not race with a retry that would also allocate a local_number.
-    if !cmd.idempotency_key.is_empty() {
-        if let Some(cached_json) = st.repo.find_idempotent_response(&cmd.idempotency_key)? {
-            let cached: FiscalSendResponse = serde_json::from_str(&cached_json)
-                .map_err(|e| SidecarError::Internal(format!("idempotency cache parse: {e}")))?;
-            return Ok(cached);
+    // ── S4/C2: durable pending-state idempotency ─────────────────────────────
+    // Insert a 'pending' record BEFORE allocating local_number so that a concurrent
+    // retry with the same key sees DuplicatePending → 409 instead of allocating
+    // a second local_number.  On success the record is promoted to 'accepted'.
+    // Stale pending rows (DPS timeout / crash) are cleaned by a background task.
+    let pending_key: Option<String> = if !cmd.idempotency_key.is_empty() {
+        match st.repo.insert_pending_request(&cmd.idempotency_key, fn_id)? {
+            PendingInsertResult::DuplicateAccepted(json) => {
+                let cached: FiscalSendResponse = serde_json::from_str(&json)
+                    .map_err(|e| SidecarError::Internal(format!("idempotency cache parse: {e}")))?;
+                return Ok(cached);
+            }
+            PendingInsertResult::DuplicatePending => {
+                return Err(SidecarError::DuplicateInFlight(
+                    cmd.idempotency_key.clone(),
+                ));
+            }
+            PendingInsertResult::Inserted => Some(cmd.idempotency_key.clone()),
         }
-    }
+    } else {
+        None
+    };
 
     // ── 9. Allocate local_number and load previous_hash (two short locks) ─────
     // local_num is incremented here — before CMS signing (step 11) and gRPC (step 12).
@@ -566,12 +595,14 @@ async fn fiscal_send_inner(
         dps_error_category,
     };
 
-    // S4: persist for idempotency replay — only for accepted documents (status > 0).
-    // Transient / permanent DPS errors MUST NOT be cached: a retry must be free to
-    // re-submit to DPS.  Uses INSERT OR IGNORE: concurrent duplicate stores are harmless.
-    if resp.status > 0 && !cmd.idempotency_key.is_empty() {
-        if let Ok(json) = serde_json::to_string(&response) {
-            let _ = st.repo.record_idempotent_response(&cmd.idempotency_key, fn_id, &json);
+    // S4/C2: promote pending → accepted only for DPS-accepted documents (status > 0).
+    // Transient / permanent DPS errors are NOT promoted: the pending row expires via
+    // the background cleanup task, allowing the client to retry after the TTL window.
+    if let Some(key) = &pending_key {
+        if resp.status > 0 {
+            if let Ok(json) = serde_json::to_string(&response) {
+                let _ = st.repo.accept_request(key, &json);
+            }
         }
     }
 

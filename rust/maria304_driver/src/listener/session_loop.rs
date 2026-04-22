@@ -14,10 +14,12 @@ use tokio::time::{timeout, Instant};
 use crate::bridge::{Bridge, BridgeError};
 use crate::observability::SessionMetrics;
 use crate::protocol::{Command, Response};
+// NOTE: Command::Cnac is the cancel-receipt command (no bridge call, Done path).
 use crate::session::dispatcher::{
-    dispatch, dispatch_prepare, dispatch_with_result, Clock, Correlation, DispatchPrepared,
-    Identity,
+    dispatch_prepare, dispatch_with_result, Clock, Correlation, DispatchPrepared, Identity,
 };
+#[cfg(test)]
+use crate::session::dispatcher::dispatch;
 use crate::session::Session;
 use crate::wire::{decode_frame, FrameError};
 
@@ -75,7 +77,7 @@ pub async fn run_connection(
         // see extra CRC bytes as junk bytes on the wire.
         let crc_for_write = session.crc_enabled;
         if let Some(responses) =
-            process_buffered(&mut buf, &mut session, &identity, &bridge, &*clock_src, &mut correlation).await
+            process_buffered(&mut buf, &mut session, &identity, &bridge, &*clock_src, &mut correlation, &metrics).await
         {
             for resp in responses {
                 write_response(&mut stream, &resp, crc_for_write).await?;
@@ -122,6 +124,7 @@ async fn process_buffered(
     bridge: &Arc<dyn Bridge + Send + Sync>,
     clock_src: &dyn ClockSource,
     correlation: &mut Correlation,
+    metrics: &SessionMetrics,
 ) -> Option<Vec<Response>> {
     if buf.is_empty() {
         return None;
@@ -133,7 +136,13 @@ async fn process_buffered(
             let clock = Clock { date: &date, time: &time };
             let command = Command::parse(&frame);
             match dispatch_prepare(session, &command, identity, clock, correlation) {
-                DispatchPrepared::Done(r) => Some(r),
+                DispatchPrepared::Done(r) => {
+                    // M6: receipt cancelled when CNAC dispatches locally.
+                    if matches!(command, Command::Cnac) {
+                        metrics.record_receipt_cancelled();
+                    }
+                    Some(r)
+                }
                 DispatchPrepared::NeedsBridge(envelope) => {
                     let b = Arc::clone(bridge);
                     let bridge_result = tokio::task::spawn_blocking(move || b.submit(&envelope))
@@ -141,6 +150,13 @@ async fn process_buffered(
                         .unwrap_or_else(|_| {
                             Err(BridgeError::Transport("spawn_blocking panicked".into()))
                         });
+                    // M6: count bridge errors and receipt outcomes.
+                    let is_bridge_ok = bridge_result.is_ok();
+                    if !is_bridge_ok {
+                        metrics.record_bridge_error();
+                    } else if matches!(command, Command::Comp(_)) {
+                        metrics.record_receipt_acked();
+                    }
                     Some(dispatch_with_result(session, &command, bridge_result, correlation))
                 }
             }
@@ -151,16 +167,19 @@ async fn process_buffered(
             Some(Vec::new())
         }
         Err(FrameError::BadCrc) => {
+            metrics.record_frame_error(); // M6
             buf.drain(..1);
             Some(vec![Response::Error(
                 crate::protocol::error_codes::ErrorCode::SoftBadCs,
             )])
         }
         Err(FrameError::NoFrameFound) => {
+            metrics.record_frame_error(); // M6
             buf.clear();
             Some(Vec::new())
         }
         Err(FrameError::InvalidCmdLen(_)) => {
+            metrics.record_frame_error(); // M6
             buf.drain(..1);
             Some(vec![Response::Error(
                 crate::protocol::error_codes::ErrorCode::SoftBlock,
@@ -173,6 +192,7 @@ async fn process_buffered(
 /// `Some(responses)` when a full frame was consumed, `None` when more
 /// bytes are needed.  On decode errors we consume enough bytes to
 /// resync and continue.
+#[cfg(test)]
 fn try_handle_buffered(
     buf: &mut Vec<u8>,
     session: &mut Session,
@@ -321,6 +341,99 @@ mod tests {
         let r2 = try_handle_buffered(&mut buf, &mut s, &id, &bridge, &clock, &mut corr).unwrap();
         assert_eq!(r2.len(), 2); // DONE + READY
         assert!(buf.is_empty());
+    }
+
+    // ── M7: metrics wiring tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bad_crc_frame_increments_frame_error_counter() {
+        use crate::observability::SessionMetrics;
+
+        // Encode a valid frame then flip a byte to corrupt the CRC.
+        let mut buf = crate::wire::encode_frame("SYNC", true).unwrap();
+        *buf.last_mut().unwrap() ^= 0xFF; // corrupt CRC byte
+
+        let mut s = Session::new();
+        s.crc_enabled = true;
+        let id = Arc::new(Identity::default());
+        let bridge: Arc<dyn Bridge + Send + Sync> = Arc::new(MockBridge::new());
+        let clock = Arc::new(FixedClock);
+        let metrics = Arc::new(SessionMetrics::new());
+        let mut corr = Correlation { session_uuid: "s".to_string(), receipt_seq: 0 };
+
+        process_buffered(&mut buf, &mut s, &id, &bridge, &*clock, &mut corr, &metrics).await;
+
+        assert_eq!(metrics.snapshot().frame_errors, 1);
+    }
+
+    #[tokio::test]
+    async fn bridge_error_increments_bridge_error_counter() {
+        use crate::bridge::BridgeError;
+        use crate::observability::SessionMetrics;
+        use crate::session::state::{OpenReceipt, SessionState};
+
+        struct ErrorBridge;
+        impl Bridge for ErrorBridge {
+            fn submit(&self, _: &crate::bridge::CanonicalCommand)
+                -> Result<crate::bridge::CanonicalResponse, BridgeError>
+            {
+                Err(BridgeError::Transport("injected".into()))
+            }
+        }
+
+        let mut s = Session::new();
+        s.cashier_id = Some("cashier1".to_string());
+        s.state = SessionState::ReceiptOpen(OpenReceipt::default());
+        let id = Arc::new(Identity::default());
+        let bridge: Arc<dyn Bridge + Send + Sync> = Arc::new(ErrorBridge);
+        let clock = Arc::new(FixedClock);
+        let metrics = Arc::new(SessionMetrics::new());
+        let mut corr = Correlation { session_uuid: "s".to_string(), receipt_seq: 0 };
+        let mut buf = crate::wire::encode_frame("COMP", false).unwrap();
+
+        process_buffered(&mut buf, &mut s, &id, &bridge, &*clock, &mut corr, &metrics).await;
+
+        assert_eq!(metrics.snapshot().bridge_errors, 1);
+        assert_eq!(metrics.snapshot().receipts_acked, 0);
+    }
+
+    #[tokio::test]
+    async fn successful_comp_increments_receipt_acked_counter() {
+        use crate::bridge::CanonicalResponse;
+        use crate::observability::SessionMetrics;
+        use crate::session::state::{OpenReceipt, SessionState};
+
+        struct OkBridge;
+        impl Bridge for OkBridge {
+            fn submit(&self, _: &crate::bridge::CanonicalCommand)
+                -> Result<CanonicalResponse, crate::bridge::BridgeError>
+            {
+                Ok(CanonicalResponse {
+                    ok: true,
+                    document_id: "DOC1".to_string(),
+                    fiscal_id: "0000000001".to_string(),
+                    fiscal_ts: "2026-01-01T00:00:00".to_string(),
+                    document_state: "ACK".to_string(),
+                    sale_total_kopecks: 1000,
+                    return_total_kopecks: 0,
+                })
+            }
+        }
+
+        let mut s = Session::new();
+        s.cashier_id = Some("cashier1".to_string());
+        s.state = SessionState::ReceiptOpen(OpenReceipt::default());
+        let id = Arc::new(Identity::default());
+        let bridge: Arc<dyn Bridge + Send + Sync> = Arc::new(OkBridge);
+        let clock = Arc::new(FixedClock);
+        let metrics = Arc::new(SessionMetrics::new());
+        let mut corr = Correlation { session_uuid: "s".to_string(), receipt_seq: 0 };
+        let mut buf = crate::wire::encode_frame("COMP", false).unwrap();
+
+        process_buffered(&mut buf, &mut s, &id, &bridge, &*clock, &mut corr, &metrics).await;
+
+        assert_eq!(metrics.snapshot().receipts_acked, 1);
+        assert_eq!(metrics.snapshot().bridge_errors, 0);
     }
 
 }
