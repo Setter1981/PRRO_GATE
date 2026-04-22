@@ -45,6 +45,7 @@ class DocumentState(StrEnum):
     PREPARED = "PREPARED"
     SIGNED = "SIGNED"
     ENCRYPTED = "ENCRYPTED"
+    SENDING = "SENDING"
     SENT = "SENT"
     KVT1 = "KVT1"
     KVT2 = "KVT2"

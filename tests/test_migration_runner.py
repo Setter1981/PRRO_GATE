@@ -59,3 +59,32 @@ def test_placeholder_014_applied(tmp_path):
         assert count == 1, "014_placeholder.sql must be in schema_migrations"
     finally:
         conn.close()
+
+
+def test_migration_024_sending_state_in_constraint(tmp_path):
+    """B-1a: migration 024 must add SENDING to fiscal_documents.state CHECK constraint."""
+    db_path = tmp_path / "test.db"
+    apply_migrations(db_path, ROOT / "sql")
+    conn = sqlite3.connect(db_path)
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations WHERE migration_name = '024_sending_state.sql'"
+        ).fetchone()[0]
+        assert count == 1
+
+        # Verify 'SENDING' is accepted in the CHECK constraint
+        conn.execute("""
+            INSERT INTO fiscal_documents (
+                document_id, request_id, fiscal_number, lnd, doc_type, state,
+                backend_profile_id, transport_profile_id, fs_mode, business_ts,
+                payload_json, payload_sha256
+            ) VALUES (
+                'test-sending', 'req-sending', 'FN-TEST', 1, 'SELL', 'SENDING',
+                'backend_checkbox_default', 'transport_checkbox_rest_default',
+                'ONLINE', '2026-01-01T10:00:00+00:00',
+                '{}', 'sha256-test'
+            )
+        """)
+        conn.rollback()
+    finally:
+        conn.close()
