@@ -42,9 +42,9 @@
     {
       "id": 7,
       "subject": "Task 7: D-2 — Maria304 total_sum guard",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** Для MARIA_304_NATIVE SELL/RETURN проверять total_sum > 0.\n\n**Files:**\n- Modify: `src/prro_gateway/services/write_path.py:_stage_acquire_and_validate`\n\n**Acceptance Criteria:**\n- [ ] total_sum=0 SELL rejected with INVALID_RECEIPT_DATA\n- [ ] total_sum=None SELL rejected\n- [ ] total_sum=1000 SELL accepted\n- [ ] RETURN with total_sum=0 rejected\n- [ ] Other operation types unaffected\n\n**Verify:** `pytest tests/test_write_path.py -v -k \"maria304_total_sum\" 2>&1 | tail -20`\n\n```json:metadata\n{\"files\": [\"src/prro_gateway/services/write_path.py\", \"tests/test_write_path.py\"], \"verifyCommand\": \"pytest tests/test_write_path.py -v -k \\\"maria304_total_sum\\\" 2>&1 | tail -20\", \"acceptanceCriteria\": [\"total_sum=0 SELL rejected with INVALID_RECEIPT_DATA\", \"total_sum=None SELL rejected\", \"total_sum=1000 SELL accepted\", \"RETURN with total_sum=0 rejected\", \"other operation types unaffected\"]}\n```"
     }
   ],
-  "lastUpdated": "2026-04-22T19:30:00Z"
+  "lastUpdated": "2026-04-22T20:30:00Z"
 }
