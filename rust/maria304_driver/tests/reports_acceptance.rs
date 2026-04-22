@@ -191,3 +191,31 @@ fn report_correlation_receipt_seq_bumps_on_every_successful_report() {
     run(&mut s, &b, &mut c, Command::Nrep);
     assert_eq!(c.receipt_seq, start + 2);
 }
+
+#[test]
+fn report_firn_key_is_content_stable_across_tcp_sessions() {
+    // F2-fix: FIRN/IREN carry a date-range body — the key must survive a TCP
+    // reconnect so a DPS-already-accepted report isn't re-submitted.
+    let fn_id = Identity::default().fiscal_number;
+    let prefix = format!("maria304:{fn_id}:");
+
+    let (mut s1, b1, mut c1) = logged_in();
+    run(&mut s1, &b1, &mut c1, Command::Firn { first: 1, last: 10 });
+    let key1 = b1.submitted().last().unwrap().idempotency_key.clone();
+
+    // New TCP session (different session_uuid / receipt_seq) — same date range.
+    let (mut s2, b2, mut c2) = logged_in();
+    run(&mut s2, &b2, &mut c2, Command::Firn { first: 1, last: 10 });
+    let key2 = b2.submitted().last().unwrap().idempotency_key.clone();
+
+    assert_eq!(key1, key2, "FIRN key must be stable across TCP sessions for same date range");
+    assert!(key1.starts_with(&prefix));
+    assert_eq!(key1[prefix.len()..].len(), 64, "hash part must be 64 hex chars");
+
+    // Different date range → different key.
+    let (mut s3, b3, mut c3) = logged_in();
+    run(&mut s3, &b3, &mut c3, Command::Firn { first: 11, last: 20 });
+    let key3 = b3.submitted().last().unwrap().idempotency_key.clone();
+
+    assert_ne!(key1, key3, "FIRN key must differ for different date ranges");
+}

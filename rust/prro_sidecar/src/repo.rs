@@ -630,14 +630,20 @@ impl Repo {
                 Ok(PendingInsertResult::Inserted)
             }
             Some((ref s, ref json, ref fn_k, ref op_k, ref sha_k)) => {
-                // F2: identity-binding check — same key must always bind to same identity.
+                // F4-fix: check accepted BEFORE identity binding.  Pre-migration rows
+                // have empty identity columns (operation_type_key='', payload_sha256_key='')
+                // and would falsely trigger HardConflict on any replay.  An accepted row
+                // already has a stored response — return it without re-validating identity.
+                if s == "accepted" {
+                    return Ok(PendingInsertResult::DuplicateAccepted(json.clone()));
+                }
+                // F2: identity-binding check for non-terminal rows.
                 if fn_k != fiscal_number || op_k != operation_type || sha_k != payload_sha256 {
                     return Ok(PendingInsertResult::HardConflict(format!(
                         "key {key:?} already bound to fn={fn_k:?} op={op_k:?} sha256={sha_k:?}"
                     )));
                 }
                 match s.as_str() {
-                    "accepted"  => Ok(PendingInsertResult::DuplicateAccepted(json.clone())),
                     "pending"   => Ok(PendingInsertResult::DuplicatePending),
                     // F1: ambiguous = timed-out in-flight; block new allocations.
                     "ambiguous" => Ok(PendingInsertResult::DuplicateAmbiguous),
@@ -669,6 +675,21 @@ impl Repo {
             "UPDATE sidecar_requests SET status = 'accepted', response_json = ?2
              WHERE idempotency_key = ?1 AND status = 'pending'",
             rusqlite::params![key, response_json],
+        )?;
+        Ok(())
+    }
+
+    /// F3-fix: Transition a pending record to 'rejected' for permanent DPS errors.
+    ///
+    /// Unlike 'ambiguous' (unknown outcome), 'rejected' means the document was
+    /// definitively refused by DPS.  The sidecar journal allows a fresh retry on a
+    /// 'rejected' row so the operator can re-submit after investigating the cause.
+    pub fn reject_request(&self, key: &str) -> Result<(), SidecarError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE sidecar_requests SET status = 'rejected'
+             WHERE idempotency_key = ?1 AND status = 'pending'",
+            rusqlite::params![key],
         )?;
         Ok(())
     }

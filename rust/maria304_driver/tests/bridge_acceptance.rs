@@ -240,6 +240,19 @@ fn comp_retry_after_bridge_failure_submits_same_canonical_envelope() {
     let env = bridge.last().unwrap();
     let opcodes: Vec<&str> = env.payload.raw_frames.iter().map(|f| f.opcode.as_str()).collect();
     assert_eq!(opcodes, vec!["FISC", "PSDt", "COMP", "COMP"]);
+
+    // F1-fix: the retry must use the SAME idempotency key as a clean first attempt.
+    // COMP frames are excluded from the fingerprint so accumulated COMPs in raw_frames
+    // don't shift the hash and accidentally bypass the sidecar's idempotency journal.
+    let (mut clean, clean_b, mut clean_c) = logged_in_session();
+    run(&mut clean, &clean_b, &mut clean_c, Command::Prep("X".to_string()));
+    run(&mut clean, &clean_b, &mut clean_c, Command::Fisc("line".to_string()));
+    run(&mut clean, &clean_b, &mut clean_c, Command::Psdt("102ACQ".to_string()));
+    run(&mut clean, &clean_b, &mut clean_c, Command::Comp(String::new()));
+    let clean_key = clean_b.last().unwrap().idempotency_key;
+
+    assert_eq!(env.idempotency_key, clean_key,
+        "retry COMP must produce the same idempotency key as a clean attempt with identical content");
 }
 
 #[test]

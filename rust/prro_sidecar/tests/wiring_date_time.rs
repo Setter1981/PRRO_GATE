@@ -215,6 +215,42 @@ mod idempotency {
         assert!(src.contains("insert_pending_request"), "must call insert_pending_request");
         assert!(src.contains("accept_request"), "must call accept_request");
     }
+
+    #[test]
+    fn pre_migration_accepted_row_returns_cached_without_hard_conflict() {
+        // F4-fix: rows migrated from a pre-F2 schema have operation_type_key=''
+        // and payload_sha256_key=''.  A replay with the real op/hash would trigger
+        // HardConflict if the identity check ran before the status check.
+        // This test simulates a pre-migration accepted row by inserting with empty
+        // identity values and then replaying with real values.
+        let repo = make_repo();
+
+        // Insert with empty identity (simulates pre-F2 row after migration).
+        repo.insert_pending_request("legacy-key", "FN001", "", "").unwrap();
+        repo.accept_request("legacy-key", r#"{"status":99}"#).unwrap();
+
+        // Replay with real op/sha — must return cached response, NOT HardConflict.
+        match repo.insert_pending_request("legacy-key", "FN001", "SELL", SHA).unwrap() {
+            PendingInsertResult::DuplicateAccepted(json) => {
+                assert_eq!(json, r#"{"status":99}"#);
+            }
+            other => panic!("expected DuplicateAccepted for pre-migration row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_request_transitions_pending_to_rejected_allowing_fresh_retry() {
+        // F3-fix: permanent DPS errors mark the row 'rejected', which allows a
+        // fresh retry (unlike 'ambiguous' which blocks until reconciliation).
+        let repo = make_repo();
+        repo.insert_pending_request("key-perm", "FN001", OP, SHA).unwrap();
+        repo.reject_request("key-perm").unwrap();
+
+        // After rejection, a fresh insert with same identity must succeed.
+        let r = repo.insert_pending_request("key-perm", "FN001", OP, SHA).unwrap();
+        assert!(matches!(r, PendingInsertResult::Inserted),
+            "rejected row must allow fresh retry, got {r:?}");
+    }
 }
 
 #[cfg(test)]

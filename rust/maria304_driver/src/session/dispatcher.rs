@@ -280,7 +280,7 @@ pub fn dispatch(
             // is mapped to the corresponding `SOFT*` wire code and
             // the receipt stays open so the caller can retry or CANC.
             append_receipt_frame(session, "COMP", body.clone());
-            let envelope = build_canonical(session, identity, correlation);
+            let envelope = build_canonical(session, identity);
             match bridge.submit(&envelope) {
                 Ok(resp) => match classify_response(&resp) {
                     DocumentOutcome::Accepted { fiscal_id, sale, ret } => {
@@ -578,8 +578,35 @@ fn map_bridge_error(err: &BridgeError) -> ErrorCode {
 /// We now hash the serialised `ReceiptPayload` so the key is stable regardless
 /// of how many times the TCP session was restarted — as long as the receipt
 /// content is identical the sidecar sees the same idempotency key.
+///
+/// F1-fix: COMP frames are excluded from the hash.  `dispatch` appends COMP to
+/// `raw_frames` before every send attempt; after a bridge failure the receipt
+/// stays open and the next retry appends a second COMP.  Without filtering,
+/// [FISC, COMP] and [FISC, COMP, COMP] hash to different values, producing a new
+/// idempotency key that bypasses the sidecar's journal — exactly the double-send
+/// risk the key was supposed to close.
 fn receipt_fingerprint(payload: &ReceiptPayload) -> String {
-    let bytes = serde_json::to_vec(payload).unwrap_or_default();
+    let mut stable = payload.clone();
+    stable.raw_frames.retain(|f| f.opcode != "COMP");
+    let bytes = serde_json::to_vec(&stable).unwrap_or_default();
+    let digest = Sha256::digest(&bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Content-stable fingerprint for report-type commands with non-empty bodies.
+///
+/// F2-fix: FIRN/IREN/FIRP/IREP carry date-range bodies; CAIOI/CAIOO carry amounts.
+/// These bodies are unique per distinct fiscal operation, so sha256(opcode + NUL + body)
+/// is safe as an idempotency key and survives TCP reconnects.
+///
+/// Zero-body reports (ZREP, NREP, nrep) are NOT handled here — consecutive reports
+/// of the same type on an empty shift would collide on a pure content hash.  Those
+/// callers fall back to the session-local key.  DPS provides last-resort protection
+/// for the reconnect case (e.g. shift-close is rejected by DPS if already closed).
+fn report_fingerprint(opcode: &str, body: &str) -> String {
+    let mut bytes = opcode.as_bytes().to_vec();
+    bytes.push(0u8);
+    bytes.extend_from_slice(body.as_bytes());
     let digest = Sha256::digest(&bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -587,7 +614,6 @@ fn receipt_fingerprint(payload: &ReceiptPayload) -> String {
 fn build_canonical(
     session: &Session,
     identity: &Identity,
-    correlation: &Correlation,
 ) -> CanonicalCommand {
     let (department, return_check_number, direction, raw_frames, dual_tax_mode, totals) =
         match session.state {
@@ -653,6 +679,18 @@ fn submit_report(
     opcode: &str,
     body: String,
 ) -> Vec<Response> {
+    // F2-fix: compute key BEFORE body is moved into the payload.
+    // Content-stable for non-empty bodies (FIRN/IREN/FIRP/IREP/CAIOI/CAIOO);
+    // session-local fallback for zero-body commands (ZREP/NREP/nrep) — see
+    // report_fingerprint doc for the rationale.
+    let idempotency_key = if body.is_empty() {
+        format!(
+            "maria304:{}:{}:{}:{}",
+            identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq, opcode,
+        )
+    } else {
+        format!("maria304:{}:{}", identity.fiscal_number, report_fingerprint(opcode, &body))
+    };
     let report_payload = ReceiptPayload {
         raw_frames: vec![RawFrame { opcode: opcode.to_string(), body }],
         ..Default::default()
@@ -661,15 +699,7 @@ fn submit_report(
         schema_version: "1.0".to_string(),
         fiscal_number: identity.fiscal_number.clone(),
         command_type,
-        // Reports keep the session-local key because sequential reports of the same type
-        // (e.g. two Z-reports in one session) have identical content and would collide
-        // under a pure content hash.  Reports are rare and the sidecar's TTL-based
-        // cache expires before the next fiscal period; the content-stable approach
-        // (F3) is applied to receipts only where unique content provides natural safety.
-        idempotency_key: format!(
-            "maria304:{}:{}:{}:{}",
-            identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq, opcode,
-        ),
+        idempotency_key,
         cashier_id: session.cashier_id.clone(),
         department: None,
         return_check_number: None,
@@ -790,7 +820,7 @@ pub fn dispatch_prepare(
                 return DispatchPrepared::Done(err(ErrorCode::SoftNoDoc));
             }
             append_receipt_frame(session, "COMP", body.clone());
-            DispatchPrepared::NeedsBridge(build_canonical(session, identity, correlation))
+            DispatchPrepared::NeedsBridge(build_canonical(session, identity))
         }
         Command::Zrep => DispatchPrepared::NeedsBridge(
             build_report_envelope(session, identity, correlation, CommandType::XReport, "ZREP", String::new()),
@@ -935,14 +965,22 @@ fn build_report_envelope(
     opcode: &str,
     body: String,
 ) -> CanonicalCommand {
+    // F2-fix: compute key BEFORE body is moved into the payload — same strategy
+    // as submit_report: content-stable for non-empty bodies, session-local fallback
+    // for zero-body reports (ZREP/NREP/nrep).
+    let idempotency_key = if body.is_empty() {
+        format!(
+            "maria304:{}:{}:{}:{}",
+            identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq, opcode,
+        )
+    } else {
+        format!("maria304:{}:{}", identity.fiscal_number, report_fingerprint(opcode, &body))
+    };
     CanonicalCommand {
         schema_version: "1.0".to_string(),
         fiscal_number: identity.fiscal_number.clone(),
         command_type,
-        idempotency_key: format!(
-            "maria304:{}:{}:{}:{}",
-            identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq, opcode,
-        ),
+        idempotency_key,
         cashier_id: session.cashier_id.clone(),
         department: None,
         return_check_number: None,

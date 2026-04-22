@@ -613,6 +613,7 @@ async fn fiscal_send_inner(
         DpsErrorCategory::Transient => "transient".to_string(),
         DpsErrorCategory::Permanent => "permanent".to_string(),
     });
+    let is_permanent_reject = dps_error_category.as_deref() == Some("permanent");
     let response = FiscalSendResponse {
         status:             resp.status,
         fiscal_id:          resp.id.clone(),
@@ -622,13 +623,17 @@ async fn fiscal_send_inner(
     };
 
     // S4/C2: promote pending → accepted only for DPS-accepted documents (status > 0).
-    // Transient / permanent DPS errors are NOT promoted: the pending row expires via
-    // the background cleanup task, allowing the client to retry after the TTL window.
+    // F3-fix: on permanent DPS reject, transition to 'rejected' immediately so the
+    // operator can re-submit after investigation (rejected allows fresh retry).
+    // Transient errors leave the row pending — it expires to 'ambiguous' via the
+    // background cleanup task, signalling an unknown outcome to the caller.
     if let Some(key) = &pending_key {
         if resp.status > 0 {
             if let Ok(json) = serde_json::to_string(&response) {
                 let _ = st.repo.accept_request(key, &json);
             }
+        } else if is_permanent_reject {
+            let _ = st.repo.reject_request(key);
         }
     }
 
