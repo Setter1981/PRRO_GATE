@@ -634,31 +634,38 @@ class WritePathWorker:
                 sign_data = sign_input.encode('utf-8')
                 _doc_id = ctx.document.document_id
                 if self.crypto_timeout_seconds is not None:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _executor:
-                        _future = _executor.submit(self.crypto_provider.sign_raw, data=sign_data, document_id=_doc_id)
-                        try:
-                            signed_payload = _future.result(timeout=self.crypto_timeout_seconds)
-                        except concurrent.futures.TimeoutError:
-                            raise CryptoProviderUnavailableError(
-                                f'crypto sign_raw() timed out after {self.crypto_timeout_seconds}s'
-                            )
+                    # C-1: abandon executor on timeout so the hung thread does not block
+                    # the caller (with-block __exit__ calls shutdown(wait=True)).
+                    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    _future = _executor.submit(self.crypto_provider.sign_raw, data=sign_data, document_id=_doc_id)
+                    _done, _ = concurrent.futures.wait([_future], timeout=self.crypto_timeout_seconds)
+                    if not _done:
+                        _executor.shutdown(wait=False)
+                        raise CryptoProviderUnavailableError(
+                            f'crypto sign_raw() timed out after {self.crypto_timeout_seconds}s'
+                        )
+                    signed_payload = _future.result()
+                    _executor.shutdown(wait=False)
                 else:
                     signed_payload = self.crypto_provider.sign_raw(data=sign_data, document_id=_doc_id)
             else:
                 # Non-DPS path: use sign() → returns str
                 if self.crypto_timeout_seconds is not None:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _executor:
-                        _future = _executor.submit(
-                            self.crypto_provider.sign,
-                            document_id=ctx.document.document_id,
-                            payload_json=sign_input,
+                    # C-1: abandon executor on timeout (same pattern as sign_raw block above).
+                    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    _future = _executor.submit(
+                        self.crypto_provider.sign,
+                        document_id=ctx.document.document_id,
+                        payload_json=sign_input,
+                    )
+                    _done, _ = concurrent.futures.wait([_future], timeout=self.crypto_timeout_seconds)
+                    if not _done:
+                        _executor.shutdown(wait=False)
+                        raise CryptoProviderUnavailableError(
+                            f'crypto sign() timed out after {self.crypto_timeout_seconds}s'
                         )
-                        try:
-                            signed_payload = _future.result(timeout=self.crypto_timeout_seconds)
-                        except concurrent.futures.TimeoutError:
-                            raise CryptoProviderUnavailableError(
-                                f'crypto sign() timed out after {self.crypto_timeout_seconds}s'
-                            )
+                    signed_payload = _future.result()
+                    _executor.shutdown(wait=False)
                 else:
                     signed_payload = self.crypto_provider.sign(document_id=ctx.document.document_id, payload_json=sign_input)
         except CryptoProviderUnavailableError as exc:

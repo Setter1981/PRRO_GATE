@@ -814,3 +814,40 @@ def test_invalid_send_state_returns_error_without_open_transaction(conn):
     final_state = conn.execute("SELECT state FROM fiscal_documents").fetchone()[0]
     assert final_state == 'ERROR_RETRYABLE', f"Expected ERROR_RETRYABLE, got {final_state}"
     assert conn.in_transaction is False, "No open transaction must remain after invalid state error"
+
+
+# ---------------------------------------------------------------------------
+# C-1: Executor abandonment — crypto timeout returns without blocking on thread
+# ---------------------------------------------------------------------------
+
+def test_crypto_timeout_abandons_executor_without_blocking(conn):
+    """crypto sign() timeout returns < 1s even when the crypto thread is hung."""
+    import time as _time
+    from prro_gateway.enums import CanonicalErrorCode
+
+    class SlowCryptoProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def sign(self, *, document_id: str, payload_json: str) -> str:
+            self.calls += 1
+            _time.sleep(10)  # simulates a hung sidecar
+            return 'signed'
+
+    _open_shift(conn)
+    _accept_sell_command(conn, request_id='req-crypto-timeout')
+    conn.commit()
+
+    worker = WritePathWorker(
+        crypto_provider=SlowCryptoProvider(),
+        transport_client=StubTransportClient(conn=conn),
+        crypto_timeout_seconds=0.05,
+    )
+    t0 = _time.perf_counter()
+    result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
+    elapsed = _time.perf_counter() - t0
+
+    assert result.outcome == 'ERROR', f"Expected ERROR, got {result.outcome}"
+    assert result.canonical_error is not None
+    assert result.canonical_error.code == CanonicalErrorCode.CRYPTO_PROVIDER_UNAVAILABLE
+    assert elapsed < 1.0, f"Expected < 1s response, got {elapsed:.2f}s (executor may be blocking on hung thread)"
