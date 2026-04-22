@@ -306,6 +306,53 @@ fn return_line_opcode_marks_receipt_as_return() {
     assert_eq!(env.return_check_number, None);
 }
 
+// ── Task 5: submit_report ok=false returns error ──────────────────────────────
+
+#[test]
+fn submit_report_bridge_ok_false_returns_error() {
+    // Regression guard: submit_report() must NOT return ok(None) when the
+    // bridge sets ok=false.  Previously the Ok(_) arm ignored resp.ok.
+    let (mut session, bridge, mut correlation) = logged_in_session();
+
+    // Inject ok=false for the ZREP submit.
+    bridge.set_next_response(canonical_response(false, "", "REJECTED"));
+
+    let responses = run(&mut session, &bridge, &mut correlation, Command::Zrep);
+
+    // Must return an error frame, not DONE+READY.
+    let has_error = responses.iter().any(|r| matches!(r, Response::Error(_)));
+    assert!(
+        has_error,
+        "expected Error when bridge ok=false, got: {responses:?}",
+    );
+
+    // Correlation sequence must NOT advance on failure.
+    assert_eq!(
+        correlation.receipt_seq, 0,
+        "sequence must not advance when submit_report fails",
+    );
+}
+
+#[test]
+fn submit_report_bridge_ok_true_returns_done_ready() {
+    // Positive case: ok=true must still produce DONE+READY (no regression).
+    let (mut session, bridge, mut correlation) = logged_in_session();
+
+    bridge.set_next_response(canonical_response(true, "0000000001", "ACK"));
+
+    let responses = run(&mut session, &bridge, &mut correlation, Command::Zrep);
+
+    let has_error = responses.iter().any(|r| matches!(r, Response::Error(_)));
+    assert!(
+        !has_error,
+        "expected no error when bridge ok=true, got: {responses:?}",
+    );
+    assert_eq!(
+        correlation.receipt_seq, 1,
+        "sequence must advance on success",
+    );
+}
+
 // ── Task 6: fail-close COMP dispatcher ───────────────────────────────────────
 
 fn canonical_response(ok: bool, fiscal_id: &str, document_state: &str) -> CanonicalResponse {

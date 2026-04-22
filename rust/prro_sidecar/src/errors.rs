@@ -2,6 +2,8 @@
 
 #[derive(Debug, thiserror::Error)]
 pub enum SidecarError {
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error("not found: {0}")]
@@ -18,6 +20,10 @@ pub enum SidecarError {
     Db(#[from] rusqlite::Error),
     #[error("fn degraded: {0}")]
     FnDegraded(String),
+    /// C2: duplicate idempotency key is still in-flight.
+    /// Returns HTTP 409 so the client knows to wait and retry.
+    #[error("duplicate in-flight: {0}")]
+    DuplicateInFlight(String),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -31,6 +37,7 @@ impl axum::response::IntoResponse for SidecarError {
         // contain key-encoding hints, SQL fragments, or file paths.
         tracing::error!(error = %self, "fiscal handler error");
         let (status, msg) = match &self {
+            Self::InvalidInput(m) => (StatusCode::BAD_REQUEST,          m.clone()),
             Self::BadRequest(m)  => (StatusCode::BAD_REQUEST,           m.clone()),
             Self::NotFound(m)    => (StatusCode::NOT_FOUND,             m.clone()),
             Self::License(m)     => (StatusCode::FORBIDDEN,             m.clone()),
@@ -38,8 +45,9 @@ impl axum::response::IntoResponse for SidecarError {
             Self::CmsSign(_)     => (StatusCode::BAD_GATEWAY,           "cms sign failed".into()),
             Self::Grpc(_)        => (StatusCode::BAD_GATEWAY,           "dps unavailable".into()),
             Self::Db(_)          => (StatusCode::INTERNAL_SERVER_ERROR, "database error".into()),
-            Self::FnDegraded(_)  => (StatusCode::SERVICE_UNAVAILABLE,   "FN_DEGRADED".into()),
-            Self::Internal(_)    => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()),
+            Self::FnDegraded(_)       => (StatusCode::SERVICE_UNAVAILABLE, "FN_DEGRADED".into()),
+            Self::DuplicateInFlight(m) => (StatusCode::CONFLICT,          m.clone()),
+            Self::Internal(_)         => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()),
         };
         (status, Json(serde_json::json!({"error": msg}))).into_response()
     }

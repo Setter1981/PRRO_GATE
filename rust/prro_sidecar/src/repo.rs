@@ -4,7 +4,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::config::CredentialsMode;
 use crate::errors::SidecarError;
@@ -175,6 +175,20 @@ pub struct AuditEntry<'a> {
     pub event_payload_json: Option<&'a str>,
 }
 
+// ── Idempotency ───────────────────────────────────────────────────────────────
+
+/// Result of attempting to reserve an idempotency key before DPS submission.
+#[derive(Debug)]
+pub enum PendingInsertResult {
+    /// Key was fresh; caller should proceed with the request.
+    Inserted,
+    /// An in-flight request with this key is already being processed.
+    /// Caller should return HTTP 409 and ask the client to retry later.
+    DuplicatePending,
+    /// A previously accepted response is cached; caller should return it.
+    DuplicateAccepted(String),
+}
+
 // ── Repo ──────────────────────────────────────────────────────────────────────
 
 pub struct Repo {
@@ -201,8 +215,27 @@ impl Repo {
                  degraded_at   TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
                  retry_count   INTEGER NOT NULL DEFAULT 0,
                  last_retry_at TEXT
+             );
+             -- S4/C2: idempotency journal — prevents double-submission on client retry storms.
+             -- status: 'pending' (in-flight), 'accepted' (DPS acked), 'rejected' (DPS rejected).
+             -- Rows with status='pending' older than ~2 min are cleaned by the background task.
+             CREATE TABLE IF NOT EXISTS sidecar_requests (
+                 idempotency_key TEXT    PRIMARY KEY,
+                 fiscal_number   TEXT    NOT NULL,
+                 status          TEXT    NOT NULL DEFAULT 'pending'
+                                 CHECK (status IN ('pending','accepted','rejected')),
+                 response_json   TEXT    NOT NULL DEFAULT '',
+                 created_at      TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
              );",
         )?;
+        // C2: online migration for existing DBs that have sidecar_requests
+        // without the `status` column (pre-C2 schema).  SQLite supports ADD COLUMN
+        // only if the column has a DEFAULT — which `status` does.
+        conn.execute_batch(
+            "ALTER TABLE sidecar_requests ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending','accepted','rejected'));",
+        )
+        .ok(); // ignore error — means the column already exists
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -507,6 +540,89 @@ impl Repo {
         })
     }
 
+    /// S4/C2: Insert a pending idempotency record BEFORE allocating local_number.
+    ///
+    /// Must be called inside the per-FN lock so a concurrent request for the same FN
+    /// sees the pending row and returns 409 instead of allocating another local_number.
+    ///
+    /// Returns:
+    /// - `Inserted`            — fresh key; proceed with the request.
+    /// - `DuplicatePending`    — key already in-flight; caller should return 409.
+    /// - `DuplicateAccepted`   — key already accepted; caller should return cached response.
+    pub fn insert_pending_request(
+        &self,
+        key: &str,
+        fiscal_number: &str,
+    ) -> Result<PendingInsertResult, SidecarError> {
+        let conn = self.lock()?;
+        let existing: Option<(String, String)> = conn
+            .query_row(
+                "SELECT status, response_json FROM sidecar_requests WHERE idempotency_key = ?1",
+                rusqlite::params![key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(SidecarError::Db)?;
+
+        match existing {
+            None => {
+                conn.execute(
+                    "INSERT INTO sidecar_requests
+                         (idempotency_key, fiscal_number, status, response_json)
+                     VALUES (?1, ?2, 'pending', '')",
+                    rusqlite::params![key, fiscal_number],
+                )?;
+                Ok(PendingInsertResult::Inserted)
+            }
+            Some((ref s, ref json)) if s == "accepted" => {
+                Ok(PendingInsertResult::DuplicateAccepted(json.clone()))
+            }
+            Some((ref s, _)) if s == "pending" => Ok(PendingInsertResult::DuplicatePending),
+            // rejected or unknown: delete + re-insert as pending (allow fresh retry)
+            Some(_) => {
+                conn.execute(
+                    "DELETE FROM sidecar_requests WHERE idempotency_key = ?1",
+                    rusqlite::params![key],
+                )?;
+                conn.execute(
+                    "INSERT INTO sidecar_requests
+                         (idempotency_key, fiscal_number, status, response_json)
+                     VALUES (?1, ?2, 'pending', '')",
+                    rusqlite::params![key, fiscal_number],
+                )?;
+                Ok(PendingInsertResult::Inserted)
+            }
+        }
+    }
+
+    /// S4/C2: Transition a pending record to 'accepted' and store the response JSON.
+    /// Called after a successful DPS submission (status > 0).
+    pub fn accept_request(&self, key: &str, response_json: &str) -> Result<(), SidecarError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE sidecar_requests SET status = 'accepted', response_json = ?2
+             WHERE idempotency_key = ?1 AND status = 'pending'",
+            rusqlite::params![key, response_json],
+        )?;
+        Ok(())
+    }
+
+    /// C2: Remove stale pending records (in-flight longer than `max_age_secs`).
+    ///
+    /// Background task calls this every ~60 s.  Pending rows older than 2 minutes
+    /// represent ambiguous DPS calls (timeout / process crash) — clearing them
+    /// allows clients to retry after the ambiguity window.
+    pub fn cleanup_stale_pending(&self, max_age_secs: u64) -> Result<usize, SidecarError> {
+        let conn = self.lock()?;
+        let deleted = conn.execute(
+            "DELETE FROM sidecar_requests
+             WHERE status = 'pending'
+               AND created_at <= datetime('now', ?1)",
+            rusqlite::params![format!("-{max_age_secs} seconds")],
+        )?;
+        Ok(deleted)
+    }
+
     pub fn audit_log_insert(&self, entry: &AuditEntry<'_>) -> Result<(), SidecarError> {
         let conn = self.lock()?;
         conn.execute(
@@ -621,6 +737,14 @@ mod tests {
                  degraded_at   TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
                  retry_count   INTEGER NOT NULL DEFAULT 0,
                  last_retry_at TEXT
+             );
+             CREATE TABLE sidecar_requests (
+                 idempotency_key TEXT    PRIMARY KEY,
+                 fiscal_number   TEXT    NOT NULL,
+                 status          TEXT    NOT NULL DEFAULT 'pending'
+                                 CHECK (status IN ('pending','accepted','rejected')),
+                 response_json   TEXT    NOT NULL DEFAULT '',
+                 created_at      TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
              );",
         )
         .unwrap();
@@ -1450,5 +1574,78 @@ mod tests {
             matches!(result, Err(SidecarError::Internal(_))),
             "poisoned mutex must produce SidecarError::Internal, got {result:?}"
         );
+    }
+
+    // ── M7: idempotency pending-state tests (C2) ──────────────────────────────
+
+    #[test]
+    fn insert_pending_fresh_key_returns_inserted() {
+        let repo = make_repo();
+        let r = repo.insert_pending_request("key1", "FN001").unwrap();
+        assert!(matches!(r, PendingInsertResult::Inserted));
+    }
+
+    #[test]
+    fn insert_pending_same_key_returns_duplicate_pending() {
+        let repo = make_repo();
+        repo.insert_pending_request("key1", "FN001").unwrap();
+        let r = repo.insert_pending_request("key1", "FN001").unwrap();
+        assert!(matches!(r, PendingInsertResult::DuplicatePending));
+    }
+
+    #[test]
+    fn accept_request_then_replay_returns_cached_json() {
+        let repo = make_repo();
+        repo.insert_pending_request("key1", "FN001").unwrap();
+        repo.accept_request("key1", r#"{"status":1}"#).unwrap();
+
+        let r = repo.insert_pending_request("key1", "FN001").unwrap();
+        match r {
+            PendingInsertResult::DuplicateAccepted(json) => {
+                assert_eq!(json, r#"{"status":1}"#);
+            }
+            other => panic!("expected DuplicateAccepted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cleanup_stale_pending_removes_old_rows() {
+        let repo = make_repo();
+        // Insert row and immediately backdate it past the cleanup window.
+        repo.insert_pending_request("stale_key", "FN001").unwrap();
+        {
+            let conn = repo.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE sidecar_requests SET created_at = datetime('now', '-300 seconds')
+                 WHERE idempotency_key = 'stale_key'",
+                [],
+            ).unwrap();
+        }
+        // Fresh key should NOT be deleted.
+        repo.insert_pending_request("fresh_key", "FN001").unwrap();
+
+        let deleted = repo.cleanup_stale_pending(120).unwrap();
+        assert_eq!(deleted, 1, "only the stale row should be removed");
+
+        // fresh_key still pending
+        let r = repo.insert_pending_request("fresh_key", "FN001").unwrap();
+        assert!(matches!(r, PendingInsertResult::DuplicatePending));
+    }
+
+    #[test]
+    fn insert_pending_after_rejected_status_reinserts_as_pending() {
+        let repo = make_repo();
+        // Manually insert a 'rejected' row to simulate a previous DPS failure.
+        {
+            let conn = repo.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sidecar_requests (idempotency_key, fiscal_number, status, response_json)
+                 VALUES ('key1', 'FN001', 'rejected', '')",
+                [],
+            ).unwrap();
+        }
+        // A new insert_pending should succeed (rejected → allow retry).
+        let r = repo.insert_pending_request("key1", "FN001").unwrap();
+        assert!(matches!(r, PendingInsertResult::Inserted));
     }
 }

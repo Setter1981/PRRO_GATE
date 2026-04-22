@@ -212,6 +212,28 @@ fn verify_inner(
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
+/// Called once at startup — panics immediately if the embedded pubkeys
+/// are malformed (wrong length or not a valid DSTU PB-257 compressed point).
+/// A 32-byte placeholder would silently make verify_detached always return false,
+/// causing every license verification to report SignatureInvalid regardless of key.
+pub fn check_embedded_pubkeys() {
+    use prro_crypto::core::curve::Curve;
+    use prro_crypto::core::point::expand_compressed_checked;
+
+    let curve = Curve::dstu_pb_257();
+    for (label, key) in [("current", PUBKEY_CURRENT), ("next", PUBKEY_NEXT)] {
+        assert_eq!(
+            key.len(), 33,
+            "license_pubkey_{label}.der must be 33 bytes (DSTU PB-257 compressed point); got {}",
+            key.len()
+        );
+        expand_compressed_checked(key, &curve)
+            .unwrap_or_else(|e| panic!(
+                "license_pubkey_{label}.der is not a valid DSTU PB-257 compressed point: {e}"
+            ));
+    }
+}
+
 /// Verify signature + expiry only. Used at startup and during install_license.
 /// Does NOT check TIN or FN membership — those are checked per-request.
 pub fn verify_signature_only(

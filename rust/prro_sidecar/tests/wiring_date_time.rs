@@ -108,3 +108,125 @@ fn xml_builder_format_ts_uses_iana_kyiv_tz_not_fixed_utc_plus_3() {
          Check.date_time and with Python's zoneinfo-based path",
     );
 }
+
+
+// ── S2: envelope integrity ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod envelope_integrity {
+    use prro_sidecar::input::CanonicalCommand;
+    use sha2::{Digest, Sha256};
+    use serde_json::json;
+
+    fn make_cmd(schema_version: &str, payload_sha256: &str) -> CanonicalCommand {
+        serde_json::from_value(json!({
+            "schema_version":  schema_version,
+            "request_id":      "req-1",
+            "idempotency_key": "idem-1",
+            "operation_type":  "SELL",
+            "fiscal_number":   "9999999999",
+            "business_ts":     "2026-04-22T10:00:00+03:00",
+            "payload_sha256":  payload_sha256,
+            "payload":         {"receipt": {}}
+        }))
+        .expect("make_cmd: JSON must parse")
+    }
+
+    #[test]
+    fn unknown_schema_version_rejected() {
+        let cmd = make_cmd("2.0", "");
+        let err = prro_sidecar::validate_envelope(&cmd).unwrap_err();
+        assert!(err.contains("schema_version"), "got: {err}");
+    }
+
+    #[test]
+    fn known_schema_version_passes() {
+        let cmd = make_cmd("1.0", "");
+        assert!(prro_sidecar::validate_envelope(&cmd).is_ok());
+    }
+
+    #[test]
+    fn correct_payload_sha256_passes() {
+        let payload = json!({"receipt": {}});
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let sha = hex::encode(Sha256::digest(&bytes));
+        let cmd = make_cmd("1.0", &sha);
+        assert!(prro_sidecar::validate_envelope(&cmd).is_ok());
+    }
+
+    #[test]
+    fn tampered_payload_sha256_rejected() {
+        let cmd = make_cmd("1.0", "deadbeef");
+        let err = prro_sidecar::validate_envelope(&cmd).unwrap_err();
+        assert!(err.contains("payload_sha256"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod idempotency {
+    use prro_sidecar::repo::{PendingInsertResult, Repo};
+
+    fn make_repo() -> Repo { Repo::open(":memory:").expect("in-memory repo") }
+
+    #[test]
+    fn fresh_key_returns_inserted() {
+        let repo = make_repo();
+        let r = repo.insert_pending_request("key-1", "FN001").unwrap();
+        assert!(matches!(r, PendingInsertResult::Inserted));
+    }
+
+    #[test]
+    fn accepted_key_returns_cached_json() {
+        let repo = make_repo();
+        repo.insert_pending_request("key-1", "FN001").unwrap();
+        repo.accept_request("key-1", r#"{"status":1}"#).unwrap();
+        match repo.insert_pending_request("key-1", "FN001").unwrap() {
+            PendingInsertResult::DuplicateAccepted(json) => {
+                assert_eq!(json, r#"{"status":1}"#);
+            }
+            other => panic!("expected DuplicateAccepted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn different_key_returns_inserted() {
+        let repo = make_repo();
+        repo.insert_pending_request("key-A", "FN001").unwrap();
+        repo.accept_request("key-A", r#"{"status":1}"#).unwrap();
+        let r = repo.insert_pending_request("key-B", "FN001").unwrap();
+        assert!(matches!(r, PendingInsertResult::Inserted));
+    }
+
+    #[test]
+    fn fiscal_send_inner_contains_idempotency_wiring() {
+        let src = include_str!("../src/bin/prro_sidecar.rs");
+        assert!(src.contains("insert_pending_request"), "must call insert_pending_request");
+        assert!(src.contains("accept_request"), "must call accept_request");
+    }
+}
+
+#[cfg(test)]
+mod dps_classifier_wire {
+    use prro_sidecar::grpc_client::{classify_dps_status, DpsErrorCategory};
+
+    #[test]
+    fn status_ok_returns_none() {
+        assert_eq!(classify_dps_status(1), None);
+    }
+    #[test]
+    fn status_minus3_is_transient() {
+        assert_eq!(classify_dps_status(-3), Some(DpsErrorCategory::Transient));
+    }
+    #[test]
+    fn status_minus1_is_permanent() {
+        assert_eq!(classify_dps_status(-1), Some(DpsErrorCategory::Permanent));
+    }
+    #[test]
+    fn status_zero_is_permanent() {
+        assert_eq!(classify_dps_status(0), Some(DpsErrorCategory::Permanent));
+    }
+    #[test]
+    fn status_minus12_is_transient() {
+        assert_eq!(classify_dps_status(-12), Some(DpsErrorCategory::Transient));
+    }
+}

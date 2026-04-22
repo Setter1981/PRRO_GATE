@@ -13,8 +13,8 @@
 //! real handlers.
 
 use crate::bridge::{
-    Bridge, BridgeError, CanonicalCommand, CommandType, RawFrame, ReceiptDirection,
-    ReceiptPayload,
+    Bridge, BridgeError, CanonicalCommand, CanonicalResponse, CommandType, RawFrame,
+    ReceiptDirection, ReceiptPayload,
 };
 use crate::bridge::dto::{classify_response, DocumentOutcome};
 use crate::protocol::{
@@ -652,7 +652,7 @@ fn submit_report(
         },
     };
     match bridge.submit(&envelope) {
-        Ok(_) => {
+        Ok(resp) if resp.ok => {
             session.mark_command_ok(opcode);
             // Every report increments the correlation sequence so
             // replays use a fresh idempotency_key.  Z-report
@@ -660,6 +660,16 @@ fn submit_report(
             // this via the response but for now just bump the seq.
             correlation.receipt_seq = correlation.receipt_seq.saturating_add(1);
             ok(None)
+        }
+        Ok(resp) => {
+            // Bridge returned ok=false — surface as a soft error.
+            // Use document_state as the code so SOFT-prefixed states
+            // (e.g. "SOFTBADART") map to the right ErrorCode; anything
+            // else falls back to SoftBlock via map_bridge_error.
+            err(map_bridge_error(&BridgeError::Rejected {
+                code: resp.document_state.clone(),
+                message: format!("submit_report ok=false: {}", resp.document_state),
+            }))
         }
         Err(bridge_err) => err(map_bridge_error(&bridge_err)),
     }
@@ -718,6 +728,220 @@ fn ok(data: Option<Response>) -> Vec<Response> {
 
 fn err(code: ErrorCode) -> Vec<Response> {
     vec![Response::Error(code)]
+}
+
+// ── Two-stage dispatch for spawn_blocking integration ─────────────────────────
+
+/// Result of [`dispatch_prepare`]: either fully computed responses, or a
+/// canonical envelope that must be submitted to the bridge.
+#[derive(Debug)]
+pub enum DispatchPrepared {
+    /// All processing complete — send these responses.
+    Done(Vec<Response>),
+    /// Bridge I/O required.  Call `bridge.submit(&envelope)` (ideally via
+    /// `tokio::task::spawn_blocking`), then pass the result to
+    /// [`dispatch_with_result`].
+    NeedsBridge(CanonicalCommand),
+}
+
+/// First stage of two-stage dispatch.
+///
+/// For COMP and fiscal-report commands, builds the canonical envelope without
+/// performing any I/O and returns [`DispatchPrepared::NeedsBridge`].  All other
+/// commands are dispatched immediately and the responses returned as
+/// [`DispatchPrepared::Done`].
+pub fn dispatch_prepare(
+    session: &mut Session,
+    command: &Command,
+    identity: &Identity,
+    clock: Clock<'_>,
+    correlation: &mut Correlation,
+) -> DispatchPrepared {
+    if !session.cashier_registered() && !is_preauth_command(command) {
+        return DispatchPrepared::Done(err(ErrorCode::SoftUpas));
+    }
+    match command {
+        Command::Comp(ref body) => {
+            if !session.receipt_open() {
+                return DispatchPrepared::Done(err(ErrorCode::SoftNoDoc));
+            }
+            append_receipt_frame(session, "COMP", body.clone());
+            DispatchPrepared::NeedsBridge(build_canonical(session, identity, correlation))
+        }
+        Command::Zrep => DispatchPrepared::NeedsBridge(
+            build_report_envelope(session, identity, correlation, CommandType::XReport, "ZREP", String::new()),
+        ),
+        Command::Nrep => {
+            if session.receipt_open() {
+                return DispatchPrepared::Done(err(ErrorCode::SoftCheck));
+            }
+            DispatchPrepared::NeedsBridge(
+                build_report_envelope(session, identity, correlation, CommandType::ZReport, "NREP", String::new()),
+            )
+        }
+        Command::NrepLowercase => DispatchPrepared::NeedsBridge(
+            build_report_envelope(session, identity, correlation, CommandType::ShiftOpen, "nrep", String::new()),
+        ),
+        Command::Firn { first, last } => {
+            if session.receipt_open() {
+                return DispatchPrepared::Done(err(ErrorCode::SoftCheck));
+            }
+            let (f, l) = (*first, *last);
+            DispatchPrepared::NeedsBridge(
+                build_report_envelope(session, identity, correlation, CommandType::PeriodicReport, "FIRN", format!("{f:04}{l:04}")),
+            )
+        }
+        Command::Iren { first, last } => {
+            if session.receipt_open() {
+                return DispatchPrepared::Done(err(ErrorCode::SoftCheck));
+            }
+            let (f, l) = (*first, *last);
+            DispatchPrepared::NeedsBridge(
+                build_report_envelope(session, identity, correlation, CommandType::PeriodicReport, "IREN", format!("{f:04}{l:04}")),
+            )
+        }
+        Command::Firp { ref from, ref to } => {
+            if session.receipt_open() {
+                return DispatchPrepared::Done(err(ErrorCode::SoftCheck));
+            }
+            let (from, to) = (from.clone(), to.clone());
+            DispatchPrepared::NeedsBridge(
+                build_report_envelope(session, identity, correlation, CommandType::PeriodicReport, "FIRP", format!("{from}{to}")),
+            )
+        }
+        Command::Irep { ref from, ref to } => {
+            if session.receipt_open() {
+                return DispatchPrepared::Done(err(ErrorCode::SoftCheck));
+            }
+            let (from, to) = (from.clone(), to.clone());
+            DispatchPrepared::NeedsBridge(
+                build_report_envelope(session, identity, correlation, CommandType::PeriodicReport, "IREP", format!("{from}{to}")),
+            )
+        }
+        Command::Caioi { sum_kopecks, description } => {
+            if session.receipt_open() {
+                return DispatchPrepared::Done(err(ErrorCode::SoftCheck));
+            }
+            let body = format!("{sum_kopecks:010}{description}");
+            DispatchPrepared::NeedsBridge(
+                build_report_envelope(session, identity, correlation, CommandType::ServiceIn, "CAIOI", body),
+            )
+        }
+        Command::Caioo { sum_kopecks, description } => {
+            if session.receipt_open() {
+                return DispatchPrepared::Done(err(ErrorCode::SoftCheck));
+            }
+            let body = format!("{sum_kopecks:010}{description}");
+            DispatchPrepared::NeedsBridge(
+                build_report_envelope(session, identity, correlation, CommandType::ServiceOut, "CAIOO", body),
+            )
+        }
+        _ => {
+            struct NeverBridge;
+            impl Bridge for NeverBridge {
+                fn submit(&self, _: &CanonicalCommand) -> Result<CanonicalResponse, BridgeError> {
+                    unreachable!("NeverBridge::submit — bridge command slipped into dispatch_prepare non-bridge arm")
+                }
+            }
+            DispatchPrepared::Done(dispatch(session, command.clone(), identity, clock, &NeverBridge, correlation))
+        }
+    }
+}
+
+/// Second stage of two-stage dispatch — produce final responses after the
+/// bridge call.
+///
+/// Must only be called when [`dispatch_prepare`] returned
+/// [`DispatchPrepared::NeedsBridge`] for the same `command`.
+pub fn dispatch_with_result(
+    session: &mut Session,
+    command: &Command,
+    bridge_result: Result<CanonicalResponse, BridgeError>,
+    correlation: &mut Correlation,
+) -> Vec<Response> {
+    match command {
+        Command::Comp(_) => match bridge_result {
+            Ok(ref resp) => match classify_response(resp) {
+                DocumentOutcome::Accepted { fiscal_id, sale, ret } => {
+                    let comp_payload = CompBuilder::new(fiscal_id, sale, ret).to_wire_payload();
+                    session.state = SessionState::Authenticated;
+                    session.psdt_sequence = 0;
+                    session.pending_return_check_number = None;
+                    correlation.receipt_seq = correlation.receipt_seq.saturating_add(1);
+                    session.mark_command_ok("COMP");
+                    ok(Some(Response::data(comp_payload).expect("COMP payload is 94 chars")))
+                }
+                DocumentOutcome::Terminal(code) => {
+                    session.state = SessionState::Authenticated;
+                    session.psdt_sequence = 0;
+                    session.pending_return_check_number = None;
+                    correlation.receipt_seq = correlation.receipt_seq.saturating_add(1);
+                    session.mark_command_ok("COMP_REJECTED");
+                    err(code)
+                }
+                DocumentOutcome::Retryable(code) => err(code),
+            },
+            Err(e) => err(map_bridge_error(&e)),
+        },
+        cmd => {
+            let opcode = report_opcode(cmd)
+                .expect("dispatch_with_result called for non-bridge command");
+            match bridge_result {
+                Ok(resp) if resp.ok => {
+                    session.mark_command_ok(opcode);
+                    correlation.receipt_seq = correlation.receipt_seq.saturating_add(1);
+                    ok(None)
+                }
+                Ok(resp) => err(map_bridge_error(&BridgeError::Rejected {
+                    code: resp.document_state.clone(),
+                    message: format!("submit_report ok=false: {}", resp.document_state),
+                })),
+                Err(e) => err(map_bridge_error(&e)),
+            }
+        }
+    }
+}
+
+/// Build a report-type canonical envelope without calling the bridge.
+fn build_report_envelope(
+    session: &Session,
+    identity: &Identity,
+    correlation: &Correlation,
+    command_type: CommandType,
+    opcode: &str,
+    body: String,
+) -> CanonicalCommand {
+    CanonicalCommand {
+        schema_version: "1.0".to_string(),
+        fiscal_number: identity.fiscal_number.clone(),
+        command_type,
+        idempotency_key: format!(
+            "maria304:{}:{}:{}:{}",
+            identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq, opcode,
+        ),
+        cashier_id: session.cashier_id.clone(),
+        department: None,
+        return_check_number: None,
+        payload: ReceiptPayload {
+            raw_frames: vec![RawFrame { opcode: opcode.to_string(), body }],
+            ..Default::default()
+        },
+    }
+}
+
+fn report_opcode(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::Zrep => Some("ZREP"),
+        Command::Nrep => Some("NREP"),
+        Command::NrepLowercase => Some("nrep"),
+        Command::Firn { .. } => Some("FIRN"),
+        Command::Iren { .. } => Some("IREN"),
+        Command::Firp { .. } => Some("FIRP"),
+        Command::Irep { .. } => Some("IREP"),
+        Command::Caioi { .. } => Some("CAIOI"),
+        Command::Caioo { .. } => Some("CAIOO"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

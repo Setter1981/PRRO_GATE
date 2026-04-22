@@ -146,4 +146,15 @@ mod tests {
         let b = m.snapshot();
         assert_eq!(a, b);
     }
+
+    #[test]
+    fn metrics_counted() {
+        let m = SessionMetrics::new();
+        m.record_inbound_frame();
+        m.record_inbound_frame();
+        m.record_outbound_frame();
+        let s = m.snapshot();
+        assert_eq!(s.inbound_frames, 2);
+        assert_eq!(s.outbound_frames, 1);
+    }
 }

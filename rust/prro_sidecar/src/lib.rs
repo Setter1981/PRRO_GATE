@@ -23,6 +23,40 @@ pub mod config;
 pub mod grpc_client;
 pub mod repo;
 
+// ── Envelope integrity ────────────────────────────────────────────────────────
+
+use sha2::{Digest, Sha256};
+use crate::input::CanonicalCommand;
+
+const ALLOWED_SCHEMA_VERSIONS: &[&str] = &["1.0"];
+
+/// Validate envelope fields checkable before any DB/crypto work.
+///
+/// Checks (invariant 7):
+///   1. `schema_version` is in the allowlist.
+///   2. If `payload_sha256` is non-empty, recompute SHA-256 of the serialized
+///      `payload` and verify it matches.
+pub fn validate_envelope(cmd: &CanonicalCommand) -> Result<(), String> {
+    if !ALLOWED_SCHEMA_VERSIONS.contains(&cmd.schema_version.as_str()) {
+        return Err(format!(
+            "schema_version '{}' not in allowlist {:?}",
+            cmd.schema_version, ALLOWED_SCHEMA_VERSIONS
+        ));
+    }
+    if !cmd.payload_sha256.is_empty() {
+        let payload_bytes = serde_json::to_vec(&cmd.payload)
+            .map_err(|e| format!("payload serialize: {e}"))?;
+        let computed = hex::encode(Sha256::digest(&payload_bytes));
+        if computed != cmd.payload_sha256 {
+            return Err(format!(
+                "payload_sha256 mismatch: expected '{}', computed '{computed}'",
+                cmd.payload_sha256
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub mod generated {
     //! tonic-generated gRPC stubs from proto/check.proto.
     #![allow(clippy::all)]
