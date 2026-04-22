@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import re
 import sqlite3
 from pathlib import Path
 
@@ -31,10 +30,25 @@ def applied(conn: sqlite3.Connection) -> dict[str, str]:
 
 
 def _split_sql_statements(sql_text: str) -> list[str]:
-    """Strip SQL comments and split into individual statements on semicolons."""
-    sql = re.sub(r'--[^\n]*', '', sql_text)
-    sql = re.sub(r'/\*.*?\*/', '', sql, flags=re.DOTALL)
-    return [s.strip() for s in sql.split(';') if s.strip()]
+    """Split SQL into individual statements using the SQLite tokenizer.
+
+    sqlite3.complete_statement() correctly handles semicolons inside string
+    literals, block comments, and multi-statement DDL (e.g. triggers).
+    Leading comment lines are stripped from each statement so that the
+    caller's PRAGMA/BEGIN/COMMIT keyword checks work on the actual SQL.
+    """
+    statements: list[str] = []
+    buf = ''
+    for char in sql_text:
+        buf += char
+        if sqlite3.complete_statement(buf):
+            # Strip leading comment-only lines to expose the first SQL keyword.
+            sql_lines = [l for l in buf.splitlines() if not l.strip().startswith('--')]
+            stmt = '\n'.join(sql_lines).strip()
+            if stmt:
+                statements.append(stmt)
+            buf = ''
+    return statements
 
 
 def apply_migrations_to_connection(conn: sqlite3.Connection, sql_dir: Path, dry_run: bool = False) -> list[str]:
@@ -59,7 +73,7 @@ def apply_migrations_to_connection(conn: sqlite3.Connection, sql_dir: Path, dry_
             body_stmts = [
                 s for s in stmts
                 if not s.upper().startswith('PRAGMA')
-                and s.upper() not in ('BEGIN', 'COMMIT', 'ROLLBACK')
+                and s.upper().rstrip('; ') not in ('BEGIN', 'COMMIT', 'ROLLBACK')
                 and not s.upper().startswith(('BEGIN ', 'COMMIT ', 'ROLLBACK '))
             ]
             for stmt in pragma_stmts:

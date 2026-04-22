@@ -88,3 +88,30 @@ def test_migration_024_sending_state_in_constraint(tmp_path):
         conn.rollback()
     finally:
         conn.close()
+
+
+def test_split_sql_handles_semicolon_in_string_literal(tmp_path):
+    """D-1: _split_sql_statements must not split on semicolons inside string literals."""
+    from prro_gateway.migrations.runner import _split_sql_statements, apply_migrations_to_connection
+
+    # Migration SQL with a semicolon inside a string value
+    sql = """
+CREATE TABLE test_semicolon_in_literal (id INTEGER PRIMARY KEY, note TEXT);
+INSERT INTO test_semicolon_in_literal (id, note) VALUES (1, 'value; with semicolon');
+"""
+    stmts = _split_sql_statements(sql)
+    assert len(stmts) == 2, f"Expected 2 statements, got {len(stmts)}: {stmts}"
+    assert 'CREATE TABLE' in stmts[0]
+    assert 'value; with semicolon' in stmts[1], "Semicolon in string literal must be preserved"
+
+    # Verify it actually executes correctly
+    conn = __import__('sqlite3').connect(':memory:')
+    try:
+        conn.execute('BEGIN')
+        for stmt in stmts:
+            conn.execute(stmt)
+        conn.commit()
+        row = conn.execute("SELECT note FROM test_semicolon_in_literal WHERE id = 1").fetchone()
+        assert row is not None and row[0] == 'value; with semicolon'
+    finally:
+        conn.close()

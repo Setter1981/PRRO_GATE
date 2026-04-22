@@ -8,6 +8,7 @@ import time
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from ..config import AppConfig
 from ..logging import get_logger
@@ -129,12 +130,14 @@ def create_app(container: RuntimeContainer) -> FastAPI:
         raw = await request.json()
         started = time.monotonic()
         try:
-            with container.connect() as conn:
-                inbox, command, process_result, is_replay = container.ingress_service.accept_checkbox(
-                    conn,
-                    raw_request=raw,
-                    response_timeout_seconds=container.config.ingress.rest.response_timeout_seconds,
-                )
+            def _accept_sync():
+                with container.connect() as conn:
+                    return container.ingress_service.accept_checkbox(
+                        conn,
+                        raw_request=raw,
+                        response_timeout_seconds=container.config.ingress.rest.response_timeout_seconds,
+                    )
+            inbox, command, process_result, is_replay = await run_in_threadpool(_accept_sync)
         except (AdapterMappingError, KeyError, ValueError) as exc:
             container.metrics.inc("ingress.checkbox.error")
             detail = {"code": getattr(exc, "code", "INVALID_REQUEST"), "message": getattr(exc, "message", str(exc))}
@@ -615,10 +618,12 @@ def create_app(container: RuntimeContainer) -> FastAPI:
             body = {}
         fiscal_number = body.get("fiscal_number") or None  # "" → None
         try:
-            with container.connect() as conn:
-                result = container.reconciliation_service.reconcile_pending(
-                    conn, fiscal_number=fiscal_number
-                )
+            def _reconcile_sync():
+                with container.connect() as conn:
+                    return container.reconciliation_service.reconcile_pending(
+                        conn, fiscal_number=fiscal_number,
+                    )
+            result = await run_in_threadpool(_reconcile_sync)
         except Exception as exc:
             logger.error("reconciliation_trigger_error", exc_info=True, extra={"extra_fields": {
                 "fiscal_number": fiscal_number, "error": str(exc),
@@ -662,8 +667,12 @@ def create_app(container: RuntimeContainer) -> FastAPI:
                 "detail": "fiscal_number is required (string)",
             })
         try:
-            with container.connect() as conn:
-                result = container.offline_sync_service.sync_pending(conn, fiscal_number=fiscal_number)
+            def _sync_pending_sync():
+                with container.connect() as conn:
+                    return container.offline_sync_service.sync_pending(
+                        conn, fiscal_number=fiscal_number,
+                    )
+            result = await run_in_threadpool(_sync_pending_sync)
         except Exception as exc:
             logger.error("offline_sync_error", exc_info=True, extra={"extra_fields": {
                 "fiscal_number": fiscal_number, "error": str(exc),
