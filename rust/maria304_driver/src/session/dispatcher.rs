@@ -69,10 +69,10 @@ pub struct Clock<'a> {
 }
 
 /// Session-level correlation bits used to build
-/// [`CanonicalCommand::idempotency_key`].  M6 will populate
-/// `session_uuid` per TCP connection; `receipt_seq` monotonically
-/// increments per closed receipt so two replays of the same COMP
-/// share the same idempotency key.
+/// [`CanonicalCommand::idempotency_key`].  `session_uuid` is assigned per
+/// TCP connection; `receipt_seq` increments per closed receipt and is used
+/// for session-local keys (ZREP/NREP).  Fiscal receipt keys (COMP) use a
+/// content-stable hash of the deduped payload, so they survive TCP reconnects.
 #[derive(Debug, Clone)]
 pub struct Correlation {
     pub session_uuid: String,

@@ -591,7 +591,9 @@ impl Repo {
     /// Must be called inside the per-FN lock so a concurrent request for the same FN
     /// sees the pending row and returns 409 instead of allocating another local_number.
     ///
-    /// `operation_type` and `payload_sha256` are bound to the key on first insert.
+    /// `operation_type` and `payload_sha256` (in practice the call site passes
+    /// `sha256(payload_sha256 || "|" || business_ts)` so the timestamp is also
+    /// bound) are stored as the content identity on first insert.
     /// Subsequent calls with the same key but different identity return `HardConflict`.
     ///
     /// Returns:
@@ -681,11 +683,14 @@ impl Repo {
     /// Called after a successful DPS submission (status > 0).
     pub fn accept_request(&self, key: &str, response_json: &str) -> Result<(), SidecarError> {
         let conn = self.lock()?;
-        conn.execute(
+        let n = conn.execute(
             "UPDATE sidecar_requests SET status = 'accepted', response_json = ?2
              WHERE idempotency_key = ?1 AND status = 'pending'",
             rusqlite::params![key, response_json],
         )?;
+        if n == 0 {
+            tracing::warn!(%key, "accept_request: row not in pending state — may have expired to ambiguous before DPS response arrived");
+        }
         Ok(())
     }
 
@@ -696,11 +701,14 @@ impl Repo {
     /// 'rejected' row so the operator can re-submit after investigating the cause.
     pub fn reject_request(&self, key: &str) -> Result<(), SidecarError> {
         let conn = self.lock()?;
-        conn.execute(
+        let n = conn.execute(
             "UPDATE sidecar_requests SET status = 'rejected'
              WHERE idempotency_key = ?1 AND status = 'pending'",
             rusqlite::params![key],
         )?;
+        if n == 0 {
+            tracing::warn!(%key, "reject_request: row not in pending state — already ambiguous or accepted");
+        }
         Ok(())
     }
 

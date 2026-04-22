@@ -129,8 +129,9 @@ async fn main() {
     }
 
     // C2: cleanup stale 'pending' idempotency rows every 60 s.
-    // Rows older than 120 s represent ambiguous DPS calls (timeout / crash) —
-    // removing them restores the ability to retry after the ambiguity window.
+    // Rows older than 120 s represent in-flight requests with unknown DPS outcome
+    // (timeout / crash).  They are transitioned to 'ambiguous' (not deleted) so
+    // subsequent retries are blocked until ops or reconciliation resolves them.
     {
         let cleanup_repo = Arc::clone(&state.repo);
         tokio::spawn(async move {
@@ -357,9 +358,20 @@ async fn fiscal_send_inner(
     // a second local_number.  On success the record is promoted to 'accepted'.
     // Stale pending rows (DPS timeout / crash) are cleaned by a background task.
     let op_type_str = format!("{:?}", cmd.operation_type);
+    // business_ts drives Check.date_time in the signed XML (fiscally significant).
+    // Bind identity to sha256(payload_sha256 || "|" || business_ts) so a replay
+    // with the same payload but a shifted timestamp is treated as a conflict.
+    let content_identity = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(cmd.payload_sha256.as_bytes());
+        h.update(b"|");
+        h.update(cmd.business_ts.as_bytes());
+        hex::encode(h.finalize())
+    };
     let pending_key: Option<String> = if !cmd.idempotency_key.is_empty() {
         match st.repo.insert_pending_request(
-            &cmd.idempotency_key, fn_id, &op_type_str, &cmd.payload_sha256,
+            &cmd.idempotency_key, fn_id, &op_type_str, &content_identity,
         )? {
             PendingInsertResult::DuplicateAccepted(json) => {
                 let cached: FiscalSendResponse = serde_json::from_str(&json)
@@ -630,10 +642,14 @@ async fn fiscal_send_inner(
     if let Some(key) = &pending_key {
         if resp.status > 0 {
             if let Ok(json) = serde_json::to_string(&response) {
-                let _ = st.repo.accept_request(key, &json);
+                if let Err(e) = st.repo.accept_request(key, &json) {
+                    tracing::warn!(%key, %e, "journal accept failed after DPS success");
+                }
             }
         } else if is_permanent_reject {
-            let _ = st.repo.reject_request(key);
+            if let Err(e) = st.repo.reject_request(key) {
+                tracing::warn!(%key, %e, "journal reject failed after permanent DPS error");
+            }
         }
     }
 

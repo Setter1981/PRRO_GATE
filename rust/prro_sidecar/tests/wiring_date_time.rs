@@ -269,6 +269,30 @@ mod idempotency {
         assert!(matches!(r, PendingInsertResult::Inserted),
             "rejected row must allow fresh retry, got {r:?}");
     }
+
+    #[test]
+    fn same_payload_different_business_ts_gives_hard_conflict() {
+        // Round-3 finding: business_ts is fiscally significant — it drives
+        // Check.date_time in the signed XML.  The call site in prro_sidecar.rs
+        // binds the identity key to sha256(payload_sha256 || "|" || business_ts).
+        // Simulate that here to verify HardConflict is triggered on ts mismatch.
+        use sha2::{Digest, Sha256};
+        let repo = make_repo();
+        let base_sha = SHA;
+        let hash_ts1 = hex::encode(Sha256::digest(
+            format!("{base_sha}|2026-01-01T10:00:00+03:00"),
+        ));
+        let hash_ts2 = hex::encode(Sha256::digest(
+            format!("{base_sha}|2026-01-02T10:00:00+03:00"),
+        ));
+        repo.insert_pending_request("key-ts", "FN001", OP, &hash_ts1).unwrap();
+        repo.accept_request("key-ts", r#"{"status":1}"#).unwrap();
+
+        match repo.insert_pending_request("key-ts", "FN001", OP, &hash_ts2).unwrap() {
+            PendingInsertResult::HardConflict(_) => {}
+            other => panic!("expected HardConflict for different business_ts, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
