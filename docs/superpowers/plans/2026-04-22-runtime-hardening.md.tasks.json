@@ -1,0 +1,50 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-22-runtime-hardening.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: B-1a — DocumentState.SENDING + migration 024",
+      "status": "pending",
+      "description": "**Goal:** Добавить `SENDING` в enum `DocumentState` и в CHECK constraint `fiscal_documents.state` через SQL migration 024.\n\n**Files:**\n- Modify: `src/prro_gateway/enums.py:44-56`\n- Create: `sql/024_sending_state.sql`\n\n**Acceptance Criteria:**\n- [ ] `DocumentState.SENDING = \"SENDING\"` существует между `ENCRYPTED` и `SENT`\n- [ ] migration 024 содержит `'SENDING'` в CHECK constraint `fiscal_documents.state`\n- [ ] migration 024 применяется без ошибок\n- [ ] все существующие миграции 001–023 применяются до 024 без ошибок\n\n**Verify:** `pytest tests/test_migration_runner.py -v 2>&1 | tail -10`\n\n```json:metadata\n{\"files\": [\"src/prro_gateway/enums.py\", \"sql/024_sending_state.sql\", \"tests/test_migration_runner.py\"], \"verifyCommand\": \"pytest tests/test_migration_runner.py -v 2>&1 | tail -10\", \"acceptanceCriteria\": [\"DocumentState.SENDING exists between ENCRYPTED and SENT\", \"migration 024 adds SENDING to CHECK constraint\", \"migration 024 applies without errors\", \"migrations 001-023 still apply\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: B-1b — SENDING state в write_path",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Записывать `SENDING` в БД перед вызовом транспорта; при crash-resume переводить `SENDING → ERROR_RETRYABLE`.\n\n**Files:**\n- Modify: `src/prro_gateway/services/write_path.py`\n\n**Acceptance Criteria:**\n- [ ] В `_stage_send_or_offline`: BEGIN IMMEDIATE → update_state(SENDING) → commit() — до transport_client.send()\n- [ ] В `process_next`: SENDING → _mark_document_and_inbox_error(ERROR_RETRYABLE) → return, transport не вызывается\n- [ ] Transport exceptions корректно переводят из SENDING\n- [ ] Тест: нормальный путь — SENDING перед transport, финальное != SENDING\n- [ ] Тест: crash-resume — документ в SENDING → ERROR_RETRYABLE, transport.calls == 0\n\n**Verify:** `pytest tests/test_write_path.py tests/test_write_path_sidecar.py tests/test_sprint12_write_path_gaps.py -x 2>&1 | tail -20`\n\n```json:metadata\n{\"files\": [\"src/prro_gateway/services/write_path.py\", \"tests/test_write_path.py\"], \"verifyCommand\": \"pytest tests/test_write_path.py tests/test_write_path_sidecar.py tests/test_sprint12_write_path_gaps.py -x 2>&1 | tail -20\", \"acceptanceCriteria\": [\"SENDING written before transport_client.send()\", \"crash-resume SENDING -> ERROR_RETRYABLE without calling transport\", \"transport exceptions still work from SENDING state\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: B-2 — State validation перед BEGIN в _stage_finalize_ack",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "**Goal:** Перенести `DocumentState(ctx.send_result.state)` до `BEGIN IMMEDIATE`.\n\n**Files:**\n- Modify: `src/prro_gateway/services/write_path.py:_stage_finalize_ack`\n\n**Acceptance Criteria:**\n- [ ] DocumentState(ctx.send_result.state) вызывается до conn.execute('BEGIN IMMEDIATE')\n- [ ] При ValueError возвращается error result без открытия транзакции\n- [ ] Тест: невалидный send_result.state → ERROR_RETRYABLE, conn.in_transaction == False\n\n**Verify:** `pytest tests/test_write_path.py -v -k \"invalid_send_state\" 2>&1 | tail -10`\n\n```json:metadata\n{\"files\": [\"src/prro_gateway/services/write_path.py\", \"tests/test_write_path.py\"], \"verifyCommand\": \"pytest tests/test_write_path.py -v -k \\\"invalid_send_state\\\" 2>&1 | tail -10\", \"acceptanceCriteria\": [\"DocumentState validation before BEGIN IMMEDIATE\", \"ValueError returns error result without transaction\", \"test passes\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: C-1 — Executor abandonment при crypto timeout",
+      "status": "pending",
+      "description": "**Goal:** Заменить `with ThreadPoolExecutor` на `wait + shutdown(wait=False)` в _stage_sign.\n\n**Files:**\n- Modify: `src/prro_gateway/services/write_path.py:_stage_sign`\n\n**Acceptance Criteria:**\n- [ ] Оба блока (sign_raw и sign) используют wait() + shutdown(wait=False)\n- [ ] При таймауте CryptoProviderUnavailableError бросается < 1s при sleep(10) provider\n- [ ] Тест passes\n\n**Verify:** `pytest tests/test_write_path.py -v -k \"timeout\" 2>&1 | tail -15`\n\n```json:metadata\n{\"files\": [\"src/prro_gateway/services/write_path.py\", \"tests/test_write_path.py\"], \"verifyCommand\": \"pytest tests/test_write_path.py -v -k \\\"timeout\\\" 2>&1 | tail -15\", \"acceptanceCriteria\": [\"both ThreadPoolExecutor blocks replaced with wait+shutdown(wait=False)\", \"timeout returns immediately without blocking on thread\", \"test passes within 1s\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: C-2 — run_in_threadpool для async endpoints",
+      "status": "pending",
+      "description": "**Goal:** Синхронные вызовы в 3 async endpoints вынести в run_in_threadpool.\n\n**Files:**\n- Modify: `src/prro_gateway/runtime/rest_app.py`\n\n**Acceptance Criteria:**\n- [ ] run_in_threadpool imported\n- [ ] 3 endpoints wrapped: ingress_checkbox, admin_reconciliation_trigger, admin_offline_sync\n- [ ] No regressions\n\n**Verify:** `pytest tests/ -x -q 2>&1 | tail -10`\n\n```json:metadata\n{\"files\": [\"src/prro_gateway/runtime/rest_app.py\"], \"verifyCommand\": \"pytest tests/ -x -q 2>&1 | tail -10\", \"acceptanceCriteria\": [\"run_in_threadpool imported from starlette.concurrency\", \"3 endpoints wrapped\", \"no regressions in test suite\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: D-1 — Migration splitter fix",
+      "status": "pending",
+      "description": "**Goal:** Заменить regex-сплиттер на sqlite3.complete_statement().\n\n**Files:**\n- Modify: `src/prro_gateway/migrations/runner.py`\n\n**Acceptance Criteria:**\n- [ ] _split_sql_statements uses sqlite3.complete_statement()\n- [ ] import re removed\n- [ ] Existing transaction logic unchanged\n- [ ] Semicolon in string literal test passes\n\n**Verify:** `pytest tests/test_migration_runner.py tests/test_gate4c_migration_transaction_safety.py tests/test_gate4d_migration_checksum_mismatch.py -v 2>&1 | tail -15`\n\n```json:metadata\n{\"files\": [\"src/prro_gateway/migrations/runner.py\", \"tests/test_migration_runner.py\"], \"verifyCommand\": \"pytest tests/test_migration_runner.py tests/test_gate4c_migration_transaction_safety.py tests/test_gate4d_migration_checksum_mismatch.py -v 2>&1 | tail -15\", \"acceptanceCriteria\": [\"_split_sql_statements uses sqlite3.complete_statement()\", \"import re removed\", \"existing transaction logic unchanged\", \"semicolon in string literal test passes\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: D-2 — Maria304 total_sum guard",
+      "status": "pending",
+      "description": "**Goal:** Для MARIA_304_NATIVE SELL/RETURN проверять total_sum > 0.\n\n**Files:**\n- Modify: `src/prro_gateway/services/write_path.py:_stage_acquire_and_validate`\n\n**Acceptance Criteria:**\n- [ ] total_sum=0 SELL rejected with INVALID_RECEIPT_DATA\n- [ ] total_sum=None SELL rejected\n- [ ] total_sum=1000 SELL accepted\n- [ ] RETURN with total_sum=0 rejected\n- [ ] Other operation types unaffected\n\n**Verify:** `pytest tests/test_write_path.py -v -k \"maria304_total_sum\" 2>&1 | tail -20`\n\n```json:metadata\n{\"files\": [\"src/prro_gateway/services/write_path.py\", \"tests/test_write_path.py\"], \"verifyCommand\": \"pytest tests/test_write_path.py -v -k \\\"maria304_total_sum\\\" 2>&1 | tail -20\", \"acceptanceCriteria\": [\"total_sum=0 SELL rejected with INVALID_RECEIPT_DATA\", \"total_sum=None SELL rejected\", \"total_sum=1000 SELL accepted\", \"RETURN with total_sum=0 rejected\", \"other operation types unaffected\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-04-22T16:00:00Z"
+}
