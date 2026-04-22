@@ -74,9 +74,19 @@ fn sell_with_items_payments_slip_lands_canonical_envelope_on_bridge() {
     assert_eq!(env.cashier_id.as_deref(), Some("csh1"));
     assert_eq!(env.department.as_deref(), Some("Bar1"));
     assert_eq!(env.return_check_number, None);
-    assert_eq!(
-        env.idempotency_key,
-        format!("maria304:{}:sess-test:0", Identity::default().fiscal_number),
+    // F3: key is now content-stable — prefix is "maria304:{FN}:" + 64-hex SHA-256.
+    let fn_id = Identity::default().fiscal_number;
+    let expected_prefix = format!("maria304:{fn_id}:");
+    assert!(
+        env.idempotency_key.starts_with(&expected_prefix),
+        "idempotency_key must start with {expected_prefix:?}, got {:?}",
+        env.idempotency_key
+    );
+    let hash_part = &env.idempotency_key[expected_prefix.len()..];
+    assert_eq!(hash_part.len(), 64, "hash part must be 64 hex chars");
+    assert!(
+        hash_part.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "hash part must be lowercase hex"
     );
 
     // Dual-tax mode — Cyrillic А=1, Б=2.
@@ -159,30 +169,45 @@ fn bridge_typed_rejection_translates_to_specific_soft_code() {
     assert_eq!(out, vec![Response::Error(ErrorCode::SoftBadArt)]);
 }
 
+// F3: idempotency_key is now content-stable.
+// Two receipts with different content produce different keys.
+// The same receipt content produces the same key (supports dedup on TCP reconnect).
 #[test]
-fn idempotency_key_changes_per_receipt_sequence() {
+fn idempotency_key_is_content_stable() {
+    let fn_id = Identity::default().fiscal_number;
+    let prefix = format!("maria304:{fn_id}:");
+
+    // Receipt A: one item "X".
     let (mut session, bridge, mut correlation) = logged_in_session();
+    run(&mut session, &bridge, &mut correlation, Command::Prep("X".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Fisc("100item".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+    let key_a1 = bridge.last().unwrap().idempotency_key.clone();
 
-    // Three receipts in a row.
-    for _ in 0..3 {
-        run(&mut session, &bridge, &mut correlation, Command::Prep("X".to_string()));
-        run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+    // Receipt B: different item "Y".
+    run(&mut session, &bridge, &mut correlation, Command::Prep("Y".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Fisc("200item".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+    let key_b = bridge.last().unwrap().idempotency_key.clone();
+
+    // Different content → different keys.
+    assert_ne!(key_a1, key_b, "different receipt content must produce different idempotency keys");
+
+    // Both keys have the right format.
+    for key in [&key_a1, &key_b] {
+        assert!(key.starts_with(&prefix), "key must start with {prefix:?}");
+        assert_eq!(&key[prefix.len()..].len(), &64, "hash part must be 64 chars");
     }
-    assert_eq!(bridge.call_count(), 3);
 
-    let keys: Vec<String> = bridge
-        .submitted()
-        .iter()
-        .map(|e| e.idempotency_key.clone())
-        .collect();
-    assert_eq!(
-        keys,
-        vec![
-            format!("maria304:{}:sess-test:0", Identity::default().fiscal_number),
-            format!("maria304:{}:sess-test:1", Identity::default().fiscal_number),
-            format!("maria304:{}:sess-test:2", Identity::default().fiscal_number),
-        ],
-    );
+    // Simulate retry: same receipt "X" (new session, same content) → same key.
+    let (mut session2, bridge2, mut corr2) = logged_in_session();
+    run(&mut session2, &bridge2, &mut corr2, Command::Prep("X".to_string()));
+    run(&mut session2, &bridge2, &mut corr2, Command::Fisc("100item".to_string()));
+    run(&mut session2, &bridge2, &mut corr2, Command::Comp(String::new()));
+    let key_a2 = bridge2.last().unwrap().idempotency_key.clone();
+
+    assert_eq!(key_a1, key_a2,
+        "same receipt content must produce the same key across sessions (content-stable)");
 }
 
 #[test]

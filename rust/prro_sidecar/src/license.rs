@@ -189,13 +189,9 @@ fn verify_inner(
         }
     }
 
-    // 3. Demo tier: return caps immediately (no expiry logic for demo)
-    if payload.tier == LicenseTier::Demo {
-        let limits = payload.demo_limits.ok_or(LicenseError::MissingDemoLimits)?;
-        return Ok(LicenseState::Demo { limits });
-    }
-
-    // 4. Expiry / grace
+    // 3. Expiry / grace — checked for ALL tiers including Demo.
+    // F4: demo licenses were previously exempt from expiry (bypass at old line 192).
+    // An expired demo license returns Expired, not Demo { limits }.
     let expires     = parse_iso8601(&payload.expires_at)?;
     let grace_start = expires - time::Duration::days(GRACE_DAYS);
 
@@ -205,6 +201,12 @@ fn verify_inner(
     if now >= grace_start {
         let days_left = (expires - now).whole_days() as i32;
         return Ok(LicenseState::Grace { days_left });
+    }
+
+    // 4. Demo tier caps (only reached when license is not expired or in grace).
+    if payload.tier == LicenseTier::Demo {
+        let limits = payload.demo_limits.ok_or(LicenseError::MissingDemoLimits)?;
+        return Ok(LicenseState::Demo { limits });
     }
 
     Ok(LicenseState::Valid)

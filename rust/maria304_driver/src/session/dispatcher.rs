@@ -12,6 +12,8 @@
 //! defensive `SOFTBLOCK` for now — M4/M5/M7 replace those arms with
 //! real handlers.
 
+use sha2::{Digest, Sha256};
+
 use crate::bridge::{
     Bridge, BridgeError, CanonicalCommand, CanonicalResponse, CommandType, RawFrame,
     ReceiptDirection, ReceiptPayload,
@@ -566,6 +568,22 @@ fn map_bridge_error(err: &BridgeError) -> ErrorCode {
     }
 }
 
+/// Content-stable fingerprint for a receipt payload.
+///
+/// F3: previously the idempotency key embedded `session_uuid` (a per-TCP-connection
+/// random UUID) which changed on every TCP reconnect.  A retry after a disconnect
+/// would generate a different key and bypass the sidecar's idempotency journal,
+/// risking double-send to DPS.
+///
+/// We now hash the serialised `ReceiptPayload` so the key is stable regardless
+/// of how many times the TCP session was restarted — as long as the receipt
+/// content is identical the sidecar sees the same idempotency key.
+fn receipt_fingerprint(payload: &ReceiptPayload) -> String {
+    let bytes = serde_json::to_vec(payload).unwrap_or_default();
+    let digest = Sha256::digest(&bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn build_canonical(
     session: &Session,
     identity: &Identity,
@@ -608,10 +626,10 @@ fn build_canonical(
         schema_version: "1.0".to_string(),
         fiscal_number: identity.fiscal_number.clone(),
         command_type,
-        idempotency_key: format!(
-            "maria304:{}:{}:{}",
-            identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq,
-        ),
+        // F3: content-stable key (hash of payload) so TCP reconnects don't generate
+        // a new key for the same receipt, preventing bypass of the sidecar's
+        // idempotency journal.
+        idempotency_key: format!("maria304:{}:{}", identity.fiscal_number, receipt_fingerprint(&payload)),
         cashier_id: session.cashier_id.clone(),
         department,
         return_check_number,
@@ -635,10 +653,19 @@ fn submit_report(
     opcode: &str,
     body: String,
 ) -> Vec<Response> {
+    let report_payload = ReceiptPayload {
+        raw_frames: vec![RawFrame { opcode: opcode.to_string(), body }],
+        ..Default::default()
+    };
     let envelope = CanonicalCommand {
         schema_version: "1.0".to_string(),
         fiscal_number: identity.fiscal_number.clone(),
         command_type,
+        // Reports keep the session-local key because sequential reports of the same type
+        // (e.g. two Z-reports in one session) have identical content and would collide
+        // under a pure content hash.  Reports are rare and the sidecar's TTL-based
+        // cache expires before the next fiscal period; the content-stable approach
+        // (F3) is applied to receipts only where unique content provides natural safety.
         idempotency_key: format!(
             "maria304:{}:{}:{}:{}",
             identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq, opcode,
@@ -646,10 +673,7 @@ fn submit_report(
         cashier_id: session.cashier_id.clone(),
         department: None,
         return_check_number: None,
-        payload: ReceiptPayload {
-            raw_frames: vec![RawFrame { opcode: opcode.to_string(), body }],
-            ..Default::default()
-        },
+        payload: report_payload,
     };
     match bridge.submit(&envelope) {
         Ok(resp) if resp.ok => {

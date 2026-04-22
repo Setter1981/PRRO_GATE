@@ -12,6 +12,7 @@ use tokio::net::TcpStream;
 use tokio::time::{timeout, Instant};
 
 use crate::bridge::{Bridge, BridgeError};
+use crate::bridge::dto::{classify_response, DocumentOutcome};
 use crate::observability::SessionMetrics;
 use crate::protocol::{Command, Response};
 // NOTE: Command::Cnac is the cancel-receipt command (no bridge call, Done path).
@@ -151,11 +152,17 @@ async fn process_buffered(
                             Err(BridgeError::Transport("spawn_blocking panicked".into()))
                         });
                     // M6: count bridge errors and receipt outcomes.
+                    // F6: receipts_acked only when DPS confirmed acceptance
+                    // (classify_response returns Accepted), not on any Ok(CanonicalResponse).
                     let is_bridge_ok = bridge_result.is_ok();
                     if !is_bridge_ok {
                         metrics.record_bridge_error();
                     } else if matches!(command, Command::Comp(_)) {
-                        metrics.record_receipt_acked();
+                        if let Ok(ref resp) = bridge_result {
+                            if matches!(classify_response(resp), DocumentOutcome::Accepted { .. }) {
+                                metrics.record_receipt_acked();
+                            }
+                        }
                     }
                     Some(dispatch_with_result(session, &command, bridge_result, correlation))
                 }

@@ -24,6 +24,14 @@ pub enum SidecarError {
     /// Returns HTTP 409 so the client knows to wait and retry.
     #[error("duplicate in-flight: {0}")]
     DuplicateInFlight(String),
+    /// F1: in-flight request timed out without a confirmed DPS outcome.
+    /// Row is now 'ambiguous' — reject further sends until reconciled manually.
+    #[error("ambiguous request: {0}")]
+    AmbiguousRequest(String),
+    /// F2: idempotency key reused with different fiscal_number / operation_type / payload.
+    /// Hard conflict — the key is bound to a different request identity.
+    #[error("idempotency conflict: {0}")]
+    IdempotencyConflict(String),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -45,9 +53,11 @@ impl axum::response::IntoResponse for SidecarError {
             Self::CmsSign(_)     => (StatusCode::BAD_GATEWAY,           "cms sign failed".into()),
             Self::Grpc(_)        => (StatusCode::BAD_GATEWAY,           "dps unavailable".into()),
             Self::Db(_)          => (StatusCode::INTERNAL_SERVER_ERROR, "database error".into()),
-            Self::FnDegraded(_)       => (StatusCode::SERVICE_UNAVAILABLE, "FN_DEGRADED".into()),
+            Self::FnDegraded(_)        => (StatusCode::SERVICE_UNAVAILABLE, "FN_DEGRADED".into()),
             Self::DuplicateInFlight(m) => (StatusCode::CONFLICT,          m.clone()),
-            Self::Internal(_)         => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()),
+            Self::AmbiguousRequest(m)  => (StatusCode::CONFLICT,          m.clone()),
+            Self::IdempotencyConflict(m) => (StatusCode::CONFLICT,        m.clone()),
+            Self::Internal(_)          => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()),
         };
         (status, Json(serde_json::json!({"error": msg}))).into_response()
     }

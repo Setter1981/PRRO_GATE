@@ -140,9 +140,19 @@ mod envelope_integrity {
     }
 
     #[test]
-    fn known_schema_version_passes() {
-        let cmd = make_cmd("1.0", "");
+    fn known_schema_version_with_correct_sha256_passes() {
+        let payload = json!({"receipt": {}});
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let sha = hex::encode(Sha256::digest(&bytes));
+        let cmd = make_cmd("1.0", &sha);
         assert!(prro_sidecar::validate_envelope(&cmd).is_ok());
+    }
+
+    #[test]
+    fn empty_payload_sha256_rejected() {
+        let cmd = make_cmd("1.0", "");
+        let err = prro_sidecar::validate_envelope(&cmd).unwrap_err();
+        assert!(err.contains("payload_sha256"), "got: {err}");
     }
 
     #[test]
@@ -167,20 +177,22 @@ mod idempotency {
     use prro_sidecar::repo::{PendingInsertResult, Repo};
 
     fn make_repo() -> Repo { Repo::open(":memory:").expect("in-memory repo") }
+    const OP: &str = "SELL";
+    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
     fn fresh_key_returns_inserted() {
         let repo = make_repo();
-        let r = repo.insert_pending_request("key-1", "FN001").unwrap();
+        let r = repo.insert_pending_request("key-1", "FN001", OP, SHA).unwrap();
         assert!(matches!(r, PendingInsertResult::Inserted));
     }
 
     #[test]
     fn accepted_key_returns_cached_json() {
         let repo = make_repo();
-        repo.insert_pending_request("key-1", "FN001").unwrap();
+        repo.insert_pending_request("key-1", "FN001", OP, SHA).unwrap();
         repo.accept_request("key-1", r#"{"status":1}"#).unwrap();
-        match repo.insert_pending_request("key-1", "FN001").unwrap() {
+        match repo.insert_pending_request("key-1", "FN001", OP, SHA).unwrap() {
             PendingInsertResult::DuplicateAccepted(json) => {
                 assert_eq!(json, r#"{"status":1}"#);
             }
@@ -191,9 +203,9 @@ mod idempotency {
     #[test]
     fn different_key_returns_inserted() {
         let repo = make_repo();
-        repo.insert_pending_request("key-A", "FN001").unwrap();
+        repo.insert_pending_request("key-A", "FN001", OP, SHA).unwrap();
         repo.accept_request("key-A", r#"{"status":1}"#).unwrap();
-        let r = repo.insert_pending_request("key-B", "FN001").unwrap();
+        let r = repo.insert_pending_request("key-B", "FN001", OP, SHA).unwrap();
         assert!(matches!(r, PendingInsertResult::Inserted));
     }
 

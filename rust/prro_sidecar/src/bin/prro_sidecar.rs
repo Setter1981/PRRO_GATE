@@ -356,8 +356,11 @@ async fn fiscal_send_inner(
     // retry with the same key sees DuplicatePending → 409 instead of allocating
     // a second local_number.  On success the record is promoted to 'accepted'.
     // Stale pending rows (DPS timeout / crash) are cleaned by a background task.
+    let op_type_str = format!("{:?}", cmd.operation_type);
     let pending_key: Option<String> = if !cmd.idempotency_key.is_empty() {
-        match st.repo.insert_pending_request(&cmd.idempotency_key, fn_id)? {
+        match st.repo.insert_pending_request(
+            &cmd.idempotency_key, fn_id, &op_type_str, &cmd.payload_sha256,
+        )? {
             PendingInsertResult::DuplicateAccepted(json) => {
                 let cached: FiscalSendResponse = serde_json::from_str(&json)
                     .map_err(|e| SidecarError::Internal(format!("idempotency cache parse: {e}")))?;
@@ -367,6 +370,18 @@ async fn fiscal_send_inner(
                 return Err(SidecarError::DuplicateInFlight(
                     cmd.idempotency_key.clone(),
                 ));
+            }
+            // F1: key timed out without confirmed DPS outcome — block new allocation.
+            PendingInsertResult::DuplicateAmbiguous => {
+                return Err(SidecarError::AmbiguousRequest(format!(
+                    "idempotency key {:?} is in ambiguous state (prior request timed out); \
+                     wait for reconciliation or contact support",
+                    cmd.idempotency_key
+                )));
+            }
+            // F2: key reused with different identity — hard conflict.
+            PendingInsertResult::HardConflict(detail) => {
+                return Err(SidecarError::IdempotencyConflict(detail));
             }
             PendingInsertResult::Inserted => Some(cmd.idempotency_key.clone()),
         }
