@@ -690,3 +690,84 @@ def test_worker_signed_crash_resume_skips_resign_and_sends(conn):
         assert result2.document_id == doc_id, "Must reuse existing document_id, not create a new one"
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# B-1b: SENDING state written before transport (normal path)
+# ---------------------------------------------------------------------------
+
+def test_sending_state_written_before_transport(conn):
+    """SENDING must be persisted atomically before transport.send() is called."""
+    from prro_gateway.enums import DocumentState
+
+    _open_shift(conn)
+    _accept_sell_command(conn, request_id='req-sending-normal')
+    conn.commit()
+
+    # Track state at the moment transport.send() is called
+    states_at_send = []
+
+    class SpyTransportClient(StubTransportClient):
+        def send(self, **kwargs):
+            doc_state = conn.execute(
+                "SELECT state FROM fiscal_documents ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            states_at_send.append(doc_state[0] if doc_state else None)
+            return super().send(**kwargs)
+
+    worker = WritePathWorker(
+        crypto_provider=StubCryptoProvider(conn=conn),
+        transport_client=SpyTransportClient(conn=conn),
+    )
+    result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
+
+    assert result.outcome == 'ACK', f"Expected ACK, got {result.outcome}"
+    assert states_at_send == ['SENDING'], f"Expected SENDING state at transport call, got {states_at_send}"
+
+    final_state = conn.execute("SELECT state FROM fiscal_documents").fetchone()[0]
+    assert final_state != 'SENDING', f"Final state must not remain SENDING, got {final_state}"
+
+
+# ---------------------------------------------------------------------------
+# B-1b: crash-resume from SENDING → ERROR_RETRYABLE, transport not called
+# ---------------------------------------------------------------------------
+
+def test_crash_resume_sending_to_error_retryable(conn):
+    """A document stuck in SENDING on startup must become ERROR_RETRYABLE without calling transport."""
+    from prro_gateway.enums import DocumentState
+
+    _open_shift(conn)
+    _accept_sell_command(conn, request_id='req-crash-resume-sending')
+    conn.commit()
+
+    # First pass: run through sign stage with retryable transport failure
+    # → leaves document in ERROR_RETRYABLE after transport exception
+    crypto = StubCryptoProvider(conn=conn)
+    transport_fail = StubTransportClient(fail_retryable=True, conn=conn)
+    worker = WritePathWorker(crypto_provider=crypto, transport_client=transport_fail)
+    result1 = worker.process_next(conn, fiscal_number='FN-DEV-0001')
+    assert result1.outcome == 'ERROR'
+    doc_id = result1.document_id
+
+    # Simulate crash: reset to SENDING state (what would happen if crashed after
+    # SENDING commit but before transport ACK was received)
+    conn.execute("UPDATE fiscal_documents SET state = 'SENDING' WHERE document_id = ?", (doc_id,))
+    # requeue_count=1 so _mark_document_and_inbox_error generates trace_id
+    # '{doc_id}-transport-error-2' (not the already-used '{doc_id}-transport-error').
+    conn.execute(
+        "UPDATE ingress_inbox SET status = 'NEW', canonical_error_code = NULL, requeue_count = 1 WHERE request_id = 'req-crash-resume-sending'"
+    )
+    conn.commit()
+
+    # Second pass: crash-resume must detect SENDING and transition to ERROR_RETRYABLE without sending
+    transport_spy = StubTransportClient(conn=conn)
+    worker2 = WritePathWorker(
+        crypto_provider=StubCryptoProvider(conn=conn),
+        transport_client=transport_spy,
+    )
+    result2 = worker2.process_next(conn, fiscal_number='FN-DEV-0001')
+
+    assert result2.outcome == 'ERROR', f"Expected ERROR, got {result2.outcome}"
+    final_state = conn.execute("SELECT state FROM fiscal_documents WHERE document_id = ?", (doc_id,)).fetchone()[0]
+    assert final_state == 'ERROR_RETRYABLE', f"Expected ERROR_RETRYABLE, got {final_state}"
+    assert transport_spy.calls == 0, f"transport.send() must NOT be called on crash-resume from SENDING, calls={transport_spy.calls}"

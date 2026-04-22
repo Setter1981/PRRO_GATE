@@ -141,6 +141,26 @@ class WritePathWorker:
             return result
 
         assert ctx.inbox is not None and ctx.command is not None and ctx.document is not None
+        if ctx.document.state == DocumentState.SENDING:
+            # Crash-resume: process crashed after SENDING commit but before transport ACK.
+            # _stage_acquire_and_validate has committed its transaction, so
+            # _mark_document_and_inbox_error can safely open BEGIN IMMEDIATE here.
+            # DPS does not deduplicate — re-sending is dangerous. Mark as ERROR_RETRYABLE
+            # so the operator can inspect and requeue manually if appropriate.
+            self.logger.warning(
+                'crash_resume_sending_to_error_retryable',
+                extra={'extra_fields': {'document_id': ctx.document.document_id, 'fiscal_number': ctx.fiscal_number}},
+            )
+            return self._mark_document_and_inbox_error(
+                conn,
+                ctx=ctx,
+                document_id=ctx.document.document_id,
+                state=DocumentState.ERROR_RETRYABLE,
+                error=build_canonical_error(
+                    CanonicalErrorCode.TRANSPORT_RETRYABLE_ERROR,
+                    message='crash-resume: SENDING → ERROR_RETRYABLE (possible duplicate send avoided)',
+                ),
+            )
         if ctx.document.state in {DocumentState.SIGNED, DocumentState.ENCRYPTED}:
             # Crash-resume: signature already persisted — skip _stage_sign entirely.
             self.logger.info("stage_sign_skipped_resume", extra={"extra_fields": {"document_id": ctx.document.document_id, "state": ctx.document.state}})
@@ -345,6 +365,13 @@ class WritePathWorker:
             # _stage_send_or_offline handles both via isinstance checks.
             if _signed_bytes is not None:
                 ctx.signed_payload = _signed_bytes  # type: ignore[assignment]
+            conn.commit()
+            return ctx, None
+        elif _existing is not None and _existing.state == DocumentState.SENDING:
+            # Crash-resume: process crashed after SENDING commit but before transport ACK.
+            # Restore document without re-signing; process_next will see SENDING and call
+            # _mark_document_and_inbox_error(ERROR_RETRYABLE) — no transport call made.
+            ctx.document = _existing
             conn.commit()
             return ctx, None
 
@@ -739,6 +766,27 @@ class WritePathWorker:
 
         transport_profile = TransportProfileRepository.get_by_id(conn, ctx.document.transport_profile_id)
         ctx.transport_profile = transport_profile
+
+        # B-1b: persist SENDING before network call.
+        # Commit must complete before transport_client.send() is called (invariant 1).
+        # On crash-resume, a document stuck in SENDING will be detected in
+        # _stage_acquire_and_validate and transitioned to ERROR_RETRYABLE without re-sending.
+        _doc_id_pre_send = ctx.document.document_id
+        conn.execute('BEGIN IMMEDIATE')
+        _updated = FiscalDocumentRepository.update_state(
+            conn,
+            document_id=_doc_id_pre_send,
+            state=DocumentState.SENDING,
+            expected_states=(DocumentState.PREPARED, DocumentState.SIGNED, DocumentState.ENCRYPTED),
+        )
+        if _updated is None:
+            # Idempotent: document already moved past expected pre-send states (concurrent path or replay).
+            conn.rollback()
+            self.logger.info('stage_send_sending_idempotent', extra={'extra_fields': {'document_id': _doc_id_pre_send}})
+            return ctx, None
+        ctx.document = _updated
+        conn.commit()
+
         try:
             send_result = self.transport_client.send(
                 document_id=ctx.document.document_id,
