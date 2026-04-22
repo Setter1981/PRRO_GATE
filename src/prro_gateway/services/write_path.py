@@ -324,6 +324,14 @@ class WritePathWorker:
             # payment (see _enrich_cashwithdrawal_payload).
             from ..validators.ua_receipt import validate_cash_withdrawal_receipt
             violations = validate_cash_withdrawal_receipt(command.payload)
+        if maria304_bypass and command.operation_type in {OperationType.SELL, OperationType.RETURN}:
+            totals = (
+                command.payload.get('receipt', {}).get('totals')
+                if isinstance(command.payload, dict) else None
+            )
+            _total_sum = totals.get('total_sum') if isinstance(totals, dict) else None
+            if not _total_sum or int(_total_sum) <= 0:
+                violations.append('total_sum must be > 0 for MARIA_304_NATIVE SELL/RETURN')
         if violations:
             err = build_canonical_error(
                 CanonicalErrorCode.INVALID_RECEIPT_DATA,
@@ -1454,8 +1462,9 @@ class WritePathWorker:
                     message=f'business_ts is {abs(delta_seconds) / 3600:.1f} hours in the past. Backdating not allowed.',
                 )
 
-        # Receipt sanity checks
-        if op in {OperationType.SELL, OperationType.RETURN}:
+        # Receipt sanity checks — skipped for MARIA_304_NATIVE (goods/payments not in
+        # canonical form; audit uses raw_frames; see comment in _stage_acquire_and_validate).
+        if op in {OperationType.SELL, OperationType.RETURN} and command.protocol != Protocol.MARIA_304_NATIVE:
             sanity_error = self._guard_receipt_sanity(command)
             if sanity_error is not None:
                 return sanity_error

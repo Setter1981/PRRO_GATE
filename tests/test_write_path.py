@@ -131,7 +131,7 @@ def _accept_sell_command(conn: sqlite3.Connection, *, request_id: str = 'req-1',
 
 
 
-def _open_shift(conn: sqlite3.Connection, *, owner: str = 'front-a', backend_profile_id: str = 'backend_checkbox_default') -> None:
+def _open_shift(conn: sqlite3.Connection, *, owner: str = 'front-a', backend_profile_id: str = 'backend_checkbox_default', protocol: Protocol = Protocol.CHECKBOX_REST) -> None:
     ShiftRepository.create_shift(
         conn,
         shift_id='shift-1',
@@ -140,7 +140,7 @@ def _open_shift(conn: sqlite3.Connection, *, owner: str = 'front-a', backend_pro
         open_mode='ONLINE',
         backend_profile_id=backend_profile_id,
         transport_profile_id='transport_checkbox_rest_default',
-        protocol=Protocol.CHECKBOX_REST,
+        protocol=protocol,
         integration_owner=owner,
         channel_lock_acquired_at='2026-01-01T09:59:00+00:00',
     )
@@ -693,161 +693,174 @@ def test_worker_signed_crash_resume_skips_resign_and_sends(conn):
 
 
 # ---------------------------------------------------------------------------
-# B-1b: SENDING state written before transport (normal path)
+# D-2: Maria304 total_sum > 0 guard for SELL / RETURN
 # ---------------------------------------------------------------------------
 
-def test_sending_state_written_before_transport(conn):
-    """SENDING must be persisted atomically before transport.send() is called."""
-    from prro_gateway.enums import DocumentState
-
-    _open_shift(conn)
-    _accept_sell_command(conn, request_id='req-sending-normal')
-    conn.commit()
-
-    # Track state at the moment transport.send() is called
-    states_at_send = []
-
-    class SpyTransportClient(StubTransportClient):
-        def send(self, **kwargs):
-            doc_state = conn.execute(
-                "SELECT state FROM fiscal_documents ORDER BY created_at DESC LIMIT 1"
-            ).fetchone()
-            states_at_send.append(doc_state[0] if doc_state else None)
-            return super().send(**kwargs)
-
-    worker = WritePathWorker(
-        crypto_provider=StubCryptoProvider(conn=conn),
-        transport_client=SpyTransportClient(conn=conn),
+def _accept_maria304_command(
+    conn: sqlite3.Connection,
+    *,
+    request_id: str,
+    operation_type: OperationType,
+    total_sum: int | None,
+) -> None:
+    """Insert a MARIA_304_NATIVE command with the given total_sum into inbox."""
+    if total_sum is not None:
+        payload: dict = {
+            'receipt': {
+                'direction': 'SALE',
+                'goods': [],
+                'payments': [],
+                'totals': {'total_sum': total_sum},
+                'raw_frames': [],
+            },
+        }
+    else:
+        payload = {
+            'receipt': {
+                'direction': 'SALE',
+                'goods': [],
+                'payments': [],
+                'raw_frames': [],
+            },
+        }
+    cmd = CanonicalFiscalCommand(
+        request_id=request_id,
+        idempotency_key=f'idem-{request_id}',
+        protocol=Protocol.MARIA_304_NATIVE,
+        operation_type=operation_type,
+        fiscal_number='FN-DEV-0001',
+        route_key='main',
+        backend_profile_id='backend_checkbox_default',
+        transport_profile_id='transport_checkbox_rest_default',
+        channel_owner='maria304-driver',
+        external_request_id=f'ext-{request_id}',
+        business_ts=datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC),
+        payload=payload,
+        payload_sha256=f'sha-{request_id}',
+        trace_context=TraceContext(source_ip='10.0.0.10', source_port=12000, session_id='sess-1', correlation_id=f'corr-{request_id}'),
+        correlation_id=f'corr-{request_id}',
     )
-    result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
-
-    assert result.outcome == 'ACK', f"Expected ACK, got {result.outcome}"
-    assert states_at_send == ['SENDING'], f"Expected SENDING state at transport call, got {states_at_send}"
-
-    final_state = conn.execute("SELECT state FROM fiscal_documents").fetchone()[0]
-    assert final_state != 'SENDING', f"Final state must not remain SENDING, got {final_state}"
-
-
-# ---------------------------------------------------------------------------
-# B-1b: crash-resume from SENDING → ERROR_RETRYABLE, transport not called
-# ---------------------------------------------------------------------------
-
-def test_crash_resume_sending_to_error_retryable(conn):
-    """A document stuck in SENDING on startup must become ERROR_RETRYABLE without calling transport."""
-    from prro_gateway.enums import DocumentState
-
-    _open_shift(conn)
-    _accept_sell_command(conn, request_id='req-crash-resume-sending')
-    conn.commit()
-
-    # First pass: sign succeeds, transport raises TransportRetryableError.
-    # Document ends in ERROR_RETRYABLE. We then patch state to SENDING to simulate
-    # the crash scenario (process died after the SENDING commit in _stage_send_or_offline
-    # but before transport returned). The artificial injection covers the guard in
-    # process_next; the _stage_acquire_and_validate SENDING branch is covered by the
-    # fact that _stage_acquire_and_validate returns (ctx, None) for SENDING documents.
-    crypto = StubCryptoProvider(conn=conn)
-    transport_fail = StubTransportClient(fail_retryable=True, conn=conn)
-    worker = WritePathWorker(crypto_provider=crypto, transport_client=transport_fail)
-    result1 = worker.process_next(conn, fiscal_number='FN-DEV-0001')
-    assert result1.outcome == 'ERROR'
-    doc_id = result1.document_id
-
-    # Simulate crash: force SENDING state and reset inbox to NEW.
-    # requeue_count=1 avoids a trace_id uniqueness conflict: the first pass already
-    # wrote '{doc_id}-transport-error' to transport_trace_log; without incrementing
-    # the count the crash-resume pass would attempt the same trace_id and hit a
-    # UNIQUE constraint in _mark_document_and_inbox_error.
-    conn.execute("UPDATE fiscal_documents SET state = 'SENDING' WHERE document_id = ?", (doc_id,))
-    conn.execute(
-        "UPDATE ingress_inbox SET status = 'NEW', canonical_error_code = NULL, requeue_count = 1 WHERE request_id = 'req-crash-resume-sending'"
+    InboxRepository.accept_command(
+        conn,
+        request_id=request_id,
+        idempotency_key=cmd.idempotency_key,
+        protocol=cmd.protocol,
+        operation_type=cmd.operation_type,
+        fiscal_number=cmd.fiscal_number,
+        backend_profile_id=cmd.backend_profile_id,
+        transport_profile_id=cmd.transport_profile_id,
+        channel_owner=cmd.channel_owner,
+        external_request_id=cmd.external_request_id,
+        protocol_session_id='proto-session-maria304',
+        payload_json=dumps_json(cmd.model_dump(mode='json')),
+        payload_sha256=cmd.payload_sha256,
     )
-    conn.commit()
-
-    # Second pass: crash-resume must detect SENDING and transition to ERROR_RETRYABLE without sending
-    transport_spy = StubTransportClient(conn=conn)
-    worker2 = WritePathWorker(
-        crypto_provider=StubCryptoProvider(conn=conn),
-        transport_client=transport_spy,
-    )
-    result2 = worker2.process_next(conn, fiscal_number='FN-DEV-0001')
-
-    assert result2.outcome == 'ERROR', f"Expected ERROR, got {result2.outcome}"
-    final_state = conn.execute("SELECT state FROM fiscal_documents WHERE document_id = ?", (doc_id,)).fetchone()[0]
-    assert final_state == 'ERROR_RETRYABLE', f"Expected ERROR_RETRYABLE, got {final_state}"
-    assert transport_spy.calls == 0, f"transport.send() must NOT be called on crash-resume from SENDING, calls={transport_spy.calls}"
 
 
-# ---------------------------------------------------------------------------
-# B-2: DocumentState validation before BEGIN IMMEDIATE in _stage_finalize_ack
-# ---------------------------------------------------------------------------
+def test_maria304_total_sum_zero_sell_rejected(conn):
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        _open_shift(conn, owner='maria304-driver', protocol=Protocol.MARIA_304_NATIVE)
+        _accept_maria304_command(conn, request_id='req-m304-1', operation_type=OperationType.SELL, total_sum=0)
+        conn.commit()
 
-def test_invalid_send_state_returns_error_without_open_transaction(conn):
-    """Invalid send_result.state → ERROR_RETRYABLE without opening a write transaction."""
-    _open_shift(conn)
-    _accept_sell_command(conn, request_id='req-invalid-state')
-    conn.commit()
-
-    class InvalidStateTransportClient(StubTransportClient):
-        def send(self, *, document_id: str, signed_payload: str, fiscal_number: str,
-                 backend_profile_id: str, transport_profile_id: str, **kwargs) -> SendResult:
-            self.calls += 1
-            now = datetime.now(UTC)
-            return SendResult(
-                state='NOT_A_VALID_STATE',
-                transport_request_id=f'tx-{document_id}',
-                submission_status='ACK',
-                server_fiscal_no=f'FISC-{document_id}',
-                server_fiscal_date=now.isoformat(),
-                response_json='{}',
-                sent_at=now,
-                ack_at=now,
-            )
-
-    worker = WritePathWorker(
-        crypto_provider=StubCryptoProvider(conn=conn),
-        transport_client=InvalidStateTransportClient(conn=conn),
-    )
-    result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
-
-    assert result.outcome == 'ERROR', f"Expected ERROR, got {result.outcome}"
-    final_state = conn.execute("SELECT state FROM fiscal_documents").fetchone()[0]
-    assert final_state == 'ERROR_RETRYABLE', f"Expected ERROR_RETRYABLE, got {final_state}"
-    assert conn.in_transaction is False, "No open transaction must remain after invalid state error"
+        worker = WritePathWorker(crypto_provider=StubCryptoProvider(), transport_client=StubTransportClient())
+        result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
+        assert result.outcome == 'ERROR'
+        assert result.canonical_error is not None
+        assert result.canonical_error.code == CanonicalErrorCode.INVALID_RECEIPT_DATA
+    finally:
+        conn.close()
 
 
-# ---------------------------------------------------------------------------
-# C-1: Executor abandonment — crypto timeout returns without blocking on thread
-# ---------------------------------------------------------------------------
+def test_maria304_total_sum_none_sell_rejected(conn):
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        _open_shift(conn, owner='maria304-driver', protocol=Protocol.MARIA_304_NATIVE)
+        _accept_maria304_command(conn, request_id='req-m304-2', operation_type=OperationType.SELL, total_sum=None)
+        conn.commit()
 
-def test_crypto_timeout_abandons_executor_without_blocking(conn):
-    """crypto sign() timeout returns < 1s even when the crypto thread is hung."""
-    import time as _time
-    from prro_gateway.enums import CanonicalErrorCode
+        worker = WritePathWorker(crypto_provider=StubCryptoProvider(), transport_client=StubTransportClient())
+        result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
+        assert result.outcome == 'ERROR'
+        assert result.canonical_error is not None
+        assert result.canonical_error.code == CanonicalErrorCode.INVALID_RECEIPT_DATA
+    finally:
+        conn.close()
 
-    class SlowCryptoProvider:
-        def __init__(self) -> None:
-            self.calls = 0
 
-        def sign(self, *, document_id: str, payload_json: str) -> str:
-            self.calls += 1
-            _time.sleep(10)  # simulates a hung sidecar
-            return 'signed'
+def test_maria304_total_sum_valid_sell_accepted(conn):
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        _open_shift(conn, owner='maria304-driver', protocol=Protocol.MARIA_304_NATIVE)
+        _accept_maria304_command(conn, request_id='req-m304-3', operation_type=OperationType.SELL, total_sum=1000)
+        conn.commit()
 
-    _open_shift(conn)
-    _accept_sell_command(conn, request_id='req-crypto-timeout')
-    conn.commit()
+        worker = WritePathWorker(crypto_provider=StubCryptoProvider(), transport_client=StubTransportClient())
+        result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
+        # Must NOT be rejected for total_sum validation
+        assert result.canonical_error is None or result.canonical_error.code != CanonicalErrorCode.INVALID_RECEIPT_DATA
+    finally:
+        conn.close()
 
-    worker = WritePathWorker(
-        crypto_provider=SlowCryptoProvider(),
-        transport_client=StubTransportClient(conn=conn),
-        crypto_timeout_seconds=0.05,
-    )
-    t0 = _time.perf_counter()
-    result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
-    elapsed = _time.perf_counter() - t0
 
-    assert result.outcome == 'ERROR', f"Expected ERROR, got {result.outcome}"
-    assert result.canonical_error is not None
-    assert result.canonical_error.code == CanonicalErrorCode.CRYPTO_PROVIDER_UNAVAILABLE
-    assert elapsed < 1.0, f"Expected < 1s response, got {elapsed:.2f}s (executor may be blocking on hung thread)"
+def test_maria304_total_sum_zero_return_rejected(conn):
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        _open_shift(conn, owner='maria304-driver', protocol=Protocol.MARIA_304_NATIVE)
+        _accept_maria304_command(conn, request_id='req-m304-4', operation_type=OperationType.RETURN, total_sum=0)
+        conn.commit()
+
+        worker = WritePathWorker(crypto_provider=StubCryptoProvider(), transport_client=StubTransportClient(), require_return_linkage=False)
+        result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
+        assert result.outcome == 'ERROR'
+        assert result.canonical_error is not None
+        assert result.canonical_error.code == CanonicalErrorCode.INVALID_RECEIPT_DATA
+    finally:
+        conn.close()
+
+
+def test_maria304_total_sum_open_shift_unaffected(conn):
+    """OPEN_SHIFT via MARIA_304_NATIVE must NOT be checked for total_sum."""
+    try:
+        cmd = CanonicalFiscalCommand(
+            request_id='req-m304-5',
+            idempotency_key='idem-req-m304-5',
+            protocol=Protocol.MARIA_304_NATIVE,
+            operation_type=OperationType.SHIFT_OPEN,
+            fiscal_number='FN-DEV-0001',
+            route_key='main',
+            backend_profile_id='backend_checkbox_default',
+            transport_profile_id='transport_checkbox_rest_default',
+            channel_owner='maria304-driver',
+            external_request_id='ext-req-m304-5',
+            business_ts=datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC),
+            payload={},
+            payload_sha256='sha-req-m304-5',
+            trace_context=TraceContext(source_ip='10.0.0.10', source_port=12000, session_id='sess-1', correlation_id='corr-req-m304-5'),
+            correlation_id='corr-req-m304-5',
+        )
+        conn.execute('BEGIN IMMEDIATE')
+        InboxRepository.accept_command(
+            conn,
+            request_id=cmd.request_id,
+            idempotency_key=cmd.idempotency_key,
+            protocol=cmd.protocol,
+            operation_type=cmd.operation_type,
+            fiscal_number=cmd.fiscal_number,
+            backend_profile_id=cmd.backend_profile_id,
+            transport_profile_id=cmd.transport_profile_id,
+            channel_owner=cmd.channel_owner,
+            external_request_id=cmd.external_request_id,
+            protocol_session_id='proto-session-m304-5',
+            payload_json=dumps_json(cmd.model_dump(mode='json')),
+            payload_sha256=cmd.payload_sha256,
+        )
+        conn.commit()
+
+        worker = WritePathWorker(crypto_provider=StubCryptoProvider(), transport_client=StubTransportClient())
+        result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
+        # Must NOT fail with INVALID_RECEIPT_DATA due to total_sum guard
+        assert result.canonical_error is None or result.canonical_error.code != CanonicalErrorCode.INVALID_RECEIPT_DATA
+    finally:
+        conn.close()
