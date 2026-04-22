@@ -239,6 +239,24 @@ mod idempotency {
     }
 
     #[test]
+    fn bound_accepted_row_with_different_identity_gives_hard_conflict() {
+        // F2/F4: accepted rows that are fully bound (non-empty identity columns)
+        // must still reject key reuse with a different payload — otherwise an
+        // attacker could retrieve a cached response by reusing a known accepted key
+        // with different content.
+        let repo = make_repo();
+        repo.insert_pending_request("bound-key", "FN001", OP, SHA).unwrap();
+        repo.accept_request("bound-key", r#"{"status":1}"#).unwrap();
+
+        // Different sha — must give HardConflict, not DuplicateAccepted.
+        let other_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        match repo.insert_pending_request("bound-key", "FN001", OP, other_sha).unwrap() {
+            PendingInsertResult::HardConflict(_) => {}
+            other => panic!("expected HardConflict for bound accepted with wrong sha, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn reject_request_transitions_pending_to_rejected_allowing_fresh_retry() {
         // F3-fix: permanent DPS errors mark the row 'rejected', which allows a
         // fresh retry (unlike 'ambiguous' which blocks until reconciliation).

@@ -630,14 +630,24 @@ impl Repo {
                 Ok(PendingInsertResult::Inserted)
             }
             Some((ref s, ref json, ref fn_k, ref op_k, ref sha_k)) => {
-                // F4-fix: check accepted BEFORE identity binding.  Pre-migration rows
-                // have empty identity columns (operation_type_key='', payload_sha256_key='')
-                // and would falsely trigger HardConflict on any replay.  An accepted row
-                // already has a stored response — return it without re-validating identity.
                 if s == "accepted" {
+                    // F4-fix: pre-migration rows have empty identity columns (op='', sha='').
+                    // Bypass identity check only for those legacy rows (same FN, empty binding).
+                    // For fully-bound accepted rows the identity check still applies so we
+                    // don't return a different document's cached response on key reuse.
+                    let is_legacy = op_k.is_empty() && sha_k.is_empty() && fn_k == fiscal_number;
+                    if is_legacy {
+                        return Ok(PendingInsertResult::DuplicateAccepted(json.clone()));
+                    }
+                    // Bound accepted row — verify identity.
+                    if fn_k != fiscal_number || op_k != operation_type || sha_k != payload_sha256 {
+                        return Ok(PendingInsertResult::HardConflict(format!(
+                            "key {key:?} already bound to fn={fn_k:?} op={op_k:?} sha256={sha_k:?}"
+                        )));
+                    }
                     return Ok(PendingInsertResult::DuplicateAccepted(json.clone()));
                 }
-                // F2: identity-binding check for non-terminal rows.
+                // F2: identity-binding check for non-accepted rows.
                 if fn_k != fiscal_number || op_k != operation_type || sha_k != payload_sha256 {
                     return Ok(PendingInsertResult::HardConflict(format!(
                         "key {key:?} already bound to fn={fn_k:?} op={op_k:?} sha256={sha_k:?}"

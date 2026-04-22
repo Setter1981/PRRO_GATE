@@ -1,3 +1,4 @@
+#![allow(clippy::duration_suboptimal_units)]
 //! Sprint M6 acceptance — real TCP end-to-end.
 //!
 //! Binds an actual TCP port, spawns the listener, connects a client,

@@ -1,3 +1,4 @@
+#![allow(clippy::ignored_unit_patterns, clippy::duration_suboptimal_units)]
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]

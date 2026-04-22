@@ -1,3 +1,4 @@
+#![allow(clippy::doc_markdown, clippy::duration_suboptimal_units)]
 use std::sync::Arc;
 
 use maria304_driver::bridge::{Bridge, BridgeError, CanonicalCommand, CanonicalResponse};

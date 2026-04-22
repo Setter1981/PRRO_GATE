@@ -26,6 +26,7 @@ use crate::wire::{decode_frame, FrameError};
 
 /// Default idle timeout — if the client is silent for this long we
 /// close the socket.  Tunable per plan §config.
+#[allow(clippy::duration_suboptimal_units)]
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Provider for the current clock values (date/time).  Real sessions
@@ -51,6 +52,7 @@ impl ClockSource for FixedClock {
 /// # Errors
 /// I/O errors are propagated.  Protocol-level errors (bad CRC,
 /// malformed frame) are handled in-stream — the loop keeps going.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_connection(
     mut stream: TcpStream,
     identity: Arc<Identity>,
@@ -105,7 +107,7 @@ pub async fn run_connection(
                     }
                 }
             }
-            _ = shutdown.cancelled() => {
+            () = shutdown.cancelled() => {
                 tracing::debug!("connection terminated by shutdown signal");
                 return Ok(());
             }

@@ -235,11 +235,11 @@ fn comp_retry_after_bridge_failure_submits_same_canonical_envelope() {
     assert_eq!(bridge.call_count(), 1, "recovered submit is logged");
     assert!(!session.receipt_open());
 
-    // Frame order in the canonical envelope: what we sent + BOTH COMPs
-    // (because the first COMP also appended to raw_frames before failure).
+    // F1-fix: build_canonical deduplicates COMP frames — only one COMP in envelope
+    // even though raw_frames in session state has two (from the failed first attempt).
     let env = bridge.last().unwrap();
     let opcodes: Vec<&str> = env.payload.raw_frames.iter().map(|f| f.opcode.as_str()).collect();
-    assert_eq!(opcodes, vec!["FISC", "PSDt", "COMP", "COMP"]);
+    assert_eq!(opcodes, vec!["FISC", "PSDt", "COMP"]);
 
     // F1-fix: the retry must use the SAME idempotency key as a clean first attempt.
     // COMP frames are excluded from the fingerprint so accumulated COMPs in raw_frames

@@ -570,27 +570,13 @@ fn map_bridge_error(err: &BridgeError) -> ErrorCode {
 
 /// Content-stable fingerprint for a receipt payload.
 ///
-/// F3: previously the idempotency key embedded `session_uuid` (a per-TCP-connection
-/// random UUID) which changed on every TCP reconnect.  A retry after a disconnect
-/// would generate a different key and bypass the sidecar's idempotency journal,
-/// risking double-send to DPS.
-///
-/// We now hash the serialised `ReceiptPayload` so the key is stable regardless
-/// of how many times the TCP session was restarted — as long as the receipt
-/// content is identical the sidecar sees the same idempotency key.
-///
-/// F1-fix: COMP frames are excluded from the hash.  `dispatch` appends COMP to
-/// `raw_frames` before every send attempt; after a bridge failure the receipt
-/// stays open and the next retry appends a second COMP.  Without filtering,
-/// [FISC, COMP] and [FISC, COMP, COMP] hash to different values, producing a new
-/// idempotency key that bypasses the sidecar's journal — exactly the double-send
-/// risk the key was supposed to close.
+/// `build_canonical` passes a payload whose COMP frames have already been
+/// deduplicated to exactly one, so this function hashes the full payload as-is.
+/// Including the COMP body is intentional — the COMP frame may carry payment totals
+/// that distinguish two receipts with the same goods lines but different payment.
 fn receipt_fingerprint(payload: &ReceiptPayload) -> String {
-    let mut stable = payload.clone();
-    stable.raw_frames.retain(|f| f.opcode != "COMP");
-    let bytes = serde_json::to_vec(&stable).unwrap_or_default();
-    let digest = Sha256::digest(&bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    let bytes = serde_json::to_vec(payload).unwrap_or_default();
+    hex::encode(Sha256::digest(&bytes))
 }
 
 /// Content-stable fingerprint for report-type commands with non-empty bodies.
@@ -607,15 +593,14 @@ fn report_fingerprint(opcode: &str, body: &str) -> String {
     let mut bytes = opcode.as_bytes().to_vec();
     bytes.push(0u8);
     bytes.extend_from_slice(body.as_bytes());
-    let digest = Sha256::digest(&bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    hex::encode(Sha256::digest(&bytes))
 }
 
 fn build_canonical(
     session: &Session,
     identity: &Identity,
 ) -> CanonicalCommand {
-    let (department, return_check_number, direction, raw_frames, dual_tax_mode, totals) =
+    let (department, return_check_number, direction, raw_frames_orig, dual_tax_mode, totals) =
         match session.state {
             SessionState::ReceiptOpen(ref r) => (
                 Some(r.department.clone()),
@@ -631,7 +616,25 @@ fn build_canonical(
     // withdrawal (per Maria 304 protocol §54 — always its own receipt).
     // Override Sell/Return with CashWithdrawal so the Python adapter
     // selects the correct canonical operation path.
-    let has_cshg = raw_frames.iter().any(|f| f.opcode == "CSHG");
+    let has_cshg = raw_frames_orig.iter().any(|f| f.opcode == "CSHG");
+    // F1-fix: deduplicate COMP frames — keep only the first.
+    // dispatch() appends COMP to raw_frames before every send; after a bridge
+    // failure the receipt stays open and the next retry appends a second COMP.
+    // Sending [FISC, COMP, COMP] would bind the idempotency key to a different
+    // payload_sha256 than the first attempt, triggering HardConflict in the sidecar.
+    let mut seen_comp = false;
+    let raw_frames: Vec<_> = raw_frames_orig
+        .into_iter()
+        .filter(|f| {
+            if f.opcode == "COMP" {
+                if seen_comp {
+                    return false;
+                }
+                seen_comp = true;
+            }
+            true
+        })
+        .collect();
     let payload = ReceiptPayload {
         direction,
         goods: Vec::new(),
@@ -789,6 +792,7 @@ fn err(code: ErrorCode) -> Vec<Response> {
 /// Result of [`dispatch_prepare`]: either fully computed responses, or a
 /// canonical envelope that must be submitted to the bridge.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum DispatchPrepared {
     /// All processing complete — send these responses.
     Done(Vec<Response>),
@@ -907,6 +911,10 @@ pub fn dispatch_prepare(
 ///
 /// Must only be called when [`dispatch_prepare`] returned
 /// [`DispatchPrepared::NeedsBridge`] for the same `command`.
+///
+/// # Panics
+/// Panics if the `COMP` wire payload is not exactly 94 bytes (data-contract
+/// invariant checked at call-site via `.expect`).
 pub fn dispatch_with_result(
     session: &mut Session,
     command: &Command,
@@ -957,6 +965,10 @@ pub fn dispatch_with_result(
 }
 
 /// Build a report-type canonical envelope without calling the bridge.
+///
+/// # Panics
+/// Panics if the internal mutex of a test `MockBridge` is poisoned (only
+/// relevant in single-threaded test contexts; unreachable in production).
 fn build_report_envelope(
     session: &Session,
     identity: &Identity,
