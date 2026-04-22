@@ -242,8 +242,8 @@ fn comp_retry_after_bridge_failure_submits_same_canonical_envelope() {
     assert_eq!(opcodes, vec!["FISC", "PSDt", "COMP"]);
 
     // F1-fix: the retry must use the SAME idempotency key as a clean first attempt.
-    // COMP frames are excluded from the fingerprint so accumulated COMPs in raw_frames
-    // don't shift the hash and accidentally bypass the sidecar's idempotency journal.
+    // build_canonical deduplicates COMP to one frame, so the full-payload hash is
+    // identical whether this is the first attempt or a retry with an extra accumulated COMP.
     let (mut clean, clean_b, mut clean_c) = logged_in_session();
     run(&mut clean, &clean_b, &mut clean_c, Command::Prep("X".to_string()));
     run(&mut clean, &clean_b, &mut clean_c, Command::Fisc("line".to_string()));
