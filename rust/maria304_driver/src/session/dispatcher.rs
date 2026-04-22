@@ -757,6 +757,9 @@ pub fn dispatch_prepare(
     clock: Clock<'_>,
     correlation: &mut Correlation,
 ) -> DispatchPrepared {
+    if !session.cashier_registered() && !is_preauth_command(command) {
+        return DispatchPrepared::Done(err(ErrorCode::SoftUpas));
+    }
     match command {
         Command::Comp(ref body) => {
             if !session.receipt_open() {

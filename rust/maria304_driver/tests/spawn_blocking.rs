@@ -170,3 +170,53 @@ async fn spawn_blocking_bridge_submit_runs_outside_async_executor() {
 
     assert!(SUBMIT_CALLED.load(Ordering::SeqCst), "bridge.submit must have been called");
 }
+
+#[test]
+fn dispatch_prepare_unauthenticated_zrep_returns_softupas_not_bridge() {
+    // Regression for C1: unauthenticated session must NOT reach bridge for any fiscal command.
+    let mut s = Session::new(); // no cashier registered
+    let id = identity();
+    let mut corr = corr();
+    let (date, time) = clock();
+    let clk = Clock { date: &date, time: &time };
+
+    for cmd in [
+        Command::Zrep,
+        Command::Nrep,
+        Command::NrepLowercase,
+    ] {
+        let result = dispatch_prepare(&mut s, &cmd, &id, clk, &mut corr);
+        match result {
+            DispatchPrepared::Done(responses) => {
+                assert!(
+                    responses.iter().any(|r| matches!(r, maria304_driver::protocol::Response::Error(
+                        maria304_driver::protocol::error_codes::ErrorCode::SoftUpas
+                    ))),
+                    "{cmd:?} must return SoftUpas when unauthenticated, got {responses:?}",
+                );
+            }
+            DispatchPrepared::NeedsBridge(_) => {
+                panic!("{cmd:?}: unauthenticated session must not reach bridge");
+            }
+        }
+    }
+}
+
+#[test]
+fn dispatch_prepare_unauthenticated_caioi_returns_softupas_not_bridge() {
+    let mut s = Session::new();
+    let id = identity();
+    let mut corr = corr();
+    let (date, time) = clock();
+    let clk = Clock { date: &date, time: &time };
+
+    let result = dispatch_prepare(
+        &mut s,
+        &Command::Caioi { sum_kopecks: 100, description: "test".to_string() },
+        &id, clk, &mut corr,
+    );
+    assert!(
+        matches!(result, DispatchPrepared::Done(_)),
+        "unauthenticated CAIOI must return Done(SoftUpas), not NeedsBridge"
+    );
+}

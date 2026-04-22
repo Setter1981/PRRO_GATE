@@ -80,6 +80,8 @@ async fn main() {
         subscriber.json().init();
     }
 
+    prro_sidecar::license::check_embedded_pubkeys();
+
     let repo = Repo::open(&config.db.path).unwrap_or_else(|e| {
         eprintln!("db error: {e}");
         std::process::exit(1);
@@ -176,7 +178,17 @@ async fn handle_fiscal_send(
 ) -> impl IntoResponse {
     // Per-request wall-clock timeout: TSP HTTP (≤5 s) + gRPC (≤? s) + signing.
     match tokio::time::timeout(REQUEST_TIMEOUT, fiscal_send_inner(&st, cmd)).await {
-        Ok(Ok(r))  => (StatusCode::OK, Json(r)).into_response(),
+        Ok(Ok(r)) => {
+            // Map DPS error category to HTTP status so callers get a clear non-success
+            // signal without needing to inspect the JSON body.  status > 0 is success.
+            let http_status = match r.dps_error_category.as_deref() {
+                Some("transient") => StatusCode::SERVICE_UNAVAILABLE,
+                Some("permanent") => StatusCode::UNPROCESSABLE_ENTITY,
+                _ if r.status <= 0 => StatusCode::BAD_GATEWAY,
+                _ => StatusCode::OK,
+            };
+            (http_status, Json(r)).into_response()
+        }
         Ok(Err(e)) => e.into_response(),
         Err(_)     => SidecarError::Internal("request timeout".into()).into_response(),
     }
@@ -554,10 +566,10 @@ async fn fiscal_send_inner(
         dps_error_category,
     };
 
-    // S4: persist for idempotency replay — only for accepted documents (status > 0)
-    // to avoid caching transient DPS errors. Uses INSERT OR IGNORE: concurrent
-    // duplicate stores are harmless.
-    if !cmd.idempotency_key.is_empty() {
+    // S4: persist for idempotency replay — only for accepted documents (status > 0).
+    // Transient / permanent DPS errors MUST NOT be cached: a retry must be free to
+    // re-submit to DPS.  Uses INSERT OR IGNORE: concurrent duplicate stores are harmless.
+    if resp.status > 0 && !cmd.idempotency_key.is_empty() {
         if let Ok(json) = serde_json::to_string(&response) {
             let _ = st.repo.record_idempotent_response(&cmd.idempotency_key, fn_id, &json);
         }

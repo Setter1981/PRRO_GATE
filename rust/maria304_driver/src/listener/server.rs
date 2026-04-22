@@ -94,6 +94,7 @@ impl FnListener {
             addr = %self.cfg.bind,
             "maria304 listener bound",
         );
+        let mut connections: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 accept_res = tcp.accept() => {
@@ -107,7 +108,7 @@ impl FnListener {
                     let conn_shutdown = shutdown.clone();
 
                     let metrics = Arc::clone(&self.metrics);
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         handle_incoming(stream, peer, gate, cooldown, bridge, clock, identity, idle, metrics, conn_shutdown).await;
                     });
                 }
@@ -117,6 +118,9 @@ impl FnListener {
                 }
             }
         }
+        // Drain in-flight connections.  Each connection's shutdown token is already
+        // cancelled, so bridge calls / IO will unwind to their next cancel point.
+        while connections.join_next().await.is_some() {}
         Ok(())
     }
 }
