@@ -1,0 +1,77 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-22-fiscal-correctness-fixes.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: P0-a — Per-FN single-writer mutex",
+      "status": "completed",
+      "description": "**Goal:** Serialize steps 9–13 per fiscal_number, eliminating previous_hash race.\n\n**Files:**\n- Modify: `rust/prro_sidecar/src/bin/prro_sidecar.rs`\n\n**Verify:** `cargo test -p prro_sidecar fn_lock 2>&1 | tail -5`\n\n```json:metadata\n{\"files\": [\"rust/prro_sidecar/src/bin/prro_sidecar.rs\"], \"verifyCommand\": \"cargo test -p prro_sidecar fn_lock 2>&1 | tail -5\", \"acceptanceCriteria\": [\"fn_locks in AppState\", \"lock wraps steps 9-13\", \"cleanup task\", \"concurrent test\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: P0-b — fn_degraded schema + Repo methods + SidecarError variant",
+      "status": "completed",
+      "description": "**Goal:** Persist degraded FN state; typed Repo API.\n\n**Files:**\n- Modify: `rust/prro_sidecar/src/repo.rs`\n- Modify: `rust/prro_sidecar/src/errors.rs`\n\n**Verify:** `cargo test -p prro_sidecar repo::tests 2>&1 | tail -10`\n\n```json:metadata\n{\"files\": [\"rust/prro_sidecar/src/repo.rs\", \"rust/prro_sidecar/src/errors.rs\"], \"verifyCommand\": \"cargo test -p prro_sidecar repo::tests 2>&1 | tail -10\", \"acceptanceCriteria\": [\"fn_degraded table\", \"4 repo methods\", \"FnDegraded error\", \"unit tests\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: P0-b — ChainBroken handler integration",
+      "status": "completed",
+      "blockedBy": [1, 2],
+      "description": "**Goal:** Wire degraded state into fiscal_send_inner.\n\n**Files:**\n- Modify: `rust/prro_sidecar/src/bin/prro_sidecar.rs`\n\n**Verify:** `cargo test -p prro_sidecar chain_broken 2>&1 | tail -10`\n\n```json:metadata\n{\"files\": [\"rust/prro_sidecar/src/bin/prro_sidecar.rs\"], \"verifyCommand\": \"cargo test -p prro_sidecar chain_broken 2>&1 | tail -10\", \"acceptanceCriteria\": [\"chain_broken field\", \"503 for degraded FN\", \"200+chain_broken on MAC failure\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: P0-b — Reconcile background loop",
+      "status": "completed",
+      "blockedBy": [3],
+      "description": "**Goal:** Auto-recover degraded FNs every 30s.\n\n**Files:**\n- Modify: `rust/prro_sidecar/src/bin/prro_sidecar.rs`\n\n**Verify:** `cargo test -p prro_sidecar reconcile 2>&1 | tail -10`\n\n```json:metadata\n{\"files\": [\"rust/prro_sidecar/src/bin/prro_sidecar.rs\"], \"verifyCommand\": \"cargo test -p prro_sidecar reconcile 2>&1 | tail -10\", \"acceptanceCriteria\": [\"loop spawned\", \"uses fn_locks\", \"clears degraded\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: P0-c — DocumentOutcome + classify_response",
+      "status": "completed",
+      "description": "**Goal:** Pure function for COMP response classification.\n\n**Files:**\n- Modify: `rust/maria304_driver/src/bridge/dto.rs`\n\n**Verify:** `cargo test -p maria304_driver classify_response 2>&1 | tail -10`\n\n```json:metadata\n{\"files\": [\"rust/maria304_driver/src/bridge/dto.rs\"], \"verifyCommand\": \"cargo test -p maria304_driver classify_response 2>&1 | tail -10\", \"acceptanceCriteria\": [\"DocumentOutcome enum\", \"classify_response\", \"8 unit tests\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: P0-c — COMP dispatcher fail-close",
+      "status": "completed",
+      "blockedBy": [5],
+      "description": "**Goal:** Use classify_response in COMP handler.\n\n**Files:**\n- Modify: `rust/maria304_driver/src/session/dispatcher.rs`\n- Modify: `rust/maria304_driver/tests/bridge_acceptance.rs`\n\n**Verify:** `cargo test -p maria304_driver 2>&1 | tail -5`\n\n```json:metadata\n{\"files\": [\"rust/maria304_driver/src/session/dispatcher.rs\", \"rust/maria304_driver/tests/bridge_acceptance.rs\"], \"verifyCommand\": \"cargo test -p maria304_driver 2>&1 | tail -5\", \"acceptanceCriteria\": [\"Accepted closes receipt\", \"Terminal closes as rejected\", \"Retryable leaves open\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: P1-a — credentials_mode SQL migration + OperatorRow + per-row decode",
+      "status": "completed",
+      "description": "**Goal:** Per-row credentials_mode replaces global config.\n\n**Files:**\n- Create: `sql/023_operator_credentials_mode.sql`\n- Modify: `rust/prro_sidecar/src/repo.rs`\n- Modify: `rust/prro_sidecar/src/bin/prro_sidecar.rs`\n\n**Verify:** `cargo test -p prro_sidecar 2>&1 | tail -5`\n\n```json:metadata\n{\"files\": [\"sql/023_operator_credentials_mode.sql\", \"rust/prro_sidecar/src/repo.rs\", \"rust/prro_sidecar/src/bin/prro_sidecar.rs\"], \"verifyCommand\": \"cargo test -p prro_sidecar 2>&1 | tail -5\", \"acceptanceCriteria\": [\"SQL migration\", \"OperatorRow.credentials_mode\", \"per-row decode\"]}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 8: P1-a — migrate-passwords command + cmd_add_operator encode",
+      "status": "completed",
+      "blockedBy": [7],
+      "description": "**Goal:** prro_admin re-encodes passwords; new operators written as xor_soft.\n\n**Files:**\n- Modify: `rust/prro_sidecar/src/bin/prro_admin.rs`\n\n**Verify:** `cargo build -p prro_sidecar --bin prro_admin 2>&1 | tail -3`\n\n```json:metadata\n{\"files\": [\"rust/prro_sidecar/src/bin/prro_admin.rs\"], \"verifyCommand\": \"cargo build -p prro_sidecar --bin prro_admin 2>&1 | tail -3\", \"acceptanceCriteria\": [\"migrate-passwords subcommand\", \"dry-run\", \"encodes on write\"]}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 9: P1-a — routes.py CLI delegation for add-operator",
+      "status": "completed",
+      "blockedBy": [8],
+      "description": "**Goal:** Python UI delegates to prro_admin CLI.\n\n**Files:**\n- Modify: `src/prro_gateway/admin_ui/routes.py`\n\n**Verify:** `python -m pytest tests/test_admin_ui.py -k operator -x 2>&1 | tail -10`\n\n```json:metadata\n{\"files\": [\"src/prro_gateway/admin_ui/routes.py\"], \"verifyCommand\": \"python -m pytest tests/test_admin_ui.py -k operator -x 2>&1 | tail -10\", \"acceptanceCriteria\": [\"subprocess to prro_admin\", \"409 on FN not registered\", \"400 on error\"]}\n```"
+    },
+    {
+      "id": 10,
+      "subject": "Task 10: P1-b — spawn_blocking for TSP fetch_timestamp",
+      "status": "completed",
+      "description": "**Goal:** Unblock tokio workers during TSP call.\n\n**Files:**\n- Modify: `rust/prro_sidecar/src/bin/prro_sidecar.rs`\n\n**Verify:** `cargo test -p prro_sidecar 2>&1 | tail -5`\n\n```json:metadata\n{\"files\": [\"rust/prro_sidecar/src/bin/prro_sidecar.rs\"], \"verifyCommand\": \"cargo test -p prro_sidecar 2>&1 | tail -5\", \"acceptanceCriteria\": [\"spawn_blocking wrapper\", \"JoinError mapped\", \"build succeeds\"]}\n```"
+    },
+    {
+      "id": 11,
+      "subject": "Task 11: P2-b — CAIO amount validation",
+      "status": "completed",
+      "description": "**Goal:** Reject zero and non-numeric CAIO amounts.\n\n**Files:**\n- Modify: `rust/maria304_driver/src/protocol/commands.rs`\n\n**Verify:** `cargo test -p maria304_driver 2>&1 | tail -5`\n\n```json:metadata\n{\"files\": [\"rust/maria304_driver/src/protocol/commands.rs\"], \"verifyCommand\": \"cargo test -p maria304_driver 2>&1 | tail -5\", \"acceptanceCriteria\": [\"invalid string → InvalidParams\", \"zero → InvalidParams\", \"valid → Caioi/Caioo\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-04-22T15:00:00Z"
+}

@@ -16,6 +16,8 @@ pub enum SidecarError {
     Grpc(String),
     #[error("db: {0}")]
     Db(#[from] rusqlite::Error),
+    #[error("fn degraded: {0}")]
+    FnDegraded(String),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -36,6 +38,7 @@ impl axum::response::IntoResponse for SidecarError {
             Self::CmsSign(_)     => (StatusCode::BAD_GATEWAY,           "cms sign failed".into()),
             Self::Grpc(_)        => (StatusCode::BAD_GATEWAY,           "dps unavailable".into()),
             Self::Db(_)          => (StatusCode::INTERNAL_SERVER_ERROR, "database error".into()),
+            Self::FnDegraded(_)  => (StatusCode::SERVICE_UNAVAILABLE,   "FN_DEGRADED".into()),
             Self::Internal(_)    => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()),
         };
         (status, Json(serde_json::json!({"error": msg}))).into_response()

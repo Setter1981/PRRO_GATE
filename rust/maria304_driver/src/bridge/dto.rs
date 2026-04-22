@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::protocol::error_codes::ErrorCode;
+
 /// Top-level envelope posted to `/v1/ingress/maria304`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CanonicalCommand {
@@ -305,5 +307,124 @@ mod tests {
         assert!(parsed.ok);
         assert_eq!(parsed.fiscal_id, "0000001234");
         assert_eq!(parsed.sale_total_kopecks, 0); // serde default
+    }
+}
+
+/// Classification of a COMP (fiscal document send) response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocumentOutcome {
+    /// DPS accepted the document — fiscal_id is valid; close receipt, store hash.
+    Accepted { fiscal_id: u64, sale: u64, ret: u64 },
+    /// Terminal failure — DPS permanently rejected or signed with bad key.
+    /// Receipt must be closed as rejected; caller cannot retry this document.
+    Terminal(ErrorCode),
+    /// Transient failure — DPS may not have seen this document.
+    /// Leave receipt open so caller can retry COMP or issue CANC.
+    Retryable(ErrorCode),
+}
+
+/// Classify a `CanonicalResponse` into an outcome for the COMP handler.
+///
+/// Rationale: closing a receipt must reflect actual DPS outcome, not just
+/// whether the HTTP call succeeded (Invariant #4 — idempotency).
+pub fn classify_response(resp: &CanonicalResponse) -> DocumentOutcome {
+    if resp.ok {
+        match resp.fiscal_id.parse::<u64>() {
+            Ok(id) if id > 0 => DocumentOutcome::Accepted {
+                fiscal_id: id,
+                sale: resp.sale_total_kopecks,
+                ret:  resp.return_total_kopecks,
+            },
+            // ok=true but fiscal_id zero or unparseable — data-contract violation from
+            // the gateway.  Close the receipt (cannot retry this document) and signal
+            // SoftBlock so 1C retries the higher-level operation from scratch.
+            _ => DocumentOutcome::Terminal(ErrorCode::SoftBlock),
+        }
+    } else {
+        match resp.document_state.as_str() {
+            // Known permanent rejections — DPS will not accept a re-send.
+            "REJECTED" | "ERROR_SIGN" | "ERROR_FISCAL" =>
+                DocumentOutcome::Terminal(ErrorCode::SoftLocked),
+            // ERROR_SEND or unknown state: DPS may not have seen it → retryable.
+            // Includes ERROR_SAVE (-3 in native DPS protocol) per backlog ADR.
+            _ => DocumentOutcome::Retryable(ErrorCode::SoftBlock),
+        }
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    fn resp(ok: bool, fiscal_id: &str, document_state: &str) -> CanonicalResponse {
+        CanonicalResponse {
+            ok,
+            document_id:         "doc1".into(),
+            fiscal_id:           fiscal_id.into(),
+            fiscal_ts:           "2026-04-22T10:00:00Z".into(),
+            document_state:      document_state.into(),
+            sale_total_kopecks:  1000,
+            return_total_kopecks: 0,
+        }
+    }
+
+    #[test]
+    fn accepted_when_ok_and_valid_fiscal_id() {
+        let r = resp(true, "12345", "SENT");
+        assert!(matches!(
+            classify_response(&r),
+            DocumentOutcome::Accepted { fiscal_id: 12345, .. }
+        ));
+    }
+
+    #[test]
+    fn accepted_carries_sale_totals() {
+        let r = resp(true, "9", "SENT");
+        match classify_response(&r) {
+            DocumentOutcome::Accepted { sale, .. } => assert_eq!(sale, 1000),
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_when_ok_but_fiscal_id_zero() {
+        let r = resp(true, "0", "SENT");
+        assert!(matches!(classify_response(&r), DocumentOutcome::Terminal(_)));
+    }
+
+    #[test]
+    fn terminal_when_ok_but_fiscal_id_empty() {
+        let r = resp(true, "", "SENT");
+        assert!(matches!(classify_response(&r), DocumentOutcome::Terminal(_)));
+    }
+
+    #[test]
+    fn terminal_on_rejected() {
+        let r = resp(false, "", "REJECTED");
+        assert!(matches!(classify_response(&r), DocumentOutcome::Terminal(_)));
+    }
+
+    #[test]
+    fn terminal_on_error_sign() {
+        let r = resp(false, "", "ERROR_SIGN");
+        assert!(matches!(classify_response(&r), DocumentOutcome::Terminal(_)));
+    }
+
+    #[test]
+    fn terminal_on_error_fiscal() {
+        let r = resp(false, "", "ERROR_FISCAL");
+        assert!(matches!(classify_response(&r), DocumentOutcome::Terminal(_)));
+    }
+
+    #[test]
+    fn retryable_on_error_send() {
+        let r = resp(false, "", "ERROR_SEND");
+        assert!(matches!(classify_response(&r), DocumentOutcome::Retryable(_)));
+    }
+
+    #[test]
+    fn retryable_on_empty_document_state() {
+        let r = resp(false, "", "");
+        assert!(matches!(classify_response(&r), DocumentOutcome::Retryable(_)));
     }
 }

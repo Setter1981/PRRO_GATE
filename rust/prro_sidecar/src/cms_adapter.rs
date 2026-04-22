@@ -109,6 +109,87 @@ pub fn extract_issuer_dn(cert_der: &[u8]) -> Result<String, CmsAdapterError> {
     Ok(dn_parts.join(", "))
 }
 
+/// Extract the notAfter date from a DER-encoded X.509 certificate.
+/// Returns an RFC3339 string like "2027-01-01T00:00:00Z".
+/// Used to derive the XorSoft key for password encoding/decoding.
+/// The returned format must match what is stored in `operator_certs.valid_to`.
+pub fn extract_cert_valid_to(cert_der: &[u8]) -> Result<String, CmsAdapterError> {
+    use prro_crypto::cms::asn1_util as a1;
+
+    // Certificate (SEQUENCE) → tbsCertificate (SEQUENCE)
+    let (_, tbs_start) = a1::read_tlv(cert_der, 0)
+        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    let (_, tbs_inner) = a1::read_tlv(cert_der, tbs_start)
+        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+
+    let mut pos = tbs_inner;
+    // Skip optional version [0]
+    if a1::peek_tag(cert_der, pos)
+        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))? == 0xa0
+    {
+        let (end, _) = a1::read_tlv(cert_der, pos)
+            .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+        pos = end;
+    }
+    // Skip serialNumber, signature, issuer (3 fields)
+    for _ in 0..3 {
+        let (end, _) = a1::read_tlv(cert_der, pos)
+            .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+        pos = end;
+    }
+    // validity SEQUENCE
+    let (_, val_inner) = a1::read_tlv(cert_der, pos)
+        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    // notBefore — check tag then skip it
+    let not_before_tag = a1::peek_tag(cert_der, val_inner)
+        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    if not_before_tag != 0x17 && not_before_tag != 0x18 {
+        return Err(CmsAdapterError::CertParse(
+            format!("unexpected notBefore tag 0x{not_before_tag:02x}")
+        ));
+    }
+    let (not_after_pos, _) = a1::read_tlv(cert_der, val_inner)
+        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    // notAfter
+    let not_after_tag = a1::peek_tag(cert_der, not_after_pos)
+        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    let (not_after_end, not_after_inner) = a1::read_tlv(cert_der, not_after_pos)
+        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    if not_after_end > cert_der.len() {
+        return Err(CmsAdapterError::CertParse("notAfter extends beyond cert DER".into()));
+    }
+    let raw = std::str::from_utf8(&cert_der[not_after_inner..not_after_end])
+        .map_err(|e| CmsAdapterError::CertParse(format!("notAfter UTF-8: {e}")))?;
+    // Normalize to RFC3339: "YYYY-MM-DDTHH:MM:SSZ"
+    match not_after_tag {
+        0x17 => {
+            // UTCTime: YYMMDDHHMMSSZ (13 bytes)
+            // RFC 5280: year 00-49 = 2000+, year 50-99 = 1900+
+            if raw.len() < 13 {
+                return Err(CmsAdapterError::CertParse(format!("UTCTime too short: {raw:?}")));
+            }
+            let yy: u32 = raw[..2].parse().map_err(|_| CmsAdapterError::CertParse(format!("UTCTime yy: {raw}")))?;
+            let century = if yy <= 49 { 2000u32 } else { 1900u32 };
+            let yyyy = century + yy;
+            Ok(format!(
+                "{:04}-{}-{}T{}:{}:{}Z",
+                yyyy, &raw[2..4], &raw[4..6], &raw[6..8], &raw[8..10], &raw[10..12]
+            ))
+        }
+        0x18 => {
+            // GeneralizedTime: YYYYMMDDHHMMSSZ (15 bytes)
+            if raw.len() < 15 {
+                return Err(CmsAdapterError::CertParse(format!("GeneralizedTime too short: {raw:?}")));
+            }
+            Ok(format!(
+                "{}-{}-{}T{}:{}:{}Z",
+                &raw[..4], &raw[4..6], &raw[6..8], &raw[8..10], &raw[10..12], &raw[12..14]
+            ))
+        }
+        tag => Err(CmsAdapterError::CertParse(format!("unexpected notAfter tag 0x{tag:02x}"))),
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -230,6 +311,90 @@ mod tests {
     }
 
     // ── C. extract_issuer_dn with empty bytes ─────────────────────────────────
+
+    // ── extract_cert_valid_to ─────────────────────────────────────────────────
+
+    /// Build a minimal DER Certificate skeleton with a UTCTime notAfter.
+    /// Structure: SEQUENCE { SEQUENCE { [0]{02 01 02} INTEGER{01} SEQUENCE{} SEQUENCE{} SEQUENCE{ UTCTime notBefore, UTCTime notAfter } } }
+    fn make_minimal_cert_der(not_before: &[u8], not_after: &[u8]) -> Vec<u8> {
+        // Encode a single TLV: tag, len, value
+        let tlv = |tag: u8, val: &[u8]| -> Vec<u8> {
+            let mut out = vec![tag];
+            let len = val.len();
+            if len < 0x80 {
+                out.push(len as u8);
+            } else {
+                out.push(0x82);
+                out.push((len >> 8) as u8);
+                out.push((len & 0xff) as u8);
+            }
+            out.extend_from_slice(val);
+            out
+        };
+
+        // version [0] EXPLICIT v3 (02 01 02)
+        let version_inner = tlv(0x02, &[0x02]);
+        let version = tlv(0xa0, &version_inner);
+        // serialNumber INTEGER 1
+        let serial = tlv(0x02, &[0x01]);
+        // signature AlgorithmIdentifier (empty SEQUENCE)
+        let sig_alg = tlv(0x30, &[]);
+        // issuer (empty SEQUENCE)
+        let issuer = tlv(0x30, &[]);
+        // validity SEQUENCE { notBefore, notAfter }
+        let mut validity_inner = Vec::new();
+        validity_inner.extend_from_slice(not_before);
+        validity_inner.extend_from_slice(not_after);
+        let validity = tlv(0x30, &validity_inner);
+
+        // tbsCertificate SEQUENCE
+        let mut tbs_inner = Vec::new();
+        tbs_inner.extend_from_slice(&version);
+        tbs_inner.extend_from_slice(&serial);
+        tbs_inner.extend_from_slice(&sig_alg);
+        tbs_inner.extend_from_slice(&issuer);
+        tbs_inner.extend_from_slice(&validity);
+        let tbs = tlv(0x30, &tbs_inner);
+
+        // Certificate SEQUENCE
+        tlv(0x30, &tbs)
+    }
+
+    #[test]
+    fn extract_cert_valid_to_utctime() {
+        // UTCTime "270101000000Z" → "2027-01-01T00:00:00Z"
+        let not_before = [0x17u8, 0x0d, b'2', b'6', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0', b'Z'];
+        let not_after  = [0x17u8, 0x0d, b'2', b'7', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0', b'Z'];
+        let der = make_minimal_cert_der(&not_before, &not_after);
+        let result = extract_cert_valid_to(&der).unwrap();
+        assert_eq!(result, "2027-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn extract_cert_valid_to_utctime_century_50_to_99() {
+        // UTCTime "991231235959Z" → year 99 ≥ 50 → 1999-12-31T23:59:59Z
+        let not_before = [0x17u8, 0x0d, b'9', b'8', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0', b'Z'];
+        let not_after  = [0x17u8, 0x0d, b'9', b'9', b'1', b'2', b'3', b'1', b'2', b'3', b'5', b'9', b'5', b'9', b'Z'];
+        let der = make_minimal_cert_der(&not_before, &not_after);
+        let result = extract_cert_valid_to(&der).unwrap();
+        assert_eq!(result, "1999-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn extract_cert_valid_to_generalizedtime() {
+        // GeneralizedTime "20270101000000Z" → "2027-01-01T00:00:00Z"
+        let not_before = [0x18u8, 0x0f, b'2', b'0', b'2', b'6', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0', b'Z'];
+        let not_after  = [0x18u8, 0x0f, b'2', b'0', b'2', b'7', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0', b'Z'];
+        let der = make_minimal_cert_der(&not_before, &not_after);
+        let result = extract_cert_valid_to(&der).unwrap();
+        assert_eq!(result, "2027-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn extract_cert_valid_to_empty_returns_error() {
+        let result = extract_cert_valid_to(&[]);
+        assert!(matches!(result, Err(CmsAdapterError::CertParse(_))));
+    }
 
     #[test]
     fn extract_issuer_dn_empty_input_returns_error() {

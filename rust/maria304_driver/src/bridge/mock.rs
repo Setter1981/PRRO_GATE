@@ -19,6 +19,8 @@ pub struct MockBridge {
     next_fiscal_id: Mutex<u64>,
     /// If set, every submit returns this error instead of a canned ACK.
     forced_error: Mutex<Option<BridgeError>>,
+    /// If set, next submit returns this response instead of the auto-generated one.
+    forced_response: Mutex<Option<CanonicalResponse>>,
 }
 
 impl MockBridge {
@@ -28,7 +30,13 @@ impl MockBridge {
             submitted: Mutex::default(),
             next_fiscal_id: Mutex::new(1),
             forced_error: Mutex::default(),
+            forced_response: Mutex::default(),
         }
+    }
+
+    /// Force the next submit to return this response (one-shot).
+    pub fn set_next_response(&self, resp: CanonicalResponse) {
+        *self.forced_response.lock().expect("MockBridge mutex poisoned") = Some(resp);
     }
 
     /// Force the next submit to fail with the given error.  Consumed
@@ -92,6 +100,10 @@ impl Bridge for MockBridge {
             .lock()
             .expect("MockBridge mutex poisoned")
             .push(command.clone());
+        if let Some(resp) = self.forced_response.lock().expect("MockBridge mutex poisoned").take() {
+            return Ok(resp);
+        }
+
         let fiscal_id = {
             let mut n = self
                 .next_fiscal_id

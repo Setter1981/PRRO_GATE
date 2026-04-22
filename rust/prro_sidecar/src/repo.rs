@@ -6,6 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::{params, Connection};
 
+use crate::config::CredentialsMode;
 use crate::errors::SidecarError;
 
 // ── Domain types ──────────────────────────────────────────────────────────────
@@ -34,6 +35,21 @@ impl rusqlite::types::FromSql for FiscalMode {
     }
 }
 
+impl rusqlite::types::FromSql for CredentialsMode {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match String::column_result(value)?.as_str() {
+            "plain"    => Ok(Self::Plain),
+            "xor_soft" => Ok(Self::XorSoft),
+            other => Err(rusqlite::types::FromSqlError::Other(Box::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid credentials_mode {other:?}; expected 'plain' or 'xor_soft'"),
+                ),
+            ))),
+        }
+    }
+}
+
 // ── Row types ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -50,13 +66,15 @@ pub struct FnConfig {
 
 #[derive(Debug, Clone)]
 pub struct OperatorRow {
-    pub id:            i64,
-    pub fiscal_number: String,
-    pub operator_name: Option<String>,
-    pub operator_inn:  String,
-    pub jks_path:      String,
+    pub id:               i64,
+    pub fiscal_number:    String,
+    pub operator_name:    Option<String>,
+    pub operator_inn:     String,
+    pub jks_path:         String,
     /// XOR-soft hex or plain text — as stored; caller decodes via credentials module.
-    pub jks_password:  String,
+    pub jks_password:     String,
+    /// Per-row password encoding mode — overrides global config.security.credentials_mode.
+    pub credentials_mode: CredentialsMode,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +194,13 @@ impl Repo {
                  fiscal_number TEXT PRIMARY KEY,
                  last          INTEGER NOT NULL DEFAULT 0,
                  previous_hash TEXT    NOT NULL DEFAULT ''
+             );
+             CREATE TABLE IF NOT EXISTS fn_degraded (
+                 fiscal_number TEXT PRIMARY KEY,
+                 pending_hash  TEXT    NOT NULL,
+                 degraded_at   TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 retry_count   INTEGER NOT NULL DEFAULT 0,
+                 last_retry_at TEXT
              );",
         )?;
         Ok(Self { conn: Mutex::new(conn) })
@@ -227,7 +252,7 @@ impl Repo {
         let conn = self.lock()?;
         conn.query_row(
             "SELECT id, fiscal_number, operator_name, operator_inn,
-                    jks_path, jks_password
+                    jks_path, jks_password, credentials_mode
              FROM   sidecar_operators
              WHERE  fiscal_number = ?1 AND active = 1
              ORDER  BY id DESC
@@ -235,12 +260,13 @@ impl Repo {
             params![fiscal_number],
             |row| {
                 Ok(OperatorRow {
-                    id:            row.get(0)?,
-                    fiscal_number: row.get(1)?,
-                    operator_name: row.get(2)?,
-                    operator_inn:  row.get(3)?,
-                    jks_path:      row.get(4)?,
-                    jks_password:  row.get(5)?,
+                    id:               row.get(0)?,
+                    fiscal_number:    row.get(1)?,
+                    operator_name:    row.get(2)?,
+                    operator_inn:     row.get(3)?,
+                    jks_path:         row.get(4)?,
+                    jks_password:     row.get(5)?,
+                    credentials_mode: row.get(6)?,
                 })
             },
         )
@@ -372,6 +398,85 @@ impl Repo {
         Ok(())
     }
 
+    /// Mark a fiscal number as hash-chain-degraded with the pending hash that
+    /// could not be persisted after a successful DPS response.
+    /// Re-degradation resets retry_count — each degradation event starts fresh.
+    pub fn set_degraded(&self, fiscal_number: &str, pending_hash: &str) -> Result<(), SidecarError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO fn_degraded (fiscal_number, pending_hash)
+             VALUES (?1, ?2)
+             ON CONFLICT(fiscal_number) DO UPDATE SET
+                 pending_hash  = excluded.pending_hash,
+                 degraded_at   = CURRENT_TIMESTAMP,
+                 retry_count   = 0,
+                 last_retry_at = NULL",
+            params![fiscal_number, pending_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Returns true when the fiscal number has an unresolved degraded-chain entry.
+    pub fn is_degraded(&self, fiscal_number: &str) -> Result<bool, SidecarError> {
+        let conn = self.lock()?;
+        let count: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM fn_degraded WHERE fiscal_number = ?1",
+            params![fiscal_number],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Return all degraded fiscal numbers with their pending hash and retry count,
+    /// ordered oldest-first so the reconcile loop drains longest-stuck entries first.
+    pub fn list_degraded(&self) -> Result<Vec<(String, String, i32)>, SidecarError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT fiscal_number, pending_hash, retry_count FROM fn_degraded ORDER BY degraded_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i32>(2)?))
+        })?;
+        let mut result = Vec::new();
+        for row in rows { result.push(row?); }
+        Ok(result)
+    }
+
+    /// On success: store pending_hash as previous_hash + DELETE fn_degraded (one transaction).
+    /// On failure: increment retry_count + last_retry_at (best-effort, only when ROLLBACK succeeds).
+    /// Caller must pass the same hash that was stored in fn_degraded by set_degraded().
+    pub fn reconcile_chain(&self, fiscal_number: &str, pending_hash: &str) -> Result<(), SidecarError> {
+        let conn = self.lock()?;
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(SidecarError::Db)?;
+        let store_result = conn.execute(
+            "INSERT INTO local_sequences (fiscal_number, previous_hash) VALUES (?1, ?2)
+             ON CONFLICT(fiscal_number) DO UPDATE SET previous_hash = excluded.previous_hash",
+            params![fiscal_number, pending_hash],
+        );
+        let del_result = store_result.and_then(|_| {
+            conn.execute(
+                "DELETE FROM fn_degraded WHERE fiscal_number = ?1",
+                params![fiscal_number],
+            )
+        });
+        match del_result {
+            Ok(_) => {
+                conn.execute_batch("COMMIT").map_err(SidecarError::Db)?;
+                Ok(())
+            }
+            Err(e) => {
+                if conn.execute_batch("ROLLBACK").is_ok() {
+                    let _ = conn.execute(
+                        "UPDATE fn_degraded SET retry_count = retry_count + 1,
+                         last_retry_at = CURRENT_TIMESTAMP WHERE fiscal_number = ?1",
+                        params![fiscal_number],
+                    );
+                }
+                Err(SidecarError::Db(e))
+            }
+        }
+    }
+
     /// Load raw cert DER bytes for the given fiscal_number.
     /// Used when `ExtractedKey.certs` is empty (Key6Dat containers).
     pub fn load_cert_der_for_fn(&self, fiscal_number: &str) -> Result<Vec<u8>, SidecarError> {
@@ -450,15 +555,17 @@ mod tests {
              );
 
              CREATE TABLE sidecar_operators (
-                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                 fiscal_number  TEXT NOT NULL,
-                 operator_name  TEXT,
-                 operator_inn   TEXT NOT NULL,
-                 jks_path       TEXT NOT NULL,
-                 jks_password   TEXT NOT NULL,
-                 active         INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
-                 created_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                 updated_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                 fiscal_number    TEXT NOT NULL,
+                 operator_name    TEXT,
+                 operator_inn     TEXT NOT NULL,
+                 jks_path         TEXT NOT NULL,
+                 jks_password     TEXT NOT NULL,
+                 active           INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+                 credentials_mode TEXT NOT NULL DEFAULT 'plain'
+                                  CHECK (credentials_mode IN ('plain', 'xor_soft')),
+                 created_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 updated_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                  FOREIGN KEY (fiscal_number) REFERENCES fiscal_number_config(fiscal_number)
              );
 
@@ -506,6 +613,14 @@ mod tests {
                  fiscal_number TEXT PRIMARY KEY,
                  last          INTEGER NOT NULL DEFAULT 0,
                  previous_hash TEXT    NOT NULL DEFAULT ''
+             );
+
+             CREATE TABLE fn_degraded (
+                 fiscal_number TEXT PRIMARY KEY,
+                 pending_hash  TEXT    NOT NULL,
+                 degraded_at   TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 retry_count   INTEGER NOT NULL DEFAULT 0,
+                 last_retry_at TEXT
              );",
         )
         .unwrap();
@@ -571,6 +686,32 @@ mod tests {
         let repo = make_repo();
         let err = repo.load_active_operator("3001234567").unwrap_err();
         assert!(matches!(err, SidecarError::NotFound(_)));
+    }
+
+    #[test]
+    fn load_active_operator_credentials_mode_xor_soft() {
+        // Verify that a row inserted with credentials_mode='xor_soft' is returned
+        // as CredentialsMode::XorSoft — per-row mode decode, not global config.
+        let repo = make_repo();
+        insert_fn(&repo, "3001234567");
+        {
+            let conn = repo.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sidecar_operators
+                     (fiscal_number, operator_name, operator_inn, jks_path, jks_password,
+                      active, credentials_mode)
+                 VALUES (?1, 'Тест Оператор', '1234567890', '/keys/op.jks', 'hexhex01',
+                         1, 'xor_soft')",
+                params!["3001234567"],
+            )
+            .unwrap();
+        }
+        let op = repo.load_active_operator("3001234567").unwrap();
+        assert_eq!(
+            op.credentials_mode,
+            CredentialsMode::XorSoft,
+            "credentials_mode column 'xor_soft' must map to CredentialsMode::XorSoft"
+        );
     }
 
     #[test]
@@ -1241,6 +1382,52 @@ mod tests {
             matches!(result, Err(SidecarError::NotFound(_))),
             "unknown issuer must be NotFound"
         );
+    }
+
+    // ── fn_degraded ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn set_and_check_degraded() {
+        let repo = make_repo();
+        repo.next_local_number("FN001").unwrap();
+        assert!(!repo.is_degraded("FN001").unwrap());
+        repo.set_degraded("FN001", "deadbeef").unwrap();
+        assert!(repo.is_degraded("FN001").unwrap());
+    }
+
+    #[test]
+    fn reconcile_chain_clears_degraded() {
+        let repo = make_repo();
+        repo.next_local_number("FN001").unwrap();
+        repo.set_degraded("FN001", "cafebabe").unwrap();
+        repo.reconcile_chain("FN001", "cafebabe").unwrap();
+        assert!(!repo.is_degraded("FN001").unwrap());
+        assert_eq!(repo.load_previous_hash("FN001").unwrap(), "cafebabe");
+    }
+
+    #[test]
+    fn list_degraded_returns_all() {
+        let repo = make_repo();
+        repo.next_local_number("FN001").unwrap();
+        repo.next_local_number("FN002").unwrap();
+        repo.set_degraded("FN001", "hash1").unwrap();
+        repo.set_degraded("FN002", "hash2").unwrap();
+        let entries = repo.list_degraded().unwrap();
+        assert_eq!(entries.len(), 2);
+        let fns: Vec<&str> = entries.iter().map(|(fn_id, _, _)| fn_id.as_str()).collect();
+        assert!(fns.contains(&"FN001"));
+        assert!(fns.contains(&"FN002"));
+    }
+
+    #[test]
+    fn set_degraded_idempotent_updates_hash() {
+        let repo = make_repo();
+        repo.next_local_number("FN001").unwrap();
+        repo.set_degraded("FN001", "first_hash").unwrap();
+        repo.set_degraded("FN001", "second_hash").unwrap();
+        let entries = repo.list_degraded().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "second_hash");
     }
 
     // ── Mutex poison ──────────────────────────────────────────────────────────

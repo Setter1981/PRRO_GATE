@@ -10,8 +10,11 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import os
 import secrets
+import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit
@@ -841,6 +844,33 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
         return RedirectResponse("/admin/ui/settings/fns", status_code=303)
 
     # ── Cashier (sidecar_operators) CRUD — Phase 12a ─────────────
+
+    def _add_operator_via_cli(
+        db_path: str,
+        fiscal_number: str,
+        operator_name: str,
+        inn: str,
+        jks_path: str,
+        jks_password: str,
+    ) -> None:
+        """Delegate operator registration to prro_admin CLI (handles XorSoft encoding)."""
+        admin_bin = (
+            os.environ.get("PRRO_ADMIN_BIN")
+            or shutil.which("prro_admin")
+            or "/usr/local/bin/prro_admin"
+        )
+        args = [
+            admin_bin, "--db", db_path,
+            "add-operator",
+            fiscal_number, inn, jks_path,
+            "--jks-password", jks_password,
+        ]
+        if operator_name:
+            args += ["--name", operator_name]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            raise ValueError(result.stderr.strip() or "prro_admin add-operator failed")
+
     def _validate_cashier(form: dict[str, str]) -> list[str]:
         errors: list[str] = []
         for field, cap in (("operator_name", 256), ("jks_path", 512),
@@ -947,6 +977,20 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
         if errors:
             return _bad(400)
 
+        # Invariant #10: active (fn, inn) pair must be unique — check before CLI call
+        # so the user sees 409 with a Ukrainian message, not a raw SQLite error.
+        with container.connect() as conn:
+            dup = conn.execute(
+                "SELECT 1 FROM sidecar_operators WHERE fiscal_number = ? AND operator_inn = ? AND active = 1",
+                (fn, form["operator_inn"]),
+            ).fetchone()
+        if dup:
+            errors = [
+                "Касир з таким ІНН вже зареєстрований на цей ФН. "
+                "Деактивуйте існуючого перш ніж додавати дубль."
+            ]
+            return _bad(409)
+
         audit_payload = json.dumps({
             "fiscal_number": fn,
             "operator_inn": form["operator_inn"],
@@ -954,38 +998,43 @@ def register_admin_ui(app: FastAPI, container: "RuntimeContainer") -> None:
         }, ensure_ascii=False)
 
         try:
+            _add_operator_via_cli(
+                db_path=str(container.db_path),
+                fiscal_number=fn,
+                operator_name=form["operator_name"],
+                inn=form["operator_inn"],
+                jks_path=form["jks_path"],
+                jks_password=jks_password,
+            )
+        except ValueError as exc:
+            error_msg = str(exc)
+            if "not registered" in error_msg:
+                errors = [error_msg]
+                return _bad(409)
+            errors = [error_msg or "Помилка реєстрації касира."]
+            return _bad(400)
+
+        # Write audit_log — query for the id just inserted by prro_admin.
+        try:
             with container.connect() as conn:
+                row = conn.execute(
+                    """SELECT id FROM sidecar_operators
+                       WHERE fiscal_number = ? AND operator_inn = ? AND active = 1
+                       ORDER BY id DESC LIMIT 1""",
+                    (fn, form["operator_inn"]),
+                ).fetchone()
+                op_id = row[0] if row else None
                 with conn:
-                    cur = conn.execute(
-                        """INSERT INTO sidecar_operators (
-                                fiscal_number, operator_name, operator_inn,
-                                jks_path, jks_password, active
-                           ) VALUES (?, ?, ?, ?, ?, 1)""",
-                        (fn, form["operator_name"] or None,
-                         form["operator_inn"], form["jks_path"], jks_password),
-                    )
-                    op_id = cur.lastrowid
                     conn.execute(
                         """INSERT INTO audit_log (
                                 entity_type, entity_id, event_type, severity,
                                 event_payload_json
                            ) VALUES ('sidecar_operators', ?,
                                      'cashier_registered', 'INFO', ?)""",
-                        (str(op_id), audit_payload),
+                        (str(op_id) if op_id else "unknown", audit_payload),
                     )
-        except sqlite3.IntegrityError:
-            # Partial unique index (migration 021) rejected a duplicate
-            # active (fiscal_number, operator_inn) pair — invariant #10
-            # demands an unambiguous signer, so we refuse with 409.
-            errors = [
-                "Касир з таким ІНН вже зареєстрований на цей ФН. "
-                "Деактивуйте існуючого перш ніж додавати дубль."
-            ]
-            return _bad(409)
         except sqlite3.DatabaseError:
-            _log.exception("cashier_new_db_error fn=%s", fn)
-            errors = ["Помилка збереження. Зверніться до адміністратора."]
-            return _bad(500)
+            _log.exception("cashier_new_audit_error fn=%s", fn)
 
         return RedirectResponse("/admin/ui/settings/operators",
                                 status_code=303)

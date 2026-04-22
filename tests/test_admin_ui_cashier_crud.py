@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -153,35 +154,34 @@ def test_operators_list_has_add_link_per_fn(tmp_path: Path) -> None:
 # ─── 2. Add cashier — POST ───────────────────────────────────────────
 
 
+def _mock_cli_success() -> MagicMock:
+    m = MagicMock()
+    m.returncode = 0
+    m.stdout = "added operator id=1 inn=2222222222 fn=4000012100 (xor_soft)\n"
+    m.stderr = ""
+    return m
+
+
 def test_add_post_success_redirects(tmp_path: Path) -> None:
     container = RuntimeContainer(_config(tmp_path))
     client = _logged_in(container)
     try:
         _seed_fn(container)
         csrf = _csrf(client, "/admin/ui/settings/fns/4000012100/operators/new")
-        r = client.post(
-            "/admin/ui/settings/fns/4000012100/operators/new",
-            data={
-                "csrf_token": csrf,
-                "operator_name": "Іванов І.І.",
-                "operator_inn": "2222222222",
-                "jks_path": "/keys/iv.jks",
-                "jks_password": "mega-pw",
-            },
-            follow_redirects=False,
-        )
+        with patch("subprocess.run", return_value=_mock_cli_success()):
+            r = client.post(
+                "/admin/ui/settings/fns/4000012100/operators/new",
+                data={
+                    "csrf_token": csrf,
+                    "operator_name": "Іванов І.І.",
+                    "operator_inn": "2222222222",
+                    "jks_path": "/keys/iv.jks",
+                    "jks_password": "mega-pw",
+                },
+                follow_redirects=False,
+            )
         assert r.status_code in (302, 303), r.text
         assert r.headers["location"].rstrip("/") == "/admin/ui/settings/operators"
-        with container.connect() as conn:
-            row = conn.execute(
-                """SELECT fiscal_number, operator_name, operator_inn,
-                          jks_path, active
-                   FROM sidecar_operators WHERE operator_inn = '2222222222'"""
-            ).fetchone()
-        assert row is not None
-        assert (row[0], row[1], row[2], row[3], row[4]) == (
-            "4000012100", "Іванов І.І.", "2222222222", "/keys/iv.jks", 1,
-        )
     finally:
         client.__exit__(None, None, None)
 
@@ -192,17 +192,18 @@ def test_add_post_writes_audit_row(tmp_path: Path) -> None:
     try:
         _seed_fn(container)
         csrf = _csrf(client, "/admin/ui/settings/fns/4000012100/operators/new")
-        client.post(
-            "/admin/ui/settings/fns/4000012100/operators/new",
-            data={
-                "csrf_token": csrf,
-                "operator_name": "Audit O.",
-                "operator_inn": "3333333333",
-                "jks_path": "/keys/a.jks",
-                "jks_password": "pw",
-            },
-            follow_redirects=False,
-        )
+        with patch("subprocess.run", return_value=_mock_cli_success()):
+            client.post(
+                "/admin/ui/settings/fns/4000012100/operators/new",
+                data={
+                    "csrf_token": csrf,
+                    "operator_name": "Audit O.",
+                    "operator_inn": "3333333333",
+                    "jks_path": "/keys/a.jks",
+                    "jks_password": "pw",
+                },
+                follow_redirects=False,
+            )
         with container.connect() as conn:
             row = conn.execute(
                 """SELECT event_type, severity, event_payload_json
@@ -295,6 +296,60 @@ def test_add_post_404_on_unknown_fn(tmp_path: Path) -> None:
             follow_redirects=False,
         )
         assert r.status_code == 404
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_add_post_calls_prro_admin_subprocess(tmp_path: Path) -> None:
+    container = RuntimeContainer(_config(tmp_path))
+    client = _logged_in(container)
+    try:
+        _seed_fn(container)
+        csrf = _csrf(client, "/admin/ui/settings/fns/4000012100/operators/new")
+        with patch("subprocess.run", return_value=_mock_cli_success()) as mock_run:
+            r = client.post(
+                "/admin/ui/settings/fns/4000012100/operators/new",
+                data={
+                    "csrf_token": csrf,
+                    "operator_name": "CLI Test",
+                    "operator_inn": "7777777711",
+                    "jks_path": "/keys/cl.jks",
+                    "jks_password": "cli-pw",
+                },
+                follow_redirects=False,
+            )
+        assert r.status_code in (302, 303), r.text
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args[0][0]
+        assert "add-operator" in call_args
+        assert "4000012100" in call_args
+        assert "7777777711" in call_args
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_add_post_returns_409_on_fn_not_registered(tmp_path: Path) -> None:
+    container = RuntimeContainer(_config(tmp_path))
+    client = _logged_in(container)
+    try:
+        _seed_fn(container)
+        csrf = _csrf(client, "/admin/ui/settings/fns/4000012100/operators/new")
+        failed = MagicMock()
+        failed.returncode = 1
+        failed.stderr = "fiscal_number '9999999999' is not registered — run 'register-fn' first"
+        with patch("subprocess.run", return_value=failed):
+            r = client.post(
+                "/admin/ui/settings/fns/4000012100/operators/new",
+                data={
+                    "csrf_token": csrf,
+                    "operator_name": "X",
+                    "operator_inn": "8888888888",
+                    "jks_path": "/keys/x.jks",
+                    "jks_password": "pw",
+                },
+                follow_redirects=False,
+            )
+        assert r.status_code == 409, r.text
     finally:
         client.__exit__(None, None, None)
 
@@ -561,17 +616,18 @@ def test_add_allows_same_inn_under_different_fn(tmp_path: Path) -> None:
         _seed_fn(container, fn="4000012102")
         _seed_operator(container, fn="4000012101", inn="5000000002")
         csrf = _csrf(client, "/admin/ui/settings/fns/4000012102/operators/new")
-        r = client.post(
-            "/admin/ui/settings/fns/4000012102/operators/new",
-            data={
-                "csrf_token": csrf,
-                "operator_name": "Same person",
-                "operator_inn": "5000000002",
-                "jks_path": "/keys/x.jks",
-                "jks_password": "pw",
-            },
-            follow_redirects=False,
-        )
+        with patch("subprocess.run", return_value=_mock_cli_success()):
+            r = client.post(
+                "/admin/ui/settings/fns/4000012102/operators/new",
+                data={
+                    "csrf_token": csrf,
+                    "operator_name": "Same person",
+                    "operator_inn": "5000000002",
+                    "jks_path": "/keys/x.jks",
+                    "jks_password": "pw",
+                },
+                follow_redirects=False,
+            )
         assert r.status_code in (302, 303), r.text
     finally:
         client.__exit__(None, None, None)
@@ -586,17 +642,18 @@ def test_add_allows_new_after_soft_delete(tmp_path: Path) -> None:
         _seed_fn(container)
         _seed_operator(container, inn="5000000003", active=0)
         csrf = _csrf(client, "/admin/ui/settings/fns/4000012100/operators/new")
-        r = client.post(
-            "/admin/ui/settings/fns/4000012100/operators/new",
-            data={
-                "csrf_token": csrf,
-                "operator_name": "Re-hired",
-                "operator_inn": "5000000003",
-                "jks_path": "/keys/rh.jks",
-                "jks_password": "pw",
-            },
-            follow_redirects=False,
-        )
+        with patch("subprocess.run", return_value=_mock_cli_success()):
+            r = client.post(
+                "/admin/ui/settings/fns/4000012100/operators/new",
+                data={
+                    "csrf_token": csrf,
+                    "operator_name": "Re-hired",
+                    "operator_inn": "5000000003",
+                    "jks_path": "/keys/rh.jks",
+                    "jks_password": "pw",
+                },
+                follow_redirects=False,
+            )
         assert r.status_code in (302, 303), r.text
     finally:
         client.__exit__(None, None, None)

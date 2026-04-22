@@ -13,8 +13,10 @@
 //! real handlers.
 
 use crate::bridge::{
-    Bridge, BridgeError, CanonicalCommand, CommandType, RawFrame, ReceiptPayload,
+    Bridge, BridgeError, CanonicalCommand, CommandType, RawFrame, ReceiptDirection,
+    ReceiptPayload,
 };
+use crate::bridge::dto::{classify_response, DocumentOutcome};
 use crate::protocol::{
     error_codes::ErrorCode, Command, CompBuilder, ConfBuilder, ConfMode, Response, SysKey,
 };
@@ -171,10 +173,16 @@ pub fn dispatch(
             if session.receipt_open() {
                 return err(ErrorCode::SoftCheck);
             }
+            let return_check_number = session.pending_return_check_number.take();
+            let direction = if return_check_number.is_some() {
+                ReceiptDirection::Return
+            } else {
+                ReceiptDirection::Sale
+            };
             let receipt = OpenReceipt {
                 department: dept,
-                return_check_number: session.pending_return_check_number.take(),
-                direction: crate::bridge::ReceiptDirection::Sale,
+                return_check_number,
+                direction,
                 raw_frames: Vec::new(),
                 dual_tax_mode: None,
                 totals: crate::bridge::Totals::default(),
@@ -217,6 +225,11 @@ pub fn dispatch(
             }
             let opcode = command_opcode(&command);
             append_receipt_frame(session, &opcode, body.clone());
+            if matches!(command, Command::Bfis(_) | Command::Arbf(_) | Command::Bfcd(_)) {
+                if let SessionState::ReceiptOpen(ref mut r) = session.state {
+                    r.direction = ReceiptDirection::Return;
+                }
+            }
             if matches!(command, Command::Psdt(_)) {
                 session.psdt_sequence = session.psdt_sequence.saturating_add(1);
                 if let SessionState::ReceiptOpen(ref mut r) = session.state {
@@ -267,27 +280,34 @@ pub fn dispatch(
             append_receipt_frame(session, "COMP", body.clone());
             let envelope = build_canonical(session, identity, correlation);
             match bridge.submit(&envelope) {
-                Ok(resp) => {
-                    let fiscal_id = resp
-                        .fiscal_id
-                        .parse::<u64>()
-                        .unwrap_or(0);
-                    let sale = resp.sale_total_kopecks;
-                    let ret = resp.return_total_kopecks;
-                    let comp_payload = CompBuilder::new(fiscal_id, sale, ret).to_wire_payload();
-                    // Close receipt, increment sequence, reset counters.
-                    session.state = SessionState::Authenticated;
-                    session.psdt_sequence = 0;
-                    session.pending_return_check_number = None;
-                    correlation.receipt_seq = correlation.receipt_seq.saturating_add(1);
-                    session.mark_command_ok("COMP");
-                    ok(Some(
-                        Response::data(comp_payload).expect("COMP payload is 94 chars"),
-                    ))
-                }
+                Ok(resp) => match classify_response(&resp) {
+                    DocumentOutcome::Accepted { fiscal_id, sale, ret } => {
+                        let comp_payload = CompBuilder::new(fiscal_id, sale, ret).to_wire_payload();
+                        session.state = SessionState::Authenticated;
+                        session.psdt_sequence = 0;
+                        session.pending_return_check_number = None;
+                        correlation.receipt_seq = correlation.receipt_seq.saturating_add(1);
+                        session.mark_command_ok("COMP");
+                        ok(Some(
+                            Response::data(comp_payload).expect("COMP payload is 94 chars"),
+                        ))
+                    }
+                    DocumentOutcome::Terminal(code) => {
+                        // DPS rejected permanently — close receipt, cannot retry this doc.
+                        session.state = SessionState::Authenticated;
+                        session.psdt_sequence = 0;
+                        session.pending_return_check_number = None;
+                        correlation.receipt_seq = correlation.receipt_seq.saturating_add(1);
+                        session.mark_command_ok("COMP_REJECTED");
+                        err(code)
+                    }
+                    DocumentOutcome::Retryable(code) => {
+                        // DPS may not have seen this — leave receipt open for retry or CANC.
+                        err(code)
+                    }
+                },
                 Err(bridge_err) => {
-                    // Leave receipt state intact so the caller can retry
-                    // or issue CANC.  Convert to a wire error.
+                    // Transport failure — leave receipt open so caller can retry or CANC.
                     let code = map_bridge_error(&bridge_err);
                     err(code)
                 }
@@ -792,6 +812,7 @@ mod tests {
             SessionState::ReceiptOpen(r) => {
                 assert_eq!(r.department, "Bar");
                 assert_eq!(r.return_check_number.as_deref(), Some("42"));
+                assert_eq!(r.direction, crate::bridge::ReceiptDirection::Return);
             }
             other => panic!("{other:?}"),
         }
@@ -1062,6 +1083,7 @@ mod tests {
         match &s.state {
             SessionState::ReceiptOpen(r) => {
                 assert_eq!(r.return_check_number.as_deref(), Some("999"));
+                assert_eq!(r.direction, crate::bridge::ReceiptDirection::Return);
             }
             other => panic!("{other:?}"),
         }

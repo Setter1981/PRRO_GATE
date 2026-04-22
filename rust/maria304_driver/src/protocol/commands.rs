@@ -377,7 +377,10 @@ impl Command {
                     };
                 };
                 let sum_str: String = prefix_chars.collect();
-                let sum: u64 = sum_str.parse().unwrap_or(0);
+                let sum: u64 = match sum_str.parse::<u64>() {
+                    Ok(v) if v > 0 => v,
+                    _ => return Self::InvalidParams { opcode: opcode.into(), body: body_owned },
+                };
                 let desc = description.to_string();
                 match dir {
                     'I' => Self::Caioi { sum_kopecks: sum, description: desc },
@@ -732,6 +735,43 @@ mod tests {
             Command::InvalidParams { opcode, .. } => assert_eq!(opcode, "CAIO"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn caio_invalid_string_returns_error() {
+        // Non-numeric characters in the 10-digit sum field → InvalidParams.
+        let c = parse("CAIOIXXXXXXXXXXdesc");
+        match c {
+            Command::InvalidParams { opcode, .. } => assert_eq!(opcode, "CAIO"),
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn caio_zero_amount_returns_error() {
+        // Zero sum is semantically invalid — a deposit/withdrawal of 0 kopecks
+        // is never a legitimate fiscal operation.
+        let c = parse("CAIOI0000000000desc");
+        match c {
+            Command::InvalidParams { opcode, .. } => assert_eq!(opcode, "CAIO"),
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn caio_valid_amount_succeeds() {
+        // Deposit: 50 000 kopecks (500 UAH), direction 'I' → Caioi.
+        let c = parse("CAIOI0000050000desc");
+        match c {
+            Command::Caioi { sum_kopecks, description } => {
+                assert_eq!(sum_kopecks, 50_000);
+                assert_eq!(description, "desc");
+            }
+            other => panic!("expected Caioi, got {other:?}"),
+        }
+        // Withdrawal: direction 'O' → Caioo.
+        let c2 = parse("CAIOO0000050000desc");
+        assert!(matches!(c2, Command::Caioo { sum_kopecks: 50_000, .. }));
     }
 
     #[test]

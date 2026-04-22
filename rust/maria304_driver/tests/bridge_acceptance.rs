@@ -5,6 +5,7 @@
 //! on the mock bridge with every field populated from wire commands".
 
 use maria304_driver::bridge::{BridgeError, CanonicalCommand, CommandType, MockBridge};
+use maria304_driver::bridge::dto::CanonicalResponse;
 use maria304_driver::protocol::error_codes::ErrorCode;
 use maria304_driver::protocol::{Command, Response};
 use maria304_driver::session::dispatcher::Correlation;
@@ -284,16 +285,96 @@ fn return_receipt_command_type_is_return_not_sell() {
         &mut correlation,
         Command::Bchn("123".to_string()),
     );
-    // Manually flip direction — no wire opcode in M4 yet; direction
-    // is set by the session state init which defaults to Sale.
-    // For the envelope to be a RETURN, we flip the OpenReceipt.
     run(&mut session, &bridge, &mut correlation, Command::Prep("X".to_string()));
-    if let maria304_driver::session::SessionState::ReceiptOpen(ref mut r) = session.state {
-        r.direction = maria304_driver::bridge::ReceiptDirection::Return;
-    }
     run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
 
     let env = bridge.last().unwrap();
     assert_eq!(env.command_type, CommandType::Return);
     assert_eq!(env.return_check_number.as_deref(), Some("123"));
+}
+
+#[test]
+fn return_line_opcode_marks_receipt_as_return() {
+    let (mut session, bridge, mut correlation) = logged_in_session();
+
+    run(&mut session, &bridge, &mut correlation, Command::Prep("X".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Bfis("return-line".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+
+    let env = bridge.last().unwrap();
+    assert_eq!(env.command_type, CommandType::Return);
+    assert_eq!(env.return_check_number, None);
+}
+
+// ── Task 6: fail-close COMP dispatcher ───────────────────────────────────────
+
+fn canonical_response(ok: bool, fiscal_id: &str, document_state: &str) -> CanonicalResponse {
+    CanonicalResponse {
+        ok,
+        document_id:         "doc-test".into(),
+        fiscal_id:           fiscal_id.into(),
+        fiscal_ts:           "2026-04-22T10:00:00Z".into(),
+        document_state:      document_state.into(),
+        sale_total_kopecks:  500,
+        return_total_kopecks: 0,
+    }
+}
+
+#[test]
+fn comp_accepted_closes_receipt() {
+    let (mut session, bridge, mut correlation) = logged_in_session();
+    bridge.set_next_response(canonical_response(true, "99999", "SENT"));
+
+    run(&mut session, &bridge, &mut correlation, Command::Prep("X".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+
+    // Receipt must be closed — a new COMP without PREP must fail with SoftNoDoc.
+    let responses = run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+    assert!(
+        responses.iter().any(|r| matches!(r, Response::Error(ErrorCode::SoftNoDoc))),
+        "receipt must be closed after Accepted: {responses:?}",
+    );
+}
+
+#[test]
+fn comp_terminal_closes_receipt_as_rejected() {
+    let (mut session, bridge, mut correlation) = logged_in_session();
+    bridge.set_next_response(canonical_response(false, "", "REJECTED"));
+
+    run(&mut session, &bridge, &mut correlation, Command::Prep("X".to_string()));
+    let responses = run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+
+    // Terminal: an error response is returned.
+    assert!(
+        responses.iter().any(|r| matches!(r, Response::Error(_))),
+        "terminal COMP must return error: {responses:?}",
+    );
+    // Receipt must be closed — next COMP without PREP must fail with SoftNoDoc.
+    let next = run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+    assert!(
+        next.iter().any(|r| matches!(r, Response::Error(ErrorCode::SoftNoDoc))),
+        "receipt must be closed after Terminal: {next:?}",
+    );
+}
+
+#[test]
+fn comp_retryable_leaves_receipt_open() {
+    let (mut session, bridge, mut correlation) = logged_in_session();
+    bridge.set_next_response(canonical_response(false, "", "ERROR_SEND"));
+
+    run(&mut session, &bridge, &mut correlation, Command::Prep("X".to_string()));
+    let responses = run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+
+    // Retryable: an error response is returned.
+    assert!(
+        responses.iter().any(|r| matches!(r, Response::Error(_))),
+        "retryable COMP must return error: {responses:?}",
+    );
+    // Receipt must stay open — can retry COMP immediately.
+    bridge.set_next_response(canonical_response(true, "88888", "SENT"));
+    let retry = run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+    assert!(
+        retry.iter().any(|r| matches!(r, Response::Data(_))),
+        "retry COMP after Retryable must succeed: {retry:?}",
+    );
 }

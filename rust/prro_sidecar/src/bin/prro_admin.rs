@@ -13,6 +13,9 @@ use std::io::{self, BufRead};
 
 use clap::{Parser, Subcommand};
 use rusqlite::{params, Connection};
+use prro_sidecar::credentials;
+use prro_sidecar::cms_adapter;
+use prro_crypto::interop::prro::extract_private_key;
 
 #[derive(Parser)]
 #[command(name = "prro_admin", about = "Fiscal sidecar management CLI")]
@@ -71,6 +74,14 @@ enum Cmd {
         operator_id: i64,
     },
 
+    /// Re-encode all plain-mode operator passwords to xor_soft.
+    /// Run after deploying the credentials_mode migration.
+    MigratePasswords {
+        /// Print what would be done without modifying the DB.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+
     /// Install license payload + signature from files.
     /// Validates the signature before persisting.
     LoadLicense {
@@ -116,6 +127,8 @@ fn main() {
         Cmd::ListOperators { fiscal_number } => cmd_list_operators(&conn, fiscal_number.as_deref()),
 
         Cmd::Deactivate { operator_id } => cmd_deactivate(&conn, operator_id),
+
+        Cmd::MigratePasswords { dry_run } => cmd_migrate_passwords(&conn, dry_run),
 
         Cmd::LoadLicense { payload_file, signature_file } => {
             cmd_load_license(&conn, &payload_file, &signature_file)
@@ -193,15 +206,114 @@ fn cmd_add_operator(
     jks_password:  &str,
     name:          Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let jks_bytes = std::fs::read(jks_path)
+        .map_err(|e| format!("cannot read JKS at {jks_path:?}: {e}"))?;
+    let extracted = extract_private_key(&jks_bytes, jks_password)
+        .map_err(|e| format!("cannot open JKS (wrong password?): {e}"))?;
+    let cert_der = extracted.certs.first()
+        .ok_or_else(|| String::from("JKS container has no certificate"))?;
+    let valid_to = cms_adapter::extract_cert_valid_to(cert_der)
+        .map_err(|e| format!("cannot extract cert valid_to: {e}"))?;
+    let op_name  = name.unwrap_or("");
+    let encoded  = credentials::encode_password(jks_password, &valid_to, op_name);
+
     conn.execute(
         "INSERT INTO sidecar_operators
-             (fiscal_number, operator_inn, jks_path, jks_password, operator_name)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![fiscal_number, operator_inn, jks_path, jks_password, name],
+             (fiscal_number, operator_inn, jks_path, jks_password, operator_name, credentials_mode)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'xor_soft')",
+        params![fiscal_number, operator_inn, jks_path, encoded, name],
     )
     .map_err(|e| map_operator_insert_error(e, fiscal_number))?;
     let row_id = conn.last_insert_rowid();
-    println!("added operator id={row_id} inn={operator_inn} fn={fiscal_number}");
+    println!("added operator id={row_id} inn={operator_inn} fn={fiscal_number} (xor_soft)");
+    Ok(())
+}
+
+// ── migrate-passwords ─────────────────────────────────────────────────────────
+
+fn cmd_migrate_passwords(
+    conn:    &Connection,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    struct OpRow {
+        id:            i64,
+        operator_name: Option<String>,
+        jks_path:      String,
+        jks_password:  String,
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT id, operator_name, jks_path, jks_password
+         FROM sidecar_operators WHERE credentials_mode = 'plain' AND active = 1",
+    )?;
+    let rows: Vec<OpRow> = stmt.query_map([], |row| {
+        Ok(OpRow {
+            id:            row.get(0)?,
+            operator_name: row.get(1)?,
+            jks_path:      row.get(2)?,
+            jks_password:  row.get(3)?,
+        })
+    })?.filter_map(|r| r.ok()).collect();
+
+    let total = rows.len();
+    let mut migrated = 0usize;
+    let mut skipped  = 0usize;
+
+    for op in &rows {
+        let jks_bytes = match std::fs::read(&op.jks_path) {
+            Ok(b)  => b,
+            Err(e) => {
+                eprintln!("[skip] id={} path={:?}: {e}", op.id, op.jks_path);
+                skipped += 1;
+                continue;
+            }
+        };
+        let extracted = match extract_private_key(&jks_bytes, &op.jks_password) {
+            Ok(e)  => e,
+            Err(e) => {
+                eprintln!("[skip] id={} cannot open JKS: {e}", op.id);
+                skipped += 1;
+                continue;
+            }
+        };
+        let cert_der = match extracted.certs.first() {
+            Some(c) => c,
+            None => {
+                eprintln!("[skip] id={} no cert in JKS container", op.id);
+                skipped += 1;
+                continue;
+            }
+        };
+        let valid_to = match cms_adapter::extract_cert_valid_to(cert_der) {
+            Ok(v)  => v,
+            Err(e) => {
+                eprintln!("[skip] id={} cannot extract valid_to: {e}", op.id);
+                skipped += 1;
+                continue;
+            }
+        };
+        let op_name = op.operator_name.as_deref().unwrap_or("");
+        let encoded  = credentials::encode_password(&op.jks_password, &valid_to, op_name);
+
+        if dry_run {
+            println!("[dry-run] id={} would encode password (valid_to={valid_to})", op.id);
+        } else {
+            conn.execute(
+                "UPDATE sidecar_operators SET jks_password = ?1, credentials_mode = 'xor_soft'
+                 WHERE id = ?2",
+                rusqlite::params![encoded, op.id],
+            )?;
+            println!("[ok] id={} encoded (valid_to={valid_to})", op.id);
+        }
+        migrated += 1;
+    }
+
+    println!("migrate-passwords: total={total} migrated={migrated} skipped={skipped}{}",
+        if dry_run { " (dry-run)" } else { "" });
+    if skipped > 0 {
+        eprintln!("warning: {skipped} operator(s) remain in plain mode — check errors above");
+        return Err(format!("{skipped} operator(s) could not be migrated").into());
+    }
     Ok(())
 }
 
