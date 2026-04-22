@@ -47,6 +47,7 @@ fn session_authenticated() -> Session {
 
 /// Bridge that panics if `submit` is called — used to verify dispatch_prepare
 /// does NOT call the bridge.
+#[allow(dead_code)]
 struct PanicBridge;
 impl Bridge for PanicBridge {
     fn submit(&self, _: &CanonicalCommand) -> Result<CanonicalResponse, BridgeError> {

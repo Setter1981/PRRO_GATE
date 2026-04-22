@@ -14,7 +14,7 @@
 //! module uses `time-tz` (IANA-backed).
 
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use time_tz::{timezones, OffsetDateTimeExt, PrimitiveDateTimeExt};
+use time_tz::{timezones, OffsetDateTimeExt};
 
 use crate::errors::SidecarError;
 

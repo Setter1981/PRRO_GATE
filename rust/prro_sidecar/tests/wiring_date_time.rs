@@ -114,7 +114,7 @@ fn xml_builder_format_ts_uses_iana_kyiv_tz_not_fixed_utc_plus_3() {
 
 #[cfg(test)]
 mod envelope_integrity {
-    use prro_sidecar::input::{CanonicalCommand, OperationType};
+    use prro_sidecar::input::CanonicalCommand;
     use sha2::{Digest, Sha256};
     use serde_json::json;
 
