@@ -1017,6 +1017,24 @@ class WritePathWorker:
 
     def _stage_finalize_ack(self, conn: sqlite3.Connection, ctx: WorkerContext) -> WorkerProcessResult:
         assert ctx.document is not None and ctx.inbox is not None and ctx.command is not None
+        # B-2: validate send_result.state before opening the transaction.
+        # A ValueError from an unknown state would otherwise be raised inside BEGIN IMMEDIATE,
+        # leaving an open write transaction on an unhandled exception path.
+        if ctx.document.fs_mode != 'OFFLINE':
+            assert ctx.send_result is not None
+            try:
+                send_state = DocumentState(ctx.send_result.state) if ctx.send_result.state else DocumentState.ACK
+            except ValueError:
+                return self._mark_document_and_inbox_error(
+                    conn,
+                    ctx=ctx,
+                    document_id=ctx.document.document_id,
+                    state=DocumentState.ERROR_RETRYABLE,
+                    error=build_canonical_error(
+                        CanonicalErrorCode.TRANSPORT_RETRYABLE_ERROR,
+                        message=f'invalid send_result.state: {ctx.send_result.state!r}',
+                    ),
+                )
         conn.execute('BEGIN IMMEDIATE')
         if ctx.document.fs_mode == 'OFFLINE':
             ack_at = datetime.now(UTC).isoformat()
@@ -1036,8 +1054,7 @@ class WritePathWorker:
             self._apply_shift_side_effects_locked(conn, ctx=ctx, target_state=DocumentState.OFFLINE_LOCAL_ACK)
             outcome = 'OFFLINE_LOCAL_ACK'
         else:
-            assert ctx.send_result is not None
-            send_state = DocumentState(ctx.send_result.state) if ctx.send_result.state else DocumentState.ACK
+            # send_state validated and computed before BEGIN IMMEDIATE above (B-2).
             if send_state == DocumentState.ACK:
                 ctx.document = FiscalDocumentRepository.update_state(
                     conn,

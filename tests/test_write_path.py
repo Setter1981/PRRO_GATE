@@ -740,8 +740,12 @@ def test_crash_resume_sending_to_error_retryable(conn):
     _accept_sell_command(conn, request_id='req-crash-resume-sending')
     conn.commit()
 
-    # First pass: run through sign stage with retryable transport failure
-    # → leaves document in ERROR_RETRYABLE after transport exception
+    # First pass: sign succeeds, transport raises TransportRetryableError.
+    # Document ends in ERROR_RETRYABLE. We then patch state to SENDING to simulate
+    # the crash scenario (process died after the SENDING commit in _stage_send_or_offline
+    # but before transport returned). The artificial injection covers the guard in
+    # process_next; the _stage_acquire_and_validate SENDING branch is covered by the
+    # fact that _stage_acquire_and_validate returns (ctx, None) for SENDING documents.
     crypto = StubCryptoProvider(conn=conn)
     transport_fail = StubTransportClient(fail_retryable=True, conn=conn)
     worker = WritePathWorker(crypto_provider=crypto, transport_client=transport_fail)
@@ -749,11 +753,12 @@ def test_crash_resume_sending_to_error_retryable(conn):
     assert result1.outcome == 'ERROR'
     doc_id = result1.document_id
 
-    # Simulate crash: reset to SENDING state (what would happen if crashed after
-    # SENDING commit but before transport ACK was received)
+    # Simulate crash: force SENDING state and reset inbox to NEW.
+    # requeue_count=1 avoids a trace_id uniqueness conflict: the first pass already
+    # wrote '{doc_id}-transport-error' to transport_trace_log; without incrementing
+    # the count the crash-resume pass would attempt the same trace_id and hit a
+    # UNIQUE constraint in _mark_document_and_inbox_error.
     conn.execute("UPDATE fiscal_documents SET state = 'SENDING' WHERE document_id = ?", (doc_id,))
-    # requeue_count=1 so _mark_document_and_inbox_error generates trace_id
-    # '{doc_id}-transport-error-2' (not the already-used '{doc_id}-transport-error').
     conn.execute(
         "UPDATE ingress_inbox SET status = 'NEW', canonical_error_code = NULL, requeue_count = 1 WHERE request_id = 'req-crash-resume-sending'"
     )
@@ -771,3 +776,41 @@ def test_crash_resume_sending_to_error_retryable(conn):
     final_state = conn.execute("SELECT state FROM fiscal_documents WHERE document_id = ?", (doc_id,)).fetchone()[0]
     assert final_state == 'ERROR_RETRYABLE', f"Expected ERROR_RETRYABLE, got {final_state}"
     assert transport_spy.calls == 0, f"transport.send() must NOT be called on crash-resume from SENDING, calls={transport_spy.calls}"
+
+
+# ---------------------------------------------------------------------------
+# B-2: DocumentState validation before BEGIN IMMEDIATE in _stage_finalize_ack
+# ---------------------------------------------------------------------------
+
+def test_invalid_send_state_returns_error_without_open_transaction(conn):
+    """Invalid send_result.state → ERROR_RETRYABLE without opening a write transaction."""
+    _open_shift(conn)
+    _accept_sell_command(conn, request_id='req-invalid-state')
+    conn.commit()
+
+    class InvalidStateTransportClient(StubTransportClient):
+        def send(self, *, document_id: str, signed_payload: str, fiscal_number: str,
+                 backend_profile_id: str, transport_profile_id: str, **kwargs) -> SendResult:
+            self.calls += 1
+            now = datetime.now(UTC)
+            return SendResult(
+                state='NOT_A_VALID_STATE',
+                transport_request_id=f'tx-{document_id}',
+                submission_status='ACK',
+                server_fiscal_no=f'FISC-{document_id}',
+                server_fiscal_date=now.isoformat(),
+                response_json='{}',
+                sent_at=now,
+                ack_at=now,
+            )
+
+    worker = WritePathWorker(
+        crypto_provider=StubCryptoProvider(conn=conn),
+        transport_client=InvalidStateTransportClient(conn=conn),
+    )
+    result = worker.process_next(conn, fiscal_number='FN-DEV-0001')
+
+    assert result.outcome == 'ERROR', f"Expected ERROR, got {result.outcome}"
+    final_state = conn.execute("SELECT state FROM fiscal_documents").fetchone()[0]
+    assert final_state == 'ERROR_RETRYABLE', f"Expected ERROR_RETRYABLE, got {final_state}"
+    assert conn.in_transaction is False, "No open transaction must remain after invalid state error"
