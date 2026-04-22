@@ -19,6 +19,7 @@ use tokio::time::timeout;
 use maria304_driver::bridge::{Bridge, MockBridge};
 use maria304_driver::listener::session_loop::{ClockSource, FixedClock};
 use maria304_driver::listener::{FnListener, ListenerConfig};
+use maria304_driver::observability::SessionMetrics;
 use maria304_driver::session::dispatcher::Identity;
 use maria304_driver::wire::{decode_frame, encode_frame};
 
@@ -40,9 +41,10 @@ async fn spawn_listener(fn_id: &str, cooldown: Duration) -> (String, Arc<MockBri
     cfg.cooldown = cooldown;
     cfg.idle_timeout = Duration::from_secs(2);
 
-    let listener = FnListener::new(cfg, bridge_trait, clock);
+    let metrics = Arc::new(SessionMetrics::new());
+    let listener = FnListener::new(cfg, bridge_trait, clock, metrics);
     tokio::spawn(async move {
-        if let Err(e) = listener.serve().await {
+        if let Err(e) = listener.serve(tokio_util::sync::CancellationToken::new()).await {
             eprintln!("listener died: {e}");
         }
     });

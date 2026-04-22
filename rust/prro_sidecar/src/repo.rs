@@ -201,6 +201,13 @@ impl Repo {
                  degraded_at   TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
                  retry_count   INTEGER NOT NULL DEFAULT 0,
                  last_retry_at TEXT
+             );
+             -- S4: idempotency journal — prevents double-submission on client retry storms.
+             CREATE TABLE IF NOT EXISTS sidecar_requests (
+                 idempotency_key TEXT    PRIMARY KEY,
+                 fiscal_number   TEXT    NOT NULL,
+                 response_json   TEXT    NOT NULL,
+                 created_at      TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
              );",
         )?;
         Ok(Self { conn: Mutex::new(conn) })
@@ -505,6 +512,39 @@ impl Repo {
             }
             other => SidecarError::Internal(other.to_string()),
         })
+    }
+
+    /// Return the cached JSON response for an idempotency key, or None if not seen before.
+    /// S4: called before allocating local_number to short-circuit duplicate submissions.
+    pub fn find_idempotent_response(&self, key: &str) -> Result<Option<String>, SidecarError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT response_json FROM sidecar_requests WHERE idempotency_key = ?1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![key])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Persist the response JSON for an idempotency key.
+    /// Uses INSERT OR IGNORE so concurrent duplicates are safe (no error on race).
+    /// S4: called after a successful DPS response.
+    pub fn record_idempotent_response(
+        &self,
+        key: &str,
+        fiscal_number: &str,
+        response_json: &str,
+    ) -> Result<(), SidecarError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO sidecar_requests (idempotency_key, fiscal_number, response_json)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![key, fiscal_number, response_json],
+        )?;
+        Ok(())
     }
 
     pub fn audit_log_insert(&self, entry: &AuditEntry<'_>) -> Result<(), SidecarError> {

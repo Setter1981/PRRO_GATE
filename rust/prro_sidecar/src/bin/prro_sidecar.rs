@@ -41,6 +41,7 @@ use prro_sidecar::{
     input::{CanonicalCommand, OperationType},
     license::LicenseState,
     repo::Repo,
+    validate_envelope,
     xml_builder::{self, BuildContext},
 };
 
@@ -157,14 +158,16 @@ async fn health_ready(State(st): State<AppState>) -> StatusCode {
 
 // ── Fiscal send ───────────────────────────────────────────────────────────────
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct FiscalSendResponse {
-    status:        i32,
-    fiscal_id:     String,
+    status:             i32,
+    fiscal_id:          String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error_message: Option<String>,
+    error_message:      Option<String>,
     #[serde(default)]
-    chain_broken:  bool,
+    chain_broken:       bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dps_error_category: Option<String>,
 }
 
 async fn handle_fiscal_send(
@@ -183,6 +186,11 @@ async fn fiscal_send_inner(
     st:  &AppState,
     cmd: CanonicalCommand,
 ) -> Result<FiscalSendResponse, SidecarError> {
+    // ── S2: envelope integrity (schema_version allowlist + payload_sha256) ───
+    if let Err(msg) = validate_envelope(&cmd) {
+        return Err(SidecarError::InvalidInput(msg));
+    }
+
     // ── 1. Validate operation ─────────────────────────────────────────────────
     if !cmd.operation_type.is_sidecar_supported() {
         return Err(SidecarError::BadRequest(format!(
@@ -202,10 +210,11 @@ async fn fiscal_send_inner(
         // (step 3 below) would bail before reaching here in non-dev mode.
         let xml_bytes = build_dev_xml(st, fn_id, &cmd)?;
         return Ok(FiscalSendResponse {
-            status:        1, // synthetic OK
-            fiscal_id:     String::new(),
-            error_message: Some(format!("dev.skip_sign: {} bytes XML, DPS skipped", xml_bytes.len())),
-            chain_broken:  false,
+            status:             1, // synthetic OK
+            fiscal_id:          String::new(),
+            error_message:      Some(format!("dev.skip_sign: {} bytes XML, DPS skipped", xml_bytes.len())),
+            chain_broken:       false,
+            dps_error_category: None,
         });
     }
 
@@ -300,6 +309,17 @@ async fn fiscal_send_inner(
     // submit a new document (which would use a broken MAC chain).
     if st.repo.is_degraded(fn_id)? {
         return Err(SidecarError::FnDegraded(fn_id.to_string()));
+    }
+
+    // ── S4: idempotency check — return cached response on duplicate key ──────────
+    // Must run inside the fn_lock so a concurrent first-send that is still
+    // in-flight does not race with a retry that would also allocate a local_number.
+    if !cmd.idempotency_key.is_empty() {
+        if let Some(cached_json) = st.repo.find_idempotent_response(&cmd.idempotency_key)? {
+            let cached: FiscalSendResponse = serde_json::from_str(&cached_json)
+                .map_err(|e| SidecarError::Internal(format!("idempotency cache parse: {e}")))?;
+            return Ok(cached);
+        }
     }
 
     // ── 9. Allocate local_number and load previous_hash (two short locks) ─────
@@ -521,12 +541,29 @@ async fn fiscal_send_inner(
     } else {
         Some(resp.error_message.clone())
     };
-    Ok(FiscalSendResponse {
-        status:        resp.status,
-        fiscal_id:     resp.id.clone(),
-        error_message: error_msg,
+    use prro_sidecar::grpc_client::{classify_dps_status, DpsErrorCategory};
+    let dps_error_category = classify_dps_status(resp.status).map(|c| match c {
+        DpsErrorCategory::Transient => "transient".to_string(),
+        DpsErrorCategory::Permanent => "permanent".to_string(),
+    });
+    let response = FiscalSendResponse {
+        status:             resp.status,
+        fiscal_id:          resp.id.clone(),
+        error_message:      error_msg,
         chain_broken,
-    })
+        dps_error_category,
+    };
+
+    // S4: persist for idempotency replay — only for accepted documents (status > 0)
+    // to avoid caching transient DPS errors. Uses INSERT OR IGNORE: concurrent
+    // duplicate stores are harmless.
+    if !cmd.idempotency_key.is_empty() {
+        if let Ok(json) = serde_json::to_string(&response) {
+            let _ = st.repo.record_idempotent_response(&cmd.idempotency_key, fn_id, &json);
+        }
+    }
+
+    Ok(response)
 }
 
 #[cfg(test)]

@@ -11,9 +11,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Instant};
 
-use crate::bridge::Bridge;
+use crate::bridge::{Bridge, BridgeError};
+use crate::observability::SessionMetrics;
 use crate::protocol::{Command, Response};
-use crate::session::dispatcher::{dispatch, Clock, Correlation, Identity};
+use crate::session::dispatcher::{
+    dispatch, dispatch_prepare, dispatch_with_result, Clock, Correlation, DispatchPrepared,
+    Identity,
+};
 use crate::session::Session;
 use crate::wire::{decode_frame, FrameError};
 
@@ -51,6 +55,8 @@ pub async fn run_connection(
     clock_src: Arc<dyn ClockSource>,
     session_uuid: String,
     idle_timeout: Duration,
+    metrics: Arc<SessionMetrics>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> std::io::Result<()> {
     let mut session = Session::new();
     let mut correlation = Correlation {
@@ -69,30 +75,97 @@ pub async fn run_connection(
         // see extra CRC bytes as junk bytes on the wire.
         let crc_for_write = session.crc_enabled;
         if let Some(responses) =
-            try_handle_buffered(&mut buf, &mut session, &identity, &bridge, &*clock_src, &mut correlation)
+            process_buffered(&mut buf, &mut session, &identity, &bridge, &*clock_src, &mut correlation).await
         {
             for resp in responses {
                 write_response(&mut stream, &resp, crc_for_write).await?;
+                metrics.record_outbound_frame();
             }
             continue;
         }
         let read_at = Instant::now();
-        let n = match timeout(idle_timeout, stream.read(&mut scratch)).await {
-            Ok(Ok(0)) => {
-                tracing::debug!("client closed after {:?}", read_at.elapsed());
-                return Ok(());
+        let n = tokio::select! {
+            result = timeout(idle_timeout, stream.read(&mut scratch)) => {
+                match result {
+                    Ok(Ok(0)) => {
+                        tracing::debug!("client closed after {:?}", read_at.elapsed());
+                        return Ok(());
+                    }
+                    Ok(Ok(n)) => { metrics.record_inbound_frame(); n }
+                    Ok(Err(e)) => {
+                        tracing::warn!("read error: {e}");
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        tracing::info!("idle timeout {idle_timeout:?}");
+                        return Ok(());
+                    }
+                }
             }
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => {
-                tracing::warn!("read error: {e}");
-                return Err(e);
-            }
-            Err(_) => {
-                tracing::info!("idle timeout {idle_timeout:?}");
+            _ = shutdown.cancelled() => {
+                tracing::debug!("connection terminated by shutdown signal");
                 return Ok(());
             }
         };
         buf.extend_from_slice(&scratch[..n]);
+    }
+}
+
+/// Async version of frame processing.  Decodes one frame from `buf`,
+/// calls `dispatch_prepare`, and — if the command needs the bridge —
+/// executes `bridge.submit` inside `tokio::task::spawn_blocking` so
+/// the async executor is not blocked by the synchronous HTTP call.
+async fn process_buffered(
+    buf: &mut Vec<u8>,
+    session: &mut Session,
+    identity: &Arc<Identity>,
+    bridge: &Arc<dyn Bridge + Send + Sync>,
+    clock_src: &dyn ClockSource,
+    correlation: &mut Correlation,
+) -> Option<Vec<Response>> {
+    if buf.is_empty() {
+        return None;
+    }
+    match decode_frame(buf, session.crc_enabled) {
+        Ok((frame, consumed)) => {
+            buf.drain(..consumed);
+            let (date, time) = clock_src.now();
+            let clock = Clock { date: &date, time: &time };
+            let command = Command::parse(&frame);
+            match dispatch_prepare(session, &command, identity, clock, correlation) {
+                DispatchPrepared::Done(r) => Some(r),
+                DispatchPrepared::NeedsBridge(envelope) => {
+                    let b = Arc::clone(bridge);
+                    let bridge_result = tokio::task::spawn_blocking(move || b.submit(&envelope))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(BridgeError::Transport("spawn_blocking panicked".into()))
+                        });
+                    Some(dispatch_with_result(session, &command, bridge_result, correlation))
+                }
+            }
+        }
+        Err(FrameError::Empty | FrameError::Incomplete) => None,
+        Err(FrameError::MissingStart) => {
+            buf.drain(..1);
+            Some(Vec::new())
+        }
+        Err(FrameError::BadCrc) => {
+            buf.drain(..1);
+            Some(vec![Response::Error(
+                crate::protocol::error_codes::ErrorCode::SoftBadCs,
+            )])
+        }
+        Err(FrameError::NoFrameFound) => {
+            buf.clear();
+            Some(Vec::new())
+        }
+        Err(FrameError::InvalidCmdLen(_)) => {
+            buf.drain(..1);
+            Some(vec![Response::Error(
+                crate::protocol::error_codes::ErrorCode::SoftBlock,
+            )])
+        }
     }
 }
 

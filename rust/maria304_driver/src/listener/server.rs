@@ -15,6 +15,7 @@ use super::exclusion::ConnectionGate;
 use super::session_loop::{run_connection, ClockSource, DEFAULT_IDLE_TIMEOUT};
 
 use crate::bridge::Bridge;
+use crate::observability::SessionMetrics;
 use crate::protocol::{error_codes::ErrorCode, Response};
 use crate::session::dispatcher::Identity;
 
@@ -55,6 +56,7 @@ pub struct FnListener {
     cooldown: Arc<Cooldown>,
     bridge: Arc<dyn Bridge + Send + Sync>,
     clock: Arc<dyn ClockSource>,
+    metrics: Arc<SessionMetrics>,
 }
 
 impl FnListener {
@@ -62,6 +64,7 @@ impl FnListener {
         cfg: ListenerConfig,
         bridge: Arc<dyn Bridge + Send + Sync>,
         clock: Arc<dyn ClockSource>,
+        metrics: Arc<SessionMetrics>,
     ) -> Self {
         let cooldown = Arc::new(Cooldown::new(cfg.cooldown));
         Self {
@@ -70,6 +73,7 @@ impl FnListener {
             cooldown,
             bridge,
             clock,
+            metrics,
         }
     }
 
@@ -79,11 +83,11 @@ impl FnListener {
         Arc::clone(&self.gate)
     }
 
-    /// Spawn the accept loop.  Runs until the listener is dropped.
+    /// Spawn the accept loop.  Runs until cancelled or a fatal I/O error.
     ///
     /// # Errors
     /// Returns if binding fails or the accept loop hits an unrecoverable error.
-    pub async fn serve(self) -> Result<(), ListenerError> {
+    pub async fn serve(self, shutdown: tokio_util::sync::CancellationToken) -> Result<(), ListenerError> {
         let tcp = TcpListener::bind(&self.cfg.bind).await?;
         tracing::info!(
             fn_id = %self.cfg.fiscal_number,
@@ -91,18 +95,29 @@ impl FnListener {
             "maria304 listener bound",
         );
         loop {
-            let (stream, peer) = tcp.accept().await?;
-            let gate = Arc::clone(&self.gate);
-            let cooldown = Arc::clone(&self.cooldown);
-            let bridge = Arc::clone(&self.bridge);
-            let clock = Arc::clone(&self.clock);
-            let identity = Arc::new(self.cfg.identity.clone());
-            let idle = self.cfg.idle_timeout;
+            tokio::select! {
+                accept_res = tcp.accept() => {
+                    let (stream, peer) = accept_res?;
+                    let gate = Arc::clone(&self.gate);
+                    let cooldown = Arc::clone(&self.cooldown);
+                    let bridge = Arc::clone(&self.bridge);
+                    let clock = Arc::clone(&self.clock);
+                    let identity = Arc::new(self.cfg.identity.clone());
+                    let idle = self.cfg.idle_timeout;
+                    let conn_shutdown = shutdown.clone();
 
-            tokio::spawn(async move {
-                handle_incoming(stream, peer, gate, cooldown, bridge, clock, identity, idle).await;
-            });
+                    let metrics = Arc::clone(&self.metrics);
+                    tokio::spawn(async move {
+                        handle_incoming(stream, peer, gate, cooldown, bridge, clock, identity, idle, metrics, conn_shutdown).await;
+                    });
+                }
+                _ = shutdown.cancelled() => {
+                    tracing::info!(fiscal_number = %self.cfg.fiscal_number, "listener shutdown requested");
+                    break;
+                }
+            }
         }
+        Ok(())
     }
 }
 
@@ -134,6 +149,8 @@ async fn handle_incoming(
     clock: Arc<dyn ClockSource>,
     identity: Arc<Identity>,
     idle: Duration,
+    metrics: Arc<SessionMetrics>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     if !cooldown.is_clear() {
         tracing::info!(%peer, "reject: cooldown active");
@@ -151,7 +168,7 @@ async fn handle_incoming(
     let _slot = SlotGuard { gate, cooldown };
     let session_uuid = session_uuid();
     tracing::info!(%peer, uuid = %session_uuid, "session accepted");
-    let run = run_connection(stream, identity, bridge, clock, session_uuid.clone(), idle).await;
+    let run = run_connection(stream, identity, bridge, clock, session_uuid.clone(), idle, metrics, shutdown).await;
     if let Err(e) = &run {
         tracing::warn!(%peer, uuid = %session_uuid, "session ended: {e}");
     } else {

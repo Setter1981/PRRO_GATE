@@ -2,6 +2,8 @@
 
 #[derive(Debug, thiserror::Error)]
 pub enum SidecarError {
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error("not found: {0}")]
@@ -31,6 +33,7 @@ impl axum::response::IntoResponse for SidecarError {
         // contain key-encoding hints, SQL fragments, or file paths.
         tracing::error!(error = %self, "fiscal handler error");
         let (status, msg) = match &self {
+            Self::InvalidInput(m) => (StatusCode::BAD_REQUEST,          m.clone()),
             Self::BadRequest(m)  => (StatusCode::BAD_REQUEST,           m.clone()),
             Self::NotFound(m)    => (StatusCode::NOT_FOUND,             m.clone()),
             Self::License(m)     => (StatusCode::FORBIDDEN,             m.clone()),
