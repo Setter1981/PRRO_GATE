@@ -169,9 +169,20 @@ async fn health_live() -> StatusCode {
 }
 
 async fn health_ready(State(st): State<AppState>) -> StatusCode {
-    match st.repo.load_active_license() {
-        Ok(_)  => StatusCode::OK,
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    // Load the active row, then validate sig + expiry so an expired or
+    // tampered license is caught here rather than on the first fiscal send.
+    // TIN / FN membership is not checked — readiness is per-instance, not
+    // per fiscal-number (those are validated in handle_fiscal_send).
+    let row = match st.repo.load_active_license() {
+        Ok(r)  => r,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE,
+    };
+    let now = time::OffsetDateTime::now_utc();
+    match prro_sidecar::license::verify_signature_only(&row.payload_b64, &row.signature_b64, now) {
+        Ok(prro_sidecar::license::LicenseState::Valid)
+        | Ok(prro_sidecar::license::LicenseState::Grace { .. })
+        | Ok(prro_sidecar::license::LicenseState::Demo  { .. }) => StatusCode::OK,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
