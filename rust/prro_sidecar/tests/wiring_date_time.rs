@@ -285,6 +285,26 @@ mod idempotency {
             other => panic!("expected HardConflict for different business_ts, got {other:?}"),
         }
     }
+
+    #[test]
+    fn pre_r3_pending_row_with_empty_ts_key_returns_duplicate_pending_on_ts_mismatch() {
+        // Migration policy: rows inserted by a pre-R3 sidecar have business_ts_key=''.
+        // A replay from a new sidecar with a different business_ts must NOT give
+        // HardConflict — it returns DuplicatePending (row is still in-flight).
+        // This is the accepted tradeoff: the ambiguity window is bounded by the
+        // cleanup task (120 s → ambiguous), and DPS deduplicates on its side.
+        let repo = make_repo();
+        // Simulate pre-R3 insert: empty ts_key.
+        repo.insert_pending_request("key-pre-r3", "FN001", OP, SHA, "").unwrap();
+
+        let ts_new = "2026-01-01T10:00:00+03:00";
+        match repo.insert_pending_request("key-pre-r3", "FN001", OP, SHA, ts_new).unwrap() {
+            PendingInsertResult::DuplicatePending => {}
+            other => panic!(
+                "pre-R3 pending row with empty ts_key must return DuplicatePending, not {other:?}"
+            ),
+        }
+    }
 }
 
 #[cfg(test)]

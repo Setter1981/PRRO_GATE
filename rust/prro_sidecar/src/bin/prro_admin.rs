@@ -390,8 +390,8 @@ fn print_operator_rows(rows: &[OperatorDisplay]) {
         return;
     }
     println!(
-        "{:<5} {:<14} {:<12} {:<20} {:<6} {}",
-        "ID", "FiscalNum", "INN", "Name", "Active", "JKS (filename)"
+        "{:<5} {:<14} {:<12} {:<20} {:<6} JKS (filename)",
+        "ID", "FiscalNum", "INN", "Name", "Active"
     );
     println!("{}", "-".repeat(80_usize));
     for r in rows {
