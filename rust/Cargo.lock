@@ -1301,10 +1301,12 @@ name = "maria304_driver"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "hex",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",

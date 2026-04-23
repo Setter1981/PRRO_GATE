@@ -12,6 +12,7 @@ use tokio::net::TcpStream;
 use tokio::time::{timeout, Instant};
 
 use crate::bridge::{Bridge, BridgeError};
+use crate::bridge::dto::{classify_response, DocumentOutcome};
 use crate::observability::SessionMetrics;
 use crate::protocol::{Command, Response};
 // NOTE: Command::Cnac is the cancel-receipt command (no bridge call, Done path).
@@ -25,6 +26,7 @@ use crate::wire::{decode_frame, FrameError};
 
 /// Default idle timeout — if the client is silent for this long we
 /// close the socket.  Tunable per plan §config.
+#[allow(clippy::duration_suboptimal_units)]
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Provider for the current clock values (date/time).  Real sessions
@@ -50,6 +52,7 @@ impl ClockSource for FixedClock {
 /// # Errors
 /// I/O errors are propagated.  Protocol-level errors (bad CRC,
 /// malformed frame) are handled in-stream — the loop keeps going.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_connection(
     mut stream: TcpStream,
     identity: Arc<Identity>,
@@ -104,7 +107,7 @@ pub async fn run_connection(
                     }
                 }
             }
-            _ = shutdown.cancelled() => {
+            () = shutdown.cancelled() => {
                 tracing::debug!("connection terminated by shutdown signal");
                 return Ok(());
             }
@@ -151,11 +154,17 @@ async fn process_buffered(
                             Err(BridgeError::Transport("spawn_blocking panicked".into()))
                         });
                     // M6: count bridge errors and receipt outcomes.
+                    // F6: receipts_acked only when DPS confirmed acceptance
+                    // (classify_response returns Accepted), not on any Ok(CanonicalResponse).
                     let is_bridge_ok = bridge_result.is_ok();
                     if !is_bridge_ok {
                         metrics.record_bridge_error();
                     } else if matches!(command, Command::Comp(_)) {
-                        metrics.record_receipt_acked();
+                        if let Ok(ref resp) = bridge_result {
+                            if matches!(classify_response(resp), DocumentOutcome::Accepted { .. }) {
+                                metrics.record_receipt_acked();
+                            }
+                        }
                     }
                     Some(dispatch_with_result(session, &command, bridge_result, correlation))
                 }

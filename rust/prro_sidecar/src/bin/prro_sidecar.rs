@@ -129,8 +129,9 @@ async fn main() {
     }
 
     // C2: cleanup stale 'pending' idempotency rows every 60 s.
-    // Rows older than 120 s represent ambiguous DPS calls (timeout / crash) —
-    // removing them restores the ability to retry after the ambiguity window.
+    // Rows older than 120 s represent in-flight requests with unknown DPS outcome
+    // (timeout / crash).  They are transitioned to 'ambiguous' (not deleted) so
+    // subsequent retries are blocked until ops or reconciliation resolves them.
     {
         let cleanup_repo = Arc::clone(&state.repo);
         tokio::spawn(async move {
@@ -356,8 +357,11 @@ async fn fiscal_send_inner(
     // retry with the same key sees DuplicatePending → 409 instead of allocating
     // a second local_number.  On success the record is promoted to 'accepted'.
     // Stale pending rows (DPS timeout / crash) are cleaned by a background task.
+    let op_type_str = format!("{:?}", cmd.operation_type);
     let pending_key: Option<String> = if !cmd.idempotency_key.is_empty() {
-        match st.repo.insert_pending_request(&cmd.idempotency_key, fn_id)? {
+        match st.repo.insert_pending_request(
+            &cmd.idempotency_key, fn_id, &op_type_str, &cmd.payload_sha256, &cmd.business_ts,
+        )? {
             PendingInsertResult::DuplicateAccepted(json) => {
                 let cached: FiscalSendResponse = serde_json::from_str(&json)
                     .map_err(|e| SidecarError::Internal(format!("idempotency cache parse: {e}")))?;
@@ -367,6 +371,18 @@ async fn fiscal_send_inner(
                 return Err(SidecarError::DuplicateInFlight(
                     cmd.idempotency_key.clone(),
                 ));
+            }
+            // F1: key timed out without confirmed DPS outcome — block new allocation.
+            PendingInsertResult::DuplicateAmbiguous => {
+                return Err(SidecarError::AmbiguousRequest(format!(
+                    "idempotency key {:?} is in ambiguous state (prior request timed out); \
+                     wait for reconciliation or contact support",
+                    cmd.idempotency_key
+                )));
+            }
+            // F2: key reused with different identity — hard conflict.
+            PendingInsertResult::HardConflict(detail) => {
+                return Err(SidecarError::IdempotencyConflict(detail));
             }
             PendingInsertResult::Inserted => Some(cmd.idempotency_key.clone()),
         }
@@ -598,6 +614,7 @@ async fn fiscal_send_inner(
         DpsErrorCategory::Transient => "transient".to_string(),
         DpsErrorCategory::Permanent => "permanent".to_string(),
     });
+    let is_permanent_reject = dps_error_category.as_deref() == Some("permanent");
     let response = FiscalSendResponse {
         status:             resp.status,
         fiscal_id:          resp.id.clone(),
@@ -607,12 +624,27 @@ async fn fiscal_send_inner(
     };
 
     // S4/C2: promote pending → accepted only for DPS-accepted documents (status > 0).
-    // Transient / permanent DPS errors are NOT promoted: the pending row expires via
-    // the background cleanup task, allowing the client to retry after the TTL window.
+    // F3-fix: on permanent DPS reject, transition to 'rejected' immediately so the
+    // operator can re-submit after investigation (rejected allows fresh retry).
+    // Transient errors leave the row pending — it expires to 'ambiguous' via the
+    // background cleanup task, signalling an unknown outcome to the caller.
     if let Some(key) = &pending_key {
         if resp.status > 0 {
             if let Ok(json) = serde_json::to_string(&response) {
-                let _ = st.repo.accept_request(key, &json);
+                match st.repo.accept_request(key, &json) {
+                    Ok(false) => tracing::error!(%key,
+                        "journal state mismatch: DPS accepted but row not in pending state — \
+                         row may have expired to ambiguous; FN requires manual review"),
+                    Err(e) => tracing::error!(%key, %e, "journal accept failed after DPS success"),
+                    Ok(true) => {}
+                }
+            }
+        } else if is_permanent_reject {
+            match st.repo.reject_request(key) {
+                Ok(false) => tracing::warn!(%key,
+                    "journal reject: row not in pending state — already ambiguous or accepted"),
+                Err(e) => tracing::error!(%key, %e, "journal reject failed after permanent DPS error"),
+                Ok(true) => {}
             }
         }
     }

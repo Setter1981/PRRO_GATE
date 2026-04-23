@@ -112,7 +112,7 @@ impl FnListener {
                         handle_incoming(stream, peer, gate, cooldown, bridge, clock, identity, idle, metrics, conn_shutdown).await;
                     });
                 }
-                _ = shutdown.cancelled() => {
+                () = shutdown.cancelled() => {
                     tracing::info!(fiscal_number = %self.cfg.fiscal_number, "listener shutdown requested");
                     break;
                 }

@@ -12,6 +12,8 @@
 //! defensive `SOFTBLOCK` for now — M4/M5/M7 replace those arms with
 //! real handlers.
 
+use sha2::{Digest, Sha256};
+
 use crate::bridge::{
     Bridge, BridgeError, CanonicalCommand, CanonicalResponse, CommandType, RawFrame,
     ReceiptDirection, ReceiptPayload,
@@ -67,10 +69,10 @@ pub struct Clock<'a> {
 }
 
 /// Session-level correlation bits used to build
-/// [`CanonicalCommand::idempotency_key`].  M6 will populate
-/// `session_uuid` per TCP connection; `receipt_seq` monotonically
-/// increments per closed receipt so two replays of the same COMP
-/// share the same idempotency key.
+/// [`CanonicalCommand::idempotency_key`].  `session_uuid` is assigned per
+/// TCP connection; `receipt_seq` increments per closed receipt and is used
+/// for session-local keys (ZREP/NREP).  Fiscal receipt keys (COMP) use a
+/// content-stable hash of the deduped payload, so they survive TCP reconnects.
 #[derive(Debug, Clone)]
 pub struct Correlation {
     pub session_uuid: String,
@@ -278,7 +280,7 @@ pub fn dispatch(
             // is mapped to the corresponding `SOFT*` wire code and
             // the receipt stays open so the caller can retry or CANC.
             append_receipt_frame(session, "COMP", body.clone());
-            let envelope = build_canonical(session, identity, correlation);
+            let envelope = build_canonical(session, identity);
             match bridge.submit(&envelope) {
                 Ok(resp) => match classify_response(&resp) {
                     DocumentOutcome::Accepted { fiscal_id, sale, ret } => {
@@ -566,12 +568,39 @@ fn map_bridge_error(err: &BridgeError) -> ErrorCode {
     }
 }
 
+/// Content-stable fingerprint for a receipt payload.
+///
+/// `build_canonical` passes a payload whose COMP frames have already been
+/// deduplicated to exactly one, so this function hashes the full payload as-is.
+/// Including the COMP body is intentional — the COMP frame may carry payment totals
+/// that distinguish two receipts with the same goods lines but different payment.
+fn receipt_fingerprint(payload: &ReceiptPayload) -> String {
+    let bytes = serde_json::to_vec(payload).unwrap_or_default();
+    hex::encode(Sha256::digest(&bytes))
+}
+
+/// Content-stable fingerprint for report-type commands with non-empty bodies.
+///
+/// F2-fix: FIRN/IREN/FIRP/IREP carry date-range bodies; CAIOI/CAIOO carry amounts.
+/// These bodies are unique per distinct fiscal operation, so sha256(opcode + NUL + body)
+/// is safe as an idempotency key and survives TCP reconnects.
+///
+/// Zero-body reports (ZREP, NREP, nrep) are NOT handled here — consecutive reports
+/// of the same type on an empty shift would collide on a pure content hash.  Those
+/// callers fall back to the session-local key.  DPS provides last-resort protection
+/// for the reconnect case (e.g. shift-close is rejected by DPS if already closed).
+fn report_fingerprint(opcode: &str, body: &str) -> String {
+    let mut bytes = opcode.as_bytes().to_vec();
+    bytes.push(0u8);
+    bytes.extend_from_slice(body.as_bytes());
+    hex::encode(Sha256::digest(&bytes))
+}
+
 fn build_canonical(
     session: &Session,
     identity: &Identity,
-    correlation: &Correlation,
 ) -> CanonicalCommand {
-    let (department, return_check_number, direction, raw_frames, dual_tax_mode, totals) =
+    let (department, return_check_number, direction, raw_frames_orig, dual_tax_mode, totals) =
         match session.state {
             SessionState::ReceiptOpen(ref r) => (
                 Some(r.department.clone()),
@@ -587,7 +616,25 @@ fn build_canonical(
     // withdrawal (per Maria 304 protocol §54 — always its own receipt).
     // Override Sell/Return with CashWithdrawal so the Python adapter
     // selects the correct canonical operation path.
-    let has_cshg = raw_frames.iter().any(|f| f.opcode == "CSHG");
+    let has_cshg = raw_frames_orig.iter().any(|f| f.opcode == "CSHG");
+    // F1-fix: deduplicate COMP frames — keep only the first.
+    // dispatch() appends COMP to raw_frames before every send; after a bridge
+    // failure the receipt stays open and the next retry appends a second COMP.
+    // Sending [FISC, COMP, COMP] would bind the idempotency key to a different
+    // payload_sha256 than the first attempt, triggering HardConflict in the sidecar.
+    let mut seen_comp = false;
+    let raw_frames: Vec<_> = raw_frames_orig
+        .into_iter()
+        .filter(|f| {
+            if f.opcode == "COMP" {
+                if seen_comp {
+                    return false;
+                }
+                seen_comp = true;
+            }
+            true
+        })
+        .collect();
     let payload = ReceiptPayload {
         direction,
         goods: Vec::new(),
@@ -608,10 +655,10 @@ fn build_canonical(
         schema_version: "1.0".to_string(),
         fiscal_number: identity.fiscal_number.clone(),
         command_type,
-        idempotency_key: format!(
-            "maria304:{}:{}:{}",
-            identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq,
-        ),
+        // F3: content-stable key (hash of payload) so TCP reconnects don't generate
+        // a new key for the same receipt, preventing bypass of the sidecar's
+        // idempotency journal.
+        idempotency_key: format!("maria304:{}:{}", identity.fiscal_number, receipt_fingerprint(&payload)),
         cashier_id: session.cashier_id.clone(),
         department,
         return_check_number,
@@ -635,21 +682,31 @@ fn submit_report(
     opcode: &str,
     body: String,
 ) -> Vec<Response> {
+    // F2-fix: compute key BEFORE body is moved into the payload.
+    // Content-stable for non-empty bodies (FIRN/IREN/FIRP/IREP/CAIOI/CAIOO);
+    // session-local fallback for zero-body commands (ZREP/NREP/nrep) — see
+    // report_fingerprint doc for the rationale.
+    let idempotency_key = if body.is_empty() {
+        format!(
+            "maria304:{}:{}:{}:{}",
+            identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq, opcode,
+        )
+    } else {
+        format!("maria304:{}:{}", identity.fiscal_number, report_fingerprint(opcode, &body))
+    };
+    let report_payload = ReceiptPayload {
+        raw_frames: vec![RawFrame { opcode: opcode.to_string(), body }],
+        ..Default::default()
+    };
     let envelope = CanonicalCommand {
         schema_version: "1.0".to_string(),
         fiscal_number: identity.fiscal_number.clone(),
         command_type,
-        idempotency_key: format!(
-            "maria304:{}:{}:{}:{}",
-            identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq, opcode,
-        ),
+        idempotency_key,
         cashier_id: session.cashier_id.clone(),
         department: None,
         return_check_number: None,
-        payload: ReceiptPayload {
-            raw_frames: vec![RawFrame { opcode: opcode.to_string(), body }],
-            ..Default::default()
-        },
+        payload: report_payload,
     };
     match bridge.submit(&envelope) {
         Ok(resp) if resp.ok => {
@@ -735,6 +792,7 @@ fn err(code: ErrorCode) -> Vec<Response> {
 /// Result of [`dispatch_prepare`]: either fully computed responses, or a
 /// canonical envelope that must be submitted to the bridge.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum DispatchPrepared {
     /// All processing complete — send these responses.
     Done(Vec<Response>),
@@ -766,7 +824,7 @@ pub fn dispatch_prepare(
                 return DispatchPrepared::Done(err(ErrorCode::SoftNoDoc));
             }
             append_receipt_frame(session, "COMP", body.clone());
-            DispatchPrepared::NeedsBridge(build_canonical(session, identity, correlation))
+            DispatchPrepared::NeedsBridge(build_canonical(session, identity))
         }
         Command::Zrep => DispatchPrepared::NeedsBridge(
             build_report_envelope(session, identity, correlation, CommandType::XReport, "ZREP", String::new()),
@@ -853,6 +911,10 @@ pub fn dispatch_prepare(
 ///
 /// Must only be called when [`dispatch_prepare`] returned
 /// [`DispatchPrepared::NeedsBridge`] for the same `command`.
+///
+/// # Panics
+/// Panics if the `COMP` wire payload is not exactly 94 bytes (data-contract
+/// invariant checked at call-site via `.expect`).
 pub fn dispatch_with_result(
     session: &mut Session,
     command: &Command,
@@ -903,6 +965,10 @@ pub fn dispatch_with_result(
 }
 
 /// Build a report-type canonical envelope without calling the bridge.
+///
+/// # Panics
+/// Panics if the internal mutex of a test `MockBridge` is poisoned (only
+/// relevant in single-threaded test contexts; unreachable in production).
 fn build_report_envelope(
     session: &Session,
     identity: &Identity,
@@ -911,14 +977,22 @@ fn build_report_envelope(
     opcode: &str,
     body: String,
 ) -> CanonicalCommand {
+    // F2-fix: compute key BEFORE body is moved into the payload — same strategy
+    // as submit_report: content-stable for non-empty bodies, session-local fallback
+    // for zero-body reports (ZREP/NREP/nrep).
+    let idempotency_key = if body.is_empty() {
+        format!(
+            "maria304:{}:{}:{}:{}",
+            identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq, opcode,
+        )
+    } else {
+        format!("maria304:{}:{}", identity.fiscal_number, report_fingerprint(opcode, &body))
+    };
     CanonicalCommand {
         schema_version: "1.0".to_string(),
         fiscal_number: identity.fiscal_number.clone(),
         command_type,
-        idempotency_key: format!(
-            "maria304:{}:{}:{}:{}",
-            identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq, opcode,
-        ),
+        idempotency_key,
         cashier_id: session.cashier_id.clone(),
         department: None,
         return_check_number: None,
