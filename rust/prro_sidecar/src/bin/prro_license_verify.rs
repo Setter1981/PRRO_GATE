@@ -66,7 +66,7 @@ fn main() {
     let state = license::verify(payload_b64, signature_b64, &cli.fn_, &cli.tin, now)
         .unwrap_or_else(|e| { eprintln!("verify error: {e}"); std::process::exit(2); });
 
-    let tier_str = serde_json::to_value(&payload.tier).unwrap()
+    let tier_str = serde_json::to_value(payload.tier.clone()).unwrap()
         .as_str().unwrap_or("unknown").to_string();
 
     let (output, exit_code) = match &state {

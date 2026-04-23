@@ -90,7 +90,7 @@ fn jcs_serialize(val: &Value) -> String {
         Value::Object(map) => {
             let mut pairs: Vec<(&str, &Value)> =
                 map.iter().map(|(k, v)| (k.as_str(), v)).collect();
-            pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+            pairs.sort_by_key(|(a, _)| *a);
             let items: Vec<String> = pairs
                 .iter()
                 .map(|(k, v)| {
@@ -377,7 +377,7 @@ mod tests {
         let now     = datetime!(2026-04-19 12:00:00 UTC);    // 13d before expiry
         let state   = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
         assert!(
-            matches!(state, LicenseState::Grace { days_left } if days_left >= 12 && days_left <= 13),
+            matches!(state, LicenseState::Grace { days_left } if (12..=13).contains(&days_left)),
             "expected Grace(12..13), got {state:?}"
         );
     }
@@ -605,7 +605,7 @@ mod tests {
         let payload = pro_payload("2027-04-19T00:00:00Z");
         let p_b64   = B64.encode(payload.to_canonical_bytes());
         // 32 bytes (half a signature) — wrong length
-        let short_sig = B64.encode(&[0xAB_u8; 32]);
+        let short_sig = B64.encode([0xAB_u8; 32]);
         let state = verify_inner(&p_b64, &short_sig, None, None,
                                   datetime!(2026-04-19 12:00:00 UTC), &[&pub_k])
             .unwrap();

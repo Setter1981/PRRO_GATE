@@ -103,11 +103,11 @@ impl CanonicalCommand {
         self.payload
             .pointer("/receipt/payments")
             .and_then(|v| v.as_array())
-            .map_or(false, |payments| {
+            .is_some_and(|payments| {
                 payments.iter().any(|p| {
                     p.get("rrn")
                         .and_then(|r| r.as_str())
-                        .map_or(false, |s| !s.is_empty())
+                        .is_some_and(|s| !s.is_empty())
                 })
             })
     }

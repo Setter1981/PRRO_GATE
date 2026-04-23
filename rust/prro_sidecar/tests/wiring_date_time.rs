@@ -183,16 +183,16 @@ mod idempotency {
     #[test]
     fn fresh_key_returns_inserted() {
         let repo = make_repo();
-        let r = repo.insert_pending_request("key-1", "FN001", OP, SHA).unwrap();
+        let r = repo.insert_pending_request("key-1", "FN001", OP, SHA, "").unwrap();
         assert!(matches!(r, PendingInsertResult::Inserted));
     }
 
     #[test]
     fn accepted_key_returns_cached_json() {
         let repo = make_repo();
-        repo.insert_pending_request("key-1", "FN001", OP, SHA).unwrap();
+        repo.insert_pending_request("key-1", "FN001", OP, SHA, "").unwrap();
         repo.accept_request("key-1", r#"{"status":1}"#).unwrap();
-        match repo.insert_pending_request("key-1", "FN001", OP, SHA).unwrap() {
+        match repo.insert_pending_request("key-1", "FN001", OP, SHA, "").unwrap() {
             PendingInsertResult::DuplicateAccepted(json) => {
                 assert_eq!(json, r#"{"status":1}"#);
             }
@@ -203,9 +203,9 @@ mod idempotency {
     #[test]
     fn different_key_returns_inserted() {
         let repo = make_repo();
-        repo.insert_pending_request("key-A", "FN001", OP, SHA).unwrap();
+        repo.insert_pending_request("key-A", "FN001", OP, SHA, "").unwrap();
         repo.accept_request("key-A", r#"{"status":1}"#).unwrap();
-        let r = repo.insert_pending_request("key-B", "FN001", OP, SHA).unwrap();
+        let r = repo.insert_pending_request("key-B", "FN001", OP, SHA, "").unwrap();
         assert!(matches!(r, PendingInsertResult::Inserted));
     }
 
@@ -226,11 +226,11 @@ mod idempotency {
         let repo = make_repo();
 
         // Insert with empty identity (simulates pre-F2 row after migration).
-        repo.insert_pending_request("legacy-key", "FN001", "", "").unwrap();
+        repo.insert_pending_request("legacy-key", "FN001", "", "", "").unwrap();
         repo.accept_request("legacy-key", r#"{"status":99}"#).unwrap();
 
-        // Replay with real op/sha — must return cached response, NOT HardConflict.
-        match repo.insert_pending_request("legacy-key", "FN001", "SELL", SHA).unwrap() {
+        // Replay with real op/sha/ts — must return cached response, NOT HardConflict.
+        match repo.insert_pending_request("legacy-key", "FN001", "SELL", SHA, "2026-01-01T10:00:00+03:00").unwrap() {
             PendingInsertResult::DuplicateAccepted(json) => {
                 assert_eq!(json, r#"{"status":99}"#);
             }
@@ -245,12 +245,12 @@ mod idempotency {
         // attacker could retrieve a cached response by reusing a known accepted key
         // with different content.
         let repo = make_repo();
-        repo.insert_pending_request("bound-key", "FN001", OP, SHA).unwrap();
+        repo.insert_pending_request("bound-key", "FN001", OP, SHA, "").unwrap();
         repo.accept_request("bound-key", r#"{"status":1}"#).unwrap();
 
         // Different sha — must give HardConflict, not DuplicateAccepted.
         let other_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        match repo.insert_pending_request("bound-key", "FN001", OP, other_sha).unwrap() {
+        match repo.insert_pending_request("bound-key", "FN001", OP, other_sha, "").unwrap() {
             PendingInsertResult::HardConflict(_) => {}
             other => panic!("expected HardConflict for bound accepted with wrong sha, got {other:?}"),
         }
@@ -261,34 +261,26 @@ mod idempotency {
         // F3-fix: permanent DPS errors mark the row 'rejected', which allows a
         // fresh retry (unlike 'ambiguous' which blocks until reconciliation).
         let repo = make_repo();
-        repo.insert_pending_request("key-perm", "FN001", OP, SHA).unwrap();
+        repo.insert_pending_request("key-perm", "FN001", OP, SHA, "").unwrap();
         repo.reject_request("key-perm").unwrap();
 
         // After rejection, a fresh insert with same identity must succeed.
-        let r = repo.insert_pending_request("key-perm", "FN001", OP, SHA).unwrap();
+        let r = repo.insert_pending_request("key-perm", "FN001", OP, SHA, "").unwrap();
         assert!(matches!(r, PendingInsertResult::Inserted),
             "rejected row must allow fresh retry, got {r:?}");
     }
 
     #[test]
     fn same_payload_different_business_ts_gives_hard_conflict() {
-        // Round-3 finding: business_ts is fiscally significant — it drives
-        // Check.date_time in the signed XML.  The call site in prro_sidecar.rs
-        // binds the identity key to sha256(payload_sha256 || "|" || business_ts).
-        // Simulate that here to verify HardConflict is triggered on ts mismatch.
-        use sha2::{Digest, Sha256};
+        // R3: business_ts is stored in a dedicated column (business_ts_key).
+        // Same key + same payload + different business_ts must give HardConflict.
         let repo = make_repo();
-        let base_sha = SHA;
-        let hash_ts1 = hex::encode(Sha256::digest(
-            format!("{base_sha}|2026-01-01T10:00:00+03:00"),
-        ));
-        let hash_ts2 = hex::encode(Sha256::digest(
-            format!("{base_sha}|2026-01-02T10:00:00+03:00"),
-        ));
-        repo.insert_pending_request("key-ts", "FN001", OP, &hash_ts1).unwrap();
+        let ts1 = "2026-01-01T10:00:00+03:00";
+        let ts2 = "2026-01-02T10:00:00+03:00";
+        repo.insert_pending_request("key-ts", "FN001", OP, SHA, ts1).unwrap();
         repo.accept_request("key-ts", r#"{"status":1}"#).unwrap();
 
-        match repo.insert_pending_request("key-ts", "FN001", OP, &hash_ts2).unwrap() {
+        match repo.insert_pending_request("key-ts", "FN001", OP, SHA, ts2).unwrap() {
             PendingInsertResult::HardConflict(_) => {}
             other => panic!("expected HardConflict for different business_ts, got {other:?}"),
         }

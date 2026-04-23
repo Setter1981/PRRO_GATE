@@ -163,6 +163,7 @@ fn resolve_jks_password(cli_value: Option<String>, operator_inn: &str) -> String
 
 // ── register-fn ───────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_register_fn(
     conn:            &Connection,
     fiscal_number:   &str,
@@ -392,7 +393,7 @@ fn print_operator_rows(rows: &[OperatorDisplay]) {
         "{:<5} {:<14} {:<12} {:<20} {:<6} {}",
         "ID", "FiscalNum", "INN", "Name", "Active", "JKS (filename)"
     );
-    println!("{}", "-".repeat(80));
+    println!("{}", "-".repeat(80_usize));
     for r in rows {
         // Show only the filename to avoid leaking key storage layout.
         let jks_display = std::path::Path::new(&r.jks_path)

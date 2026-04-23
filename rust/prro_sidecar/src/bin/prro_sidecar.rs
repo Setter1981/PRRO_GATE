@@ -358,20 +358,9 @@ async fn fiscal_send_inner(
     // a second local_number.  On success the record is promoted to 'accepted'.
     // Stale pending rows (DPS timeout / crash) are cleaned by a background task.
     let op_type_str = format!("{:?}", cmd.operation_type);
-    // business_ts drives Check.date_time in the signed XML (fiscally significant).
-    // Bind identity to sha256(payload_sha256 || "|" || business_ts) so a replay
-    // with the same payload but a shifted timestamp is treated as a conflict.
-    let content_identity = {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(cmd.payload_sha256.as_bytes());
-        h.update(b"|");
-        h.update(cmd.business_ts.as_bytes());
-        hex::encode(h.finalize())
-    };
     let pending_key: Option<String> = if !cmd.idempotency_key.is_empty() {
         match st.repo.insert_pending_request(
-            &cmd.idempotency_key, fn_id, &op_type_str, &content_identity,
+            &cmd.idempotency_key, fn_id, &op_type_str, &cmd.payload_sha256, &cmd.business_ts,
         )? {
             PendingInsertResult::DuplicateAccepted(json) => {
                 let cached: FiscalSendResponse = serde_json::from_str(&json)
@@ -642,13 +631,20 @@ async fn fiscal_send_inner(
     if let Some(key) = &pending_key {
         if resp.status > 0 {
             if let Ok(json) = serde_json::to_string(&response) {
-                if let Err(e) = st.repo.accept_request(key, &json) {
-                    tracing::warn!(%key, %e, "journal accept failed after DPS success");
+                match st.repo.accept_request(key, &json) {
+                    Ok(false) => tracing::error!(%key,
+                        "journal state mismatch: DPS accepted but row not in pending state — \
+                         row may have expired to ambiguous; FN requires manual review"),
+                    Err(e) => tracing::error!(%key, %e, "journal accept failed after DPS success"),
+                    Ok(true) => {}
                 }
             }
         } else if is_permanent_reject {
-            if let Err(e) = st.repo.reject_request(key) {
-                tracing::warn!(%key, %e, "journal reject failed after permanent DPS error");
+            match st.repo.reject_request(key) {
+                Ok(false) => tracing::warn!(%key,
+                    "journal reject: row not in pending state — already ambiguous or accepted"),
+                Err(e) => tracing::error!(%key, %e, "journal reject failed after permanent DPS error"),
+                Ok(true) => {}
             }
         }
     }

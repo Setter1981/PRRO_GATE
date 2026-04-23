@@ -227,11 +227,13 @@ impl Repo {
              -- status: 'pending' (in-flight), 'accepted' (DPS acked), 'rejected' (DPS rejected),
              --         'ambiguous' (F1: timed-out, outcome unknown — must not retry blindly).
              -- F2: operation_type_key + payload_sha256_key bind the key to a specific identity.
+             -- R3: business_ts_key added — business_ts drives Check.date_time in signed XML.
              CREATE TABLE IF NOT EXISTS sidecar_requests (
                  idempotency_key    TEXT    PRIMARY KEY,
                  fiscal_number      TEXT    NOT NULL,
                  operation_type_key TEXT    NOT NULL DEFAULT '',
                  payload_sha256_key TEXT    NOT NULL DEFAULT '',
+                 business_ts_key    TEXT    NOT NULL DEFAULT '',
                  status             TEXT    NOT NULL DEFAULT 'pending'
                                     CHECK (status IN ('pending','accepted','rejected','ambiguous')),
                  response_json      TEXT    NOT NULL DEFAULT '',
@@ -281,6 +283,12 @@ impl Repo {
         ).ok();
         conn.execute_batch(
             "ALTER TABLE sidecar_requests ADD COLUMN payload_sha256_key TEXT NOT NULL DEFAULT '';",
+        ).ok();
+        // R3: business_ts is fiscally significant (drives Check.date_time in signed XML).
+        // Empty business_ts_key means a pre-R3 row; those skip the ts identity check
+        // for backward compat (same pattern as empty op/sha in F4-fix).
+        conn.execute_batch(
+            "ALTER TABLE sidecar_requests ADD COLUMN business_ts_key TEXT NOT NULL DEFAULT '';",
         ).ok();
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -591,31 +599,33 @@ impl Repo {
     /// Must be called inside the per-FN lock so a concurrent request for the same FN
     /// sees the pending row and returns 409 instead of allocating another local_number.
     ///
-    /// `operation_type` and `payload_sha256` (in practice the call site passes
-    /// `sha256(payload_sha256 || "|" || business_ts)` so the timestamp is also
-    /// bound) are stored as the content identity on first insert.
-    /// Subsequent calls with the same key but different identity return `HardConflict`.
+    /// `operation_type`, `payload_sha256`, and `business_ts` are bound to the key
+    /// on first insert.  `business_ts` is stored in a dedicated column so existing
+    /// rows with `business_ts_key = ''` (pre-R3 deployments) skip the ts check —
+    /// backward-compat migration path identical to the F4-fix for empty op/sha.
     ///
     /// Returns:
     /// - `Inserted`            — fresh key; proceed with the request.
     /// - `DuplicatePending`    — key already in-flight; caller should return 409.
     /// - `DuplicateAccepted`   — key already accepted; caller should return cached response.
     /// - `DuplicateAmbiguous`  — F1: key timed out without confirmed DPS outcome.
-    /// - `HardConflict`        — F2: same key, different identity — reject hard.
+    /// - `HardConflict`        — F2/R3: same key, different identity — reject hard.
     pub fn insert_pending_request(
         &self,
         key: &str,
         fiscal_number: &str,
         operation_type: &str,
         payload_sha256: &str,
+        business_ts: &str,
     ) -> Result<PendingInsertResult, SidecarError> {
         let conn = self.lock()?;
-        let existing: Option<(String, String, String, String, String)> = conn
+        let existing: Option<(String, String, String, String, String, String)> = conn
             .query_row(
-                "SELECT status, response_json, fiscal_number, operation_type_key, payload_sha256_key
+                "SELECT status, response_json, fiscal_number,
+                         operation_type_key, payload_sha256_key, business_ts_key
                  FROM sidecar_requests WHERE idempotency_key = ?1",
                 rusqlite::params![key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()
             .map_err(SidecarError::Db)?;
@@ -625,13 +635,13 @@ impl Repo {
                 conn.execute(
                     "INSERT INTO sidecar_requests
                          (idempotency_key, fiscal_number, operation_type_key,
-                          payload_sha256_key, status, response_json)
-                     VALUES (?1, ?2, ?3, ?4, 'pending', '')",
-                    rusqlite::params![key, fiscal_number, operation_type, payload_sha256],
+                          payload_sha256_key, business_ts_key, status, response_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'pending', '')",
+                    rusqlite::params![key, fiscal_number, operation_type, payload_sha256, business_ts],
                 )?;
                 Ok(PendingInsertResult::Inserted)
             }
-            Some((ref s, ref json, ref fn_k, ref op_k, ref sha_k)) => {
+            Some((ref s, ref json, ref fn_k, ref op_k, ref sha_k, ref ts_k)) => {
                 if s == "accepted" {
                     // F4-fix: pre-migration rows have empty identity columns (op='', sha='').
                     // Bypass identity check only for those legacy rows (same FN, empty binding).
@@ -641,10 +651,16 @@ impl Repo {
                     if is_legacy {
                         return Ok(PendingInsertResult::DuplicateAccepted(json.clone()));
                     }
-                    // Bound accepted row — verify identity.
+                    // Bound accepted row — verify full identity (fn + op + sha).
                     if fn_k != fiscal_number || op_k != operation_type || sha_k != payload_sha256 {
                         return Ok(PendingInsertResult::HardConflict(format!(
                             "key {key:?} already bound to fn={fn_k:?} op={op_k:?} sha256={sha_k:?}"
+                        )));
+                    }
+                    // R3: ts_k == '' means pre-R3 row; skip ts check for backward compat.
+                    if !ts_k.is_empty() && ts_k != business_ts {
+                        return Ok(PendingInsertResult::HardConflict(format!(
+                            "key {key:?} already bound to business_ts={ts_k:?}"
                         )));
                     }
                     return Ok(PendingInsertResult::DuplicateAccepted(json.clone()));
@@ -653,6 +669,12 @@ impl Repo {
                 if fn_k != fiscal_number || op_k != operation_type || sha_k != payload_sha256 {
                     return Ok(PendingInsertResult::HardConflict(format!(
                         "key {key:?} already bound to fn={fn_k:?} op={op_k:?} sha256={sha_k:?}"
+                    )));
+                }
+                // R3: ts check for non-accepted rows (skip if pre-R3 empty ts).
+                if !ts_k.is_empty() && ts_k != business_ts {
+                    return Ok(PendingInsertResult::HardConflict(format!(
+                        "key {key:?} already bound to business_ts={ts_k:?}"
                     )));
                 }
                 match s.as_str() {
@@ -668,9 +690,9 @@ impl Repo {
                         conn.execute(
                             "INSERT INTO sidecar_requests
                                  (idempotency_key, fiscal_number, operation_type_key,
-                                  payload_sha256_key, status, response_json)
-                             VALUES (?1, ?2, ?3, ?4, 'pending', '')",
-                            rusqlite::params![key, fiscal_number, operation_type, payload_sha256],
+                                  payload_sha256_key, business_ts_key, status, response_json)
+                             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', '')",
+                            rusqlite::params![key, fiscal_number, operation_type, payload_sha256, business_ts],
                         )?;
                         Ok(PendingInsertResult::Inserted)
                     }
@@ -681,17 +703,18 @@ impl Repo {
 
     /// S4/C2: Transition a pending record to 'accepted' and store the response JSON.
     /// Called after a successful DPS submission (status > 0).
-    pub fn accept_request(&self, key: &str, response_json: &str) -> Result<(), SidecarError> {
+    /// Returns `Ok(true)` if the row was in `pending` state and transitioned to
+    /// `accepted`.  Returns `Ok(false)` if no pending row was found (it may have
+    /// expired to `ambiguous` before the DPS response arrived).  Callers should
+    /// treat `Ok(false)` as a journal state mismatch requiring manual review.
+    pub fn accept_request(&self, key: &str, response_json: &str) -> Result<bool, SidecarError> {
         let conn = self.lock()?;
         let n = conn.execute(
             "UPDATE sidecar_requests SET status = 'accepted', response_json = ?2
              WHERE idempotency_key = ?1 AND status = 'pending'",
             rusqlite::params![key, response_json],
         )?;
-        if n == 0 {
-            tracing::warn!(%key, "accept_request: row not in pending state — may have expired to ambiguous before DPS response arrived");
-        }
-        Ok(())
+        Ok(n > 0)
     }
 
     /// F3-fix: Transition a pending record to 'rejected' for permanent DPS errors.
@@ -699,17 +722,16 @@ impl Repo {
     /// Unlike 'ambiguous' (unknown outcome), 'rejected' means the document was
     /// definitively refused by DPS.  The sidecar journal allows a fresh retry on a
     /// 'rejected' row so the operator can re-submit after investigating the cause.
-    pub fn reject_request(&self, key: &str) -> Result<(), SidecarError> {
+    /// Returns `Ok(true)` if the row transitioned to `rejected`.
+    /// Returns `Ok(false)` if the row was not in `pending` state.
+    pub fn reject_request(&self, key: &str) -> Result<bool, SidecarError> {
         let conn = self.lock()?;
         let n = conn.execute(
             "UPDATE sidecar_requests SET status = 'rejected'
              WHERE idempotency_key = ?1 AND status = 'pending'",
             rusqlite::params![key],
         )?;
-        if n == 0 {
-            tracing::warn!(%key, "reject_request: row not in pending state — already ambiguous or accepted");
-        }
-        Ok(())
+        Ok(n > 0)
     }
 
     /// C2/F1: Transition stale pending records to 'ambiguous' status.
@@ -851,6 +873,7 @@ mod tests {
                  fiscal_number      TEXT    NOT NULL,
                  operation_type_key TEXT    NOT NULL DEFAULT '',
                  payload_sha256_key TEXT    NOT NULL DEFAULT '',
+                 business_ts_key    TEXT    NOT NULL DEFAULT '',
                  status             TEXT    NOT NULL DEFAULT 'pending'
                                     CHECK (status IN ('pending','accepted','rejected','ambiguous')),
                  response_json      TEXT    NOT NULL DEFAULT '',
@@ -1694,25 +1717,25 @@ mod tests {
     #[test]
     fn insert_pending_fresh_key_returns_inserted() {
         let repo = make_repo();
-        let r = repo.insert_pending_request("key1", "FN001", OP, SHA).unwrap();
+        let r = repo.insert_pending_request("key1", "FN001", OP, SHA, "").unwrap();
         assert!(matches!(r, PendingInsertResult::Inserted));
     }
 
     #[test]
     fn insert_pending_same_key_returns_duplicate_pending() {
         let repo = make_repo();
-        repo.insert_pending_request("key1", "FN001", OP, SHA).unwrap();
-        let r = repo.insert_pending_request("key1", "FN001", OP, SHA).unwrap();
+        repo.insert_pending_request("key1", "FN001", OP, SHA, "").unwrap();
+        let r = repo.insert_pending_request("key1", "FN001", OP, SHA, "").unwrap();
         assert!(matches!(r, PendingInsertResult::DuplicatePending));
     }
 
     #[test]
     fn accept_request_then_replay_returns_cached_json() {
         let repo = make_repo();
-        repo.insert_pending_request("key1", "FN001", OP, SHA).unwrap();
+        repo.insert_pending_request("key1", "FN001", OP, SHA, "").unwrap();
         repo.accept_request("key1", r#"{"status":1}"#).unwrap();
 
-        let r = repo.insert_pending_request("key1", "FN001", OP, SHA).unwrap();
+        let r = repo.insert_pending_request("key1", "FN001", OP, SHA, "").unwrap();
         match r {
             PendingInsertResult::DuplicateAccepted(json) => {
                 assert_eq!(json, r#"{"status":1}"#);
@@ -1725,7 +1748,7 @@ mod tests {
     fn cleanup_stale_pending_transitions_to_ambiguous() {
         let repo = make_repo();
         // Insert row and immediately backdate it past the cleanup window.
-        repo.insert_pending_request("stale_key", "FN001", OP, SHA).unwrap();
+        repo.insert_pending_request("stale_key", "FN001", OP, SHA, "").unwrap();
         {
             let conn = repo.conn.lock().unwrap();
             conn.execute(
@@ -1735,18 +1758,18 @@ mod tests {
             ).unwrap();
         }
         // Fresh key should NOT be affected.
-        repo.insert_pending_request("fresh_key", "FN001", OP, SHA).unwrap();
+        repo.insert_pending_request("fresh_key", "FN001", OP, SHA, "").unwrap();
 
         let updated = repo.cleanup_stale_pending(120).unwrap();
         assert_eq!(updated, 1, "only the stale row should be transitioned");
 
         // F1: stale key is now ambiguous, not deleted.
-        let r = repo.insert_pending_request("stale_key", "FN001", OP, SHA).unwrap();
+        let r = repo.insert_pending_request("stale_key", "FN001", OP, SHA, "").unwrap();
         assert!(matches!(r, PendingInsertResult::DuplicateAmbiguous),
             "stale key must return DuplicateAmbiguous after cleanup, got {r:?}");
 
         // fresh_key still pending
-        let r2 = repo.insert_pending_request("fresh_key", "FN001", OP, SHA).unwrap();
+        let r2 = repo.insert_pending_request("fresh_key", "FN001", OP, SHA, "").unwrap();
         assert!(matches!(r2, PendingInsertResult::DuplicatePending));
     }
 
@@ -1765,7 +1788,7 @@ mod tests {
             ).unwrap();
         }
         // A new insert_pending should succeed (rejected → allow retry).
-        let r = repo.insert_pending_request("key1", "FN001", "SELL", "aaaaaa").unwrap();
+        let r = repo.insert_pending_request("key1", "FN001", "SELL", "aaaaaa", "").unwrap();
         assert!(matches!(r, PendingInsertResult::Inserted));
     }
 
@@ -1773,11 +1796,11 @@ mod tests {
     #[test]
     fn insert_pending_different_identity_returns_hard_conflict() {
         let repo = make_repo();
-        repo.insert_pending_request("key1", "FN001", "SELL", SHA).unwrap();
-        let r = repo.insert_pending_request("key1", "FN002", "SELL", SHA).unwrap();
+        repo.insert_pending_request("key1", "FN001", "SELL", SHA, "").unwrap();
+        let r = repo.insert_pending_request("key1", "FN002", "SELL", SHA, "").unwrap();
         assert!(matches!(r, PendingInsertResult::HardConflict(_)),
             "different fiscal_number must return HardConflict, got {r:?}");
-        let r2 = repo.insert_pending_request("key1", "FN001", "RETURN", SHA).unwrap();
+        let r2 = repo.insert_pending_request("key1", "FN001", "RETURN", SHA, "").unwrap();
         assert!(matches!(r2, PendingInsertResult::HardConflict(_)),
             "different operation_type must return HardConflict, got {r2:?}");
     }
@@ -1796,7 +1819,7 @@ mod tests {
                 [],
             ).unwrap();
         }
-        let r = repo.insert_pending_request("key1", "FN001", "SELL", "aaaaaa").unwrap();
+        let r = repo.insert_pending_request("key1", "FN001", "SELL", "aaaaaa", "").unwrap();
         assert!(matches!(r, PendingInsertResult::DuplicateAmbiguous),
             "ambiguous row must return DuplicateAmbiguous, got {r:?}");
     }
