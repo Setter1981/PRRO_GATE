@@ -1,13 +1,14 @@
 # PRRO Gateway — Full Rust Rewrite Design
 
-**Status:** Draft v2 — spec-review fixes applied; awaiting user sign-off
+**Status:** Draft v3 — second-round review fixes applied; awaiting user sign-off
 **Date:** 2026-04-22
 **Owner:** Setter1981 + pair-AI
 **Target:** Single Rust binary on retail (Windows + Linux), full feature parity with current Python gateway, freeze Python after cutover.
 
 **Revision log:**
 - v1 (initial): 30 decisions from 7-section brainstorm.
-- v2 (post-review): added decisions #31–#37 closing the 3 HIGH + 3 MED findings raised in spec review (idempotency conflict policy, MAC chain alignment, DpsSubmission struct, per-table FK policy, musl Linux target, SQLite bundled pin, M8 packaging deliverables).
+- v2 (1st-review): added decisions #31–#37 closing 3 HIGH + 3 MED findings (idempotency conflict policy, MAC chain alignment, DpsSubmission struct, per-table FK policy, musl Linux target, SQLite bundled pin, M8 packaging).
+- v3 (2nd-review): added decisions #38–#41 closing 1 HIGH + 2 MED + 2 LOW findings (DpsStatusQuery + ambiguous-outcome FN block, with_immediate sqlx tx primitive, maintenance/live CLI split, Rust-idiomatic CSRF generator).
 
 ---
 
@@ -60,6 +61,10 @@ Rewrite strategy: **big-bang on a side branch** (`rust-gateway`), full feature p
 | 35 | Linux target | Primary `x86_64-unknown-linux-musl` (truly static), fallback `x86_64-unknown-linux-gnu` if typst sub-deps block musl (revised after spec review) |
 | 36 | SQLite bundled | Pinned via `libsqlite3-sys = { version = "0.30", features = ["bundled"] }` in `Cargo.toml` (revised after spec review) |
 | 37 | Pre-cutover deliverables | Add to M8: Windows service / systemd unit installers; SBOM + cargo-audit + cargo-deny CI; signed artefacts + reproducible builds (revised after spec review) |
+| 38 | DPS reconciliation / status query | `DpsStatusQuery::{ByServerFiscalNo, ByLocalIdentity}` + `DpsStatusOutcome::{Found, NotFound, Ambiguous, QueryNotSupported}`; FN HARD-BLOCKS on Ambiguous/QueryNotSupported until operator resolves at /admin/ui/recovery (revised after spec review v3) |
+| 39 | Write-tx primitive | `db::tx::with_immediate(pool, fn)` helper acquires raw connection + manual `BEGIN IMMEDIATE`; never nest under `pool.begin()` (revised after spec review v3) |
+| 40 | CLI split | Maintenance CLI (PID lock, daemon stopped) vs Live CLI (HTTP-to-daemon, no lock); see §3.4 (revised after spec review v3) |
+| 41 | CSRF token generator | `OsRng + base64url` (Rust idioms), `subtle::ConstantTimeEq` for verify; not Python's `secrets.token_urlsafe` (revised after spec review v3) |
 
 ---
 
@@ -246,22 +251,47 @@ usb_print = []      # opt-in: pulls rusb crate
 
 ### 3.4 CLI shape
 
+CLI is split into **two modes** (post-review fix MED-2). Mixing them
+under a single PID lock would prevent the operator from making any
+changes while the gateway runs — bad UX for a 24/7 retail service.
+
+#### 3.4.1 Maintenance mode — daemon must be stopped
+
+These touch the DB directly. They **acquire the singleton PID lock**
+and refuse to run while `prro serve` is active.
+
 ```bash
 prro serve [--config /etc/prro/prro.toml]
 prro migrate [--db /var/lib/prro/prro.db]
 prro doctor                           # config + perm + network + cert validity
+prro fn seed-prevhash --fn <FN> --hex <32-byte hex>   # bootstrap chain anchor
+prro db backup [--out path]
+prro db verify                        # integrity_check + chain replay
+```
+
+#### 3.4.2 Live mode — talks to the running daemon over loopback HTTP
+
+These hit `http://127.0.0.1:<admin_port>` (or unix socket on Linux).
+They authenticate via a local-only API key auto-generated on
+`prro serve` startup and stored in `/var/lib/prro/cli.key` with
+mode 0600. No PID lock needed — the daemon itself serializes
+operations through its WriteWorker registry.
+
+```bash
 prro fn add <FN> --tax-number ... --org "..." [--vat-payer-inn ...]
 prro fn list
-prro fn seed-mac --fn <FN> --hex <32-byte hex>
 prro cashier add --fn <FN> --inn <INN> --jks <path> [--name "..."]
 prro shift open --fn <FN>
 prro shift close --fn <FN>
 prro test-print --profile tm-t88ii --host 192.168.1.50:9100
 prro health
 prro print --doc <UUID> --printer <printer-id>
+prro recovery list
+prro recovery resolve --doc <UUID> --action {ack|reject|resend}
 ```
 
-CLI commands operate against the same SQLite DB. They acquire the singleton PID lock just like `serve`, so they cannot run concurrently with a running daemon.
+If a live-mode command runs while the daemon is stopped, it errors
+clearly: `daemon not running at 127.0.0.1:8443; start with 'prro serve'`.
 
 ### 3.5 Ingress extensibility (trait-based shell registration)
 
@@ -496,6 +526,41 @@ a 409 Conflict**.
 
 Repository implementation:
 
+**Note on transaction primitive (post-review fix MED-1).** sqlx's
+`pool.begin()` already opens a `BEGIN DEFERRED`; issuing another
+`BEGIN IMMEDIATE` inside that span is a SQLite error. We need a
+helper that acquires a connection AND issues `BEGIN IMMEDIATE`
+manually (so writers contend on the RESERVED lock from the start):
+
+```rust
+// db/tx.rs — single source of truth for write transactions
+pub async fn with_immediate<R, F>(pool: &SqlitePool, f: F) -> Result<R>
+where
+    F: for<'c> FnOnce(&'c mut SqliteConnection)
+        -> futures::future::BoxFuture<'c, Result<R>> + Send,
+    R: Send,
+{
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    match f(&mut *conn).await {
+        Ok(r) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            Ok(r)
+        }
+        Err(e) => {
+            // Best-effort rollback; ignore secondary error.
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(e)
+        }
+    }
+}
+```
+
+The inbox insert and every write-path stage transition use this helper
+exclusively. Test: `tests/db/single_writer_lock.rs` — spawn two tokio
+tasks both racing for `with_immediate` on the same FN; assert one
+succeeds, the other blocks until first commits, neither corrupts state.
+
 ```rust
 pub enum InboxInsertOutcome {
     /// First time we see this (fn, idem_key) — row inserted.
@@ -511,34 +576,29 @@ pub enum InboxInsertOutcome {
 pub async fn insert_inbox(
     pool: &SqlitePool, cmd: &CanonicalFiscalCommand,
 ) -> Result<InboxInsertOutcome> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("BEGIN IMMEDIATE").execute(&mut *tx).await?;
-
-    if let Some(existing) = sqlx::query_as!(InboxRow,
-        r#"SELECT ... FROM ingress_inbox
-           WHERE fiscal_number = ? AND idempotency_key = ?"#,
-        cmd.fiscal_number, cmd.idempotency_key
-    ).fetch_optional(&mut *tx).await? {
-        if existing.payload_sha256_canonical[..] == cmd.payload_sha256[..] {
-            tx.commit().await?;
-            return Ok(InboxInsertOutcome::Replay(existing));
-        } else {
-            tx.commit().await?;
-            return Ok(InboxInsertOutcome::Conflict {
-                existing_payload_hash: existing.payload_sha256_canonical,
-                submitted_payload_hash: cmd.payload_sha256,
+    db::tx::with_immediate(pool, |conn| Box::pin(async move {
+        if let Some(existing) = sqlx::query_as!(InboxRow,
+            r#"SELECT ... FROM ingress_inbox
+               WHERE fiscal_number = ? AND idempotency_key = ?"#,
+            cmd.fiscal_number, cmd.idempotency_key
+        ).fetch_optional(&mut *conn).await? {
+            return Ok(if existing.payload_sha256_canonical[..] == cmd.payload_sha256[..] {
+                InboxInsertOutcome::Replay(existing)
+            } else {
+                InboxInsertOutcome::Conflict {
+                    existing_payload_hash: existing.payload_sha256_canonical,
+                    submitted_payload_hash: cmd.payload_sha256,
+                }
             });
         }
-    }
-
-    let row = sqlx::query_as!(InboxRow,
-        r#"INSERT INTO ingress_inbox (... , payload_sha256_canonical)
-           VALUES (... , ?)
-           RETURNING ..."#,
-        cmd.payload_sha256
-    ).fetch_one(&mut *tx).await?;
-    tx.commit().await?;
-    Ok(InboxInsertOutcome::Created(row))
+        let row = sqlx::query_as!(InboxRow,
+            r#"INSERT INTO ingress_inbox (... , payload_sha256_canonical)
+               VALUES (... , ?)
+               RETURNING ..."#,
+            cmd.payload_sha256
+        ).fetch_one(&mut *conn).await?;
+        Ok(InboxInsertOutcome::Created(row))
+    })).await
 }
 ```
 
@@ -579,8 +639,21 @@ axum + tower-sessions (SQLite store) + Askama templates + custom CSRF helper + L
 - `/admin/ui/login`, `/logout`
 - `/admin/ui/`, `/documents`, `/documents/:id`
 - `/admin/ui/settings/fns/{new,edit,delete}`
-- `/admin/ui/settings/operators` (list) + `/admin/ui/settings/fns/{fn}/operators/new` + `/operators/{id}/{edit,delete}` + key parsing dialog
-- `/admin/ui/settings/printers` (list) + `/admin/ui/settings/printers/{new,/{id}/edit,/{id}/delete}` (port from Phase 13 Step 4a)
+- Cashiers (`sidecar_operators`):
+  - `GET  /admin/ui/settings/operators`
+  - `GET  /admin/ui/settings/fns/{fn}/operators/new`
+  - `POST /admin/ui/settings/fns/{fn}/operators/new`
+  - `GET  /admin/ui/settings/operators/{id}/edit`
+  - `POST /admin/ui/settings/operators/{id}/edit`
+  - `POST /admin/ui/settings/operators/{id}/delete`
+  - `POST /admin/ui/settings/fns/parse-key` (key parsing dialog)
+- Printers (`printer_profiles`):
+  - `GET  /admin/ui/settings/printers`
+  - `GET  /admin/ui/settings/printers/new`
+  - `POST /admin/ui/settings/printers/new`
+  - `GET  /admin/ui/settings/printers/{id}/edit`
+  - `POST /admin/ui/settings/printers/{id}/edit`
+  - `POST /admin/ui/settings/printers/{id}/delete`
 - `/admin/ui/settings/node`, `/dps`
 - `/admin/ui/recovery` — dangling shifts, manual-recon docs, stuck inbox
 - `/admin/ui/documents/:id/{receipt.html,receipt.pdf,print}`
@@ -593,7 +666,32 @@ axum + tower-sessions (SQLite store) + Askama templates + custom CSRF helper + L
 
 ### 7.4 CSRF helper
 
-50 LoC: per-session token via `secrets::token_urlsafe(32)` stored in tower-session, hidden form input, double-submit cookie, `hmac::compare_digest` validation.
+~50 LoC, custom (no third-party crate). Per-session token stored in
+tower-session, hidden form input, double-submit cookie, constant-time
+comparison.
+
+Token generation in pure Rust (post-review fix LOW-2 — earlier draft
+referenced a Python `secrets.token_urlsafe` API that has no Rust
+equivalent):
+
+```rust
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use rand_core::{OsRng, RngCore};
+
+pub fn generate_csrf_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+pub fn verify_csrf(stored: &str, submitted: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    stored.as_bytes().ct_eq(submitted.as_bytes()).into()
+}
+```
+
+Deps: `rand_core = "0.6"`, `subtle = "2.5"`. Both small, no transitive
+crypto.
 
 ---
 
@@ -647,11 +745,13 @@ pub enum DpsResponse {
 #[async_trait]
 pub trait DpsChannel: Send + Sync {
     async fn submit(&self, sub: &DpsSubmission) -> Result<DpsResponse, DpsTransportError>;
-    async fn fetch_status(&self, fn_id: &FiscalNumber, server_fiscal_no: &str)
-        -> Result<DocStatus, DpsTransportError>;
+    async fn query_status(&self, q: &DpsStatusQuery)
+        -> Result<DpsStatusOutcome, DpsTransportError>;
     fn channel_id(&self) -> &str;
     fn capabilities(&self) -> ChannelCapabilities;
 }
+
+// See §8.5 below for DpsStatusQuery / DpsStatusOutcome.
 
 #[derive(Debug, Clone)]
 pub struct ChannelCapabilities {
@@ -689,6 +789,99 @@ Wraps `prro_crypto`. In-process (no HTTP hop to sidecar). Cred-sealing default-o
 ### 8.4 Print transport
 
 Used internally by admin UI `print` action; uses `prro_escpos` compiler + bundled XML profiles + TCP/Serial/USB transport. `prro_escpos_daemon` remains as a separate universal HTTP service for non-PRRO consumers.
+
+### 8.5 Reconciliation / status query — ambiguous-outcome policy
+
+**Problem.** When a document is in `state IN ('SENDING','SENT','KVT1','ERROR_RETRYABLE')`
+and the gateway crashed or its DPS request timed out, we may not know
+whether DPS accepted the submission. We may **not even have a
+`server_fiscal_no`**: the doc was acked by the channel transport
+but the response packet was lost, or the connection died mid-write.
+A `fetch_status(fn, server_fiscal_no)` API cannot represent this case.
+
+**Fix (decision #38).** Introduce a richer query type and an explicit
+ambiguous-outcome path that BLOCKS the FN until the operator resolves.
+
+```rust
+pub enum DpsStatusQuery {
+    /// We do hold a server_fiscal_no — fast direct lookup.
+    ByServerFiscalNo {
+        fiscal_number: FiscalNumber,
+        server_fiscal_no: String,
+    },
+    /// We do NOT have a server_fiscal_no.  DPS is asked to look up by
+    /// our local identity + canonical content hash.  Channels that
+    /// can't do this return `QueryNotSupported`.
+    ByLocalIdentity {
+        fiscal_number: FiscalNumber,
+        local_number: u64,                    // LND
+        business_ts: DateTime<Utc>,
+        unsigned_xml_sha256: [u8; 32],         // ties query to specific content
+        idempotency_key: String,
+    },
+}
+
+pub enum DpsStatusOutcome {
+    /// DPS has it acked. Recovery transitions doc → ACK.
+    Found(DpsAck),
+
+    /// DPS does not have any record matching the query. Channel is
+    /// confident the submission did not land. Recovery may safely
+    /// retry the original submission with the same idempotency_key.
+    NotFound,
+
+    /// DPS responded but the local hash / identity does not match
+    /// any record DPS has. This is chain divergence — manual review
+    /// required. Gateway BLOCKS subsequent docs on this FN.
+    Ambiguous { reason: String },
+
+    /// Channel cannot answer this query (e.g. no by-content lookup
+    /// support). Recovery escalates to RequiresManualReconciliation.
+    QueryNotSupported,
+}
+```
+
+Recovery flow on boot or post-timeout:
+
+1. For each `fiscal_documents` row in non-final state:
+   - If `server_fiscal_no IS NOT NULL` → `ByServerFiscalNo` query.
+   - Else → `ByLocalIdentity` query.
+2. Map the outcome:
+   - `Found(ack)` → transition `state → ACK`, persist `server_fiscal_no`,
+     update `node_state.last_known_unsigned_xml_sha256`.
+   - `NotFound` → safe to re-submit. Worker re-enters `send` stage
+     with same `idempotency_key`.
+   - `Ambiguous` → set `state = REQUIRES_MANUAL_RECONCILIATION`,
+     emit audit row severity=CRITICAL, **block FN**.
+   - `QueryNotSupported` → same as Ambiguous; manual.
+
+**Hard block on RequiresManualReconciliation** (per fiscal_number):
+
+```rust
+async fn ensure_fn_unblocked(pool: &SqlitePool, fn_id: &FiscalNumber) -> Result<()> {
+    let blocked: Option<i64> = sqlx::query_scalar!(
+        r#"SELECT 1 FROM fiscal_documents
+           WHERE fiscal_number = ?
+             AND state = 'REQUIRES_MANUAL_RECONCILIATION'
+           LIMIT 1"#,
+        fn_id
+    ).fetch_optional(pool).await?;
+    if blocked.is_some() {
+        return Err(WriteError::FnBlockedManualRecon { fn_id: fn_id.clone() });
+    }
+    Ok(())
+}
+```
+
+WriteWorker calls this BEFORE Stage 1 (acquire) for every job. Until
+the operator resolves the doc via `/admin/ui/recovery` (mark-ACK,
+reject, or re-send), the FN does not accept new ingress. Ingress
+returns HTTP 409 + `{ error: "fn_blocked_manual_reconciliation",
+hint: "Resolve at /admin/ui/recovery" }`.
+
+This closes the recovery gate (§5.6) for the SENDING-after-crash
+scenario and aligns with frozen invariant #8 (recovery may not
+silently violate state transitions).
 
 ---
 
