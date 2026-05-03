@@ -537,7 +537,7 @@ async fn migration_001_strict_typing_rejects_text_in_int_column() {
     let (_d, pool) = fresh_pool().await;
     // tsp_enabled is INTEGER NOT NULL — STRICT must reject 'abc'
     sqlx::query!(
-        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) VALUES (?, '0', 'test')",
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) VALUES (?, '12345678', 'test')",
         "1234567890"
     )
     .execute(&pool)
@@ -921,7 +921,8 @@ CREATE INDEX ix_offline_active ON offline_sessions(fiscal_number, status)
 
 CREATE TABLE offline_codes (
     fiscal_number TEXT    NOT NULL,
-    code_value    INTEGER NOT NULL,
+    -- DPS issues positive integer offline reservation codes.
+    code_value    INTEGER NOT NULL  CHECK (code_value > 0),
     used_at       TEXT,
     used_by_doc   BLOB,
     PRIMARY KEY (fiscal_number, code_value),
@@ -1969,9 +1970,12 @@ pub mod shifts;
 - [ ] **Step 2: Re-prepare sqlx data**
 
 ```bash
+# from rust/prro/, with absolute path; no --workspace
 cd rust/prro
-DATABASE_URL=sqlite:./var/prro.dev.db cargo sqlx prepare
+DATABASE_URL=sqlite:///<absolute-path>/var/prro.dev.db cargo sqlx prepare
 ```
+
+Relative `sqlite:./var/...` does not resolve from cargo proc-macro CWD.
 
 - [ ] **Step 3: Write tests**
 
@@ -2222,11 +2226,11 @@ Add to repositories `mod.rs`:
 pub mod fiscal_documents;
 ```
 
-Re-prepare sqlx data:
+Re-prepare sqlx data (absolute path, no `--workspace`):
 
 ```bash
 cd rust/prro
-DATABASE_URL=sqlite:./var/prro.dev.db cargo sqlx prepare
+DATABASE_URL=sqlite:///<absolute-path>/var/prro.dev.db cargo sqlx prepare
 ```
 
 - [ ] **Step 2: Write tests**
