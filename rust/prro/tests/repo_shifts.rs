@@ -1,0 +1,129 @@
+use prro::db::models::enums::FiscalMode;
+use prro::db::{
+    models::{enums::ShiftState, ids::ShiftId},
+    open_pool,
+    repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig, shifts},
+};
+
+async fn fresh_with_fn() -> (sqlx::SqlitePool, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    std::mem::forget(dir);
+    let pool = open_pool(&path).await.unwrap();
+    fn_repo::insert(
+        &pool,
+        &NewFnConfig {
+            fiscal_number: "4000000001".into(),
+            tax_number: "12345678".into(),
+            vat_payer_inn: None,
+            fiscal_mode: FiscalMode::Test,
+            org_name: None,
+            point_name: None,
+            org_address: None,
+            tsp_enabled: false,
+            offline_enabled: true,
+            national_check_enabled: false,
+            min_offline_codes: 0,
+            max_offline_codes: 0,
+        },
+    )
+    .await
+    .unwrap();
+    (pool, "4000000001".to_string())
+}
+
+#[tokio::test]
+async fn insert_created_then_get() {
+    let (pool, fn_id) = fresh_with_fn().await;
+    let id = ShiftId::new();
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE")
+        .await
+        .unwrap();
+    let row = shifts::get(&pool, id).await.unwrap().unwrap();
+    assert_eq!(row.shift_id, id);
+    assert_eq!(row.fiscal_number, fn_id);
+    assert_eq!(row.state, ShiftState::Created);
+    assert_eq!(row.cash_balance_kop, 0);
+    assert!(row.serial.is_none());
+}
+
+#[tokio::test]
+async fn allowed_transitions_succeed() {
+    let (pool, fn_id) = fresh_with_fn().await;
+    let id = ShiftId::new();
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE")
+        .await
+        .unwrap();
+    assert!(
+        shifts::transition(&pool, id, ShiftState::Created, ShiftState::Opening)
+            .await
+            .unwrap()
+    );
+    assert!(
+        shifts::transition(&pool, id, ShiftState::Opening, ShiftState::Opened)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        shifts::get(&pool, id).await.unwrap().unwrap().state,
+        ShiftState::Opened
+    );
+}
+
+#[tokio::test]
+async fn forbidden_transitions_blocked_in_code() {
+    // Code-level whitelist must short-circuit BEFORE touching the DB.
+    let (pool, fn_id) = fresh_with_fn().await;
+    let id = ShiftId::new();
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE")
+        .await
+        .unwrap();
+    let did_it = shifts::transition(&pool, id, ShiftState::Created, ShiftState::Closed)
+        .await
+        .unwrap();
+    assert!(!did_it, "Created → Closed must be blocked by whitelist");
+    assert_eq!(
+        shifts::get(&pool, id).await.unwrap().unwrap().state,
+        ShiftState::Created,
+        "row state must remain unchanged after blocked transition"
+    );
+}
+
+#[tokio::test]
+async fn cas_blocks_when_state_diverged() {
+    // Allowed transition Opening → Opened, but row is in Created — CAS must reject.
+    let (pool, fn_id) = fresh_with_fn().await;
+    let id = ShiftId::new();
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE")
+        .await
+        .unwrap();
+    let did_it = shifts::transition(&pool, id, ShiftState::Opening, ShiftState::Opened)
+        .await
+        .unwrap();
+    assert!(!did_it, "CAS must reject when actual state ≠ expected from");
+    assert_eq!(
+        shifts::get(&pool, id).await.unwrap().unwrap().state,
+        ShiftState::Created
+    );
+}
+
+#[tokio::test]
+async fn allowed_transition_table_matrix() {
+    use ShiftState::*;
+    // Allowed (must be true).
+    assert!(shifts::allowed_transition(Created, Opening));
+    assert!(shifts::allowed_transition(Opening, Opened));
+    assert!(shifts::allowed_transition(Opening, Error));
+    assert!(shifts::allowed_transition(Opened, Closing));
+    assert!(shifts::allowed_transition(Closing, Closed));
+    assert!(shifts::allowed_transition(Closing, Error));
+    assert!(shifts::allowed_transition(Error, Closed));
+
+    // Forbidden (must be false).
+    assert!(!shifts::allowed_transition(Closed, Opening)); // re-open final state
+    assert!(!shifts::allowed_transition(Created, Opened)); // skipped Opening
+    assert!(!shifts::allowed_transition(Created, Closed)); // skipped pipeline
+    assert!(!shifts::allowed_transition(Opened, Created)); // backwards
+    assert!(!shifts::allowed_transition(Closed, Closed)); // self-loop
+    assert!(!shifts::allowed_transition(Error, Opened)); // recovery → not back to Opened
+}
