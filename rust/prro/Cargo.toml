@@ -45,6 +45,9 @@ fs4 = "0.9"
 # RNG (M1 needs it for nothing user-facing, but lock in version for later modules)
 rand_core = { version = "0.6", features = ["std"] }
 
+# Async helpers — needed for `db::tx::with_immediate` higher-ranked closures
+futures = "0.3"
+
 # Crate cross-deps (will be wired in M2+)
 prro_crypto = { path = "../prro_crypto" }
 prro_escpos = { path = "../prro_escpos" }
