@@ -101,6 +101,86 @@ async fn migration_002_ingress_inbox_has_unique_idempotency_index() {
 }
 
 #[tokio::test]
+async fn migration_003_partial_active_indexes_present() {
+    let (_d, pool) = fresh_pool().await;
+    let names: HashSet<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type='index' ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .collect();
+    for idx in ["ux_op_fn_inn_active", "ux_op_certs_active_per_fn"] {
+        assert!(names.contains(idx), "missing index {idx}; have {names:?}");
+    }
+}
+
+#[tokio::test]
+async fn migration_003_operator_certs_supports_rolling_refresh() {
+    let (_d, pool) = fresh_pool().await;
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES ('1234567890', '12345678', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ski_a = "a".repeat(64);
+    let ski_b = "b".repeat(64);
+    let der = vec![0u8; 4];
+
+    // Stage cert A as active.
+    sqlx::query(
+        "INSERT INTO operator_certs(ski_hex, fiscal_number, cert_fingerprint, cert_der, \
+            fetched_at, source, active) VALUES (?, '1234567890', 'fp-a', ?, '2026-01-01T00:00:00Z', 'manual', 1)",
+    )
+    .bind(&ski_a)
+    .bind(&der)
+    .execute(&pool)
+    .await
+    .expect("first active cert insert");
+
+    // Stage cert B as inactive — same FN, different SKI: must succeed.
+    sqlx::query(
+        "INSERT INTO operator_certs(ski_hex, fiscal_number, cert_fingerprint, cert_der, \
+            fetched_at, source, active) VALUES (?, '1234567890', 'fp-b', ?, '2026-02-01T00:00:00Z', 'manual', 0)",
+    )
+    .bind(&ski_b)
+    .bind(&der)
+    .execute(&pool)
+    .await
+    .expect("second cert with active=0 must coexist with active cert A");
+
+    // Flipping B to active=1 while A is still active must violate the partial unique idx.
+    let collision = sqlx::query("UPDATE operator_certs SET active = 1 WHERE ski_hex = ?")
+        .bind(&ski_b)
+        .execute(&pool)
+        .await
+        .expect_err("two active certs per FN must violate ux_op_certs_active_per_fn");
+    let msg = collision.to_string().to_lowercase();
+    assert!(
+        msg.contains("unique") || msg.contains("constraint"),
+        "expected UNIQUE-constraint error, got: {msg}"
+    );
+
+    // Atomic rolling-refresh: deactivate A then activate B in one tx — must succeed.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE operator_certs SET active = 0 WHERE ski_hex = ?")
+        .bind(&ski_a)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE operator_certs SET active = 1 WHERE ski_hex = ?")
+        .bind(&ski_b)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.expect("atomic rolling refresh must commit");
+}
+
+#[tokio::test]
 async fn migration_001_strict_typing_rejects_text_in_int_column() {
     let (_d, pool) = fresh_pool().await;
     sqlx::query(
