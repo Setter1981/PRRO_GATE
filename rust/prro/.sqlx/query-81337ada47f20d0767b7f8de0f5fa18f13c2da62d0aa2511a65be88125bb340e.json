@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT document_id    as \"document_id: DocumentId\",\n                  fiscal_number,\n                  state           as \"state: DocState\",\n                  doc_type        as \"doc_type: DocType\",\n                  server_fiscal_no,\n                  submission_attempted_at\n           FROM fiscal_documents\n           WHERE fiscal_number = ?\n             AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENT','KVT1','ERROR_RETRYABLE')\n           ORDER BY created_at",
+  "describe": {
+    "columns": [
+      {
+        "name": "document_id: DocumentId",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "fiscal_number",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "state: DocState",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "doc_type: DocType",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "server_fiscal_no",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "submission_attempted_at",
+        "ordinal": 5,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "81337ada47f20d0767b7f8de0f5fa18f13c2da62d0aa2511a65be88125bb340e"
+}
