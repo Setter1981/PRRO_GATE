@@ -1,9 +1,13 @@
 # PRRO Gateway — Full Rust Rewrite Design
 
-**Status:** Draft (brainstorm complete, awaiting user sign-off)
+**Status:** Draft v2 — spec-review fixes applied; awaiting user sign-off
 **Date:** 2026-04-22
 **Owner:** Setter1981 + pair-AI
 **Target:** Single Rust binary on retail (Windows + Linux), full feature parity with current Python gateway, freeze Python after cutover.
+
+**Revision log:**
+- v1 (initial): 30 decisions from 7-section brainstorm.
+- v2 (post-review): added decisions #31–#37 closing the 3 HIGH + 3 MED findings raised in spec review (idempotency conflict policy, MAC chain alignment, DpsSubmission struct, per-table FK policy, musl Linux target, SQLite bundled pin, M8 packaging deliverables).
 
 ---
 
@@ -49,6 +53,13 @@ Rewrite strategy: **big-bang on a side branch** (`rust-gateway`), full feature p
 | 28 | Branch strategy | `rust-gateway` branch in current repo |
 | 29 | Roadmap | 7-8 months pair-coding effort |
 | 30 | Ingress extensibility | Trait-based shell registration so new protocols are 1-file add |
+| 31 | Idempotency conflict policy | **STRICT** — same `(fn, idem_key)` + same `payload_sha256_canonical` ⇒ replay; differing payload ⇒ HTTP 409 Conflict, never silent replay (revised after spec review) |
+| 32 | MAC / `previous_hash` semantics | `previous_hash(N) = SHA-256(unsigned_xml(N-1))` — NOT a chain MAC; aligned with Python `write_path.py:477` (revised after spec review) |
+| 33 | DpsChannel envelope | Rich `DpsSubmission` struct (FN, LND, doc_type, business_ts, offline ids, cancellation, profile, fiscal_mode) — NOT bare `(cms, idem)` (revised after spec review) |
+| 34 | FK deletion policy | Per-table; **RESTRICT** for legally significant data (fiscal_documents, shifts, sidecar_operators), **CASCADE** only for derivative artefacts (document_files, kvt2_envelopes); audit_log carries no FK (revised after spec review) |
+| 35 | Linux target | Primary `x86_64-unknown-linux-musl` (truly static), fallback `x86_64-unknown-linux-gnu` if typst sub-deps block musl (revised after spec review) |
+| 36 | SQLite bundled | Pinned via `libsqlite3-sys = { version = "0.30", features = ["bundled"] }` in `Cargo.toml` (revised after spec review) |
+| 37 | Pre-cutover deliverables | Add to M8: Windows service / systemd unit installers; SBOM + cargo-audit + cargo-deny CI; signed artefacts + reproducible builds (revised after spec review) |
 
 ---
 
@@ -58,11 +69,14 @@ Rewrite strategy: **big-bang on a side branch** (`rust-gateway`), full feature p
 
 One Rust binary `prro`. Statically linked. Cross-compile targets:
 
-- `x86_64-unknown-linux-gnu` (RHEL/Debian/Ubuntu)
-- `x86_64-pc-windows-msvc` (Win10+)
-- `aarch64-apple-darwin` (dev only)
+- **`x86_64-unknown-linux-musl`** — primary Linux target. Statically linked (no glibc dependency on host). Single-file deploy on any Linux 3.x+ retail box.
+- `x86_64-unknown-linux-gnu` — secondary Linux target. Smaller binary (~5-10% less) but requires host glibc ≥ matching dev image. Use only when musl build is blocked by a sub-dependency (e.g. typst sub-deps).
+- `x86_64-pc-windows-msvc` (Win10+) — statically linked CRT (`+crt-static` rustflag).
+- `aarch64-apple-darwin` (dev only) — not retail-deployed.
 
-Approximate post-strip release size: ~40-45 MB (typst dependency is the dominant +30 MB; DejaVu fonts +3 MB; rest is gateway code).
+Approximate post-strip release size: ~40-45 MB (typst dependency dominates +30 MB; DejaVu fonts +3 MB; rest is gateway code). musl typically adds ~5% size vs gnu.
+
+**Risk noted**: typst's transitive deps may include build scripts that depend on system libraries (e.g. `harfbuzz`, `freetype`). If musl build fails on these, fall back to gnu for Linux and document the glibc minimum version. Validate cross-compile matrix in CI from week 1.
 
 One process. One tokio multi-threaded runtime. All subsystems (ingress, write-path, transports, admin UI, rendering, ops_loop) share `Arc<App>` DI container.
 
@@ -172,8 +186,12 @@ askama           = "0.12"
 askama_axum      = "0.4"
 rust-embed       = "8"
 
-# DB
+# DB — bundled libsqlite3-sys is mandatory (decision in §4):
+# - guarantees STRICT tables (SQLite ≥ 3.37) regardless of host
+# - guarantees JSON1 + UUID-friendly extensions
+# - removes dependency on system libsqlite3 cross-platform
 sqlx             = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "sqlite", "chrono", "uuid", "macros"] }
+libsqlite3-sys   = { version = "0.30", features = ["bundled"] }   # pinned bundled build
 
 # Serialization
 serde            = { version = "1", features = ["derive"] }
@@ -292,10 +310,25 @@ Clean redesign from migration 001. Drop legacy fields (`current_channel_lock`, `
 
 ### 4.1 Schema principles
 
-- **STRICT tables** everywhere (sqlx bundles SQLite 3.46+ via libsqlite3-sys when `bundled` feature is on; safe to require).
+- **STRICT tables** everywhere — bundled SQLite via `libsqlite3-sys = { features = ["bundled"] }` (see §3.3 dependency block) gives 3.46+ unconditionally.
 - **UUIDv7 BLOB** for all identifiers (16B vs 36B TEXT, monotonic, sortable).
 - **Enum types via TEXT + sqlx::Type** with Rust-side whitelist; minimal `CHECK` constraints.
-- **All FKs ON DELETE CASCADE** for child tables.
+- **FK deletion policy is per-table, not global** (revised after spec review):
+
+  | Parent → Child | Policy | Rationale |
+  |---|---|---|
+  | `fiscal_documents → document_files` | `ON DELETE CASCADE` | Files are technical artifacts of a doc; meaningless without doc. |
+  | `fiscal_documents → kvt2_envelopes` | `ON DELETE CASCADE` | Same — derivative of doc. |
+  | `fiscal_number_config → fiscal_documents` | `ON DELETE RESTRICT` | Legally significant data; cannot delete a registered FN that has issued docs. |
+  | `fiscal_number_config → shifts` | `ON DELETE RESTRICT` | Same. |
+  | `shifts → fiscal_documents` | `ON DELETE RESTRICT` | Cannot delete a shift that has issued docs. |
+  | `fiscal_number_config → sidecar_operators` | `ON DELETE RESTRICT` | Legal record — cashier-FN binding. |
+  | `fiscal_number_config → printer_profiles` | `ON DELETE SET NULL` | Operational, not legal — orphan-OK. |
+  | `audit_log` → no parent FK | (no FK) | Append-only log, can outlive entities. `entity_type`/`entity_id` are TEXT search keys. |
+  | `ingress_inbox → fiscal_documents` (if linked) | (no FK) | Inbox is operational queue; doc creation is an effect, not a parent-child relationship. |
+  | `offline_sessions → fiscal_documents` | `ON DELETE RESTRICT` | Session is legally tied to its docs. |
+
+  Default for **legally significant** tables is RESTRICT. Cascade only for technical/derivative artifacts.
 - **`updated_at` via TRIGGER** — single source of truth.
 - **Partial indexes** on hot query patterns (`WHERE active=1`, `WHERE status NOT IN (final-states)`).
 
@@ -370,11 +403,55 @@ Each stage = async function. Failure at any stage transitions the doc to `ERROR_
 
 `DocState`, `ShiftState`, `OfflineSessionState`, `NodeMode` — Rust enums with `#[derive(sqlx::Type)]`. Allowed transitions whitelisted in `state_machine.rs`. Tests assert each forbidden transition is rejected with `StateTransitionConflict`.
 
-### 5.4 MAC chain
+### 5.4 MAC / `previous_hash` semantics — ALIGNED WITH PYTHON
 
-`fn next_mac(prev: Option<&[u8;32]>, payload_xml: &[u8]) -> [u8;32]` — SHA-256(prev || payload). Ported 1:1 from Python.
+**Critical clarification after spec review.** Earlier draft said
+`MAC(N) = SHA-256(prev_mac || payload(N))` — that is **WRONG** for our DPS protocol.
 
-`node_state.last_known_mac` BLOB(32) — bootstrap anchor. CLI command `prro fn seed-mac --fn ... --hex ...` for fresh DB against existing DPS history.
+Python source of truth: `src/prro_gateway/services/write_path.py:477` —
+the `previous_hash` field on document N is **SHA-256 of the previous
+document's UNSIGNED DPS XML payload**. This is NOT a Merkle-style
+running MAC chain; it is "doc N references doc N-1's unsigned XML
+hash". DPS validates by recomputing.
+
+Rust must compute byte-identical:
+
+```rust
+// crypto/mac.rs
+pub fn previous_hash_for(unsigned_xml_n_minus_1: &[u8]) -> [u8; 32] {
+    Sha256::digest(unsigned_xml_n_minus_1).into()
+}
+```
+
+Storage:
+
+- `fiscal_documents.unsigned_xml_sha256` BLOB(32) — sha256 of THIS document's
+  unsigned DPS XML (cp1251 bytes, before CMS wrap). Computed at sign-stage,
+  persisted on commit. Used by next document's `previous_hash`.
+- `fiscal_documents.previous_hash` BLOB(32) NULL — pulled from previous doc's
+  `unsigned_xml_sha256` (or from `node_state.last_known_unsigned_xml_sha256` for
+  the first doc after fresh DB).
+- `node_state.last_known_unsigned_xml_sha256` BLOB(32) NULL — bootstrap anchor:
+  set via `prro fn seed-prevhash --fn ... --hex ...` when the FN already has
+  DPS history but a fresh DB is being initialised; updated on every successful
+  ACK.
+
+Distinction from `payload_sha256`:
+
+- `fiscal_documents.payload_sha256_canonical` BLOB(32) — sha256 of the
+  canonical JSON envelope (what we have now). Used for inbox-side
+  idempotency conflict detection (see §6.2).
+- `fiscal_documents.unsigned_xml_sha256` BLOB(32) — sha256 of the cp1251 DPS
+  XML. Used for `previous_hash` chain.
+
+Two distinct hashes; do not confuse. Byte-equivalence golden tests
+(see §9) capture both per-document.
+
+**Bootstrap policy** (project memory `project_dps_mac_bootstrap`): for a
+fresh DB against an FN that already has DPS history, operator MUST seed
+`node_state.last_known_unsigned_xml_sha256` from the last DPS-acknowledged
+document via the CLI. Without seeding, DPS rejects the next submission
+with code -2 (chain mismatch).
 
 ### 5.5 DPS error classification
 
@@ -402,9 +479,84 @@ Boot phases: `BOOT → RECOVERY → READY`. Recovery scans `fiscal_documents` in
 | Maria 304 native | async | RequestId field | shared token | 8200 |
 | Checkbox-compat | yes | webhook `id` | API key | 8443 |
 
-### 6.2 IngressService contract
+### 6.2 IngressService contract — strict idempotency
 
-`receive_sync(cmd, timeout) → DocResponse` and `receive_async(cmd) → RequestId`. Inbox INSERT with UNIQUE `(fiscal_number, idempotency_key)` ON CONFLICT IGNORE. ResponseResolver: `DashMap<RequestId, oneshot::Sender>` for sync wait.
+`receive_sync(cmd, timeout) → DocResponse` and `receive_async(cmd) → RequestId`.
+
+**Revised after spec review.** Earlier draft said "ON CONFLICT IGNORE"
+— that is **WRONG** because it would silently accept a different
+`payload_sha256_canonical` under the same `(fiscal_number,
+idempotency_key)` and replay the previous response. Two clients each
+submitting their own SELL with the same idempotency_key (collision)
+would see one of them lose data without any error.
+
+Correct policy: **idempotency key must map deterministically to
+exactly one payload hash; differing payload under the same key is
+a 409 Conflict**.
+
+Repository implementation:
+
+```rust
+pub enum InboxInsertOutcome {
+    /// First time we see this (fn, idem_key) — row inserted.
+    Created(InboxRow),
+    /// Duplicate of an earlier identical request — return prior result.
+    /// Same `payload_sha256_canonical` ⇒ true replay.
+    Replay(InboxRow),
+    /// Same (fn, idem_key) but DIFFERENT payload hash ⇒ caller bug or
+    /// idempotency-key collision. Reject with 409, never replay.
+    Conflict { existing_payload_hash: [u8; 32], submitted_payload_hash: [u8; 32] },
+}
+
+pub async fn insert_inbox(
+    pool: &SqlitePool, cmd: &CanonicalFiscalCommand,
+) -> Result<InboxInsertOutcome> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *tx).await?;
+
+    if let Some(existing) = sqlx::query_as!(InboxRow,
+        r#"SELECT ... FROM ingress_inbox
+           WHERE fiscal_number = ? AND idempotency_key = ?"#,
+        cmd.fiscal_number, cmd.idempotency_key
+    ).fetch_optional(&mut *tx).await? {
+        if existing.payload_sha256_canonical[..] == cmd.payload_sha256[..] {
+            tx.commit().await?;
+            return Ok(InboxInsertOutcome::Replay(existing));
+        } else {
+            tx.commit().await?;
+            return Ok(InboxInsertOutcome::Conflict {
+                existing_payload_hash: existing.payload_sha256_canonical,
+                submitted_payload_hash: cmd.payload_sha256,
+            });
+        }
+    }
+
+    let row = sqlx::query_as!(InboxRow,
+        r#"INSERT INTO ingress_inbox (... , payload_sha256_canonical)
+           VALUES (... , ?)
+           RETURNING ..."#,
+        cmd.payload_sha256
+    ).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(InboxInsertOutcome::Created(row))
+}
+```
+
+`ingress_inbox.payload_sha256_canonical` BLOB(32) NOT NULL — new column
+in §4 schema. Plus the existing `UNIQUE (fiscal_number, idempotency_key)`.
+
+Caller-visible behaviour:
+
+| Outcome | Sync response | Async response |
+|---|---|---|
+| `Created` | wait for worker → DocResponse | 202 + `request_id` |
+| `Replay` | return previously stored `DocResponse` | 200 + previously stored `request_id` |
+| `Conflict` | **HTTP 409 Conflict** with body `{ existing_hash, submitted_hash }` | same — fail-fast |
+
+ResponseResolver: `DashMap<RequestId, oneshot::Sender<DocResponse>>`
+for sync wait. Replay path looks up stored response from
+`ingress_inbox` (or its linked `fiscal_documents` row) — never
+re-runs the worker.
 
 ### 6.3 Per-FN rate limiting
 
@@ -449,16 +601,76 @@ axum + tower-sessions (SQLite store) + Askama templates + custom CSRF helper + L
 
 ### 8.1 DPS channel abstraction
 
+**Revised after spec review.** `send_signed_cms(cms, idem)` is too thin
+— DPS channels need full submission context (FN, LND, doc type, business
+ts, offline ids, cancellation linkage, profile context) for routing,
+metadata building, and audit trail. Introduce `DpsSubmission` struct
+that carries everything the channel needs to make a decision:
+
 ```rust
+#[derive(Debug)]
+pub struct DpsSubmission {
+    pub document_id: Uuid,
+    pub fiscal_number: FiscalNumber,
+    pub local_number: u64,                       // LND
+    pub doc_type: DocType,                       // SHIFT_OPEN/SELL/RETURN/Z_REPORT/...
+    pub business_ts: DateTime<Utc>,
+    pub idempotency_key: String,
+    pub signed_cms: Vec<u8>,
+    pub unsigned_xml_sha256: [u8; 32],           // for chain validation (see §5.4)
+    pub previous_hash: Option<[u8; 32]>,
+    pub offline_session_id: Option<Uuid>,
+    pub offline_fiscal_no: Option<u64>,
+    pub offline_fiscal_date: Option<DateTime<Utc>>,
+    pub cancellation_of: Option<Uuid>,           // tech-return / cancel pointer
+    pub backend_profile_id: String,
+    pub transport_profile_id: String,
+    pub fiscal_mode: FiscalMode,                 // test|prod (see §8.2)
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct DpsAck {
+    pub server_fiscal_no: String,
+    pub server_fiscal_date: DateTime<Utc>,
+    pub raw_response: Vec<u8>,                   // KVT2 bytes for archive
+}
+
+#[derive(Debug)]
+pub enum DpsResponse {
+    Ack(DpsAck),
+    Reject { code: i32, message: String },
+    NeedsReconciliation { code: i32, hint: String },
+    Retryable { class: RetryClass, after: Option<Duration> },
+}
+
 #[async_trait]
 pub trait DpsChannel: Send + Sync {
-    async fn send_signed_cms(&self, cms: &[u8], idem: &str) -> Result<DpsAckOrError>;
-    async fn fetch_status(&self, fiscal_no: &str) -> Result<DocStatus>;
+    async fn submit(&self, sub: &DpsSubmission) -> Result<DpsResponse, DpsTransportError>;
+    async fn fetch_status(&self, fn_id: &FiscalNumber, server_fiscal_no: &str)
+        -> Result<DocStatus, DpsTransportError>;
     fn channel_id(&self) -> &str;
-    fn supports_offline_codes(&self) -> bool;
-    fn supports_async_callback(&self) -> bool;
+    fn capabilities(&self) -> ChannelCapabilities;
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelCapabilities {
+    pub supports_offline_codes: bool,
+    pub supports_async_callback: bool,
+    pub supports_cancellation: bool,
+    pub max_payload_bytes: usize,
+    pub supports_status_query: bool,
 }
 ```
+
+Variants implement the trait independently:
+
+- `GrpcCabinetChannel` — packs `DpsSubmission` into gRPC `SendChkV2Request`
+- `EdyneViknoChannel` — future, signature stays the same when API ships
+- `SoapDpsChannel` — legacy fallback if needed
+
+The submission struct is the contract. Channels translate to wire format
+in their own module.
 
 Variants:
 
@@ -543,7 +755,7 @@ Native Rust tonic server mirroring `mock_dps_server.py`. ~300 LoC. Used in CI in
 | M5 | Admin UI | Feature parity with Python admin UI |
 | M6 | Maria + polish | All ingress, observability, packaging |
 | M7 | Side-by-side | 7 clean days vs Python on test FN, performance tune |
-| M8 | Cutover | Pilot deploy, 30-day monitor, Python freeze |
+| M8 | Packaging + cutover | systemd unit + Windows-service installer + signed `.deb`/`.rpm`/`.msi` + reproducible build CI + SBOM/audit; pilot deploy + 30-day monitor + Python freeze |
 
 **Total: 7-8 months pair-coding effort.** Scope reduction (drop XML-RPC / Maria 304 / Checkbox-compat) could shave 1-2 months.
 
@@ -574,13 +786,34 @@ Native Rust tonic server mirroring `mock_dps_server.py`. ~300 LoC. Used in CI in
 
 ---
 
-## 14. Open follow-ups (post-cutover)
+## 14. Open follow-ups
 
-- Windows service / systemd unit installer scripts
-- Auto-update mechanism (background fetch + rolling restart)
-- Multi-printer per FN (currently one default printer per FN, multi-printer routing rules)
-- "Єдине вікно" backend channel implementation when API published
-- Full SBOM + supply-chain audit (cargo-audit + cargo-deny in CI)
+### 14.1 Required PRE-cutover (added M8)
+
+Per spec review — these affect operational deployability and must be
+solved before any pilot retail box runs the Rust binary.
+
+- **Windows service / systemd unit installer scripts** — without these,
+  retail can't auto-start `prro` after reboot. Block cutover.
+- **SBOM + cargo-audit + cargo-deny in CI** — supply-chain hygiene for
+  a binary running on a fiscal endpoint. Generate CycloneDX SBOM at
+  build, fail CI on known-vulnerable transitive deps.
+- **Packaging + signing + release reproducibility** — signed `.deb`,
+  `.rpm`, `.msi` artefacts. Reproducible builds (`cargo --frozen
+  --locked --offline` + pinned toolchain) so two builders produce
+  byte-identical binaries — required for hash-based update verification
+  and audit trail.
+
+### 14.2 OK to defer post-cutover
+
+- **Auto-update mechanism** (background fetch + rolling restart) — pilot
+  retail boxes can be hand-updated for the first 60 days.
+- **Multi-printer routing per FN** (current model: one default printer
+  per FN). Operators with multiple printers per point can assign manually
+  in the meantime.
+- **"Єдине вікно" backend channel implementation** — only deferable if
+  the DPS-published API isn't ready by pilot. The architectural slot
+  (DpsChannel trait variant) is in M2.
 
 ---
 
