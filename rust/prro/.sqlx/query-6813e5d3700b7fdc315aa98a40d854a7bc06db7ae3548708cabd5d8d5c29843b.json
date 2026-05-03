@@ -1,0 +1,80 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT fiscal_number,\n                  tax_number,\n                  vat_payer_inn,\n                  fiscal_mode    as \"fiscal_mode: FiscalMode\",\n                  org_name, point_name, org_address,\n                  tsp_enabled    as \"tsp_enabled: i64\",\n                  offline_enabled as \"offline_enabled: i64\",\n                  min_offline_codes  as \"min_offline_codes: i64\",\n                  max_offline_codes  as \"max_offline_codes: i64\"\n           FROM fiscal_number_config ORDER BY fiscal_number",
+  "describe": {
+    "columns": [
+      {
+        "name": "fiscal_number",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "tax_number",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "vat_payer_inn",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "fiscal_mode: FiscalMode",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "org_name",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "point_name",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "org_address",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "tsp_enabled: i64",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "offline_enabled: i64",
+        "ordinal": 8,
+        "type_info": "Integer"
+      },
+      {
+        "name": "min_offline_codes: i64",
+        "ordinal": 9,
+        "type_info": "Integer"
+      },
+      {
+        "name": "max_offline_codes: i64",
+        "ordinal": 10,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "6813e5d3700b7fdc315aa98a40d854a7bc06db7ae3548708cabd5d8d5c29843b"
+}
