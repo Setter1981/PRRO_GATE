@@ -493,6 +493,108 @@ async fn migration_004_offline_codes_value_must_be_positive() {
 }
 
 #[tokio::test]
+async fn migration_002_delete_offline_session_blocked_by_doc_reference() {
+    let (_d, pool) = fresh_pool().await;
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES ('1234567890', '12345678', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let session_id = vec![0xAAu8; 16];
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, status, opened_at) \
+         VALUES (?, '1234567890', 'OPEN', '2026-01-01T00:00:00Z')",
+    )
+    .bind(&session_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let doc_id = vec![0x01u8; 16];
+    let req_id = vec![0x02u8; 16];
+    let sha = vec![0u8; 32];
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical, offline_session_id) \
+         VALUES (?, ?, '1234567890', 1, 'SELL', 'PREPARED', 'b', 't', 'OFFLINE', \
+            '2026-01-01T00:00:00Z', '{}', ?, ?)",
+    )
+    .bind(&doc_id)
+    .bind(&req_id)
+    .bind(&sha)
+    .bind(&session_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = sqlx::query("DELETE FROM offline_sessions WHERE offline_session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .expect_err("ON DELETE RESTRICT must block deletion while doc references session");
+    let msg = err.to_string().to_lowercase();
+    assert!(msg.contains("foreign key"), "expected FK error, got: {msg}");
+}
+
+#[tokio::test]
+async fn migration_002_delete_related_receipt_blocked_by_self_referrer() {
+    let (_d, pool) = fresh_pool().await;
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES ('1234567890', '12345678', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let original = vec![0x10u8; 16];
+    let req_orig = vec![0x11u8; 16];
+    let sha = vec![0u8; 32];
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical) \
+         VALUES (?, ?, '1234567890', 1, 'SELL', 'ACK', 'b', 't', 'ONLINE', \
+            '2026-01-01T00:00:00Z', '{}', ?)",
+    )
+    .bind(&original)
+    .bind(&req_orig)
+    .bind(&sha)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let returnee = vec![0x20u8; 16];
+    let req_ret = vec![0x21u8; 16];
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical, related_receipt_id) \
+         VALUES (?, ?, '1234567890', 2, 'RETURN', 'PREPARED', 'b', 't', 'ONLINE', \
+            '2026-01-01T00:00:00Z', '{}', ?, ?)",
+    )
+    .bind(&returnee)
+    .bind(&req_ret)
+    .bind(&sha)
+    .bind(&original)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = sqlx::query("DELETE FROM fiscal_documents WHERE document_id = ?")
+        .bind(&original)
+        .execute(&pool)
+        .await
+        .expect_err("ON DELETE RESTRICT must block deletion of original while RETURN references it");
+    let msg = err.to_string().to_lowercase();
+    assert!(msg.contains("foreign key"), "expected FK error, got: {msg}");
+}
+
+#[tokio::test]
 async fn migration_001_strict_typing_rejects_text_in_int_column() {
     let (_d, pool) = fresh_pool().await;
     sqlx::query(

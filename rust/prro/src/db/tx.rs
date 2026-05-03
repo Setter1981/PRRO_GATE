@@ -16,12 +16,19 @@ where
     let mut conn = pool.acquire().await?;
     sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
     match f(&mut *conn).await {
-        Ok(r) => {
-            sqlx::query("COMMIT").execute(&mut *conn).await?;
-            Ok(r)
-        }
+        Ok(r) => match sqlx::query("COMMIT").execute(&mut *conn).await {
+            Ok(_) => Ok(r),
+            Err(commit_err) => {
+                // COMMIT can fail (e.g. deferred FK / disk error).  Without
+                // an explicit ROLLBACK the connection would return to the
+                // pool with the transaction still open, poisoning the next
+                // acquire.  Best-effort rollback; surface the COMMIT error.
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(commit_err.into())
+            }
+        },
         Err(e) => {
-            // Best-effort rollback; ignore secondary error.
+            // Closure failed; best-effort rollback, surface the original.
             let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
             Err(e)
         }
