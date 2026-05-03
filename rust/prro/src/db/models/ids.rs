@@ -13,13 +13,21 @@ macro_rules! id_newtype {
         pub struct $name(pub Uuid);
 
         impl $name {
-            pub fn new() -> Self { Self(Uuid::now_v7()) }
-            pub fn from_bytes(b: [u8; 16]) -> Self { Self(Uuid::from_bytes(b)) }
-            pub fn as_bytes(&self) -> &[u8; 16] { self.0.as_bytes() }
+            pub fn new() -> Self {
+                Self(Uuid::now_v7())
+            }
+            pub fn from_bytes(b: [u8; 16]) -> Self {
+                Self(Uuid::from_bytes(b))
+            }
+            pub fn as_bytes(&self) -> &[u8; 16] {
+                self.0.as_bytes()
+            }
         }
 
         impl Default for $name {
-            fn default() -> Self { Self::new() }
+            fn default() -> Self {
+                Self::new()
+            }
         }
 
         impl Type<Sqlite> for $name {
@@ -35,7 +43,9 @@ macro_rules! id_newtype {
             ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
                 // Owned blob: self's lifetime is shorter than 'q, so we copy
                 // the 16-byte UUID into the argument buffer.
-                buf.push(SqliteArgumentValue::Blob(Cow::Owned(self.0.as_bytes().to_vec())));
+                buf.push(SqliteArgumentValue::Blob(Cow::Owned(
+                    self.0.as_bytes().to_vec(),
+                )));
                 Ok(sqlx::encode::IsNull::No)
             }
         }

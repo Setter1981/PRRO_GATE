@@ -17,14 +17,13 @@ async fn fresh_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
 #[tokio::test]
 async fn migration_001_creates_core_tables() {
     let (_d, pool) = fresh_pool().await;
-    let names: HashSet<String> = sqlx::query_scalar(
-        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY 1",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap()
-    .into_iter()
-    .collect();
+    let names: HashSet<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='table' ORDER BY 1")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
     for t in ["fiscal_number_config", "shifts", "node_state", "audit_log"] {
         assert!(names.contains(t), "missing table {t}; have {names:?}");
     }
@@ -45,7 +44,10 @@ async fn migration_002_fiscal_documents_carries_both_hash_columns() {
         "unsigned_xml_sha256",
         "submission_attempted_at",
     ] {
-        assert!(names.contains(col), "fiscal_documents missing {col}; have {names:?}");
+        assert!(
+            names.contains(col),
+            "fiscal_documents missing {col}; have {names:?}"
+        );
     }
 }
 
@@ -103,14 +105,13 @@ async fn migration_002_ingress_inbox_has_unique_idempotency_index() {
 #[tokio::test]
 async fn migration_003_partial_active_indexes_present() {
     let (_d, pool) = fresh_pool().await;
-    let names: HashSet<String> = sqlx::query_scalar(
-        "SELECT name FROM sqlite_master WHERE type='index' ORDER BY 1",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap()
-    .into_iter()
-    .collect();
+    let names: HashSet<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='index' ORDER BY 1")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
     for idx in ["ux_op_fn_inn_active", "ux_op_certs_active_per_fn"] {
         assert!(names.contains(idx), "missing index {idx}; have {names:?}");
     }
@@ -177,20 +178,21 @@ async fn migration_003_operator_certs_supports_rolling_refresh() {
         .execute(&mut *tx)
         .await
         .unwrap();
-    tx.commit().await.expect("atomic rolling refresh must commit");
+    tx.commit()
+        .await
+        .expect("atomic rolling refresh must commit");
 }
 
 #[tokio::test]
 async fn migration_004_offline_and_routing_tables_present() {
     let (_d, pool) = fresh_pool().await;
-    let names: HashSet<String> = sqlx::query_scalar(
-        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY 1",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap()
-    .into_iter()
-    .collect();
+    let names: HashSet<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='table' ORDER BY 1")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
     for t in [
         "offline_sessions",
         "offline_codes",
@@ -212,7 +214,10 @@ async fn migration_004_transport_profiles_carries_channel_kind_and_test_mode() {
             .unwrap();
     let names: HashSet<String> = cols.iter().map(|c| c.1.clone()).collect();
     for col in ["channel_kind", "test_mode"] {
-        assert!(names.contains(col), "transport_profiles missing {col}; have {names:?}");
+        assert!(
+            names.contains(col),
+            "transport_profiles missing {col}; have {names:?}"
+        );
     }
 
     // Behavioural: an invalid channel_kind must be rejected by the CHECK.
@@ -240,7 +245,10 @@ async fn migration_005_licenses_carries_required_columns() {
             .unwrap();
     let names: HashSet<String> = cols.iter().map(|c| c.1.clone()).collect();
     for col in ["tier", "expires_at", "payload_b64", "signature_b64"] {
-        assert!(names.contains(col), "licenses missing {col}; have {names:?}");
+        assert!(
+            names.contains(col),
+            "licenses missing {col}; have {names:?}"
+        );
     }
 }
 
@@ -265,10 +273,14 @@ async fn migration_005_at_most_one_active_license() {
     };
 
     // First active license — OK.
-    insert("basic", 1).await.expect("first active license must insert");
+    insert("basic", 1)
+        .await
+        .expect("first active license must insert");
 
     // Staged inactive license — same DB, must coexist with the active one.
-    insert("pro", 0).await.expect("staged inactive license must coexist");
+    insert("pro", 0)
+        .await
+        .expect("staged inactive license must coexist");
 
     // Second active=1 — must violate ux_lic_active.
     let collision = insert("enterprise", 1)
@@ -482,14 +494,15 @@ async fn migration_004_offline_codes_value_must_be_positive() {
         .execute(&pool)
         .await
         .expect_err("non-positive code_value must violate CHECK");
-        assert!(err.to_string().to_lowercase().contains("check"), "bad={bad}");
+        assert!(
+            err.to_string().to_lowercase().contains("check"),
+            "bad={bad}"
+        );
     }
-    sqlx::query(
-        "INSERT INTO offline_codes(fiscal_number, code_value) VALUES ('1234567890', 1)",
-    )
-    .execute(&pool)
-    .await
-    .expect("code_value = 1 must be allowed");
+    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_value) VALUES ('1234567890', 1)")
+        .execute(&pool)
+        .await
+        .expect("code_value = 1 must be allowed");
 }
 
 #[tokio::test]
@@ -589,7 +602,9 @@ async fn migration_002_delete_related_receipt_blocked_by_self_referrer() {
         .bind(&original)
         .execute(&pool)
         .await
-        .expect_err("ON DELETE RESTRICT must block deletion of original while RETURN references it");
+        .expect_err(
+            "ON DELETE RESTRICT must block deletion of original while RETURN references it",
+        );
     let msg = err.to_string().to_lowercase();
     assert!(msg.contains("foreign key"), "expected FK error, got: {msg}");
 }

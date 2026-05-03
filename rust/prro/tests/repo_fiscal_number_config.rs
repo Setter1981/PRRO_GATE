@@ -1,6 +1,4 @@
-use prro::db::{
-    models::enums::FiscalMode, open_pool, repositories::fiscal_number_config as repo,
-};
+use prro::db::{models::enums::FiscalMode, open_pool, repositories::fiscal_number_config as repo};
 
 async fn fresh() -> sqlx::SqlitePool {
     let dir = tempfile::tempdir().unwrap();
@@ -36,7 +34,10 @@ async fn insert_and_get_roundtrip() {
     assert_eq!(got.org_name.as_deref(), Some("ТОВ Демо"));
     assert!(got.offline_enabled);
     assert!(!got.tsp_enabled);
-    assert!(got.national_check_enabled, "National Check flag must round-trip (drives <L> tag)");
+    assert!(
+        got.national_check_enabled,
+        "National Check flag must round-trip (drives <L> tag)"
+    );
 }
 
 #[tokio::test]

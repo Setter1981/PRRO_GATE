@@ -97,11 +97,12 @@ async fn two_writers_serialize() {
     );
 
     // Both rows must be present after both writers commit.
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_number_config WHERE tax_number = '12345678'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_number_config WHERE tax_number = '12345678'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(count, 2, "both writers must have committed");
 }
 
@@ -168,11 +169,12 @@ async fn rollback_on_commit_failure_keeps_pool_clean() {
         r2
     );
 
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_number_config WHERE fiscal_number = '5555555555'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_number_config WHERE fiscal_number = '5555555555'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(count, 1);
 }
 

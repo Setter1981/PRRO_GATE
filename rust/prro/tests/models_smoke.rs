@@ -20,13 +20,21 @@ fn document_id_monotonic() {
     let a = DocumentId::new();
     let b = DocumentId::new();
     // UUIDv7 is monotonic by construction (time-ordered) — equal-or-greater.
-    assert!(b.as_bytes() >= a.as_bytes(), "two new UUIDv7 should be monotonic: {:?} {:?}", a, b);
+    assert!(
+        b.as_bytes() >= a.as_bytes(),
+        "two new UUIDv7 should be monotonic: {:?} {:?}",
+        a,
+        b
+    );
 }
 
 #[test]
 fn enum_as_str_covers_known_variants() {
     assert_eq!(DocState::Prepared.as_str(), "PREPARED");
-    assert_eq!(DocState::RequiresManualReconciliation.as_str(), "REQUIRES_MANUAL_RECONCILIATION");
+    assert_eq!(
+        DocState::RequiresManualReconciliation.as_str(),
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
     assert_eq!(ShiftState::Opened.as_str(), "OPENED");
     assert_eq!(NodeMode::CryptoDegraded.as_str(), "CRYPTO_DEGRADED");
     assert_eq!(FiscalMode::Test.as_str(), "test");
@@ -90,12 +98,14 @@ async fn shift_id_roundtrips_through_shifts_blob_column() {
     .await
     .unwrap();
 
-    let got: ShiftId = sqlx::query_scalar(
-        "SELECT shift_id FROM shifts WHERE fiscal_number = '5555555555'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(id, got, "round-trip BLOB through real shifts column must be lossless");
+    let got: ShiftId =
+        sqlx::query_scalar("SELECT shift_id FROM shifts WHERE fiscal_number = '5555555555'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        id, got,
+        "round-trip BLOB through real shifts column must be lossless"
+    );
     assert_eq!(got.as_bytes().len(), 16);
 }

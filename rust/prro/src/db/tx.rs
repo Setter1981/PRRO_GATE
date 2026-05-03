@@ -15,7 +15,7 @@ where
 {
     let mut conn = pool.acquire().await?;
     sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-    match f(&mut *conn).await {
+    match f(&mut conn).await {
         Ok(r) => match sqlx::query("COMMIT").execute(&mut *conn).await {
             Ok(_) => Ok(r),
             Err(commit_err) => {
