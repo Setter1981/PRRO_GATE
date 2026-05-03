@@ -384,8 +384,8 @@ CREATE TABLE fiscal_number_config (
     tsp_enabled            INTEGER NOT NULL DEFAULT 0  CHECK (tsp_enabled IN (0,1)),
     offline_enabled        INTEGER NOT NULL DEFAULT 1  CHECK (offline_enabled IN (0,1)),
     national_check_enabled INTEGER NOT NULL DEFAULT 0  CHECK (national_check_enabled IN (0,1)),
-    min_offline_codes      INTEGER NOT NULL DEFAULT 0,
-    max_offline_codes      INTEGER NOT NULL DEFAULT 0,
+    min_offline_codes      INTEGER NOT NULL DEFAULT 0  CHECK (min_offline_codes >= 0),
+    max_offline_codes      INTEGER NOT NULL DEFAULT 0  CHECK (max_offline_codes >= 0 AND max_offline_codes >= min_offline_codes),
     created_at             TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
     updated_at             TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 ) STRICT;
@@ -640,8 +640,13 @@ CREATE TABLE fiscal_documents (
     related_receipt_id         BLOB,
     created_at                 TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
     updated_at                 TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-    FOREIGN KEY (fiscal_number) REFERENCES fiscal_number_config(fiscal_number) ON DELETE RESTRICT,
-    FOREIGN KEY (shift_id)     REFERENCES shifts(shift_id) ON DELETE RESTRICT
+    FOREIGN KEY (fiscal_number)       REFERENCES fiscal_number_config(fiscal_number) ON DELETE RESTRICT,
+    FOREIGN KEY (shift_id)            REFERENCES shifts(shift_id)                    ON DELETE RESTRICT,
+    -- Forward FK: offline_sessions is created in migration 004.  SQLite declares
+    -- the constraint at CREATE time and enforces it at write time.
+    FOREIGN KEY (offline_session_id)  REFERENCES offline_sessions(offline_session_id) ON DELETE RESTRICT,
+    -- Self-FK for cancellation / technical-return linkage.
+    FOREIGN KEY (related_receipt_id)  REFERENCES fiscal_documents(document_id)        ON DELETE RESTRICT
 ) STRICT;
 
 CREATE INDEX ix_fd_fn_lnd     ON fiscal_documents(fiscal_number, lnd);
@@ -1539,10 +1544,14 @@ Add to `rust/prro/Cargo.toml` `[package.metadata]`:
 # Use offline mode in CI; locally we run with DATABASE_URL.
 ```
 
-Set up `.env.example` and add `.env` to `.gitignore`:
+Set up `.env.example` and add `.env` to `.gitignore`.  See the actual
+`rust/prro/.env.example` for the canonical template — it documents two
+modes (SQLX_OFFLINE=true day-to-day; absolute DATABASE_URL only when
+`cargo sqlx prepare` regenerates the cache).  Relative `sqlite:./var/...`
+paths do NOT resolve from cargo proc-macro CWD and were the source of
+two T8 pitfalls.
 
 ```bash
-echo 'DATABASE_URL=sqlite:./var/prro.dev.db' > rust/prro/.env.example
 echo '.env' >> rust/prro/.gitignore
 ```
 
@@ -1566,11 +1575,24 @@ async fn main() -> anyhow::Result<()> {
 Run from `rust/prro/`:
 ```bash
 cargo run --example bootstrap_dev_db
-echo "DATABASE_URL=sqlite:./var/prro.dev.db" > .env
+echo "SQLX_OFFLINE=true" > .env   # day-to-day mode; uses committed .sqlx/ cache
 ```
 
-For `cargo sqlx prepare` (committing the `.sqlx/` offline cache used by Task
-16 CI), `sqlx-cli` is needed *once*: `cargo install sqlx-cli --no-default-features --features sqlite`. Day-to-day dev uses `cargo build/test` only.
+For `cargo sqlx prepare` (regenerating `.sqlx/` after a SQL change),
+`sqlx-cli` is needed *once*: `cargo install sqlx-cli --no-default-features --features sqlite`.
+Then run from `rust/prro/` (NOT `--workspace`, which writes to the
+workspace root that sqlx-macros for `prro` does not consult), with the
+absolute path to the dev DB:
+
+```bash
+# from rust/prro/
+DATABASE_URL=sqlite:///<absolute-path>/var/prro.dev.db cargo sqlx prepare
+git add .sqlx/
+```
+
+Relative `sqlite:./var/...` does NOT resolve from cargo's proc-macro CWD
+— always use absolute, or rely on SQLX_OFFLINE=true with a committed
+`.sqlx/` cache.
 
 - [ ] **Step 2: Write `FnConfig` struct + repo functions**
 
@@ -1726,12 +1748,22 @@ pub mod fiscal_number_config;
 - [ ] **Step 3: Generate `sqlx-data.json` for offline build**
 
 ```bash
+# from rust/prro/, with absolute path to the dev DB you bootstrapped above:
 cd rust/prro
-DATABASE_URL=sqlite:./var/prro.dev.db cargo sqlx prepare
-git add .sqlx
+DATABASE_URL=sqlite:///<absolute-path>/var/prro.dev.db cargo sqlx prepare
+git add .sqlx/
 ```
 
-(creates `.sqlx/` cache directory; required for `SQLX_OFFLINE=true` CI builds.)
+Notes:
+- Relative `sqlite:./var/...` does NOT resolve from cargo's proc-macro
+  CWD — always use absolute.
+- Do NOT pass `--workspace` to `cargo sqlx prepare`: it writes the cache
+  to the workspace root `.sqlx/`, which sqlx-macros for the `prro`
+  crate does not consult.  Run from `rust/prro/` without `--workspace`.
+
+The `.sqlx/` cache makes `SQLX_OFFLINE=true cargo build` work without
+a live DB — used by Task 16 CI and recommended for day-to-day dev
+(set `SQLX_OFFLINE=true` in `.env`).
 
 - [ ] **Step 4: Write tests**
 
@@ -1964,7 +1996,7 @@ async fn fresh_with_fn() -> (sqlx::SqlitePool, String) {
         vat_payer_inn: None,
         fiscal_mode: FiscalMode::Test,
         org_name: None, point_name: None, org_address: None,
-        tsp_enabled: false, offline_enabled: true,
+        tsp_enabled: false, offline_enabled: true, national_check_enabled: false,
         min_offline_codes: 0, max_offline_codes: 0,
     }).await.unwrap();
     (pool, "4000000001".to_string())
@@ -2220,7 +2252,7 @@ async fn fresh_with_fn() -> (sqlx::SqlitePool, String) {
         vat_payer_inn: None,
         fiscal_mode: FiscalMode::Test,
         org_name: None, point_name: None, org_address: None,
-        tsp_enabled: false, offline_enabled: true,
+        tsp_enabled: false, offline_enabled: true, national_check_enabled: false,
         min_offline_codes: 0, max_offline_codes: 0,
     }).await.unwrap();
     (pool, "4000000001".to_string())
@@ -2493,7 +2525,7 @@ async fn fresh_with_fn() -> (sqlx::SqlitePool, String) {
         vat_payer_inn: None,
         fiscal_mode: FiscalMode::Test,
         org_name: None, point_name: None, org_address: None,
-        tsp_enabled: false, offline_enabled: true,
+        tsp_enabled: false, offline_enabled: true, national_check_enabled: false,
         min_offline_codes: 0, max_offline_codes: 0,
     }).await.unwrap();
     (pool, "4000000001".to_string())
@@ -2825,7 +2857,7 @@ async fn fresh_with_fn() -> (sqlx::SqlitePool, String) {
         tax_number: "12345678".into(), vat_payer_inn: None,
         fiscal_mode: FiscalMode::Test,
         org_name: None, point_name: None, org_address: None,
-        tsp_enabled: false, offline_enabled: true,
+        tsp_enabled: false, offline_enabled: true, national_check_enabled: false,
         min_offline_codes: 0, max_offline_codes: 0,
     }).await.unwrap();
     (pool, "4000000001".to_string())
