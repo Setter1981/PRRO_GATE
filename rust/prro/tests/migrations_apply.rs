@@ -231,6 +231,69 @@ async fn migration_004_transport_profiles_carries_channel_kind_and_test_mode() {
 }
 
 #[tokio::test]
+async fn migration_005_licenses_carries_required_columns() {
+    let (_d, pool) = fresh_pool().await;
+    let cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
+        sqlx::query_as("PRAGMA table_info(licenses)")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let names: HashSet<String> = cols.iter().map(|c| c.1.clone()).collect();
+    for col in ["tier", "expires_at", "payload_b64", "signature_b64"] {
+        assert!(names.contains(col), "licenses missing {col}; have {names:?}");
+    }
+}
+
+#[tokio::test]
+async fn migration_005_at_most_one_active_license() {
+    let (_d, pool) = fresh_pool().await;
+
+    let insert = |tier: &'static str, active: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO licenses(tin, fn_numbers_json, issued_at, expires_at, tier, \
+                    payload_b64, signature_b64, active) \
+                 VALUES ('12345678', '[]', '2026-01-01T00:00:00Z', '2027-01-01T00:00:00Z', \
+                    ?, 'p', 's', ?)",
+            )
+            .bind(tier)
+            .bind(active)
+            .execute(&pool)
+            .await
+        }
+    };
+
+    // First active license — OK.
+    insert("basic", 1).await.expect("first active license must insert");
+
+    // Staged inactive license — same DB, must coexist with the active one.
+    insert("pro", 0).await.expect("staged inactive license must coexist");
+
+    // Second active=1 — must violate ux_lic_active.
+    let collision = insert("enterprise", 1)
+        .await
+        .expect_err("two active licenses must violate ux_lic_active");
+    let msg = collision.to_string().to_lowercase();
+    assert!(
+        msg.contains("unique") || msg.contains("constraint"),
+        "expected UNIQUE constraint error, got: {msg}"
+    );
+
+    // Atomic upgrade: deactivate old + activate staged in one tx — must succeed.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE licenses SET active = 0 WHERE tier = 'basic'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE licenses SET active = 1 WHERE tier = 'pro'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.expect("atomic license swap must commit");
+}
+
+#[tokio::test]
 async fn migration_001_strict_typing_rejects_text_in_int_column() {
     let (_d, pool) = fresh_pool().await;
     sqlx::query(
