@@ -1,6 +1,6 @@
 # PRRO Gateway — Full Rust Rewrite Design
 
-**Status:** Draft v3 — second-round review fixes applied; awaiting user sign-off
+**Status:** Draft v3.1 — third-round doc-cleanup; non-blocking; ready for writing-plans
 **Date:** 2026-04-22
 **Owner:** Setter1981 + pair-AI
 **Target:** Single Rust binary on retail (Windows + Linux), full feature parity with current Python gateway, freeze Python after cutover.
@@ -9,6 +9,7 @@
 - v1 (initial): 30 decisions from 7-section brainstorm.
 - v2 (1st-review): added decisions #31–#37 closing 3 HIGH + 3 MED findings (idempotency conflict policy, MAC chain alignment, DpsSubmission struct, per-table FK policy, musl Linux target, SQLite bundled pin, M8 packaging).
 - v3 (2nd-review): added decisions #38–#41 closing 1 HIGH + 2 MED + 2 LOW findings (DpsStatusQuery + ambiguous-outcome FN block, with_immediate sqlx tx primitive, maintenance/live CLI split, Rust-idiomatic CSRF generator).
+- v3.1 (3rd-review, non-blocking): doc-cleanup of §5.6 — replaced stale `fetch_status(fiscal_no)` reference with link to `DpsChannel::query_status` + §8.5 flow; added stage-gating note (pre-send/pre-sign rows NOT eligible for DPS reconciliation; needs `submission_attempted_at` marker — captured as a writing-plans M3/M4 task, not a spec-level decision).
 
 ---
 
@@ -489,7 +490,24 @@ Whitelist table in `transports/dps_grpc.rs`. Code → `ErrorClass` enum (`Reject
 
 ### 5.6 Recovery (invariant #8)
 
-Boot phases: `BOOT → RECOVERY → READY`. Recovery scans `fiscal_documents` in non-final states, attempts reconciliation against DPS (`fetch_status(fiscal_no)`). Dangling shifts surfaced in `/admin/ui/recovery`.
+Boot phases: `BOOT → RECOVERY → READY`. Recovery scans
+`fiscal_documents` in non-final states and reconciles against DPS
+through `DpsChannel::query_status(DpsStatusQuery)` — see §8.5 for
+the full query/outcome contract and the FN hard-block on ambiguous
+results. Dangling shifts surfaced in `/admin/ui/recovery`.
+
+**Stage gating (writing-plans hand-off note).** Reconciliation through
+DPS is only meaningful for documents that reached the submit attempt:
+`unsigned_xml_sha256` (used by `ByLocalIdentity`) is materialised at
+sign-stage, and `server_fiscal_no` (used by `ByServerFiscalNo`) only
+appears after a successful KVT1. Pre-send / pre-sign rows
+(`PREPARED`, `SIGNED` without a submission attempt) are NOT eligible
+for DPS reconciliation — they are simply restartable in the local
+worker. The implementation must carry a `submission_attempted_at`
+timestamp (or equivalent stage marker) on `fiscal_documents`, and the
+recovery loop branches on it. This is a M3/M4 implementation detail,
+not a spec-level decision; called out here so the writing-plans phase
+captures it as a discrete task.
 
 ### 5.7 Graceful shutdown (invariant #9)
 
