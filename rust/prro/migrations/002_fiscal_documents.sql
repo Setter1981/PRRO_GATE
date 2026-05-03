@@ -34,8 +34,17 @@ CREATE TABLE fiscal_documents (
     related_receipt_id         BLOB,
     created_at                 TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
     updated_at                 TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-    FOREIGN KEY (fiscal_number) REFERENCES fiscal_number_config(fiscal_number) ON DELETE RESTRICT,
-    FOREIGN KEY (shift_id)     REFERENCES shifts(shift_id) ON DELETE RESTRICT
+    FOREIGN KEY (fiscal_number)       REFERENCES fiscal_number_config(fiscal_number) ON DELETE RESTRICT,
+    FOREIGN KEY (shift_id)            REFERENCES shifts(shift_id)                    ON DELETE RESTRICT,
+    -- Forward FK: offline_sessions is created in migration 004.  SQLite
+    -- declares the constraint at CREATE time and enforces it at write time
+    -- (foreign_keys=ON is set in db::open_pool).  Per spec §4.1 — sessions
+    -- are legally tied to their docs, RESTRICT prevents orphaning.
+    FOREIGN KEY (offline_session_id)  REFERENCES offline_sessions(offline_session_id) ON DELETE RESTRICT,
+    -- Self-FK for cancellation / technical-return linkage: a RETURN cannot
+    -- point to a non-existent SELL, and the original SELL cannot be deleted
+    -- while a return references it.
+    FOREIGN KEY (related_receipt_id)  REFERENCES fiscal_documents(document_id)        ON DELETE RESTRICT
 ) STRICT;
 
 CREATE INDEX ix_fd_fn_lnd     ON fiscal_documents(fiscal_number, lnd);

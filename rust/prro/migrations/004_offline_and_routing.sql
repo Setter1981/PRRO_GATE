@@ -18,7 +18,8 @@ CREATE INDEX ix_offline_active ON offline_sessions(fiscal_number, status)
 
 CREATE TABLE offline_codes (
     fiscal_number TEXT    NOT NULL,
-    code_value    INTEGER NOT NULL,
+    -- Offline reservation codes are positive integers issued by DPS.
+    code_value    INTEGER NOT NULL  CHECK (code_value > 0),
     used_at       TEXT,
     used_by_doc   BLOB,
     PRIMARY KEY (fiscal_number, code_value),

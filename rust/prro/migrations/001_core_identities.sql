@@ -18,8 +18,8 @@ CREATE TABLE fiscal_number_config (
     tsp_enabled            INTEGER NOT NULL DEFAULT 0  CHECK (tsp_enabled IN (0,1)),
     offline_enabled        INTEGER NOT NULL DEFAULT 1  CHECK (offline_enabled IN (0,1)),
     national_check_enabled INTEGER NOT NULL DEFAULT 0  CHECK (national_check_enabled IN (0,1)),
-    min_offline_codes      INTEGER NOT NULL DEFAULT 0,
-    max_offline_codes      INTEGER NOT NULL DEFAULT 0,
+    min_offline_codes      INTEGER NOT NULL DEFAULT 0  CHECK (min_offline_codes >= 0),
+    max_offline_codes      INTEGER NOT NULL DEFAULT 0  CHECK (max_offline_codes >= 0 AND max_offline_codes >= min_offline_codes),
     created_at             TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
     updated_at             TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 ) STRICT;

@@ -363,6 +363,136 @@ async fn migration_003_rejects_non_digit_operator_inn() {
 }
 
 #[tokio::test]
+async fn migration_002_fiscal_documents_offline_session_fk_enforced() {
+    let (_d, pool) = fresh_pool().await;
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES ('1234567890', '12345678', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let bogus_session = vec![0xAAu8; 16];
+    let doc_id = vec![0x01u8; 16];
+    let req_id = vec![0x02u8; 16];
+    let sha = vec![0u8; 32];
+    let err = sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical, offline_session_id) \
+         VALUES (?, ?, '1234567890', 1, 'SELL', 'PREPARED', 'b', 't', 'OFFLINE', \
+            '2026-01-01T00:00:00Z', '{}', ?, ?)",
+    )
+    .bind(&doc_id)
+    .bind(&req_id)
+    .bind(&sha)
+    .bind(&bogus_session)
+    .execute(&pool)
+    .await
+    .expect_err("non-existent offline_session_id must violate FK");
+    let msg = err.to_string().to_lowercase();
+    assert!(msg.contains("foreign key"), "expected FK error, got: {msg}");
+}
+
+#[tokio::test]
+async fn migration_002_fiscal_documents_related_receipt_self_fk_enforced() {
+    let (_d, pool) = fresh_pool().await;
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES ('1234567890', '12345678', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let bogus_related = vec![0xBBu8; 16];
+    let doc_id = vec![0x03u8; 16];
+    let req_id = vec![0x04u8; 16];
+    let sha = vec![0u8; 32];
+    let err = sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical, related_receipt_id) \
+         VALUES (?, ?, '1234567890', 1, 'RETURN', 'PREPARED', 'b', 't', 'ONLINE', \
+            '2026-01-01T00:00:00Z', '{}', ?, ?)",
+    )
+    .bind(&doc_id)
+    .bind(&req_id)
+    .bind(&sha)
+    .bind(&bogus_related)
+    .execute(&pool)
+    .await
+    .expect_err("non-existent related_receipt_id must violate self-FK");
+    let msg = err.to_string().to_lowercase();
+    assert!(msg.contains("foreign key"), "expected FK error, got: {msg}");
+}
+
+#[tokio::test]
+async fn migration_001_offline_bounds_check_enforced() {
+    let (_d, pool) = fresh_pool().await;
+    // Negative min_offline_codes
+    let err1 = sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode, min_offline_codes) \
+         VALUES ('1234567890', '12345678', 'test', -1)",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("negative min_offline_codes must be rejected");
+    assert!(err1.to_string().to_lowercase().contains("check"));
+
+    // max < min
+    let err2 = sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode, \
+            min_offline_codes, max_offline_codes) \
+         VALUES ('2222222222', '12345678', 'test', 10, 5)",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("max < min must be rejected");
+    assert!(err2.to_string().to_lowercase().contains("check"));
+
+    // Boundary case: max == min → allowed.
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode, \
+            min_offline_codes, max_offline_codes) \
+         VALUES ('3333333333', '12345678', 'test', 5, 5)",
+    )
+    .execute(&pool)
+    .await
+    .expect("max == min must be allowed");
+}
+
+#[tokio::test]
+async fn migration_004_offline_codes_value_must_be_positive() {
+    let (_d, pool) = fresh_pool().await;
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES ('1234567890', '12345678', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    for bad in [0i64, -1, -1000] {
+        let err = sqlx::query(
+            "INSERT INTO offline_codes(fiscal_number, code_value) VALUES ('1234567890', ?)",
+        )
+        .bind(bad)
+        .execute(&pool)
+        .await
+        .expect_err("non-positive code_value must violate CHECK");
+        assert!(err.to_string().to_lowercase().contains("check"), "bad={bad}");
+    }
+    sqlx::query(
+        "INSERT INTO offline_codes(fiscal_number, code_value) VALUES ('1234567890', 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("code_value = 1 must be allowed");
+}
+
+#[tokio::test]
 async fn migration_001_strict_typing_rejects_text_in_int_column() {
     let (_d, pool) = fresh_pool().await;
     sqlx::query(
