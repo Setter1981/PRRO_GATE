@@ -181,6 +181,56 @@ async fn migration_003_operator_certs_supports_rolling_refresh() {
 }
 
 #[tokio::test]
+async fn migration_004_offline_and_routing_tables_present() {
+    let (_d, pool) = fresh_pool().await;
+    let names: HashSet<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .collect();
+    for t in [
+        "offline_sessions",
+        "offline_codes",
+        "backend_profiles",
+        "transport_profiles",
+        "prro_bindings",
+    ] {
+        assert!(names.contains(t), "missing table {t}; have {names:?}");
+    }
+}
+
+#[tokio::test]
+async fn migration_004_transport_profiles_carries_channel_kind_and_test_mode() {
+    let (_d, pool) = fresh_pool().await;
+    let cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
+        sqlx::query_as("PRAGMA table_info(transport_profiles)")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let names: HashSet<String> = cols.iter().map(|c| c.1.clone()).collect();
+    for col in ["channel_kind", "test_mode"] {
+        assert!(names.contains(col), "transport_profiles missing {col}; have {names:?}");
+    }
+
+    // Behavioural: an invalid channel_kind must be rejected by the CHECK.
+    let err = sqlx::query(
+        "INSERT INTO transport_profiles(transport_profile_id, name, channel_kind, test_mode) \
+         VALUES ('tp-bad', 'bad', 'no_such_kind', 0)",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("CHECK on channel_kind must reject unknown values");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("check") || msg.contains("constraint"),
+        "expected CHECK-constraint error, got: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn migration_001_strict_typing_rejects_text_in_int_column() {
     let (_d, pool) = fresh_pool().await;
     sqlx::query(
