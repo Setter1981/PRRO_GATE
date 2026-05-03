@@ -1,0 +1,126 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-22-rust-rewrite-m1-foundation.md",
+  "specPath": "docs/superpowers/specs/2026-04-22-rust-rewrite-design.md",
+  "scope": "Month 1 — Foundation (workspace, schema, repos, tx primitive, app skeleton, CI matrix)",
+  "lastUpdated": "2026-04-22T00:00:00Z",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: Workspace bootstrap + branch + crate skeleton",
+      "status": "pending",
+      "description": "Create branch `rust-gateway`, register `prro` crate in the workspace, baseline lib.rs/main.rs/Cargo.toml with stub module tree.\n\n```json:metadata\n{\"files\":[\"rust/Cargo.toml\",\"rust/prro/Cargo.toml\",\"rust/prro/src/lib.rs\",\"rust/prro/src/main.rs\"],\"verifyCommand\":\"cd rust && cargo build -p prro && cargo run -p prro -- --version\",\"acceptanceCriteria\":[\"branch rust-gateway exists\",\"cargo build -p prro clean (no warnings)\",\"prro --version prints prro 0.1.0\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: Migration 001 — core identity tables",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "Land fiscal_number_config, shifts, node_state, audit_log per spec §4.\n\n```json:metadata\n{\"files\":[\"rust/prro/migrations/001_core_identities.sql\"],\"verifyCommand\":\"DATABASE_URL=sqlite:/tmp/prro_m1_t1.db cargo sqlx migrate run --source migrations\",\"acceptanceCriteria\":[\"sqlx migrate run applies cleanly\",\"FK policy matches spec table\",\"STRICT tables\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Migration 002 — fiscal_documents + ingress_inbox",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "Distinct hashes (unsigned_xml_sha256 chain + payload_sha256_canonical idempotency) + submission_attempted_at stage marker.\n\n```json:metadata\n{\"files\":[\"rust/prro/migrations/002_fiscal_documents.sql\"],\"verifyCommand\":\"sqlite3 db PRAGMA table_info(fiscal_documents)\",\"acceptanceCriteria\":[\"both sha256 columns NOT NULL/optional per spec\",\"submission_attempted_at present\",\"ingress_inbox UNIQUE(fn,idem_key)\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Migration 003 — operators, certs, printers, tax/pay defs",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "sidecar_operators always-sealed (jks_password_hex + cred_salt). Partial unique idx (fn,inn) WHERE active=1.\n\n```json:metadata\n{\"files\":[\"rust/prro/migrations/003_operators_printers.sql\"],\"verifyCommand\":\"sqlite3 db SELECT name FROM sqlite_master WHERE name='ux_op_fn_inn_active'\",\"acceptanceCriteria\":[\"5 tables created\",\"cred_salt BLOB present\",\"partial unique idx\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Migration 004 — offline + routing",
+      "status": "pending",
+      "blockedBy": [3],
+      "description": "offline_sessions, offline_codes, backend_profiles, transport_profiles (channel_kind+test_mode), prro_bindings.\n\n```json:metadata\n{\"files\":[\"rust/prro/migrations/004_offline_and_routing.sql\"],\"verifyCommand\":\"sqlite3 db PRAGMA table_info(transport_profiles)\",\"acceptanceCriteria\":[\"channel_kind+test_mode present\",\"5 tables created\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Migration 005 — licenses",
+      "status": "pending",
+      "blockedBy": [4],
+      "description": "Commercial-tier licenses kept per spec.\n\n```json:metadata\n{\"files\":[\"rust/prro/migrations/005_licenses.sql\"],\"verifyCommand\":\"sqlite3 db PRAGMA table_info(licenses)\",\"acceptanceCriteria\":[\"licenses table with tier/expires_at/payload_b64/signature_b64\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: db::tx::with_immediate helper + single-writer regression test",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "Spec decision #39. Helper acquires raw conn + manual BEGIN IMMEDIATE/COMMIT/ROLLBACK. Two-writer contention test.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/db/mod.rs\",\"rust/prro/src/db/tx.rs\",\"rust/prro/tests/tx_with_immediate_lock.rs\"],\"verifyCommand\":\"cargo test --test tx_with_immediate_lock\",\"acceptanceCriteria\":[\"two writers serialize on RESERVED lock\",\"rollback on Err removes inserted row\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: UUIDv7 ids + sqlx::Type enum wrappers",
+      "status": "pending",
+      "blockedBy": [6],
+      "description": "DocumentId/RequestId/ShiftId/OperatorId/PrinterId/OfflineSessionId newtypes; DocState/ShiftState/NodeMode/Protocol/DocType/FiscalMode/Severity/InboxStatus enums.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/db/models/ids.rs\",\"rust/prro/src/db/models/enums.rs\",\"rust/prro/tests/models_smoke.rs\"],\"verifyCommand\":\"cargo test --test models_smoke\",\"acceptanceCriteria\":[\"5 tests pass\",\"UUIDv7 16B + monotonic\",\"sqlx round-trip works\"]}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 8: FiscalNumberConfigRepo + tests",
+      "status": "pending",
+      "blockedBy": [7],
+      "description": "insert/get/list_all/update_org_metadata with sqlx::query! compile-time SQL.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/db/repositories/fiscal_number_config.rs\",\"rust/prro/tests/repo_fiscal_number_config.rs\"],\"verifyCommand\":\"cargo test --test repo_fiscal_number_config\",\"acceptanceCriteria\":[\"4 tests pass\",\"sqlx prepare succeeds\"]}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 9: ShiftsRepo + state guard tests",
+      "status": "pending",
+      "blockedBy": [8],
+      "description": "insert_created/transition/get + allowed_transition() whitelist + CAS UPDATE.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/db/repositories/shifts.rs\",\"rust/prro/tests/repo_shifts.rs\"],\"verifyCommand\":\"cargo test --test repo_shifts\",\"acceptanceCriteria\":[\"5 tests pass\",\"forbidden transitions blocked in code\",\"CAS rejects on state divergence\"]}\n```"
+    },
+    {
+      "id": 10,
+      "subject": "Task 10: FiscalDocumentRepo + state CAS test",
+      "status": "pending",
+      "blockedBy": [9],
+      "description": "NewDocument with both payload_sha256_canonical + unsigned_xml_sha256. transition_state CAS + whitelist. list_pending_for_fn excludes final states.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/db/repositories/fiscal_documents.rs\",\"rust/prro/tests/repo_fiscal_documents_state_cas.rs\"],\"verifyCommand\":\"cargo test --test repo_fiscal_documents_state_cas\",\"acceptanceCriteria\":[\"4 tests pass\",\"CAS rejects on diverged state\",\"forbidden transitions code-blocked\"]}\n```"
+    },
+    {
+      "id": 11,
+      "subject": "Task 11: IngressInboxRepo + Created/Replay/Conflict outcomes",
+      "status": "pending",
+      "blockedBy": [10, 6],
+      "description": "Spec §6.2 / decision #31 — same key+matching hash = Replay; differing hash = Conflict; first time = Created. All inside with_immediate.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/db/repositories/ingress_inbox.rs\",\"rust/prro/tests/repo_ingress_inbox_idempotency.rs\"],\"verifyCommand\":\"cargo test --test repo_ingress_inbox_idempotency\",\"acceptanceCriteria\":[\"3 tests pass\",\"Conflict carries existing+submitted hashes\"]}\n```"
+    },
+    {
+      "id": 12,
+      "subject": "Task 12: AuditLogRepo",
+      "status": "pending",
+      "blockedBy": [7],
+      "description": "append/list_for_entity (DESC by audit_id).\n\n```json:metadata\n{\"files\":[\"rust/prro/src/db/repositories/audit_log.rs\",\"rust/prro/tests/repo_audit_log.rs\"],\"verifyCommand\":\"cargo test --test repo_audit_log\",\"acceptanceCriteria\":[\"2 tests pass\",\"DESC ordering by audit_id\"]}\n```"
+    },
+    {
+      "id": 13,
+      "subject": "Task 13: NodeStateRepo + seed_prevhash",
+      "status": "pending",
+      "blockedBy": [8],
+      "description": "upsert_initial/get/seed_prevhash for the chain bootstrap CLI.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/db/repositories/node_state.rs\",\"rust/prro/tests/repo_node_state.rs\"],\"verifyCommand\":\"cargo test --test repo_node_state\",\"acceptanceCriteria\":[\"3 tests pass\",\"seed_prevhash returns false for unknown FN\"]}\n```"
+    },
+    {
+      "id": 14,
+      "subject": "Task 14: AppConfig + App composition root",
+      "status": "pending",
+      "blockedBy": [5, 11, 12, 13],
+      "description": "AppConfig TOML+serde; App::boot opens pool + runs migrations; serve subcommand idles for SIGINT.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/config/mod.rs\",\"rust/prro/src/app.rs\",\"rust/prro/src/main.rs\",\"rust/prro/tests/app_boot.rs\"],\"verifyCommand\":\"cargo test --test app_boot\",\"acceptanceCriteria\":[\"AppConfig parses TOML\",\"App::boot applies migrations\",\"serve idles for SIGINT\"]}\n```"
+    },
+    {
+      "id": 15,
+      "subject": "Task 15: PID file lock + minimal `prro doctor`",
+      "status": "pending",
+      "blockedBy": [14],
+      "description": "Cross-platform fs4 exclusive lock; doctor checks config+DB+lock+listen-addr.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/runtime/singleton.rs\",\"rust/prro/src/doctor.rs\",\"rust/prro/etc/prro.example.toml\",\"rust/prro/tests/singleton_lock.rs\"],\"verifyCommand\":\"cargo test --test singleton_lock && cargo run -p prro -- doctor --config etc/prro.example.toml\",\"acceptanceCriteria\":[\"second lock attempt fails\",\"lock releases on drop\",\"doctor exits 0 with all OK lines\"]}\n```"
+    },
+    {
+      "id": 16,
+      "subject": "Task 16: CI matrix — Linux musl + Linux gnu + Windows MSVC",
+      "status": "pending",
+      "blockedBy": [15],
+      "description": "GitHub Actions builds prro on all 3 production targets. SQLX_OFFLINE=true.\n\n```json:metadata\n{\"files\":[\".github/workflows/rust-prro.yml\"],\"verifyCommand\":\"open PR rust-gateway → main; CI matrix passes\",\"acceptanceCriteria\":[\"all 3 jobs green\",\"sqlx offline cache used\"]}\n```"
+    }
+  ]
+}
