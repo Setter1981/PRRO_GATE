@@ -345,18 +345,18 @@ git push origin rust-gateway
 - Create: `rust/prro/migrations/001_core_identities.sql`
 
 **Acceptance Criteria:**
-- [ ] `sqlx migrate run` against an empty SQLite DB applies cleanly
-- [ ] `PRAGMA foreign_keys = ON; PRAGMA strict = ON;` does not break any insert in fixtures
+- [ ] `sqlx::migrate!()` against a temp SQLite file applies cleanly via `db::open_pool`
+- [ ] DDL contains `STRICT` keyword on every fiscal table (grep)
+- [ ] STRICT typing enforced: inserting a TEXT into an INTEGER column returns an error in a fixture test
 - [ ] FK policy matches spec table (RESTRICT for shifts→fn_config, audit_log has no FK)
 
 **Verify:**
 ```bash
-cd rust/prro
-DATABASE_URL=sqlite:/tmp/prro_m1_t1.db cargo sqlx database create
-DATABASE_URL=sqlite:/tmp/prro_m1_t1.db cargo sqlx migrate run --source migrations
-sqlite3 /tmp/prro_m1_t1.db "SELECT name FROM sqlite_master WHERE type='table' ORDER BY 1;"
+# Bundled libsqlite3-sys is the source of truth, NOT the system sqlite3 CLI
+# (system sqlite3 is 3.45.x in WSL; runtime is whatever libsqlite3-sys ships).
+cargo test -p prro --test migrations_apply
 ```
-Expected output contains: `_sqlx_migrations`, `audit_log`, `fiscal_number_config`, `node_state`, `shifts`.
+Expected output: `test migrations_apply::migration_001_creates_core_tables ... ok` (and STRICT-enforcement test).
 
 **Steps:**
 
@@ -366,9 +366,10 @@ Create `rust/prro/migrations/001_core_identities.sql`:
 
 ```sql
 -- 001 — core identity tables.  Per spec §4.
-
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
+--
+-- NB: connection-level pragmas (journal_mode, foreign_keys, busy_timeout,
+-- synchronous) live in `db::open_pool` via SqliteConnectOptions — they cannot
+-- be set inside a transaction, and sqlx wraps each migration in one.
 
 CREATE TABLE fiscal_number_config (
     fiscal_number          TEXT    PRIMARY KEY  CHECK (length(fiscal_number) = 10),
@@ -457,39 +458,120 @@ CREATE TABLE audit_log (
 CREATE INDEX ix_audit_entity ON audit_log(entity_type, entity_id, created_at);
 ```
 
-- [ ] **Step 2: Install sqlx-cli**
+- [ ] **Step 2: Add `db::open_pool` (early — needed by tests)**
+
+This helper lands here in Task 1 instead of Task 6 because every migration test depends on it. Task 6 keeps the `with_immediate` helper.
+
+Replace `rust/prro/src/db/mod.rs` with:
+
+```rust
+pub mod tx;
+pub mod models;
+pub mod repositories;
+
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::SqlitePool;
+use std::path::Path;
+use std::str::FromStr;
+
+/// Open a connection pool against the given SQLite file.
+///
+/// Sets WAL journal mode, busy_timeout 5s, foreign_keys ON, NORMAL synchronous.
+/// Migrations are applied via `sqlx::migrate!()`.
+pub async fn open_pool(path: &Path) -> anyhow::Result<SqlitePool> {
+    let url = format!("sqlite:{}", path.display());
+    let opts = SqliteConnectOptions::from_str(&url)?
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_secs(5));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(8)
+        .connect_with(opts)
+        .await?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
+    Ok(pool)
+}
+```
+
+- [ ] **Step 3: Add unified migration test**
+
+Create `rust/prro/tests/migrations_apply.rs`:
+
+```rust
+//! One verification path for all M1 migrations: apply via sqlx::migrate!,
+//! assert table/index set, and prove STRICT typing rejects bad inserts.
+//! Runs against bundled libsqlite3-sys, NOT the system sqlite3 CLI.
+
+use std::collections::HashSet;
+
+async fn fresh_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = prro::db::open_pool(&dir.path().join("m.db"))
+        .await
+        .expect("open_pool runs migrations");
+    (dir, pool)
+}
+
+#[tokio::test]
+async fn migration_001_creates_core_tables() {
+    let (_d, pool) = fresh_pool().await;
+    let names: HashSet<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .collect();
+    for t in ["fiscal_number_config", "shifts", "node_state", "audit_log"] {
+        assert!(names.contains(t), "missing table {t}; have {names:?}");
+    }
+}
+
+#[tokio::test]
+async fn migration_001_strict_typing_rejects_text_in_int_column() {
+    let (_d, pool) = fresh_pool().await;
+    // tsp_enabled is INTEGER NOT NULL — STRICT must reject 'abc'
+    sqlx::query!(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) VALUES (?, '0', 'test')",
+        "1234567890"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let err = sqlx::query("UPDATE fiscal_number_config SET tsp_enabled = 'abc' WHERE fiscal_number = '1234567890'")
+        .execute(&pool)
+        .await
+        .expect_err("STRICT must reject TEXT in INTEGER column");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("INTEGER") || msg.contains("STRICT") || msg.contains("type"),
+        "expected STRICT/type-mismatch error, got: {msg}"
+    );
+}
+```
+
+- [ ] **Step 4: Run + assert**
 
 ```bash
-cargo install sqlx-cli --no-default-features --features sqlite
+cargo test -p prro --test migrations_apply
 ```
 
-- [ ] **Step 3: Apply + assert table set**
+Both tests must pass.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-cd rust/prro
-DATABASE_URL=sqlite:/tmp/prro_m1_t1.db cargo sqlx database create
-DATABASE_URL=sqlite:/tmp/prro_m1_t1.db cargo sqlx migrate run --source migrations
-sqlite3 /tmp/prro_m1_t1.db "SELECT name FROM sqlite_master WHERE type='table' ORDER BY 1;"
-```
-
-Expected output:
-```
-_sqlx_migrations
-audit_log
-fiscal_number_config
-node_state
-shifts
-```
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add rust/prro/migrations/001_core_identities.sql
-git commit -m "feat(rust/db): migration 001 — core identity tables
+git add rust/prro/migrations/001_core_identities.sql \
+        rust/prro/src/db/mod.rs \
+        rust/prro/tests/migrations_apply.rs
+git commit -m "feat(rust/db): migration 001 + open_pool + migration smoke test
 
 fiscal_number_config + shifts + node_state + audit_log.  STRICT
-tables, FKs per spec §4 decision #34: shifts→fn_config RESTRICT,
-node_state→fn_config RESTRICT, audit_log no FK."
+tables, FKs per spec §4 decision #34.  open_pool + sqlx::migrate!
+land here so Tasks 2-5 share one verification path (no sqlx-cli)."
 git push origin rust-gateway
 ```
 
@@ -509,12 +591,9 @@ git push origin rust-gateway
 
 **Verify:**
 ```bash
-cd rust/prro
-DATABASE_URL=sqlite:/tmp/prro_m1_t2.db cargo sqlx database create
-DATABASE_URL=sqlite:/tmp/prro_m1_t2.db cargo sqlx migrate run --source migrations
-sqlite3 /tmp/prro_m1_t2.db "PRAGMA table_info(fiscal_documents);" | grep -E "unsigned_xml_sha256|payload_sha256_canonical"
+cargo test -p prro --test migrations_apply
 ```
-Expected: both columns appear, type BLOB.
+Add a sub-test in `tests/migrations_apply.rs` that asserts both `unsigned_xml_sha256` and `payload_sha256_canonical` are present in `fiscal_documents` (and that `ingress_inbox` has UNIQUE `(fiscal_number, idempotency_key)`).
 
 **Steps:**
 
@@ -606,17 +685,15 @@ CREATE INDEX ix_inbox_pending ON ingress_inbox(fiscal_number, received_at)
     WHERE status IN ('NEW','PROCESSING');
 ```
 
-- [ ] **Step 2: Apply + verify columns**
+- [ ] **Step 2: Extend `tests/migrations_apply.rs`**
+
+Add a test that queries `PRAGMA table_info(fiscal_documents)` via sqlx and asserts the presence of `unsigned_xml_sha256`, `payload_sha256_canonical`, `submission_attempted_at`. Add another that queries `sqlite_master` for `ux_inbox_fn_idem`.
 
 ```bash
-cd rust/prro
-rm -f /tmp/prro_m1_t2.db
-DATABASE_URL=sqlite:/tmp/prro_m1_t2.db cargo sqlx database create
-DATABASE_URL=sqlite:/tmp/prro_m1_t2.db cargo sqlx migrate run --source migrations
-sqlite3 /tmp/prro_m1_t2.db "PRAGMA table_info(fiscal_documents);" | grep -E "unsigned_xml_sha256|payload_sha256_canonical|submission_attempted_at"
+cargo test -p prro --test migrations_apply
 ```
 
-Expected: 3 lines.
+All migration_002_* tests must pass.
 
 - [ ] **Step 3: Commit**
 
@@ -648,13 +725,9 @@ git push origin rust-gateway
 
 **Verify:**
 ```bash
-cd rust/prro
-rm -f /tmp/prro_m1_t3.db
-DATABASE_URL=sqlite:/tmp/prro_m1_t3.db cargo sqlx database create
-DATABASE_URL=sqlite:/tmp/prro_m1_t3.db cargo sqlx migrate run --source migrations
-sqlite3 /tmp/prro_m1_t3.db "SELECT name FROM sqlite_master WHERE type='index' AND name = 'ux_op_fn_inn_active';"
+cargo test -p prro --test migrations_apply
 ```
-Expected output: `ux_op_fn_inn_active`.
+Add a sub-test asserting `ux_op_fn_inn_active` is present in `sqlite_master`, AND that `operator_certs` allows two rows with the same `fiscal_number` when only one has `active=1` (decision: PK on `ski_hex`, partial unique idx on `(fn) WHERE active=1` — supports rolling cert refresh).
 
 **Steps:**
 
@@ -688,10 +761,14 @@ BEGIN
     UPDATE sidecar_operators SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
 END;
 
+-- operator_certs: cert cache keyed by ski_hex (cert is uniquely identified
+-- by its Subject Key Identifier).  At most one row per FN may carry
+-- active=1 — enforced by a partial unique index, not by PK.  This supports
+-- rolling refresh: stage a new cert (active=0), then flip in one tx.
 CREATE TABLE operator_certs (
-    fiscal_number    TEXT    PRIMARY KEY,
+    ski_hex          TEXT    PRIMARY KEY  CHECK (length(ski_hex) = 64),
+    fiscal_number    TEXT    NOT NULL,
     cert_fingerprint TEXT    NOT NULL,
-    ski_hex          TEXT    NOT NULL  CHECK (length(ski_hex) = 64),
     cert_der         BLOB    NOT NULL,
     subject_dn       TEXT,
     issuer_dn        TEXT,
@@ -699,10 +776,13 @@ CREATE TABLE operator_certs (
     valid_to         TEXT,
     fetched_at       TEXT    NOT NULL,
     source           TEXT    NOT NULL  CHECK (source IN ('container','cmp','manual')),
+    active           INTEGER NOT NULL DEFAULT 0  CHECK (active IN (0,1)),
     last_refresh_at  TEXT,
     FOREIGN KEY (fiscal_number) REFERENCES fiscal_number_config(fiscal_number) ON DELETE RESTRICT
 ) STRICT;
-CREATE UNIQUE INDEX ux_op_certs_ski ON operator_certs(ski_hex);
+CREATE INDEX ix_op_certs_fn ON operator_certs(fiscal_number);
+CREATE UNIQUE INDEX ux_op_certs_active_per_fn
+    ON operator_certs(fiscal_number) WHERE active = 1;
 
 CREATE TABLE cert_provisioning_config (
     id                  INTEGER PRIMARY KEY  CHECK (id = 1),
@@ -764,17 +844,16 @@ CREATE TABLE payment_type_definitions (
 ) STRICT;
 ```
 
-- [ ] **Step 2: Apply + verify**
+- [ ] **Step 2: Extend `tests/migrations_apply.rs`**
 
 ```bash
-cd rust/prro
-rm -f /tmp/prro_m1_t3.db
-DATABASE_URL=sqlite:/tmp/prro_m1_t3.db cargo sqlx database create
-DATABASE_URL=sqlite:/tmp/prro_m1_t3.db cargo sqlx migrate run --source migrations
-sqlite3 /tmp/prro_m1_t3.db "SELECT name FROM sqlite_master WHERE type='index' AND name = 'ux_op_fn_inn_active';"
+cargo test -p prro --test migrations_apply
 ```
 
-Expected: `ux_op_fn_inn_active`.
+Add a sub-test that:
+- asserts both `ux_op_fn_inn_active` (operators) and `ux_op_certs_active_per_fn` (certs) exist;
+- inserts two `operator_certs` rows with the same `fiscal_number` but different `ski_hex`, only one `active=1` — both inserts succeed;
+- attempts to flip the second row to `active=1` while the first is still active — must fail with UNIQUE-constraint error.
 
 - [ ] **Step 3: Commit**
 
@@ -803,13 +882,9 @@ git push origin rust-gateway
 
 **Verify:**
 ```bash
-cd rust/prro
-rm -f /tmp/prro_m1_t4.db
-DATABASE_URL=sqlite:/tmp/prro_m1_t4.db cargo sqlx database create
-DATABASE_URL=sqlite:/tmp/prro_m1_t4.db cargo sqlx migrate run --source migrations
-sqlite3 /tmp/prro_m1_t4.db "PRAGMA table_info(transport_profiles);" | grep -E "channel_kind|test_mode"
+cargo test -p prro --test migrations_apply
 ```
-Expected: 2 lines.
+Add a sub-test asserting `transport_profiles` has both `channel_kind` and `test_mode` columns, and that all 5 routing/offline tables are created.
 
 **Steps:**
 
@@ -875,17 +950,13 @@ CREATE TABLE prro_bindings (
 ) STRICT;
 ```
 
-- [ ] **Step 2: Apply + verify columns**
+- [ ] **Step 2: Extend `tests/migrations_apply.rs`**
 
 ```bash
-cd rust/prro
-rm -f /tmp/prro_m1_t4.db
-DATABASE_URL=sqlite:/tmp/prro_m1_t4.db cargo sqlx database create
-DATABASE_URL=sqlite:/tmp/prro_m1_t4.db cargo sqlx migrate run --source migrations
-sqlite3 /tmp/prro_m1_t4.db "PRAGMA table_info(transport_profiles);" | grep -E "channel_kind|test_mode"
+cargo test -p prro --test migrations_apply
 ```
 
-Expected: 2 lines.
+Add a sub-test asserting `transport_profiles` has both `channel_kind` and `test_mode` columns and that all 5 offline/routing tables are present.
 
 - [ ] **Step 3: Commit**
 
@@ -913,13 +984,9 @@ git push origin rust-gateway
 
 **Verify:**
 ```bash
-cd rust/prro
-rm -f /tmp/prro_m1_t5.db
-DATABASE_URL=sqlite:/tmp/prro_m1_t5.db cargo sqlx database create
-DATABASE_URL=sqlite:/tmp/prro_m1_t5.db cargo sqlx migrate run --source migrations
-sqlite3 /tmp/prro_m1_t5.db "PRAGMA table_info(licenses);" | grep -E "tier|expires_at"
+cargo test -p prro --test migrations_apply
 ```
-Expected: 2 lines.
+Add a sub-test asserting `licenses` has `tier`, `expires_at`, `payload_b64`, `signature_b64` columns.
 
 **Steps:**
 
@@ -949,17 +1016,13 @@ CREATE TABLE licenses (
 CREATE UNIQUE INDEX ux_lic_active ON licenses(active) WHERE active = 1;
 ```
 
-- [ ] **Step 2: Apply + verify**
+- [ ] **Step 2: Extend `tests/migrations_apply.rs`**
 
 ```bash
-cd rust/prro
-rm -f /tmp/prro_m1_t5.db
-DATABASE_URL=sqlite:/tmp/prro_m1_t5.db cargo sqlx database create
-DATABASE_URL=sqlite:/tmp/prro_m1_t5.db cargo sqlx migrate run --source migrations
-sqlite3 /tmp/prro_m1_t5.db "PRAGMA table_info(licenses);" | grep -E "tier|expires_at"
+cargo test -p prro --test migrations_apply
 ```
 
-Expected: 2 lines.
+Add a sub-test asserting `licenses` has `tier`, `expires_at`, `payload_b64`, `signature_b64` columns.
 
 - [ ] **Step 3: Commit**
 
@@ -991,40 +1054,9 @@ git push origin rust-gateway
 
 **Steps:**
 
-- [ ] **Step 1: Add `db::pool::open` helper**
+- [ ] **Step 1: `db::open_pool` (already landed in Task 1)**
 
-Modify `rust/prro/src/db/mod.rs` to:
-
-```rust
-pub mod tx;
-pub mod models;
-pub mod repositories;
-
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
-use std::path::Path;
-use std::str::FromStr;
-
-/// Open a connection pool against the given SQLite file.
-///
-/// Sets WAL journal mode, busy_timeout 5s, foreign_keys ON, NORMAL synchronous.
-/// Migrations are applied via `sqlx::migrate!()`.
-pub async fn open_pool(path: &Path) -> anyhow::Result<SqlitePool> {
-    let url = format!("sqlite:{}", path.display());
-    let opts = SqliteConnectOptions::from_str(&url)?
-        .create_if_missing(true)
-        .foreign_keys(true)
-        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
-        .busy_timeout(std::time::Duration::from_secs(5));
-    let pool = SqlitePoolOptions::new()
-        .max_connections(8)
-        .connect_with(opts)
-        .await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
-    Ok(pool)
-}
-```
+The `open_pool` helper was introduced earlier in Task 1 so the migration tests have a single verification path. Reuse it here — no edits to `db/mod.rs` are needed in this task except to add the `tx` re-export if not yet present.
 
 - [ ] **Step 2: Implement `with_immediate`**
 
@@ -1511,14 +1543,31 @@ echo 'DATABASE_URL=sqlite:./var/prro.dev.db' > rust/prro/.env.example
 echo '.env' >> rust/prro/.gitignore
 ```
 
-For local dev:
+For local dev (no `sqlx-cli` required — bootstrap the dev DB via our own
+`open_pool`, which already runs `sqlx::migrate!()`):
+
+Add `rust/prro/examples/bootstrap_dev_db.rs`:
+```rust
+//! One-off helper: create `var/prro.dev.db` and apply migrations so that
+//! `sqlx::query!` macros can compile against the dev schema.
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    std::fs::create_dir_all("var")?;
+    let _pool = prro::db::open_pool(std::path::Path::new("var/prro.dev.db")).await?;
+    println!("dev DB ready: var/prro.dev.db");
+    Ok(())
+}
+```
+
+Run from `rust/prro/`:
 ```bash
-cd rust/prro
-mkdir -p var
-DATABASE_URL=sqlite:./var/prro.dev.db cargo sqlx database create
-DATABASE_URL=sqlite:./var/prro.dev.db cargo sqlx migrate run --source migrations
+cargo run --example bootstrap_dev_db
 echo "DATABASE_URL=sqlite:./var/prro.dev.db" > .env
 ```
+
+For `cargo sqlx prepare` (committing the `.sqlx/` offline cache used by Task
+16 CI), `sqlx-cli` is needed *once*: `cargo install sqlx-cli --no-default-features --features sqlite`. Day-to-day dev uses `cargo build/test` only.
 
 - [ ] **Step 2: Write `FnConfig` struct + repo functions**
 
