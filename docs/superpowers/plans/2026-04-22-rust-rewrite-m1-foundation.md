@@ -1593,6 +1593,8 @@ pub struct FnConfig {
     pub org_address: Option<String>,
     pub tsp_enabled: bool,
     pub offline_enabled: bool,
+    /// Drives <L> tag injection in National Check submissions.
+    pub national_check_enabled: bool,
     pub min_offline_codes: i64,
     pub max_offline_codes: i64,
 }
@@ -1608,6 +1610,7 @@ pub struct NewFnConfig {
     pub org_address: Option<String>,
     pub tsp_enabled: bool,
     pub offline_enabled: bool,
+    pub national_check_enabled: bool,
     pub min_offline_codes: i64,
     pub max_offline_codes: i64,
 }
@@ -1617,8 +1620,9 @@ pub async fn insert(pool: &SqlitePool, n: &NewFnConfig) -> sqlx::Result<()> {
         "INSERT INTO fiscal_number_config (
              fiscal_number, tax_number, vat_payer_inn, fiscal_mode,
              org_name, point_name, org_address,
-             tsp_enabled, offline_enabled, min_offline_codes, max_offline_codes
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+             tsp_enabled, offline_enabled, national_check_enabled,
+             min_offline_codes, max_offline_codes
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
         .bind(&n.fiscal_number)
         .bind(&n.tax_number)
@@ -1629,6 +1633,7 @@ pub async fn insert(pool: &SqlitePool, n: &NewFnConfig) -> sqlx::Result<()> {
         .bind(n.org_address.as_deref())
         .bind(n.tsp_enabled as i64)
         .bind(n.offline_enabled as i64)
+        .bind(n.national_check_enabled as i64)
         .bind(n.min_offline_codes)
         .bind(n.max_offline_codes)
         .execute(pool).await?;
@@ -1642,10 +1647,11 @@ pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<FnConfig
                   vat_payer_inn,
                   fiscal_mode    as "fiscal_mode: FiscalMode",
                   org_name, point_name, org_address,
-                  tsp_enabled    as "tsp_enabled: i64",
-                  offline_enabled as "offline_enabled: i64",
-                  min_offline_codes  as "min_offline_codes: i64",
-                  max_offline_codes  as "max_offline_codes: i64"
+                  tsp_enabled            as "tsp_enabled: i64",
+                  offline_enabled        as "offline_enabled: i64",
+                  national_check_enabled as "national_check_enabled: i64",
+                  min_offline_codes      as "min_offline_codes: i64",
+                  max_offline_codes      as "max_offline_codes: i64"
            FROM fiscal_number_config WHERE fiscal_number = ?"#,
         fn_id
     ).fetch_optional(pool).await?;
@@ -1659,6 +1665,7 @@ pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<FnConfig
         org_address: r.org_address,
         tsp_enabled: r.tsp_enabled != 0,
         offline_enabled: r.offline_enabled != 0,
+        national_check_enabled: r.national_check_enabled != 0,
         min_offline_codes: r.min_offline_codes,
         max_offline_codes: r.max_offline_codes,
     }))
@@ -1671,10 +1678,11 @@ pub async fn list_all(pool: &SqlitePool) -> sqlx::Result<Vec<FnConfig>> {
                   vat_payer_inn,
                   fiscal_mode    as "fiscal_mode: FiscalMode",
                   org_name, point_name, org_address,
-                  tsp_enabled    as "tsp_enabled: i64",
-                  offline_enabled as "offline_enabled: i64",
-                  min_offline_codes  as "min_offline_codes: i64",
-                  max_offline_codes  as "max_offline_codes: i64"
+                  tsp_enabled            as "tsp_enabled: i64",
+                  offline_enabled        as "offline_enabled: i64",
+                  national_check_enabled as "national_check_enabled: i64",
+                  min_offline_codes      as "min_offline_codes: i64",
+                  max_offline_codes      as "max_offline_codes: i64"
            FROM fiscal_number_config ORDER BY fiscal_number"#
     ).fetch_all(pool).await?;
     Ok(rows.into_iter().map(|r| FnConfig {
@@ -1687,6 +1695,7 @@ pub async fn list_all(pool: &SqlitePool) -> sqlx::Result<Vec<FnConfig>> {
         org_address: r.org_address,
         tsp_enabled: r.tsp_enabled != 0,
         offline_enabled: r.offline_enabled != 0,
+        national_check_enabled: r.national_check_enabled != 0,
         min_offline_codes: r.min_offline_codes,
         max_offline_codes: r.max_offline_codes,
     }).collect())
@@ -1750,6 +1759,7 @@ fn sample(fn_id: &str) -> repo::NewFnConfig {
         org_address: Some("м. Київ".to_string()),
         tsp_enabled: false,
         offline_enabled: true,
+        national_check_enabled: true,
         min_offline_codes: 0,
         max_offline_codes: 0,
     }
