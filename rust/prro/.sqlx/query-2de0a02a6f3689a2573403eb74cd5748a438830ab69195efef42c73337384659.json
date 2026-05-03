@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT fiscal_number,\n                  tax_number,\n                  vat_payer_inn,\n                  fiscal_mode    as \"fiscal_mode: FiscalMode\",\n                  org_name, point_name, org_address,\n                  tsp_enabled    as \"tsp_enabled: i64\",\n                  offline_enabled as \"offline_enabled: i64\",\n                  min_offline_codes  as \"min_offline_codes: i64\",\n                  max_offline_codes  as \"max_offline_codes: i64\"\n           FROM fiscal_number_config WHERE fiscal_number = ?",
+  "query": "SELECT fiscal_number,\n                  tax_number,\n                  vat_payer_inn,\n                  fiscal_mode    as \"fiscal_mode: FiscalMode\",\n                  org_name, point_name, org_address,\n                  tsp_enabled            as \"tsp_enabled: i64\",\n                  offline_enabled        as \"offline_enabled: i64\",\n                  national_check_enabled as \"national_check_enabled: i64\",\n                  min_offline_codes      as \"min_offline_codes: i64\",\n                  max_offline_codes      as \"max_offline_codes: i64\"\n           FROM fiscal_number_config WHERE fiscal_number = ?",
   "describe": {
     "columns": [
       {
@@ -49,13 +49,18 @@
         "type_info": "Integer"
       },
       {
-        "name": "min_offline_codes: i64",
+        "name": "national_check_enabled: i64",
         "ordinal": 9,
         "type_info": "Integer"
       },
       {
-        "name": "max_offline_codes: i64",
+        "name": "min_offline_codes: i64",
         "ordinal": 10,
+        "type_info": "Integer"
+      },
+      {
+        "name": "max_offline_codes: i64",
+        "ordinal": 11,
         "type_info": "Integer"
       }
     ],
@@ -73,8 +78,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "06628a5d06663f4bbb47cb7085f81fba34ded3e4a1de204ae5c9198266ac237d"
+  "hash": "2de0a02a6f3689a2573403eb74cd5748a438830ab69195efef42c73337384659"
 }

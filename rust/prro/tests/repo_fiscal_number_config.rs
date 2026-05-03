@@ -20,6 +20,7 @@ fn sample(fn_id: &str) -> repo::NewFnConfig {
         org_address: Some("м. Київ".to_string()),
         tsp_enabled: false,
         offline_enabled: true,
+        national_check_enabled: true,
         min_offline_codes: 0,
         max_offline_codes: 0,
     }
@@ -35,6 +36,7 @@ async fn insert_and_get_roundtrip() {
     assert_eq!(got.org_name.as_deref(), Some("ТОВ Демо"));
     assert!(got.offline_enabled);
     assert!(!got.tsp_enabled);
+    assert!(got.national_check_enabled, "National Check flag must round-trip (drives <L> tag)");
 }
 
 #[tokio::test]
