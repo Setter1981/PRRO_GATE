@@ -7,4 +7,5 @@ members = [
     "maria304_driver",
     "prro_escpos",
     "prro_escpos_daemon",
+    "prro",
 ]
