@@ -372,9 +372,11 @@ Create `rust/prro/migrations/001_core_identities.sql`:
 -- be set inside a transaction, and sqlx wraps each migration in one.
 
 CREATE TABLE fiscal_number_config (
-    fiscal_number          TEXT    PRIMARY KEY  CHECK (length(fiscal_number) = 10),
+    -- All-digit checks use `NOT GLOB '*[^0-9]*'` because GLOB '[0-9]*'
+    -- only constrains the FIRST character ('*' = anything-after).
+    fiscal_number          TEXT    PRIMARY KEY  CHECK (length(fiscal_number) = 10 AND NOT fiscal_number GLOB '*[^0-9]*'),
     tax_number             TEXT    NOT NULL,
-    vat_payer_inn          TEXT    CHECK (vat_payer_inn IS NULL OR (length(vat_payer_inn) = 12 AND vat_payer_inn GLOB '[0-9]*')),
+    vat_payer_inn          TEXT    CHECK (vat_payer_inn IS NULL OR (length(vat_payer_inn) = 12 AND NOT vat_payer_inn GLOB '*[^0-9]*')),
     fiscal_mode            TEXT    NOT NULL  CHECK (fiscal_mode IN ('test','prod')),
     org_name               TEXT,
     point_name             TEXT,
@@ -742,7 +744,8 @@ CREATE TABLE sidecar_operators (
     id                BLOB    PRIMARY KEY  CHECK (length(id) = 16),
     fiscal_number     TEXT    NOT NULL,
     operator_name     TEXT,
-    operator_inn      TEXT    NOT NULL  CHECK (length(operator_inn) = 10 AND operator_inn GLOB '[0-9]*'),
+    -- All-digit check: `NOT GLOB '*[^0-9]*'` rejects any non-digit anywhere.
+    operator_inn      TEXT    NOT NULL  CHECK (length(operator_inn) = 10 AND NOT operator_inn GLOB '*[^0-9]*'),
     jks_path          TEXT    NOT NULL,
     jks_password_hex  TEXT    NOT NULL,                  -- always XOR-soft sealed (spec decision #16)
     cred_salt         BLOB    NOT NULL  CHECK (length(cred_salt) = 16),

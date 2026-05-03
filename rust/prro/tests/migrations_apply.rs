@@ -294,6 +294,75 @@ async fn migration_005_at_most_one_active_license() {
 }
 
 #[tokio::test]
+async fn migration_001_rejects_non_digit_fiscal_number() {
+    let (_d, pool) = fresh_pool().await;
+    let err = sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES ('1aaaaaaaaa', '12345678', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("non-digit fiscal_number must violate CHECK");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("check") || msg.contains("constraint"),
+        "expected CHECK error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn migration_001_rejects_non_digit_vat_payer_inn() {
+    let (_d, pool) = fresh_pool().await;
+    let err = sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, vat_payer_inn, fiscal_mode) \
+         VALUES ('1234567890', '12345678', '1aaaaaaaaaaa', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("non-digit vat_payer_inn (right length) must violate CHECK");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("check") || msg.contains("constraint"),
+        "expected CHECK error, got: {msg}"
+    );
+    // Sanity: NULL vat_payer_inn is still allowed.
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, vat_payer_inn, fiscal_mode) \
+         VALUES ('1234567890', '12345678', NULL, 'test')",
+    )
+    .execute(&pool)
+    .await
+    .expect("NULL vat_payer_inn must remain allowed");
+}
+
+#[tokio::test]
+async fn migration_003_rejects_non_digit_operator_inn() {
+    let (_d, pool) = fresh_pool().await;
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES ('1234567890', '12345678', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = sqlx::query(
+        "INSERT INTO sidecar_operators(id, fiscal_number, operator_inn, jks_path, \
+            jks_password_hex, cred_salt) \
+         VALUES (X'00000000000000000000000000000001', '1234567890', '1aaaaaaaaa', \
+            '/tmp/x.jks', 'deadbeef', X'00000000000000000000000000000001')",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("non-digit operator_inn (right length) must violate CHECK");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("check") || msg.contains("constraint"),
+        "expected CHECK error, got: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn migration_001_strict_typing_rejects_text_in_int_column() {
     let (_d, pool) = fresh_pool().await;
     sqlx::query(

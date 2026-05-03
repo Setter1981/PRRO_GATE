@@ -4,7 +4,8 @@ CREATE TABLE sidecar_operators (
     id                BLOB    PRIMARY KEY  CHECK (length(id) = 16),
     fiscal_number     TEXT    NOT NULL,
     operator_name     TEXT,
-    operator_inn      TEXT    NOT NULL  CHECK (length(operator_inn) = 10 AND operator_inn GLOB '[0-9]*'),
+    -- All-digit check: `NOT GLOB '*[^0-9]*'` rejects any non-digit anywhere.
+    operator_inn      TEXT    NOT NULL  CHECK (length(operator_inn) = 10 AND NOT operator_inn GLOB '*[^0-9]*'),
     jks_path          TEXT    NOT NULL,
     jks_password_hex  TEXT    NOT NULL,                  -- always XOR-soft sealed (spec decision #16)
     cred_salt         BLOB    NOT NULL  CHECK (length(cred_salt) = 16),
