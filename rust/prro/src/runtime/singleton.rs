@@ -10,6 +10,7 @@
 
 use anyhow::{anyhow, Context};
 use fs4::fs_std::FileExt;
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,13 @@ pub struct PidLock {
 }
 
 pub fn acquire(db_path: &Path) -> anyhow::Result<PidLock> {
-    let lock_path = db_path.with_extension("pid");
+    // Append `.pid` rather than replacing the extension via
+    // `with_extension("pid")` — otherwise `prro.sqlite3` and any sibling
+    // `prro.<other-ext>` would collapse onto the same `prro.pid` lock and
+    // over-lock distinct databases that happen to share a file stem.
+    let mut s: OsString = db_path.as_os_str().to_owned();
+    s.push(".pid");
+    let lock_path: PathBuf = s.into();
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating lock dir {}", parent.display()))?;
@@ -40,11 +47,15 @@ pub fn acquire(db_path: &Path) -> anyhow::Result<PidLock> {
             lock_path.display()
         )
     })?;
-    // Best-effort PID write so operators can `cat` the file to find the holder.
-    // Truncate first so a leftover PID from a prior run does not appear after ours.
-    let _ = file.set_len(0);
+    // Truncate stale PID from a prior run, then write ours.  Failure here
+    // means the lock IS held but the PID file is unhelpful for diagnostics —
+    // surface the error rather than silently leaving an empty/stale file.
+    file.set_len(0)
+        .with_context(|| format!("truncating lock file {}", lock_path.display()))?;
     let mut writer = &file;
-    let _ = writer.write_all(std::process::id().to_string().as_bytes());
+    writer
+        .write_all(std::process::id().to_string().as_bytes())
+        .with_context(|| format!("writing PID to lock file {}", lock_path.display()))?;
     Ok(PidLock {
         _file: file,
         lock_path,
