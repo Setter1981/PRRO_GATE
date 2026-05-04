@@ -48,8 +48,11 @@ CREATE TABLE fiscal_documents (
 ) STRICT;
 
 CREATE INDEX ix_fd_fn_lnd     ON fiscal_documents(fiscal_number, lnd);
+-- Partial index covers the same pending-set as `list_pending_for_fn`:
+-- KVT2 is included (a doc between KVT2 and ACK is mid-flight; recovery
+-- loop must pick it up).
 CREATE INDEX ix_fd_state_pending ON fiscal_documents(state, created_at)
-    WHERE state IN ('PREPARED','SIGNED','ENCRYPTED','SENT','KVT1','ERROR_RETRYABLE');
+    WHERE state IN ('PREPARED','SIGNED','ENCRYPTED','SENT','KVT1','KVT2','ERROR_RETRYABLE');
 CREATE INDEX ix_fd_recon_manual ON fiscal_documents(state)
     WHERE state = 'REQUIRES_MANUAL_RECONCILIATION';
 
