@@ -127,8 +127,11 @@ Capture pipeline:
 1. **Primary oracle = current Python gateway/sidecar output** on a
    fixed canonical input set.  Run Python-side once, capture the byte
    output of each hot zone, write to `goldens/<zone>/<case>.bin`.
-2. **Secondary = spec test-vectors from §10.X** (where the spec gives
-   concrete bytes) frozen identically.
+2. **Secondary = protocol/spec vectors where concrete bytes exist.**
+   The current rust-rewrite spec §10 is a cutover plan, not a vector
+   annex; concrete bytes today live mostly in the legacy spec PDFs and
+   the Python test-data corpus.  Vendor those alongside the goldens or
+   add a future annex when one is written.
 
 CI does NOT re-run Python.  Goldens are byte-compared against the
 Rust output deterministically.
