@@ -1,0 +1,26 @@
+{
+  "planPath": "docs/superpowers/plans/2026-05-04-m2-w0-research.md",
+  "specPath": "docs/superpowers/specs/2026-05-04-m2-pre-plan-adr.md",
+  "scope": "M2-W0 research / ADR-resolution mini-plan — three independent findings docs that close the open risks in the M2 pre-plan ADR.",
+  "lastUpdated": "2026-05-04T00:00:00Z",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: W0-1 — verify production DPS wire format and contract subset",
+      "status": "pending",
+      "description": "**Goal:** Frozen findings doc naming exactly which protocol production DPS uses (gRPC/SOAP/XMLRPC/REST), the contract subset prro must mirror, and the canonical schema artefact M2 W1+ will mock against.\n\nDay budget: 1-2 days (up to 3 if live trace capture needed).\n\nFiles to read: src/prro_gateway/transports/dps_fiscal_server.py + fiscal_sidecar.py + stubs.py + proto/fiscal_server.proto + proto/fiscal_server_pb2_grpc.py; scripts/mock_dps_server.py + mock_dps.proto; ADR-M2-2; spec §8/§9.\n\nFiles to create: docs/superpowers/specs/2026-05-XX-m2-w0-1-dps-wire.md.\n\nMay modify (only if revising ADR-M2-2): docs/superpowers/specs/2026-05-04-m2-pre-plan-adr.md.\n\n```json:metadata\n{\"files\":[\"docs/superpowers/specs/2026-05-XX-m2-w0-1-dps-wire.md\"],\"verifyCommand\":\"test -f docs/superpowers/specs/2026-05-*-m2-w0-1-dps-wire.md && grep -E '^Status: (final|deferred)$' docs/superpowers/specs/2026-05-*-m2-w0-1-dps-wire.md\",\"acceptanceCriteria\":[\"protocol named with file/line cite\",\"method-level contract subset enumerated (incl submit + query_status)\",\"canonical schema artefact pointed at\",\"ADR-M2-2 revision-or-confirm explicit\",\"transport-level behaviours mock MUST cover enumerated\",\"no edits under rust/prro/src/**\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: W0-2 — probe CMP / test-CA protocol details for cert_refresher sizing",
+      "status": "pending",
+      "description": "**Goal:** Frozen findings doc with CMP message types, auth model, and test-CA recipe so M2 W1+ cert_refresher integration test is sizable and CI-runnable without live acskidd.gov.ua.\n\nDay budget: 2-3 days.\n\nFiles to read: rust/prro/migrations/003_operators_printers.sql; ADR-M2-4 + ADR-M2-5; src/prro_gateway/services/cert_provisioning.py + repositories/operator_certs.py + repositories/ca_endpoints.py; rust/prro_crypto/src/; rust/prro_sidecar/src/; RFC 4210 §5.\n\nFiles to create: docs/superpowers/specs/2026-05-XX-m2-w0-2-cmp-probe.md.\n\nMay modify (only if revising ADR-M2-4/-5): docs/superpowers/specs/2026-05-04-m2-pre-plan-adr.md.\n\n```json:metadata\n{\"files\":[\"docs/superpowers/specs/2026-05-XX-m2-w0-2-cmp-probe.md\"],\"verifyCommand\":\"test -f docs/superpowers/specs/2026-05-*-m2-w0-2-cmp-probe.md && grep -E '^Status: (final|deferred)$' docs/superpowers/specs/2026-05-*-m2-w0-2-cmp-probe.md\",\"acceptanceCriteria\":[\"CMP operations cert_refresher must perform listed with python cite\",\"auth model named in implementable detail\",\"test-CA recipe chosen and justified (self-hosted RFC-4210 stub | vendored CA fixture | live test endpoint)\",\"cert_refresher (services::) vs prro::crypto boundary explicit per ADR-M2-4 + ADR-M2-6\",\"ADR-M2-4 revision-or-confirm explicit\",\"no edits under rust/prro/src/**\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: W0-3 — audit prro_crypto API surface and draft CryptoProvider trait shape",
+      "status": "pending",
+      "description": "**Goal:** Frozen findings doc listing prro_crypto public functions prro::crypto needs, required extensions (additive/signature-shaping/breaking) with migration plans, and a proposed CryptoProvider trait shape compliant with ADR-M2-1/-5/-6.\n\nDay budget: 1-2 days.\n\nFiles to read: rust/prro_crypto/{Cargo.toml, src/lib.rs, src/cms_adapter.rs, src/config.rs, src/cp1251.rs, src/credentials.rs, examples/, tests/}; rust/prro_sidecar/src/; ADR-M2-1 + -5 + -6.\n\nSearch: grep -rn 'use prro_crypto' rust/ | grep -v target.\n\nFiles to create: docs/superpowers/specs/2026-05-XX-m2-w0-3-prro-crypto-audit.md.\n\nMay modify (only if revising ADR-M2-1): docs/superpowers/specs/2026-05-04-m2-pre-plan-adr.md.\n\nNo edits under rust/prro/src/** OR rust/prro_crypto/src/**.\n\n```json:metadata\n{\"files\":[\"docs/superpowers/specs/2026-05-XX-m2-w0-3-prro-crypto-audit.md\"],\"verifyCommand\":\"test -f docs/superpowers/specs/2026-05-*-m2-w0-3-prro-crypto-audit.md && grep -E '^Status: (final|deferred)$' docs/superpowers/specs/2026-05-*-m2-w0-3-prro-crypto-audit.md\",\"acceptanceCriteria\":[\"prro_crypto public functions used by prro::crypto listed with cite + use-case\",\"extensions classified additive | signature-shaping | breaking\",\"non-additive extensions have concrete migration plan\",\"CryptoProvider trait shape proposed in findings doc (compliant with ADR-M2-6 no-DB-handle rule)\",\"redacted-Debug discipline proposed for secret-bearing types per ADR-M2-5\",\"ADR-M2-1 revision-or-confirm explicit\",\"no edits under rust/prro/src/** or rust/prro_crypto/src/**\"]}\n```"
+    }
+  ]
+}
