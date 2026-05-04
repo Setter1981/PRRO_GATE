@@ -13,7 +13,7 @@
     {
       "id": 1,
       "subject": "Task 1: W0-2 — probe CMP / test-CA protocol details for cert_refresher sizing",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** Frozen findings doc with CMP message types, auth model, and test-CA recipe so M2 W1+ cert_refresher integration test is sizable and CI-runnable without live acskidd.gov.ua.\n\nDay budget: 2-3 days.\n\nFiles to read: rust/prro/migrations/003_operators_printers.sql; ADR-M2-4 + ADR-M2-5; src/prro_gateway/services/cert_provisioning.py + repositories/operator_certs.py + repositories/ca_endpoints.py; rust/prro_crypto/src/; rust/prro_sidecar/src/; RFC 4210 §5.\n\nFiles to create: docs/superpowers/specs/2026-05-XX-m2-w0-2-cmp-probe.md.\n\nMay modify (only if revising ADR-M2-4/-5): docs/superpowers/specs/2026-05-04-m2-pre-plan-adr.md.\n\n```json:metadata\n{\"files\":[\"docs/superpowers/specs/2026-05-XX-m2-w0-2-cmp-probe.md\"],\"verifyCommand\":\"test -f docs/superpowers/specs/2026-05-*-m2-w0-2-cmp-probe.md && grep -E '^Status: (final|deferred)$' docs/superpowers/specs/2026-05-*-m2-w0-2-cmp-probe.md\",\"acceptanceCriteria\":[\"CMP operations cert_refresher must perform listed with python cite\",\"auth model named in implementable detail\",\"test-CA recipe chosen and justified (self-hosted RFC-4210 stub | vendored CA fixture | live test endpoint)\",\"cert_refresher (services::) vs prro::crypto boundary explicit per ADR-M2-4 + ADR-M2-6\",\"ADR-M2-4 revision-or-confirm explicit\",\"no edits under rust/prro/src/**\"]}\n```"
     },
     {
