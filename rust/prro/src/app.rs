@@ -10,6 +10,7 @@
 //! reconciliation against `shifts` / `fiscal_documents`.
 
 use crate::config::AppConfig;
+use anyhow::Context;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
@@ -26,7 +27,13 @@ struct Inner {
 impl App {
     pub async fn boot(config: AppConfig) -> anyhow::Result<Self> {
         if let Some(parent) = config.database.db_path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            // Empty parent (`db_path = "x.db"` -> parent == "") is a no-op
+            // create.  For non-empty paths we propagate any creation error
+            // with operator-readable context instead of swallowing it.
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating db parent dir {}", parent.display()))?;
+            }
         }
         let db = crate::db::open_pool(&config.database.db_path).await?;
         Ok(Self {

@@ -90,7 +90,8 @@ async fn boot_applies_migrations_and_returns_pool() {
         .unwrap();
     assert_eq!(count, 0, "fresh DB must have empty fiscal_number_config");
 
-    // All expected M1 tables are reachable.
+    // Spot-check the key M1 tables — full migration coverage is in
+    // tests/migrations_apply.rs.
     for table in [
         "fiscal_number_config",
         "shifts",
