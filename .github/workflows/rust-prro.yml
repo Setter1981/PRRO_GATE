@@ -4,14 +4,25 @@ on:
   push:
     branches: [rust-gateway]
     paths:
+      # `prro` plus its workspace path-dependencies (rust/prro/Cargo.toml
+      # references ../prro_crypto and ../prro_escpos), so a change there
+      # also breaks `cargo build -p prro` and must trigger this matrix.
       - 'rust/prro/**'
+      - 'rust/prro_crypto/**'
+      - 'rust/prro_escpos/**'
       - 'rust/Cargo.*'
       - '.github/workflows/rust-prro.yml'
   pull_request:
     paths:
       - 'rust/prro/**'
+      - 'rust/prro_crypto/**'
+      - 'rust/prro_escpos/**'
       - 'rust/Cargo.*'
       - '.github/workflows/rust-prro.yml'
+
+# Default to least-privilege: this workflow only reads the repo.
+permissions:
+  contents: read
 
 # Cancel superseded runs on the same ref.
 concurrency:
