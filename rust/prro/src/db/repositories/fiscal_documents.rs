@@ -12,6 +12,17 @@
 //!
 //!   This split is what write_path retry logic (M3) needs to decide between
 //!   "reload + retry" (Conflict) and "escalate" (NotFound).
+//!
+//! Known limitation (deferred to M3 — see bd-issue tracked for write_path):
+//! `transition_state` disambiguates Conflict vs NotFound with a *separate*
+//! `SELECT 1` after a CAS-miss.  A delete or insert in the gap between the
+//! UPDATE and the SELECT could swap the two outcomes.  In practice this is
+//! benign — `fiscal_documents` is legally append-only-like (no production
+//! delete path) and M3 write_path is expected to call `transition_state`
+//! inside its own `db::tx::with_immediate` envelope as part of a compound
+//! op (transition + audit_log.append + node_state.update), naturally
+//! making the disambiguation atomic.  If a code path needs strict atomic
+//! disambiguation in M1, wrap the call site in `with_immediate` directly.
 
 use crate::db::models::{
     enums::{DocState, DocType},
