@@ -228,10 +228,24 @@ Cert refresh policy:
   `valid_to - now <= refresh_within_days` is.
 
 ### Open risk
-- CMP protocol details (which endpoint, primary vs fallback URLs,
-  authentication mode) are still spec-only.  M2 plan must include a
-  task to implement a thin `CmpClient` against the test CA before
-  the cert_refresher integration test can run.
+- Resolved 2026-05-04 in
+  `docs/superpowers/specs/2026-05-04-m2-w0-2-cmp-probe.md`.  Ukrainian
+  CA "CMP" is an IIT-proprietary 120-byte cert lookup-by-SKI request,
+  NOT RFC 4210.  The wire client already exists in
+  `prro_crypto::cms::cmp::fetch_cert_by_ski` (encode + POST + parse +
+  SKI re-check), so M2 W1+ must not spend scope porting an encoder or
+  parser.
+- The lookup channel is unauthenticated.  Current endpoint rows use
+  plain `http://.../services/cmp/` and the existing Rust client disables
+  redirects, so the implemented integrity guard is response-side SKI
+  re-check, not TLS.  If W1+ requires server-authenticated transport,
+  it must prefer verified HTTPS endpoints where available or document
+  the operational exception.
+- Remaining W1+ work on this path is orchestration: async wrapper
+  (likely `spawn_blocking` around the existing blocking
+  `fetch_cert_by_ski`), service-level retry/backoff/multi-URL fallback
+  following `sql/016_ca_endpoints.sql`, and atomic active-flip via the
+  M1 `with_immediate` primitive.
 
 ---
 
@@ -384,11 +398,15 @@ caller wraps a single CAS-then-audit_log compound op in
 
 ## What this ADR explicitly does NOT decide
 
-- The exact `proto` definition for `DpsChannel` mock (depends on
-  ADR-M2-2 open risk: production wire format check).
+- The exact Rust module/proto layout for the generated `DpsChannel`
+  mock.  W0-1 resolved the production wire format as gRPC and named
+  `src/prro_gateway/transports/proto/fiscal_server.proto` as the schema
+  of record; W1+ still chooses the Rust-side crate/file layout.
 - The exact filenames / layouts under `goldens/`.
-- The wire format and authentication scheme of the CMP client
-  (ADR-M2-4 open risk).
+- The endpoint policy for CMP over `http://` vs verified HTTPS.  W0-2
+  resolved the wire format and auth model; W1+ decides whether to keep
+  the Python-compatible HTTP endpoints as an operational exception or
+  prefer HTTPS endpoints where verified.
 - M2 task breakdown (W1..W4 or otherwise) — that is the M2 plan,
   written **after** this ADR is reviewed.
 
@@ -403,28 +421,32 @@ The split is intentionally narrow to keep the ADR a *gate*, not a
   only be guesses.
 - **A short M2-W0 research / ADR-resolution mini-plan IS allowed**
   and is the recommended next artifact: a focused plan whose only
-  scope is to close the three open risks below (verify wire format,
+  scope is to close the three W0 risks below (verify wire format,
   CMP probe, prro_crypto API audit) and surface findings as ADR
   fix-commits or new ADR sections.
 
-Open risks (each becomes a W0 task in the mini-plan):
+W0 risk status (each item maps to a task in the mini-plan):
 
-- ADR-M2-2 open risk: **verify production DPS wire format** (gRPC vs
-  SOAP/REST).  Without this, "mock DPS as tonic" may be mocking the
-  wrong protocol and the W1+ mock-DPS tasks would be invalid.
-- ADR-M2-4 open risk: CMP protocol details for the test CA, so the
-  cert_refresher integration test in W1+ can be sized.
+- ADR-M2-2 open risk: **resolved in W0-1**.  Production DPS wire format
+  is gRPC and the schema of record is
+  `src/prro_gateway/transports/proto/fiscal_server.proto`; see
+  `docs/superpowers/specs/2026-05-04-m2-w0-1-dps-wire.md`.
+- ADR-M2-4 open risk: **resolved in W0-2**.  Ukrainian CA "CMP" is IIT
+  cert lookup-by-SKI; `prro_crypto::cms::cmp::fetch_cert_by_ski`
+  already implements the wire client; see
+  `docs/superpowers/specs/2026-05-04-m2-w0-2-cmp-probe.md`.
 - ADR-M2-1 open risk: `prro_crypto` API audit — what extensions does
   the wrapper need, and can they be added without breaking the
   Python sidecar consumer?
 
-After W0 lands, the W1..Wn implementation plan can be written
+After W0-3 lands, the W1..Wn implementation plan can be written
 against verified inputs.
 
 ---
 
 **Review status:** approved 2026-05-04 (after two review rounds; six
-findings closed in commits `7e154bd` and `25ad32a`).  M2 implementation
-plan (W1+) remains gated by the three open risks listed in
-"What blocks M2 plan-writing"; an M2-W0 research / ADR-resolution
-mini-plan is now allowed and is the next artifact.
+findings closed in commits `7e154bd` and `25ad32a`).  W0-1 and W0-2
+resolved the DPS wire-format and CMP protocol risks; M2 implementation
+plan (W1+) remains gated by W0-3, the `prro_crypto` API audit.  The
+M2-W0 research / ADR-resolution mini-plan remains the active artifact
+until W0-3 lands.
