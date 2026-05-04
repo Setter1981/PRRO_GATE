@@ -9,6 +9,7 @@ use prro::db::{
         fiscal_documents as fd, fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig,
     },
 };
+use std::collections::HashSet;
 
 async fn fresh_with_fn() -> (sqlx::SqlitePool, String) {
     let dir = tempfile::tempdir().unwrap();
@@ -141,9 +142,128 @@ async fn list_pending_excludes_final_states() {
     );
 }
 
+#[tokio::test]
+async fn list_pending_full_state_inclusion_contract() {
+    let (pool, fn_id) = fresh_with_fn().await;
+    let all_states = [
+        DocState::Prepared,
+        DocState::Signed,
+        DocState::Encrypted,
+        DocState::Sent,
+        DocState::Kvt1,
+        DocState::Kvt2,
+        DocState::Ack,
+        DocState::OfflineLocalAck,
+        DocState::Rejected,
+        DocState::Cancelled,
+        DocState::ErrorRetryable,
+        DocState::RequiresManualReconciliation,
+    ];
+
+    for (i, &state) in all_states.iter().enumerate() {
+        let mut doc = sample_doc(&fn_id);
+        doc.lnd = (i as i64) + 1;
+        let id = doc.document_id;
+        fd::insert_prepared(&pool, &doc).await.unwrap();
+        if state != DocState::Prepared {
+            sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
+                .bind(state)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    let pending = fd::list_pending_for_fn(&pool, &fn_id).await.unwrap();
+    let pending_states: HashSet<DocState> = pending.iter().map(|r| r.state).collect();
+
+    let expected_pending: HashSet<DocState> = [
+        DocState::Prepared,
+        DocState::Signed,
+        DocState::Encrypted,
+        DocState::Sent,
+        DocState::Kvt1,
+        DocState::Kvt2,
+        DocState::ErrorRetryable,
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(
+        pending_states, expected_pending,
+        "pending set drift: returned {pending_states:?}, expected {expected_pending:?}"
+    );
+
+    for s in [
+        DocState::Ack,
+        DocState::Rejected,
+        DocState::Cancelled,
+        DocState::OfflineLocalAck,
+        DocState::RequiresManualReconciliation,
+    ] {
+        assert!(
+            !pending_states.contains(&s),
+            "{s:?} must NOT be returned by list_pending_for_fn"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_pending_orders_by_lnd_for_chain_safety() {
+    let (pool, fn_id) = fresh_with_fn().await;
+    // Insert in REVERSE lnd order; CURRENT_TIMESTAMP is second-granular and
+    // these inserts may share the same created_at second, so created_at
+    // alone is not sufficient — `lnd` must drive the order.
+    for lnd in [3i64, 1, 2] {
+        let mut doc = sample_doc(&fn_id);
+        doc.lnd = lnd;
+        fd::insert_prepared(&pool, &doc).await.unwrap();
+    }
+    let pending = fd::list_pending_for_fn(&pool, &fn_id).await.unwrap();
+    let lnds: Vec<i64> = pending.iter().map(|r| r.lnd).collect();
+    assert_eq!(
+        lnds,
+        vec![1, 2, 3],
+        "list_pending_for_fn must order by lnd ascending, not just created_at"
+    );
+}
+
+#[tokio::test]
+async fn hashes_persist_at_32_bytes_through_insert_prepared() {
+    let (pool, fn_id) = fresh_with_fn().await;
+    let mut doc = sample_doc(&fn_id);
+    doc.payload_sha256_canonical = [0xAAu8; 32];
+    doc.unsigned_xml_sha256 = Some([0xBBu8; 32]);
+    doc.previous_hash = Some([0xCCu8; 32]);
+    let id = doc.document_id;
+    fd::insert_prepared(&pool, &doc).await.unwrap();
+
+    let row: (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT payload_sha256_canonical, unsigned_xml_sha256, previous_hash \
+         FROM fiscal_documents WHERE document_id = ?",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        row.0.len(),
+        32,
+        "payload_sha256_canonical must persist as 32 bytes"
+    );
+    assert_eq!(row.0, vec![0xAAu8; 32]);
+    let unsigned = row.1.expect("unsigned_xml_sha256 must persist when set");
+    assert_eq!(unsigned.len(), 32);
+    assert_eq!(unsigned, vec![0xBBu8; 32]);
+    let prev = row.2.expect("previous_hash must persist when set");
+    assert_eq!(prev.len(), 32);
+    assert_eq!(prev, vec![0xCCu8; 32]);
+}
+
 #[test]
 fn allowed_transition_exhaustive_matrix() {
-    use std::collections::HashSet;
     use DocState::*;
 
     let all = [

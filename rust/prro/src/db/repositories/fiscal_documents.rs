@@ -54,6 +54,7 @@ pub struct NewDocument {
 pub struct DocumentRow {
     pub document_id: DocumentId,
     pub fiscal_number: String,
+    pub lnd: i64,
     pub state: DocState,
     pub doc_type: DocType,
     pub server_fiscal_no: Option<String>,
@@ -62,6 +63,13 @@ pub struct DocumentRow {
 
 /// Outcome of a state transition attempt.  Replaces a bare `bool` so write_path
 /// retry logic can tell "row diverged, reload" apart from "row vanished, escalate".
+///
+/// Precedence: `Forbidden` is decided in code BEFORE the DB is consulted, so a
+/// forbidden transition for a non-existent `document_id` returns `Forbidden`,
+/// not `NotFound`.  This is by design — `Forbidden` indicates a caller bug
+/// (asked for a transition not in the whitelist) and should be surfaced
+/// regardless of row existence.  `NotFound` is reserved for the case where
+/// the requested transition WOULD have been allowed but the row is missing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionOutcome {
     Applied,
@@ -161,18 +169,39 @@ pub async fn transition_state(
     })
 }
 
+/// Returns documents in non-final, non-handed-off states for the given FN,
+/// in deterministic order suitable for fiscal-chain recovery.
+///
+/// Pending set (7 states):
+/// - PREPARED, SIGNED, ENCRYPTED, SENT, KVT1, KVT2, ERROR_RETRYABLE
+///
+/// KVT2 IS pending: a crash between persisting KVT2 and transitioning to ACK
+/// would otherwise strand the document.  ACK is the only true terminal-success
+/// state.
+///
+/// Excluded:
+/// - ACK / REJECTED / CANCELLED — terminal.
+/// - OFFLINE_LOCAL_ACK — handed off to offline_sync_service (separate worker).
+/// - REQUIRES_MANUAL_RECONCILIATION — operator-driven flow.
+///
+/// Ordering: `(lnd, created_at, document_id)`.  `created_at` alone is
+/// second-granular in SQLite (`CURRENT_TIMESTAMP`), so multiple docs created
+/// within one second would otherwise have unstable order.  `lnd` is the
+/// Local Numerator of Document — strictly monotonic per FN — so it is the
+/// authoritative chain-recovery key; the other two are tiebreakers.
 pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Vec<DocumentRow>> {
     let rows = sqlx::query!(
         r#"SELECT document_id    as "document_id: DocumentId",
                   fiscal_number,
+                  lnd,
                   state           as "state: DocState",
                   doc_type        as "doc_type: DocType",
                   server_fiscal_no,
                   submission_attempted_at
            FROM fiscal_documents
            WHERE fiscal_number = ?
-             AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENT','KVT1','ERROR_RETRYABLE')
-           ORDER BY created_at"#,
+             AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENT','KVT1','KVT2','ERROR_RETRYABLE')
+           ORDER BY lnd, created_at, document_id"#,
         fn_id
     )
     .fetch_all(pool)
@@ -182,6 +211,7 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
         .map(|r| DocumentRow {
             document_id: r.document_id,
             fiscal_number: r.fiscal_number,
+            lnd: r.lnd,
             state: r.state,
             doc_type: r.doc_type,
             server_fiscal_no: r.server_fiscal_no,
