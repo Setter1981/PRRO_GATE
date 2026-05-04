@@ -72,6 +72,12 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             apt: ''
+          # Native ARM64 runner (GitHub-hosted, free for public repos).
+          # Validates aarch64 codegen for embedded / edge gateway boxes
+          # without cross-compile overhead.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            apt: ''
 
     steps:
       - uses: actions/checkout@v4
