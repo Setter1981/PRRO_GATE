@@ -11,6 +11,16 @@
 //!   it inserts on first call and refreshes only the cheap `mode` and
 //!   `shift_state` fields on conflict — `next_lnd`, recovery markers, and
 //!   `last_known_unsigned_xml_sha256` are NOT clobbered.
+//!
+//!   CALLER CONTRACT: do NOT blindly call `upsert_initial(fn, Online, Closed,
+//!   1)` for every configured FN at App boot.  If the FN already has a row
+//!   from a previous run, that row may carry `shift_state = Opened` from an
+//!   in-flight shift that crashed mid-operation; overwriting it with
+//!   `Closed` would mask the recovery requirement.  T14 / App::boot MUST
+//!   either (a) call `get(fn)` first and only `upsert_initial` for missing
+//!   rows, or (b) pass the `mode` / `shift_state` values it has already
+//!   reconciled with `shifts` and `fiscal_documents` repos.  See
+//!   bd-issue PRRO_GATE-ah8 tracking the App-boot constraint.
 //! - `seed_prevhash` is what the `prro fn seed-prevhash <hex>` CLI calls
 //!   when an operator imports a chain pre-history (spec §5.4).  Returns
 //!   `false` (not error) if the FN row is missing — the caller can decide
@@ -26,6 +36,32 @@ pub struct NodeStateRow {
     pub shift_state: ShiftState,
     pub next_lnd: i64,
     pub last_known_unsigned_xml_sha256: Option<[u8; 32]>,
+}
+
+/// Decode `last_known_unsigned_xml_sha256` BLOB into a fixed-32-byte array.
+///
+/// Fail-closed for chain-state safety: if the BLOB is present but its length
+/// is not 32, return a decode error rather than silently treating the chain
+/// as un-seeded.  Schema CHECK length=32 should make malformed rows
+/// impossible in production, but a defensive check here means a corrupted
+/// or hand-edited DB will surface as an explicit error at FN load time
+/// (operator-visible) instead of silently breaking chain hashing.
+fn decode_chain_hash(raw: Option<Vec<u8>>) -> Result<Option<[u8; 32]>, sqlx::Error> {
+    match raw {
+        None => Ok(None),
+        Some(v) => {
+            let arr: [u8; 32] = v.as_slice().try_into().map_err(|_| {
+                sqlx::Error::Decode(
+                    format!(
+                        "node_state.last_known_unsigned_xml_sha256: expected 32 bytes, got {}",
+                        v.len()
+                    )
+                    .into(),
+                )
+            })?;
+            Ok(Some(arr))
+        }
+    }
 }
 
 pub async fn upsert_initial(
@@ -76,13 +112,50 @@ pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStat
     )
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|r| NodeStateRow {
+    let Some(r) = row else {
+        return Ok(None);
+    };
+    Ok(Some(NodeStateRow {
         fiscal_number: r.fiscal_number,
         mode: r.mode,
         shift_state: r.shift_state,
         next_lnd: r.next_lnd,
-        last_known_unsigned_xml_sha256: r
-            .last_known_unsigned_xml_sha256
-            .and_then(|v| v.as_slice().try_into().ok()),
+        last_known_unsigned_xml_sha256: decode_chain_hash(r.last_known_unsigned_xml_sha256)?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_chain_hash;
+
+    #[test]
+    fn decode_none_is_ok_none() {
+        assert_eq!(decode_chain_hash(None).unwrap(), None);
+    }
+
+    #[test]
+    fn decode_exact_32_is_ok_some() {
+        let blob = vec![0xABu8; 32];
+        assert_eq!(decode_chain_hash(Some(blob)).unwrap(), Some([0xABu8; 32]));
+    }
+
+    #[test]
+    fn decode_too_short_fails_closed() {
+        let err = decode_chain_hash(Some(vec![0u8; 31])).expect_err("31-byte blob must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("32 bytes"),
+            "error must mention expected length: {msg}"
+        );
+        assert!(
+            msg.contains("31"),
+            "error must mention actual length: {msg}"
+        );
+    }
+
+    #[test]
+    fn decode_too_long_fails_closed() {
+        let err = decode_chain_hash(Some(vec![0u8; 33])).expect_err("33-byte blob must error");
+        assert!(err.to_string().contains("32 bytes"));
+    }
 }
