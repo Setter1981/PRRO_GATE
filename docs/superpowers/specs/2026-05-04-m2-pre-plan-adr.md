@@ -423,6 +423,8 @@ against verified inputs.
 
 ---
 
-**Review status:** unreviewed.  M2 plan-writing is blocked until this
-ADR receives explicit approval and any required revisions are landed
-as docs fix-commits on `rust-gateway`.
+**Review status:** approved 2026-05-04 (after two review rounds; six
+findings closed in commits `7e154bd` and `25ad32a`).  M2 implementation
+plan (W1+) remains gated by the three open risks listed in
+"What blocks M2 plan-writing"; an M2-W0 research / ADR-resolution
+mini-plan is now allowed and is the next artifact.
