@@ -457,7 +457,9 @@ CREATE TABLE audit_log (
     created_at         TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 ) STRICT;
 
-CREATE INDEX ix_audit_entity ON audit_log(entity_type, entity_id, created_at);
+-- Index matches the hot query (list_for_entity ... ORDER BY audit_id DESC)
+-- so the planner can stream without an extra sort.
+CREATE INDEX ix_audit_entity ON audit_log(entity_type, entity_id, audit_id DESC);
 ```
 
 - [ ] **Step 2: Add `db::open_pool` (early — needed by tests)**

@@ -91,4 +91,8 @@ CREATE TABLE audit_log (
     created_at         TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 ) STRICT;
 
-CREATE INDEX ix_audit_entity ON audit_log(entity_type, entity_id, created_at);
+-- Hot query: list_for_entity ORDER BY audit_id DESC LIMIT ?
+-- Index ordering matches the ORDER BY so the planner can stream from the
+-- index without a sort step.  audit_id is AUTOINCREMENT (monotonic), so
+-- DESC on the index gives reverse-chronological without created_at.
+CREATE INDEX ix_audit_entity ON audit_log(entity_type, entity_id, audit_id DESC);

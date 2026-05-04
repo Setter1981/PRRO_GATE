@@ -15,6 +15,13 @@
 use crate::db::models::enums::Severity;
 use sqlx::SqlitePool;
 
+/// Hard cap on `list_for_entity` to prevent unbounded queries from admin UI /
+/// API.  SQLite treats negative LIMIT as "no limit", so passing a negative
+/// value is forbidden at the type system level (`limit: u32`); this constant
+/// caps the upper end as well so a stray `u32::MAX` cannot drag the entire
+/// audit log into memory.
+pub const MAX_LIST_LIMIT: u32 = 10_000;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuditEntry {
     pub audit_id: i64,
@@ -55,11 +62,13 @@ pub async fn list_for_entity(
     pool: &SqlitePool,
     entity_type: &str,
     entity_id: &str,
-    limit: i64,
+    limit: u32,
 ) -> sqlx::Result<Vec<AuditEntry>> {
+    let bounded: i64 = limit.min(MAX_LIST_LIMIT).into();
     let rows = sqlx::query!(
-        r#"SELECT audit_id, entity_type, entity_id, event_type,
-                  severity as "severity: Severity",
+        r#"SELECT audit_id           as "audit_id!",
+                  entity_type, entity_id, event_type,
+                  severity            as "severity: Severity",
                   actor, event_payload_json, created_at
            FROM audit_log
            WHERE entity_type = ? AND entity_id = ?
@@ -67,14 +76,14 @@ pub async fn list_for_entity(
            LIMIT ?"#,
         entity_type,
         entity_id,
-        limit
+        bounded
     )
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
         .map(|r| AuditEntry {
-            audit_id: r.audit_id.unwrap_or_default(),
+            audit_id: r.audit_id,
             entity_type: r.entity_type,
             entity_id: r.entity_id,
             event_type: r.event_type,
