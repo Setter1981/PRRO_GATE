@@ -69,9 +69,12 @@ ship sidecar HTTP support.
 ### Decision
 M2 ships `tests/mock_dps_server.rs` (or a dedicated test crate) as a
 native Rust `tonic`-based server mirroring the gRPC contract subset
-that `DpsChannel` calls in production: at minimum `submit_document`,
-`query_status`, and the metadata fields the transport layer relies on
-(auth headers, deadlines, error mapping).
+that `DpsChannel` calls in production.  The mock implements the
+DpsChannel-trait operations (`submit` / `query_status` at trait level;
+exact gRPC method names mapped to the actual production `.proto` after
+W0 wire-format check, see ADR-M2-2 open risk).  The mock also covers
+the metadata fields the transport layer relies on (auth headers,
+deadlines, error mapping).
 
 Mock DPS is the primary target for `DpsChannel` integration tests in
 M2.  HTTP-replay fixtures of recorded responses are a **secondary**
@@ -201,8 +204,11 @@ Cert refresh policy:
   attack surface; couples cert refresh with secret unsealing; breaks
   invariant #10 in spirit.
 - **Refresh inline on signing call.** Signing path is hot; inline
-  CMP fetch would block under network failure.  Spec §8.4 already
-  specifies background refresh.
+  CMP fetch would block under network failure.  Background refresh is
+  the design implication of M1 schema (`cert_provisioning_config`
+  carrying `refresh_within_days` / `cache_ttl_seconds`) and ADR-M2-4
+  itself; spec §8.3 (cert provisioning) is the reference for protocol
+  details, not for the schedule mechanic.
 - **No staging — overwrite active cert atomically.** Loses the
   rolling-refresh guarantee; a CMP fetch that brings back stale or
   invalid bytes would replace the working cert.
@@ -243,12 +249,23 @@ key bytes) flows through the system as follows:
    wrappers (existing `zeroize` crate) for the duration of the call,
    and are dropped (zeroed) at function return.  No `String` /
    `Vec<u8>` of plaintext crosses an `await` boundary unless wrapped.
-4. Logging boundary: the global `tracing` filter MUST NOT include any
-   field named `password`, `jks`, `cred_salt`, `cert_der`, or any
-   path that has been observed to contain those.  Errors are typed
-   (e.g. `CryptoError::JksUnseal { operator_id, reason: SealKind }`)
-   and reasons are enums, NOT free-form `String`s, so a developer
+4. Logging boundary (NB: `tracing_subscriber::EnvFilter` is NOT a
+   field-redaction mechanism — it filters by target/level only, so
+   "filter by field name" is the wrong shape).  The actual rule is:
+   a) Structured tracing events MUST NOT emit secret-bearing fields
+   at the call site (no `tracing::info!(jks_password = …)` etc.).
+   b) Secret-bearing types implement redacted `Debug` / `Display`
+   (Rust pattern: `#[derive(Debug)]` is forbidden; manual `impl Debug`
+   prints `"<redacted>"`).  This makes accidental `?password` /
+   `{password:?}` safe by construction.
+   c) Errors are typed with enum reasons, e.g.
+   `CryptoError::JksUnseal { operator_id, reason: SealKind }` —
+   reasons are enums, NOT free-form `String`s, so a developer
    cannot accidentally `format!` a password into the error.
+   d) Tests install a `tracing` subscriber, run signing / unsealing
+   end-to-end, and assert NO captured event contains a substring of
+   the seeded password / cred_salt / private-key bytes.  This is the
+   actual safety net, not a global filter.
 5. The crypto provider trait does not return plaintext key material to
    callers; it returns signed/encrypted output bytes only.
 
@@ -296,6 +313,18 @@ NOT accept any sqlx connection / pool / transaction handle in their
 public API.**  They take typed inputs (canonical bytes, request
 structs) and return typed outputs.  This makes "crypto inside
 `with_immediate`" a compile error, not a code-review catch.
+
+**`cert_refresher` and repositories are explicitly OUT of scope of
+this rule.**  Cert refresh is a service / orchestrator concern that
+DOES read & write `operator_certs` rows via repositories — taking a
+`SqlitePool` there is correct.  The rule it follows is the staged
+pipeline below: any CMP fetch / crypto operation runs OUTSIDE any
+`with_immediate`, the result is materialised as typed bytes, and the
+DB write that flips `active` (a single CAS UPDATE compound) runs
+inside `with_immediate` afterwards.  `cert_refresher` lives under
+`services::` (or similar), NOT under `crypto::` / `transports::`,
+specifically so that the no-DB-handle rule applies cleanly to the
+provider/channel API surface without trapping the orchestrator.
 
 Write-path stages in M3 (and any service-level orchestration in M2)
 follow the staged pipeline:
@@ -362,19 +391,32 @@ caller wraps a single CAS-then-audit_log compound op in
 
 ## What blocks M2 plan-writing
 
-These open risks must be resolved (or explicitly deferred with
-documented assumptions) before the M2 plan task list is meaningful:
+The split is intentionally narrow to keep the ADR a *gate*, not a
+*ceiling*:
+
+- **M2 implementation plan (W1+) is BLOCKED** until the open risks
+  below are resolved (or explicitly deferred with documented
+  assumptions).  Without resolution, the implementation tasks can
+  only be guesses.
+- **A short M2-W0 research / ADR-resolution mini-plan IS allowed**
+  and is the recommended next artifact: a focused plan whose only
+  scope is to close the three open risks below (verify wire format,
+  CMP probe, prro_crypto API audit) and surface findings as ADR
+  fix-commits or new ADR sections.
+
+Open risks (each becomes a W0 task in the mini-plan):
 
 - ADR-M2-2 open risk: **verify production DPS wire format** (gRPC vs
   SOAP/REST).  Without this, "mock DPS as tonic" may be mocking the
-  wrong protocol and the plan's mock-DPS tasks will be invalid.
+  wrong protocol and the W1+ mock-DPS tasks would be invalid.
 - ADR-M2-4 open risk: CMP protocol details for the test CA, so the
-  cert_refresher integration test can be sized.
+  cert_refresher integration test in W1+ can be sized.
 - ADR-M2-1 open risk: `prro_crypto` API audit — what extensions does
   the wrapper need, and can they be added without breaking the
   Python sidecar consumer?
 
-These are the M2-W0 work items the plan must front-load.
+After W0 lands, the W1..Wn implementation plan can be written
+against verified inputs.
 
 ---
 
