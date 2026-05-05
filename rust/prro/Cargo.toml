@@ -72,6 +72,11 @@ tempfile = "3"
 # server in place of a live CMP endpoint.
 wiremock = "0.6"
 
+# M2 W3 dps_channel_smoke uses a tonic-based in-process mock server;
+# tokio-stream::TcpListenerStream wraps an ephemeral-port listener so
+# tonic's serve_with_incoming can accept connections.
+tokio-stream = { version = "0.1", features = ["net"] }
+
 [build-dependencies]
 # M2 W3 compiles the production DPS proto into a client + test mock server.
 tonic-build = "0.12"
