@@ -2,7 +2,7 @@
   "planPath": "docs/superpowers/plans/2026-05-04-m2-w1-implementation.md",
   "specPath": "docs/superpowers/specs/2026-05-04-m2-pre-plan-adr.md",
   "scope": "M2 implementation — crypto wrapper, cert_refresher, DpsChannel + tonic mock, byte-equivalence goldens, ADR-M2-6 + ADR-M2-5 architectural gates.  Inputs: ADR (approved 2026-05-04) + W0-1/W0-2/W0-3 findings docs + PRRO_GATE-5js note.",
-  "lastUpdated": "2026-05-05T08:00:00Z",
+  "lastUpdated": "2026-05-05T10:00:00Z",
   "tasks": [
     {
       "id": 0,
@@ -14,14 +14,14 @@
       "id": 1,
       "subject": "Task 1 (W1): prro::crypto in-process wrapper over prro_crypto",
       "status": "pending",
-      "description": "3-5 days.  CryptoProvider trait + SigningSession + unseal_jks + redacted Debug + InProcessProvider.  ADR-M2-1/-5/-6.\n\n```json:metadata\n{\"files\":[\"rust/prro/Cargo.toml\",\"rust/prro/src/lib.rs\",\"rust/prro/src/crypto/\",\"rust/prro/tests/crypto_provider_smoke.rs\"],\"verifyCommand\":\"cargo test -p prro --test crypto_provider_smoke\",\"acceptanceCriteria\":[\"build clean 4 targets\",\"trait Send+Sync no DB handle\",\"redacted Debug\",\"enum reasons\",\"spawn_blocking\",\"no secret substring leak\"]}\n```"
+      "description": "3-5 days.  CryptoProvider trait + SigningSession + unseal_jks + redacted Debug + InProcessProvider (stateless; timeout per call).  Real verify_dstu wired to prro_crypto::core::sign::verify (positive smoke fixture required).  ADR-M2-1/-5/-6.\n\n```json:metadata\n{\"files\":[\"rust/prro/Cargo.toml\",\"rust/prro/src/lib.rs\",\"rust/prro/src/crypto/\",\"rust/prro/tests/crypto_provider_smoke.rs\"],\"verifyCommand\":\"cargo test -p prro --test crypto_provider_smoke\",\"acceptanceCriteria\":[\"build clean 4 targets\",\"trait Send+Sync no DB handle\",\"redacted Debug (SigningSession smoke uses [u8;32])\",\"enum reasons including VerifyKind\",\"spawn_blocking\",\"verify_dstu wired to real prro_crypto::core::sign::verify (positive fixture)\",\"no secret substring leak\",\"5 tests pass\"]}\n```"
     },
     {
       "id": 2,
       "subject": "Task 2 (W2): services::cert_refresher with multi-URL fallback + atomic flip",
       "status": "pending",
       "blockedBy": [1],
-      "description": "4-6 days.  Async multi-URL CMP fetch + atomic active flip via with_immediate.  ADR-M2-4/-6 services-layer carve-out.  W0-2 test-CA strategy.\n\n```json:metadata\n{\"files\":[\"rust/prro/Cargo.toml\",\"rust/prro/migrations/006_ca_endpoints.sql\",\"rust/prro/src/lib.rs\",\"rust/prro/src/services/\",\"rust/prro/tests/cert_refresher_smoke.rs\",\"rust/prro/tests/fixtures/test_ca/\"],\"verifyCommand\":\"cargo test -p prro --test cert_refresher_smoke\",\"acceptanceCriteria\":[\"RefreshOutcome enum\",\"006_ca_endpoints + cmp_request_timeout_secs migration\",\"multi-URL fallback with per-URL timeout\",\"same-SKI in-place UPDATE writes valid_from/to/subject_dn/issuer_dn\",\"key-roll stage+flip writes all metadata\",\"both UPDATE rows_affected==1 guarded\",\"prro_crypto::cms::envelope::parse_cert_basic_fields additive PR landed first\",\"hex_to_ski fail-closed (typed MalformedCertMetadata)\",\"refresh_within_days\",\"AllUrlsFailed no DB write\",\"exactly one active=1\",\"malformed cert metadata gates fail-closed\"]}\n```"
+      "description": "4-6 days.  Async multi-URL CMP fetch + atomic stage+flip inside ONE with_immediate tx (idempotent on retry).  Result<RefreshOutcome, RefreshError> contract — no Failed-as-Ok variant.  Step 0 prerequisite: land additive prro_crypto::cms::envelope::parse_cert_basic_fields PR (W0-3 §3 amendment 2026-05-05).  ADR-M2-4/-6 services-layer carve-out.  W0-2 test-CA strategy.\n\n```json:metadata\n{\"files\":[\"rust/prro_crypto/src/cms/envelope.rs (prereq additive PR)\",\"rust/prro/Cargo.toml\",\"rust/prro/migrations/006_ca_endpoints.sql\",\"rust/prro/src/lib.rs\",\"rust/prro/src/services/\",\"rust/prro/tests/cert_refresher_smoke.rs\",\"rust/prro/tests/fixtures/test_ca/\"],\"verifyCommand\":\"cargo test -p prro --test cert_refresher_smoke\",\"acceptanceCriteria\":[\"Step 0 prereq: prro_crypto parse_cert_basic_fields PR merged first\",\"Result<RefreshOutcome,RefreshError> (no Failed variant)\",\"006_ca_endpoints + cmp_request_timeout_secs migration\",\"multi-URL fallback with per-URL timeout (method param only, no provider cfg)\",\"same-SKI in-place UPDATE writes valid_from/to/subject_dn/issuer_dn rows_affected==1\",\"key-roll: ONE with_immediate tx contains stage(INSERT OR REPLACE)+flip+audit\",\"both UPDATE rows_affected==1 guarded; mismatch ROLLBACKs\",\"hex_to_ski fail-closed (typed MalformedCertMetadata)\",\"refresh_within_days\",\"Err(AllUrlsFailed) no DB write\",\"exactly one active=1\",\"malformed cert metadata gates fail-closed\"]}\n```"
     },
     {
       "id": 3,

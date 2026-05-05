@@ -96,6 +96,7 @@ separate consumer surface — see §3 deferred note.)
 | Manual `impl Debug` for `JksEntry`, `ExtractedKey`, `Key6Parsed`, `PfxParsed` (redacted) | additive (likely already done; verify in §6) | ADR-M2-5 §4: secret-bearing types must NOT `#[derive(Debug)]`.  If any of the above carry private-key bytes and currently derive `Debug`, replace with manual redacted `impl Debug` — that's a breaking change for any caller that pretty-printed the struct, but no consumer in §2 does. |
 | `cms::cmp::fetch_cert_by_ski_async` | additive (optional) | Convenience: the wrapper can do `spawn_blocking` itself, so this is purely an ergonomic add.  Not required for W1+. |
 | Cert-chain bundle accessor (issuer chain walk via OCSP/CRL URLs) | additive | `prro_crypto::cms::revocation::{ocsp_url_from_cert, crl_url_from_cert}` already give the URL accessors; an issuer-chain walker would be a new function in `services::cert_refresher` (NOT in `prro_crypto`).  No `prro_crypto` change required. |
+| `cms::envelope::parse_cert_basic_fields(cert_der) -> Result<BasicCertFields, EnvelopeError>` returning `valid_from`, `valid_to`, `subject_dn`, `issuer_dn` | **additive (required by W2)** | W2's `services::cert_refresher` must persist these four fields into `operator_certs` so the refresh-eligibility check (`valid_to - now > refresh_within_days`) reads accurate metadata without re-fetching the cert.  Today only `extract_cert_pubkey_bytes` and `compute_ski` walk an X.509 cert in `prro_crypto`; the validity / subject / issuer fields are not exposed.  Single-PR additive helper, same DER walker as `extract_cert_pubkey_bytes`.  Lands BEFORE W2 implementation begins; filed as `bd add` on the M2 epic at W2 task start (gating).  Discovered 2026-05-05 during plan-fix pass 3. |
 
 **Total non-additive extensions: 0.**  All needs are met by the existing
 public surface or by additive helpers.  ADR-M2-1's "open risk" note can
@@ -331,7 +332,7 @@ trivial.  No proposed diff.  ADR review status remains `approved`.
 | Criterion | Met by |
 |---|---|
 | Public functions `prro::crypto` needs from `prro_crypto`, with file:line + use-case | §1 (16-row table) |
-| Extensions required, classified additive / signature-shaping / breaking | §3 (5-row table; all 0 non-additive) |
+| Extensions required, classified additive / signature-shaping / breaking | §3 (6-row table; all 0 non-additive — last row added 2026-05-05) |
 | Concrete migration plan per non-additive extension | §4 (no non-additive entries; standing template documented) |
 | `CryptoProvider` trait shape proposed in Rust (no edits under `rust/prro/src/**`) | §5 (full Rust block, lives only in this doc) |
 | Trait complies with ADR-M2-6 (no DB handle in any signature) | §5 "Compliance checks" + grep'able: signatures contain no `SqlitePool` / `SqliteConnection` / `Transaction` / `Pool` |

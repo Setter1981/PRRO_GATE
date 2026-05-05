@@ -242,8 +242,8 @@ pub enum CryptoError {
     EnvelopeDecrypt { reason: DecryptKind },
     #[error("cert fetch failed: {reason:?}")]
     CertFetch { reason: FetchKind },
-    #[error("signature verification failed")]
-    VerifyFailed,
+    #[error("signature verification failed: {reason:?}")]
+    VerifyFailed { reason: VerifyKind },
 }
 
 // Manual Debug — make sure no future field accidentally `format!`s a secret.
@@ -257,7 +257,7 @@ impl fmt::Debug for CryptoError {
             Self::CmsSign { reason } => f.debug_struct("CmsSign").field("reason", reason).finish(),
             Self::EnvelopeDecrypt { reason } => f.debug_struct("EnvelopeDecrypt").field("reason", reason).finish(),
             Self::CertFetch { reason } => f.debug_struct("CertFetch").field("reason", reason).finish(),
-            Self::VerifyFailed => f.write_str("VerifyFailed"),
+            Self::VerifyFailed { reason } => f.debug_struct("VerifyFailed").field("reason", reason).finish(),
         }
     }
 }
@@ -290,6 +290,19 @@ pub enum FetchKind {
     ParseFailed,
     SkiMismatch,
     AllUrlsFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyKind {
+    /// raw `r||s` LE-bytes blob is not exactly 64 bytes for PB-257.
+    MalformedSignature,
+    /// `expand_compressed_checked` rejected the public key (off-curve,
+    /// wrong length, or wrong cofactor).
+    MalformedPubkey,
+    /// Signature parsed and curve checks passed but `verify` returned
+    /// false — used by callers that want to distinguish "wrong sig"
+    /// from "malformed inputs".
+    SignatureRejected,
 }
 ```
 
@@ -515,9 +528,19 @@ pub trait CryptoProvider: Send + Sync {
     ) -> Result<SignedCmsBytes, CryptoError>;
 
     /// Verify a DSTU 4145 raw signature.
+    ///
+    /// `content_digest` is the already-computed message hash bytes
+    /// (caller chooses the profile — GOST 34.311-95 or Kupyna-256 — and
+    /// hands in the digest, mirroring `sign_cms_detached`'s contract);
+    /// `sig_bytes` is the 64-byte raw concatenation of `r || s` LE-packed
+    /// per `prro_crypto::python::raw_split_to_rs` (`rust/prro_crypto/
+    /// src/python.rs:284`); `pubkey_compressed` is the 33-byte LE
+    /// compressed point as returned by
+    /// `prro_crypto::cms::envelope::extract_cert_pubkey_bytes` and
+    /// validated via `expand_compressed_checked`.
     async fn verify_dstu(
         &self,
-        msg: &[u8],
+        content_digest: &[u8],
         sig_bytes: &[u8],
         pubkey_compressed: &[u8],
     ) -> Result<DstuVerifyResult, CryptoError>;
@@ -570,32 +593,17 @@ use crate::crypto::provider::{
 };
 use crate::crypto::session::SigningSession;
 
-/// Provider configuration consumed at construction time.  Exposes the
-/// curve choice (locked to PB-257 in M2 — the only DPS-deployed Ukrainian
-/// CA curve, per W0-3 §1) and the per-URL CMP request timeout.
-#[derive(Debug, Clone)]
-pub struct InProcessProviderConfig {
-    pub cmp_request_timeout: std::time::Duration,
-}
-
-impl Default for InProcessProviderConfig {
-    fn default() -> Self {
-        Self { cmp_request_timeout: std::time::Duration::from_secs(15) }
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct InProcessProvider {
-    cfg: InProcessProviderConfig,
-}
+/// Single source of timeout truth: each `CryptoProvider::fetch_cert_by_ski`
+/// call carries its own `request_timeout`.  Caller (`services::cert_refresher`)
+/// loads it from `cert_provisioning_config.cmp_request_timeout_secs` and
+/// passes it through; the provider itself is stateless w.r.t. timeouts.
+/// This avoids drift between a config-stamped value and a per-call value.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct InProcessProvider;
 
 impl InProcessProvider {
     pub fn new() -> Self {
-        Self { cfg: InProcessProviderConfig::default() }
-    }
-
-    pub fn with_config(cfg: InProcessProviderConfig) -> Self {
-        Self { cfg }
+        Self
     }
 }
 
@@ -624,13 +632,14 @@ impl CryptoProvider for InProcessProvider {
 
     async fn verify_dstu(
         &self,
-        msg: &[u8],
+        content_digest: &[u8],
         sig_bytes: &[u8],
         pubkey_compressed: &[u8],
     ) -> Result<DstuVerifyResult, CryptoError> {
-        // Verify is fast enough that staying on the executor is OK.
-        let ok = prro_crypto_verify_blocking(msg, sig_bytes, pubkey_compressed);
-        Ok(DstuVerifyResult(ok))
+        // Verify is fast enough (~150µs first call, ~10µs after pubkey
+        // validation cache hit) that staying on the executor is OK.
+        prro_crypto_verify_blocking(content_digest, sig_bytes, pubkey_compressed)
+            .map(DstuVerifyResult)
     }
 
     async fn unwrap_envelope(
@@ -705,10 +714,31 @@ fn sign_cms_blocking(
         .map_err(|_| CryptoError::CmsSign { reason: SignKind::BackendError })
 }
 
-fn prro_crypto_verify_blocking(_msg: &[u8], _sig: &[u8], _pubkey: &[u8]) -> bool {
-    // Wire to `prro_crypto::core::sign::verify` — exact signature derived
-    // from W0-3 §1 (root re-export at `rust/prro_crypto/src/lib.rs:9`).
-    false
+fn prro_crypto_verify_blocking(
+    content_digest: &[u8],
+    sig_bytes: &[u8],
+    pubkey_compressed: &[u8],
+) -> Result<bool, CryptoError> {
+    use prro_crypto::core::curve::Curve;
+    use prro_crypto::core::field::FieldEl;
+    use prro_crypto::core::point::expand_compressed_checked;
+    use prro_crypto::core::sign::{verify, Signature};
+
+    // Real signature at `rust/prro_crypto/src/core/sign.rs:301`:
+    //   `fn verify(curve: &Curve, pub_q: &Point, hash: &FieldEl,
+    //              signature: &Signature) -> bool`
+    // PB-257 sig is 32+32 raw LE bytes (per `python.rs:284`); split here.
+    if sig_bytes.len() != 64 {
+        return Err(CryptoError::VerifyFailed { reason: VerifyKind::MalformedSignature });
+    }
+    let curve = Curve::dstu_pb_257();
+    let pub_q = expand_compressed_checked(pubkey_compressed, &curve)
+        .map_err(|_| CryptoError::VerifyFailed { reason: VerifyKind::MalformedPubkey })?;
+    let hash = FieldEl::from_le_bytes(content_digest, curve.mod_words);
+    let r = FieldEl::from_le_bytes(&sig_bytes[..32], curve.mod_words);
+    let s = FieldEl::from_le_bytes(&sig_bytes[32..], curve.mod_words);
+    let signature = Signature { r, s };
+    Ok(verify(&curve, &pub_q, &hash, &signature))
 }
 
 fn unwrap_envelope_blocking(
@@ -778,7 +808,7 @@ pub mod in_process;
 pub mod provider;
 pub mod session;
 
-pub use errors::{CryptoError, DecryptKind, FetchKind, SealKind, SignKind};
+pub use errors::{CryptoError, DecryptKind, FetchKind, SealKind, SignKind, VerifyKind};
 pub use in_process::InProcessProvider;
 pub use provider::{
     CertDer, CryptoProvider, DstuVerifyResult, SignCmsRequest, SignedCmsBytes,
@@ -798,15 +828,21 @@ use prro::crypto::{
 
 #[test]
 fn signing_session_debug_is_redacted() {
+    // `SigningSession::new_for_test` takes `[u8; 32]` (the param-d width
+    // for DSTU PB-257), not a `Vec<u8>` — see plan §"SigningSession".
+    // The 32-byte canary below is ASCII-only so a successful redaction
+    // assertion below is unambiguous (no UTF-8 lossy mapping).
+    let secret: [u8; 32] = *b"super-secret-canary-32bytes-aaaa";
     let session = SigningSession::new_for_test(
         "operator-1".into(),
-        b"super-secret-private-key-bytes".to_vec(),
+        secret,
         b"<cert-der>".to_vec(),
     );
     let s = format!("{:?}", session);
     assert!(s.contains("operator-1"));
     assert!(s.contains("<redacted>"));
-    assert!(!s.contains("super-secret-private-key-bytes"));
+    // Substrings of the secret must NOT leak through Debug.
+    assert!(!s.contains("super-secret-canary"));
 }
 
 #[test]
@@ -852,6 +888,69 @@ async fn fetch_cert_with_no_urls_returns_typed_all_urls_failed() {
         .expect_err("empty urls");
     assert!(matches!(err, CryptoError::CertFetch { .. }));
 }
+
+/// Positive control for `verify_dstu`: prove the wrapper actually calls
+/// the real `prro_crypto::core::sign::verify` and not a stub.  Uses a
+/// known-good fixture vector captured deterministically from
+/// `prro_crypto::core::sign::sign(curve, d, hash, rand_e)` (vendored
+/// under `tests/fixtures/dstu_pb257_sig_ok.json` as `{d_hex, hash_hex,
+/// rand_e_hex, content_digest_hex, sig_64_hex, pubkey_compressed_hex}`).
+/// A passing test here is what guarantees that a future stubbing
+/// regression in `verify_dstu` lights up immediately.
+#[tokio::test]
+async fn verify_dstu_known_good_sig_returns_true() {
+    let provider = InProcessProvider::new();
+    let fixture = test_fixtures::dstu_pb257_sig_ok();
+    let result = provider
+        .verify_dstu(
+            &fixture.content_digest,
+            &fixture.sig_64,
+            &fixture.pubkey_compressed,
+        )
+        .await
+        .expect("verify_dstu must not error on known-good inputs");
+    assert!(result.0, "real verify must accept a known-good sig");
+
+    // Negative complement: flip one bit of the signature; verify must
+    // either return DstuVerifyResult(false) OR a typed VerifyFailed
+    // error (depending on whether the flipped sig is structurally
+    // malformed or just wrong).  Either is acceptable; silently
+    // returning true is NOT.
+    let mut bad = fixture.sig_64.clone();
+    bad[0] ^= 0x01;
+    match provider
+        .verify_dstu(&fixture.content_digest, &bad, &fixture.pubkey_compressed)
+        .await
+    {
+        Ok(DstuVerifyResult(false)) => {} // ok
+        Err(CryptoError::VerifyFailed { .. }) => {} // ok
+        Ok(DstuVerifyResult(true)) => panic!("flipped sig must NOT verify true"),
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
+}
+
+mod test_fixtures {
+    /// Deterministic fixture; implementer captures from a one-shot
+    /// `prro_crypto::core::sign::sign` invocation with hard-coded
+    /// `(d_hex, hash_hex, rand_e_hex)` and freezes the resulting
+    /// `(content_digest, sig_64, pubkey_compressed)` triple inline so
+    /// the smoke test is self-contained (no JSON IO at runtime).
+    pub struct DstuFixture {
+        pub content_digest: Vec<u8>,
+        pub sig_64: Vec<u8>,
+        pub pubkey_compressed: Vec<u8>,
+    }
+    pub fn dstu_pb257_sig_ok() -> DstuFixture {
+        // Implementer fills these from a captured `sign` run.  Hex →
+        // bytes via a small inline `hex_decode` helper or `hex::decode`.
+        DstuFixture {
+            content_digest: hex_decode("…32-byte-hash-hex…"),
+            sig_64: hex_decode("…64-byte-sig-hex…"),
+            pubkey_compressed: hex_decode("…33-byte-compressed-pubkey-hex…"),
+        }
+    }
+    fn hex_decode(_s: &str) -> Vec<u8> { unimplemented!("inline hex decode") }
+}
 ```
 
 - [ ] **Step 9: Build + test.**
@@ -861,7 +960,7 @@ cargo build -p prro
 cargo test -p prro --test crypto_provider_smoke
 ```
 
-Expected: build clean, 4 tests pass.
+Expected: build clean, 5 tests pass (3 redaction tests + `fetch_cert_with_no_urls_returns_typed_all_urls_failed` + `verify_dstu_known_good_sig_returns_true`).
 
 - [ ] **Step 10: Commit.**
 
@@ -887,7 +986,7 @@ bd: <M2 epic id>.
 
 Verified:
   cargo build -p prro                          → clean
-  cargo test -p prro --test crypto_provider_smoke → 4 passed
+  cargo test -p prro --test crypto_provider_smoke → 5 passed
 ```
 
 ---
@@ -923,11 +1022,11 @@ Verified:
 
 **Acceptance Criteria:**
 
-- [ ] `cert_refresher::refresh_for_fn(pool, fn_id, provider)` returns `Ok(RefreshOutcome)` with one of `{NoChange, RefreshedInPlace { ski }, RefreshedKeyRoll { ski_old, ski_new }, Failed(reason)}`.
+- [ ] `cert_refresher::refresh_for_fn(pool, fn_id, provider) -> Result<RefreshOutcome, RefreshError>`.  Success cases: `Ok(NoChange)`, `Ok(RefreshedInPlace { ski })`, `Ok(RefreshedKeyRoll { ski_old, ski_new })`.  Every failure mode (no active cert, no enabled endpoints, all CMP URLs failed, malformed metadata, DB error, propagated `CryptoError`) is `Err(RefreshError::*)` — the enum has NO `Failed(reason)` success variant; the `?`-skeleton in step 4 is the canonical contract.
 - [ ] **Same-SKI refresh (cert renewed, key kept)** does NOT stage a new row (would PK-conflict with `operator_certs.ski_hex`); instead UPDATEs the existing row's `cert_der`, `cert_fingerprint`, `valid_from`, `valid_to`, `subject_dn`, `issuer_dn`, `last_refresh_at`, `fetched_at` in a single short tx.  The UPDATE asserts `rows_affected == 1`; a 0 means the active row was concurrently deactivated and is treated as a typed DB error, not silently absorbed.  Returns `RefreshedInPlace { ski }`.
-- [ ] **Key-roll (new SKI)** stages the new cert at `active=0` with all four cert-metadata fields (`valid_from`, `valid_to`, `subject_dn`, `issuer_dn`) populated from the freshly-parsed DER, then `with_immediate(pool, |conn| ...)` runs `UPDATE … SET active=0 WHERE active=1` + `UPDATE … SET active=1 WHERE ski_hex=?` + `audit_log INSERT` in one tx.  Both UPDATEs assert `rows_affected == 1` — any mismatch returns a typed error and the with_immediate ROLLBACKs.  Returns `RefreshedKeyRoll { ski_old, ski_new }`.
-- [ ] Cert metadata extraction goes through a new additive helper `prro_crypto::cms::envelope::parse_cert_basic_fields(cert_der) -> Result<BasicCertFields, EnvelopeError>` returning `valid_from`, `valid_to`, `subject_dn`, `issuer_dn`.  W2 step 0 files an additive PR against `prro_crypto` (W0-3 §3 classification) before wiring this helper into `services::cert_refresher::parse_cert_metadata`.  No ad-hoc ASN.1 walker lands inside `rust/prro/src/services/`.
-- [ ] Multi-URL fallback reads from the new `ca_endpoints` table (priority-ordered, enabled-only).  Each per-URL probe is bounded by `cfg.cmp_request_timeout` (loaded from `cert_provisioning_config.cmp_request_timeout_secs`, default 15s).  If one URL returns transport error / parse error / SKI mismatch / timeout, the next is tried; if all fail, `Failed(AllUrlsFailed)` is returned without touching the DB.
+- [ ] **Key-roll (new SKI)** runs ONE `with_immediate(pool, |conn| ...)` containing: `INSERT OR REPLACE … active=0` (staging the new cert with all four metadata fields), `UPDATE … SET active=0 WHERE fiscal_number=? AND active=1`, `UPDATE … SET active=1 WHERE ski_hex=?`, and `audit_log INSERT`.  All in one tx.  Both UPDATEs assert `rows_affected == 1` — any mismatch returns a typed error and the with_immediate ROLLBACKs.  No `stage_inactive_cert` INSERT outside the tx — the previous design had a stage-then-flip window where a crash left an orphan staged row that a retry could not re-stage (PK conflict on `operator_certs.ski_hex`); the unified-tx design closes that window.  Returns `RefreshedKeyRoll { ski_old, ski_new }`.
+- [ ] Cert metadata extraction goes through a new additive helper `prro_crypto::cms::envelope::parse_cert_basic_fields(cert_der) -> Result<BasicCertFields, EnvelopeError>` returning `valid_from`, `valid_to`, `subject_dn`, `issuer_dn`.  This is a **prerequisite additive PR against `prro_crypto`** that lands BEFORE W2 implementation begins.  Cross-references: W0-3 §3 (last row, classification: additive, single-PR scope) and W0-3 §3 amendment 2026-05-05.  W2 step 0 below files the bd issue + lands the additive PR; only after that PR merges does the W2 wiring step proceed.  No ad-hoc ASN.1 walker lands inside `rust/prro/src/services/`.
+- [ ] Multi-URL fallback reads from the new `ca_endpoints` table (priority-ordered, enabled-only).  Each per-URL probe is bounded by `cfg.cmp_request_timeout` (loaded from `cert_provisioning_config.cmp_request_timeout_secs`, default 15s).  If one URL returns transport error / parse error / SKI mismatch / timeout, the next is tried; if all fail, the function returns `Err(RefreshError::AllUrlsFailed)` without touching the DB.
 - [ ] `refresh_within_days` honoured: a cert whose `valid_to - now > refresh_within_days` is NOT refreshed (returns `NoChange`).  One whose `valid_to - now <= refresh_within_days` IS refreshed.  The freshly-written `valid_to` in step 6 of `refresh_for_fn` MUST be the new cert's lifetime — not `Utc::now()` — so the next refresh cycle's eligibility check reads the correct expiry.
 - [ ] No CMP fetch / network call happens inside any `with_immediate` block (W5 will static-assert this; W2 must not introduce a violation).
 - [ ] Malformed inputs are fail-closed:
@@ -944,6 +1043,42 @@ cargo test -p prro --test cert_refresher_smoke
 ```
 
 **Steps:**
+
+- [ ] **Step 0 (gating prerequisite): Land additive `prro_crypto::cms::envelope::parse_cert_basic_fields`.**
+
+This step happens BEFORE any code in `rust/prro/src/services/` is written.
+
+```bash
+# 1) File the bd issue against the M2 epic so the PR has a tracked id.
+bd add --type task --title "prro_crypto: parse_cert_basic_fields helper (M2/W2 prerequisite)" \
+       --parent <M2-epic-id> --discovered-from <plan-fix-pass-3-commit>
+
+# 2) Implement the helper in a separate PR against rust/prro_crypto/.
+#    Suggested location: rust/prro_crypto/src/cms/envelope.rs (next to
+#    extract_cert_pubkey_bytes — same DER walker prefix).
+#    Returned struct shape:
+#      pub struct BasicCertFields {
+#          pub valid_from: chrono::DateTime<chrono::Utc>,
+#          pub valid_to:   chrono::DateTime<chrono::Utc>,
+#          pub subject_dn: String,   // RFC 4514 DN string
+#          pub issuer_dn:  String,
+#      }
+#    Tests: a fixture cert (vendored under rust/prro_crypto/tests/fixtures/)
+#    asserts each field byte-equal to a known-good value.
+#    Acceptance: cargo test -p prro_crypto passes; cargo build -p prro
+#    against the new helper + an unmodified rust/prro/ HEAD compiles.
+
+# 3) Merge the prro_crypto PR before continuing W2 step 1.
+```
+
+Why this is its own step, not folded into step 1: W0-3 §3 classifies it
+additive but it is a NEW symbol in `prro_crypto`; landing it as a
+discrete PR (with its own tests + review + commit) is the contract this
+plan owes to the architecture rule "no edits under `rust/prro_crypto/
+src/**` from inside a `prro` task".  Also unblocks W2 cleanly: the
+implementer of `services::cert_refresher` can `use
+prro_crypto::cms::envelope::parse_cert_basic_fields` from a published
+helper rather than racing the dependency.
 
 - [ ] **Step 1: Add deps + port `ca_endpoints` migration.**
 
@@ -1040,12 +1175,16 @@ The full source is ~250 lines; the implementer follows this skeleton:
 //!   3. Compute the SKI to fetch (= currently-active cert's SKI for refresh,
 //!      or a separately-supplied SKI for first-time provisioning).
 //!   4. Call `provider.fetch_cert_by_ski(urls, ski, cfg.cmp_request_timeout)` — outside any tx.
-//!   5. Stage the new cert at active=0 in `operator_certs` (single INSERT).
-//!   6. Atomically flip via `db::tx::with_immediate`:
-//!        UPDATE operator_certs SET active=0 WHERE fiscal_number=? AND active=1;
-//!        UPDATE operator_certs SET active=1 WHERE ski_hex=?;
-//!   7. Append an `audit_log` row in the same tx.
-//!   8. Return Refreshed{old, new}.
+//!   5. Parse cert metadata (SKI, valid_from/to, subject/issuer DN).
+//!   6. If the new SKI matches the active SKI → in-place UPDATE the
+//!      existing active=1 row (single short tx, rows_affected==1).
+//!   7. Else (key-roll) → ONE `with_immediate` tx that runs:
+//!        INSERT OR REPLACE … active=0 (stage)
+//!        UPDATE … SET active=0 WHERE fiscal_number=? AND active=1
+//!        UPDATE … SET active=1 WHERE ski_hex=?
+//!        INSERT INTO audit_log
+//!      — atomic + idempotent on retry (no orphan staged-row window).
+//!   8. Return RefreshedInPlace { ski } | RefreshedKeyRoll { old, new }.
 
 use std::sync::Arc;
 
@@ -1073,7 +1212,6 @@ pub enum RefreshOutcome {
     RefreshedInPlace { ski: String },
     /// New SKI: stage at active=0 + atomic flip via with_immediate.
     RefreshedKeyRoll { ski_old: String, ski_new: String },
-    Failed(RefreshError),
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -1147,22 +1285,51 @@ pub async fn refresh_for_fn(
         return Ok(RefreshOutcome::RefreshedInPlace { ski: new_ski_hex });
     }
 
-    // Key-roll: new SKI != old.  Stage at active=0 outside any tx; flip + audit
-    // inside one with_immediate.
-    stage_inactive_cert(pool, fn_id, &new_ski_hex, &new_cert.0, &parsed)
-        .await
-        .map_err(|e| RefreshError::Db(e.to_string()))?;
-
+    // Key-roll: new SKI != old.  Stage + flip + audit run inside ONE
+    // `with_immediate` tx so the operation is atomic AND idempotent on
+    // retry: a crash before COMMIT leaves no orphan staged row (tx never
+    // committed); a crash AFTER COMMIT means the row is already there and
+    // active=1 for the new SKI, so a subsequent refresh_for_fn call would
+    // see `valid_to - now > refresh_within_days` and return NoChange.
+    // The stage uses INSERT OR REPLACE so a stale staged row from a prior
+    // fence (rare: only possible if a previous `with_immediate` succeeded
+    // its INSERT but failed both UPDATEs *and* the implicit ROLLBACK was
+    // skipped — defensive belt-and-braces) does not cause a PK conflict.
     let new_ski_for_tx = new_ski_hex.clone();
     let active_ski_for_tx = active_ski.clone();
     let fn_id_for_tx = fn_id_owned.clone();
+    let parsed_for_tx = parsed.clone();
+    let new_cert_for_tx = new_cert.0.clone();
     with_immediate(pool, move |conn| {
         Box::pin(async move {
+            let now_iso = Utc::now().to_rfc3339();
+
+            // Stage at active=0.  INSERT OR REPLACE is safe here because
+            // ski_hex is the PK and we only hit this branch when
+            // new_ski_hex != active_ski, so we cannot accidentally
+            // overwrite the currently-active row.
+            sqlx::query(
+                "INSERT OR REPLACE INTO operator_certs( \
+                     ski_hex, fiscal_number, cert_fingerprint, cert_der, \
+                     valid_from, valid_to, subject_dn, issuer_dn, \
+                     fetched_at, source, active) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'cmp', 0)",
+            )
+            .bind(&new_ski_for_tx)
+            .bind(&fn_id_for_tx)
+            .bind(compute_fingerprint(&new_cert_for_tx))
+            .bind(&new_cert_for_tx)
+            .bind(parsed_for_tx.valid_from.to_rfc3339())
+            .bind(parsed_for_tx.valid_to.to_rfc3339())
+            .bind(&parsed_for_tx.subject_dn)
+            .bind(&parsed_for_tx.issuer_dn)
+            .bind(&now_iso)
+            .execute(&mut *conn)
+            .await?;
+
             // Both UPDATEs MUST hit exactly one row.  rows_affected != 1
-            // means concurrent state mutation under a non-IMMEDIATE caller
-            // or a stale stage row — either way we abort the tx (returning
-            // an error rolls back via with_immediate's contract) so the
-            // exactly-one-active=1 invariant is never silently violated.
+            // means concurrent state mutation or a logic bug; abort the
+            // tx (Err triggers ROLLBACK via with_immediate's contract).
             let r1 = sqlx::query(
                 "UPDATE operator_certs SET active = 0 \
                  WHERE fiscal_number = ? AND active = 1",
@@ -1312,33 +1479,13 @@ async fn load_ca_urls(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
     Ok(rows.into_iter().map(|(u,)| u).collect())
 }
 
-async fn stage_inactive_cert(
-    pool: &SqlitePool,
-    fn_id: &str,
-    ski_hex: &str,
-    cert_der: &[u8],
-    parsed: &ParsedCertMetadata,
-) -> sqlx::Result<()> {
-    sqlx::query(
-        "INSERT INTO operator_certs( \
-             ski_hex, fiscal_number, cert_fingerprint, cert_der, \
-             valid_from, valid_to, subject_dn, issuer_dn, \
-             fetched_at, source, active) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'cmp', 0)",
-    )
-    .bind(ski_hex)
-    .bind(fn_id)
-    .bind(compute_fingerprint(cert_der))
-    .bind(cert_der)
-    .bind(parsed.valid_from.to_rfc3339())
-    .bind(parsed.valid_to.to_rfc3339())
-    .bind(&parsed.subject_dn)
-    .bind(&parsed.issuer_dn)
-    .bind(Utc::now().to_rfc3339())
-    .execute(pool)
-    .await?;
-    Ok(())
-}
+// `stage_inactive_cert` (a stand-alone INSERT outside any tx) is
+// intentionally absent: the W2 refresh path now stages-and-flips inside
+// ONE `with_immediate` block (see `refresh_for_fn` above).  This makes
+// the operation idempotent on retry — a crash between the old "stage
+// outside tx" + "flip inside tx" pair would have left an orphan
+// active=0 row that a retry could not stage again (PK conflict on
+// `operator_certs.ski_hex`); the new design has no such window.
 
 /// Fail-closed hex → 32-byte SKI converter.  Rejects wrong-length input
 /// and any non-hex character with a typed reason instead of returning
@@ -2127,7 +2274,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 
 use std::sync::{Arc, Mutex};
 use std::io::{self, Write};
-use tracing::subscriber::with_default;
+use tracing::subscriber::set_default;
 use tracing_subscriber::fmt;
 
 const SEEDED_PASSWORD: &str = "p@ssw0rd-leak-canary-9f8a";
@@ -2159,7 +2306,24 @@ impl CaptureBuf {
     }
 }
 
-#[tokio::test]
+// Why `set_default` (returning a `DefaultGuard`) and NOT `with_default`
+// (which takes a sync closure):
+//   `with_default(subscriber, || { … })` requires a synchronous body —
+//   any `.await` inside would suspend the future and the subscriber
+//   would be reset before the `.await` resumed, so events emitted on
+//   the resumed continuation would land in the GLOBAL subscriber
+//   (whatever cargo-test sets up by default), NOT in our capture buf.
+//   `set_default` returns a guard that lives across `.await` points and
+//   restores the previous subscriber when dropped — exactly what we
+//   want for an async test.
+//   See https://docs.rs/tracing/latest/tracing/subscriber/fn.set_default.html
+//   for the documented contract.
+//   Tests are NOT marked `#[tokio::test(flavor = "current_thread")]`
+//   because tokio's default multi-threaded runtime requires `Send`
+//   guards; `DefaultGuard` is `!Send`, so we explicitly request
+//   `current_thread`.
+
+#[tokio::test(flavor = "current_thread")]
 async fn no_secret_substring_leaks_through_any_log() {
     let buf = CaptureBuf::default();
     let subscriber = fmt()
@@ -2167,14 +2331,17 @@ async fn no_secret_substring_leaks_through_any_log() {
         .with_max_level(tracing::Level::TRACE)
         .with_ansi(false)
         .finish();
+    let _guard = set_default(subscriber);
 
-    with_default(subscriber, || {
-        // Step 1: exercise unseal_jks happy path with seeded password+key.
-        // Step 2: exercise sign_cms_detached.
-        // Step 3: exercise refresh_for_fn against a wiremock stub.
-        // Step 4: exercise each CryptoError variant by triggering it.
-        // (implementer wires; uses test_helpers from W1)
-    });
+    // All `.await`s below run with the capture subscriber active because
+    // `_guard` is held in the surrounding scope.
+    // Step 1: exercise unseal_jks happy path with seeded password+key.
+    // Step 2: exercise sign_cms_detached.
+    // Step 3: exercise refresh_for_fn against a wiremock stub.
+    // Step 4: exercise each CryptoError variant by triggering it.
+    // (implementer wires; uses test_helpers from W1)
+
+    drop(_guard); // explicit so the assertion runs against a frozen buffer
 
     let captured = buf.into_string();
     let priv_substr = std::str::from_utf8(&SEEDED_PRIVATE_KEY[..16])
@@ -2184,7 +2351,7 @@ async fn no_secret_substring_leaks_through_any_log() {
     assert!(!captured.contains(priv_substr), "priv-key prefix leaked: {captured}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn positive_control_capture_works() {
     let buf = CaptureBuf::default();
     let subscriber = fmt()
@@ -2192,15 +2359,24 @@ async fn positive_control_capture_works() {
         .with_max_level(tracing::Level::TRACE)
         .with_ansi(false)
         .finish();
+    let _guard = set_default(subscriber);
 
-    with_default(subscriber, || {
-        tracing::info!(jks = "leaked-on-purpose-for-test");
-    });
+    // Use a sync emit + a tiny await so the test exercises both the
+    // pre-await and post-await capture paths.
+    tracing::info!(jks = "leaked-on-purpose-for-test");
+    tokio::task::yield_now().await;
+    tracing::info!("post-await event");
+
+    drop(_guard);
 
     let captured = buf.into_string();
     assert!(
         captured.contains("leaked-on-purpose-for-test"),
         "capture machinery broken: {captured}"
+    );
+    assert!(
+        captured.contains("post-await event"),
+        "guard did not survive .await — events lost: {captured}"
     );
 }
 ```
