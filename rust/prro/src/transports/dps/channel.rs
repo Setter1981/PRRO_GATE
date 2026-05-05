@@ -58,4 +58,22 @@ pub trait DpsChannel: Send + Sync {
             "W3-C3-not-yet-wired: by_server_fiscal_no semantic lands in C3".into(),
         ))
     }
+
+    /// Lookup by local-identity (per-FN local document number / lnd).
+    ///
+    /// W0-1 finding: DPS does NOT expose this query at the wire
+    /// level.  The trait carries the method as a typed `Err` for
+    /// caller ergonomics — services calling `dyn DpsChannel` can
+    /// match on `DpsError::QueryNotSupported` without having to know
+    /// about the wire shape.  Default body returns
+    /// `QueryNotSupported`; impls SHOULD NOT override it.  C4 mock
+    /// asserts the typed-Err contract so a future caller cannot
+    /// silently get `Internal(...)` instead.
+    async fn query_by_local_identity(
+        &self,
+        _fn_id: &str,
+        _local_number: i32,
+    ) -> Result<CheckAck, DpsError> {
+        Err(DpsError::QueryNotSupported("query_by_local_identity"))
+    }
 }

@@ -41,12 +41,31 @@ pub enum DpsError {
     #[error("DPS server status {code}: {message}")]
     Server { code: i32, message: String },
 
-    /// `by_server_fiscal_no`-specific outcome: server returned a
-    /// well-formed response but no record matched the requested
-    /// fiscal id (the response's `id` field is empty / disagrees in
-    /// the documented absent-shape).
+    /// `by_server_fiscal_no` absent path: server returned a
+    /// well-formed response but no record exists for the FN
+    /// (`response.id` empty / documented absent-shape).
     #[error("DPS lookup not found for the requested fiscal id")]
     NotFound,
+
+    /// `by_server_fiscal_no` mismatch path (PRRO_GATE-5js): server's
+    /// `lastChk` returned a fiscal id that does NOT match what the
+    /// caller expected.  Distinct variant so callers can route this
+    /// to a reconciliation flow without pattern-matching on
+    /// `Server { code, .. }` substrings.
+    #[error("DPS fiscal id mismatch: expected {expected_id}, server returned {actual_id}")]
+    ServerFiscalIdMismatch {
+        expected_id: String,
+        actual_id: String,
+    },
+
+    /// Caller asked for a query method DPS does not implement (W0-1
+    /// finding: `ByLocalIdentity` has no wire-level RPC; the only
+    /// server-side lookup is `lastChk` + id-match).  Distinct from
+    /// `NotFound` (which is a runtime outcome) and from `Internal`
+    /// (which is a wrapper bug) — `QueryNotSupported` is a typed
+    /// "this protocol does not offer that operation" signal.
+    #[error("DPS does not support the requested query: {0}")]
+    QueryNotSupported(&'static str),
 
     /// Wrapper-side bug or un-wired path.  Production callers should
     /// never see this; if they do, the channel is mis-configured.

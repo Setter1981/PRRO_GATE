@@ -10,14 +10,18 @@
 //! `SqlitePool` / `SqliteConnection` / `Pool<Sqlite>` / `Transaction<…>`.
 //! W5 will static-assert this at build time.
 //!
-//! Generated `gen` stays `pub mod` for now so the typed wrappers in
-//! `dto` can construct and read the prost types crate-internally; the
-//! public trait surface (`DpsChannel`, the DTOs, `DpsError`) does NOT
-//! leak any prost / tonic shape across crate boundaries.
+//! Generated `gen` is `#[doc(hidden)] pub mod` — technically reachable
+//! from outside the crate (so C4's integration-test mock server can
+//! call `tonic::include_proto!`-derived server-side stubs without
+//! re-running the proto codegen) but flagged as "test/unstable
+//! support, NOT public contract".  Production callers consume the
+//! typed surface (`DpsChannel`, the DTOs, `DpsError`); raw prost /
+//! tonic shapes do NOT belong in any production code path.
 
 pub mod channel;
 pub mod dto;
 pub mod error;
+#[doc(hidden)]
 pub mod gen;
 pub mod grpc;
 

@@ -31,7 +31,13 @@ pub enum DpsCheckType {
 pub struct CheckEnvelope {
     /// Fiscal number string (`rro_fn`).
     pub rro_fn: String,
-    /// Unix-epoch seconds.
+    /// DPS-specific "Kyiv-local-as-epoch": the wall-clock time in
+    /// `Europe/Kiev` interpreted as if it were UTC, then converted to
+    /// epoch seconds.  This is NOT a true UTC epoch — DPS expects the
+    /// Kyiv-local timestamp on the wire and the existing Python
+    /// transport encodes it that way.  Callers in M3+ MUST NOT pass a
+    /// raw `Utc::now().timestamp()`; the conversion to Kyiv-local
+    /// epoch happens in `services/` before reaching this DTO.
     pub date_time: i64,
     /// CMS-signed receipt blob.  Borrow elided to keep the type
     /// `'static`-safe for `Arc<dyn DpsChannel>` patterns.

@@ -46,9 +46,11 @@ pub struct GrpcDpsChannel {
 
 impl GrpcDpsChannel {
     /// Open a long-lived channel to `endpoint` (e.g.
-    /// `https://cabinet.tax.gov.ua:9443`).  The connection is
-    /// established lazily by tonic; this call only validates the URI
-    /// and configures the default deadline.
+    /// `https://cabinet.tax.gov.ua:9443`).  Eagerly establishes the
+    /// HTTP/2 connection so a misconfigured endpoint surfaces a
+    /// typed `DpsError::Transport` at construction time instead of
+    /// on the first RPC.  Validates the URI and configures the
+    /// default per-call deadline.
     pub async fn connect(endpoint: &str, request_timeout: Duration) -> Result<Self, DpsError> {
         let ep = Endpoint::from_shared(endpoint.to_string())
             .map_err(|e| DpsError::Transport(format!("invalid endpoint URI: {e}")))?
