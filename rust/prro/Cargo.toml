@@ -46,6 +46,11 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 # Cert refresher (M2 W2) — fingerprinting helper.
 sha2 = "0.10"
 
+# DPS gRPC transport (M2 W3).
+prost = "0.13"
+prost-types = "0.13"
+tonic = "0.12"
+
 # OS / fs
 fs4 = "0.9"
 
@@ -67,3 +72,9 @@ tempfile = "3"
 # server in place of a live CMP endpoint.
 wiremock = "0.6"
 
+[build-dependencies]
+# M2 W3 compiles the production DPS proto into a client + test mock server.
+tonic-build = "0.12"
+
+# Keep CI independent from a system-level `protoc` installation.
+protoc-bin-vendored = "3"

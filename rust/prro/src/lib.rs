@@ -20,5 +20,6 @@ pub mod db;
 pub mod doctor;
 pub mod runtime;
 pub mod services;
+pub mod transports;
 
 pub use app::App;

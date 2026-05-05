@@ -1,0 +1,113 @@
+// DPS Fiscal Server API — ChkIncomeService
+// Source: https://cabinet.tax.gov.ua/help/api.html
+
+syntax = "proto3";
+
+package com.programika.rro.ws.chk;
+
+service ChkIncomeService {
+    rpc sendChkV2 (Check) returns (CheckResponse);
+    rpc lastChk (CheckRequest) returns (CheckResponse);
+    rpc ping (Check) returns (CheckResponse);
+    rpc statusRro (CheckRequest) returns (StatusResponse);
+    rpc infoRro (CheckRequest) returns (RroInfoResponse);
+}
+
+message Check {
+    string rro_fn = 1;
+    int64 date_time = 2;
+    bytes check_sign = 3;
+    int32 local_number = 4;
+    enum Type {
+        UNKNOWN = 0;
+        CHK = 1;
+        ZREPORT = 2;
+        SERVICECHK = 3;
+    }
+    Type check_type = 5;
+    string id_offline = 6;
+    string id_cancel = 7;
+}
+
+message CheckRequest {
+    bytes rro_fn_sign = 3;
+}
+
+message CheckResponse {
+    string id = 1;
+    enum Status {
+        UNKNOWN = 0;
+        OK = 1;
+        ERROR_VEREFY = -1;
+        ERROR_CHECK = -2;
+        ERROR_SAVE = -3;
+        ERROR_UNKNOWN = -4;
+        ERROR_TYPE = -5;
+        ERROR_NOT_PREV_ZREPORT = -6;
+        ERROR_XML = -7;
+        ERROR_XML_DATE = -8;
+        ERROR_XML_CHK = -9;
+        ERROR_XML_ZREPORT = -10;
+        ERROR_OFFLINE_168 = -11;
+        ERROR_BAD_HASH_PREV = -12;
+        ERROR_NOT_REGISTERED_RRO = -13;
+        ERROR_NOT_REGISTERED_SIGNER = -14;
+        ERROR_NOT_OPEN_SHIFT = -15;
+        ERROR_OFFLINE_ID = -16;
+    }
+    Status status = 2;
+    bytes id_sign = 3;
+    bytes data_sign = 4;
+    string error_message = 5;
+}
+
+message StatusResponse {
+    bool open_shift = 1;
+    bool online = 2;
+    string last_signer = 3;
+    enum Status {
+        UNKNOWN = 0;
+        OK = 1;
+        ERROR_VEREFY = -1;
+        ERROR_CHECK = -2;
+        ERROR_UNKNOWN = -4;
+        ERROR_NOT_REGISTERED_RRO = -13;
+        ERROR_NOT_REGISTERED_SIGNER = -14;
+    }
+    Status status = 4;
+    string error_message = 5;
+}
+
+message RroInfoResponse {
+    enum Status {
+        UNKNOWN = 0;
+        OK = 1;
+        ERROR_VEREFY = -1;
+        ERROR_CHECK = -2;
+        ERROR_UNKNOWN = -4;
+        ERROR_NOT_REGISTERED_RRO = -13;
+        ERROR_NOT_REGISTERED_SIGNER = -14;
+    }
+    Status status = 1;
+    int32 status_rro = 2;
+    bool open_shift = 3;
+    bool online = 4;
+    string last_signer = 5;
+    string name = 6;
+    string name_to = 7;
+    string addr = 8;
+    bool single_tax = 9;
+    bool offline_allowed = 10;
+    int32 add_num = 11;
+    string pn = 12;
+    message Operator {
+        string serial = 1;
+        int32 status = 2;
+        bool senior = 3;
+        string isname = 4;
+    }
+    repeated Operator operators = 13;
+    string tins = 14;
+    int32 lnum = 15;
+    string name_pay = 16;
+}
