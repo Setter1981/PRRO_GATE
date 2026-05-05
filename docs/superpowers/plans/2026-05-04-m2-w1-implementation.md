@@ -1024,7 +1024,7 @@ Verified:
 
 - [ ] `cert_refresher::refresh_for_fn(pool, fn_id, provider) -> Result<RefreshOutcome, RefreshError>`.  Success cases: `Ok(NoChange)`, `Ok(RefreshedInPlace { ski })`, `Ok(RefreshedKeyRoll { ski_old, ski_new })`.  Every failure mode (no active cert, no enabled endpoints, all CMP URLs failed, malformed metadata, DB error, propagated `CryptoError`) is `Err(RefreshError::*)` — the enum has NO `Failed(reason)` success variant; the `?`-skeleton in step 4 is the canonical contract.
 - [ ] **Same-SKI refresh (cert renewed, key kept)** does NOT stage a new row (would PK-conflict with `operator_certs.ski_hex`); instead UPDATEs the existing row's `cert_der`, `cert_fingerprint`, `valid_from`, `valid_to`, `subject_dn`, `issuer_dn`, `last_refresh_at`, `fetched_at` in a single short tx.  The UPDATE asserts `rows_affected == 1`; a 0 means the active row was concurrently deactivated and is treated as a typed DB error, not silently absorbed.  Returns `RefreshedInPlace { ski }`.
-- [ ] **Key-roll (new SKI)** runs ONE `with_immediate(pool, |conn| ...)` containing: `INSERT OR REPLACE … active=0` (staging the new cert with all four metadata fields), `UPDATE … SET active=0 WHERE fiscal_number=? AND active=1`, `UPDATE … SET active=1 WHERE ski_hex=?`, and `audit_log INSERT`.  All in one tx.  Both UPDATEs assert `rows_affected == 1` — any mismatch returns a typed error and the with_immediate ROLLBACKs.  No `stage_inactive_cert` INSERT outside the tx — the previous design had a stage-then-flip window where a crash left an orphan staged row that a retry could not re-stage (PK conflict on `operator_certs.ski_hex`); the unified-tx design closes that window.  Returns `RefreshedKeyRoll { ski_old, ski_new }`.
+- [ ] **Key-roll (new SKI)** runs ONE `with_immediate(pool, |conn| ...)` containing: `INSERT … ON CONFLICT(ski_hex) DO UPDATE … WHERE operator_certs.fiscal_number = excluded.fiscal_number AND operator_certs.active = 0` (idempotent stage that REFUSES to overwrite a row owned by a different fiscal_number or one already at active=1 — sqlite_constraint or rows_affected==0 on those, both surfaced as a typed error), then `UPDATE … SET active=0 WHERE fiscal_number=? AND active=1`, `UPDATE … SET active=1 WHERE ski_hex=?`, and `audit_log INSERT`.  All in one tx.  Both UPDATEs and the stage assert `rows_affected == 1` — any mismatch returns a typed error and the with_immediate ROLLBACKs.  Why NOT `INSERT OR REPLACE`: SQLite REPLACE is DELETE+INSERT and would silently wipe a foreign-owned `ski_hex` row (legal/cert artefacts), so we use `ON CONFLICT … DO UPDATE` with a same-fiscal-number, active=0 guard.  No `stage_inactive_cert` INSERT outside the tx — the previous design had a stage-then-flip window where a crash left an orphan staged row that a retry could not re-stage (PK conflict on `operator_certs.ski_hex`); the unified-tx design closes that window.  Returns `RefreshedKeyRoll { ski_old, ski_new }`.
 - [ ] Cert metadata extraction goes through a new additive helper `prro_crypto::cms::envelope::parse_cert_basic_fields(cert_der) -> Result<BasicCertFields, EnvelopeError>` returning `valid_from`, `valid_to`, `subject_dn`, `issuer_dn`.  This is a **prerequisite additive PR against `prro_crypto`** that lands BEFORE W2 implementation begins.  Cross-references: W0-3 §3 (last row, classification: additive, single-PR scope) and W0-3 §3 amendment 2026-05-05.  W2 step 0 below files the bd issue + lands the additive PR; only after that PR merges does the W2 wiring step proceed.  No ad-hoc ASN.1 walker lands inside `rust/prro/src/services/`.
 - [ ] Multi-URL fallback reads from the new `ca_endpoints` table (priority-ordered, enabled-only).  Each per-URL probe is bounded by `cfg.cmp_request_timeout` (loaded from `cert_provisioning_config.cmp_request_timeout_secs`, default 15s).  If one URL returns transport error / parse error / SKI mismatch / timeout, the next is tried; if all fail, the function returns `Err(RefreshError::AllUrlsFailed)` without touching the DB.
 - [ ] `refresh_within_days` honoured: a cert whose `valid_to - now > refresh_within_days` is NOT refreshed (returns `NoChange`).  One whose `valid_to - now <= refresh_within_days` IS refreshed.  The freshly-written `valid_to` in step 6 of `refresh_for_fn` MUST be the new cert's lifetime — not `Utc::now()` — so the next refresh cycle's eligibility check reads the correct expiry.
@@ -1179,7 +1179,11 @@ The full source is ~250 lines; the implementer follows this skeleton:
 //!   6. If the new SKI matches the active SKI → in-place UPDATE the
 //!      existing active=1 row (single short tx, rows_affected==1).
 //!   7. Else (key-roll) → ONE `with_immediate` tx that runs:
-//!        INSERT OR REPLACE … active=0 (stage)
+//!        INSERT INTO operator_certs … active=0
+//!          ON CONFLICT(ski_hex) DO UPDATE …
+//!          WHERE operator_certs.fiscal_number = excluded.fiscal_number
+//!            AND operator_certs.active = 0   (idempotent stage that
+//!            REFUSES to clobber foreign-owned or active=1 rows)
 //!        UPDATE … SET active=0 WHERE fiscal_number=? AND active=1
 //!        UPDATE … SET active=1 WHERE ski_hex=?
 //!        INSERT INTO audit_log
@@ -1304,16 +1308,41 @@ pub async fn refresh_for_fn(
         Box::pin(async move {
             let now_iso = Utc::now().to_rfc3339();
 
-            // Stage at active=0.  INSERT OR REPLACE is safe here because
-            // ski_hex is the PK and we only hit this branch when
-            // new_ski_hex != active_ski, so we cannot accidentally
-            // overwrite the currently-active row.
-            sqlx::query(
-                "INSERT OR REPLACE INTO operator_certs( \
+            // Stage at active=0.  Why NOT `INSERT OR REPLACE`:
+            // SQLite REPLACE is implemented as DELETE-then-INSERT, which
+            // means an existing `ski_hex` row that does NOT belong to
+            // this `fn_id` (e.g. a row owned by a different operator
+            // who happens to have the same SKI hash via a malicious or
+            // accidental collision, or a row left stuck at active=1
+            // from a prior interrupted refresh) would be silently
+            // wiped — destroying ownership / metadata / the active=1
+            // flag for a different fiscal_number.  The legal artefact
+            // here (the cert + its valid_to / issuer DN / audit trail)
+            // is too important to overwrite without a guard.
+            //
+            // Use INSERT … ON CONFLICT(ski_hex) DO UPDATE … with a
+            // WHERE clause that ONLY matches a stale stage row left by
+            // this same fiscal_number's previous failed refresh
+            // (active = 0, same fiscal_number).  Any other conflicting
+            // row produces sqlite_constraint and the with_immediate
+            // ROLLBACKs cleanly.
+            let stage_result = sqlx::query(
+                "INSERT INTO operator_certs( \
                      ski_hex, fiscal_number, cert_fingerprint, cert_der, \
                      valid_from, valid_to, subject_dn, issuer_dn, \
                      fetched_at, source, active) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'cmp', 0)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'cmp', 0) \
+                 ON CONFLICT(ski_hex) DO UPDATE SET \
+                     cert_fingerprint = excluded.cert_fingerprint, \
+                     cert_der         = excluded.cert_der, \
+                     valid_from       = excluded.valid_from, \
+                     valid_to         = excluded.valid_to, \
+                     subject_dn       = excluded.subject_dn, \
+                     issuer_dn        = excluded.issuer_dn, \
+                     fetched_at       = excluded.fetched_at, \
+                     source           = excluded.source \
+                 WHERE operator_certs.fiscal_number = excluded.fiscal_number \
+                   AND operator_certs.active = 0",
             )
             .bind(&new_ski_for_tx)
             .bind(&fn_id_for_tx)
@@ -1326,6 +1355,21 @@ pub async fn refresh_for_fn(
             .bind(&now_iso)
             .execute(&mut *conn)
             .await?;
+            // INSERT path → rows_affected == 1.
+            // ON CONFLICT path that matched our WHERE → rows_affected == 1.
+            // ON CONFLICT path where the WHERE filtered us out (foreign
+            // ownership or already-active) → rows_affected == 0; we
+            // fail the tx so the operator gets a typed error instead
+            // of a silent "stage succeeded" that didn't actually stage.
+            if stage_result.rows_affected() != 1 {
+                return Err(sqlx::Error::Protocol(format!(
+                    "key-roll stage: ski_hex {} already exists for a \
+                     different fiscal_number or is already active=1; \
+                     refusing to overwrite (rows_affected={})",
+                    new_ski_for_tx,
+                    stage_result.rows_affected()
+                )));
+            }
 
             // Both UPDATEs MUST hit exactly one row.  rows_affected != 1
             // means concurrent state mutation or a logic bug; abort the
@@ -1628,8 +1672,13 @@ async fn refresh_falls_back_to_second_url_when_first_returns_5xx() {
         .respond_with(ResponseTemplate::new(200).set_body_bytes(include_bytes!("fixtures/test_ca/cert_aabbccdd.der").to_vec()))
         .mount(&mock)
         .await;
-    // ... wire pool with primary_cmp_url=mock.uri() and fallback=mock.uri() ...
-    // ... call refresh_for_fn, assert Refreshed { ski_old, ski_new } ...
+    // ... wire ca_endpoints with two rows pointing at mock.uri() (same
+    //     host, different priorities — wiremock counts requests in
+    //     order, so `up_to_n_times(1)` 503 then 200 simulates first-url
+    //     fail / second-url succeed) ...
+    // ... call refresh_for_fn, assert
+    //     matches!(result, Ok(RefreshOutcome::RefreshedKeyRoll {
+    //         ski_old, ski_new })) where ski_new is the new cert's SKI ...
 }
 
 #[tokio::test]
@@ -1640,7 +1689,8 @@ async fn refresh_returns_all_urls_failed_without_touching_db() {
         .mount(&mock)
         .await;
     // ... wire two URLs that both 500 ...
-    // ... call refresh_for_fn, assert RefreshOutcome::Failed(AllUrlsFailed) ...
+    // ... call refresh_for_fn, assert
+    //     matches!(result, Err(RefreshError::AllUrlsFailed)) ...
     // ... assert active cert in DB unchanged ...
 }
 
