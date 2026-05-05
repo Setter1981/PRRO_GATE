@@ -2,7 +2,7 @@
   "planPath": "docs/superpowers/plans/2026-05-04-m2-w1-implementation.md",
   "specPath": "docs/superpowers/specs/2026-05-04-m2-pre-plan-adr.md",
   "scope": "M2 implementation — crypto wrapper, cert_refresher, DpsChannel + tonic mock, byte-equivalence goldens, ADR-M2-6 + ADR-M2-5 architectural gates.  Inputs: ADR (approved 2026-05-04) + W0-1/W0-2/W0-3 findings docs + PRRO_GATE-5js note.",
-  "lastUpdated": "2026-05-04T22:00:00Z",
+  "lastUpdated": "2026-05-05T08:00:00Z",
   "tasks": [
     {
       "id": 0,
@@ -21,7 +21,7 @@
       "subject": "Task 2 (W2): services::cert_refresher with multi-URL fallback + atomic flip",
       "status": "pending",
       "blockedBy": [1],
-      "description": "4-6 days.  Async multi-URL CMP fetch + atomic active flip via with_immediate.  ADR-M2-4/-6 services-layer carve-out.  W0-2 test-CA strategy.\n\n```json:metadata\n{\"files\":[\"rust/prro/Cargo.toml\",\"rust/prro/src/lib.rs\",\"rust/prro/src/services/\",\"rust/prro/tests/cert_refresher_smoke.rs\",\"rust/prro/tests/fixtures/test_ca/\"],\"verifyCommand\":\"cargo test -p prro --test cert_refresher_smoke\",\"acceptanceCriteria\":[\"RefreshOutcome enum\",\"multi-URL fallback\",\"atomic flip in with_immediate\",\"refresh_within_days\",\"AllUrlsFailed no DB write\",\"exactly one active=1\"]}\n```"
+      "description": "4-6 days.  Async multi-URL CMP fetch + atomic active flip via with_immediate.  ADR-M2-4/-6 services-layer carve-out.  W0-2 test-CA strategy.\n\n```json:metadata\n{\"files\":[\"rust/prro/Cargo.toml\",\"rust/prro/migrations/006_ca_endpoints.sql\",\"rust/prro/src/lib.rs\",\"rust/prro/src/services/\",\"rust/prro/tests/cert_refresher_smoke.rs\",\"rust/prro/tests/fixtures/test_ca/\"],\"verifyCommand\":\"cargo test -p prro --test cert_refresher_smoke\",\"acceptanceCriteria\":[\"RefreshOutcome enum\",\"006_ca_endpoints + cmp_request_timeout_secs migration\",\"multi-URL fallback with per-URL timeout\",\"same-SKI in-place UPDATE writes valid_from/to/subject_dn/issuer_dn\",\"key-roll stage+flip writes all metadata\",\"both UPDATE rows_affected==1 guarded\",\"prro_crypto::cms::envelope::parse_cert_basic_fields additive PR landed first\",\"hex_to_ski fail-closed (typed MalformedCertMetadata)\",\"refresh_within_days\",\"AllUrlsFailed no DB write\",\"exactly one active=1\",\"malformed cert metadata gates fail-closed\"]}\n```"
     },
     {
       "id": 3,
@@ -35,21 +35,21 @@
       "subject": "Task 4 (W4): byte-equivalence goldens harness + first-round vectors",
       "status": "pending",
       "blockedBy": [1, 3],
-      "description": "4-6 days.  Goldens harness + frozen fixtures + minimal XML builder for 5 doc types + manual capture script.  ADR-M2-3.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/xml/mod.rs\",\"rust/prro/tests/goldens_byte_equiv.rs\",\"rust/prro/tests/goldens/\",\"docs/M2-goldens-capture.md\"],\"verifyCommand\":\"cargo test -p prro --test goldens_byte_equiv\",\"acceptanceCriteria\":[\"harness diffs frozen vs Rust\",\"9 first-round goldens\",\"regenerate.py manual-only\",\"hex diff on mismatch\",\"CMS deterministic prefix split\"]}\n```"
+      "description": "4-6 days.  Goldens harness + frozen fixtures + minimal XML builder for 5 doc types + manual capture script.  ADR-M2-3.  KVT1/KVT2 fixtures DEFERRED from first round (no parser in W1; follow-up gated on W3).\n\n```json:metadata\n{\"files\":[\"rust/prro/src/xml/mod.rs\",\"rust/prro/tests/goldens_byte_equiv.rs\",\"rust/prro/tests/goldens/\",\"docs/M2-goldens-capture.md\"],\"verifyCommand\":\"cargo test -p prro --test goldens_byte_equiv\",\"acceptanceCriteria\":[\"harness diffs frozen vs Rust\",\"7 first-round goldens (5 xml + 1 cms prefix + 1 prevhash seed; KVT deferred)\",\"regenerate.py manual-only\",\"hex diff on mismatch\",\"CMS deterministic prefix split\"]}\n```"
     },
     {
       "id": 5,
       "subject": "Task 5 (W5): ADR-M2-6 static check — no DB handle in crypto/transports public API",
       "status": "pending",
       "blockedBy": [1, 2, 3],
-      "description": "1-2 days.  syn-based scan of crypto:: + transports:: public API; fail build on SqlitePool/Connection/Pool/Transaction.  services/ exempt.  #[cfg(test)] skipped.\n\n```json:metadata\n{\"files\":[\"rust/prro/Cargo.toml\",\"rust/prro/tests/api_surface_no_db_handle.rs\"],\"verifyCommand\":\"cargo test -p prro --test api_surface_no_db_handle\",\"acceptanceCriteria\":[\"syn parse + visit\",\"signature scan\",\"services/ exempt\",\"cfg(test) skipped\",\"negative-fixture catches violation\"]}\n```"
+      "description": "1-2 days.  syn-based scan of crypto:: + transports:: public API; fail build on SqlitePool/Connection/Pool/Transaction.  services/ exempt.  #[cfg(test)] skipped.  Scans BOTH free fns AND trait method defs (CryptoProvider, DpsChannel are traits).\n\n```json:metadata\n{\"files\":[\"rust/prro/Cargo.toml\",\"rust/prro/tests/api_surface_no_db_handle.rs\"],\"verifyCommand\":\"cargo test -p prro --test api_surface_no_db_handle\",\"acceptanceCriteria\":[\"syn 2 with full+extra-traits+visit\",\"quote 1 dev-dep\",\"parse + visit free fns\",\"parse + visit trait method defs\",\"signature stringification\",\"services/ exempt\",\"cfg(test) skipped\",\"negative-fixture catches free-fn AND trait-method violations\"]}\n```"
     },
     {
       "id": 6,
       "subject": "Task 6 (W6): secret-material flow tracing test",
       "status": "pending",
       "blockedBy": [1, 2, 3],
-      "description": "1-2 days.  tracing-subscriber test exercising every CryptoError variant + happy paths; asserts no seeded secret substring in any captured log.  ADR-M2-5 §4d.\n\n```json:metadata\n{\"files\":[\"rust/prro/Cargo.toml\",\"rust/prro/tests/secret_flow_tracing.rs\"],\"verifyCommand\":\"cargo test -p prro --test secret_flow_tracing\",\"acceptanceCriteria\":[\"traced_test subscriber\",\"3 seeded secrets\",\"every CryptoError variant\",\"happy paths\",\"no leaked substring\",\"positive control\"]}\n```"
+      "description": "1-2 days.  tracing-subscriber test exercising every CryptoError variant + happy paths; asserts no seeded secret substring in any captured log.  Self-managed Arc<Mutex<Vec<u8>>> capture sink — no tracing_test::internal::* private API.  ADR-M2-5 §4d.\n\n```json:metadata\n{\"files\":[\"rust/prro/Cargo.toml\",\"rust/prro/tests/secret_flow_tracing.rs\"],\"verifyCommand\":\"cargo test -p prro --test secret_flow_tracing\",\"acceptanceCriteria\":[\"tracing-subscriber 0.3 with std+fmt features\",\"self-managed CaptureBuf MakeWriter\",\"3 seeded secrets\",\"every CryptoError variant\",\"happy paths\",\"no leaked substring\",\"positive control\"]}\n```"
     }
   ]
 }
