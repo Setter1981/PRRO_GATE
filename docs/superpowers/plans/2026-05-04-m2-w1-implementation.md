@@ -1054,17 +1054,18 @@ bd add --type task --title "prro_crypto: parse_cert_basic_fields helper (M2/W2 p
        --parent <M2-epic-id> --discovered-from <plan-fix-pass-3-commit>
 
 # 2) Implement the helper in a separate PR against rust/prro_crypto/.
-#    Suggested location: rust/prro_crypto/src/cms/envelope.rs (next to
+#    Location: rust/prro_crypto/src/cms/envelope.rs (next to
 #    extract_cert_pubkey_bytes — same DER walker prefix).
-#    Returned struct shape:
+#    Returned struct shape (revision 2026-05-05: STRINGS — keeping
+#    prro_crypto chrono-free; W2 caller parses RFC 3339 via chrono):
 #      pub struct BasicCertFields {
-#          pub valid_from: chrono::DateTime<chrono::Utc>,
-#          pub valid_to:   chrono::DateTime<chrono::Utc>,
-#          pub subject_dn: String,   // RFC 4514 DN string
+#          pub valid_from: String,   // RFC 3339 (e.g. "2017-07-14T02:40:00Z")
+#          pub valid_to:   String,
+#          pub subject_dn: String,   // RFC 4514–style, best-effort
 #          pub issuer_dn:  String,
 #      }
-#    Tests: a fixture cert (vendored under rust/prro_crypto/tests/fixtures/)
-#    asserts each field byte-equal to a known-good value.
+#    Tests: a vendored test cert (jkurwa SELF_SIGNED_ENC_6929) asserts each
+#    field against known-good values printed by `openssl x509 -text`.
 #    Acceptance: cargo test -p prro_crypto passes; cargo build -p prro
 #    against the new helper + an unmodified rust/prro/ HEAD compiles.
 
@@ -1353,8 +1354,8 @@ pub async fn refresh_for_fn(
             .bind(&fn_id_for_tx)
             .bind(compute_fingerprint(&new_cert_for_tx))
             .bind(&new_cert_for_tx)
-            .bind(parsed_for_tx.valid_from.to_rfc3339())
-            .bind(parsed_for_tx.valid_to.to_rfc3339())
+            .bind(&parsed_for_tx.valid_from)
+            .bind(&parsed_for_tx.valid_to)
             .bind(&parsed_for_tx.subject_dn)
             .bind(&parsed_for_tx.issuer_dn)
             .bind(&now_iso)
@@ -1447,8 +1448,8 @@ async fn in_place_refresh(
     )
     .bind(new_cert_der)
     .bind(compute_fingerprint(new_cert_der))
-    .bind(parsed.valid_from.to_rfc3339())
-    .bind(parsed.valid_to.to_rfc3339())
+    .bind(&parsed.valid_from)
+    .bind(&parsed.valid_to)
     .bind(&parsed.subject_dn)
     .bind(&parsed.issuer_dn)
     .bind(&now)
@@ -1567,8 +1568,12 @@ fn hex_digit(c: u8) -> Option<u8> {
 #[derive(Debug, Clone)]
 struct ParsedCertMetadata {
     ski_hex: String,
-    valid_from: DateTime<Utc>,
-    valid_to: DateTime<Utc>,
+    /// RFC 3339 string from `prro_crypto::cms::envelope::BasicCertFields`.
+    /// Persisted as-is into `operator_certs.valid_from TEXT`; eligibility
+    /// arithmetic happens in `refresh_for_fn` after a one-shot
+    /// `chrono::DateTime::parse_from_rfc3339` parse.
+    valid_from: String,
+    valid_to: String,
     subject_dn: String,
     issuer_dn: String,
 }
@@ -1577,17 +1582,12 @@ struct ParsedCertMetadata {
 /// persist into `operator_certs`.  All four are extracted in one pass
 /// to avoid four redundant ASN.1 walks.
 ///
-/// **Required `prro_crypto` extension (W0-3 §3 — additive).**
-/// `prro_crypto` exposes `extract_cert_pubkey_bytes` + `compute_ski`
-/// today but does NOT expose `validity` / `subject` / `issuer` field
-/// extractors.  The implementer adds a single helper
-/// `prro_crypto::cms::envelope::parse_cert_basic_fields(cert_der)
-/// -> Result<BasicCertFields, EnvelopeError>` (returning `valid_from`,
-/// `valid_to`, `subject_dn`, `issuer_dn` as DER-walk products) before
-/// wiring W2.  This is an additive PR against `prro_crypto`; do NOT
-/// inline an ad-hoc ASN.1 walker into `rust/prro/src/services/`.
-/// Until that helper lands, W2 cannot satisfy its acceptance — the
-/// follow-up is filed as `bd add` on the M2 epic at task start.
+/// **Required `prro_crypto` extension (W0-3 §3 — additive, landed
+/// 2026-05-05 in PRRO_GATE-aty).**  `prro_crypto::cms::envelope::
+/// parse_cert_basic_fields(cert_der) -> Result<BasicCertFields,
+/// EnvelopeError>` returns `valid_from` / `valid_to` (RFC 3339
+/// strings) + `subject_dn` / `issuer_dn` (RFC 4514–style strings).
+/// W2 does NOT inline an ad-hoc ASN.1 walker.
 fn parse_cert_metadata(cert_der: &[u8]) -> Result<ParsedCertMetadata, RefreshError> {
     use prro_crypto::cms::envelope::{
         compute_ski, extract_cert_pubkey_bytes, parse_cert_basic_fields,

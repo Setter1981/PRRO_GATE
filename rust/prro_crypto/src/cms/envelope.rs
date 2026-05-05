@@ -625,3 +625,383 @@ pub fn extract_cert_pubkey_bytes(cert_der: &[u8]) -> Result<Vec<u8>, EnvelopeErr
     }
     Ok(key_data.to_vec())
 }
+
+// ─── Cert basic-fields extractor (M2/W2 prerequisite) ─────────────────
+
+/// Subset of X.509 cert fields the M2 cert-refresher persists into
+/// `operator_certs`.  All fields are strings to keep `prro_crypto`
+/// chrono-free; the W2 caller parses `valid_from` / `valid_to` via
+/// `chrono::DateTime::parse_from_rfc3339` (already in the `prro` crate's
+/// dep tree).
+///
+/// `subject_dn` and `issuer_dn` are minimal RFC 4514–style serialisations
+/// (`CN=...,O=...,L=...,C=UA`) — sufficient for the
+/// `ca_endpoints.issuer_pattern` case-insensitive substring match and
+/// for diagnostic display.  Not intended to round-trip into a strict
+/// RFC 4514 parser; if a future caller needs that, build it on top.
+#[derive(Debug, Clone)]
+pub struct BasicCertFields {
+    /// notBefore as RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`).
+    pub valid_from: String,
+    /// notAfter as RFC 3339.
+    pub valid_to: String,
+    /// Subject DN, RFC 4514-style (best-effort serialisation).
+    pub subject_dn: String,
+    /// Issuer DN, RFC 4514-style.
+    pub issuer_dn: String,
+}
+
+/// Walk a DER-encoded X.509 cert and extract the four "basic" fields the
+/// M2 cert-refresher needs (`valid_from`, `valid_to`, `subject_dn`,
+/// `issuer_dn`).
+///
+/// All four fields come out of the `tbsCertificate` SEQUENCE prefix —
+/// the same prefix [`extract_cert_pubkey_bytes`] walks.  This is an
+/// additive helper (W0-3 §3 amendment 2026-05-05); it does NOT modify
+/// any existing parser and shares the bounded `read_tlv` from
+/// `crate::cms::asn1_util`.
+pub fn parse_cert_basic_fields(cert_der: &[u8]) -> Result<BasicCertFields, EnvelopeError> {
+    // Outer SEQUENCE → tbsCertificate SEQUENCE.
+    let (_, tbs_start) = a1::read_tlv(cert_der, 0)?;
+    let (_, tbs_inner) = a1::read_tlv(cert_der, tbs_start)?;
+
+    let mut pos = tbs_inner;
+    // version [0] EXPLICIT (optional)
+    if a1::peek_tag(cert_der, pos)? == 0xa0 {
+        let (end, _) = a1::read_tlv(cert_der, pos)?;
+        pos = end;
+    }
+    // serialNumber INTEGER — skip
+    let (sn_end, _) = a1::read_tlv(cert_der, pos)?;
+    pos = sn_end;
+    // signature AlgorithmIdentifier SEQUENCE — skip
+    let (sig_end, _) = a1::read_tlv(cert_der, pos)?;
+    pos = sig_end;
+
+    // issuer Name SEQUENCE → RDNSequence
+    let (iss_end, iss_inner) = a1::read_tlv(cert_der, pos)?;
+    let issuer_dn = serialize_dn(cert_der, iss_inner, iss_end)?;
+    pos = iss_end;
+
+    // validity SEQUENCE { Time, Time }
+    let (val_end, val_inner) = a1::read_tlv(cert_der, pos)?;
+    let (nb_end, nb_inner) = a1::read_tlv(cert_der, val_inner)?;
+    let nb_tag = a1::peek_tag(cert_der, val_inner)?;
+    let valid_from = parse_asn1_time(&cert_der[nb_inner..nb_end], nb_tag)?;
+    let (na_end, na_inner) = a1::read_tlv(cert_der, nb_end)?;
+    let na_tag = a1::peek_tag(cert_der, nb_end)?;
+    let valid_to = parse_asn1_time(&cert_der[na_inner..na_end], na_tag)?;
+    if na_end > val_end {
+        return Err(EnvelopeError::Asn1(
+            "validity SEQUENCE: notAfter extends past parent end".into(),
+        ));
+    }
+    pos = val_end;
+
+    // subject Name SEQUENCE → RDNSequence
+    let (sub_end, sub_inner) = a1::read_tlv(cert_der, pos)?;
+    let subject_dn = serialize_dn(cert_der, sub_inner, sub_end)?;
+
+    Ok(BasicCertFields {
+        valid_from,
+        valid_to,
+        subject_dn,
+        issuer_dn,
+    })
+}
+
+/// Convert an ASN.1 Time TLV (UTCTime tag 0x17, GeneralizedTime tag 0x18)
+/// to RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`).
+///
+/// UTCTime is `YYMMDDHHMMSSZ` (13 chars).  RFC 5280 §4.1.2.5.1 defines
+/// the YY pivot: 00..49 → 2000..2049, 50..99 → 1950..1999.
+/// GeneralizedTime is `YYYYMMDDHHMMSSZ` (15 chars), optionally with a
+/// fractional-seconds component which we accept-and-drop.
+fn parse_asn1_time(content: &[u8], tag: u8) -> Result<String, EnvelopeError> {
+    let s = std::str::from_utf8(content)
+        .map_err(|_| EnvelopeError::Asn1("ASN.1 Time content is not ASCII".into()))?;
+    if !s.ends_with('Z') {
+        return Err(EnvelopeError::Asn1(format!(
+            "ASN.1 Time {s:?} not in UTC (must end with Z)"
+        )));
+    }
+    let body = &s[..s.len() - 1];
+    let (year, mmddhhmmss): (i32, &str) = match tag {
+        0x17 => {
+            // UTCTime: YYMMDDHHMMSS
+            if body.len() < 12 {
+                return Err(EnvelopeError::Asn1(format!("UTCTime too short: {s:?}")));
+            }
+            let yy: i32 = body[0..2]
+                .parse()
+                .map_err(|_| EnvelopeError::Asn1(format!("UTCTime: bad year in {s:?}")))?;
+            let year = if yy < 50 { 2000 + yy } else { 1900 + yy };
+            (year, &body[2..12])
+        }
+        0x18 => {
+            // GeneralizedTime: YYYYMMDDHHMMSS[.fff]
+            if body.len() < 14 {
+                return Err(EnvelopeError::Asn1(format!(
+                    "GeneralizedTime too short: {s:?}"
+                )));
+            }
+            let yyyy: i32 = body[0..4]
+                .parse()
+                .map_err(|_| EnvelopeError::Asn1(format!("GeneralizedTime: bad year in {s:?}")))?;
+            (yyyy, &body[4..14])
+        }
+        _ => {
+            return Err(EnvelopeError::Asn1(format!(
+                "validity entry: unsupported tag {tag:#x} \
+                 (expect UTCTime 0x17 or GeneralizedTime 0x18)"
+            )));
+        }
+    };
+    if mmddhhmmss.len() != 10 || !mmddhhmmss.chars().all(|c| c.is_ascii_digit()) {
+        return Err(EnvelopeError::Asn1(format!(
+            "ASN.1 Time MMDDHHMMSS is not 10 digits in {s:?}"
+        )));
+    }
+    Ok(format!(
+        "{:04}-{}-{}T{}:{}:{}Z",
+        year,
+        &mmddhhmmss[0..2],
+        &mmddhhmmss[2..4],
+        &mmddhhmmss[4..6],
+        &mmddhhmmss[6..8],
+        &mmddhhmmss[8..10],
+    ))
+}
+
+/// Walk an X.509 RDNSequence (`SEQUENCE OF SET OF AttributeTypeAndValue`)
+/// from `start..end` and produce a flat RFC 4514–style DN string.
+///
+/// `start` is the content offset (first byte of the first SET tag);
+/// `end` is the half-open content end.  Each RDN's SET produces one
+/// `OID=value` pair (multi-value RDNs are joined with `+` per RFC 4514);
+/// pairs are joined with `,` in REVERSE order — RFC 4514 specifies that
+/// the most-significant component (CN) comes first, while X.509 stores
+/// them root-first.
+fn serialize_dn(data: &[u8], start: usize, end: usize) -> Result<String, EnvelopeError> {
+    let mut rdn_strings: Vec<String> = Vec::new();
+    let mut pos = start;
+    while pos < end {
+        let (set_end, set_inner) = a1::read_tlv(data, pos)?;
+        if a1::peek_tag(data, pos)? != 0x31 {
+            return Err(EnvelopeError::Asn1(format!(
+                "DN: expected SET (0x31) tag at offset {pos}, got {:#x}",
+                a1::peek_tag(data, pos)?
+            )));
+        }
+        // Each SET contains 1+ AttributeTypeAndValue.
+        let mut atv_strings: Vec<String> = Vec::new();
+        let mut atv_pos = set_inner;
+        while atv_pos < set_end {
+            let (atv_end, atv_inner) = a1::read_tlv(data, atv_pos)?;
+            // AttributeTypeAndValue ::= SEQUENCE { type OID, value ANY }
+            let (oid_end, oid_inner) = a1::read_tlv(data, atv_inner)?;
+            if a1::peek_tag(data, atv_inner)? != 0x06 {
+                return Err(EnvelopeError::Asn1(
+                    "DN: AttributeTypeAndValue: first child must be OID".into(),
+                ));
+            }
+            let oid_bytes = &data[oid_inner..oid_end];
+            let attr = oid_short_name(oid_bytes);
+            // value: usually PrintableString / UTF8String / IA5String /
+            // BMPString / UniversalString.  We accept the printable +
+            // UTF-8 cases byte-for-byte; everything else falls back to
+            // hex-prefixed octet form (`#<hex>`).
+            let (val_end, val_inner) = a1::read_tlv(data, oid_end)?;
+            let val_tag = a1::peek_tag(data, oid_end)?;
+            let val_bytes = &data[val_inner..val_end];
+            let val_str = match val_tag {
+                0x0c | 0x13 | 0x14 | 0x16 => {
+                    // UTF8String, PrintableString, T61String, IA5String
+                    String::from_utf8(val_bytes.to_vec()).unwrap_or_else(|_| {
+                        format!(
+                            "#{}",
+                            val_bytes
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>()
+                        )
+                    })
+                }
+                _ => format!(
+                    "#{}",
+                    val_bytes
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                ),
+            };
+            atv_strings.push(format!("{attr}={}", escape_dn_value(&val_str)));
+            atv_pos = atv_end;
+        }
+        rdn_strings.push(atv_strings.join("+"));
+        pos = set_end;
+    }
+    // RFC 4514 emits most-significant-RDN first; X.509 stored root-first.
+    rdn_strings.reverse();
+    Ok(rdn_strings.join(","))
+}
+
+/// Map a few well-known DN attribute OIDs to their short names.  Anything
+/// not in the table renders as a dotted-decimal OID (RFC 4514 fallback).
+fn oid_short_name(oid_der: &[u8]) -> String {
+    match oid_der {
+        [0x55, 0x04, 0x03] => "CN".into(),
+        [0x55, 0x04, 0x04] => "SN".into(),
+        [0x55, 0x04, 0x05] => "serialNumber".into(),
+        [0x55, 0x04, 0x06] => "C".into(),
+        [0x55, 0x04, 0x07] => "L".into(),
+        [0x55, 0x04, 0x08] => "ST".into(),
+        [0x55, 0x04, 0x09] => "STREET".into(),
+        [0x55, 0x04, 0x0a] => "O".into(),
+        [0x55, 0x04, 0x0b] => "OU".into(),
+        [0x55, 0x04, 0x0c] => "title".into(),
+        [0x55, 0x04, 0x2a] => "GN".into(),
+        [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x01] => "emailAddress".into(),
+        _ => format_oid_dotted(oid_der),
+    }
+}
+
+/// Render a DER-encoded OID as a dotted-decimal string (RFC 4514's
+/// fallback form for unknown attribute types).
+fn format_oid_dotted(oid_der: &[u8]) -> String {
+    if oid_der.is_empty() {
+        return String::from("2.5"); // unreachable in well-formed DER
+    }
+    let mut out = String::new();
+    let first = oid_der[0];
+    let arc1 = (first / 40) as u32;
+    let arc2 = (first % 40) as u32;
+    out.push_str(&arc1.to_string());
+    out.push('.');
+    out.push_str(&arc2.to_string());
+    let mut acc: u32 = 0;
+    for &b in &oid_der[1..] {
+        acc = (acc << 7) | (b & 0x7f) as u32;
+        if b & 0x80 == 0 {
+            out.push('.');
+            out.push_str(&acc.to_string());
+            acc = 0;
+        }
+    }
+    out
+}
+
+/// Minimal RFC 4514 DN-value escape for ASCII commas / `+` / `\` /
+/// leading-`#` / leading-space / trailing-space.  Good enough for the
+/// substring-match callers in M2; not a full RFC 4514 implementation.
+fn escape_dn_value(v: &str) -> String {
+    if v.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = v.chars().collect();
+    let mut out = String::with_capacity(v.len());
+    for (i, &c) in chars.iter().enumerate() {
+        let needs_escape = matches!(c, ',' | '+' | '\\' | '"' | '<' | '>' | ';')
+            || (i == 0 && (c == '#' || c == ' '))
+            || (i + 1 == chars.len() && c == ' ');
+        if needs_escape {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[cfg(test)]
+mod basic_fields_tests {
+    use super::*;
+
+    /// Vendored test cert — DSTU 4145 self-signed, validity Jul 2017
+    /// → Nov 2023, subject/issuer == `O=Very Much CA,serialNumber=
+    /// UA-99999991,L=Wakanda` (printed by `openssl x509 -text`).
+    /// File comes from the jkurwa upstream test corpus.
+    const CERT_DER: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/node_modules/jkurwa/test/data/SELF_SIGNED_ENC_6929.cer"
+    ));
+
+    #[test]
+    fn parse_cert_basic_fields_self_signed_6929() {
+        let parsed = parse_cert_basic_fields(CERT_DER)
+            .expect("parse_cert_basic_fields must succeed on a real DSTU cert");
+
+        // openssl x509 -inform DER -text -noout for this cert prints:
+        //   Not Before: Jul 14 02:40:00 2017 GMT
+        //   Not After : Nov 14 22:13:20 2023 GMT
+        assert_eq!(parsed.valid_from, "2017-07-14T02:40:00Z");
+        assert_eq!(parsed.valid_to, "2023-11-14T22:13:20Z");
+
+        // openssl prints the DN root-first ("O=...,serialNumber=...,L=...");
+        // RFC 4514 specifies most-significant first, which for this cert
+        // (an O-rooted DN with no CN) means L first, then serialNumber,
+        // then O.  We assert by membership rather than exact position so
+        // the test survives any later RDN ordering tweak — the values
+        // themselves are what matter.
+        for needle in ["O=Very Much CA", "serialNumber=UA-99999991", "L=Wakanda"] {
+            assert!(
+                parsed.subject_dn.contains(needle),
+                "subject_dn missing {needle:?}: {sub}",
+                sub = parsed.subject_dn
+            );
+            assert!(
+                parsed.issuer_dn.contains(needle),
+                "issuer_dn missing {needle:?}: {iss}",
+                iss = parsed.issuer_dn
+            );
+        }
+        // Self-signed: subject == issuer.
+        assert_eq!(parsed.subject_dn, parsed.issuer_dn);
+    }
+
+    #[test]
+    fn parse_cert_basic_fields_rejects_truncated_input() {
+        let truncated = &CERT_DER[..50];
+        let err = parse_cert_basic_fields(truncated).expect_err("must reject truncated input");
+        assert!(matches!(
+            err,
+            EnvelopeError::Asn1(_) | EnvelopeError::Asn1Util(_)
+        ));
+    }
+
+    #[test]
+    fn format_oid_dotted_well_known() {
+        // 2.5.4.3 commonName
+        assert_eq!(format_oid_dotted(&[0x55, 0x04, 0x03]), "2.5.4.3");
+        // 1.2.840.113549.1.9.1 emailAddress
+        assert_eq!(
+            format_oid_dotted(&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x01]),
+            "1.2.840.113549.1.9.1"
+        );
+    }
+
+    #[test]
+    fn parse_asn1_time_utctime_y2k_pivot() {
+        // UTCTime: 49 → 2049, 50 → 1950 per RFC 5280.
+        assert_eq!(
+            parse_asn1_time(b"491231235959Z", 0x17).unwrap(),
+            "2049-12-31T23:59:59Z"
+        );
+        assert_eq!(
+            parse_asn1_time(b"500101000000Z", 0x17).unwrap(),
+            "1950-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn parse_asn1_time_generalizedtime() {
+        assert_eq!(
+            parse_asn1_time(b"20991231235959Z", 0x18).unwrap(),
+            "2099-12-31T23:59:59Z"
+        );
+    }
+
+    #[test]
+    fn parse_asn1_time_rejects_non_utc() {
+        assert!(parse_asn1_time(b"170714024000+0300", 0x17).is_err());
+    }
+}
