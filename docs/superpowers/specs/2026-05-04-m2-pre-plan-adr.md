@@ -455,3 +455,65 @@ M2 implementation plan-writing is UNBLOCKED.  Active artefact: M2 W1+
 implementation plan at `docs/superpowers/plans/2026-05-04-m2-w1-implementation.md`
 (currently under docs-fix review; do NOT start coding from it until the
 review is closed).
+
+---
+
+## ADR-M2-2 amendment — WebCheck parity note (2026-05-05)
+
+A WebCheck `TaxGrpc` decompilation pass during M2/W3-C3 review
+revealed wire-contract drift between the canonical
+`fiscal_server.proto` (5 RPCs) and the WebCheck reference client
+(8 generated RPCs).  This amendment **does not change** the
+approved ADR-M2-2 decision (mock DPS = native Rust tonic for the
+M2 RPC subset); it pins the scope explicitly and adds a pilot-
+readiness open risk.
+
+### Confirmed (no decision change)
+
+- **Mock DPS = native Rust tonic** for the M2 RPC subset
+  (`sendChkV2`, `lastChk`, `ping`, `statusRro`, `infoRro`).  This
+  is the W3 acceptance scope.
+- ByServerFiscalNo semantic = `lastChk(fn_sign) + response.id
+  match` (PRRO_GATE-5js); decision unchanged.
+
+### Explicit non-goals (deferred)
+
+- **`sendChk` (API v1)** — deferred unless a pilot configuration
+  hard-codes `apiver=1`.  Migration plan for legacy WebCheck-era
+  configs lands in PRRO_GATE-0ps.
+- **`delLastChk` / `delLastChkId`** — destructive recovery /
+  admin operations.  These do NOT belong in `DpsChannel` casually;
+  deferred to a separate "DpsAdminOps / manual recovery" ADR with
+  audit + hard gate.  Tracked in PRRO_GATE-0ps.
+
+### New open risk (pre-pilot)
+
+- **Pilot parity with WebCheck TaxGrpc requires decisions on 3
+  extra RPCs (`sendChk` / `delLastChk` / `delLastChkId`) before
+  pilot sign-off.**  These decisions MUST be recorded in
+  PRRO_GATE-0ps before M2 → pilot scope review.
+
+### Adjacent operational risks (separate follow-ups)
+
+The same reverse-engineering pass surfaced these gaps; they are
+NOT amendments to ADR-M2-2 itself but ARE cross-linked from the
+W3 sign-off gate:
+
+- **TLS CA bundle** for production DPS — PRRO_GATE-k54 (P1);
+  potentially a small ADR if config shape diverges from M1
+  precedent.
+- **M3 `services::write_path` retry/recovery policy** derived
+  from WebCheck `SubmitPtr.cs:50` — PRRO_GATE-6bj (P1).  Belongs
+  in an M3 ADR, not M2.
+- **WebCheck COM/1C 19-method compatibility** — PRRO_GATE-iap
+  (P2; bumps to P1 if pilot survey identifies a dependent
+  operator).
+- **Offline lifecycle parity** — PRRO_GATE-gx2 (P1).  Likely
+  warrants its own ADR / milestone if pilot requires offline.
+- **Print/export/check URL parity** — PRRO_GATE-3a8 (P2).  M5
+  scope adjustment, not M2/M3.
+
+See `docs/superpowers/specs/2026-05-04-m2-w0-1-dps-wire.md §10`
+for the full RPC matrix and evidence references, and
+`docs/superpowers/specs/2026-05-05-webcheck-pilot-parity-findings.md`
+for the consolidated pilot-readiness view.

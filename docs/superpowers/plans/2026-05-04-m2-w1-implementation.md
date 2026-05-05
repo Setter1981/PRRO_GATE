@@ -2086,6 +2086,68 @@ git push origin rust-gateway
 
 Closes `PRRO_GATE-5js`.
 
+### W3 acceptance criteria (revision 2026-05-05 — WebCheck parity)
+
+The 5 W3 RPCs ARE the acceptance scope:
+
+- [ ] `sendChkV2`, `lastChk`, `ping`, `statusRro`, `infoRro`
+  implemented as typed `DpsChannel` methods backed by
+  `GrpcDpsChannel`.
+- [ ] C4 mock covers `ByServerFiscalNo` match / mismatch / absent
+  triple per PRRO_GATE-5js.
+- [ ] C4 mock verifies `grpc-timeout` metadata arrives on every
+  request (or documents the omission as a follow-up if mock-side
+  introspection of metadata is not feasible).
+- [ ] `query_by_local_identity` returns
+  `Err(DpsError::QueryNotSupported(...))` per W0-1 (no wire-level
+  RPC for it; covered by mock test).
+- [ ] DPS non-OK statuses route per the W0-1 mapping rules:
+  `ErrorVerefy` / `ErrorNotRegisteredRro` /
+  `ErrorNotRegisteredSigner` → `Authorization`; `ErrorUnknown`
+  (-4) → `Transport` (retry-class per W0-1 D3); rest → `Server`.
+- [ ] `tonic::Status::Unavailable / DeadlineExceeded` →
+  `Transport`; `Unauthenticated / PermissionDenied` →
+  `Authorization`.
+
+The 3 WebCheck-extra RPCs are explicitly DEFERRED in this plan:
+
+- [ ] `sendChk` (API v1) — recorded as deferred; no acceptance
+  required for M2 W3 close-out unless a pilot config requires
+  `apiver=1`.  Decision lives in PRRO_GATE-0ps.
+- [ ] `delLastChk` / `delLastChkId` — recorded as deferred to a
+  separate "DpsAdminOps / manual recovery" ADR; MUST NOT fold
+  into `DpsChannel`.  Decision lives in PRRO_GATE-0ps.
+
+### W3 sign-off gate (added 2026-05-05)
+
+Before W3 is marked complete and M2 advances:
+
+- [ ] PRRO_GATE-0ps (DPS proto drift) has a recorded decision for
+  each of the 3 deferred RPCs (implemented OR explicitly
+  deferred-with-rationale, with owner milestone for any deferral).
+- [ ] PRRO_GATE-k54 (TLS CA bundle) has either:
+  (a) a configurable CA-bundle path implemented in W3 / a follow-up
+  task within M2, OR (b) explicit "system-roots-only" decision
+  documented + pilot smoke test still required before pilot
+  sign-off.
+- [ ] PRRO_GATE-6bj (M3 retry/recovery policy) acknowledged and
+  scheduled in M3 plan (not implemented in W3, but the M3 owner
+  is named).
+- [ ] Pilot decisions PRRO_GATE-iap (COM/1C),
+  PRRO_GATE-gx2 (offline lifecycle), PRRO_GATE-3a8 (print/export)
+  have priorities calibrated against the actual pilot operator
+  set (P2 → P1 promotion if any pilot depends on them).
+
+### W3 risk record
+
+> If the pilot environment sends API v1 (`apiver=1`) submits or
+> invokes `delLast*` semantics, the current M2 transport is
+> insufficient.  PRRO_GATE-0ps tracks the decision; W3 ships
+> with a typed surface that can host these later (separate
+> `DpsAdminChannel` for delLast*; `Check(version)`-style routing
+> for sendChk if revived) without breaking the existing
+> `DpsChannel` contract.
+
 ---
 
 ## Task 4 (W4) — byte-equivalence goldens harness
