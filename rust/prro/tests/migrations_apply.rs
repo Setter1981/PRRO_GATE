@@ -635,26 +635,42 @@ async fn migration_006_ca_endpoints_table_and_seed_present() {
         );
     }
 
-    // Seed rows: both production CMP URLs MUST include the
-    // `/services/cmp/` path component (M1 default lacked it; W2's whole
-    // point is that ca_endpoints carries the correct URLs).
-    let urls: Vec<String> =
-        sqlx::query_scalar("SELECT cmp_url FROM ca_endpoints WHERE enabled = 1 ORDER BY priority")
-            .fetch_all(&pool)
-            .await
-            .expect("seed rows reachable");
-    assert!(
-        urls.iter().all(|u| u.contains("/services/cmp/")),
-        "all seeded ca_endpoints URLs must carry /services/cmp/ path; got {urls:?}"
+    // Seed rows: exactly two production CMP URLs, ordered acskidd first
+    // (priority 10), ca.tax.gov.ua second (priority 20).  Each MUST
+    // include the `/services/cmp/` path component (M1's default lacked
+    // it; W2's whole point is that ca_endpoints carries the correct
+    // URLs).  `name` is asserted alongside `cmp_url` so the priority
+    // contract is positionally explicit, not just substring-matched.
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT name, cmp_url, priority FROM ca_endpoints WHERE enabled = 1 ORDER BY priority",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("seed rows reachable");
+    assert_eq!(
+        rows.len(),
+        2,
+        "ca_endpoints seed must contain exactly 2 enabled rows; got {rows:?}"
     );
-    assert!(
-        urls.iter().any(|u| u.contains("acskidd")),
-        "acskidd seed missing; got {urls:?}"
+    assert_eq!(
+        rows[0].0, "acskidd",
+        "first-priority endpoint must be 'acskidd'; got {rows:?}"
     );
-    assert!(
-        urls.iter().any(|u| u.contains("ca.tax.gov.ua")),
-        "ca.tax.gov.ua seed missing; got {urls:?}"
+    assert_eq!(rows[0].2, 10, "acskidd priority must be 10; got {rows:?}");
+    assert_eq!(
+        rows[1].0, "ca.tax.gov.ua",
+        "second-priority endpoint must be 'ca.tax.gov.ua'; got {rows:?}"
     );
+    assert_eq!(
+        rows[1].2, 20,
+        "ca.tax.gov.ua priority must be 20; got {rows:?}"
+    );
+    for (_, url, _) in &rows {
+        assert!(
+            url.contains("/services/cmp/"),
+            "all seeded ca_endpoints URLs must carry /services/cmp/ path; got {url}"
+        );
+    }
 
     // Partial index ix_ca_endpoints_priority must cover only enabled=1
     // rows (pre-existing pattern from the legacy schema; W5's static

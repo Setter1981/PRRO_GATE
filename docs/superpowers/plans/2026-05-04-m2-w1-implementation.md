@@ -595,7 +595,7 @@ use crate::crypto::session::SigningSession;
 
 /// Single source of timeout truth: each `CryptoProvider::fetch_cert_by_ski`
 /// call carries its own `request_timeout`.  Caller (`services::cert_refresher`)
-/// loads it from `cert_provisioning_config.cmp_request_timeout_secs` and
+/// loads it from M1's `cert_provisioning_config.timeout_seconds` (default 10s) and
 /// passes it through; the provider itself is stateless w.r.t. timeouts.
 /// This avoids drift between a config-stamped value and a per-call value.
 #[derive(Debug, Default, Clone, Copy)]
@@ -1026,7 +1026,7 @@ Verified:
 - [ ] **Same-SKI refresh (cert renewed, key kept)** does NOT stage a new row (would PK-conflict with `operator_certs.ski_hex`); instead UPDATEs the existing row's `cert_der`, `cert_fingerprint`, `valid_from`, `valid_to`, `subject_dn`, `issuer_dn`, `last_refresh_at`, `fetched_at` in a single short tx.  The UPDATE asserts `rows_affected == 1`; a 0 means the active row was concurrently deactivated and is treated as a typed DB error, not silently absorbed.  Returns `RefreshedInPlace { ski }`.
 - [ ] **Key-roll (new SKI)** runs ONE `with_immediate(pool, |conn| ...)` containing: `INSERT … ON CONFLICT(ski_hex) DO UPDATE … WHERE operator_certs.fiscal_number = excluded.fiscal_number AND operator_certs.active = 0` (idempotent stage that REFUSES to overwrite a row owned by a different fiscal_number or one already at active=1 — sqlite_constraint or rows_affected==0 on those, both surfaced as a typed error), then `UPDATE … SET active=0 WHERE fiscal_number=? AND active=1`, `UPDATE … SET active=1 WHERE ski_hex=?`, and `audit_log INSERT`.  All in one tx.  Both UPDATEs and the stage assert `rows_affected == 1` — any mismatch returns a typed error and the with_immediate ROLLBACKs.  Why NOT `INSERT OR REPLACE`: SQLite REPLACE is DELETE+INSERT and would silently wipe a foreign-owned `ski_hex` row (legal/cert artefacts), so we use `ON CONFLICT … DO UPDATE` with a same-fiscal-number, active=0 guard.  No `stage_inactive_cert` INSERT outside the tx — the previous design had a stage-then-flip window where a crash left an orphan staged row that a retry could not re-stage (PK conflict on `operator_certs.ski_hex`); the unified-tx design closes that window.  Returns `RefreshedKeyRoll { ski_old, ski_new }`.
 - [ ] Cert metadata extraction goes through a new additive helper `prro_crypto::cms::envelope::parse_cert_basic_fields(cert_der) -> Result<BasicCertFields, EnvelopeError>` returning `valid_from`, `valid_to`, `subject_dn`, `issuer_dn`.  This is a **prerequisite additive PR against `prro_crypto`** that lands BEFORE W2 implementation begins.  Cross-references: W0-3 §3 (last row, classification: additive, single-PR scope) and W0-3 §3 amendment 2026-05-05.  W2 step 0 below files the bd issue + lands the additive PR; only after that PR merges does the W2 wiring step proceed.  No ad-hoc ASN.1 walker lands inside `rust/prro/src/services/`.
-- [ ] Multi-URL fallback reads from the new `ca_endpoints` table (priority-ordered, enabled-only).  Each per-URL probe is bounded by `cfg.cmp_request_timeout` (loaded from `cert_provisioning_config.cmp_request_timeout_secs`, default 15s).  If one URL returns transport error / parse error / SKI mismatch / timeout, the next is tried; if all fail, the function returns `Err(RefreshError::AllUrlsFailed)` without touching the DB.
+- [ ] Multi-URL fallback reads from the new `ca_endpoints` table (priority-ordered, enabled-only).  Each per-URL probe is bounded by `cfg.cmp_request_timeout` (loaded from M1's existing `cert_provisioning_config.timeout_seconds` column, default 10s — no new column is added by W2).  If one URL returns transport error / parse error / SKI mismatch / timeout, the next is tried; if all fail, the function returns `Err(RefreshError::AllUrlsFailed)` without touching the DB.
 - [ ] `refresh_within_days` honoured: a cert whose `valid_to - now > refresh_within_days` is NOT refreshed (returns `NoChange`).  One whose `valid_to - now <= refresh_within_days` IS refreshed.  The freshly-written `valid_to` in step 6 of `refresh_for_fn` MUST be the new cert's lifetime — not `Utc::now()` — so the next refresh cycle's eligibility check reads the correct expiry.
 - [ ] No CMP fetch / network call happens inside any `with_immediate` block (W5 will static-assert this; W2 must not introduce a violation).
 - [ ] Malformed inputs are fail-closed:
@@ -1125,15 +1125,14 @@ CREATE INDEX ix_ca_endpoints_priority ON ca_endpoints(priority) WHERE enabled = 
 INSERT INTO ca_endpoints (name, cmp_url, issuer_pattern, priority) VALUES
     ('acskidd', 'http://acskidd.gov.ua:80/services/cmp/', 'acskidd', 10),
     ('ca.tax.gov.ua', 'http://ca.tax.gov.ua:80/services/cmp/', 'tax', 20);
-
--- Per-URL CMP request timeout.  Forwarded to
--- `prro_crypto::cms::cmp::fetch_cert_by_ski(_, _, timeout)` for every
--- probe.  Default 15s — generous for a 1-RTT CMP exchange but bounded
--- so a hung CMP host can't stall the refresher loop.
-ALTER TABLE cert_provisioning_config
-    ADD COLUMN cmp_request_timeout_secs INTEGER NOT NULL DEFAULT 15
-    CHECK (cmp_request_timeout_secs BETWEEN 1 AND 120);
 ```
+
+> **Schema note (revision 2026-05-05).**  Migration 006 does NOT add a
+> `cmp_request_timeout_secs` column.  M1's `cert_provisioning_config`
+> already provides `timeout_seconds INTEGER NOT NULL DEFAULT 10` —
+> W2's `load_refresh_config()` reuses that column for the per-URL CMP
+> request timeout.  The earlier plan-pass-3 wording calling for a new
+> `cmp_request_timeout_secs` column is superseded.
 
 Acceptance: `cargo test -p prro --test migrations_apply` passes (M1 sub-test
 extended to assert the new `ca_endpoints` table is reachable post-006).
@@ -1203,9 +1202,8 @@ use crate::db::tx::with_immediate;
 pub struct RefreshConfig {
     pub refresh_within_days: i64,
     /// Per-URL CMP probe timeout, forwarded to
-    /// `CryptoProvider::fetch_cert_by_ski`.  Defaults to 15s; sourced
-    /// from `cert_provisioning_config.cmp_request_timeout_secs` if the
-    /// column is present.
+    /// `CryptoProvider::fetch_cert_by_ski`.  Sourced from M1's existing
+    /// `cert_provisioning_config.timeout_seconds` column (default 10s).
     pub cmp_request_timeout: std::time::Duration,
 }
 
@@ -1483,12 +1481,13 @@ struct ActiveCertRow {
 }
 
 async fn load_refresh_config(pool: &SqlitePool) -> sqlx::Result<RefreshConfig> {
-    // M1 schema exposes `refresh_within_days` and `cmp_request_timeout_secs`
-    // (the latter added by W2 migration 006 alongside `ca_endpoints`).  If
-    // a future migration adds more columns, extend the SELECT explicitly
-    // — do not `SELECT *` here.
+    // Both columns ship in M1's `cert_provisioning_config` (no W2
+    // migration adds a column for this).  `timeout_seconds` is the M1
+    // CMP request timeout — W2 reuses it as the per-URL probe budget.
+    // If a future migration adds more columns, extend the SELECT
+    // explicitly — do not `SELECT *` here.
     let row: (i64, i64) = sqlx::query_as(
-        "SELECT refresh_within_days, cmp_request_timeout_secs \
+        "SELECT refresh_within_days, timeout_seconds \
          FROM cert_provisioning_config WHERE id = 1",
     )
     .fetch_one(pool)

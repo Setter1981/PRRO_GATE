@@ -4,8 +4,8 @@
 //! Stateless: timeouts are method-arguments, curve is locked to PB-257
 //! (the only DSTU curve in DPS-deployed CAs per W0-3 §1).  No
 //! `Config` struct — single source of timeout truth is the caller (a
-//! service-layer module) which loads it from
-//! `cert_provisioning_config.cmp_request_timeout_secs`.
+//! service-layer module) which loads it from M1's existing
+//! `cert_provisioning_config.timeout_seconds` column (default 10s).
 
 use std::time::Duration;
 
