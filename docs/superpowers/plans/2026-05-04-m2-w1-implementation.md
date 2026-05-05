@@ -8,6 +8,31 @@
 
 **Tech Stack:** Rust 1.83+, sqlx 0.8 SQLite (M1), `prro_crypto` (workspace), new deps: `async-trait` 0.1, `zeroize` 1.7+, `tonic` 0.12, `tonic-build` 0.12, `prost` 0.13, `wiremock` 0.6 (HTTP byte-replay for the test CA), `httpmock` or hand-rolled axum test server alternative. SQLX_OFFLINE workflow inherited from M1; `cargo sqlx prepare` from `rust/prro/` with absolute `DATABASE_URL` whenever new `sqlx::query!` macros land.
 
+> **Plan revision 2026-05-05 (READ FIRST).**  Pre-implementation review found
+> the original snippets diverged from the actual `prro_crypto` API and the
+> real `fiscal_server.proto` contents; ten corrections were applied in
+> place.  Quick reference for what changed:
+>
+> - **W1**: `SigningSession` now holds `Zeroizing<[u8; 32]>` matching
+>   `prro_crypto::interop::prro::containers::ExtractedKey.param_d`; the
+>   blocking closure receives `Arc<SigningSession>` (no plaintext copy).
+>   `sign_cms_detached` calls the real
+>   `sign_detached_with_content_digest(profile, cert_der, content_digest, &dyn RawSigner)`
+>   shape via a `DstuInProcessSigner` built from the session's `param_d`.
+> - **W2**: same-SKI refresh now does in-place UPDATE (no PK conflict
+>   with `operator_certs.ski_hex`); only key-roll uses the staged-row
+>   pattern.  Multi-URL routing reads from the new `006_ca_endpoints.sql`
+>   migration (vendoring legacy `sql/016_ca_endpoints.sql`); the `cmp_url`
+>   value already includes `/services/cmp/`.  `parse_iso8601` and SKI
+>   computation propagate typed errors instead of fail-open.
+> - **W3**: real proto package is `com.programika.rro.ws.chk`; service
+>   `ChkIncomeService` with five RPCs (`sendChkV2`, `lastChk`, `ping`,
+>   `statusRro`, `infoRro`).  `CheckResponse` fields are `id`, `status`,
+>   `id_sign`, `data_sign`, `error_message` (no `fns_data`).
+> - **W5**: scanner walks `ItemTrait` / `TraitItemFn` in addition to
+>   `pub fn` — the trait surface is the main API and would otherwise be
+>   missed.
+
 **Out of scope (deferred to M3):**
 - Write-path stages (`PREPARED → SIGNED → ENCRYPTED → SENT → KVT1 → KVT2 → ACK`); `WriteWorker`; staged pipeline orchestration.
 - Ingress shells (REST / XML-RPC / Maria / Maria304 / Checkbox-compat).
@@ -305,50 +330,60 @@ impl<'a> fmt::Debug for SealedMaterial<'a> {
     }
 }
 
-/// Opaque handle returned by `unseal_jks`.  Holds the unsealed private key
-/// in `Zeroizing<...>`; dropped at end of crypto operation.  Manual `Debug`
-/// prints `<redacted>` for the key bytes.
+/// Opaque handle returned by `unseal_jks`.  Holds the DSTU 4145 private
+/// scalar in `Zeroizing<[u8; 32]>` (matching `ExtractedKey.param_d` shape);
+/// the inner state is `Arc`-shared so the blocking closure can move a clone
+/// without copying the plaintext bytes.  Manual `Debug` prints `<redacted>`.
+#[derive(Clone)]
 pub struct SigningSession {
+    inner: std::sync::Arc<SigningSessionInner>,
+}
+
+struct SigningSessionInner {
     operator_id: String,
-    /// `Zeroizing<Vec<u8>>` — DSTU 4145 private scalar bytes.
-    /// Never logged; never `Debug`-printed; zeroed on drop.
-    private_key: Zeroizing<Vec<u8>>,
-    /// Public cert DER (non-secret).
+    /// 32 little-endian bytes of the DSTU 4145 private scalar.
+    /// Wrapped in `Zeroizing` so dropping the last `Arc` zeros the array.
+    /// Never logged; never `Debug`-printed.
+    param_d: Zeroizing<[u8; 32]>,
+    /// Leaf cert DER (non-secret).
     cert_der: Vec<u8>,
 }
 
 impl fmt::Debug for SigningSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SigningSession")
-            .field("operator_id", &self.operator_id)
-            .field("private_key", &"<redacted>")
-            .field("cert_der_len", &self.cert_der.len())
+            .field("operator_id", &self.inner.operator_id)
+            .field("param_d", &"<redacted>")
+            .field("cert_der_len", &self.inner.cert_der.len())
             .finish()
     }
 }
 
 impl SigningSession {
     pub fn operator_id(&self) -> &str {
-        &self.operator_id
+        &self.inner.operator_id
     }
 
     pub fn cert_der(&self) -> &[u8] {
-        &self.cert_der
+        &self.inner.cert_der
     }
 
-    /// Crate-internal accessor; the trait `Encode` for signing reaches in
-    /// here.  External callers MUST NOT see plaintext key bytes.
-    pub(crate) fn private_key_bytes(&self) -> &[u8] {
-        &self.private_key
+    /// Crate-internal accessor; the in-process provider reads this when
+    /// constructing a `DstuInProcessSigner`.  External callers MUST NOT
+    /// see plaintext key bytes.
+    pub(crate) fn param_d(&self) -> &Zeroizing<[u8; 32]> {
+        &self.inner.param_d
     }
 
     /// Test-only constructor.
     #[cfg(any(test, feature = "test_helpers"))]
-    pub fn new_for_test(operator_id: String, private_key: Vec<u8>, cert_der: Vec<u8>) -> Self {
+    pub fn new_for_test(operator_id: String, param_d: [u8; 32], cert_der: Vec<u8>) -> Self {
         Self {
-            operator_id,
-            private_key: Zeroizing::new(private_key),
-            cert_der,
+            inner: std::sync::Arc::new(SigningSessionInner {
+                operator_id,
+                param_d: Zeroizing::new(param_d),
+                cert_der,
+            }),
         }
     }
 }
@@ -374,13 +409,25 @@ pub fn unseal_jks(sealed: SealedMaterial<'_>) -> Result<SigningSession, CryptoEr
         }
     })?;
 
-    // `extracted.private_key_bytes` and `extracted.cert_der` shapes come from
-    // `prro_crypto`; field names will likely match.  If not, this is the
-    // additive helper W0-3 §3 flagged.
+    // `ExtractedKey { format, param_d: Zeroizing<[u8;32]>, certs: Vec<Vec<u8>> }`
+    // — see `rust/prro_crypto/src/interop/prro/containers.rs:73-`.
+    let leaf_cert = extracted
+        .certs
+        .into_iter()
+        .next()
+        .ok_or_else(|| CryptoError::JksUnseal {
+            operator_id: sealed.operator_id.to_string(),
+            reason: SealKind::KeyExtractionFailed,
+        })?;
+
     Ok(SigningSession {
-        operator_id: sealed.operator_id.to_string(),
-        private_key: Zeroizing::new(extracted.private_key_bytes().to_vec()),
-        cert_der: extracted.cert_der().to_vec(),
+        inner: std::sync::Arc::new(SigningSessionInner {
+            operator_id: sealed.operator_id.to_string(),
+            // No copy of the plaintext bytes — `param_d` already wraps
+            // `[u8; 32]` in `Zeroizing`, we move it into the session.
+            param_d: extracted.param_d,
+            cert_der: leaf_cert,
+        }),
     })
 }
 
@@ -456,7 +503,7 @@ pub struct DstuVerifyResult(pub bool);
 pub struct SignCmsRequest<'a> {
     pub session: &'a SigningSession,
     pub canonical_xml: &'a [u8],
-    pub include_tsp: bool,
+    pub profile: prro_crypto::cms::profile::CmsProfile,
 }
 
 #[async_trait]
@@ -524,16 +571,16 @@ impl CryptoProvider for InProcessProvider {
         &self,
         request: SignCmsRequest<'_>,
     ) -> Result<SignedCmsBytes, CryptoError> {
-        // Copy out borrows so the async closure can move them — the trait
-        // boundary requires lifetimes match `'_`, but `spawn_blocking` needs
-        // 'static.
+        // The `SigningSession` is `Clone` over `Arc<Inner>`; we move a clone
+        // into the blocking closure.  No copy of the `Zeroizing<[u8; 32]>`
+        // private key — only Arc-strong-count bumps.  The Zeroizing wrapper
+        // zeroes the array when the last Arc holder drops.
+        let session = request.session.clone();
         let canonical = request.canonical_xml.to_vec();
-        let include_tsp = request.include_tsp;
-        let private_key = request.session.private_key_bytes().to_vec();
-        let cert_der = request.session.cert_der().to_vec();
+        let profile = request.profile;
 
         let bytes = tokio::task::spawn_blocking(move || {
-            sign_cms_blocking(&canonical, &private_key, &cert_der, include_tsp)
+            sign_cms_blocking(&canonical, &session, profile)
         })
         .await
         .map_err(|_| CryptoError::CmsSign { reason: SignKind::BackendError })??;
@@ -558,10 +605,12 @@ impl CryptoProvider for InProcessProvider {
         session: &SigningSession,
     ) -> Result<Vec<u8>, CryptoError> {
         let env = envelope_der.to_vec();
-        let key = session.private_key_bytes().to_vec();
-        let plaintext = tokio::task::spawn_blocking(move || unwrap_envelope_blocking(&env, &key))
-            .await
-            .map_err(|_| CryptoError::EnvelopeDecrypt { reason: DecryptKind::ParseFailed })??;
+        let session_clone = session.clone();   // Arc bump, no plaintext copy
+        let plaintext = tokio::task::spawn_blocking(move || {
+            unwrap_envelope_blocking(&env, &session_clone)
+        })
+        .await
+        .map_err(|_| CryptoError::EnvelopeDecrypt { reason: DecryptKind::ParseFailed })??;
         Ok(plaintext)
     }
 
@@ -586,26 +635,50 @@ impl CryptoProvider for InProcessProvider {
 
 fn sign_cms_blocking(
     canonical_xml: &[u8],
-    private_key: &[u8],
-    cert_der: &[u8],
-    include_tsp: bool,
+    session: &SigningSession,
+    profile: prro_crypto::cms::profile::CmsProfile,
 ) -> Result<Vec<u8>, CryptoError> {
     use prro_crypto::cms::builder::sign_detached_with_content_digest;
-    sign_detached_with_content_digest(canonical_xml, private_key, cert_der, include_tsp)
+    use prro_crypto::cms::profile::CmsProfile;
+    use prro_crypto::cms::signer::DstuInProcessSigner;
+    use prro_crypto::core::field::FieldEl;
+    use prro_crypto::core::hash::{gost_34_311_95, kupyna_256};
+
+    // `sign_detached_with_content_digest(profile, cert_der, content_digest, &dyn RawSigner)`
+    // — real signature at `rust/prro_crypto/src/cms/builder.rs:303`.
+    // The CMS builder owns `signedAttrs` hashing; we supply the content
+    // digest of `canonical_xml` per profile.
+    let content_digest = match profile {
+        CmsProfile::Dstu4145WithGost34311Pb => gost_34_311_95(canonical_xml).to_vec(),
+        CmsProfile::Dstu4145WithDstu7564Pb => kupyna_256(canonical_xml).to_vec(),
+    };
+
+    // `param_d` is 32 LE bytes; `bytes_le_to_field` consumes that exact
+    // shape (per `rust/prro_crypto/src/interop/prro/containers.rs:24`).
+    // The clone on `*session.param_d()` is a copy of `[u8; 32]` (32 bytes,
+    // not the plaintext private key as a heap blob); the FieldEl swallows
+    // it and is itself a secret-bearing value.
+    let d = FieldEl::from_le_bytes(&*session.param_d().clone())
+        .map_err(|_| CryptoError::CmsSign { reason: SignKind::CurveMismatch })?;
+    let signer = DstuInProcessSigner::new(d);
+
+    sign_detached_with_content_digest(profile, session.cert_der(), &content_digest, &signer)
         .map_err(|_| CryptoError::CmsSign { reason: SignKind::BackendError })
 }
 
 fn prro_crypto_verify_blocking(_msg: &[u8], _sig: &[u8], _pubkey: &[u8]) -> bool {
-    // Wire to `prro_crypto::core::sign::verify` — exact signature TBD by
-    // the implementer at integration time; signature derived from W0-3 §1.
+    // Wire to `prro_crypto::core::sign::verify` — exact signature derived
+    // from W0-3 §1 (root re-export at `rust/prro_crypto/src/lib.rs:9`).
     false
 }
 
-fn unwrap_envelope_blocking(envelope_der: &[u8], private_key: &[u8]) -> Result<Vec<u8>, CryptoError> {
+fn unwrap_envelope_blocking(envelope_der: &[u8], session: &SigningSession) -> Result<Vec<u8>, CryptoError> {
     use prro_crypto::cms::envelope::{parse_envelope_params, unwrap_envelope};
     let params = parse_envelope_params(envelope_der)
         .map_err(|_| CryptoError::EnvelopeDecrypt { reason: DecryptKind::ParseFailed })?;
-    unwrap_envelope(envelope_der, &params, private_key)
+    // Pass `&[u8]` derived from the in-Arc Zeroizing wrapper — no extra
+    // plaintext copy.
+    unwrap_envelope(envelope_der, &params, &**session.param_d())
         .map_err(|_| CryptoError::EnvelopeDecrypt { reason: DecryptKind::MacFailed })
 }
 
@@ -760,21 +833,35 @@ Verified:
 
 **Files:**
 
-- Modify: `rust/prro/Cargo.toml` (add `wiremock` to `[dev-dependencies]`)
+- Modify: `rust/prro/Cargo.toml` (add `wiremock` to `[dev-dependencies]`, `sha2` and `chrono` to `[dependencies]`, enable `prro_crypto`'s `tsp_http` feature so `fetch_cert_by_ski` is compiled)
+- Create: `rust/prro/migrations/006_ca_endpoints.sql` (NEW — vendors the legacy `sql/016_ca_endpoints.sql` schema into the M1 Rust migration tree; populates the table with the production CMP URLs INCLUDING the `/services/cmp/` path)
 - Modify: `rust/prro/src/lib.rs` (`pub mod services;`)
 - Create: `rust/prro/src/services/mod.rs`
 - Create: `rust/prro/src/services/cert_refresher.rs`
 - Create: `rust/prro/tests/cert_refresher_smoke.rs`
 - Create: `rust/prro/tests/fixtures/test_ca/` (vendored byte-replay corpus)
 
+> **W2 schema note (revision 2026-05-05).**  M1 `cert_provisioning_config`
+> carries `primary_cmp_url` and `fallback_cmp_url` columns whose default
+> values lack the `/services/cmp/` path component the IIT CMP wire client
+> expects (per `rust/prro_crypto/src/cms/cmp.rs:300-`).  Per W0-2 the
+> authoritative multi-URL routing source is the `ca_endpoints` table
+> (legacy `sql/016_ca_endpoints.sql`).  W2 step 1 ports that schema into
+> Rust migrations and W2 reads from the new table; the old
+> `cert_provisioning_config.{primary,fallback}_cmp_url` columns become
+> deprecated/unused (W2 does NOT remove them — that's an M3+ schema
+> hygiene follow-up to file when it lands).
+
 **Acceptance Criteria:**
 
-- [ ] `cert_refresher::refresh_for_fn(pool, fn_id, provider)` returns `Ok(RefreshOutcome)` with one of `{NoChange, Refreshed { ski_old, ski_new }, Failed(reason)}`.
-- [ ] Multi-URL fallback: if URL #1 returns transport error or a SKI mismatch, URL #2 is tried; if all fail, `Failed(AllUrlsFailed)` is returned without touching the DB.
-- [ ] Atomic flip: stage at `active=0`, then `with_immediate(pool, |conn| ...)` runs `UPDATE … SET active=0 WHERE active=1` + `UPDATE … SET active=1 WHERE ski=?` in one tx.  Concurrent reader after the tx sees exactly one `active=1` row for the FN.
+- [ ] `cert_refresher::refresh_for_fn(pool, fn_id, provider)` returns `Ok(RefreshOutcome)` with one of `{NoChange, RefreshedInPlace { ski }, RefreshedKeyRoll { ski_old, ski_new }, Failed(reason)}`.
+- [ ] **Same-SKI refresh (cert renewed, key kept)** does NOT stage a new row (would PK-conflict with `operator_certs.ski_hex`); instead UPDATEs the existing row's `cert_der`, `cert_fingerprint`, `valid_from`, `valid_to`, `last_refresh_at`, `fetched_at` in a single short tx.  Returns `RefreshedInPlace { ski }`.
+- [ ] **Key-roll (new SKI)** stages the new cert at `active=0` (new PK row), then `with_immediate(pool, |conn| ...)` runs `UPDATE … SET active=0 WHERE active=1` + `UPDATE … SET active=1 WHERE ski_hex=?` + `audit_log INSERT` in one tx.  Returns `RefreshedKeyRoll { ski_old, ski_new }`.
+- [ ] Multi-URL fallback reads from the new `ca_endpoints` table (priority-ordered, enabled-only).  If one URL returns transport error / parse error / SKI mismatch, the next is tried; if all fail, `Failed(AllUrlsFailed)` is returned without touching the DB.
 - [ ] `refresh_within_days` honoured: a cert whose `valid_to - now > refresh_within_days` is NOT refreshed (returns `NoChange`).  One whose `valid_to - now <= refresh_within_days` IS refreshed.
 - [ ] No CMP fetch / network call happens inside any `with_immediate` block (W5 will static-assert this; W2 must not introduce a violation).
-- [ ] Smoke tests pass against a `wiremock` HTTP byte-replay server using the vendored fixture corpus.
+- [ ] Malformed cert metadata (unparseable `valid_to`, malformed cert DER on SKI compute) returns a typed `RefreshError::MalformedCertMetadata` / `MalformedCert` — NOT `Utc::now()` fail-open or panic.
+- [ ] Smoke tests pass against a `wiremock` HTTP byte-replay server using the vendored fixture corpus, plus a unit test for the same-SKI vs key-roll branch decision.
 
 **Verify:**
 
@@ -784,13 +871,54 @@ cargo test -p prro --test cert_refresher_smoke
 
 **Steps:**
 
-- [ ] **Step 1: Add `wiremock` dev-dep.**
+- [ ] **Step 1: Add deps + port `ca_endpoints` migration.**
 
-In `rust/prro/Cargo.toml` `[dev-dependencies]`:
+In `rust/prro/Cargo.toml` `[dependencies]` add:
+
+```toml
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }   # already in M1 — verify, don't dup
+prro_crypto = { path = "../prro_crypto", features = ["tsp_http"] }   # enable feature for fetch_cert_by_ski
+```
+
+`[dev-dependencies]`:
 
 ```toml
 wiremock = "0.6"
 ```
+
+Then create `rust/prro/migrations/006_ca_endpoints.sql` mirroring the
+shape of the legacy `sql/016_ca_endpoints.sql`.  Minimal viable schema:
+
+```sql
+-- 006 — CA endpoint registry for cert_provisioning multi-URL retry.
+-- Vendored from legacy sql/016_ca_endpoints.sql.  The IIT proprietary
+-- wire protocol used by every listed CMP endpoint is identical;
+-- only the host differs.
+
+CREATE TABLE ca_endpoints (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT    NOT NULL UNIQUE,
+    cmp_url         TEXT    NOT NULL,
+    issuer_pattern  TEXT,           -- case-insensitive substring vs cert issuer DN; nullable
+    priority        INTEGER NOT NULL DEFAULT 0,
+    enabled         INTEGER NOT NULL DEFAULT 1  CHECK (enabled IN (0,1)),
+    created_at      TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    updated_at      TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+) STRICT;
+
+CREATE INDEX ix_ca_endpoints_priority ON ca_endpoints(priority) WHERE enabled = 1;
+
+-- Seed the two production CMP URLs WITH the /services/cmp/ path.
+-- The M1 default `primary_cmp_url='http://acskidd.gov.ua:80'` lacks
+-- this path and is incomplete for a direct CMP request.
+INSERT INTO ca_endpoints (name, cmp_url, issuer_pattern, priority) VALUES
+    ('acskidd', 'http://acskidd.gov.ua:80/services/cmp/', 'acskidd', 10),
+    ('ca.tax.gov.ua', 'http://ca.tax.gov.ua:80/services/cmp/', 'tax', 20);
+```
+
+Acceptance: `cargo test -p prro --test migrations_apply` passes (M1 sub-test
+extended to assert the new `ca_endpoints` table is reachable post-006).
 
 - [ ] **Step 2: Add `pub mod services;` to `rust/prro/src/lib.rs`.**
 
@@ -853,7 +981,11 @@ pub struct RefreshConfig {
 #[derive(Debug, Clone)]
 pub enum RefreshOutcome {
     NoChange,
-    Refreshed { ski_old: String, ski_new: String },
+    /// Same-SKI refresh: in-place UPDATE only, no PK conflict on
+    /// `operator_certs.ski_hex`.
+    RefreshedInPlace { ski: String },
+    /// New SKI: stage at active=0 + atomic flip via with_immediate.
+    RefreshedKeyRoll { ski_old: String, ski_new: String },
     Failed(RefreshError),
 }
 
@@ -861,10 +993,16 @@ pub enum RefreshOutcome {
 pub enum RefreshError {
     #[error("no active cert for FN {fn_id}")]
     NoActiveCert { fn_id: String },
+    #[error("no enabled CA endpoints")]
+    NoEnabledEndpoints,
     #[error("CMP fetch failed across all URLs")]
     AllUrlsFailed,
     #[error("CMP fetch returned a cert whose SKI differs from request")]
     SkiMismatch,
+    #[error("malformed cert metadata in operator_certs row for FN {fn_id}: {field}")]
+    MalformedCertMetadata { fn_id: String, field: &'static str },
+    #[error("malformed cert DER bytes returned from CMP")]
+    MalformedCert,
     #[error("DB error: {0}")]
     Db(String),
     #[error("crypto provider error: {0:?}")]
@@ -877,7 +1015,7 @@ pub async fn refresh_for_fn(
     provider: Arc<dyn CryptoProvider>,
 ) -> Result<RefreshOutcome, RefreshError> {
     let cfg = load_refresh_config(pool).await.map_err(|e| RefreshError::Db(e.to_string()))?;
-    let active = load_active_cert(pool, fn_id).await.map_err(|e| RefreshError::Db(e.to_string()))?
+    let active = load_active_cert(pool, fn_id).await?
         .ok_or_else(|| RefreshError::NoActiveCert { fn_id: fn_id.to_string() })?;
 
     let now = Utc::now();
@@ -885,7 +1023,10 @@ pub async fn refresh_for_fn(
         return Ok(RefreshOutcome::NoChange);
     }
 
-    let urls = load_ca_urls(pool, fn_id).await.map_err(|e| RefreshError::Db(e.to_string()))?;
+    let urls = load_ca_urls(pool).await.map_err(|e| RefreshError::Db(e.to_string()))?;
+    if urls.is_empty() {
+        return Err(RefreshError::NoEnabledEndpoints);
+    }
     let ski_bytes = hex_to_ski(&active.ski_hex);
 
     let new_cert: CertDer = provider
@@ -893,21 +1034,34 @@ pub async fn refresh_for_fn(
         .await
         .map_err(map_crypto_to_refresh)?;
 
-    let new_ski_hex = compute_ski_hex(&new_cert.0);
+    // SKI compute is fail-closed: malformed cert DER -> typed error,
+    // not a panic.
+    let new_ski_hex = compute_ski_hex(&new_cert.0)?;
+    let active_ski = active.ski_hex.clone();
+    let fn_id_owned = fn_id.to_string();
 
-    // Stage outside any tx.
+    if new_ski_hex == active_ski {
+        // Same-SKI refresh: in-place UPDATE.  No staged row (would PK-conflict
+        // with operator_certs.ski_hex), no atomic flip needed (still exactly
+        // one active=1 for this FN throughout).
+        in_place_refresh(pool, &active_ski, &new_cert.0).await
+            .map_err(|e| RefreshError::Db(e.to_string()))?;
+        return Ok(RefreshOutcome::RefreshedInPlace { ski: new_ski_hex });
+    }
+
+    // Key-roll: new SKI != old.  Stage at active=0 outside any tx; flip + audit
+    // inside one with_immediate.
     stage_inactive_cert(pool, fn_id, &new_ski_hex, &new_cert.0)
         .await
         .map_err(|e| RefreshError::Db(e.to_string()))?;
 
-    // Atomic flip + audit_log inside a single with_immediate.
-    let active_ski = active.ski_hex.clone();
     let new_ski_for_tx = new_ski_hex.clone();
-    let fn_id_owned = fn_id.to_string();
+    let active_ski_for_tx = active_ski.clone();
+    let fn_id_for_tx = fn_id_owned.clone();
     with_immediate(pool, move |conn| {
         Box::pin(async move {
             sqlx::query("UPDATE operator_certs SET active = 0 WHERE fiscal_number = ? AND active = 1")
-                .bind(&fn_id_owned)
+                .bind(&fn_id_for_tx)
                 .execute(&mut *conn)
                 .await?;
             sqlx::query("UPDATE operator_certs SET active = 1 WHERE ski_hex = ?")
@@ -916,10 +1070,10 @@ pub async fn refresh_for_fn(
                 .await?;
             sqlx::query(
                 "INSERT INTO audit_log(entity_type, entity_id, event_type, severity, actor, event_payload_json) \
-                 VALUES ('fn', ?, 'cert_refresh', 'INFO', 'cert_refresher', ?)",
+                 VALUES ('fn', ?, 'cert_refresh_key_roll', 'INFO', 'cert_refresher', ?)",
             )
-            .bind(&fn_id_owned)
-            .bind(format!(r#"{{"ski_old":"{}","ski_new":"{}"}}"#, active_ski, new_ski_for_tx))
+            .bind(&fn_id_for_tx)
+            .bind(format!(r#"{{"ski_old":"{}","ski_new":"{}"}}"#, active_ski_for_tx, new_ski_for_tx))
             .execute(&mut *conn)
             .await?;
             Ok(())
@@ -928,10 +1082,32 @@ pub async fn refresh_for_fn(
     .await
     .map_err(|e| RefreshError::Db(e.to_string()))?;
 
-    Ok(RefreshOutcome::Refreshed {
-        ski_old: active.ski_hex,
+    Ok(RefreshOutcome::RefreshedKeyRoll {
+        ski_old: active_ski,
         ski_new: new_ski_hex,
     })
+}
+
+/// Same-SKI refresh: cert renewed but key kept.  UPDATEs the existing
+/// active=1 row.  Single short tx.  No staging, no flip.
+async fn in_place_refresh(
+    pool: &SqlitePool,
+    ski_hex: &str,
+    new_cert_der: &[u8],
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE operator_certs \
+         SET cert_der = ?, cert_fingerprint = ?, fetched_at = ?, last_refresh_at = ? \
+         WHERE ski_hex = ? AND active = 1",
+    )
+    .bind(new_cert_der)
+    .bind(compute_fingerprint(new_cert_der))
+    .bind(Utc::now().to_rfc3339())
+    .bind(Utc::now().to_rfc3339())
+    .bind(ski_hex)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 fn map_crypto_to_refresh(e: CryptoError) -> RefreshError {
@@ -958,32 +1134,34 @@ async fn load_refresh_config(pool: &SqlitePool) -> sqlx::Result<RefreshConfig> {
     Ok(RefreshConfig { refresh_within_days: days })
 }
 
-async fn load_active_cert(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<ActiveCertRow>> {
+async fn load_active_cert(pool: &SqlitePool, fn_id: &str) -> Result<Option<ActiveCertRow>, RefreshError> {
     let row: Option<(String, String)> = sqlx::query_as(
         "SELECT ski_hex, valid_to FROM operator_certs WHERE fiscal_number = ? AND active = 1",
     )
     .bind(fn_id)
     .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(ski_hex, valid_to_str)| ActiveCertRow {
-        ski_hex,
-        valid_to: parse_iso8601(&valid_to_str),
-    }))
+    .await
+    .map_err(|e| RefreshError::Db(e.to_string()))?;
+    match row {
+        None => Ok(None),
+        Some((ski_hex, valid_to_str)) => {
+            let valid_to = parse_iso8601(fn_id, "valid_to", &valid_to_str)?;
+            Ok(Some(ActiveCertRow { ski_hex, valid_to }))
+        }
+    }
 }
 
-async fn load_ca_urls(pool: &SqlitePool, _fn_id: &str) -> sqlx::Result<Vec<String>> {
-    // For M2 W2 minimal: read primary + fallback from cert_provisioning_config.
-    // FN-specific override via ca_endpoints is a follow-up.
-    let row: (String, Option<String>) = sqlx::query_as(
-        "SELECT primary_cmp_url, fallback_cmp_url FROM cert_provisioning_config WHERE id = 1",
+async fn load_ca_urls(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
+    // Read enabled endpoints in priority order from ca_endpoints (M2 W2
+    // migration 006).  The cmp_url column already includes the
+    // `/services/cmp/` path component.  cert_provisioning_config's
+    // primary/fallback columns are deprecated and not consulted here.
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT cmp_url FROM ca_endpoints WHERE enabled = 1 ORDER BY priority ASC",
     )
-    .fetch_one(pool)
+    .fetch_all(pool)
     .await?;
-    let mut urls = vec![row.0];
-    if let Some(fallback) = row.1 {
-        urls.push(fallback);
-    }
-    Ok(urls)
+    Ok(rows.into_iter().map(|(u,)| u).collect())
 }
 
 async fn stage_inactive_cert(
@@ -1026,12 +1204,11 @@ fn hex_digit(c: u8) -> u8 {
     }
 }
 
-fn compute_ski_hex(cert_der: &[u8]) -> String {
-    use prro_crypto::cms::envelope::compute_ski;
-    let pubkey = prro_crypto::cms::envelope::extract_cert_pubkey_bytes(cert_der)
-        .expect("cert without parseable pubkey");
+fn compute_ski_hex(cert_der: &[u8]) -> Result<String, RefreshError> {
+    use prro_crypto::cms::envelope::{compute_ski, extract_cert_pubkey_bytes};
+    let pubkey = extract_cert_pubkey_bytes(cert_der).map_err(|_| RefreshError::MalformedCert)?;
     let ski = compute_ski(&pubkey);
-    ski.iter().map(|b| format!("{:02x}", b)).collect()
+    Ok(ski.iter().map(|b| format!("{:02x}", b)).collect())
 }
 
 fn compute_fingerprint(cert_der: &[u8]) -> String {
@@ -1039,10 +1216,10 @@ fn compute_fingerprint(cert_der: &[u8]) -> String {
     format!("{:x}", Sha256::digest(cert_der))
 }
 
-fn parse_iso8601(s: &str) -> DateTime<Utc> {
+fn parse_iso8601(fn_id: &str, field: &'static str, s: &str) -> Result<DateTime<Utc>, RefreshError> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+        .map_err(|_| RefreshError::MalformedCertMetadata { fn_id: fn_id.to_string(), field })
 }
 ```
 
@@ -1175,7 +1352,7 @@ git push origin rust-gateway
 
 - [ ] `tonic_build` generates Rust types from `rust/prro/proto/fiscal_server.proto` at build time; `cargo build -p prro` clean on all four targets.
 - [ ] `DpsChannel` trait is `Send + Sync`; methods take typed inputs and return typed outputs; NO `SqlitePool` / `SqliteConnection` / `Pool` / `Transaction` in any signature.
-- [ ] Methods covered: `submit`, `last_chk` (named per the actual proto message name; alias for documentation if the wire name is shorter), `query_by_local_identity` (returns `QueryNotSupported` typed variant per W0-1 finding), `ping`, `status_rro`, `info_rro`.
+- [ ] Trait methods covered (mapped to actual proto rpcs): `submit` → `send_chk_v2`, `last_chk` → `last_chk`, `ping` → `ping`, `status_rro` → `status_rro`, `info_rro` → `info_rro`, plus `query_by_local_identity` (returns `QueryNotSupported` typed variant per W0-1 finding) and the `query_by_server_fiscal_no` default impl that calls `last_chk` + asserts `response.id == expected_fiscal_id` per `PRRO_GATE-5js`.
 - [ ] `query_by_server_fiscal_no` is implemented on top of `last_chk`: it signs the FN, calls `last_chk(fn_sign)`, and asserts `response.id == expected_fiscal_id`; mismatch returns a typed `DpsError::ServerFiscalIdMismatch`.
 - [ ] Native Rust tonic mock in `tests/dps_channel_smoke.rs` exercises happy path + error categorisation: `INVALID_ARGUMENT`, `UNAUTHENTICATED`, `DEADLINE_EXCEEDED`, `UNAVAILABLE`, transport drop mid-call → distinct typed error variants.
 - [ ] Connection reuse: `GrpcDpsChannel` holds the tonic `Channel` for a logical session, not per-request.
@@ -1244,15 +1421,20 @@ pub mod dps;
 - [ ] **Step 6: Write `rust/prro/src/transports/dps/gen.rs` (wraps tonic-generated module).**
 
 ```rust
-//! Re-export of the tonic-generated module under a stable path so callers
-//! never `use` the raw generated module name (which depends on the .proto
-//! package directive).
+//! Re-export of the tonic-generated module under a stable path.  The proto
+//! `package com.programika.rro.ws.chk;` is what `include_proto!` resolves
+//! to (per the canonical schema confirmed in W0-1 + verified against
+//! `src/prro_gateway/transports/proto/fiscal_server.proto:6`).
 
 #![allow(clippy::all)]
-tonic::include_proto!("fiscal_server");
+tonic::include_proto!("com.programika.rro.ws.chk");
 ```
 
-(If the proto's `package` directive is not `fiscal_server`, the implementer adjusts the literal in `include_proto!`.)
+The generated client lives at `chk_income_service_client::ChkIncomeServiceClient<...>`
+(snake_case of the service name `ChkIncomeService` plus the `_client` suffix
+from `tonic-build` defaults).  The five generated method functions are
+`send_chk_v2`, `last_chk`, `ping`, `status_rro`, `info_rro` (snake_case of
+the proto rpc names).  All five RPCs are unary; no streaming.
 
 - [ ] **Step 7: Write `rust/prro/src/transports/dps/types.rs`.**
 
@@ -1260,47 +1442,62 @@ Typed structs that the trait emits/consumes — never raw protobuf types.  Imple
 
 ```rust
 //! Typed DPS request/response structs.  The trait surface uses these,
-//! NEVER the raw tonic-generated types.
+//! NEVER the raw tonic-generated types.  Field set mirrors
+//! `src/prro_gateway/transports/proto/fiscal_server.proto` exactly.
 
+/// `Check` request for `sendChkV2` and `ping`.  The proto `Check`
+/// message carries the signed CMS envelope payload as a single bytes
+/// field (verified by W3 implementer against the actual proto field
+/// name; rename in this struct accordingly).
 #[derive(Debug, Clone)]
-pub struct SubmitDocumentRequest {
+pub struct CheckRequestPayload {
     pub envelope_der: Vec<u8>,
     pub deadline_ms: u64,
 }
 
+/// `CheckRequest` request type for `lastChk`, `statusRro`, `infoRro`.
+/// Carries a signed FN identifier for the by-FN lookup pattern
+/// described in `PRRO_GATE-5js`.
 #[derive(Debug, Clone)]
-pub struct SubmitDocumentResponse {
-    pub fiscal_no: String,
-    pub fiscal_date: String,
-    pub kvt1_der: Vec<u8>,
+pub struct SignedRequestPayload {
+    pub signed_payload: Vec<u8>,
+    pub deadline_ms: u64,
 }
 
+/// `CheckResponse` — the unified response type returned by `sendChkV2`,
+/// `lastChk`, and `ping`.  Matches the 5-field shape of the canonical
+/// `.proto` (id, status, id_sign, data_sign, error_message).
 #[derive(Debug, Clone)]
-pub struct LastChkRequest {
-    pub signed_fn: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LastChkResponse {
+pub struct CheckResponse {
     pub id: String,
-    pub fns_data: Vec<u8>,
+    /// Wire-level status enum, decoded as i32 by tonic.  See
+    /// `gen::check_response::Status` for the enum variants
+    /// (OK, ERROR_VEREFY, ERROR_CHECK, ERROR_SAVE, ERROR_UNKNOWN, etc.).
+    pub status: i32,
+    pub id_sign: Vec<u8>,
+    pub data_sign: Vec<u8>,
+    pub error_message: String,
 }
 
+/// `StatusResponse` from `statusRro`.  Implementer maps the actual
+/// fields from `gen::StatusResponse` here once W3 reads the proto.
 #[derive(Debug, Clone)]
-pub struct PingResponse {
-    pub server_time: String,
+pub struct StatusResponse {
+    pub status: i32,
+    pub data: Vec<u8>,
 }
 
+/// `RroInfoResponse` from `infoRro`.
 #[derive(Debug, Clone)]
-pub struct StatusRroResponse {
-    pub status: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct InfoRroResponse {
+pub struct RroInfoResponse {
     pub data: Vec<u8>,
 }
 ```
+
+> **Deferred.**  `fns_data` was named in W0-1 as a future field; the
+> committed proto does NOT carry it as part of `CheckResponse`.  W3
+> ships the 5-field shape verbatim; if the production proto later
+> grows `fns_data` (or a separate KVT-fetch RPC), W3+1 adds it.
 
 - [ ] **Step 8: Write `rust/prro/src/transports/dps/errors.rs`.**
 
@@ -1342,7 +1539,8 @@ Trait + impl skeleton:
 
 ```rust
 //! `DpsChannel` trait + `GrpcDpsChannel` impl.  No DB handle in any
-//! signature (ADR-M2-6).
+//! signature (ADR-M2-6).  Wraps the tonic-generated `ChkIncomeService`
+//! client (per the actual proto package `com.programika.rro.ws.chk`).
 
 use async_trait::async_trait;
 use tonic::transport::Channel;
@@ -1353,20 +1551,32 @@ use crate::transports::dps::types::*;
 
 #[async_trait]
 pub trait DpsChannel: Send + Sync {
-    async fn submit(&self, req: SubmitDocumentRequest) -> Result<SubmitDocumentResponse, DpsError>;
-    async fn last_chk(&self, req: LastChkRequest) -> Result<LastChkResponse, DpsError>;
-    async fn ping(&self) -> Result<PingResponse, DpsError>;
-    async fn status_rro(&self) -> Result<StatusRroResponse, DpsError>;
-    async fn info_rro(&self) -> Result<InfoRroResponse, DpsError>;
+    /// Maps to `ChkIncomeService::sendChkV2(Check) -> CheckResponse`.
+    async fn submit(&self, req: CheckRequestPayload) -> Result<CheckResponse, DpsError>;
 
-    /// Encoded as `last_chk(fn_sign) + response.id == expected_fiscal_id`.
-    /// Per `PRRO_GATE-5js`.
+    /// Maps to `ChkIncomeService::lastChk(CheckRequest) -> CheckResponse`.
+    async fn last_chk(&self, req: SignedRequestPayload) -> Result<CheckResponse, DpsError>;
+
+    /// Maps to `ChkIncomeService::ping(Check) -> CheckResponse`.
+    async fn ping(&self, req: CheckRequestPayload) -> Result<CheckResponse, DpsError>;
+
+    /// Maps to `ChkIncomeService::statusRro(CheckRequest) -> StatusResponse`.
+    async fn status_rro(&self, req: SignedRequestPayload) -> Result<StatusResponse, DpsError>;
+
+    /// Maps to `ChkIncomeService::infoRro(CheckRequest) -> RroInfoResponse`.
+    async fn info_rro(&self, req: SignedRequestPayload) -> Result<RroInfoResponse, DpsError>;
+
+    /// Encoded as `last_chk(signed_fn) + response.id == expected_fiscal_id`.
+    /// Per `PRRO_GATE-5js`.  Default impl provided so concrete impls
+    /// don't have to repeat it.
     async fn query_by_server_fiscal_no(
         &self,
         signed_fn: Vec<u8>,
         expected_fiscal_id: &str,
-    ) -> Result<LastChkResponse, DpsError> {
-        let resp = self.last_chk(LastChkRequest { signed_fn }).await?;
+    ) -> Result<CheckResponse, DpsError> {
+        let resp = self
+            .last_chk(SignedRequestPayload { signed_payload: signed_fn, deadline_ms: 5_000 })
+            .await?;
         if resp.id == expected_fiscal_id {
             Ok(resp)
         } else {
@@ -1377,15 +1587,16 @@ pub trait DpsChannel: Send + Sync {
         }
     }
 
-    /// Per W0-1: always returns `QueryNotSupported`.  Callers handle this
-    /// at the service layer.
+    /// Per W0-1: the production DPS contour does NOT support
+    /// query-by-local-identity, so this method always returns
+    /// `QueryNotSupported`.  Callers handle this at the service layer.
     async fn query_by_local_identity(&self) -> Result<(), DpsError> {
         Err(DpsError::QueryNotSupported)
     }
 }
 
 pub struct GrpcDpsChannel {
-    inner: gen::fiscal_server_client::FiscalServerClient<Channel>,
+    inner: gen::chk_income_service_client::ChkIncomeServiceClient<Channel>,
 }
 
 impl GrpcDpsChannel {
@@ -1395,28 +1606,46 @@ impl GrpcDpsChannel {
             .connect()
             .await
             .map_err(|_| DpsError::Unavailable)?;
-        Ok(Self { inner: gen::fiscal_server_client::FiscalServerClient::new(channel) })
+        Ok(Self {
+            inner: gen::chk_income_service_client::ChkIncomeServiceClient::new(channel),
+        })
     }
 }
 
 #[async_trait]
 impl DpsChannel for GrpcDpsChannel {
-    async fn submit(&self, req: SubmitDocumentRequest) -> Result<SubmitDocumentResponse, DpsError> {
-        // map req → gen::SubmitRequest → call → gen::SubmitResponse → SubmitDocumentResponse
-        // map tonic::Status into typed DpsError per the spec mapping.
+    async fn submit(&self, req: CheckRequestPayload) -> Result<CheckResponse, DpsError> {
+        // implementer wires:
+        //   1. map req -> gen::Check (the proto request type for sendChkV2);
+        //   2. call self.inner.clone().send_chk_v2(tonic::Request::new(...)).await;
+        //   3. on Ok: map gen::CheckResponse (5 fields: id, status, id_sign,
+        //      data_sign, error_message) -> CheckResponse;
+        //   4. on Err(tonic::Status): map status code -> typed DpsError per
+        //      the table in §errors.rs (INVALID_ARGUMENT/UNAUTHENTICATED/
+        //      DEADLINE_EXCEEDED/UNAVAILABLE/transport drop).
         let _ = req;
-        Err(DpsError::Internal("not yet implemented".into())) // implementer wires
+        Err(DpsError::Internal("implementer wires send_chk_v2".into()))
     }
-    // ... last_chk, ping, status_rro, info_rro likewise ...
-
-    async fn last_chk(&self, _req: LastChkRequest) -> Result<LastChkResponse, DpsError> { Err(DpsError::Internal("nyi".into())) }
-    async fn ping(&self) -> Result<PingResponse, DpsError> { Err(DpsError::Internal("nyi".into())) }
-    async fn status_rro(&self) -> Result<StatusRroResponse, DpsError> { Err(DpsError::Internal("nyi".into())) }
-    async fn info_rro(&self) -> Result<InfoRroResponse, DpsError> { Err(DpsError::Internal("nyi".into())) }
+    async fn last_chk(&self, _req: SignedRequestPayload) -> Result<CheckResponse, DpsError> {
+        Err(DpsError::Internal("implementer wires last_chk".into()))
+    }
+    async fn ping(&self, _req: CheckRequestPayload) -> Result<CheckResponse, DpsError> {
+        Err(DpsError::Internal("implementer wires ping".into()))
+    }
+    async fn status_rro(&self, _req: SignedRequestPayload) -> Result<StatusResponse, DpsError> {
+        Err(DpsError::Internal("implementer wires status_rro".into()))
+    }
+    async fn info_rro(&self, _req: SignedRequestPayload) -> Result<RroInfoResponse, DpsError> {
+        Err(DpsError::Internal("implementer wires info_rro".into()))
+    }
 }
 ```
 
-The implementer fills in each method's tonic call + typed conversion.  Generated client name is `fiscal_server_client::FiscalServerClient` if the proto service is named `FiscalServer`.
+The implementer fills in each method's tonic call + typed conversion.
+Generated module path is `chk_income_service_client::ChkIncomeServiceClient`
+(snake_case of `ChkIncomeService` + `_client` suffix from tonic-build
+defaults).  The 5 RPC method names on the generated client are
+`send_chk_v2`, `last_chk`, `ping`, `status_rro`, `info_rro`.
 
 - [ ] **Step 10: Write `rust/prro/src/transports/dps/mod.rs`.**
 
@@ -1429,8 +1658,7 @@ pub mod types;
 pub use channel::{DpsChannel, GrpcDpsChannel};
 pub use errors::{DpsError, InvalidKind};
 pub use types::{
-    InfoRroResponse, LastChkRequest, LastChkResponse, PingResponse, StatusRroResponse,
-    SubmitDocumentRequest, SubmitDocumentResponse,
+    CheckRequestPayload, CheckResponse, RroInfoResponse, SignedRequestPayload, StatusResponse,
 };
 ```
 
@@ -1594,10 +1822,11 @@ git push origin rust-gateway
 **Acceptance Criteria:**
 
 - [ ] Test parses every `.rs` under `rust/prro/src/crypto/` and `rust/prro/src/transports/` via `syn`.
-- [ ] For every `pub fn` / `pub async fn`, asserts no parameter type or return type stringifies to a name containing `SqlitePool`, `SqliteConnection`, `Pool` (with sqlx generic), or `Transaction` (with sqlx generic).
+- [ ] Scanner walks **both** free `pub fn` / `pub async fn` items (`syn::ItemFn`) **and trait method definitions** (`syn::ItemTrait` → each `syn::TraitItemFn`).  Without trait-item scanning the main API surface (`CryptoProvider`, `DpsChannel`) would be missed entirely.
+- [ ] For every public function or trait method scanned, asserts no parameter type or return type stringifies to a name containing `SqlitePool`, `SqliteConnection`, `Pool` (with sqlx generic), or `Transaction` (with sqlx generic).
 - [ ] `services::cert_refresher` is NOT scanned (carved out per ADR-M2-6).
 - [ ] `#[cfg(test)]` modules / blocks are skipped.
-- [ ] A negative-fixture test confirms the scanner WOULD catch a violation if injected (synthesised AST input with `pool: SqlitePool` parameter — must produce an error).
+- [ ] A negative-fixture test confirms the scanner WOULD catch a violation if injected via BOTH paths: (1) synthesised AST with `pub async fn debug_violation(pool: SqlitePool)` (free fn), AND (2) synthesised `pub trait T { async fn m(&self, pool: &SqlitePool); }` (trait method) — both must produce an error with a clear `file:line` diagnostic.
 
 **Verify:**
 
@@ -1616,7 +1845,14 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 
 - [ ] **Step 2: Write the test.**
 
-`tests/api_surface_no_db_handle.rs` walks the directory tree, parses each file, visits items, applies the rule.  ~150-200 lines; implementer follows `syn::visit::Visit` pattern.
+`tests/api_surface_no_db_handle.rs` walks the directory tree, parses each file, visits items, applies the rule.  ~200-250 lines; implementer follows `syn::visit::Visit` pattern with these visit fns:
+
+- `visit_item_fn(&mut self, i: &ItemFn)` — covers free `pub fn` / `pub async fn` items.
+- `visit_item_trait(&mut self, i: &ItemTrait)` — descends into each `TraitItemFn` and inspects its signature.  This is the critical addition: the M2 main API surface (`CryptoProvider`, `DpsChannel`) is expressed as trait methods, NOT free functions, so a `pub fn`-only scanner would silently pass a violation in a trait method.
+- `visit_item_impl(&mut self, i: &ItemImpl)` — inspect each `ImplItemFn` only when its `vis` is `Visibility::Public` (private impl-block helpers are intentionally exempt).
+- skip any item whose `attrs` contains `#[cfg(test)]` or whose enclosing module / file has it at the top.
+
+For each visited signature: stringify every input type and the return type via `quote::ToTokens::to_token_stream().to_string()`, then check the resulting string for substrings `SqlitePool`, `SqliteConnection`, `sqlx::Pool`, `sqlx::Transaction`, `sqlite::Pool`, `Pool<Sqlite>`, `Transaction<'_, Sqlite>`.  Use a small list of substrings, not regex — false positives in test fixtures are caught by the `services/` exemption.
 
 - [ ] **Step 3: Build + test, then deliberately inject a violation to confirm catch.**
 
@@ -1750,3 +1986,31 @@ git push origin rust-gateway
 - **`lnd` monotonicity source-of-truth.**  Tracked as `PRRO_GATE-ddn`.
 
 After M2 lands, the next plan to write is the M3 write-path implementation plan, which will compose `prro::crypto`, `prro::transports::dps`, and `services::cert_refresher` from this plan into the staged pipeline and resolve the M3-side follow-ups above.
+
+---
+
+## Revision history
+
+- **2026-05-04** initial plan (commit `617b274`).
+- **2026-05-05** docs-fix pass after pre-implementation review found 10
+  divergences between plan code blocks and reality (real `prro_crypto`
+  API + actual `fiscal_server.proto` + M1 `operator_certs` PK shape):
+  W1 `SigningSession` reshaped to `Arc<Inner>` carrying
+  `Zeroizing<[u8; 32]>` matching `ExtractedKey.param_d`; W1
+  `sign_cms_detached` rewritten against the real
+  `sign_detached_with_content_digest(profile, cert_der, content_digest, &dyn RawSigner)`
+  signature; W1 `spawn_blocking` now moves an `Arc<SigningSession>`
+  clone (no plaintext copy); W2 split into `RefreshedInPlace` (same-SKI
+  UPDATE) vs `RefreshedKeyRoll` (stage + flip) to avoid PK conflict on
+  `operator_certs.ski_hex`; W2 multi-URL routing reads from a new
+  `006_ca_endpoints.sql` migration vendoring legacy
+  `sql/016_ca_endpoints.sql` (with `/services/cmp/` suffix in seeded
+  URLs); W2 `parse_iso8601` and `compute_ski_hex` propagate typed
+  `RefreshError` instead of `Utc::now()` fail-open / `expect()` panic;
+  W3 proto package `com.programika.rro.ws.chk` and service
+  `ChkIncomeService` (5 RPCs: `sendChkV2` / `lastChk` / `ping` /
+  `statusRro` / `infoRro`); W3 `CheckResponse` shape is `id` /
+  `status` / `id_sign` / `data_sign` / `error_message` (no
+  `fns_data`); W5 scanner extended to walk `ItemTrait` /
+  `TraitItemFn` so the trait surface (the actual M2 public API) is
+  not missed.

@@ -445,8 +445,13 @@ against verified inputs.
 ---
 
 **Review status:** approved 2026-05-04 (after two review rounds; six
-findings closed in commits `7e154bd` and `25ad32a`).  W0-1 and W0-2
-resolved the DPS wire-format and CMP protocol risks; M2 implementation
-plan (W1+) remains gated by W0-3, the `prro_crypto` API audit.  The
-M2-W0 research / ADR-resolution mini-plan remains the active artifact
-until W0-3 lands.
+findings closed in commits `7e154bd` and `25ad32a`).  All three W0
+risks RESOLVED:
+- W0-1 (DPS wire = gRPC) — `1ad7492`, doc `docs/superpowers/specs/2026-05-04-m2-w0-1-dps-wire.md`.
+- W0-2 (CMP = IIT lookup-by-SKI, `prro_crypto::cms::cmp::fetch_cert_by_ski` ready) — `2c92907` + `32705e6`, doc `docs/superpowers/specs/2026-05-04-m2-w0-2-cmp-probe.md`.
+- W0-3 (`prro_crypto` API surface sufficient; `CryptoProvider` trait shape drafted) — `d58c881`, doc `docs/superpowers/specs/2026-05-04-m2-w0-3-prro-crypto-audit.md`.
+
+M2 implementation plan-writing is UNBLOCKED.  Active artefact: M2 W1+
+implementation plan at `docs/superpowers/plans/2026-05-04-m2-w1-implementation.md`
+(currently under docs-fix review; do NOT start coding from it until the
+review is closed).
