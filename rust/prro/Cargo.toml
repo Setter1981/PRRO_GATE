@@ -60,10 +60,3 @@ prro_escpos = { path = "../prro_escpos" }
 pretty_assertions = "1"
 tempfile = "3"
 
-[features]
-default = []
-# Exposes test-only constructors (e.g. `SigningSession::new_for_test`)
-# to integration tests in this crate's `tests/` tree.  NOT to be enabled
-# by production binaries — the only production path to a SigningSession
-# is through `crypto::unseal_jks`.
-test_helpers = []

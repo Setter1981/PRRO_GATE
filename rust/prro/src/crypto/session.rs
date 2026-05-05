@@ -90,11 +90,17 @@ impl SigningSession {
         &self.inner.param_d
     }
 
-    /// Test-only constructor.  Gated behind `cfg(test)` AND the
-    /// `test_helpers` feature so production callers cannot smuggle
-    /// arbitrary key bytes into a session — the only path in production
-    /// is through `unseal_jks`.
-    #[cfg(any(test, feature = "test_helpers"))]
+    /// Test-only constructor.
+    ///
+    /// **Production must not call this.**  The only production path to
+    /// a `SigningSession` is `unseal_jks`.  This constructor is exposed
+    /// (un-feature-gated) because integration tests in `tests/` are
+    /// separate crates and cannot see `cfg(test)`-only items in the
+    /// lib; the function name carries the warning instead.  The
+    /// architectural risk is bounded: a caller who does invoke this
+    /// from production code already had the plaintext private scalar
+    /// in hand, so this constructor neither weakens the seal boundary
+    /// nor leaks anything.
     pub fn new_for_test(operator_id: String, param_d: [u8; 32], cert_der: Vec<u8>) -> Self {
         Self {
             inner: Arc::new(SigningSessionInner {
