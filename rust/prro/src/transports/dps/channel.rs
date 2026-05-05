@@ -49,14 +49,35 @@ pub trait DpsChannel: Send + Sync {
     /// mock.  We expose the default here so impls cannot accidentally
     /// diverge: there is one canonical implementation living next to
     /// the trait definition.
+    /// Server-side fiscal-id lookup (PRRO_GATE-5js).
+    ///
+    /// DPS does not expose a direct "lookup by fiscal id" RPC.  The
+    /// canonical semantic per W0-1 is: send `lastChk(fn_sign)`, then
+    /// match `response.id` against the caller's `expected_id`:
+    ///
+    /// - `response.id` empty           → `DpsError::NotFound`
+    /// - `response.id != expected_id`  → `DpsError::ServerFiscalIdMismatch`
+    /// - `response.id == expected_id`  → `Ok(ack)`
+    ///
+    /// Default body lives in the trait so impls cannot diverge —
+    /// there is one canonical implementation.  C4 mock asserts the
+    /// match / mismatch / absent triple end-to-end.
     async fn by_server_fiscal_no(
         &self,
-        _fn_sign: &CheckSignBlob,
-        _expected_id: &str,
+        fn_sign: &CheckSignBlob,
+        expected_id: &str,
     ) -> Result<CheckAck, DpsError> {
-        Err(DpsError::Internal(
-            "W3-C3-not-yet-wired: by_server_fiscal_no semantic lands in C3".into(),
-        ))
+        let ack = self.last_chk(fn_sign).await?;
+        if ack.id.is_empty() {
+            return Err(DpsError::NotFound);
+        }
+        if ack.id != expected_id {
+            return Err(DpsError::ServerFiscalIdMismatch {
+                expected_id: expected_id.to_string(),
+                actual_id: ack.id,
+            });
+        }
+        Ok(ack)
     }
 
     /// Lookup by local-identity (per-FN local document number / lnd).

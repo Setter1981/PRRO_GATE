@@ -7,9 +7,10 @@
 //! test does not have to assert on prost-generated `Default::default`).
 //!
 //! Field set is the proto field set, mapped to plain owned types — no
-//! repr trick, no zero-copy borrow lifetimes.  C3 fills in the
-//! `From<gen::*>` / `Into<gen::*>` conversions; C2 only lands the
-//! shapes.
+//! repr trick, no zero-copy borrow lifetimes.  C3 (this commit) wires
+//! the `From<DpsCheckType> for gen::check::Type`, `From<CheckEnvelope>
+//! for gen::Check`, and `try_decode_*_response` dispatchers used by
+//! `GrpcDpsChannel`'s RPC bodies.
 
 /// Subset of `Check.Type` proto values the wrapper accepts.  `UNKNOWN`
 /// is intentionally absent — the proto's UNKNOWN means the field was
@@ -105,4 +106,184 @@ pub struct RroInfo {
     pub tins: String,
     pub lnum: i32,
     pub name_pay: String,
+}
+
+// ─── Typed-DTO ↔ generated-prost conversions (crate-private) ───────────
+
+use super::error::DpsError;
+use super::gen;
+
+impl From<DpsCheckType> for gen::check::Type {
+    fn from(t: DpsCheckType) -> Self {
+        match t {
+            DpsCheckType::Chk => gen::check::Type::Chk,
+            DpsCheckType::ZReport => gen::check::Type::Zreport,
+            DpsCheckType::ServiceChk => gen::check::Type::Servicechk,
+        }
+    }
+}
+
+impl From<CheckEnvelope> for gen::Check {
+    fn from(e: CheckEnvelope) -> Self {
+        gen::Check {
+            rro_fn: e.rro_fn,
+            date_time: e.date_time,
+            check_sign: e.check_sign,
+            local_number: e.local_number,
+            check_type: gen::check::Type::from(e.check_type) as i32,
+            id_offline: e.id_offline,
+            id_cancel: e.id_cancel,
+        }
+    }
+}
+
+impl From<&CheckSignBlob> for gen::CheckRequest {
+    fn from(b: &CheckSignBlob) -> Self {
+        gen::CheckRequest {
+            rro_fn_sign: b.0.clone(),
+        }
+    }
+}
+
+/// Dispatch a `gen::CheckResponse` onto either `Ok(CheckAck)` or a
+/// typed `DpsError`.  Status-code mapping (per W0-1 review):
+///
+/// - `Ok` (1) → `Ok(CheckAck)`
+/// - `Unknown` (0) → `Decode` (proto3 default = field was missing
+///   on the wire)
+/// - `ErrorVerefy` (-1) → `Authorization`
+/// - `ErrorNotRegisteredRro` (-13) → `Authorization`
+/// - `ErrorNotRegisteredSigner` (-14) → `Authorization`
+/// - `ErrorUnknown` (-4) → `Transport` (retry-class per W0-1 D3; the
+///   wire error is not stable enough to mark the FN broken — back
+///   off + retry)
+/// - everything else → `Server { code, message }`
+pub(crate) fn try_decode_check_response(r: gen::CheckResponse) -> Result<CheckAck, DpsError> {
+    use gen::check_response::Status;
+    let st = Status::try_from(r.status).map_err(|_| {
+        DpsError::Decode(format!(
+            "unknown CheckResponse.status raw value {}",
+            r.status
+        ))
+    })?;
+    match st {
+        Status::Ok => Ok(CheckAck {
+            id: r.id,
+            id_sign: r.id_sign,
+            data_sign: r.data_sign,
+        }),
+        Status::Unknown => Err(DpsError::Decode(
+            "CheckResponse.status missing on the wire (Unknown=0)".into(),
+        )),
+        Status::ErrorVerefy | Status::ErrorNotRegisteredRro | Status::ErrorNotRegisteredSigner => {
+            Err(DpsError::Authorization(format!(
+                "{}: {}",
+                st.as_str_name(),
+                r.error_message
+            )))
+        }
+        Status::ErrorUnknown => Err(DpsError::Transport(format!(
+            "ERROR_UNKNOWN (-4) — retry-class per W0-1 D3: {}",
+            r.error_message
+        ))),
+        other => Err(DpsError::Server {
+            code: other as i32,
+            message: r.error_message,
+        }),
+    }
+}
+
+/// Same dispatch shape for `StatusResponse` — the proto's status enum
+/// is a strict subset of `CheckResponse`'s, so the routing rules
+/// match one-to-one.
+pub(crate) fn try_decode_status_response(
+    r: gen::StatusResponse,
+) -> Result<StatusSnapshot, DpsError> {
+    use gen::status_response::Status;
+    let st = Status::try_from(r.status).map_err(|_| {
+        DpsError::Decode(format!(
+            "unknown StatusResponse.status raw value {}",
+            r.status
+        ))
+    })?;
+    match st {
+        Status::Ok => Ok(StatusSnapshot {
+            open_shift: r.open_shift,
+            online: r.online,
+            last_signer: r.last_signer,
+        }),
+        Status::Unknown => Err(DpsError::Decode(
+            "StatusResponse.status missing on the wire (Unknown=0)".into(),
+        )),
+        Status::ErrorVerefy | Status::ErrorNotRegisteredRro | Status::ErrorNotRegisteredSigner => {
+            Err(DpsError::Authorization(format!(
+                "{}: {}",
+                st.as_str_name(),
+                r.error_message
+            )))
+        }
+        Status::ErrorUnknown => Err(DpsError::Transport(format!(
+            "ERROR_UNKNOWN (-4) — retry-class per W0-1 D3: {}",
+            r.error_message
+        ))),
+        other => Err(DpsError::Server {
+            code: other as i32,
+            message: r.error_message,
+        }),
+    }
+}
+
+/// Same dispatch shape for `RroInfoResponse`.  `RroInfoResponse` does
+/// not carry an `error_message` field, so server-side errors here
+/// surface with an empty message; callers that need to render it
+/// fall back to the typed status code.
+pub(crate) fn try_decode_rro_info_response(r: gen::RroInfoResponse) -> Result<RroInfo, DpsError> {
+    use gen::rro_info_response::Status;
+    let st = Status::try_from(r.status).map_err(|_| {
+        DpsError::Decode(format!(
+            "unknown RroInfoResponse.status raw value {}",
+            r.status
+        ))
+    })?;
+    match st {
+        Status::Ok => Ok(RroInfo {
+            status_rro: r.status_rro,
+            open_shift: r.open_shift,
+            online: r.online,
+            last_signer: r.last_signer,
+            name: r.name,
+            name_to: r.name_to,
+            addr: r.addr,
+            single_tax: r.single_tax,
+            offline_allowed: r.offline_allowed,
+            add_num: r.add_num,
+            pn: r.pn,
+            operators: r
+                .operators
+                .into_iter()
+                .map(|o| DpsOperator {
+                    serial: o.serial,
+                    status: o.status,
+                    senior: o.senior,
+                    isname: o.isname,
+                })
+                .collect(),
+            tins: r.tins,
+            lnum: r.lnum,
+            name_pay: r.name_pay,
+        }),
+        Status::Unknown => Err(DpsError::Decode(
+            "RroInfoResponse.status missing on the wire (Unknown=0)".into(),
+        )),
+        Status::ErrorVerefy | Status::ErrorNotRegisteredRro | Status::ErrorNotRegisteredSigner => {
+            Err(DpsError::Authorization(st.as_str_name().to_string()))
+        }
+        Status::ErrorUnknown => Err(DpsError::Transport(
+            "ERROR_UNKNOWN (-4) on RroInfoResponse — retry-class per W0-1 D3".into(),
+        )),
+        other => Err(DpsError::Server {
+            code: other as i32,
+            message: String::new(),
+        }),
+    }
 }

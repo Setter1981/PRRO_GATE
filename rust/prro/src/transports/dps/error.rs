@@ -1,11 +1,12 @@
 //! Typed error surface for the DPS gRPC transport.
 //!
-//! Six variants cover the failure modes a `DpsChannel` caller has to
-//! make routing decisions on (retry now, fall back, mark FN broken,
-//! escalate to operator).  The categories are protocol-shape, not
-//! error-source: a `tonic::Status::with_code(GRPC_UNAVAILABLE)` and a
-//! TCP connect-refused both surface as `Transport`, because the
-//! caller's response is the same — back off + retry.
+//! Eight variants cover the failure modes a `DpsChannel` caller has
+//! to make routing decisions on (retry now, fall back, mark FN
+//! broken, escalate to operator, classify by-id-lookup outcome,
+//! reject unsupported queries).  The categories are protocol-shape,
+//! not error-source: a `tonic::Status::with_code(GRPC_UNAVAILABLE)`
+//! and a TCP connect-refused both surface as `Transport`, because
+//! the caller's response is the same — back off + retry.
 
 use thiserror::Error;
 
