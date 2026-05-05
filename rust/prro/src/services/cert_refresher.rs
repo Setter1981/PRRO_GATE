@@ -284,6 +284,11 @@ async fn in_place_refresh(
 ) -> Result<(), RefreshError> {
     let new_cert = new_cert_der.to_vec();
     let parsed = parsed.clone();
+    // Hash BEFORE the tx opens — invariant #1: no crypto inside a
+    // SQLite write-tx (SHA-256 is small but the rule is strict, and
+    // W5's static check encodes the spirit of "crypto strictly
+    // precedes the with_immediate boundary").
+    let fingerprint = compute_fingerprint(&new_cert);
     with_immediate(pool, move |conn| {
         Box::pin(async move {
             let now_iso = Utc::now().to_rfc3339();
@@ -296,7 +301,7 @@ async fn in_place_refresh(
                  WHERE ski_hex = ? AND active = 1",
             )
             .bind(&new_cert)
-            .bind(compute_fingerprint(&new_cert))
+            .bind(&fingerprint)
             .bind(&parsed.valid_from)
             .bind(&parsed.valid_to)
             .bind(&parsed.subject_dn)
@@ -353,6 +358,10 @@ pub(crate) async fn key_roll_atomic(
     let active_ski = active_ski.to_string();
     let new_cert = new_cert_der.to_vec();
     let parsed = parsed.clone();
+    // Hash BEFORE the tx opens — invariant #1.  Same rule as
+    // in_place_refresh; W5's static check encodes the spirit of
+    // "crypto strictly precedes the with_immediate boundary".
+    let fingerprint = compute_fingerprint(&new_cert);
     with_immediate(pool, move |conn| {
         Box::pin(async move {
             let now_iso = Utc::now().to_rfc3339();
@@ -381,7 +390,7 @@ pub(crate) async fn key_roll_atomic(
             )
             .bind(&parsed.ski_hex)
             .bind(&fn_id)
-            .bind(compute_fingerprint(&new_cert))
+            .bind(&fingerprint)
             .bind(&new_cert)
             .bind(&parsed.valid_from)
             .bind(&parsed.valid_to)
