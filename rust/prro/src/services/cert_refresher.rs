@@ -1,9 +1,5 @@
 //! Async cert refresh service (M2/W2).
 //!
-//! C1 landed the module seam + migration 006.  C2 (this commit) lands
-//! the substrate: types, helpers, and pure read paths.  No write-path
-//! side effects.  The transactional `refresh_for_fn` body lands in C3.
-//!
 //! Pipeline (per ADR-M2-4 + ADR-M2-6):
 //!
 //! 1. Load FN row + `cert_provisioning_config` + `ca_endpoints` (DB
@@ -23,9 +19,13 @@
 //!    WHERE fiscal_number = excluded.fiscal_number AND active = 0`
 //!    (idempotent stage that REFUSES to clobber foreign-owned or
 //!    active=1 rows), then `UPDATE … SET active=0 WHERE
-//!    fiscal_number=? AND active=1`, then `UPDATE … SET active=1
-//!    WHERE ski_hex=?`, then audit_log INSERT.  Atomic + idempotent
-//!    on retry (no orphan staged-row window).
+//!    fiscal_number=? AND ski_hex=? AND active=1` (the `ski_hex`
+//!    bind is the stale-read guard — if a concurrent writer flipped
+//!    the active cert between our read and this tx, the WHERE
+//!    filters us out → rows_affected==0 → typed error → ROLLBACK,
+//!    no audit emitted), then `UPDATE … SET active=1 WHERE
+//!    ski_hex=?`, then audit_log INSERT.  Atomic + idempotent on
+//!    retry (no orphan staged-row window).
 //! 8. Return `RefreshedInPlace { ski }` or `RefreshedKeyRoll { old, new }`.
 
 use std::sync::Arc;
@@ -338,7 +338,11 @@ async fn in_place_refresh(
 /// REPLACE is DELETE+INSERT and would silently wipe a foreign-owned
 /// cert row, destroying ownership / metadata for an unrelated
 /// operator.
-async fn key_roll_atomic(
+// `pub(crate)` so the regression test that simulates a stale-read race
+// can drive this function directly with a deliberately stale
+// `active_ski` argument — the in-memory ski we *thought* was active at
+// read time but which a concurrent writer has since swapped.
+pub(crate) async fn key_roll_atomic(
     pool: &SqlitePool,
     fn_id: &str,
     active_ski: &str,
@@ -396,17 +400,31 @@ async fn key_roll_atomic(
                 ));
             }
 
-            // Deactivate the old active row.
+            // Deactivate the old active row.  WHERE clause is bound on
+            // BOTH `fiscal_number` AND the EXACT `ski_hex` we read at
+            // the start of refresh_for_fn (before fetch + parse).  This
+            // is the stale-read guard: if another refresh / operator
+            // action concurrently swapped the active cert between our
+            // read and this with_immediate block, the WHERE filters us
+            // out → rows_affected == 0 → typed error → ROLLBACK → the
+            // already-newly-active row stays untouched and no audit
+            // entry is emitted (the INSERT below never executes).
+            // Without binding ski_hex, this UPDATE would silently
+            // deactivate whatever is currently active and the next
+            // UPDATE would promote a cert derived from a stale read
+            // — a real wrong-cert-on-the-wire bug.
             let r1 = sqlx::query(
                 "UPDATE operator_certs SET active = 0 \
-                 WHERE fiscal_number = ? AND active = 1",
+                 WHERE fiscal_number = ? AND ski_hex = ? AND active = 1",
             )
             .bind(&fn_id)
+            .bind(&active_ski)
             .execute(&mut *conn)
             .await?;
             if r1.rows_affected() != 1 {
                 return Err(anyhow::anyhow!(
-                    "key-roll deactivate: expected 1 row, got {}",
+                    "key-roll deactivate: stale-read or concurrent swap detected \
+                     (fn={fn_id} expected_active_ski={active_ski} rows_affected={})",
                     r1.rows_affected()
                 ));
             }
@@ -624,5 +642,169 @@ mod helper_tests {
             reason: FetchKind::TransportError,
         });
         assert!(matches!(e, RefreshError::Crypto(_)));
+    }
+}
+
+// ─── Stale-read race regression (in-tree so it can drive the pub(crate)
+//      key_roll_atomic with a deliberately stale active_ski) ───────────
+
+#[cfg(test)]
+mod stale_read_tests {
+    use super::*;
+
+    /// Vendored DSTU 4145 cert; same fixture
+    /// `cert_refresher_branches.rs` uses for branch coverage.  Lets us
+    /// produce a `ParsedCertMetadata` from a real cert without hand-
+    /// crafting one (`ParsedCertMetadata` is `pub(crate)`).
+    const FIXTURE_CERT_DER: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../prro_crypto/node_modules/jkurwa/test/data/SELF_SIGNED_ENC_6929.cer"
+    ));
+
+    async fn fresh_pool_with_fn(fn_id: &str) -> (tempfile::TempDir, sqlx::SqlitePool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = crate::db::open_pool(&dir.path().join("m.db"))
+            .await
+            .expect("open_pool runs migrations");
+        sqlx::query(
+            "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+             VALUES (?, '12345678', 'test')",
+        )
+        .bind(fn_id)
+        .execute(&pool)
+        .await
+        .expect("seed FN row");
+        (dir, pool)
+    }
+
+    /// Stage an `operator_certs` row at the given `ski_hex` + `active`
+    /// flag.  Used to simulate the post-race state where another
+    /// writer has already swapped the active cert.
+    async fn stage_cert(pool: &sqlx::SqlitePool, fn_id: &str, ski_hex: &str, active: i64) {
+        let valid_to_soon = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO operator_certs( \
+                 ski_hex, fiscal_number, cert_fingerprint, cert_der, \
+                 valid_from, valid_to, subject_dn, issuer_dn, \
+                 fetched_at, source, active) \
+             VALUES (?, ?, 'fp', x'00', \
+                     '2020-01-01T00:00:00Z', ?, \
+                     'CN=stage', 'CN=stage-issuer', \
+                     '2020-01-01T00:00:00Z', 'manual', ?)",
+        )
+        .bind(ski_hex)
+        .bind(fn_id)
+        .bind(&valid_to_soon)
+        .bind(active)
+        .execute(pool)
+        .await
+        .expect("stage cert row");
+    }
+
+    /// **Regression — stale-read race in `key_roll_atomic`.**
+    ///
+    /// Models the race where `refresh_for_fn` reads `active_ski = X`,
+    /// then performs a network fetch + parse (during which time another
+    /// writer flips the active cert from X → Y), then enters
+    /// `with_immediate` armed with the stale `active_ski = X`.
+    ///
+    /// Pre-fix, the deactivate UPDATE used `WHERE fn = ? AND active = 1`
+    /// — it would silently deactivate Y (the freshly-active row),
+    /// activate the cert derived from the stale X read, and emit an
+    /// audit entry citing X→new — a wrong-cert-on-the-wire bug.
+    ///
+    /// Post-fix, the deactivate UPDATE uses
+    /// `WHERE fn = ? AND ski_hex = ? AND active = 1` bound on `X`.
+    /// The WHERE filters us out (current active is Y, not X) →
+    /// rows_affected == 0 → typed `RefreshError::Db` → `with_immediate`
+    /// ROLLBACKs.  The newly-active row Y stays untouched; no audit
+    /// entry is emitted (the audit INSERT runs AFTER the deactivate
+    /// guard inside the same tx).
+    #[tokio::test]
+    async fn key_roll_atomic_detects_stale_active_ski_and_rolls_back() {
+        let fn_id = "1234567890";
+        let (_d, pool) = fresh_pool_with_fn(fn_id).await;
+
+        // The "winner" of the race: a different ski_hex took active=1
+        // between our read and our with_immediate block.
+        let stale_ski = "a".repeat(64); // what refresh_for_fn THOUGHT was active
+        let winner_ski = "b".repeat(64); // what actually IS active now
+        stage_cert(&pool, fn_id, &winner_ski, 1).await;
+
+        // ParsedCertMetadata: build via the public path so the SKI is
+        // a real DSTU SKI distinct from both stale and winner.
+        let parsed = parse_cert_metadata(FIXTURE_CERT_DER)
+            .expect("fixture must parse via prro_crypto::parse_cert_basic_fields");
+        assert_ne!(parsed.ski_hex, stale_ski);
+        assert_ne!(parsed.ski_hex, winner_ski);
+
+        // Drive key_roll_atomic with the stale ski.  Must surface a
+        // typed RefreshError::Db (the with_immediate maps the
+        // anyhow::anyhow! bail into RefreshError::Db) and ROLLBACK.
+        let err = key_roll_atomic(&pool, fn_id, &stale_ski, FIXTURE_CERT_DER, &parsed)
+            .await
+            .expect_err("stale active_ski must surface a typed error");
+        let msg = format!("{err:?}");
+        assert!(
+            matches!(err, RefreshError::Db(_)),
+            "expected Db-wrapped failure; got {msg}"
+        );
+        // Diagnostic substring: the error message names BOTH the
+        // expected-stale ski AND "stale-read or concurrent swap".
+        // Lets an operator immediately classify the failure mode.
+        assert!(
+            msg.contains("stale-read") || msg.contains("concurrent swap"),
+            "diagnostic must name the stale-read class; got {msg}"
+        );
+        assert!(
+            msg.contains(&stale_ski),
+            "diagnostic must name the expected_active_ski; got {msg}"
+        );
+
+        // Post-conditions: no DB corruption.
+        //   - winner_ski is STILL the only active=1 row
+        //   - the stage row from the stale-driven attempt is NOT present
+        //     (with_immediate ROLLBACKed before COMMIT)
+        //   - no audit_log entry for cert_refresh_key_roll
+        let active_rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT ski_hex, active FROM operator_certs WHERE fiscal_number = ?")
+                .bind(fn_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let actives: Vec<&(String, i64)> = active_rows.iter().filter(|(_, a)| *a == 1).collect();
+        assert_eq!(
+            actives.len(),
+            1,
+            "exactly one active row must remain after rollback; got {active_rows:?}"
+        );
+        assert_eq!(
+            actives[0].0, winner_ski,
+            "active row must STILL be the winner; got {active_rows:?}"
+        );
+        // Stage row would have ski_hex == parsed.ski_hex.  Must NOT
+        // be present after rollback.
+        let stage_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM operator_certs WHERE fiscal_number = ? AND ski_hex = ?",
+        )
+        .bind(fn_id)
+        .bind(&parsed.ski_hex)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stage_count, 0,
+            "rolled-back stage row must not be visible post-tx"
+        );
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE event_type = 'cert_refresh_key_roll'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            audit_count, 0,
+            "no audit entry must be emitted when the tx ROLLBACKs"
+        );
     }
 }
