@@ -35,6 +35,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx::SqlitePool;
 
 use crate::crypto::{CryptoError, CryptoProvider};
+use crate::db::tx::with_immediate;
 
 /// Static configuration loaded from `cert_provisioning_config` at the
 /// start of every refresh cycle.  Held by value because the table has
@@ -184,18 +185,26 @@ pub(crate) async fn load_ca_urls(pool: &SqlitePool) -> sqlx::Result<Vec<String>>
     Ok(rows.into_iter().map(|(u,)| u).collect())
 }
 
-// ─── Public entry point (C2 skeleton; transactional body in C3) ────────
+// ─── Public entry point ────────────────────────────────────────────────
 
-/// Refresh the operator cert for `fn_id` if it is within the
-/// configured `refresh_within_days` window.  C2 (this commit) only
-/// lands the read-side of the pipeline — the transactional body
-/// (in-place UPDATE / key-roll inside `with_immediate`) lands in C3.
+/// Refresh the operator cert for `fn_id` if it is within the configured
+/// `refresh_within_days` window.
 ///
-/// Until C3 lands, any caller hitting the `Refreshed*` branches
-/// receives `RefreshError::Db("C3-not-yet-landed: …")` so the gap is
-/// loud, not silent.  The eligibility-check branch (`NoChange`) IS
-/// fully functional in C2 — that path covers the most common runtime
-/// outcome (a cert is checked, found still good, returns NoChange).
+/// Pipeline (per ADR-M2-4 + ADR-M2-6):
+///
+/// 1. Read-only: load config, active cert, CA URL list — all OUTSIDE
+///    any tx (invariant #1: no network/crypto inside a tx).
+/// 2. Eligibility check: `valid_to - now > refresh_within_days` →
+///    `NoChange`.
+/// 3. Fetch the new cert via `provider.fetch_cert_by_ski` — also
+///    outside any tx.
+/// 4. Parse the new cert's metadata (SKI, validity, DNs).
+/// 5. Branch on SKI:
+///    - new SKI == active SKI → `in_place_refresh` (single short tx;
+///      `rows_affected == 1` strict).
+///    - new SKI != active SKI → `key_roll_atomic` inside ONE
+///      `with_immediate` block (stage + flip + audit; all three
+///      `rows_affected == 1` strict).
 pub async fn refresh_for_fn(
     pool: &SqlitePool,
     fn_id: &str,
@@ -229,29 +238,209 @@ pub async fn refresh_for_fn(
             field: reason,
         })?;
 
+    // Network call OUTSIDE any tx — invariant #1.  W5 will static-assert
+    // that no fetch happens inside `with_immediate`; this is the
+    // "before" half of that contract.
     let new_cert = provider
         .fetch_cert_by_ski(&urls, &ski_bytes, cfg.cmp_request_timeout)
         .await
         .map_err(map_crypto_to_refresh)?;
 
+    // Parse OUTSIDE any tx — `parse_cert_basic_fields` reads cert DER
+    // bytes; no DB / network traffic.
     let parsed = parse_cert_metadata(&new_cert.0)?;
-    // C3 will persist all five fields below into operator_certs; for C2
-    // we touch each one to keep the compiler honest about the type's
-    // shape and keep the dead-code warning silent.
-    let _ = (
-        compute_fingerprint(&new_cert.0),
-        &parsed.valid_from,
-        &parsed.valid_to,
-        &parsed.subject_dn,
-        &parsed.issuer_dn,
-    );
 
-    // C3-fence: writing the new cert (in-place or via key-roll) lands in C3.
-    Err(RefreshError::Db(format!(
-        "C3-not-yet-landed: cert fetched (ski={ski}) but transactional refresh body \
-         is gated on the next commit; rerun once C3 ships",
-        ski = parsed.ski_hex,
-    )))
+    // Branch decision is made on SKI equality.  Both branches now
+    // perform writes; either path drops into a tx after this point.
+    if parsed.ski_hex == active.ski_hex {
+        in_place_refresh(pool, &new_cert.0, &parsed).await?;
+        Ok(RefreshOutcome::RefreshedInPlace {
+            ski: parsed.ski_hex,
+        })
+    } else {
+        let ski_old = active.ski_hex.clone();
+        let ski_new = parsed.ski_hex.clone();
+        key_roll_atomic(pool, fn_id, &active.ski_hex, &new_cert.0, &parsed).await?;
+        Ok(RefreshOutcome::RefreshedKeyRoll { ski_old, ski_new })
+    }
+}
+
+/// Same-SKI refresh: cert reissued, key unchanged.
+///
+/// One short tx UPDATEs the existing `active=1` row.  Asserts
+/// `rows_affected == 1` — a 0-row outcome means the active row was
+/// concurrently deactivated by another writer (or the partial unique
+/// index `ux_op_certs_active_per_fn` was violated upstream); both are
+/// real bugs we surface as a typed error rather than absorb silently.
+///
+/// Wrapped in `with_immediate` because (a) it involves a write
+/// (BEGIN IMMEDIATE acquires the RESERVED lock from the first
+/// statement; spec decision #39) and (b) consistency with the
+/// key-roll path simplifies the W5 static check.
+async fn in_place_refresh(
+    pool: &SqlitePool,
+    new_cert_der: &[u8],
+    parsed: &ParsedCertMetadata,
+) -> Result<(), RefreshError> {
+    let new_cert = new_cert_der.to_vec();
+    let parsed = parsed.clone();
+    with_immediate(pool, move |conn| {
+        Box::pin(async move {
+            let now_iso = Utc::now().to_rfc3339();
+            let r = sqlx::query(
+                "UPDATE operator_certs \
+                 SET cert_der = ?, cert_fingerprint = ?, \
+                     valid_from = ?, valid_to = ?, \
+                     subject_dn = ?, issuer_dn = ?, \
+                     fetched_at = ?, last_refresh_at = ? \
+                 WHERE ski_hex = ? AND active = 1",
+            )
+            .bind(&new_cert)
+            .bind(compute_fingerprint(&new_cert))
+            .bind(&parsed.valid_from)
+            .bind(&parsed.valid_to)
+            .bind(&parsed.subject_dn)
+            .bind(&parsed.issuer_dn)
+            .bind(&now_iso)
+            .bind(&now_iso)
+            .bind(&parsed.ski_hex)
+            .execute(&mut *conn)
+            .await?;
+            if r.rows_affected() != 1 {
+                return Err(anyhow::anyhow!(
+                    "in_place_refresh: expected 1 row, got {} for ski={}",
+                    r.rows_affected(),
+                    parsed.ski_hex
+                ));
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| RefreshError::Db(e.to_string()))
+}
+
+/// Key-roll: new cert carries a different SKI than the current active
+/// row.  Stage + flip + audit run inside ONE `with_immediate` tx so the
+/// operation is atomic AND idempotent on retry — a crash before COMMIT
+/// leaves no orphan staged row (tx never committed); a crash AFTER
+/// COMMIT means the row is already there with active=1, so a
+/// subsequent refresh_for_fn call sees `valid_to - now >
+/// refresh_within_days` and returns NoChange.
+///
+/// The stage uses `INSERT … ON CONFLICT(ski_hex) DO UPDATE … WHERE
+/// operator_certs.fiscal_number = excluded.fiscal_number AND
+/// operator_certs.active = 0` — so a stale staged row from a prior
+/// interrupted refresh (same fn, active=0) is harmlessly overwritten,
+/// while a foreign-owned `ski_hex` (different fn) or an `active=1`
+/// row is REFUSED (sqlite_constraint or `rows_affected==0` → typed
+/// error → with_immediate ROLLBACKs).  Why NOT `INSERT OR REPLACE`:
+/// REPLACE is DELETE+INSERT and would silently wipe a foreign-owned
+/// cert row, destroying ownership / metadata for an unrelated
+/// operator.
+async fn key_roll_atomic(
+    pool: &SqlitePool,
+    fn_id: &str,
+    active_ski: &str,
+    new_cert_der: &[u8],
+    parsed: &ParsedCertMetadata,
+) -> Result<(), RefreshError> {
+    let fn_id = fn_id.to_string();
+    let active_ski = active_ski.to_string();
+    let new_cert = new_cert_der.to_vec();
+    let parsed = parsed.clone();
+    with_immediate(pool, move |conn| {
+        Box::pin(async move {
+            let now_iso = Utc::now().to_rfc3339();
+
+            // Stage at active=0.  ON CONFLICT(ski_hex) guard restricts
+            // the UPDATE to a same-fiscal_number, active=0 row only —
+            // foreign rows or active=1 rows produce rows_affected==0
+            // (the WHERE filter excluded them) and we abort the tx.
+            let stage_result = sqlx::query(
+                "INSERT INTO operator_certs( \
+                     ski_hex, fiscal_number, cert_fingerprint, cert_der, \
+                     valid_from, valid_to, subject_dn, issuer_dn, \
+                     fetched_at, source, active) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'cmp', 0) \
+                 ON CONFLICT(ski_hex) DO UPDATE SET \
+                     cert_fingerprint = excluded.cert_fingerprint, \
+                     cert_der         = excluded.cert_der, \
+                     valid_from       = excluded.valid_from, \
+                     valid_to         = excluded.valid_to, \
+                     subject_dn       = excluded.subject_dn, \
+                     issuer_dn        = excluded.issuer_dn, \
+                     fetched_at       = excluded.fetched_at, \
+                     source           = excluded.source \
+                 WHERE operator_certs.fiscal_number = excluded.fiscal_number \
+                   AND operator_certs.active = 0",
+            )
+            .bind(&parsed.ski_hex)
+            .bind(&fn_id)
+            .bind(compute_fingerprint(&new_cert))
+            .bind(&new_cert)
+            .bind(&parsed.valid_from)
+            .bind(&parsed.valid_to)
+            .bind(&parsed.subject_dn)
+            .bind(&parsed.issuer_dn)
+            .bind(&now_iso)
+            .execute(&mut *conn)
+            .await?;
+            if stage_result.rows_affected() != 1 {
+                return Err(anyhow::anyhow!(
+                    "key-roll stage: ski_hex {} already exists for a different \
+                     fiscal_number or is already active=1; refusing to overwrite \
+                     (rows_affected={})",
+                    parsed.ski_hex,
+                    stage_result.rows_affected()
+                ));
+            }
+
+            // Deactivate the old active row.
+            let r1 = sqlx::query(
+                "UPDATE operator_certs SET active = 0 \
+                 WHERE fiscal_number = ? AND active = 1",
+            )
+            .bind(&fn_id)
+            .execute(&mut *conn)
+            .await?;
+            if r1.rows_affected() != 1 {
+                return Err(anyhow::anyhow!(
+                    "key-roll deactivate: expected 1 row, got {}",
+                    r1.rows_affected()
+                ));
+            }
+
+            // Activate the new row.
+            let r2 = sqlx::query("UPDATE operator_certs SET active = 1 WHERE ski_hex = ?")
+                .bind(&parsed.ski_hex)
+                .execute(&mut *conn)
+                .await?;
+            if r2.rows_affected() != 1 {
+                return Err(anyhow::anyhow!(
+                    "key-roll activate: expected 1 row, got {}",
+                    r2.rows_affected()
+                ));
+            }
+
+            // Audit trail in the same tx.
+            sqlx::query(
+                "INSERT INTO audit_log( \
+                     entity_type, entity_id, event_type, severity, actor, event_payload_json) \
+                 VALUES ('fn', ?, 'cert_refresh_key_roll', 'INFO', 'cert_refresher', ?)",
+            )
+            .bind(&fn_id)
+            .bind(format!(
+                r#"{{"ski_old":"{active_ski}","ski_new":"{}"}}"#,
+                parsed.ski_hex
+            ))
+            .execute(&mut *conn)
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| RefreshError::Db(e.to_string()))
 }
 
 // ─── Pure helpers (no DB, no network) ──────────────────────────────────
