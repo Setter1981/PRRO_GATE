@@ -40,10 +40,14 @@ pub struct GrpcDpsChannel {
     /// `channel`.
     #[allow(dead_code)] // diagnostic logging surface — wired in M3 ops layer
     endpoint: String,
-    /// Default per-call deadline applied to every RPC.  Configured on
-    /// the `Endpoint` at construction time so every clone of the
-    /// channel inherits the same deadline; not re-applied per call.
-    #[allow(dead_code)] // documented contract; tonic Endpoint enforces it
+    /// Default per-call deadline.  Applied at TWO layers:
+    ///   1. `Endpoint::timeout` at construction (covers connect /
+    ///      handshake / generic transport-level stalls).
+    ///   2. `tonic::Request::set_timeout` on every per-call request
+    ///      (writes the `grpc-timeout` HTTP/2 metadata header that
+    ///      tonic 0.12 honours as the gRPC deadline; without this
+    ///      the server has no deadline visibility and a hung server
+    ///      could keep the call open past `Endpoint::timeout`).
     request_timeout: Duration,
     channel: Channel,
 }
@@ -77,6 +81,20 @@ impl GrpcDpsChannel {
     fn client(&self) -> ChkIncomeServiceClient<Channel> {
         ChkIncomeServiceClient::new(self.channel.clone())
     }
+
+    /// Wrap a request payload in a `tonic::Request` with the
+    /// `grpc-timeout` metadata header set to `self.request_timeout`.
+    /// `Endpoint::timeout` alone is not enough — it covers transport
+    /// stalls but does NOT write the gRPC deadline header, so a
+    /// server that holds a unary call open indefinitely could blow
+    /// past the configured deadline.  `Request::set_timeout` is the
+    /// tonic 0.12-documented way to set the gRPC deadline (W0-1
+    /// review finding).
+    fn request<T>(&self, payload: T) -> tonic::Request<T> {
+        let mut req = tonic::Request::new(payload);
+        req.set_timeout(self.request_timeout);
+        req
+    }
 }
 
 /// Map a `tonic::Status` (gRPC-level error) to a `DpsError` per the
@@ -101,7 +119,7 @@ fn map_tonic_status(s: Status) -> DpsError {
 #[async_trait]
 impl DpsChannel for GrpcDpsChannel {
     async fn send_chk(&self, envelope: CheckEnvelope) -> Result<CheckAck, DpsError> {
-        let req = tonic::Request::new(envelope.into());
+        let req = self.request(envelope.into());
         let resp = self
             .client()
             .send_chk_v2(req)
@@ -111,7 +129,7 @@ impl DpsChannel for GrpcDpsChannel {
     }
 
     async fn last_chk(&self, fn_sign: &CheckSignBlob) -> Result<CheckAck, DpsError> {
-        let req = tonic::Request::new(fn_sign.into());
+        let req = self.request(fn_sign.into());
         let resp = self
             .client()
             .last_chk(req)
@@ -121,13 +139,13 @@ impl DpsChannel for GrpcDpsChannel {
     }
 
     async fn ping(&self, envelope: CheckEnvelope) -> Result<CheckAck, DpsError> {
-        let req = tonic::Request::new(envelope.into());
+        let req = self.request(envelope.into());
         let resp = self.client().ping(req).await.map_err(map_tonic_status)?;
         try_decode_check_response(resp.into_inner())
     }
 
     async fn status_rro(&self, fn_sign: &CheckSignBlob) -> Result<StatusSnapshot, DpsError> {
-        let req = tonic::Request::new(fn_sign.into());
+        let req = self.request(fn_sign.into());
         let resp = self
             .client()
             .status_rro(req)
@@ -137,7 +155,7 @@ impl DpsChannel for GrpcDpsChannel {
     }
 
     async fn info_rro(&self, fn_sign: &CheckSignBlob) -> Result<RroInfo, DpsError> {
-        let req = tonic::Request::new(fn_sign.into());
+        let req = self.request(fn_sign.into());
         let resp = self
             .client()
             .info_rro(req)

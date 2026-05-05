@@ -37,18 +37,6 @@ pub trait DpsChannel: Send + Sync {
     /// tax mode).
     async fn info_rro(&self, fn_sign: &CheckSignBlob) -> Result<RroInfo, DpsError>;
 
-    /// "By server fiscal no" lookup — `lastChk(fn_sign) + response.id
-    /// match` (PRRO_GATE-5js).  The wire protocol does not expose a
-    /// direct lookup-by-id RPC; a caller asking "do you know fiscal
-    /// id X for this FN?" sends the FN signature, gets back the most
-    /// recent server-known id, and asserts it matches X.
-    ///
-    /// Default body in C2 is an `Internal` stub — no panic path, no
-    /// silent success.  C3 lands the real `last_chk` + match logic;
-    /// C4 covers the match / mismatch / absent triple with a tonic
-    /// mock.  We expose the default here so impls cannot accidentally
-    /// diverge: there is one canonical implementation living next to
-    /// the trait definition.
     /// Server-side fiscal-id lookup (PRRO_GATE-5js).
     ///
     /// DPS does not expose a direct "lookup by fiscal id" RPC.  The
