@@ -1295,10 +1295,15 @@ pub async fn refresh_for_fn(
     // committed); a crash AFTER COMMIT means the row is already there and
     // active=1 for the new SKI, so a subsequent refresh_for_fn call would
     // see `valid_to - now > refresh_within_days` and return NoChange.
-    // The stage uses INSERT OR REPLACE so a stale staged row from a prior
-    // fence (rare: only possible if a previous `with_immediate` succeeded
-    // its INSERT but failed both UPDATEs *and* the implicit ROLLBACK was
-    // skipped — defensive belt-and-braces) does not cause a PK conflict.
+    // The stage uses INSERT … ON CONFLICT(ski_hex) DO UPDATE WHERE
+    // operator_certs.fiscal_number = excluded.fiscal_number AND active = 0
+    // — so a stale staged row from a prior interrupted refresh (same fn,
+    // active=0) is harmlessly overwritten, while a foreign-owned ski_hex
+    // (different fn) or an active=1 row is REFUSED (sqlite_constraint or
+    // rows_affected==0 → typed error → with_immediate ROLLBACKs).  Why
+    // not INSERT OR REPLACE: REPLACE is DELETE+INSERT and would silently
+    // wipe a foreign-owned cert row, destroying ownership / metadata for
+    // an unrelated operator.
     let new_ski_for_tx = new_ski_hex.clone();
     let active_ski_for_tx = active_ski.clone();
     let fn_id_for_tx = fn_id_owned.clone();
