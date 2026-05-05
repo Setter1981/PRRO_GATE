@@ -2,12 +2,12 @@
   "planPath": "docs/superpowers/plans/2026-05-04-m2-w1-implementation.md",
   "specPath": "docs/superpowers/specs/2026-05-04-m2-pre-plan-adr.md",
   "scope": "M2 implementation — crypto wrapper, cert_refresher, DpsChannel + tonic mock, byte-equivalence goldens, ADR-M2-6 + ADR-M2-5 architectural gates.  Inputs: ADR (approved 2026-05-04) + W0-1/W0-2/W0-3 findings docs + PRRO_GATE-5js note.",
-  "lastUpdated": "2026-05-05T11:30:00Z",
+  "lastUpdated": "2026-05-05T12:00:00Z",
   "tasks": [
     {
       "id": 0,
       "subject": "Task 0: M2 bd epic + W0 follow-up cross-link (administrative)",
-      "status": "pending",
+      "status": "completed",
       "description": "Administrative ~30 min.  Create bd epic, link 6 follow-ups child-of.\n\n```json:metadata\n{\"files\":[],\"verifyCommand\":\"bd show <epic-id> --json | jq -r '.[0].title' | grep -q M2\",\"acceptanceCriteria\":[\"epic created\",\"6 follow-ups linked\",\"bd ready shows epic\"]}\n```"
     },
     {
