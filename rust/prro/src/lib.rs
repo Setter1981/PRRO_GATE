@@ -19,5 +19,6 @@ pub mod crypto;
 pub mod db;
 pub mod doctor;
 pub mod runtime;
+pub mod services;
 
 pub use app::App;

@@ -43,6 +43,9 @@ thiserror = "1"
 async-trait = "0.1"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
+# Cert refresher (M2 W2) — fingerprinting helper.
+sha2 = "0.10"
+
 # OS / fs
 fs4 = "0.9"
 
@@ -59,4 +62,8 @@ prro_escpos = { path = "../prro_escpos" }
 [dev-dependencies]
 pretty_assertions = "1"
 tempfile = "3"
+
+# M2 W2 cert_refresher smoke tests use wiremock as a byte-replay HTTP
+# server in place of a live CMP endpoint.
+wiremock = "0.6"
 

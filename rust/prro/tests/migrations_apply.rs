@@ -610,6 +610,65 @@ async fn migration_002_delete_related_receipt_blocked_by_self_referrer() {
 }
 
 #[tokio::test]
+async fn migration_006_ca_endpoints_table_and_seed_present() {
+    let (_d, pool) = fresh_pool().await;
+    // Table exists with the expected column set.
+    let cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
+        sqlx::query_as("PRAGMA table_info(ca_endpoints)")
+            .fetch_all(&pool)
+            .await
+            .expect("ca_endpoints must exist post-006");
+    let names: HashSet<String> = cols.iter().map(|c| c.1.clone()).collect();
+    for col in [
+        "id",
+        "name",
+        "cmp_url",
+        "issuer_pattern",
+        "priority",
+        "enabled",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            names.contains(col),
+            "ca_endpoints missing {col}; have {names:?}"
+        );
+    }
+
+    // Seed rows: both production CMP URLs MUST include the
+    // `/services/cmp/` path component (M1 default lacked it; W2's whole
+    // point is that ca_endpoints carries the correct URLs).
+    let urls: Vec<String> =
+        sqlx::query_scalar("SELECT cmp_url FROM ca_endpoints WHERE enabled = 1 ORDER BY priority")
+            .fetch_all(&pool)
+            .await
+            .expect("seed rows reachable");
+    assert!(
+        urls.iter().all(|u| u.contains("/services/cmp/")),
+        "all seeded ca_endpoints URLs must carry /services/cmp/ path; got {urls:?}"
+    );
+    assert!(
+        urls.iter().any(|u| u.contains("acskidd")),
+        "acskidd seed missing; got {urls:?}"
+    );
+    assert!(
+        urls.iter().any(|u| u.contains("ca.tax.gov.ua")),
+        "ca.tax.gov.ua seed missing; got {urls:?}"
+    );
+
+    // Partial index ix_ca_endpoints_priority must cover only enabled=1
+    // rows (pre-existing pattern from the legacy schema; W5's static
+    // check inspects index hygiene later).
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='ix_ca_endpoints_priority'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(index_count, 1, "ix_ca_endpoints_priority must exist");
+}
+
+#[tokio::test]
 async fn migration_001_strict_typing_rejects_text_in_int_column() {
     let (_d, pool) = fresh_pool().await;
     sqlx::query(
