@@ -39,6 +39,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "1"
 
+# Crypto wrapper (M2 W1) — secret-material discipline per ADR-M2-5.
+async-trait = "0.1"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+
 # OS / fs
 fs4 = "0.9"
 
@@ -55,3 +59,11 @@ prro_escpos = { path = "../prro_escpos" }
 [dev-dependencies]
 pretty_assertions = "1"
 tempfile = "3"
+
+[features]
+default = []
+# Exposes test-only constructors (e.g. `SigningSession::new_for_test`)
+# to integration tests in this crate's `tests/` tree.  NOT to be enabled
+# by production binaries — the only production path to a SigningSession
+# is through `crypto::unseal_jks`.
+test_helpers = []
