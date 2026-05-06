@@ -10,23 +10,34 @@
 //! W4 scope (revision 2026-05-06): four canonical-XML doc types per
 //! ADR-M2-3 + W4 plan:
 //!
-//! - `ShiftOpen` — `<C T="108">` + DI=0
-//! - `Sell`      — `<C T="0">`
-//! - `Return`    — `<C T="1">`
-//! - `ZReport`   — `<Z>` instead of `<C>`.  Per WebCheck +
-//!   DPS reality (`docs/webcheck_reverse/WEBCHECK_ANALYSIS.md:77`,
+//! - `ShiftOpen` — `<C T="108">` + `DI=0` + `<O>` + `<E>`.
+//! - `Sell` — `<C T="0">` containing `<P>` items + `<M>` payments +
+//!   closing `<E FN N NO SM TS>`.
+//! - `Return` — `<C T="1">` with the same body shape as `Sell`.
+//! - `ZReport` — `<Z NO="...">` containing `<M>` per-payment-type
+//!   totals + `<NC NI NO>` check counts.  Per WebCheck + DPS reality
+//!   (`docs/webcheck_reverse/WEBCHECK_ANALYSIS.md:77`,
 //!   `WebCheck/CreateDB.cs:624` doctype='80', DPS
-//!   `Check.Type::ZREPORT=2` in `fiscal_server.proto:24`),
-//!   `ZReport` IS the close-shift wire artifact.  There is no
-//!   separate `ShiftClose` variant; do NOT add one.
+//!   `Check.Type::ZREPORT=2` in `fiscal_server.proto:24`), `ZReport`
+//!   IS the close-shift wire artifact.  There is no separate
+//!   `ShiftClose` variant; do NOT add one.
 //!
 //! C1 (this commit) lands typed payload structs + the canonical-XML
 //! builder + unit tests.  Unit-level acceptance only — attribute
 //! alphabetical ordering, cp1251 byte mapping, escaping,
 //! deterministic output.  Byte-equivalence against the
 //! Python-captured goldens lands in C3.
-
-use std::fmt::Write as _;
+//!
+//! W4 first-round subset:  the typed payloads here mirror the Python
+//! `_build_check` / `_build_z_report` shapes for the SUBSET we ship
+//! goldens for in C2 — items/payments/closing-E for checks, and
+//! payment-summaries+check-count for Z-reports.  The omitted optional
+//! sections (per-item barcodes/excise/tax codes, per-item discounts,
+//! check-level discounts, header/footer text lines, EPZ payment
+//! attributes, TXS/IO/EPZ Z-report sections, tax_groups TX children
+//! inside `<E>`) are intentional — C2 fixtures will be designed
+//! against this subset, and tag/attr names ARE the Python names so a
+//! future expansion is purely additive.
 
 pub mod cp1251;
 
@@ -83,55 +94,96 @@ impl DocumentHeader {
 #[derive(Debug, Clone)]
 pub struct ShiftOpenPayload {
     pub header: DocumentHeader,
-    /// `<O SM=...>`.  Opening cash sum, string-formatted decimal
-    /// (e.g. `"0"`, `"1234"`).
-    pub opening_sum: String,
+    /// `<O SM=...>`.  Opening cash sum (kopecks).
+    pub opening_sum: i64,
 }
 
-/// SELL or RETURN check.  The `kind` discriminator picks
-/// `<C T="0">` (Sell) vs `<C T="1">` (Return); the rest of the body
-/// shape is identical.
+/// SELL or RETURN check.  The CanonicalDoc variant picks
+/// `<C T="0">` (Sell) vs `<C T="1">` (Return); body shape identical.
 #[derive(Debug, Clone)]
 pub struct CheckPayload {
     pub header: DocumentHeader,
-    /// Per-FN local document number (`<DAT DI=...>`).  Sell + Return
-    /// always emit a non-zero DI; SHIFT_OPEN forces DI=0.
+    /// Per-FN local document number (`<DAT DI=...>`).
     pub local_number: u32,
-    /// `<S SM=...>` — total sum across the receipt, string-formatted
-    /// decimal.
-    pub total_sum: String,
+    /// Line items emitted as `<P>` elements (W4 first-round subset:
+    /// six required attrs only, no barcodes / excise / tax codes).
     pub items: Vec<CheckItem>,
+    /// Payments emitted as `<M>` elements after items (W4 first-round
+    /// subset: four required attrs only, no EPZ / change / rounding).
+    pub payments: Vec<CheckPayment>,
+    /// `<E SM=...>` total (kopecks).  The closing `<E>` element
+    /// always emits `FN / N / NO / SM / TS` per ФСКО Table 23.
+    pub total_sum: i64,
 }
 
-/// Single line item inside a SELL/RETURN check.  Mirrors the Python
-/// `<P>` element shape; full ФСКО semantics (discounts, taxes,
-/// excise) are out of scope for C1 — the items list is just enough
-/// to exercise the canonical-XML byte stream.
+/// Single line item inside a SELL/RETURN check.  Mirrors Python
+/// `_build_check`'s `<P>` element with the W4 first-round attribute
+/// subset: `C / N / NM / PRC / Q / SM`.
 #[derive(Debug, Clone)]
 pub struct CheckItem {
     /// `<P C=...>`.  Item code (article SKU).
     pub code: String,
     /// `<P NM=...>`.  Item name.
     pub name: String,
-    /// `<P PR=...>`.  Per-unit price, string-formatted decimal.
-    pub price: String,
-    /// `<P AM=...>`.  Quantity, string-formatted decimal.
-    pub quantity: String,
-    /// `<P CS=...>`.  Line total, string-formatted decimal.
-    pub line_total: String,
+    /// `<P PRC=...>`.  Per-unit price (kopecks).
+    pub price: i64,
+    /// `<P Q=...>`.  Quantity (thousandths, per Python).
+    pub quantity: i64,
+    /// `<P SM=...>`.  Line total (kopecks).
+    pub sum: i64,
+}
+
+/// Single payment inside a SELL/RETURN check.  Mirrors Python's
+/// `<M>` shape with the W4 first-round attribute subset: `N / NM /
+/// SM / T`.
+#[derive(Debug, Clone)]
+pub struct CheckPayment {
+    /// `<M NM=...>`.  Payment-type display name (e.g. `"CASH"`).
+    pub name: String,
+    /// `<M SM=...>`.  Amount (kopecks).
+    pub sum: i64,
+    /// `<M T=...>`.  Type code: `"0"` cash, `"2"` non-cash.
+    pub type_code: String,
 }
 
 /// Z_REPORT — shift-close fiscal document.  Per WebCheck + DPS
 /// reality this DOUBLES as the CloseShift wire artifact; do NOT add
 /// a separate `ShiftClosePayload`.
+///
+/// W4 first-round subset: `<Z NO=...>` containing `<M>` per-payment-
+/// type sums and a single `<NC NI NO>` check-count footer.  Optional
+/// `<TXS>` / `<IO>` / `<EPZ>` sections from the Python serializer
+/// are deliberately omitted; C2 fixtures will be designed against
+/// this subset.
 #[derive(Debug, Clone)]
 pub struct ZReportPayload {
     pub header: DocumentHeader,
     pub local_number: u32,
-    /// Z-report total turnover, string-formatted decimal.
-    pub total_sum: String,
-    /// Document count for the shift.
-    pub doc_count: u32,
+    /// Per-payment-type aggregate sums.  Each entry emits one
+    /// `<M NM SMI SMO T>` element.
+    pub payments: Vec<ZReportPaymentSum>,
+    /// `<NC NI=... NO=...>` check counts.
+    pub check_count: ZReportCheckCount,
+}
+
+#[derive(Debug, Clone)]
+pub struct ZReportPaymentSum {
+    /// `<M NM=...>`.  Payment-type name (`"CASH"`, `"CARD"`, ...).
+    pub name: String,
+    /// `<M SMI=...>`.  Inflow sum (kopecks).
+    pub sum_in: i64,
+    /// `<M SMO=...>`.  Outflow sum (kopecks).
+    pub sum_out: i64,
+    /// `<M T=...>`.  `"0"` cash, `"2"` non-cash.
+    pub type_code: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ZReportCheckCount {
+    /// `<NC NI=...>`.  Sell-receipt count.
+    pub sell_count: u32,
+    /// `<NC NO=...>`.  Return-receipt count.
+    pub return_count: u32,
 }
 
 /// Top-level discriminated wrapper consumed by `build_canonical_xml`.
@@ -142,18 +194,13 @@ pub enum CanonicalDoc {
     Return(CheckPayload),
     /// CloseShift wire artifact (DPS Check.Type::ZREPORT=2; WebCheck
     /// CreateDB.cs:624 doctype='80').  No separate `ShiftClose`
-    /// variant — that would obscure the fact that there is one
-    /// fiscal doc on the wire, not two.
+    /// variant.
     ZReport(ZReportPayload),
 }
 
 // ─── Build entry point ────────────────────────────────────────────────
 
-/// Errors a builder run can surface.  Encoding errors are the only
-/// recoverable category: cp1251 cannot represent every Unicode char,
-/// and a surprise non-cp1251 string in a payload (e.g. emoji in a
-/// product name) would silently produce broken bytes if we let the
-/// encoder fall back to `?`.  Fail closed.
+/// Errors a builder run can surface.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum XmlBuildError {
     #[error("cp1251: cannot encode character {0:?} (U+{1:04X}) in payload field")]
@@ -173,14 +220,15 @@ pub fn build_canonical_xml(doc: &CanonicalDoc) -> Result<Vec<u8>, XmlBuildError>
     cp1251::encode(&out)
 }
 
-// ─── Per-doc emitters (mirror Python _build_* helpers) ────────────────
+// ─── Per-doc emitters (literal port of Python `_build_*` helpers) ─────
 
 fn emit_shift_open(p: &ShiftOpenPayload, out: &mut String) {
     let h = &p.header;
     open_rq(out, h);
     open_dat(out, h, "0");
     tag_attrs(out, "C", &[("T", "108")]);
-    tag_attrs(out, "O", &[("N", "1"), ("SM", &p.opening_sum), ("T", "0")]);
+    let opening = p.opening_sum.to_string();
+    tag_attrs(out, "O", &[("N", "1"), ("SM", &opening), ("T", "0")]);
     close(out, "O");
     tag_attrs(out, "E", &[("N", "2")]);
     close(out, "E");
@@ -194,26 +242,71 @@ fn emit_shift_open(p: &ShiftOpenPayload, out: &mut String) {
 fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
     let h = &p.header;
     open_rq(out, h);
-    open_dat(out, h, &p.local_number.to_string());
+    let di = p.local_number.to_string();
+    open_dat(out, h, &di);
     tag_attrs(out, "C", &[("T", c_type)]);
-    for (idx, it) in p.items.iter().enumerate() {
-        let n = (idx + 1).to_string();
+
+    // Item numbering N is shared across <P> + <M>; Python increments
+    // a single `item_no` counter.  Mirror that.
+    let mut item_no: u32 = 1;
+
+    for it in &p.items {
+        let n = item_no.to_string();
+        let prc = it.price.to_string();
+        let q = it.quantity.to_string();
+        let sm = it.sum.to_string();
+        // Python `_build_check` p_attrs: C, N, NM, PRC, Q, SM.
         tag_attrs(
             out,
             "P",
             &[
-                ("AM", &it.quantity),
                 ("C", &it.code),
-                ("CS", &it.line_total),
                 ("N", &n),
                 ("NM", &it.name),
-                ("PR", &it.price),
+                ("PRC", &prc),
+                ("Q", &q),
+                ("SM", &sm),
             ],
         );
         close(out, "P");
+        item_no += 1;
     }
-    tag_attrs(out, "S", &[("SM", &p.total_sum)]);
-    close(out, "S");
+
+    for pay in &p.payments {
+        let n = item_no.to_string();
+        let sm = pay.sum.to_string();
+        // Python `_build_check` m_attrs (subset): N, NM, SM, T.
+        tag_attrs(
+            out,
+            "M",
+            &[
+                ("N", &n),
+                ("NM", &pay.name),
+                ("SM", &sm),
+                ("T", &pay.type_code),
+            ],
+        );
+        close(out, "M");
+        item_no += 1;
+    }
+
+    // Closing <E FN N NO SM TS> per ФСКО Table 23 / Python
+    // `_build_e_element` no-tax-groups branch.
+    let e_n = item_no.to_string();
+    let e_no = p.local_number.to_string();
+    let e_sm = p.total_sum.to_string();
+    tag_attrs(
+        out,
+        "E",
+        &[
+            ("FN", &h.fiscal_number),
+            ("N", &e_n),
+            ("NO", &e_no),
+            ("SM", &e_sm),
+            ("TS", &h.ts_str),
+        ],
+    );
+    close(out, "E");
     close(out, "C");
     tag_text(out, "TS", &h.ts_str);
     close(out, "DAT");
@@ -224,10 +317,41 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
 fn emit_z_report(p: &ZReportPayload, out: &mut String) {
     let h = &p.header;
     open_rq(out, h);
-    open_dat(out, h, &p.local_number.to_string());
+    let di = p.local_number.to_string();
+    open_dat(out, h, &di);
     let zn = h.z_number.to_string();
-    let dc = p.doc_count.to_string();
-    tag_attrs(out, "Z", &[("DC", &dc), ("NO", &zn), ("SM", &p.total_sum)]);
+    tag_attrs(out, "Z", &[("NO", &zn)]);
+
+    // Z body — per-payment-type <M NM SMI SMO T>.  Python iterates
+    // `sorted(payment_sums.keys())`; we mirror that by sorting the
+    // caller-supplied vec by `name` so the wire output is
+    // deterministic regardless of caller insertion order.
+    let mut sorted_payments: Vec<&ZReportPaymentSum> = p.payments.iter().collect();
+    sorted_payments.sort_by(|a, b| a.name.cmp(&b.name));
+    for pay in sorted_payments {
+        let smi = pay.sum_in.to_string();
+        let smo = pay.sum_out.to_string();
+        tag_attrs(
+            out,
+            "M",
+            &[
+                ("NM", &pay.name),
+                ("SMI", &smi),
+                ("SMO", &smo),
+                ("T", &pay.type_code),
+            ],
+        );
+        close(out, "M");
+    }
+
+    // Z body — <NC NI NO>.  Always emitted in W4 first-round shape
+    // (Python emits if `check_count` is a dict, which it always is
+    // in our typed payload).
+    let ni = p.check_count.sell_count.to_string();
+    let no = p.check_count.return_count.to_string();
+    tag_attrs(out, "NC", &[("NI", &ni), ("NO", &no)]);
+    close(out, "NC");
+
     close(out, "Z");
     tag_text(out, "TS", &h.ts_str);
     close(out, "DAT");
@@ -289,16 +413,21 @@ fn tag_attrs(out: &mut String, name: &str, attrs: &[(&str, &str)]) {
     out.push('>');
 }
 
-/// Emit `<name>content</name>` where content is XML-escaped text.
-/// Used for `<TS>` and `<MAC>` and any other attr-less tag whose
-/// content is pure text.
+/// Emit `<name>content</name>`.  Used for `<TS>` and `<MAC>`.
+///
+/// **Content is NOT XML-escaped** — mirrors Python `_tag` exactly:
+/// the Python helper f-strings `{open_tag}{content}` directly, so
+/// `&` / `<` / `>` in a hex-MAC or a YYYYMMDDHHMMSS timestamp are
+/// passed through verbatim.  In practice TS is always digits and
+/// MAC is always hex, so the question is academic — but we match
+/// the oracle's behaviour for byte-equivalence.  If a future text
+/// content needs escaping, callers should pre-escape and emit via
+/// `tag_attrs` instead.
 fn tag_text(out: &mut String, name: &str, content: &str) {
     out.push('<');
     out.push_str(name);
     out.push('>');
-    push_escaped(out, content);
-    // close() emitted by caller for symmetry with tag_attrs callers
-    // — but tag_text is self-contained: emit the closer here.
+    out.push_str(content);
     out.push_str("</");
     out.push_str(name);
     out.push('>');
@@ -329,13 +458,6 @@ fn push_escaped(out: &mut String, s: &str) {
     }
 }
 
-// `Write as _` is imported but no `write!` calls are made — left
-// intentional so `format!`-free helpers stay obviously pure pushers.
-#[allow(dead_code)]
-fn _silence_write_import_warning() {
-    let _ = String::new().write_str("");
-}
-
 // ─── Unit tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -348,10 +470,8 @@ mod tests {
 
     fn ascii_header() -> DocumentHeader {
         let mut h = header();
-        // Override the cyrillic device name so the XML is
-        // pure-ASCII for tests that assert string-shape via
-        // `from_utf8` (cp1251 cyrillic bytes are NOT valid UTF-8
-        // and would fail that path).
+        // Override the cyrillic device name so the XML is pure-ASCII
+        // for tests that assert string-shape via `from_utf8`.
         h.device_name = "ASCII_RRO".into();
         h
     }
@@ -361,7 +481,25 @@ mod tests {
         String::from_utf8(bytes).expect("ASCII fixture must round-trip via UTF-8")
     }
 
-    // ─── tag_attrs alphabetical ordering ──────────────────────────
+    fn one_check_item() -> CheckItem {
+        CheckItem {
+            code: "ART-1".into(),
+            name: "Apple".into(),
+            price: 1500,
+            quantity: 1000,
+            sum: 1500,
+        }
+    }
+
+    fn one_cash_payment() -> CheckPayment {
+        CheckPayment {
+            name: "CASH".into(),
+            sum: 1500,
+            type_code: "0".into(),
+        }
+    }
+
+    // ─── Attribute alphabetical ordering ──────────────────────────
 
     #[test]
     fn attributes_emitted_alphabetically_by_name() {
@@ -374,16 +512,12 @@ mod tests {
     fn dat_attrs_alphabetical_di_fn_tn_v_zn() {
         let doc = CanonicalDoc::ShiftOpen(ShiftOpenPayload {
             header: ascii_header(),
-            opening_sum: "0".into(),
+            opening_sum: 0,
         });
         let s = render_ascii(&doc);
-        let dat_idx = s.find("<DAT").expect("DAT tag");
-        let dat_close = s[dat_idx..].find('>').unwrap() + dat_idx;
-        let dat_open = &s[dat_idx..=dat_close];
-        // Expect the exact attr order DI, FN, TN, V, ZN.
         assert!(
-            dat_open.contains(r#" DI="0" FN="1234567890" TN="12345678" V="1" ZN="7""#),
-            "DAT attrs out of alphabetical order: {dat_open}"
+            s.contains(r#"<DAT DI="0" FN="1234567890" TN="12345678" V="1" ZN="7">"#),
+            "DAT attrs out of alphabetical order: {s}"
         );
     }
 
@@ -391,10 +525,9 @@ mod tests {
     fn rq_attrs_alphabetical_ndv_prv_v() {
         let doc = CanonicalDoc::ShiftOpen(ShiftOpenPayload {
             header: ascii_header(),
-            opening_sum: "0".into(),
+            opening_sum: 0,
         });
         let s = render_ascii(&doc);
-        // The full RQ open is the first chunk of the doc.
         assert!(
             s.starts_with(r#"<RQ NDv="ASCII_RRO" PrV="1.1" V="1">"#),
             "RQ attrs out of order: {}",
@@ -405,50 +538,53 @@ mod tests {
     // ─── Escaping ─────────────────────────────────────────────────
 
     #[test]
-    fn escapes_amp_quote_lt_gt_in_attrs_and_text() {
+    fn attribute_values_escape_amp_quote_lt_gt_but_not_apostrophe() {
         let mut h = ascii_header();
-        // Inject every escape-target into the device name so it
-        // lands as an attribute value.
         h.device_name = r#"<a&b>"c'd"#.into();
-        // Apostrophe MUST NOT be escaped (mirror Python).
         let doc = CanonicalDoc::ShiftOpen(ShiftOpenPayload {
             header: h,
-            opening_sum: "0".into(),
+            opening_sum: 0,
         });
         let s = render_ascii(&doc);
-        // Every metacharacter except `'` must be escaped.
         assert!(
             s.contains(r#"NDv="&lt;a&amp;b&gt;&quot;c'd""#),
-            "escape mismatch: {s}"
+            "attribute escape mismatch: {s}"
         );
-        // Single quote stays raw.
         assert!(s.contains("c'd"), "apostrophe must NOT be escaped");
     }
 
     #[test]
-    fn escapes_inside_macro_text_content() {
-        // <MAC> is a text-content tag (tag_text path); a previous-
-        // hash that happens to contain '<' / '&' must be escaped.
+    fn text_content_is_not_escaped_in_ts_or_mac() {
+        // Python `_tag` interpolates `content` raw — any `&` or `<`
+        // appearing in a TS / MAC string lands verbatim on the wire.
+        // Practically TS is digits and MAC is hex, but the contract
+        // matters because byte-equivalence depends on it.
         let mut h = ascii_header();
         h.previous_hash = "<dead&beef>".into();
+        h.ts_str = "AB&CD".into(); // synthetic — TS is normally numeric
         let doc = CanonicalDoc::ShiftOpen(ShiftOpenPayload {
             header: h,
-            opening_sum: "0".into(),
+            opening_sum: 0,
         });
         let s = render_ascii(&doc);
+        // Both raw — no escape.
         assert!(
-            s.contains("<MAC>&lt;dead&amp;beef&gt;</MAC>"),
-            "MAC escape mismatch: {s}"
+            s.contains("<MAC><dead&beef></MAC>"),
+            "MAC content must pass through raw: {s}"
+        );
+        assert!(
+            s.contains("<TS>AB&CD</TS>"),
+            "TS content must pass through raw: {s}"
         );
     }
 
-    // ─── Per-doc invariants ───────────────────────────────────────
+    // ─── Per-doc shape invariants ─────────────────────────────────
 
     #[test]
     fn shift_open_uses_c_t_108_and_di_zero() {
         let doc = CanonicalDoc::ShiftOpen(ShiftOpenPayload {
             header: ascii_header(),
-            opening_sum: "1234".into(),
+            opening_sum: 1234,
         });
         let s = render_ascii(&doc);
         assert!(s.contains(r#"<C T="108">"#), "SHIFT_OPEN must be C T=108");
@@ -461,37 +597,53 @@ mod tests {
     }
 
     #[test]
-    fn sell_uses_c_t_0_and_local_number_in_di() {
+    fn sell_uses_c_t_0_with_p_m_e_body_in_python_shape() {
         let doc = CanonicalDoc::Sell(CheckPayload {
             header: ascii_header(),
             local_number: 42,
-            total_sum: "9999".into(),
-            items: vec![],
+            items: vec![one_check_item()],
+            payments: vec![one_cash_payment()],
+            total_sum: 1500,
         });
         let s = render_ascii(&doc);
         assert!(s.contains(r#"<C T="0">"#), "SELL must be C T=0");
         assert!(s.contains(r#"DI="42""#), "SELL DI must equal local_number");
+        // Per-item attrs alphabetical: C, N, NM, PRC, Q, SM
         assert!(
-            s.contains(r#"<S SM="9999">"#),
-            "SELL <S> shape mismatch: {s}"
+            s.contains(r#"<P C="ART-1" N="1" NM="Apple" PRC="1500" Q="1000" SM="1500">"#),
+            "SELL <P> shape mismatch: {s}"
+        );
+        // Per-payment attrs alphabetical: N, NM, SM, T (item_no=2 because item_no=1 was the P)
+        assert!(
+            s.contains(r#"<M N="2" NM="CASH" SM="1500" T="0">"#),
+            "SELL <M> shape mismatch: {s}"
+        );
+        // Closing <E FN N NO SM TS> with N=3 (after one P + one M)
+        assert!(
+            s.contains(r#"<E FN="1234567890" N="3" NO="42" SM="1500" TS="20260506120000">"#),
+            "SELL <E> shape mismatch: {s}"
         );
     }
 
     #[test]
-    fn return_uses_c_t_1_and_local_number_in_di() {
+    fn return_uses_c_t_1_with_same_body_shape_as_sell() {
         let doc = CanonicalDoc::Return(CheckPayload {
             header: ascii_header(),
             local_number: 13,
-            total_sum: "100".into(),
-            items: vec![],
+            items: vec![one_check_item()],
+            payments: vec![one_cash_payment()],
+            total_sum: 1500,
         });
         let s = render_ascii(&doc);
         assert!(s.contains(r#"<C T="1">"#), "RETURN must be C T=1");
         assert!(s.contains(r#"DI="13""#));
+        // Body shape identical to SELL.
+        assert!(s.contains(r#"<P C="ART-1" N="1" NM="Apple" PRC="1500" Q="1000" SM="1500">"#));
+        assert!(s.contains(r#"<M N="2" NM="CASH" SM="1500" T="0">"#));
     }
 
     #[test]
-    fn z_report_uses_z_tag_and_doubles_as_close_shift_artifact() {
+    fn z_report_uses_z_no_with_m_and_nc_body_and_doubles_as_close_shift() {
         // This test pins the contract that `ZReport` IS the
         // close-shift wire artifact (DPS Check.Type::ZREPORT=2;
         // WebCheck CreateDB.cs:624 doctype='80').  A future
@@ -500,17 +652,66 @@ mod tests {
         let doc = CanonicalDoc::ZReport(ZReportPayload {
             header: ascii_header(),
             local_number: 100,
-            total_sum: "5000".into(),
-            doc_count: 17,
+            payments: vec![ZReportPaymentSum {
+                name: "CASH".into(),
+                sum_in: 5000,
+                sum_out: 0,
+                type_code: "0".into(),
+            }],
+            check_count: ZReportCheckCount {
+                sell_count: 17,
+                return_count: 2,
+            },
         });
         let s = render_ascii(&doc);
+        // <Z NO="..."> not <Z DC NO SM>.
+        assert!(s.contains(r#"<Z NO="7">"#), "Z open shape mismatch: {s}");
+        // <M NM SMI SMO T> alphabetical.
         assert!(
-            s.contains(r#"<Z DC="17" NO="7" SM="5000">"#),
-            "Z shape mismatch: {s}"
+            s.contains(r#"<M NM="CASH" SMI="5000" SMO="0" T="0">"#),
+            "Z<M> shape mismatch: {s}"
         );
-        // Z_REPORT must NOT contain a <C T=...> wrapper — that's
-        // the SELL/RETURN/SHIFT_OPEN shape.
+        // <NC NI NO>.
+        assert!(
+            s.contains(r#"<NC NI="17" NO="2">"#),
+            "Z<NC> shape mismatch: {s}"
+        );
+        // Z_REPORT must NOT contain a <C T=...> wrapper.
         assert!(!s.contains("<C "), "Z_REPORT must not emit a <C> tag: {s}");
+    }
+
+    #[test]
+    fn z_report_payments_emit_in_sorted_name_order() {
+        // Python iterates `sorted(payment_sums.keys())`; Rust must
+        // match regardless of caller insertion order.  Pass in
+        // CARD, then CASH; expect CASH < CARD lex order ⇒ CARD
+        // emits first (because `'CARD' < 'CASH'`).
+        let doc = CanonicalDoc::ZReport(ZReportPayload {
+            header: ascii_header(),
+            local_number: 1,
+            payments: vec![
+                ZReportPaymentSum {
+                    name: "CASH".into(),
+                    sum_in: 2,
+                    sum_out: 0,
+                    type_code: "0".into(),
+                },
+                ZReportPaymentSum {
+                    name: "CARD".into(),
+                    sum_in: 1,
+                    sum_out: 0,
+                    type_code: "2".into(),
+                },
+            ],
+            check_count: ZReportCheckCount {
+                sell_count: 0,
+                return_count: 0,
+            },
+        });
+        let s = render_ascii(&doc);
+        let card_idx = s.find(r#"NM="CARD""#).expect("CARD present");
+        let cash_idx = s.find(r#"NM="CASH""#).expect("CASH present");
+        assert!(card_idx < cash_idx, "CARD < CASH lex order: {s}");
     }
 
     #[test]
@@ -518,31 +719,26 @@ mod tests {
         let doc = CanonicalDoc::Sell(CheckPayload {
             header: ascii_header(),
             local_number: 1,
-            total_sum: "200".into(),
             items: vec![
                 CheckItem {
                     code: "CODE-1".into(),
                     name: "Apple".into(),
-                    price: "100".into(),
-                    quantity: "1".into(),
-                    line_total: "100".into(),
+                    price: 100,
+                    quantity: 1000,
+                    sum: 100,
                 },
                 CheckItem {
                     code: "CODE-2".into(),
                     name: "Banana".into(),
-                    price: "100".into(),
-                    quantity: "1".into(),
-                    line_total: "100".into(),
+                    price: 100,
+                    quantity: 1000,
+                    sum: 100,
                 },
             ],
+            payments: vec![one_cash_payment()],
+            total_sum: 200,
         });
         let s = render_ascii(&doc);
-        // Per-item attr order: AM, C, CS, N, NM, PR (alphabetical).
-        assert!(
-            s.contains(r#"<P AM="1" C="CODE-1" CS="100" N="1" NM="Apple" PR="100">"#),
-            "first item shape mismatch: {s}"
-        );
-        // Item order preserved (N=1 before N=2).
         let idx1 = s.find("CODE-1").expect("first item present");
         let idx2 = s.find("CODE-2").expect("second item present");
         assert!(idx1 < idx2, "items must emit in input order");
@@ -555,8 +751,9 @@ mod tests {
         let doc = CanonicalDoc::Sell(CheckPayload {
             header: ascii_header(),
             local_number: 1,
-            total_sum: "1".into(),
-            items: vec![],
+            items: vec![one_check_item()],
+            payments: vec![one_cash_payment()],
+            total_sum: 1500,
         });
         let a = build_canonical_xml(&doc).unwrap();
         let b = build_canonical_xml(&doc).unwrap();
@@ -567,29 +764,51 @@ mod tests {
 
     #[test]
     fn default_device_name_encodes_to_known_cp1251_bytes() {
-        // Default device_name = "ПРО_каса".  cp1251 mapping:
-        //   П=0xCF, Р=0xD0, О=0xCE, _=0x5F, к=0xEA, а=0xE0,
-        //   с=0xF1, а=0xE0  → 8 bytes total.
         let doc = CanonicalDoc::ShiftOpen(ShiftOpenPayload {
             header: header(),
-            opening_sum: "0".into(),
+            opening_sum: 0,
         });
         let bytes = build_canonical_xml(&doc).expect("default cyrillic must encode");
         let expected: &[u8] = &[0xCF, 0xD0, 0xCE, 0x5F, 0xEA, 0xE0, 0xF1, 0xE0];
-        let needle_idx = bytes
+        let _ = bytes
             .windows(expected.len())
             .position(|w| w == expected)
             .expect("ПРО_каса bytes must appear in cp1251 output");
-        let _ = needle_idx;
+    }
+
+    #[test]
+    fn ukrainian_name_encodes_via_cp1251() {
+        // Item name with Ukrainian glyphs must round-trip; this is
+        // the guard that catches cp1251 coverage drift.
+        let doc = CanonicalDoc::Sell(CheckPayload {
+            header: ascii_header(),
+            local_number: 1,
+            items: vec![CheckItem {
+                code: "ART".into(),
+                name: "Їжа".into(), // Ї (0xAF) + ж (0xE6) + а (0xE0)
+                price: 100,
+                quantity: 1000,
+                sum: 100,
+            }],
+            payments: vec![one_cash_payment()],
+            total_sum: 100,
+        });
+        let bytes = build_canonical_xml(&doc).expect("ukrainian must encode");
+        // Find the cp1251 bytes for "Їжа" inside the wire output.
+        let needle: &[u8] = &[0xAF, 0xE6, 0xE0];
+        assert!(
+            bytes.windows(needle.len()).any(|w| w == needle),
+            "Ukrainian name must round-trip through cp1251"
+        );
     }
 
     #[test]
     fn unmappable_char_in_device_name_returns_typed_error() {
         let mut h = ascii_header();
-        h.device_name = "RRO😀".into(); // emoji not in cp1251
+        h.device_name = "RRO😀".into();
         let doc = CanonicalDoc::ShiftOpen(ShiftOpenPayload {
             header: h,
-            opening_sum: "0".into(),
+            opening_sum: 0,
         });
         let err = build_canonical_xml(&doc).expect_err("emoji must be unmappable");
         assert!(
