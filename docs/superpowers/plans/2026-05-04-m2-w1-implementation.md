@@ -82,7 +82,7 @@ rust/prro/
         sell.bin
         return.bin
         z_report.bin                          # also IS the close-shift wire artifact
-      regenerate.rs                            # NEW — manual capture binary (NOT CI-triggered)
+      regenerate.py                            # NEW — Python capture script (oracle = src/prro_gateway serializer; NOT CI-triggered)
       README.md                                # NEW — operator procedure for re-capture
     api_surface_no_db_handle.rs                # NEW — W5 ADR-M2-6 static check via `syn`
     secret_flow_tracing.rs                     # NEW — W6 tracing-subscriber substring check
@@ -2183,7 +2183,7 @@ Before W3 is marked complete and M2 advances:
 - Create: `rust/prro/src/xml/` — minimal canonical XML builder for the 4 doc types (no general schema; literally just enough to produce a byte-stable canonical wire payload for each).  Scope per the W4 scope-note above: `shift_open`, `sell`, `return`, `z_report` (which doubles as close-shift).
 - Create: `rust/prro/tests/goldens_byte_equiv.rs` — the harness.
 - Create: `rust/prro/tests/goldens/{xml,cms,prevhash}/*.bin` — frozen fixtures.  (`kvt1/`, `kvt2/` directory layout is reserved by the tree but no fixtures land in W4 first round — see scope note.)
-- Create: `rust/prro/tests/goldens/regenerate.rs` — manual capture script (Rust binary, not Python; the goldens are Rust-output canonicalised by the Rust builder, frozen by manual review).
+- Create: `rust/prro/tests/goldens/regenerate.py` — manual capture script (Python, NOT a Rust binary).  ADR-M2-3 rule: the goldens' oracle is the Python serializer (`src/prro_gateway/serializers/dps_xml.py`).  Rust does NOT freeze its own output as the golden — that would defeat the byte-equivalence contract.  The script imports the Python serializer with hard-coded payload fixtures, writes `.bin` files + a `manifest.json` with sha256 + length, and prints a diff against any pre-existing committed bytes.
 - Create: `rust/prro/tests/goldens/README.md` — operator procedure.
 - Create: `docs/M2-goldens-capture.md` — operator-facing procedure.
 
@@ -2191,8 +2191,8 @@ Before W3 is marked complete and M2 advances:
 
 - [ ] `tests/goldens_byte_equiv.rs` runs against the frozen `tests/goldens/**/*.bin` files: each test reads a `.bin`, runs the Rust producer (XML builder / CMS signer with deterministic test key), and asserts byte equality.
 - [ ] First-round goldens committed: `xml/{shift_open,sell,return,z_report}.bin`; `cms/deterministic_prefix.bin` (or similar); `prevhash/seed.bin`.  No `xml/shift_close.bin` — `z_report` IS the close-shift wire artifact (see scope note).  KVT1/KVT2 fixtures DEFERRED.
-- [ ] `regenerate.rs` documents-the-procedure + re-captures from the Rust builder and prints a `diff` against the frozen vectors.  CI does NOT run it.  Re-capture is a deliberate-spec-change action, not a regression-fix action — every re-capture goes through manual review of the new bytes.
-- [ ] If a golden fails (Rust output drifts), the test surfaces a diff readable in CI logs (hex dump of first ~64 differing bytes).
+- [ ] **Goldens are CAPTURED FROM PYTHON, NOT Rust.**  `regenerate.py` imports `src/prro_gateway/serializers/dps_xml.py`, runs each of the 4 typed payload fixtures through it, writes the resulting cp1251-encoded bytes to `tests/goldens/xml/*.bin` plus a `manifest.json` with sha256 + length per file.  CI does NOT run the script.  Re-capture is a deliberate-spec-change action; every re-capture goes through manual review of the new bytes + manifest diff.
+- [ ] If a golden fails (Rust output diverges from the Python-captured bytes), the test surfaces a diff readable in CI logs (hex dump of first ~64 differing bytes).
 - [ ] CMS goldens are split into "deterministic prefix" (the XML-to-be-signed bytes) — pinned byte-equivalent — and "signature shape" (signature is parsed + verified, NOT byte-compared).
 - [ ] Doc record:  `WebCheck CloseShift == DPS Z_REPORT (typCheck=2, doctype=80)` is stated explicitly in the goldens README so a future contributor cannot accidentally re-introduce a separate `shift_close` golden.
 
@@ -2206,7 +2206,7 @@ cargo test -p prro --test goldens_byte_equiv
 
 - [ ] **Step 1: Write a minimal XML builder.**
 
-`rust/prro/src/xml/mod.rs` exposes `build_canonical_xml(doc_type: DocType, payload: &Payload) -> Vec<u8>` for the 5 doc types in scope.  The implementer ports the canonicalisation rules from the Python adapter — attribute ordering, namespace declarations, cp1251 encoding — and pins them in unit tests inside this module.
+`rust/prro/src/xml/mod.rs` exposes `build_canonical_xml(doc_type: DocType, payload: &Payload) -> Vec<u8>` for the 4 doc types in scope (`shift_open`, `sell`, `return`, `z_report`).  The implementer ports the canonicalisation rules from the Python adapter — attribute ordering, namespace declarations, cp1251 encoding — and pins them in unit tests inside this module.  C1 acceptance is unit-level only (attr order, escaping, cp1251 byte mapping per typed payload struct).  Byte-equivalence against the Python-captured goldens lands in C3.
 
 The builder is intentionally narrow: M3 will replace it with a full schema-driven builder.  W4's job is just to give the harness a Rust-side producer.
 
@@ -2552,7 +2552,7 @@ git push origin rust-gateway
 - **Ingress shells.**  REST / XML-RPC / Maria / Maria304 / Checkbox-compat are M4.
 - **Admin UI / receipt rendering.**  M5.
 - **Recovery loop / reconciliation.**  M3+.
-- **Full canonical-XML builder.**  W4 ships only the minimal XML helpers needed for the five W4-scoped doc types.  M3 replaces with a full schema-driven builder.
+- **Full canonical-XML builder.**  W4 ships only the minimal XML helpers needed for the four W4-scoped doc types (`shift_open`, `sell`, `return`, `z_report` — `z_report` doubles as the CloseShift wire artifact, see W4 scope note).  M3 replaces with a full schema-driven builder.
 - **`node_state` bootstrap reconciliation.**  Still gated by `PRRO_GATE-ah8`.
 - **Workspace-wide clippy hardening (`prro_crypto`/`prro_sidecar` profile warnings).**  Tracked as `PRRO_GATE-u8z`.
 - **Concurrent race test for ingress idempotency.**  Tracked as `PRRO_GATE-6r7`.

@@ -138,8 +138,11 @@ Rust output deterministically.
 
 Hot zones in scope for M2 goldens:
 - canonical unsigned XML (cp1251 encoding, attribute ordering, namespace
-  declarations) for at least: `SHIFT_OPEN`, `SHIFT_CLOSE`, `SELL`,
-  `RETURN`, `Z_REPORT`;
+  declarations) for at least: `SHIFT_OPEN`, `SELL`, `RETURN`,
+  `Z_REPORT` (which doubles as the CloseShift wire artifact —
+  WebCheck `CreateDB.cs:624` indexes shift-close on `doctype = '80'`,
+  the Z-report doctype; DPS `Check.Type::ZREPORT = 2`; revision
+  2026-05-06);
 - `previous_hash` chain seed (first-after-bootstrap and steady-state);
 - CMS-signed XML bytes where DSTU signing is deterministic with a
   fixed test key (otherwise pin only the XML pre-signature);
