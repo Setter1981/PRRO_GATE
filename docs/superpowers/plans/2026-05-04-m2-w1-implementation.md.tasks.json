@@ -2,7 +2,7 @@
   "planPath": "docs/superpowers/plans/2026-05-04-m2-w1-implementation.md",
   "specPath": "docs/superpowers/specs/2026-05-04-m2-pre-plan-adr.md",
   "scope": "M2 implementation — crypto wrapper, cert_refresher, DpsChannel + tonic mock, byte-equivalence goldens, ADR-M2-6 + ADR-M2-5 architectural gates.  Inputs: ADR (approved 2026-05-04) + W0-1/W0-2/W0-3 findings docs + PRRO_GATE-5js note.",
-  "lastUpdated": "2026-05-06T15:45:00Z",
+  "lastUpdated": "2026-05-06T17:00:00Z",
   "tasks": [
     {
       "id": 0,
@@ -40,7 +40,7 @@
     {
       "id": 5,
       "subject": "Task 5 (W5): ADR-M2-6 static check — no DB handle in crypto/transports public API",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [1, 2, 3],
       "description": "1-2 days.  syn-based scan of crypto:: + transports:: public API; fail build on SqlitePool/Connection/Pool/Transaction.  services/ exempt.  #[cfg(test)] skipped.  Scans BOTH free fns AND trait method defs (CryptoProvider, DpsChannel are traits).\n\n```json:metadata\n{\"files\":[\"rust/prro/Cargo.toml\",\"rust/prro/tests/api_surface_no_db_handle.rs\"],\"verifyCommand\":\"cargo test -p prro --test api_surface_no_db_handle\",\"acceptanceCriteria\":[\"syn 2 with full+extra-traits+visit\",\"quote 1 dev-dep\",\"parse + visit free fns\",\"parse + visit trait method defs\",\"signature stringification\",\"services/ exempt\",\"cfg(test) skipped\",\"negative-fixture catches free-fn AND trait-method violations\"]}\n```"
     },

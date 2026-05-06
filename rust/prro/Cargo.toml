@@ -77,6 +77,13 @@ wiremock = "0.6"
 # tonic's serve_with_incoming can accept connections.
 tokio-stream = { version = "0.1", features = ["net"] }
 
+# M2 W5 ADR-M2-6 static check — syn-based scan of crypto:: + transports::
+# public API for forbidden sqlx types.  `visit` enables the syn::visit::Visit
+# trait the scanner walks; `extra-traits` gives Debug/Clone for diagnostics.
+# `quote::ToTokens` stringifies type expressions.
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+quote = "1"
+
 [build-dependencies]
 # M2 W3 compiles the production DPS proto into a client + test mock server.
 tonic-build = "0.12"
