@@ -2,7 +2,7 @@
   "planPath": "docs/superpowers/plans/2026-05-04-m2-w1-implementation.md",
   "specPath": "docs/superpowers/specs/2026-05-04-m2-pre-plan-adr.md",
   "scope": "M2 implementation — crypto wrapper, cert_refresher, DpsChannel + tonic mock, byte-equivalence goldens, ADR-M2-6 + ADR-M2-5 architectural gates.  Inputs: ADR (approved 2026-05-04) + W0-1/W0-2/W0-3 findings docs + PRRO_GATE-5js note.",
-  "lastUpdated": "2026-05-06T17:00:00Z",
+  "lastUpdated": "2026-05-06T18:30:00Z",
   "tasks": [
     {
       "id": 0,
@@ -47,7 +47,7 @@
     {
       "id": 6,
       "subject": "Task 6 (W6): secret-material flow tracing test",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [1, 2, 3],
       "description": "1-2 days.  tracing-subscriber test exercising every CryptoError variant + happy paths; asserts no seeded secret substring in any captured log.  Self-managed Arc<Mutex<Vec<u8>>> capture sink — no tracing_test::internal::* private API.  ADR-M2-5 §4d.\n\n```json:metadata\n{\"files\":[\"rust/prro/Cargo.toml\",\"rust/prro/tests/secret_flow_tracing.rs\"],\"verifyCommand\":\"cargo test -p prro --test secret_flow_tracing\",\"acceptanceCriteria\":[\"tracing-subscriber 0.3 with std+fmt features\",\"self-managed CaptureBuf MakeWriter\",\"3 seeded secrets\",\"every CryptoError variant\",\"happy paths\",\"no leaked substring\",\"positive control\"]}\n```"
     }
