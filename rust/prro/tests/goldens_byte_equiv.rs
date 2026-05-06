@@ -126,16 +126,21 @@ fn read_golden(rel: &str) -> Vec<u8> {
 }
 
 /// Assert two byte slices are identical.  On mismatch emit an
-/// ADR-M2-3-shaped hex dump of the first up-to 64 differing bytes,
-/// plus the byte offset of the first divergence and both lengths.
+/// ADR-M2-3-shaped hex dump diagnostic: scan the FULL overlap for
+/// the first divergence (not just the first 64 bytes — a regression
+/// at byte 100 with equal length must be reported precisely, not
+/// misclassified as "length only"), then show a 64-byte window
+/// CENTRED on the first-diff offset (±32 bytes) so the dump always
+/// covers the divergence point.
 fn assert_byte_equal(rel: &str, actual: &[u8], expected: &[u8]) {
     if actual == expected {
         return;
     }
-    let max_diff = 64usize;
-    let scan_len = actual.len().min(expected.len()).min(max_diff);
-
-    let first_diff = (0..scan_len).find(|&i| actual[i] != expected[i]);
+    // Scan the full overlap (not min(64)) — drift at any offset
+    // must surface as "first diff at byte N", not as a false
+    // "length only" verdict.
+    let overlap = actual.len().min(expected.len());
+    let first_diff = (0..overlap).find(|&i| actual[i] != expected[i]);
 
     let mut msg = String::new();
     msg.push_str(&format!(
@@ -143,21 +148,38 @@ fn assert_byte_equal(rel: &str, actual: &[u8], expected: &[u8]) {
         actual.len(),
         expected.len()
     ));
-    if let Some(idx) = first_diff {
-        msg.push_str(&format!("  first diff at byte {idx}\n"));
-    } else {
-        msg.push_str(&format!(
-            "  first {scan_len} bytes match — divergence is in length only \
-             (truncation or appended bytes)\n"
-        ));
+
+    // Window centred on the first diff (±32 bytes, total 64).  When
+    // the divergence is purely in length (one slice is a prefix of
+    // the other), `first_diff` is None and we anchor the window at
+    // the truncation boundary.
+    let window_size = 64usize;
+    let half = window_size / 2;
+    let anchor = first_diff.unwrap_or(overlap);
+    let start = anchor.saturating_sub(half);
+
+    match first_diff {
+        Some(idx) => {
+            msg.push_str(&format!(
+                "  first diff at byte {idx}\n  window: bytes {start}..\n"
+            ));
+        }
+        None => {
+            msg.push_str(&format!(
+                "  first {overlap} bytes match — divergence is in length only \
+                 (truncation or appended bytes)\n  window: bytes {start}..\n"
+            ));
+        }
     }
-    msg.push_str("  rust    (first 64 bytes):");
-    for &b in actual.iter().take(max_diff) {
+    let rust_window: &[u8] = &actual[start.min(actual.len())..];
+    let py_window: &[u8] = &expected[start.min(expected.len())..];
+    msg.push_str("  rust    (window, up to 64 bytes):");
+    for &b in rust_window.iter().take(window_size) {
         msg.push_str(&format!(" {b:02x}"));
     }
     msg.push('\n');
-    msg.push_str("  python  (first 64 bytes):");
-    for &b in expected.iter().take(max_diff) {
+    msg.push_str("  python  (window, up to 64 bytes):");
+    for &b in py_window.iter().take(window_size) {
         msg.push_str(&format!(" {b:02x}"));
     }
     msg.push('\n');
