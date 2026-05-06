@@ -85,8 +85,11 @@ syn = { version = "2", features = ["full", "extra-traits", "visit"] }
 quote = "1"
 
 # M2 W6 secret-material flow tracing test — self-managed CaptureBuf
-# `MakeWriter` + `tracing::subscriber::set_default` `DefaultGuard` held
-# across `.await`s.  No `tracing-test` dep (private API).  Std + fmt only.
+# `MakeWriter` + `tracing::subscriber::set_global_default` installed
+# once per test-binary process via `OnceLock` (so spawn_blocking
+# emissions on tokio's blocking thread pool are captured, not just
+# the current_thread runtime).  No `tracing-test` dep (private API).
+# Std + fmt only.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
 
 [build-dependencies]
