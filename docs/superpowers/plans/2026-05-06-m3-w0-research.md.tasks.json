@@ -1,0 +1,35 @@
+{
+  "planPath": "docs/superpowers/plans/2026-05-06-m3-w0-research.md",
+  "specPath": null,
+  "scope": "M3-W0 research — research-address 5 entry decisions from docs/M2-handoff.md §4.3 (PRRO_GATE-ddn, -zti, -k99, -6bj, -ah8) by producing 3 frozen findings/spec documents.  Research only; no code edits.  bd issues remain open after W0; closure happens at M3a implementation time.  After W0 closes, an ADR amendment + M3a implementation plan is drafted on solid ground.",
+  "lastUpdated": "2026-05-06T20:35:00Z",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: M3 epic + bd cross-link (administrative)",
+      "status": "pending",
+      "description": "Administrative ~30 min.  Create PRRO_GATE-M3 epic, link 5 entry-decision issues as child-of, link M3 epic as discovered-from on M2 epic.\n\n```json:metadata\n{\"files\":[],\"verifyCommand\":\"bd list --status open | grep -A 5 'M3.*write-path'\",\"acceptanceCriteria\":[\"M3 epic created\",\"5 child-of edges set (ddn/zti/k99/6bj/ah8)\",\"discovered-from edge to M2 epic PRRO_GATE-82j\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1 (W0-1): State + sequence findings",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "2 days.  Produce docs/superpowers/specs/2026-05-06-m3-w0-1-state-sequence.md with: lnd source-of-truth decision among 4 candidates (next_lnd transactional sequencer + UNIQUE / MAX(lnd)+1 + UNIQUE / ROWID-AUTOINCREMENT / in-memory counter); 4 state machines tabulated against canonical Rust persistence sources — DocState 12 values per rust/prro/src/db/models/enums.rs:29, ShiftState 6 values per rust/prro/src/db/models/enums.rs:44, Offline session 5 values per rust/prro/migrations/004_offline_and_routing.sql:6 (Python legacy sql/001_hot_store_init.sql:186 cited for parity only), NodeMode 7 values per rust/prro/src/db/models/enums.rs:53; allowed_transition matrix + pending/recovery inclusion set per rust/prro/src/db/repositories/fiscal_documents.rs:176; M3a happy-path 5-stage sequence diagram with explicit lock + crypto/network boundaries; CloseShift→Z_REPORT mapping decision (rename vs map-at-boundary); reviewer checklist.  Research-addresses PRRO_GATE-ddn + PRRO_GATE-zti (closure deferred to M3a impl).  Research only — no code.\n\n```json:metadata\n{\"files\":[\"docs/superpowers/specs/2026-05-06-m3-w0-1-state-sequence.md\"],\"verifyCommand\":\"test -f docs/superpowers/specs/2026-05-06-m3-w0-1-state-sequence.md\",\"acceptanceCriteria\":[\"lnd source-of-truth decision among 4 candidates\",\"4 state machines tabulated against canonical Rust persistence sources (Document/Shift/Offline/Node)\",\"allowed_transition matrix + pending/recovery inclusion set\",\"M3a happy-path sequence diagram with lock + crypto/network boundaries\",\"CloseShift mapping decision\",\"PRRO_GATE-ddn research-addressed\",\"PRRO_GATE-zti research-addressed\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2 (W0-2): Lock discipline findings",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "1-2 days.  Produce docs/superpowers/specs/2026-05-06-m3-w0-2-lock-discipline.md with: full Python with_immediate audit (every site enumerated); transactional-boundary table per M3a stage; db::tx::with_immediate Rust helper contract decision (compile-time / runtime debug_assert / convention+static-check / hybrid) WITH per-option feasibility verdict — what is genuinely enforceable vs policy-only (note: runtime debug_assert cannot universally catch foreign-IO await inside tx closure); transition_state contract decision (call-site / helper-tx-arg / micro-tx); crypto/network boundary pattern catalogue (W2 cert_refresher precedent); App::boot lock-discipline preview; reviewer checklist.  Research-addresses PRRO_GATE-k99 (closure deferred to M3a impl).  Research only — no code.\n\n```json:metadata\n{\"files\":[\"docs/superpowers/specs/2026-05-06-m3-w0-2-lock-discipline.md\"],\"verifyCommand\":\"test -f docs/superpowers/specs/2026-05-06-m3-w0-2-lock-discipline.md\",\"acceptanceCriteria\":[\"Python with_immediate full audit\",\"transactional boundary table per M3a stage\",\"db::tx::with_immediate helper contract decision with feasibility verdict per option\",\"transition_state contract decision\",\"crypto/network boundary pattern catalogue\",\"PRRO_GATE-k99 research-addressed\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3 (W0-3): Retry/recovery findings",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "2-3 days (largest W0 task).  Produce docs/superpowers/specs/2026-05-06-m3-w0-3-retry-recovery.md with: WebCheck retry-class audit (with source-line evidence); DpsError → retry policy table covering the 8 real variants per rust/prro/src/transports/dps/error.rs:14 (Transport, Authorization, Decode, Server { code, message } sub-tabled by raw status code, NotFound, ServerFiscalIdMismatch, QueryNotSupported, Internal); pending-state recovery rules per the 7 pending Document states (PREPARED, SIGNED, ENCRYPTED, SENT, KVT1, KVT2, ERROR_RETRYABLE) plus explicit exclusions for OFFLINE_LOCAL_ACK, REQUIRES_MANUAL_RECONCILIATION, ACK/REJECTED/CANCELLED terminals; App::boot reconciliation contract closing PRRO_GATE-ah8 (preserve shift_state, no blind upsert_initial); offline failover trigger map (M3a carve-out boundary); deterministic-replay invariant; reviewer checklist.  Research-addresses PRRO_GATE-6bj + PRRO_GATE-ah8 (closure deferred to M3a impl).  Research only — no code.\n\n```json:metadata\n{\"files\":[\"docs/superpowers/specs/2026-05-06-m3-w0-3-retry-recovery.md\"],\"verifyCommand\":\"test -f docs/superpowers/specs/2026-05-06-m3-w0-3-retry-recovery.md\",\"acceptanceCriteria\":[\"WebCheck retry-class audit with source evidence\",\"DpsError 8-variant retry policy table with Server-status sub-table\",\"pending-state recovery rules for 7 pending states + explicit exclusions for OFFLINE_LOCAL_ACK / REQUIRES_MANUAL_RECONCILIATION / terminals\",\"App::boot reconciliation contract\",\"offline failover trigger map\",\"deterministic-replay invariant\",\"PRRO_GATE-6bj research-addressed\",\"PRRO_GATE-ah8 research-addressed\"]}\n```"
+    }
+  ]
+}
