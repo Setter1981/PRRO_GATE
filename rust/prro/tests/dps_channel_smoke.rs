@@ -10,7 +10,10 @@
 //!
 //! Coverage matrix (per W0-1 review):
 //!
-//! Happy path × 5 RPCs:
+//! Happy path × 5 RPCs (each asserts both the typed response AND the
+//! outbound proto body — proves `From<CheckEnvelope> for gen::Check`
+//! and `From<&CheckSignBlob> for gen::CheckRequest` actually wire the
+//! field values onto the wire):
 //!   - send_chk_happy_returns_check_ack
 //!   - last_chk_happy_returns_check_ack
 //!   - ping_happy_returns_check_ack
@@ -35,7 +38,9 @@
 //!
 //! QueryNotSupported + grpc-timeout:
 //!   - query_by_local_identity_returns_query_not_supported_without_hitting_server
-//!   - grpc_timeout_metadata_set_on_every_request
+//!   - grpc_timeout_metadata_set_on_every_rpc (all 5 RPCs in one
+//!     test; closes the W3-C4 review finding that the previous
+//!     single-RPC test did not prove the "every request" claim)
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -59,6 +64,32 @@ use tonic::{Code, Request, Response, Status};
 
 // ─── Mock state + tonic service impl ──────────────────────────────────
 
+/// Inbound request body, captured per-RPC before the mock pops a
+/// scripted response.  Tests assert on these to prove the
+/// `From<CheckEnvelope> for gen::Check` / `From<&CheckSignBlob> for
+/// gen::CheckRequest` conversions in `dto.rs` actually wire field
+/// values onto the wire — without this, a buggy conversion (field
+/// swap, dropped value) would still pass C4 because mock responses
+/// are scripted independently of the inbound request.
+#[derive(Debug)]
+enum CapturedBody {
+    SendChk(Check),
+    LastChk(CheckRequest),
+    Ping(Check),
+    StatusRro(CheckRequest),
+    InfoRro(CheckRequest),
+}
+
+/// One captured call: metadata + body, correlated.  `Vec<CapturedCall>`
+/// preserves arrival order across all RPCs so the
+/// `grpc_timeout_metadata_set_on_every_rpc` test can verify each of
+/// the 5 calls carries the deadline header.
+#[derive(Debug)]
+struct CapturedCall {
+    metadata: HashMap<String, String>,
+    body: CapturedBody,
+}
+
 #[derive(Default)]
 struct MockDpsState {
     /// Per-RPC scripted response queues.  Each test pushes the
@@ -70,14 +101,17 @@ struct MockDpsState {
     ping: Mutex<VecDeque<Result<CheckResponse, Status>>>,
     status_rro: Mutex<VecDeque<Result<StatusResponse, Status>>>,
     info_rro: Mutex<VecDeque<Result<RroInfoResponse, Status>>>,
-    /// Captures inbound request metadata (one HashMap per call,
-    /// across all RPCs).  Tests that care about metadata pull from
-    /// here after the call returns.
-    captured_metadata: Mutex<Vec<HashMap<String, String>>>,
+    /// Every inbound RPC, in arrival order, with both metadata and
+    /// the deserialised body.  Tests that care about either pull
+    /// from here after the call returns.
+    captured: Mutex<Vec<CapturedCall>>,
 }
 
 impl MockDpsState {
-    fn capture(&self, md: &tonic::metadata::MetadataMap) {
+    /// Pure metadata snapshot (does not push); the per-RPC handler
+    /// pairs the result with the inbound body and pushes one
+    /// `CapturedCall`.
+    fn snapshot_metadata(&self, md: &tonic::metadata::MetadataMap) -> HashMap<String, String> {
         let mut snapshot: HashMap<String, String> = HashMap::new();
         for kv in md.iter() {
             // Ascii-only keys; binary metadata is irrelevant for the
@@ -90,7 +124,7 @@ impl MockDpsState {
                 );
             }
         }
-        self.captured_metadata.lock().unwrap().push(snapshot);
+        snapshot
     }
 }
 
@@ -105,7 +139,12 @@ impl ChkIncomeService for MockDpsService {
         &self,
         request: Request<Check>,
     ) -> Result<Response<CheckResponse>, Status> {
-        self.state.capture(request.metadata());
+        let metadata = self.state.snapshot_metadata(request.metadata());
+        let body = request.into_inner();
+        self.state.captured.lock().unwrap().push(CapturedCall {
+            metadata,
+            body: CapturedBody::SendChk(body),
+        });
         match self.state.send_chk_v2.lock().unwrap().pop_front() {
             Some(Ok(r)) => Ok(Response::new(r)),
             Some(Err(s)) => Err(s),
@@ -117,7 +156,12 @@ impl ChkIncomeService for MockDpsService {
         &self,
         request: Request<CheckRequest>,
     ) -> Result<Response<CheckResponse>, Status> {
-        self.state.capture(request.metadata());
+        let metadata = self.state.snapshot_metadata(request.metadata());
+        let body = request.into_inner();
+        self.state.captured.lock().unwrap().push(CapturedCall {
+            metadata,
+            body: CapturedBody::LastChk(body),
+        });
         match self.state.last_chk.lock().unwrap().pop_front() {
             Some(Ok(r)) => Ok(Response::new(r)),
             Some(Err(s)) => Err(s),
@@ -126,7 +170,12 @@ impl ChkIncomeService for MockDpsService {
     }
 
     async fn ping(&self, request: Request<Check>) -> Result<Response<CheckResponse>, Status> {
-        self.state.capture(request.metadata());
+        let metadata = self.state.snapshot_metadata(request.metadata());
+        let body = request.into_inner();
+        self.state.captured.lock().unwrap().push(CapturedCall {
+            metadata,
+            body: CapturedBody::Ping(body),
+        });
         match self.state.ping.lock().unwrap().pop_front() {
             Some(Ok(r)) => Ok(Response::new(r)),
             Some(Err(s)) => Err(s),
@@ -138,7 +187,12 @@ impl ChkIncomeService for MockDpsService {
         &self,
         request: Request<CheckRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        self.state.capture(request.metadata());
+        let metadata = self.state.snapshot_metadata(request.metadata());
+        let body = request.into_inner();
+        self.state.captured.lock().unwrap().push(CapturedCall {
+            metadata,
+            body: CapturedBody::StatusRro(body),
+        });
         match self.state.status_rro.lock().unwrap().pop_front() {
             Some(Ok(r)) => Ok(Response::new(r)),
             Some(Err(s)) => Err(s),
@@ -150,7 +204,12 @@ impl ChkIncomeService for MockDpsService {
         &self,
         request: Request<CheckRequest>,
     ) -> Result<Response<RroInfoResponse>, Status> {
-        self.state.capture(request.metadata());
+        let metadata = self.state.snapshot_metadata(request.metadata());
+        let body = request.into_inner();
+        self.state.captured.lock().unwrap().push(CapturedCall {
+            metadata,
+            body: CapturedBody::InfoRro(body),
+        });
         match self.state.info_rro.lock().unwrap().pop_front() {
             Some(Ok(r)) => Ok(Response::new(r)),
             Some(Err(s)) => Err(s),
@@ -244,6 +303,70 @@ fn err_check_response(status: check_response::Status, message: &str) -> CheckRes
 
 // ─── Happy paths × 5 RPCs ─────────────────────────────────────────────
 
+/// Assert exactly one call was captured and pull its body, asserting
+/// it is the expected `CapturedBody` variant.  Returns the inner
+/// proto type for further field-level assertions.
+fn expect_one_send_chk_body(state: &MockDpsState) -> Check {
+    let captured = state.captured.lock().unwrap();
+    assert_eq!(captured.len(), 1, "expected exactly one captured call");
+    match &captured[0].body {
+        CapturedBody::SendChk(c) => c.clone(),
+        other => panic!("expected SendChk body, got {other:?}"),
+    }
+}
+
+fn expect_one_last_chk_body(state: &MockDpsState) -> CheckRequest {
+    let captured = state.captured.lock().unwrap();
+    assert_eq!(captured.len(), 1, "expected exactly one captured call");
+    match &captured[0].body {
+        CapturedBody::LastChk(r) => r.clone(),
+        other => panic!("expected LastChk body, got {other:?}"),
+    }
+}
+
+fn expect_one_ping_body(state: &MockDpsState) -> Check {
+    let captured = state.captured.lock().unwrap();
+    assert_eq!(captured.len(), 1, "expected exactly one captured call");
+    match &captured[0].body {
+        CapturedBody::Ping(c) => c.clone(),
+        other => panic!("expected Ping body, got {other:?}"),
+    }
+}
+
+fn expect_one_status_rro_body(state: &MockDpsState) -> CheckRequest {
+    let captured = state.captured.lock().unwrap();
+    assert_eq!(captured.len(), 1, "expected exactly one captured call");
+    match &captured[0].body {
+        CapturedBody::StatusRro(r) => r.clone(),
+        other => panic!("expected StatusRro body, got {other:?}"),
+    }
+}
+
+fn expect_one_info_rro_body(state: &MockDpsState) -> CheckRequest {
+    let captured = state.captured.lock().unwrap();
+    assert_eq!(captured.len(), 1, "expected exactly one captured call");
+    match &captured[0].body {
+        CapturedBody::InfoRro(r) => r.clone(),
+        other => panic!("expected InfoRro body, got {other:?}"),
+    }
+}
+
+/// Assert that a `gen::Check` body matches the canonical envelope
+/// produced by `From<CheckEnvelope> for gen::Check`.  Field-by-field
+/// so a future regression in `dto.rs` (field swap, dropped value,
+/// truncated bytes) fails loudly here rather than silently when a
+/// real DPS rejects the malformed wire payload.
+fn assert_check_body_matches_canonical_envelope(c: &Check) {
+    use prro::transports::dps::gen::check::Type;
+    assert_eq!(c.rro_fn, "1234567890");
+    assert_eq!(c.date_time, 1_700_000_000);
+    assert_eq!(c.check_sign, b"<signed-cms-bytes>");
+    assert_eq!(c.local_number, 42);
+    assert_eq!(c.check_type, Type::Chk as i32);
+    assert_eq!(c.id_offline, "");
+    assert_eq!(c.id_cancel, "");
+}
+
 #[tokio::test]
 async fn send_chk_happy_returns_check_ack() {
     let h = start_mock().await;
@@ -257,6 +380,13 @@ async fn send_chk_happy_returns_check_ack() {
     assert_eq!(ack.id, "FN-OK-1");
     assert_eq!(ack.id_sign, b"<id-sign>");
     assert_eq!(ack.data_sign, b"<data-sign>");
+
+    // Body assertion: the wire payload must reflect the typed
+    // envelope passed to send_chk.  Catches a regression in
+    // `From<CheckEnvelope> for gen::Check` that a response-only
+    // assertion would miss.
+    let body = expect_one_send_chk_body(&h.state);
+    assert_check_body_matches_canonical_envelope(&body);
 }
 
 #[tokio::test]
@@ -270,6 +400,12 @@ async fn last_chk_happy_returns_check_ack() {
     let ch = channel(&h.endpoint).await;
     let ack = ch.last_chk(&fn_sign()).await.expect("happy");
     assert_eq!(ack.id, "FN-LAST-9");
+
+    // Body assertion: rro_fn_sign must equal the bytes wrapped in
+    // CheckSignBlob.  Catches a regression in
+    // `From<&CheckSignBlob> for gen::CheckRequest`.
+    let body = expect_one_last_chk_body(&h.state);
+    assert_eq!(body.rro_fn_sign, b"<rro-fn-sign>");
 }
 
 #[tokio::test]
@@ -283,6 +419,11 @@ async fn ping_happy_returns_check_ack() {
     let ch = channel(&h.endpoint).await;
     let ack = ch.ping(check_envelope()).await.expect("happy");
     assert_eq!(ack.id, "PONG");
+
+    // ping shares the Check shape with send_chk; same canonical
+    // envelope must reach the wire.
+    let body = expect_one_ping_body(&h.state);
+    assert_check_body_matches_canonical_envelope(&body);
 }
 
 #[tokio::test]
@@ -304,6 +445,9 @@ async fn status_rro_happy_returns_status_snapshot() {
     assert!(snap.open_shift);
     assert!(snap.online);
     assert_eq!(snap.last_signer, "OP-007");
+
+    let body = expect_one_status_rro_body(&h.state);
+    assert_eq!(body.rro_fn_sign, b"<rro-fn-sign>");
 }
 
 #[tokio::test]
@@ -336,6 +480,9 @@ async fn info_rro_happy_returns_rro_info() {
     assert_eq!(info.name, "Shop");
     assert_eq!(info.addr, "Kyiv");
     assert!(info.offline_allowed);
+
+    let body = expect_one_info_rro_body(&h.state);
+    assert_eq!(body.rro_fn_sign, b"<rro-fn-sign>");
 }
 
 // ─── DPS non-OK status mapping ────────────────────────────────────────
@@ -582,41 +729,106 @@ async fn query_by_local_identity_returns_query_not_supported_without_hitting_ser
         "expected QueryNotSupported(\"query_by_local_identity\"), got {err:?}"
     );
     assert!(
-        h.state.captured_metadata.lock().unwrap().is_empty(),
+        h.state.captured.lock().unwrap().is_empty(),
         "default-body QueryNotSupported must not hit the server"
     );
 }
 
+/// Validate a single `grpc-timeout` header value: `<num><unit>` where
+/// unit is one of n / u / m / S / M / H per the gRPC HTTP/2 spec.
+/// tonic 0.12 picks the unit; we don't lock to a specific choice
+/// because it can vary with the configured Duration value.
+fn assert_grpc_timeout_shape(value: &str) {
+    let last = value.chars().last().expect("non-empty grpc-timeout");
+    assert!(
+        matches!(last, 'n' | 'u' | 'm' | 'S' | 'M' | 'H'),
+        "grpc-timeout must end with a gRPC unit suffix; got {value:?}"
+    );
+    let num: &str = &value[..value.len() - 1];
+    assert!(
+        num.chars().all(|c| c.is_ascii_digit()) && !num.is_empty(),
+        "grpc-timeout numeric prefix invalid in {value:?}"
+    );
+}
+
 #[tokio::test]
-async fn grpc_timeout_metadata_set_on_every_request() {
+async fn grpc_timeout_metadata_set_on_every_rpc() {
     let h = start_mock().await;
+    // Script one OK response per RPC so all five calls land happy
+    // and we accumulate five captured entries.
     h.state
         .send_chk_v2
         .lock()
         .unwrap()
-        .push_back(Ok(ok_check_response("FN-METADATA-PROBE")));
-    let ch = channel(&h.endpoint).await;
-    let _ = ch.send_chk(check_envelope()).await.expect("happy");
+        .push_back(Ok(ok_check_response("a")));
+    h.state
+        .last_chk
+        .lock()
+        .unwrap()
+        .push_back(Ok(ok_check_response("b")));
+    h.state
+        .ping
+        .lock()
+        .unwrap()
+        .push_back(Ok(ok_check_response("c")));
+    h.state
+        .status_rro
+        .lock()
+        .unwrap()
+        .push_back(Ok(StatusResponse {
+            open_shift: false,
+            online: false,
+            last_signer: String::new(),
+            status: status_response::Status::Ok as i32,
+            error_message: String::new(),
+        }));
+    h.state
+        .info_rro
+        .lock()
+        .unwrap()
+        .push_back(Ok(RroInfoResponse {
+            status: rro_info_response::Status::Ok as i32,
+            status_rro: 0,
+            open_shift: false,
+            online: false,
+            last_signer: String::new(),
+            name: String::new(),
+            name_to: String::new(),
+            addr: String::new(),
+            single_tax: false,
+            offline_allowed: false,
+            add_num: 0,
+            pn: String::new(),
+            operators: Vec::new(),
+            tins: String::new(),
+            lnum: 0,
+            name_pay: String::new(),
+        }));
 
-    let captured = h.state.captured_metadata.lock().unwrap();
-    assert_eq!(captured.len(), 1, "exactly one call captured");
-    let md = &captured[0];
-    let timeout = md.get("grpc-timeout").expect(
-        "grpc-timeout header MUST be present (set via tonic::Request::set_timeout in W3-C3)",
+    let ch = channel(&h.endpoint).await;
+    let _ = ch.send_chk(check_envelope()).await.expect("send_chk");
+    let _ = ch.last_chk(&fn_sign()).await.expect("last_chk");
+    let _ = ch.ping(check_envelope()).await.expect("ping");
+    let _ = ch.status_rro(&fn_sign()).await.expect("status_rro");
+    let _ = ch.info_rro(&fn_sign()).await.expect("info_rro");
+
+    let captured = h.state.captured.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        5,
+        "all five RPCs should be captured; got {captured:?}"
     );
-    // tonic encodes the duration as `<num><unit>` where unit is one
-    // of n / u / m / S / M / H.  We seeded the channel with
-    // `Duration::from_secs(5)`; tonic 0.12 typically renders this as
-    // milliseconds (e.g., "5000m") or larger (5S).  Both are valid;
-    // we assert the format shape, not the unit choice.
-    let last = timeout.chars().last().expect("non-empty grpc-timeout");
-    assert!(
-        matches!(last, 'n' | 'u' | 'm' | 'S' | 'M' | 'H'),
-        "grpc-timeout must end with a gRPC unit suffix; got {timeout:?}"
-    );
-    let num: &str = &timeout[..timeout.len() - 1];
-    assert!(
-        num.chars().all(|c| c.is_ascii_digit()) && !num.is_empty(),
-        "grpc-timeout numeric prefix invalid in {timeout:?}"
-    );
+    // Per-call: every entry must carry the grpc-timeout header
+    // (set by GrpcDpsChannel::request via tonic::Request::set_timeout
+    // in W3-C3, commit 580ed20).  Closes the C4 review finding that
+    // the previous test only proved the header on send_chk.
+    for (i, call) in captured.iter().enumerate() {
+        let timeout = call.metadata.get("grpc-timeout").unwrap_or_else(|| {
+            panic!(
+                "grpc-timeout MUST be present on RPC #{i} ({:?})",
+                std::mem::discriminant(&call.body)
+            )
+        });
+        assert_grpc_timeout_shape(timeout);
+    }
 }
