@@ -2,13 +2,13 @@
   "planPath": "docs/superpowers/plans/2026-05-06-m3-w0-research.md",
   "specPath": null,
   "scope": "M3-W0 research — research-address 5 entry decisions from docs/M2-handoff.md §4.3 (PRRO_GATE-ddn, -zti, -k99, -6bj, -ah8) by producing 3 frozen findings/spec documents.  Research only; no code edits.  bd issues remain open after W0; closure happens at M3a implementation time.  After W0 closes, an ADR amendment + M3a implementation plan is drafted on solid ground.",
-  "lastUpdated": "2026-05-06T20:35:00Z",
+  "lastUpdated": "2026-05-06T20:55:00Z",
   "tasks": [
     {
       "id": 0,
       "subject": "Task 0: M3 epic + bd cross-link (administrative)",
-      "status": "pending",
-      "description": "Administrative ~30 min.  Create PRRO_GATE-M3 epic, link 5 entry-decision issues as child-of, link M3 epic as discovered-from on M2 epic.\n\n```json:metadata\n{\"files\":[],\"verifyCommand\":\"bd list --status open | grep -A 5 'M3.*write-path'\",\"acceptanceCriteria\":[\"M3 epic created\",\"5 child-of edges set (ddn/zti/k99/6bj/ah8)\",\"discovered-from edge to M2 epic PRRO_GATE-82j\"]}\n```"
+      "status": "completed",
+      "description": "Administrative ~30 min.  Create PRRO_GATE-M3 epic, link 5 entry-decision issues as child-of, link M3 epic as discovered-from on M2 epic.\n\nResult: PRRO_GATE-9qd created (epic, P1).  parent-child edges added: ddn/zti/k99/6bj/ah8 → 9qd.  discovered-from edge added: 9qd → PRRO_GATE-82j (M2 epic).  bd dolt push complete.\n\n```json:metadata\n{\"files\":[],\"verifyCommand\":\"bd list --status open | grep -A 5 'M3.*write-path'\",\"acceptanceCriteria\":[\"M3 epic created (PRRO_GATE-9qd)\",\"5 parent-child edges set (ddn/zti/k99/6bj/ah8 → 9qd)\",\"discovered-from edge set (9qd → PRRO_GATE-82j)\"]}\n```"
     },
     {
       "id": 1,
