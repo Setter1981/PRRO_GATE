@@ -77,13 +77,12 @@ rust/prro/
     goldens/                                   # NEW — frozen test vectors (committed)
       # kvt1/, kvt2/ DEFERRED from W4 first round (see W4 scope note)
       cms/                                     # NEW — deterministic-prefix CMS-signed XML
-      xml/                                     # NEW — canonical unsigned XML for 5 doc types
+      xml/                                     # NEW — canonical unsigned XML for 4 doc types
         shift_open.bin
-        shift_close.bin
         sell.bin
         return.bin
-        z_report.bin
-      regenerate.py                            # NEW — manual capture script (NOT CI-triggered)
+        z_report.bin                          # also IS the close-shift wire artifact
+      regenerate.rs                            # NEW — manual capture binary (NOT CI-triggered)
       README.md                                # NEW — operator procedure for re-capture
     api_surface_no_db_handle.rs                # NEW — W5 ADR-M2-6 static check via `syn`
     secret_flow_tracing.rs                     # NEW — W6 tracing-subscriber substring check
@@ -2152,30 +2151,50 @@ Before W3 is marked complete and M2 advances:
 
 ## Task 4 (W4) — byte-equivalence goldens harness
 
-**Goal:** Land the goldens harness + first round of frozen test vectors covering: canonical unsigned XML for SHIFT_OPEN/SHIFT_CLOSE/SELL/RETURN/Z_REPORT and the deterministic-prefix CMS-signed XML zone.  Plus a manual-only re-capture script.
+**Goal:** Land the goldens harness + first round of frozen test vectors covering: canonical unsigned XML for SHIFT_OPEN / SELL / RETURN / Z_REPORT and the deterministic-prefix CMS-signed XML zone.  Plus a manual-only re-capture script.
 
-> **Scope note (W4 first round).** KVT1/KVT2 parser input/struct goldens are explicitly DEFERRED from W4's first round.  W1's `prro::crypto` wrapper does not include a KVT parser — the Python `transports/dps_fiscal_server.py` decoder will be lifted into Rust as a follow-up `prro::crypto::kvt::{parse_kvt1, parse_kvt2}` module gated on W3 (DpsChannel) so fixtures can be captured from real `lastChk` round-trips.  Filed as a discovered-from issue against the M2 epic at W4 task start.
+> **Scope note (W4 first round, revision 2026-05-06).**  WebCheck +
+> DPS reality:  there is no separate "SHIFT_CLOSE" XML on the wire.
+> "Close shift" is fiscally identical to a Z-report — `WebCheck/
+> CreateDB.cs:624` indexes shift-close on `doctype = '80'` (the
+> Z-report doctype), `WebCheckMain/StringXML.cs:2509` routes
+> `OpenCloseShift: true` close through `SubmitCheck(typCheck=2)`,
+> and the DPS `Check.Type::ZREPORT = 2` proto enum confirms
+> `typCheck=2` IS the Z-report (`fiscal_server.proto:24`).  W4
+> therefore commits exactly FOUR canonical-XML goldens
+> (`shift_open`, `sell`, `return`, `z_report`); the fourth doubles
+> as the close-shift wire artifact.  Drift between this scope and
+> the legacy Python `transports/` adapter (which today maps
+> `CloseShift → SHIFT_CLOSE`) is filed as a separate bd follow-up
+> for the M3 ingress / adapter layer; W4's job is the wire
+> contract, not the legacy Python adapter's internal naming.
+>
+> KVT1/KVT2 parser input/struct goldens are explicitly DEFERRED
+> from W4's first round.  W1's `prro::crypto` wrapper does not
+> include a KVT parser; lifting the legacy decoder into Rust is a
+> follow-up `prro::crypto::kvt` module gated on W3.
 
-**Day budget:** 4-6 days.  XML builder for the 5 doc types + capture-script wiring + fixture review eat the budget.
+**Day budget:** 4-6 days.  XML builder for the 4 doc types + capture-script wiring + fixture review eat the budget.
 
 **Implements:** ADR-M2-3.  blockedBy: W1, W3.  (W3 is needed because the deterministic-prefix CMS golden is captured from the same `prro::crypto::sign_cms_detached` path the M2 transport will exercise; KVT1/KVT2 parsers are out of scope for W4 first round, see scope note above.)
 
 **Files:**
 
-- Create: `rust/prro/src/xml/` — minimal canonical XML builder for the 5 doc types (no general schema; literally just enough to produce byte-identical output to Python on these 5 cases).
+- Create: `rust/prro/src/xml/` — minimal canonical XML builder for the 4 doc types (no general schema; literally just enough to produce a byte-stable canonical wire payload for each).  Scope per the W4 scope-note above: `shift_open`, `sell`, `return`, `z_report` (which doubles as close-shift).
 - Create: `rust/prro/tests/goldens_byte_equiv.rs` — the harness.
 - Create: `rust/prro/tests/goldens/{xml,cms,prevhash}/*.bin` — frozen fixtures.  (`kvt1/`, `kvt2/` directory layout is reserved by the tree but no fixtures land in W4 first round — see scope note.)
-- Create: `rust/prro/tests/goldens/regenerate.py` — manual capture script.
+- Create: `rust/prro/tests/goldens/regenerate.rs` — manual capture script (Rust binary, not Python; the goldens are Rust-output canonicalised by the Rust builder, frozen by manual review).
 - Create: `rust/prro/tests/goldens/README.md` — operator procedure.
 - Create: `docs/M2-goldens-capture.md` — operator-facing procedure.
 
 **Acceptance Criteria:**
 
 - [ ] `tests/goldens_byte_equiv.rs` runs against the frozen `tests/goldens/**/*.bin` files: each test reads a `.bin`, runs the Rust producer (XML builder / CMS signer with deterministic test key), and asserts byte equality.
-- [ ] First-round goldens committed: `xml/{shift_open,shift_close,sell,return,z_report}.bin`; `cms/deterministic_prefix.bin` (or similar); `prevhash/seed.bin`.  (KVT1/KVT2 fixtures DEFERRED — see scope note.)
-- [ ] `regenerate.py` documents-the-procedure + (when run with a Python checkout side-by-side) re-captures from the live Python and prints a `diff` against the frozen vectors.  CI does NOT run it.
-- [ ] If a golden fails (Python output drifts), the test surfaces a diff readable in CI logs (hex dump of first ~64 differing bytes).
+- [ ] First-round goldens committed: `xml/{shift_open,sell,return,z_report}.bin`; `cms/deterministic_prefix.bin` (or similar); `prevhash/seed.bin`.  No `xml/shift_close.bin` — `z_report` IS the close-shift wire artifact (see scope note).  KVT1/KVT2 fixtures DEFERRED.
+- [ ] `regenerate.rs` documents-the-procedure + re-captures from the Rust builder and prints a `diff` against the frozen vectors.  CI does NOT run it.  Re-capture is a deliberate-spec-change action, not a regression-fix action — every re-capture goes through manual review of the new bytes.
+- [ ] If a golden fails (Rust output drifts), the test surfaces a diff readable in CI logs (hex dump of first ~64 differing bytes).
 - [ ] CMS goldens are split into "deterministic prefix" (the XML-to-be-signed bytes) — pinned byte-equivalent — and "signature shape" (signature is parsed + verified, NOT byte-compared).
+- [ ] Doc record:  `WebCheck CloseShift == DPS Z_REPORT (typCheck=2, doctype=80)` is stated explicitly in the goldens README so a future contributor cannot accidentally re-introduce a separate `shift_close` golden.
 
 **Verify:**
 
@@ -2221,7 +2240,9 @@ fn xml_shift_open_canonical_byte_equal() {
     assert_golden_eq(&actual, "tests/goldens/xml/shift_open.bin");
 }
 
-// Repeat for shift_close, sell, return, z_report.
+// Repeat for sell, return, z_report.  No separate shift_close — the
+// z_report golden IS the close-shift wire artifact (DPS Check.Type
+// ZREPORT = 2; WebCheck CreateDB.cs:624 + StringXML.cs:2509).
 
 // KVT1/KVT2 input→struct goldens are deferred from W4's first round.
 // The parser does NOT ship in W1 (`prro::crypto` is wrapper-only over
