@@ -1,0 +1,35 @@
+{
+  "oracle": "src/prro_gateway/serializers/dps_xml.py",
+  "files": [
+    {
+      "path": "goldens/xml/shift_open.bin",
+      "sha256": "a1251d7314e913354aab38cbdc671b85d061f3d3d52c8cdab50d0dcb368324f7",
+      "length": 197
+    },
+    {
+      "path": "goldens/xml/sell.bin",
+      "sha256": "5f00dd0edb6f8377aff64956948584f1ddf8f13b1db32a0cc2e31f8e22074400",
+      "length": 327
+    },
+    {
+      "path": "goldens/xml/return.bin",
+      "sha256": "3c6543c91f34375e2bfba983fce53bcf39f5c2cb7ac90651a307e38d9613e9b4",
+      "length": 327
+    },
+    {
+      "path": "goldens/xml/z_report.bin",
+      "sha256": "02943e4cc63f5b5fde0259ce748dfc0268d5d5ceb3007e7c7964542b70b5d297",
+      "length": 225
+    },
+    {
+      "path": "goldens/cms/deterministic_prefix.bin",
+      "sha256": "5f00dd0edb6f8377aff64956948584f1ddf8f13b1db32a0cc2e31f8e22074400",
+      "length": 327
+    },
+    {
+      "path": "goldens/prevhash/seed.bin",
+      "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+      "length": 32
+    }
+  ]
+}
