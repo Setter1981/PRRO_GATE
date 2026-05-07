@@ -38,15 +38,105 @@
 
 ---
 
-## 3. Explicitly deferred to M3b
+## 3. Explicitly deferred from M3a (post-M3a Rust-only sequence)
 
-- Offline session lifecycle (open/drain/close OFFLINE_LOCAL_ACK pool) — W0-3 §5 trigger map carve-out.
-- OFFLINE_LOCAL_ACK whitelist extension to 6 targets + retry self-loop per `services/offline_sync.py:10-14` — W0-1 §6.3 amendment, W0-3 §3 explicit M3b extension.
-- `ix_offline_active` UNIQUE migration — W0-1 §6.3 (M3b blocker, M3a non-blocker because M3a never opens offline sessions).
-- Pattern C "stage and flip" — W0-2 §5.3 reservation.
-- Operator recovery UI / manual-reconciliation flows — out of M3a scope.
-- M3b automated reconciliation worker (`last_chk` with cooldown / rate-limiting for SENDING-state docs) — W0-3 §6.3.
-- Auto-flip OFFLINE→ONLINE via `ping(fn_sign)` confirmation — W0-3 §4.3 branch (d) option (iii).
+Per ADR `docs/superpowers/specs/2026-05-07-pilot-runtime-decision.md`
+(Status: ACCEPTED), the path from M3a to live pilot is the Rust-only
+milestone sequence **M3b → M4 → M5**, with **M6** delivering the pilot
+admin surface separately.  No Python service runs on the pilot path;
+references to Python files in this section are behavioural reference for
+the Rust port, not implementation pointers, and references to Python-era
+bd issues (notably `PRRO_GATE-er6`) are superseded historical spec
+sources, not work items for Python implementation.
+
+### 3.1 M3b — Phase-6-min offline subsystem (Rust)
+
+Deferred from M3a; the minimum Rust offline subsystem required to pass
+`PILOT_ACCEPTANCE_TEST_PLAN` Phase 6 (offline lifecycle: enter offline,
+issue receipts under `OFFLINE_LOCAL_ACK`, block Z-report on backlog,
+return online, sync, finalize).
+
+36h / 168h offline-limit enforcement and the 24h shift guard are **not**
+part of Phase-6-min acceptance unless promoted into M3b scope, but
+omitting them from a live pilot requires **explicit owner risk
+acceptance** recorded before Go.  Offline-code availability and
+offline-code-pool bounds remain in M3b — without them Phase 6 has no
+meaning.
+
+- Offline session lifecycle: open / drain / close `OFFLINE_LOCAL_ACK`
+  pool — W0-3 §5 trigger map carve-out.
+- `OFFLINE_LOCAL_ACK` whitelist extension to 6 targets + retry self-loop
+  — W0-1 §6.3 amendment, W0-3 §3 explicit M3b extension.  bd
+  `PRRO_GATE-er6` (Sprint 2 step 1: OfflineSyncService selector) **will
+  be closed during ADR propagation** as a superseded historical spec
+  source; no Python implementation under this scope.
+- `ix_offline_active` UNIQUE migration — W0-1 §6.3 (M3b blocker; M3a
+  non-blocker because M3a never opens offline sessions).
+- Pattern C "stage and flip" envelope-then-finalize — W0-2 §5.3
+  reservation.
+- Auto-flip OFFLINE → ONLINE via `ping(fn_sign)` confirmation — W0-3
+  §4.3 branch (d) option (iii).
+
+### 3.2 M4 — Rust ingress + transport bridges
+
+Deferred from M3a; required to remove Python ingress shells from the
+pilot path.
+
+- Rust ingress shells: REST, XML-RPC, Maria-shell (replace
+  `scripts/run_rest.py`, `scripts/run_xmlrpc.py`,
+  `scripts/run_maria.py`).
+- `maria304_driver` bridge re-target: from Python REST
+  (`reqwest::blocking` in `spawn_blocking`) to in-process Rust gateway.
+- 1С OLE bridge subsystem (sized after operator profile inventory; ADR
+  open item O1).
+
+### 3.3 M5 — services tail
+
+Deferred from M3a; required to complete Python eradication for the
+pilot.
+
+- Ingress writer (replaces `services/ingress.py`).
+- Generic `SENDING`-state reconciliation worker (`last_chk` with
+  cooldown / rate-limiting for operator-stuck `SENDING`-state docs) —
+  W0-3 §6.3.  Lives in M5, **not** M3b: M3b carries only the
+  offline-recovery surface required by Phase 6; the general-purpose
+  `SENDING` reconciler is M5 because it is not gated by Phase 6
+  acceptance.
+- Post-boot reconciliation surface points (the `App::boot`
+  reconciliation phase itself is in M3a §2; M5 adds long-running
+  post-boot reconciliation hooks).
+- Operator manual-reconciliation hooks exposed through the CLI surface
+  per ADR D2 (no web admin in pilot scope).
+- `cert_provisioning` subsystem — gated by ADR open item O2; only if
+  automated key / cert provisioning is required for pilot.
+- `retention` and `shift_aggregation` — gated by ADR open item O3;
+  depth depends on pilot duration and reporting requirements.
+
+### 3.4 M6 — admin surface (CLI only for pilot)
+
+Deferred from M3a; pilot delivers CLI only per ADR D2.
+
+- `prro_admin` CLI subcommands at minimum: `status`, `set-config`,
+  `cert show / rotate`, `node-state show / set`,
+  `manual-reconcile <doc-id>`.
+- Web admin UI (port of `admin_ui/routes.py` + Jinja templates) is
+  **not** in M6 pilot delivery; reconsidered post-pilot once real
+  operator workflow needs are observed.
+
+### 3.5 Pilot prerequisites running parallel to code milestones
+
+Per ADR D3, these are **not** code-milestone tail items and **not**
+part of M3b / M5; they are a parallel docs+ops track that gates live
+pilot independently of code completion.
+
+- `OPERATIONS.md` runbooks: backup / restore (SQLite WAL `.backup`
+  API, not file copy), key / CA-bundle rotation, rollback rehearsal.
+- M3a-end ONLINE-against-test-DPS smoke (mandatory if a non-production
+  DPS contour is available; otherwise discharged by explicit owner
+  waiver committed before M3b — ADR test gate #4).
+- Closure of ADR open items O1 / O2 / O3 (1С OLE scope, onboarding
+  automation, retention depth) **before** M4 / M5 sizing — these
+  decisions are the bottleneck on plan writing for those milestones.
 
 ---
 
