@@ -2,13 +2,13 @@
   "planPath": "docs/superpowers/plans/2026-05-07-m3a-implementation.md",
   "specPath": null,
   "scope": "M3a implementation — ONLINE happy-path write-path + guarded recovery, anchored on ADR-M3-A1..A9 (committed 8c72a14) + W0 §9 test acceptance (51 explicit fixtures).  Day budgets are confidence ranges; aim 6 weeks optimistic / 8 weeks realistic with review cycles.  M3b deferrals per docs/M3-W0-handoff.md §3.  Production W-tasks bundle code+tests; W11 is the explicit cross-stage deterministic-replay test gate.  Task IDs follow execution order; W labels keep ADR/work-package names.",
-  "lastUpdated": "2026-05-07T20:30:00Z",
+  "lastUpdated": "2026-05-07T13:00:00Z",
   "tasks": [
     {
       "id": 0,
       "subject": "Task 0 (W0a): M3a epic + bd cross-link (administrative)",
-      "status": "pending",
-      "description": "~30 min.  Create PRRO_GATE-M3a epic; link 5 entry-decision bd issues (ddn/zti/k99/6bj/ah8) as child-of; link M3a epic as child-of PRRO_GATE-9qd (M3 epic).  Mirror M2 / M3-W0 admin pattern.\n\n```json:metadata\n{\"files\":[],\"verifyCommand\":\"bd list --status open | grep -A 5 'M3a.*implementation'\",\"acceptanceCriteria\":[\"M3a epic created\",\"5 child-of edges (ddn/zti/k99/6bj/ah8)\",\"child-of edge to PRRO_GATE-9qd\"]}\n```"
+      "status": "completed",
+      "description": "~30 min.  Create PRRO_GATE-M3a epic; link 5 entry-decision bd issues (ddn/zti/k99/6bj/ah8) as child-of; link M3a epic as child-of PRRO_GATE-9qd (M3 epic).  Mirror M2 / M3-W0 admin pattern.\n\n```json:metadata\n{\"files\":[],\"verifyCommand\":\"bd list --status open | grep -A 5 'M3a.*implementation'\",\"acceptanceCriteria\":[\"M3a epic created\",\"5 child-of edges (ddn/zti/k99/6bj/ah8)\",\"child-of edge to PRRO_GATE-9qd\"]}\n```\n\n**Result (2026-05-07):** M3a epic created as `PRRO_GATE-9qd.1` (parent-child to PRRO_GATE-9qd set at creation via --parent).  5 entry-decision issues re-linked from PRRO_GATE-9qd to PRRO_GATE-9qd.1 (parent-child edges removed from 9qd, added to 9qd.1): ddn (lnd monotonicity), zti (CloseShift→Z_REPORT), k99 (transition_state lock discipline), 6bj (retry/recovery policy), ah8 (App::boot upsert).  Verified via `bd list --parent PRRO_GATE-9qd.1` (5 children listed) and `bd list --parent PRRO_GATE-9qd` (single M3a child)."
     },
     {
       "id": 1,
