@@ -1,0 +1,91 @@
+{
+  "planPath": "docs/superpowers/plans/2026-05-07-m3a-implementation.md",
+  "specPath": null,
+  "scope": "M3a implementation — ONLINE happy-path write-path + guarded recovery, anchored on ADR-M3-A1..A9 (committed 8c72a14) + W0 §9 test acceptance (51 explicit fixtures).  Day budgets are confidence ranges; aim 6 weeks optimistic / 8 weeks realistic with review cycles.  M3b deferrals per docs/M3-W0-handoff.md §3.  Production W-tasks bundle code+tests; W11 is the explicit cross-stage deterministic-replay test gate.  Task IDs follow execution order; W labels keep ADR/work-package names.",
+  "lastUpdated": "2026-05-07T20:30:00Z",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0 (W0a): M3a epic + bd cross-link (administrative)",
+      "status": "pending",
+      "description": "~30 min.  Create PRRO_GATE-M3a epic; link 5 entry-decision bd issues (ddn/zti/k99/6bj/ah8) as child-of; link M3a epic as child-of PRRO_GATE-9qd (M3 epic).  Mirror M2 / M3-W0 admin pattern.\n\n```json:metadata\n{\"files\":[],\"verifyCommand\":\"bd list --status open | grep -A 5 'M3a.*implementation'\",\"acceptanceCriteria\":[\"M3a epic created\",\"5 child-of edges (ddn/zti/k99/6bj/ah8)\",\"child-of edge to PRRO_GATE-9qd\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1 (W1): Schema foundation — migrations 007 (UNIQUE fn,lnd) + 008 (DocState::Sending) + whitelist additions",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "1-2 days.  Anchored ADR-M3-A1, A8, A9 step 1-3.  Files: migrations/007_lnd_unique.sql, migrations/008_doc_state_sending.sql, db/models/enums.rs (Sending variant), db/repositories/fiscal_documents.rs (whitelist + list_pending_for_fn), tests/repo_fiscal_documents_state_cas.rs (extend matrix), tests/migrations_007_008.rs (new).  Migration 008 MUST be an explicit SQLite table-rebuild migration for fiscal_documents.state CHECK (create fiscal_documents_new with SENDING + STRICT, copy rows, recreate FKs/indexes/triggers, swap); ALTER CHECK is not available.  Bundle code+tests.\n\n```json:metadata\n{\"files\":[\"rust/prro/migrations/007_lnd_unique.sql\",\"rust/prro/migrations/008_doc_state_sending.sql\",\"rust/prro/src/db/models/enums.rs\",\"rust/prro/src/db/repositories/fiscal_documents.rs\",\"rust/prro/tests/repo_fiscal_documents_state_cas.rs\",\"rust/prro/tests/migrations_007_008.rs\"],\"verifyCommand\":\"cargo test -p prro --test repo_fiscal_documents_state_cas --test migrations_007_008\",\"acceptanceCriteria\":[\"migrations 007+008 apply cleanly\",\"DocState::Sending round-trips through sqlx\",\"allowed_transition matrix extended with 7 new entries\",\"list_pending_for_fn returns Sending docs\",\"cargo sqlx prepare regenerates cache\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2 (W4): M2/W3 additive amendment — DpsError::Authorization { code, kind, message }",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "1-2 days.  PARALLEL with W1 (different failure domain; small additive API prep).  Anchored ADR-M3-A6 prereq.  Files: transports/dps/error.rs (Authorization variant + AuthorizationKind enum), transports/dps/dto.rs:178-184 (decoder split), tests/dps_channel_smoke.rs (3 new fixtures).  Bundle code+tests.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/transports/dps/error.rs\",\"rust/prro/src/transports/dps/dto.rs\",\"rust/prro/tests/dps_channel_smoke.rs\"],\"verifyCommand\":\"cargo test -p prro --test dps_channel_smoke && cargo test -p prro\",\"acceptanceCriteria\":[\"Authorization variant has code/kind/message fields\",\"dto.rs splits -1 vs -13/-14\",\"3 new smoke fixtures green\",\"full prro suite stays green\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3 (W2): WriteTxConn<'_> sealed newtype + transition_state/shifts::transition signature change",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "3-4 days.  Risk: lifetime-shape ergonomics (3 fallback HRTB shapes per W0-2 §4.4).  Anchored ADR-M3-A4.  Files: db/tx.rs (WriteTxConn sealed newtype + with_immediate signature change), db/repositories/fiscal_documents.rs (transition_state signature), db/repositories/shifts.rs (transition signature), db/repositories/ingress_inbox.rs + services/cert_refresher.rs (call sites updated), tests/write_tx_conn_compile_fail/ (5 trybuild fixtures), tests/transition_state_atomicity.rs (Phase B post-fix CI).  Bundle code+tests.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/db/tx.rs\",\"rust/prro/src/db/repositories/fiscal_documents.rs\",\"rust/prro/src/db/repositories/shifts.rs\",\"rust/prro/src/db/repositories/ingress_inbox.rs\",\"rust/prro/src/services/cert_refresher.rs\",\"rust/prro/tests/write_tx_conn_compile_fail/\",\"rust/prro/tests/transition_state_atomicity.rs\"],\"verifyCommand\":\"cargo test -p prro --test write_tx_conn_compile_fail --test transition_state_atomicity && cargo test -p prro\",\"acceptanceCriteria\":[\"WriteTxConn sealed; trybuild compile-fail green\",\"transition_state + shifts::transition take &mut WriteTxConn<'_>\",\"5 trybuild compile-fail fixtures green\",\"Phase B atomicity test green\",\"M2 baseline 164+ tests stay green\",\"doc-comment known-limitation removed\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4 (W3): with_immediate hybrid enforcement — static scan + tokio::task_local!",
+      "status": "pending",
+      "blockedBy": [3],
+      "description": "3-4 days.  Anchored ADR-M3-A3.  Files: db/tx.rs (tokio::task_local! IN_WITH_IMMEDIATE + scope), crypto/in_process.rs + transports/dps/grpc.rs + channel.rs (debug_assert! at every M2 substrate public-API entry), tests/with_immediate_no_foreign_io.rs (W5-sibling syn-based AST scanner with denylist including spawn_blocking + block_in_place literal call expressions), tests/with_immediate_runtime_guard.rs (5 §9.1 fixtures).  Bundle code+tests.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/db/tx.rs\",\"rust/prro/src/crypto/in_process.rs\",\"rust/prro/src/transports/dps/grpc.rs\",\"rust/prro/src/transports/dps/channel.rs\",\"rust/prro/tests/with_immediate_no_foreign_io.rs\",\"rust/prro/tests/with_immediate_runtime_guard.rs\"],\"verifyCommand\":\"cargo test -p prro --test with_immediate_no_foreign_io --test with_immediate_runtime_guard\",\"acceptanceCriteria\":[\"tokio::task_local! setup correct\",\"debug_assert! at every M2 substrate entry\",\"static scan catches substrate methods + spawn_blocking + block_in_place\",\"5 §9.1 fixtures behave per spec\",\"release build zero perf cost\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5 (W5): Write-path stages 1+2 — acquire+validate + guard",
+      "status": "pending",
+      "blockedBy": [3, 4],
+      "description": "3-4 days.  Anchored ADR-M3-A1 (lnd sequencer), A5 (Pattern A), A7 (App::boot interaction surface).  Files: services/write_path/mod.rs + stage_acquire.rs + types.rs, existing db/repositories/node_state.rs (add allocate_next_lnd), existing db/repositories/ingress_inbox.rs (add acquire_lease), existing db/repositories/audit_log.rs (add append_tx; do not create a duplicate audit module), tests/write_path_stage1_acquire.rs (4 fixtures: happy / lease miss / replay / UNIQUE collision).  Bundle code+tests.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/services/write_path/mod.rs\",\"rust/prro/src/services/write_path/stage_acquire.rs\",\"rust/prro/src/services/write_path/types.rs\",\"rust/prro/src/db/repositories/node_state.rs\",\"rust/prro/src/db/repositories/ingress_inbox.rs\",\"rust/prro/src/db/repositories/audit_log.rs\",\"rust/prro/tests/write_path_stage1_acquire.rs\"],\"verifyCommand\":\"cargo test -p prro --test write_path_stage1_acquire\",\"acceptanceCriteria\":[\"stage 1 opens with_immediate once per request\",\"no network/crypto inside lock\",\"lnd allocation atomic + UNIQUE fail-closed\",\"lease miss returns Noop\",\"inbox replay-detect\",\"4 stage-1 fixtures green\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6 (W6): Write-path stage 3 — sign (Pattern A: compute outside, persist inside)",
+      "status": "pending",
+      "blockedBy": [5],
+      "description": "3-4 days.  Anchored ADR-M3-A2 (CloseShift→ZReport at builder; Z-allocation by wire_artifact_kind), A5 (Pattern A).  Files: services/write_path/stage_sign.rs, db/repositories/document_files.rs (new), existing db/repositories/node_state.rs (add allocate_z_report_number), tests/write_path_stage3_sign.rs (4 fixtures: happy / Z-allocation by wire-kind for both internal labels / crypto error / byte-equiv W4 golden).  Bundle code+tests.  CRITICAL: wire_artifact_kind derived BEFORE Z-allocation gate (NOT internal op label).\n\n```json:metadata\n{\"files\":[\"rust/prro/src/services/write_path/stage_sign.rs\",\"rust/prro/src/db/repositories/document_files.rs\",\"rust/prro/src/db/repositories/node_state.rs\",\"rust/prro/tests/write_path_stage3_sign.rs\"],\"verifyCommand\":\"cargo test -p prro --test write_path_stage3_sign\",\"acceptanceCriteria\":[\"wire_artifact_kind derived before Z-allocation\",\"sign called outside with_immediate\",\"sign result persisted inside with_immediate\",\"Pattern A timestamp ordering proved\",\"4 stage-3 fixtures green\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7 (W7): Write-path stage 4 — send (Pattern B with SENDING marker)",
+      "status": "pending",
+      "blockedBy": [6, 4, 2],
+      "description": "4-5 days.  Largest M3a task.  Critical safety: duplicate-send hazard prevention.  Anchored ADR-M3-A5 (Pattern B mandatory), A6 (DpsError routing — minimal in W7, full in W10), A9 step 5-6 (3-segment lock structure 4-pre/4a/4b).  Files: services/write_path/stage_send.rs (3-segment with_immediate structure), db/repositories/transport_trace.rs (new), tests/write_path_stage4_send.rs (5 fixtures: happy Sending→Sent / inline KVT1 / terminal reject / transport error / Pattern B timestamp ordering proof).  Bundle code+tests.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/services/write_path/stage_send.rs\",\"rust/prro/src/db/repositories/transport_trace.rs\",\"rust/prro/tests/write_path_stage4_send.rs\"],\"verifyCommand\":\"cargo test -p prro --test write_path_stage4_send\",\"acceptanceCriteria\":[\"3-segment lock structure verified\",\"wire send between locks\",\"4 happy-path transitions exercised\",\"Pattern B timestamp ordering proved\",\"idempotency Forbidden outcome\",\"5 stage-4 fixtures green\"]}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 8 (W8): Write-path stage 5 — finalize",
+      "status": "pending",
+      "blockedBy": [7],
+      "description": "2-3 days.  Anchored ADR-M3-A8 (KVT2 forward-only; Ack as terminal-success).  Files: services/write_path/stage_finalize.rs, existing db/repositories/node_state.rs (add update_last_known_xml_sha), db/repositories/outbox.rs (new, stub for M3a), tests/write_path_stage5_finalize.rs (4 fixtures: Kvt2→Ack happy / MAC chain seed atomic / inbox.status=DONE atomic / outbox INSERT inside lock + publish post-commit).  Bundle code+tests.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/services/write_path/stage_finalize.rs\",\"rust/prro/src/db/repositories/node_state.rs\",\"rust/prro/src/db/repositories/outbox.rs\",\"rust/prro/tests/write_path_stage5_finalize.rs\"],\"verifyCommand\":\"cargo test -p prro --test write_path_stage5_finalize\",\"acceptanceCriteria\":[\"finalize is single with_immediate\",\"no network/crypto inside finalize\",\"MAC chain seed updated only on Ack\",\"4 stage-5 fixtures green\"]}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 9 (W10): DpsError routing dispatch — full 8-variant + 12-status-code table",
+      "status": "pending",
+      "blockedBy": [7, 2],
+      "description": "3-4 days.  Anchored ADR-M3-A6 (full retry policy table), A9 (retry path uses ErrorRetryable→Sending, not direct→Sent).  Files: services/write_path/stage_send.rs (replace W7's minimal classify_send_outcome with full DpsError→SendOutcome mapping), services/write_path/error_routing.rs (new, pure-fn route_dps_error returning RoutingDecision), tests/write_path_dps_error_routing.rs (21 fixtures: 10 main DpsError + 11 sub-table Server-routed codes), tests/write_path_mac_recovery.rs (Server -12 MAC-recovery fixture).  Bundle code+tests.  CRITICAL: M3a DPS retry path uses ErrorRetryable→Sending ONLY; ErrorRetryable→Sent never invoked by M3a DPS code.\n\n```json:metadata\n{\"files\":[\"rust/prro/src/services/write_path/stage_send.rs\",\"rust/prro/src/services/write_path/error_routing.rs\",\"rust/prro/tests/write_path_dps_error_routing.rs\",\"rust/prro/tests/write_path_mac_recovery.rs\"],\"verifyCommand\":\"cargo test -p prro --test write_path_dps_error_routing --test write_path_mac_recovery\",\"acceptanceCriteria\":[\"all 8 DpsError variants routed\",\"all 12 Server-routed codes routed\",\"AuthorizationKind dispatch correct\",\"ErrorRetryable→Sent never invoked by M3a DPS\",\"MAC recovery -12 path green\",\"21 routing + MAC fixtures green\"]}\n```"
+    },
+    {
+      "id": 10,
+      "subject": "Task 10 (W9): App::boot reconciliation phase — 6-branch per-FN decision tree",
+      "status": "pending",
+      "blockedBy": [8, 9],
+      "description": "4-5 days.  AFTER W10 so boot uses final DpsError routing.  Anchored ADR-M3-A7.  Closes PRRO_GATE-ah8 acceptance test verbatim.  Files: app.rs (add reconcile_pending method), services/reconciliation/mod.rs + boot_phase.rs (new module), tests/app_boot_reconciliation.rs (9 §9.1 fixtures: branches a-f + idempotency + quick_check failure).  Bundle code+tests.  CRITICAL: PRAGMA quick_check fail-closed without DB writes (mirror Python container.py:144 raises RuntimeError).\n\n```json:metadata\n{\"files\":[\"rust/prro/src/app.rs\",\"rust/prro/src/services/reconciliation/mod.rs\",\"rust/prro/src/services/reconciliation/boot_phase.rs\",\"rust/prro/tests/app_boot_reconciliation.rs\",\"rust/prro/tests/app_boot_quick_check_failure.rs\"],\"verifyCommand\":\"cargo test -p prro --test app_boot_reconciliation --test app_boot_quick_check_failure\",\"acceptanceCriteria\":[\"App::boot keeps pool+migrations shape\",\"quick_check fail-closed without DB writes\",\"upsert_initial only for branch (a)\",\"PRRO_GATE-ah8 verbatim test green\",\"branch (e) orphan to Error + CRITICAL\",\"idempotency run-twice\",\"9 §9.1 fixtures green\"]}\n```"
+    },
+    {
+      "id": 11,
+      "subject": "Task 11 (W11): Deterministic-replay invariant — 9 crash-point fixtures",
+      "status": "pending",
+      "blockedBy": [5, 6, 7, 8, 9, 10],
+      "description": "2-3 days.  Anchored ADR-M3-A8 (pending-set; intentional whitelist gaps), A9 (Sending crash-resume contract).  Files: tests/write_path_deterministic_replay.rs (9 crash-point fixtures: PREPARED, SIGNED, SENDING, SENT cases a/b/c, KVT1, KVT2, ERROR_RETRYABLE).  Bundle test-only (this task IS the test fixture set; no production code change beyond what W5..W10 already shipped).  CRITICAL: §6.3 SENDING fixture verifies ZERO send_chk during recovery; §6.6 KVT2 fixture verifies NO DPS query (KVT2 protocol-final); §6.4 SENT case (c) verifies two-step Sent→ErrorRetryable→Sending transition.\n\n```json:metadata\n{\"files\":[\"rust/prro/tests/write_path_deterministic_replay.rs\"],\"verifyCommand\":\"cargo test -p prro --test write_path_deterministic_replay\",\"acceptanceCriteria\":[\"9 crash-point fixtures cover all 7 pending states\",\"§6.3 SENDING zero send_chk during recovery\",\"§6.6 KVT2 no DPS query\",\"§6.4 SENT case (c) two-step transition\",\"9 fixtures green\"]}\n```"
+    }
+  ]
+}
