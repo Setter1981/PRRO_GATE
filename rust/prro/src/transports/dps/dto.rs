@@ -110,7 +110,7 @@ pub struct RroInfo {
 
 // ─── Typed-DTO ↔ generated-prost conversions (crate-private) ───────────
 
-use super::error::DpsError;
+use super::error::{AuthorizationKind, DpsError};
 use super::gen;
 
 impl From<DpsCheckType> for gen::check::Type {
@@ -175,12 +175,20 @@ pub(crate) fn try_decode_check_response(r: gen::CheckResponse) -> Result<CheckAc
         Status::Unknown => Err(DpsError::Decode(
             "CheckResponse.status missing on the wire (Unknown=0)".into(),
         )),
-        Status::ErrorVerefy | Status::ErrorNotRegisteredRro | Status::ErrorNotRegisteredSigner => {
-            Err(DpsError::Authorization(format!(
-                "{}: {}",
-                st.as_str_name(),
-                r.error_message
-            )))
+        // ADR-M3-A6 prereq: split authorization-class statuses by kind
+        // so the routing layer (W7/W10) can distinguish per-doc rejects
+        // (-1) from per-FN registration failures (-13/-14).
+        Status::ErrorVerefy => Err(DpsError::Authorization {
+            code: Status::ErrorVerefy as i32,
+            kind: AuthorizationKind::DocumentReject,
+            message: format!("{}: {}", st.as_str_name(), r.error_message),
+        }),
+        Status::ErrorNotRegisteredRro | Status::ErrorNotRegisteredSigner => {
+            Err(DpsError::Authorization {
+                code: st as i32,
+                kind: AuthorizationKind::FiscalNumberNotRegistered,
+                message: format!("{}: {}", st.as_str_name(), r.error_message),
+            })
         }
         Status::ErrorUnknown => Err(DpsError::Transport(format!(
             "ERROR_UNKNOWN (-4) — retry-class per W0-1 D3: {}",
@@ -215,12 +223,18 @@ pub(crate) fn try_decode_status_response(
         Status::Unknown => Err(DpsError::Decode(
             "StatusResponse.status missing on the wire (Unknown=0)".into(),
         )),
-        Status::ErrorVerefy | Status::ErrorNotRegisteredRro | Status::ErrorNotRegisteredSigner => {
-            Err(DpsError::Authorization(format!(
-                "{}: {}",
-                st.as_str_name(),
-                r.error_message
-            )))
+        // ADR-M3-A6 prereq — same split as CheckResponse decoder above.
+        Status::ErrorVerefy => Err(DpsError::Authorization {
+            code: Status::ErrorVerefy as i32,
+            kind: AuthorizationKind::DocumentReject,
+            message: format!("{}: {}", st.as_str_name(), r.error_message),
+        }),
+        Status::ErrorNotRegisteredRro | Status::ErrorNotRegisteredSigner => {
+            Err(DpsError::Authorization {
+                code: st as i32,
+                kind: AuthorizationKind::FiscalNumberNotRegistered,
+                message: format!("{}: {}", st.as_str_name(), r.error_message),
+            })
         }
         Status::ErrorUnknown => Err(DpsError::Transport(format!(
             "ERROR_UNKNOWN (-4) — retry-class per W0-1 D3: {}",
@@ -275,8 +289,20 @@ pub(crate) fn try_decode_rro_info_response(r: gen::RroInfoResponse) -> Result<Rr
         Status::Unknown => Err(DpsError::Decode(
             "RroInfoResponse.status missing on the wire (Unknown=0)".into(),
         )),
-        Status::ErrorVerefy | Status::ErrorNotRegisteredRro | Status::ErrorNotRegisteredSigner => {
-            Err(DpsError::Authorization(st.as_str_name().to_string()))
+        // ADR-M3-A6 prereq — same split as the two decoders above.
+        // RroInfoResponse has no error_message field, so the message
+        // carries the typed status name only.
+        Status::ErrorVerefy => Err(DpsError::Authorization {
+            code: Status::ErrorVerefy as i32,
+            kind: AuthorizationKind::DocumentReject,
+            message: st.as_str_name().to_string(),
+        }),
+        Status::ErrorNotRegisteredRro | Status::ErrorNotRegisteredSigner => {
+            Err(DpsError::Authorization {
+                code: st as i32,
+                kind: AuthorizationKind::FiscalNumberNotRegistered,
+                message: st.as_str_name().to_string(),
+            })
         }
         Status::ErrorUnknown => Err(DpsError::Transport(
             "ERROR_UNKNOWN (-4) on RroInfoResponse — retry-class per W0-1 D3".into(),

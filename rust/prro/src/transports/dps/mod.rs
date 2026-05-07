@@ -29,5 +29,5 @@ pub use channel::DpsChannel;
 pub use dto::{
     CheckAck, CheckEnvelope, CheckSignBlob, DpsCheckType, DpsOperator, RroInfo, StatusSnapshot,
 };
-pub use error::DpsError;
+pub use error::{AuthorizationKind, DpsError};
 pub use grpc::GrpcDpsChannel;

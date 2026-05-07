@@ -19,12 +19,28 @@ pub enum DpsError {
     #[error("DPS transport: {0}")]
     Transport(String),
 
-    /// Authorization-class server response (cert revoked, signature
-    /// rejected, FN not registered for this signer, etc.).  Retrying
-    /// won't help; an operator must rotate creds or reconcile FN
-    /// registration with DPS.
-    #[error("DPS authorization: {0}")]
-    Authorization(String),
+    /// Authorization-class server response, split by the application-
+    /// level DPS status code so callers can route per-doc rejects
+    /// (`-1`, `kind = DocumentReject`) separately from per-FN
+    /// configuration failures (`-13` / `-14`,
+    /// `kind = FiscalNumberNotRegistered`).  Retrying never helps; the
+    /// caller's response depends on `kind` (reject the doc vs operator-
+    /// escalate the FN).  See ADR-M3-A6 prereq + W0-3 §2.1 for the
+    /// routing table that consumes `kind`.
+    ///
+    /// `kind` covers exactly the application-level CheckResponse /
+    /// StatusResponse / RroInfoResponse status codes for which an
+    /// authorization-class destination is documented.  Transport-level
+    /// authentication failures (gRPC `Unauthenticated` /
+    /// `PermissionDenied`) are mapped to [`DpsError::Transport`] in
+    /// `grpc.rs::map_tonic_status` — they have no DPS status code and
+    /// would force a synthetic `code = 0` here.
+    #[error("DPS authorization {kind:?} (code={code}): {message}")]
+    Authorization {
+        code: i32,
+        kind: AuthorizationKind,
+        message: String,
+    },
 
     /// Server-side response decode failed (malformed protobuf, missing
     /// required field, status enum out of range).  Possibly an
@@ -74,4 +90,32 @@ pub enum DpsError {
     /// loudly without panicking.
     #[error("DPS wrapper internal: {0}")]
     Internal(String),
+}
+
+/// Sub-classification of [`DpsError::Authorization`] for routing.
+///
+/// Per ADR-M3-A6 prereq + W0-3 §2.1, M3a write-path routing splits
+/// authorization-class server responses by intent:
+/// - `DocumentReject` — the server rejected this specific document
+///   (cert/signature did not verify the canonical envelope).  Live
+///   stage-4-4b: `Sending → Rejected`.
+/// - `FiscalNumberNotRegistered` — the FN itself is in a bad
+///   registration state with DPS.  Live stage-4-4b:
+///   `Sending → ErrorRetryable → RequiresManualReconciliation`.
+///
+/// `kind` is intentionally a closed set of application-level
+/// authorization classes; transport-level gRPC `Unauthenticated` /
+/// `PermissionDenied` does not belong here (no DPS status code, and
+/// the corrective action is "back off + retry" not "reject doc" or
+/// "rotate creds").  See [`DpsError::Authorization`] for the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorizationKind {
+    /// `-1` ERROR_VEREFY: per-document authorization failure.  The
+    /// document's signature or content was rejected by DPS for this
+    /// specific receipt; FN registration is intact.
+    DocumentReject,
+    /// `-13` ERROR_NOT_REGISTERED_RRO / `-14` ERROR_NOT_REGISTERED_SIGNER:
+    /// per-FN configuration failure.  The FN row or its signer cert is
+    /// not registered with DPS; operator must rotate / reconcile creds.
+    FiscalNumberNotRegistered,
 }
