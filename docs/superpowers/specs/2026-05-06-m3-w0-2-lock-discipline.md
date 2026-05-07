@@ -1,5 +1,7 @@
 # M3 W0-2 findings — lock discipline
 
+> **Status update 2026-05-07:** ADR-M3-A1..A9 were approved and committed in `8c72a14` (`docs/superpowers/specs/2026-05-04-m2-pre-plan-adr.md`).  Any `PROPOSED — NOT COMMITTED` wording below is historical research-time wording; canonical ADR status is the committed ADR block.
+
 **Status:** research findings, not yet ratified.  Closes nothing —
 PRRO_GATE-k99 remains open until M3a implementation lands the
 chosen contracts in code.
