@@ -145,10 +145,12 @@ async fn list_pending_excludes_final_states() {
 #[tokio::test]
 async fn list_pending_full_state_inclusion_contract() {
     let (pool, fn_id) = fresh_with_fn().await;
+    // 13 states per ADR-M3-A9 step 2 (Sending added).
     let all_states = [
         DocState::Prepared,
         DocState::Signed,
         DocState::Encrypted,
+        DocState::Sending,
         DocState::Sent,
         DocState::Kvt1,
         DocState::Kvt2,
@@ -178,10 +180,12 @@ async fn list_pending_full_state_inclusion_contract() {
     let pending = fd::list_pending_for_fn(&pool, &fn_id).await.unwrap();
     let pending_states: HashSet<DocState> = pending.iter().map(|r| r.state).collect();
 
+    // 8 pending states per ADR-M3-A8.
     let expected_pending: HashSet<DocState> = [
         DocState::Prepared,
         DocState::Signed,
         DocState::Encrypted,
+        DocState::Sending,
         DocState::Sent,
         DocState::Kvt1,
         DocState::Kvt2,
@@ -266,10 +270,12 @@ async fn hashes_persist_at_32_bytes_through_insert_prepared() {
 fn allowed_transition_exhaustive_matrix() {
     use DocState::*;
 
+    // 13 variants per ADR-M3-A9 step 2 (Sending added).
     let all = [
         Prepared,
         Signed,
         Encrypted,
+        Sending,
         Sent,
         Kvt1,
         Kvt2,
@@ -299,11 +305,19 @@ fn allowed_transition_exhaustive_matrix() {
         (ErrorRetryable, Sent),
         (ErrorRetryable, Kvt1),
         (ErrorRetryable, RequiresManualReconciliation),
+        // 7 Pattern B additions per ADR-M3-A9 step 3.
+        (Signed, Sending),
+        (Encrypted, Sending),
+        (Sending, Sent),
+        (Sending, Kvt1),
+        (Sending, ErrorRetryable),
+        (Sending, Rejected),
+        (ErrorRetryable, Sending),
     ]
     .into_iter()
     .collect();
 
-    // 12 * 12 = 144 pairs covered explicitly.
+    // 13 * 13 = 169 pairs covered explicitly.
     let mut allowed_count = 0usize;
     let mut forbidden_count = 0usize;
     for &from in &all {
@@ -321,6 +335,32 @@ fn allowed_transition_exhaustive_matrix() {
             }
         }
     }
-    assert_eq!(allowed_count, 17, "expected 17 allowed pairs in spec §5");
-    assert_eq!(forbidden_count, 144 - 17);
+    assert_eq!(
+        allowed_count, 24,
+        "expected 17 base + 7 Pattern B = 24 allowed pairs (ADR-M3-A9 step 3)"
+    );
+    assert_eq!(forbidden_count, 169 - 24);
+}
+
+/// Negative coverage of intentional whitelist gaps from ADR-M3-A8 / A9.
+/// Without this, a future "looks-symmetric" expansion could re-introduce
+/// silent fiscal hazards.
+#[test]
+fn intentional_whitelist_gaps_remain_forbidden() {
+    use DocState::*;
+    // Signed -> Rejected: DPS reject is only legal AFTER wire send;
+    // direct Signed -> Rejected would skip the wire.
+    assert!(!fd::allowed_transition(Signed, Rejected));
+    // Prepared -> ErrorRetryable: nothing has been retried yet at
+    // PREPARED; a failure here is a build/validation error, not a
+    // retryable wire condition.
+    assert!(!fd::allowed_transition(Prepared, ErrorRetryable));
+    // Kvt2 -> ErrorRetryable: KVT2 is forward-only toward ACK.
+    assert!(!fd::allowed_transition(Kvt2, ErrorRetryable));
+    // Sending direct shortcuts that would defeat Pattern B safety.
+    assert!(!fd::allowed_transition(Sending, Ack));
+    assert!(
+        !fd::allowed_transition(Sending, RequiresManualReconciliation),
+        "operator escalation must go via ErrorRetryable"
+    );
 }

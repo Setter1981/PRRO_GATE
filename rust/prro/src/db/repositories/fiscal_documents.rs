@@ -99,6 +99,19 @@ pub fn allowed_transition(from: DocState, to: DocState) -> bool {
             | (ErrorRetryable, Sent)
             | (ErrorRetryable, Kvt1)
             | (ErrorRetryable, RequiresManualReconciliation)
+            // Pattern B (ADR-M3-A5 / A9 step 3): Sending is the
+            // intent-marker for stage 4 send.  The 7 additions below
+            // wire it in.  M3a DPS code MUST NOT use the legacy
+            // (ErrorRetryable, Sent) entry for wire send; retries go
+            // through (ErrorRetryable, Sending) and then on through
+            // a fresh wire call.
+            | (Signed, Sending)
+            | (Encrypted, Sending)
+            | (Sending, Sent)
+            | (Sending, Kvt1)
+            | (Sending, ErrorRetryable)
+            | (Sending, Rejected)
+            | (ErrorRetryable, Sending)
     )
 }
 
@@ -172,8 +185,15 @@ pub async fn transition_state(
 /// Returns documents in non-final, non-handed-off states for the given FN,
 /// in deterministic order suitable for fiscal-chain recovery.
 ///
-/// Pending set (7 states):
-/// - PREPARED, SIGNED, ENCRYPTED, SENT, KVT1, KVT2, ERROR_RETRYABLE
+/// Pending set (8 states, per ADR-M3-A8):
+/// - PREPARED, SIGNED, ENCRYPTED, SENDING, SENT, KVT1, KVT2, ERROR_RETRYABLE
+///
+/// SENDING is pending (ADR-M3-A9 step 2): a crash between the CAS
+/// Signed/Encrypted -> Sending and the wire send leaves the document in
+/// SENDING with unknown wire-state; the App::boot recovery rule transitions
+/// it to ERROR_RETRYABLE without invoking send_chk, because DPS does not
+/// deduplicate and a re-send could fiscalise the same canonical receipt
+/// twice.
 ///
 /// KVT2 IS pending: a crash between persisting KVT2 and transitioning to ACK
 /// would otherwise strand the document.  ACK is the only true terminal-success
@@ -200,7 +220,7 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
                   submission_attempted_at
            FROM fiscal_documents
            WHERE fiscal_number = ?
-             AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENT','KVT1','KVT2','ERROR_RETRYABLE')
+             AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')
            ORDER BY lnd, created_at, document_id"#,
         fn_id
     )
