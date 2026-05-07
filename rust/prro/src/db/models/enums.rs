@@ -30,6 +30,12 @@ str_enum!(DocState {
     Prepared                     => "PREPARED",
     Signed                       => "SIGNED",
     Encrypted                    => "ENCRYPTED",
+    // Pattern B intent-marker (ADR-M3-A9 step 2).  Stored after a
+    // successful CAS Signed->Sending or Encrypted->Sending and BEFORE
+    // the wire send; the recovery rule (Sending->ErrorRetryable on
+    // boot, ZERO send_chk invocations) prevents duplicate fiscalisation
+    // because DPS does not deduplicate.
+    Sending                      => "SENDING",
     Sent                         => "SENT",
     Kvt1                         => "KVT1",
     Kvt2                         => "KVT2",

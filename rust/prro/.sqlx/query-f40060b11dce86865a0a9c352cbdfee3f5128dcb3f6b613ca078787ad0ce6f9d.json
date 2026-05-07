@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT document_id    as \"document_id: DocumentId\",\n                  fiscal_number,\n                  lnd,\n                  state           as \"state: DocState\",\n                  doc_type        as \"doc_type: DocType\",\n                  server_fiscal_no,\n                  submission_attempted_at\n           FROM fiscal_documents\n           WHERE fiscal_number = ?\n             AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENT','KVT1','KVT2','ERROR_RETRYABLE')\n           ORDER BY lnd, created_at, document_id",
+  "query": "SELECT document_id    as \"document_id: DocumentId\",\n                  fiscal_number,\n                  lnd,\n                  state           as \"state: DocState\",\n                  doc_type        as \"doc_type: DocType\",\n                  server_fiscal_no,\n                  submission_attempted_at\n           FROM fiscal_documents\n           WHERE fiscal_number = ?\n             AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')\n           ORDER BY lnd, created_at, document_id",
   "describe": {
     "columns": [
       {
@@ -52,5 +52,5 @@
       true
     ]
   },
-  "hash": "a56127eca6c9e706e459b19fce83c52ea07830d9717e3ff16134cbba1f183806"
+  "hash": "f40060b11dce86865a0a9c352cbdfee3f5128dcb3f6b613ca078787ad0ce6f9d"
 }
