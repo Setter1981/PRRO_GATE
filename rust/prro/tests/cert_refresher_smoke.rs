@@ -53,8 +53,7 @@ fn fixture_cert_ski_hex() -> String {
     ski.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-const FIXTURE_CERT_DER: &[u8] =
-    include_bytes!("../../prro_crypto/node_modules/jkurwa/test/data/SELF_SIGNED_ENC_6929.cer");
+const FIXTURE_CERT_DER: &[u8] = include_bytes!("fixtures/SELF_SIGNED_ENC_6929.cer");
 
 // ─── IIT CMP response envelope builder ────────────────────────────────
 

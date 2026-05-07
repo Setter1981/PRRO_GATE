@@ -667,7 +667,7 @@ mod stale_read_tests {
     /// crafting one (`ParsedCertMetadata` is `pub(crate)`).
     const FIXTURE_CERT_DER: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../prro_crypto/node_modules/jkurwa/test/data/SELF_SIGNED_ENC_6929.cer"
+        "/tests/fixtures/SELF_SIGNED_ENC_6929.cer"
     ));
 
     async fn fresh_pool_with_fn(fn_id: &str) -> (tempfile::TempDir, sqlx::SqlitePool) {

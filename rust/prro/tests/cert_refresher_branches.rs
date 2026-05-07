@@ -32,8 +32,7 @@ use prro::crypto::{
 };
 use prro::services::cert_refresher::{refresh_for_fn, RefreshOutcome};
 
-const FIXTURE_CERT_DER: &[u8] =
-    include_bytes!("../../prro_crypto/node_modules/jkurwa/test/data/SELF_SIGNED_ENC_6929.cer");
+const FIXTURE_CERT_DER: &[u8] = include_bytes!("fixtures/SELF_SIGNED_ENC_6929.cer");
 
 /// Mock `CryptoProvider` that returns a configured cert DER for every
 /// `fetch_cert_by_ski` call.  All other methods panic with
