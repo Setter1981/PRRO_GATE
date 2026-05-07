@@ -520,3 +520,215 @@ See `docs/superpowers/specs/2026-05-04-m2-w0-1-dps-wire.md §10`
 for the full RPC matrix and evidence references, and
 `docs/superpowers/specs/2026-05-05-webcheck-pilot-parity-findings.md`
 for the consolidated pilot-readiness view.
+
+---
+
+## ADR-M3 amendments — W0 findings (2026-05-07)
+
+This block records 9 amendments born out of M3-W0 research
+(see `docs/M3-W0-handoff.md` §1 for the gate summary).
+Numbering family is `ADR-M3-Ax` (separate from `ADR-M2-x`)
+because these decisions belong to the M3 milestone and
+emerged from W0 research, not from M2 implementation.
+
+Approval status: **all 9 approved 2026-05-07** (per
+`docs/M3-W0-handoff.md` §5 entry-gate user decision).
+Closure of bd issues PRRO_GATE-ddn / -zti / -k99 / -6bj /
+-ah8 happens at M3a implementation time — not at this
+amendment commit.
+
+Sources cited (do not duplicate here):
+`docs/superpowers/specs/2026-05-06-m3-w0-1-state-sequence.md`,
+`docs/superpowers/specs/2026-05-06-m3-w0-2-lock-discipline.md`,
+`docs/superpowers/specs/2026-05-06-m3-w0-3-retry-recovery.md`.
+
+### ADR-M3-A1 — `lnd` source-of-truth: `node_state.next_lnd` transactional sequencer + UNIQUE(fiscal_number, lnd)
+
+**Decision.** M3a uses the existing `node_state.next_lnd` column (per `migrations/001_core_identities.sql:64`) as the lnd source-of-truth, advanced inside `with_immediate` via `UPDATE … SET next_lnd = next_lnd + 1 … RETURNING next_lnd - 1`.  Paired with a new UNIQUE INDEX `ux_fd_fn_lnd ON fiscal_documents(fiscal_number, lnd)` (additive migration `007_lnd_unique.sql`) that fails-closed on any drift.
+
+**Source.** W0-1 §6.1 (4-candidate evaluation; rejected MAX(lnd)+1 / ROWID-AUTOINCREMENT / in-memory counter).
+
+**M3a implementation contract.**  Sequencer call site lives in stage 1 (acquire+validate) per W0-2 §2 row 1; runs inside `with_immediate`.  Existing `next_lnd` column reused as-is; only the UNIQUE index is new.
+
+**Tests.**  Per W0-2 §9 stage-1 fixtures + concurrent-writer race test (UNIQUE constraint asserts on collision).
+
+**Closes (at M3a impl time):** PRRO_GATE-ddn.
+
+### ADR-M3-A2 — CloseShift → ZReport mapping at the Rust XML builder boundary
+
+**Decision.** M3a keeps `OperationType.SHIFT_CLOSE` as the internal canonical label and maps SHIFT_CLOSE → ZReport at the Rust XML builder boundary (`prro::xml::build_canonical_xml`).  Z-number allocation in the Rust write-path MUST derive `wire_artifact_kind` first and allocate when `wire_artifact_kind == ZReport` — NOT key on the internal `OperationType` label like Python does at `write_path.py:535` (which has a latent fragility masked only by upstream COM clients).
+
+**Source.** W0-1 §6.2 (candidate (b) selected; (a) end-to-end rename rejected for schema/COM-1C blast radius).  W0-1 §4.5 + §4.6 binding constraint.
+
+**M3a implementation contract.**  XML builder branch already exists (M2 W4 commit `fd81b03` — `xml_z_report_byte_equivalent_doubles_as_close_shift` golden).  M3a write-path code must NOT replicate Python's `op == OperationType.Z_REPORT` predicate; allocation gate is `wire_artifact_kind == ZReport`.
+
+**Tests.**  W0-2 §9.4 boundary-pattern smoke fixture #1 (Pattern A hoist proof at stage 3) + golden test parity confirms wire output.
+
+**Closes (at M3a impl time):** PRRO_GATE-zti.
+
+### ADR-M3-A3 — `db::tx::with_immediate` enforcement: hybrid (Send bound + static scan + `tokio::task_local!`)
+
+**Decision.** Hybrid enforcement of "no foreign IO inside `with_immediate`" (M2 invariant #1):
+1. Keep the `F: ... + Send` bound (catches `!Send` captures; necessary but not sufficient).
+2. Add a W5-sibling syn-based static scan over every `with_immediate(...)` closure body.  Denylist: M2 substrate method names (`sign_cms_detached`, `verify_dstu`, `unwrap_envelope`, `fetch_cert_by_ski`, `send_chk`, `last_chk`, `ping`, `status_rro`, `info_rro`, `query_by_local_identity`, `by_server_fiscal_no`) AND literal `tokio::task::spawn_blocking` / `tokio::task::block_in_place` call expressions.
+3. Add `tokio::task_local!` `IN_WITH_IMMEDIATE` (NOT `thread_local!` — tokio multi-threaded runtime migrates futures across worker threads after `.await`).  `with_immediate` enters via `IN_WITH_IMMEDIATE.scope((), async { f(&mut wt).await })`.  M2 substrate public-API entry points `debug_assert!(IN_WITH_IMMEDIATE.try_with(|_| ()).is_err(), ...)`.
+4. POLICY ONLY for arbitrary helper-fn-of-helper-fn chains past two levels of indirection — reviewer-only.
+
+**Important nuance.** `tokio::task_local!` is visible at provider public-API entry (which runs in the awaiting task's polling context) but NOT inside `tokio::task::spawn_blocking` closure bodies (those run on the blocking pool without async context).  The static scan is the structural gate for ad-hoc `spawn_blocking` inside `with_immediate`; the runtime guard is the gate for substrate-method calls (catches before internal `spawn_blocking` dispatches).
+
+**Source.** W0-2 §3 (4-option evaluation; option (d) hybrid selected).
+
+**Tests.**  W0-2 §9.1 — 5 fixtures: 2 static-scan gates (#1 substrate methods, #3 ad-hoc `spawn_blocking`); 2 runtime gates (#2 indirect helper, #4 provider entry positive control); #5 negative control outside tx.
+
+**Closes (at M3a impl time):** reinforces PRRO_GATE-k99 (the helper-side hardening lives in ADR-M3-A4 below).
+
+### ADR-M3-A4 — `WriteTxConn<'_>` sealed newtype + `transition_state` / `shifts::transition` signature change
+
+**Decision.** Introduce sealed newtype `WriteTxConn<'a>` in `rust/prro/src/db/tx.rs` whose constructor is module-private (`fn new`, NOT `pub(crate)`) and whose `_seal: ()` private field prevents struct-literal construction from outside `db::tx`.  Test-only constructor `#[cfg(test)] pub(super) fn new_for_test` lives inside `db::tx`.  `with_immediate`'s closure signature changes from `for<'c> FnOnce(&'c mut SqliteConnection) -> BoxFuture<'c, _>` to `for<'c> FnOnce(&'c mut WriteTxConn<'c>) -> BoxFuture<'c, _>`.  All transactional repository helpers — `fiscal_documents::transition_state` (`:139`), `shifts::transition` (`:83`), and any future `transition_*` analogues — change signature to take `&mut WriteTxConn<'_>` instead of `&SqlitePool`.
+
+**Source.** W0-2 §4 (3-option evaluation; option (b) sealed-newtype variant selected; option (a) POLICY-ONLY rejected as reviewer-only; option (c) helper-internal micro-tx rejected as breaking compound-op atomicity vs Python `write_path.py:737-773`).
+
+**M3a implementation contract.**  Three lifetime-shape fallbacks documented in W0-2 §4.4 if the borrow checker rejects the primary `for<'c> FnOnce(&'c mut WriteTxConn<'c>)`: (i) separate inner/outer lifetimes with `'a: 'c` bound; (ii) by-value `WriteTxConn<'c>` move into closure.  M3a impl picks whichever compiles cleanest.  Existing inline `with_immediate` call sites at `ingress_inbox.rs:67` + `cert_refresher.rs:292,365` get a mechanical `&mut **conn` refactor (one extra deref through DerefMut).
+
+**Tests.**  W0-2 §9.2 — 5 trybuild compile-fail fixtures (raw `&mut SqliteConnection` rejected; `WriteTxConn::new` private outside `db::tx`; struct-literal seal-field private; valid usage compiles; `new_for_test` cfg(test)-gated).  W0-2 §9.3 two-phase atomicity test (Phase A pre-fix local proof of CAS-vs-SELECT race; Phase B post-fix CI deterministic regression).
+
+**Closes (at M3a impl time):** PRRO_GATE-k99 by construction.
+
+### ADR-M3-A5 — Boundary-pattern selection per pipeline stage
+
+**Decision.** M3a write-path uses:
+- Pattern A ("compute outside, persist inside") at stage 3 sign and any other foreign-IO stage where the wire side-effect is naturally idempotent.
+- **Pattern B ("persist intent, act, persist outcome") MANDATORY at stage 4 send.**  DPS does NOT deduplicate (Python `write_path.py:148` explicit); the SENDING marker (Python `write_path.py:786-803` + `:144-165`) is the only crash-resume safety mechanism.  Adopting Pattern A only at stage 4 would create a real duplicate-send hazard at DPS on any process crash between state=SIGNED commit and the wire reply landing.
+- Pattern C ("stage and flip") reserved for M3b (offline lifecycle).
+
+**Source.** W0-2 §5 catalogue (3 patterns) + §5.4 selection matrix.  Earlier W0-2 draft recommended Pattern A only at stage 4; that recommendation was withdrawn after senior review (single-process daemons can crash mid-wire too).
+
+**M3a implementation contract.**  Pattern B implementation details (DocState::Sending value, migration 008, whitelist additions, recovery rule) live in **ADR-M3-A9 below**.  This ADR is the architectural decision; A9 is the implementation contract.  Both must land together.
+
+**Tests.**  W0-2 §9.4 boundary-pattern smoke fixtures (Pattern A hoist proof at stage 3, Pattern B intent-marker order proof at stage 4, crash-resume zero-send proof for SENDING).
+
+**Closes (at M3a impl time):** reinforces M2 invariant #1 + invariant #4 (idempotency at the wire) by structural design.
+
+### ADR-M3-A6 — DpsError → retry policy table (8 variants × 12 Server-status sub-codes)
+
+**Decision.** M3a adopts the W0-3 §2 main table + §2.1 sub-table as the binding routing contract for `DpsError` variants in `services::write_path`.  Three pillars:
+1. WebCheck-derived retry classes for negative `CheckResponse.Status` codes -3, -15 (close-shift only), -16, and 0 (proto-default UNKNOWN) carry distinct semantics from "all other negatives are terminal" — see W0-3 §2.1.
+2. Per-call gRPC deadline is constant + short (3–9 s band per WebCheck `All.cs:38-56`); set at `GrpcDpsChannel::connect` time, not per-call.
+3. Recovery attempts bounded (default 5, mirror Python `reconciliation.py:44`); on exhaustion, escalate to `REQUIRES_MANUAL_RECONCILIATION` via the ErrorRetryable→RequiresManualReconciliation chain.
+
+All retry / reconciliation work happens OUTSIDE `with_immediate` per M2 invariant #1.
+
+**Pre-requisite — M2/W3 additive amendment to `DpsError::Authorization`** (approved alongside this ADR per `docs/M3-W0-handoff.md` §5 gate item 2):
+```rust
+// rust/prro/src/transports/dps/error.rs
+#[derive(Debug, Error)]
+pub enum DpsError {
+    #[error("DPS authorization {kind:?} (code={code}): {message}")]
+    Authorization { code: i32, kind: AuthorizationKind, message: String },
+    // … other variants unchanged …
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorizationKind {
+    /// `-1` ERROR_VEREFY: per-document authorization failure
+    DocumentReject,
+    /// `-13` / `-14` ERROR_NOT_REGISTERED_RRO / ERROR_NOT_REGISTERED_SIGNER:
+    /// per-FN configuration failure
+    FiscalNumberNotRegistered,
+}
+```
+Decoder at `dto.rs:178-184` updates to populate the new fields based on the raw status code already in scope.  This is an **additive amendment** to the M2 W3 frozen contract (no existing public API removed; variant gets richer fields).  Without it, the -1 vs -13/-14 routing collapses to "single safe destination = RequiresManualReconciliation" with documented operational-load trade-off — fallback rejected in favour of the additive extension.
+
+**Source.** W0-3 §1 (WebCheck retry-class audit) + §2 main table + §2.1 sub-table.
+
+**Tests.**  W0-3 §9.2 — 21 fixtures (10 covering §2 main 8 variants + 11 covering §2.1 sub-table 12 codes).
+
+**Closes (at M3a impl time):** PRRO_GATE-6bj (retry-policy half).
+
+### ADR-M3-A7 — App::boot reconciliation contract (6-branch per-FN decision tree)
+
+**Decision.** M3a App::boot follows the W0-3 §4.3 per-FN decision tree.  Specifically:
+- `node_state::upsert_initial` is permitted ONLY for branch (a) (FN row absent).
+- For all other branches, App::boot MUST `node_state::get(fn)` first and reconcile via `list_pending_for_fn` + the W0-3 §3 per-state recovery rules.
+- OFFLINE-on-boot in M3a is a hard refusal (branch d, option (i)).  Audit `NODE_STATE_BOOT_OFFLINE_REFUSAL` ERROR.
+- Mid-transition shift orphan (branch e, no corresponding pending doc) transitions the shift to `Error` + CRITICAL audit.
+- PRAGMA quick_check failure: fail-closed BEFORE any FN-row write; refuse startup; surface via stderr / `/health/startup` 503; do NOT write `STOP_MODE` to a corrupt DB (mirror Python `container.py:144` raises RuntimeError).
+
+**Acceptance test (mandatory in M3a):** create a `node_state` row with `shift_state = Opened`, run App::boot, assert the row still has `shift_state = Opened` (no overwrite).  PRRO_GATE-ah8 acceptance verbatim.
+
+**Source.** W0-3 §4.1–§4.5 (status quo + pre-conditions + decision tree + post-conditions + idempotency invariant).
+
+**M3a implementation contract.** App::boot at `rust/prro/src/app.rs:28` keeps its current shape (pool + migrations); a new method (working name `App::reconcile_pending` or similar) runs the per-FN decision tree before runtime accepts ingress.  Health gates flip in order `live → startup_complete → ready` per Python `runtime/supervisor.py:34-58` parity.
+
+**Tests.**  W0-3 §9.1 — 9 fixtures covering branches (a)–(f) + idempotency (run-twice) + quick_check failure.
+
+**Closes (at M3a impl time):** PRRO_GATE-ah8.
+
+### ADR-M3-A8 — Pending-set documentation alignment (M2's 7 + M3a's SENDING = 8)
+
+**Decision.** The W0-3 §3 pending-state recovery rules table becomes the binding M3a recovery contract.  The 7 M2-shipped pending states from `rust/prro/src/db/repositories/fiscal_documents.rs:176`, PLUS the M3a-introduced `SENDING` state per ADR-M3-A9 (8 pending states total in M3a), plus the explicit exclusions for OFFLINE_LOCAL_ACK / REQUIRES_MANUAL_RECONCILIATION and the 3 terminal states (ACK / REJECTED / CANCELLED), are the M3a recovery surface.
+
+For each pending state the W0-3 §3 table specifies:
+- the exact recovery action (re-drive forward / re-query DPS / mark recoverable / mark stuck for operator),
+- the whitelist transitions invoked,
+- the W0-1 §2.1 design constraint preserved (no Signed→Rejected; Kvt2 forward-only; etc.).
+
+The W0-3 §6 deterministic-replay invariant — particularly §6.6 KVT2 — is the proof obligation that justifies including KVT2 in the pending set.  Removing KVT2 from the pending set would re-introduce the KVT2-strand bug cited at `fiscal_documents.rs:178-180`.
+
+**Source.** W0-3 §3 + §3.1 + §6.
+
+**Tests.**  W0-3 §9.3 — 9 deterministic-replay fixtures (one per pending state).
+
+**Closes (at M3a impl time):** PRRO_GATE-6bj (pending-set / recovery-rules half).
+
+### ADR-M3-A9 — `DocState::Sending` + Pattern B for stage 4 (full implementation contract)
+
+**Decision.** M3a adopts Pattern B for the stage-4 send boundary (per ADR-M3-A5 architectural decision).  This requires a new DocState value `Sending` that joins the pending set and gates wire send through a CAS Signed→Sending → wire → CAS Sending→Sent/Kvt1 sequence, mirroring Python `write_path.py:786-803`.
+
+**Rationale.** DPS does NOT deduplicate at the wire — Python `write_path.py:148` explicitly states so.  Without a SENDING intermediate, a process crash between state=SIGNED commit and the wire reply lets recovery re-drive forward to send, producing a duplicate document at DPS.  The SENDING marker makes the dangerous state structurally distinct from the safe SIGNED state: SIGNED means "stage 4 has not yet started"; SENDING means "wire send was initiated, outcome unknown".  Recovery rules (W0-3 §3 + §6.3) treat the two cases differently: SIGNED is safe to re-drive forward; SENDING is routed to ErrorRetryable for operator inspection and never auto-re-sent.
+
+**Required code changes (M3a impl).**
+1. `rust/prro/src/db/models/enums.rs:29-42` — add `Sending => "SENDING"` to the DocState enum (12 → 13 values).
+2. `rust/prro/migrations/008_doc_state_sending.sql` (new) — extend the `fiscal_documents.state` CHECK constraint to include `'SENDING'`.  Additive (existing rows keep their states; no backfill).
+3. `rust/prro/src/db/repositories/fiscal_documents.rs:81-103` — extend `allowed_transition` whitelist with:
+   - `(Signed, Sending)` — Pattern B entry (DPS profile)
+   - `(Encrypted, Sending)` — Pattern B entry (Checkbox/encrypted)
+   - `(Sending, Sent)` — wire OK, no inline KVT1
+   - `(Sending, Kvt1)` — wire OK with inline KVT1
+   - `(Sending, ErrorRetryable)` — transient transport failure with known wire reply, OR crash-resume
+   - `(Sending, Rejected)` — immediate stage-4-4b terminal reject (Authorization -1, Server -2, -5..-11, -16)
+   - `(ErrorRetryable, Sending)` — **retry/requeue path under Pattern B** (the only DPS re-send path).  M3a DPS code MUST NOT use the legacy `(ErrorRetryable, Sent)` whitelist `:99` for wire send — that re-introduces the duplicate-send hazard.
+4. `rust/prro/src/db/repositories/fiscal_documents.rs:172-205` — extend `list_pending_for_fn`: doc-comment 7 → 8 pending states; SQL `state IN (...)` clause includes `'SENDING'`.
+5. M3a stage-4 implementation: `with_immediate` → CAS Signed→Sending → commit → release → call `DpsChannel::send_chk` outside lock → on reply: `with_immediate` → CAS Sending→{Sent|Kvt1|Rejected|ErrorRetryable} → commit + audit + transport_trace.
+6. App::boot recovery worker: a doc found in SENDING after restart is unconditionally CAS'd Sending→ErrorRetryable with audit `crash_resume_sending_to_error_retryable`.  No wire calls made.  Operator (or M3b automated reconciler) resolves via `last_chk` + manual re-queue or escalation.
+7. recovery_attempts column policy: SENDING does NOT count toward the per-doc recovery attempt budget on its own; the SENDING→ErrorRetryable transition is bookkeeping, not a retry.
+
+**Acceptance test.** Pre-seed a doc with `state=SENDING`; run App::boot; assert (a) the doc transitions to `ErrorRetryable`, (b) audit `crash_resume_sending_to_error_retryable` is logged, (c) DpsChannel mock records ZERO `send_chk` invocations for the doc id.
+
+**Source.** W0-2 §5.2 (Pattern B catalogue) + W0-3 §3 SENDING row + §6.3 SENDING crash-resume + §8.4 ADR-M3-A9.
+
+**Tests.**  W0-3 §9.2 fixtures #1–#10 (Pattern B routing) + W0-3 §9.3 §6.3 crash-resume fixture.
+
+**Closes (at M3a impl time):** PRRO_GATE-6bj (Pattern B / SENDING half).
+
+### ADR-M3 amendments — alternatives rejected (block-level)
+
+- **Numbering as continuation of M2 (M3-7..M3-15 instead of A1..A9)** — rejected.  M3-W0 is a separate decision family; the `A` prefix marks "amendment born of W0 research" and prevents collision with future M3-original ADRs.
+- **Per-ADR commit (9 separate commits)** — rejected.  Decisions are interconnected (SENDING/Pattern B + WriteTxConn + retry policy + App::boot recovery cannot be safely split).  Single amendment commit preserves atomicity of the decision set per `docs/M3-W0-handoff.md` §5 gate item 3.
+- **DpsError::Authorization fallback ("single safe destination")** — rejected for pilot.  Loses the per-doc-reject vs FN-config-error distinction; overloads operator on -1 vs -13/-14 where the corrective action is different (rotate doc vs rotate creds).  Additive variant extension chosen instead.
+
+### ADR-M3 amendments — open risk
+
+- **`DpsError::Authorization` amendment** is additive but still touches the M2 W3 frozen public API.  M3a impl prep MUST land it before any §3 SIGNED / SENDING recovery exercises end-to-end.  W3 caller-side update is mechanical (decoder dispatch logic at `dto.rs:178-184`); test impact bounded to the W3 status-routing tests.
+- **`WriteTxConn<'_>` lifetime shape** is the riskiest M3a impl item.  Three fallback HRTB shapes documented in W0-2 §4.4; M3a impl validates with `cargo check` early.  If all three shapes fail, fall back to ADR-M3-A4 fallback (option (a) POLICY ONLY review — reduces enforcement to STRONG CONVENTION, with PRRO_GATE-k99 closure deferred until a future enforcement strategy lands).
+- **`tokio::task_local!` runtime guard** does NOT cover `spawn_blocking` closure bodies; the static scan covers ad-hoc `spawn_blocking` calls in `with_immediate` closures via the AST denylist.  The combination is sound but relies on the static scan being kept in sync with new substrate methods or new sync-blocking primitives — see W0-2 §9.1 case 3 + ADR-M3-A3 step 4 POLICY-ONLY note for the residual.
+
+### ADR-M3 amendments — what they explicitly do NOT decide
+
+- **Offline lifecycle** (open/drain/close OFFLINE_LOCAL_ACK pool) — M3b scope per `docs/M3-W0-handoff.md` §3.
+- **Operator recovery UI / manual reconciliation flows** — M3b scope.
+- **Automated SENDING reconciler** (calls `last_chk` with cooldown / rate-limiting to resolve operator-stuck docs) — M3b scope.
+- **OFFLINE→ONLINE auto-flip via `ping(fn_sign)`** — M3b scope.
+- **`ix_offline_active` UNIQUE migration** — M3b blocker (M3a never opens offline sessions, so the constraint absence cannot be exercised in M3a).
+
+See `docs/M3-W0-handoff.md` §3 + §4 for the full deferral list and bd-issue closure-gate per issue.
