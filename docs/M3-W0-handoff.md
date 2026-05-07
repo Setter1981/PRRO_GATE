@@ -9,7 +9,7 @@
 
 ---
 
-## 1. W0 findings → ADR amendments (A1–A9, all PROPOSED — NOT COMMITTED)
+## 1. W0 findings → ADR amendments (A1–A9, COMMITTED in 8c72a14)
 
 | ADR | From | Decision |
 |-----|------|----------|
