@@ -20,16 +20,26 @@
 //!   - status_rro_happy_returns_status_snapshot
 //!   - info_rro_happy_returns_rro_info
 //!
-//! DPS non-OK status mapping:
+//! DPS non-OK status mapping (decoder split per ADR-M3-A6 prereq):
 //!   - send_chk_error_verefy_routes_to_authorization
+//!     (-1 → kind = DocumentReject; CheckResponse arm)
+//!   - send_chk_error_not_registered_rro_routes_to_authorization_fn_not_registered
+//!     (-13 → kind = FiscalNumberNotRegistered; CheckResponse arm)
+//!   - send_chk_error_not_registered_signer_routes_to_authorization_fn_not_registered
+//!     (-14 → kind = FiscalNumberNotRegistered; CheckResponse arm)
 //!   - send_chk_error_unknown_routes_to_transport_retry_class
 //!   - send_chk_error_not_open_shift_routes_to_server_kind
 //!   - send_chk_status_unknown_routes_to_decode
 //!   - status_rro_error_not_registered_rro_routes_to_authorization
+//!     (-13 → kind = FiscalNumberNotRegistered; StatusResponse arm —
+//!     additional decoder coverage on the status_rro path)
 //!
 //! tonic::Status mapping:
 //!   - tonic_unavailable_routes_to_transport
-//!   - tonic_unauthenticated_routes_to_authorization
+//!   - tonic_unauthenticated_routes_to_transport
+//!     (gRPC `Unauthenticated` is transport-level — no DPS status code,
+//!     so it maps to DpsError::Transport rather than Authorization;
+//!     see ADR-M3-A6 prereq.)
 //!
 //! ByServerFiscalNo (PRRO_GATE-5js):
 //!   - by_server_fiscal_no_match_returns_ok
@@ -56,7 +66,8 @@ use prro::transports::dps::gen::{
     RroInfoResponse, StatusResponse,
 };
 use prro::transports::dps::{
-    CheckEnvelope, CheckSignBlob, DpsChannel, DpsCheckType, DpsError, GrpcDpsChannel,
+    AuthorizationKind, CheckEnvelope, CheckSignBlob, DpsChannel, DpsCheckType, DpsError,
+    GrpcDpsChannel,
 };
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -503,10 +514,116 @@ async fn send_chk_error_verefy_routes_to_authorization() {
         .send_chk(check_envelope())
         .await
         .expect_err("ErrorVerefy must error");
-    assert!(
-        matches!(err, DpsError::Authorization(ref m) if m.contains("ERROR_VEREFY")),
-        "expected Authorization with ERROR_VEREFY, got {err:?}"
-    );
+    // Typed assertion per ADR-M3-A6 prereq: -1 → kind=DocumentReject.
+    match err {
+        DpsError::Authorization {
+            code,
+            kind,
+            ref message,
+        } => {
+            assert_eq!(code, check_response::Status::ErrorVerefy as i32);
+            assert_eq!(code, -1, "ADR-M3-A6: ERROR_VEREFY wire code is -1");
+            assert_eq!(kind, AuthorizationKind::DocumentReject);
+            assert!(
+                message.contains("ERROR_VEREFY"),
+                "message must carry the typed status name; got {message}"
+            );
+        }
+        other => {
+            panic!("expected Authorization {{ code:-1, kind:DocumentReject, .. }}, got {other:?}")
+        }
+    }
+}
+
+#[tokio::test]
+async fn send_chk_error_not_registered_rro_routes_to_authorization_fn_not_registered() {
+    // ADR-M3-A6 prereq + W0-3 §2.1 row -13 — same kind as -14 but on
+    // the CheckResponse decoder path (status_rro coverage of -13 lives
+    // in `status_rro_error_not_registered_rro_routes_to_authorization`
+    // and is preserved as additional decoder coverage; this fixture
+    // pins the CheckResponse arm in `try_decode_check_response`
+    // (dto.rs :178 area), which would otherwise be untested for -13
+    // even though -1 and -14 are both covered through send_chk).
+    let h = start_mock().await;
+    h.state
+        .send_chk_v2
+        .lock()
+        .unwrap()
+        .push_back(Ok(err_check_response(
+            check_response::Status::ErrorNotRegisteredRro,
+            "FN not registered",
+        )));
+    let ch = channel(&h.endpoint).await;
+    let err = ch
+        .send_chk(check_envelope())
+        .await
+        .expect_err("ErrorNotRegisteredRro must error");
+    match err {
+        DpsError::Authorization {
+            code,
+            kind,
+            ref message,
+        } => {
+            assert_eq!(code, check_response::Status::ErrorNotRegisteredRro as i32);
+            assert_eq!(
+                code, -13,
+                "ADR-M3-A6: ERROR_NOT_REGISTERED_RRO wire code is -13"
+            );
+            assert_eq!(kind, AuthorizationKind::FiscalNumberNotRegistered);
+            assert!(
+                message.contains("ERROR_NOT_REGISTERED_RRO"),
+                "message must carry the typed status name; got {message}"
+            );
+        }
+        other => panic!(
+            "expected Authorization {{ code:-13, kind:FiscalNumberNotRegistered, .. }}, got {other:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn send_chk_error_not_registered_signer_routes_to_authorization_fn_not_registered() {
+    // ADR-M3-A6 prereq + W0-3 §2.1 row -14:
+    // ERROR_NOT_REGISTERED_SIGNER → Authorization { kind: FiscalNumberNotRegistered }.
+    // Same kind as -13 (FN-config failure, operator must reconcile creds);
+    // the dto.rs decoder collapses both -13 and -14 onto the same
+    // `FiscalNumberNotRegistered` arm but preserves the distinct wire
+    // code so the audit trail keeps -13 vs -14 distinguishable.
+    let h = start_mock().await;
+    h.state
+        .send_chk_v2
+        .lock()
+        .unwrap()
+        .push_back(Ok(err_check_response(
+            check_response::Status::ErrorNotRegisteredSigner,
+            "signer cert not registered",
+        )));
+    let ch = channel(&h.endpoint).await;
+    let err = ch
+        .send_chk(check_envelope())
+        .await
+        .expect_err("ErrorNotRegisteredSigner must error");
+    match err {
+        DpsError::Authorization {
+            code,
+            kind,
+            ref message,
+        } => {
+            assert_eq!(
+                code,
+                check_response::Status::ErrorNotRegisteredSigner as i32
+            );
+            assert_eq!(code, -14, "ADR-M3-A6: ERROR_NOT_REGISTERED_SIGNER wire code is -14");
+            assert_eq!(kind, AuthorizationKind::FiscalNumberNotRegistered);
+            assert!(
+                message.contains("ERROR_NOT_REGISTERED_SIGNER"),
+                "message must carry the typed status name; got {message}"
+            );
+        }
+        other => panic!(
+            "expected Authorization {{ code:-14, kind:FiscalNumberNotRegistered, .. }}, got {other:?}"
+        ),
+    }
 }
 
 #[tokio::test]
@@ -602,10 +719,26 @@ async fn status_rro_error_not_registered_rro_routes_to_authorization() {
         .status_rro(&fn_sign())
         .await
         .expect_err("ErrorNotRegisteredRro must error");
-    assert!(
-        matches!(err, DpsError::Authorization(ref m) if m.contains("ERROR_NOT_REGISTERED_RRO")),
-        "expected Authorization, got {err:?}"
-    );
+    // Typed assertion per ADR-M3-A6 prereq:
+    // -13 → kind=FiscalNumberNotRegistered.
+    match err {
+        DpsError::Authorization {
+            code,
+            kind,
+            ref message,
+        } => {
+            assert_eq!(code, status_response::Status::ErrorNotRegisteredRro as i32);
+            assert_eq!(code, -13, "ADR-M3-A6: ERROR_NOT_REGISTERED_RRO wire code is -13");
+            assert_eq!(kind, AuthorizationKind::FiscalNumberNotRegistered);
+            assert!(
+                message.contains("ERROR_NOT_REGISTERED_RRO"),
+                "message must carry the typed status name; got {message}"
+            );
+        }
+        other => panic!(
+            "expected Authorization {{ code:-13, kind:FiscalNumberNotRegistered, .. }}, got {other:?}"
+        ),
+    }
 }
 
 // ─── tonic::Status mapping ────────────────────────────────────────────
@@ -630,7 +763,12 @@ async fn tonic_unavailable_routes_to_transport() {
 }
 
 #[tokio::test]
-async fn tonic_unauthenticated_routes_to_authorization() {
+async fn tonic_unauthenticated_routes_to_transport() {
+    // Per ADR-M3-A6 prereq, gRPC `Unauthenticated` / `PermissionDenied`
+    // are transport-level (no DPS status code, no AuthorizationKind);
+    // they map to DpsError::Transport so that the W7/W10 routing layer
+    // sees a single transport-class signal for "back off + retry the
+    // channel" rather than a synthetic Authorization with code=0.
     let h = start_mock().await;
     h.state
         .send_chk_v2
@@ -643,8 +781,8 @@ async fn tonic_unauthenticated_routes_to_authorization() {
         .await
         .expect_err("Unauthenticated must error");
     assert!(
-        matches!(err, DpsError::Authorization(ref m) if m.contains("Unauthenticated")),
-        "expected Authorization, got {err:?}"
+        matches!(err, DpsError::Transport(ref m) if m.contains("Unauthenticated")),
+        "expected Transport for gRPC Unauthenticated, got {err:?}"
     );
 }
 

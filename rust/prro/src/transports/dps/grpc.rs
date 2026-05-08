@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tonic::transport::{Channel, Endpoint};
-use tonic::{Code, Status};
+use tonic::Status;
 
 use super::channel::DpsChannel;
 use super::dto::{
@@ -97,23 +97,21 @@ impl GrpcDpsChannel {
     }
 }
 
-/// Map a `tonic::Status` (gRPC-level error) to a `DpsError` per the
-/// W0-1 review rules:
+/// Map a `tonic::Status` (gRPC-level error) to a `DpsError`.
 ///
-/// - `Unavailable` / `DeadlineExceeded` → `Transport` (retry-class)
-/// - `Unauthenticated` / `PermissionDenied` → `Authorization`
-/// - everything else → `Transport` (conservative; M3 ops layer will
-///   tighten this if a specific gRPC code needs different routing)
+/// All gRPC-level statuses (transport, deadline, auth) map to
+/// [`DpsError::Transport`].  The application-level
+/// [`DpsError::Authorization`] variant is reserved for documented DPS
+/// status codes carried inside `CheckResponse` / `StatusResponse` /
+/// `RroInfoResponse`, with a typed `AuthorizationKind` (per ADR-M3-A6
+/// prereq).  gRPC `Unauthenticated` / `PermissionDenied` have no DPS
+/// status code and would force a synthetic `code = 0` if mapped to
+/// `Authorization`; routing them as `Transport` keeps the
+/// `DpsError::Authorization` shape clean for the W7/W10 routing layer
+/// and matches the actual recovery action ("back off + retry the
+/// channel" — the wrapper, not the document).
 fn map_tonic_status(s: Status) -> DpsError {
-    match s.code() {
-        Code::Unavailable | Code::DeadlineExceeded => {
-            DpsError::Transport(format!("gRPC {:?}: {}", s.code(), s.message()))
-        }
-        Code::Unauthenticated | Code::PermissionDenied => {
-            DpsError::Authorization(format!("gRPC {:?}: {}", s.code(), s.message()))
-        }
-        _ => DpsError::Transport(format!("gRPC {:?}: {}", s.code(), s.message())),
-    }
+    DpsError::Transport(format!("gRPC {:?}: {}", s.code(), s.message()))
 }
 
 #[async_trait]
