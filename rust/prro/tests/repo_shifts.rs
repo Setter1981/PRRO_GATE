@@ -1,9 +1,24 @@
 use prro::db::models::enums::FiscalMode;
+use prro::db::tx::with_immediate;
 use prro::db::{
     models::{enums::ShiftState, ids::ShiftId},
     open_pool,
     repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig, shifts},
 };
+
+/// Test-only helper that drives `shifts::transition` through the
+/// production `with_immediate` envelope (per ADR-M3-A4 / W0-2 §4.4).
+async fn tx_shift_transition(
+    pool: &sqlx::SqlitePool,
+    id: ShiftId,
+    from: ShiftState,
+    to: ShiftState,
+) -> anyhow::Result<bool> {
+    with_immediate(pool, move |tx| {
+        Box::pin(async move { Ok(shifts::transition(tx, id, from, to).await?) })
+    })
+    .await
+}
 
 async fn fresh_with_fn() -> (sqlx::SqlitePool, String) {
     let dir = tempfile::tempdir().unwrap();
@@ -55,12 +70,12 @@ async fn allowed_transitions_succeed() {
         .await
         .unwrap();
     assert!(
-        shifts::transition(&pool, id, ShiftState::Created, ShiftState::Opening)
+        tx_shift_transition(&pool, id, ShiftState::Created, ShiftState::Opening)
             .await
             .unwrap()
     );
     assert!(
-        shifts::transition(&pool, id, ShiftState::Opening, ShiftState::Opened)
+        tx_shift_transition(&pool, id, ShiftState::Opening, ShiftState::Opened)
             .await
             .unwrap()
     );
@@ -78,7 +93,7 @@ async fn forbidden_transitions_blocked_in_code() {
     shifts::insert_created(&pool, id, &fn_id, "ONLINE")
         .await
         .unwrap();
-    let did_it = shifts::transition(&pool, id, ShiftState::Created, ShiftState::Closed)
+    let did_it = tx_shift_transition(&pool, id, ShiftState::Created, ShiftState::Closed)
         .await
         .unwrap();
     assert!(!did_it, "Created → Closed must be blocked by whitelist");
@@ -97,7 +112,7 @@ async fn cas_blocks_when_state_diverged() {
     shifts::insert_created(&pool, id, &fn_id, "ONLINE")
         .await
         .unwrap();
-    let did_it = shifts::transition(&pool, id, ShiftState::Opening, ShiftState::Opened)
+    let did_it = tx_shift_transition(&pool, id, ShiftState::Opening, ShiftState::Opened)
         .await
         .unwrap();
     assert!(!did_it, "CAS must reject when actual state ≠ expected from");

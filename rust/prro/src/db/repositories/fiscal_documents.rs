@@ -11,23 +11,19 @@
 //!     * NotFound — no row with `document_id`.
 //!
 //!   This split is what write_path retry logic (M3) needs to decide between
-//!   "reload + retry" (Conflict) and "escalate" (NotFound).
-//!
-//! Known limitation (deferred to M3 — see bd-issue tracked for write_path):
-//! `transition_state` disambiguates Conflict vs NotFound with a *separate*
-//! `SELECT 1` after a CAS-miss.  A delete or insert in the gap between the
-//! UPDATE and the SELECT could swap the two outcomes.  In practice this is
-//! benign — `fiscal_documents` is legally append-only-like (no production
-//! delete path) and M3 write_path is expected to call `transition_state`
-//! inside its own `db::tx::with_immediate` envelope as part of a compound
-//! op (transition + audit_log.append + node_state.update), naturally
-//! making the disambiguation atomic.  If a code path needs strict atomic
-//! disambiguation in M1, wrap the call site in `with_immediate` directly.
+//!   "reload + retry" (Conflict) and "escalate" (NotFound).  Per ADR-M3-A4
+//!   and W0-2 §4.4 (M3a W2), `transition_state` takes
+//!   `&mut WriteTxConn<'_>` rather than a pool: the disambiguation
+//!   `SELECT` and the CAS `UPDATE` run on the same connection inside the
+//!   same `with_immediate` BEGIN IMMEDIATE envelope, so the
+//!   Conflict-vs-NotFound result is atomic by construction —
+//!   PRRO_GATE-k99 closed structurally.
 
 use crate::db::models::{
     enums::{DocState, DocType},
     ids::{DocumentId, OfflineSessionId, RequestId, ShiftId},
 };
+use crate::db::tx::WriteTxConn;
 use sqlx::SqlitePool;
 
 #[derive(Debug, Clone)]
@@ -149,8 +145,13 @@ pub async fn insert_prepared(pool: &SqlitePool, n: &NewDocument) -> sqlx::Result
 /// results.  The whitelist short-circuits forbidden moves before any DB call;
 /// a successful CAS returns Applied; a missed CAS triggers a follow-up
 /// existence check to disambiguate Conflict from NotFound.
+///
+/// Per ADR-M3-A4 / W0-2 §4.4 (M3a W2), takes `&mut WriteTxConn<'_>` —
+/// callers obtain it from a `with_immediate` closure, which guarantees
+/// the CAS UPDATE and the disambiguation SELECT run on the same
+/// connection inside the same BEGIN IMMEDIATE envelope.
 pub async fn transition_state(
-    pool: &SqlitePool,
+    tx: &mut WriteTxConn<'_>,
     id: DocumentId,
     from: DocState,
     to: DocState,
@@ -163,17 +164,19 @@ pub async fn transition_state(
             .bind(to)
             .bind(id)
             .bind(from)
-            .execute(pool)
+            .execute(&mut **tx)
             .await?;
     if res.rows_affected() == 1 {
         return Ok(TransitionOutcome::Applied);
     }
-    // CAS missed — disambiguate row-missing vs state-diverged.  One extra
-    // round-trip on the unhappy path; the happy path stays single-statement.
+    // CAS missed — disambiguate row-missing vs state-diverged.  Same
+    // connection inside the same BEGIN IMMEDIATE tx (via WriteTxConn
+    // Deref), so this SELECT cannot interleave with another writer's
+    // INSERT/DELETE.
     let exists: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM fiscal_documents WHERE document_id = ? LIMIT 1")
             .bind(id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut **tx)
             .await?;
     Ok(if exists.is_some() {
         TransitionOutcome::Conflict

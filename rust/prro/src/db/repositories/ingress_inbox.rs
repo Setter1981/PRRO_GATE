@@ -83,7 +83,7 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
                 n.fiscal_number,
                 n.idempotency_key
             )
-            .fetch_optional(&mut *conn)
+            .fetch_optional(&mut **conn)
             .await?;
 
             if let Some(r) = existing {
@@ -133,7 +133,7 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
             .bind(&n.payload_json)
             .bind(&n.payload_sha256_canonical[..])
             .bind(n.correlation_id.as_deref())
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await?;
 
             // Read back received_at (server-side default) so the caller sees
@@ -143,7 +143,7 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
             )
             .bind(&n.fiscal_number)
             .bind(&n.idempotency_key)
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut **conn)
             .await?;
 
             Ok(InboxInsertOutcome::Created(InboxRow {
