@@ -117,6 +117,7 @@ fn map_tonic_status(s: Status) -> DpsError {
 #[async_trait]
 impl DpsChannel for GrpcDpsChannel {
     async fn send_chk(&self, envelope: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        crate::db::tx::assert_not_in_with_immediate("send_chk");
         let req = self.request(envelope.into());
         let resp = self
             .client()
@@ -127,6 +128,7 @@ impl DpsChannel for GrpcDpsChannel {
     }
 
     async fn last_chk(&self, fn_sign: &CheckSignBlob) -> Result<CheckAck, DpsError> {
+        crate::db::tx::assert_not_in_with_immediate("last_chk");
         let req = self.request(fn_sign.into());
         let resp = self
             .client()
@@ -137,12 +139,14 @@ impl DpsChannel for GrpcDpsChannel {
     }
 
     async fn ping(&self, envelope: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        crate::db::tx::assert_not_in_with_immediate("ping");
         let req = self.request(envelope.into());
         let resp = self.client().ping(req).await.map_err(map_tonic_status)?;
         try_decode_check_response(resp.into_inner())
     }
 
     async fn status_rro(&self, fn_sign: &CheckSignBlob) -> Result<StatusSnapshot, DpsError> {
+        crate::db::tx::assert_not_in_with_immediate("status_rro");
         let req = self.request(fn_sign.into());
         let resp = self
             .client()
@@ -153,6 +157,7 @@ impl DpsChannel for GrpcDpsChannel {
     }
 
     async fn info_rro(&self, fn_sign: &CheckSignBlob) -> Result<RroInfo, DpsError> {
+        crate::db::tx::assert_not_in_with_immediate("info_rro");
         let req = self.request(fn_sign.into());
         let resp = self
             .client()

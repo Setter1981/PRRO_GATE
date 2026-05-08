@@ -22,6 +22,53 @@ use std::ops::{Deref, DerefMut};
 use futures::future::BoxFuture;
 use sqlx::{SqliteConnection, SqlitePool};
 
+tokio::task_local! {
+    /// Marker scope active while a `with_immediate` BEGIN IMMEDIATE
+    /// closure body is being polled.  Per ADR-M3-A3 / W0-2 §3.6
+    /// (M3a W3 hybrid enforcement), every M2 substrate public-API
+    /// entry in `prro::crypto::*` and `prro::transports::dps::*`
+    /// `debug_assert!` that this scope is NOT active — calling
+    /// substrate from inside the BEGIN IMMEDIATE envelope violates
+    /// PRRO invariant #1 ("no network or crypto inside long SQLite
+    /// write transactions").
+    ///
+    /// `tokio::task_local!` (NOT `thread_local!`) because tokio's
+    /// multi-threaded runtime migrates polled futures across worker
+    /// threads after `.await`; per-task storage stays visible across
+    /// the migration whereas a `thread_local!` set on thread T1 is
+    /// invisible on T2 where the future resumes.
+    ///
+    /// What this does NOT cover, and how the W3 static scan
+    /// complements it: `tokio::task::spawn_blocking(closure)` runs
+    /// `closure` on a blocking-pool thread without async polling
+    /// context.  Tokio does not propagate task-local table into the
+    /// blocking-pool thread; the closure body runs as if the scope
+    /// were never entered.  The static scan in
+    /// `tests/with_immediate_no_foreign_io.rs` therefore catches
+    /// literal `spawn_blocking` / `block_in_place` call expressions
+    /// inside `with_immediate` closure bodies — the runtime guard
+    /// here cannot.
+    pub(crate) static IN_WITH_IMMEDIATE: ();
+}
+
+/// Runtime guard helper for M2 substrate public-API entry points.
+/// Substrate methods (`crypto::*`, `transports::dps::*`) call this as
+/// their first body line; in debug / test builds it `debug_assert!`s
+/// that we are NOT inside a `with_immediate` BEGIN IMMEDIATE scope.
+/// In release builds the assert compiles to a no-op.
+///
+/// The `method` parameter names the offending entry in the panic
+/// message so reviewers reading a CI failure see exactly which
+/// substrate call leaked into a transaction without grepping the
+/// stack frame addresses.
+#[inline]
+pub(crate) fn assert_not_in_with_immediate(method: &'static str) {
+    debug_assert!(
+        IN_WITH_IMMEDIATE.try_with(|_| ()).is_err(),
+        "foreign IO inside with_immediate: {method}"
+    );
+}
+
 /// Sealed handle to a SQLite connection that is **inside** a
 /// `with_immediate` BEGIN IMMEDIATE transaction.
 ///
@@ -75,17 +122,23 @@ where
 {
     let mut conn = pool.acquire().await?;
     sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-    // Explicit inner scope so the `WriteTxConn` borrow of `conn` is
-    // released BEFORE we issue COMMIT or ROLLBACK on `conn`.  Without
-    // this scope the closure's BoxFuture keeps the borrow alive past
-    // the `match`'s control-flow split, and the COMMIT/ROLLBACK calls
-    // on `&mut *conn` would either fail to borrow (compile error) or
-    // run while a stale `WriteTxConn` reference is still considered
-    // live (soundness hazard via DerefMut).
-    let result = {
-        let mut wt = WriteTxConn::new(&mut conn);
-        f(&mut wt).await
-    };
+    // Wrap the closure body in `IN_WITH_IMMEDIATE.scope(...)` so the
+    // M3a W3 hybrid runtime guard (per ADR-M3-A3 / W0-2 §3.6) sees the
+    // marker scope active throughout the closure's polling.  Substrate
+    // public-API methods called from inside the closure (directly or
+    // via helper-of-helper indirection) `debug_assert!` against this
+    // scope at their entry and panic in debug / test builds.
+    //
+    // The `WriteTxConn::new(&mut conn)` lives inside the scope so the
+    // borrow ends at the scope close (before the COMMIT/ROLLBACK
+    // statements below) — same lifetime hygiene as the W2 inner-block
+    // shape it replaces.
+    let result = IN_WITH_IMMEDIATE
+        .scope((), async {
+            let mut wt = WriteTxConn::new(&mut conn);
+            f(&mut wt).await
+        })
+        .await;
     match result {
         Ok(r) => match sqlx::query("COMMIT").execute(&mut *conn).await {
             Ok(_) => Ok(r),
