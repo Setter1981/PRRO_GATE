@@ -1,4 +1,5 @@
 use prro::db::models::enums::FiscalMode;
+use prro::db::tx::with_immediate;
 use prro::db::{
     models::{
         enums::{DocState, DocType},
@@ -10,6 +11,24 @@ use prro::db::{
     },
 };
 use std::collections::HashSet;
+
+/// Test-only helper that drives `fd::transition_state` through the
+/// production `with_immediate` envelope (per ADR-M3-A4 / W0-2 §4.4
+/// — every transactional helper must run inside a BEGIN IMMEDIATE
+/// transaction).  Tests use this rather than `WriteTxConn::new_for_test`
+/// (which is module-private to `db::tx`) so they exercise the same
+/// structural seal that production callers do.
+async fn tx_transition_state(
+    pool: &sqlx::SqlitePool,
+    id: DocumentId,
+    from: DocState,
+    to: DocState,
+) -> anyhow::Result<fd::TransitionOutcome> {
+    with_immediate(pool, move |tx| {
+        Box::pin(async move { Ok(fd::transition_state(tx, id, from, to).await?) })
+    })
+    .await
+}
 
 async fn fresh_with_fn() -> (sqlx::SqlitePool, String) {
     let dir = tempfile::tempdir().unwrap();
@@ -66,7 +85,7 @@ async fn insert_then_transition_signed_returns_applied() {
     let id = new.document_id;
     fd::insert_prepared(&pool, &new).await.unwrap();
 
-    let outcome = fd::transition_state(&pool, id, DocState::Prepared, DocState::Signed)
+    let outcome = tx_transition_state(&pool, id, DocState::Prepared, DocState::Signed)
         .await
         .unwrap();
     assert_eq!(outcome, fd::TransitionOutcome::Applied);
@@ -79,7 +98,7 @@ async fn forbidden_transition_returns_forbidden() {
     let id = new.document_id;
     fd::insert_prepared(&pool, &new).await.unwrap();
     // PREPARED -> ACK is not a whitelisted transition.
-    let outcome = fd::transition_state(&pool, id, DocState::Prepared, DocState::Ack)
+    let outcome = tx_transition_state(&pool, id, DocState::Prepared, DocState::Ack)
         .await
         .unwrap();
     assert_eq!(outcome, fd::TransitionOutcome::Forbidden);
@@ -92,7 +111,7 @@ async fn cas_returns_conflict_when_actual_state_diverged() {
     let id = new.document_id;
     fd::insert_prepared(&pool, &new).await.unwrap();
     // (Sent, Kvt1) is allowed by the whitelist, but the row is still PREPARED.
-    let outcome = fd::transition_state(&pool, id, DocState::Sent, DocState::Kvt1)
+    let outcome = tx_transition_state(&pool, id, DocState::Sent, DocState::Kvt1)
         .await
         .unwrap();
     assert_eq!(outcome, fd::TransitionOutcome::Conflict);
@@ -102,7 +121,7 @@ async fn cas_returns_conflict_when_actual_state_diverged() {
 async fn transition_returns_not_found_for_missing_doc() {
     let (pool, _fn_id) = fresh_with_fn().await;
     let phantom = DocumentId::new();
-    let outcome = fd::transition_state(&pool, phantom, DocState::Prepared, DocState::Signed)
+    let outcome = tx_transition_state(&pool, phantom, DocState::Prepared, DocState::Signed)
         .await
         .unwrap();
     assert_eq!(outcome, fd::TransitionOutcome::NotFound);
@@ -116,7 +135,7 @@ async fn list_pending_excludes_final_states() {
     let id_a = a.document_id;
     fd::insert_prepared(&pool, &a).await.unwrap();
     assert_eq!(
-        fd::transition_state(&pool, id_a, DocState::Prepared, DocState::Signed)
+        tx_transition_state(&pool, id_a, DocState::Prepared, DocState::Signed)
             .await
             .unwrap(),
         fd::TransitionOutcome::Applied
@@ -127,7 +146,7 @@ async fn list_pending_excludes_final_states() {
     let id_b = b.document_id;
     fd::insert_prepared(&pool, &b).await.unwrap();
     assert_eq!(
-        fd::transition_state(&pool, id_b, DocState::Prepared, DocState::Rejected)
+        tx_transition_state(&pool, id_b, DocState::Prepared, DocState::Rejected)
             .await
             .unwrap(),
         fd::TransitionOutcome::Applied

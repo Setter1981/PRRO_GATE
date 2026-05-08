@@ -68,6 +68,13 @@ prro_escpos = { path = "../prro_escpos" }
 pretty_assertions = "1"
 tempfile = "3"
 
+# M3a W2 — `WriteTxConn<'_>` sealed-newtype seal proof.  Five compile-fail
+# fixtures (raw `&mut SqliteConnection` rejected, `WriteTxConn::new` private,
+# struct-literal `_seal: ()` private, `new_for_test` not visible outside
+# `db::tx`) live under `tests/write_tx_conn_compile_fail/` and are driven
+# by `tests/write_tx_conn_compile_fail.rs` per W0-2 §9.2.
+trybuild = "1"
+
 # M2 W2 cert_refresher smoke tests use wiremock as a byte-replay HTTP
 # server in place of a live CMP endpoint.
 wiremock = "0.6"

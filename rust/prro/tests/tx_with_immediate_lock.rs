@@ -54,7 +54,7 @@ async fn two_writers_serialize() {
                     "INSERT INTO fiscal_number_config (fiscal_number, tax_number, fiscal_mode) \
                      VALUES ('1111111111', '12345678', 'test')",
                 )
-                .execute(&mut *conn)
+                .execute(&mut **conn)
                 .await?;
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 Ok::<_, anyhow::Error>(started_at.elapsed())
@@ -73,7 +73,7 @@ async fn two_writers_serialize() {
                     "INSERT INTO fiscal_number_config (fiscal_number, tax_number, fiscal_mode) \
                      VALUES ('2222222222', '12345678', 'test')",
                 )
-                .execute(&mut *conn)
+                .execute(&mut **conn)
                 .await?;
                 Ok::<_, anyhow::Error>(started_at.elapsed())
             })
@@ -124,7 +124,7 @@ async fn rollback_on_commit_failure_keeps_pool_clean() {
     let r1: anyhow::Result<()> = with_immediate(&pool, |conn| {
         Box::pin(async move {
             sqlx::query("PRAGMA defer_foreign_keys = ON")
-                .execute(&mut *conn)
+                .execute(&mut **conn)
                 .await?;
             let doc_id = vec![0xAAu8; 16];
             let req_id = vec![0xBBu8; 16];
@@ -139,7 +139,7 @@ async fn rollback_on_commit_failure_keeps_pool_clean() {
             .bind(&doc_id)
             .bind(&req_id)
             .bind(&sha)
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await?;
             Ok(())
         })
@@ -157,7 +157,7 @@ async fn rollback_on_commit_failure_keeps_pool_clean() {
                 "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
                  VALUES ('5555555555', '12345678', 'test')",
             )
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await?;
             Ok(())
         })
@@ -187,7 +187,7 @@ async fn rollback_on_error_removes_inserted_row() {
                 "INSERT INTO fiscal_number_config (fiscal_number, tax_number, fiscal_mode) \
                  VALUES ('3333333333', '12345678', 'test')",
             )
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await?;
             Err(anyhow::anyhow!("simulated failure"))
         })

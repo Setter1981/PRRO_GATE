@@ -309,7 +309,7 @@ async fn in_place_refresh(
             .bind(&now_iso)
             .bind(&now_iso)
             .bind(&parsed.ski_hex)
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await?;
             if r.rows_affected() != 1 {
                 return Err(anyhow::anyhow!(
@@ -397,7 +397,7 @@ pub(crate) async fn key_roll_atomic(
             .bind(&parsed.subject_dn)
             .bind(&parsed.issuer_dn)
             .bind(&now_iso)
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await?;
             if stage_result.rows_affected() != 1 {
                 return Err(anyhow::anyhow!(
@@ -428,7 +428,7 @@ pub(crate) async fn key_roll_atomic(
             )
             .bind(&fn_id)
             .bind(&active_ski)
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await?;
             if r1.rows_affected() != 1 {
                 return Err(anyhow::anyhow!(
@@ -441,7 +441,7 @@ pub(crate) async fn key_roll_atomic(
             // Activate the new row.
             let r2 = sqlx::query("UPDATE operator_certs SET active = 1 WHERE ski_hex = ?")
                 .bind(&parsed.ski_hex)
-                .execute(&mut *conn)
+                .execute(&mut **conn)
                 .await?;
             if r2.rows_affected() != 1 {
                 return Err(anyhow::anyhow!(
@@ -461,7 +461,7 @@ pub(crate) async fn key_roll_atomic(
                 r#"{{"ski_old":"{active_ski}","ski_new":"{}"}}"#,
                 parsed.ski_hex
             ))
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await?;
             Ok(())
         })

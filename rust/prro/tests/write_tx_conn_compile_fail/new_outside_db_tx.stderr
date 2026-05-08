@@ -1,0 +1,10 @@
+error[E0624]: associated function `new` is private
+  --> tests/write_tx_conn_compile_fail/new_outside_db_tx.rs:10:26
+   |
+10 |     let _ = WriteTxConn::new(conn);
+   |                          ^^^ private associated function
+   |
+  ::: src/db/tx.rs
+   |
+   |     fn new(inner: &'a mut SqliteConnection) -> Self {
+   |     ----------------------------------------------- private associated function defined here

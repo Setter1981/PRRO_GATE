@@ -9,6 +9,7 @@
 //!   short-circuits forbidden moves before touching the DB.
 
 use crate::db::models::{enums::ShiftState, ids::ShiftId};
+use crate::db::tx::WriteTxConn;
 use sqlx::SqlitePool;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,8 +81,12 @@ pub async fn get(pool: &SqlitePool, id: ShiftId) -> sqlx::Result<Option<ShiftRow
 ///
 /// The `allowed_transition` whitelist is enforced in code (cheap)
 /// before hitting the DB.
+///
+/// Per ADR-M3-A4 / W0-2 §4.4 (M3a W2), takes `&mut WriteTxConn<'_>` —
+/// callers obtain it from a `with_immediate` closure, mirroring the
+/// `fiscal_documents::transition_state` discipline.
 pub async fn transition(
-    pool: &SqlitePool,
+    tx: &mut WriteTxConn<'_>,
     id: ShiftId,
     from: ShiftState,
     to: ShiftState,
@@ -93,7 +98,7 @@ pub async fn transition(
         .bind(to)
         .bind(id)
         .bind(from)
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
     Ok(res.rows_affected() == 1)
 }
