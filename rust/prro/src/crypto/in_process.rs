@@ -32,6 +32,7 @@ impl CryptoProvider for InProcessProvider {
         &self,
         request: SignCmsRequest<'_>,
     ) -> Result<SignedCmsBytes, CryptoError> {
+        crate::db::tx::assert_not_in_with_immediate("sign_cms_detached");
         // The session is `Clone` over `Arc<Inner>`; we move a clone into
         // the blocking closure.  No copy of the `Zeroizing<[u8; 32]>`
         // private key — only Arc-strong-count bumps.
@@ -55,6 +56,7 @@ impl CryptoProvider for InProcessProvider {
         sig_bytes: &[u8],
         pubkey_compressed: &[u8],
     ) -> Result<DstuVerifyResult, CryptoError> {
+        crate::db::tx::assert_not_in_with_immediate("verify_dstu");
         // Verify is fast (~150µs first call, ~10µs after the pubkey
         // validation cache warms up); stays on the executor.
         verify_blocking(content_digest, sig_bytes, pubkey_compressed).map(DstuVerifyResult)
@@ -66,6 +68,7 @@ impl CryptoProvider for InProcessProvider {
         originator_cert_der: &[u8],
         session: &SigningSession,
     ) -> Result<Vec<u8>, CryptoError> {
+        crate::db::tx::assert_not_in_with_immediate("unwrap_envelope");
         let env = envelope_der.to_vec();
         let originator = originator_cert_der.to_vec();
         let session_clone = session.clone(); // Arc bump, no plaintext copy
@@ -85,6 +88,7 @@ impl CryptoProvider for InProcessProvider {
         ski: &[u8; 32],
         request_timeout: Duration,
     ) -> Result<CertDer, CryptoError> {
+        crate::db::tx::assert_not_in_with_immediate("fetch_cert_by_ski");
         if urls.is_empty() {
             return Err(CryptoError::CertFetch {
                 reason: FetchKind::AllUrlsFailed,

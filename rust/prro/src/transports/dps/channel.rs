@@ -55,6 +55,7 @@ pub trait DpsChannel: Send + Sync {
         fn_sign: &CheckSignBlob,
         expected_id: &str,
     ) -> Result<CheckAck, DpsError> {
+        crate::db::tx::assert_not_in_with_immediate("by_server_fiscal_no");
         let ack = self.last_chk(fn_sign).await?;
         if ack.id.is_empty() {
             return Err(DpsError::NotFound);
@@ -83,6 +84,7 @@ pub trait DpsChannel: Send + Sync {
         _fn_id: &str,
         _local_number: i32,
     ) -> Result<CheckAck, DpsError> {
+        crate::db::tx::assert_not_in_with_immediate("query_by_local_identity");
         Err(DpsError::QueryNotSupported("query_by_local_identity"))
     }
 }
