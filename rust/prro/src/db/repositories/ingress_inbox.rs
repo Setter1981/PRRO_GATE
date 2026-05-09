@@ -244,3 +244,33 @@ pub async fn mark_rejected_tx(tx: &mut WriteTxConn<'_>, request_id: &[u8; 16]) -
     .await?;
     Ok(())
 }
+
+/// W8 stage 5 finalize — finalise the inbox row to terminal `DONE`
+/// status **inside** the same `with_immediate` envelope as the CAS
+/// `Kvt2 → Ack` on `fiscal_documents`.  Tx-bound; mirror of
+/// [`mark_rejected_tx`] but with `status = 'DONE'`.
+///
+/// **Atomicity contract.**  Caller (`stage_finalize::run`) MUST
+/// invoke this after the CAS Applied AND the seed advance AND
+/// before / alongside the outbox INSERT + audit row.  All five
+/// writes commit atomically; partial commits are impossible by
+/// construction.
+///
+/// Returns `true` if the inbox row existed and was updated; `false`
+/// indicates a missing `request_id`, which is a state-invariant
+/// breach (the inbox row is the very thing that drives the worker;
+/// it must exist for stage 5 to run).  Caller MUST treat `false` as
+/// a typed stage error (`StageFinalizeError::InboxDoneMissing`),
+/// not silent ignore.
+pub async fn mark_done_tx(tx: &mut WriteTxConn<'_>, request_id: &[u8; 16]) -> sqlx::Result<bool> {
+    let req_slice: &[u8] = request_id;
+    let res = sqlx::query(
+        "UPDATE ingress_inbox \
+         SET status = 'DONE', processed_at = CURRENT_TIMESTAMP \
+         WHERE request_id = ?",
+    )
+    .bind(req_slice)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}

@@ -324,6 +324,25 @@ async fn enqueue_with_bogus_doc_id_violates_fk() {
 
 ### bd follow-ups carry-forward (P3, unchanged)
 
-- `PRRO_GATE-9qd.1.1` — promote `document_files` + `transport_trace` + `outbox` runtime queries to `query!`/`query_as!` macros + `#[derive(FromRow)]`.
+- `PRRO_GATE-9qd.1.1` — promote `document_files` + `transport_trace` + `outbox` runtime queries to `query!`/`query_as!` macros + `#[derive(FromRow)]`.  Bundle with W8.2 F1-bis (promote `mark_rejected_tx → Result<bool>` for symmetric missing-row contract with `mark_done_tx`).
 - `PRRO_GATE-9qd.1.2` — feature-gate `pub mod test_hook` + production call site (`stage_sign.rs:372`).
 - W7 cosmetics (defer to W8 / final cleanup pass): `truncate_msg` byte → char count; deduplicate inline `truncate_msg`; richer audit payloads in `STAGE_SEND_INTENT_MARKED` / `STAGE_SEND_RESULT`.
+
+---
+
+## 11. W8.2 review polish tracking
+
+### F1-bis-W8.2 (deferred — bd `9qd.1.1`) — `mark_rejected_tx::Result<()>` vs `mark_done_tx::Result<bool>` asymmetry
+Same file (`ingress_inbox.rs`), different return-type conventions.  W7.2 → W8.2 established `bool`-for-missing as the modern shape; the legacy W5 `mark_rejected_tx` predates that convention.  Promote in the consolidated 9qd.1.1 cleanup batch (alongside `query!` macro promotion) — touching W5 here would creep W8 scope.
+
+### F2-bis-W8.2 (intentional non-action) — no status-guard on `mark_done_tx`
+`UPDATE ... WHERE request_id = ?` is permissive about source state.  Adding `AND status = 'PROCESSING'` would create a false-positive "missing" class for idempotent retry (DONE→DONE re-call would report `false`).  Caller-side CAS short-circuit in `stage_finalize::run` owns idempotency at the state-machine level; the helper stays generic.  Consistent with `mark_rejected_tx` precedent.  **No fix planned.**
+
+### F3-bis-W8.2 (closed) — atomicity docstring over-prescribed write order
+**Status: landed in W8.2.**  `update_last_known_xml_sha_tx` docstring updated: "AFTER the CAS Applied; relative ordering against the other post-CAS writes (inbox-DONE / outbox-INSERT / audit) does not matter — all four commit atomically together as a single `with_immediate` envelope."  Preserves the only real ordering invariant (CAS-first) without falsely implying inter-write ordering matters.
+
+### F4-bis-W8.2 (closed) — idempotent-same-hash retry test
+**Status: landed in W8.2.**  `seed_update_idempotent_under_same_hash_returns_true` fixture pins the SQLite `rows_affected` semantic (matched-rows, not just-modified-rows) so a future SQLite version that changes this behaviour would fail at CI.
+
+### F5-bis-W8.2 (carry-forward to W8.4) — `*_rolls_back_with_enclosing_tx` pattern
+Both W8.2 atomicity proofs (`seed_update_rolls_back_with_enclosing_tx` + `mark_done_rolls_back_with_enclosing_tx`) use the same shape: pre-state → with_immediate(advance + Err) → assert pre-state restored.  W8.4 `write_path_stage5_finalize.rs` MUST land an integrated equivalent: full happy 5-write sequence, then force a downstream Err, then assert all five mutations rolled back.  Pattern documented; copy in W8.4.
