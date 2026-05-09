@@ -49,6 +49,40 @@ pub async fn run(
             };
             let fn_id = inbox.fiscal_number.clone();
 
+            // [Step 1b] Command-vs-inbox cross-check.  The leased
+            //           inbox row carries `payload_json`,
+            //           `payload_sha256_canonical`, and
+            //           `operation_type` persisted by ingress; the
+            //           in-process `command` argument MUST agree on
+            //           hash and doc_type, otherwise the worker is
+            //           about to PREPARE a doc against payload it did
+            //           not receive.  Reject without lnd advance and
+            //           without INSERT.
+            if command.payload_sha256_canonical != inbox.payload_sha256_canonical {
+                return reject(
+                    tx,
+                    &request_id,
+                    RejectionReason::InvalidPayload {
+                        detail: "command_payload_hash_mismatch".to_string(),
+                    },
+                    "command_inbox_mismatch",
+                    Severity::Critical,
+                )
+                .await;
+            }
+            if command.doc_type.as_str() != inbox.operation_type {
+                return reject(
+                    tx,
+                    &request_id,
+                    RejectionReason::InvalidPayload {
+                        detail: "command_doc_type_mismatch".to_string(),
+                    },
+                    "command_inbox_mismatch",
+                    Severity::Critical,
+                )
+                .await;
+            }
+
             // [Step 2] Snapshot node_state inside the same tx.
             let node_state = node_state::get_tx(tx, &fn_id)
                 .await?
@@ -127,9 +161,14 @@ pub async fn run(
                 _ => None,
             };
 
-            // [Step 6] Resume-detect — reuse existing pending doc.
+            // [Step 6] Resume-detect — pending lookup only.  Terminal
+            //          rows (ACK / REJECTED / CANCELLED /
+            //          OFFLINE_LOCAL_ACK / REQUIRES_MANUAL_RECONCILIATION)
+            //          MUST NOT drive Resumed; their flow is concluded.
             let request_id_typed = RequestId::from_bytes(request_id);
-            if let Some(existing) = fd::get_by_request_id_tx(tx, &request_id_typed).await? {
+            if let Some(existing) =
+                fd::get_pending_by_request_id_tx(tx, &request_id_typed).await?
+            {
                 audit_log::append_tx(
                     tx,
                     "fiscal_document",
@@ -152,6 +191,24 @@ pub async fn run(
                     active_shift,
                     document: existing,
                 }));
+            }
+
+            // [Step 6b] Terminal-doc + NEW-inbox-for-same-request_id =
+            //           invariant breach.  Refuse to INSERT a duplicate
+            //           PREPARED; surface as InvalidPayload (Critical
+            //           audit) so the operator can investigate the
+            //           lifecycle clash.
+            if fd::exists_terminal_by_request_id_tx(tx, &request_id_typed).await? {
+                return reject(
+                    tx,
+                    &request_id,
+                    RejectionReason::InvalidPayload {
+                        detail: "terminal_document_for_request_id".to_string(),
+                    },
+                    "terminal_document_for_request_id",
+                    Severity::Critical,
+                )
+                .await;
             }
 
             // [Step 7] Allocate lnd atomically (UPDATE ... RETURNING).
@@ -257,15 +314,22 @@ async fn reject(
 
 /// Stage 2 shift-state guard.  Returns `Some(reason)` if the
 /// (doc_type, shift_state) pair is forbidden, `None` if allowed.
+///
+/// **Order matters**: `ShiftState::Error` is terminal and applies
+/// uniformly to every doc_type, so the `(_, Error)` arm runs FIRST
+/// — before any `(SHIFT_OPEN, _)` / `(SHIFT_CLOSE, _)` / `(Z_REPORT, _)`
+/// catch-all that would otherwise mislabel an Error-state shift as
+/// `ShiftAlreadyOpen` / `ShiftNotOpen`.
 fn check_shift_guard(doc_type: DocType, shift_state: ShiftState) -> Option<RejectionReason> {
     match (doc_type, shift_state) {
+        // ERROR is terminal — reject everything.  Must precede every
+        // doc_type-specific catch-all below.
+        (_, ShiftState::Error) => Some(RejectionReason::ShiftInError),
         // Shift-management ops require specific shift states.
         (DocType::ShiftOpen, ShiftState::Closed) => None,
         (DocType::ShiftOpen, _) => Some(RejectionReason::ShiftAlreadyOpen),
         (DocType::ShiftClose, ShiftState::Opened) => None,
         (DocType::ZReport, ShiftState::Opened) => None,
-        // ERROR is terminal — reject everything.
-        (_, ShiftState::Error) => Some(RejectionReason::ShiftInError),
         // Mid-transition (Opening / Closing / Created) — block everything.
         (_, ShiftState::Created | ShiftState::Opening | ShiftState::Closing) => {
             Some(RejectionReason::ShiftNotOpen {

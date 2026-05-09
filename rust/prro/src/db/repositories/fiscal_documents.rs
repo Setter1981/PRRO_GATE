@@ -254,13 +254,21 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
         .collect())
 }
 
-/// W5 / W0-1 §3.1 stage 1 — resume-detect lookup by request_id
-/// inside the worker's `with_immediate` envelope.  If a document
-/// already exists for this request, return it so stage 1 can branch
-/// to `WorkerProcessResult::Resumed` and reuse its persisted lnd
-/// (and persisted profile bindings — see `DocumentRow` doc-comment)
-/// rather than allocating a fresh lnd or rebinding profiles.
-pub async fn get_by_request_id_tx(
+/// W5 / W0-1 §3.1 stage 1 — resume-detect lookup by `request_id`
+/// inside the worker's `with_immediate` envelope.
+///
+/// **Filtered to pending (resumable) states only**: PREPARED, SIGNED,
+/// ENCRYPTED, SENDING, SENT, KVT1, KVT2, ERROR_RETRYABLE.  Mirrors
+/// the pending list of `list_pending_for_fn`.  Terminal-success
+/// (ACK), terminal-fail (REJECTED, CANCELLED, REQUIRES_MANUAL_
+/// RECONCILIATION), and offline-handoff (OFFLINE_LOCAL_ACK) rows
+/// MUST NOT be returned — they would otherwise drive
+/// `WorkerProcessResult::Resumed` for a document whose flow is
+/// already concluded.  Terminal coexistence with a `NEW` inbox row
+/// for the same `request_id` is detected separately by
+/// [`exists_terminal_by_request_id_tx`] and surfaces as a guard
+/// rejection; this method's job is strictly the resume path.
+pub async fn get_pending_by_request_id_tx(
     tx: &mut WriteTxConn<'_>,
     request_id: &RequestId,
 ) -> sqlx::Result<Option<DocumentRow>> {
@@ -274,7 +282,9 @@ pub async fn get_by_request_id_tx(
                   submission_attempted_at,
                   backend_profile_id,
                   transport_profile_id
-           FROM fiscal_documents WHERE request_id = ?"#,
+           FROM fiscal_documents
+           WHERE request_id = ?
+             AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')"#,
         request_id
     )
     .fetch_optional(&mut **tx)
@@ -290,6 +300,34 @@ pub async fn get_by_request_id_tx(
         backend_profile_id: r.backend_profile_id,
         transport_profile_id: r.transport_profile_id,
     }))
+}
+
+/// W5 / W0-1 §3.1 stage 1 — companion to
+/// [`get_pending_by_request_id_tx`].  Returns `true` when a
+/// fiscal_documents row with the given `request_id` exists in a
+/// terminal state: ACK, REJECTED, CANCELLED, OFFLINE_LOCAL_ACK,
+/// REQUIRES_MANUAL_RECONCILIATION.
+///
+/// Stage 1 calls this AFTER a clean pending miss to detect the
+/// "terminal-doc + NEW-inbox-for-same-request_id" invariant breach
+/// — coexistence here means a previous run reached terminal but a
+/// fresh ingress row was admitted under the same `request_id`,
+/// which the worker MUST refuse rather than INSERT a duplicate
+/// PREPARED.
+pub async fn exists_terminal_by_request_id_tx(
+    tx: &mut WriteTxConn<'_>,
+    request_id: &RequestId,
+) -> sqlx::Result<bool> {
+    let row: Option<i64> = sqlx::query_scalar(
+        r#"SELECT 1 FROM fiscal_documents
+            WHERE request_id = ?
+              AND state IN ('ACK','REJECTED','CANCELLED','OFFLINE_LOCAL_ACK','REQUIRES_MANUAL_RECONCILIATION')
+            LIMIT 1"#,
+    )
+    .bind(request_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.is_some())
 }
 
 /// W5 / W0-1 §3.1 stage 1 — same INSERT as [`insert_prepared`] but

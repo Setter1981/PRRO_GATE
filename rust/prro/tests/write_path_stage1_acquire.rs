@@ -112,7 +112,21 @@ async fn seed_open_shift(pool: &sqlx::SqlitePool) -> ShiftId {
     shift_id
 }
 
-async fn seed_inbox_new(pool: &sqlx::SqlitePool) -> [u8; 16] {
+/// Seed a NEW inbox row whose `operation_type` is the canonical
+/// `DocType::as_str()` of `doc_type` and whose `payload_sha256_canonical`
+/// matches [`cmd`].  Stage 1's command-vs-inbox cross-check enforces both.
+async fn seed_inbox_new(pool: &sqlx::SqlitePool, doc_type: DocType) -> [u8; 16] {
+    seed_inbox_with_overrides(pool, doc_type.as_str(), [0u8; 32]).await
+}
+
+/// Same as `seed_inbox_new` but lets the caller provide a different
+/// `operation_type` string and / or a different `payload_sha256_canonical`
+/// to drive the command-vs-inbox mismatch fixtures.
+async fn seed_inbox_with_overrides(
+    pool: &sqlx::SqlitePool,
+    operation_type: &str,
+    payload_sha256_canonical: [u8; 32],
+) -> [u8; 16] {
     let req_id = RequestId::new();
     let req_bytes: [u8; 16] = *req_id.as_bytes();
     inbox::insert(
@@ -121,10 +135,10 @@ async fn seed_inbox_new(pool: &sqlx::SqlitePool) -> [u8; 16] {
             request_id: req_bytes,
             fiscal_number: FN.into(),
             protocol: prro::db::models::enums::Protocol::Rest,
-            operation_type: "sell".into(),
+            operation_type: operation_type.into(),
             idempotency_key: format!("idem-{}", hex::encode(req_bytes)),
             payload_json: r#"{"goods":[]}"#.into(),
-            payload_sha256_canonical: [0u8; 32],
+            payload_sha256_canonical,
             correlation_id: None,
         },
     )
@@ -198,7 +212,7 @@ async fn stage1_sell_happy_path_with_opened_shift() {
         Some(shift_id),
     )
     .await;
-    let req_id = seed_inbox_new(&pool).await;
+    let req_id = seed_inbox_new(&pool, DocType::Sell).await;
 
     let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
         .await
@@ -232,7 +246,7 @@ async fn stage1_shift_open_happy_path_with_closed_state() {
         None,
     )
     .await;
-    let req_id = seed_inbox_new(&pool).await;
+    let req_id = seed_inbox_new(&pool, DocType::ShiftOpen).await;
 
     let result = stage_acquire::run(&pool, req_id, cmd(DocType::ShiftOpen))
         .await
@@ -261,7 +275,7 @@ async fn stage1_lease_miss_returns_noop_no_state_mutation_no_audit() {
         None,
     )
     .await;
-    let req_id = seed_inbox_new(&pool).await;
+    let req_id = seed_inbox_new(&pool, DocType::ShiftOpen).await;
     // Pre-flip the inbox row to simulate "another worker has it".
     let req_slice: &[u8] = &req_id;
     sqlx::query("UPDATE ingress_inbox SET status = 'PROCESSING' WHERE request_id = ?")
@@ -310,7 +324,7 @@ async fn stage1_resume_detect_existing_prepared_doc_skips_lnd_alloc() {
         Some(shift_id),
     )
     .await;
-    let req_id = seed_inbox_new(&pool).await;
+    let req_id = seed_inbox_new(&pool, DocType::Sell).await;
 
     // First call: happy path — INSERTs PREPARED at lnd=1, advances to 2.
     let _ = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
@@ -365,7 +379,7 @@ async fn stage1_unique_fn_lnd_collision_fails_closed() {
     .await;
 
     // First call: lnd=1.
-    let req1 = seed_inbox_new(&pool).await;
+    let req1 = seed_inbox_new(&pool, DocType::Sell).await;
     stage_acquire::run(&pool, req1, cmd(DocType::Sell))
         .await
         .unwrap();
@@ -380,7 +394,7 @@ async fn stage1_unique_fn_lnd_collision_fails_closed() {
 
     // Second call: allocate_next_lnd will return 1 again →
     // INSERT fiscal_documents collision on ux_fd_fn_lnd → tx rollback.
-    let req2 = seed_inbox_new(&pool).await;
+    let req2 = seed_inbox_new(&pool, DocType::Sell).await;
     let result = stage_acquire::run(&pool, req2, cmd(DocType::Sell)).await;
     assert!(result.is_err(), "UNIQUE collision must surface as Err");
     let msg = format!("{:?}", result.unwrap_err());
@@ -420,8 +434,8 @@ async fn stage1_concurrent_writers_lnd_monotonic() {
         Some(shift_id),
     )
     .await;
-    let req_a = seed_inbox_new(&pool).await;
-    let req_b = seed_inbox_new(&pool).await;
+    let req_a = seed_inbox_new(&pool, DocType::Sell).await;
+    let req_b = seed_inbox_new(&pool, DocType::Sell).await;
 
     let p1 = pool.clone();
     let p2 = pool.clone();
@@ -465,7 +479,7 @@ async fn stage1_sell_with_closed_shift_rejects_inbox_no_doc() {
         None,
     )
     .await;
-    let req_id = seed_inbox_new(&pool).await;
+    let req_id = seed_inbox_new(&pool, DocType::Sell).await;
 
     let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
         .await
@@ -502,7 +516,7 @@ async fn stage1_shift_close_with_opened_shift_proceeds() {
         Some(shift_id),
     )
     .await;
-    let req_id = seed_inbox_new(&pool).await;
+    let req_id = seed_inbox_new(&pool, DocType::ShiftClose).await;
 
     let result = stage_acquire::run(&pool, req_id, cmd(DocType::ShiftClose))
         .await
@@ -530,7 +544,7 @@ async fn stage1_node_offline_rejects_with_audit() {
         None,
     )
     .await;
-    let req_id = seed_inbox_new(&pool).await;
+    let req_id = seed_inbox_new(&pool, DocType::Sell).await;
 
     let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
         .await
@@ -565,7 +579,7 @@ async fn stage1_shift_invariant_violation_caught() {
         None, // ← invariant breach: shift_state=Opened but no current_shift_id
     )
     .await;
-    let req_id = seed_inbox_new(&pool).await;
+    let req_id = seed_inbox_new(&pool, DocType::Sell).await;
 
     let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
         .await
@@ -603,7 +617,7 @@ async fn stage1_missing_profile_binding_rejects_inbox_no_doc_no_lnd() {
         None,
     )
     .await;
-    let req_id = seed_inbox_new(&pool).await;
+    let req_id = seed_inbox_new(&pool, DocType::ShiftOpen).await;
 
     let result = stage_acquire::run(&pool, req_id, cmd(DocType::ShiftOpen))
         .await
@@ -635,6 +649,186 @@ async fn stage1_missing_profile_binding_rejects_inbox_no_doc_no_lnd() {
     );
     // Sanity: doc_prepared MUST NOT have been written.
     assert_eq!(audit_count_for_event(&pool, "doc_prepared").await, 0);
+}
+
+// ─── 12. command/inbox payload-hash mismatch → reject InvalidPayload ──
+
+#[tokio::test]
+async fn stage1_command_inbox_hash_mismatch_rejects_no_doc_no_lnd() {
+    let pool = fresh_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(
+        &pool,
+        Some("b"),
+        Some("t"),
+        NodeMode::Online,
+        ShiftState::Opened,
+        Some(shift_id),
+    )
+    .await;
+    // inbox carries a non-zero hash; cmd() carries [0u8; 32].
+    let req_id = seed_inbox_with_overrides(&pool, DocType::Sell.as_str(), [0xAAu8; 32]).await;
+
+    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+        .await
+        .unwrap();
+
+    match result {
+        WorkerProcessResult::Rejected {
+            reason: RejectionReason::InvalidPayload { detail },
+        } => assert_eq!(detail, "command_payload_hash_mismatch"),
+        other => panic!("expected InvalidPayload(hash_mismatch), got {other:?}"),
+    }
+    assert_eq!(doc_count(&pool).await, 0, "no doc on hash mismatch");
+    assert_eq!(next_lnd(&pool).await, 1, "lnd not advanced on mismatch");
+    assert_eq!(inbox_status(&pool, &req_id).await, "REJECTED");
+    assert_eq!(
+        audit_count_for_event(&pool, "command_inbox_mismatch").await,
+        1
+    );
+}
+
+// ─── 13. command/inbox doc_type mismatch → reject InvalidPayload ──────
+
+#[tokio::test]
+async fn stage1_command_inbox_doc_type_mismatch_rejects_no_doc_no_lnd() {
+    let pool = fresh_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(
+        &pool,
+        Some("b"),
+        Some("t"),
+        NodeMode::Online,
+        ShiftState::Opened,
+        Some(shift_id),
+    )
+    .await;
+    // inbox.operation_type = "RETURN", cmd.doc_type = SELL — mismatch.
+    let req_id = seed_inbox_with_overrides(&pool, "RETURN", [0u8; 32]).await;
+
+    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+        .await
+        .unwrap();
+
+    match result {
+        WorkerProcessResult::Rejected {
+            reason: RejectionReason::InvalidPayload { detail },
+        } => assert_eq!(detail, "command_doc_type_mismatch"),
+        other => panic!("expected InvalidPayload(doc_type_mismatch), got {other:?}"),
+    }
+    assert_eq!(doc_count(&pool).await, 0);
+    assert_eq!(next_lnd(&pool).await, 1);
+    assert_eq!(inbox_status(&pool, &req_id).await, "REJECTED");
+}
+
+// ─── 14. terminal-doc + NEW inbox for same request_id → reject ────────
+
+#[tokio::test]
+async fn stage1_terminal_existing_doc_rejects_not_resumed() {
+    let pool = fresh_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(
+        &pool,
+        Some("b"),
+        Some("t"),
+        NodeMode::Online,
+        ShiftState::Opened,
+        Some(shift_id),
+    )
+    .await;
+    let req_id = seed_inbox_new(&pool, DocType::Sell).await;
+
+    // Plant a TERMINAL fiscal_documents row for the same request_id
+    // (e.g. ACK from a previous flow whose inbox row got recycled).
+    let req_slice: &[u8] = &req_id;
+    let doc_id = prro::db::models::ids::DocumentId::new();
+    sqlx::query(
+        "INSERT INTO fiscal_documents (
+             document_id, request_id, fiscal_number, lnd, doc_type, state,
+             backend_profile_id, transport_profile_id, fs_mode, business_ts,
+             total_sum_kop, payload_json, payload_sha256_canonical
+         ) VALUES (?, ?, ?, 999, 'SELL', 'ACK', 'b', 't', 'ONLINE', ?, ?, ?, ?)",
+    )
+    .bind(doc_id)
+    .bind(req_slice)
+    .bind(FN)
+    .bind("2026-04-22T11:00:00Z")
+    .bind(15000_i64)
+    .bind(r#"{"goods":[]}"#)
+    .bind(&[0u8; 32][..])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+        .await
+        .unwrap();
+
+    match result {
+        WorkerProcessResult::Rejected {
+            reason: RejectionReason::InvalidPayload { detail },
+        } => assert_eq!(detail, "terminal_document_for_request_id"),
+        WorkerProcessResult::Resumed(_) => {
+            panic!("terminal doc MUST NOT drive Resumed")
+        }
+        other => panic!("expected InvalidPayload(terminal_document), got {other:?}"),
+    }
+    // Pre-existing terminal doc remains; NO fresh PREPARED inserted.
+    assert_eq!(
+        doc_count(&pool).await,
+        1,
+        "stage 1 must not INSERT alongside terminal row"
+    );
+    assert_eq!(
+        next_lnd(&pool).await,
+        1,
+        "lnd not advanced on terminal-coexistence reject"
+    );
+    assert_eq!(inbox_status(&pool, &req_id).await, "REJECTED");
+    assert_eq!(
+        audit_count_for_event(&pool, "terminal_document_for_request_id").await,
+        1
+    );
+}
+
+// ─── 15. SHIFT_OPEN against ShiftState::Error → ShiftInError ──────────
+
+#[tokio::test]
+async fn stage1_shift_open_against_error_state_rejects_as_shift_in_error() {
+    let pool = fresh_pool().await;
+    seed_fn_with_profiles(
+        &pool,
+        Some("b"),
+        Some("t"),
+        NodeMode::Online,
+        ShiftState::Error,
+        None,
+    )
+    .await;
+    let req_id = seed_inbox_new(&pool, DocType::ShiftOpen).await;
+
+    let result = stage_acquire::run(&pool, req_id, cmd(DocType::ShiftOpen))
+        .await
+        .unwrap();
+
+    // Critical ordering: Error must take precedence over the
+    // ShiftOpen catch-all (which would otherwise label this as
+    // ShiftAlreadyOpen).
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::ShiftInError
+            }
+        ),
+        "got {result:?}"
+    );
+    assert_eq!(doc_count(&pool).await, 0);
+    assert_eq!(next_lnd(&pool).await, 1);
+    assert_eq!(inbox_status(&pool, &req_id).await, "REJECTED");
 }
 
 // fd / shifts unused-import suppression:
