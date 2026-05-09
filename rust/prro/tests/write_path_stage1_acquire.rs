@@ -844,6 +844,11 @@ fn _unused_imports_suppression() {
         submission_attempted_at: None,
         backend_profile_id: String::new(),
         transport_profile_id: String::new(),
+        // W6 additive fields.
+        previous_hash: None,
+        z_report_number: None,
+        unsigned_xml_sha256: None,
+        signing_inputs_pinned_at: None,
     };
     let _ = Severity::Info;
     let _ = shifts::ShiftRow {
