@@ -11,6 +11,7 @@
 //!   - W11: cross-stage deterministic-replay gate
 
 pub mod stage_acquire;
+pub mod stage_finalize;
 pub mod stage_send;
 pub mod stage_sign;
 pub mod types;

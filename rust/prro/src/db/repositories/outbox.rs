@@ -85,19 +85,28 @@ pub struct OutboxRow {
     pub published_at: Option<String>,
 }
 
+/// Wire shape of an `outbox` row when read via `query_as` runtime-bound
+/// — 7 columns in the order the SELECT below emits them.  Type alias
+/// keeps the call site narrow (clippy `clippy::type_complexity` was
+/// tripping on the inline tuple).  Mirrors the W7.1
+/// `transport_trace::TraceRowTuple` pattern.  Promotion to
+/// `query_as!` + `#[derive(FromRow)]` is tracked under bd
+/// `PRRO_GATE-9qd.1.1`.
+type OutboxRowTuple = (
+    Vec<u8>,        // document_id (decoded to [u8; 16] below)
+    String,         // fiscal_number
+    i64,            // sequence_no
+    Vec<u8>,        // payload_sha256 (decoded to [u8; 32] below)
+    String,         // enqueued_at
+    String,         // status
+    Option<String>, // published_at
+);
+
 pub async fn get_for_document(
     pool: &sqlx::SqlitePool,
     doc_id: DocumentId,
 ) -> sqlx::Result<Option<OutboxRow>> {
-    let row: Option<(
-        Vec<u8>,
-        String,
-        i64,
-        Vec<u8>,
-        String,
-        String,
-        Option<String>,
-    )> = sqlx::query_as(
+    let row: Option<OutboxRowTuple> = sqlx::query_as(
         "SELECT document_id, fiscal_number, sequence_no, payload_sha256, \
                     enqueued_at, status, published_at \
              FROM outbox WHERE document_id = ?",

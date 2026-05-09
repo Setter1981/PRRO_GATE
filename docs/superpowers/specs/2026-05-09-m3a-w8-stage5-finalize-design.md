@@ -224,6 +224,18 @@ Six fixtures (plan said 4; +2 from R3 idempotency / R1 atomic-rollback proofs):
 - **Outbox cross-process publishing.**  Stub schema accepts the row; the publish step (`status PENDING → PUBLISHED`) is a separate worker, post-M3a.
 - **Archive `payload_path`.**  Filesystem archive layer is post-M3a.
 - **App::boot reconciliation for stuck Kvt2 docs.**  W9 owns this.
+
+  **W9 design constraint (W8.3 review F5-bis):**  if W9 finds multiple
+  stuck `Kvt2` docs for one FN, finalize them in **lnd ascending
+  order**.  The seed advance in stage_finalize is a single
+  `UPDATE node_state SET last_known_unsigned_xml_sha256 = ?` — last
+  writer wins.  Out-of-order finalization (e.g. doc `lnd=43` Acked
+  before doc `lnd=42`) writes the older `unsigned_xml_sha256` over
+  the newer one, corrupting the next-doc MAC chain seed for `lnd=44`.
+  Under M3a single-writer-per-FN this is impossible in live traffic
+  (finalization is sequential by lnd), but W9 boot recovery operates
+  on a snapshot of pending docs and MUST sort by lnd before
+  iterating finalize.
 - **W7 carry-forward cleanups** (`truncate_msg` byte→char, deduplicate inline truncate, audit payload enrichment).  Defer to W8/W9 final cleanup pass per W7 carry-forward note.
 
 ---
@@ -346,3 +358,29 @@ Same file (`ingress_inbox.rs`), different return-type conventions.  W7.2 → W8.
 
 ### F5-bis-W8.2 (carry-forward to W8.4) — `*_rolls_back_with_enclosing_tx` pattern
 Both W8.2 atomicity proofs (`seed_update_rolls_back_with_enclosing_tx` + `mark_done_rolls_back_with_enclosing_tx`) use the same shape: pre-state → with_immediate(advance + Err) → assert pre-state restored.  W8.4 `write_path_stage5_finalize.rs` MUST land an integrated equivalent: full happy 5-write sequence, then force a downstream Err, then assert all five mutations rolled back.  Pattern documented; copy in W8.4.
+
+---
+
+## 12. W8.3 review polish tracking
+
+### F1-bis-W8.3 (deferred — bd `9qd.1.1`) — `fetch_send_inputs_tx` reused for state-only disambiguation
+`stage_finalize::run` CAS Conflict path reads 7-column `SendInputs` to use only `state` for AlreadyAcked vs StateConflict disambiguation.  Wasteful but correct — and creates a soft coupling: if W7.2 ever drops `state` from `SendInputs`, stage_finalize disambiguation breaks (compile error, fortunately).  Refactor: thin `fd::read_state_tx(tx, doc) -> sqlx::Result<Option<DocState>>` single-column SELECT.  Bundle with the consolidated 9qd.1.1 cleanup batch.
+
+### F2-bis-W8.3 (intentional non-action) — unnecessary `fn_id.clone()` in error path
+Inside the closure, `SeedUpdateMissing { fn_id: fn_id.clone() }` clones — could move directly since `fn_id` (closure-captured String) is dead after this line.  Micro-opt; readability of `.clone()` slightly better than analysing NLL borrow boundaries.  No fix planned.
+
+### F3-bis-W8.3 (deferred — log readability polish) — `[u8; 16]` request_id Debug formatting in errors
+`InboxDoneMissing { request_id: [u8; 16] }` debug-prints as `[171, 171, ...]` — ugly in logs.  A `RequestIdDisplay` hex wrapper type would be cleaner.  Defer; the error class itself is impossible under M3a single-writer + W5 acquire upsert invariant, so production logs unlikely to surface it.
+
+### F4-bis-W8.3 (carry-forward to W8.4) — `(Kvt2, Ack)` whitelist regression guard
+W8.3 `unreachable!("(Kvt2,Ack) is whitelisted")` on the `Forbidden` arm of the CAS depends on `fiscal_documents::allowed_transition` carrying that whitelist entry.  W7.5 closed the analogous concern for `(Signed, Sending)` via `whitelist_signed_sending_regression_guard` (1 LoC).  W8.4 MUST land the same shape:
+
+```rust
+#[test]
+fn whitelist_kvt2_ack_regression_guard() {
+    assert!(allowed_transition(DocState::Kvt2, DocState::Ack));
+}
+```
+
+### F5-bis-W8.3 (closed in §6 above) — multi-doc Kvt2 lnd-monotonic constraint for W9
+Documented in §6 "Out of scope" under the App::boot recovery line.  Subtle correctness property: seed advance is last-writer-wins, so W9 boot reconciliation MUST iterate finalize in lnd ascending order if multiple Kvt2 docs are stuck for the same FN.  Under live single-writer this is automatic; on boot recovery it requires explicit sort.

@@ -606,6 +606,77 @@ pub async fn fetch_send_inputs_tx(
     }))
 }
 
+/// W8 stage 5 — minimal field set the finalize stage needs to write
+/// `node_state.last_known_unsigned_xml_sha256` (seed advance), the
+/// `outbox` row (sequence + canonical payload hash), and the rich
+/// `STAGE_FINALIZE_ACK` audit row.  Strict subset of [`DocumentRow`]
+/// and disjoint from [`SendInputs`] (W7) — finalize doesn't need
+/// state / doc_type / business_ts / profile bindings.
+#[derive(Debug, Clone)]
+pub struct FinalizeInputs {
+    pub fiscal_number: String,
+    pub lnd: i64,
+    /// `Some` after W6 stage 3-PERSIST writes it; `None` only on a
+    /// freshly-PREPARED row.  Post-Kvt2 invariant: `Some` MUST hold;
+    /// stage_finalize::run surfaces `None` as
+    /// `StageFinalizeError::UnsignedXmlShaMissing`.
+    pub unsigned_xml_sha256: Option<[u8; 32]>,
+    /// `Some` for non-genesis docs (set in W6 stage 3-PRE pin); `None`
+    /// for the very first doc-after-bootstrap.  Surfaced into the
+    /// `STAGE_FINALIZE_ACK` audit payload for forensic correlation;
+    /// not used for any state mutation.
+    pub previous_hash: Option<[u8; 32]>,
+    /// Schema-NOT-NULL on `fiscal_documents` (set at W5 stage 1
+    /// INSERT PREPARED).  Copied into `outbox.payload_sha256` so the
+    /// post-M3a publisher worker can cross-correlate the queue row
+    /// with the canonical payload archive.
+    pub payload_sha256_canonical: [u8; 32],
+}
+
+/// W8 stage 5 finalize — read the minimal field set required for
+/// post-CAS bookkeeping in a single SELECT inside the same
+/// `with_immediate` envelope as the CAS `Kvt2 → Ack`.  Returns
+/// `None` when the row vanished between the CAS Applied and this
+/// read (impossible under M3a single-writer + the CAS we just
+/// committed, but typed defensively rather than panicking).
+pub async fn fetch_finalize_inputs_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+) -> sqlx::Result<Option<FinalizeInputs>> {
+    let row = sqlx::query!(
+        r#"SELECT fiscal_number,
+                  lnd,
+                  unsigned_xml_sha256       as "unsigned_xml_sha256: Vec<u8>",
+                  previous_hash             as "previous_hash: Vec<u8>",
+                  payload_sha256_canonical  as "payload_sha256_canonical!: Vec<u8>"
+           FROM fiscal_documents WHERE document_id = ?"#,
+        doc_id
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(r) = row else { return Ok(None) };
+    let payload_sha256: [u8; 32] =
+        r.payload_sha256_canonical
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                sqlx::Error::Decode(
+                    format!(
+                        "fiscal_documents.payload_sha256_canonical: expected 32 bytes, got {}",
+                        r.payload_sha256_canonical.len()
+                    )
+                    .into(),
+                )
+            })?;
+    Ok(Some(FinalizeInputs {
+        fiscal_number: r.fiscal_number,
+        lnd: r.lnd,
+        unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
+        previous_hash: decode_blob32(r.previous_hash, "previous_hash")?,
+        payload_sha256_canonical: payload_sha256,
+    }))
+}
+
 /// W7 stage 4-pre — stamp `submission_attempted_at = CURRENT_TIMESTAMP`
 /// for `doc_id`.
 ///
