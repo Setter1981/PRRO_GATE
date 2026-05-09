@@ -55,6 +55,13 @@ pub struct DocumentRow {
     pub doc_type: DocType,
     pub server_fiscal_no: Option<String>,
     pub submission_attempted_at: Option<String>,
+    /// W5 — read along the doc to make resume path use PERSISTED
+    /// profile bindings (not the current `node_state.*_profile_id`,
+    /// which can drift between original PREPARED and a later resume
+    /// pickup).  Schema-NOT-NULL on `fiscal_documents`, so always
+    /// present for a successfully-inserted doc.
+    pub backend_profile_id: String,
+    pub transport_profile_id: String,
 }
 
 /// Outcome of a state transition attempt.  Replaces a bare `bool` so write_path
@@ -220,7 +227,9 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
                   state           as "state: DocState",
                   doc_type        as "doc_type: DocType",
                   server_fiscal_no,
-                  submission_attempted_at
+                  submission_attempted_at,
+                  backend_profile_id,
+                  transport_profile_id
            FROM fiscal_documents
            WHERE fiscal_number = ?
              AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')
@@ -239,6 +248,83 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
             doc_type: r.doc_type,
             server_fiscal_no: r.server_fiscal_no,
             submission_attempted_at: r.submission_attempted_at,
+            backend_profile_id: r.backend_profile_id,
+            transport_profile_id: r.transport_profile_id,
         })
         .collect())
+}
+
+/// W5 / W0-1 §3.1 stage 1 — resume-detect lookup by request_id
+/// inside the worker's `with_immediate` envelope.  If a document
+/// already exists for this request, return it so stage 1 can branch
+/// to `WorkerProcessResult::Resumed` and reuse its persisted lnd
+/// (and persisted profile bindings — see `DocumentRow` doc-comment)
+/// rather than allocating a fresh lnd or rebinding profiles.
+pub async fn get_by_request_id_tx(
+    tx: &mut WriteTxConn<'_>,
+    request_id: &RequestId,
+) -> sqlx::Result<Option<DocumentRow>> {
+    let row = sqlx::query!(
+        r#"SELECT document_id    as "document_id: DocumentId",
+                  fiscal_number,
+                  lnd,
+                  state           as "state: DocState",
+                  doc_type        as "doc_type: DocType",
+                  server_fiscal_no,
+                  submission_attempted_at,
+                  backend_profile_id,
+                  transport_profile_id
+           FROM fiscal_documents WHERE request_id = ?"#,
+        request_id
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.map(|r| DocumentRow {
+        document_id: r.document_id,
+        fiscal_number: r.fiscal_number,
+        lnd: r.lnd,
+        state: r.state,
+        doc_type: r.doc_type,
+        server_fiscal_no: r.server_fiscal_no,
+        submission_attempted_at: r.submission_attempted_at,
+        backend_profile_id: r.backend_profile_id,
+        transport_profile_id: r.transport_profile_id,
+    }))
+}
+
+/// W5 / W0-1 §3.1 stage 1 — same INSERT as [`insert_prepared`] but
+/// driven from inside a `with_immediate` envelope through
+/// `&mut WriteTxConn<'_>`.  The pool-version is preserved for
+/// pre-W5 call sites (admin / migration tooling); W5 stage 1 uses
+/// this one so the lease CAS, lnd allocate, INSERT PREPARED, and
+/// audit append all run on the same connection inside the same
+/// BEGIN IMMEDIATE transaction.
+pub async fn insert_prepared_tx(tx: &mut WriteTxConn<'_>, n: &NewDocument) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO fiscal_documents (
+             document_id, request_id, fiscal_number, shift_id, offline_session_id,
+             lnd, doc_type, state, backend_profile_id, transport_profile_id,
+             fs_mode, business_ts, total_sum_kop, payload_json,
+             payload_sha256_canonical, unsigned_xml_sha256, previous_hash
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+    )
+    .bind(n.document_id)
+    .bind(n.request_id)
+    .bind(&n.fiscal_number)
+    .bind(n.shift_id)
+    .bind(n.offline_session_id)
+    .bind(n.lnd)
+    .bind(n.doc_type)
+    .bind(&n.backend_profile_id)
+    .bind(&n.transport_profile_id)
+    .bind(n.fs_mode)
+    .bind(&n.business_ts)
+    .bind(n.total_sum_kop)
+    .bind(&n.payload_json)
+    .bind(&n.payload_sha256_canonical[..])
+    .bind(n.unsigned_xml_sha256.as_ref().map(|b| &b[..]))
+    .bind(n.previous_hash.as_ref().map(|b| &b[..]))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }

@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT fiscal_number,\n                  mode               as \"mode: NodeMode\",\n                  shift_state        as \"shift_state: ShiftState\",\n                  next_lnd,\n                  last_known_unsigned_xml_sha256 as \"last_known_unsigned_xml_sha256: Vec<u8>\",\n                  current_shift_id   as \"current_shift_id: ShiftId\",\n                  backend_profile_id,\n                  transport_profile_id\n           FROM node_state WHERE fiscal_number = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "fiscal_number",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "mode: NodeMode",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "shift_state: ShiftState",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "next_lnd",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "last_known_unsigned_xml_sha256: Vec<u8>",
+        "ordinal": 4,
+        "type_info": "Blob"
+      },
+      {
+        "name": "current_shift_id: ShiftId",
+        "ordinal": 5,
+        "type_info": "Blob"
+      },
+      {
+        "name": "backend_profile_id",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "transport_profile_id",
+        "ordinal": 7,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "d231d70dafbe1688958c228255a9bba0a4aea1d78b93767bb27a13444962d830"
+}

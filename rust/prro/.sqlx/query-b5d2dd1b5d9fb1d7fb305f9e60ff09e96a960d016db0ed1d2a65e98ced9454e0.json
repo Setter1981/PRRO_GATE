@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT document_id    as \"document_id: DocumentId\",\n                  fiscal_number,\n                  lnd,\n                  state           as \"state: DocState\",\n                  doc_type        as \"doc_type: DocType\",\n                  server_fiscal_no,\n                  submission_attempted_at\n           FROM fiscal_documents\n           WHERE fiscal_number = ?\n             AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')\n           ORDER BY lnd, created_at, document_id",
+  "query": "SELECT document_id    as \"document_id: DocumentId\",\n                  fiscal_number,\n                  lnd,\n                  state           as \"state: DocState\",\n                  doc_type        as \"doc_type: DocType\",\n                  server_fiscal_no,\n                  submission_attempted_at,\n                  backend_profile_id,\n                  transport_profile_id\n           FROM fiscal_documents WHERE request_id = ?",
   "describe": {
     "columns": [
       {
@@ -37,6 +37,16 @@
         "name": "submission_attempted_at",
         "ordinal": 6,
         "type_info": "Text"
+      },
+      {
+        "name": "backend_profile_id",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "transport_profile_id",
+        "ordinal": 8,
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -49,8 +59,10 @@
       false,
       false,
       true,
-      true
+      true,
+      false,
+      false
     ]
   },
-  "hash": "f40060b11dce86865a0a9c352cbdfee3f5128dcb3f6b613ca078787ad0ce6f9d"
+  "hash": "b5d2dd1b5d9fb1d7fb305f9e60ff09e96a960d016db0ed1d2a65e98ced9454e0"
 }
