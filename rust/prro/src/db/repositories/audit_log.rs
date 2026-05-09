@@ -13,6 +13,7 @@
 //!   issue, so it gives stable reverse-chronological order.
 
 use crate::db::models::enums::Severity;
+use crate::db::tx::WriteTxConn;
 use sqlx::SqlitePool;
 
 /// Hard cap on `list_for_entity` to prevent unbounded queries from admin UI /
@@ -54,6 +55,35 @@ pub async fn append(
     .bind(actor)
     .bind(payload_json)
     .execute(pool)
+    .await?;
+    Ok(res.last_insert_rowid())
+}
+
+/// W5 — same INSERT as [`append`] but driven through
+/// `&mut WriteTxConn<'_>` so stage 1 can append audit rows inside
+/// the same `with_immediate` envelope as the lease / lnd-allocate /
+/// INSERT PREPARED writes.  Pool-version is preserved for non-tx
+/// call sites (post-stage events, ingress shells, etc.).
+pub async fn append_tx(
+    tx: &mut WriteTxConn<'_>,
+    entity_type: &str,
+    entity_id: &str,
+    event_type: &str,
+    severity: Severity,
+    actor: Option<&str>,
+    payload_json: Option<&str>,
+) -> sqlx::Result<i64> {
+    let res = sqlx::query(
+        "INSERT INTO audit_log (entity_type, entity_id, event_type, severity, actor, event_payload_json) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(entity_type)
+    .bind(entity_id)
+    .bind(event_type)
+    .bind(severity)
+    .bind(actor)
+    .bind(payload_json)
+    .execute(&mut **tx)
     .await?;
     Ok(res.last_insert_rowid())
 }

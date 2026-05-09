@@ -27,6 +27,8 @@
 //!   whether to upsert_initial first.
 
 use crate::db::models::enums::{NodeMode, ShiftState};
+use crate::db::models::ids::ShiftId;
+use crate::db::tx::WriteTxConn;
 use sqlx::SqlitePool;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +38,13 @@ pub struct NodeStateRow {
     pub shift_state: ShiftState,
     pub next_lnd: i64,
     pub last_known_unsigned_xml_sha256: Option<[u8; 32]>,
+    /// W5 — read existing schema columns (`migrations/001`).  All three
+    /// can be `NULL` on a freshly bootstrapped FN row that has not yet
+    /// been bound to profiles or had a shift opened.  Stage 2 guards
+    /// reject when the request needs them but they are absent.
+    pub current_shift_id: Option<ShiftId>,
+    pub backend_profile_id: Option<String>,
+    pub transport_profile_id: Option<String>,
 }
 
 /// Decode `last_known_unsigned_xml_sha256` BLOB into a fixed-32-byte array.
@@ -106,7 +115,10 @@ pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStat
                   mode               as "mode: NodeMode",
                   shift_state        as "shift_state: ShiftState",
                   next_lnd,
-                  last_known_unsigned_xml_sha256 as "last_known_unsigned_xml_sha256: Vec<u8>"
+                  last_known_unsigned_xml_sha256 as "last_known_unsigned_xml_sha256: Vec<u8>",
+                  current_shift_id   as "current_shift_id: ShiftId",
+                  backend_profile_id,
+                  transport_profile_id
            FROM node_state WHERE fiscal_number = ?"#,
         fn_id
     )
@@ -121,7 +133,69 @@ pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStat
         shift_state: r.shift_state,
         next_lnd: r.next_lnd,
         last_known_unsigned_xml_sha256: decode_chain_hash(r.last_known_unsigned_xml_sha256)?,
+        current_shift_id: r.current_shift_id,
+        backend_profile_id: r.backend_profile_id,
+        transport_profile_id: r.transport_profile_id,
     }))
+}
+
+/// W5 — same as [`get`] but takes `&mut WriteTxConn<'_>` so stage 1
+/// reads `node_state` inside its `with_immediate` envelope (atomic
+/// snapshot vs. allocate_next_lnd UPDATE that follows).
+pub async fn get_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<Option<NodeStateRow>> {
+    let row = sqlx::query!(
+        r#"SELECT fiscal_number,
+                  mode               as "mode: NodeMode",
+                  shift_state        as "shift_state: ShiftState",
+                  next_lnd,
+                  last_known_unsigned_xml_sha256 as "last_known_unsigned_xml_sha256: Vec<u8>",
+                  current_shift_id   as "current_shift_id: ShiftId",
+                  backend_profile_id,
+                  transport_profile_id
+           FROM node_state WHERE fiscal_number = ?"#,
+        fn_id
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(r) = row else {
+        return Ok(None);
+    };
+    Ok(Some(NodeStateRow {
+        fiscal_number: r.fiscal_number,
+        mode: r.mode,
+        shift_state: r.shift_state,
+        next_lnd: r.next_lnd,
+        last_known_unsigned_xml_sha256: decode_chain_hash(r.last_known_unsigned_xml_sha256)?,
+        current_shift_id: r.current_shift_id,
+        backend_profile_id: r.backend_profile_id,
+        transport_profile_id: r.transport_profile_id,
+    }))
+}
+
+/// W5 / ADR-M3-A1 — atomically allocate and advance the FN's `next_lnd`.
+///
+/// Single statement `UPDATE ... RETURNING`: no CAS race window inside
+/// the same `with_immediate` envelope; concurrent writers serialise on
+/// the SQLite RESERVED lock and emerge with strictly monotonic lnd
+/// values.  `ux_fd_fn_lnd` (W1 migration 007) is the fail-closed
+/// downstream guard against any drift.
+///
+/// Returns the allocated lnd (the value that should be persisted on
+/// the new fiscal_documents row); the FN's stored `next_lnd` is
+/// advanced by 1 atomically.  Returns `RowNotFound` if the FN row
+/// does not exist (caller must `upsert_initial` first or treat as
+/// invariant breach — App::boot is responsible for ensuring the row
+/// exists before stage 1 runs).
+pub async fn allocate_next_lnd(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<i64> {
+    let allocated: i64 = sqlx::query_scalar(
+        "UPDATE node_state SET next_lnd = next_lnd + 1 \
+         WHERE fiscal_number = ? \
+         RETURNING next_lnd - 1",
+    )
+    .bind(fn_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(allocated)
 }
 
 #[cfg(test)]

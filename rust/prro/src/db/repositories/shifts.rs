@@ -74,6 +74,30 @@ pub async fn get(pool: &SqlitePool, id: ShiftId) -> sqlx::Result<Option<ShiftRow
     }))
 }
 
+/// W5 — same as [`get`] but takes `&mut WriteTxConn<'_>` so stage 1
+/// reads the shift row inside its `with_immediate` envelope alongside
+/// `node_state.current_shift_id`.  No CAS, no UPDATE — strictly read.
+pub async fn get_tx(tx: &mut WriteTxConn<'_>, id: ShiftId) -> sqlx::Result<Option<ShiftRow>> {
+    let row = sqlx::query!(
+        r#"SELECT shift_id      as "shift_id: ShiftId",
+                  fiscal_number,
+                  serial,
+                  state          as "state: ShiftState",
+                  cash_balance_kop
+           FROM shifts WHERE shift_id = ?"#,
+        id
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.map(|r| ShiftRow {
+        shift_id: r.shift_id,
+        fiscal_number: r.fiscal_number,
+        serial: r.serial,
+        state: r.state,
+        cash_balance_kop: r.cash_balance_kop,
+    }))
+}
+
 /// Atomic CAS state transition.  Returns true if exactly one row
 /// changed (transition succeeded), false otherwise.  Caller decides
 /// what to do on `false` (typically: load current state and decide

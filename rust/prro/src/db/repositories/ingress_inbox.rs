@@ -23,7 +23,7 @@
 //! `with_immediate` primitive in M1.
 
 use crate::db::models::enums::Protocol;
-use crate::db::tx::with_immediate;
+use crate::db::tx::{with_immediate, WriteTxConn};
 use sqlx::SqlitePool;
 
 #[derive(Debug, Clone)]
@@ -161,4 +161,86 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
         })
     })
     .await
+}
+
+/// W5 / W0-1 §3.1 stage 1 — atomically claim an inbox row for
+/// processing.  CAS `status = 'NEW' → 'PROCESSING'` keyed on
+/// `request_id`.  Returns:
+///   - `Some(row)` — lease acquired; row state was `NEW`, now
+///     `PROCESSING`.
+///   - `None` — lease miss; row was already `PROCESSING` /
+///     `DONE` / `REJECTED` / `ERROR` (another worker has it,
+///     or processing is complete).  Caller maps to
+///     `WorkerProcessResult::Noop`.
+///
+/// Orthogonal to `insert`: this method takes an existing row and
+/// flips its status atomically inside the worker's
+/// `with_immediate` envelope.  Replay / conflict detection at
+/// ingress time is handled by `insert` against UNIQUE
+/// `(fiscal_number, idempotency_key)` and is NOT involved here.
+pub async fn acquire_lease(
+    tx: &mut WriteTxConn<'_>,
+    request_id: &[u8; 16],
+) -> sqlx::Result<Option<InboxRow>> {
+    let req_slice: &[u8] = request_id;
+    let row = sqlx::query!(
+        r#"UPDATE ingress_inbox
+           SET status = 'PROCESSING', processed_at = CURRENT_TIMESTAMP
+           WHERE request_id = ? AND status = 'NEW'
+           RETURNING request_id      as "request_id: Vec<u8>",
+                     fiscal_number,
+                     protocol         as "protocol: Protocol",
+                     operation_type,
+                     idempotency_key,
+                     status,
+                     payload_json,
+                     payload_sha256_canonical as "payload_sha256_canonical: Vec<u8>",
+                     correlation_id,
+                     received_at"#,
+        req_slice
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(r) = row else { return Ok(None) };
+    let req_array: [u8; 16] = r
+        .request_id
+        .as_slice()
+        .try_into()
+        .map_err(|_| sqlx::Error::Decode("inbox.request_id length != 16".into()))?;
+    let sha_array: [u8; 32] = r
+        .payload_sha256_canonical
+        .as_slice()
+        .try_into()
+        .map_err(|_| sqlx::Error::Decode("inbox.payload_sha256_canonical length != 32".into()))?;
+    Ok(Some(InboxRow {
+        request_id: req_array,
+        fiscal_number: r.fiscal_number,
+        protocol: r.protocol,
+        operation_type: r.operation_type,
+        idempotency_key: r.idempotency_key,
+        status: r.status,
+        payload_json: r.payload_json,
+        payload_sha256_canonical: sha_array,
+        correlation_id: r.correlation_id,
+        received_at: r.received_at,
+    }))
+}
+
+/// W5 stage 1 reject path — finalise an inbox row to terminal
+/// `REJECTED` status without going through `transition_state`.
+/// Used when a guard fails (NodeMode != Online, shift state
+/// mismatch, missing profile binding, invalid payload).  No
+/// `fiscal_documents` row is created and no `lnd` is allocated;
+/// the inbox row carries the rejection.
+pub async fn mark_rejected_tx(tx: &mut WriteTxConn<'_>, request_id: &[u8; 16]) -> sqlx::Result<()> {
+    let req_slice: &[u8] = request_id;
+    sqlx::query(
+        "UPDATE ingress_inbox \
+         SET status = 'REJECTED', processed_at = CURRENT_TIMESTAMP \
+         WHERE request_id = ?",
+    )
+    .bind(req_slice)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
