@@ -5,3 +5,4 @@ pub mod fiscal_number_config;
 pub mod ingress_inbox;
 pub mod node_state;
 pub mod shifts;
+pub mod transport_trace;
