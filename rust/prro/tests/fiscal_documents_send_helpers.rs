@@ -25,12 +25,7 @@ async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
 /// Seed an FN config + a SIGNED fiscal_documents row in `state =
 /// SIGNED` with a fixed `lnd`.  Mirrors the W6→W7 hand-off shape: a
 /// doc that has cleared stage 3 sign and is ready for stage 4 send.
-async fn seed_signed_doc(
-    pool: &SqlitePool,
-    doc_byte: u8,
-    doc_type: &str,
-    lnd: i64,
-) -> DocumentId {
+async fn seed_signed_doc(pool: &SqlitePool, doc_byte: u8, doc_type: &str, lnd: i64) -> DocumentId {
     sqlx::query(
         "INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
          VALUES ('1234567890', '12345678', 'test')",
@@ -74,7 +69,11 @@ async fn fetch_send_inputs_returns_minimal_field_set() {
     .expect("fetch_send_inputs_tx")
     .expect("row must be present for seeded doc");
 
-    assert_eq!(inputs.state, DocState::Signed, "pre-CAS state must be SIGNED");
+    assert_eq!(
+        inputs.state,
+        DocState::Signed,
+        "pre-CAS state must be SIGNED"
+    );
     assert_eq!(inputs.fiscal_number, "1234567890");
     assert_eq!(inputs.lnd, 42);
     assert_eq!(inputs.doc_type, DocType::Sell);
@@ -122,7 +121,10 @@ async fn fetch_send_inputs_works_for_all_doc_types() {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(inputs.doc_type, expected, "doc_type round-trip for {dt_str}");
+        assert_eq!(
+            inputs.doc_type, expected,
+            "doc_type round-trip for {dt_str}"
+        );
         assert_eq!(inputs.lnd, lnd);
     }
 }
@@ -164,7 +166,11 @@ async fn mark_submission_attempted_updates_existing_row() {
     let ts = v.expect("submission_attempted_at must be non-NULL after mark");
     // Loose shape check: `YYYY-MM-DD HH:MM:SS` is 19 chars, with
     // dashes / spaces in fixed positions.
-    assert_eq!(ts.len(), 19, "expected SQLite-flavoured timestamp, got {ts:?}");
+    assert_eq!(
+        ts.len(),
+        19,
+        "expected SQLite-flavoured timestamp, got {ts:?}"
+    );
     assert_eq!(&ts[4..5], "-");
     assert_eq!(&ts[7..8], "-");
     assert_eq!(&ts[10..11], " ");
@@ -185,7 +191,10 @@ async fn mark_submission_attempted_returns_false_for_missing_row() {
     })
     .await
     .expect("mark_submission_attempted_tx");
-    assert!(!updated, "missing row must report updated=false (not silent ignore)");
+    assert!(
+        !updated,
+        "missing row must report updated=false (not silent ignore)"
+    );
 }
 
 #[tokio::test]
@@ -225,5 +234,8 @@ async fn set_server_fiscal_no_returns_false_for_missing_row() {
     })
     .await
     .expect("set_server_fiscal_no_tx");
-    assert!(!updated, "missing row must report updated=false (not silent ignore)");
+    assert!(
+        !updated,
+        "missing row must report updated=false (not silent ignore)"
+    );
 }

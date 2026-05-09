@@ -662,11 +662,10 @@ pub async fn set_server_fiscal_no_tx(
     doc_id: DocumentId,
     server_fiscal_no: &str,
 ) -> sqlx::Result<bool> {
-    let res =
-        sqlx::query("UPDATE fiscal_documents SET server_fiscal_no = ? WHERE document_id = ?")
-            .bind(server_fiscal_no)
-            .bind(doc_id)
-            .execute(&mut **tx)
-            .await?;
+    let res = sqlx::query("UPDATE fiscal_documents SET server_fiscal_no = ? WHERE document_id = ?")
+        .bind(server_fiscal_no)
+        .bind(doc_id)
+        .execute(&mut **tx)
+        .await?;
     Ok(res.rows_affected() == 1)
 }

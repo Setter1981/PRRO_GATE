@@ -16,9 +16,7 @@
 //!     constraint (forensic invariant).
 
 use prro::db::models::ids::DocumentId;
-use prro::db::repositories::transport_trace::{
-    self, AttemptCompletion, NewAttempt, OutcomeKind,
-};
+use prro::db::repositories::transport_trace::{self, AttemptCompletion, NewAttempt, OutcomeKind};
 use prro::db::tx::with_immediate;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -132,8 +130,14 @@ async fn migration_010_creates_table_and_indexes() {
             .unwrap()
             .into_iter()
             .collect();
-    for idx in ["ix_transport_trace_started", "ix_transport_trace_unfinished"] {
-        assert!(indexes.contains(idx), "missing index {idx}; have {indexes:?}");
+    for idx in [
+        "ix_transport_trace_started",
+        "ix_transport_trace_unfinished",
+    ] {
+        assert!(
+            indexes.contains(idx),
+            "missing index {idx}; have {indexes:?}"
+        );
     }
 
     let cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
@@ -173,7 +177,9 @@ async fn allocate_then_complete_round_trip() {
     let attempt_no = alloc(&pool, doc, [7u8; 32]).await;
     assert_eq!(attempt_no, 1, "first attempt_no must be 1");
 
-    let rows = transport_trace::list_for_document(&pool, doc).await.unwrap();
+    let rows = transport_trace::list_for_document(&pool, doc)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert!(
         rows[0].completed_at.is_none(),
@@ -187,7 +193,9 @@ async fn allocate_then_complete_round_trip() {
 
     complete_ok(&pool, doc, attempt_no, "SERVER-1").await;
 
-    let rows = transport_trace::list_for_document(&pool, doc).await.unwrap();
+    let rows = transport_trace::list_for_document(&pool, doc)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].completed_at.is_some());
     assert_eq!(rows[0].outcome_kind.as_deref(), Some("OK"));
@@ -291,8 +299,16 @@ async fn partial_index_unfinished_is_queryable() {
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(unfinished.len(), 1, "exactly one unfinished attempt expected");
-    assert_eq!(&unfinished[0].0[..], doc_a.as_bytes(), "unfinished doc must be doc_a");
+    assert_eq!(
+        unfinished.len(),
+        1,
+        "exactly one unfinished attempt expected"
+    );
+    assert_eq!(
+        &unfinished[0].0[..],
+        doc_a.as_bytes(),
+        "unfinished doc must be doc_a"
+    );
     assert_eq!(unfinished[0].1, 1);
 }
 
@@ -335,7 +351,9 @@ async fn second_completion_is_noop_first_outcome_preserved() {
     );
 
     // First outcome preserved — still OK + SERVER-id 'FIRST'.
-    let rows = transport_trace::list_for_document(&pool, doc).await.unwrap();
+    let rows = transport_trace::list_for_document(&pool, doc)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].outcome_kind.as_deref(), Some("OK"));
     assert_eq!(rows[0].server_fiscal_no.as_deref(), Some("FIRST"));
@@ -413,7 +431,12 @@ async fn ok_outcome_without_server_fiscal_no_is_rejected() {
     );
 
     // Sanity: row stayed unfinished.
-    let rows = transport_trace::list_for_document(&pool, doc).await.unwrap();
+    let rows = transport_trace::list_for_document(&pool, doc)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
-    assert!(rows[0].completed_at.is_none(), "row must remain unfinished after rejected completes");
+    assert!(
+        rows[0].completed_at.is_none(),
+        "row must remain unfinished after rejected completes"
+    );
 }

@@ -109,13 +109,17 @@ pub enum StageSendError {
     /// the CAS `Signed → Sending` succeeded.  Also impossible under
     /// the single-writer invariant: CAS Applied means the row exists
     /// for the duration of the same `with_immediate` envelope.
-    #[error("stage 4 mark_submission_attempted_tx returned 0 for doc {document_id:?} after CAS Applied")]
+    #[error(
+        "stage 4 mark_submission_attempted_tx returned 0 for doc {document_id:?} after CAS Applied"
+    )]
     MarkSubmissionAttemptedMissing { document_id: DocumentId },
 
     /// `set_server_fiscal_no_tx` returned `false` in 4-b AFTER the
     /// CAS `Sending → Sent` succeeded.  Same invariant breach class
     /// as `PostWireCasFailed`.
-    #[error("stage 4 set_server_fiscal_no_tx returned 0 for doc {document_id:?} after CAS Applied")]
+    #[error(
+        "stage 4 set_server_fiscal_no_tx returned 0 for doc {document_id:?} after CAS Applied"
+    )]
     SetServerFiscalNoMissing { document_id: DocumentId },
 
     /// `transport_trace::complete_tx` returned `rows_affected == 0`
@@ -206,9 +210,8 @@ pub fn build_send_envelope(
 
     let local_number: i32 = match kind {
         WireArtifactKind::ShiftOpen => 0,
-        _ => i32::try_from(inputs.lnd).map_err(|_| StageSendError::LndOutOfRangeI32 {
-            lnd: inputs.lnd,
-        })?,
+        _ => i32::try_from(inputs.lnd)
+            .map_err(|_| StageSendError::LndOutOfRangeI32 { lnd: inputs.lnd })?,
     };
 
     let date_time = kyiv_local_epoch(&inputs.business_ts)?;
@@ -367,9 +370,7 @@ pub fn classify_send_outcome(r: Result<CheckAck, DpsError>) -> SendOutcome {
             reason: RetryableReason::AuthorizationFnNotRegistered { code, message },
         },
         Err(other) => SendOutcome::Retryable {
-            reason: RetryableReason::Transport(format!(
-                "unexpected DpsError on send_chk: {other}"
-            )),
+            reason: RetryableReason::Transport(format!("unexpected DpsError on send_chk: {other}")),
         },
     }
 }
@@ -509,9 +510,10 @@ fn build_attempt_completion(
     };
     let (error_kind, error_message) = match outcome {
         SendOutcome::Sent { .. } => (None, None),
-        SendOutcome::Rejected { message, .. } => {
-            (Some("AuthorizationDocumentReject".into()), Some(message.clone()))
-        }
+        SendOutcome::Rejected { message, .. } => (
+            Some("AuthorizationDocumentReject".into()),
+            Some(message.clone()),
+        ),
         SendOutcome::Retryable {
             reason: RetryableReason::Transport(msg),
         } => (Some("Transport".into()), Some(msg.clone())),
@@ -633,7 +635,9 @@ pub async fn run(
                 }
                 TransitionOutcome::NotFound => return Ok(PreOutcome::DocumentMissing),
                 TransitionOutcome::Forbidden => {
-                    unreachable!("(Signed,Sending) is whitelisted in fiscal_documents::allowed_transition")
+                    unreachable!(
+                        "(Signed,Sending) is whitelisted in fiscal_documents::allowed_transition"
+                    )
                 }
             }
 
@@ -773,12 +777,10 @@ pub async fn run(
             let completion = build_attempt_completion(&outcome, started, finished);
             let rows = transport_trace::complete_tx(tx, doc, attempt_no, completion).await?;
             if rows == 0 {
-                return Err(anyhow::Error::new(
-                    StageSendError::TraceMissingAtComplete {
-                        document_id: doc,
-                        attempt_no,
-                    },
-                ));
+                return Err(anyhow::Error::new(StageSendError::TraceMissingAtComplete {
+                    document_id: doc,
+                    attempt_no,
+                }));
             }
 
             // Audit STAGE_SEND_RESULT.
@@ -814,10 +816,7 @@ pub async fn run(
             message,
             attempt_no,
         },
-        SendOutcome::Retryable { reason } => StageSendOutcome::Retryable {
-            reason,
-            attempt_no,
-        },
+        SendOutcome::Retryable { reason } => StageSendOutcome::Retryable { reason, attempt_no },
     })
 }
 
@@ -844,8 +843,11 @@ mod tests {
 
     #[test]
     fn build_envelope_sell_passes_lnd_and_chk() {
-        let env = build_send_envelope(&inputs(DocType::Sell, 42, "2026-05-09T12:34:56Z"), b"PAY".to_vec())
-            .expect("SELL/lnd=42 must build");
+        let env = build_send_envelope(
+            &inputs(DocType::Sell, 42, "2026-05-09T12:34:56Z"),
+            b"PAY".to_vec(),
+        )
+        .expect("SELL/lnd=42 must build");
         assert_eq!(env.rro_fn, "1234567890");
         assert_eq!(env.local_number, 42);
         assert_eq!(env.check_type, DpsCheckType::Chk);
@@ -942,7 +944,11 @@ mod tests {
         // on the row must NOT prevent envelope construction (the
         // override happens BEFORE the i32::try_from).
         let env = build_send_envelope(
-            &inputs(DocType::ShiftOpen, (i32::MAX as i64) + 1, "2026-05-09T12:34:56Z"),
+            &inputs(
+                DocType::ShiftOpen,
+                (i32::MAX as i64) + 1,
+                "2026-05-09T12:34:56Z",
+            ),
             b"PAY".to_vec(),
         )
         .expect("SHIFT_OPEN must build despite oversize lnd");
@@ -971,9 +977,11 @@ mod tests {
         // 2026-07-15T10:00:00Z is summer (DST active) in Kyiv: local
         // = 13:00 EEST (UTC+3).  Kyiv-local-as-epoch fakes 13:00 as
         // UTC, so the value is `2026-07-15T13:00:00Z.timestamp()`.
-        let env =
-            build_send_envelope(&inputs(DocType::Sell, 1, "2026-07-15T10:00:00Z"), b"PAY".to_vec())
-                .expect("summer build must succeed");
+        let env = build_send_envelope(
+            &inputs(DocType::Sell, 1, "2026-07-15T10:00:00Z"),
+            b"PAY".to_vec(),
+        )
+        .expect("summer build must succeed");
         let expected = Utc
             .with_ymd_and_hms(2026, 7, 15, 13, 0, 0)
             .single()
@@ -986,9 +994,11 @@ mod tests {
     fn build_envelope_kyiv_local_epoch_winter_offset_2h() {
         // 2026-01-15T10:00:00Z is winter (no DST): local = 12:00 EET
         // (UTC+2).  Faked-as-UTC epoch is `2026-01-15T12:00:00Z.timestamp()`.
-        let env =
-            build_send_envelope(&inputs(DocType::Sell, 1, "2026-01-15T10:00:00Z"), b"PAY".to_vec())
-                .expect("winter build must succeed");
+        let env = build_send_envelope(
+            &inputs(DocType::Sell, 1, "2026-01-15T10:00:00Z"),
+            b"PAY".to_vec(),
+        )
+        .expect("winter build must succeed");
         let expected = Utc
             .with_ymd_and_hms(2026, 1, 15, 12, 0, 0)
             .single()
@@ -1187,7 +1197,11 @@ mod tests {
     #[test]
     fn now_db_format_matches_sqlite_current_timestamp_shape() {
         let s = now_db_format();
-        assert_eq!(s.len(), 19, "expected 'YYYY-MM-DD HH:MM:SS' shape, got {s:?}");
+        assert_eq!(
+            s.len(),
+            19,
+            "expected 'YYYY-MM-DD HH:MM:SS' shape, got {s:?}"
+        );
         assert_eq!(&s[4..5], "-");
         assert_eq!(&s[7..8], "-");
         assert_eq!(&s[10..11], " ");

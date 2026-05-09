@@ -62,10 +62,7 @@ impl StubDpsChannel {
         }
     }
 
-    fn with_spy(
-        response: Result<CheckAck, DpsError>,
-        spy: Box<dyn Fn() + Send + Sync>,
-    ) -> Self {
+    fn with_spy(response: Result<CheckAck, DpsError>, spy: Box<dyn Fn() + Send + Sync>) -> Self {
         Self {
             response: Mutex::new(Some(response)),
             send_chk_calls: AtomicUsize::new(0),
@@ -185,13 +182,11 @@ async fn read_server_fiscal_no(pool: &SqlitePool, doc: DocumentId) -> Option<Str
 }
 
 async fn read_submission_attempted_at(pool: &SqlitePool, doc: DocumentId) -> Option<String> {
-    sqlx::query_scalar(
-        "SELECT submission_attempted_at FROM fiscal_documents WHERE document_id = ?",
-    )
-    .bind(doc)
-    .fetch_one(pool)
-    .await
-    .expect("read submission_attempted_at")
+    sqlx::query_scalar("SELECT submission_attempted_at FROM fiscal_documents WHERE document_id = ?")
+        .bind(doc)
+        .fetch_one(pool)
+        .await
+        .expect("read submission_attempted_at")
 }
 
 async fn read_audit_event_types(pool: &SqlitePool, doc: DocumentId) -> Vec<String> {
@@ -404,12 +399,13 @@ async fn pattern_b_ordering_spy_observes_committed_sending_before_send_chk() {
                     .build()
                     .expect("spy runtime");
                 rt.block_on(async move {
-                    let row: String =
-                        sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-                            .bind(doc)
-                            .fetch_one(&pool)
-                            .await
-                            .expect("spy SELECT state");
+                    let row: String = sqlx::query_scalar(
+                        "SELECT state FROM fiscal_documents WHERE document_id = ?",
+                    )
+                    .bind(doc)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("spy SELECT state");
                     *observed.lock().unwrap() = Some(row);
                 });
             });
@@ -477,7 +473,10 @@ async fn rerun_on_sent_state_conflict_short_circuits_with_zero_wire_calls() {
         "StateConflict must not allocate a trace row"
     );
     // No audit entries from stage 4 either.
-    assert_eq!(read_audit_event_types(&pool, doc).await, Vec::<String>::new());
+    assert_eq!(
+        read_audit_event_types(&pool, doc).await,
+        Vec::<String>::new()
+    );
 }
 
 // ─── Fixture 6 — whitelist regression for (Signed, Sending) ──────────
@@ -518,7 +517,11 @@ async fn empty_server_fiscal_no_routes_to_typed_error_no_4b_persist() {
         }
         other => panic!("expected EmptyServerFiscalNo, got {other:?}"),
     }
-    assert_eq!(stub.call_count(), 1, "wire call DID happen — guard runs after");
+    assert_eq!(
+        stub.call_count(),
+        1,
+        "wire call DID happen — guard runs after"
+    );
 
     // Doc state still SENDING (4-b never ran).
     assert_eq!(read_doc_state(&pool, doc).await, "SENDING");
