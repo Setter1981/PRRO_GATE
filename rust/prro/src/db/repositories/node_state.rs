@@ -45,6 +45,12 @@ pub struct NodeStateRow {
     pub current_shift_id: Option<ShiftId>,
     pub backend_profile_id: Option<String>,
     pub transport_profile_id: Option<String>,
+    /// W6 — Z-report counter allocator state (`migrations/009`).  Bumped
+    /// by [`allocate_z_report_number`] strictly inside `with_immediate`
+    /// envelopes, mirroring `next_lnd`'s discipline.  CHECK (>=1) at
+    /// schema level makes wraparound observable as a constraint
+    /// violation rather than a silent corruption.
+    pub next_z_report_number: i64,
 }
 
 /// Decode `last_known_unsigned_xml_sha256` BLOB into a fixed-32-byte array.
@@ -118,7 +124,8 @@ pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStat
                   last_known_unsigned_xml_sha256 as "last_known_unsigned_xml_sha256: Vec<u8>",
                   current_shift_id   as "current_shift_id: ShiftId",
                   backend_profile_id,
-                  transport_profile_id
+                  transport_profile_id,
+                  next_z_report_number
            FROM node_state WHERE fiscal_number = ?"#,
         fn_id
     )
@@ -136,6 +143,7 @@ pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStat
         current_shift_id: r.current_shift_id,
         backend_profile_id: r.backend_profile_id,
         transport_profile_id: r.transport_profile_id,
+        next_z_report_number: r.next_z_report_number,
     }))
 }
 
@@ -151,7 +159,8 @@ pub async fn get_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<Optio
                   last_known_unsigned_xml_sha256 as "last_known_unsigned_xml_sha256: Vec<u8>",
                   current_shift_id   as "current_shift_id: ShiftId",
                   backend_profile_id,
-                  transport_profile_id
+                  transport_profile_id,
+                  next_z_report_number
            FROM node_state WHERE fiscal_number = ?"#,
         fn_id
     )
@@ -169,6 +178,7 @@ pub async fn get_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<Optio
         current_shift_id: r.current_shift_id,
         backend_profile_id: r.backend_profile_id,
         transport_profile_id: r.transport_profile_id,
+        next_z_report_number: r.next_z_report_number,
     }))
 }
 
@@ -191,6 +201,34 @@ pub async fn allocate_next_lnd(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::R
         "UPDATE node_state SET next_lnd = next_lnd + 1 \
          WHERE fiscal_number = ? \
          RETURNING next_lnd - 1",
+    )
+    .bind(fn_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(allocated)
+}
+
+/// W6 / ADR-M3-A2 — atomically allocate and advance the FN's
+/// `next_z_report_number`.
+///
+/// Mirrors [`allocate_next_lnd`] discipline (single-statement
+/// `UPDATE … RETURNING`; bare CAS — the existing `node_state_updated_at`
+/// trigger from migration 001 covers `updated_at`).  Caller (W6 stage
+/// 3-PRE) MUST persist the returned value onto
+/// `fiscal_documents.z_report_number` in the SAME `with_immediate`
+/// envelope; on retry, stage 3-PRE reads the persisted value back and
+/// does NOT call this allocator again.  Partial UNIQUE index
+/// `ux_fd_fn_zrn` (migration 009) is the fail-closed downstream guard
+/// against any drift.
+///
+/// Returns the allocated z_report_number; returns `RowNotFound` if the
+/// FN row is missing (caller responsibility per ADR-M3-A7 / App::boot
+/// invariants).
+pub async fn allocate_z_report_number(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<i64> {
+    let allocated: i64 = sqlx::query_scalar(
+        "UPDATE node_state SET next_z_report_number = next_z_report_number + 1 \
+         WHERE fiscal_number = ? \
+         RETURNING next_z_report_number - 1",
     )
     .bind(fn_id)
     .fetch_one(&mut **tx)

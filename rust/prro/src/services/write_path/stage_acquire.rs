@@ -274,6 +274,13 @@ pub async fn run(
                 submission_attempted_at: None,
                 backend_profile_id: new_doc.backend_profile_id.clone(),
                 transport_profile_id: new_doc.transport_profile_id.clone(),
+                // W6 — fresh PREPARED row: chain hash, Z, unsigned-hash,
+                // and pin-marker are all genuinely None.  Stage 3-PRE
+                // (W6) is the canonical pin site.
+                previous_hash: None,
+                z_report_number: None,
+                unsigned_xml_sha256: None,
+                signing_inputs_pinned_at: None,
             };
 
             Ok(WorkerProcessResult::Proceed(WorkerContext {

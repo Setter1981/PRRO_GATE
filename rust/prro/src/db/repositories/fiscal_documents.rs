@@ -62,6 +62,53 @@ pub struct DocumentRow {
     /// present for a successfully-inserted doc.
     pub backend_profile_id: String,
     pub transport_profile_id: String,
+    /// W6 — previous-doc unsigned-XML SHA256 (raw 32 bytes, NOT hex).
+    /// Pinned in stage 3-PRE atomically with `signing_inputs_pinned_at`.
+    /// Hex-encoded only at the XML builder boundary (`<MAC>` attr).
+    /// `None` for a doc whose chain seed was unset at pin time
+    /// (genuine first-after-bootstrap), distinguishable from "not
+    /// pinned yet" via [`signing_inputs_pinned_at`].
+    pub previous_hash: Option<[u8; 32]>,
+    /// W6 — Z-report counter persisted on the doc; `Some(N)` only for
+    /// `wire_artifact_kind == ZReport` (DocType::ShiftClose or
+    /// DocType::ZReport after boundary mapping).  Pinned in stage
+    /// 3-PRE; retry observes the persisted value and reuses it.
+    pub z_report_number: Option<i64>,
+    /// W6 — sha256 of the canonical unsigned XML.  Updated NULL→hash
+    /// in stage 3-PERSIST (was set NULL by W5 INSERT PREPARED).
+    pub unsigned_xml_sha256: Option<[u8; 32]>,
+    /// W6 — pin-once flag (ISO8601 timestamp).  `None` = stage 3-PRE
+    /// has not pinned signing inputs yet.  `Some(_)` = pinned; the
+    /// `previous_hash` and `z_report_number` columns are now
+    /// authoritative for retry.
+    pub signing_inputs_pinned_at: Option<String>,
+}
+
+/// W6 — decode a length-32 BLOB into a fixed `[u8; 32]`.  Fail-closed:
+/// any non-NULL value whose length is not 32 surfaces as a
+/// `sqlx::Error::Decode` rather than a silent truncation.  Schema
+/// CHECK clauses (`previous_hash`, `unsigned_xml_sha256`) make this
+/// path unreachable in production, but a corrupted or hand-edited DB
+/// is then operator-visible at row load time.
+fn decode_blob32(
+    raw: Option<Vec<u8>>,
+    column: &'static str,
+) -> Result<Option<[u8; 32]>, sqlx::Error> {
+    match raw {
+        None => Ok(None),
+        Some(v) => {
+            let arr: [u8; 32] = v.as_slice().try_into().map_err(|_| {
+                sqlx::Error::Decode(
+                    format!(
+                        "fiscal_documents.{column}: expected 32 bytes, got {}",
+                        v.len()
+                    )
+                    .into(),
+                )
+            })?;
+            Ok(Some(arr))
+        }
+    }
 }
 
 /// Outcome of a state transition attempt.  Replaces a bare `bool` so write_path
@@ -229,7 +276,11 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
                   server_fiscal_no,
                   submission_attempted_at,
                   backend_profile_id,
-                  transport_profile_id
+                  transport_profile_id,
+                  previous_hash         as "previous_hash: Vec<u8>",
+                  z_report_number,
+                  unsigned_xml_sha256   as "unsigned_xml_sha256: Vec<u8>",
+                  signing_inputs_pinned_at
            FROM fiscal_documents
            WHERE fiscal_number = ?
              AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')
@@ -238,20 +289,25 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| DocumentRow {
-            document_id: r.document_id,
-            fiscal_number: r.fiscal_number,
-            lnd: r.lnd,
-            state: r.state,
-            doc_type: r.doc_type,
-            server_fiscal_no: r.server_fiscal_no,
-            submission_attempted_at: r.submission_attempted_at,
-            backend_profile_id: r.backend_profile_id,
-            transport_profile_id: r.transport_profile_id,
+    rows.into_iter()
+        .map(|r| {
+            Ok(DocumentRow {
+                document_id: r.document_id,
+                fiscal_number: r.fiscal_number,
+                lnd: r.lnd,
+                state: r.state,
+                doc_type: r.doc_type,
+                server_fiscal_no: r.server_fiscal_no,
+                submission_attempted_at: r.submission_attempted_at,
+                backend_profile_id: r.backend_profile_id,
+                transport_profile_id: r.transport_profile_id,
+                previous_hash: decode_blob32(r.previous_hash, "previous_hash")?,
+                z_report_number: r.z_report_number,
+                unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
+                signing_inputs_pinned_at: r.signing_inputs_pinned_at,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// W5 / W0-1 §3.1 stage 1 — resume-detect lookup by `request_id`
@@ -281,7 +337,11 @@ pub async fn get_pending_by_request_id_tx(
                   server_fiscal_no,
                   submission_attempted_at,
                   backend_profile_id,
-                  transport_profile_id
+                  transport_profile_id,
+                  previous_hash         as "previous_hash: Vec<u8>",
+                  z_report_number,
+                  unsigned_xml_sha256   as "unsigned_xml_sha256: Vec<u8>",
+                  signing_inputs_pinned_at
            FROM fiscal_documents
            WHERE request_id = ?
              AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')"#,
@@ -289,7 +349,8 @@ pub async fn get_pending_by_request_id_tx(
     )
     .fetch_optional(&mut **tx)
     .await?;
-    Ok(row.map(|r| DocumentRow {
+    let Some(r) = row else { return Ok(None) };
+    Ok(Some(DocumentRow {
         document_id: r.document_id,
         fiscal_number: r.fiscal_number,
         lnd: r.lnd,
@@ -299,6 +360,10 @@ pub async fn get_pending_by_request_id_tx(
         submission_attempted_at: r.submission_attempted_at,
         backend_profile_id: r.backend_profile_id,
         transport_profile_id: r.transport_profile_id,
+        previous_hash: decode_blob32(r.previous_hash, "previous_hash")?,
+        z_report_number: r.z_report_number,
+        unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
+        signing_inputs_pinned_at: r.signing_inputs_pinned_at,
     }))
 }
 
@@ -365,4 +430,103 @@ pub async fn insert_prepared_tx(tx: &mut WriteTxConn<'_>, n: &NewDocument) -> sq
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// W6 stage 3-PRE — pin status + state snapshot of a doc, atomic with
+/// the rest of the 3-PRE write tx.  Returns `None` if the row is
+/// missing.  `state` is included so the caller can early-fail with
+/// `SignError::StateConflict` BEFORE pin or Z allocation, preventing
+/// stale-WorkerContext from advancing `next_z_report_number` for a doc
+/// whose flow already concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedSigningInputs {
+    pub state: DocState,
+    /// `signing_inputs_pinned_at IS NOT NULL` — disambiguates "not
+    /// pinned yet" from "pinned with empty/None previous_hash"
+    /// (genuine first-doc-after-bootstrap edge case).
+    pub is_pinned: bool,
+    pub previous_hash: Option<[u8; 32]>,
+    pub z_report_number: Option<i64>,
+}
+
+/// W6 stage 3-PRE — read state + pin status atomically inside the
+/// `with_immediate` envelope.  See [`PinnedSigningInputs`] for shape.
+pub async fn get_signing_inputs_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+) -> sqlx::Result<Option<PinnedSigningInputs>> {
+    let row = sqlx::query!(
+        r#"SELECT state                    as "state: DocState",
+                  previous_hash            as "previous_hash: Vec<u8>",
+                  z_report_number,
+                  signing_inputs_pinned_at
+           FROM fiscal_documents WHERE document_id = ?"#,
+        doc_id
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(r) = row else { return Ok(None) };
+    Ok(Some(PinnedSigningInputs {
+        state: r.state,
+        is_pinned: r.signing_inputs_pinned_at.is_some(),
+        previous_hash: decode_blob32(r.previous_hash, "previous_hash")?,
+        z_report_number: r.z_report_number,
+    }))
+}
+
+/// W6 stage 3-PRE — pin signing inputs onto the doc atomically.  One
+/// UPDATE writes `previous_hash`, `z_report_number`, AND
+/// `signing_inputs_pinned_at = CURRENT_TIMESTAMP`.
+///
+/// **Pin-once + state-gate guard**: WHERE-guarded on
+/// `state = 'PREPARED' AND signing_inputs_pinned_at IS NULL`.  Returns
+/// `rows_affected` so the caller can distinguish:
+/// - `1` — pin happened (this caller is authoritative)
+/// - `0` — either state moved (concurrent finalize/reject) OR row
+///   was already pinned by an earlier 3-PRE re-entry; caller already
+///   has [`get_signing_inputs_tx`] read in the same tx and acts on
+///   that truth (re-fetch + StateConflict OR reuse-branch).
+///
+/// Idempotent under concurrent re-entry: a second pin attempt finds
+/// `signing_inputs_pinned_at IS NOT NULL`, UPDATE matches 0 rows,
+/// caller falls through to reuse.
+pub async fn pin_signing_inputs_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+    previous_hash: Option<&[u8; 32]>,
+    z_report_number: Option<i64>,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE fiscal_documents \
+         SET previous_hash            = ?, \
+             z_report_number          = ?, \
+             signing_inputs_pinned_at = CURRENT_TIMESTAMP \
+         WHERE document_id = ? \
+           AND state = 'PREPARED' \
+           AND signing_inputs_pinned_at IS NULL",
+    )
+    .bind(previous_hash.map(|h| &h[..]))
+    .bind(z_report_number)
+    .bind(doc_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// W6 stage 3-PERSIST — UPDATE `unsigned_xml_sha256` from NULL to the
+/// canonical sha256 of the unsigned XML.  W5 INSERT PREPARED leaves
+/// it NULL; this is the canonical write site.  Returns `true` if the
+/// row exists and was updated.
+pub async fn update_unsigned_xml_sha256_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+    hash: &[u8; 32],
+) -> sqlx::Result<bool> {
+    let res =
+        sqlx::query("UPDATE fiscal_documents SET unsigned_xml_sha256 = ? WHERE document_id = ?")
+            .bind(&hash[..])
+            .bind(doc_id)
+            .execute(&mut **tx)
+            .await?;
+    Ok(res.rows_affected() == 1)
 }
