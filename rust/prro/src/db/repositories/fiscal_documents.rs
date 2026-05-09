@@ -530,3 +530,143 @@ pub async fn update_unsigned_xml_sha256_tx(
             .await?;
     Ok(res.rows_affected() == 1)
 }
+
+/// W7 stage 4 — minimal field set the send stage needs to construct a
+/// `CheckEnvelope` and a `transport_trace::NewAttempt`.  Fields are a
+/// strict subset of [`DocumentRow`]: only what stage 4 reads.  No
+/// unsigned-xml hash, no Z-allocation seed, no offline session id —
+/// those are 4-pre's not-our-concern (`document_files::SignedXml` is
+/// read separately; `id_offline`/`id_cancel` are W11 / future cancel
+/// territory and stay empty in W7).
+#[derive(Debug, Clone)]
+pub struct SendInputs {
+    /// Pre-CAS observed state.  Stage 4-pre reads this BEFORE the
+    /// `transition_state(Signed, Sending)` CAS so that, on a CAS miss
+    /// (`TransitionOutcome::Conflict`), the worker can surface the
+    /// actual current state to the dispatch layer (e.g. doc already
+    /// `Sent` from a prior worker).
+    pub state: DocState,
+    /// Maps to `CheckEnvelope.rro_fn`.
+    pub fiscal_number: String,
+    /// Maps to `CheckEnvelope.local_number` for SELL/RETURN/Z_REPORT/
+    /// SHIFT_CLOSE.  `WireArtifactKind::ShiftOpen` overrides this to 0
+    /// inside the envelope builder per the proven Sprint 7 contract
+    /// (see `dps_fiscal_server.py:190`); raw `lnd` is still surfaced
+    /// here so the override site is the single source of truth.
+    pub lnd: i64,
+    /// Drives [`derive_wire_artifact_kind`] in stage_sign / stage_send;
+    /// `DpsCheckType` is then derived in the envelope builder.
+    pub doc_type: DocType,
+    /// ISO-8601 business timestamp; envelope builder converts to the
+    /// DPS Kyiv-local-as-epoch shape (`CheckEnvelope.date_time`).
+    pub business_ts: String,
+    /// Persisted profile bindings — snapshot from the doc, NOT
+    /// re-resolved against `node_state` (mirrors W5 resume semantics).
+    /// Pass-through to `transport_trace::NewAttempt`.
+    pub backend_profile_id: String,
+    pub transport_profile_id: String,
+}
+
+/// W7 stage 4-pre — read the minimal field set required by stage 4 in
+/// a single SELECT inside the `with_immediate` envelope.  Returns
+/// `None` when the row is missing; caller treats that as
+/// `StageSendError::DocumentMissing`.
+///
+/// **Pre-CAS read.** This MUST be called BEFORE
+/// `transition_state(Signed, Sending)` so the returned `state` is the
+/// pre-transition observation.  After a successful CAS the doc is in
+/// `Sending`; reading state post-CAS would only ever return `Sending`
+/// and would be useless for the StateConflict diagnostic.
+pub async fn fetch_send_inputs_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+) -> sqlx::Result<Option<SendInputs>> {
+    let row = sqlx::query!(
+        r#"SELECT state                as "state: DocState",
+                  fiscal_number,
+                  lnd,
+                  doc_type             as "doc_type: DocType",
+                  business_ts,
+                  backend_profile_id,
+                  transport_profile_id
+           FROM fiscal_documents WHERE document_id = ?"#,
+        doc_id
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(r) = row else { return Ok(None) };
+    Ok(Some(SendInputs {
+        state: r.state,
+        fiscal_number: r.fiscal_number,
+        lnd: r.lnd,
+        doc_type: r.doc_type,
+        business_ts: r.business_ts,
+        backend_profile_id: r.backend_profile_id,
+        transport_profile_id: r.transport_profile_id,
+    }))
+}
+
+/// W7 stage 4-pre — stamp `submission_attempted_at = CURRENT_TIMESTAMP`
+/// for `doc_id`.
+///
+/// **Scope.** Lives ONLY inside the 4-pre `with_immediate` envelope,
+/// alongside the CAS `Signed → Sending`, the
+/// `transport_trace::allocate_and_insert_tx`, and the
+/// `STAGE_SEND_INTENT_MARKED` audit row.  This UPDATE does NOT mean
+/// "send happened" — it means "an attempt to send started".  The
+/// distinction matters because Pattern B places the durable intent
+/// marker BEFORE the wire call: a crash between 4-pre commit and 4-b
+/// commit leaves `submission_attempted_at IS NOT NULL` regardless of
+/// whether DPS received the request.
+///
+/// **Clock seam.** The timestamp comes from SQLite's
+/// `CURRENT_TIMESTAMP` rather than a caller-supplied string, per W7
+/// freeze decision #4 (no clock seam in `WorkerContext`).  Format
+/// matches `audit_log.created_at` and other DEFAULT-CURRENT_TIMESTAMP
+/// columns (`'YYYY-MM-DD HH:MM:SS'`); ordering against those columns
+/// is monotonic-by-construction.
+///
+/// Returns `true` if the row exists and was updated; `false`
+/// indicates a missing `document_id` and MUST be treated by the caller
+/// as `StageSendError::DocumentMissing`, not silently ignored.
+pub async fn mark_submission_attempted_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "UPDATE fiscal_documents SET submission_attempted_at = CURRENT_TIMESTAMP \
+         WHERE document_id = ?",
+    )
+    .bind(doc_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// W7 stage 4-b — persist the DPS-assigned fiscal id (`CheckAck.id`)
+/// onto the document row.
+///
+/// **Scope.** Lives ONLY inside the 4-b `with_immediate` envelope,
+/// alongside the CAS `Sending → Sent` (or `Sending → Kvt1` on inline
+/// KVT1 piggyback in W8), the matching `transport_trace::complete_tx`,
+/// and the audit row.  Not an idempotency seam: the CAS in 4-b is
+/// what guarantees the write happens at most once per attempt; this
+/// UPDATE is the side-effect of that CAS having succeeded.
+///
+/// Returns `true` if the row exists and was updated; `false` indicates
+/// a missing `document_id` and MUST be treated by the caller as a
+/// stage error (caller bug — the row was alive in 4-pre, so a
+/// 4-b-time miss is unrecoverable mid-stage), NOT a silent ignore.
+pub async fn set_server_fiscal_no_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+    server_fiscal_no: &str,
+) -> sqlx::Result<bool> {
+    let res =
+        sqlx::query("UPDATE fiscal_documents SET server_fiscal_no = ? WHERE document_id = ?")
+            .bind(server_fiscal_no)
+            .bind(doc_id)
+            .execute(&mut **tx)
+            .await?;
+    Ok(res.rows_affected() == 1)
+}
