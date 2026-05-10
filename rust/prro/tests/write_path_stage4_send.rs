@@ -710,6 +710,51 @@ async fn server_minus_11_with_missing_node_state_surfaces_typed_error() {
     // Doc state stays in SENDING (4-b tx rolled back).  W9 will pick
     // it up on the next boot.
     assert_eq!(read_doc_state(&pool, doc).await, "SENDING");
+
+    // R-W10.3-review LOW 4 close: 4-pre commits SHOULD persist
+    // (CAS doc-state, trace alloc, intent-marker audit), but 4-b
+    // SHOULD roll back (trace.completed_at NULL, no result audit
+    // row).  This contract is what makes W9 reconciliation safe to
+    // pick up Sending docs without losing forensic continuity.
+    let traces = transport_trace::list_for_document(&pool, doc)
+        .await
+        .unwrap();
+    assert_eq!(
+        traces.len(),
+        1,
+        "trace allocated in 4-pre persists across 4-b rollback (1 row)"
+    );
+    assert!(
+        traces[0].completed_at.is_none(),
+        "4-b rolled back — trace.completed_at must remain NULL"
+    );
+    assert!(
+        traces[0].outcome_kind.is_none(),
+        "4-b rolled back — outcome_kind must not be set"
+    );
+    assert!(
+        traces[0].retry_class.is_none(),
+        "4-b rolled back — retry_class must not be set"
+    );
+
+    // Audit: only the intent marker, no result/blocked entry (4-b
+    // rolled back swallowed it).
+    assert_eq!(
+        read_audit_event_types(&pool, doc).await,
+        vec!["STAGE_SEND_INTENT_MARKED"],
+        "4-b rollback must drop the result audit row"
+    );
+
+    // node_state row is genuinely missing (we never seeded it).  Pin
+    // that the failed flip didn't leave a half-applied row behind.
+    let node_row = prro::db::repositories::node_state::get(&pool, "1234567890")
+        .await
+        .unwrap();
+    assert!(
+        node_row.is_none(),
+        "missing-FN scenario must NOT leave a partial node_state row \
+         after the 4-b rollback"
+    );
 }
 
 // ─── Fixture 4 — pattern_b_ordering (spy) ────────────────────────────

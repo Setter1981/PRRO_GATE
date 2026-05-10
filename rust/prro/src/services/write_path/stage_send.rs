@@ -843,7 +843,9 @@ pub async fn run(
         let forensics = forensics_for_closure;
         let started = started_for_closure;
         let finished = finished_for_closure;
-        let fiscal_number = fiscal_number;
+        // `fiscal_number` captured directly via `move`; no rebind
+        // (R-W10.3-review LOW 3 close — the previous self-rebind
+        // `let fiscal_number = fiscal_number;` was a no-op).
         Box::pin(async move {
             let target = match &decision {
                 WireDecision::Sent { .. } => DocState::Sent,
@@ -920,14 +922,15 @@ pub async fn run(
             // contract); routed arm uses `decision.audit_event` per
             // freeze §3.4 closed enum.
             //
-            // Payload composition (W10.2 review LOW 1 + LOW/MED 3 close):
+            // Payload composition (W10.2 LOW 1 + LOW/MED 3 + W10.3 LOW 1):
             //   - `attempt_no`, `outcome_kind` always present (W7).
             //   - `retry_class` on the routed arm — forensic grep
             //     dimension orthogonal to event_type.
-            //   - `node_mode_flipped: "BLOCKED"` on Server-11 — durable
+            //   - `node_mode_flipped: "Blocked"` on Server-11 — durable
             //     evidence of the W10.3 flip; redundant with the
-            //     `node_state.mode = 'BLOCKED'` row but cheap, and lets
-            //     audit-log forensics work without a join.
+            //     `node_state.mode = 'BLOCKED'` row (DDL keeps SHOUTING
+            //     case) but cheap, and lets audit-log forensics work
+            //     without a join.
             //   - `probe_hint` reason on Decode/-2/-15 close-shift —
             //     surfaces the W9 last_chk-probe target without
             //     re-decoding the routing fn.

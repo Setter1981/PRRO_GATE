@@ -319,7 +319,7 @@ Implementation landed in commit `d2a3f91` + R-W10.3-review fix-up:
 
 - `pub async fn set_mode_blocked_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<bool>` added to `node_state.rs`.  Mirror of `update_last_known_xml_sha_tx`; returns `bool` for missing-row detection per W7.2 / W8.2 convention.
 - `stage_send.rs` 4-b closure honours `decision.node_mode_flip == Some(NodeMode::Blocked)` inside the same `with_immediate` envelope as the post-CAS write.  Atomic with the doc-state transition; missing FN row surfaces as typed `StageSendError::NodeStateMissingForBlock` and rolls back the entire 4-b tx — no half-applied state.
-- Audit payload extended on the routed arm: `node_mode_flipped: "BLOCKED"` recorded alongside `retry_class` (LOW 1) and `probe_hint` reason where present (LOW/MED 3 close).
+- Audit payload extended on the routed arm: `node_mode_flipped: "Blocked"` (PascalCase per R-W10.3-review LOW 1; consistent with `retry_class` + `probe_hint`) recorded alongside `retry_class` and `probe_hint` reason where present (LOW/MED 3 close).
 - Future-compat guard: `debug_assert_eq!(target_mode, NodeMode::Blocked)` fires in dev/CI if the routing fn ever emits a different `NodeMode` target without extending stage_send.
 
 ### 4.4 W10.4 — MAC recovery `-12` in-stage path
