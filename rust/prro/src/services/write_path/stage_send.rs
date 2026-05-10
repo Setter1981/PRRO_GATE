@@ -834,13 +834,16 @@ pub async fn run(
     let forensics_for_closure = wire_forensics.clone();
     let started_for_closure = wire_call_started_at;
     let finished_for_closure = wire_call_finished_at;
-    let fiscal_number_for_closure = fiscal_number.clone();
+    // R-W10.3-review LOW 2 close: `fiscal_number` is moved directly
+    // (single owner — the closure).  `wire_decision` and
+    // `wire_forensics` are cloned because the post-closure return
+    // block reads them; `fiscal_number` is not.
     with_immediate(pool, move |tx| {
         let decision = decision_for_closure;
         let forensics = forensics_for_closure;
         let started = started_for_closure;
         let finished = finished_for_closure;
-        let fiscal_number = fiscal_number_for_closure;
+        let fiscal_number = fiscal_number;
         Box::pin(async move {
             let target = match &decision {
                 WireDecision::Sent { .. } => DocState::Sent,
@@ -937,11 +940,28 @@ pub async fn run(
                 "outcome_kind": outcome_kind_str,
             });
             if let WireDecision::Routed(d) = &decision {
+                // R-W10.3-review LOW 1 close: all three payload
+                // discriminators use PascalCase consistently — matches
+                // `RetryClass::as_str()` migration-012 wire form and the
+                // Rust `Debug` form of `NodeMode` / `ProbeReason`.
+                // Earlier draft uppercased `node_mode_flipped`; that
+                // mirrored the DDL form ('BLOCKED') but broke
+                // forensic-grep consistency across audit_log JSON
+                // payloads.
+                //
+                // R-W10.3-review LOW 3 doc note: `node_mode_flipped`
+                // encodes ROUTING INTENT (the `-11` decision asked
+                // for BLOCKED), NOT a state transition observation.
+                // SQLite UPDATE semantics report rows_affected=1 for
+                // a matching row even when the value is unchanged, so
+                // the second `-11` for the same already-BLOCKED FN
+                // emits the same payload — by design, no CAS guard
+                // (avoids a read-then-write race on a hot path).
                 payload_obj["retry_class"] =
                     serde_json::Value::String(d.retry_class.as_str().to_string());
                 if let Some(mode) = d.node_mode_flip {
                     payload_obj["node_mode_flipped"] =
-                        serde_json::Value::String(format!("{mode:?}").to_uppercase());
+                        serde_json::Value::String(format!("{mode:?}"));
                 }
                 if let Some(hint) = &d.probe_hint {
                     payload_obj["probe_hint"] =

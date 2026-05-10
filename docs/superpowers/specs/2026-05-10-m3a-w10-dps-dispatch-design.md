@@ -315,7 +315,7 @@ Calling `run` repeatedly on a non-`TransientRetry` `ErrorRetryable` doc will pro
 
 ### 4.3 W10.3 — `node_state.mode → BLOCKED` side effect for `-11` ✅ (closed)
 
-Implementation landed in commit `<W10.3 commit>`:
+Implementation landed in commit `d2a3f91` + R-W10.3-review fix-up:
 
 - `pub async fn set_mode_blocked_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<bool>` added to `node_state.rs`.  Mirror of `update_last_known_xml_sha_tx`; returns `bool` for missing-row detection per W7.2 / W8.2 convention.
 - `stage_send.rs` 4-b closure honours `decision.node_mode_flip == Some(NodeMode::Blocked)` inside the same `with_immediate` envelope as the post-CAS write.  Atomic with the doc-state transition; missing FN row surfaces as typed `StageSendError::NodeStateMissingForBlock` and rolls back the entire 4-b tx — no half-applied state.

@@ -549,6 +549,30 @@ async fn decode_status_zero_routes_to_probe_required_with_decode_unknown_hint() 
         read_audit_event_types(&pool, doc).await,
         vec!["STAGE_SEND_INTENT_MARKED", "STAGE_SEND_DECODE_UNKNOWN"]
     );
+
+    // R-W10.3-review MED 1 close: pin the audit-payload extension
+    // for `probe_hint`.  freeze §4.5 + W10.3 commit msg promise the
+    // routed arm carries `probe_hint:"<ProbeReason>"` for Decode /
+    // -2 / -15 close-shift; without this assert the payload-extension
+    // branch could silently regress.
+    let last_payload = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE entity_type = 'fiscal_document' AND entity_id = ? \
+         ORDER BY audit_id DESC LIMIT 1",
+    )
+    .bind(format!("{doc:?}"))
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .expect("audit payload must be present");
+    assert!(
+        last_payload.contains("\"probe_hint\":\"DecodeUnknown\""),
+        "audit payload must carry probe_hint=DecodeUnknown evidence: {last_payload}"
+    );
+    assert!(
+        last_payload.contains("\"retry_class\":\"ProbeRequired\""),
+        "audit payload must carry retry_class: {last_payload}"
+    );
 }
 
 // ─── Fixture 3e — Server -11 ERROR_OFFLINE_168 → node BLOCKED ────────
@@ -561,7 +585,9 @@ async fn decode_status_zero_routes_to_probe_required_with_decode_unknown_hint() 
 //   - decision.node_mode_flip == Some(NodeMode::Blocked)
 //   - post-run `node_state.mode == 'BLOCKED'`
 //   - audit STAGE_SEND_NODE_BLOCKED (Critical)
-//   - audit payload carries `node_mode_flipped: "BLOCKED"`
+//   - audit payload carries `node_mode_flipped: "Blocked"` (PascalCase
+//     per R-W10.3-review LOW 1 — JSON consistency with retry_class
+//     and probe_hint)
 //   - durable retry_class on trace row
 
 #[tokio::test]
@@ -642,8 +668,8 @@ async fn server_minus_11_routes_to_rejected_and_flips_node_to_blocked() {
     .unwrap()
     .expect("audit payload must be present");
     assert!(
-        last_payload.contains("\"node_mode_flipped\":\"BLOCKED\""),
-        "audit payload must carry node_mode_flipped evidence: {last_payload}"
+        last_payload.contains("\"node_mode_flipped\":\"Blocked\""),
+        "audit payload must carry node_mode_flipped=Blocked (PascalCase per LOW 1): {last_payload}"
     );
     assert!(
         last_payload.contains("\"retry_class\":\"TerminalReject\""),
