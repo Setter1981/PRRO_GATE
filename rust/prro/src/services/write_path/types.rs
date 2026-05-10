@@ -99,3 +99,69 @@ pub enum WorkerProcessResult {
     /// `fiscal_documents` row is created and NO lnd is allocated.
     Rejected { reason: RejectionReason },
 }
+
+// ─── Shared bridge_anyhow helper (R-W10.4-senior-review LOW 1) ───────
+
+/// Generic `anyhow::Error` → typed-stage-error bridge.  Mirrors the
+/// pattern previously triplicated as private `bridge_anyhow` fns in
+/// `stage_send.rs` / `stage_sign.rs` / `mac_recovery.rs`.
+///
+/// Behaviour (matches the original three private impls):
+///   1. Try to downcast to the concrete typed error `E` first — that
+///      handles the `anyhow::Error::new(E::Variant(..))` round-trip
+///      from inside `with_immediate` closures.
+///   2. Fall back to downcasting to `sqlx::Error` and wrap via
+///      `wrap_db` — distinguishes DB errors from generic anyhow
+///      chains.
+///   3. Anything else: wrap via `wrap_internal`.
+///
+/// Each module's local `bridge_anyhow` becomes a one-liner:
+/// ```ignore
+/// fn bridge_anyhow(e: anyhow::Error) -> StageSendError {
+///     bridge_anyhow_to(e, StageSendError::Db, StageSendError::Internal)
+/// }
+/// ```
+///
+/// Why generic over wrap fns (not over the typed error directly):
+/// each module's typed error has its own `Db(sqlx::Error)` and
+/// `Internal(anyhow::Error)` variant constructors with subtly
+/// different naming; passing them as fn pointers keeps each module's
+/// surface unchanged while deduplicating the downcast logic.
+pub(super) fn bridge_anyhow_to<E>(
+    e: anyhow::Error,
+    wrap_db: fn(sqlx::Error) -> E,
+    wrap_internal: fn(anyhow::Error) -> E,
+) -> E
+where
+    E: 'static + std::error::Error + Send + Sync,
+{
+    match e.downcast::<E>() {
+        Ok(typed) => typed,
+        Err(rest) => match rest.downcast::<sqlx::Error>() {
+            Ok(sqlx_err) => wrap_db(sqlx_err),
+            Err(other) => wrap_internal(other),
+        },
+    }
+}
+
+// ─── Shared lowercase hex encoder (R-W10.4-senior-review LOW 2) ──────
+
+/// Lowercase hex encoder for byte slices.  Used for:
+///   - canonical XML `<…PREV_DOC_HASH>` rendering (W6 stage 3,
+///     `re_sign_after_mac_recovery`).
+///   - audit-payload JSON `*_hex` fields (W10.4 MAC recovery audits).
+///
+/// Closed contract: lowercase via `format!("{b:02x}")`.  W10.1 review
+/// pinned this case explicitly via fixture
+/// `re_sign_propagates_new_previous_hash_into_canonical_xml`; any
+/// regression to UPPERCASE hex would fail loudly.  De-duplicated
+/// from `stage_sign::hex_encode` + `mac_recovery::hex_lower` per
+/// senior review.
+pub(super) fn hex_encode_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}

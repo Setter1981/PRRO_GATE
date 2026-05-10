@@ -269,6 +269,38 @@ async fn read_recovery_inputs(
 /// See module docstring for the full state machine.  Caller dispatches
 /// on the returned [`MacRecoveryOutcome`] per the table in the enum
 /// docs.
+///
+/// # Caller obligation: single-writer-per-FN lease
+///
+/// (R-W10.4-senior-review MED 2 close.)  The orchestrator's MR-CLAIM
+/// and MR-PERSIST envelopes do NOT acquire the per-FN lease themselves;
+/// they rely on SQLite's BEGIN IMMEDIATE serialisation to prevent
+/// concurrent writes AND on the assumption that the caller already
+/// holds the single-writer-per-FN lease for `doc.fiscal_number`.
+///
+/// **Production caller `stage_send::run`** holds the lease for the
+/// duration of `run()`; recovery happens inside that window.  Ad-hoc
+/// callers (admin tools, test harnesses, future W9 reconciliation
+/// paths) MUST do the same — invoking `run_mac_recovery` without the
+/// lease is permitted only if the caller can justify that BEGIN
+/// IMMEDIATE serialisation alone is sufficient (e.g. read-only
+/// forensic replay where no other writer can race).
+///
+/// **What goes wrong without the lease.**  Two parallel callers on
+/// the same doc:
+///   - First MR-CLAIM wins, transitions counter 0→1.
+///   - Second MR-CLAIM CAS fails (counter already 1) ⇒
+///     `CounterExhausted`.
+///   - Doc state stays `ErrorRetryable`; first caller's PERSIST
+///     proceeds normally; second caller's caller observes
+///     `CounterExhausted` and routes to `TerminalReject`.
+///
+/// SQLite's serialisation makes this **functionally safe today** —
+/// no torn state, no double-spend.  But weakening the BEGIN
+/// IMMEDIATE invariant in a future schema change (e.g. moving
+/// counter claim outside a tx for performance) WOULD create a real
+/// race.  The lease obligation locks future maintainers into the
+/// safe model.
 pub async fn run_mac_recovery(
     pool: &SqlitePool,
     ctx: &SigningContext,
@@ -288,7 +320,24 @@ pub async fn run_mac_recovery(
         }
     };
 
-    // ── Step 2: MR-CLAIM ────────────────────────────────────────────
+    // ── Step 2: MR-NO-TX read (BEFORE MR-CLAIM) ─────────────────────
+    //
+    // R-W10.4-senior-review LOW 5 close: read recovery inputs BEFORE
+    // claiming the budget.  If the doc / fn_config row went missing
+    // (race with delete) OR `previous_hash` is malformed, we surface
+    // a typed error WITHOUT burning the single-bit budget — a future
+    // tick (after operator restores the row / config) can still
+    // attempt recovery.  Earlier ordering (CLAIM → read) permanently
+    // spent the counter on transient read failures.
+    //
+    // Reordering is safe under single-writer-per-FN: the inputs we
+    // read here cannot be mutated between this read and the MR-CLAIM
+    // CAS by another writer holding the same lease.
+    let inputs = read_recovery_inputs(pool, doc).await?;
+    let wire_artifact_kind = derive_wire_artifact_kind(inputs.doc_type)
+        .map_err(StageSendError::MacRecoverySignFailed)?;
+
+    // ── Step 3: MR-CLAIM ────────────────────────────────────────────
     let claimed: bool = with_immediate(pool, move |tx| {
         Box::pin(async move {
             fiscal_documents::mac_recovery_claim_counter_tx(tx, doc)
@@ -304,11 +353,6 @@ pub async fn run_mac_recovery(
         // alongside the override-to-TerminalReject path.
         return Ok(MacRecoveryOutcome::CounterExhausted);
     }
-
-    // ── Step 3: MR-NO-TX (read inputs + re-sign) ────────────────────
-    let inputs = read_recovery_inputs(pool, doc).await?;
-    let wire_artifact_kind = derive_wire_artifact_kind(inputs.doc_type)
-        .map_err(StageSendError::MacRecoverySignFailed)?;
     let resigned = stage_sign::re_sign_after_mac_recovery(
         ctx,
         wire_artifact_kind,
@@ -325,7 +369,16 @@ pub async fn run_mac_recovery(
     .map_err(StageSendError::MacRecoverySignFailed)?;
 
     // ── Step 4: MR-PERSIST (atomic four-write) ──────────────────────
-    let old_hash_hex = hex_lower(inputs.old_previous_hash.as_ref().map(|h| &h[..]));
+    //
+    // R-W10.4-senior-review LOW 4 close: `old_previous_hash` is
+    // serialised as JSON `null` when the doc had no prior chain (NULL
+    // column).  Earlier implementation rendered `""` (empty string),
+    // which is ambiguous between "no prior hash" and "decode-failed-
+    // to-empty".  JSON null is unambiguous "absent".
+    let old_previous_hash_field: serde_json::Value = match inputs.old_previous_hash {
+        Some(h) => serde_json::Value::String(hex_lower(Some(&h[..]))),
+        None => serde_json::Value::Null,
+    };
     let new_hash_hex = hex_lower(Some(&new_previous_hash[..]));
     let new_sha_hex = hex_lower(Some(&resigned.unsigned_xml_sha256[..]));
     let payload_xml = resigned.unsigned_xml.clone();
@@ -335,7 +388,7 @@ pub async fn run_mac_recovery(
     with_immediate(pool, move |tx| {
         let payload_xml = payload_xml.clone();
         let signed_xml = signed_xml.clone();
-        let old_hash_hex = old_hash_hex.clone();
+        let old_previous_hash_field = old_previous_hash_field.clone();
         let new_hash_hex = new_hash_hex.clone();
         let new_sha_hex = new_sha_hex.clone();
         Box::pin(async move {
@@ -392,7 +445,7 @@ pub async fn run_mac_recovery(
 
             // 4. Audit MAC_RECOVERY_RESIGNED with forensic correlation.
             let payload = serde_json::json!({
-                "old_previous_hash_hex": old_hash_hex,
+                "old_previous_hash_hex": old_previous_hash_field,
                 "new_previous_hash_hex": new_hash_hex,
                 "new_unsigned_xml_sha256_hex": new_sha_hex,
             })
@@ -460,30 +513,25 @@ async fn emit_hash_not_extractable_audit(
     Ok(())
 }
 
+/// Lowercase hex with `Option<&[u8]>` shape (None → empty string).
+/// Wraps the shared [`super::types::hex_encode_lower`]
+/// (R-W10.4-senior-review LOW 2 close).  Audit payload composition
+/// уже uses JSON null instead of empty for missing prior hash
+/// (LOW 4 close), so the empty-string fallback here is reserved for
+/// non-audit call sites that prefer empty strings in formatted
+/// output.
 fn hex_lower(bytes: Option<&[u8]>) -> String {
-    use std::fmt::Write;
-    match bytes {
-        None => String::new(),
-        Some(b) => {
-            let mut s = String::with_capacity(b.len() * 2);
-            for c in b {
-                let _ = write!(s, "{c:02x}");
-            }
-            s
-        }
-    }
+    bytes
+        .map(super::types::hex_encode_lower)
+        .unwrap_or_default()
 }
 
 /// Bridge `anyhow::Error` from `with_immediate` closures back to typed
-/// `StageSendError`.  Mirrors the pattern from `stage_send::run`.
+/// `StageSendError`.  Thin wrapper over the shared
+/// [`super::types::bridge_anyhow_to`] (R-W10.4-senior-review LOW 1
+/// close — deduplicated from three modules to one shared helper).
 fn bridge_anyhow(e: anyhow::Error) -> StageSendError {
-    match e.downcast::<StageSendError>() {
-        Ok(typed) => typed,
-        Err(rest) => match rest.downcast::<sqlx::Error>() {
-            Ok(sqlx_err) => StageSendError::Db(sqlx_err),
-            Err(other) => StageSendError::Internal(other),
-        },
-    }
+    super::types::bridge_anyhow_to(e, StageSendError::Db, StageSendError::Internal)
 }
 
 // ─── Unit tests for the pure-fn surface ──────────────────────────────

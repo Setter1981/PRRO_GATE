@@ -193,6 +193,69 @@ async fn mark_submission_attempted_updates_existing_row() {
 }
 
 #[tokio::test]
+async fn mark_submission_attempted_idempotent_preserves_first_stamp() {
+    // R-W10.4-senior-review MED 1 close: the column promise is
+    // "first submission attempt time".  W10.4 step 2d retry path
+    // re-runs 4-pre (and thus mark_submission_attempted_tx) on
+    // attempt #2; this fixture pins that the helper does NOT
+    // overwrite the existing value on the second call.
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_signed_doc(&pool, 0xF1, "SELL", 99).await;
+
+    // First call: column starts NULL, gets stamped.
+    let first = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            fiscal_documents::mark_submission_attempted_tx(tx, doc)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .expect("first stamp");
+    assert!(first, "first stamp on existing row must return true");
+
+    // Force the timestamp into a known sentinel value so the
+    // second-call assertion is wall-clock-independent.
+    sqlx::query(
+        "UPDATE fiscal_documents SET submission_attempted_at = '2020-01-01 00:00:00' \
+         WHERE document_id = ?",
+    )
+    .bind(doc)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Second call: must NOT overwrite the existing timestamp.
+    let second = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            fiscal_documents::mark_submission_attempted_tx(tx, doc)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .expect("second stamp");
+    assert!(
+        second,
+        "row exists, helper must report success even when no UPDATE happens"
+    );
+
+    let post: Option<String> = sqlx::query_scalar(
+        "SELECT submission_attempted_at FROM fiscal_documents WHERE document_id = ?",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        post.as_deref(),
+        Some("2020-01-01 00:00:00"),
+        "second helper call must preserve first-attempt timestamp \
+         (idempotency contract — first-attempt-time semantic)"
+    );
+}
+
+#[tokio::test]
 async fn mark_submission_attempted_returns_false_for_missing_row() {
     let (_d, pool) = fresh_pool().await;
     let bogus = DocumentId::from_bytes([0xCCu8; 16]);

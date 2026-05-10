@@ -617,22 +617,25 @@ enum PinResult {
 }
 
 /// Bridge `anyhow::Error` from `with_immediate` closures to typed
-/// `SignError`.  Preserves sqlx cause via downcast when possible;
-/// otherwise wraps in `Internal` keeping the chain intact.
+/// `SignError`.  Thin wrapper over the shared
+/// [`super::types::bridge_anyhow_to`] (R-W10.4-senior-review LOW 1
+/// close — deduplicated from three modules to one shared helper).
+///
+/// Side benefit: aligning with the shared helper adds a typed-`SignError`
+/// downcast attempt BEFORE the `sqlx::Error` downcast.  W6 stage 3
+/// closures don't currently throw `anyhow::Error::new(SignError::...)`
+/// (typed errors fire post-closure on persist outcomes), but future
+/// code paths that DO that pattern will round-trip cleanly without
+/// being silently wrapped in `Internal`.
 fn bridge_anyhow(e: anyhow::Error) -> SignError {
-    match e.downcast::<sqlx::Error>() {
-        Ok(sqlx_err) => SignError::Db(sqlx_err),
-        Err(other) => SignError::Internal(other),
-    }
+    super::types::bridge_anyhow_to(e, SignError::Db, SignError::Internal)
 }
 
+/// Thin wrapper over the shared
+/// [`super::types::hex_encode_lower`] (R-W10.4-senior-review LOW 2
+/// close — deduplicated with `mac_recovery::hex_lower`).
 fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+    super::types::hex_encode_lower(bytes)
 }
 
 /// Convert UTC ISO-8601 `business_ts` to Kyiv-local `YYYYMMDDHHMMSS`.

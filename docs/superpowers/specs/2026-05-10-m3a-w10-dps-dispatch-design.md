@@ -404,6 +404,28 @@ Two `transport_trace` rows materialise: `attempt_no=1` (outcome=RETRYABLE_MAC_HA
 
 **New `OutcomeKind` variant** for `transport_trace.outcome_kind` CHECK list: `RETRYABLE_MAC_HASH_MISMATCH`.  Migration 013 extends the CHECK to include it (table-rebuild per migration 008 precedent — SQLite cannot ALTER an existing CHECK in place).
 
+**Expected per-recovery audit / trace row counts (R-W10.4-senior-review LOW 6 — operator runbook).**  Each MAC-recovery outcome materialises a deterministic number of `audit_log` rows + `transport_trace` rows.  Operators alerting on "doc reached recovery" can use these counts to validate the forensic chain shape before drilling into payloads:
+
+| Outcome | audit_log rows | transport_trace rows |
+|---|---|---|
+| **Resigned** (happy attempt #2 → Sent) | 5: `STAGE_SEND_INTENT_MARKED` ×2 + `STAGE_SEND_MAC_HASH_MISMATCH` + `MAC_RECOVERY_RESIGNED` + `STAGE_SEND_RESULT` | 2: attempt 1 = `RETRYABLE_MAC_HASH_MISMATCH`, attempt 2 = `OK` |
+| **HashNotExtractable** (attempt #1 → orchestrator → Rejected) | 3: `STAGE_SEND_INTENT_MARKED` + `STAGE_SEND_MAC_HASH_MISMATCH` + `MAC_RECOVERY_HASH_NOT_EXTRACTABLE` (+ no caller audit; CAS to Rejected only) | 1: attempt 1 = `RETRYABLE_MAC_HASH_MISMATCH` |
+| **CounterExhausted** (attempt #1 → orchestrator MR-CLAIM fails → Rejected) | 3: `STAGE_SEND_INTENT_MARKED` + `STAGE_SEND_MAC_HASH_MISMATCH` + `MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH` | 1 |
+| **Second `-12`** (Resigned → attempt #2 also `-12` → Rejected) | 5: `STAGE_SEND_INTENT_MARKED` ×2 + `STAGE_SEND_MAC_HASH_MISMATCH` ×2 + `MAC_RECOVERY_RESIGNED` (+ short-circuit emits `MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH`) — 6 total | 2: both `RETRYABLE_MAC_HASH_MISMATCH` |
+| Resigned → attempt #2 returns terminal-business reject | 5: `STAGE_SEND_INTENT_MARKED` ×2 + `STAGE_SEND_MAC_HASH_MISMATCH` + `MAC_RECOVERY_RESIGNED` + the routed audit per `RetryClass` (e.g. `STAGE_SEND_REJECTED` for `-5`) | 2 |
+
+**Counter / state cross-check** (one row per outcome above):
+
+| Outcome | `mac_recovery_attempts` (post) | doc state (post) |
+|---|---|---|
+| Resigned → Sent | 1 | `Sent` |
+| HashNotExtractable | 0 | `Rejected` |
+| CounterExhausted | 1 (was 1 pre-call; helper CAS no-op; rare crash-recovery path) | `Rejected` |
+| Second `-12` | 1 | `Rejected` |
+| Resigned → other terminal | 1 | per routed decision |
+
+`MAC_RECOVERY_RESIGNED` audit row absence + `mac_recovery_attempts == 1` together signal a recovery that started but never completed (orchestrator crashed between MR-CLAIM and MR-PERSIST).  Operator runbook: pull `transport_trace.last_attempt.retry_class` to disambiguate from a clean attempt-#1 `-12` that hasn't been processed yet.
+
 #### 4.4.2 New helpers (HIGH 2 + LOW 1 close)
 
 **`mac_recovery_claim_counter_tx`** — only claims the budget; does NOT write `previous_hash`.  Lives in `fiscal_documents.rs` (touches only `fiscal_documents` columns):

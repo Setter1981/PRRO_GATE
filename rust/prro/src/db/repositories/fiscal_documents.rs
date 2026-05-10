@@ -731,14 +731,39 @@ pub async fn mark_submission_attempted_tx(
     tx: &mut WriteTxConn<'_>,
     doc_id: DocumentId,
 ) -> sqlx::Result<bool> {
+    // Idempotent stamp (R-W10.4-senior-review MED 1 close): the
+    // column promise is "first submission attempt time", not "last
+    // submission attempt time".  W10.4 step 2d introduced a Pattern B
+    // retry path through 4-pre on attempt #2 (Resigned re-entry); the
+    // earlier unconditional UPDATE silently overwrote attempt-#1's
+    // timestamp.  Per-attempt timing is preserved in
+    // `transport_trace.started_at`; this column documents the
+    // single first-submission moment and must not be rewritten.
+    //
+    // Two-statement implementation (atomic in the wrapping tx) so we
+    // can distinguish "row missing" from "already stamped" without
+    // sqlx Database-error-text matching.  The cost is one extra
+    // SELECT on stage 4-pre — negligible vs the wire send + audit
+    // writes that follow.
     let res = sqlx::query(
         "UPDATE fiscal_documents SET submission_attempted_at = CURRENT_TIMESTAMP \
-         WHERE document_id = ?",
+         WHERE document_id = ? AND submission_attempted_at IS NULL",
     )
     .bind(doc_id)
     .execute(&mut **tx)
     .await?;
-    Ok(res.rows_affected() == 1)
+    if res.rows_affected() == 1 {
+        // First-time stamp committed.
+        return Ok(true);
+    }
+    // rows_affected == 0 could mean: (a) row missing, (b) already
+    // stamped.  Disambiguate with a SELECT in the same tx.
+    let exists: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(exists.is_some())
 }
 
 /// W7 stage 4-b — persist the DPS-assigned fiscal id (`CheckAck.id`)
