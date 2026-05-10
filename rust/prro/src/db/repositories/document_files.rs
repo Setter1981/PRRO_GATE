@@ -84,17 +84,28 @@ pub async fn get_tx(
 /// Used by the MAC-recovery orchestrator (`mac_recovery.rs`) inside
 /// the MR-PERSIST `with_immediate` envelope to swap PAYLOAD_XML and
 /// SIGNED_XML after re-signing with a recovered `previous_hash`.
-/// `INSERT OR REPLACE` is the SQLite idiom: the new row replaces any
-/// existing `(document_id, kind)` row in a single statement, atomic
-/// by definition.
+/// Within the wrapping `with_immediate` envelope, `INSERT OR REPLACE`
+/// commits as a single atomic step — the conflict-resolution DELETE
+/// and the new INSERT happen in one tx with no intermediate visibility
+/// (R-W10.4-step2a-review NIT close — phrasing tightened from "atomic
+/// by SQLite definition").
 ///
-/// **Why not DELETE+INSERT.**  Two statements would commit only if
-/// both succeed (the wrapping `with_immediate` provides atomicity),
-/// but `INSERT OR REPLACE` is a single statement, single B-tree
-/// touch, and matches SQLite's documented "upsert by PK collision"
-/// idiom.  No CHECK / UNIQUE / FK constraints on `document_files`
-/// beyond the PK + FK to `fiscal_documents`, so PK collision is the
-/// only concern — exactly what `OR REPLACE` handles.
+/// **Why not DELETE+INSERT.**  Two statements would commit-or-roll
+/// back together via the wrapping tx, but `INSERT OR REPLACE` is a
+/// single statement with single-PK semantics matching SQLite's
+/// documented upsert idiom.  No CHECK / UNIQUE / FK constraints on
+/// `document_files` beyond the PK + FK to `fiscal_documents`, so PK
+/// collision is the only concern — exactly what `OR REPLACE` handles.
+///
+/// **Caller contract (R-W10.4-step2a-review LOW 3).**  Although the
+/// helper handles the missing-row case via INSERT semantics, the
+/// MAC-recovery orchestrator's MR-PERSIST step assumes the row
+/// exists (W6 stage 3 invariant: PAYLOAD_XML + SIGNED_XML are INSERTed
+/// before stage 4 ever runs).  A missing row at MR-PERSIST time is a
+/// structural breach that should surface as a typed error from the
+/// orchestrator BEFORE reaching this helper — not be silently
+/// INSERTed here.  Callers without that invariant (e.g. ad-hoc
+/// admin tooling) are free to use the INSERT fallback intentionally.
 ///
 /// **Forensic note.**  Replacing artifacts intentionally drops the
 /// pre-recovery bytes.  The `MAC_RECOVERY_RESIGNED` audit row carries
@@ -102,6 +113,14 @@ pub async fn get_tx(
 /// for chain-level forensics; raw pre-recovery XML is NOT preserved.
 /// Operators wanting raw byte history of attempt #1 need a separate
 /// archive layer (out of M3a scope).
+///
+/// **`created_at` semantics (R-W10.4-step2a-review LOW 1).**  REPLACE
+/// resolves the PK conflict via DELETE + INSERT under the hood, so
+/// the new row gets a fresh `CURRENT_TIMESTAMP` default.
+/// `document_files.created_at` therefore reflects the recovery time,
+/// NOT the original sign time.  Original stage-3 commit time is
+/// preserved in `fiscal_documents.created_at` and the W6
+/// `STAGE_SIGN_RESULT` audit row.
 pub async fn replace_tx(
     tx: &mut WriteTxConn<'_>,
     doc_id: DocumentId,

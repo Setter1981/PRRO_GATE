@@ -160,6 +160,39 @@ async fn replace_inserts_when_no_existing_row() {
 }
 
 #[tokio::test]
+async fn replace_fk_violation_on_missing_fiscal_document() {
+    // R-W10.4-step2a-review LOW 2 close: replace_tx with a doc_id
+    // that doesn't exist in fiscal_documents must surface the FK
+    // violation via the wrapping tx (no silent ghost-row INSERT).
+    // Pins the document_files FK contract against future schema
+    // drift (e.g. accidental `ON DELETE SET NULL` change).
+    let (_d, pool) = fresh_pool().await;
+    let bogus = DocumentId::from_bytes([0xFFu8; 16]);
+
+    let res = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            document_files::replace_tx(tx, bogus, DocumentFileKind::SignedXml, b"x").await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await;
+    let err = res.expect_err("FK violation must surface (no ghost INSERT)");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("foreign") || msg.contains("constraint"),
+        "expected FK / constraint error, got: {msg}"
+    );
+
+    // Sanity: no row landed via the rolled-back attempt.
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM document_files WHERE document_id = ?")
+        .bind(bogus)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "rolled-back tx must not leave a partial row");
+}
+
+#[tokio::test]
 async fn replace_round_trips_arbitrary_byte_content() {
     // Pin: SQLite BLOB does not transform bytes; replace_tx is bit-faithful.
     let (_d, pool) = fresh_pool().await;
