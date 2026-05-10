@@ -97,6 +97,7 @@ async fn complete_ok(pool: &SqlitePool, doc: DocumentId, attempt_no: i32, server
                     server_status_code: None,
                     error_kind: None,
                     error_message: None,
+                    retry_class: None,
                 },
             )
             .await?;
@@ -283,6 +284,7 @@ async fn partial_index_unfinished_is_queryable() {
                     server_status_code: Some(-1),
                     error_kind: Some("Authorization".into()),
                     error_message: Some("ERROR_VEREFY".into()),
+                    retry_class: Some("TerminalReject".into()),
                 },
             )
             .await?;
@@ -336,6 +338,7 @@ async fn second_completion_is_noop_first_outcome_preserved() {
                     server_status_code: Some(-1),
                     error_kind: Some("Authorization".into()),
                     error_message: Some("ERROR_VEREFY".into()),
+                    retry_class: Some("TerminalReject".into()),
                 },
             )
             .await?;
@@ -386,6 +389,7 @@ async fn ok_outcome_without_server_fiscal_no_is_rejected() {
                     server_status_code: None,
                     error_kind: None,
                     error_message: None,
+                    retry_class: None,
                 },
             )
             .await?;
@@ -416,6 +420,7 @@ async fn ok_outcome_without_server_fiscal_no_is_rejected() {
                     server_status_code: None,
                     error_kind: None,
                     error_message: None,
+                    retry_class: None,
                 },
             )
             .await?;

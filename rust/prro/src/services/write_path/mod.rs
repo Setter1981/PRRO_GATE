@@ -10,6 +10,8 @@
 //!   - W10: DpsError routing dispatch
 //!   - W11: cross-stage deterministic-replay gate
 
+pub mod error_routing;
+pub mod mac_recovery;
 pub mod stage_acquire;
 pub mod stage_finalize;
 pub mod stage_send;

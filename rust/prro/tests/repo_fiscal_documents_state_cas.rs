@@ -332,6 +332,12 @@ fn allowed_transition_exhaustive_matrix() {
         (Sending, ErrorRetryable),
         (Sending, Rejected),
         (ErrorRetryable, Sending),
+        // 1 W10.5 addition: MAC recovery dispatch terminal — orchestrator
+        // CounterExhausted / HashNotExtractable / second-`-12`-after-Resigned
+        // overrides ERROR_RETRYABLE → REJECTED via
+        // `override_to_rejected_with_failed_repeat_audit`
+        // (services/write_path/stage_send.rs).
+        (ErrorRetryable, Rejected),
     ]
     .into_iter()
     .collect();
@@ -355,10 +361,10 @@ fn allowed_transition_exhaustive_matrix() {
         }
     }
     assert_eq!(
-        allowed_count, 24,
-        "expected 17 base + 7 Pattern B = 24 allowed pairs (ADR-M3-A9 step 3)"
+        allowed_count, 25,
+        "expected 17 base + 7 Pattern B + 1 MAC recovery dispatch terminal = 25 allowed pairs"
     );
-    assert_eq!(forbidden_count, 169 - 24);
+    assert_eq!(forbidden_count, 169 - 25);
 }
 
 /// Negative coverage of intentional whitelist gaps from ADR-M3-A8 / A9.

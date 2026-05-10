@@ -1,14 +1,51 @@
 //! Stage 4 — send (Pattern B with SENDING marker).
 //!
 //! W7.3 lands the pure-Rust pre-flight surface: typed errors,
-//! `build_send_envelope`, `classify_send_outcome`, and
-//! `SendOutcome::trace_kind`.  The full 3-segment Pattern B worker
-//! step (4-pre / 4a / 4b) lives in W7.4 in this same module.
+//! `build_send_envelope`, and `transport_trace::OutcomeKind`-shaped
+//! completion building.  The full 3-segment Pattern B worker step
+//! (4-pre / 4a / 4b) lives in W7.4 in this same module.
+//!
+//! W10.2 wires `error_routing::route_send_result` into 4-a/4-b: the
+//! W7 minimal `SendOutcome` / `classify_send_outcome` shim was dropped
+//! wholesale and replaced with `WireDecision::{Sent, Routed(decision)}`
+//! dispatch (freeze §3 + W0-3 §2 + §2.1).  4-pre source-state CAS is
+//! extended from `Signed → Sending` to `(Signed | ErrorRetryable) → Sending`
+//! per HIGH 3 §4.2 — Pattern B retry-path edge.
+//!
+//! # Caller obligation — retry-loop policy (R-W10.2-review HIGH 1)
+//!
+//! 4-pre CAS allowlist `(Signed | ErrorRetryable) → Sending` makes
+//! [`run`] willing to re-attempt any doc in `ErrorRetryable`,
+//! regardless of which `RetryClass` put it there.  The routing fn is
+//! pure; the policy of "which retry classes warrant another wire
+//! send" lives one layer up (worker dispatcher, W11+).  Callers MUST
+//! respect this table:
+//!
+//! | RetryClass of last attempt | re-invoke `run` |
+//! |---|---|
+//! | `TransientRetry` (Transport / Server-3)          | YES |
+//! | `FnConfigError` (-13/-14)                        | NO — operator |
+//! | `WrapperBug`                                     | NO — code fix |
+//! | `ProbeRequired` (Decode / -2/-15 close-shift)    | NO — W9 probe |
+//! | `MacRecovery` (-12)                              | NO — W10.4 orchestrator |
+//! | `OperatorEscalation` (-6)                        | NO — operator |
+//!
+//! Calling [`run`] repeatedly on a non-`TransientRetry` `ErrorRetryable`
+//! doc produces an unbounded crash-loop: same envelope, same server
+//! reply, same `ErrorRetryable` landing.  Until the worker dispatcher
+//! lands (W11+), tests + ops scripts MUST manually filter via
+//! [`crate::db::repositories::transport_trace::last_attempt_retry_class_for`]
+//! (durable column added in migration 012; encoded by the closed
+//! `RetryClass::as_str` map and decoded via `RetryClass::from_wire_str`).
+//! See freeze §4.2.
 //!
 //! Anchored on:
-//!   - W7 design freeze §4.3 (envelope builder; classify minimal table)
+//!   - W7 design freeze §4.3 (envelope builder)
+//!   - W10 design freeze §3 (`route_send_result`, `RoutingDecision`,
+//!     `AuditEvent`, `RetryClass`)
 //!   - ADR-M3-A2 (Z-allocation by `wire_artifact_kind`)
-//!   - ADR-M3-A6 (DpsError routing scaffold; full table is W10)
+//!   - ADR-M3-A6 (DpsError routing — full table)
+//!   - ADR-M3-A9 step 5-6 (Pattern B retry-path: ErrorRetryable → Sending)
 //!   - Sprint-7-proven Python contract `dps_fiscal_server.py:91-102, 190`
 //!     for `DocType -> DpsCheckType` and the `SHIFT_OPEN -> local_number = 0`
 //!     override.
@@ -27,15 +64,20 @@ use crate::db::repositories::{
     audit_log, document_files,
     document_files::DocumentFileKind,
     fiscal_documents::{self as fd, TransitionOutcome},
+    node_state,
     transport_trace::{self, AttemptCompletion, NewAttempt},
 };
 use crate::db::tx::with_immediate;
 use crate::transports::dps::channel::DpsChannel;
-use crate::transports::dps::dto::{CheckAck, CheckEnvelope, DpsCheckType};
-use crate::transports::dps::error::{AuthorizationKind, DpsError};
+use crate::transports::dps::dto::{CheckEnvelope, DpsCheckType};
+use crate::transports::dps::error::DpsError;
 use crate::transports::dps::gen;
 
-use super::stage_sign::{derive_wire_artifact_kind, SignError, WireArtifactKind};
+use super::error_routing::{
+    route_send_result, AuditEvent, RetryClass, RoutingDecision, WireDecision,
+};
+use super::mac_recovery::{self, MacRecoveryOutcome};
+use super::stage_sign::{derive_wire_artifact_kind, SignError, SigningContext, WireArtifactKind};
 
 // ─── Errors ──────────────────────────────────────────────────────────
 
@@ -114,6 +156,20 @@ pub enum StageSendError {
     )]
     MarkSubmissionAttemptedMissing { document_id: DocumentId },
 
+    /// W10.3 — `node_state::set_mode_blocked_tx` returned `false` in
+    /// 4-b: the FN row is missing.  W5 acquire upserts the row before
+    /// stage 1, so a missing FN at 4-b time is a structural breach
+    /// (mirror of `StageFinalizeError::SeedUpdateMissing`).  Surfacing
+    /// as typed error lets the dispatcher escalate (operator inspection
+    /// / W9 forensics) rather than silently leave the FN unblocked
+    /// after a -11 — which would let the next document hit the same
+    /// 168-hour limit and burst the fleet of Rejected docs.
+    #[error("stage 4 set_mode_blocked_tx returned 0 for fn {fn_id} after CAS Applied")]
+    NodeStateMissingForBlock {
+        fn_id: String,
+        document_id: DocumentId,
+    },
+
     /// `set_server_fiscal_no_tx` returned `false` in 4-b AFTER the
     /// CAS `Sending → Sent` succeeded.  Same invariant breach class
     /// as `PostWireCasFailed`.
@@ -134,6 +190,63 @@ pub enum StageSendError {
         document_id: DocumentId,
         attempt_no: i32,
     },
+
+    /// W10.4 step 2d — `stage_send::run` was invoked with
+    /// `sign_ctx = None` but the wire `-12` decision requires invoking
+    /// the MAC recovery orchestrator.  Production code paths MUST pass
+    /// `Some(&SigningContext)` so this never fires in production; it
+    /// surfaces in test contexts that exercise `-12` without a stub
+    /// crypto provider, OR in any future caller that forgets the
+    /// argument.  Surfacing as a typed error keeps recovery semantics
+    /// auditable rather than silently treating `-12` as a normal
+    /// `ErrorRetryable` doc.
+    #[error("stage 4 MAC recovery dispatch needs SigningContext (doc {document_id:?})")]
+    MacRecoveryContextMissing { document_id: DocumentId },
+
+    /// W10.4 step 2c — MAC recovery orchestrator could not find the
+    /// `(doc_id, kind)` artifact row in `document_files` during the
+    /// MR-PERSIST Pre-PERSIST assertion.  W6 stage-3 invariant
+    /// breach: PAYLOAD_XML + SIGNED_XML are INSERTed before stage 4
+    /// runs, so a missing row at MR-PERSIST time means the doc is
+    /// structurally broken.  Surfacing as a typed error rolls back
+    /// the entire MR-PERSIST envelope before `replace_tx` (which
+    /// would otherwise silently INSERT) gets invoked
+    /// (R-W10.4-step2a-review LOW 3 close).
+    #[error("MAC recovery artifact missing for doc {document_id:?}: {kind:?}")]
+    MacRecoveryArtifactMissing {
+        document_id: DocumentId,
+        kind: crate::db::repositories::document_files::DocumentFileKind,
+    },
+
+    /// W10.4 step 2c — MAC recovery orchestrator could not find the
+    /// `fiscal_documents` row when reading recovery inputs.  The doc
+    /// must be present for stage 4 to have invoked recovery; absence
+    /// indicates a race with delete (offline reconciliation, manual
+    /// operator action) that the orchestrator surfaces typed for W9.
+    #[error("MAC recovery: fiscal_documents row missing for doc {document_id:?}")]
+    DocumentMissingForRecovery { document_id: DocumentId },
+
+    /// W10.4 step 2c — MAC recovery orchestrator could not find the
+    /// `fiscal_number_config` row for the doc's `fiscal_number`.  This
+    /// would be a config-table inconsistency: the doc exists but the
+    /// FN it points to has no config row.  Possible causes: operator
+    /// removed the FN config while a doc was in flight, or a manual
+    /// DB edit.  Surfacing typed lets W9 pick this up distinctly from
+    /// the routine `DocumentMissingForRecovery`.
+    #[error("MAC recovery: fn_config missing for fn {fn_id} (doc {document_id:?})")]
+    FnConfigMissingForRecovery {
+        fn_id: String,
+        document_id: DocumentId,
+    },
+
+    /// W10.4 step 2c — MAC recovery orchestrator's MR-NO-TX re-sign
+    /// step (`stage_sign::re_sign_after_mac_recovery`) failed.  Wraps
+    /// the underlying [`crate::services::write_path::stage_sign::SignError`]
+    /// so the caller routes failure forensically (typically:
+    /// `PayloadSchema` / `TimestampConversion` / `Range` / `Crypto`
+    /// from the re-sign helper).
+    #[error("MAC recovery re-sign failed: {0}")]
+    MacRecoverySignFailed(#[source] crate::services::write_path::stage_sign::SignError),
 
     /// Pass-through DB error from any helper.  Distinct variant so
     /// callers can route DB issues separately from state-invariant
@@ -267,144 +380,55 @@ fn kyiv_local_epoch(business_ts: &str) -> Result<i64, StageSendError> {
     Ok(fake.timestamp())
 }
 
-// ─── classify_send_outcome ───────────────────────────────────────────
-
-/// W7-minimal outcome of the wire `send_chk` call.  Carries just
-/// enough to drive (a) the 4-b CAS target state, (b) the
-/// `transport_trace::OutcomeKind` mapping, and (c) the
-/// `set_server_fiscal_no_tx` write on the success branch.
-///
-/// **No `Kvt1` variant in W7.**  Inline KVT1 piggyback is W8
-/// territory; W7 fixtures intentionally do not exercise that path.
-///
-/// **No `StateConflict` variant here.**  StateConflict is observed
-/// from `transition_state(Signed, Sending)` in 4-pre, BEFORE the
-/// wire call.  Classify only sees post-wire results.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SendOutcome {
-    /// DPS returned OK; `server_fiscal_no` is the assigned fiscal id
-    /// (`CheckAck.id`).  4-b transitions `Sending → Sent` and writes
-    /// `server_fiscal_no` to `fiscal_documents`.
-    Sent { server_fiscal_no: String },
-    /// Terminal per-document reject (W7 minimal: only
-    /// `Authorization{DocumentReject}`).  4-b transitions
-    /// `Sending → Rejected`.
-    Rejected { code: i32, message: String },
-    /// Transient failure — 4-b transitions `Sending → ErrorRetryable`
-    /// and the worker re-enters via `(ErrorRetryable, Sending)` next
-    /// tick (per ADR-M3-A9 step 5-6 retry path).
-    Retryable { reason: RetryableReason },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RetryableReason {
-    /// gRPC transport-level failure (TCP/TLS/DNS/per-call deadline).
-    Transport(String),
-    /// DPS replied with a non-OK application status code.  W7 is
-    /// conservative: ALL `DpsError::Server` shapes route here.  W10
-    /// dispatch table will split per `code` (e.g. ERROR_NOT_OPEN_SHIFT
-    /// vs ERROR_BAD_HASH_PREV vs ...) into terminal vs transient.
-    Server { code: i32, message: String },
-    /// `Authorization{FiscalNumberNotRegistered}` (codes -13/-14).
-    /// Per ADR-M3-A6 prereq + W0-3 §2.1 this routes through
-    /// `ErrorRetryable → RequiresManualReconciliation` once the W10
-    /// dispatch table lands; W7 stops at `ErrorRetryable`.
-    AuthorizationFnNotRegistered { code: i32, message: String },
-}
-
-impl SendOutcome {
-    /// Map a post-wire outcome to the `transport_trace.outcome_kind`
-    /// CHECK-list value persisted by `complete_tx` in 4-b.
-    pub fn trace_kind(&self) -> OutcomeKind {
-        match self {
-            SendOutcome::Sent { .. } => OutcomeKind::Ok,
-            SendOutcome::Rejected { .. } => OutcomeKind::Rejected,
-            SendOutcome::Retryable {
-                reason: RetryableReason::Transport(_),
-            } => OutcomeKind::RetryableTransport,
-            SendOutcome::Retryable {
-                reason: RetryableReason::Server { .. },
-            } => OutcomeKind::RetryableServer,
-            SendOutcome::Retryable {
-                reason: RetryableReason::AuthorizationFnNotRegistered { .. },
-            } => OutcomeKind::RetryableAuthFn,
-        }
-    }
-}
-
-/// Classify the result of `dps_channel.send_chk(envelope).await` into
-/// a typed `SendOutcome`.  Pure function — no I/O.
-///
-/// **W7 minimal table.**  Per W7 freeze §4.3:
-/// - `Ok(ack)`                                                 → `Sent { server_fiscal_no = ack.id }`
-/// - `Err(Transport(..))`                                      → `Retryable::Transport`
-/// - `Err(Server { .. })`                                      → `Retryable::Server` (W7 conservative; W10 splits)
-/// - `Err(Authorization { DocumentReject, .. })`               → `Rejected`
-/// - `Err(Authorization { FiscalNumberNotRegistered, .. })`    → `Retryable::AuthorizationFnNotRegistered`
-/// - `Err(other shapes)` (`Decode`, `NotFound`, `ServerFiscalIdMismatch`,
-///   `QueryNotSupported`, `Internal`) → `Retryable::Transport`.  These
-///   shapes are not part of the documented `send_chk` success/failure
-///   contract; conservatively retrying is safer than classifying as
-///   terminal reject.  W10 may refine.
-pub fn classify_send_outcome(r: Result<CheckAck, DpsError>) -> SendOutcome {
-    match r {
-        Ok(ack) => SendOutcome::Sent {
-            server_fiscal_no: ack.id,
-        },
-        Err(DpsError::Transport(msg)) => SendOutcome::Retryable {
-            reason: RetryableReason::Transport(msg),
-        },
-        Err(DpsError::Server { code, message }) => SendOutcome::Retryable {
-            reason: RetryableReason::Server { code, message },
-        },
-        Err(DpsError::Authorization {
-            code,
-            kind: AuthorizationKind::DocumentReject,
-            message,
-        }) => SendOutcome::Rejected { code, message },
-        Err(DpsError::Authorization {
-            code,
-            kind: AuthorizationKind::FiscalNumberNotRegistered,
-            message,
-        }) => SendOutcome::Retryable {
-            reason: RetryableReason::AuthorizationFnNotRegistered { code, message },
-        },
-        Err(other) => SendOutcome::Retryable {
-            reason: RetryableReason::Transport(format!("unexpected DpsError on send_chk: {other}")),
-        },
-    }
-}
-
 // ─── Stage outcome (worker dispatcher contract) ─────────────────────
 
-/// Top-level outcome of [`run`].  Five variants cover the full Pattern
-/// B stage 4 surface as observed by the worker dispatcher:
+/// Top-level outcome of [`run`].  Four variants cover the full Pattern
+/// B stage 4 surface as observed by the worker dispatcher (W10.2):
 ///
-///   - `Sent` / `Rejected` / `Retryable` — wire `send_chk` returned and
-///     4-b CAS persisted the result.  `attempt_no` correlates with the
+///   - `Sent` — wire `send_chk` returned `Ok(CheckAck)` and 4-b CAS
+///     `Sending → Sent` committed.  `attempt_no` correlates with the
 ///     `transport_trace` row.
-///   - `StateConflict` — 4-pre CAS `Signed → Sending` missed: the doc
-///     was already past `Signed` (e.g. `Sent` from a prior worker, or
-///     transitioned to a non-Signed state by reconciliation).  Stage
-///     4 did NOT call `send_chk`.  Idempotent re-entry — the
-///     dispatcher should NOT treat this as failure.
+///   - `Routed` — wire `send_chk` returned `Err(DpsError)` and 4-b CAS
+///     `Sending → decision.target_state` committed.  `decision`
+///     carries the full W10 routing surface (`retry_class`,
+///     `audit_event`, `node_mode_flip`, `probe_hint`,
+///     `mac_recovery_hint`); the worker dispatcher and W9
+///     reconciliation read it to decide next-tick behaviour.
+///   - `StateConflict` — 4-pre CAS `(Signed | ErrorRetryable) → Sending`
+///     missed: the doc was past `Signed` AND not in `ErrorRetryable`
+///     either (e.g. `Sent` from a prior worker, or transitioned to a
+///     non-Signed state by reconciliation).  Stage 4 did NOT call
+///     `send_chk`.  Idempotent re-entry — the dispatcher should NOT
+///     treat this as failure.
 ///   - `DocumentMissing` — the `(doc_id)` row was not present at 4-pre
 ///     read.  Race with a delete (offline reconciliation, manual
 ///     operator action).  Stage 4 did NOT call `send_chk`.
+///
+/// **W7 → W10 collapse.**  W7 split the failure surface into
+/// `Rejected { code, message }` + `Retryable { reason }`.  W10
+/// collapses both into `Routed { decision }`: callers wanting the
+/// status code / message read them via the routing decision +
+/// the optional `wire_status_code` / `wire_error_message` fields
+/// alongside `decision`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StageSendOutcome {
     Sent {
         server_fiscal_no: String,
         attempt_no: i32,
     },
-    Rejected {
-        code: i32,
-        message: String,
+    Routed {
+        decision: RoutingDecision,
         attempt_no: i32,
-    },
-    Retryable {
-        reason: RetryableReason,
-        attempt_no: i32,
+        /// Optional server status code from the wire reply
+        /// (`Server { code, .. }` / `Authorization { code, .. }`).
+        /// `None` for non-status-coded variants (Transport / Decode /
+        /// NotFound / Internal / QueryNotSupported / ServerFiscalIdMismatch).
+        wire_status_code: Option<i32>,
+        /// Truncated wire error_message; useful for tests + W9
+        /// forensics.  Truncation cap matches `transport_trace`
+        /// CHECK (≤ 512 chars).  `None` only when the wire variant
+        /// has no message at all.
+        wire_error_message: Option<String>,
     },
     StateConflict {
         observed: DocState,
@@ -420,11 +444,17 @@ pub enum StageSendOutcome {
 /// the `SENDING` marker, allocated the trace row, and written the
 /// `STAGE_SEND_INTENT_MARKED` audit entry.
 enum PreOutcome {
-    /// CAS `Signed → Sending` applied; trace row allocated; audit
-    /// written.  Wire send is the next step (4a, no lock).
+    /// CAS `(Signed | ErrorRetryable) → Sending` applied; trace row
+    /// allocated; audit written.  Wire send is the next step (4a, no
+    /// lock).  `doc_type` is propagated out of the closure so 4-a can
+    /// pass it to `route_send_result`; `fiscal_number` is propagated
+    /// out so 4-b can call `node_state::set_mode_blocked_tx` for the
+    /// W10.3 `-11` flip without a separate read.
     Marked {
         envelope: CheckEnvelope,
         attempt_no: i32,
+        doc_type: DocType,
+        fiscal_number: String,
     },
     /// `fetch_send_inputs_tx` returned `None` OR CAS returned
     /// `NotFound`.  No side effects.
@@ -438,9 +468,10 @@ enum PreOutcome {
     /// type / lnd overflow / business_ts parse).  Routed back as
     /// the typed error; no side effects.
     EnvelopeBuildFailed(StageSendError),
-    /// CAS `Signed → Sending` returned `Conflict`: the doc was not
-    /// in `Signed` at the time of the CAS.  No marker, no trace,
-    /// no audit, no wire.
+    /// W10.2: 4-pre source-state CAS rejected.  Either `inputs.state`
+    /// was outside `{Signed, ErrorRetryable}` (we never attempt the
+    /// CAS), OR the CAS `(observed_source) → Sending` returned
+    /// `Conflict`.  No marker, no trace, no audit, no wire.
     StateConflict { observed: DocState },
 }
 
@@ -470,78 +501,154 @@ fn now_db_format() -> String {
 }
 
 /// Bridge `anyhow::Error` from `with_immediate` closures back to
-/// typed `StageSendError`.  Mirrors stage_sign's `bridge_anyhow`
-/// pattern: typed errors thrown via `anyhow::Error::new(StageSendError::...)`
-/// inside closures round-trip cleanly; raw `sqlx::Error` becomes
-/// `StageSendError::Db`; everything else surfaces as `Internal`
-/// preserving the cause chain.
+/// typed `StageSendError`.  Thin wrapper over the shared
+/// [`super::types::bridge_anyhow_to`] (R-W10.4-senior-review LOW 1
+/// close — deduplicated from three modules to one shared helper).
 fn bridge_anyhow(e: anyhow::Error) -> StageSendError {
-    match e.downcast::<StageSendError>() {
-        Ok(typed) => typed,
-        Err(rest) => match rest.downcast::<sqlx::Error>() {
-            Ok(sqlx_err) => StageSendError::Db(sqlx_err),
-            Err(other) => StageSendError::Internal(other),
+    super::types::bridge_anyhow_to(e, StageSendError::Db, StageSendError::Internal)
+}
+
+/// W10.2: derive the `transport_trace.outcome_kind` CHECK-list value
+/// from a `WireDecision` + the wire error variant tag.  Mapping uses
+/// the W7-frozen 5-value CHECK (`OK / REJECTED / RETRYABLE_TRANSPORT /
+/// RETRYABLE_SERVER / RETRYABLE_AUTH_FN`); broader categories from the
+/// W10 routing surface (WrapperBug / ProbeRequired / MacRecovery /
+/// OperatorEscalation) all fold into `RETRYABLE_SERVER` because each
+/// originates from a server response — not a transport-level fault.
+///
+/// `wire_kind` is the `&'static str` tag returned by
+/// [`extract_wire_forensics`]; it disambiguates `TransientRetry` from
+/// `Transport` (→ `RETRYABLE_TRANSPORT`) vs from `Server` (→
+/// `RETRYABLE_SERVER`).
+///
+/// **W10.4 update.**  `MacRecovery` now folds to its own
+/// `RETRYABLE_MAC_HASH_MISMATCH` (migration 013 extends the CHECK
+/// list).  W10.5 may add finer kinds for `ProbeRequired` /
+/// `OperatorEscalation` if forensic value outweighs migration cost.
+fn wire_decision_to_outcome_kind(decision: &WireDecision, wire_kind: &str) -> OutcomeKind {
+    match decision {
+        WireDecision::Sent { .. } => OutcomeKind::Ok,
+        WireDecision::Routed(d) => match d.retry_class {
+            RetryClass::TerminalReject => OutcomeKind::Rejected,
+            RetryClass::TransientRetry => match wire_kind {
+                "Transport" => OutcomeKind::RetryableTransport,
+                _ => OutcomeKind::RetryableServer,
+            },
+            RetryClass::FnConfigError => OutcomeKind::RetryableAuthFn,
+            RetryClass::MacRecovery => OutcomeKind::RetryableMacHashMismatch,
+            RetryClass::WrapperBug | RetryClass::ProbeRequired | RetryClass::OperatorEscalation => {
+                OutcomeKind::RetryableServer
+            }
         },
     }
 }
 
+/// W10.2: extract `(server_status_code, error_kind, error_message)`
+/// from the raw wire `DpsError` for `transport_trace::complete_tx`
+/// AND for the public `StageSendOutcome::Routed` surface.  Status code
+/// present for `Server` and `Authorization` variants; `error_kind` is
+/// the variant tag (stable, used by the outcome-kind decision fn).
+fn extract_wire_forensics(err: &DpsError) -> (Option<i32>, &'static str, String) {
+    use crate::transports::dps::error::AuthorizationKind;
+    match err {
+        DpsError::Transport(msg) => (None, "Transport", msg.clone()),
+        DpsError::Server { code, message } => (Some(*code), "Server", message.clone()),
+        DpsError::Authorization {
+            code,
+            kind,
+            message,
+        } => {
+            let kind_str = match kind {
+                AuthorizationKind::DocumentReject => "AuthorizationDocumentReject",
+                AuthorizationKind::FiscalNumberNotRegistered => "AuthorizationFnNotRegistered",
+            };
+            (Some(*code), kind_str, message.clone())
+        }
+        DpsError::Decode(msg) => (None, "Decode", msg.clone()),
+        DpsError::NotFound => (None, "NotFound", String::new()),
+        DpsError::ServerFiscalIdMismatch {
+            expected_id,
+            actual_id,
+        } => (
+            None,
+            "ServerFiscalIdMismatch",
+            format!("expected={expected_id} actual={actual_id}"),
+        ),
+        DpsError::QueryNotSupported(q) => (None, "QueryNotSupported", q.to_string()),
+        DpsError::Internal(msg) => (None, "Internal", msg.clone()),
+    }
+}
+
 /// Build the `AttemptCompletion` payload for `transport_trace::complete_tx`.
-/// The `outcome_kind` ↔ `error_kind` shape mirrors the W7-frozen
-/// CHECK list in migration 010; kind / message present iff the
-/// outcome is non-OK.
+/// W10.2: takes a `WireDecision` plus the pre-extracted forensics
+/// tuple `(status_code, kind, message)` so the closure body can
+/// compose the trace row deterministically.
 fn build_attempt_completion(
-    outcome: &SendOutcome,
+    decision: &WireDecision,
+    forensics: Option<&(Option<i32>, &'static str, String)>,
     wire_call_started_at: String,
     wire_call_finished_at: String,
 ) -> AttemptCompletion {
-    let server_fiscal_no = match outcome {
-        SendOutcome::Sent { server_fiscal_no } => Some(server_fiscal_no.clone()),
+    let server_fiscal_no = match decision {
+        WireDecision::Sent { server_fiscal_no } => Some(server_fiscal_no.clone()),
         _ => None,
     };
-    let server_status_code = match outcome {
-        SendOutcome::Rejected { code, .. } => Some(*code),
-        SendOutcome::Retryable {
-            reason: RetryableReason::Server { code, .. },
-        } => Some(*code),
-        SendOutcome::Retryable {
-            reason: RetryableReason::AuthorizationFnNotRegistered { code, .. },
-        } => Some(*code),
-        _ => None,
+    let (server_status_code, error_kind, error_message) = match (decision, forensics) {
+        (WireDecision::Sent { .. }, _) => (None, None, None),
+        (WireDecision::Routed(_), Some((code, kind, message))) => {
+            let message_opt = if message.is_empty() {
+                None
+            } else {
+                Some(message.clone())
+            };
+            (*code, Some((*kind).to_string()), message_opt)
+        }
+        // Routed without forensics is a programming bug — every
+        // Routed arm comes from a DpsError.  Surface defensively
+        // rather than panic in case of unforeseen path.
+        (WireDecision::Routed(_), None) => (None, Some("UnknownRouted".to_string()), None),
     };
-    let (error_kind, error_message) = match outcome {
-        SendOutcome::Sent { .. } => (None, None),
-        SendOutcome::Rejected { message, .. } => (
-            Some("AuthorizationDocumentReject".into()),
-            Some(message.clone()),
-        ),
-        SendOutcome::Retryable {
-            reason: RetryableReason::Transport(msg),
-        } => (Some("Transport".into()), Some(msg.clone())),
-        SendOutcome::Retryable {
-            reason: RetryableReason::Server { message, .. },
-        } => (Some("Server".into()), Some(message.clone())),
-        SendOutcome::Retryable {
-            reason: RetryableReason::AuthorizationFnNotRegistered { message, .. },
-        } => (
-            Some("AuthorizationFnNotRegistered".into()),
-            Some(truncate_msg(message)),
-        ),
+    // W10.2 review fix-up + migration 012: durable encoding of
+    // RetryClass on the routed arm.  Sent arm leaves NULL.
+    let retry_class = match decision {
+        WireDecision::Sent { .. } => None,
+        WireDecision::Routed(d) => Some(d.retry_class.as_str().to_string()),
+    };
+    let kind_for_outcome = match forensics {
+        Some((_, k, _)) => *k,
+        None => {
+            // R-W10.2-review LOW 4 close: Routed-without-forensics is
+            // a programming bug — every Routed arm comes from `Err(_)`,
+            // which extract_wire_forensics handles exhaustively.  Fail
+            // fast in dev/CI; defensive fallback in release.
+            debug_assert!(
+                matches!(decision, WireDecision::Sent { .. }),
+                "WireDecision::Routed reached build_attempt_completion without forensics"
+            );
+            "Transport"
+        }
     };
     AttemptCompletion {
         wire_call_started_at,
         wire_call_finished_at,
-        outcome_kind: outcome.trace_kind(),
+        outcome_kind: wire_decision_to_outcome_kind(decision, kind_for_outcome),
         server_fiscal_no,
         server_status_code,
         error_kind,
         error_message: error_message.map(|m| truncate_msg(&m)),
+        retry_class,
     }
 }
 
-/// transport_trace.error_message has CHECK length <= 512.  Truncate
+/// `transport_trace.error_message` has CHECK length <= 512.  Truncate
 /// upstream so an oversized DPS message doesn't trip the CHECK at
-/// 4-b commit time and roll back the entire 4-b tx.
-fn truncate_msg(s: &str) -> String {
+/// 4-b commit time and roll back the entire 4-b tx.  Char-boundary
+/// safe (UTF-8 codepoint integrity preserved).
+///
+/// `pub(super)` since W10.4 step 2c — `mac_recovery::emit_hash_not_extractable_audit`
+/// reuses the same byte-bounded truncation for audit_log payload
+/// hygiene (R-W10.4-step2c-review LOW 4 close).
+pub(super) fn truncate_msg(s: &str) -> String {
     if s.len() <= 512 {
         s.to_string()
     } else {
@@ -573,8 +680,8 @@ fn truncate_msg(s: &str) -> String {
 ///     any `with_immediate` closure; the runtime guard panics in
 ///     debug if violated.
 ///   - **4b** (`with_immediate` #2): post-wire CAS
-///     `Sending → {Sent | Rejected | ErrorRetryable}` (target
-///     derived from `classify_send_outcome`), conditional
+///     `Sending → {Sent | decision.target_state}` (target derived
+///     from `route_send_result` → `WireDecision`), conditional
 ///     `set_server_fiscal_no_tx` on the success branch (gated by
 ///     the EmptyServerFiscalNo guard run BEFORE 4-b),
 ///     `transport_trace::complete_tx` (UPDATE the row 4-pre
@@ -594,6 +701,89 @@ fn truncate_msg(s: &str) -> String {
 ///     `with_immediate`; this implementation places `send_chk`
 ///     between two strictly-separated `with_immediate` blocks.
 pub async fn run(
+    pool: &SqlitePool,
+    dps_channel: &dyn DpsChannel,
+    doc: DocumentId,
+    sign_ctx: Option<&SigningContext>,
+) -> Result<StageSendOutcome, StageSendError> {
+    // W10.4 step 2d — MAC recovery dispatch loop bound.  At most ONE
+    // re-entry per `run()` invocation; combined with the DDL
+    // `mac_recovery_attempts CHECK IN (0, 1)` budget, infinite-loop
+    // is unreachable.  Flag is reset on each fresh `run()` call.
+    //
+    // Architecture (R-W10.4-senior-review MED 3 + LOW 3 close):
+    // `run` is now a thin loop wrapper; the 4-pre/4a/4b body lives
+    // in `run_one_attempt` so loop body indentation stays canonical
+    // and each attempt is independently reasoned about.
+    let mut mac_recovery_invoked = false;
+
+    loop {
+        let outcome = run_one_attempt(pool, dps_channel, doc).await?;
+
+        // MAC recovery dispatch only fires on the routed-MacRecovery
+        // arm; everything else returns directly.
+        let (decision, attempt_no, wire_msg) = match &outcome {
+            StageSendOutcome::Routed {
+                decision,
+                attempt_no,
+                wire_error_message,
+                ..
+            } if decision.retry_class == RetryClass::MacRecovery => {
+                (decision.clone(), *attempt_no, wire_error_message.clone())
+            }
+            _ => return Ok(outcome),
+        };
+
+        if mac_recovery_invoked {
+            // Second `-12` after a successful Resigned in the same
+            // run() call.  Budget burnt by the first orchestrator
+            // invocation; short-circuit with FAILED_REPEAT audit.
+            return override_to_rejected_with_failed_repeat_audit(pool, doc, attempt_no, wire_msg)
+                .await;
+        }
+        mac_recovery_invoked = true;
+
+        let ctx = sign_ctx.ok_or(StageSendError::MacRecoveryContextMissing { document_id: doc })?;
+        let hint = decision.mac_recovery_hint.clone().ok_or_else(|| {
+            StageSendError::Internal(anyhow::anyhow!(
+                "MacRecovery decision missing mac_recovery_hint for doc {doc:?}"
+            ))
+        })?;
+
+        match mac_recovery::run_mac_recovery(pool, ctx, doc, &hint).await? {
+            MacRecoveryOutcome::Resigned => continue,
+            MacRecoveryOutcome::HashNotExtractable => {
+                // Orchestrator already emitted MAC_RECOVERY_HASH_NOT_EXTRACTABLE.
+                // Caller's job: CAS to Rejected without duplicate audit.
+                return override_to_rejected_no_additional_audit(
+                    pool,
+                    doc,
+                    attempt_no,
+                    AuditEvent::MacRecoveryHashNotExtractable,
+                    wire_msg,
+                )
+                .await;
+            }
+            MacRecoveryOutcome::CounterExhausted => {
+                return override_to_rejected_with_failed_repeat_audit(
+                    pool, doc, attempt_no, wire_msg,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// One pass of the 4-pre/4a/4b cycle.  Pure body — no MAC recovery
+/// dispatch.  Caller (`run`) loops over this fn at most twice (initial
+/// attempt + one Resigned re-entry) bounded by the `mac_recovery_invoked`
+/// flag in the caller's scope.
+///
+/// Extracted from inline body in W10.4 step 2d follow-up
+/// (R-W10.4-senior-review MED 3 close); body identical to W10.2/W10.3
+/// integrated stage 4 worker step modulo the return-vs-loop-continue
+/// dispatch which now lives entirely in `run`.
+async fn run_one_attempt(
     pool: &SqlitePool,
     dps_channel: &dyn DpsChannel,
     doc: DocumentId,
@@ -624,9 +814,18 @@ pub async fn run(
                 Err(err) => return Ok(PreOutcome::EnvelopeBuildFailed(err)),
             };
 
-            // CAS Signed -> Sending.  Whitelist guarantees `Forbidden`
-            // is unreachable for this transition.
-            match fd::transition_state(tx, doc, DocState::Signed, DocState::Sending).await? {
+            // W10.2 HIGH 3 §4.2: 4-pre source-state CAS accepts
+            // {Signed, ErrorRetryable} → Sending.  ErrorRetryable is
+            // the Pattern B retry-path edge per ADR-M3-A9 step 5-6:
+            // a routed failure in 4-b transitions Sending → ErrorRetryable,
+            // and the next worker tick re-enters via this CAS.  Any
+            // other observed state is a structural rejection — no CAS
+            // attempt, no wire call.
+            let source_state = match inputs.state {
+                DocState::Signed | DocState::ErrorRetryable => inputs.state,
+                other => return Ok(PreOutcome::StateConflict { observed: other }),
+            };
+            match fd::transition_state(tx, doc, source_state, DocState::Sending).await? {
                 TransitionOutcome::Applied => {}
                 TransitionOutcome::Conflict => {
                     return Ok(PreOutcome::StateConflict {
@@ -636,7 +835,7 @@ pub async fn run(
                 TransitionOutcome::NotFound => return Ok(PreOutcome::DocumentMissing),
                 TransitionOutcome::Forbidden => {
                     unreachable!(
-                        "(Signed,Sending) is whitelisted in fiscal_documents::allowed_transition"
+                        "({source_state:?},Sending) is whitelisted in fiscal_documents::allowed_transition"
                     )
                 }
             }
@@ -687,17 +886,21 @@ pub async fn run(
             Ok(PreOutcome::Marked {
                 envelope,
                 attempt_no,
+                doc_type: inputs.doc_type,
+                fiscal_number: inputs.fiscal_number,
             })
         })
     })
     .await
     .map_err(bridge_anyhow)?;
 
-    let (envelope, attempt_no) = match pre {
+    let (envelope, attempt_no, doc_type, fiscal_number) = match pre {
         PreOutcome::Marked {
             envelope,
             attempt_no,
-        } => (envelope, attempt_no),
+            doc_type,
+            fiscal_number,
+        } => (envelope, attempt_no, doc_type, fiscal_number),
         PreOutcome::DocumentMissing => return Ok(StageSendOutcome::DocumentMissing),
         PreOutcome::SignedArtifactMissing => {
             return Err(StageSendError::SignedArtifactMissing { document_id: doc })
@@ -719,32 +922,73 @@ pub async fn run(
     let wire_call_started_at = now_db_format();
     let wire_result = dps_channel.send_chk(envelope.clone()).await;
     let wire_call_finished_at = now_db_format();
-    let outcome = classify_send_outcome(wire_result);
+
+    // W10.2: dispatch on the typed routing surface.  `is_live_send=true`
+    // — production stage 4 send (freeze §3.5; W9 reconciliation will
+    // pass `false`).  Forensics (status_code / error_kind /
+    // error_message) are extracted ONCE here so they're available BOTH
+    // for the 4-b `transport_trace::complete_tx` row AND for the
+    // public `StageSendOutcome::Routed { wire_status_code,
+    // wire_error_message, .. }` surface tests rely on.
+    let wire_forensics: Option<(Option<i32>, &'static str, String)> = match &wire_result {
+        Ok(_) => None,
+        Err(e) => Some(extract_wire_forensics(e)),
+    };
+    let wire_decision = route_send_result(wire_result, doc_type, true);
 
     // EmptyServerFiscalNo guard (LOW risk close from W7.3 review).
     // The transport_trace OK-CHECK would otherwise reject 4-b commit
     // and roll back the entire 4-b tx (losing the audit and
     // CAS-Sending->Sent in the process); catching here lets the
     // doc stay cleanly in `Sending` for W9 reconciliation.
-    if let SendOutcome::Sent { server_fiscal_no } = &outcome {
+    if let WireDecision::Sent { server_fiscal_no } = &wire_decision {
         if server_fiscal_no.is_empty() {
             return Err(StageSendError::EmptyServerFiscalNo { document_id: doc });
         }
     }
 
     // ── 4b ───────────────────────────────────────────────────────────
-    let outcome_for_closure = outcome.clone();
+    //
+    // W10.2 dispatch:
+    //   - `WireDecision::Sent`            → CAS Sending → Sent +
+    //                                        set_server_fiscal_no_tx +
+    //                                        audit STAGE_SEND_RESULT.
+    //   - `WireDecision::Routed(decision)` → CAS Sending →
+    //                                        decision.target_state +
+    //                                        audit decision.audit_event.
+    //
+    // **W10.3 honoured.**  `decision.node_mode_flip == Some(Blocked)`
+    // is invoked inside this same 4-b `with_immediate` envelope —
+    // `node_state.mode → BLOCKED` is atomic with the CAS
+    // `Sending → Rejected` and the audit row.  Server-11 cannot leave
+    // the FN unblocked.
+    //
+    // **W10.2 deferred:**
+    //   - `decision.mac_recovery_hint` (Server-12) → W10.4 will
+    //     orchestrate MAC re-sign + re-send BEFORE this 4-b commit.
+    //   - `decision.probe_hint` → W9 reconciliation territory; never
+    //     actioned in stage 4 (only surfaced in audit payload for
+    //     forensic grep, per W10.2 review LOW/MED 3).
+    let decision_for_closure = wire_decision.clone();
+    let forensics_for_closure = wire_forensics.clone();
     let started_for_closure = wire_call_started_at;
     let finished_for_closure = wire_call_finished_at;
+    // R-W10.3-review LOW 2 close: `fiscal_number` is moved directly
+    // (single owner — the closure).  `wire_decision` and
+    // `wire_forensics` are cloned because the post-closure return
+    // block reads them; `fiscal_number` is not.
     with_immediate(pool, move |tx| {
-        let outcome = outcome_for_closure;
+        let decision = decision_for_closure;
+        let forensics = forensics_for_closure;
         let started = started_for_closure;
         let finished = finished_for_closure;
+        // `fiscal_number` captured directly via `move`; no rebind
+        // (R-W10.3-review LOW 3 close — the previous self-rebind
+        // `let fiscal_number = fiscal_number;` was a no-op).
         Box::pin(async move {
-            let target = match &outcome {
-                SendOutcome::Sent { .. } => DocState::Sent,
-                SendOutcome::Rejected { .. } => DocState::Rejected,
-                SendOutcome::Retryable { .. } => DocState::ErrorRetryable,
+            let target = match &decision {
+                WireDecision::Sent { .. } => DocState::Sent,
+                WireDecision::Routed(d) => d.target_state,
             };
 
             // Post-wire CAS Sending -> target.  Single-writer +
@@ -764,7 +1008,7 @@ pub async fn run(
 
             // server_fiscal_no UPDATE on success branch (Empty guard
             // ran before this closure; we know it's non-empty here).
-            if let SendOutcome::Sent { server_fiscal_no } = &outcome {
+            if let WireDecision::Sent { server_fiscal_no } = &decision {
                 if !fd::set_server_fiscal_no_tx(tx, doc, server_fiscal_no).await? {
                     return Err(anyhow::Error::new(
                         StageSendError::SetServerFiscalNoMissing { document_id: doc },
@@ -772,9 +1016,39 @@ pub async fn run(
                 }
             }
 
+            // W10.3 — node_state.mode flip atomic with the CAS above.
+            // Only Server-11 currently emits this flip; future routes
+            // may emit it for additional NodeMode targets.  We restrict
+            // to BLOCKED here (the only target the routing fn ever
+            // emits per freeze §3); if `node_mode_flip` ever carries
+            // a different NodeMode, the match falls through to a
+            // skip — surfaced via debug_assert! so dev/CI catches it.
+            if let WireDecision::Routed(d) = &decision {
+                if let Some(target_mode) = d.node_mode_flip {
+                    debug_assert_eq!(
+                        target_mode,
+                        crate::db::models::enums::NodeMode::Blocked,
+                        "W10.3 only honours NodeMode::Blocked; routing fn must \
+                         not emit other NodeMode targets without extending stage_send"
+                    );
+                    if target_mode == crate::db::models::enums::NodeMode::Blocked
+                        && !node_state::set_mode_blocked_tx(tx, &fiscal_number).await?
+                    {
+                        return Err(anyhow::Error::new(
+                            StageSendError::NodeStateMissingForBlock {
+                                fn_id: fiscal_number.clone(),
+                                document_id: doc,
+                            },
+                        ));
+                    }
+                }
+            }
+
             // Complete trace row.  rows_affected == 0 ⇒ typed error
             // (W7.1 append-then-complete contract).
-            let completion = build_attempt_completion(&outcome, started, finished);
+            let completion =
+                build_attempt_completion(&decision, forensics.as_ref(), started, finished);
+            let outcome_kind_str = completion.outcome_kind.as_str();
             let rows = transport_trace::complete_tx(tx, doc, attempt_no, completion).await?;
             if rows == 0 {
                 return Err(anyhow::Error::new(StageSendError::TraceMissingAtComplete {
@@ -783,18 +1057,66 @@ pub async fn run(
                 }));
             }
 
-            // Audit STAGE_SEND_RESULT.
-            let payload = serde_json::json!({
+            // Audit event: success arm uses STAGE_SEND_RESULT (W7
+            // contract); routed arm uses `decision.audit_event` per
+            // freeze §3.4 closed enum.
+            //
+            // Payload composition (W10.2 LOW 1 + LOW/MED 3 + W10.3 LOW 1):
+            //   - `attempt_no`, `outcome_kind` always present (W7).
+            //   - `retry_class` on the routed arm — forensic grep
+            //     dimension orthogonal to event_type.
+            //   - `node_mode_flipped: "Blocked"` on Server-11 — durable
+            //     evidence of the W10.3 flip; redundant with the
+            //     `node_state.mode = 'BLOCKED'` row (DDL keeps SHOUTING
+            //     case) but cheap, and lets audit-log forensics work
+            //     without a join.
+            //   - `probe_hint` reason on Decode/-2/-15 close-shift —
+            //     surfaces the W9 last_chk-probe target without
+            //     re-decoding the routing fn.
+            let (event_type, severity) = match &decision {
+                WireDecision::Sent { .. } => ("STAGE_SEND_RESULT", Severity::Info),
+                WireDecision::Routed(d) => (d.audit_event.as_str(), d.audit_severity),
+            };
+            let mut payload_obj = serde_json::json!({
                 "attempt_no": attempt_no,
-                "outcome_kind": outcome.trace_kind().as_str(),
-            })
-            .to_string();
+                "outcome_kind": outcome_kind_str,
+            });
+            if let WireDecision::Routed(d) = &decision {
+                // R-W10.3-review LOW 1 close: all three payload
+                // discriminators use PascalCase consistently — matches
+                // `RetryClass::as_str()` migration-012 wire form and the
+                // Rust `Debug` form of `NodeMode` / `ProbeReason`.
+                // Earlier draft uppercased `node_mode_flipped`; that
+                // mirrored the DDL form ('BLOCKED') but broke
+                // forensic-grep consistency across audit_log JSON
+                // payloads.
+                //
+                // R-W10.3-review LOW 3 doc note: `node_mode_flipped`
+                // encodes ROUTING INTENT (the `-11` decision asked
+                // for BLOCKED), NOT a state transition observation.
+                // SQLite UPDATE semantics report rows_affected=1 for
+                // a matching row even when the value is unchanged, so
+                // the second `-11` for the same already-BLOCKED FN
+                // emits the same payload — by design, no CAS guard
+                // (avoids a read-then-write race on a hot path).
+                payload_obj["retry_class"] =
+                    serde_json::Value::String(d.retry_class.as_str().to_string());
+                if let Some(mode) = d.node_mode_flip {
+                    payload_obj["node_mode_flipped"] =
+                        serde_json::Value::String(format!("{mode:?}"));
+                }
+                if let Some(hint) = &d.probe_hint {
+                    payload_obj["probe_hint"] =
+                        serde_json::Value::String(format!("{:?}", hint.reason));
+                }
+            }
+            let payload = payload_obj.to_string();
             audit_log::append_tx(
                 tx,
                 "fiscal_document",
                 &format!("{doc:?}"),
-                "STAGE_SEND_RESULT",
-                Severity::Info,
+                event_type,
+                severity,
                 None,
                 Some(&payload),
             )
@@ -806,17 +1128,152 @@ pub async fn run(
     .await
     .map_err(bridge_anyhow)?;
 
-    Ok(match outcome {
-        SendOutcome::Sent { server_fiscal_no } => StageSendOutcome::Sent {
+    Ok(match wire_decision {
+        WireDecision::Sent { server_fiscal_no } => StageSendOutcome::Sent {
             server_fiscal_no,
             attempt_no,
         },
-        SendOutcome::Rejected { code, message } => StageSendOutcome::Rejected {
-            code,
-            message,
-            attempt_no,
-        },
-        SendOutcome::Retryable { reason } => StageSendOutcome::Retryable { reason, attempt_no },
+        WireDecision::Routed(decision) => {
+            let (wire_status_code, wire_error_message) = match &wire_forensics {
+                Some((code, _kind, msg)) if !msg.is_empty() => (*code, Some(truncate_msg(msg))),
+                Some((code, _kind, _empty)) => (*code, None),
+                // Routed arm without source forensics is a programming
+                // bug — Routed only reaches here from `Err(_)`.
+                None => (None, None),
+            };
+            StageSendOutcome::Routed {
+                decision,
+                attempt_no,
+                wire_status_code,
+                wire_error_message,
+            }
+        }
+    })
+}
+
+// ─── W10.4 step 2d — recovery-failure override helpers ───────────────
+
+/// Synthetic `RoutingDecision` for the post-recovery override paths
+/// (HashNotExtractable / CounterExhausted): doc transitions
+/// `ErrorRetryable → Rejected`; the carried `audit_event` discriminates
+/// which recovery-failure mode caused the override.
+fn synthetic_rejected_decision(audit_event: AuditEvent) -> RoutingDecision {
+    RoutingDecision {
+        target_state: DocState::Rejected,
+        retry_class: RetryClass::TerminalReject,
+        audit_event,
+        audit_severity: Severity::Error,
+        node_mode_flip: None,
+        probe_hint: None,
+        mac_recovery_hint: None,
+    }
+}
+
+/// Override path for `HashNotExtractable`: orchestrator already emitted
+/// `MAC_RECOVERY_HASH_NOT_EXTRACTABLE`.  Caller's job is just to CAS
+/// the doc out of `ErrorRetryable` into `Rejected`.  No audit row
+/// (recovery layer + final state suffice for forensics).
+///
+/// `synthetic_decision_event` populates the surfaced
+/// `StageSendOutcome::Routed.decision.audit_event`.  The helper does
+/// NOT emit an audit row — naming reflects "which event the synthetic
+/// decision will carry", not "what we'll write to audit_log"
+/// (R-W10.4-step2d-review LOW 2 close — earlier `audit_event_for_outcome`
+/// suggested writing).
+///
+/// `wire_error_message` carries the original `-12` wire message
+/// through to the public `StageSendOutcome` surface so caller-side
+/// forensics don't lose context (R-W10.4-step2d-review LOW 1 close).
+async fn override_to_rejected_no_additional_audit(
+    pool: &SqlitePool,
+    doc: DocumentId,
+    attempt_no: i32,
+    synthetic_decision_event: AuditEvent,
+    wire_error_message: Option<String>,
+) -> Result<StageSendOutcome, StageSendError> {
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            match fd::transition_state(tx, doc, DocState::ErrorRetryable, DocState::Rejected)
+                .await?
+            {
+                TransitionOutcome::Applied => Ok::<_, anyhow::Error>(()),
+                observed => Err(anyhow::Error::new(StageSendError::PostWireCasFailed {
+                    document_id: doc,
+                    target: DocState::Rejected,
+                    observed,
+                })),
+            }
+        })
+    })
+    .await
+    .map_err(bridge_anyhow)?;
+    Ok(StageSendOutcome::Routed {
+        decision: synthetic_rejected_decision(synthetic_decision_event),
+        attempt_no,
+        // `-12` is the only Server status code that maps to
+        // `RetryClass::MacRecovery` (W10.1 routing fn §2.1 row -12);
+        // hardcoded value matches the contract.
+        wire_status_code: Some(-12),
+        wire_error_message,
+    })
+}
+
+/// Override path for `CounterExhausted` AND for second `-12` after a
+/// successful Resigned in the same `run()` call.  Both signal that the
+/// recovery budget is spent; emit `MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH`
+/// audit + CAS to `Rejected` atomically.
+///
+/// `wire_error_message` (R-W10.4-step2d-review LOW 1 close) preserves
+/// the wire `-12` message through to the public `StageSendOutcome`.
+async fn override_to_rejected_with_failed_repeat_audit(
+    pool: &SqlitePool,
+    doc: DocumentId,
+    attempt_no: i32,
+    wire_error_message: Option<String>,
+) -> Result<StageSendOutcome, StageSendError> {
+    let payload = serde_json::json!({
+        "attempt_no": attempt_no,
+        "outcome_kind": "REJECTED",
+        "retry_class": RetryClass::TerminalReject.as_str(),
+    })
+    .to_string();
+    with_immediate(pool, move |tx| {
+        let payload = payload.clone();
+        Box::pin(async move {
+            match fd::transition_state(tx, doc, DocState::ErrorRetryable, DocState::Rejected)
+                .await?
+            {
+                TransitionOutcome::Applied => {}
+                observed => {
+                    return Err(anyhow::Error::new(StageSendError::PostWireCasFailed {
+                        document_id: doc,
+                        target: DocState::Rejected,
+                        observed,
+                    }));
+                }
+            }
+            audit_log::append_tx(
+                tx,
+                "fiscal_document",
+                &format!("{doc:?}"),
+                AuditEvent::MacRecoveryFailedRepeatHashMismatch.as_str(),
+                Severity::Error,
+                None,
+                Some(&payload),
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(bridge_anyhow)?;
+    Ok(StageSendOutcome::Routed {
+        decision: synthetic_rejected_decision(AuditEvent::MacRecoveryFailedRepeatHashMismatch),
+        attempt_no,
+        // See note in `override_to_rejected_no_additional_audit`:
+        // `-12` is the only MacRecovery wire code.
+        wire_status_code: Some(-12),
+        wire_error_message,
     })
 }
 
@@ -1007,93 +1464,6 @@ mod tests {
         assert_eq!(env.date_time, expected, "winter offset must be +2h");
     }
 
-    // ─── classify_send_outcome ──────────────────────────────────────
-
-    fn ack(id: &str) -> CheckAck {
-        CheckAck {
-            id: id.into(),
-            id_sign: vec![],
-            data_sign: vec![],
-        }
-    }
-
-    #[test]
-    fn classify_ok_yields_sent_with_server_fiscal_no() {
-        let out = classify_send_outcome(Ok(ack("DPS-FN-1")));
-        assert_eq!(
-            out,
-            SendOutcome::Sent {
-                server_fiscal_no: "DPS-FN-1".into()
-            }
-        );
-        assert_eq!(out.trace_kind(), OutcomeKind::Ok);
-    }
-
-    #[test]
-    fn classify_transport_yields_retryable_transport() {
-        let out = classify_send_outcome(Err(DpsError::Transport("TLS reset".into())));
-        let SendOutcome::Retryable {
-            reason: RetryableReason::Transport(msg),
-        } = out.clone()
-        else {
-            panic!("expected Retryable::Transport, got {out:?}");
-        };
-        assert_eq!(msg, "TLS reset");
-        assert_eq!(out.trace_kind(), OutcomeKind::RetryableTransport);
-    }
-
-    #[test]
-    fn classify_server_yields_retryable_server_w7_conservative() {
-        let out = classify_send_outcome(Err(DpsError::Server {
-            code: -7,
-            message: "ERROR_NOT_OPEN_SHIFT".into(),
-        }));
-        let SendOutcome::Retryable {
-            reason: RetryableReason::Server { code, message },
-        } = out.clone()
-        else {
-            panic!("expected Retryable::Server, got {out:?}");
-        };
-        assert_eq!(code, -7);
-        assert_eq!(message, "ERROR_NOT_OPEN_SHIFT");
-        assert_eq!(out.trace_kind(), OutcomeKind::RetryableServer);
-    }
-
-    #[test]
-    fn classify_authorization_document_reject_yields_terminal_rejected() {
-        let out = classify_send_outcome(Err(DpsError::Authorization {
-            code: -1,
-            kind: AuthorizationKind::DocumentReject,
-            message: "ERROR_VEREFY".into(),
-        }));
-        assert_eq!(
-            out,
-            SendOutcome::Rejected {
-                code: -1,
-                message: "ERROR_VEREFY".into()
-            }
-        );
-        assert_eq!(out.trace_kind(), OutcomeKind::Rejected);
-    }
-
-    #[test]
-    fn classify_authorization_fn_not_registered_yields_retryable_auth_fn() {
-        let out = classify_send_outcome(Err(DpsError::Authorization {
-            code: -13,
-            kind: AuthorizationKind::FiscalNumberNotRegistered,
-            message: "ERROR_NOT_REGISTERED_RRO".into(),
-        }));
-        let SendOutcome::Retryable {
-            reason: RetryableReason::AuthorizationFnNotRegistered { code, message },
-        } = out.clone()
-        else {
-            panic!("expected Retryable::AuthorizationFnNotRegistered, got {out:?}");
-        };
-        assert_eq!(code, -13);
-        assert_eq!(message, "ERROR_NOT_REGISTERED_RRO");
-        assert_eq!(out.trace_kind(), OutcomeKind::RetryableAuthFn);
-    }
-
     // ─── compute_envelope_hash ──────────────────────────────────────
 
     fn sample_envelope() -> CheckEnvelope {
@@ -1238,30 +1608,131 @@ mod tests {
         assert!(out.is_char_boundary(out.len()));
     }
 
-    // ─── classify_send_outcome ──────────────────────────────────────
+    // ─── extract_wire_forensics + outcome_kind mapping ──────────────
 
     #[test]
-    fn classify_unexpected_dps_error_shapes_fall_back_to_retryable_transport() {
-        // None of these are part of the documented send_chk
-        // success/failure contract; conservative classifier routes
-        // them all to Retryable::Transport so the doc lands in
-        // ErrorRetryable rather than terminal Rejected.
-        for err in [
-            DpsError::Decode("malformed".into()),
-            DpsError::NotFound,
-            DpsError::ServerFiscalIdMismatch {
-                expected_id: "A".into(),
-                actual_id: "B".into(),
-            },
-            DpsError::QueryNotSupported("ByLocalIdentity"),
-            DpsError::Internal("wrapper bug".into()),
+    fn extract_wire_forensics_carries_status_code_and_kind_per_variant() {
+        use crate::transports::dps::error::AuthorizationKind;
+        let cases: Vec<(DpsError, Option<i32>, &'static str)> = vec![
+            (DpsError::Transport("TLS".into()), None, "Transport"),
+            (
+                DpsError::Server {
+                    code: -3,
+                    message: "ERROR_SAVE".into(),
+                },
+                Some(-3),
+                "Server",
+            ),
+            (
+                DpsError::Authorization {
+                    code: -1,
+                    kind: AuthorizationKind::DocumentReject,
+                    message: "ERROR_VEREFY".into(),
+                },
+                Some(-1),
+                "AuthorizationDocumentReject",
+            ),
+            (
+                DpsError::Authorization {
+                    code: -13,
+                    kind: AuthorizationKind::FiscalNumberNotRegistered,
+                    message: "ERROR_NOT_REGISTERED_RRO".into(),
+                },
+                Some(-13),
+                "AuthorizationFnNotRegistered",
+            ),
+            (DpsError::Decode("status=0".into()), None, "Decode"),
+            (DpsError::NotFound, None, "NotFound"),
+            (
+                DpsError::ServerFiscalIdMismatch {
+                    expected_id: "A".into(),
+                    actual_id: "B".into(),
+                },
+                None,
+                "ServerFiscalIdMismatch",
+            ),
+            (
+                DpsError::QueryNotSupported("ByLocalIdentity"),
+                None,
+                "QueryNotSupported",
+            ),
+            (DpsError::Internal("wrapper".into()), None, "Internal"),
+        ];
+        for (err, exp_code, exp_kind) in cases {
+            let (code, kind, _msg) = extract_wire_forensics(&err);
+            assert_eq!(code, exp_code, "{err:?}");
+            assert_eq!(kind, exp_kind, "{err:?}");
+        }
+    }
+
+    #[test]
+    fn wire_decision_to_outcome_kind_maps_per_w10_table() {
+        // Covers both W10.2 baseline mapping (5 retry classes folding
+        // to W7-frozen kinds) and W10.4 split (MacRecovery →
+        // RetryableMacHashMismatch via migration 013).
+        use super::super::error_routing::{AuditEvent, RetryClass, RoutingDecision, WireDecision};
+        // Sent → OK regardless of wire_kind.
+        assert_eq!(
+            wire_decision_to_outcome_kind(
+                &WireDecision::Sent {
+                    server_fiscal_no: "X".into()
+                },
+                "Transport"
+            ),
+            OutcomeKind::Ok
+        );
+        // Helper to build a routed decision quickly.
+        let routed = |rc: RetryClass| {
+            WireDecision::Routed(RoutingDecision {
+                target_state: DocState::ErrorRetryable,
+                retry_class: rc,
+                audit_event: AuditEvent::StageSendResult,
+                audit_severity: Severity::Warning,
+                node_mode_flip: None,
+                probe_hint: None,
+                mac_recovery_hint: None,
+            })
+        };
+        // TerminalReject → REJECTED.
+        assert_eq!(
+            wire_decision_to_outcome_kind(&routed(RetryClass::TerminalReject), "Server"),
+            OutcomeKind::Rejected
+        );
+        // TransientRetry split: Transport → RETRYABLE_TRANSPORT,
+        // anything else → RETRYABLE_SERVER.
+        assert_eq!(
+            wire_decision_to_outcome_kind(&routed(RetryClass::TransientRetry), "Transport"),
+            OutcomeKind::RetryableTransport
+        );
+        assert_eq!(
+            wire_decision_to_outcome_kind(&routed(RetryClass::TransientRetry), "Server"),
+            OutcomeKind::RetryableServer
+        );
+        // FnConfigError → RETRYABLE_AUTH_FN.
+        assert_eq!(
+            wire_decision_to_outcome_kind(&routed(RetryClass::FnConfigError), "Authorization"),
+            OutcomeKind::RetryableAuthFn
+        );
+        // WrapperBug / ProbeRequired / OperatorEscalation fold to
+        // RETRYABLE_SERVER; MacRecovery has its own kind from W10.4
+        // (migration 013 extends the CHECK list with
+        // RETRYABLE_MAC_HASH_MISMATCH).
+        for rc in [
+            RetryClass::WrapperBug,
+            RetryClass::ProbeRequired,
+            RetryClass::OperatorEscalation,
         ] {
-            let out = classify_send_outcome(Err(err));
             assert_eq!(
-                out.trace_kind(),
-                OutcomeKind::RetryableTransport,
-                "expected RetryableTransport for unexpected DpsError shape: {out:?}"
+                wire_decision_to_outcome_kind(&routed(rc), "Server"),
+                OutcomeKind::RetryableServer,
+                "{rc:?} should fold to RetryableServer"
             );
         }
+        // W10.4 split: MacRecovery → RETRYABLE_MAC_HASH_MISMATCH.
+        assert_eq!(
+            wire_decision_to_outcome_kind(&routed(RetryClass::MacRecovery), "Server"),
+            OutcomeKind::RetryableMacHashMismatch,
+            "MacRecovery must fold to RETRYABLE_MAC_HASH_MISMATCH (W10.4 + migration 013)"
+        );
     }
 }

@@ -162,6 +162,14 @@ pub fn allowed_transition(from: DocState, to: DocState) -> bool {
             | (Sending, ErrorRetryable)
             | (Sending, Rejected)
             | (ErrorRetryable, Sending)
+            // W10.4 step 2d: MAC recovery failure overrides
+            // (`HashNotExtractable` / `CounterExhausted` /
+            // second-`-12` short-circuit) terminate the doc directly
+            // from `ErrorRetryable` without a fresh wire send.
+            // Semantically: "we tried recovery, it failed, give up".
+            // Freeze §4.4.4 step 2d names this CAS explicitly; the
+            // whitelist edge was added in W10.5 follow-up.
+            | (ErrorRetryable, Rejected)
     )
 }
 
@@ -731,14 +739,39 @@ pub async fn mark_submission_attempted_tx(
     tx: &mut WriteTxConn<'_>,
     doc_id: DocumentId,
 ) -> sqlx::Result<bool> {
+    // Idempotent stamp (R-W10.4-senior-review MED 1 close): the
+    // column promise is "first submission attempt time", not "last
+    // submission attempt time".  W10.4 step 2d introduced a Pattern B
+    // retry path through 4-pre on attempt #2 (Resigned re-entry); the
+    // earlier unconditional UPDATE silently overwrote attempt-#1's
+    // timestamp.  Per-attempt timing is preserved in
+    // `transport_trace.started_at`; this column documents the
+    // single first-submission moment and must not be rewritten.
+    //
+    // Two-statement implementation (atomic in the wrapping tx) so we
+    // can distinguish "row missing" from "already stamped" without
+    // sqlx Database-error-text matching.  The cost is one extra
+    // SELECT on stage 4-pre — negligible vs the wire send + audit
+    // writes that follow.
     let res = sqlx::query(
         "UPDATE fiscal_documents SET submission_attempted_at = CURRENT_TIMESTAMP \
-         WHERE document_id = ?",
+         WHERE document_id = ? AND submission_attempted_at IS NULL",
     )
     .bind(doc_id)
     .execute(&mut **tx)
     .await?;
-    Ok(res.rows_affected() == 1)
+    if res.rows_affected() == 1 {
+        // First-time stamp committed.
+        return Ok(true);
+    }
+    // rows_affected == 0 could mean: (a) row missing, (b) already
+    // stamped.  Disambiguate with a SELECT in the same tx.
+    let exists: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(exists.is_some())
 }
 
 /// W7 stage 4-b — persist the DPS-assigned fiscal id (`CheckAck.id`)
@@ -765,5 +798,62 @@ pub async fn set_server_fiscal_no_tx(
         .bind(doc_id)
         .execute(&mut **tx)
         .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// W10.4 — claim the single-bit MAC-recovery counter for `doc_id`.
+/// CAS shape: succeed only if the doc is in `ERROR_RETRYABLE` AND
+/// `mac_recovery_attempts == 0`.  On success bumps the counter to 1
+/// and returns `true`; on any other state — wrong doc state,
+/// counter already burned, missing row — returns `false`.
+///
+/// **Lifecycle (per freeze §4.4.1 + R-W10.4 HIGH 2 split).**  Called
+/// by `mac_recovery::run_mac_recovery` AFTER the attempt-#1 4-b commit
+/// lands the doc in `ErrorRetryable` with `STAGE_SEND_MAC_HASH_MISMATCH`
+/// audit + `RETRYABLE_MAC_HASH_MISMATCH` trace.
+///
+/// **MR-CLAIM and MR-PERSIST run in SEPARATE `with_immediate`
+/// envelopes by design** — this is NOT a bug.  The claim envelope
+/// (MR-CLAIM, this helper) commits the counter bump alone, before
+/// the no-tx re-sign step runs; the rewrite envelope (MR-PERSIST)
+/// commits `previous_hash` + replaced SIGNED_XML + `MAC_RECOVERY_RESIGNED`
+/// audit together.  Crash between them leaves the doc in
+/// `ERROR_RETRYABLE` with `mac_recovery_attempts = 1` and OLD
+/// artifacts; worker re-entry hits this helper's `rows_affected = 0`
+/// branch (counter already 1) ⇒ `CounterExhausted` ⇒ caller emits
+/// `MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH` ⇒ doc Rejected.  No
+/// silent progression; partial state forensically visible via
+/// missing `MAC_RECOVERY_RESIGNED` audit row.  See
+/// `services/write_path/mac_recovery.rs` module docs (HIGH 2 section).
+///
+/// **Why CAS guard `state = 'ERROR_RETRYABLE'`.**  A doc in any other
+/// state shouldn't go through MAC recovery (e.g. operator manually
+/// flipped to Rejected, or W9 promoted to RequiresManualReconciliation).
+/// Bare counter UPDATE without state guard would silently burn the
+/// budget for a doc that no longer needs it.
+///
+/// **Why CAS guard `mac_recovery_attempts = 0`.**  Single-bit budget
+/// per W0-3 §2.1 row -12: ONE auto-recovery per doc.  A second `-12`
+/// for a doc that already burned its budget routes to TerminalReject
+/// with audit `MacRecoveryFailedRepeatHashMismatch` (closed-enum
+/// `AuditEvent` per freeze §3.4).
+///
+/// **DDL CHECK as belt-and-braces.**  Migration 013 enforces
+/// `mac_recovery_attempts IN (0, 1)`; this helper guarantees we only
+/// ever transition 0→1 (never 1→2 — that would be a CHECK violation
+/// + observable error, not silent corruption).
+pub async fn mac_recovery_claim_counter_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "UPDATE fiscal_documents SET mac_recovery_attempts = 1 \
+         WHERE document_id = ? \
+           AND state = 'ERROR_RETRYABLE' \
+           AND mac_recovery_attempts = 0",
+    )
+    .bind(doc_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(res.rows_affected() == 1)
 }

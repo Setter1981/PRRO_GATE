@@ -148,6 +148,40 @@ pub async fn update_last_known_xml_sha_tx(
     Ok(res.rows_affected() == 1)
 }
 
+/// W10.3 — flip `node_state.mode` to `BLOCKED` for the FN.  Mirror of
+/// [`update_last_known_xml_sha_tx`]: tx-bound, single UPDATE,
+/// returns `bool` (`true` = row existed and was updated; `false` =
+/// missing FN row, structural breach).
+///
+/// Invoked from `stage_send::run` 4-b closure when
+/// `decision.node_mode_flip == Some(NodeMode::Blocked)` (Server `-11`
+/// ERROR_OFFLINE_168 — 168-hour cumulative-offline limit exceeded
+/// per W0-1 §2.4).  Atomic with the post-wire CAS `Sending → Rejected`,
+/// `transport_trace::complete_tx`, and the audit
+/// `STAGE_SEND_NODE_BLOCKED` row, all in the same `with_immediate`
+/// envelope.
+///
+/// **Idempotent.**  CAS-style guard `WHERE mode != 'BLOCKED'` would
+/// add cost (one row read) for no real benefit: if the doc just
+/// reached us with `-11`, the prior worker either flipped already
+/// (`rows_affected == 0` is fine — we don't surface as error) OR not
+/// (we flip now — also fine).  The bare UPDATE is thus the simplest
+/// shape; callers MUST treat `false` as "missing row" specifically,
+/// not "already-blocked".  W5 acquire upserts the row before stage 1
+/// runs, so missing-row at 4-b time is a structural breach.
+///
+/// Carries no `node_state_updated_at` bump — that column does not
+/// exist (verified `migrations/001_core_identities.sql`); the change
+/// is fully captured by the audit-log entry the caller writes
+/// alongside.
+pub async fn set_mode_blocked_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<bool> {
+    let res = sqlx::query("UPDATE node_state SET mode = 'BLOCKED' WHERE fiscal_number = ?")
+        .bind(fn_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStateRow>> {
     let row = sqlx::query!(
         r#"SELECT fiscal_number,
