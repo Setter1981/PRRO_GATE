@@ -5,21 +5,28 @@
 //! `stage_send::run` (step 2d) after attempt #1 commits with
 //! `decision.retry_class == MacRecovery`.
 //!
-//! **Four-step state machine (per freeze §4.4.1 + §4.4.3):**
+//! **Four-step state machine (per freeze §4.4.1 + §4.4.3, with the
+//! step 2/3 reorder per R-W10.4-senior-review LOW 5):**
 //!   1. **Hash extraction (pure-fn)** — regex-extract `store {64hex}`
 //!      from the wire `error_message`.  Failure ⇒
 //!      [`MacRecoveryOutcome::HashNotExtractable`].  Counter is NOT
 //!      claimed yet — preserves the budget if DPS shipped a malformed
 //!      message.
-//!   2. **MR-CLAIM** (`with_immediate` #1) — atomic CAS on
-//!      `(state == ERROR_RETRYABLE AND mac_recovery_attempts == 0)
-//!      → mac_recovery_attempts = 1`.  Failure ⇒
+//!   2. **MR-NO-TX read** — pool-bound read of recovery inputs (doc
+//!      row + fn_config).  Runs BEFORE MR-CLAIM so that a transient
+//!      read failure (missing row, malformed `previous_hash`) does
+//!      NOT burn the single-bit budget; a future tick can still
+//!      attempt recovery after the operator fixes the row.
+//!      (R-W10.4-senior-review LOW 5 close; earlier ordering was
+//!      CLAIM → read.)
+//!   3. **MR-CLAIM** (`with_immediate` #1) + **re-sign** — atomic CAS
+//!      on `(state == ERROR_RETRYABLE AND mac_recovery_attempts == 0)
+//!      → mac_recovery_attempts = 1`; on failure ⇒
 //!      [`MacRecoveryOutcome::CounterExhausted`] (caller emits
-//!      `MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH` audit).
-//!   3. **MR-NO-TX** — pool-bound read of recovery inputs +
-//!      [`stage_sign::re_sign_after_mac_recovery`] → fresh canonical
-//!      XML + sha256 + CMS signature.  Pure CPU + crypto, NO DB
-//!      writes.
+//!      `MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH` audit).  On
+//!      success: `stage_sign::re_sign_after_mac_recovery` runs
+//!      OUTSIDE any tx (pure CPU + crypto, no DB writes) producing
+//!      fresh canonical XML + sha256 + CMS signature.
 //!   4. **MR-PERSIST** (`with_immediate` #2) — atomic four-write:
 //!      Pre-PERSIST assertion (PAYLOAD_XML + SIGNED_XML must exist
 //!      per W6 stage-3 invariant; missing ⇒

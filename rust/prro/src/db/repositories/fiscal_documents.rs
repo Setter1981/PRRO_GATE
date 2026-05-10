@@ -807,14 +807,24 @@ pub async fn set_server_fiscal_no_tx(
 /// and returns `true`; on any other state — wrong doc state,
 /// counter already burned, missing row — returns `false`.
 ///
-/// **Lifecycle (per freeze §4.4.1).**  Called by `mac_recovery::orchestrate`
-/// AFTER the attempt-#1 4-b commit lands the doc in `ErrorRetryable`
-/// with `STAGE_SEND_MAC_HASH_MISMATCH` audit + `RETRYABLE_MAC_HASH_MISMATCH`
-/// trace.  The claim, the new `previous_hash` write, the replaced
-/// SIGNED_XML artifact, and the `MAC_RECOVERY_RESIGNED` audit row
-/// commit atomically together inside the **MR-PERSIST**
-/// `with_immediate` envelope — if any one fails, the entire envelope
-/// rolls back and the budget is NOT burned.
+/// **Lifecycle (per freeze §4.4.1 + R-W10.4 HIGH 2 split).**  Called
+/// by `mac_recovery::run_mac_recovery` AFTER the attempt-#1 4-b commit
+/// lands the doc in `ErrorRetryable` with `STAGE_SEND_MAC_HASH_MISMATCH`
+/// audit + `RETRYABLE_MAC_HASH_MISMATCH` trace.
+///
+/// **MR-CLAIM and MR-PERSIST run in SEPARATE `with_immediate`
+/// envelopes by design** — this is NOT a bug.  The claim envelope
+/// (MR-CLAIM, this helper) commits the counter bump alone, before
+/// the no-tx re-sign step runs; the rewrite envelope (MR-PERSIST)
+/// commits `previous_hash` + replaced SIGNED_XML + `MAC_RECOVERY_RESIGNED`
+/// audit together.  Crash between them leaves the doc in
+/// `ERROR_RETRYABLE` with `mac_recovery_attempts = 1` and OLD
+/// artifacts; worker re-entry hits this helper's `rows_affected = 0`
+/// branch (counter already 1) ⇒ `CounterExhausted` ⇒ caller emits
+/// `MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH` ⇒ doc Rejected.  No
+/// silent progression; partial state forensically visible via
+/// missing `MAC_RECOVERY_RESIGNED` audit row.  See
+/// `services/write_path/mac_recovery.rs` module docs (HIGH 2 section).
 ///
 /// **Why CAS guard `state = 'ERROR_RETRYABLE'`.**  A doc in any other
 /// state shouldn't go through MAC recovery (e.g. operator manually
