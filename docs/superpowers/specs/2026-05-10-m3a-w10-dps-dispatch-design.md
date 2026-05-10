@@ -1,7 +1,7 @@
 # M3a W10 — DpsError Routing Dispatch (full 8-variant + 12-status-code table) — Design Freeze
 
 **Date:** 2026-05-10
-**Status:** v2 — 4 blockers + Q1-Q5 finalised; ready for W10.1 apply
+**Status:** v3 — second-round 6 findings closed (3 HIGH + 2 MED + 1 LOW); ready for W10.1 apply
 **Anchors:** ADR-M3-A6 (full retry policy table), ADR-M3-A9 step 5-6 (Pattern B retry path), W0-3 §2 main + §2.1 sub-table + §9.2 acceptance, M3a plan Task 9
 **Predecessor:** W8 (PR #27 + #28, merged `1d29315`) — stage 5 finalize
 **Successor:** W9 (App::boot reconciliation; consumes W10's routing in non-live context), W11 (deterministic-replay gate)
@@ -211,6 +211,18 @@ pub struct MacRecoveryHint {
 
 **Why a struct + outer enum:** `WireDecision` enum captures the OK/Err split (CheckAck.id is only on OK).  `RoutingDecision` struct carries the multi-faceted Err shape (target state, retry class, audit, side-effect hints) — an enum would lose information or duplicate variants combinatorially.
 
+### 3.5 `is_live_send` parameter — W10 implements TRUE; FALSE is RESERVED for W9 (MED 2 close)
+
+The `route_dps_error(err, doc_type, is_live_send)` and `route_send_result(...)` signatures both carry the `is_live_send: bool` parameter for forward-compat with W9 reconciliation.  **W10 implements ONLY the `is_live_send=true` branch.**  Calling `route_dps_error` with `is_live_send=false` in W10 returns a `RoutingDecision` whose contract has not yet been finalised (W9 will define the reconciliation-side source-state mapping `Sent → ...` per W0-3 §2 "Source-state implications" column).
+
+**W10 enforcement of the RESERVED status:**
+- The unit tests in `error_routing.rs::tests` cover `is_live_send=true` exclusively.  W10 ships ZERO fixtures asserting `is_live_send=false` behaviour.
+- Production caller — `stage_send::run` — passes `true` literally at the only call site.  No other caller exists in W10.
+- Module doc on `route_dps_error` includes a STABILITY NOTE: «`is_live_send=false` is RESERVED for W9; calling it in W10 yields a routing decision whose contract has not been audited and may change without notice.»
+- W9 design freeze (when written) MUST extend the routing fn body to handle `is_live_send=false` AND extend the unit tests to cover both branches.
+
+**Why a parameter at all in W10, not "delete and add later":** the routing fn signature is a stable API surface that W7 baseline `classify_send_outcome` did NOT have.  Threading `is_live_send` through W10 prevents a future signature break that would force W9 to refactor every call site.  The RESERVED treatment lets W10 ship the parameter without committing to its semantics.
+
 ---
 
 ## 4. Decomposition (5 sub-units)
@@ -222,19 +234,54 @@ pub struct MacRecoveryHint {
   - `pub fn route_dps_error(err: &DpsError, doc_type: DocType, is_live_send: bool) -> RoutingDecision` — pure-fn the Err arm dispatches to.
   - **Exhaustive `match err` (B1 close).**  `DpsError` is NOT `#[non_exhaustive]` (verified at `transports/dps/error.rs:15`).  Match has explicit arms for ALL 8 variants: Transport / Authorization{kind:DocumentReject} / Authorization{kind:FiscalNumberNotRegistered} / Decode / Server / NotFound / ServerFiscalIdMismatch / QueryNotSupported / Internal — **no `_` catch-all**.  If a future commit adds a 9th DpsError variant, the build BREAKS — exactly the safety net we want; the match-arm forces explicit routing decision rather than silently default-routing.
   - **Server{code:i32} fail-closed default arm (B1 + R-W10-1 close).**  For the `Server { code, message }` arm, dispatch to a private `route_server_code(code, message, doc_type, is_live_send)`.  Inside, match the **12 known codes** (-2/-3/-5/-6/-7..-10/-11/-12/-15/-16) explicitly; trailing `_` arm for **unknown** codes routes to `WrapperBug` retry class with `target_state = ErrorRetryable`, `audit_event = StageSendWrapperBug`, `audit_severity = Critical`.  `i32` is not an enum, so the catch-all is required here (B1 distinction: enum match exhaustiveness vs raw int dispatch).
-  - **Live-only routing for query variants (B2 close).**  `NotFound` / `QueryNotSupported` on `is_live_send=true` route to `WrapperBug` → `target_state = ErrorRetryable` + CRITICAL audit `StageSendWrapperBug`.  These shapes should NEVER come from `send_chk` in live; the WrapperBug routing ensures the doc doesn't get stuck in SENDING.  Reconciliation context (`is_live_send=false`) preserves the original "no DocState transition" semantic for these — that's W9's contract.
+  - **Live-only routing for query variants (B2 close).**  `NotFound` / `QueryNotSupported` on `is_live_send=true` route to `WrapperBug` → `target_state = ErrorRetryable` + CRITICAL audit `StageSendWrapperBug`.  These shapes should NEVER come from `send_chk` in live; the WrapperBug routing ensures the doc doesn't get stuck in SENDING.  **Reconciliation context (`is_live_send=false`) is RESERVED in W10 (MED 2 close)** — see §3.5; the routing fn signature carries the parameter for forward compat, but W10 unit tests assert that the only currently-supported value is `true`, and W9 will define + ship the FALSE branch.
   - Unit tests inside the file (`mod tests`): 21 cases (10 main + 11 sub-table) + 4 RetryClass sanity checks + 1 unknown-Server-code fail-closed test.  Pure Rust — no DB, no async, sub-millisecond.
 - Register `pub mod error_routing;` in `services/write_path/mod.rs`.
 
 ### 4.2 W10.2 — Wire routing into `stage_send.rs`
-- Replace `classify_send_outcome` body with:
-  ```rust
-  let decision = error_routing::route_dps_error(&err, inputs.doc_type, /* is_live_send */ true);
-  ```
-  for the `Err(_)` arm; keep the `Ok(ack)` happy path unchanged.
-- Extend `SendOutcome` enum with a new variant `Routed { decision: RoutingDecision }` OR fold directly: replace `classify_send_outcome → SendOutcome` with `→ RoutingDecision` and update 4-b commit logic to dispatch on `decision.target_state`.  **Recommend the latter** — fewer indirections; W7's `SendOutcome` shape was always meant to be replaced (per W7 freeze §6).
-- 4-b commit applies `decision.target_state` via CAS; emits audit `decision.audit_event` with rich payload (existing payload + `retry_class`, `probe_required: bool`, `node_mode_flipped: bool`).
-- W3 static scan stays green (no foreign IO inserted into closures).
+
+**HIGH 3 close — extend 4-pre source-state CAS to accept `Signed` OR `ErrorRetryable`.**  W7's hardcoded CAS `Signed → Sending` works only for the live first-attempt path.  Pattern B retry path (per ADR-M3-A9 step 5-6) requires `ErrorRetryable → Sending` for any re-attempt — including MAC recovery (W10.4) and W9 boot recovery for stuck `ErrorRetryable` docs.  Without this extension, Pattern B retry-path proof (fixture 21) is impossible to land cleanly.
+
+**New 4-pre CAS dispatch (replaces W7 hardcoded):**
+
+```rust
+let inputs = fd::fetch_send_inputs_tx(tx, doc).await?
+    .ok_or_else(|| ... DocumentMissing ...)?;
+
+let source_state = match inputs.state {
+    DocState::Signed | DocState::ErrorRetryable => inputs.state,
+    other => return Ok(PreOutcome::StateConflict { observed: other }),
+};
+
+match fd::transition_state(tx, doc, source_state, DocState::Sending).await? {
+    TransitionOutcome::Applied => { /* proceed */ }
+    TransitionOutcome::Conflict => return Ok(PreOutcome::StateConflict { observed: source_state }),
+    TransitionOutcome::NotFound  => return Ok(PreOutcome::DocumentMissing),
+    TransitionOutcome::Forbidden => unreachable!(
+        "(Signed,Sending) and (ErrorRetryable,Sending) are both whitelisted"
+    ),
+}
+```
+
+Whitelist already carries both edges (`fiscal_documents.rs:158, 164`); W10.2 is purely a stage_send.rs change.
+
+**Routing wire-in.**  Replace W7-minimal `classify_send_outcome` with:
+
+```rust
+let outcome = error_routing::route_send_result(
+    wire_result,            // Result<CheckAck, DpsError>
+    inputs.doc_type,
+    /* is_live_send */ true,
+);
+```
+
+Returns `WireDecision`.  4-b dispatch:
+- `WireDecision::Sent { server_fiscal_no }` → CAS `Sending → Sent` + `set_server_fiscal_no_tx` + audit `StageSendResult` + `transport_trace::complete_tx { outcome_kind: OK }`.
+- `WireDecision::Routed(decision)` → CAS `Sending → decision.target_state` + side-effects (`node_mode_flip`, `mac_recovery_hint` triggers W10.4 orchestrator before 4-b commit; see §4.4) + audit `decision.audit_event` + `transport_trace::complete_tx { outcome_kind = decision-derived }`.
+
+**`SendOutcome` removal.**  W7's `SendOutcome` enum is dropped wholesale; W10 only exposes `WireDecision` (outer) + `RoutingDecision` (inner).  Existing W7.5 fixtures asserting the old `SendOutcome::{Sent, Rejected, Retryable}` shape are updated to assert `WireDecision::{Sent, Routed}`.
+
+**W3 static scan invariant** stays green (no foreign IO inserted into `with_immediate` closures).
 
 ### 4.3 W10.3 — `node_state.mode → BLOCKED` side effect for `-11`
 - Add `pub async fn set_mode_blocked_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<bool>` to `node_state.rs`.  Mirror of existing tx-bound update helpers; returns `bool` for missing-row detection per W7.2 / W8.2 convention.
@@ -243,9 +290,10 @@ pub struct MacRecoveryHint {
 
 ### 4.4 W10.4 — MAC recovery `-12` in-stage path
 
-**Q1 finalised: dedicated `mac_recovery_attempts` column + migration 012.**  `recovery_attempts` does not exist in the current schema (verified) — reuse was never an option.  Add a single-bit budget column with a CHECK so the bounded-ONE invariant is DDL-enforced.
+**HIGH 1 + HIGH 2 + LOW 1 close — Pattern B-consistent two-attempt sequence with atomic single-tx PERSIST.**  The earlier draft had two issues: (a) it implicitly created two wire calls without acknowledging that each must produce its own `transport_trace` row, and (b) `mac_recovery_repin_tx` updated `previous_hash` separately from the artifact PERSIST, opening a crash window where the new hash + old XML/sha could be observed.  The v2 design closes both.
 
-**Migration 012:**
+**Q1 finalised: dedicated `mac_recovery_attempts` column + migration 012.**  Single-bit budget DDL-enforced via CHECK.
+
 ```sql
 -- migrations/012_mac_recovery_attempts.sql
 ALTER TABLE fiscal_documents
@@ -253,104 +301,159 @@ ALTER TABLE fiscal_documents
   CHECK (mac_recovery_attempts IN (0, 1));
 ```
 
-**B4 close — separate `mac_recovery_repin_tx` helper, NOT W6 pin reuse.**  W6 pin reads `node_state.last_known_unsigned_xml_sha256`; MAC recovery uses the DPS-extracted hash from the error_message.  Reusing W6 pin would re-read node_state and overwrite our extracted-hash with the chain seed — wrong.  New helper:
+#### 4.4.1 Pattern B-consistent state-machine flow (HIGH 1 close)
+
+The MAC recovery does NOT bypass Pattern B — it lives ABOVE the standard 4-pre/4a/4b cycle.  Two wire attempts ⇒ two `transport_trace` rows.
+
+**Sequence diagram:**
+
+```
+attempt #1 — original signed payload
+  4-pre tx        : CAS Signed→Sending; trace[1] alloc; submission_attempted_at; audit STAGE_SEND_INTENT_MARKED
+  4a (no-tx)      : send_chk(envelope_v1) → Err(Server{-12, "...store {hex}..."})
+  classify        : RoutingDecision { target_state=ErrorRetryable, retry_class=MacRecovery, mac_recovery_hint=Some(_) }
+  4b tx           : CAS Sending→ErrorRetryable; trace[1].complete(outcome=RETRYABLE_MAC_HASH_MISMATCH); audit StageSendMacHashMismatch
+
+  ↓ stage_send::run sees mac_recovery_hint AND attempts==0; invokes orchestrator BEFORE returning to caller.
+
+mac_recovery_orchestrator()
+  MR-CLAIM tx     : claim counter atomically: state==ErrorRetryable AND attempts==0
+                    → SET attempts=1.  No previous_hash write yet (HIGH 2 close).
+                    On rows_affected==0: counter already burnt OR wrong state → return Outcome::CounterExhausted.
+  MR-NO-TX        : regex_extract_store_hash(error_message) → Option<[u8; 32]>.
+                    On None: return Outcome::HashNotExtractable.
+                    Build canonical XML using extracted_hash as previous_hash;
+                    sha256(unsigned_xml); sign_cms_detached(...).
+                    All pure CPU + crypto, OUTSIDE any tx.
+  MR-PERSIST tx   : atomic single tx that rewrites the FOUR drift-sensitive artifacts together
+                    (HIGH 2 close): previous_hash, unsigned_xml_sha256, document_files{PAYLOAD_XML},
+                    document_files{SIGNED_XML}.  Audit MacRecoveryResigned.
+
+  ↓ orchestrator returns Outcome::Resigned; stage_send::run re-enters the standard 4-pre/4a/4b cycle.
+
+attempt #2 — re-signed payload
+  4-pre tx        : source_state = ErrorRetryable; CAS ErrorRetryable→Sending (per HIGH 3 §4.2);
+                    trace[2] alloc; submission_attempted_at; audit STAGE_SEND_INTENT_MARKED.
+  4a (no-tx)      : send_chk(envelope_v2) → outcome.
+  classify        : if again Err(Server{-12}) → RoutingDecision { TerminalReject, audit_event = MacRecoveryFailedRepeatHashMismatch }
+                    (DDL CHECK already prevents claim-counter from going past 1; routing fn just uses the existing
+                    state machine — no second orchestrator entry).
+                    Otherwise: standard RoutingDecision per §3.
+  4b tx           : CAS Sending→target_state; trace[2].complete; audit decision.audit_event.
+```
+
+Two `transport_trace` rows materialise: `attempt_no=1` (outcome=RETRYABLE_MAC_HASH_MISMATCH) and `attempt_no=2` (outcome per fresh classify).  Forensic visibility: operator can replay the chain "first envelope rejected with hash X, recovery rebuilt with hash Y, second envelope <result>".  The `transport_trace` PRIMARY KEY `(document_id, attempt_no)` already enforces uniqueness.
+
+**New `OutcomeKind` variant** for `transport_trace.outcome_kind` CHECK list: `RETRYABLE_MAC_HASH_MISMATCH`.  Migration 012 extends the CHECK to include it (single-statement ALTER + table-rebuild per migration 008 precedent if SQLite version requires).
+
+#### 4.4.2 New helpers (HIGH 2 + LOW 1 close)
+
+**`mac_recovery_claim_counter_tx`** — only claims the budget; does NOT write `previous_hash`.  Lives in `fiscal_documents.rs` (touches only `fiscal_documents` columns):
 
 ```rust
-// fiscal_documents.rs — MAC recovery re-pin (distinct from W6 pin)
-pub async fn mac_recovery_repin_tx(
+pub async fn mac_recovery_claim_counter_tx(
     tx: &mut WriteTxConn<'_>,
     doc_id: DocumentId,
-    extracted_hash: &[u8; 32],
 ) -> sqlx::Result<u64> {
     let res = sqlx::query(
         "UPDATE fiscal_documents SET \
-            previous_hash         = ?, \
             mac_recovery_attempts = mac_recovery_attempts + 1 \
          WHERE document_id = ? \
-           AND state = 'SENDING' \
+           AND state = 'ERROR_RETRYABLE' \
            AND mac_recovery_attempts = 0",
     )
-    .bind(&extracted_hash[..])
     .bind(doc_id)
     .execute(&mut **tx)
     .await?;
     Ok(res.rows_affected())
 }
 ```
-- Source-state guard: `state='SENDING'` (the doc must be in SENDING from 4-pre, NOT PREPARED — that's W6's source).
-- Counter guard: `mac_recovery_attempts = 0` (first and only attempt).
-- `signing_inputs_pinned_at` is intentionally NOT reset — the row is still pinned, just with a recovered `previous_hash`.
+- Source-state guard: `ERROR_RETRYABLE` (post-4b commit of attempt #1, NOT `SENDING`).
+- Counter guard: `attempts = 0` (first and only attempt).
+- DDL CHECK `IN (0, 1)` is the second-line safety: if a future bug somehow tried to increment past 1, INSERT/UPDATE fails loudly.
 
-**Q2 finalised — re-sign helper extraction (rebuild + sign, no Z alloc, no Prepared→Signed CAS).**  Extract from `stage_sign.rs` a new helper that does the no-tx 3-NO-TX segment:
-
-```rust
-// stage_sign.rs — extracted re-sign helper
-pub async fn re_sign_after_mac_recovery(
-    crypto: Arc<dyn CryptoProvider>,
-    session: SigningSession,
-    profile: CmsProfile,
-    inputs: PinnedSigningInputs,  // includes the recovered previous_hash
-    typed_payload: TypedPayload,
-    header: DocumentHeader,
-    local_number: u32,
-    wire_artifact_kind: WireArtifactKind,
-) -> Result<RebuildedAndSigned, SignError> {
-    // No-tx, no Z alloc, no Prepared→Signed CAS.
-    // 1. build_canonical_xml(wire_artifact_kind, header, local_number, typed_payload).
-    // 2. sha256(unsigned_xml).
-    // 3. sign_cms_detached(provider, session, profile, unsigned_xml).
-    // Returns the rebuilt unsigned_xml + sha256 + signed_payload bytes.
-}
-```
-This is invoked OUTSIDE any `with_immediate` per W3 invariant.
-
-**B3 close — atomic multi-write at MAC recovery PERSIST step.**  After re-sign, atomically replace ALL THREE artifacts inside one `with_immediate` (so the next-doc chain advance W8 picks up sees a consistent triple):
+**`mac_recovery_persist_tx`** — atomic FOUR-write inside one tx.  Lives in **`mac_recovery.rs`** (LOW 1 close — orchestrator-local, not in `fiscal_documents.rs` because it crosses repo boundaries: writes `fiscal_documents` columns AND replaces `document_files` rows):
 
 ```rust
-// fiscal_documents.rs — MAC recovery PERSIST atomic helper
-pub async fn mac_recovery_persist_resigned_tx(
+// mac_recovery.rs — atomic PERSIST step
+async fn persist_resigned(
     tx: &mut WriteTxConn<'_>,
     doc_id: DocumentId,
+    new_previous_hash: &[u8; 32],
     new_unsigned_xml_sha256: &[u8; 32],
     new_payload_xml: &[u8],
     new_signed_xml: &[u8],
 ) -> sqlx::Result<()> {
-    // 1. UPDATE fiscal_documents.unsigned_xml_sha256 = new sha.
-    // 2. UPDATE document_files SET content = new_payload_xml WHERE kind = 'PAYLOAD_XML'.
-    // 3. UPDATE document_files SET content = new_signed_xml  WHERE kind = 'SIGNED_XML'.
-    // All three under one BEGIN IMMEDIATE; if any fails, rollback all.
-    // (B3 close: previous_hash + unsigned_xml_sha256 + PAYLOAD_XML +
-    // SIGNED_XML must NEVER drift; W8 stage 5 reads
-    // unsigned_xml_sha256 to advance the chain seed — stale value
-    // freezes the chain.)
+    // 1. fiscal_documents: previous_hash + unsigned_xml_sha256 in one UPDATE.
+    sqlx::query(
+        "UPDATE fiscal_documents SET \
+            previous_hash       = ?, \
+            unsigned_xml_sha256 = ? \
+         WHERE document_id = ?"
+    ).bind(&new_previous_hash[..]).bind(&new_unsigned_xml_sha256[..]).bind(doc_id)
+        .execute(&mut **tx).await?;
+    // 2. document_files: replace PAYLOAD_XML and SIGNED_XML rows.
+    //    Uses new document_files::replace_tx helper (LOW 1 close — repo
+    //    boundary respected).
+    document_files::replace_tx(tx, doc_id, DocumentFileKind::PayloadXml, new_payload_xml).await?;
+    document_files::replace_tx(tx, doc_id, DocumentFileKind::SignedXml, new_signed_xml).await?;
+    Ok(())
 }
 ```
 
-**Orchestrator (`mac_recovery.rs`):**
+**`document_files::replace_tx`** — new repo helper (LOW 1 close):
 ```rust
+// document_files.rs — replace existing artifact (uses ON CONFLICT REPLACE
+// or DELETE+INSERT to keep PK invariant).  W6 stage 3 only INSERTs;
+// this helper is the canonical replace surface for MAC recovery.
+pub async fn replace_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+    kind: DocumentFileKind,
+    content: &[u8],
+) -> sqlx::Result<()>;
+```
+
+**Q2 finalised — `re_sign_after_mac_recovery` helper extraction** in `stage_sign.rs`.  Same scope as before: rebuild canonical XML + sign already-pinned/recovered inputs; NO Z alloc, NO `Prepared→Signed` CAS.  Pure no-tx.  W3 invariant holds.
+
+#### 4.4.3 Orchestrator (`mac_recovery.rs`)
+
+```rust
+pub(super) enum MacRecoveryOutcome {
+    /// MR succeeded; caller MUST re-enter the standard 4-pre/4a/4b
+    /// cycle; the doc is now in `ErrorRetryable` with attempts=1 and
+    /// fresh artifacts persisted.
+    Resigned,
+    /// regex extraction failed → terminal Reject path; caller routes
+    /// to RoutingDecision with retry_class=TerminalReject + audit
+    /// MacRecoveryHashNotExtractable.
+    HashNotExtractable,
+    /// Counter already burnt OR wrong state → terminal Reject path;
+    /// caller routes likewise (audit MacRecoveryFailedRepeatHashMismatch
+    /// if the path was the second -12).
+    CounterExhausted,
+}
+
 pub(super) async fn run_mac_recovery(
     pool: &SqlitePool,
     crypto: Arc<dyn CryptoProvider>,
     session: SigningSession,
     profile: CmsProfile,
-    dps_channel: &dyn DpsChannel,
     doc: DocumentId,
     hint: &MacRecoveryHint,
 ) -> Result<MacRecoveryOutcome, StageSendError>
 ```
 
-Steps (per ADR-M3-A6 §2.1 row -12 + Python `dps_fiscal_server.py:494` + `write_path.py:903-994`):
+Steps:
+1. **Hash extraction (pure-fn):** `regex_extract_store_hash(&hint.raw_error_message) → Option<[u8; 32]>`.  Pattern `r"store ([0-9a-fA-F]{64})"`.  Failure → `Outcome::HashNotExtractable`.
+2. **MR-CLAIM (with_immediate #1):** `mac_recovery_claim_counter_tx`.  rows_affected==0 → `Outcome::CounterExhausted`.
+3. **MR-NO-TX:** read `fiscal_documents.payload_json`, `lnd`, `doc_type`, etc. (separate read, NOT in claim tx; can be done via existing `get_signing_inputs_tx` or a new lightweight helper).  Parse typed payload; build canonical XML using `extracted_hash` as previous_hash.  Sign.
+4. **MR-PERSIST (with_immediate #2):** `persist_resigned(...)` — atomic four-write per HIGH 2.  Audit `MacRecoveryResigned` with payload `{old_previous_hash_hex, new_previous_hash_hex, new_unsigned_xml_sha256_hex}` for forensic correlation.
+5. Return `Outcome::Resigned`.  Caller (`stage_send::run`) re-enters the standard 4-pre/4a/4b loop; the existing source-state CAS dispatch (per §4.2) accepts `ErrorRetryable` and proceeds with attempt #2.
 
-1. **Hash extraction (pure-fn):** `regex_extract_store_hash(&hint.raw_error_message) → Option<[u8; 32]>`.  Pattern: `r"store ([0-9a-fA-F]{64})"`.  Failure → `MacRecoveryOutcome::HashNotExtractable` → caller routes to TerminalReject + audit `MacRecoveryHashNotExtractable`.
-2. **Re-pin (with_immediate #1):** `mac_recovery_repin_tx(tx, doc, extracted_hash)`.  Returns `rows_affected`; `0` means either state≠SENDING OR mac_recovery_attempts>0 → caller routes to TerminalReject + audit (counter exhausted).
-3. **Re-sign (no-tx):** invoke `re_sign_after_mac_recovery(...)` → rebuilt unsigned_xml + new sha256 + new signed_payload bytes.  W3 invariant satisfied (sign outside any tx).
-4. **PERSIST (with_immediate #2):** `mac_recovery_persist_resigned_tx(tx, doc, &new_sha, &new_payload_xml, &new_signed_xml)` — atomic triple write per B3.  Audit `MacRecoveryResigned` with payload `{old_previous_hash, new_previous_hash, new_unsigned_xml_sha256_hex}` for forensic correlation.
-5. **Re-send (no-tx + Pattern B):** call `dps_channel.send_chk(new_envelope).await` OUTSIDE locks.  Result returned as `MacRecoveryOutcome::ResignSucceeded { fresh_send_outcome: WireDecision }` — caller then runs the standard 4-b dispatch on the fresh outcome.
-6. **Repeat -12 detection:** if the fresh outcome is again `Server { code: -12 }`, the routing fn (W10.1) sees `mac_recovery_attempts == 1` (DDL CHECK enforces no second attempt anyway) and routes to TerminalReject + audit `MacRecoveryFailedRepeatHashMismatch`.
+**Note on ordering:** `attempts` counter is claimed in step 2 BEFORE the artifacts are rewritten in step 4.  Crash between 2 and 4: doc state stays `ErrorRetryable`, `attempts=1`, OLD artifacts.  Worker re-enters, routing fn sees `attempts==1` → TerminalReject + audit (the doc is unrecoverable since the budget is burnt).  Acceptable failure mode: a partial MR is forensically visible (audit log + attempts=1) and never silently progresses.
 
-**Doc-files reads:** to re-build the canonical XML (step 3), `re_sign_after_mac_recovery` needs the typed payload + header + local_number.  These can be reconstructed from `fiscal_documents.payload_json` + the recovered `previous_hash` + lnd.  The typed payload parser (`parse_payload`) already exists in W6 stage_sign.
-
-**LoC budget:** ~250 in mac_recovery.rs, ~30 in fiscal_documents.rs (2 new helpers), ~30 in stage_sign.rs (extracted re-sign helper), ~40 integration in stage_send.rs.  Migration 012 = 5 LoC SQL + 1 schema fixture (~30 LoC).
+**LoC budget:** ~280 in `mac_recovery.rs` (orchestrator + persist + extract), ~15 in `fiscal_documents.rs` (claim counter + counter+previous_hash columns join), ~30 in `stage_sign.rs` (extracted re-sign), ~30 in `document_files.rs` (replace_tx), ~50 integration in `stage_send.rs`.  Migration 012 = ~10 LoC SQL (column + outcome_kind CHECK extension) + 1 schema fixture.
 
 ### 4.5 W10.5 — Test fixtures
 - New `rust/prro/tests/write_path_dps_error_routing.rs`: 21 fixtures per W0-3 §9.2 (lines 1218-1256).  Pure-DB integration via stub `DpsChannel` (mirror W7.5 stub pattern); driver invokes `stage_send::run` end-to-end; asserts post-tx `state` + audit event_type + audit payload `retry_class` + (where applicable) `node_state.mode` + `probe_hint`.
@@ -388,8 +491,11 @@ Steps (per ADR-M3-A6 §2.1 row -12 + Python `dps_fiscal_server.py:494` + `write_
 | I1 | No network/crypto inside `with_immediate` | `route_dps_error` is pure-fn; MAC recovery re-sign is W6 Pattern A (sign no-tx); W3 static scan stays green |
 | I4 | Idempotency mandatory | Every routing decision is deterministic on `(err, doc_type, is_live_send)` — same input → same RoutingDecision → same DocState target |
 | I8 | Recovery does not violate state transitions | Pattern B retry path enforced (`ErrorRetryable → Sending → wire`); legacy `(ErrorRetryable, Sent)` whitelist `:99` is NEVER invoked by M3a DPS — fixture 21 proves via provider spy |
-| **NEW** | All 8 DpsError variants have explicit routing | `route_dps_error` match arms cover all 8; `#[non_exhaustive]` on DpsError handled via fail-closed default arm + assertion in unit tests |
-| **NEW** | All 12 Server-routed codes have explicit routing | `route_server_code` covers all 12; unknown code → `Server::TerminalReject` + CRITICAL audit (fail-closed) |
+| **NEW** | All 8 DpsError variants have explicit routing | `route_dps_error` exhaustive match (no `_` arm); `DpsError` is NOT `#[non_exhaustive]` (verified) — adding a 9th variant breaks the build at compile time, exactly the safety net we want (B1 close) |
+| **NEW** | All 12 Server-routed codes have explicit routing | `route_server_code` covers all 12 known codes; unknown `i32` → `WrapperBug` retry class + `target_state = ErrorRetryable` + CRITICAL audit `StageSendWrapperBug` (fail-closed) |
+| **NEW (MAC recovery)** | Two `transport_trace` rows per recovered doc | Attempt #1 trace closed with `RETRYABLE_MAC_HASH_MISMATCH` outcome; attempt #2 trace allocated by re-entry into 4-pre after MR-PERSIST (HIGH 1 close) |
+| **NEW (MAC recovery)** | Atomic four-write at MR-PERSIST | `previous_hash` + `unsigned_xml_sha256` + `PAYLOAD_XML` + `SIGNED_XML` rewritten under one `BEGIN IMMEDIATE`; counter is claimed in a separate prior tx (HIGH 2 close) |
+| **NEW (Pattern B)** | 4-pre source-state CAS accepts `Signed` OR `ErrorRetryable` | New dispatch in §4.2; both edges already in `allowed_transition` whitelist (HIGH 3 close) |
 | **NEW** | MAC recovery is bounded to ONE attempt | Recovery counter check + repeat-on-12 fixture |
 | **NEW** | NodeMode flip for -11 atomic with state transition | -11 fixture asserts `node_state.mode == 'BLOCKED'` AND doc state == 'REJECTED' post-tx |
 
@@ -408,7 +514,7 @@ Steps (per ADR-M3-A6 §2.1 row -12 + Python `dps_fiscal_server.py:494` + `write_
 
 ## 7. Open questions — FINALISED
 
-1. **Q1 — MAC recovery counter (closed: A).**  Dedicated `mac_recovery_attempts` column via **migration 012** with `CHECK (mac_recovery_attempts IN (0, 1))` — DDL-enforced single-bit budget.  `recovery_attempts` does not exist in the current schema (verified), so reuse was never an option.  Tx helper `mac_recovery_repin_tx` carries `WHERE state='SENDING' AND mac_recovery_attempts = 0`; `rows_affected == 0` ⇒ counter exhausted OR wrong state ⇒ TerminalReject + audit.  See §4.4.
+1. **Q1 — MAC recovery counter (closed: A).**  Dedicated `mac_recovery_attempts` column via **migration 012** with `CHECK (mac_recovery_attempts IN (0, 1))` — DDL-enforced single-bit budget.  `recovery_attempts` does not exist in the current schema (verified), so reuse was never an option.  Per §4.4 v2 split: tx helper `mac_recovery_claim_counter_tx` carries `WHERE state='ERROR_RETRYABLE' AND mac_recovery_attempts = 0` (claim phase, post-attempt-#1 4-b commit); `rows_affected == 0` ⇒ counter exhausted OR wrong state ⇒ TerminalReject + audit.  Atomicity of `previous_hash` + artifacts handled in MR-PERSIST step, NOT in claim (HIGH 2 close).
 2. **Q2 — Re-sign helper (closed: A, scoped).**  Extract `pub async fn re_sign_after_mac_recovery(...)` from `stage_sign.rs`.  **Scope:** rebuild canonical XML + sign already-pinned/recovered inputs.  **Excludes:** new Z-report number allocation; `Prepared → Signed` CAS.  Pure no-tx segment per W3 invariant.  See §4.4 helper signature.
 3. **Q3 — `SendOutcome` shape (closed: modified A).**  Drop W7-minimal `SendOutcome`.  Do NOT replace with bare `RoutingDecision` — the OK arm carries `CheckAck.id` (server_fiscal_no) which RoutingDecision can't express without losing the typed routing structure.  Wrap in `WireDecision::{Sent { server_fiscal_no }, Routed(RoutingDecision)}`.  See §3.
 4. **Q4 — Audit event_type (closed: A).**  Closed enum `AuditEvent` with `as_str() -> &'static str`.  All event_types written into `audit_log.event_type` go through this enum; new events require enum extension AND a fixture asserting it.  Mirrors W7.1 `OutcomeKind` precedent.  See §3.
@@ -462,16 +568,23 @@ Estimated total: **4 days** (matches plan Task 9 budget).
 
 ---
 
-## 12. Sign-off checklist (v2 — conditional GO accepted)
+## 12. Sign-off checklist (v3 — second-round findings closed)
 
-- [x] **All 5 open questions in §7 finalised** (Q1=A, Q2=A scoped, Q3=modified A, Q4=A, Q5=B+spy).
-- [x] **§8 apply order accepted** (W10.1 → W10.2 → W10.3 → W10.4 → W10.5).
-- [x] **§6 out-of-scope items frozen** (last_chk probe execution → W9; Sent→Kvt1→Kvt2 → separate slice; offline-pool → M3b).
-- [x] **`is_live_send` contract documented** on `route_dps_error` + `route_send_result` doc; caller convention enforced at sites (stage_send=true; W9=false).
-- [x] **MAC recovery counter strategy = Q1.A** — migration 012 dedicated column.
-- [x] **B1 close** — exhaustive match on `DpsError` (no `_` catch-all); only `Server{code:i32}` has fail-closed default arm.
-- [x] **B2 close** — `target_state` always `DocState`; NotFound/QueryNotSupported on live → ErrorRetryable+WrapperBug+CRITICAL.
-- [x] **B3 close** — MAC recovery atomic multi-write of (previous_hash, unsigned_xml_sha256, PAYLOAD_XML, SIGNED_XML, mac_recovery_attempts) inside one `with_immediate`.
-- [x] **B4 close** — `mac_recovery_repin_tx` distinct from W6 pin (no `node_state` read; uses DPS-extracted hash; source state SENDING; counter guard).
+**v2 first-round closures (preserved):**
+- [x] All 5 open questions in §7 finalised (Q1=A, Q2=A scoped, Q3=modified A, Q4=A, Q5=B+spy).
+- [x] §8 apply order accepted (W10.1 → W10.5).
+- [x] §6 out-of-scope items frozen.
+- [x] B1 — exhaustive `match err` on `DpsError` (no `_`); only `Server{code:i32}` raw-int dispatch has fail-closed `_`.
+- [x] B2 — `target_state` always `DocState`; NotFound/QueryNotSupported on live → ErrorRetryable+WrapperBug+CRITICAL.
+- [x] B3 — atomic multi-write at MR-PERSIST.
+- [x] B4 — `mac_recovery_*` helpers distinct from W6 pin.
+
+**v3 second-round closures:**
+- [x] **HIGH 1 (MAC recovery trace flow)** — explicit two-attempt sequence per §4.4.1; trace[1] closed with `RETRYABLE_MAC_HASH_MISMATCH` on 4-b commit of attempt #1; trace[2] allocated by 4-pre re-entry after MR-PERSIST.  Each wire call has its own forensic row.
+- [x] **HIGH 2 (MAC recovery atomicity)** — claim phase only updates the counter (no `previous_hash` write); PERSIST phase atomically rewrites `previous_hash` + `unsigned_xml_sha256` + `PAYLOAD_XML` + `SIGNED_XML` under one `with_immediate`.  Crash window between claim and PERSIST: counter burnt + old artifacts → re-entry routes to TerminalReject (forensically visible, never silent progress).
+- [x] **HIGH 3 (4-pre source-state CAS)** — explicit dispatch in §4.2 accepts `Signed` OR `ErrorRetryable`; anything else returns `StateConflict`.  Whitelist already carries both edges.  Pattern B retry-path proof (fixture 21) lands cleanly via this dispatch.
+- [x] **MED 1 (stale references)** — §5 invariants table rewritten; §7 Q1 description aligned with §4.4 v2 helpers; §3.5 added documenting `is_live_send` semantics.
+- [x] **MED 2 (`is_live_send=false` underdefined)** — §3.5 marks the FALSE branch RESERVED for W9.  W10 ships ZERO fixtures asserting it; production caller passes `true` literally; module doc carries STABILITY NOTE.
+- [x] **LOW 1 (repo boundary)** — `mac_recovery_persist_tx` lives in `mac_recovery.rs` (orchestrator-local) and uses new `document_files::replace_tx` helper.  `fiscal_documents.rs` only carries the counter-claim helper.
 
 GO confirmed for W10.1 → W10.5 apply order.
