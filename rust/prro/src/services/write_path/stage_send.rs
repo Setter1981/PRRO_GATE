@@ -188,6 +188,51 @@ pub enum StageSendError {
         attempt_no: i32,
     },
 
+    /// W10.4 step 2c — MAC recovery orchestrator could not find the
+    /// `(doc_id, kind)` artifact row in `document_files` during the
+    /// MR-PERSIST Pre-PERSIST assertion.  W6 stage-3 invariant
+    /// breach: PAYLOAD_XML + SIGNED_XML are INSERTed before stage 4
+    /// runs, so a missing row at MR-PERSIST time means the doc is
+    /// structurally broken.  Surfacing as a typed error rolls back
+    /// the entire MR-PERSIST envelope before `replace_tx` (which
+    /// would otherwise silently INSERT) gets invoked
+    /// (R-W10.4-step2a-review LOW 3 close).
+    #[error("MAC recovery artifact missing for doc {document_id:?}: {kind:?}")]
+    MacRecoveryArtifactMissing {
+        document_id: DocumentId,
+        kind: crate::db::repositories::document_files::DocumentFileKind,
+    },
+
+    /// W10.4 step 2c — MAC recovery orchestrator could not find the
+    /// `fiscal_documents` row when reading recovery inputs.  The doc
+    /// must be present for stage 4 to have invoked recovery; absence
+    /// indicates a race with delete (offline reconciliation, manual
+    /// operator action) that the orchestrator surfaces typed for W9.
+    #[error("MAC recovery: fiscal_documents row missing for doc {document_id:?}")]
+    DocumentMissingForRecovery { document_id: DocumentId },
+
+    /// W10.4 step 2c — MAC recovery orchestrator could not find the
+    /// `fiscal_number_config` row for the doc's `fiscal_number`.  This
+    /// would be a config-table inconsistency: the doc exists but the
+    /// FN it points to has no config row.  Possible causes: operator
+    /// removed the FN config while a doc was in flight, or a manual
+    /// DB edit.  Surfacing typed lets W9 pick this up distinctly from
+    /// the routine `DocumentMissingForRecovery`.
+    #[error("MAC recovery: fn_config missing for fn {fn_id} (doc {document_id:?})")]
+    FnConfigMissingForRecovery {
+        fn_id: String,
+        document_id: DocumentId,
+    },
+
+    /// W10.4 step 2c — MAC recovery orchestrator's MR-NO-TX re-sign
+    /// step (`stage_sign::re_sign_after_mac_recovery`) failed.  Wraps
+    /// the underlying [`crate::services::write_path::stage_sign::SignError`]
+    /// so the caller routes failure forensically (typically:
+    /// `PayloadSchema` / `TimestampConversion` / `Range` / `Crypto`
+    /// from the re-sign helper).
+    #[error("MAC recovery re-sign failed: {0}")]
+    MacRecoverySignFailed(#[source] crate::services::write_path::stage_sign::SignError),
+
     /// Pass-through DB error from any helper.  Distinct variant so
     /// callers can route DB issues separately from state-invariant
     /// breaches.
