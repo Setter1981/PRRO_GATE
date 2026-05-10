@@ -178,6 +178,13 @@ async fn replace_fk_violation_on_missing_fiscal_document() {
     .await;
     let err = res.expect_err("FK violation must surface (no ghost INSERT)");
     let msg = err.to_string().to_lowercase();
+    // Brittle by design: relies on the libsqlite3 FK error wording
+    // being stable ("FOREIGN KEY constraint failed") and sqlx
+    // preserving the substring through its `Error::Database` wrap.
+    // If a future libsqlite3 / sqlx version changes the format,
+    // this fixture will fail loudly — by intent — so we can audit
+    // whether the new shape still surfaces FK violations distinctly
+    // enough for forensics (R-W10.4-step2a-review-fixup LOW 2).
     assert!(
         msg.contains("foreign") || msg.contains("constraint"),
         "expected FK / constraint error, got: {msg}"
@@ -190,6 +197,72 @@ async fn replace_fk_violation_on_missing_fiscal_document() {
         .await
         .unwrap();
     assert_eq!(n, 0, "rolled-back tx must not leave a partial row");
+}
+
+#[tokio::test]
+async fn replace_resets_created_at_to_recovery_time() {
+    // R-W10.4-step2a-review-fixup LOW 1 close: pin the docstring
+    // claim "REPLACE resets `created_at` to the recovery time".
+    // Wall-clock-independent: seed an explicit `created_at = '2020-01-01
+    // 00:00:00'` (bypassing the DEFAULT clause via raw INSERT), then
+    // REPLACE the row and assert the new `created_at` is strictly later
+    // than the seeded sentinel.
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_doc(&pool, 0x05).await;
+
+    // Seed via raw SQL to override the DEFAULT (CURRENT_TIMESTAMP)
+    // clause and force a known-old timestamp.
+    sqlx::query(
+        "INSERT INTO document_files (document_id, kind, content, created_at) \
+         VALUES (?, 'SIGNED_XML', ?, '2020-01-01 00:00:00')",
+    )
+    .bind(doc)
+    .bind(b"original".to_vec())
+    .execute(&pool)
+    .await
+    .expect("seed with known-old created_at");
+
+    let initial: String = sqlx::query_scalar(
+        "SELECT created_at FROM document_files \
+         WHERE document_id = ? AND kind = 'SIGNED_XML'",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        initial, "2020-01-01 00:00:00",
+        "raw INSERT must keep the explicit created_at override"
+    );
+
+    // Replace.  REPLACE runs DELETE+INSERT under the hood — the new
+    // INSERT does NOT carry an explicit created_at, so the DEFAULT
+    // (CURRENT_TIMESTAMP) clause fires and produces a fresh timestamp.
+    with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            document_files::replace_tx(tx, doc, DocumentFileKind::SignedXml, b"recovered").await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .expect("replace_tx");
+
+    let after: String = sqlx::query_scalar(
+        "SELECT created_at FROM document_files \
+         WHERE document_id = ? AND kind = 'SIGNED_XML'",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_ne!(
+        after, "2020-01-01 00:00:00",
+        "REPLACE must reset created_at (DEFAULT CURRENT_TIMESTAMP fires)"
+    );
+    assert!(
+        after.as_str() > "2020-01-01 00:00:00",
+        "new created_at must be strictly later than the seeded sentinel: {after}"
+    );
 }
 
 #[tokio::test]

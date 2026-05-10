@@ -539,56 +539,66 @@ W10.4 is large enough (≈400 LoC across 5 files + migration + DDL fixtures + in
 
 **Verified:** 93 lib + 11 helpers + 4 migration_013 + 7 migration_010 + 16 stage4 + 8 W3 scanner + clippy clean.
 
-##### Step 2 — orchestrator + helpers (NEXT)
+##### Step 2 — orchestrator + helpers (in progress)
+
+Step 2 ships as **four review-friendly sub-commits** (2a / 2b / 2c / 2d).  Each sub-commit is independently buildable + testable; cumulative behaviour change happens only at sub-commit 2d (where `stage_send::run` actually invokes the orchestrator).
+
+###### Step 2a — `document_files::replace_tx` (LANDED, commits `9d99159` + `8c14b00`)
 
 **Scope:**
+- `pub async fn replace_tx(tx, doc_id, kind, content) -> sqlx::Result<()>` — `INSERT OR REPLACE INTO document_files`.  Single-statement atomic upsert by PK.
+- Targeted fixtures in `tests/document_files_replace.rs`: replace overwrite, INSERT-when-missing, FK violation, content byte round-trip, `created_at` reset on REPLACE (5 fixtures total).
 
-1. **`document_files::replace_tx(tx, doc_id, kind, content) → sqlx::Result<()>`**
-   - New tx-bound repo helper in `db/repositories/document_files.rs`.
-   - Replaces an existing artifact row in-place.  Implementation: `INSERT OR REPLACE` on the `(document_id, kind)` PK.  W6 stage 3 only INSERTs new artifacts; this helper is the canonical replace surface for MAC recovery.
-   - Error semantics: returns the wrapped sqlx error; any failure rolls back the wrapping `with_immediate` envelope.
-   - Targeted lib test in `tests/document_files_replace.rs` (~3 fixtures: replaces existing row, INSERTs if missing — semantic of `OR REPLACE` — pinned for W9 forensics, content round-trip).
+**Carry-forward to 2c (R-W10.4-step2a-review LOW 3):** `replace_tx` is intentionally permissive (silent INSERT on missing row).  The orchestrator's MR-PERSIST step MUST surface a typed error before invoking `replace_tx` if the existing PAYLOAD_XML / SIGNED_XML row is absent (W6 stage-3 invariant breach).  See step 2c "Pre-PERSIST assertion" item.
 
-2. **`stage_sign::re_sign_after_mac_recovery(...)` extracted helper**
-   - Pulled from existing `stage_sign::run` Pattern A logic.  Same scope as W6 sign, BUT:
-     - NO Z allocation (already done on attempt #1).
-     - NO `Prepared → Signed` CAS (we are already in `ErrorRetryable`).
-     - Inputs: typed payload + lnd + doc_type + new previous_hash (caller passes the recovered hash from MR-NO-TX step).
-     - Output: `(canonical_unsigned_xml: Vec<u8>, unsigned_xml_sha256: [u8; 32], signed_xml_cms: Vec<u8>)`.
-   - Pure no-tx (per Q2 finalised, W3 invariant holds).
-   - Caller (orchestrator) feeds the output into MR-PERSIST.
+###### Step 2b — `stage_sign::re_sign_after_mac_recovery` extracted helper (NEXT)
 
-3. **`mac_recovery.rs` module** (~280 LoC, lives at `services/write_path/mac_recovery.rs`):
-   - `regex_extract_store_hash(message: &str) → Option<[u8; 32]>` (pure-fn, regex `r"store ([0-9a-fA-F]{64})"`; mirrors Python `dps_fiscal_server.py:494`).
-   - `MacRecoveryOutcome` enum: `Resigned`, `HashNotExtractable`, `CounterExhausted`.
-   - `run_mac_recovery(pool, crypto, session, profile, doc, hint) → Result<MacRecoveryOutcome, StageSendError>` orchestrator: regex extract → MR-CLAIM `with_immediate` → MR-NO-TX (read inputs + re-sign) → MR-PERSIST `with_immediate` (atomic four-write per HIGH 2).
-   - `persist_resigned_tx(tx, doc, new_previous_hash, new_unsigned_xml_sha256, new_payload_xml, new_signed_xml)` — orchestrator-local helper (LOW 1 close — crosses repo boundary, lives in `mac_recovery.rs` not `fiscal_documents.rs`).
-   - Audit: emits `MAC_RECOVERY_HASH_NOT_EXTRACTABLE` / `MAC_RECOVERY_RESIGNED` / (caller emits `MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH` on second `-12`) per freeze §3.4 closed enum.
-   - Targeted lib tests:
-     - `regex_extract_store_hash` happy + malformed message + non-hex chars + wrong-length hex.
-     - `MacRecoveryOutcome` dispatch table (3 variants).
+**Scope:**
+- Extract from existing `stage_sign::run` Pattern A logic.  Same canonical-XML build + sign as W6, BUT:
+  - NO Z allocation (already done on attempt #1; the doc has its `lnd` / Z number stable).
+  - NO `Prepared → Signed` CAS (the doc is already in `ErrorRetryable` post-attempt-#1 4-b).
+  - Inputs: typed payload (re-read from `payload_json` column) + `lnd` + `doc_type` + `new_previous_hash: [u8; 32]` (caller passes the recovered hash from MR-NO-TX regex).
+  - Output: `(canonical_unsigned_xml: Vec<u8>, unsigned_xml_sha256: [u8; 32], signed_xml_cms: Vec<u8>)`.
+- Pure no-tx (per Q2 finalised in §3 finalised questions; W3 invariant holds).  Caller (orchestrator) feeds the output into MR-PERSIST.
+- Targeted lib tests: deterministic build (same input → same output), `previous_hash` propagation (different `new_previous_hash` → different `unsigned_xml_sha256`).
 
-4. **`stage_send::run` integration** (~50 LoC):
-   - After 4-b commit returns and `wire_decision == WireDecision::Routed(d) && d.retry_class == MacRecovery && !mac_recovery_invoked`, invoke `mac_recovery::run_mac_recovery` BEFORE returning to the caller.
-   - Local `mac_recovery_invoked: bool` flag in `run()` scope tracks budget use within a single invocation.
-   - Outcome routing:
-     - `Resigned` → set flag = true, re-enter the standard 4-pre/4a/4b cycle in a loop (the 4-pre source-state allowlist already accepts `ErrorRetryable → Sending` per §4.2).
-     - `HashNotExtractable` → override `wire_decision` to `RoutingDecision { target_state=Rejected, retry_class=TerminalReject, audit_event=MacRecoveryHashNotExtractable, ... }`.  CAS `ErrorRetryable → Rejected` in a follow-up `with_immediate` envelope.  Audit + trace 2 closure.
-     - `CounterExhausted` (second `-12` on attempt #2) → similar override but audit `MacRecoveryFailedRepeatHashMismatch`.
-   - Loop bound: at most ONE re-entry per `run()` invocation (the flag prevents infinite looping).  Crash recovery semantics per §4.4.3 step list paragraph "Note on ordering and crash recovery".
+###### Step 2c — `mac_recovery.rs` orchestrator (after 2b)
 
-5. **W3 scanner**: `mac_recovery::run_mac_recovery` lives at module top level; `MR-NO-TX` (re-sign) executes BETWEEN two `with_immediate` envelopes (MR-CLAIM and MR-PERSIST), exactly the same shape stage 3 / stage 4-pre+4-b uses.  W3 static scan must stay green.
+**Scope:**
+- `regex_extract_store_hash(message: &str) → Option<[u8; 32]>` (pure-fn, regex `r"store ([0-9a-fA-F]{64})"`; mirrors Python `dps_fiscal_server.py:494`).
+- `MacRecoveryOutcome` enum: `Resigned`, `HashNotExtractable`, `CounterExhausted`.
+- `run_mac_recovery(pool, crypto, session, profile, doc, hint) → Result<MacRecoveryOutcome, StageSendError>` orchestrator: regex extract → MR-CLAIM `with_immediate` → MR-NO-TX (read inputs + re-sign via 2b helper) → MR-PERSIST `with_immediate` (atomic four-write per HIGH 2).
+- `persist_resigned_tx(tx, doc, new_previous_hash, new_unsigned_xml_sha256, new_payload_xml, new_signed_xml)` — orchestrator-local helper (LOW 1 close — crosses repo boundary, lives in `mac_recovery.rs` not `fiscal_documents.rs`).
+- **Pre-PERSIST assertion (R-W10.4-step2a-review LOW 3 close):** before MR-PERSIST opens its `with_immediate` envelope, the orchestrator reads existing PAYLOAD_XML + SIGNED_XML rows via `document_files::get_tx`; if either is `None`, surface a typed `StageSendError::SignedArtifactMissing`-equivalent error (W6 stage-3 invariant breach).  `replace_tx`'s permissive INSERT-on-missing semantic does NOT silently mask the breach.
+- Audit: emits `MAC_RECOVERY_HASH_NOT_EXTRACTABLE` / `MAC_RECOVERY_RESIGNED` per freeze §3.4 closed enum.  (Caller — `stage_send::run` in step 2d — emits `MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH` on second `-12`.)
+- Targeted lib tests:
+  - `regex_extract_store_hash` happy + malformed message + non-hex chars + wrong-length hex.
+  - `MacRecoveryOutcome` dispatch table (3 variants).
+  - Pre-PERSIST assertion: missing PAYLOAD_XML / SIGNED_XML surfaces typed error before `replace_tx` is ever invoked.
 
-**Verify after step 2 (BEFORE merge to main):**
-- `cargo test -p prro --test document_files_replace` (NEW) → expect 3 fixtures.
+###### Step 2d — `stage_send::run` integration (after 2c)
+
+**Scope:**
+- After 4-b commit returns and `wire_decision == WireDecision::Routed(d) && d.retry_class == MacRecovery && !mac_recovery_invoked`, invoke `mac_recovery::run_mac_recovery` BEFORE returning to the caller.
+- Local `mac_recovery_invoked: bool` flag in `run()` scope tracks budget use within a single invocation.
+- Outcome routing:
+  - `Resigned` → set flag = true, re-enter the standard 4-pre/4a/4b cycle in a loop (the 4-pre source-state allowlist already accepts `ErrorRetryable → Sending` per §4.2).
+  - `HashNotExtractable` → override `wire_decision` to `RoutingDecision { target_state=Rejected, retry_class=TerminalReject, audit_event=MacRecoveryHashNotExtractable, ... }`.  CAS `ErrorRetryable → Rejected` in a follow-up `with_immediate` envelope.  Audit + trace 2 closure.
+  - `CounterExhausted` (second `-12` on attempt #2) → similar override but audit `MacRecoveryFailedRepeatHashMismatch`.
+- Loop bound: at most ONE re-entry per `run()` invocation (the flag prevents infinite looping).  Crash recovery semantics per §4.4.3 step list paragraph "Note on ordering and crash recovery".
+- **W3 scanner**: `mac_recovery::run_mac_recovery` lives at module top level; `MR-NO-TX` (re-sign) executes BETWEEN two `with_immediate` envelopes (MR-CLAIM and MR-PERSIST), exactly the same shape stage 3 / stage 4-pre+4-b uses.  W3 static scan must stay green.
+
+**Verify after step 2d (BEFORE merge to main):**
+- `cargo test -p prro --test document_files_replace` → 5 fixtures (LANDED in 2a).
 - `cargo test -p prro --test write_path_stage4_send` → still 16 (step 2 leaves existing fixtures unchanged; W10.5 adds the MAC-recovery fixtures).
-- `cargo test -p prro --lib` (full) → +N tests for `regex_extract_store_hash` + `MacRecoveryOutcome` dispatch.
+- `cargo test -p prro --lib` (full) → +N tests for `regex_extract_store_hash` + `MacRecoveryOutcome` dispatch + 2b deterministic-build pin.
 - `cargo test -p prro --test with_immediate_no_foreign_io` → still 8 (W3 scanner green; orchestrator IO is OUTSIDE any `with_immediate`).
 - `cargo clippy -p prro --tests --no-deps -- -D warnings` → clean.
 
 **Acceptance criteria:**
 - All four MR-PERSIST writes commit atomically OR all roll back (HIGH 2 close).
 - Counter claim happens in a separate `with_immediate` BEFORE re-sign starts (HIGH 2 close — counter is the budget gate, not the persist gate).
+- Pre-PERSIST assertion catches missing PAYLOAD_XML / SIGNED_XML before `replace_tx` is invoked (R-W10.4-step2a LOW 3 close).
 - `mac_recovery_invoked` flag prevents the orchestrator from being invoked twice in the same `run()` call (loop-bound proof).
 - No foreign IO inside `with_immediate` envelopes.
 
