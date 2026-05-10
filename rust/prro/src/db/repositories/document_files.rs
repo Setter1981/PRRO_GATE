@@ -78,3 +78,43 @@ pub async fn get_tx(
             .await?;
     Ok(row)
 }
+
+/// W10.4 step 2 — atomic in-place replacement of an artifact row.
+///
+/// Used by the MAC-recovery orchestrator (`mac_recovery.rs`) inside
+/// the MR-PERSIST `with_immediate` envelope to swap PAYLOAD_XML and
+/// SIGNED_XML after re-signing with a recovered `previous_hash`.
+/// `INSERT OR REPLACE` is the SQLite idiom: the new row replaces any
+/// existing `(document_id, kind)` row in a single statement, atomic
+/// by definition.
+///
+/// **Why not DELETE+INSERT.**  Two statements would commit only if
+/// both succeed (the wrapping `with_immediate` provides atomicity),
+/// but `INSERT OR REPLACE` is a single statement, single B-tree
+/// touch, and matches SQLite's documented "upsert by PK collision"
+/// idiom.  No CHECK / UNIQUE / FK constraints on `document_files`
+/// beyond the PK + FK to `fiscal_documents`, so PK collision is the
+/// only concern — exactly what `OR REPLACE` handles.
+///
+/// **Forensic note.**  Replacing artifacts intentionally drops the
+/// pre-recovery bytes.  The `MAC_RECOVERY_RESIGNED` audit row carries
+/// `(old_previous_hash_hex, new_previous_hash_hex, new_unsigned_xml_sha256_hex)`
+/// for chain-level forensics; raw pre-recovery XML is NOT preserved.
+/// Operators wanting raw byte history of attempt #1 need a separate
+/// archive layer (out of M3a scope).
+pub async fn replace_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+    kind: DocumentFileKind,
+    content: &[u8],
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT OR REPLACE INTO document_files (document_id, kind, content) VALUES (?, ?, ?)",
+    )
+    .bind(doc_id)
+    .bind(kind)
+    .bind(content)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
