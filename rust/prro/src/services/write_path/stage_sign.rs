@@ -443,6 +443,131 @@ pub async fn run(
     })
 }
 
+// ─── W10.4 step 2b — MAC recovery re-sign ─────────────────────────────
+
+/// Output of [`re_sign_after_mac_recovery`].  Mirrors the relevant
+/// slice of [`SigningOutcome`] but without the document row + with
+/// the new SHA fixed by the input `new_previous_hash`.
+#[derive(Debug, Clone)]
+pub struct ReSignedArtifacts {
+    /// Canonical unsigned XML rebuilt with the recovered
+    /// `previous_hash` substituted into the header.
+    pub unsigned_xml: Vec<u8>,
+    /// SHA-256 of `unsigned_xml`.  Caller (`mac_recovery::orchestrate`)
+    /// writes this into `fiscal_documents.unsigned_xml_sha256` inside
+    /// the MR-PERSIST `with_immediate` envelope.
+    pub unsigned_xml_sha256: [u8; 32],
+    /// CMS detached signature produced by the configured provider over
+    /// `unsigned_xml`.  Caller writes it into `document_files.SIGNED_XML`
+    /// via `document_files::replace_tx`.
+    pub signed_xml_cms: SignedCmsBytes,
+}
+
+/// Pure no-tx canonical-XML rebuild + CMS sign for the MAC recovery
+/// path.  Mirrors the W6 stage 3-NO-TX block (`stage_sign::run` lines
+/// 311-362) **but** with three deliberate omissions:
+///
+///   - **NO Z allocation.**  The doc already has its `lnd` / Z number
+///     fixed at attempt #1; recovery only swaps `previous_hash` in the
+///     header.  Caller passes `z_report_number` from the doc row.
+///
+///   - **NO `Prepared → Signed` CAS.**  The doc is in `ErrorRetryable`
+///     post-attempt-#1 4-b; the orchestrator's MR-PERSIST envelope
+///     wraps its own writes (counter claim, `previous_hash` UPDATE,
+///     PAYLOAD_XML / SIGNED_XML replace, audit) atomically.  This
+///     helper only produces the artifacts; persistence is the
+///     caller's responsibility.
+///
+///   - **NO db read.**  Caller (orchestrator MR-NO-TX step) passes
+///     all inputs that previously came from `fiscal_documents` /
+///     `fiscal_number_config` / `node_state` — the function is
+///     genuinely pure-CPU + crypto.
+///
+/// **W3 invariant.**  No `with_immediate` wrap; no DB writes; no IO
+/// besides the crypto provider call (which itself runs outside any
+/// tx in `stage_sign::run` and continues to do so here).  The
+/// `production_src_has_no_foreign_io_inside_with_immediate` scanner
+/// test continues to pass.
+///
+/// **Error surface.**  All `SignError` variants reachable by stage
+/// 3-NO-TX are reachable here too: payload schema mismatch, Kyiv
+/// timestamp parse failure, lnd / Z numeric range, canonical XML
+/// build failure, crypto provider failure.  `Db` / `Internal` /
+/// CAS / state variants are NOT reachable because this fn does no
+/// DB I/O.
+///
+/// **Argument count.**  10 args is intentional — every input is a
+/// distinct per-call value the orchestrator pulls from a different
+/// row / column.  Wrapping into an `ReSignInputs` struct adds one
+/// indirection without reducing the actual surface area.  Clippy
+/// `too_many_arguments` lint suppressed at the function level.
+#[allow(clippy::too_many_arguments)]
+pub async fn re_sign_after_mac_recovery(
+    ctx: &SigningContext,
+    wire_artifact_kind: WireArtifactKind,
+    fn_id: &str,
+    tax_number: &str,
+    business_ts: &str,
+    payload_json: &str,
+    total_sum_kop: Option<i64>,
+    lnd: i64,
+    z_report_number: Option<i64>,
+    new_previous_hash: [u8; 32],
+) -> Result<ReSignedArtifacts, SignError> {
+    let ts_str = format_kyiv_local(business_ts)?;
+    let typed_payload = parse_payload(wire_artifact_kind, payload_json, total_sum_kop)?;
+
+    let local_number_u32: u32 = u32::try_from(lnd).map_err(|_| SignError::Range {
+        field: "lnd",
+        value: lnd,
+    })?;
+    let z_number_u32: u32 = match z_report_number {
+        Some(z) => u32::try_from(z).map_err(|_| SignError::Range {
+            field: "z_report_number",
+            value: z,
+        })?,
+        // Python parity (mirrors stage 3-NO-TX): `<DAT ZN="0">` for
+        // non-Z artifacts.  MAC recovery on a Z_REPORT keeps the
+        // already-allocated Z number; on SELL/RETURN/SHIFT_OPEN this
+        // is 0.
+        None => 0,
+    };
+
+    let header = DocumentHeader::with_defaults(
+        fn_id.to_string(),
+        tax_number.to_string(),
+        z_number_u32,
+        ts_str,
+        hex_encode(&new_previous_hash),
+    );
+
+    let canonical_doc =
+        build_canonical_doc(wire_artifact_kind, header, local_number_u32, typed_payload);
+    let unsigned_xml: Vec<u8> = build_canonical_xml(&canonical_doc)?;
+
+    let unsigned_xml_sha256: [u8; 32] = {
+        let digest = Sha256::digest(&unsigned_xml);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(digest.as_slice());
+        out
+    };
+
+    let signed_xml_cms = ctx
+        .provider
+        .sign_cms_detached(SignCmsRequest {
+            session: &ctx.session,
+            canonical_xml: &unsigned_xml,
+            profile: ctx.profile,
+        })
+        .await?;
+
+    Ok(ReSignedArtifacts {
+        unsigned_xml,
+        unsigned_xml_sha256,
+        signed_xml_cms,
+    })
+}
+
 // ─── Private helpers ──────────────────────────────────────────────────
 
 #[derive(Debug)]
