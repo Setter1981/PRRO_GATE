@@ -384,3 +384,79 @@ fn whitelist_kvt2_ack_regression_guard() {
 
 ### F5-bis-W8.3 (closed in §6 above) — multi-doc Kvt2 lnd-monotonic constraint for W9
 Documented in §6 "Out of scope" under the App::boot recovery line.  Subtle correctness property: seed advance is last-writer-wins, so W9 boot reconciliation MUST iterate finalize in lnd ascending order if multiple Kvt2 docs are stuck for the same FN.  Under live single-writer this is automatic; on boot recovery it requires explicit sort.
+
+---
+
+## 13. W8 senior-review polish tracking (post-PR-#27 fixup)
+
+After the W8.4 fixtures landed and the PR #27 was opened, a follow-up senior-grade review surfaced **four correctness gaps** — two HIGH-severity (real bug-class hazards) and two MED-severity (verification gaps + tightening).  All four are closed in commit `3b19cd2 fix(prro/W8): close 4 senior-review findings (2 HIGH, 2 MED)`.  This section is the canonical record of what changed and why.
+
+### F1-W8 (HIGH, closed in `3b19cd2`) — caller-supplied `fn_id` / `request_id` data-corruption hazard
+
+**Pre-fix shape:** `stage_finalize::run(pool, doc, fn_id, request_id)` accepted two pieces of caller-supplied identity that DUPLICATED data already on the `fiscal_documents` row.  A wrong-FN dispatch would Ack one doc but advance another FN's `node_state.last_known_unsigned_xml_sha256`; a wrong `request_id` would mark another inbox row DONE.  The bug class was real: any future worker-dispatch refactor or a race that mismatched the identity tuple from the doc tuple would silently cross data between docs.
+
+**Fix:**
+- Both params dropped from the signature.  New shape: `pub async fn run(pool: &SqlitePool, doc: DocumentId)`.
+- `FinalizeInputs` gained `request_id: [u8; 16]`.
+- `fetch_finalize_inputs_tx` reads `request_id` from the doc row (with `request_id!: Vec<u8>` force-non-null annotation; schema 002 has `NOT NULL CHECK length=16`).
+- `node_state::update_last_known_xml_sha_tx` now uses `inputs.fiscal_number` (not a caller param).
+- `ingress_inbox::mark_done_tx` now uses `inputs.request_id` (not a caller param).
+- Source-of-truth contract documented on the `FinalizeInputs` struct AND the `run` doc.
+
+**Why no new fixture:** the bug class is now structurally impossible (signature has nowhere for a wrong identity to enter).
+
+### F2-W8 (HIGH, closed in `3b19cd2`) — no MAC-chain continuity guard before seed advance
+
+**Pre-fix shape:** finalize blindly UPDATEd `node_state.last_known_unsigned_xml_sha256` with `inputs.unsigned_xml_sha256`.  `inputs.previous_hash` was read but only used for the audit payload.  Out-of-order finalize (e.g. W9 boot recovery iterating Kvt2 docs in wrong lnd order) would silently corrupt the next-doc MAC chain seed.  Under live single-writer this is automatic; on boot recovery it required the W9 author to remember the lnd-monotonic constraint (§6) — a runtime invariant on the caller, not enforced by the data model.
+
+**Fix:**
+- New `StageFinalizeError::ChainSeedMismatch { document_id, expected: Option<[u8; 32]>, actual: Option<[u8; 32]> }` typed variant.
+- New step inside the finalize closure (between fetch_finalize_inputs and seed UPDATE): read current `node_state.last_known_unsigned_xml_sha256` via the existing `node_state::get_tx` (inside the same `with_immediate` envelope), assert equality with `inputs.previous_hash`.  `None == None` is the legitimate genesis case.  Any other inequality returns the typed error → full envelope rollback via `?`-propagation.
+
+**Fixtures (4):**
+- `chain_seed_mismatch_some_neq_some_typed_error_full_rollback` — Some(a) vs Some(b) where a ≠ b.  Asserts typed error AND that all five would-be writes (state, seed, inbox, outbox, audit, KVT2_RAW) survived rollback unchanged.
+- `chain_seed_mismatch_none_vs_some_typed_error_full_rollback` — FN seed = None (genesis), doc claims to extend a chain.
+- `chain_seed_mismatch_some_vs_none_typed_error_full_rollback` — FN seed = Some(...), doc claims genesis.
+- `chain_seed_genesis_none_to_none_succeeds` — positive control proving the genesis case isn't accidentally rejected.
+
+### F3-W8 (MED, closed in `3b19cd2`) — R2 invariant ("KVT raw bytes never lost") not asserted in tests
+
+**Pre-fix shape:** code never touched `document_files` (verified in §5 invariants), but W8.4 fixtures didn't seed `KVT1_RAW` / `KVT2_RAW` rows or assert their post-finalize preservation.  R2 was a verbal claim; the tests didn't witness it.
+
+**Fix:**
+- `seed_doc` test helper extended to insert `KVT1_RAW` for `KVT1+/KVT2/ACK` states and `KVT2_RAW` for `KVT2/ACK` states.
+- New `read_doc_file(pool, doc, kind)` test helper.
+- Fixture 1 (`kvt2_to_ack_happy_path`) now asserts `KVT1_RAW` and `KVT2_RAW` survive Ack unchanged.
+- `chain_seed_mismatch_some_neq_some_typed_error_full_rollback` asserts `KVT2_RAW` survives the rollback path unchanged.
+
+**Result:** R2 is now witnessed both for the happy commit path and a negative rollback path.
+
+### F4-W8 (MED, closed in `3b19cd2`) — `mark_done_tx` blind UPDATE without source-state guard
+
+**Pre-fix shape:** `UPDATE ingress_inbox SET status='DONE', processed_at=CURRENT_TIMESTAMP WHERE request_id = ?`.  No `AND status = 'PROCESSING'` guard.  In conjunction with F1-W8 (caller-bug-induced wrong `request_id`), the helper could silently rewrite a terminal `DONE` / `REJECTED` / `ERROR` row's status and `processed_at`.  W8.2 even had a fixture (`mark_done_idempotent_via_repeat_returns_true_each_time`) that pinned this permissive shape as INTENDED behaviour.
+
+**Fix:**
+- SQL clause now `WHERE request_id = ? AND status = 'PROCESSING'`.
+- W8.2 idempotency fixture **replaced** with two new guard fixtures:
+  - `mark_done_status_guard_rejects_already_done_row` — first call returns `true` (PROCESSING → DONE), second call returns `false` (status guard rejects).
+  - `mark_done_status_guard_rejects_rejected_row` — REJECTED-source row stays REJECTED; cannot be flipped to DONE.
+- Live worker flow unaffected: upstream CAS `Kvt2 → Ack` short-circuits rerun-on-Ack to `AlreadyAcked` BEFORE this helper is reached, so the live path never hits the guard.
+
+### Verification (post-fixup, commit `3b19cd2` + this docs commit)
+
+- `cargo test -p prro` → **295/295 passed (35 suites)**, was 290 pre-fix; +5 fixtures (3 ChainSeedMismatch + 1 genesis positive control + 1 mark_done REJECTED guard; the W8.2 idempotency fixture was *replaced* by the two new mark_done guards).
+- `cargo test -p prro --test write_path_stage5_finalize` → **16/16** (12 originals + 4 new chain fixtures).
+- `cargo test -p prro --test finalize_helpers` → **10/10** (W8.2 had 9; +2 new − 1 replaced = 10).
+- `cargo fmt -p prro --check` → clean.
+- `cargo clippy -p prro --tests --no-deps` → 0 prro warnings.
+- `.sqlx/` cache regenerated for the extended `FinalizeInputs` query (request_id added; old cache JSON deleted, new file added; verified at commit 3b19cd2).
+
+### Invariants strengthened
+
+- **Invariant 4 (idempotency)** now has **five layers** of defence:
+  1. CAS `Kvt2 → Ack` short-circuit (rerun-on-Ack returns `AlreadyAcked` without side effects).
+  2. **Chain-continuity guard** (F2-W8 close) — out-of-order finalize is structurally rejected.
+  3. **`mark_done_tx` source-state guard** (F4-W8 close) — wrong `request_id` cannot rewrite a terminal inbox row.
+  4. Outbox PRIMARY KEY `(document_id)` — duplicate finalize fails loudly via UNIQUE violation.
+  5. Audit `STAGE_FINALIZE_ACK` appends iff CAS Applied — never on AlreadyAcked / StateConflict / DocumentMissing / any post-CAS rollback path.
+- **Invariant 8 (recovery without violating transitions)** strengthened: chain pointer cannot leak past a failed Ack EVEN if the caller passes a wrong identity tuple (F1-W8 close makes that impossible) AND EVEN if W9 boot recovery iterates docs in wrong lnd order (F2-W8 chain-continuity guard catches it).
