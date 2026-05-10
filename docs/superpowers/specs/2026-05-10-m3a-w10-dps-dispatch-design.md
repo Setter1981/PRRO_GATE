@@ -151,7 +151,8 @@ pub enum RetryClass {
 /// extending this enum AND a fixture asserting it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditEvent {
-    StageSendResult,                        // happy + transient retry
+    StageSendResult,                        // happy commit ONLY (OK arm); routing fn never emits this
+    StageSendTransientRetry,                // R-W10-F4: Transport / Server-3 (split from StageSendResult)
     StageSendRejected,                      // terminal reject (-1, -2, -5..-10, -15 non-shift, -16, -12 fallback)
     StageSendFnNotRegistered,               // -13 / -14
     StageSendWrapperBug,                    // Internal / NotFound (live) / QueryNotSupported (live)
@@ -160,15 +161,24 @@ pub enum AuditEvent {
     StageSendProbeRequired,                 // -2/-15 close-shift; probe required
     StageSendNodeBlocked,                   // -11; node_state.mode → BLOCKED
     StageSendOperatorEscalation,            // -6
+    StageSendMacHashMismatch,               // R-W10-F4: -12 first attempt (split from StageSendResult)
     MacRecoveryHashNotExtractable,          // -12 with malformed message
     MacRecoveryResigned,                    // -12 successful re-pin + re-sign
     MacRecoveryFailedRepeatHashMismatch,    // -12 → -12 second time
 }
 
+// **R-W10-F4 amendment 2026-05-10:** Earlier draft overloaded
+// `StageSendResult` for happy + transient retry + MAC first attempt.
+// W10.1 review found this collapses three semantically-distinct
+// events into one wire string and degrades log discoverability;
+// `StageSendTransientRetry` and `StageSendMacHashMismatch` were
+// added so each retry-class has a distinct grep pattern.
+
 impl AuditEvent {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::StageSendResult => "STAGE_SEND_RESULT",
+            Self::StageSendTransientRetry => "STAGE_SEND_TRANSIENT_RETRY",
             Self::StageSendRejected => "STAGE_SEND_REJECTED",
             Self::StageSendFnNotRegistered => "STAGE_SEND_FN_NOT_REGISTERED",
             Self::StageSendWrapperBug => "STAGE_SEND_WRAPPER_BUG",
@@ -177,6 +187,7 @@ impl AuditEvent {
             Self::StageSendProbeRequired => "STAGE_SEND_PROBE_REQUIRED",
             Self::StageSendNodeBlocked => "STAGE_SEND_NODE_BLOCKED",
             Self::StageSendOperatorEscalation => "STAGE_SEND_OPERATOR_ESCALATION",
+            Self::StageSendMacHashMismatch => "STAGE_SEND_MAC_HASH_MISMATCH",
             Self::MacRecoveryHashNotExtractable => "MAC_RECOVERY_HASH_NOT_EXTRACTABLE",
             Self::MacRecoveryResigned => "MAC_RECOVERY_RESIGNED",
             Self::MacRecoveryFailedRepeatHashMismatch => "MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH",

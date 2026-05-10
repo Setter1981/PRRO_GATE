@@ -331,6 +331,12 @@ pub fn route_dps_error(err: &DpsError, doc_type: DocType, is_live_send: bool) ->
 /// forward-compat with W9.  W10 body does NOT branch on it (FALSE
 /// branch RESERVED per freeze §3.5); W9 will introduce reconciliation-
 /// side overrides without forcing a signature change.
+///
+/// **W9 follow-up:** drop the underscore prefix on `_is_live_send`
+/// when the FALSE branch lands; F2 pin test
+/// (`is_live_send_false_currently_mirrors_true_w10_reserves_for_w9`)
+/// will fail when divergence is introduced and must be UPDATED, not
+/// deleted, to encode the new W9 contract.
 fn route_server_code(
     code: i32,
     message: &str,
@@ -339,20 +345,17 @@ fn route_server_code(
 ) -> RoutingDecision {
     match code {
         -2 => {
-            // ERROR_CHECK.  W0-3 §2.1 row -2: terminal-business by
-            // default; close-shift exception → ProbeRequired.
-            //
-            // F3 close (W10.1 review): drop the
-            // `message.contains("open shift")` substring check.
-            // DPS server message format is not a stable contract;
-            // routing on substring leaves the door open to silently
+            // ERROR_CHECK.  W0-3 §2.1 row -2 (post-R-W10-F3 amendment):
+            // terminal-business by default; close-shift exception →
+            // ProbeRequired.  The original draft had a substring gate
+            // on `error_message` indicating "open shift" — DROPPED
+            // because DPS message text is not a stable contract;
+            // routing on substring left the door open to silently
             // mis-classifying close-shift races as terminal Rejects
-            // if DPS rewords the message.  ALL `-2` for close-shift
-            // doc_types route to ProbeRequired; the W9 `last_chk`
-            // probe reveals the truth on its own.  The `_message`
-            // parameter is preserved on the signature for forensic
-            // audit-payload composition by the caller.
-            let _ = message;
+            // if DPS rewords the message.  The W9 `last_chk` probe
+            // is the durable source-of-truth.  `message` is consumed
+            // by the `-12` arm below for MAC recovery hint extraction;
+            // here we intentionally do not branch on it.
             if is_close_shift(doc_type) {
                 RoutingDecision {
                     target_state: DocState::ErrorRetryable,
