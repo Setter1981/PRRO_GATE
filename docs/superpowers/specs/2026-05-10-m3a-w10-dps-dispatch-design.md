@@ -1,7 +1,7 @@
 # M3a W10 — DpsError Routing Dispatch (full 8-variant + 12-status-code table) — Design Freeze
 
 **Date:** 2026-05-10
-**Status:** v3 — second-round 6 findings closed (3 HIGH + 2 MED + 1 LOW); ready for W10.1 apply
+**Status:** v3.1 — third-round 3 doc-drift findings closed (1 MED + 2 LOW/MED); ready for W10.1 apply
 **Anchors:** ADR-M3-A6 (full retry policy table), ADR-M3-A9 step 5-6 (Pattern B retry path), W0-3 §2 main + §2.1 sub-table + §9.2 acceptance, M3a plan Task 9
 **Predecessor:** W8 (PR #27 + #28, merged `1d29315`) — stage 5 finalize
 **Successor:** W9 (App::boot reconciliation; consumes W10's routing in non-live context), W11 (deterministic-replay gate)
@@ -14,7 +14,7 @@ W10 lands the **complete `DpsError` → `DocState` routing contract** that W7 st
 
 **Three concrete deliverables:**
 1. **Pure-fn routing module** `services/write_path/error_routing.rs` — `route_dps_error(err, doc_type, is_live_send) → RoutingDecision`.  No DB, no I/O.
-2. **Stage 4 wire-in** — `stage_send.rs` replaces minimal `classify_send_outcome` with the new routing call; existing `SendOutcome` enum extended to carry the routing decision shape.
+2. **Stage 4 wire-in** — `stage_send.rs` replaces W7-minimal `classify_send_outcome` with `route_send_result(...)`.  W7's `SendOutcome` enum is **dropped wholesale**; W10 only exposes `WireDecision::{Sent, Routed(RoutingDecision)}` (see §3).  No facade or compat shim — W7.5 fixtures asserting the old enum shape are updated as part of W10.2.
 3. **MAC recovery -12 in-stage path** — regex-extract `store {64hex}`, one bounded re-derive + re-sign + re-send via Pattern B (per ADR-M3-A6 §2.1 row -12).
 
 **Two side effects W10 must wire:**
@@ -314,12 +314,16 @@ attempt #1 — original signed payload
   classify        : RoutingDecision { target_state=ErrorRetryable, retry_class=MacRecovery, mac_recovery_hint=Some(_) }
   4b tx           : CAS Sending→ErrorRetryable; trace[1].complete(outcome=RETRYABLE_MAC_HASH_MISMATCH); audit StageSendMacHashMismatch
 
-  ↓ stage_send::run sees mac_recovery_hint AND attempts==0; invokes orchestrator BEFORE returning to caller.
+  ↓ stage_send::run sees `decision.mac_recovery_hint == Some(_)`; invokes orchestrator
+    BEFORE returning to caller.  The routing fn is pure (no DB) and CANNOT see
+    `mac_recovery_attempts` — counter knowledge lives entirely in the orchestrator
+    and stage_send loop bookkeeping.
 
 mac_recovery_orchestrator()
   MR-CLAIM tx     : claim counter atomically: state==ErrorRetryable AND attempts==0
                     → SET attempts=1.  No previous_hash write yet (HIGH 2 close).
-                    On rows_affected==0: counter already burnt OR wrong state → return Outcome::CounterExhausted.
+                    On rows_affected==0: counter already burnt OR wrong state →
+                    return Outcome::CounterExhausted.
   MR-NO-TX        : regex_extract_store_hash(error_message) → Option<[u8; 32]>.
                     On None: return Outcome::HashNotExtractable.
                     Build canonical XML using extracted_hash as previous_hash;
@@ -329,17 +333,32 @@ mac_recovery_orchestrator()
                     (HIGH 2 close): previous_hash, unsigned_xml_sha256, document_files{PAYLOAD_XML},
                     document_files{SIGNED_XML}.  Audit MacRecoveryResigned.
 
-  ↓ orchestrator returns Outcome::Resigned; stage_send::run re-enters the standard 4-pre/4a/4b cycle.
+  ↓ orchestrator returns Outcome::Resigned; stage_send::run sets local flag
+    `mac_recovery_invoked = true` and re-enters the standard 4-pre/4a/4b cycle.
 
 attempt #2 — re-signed payload
   4-pre tx        : source_state = ErrorRetryable; CAS ErrorRetryable→Sending (per HIGH 3 §4.2);
                     trace[2] alloc; submission_attempted_at; audit STAGE_SEND_INTENT_MARKED.
   4a (no-tx)      : send_chk(envelope_v2) → outcome.
-  classify        : if again Err(Server{-12}) → RoutingDecision { TerminalReject, audit_event = MacRecoveryFailedRepeatHashMismatch }
-                    (DDL CHECK already prevents claim-counter from going past 1; routing fn just uses the existing
-                    state machine — no second orchestrator entry).
-                    Otherwise: standard RoutingDecision per §3.
-  4b tx           : CAS Sending→target_state; trace[2].complete; audit decision.audit_event.
+  classify        : routing fn is pure — it produces the SAME `RoutingDecision`
+                    for any -12 (target=ErrorRetryable, retry_class=MacRecovery,
+                    mac_recovery_hint=Some(_)).  It has no notion of "first vs
+                    second time".
+  4b tx           : stage_send::run inspects `mac_recovery_invoked`:
+                    - if true (we already used the budget this run) → OVERRIDE the
+                      routing decision: CAS Sending→Rejected; trace[2].complete with
+                      `RETRYABLE_MAC_HASH_MISMATCH`-class outcome; audit
+                      `MacRecoveryFailedRepeatHashMismatch`.  Do NOT invoke the
+                      orchestrator again.
+                    - if false (this is a fresh run after a crash, doc could be in
+                      ErrorRetryable with attempts already 1) → invoke orchestrator;
+                      MR-CLAIM returns rows_affected==0 → Outcome::CounterExhausted →
+                      stage_send::run downgrades to the same TerminalReject path
+                      (Sending→Rejected + audit MacRecoveryFailedRepeatHashMismatch).
+
+                    For non-(-12) outcomes on attempt #2: standard
+                    CAS Sending→decision.target_state; trace[2].complete; audit
+                    decision.audit_event.
 ```
 
 Two `transport_trace` rows materialise: `attempt_no=1` (outcome=RETRYABLE_MAC_HASH_MISMATCH) and `attempt_no=2` (outcome per fresh classify).  Forensic visibility: operator can replay the chain "first envelope rejected with hash X, recovery rebuilt with hash Y, second envelope <result>".  The `transport_trace` PRIMARY KEY `(document_id, attempt_no)` already enforces uniqueness.
@@ -451,7 +470,16 @@ Steps:
 4. **MR-PERSIST (with_immediate #2):** `persist_resigned(...)` — atomic four-write per HIGH 2.  Audit `MacRecoveryResigned` with payload `{old_previous_hash_hex, new_previous_hash_hex, new_unsigned_xml_sha256_hex}` for forensic correlation.
 5. Return `Outcome::Resigned`.  Caller (`stage_send::run`) re-enters the standard 4-pre/4a/4b loop; the existing source-state CAS dispatch (per §4.2) accepts `ErrorRetryable` and proceeds with attempt #2.
 
-**Note on ordering:** `attempts` counter is claimed in step 2 BEFORE the artifacts are rewritten in step 4.  Crash between 2 and 4: doc state stays `ErrorRetryable`, `attempts=1`, OLD artifacts.  Worker re-enters, routing fn sees `attempts==1` → TerminalReject + audit (the doc is unrecoverable since the budget is burnt).  Acceptable failure mode: a partial MR is forensically visible (audit log + attempts=1) and never silently progresses.
+**Note on ordering and crash recovery:** `attempts` counter is claimed in step 2 BEFORE the artifacts are rewritten in step 4.  Crash between 2 and 4: doc state stays `ErrorRetryable`, `attempts=1`, OLD artifacts.  Worker re-enters via the next tick:
+
+- **stage_send::run** is invoked again on the same doc (still in `ErrorRetryable` from a prior tick that triggered an Err on attempt #1).
+- 4-pre CAS `ErrorRetryable → Sending` succeeds (per §4.2 source-state dispatch).  attempt #N trace allocated.
+- `send_chk` runs against the OLD signed payload (PERSIST never completed).  Whatever DPS returns, classify produces a `RoutingDecision`.  If it's again `Server{-12}`, classify yields `Routed(MacRecovery)` again.
+- `mac_recovery_invoked` flag is FALSE (this is a fresh `run()` invocation; the flag is local).  So stage_send calls the orchestrator.
+- Orchestrator MR-CLAIM: `rows_affected==0` (state is `SENDING`, not `ErrorRetryable` — the 4-pre CAS just moved it; AND attempts is already 1 from the earlier crash).  Return `Outcome::CounterExhausted`.
+- stage_send::run downgrades to `TerminalReject + MacRecoveryFailedRepeatHashMismatch`.
+
+The `attempts=1 + OLD artifacts` partial state is forensically visible (audit log carries `MacRecoveryResigned` only on PERSIST commit; if absent, recovery never completed) and never silently progresses.  Routing fn never inspects the counter — that's stage_send + orchestrator territory (see Finding-1 close in §3 / sequence diagram).
 
 **LoC budget:** ~280 in `mac_recovery.rs` (orchestrator + persist + extract), ~15 in `fiscal_documents.rs` (claim counter + counter+previous_hash columns join), ~30 in `stage_sign.rs` (extracted re-sign), ~30 in `document_files.rs` (replace_tx), ~50 integration in `stage_send.rs`.  Migration 012 = ~10 LoC SQL (column + outcome_kind CHECK extension) + 1 schema fixture.
 
@@ -461,9 +489,9 @@ Steps:
   - 2 Authorization{DocumentReject, -1}
   - 3-4 Authorization{FiscalNumberNotRegistered, -13/-14}
   - 5 Decode (status=0) → ErrorRetryable + probe_hint=DecodeUnknown
-  - 6 NotFound (out-of-band; no state mutation)
+  - 6 NotFound on live send_chk → WrapperBug → CAS Sending → ErrorRetryable + CRITICAL audit `StageSendWrapperBug` (B2 close: live path never leaves doc durably in SENDING)
   - 7 ServerFiscalIdMismatch
-  - 8 QueryNotSupported (out-of-band; no state mutation)
+  - 8 QueryNotSupported on live send_chk → WrapperBug → CAS Sending → ErrorRetryable + CRITICAL audit `StageSendWrapperBug` (same B2 rationale as #6 — live path never leaves doc durably in SENDING)
   - 9 Internal
   - 10 Server{-2} non-shift → Rejected
   - 11 Server{-2} close-shift → ErrorRetryable + probe_hint=Code2CloseShift
@@ -578,6 +606,11 @@ Estimated total: **4 days** (matches plan Task 9 budget).
 - [x] B2 — `target_state` always `DocState`; NotFound/QueryNotSupported on live → ErrorRetryable+WrapperBug+CRITICAL.
 - [x] B3 — atomic multi-write at MR-PERSIST.
 - [x] B4 — `mac_recovery_*` helpers distinct from W6 pin.
+
+**v3.1 third-round closures:**
+- [x] **MED (repeat-12 attribution)** — repeat-12 detection now correctly attributed to stage_send + orchestrator boundary, NOT routing fn.  Routing fn is pure (no DB, no counter).  stage_send carries `mac_recovery_invoked` local flag; orchestrator's `MR-CLAIM` returns `Outcome::CounterExhausted` when budget already burnt.  Both paths converge on `TerminalReject + MacRecoveryFailedRepeatHashMismatch`.  See §4.4.1 sequence diagram + §4.4.3 ordering note.
+- [x] **LOW/MED (stale §1 SendOutcome phrase)** — §1 paragraph 2 rewritten: «W7's `SendOutcome` enum is dropped wholesale; W10 only exposes `WireDecision`».  No facade or compat shim.
+- [x] **LOW/MED (stale fixtures 6 + 8 "no state mutation")** — §4.5 fixture list updated: NotFound/QueryNotSupported on live send_chk → WrapperBug → CAS `Sending → ErrorRetryable` + CRITICAL audit `StageSendWrapperBug`.  Aligned with B2 close in §3 + §4.1.
 
 **v3 second-round closures:**
 - [x] **HIGH 1 (MAC recovery trace flow)** — explicit two-attempt sequence per §4.4.1; trace[1] closed with `RETRYABLE_MAC_HASH_MISMATCH` on 4-b commit of attempt #1; trace[2] allocated by 4-pre re-entry after MR-PERSIST.  Each wire call has its own forensic row.
