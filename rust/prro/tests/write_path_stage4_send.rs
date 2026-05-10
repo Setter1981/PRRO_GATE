@@ -33,9 +33,8 @@ use prro::db::models::enums::DocState;
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::fiscal_documents::allowed_transition;
 use prro::db::repositories::transport_trace;
-use prro::services::write_path::stage_send::{
-    self, RetryableReason, StageSendError, StageSendOutcome,
-};
+use prro::services::write_path::error_routing::RetryClass;
+use prro::services::write_path::stage_send::{self, StageSendError, StageSendOutcome};
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
 use prro::transports::dps::error::{AuthorizationKind, DpsError};
@@ -288,16 +287,19 @@ async fn terminal_reject_routes_to_rejected_no_server_fiscal_no() {
         .expect("rejected wire response is a successful stage_send outcome");
 
     match outcome {
-        StageSendOutcome::Rejected {
-            code,
-            message,
+        StageSendOutcome::Routed {
+            decision,
             attempt_no,
+            wire_status_code,
+            wire_error_message,
         } => {
-            assert_eq!(code, -1);
-            assert_eq!(message, "ERROR_VEREFY");
+            assert_eq!(decision.retry_class, RetryClass::TerminalReject);
+            assert_eq!(decision.target_state, DocState::Rejected);
+            assert_eq!(wire_status_code, Some(-1));
+            assert_eq!(wire_error_message.as_deref(), Some("ERROR_VEREFY"));
             assert_eq!(attempt_no, 1);
         }
-        other => panic!("expected Rejected, got {other:?}"),
+        other => panic!("expected Routed terminal-reject, got {other:?}"),
     }
     assert_eq!(stub.call_count(), 1);
 
@@ -331,14 +333,19 @@ async fn transport_retryable_routes_to_error_retryable_preserves_attempt_at() {
         .expect("transport error is a successful stage_send outcome");
 
     match outcome {
-        StageSendOutcome::Retryable {
-            reason: RetryableReason::Transport(msg),
+        StageSendOutcome::Routed {
+            decision,
             attempt_no,
+            wire_status_code,
+            wire_error_message,
         } => {
-            assert_eq!(msg, "TLS reset");
+            assert_eq!(decision.retry_class, RetryClass::TransientRetry);
+            assert_eq!(decision.target_state, DocState::ErrorRetryable);
+            assert_eq!(wire_status_code, None);
+            assert_eq!(wire_error_message.as_deref(), Some("TLS reset"));
             assert_eq!(attempt_no, 1);
         }
-        other => panic!("expected Retryable::Transport, got {other:?}"),
+        other => panic!("expected Routed transient-retry (Transport), got {other:?}"),
     }
     assert_eq!(stub.call_count(), 1);
 
@@ -479,20 +486,95 @@ async fn rerun_on_sent_state_conflict_short_circuits_with_zero_wire_calls() {
     );
 }
 
-// ─── Fixture 6 — whitelist regression for (Signed, Sending) ──────────
+// ─── Fixture 6 — whitelist regression for 4-pre source states ───────
 
 #[test]
-fn whitelist_signed_sending_regression_guard() {
-    // W7.4 F4 close: stage_send.rs 4-pre relies on `(Signed, Sending)`
-    // being whitelisted; a future migration that drops the entry would
+fn whitelist_4pre_source_states_regression_guard() {
+    // W7.4 F4 + W10.2 HIGH 3 §4.2 close: stage_send.rs 4-pre relies on
+    // both `(Signed, Sending)` and `(ErrorRetryable, Sending)` being
+    // whitelisted; a future migration that drops either entry would
     // make the `unreachable!` in the Forbidden arm fire in production.
     // This sub-millisecond test catches the regression at CI before it
     // ever ships.
     assert!(
         allowed_transition(DocState::Signed, DocState::Sending),
         "(Signed, Sending) MUST stay in the allowed_transition whitelist; \
-         stage_send::run depends on this for the 4-pre CAS"
+         stage_send::run depends on this for the 4-pre CAS (W7 happy path)"
     );
+    assert!(
+        allowed_transition(DocState::ErrorRetryable, DocState::Sending),
+        "(ErrorRetryable, Sending) MUST stay in the allowed_transition whitelist; \
+         stage_send::run depends on this for the 4-pre CAS (W10.2 retry path)"
+    );
+}
+
+// ─── Fixture 6b — Pattern B retry-path: ErrorRetryable → Sending ─────
+
+#[tokio::test]
+async fn retry_path_error_retryable_to_sending_drives_through_4_pre() {
+    // W10.2 HIGH 3 §4.2: a doc previously routed to ErrorRetryable
+    // (e.g. Transport timeout on attempt #1) MUST be picked up by
+    // stage_send::run on the next worker tick via the 4-pre CAS
+    // (ErrorRetryable, Sending).  This fixture seeds in
+    // `ERROR_RETRYABLE`, runs stage_send::run, and asserts:
+    //   - attempt_no == 1 (fresh trace row, allocator counts attempts
+    //     per-document irrespective of source state)
+    //   - the 4-pre CAS Applied (no StateConflict)
+    //   - wire send_chk WAS called
+    //   - 4-b CAS Sending → Sent committed
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_signed_doc_with_xml(&pool, 0xC1, "SELL", 1, "ERROR_RETRYABLE").await;
+    let stub = StubDpsChannel::new(Ok(ack("DPS-FN-RETRY-OK")));
+
+    let outcome = stage_send::run(&pool, &stub, doc)
+        .await
+        .expect("retry from ErrorRetryable must succeed");
+
+    match outcome {
+        StageSendOutcome::Sent {
+            server_fiscal_no,
+            attempt_no: _,
+        } => {
+            assert_eq!(server_fiscal_no, "DPS-FN-RETRY-OK");
+        }
+        other => panic!("expected Sent on retry-path, got {other:?}"),
+    }
+    assert_eq!(
+        stub.call_count(),
+        1,
+        "retry-path must invoke send_chk exactly once"
+    );
+    assert_eq!(read_doc_state(&pool, doc).await, "SENT");
+}
+
+// ─── Fixture 6c — non-{Signed, ErrorRetryable} short-circuits ────────
+
+#[tokio::test]
+async fn rerun_on_prepared_state_conflict_short_circuits_with_zero_wire_calls() {
+    // W10.2 HIGH 3 §4.2: 4-pre CAS only accepts Signed | ErrorRetryable.
+    // Any other source state (Prepared, Kvt1, Kvt2, etc.) MUST yield
+    // StateConflict + zero wire calls.  Pin Prepared specifically — the
+    // common pre-stage-3 leakage scenario.
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_signed_doc_with_xml(&pool, 0xC2, "SELL", 1, "PREPARED").await;
+    let stub = StubDpsChannel::new(Ok(ack("SHOULD-NEVER-BE-USED")));
+
+    let outcome = stage_send::run(&pool, &stub, doc)
+        .await
+        .expect("rerun on PREPARED is a successful idempotent re-entry, not an error");
+
+    match outcome {
+        StageSendOutcome::StateConflict { observed } => {
+            assert_eq!(observed, DocState::Prepared);
+        }
+        other => panic!("expected StateConflict on PREPARED, got {other:?}"),
+    }
+    assert_eq!(
+        stub.call_count(),
+        0,
+        "rerun on PREPARED MUST NOT invoke send_chk"
+    );
+    assert_eq!(read_doc_state(&pool, doc).await, "PREPARED");
 }
 
 // ─── Fixture 7 — empty server_fiscal_no surfaces typed error ────────
