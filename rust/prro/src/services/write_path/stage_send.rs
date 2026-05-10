@@ -633,10 +633,15 @@ fn build_attempt_completion(
     }
 }
 
-/// transport_trace.error_message has CHECK length <= 512.  Truncate
+/// `transport_trace.error_message` has CHECK length <= 512.  Truncate
 /// upstream so an oversized DPS message doesn't trip the CHECK at
-/// 4-b commit time and roll back the entire 4-b tx.
-fn truncate_msg(s: &str) -> String {
+/// 4-b commit time and roll back the entire 4-b tx.  Char-boundary
+/// safe (UTF-8 codepoint integrity preserved).
+///
+/// `pub(super)` since W10.4 step 2c — `mac_recovery::emit_hash_not_extractable_audit`
+/// reuses the same byte-bounded truncation for audit_log payload
+/// hygiene (R-W10.4-step2c-review LOW 4 close).
+pub(super) fn truncate_msg(s: &str) -> String {
     if s.len() <= 512 {
         s.to_string()
     } else {

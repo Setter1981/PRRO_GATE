@@ -5,7 +5,7 @@
 //! `stage_send::run` (step 2d) after attempt #1 commits with
 //! `decision.retry_class == MacRecovery`.
 //!
-//! **Three-step state machine (per freeze §4.4.1 + §4.4.3):**
+//! **Four-step state machine (per freeze §4.4.1 + §4.4.3):**
 //!   1. **Hash extraction (pure-fn)** — regex-extract `store {64hex}`
 //!      from the wire `error_message`.  Failure ⇒
 //!      [`MacRecoveryOutcome::HashNotExtractable`].  Counter is NOT
@@ -429,7 +429,12 @@ async fn emit_hash_not_extractable_audit(
 ) -> Result<(), StageSendError> {
     // Truncate the raw message to keep audit_log payload small;
     // forensics already has the full message via transport_trace.
-    let truncated: String = raw_error_message.chars().take(256).collect();
+    // R-W10.4-step2c-review LOW 4 close: byte-bounded UTF-8 safe
+    // truncation via `stage_send::truncate_msg` (≤ 512 bytes,
+    // codepoint integrity preserved) — consistent with the
+    // transport_trace.error_message CHECK convention rather than
+    // an ad-hoc char-bounded `take(256)`.
+    let truncated = super::stage_send::truncate_msg(raw_error_message);
     let payload = serde_json::json!({
         "raw_error_message_truncated": truncated,
     })
