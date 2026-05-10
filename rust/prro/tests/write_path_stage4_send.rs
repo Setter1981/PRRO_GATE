@@ -921,6 +921,17 @@ fn whitelist_4pre_source_states_regression_guard() {
         "(ErrorRetryable, Sending) MUST stay in the allowed_transition whitelist; \
          stage_send::run depends on this for the 4-pre CAS (W10.2 retry path)"
     );
+    // W10.4 step 2d: MAC recovery failure overrides terminate the
+    // doc directly from `ErrorRetryable` → `Rejected` without a
+    // fresh wire send (HashNotExtractable / CounterExhausted /
+    // second-`-12` short-circuit).  Pin against future allowlist
+    // tightening.
+    assert!(
+        allowed_transition(DocState::ErrorRetryable, DocState::Rejected),
+        "(ErrorRetryable, Rejected) MUST stay in the allowed_transition whitelist; \
+         stage_send::run override-helpers depend on this for the W10.4 \
+         MAC-recovery-failure terminal path"
+    );
 }
 
 // ─── Fixture 6b — Pattern B retry-path: ErrorRetryable → Sending ─────

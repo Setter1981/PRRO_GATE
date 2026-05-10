@@ -162,6 +162,14 @@ pub fn allowed_transition(from: DocState, to: DocState) -> bool {
             | (Sending, ErrorRetryable)
             | (Sending, Rejected)
             | (ErrorRetryable, Sending)
+            // W10.4 step 2d: MAC recovery failure overrides
+            // (`HashNotExtractable` / `CounterExhausted` /
+            // second-`-12` short-circuit) terminate the doc directly
+            // from `ErrorRetryable` without a fresh wire send.
+            // Semantically: "we tried recovery, it failed, give up".
+            // Freeze §4.4.4 step 2d names this CAS explicitly; the
+            // whitelist edge was added in W10.5 follow-up.
+            | (ErrorRetryable, Rejected)
     )
 }
 
