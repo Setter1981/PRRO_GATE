@@ -367,6 +367,190 @@ async fn transport_retryable_routes_to_error_retryable_preserves_attempt_at() {
     assert!(t.server_status_code.is_none());
 }
 
+// ─── Fixture 3b — terminal Server reject (-5 ERROR_TYPE) ─────────────
+//
+// W10.2 review MED 2 close.  Anchors the §2.1 sub-table for terminal
+// Server-class errors that are NOT Authorization{DocumentReject}.  -5
+// is the canonical "M3 builder bug" reject — invalid `check_type` —
+// which the W10 routing fn fail-closes to TerminalReject + CRITICAL.
+// Mirrors the §2.1 row-5 + §3.4 audit-event contract.
+
+#[tokio::test]
+async fn terminal_server_minus_5_routes_to_rejected_critical_audit() {
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_signed_doc_with_xml(&pool, 0xB1, "SELL", 1, "SIGNED").await;
+    let stub = StubDpsChannel::new(Err(DpsError::Server {
+        code: -5,
+        message: "ERROR_TYPE".into(),
+    }));
+
+    let outcome = stage_send::run(&pool, &stub, doc)
+        .await
+        .expect("Server -5 is a successful stage_send outcome (terminal route)");
+
+    match outcome {
+        StageSendOutcome::Routed {
+            decision,
+            wire_status_code,
+            wire_error_message,
+            ..
+        } => {
+            assert_eq!(decision.retry_class, RetryClass::TerminalReject);
+            assert_eq!(decision.target_state, DocState::Rejected);
+            assert_eq!(wire_status_code, Some(-5));
+            assert_eq!(wire_error_message.as_deref(), Some("ERROR_TYPE"));
+        }
+        other => panic!("expected Routed terminal-reject for -5, got {other:?}"),
+    }
+    assert_eq!(stub.call_count(), 1);
+    assert_eq!(read_doc_state(&pool, doc).await, "REJECTED");
+
+    // Trace forensics: REJECTED outcome_kind, retry_class durably
+    // persisted (W10.2 review MED 1 close — migration 012).
+    let traces = transport_trace::list_for_document(&pool, doc)
+        .await
+        .unwrap();
+    let t = &traces[0];
+    assert_eq!(t.outcome_kind.as_deref(), Some("REJECTED"));
+    assert_eq!(t.error_kind.as_deref(), Some("Server"));
+    assert_eq!(t.server_status_code, Some(-5));
+    assert_eq!(t.retry_class.as_deref(), Some("TerminalReject"));
+
+    // Audit event: STAGE_SEND_REJECTED (per §3.4 closed enum), Critical
+    // severity (per §2.1 row -5 — M3 builder bug).
+    assert_eq!(
+        read_audit_event_types(&pool, doc).await,
+        vec!["STAGE_SEND_INTENT_MARKED", "STAGE_SEND_REJECTED"]
+    );
+}
+
+// ─── Fixture 3c — Authorization{FnNotRegistered} (-13) ───────────────
+//
+// W10.2 review MED 2 close.  -13/-14 carry an Authorization variant
+// that is per-FN, not per-doc: doc lands in ErrorRetryable with
+// retry_class=FnConfigError and audit STAGE_SEND_FN_NOT_REGISTERED.
+// W9 chains via RequiresManualReconciliation.
+
+#[tokio::test]
+async fn fn_config_minus_13_routes_to_error_retryable_with_fn_config_class() {
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_signed_doc_with_xml(&pool, 0xB2, "SELL", 1, "SIGNED").await;
+    let stub = StubDpsChannel::new(Err(DpsError::Authorization {
+        code: -13,
+        kind: AuthorizationKind::FiscalNumberNotRegistered,
+        message: "ERROR_NOT_REGISTERED_RRO".into(),
+    }));
+
+    let outcome = stage_send::run(&pool, &stub, doc)
+        .await
+        .expect("Authorization -13 is a successful stage_send outcome");
+
+    match outcome {
+        StageSendOutcome::Routed {
+            decision,
+            wire_status_code,
+            wire_error_message,
+            ..
+        } => {
+            assert_eq!(decision.retry_class, RetryClass::FnConfigError);
+            assert_eq!(decision.target_state, DocState::ErrorRetryable);
+            assert_eq!(wire_status_code, Some(-13));
+            assert_eq!(
+                wire_error_message.as_deref(),
+                Some("ERROR_NOT_REGISTERED_RRO")
+            );
+        }
+        other => panic!("expected Routed FnConfigError for -13, got {other:?}"),
+    }
+    assert_eq!(read_doc_state(&pool, doc).await, "ERROR_RETRYABLE");
+
+    let traces = transport_trace::list_for_document(&pool, doc)
+        .await
+        .unwrap();
+    let t = &traces[0];
+    assert_eq!(t.outcome_kind.as_deref(), Some("RETRYABLE_AUTH_FN"));
+    assert_eq!(
+        t.error_kind.as_deref(),
+        Some("AuthorizationFnNotRegistered")
+    );
+    assert_eq!(t.server_status_code, Some(-13));
+    assert_eq!(t.retry_class.as_deref(), Some("FnConfigError"));
+
+    // R-W10.2-review HIGH 1 close: durable retry_class enables
+    // dispatcher-level retry-loop gate.  Read via the public helper
+    // and verify it surfaces the right RetryClass — this is the
+    // contract that keeps a future worker dispatcher from auto-retrying
+    // an FN-config doc into a crash-loop.
+    let last_rc = transport_trace::last_attempt_retry_class_for(&pool, doc)
+        .await
+        .unwrap();
+    assert_eq!(last_rc, Some(RetryClass::FnConfigError));
+
+    assert_eq!(
+        read_audit_event_types(&pool, doc).await,
+        vec!["STAGE_SEND_INTENT_MARKED", "STAGE_SEND_FN_NOT_REGISTERED"]
+    );
+}
+
+// ─── Fixture 3d — Decode (proto status=0) → ProbeRequired ────────────
+//
+// W10.2 review MED 2 close.  Decode is the W3 pre-classifier shape for
+// `status=0` UNKNOWN proto-default: needs a W9 `last_chk` probe to
+// disambiguate.  Routing fn emits target=ErrorRetryable +
+// retry_class=ProbeRequired + probe_hint=DecodeUnknown.
+
+#[tokio::test]
+async fn decode_status_zero_routes_to_probe_required_with_decode_unknown_hint() {
+    use prro::services::write_path::error_routing::ProbeReason;
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_signed_doc_with_xml(&pool, 0xB3, "SELL", 1, "SIGNED").await;
+    let stub = StubDpsChannel::new(Err(DpsError::Decode("status=0 UNKNOWN".into())));
+
+    let outcome = stage_send::run(&pool, &stub, doc)
+        .await
+        .expect("Decode is a successful stage_send outcome (probe-required route)");
+
+    match outcome {
+        StageSendOutcome::Routed {
+            decision,
+            wire_status_code,
+            wire_error_message,
+            ..
+        } => {
+            assert_eq!(decision.retry_class, RetryClass::ProbeRequired);
+            assert_eq!(decision.target_state, DocState::ErrorRetryable);
+            assert_eq!(wire_status_code, None);
+            assert_eq!(wire_error_message.as_deref(), Some("status=0 UNKNOWN"));
+            assert_eq!(
+                decision.probe_hint.as_ref().map(|h| h.reason),
+                Some(ProbeReason::DecodeUnknown),
+                "probe_hint must carry DecodeUnknown reason for W9 probe"
+            );
+        }
+        other => panic!("expected Routed ProbeRequired for Decode, got {other:?}"),
+    }
+    assert_eq!(read_doc_state(&pool, doc).await, "ERROR_RETRYABLE");
+
+    let traces = transport_trace::list_for_document(&pool, doc)
+        .await
+        .unwrap();
+    let t = &traces[0];
+    // ProbeRequired folds to RETRYABLE_SERVER per W10.2 best-effort
+    // mapping (existing CHECK list).  W10.5 may add a finer kind.
+    assert_eq!(t.outcome_kind.as_deref(), Some("RETRYABLE_SERVER"));
+    assert_eq!(t.error_kind.as_deref(), Some("Decode"));
+    assert_eq!(t.retry_class.as_deref(), Some("ProbeRequired"));
+    let last_rc = transport_trace::last_attempt_retry_class_for(&pool, doc)
+        .await
+        .unwrap();
+    assert_eq!(last_rc, Some(RetryClass::ProbeRequired));
+
+    assert_eq!(
+        read_audit_event_types(&pool, doc).await,
+        vec!["STAGE_SEND_INTENT_MARKED", "STAGE_SEND_DECODE_UNKNOWN"]
+    );
+}
+
 // ─── Fixture 4 — pattern_b_ordering (spy) ────────────────────────────
 
 #[tokio::test]

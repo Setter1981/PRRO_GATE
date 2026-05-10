@@ -103,6 +103,43 @@ pub enum RetryClass {
     OperatorEscalation,
 }
 
+impl RetryClass {
+    /// Stable wire encoding for `transport_trace.retry_class` and
+    /// audit-payload JSON.  These strings are part of a public DB
+    /// contract (W10.2 review fix-up + migration 012); changing them
+    /// requires a backfill migration.  Variant tags match the Rust
+    /// `Debug` form so `format!("{:?}", retry_class)` and
+    /// `retry_class.as_str()` stay in sync.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TerminalReject => "TerminalReject",
+            Self::TransientRetry => "TransientRetry",
+            Self::FnConfigError => "FnConfigError",
+            Self::WrapperBug => "WrapperBug",
+            Self::ProbeRequired => "ProbeRequired",
+            Self::MacRecovery => "MacRecovery",
+            Self::OperatorEscalation => "OperatorEscalation",
+        }
+    }
+
+    /// Inverse of [`as_str`].  Returns `None` for unknown / NULL /
+    /// pre-migration-012 rows.  Callers MUST treat `None` as
+    /// "indeterminate from durable evidence" — typically forwarded
+    /// to W9 reconciliation rather than auto-retried.
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "TerminalReject" => Self::TerminalReject,
+            "TransientRetry" => Self::TransientRetry,
+            "FnConfigError" => Self::FnConfigError,
+            "WrapperBug" => Self::WrapperBug,
+            "ProbeRequired" => Self::ProbeRequired,
+            "MacRecovery" => Self::MacRecovery,
+            "OperatorEscalation" => Self::OperatorEscalation,
+            _ => return None,
+        })
+    }
+}
+
 /// Closed enum of every audit `event_type` the W10 routing fn may
 /// emit on the post-CAS commit.  As-str strings are the canonical
 /// wire form; written into `audit_log.event_type`.  Adding a new

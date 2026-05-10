@@ -322,13 +322,18 @@ Calling `run` repeatedly on a non-`TransientRetry` `ErrorRetryable` doc will pro
 
 **HIGH 1 + HIGH 2 + LOW 1 close — Pattern B-consistent two-attempt sequence with atomic single-tx PERSIST.**  The earlier draft had two issues: (a) it implicitly created two wire calls without acknowledging that each must produce its own `transport_trace` row, and (b) `mac_recovery_repin_tx` updated `previous_hash` separately from the artifact PERSIST, opening a crash window where the new hash + old XML/sha could be observed.  The v2 design closes both.
 
-**Q1 finalised: dedicated `mac_recovery_attempts` column + migration 012.**  Single-bit budget DDL-enforced via CHECK.
+**Q1 finalised: dedicated `mac_recovery_attempts` column + migration 013.**  Single-bit budget DDL-enforced via CHECK.
+
+> **Migration numbering note (R-W10.2-review).**  Migration 012 was claimed in W10.2 review fix-up to durably encode `transport_trace.retry_class` (closes the retry-loop policy gap — see §4.2 caller obligation table).  W10.4's MAC-recovery column therefore moves to **migration 013**.  W10.5's `transport_trace.outcome_kind` CHECK extension for `RETRYABLE_MAC_HASH_MISMATCH` (per §3.4) lands in the same migration 013 to keep MAC-recovery DDL atomic.
 
 ```sql
--- migrations/012_mac_recovery_attempts.sql
+-- migrations/013_mac_recovery_attempts.sql
 ALTER TABLE fiscal_documents
   ADD COLUMN mac_recovery_attempts INTEGER NOT NULL DEFAULT 0
   CHECK (mac_recovery_attempts IN (0, 1));
+
+-- transport_trace.outcome_kind CHECK extension is a SQLite table
+-- rebuild (see migration 008 precedent) to add 'RETRYABLE_MAC_HASH_MISMATCH'.
 ```
 
 #### 4.4.1 Pattern B-consistent state-machine flow (HIGH 1 close)
@@ -393,7 +398,7 @@ attempt #2 — re-signed payload
 
 Two `transport_trace` rows materialise: `attempt_no=1` (outcome=RETRYABLE_MAC_HASH_MISMATCH) and `attempt_no=2` (outcome per fresh classify).  Forensic visibility: operator can replay the chain "first envelope rejected with hash X, recovery rebuilt with hash Y, second envelope <result>".  The `transport_trace` PRIMARY KEY `(document_id, attempt_no)` already enforces uniqueness.
 
-**New `OutcomeKind` variant** for `transport_trace.outcome_kind` CHECK list: `RETRYABLE_MAC_HASH_MISMATCH`.  Migration 012 extends the CHECK to include it (single-statement ALTER + table-rebuild per migration 008 precedent if SQLite version requires).
+**New `OutcomeKind` variant** for `transport_trace.outcome_kind` CHECK list: `RETRYABLE_MAC_HASH_MISMATCH`.  Migration 013 extends the CHECK to include it (table-rebuild per migration 008 precedent — SQLite cannot ALTER an existing CHECK in place).
 
 #### 4.4.2 New helpers (HIGH 2 + LOW 1 close)
 
@@ -511,7 +516,7 @@ Steps:
 
 The `attempts=1 + OLD artifacts` partial state is forensically visible (audit log carries `MacRecoveryResigned` only on PERSIST commit; if absent, recovery never completed) and never silently progresses.  Routing fn never inspects the counter — that's stage_send + orchestrator territory (see Finding-1 close in §3 / sequence diagram).
 
-**LoC budget:** ~280 in `mac_recovery.rs` (orchestrator + persist + extract), ~15 in `fiscal_documents.rs` (claim counter + counter+previous_hash columns join), ~30 in `stage_sign.rs` (extracted re-sign), ~30 in `document_files.rs` (replace_tx), ~50 integration in `stage_send.rs`.  Migration 012 = ~10 LoC SQL (column + outcome_kind CHECK extension) + 1 schema fixture.
+**LoC budget:** ~280 in `mac_recovery.rs` (orchestrator + persist + extract), ~15 in `fiscal_documents.rs` (claim counter + counter+previous_hash columns join), ~30 in `stage_sign.rs` (extracted re-sign), ~30 in `document_files.rs` (replace_tx), ~50 integration in `stage_send.rs`.  Migration 013 = column ALTER + table-rebuild for `outcome_kind` CHECK extension + 1 schema fixture.
 
 ### 4.5 W10.5 — Test fixtures
 - New `rust/prro/tests/write_path_dps_error_routing.rs`: 21 fixtures per W0-3 §9.2 (lines 1218-1256).  Pure-DB integration via stub `DpsChannel` (mirror W7.5 stub pattern); driver invokes `stage_send::run` end-to-end; asserts post-tx `state` + audit event_type + audit payload `retry_class` + (where applicable) `node_state.mode` + `probe_hint`.
@@ -572,7 +577,7 @@ The `attempts=1 + OLD artifacts` partial state is forensically visible (audit lo
 
 ## 7. Open questions — FINALISED
 
-1. **Q1 — MAC recovery counter (closed: A).**  Dedicated `mac_recovery_attempts` column via **migration 012** with `CHECK (mac_recovery_attempts IN (0, 1))` — DDL-enforced single-bit budget.  `recovery_attempts` does not exist in the current schema (verified), so reuse was never an option.  Per §4.4 v2 split: tx helper `mac_recovery_claim_counter_tx` carries `WHERE state='ERROR_RETRYABLE' AND mac_recovery_attempts = 0` (claim phase, post-attempt-#1 4-b commit); `rows_affected == 0` ⇒ counter exhausted OR wrong state ⇒ TerminalReject + audit.  Atomicity of `previous_hash` + artifacts handled in MR-PERSIST step, NOT in claim (HIGH 2 close).
+1. **Q1 — MAC recovery counter (closed: A).**  Dedicated `mac_recovery_attempts` column via **migration 013** (renumbered from 012 in W10.2 review fix-up; see §4.4) with `CHECK (mac_recovery_attempts IN (0, 1))` — DDL-enforced single-bit budget.  `recovery_attempts` does not exist in the current schema (verified), so reuse was never an option.  Per §4.4 v2 split: tx helper `mac_recovery_claim_counter_tx` carries `WHERE state='ERROR_RETRYABLE' AND mac_recovery_attempts = 0` (claim phase, post-attempt-#1 4-b commit); `rows_affected == 0` ⇒ counter exhausted OR wrong state ⇒ TerminalReject + audit.  Atomicity of `previous_hash` + artifacts handled in MR-PERSIST step, NOT in claim (HIGH 2 close).
 2. **Q2 — Re-sign helper (closed: A, scoped).**  Extract `pub async fn re_sign_after_mac_recovery(...)` from `stage_sign.rs`.  **Scope:** rebuild canonical XML + sign already-pinned/recovered inputs.  **Excludes:** new Z-report number allocation; `Prepared → Signed` CAS.  Pure no-tx segment per W3 invariant.  See §4.4 helper signature.
 3. **Q3 — `SendOutcome` shape (closed: modified A).**  Drop W7-minimal `SendOutcome`.  Do NOT replace with bare `RoutingDecision` — the OK arm carries `CheckAck.id` (server_fiscal_no) which RoutingDecision can't express without losing the typed routing structure.  Wrap in `WireDecision::{Sent { server_fiscal_no }, Routed(RoutingDecision)}`.  See §3.
 4. **Q4 — Audit event_type (closed: A).**  Closed enum `AuditEvent` with `as_str() -> &'static str`.  All event_types written into `audit_log.event_type` go through this enum; new events require enum extension AND a fixture asserting it.  Mirrors W7.1 `OutcomeKind` precedent.  See §3.

@@ -33,8 +33,11 @@
 //! Calling [`run`] repeatedly on a non-`TransientRetry` `ErrorRetryable`
 //! doc produces an unbounded crash-loop: same envelope, same server
 //! reply, same `ErrorRetryable` landing.  Until the worker dispatcher
-//! lands (W11+), tests + ops scripts MUST manually filter on
-//! `transport_trace.last_attempt_for(doc).retry_class`.  See freeze §4.2.
+//! lands (W11+), tests + ops scripts MUST manually filter via
+//! [`crate::db::repositories::transport_trace::last_attempt_retry_class_for`]
+//! (durable column added in migration 012; encoded by the closed
+//! `RetryClass::as_str` map and decoded via `RetryClass::from_wire_str`).
+//! See freeze §4.2.
 //!
 //! Anchored on:
 //!   - W7 design freeze §4.3 (envelope builder)
@@ -536,6 +539,12 @@ fn build_attempt_completion(
         // rather than panic in case of unforeseen path.
         (WireDecision::Routed(_), None) => (None, Some("UnknownRouted".to_string()), None),
     };
+    // W10.2 review fix-up + migration 012: durable encoding of
+    // RetryClass on the routed arm.  Sent arm leaves NULL.
+    let retry_class = match decision {
+        WireDecision::Sent { .. } => None,
+        WireDecision::Routed(d) => Some(d.retry_class.as_str().to_string()),
+    };
     let kind_for_outcome = match forensics {
         Some((_, k, _)) => *k,
         None => {
@@ -558,6 +567,7 @@ fn build_attempt_completion(
         server_status_code,
         error_kind,
         error_message: error_message.map(|m| truncate_msg(&m)),
+        retry_class,
     }
 }
 
@@ -596,8 +606,8 @@ fn truncate_msg(s: &str) -> String {
 ///     any `with_immediate` closure; the runtime guard panics in
 ///     debug if violated.
 ///   - **4b** (`with_immediate` #2): post-wire CAS
-///     `Sending → {Sent | Rejected | ErrorRetryable}` (target
-///     derived from `classify_send_outcome`), conditional
+///     `Sending → {Sent | decision.target_state}` (target derived
+///     from `route_send_result` → `WireDecision`), conditional
 ///     `set_server_fiscal_no_tx` on the success branch (gated by
 ///     the EmptyServerFiscalNo guard run BEFORE 4-b),
 ///     `transport_trace::complete_tx` (UPDATE the row 4-pre

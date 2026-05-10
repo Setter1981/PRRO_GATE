@@ -86,6 +86,14 @@ pub struct AttemptCompletion {
     pub server_status_code: Option<i32>,
     pub error_kind: Option<String>,
     pub error_message: Option<String>,
+    /// W10.2 review fix-up + migration 012: durable encoding of the
+    /// W10 routing `RetryClass` for the routed arm.  `None` on the
+    /// `WireDecision::Sent` happy path (success has no retry class)
+    /// AND on pre-migration-012 rows (NULL).  Callers (worker
+    /// dispatcher in W11+) read this via
+    /// [`last_attempt_retry_class_for`] to decide whether a doc
+    /// currently in `ErrorRetryable` warrants another wire send.
+    pub retry_class: Option<String>,
 }
 
 /// Allocate the next `attempt_no` for `doc_id` and INSERT the trace
@@ -169,7 +177,8 @@ pub async fn complete_tx(
             server_fiscal_no = ?, \
             server_status_code = ?, \
             error_kind = ?, \
-            error_message = ? \
+            error_message = ?, \
+            retry_class = ? \
          WHERE document_id = ? AND attempt_no = ? AND completed_at IS NULL",
     )
     .bind(&completion.wire_call_started_at)
@@ -179,6 +188,7 @@ pub async fn complete_tx(
     .bind(completion.server_status_code)
     .bind(completion.error_kind.as_deref())
     .bind(completion.error_message.as_deref())
+    .bind(completion.retry_class.as_deref())
     .bind(doc_id)
     .bind(attempt_no)
     .execute(&mut **tx)
@@ -203,6 +213,9 @@ pub struct TraceRow {
     pub server_status_code: Option<i32>,
     pub error_kind: Option<String>,
     pub error_message: Option<String>,
+    /// W10.2 review fix-up + migration 012.  `None` on success path
+    /// AND on pre-012 rows.  Decode via [`crate::services::write_path::error_routing::RetryClass::from_wire_str`].
+    pub retry_class: Option<String>,
 }
 
 /// Wire shape of a `transport_trace` row when read via `query_as`
@@ -226,6 +239,7 @@ type TraceRowTuple = (
     Option<i32>,    // server_status_code
     Option<String>, // error_kind
     Option<String>, // error_message
+    Option<String>, // retry_class (W10.2 review fix-up + migration 012)
 );
 
 pub async fn list_for_document(
@@ -236,7 +250,7 @@ pub async fn list_for_document(
         "SELECT attempt_no, started_at, backend_profile_id, transport_profile_id, \
                 request_envelope_sha256, completed_at, wire_call_started_at, \
                 wire_call_finished_at, outcome_kind, server_fiscal_no, \
-                server_status_code, error_kind, error_message \
+                server_status_code, error_kind, error_message, retry_class \
          FROM transport_trace WHERE document_id = ? ORDER BY attempt_no",
     )
     .bind(doc_id)
@@ -267,7 +281,45 @@ pub async fn list_for_document(
                 server_status_code: r.10,
                 error_kind: r.11,
                 error_message: r.12,
+                retry_class: r.13,
             })
         })
         .collect()
+}
+
+/// W10.2 review fix-up: read the durable `retry_class` of the most
+/// recent (highest `attempt_no`) **completed** trace row for `doc_id`.
+/// Used by the worker dispatcher (W11+) and ops scripts to decide
+/// whether a doc currently in `ErrorRetryable` warrants another wire
+/// send per the table in `stage_send.rs` module docstring + freeze §4.2.
+///
+/// Returns:
+///   - `Ok(None)`  — no completed attempt yet (4-pre allocated but
+///     4-b never committed) OR the doc has no trace rows at all OR the
+///     row is pre-migration-012 (NULL `retry_class`).  Caller should
+///     treat as "indeterminate; do NOT auto-retry".
+///   - `Ok(Some(rc))` — last completed attempt's retry class.  Caller
+///     filters per the docstring contract: only `TransientRetry` is
+///     auto-retryable; the other six classes need higher-layer
+///     orchestration.
+///
+/// Reads outside any tx — pool-bound; safe to call from the dispatcher
+/// scheduling loop without entering a write lock.  WAL semantics: the
+/// row is visible after the 4-b `with_immediate` envelope commits.
+pub async fn last_attempt_retry_class_for(
+    pool: &sqlx::SqlitePool,
+    doc_id: DocumentId,
+) -> sqlx::Result<Option<crate::services::write_path::error_routing::RetryClass>> {
+    let opt: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT retry_class FROM transport_trace \
+         WHERE document_id = ? AND completed_at IS NOT NULL \
+         ORDER BY attempt_no DESC LIMIT 1",
+    )
+    .bind(doc_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(opt
+        .flatten()
+        .as_deref()
+        .and_then(crate::services::write_path::error_routing::RetryClass::from_wire_str))
 }
