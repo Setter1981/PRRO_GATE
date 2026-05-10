@@ -23,112 +23,21 @@
 //!      whitelist would make the `unreachable!` in 4-pre fire in
 //!      production; this test catches it at CI.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use sqlx::SqlitePool;
 
-use prro::crypto::errors::CryptoError;
-use prro::crypto::provider::{
-    CertDer, CryptoProvider, DstuVerifyResult, SignCmsRequest, SignedCmsBytes,
-};
-use prro::crypto::session::SigningSession;
 use prro::db::models::enums::DocState;
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::fiscal_documents::allowed_transition;
 use prro::db::repositories::transport_trace;
 use prro::services::write_path::error_routing::RetryClass;
 use prro::services::write_path::stage_send::{self, StageSendError, StageSendOutcome};
-use prro::services::write_path::stage_sign::SigningContext;
-use prro::transports::dps::channel::DpsChannel;
-use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
+use prro::transports::dps::dto::CheckAck;
 use prro::transports::dps::error::{AuthorizationKind, DpsError};
 
-// ─── In-memory stub DpsChannel ───────────────────────────────────────
-
-/// Lightweight stub: scripted response queue + call counter +
-/// optional spy callback fired BEFORE the response is returned.
-///
-/// W10.4 step 2d MED 1 close: queue-based to support multi-attempt
-/// scenarios (e.g. MAC recovery's two-attempt sequence: -12 then OK).
-/// Single-response constructors (`new` / `with_spy`) push exactly one
-/// element into the queue for backwards compat with the W7.5
-/// fixtures.
-struct StubDpsChannel {
-    responses: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
-    send_chk_calls: AtomicUsize,
-    /// Spy hook for `pattern_b_ordering` — reads `fiscal_documents.state`
-    /// from a fresh connection and stashes it in a slot.  Fires
-    /// inside `send_chk` BEFORE the response is returned.
-    on_send_chk: Option<Box<dyn Fn() + Send + Sync>>,
-}
-
-impl StubDpsChannel {
-    fn new(response: Result<CheckAck, DpsError>) -> Self {
-        let mut q = VecDeque::with_capacity(1);
-        q.push_back(response);
-        Self {
-            responses: Mutex::new(q),
-            send_chk_calls: AtomicUsize::new(0),
-            on_send_chk: None,
-        }
-    }
-
-    fn with_queue(responses: Vec<Result<CheckAck, DpsError>>) -> Self {
-        Self {
-            responses: Mutex::new(responses.into()),
-            send_chk_calls: AtomicUsize::new(0),
-            on_send_chk: None,
-        }
-    }
-
-    fn with_spy(response: Result<CheckAck, DpsError>, spy: Box<dyn Fn() + Send + Sync>) -> Self {
-        let mut q = VecDeque::with_capacity(1);
-        q.push_back(response);
-        Self {
-            responses: Mutex::new(q),
-            send_chk_calls: AtomicUsize::new(0),
-            on_send_chk: Some(spy),
-        }
-    }
-
-    fn call_count(&self) -> usize {
-        self.send_chk_calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl DpsChannel for StubDpsChannel {
-    async fn send_chk(&self, _envelope: CheckEnvelope) -> Result<CheckAck, DpsError> {
-        self.send_chk_calls.fetch_add(1, Ordering::SeqCst);
-        if let Some(spy) = &self.on_send_chk {
-            spy();
-        }
-        self.responses
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("StubDpsChannel response queue empty (caller forgot to enqueue)")
-    }
-
-    async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
-        unreachable!("W7.5 stub: last_chk not exercised")
-    }
-
-    async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
-        unreachable!("W7.5 stub: ping not exercised")
-    }
-
-    async fn status_rro(&self, _: &CheckSignBlob) -> Result<StatusSnapshot, DpsError> {
-        unreachable!("W7.5 stub: status_rro not exercised")
-    }
-
-    async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
-        unreachable!("W7.5 stub: info_rro not exercised")
-    }
-}
+mod common;
+use common::StubDpsChannel;
 
 // ─── Test seed helpers ───────────────────────────────────────────────
 
@@ -1173,47 +1082,10 @@ async fn signed_xml_missing_surfaces_typed_error_no_state_mutation() {
 }
 
 // ─── W10.4 step 2d MED 1 close — MAC recovery dispatch smoke fixture ─
-
-/// Deterministic crypto stub for the MAC recovery smoke test.
-/// `re_sign_after_mac_recovery` calls `provider.sign_cms_detached`
-/// once during the orchestrator's MR-NO-TX step; this stub returns
-/// a fixed CMS byte string so the fixture can assert on the post-
-/// MR-PERSIST `document_files.SIGNED_XML` content.
-struct DetCrypto;
-
-#[async_trait]
-impl CryptoProvider for DetCrypto {
-    async fn sign_cms_detached(
-        &self,
-        _: SignCmsRequest<'_>,
-    ) -> Result<SignedCmsBytes, CryptoError> {
-        Ok(SignedCmsBytes(b"RECOVERED-CMS-V2".to_vec()))
-    }
-    async fn verify_dstu(
-        &self,
-        _: &[u8],
-        _: &[u8],
-        _: &[u8],
-    ) -> Result<DstuVerifyResult, CryptoError> {
-        unimplemented!("not exercised");
-    }
-    async fn unwrap_envelope(
-        &self,
-        _: &[u8],
-        _: &[u8],
-        _: &SigningSession,
-    ) -> Result<Vec<u8>, CryptoError> {
-        unimplemented!("not exercised");
-    }
-    async fn fetch_cert_by_ski(
-        &self,
-        _: &[String],
-        _: &[u8; 32],
-        _: std::time::Duration,
-    ) -> Result<CertDer, CryptoError> {
-        unimplemented!("not exercised");
-    }
-}
+//
+// Crypto stub + signing context provided by `tests/common/mod.rs`
+// (R-W10.5-review MED 2 close — shared infra dedup).  `DetCrypto`
+// returns `RECOVERED-CMS` on every `sign_cms_detached` call.
 
 /// Seed an `ERROR_RETRYABLE` doc with PAYLOAD_XML + SIGNED_XML
 /// pre-INSERTed (mirrors post-attempt-#1 4-b commit shape per freeze
@@ -1303,12 +1175,9 @@ async fn mac_recovery_resigned_drives_attempt_2_through_loop_to_sent() {
         }),
     ]);
 
-    // SigningContext for the recovery orchestrator.
-    let sign_ctx = SigningContext {
-        provider: Arc::new(DetCrypto) as Arc<dyn CryptoProvider>,
-        session: SigningSession::new_for_test("operator-1".into(), [0u8; 32], vec![]),
-        profile: prro_crypto::cms::profile::CmsProfile::Dstu4145WithGost34311Pb,
-    };
+    // SigningContext for the recovery orchestrator (shared common
+    // helper; `DetCrypto` returns `RECOVERED-CMS` on every call).
+    let sign_ctx = common::det_signing_ctx();
 
     let outcome = stage_send::run(&pool, &stub, doc, Some(&sign_ctx))
         .await
@@ -1384,7 +1253,7 @@ async fn mac_recovery_resigned_drives_attempt_2_through_loop_to_sent() {
     .unwrap();
     assert_eq!(
         signed.as_deref(),
-        Some(b"RECOVERED-CMS-V2".as_slice()),
+        Some(b"RECOVERED-CMS".as_slice()),
         "SIGNED_XML must reflect the orchestrator's re-signed bytes"
     );
 }

@@ -22,143 +22,28 @@
 //! that overlap is intentional — `write_path_stage4_send` proves the
 //! plumbing, `write_path_dps_error_routing` proves the routing decision
 //! matrix.
+//!
+//! **Naming convention** (R-W10.5-review NIT):
+//!   - `fx01..fx21` — routing decisions per W0-3 §9.2 numbered list
+//!     (matches the spec's enumeration 1-by-1 для cross-reference).
+//!   - `mac_fx01..mac_fx03` — MAC recovery dispatch outcomes
+//!     (HashNotExtractable / CounterExhausted / second-`-12`).
+//!     The `mac_` prefix already discriminates from routing fixtures;
+//!     `mac_dispatch_` prefix considered but rejected as redundant.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use sqlx::SqlitePool;
 
-use prro::crypto::errors::CryptoError;
-use prro::crypto::provider::{
-    CertDer, CryptoProvider, DstuVerifyResult, SignCmsRequest, SignedCmsBytes,
-};
-use prro::crypto::session::SigningSession;
 use prro::db::models::enums::{DocState, NodeMode};
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::{node_state, transport_trace};
 use prro::services::write_path::error_routing::{ProbeReason, RetryClass};
 use prro::services::write_path::stage_send::{self, StageSendOutcome};
-use prro::services::write_path::stage_sign::SigningContext;
-use prro::transports::dps::channel::DpsChannel;
-use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
 use prro::transports::dps::error::{AuthorizationKind, DpsError};
 
-// ─── Stub DpsChannel (queue-based, optional spy) ─────────────────────
-
-struct StubDpsChannel {
-    responses: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
-    send_chk_calls: AtomicUsize,
-    on_send_chk: Option<Box<dyn Fn() + Send + Sync>>,
-}
-
-impl StubDpsChannel {
-    fn new(response: Result<CheckAck, DpsError>) -> Self {
-        let mut q = VecDeque::with_capacity(1);
-        q.push_back(response);
-        Self {
-            responses: Mutex::new(q),
-            send_chk_calls: AtomicUsize::new(0),
-            on_send_chk: None,
-        }
-    }
-
-    fn with_queue(responses: Vec<Result<CheckAck, DpsError>>) -> Self {
-        Self {
-            responses: Mutex::new(responses.into()),
-            send_chk_calls: AtomicUsize::new(0),
-            on_send_chk: None,
-        }
-    }
-
-    fn with_spy(response: Result<CheckAck, DpsError>, spy: Box<dyn Fn() + Send + Sync>) -> Self {
-        let mut q = VecDeque::with_capacity(1);
-        q.push_back(response);
-        Self {
-            responses: Mutex::new(q),
-            send_chk_calls: AtomicUsize::new(0),
-            on_send_chk: Some(spy),
-        }
-    }
-
-    fn call_count(&self) -> usize {
-        self.send_chk_calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl DpsChannel for StubDpsChannel {
-    async fn send_chk(&self, _envelope: CheckEnvelope) -> Result<CheckAck, DpsError> {
-        self.send_chk_calls.fetch_add(1, Ordering::SeqCst);
-        if let Some(spy) = &self.on_send_chk {
-            spy();
-        }
-        self.responses
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("StubDpsChannel response queue empty")
-    }
-    async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
-        unreachable!("not exercised");
-    }
-    async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
-        unreachable!("not exercised");
-    }
-    async fn status_rro(&self, _: &CheckSignBlob) -> Result<StatusSnapshot, DpsError> {
-        unreachable!("not exercised");
-    }
-    async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
-        unreachable!("not exercised");
-    }
-}
-
-// ─── Stub crypto provider for MAC recovery fixtures ──────────────────
-
-struct DetCrypto;
-
-#[async_trait]
-impl CryptoProvider for DetCrypto {
-    async fn sign_cms_detached(
-        &self,
-        _: SignCmsRequest<'_>,
-    ) -> Result<SignedCmsBytes, CryptoError> {
-        Ok(SignedCmsBytes(b"RECOVERED-CMS".to_vec()))
-    }
-    async fn verify_dstu(
-        &self,
-        _: &[u8],
-        _: &[u8],
-        _: &[u8],
-    ) -> Result<DstuVerifyResult, CryptoError> {
-        unimplemented!();
-    }
-    async fn unwrap_envelope(
-        &self,
-        _: &[u8],
-        _: &[u8],
-        _: &SigningSession,
-    ) -> Result<Vec<u8>, CryptoError> {
-        unimplemented!();
-    }
-    async fn fetch_cert_by_ski(
-        &self,
-        _: &[String],
-        _: &[u8; 32],
-        _: std::time::Duration,
-    ) -> Result<CertDer, CryptoError> {
-        unimplemented!();
-    }
-}
-
-fn det_signing_ctx() -> SigningContext {
-    SigningContext {
-        provider: Arc::new(DetCrypto) as Arc<dyn CryptoProvider>,
-        session: SigningSession::new_for_test("operator-1".into(), [0u8; 32], vec![]),
-        profile: prro_crypto::cms::profile::CmsProfile::Dstu4145WithGost34311Pb,
-    }
-}
+mod common;
+use common::{det_signing_ctx, StubDpsChannel};
 
 // ─── Pool / seed helpers ─────────────────────────────────────────────
 
@@ -432,7 +317,12 @@ async fn fx06_not_found_on_live_routes_to_wrapper_bug_critical() {
     stage_send::run(&pool, &stub, doc, None).await.unwrap();
     // B2 close: live path never leaves doc durably in SENDING; routes
     // to ErrorRetryable + CRITICAL audit.
-    assert_eq!(read_state(&pool, doc).await, "ERROR_RETRYABLE");
+    let state = read_state(&pool, doc).await;
+    assert_ne!(
+        state, "SENDING",
+        "B2 close: live wrapper-bug NotFound MUST NOT leave doc in SENDING"
+    );
+    assert_eq!(state, "ERROR_RETRYABLE");
     let trace = last_trace(&pool, doc).await;
     assert_eq!(trace.retry_class.as_deref(), Some("WrapperBug"));
     let chain = read_audit_chain(&pool, doc).await;
@@ -466,7 +356,12 @@ async fn fx08_query_not_supported_on_live_routes_to_wrapper_bug_critical() {
     let stub = StubDpsChannel::new(Err(DpsError::QueryNotSupported("ByLocalIdentity")));
 
     stage_send::run(&pool, &stub, doc, None).await.unwrap();
-    assert_eq!(read_state(&pool, doc).await, "ERROR_RETRYABLE");
+    let state = read_state(&pool, doc).await;
+    assert_ne!(
+        state, "SENDING",
+        "B2 close: live wrapper-bug QueryNotSupported MUST NOT leave doc in SENDING"
+    );
+    assert_eq!(state, "ERROR_RETRYABLE");
     let trace = last_trace(&pool, doc).await;
     assert_eq!(trace.retry_class.as_deref(), Some("WrapperBug"));
     let chain = read_audit_chain(&pool, doc).await;
@@ -632,6 +527,16 @@ async fn fx16_server_minus_11_routes_to_rejected_and_flips_node_blocked() {
     )
     .await
     .unwrap();
+    // R-W10.5-review LOW 4 close: pin pre-flip baseline so the
+    // direction Online → Blocked is documented by the test, not
+    // just by the upsert_initial argument.  A future refactor that
+    // accidentally seeds Blocked would flip the post-assertion
+    // semantically, but this pre-pin would catch it.
+    let pre = node_state::get(&pool, "1234567890")
+        .await
+        .unwrap()
+        .expect("node_state row must exist");
+    assert_eq!(pre.mode, NodeMode::Online, "pre-flip baseline = Online");
     let stub = StubDpsChannel::new(Err(DpsError::Server {
         code: -11,
         message: "ERROR_OFFLINE_168".into(),
@@ -835,22 +740,42 @@ async fn mac_fx01_hash_not_extractable_overrides_to_rejected() {
         .await
         .unwrap();
     match outcome {
-        StageSendOutcome::Routed { decision, .. } => {
+        StageSendOutcome::Routed {
+            decision,
+            attempt_no,
+            ..
+        } => {
             assert_eq!(decision.target_state, DocState::Rejected);
             assert_eq!(decision.retry_class, RetryClass::TerminalReject);
+            // R-W10.5-review LOW 3 close: pin attempt_no = 1 to
+            // document that NO second attempt fired (orchestrator
+            // returned before re-sign).
+            assert_eq!(
+                attempt_no, 1,
+                "HashNotExtractable terminates without a re-sign retry"
+            );
         }
         other => panic!("expected Routed (HashNotExtractable override), got {other:?}"),
     }
     assert_eq!(read_state(&pool, doc).await, "REJECTED");
-    let chain = read_audit_chain(&pool, doc).await;
+    // R-W10.5-review LOW 2 close: position-pinned audit chain.
     // Orchestrator emitted MAC_RECOVERY_HASH_NOT_EXTRACTABLE; caller
     // does NOT emit a duplicate audit (orchestrator's record + final
     // state suffice forensically).
-    assert!(
-        chain
-            .iter()
-            .any(|(e, _, _)| e == "MAC_RECOVERY_HASH_NOT_EXTRACTABLE"),
-        "orchestrator must emit HASH_NOT_EXTRACTABLE: {chain:?}"
+    let chain_events: Vec<String> = read_audit_chain(&pool, doc)
+        .await
+        .into_iter()
+        .map(|(e, _, _)| e)
+        .collect();
+    assert_eq!(
+        chain_events,
+        vec![
+            "STAGE_SEND_INTENT_MARKED".to_string(),
+            "STAGE_SEND_MAC_HASH_MISMATCH".to_string(),
+            "MAC_RECOVERY_HASH_NOT_EXTRACTABLE".to_string(),
+        ],
+        "HashNotExtractable audit chain must be ordered exactly: \
+         INTENT_MARKED → MAC_HASH_MISMATCH → HASH_NOT_EXTRACTABLE"
     );
     // Counter NOT burnt — preserves budget for future tick if DPS
     // ships a corrected message format.
@@ -868,20 +793,31 @@ async fn mac_fx01_hash_not_extractable_overrides_to_rejected() {
 // FAILED_REPEAT + override to Rejected
 #[tokio::test]
 async fn mac_fx02_counter_exhausted_overrides_to_rejected_with_failed_repeat_audit() {
+    // R-W10.5-review MED 1 close: seed doc directly in ERROR_RETRYABLE
+    // (legitimate INSERT-time state — same INSERT path W6 stage 3
+    // commits to via transition_state on Prepared→Signed→Sending→ErrorRetryable).
+    // Counter pre-bumped via raw UPDATE on the counter column ONLY
+    // (counter is not part of the state machine; it's a free
+    // single-bit budget column gated by DDL CHECK).  Earlier setup
+    // synthesised both state and counter in a single raw UPDATE,
+    // bypassing the (Signed, ErrorRetryable) edge — methodologically
+    // fragile.  Now: one INSERT for state, one column-scoped UPDATE
+    // for the counter.
     let (_d, pool) = fresh_pool().await;
-    let doc = seed_signed_sell(&pool, 0xE2).await;
-    // Pre-burn the counter (simulates: prior worker tick claimed but
-    // PERSIST never committed).  Doc state must still be ERROR_RETRYABLE
-    // for the orchestrator's MR-CLAIM CAS to be exercised.  Update the
-    // doc state + counter in one tx.
-    sqlx::query(
-        "UPDATE fiscal_documents SET mac_recovery_attempts = 1, state = 'ERROR_RETRYABLE' \
-         WHERE document_id = ?",
+    let doc = seed_doc(
+        &pool,
+        0xE2,
+        "SELL",
+        "ERROR_RETRYABLE",
+        SELL_PAYLOAD_JSON,
+        Some(1500),
     )
-    .bind(doc)
-    .execute(&pool)
-    .await
-    .unwrap();
+    .await;
+    sqlx::query("UPDATE fiscal_documents SET mac_recovery_attempts = 1 WHERE document_id = ?")
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
     let stub = StubDpsChannel::new(Err(DpsError::Server {
         code: -12,
         message: "ERROR_BAD_HASH_PREV: store deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567"
@@ -893,17 +829,26 @@ async fn mac_fx02_counter_exhausted_overrides_to_rejected_with_failed_repeat_aud
         .await
         .unwrap();
     assert_eq!(read_state(&pool, doc).await, "REJECTED");
-    let chain = read_audit_chain(&pool, doc).await;
-    assert!(
-        chain
-            .iter()
-            .any(|(e, _, _)| e == "MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH"),
-        "caller must emit FAILED_REPEAT on CounterExhausted: {chain:?}"
-    );
-    // NO MAC_RECOVERY_RESIGNED (orchestrator never reached MR-PERSIST).
-    assert!(
-        chain.iter().all(|(e, _, _)| e != "MAC_RECOVERY_RESIGNED"),
-        "MR-PERSIST must NOT have committed: {chain:?}"
+    // R-W10.5-review LOW 2 close: position-pinned audit chain.
+    // CounterExhausted: orchestrator's MR-CLAIM CAS fails (counter
+    // already 1 pre-call); orchestrator returns без emit; caller's
+    // override emits FAILED_REPEAT.  No MAC_RECOVERY_RESIGNED
+    // (PERSIST never reached); no MAC_RECOVERY_HASH_NOT_EXTRACTABLE
+    // (regex succeeded; only the CAS guard failed).
+    let chain_events: Vec<String> = read_audit_chain(&pool, doc)
+        .await
+        .into_iter()
+        .map(|(e, _, _)| e)
+        .collect();
+    assert_eq!(
+        chain_events,
+        vec![
+            "STAGE_SEND_INTENT_MARKED".to_string(),
+            "STAGE_SEND_MAC_HASH_MISMATCH".to_string(),
+            "MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH".to_string(),
+        ],
+        "CounterExhausted audit chain must be ordered exactly: \
+         INTENT_MARKED → MAC_HASH_MISMATCH → FAILED_REPEAT"
     );
 }
 
@@ -935,17 +880,27 @@ async fn mac_fx03_second_minus_12_after_resigned_emits_failed_repeat() {
         .await
         .unwrap();
     assert_eq!(read_state(&pool, doc).await, "REJECTED");
-    let chain = read_audit_chain(&pool, doc).await;
-    // Resigned on attempt #1; FAILED_REPEAT on attempt #2; counter=1.
-    assert!(
-        chain.iter().any(|(e, _, _)| e == "MAC_RECOVERY_RESIGNED"),
-        "attempt #1 must complete with RESIGNED: {chain:?}"
-    );
-    assert!(
-        chain
-            .iter()
-            .any(|(e, _, _)| e == "MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH"),
-        "attempt #2 short-circuit must emit FAILED_REPEAT: {chain:?}"
+    // R-W10.5-review LOW 2 close: position-pinned audit chain.
+    // Resigned on attempt #1; second-`-12` short-circuit on attempt
+    // #2 emits FAILED_REPEAT WITHOUT re-invoking the orchestrator.
+    let chain_events: Vec<String> = read_audit_chain(&pool, doc)
+        .await
+        .into_iter()
+        .map(|(e, _, _)| e)
+        .collect();
+    assert_eq!(
+        chain_events,
+        vec![
+            "STAGE_SEND_INTENT_MARKED".to_string(),
+            "STAGE_SEND_MAC_HASH_MISMATCH".to_string(),
+            "MAC_RECOVERY_RESIGNED".to_string(),
+            "STAGE_SEND_INTENT_MARKED".to_string(),
+            "STAGE_SEND_MAC_HASH_MISMATCH".to_string(),
+            "MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH".to_string(),
+        ],
+        "Second-`-12`-after-Resigned audit chain must be ordered exactly: \
+         INTENT_MARKED → MAC_HASH_MISMATCH → RESIGNED → \
+         INTENT_MARKED → MAC_HASH_MISMATCH → FAILED_REPEAT"
     );
     // Two trace rows (both RETRYABLE_MAC_HASH_MISMATCH).
     let traces = transport_trace::list_for_document(&pool, doc)
