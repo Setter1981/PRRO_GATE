@@ -9,7 +9,7 @@
 //! end-to-end through `with_immediate`, mirroring how W8.3 will
 //! invoke them.
 //!
-//! Nine fixtures:
+//! Ten fixtures:
 //!   1. seed_update happy: existing row → true, value persisted.
 //!   2. seed_update overwrite: prior value replaced (chain advance).
 //!   3. seed_update same-hash retry: idempotent, still returns true
@@ -19,8 +19,12 @@
 //!   6. mark_done happy: PROCESSING → DONE, processed_at set.
 //!   7. mark_done missing: false.
 //!   8. mark_done rolls back with enclosing tx.
-//!   9. mark_done idempotent on repeat: documents no-status-guard
-//!      contract (W8.3 CAS short-circuit owns idempotency upstream).
+//!   9. mark_done status guard rejects already-DONE row (W8 review
+//!      F4 close — replaces the previous "idempotent on repeat"
+//!      fixture which documented the now-removed permissive shape).
+//!   10. mark_done status guard rejects REJECTED-source row (belt-
+//!       and-braces against a wrong request_id flipping a terminal
+//!       row).
 
 use prro::db::models::enums::{NodeMode, ShiftState};
 use prro::db::repositories::{ingress_inbox, node_state};
@@ -291,33 +295,80 @@ async fn mark_done_rolls_back_with_enclosing_tx() {
 }
 
 #[tokio::test]
-async fn mark_done_idempotent_via_repeat_returns_true_each_time() {
-    // Note: unlike outbox INSERT, mark_done_tx is a plain UPDATE
-    // without a state-source guard.  A second call after DONE will
-    // still UPDATE 1 row (re-setting processed_at).  This is
-    // documented behaviour — stage_finalize is responsible for
-    // idempotency at the CAS level (Kvt2→Ack short-circuits on rerun
-    // BEFORE this helper runs, so in practice mark_done_tx is called
-    // exactly once per doc lifecycle).  The test pins this contract.
+async fn mark_done_status_guard_rejects_already_done_row() {
+    // W8 review F4 close: `mark_done_tx` carries
+    // `WHERE status = 'PROCESSING'` — a repeat call against a
+    // doc whose inbox is already DONE returns `false`, NOT silent
+    // success.  This protects terminal inbox state from being
+    // re-stamped by a caller-bug-induced wrong request_id.
+    //
+    // Note: under live worker flow the upstream CAS `Kvt2 → Ack`
+    // short-circuits rerun-on-Ack to `AlreadyAcked` BEFORE this
+    // helper is reached, so the live path is unaffected by the
+    // guard.  The test pins the helper-level contract.
     let (_d, pool) = fresh_pool().await;
     let req_id = seed_inbox_row_processing(&pool, 0x33).await;
 
-    for _ in 0..2 {
-        let updated = with_immediate(&pool, move |tx| {
-            Box::pin(async move {
-                let b = ingress_inbox::mark_done_tx(tx, &req_id).await?;
-                Ok::<bool, anyhow::Error>(b)
-            })
+    // First call: PROCESSING → DONE, returns true.
+    let first = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            let b = ingress_inbox::mark_done_tx(tx, &req_id).await?;
+            Ok::<bool, anyhow::Error>(b)
         })
-        .await
-        .unwrap();
-        assert!(
-            updated,
-            "each call against an existing row reports updated=true"
-        );
-    }
+    })
+    .await
+    .unwrap();
+    assert!(first, "PROCESSING → DONE must report updated=true");
     assert_eq!(
         read_inbox_status(&pool, &req_id).await.as_deref(),
         Some("DONE")
+    );
+
+    // Second call: status is now 'DONE', source-state guard rejects,
+    // rows_affected = 0, returns false.
+    let second = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            let b = ingress_inbox::mark_done_tx(tx, &req_id).await?;
+            Ok::<bool, anyhow::Error>(b)
+        })
+    })
+    .await
+    .unwrap();
+    assert!(
+        !second,
+        "second call against already-DONE row must report updated=false (status guard)"
+    );
+}
+
+#[tokio::test]
+async fn mark_done_status_guard_rejects_rejected_row() {
+    // Belt-and-braces: a row that already moved to REJECTED via
+    // `mark_rejected_tx` MUST NOT be flipped to DONE by a wrong
+    // `request_id` slipping through.
+    let (_d, pool) = fresh_pool().await;
+    let req_id = seed_inbox_row_processing(&pool, 0x44).await;
+    let req_slice: &[u8] = &req_id;
+    sqlx::query("UPDATE ingress_inbox SET status = 'REJECTED' WHERE request_id = ?")
+        .bind(req_slice)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let updated = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            let b = ingress_inbox::mark_done_tx(tx, &req_id).await?;
+            Ok::<bool, anyhow::Error>(b)
+        })
+    })
+    .await
+    .unwrap();
+    assert!(
+        !updated,
+        "REJECTED source state must not be flipped to DONE (status guard)"
+    );
+    assert_eq!(
+        read_inbox_status(&pool, &req_id).await.as_deref(),
+        Some("REJECTED"),
+        "status must remain REJECTED"
     );
 }

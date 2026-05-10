@@ -131,9 +131,48 @@ async fn seed_doc(
     .await
     .expect("seed SIGNED_XML");
 
+    // KVT raw bytes — for KVT1+ states finalize must NOT touch
+    // document_files.  Seed KVT1_RAW + KVT2_RAW so W8.4 review F3
+    // can assert post-finalize equality (R2 invariant: KVT raw
+    // bytes are never lost during stage 5).
+    if matches!(state, "KVT1" | "KVT2" | "ACK") {
+        sqlx::query(
+            "INSERT INTO document_files(document_id, kind, content) \
+             VALUES (?, 'KVT1_RAW', ?)",
+        )
+        .bind(&doc_bytes)
+        .bind(b"FAKE-KVT1-PROTOBUF".to_vec())
+        .execute(pool)
+        .await
+        .expect("seed KVT1_RAW");
+    }
+    if matches!(state, "KVT2" | "ACK") {
+        sqlx::query(
+            "INSERT INTO document_files(document_id, kind, content) \
+             VALUES (?, 'KVT2_RAW', ?)",
+        )
+        .bind(&doc_bytes)
+        .bind(b"FAKE-KVT2-PROTOBUF".to_vec())
+        .execute(pool)
+        .await
+        .expect("seed KVT2_RAW");
+    }
+
     let doc = DocumentId::from_bytes(<[u8; 16]>::try_from(doc_bytes.as_slice()).unwrap());
     let req: [u8; 16] = req_bytes.try_into().unwrap();
     (doc, req)
+}
+
+/// Read a `document_files` artifact by kind.  Used by the R2
+/// invariant assertions (W8.4 review F3 close): KVT raw bytes
+/// must survive finalize unchanged.
+async fn read_doc_file(pool: &SqlitePool, doc: DocumentId, kind: &str) -> Option<Vec<u8>> {
+    sqlx::query_scalar("SELECT content FROM document_files WHERE document_id = ? AND kind = ?")
+        .bind(doc)
+        .bind(kind)
+        .fetch_optional(pool)
+        .await
+        .expect("read document_files")
 }
 
 async fn read_state(pool: &SqlitePool, doc: DocumentId) -> String {
@@ -217,7 +256,7 @@ async fn kvt2_to_ack_happy_path() {
     )
     .await;
 
-    let outcome = stage_finalize::run(&pool, doc, FN_ID, &req)
+    let outcome = stage_finalize::run(&pool, doc)
         .await
         .expect("happy finalize");
 
@@ -286,6 +325,20 @@ async fn kvt2_to_ack_happy_path() {
     );
     // document_id is 0x11 x 16.
     assert_eq!(parsed["document_id"].as_str().unwrap(), "11".repeat(16));
+
+    // W8 review F3 close: R2 "KVT raw bytes never lost" — finalize
+    // does NOT touch document_files; KVT1_RAW and KVT2_RAW must
+    // survive unchanged.
+    assert_eq!(
+        read_doc_file(&pool, doc, "KVT1_RAW").await.as_deref(),
+        Some(&b"FAKE-KVT1-PROTOBUF"[..]),
+        "KVT1_RAW raw bytes must be unchanged after Ack"
+    );
+    assert_eq!(
+        read_doc_file(&pool, doc, "KVT2_RAW").await.as_deref(),
+        Some(&b"FAKE-KVT2-PROTOBUF"[..]),
+        "KVT2_RAW raw bytes must be unchanged after Ack"
+    );
 }
 
 // ─── Fixture 2 — MAC chain seed advances atomically with Ack ─────────
@@ -294,14 +347,12 @@ async fn kvt2_to_ack_happy_path() {
 async fn mac_chain_seed_advances_atomically_with_ack() {
     let (_d, pool) = fresh_pool().await;
     seed_fn(&pool, Some([0x55; 32])).await;
-    let (doc, req) = seed_doc(&pool, 0x22, 1, "KVT2", Some([0x77; 32]), Some([0x55; 32])).await;
+    let (doc, _req) = seed_doc(&pool, 0x22, 1, "KVT2", Some([0x77; 32]), Some([0x55; 32])).await;
 
     let pre_seed = read_seed(&pool).await.unwrap();
     assert_eq!(pre_seed, vec![0x55; 32]);
 
-    stage_finalize::run(&pool, doc, FN_ID, &req)
-        .await
-        .expect("finalize");
+    stage_finalize::run(&pool, doc).await.expect("finalize");
 
     let post_seed = read_seed(&pool).await.unwrap();
     assert_eq!(
@@ -322,9 +373,7 @@ async fn inbox_status_done_atomic_with_state_transition() {
 
     assert_eq!(read_inbox_status(&pool, &req).await, "PROCESSING");
 
-    stage_finalize::run(&pool, doc, FN_ID, &req)
-        .await
-        .expect("finalize");
+    stage_finalize::run(&pool, doc).await.expect("finalize");
 
     assert_eq!(read_inbox_status(&pool, &req).await, "DONE");
     assert_eq!(read_state(&pool, doc).await, "ACK");
@@ -336,13 +385,11 @@ async fn inbox_status_done_atomic_with_state_transition() {
 async fn outbox_row_inserted_inside_lock_no_publish_yet() {
     let (_d, pool) = fresh_pool().await;
     seed_fn(&pool, None).await;
-    let (doc, req) = seed_doc(&pool, 0x44, 5, "KVT2", Some([0xAA; 32]), None).await;
+    let (doc, _req) = seed_doc(&pool, 0x44, 5, "KVT2", Some([0xAA; 32]), None).await;
 
     assert_eq!(read_outbox_count(&pool).await, 0);
 
-    stage_finalize::run(&pool, doc, FN_ID, &req)
-        .await
-        .expect("finalize");
+    stage_finalize::run(&pool, doc).await.expect("finalize");
 
     let row = outbox::get_for_document(&pool, doc)
         .await
@@ -366,10 +413,10 @@ async fn outbox_row_inserted_inside_lock_no_publish_yet() {
 async fn rerun_on_ack_is_idempotent_no_op() {
     let (_d, pool) = fresh_pool().await;
     seed_fn(&pool, None).await;
-    let (doc, req) = seed_doc(&pool, 0x55, 1, "KVT2", Some([0xEE; 32]), None).await;
+    let (doc, _req) = seed_doc(&pool, 0x55, 1, "KVT2", Some([0xEE; 32]), None).await;
 
     // First run — happy.
-    let first = stage_finalize::run(&pool, doc, FN_ID, &req)
+    let first = stage_finalize::run(&pool, doc)
         .await
         .expect("first finalize");
     assert!(matches!(first, StageFinalizeOutcome::Acked { .. }));
@@ -379,7 +426,7 @@ async fn rerun_on_ack_is_idempotent_no_op() {
     let audit_after_first = read_audit_event_types(&pool, doc).await;
 
     // Second run — must be no-op, no side effects.
-    let second = stage_finalize::run(&pool, doc, FN_ID, &req)
+    let second = stage_finalize::run(&pool, doc)
         .await
         .expect("rerun on Ack is success-shape");
     assert_eq!(
@@ -417,7 +464,7 @@ async fn non_kvt2_state_short_circuits_no_seed_advance() {
 
     let pre_seed = read_seed(&pool).await.unwrap();
 
-    let outcome = stage_finalize::run(&pool, doc, FN_ID, &req)
+    let outcome = stage_finalize::run(&pool, doc)
         .await
         .expect("non-Kvt2 is success-shape, not error");
 
@@ -450,7 +497,7 @@ async fn unsigned_xml_sha_missing_typed_error_full_rollback() {
 
     let pre_seed = read_seed(&pool).await.unwrap();
 
-    let err = stage_finalize::run(&pool, doc, FN_ID, &req)
+    let err = stage_finalize::run(&pool, doc)
         .await
         .expect_err("missing unsigned_xml_sha256 must surface as typed error");
 
@@ -498,9 +545,8 @@ async fn document_missing_returns_outcome_not_error() {
     let (_d, pool) = fresh_pool().await;
     seed_fn(&pool, None).await;
     let bogus = DocumentId::from_bytes([0xAA; 16]);
-    let req = [0xBB; 16];
 
-    let outcome = stage_finalize::run(&pool, bogus, FN_ID, &req)
+    let outcome = stage_finalize::run(&pool, bogus)
         .await
         .expect("missing doc is success-shape, not error");
     assert_eq!(outcome, StageFinalizeOutcome::DocumentMissing);
@@ -536,7 +582,7 @@ async fn seed_update_missing_typed_error_full_rollback() {
         .await
         .expect("delete node_state");
 
-    let err = stage_finalize::run(&pool, doc, FN_ID, &req)
+    let err = stage_finalize::run(&pool, doc)
         .await
         .expect_err("missing node_state must surface as typed error");
 
@@ -566,7 +612,10 @@ async fn seed_update_missing_typed_error_full_rollback() {
 async fn inbox_done_missing_typed_error_full_rollback() {
     let (_d, pool) = fresh_pool().await;
     seed_fn(&pool, Some([0x44; 32])).await;
-    let (doc, req) = seed_doc(&pool, 0x99, 1, "KVT2", Some([0x66; 32]), None).await;
+    // doc.previous_hash MUST match FN seed (0x44) — otherwise the
+    // chain-continuity guard would reject FIRST and we'd never reach
+    // the InboxDoneMissing path.
+    let (doc, req) = seed_doc(&pool, 0x99, 1, "KVT2", Some([0x66; 32]), Some([0x44; 32])).await;
 
     let pre_seed = read_seed(&pool).await.unwrap();
 
@@ -581,7 +630,7 @@ async fn inbox_done_missing_typed_error_full_rollback() {
         .await
         .expect("delete inbox row");
 
-    let err = stage_finalize::run(&pool, doc, FN_ID, &req)
+    let err = stage_finalize::run(&pool, doc)
         .await
         .expect_err("missing inbox row must surface as typed error");
 
@@ -613,17 +662,13 @@ async fn inbox_done_missing_typed_error_full_rollback() {
 async fn concurrent_finalize_yields_one_acked_and_one_already_acked() {
     let (_d, pool) = fresh_pool().await;
     seed_fn(&pool, None).await;
-    let (doc, req) = seed_doc(&pool, 0xAA, 1, "KVT2", Some([0xBB; 32]), None).await;
+    let (doc, _req) = seed_doc(&pool, 0xAA, 1, "KVT2", Some([0xBB; 32]), None).await;
 
     let pool_a = pool.clone();
     let pool_b = pool.clone();
-    let req_a = req;
-    let req_b = req;
 
-    let handle_a =
-        tokio::spawn(async move { stage_finalize::run(&pool_a, doc, FN_ID, &req_a).await });
-    let handle_b =
-        tokio::spawn(async move { stage_finalize::run(&pool_b, doc, FN_ID, &req_b).await });
+    let handle_a = tokio::spawn(async move { stage_finalize::run(&pool_a, doc).await });
+    let handle_b = tokio::spawn(async move { stage_finalize::run(&pool_b, doc).await });
 
     let outcome_a = handle_a.await.expect("spawn join a").expect("finalize a");
     let outcome_b = handle_b.await.expect("spawn join b").expect("finalize b");
@@ -662,7 +707,118 @@ async fn concurrent_finalize_yields_one_acked_and_one_already_acked() {
     assert_eq!(read_state(&pool, doc).await, "ACK");
 }
 
-// ─── Fixture 12 — `(Kvt2, Ack)` whitelist regression guard (F4-bis) ──
+// ─── Fixtures 12-14 — chain-continuity guard (W8 review F2 close) ────
+// (Out-of-order finalize would silently corrupt the chain seed
+// without this guard.  Three mismatch shapes: Some≠Some, None vs
+// Some, Some vs None.  All return ChainSeedMismatch + full rollback.)
+
+#[tokio::test]
+async fn chain_seed_mismatch_some_neq_some_typed_error_full_rollback() {
+    let (_d, pool) = fresh_pool().await;
+    seed_fn(&pool, Some([0x11; 32])).await; // FN seed = 0x11
+                                            // Doc's previous_hash = 0x99 ≠ FN seed 0x11 — chain break.
+    let (doc, req) = seed_doc(&pool, 0xC1, 1, "KVT2", Some([0xCC; 32]), Some([0x99; 32])).await;
+
+    let pre_seed = read_seed(&pool).await.unwrap();
+
+    let err = stage_finalize::run(&pool, doc)
+        .await
+        .expect_err("chain mismatch must surface as typed error");
+
+    match err {
+        StageFinalizeError::ChainSeedMismatch {
+            document_id,
+            expected,
+            actual,
+        } => {
+            assert_eq!(document_id, doc);
+            assert_eq!(expected, Some([0x99; 32]));
+            assert_eq!(actual, Some([0x11; 32]));
+        }
+        other => panic!("expected ChainSeedMismatch, got {other:?}"),
+    }
+
+    // Full rollback: doc state, seed, inbox, outbox, audit, KVT2_RAW.
+    assert_eq!(read_state(&pool, doc).await, "KVT2");
+    assert_eq!(read_seed(&pool).await.unwrap(), pre_seed);
+    assert_eq!(read_inbox_status(&pool, &req).await, "PROCESSING");
+    assert_eq!(read_outbox_count(&pool).await, 0);
+    assert!(read_audit_event_types(&pool, doc).await.is_empty());
+    assert_eq!(
+        read_doc_file(&pool, doc, "KVT2_RAW").await.as_deref(),
+        Some(&b"FAKE-KVT2-PROTOBUF"[..]),
+        "KVT2_RAW must remain intact after rollback"
+    );
+}
+
+#[tokio::test]
+async fn chain_seed_mismatch_none_vs_some_typed_error_full_rollback() {
+    // FN seed = None (genesis), but doc's previous_hash = Some(...)
+    // — doc claims to extend a chain that doesn't exist.
+    let (_d, pool) = fresh_pool().await;
+    seed_fn(&pool, None).await;
+    let (doc, _req) = seed_doc(&pool, 0xC2, 1, "KVT2", Some([0xDD; 32]), Some([0x77; 32])).await;
+
+    let err = stage_finalize::run(&pool, doc)
+        .await
+        .expect_err("None vs Some chain mismatch must surface as typed error");
+
+    match err {
+        StageFinalizeError::ChainSeedMismatch {
+            expected, actual, ..
+        } => {
+            assert_eq!(expected, Some([0x77; 32]));
+            assert_eq!(actual, None);
+        }
+        other => panic!("expected ChainSeedMismatch, got {other:?}"),
+    }
+    assert_eq!(read_state(&pool, doc).await, "KVT2");
+    assert!(read_seed(&pool).await.is_none());
+}
+
+#[tokio::test]
+async fn chain_seed_mismatch_some_vs_none_typed_error_full_rollback() {
+    // FN seed = Some(0x44), but doc's previous_hash = None — doc
+    // claims to be genesis when chain already has prior docs.
+    let (_d, pool) = fresh_pool().await;
+    seed_fn(&pool, Some([0x44; 32])).await;
+    let (doc, _req) = seed_doc(&pool, 0xC3, 1, "KVT2", Some([0xEE; 32]), None).await;
+
+    let err = stage_finalize::run(&pool, doc)
+        .await
+        .expect_err("Some vs None chain mismatch must surface as typed error");
+
+    match err {
+        StageFinalizeError::ChainSeedMismatch {
+            expected, actual, ..
+        } => {
+            assert_eq!(expected, None);
+            assert_eq!(actual, Some([0x44; 32]));
+        }
+        other => panic!("expected ChainSeedMismatch, got {other:?}"),
+    }
+    assert_eq!(read_state(&pool, doc).await, "KVT2");
+    assert_eq!(read_seed(&pool).await.unwrap(), vec![0x44; 32]);
+}
+
+#[tokio::test]
+async fn chain_seed_genesis_none_to_none_succeeds() {
+    // Genesis case: FN seed None, doc previous_hash None — chain
+    // boots cleanly.  Positive control for the chain-continuity
+    // guard (None == None must NOT be treated as mismatch).
+    let (_d, pool) = fresh_pool().await;
+    seed_fn(&pool, None).await;
+    let (doc, _req) = seed_doc(&pool, 0xC4, 1, "KVT2", Some([0xAA; 32]), None).await;
+
+    let outcome = stage_finalize::run(&pool, doc)
+        .await
+        .expect("genesis (None == None) must finalize cleanly");
+    assert!(matches!(outcome, StageFinalizeOutcome::Acked { .. }));
+    assert_eq!(read_state(&pool, doc).await, "ACK");
+    assert_eq!(read_seed(&pool).await.unwrap(), vec![0xAA; 32]);
+}
+
+// ─── Fixture 16 — `(Kvt2, Ack)` whitelist regression guard (F4-bis) ──
 
 #[test]
 fn whitelist_kvt2_ack_regression_guard() {

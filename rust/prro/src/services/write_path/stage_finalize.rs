@@ -65,6 +65,28 @@ pub enum StageFinalizeError {
     #[error("stage 5 unsigned_xml_sha256 missing for doc {document_id:?} despite reaching Kvt2")]
     UnsignedXmlShaMissing { document_id: DocumentId },
 
+    /// Doc's `previous_hash` does not match the FN's current
+    /// `node_state.last_known_unsigned_xml_sha256` (the chain seed
+    /// from the previously-Acked doc).  Out-of-order finalize
+    /// (e.g. W9 boot recovery iterating Kvt2 docs in wrong lnd
+    /// order) would silently corrupt the next-doc MAC chain seed
+    /// without this guard.
+    ///
+    /// Per W8 review F2: chain-continuity is enforced at finalize,
+    /// not just by the W9 design constraint that recovery must sort
+    /// by lnd.  `expected` is the doc's `previous_hash` (what the
+    /// chain SHOULD point to upon entering finalize), `actual` is
+    /// the FN's `last_known_unsigned_xml_sha256` (what the chain
+    /// DOES point to).  Both `None` is the genesis case (legitimate;
+    /// no error).  Any other inequality is a structural breach;
+    /// rollback the entire envelope.
+    #[error("stage 5 chain seed mismatch for doc {document_id:?}: expected {expected:?}, actual {actual:?}")]
+    ChainSeedMismatch {
+        document_id: DocumentId,
+        expected: Option<[u8; 32]>,
+        actual: Option<[u8; 32]>,
+    },
+
     /// `node_state::update_last_known_xml_sha_tx` returned `false` —
     /// `node_state` row missing for the FN.  W5 acquire stage upserts
     /// this row before any doc lands in PREPARED, so a missing row
@@ -172,13 +194,29 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// Stage 5 worker step — single-`with_immediate` finalize.
 ///
+/// **Source-of-truth contract (W8 review F1 close).**  The signature
+/// takes ONLY `doc` (DocumentId).  `fiscal_number` and `request_id`
+/// are read from the doc row via [`fd::fetch_finalize_inputs_tx`]
+/// inside the same envelope as the CAS — caller-supplied FN /
+/// request_id would let a wrong dispatch (worker bug, race) Ack one
+/// doc but advance another FN's seed or mark another inbox row
+/// DONE.  The new shape makes that bug class structurally impossible.
+///
 /// **Atomicity envelope.**  All five writes (CAS, seed, inbox, outbox,
 /// audit) commit under one `BEGIN IMMEDIATE`; partial commits are
 /// impossible by construction.  Any post-CAS write returning a
-/// state-invariant breach (`SeedUpdateMissing`, `InboxDoneMissing`)
-/// rolls the entire tx back via `?`-propagation — the chain pointer
-/// cannot leak past a failed Ack, and `STAGE_FINALIZE_ACK` audit row
-/// is written if and only if the doc actually reached terminal Ack.
+/// state-invariant breach (`ChainSeedMismatch`, `SeedUpdateMissing`,
+/// `InboxDoneMissing`) rolls the entire tx back via `?`-propagation
+/// — the chain pointer cannot leak past a failed Ack, and
+/// `STAGE_FINALIZE_ACK` audit row is written iff the doc actually
+/// reached terminal Ack.
+///
+/// **Chain-continuity guard (W8 review F2 close).**  Before the seed
+/// advance, the closure reads `node_state.last_known_unsigned_xml_sha256`
+/// inside the same tx and asserts it equals `inputs.previous_hash`
+/// (None == None for genesis).  Out-of-order finalize (e.g. W9 boot
+/// recovery iterating Kvt2 docs in wrong lnd order) would silently
+/// corrupt the chain seed without this guard.
 ///
 /// **Idempotency.**  CAS `Kvt2 → Ack` on a doc already in `Ack`
 /// returns `Conflict`; the closure disambiguates via a follow-up
@@ -195,14 +233,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 pub async fn run(
     pool: &SqlitePool,
     doc: DocumentId,
-    fn_id: &str,
-    request_id: &[u8; 16],
 ) -> Result<StageFinalizeOutcome, StageFinalizeError> {
-    let fn_id_owned = fn_id.to_string();
-    let request_id_owned = *request_id;
     let outcome = with_immediate(pool, move |tx| {
-        let fn_id = fn_id_owned;
-        let request_id = request_id_owned;
         Box::pin(async move {
             // 1. CAS Kvt2 → Ack.  Conflict → disambiguate already-Ack
             //    (idempotent) vs other states (StateConflict).
@@ -242,21 +274,45 @@ pub async fn run(
                 anyhow::Error::new(StageFinalizeError::UnsignedXmlShaMissing { document_id: doc })
             })?;
 
-            // 3. Cross-doc MAC chain seed advance.
-            if !node_state::update_last_known_xml_sha_tx(tx, &fn_id, &seed).await? {
+            // 3. Chain-continuity guard (W8 review F2 close).  Read
+            //    the FN's current chain seed inside the same tx and
+            //    assert it equals this doc's `previous_hash` — i.e.
+            //    this doc extends the existing chain, not jumps over
+            //    it.  Genesis case: both `None`.  Out-of-order
+            //    finalize (W9 boot recovery in wrong lnd order) is
+            //    structurally rejected here.
+            let ns_row = node_state::get_tx(tx, &inputs.fiscal_number)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::Error::new(StageFinalizeError::SeedUpdateMissing {
+                        fn_id: inputs.fiscal_number.clone(),
+                    })
+                })?;
+            if ns_row.last_known_unsigned_xml_sha256 != inputs.previous_hash {
+                return Err(anyhow::Error::new(StageFinalizeError::ChainSeedMismatch {
+                    document_id: doc,
+                    expected: inputs.previous_hash,
+                    actual: ns_row.last_known_unsigned_xml_sha256,
+                }));
+            }
+
+            // 4. Cross-doc MAC chain seed advance.  fiscal_number is
+            //    sourced from the doc row (W8 review F1 close).
+            if !node_state::update_last_known_xml_sha_tx(tx, &inputs.fiscal_number, &seed).await? {
                 return Err(anyhow::Error::new(StageFinalizeError::SeedUpdateMissing {
-                    fn_id: fn_id.clone(),
+                    fn_id: inputs.fiscal_number.clone(),
                 }));
             }
 
-            // 4. Inbox DONE.
-            if !ingress_inbox::mark_done_tx(tx, &request_id).await? {
+            // 5. Inbox DONE.  request_id is sourced from the doc row
+            //    (W8 review F1 close).
+            if !ingress_inbox::mark_done_tx(tx, &inputs.request_id).await? {
                 return Err(anyhow::Error::new(StageFinalizeError::InboxDoneMissing {
-                    request_id,
+                    request_id: inputs.request_id,
                 }));
             }
 
-            // 5. Outbox INSERT.  PK on document_id is defence-in-depth
+            // 6. Outbox INSERT.  PK on document_id is defence-in-depth
             //    against duplicate finalize (CAS short-circuit above
             //    is the primary guard).
             outbox::enqueue_document_tx(
@@ -270,10 +326,10 @@ pub async fn run(
             )
             .await?;
 
-            // 6. Audit STAGE_FINALIZE_ACK with rich cross-correlation
+            // 7. Audit STAGE_FINALIZE_ACK with rich cross-correlation
             //    payload.
             let payload = serde_json::json!({
-                "request_id": hex_encode(&request_id),
+                "request_id": hex_encode(&inputs.request_id),
                 "document_id": hex_encode(doc.as_bytes()),
                 "fiscal_number": inputs.fiscal_number,
                 "lnd": inputs.lnd,
