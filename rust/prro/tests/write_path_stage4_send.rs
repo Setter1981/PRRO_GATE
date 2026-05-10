@@ -217,7 +217,7 @@ async fn happy_sent_full_pattern_b_round_trip() {
     let doc = seed_signed_doc_with_xml(&pool, 0x11, "SELL", 1, "SIGNED").await;
     let stub = StubDpsChannel::new(Ok(ack("DPS-FN-7777")));
 
-    let outcome = stage_send::run(&pool, &stub, doc)
+    let outcome = stage_send::run(&pool, &stub, doc, None)
         .await
         .expect("happy path must succeed");
 
@@ -282,7 +282,7 @@ async fn terminal_reject_routes_to_rejected_no_server_fiscal_no() {
         message: "ERROR_VEREFY".into(),
     }));
 
-    let outcome = stage_send::run(&pool, &stub, doc)
+    let outcome = stage_send::run(&pool, &stub, doc, None)
         .await
         .expect("rejected wire response is a successful stage_send outcome");
 
@@ -328,7 +328,7 @@ async fn transport_retryable_routes_to_error_retryable_preserves_attempt_at() {
     let doc = seed_signed_doc_with_xml(&pool, 0x33, "SELL", 1, "SIGNED").await;
     let stub = StubDpsChannel::new(Err(DpsError::Transport("TLS reset".into())));
 
-    let outcome = stage_send::run(&pool, &stub, doc)
+    let outcome = stage_send::run(&pool, &stub, doc, None)
         .await
         .expect("transport error is a successful stage_send outcome");
 
@@ -384,7 +384,7 @@ async fn terminal_server_minus_5_routes_to_rejected_critical_audit() {
         message: "ERROR_TYPE".into(),
     }));
 
-    let outcome = stage_send::run(&pool, &stub, doc)
+    let outcome = stage_send::run(&pool, &stub, doc, None)
         .await
         .expect("Server -5 is a successful stage_send outcome (terminal route)");
 
@@ -441,7 +441,7 @@ async fn fn_config_minus_13_routes_to_error_retryable_with_fn_config_class() {
         message: "ERROR_NOT_REGISTERED_RRO".into(),
     }));
 
-    let outcome = stage_send::run(&pool, &stub, doc)
+    let outcome = stage_send::run(&pool, &stub, doc, None)
         .await
         .expect("Authorization -13 is a successful stage_send outcome");
 
@@ -506,7 +506,7 @@ async fn decode_status_zero_routes_to_probe_required_with_decode_unknown_hint() 
     let doc = seed_signed_doc_with_xml(&pool, 0xB3, "SELL", 1, "SIGNED").await;
     let stub = StubDpsChannel::new(Err(DpsError::Decode("status=0 UNKNOWN".into())));
 
-    let outcome = stage_send::run(&pool, &stub, doc)
+    let outcome = stage_send::run(&pool, &stub, doc, None)
         .await
         .expect("Decode is a successful stage_send outcome (probe-required route)");
 
@@ -615,7 +615,7 @@ async fn server_minus_11_routes_to_rejected_and_flips_node_to_blocked() {
         message: "ERROR_OFFLINE_168".into(),
     }));
 
-    let outcome = stage_send::run(&pool, &stub, doc)
+    let outcome = stage_send::run(&pool, &stub, doc, None)
         .await
         .expect("Server -11 is a successful stage_send outcome (terminal + flip)");
 
@@ -696,7 +696,7 @@ async fn server_minus_11_with_missing_node_state_surfaces_typed_error() {
         message: "ERROR_OFFLINE_168".into(),
     }));
 
-    let err = stage_send::run(&pool, &stub, doc)
+    let err = stage_send::run(&pool, &stub, doc, None)
         .await
         .expect_err("missing node_state at 4-b must surface typed error");
     match err {
@@ -810,7 +810,7 @@ async fn pattern_b_ordering_spy_observes_committed_sending_before_send_chk() {
         }),
     );
 
-    let outcome = stage_send::run(&pool, &stub, doc).await.unwrap();
+    let outcome = stage_send::run(&pool, &stub, doc, None).await.unwrap();
     assert!(
         matches!(outcome, StageSendOutcome::Sent { .. }),
         "spy fixture expects happy path, got {outcome:?}"
@@ -840,7 +840,7 @@ async fn rerun_on_sent_state_conflict_short_circuits_with_zero_wire_calls() {
     // Stub configured but should NOT be called.  call_count proves it.
     let stub = StubDpsChannel::new(Ok(ack("SHOULD-NEVER-BE-USED")));
 
-    let outcome = stage_send::run(&pool, &stub, doc)
+    let outcome = stage_send::run(&pool, &stub, doc, None)
         .await
         .expect("rerun on SENT is a successful idempotent re-entry, not an error");
 
@@ -916,7 +916,7 @@ async fn retry_path_error_retryable_to_sending_drives_through_4_pre() {
     let doc = seed_signed_doc_with_xml(&pool, 0xC1, "SELL", 1, "ERROR_RETRYABLE").await;
     let stub = StubDpsChannel::new(Ok(ack("DPS-FN-RETRY-OK")));
 
-    let outcome = stage_send::run(&pool, &stub, doc)
+    let outcome = stage_send::run(&pool, &stub, doc, None)
         .await
         .expect("retry from ErrorRetryable must succeed");
 
@@ -975,7 +975,7 @@ async fn rerun_on_non_allowlisted_states_short_circuits_with_zero_wire_calls() {
         let doc = seed_signed_doc_with_xml(&pool, byte_seed, "SELL", lnd, state_str).await;
         let stub = StubDpsChannel::new(Ok(ack("SHOULD-NEVER-BE-USED")));
 
-        let outcome = stage_send::run(&pool, &stub, doc)
+        let outcome = stage_send::run(&pool, &stub, doc, None)
             .await
             .unwrap_or_else(|e| {
                 panic!("rerun on {state_str} should be Ok(StateConflict), got Err({e:?})")
@@ -1016,7 +1016,7 @@ async fn empty_server_fiscal_no_routes_to_typed_error_no_4b_persist() {
     // on the next boot.
     let stub = StubDpsChannel::new(Ok(ack("")));
 
-    let err = stage_send::run(&pool, &stub, doc)
+    let err = stage_send::run(&pool, &stub, doc, None)
         .await
         .expect_err("empty CheckAck.id must surface as typed error");
     match err {
@@ -1067,7 +1067,7 @@ async fn document_missing_returns_outcome_with_zero_wire_calls() {
     let bogus = DocumentId::from_bytes([0xAAu8; 16]);
     let stub = StubDpsChannel::new(Ok(ack("UNUSED")));
 
-    let outcome = stage_send::run(&pool, &stub, bogus)
+    let outcome = stage_send::run(&pool, &stub, bogus, None)
         .await
         .expect("DocumentMissing is a successful idempotent outcome, not an error");
     assert_eq!(outcome, StageSendOutcome::DocumentMissing);
@@ -1112,7 +1112,7 @@ async fn signed_xml_missing_surfaces_typed_error_no_state_mutation() {
     let doc = DocumentId::from_bytes(<[u8; 16]>::try_from(doc_bytes.as_slice()).unwrap());
 
     let stub = StubDpsChannel::new(Ok(ack("UNUSED")));
-    let err = stage_send::run(&pool, &stub, doc)
+    let err = stage_send::run(&pool, &stub, doc, None)
         .await
         .expect_err("missing SIGNED_XML must surface as typed error");
     match err {
