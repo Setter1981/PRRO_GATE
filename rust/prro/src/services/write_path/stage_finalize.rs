@@ -28,6 +28,15 @@
 //! `sign_cms_detached` / other foreign-IO calls; the closure body is
 //! pure DB.  The runtime task_local guard panics in debug if any
 //! denied method is reached from inside the `with_immediate`.
+//!
+//! **Cancellation safety.**  `run` is cancel-safe at every await
+//! point.  If the caller drops the future before the enclosing
+//! `with_immediate` commits, sqlx's `SqliteConnection::Drop` issues
+//! an automatic ROLLBACK on the in-flight `BEGIN IMMEDIATE`
+//! transaction — no partial state survives.  The CAS `Kvt2 → Ack`
+//! and the four downstream writes are visible only after the
+//! envelope's COMMIT, which is the closure's last syscall; any
+//! earlier cancellation rolls all five writes back atomically.
 
 use sqlx::SqlitePool;
 
@@ -125,6 +134,16 @@ enum InternalOutcome {
 /// thrown via `anyhow::Error::new(StageFinalizeError::...)` round-trip
 /// cleanly; raw `sqlx::Error` becomes `Db`; everything else surfaces
 /// as `Internal` preserving the cause chain.
+///
+/// **Bridge discipline (callers MUST follow):** typed errors are
+/// constructed at the **top level** of the `anyhow::Error` chain via
+/// `anyhow::Error::new(StageFinalizeError::...)`.  Wrapping a typed
+/// error with `.context("...")` (which prepends the context as the
+/// new top of the chain) defeats this downcast — the error would
+/// surface as `Internal(anyhow::Error)` instead of the typed variant.
+/// If a future refactor needs context strings, switch this bridge to
+/// walk the chain via `e.chain().find_map(...)` rather than relaxing
+/// the discipline.
 fn bridge_anyhow(e: anyhow::Error) -> StageFinalizeError {
     match e.downcast::<StageFinalizeError>() {
         Ok(typed) => typed,
