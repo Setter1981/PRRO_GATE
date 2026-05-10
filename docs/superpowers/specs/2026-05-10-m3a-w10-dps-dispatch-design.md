@@ -313,10 +313,14 @@ Calling `run` repeatedly on a non-`TransientRetry` `ErrorRetryable` doc will pro
 
 **Why stage_send doesn't enforce.**  Reading the last trace row inside 4-pre would entangle stage 4 logic with W9 reconciliation policy and force `stage_send::run` to know the retry-class semantics — a layering violation.  Single-policy enforcement at the dispatcher gives one chokepoint that ops + W9 share.
 
-### 4.3 W10.3 — `node_state.mode → BLOCKED` side effect for `-11`
-- Add `pub async fn set_mode_blocked_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<bool>` to `node_state.rs`.  Mirror of existing tx-bound update helpers; returns `bool` for missing-row detection per W7.2 / W8.2 convention.
-- In `stage_send.rs` 4-b closure: if `decision.node_mode_flip == Some(NodeMode::Blocked)`, invoke the helper inside the same `with_immediate` envelope as the post-CAS write.  Atomic with the doc-state transition.
-- Audit payload extended: `node_mode_flipped: "BLOCKED"` recorded.
+### 4.3 W10.3 — `node_state.mode → BLOCKED` side effect for `-11` ✅ (closed)
+
+Implementation landed in commit `<W10.3 commit>`:
+
+- `pub async fn set_mode_blocked_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<bool>` added to `node_state.rs`.  Mirror of `update_last_known_xml_sha_tx`; returns `bool` for missing-row detection per W7.2 / W8.2 convention.
+- `stage_send.rs` 4-b closure honours `decision.node_mode_flip == Some(NodeMode::Blocked)` inside the same `with_immediate` envelope as the post-CAS write.  Atomic with the doc-state transition; missing FN row surfaces as typed `StageSendError::NodeStateMissingForBlock` and rolls back the entire 4-b tx — no half-applied state.
+- Audit payload extended on the routed arm: `node_mode_flipped: "BLOCKED"` recorded alongside `retry_class` (LOW 1) and `probe_hint` reason where present (LOW/MED 3 close).
+- Future-compat guard: `debug_assert_eq!(target_mode, NodeMode::Blocked)` fires in dev/CI if the routing fn ever emits a different `NodeMode` target without extending stage_send.
 
 ### 4.4 W10.4 — MAC recovery `-12` in-stage path
 

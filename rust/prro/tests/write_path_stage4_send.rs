@@ -551,6 +551,141 @@ async fn decode_status_zero_routes_to_probe_required_with_decode_unknown_hint() 
     );
 }
 
+// ─── Fixture 3e — Server -11 ERROR_OFFLINE_168 → node BLOCKED ────────
+//
+// W10.3 close.  -11 routes to TerminalReject + target=Rejected AND
+// flips `node_state.mode → BLOCKED` atomic with the doc-state CAS.
+// Pins:
+//   - decision.retry_class == TerminalReject
+//   - decision.target_state == Rejected
+//   - decision.node_mode_flip == Some(NodeMode::Blocked)
+//   - post-run `node_state.mode == 'BLOCKED'`
+//   - audit STAGE_SEND_NODE_BLOCKED (Critical)
+//   - audit payload carries `node_mode_flipped: "BLOCKED"`
+//   - durable retry_class on trace row
+
+#[tokio::test]
+async fn server_minus_11_routes_to_rejected_and_flips_node_to_blocked() {
+    use prro::db::repositories::node_state;
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_signed_doc_with_xml(&pool, 0xB4, "SELL", 1, "SIGNED").await;
+
+    // Pre-condition: node_state row must exist for the fn (W5 acquire
+    // upserts it; the seed helper above already INSERTed
+    // fiscal_number_config but not node_state).  Use upsert_initial
+    // mirroring W5's behaviour.
+    node_state::upsert_initial(
+        &pool,
+        "1234567890",
+        prro::db::models::enums::NodeMode::Online,
+        prro::db::models::enums::ShiftState::Closed,
+        1,
+    )
+    .await
+    .expect("seed node_state row");
+
+    let stub = StubDpsChannel::new(Err(DpsError::Server {
+        code: -11,
+        message: "ERROR_OFFLINE_168".into(),
+    }));
+
+    let outcome = stage_send::run(&pool, &stub, doc)
+        .await
+        .expect("Server -11 is a successful stage_send outcome (terminal + flip)");
+
+    // Outcome shape — TerminalReject + node_mode_flip evidence.
+    match outcome {
+        StageSendOutcome::Routed {
+            decision,
+            wire_status_code,
+            ..
+        } => {
+            assert_eq!(decision.retry_class, RetryClass::TerminalReject);
+            assert_eq!(decision.target_state, DocState::Rejected);
+            assert_eq!(
+                decision.node_mode_flip,
+                Some(prro::db::models::enums::NodeMode::Blocked),
+                "Server -11 routing fn must emit node_mode_flip=Blocked"
+            );
+            assert_eq!(wire_status_code, Some(-11));
+        }
+        other => panic!("expected Routed terminal-reject for -11, got {other:?}"),
+    }
+
+    // Doc state: REJECTED.
+    assert_eq!(read_doc_state(&pool, doc).await, "REJECTED");
+
+    // **W10.3 atomic flip proof.**  node_state.mode is BLOCKED.
+    let row = node_state::get(&pool, "1234567890")
+        .await
+        .unwrap()
+        .expect("node_state row must exist");
+    assert_eq!(
+        row.mode,
+        prro::db::models::enums::NodeMode::Blocked,
+        "Server -11 MUST flip node_state.mode → BLOCKED atomic with the CAS"
+    );
+
+    // Audit pair + payload evidence.
+    assert_eq!(
+        read_audit_event_types(&pool, doc).await,
+        vec!["STAGE_SEND_INTENT_MARKED", "STAGE_SEND_NODE_BLOCKED"]
+    );
+    let last_payload = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE entity_type = 'fiscal_document' AND entity_id = ? \
+         ORDER BY audit_id DESC LIMIT 1",
+    )
+    .bind(format!("{doc:?}"))
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .expect("audit payload must be present");
+    assert!(
+        last_payload.contains("\"node_mode_flipped\":\"BLOCKED\""),
+        "audit payload must carry node_mode_flipped evidence: {last_payload}"
+    );
+    assert!(
+        last_payload.contains("\"retry_class\":\"TerminalReject\""),
+        "audit payload must carry retry_class: {last_payload}"
+    );
+}
+
+// ─── Fixture 3f — Server -11 with missing node_state row → typed error
+//
+// W10.3 structural-breach proof.  If `node_state` row is missing at
+// 4-b time (W5 acquire MUST upsert it before stage 1), the typed
+// `NodeStateMissingForBlock` surfaces and the entire 4-b tx rolls
+// back — doc stays in SENDING for W9 reconciliation.
+
+#[tokio::test]
+async fn server_minus_11_with_missing_node_state_surfaces_typed_error() {
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_signed_doc_with_xml(&pool, 0xB5, "SELL", 1, "SIGNED").await;
+    // **Intentionally NO `node_state::upsert_initial`** — simulate
+    // structural breach (W5 invariant violated upstream).
+
+    let stub = StubDpsChannel::new(Err(DpsError::Server {
+        code: -11,
+        message: "ERROR_OFFLINE_168".into(),
+    }));
+
+    let err = stage_send::run(&pool, &stub, doc)
+        .await
+        .expect_err("missing node_state at 4-b must surface typed error");
+    match err {
+        StageSendError::NodeStateMissingForBlock { fn_id, document_id } => {
+            assert_eq!(fn_id, "1234567890");
+            assert_eq!(document_id, doc);
+        }
+        other => panic!("expected NodeStateMissingForBlock, got {other:?}"),
+    }
+
+    // Doc state stays in SENDING (4-b tx rolled back).  W9 will pick
+    // it up on the next boot.
+    assert_eq!(read_doc_state(&pool, doc).await, "SENDING");
+}
+
 // ─── Fixture 4 — pattern_b_ordering (spy) ────────────────────────────
 
 #[tokio::test]

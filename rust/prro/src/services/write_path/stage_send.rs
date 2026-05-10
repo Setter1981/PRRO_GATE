@@ -64,6 +64,7 @@ use crate::db::repositories::{
     audit_log, document_files,
     document_files::DocumentFileKind,
     fiscal_documents::{self as fd, TransitionOutcome},
+    node_state,
     transport_trace::{self, AttemptCompletion, NewAttempt},
 };
 use crate::db::tx::with_immediate;
@@ -151,6 +152,20 @@ pub enum StageSendError {
         "stage 4 mark_submission_attempted_tx returned 0 for doc {document_id:?} after CAS Applied"
     )]
     MarkSubmissionAttemptedMissing { document_id: DocumentId },
+
+    /// W10.3 — `node_state::set_mode_blocked_tx` returned `false` in
+    /// 4-b: the FN row is missing.  W5 acquire upserts the row before
+    /// stage 1, so a missing FN at 4-b time is a structural breach
+    /// (mirror of `StageFinalizeError::SeedUpdateMissing`).  Surfacing
+    /// as typed error lets the dispatcher escalate (operator inspection
+    /// / W9 forensics) rather than silently leave the FN unblocked
+    /// after a -11 — which would let the next document hit the same
+    /// 168-hour limit and burst the fleet of Rejected docs.
+    #[error("stage 4 set_mode_blocked_tx returned 0 for fn {fn_id} after CAS Applied")]
+    NodeStateMissingForBlock {
+        fn_id: String,
+        document_id: DocumentId,
+    },
 
     /// `set_server_fiscal_no_tx` returned `false` in 4-b AFTER the
     /// CAS `Sending → Sent` succeeded.  Same invariant breach class
@@ -372,11 +387,14 @@ enum PreOutcome {
     /// CAS `(Signed | ErrorRetryable) → Sending` applied; trace row
     /// allocated; audit written.  Wire send is the next step (4a, no
     /// lock).  `doc_type` is propagated out of the closure so 4-a can
-    /// pass it to `route_send_result`.
+    /// pass it to `route_send_result`; `fiscal_number` is propagated
+    /// out so 4-b can call `node_state::set_mode_blocked_tx` for the
+    /// W10.3 `-11` flip without a separate read.
     Marked {
         envelope: CheckEnvelope,
         attempt_no: i32,
         doc_type: DocType,
+        fiscal_number: String,
     },
     /// `fetch_send_inputs_tx` returned `None` OR CAS returned
     /// `NotFound`.  No side effects.
@@ -730,18 +748,20 @@ pub async fn run(
                 envelope,
                 attempt_no,
                 doc_type: inputs.doc_type,
+                fiscal_number: inputs.fiscal_number,
             })
         })
     })
     .await
     .map_err(bridge_anyhow)?;
 
-    let (envelope, attempt_no, doc_type) = match pre {
+    let (envelope, attempt_no, doc_type, fiscal_number) = match pre {
         PreOutcome::Marked {
             envelope,
             attempt_no,
             doc_type,
-        } => (envelope, attempt_no, doc_type),
+            fiscal_number,
+        } => (envelope, attempt_no, doc_type, fiscal_number),
         PreOutcome::DocumentMissing => return Ok(StageSendOutcome::DocumentMissing),
         PreOutcome::SignedArtifactMissing => {
             return Err(StageSendError::SignedArtifactMissing { document_id: doc })
@@ -798,23 +818,29 @@ pub async fn run(
     //                                        decision.target_state +
     //                                        audit decision.audit_event.
     //
+    // **W10.3 honoured.**  `decision.node_mode_flip == Some(Blocked)`
+    // is invoked inside this same 4-b `with_immediate` envelope —
+    // `node_state.mode → BLOCKED` is atomic with the CAS
+    // `Sending → Rejected` and the audit row.  Server-11 cannot leave
+    // the FN unblocked.
+    //
     // **W10.2 deferred:**
-    //   - `decision.node_mode_flip` (Server-11) → W10.3 will honour
-    //     via `node_state::set_mode_blocked_tx` inside this same 4-b
-    //     closure.
     //   - `decision.mac_recovery_hint` (Server-12) → W10.4 will
     //     orchestrate MAC re-sign + re-send BEFORE this 4-b commit.
     //   - `decision.probe_hint` → W9 reconciliation territory; never
-    //     actioned in stage 4.
+    //     actioned in stage 4 (only surfaced in audit payload for
+    //     forensic grep, per W10.2 review LOW/MED 3).
     let decision_for_closure = wire_decision.clone();
     let forensics_for_closure = wire_forensics.clone();
     let started_for_closure = wire_call_started_at;
     let finished_for_closure = wire_call_finished_at;
+    let fiscal_number_for_closure = fiscal_number.clone();
     with_immediate(pool, move |tx| {
         let decision = decision_for_closure;
         let forensics = forensics_for_closure;
         let started = started_for_closure;
         let finished = finished_for_closure;
+        let fiscal_number = fiscal_number_for_closure;
         Box::pin(async move {
             let target = match &decision {
                 WireDecision::Sent { .. } => DocState::Sent,
@@ -846,6 +872,34 @@ pub async fn run(
                 }
             }
 
+            // W10.3 — node_state.mode flip atomic with the CAS above.
+            // Only Server-11 currently emits this flip; future routes
+            // may emit it for additional NodeMode targets.  We restrict
+            // to BLOCKED here (the only target the routing fn ever
+            // emits per freeze §3); if `node_mode_flip` ever carries
+            // a different NodeMode, the match falls through to a
+            // skip — surfaced via debug_assert! so dev/CI catches it.
+            if let WireDecision::Routed(d) = &decision {
+                if let Some(target_mode) = d.node_mode_flip {
+                    debug_assert_eq!(
+                        target_mode,
+                        crate::db::models::enums::NodeMode::Blocked,
+                        "W10.3 only honours NodeMode::Blocked; routing fn must \
+                         not emit other NodeMode targets without extending stage_send"
+                    );
+                    if target_mode == crate::db::models::enums::NodeMode::Blocked
+                        && !node_state::set_mode_blocked_tx(tx, &fiscal_number).await?
+                    {
+                        return Err(anyhow::Error::new(
+                            StageSendError::NodeStateMissingForBlock {
+                                fn_id: fiscal_number.clone(),
+                                document_id: doc,
+                            },
+                        ));
+                    }
+                }
+            }
+
             // Complete trace row.  rows_affected == 0 ⇒ typed error
             // (W7.1 append-then-complete contract).
             let completion =
@@ -861,11 +915,19 @@ pub async fn run(
 
             // Audit event: success arm uses STAGE_SEND_RESULT (W7
             // contract); routed arm uses `decision.audit_event` per
-            // freeze §3.4 closed enum.  R-W10.2-review LOW 1 close:
-            // routed arm carries `retry_class` in the payload so
-            // forensic grep is unambiguous (event_type alone clusters
-            // by audit category, but `retry_class` distinguishes
-            // routing-policy decisions inside a single category).
+            // freeze §3.4 closed enum.
+            //
+            // Payload composition (W10.2 review LOW 1 + LOW/MED 3 close):
+            //   - `attempt_no`, `outcome_kind` always present (W7).
+            //   - `retry_class` on the routed arm — forensic grep
+            //     dimension orthogonal to event_type.
+            //   - `node_mode_flipped: "BLOCKED"` on Server-11 — durable
+            //     evidence of the W10.3 flip; redundant with the
+            //     `node_state.mode = 'BLOCKED'` row but cheap, and lets
+            //     audit-log forensics work without a join.
+            //   - `probe_hint` reason on Decode/-2/-15 close-shift —
+            //     surfaces the W9 last_chk-probe target without
+            //     re-decoding the routing fn.
             let (event_type, severity) = match &decision {
                 WireDecision::Sent { .. } => ("STAGE_SEND_RESULT", Severity::Info),
                 WireDecision::Routed(d) => (d.audit_event.as_str(), d.audit_severity),
@@ -876,7 +938,15 @@ pub async fn run(
             });
             if let WireDecision::Routed(d) = &decision {
                 payload_obj["retry_class"] =
-                    serde_json::Value::String(format!("{:?}", d.retry_class));
+                    serde_json::Value::String(d.retry_class.as_str().to_string());
+                if let Some(mode) = d.node_mode_flip {
+                    payload_obj["node_mode_flipped"] =
+                        serde_json::Value::String(format!("{mode:?}").to_uppercase());
+                }
+                if let Some(hint) = &d.probe_hint {
+                    payload_obj["probe_hint"] =
+                        serde_json::Value::String(format!("{:?}", hint.reason));
+                }
             }
             let payload = payload_obj.to_string();
             audit_log::append_tx(
