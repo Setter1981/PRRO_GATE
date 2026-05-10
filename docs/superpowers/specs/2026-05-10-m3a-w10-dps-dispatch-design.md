@@ -294,6 +294,25 @@ Returns `WireDecision`.  4-b dispatch:
 
 **W3 static scan invariant** stays green (no foreign IO inserted into `with_immediate` closures).
 
+**Caller obligation — retry-loop policy (R-W10.2-review HIGH 1 close).**  4-pre CAS allowlist `(Signed | ErrorRetryable) → Sending` makes `stage_send::run` willing to re-attempt ANY doc currently in `ErrorRetryable`, regardless of which `RetryClass` put it there.  This is intentional — the routing fn is pure; the policy of "which retry classes warrant another wire send" lives one layer up.
+
+The contract:
+
+| `RetryClass` of last attempt | Caller MAY re-invoke `stage_send::run` |
+|---|---|
+| `TransientRetry` (Transport / Server-3) | YES — back off + re-attempt is the point of `ErrorRetryable` |
+| `FnConfigError` (Authorization{FnNotRegistered}, -13/-14) | NO — needs operator (W9 chains via `RequiresManualReconciliation`) |
+| `WrapperBug` (Internal / NotFound on live / QueryNotSupported on live / unknown server code / ServerFiscalIdMismatch) | NO — wrapper bug; needs code fix or W9 escalation |
+| `ProbeRequired` (Decode / `-2` close-shift / `-15` close-shift) | NO — needs W9 `last_chk` probe to disambiguate |
+| `MacRecovery` (`-12` first attempt) | NO — needs W10.4 orchestrator for re-pin + re-sign before retry |
+| `OperatorEscalation` (`-6` ERROR_NOT_PREV_ZREPORT) | NO — operator must reconcile a prior Z-report |
+
+Calling `run` repeatedly on a non-`TransientRetry` `ErrorRetryable` doc will produce an unbounded crash-loop: the same envelope ships, the server returns the same status, the doc lands in `ErrorRetryable` again with the same `retry_class`.
+
+**Where the gate lives.**  W10.2 does NOT gate inside `stage_send::run`; the gate is the worker dispatcher's responsibility (W11+).  `transport_trace.last_attempt_for(doc).retry_class` is the natural source-of-truth for the dispatcher's filter.  Until the dispatcher lands, callers (integration tests, ops scripts, ad-hoc replay) must manually respect the table above.  The module-level docstring on `stage_send.rs` carries the same warning.
+
+**Why stage_send doesn't enforce.**  Reading the last trace row inside 4-pre would entangle stage 4 logic with W9 reconciliation policy and force `stage_send::run` to know the retry-class semantics — a layering violation.  Single-policy enforcement at the dispatcher gives one chokepoint that ops + W9 share.
+
 ### 4.3 W10.3 — `node_state.mode → BLOCKED` side effect for `-11`
 - Add `pub async fn set_mode_blocked_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<bool>` to `node_state.rs`.  Mirror of existing tx-bound update helpers; returns `bool` for missing-row detection per W7.2 / W8.2 convention.
 - In `stage_send.rs` 4-b closure: if `decision.node_mode_flip == Some(NodeMode::Blocked)`, invoke the helper inside the same `with_immediate` envelope as the post-CAS write.  Atomic with the doc-state transition.

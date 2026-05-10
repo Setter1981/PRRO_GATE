@@ -12,6 +12,30 @@
 //! extended from `Signed → Sending` to `(Signed | ErrorRetryable) → Sending`
 //! per HIGH 3 §4.2 — Pattern B retry-path edge.
 //!
+//! # Caller obligation — retry-loop policy (R-W10.2-review HIGH 1)
+//!
+//! 4-pre CAS allowlist `(Signed | ErrorRetryable) → Sending` makes
+//! [`run`] willing to re-attempt any doc in `ErrorRetryable`,
+//! regardless of which `RetryClass` put it there.  The routing fn is
+//! pure; the policy of "which retry classes warrant another wire
+//! send" lives one layer up (worker dispatcher, W11+).  Callers MUST
+//! respect this table:
+//!
+//! | RetryClass of last attempt | re-invoke `run` |
+//! |---|---|
+//! | `TransientRetry` (Transport / Server-3)          | YES |
+//! | `FnConfigError` (-13/-14)                        | NO — operator |
+//! | `WrapperBug`                                     | NO — code fix |
+//! | `ProbeRequired` (Decode / -2/-15 close-shift)    | NO — W9 probe |
+//! | `MacRecovery` (-12)                              | NO — W10.4 orchestrator |
+//! | `OperatorEscalation` (-6)                        | NO — operator |
+//!
+//! Calling [`run`] repeatedly on a non-`TransientRetry` `ErrorRetryable`
+//! doc produces an unbounded crash-loop: same envelope, same server
+//! reply, same `ErrorRetryable` landing.  Until the worker dispatcher
+//! lands (W11+), tests + ops scripts MUST manually filter on
+//! `transport_trace.last_attempt_for(doc).retry_class`.  See freeze §4.2.
+//!
 //! Anchored on:
 //!   - W7 design freeze §4.3 (envelope builder)
 //!   - W10 design freeze §3 (`route_send_result`, `RoutingDecision`,
@@ -512,7 +536,20 @@ fn build_attempt_completion(
         // rather than panic in case of unforeseen path.
         (WireDecision::Routed(_), None) => (None, Some("UnknownRouted".to_string()), None),
     };
-    let kind_for_outcome = forensics.map(|(_, k, _)| *k).unwrap_or("Transport");
+    let kind_for_outcome = match forensics {
+        Some((_, k, _)) => *k,
+        None => {
+            // R-W10.2-review LOW 4 close: Routed-without-forensics is
+            // a programming bug — every Routed arm comes from `Err(_)`,
+            // which extract_wire_forensics handles exhaustively.  Fail
+            // fast in dev/CI; defensive fallback in release.
+            debug_assert!(
+                matches!(decision, WireDecision::Sent { .. }),
+                "WireDecision::Routed reached build_attempt_completion without forensics"
+            );
+            "Transport"
+        }
+    };
     AttemptCompletion {
         wire_call_started_at,
         wire_call_finished_at,
@@ -814,16 +851,24 @@ pub async fn run(
 
             // Audit event: success arm uses STAGE_SEND_RESULT (W7
             // contract); routed arm uses `decision.audit_event` per
-            // freeze §3.4 closed enum.
+            // freeze §3.4 closed enum.  R-W10.2-review LOW 1 close:
+            // routed arm carries `retry_class` in the payload so
+            // forensic grep is unambiguous (event_type alone clusters
+            // by audit category, but `retry_class` distinguishes
+            // routing-policy decisions inside a single category).
             let (event_type, severity) = match &decision {
                 WireDecision::Sent { .. } => ("STAGE_SEND_RESULT", Severity::Info),
                 WireDecision::Routed(d) => (d.audit_event.as_str(), d.audit_severity),
             };
-            let payload = serde_json::json!({
+            let mut payload_obj = serde_json::json!({
                 "attempt_no": attempt_no,
                 "outcome_kind": outcome_kind_str,
-            })
-            .to_string();
+            });
+            if let WireDecision::Routed(d) = &decision {
+                payload_obj["retry_class"] =
+                    serde_json::Value::String(format!("{:?}", d.retry_class));
+            }
+            let payload = payload_obj.to_string();
             audit_log::append_tx(
                 tx,
                 "fiscal_document",
@@ -1254,10 +1299,7 @@ mod tests {
 
     #[test]
     fn wire_decision_to_outcome_kind_maps_per_w10_2_table() {
-        use super::super::error_routing::{
-            AuditEvent, MacRecoveryHint, ProbeHint, ProbeReason, RetryClass, RoutingDecision,
-            WireDecision,
-        };
+        use super::super::error_routing::{AuditEvent, RetryClass, RoutingDecision, WireDecision};
         // Sent → OK regardless of wire_kind.
         assert_eq!(
             wire_decision_to_outcome_kind(
@@ -1315,16 +1357,5 @@ mod tests {
                 "{rc:?} should fold to RetryableServer in W10.2"
             );
         }
-        // Unused suppression: ProbeHint/MacRecoveryHint/ProbeReason
-        // are only used in the W10.5 fixtures; reference them here so
-        // the import isn't dead.
-        let _ = (
-            ProbeHint {
-                reason: ProbeReason::DecodeUnknown,
-            },
-            MacRecoveryHint {
-                raw_error_message: String::new(),
-            },
-        );
     }
 }

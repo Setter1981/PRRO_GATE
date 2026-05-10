@@ -550,31 +550,67 @@ async fn retry_path_error_retryable_to_sending_drives_through_4_pre() {
 // ─── Fixture 6c — non-{Signed, ErrorRetryable} short-circuits ────────
 
 #[tokio::test]
-async fn rerun_on_prepared_state_conflict_short_circuits_with_zero_wire_calls() {
+async fn rerun_on_non_allowlisted_states_short_circuits_with_zero_wire_calls() {
     // W10.2 HIGH 3 §4.2: 4-pre CAS only accepts Signed | ErrorRetryable.
-    // Any other source state (Prepared, Kvt1, Kvt2, etc.) MUST yield
-    // StateConflict + zero wire calls.  Pin Prepared specifically — the
-    // common pre-stage-3 leakage scenario.
+    // Any other source state (Prepared / Kvt1 / Kvt2 / Sending / Rejected
+    // / etc.) MUST yield StateConflict + zero wire calls.
+    //
+    // R-W10.2-review LOW 3 close: parametrise across the realistic ban
+    // set rather than pin a single state.  Each (state_str, expected
+    // DocState) tuple proves the allowlist.  byte_seed is per-case so
+    // the (fiscal_number, lnd) partial UNIQUE index is not violated
+    // when we batch them into one test.
+    //
+    // States covered:
+    //   - PREPARED: pre-stage-3 leakage scenario (worker bug bypassing
+    //     stage 3).
+    //   - SENDING: boot-recovery scenario — a crashed prior worker left
+    //     the marker; W9 must own this case, NOT a fresh stage 4.
+    //   - SENT, KVT1, KVT2: idempotent re-entry on already-fiscalised
+    //     docs (covered partly by fixture 5 for SENT; this widens it).
+    //   - REJECTED: terminal state — never re-attempted.
     let (_d, pool) = fresh_pool().await;
-    let doc = seed_signed_doc_with_xml(&pool, 0xC2, "SELL", 1, "PREPARED").await;
-    let stub = StubDpsChannel::new(Ok(ack("SHOULD-NEVER-BE-USED")));
+    let cases: Vec<(u8, &'static str, DocState)> = vec![
+        (0xC2, "PREPARED", DocState::Prepared),
+        (0xC3, "SENDING", DocState::Sending),
+        (0xC4, "KVT1", DocState::Kvt1),
+        (0xC5, "KVT2", DocState::Kvt2),
+        (0xC6, "REJECTED", DocState::Rejected),
+    ];
+    for (byte_seed, state_str, expected) in cases {
+        // Each case gets its own fiscal_number-distinguished doc via
+        // a unique lnd seed; SQLite UNIQUE(fiscal_number, lnd) WHERE
+        // lnd IS NOT NULL is otherwise tripped on batch re-seed.
+        let lnd = byte_seed as i64;
+        let doc = seed_signed_doc_with_xml(&pool, byte_seed, "SELL", lnd, state_str).await;
+        let stub = StubDpsChannel::new(Ok(ack("SHOULD-NEVER-BE-USED")));
 
-    let outcome = stage_send::run(&pool, &stub, doc)
-        .await
-        .expect("rerun on PREPARED is a successful idempotent re-entry, not an error");
+        let outcome = stage_send::run(&pool, &stub, doc)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("rerun on {state_str} should be Ok(StateConflict), got Err({e:?})")
+            });
 
-    match outcome {
-        StageSendOutcome::StateConflict { observed } => {
-            assert_eq!(observed, DocState::Prepared);
+        match outcome {
+            StageSendOutcome::StateConflict { observed } => {
+                assert_eq!(
+                    observed, expected,
+                    "{state_str}: observed must echo source state"
+                );
+            }
+            other => panic!("{state_str}: expected StateConflict, got {other:?}"),
         }
-        other => panic!("expected StateConflict on PREPARED, got {other:?}"),
+        assert_eq!(
+            stub.call_count(),
+            0,
+            "{state_str}: MUST NOT invoke send_chk on non-allowlisted state"
+        );
+        assert_eq!(
+            read_doc_state(&pool, doc).await,
+            state_str,
+            "{state_str}: state must remain unchanged"
+        );
     }
-    assert_eq!(
-        stub.call_count(),
-        0,
-        "rerun on PREPARED MUST NOT invoke send_chk"
-    );
-    assert_eq!(read_doc_state(&pool, doc).await, "PREPARED");
 }
 
 // ─── Fixture 7 — empty server_fiscal_no surfaces typed error ────────
