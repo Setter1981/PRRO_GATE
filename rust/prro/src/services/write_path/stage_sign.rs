@@ -312,52 +312,22 @@ pub async fn run(
     //
     // OUTSIDE any lock: typed parse, Kyiv-local TS, build, sha256, sign.
 
-    let ts_str = format_kyiv_local(&business_ts)?;
-    let typed_payload = parse_payload(wire_artifact_kind, &payload_json, total_sum_kop)?;
-
-    let local_number_u32: u32 = u32::try_from(lnd).map_err(|_| SignError::Range {
-        field: "lnd",
-        value: lnd,
-    })?;
-    let z_number_u32: u32 = match z_report_number {
-        Some(z) => u32::try_from(z).map_err(|_| SignError::Range {
-            field: "z_report_number",
-            value: z,
-        })?,
-        // Python parity: <DAT ZN="0"> for non-Z artifacts.
-        None => 0,
-    };
-
-    let previous_hash_hex = previous_hash_raw
-        .as_ref()
-        .map(|h| hex_encode(h))
-        .unwrap_or_default();
-
-    let header = DocumentHeader::with_defaults(
-        fn_id.clone(),
-        tax_number,
-        z_number_u32,
-        ts_str,
-        previous_hash_hex,
-    );
-
-    let canonical_doc =
-        build_canonical_doc(wire_artifact_kind, header, local_number_u32, typed_payload);
-    let unsigned_xml: Vec<u8> = build_canonical_xml(&canonical_doc)?;
-
-    let unsigned_xml_sha256: [u8; 32] = {
-        let digest = Sha256::digest(&unsigned_xml);
-        let mut out = [0u8; 32];
-        out.copy_from_slice(digest.as_slice());
-        out
-    };
-
-    let signed_payload = ctx
-        .provider
-        .sign_cms_detached(SignCmsRequest {
-            session: &ctx.session,
-            canonical_xml: &unsigned_xml,
-            profile: ctx.profile,
+    // R-W10.4-step2b-review MED 1 close: stage 3-NO-TX body shared
+    // with the W10.4 MAC recovery path via `build_canonical_and_sign_no_tx`.
+    // Single source of truth — drift between W6 sign + recovery
+    // re-sign is no longer possible.
+    let (unsigned_xml, unsigned_xml_sha256, signed_payload) =
+        build_canonical_and_sign_no_tx(NoTxBuildSignInputs {
+            ctx,
+            wire_artifact_kind,
+            fn_id: &fn_id,
+            tax_number: &tax_number,
+            business_ts: &business_ts,
+            payload_json: &payload_json,
+            total_sum_kop,
+            lnd,
+            z_report_number,
+            previous_hash: previous_hash_raw.as_ref(),
         })
         .await?;
 
@@ -514,35 +484,96 @@ pub async fn re_sign_after_mac_recovery(
     z_report_number: Option<i64>,
     new_previous_hash: [u8; 32],
 ) -> Result<ReSignedArtifacts, SignError> {
-    let ts_str = format_kyiv_local(business_ts)?;
-    let typed_payload = parse_payload(wire_artifact_kind, payload_json, total_sum_kop)?;
+    // R-W10.4-step2b-review MED 1 close: shared no-tx body with
+    // `stage_sign::run` via `build_canonical_and_sign_no_tx`.
+    let (unsigned_xml, unsigned_xml_sha256, signed_xml_cms) =
+        build_canonical_and_sign_no_tx(NoTxBuildSignInputs {
+            ctx,
+            wire_artifact_kind,
+            fn_id,
+            tax_number,
+            business_ts,
+            payload_json,
+            total_sum_kop,
+            lnd,
+            z_report_number,
+            previous_hash: Some(&new_previous_hash),
+        })
+        .await?;
+    Ok(ReSignedArtifacts {
+        unsigned_xml,
+        unsigned_xml_sha256,
+        signed_xml_cms,
+    })
+}
 
-    let local_number_u32: u32 = u32::try_from(lnd).map_err(|_| SignError::Range {
+// ─── Shared no-tx body (W6 stage 3 + W10.4 recovery) ─────────────────
+
+/// Inputs for [`build_canonical_and_sign_no_tx`].  Lifetime of all
+/// `&'a` references must outlive the await of the returned future.
+struct NoTxBuildSignInputs<'a> {
+    ctx: &'a SigningContext,
+    wire_artifact_kind: WireArtifactKind,
+    fn_id: &'a str,
+    tax_number: &'a str,
+    business_ts: &'a str,
+    payload_json: &'a str,
+    total_sum_kop: Option<i64>,
+    lnd: i64,
+    z_report_number: Option<i64>,
+    /// `None` for shifts without a prior chain (W6 first SHIFT_OPEN);
+    /// `Some(_)` for everyday SELL/RETURN/Z_REPORT and for MAC
+    /// recovery (where the recovered hash is always known).
+    previous_hash: Option<&'a [u8; 32]>,
+}
+
+/// W6 stage 3-NO-TX body, factored out so the W10.4 MAC recovery
+/// re-sign path uses identical canonical-XML build + sign logic.
+/// Single source of truth — adding validation / fixing a date bug
+/// is a one-place edit; both W6 sign and recovery re-sign pick up
+/// the change automatically (R-W10.4-step2b-review MED 1 close).
+async fn build_canonical_and_sign_no_tx(
+    inputs: NoTxBuildSignInputs<'_>,
+) -> Result<(Vec<u8>, [u8; 32], SignedCmsBytes), SignError> {
+    let ts_str = format_kyiv_local(inputs.business_ts)?;
+    let typed_payload = parse_payload(
+        inputs.wire_artifact_kind,
+        inputs.payload_json,
+        inputs.total_sum_kop,
+    )?;
+
+    let local_number_u32: u32 = u32::try_from(inputs.lnd).map_err(|_| SignError::Range {
         field: "lnd",
-        value: lnd,
+        value: inputs.lnd,
     })?;
-    let z_number_u32: u32 = match z_report_number {
+    let z_number_u32: u32 = match inputs.z_report_number {
         Some(z) => u32::try_from(z).map_err(|_| SignError::Range {
             field: "z_report_number",
             value: z,
         })?,
-        // Python parity (mirrors stage 3-NO-TX): `<DAT ZN="0">` for
-        // non-Z artifacts.  MAC recovery on a Z_REPORT keeps the
-        // already-allocated Z number; on SELL/RETURN/SHIFT_OPEN this
-        // is 0.
+        // Python parity: <DAT ZN="0"> for non-Z artifacts.
         None => 0,
     };
 
+    let previous_hash_hex = inputs
+        .previous_hash
+        .map(|h| hex_encode(h))
+        .unwrap_or_default();
+
     let header = DocumentHeader::with_defaults(
-        fn_id.to_string(),
-        tax_number.to_string(),
+        inputs.fn_id.to_string(),
+        inputs.tax_number.to_string(),
         z_number_u32,
         ts_str,
-        hex_encode(&new_previous_hash),
+        previous_hash_hex,
     );
 
-    let canonical_doc =
-        build_canonical_doc(wire_artifact_kind, header, local_number_u32, typed_payload);
+    let canonical_doc = build_canonical_doc(
+        inputs.wire_artifact_kind,
+        header,
+        local_number_u32,
+        typed_payload,
+    );
     let unsigned_xml: Vec<u8> = build_canonical_xml(&canonical_doc)?;
 
     let unsigned_xml_sha256: [u8; 32] = {
@@ -552,20 +583,17 @@ pub async fn re_sign_after_mac_recovery(
         out
     };
 
-    let signed_xml_cms = ctx
+    let signed_payload = inputs
+        .ctx
         .provider
         .sign_cms_detached(SignCmsRequest {
-            session: &ctx.session,
+            session: &inputs.ctx.session,
             canonical_xml: &unsigned_xml,
-            profile: ctx.profile,
+            profile: inputs.ctx.profile,
         })
         .await?;
 
-    Ok(ReSignedArtifacts {
-        unsigned_xml,
-        unsigned_xml_sha256,
-        signed_xml_cms,
-    })
+    Ok((unsigned_xml, unsigned_xml_sha256, signed_payload))
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────

@@ -27,7 +27,7 @@ use prro::crypto::provider::{
     CertDer, CryptoProvider, DstuVerifyResult, SignCmsRequest, SignedCmsBytes,
 };
 use prro::crypto::session::SigningSession;
-use prro::services::write_path::stage_sign::{self, SigningContext, WireArtifactKind};
+use prro::services::write_path::stage_sign::{self, SignError, SigningContext, WireArtifactKind};
 
 // ─── Minimal spy crypto provider (test-local) ────────────────────────
 
@@ -127,6 +127,8 @@ const SELL_PAYLOAD_JSON: &str = r#"{
     ]
 }"#;
 
+const Z_REPORT_PAYLOAD_JSON: &str = r#"{"payments":[{"name":"CASH","sum_in_kop":15000,"sum_out_kop":0,"type_code":"0"}],"sell_count":1,"return_count":0}"#;
+
 // ─── Fixtures ────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -180,6 +182,17 @@ async fn re_sign_deterministic_for_identical_inputs() {
         "identical inputs MUST yield identical CMS (provider stub returns same bytes)"
     );
     assert_eq!(stub.call_count(), 2, "provider invoked exactly twice");
+
+    // R-W10.4-step2b-review NIT 2 close: pin lnd propagation into
+    // the canonical XML.  Determinism alone doesn't catch a regression
+    // where lnd is dropped before reaching the wire.  SELL/RETURN
+    // canonical XML emits local_number as the `DI="..."` attribute
+    // (per src/xml/mod.rs::tests).
+    let xml_str = String::from_utf8_lossy(&a.unsigned_xml);
+    assert!(
+        xml_str.contains(r#"DI="42""#),
+        "lnd 42 must propagate into DI=\"...\" attribute: {xml_str}"
+    );
 }
 
 #[tokio::test]
@@ -246,24 +259,25 @@ async fn re_sign_propagates_new_previous_hash_into_canonical_xml() {
         "provider call #2 must receive b.unsigned_xml"
     );
 
-    // Hash hex MUST be present in the canonical XML — visible via a
-    // simple substring search.  The XML representation uses uppercase
-    // hex (per `hex_encode` helper), so we pin that.
-    let hash_a_hex = "1111111111111111111111111111111111111111111111111111111111111111";
-    let hash_b_hex = "2222222222222222222222222222222222222222222222222222222222222222";
-    let a_str = String::from_utf8_lossy(&a.unsigned_xml).to_uppercase();
-    let b_str = String::from_utf8_lossy(&b.unsigned_xml).to_uppercase();
+    // R-W10.4-step2b-review NIT 1 close: pin EXACT hex case
+    // (lowercase per `stage_sign::hex_encode` `format!("{b:02x}", ...)`).
+    // `to_uppercase()` symmetric on both sides loses the case-pin —
+    // a regression to UPPERCASE hex would have gone unnoticed.
+    let hash_a_hex_lower = "1111111111111111111111111111111111111111111111111111111111111111";
+    let hash_b_hex_lower = "2222222222222222222222222222222222222222222222222222222222222222";
+    let a_str = String::from_utf8_lossy(&a.unsigned_xml);
+    let b_str = String::from_utf8_lossy(&b.unsigned_xml);
     assert!(
-        a_str.contains(&hash_a_hex.to_uppercase()),
-        "a.unsigned_xml must contain hash_a hex"
+        a_str.contains(hash_a_hex_lower),
+        "a.unsigned_xml must contain hash_a in LOWERCASE hex (per hex_encode contract): {a_str}"
     );
     assert!(
-        b_str.contains(&hash_b_hex.to_uppercase()),
-        "b.unsigned_xml must contain hash_b hex"
+        b_str.contains(hash_b_hex_lower),
+        "b.unsigned_xml must contain hash_b in LOWERCASE hex: {b_str}"
     );
     assert!(
-        !a_str.contains(&hash_b_hex.to_uppercase()),
-        "a.unsigned_xml must NOT contain hash_b hex (cross-contamination check)"
+        !a_str.contains(hash_b_hex_lower),
+        "a.unsigned_xml must NOT contain hash_b hex (cross-contamination check): {a_str}"
     );
 }
 
@@ -299,4 +313,222 @@ async fn re_sign_provider_receives_rebuilt_xml_not_attempt_one_bytes() {
         "provider must sign the exact bytes returned as unsigned_xml"
     );
     assert_eq!(out.signed_xml_cms.0, b"CMS-OUTPUT");
+}
+
+// ─── R-W10.4-step2b-review LOW 1 close: ZReport recovery path ─────────
+
+#[tokio::test]
+async fn re_sign_z_report_propagates_z_number_into_canonical_xml() {
+    // ZReport recovery uses an already-allocated Z number from
+    // attempt #1 — caller passes it through.  Pin that the Z number
+    // lands in the canonical XML so the wire envelope stays valid.
+    let stub = StubCrypto::new();
+    stub.enqueue(b"CMS-Z".to_vec());
+    let ctx = ctx(Arc::clone(&stub));
+
+    let out = stage_sign::re_sign_after_mac_recovery(
+        &ctx,
+        WireArtifactKind::ZReport,
+        "1234567890",
+        "12345678",
+        "2026-05-09T12:34:56Z",
+        Z_REPORT_PAYLOAD_JSON,
+        None, // ZReport doesn't carry total_sum_kop
+        100,
+        Some(42),
+        [0u8; 32],
+    )
+    .await
+    .expect("ZReport re-sign");
+
+    let xml_str = String::from_utf8_lossy(&out.unsigned_xml);
+    // Z_REPORT canonical XML emits Z number via the `<Z_NO>...</Z_NO>`
+    // body slot (or `ZN="..."` attribute, depending on doc shape).
+    // Assert the value appears as a number in the rendered bytes.
+    assert!(
+        xml_str.contains(">42<") || xml_str.contains(r#"ZN="42""#),
+        "Z number 42 must propagate into the canonical XML (Z_NO body or ZN attribute): {xml_str}"
+    );
+}
+
+// ─── R-W10.4-step2b-review MED 2 close: error path fixtures ───────────
+
+#[tokio::test]
+async fn re_sign_payload_schema_mismatch_returns_typed_error() {
+    let stub = StubCrypto::new();
+    let ctx = ctx(Arc::clone(&stub));
+    let res = stage_sign::re_sign_after_mac_recovery(
+        &ctx,
+        WireArtifactKind::Sell,
+        "1234567890",
+        "12345678",
+        "2026-05-09T12:34:56Z",
+        "not-valid-json",
+        Some(1500),
+        42,
+        None,
+        [0u8; 32],
+    )
+    .await;
+    match res {
+        Err(SignError::PayloadSchema { detail }) => {
+            assert!(
+                detail.contains("Check"),
+                "PayloadSchema detail must mention the kind: {detail}"
+            );
+        }
+        other => panic!("expected SignError::PayloadSchema, got {other:?}"),
+    }
+    // Provider was never invoked — early-return on parse failure.
+    assert_eq!(stub.call_count(), 0);
+}
+
+#[tokio::test]
+async fn re_sign_invalid_business_ts_returns_typed_error() {
+    let stub = StubCrypto::new();
+    let ctx = ctx(Arc::clone(&stub));
+    let res = stage_sign::re_sign_after_mac_recovery(
+        &ctx,
+        WireArtifactKind::Sell,
+        "1234567890",
+        "12345678",
+        "not-a-timestamp",
+        SELL_PAYLOAD_JSON,
+        Some(1500),
+        42,
+        None,
+        [0u8; 32],
+    )
+    .await;
+    match res {
+        Err(SignError::TimestampConversion { detail }) => {
+            assert!(
+                detail.contains("not-a-timestamp"),
+                "TimestampConversion detail must echo the offending input: {detail}"
+            );
+        }
+        other => panic!("expected SignError::TimestampConversion, got {other:?}"),
+    }
+    assert_eq!(stub.call_count(), 0);
+}
+
+#[tokio::test]
+async fn re_sign_lnd_overflow_returns_range_error() {
+    let stub = StubCrypto::new();
+    let ctx = ctx(Arc::clone(&stub));
+    let res = stage_sign::re_sign_after_mac_recovery(
+        &ctx,
+        WireArtifactKind::Sell,
+        "1234567890",
+        "12345678",
+        "2026-05-09T12:34:56Z",
+        SELL_PAYLOAD_JSON,
+        Some(1500),
+        (u32::MAX as i64) + 1, // overflow
+        None,
+        [0u8; 32],
+    )
+    .await;
+    match res {
+        Err(SignError::Range { field, value }) => {
+            assert_eq!(field, "lnd");
+            assert_eq!(value, (u32::MAX as i64) + 1);
+        }
+        other => panic!("expected SignError::Range {{ field: lnd, .. }}, got {other:?}"),
+    }
+    assert_eq!(stub.call_count(), 0);
+}
+
+#[tokio::test]
+async fn re_sign_z_number_overflow_returns_range_error() {
+    let stub = StubCrypto::new();
+    let ctx = ctx(Arc::clone(&stub));
+    let res = stage_sign::re_sign_after_mac_recovery(
+        &ctx,
+        WireArtifactKind::ZReport,
+        "1234567890",
+        "12345678",
+        "2026-05-09T12:34:56Z",
+        Z_REPORT_PAYLOAD_JSON,
+        None,
+        100,
+        Some((u32::MAX as i64) + 1), // overflow
+        [0u8; 32],
+    )
+    .await;
+    match res {
+        Err(SignError::Range { field, value }) => {
+            assert_eq!(field, "z_report_number");
+            assert_eq!(value, (u32::MAX as i64) + 1);
+        }
+        other => {
+            panic!("expected SignError::Range {{ field: z_report_number, .. }}, got {other:?}")
+        }
+    }
+    assert_eq!(stub.call_count(), 0);
+}
+
+#[tokio::test]
+async fn re_sign_crypto_error_propagates_typed() {
+    use prro::crypto::errors::{CryptoError, SignKind};
+    // Spy that returns a hard-coded crypto error on the first call.
+    struct ErrCrypto;
+    #[async_trait]
+    impl CryptoProvider for ErrCrypto {
+        async fn sign_cms_detached(
+            &self,
+            _: SignCmsRequest<'_>,
+        ) -> Result<SignedCmsBytes, CryptoError> {
+            Err(CryptoError::CmsSign {
+                reason: SignKind::BackendError,
+            })
+        }
+        async fn verify_dstu(
+            &self,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<DstuVerifyResult, CryptoError> {
+            unimplemented!()
+        }
+        async fn unwrap_envelope(
+            &self,
+            _: &[u8],
+            _: &[u8],
+            _: &SigningSession,
+        ) -> Result<Vec<u8>, CryptoError> {
+            unimplemented!()
+        }
+        async fn fetch_cert_by_ski(
+            &self,
+            _: &[String],
+            _: &[u8; 32],
+            _: std::time::Duration,
+        ) -> Result<CertDer, CryptoError> {
+            unimplemented!()
+        }
+    }
+    let ctx = SigningContext {
+        provider: Arc::new(ErrCrypto) as Arc<dyn CryptoProvider>,
+        session: SigningSession::new_for_test("operator-1".into(), [0u8; 32], vec![]),
+        profile: prro_crypto::cms::profile::CmsProfile::Dstu4145WithGost34311Pb,
+    };
+
+    let res = stage_sign::re_sign_after_mac_recovery(
+        &ctx,
+        WireArtifactKind::Sell,
+        "1234567890",
+        "12345678",
+        "2026-05-09T12:34:56Z",
+        SELL_PAYLOAD_JSON,
+        Some(1500),
+        42,
+        None,
+        [0u8; 32],
+    )
+    .await;
+    match res {
+        Err(SignError::Crypto(_)) => { /* expected */ }
+        other => panic!("expected SignError::Crypto, got {other:?}"),
+    }
 }
