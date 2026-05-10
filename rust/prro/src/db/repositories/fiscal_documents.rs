@@ -777,9 +777,11 @@ pub async fn set_server_fiscal_no_tx(
 /// **Lifecycle (per freeze §4.4.1).**  Called by `mac_recovery::orchestrate`
 /// AFTER the attempt-#1 4-b commit lands the doc in `ErrorRetryable`
 /// with `STAGE_SEND_MAC_HASH_MISMATCH` audit + `RETRYABLE_MAC_HASH_MISMATCH`
-/// trace.  Claim happens inside the **MR-PERSIST** `with_immediate`
-/// envelope alongside the new `previous_hash` write + replaced
-/// SIGNED_XML artifact + audit `MAC_RECOVERY_RESIGNED`.  All-or-none.
+/// trace.  The claim, the new `previous_hash` write, the replaced
+/// SIGNED_XML artifact, and the `MAC_RECOVERY_RESIGNED` audit row
+/// commit atomically together inside the **MR-PERSIST**
+/// `with_immediate` envelope — if any one fails, the entire envelope
+/// rolls back and the budget is NOT burned.
 ///
 /// **Why CAS guard `state = 'ERROR_RETRYABLE'`.**  A doc in any other
 /// state shouldn't go through MAC recovery (e.g. operator manually

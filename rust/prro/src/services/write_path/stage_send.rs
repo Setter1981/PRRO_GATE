@@ -1400,7 +1400,10 @@ mod tests {
     }
 
     #[test]
-    fn wire_decision_to_outcome_kind_maps_per_w10_2_table() {
+    fn wire_decision_to_outcome_kind_maps_per_w10_table() {
+        // Covers both W10.2 baseline mapping (5 retry classes folding
+        // to W7-frozen kinds) and W10.4 split (MacRecovery →
+        // RetryableMacHashMismatch via migration 013).
         use super::super::error_routing::{AuditEvent, RetryClass, RoutingDecision, WireDecision};
         // Sent → OK regardless of wire_kind.
         assert_eq!(

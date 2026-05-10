@@ -47,15 +47,19 @@ ALTER TABLE fiscal_documents
 --
 -- Per migration 008 precedent: ALTER cannot extend a column-level
 -- CHECK in SQLite.  We:
---   1. Disable foreign-key enforcement during the rebuild (recursive
---      DROP would otherwise cascade to CHECK rows mid-DDL).
+--   1. Defer foreign-key validation until COMMIT — keeps FK
+--      enforcement enabled, but allows mid-tx DROP+INSERT shuffles
+--      that would otherwise trip per-statement FK checks.  Mirrors
+--      migration 008 (line 60).  Note: `PRAGMA defer_foreign_keys`
+--      auto-clears at the end of the wrapping transaction (sqlx
+--      migrate wraps each migration in its own tx), so no closing
+--      PRAGMA needed.
 --   2. Create the new table shape under `transport_trace_new`.
 --   3. INSERT-SELECT all existing columns including `retry_class`.
 --   4. DROP old table; RENAME new → `transport_trace`.
 --   5. Re-create the indexes (010 + 012).
---   6. Re-enable foreign-key enforcement.
 
-PRAGMA foreign_keys = OFF;
+PRAGMA defer_foreign_keys = ON;
 
 CREATE TABLE transport_trace_new (
     document_id              BLOB    NOT NULL CHECK (length(document_id) = 16)
@@ -138,5 +142,3 @@ CREATE INDEX ix_transport_trace_unfinished
 
 CREATE INDEX idx_transport_trace_doc_retry_class
   ON transport_trace(document_id, attempt_no DESC, retry_class);
-
-PRAGMA foreign_keys = ON;

@@ -22,10 +22,17 @@ async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
     (dir, pool)
 }
 
-/// Seed an FN config + a SIGNED fiscal_documents row in `state =
-/// SIGNED` with a fixed `lnd`.  Mirrors the W6→W7 hand-off shape: a
-/// doc that has cleared stage 3 sign and is ready for stage 4 send.
-async fn seed_signed_doc(pool: &SqlitePool, doc_byte: u8, doc_type: &str, lnd: i64) -> DocumentId {
+/// Internal: seed an FN config + a fiscal_documents row in the given
+/// `state` with a fixed `lnd`.  Body shared by `seed_signed_doc`
+/// (default "SIGNED") and the W10.4 claim-helper fixtures (which
+/// need "ERROR_RETRYABLE" pre-state).
+async fn seed_doc(
+    pool: &SqlitePool,
+    doc_byte: u8,
+    doc_type: &str,
+    lnd: i64,
+    state: &str,
+) -> DocumentId {
     sqlx::query(
         "INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
          VALUES ('1234567890', '12345678', 'test')",
@@ -40,18 +47,25 @@ async fn seed_signed_doc(pool: &SqlitePool, doc_byte: u8, doc_type: &str, lnd: i
         "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
             state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
             payload_sha256_canonical) \
-         VALUES (?, ?, '1234567890', ?, ?, 'SIGNED', 'b1', 't1', 'ONLINE', \
+         VALUES (?, ?, '1234567890', ?, ?, ?, 'b1', 't1', 'ONLINE', \
             '2026-05-09T12:34:56Z', '{}', ?)",
     )
     .bind(&doc_bytes)
     .bind(&req_bytes)
     .bind(lnd)
     .bind(doc_type)
+    .bind(state)
     .bind(&sha)
     .execute(pool)
     .await
     .expect("seed fiscal_documents");
     DocumentId::from_bytes(<[u8; 16]>::try_from(doc_bytes.as_slice()).unwrap())
+}
+
+/// Thin wrapper for the W7 hand-off shape: a doc that has cleared
+/// stage 3 sign (state=SIGNED) and is ready for stage 4 send.
+async fn seed_signed_doc(pool: &SqlitePool, doc_byte: u8, doc_type: &str, lnd: i64) -> DocumentId {
+    seed_doc(pool, doc_byte, doc_type, lnd, "SIGNED").await
 }
 
 #[tokio::test]
@@ -242,36 +256,11 @@ async fn set_server_fiscal_no_returns_false_for_missing_row() {
 
 // ─── W10.4 — mac_recovery_claim_counter_tx ───────────────────────────
 
-/// Seed a doc directly in `ERROR_RETRYABLE` with `mac_recovery_attempts
-/// = 0` (default).  Mirrors the post-attempt-#1 4-b commit shape per
-/// freeze §4.4.1.  Uses a unique `lnd` per call to dodge the
-/// `(fiscal_number, lnd)` partial UNIQUE index when batching.
+/// Thin wrapper: seed a doc directly in `ERROR_RETRYABLE` with
+/// `mac_recovery_attempts = 0` (DDL DEFAULT).  Mirrors the
+/// post-attempt-#1 4-b commit shape per freeze §4.4.1.
 async fn seed_error_retryable_doc(pool: &SqlitePool, doc_byte: u8, lnd: i64) -> DocumentId {
-    sqlx::query(
-        "INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
-         VALUES ('1234567890', '12345678', 'test')",
-    )
-    .execute(pool)
-    .await
-    .unwrap();
-    let doc_bytes = vec![doc_byte; 16];
-    let req_bytes = vec![doc_byte ^ 0xFF; 16];
-    let sha = vec![0u8; 32];
-    sqlx::query(
-        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
-            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
-            payload_sha256_canonical) \
-         VALUES (?, ?, '1234567890', ?, 'SELL', 'ERROR_RETRYABLE', 'b1', 't1', 'ONLINE', \
-            '2026-05-09T12:34:56Z', '{}', ?)",
-    )
-    .bind(&doc_bytes)
-    .bind(&req_bytes)
-    .bind(lnd)
-    .bind(&sha)
-    .execute(pool)
-    .await
-    .expect("seed ERROR_RETRYABLE doc");
-    DocumentId::from_bytes(<[u8; 16]>::try_from(doc_bytes.as_slice()).unwrap())
+    seed_doc(pool, doc_byte, "SELL", lnd, "ERROR_RETRYABLE").await
 }
 
 async fn read_mac_recovery_attempts(pool: &SqlitePool, doc: DocumentId) -> i64 {
