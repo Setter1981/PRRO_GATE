@@ -23,28 +23,41 @@
 //!      whitelist would make the `unreachable!` in 4-pre fire in
 //!      production; this test catches it at CI.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 
+use prro::crypto::errors::CryptoError;
+use prro::crypto::provider::{
+    CertDer, CryptoProvider, DstuVerifyResult, SignCmsRequest, SignedCmsBytes,
+};
+use prro::crypto::session::SigningSession;
 use prro::db::models::enums::DocState;
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::fiscal_documents::allowed_transition;
 use prro::db::repositories::transport_trace;
 use prro::services::write_path::error_routing::RetryClass;
 use prro::services::write_path::stage_send::{self, StageSendError, StageSendOutcome};
+use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
 use prro::transports::dps::error::{AuthorizationKind, DpsError};
 
 // ─── In-memory stub DpsChannel ───────────────────────────────────────
 
-/// Lightweight stub: scripted single response + call counter +
+/// Lightweight stub: scripted response queue + call counter +
 /// optional spy callback fired BEFORE the response is returned.
+///
+/// W10.4 step 2d MED 1 close: queue-based to support multi-attempt
+/// scenarios (e.g. MAC recovery's two-attempt sequence: -12 then OK).
+/// Single-response constructors (`new` / `with_spy`) push exactly one
+/// element into the queue for backwards compat with the W7.5
+/// fixtures.
 struct StubDpsChannel {
-    response: Mutex<Option<Result<CheckAck, DpsError>>>,
+    responses: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
     send_chk_calls: AtomicUsize,
     /// Spy hook for `pattern_b_ordering` — reads `fiscal_documents.state`
     /// from a fresh connection and stashes it in a slot.  Fires
@@ -54,16 +67,28 @@ struct StubDpsChannel {
 
 impl StubDpsChannel {
     fn new(response: Result<CheckAck, DpsError>) -> Self {
+        let mut q = VecDeque::with_capacity(1);
+        q.push_back(response);
         Self {
-            response: Mutex::new(Some(response)),
+            responses: Mutex::new(q),
+            send_chk_calls: AtomicUsize::new(0),
+            on_send_chk: None,
+        }
+    }
+
+    fn with_queue(responses: Vec<Result<CheckAck, DpsError>>) -> Self {
+        Self {
+            responses: Mutex::new(responses.into()),
             send_chk_calls: AtomicUsize::new(0),
             on_send_chk: None,
         }
     }
 
     fn with_spy(response: Result<CheckAck, DpsError>, spy: Box<dyn Fn() + Send + Sync>) -> Self {
+        let mut q = VecDeque::with_capacity(1);
+        q.push_back(response);
         Self {
-            response: Mutex::new(Some(response)),
+            responses: Mutex::new(q),
             send_chk_calls: AtomicUsize::new(0),
             on_send_chk: Some(spy),
         }
@@ -81,11 +106,11 @@ impl DpsChannel for StubDpsChannel {
         if let Some(spy) = &self.on_send_chk {
             spy();
         }
-        self.response
+        self.responses
             .lock()
             .unwrap()
-            .take()
-            .expect("StubDpsChannel response not set or already consumed")
+            .pop_front()
+            .expect("StubDpsChannel response queue empty (caller forgot to enqueue)")
     }
 
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
@@ -1134,4 +1159,221 @@ async fn signed_xml_missing_surfaces_typed_error_no_state_mutation() {
         .await
         .unwrap();
     assert_eq!(traces.len(), 0);
+}
+
+// ─── W10.4 step 2d MED 1 close — MAC recovery dispatch smoke fixture ─
+
+/// Deterministic crypto stub for the MAC recovery smoke test.
+/// `re_sign_after_mac_recovery` calls `provider.sign_cms_detached`
+/// once during the orchestrator's MR-NO-TX step; this stub returns
+/// a fixed CMS byte string so the fixture can assert on the post-
+/// MR-PERSIST `document_files.SIGNED_XML` content.
+struct DetCrypto;
+
+#[async_trait]
+impl CryptoProvider for DetCrypto {
+    async fn sign_cms_detached(
+        &self,
+        _: SignCmsRequest<'_>,
+    ) -> Result<SignedCmsBytes, CryptoError> {
+        Ok(SignedCmsBytes(b"RECOVERED-CMS-V2".to_vec()))
+    }
+    async fn verify_dstu(
+        &self,
+        _: &[u8],
+        _: &[u8],
+        _: &[u8],
+    ) -> Result<DstuVerifyResult, CryptoError> {
+        unimplemented!("not exercised");
+    }
+    async fn unwrap_envelope(
+        &self,
+        _: &[u8],
+        _: &[u8],
+        _: &SigningSession,
+    ) -> Result<Vec<u8>, CryptoError> {
+        unimplemented!("not exercised");
+    }
+    async fn fetch_cert_by_ski(
+        &self,
+        _: &[String],
+        _: &[u8; 32],
+        _: std::time::Duration,
+    ) -> Result<CertDer, CryptoError> {
+        unimplemented!("not exercised");
+    }
+}
+
+/// Seed an `ERROR_RETRYABLE` doc with PAYLOAD_XML + SIGNED_XML
+/// pre-INSERTed (mirrors post-attempt-#1 4-b commit shape per freeze
+/// §4.4.1).  `previous_hash` set to `0xAA × 32` so the MAC_RECOVERY_RESIGNED
+/// audit's `old_previous_hash_hex` field is observable.
+async fn seed_error_retryable_doc_with_artifacts(pool: &SqlitePool, doc_byte: u8) -> DocumentId {
+    sqlx::query(
+        "INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES ('1234567890', '12345678', 'test')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let doc_bytes = vec![doc_byte; 16];
+    let req_bytes = vec![doc_byte ^ 0xFF; 16];
+    let sha = vec![0u8; 32];
+    let lnd = doc_byte as i64;
+    let prev_hash = [0xAAu8; 32];
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical, total_sum_kop, previous_hash) \
+         VALUES (?, ?, '1234567890', ?, 'SELL', 'ERROR_RETRYABLE', 'b1', 't1', 'ONLINE', \
+            '2026-05-09T12:34:56Z', \
+            '{\"items\":[{\"code\":\"p-1\",\"name\":\"Item A\",\"price_kop\":1500,\
+              \"quantity_thousandths\":1000,\"sum_kop\":1500}],\
+              \"payments\":[{\"name\":\"Cash\",\"sum_kop\":1500,\"type_code\":\"0\"}]}', \
+            ?, 1500, ?)",
+    )
+    .bind(&doc_bytes)
+    .bind(&req_bytes)
+    .bind(lnd)
+    .bind(&sha)
+    .bind(&prev_hash[..])
+    .execute(pool)
+    .await
+    .expect("seed fiscal_documents (ERROR_RETRYABLE)");
+    sqlx::query(
+        "INSERT INTO document_files(document_id, kind, content) \
+         VALUES (?, 'PAYLOAD_XML', ?), (?, 'SIGNED_XML', ?)",
+    )
+    .bind(&doc_bytes)
+    .bind(b"OLD-PAYLOAD-XML".to_vec())
+    .bind(&doc_bytes)
+    .bind(b"OLD-SIGNED-CMS".to_vec())
+    .execute(pool)
+    .await
+    .expect("seed document_files");
+    DocumentId::from_bytes(<[u8; 16]>::try_from(doc_bytes.as_slice()).unwrap())
+}
+
+#[tokio::test]
+async fn mac_recovery_resigned_drives_attempt_2_through_loop_to_sent() {
+    // R-W10.4-step2d-review MED 1 close — end-to-end smoke fixture
+    // for the loop wrap + sign_ctx propagation + attempt_no increment
+    // + trace/audit chain.  Pins the contract that:
+    //   1. Server -12 on attempt #1 → orchestrator runs → Resigned →
+    //      `continue 'attempt` re-enters 4-pre/4a/4b.
+    //   2. Attempt #2 reads the new SIGNED_XML (replaced by orchestrator's
+    //      MR-PERSIST), wire send returns OK, doc lands in `Sent` with
+    //      attempt_no = 2.
+    //   3. Two transport_trace rows materialise: attempt_no=1 with
+    //      outcome=RETRYABLE_MAC_HASH_MISMATCH, attempt_no=2 with
+    //      outcome=OK.
+    //   4. Audit chain documents the full forensic story:
+    //      STAGE_SEND_INTENT_MARKED (×2, one per attempt) +
+    //      STAGE_SEND_MAC_HASH_MISMATCH (attempt #1 4-b) +
+    //      MAC_RECOVERY_RESIGNED (orchestrator MR-PERSIST) +
+    //      STAGE_SEND_RESULT (attempt #2 4-b).
+    //   5. `mac_recovery_attempts` counter = 1 post-recovery.
+    //   6. Stub `send_chk` invoked exactly twice.
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_error_retryable_doc_with_artifacts(&pool, 0xC9).await;
+
+    // Stub: queue [Err(-12), Ok(CheckAck)] for attempts #1 and #2.
+    let stub = StubDpsChannel::with_queue(vec![
+        Err(prro::transports::dps::error::DpsError::Server {
+            code: -12,
+            message:
+                "ERROR_BAD_HASH_PREV: store deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567 server-side"
+                    .into(),
+        }),
+        Ok(CheckAck {
+            id: "DPS-FN-RECOVERED".into(),
+            id_sign: vec![],
+            data_sign: vec![],
+        }),
+    ]);
+
+    // SigningContext for the recovery orchestrator.
+    let sign_ctx = SigningContext {
+        provider: Arc::new(DetCrypto) as Arc<dyn CryptoProvider>,
+        session: SigningSession::new_for_test("operator-1".into(), [0u8; 32], vec![]),
+        profile: prro_crypto::cms::profile::CmsProfile::Dstu4145WithGost34311Pb,
+    };
+
+    let outcome = stage_send::run(&pool, &stub, doc, Some(&sign_ctx))
+        .await
+        .expect("end-to-end Resigned-then-Sent must succeed");
+
+    // Outcome shape: Sent with attempt_no=2.
+    match outcome {
+        StageSendOutcome::Sent {
+            server_fiscal_no,
+            attempt_no,
+        } => {
+            assert_eq!(server_fiscal_no, "DPS-FN-RECOVERED");
+            assert_eq!(attempt_no, 2, "attempt_no must increment to 2 on re-entry");
+        }
+        other => panic!("expected Sent (recovered), got {other:?}"),
+    }
+
+    // Stub call count: exactly 2 wire sends.
+    assert_eq!(stub.call_count(), 2, "send_chk invoked once per attempt");
+
+    // Doc state: SENT.
+    assert_eq!(read_doc_state(&pool, doc).await, "SENT");
+
+    // mac_recovery_attempts counter = 1.
+    let counter: i64 = sqlx::query_scalar(
+        "SELECT mac_recovery_attempts FROM fiscal_documents WHERE document_id = ?",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counter, 1, "single-bit budget burnt by orchestrator");
+
+    // Two trace rows: attempt #1 RETRYABLE_MAC_HASH_MISMATCH, #2 OK.
+    let traces = transport_trace::list_for_document(&pool, doc)
+        .await
+        .unwrap();
+    assert_eq!(traces.len(), 2, "one trace row per attempt");
+    assert_eq!(traces[0].attempt_no, 1);
+    assert_eq!(
+        traces[0].outcome_kind.as_deref(),
+        Some("RETRYABLE_MAC_HASH_MISMATCH")
+    );
+    assert_eq!(traces[0].retry_class.as_deref(), Some("MacRecovery"));
+    assert_eq!(traces[1].attempt_no, 2);
+    assert_eq!(traces[1].outcome_kind.as_deref(), Some("OK"));
+    assert_eq!(
+        traces[1].server_fiscal_no.as_deref(),
+        Some("DPS-FN-RECOVERED")
+    );
+
+    // Audit chain.
+    let events = read_audit_event_types(&pool, doc).await;
+    assert_eq!(
+        events,
+        vec![
+            "STAGE_SEND_INTENT_MARKED",     // attempt #1 4-pre
+            "STAGE_SEND_MAC_HASH_MISMATCH", // attempt #1 4-b (routed)
+            "MAC_RECOVERY_RESIGNED",        // orchestrator MR-PERSIST
+            "STAGE_SEND_INTENT_MARKED",     // attempt #2 4-pre
+            "STAGE_SEND_RESULT",            // attempt #2 4-b (Sent)
+        ],
+        "full forensic audit chain for Resigned end-to-end"
+    );
+
+    // SIGNED_XML replaced by orchestrator's MR-PERSIST.
+    let signed: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT content FROM document_files WHERE document_id = ? AND kind = 'SIGNED_XML'",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        signed.as_deref(),
+        Some(b"RECOVERED-CMS-V2".as_slice()),
+        "SIGNED_XML must reflect the orchestrator's re-signed bytes"
+    );
 }

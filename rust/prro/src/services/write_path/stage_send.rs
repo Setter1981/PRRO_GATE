@@ -1089,13 +1089,30 @@ pub async fn run(
         // calling the orchestrator again — the budget is already spent.
         if let WireDecision::Routed(d) = &wire_decision {
             if d.retry_class == RetryClass::MacRecovery {
+                // R-W10.4-step2d-review LOW 1 close: thread the wire
+                // `-12` error_message through into the synthetic
+                // StageSendOutcome on each override path.  Caller of
+                // stage_send::run preserves forensic context without
+                // having to chase audit_log rows.
+                let wire_message_for_override = wire_forensics.as_ref().and_then(|(_, _, m)| {
+                    if m.is_empty() {
+                        None
+                    } else {
+                        Some(truncate_msg(m))
+                    }
+                });
                 if mac_recovery_invoked {
                     // Second -12 in the same run() call.  Budget burnt
                     // by the first orchestrator invocation; re-running
                     // would just hit `CounterExhausted` (counter is now
                     // 1).  Short-circuit: emit FAILED_REPEAT + override.
-                    return override_to_rejected_with_failed_repeat_audit(pool, doc, attempt_no)
-                        .await;
+                    return override_to_rejected_with_failed_repeat_audit(
+                        pool,
+                        doc,
+                        attempt_no,
+                        wire_message_for_override,
+                    )
+                    .await;
                 }
                 mac_recovery_invoked = true;
                 let ctx = sign_ctx
@@ -1119,12 +1136,16 @@ pub async fn run(
                             doc,
                             attempt_no,
                             AuditEvent::MacRecoveryHashNotExtractable,
+                            wire_message_for_override,
                         )
                         .await;
                     }
                     MacRecoveryOutcome::CounterExhausted => {
                         return override_to_rejected_with_failed_repeat_audit(
-                            pool, doc, attempt_no,
+                            pool,
+                            doc,
+                            attempt_no,
+                            wire_message_for_override,
                         )
                         .await;
                     }
@@ -1178,11 +1199,23 @@ fn synthetic_rejected_decision(audit_event: AuditEvent) -> RoutingDecision {
 /// `MAC_RECOVERY_HASH_NOT_EXTRACTABLE`.  Caller's job is just to CAS
 /// the doc out of `ErrorRetryable` into `Rejected`.  No audit row
 /// (recovery layer + final state suffice for forensics).
+///
+/// `synthetic_decision_event` populates the surfaced
+/// `StageSendOutcome::Routed.decision.audit_event`.  The helper does
+/// NOT emit an audit row — naming reflects "which event the synthetic
+/// decision will carry", not "what we'll write to audit_log"
+/// (R-W10.4-step2d-review LOW 2 close — earlier `audit_event_for_outcome`
+/// suggested writing).
+///
+/// `wire_error_message` carries the original `-12` wire message
+/// through to the public `StageSendOutcome` surface so caller-side
+/// forensics don't lose context (R-W10.4-step2d-review LOW 1 close).
 async fn override_to_rejected_no_additional_audit(
     pool: &SqlitePool,
     doc: DocumentId,
     attempt_no: i32,
-    audit_event_for_outcome: AuditEvent,
+    synthetic_decision_event: AuditEvent,
+    wire_error_message: Option<String>,
 ) -> Result<StageSendOutcome, StageSendError> {
     with_immediate(pool, move |tx| {
         Box::pin(async move {
@@ -1201,10 +1234,13 @@ async fn override_to_rejected_no_additional_audit(
     .await
     .map_err(bridge_anyhow)?;
     Ok(StageSendOutcome::Routed {
-        decision: synthetic_rejected_decision(audit_event_for_outcome),
+        decision: synthetic_rejected_decision(synthetic_decision_event),
         attempt_no,
+        // `-12` is the only Server status code that maps to
+        // `RetryClass::MacRecovery` (W10.1 routing fn §2.1 row -12);
+        // hardcoded value matches the contract.
         wire_status_code: Some(-12),
-        wire_error_message: None,
+        wire_error_message,
     })
 }
 
@@ -1212,10 +1248,14 @@ async fn override_to_rejected_no_additional_audit(
 /// successful Resigned in the same `run()` call.  Both signal that the
 /// recovery budget is spent; emit `MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH`
 /// audit + CAS to `Rejected` atomically.
+///
+/// `wire_error_message` (R-W10.4-step2d-review LOW 1 close) preserves
+/// the wire `-12` message through to the public `StageSendOutcome`.
 async fn override_to_rejected_with_failed_repeat_audit(
     pool: &SqlitePool,
     doc: DocumentId,
     attempt_no: i32,
+    wire_error_message: Option<String>,
 ) -> Result<StageSendOutcome, StageSendError> {
     let payload = serde_json::json!({
         "attempt_no": attempt_no,
@@ -1256,8 +1296,10 @@ async fn override_to_rejected_with_failed_repeat_audit(
     Ok(StageSendOutcome::Routed {
         decision: synthetic_rejected_decision(AuditEvent::MacRecoveryFailedRepeatHashMismatch),
         attempt_no,
+        // See note in `override_to_rejected_no_additional_audit`:
+        // `-12` is the only MacRecovery wire code.
         wire_status_code: Some(-12),
-        wire_error_message: None,
+        wire_error_message,
     })
 }
 
