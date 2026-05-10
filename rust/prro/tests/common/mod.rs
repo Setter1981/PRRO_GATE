@@ -13,17 +13,32 @@
 //!
 //! Why a shared module:
 //!   - **Stub providers** (`StubDpsChannel`, `DetCrypto`) and
-//!     `SigningContext` constructor are byte-for-byte identical across
-//!     `write_path_stage4_send.rs`, `mac_recovery_orchestrator.rs`,
-//!     `re_sign_after_mac_recovery.rs`, and the new W10.5
-//!     `write_path_dps_error_routing.rs`.  Earlier copies drifted (each
-//!     file accumulated minor variations); the shared definition is
-//!     the single source of truth (R-W10.5-review MED 2 close).
+//!     `SigningContext` constructor are byte-for-byte identical
+//!     across `write_path_stage4_send.rs` and the new W10.5
+//!     `write_path_dps_error_routing.rs`.  Earlier copies drifted
+//!     (each file accumulated minor variations); the shared
+//!     definition is the single source of truth (R-W10.5-review
+//!     MED 2 close).
 //!   - **Seed helpers stay per-file** because each integration test
 //!     file's setup shape is slightly different (lnd parameter
 //!     conventions, additional payload/artifact fixtures); unifying
-//!     would either narrow each test's intent or balloon the helper's
-//!     parameter list.  Per-file seeds remain.
+//!     would either narrow each test's intent or balloon the
+//!     helper's parameter list.  Per-file seeds remain.
+//!
+//! Why partial adoption (`mac_recovery_orchestrator.rs` and
+//! `re_sign_after_mac_recovery.rs` keep local stubs):
+//!   - `re_sign_after_mac_recovery.rs` exercises crypto-error paths
+//!     that need a provider variant returning
+//!     `CryptoError::CmsSign { reason: SignKind::BackendError }`;
+//!     a single constant-return `DetCrypto` cannot model both happy
+//!     and error paths.
+//!   - `mac_recovery_orchestrator.rs` uses a queue-based crypto stub
+//!     so attempt #1 vs attempt #2 CMS bytes can be byte-distinguished
+//!     in assertions (needed for re-sign-write atomicity proofs).
+//!
+//! If a future fixture needs either of those flavours from shared
+//! infra, replace `DetCrypto` here with a `QueueCrypto` (analogous to
+//! `StubDpsChannel::with_queue`) and a `FailingCrypto` variant.
 
 #![allow(dead_code)]
 
@@ -53,6 +68,14 @@ use prro::transports::dps::error::DpsError;
 /// element into the queue for backwards compat with the W7.5
 /// fixtures; `with_queue` is for multi-attempt scenarios (MAC
 /// recovery's two-attempt sequence).
+///
+/// **Concurrency contract.**  Uses `std::sync::Mutex` (not
+/// `tokio::sync::Mutex`) because tokio tests in this crate drive
+/// `send_chk` from a single task per fixture, so locks are
+/// short-held and never cross an `.await` while held.  If a future
+/// fixture exercises parallel `send_chk` from multiple tasks, switch
+/// to `tokio::sync::Mutex` to avoid blocking the runtime under
+/// contention.
 pub struct StubDpsChannel {
     responses: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
     send_chk_calls: AtomicUsize,
@@ -133,6 +156,18 @@ impl DpsChannel for StubDpsChannel {
 /// `sign_cms_detached` call.  Used by MAC recovery integration
 /// fixtures that need a callable `SigningContext` but don't care
 /// about the actual signature contents.
+///
+/// **Limitation: constant return.**  Suitable only for fixtures that
+/// don't need to byte-distinguish attempt #1 vs attempt #2 CMS bytes
+/// (e.g., for re-sign-write atomicity proofs).  If such
+/// distinguishability is required, clone the
+/// `StubDpsChannel::with_queue` pattern into a `QueueCrypto` variant
+/// rather than parametrising `DetCrypto`.
+///
+/// Non-signing methods (`verify_dstu`, `unwrap_envelope`,
+/// `fetch_cert_by_ski`) use `unreachable!()` because the integration
+/// fixtures here exercise only the signing path; if those panic at
+/// runtime, the fixture has wired up the wrong code path.
 pub struct DetCrypto;
 
 #[async_trait]
@@ -149,7 +184,7 @@ impl CryptoProvider for DetCrypto {
         _: &[u8],
         _: &[u8],
     ) -> Result<DstuVerifyResult, CryptoError> {
-        unimplemented!("not exercised");
+        unreachable!("stub: verify_dstu not exercised");
     }
     async fn unwrap_envelope(
         &self,
@@ -157,7 +192,7 @@ impl CryptoProvider for DetCrypto {
         _: &[u8],
         _: &SigningSession,
     ) -> Result<Vec<u8>, CryptoError> {
-        unimplemented!("not exercised");
+        unreachable!("stub: unwrap_envelope not exercised");
     }
     async fn fetch_cert_by_ski(
         &self,
@@ -165,7 +200,7 @@ impl CryptoProvider for DetCrypto {
         _: &[u8; 32],
         _: std::time::Duration,
     ) -> Result<CertDer, CryptoError> {
-        unimplemented!("not exercised");
+        unreachable!("stub: fetch_cert_by_ski not exercised");
     }
 }
 
