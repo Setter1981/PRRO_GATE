@@ -115,6 +115,39 @@ pub async fn seed_prevhash(pool: &SqlitePool, fn_id: &str, hash: &[u8; 32]) -> s
     Ok(res.rows_affected() == 1)
 }
 
+/// W8 stage 5 finalize — advance the cross-doc MAC chain seed
+/// **inside** the same `with_immediate` envelope as the CAS
+/// `Kvt2 → Ack` on `fiscal_documents`.  Tx-bound counterpart of
+/// [`seed_prevhash`].
+///
+/// **Atomicity contract.**  Caller (`stage_finalize::run`) MUST
+/// invoke this AFTER the CAS Applied; relative ordering against the
+/// other post-CAS writes (inbox-DONE / outbox-INSERT / audit) does
+/// not matter — all four commit atomically together as a single
+/// `with_immediate` envelope.  If any one fails, the entire tx rolls
+/// back and the seed advance is undone — the next-doc MAC chain
+/// pointer cannot leak past a failed Ack.
+///
+/// Returns `true` if the FN row existed and was updated; `false`
+/// indicates a missing `node_state` row, which is a state-invariant
+/// breach (W5 acquire stage upserts the row before stage 1 runs).
+/// Caller MUST treat `false` as a typed stage error
+/// (`StageFinalizeError::SeedUpdateMissing`), not silent ignore.
+pub async fn update_last_known_xml_sha_tx(
+    tx: &mut WriteTxConn<'_>,
+    fn_id: &str,
+    hash: &[u8; 32],
+) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "UPDATE node_state SET last_known_unsigned_xml_sha256 = ? WHERE fiscal_number = ?",
+    )
+    .bind(&hash[..])
+    .bind(fn_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStateRow>> {
     let row = sqlx::query!(
         r#"SELECT fiscal_number,

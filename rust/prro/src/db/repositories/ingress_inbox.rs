@@ -244,3 +244,44 @@ pub async fn mark_rejected_tx(tx: &mut WriteTxConn<'_>, request_id: &[u8; 16]) -
     .await?;
     Ok(())
 }
+
+/// W8 stage 5 finalize — finalise the inbox row to terminal `DONE`
+/// status **inside** the same `with_immediate` envelope as the CAS
+/// `Kvt2 → Ack` on `fiscal_documents`.  Tx-bound; mirror of
+/// [`mark_rejected_tx`] but with `status = 'DONE'`.
+///
+/// **Source-state guard (W8 review F4 close).**  The `WHERE` clause
+/// requires `status = 'PROCESSING'`.  Without this guard, a
+/// caller-bug-induced wrong `request_id` could silently rewrite a
+/// terminal `DONE` / `REJECTED` / `ERROR` inbox row and
+/// `processed_at`.  After the W8.3 source-of-truth refactor,
+/// `request_id` comes from the doc row (not from caller params),
+/// so this guard becomes belt-and-braces — but it also closes a
+/// forensic-audit class of bug for repeat callers.  Repeat-on-Ack
+/// does not reach here because the upstream CAS `Kvt2 → Ack`
+/// short-circuits to `AlreadyAcked` first.
+///
+/// **Atomicity contract.**  Caller (`stage_finalize::run`) MUST
+/// invoke this after the CAS Applied AND the seed advance AND
+/// before / alongside the outbox INSERT + audit row.  All five
+/// writes commit atomically; partial commits are impossible by
+/// construction.
+///
+/// Returns `true` if the inbox row existed in `PROCESSING` and was
+/// advanced to `DONE`; `false` indicates either a missing
+/// `request_id` OR a non-`PROCESSING` source state — both are
+/// state-invariant breaches from the finalize standpoint.  Caller
+/// MUST treat `false` as a typed stage error
+/// (`StageFinalizeError::InboxDoneMissing`), not silent ignore.
+pub async fn mark_done_tx(tx: &mut WriteTxConn<'_>, request_id: &[u8; 16]) -> sqlx::Result<bool> {
+    let req_slice: &[u8] = request_id;
+    let res = sqlx::query(
+        "UPDATE ingress_inbox \
+         SET status = 'DONE', processed_at = CURRENT_TIMESTAMP \
+         WHERE request_id = ? AND status = 'PROCESSING'",
+    )
+    .bind(req_slice)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
