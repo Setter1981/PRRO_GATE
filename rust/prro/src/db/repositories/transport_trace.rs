@@ -29,9 +29,13 @@
 use crate::db::models::ids::DocumentId;
 use crate::db::tx::WriteTxConn;
 
-/// Closed set of W7 outcome classifications.  Mirrors the CHECK list
-/// in migration 010.  W10 may extend the on-wire string space; W7
-/// freezes exactly these five.
+/// Closed set of W7-frozen + W10.4 extension outcome classifications.
+/// Mirrors the CHECK list in migration 010 + 013.
+///
+/// **W10.4 addition:** `RetryableMacHashMismatch` for the Server-12
+/// first-attempt trace row.  Migration 013 extends the
+/// `transport_trace.outcome_kind` CHECK list to include the new wire
+/// string via a SQLite table-rebuild (per migration 008 precedent).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutcomeKind {
     Ok,
@@ -39,6 +43,10 @@ pub enum OutcomeKind {
     RetryableTransport,
     RetryableServer,
     RetryableAuthFn,
+    /// W10.4 — Server `-12` ERROR_BAD_HASH_PREV first attempt.
+    /// `MacRecovery` `RetryClass` folds here; the orchestrator
+    /// completes the recovery cycle out of band of stage 4-b.
+    RetryableMacHashMismatch,
 }
 
 impl OutcomeKind {
@@ -49,6 +57,7 @@ impl OutcomeKind {
             Self::RetryableTransport => "RETRYABLE_TRANSPORT",
             Self::RetryableServer => "RETRYABLE_SERVER",
             Self::RetryableAuthFn => "RETRYABLE_AUTH_FN",
+            Self::RetryableMacHashMismatch => "RETRYABLE_MAC_HASH_MISMATCH",
         }
     }
 }

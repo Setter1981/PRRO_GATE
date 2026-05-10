@@ -767,3 +767,48 @@ pub async fn set_server_fiscal_no_tx(
         .await?;
     Ok(res.rows_affected() == 1)
 }
+
+/// W10.4 — claim the single-bit MAC-recovery counter for `doc_id`.
+/// CAS shape: succeed only if the doc is in `ERROR_RETRYABLE` AND
+/// `mac_recovery_attempts == 0`.  On success bumps the counter to 1
+/// and returns `true`; on any other state — wrong doc state,
+/// counter already burned, missing row — returns `false`.
+///
+/// **Lifecycle (per freeze §4.4.1).**  Called by `mac_recovery::orchestrate`
+/// AFTER the attempt-#1 4-b commit lands the doc in `ErrorRetryable`
+/// with `STAGE_SEND_MAC_HASH_MISMATCH` audit + `RETRYABLE_MAC_HASH_MISMATCH`
+/// trace.  Claim happens inside the **MR-PERSIST** `with_immediate`
+/// envelope alongside the new `previous_hash` write + replaced
+/// SIGNED_XML artifact + audit `MAC_RECOVERY_RESIGNED`.  All-or-none.
+///
+/// **Why CAS guard `state = 'ERROR_RETRYABLE'`.**  A doc in any other
+/// state shouldn't go through MAC recovery (e.g. operator manually
+/// flipped to Rejected, or W9 promoted to RequiresManualReconciliation).
+/// Bare counter UPDATE without state guard would silently burn the
+/// budget for a doc that no longer needs it.
+///
+/// **Why CAS guard `mac_recovery_attempts = 0`.**  Single-bit budget
+/// per W0-3 §2.1 row -12: ONE auto-recovery per doc.  A second `-12`
+/// for a doc that already burned its budget routes to TerminalReject
+/// with audit `MacRecoveryFailedRepeatHashMismatch` (closed-enum
+/// `AuditEvent` per freeze §3.4).
+///
+/// **DDL CHECK as belt-and-braces.**  Migration 013 enforces
+/// `mac_recovery_attempts IN (0, 1)`; this helper guarantees we only
+/// ever transition 0→1 (never 1→2 — that would be a CHECK violation
+/// + observable error, not silent corruption).
+pub async fn mac_recovery_claim_counter_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "UPDATE fiscal_documents SET mac_recovery_attempts = 1 \
+         WHERE document_id = ? \
+           AND state = 'ERROR_RETRYABLE' \
+           AND mac_recovery_attempts = 0",
+    )
+    .bind(doc_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}

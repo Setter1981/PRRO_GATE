@@ -469,11 +469,10 @@ fn bridge_anyhow(e: anyhow::Error) -> StageSendError {
 /// `Transport` (→ `RETRYABLE_TRANSPORT`) vs from `Server` (→
 /// `RETRYABLE_SERVER`).
 ///
-/// **Carry-forward note.**  W10.4 will add `RETRYABLE_MAC_HASH_MISMATCH`
-/// via migration 012 + extend this mapping; W10.5 may add finer kinds
-/// for `ProbeRequired` / `OperatorEscalation` if forensic value
-/// outweighs migration cost.  Until then, this function is the single
-/// chokepoint for outcome_kind decisions.
+/// **W10.4 update.**  `MacRecovery` now folds to its own
+/// `RETRYABLE_MAC_HASH_MISMATCH` (migration 013 extends the CHECK
+/// list).  W10.5 may add finer kinds for `ProbeRequired` /
+/// `OperatorEscalation` if forensic value outweighs migration cost.
 fn wire_decision_to_outcome_kind(decision: &WireDecision, wire_kind: &str) -> OutcomeKind {
     match decision {
         WireDecision::Sent { .. } => OutcomeKind::Ok,
@@ -484,10 +483,10 @@ fn wire_decision_to_outcome_kind(decision: &WireDecision, wire_kind: &str) -> Ou
                 _ => OutcomeKind::RetryableServer,
             },
             RetryClass::FnConfigError => OutcomeKind::RetryableAuthFn,
-            RetryClass::WrapperBug
-            | RetryClass::ProbeRequired
-            | RetryClass::MacRecovery
-            | RetryClass::OperatorEscalation => OutcomeKind::RetryableServer,
+            RetryClass::MacRecovery => OutcomeKind::RetryableMacHashMismatch,
+            RetryClass::WrapperBug | RetryClass::ProbeRequired | RetryClass::OperatorEscalation => {
+                OutcomeKind::RetryableServer
+            }
         },
     }
 }
@@ -1445,20 +1444,26 @@ mod tests {
             wire_decision_to_outcome_kind(&routed(RetryClass::FnConfigError), "Authorization"),
             OutcomeKind::RetryableAuthFn
         );
-        // WrapperBug / ProbeRequired / MacRecovery / OperatorEscalation
-        // all fold to RETRYABLE_SERVER (W10.4 will split MacRecovery
-        // into RETRYABLE_MAC_HASH_MISMATCH).
+        // WrapperBug / ProbeRequired / OperatorEscalation fold to
+        // RETRYABLE_SERVER; MacRecovery has its own kind from W10.4
+        // (migration 013 extends the CHECK list with
+        // RETRYABLE_MAC_HASH_MISMATCH).
         for rc in [
             RetryClass::WrapperBug,
             RetryClass::ProbeRequired,
-            RetryClass::MacRecovery,
             RetryClass::OperatorEscalation,
         ] {
             assert_eq!(
                 wire_decision_to_outcome_kind(&routed(rc), "Server"),
                 OutcomeKind::RetryableServer,
-                "{rc:?} should fold to RetryableServer in W10.2"
+                "{rc:?} should fold to RetryableServer"
             );
         }
+        // W10.4 split: MacRecovery → RETRYABLE_MAC_HASH_MISMATCH.
+        assert_eq!(
+            wire_decision_to_outcome_kind(&routed(RetryClass::MacRecovery), "Server"),
+            OutcomeKind::RetryableMacHashMismatch,
+            "MacRecovery must fold to RETRYABLE_MAC_HASH_MISMATCH (W10.4 + migration 013)"
+        );
     }
 }
