@@ -522,6 +522,91 @@ The `attempts=1 + OLD artifacts` partial state is forensically visible (audit lo
 
 **LoC budget:** ~280 in `mac_recovery.rs` (orchestrator + persist + extract), ~15 in `fiscal_documents.rs` (claim counter + counter+previous_hash columns join), ~30 in `stage_sign.rs` (extracted re-sign), ~30 in `document_files.rs` (replace_tx), ~50 integration in `stage_send.rs`.  Migration 013 = column ALTER + table-rebuild for `outcome_kind` CHECK extension + 1 schema fixture.
 
+#### 4.4.4 Implementation step plan
+
+W10.4 is large enough (≈400 LoC across 5 files + migration + DDL fixtures + integration fixtures) that it ships as **three commits**, each independently verifiable.  Step 1 is already merged on the branch; step 2 is the current GO target; step 3 lands alongside W10.5 to keep MAC-recovery integration fixtures with the rest of the routing fixtures.
+
+##### Step 1 — schema + claim helper (LANDED, commits `53f2c50` + `b18bfb1`)
+
+**Scope:**
+- Migration 013 (`migrations/013_mac_recovery.sql`):
+    - `fiscal_documents.mac_recovery_attempts INTEGER NOT NULL DEFAULT 0 CHECK (... IN (0, 1))`.
+    - `transport_trace.outcome_kind` CHECK list extended with `'RETRYABLE_MAC_HASH_MISMATCH'` via `defer_foreign_keys = ON` table rebuild (mirrors migration 008 precedent).  Indexes from 010 + 012 re-created.
+- `OutcomeKind::RetryableMacHashMismatch` enum variant + `as_str()` mapping.
+- `wire_decision_to_outcome_kind` updated: `RetryClass::MacRecovery → OutcomeKind::RetryableMacHashMismatch` (was best-effort `RetryableServer`).
+- `fiscal_documents::mac_recovery_claim_counter_tx(tx, doc) → bool` — CAS-guarded helper (state=ERROR_RETRYABLE AND counter=0 → counter=1).
+- Tests: 4 DDL fixtures in `tests/migration_013_mac_recovery.rs` + 4 helper fixtures in `tests/fiscal_documents_send_helpers.rs`.
+
+**Verified:** 93 lib + 11 helpers + 4 migration_013 + 7 migration_010 + 16 stage4 + 8 W3 scanner + clippy clean.
+
+##### Step 2 — orchestrator + helpers (NEXT)
+
+**Scope:**
+
+1. **`document_files::replace_tx(tx, doc_id, kind, content) → sqlx::Result<()>`**
+   - New tx-bound repo helper in `db/repositories/document_files.rs`.
+   - Replaces an existing artifact row in-place.  Implementation: `INSERT OR REPLACE` on the `(document_id, kind)` PK.  W6 stage 3 only INSERTs new artifacts; this helper is the canonical replace surface for MAC recovery.
+   - Error semantics: returns the wrapped sqlx error; any failure rolls back the wrapping `with_immediate` envelope.
+   - Targeted lib test in `tests/document_files_replace.rs` (~3 fixtures: replaces existing row, INSERTs if missing — semantic of `OR REPLACE` — pinned for W9 forensics, content round-trip).
+
+2. **`stage_sign::re_sign_after_mac_recovery(...)` extracted helper**
+   - Pulled from existing `stage_sign::run` Pattern A logic.  Same scope as W6 sign, BUT:
+     - NO Z allocation (already done on attempt #1).
+     - NO `Prepared → Signed` CAS (we are already in `ErrorRetryable`).
+     - Inputs: typed payload + lnd + doc_type + new previous_hash (caller passes the recovered hash from MR-NO-TX step).
+     - Output: `(canonical_unsigned_xml: Vec<u8>, unsigned_xml_sha256: [u8; 32], signed_xml_cms: Vec<u8>)`.
+   - Pure no-tx (per Q2 finalised, W3 invariant holds).
+   - Caller (orchestrator) feeds the output into MR-PERSIST.
+
+3. **`mac_recovery.rs` module** (~280 LoC, lives at `services/write_path/mac_recovery.rs`):
+   - `regex_extract_store_hash(message: &str) → Option<[u8; 32]>` (pure-fn, regex `r"store ([0-9a-fA-F]{64})"`; mirrors Python `dps_fiscal_server.py:494`).
+   - `MacRecoveryOutcome` enum: `Resigned`, `HashNotExtractable`, `CounterExhausted`.
+   - `run_mac_recovery(pool, crypto, session, profile, doc, hint) → Result<MacRecoveryOutcome, StageSendError>` orchestrator: regex extract → MR-CLAIM `with_immediate` → MR-NO-TX (read inputs + re-sign) → MR-PERSIST `with_immediate` (atomic four-write per HIGH 2).
+   - `persist_resigned_tx(tx, doc, new_previous_hash, new_unsigned_xml_sha256, new_payload_xml, new_signed_xml)` — orchestrator-local helper (LOW 1 close — crosses repo boundary, lives in `mac_recovery.rs` not `fiscal_documents.rs`).
+   - Audit: emits `MAC_RECOVERY_HASH_NOT_EXTRACTABLE` / `MAC_RECOVERY_RESIGNED` / (caller emits `MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH` on second `-12`) per freeze §3.4 closed enum.
+   - Targeted lib tests:
+     - `regex_extract_store_hash` happy + malformed message + non-hex chars + wrong-length hex.
+     - `MacRecoveryOutcome` dispatch table (3 variants).
+
+4. **`stage_send::run` integration** (~50 LoC):
+   - After 4-b commit returns and `wire_decision == WireDecision::Routed(d) && d.retry_class == MacRecovery && !mac_recovery_invoked`, invoke `mac_recovery::run_mac_recovery` BEFORE returning to the caller.
+   - Local `mac_recovery_invoked: bool` flag in `run()` scope tracks budget use within a single invocation.
+   - Outcome routing:
+     - `Resigned` → set flag = true, re-enter the standard 4-pre/4a/4b cycle in a loop (the 4-pre source-state allowlist already accepts `ErrorRetryable → Sending` per §4.2).
+     - `HashNotExtractable` → override `wire_decision` to `RoutingDecision { target_state=Rejected, retry_class=TerminalReject, audit_event=MacRecoveryHashNotExtractable, ... }`.  CAS `ErrorRetryable → Rejected` in a follow-up `with_immediate` envelope.  Audit + trace 2 closure.
+     - `CounterExhausted` (second `-12` on attempt #2) → similar override but audit `MacRecoveryFailedRepeatHashMismatch`.
+   - Loop bound: at most ONE re-entry per `run()` invocation (the flag prevents infinite looping).  Crash recovery semantics per §4.4.3 step list paragraph "Note on ordering and crash recovery".
+
+5. **W3 scanner**: `mac_recovery::run_mac_recovery` lives at module top level; `MR-NO-TX` (re-sign) executes BETWEEN two `with_immediate` envelopes (MR-CLAIM and MR-PERSIST), exactly the same shape stage 3 / stage 4-pre+4-b uses.  W3 static scan must stay green.
+
+**Verify after step 2 (BEFORE merge to main):**
+- `cargo test -p prro --test document_files_replace` (NEW) → expect 3 fixtures.
+- `cargo test -p prro --test write_path_stage4_send` → still 16 (step 2 leaves existing fixtures unchanged; W10.5 adds the MAC-recovery fixtures).
+- `cargo test -p prro --lib` (full) → +N tests for `regex_extract_store_hash` + `MacRecoveryOutcome` dispatch.
+- `cargo test -p prro --test with_immediate_no_foreign_io` → still 8 (W3 scanner green; orchestrator IO is OUTSIDE any `with_immediate`).
+- `cargo clippy -p prro --tests --no-deps -- -D warnings` → clean.
+
+**Acceptance criteria:**
+- All four MR-PERSIST writes commit atomically OR all roll back (HIGH 2 close).
+- Counter claim happens in a separate `with_immediate` BEFORE re-sign starts (HIGH 2 close — counter is the budget gate, not the persist gate).
+- `mac_recovery_invoked` flag prevents the orchestrator from being invoked twice in the same `run()` call (loop-bound proof).
+- No foreign IO inside `with_immediate` envelopes.
+
+##### Step 3 — integration fixtures (W10.5 territory)
+
+**Scope** (lives in W10.5 alongside the 21 routing fixtures, per freeze §4.5):
+- `tests/write_path_mac_recovery.rs`:
+    - **Happy** — `Server{-12}` with extractable hash → re-sign succeeds → attempt #2 OK → doc Sent.
+    - **Hash not extractable** — `Server{-12}` with malformed message → `MAC_RECOVERY_HASH_NOT_EXTRACTABLE` audit + doc Rejected.
+    - **Repeat -12** — bounded one attempt → second `-12` → doc Rejected with `MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH` audit + counter remains 1.
+- Stub `DpsChannel` records `(envelope, response)` pairs so the test asserts attempt #1 envelope ≠ attempt #2 envelope (different `previous_hash`).
+
+##### Step ordering rationale
+
+- Step 1 ships **schema-only**; no orchestrator means step 1 is pure additive (column DEFAULT 0 + new closed-enum variant + new helper).  Production deploys can roll forward without behaviour change because no caller invokes `mac_recovery_claim_counter_tx` yet.
+- Step 2 ships **orchestrator + integration**, behaviour-changing.  Doc previously routed to `ErrorRetryable` on `-12` will now (a) re-sign (b) re-attempt or (c) terminal Reject after counter exhaustion.  Without step 2 the doc is "stuck" in `ErrorRetryable` for W9 reconciliation — same as the pre-W10.4 baseline.
+- Step 3 ships **fixtures**, no behaviour change; just contract pinning.
+
 ### 4.5 W10.5 — Test fixtures
 - New `rust/prro/tests/write_path_dps_error_routing.rs`: 21 fixtures per W0-3 §9.2 (lines 1218-1256).  Pure-DB integration via stub `DpsChannel` (mirror W7.5 stub pattern); driver invokes `stage_send::run` end-to-end; asserts post-tx `state` + audit event_type + audit payload `retry_class` + (where applicable) `node_state.mode` + `probe_hint`.
   - 1 Transport
