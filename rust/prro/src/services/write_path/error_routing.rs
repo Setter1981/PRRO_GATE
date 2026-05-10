@@ -107,15 +107,24 @@ pub enum RetryClass {
 /// emit on the post-CAS commit.  As-str strings are the canonical
 /// wire form; written into `audit_log.event_type`.  Adding a new
 /// event requires extending this enum AND a fixture asserting it.
+///
+/// **F4 close (W10.1 review polish):** distinct variants for
+/// `StageSendTransientRetry` (Transport / Server-3) and
+/// `StageSendMacHashMismatch` (Server-12 first attempt).  Earlier
+/// draft overloaded `StageSendResult` for happy + retry + MAC
+/// first-attempt, which collapsed three semantically-distinct events
+/// into one wire string and degraded log discoverability.  Distinct
+/// strings = distinct grep patterns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditEvent {
-    /// Happy commit (W7-inherited, used by `stage_send.rs` directly
-    /// for OK arm) AND transient retry (Transport / Server-3 — used
-    /// by routing fn for `RetryClass::TransientRetry`).  Differentiation
-    /// by audit payload `outcome_kind` field.  AND first-attempt
-    /// MAC-recovery (Server{-12}) — same string, payload carries
-    /// `retry_class=MacRecovery` for forensics.
+    /// Happy commit on the OK arm (W7-inherited; used by
+    /// `stage_send.rs` directly when `WireDecision::Sent` lands).
+    /// **Routing fn never emits this directly** — it's only for the
+    /// success path which doesn't go through `route_dps_error`.
     StageSendResult,
+    /// Transient retry: Transport / Server-3.  `RetryClass::TransientRetry`;
+    /// doc routes to ErrorRetryable for re-drive under Pattern B.
+    StageSendTransientRetry,
     /// Terminal reject: Authorization{DocumentReject -1}, Server{-2
     /// non-shift, -5, -7..-10, -15 non-shift, -16}.
     StageSendRejected,
@@ -138,6 +147,11 @@ pub enum AuditEvent {
     StageSendNodeBlocked,
     /// `-6` ERROR_NOT_PREV_ZREPORT — operator-recoverable.
     StageSendOperatorEscalation,
+    /// `Server{-12}` first-attempt MAC hash mismatch.  Forensic event
+    /// for the wire reply that triggers MAC recovery.  Distinct from
+    /// `MacRecoveryResigned` (PERSIST commit) and
+    /// `MacRecoveryFailedRepeatHashMismatch` (second -12).
+    StageSendMacHashMismatch,
     /// MAC recovery: regex extraction failed.  Routed by stage_send
     /// after orchestrator returns `Outcome::HashNotExtractable`.
     MacRecoveryHashNotExtractable,
@@ -155,6 +169,7 @@ impl AuditEvent {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::StageSendResult => "STAGE_SEND_RESULT",
+            Self::StageSendTransientRetry => "STAGE_SEND_TRANSIENT_RETRY",
             Self::StageSendRejected => "STAGE_SEND_REJECTED",
             Self::StageSendFnNotRegistered => "STAGE_SEND_FN_NOT_REGISTERED",
             Self::StageSendWrapperBug => "STAGE_SEND_WRAPPER_BUG",
@@ -163,6 +178,7 @@ impl AuditEvent {
             Self::StageSendProbeRequired => "STAGE_SEND_PROBE_REQUIRED",
             Self::StageSendNodeBlocked => "STAGE_SEND_NODE_BLOCKED",
             Self::StageSendOperatorEscalation => "STAGE_SEND_OPERATOR_ESCALATION",
+            Self::StageSendMacHashMismatch => "STAGE_SEND_MAC_HASH_MISMATCH",
             Self::MacRecoveryHashNotExtractable => "MAC_RECOVERY_HASH_NOT_EXTRACTABLE",
             Self::MacRecoveryResigned => "MAC_RECOVERY_RESIGNED",
             Self::MacRecoveryFailedRepeatHashMismatch => "MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH",
@@ -222,12 +238,14 @@ pub fn route_send_result(
 /// is threaded through for forward-compat but does not currently change
 /// the routing.  Calling with `false` in W10 yields a routing decision
 /// whose contract has NOT been audited and may change without notice.
-pub fn route_dps_error(err: &DpsError, doc_type: DocType, _is_live_send: bool) -> RoutingDecision {
+pub fn route_dps_error(err: &DpsError, doc_type: DocType, is_live_send: bool) -> RoutingDecision {
     match err {
         DpsError::Transport(_) => RoutingDecision {
             target_state: DocState::ErrorRetryable,
             retry_class: RetryClass::TransientRetry,
-            audit_event: AuditEvent::StageSendResult,
+            // F4 close: distinct audit event for transient retry —
+            // forensic clarity vs happy-path StageSendResult.
+            audit_event: AuditEvent::StageSendTransientRetry,
             audit_severity: Severity::Warning,
             node_mode_flip: None,
             probe_hint: None,
@@ -264,7 +282,11 @@ pub fn route_dps_error(err: &DpsError, doc_type: DocType, _is_live_send: bool) -
             }),
             mac_recovery_hint: None,
         },
-        DpsError::Server { code, message } => route_server_code(*code, message, doc_type),
+        DpsError::Server { code, message } => {
+            // F1 close: thread is_live_send through forward-compat
+            // for W9, even though W10 body doesn't differentiate.
+            route_server_code(*code, message, doc_type, is_live_send)
+        }
         DpsError::NotFound | DpsError::QueryNotSupported(_) => RoutingDecision {
             // B2 close: live send_chk should never produce these
             // query-only shapes.  Doc must NOT be left durably in
@@ -304,14 +326,34 @@ pub fn route_dps_error(err: &DpsError, doc_type: DocType, _is_live_send: bool) -
 /// -12/-15/-16) have explicit arms; **unknown codes route to
 /// `WrapperBug`** (`i32` is not an enum, so a fail-closed `_` arm is
 /// the only way to be exhaustive).
-fn route_server_code(code: i32, message: &str, doc_type: DocType) -> RoutingDecision {
+///
+/// F1 close: `is_live_send` is threaded through the signature for
+/// forward-compat with W9.  W10 body does NOT branch on it (FALSE
+/// branch RESERVED per freeze §3.5); W9 will introduce reconciliation-
+/// side overrides without forcing a signature change.
+fn route_server_code(
+    code: i32,
+    message: &str,
+    doc_type: DocType,
+    _is_live_send: bool,
+) -> RoutingDecision {
     match code {
         -2 => {
             // ERROR_CHECK.  W0-3 §2.1 row -2: terminal-business by
-            // default; close-shift exception (doc_type ∈ {SHIFT_CLOSE,
-            // Z_REPORT} AND error_message indicates "open shift") →
-            // ProbeRequired.
-            if is_close_shift(doc_type) && message.to_lowercase().contains("open shift") {
+            // default; close-shift exception → ProbeRequired.
+            //
+            // F3 close (W10.1 review): drop the
+            // `message.contains("open shift")` substring check.
+            // DPS server message format is not a stable contract;
+            // routing on substring leaves the door open to silently
+            // mis-classifying close-shift races as terminal Rejects
+            // if DPS rewords the message.  ALL `-2` for close-shift
+            // doc_types route to ProbeRequired; the W9 `last_chk`
+            // probe reveals the truth on its own.  The `_message`
+            // parameter is preserved on the signature for forensic
+            // audit-payload composition by the caller.
+            let _ = message;
+            if is_close_shift(doc_type) {
                 RoutingDecision {
                     target_state: DocState::ErrorRetryable,
                     retry_class: RetryClass::ProbeRequired,
@@ -340,7 +382,8 @@ fn route_server_code(code: i32, message: &str, doc_type: DocType) -> RoutingDeci
             // (M3 deviates from Python, mirrors WebCheck).
             target_state: DocState::ErrorRetryable,
             retry_class: RetryClass::TransientRetry,
-            audit_event: AuditEvent::StageSendResult,
+            // F4 close: distinct audit for transient retry.
+            audit_event: AuditEvent::StageSendTransientRetry,
             audit_severity: Severity::Warning,
             node_mode_flip: None,
             probe_hint: None,
@@ -389,7 +432,10 @@ fn route_server_code(code: i32, message: &str, doc_type: DocType) -> RoutingDeci
             // NOT this fn.
             target_state: DocState::ErrorRetryable,
             retry_class: RetryClass::MacRecovery,
-            audit_event: AuditEvent::StageSendResult,
+            // F4 close: distinct audit event for first-attempt MAC
+            // hash mismatch — separates from happy-path StageSendResult
+            // and from the recovery-followup MAC events.
+            audit_event: AuditEvent::StageSendMacHashMismatch,
             audit_severity: Severity::Warning,
             node_mode_flip: None,
             probe_hint: None,
@@ -483,7 +529,8 @@ mod tests {
         );
         assert_eq!(d.target_state, DocState::ErrorRetryable);
         assert_eq!(d.retry_class, RetryClass::TransientRetry);
-        assert_eq!(d.audit_event, AuditEvent::StageSendResult);
+        // F4 close: distinct audit event for transient retry path.
+        assert_eq!(d.audit_event, AuditEvent::StageSendTransientRetry);
         assert_eq!(d.audit_severity, Severity::Warning);
         assert!(d.node_mode_flip.is_none());
         assert!(d.probe_hint.is_none());
@@ -635,7 +682,7 @@ mod tests {
 
     #[test]
     fn fixture_11_server_minus_2_non_shift_routes_to_terminal() {
-        let d = route_server_code(-2, "ERROR_CHECK", DocType::Sell);
+        let d = route_server_code(-2, "ERROR_CHECK", DocType::Sell, true);
         assert_eq!(d.target_state, DocState::Rejected);
         assert_eq!(d.retry_class, RetryClass::TerminalReject);
         assert_eq!(d.audit_event, AuditEvent::StageSendRejected);
@@ -643,11 +690,16 @@ mod tests {
     }
 
     #[test]
-    fn fixture_12_server_minus_2_close_shift_routes_to_probe_required() {
-        // Per §2.1 row -2: doc_type ∈ {SHIFT_CLOSE, Z_REPORT} +
-        // error_message includes "open shift" → ProbeRequired.
+    fn fixture_12_server_minus_2_close_shift_routes_to_probe_required_message_independent() {
+        // F3 close (W10.1 review): per §2.1 row -2 close-shift exception,
+        // routing fires for doc_type ∈ {SHIFT_CLOSE, Z_REPORT} REGARDLESS
+        // of error_message wording — the substring check on "open shift"
+        // was dropped because DPS message text is not a stable contract.
+        // The W9 last_chk probe is the durable source-of-truth.
         for dt in [DocType::ShiftClose, DocType::ZReport] {
-            let d = route_server_code(-2, "no open shift on RRO", dt);
+            // Message intentionally does NOT mention "open shift" —
+            // routing must STILL be ProbeRequired.
+            let d = route_server_code(-2, "ERROR_CHECK arbitrary text", dt, true);
             assert_eq!(d.target_state, DocState::ErrorRetryable);
             assert_eq!(d.retry_class, RetryClass::ProbeRequired);
             assert_eq!(d.audit_event, AuditEvent::StageSendProbeRequired);
@@ -662,16 +714,17 @@ mod tests {
 
     #[test]
     fn fixture_13_server_minus_3_routes_to_transient_retry() {
-        let d = route_server_code(-3, "ERROR_SAVE", DocType::Sell);
+        let d = route_server_code(-3, "ERROR_SAVE", DocType::Sell, true);
         assert_eq!(d.target_state, DocState::ErrorRetryable);
         assert_eq!(d.retry_class, RetryClass::TransientRetry);
-        assert_eq!(d.audit_event, AuditEvent::StageSendResult);
+        // F4 close: distinct audit event for transient retry path.
+        assert_eq!(d.audit_event, AuditEvent::StageSendTransientRetry);
         assert_eq!(d.audit_severity, Severity::Warning);
     }
 
     #[test]
     fn fixture_14_server_minus_5_routes_to_terminal() {
-        let d = route_server_code(-5, "ERROR_TYPE", DocType::Sell);
+        let d = route_server_code(-5, "ERROR_TYPE", DocType::Sell, true);
         assert_eq!(d.target_state, DocState::Rejected);
         assert_eq!(d.retry_class, RetryClass::TerminalReject);
         assert_eq!(d.audit_severity, Severity::Critical);
@@ -679,7 +732,7 @@ mod tests {
 
     #[test]
     fn fixture_15_server_minus_6_routes_to_operator_escalation() {
-        let d = route_server_code(-6, "ERROR_NOT_PREV_ZREPORT", DocType::Sell);
+        let d = route_server_code(-6, "ERROR_NOT_PREV_ZREPORT", DocType::Sell, true);
         assert_eq!(d.target_state, DocState::ErrorRetryable);
         assert_eq!(d.retry_class, RetryClass::OperatorEscalation);
         assert_eq!(d.audit_event, AuditEvent::StageSendOperatorEscalation);
@@ -690,7 +743,7 @@ mod tests {
     fn fixture_16_server_minus_7_to_minus_10_xml_class_routes_to_terminal() {
         // Parametrised: XML-class errors all route the same way.
         for code in [-7, -8, -9, -10] {
-            let d = route_server_code(code, "ERROR_XML_*", DocType::Sell);
+            let d = route_server_code(code, "ERROR_XML_*", DocType::Sell, true);
             assert_eq!(d.target_state, DocState::Rejected, "code {code}");
             assert_eq!(d.retry_class, RetryClass::TerminalReject, "code {code}");
             assert_eq!(d.audit_event, AuditEvent::StageSendRejected, "code {code}");
@@ -700,7 +753,7 @@ mod tests {
 
     #[test]
     fn fixture_17_server_minus_11_routes_to_terminal_with_node_blocked_flip() {
-        let d = route_server_code(-11, "ERROR_OFFLINE_168", DocType::Sell);
+        let d = route_server_code(-11, "ERROR_OFFLINE_168", DocType::Sell, true);
         assert_eq!(d.target_state, DocState::Rejected);
         assert_eq!(d.retry_class, RetryClass::TerminalReject);
         assert_eq!(d.audit_event, AuditEvent::StageSendNodeBlocked);
@@ -711,10 +764,11 @@ mod tests {
     #[test]
     fn fixture_18_server_minus_12_routes_to_mac_recovery() {
         let msg = "ERROR_BAD_HASH_PREV: store deadbeef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab";
-        let d = route_server_code(-12, msg, DocType::Sell);
+        let d = route_server_code(-12, msg, DocType::Sell, true);
         assert_eq!(d.target_state, DocState::ErrorRetryable);
         assert_eq!(d.retry_class, RetryClass::MacRecovery);
-        assert_eq!(d.audit_event, AuditEvent::StageSendResult);
+        // F4 close: distinct audit for first-attempt MAC hash mismatch.
+        assert_eq!(d.audit_event, AuditEvent::StageSendMacHashMismatch);
         assert_eq!(
             d.mac_recovery_hint,
             Some(MacRecoveryHint {
@@ -726,7 +780,7 @@ mod tests {
     #[test]
     fn fixture_19_server_minus_15_close_shift_routes_to_probe_required() {
         for dt in [DocType::ShiftClose, DocType::ZReport] {
-            let d = route_server_code(-15, "ERROR_NOT_OPEN_SHIFT", dt);
+            let d = route_server_code(-15, "ERROR_NOT_OPEN_SHIFT", dt, true);
             assert_eq!(d.target_state, DocState::ErrorRetryable);
             assert_eq!(d.retry_class, RetryClass::ProbeRequired);
             assert_eq!(d.audit_event, AuditEvent::StageSendProbeRequired);
@@ -741,7 +795,7 @@ mod tests {
 
     #[test]
     fn fixture_20_server_minus_15_non_shift_routes_to_terminal() {
-        let d = route_server_code(-15, "ERROR_NOT_OPEN_SHIFT", DocType::Sell);
+        let d = route_server_code(-15, "ERROR_NOT_OPEN_SHIFT", DocType::Sell, true);
         assert_eq!(d.target_state, DocState::Rejected);
         assert_eq!(d.retry_class, RetryClass::TerminalReject);
         assert_eq!(d.audit_severity, Severity::Critical);
@@ -751,7 +805,7 @@ mod tests {
     fn fixture_21_server_minus_16_m3a_routes_to_terminal_alert() {
         // M3a is ONLINE-only (W0-3 §5).  M3b will route to offline-id
         // reconciliation; M3a fails fast.
-        let d = route_server_code(-16, "ERROR_OFFLINE_ID", DocType::Sell);
+        let d = route_server_code(-16, "ERROR_OFFLINE_ID", DocType::Sell, true);
         assert_eq!(d.target_state, DocState::Rejected);
         assert_eq!(d.retry_class, RetryClass::TerminalReject);
         assert_eq!(d.audit_severity, Severity::Critical);
@@ -765,7 +819,7 @@ mod tests {
         // routing: unknown code → WrapperBug → ErrorRetryable +
         // CRITICAL audit.
         for code in [-99, -42, 100, 999] {
-            let d = route_server_code(code, "unknown", DocType::Sell);
+            let d = route_server_code(code, "unknown", DocType::Sell, true);
             assert_eq!(d.target_state, DocState::ErrorRetryable, "code {code}");
             assert_eq!(d.retry_class, RetryClass::WrapperBug, "code {code}");
             assert_eq!(
@@ -811,6 +865,10 @@ mod tests {
         // any of these strings without intent, this test fails loudly.
         assert_eq!(AuditEvent::StageSendResult.as_str(), "STAGE_SEND_RESULT");
         assert_eq!(
+            AuditEvent::StageSendTransientRetry.as_str(),
+            "STAGE_SEND_TRANSIENT_RETRY"
+        );
+        assert_eq!(
             AuditEvent::StageSendRejected.as_str(),
             "STAGE_SEND_REJECTED"
         );
@@ -843,6 +901,10 @@ mod tests {
             "STAGE_SEND_OPERATOR_ESCALATION"
         );
         assert_eq!(
+            AuditEvent::StageSendMacHashMismatch.as_str(),
+            "STAGE_SEND_MAC_HASH_MISMATCH"
+        );
+        assert_eq!(
             AuditEvent::MacRecoveryHashNotExtractable.as_str(),
             "MAC_RECOVERY_HASH_NOT_EXTRACTABLE"
         );
@@ -854,6 +916,79 @@ mod tests {
             AuditEvent::MacRecoveryFailedRepeatHashMismatch.as_str(),
             "MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH"
         );
+    }
+
+    // ─── F2 close: is_live_send forward-compat pin ──────────────────
+
+    #[test]
+    fn is_live_send_false_currently_mirrors_true_w10_reserves_for_w9() {
+        // F2 close (W10.1 review): the `is_live_send` parameter is
+        // threaded through `route_dps_error` and `route_server_code`
+        // for forward-compat with W9 reconciliation.  W10 body does
+        // NOT branch on it (per freeze §3.5: `false` branch RESERVED).
+        // This test PINS that contract: as long as W10 is on its own,
+        // both `true` and `false` must yield identical decisions for
+        // the full 8 DpsError variants × representative server codes.
+        //
+        // When W9 lands and starts diverging routing on `false`, the
+        // freeze §3.5 STABILITY NOTE will be lifted and this pin test
+        // will be UPDATED (not deleted) to encode the new contract.
+        let cases: Vec<DpsError> = vec![
+            DpsError::Transport("TLS".into()),
+            DpsError::Authorization {
+                code: -1,
+                kind: AuthorizationKind::DocumentReject,
+                message: "ERROR_VEREFY".into(),
+            },
+            DpsError::Authorization {
+                code: -13,
+                kind: AuthorizationKind::FiscalNumberNotRegistered,
+                message: "ERROR_NOT_REGISTERED_RRO".into(),
+            },
+            DpsError::Decode("status=0".into()),
+            DpsError::NotFound,
+            DpsError::ServerFiscalIdMismatch {
+                expected_id: "A".into(),
+                actual_id: "B".into(),
+            },
+            DpsError::QueryNotSupported("ByLocalIdentity"),
+            DpsError::Internal("wrapper".into()),
+            DpsError::Server {
+                code: -2,
+                message: "ERROR_CHECK".into(),
+            },
+            DpsError::Server {
+                code: -3,
+                message: "ERROR_SAVE".into(),
+            },
+            DpsError::Server {
+                code: -11,
+                message: "ERROR_OFFLINE_168".into(),
+            },
+            DpsError::Server {
+                code: -12,
+                message: "ERROR_BAD_HASH_PREV: store deadbeef".into(),
+            },
+            DpsError::Server {
+                code: -15,
+                message: "ERROR_NOT_OPEN_SHIFT".into(),
+            },
+            DpsError::Server {
+                code: -99,
+                message: "unknown".into(),
+            },
+        ];
+        for err in &cases {
+            for dt in [DocType::Sell, DocType::ShiftClose, DocType::ZReport] {
+                let live = route_dps_error(err, dt, true);
+                let reserved = route_dps_error(err, dt, false);
+                assert_eq!(
+                    live, reserved,
+                    "is_live_send=false must currently mirror is_live_send=true \
+                     in W10 (freeze §3.5 RESERVED); err={err:?}, doc_type={dt:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -869,12 +1004,12 @@ mod tests {
                 DocType::Sell,
                 true,
             ),
-            route_server_code(-2, "x", DocType::Sell),
-            route_server_code(-5, "x", DocType::Sell),
-            route_server_code(-7, "x", DocType::Sell),
-            route_server_code(-11, "x", DocType::Sell),
-            route_server_code(-15, "x", DocType::Sell),
-            route_server_code(-16, "x", DocType::Sell),
+            route_server_code(-2, "x", DocType::Sell, true),
+            route_server_code(-5, "x", DocType::Sell, true),
+            route_server_code(-7, "x", DocType::Sell, true),
+            route_server_code(-11, "x", DocType::Sell, true),
+            route_server_code(-15, "x", DocType::Sell, true),
+            route_server_code(-16, "x", DocType::Sell, true),
         ];
         for d in cases {
             assert_eq!(d.retry_class, RetryClass::TerminalReject);
@@ -898,7 +1033,7 @@ mod tests {
                 DocType::Sell,
                 true,
             ),
-            route_server_code(-99, "unknown", DocType::Sell),
+            route_server_code(-99, "unknown", DocType::Sell, true),
         ];
         for d in cases {
             assert_eq!(d.retry_class, RetryClass::WrapperBug);
@@ -915,11 +1050,11 @@ mod tests {
                 ProbeReason::DecodeUnknown,
             ),
             (
-                route_server_code(-2, "open shift", DocType::ShiftClose),
+                route_server_code(-2, "open shift", DocType::ShiftClose, true),
                 ProbeReason::Code2CloseShift,
             ),
             (
-                route_server_code(-15, "x", DocType::ZReport),
+                route_server_code(-15, "x", DocType::ZReport, true),
                 ProbeReason::Code15CloseShift,
             ),
         ];
@@ -936,7 +1071,7 @@ mod tests {
     #[test]
     fn mac_recovery_class_carries_hint_with_raw_message() {
         let msg = "store ABCDEF0123456789...";
-        let d = route_server_code(-12, msg, DocType::Sell);
+        let d = route_server_code(-12, msg, DocType::Sell, true);
         assert_eq!(d.retry_class, RetryClass::MacRecovery);
         assert_eq!(
             d.mac_recovery_hint
