@@ -31,6 +31,20 @@ enum Cmd {
     },
 }
 
+/// Drive `App::boot` to completion; on `BootError` exit with the
+/// variant's BSD sysexits code (per W9 freeze §5.5).  Returns the
+/// `App` on success.  The error message is emitted to stderr via the
+/// `Display` impl of `BootError` before exit.
+async fn boot_or_exit(cfg: AppConfig) -> anyhow::Result<App> {
+    match App::boot(cfg).await {
+        Ok(app) => Ok(app),
+        Err(boot_err) => {
+            eprintln!("prro: boot failed: {boot_err}");
+            std::process::exit(boot_err.exit_code());
+        }
+    }
+}
+
 /// Wait for a graceful-shutdown signal.
 ///
 /// On Unix, return on either SIGINT or SIGTERM (systemd / docker stop default).
@@ -70,8 +84,9 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Migrate { config } => {
             let text = std::fs::read_to_string(&config)?;
             let cfg = AppConfig::from_toml(&text)?;
-            let _lock = prro::runtime::singleton::acquire(&cfg.database.db_path)?;
-            let _app = App::boot(cfg).await?; // boot triggers migrate
+            // W9: App::boot now acquires the singleton lock internally
+            // (consolidated pre-flight pipeline); no separate acquire here.
+            let _app = boot_or_exit(cfg).await?;
             tracing::info!("migrations applied");
             Ok(())
         }
@@ -79,8 +94,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Serve { config } => {
             let text = std::fs::read_to_string(&config)?;
             let cfg = AppConfig::from_toml(&text)?;
-            let _lock = prro::runtime::singleton::acquire(&cfg.database.db_path)?;
-            let app = App::boot(cfg).await?;
+            let app = boot_or_exit(cfg).await?;
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
                 "prro listening (M1 — idle)"
