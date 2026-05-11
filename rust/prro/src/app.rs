@@ -24,6 +24,7 @@
 
 use crate::config::AppConfig;
 use crate::runtime::singleton::PidLock;
+use crate::services::reconciliation::boot_phase::ReconciliationSummary;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
@@ -173,12 +174,20 @@ impl App {
     /// each FN, delegates to
     /// `services::reconciliation::boot_phase::run_boot_reconciliation`.
     ///
+    /// **Returns** [`ReconciliationSummary`] aggregating per-FN branch
+    /// counts + per-DocState dispatch histogram (W9.4 M1 fix per
+    /// freeze §2.1).  Operator / test consumers read the summary
+    /// directly instead of re-querying `audit_log`.
+    ///
     /// **OFFLINE refusal (freeze §3.4 + §13.3).**  If any FN returns
     /// `BranchOutcome::OfflineRefusal`, this method fails-fast on the
     /// FIRST such FN encountered and returns
     /// `BootError::OfflineModeRefusal { fiscal_number }`.  The audit
     /// row `NODE_STATE_BOOT_OFFLINE_REFUSAL` was already emitted by
-    /// `run_boot_reconciliation` before returning the outcome.
+    /// `run_boot_reconciliation` before returning the outcome.  Partial
+    /// progress for FNs already processed BEFORE the refusal is
+    /// committed (each per-FN `with_immediate` envelope is atomic);
+    /// the summary that would have been returned is discarded.
     ///
     /// **Ctx-needy dispatch deferral (W9.3).**  Per-DocState
     /// dispatches that require `DpsChannel` / `SigningContext`
@@ -186,7 +195,7 @@ impl App {
     /// `BOOT_DISPATCH_DEFERRED` audit and leave the doc in its source
     /// state.  Runtime composition (W11+) wires the missing
     /// dispatches.
-    pub async fn reconcile_pending(&self) -> Result<(), BootError> {
+    pub async fn reconcile_pending(&self) -> Result<ReconciliationSummary, BootError> {
         use crate::db::repositories::fiscal_number_config;
         use crate::services::reconciliation::boot_phase::{self, BranchOutcome};
 
@@ -194,6 +203,7 @@ impl App {
         let fns = fiscal_number_config::list_all(pool)
             .await
             .map_err(BootError::Database)?;
+        let mut summary = ReconciliationSummary::default();
         for fn_cfg in &fns {
             let outcome = boot_phase::run_boot_reconciliation(pool, &fn_cfg.fiscal_number)
                 .await
@@ -209,8 +219,9 @@ impl App {
                     fiscal_number: fn_cfg.fiscal_number.clone(),
                 });
             }
+            summary.record(&outcome);
         }
-        Ok(())
+        Ok(summary)
     }
 
     pub fn config(&self) -> &AppConfig {

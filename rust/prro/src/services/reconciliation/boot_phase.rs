@@ -27,6 +27,136 @@ use crate::transports::dps::dto::CheckAck;
 /// max_recovery_attempts=5".
 pub const MAX_BOOT_ATTEMPTS: i64 = 5;
 
+/// W9.4 fix (L1 + M1) — per-DocState dispatch histogram captured
+/// during branch (c)/(e1) per-doc iteration.  Emitted in the
+/// `NODE_STATE_BOOT_RECONCILED` audit payload as `"by_outcome": {...}`
+/// per freeze §3.3 + aggregated into [`ReconciliationSummary`].
+///
+/// Counts are mutually exclusive per doc — each pending doc lands in
+/// exactly one bucket (success or `dispatch_errors` if M3 try-and-
+/// audit shim caught a helper failure).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DispatchHistogram {
+    pub sending_resumed: usize,
+    pub kvt1_held: usize,
+    pub encrypted_rerouted: usize,
+    pub kvt2_finalized: usize,
+    pub kvt2_failed: usize,
+    pub prepared_deferred: usize,
+    pub signed_deferred: usize,
+    pub sent_deferred: usize,
+    pub error_retryable_deferred: usize,
+    /// W9.4 M3 fix counter — per-doc dispatch failures absorbed by
+    /// the try-and-audit shim (helper-level Err that's NOT fatal at
+    /// branch level).  Operator dashboard surfaces these via
+    /// `BOOT_DISPATCH_ERROR` audit rows AND this counter.
+    pub dispatch_errors: usize,
+}
+
+impl DispatchHistogram {
+    pub fn total_visited(&self) -> usize {
+        self.sending_resumed
+            + self.kvt1_held
+            + self.encrypted_rerouted
+            + self.kvt2_finalized
+            + self.kvt2_failed
+            + self.prepared_deferred
+            + self.signed_deferred
+            + self.sent_deferred
+            + self.error_retryable_deferred
+            + self.dispatch_errors
+    }
+
+    fn merge(&mut self, other: &DispatchHistogram) {
+        self.sending_resumed += other.sending_resumed;
+        self.kvt1_held += other.kvt1_held;
+        self.encrypted_rerouted += other.encrypted_rerouted;
+        self.kvt2_finalized += other.kvt2_finalized;
+        self.kvt2_failed += other.kvt2_failed;
+        self.prepared_deferred += other.prepared_deferred;
+        self.signed_deferred += other.signed_deferred;
+        self.sent_deferred += other.sent_deferred;
+        self.error_retryable_deferred += other.error_retryable_deferred;
+        self.dispatch_errors += other.dispatch_errors;
+    }
+}
+
+/// W9.4 fix (M1) — sub-branch tag for `BranchOutcome::Reconciled`
+/// distinguishing pure pending-set processing (c) from mid-transition
+/// shift cascade (e1).  Freeze §3.7 partition: (e1) implies
+/// `shift_state ∈ {Opening, Closing}` AND matching pending doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubBranch {
+    /// (c) pure pending-set processing; shift_state ∉ {Opening, Closing}.
+    C,
+    /// (e1) mid-transition shift with matching pending doc; cascades to (c).
+    E1,
+}
+
+impl SubBranch {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SubBranch::C => "c",
+            SubBranch::E1 => "e1",
+        }
+    }
+}
+
+/// W9.4 fix (M1) — per-call aggregate returned by
+/// [`crate::App::reconcile_pending`].  Each FN's `BranchOutcome`
+/// folds into one of the branch-count fields; per-DocState dispatches
+/// fold into `docs_advanced`.  Operator / test consumers read the
+/// summary directly instead of re-querying `audit_log`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReconciliationSummary {
+    pub branch_a: usize,
+    pub branch_b: usize,
+    pub branch_c: usize,
+    pub branch_e1: usize,
+    pub branch_e2: usize,
+    pub branch_f_blocked: usize,
+    pub branch_f_stop_mode: usize,
+    pub branch_f_crypto_degraded: usize,
+    /// Aggregated per-DocState dispatch outcomes across all FNs
+    /// processed in this `reconcile_pending` call.  Tied to L1
+    /// histogram payload — same shape, multi-FN union.
+    pub docs_advanced: DispatchHistogram,
+    /// (e2) sub-branch: count of orphan shifts forcibly transitioned
+    /// to `ERROR` across all FNs.  One FN may contribute multiple
+    /// orphans (rare; verified by `branch_e2_handles_multiple_orphan_shifts`).
+    pub shift_orphans_to_error: usize,
+}
+
+impl ReconciliationSummary {
+    /// Fold one FN's [`BranchOutcome`] into this summary.  The histogram
+    /// (if any) is merged into `docs_advanced`; the orphan count is
+    /// added directly.
+    pub fn record(&mut self, outcome: &BranchOutcome) {
+        match outcome {
+            BranchOutcome::Bootstrapped => self.branch_a += 1,
+            BranchOutcome::IdempotentNoop => self.branch_b += 1,
+            BranchOutcome::Reconciled {
+                histogram,
+                sub_branch,
+            } => {
+                match sub_branch {
+                    SubBranch::C => self.branch_c += 1,
+                    SubBranch::E1 => self.branch_e1 += 1,
+                }
+                self.docs_advanced.merge(histogram);
+            }
+            BranchOutcome::OfflineRefusal { .. } => { /* terminal — caller maps to Err */ }
+            BranchOutcome::OrphanShiftResolved { orphans_resolved } => {
+                self.branch_e2 += 1;
+                self.shift_orphans_to_error += orphans_resolved;
+            }
+            BranchOutcome::PreservedBlocked => self.branch_f_blocked += 1,
+            BranchOutcome::PreservedStopMode => self.branch_f_stop_mode += 1,
+            BranchOutcome::PreservedCryptoDegraded => self.branch_f_crypto_degraded += 1,
+        }
+    }
+}
+
 /// W9 freeze §4.4 — `Sending` crash-resume helper.
 ///
 /// Single `with_immediate` envelope containing a CAS
@@ -273,17 +403,18 @@ pub async fn passive_hold_kvt1(pool: &SqlitePool, doc_id: DocumentId) -> anyhow:
 /// W9.3 — per-FN decision-tree dispatch.  Closed-enum outcome lets
 /// the caller (`App::reconcile_pending`) accumulate per-FN
 /// histograms without re-reading the DB.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BranchOutcome {
     /// (a) FN row absent → upsert_initial executed.
     Bootstrapped,
     /// (b) FN row + mode=Online + no pending docs → idempotent no-op.
     IdempotentNoop,
-    /// (c) FN row + pending docs → per-doc dispatch executed.
-    /// Carries the count of pending docs visited (NOT advanced —
-    /// some may have been deferred per ctx-needy DocStates).
+    /// (c) FN row + pending docs → per-doc dispatch executed.  W9.4
+    /// (M1 + L1 fix): carries per-DocState histogram + sub-branch
+    /// tag (c vs e1 cascade).
     Reconciled {
-        pending_visited: usize,
+        histogram: DispatchHistogram,
+        sub_branch: SubBranch,
     },
     /// (d) Mode ∈ {Offline, GoingOffline, GoingOnline} → refuse
     /// boot; caller surfaces `BootError::OfflineModeRefusal`.
@@ -291,13 +422,35 @@ pub enum BranchOutcome {
         observed_mode: NodeMode,
     },
     /// (e2) Mid-transition shift orphan with no matching pending
-    /// doc → shift→Error + node_state.shift_state→Closed.
-    /// (e1) collapses into Reconciled (c).
-    OrphanShiftResolved,
+    /// doc → shift→Error + node_state.shift_state→Closed.  Carries
+    /// the count of orphans resolved (one FN may have multiple).
+    OrphanShiftResolved {
+        orphans_resolved: usize,
+    },
     /// (f) Mode ∈ {Blocked, StopMode, CryptoDegraded} → preserved.
     PreservedBlocked,
     PreservedStopMode,
     PreservedCryptoDegraded,
+}
+
+impl BranchOutcome {
+    /// W9.4 fix (N2) — stable string tag for this branch, used in
+    /// audit payloads and operator-facing tooling.  Single source of
+    /// truth — adding a new variant requires extending this map AND
+    /// the corresponding audit-emission paths in
+    /// `run_boot_reconciliation`.
+    pub fn branch_tag(&self) -> &'static str {
+        match self {
+            BranchOutcome::Bootstrapped => "a",
+            BranchOutcome::IdempotentNoop => "b",
+            BranchOutcome::Reconciled { sub_branch, .. } => sub_branch.as_str(),
+            BranchOutcome::OfflineRefusal { .. } => "d",
+            BranchOutcome::OrphanShiftResolved { .. } => "e2",
+            BranchOutcome::PreservedBlocked => "f1",
+            BranchOutcome::PreservedStopMode => "f2",
+            BranchOutcome::PreservedCryptoDegraded => "f3",
+        }
+    }
 }
 
 /// W9 freeze §3 + §4 — per-FN decision tree.
@@ -388,34 +541,37 @@ pub async fn run_boot_reconciliation(
     }
 
     // ── Branch (f) — Blocked / StopMode / CryptoDegraded ─────────
-    let (preserved_event, preserved_severity, preserved_outcome) = match row.mode {
-        NodeMode::Blocked => (
+    // N1 fix: Option<tuple> shape instead of sentinel-string tuple
+    // for the unreachable Online arm.  Online path drops through to
+    // the (e2)/(b)/(c)/(e1) cascade below.
+    let preserved: Option<(
+        &'static str,
+        crate::db::models::enums::Severity,
+        BranchOutcome,
+    )> = match row.mode {
+        NodeMode::Blocked => Some((
             "NODE_STATE_BOOT_BLOCKED_PRESERVED",
             crate::db::models::enums::Severity::Info,
-            Some(BranchOutcome::PreservedBlocked),
-        ),
-        NodeMode::StopMode => (
+            BranchOutcome::PreservedBlocked,
+        )),
+        NodeMode::StopMode => Some((
             "NODE_STATE_BOOT_STOP_MODE_PRESERVED",
             crate::db::models::enums::Severity::Warning,
-            Some(BranchOutcome::PreservedStopMode),
-        ),
-        NodeMode::CryptoDegraded => (
+            BranchOutcome::PreservedStopMode,
+        )),
+        NodeMode::CryptoDegraded => Some((
             "NODE_STATE_BOOT_CRYPTO_DEGRADED_PRESERVED",
             crate::db::models::enums::Severity::Warning,
-            Some(BranchOutcome::PreservedCryptoDegraded),
-        ),
-        _ => ("", crate::db::models::enums::Severity::Info, None),
+            BranchOutcome::PreservedCryptoDegraded,
+        )),
+        _ => None,
     };
-    if let Some(outcome) = preserved_outcome {
-        let branch_tag = match &outcome {
-            BranchOutcome::PreservedBlocked => "f1",
-            BranchOutcome::PreservedStopMode => "f2",
-            BranchOutcome::PreservedCryptoDegraded => "f3",
-            _ => unreachable!(),
-        };
+    if let Some((preserved_event, preserved_severity, outcome)) = preserved {
+        // N2 fix: use BranchOutcome::branch_tag() instead of inline
+        // match-on-variant — single source of truth.
         let payload = serde_json::json!({
             "fiscal_number": fiscal_number,
-            "branch": branch_tag,
+            "branch": outcome.branch_tag(),
             "observed_mode": row.mode.as_str(),
         });
         audit_log::append(
@@ -442,9 +598,9 @@ pub async fn run_boot_reconciliation(
         // BEGIN IMMEDIATE serialisation removes the read-then-update
         // gap that the earlier pool-bound SELECT had — no need to
         // rely on the SWFN invariant as the sole guard.
+        // N3 fix: single move into the closure body — no inner re-clone.
         let fn_owned = fiscal_number.to_string();
-        with_immediate(pool, move |tx| {
-            let fn_owned = fn_owned.clone();
+        let orphans_resolved = with_immediate(pool, move |tx| {
             Box::pin(async move {
                 // Read orphan shifts inside the envelope so any
                 // parallel writer (theoretical under non-SWFN) cannot
@@ -456,6 +612,7 @@ pub async fn run_boot_reconciliation(
                 .bind(&fn_owned)
                 .fetch_all(&mut **tx)
                 .await?;
+                let orphans_resolved = orphans.len();
                 for (shift_id, current) in orphans {
                     // LOW 4 fix: whitelist alignment — `any → ERROR`
                     // is allowed per W0-1 §2.2 (operator-forced
@@ -494,11 +651,11 @@ pub async fn run_boot_reconciliation(
                 .bind(&fn_owned)
                 .execute(&mut **tx)
                 .await?;
-                Ok::<(), anyhow::Error>(())
+                Ok::<usize, anyhow::Error>(orphans_resolved)
             })
         })
         .await?;
-        return Ok(BranchOutcome::OrphanShiftResolved);
+        return Ok(BranchOutcome::OrphanShiftResolved { orphans_resolved });
     }
 
     // ── Branch (b) — Online + no pending ─────────────────────────
@@ -523,18 +680,36 @@ pub async fn run_boot_reconciliation(
     }
 
     // ── Branch (c) / (e1) — pending docs ─────────────────────────
-    let pending_count = pending.len();
+    let sub_branch = if matches!(row.shift_state, ShiftState::Opening | ShiftState::Closing) {
+        SubBranch::E1
+    } else {
+        SubBranch::C
+    };
+    let mut histogram = DispatchHistogram::default();
     for doc in &pending {
-        dispatch_pending_doc(pool, doc).await?;
+        // M3 fix: per-doc dispatch is failure-isolated.  Helper-level
+        // errors absorbed into BOOT_DISPATCH_ERROR audit + histogram
+        // counter; only infrastructure-level errors (audit insert
+        // failure) propagate.
+        dispatch_pending_doc(pool, doc, &mut histogram).await?;
     }
+    // L1 fix: emit histogram in the FN-level audit payload.
     let payload = serde_json::json!({
         "fiscal_number": fiscal_number,
-        "branch": if matches!(row.shift_state, ShiftState::Opening | ShiftState::Closing) {
-            "e1"
-        } else {
-            "c"
+        "branch": sub_branch.as_str(),
+        "by_outcome": {
+            "sending_resumed": histogram.sending_resumed,
+            "kvt1_held": histogram.kvt1_held,
+            "encrypted_rerouted": histogram.encrypted_rerouted,
+            "kvt2_finalized": histogram.kvt2_finalized,
+            "kvt2_failed": histogram.kvt2_failed,
+            "prepared_deferred": histogram.prepared_deferred,
+            "signed_deferred": histogram.signed_deferred,
+            "sent_deferred": histogram.sent_deferred,
+            "error_retryable_deferred": histogram.error_retryable_deferred,
+            "dispatch_errors": histogram.dispatch_errors,
         },
-        "pending_visited": pending_count,
+        "pending_visited": histogram.total_visited(),
     });
     audit_log::append(
         pool,
@@ -547,7 +722,8 @@ pub async fn run_boot_reconciliation(
     )
     .await?;
     Ok(BranchOutcome::Reconciled {
-        pending_visited: pending_count,
+        histogram,
+        sub_branch,
     })
 }
 
@@ -560,24 +736,33 @@ pub async fn run_boot_reconciliation(
 /// envelopes when those workers run (live or in a future ctx-wired
 /// boot dispatch).  W9.3's ctx-free dispatches (SENDING / KVT1 /
 /// ENCRYPTED / KVT2 via stage_finalize) preserve invariant I8.
+///
+/// **W9.4 M3 fix — per-doc failure containment.**  Each helper call
+/// is wrapped in `match`; helper-level Err is caught, audited as
+/// `BOOT_DISPATCH_ERROR` WARN, and counted in
+/// `histogram.dispatch_errors`.  Only infrastructure-level errors
+/// (audit insert itself failing) propagate — those are unrecoverable
+/// per-FN failures.  Net: one stuck doc cannot abort sibling
+/// reconciliation in branch (c)/(e1).
 async fn dispatch_pending_doc(
     pool: &SqlitePool,
     doc: &crate::db::repositories::fiscal_documents::DocumentRow,
+    histogram: &mut DispatchHistogram,
 ) -> anyhow::Result<()> {
     use crate::db::models::enums::DocState;
+    let doc_id = doc.document_id;
     match doc.state {
-        DocState::Sending => {
-            resume_sending_to_error_retryable(pool, doc.document_id).await?;
-        }
-        DocState::Kvt1 => {
-            passive_hold_kvt1(pool, doc.document_id).await?;
-        }
+        DocState::Sending => match resume_sending_to_error_retryable(pool, doc_id).await {
+            Ok(_) => histogram.sending_resumed += 1,
+            Err(e) => emit_dispatch_error(pool, doc_id, "c-sending", &e, histogram).await?,
+        },
+        DocState::Kvt1 => match passive_hold_kvt1(pool, doc_id).await {
+            Ok(_) => histogram.kvt1_held += 1,
+            Err(e) => emit_dispatch_error(pool, doc_id, "c-kvt1", &e, histogram).await?,
+        },
         DocState::Encrypted => {
-            // 1-tick deferral per freeze §4.3 MED 6 fix: transition
-            // Encrypted → ErrorRetryable; subsequent boot tick handles
-            // via §4.8.
-            let doc_id = doc.document_id;
-            with_immediate(pool, move |tx| {
+            // 1-tick deferral per freeze §4.3 MED 6 fix.
+            let result = with_immediate(pool, move |tx| {
                 Box::pin(async move {
                     sqlx::query(
                         "UPDATE fiscal_documents SET state = 'ERROR_RETRYABLE' \
@@ -605,20 +790,20 @@ async fn dispatch_pending_doc(
                     Ok::<(), anyhow::Error>(())
                 })
             })
-            .await?;
+            .await;
+            match result {
+                Ok(_) => histogram.encrypted_rerouted += 1,
+                Err(e) => emit_dispatch_error(pool, doc_id, "c-encrypted", &e, histogram).await?,
+            }
         }
         DocState::Kvt2 => {
             // W8 stage_finalize::run — pool + doc_id only, no ctx.
-            // The helper internally CASs Kvt2→Ack + advances chain
-            // seed + outbox INSERT + STAGE_FINALIZE_ACK audit on
-            // success.  On FAILURE the helper does NOT emit an audit,
-            // so we surface the failure via BOOT_KVT2_DISPATCH_FAILED
-            // WARN (HIGH 1 fix).  Continue iteration so one stuck
-            // Kvt2 doc doesn't abort the whole branch (c).
-            match crate::services::write_path::stage_finalize::run(pool, doc.document_id).await {
-                Ok(_) => {} // W8 emits STAGE_FINALIZE_ACK on success.
+            // Per HIGH 1 fix: distinguish kvt2_finalized (success)
+            // from kvt2_failed (stuck-Kvt2 surfaced via
+            // BOOT_KVT2_DISPATCH_FAILED audit).
+            match crate::services::write_path::stage_finalize::run(pool, doc_id).await {
+                Ok(_) => histogram.kvt2_finalized += 1,
                 Err(e) => {
-                    let doc_id = doc.document_id;
                     let payload = serde_json::json!({
                         "document_id": hex_lower(doc_id.as_bytes()),
                         "branch": "c-kvt2",
@@ -637,12 +822,12 @@ async fn dispatch_pending_doc(
                         Some(&payload.to_string()),
                     )
                     .await?;
+                    histogram.kvt2_failed += 1;
                 }
             }
         }
         // Ctx-needy states — emit DEFERRED audit, do not transition.
         DocState::Prepared | DocState::Signed | DocState::Sent | DocState::ErrorRetryable => {
-            let doc_id = doc.document_id;
             let state_str = doc.state.as_str().to_string();
             let payload = serde_json::json!({
                 "document_id": hex_lower(doc_id.as_bytes()),
@@ -660,6 +845,13 @@ async fn dispatch_pending_doc(
                 Some(&payload.to_string()),
             )
             .await?;
+            match doc.state {
+                DocState::Prepared => histogram.prepared_deferred += 1,
+                DocState::Signed => histogram.signed_deferred += 1,
+                DocState::Sent => histogram.sent_deferred += 1,
+                DocState::ErrorRetryable => histogram.error_retryable_deferred += 1,
+                _ => unreachable!(),
+            }
         }
         // Terminal states should NEVER appear in `list_pending_for_fn`
         // per its WHERE clause (excludes ACK/REJECTED/CANCELLED/
@@ -678,5 +870,41 @@ async fn dispatch_pending_doc(
             );
         }
     }
+    Ok(())
+}
+
+/// W9.4 M3 fix — try-and-audit shim: emit `BOOT_DISPATCH_ERROR` WARN
+/// and increment the dispatch_errors histogram bucket.  Used inside
+/// `dispatch_pending_doc` when a helper returns Err that's NOT a
+/// fatal infrastructure failure (audit insert failure propagates
+/// via `?`).
+///
+/// Operator-facing impact: one stuck doc surfaces as a single audit
+/// row + histogram count; sibling pending docs continue dispatch.
+async fn emit_dispatch_error(
+    pool: &SqlitePool,
+    doc_id: DocumentId,
+    branch_tag: &str,
+    error: &anyhow::Error,
+    histogram: &mut DispatchHistogram,
+) -> anyhow::Result<()> {
+    let payload = serde_json::json!({
+        "document_id": hex_lower(doc_id.as_bytes()),
+        "branch": branch_tag,
+        "dispatch_error": format!("{error}"),
+        "rationale":
+            "per-doc helper failure absorbed by try-and-audit shim; doc stays in source state",
+    });
+    audit_log::append(
+        pool,
+        "fiscal_document",
+        &hex_lower(doc_id.as_bytes()),
+        "BOOT_DISPATCH_ERROR",
+        crate::db::models::enums::Severity::Warning,
+        None,
+        Some(&payload.to_string()),
+    )
+    .await?;
+    histogram.dispatch_errors += 1;
     Ok(())
 }

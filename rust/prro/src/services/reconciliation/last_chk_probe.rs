@@ -63,6 +63,14 @@ pub enum ProbeOutcome {
     /// `DpsError::Decode` — protocol drift, non-bounded-retry per
     /// §2.  Caller escalates to `RequiresManualReconciliation`.
     DecodeEscalate { reason: String },
+
+    /// W9.4 L4 fix: catch-all for unexpected `DpsError` variants that
+    /// `last_chk` shouldn't normally surface (e.g. `Authorization`,
+    /// `Server { code }` — these belong to submit paths, not query
+    /// probes).  Distinct from `DecodeEscalate` so an operator
+    /// dashboard alarming on certificate-auth failures can fire on
+    /// the right signal instead of conflating with protocol drift.
+    Unexpected { dps_error: String },
 }
 
 /// Issue a single `DpsChannel::last_chk` call and classify the
@@ -85,12 +93,13 @@ pub async fn probe(
         Err(DpsError::NotFound) => ProbeOutcome::NotFound,
         Err(DpsError::Transport(msg)) => ProbeOutcome::TransportRetry { reason: msg },
         Err(DpsError::Decode(msg)) => ProbeOutcome::DecodeEscalate { reason: msg },
-        // Any other DpsError variant is an unexpected shape for a
-        // recovery probe (e.g. Authorization, Server { .. } —
-        // last_chk is a query, not a submit, so these shouldn't
-        // surface).  Treat as escalation to be safe.
-        Err(other) => ProbeOutcome::DecodeEscalate {
-            reason: format!("unexpected DpsError shape for last_chk: {other}"),
+        // W9.4 L4 fix: surface unexpected variants distinctly so
+        // operator alerting can fire on the right signal.
+        // `last_chk` is a query path; Authorization / Server { code }
+        // / etc. belong to submit paths.  Don't conflate with
+        // DecodeEscalate (protocol drift).
+        Err(other) => ProbeOutcome::Unexpected {
+            dps_error: format!("{other}"),
         },
     }
 }
@@ -130,7 +139,8 @@ mod tests {
                 Err(DpsError::NotFound) => Err(DpsError::NotFound),
                 Err(DpsError::Transport(s)) => Err(DpsError::Transport(s.clone())),
                 Err(DpsError::Decode(s)) => Err(DpsError::Decode(s.clone())),
-                Err(_) => Err(DpsError::Decode("test-only unhandled variant".into())),
+                Err(DpsError::Internal(s)) => Err(DpsError::Internal(s.clone())),
+                Err(_) => Err(DpsError::Internal("test-only unhandled variant".into())),
             }
         }
         async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
@@ -219,6 +229,26 @@ mod tests {
                 assert!(reason.contains("bad proto bytes"));
             }
             other => panic!("expected DecodeEscalate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_unexpected_on_non_query_dps_error() {
+        // L4 fix: surface unexpected variants distinctly so operator
+        // alerting can fire on the right signal.  Internal here stands
+        // in for any variant that shouldn't surface from a query probe.
+        let stub = StubChannel {
+            last_chk_response: Err(DpsError::Internal("wrapper-side fault".into())),
+        };
+        let out = probe(&stub, &fn_sign(), "abc-123").await;
+        match out {
+            ProbeOutcome::Unexpected { dps_error } => {
+                assert!(
+                    dps_error.contains("wrapper-side fault"),
+                    "Unexpected.dps_error should carry the formatted error: {dps_error}"
+                );
+            }
+            other => panic!("expected Unexpected, got {other:?}"),
         }
     }
 }

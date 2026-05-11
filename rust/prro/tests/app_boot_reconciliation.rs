@@ -28,7 +28,7 @@
 //! handled by #5.
 
 use prro::db::models::ids::DocumentId;
-use prro::services::reconciliation::boot_phase::{self, BranchOutcome};
+use prro::services::reconciliation::boot_phase::{self, BranchOutcome, SubBranch};
 use sqlx::SqlitePool;
 
 async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
@@ -170,7 +170,17 @@ async fn branch_c_dispatches_sending_to_resume_helper() {
     let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890")
         .await
         .unwrap();
-    assert_eq!(outcome, BranchOutcome::Reconciled { pending_visited: 1 });
+    match outcome {
+        BranchOutcome::Reconciled {
+            ref histogram,
+            sub_branch,
+        } => {
+            assert_eq!(sub_branch, SubBranch::C);
+            assert_eq!(histogram.sending_resumed, 1);
+            assert_eq!(histogram.total_visited(), 1);
+        }
+        other => panic!("expected Reconciled(c) with sending_resumed=1, got {other:?}"),
+    }
     assert_eq!(doc_state(&pool, doc).await, "ERROR_RETRYABLE");
     assert_eq!(
         audit_count(&pool, "BOOT_RESUME_SENDING_TO_ERROR_RETRYABLE").await,
@@ -278,7 +288,18 @@ async fn fixture_5_ah8_verbatim_preserves_opened_shift_state() {
     let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890")
         .await
         .unwrap();
-    assert_eq!(outcome, BranchOutcome::Reconciled { pending_visited: 1 });
+    match outcome {
+        BranchOutcome::Reconciled {
+            ref histogram,
+            sub_branch,
+        } => {
+            // shift_state=Opened is NOT in {Opening,Closing} → branch (c).
+            assert_eq!(sub_branch, SubBranch::C);
+            assert_eq!(histogram.sent_deferred, 1);
+            assert_eq!(histogram.total_visited(), 1);
+        }
+        other => panic!("expected Reconciled(c) sent_deferred=1, got {other:?}"),
+    }
     // ah8 acceptance: shift_state STILL Opened (no upsert_initial mask).
     let row = read_node_state(&pool, "1234567890").await;
     assert_eq!(
@@ -317,7 +338,12 @@ async fn branch_e2_orphan_shift_resolves_to_error_and_resets_shift_state() {
     let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890")
         .await
         .unwrap();
-    assert_eq!(outcome, BranchOutcome::OrphanShiftResolved);
+    assert_eq!(
+        outcome,
+        BranchOutcome::OrphanShiftResolved {
+            orphans_resolved: 1
+        }
+    );
     // shifts.state → ERROR.
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
         .bind(&shift_bytes)
@@ -346,7 +372,16 @@ async fn fixture_5_strict_branch_e1_with_opening_shift_and_pending_doc() {
     let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890")
         .await
         .unwrap();
-    assert_eq!(outcome, BranchOutcome::Reconciled { pending_visited: 1 });
+    match outcome {
+        BranchOutcome::Reconciled {
+            ref histogram,
+            sub_branch,
+        } => {
+            assert_eq!(sub_branch, SubBranch::E1, "shift_state=Opening → branch e1");
+            assert_eq!(histogram.sending_resumed, 1);
+        }
+        other => panic!("expected Reconciled(e1), got {other:?}"),
+    }
     assert_eq!(
         doc_state(&pool, doc).await,
         "ERROR_RETRYABLE",
@@ -396,7 +431,12 @@ async fn branch_e2_handles_multiple_orphan_shifts() {
     let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890")
         .await
         .unwrap();
-    assert_eq!(outcome, BranchOutcome::OrphanShiftResolved);
+    assert_eq!(
+        outcome,
+        BranchOutcome::OrphanShiftResolved {
+            orphans_resolved: 3
+        }
+    );
     // All 3 shifts in ERROR.
     let err_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM shifts WHERE fiscal_number = '1234567890' AND state = 'ERROR'",
@@ -433,7 +473,12 @@ async fn branch_e2_idempotent_second_boot_dispatches_to_b() {
     let r1 = boot_phase::run_boot_reconciliation(&pool, "1234567890")
         .await
         .unwrap();
-    assert_eq!(r1, BranchOutcome::OrphanShiftResolved);
+    assert_eq!(
+        r1,
+        BranchOutcome::OrphanShiftResolved {
+            orphans_resolved: 1
+        }
+    );
     // Second boot: shifts.state is now ERROR, node_state.shift_state is
     // Closed, no pending docs → branch (b).
     let r2 = boot_phase::run_boot_reconciliation(&pool, "1234567890")
@@ -597,4 +642,134 @@ listen  = "127.0.0.1:8443"
     // 2222222222 NOT iterated → no audit emitted for it.
     let row2 = read_node_state(app.db(), "2222222222").await;
     assert!(row2.is_none(), "second FN never reached (fail-fast)");
+}
+
+// ─── W9.4 M1 — App::reconcile_pending returns ReconciliationSummary ───
+
+#[tokio::test]
+async fn app_reconcile_pending_returns_summary_with_per_branch_counts() {
+    // M1 fix: App::reconcile_pending aggregates per-FN BranchOutcome
+    // into ReconciliationSummary per freeze §2.1.  Test seeds 5 FNs
+    // exercising different branches, verifies summary fields.
+    use prro::config::AppConfig;
+    use prro::App;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("a.db");
+    let toml_text = format!(
+        r#"
+app_name = "prro"
+version  = "0.1.0"
+
+[database]
+db_path = "{}"
+
+[admin_ui]
+enabled = false
+listen  = "127.0.0.1:8443"
+"#,
+        db_path.display().to_string().replace('\\', "/")
+    );
+    let cfg = AppConfig::from_toml(&toml_text).unwrap();
+    let app = App::boot(cfg).await.unwrap();
+    // FN1 — absent node_state → branch (a) bootstrap.
+    seed_fn_config(app.db(), "1111111111").await;
+    // FN2 — Online + no pending → branch (b) idempotent.
+    seed_fn_config(app.db(), "2222222222").await;
+    seed_node_state(app.db(), "2222222222", "ONLINE", "CLOSED", 1).await;
+    // FN3 — Online + 1 pending Sending → branch (c) with sending_resumed=1.
+    seed_fn_config(app.db(), "3333333333").await;
+    seed_node_state(app.db(), "3333333333", "ONLINE", "CLOSED", 1).await;
+    seed_doc_in_state(app.db(), "3333333333", 0x71, "SENDING").await;
+    // FN4 — Blocked → branch (f1) preserved.
+    seed_fn_config(app.db(), "4444444444").await;
+    seed_node_state(app.db(), "4444444444", "BLOCKED", "CLOSED", 1).await;
+    // FN5 — Online + Opening + orphan shift → branch (e2).
+    seed_fn_config(app.db(), "5555555555").await;
+    seed_node_state(app.db(), "5555555555", "ONLINE", "OPENING", 1).await;
+    sqlx::query(
+        "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at) \
+         VALUES (?, '5555555555', 'OPENING', 'ONLINE', '2026-05-10T00:00:00Z')",
+    )
+    .bind(vec![0x55u8; 16])
+    .execute(app.db())
+    .await
+    .unwrap();
+
+    let summary = app.reconcile_pending().await.expect("reconcile must Ok");
+
+    assert_eq!(summary.branch_a, 1, "FN1 bootstrap");
+    assert_eq!(summary.branch_b, 1, "FN2 idempotent");
+    assert_eq!(summary.branch_c, 1, "FN3 reconciled");
+    assert_eq!(summary.branch_e2, 1, "FN5 orphan resolved");
+    assert_eq!(summary.branch_f_blocked, 1, "FN4 preserved blocked");
+    assert_eq!(summary.shift_orphans_to_error, 1);
+    assert_eq!(summary.docs_advanced.sending_resumed, 1);
+    assert_eq!(summary.docs_advanced.total_visited(), 1);
+}
+
+// ─── W9.4 L5 — partition exhaustive matrix (freeze §3.7) ──────────────
+
+#[tokio::test]
+async fn branch_partition_exhaustive_matrix() {
+    // L5 fix: enumerate representative `(mode, shift_state, has_pending_doc)`
+    // triples and assert exactly one branch fires per triple — i.e. §3.7
+    // partition is structurally mutually exclusive.  We don't enumerate
+    // ALL of the 7×6×2 = 84 cells (would need full schema seed for each);
+    // representative coverage of the partition boundaries suffices.
+    let cases: &[(&str, &str, bool, &str)] = &[
+        // (mode, shift_state, has_pending_doc, expected_branch_tag)
+        // Branch (d) — Offline-class modes regardless of shift_state/pending.
+        ("OFFLINE", "CLOSED", false, "d"),
+        ("GOING_OFFLINE", "CLOSED", false, "d"),
+        ("GOING_ONLINE", "CLOSED", false, "d"),
+        // Branch (f) — preserved modes.
+        ("BLOCKED", "CLOSED", false, "f1"),
+        ("STOP_MODE", "CLOSED", false, "f2"),
+        ("CRYPTO_DEGRADED", "CLOSED", false, "f3"),
+        // Online + no pending + shift_state ∉ {Opening, Closing} → (b).
+        ("ONLINE", "CLOSED", false, "b"),
+        ("ONLINE", "OPENED", false, "b"),
+        // Online + no pending + shift_state ∈ {Opening, Closing} → (e2).
+        // (Requires an orphan shifts row; seeded inline.)
+        ("ONLINE", "OPENING", false, "e2"),
+        // Online + pending + shift_state ∉ {Opening, Closing} → (c).
+        ("ONLINE", "CLOSED", true, "c"),
+        ("ONLINE", "OPENED", true, "c"),
+        // Online + pending + shift_state ∈ {Opening, Closing} → (e1).
+        ("ONLINE", "OPENING", true, "e1"),
+        ("ONLINE", "CLOSING", true, "e1"),
+    ];
+
+    for (i, (mode, shift_state, has_pending, expected)) in cases.iter().enumerate() {
+        let (_dir, pool) = fresh_pool().await;
+        let fn_id = format!("99999999{:02}", i);
+        seed_fn_config(&pool, &fn_id).await;
+        seed_node_state(&pool, &fn_id, mode, shift_state, 1).await;
+        // For (e2) we need an orphan shift row; for (e1) and (c) we
+        // need a pending doc.
+        if *expected == "e2" {
+            sqlx::query(
+                "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at) \
+                 VALUES (?, ?, 'OPENING', 'ONLINE', '2026-05-10T00:00:00Z')",
+            )
+            .bind(vec![i as u8; 16])
+            .bind(&fn_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        if *has_pending {
+            seed_doc_in_state(&pool, &fn_id, (0x80 + i) as u8, "KVT1").await;
+        }
+        let outcome = boot_phase::run_boot_reconciliation(&pool, &fn_id)
+            .await
+            .unwrap_or_else(|e| panic!("case {i} ({mode},{shift_state},{has_pending}): {e}"));
+        assert_eq!(
+            outcome.branch_tag(),
+            *expected,
+            "case {i}: ({mode}, {shift_state}, pending={has_pending}) — \
+             expected {expected}, got {outcome:?}"
+        );
+    }
 }
