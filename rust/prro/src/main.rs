@@ -31,13 +31,32 @@ enum Cmd {
     },
 }
 
-/// Drive `App::boot` to completion; on `BootError` exit with the
-/// variant's BSD sysexits code (per W9 freeze §5.5).  Returns the
-/// `App` on success.  The error message is emitted to stderr via the
-/// `Display` impl of `BootError` before exit.
-async fn boot_or_exit(cfg: AppConfig) -> anyhow::Result<App> {
+/// Read config file → parse → boot.  On any `BootError`, prints the
+/// `Display`-formatted error to stderr and `std::process::exit`s with
+/// the variant's BSD sysexits code (per W9 freeze §5.5; W9.1 review
+/// LOW 2: return signature is plain `App` because the Err arm never
+/// returns — caller can use the return value directly without `?`).
+///
+/// **Hard-exit note (W9.1 review NIT 1):** `std::process::exit` is
+/// called from inside the tokio runtime.  This is intentional for
+/// fail-closed boot — no traffic has been accepted yet, no async
+/// drains are needed; an immediate exit is correct.  Future
+/// graceful-shutdown paths (post-serve) live elsewhere and use
+/// signal-driven drains, NOT this helper.
+async fn boot_from_path_or_exit(config: &std::path::Path) -> App {
+    let result = (|| -> Result<AppConfig, prro::BootError> {
+        let text = std::fs::read_to_string(config)?;
+        AppConfig::from_toml(&text).map_err(|e| prro::BootError::ConfigParse(e.to_string()))
+    })();
+    let cfg = match result {
+        Ok(cfg) => cfg,
+        Err(boot_err) => {
+            eprintln!("prro: {boot_err}");
+            std::process::exit(boot_err.exit_code());
+        }
+    };
     match App::boot(cfg).await {
-        Ok(app) => Ok(app),
+        Ok(app) => app,
         Err(boot_err) => {
             eprintln!("prro: boot failed: {boot_err}");
             std::process::exit(boot_err.exit_code());
@@ -82,19 +101,17 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Migrate { config } => {
-            let text = std::fs::read_to_string(&config)?;
-            let cfg = AppConfig::from_toml(&text)?;
-            // W9: App::boot now acquires the singleton lock internally
-            // (consolidated pre-flight pipeline); no separate acquire here.
-            let _app = boot_or_exit(cfg).await?;
+            // W9.1 review LOW 2 + LOW 3 fix: single consolidated helper
+            // reads config + parses + boots, with BootError → sysexits
+            // mapping covering config-read / parse / DB-integrity paths
+            // symmetrically.
+            let _app = boot_from_path_or_exit(&config).await;
             tracing::info!("migrations applied");
             Ok(())
         }
         Cmd::Doctor { config } => prro::doctor::run(&config).await,
         Cmd::Serve { config } => {
-            let text = std::fs::read_to_string(&config)?;
-            let cfg = AppConfig::from_toml(&text)?;
-            let app = boot_or_exit(cfg).await?;
+            let app = boot_from_path_or_exit(&config).await;
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
                 "prro listening (M1 — idle)"

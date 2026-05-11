@@ -88,6 +88,12 @@ async fn fresh_app(db_path: &Path) -> App {
 /// rows — flaking the no-writes assertions.  File truncation is a
 /// mechanical, deterministic corruption that doesn't depend on
 /// which indexes happen to have data.
+// W9.1 review LOW 4 fix: helper is reachable only from #[ignore]d
+// fixtures; rustc considers it "used" (callers compile) but it's
+// runtime-dead until the deferred corruption-infra task re-enables
+// those fixtures.  `#[allow(dead_code)]` documents the intent and
+// shields against future rustc lints if the callers change shape.
+#[allow(dead_code)]
 async fn corrupt_via_schema_mutation(db_path: &Path) {
     // (1) Open raw pool, checkpoint WAL into main file, close pool.
     let url = format!("sqlite://{}", db_path.display());

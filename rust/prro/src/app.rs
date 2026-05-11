@@ -47,22 +47,49 @@ pub enum BootError {
     #[error("database error during boot: {0}")]
     Database(#[from] sqlx::Error),
 
+    /// Config file IO failure (W9.1 review LOW 3 fix — symmetric
+    /// sysexits mapping so missing config and corrupt DB give
+    /// distinct operator-actionable exit codes).
+    #[error("config file read failed: {0}")]
+    ConfigRead(#[from] std::io::Error),
+
+    /// Config file parse failure (W9.1 review LOW 3 fix).  Stored
+    /// as String because `AppConfig::from_toml` returns
+    /// `anyhow::Result` and `anyhow::Error` is not `Error + Send +
+    /// Sync` in the thiserror derive context without explicit
+    /// shimming.
+    #[error("config file parse failed: {0}")]
+    ConfigParse(String),
+
     #[error("internal boot error: {0}")]
     Internal(String),
 }
 
 impl BootError {
-    /// BSD sysexits-compatible exit code (per freeze §5.5).
+    /// BSD sysexits-compatible exit code (per freeze §5.5 + W9.1
+    /// review LOW 3 fix adding config-error variants).
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::IntegrityCheckFailed { .. } => 65, // EX_DATAERR
             Self::OfflineModeRefusal { .. } => 78,   // EX_CONFIG
             Self::Database(_) => 71,                 // EX_OSERR
+            Self::ConfigRead(_) => 66,               // EX_NOINPUT
+            Self::ConfigParse(_) => 65,              // EX_DATAERR (config IS data)
             Self::Internal(_) => 70,                 // EX_SOFTWARE
         }
     }
 }
 
+/// Application root.
+///
+/// **Singleton-lock lifetime semantics (W9.1 review NIT 2):**
+/// `App` is `Clone`; all clones share the same `Arc<Inner>`, which
+/// owns the `PidLock`.  The OS advisory lock is released only when
+/// the LAST `App` clone drops (`Arc` refcount → 0).  Long-lived
+/// clones held in disconnected threads will keep the lock past the
+/// intended scope.  Conventionally, `App` is constructed once in
+/// `main.rs::boot_or_exit` and passed by reference / cloned only
+/// into short-lived task scopes that drop at shutdown.
 #[derive(Clone)]
 pub struct App {
     inner: Arc<Inner>,
@@ -98,9 +125,16 @@ impl App {
             .map_err(|e| BootError::Internal(format!("singleton lock: {e}")))?;
 
         // (3) Pool open + migrations (sqlx::migrate! inside `open_pool`).
+        //     `open_pool` returns `anyhow::Error`; if the underlying cause
+        //     is `sqlx::Error` preserve that as `BootError::Database`
+        //     (W9.1 review LOW 1 fix — type-information preservation).
+        //     Otherwise fall back to `BootError::Internal`.
         let db = crate::db::open_pool(&config.database.db_path)
             .await
-            .map_err(|e| BootError::Internal(format!("open_pool: {e}")))?;
+            .map_err(|e| match e.downcast::<sqlx::Error>() {
+                Ok(sqlx_err) => BootError::Database(sqlx_err),
+                Err(other) => BootError::Internal(format!("open_pool: {other}")),
+            })?;
 
         // (4) Integrity probe — `PRAGMA quick_check(1)` (cap at first
         // error; we only need fail-closed signal).  Use `query_scalar`
