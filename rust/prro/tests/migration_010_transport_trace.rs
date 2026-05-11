@@ -445,3 +445,175 @@ async fn ok_outcome_without_server_fiscal_no_is_rejected() {
         "row must remain unfinished after rejected completes"
     );
 }
+
+// ─── W9.2 helpers (freeze §4.0 + §4.5; HIGH 2 + HIGH 8 + HIGH 9 fixes) ─────
+
+#[tokio::test]
+async fn attempts_used_zero_rows_returns_zero() {
+    let (_dir, pool) = fresh_pool().await;
+    let doc = seed_doc(&pool, 0x10).await;
+    let n = transport_trace::attempts_used(&pool, doc)
+        .await
+        .expect("attempts_used must return Ok on zero rows");
+    assert_eq!(n, 0, "no attempts seeded → COALESCE returns 0");
+}
+
+#[tokio::test]
+async fn attempts_used_three_rows_returns_three() {
+    let (_dir, pool) = fresh_pool().await;
+    let doc = seed_doc(&pool, 0x11).await;
+    let _ = alloc(&pool, doc, [0u8; 32]).await; // attempt_no=1
+    let _ = alloc(&pool, doc, [1u8; 32]).await; // attempt_no=2
+    let _ = alloc(&pool, doc, [2u8; 32]).await; // attempt_no=3
+    let n = transport_trace::attempts_used(&pool, doc)
+        .await
+        .expect("attempts_used must succeed");
+    assert_eq!(n, 3, "MAX(attempt_no) across 3 rows == 3");
+}
+
+#[tokio::test]
+async fn attempts_used_multi_doc_returns_target_max_only() {
+    let (_dir, pool) = fresh_pool().await;
+    let doc_a = seed_doc(&pool, 0x20).await;
+    let doc_b = seed_doc(&pool, 0x21).await;
+    // doc_a has 2 attempts.
+    let _ = alloc(&pool, doc_a, [0u8; 32]).await;
+    let _ = alloc(&pool, doc_a, [1u8; 32]).await;
+    // doc_b has 4 attempts.
+    let _ = alloc(&pool, doc_b, [10u8; 32]).await;
+    let _ = alloc(&pool, doc_b, [11u8; 32]).await;
+    let _ = alloc(&pool, doc_b, [12u8; 32]).await;
+    let _ = alloc(&pool, doc_b, [13u8; 32]).await;
+    assert_eq!(
+        transport_trace::attempts_used(&pool, doc_a).await.unwrap(),
+        2
+    );
+    assert_eq!(
+        transport_trace::attempts_used(&pool, doc_b).await.unwrap(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn recovery_completes_inflight_row_with_probe_wire_times() {
+    // Schema reality (migration 010 all-or-none CHECK):
+    // in-flight rows have completed_at + wire_call_* + outcome_kind
+    // all NULL.  Recovery must supply its own wire times (from the
+    // `last_chk_probe` call) — there are no "original send_chk"
+    // times to preserve because the original `send_chk` either never
+    // returned or crashed before recording them.
+    let (_dir, pool) = fresh_pool().await;
+    let doc = seed_doc(&pool, 0x30).await;
+    let attempt_no = alloc(&pool, doc, [0u8; 32]).await;
+
+    let recovered = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            let n = transport_trace::complete_via_recovery_tx(
+                tx,
+                doc,
+                attempt_no,
+                "SRV-FISCAL-12345",
+                "2026-05-11T09:00:00Z",
+                "2026-05-11T09:00:01Z",
+            )
+            .await?;
+            Ok::<u64, anyhow::Error>(n)
+        })
+    })
+    .await
+    .expect("complete_via_recovery_tx");
+    assert_eq!(recovered, 1, "exactly one row completed");
+
+    // Verify post-state: completed_at non-NULL, outcome_kind = 'OK',
+    // server_fiscal_no set, wire times set from probe, retry_class
+    // cleared (always NULL on recovery OK path), error fields stay
+    // at their default NULL (recovery doesn't fabricate errors).
+    #[allow(clippy::type_complexity)]
+    let row: (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT completed_at, outcome_kind, server_fiscal_no, retry_class, \
+                wire_call_started_at, wire_call_finished_at, error_message \
+         FROM transport_trace WHERE document_id = ? AND attempt_no = ?",
+    )
+    .bind(doc)
+    .bind(attempt_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(row.0.is_some(), "completed_at set to CURRENT_TIMESTAMP");
+    assert_eq!(row.1.as_deref(), Some("OK"));
+    assert_eq!(row.2.as_deref(), Some("SRV-FISCAL-12345"));
+    assert!(row.3.is_none(), "retry_class NULL on recovery OK");
+    assert_eq!(row.4.as_deref(), Some("2026-05-11T09:00:00Z"));
+    assert_eq!(row.5.as_deref(), Some("2026-05-11T09:00:01Z"));
+    assert!(row.6.is_none(), "error_message untouched (NULL default)");
+}
+
+#[tokio::test]
+async fn recovery_on_already_completed_returns_zero_rows_affected() {
+    let (_dir, pool) = fresh_pool().await;
+    let doc = seed_doc(&pool, 0x40).await;
+    let attempt_no = alloc(&pool, doc, [0u8; 32]).await;
+    // Complete the row normally via complete_tx (sets completed_at).
+    complete_ok(&pool, doc, attempt_no, "SRV-ORIG").await;
+    // Second pass via recovery must no-op (idempotency guard).
+    let n = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            let n = transport_trace::complete_via_recovery_tx(
+                tx,
+                doc,
+                attempt_no,
+                "SRV-RECOVERED",
+                "2026-05-11T09:00:00Z",
+                "2026-05-11T09:00:01Z",
+            )
+            .await?;
+            Ok::<u64, anyhow::Error>(n)
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(n, 0, "already-completed row → rows_affected = 0");
+    // server_fiscal_no MUST remain the original.
+    let server_id: Option<String> = sqlx::query_scalar(
+        "SELECT server_fiscal_no FROM transport_trace WHERE document_id = ? AND attempt_no = ?",
+    )
+    .bind(doc)
+    .bind(attempt_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(server_id.as_deref(), Some("SRV-ORIG"));
+}
+
+#[tokio::test]
+async fn recovery_on_missing_row_returns_zero_rows_affected() {
+    let (_dir, pool) = fresh_pool().await;
+    let doc = seed_doc(&pool, 0x50).await;
+    // No transport_trace row allocated.  Recovery on a non-existent
+    // (doc, attempt_no) pair must return rows_affected = 0 (NOT err).
+    let n = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            let n = transport_trace::complete_via_recovery_tx(
+                tx,
+                doc,
+                1,
+                "SRV-X",
+                "2026-05-11T09:00:00Z",
+                "2026-05-11T09:00:01Z",
+            )
+            .await?;
+            Ok::<u64, anyhow::Error>(n)
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(n, 0, "missing row → rows_affected = 0");
+}

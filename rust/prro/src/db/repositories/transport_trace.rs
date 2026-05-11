@@ -332,3 +332,108 @@ pub async fn last_attempt_retry_class_for(
         .as_deref()
         .and_then(crate::services::write_path::error_routing::RetryClass::from_wire_str))
 }
+
+/// W9.2 (per freeze §4.0, HIGH 2 fix) — durable per-doc wire-attempt
+/// counter for boot-recovery budget decisions.
+///
+/// Returns `COALESCE(MAX(attempt_no), 0)` across all `transport_trace`
+/// rows for `doc_id` (no `completed_at` filter — both in-flight and
+/// completed attempts count toward the budget; a crash mid-send still
+/// "burned" a slot per Pattern B safety contract).  Always non-NULL
+/// `i64` because `COALESCE` guarantees a fallback `0`.
+///
+/// Used by `services::reconciliation::boot_phase::run_boot_reconciliation`
+/// (W9.3) for the §4.8 ERROR_RETRYABLE pre-check:
+///   `attempts_used(doc_id) >= MAX_BOOT_ATTEMPTS  →  escalate to
+///    RequiresManualReconciliation`.
+///
+/// Pool-bound (read-only); safe to call from boot or operational loops
+/// without entering a write lock.
+pub async fn attempts_used(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> sqlx::Result<i64> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(attempt_no), 0) FROM transport_trace WHERE document_id = ?",
+    )
+    .bind(doc_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+/// W9.2 (per freeze §4.5, HIGH 8 + HIGH 9 fix — amended for schema
+/// reality) — complete an in-flight `transport_trace` row via boot
+/// recovery.
+///
+/// **Schema constraint awareness.**  Migration 010 enforces all-or-
+/// none on `(completed_at, wire_call_started_at, wire_call_finished_at,
+/// outcome_kind)`: in-flight rows have all four NULL, completed rows
+/// have all four NOT NULL.  No legitimate intermediate "in-flight
+/// with wire times set" state exists.
+///
+/// Earlier freeze v7 claim "preserves original wire times" was based
+/// on a misread: the row that's in-flight at boot has NEVER recorded
+/// wire times (the original `send_chk` either never returned or
+/// crashed before reaching `complete_tx`).  Therefore recovery MUST
+/// supply its own wire times — the `last_chk_probe` call's times are
+/// the truthful record of when this code path interacted with DPS.
+///
+/// **What this helper writes** (recovery completion):
+///   - `completed_at = CURRENT_TIMESTAMP`
+///   - `outcome_kind = 'OK'` (doc IS protocol-acknowledged per match)
+///   - `server_fiscal_no` (from `CheckAck.id`)
+///   - `wire_call_started_at` (caller-supplied, from probe)
+///   - `wire_call_finished_at` (caller-supplied, from probe)
+///   - `retry_class = NULL` (recovery flipped a retryable in-flight
+///     to OK; classification N/A)
+///
+/// **What this helper does NOT write** — `server_status_code` /
+/// `error_kind` / `error_message` stay at their DB default (NULL on
+/// fresh row).  The audit row (`BOOT_LAST_CHK_MATCH_KVT1`) records
+/// the recovery context separately.
+///
+/// **Why a recovery-specific helper vs reusing `complete_tx`.**
+/// `complete_tx` requires the full `AttemptCompletion` struct
+/// including outcome-classification fields (`error_kind`,
+/// `error_message`, `server_status_code`).  Recovery callers don't
+/// have those — they have only the probe's identity match.  Forcing
+/// callers to fabricate `AttemptCompletion::default()` would invite
+/// drift.  Distinct helper keeps the recovery-completion contract
+/// narrow and obvious.
+///
+/// **Idempotency.**  `WHERE completed_at IS NULL` makes a second call
+/// against an already-completed row a no-op (`rows_affected = 0`).
+/// Caller treats `0` as either:
+///   - the `(doc_id, attempt_no)` pair is missing (caller bug — the
+///     orchestrator should have verified the in-flight row exists),
+///     or
+///   - the row was already completed by a parallel boot tick (race
+///     under non-single-writer scenarios — should not occur under
+///     M3a's single-writer-per-FN invariant).
+///
+/// `rows_affected = 1` is the only success shape.
+pub async fn complete_via_recovery_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+    attempt_no: i32,
+    server_fiscal_no: &str,
+    wire_call_started_at: &str,
+    wire_call_finished_at: &str,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE transport_trace SET \
+            completed_at = CURRENT_TIMESTAMP, \
+            outcome_kind = 'OK', \
+            server_fiscal_no = ?, \
+            wire_call_started_at = ?, \
+            wire_call_finished_at = ?, \
+            retry_class = NULL \
+         WHERE document_id = ? AND attempt_no = ? AND completed_at IS NULL",
+    )
+    .bind(server_fiscal_no)
+    .bind(wire_call_started_at)
+    .bind(wire_call_finished_at)
+    .bind(doc_id)
+    .bind(attempt_no)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected())
+}
