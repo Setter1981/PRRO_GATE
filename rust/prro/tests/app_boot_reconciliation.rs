@@ -332,6 +332,89 @@ async fn branch_e2_orphan_shift_resolves_to_error_and_resets_shift_state() {
 }
 
 #[tokio::test]
+async fn fixture_5_strict_branch_e1_with_opening_shift_and_pending_doc() {
+    // LOW 1 fix: freeze §10.1 #5-strict — branch (e1) strict pre-
+    // condition (shift_state ∈ {Opening, Closing}) + a matching
+    // pending doc.  This dispatches to (c) per-doc loop via the
+    // (e1) → (c) cascade; the FN-level audit MUST tag "branch": "e1"
+    // (NOT "c") so operators distinguish strict mid-transition
+    // recovery from ordinary branch (c).
+    let (_dir, pool) = fresh_pool().await;
+    seed_fn_config(&pool, "1234567890").await;
+    seed_node_state(&pool, "1234567890", "ONLINE", "OPENING", 1).await;
+    let doc = seed_doc_in_state(&pool, "1234567890", 0x31, "SENDING").await;
+    let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890")
+        .await
+        .unwrap();
+    assert_eq!(outcome, BranchOutcome::Reconciled { pending_visited: 1 });
+    assert_eq!(
+        doc_state(&pool, doc).await,
+        "ERROR_RETRYABLE",
+        "Sending dispatched"
+    );
+    // Verify the FN-level audit payload tagged the (e1) branch — not (c).
+    let payload: String = sqlx::query_scalar(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE event_type = 'NODE_STATE_BOOT_RECONCILED' AND entity_id = ?",
+    )
+    .bind("1234567890")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        payload.contains("\"branch\":\"e1\""),
+        "audit payload must tag branch as e1, got: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn branch_e2_handles_multiple_orphan_shifts() {
+    // LOW 2 fix: rare but possible — multiple shifts in OPENING/
+    // CLOSING for one FN (prior boots failed at different times).
+    // All MUST transition to ERROR in one envelope + node_state.shift_state
+    // resets to CLOSED + per-shift CRITICAL audit.
+    let (_dir, pool) = fresh_pool().await;
+    seed_fn_config(&pool, "1234567890").await;
+    seed_node_state(&pool, "1234567890", "ONLINE", "OPENING", 1).await;
+    // Seed 3 orphan shifts: 2 OPENING + 1 CLOSING.
+    for (i, state) in &[
+        (0xA1u8, "OPENING"),
+        (0xA2u8, "OPENING"),
+        (0xA3u8, "CLOSING"),
+    ] {
+        let shift_bytes = vec![*i; 16];
+        sqlx::query(
+            "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at) \
+             VALUES (?, '1234567890', ?, 'ONLINE', '2026-05-10T00:00:00Z')",
+        )
+        .bind(&shift_bytes)
+        .bind(*state)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890")
+        .await
+        .unwrap();
+    assert_eq!(outcome, BranchOutcome::OrphanShiftResolved);
+    // All 3 shifts in ERROR.
+    let err_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM shifts WHERE fiscal_number = '1234567890' AND state = 'ERROR'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(err_count, 3, "all 3 orphan shifts transitioned to ERROR");
+    // 3 CRITICAL audit rows.
+    assert_eq!(audit_count(&pool, "SHIFT_BOOT_ORPHAN_ERROR").await, 3);
+    // node_state.shift_state reset to CLOSED.
+    assert_eq!(
+        read_node_state(&pool, "1234567890").await.unwrap().1,
+        "CLOSED"
+    );
+}
+
+#[tokio::test]
 async fn branch_e2_idempotent_second_boot_dispatches_to_b() {
     // Freeze §9.1 #6-bis (HIGH 10 idempotency).
     let (_dir, pool) = fresh_pool().await;

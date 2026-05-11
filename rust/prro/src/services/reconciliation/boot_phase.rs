@@ -437,22 +437,33 @@ pub async fn run_boot_reconciliation(
 
     // ── Branch (e2) — mid-transition shift orphan (no pending) ───
     if matches!(row.shift_state, ShiftState::Opening | ShiftState::Closing) && pending.is_empty() {
-        // Find the orphan shift in transition; transition to ERROR.
-        let orphans: Vec<(ShiftId, ShiftState)> = sqlx::query_as(
-            "SELECT shift_id, state FROM shifts \
-             WHERE fiscal_number = ? AND state IN ('OPENING', 'CLOSING')",
-        )
-        .bind(fiscal_number)
-        .fetch_all(pool)
-        .await?;
-        // Single envelope: shift→Error + node_state.shift_state→Closed.
+        // LOW 5 fix: SELECT shifts + per-shift UPDATE + node_state
+        // reset ALL inside a single `with_immediate` envelope.  The
+        // BEGIN IMMEDIATE serialisation removes the read-then-update
+        // gap that the earlier pool-bound SELECT had — no need to
+        // rely on the SWFN invariant as the sole guard.
         let fn_owned = fiscal_number.to_string();
-        let orphans_owned = orphans.clone();
         with_immediate(pool, move |tx| {
             let fn_owned = fn_owned.clone();
-            let orphans_owned = orphans_owned.clone();
             Box::pin(async move {
-                for (shift_id, current) in orphans_owned {
+                // Read orphan shifts inside the envelope so any
+                // parallel writer (theoretical under non-SWFN) cannot
+                // race between SELECT and UPDATE.
+                let orphans: Vec<(ShiftId, ShiftState)> = sqlx::query_as(
+                    "SELECT shift_id, state FROM shifts \
+                     WHERE fiscal_number = ? AND state IN ('OPENING', 'CLOSING')",
+                )
+                .bind(&fn_owned)
+                .fetch_all(&mut **tx)
+                .await?;
+                for (shift_id, current) in orphans {
+                    // LOW 4 fix: whitelist alignment — `any → ERROR`
+                    // is allowed per W0-1 §2.2 (operator-forced
+                    // terminal state).  Raw UPDATE bypasses
+                    // `shifts::transition_state` but preserves I8.
+                    // Future maintainers MUST keep aligned; switch to
+                    // `shifts::transition_state_tx` when a tx-bound
+                    // variant is introduced.
                     sqlx::query("UPDATE shifts SET state = 'ERROR' WHERE shift_id = ?")
                         .bind(shift_id)
                         .execute(&mut **tx)
@@ -599,12 +610,35 @@ async fn dispatch_pending_doc(
         DocState::Kvt2 => {
             // W8 stage_finalize::run — pool + doc_id only, no ctx.
             // The helper internally CASs Kvt2→Ack + advances chain
-            // seed + outbox INSERT + audit.
-            let _ = crate::services::write_path::stage_finalize::run(pool, doc.document_id).await;
-            // Outcome is the W8 enum; we don't surface it here — the
-            // worker emits its own audit (STAGE_FINALIZE_ACK).  W9
-            // boot-level audit is the branch-level NODE_STATE_BOOT_RECONCILED
-            // row already emitted at end of branch (c).
+            // seed + outbox INSERT + STAGE_FINALIZE_ACK audit on
+            // success.  On FAILURE the helper does NOT emit an audit,
+            // so we surface the failure via BOOT_KVT2_DISPATCH_FAILED
+            // WARN (HIGH 1 fix).  Continue iteration so one stuck
+            // Kvt2 doc doesn't abort the whole branch (c).
+            match crate::services::write_path::stage_finalize::run(pool, doc.document_id).await {
+                Ok(_) => {} // W8 emits STAGE_FINALIZE_ACK on success.
+                Err(e) => {
+                    let doc_id = doc.document_id;
+                    let payload = serde_json::json!({
+                        "document_id": hex_lower(doc_id.as_bytes()),
+                        "branch": "c-kvt2",
+                        "stage_finalize_error": format!("{e}"),
+                        "rationale":
+                            "Kvt2 → Ack advance failed; doc remains in Kvt2 \
+                             pending operator inspection / next-boot retry",
+                    });
+                    audit_log::append(
+                        pool,
+                        "fiscal_document",
+                        &hex_lower(doc_id.as_bytes()),
+                        "BOOT_KVT2_DISPATCH_FAILED",
+                        crate::db::models::enums::Severity::Warning,
+                        None,
+                        Some(&payload.to_string()),
+                    )
+                    .await?;
+                }
+            }
         }
         // Ctx-needy states — emit DEFERRED audit, do not transition.
         DocState::Prepared | DocState::Signed | DocState::Sent | DocState::ErrorRetryable => {
