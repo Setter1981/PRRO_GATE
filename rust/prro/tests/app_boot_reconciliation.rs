@@ -712,49 +712,65 @@ listen  = "127.0.0.1:8443"
 
 #[tokio::test]
 async fn branch_partition_exhaustive_matrix() {
-    // L5 fix: enumerate representative `(mode, shift_state, has_pending_doc)`
-    // triples and assert exactly one branch fires per triple — i.e. §3.7
-    // partition is structurally mutually exclusive.  We don't enumerate
-    // ALL of the 7×6×2 = 84 cells (would need full schema seed for each);
-    // representative coverage of the partition boundaries suffices.
-    let cases: &[(&str, &str, bool, &str)] = &[
-        // (mode, shift_state, has_pending_doc, expected_branch_tag)
+    // L5 fix: enumerate representative `(mode, shift_state, has_pending_doc,
+    // seeded_node_state)` quadruples and assert exactly one branch fires per
+    // quadruple — i.e. §3.7 partition is structurally mutually exclusive.
+    //
+    // W9.4 cycle-2 LOW-2 + LOW-3 fix:
+    //   - LOW-3: add branch (a) case (no node_state row).
+    //   - LOW-2: seed `shifts` row in OPENING/CLOSING for (e1) cases so
+    //     the partition test exercises the full schema state, not just
+    //     node_state.shift_state.
+    //
+    // Quadruple layout:
+    //   (mode | "<absent>", shift_state | "<n/a>", has_pending_doc,
+    //    expected_branch_tag, seed_shifts_row_in_state | None)
+    let cases: &[(&str, &str, bool, &str, Option<&str>)] = &[
+        // Branch (a) — node_state row absent (mode="<absent>" sentinel).
+        ("<absent>", "<n/a>", false, "a", None),
         // Branch (d) — Offline-class modes regardless of shift_state/pending.
-        ("OFFLINE", "CLOSED", false, "d"),
-        ("GOING_OFFLINE", "CLOSED", false, "d"),
-        ("GOING_ONLINE", "CLOSED", false, "d"),
+        ("OFFLINE", "CLOSED", false, "d", None),
+        ("GOING_OFFLINE", "CLOSED", false, "d", None),
+        ("GOING_ONLINE", "CLOSED", false, "d", None),
         // Branch (f) — preserved modes.
-        ("BLOCKED", "CLOSED", false, "f1"),
-        ("STOP_MODE", "CLOSED", false, "f2"),
-        ("CRYPTO_DEGRADED", "CLOSED", false, "f3"),
+        ("BLOCKED", "CLOSED", false, "f1", None),
+        ("STOP_MODE", "CLOSED", false, "f2", None),
+        ("CRYPTO_DEGRADED", "CLOSED", false, "f3", None),
         // Online + no pending + shift_state ∉ {Opening, Closing} → (b).
-        ("ONLINE", "CLOSED", false, "b"),
-        ("ONLINE", "OPENED", false, "b"),
+        ("ONLINE", "CLOSED", false, "b", None),
+        ("ONLINE", "OPENED", false, "b", None),
         // Online + no pending + shift_state ∈ {Opening, Closing} → (e2).
-        // (Requires an orphan shifts row; seeded inline.)
-        ("ONLINE", "OPENING", false, "e2"),
+        ("ONLINE", "OPENING", false, "e2", Some("OPENING")),
         // Online + pending + shift_state ∉ {Opening, Closing} → (c).
-        ("ONLINE", "CLOSED", true, "c"),
-        ("ONLINE", "OPENED", true, "c"),
+        ("ONLINE", "CLOSED", true, "c", None),
+        ("ONLINE", "OPENED", true, "c", None),
         // Online + pending + shift_state ∈ {Opening, Closing} → (e1).
-        ("ONLINE", "OPENING", true, "e1"),
-        ("ONLINE", "CLOSING", true, "e1"),
+        // LOW-2: also seed a `shifts` row in the matching state so the
+        // schema state is internally consistent (not just node_state).
+        ("ONLINE", "OPENING", true, "e1", Some("OPENING")),
+        ("ONLINE", "CLOSING", true, "e1", Some("CLOSING")),
     ];
 
-    for (i, (mode, shift_state, has_pending, expected)) in cases.iter().enumerate() {
+    for (i, (mode, shift_state, has_pending, expected, seed_shifts_row)) in cases.iter().enumerate()
+    {
         let (_dir, pool) = fresh_pool().await;
         let fn_id = format!("99999999{:02}", i);
         seed_fn_config(&pool, &fn_id).await;
-        seed_node_state(&pool, &fn_id, mode, shift_state, 1).await;
-        // For (e2) we need an orphan shift row; for (e1) and (c) we
-        // need a pending doc.
-        if *expected == "e2" {
+        // LOW-3 fix: branch (a) — skip node_state seed entirely so
+        // run_boot_reconciliation observes Ok(None) from node_state::get.
+        if *mode != "<absent>" {
+            seed_node_state(&pool, &fn_id, mode, shift_state, 1).await;
+        }
+        // LOW-2 fix: seed shifts row whenever the case explicitly
+        // requires one (e1 strict + e2).
+        if let Some(shift_state) = seed_shifts_row {
             sqlx::query(
                 "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at) \
-                 VALUES (?, ?, 'OPENING', 'ONLINE', '2026-05-10T00:00:00Z')",
+                 VALUES (?, ?, ?, 'ONLINE', '2026-05-10T00:00:00Z')",
             )
             .bind(vec![i as u8; 16])
             .bind(&fn_id)
+            .bind(shift_state)
             .execute(&pool)
             .await
             .unwrap();

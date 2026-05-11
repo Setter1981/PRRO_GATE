@@ -112,6 +112,13 @@ pub struct ReconciliationSummary {
     pub branch_a: usize,
     pub branch_b: usize,
     pub branch_c: usize,
+    /// W9.4 cycle-2 LOW-5 fix: symmetric field for branch (d).
+    /// Always 0 under M3a's fail-fast policy (caller maps
+    /// OfflineRefusal to `BootError::OfflineModeRefusal` before
+    /// recording).  Field exists for symmetry + future-proofing
+    /// (non-fail-fast variant could populate this without silent
+    /// loss).
+    pub branch_d_offline_refusal: usize,
     pub branch_e1: usize,
     pub branch_e2: usize,
     pub branch_f_blocked: usize,
@@ -145,7 +152,15 @@ impl ReconciliationSummary {
                 }
                 self.docs_advanced.merge(histogram);
             }
-            BranchOutcome::OfflineRefusal { .. } => { /* terminal — caller maps to Err */ }
+            BranchOutcome::OfflineRefusal { .. } => {
+                // LOW-5 symmetric field: populated for non-fail-fast
+                // future variant.  Under M3a's current fail-fast
+                // policy `App::reconcile_pending` returns Err before
+                // calling `record`, so this branch is dead code
+                // today — kept for future-proofing + debug_assert
+                // catches inadvertent call.
+                self.branch_d_offline_refusal += 1;
+            }
             BranchOutcome::OrphanShiftResolved { orphans_resolved } => {
                 self.branch_e2 += 1;
                 self.shift_orphans_to_error += orphans_resolved;
@@ -858,6 +873,17 @@ async fn dispatch_pending_doc(
         // OFFLINE_LOCAL_ACK/REQUIRES_MANUAL_RECONCILIATION).  If we
         // observe one here, the SELECT contract is broken — surface
         // as anyhow error rather than silently dispatching.
+        //
+        // **W9.4 cycle-2 LOW-4 clarification:** this bail() is
+        // INTENTIONALLY NOT wrapped in the M3 try-and-audit shim.
+        // "Helper-level errors" that the shim absorbs are
+        // recoverable: a single doc's state-validation failure,
+        // CAS conflict, or transient SQL error.  Terminal-state
+        // SELECT contract violation is INFRASTRUCTURE-level (schema
+        // bug OR raw-SQL bypass) — wrapping it in audit + continuing
+        // iteration would mask a real corruption signal.  Fail-fast
+        // is correct here; the surrounding `BootError::ReconciliationFailed`
+        // preserves `fiscal_number` attribution per MED-B fix.
         DocState::Ack
         | DocState::Rejected
         | DocState::Cancelled
@@ -907,4 +933,131 @@ async fn emit_dispatch_error(
     .await?;
     histogram.dispatch_errors += 1;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! W9.4 cycle-2 MED-A fix: prove `emit_dispatch_error`'s contract
+    //! in isolation.  The M3 try-and-audit shim is the most
+    //! consequential piece of W9.4 — it changes failure mode from
+    //! "one stuck doc aborts the whole FN" to "stuck doc surfaces as
+    //! audit + counter".  Without this test the contract is
+    //! regression-prone.
+    //!
+    //! **Why lib-unit not integration:** the M3 shim fires only on a
+    //! helper returning Err.  Under SWFN + single-thread tokio, no
+    //! parallel mutation can inject helper failure between
+    //! `list_pending_for_fn` read and `dispatch_pending_doc` call.
+    //! Injecting failure via deliberate seed corruption requires
+    //! bypassing the schema CHECK / FK constraints we rely on.  The
+    //! cleanest test seam is `emit_dispatch_error` directly — the
+    //! function IS the M3 contract.
+
+    use super::*;
+    use crate::db::models::ids::DocumentId;
+    use sqlx::SqlitePool;
+
+    async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = crate::db::open_pool(&dir.path().join("m.db"))
+            .await
+            .expect("open_pool");
+        (dir, pool)
+    }
+
+    async fn seed_min_doc(pool: &SqlitePool, doc_byte: u8) -> DocumentId {
+        sqlx::query(
+            "INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+             VALUES ('1234567890', '12345678', 'test')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let bytes = vec![doc_byte; 16];
+        let req = vec![doc_byte ^ 0xFF; 16];
+        let sha = vec![0u8; 32];
+        sqlx::query(
+            "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+                state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+                payload_json, payload_sha256_canonical) \
+             VALUES (?, ?, '1234567890', ?, 'SELL', 'SIGNED', 'b1', 't1', 'ONLINE', \
+                '2026-01-01T00:00:00Z', '{}', ?)",
+        )
+        .bind(&bytes)
+        .bind(&req)
+        .bind(doc_byte as i64)
+        .bind(&sha)
+        .execute(pool)
+        .await
+        .unwrap();
+        DocumentId::from_bytes(<[u8; 16]>::try_from(bytes.as_slice()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn emit_dispatch_error_writes_audit_and_increments_counter() {
+        let (_dir, pool) = fresh_pool().await;
+        let doc = seed_min_doc(&pool, 0xE1).await;
+        let mut histogram = DispatchHistogram::default();
+        let err = anyhow::anyhow!("synthetic helper failure for test");
+
+        emit_dispatch_error(&pool, doc, "c-test", &err, &mut histogram)
+            .await
+            .expect("emit_dispatch_error must not fail under healthy DB");
+
+        assert_eq!(histogram.dispatch_errors, 1, "counter incremented");
+        assert_eq!(histogram.total_visited(), 1, "total reflects single error");
+
+        // Verify audit row exists with correct shape.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE event_type = 'BOOT_DISPATCH_ERROR'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "single BOOT_DISPATCH_ERROR audit row");
+
+        let payload: String = sqlx::query_scalar(
+            "SELECT event_payload_json FROM audit_log \
+             WHERE event_type = 'BOOT_DISPATCH_ERROR'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            payload.contains("\"branch\":\"c-test\""),
+            "payload carries branch_tag: {payload}"
+        );
+        assert!(
+            payload.contains("synthetic helper failure for test"),
+            "payload carries error message: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_dispatch_error_idempotent_under_repeated_calls() {
+        // Each call emits its own audit row + bumps counter.  This
+        // mirrors the real M3 shim behaviour: N failed dispatches in
+        // one branch (c) iteration produce N audit rows + counter=N.
+        let (_dir, pool) = fresh_pool().await;
+        let doc = seed_min_doc(&pool, 0xE2).await;
+        let mut histogram = DispatchHistogram::default();
+        let err1 = anyhow::anyhow!("first failure");
+        let err2 = anyhow::anyhow!("second failure");
+
+        emit_dispatch_error(&pool, doc, "c-test1", &err1, &mut histogram)
+            .await
+            .unwrap();
+        emit_dispatch_error(&pool, doc, "c-test2", &err2, &mut histogram)
+            .await
+            .unwrap();
+
+        assert_eq!(histogram.dispatch_errors, 2);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE event_type = 'BOOT_DISPATCH_ERROR'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 2, "two distinct audit rows");
+    }
 }

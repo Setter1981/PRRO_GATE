@@ -62,6 +62,19 @@ pub enum BootError {
     #[error("config file parse failed: {0}")]
     ConfigParse(String),
 
+    /// W9.4 cycle-2 MED-B fix: preserves per-FN attribution + source
+    /// error context when a `run_boot_reconciliation` call surfaces
+    /// a non-sqlx anyhow chain (e.g. terminal-state contract bail,
+    /// audit insert failure inside `with_immediate`).  Earlier code
+    /// stringified through `BootError::Internal`, losing the
+    /// `fiscal_number` tag operators need for triage.
+    #[error("reconcile_pending({fiscal_number}): {source}")]
+    ReconciliationFailed {
+        fiscal_number: String,
+        #[source]
+        source: anyhow::Error,
+    },
+
     #[error("internal boot error: {0}")]
     Internal(String),
 }
@@ -76,6 +89,7 @@ impl BootError {
             Self::Database(_) => 71,                 // EX_OSERR
             Self::ConfigRead(_) => 66,               // EX_NOINPUT
             Self::ConfigParse(_) => 65,              // EX_DATAERR (config IS data)
+            Self::ReconciliationFailed { .. } => 70, // EX_SOFTWARE — per-FN internal
             Self::Internal(_) => 70,                 // EX_SOFTWARE
         }
     }
@@ -205,14 +219,18 @@ impl App {
             .map_err(BootError::Database)?;
         let mut summary = ReconciliationSummary::default();
         for fn_cfg in &fns {
+            // MED-B fix (cycle-2): route per-FN failures through
+            // ReconciliationFailed which preserves `fiscal_number`
+            // attribution + `source` anyhow::Error chain.  Only raw
+            // sqlx::Error downcasts to Database (existing pattern).
             let outcome = boot_phase::run_boot_reconciliation(pool, &fn_cfg.fiscal_number)
                 .await
                 .map_err(|e| match e.downcast::<sqlx::Error>() {
                     Ok(sqlx_err) => BootError::Database(sqlx_err),
-                    Err(other) => BootError::Internal(format!(
-                        "reconcile_pending({}): {other}",
-                        fn_cfg.fiscal_number
-                    )),
+                    Err(other) => BootError::ReconciliationFailed {
+                        fiscal_number: fn_cfg.fiscal_number.clone(),
+                        source: other,
+                    },
                 })?;
             if let BranchOutcome::OfflineRefusal { .. } = outcome {
                 return Err(BootError::OfflineModeRefusal {
