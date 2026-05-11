@@ -168,12 +168,48 @@ impl App {
 
     /// Per-FN decision tree (W0-3 §4.3, 6 branches).
     ///
-    /// W9.1 stub: returns `Ok(())` without iterating FNs.  W9.3 wires
-    /// the dispatch.  Lives here because it's the public callable from
-    /// `main.rs` between `App::boot` and accepting ingress traffic.
+    /// Iterates `fiscal_number_config::list_all` sequentially (ordered
+    /// by `fiscal_number` ascending — deterministic for tests).  For
+    /// each FN, delegates to
+    /// `services::reconciliation::boot_phase::run_boot_reconciliation`.
+    ///
+    /// **OFFLINE refusal (freeze §3.4 + §13.3).**  If any FN returns
+    /// `BranchOutcome::OfflineRefusal`, this method fails-fast on the
+    /// FIRST such FN encountered and returns
+    /// `BootError::OfflineModeRefusal { fiscal_number }`.  The audit
+    /// row `NODE_STATE_BOOT_OFFLINE_REFUSAL` was already emitted by
+    /// `run_boot_reconciliation` before returning the outcome.
+    ///
+    /// **Ctx-needy dispatch deferral (W9.3).**  Per-DocState
+    /// dispatches that require `DpsChannel` / `SigningContext`
+    /// (PREPARED / SIGNED / SENT / ERROR_RETRYABLE) emit
+    /// `BOOT_DISPATCH_DEFERRED` audit and leave the doc in its source
+    /// state.  Runtime composition (W11+) wires the missing
+    /// dispatches.
     pub async fn reconcile_pending(&self) -> Result<(), BootError> {
-        // TODO(W9.3): iterate fiscal_number_config::list_all, dispatch
-        // via services::reconciliation::boot_phase::run_boot_reconciliation.
+        use crate::db::repositories::fiscal_number_config;
+        use crate::services::reconciliation::boot_phase::{self, BranchOutcome};
+
+        let pool = self.db();
+        let fns = fiscal_number_config::list_all(pool)
+            .await
+            .map_err(BootError::Database)?;
+        for fn_cfg in &fns {
+            let outcome = boot_phase::run_boot_reconciliation(pool, &fn_cfg.fiscal_number)
+                .await
+                .map_err(|e| match e.downcast::<sqlx::Error>() {
+                    Ok(sqlx_err) => BootError::Database(sqlx_err),
+                    Err(other) => BootError::Internal(format!(
+                        "reconcile_pending({}): {other}",
+                        fn_cfg.fiscal_number
+                    )),
+                })?;
+            if let BranchOutcome::OfflineRefusal { .. } = outcome {
+                return Err(BootError::OfflineModeRefusal {
+                    fiscal_number: fn_cfg.fiscal_number.clone(),
+                });
+            }
+        }
         Ok(())
     }
 
