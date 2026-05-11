@@ -23,4 +23,4 @@ pub mod services;
 pub mod transports;
 pub mod xml;
 
-pub use app::App;
+pub use app::{App, BootError};
