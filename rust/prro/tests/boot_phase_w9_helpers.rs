@@ -233,6 +233,77 @@ async fn advance_sent_to_kvt1_returns_false_when_doc_not_in_sent() {
 }
 
 #[tokio::test]
+async fn advance_sent_to_kvt1_idempotent_on_repeat_call() {
+    // MED 1 fix (freeze §10.3 row d): second invocation on an
+    // already-advanced doc must no-op (CAS Sent→Kvt1 sees doc in
+    // Kvt1 → rows_affected=0 → Ok(false)).  No duplicate audit, no
+    // duplicate KVT1_RAW write, no duplicate trace completion.
+    let (_dir, pool) = fresh_pool().await;
+    let doc = seed_doc_in_state(&pool, 0xB4, "SENT").await;
+    let attempt_no = alloc_inflight_trace(&pool, doc).await;
+    let ack = fake_ack("SRV-FISCAL-IDEMP", &[0xAB]);
+
+    // First call applies the full envelope.
+    let r1 = boot_phase::advance_sent_to_kvt1_from_probe(
+        &pool,
+        doc,
+        attempt_no,
+        &ack,
+        "2026-05-11T09:00:00Z",
+        "2026-05-11T09:00:01Z",
+    )
+    .await
+    .expect("first call must succeed");
+    assert!(r1, "first call applies → Ok(true)");
+    assert_eq!(read_state(&pool, doc).await, "KVT1");
+
+    // Second call: doc is now in Kvt1, CAS Sent→Kvt1 no-ops.
+    let r2 = boot_phase::advance_sent_to_kvt1_from_probe(
+        &pool,
+        doc,
+        attempt_no,
+        &ack,
+        "2026-05-11T09:00:02Z",
+        "2026-05-11T09:00:03Z",
+    )
+    .await
+    .expect("second call must Ok(false), not Err");
+    assert!(!r2, "second call no-ops → Ok(false)");
+
+    // Forensic invariants: no duplicates.
+    assert_eq!(
+        audit_count(&pool, "BOOT_LAST_CHK_MATCH_KVT1").await,
+        1,
+        "single audit row across the two calls"
+    );
+    // document_files Kvt1Raw: single row (replace_tx is INSERT OR
+    // REPLACE but second call bails at CAS before touching it).
+    let n_kvt1_raw: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM document_files WHERE document_id = ? AND kind = 'KVT1_RAW'",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(n_kvt1_raw, 1, "single KVT1_RAW row");
+    // Trace row stays completed with the FIRST call's wire times
+    // (second call bails before reaching complete_via_recovery_tx).
+    let wire_started: Option<String> = sqlx::query_scalar(
+        "SELECT wire_call_started_at FROM transport_trace WHERE document_id = ? AND attempt_no = ?",
+    )
+    .bind(doc)
+    .bind(attempt_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        wire_started.as_deref(),
+        Some("2026-05-11T09:00:00Z"),
+        "first call's wire times preserved (second call no-ops)"
+    );
+}
+
+#[tokio::test]
 async fn advance_sent_to_kvt1_errors_when_trace_row_missing() {
     let (_dir, pool) = fresh_pool().await;
     let doc = seed_doc_in_state(&pool, 0xB3, "SENT").await;

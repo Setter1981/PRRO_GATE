@@ -12,25 +12,13 @@
 //! W9.2 boot helpers we need tx-bound CAS to land alongside audit +
 //! artifact writes atomically.
 
-use std::fmt::Write as _;
-
 use sqlx::SqlitePool;
 
 use crate::db::models::ids::DocumentId;
 use crate::db::repositories::{audit_log, document_files, transport_trace};
 use crate::db::tx::with_immediate;
+use crate::services::write_path::types::hex_encode_lower as hex_lower;
 use crate::transports::dps::dto::CheckAck;
-
-/// Local hex helper — duplicates `services::write_path::types::hex_encode_lower`
-/// (pub(super)-scoped within write_path/).  Tiny enough not to warrant
-/// cross-module re-exposure for a single audit-payload use case.
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
 
 /// Per W9 freeze §4.0: budget cap for `attempts_used(doc_id)` →
 /// `RequiresManualReconciliation` escalation in §4.8 ERROR_RETRYABLE
@@ -45,6 +33,20 @@ pub const MAX_BOOT_ATTEMPTS: i64 = 5;
 /// `BOOT_RESUME_SENDING_TO_ERROR_RETRYABLE` ERROR.  No DPS call (DPS
 /// doesn't deduplicate; re-sending would create a duplicate-doc
 /// hazard per ADR-M3-A5 / W0-2 §5.2).
+///
+/// **Whitelist alignment (LOW 1 fix).**  The raw `UPDATE ... WHERE
+/// state = 'SENDING'` CAS hardcodes the
+/// `Sending → ErrorRetryable` edge and bypasses
+/// [`crate::db::repositories::fiscal_documents::transition_state`]
+/// (the pool-bound helper that consults the
+/// `fiscal_documents::allowed_transition` whitelist).  This edge IS
+/// in the whitelist (W7 added it for Pattern B crash-resume).
+/// Future maintainers MUST keep this CAS aligned with the whitelist
+/// — if `Sending → ErrorRetryable` is ever removed from the
+/// whitelist (extremely unlikely; the edge is structural Pattern B
+/// safety), this helper would silently violate I8.  Consider
+/// promoting to a `transition_state_tx` variant when a tx-bound
+/// transition helper lands.
 ///
 /// **Idempotency.**  CAS guard `WHERE state = 'SENDING'` makes a
 /// second invocation a no-op (the first call moved state to
@@ -118,6 +120,18 @@ pub async fn resume_sending_to_error_retryable(
 /// parallel writer OR by prior boot tick).  In that case the
 /// envelope rolls back (none of the 4 writes commit).  Caller sees
 /// `Ok(false)` and decides to skip / escalate.
+///
+/// **Whitelist alignment (LOW 1 fix).**  Raw `UPDATE ... WHERE state
+/// = 'SENT'` CAS hardcodes the `Sent → Kvt1` edge and bypasses
+/// [`crate::db::repositories::fiscal_documents::transition_state`].
+/// This edge IS in the
+/// `fiscal_documents::allowed_transition` whitelist (W1 base; W0-1
+/// §2.1 row 5).  Future maintainers MUST keep this CAS aligned —
+/// if `Sent → Kvt1` is ever removed from the whitelist (the doc
+/// transition is structurally fundamental, so removal would be a
+/// major schema redesign), this helper would silently violate I8.
+/// Consider promoting to a `transition_state_tx` variant when a
+/// tx-bound transition helper lands.
 pub async fn advance_sent_to_kvt1_from_probe(
     pool: &SqlitePool,
     doc_id: DocumentId,
@@ -126,15 +140,14 @@ pub async fn advance_sent_to_kvt1_from_probe(
     wire_call_started_at: &str,
     wire_call_finished_at: &str,
 ) -> anyhow::Result<bool> {
+    // NIT 1 fix: single clone layer.  `move |tx|` captures the
+    // outer-scope owned strings; the `async move` block then takes
+    // them into the future.  No inner re-clone needed under FnOnce.
     let ack_id = ack.id.clone();
     let ack_data_sign = ack.data_sign.clone();
     let wire_started = wire_call_started_at.to_string();
     let wire_finished = wire_call_finished_at.to_string();
     with_immediate(pool, move |tx| {
-        let ack_id = ack_id.clone();
-        let ack_data_sign = ack_data_sign.clone();
-        let wire_started = wire_started.clone();
-        let wire_finished = wire_finished.clone();
         Box::pin(async move {
             // (1) CAS Sent → Kvt1.
             let cas = sqlx::query(
@@ -219,6 +232,22 @@ pub async fn advance_sent_to_kvt1_from_probe(
 pub async fn passive_hold_kvt1(pool: &SqlitePool, doc_id: DocumentId) -> anyhow::Result<()> {
     with_immediate(pool, move |tx| {
         Box::pin(async move {
+            // LOW 4 fix: defensive state validation.  The helper
+            // emits a forensic audit claiming the doc is in Kvt1;
+            // firing on a non-Kvt1 doc would produce a misleading
+            // audit trail.  W9.3 dispatch will guard this externally
+            // too, but in-helper check hardens against ad-hoc
+            // admin / test callers.
+            let state: String =
+                sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
+                    .bind(doc_id)
+                    .fetch_one(&mut **tx)
+                    .await?;
+            anyhow::ensure!(
+                state == "KVT1",
+                "passive_hold_kvt1: doc not in Kvt1 (got {state})"
+            );
+
             let payload = serde_json::json!({
                 "document_id": hex_lower(doc_id.as_bytes()),
                 "branch": "c-kvt1",

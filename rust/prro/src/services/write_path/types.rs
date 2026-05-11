@@ -157,7 +157,7 @@ where
 /// regression to UPPERCASE hex would fail loudly.  De-duplicated
 /// from `stage_sign::hex_encode` + `mac_recovery::hex_lower` per
 /// senior review.
-pub(super) fn hex_encode_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode_lower(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {

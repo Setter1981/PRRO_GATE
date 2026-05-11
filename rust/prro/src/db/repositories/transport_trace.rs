@@ -418,16 +418,21 @@ pub async fn complete_via_recovery_tx(
     wire_call_started_at: &str,
     wire_call_finished_at: &str,
 ) -> sqlx::Result<u64> {
+    // LOW 2 fix: bind OutcomeKind::Ok.as_str() instead of hardcoded
+    // 'OK' literal — removes drift surface if the enum's wire string
+    // ever changes (currently "OK" but couples cleanly through the
+    // single source of truth).
     let res = sqlx::query(
         "UPDATE transport_trace SET \
             completed_at = CURRENT_TIMESTAMP, \
-            outcome_kind = 'OK', \
+            outcome_kind = ?, \
             server_fiscal_no = ?, \
             wire_call_started_at = ?, \
             wire_call_finished_at = ?, \
             retry_class = NULL \
          WHERE document_id = ? AND attempt_no = ? AND completed_at IS NULL",
     )
+    .bind(OutcomeKind::Ok.as_str())
     .bind(server_fiscal_no)
     .bind(wire_call_started_at)
     .bind(wire_call_finished_at)
