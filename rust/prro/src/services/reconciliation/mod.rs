@@ -14,6 +14,15 @@
 //! Active KVT2 polling (Kvt1 → Kvt2 advance) is **deferred to M3b**
 //! per freeze HIGH 6 (option A); W9 uses `boot_phase::passive_hold_kvt1`
 //! to emit a forensic audit row without state mutation.
+//!
+//! [`runtime`] (W11) — `ReconciliationRuntime<'a>` bundle that
+//! `App::reconcile_pending_with` accepts; threaded through
+//! `run_boot_reconciliation` and `dispatch_pending_doc` so PR-2 can
+//! wire ctx-needy dispatch arms (PREPARED / SIGNED / SENT /
+//! ERROR_RETRYABLE) without re-touching the dispatch tree shape.
 
 pub mod boot_phase;
 pub mod last_chk_probe;
+pub mod runtime;
+
+pub use runtime::ReconciliationRuntime;
