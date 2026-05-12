@@ -140,7 +140,7 @@ async fn read_node_seed(pool: &SqlitePool, fn_id: &str) -> Option<Vec<u8>> {
     .bind(fn_id)
     .fetch_one(pool)
     .await
-    .unwrap_or(None)
+    .expect("read node_state seed")
 }
 
 async fn read_inbox_status(pool: &SqlitePool, req_id: &[u8]) -> Option<String> {
@@ -148,8 +148,38 @@ async fn read_inbox_status(pool: &SqlitePool, req_id: &[u8]) -> Option<String> {
         .bind(req_id)
         .fetch_optional(pool)
         .await
-        .ok()
-        .flatten()
+        .expect("read inbox status")
+}
+
+async fn read_document_file_kind(
+    pool: &SqlitePool,
+    doc: DocumentId,
+    kind: &str,
+) -> Option<Vec<u8>> {
+    sqlx::query_scalar("SELECT content FROM document_files WHERE document_id = ? AND kind = ?")
+        .bind(doc)
+        .bind(kind)
+        .fetch_optional(pool)
+        .await
+        .expect("read document_files row")
+}
+
+async fn count_outbox_for(pool: &SqlitePool, doc: DocumentId) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM outbox WHERE document_id = ?")
+        .bind(doc)
+        .fetch_one(pool)
+        .await
+        .expect("count outbox rows for doc")
+}
+
+async fn insert_document_file(pool: &SqlitePool, doc: DocumentId, kind: &str, content: &[u8]) {
+    sqlx::query("INSERT INTO document_files (document_id, kind, content) VALUES (?, ?, ?)")
+        .bind(doc)
+        .bind(kind)
+        .bind(content)
+        .execute(pool)
+        .await
+        .expect("seed document_files row");
 }
 
 /// Seed a `fiscal_documents` row in KVT2 state with the chain context
@@ -388,11 +418,27 @@ async fn fixture_8_kvt2_crash_no_dps_query() {
     let (req_id, doc) = seed_doc_kvt2_for_finalize(app.db(), fn_id, 0x88, unsigned_xml_sha).await;
     seed_inbox_processing(app.db(), fn_id, &req_id).await;
 
+    // KVT2 crash-state realism: at this crash point the wire receipts
+    // KVT1_RAW and KVT2_RAW are ALREADY persisted (the worker reached
+    // KVT2 by having received and stored them).  Recovery must
+    // finalize without re-writing or mutating them.  Fingerprintable
+    // byte patterns let post-recovery readback prove unchanged-ness.
+    let kvt1_raw: &[u8] = &[0xAA; 64];
+    let kvt2_raw: &[u8] = &[0xBB; 64];
+    insert_document_file(app.db(), doc, "KVT1_RAW", kvt1_raw).await;
+    insert_document_file(app.db(), doc, "KVT2_RAW", kvt2_raw).await;
+
     // Pre-state sanity — `node_state.last_known_unsigned_xml_sha256`
     // starts NULL (matches doc's NULL `previous_hash` — genesis).
     assert!(
         read_node_seed(app.db(), fn_id).await.is_none(),
         "genesis case: seed must start NULL"
+    );
+    // Pre-state sanity — outbox empty before reconcile.
+    assert_eq!(
+        count_outbox_for(app.db(), doc).await,
+        0,
+        "pre-state: outbox row must not yet exist for this doc"
     );
 
     let stub = dps_panic_on_any_method(
@@ -429,7 +475,46 @@ async fn fixture_8_kvt2_crash_no_dps_query() {
         "stage_finalize step 5 — inbox row must be marked DONE"
     );
 
-    // (4) CRITICAL — zero DPS invocations across the recovery.
+    // (4) Outbox INSERT executed exactly once (stage_finalize step 4 /
+    // step 6 per W8 freeze).  PK on `document_id` makes any duplicate
+    // a hard error inside the tx; assert COUNT=1 to prove the
+    // finalize tx committed the outbox row (defence-in-depth: a
+    // commit without outbox row would have rolled back upstream).
+    assert_eq!(
+        count_outbox_for(app.db(), doc).await,
+        1,
+        "stage_finalize must INSERT exactly one outbox row on Ack"
+    );
+
+    // (5) STAGE_FINALIZE_ACK audit count == 1 — proves the finalize
+    // codepath actually ran end-to-end (not just CAS short-circuit on
+    // already-Ack).  Anchored at `stage_finalize.rs:212` + `:331-346`.
+    assert_eq!(
+        audit_count(app.db(), "STAGE_FINALIZE_ACK").await,
+        1,
+        "stage_finalize step 7 — STAGE_FINALIZE_ACK audit row must fire on first-time Ack"
+    );
+
+    // (6) Raw KVT artifacts unchanged.  Finalize is a state-machine
+    // close, not a wire-side write — pre-existing receipts MUST be
+    // preserved byte-for-byte.  W11 #8 is the first end-to-end proof
+    // of the read-only-on-finalize contract.
+    assert_eq!(
+        read_document_file_kind(app.db(), doc, "KVT1_RAW")
+            .await
+            .as_deref(),
+        Some(kvt1_raw),
+        "KVT1_RAW must remain byte-for-byte unchanged across finalize"
+    );
+    assert_eq!(
+        read_document_file_kind(app.db(), doc, "KVT2_RAW")
+            .await
+            .as_deref(),
+        Some(kvt2_raw),
+        "KVT2_RAW must remain byte-for-byte unchanged across finalize"
+    );
+
+    // (7) CRITICAL — zero DPS invocations across the recovery.
     // §6.6:810-811 "there is no DPS query in this branch, because
     // KVT2 is the protocol-level commit point".  Combined with
     // `unreachable!()` defaults on last_chk/ping/status_rro/info_rro,
