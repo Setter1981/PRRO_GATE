@@ -505,6 +505,7 @@ impl BranchOutcome {
 pub async fn run_boot_reconciliation(
     pool: &SqlitePool,
     fiscal_number: &str,
+    deps: Option<&super::ReconciliationRuntime<'_>>,
 ) -> anyhow::Result<BranchOutcome> {
     use crate::db::repositories::{fiscal_documents, node_state};
 
@@ -707,7 +708,7 @@ pub async fn run_boot_reconciliation(
         // errors absorbed into BOOT_DISPATCH_ERROR audit + histogram
         // counter; only infrastructure-level errors (audit insert
         // failure) propagate.
-        dispatch_pending_doc(pool, doc, &mut histogram).await?;
+        dispatch_pending_doc(pool, doc, deps, &mut histogram).await?;
     }
     // L1 fix: emit histogram in the FN-level audit payload.
     let payload = serde_json::json!({
@@ -763,9 +764,19 @@ pub async fn run_boot_reconciliation(
 async fn dispatch_pending_doc(
     pool: &SqlitePool,
     doc: &crate::db::repositories::fiscal_documents::DocumentRow,
+    deps: Option<&super::ReconciliationRuntime<'_>>,
     histogram: &mut DispatchHistogram,
 ) -> anyhow::Result<()> {
     use crate::db::models::enums::DocState;
+    // PR-1a plumbing — `deps` is threaded through the dispatch tree so
+    // PR-2 can wire ctx-needy branches (PREPARED / SIGNED / SENT /
+    // ERROR_RETRYABLE) without re-touching the function signature.
+    // PR-1a's SENDING / KVT1 / ENCRYPTED / KVT2 branches do NOT
+    // consult `deps`; per ADR-M3-A10 + W0-3 §6.3 / §6.5 / §6.6, those
+    // recovery paths are structurally ctx-free.  The DEFERRED branch
+    // surfaces `deps_available` in the audit payload so operators can
+    // see at which boot tick the runtime composition arrived.
+    let deps_available = deps.is_some();
     let doc_id = doc.document_id;
     match doc.state {
         DocState::Sending => match resume_sending_to_error_retryable(pool, doc_id).await {
@@ -843,13 +854,25 @@ async fn dispatch_pending_doc(
             }
         }
         // Ctx-needy states — emit DEFERRED audit, do not transition.
+        // PR-1a (W11): when `deps` is `Some`, the caller invoked
+        // `App::reconcile_pending_with` (runtime composition is in
+        // place), but the four ctx-needy dispatch arms (PREPARED /
+        // SIGNED / SENT / ERROR_RETRYABLE) are not yet wired — they
+        // land in PR-2.  Surfacing `deps_available` in the payload
+        // lets operators trace at which boot tick the runtime
+        // composition arrived and confirm PR-2 wiring is the only
+        // remaining blocker.
         DocState::Prepared | DocState::Signed | DocState::Sent | DocState::ErrorRetryable => {
             let state_str = doc.state.as_str().to_string();
             let payload = serde_json::json!({
                 "document_id": hex_lower(doc_id.as_bytes()),
                 "observed_state": state_str,
-                "rationale":
-                    "ctx-needy dispatch deferred to runtime composition (W11+); doc stays in source state",
+                "deps_available": deps_available,
+                "rationale": if deps_available {
+                    "ctx-needy dispatch arm pending wire-up (W11 PR-2); doc stays in source state"
+                } else {
+                    "ctx-needy dispatch deferred to runtime composition (W11+); doc stays in source state"
+                },
             });
             audit_log::append(
                 pool,

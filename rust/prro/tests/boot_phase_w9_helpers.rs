@@ -376,7 +376,7 @@ async fn run_boot_reconciliation_stub_returns_ok() {
     .execute(&pool)
     .await
     .unwrap();
-    boot_phase::run_boot_reconciliation(&pool, "1234567890")
+    boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
         .await
         .expect("W9.2 stub returns Ok(()) — W9.3 wires dispatch");
 }
