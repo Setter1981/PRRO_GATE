@@ -95,9 +95,10 @@ pub enum StageFinalizeError {
     SeedUpdateMissing { fn_id: String },
 
     /// `ingress_inbox::mark_done_tx` returned `false` — inbox row
-    /// missing for the request.  Impossible under M3a single-writer
-    /// (the inbox row is what drives the worker; it must exist for
-    /// stage 5 to run).  Tx rolls back.
+    /// missing for the request.  Impossible under M3a's single-
+    /// writer-per-FN invariant (see ADR-M3-A10): the inbox row is
+    /// what drives the worker; it must exist for stage 5 to run.
+    /// Tx rolls back.
     #[error("stage 5 mark_done returned 0 for request_id {request_id:?} — inbox row missing")]
     InboxDoneMissing { request_id: [u8; 16] },
 
@@ -261,8 +262,9 @@ pub async fn run(
 
             // 2. Read finalize inputs (post-CAS — state == Ack).
             //    Race-with-delete between CAS Applied and this read
-            //    is impossible under M3a single-writer + the same
-            //    BEGIN IMMEDIATE envelope, but typed defensively.
+            //    is impossible under M3a's single-writer-per-FN
+            //    invariant (see ADR-M3-A10) + the same BEGIN
+            //    IMMEDIATE envelope, but typed defensively.
             let inputs = fd::fetch_finalize_inputs_tx(tx, doc)
                 .await?
                 .ok_or_else(|| {

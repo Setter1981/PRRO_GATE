@@ -201,7 +201,8 @@ impl ReconciliationSummary {
 /// **Outcome shape.**  `Ok(true)` → CAS applied, audit appended.
 /// `Ok(false)` → CAS didn't apply (doc not in Sending — already
 /// resumed by prior boot tick OR state changed by parallel writer;
-/// under single-writer-per-FN the latter cannot occur within boot).
+/// under M3a's single-writer-per-FN invariant the latter cannot
+/// occur within boot — see ADR-M3-A10).
 pub async fn resume_sending_to_error_retryable(
     pool: &SqlitePool,
     doc_id: DocumentId,

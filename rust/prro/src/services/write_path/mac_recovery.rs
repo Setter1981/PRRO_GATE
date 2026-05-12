@@ -277,24 +277,36 @@ async fn read_recovery_inputs(
 /// on the returned [`MacRecoveryOutcome`] per the table in the enum
 /// docs.
 ///
-/// # Caller obligation: single-writer-per-FN lease
+/// # Caller obligation: single-writer-per-FN invariant
 ///
-/// (R-W10.4-senior-review MED 2 close.)  The orchestrator's MR-CLAIM
-/// and MR-PERSIST envelopes do NOT acquire the per-FN lease themselves;
-/// they rely on SQLite's BEGIN IMMEDIATE serialisation to prevent
-/// concurrent writes AND on the assumption that the caller already
-/// holds the single-writer-per-FN lease for `doc.fiscal_number`.
+/// (R-W10.4-senior-review MED 2 close; W10 post-merge audit MED-1
+/// close — see ADR-M3-A10 at
+/// `docs/superpowers/specs/2026-05-12-adr-m3-a10-global-single-writer.md`.)
 ///
-/// **Production caller `stage_send::run`** holds the lease for the
-/// duration of `run()`; recovery happens inside that window.  Ad-hoc
-/// callers (admin tools, test harnesses, future W9 reconciliation
-/// paths) MUST do the same — invoking `run_mac_recovery` without the
-/// lease is permitted only if the caller can justify that BEGIN
-/// IMMEDIATE serialisation alone is sufficient (e.g. read-only
-/// forensic replay where no other writer can race).
+/// The orchestrator's MR-CLAIM and MR-PERSIST envelopes do **NOT**
+/// acquire any per-FN lock — no such primitive exists in M3a (see
+/// ADR-M3-A10).  They rely on the M3a runtime invariant that at most
+/// one writer mutates state for a given `fiscal_number` at any
+/// moment.
 ///
-/// **What goes wrong without the lease.**  Two parallel callers on
-/// the same doc:
+/// Today that invariant is enforced by the strictly stronger
+/// **global-single-writer** model: one tokio worker drives the
+/// write-path orchestrator, and every write transaction is wrapped
+/// in `with_immediate` (SQLite `BEGIN IMMEDIATE`), which serialises
+/// all writers globally on the WAL writer.  Between MR-CLAIM commit
+/// and MR-PERSIST begin no other writer transaction of any kind can
+/// run, regardless of FN.
+///
+/// **Production caller `stage_send::run`** invokes the orchestrator
+/// inside its single-worker run, so the invariant is satisfied by
+/// construction.  Ad-hoc callers (admin tools, test harnesses, W9
+/// boot reconciliation) inherit the same guarantee because they
+/// run in the same single-worker context.
+///
+/// **What would go wrong if the invariant were broken.**  Two
+/// parallel callers on the same doc, assuming the invariant fails
+/// (e.g. a future multi-worker dispatcher without FN-scope
+/// exclusion):
 ///   - First MR-CLAIM wins, transitions counter 0→1.
 ///   - Second MR-CLAIM CAS fails (counter already 1) ⇒
 ///     `CounterExhausted`.
@@ -302,12 +314,11 @@ async fn read_recovery_inputs(
 ///     proceeds normally; second caller's caller observes
 ///     `CounterExhausted` and routes to `TerminalReject`.
 ///
-/// SQLite's serialisation makes this **functionally safe today** —
-/// no torn state, no double-spend.  But weakening the BEGIN
-/// IMMEDIATE invariant in a future schema change (e.g. moving
-/// counter claim outside a tx for performance) WOULD create a real
-/// race.  The lease obligation locks future maintainers into the
-/// safe model.
+/// SQLite's BEGIN IMMEDIATE serialisation makes this **functionally
+/// safe today** — no torn state, no double-spend.  But any slice
+/// that introduces concurrent writers (multi-worker dispatcher,
+/// counter claim moved outside a tx for performance) MUST add a
+/// real FN-scope exclusion primitive per ADR-M3-A10 §4.
 pub async fn run_mac_recovery(
     pool: &SqlitePool,
     ctx: &SigningContext,
@@ -337,9 +348,10 @@ pub async fn run_mac_recovery(
     // attempt recovery.  Earlier ordering (CLAIM → read) permanently
     // spent the counter on transient read failures.
     //
-    // Reordering is safe under single-writer-per-FN: the inputs we
-    // read here cannot be mutated between this read and the MR-CLAIM
-    // CAS by another writer holding the same lease.
+    // Reordering is safe under the M3a single-writer-per-FN
+    // invariant (see ADR-M3-A10): today's global-single-writer +
+    // BEGIN IMMEDIATE guarantees no other writer can mutate these
+    // inputs between this read and the MR-CLAIM CAS.
     let inputs = read_recovery_inputs(pool, doc).await?;
     let wire_artifact_kind = derive_wire_artifact_kind(inputs.doc_type)
         .map_err(StageSendError::MacRecoverySignFailed)?;

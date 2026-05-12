@@ -135,11 +135,11 @@ pub enum StageSendError {
     EmptyServerFiscalNo { document_id: DocumentId },
 
     /// 4-b post-wire CAS `Sending → {Sent|Rejected|ErrorRetryable}`
-    /// returned a non-`Applied` outcome.  Impossible under M3a W5
-    /// single-writer-per-FN + the 4-pre marker we just committed:
-    /// the doc was in `Sending` after our 4-pre tx, no other writer
-    /// can mutate it, so the post-wire CAS cannot miss.  Typed error
-    /// for forensics if it ever happens.
+    /// returned a non-`Applied` outcome.  Impossible under M3a W5's
+    /// single-writer-per-FN invariant (see ADR-M3-A10) + the 4-pre
+    /// marker we just committed: the doc was in `Sending` after our
+    /// 4-pre tx, no other writer can mutate it, so the post-wire CAS
+    /// cannot miss.  Typed error for forensics if it ever happens.
     #[error("stage 4 post-wire CAS Sending->{target:?} on doc {document_id:?}: {observed:?}")]
     PostWireCasFailed {
         document_id: DocumentId,
@@ -149,8 +149,9 @@ pub enum StageSendError {
 
     /// `mark_submission_attempted_tx` returned `false` in 4-pre AFTER
     /// the CAS `Signed → Sending` succeeded.  Also impossible under
-    /// the single-writer invariant: CAS Applied means the row exists
-    /// for the duration of the same `with_immediate` envelope.
+    /// the single-writer-per-FN invariant (see ADR-M3-A10): CAS
+    /// Applied means the row exists for the duration of the same
+    /// `with_immediate` envelope.
     #[error(
         "stage 4 mark_submission_attempted_tx returned 0 for doc {document_id:?} after CAS Applied"
     )]

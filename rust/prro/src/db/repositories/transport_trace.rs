@@ -407,7 +407,7 @@ pub async fn attempts_used(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> sqlx:
 ///     or
 ///   - the row was already completed by a parallel boot tick (race
 ///     under non-single-writer scenarios — should not occur under
-///     M3a's single-writer-per-FN invariant).
+///     M3a's single-writer-per-FN invariant; see ADR-M3-A10).
 ///
 /// `rows_affected = 1` is the only success shape.
 pub async fn complete_via_recovery_tx(
