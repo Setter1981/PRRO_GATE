@@ -593,7 +593,8 @@ async fn fixture_2_signed_crash_replays_to_sent_one_send_chk() {
         fn_sign: &fn_sign,
     };
 
-    app.reconcile_pending_with(deps)
+    let summary = app
+        .reconcile_pending_with(deps)
         .await
         .expect("reconcile_pending_with green");
 
@@ -609,6 +610,30 @@ async fn fixture_2_signed_crash_replays_to_sent_one_send_chk() {
         stub.call_count(),
         1,
         "§6.2 — one wire send during recovery (no resend hazard since no prior submission)"
+    );
+
+    // (3) W11 PR-2a wiring observable in the dispatch histogram —
+    // SIGNED arm produced exactly one dispatch (not deferred).
+    assert_eq!(
+        summary.docs_advanced.signed_dispatched, 1,
+        "PR-2a wiring: SIGNED Some(deps) path increments signed_dispatched"
+    );
+    assert_eq!(
+        summary.docs_advanced.signed_deferred, 0,
+        "PR-2a wiring: SIGNED must NOT fall through to the DEFERRED arm when deps Some"
+    );
+    assert_eq!(
+        summary.docs_advanced.total_visited(),
+        1,
+        "exactly one pending doc dispatched, all other counters zero"
+    );
+
+    // (4) No `BOOT_DISPATCH_DEFERRED` audit fired — proves the
+    // legacy ctx-free path was NOT taken under `reconcile_pending_with`.
+    assert_eq!(
+        audit_count(app.db(), "BOOT_DISPATCH_DEFERRED").await,
+        0,
+        "SIGNED dispatch arm wired in PR-2a; deferred audit must not fire"
     );
 }
 
@@ -652,7 +677,8 @@ async fn fixture_9_error_retryable_retries_without_mac_counter_burn() {
         fn_sign: &fn_sign,
     };
 
-    app.reconcile_pending_with(deps)
+    let summary = app
+        .reconcile_pending_with(deps)
         .await
         .expect("reconcile_pending_with green");
 
@@ -665,6 +691,29 @@ async fn fixture_9_error_retryable_retries_without_mac_counter_burn() {
 
     // (2) Exactly one send_chk invocation.
     assert_eq!(stub.call_count(), 1, "§6.7 — one wire send during recovery");
+
+    // (2a) W11 PR-2a wiring observable in the dispatch histogram —
+    // ERROR_RETRYABLE arm produced exactly one dispatch (not deferred).
+    assert_eq!(
+        summary.docs_advanced.error_retryable_dispatched, 1,
+        "PR-2a wiring: ERROR_RETRYABLE Some(deps) path increments error_retryable_dispatched"
+    );
+    assert_eq!(
+        summary.docs_advanced.error_retryable_deferred, 0,
+        "PR-2a wiring: ERROR_RETRYABLE must NOT fall through to DEFERRED arm under Some(deps)"
+    );
+    assert_eq!(
+        summary.docs_advanced.total_visited(),
+        1,
+        "exactly one pending doc dispatched, all other counters zero"
+    );
+
+    // (2b) No `BOOT_DISPATCH_DEFERRED` audit fired.
+    assert_eq!(
+        audit_count(app.db(), "BOOT_DISPATCH_DEFERRED").await,
+        0,
+        "ERROR_RETRYABLE dispatch arm wired in PR-2a; deferred audit must not fire"
+    );
 
     // (3) CRITICAL — MAC-recovery budget untouched.
     // The W10 single-bit `mac_recovery_attempts` is reserved for

@@ -22,9 +22,12 @@ use crate::transports::dps::DpsChannel;
 /// Bundle of runtime dependencies for ctx-needy boot dispatch.
 ///
 /// Lifetime `'a` is the caller-bound lifetime of the borrowed channel,
-/// signing context, and DPS identity blob.  The runtime is **not**
-/// `Send`/`Sync` — `App::reconcile_pending_with` consumes it on the
-/// dispatcher task (single-worker model, per ADR-M3-A10).
+/// signing context, and DPS identity blob.  The runtime is **not
+/// intended to be shared or invoked concurrently** —
+/// `App::reconcile_pending_with` consumes it on the dispatcher task
+/// (single-worker model, per ADR-M3-A10).  The type does not encode a
+/// `!Send`/`!Sync` constraint at the type level; the caller is the
+/// authority on single-task usage.
 pub struct ReconciliationRuntime<'a> {
     /// DPS wire channel used by recovery branches that re-drive docs
     /// to the wire.  PR-1a plumbs this dep through `run_boot_reconciliation`
