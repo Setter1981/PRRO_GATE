@@ -16,14 +16,15 @@
 //! dispatchers are not supported in M3a.
 
 use crate::services::write_path::stage_sign::SigningContext;
+use crate::transports::dps::dto::CheckSignBlob;
 use crate::transports::dps::DpsChannel;
 
 /// Bundle of runtime dependencies for ctx-needy boot dispatch.
 ///
-/// Lifetime `'a` is the caller-bound lifetime of the borrowed channel
-/// and signing context.  The runtime is **not** `Send`/`Sync` —
-/// `App::reconcile_pending_with` consumes it on the dispatcher task
-/// (single-worker model, per ADR-M3-A10).
+/// Lifetime `'a` is the caller-bound lifetime of the borrowed channel,
+/// signing context, and DPS identity blob.  The runtime is **not**
+/// `Send`/`Sync` — `App::reconcile_pending_with` consumes it on the
+/// dispatcher task (single-worker model, per ADR-M3-A10).
 pub struct ReconciliationRuntime<'a> {
     /// DPS wire channel used by recovery branches that re-drive docs
     /// to the wire.  PR-1a plumbs this dep through `run_boot_reconciliation`
@@ -38,4 +39,16 @@ pub struct ReconciliationRuntime<'a> {
     /// into PREPARED / SIGNED branches.  Not consulted by PR-1a's
     /// SENDING branch.
     pub signing_ctx: &'a SigningContext,
+    /// Operator DPS identity blob (opaque bytes — the same blob the
+    /// live worker holds for `DpsChannel::last_chk` / `status_rro` /
+    /// `info_rro` calls).
+    ///
+    /// W11 PR-2 (SENT branch) consumes `fn_sign` to drive
+    /// `last_chk_probe::probe` during SENT crash-recovery — the
+    /// probe's `match | mismatch | not_found` classification is the
+    /// canonical 3-way dispatch per W0-3 §6.4 + ADR-M3-A9 retry-path.
+    /// Live runtime owns this blob via the operator's keystore; tests
+    /// inject dummy bytes since the stub channel does not verify the
+    /// blob's contents.
+    pub fn_sign: &'a CheckSignBlob,
 }

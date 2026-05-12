@@ -18,6 +18,7 @@ use crate::db::models::enums::{NodeMode, ShiftState};
 use crate::db::models::ids::{DocumentId, ShiftId};
 use crate::db::repositories::{audit_log, document_files, transport_trace};
 use crate::db::tx::with_immediate;
+use crate::services::write_path::stage_send;
 use crate::services::write_path::types::hex_encode_lower as hex_lower;
 use crate::transports::dps::dto::CheckAck;
 
@@ -46,6 +47,17 @@ pub struct DispatchHistogram {
     pub signed_deferred: usize,
     pub sent_deferred: usize,
     pub error_retryable_deferred: usize,
+    /// W11 PR-2 — counter for SIGNED docs that the runtime-composed
+    /// dispatcher (`reconcile_pending_with`) drove forward through
+    /// `stage_send::run`.  Increments on successful dispatch invocation
+    /// regardless of the doc's final state (Sent / KVT1 / Rejected /
+    /// ErrorRetryable / RequiresManualReconciliation).  Helper failures
+    /// route through `BOOT_DISPATCH_ERROR` + `dispatch_errors`.
+    pub signed_dispatched: usize,
+    /// W11 PR-2 — counter for ERROR_RETRYABLE docs that the runtime-
+    /// composed dispatcher drove forward through `stage_send::run`
+    /// (which allows `ErrorRetryable → Sending` per ADR-M3-A9).
+    pub error_retryable_dispatched: usize,
     /// W9.4 M3 fix counter — per-doc dispatch failures absorbed by
     /// the try-and-audit shim (helper-level Err that's NOT fatal at
     /// branch level).  Operator dashboard surfaces these via
@@ -64,6 +76,8 @@ impl DispatchHistogram {
             + self.signed_deferred
             + self.sent_deferred
             + self.error_retryable_deferred
+            + self.signed_dispatched
+            + self.error_retryable_dispatched
             + self.dispatch_errors
     }
 
@@ -77,6 +91,8 @@ impl DispatchHistogram {
         self.signed_deferred += other.signed_deferred;
         self.sent_deferred += other.sent_deferred;
         self.error_retryable_deferred += other.error_retryable_deferred;
+        self.signed_dispatched += other.signed_dispatched;
+        self.error_retryable_dispatched += other.error_retryable_dispatched;
         self.dispatch_errors += other.dispatch_errors;
     }
 }
@@ -724,6 +740,8 @@ pub async fn run_boot_reconciliation(
             "signed_deferred": histogram.signed_deferred,
             "sent_deferred": histogram.sent_deferred,
             "error_retryable_deferred": histogram.error_retryable_deferred,
+            "signed_dispatched": histogram.signed_dispatched,
+            "error_retryable_dispatched": histogram.error_retryable_dispatched,
             "dispatch_errors": histogram.dispatch_errors,
         },
         "pending_visited": histogram.total_visited(),
@@ -853,42 +871,52 @@ async fn dispatch_pending_doc(
                 }
             }
         }
-        // Ctx-needy states — emit DEFERRED audit, do not transition.
-        // PR-1a (W11): when `deps` is `Some`, the caller invoked
-        // `App::reconcile_pending_with` (runtime composition is in
-        // place), but the four ctx-needy dispatch arms (PREPARED /
-        // SIGNED / SENT / ERROR_RETRYABLE) are not yet wired — they
-        // land in PR-2.  Surfacing `deps_available` in the payload
-        // lets operators trace at which boot tick the runtime
-        // composition arrived and confirm PR-2 wiring is the only
-        // remaining blocker.
-        DocState::Prepared | DocState::Signed | DocState::Sent | DocState::ErrorRetryable => {
-            let state_str = doc.state.as_str().to_string();
-            let payload = serde_json::json!({
-                "document_id": hex_lower(doc_id.as_bytes()),
-                "observed_state": state_str,
-                "deps_available": deps_available,
-                "rationale": if deps_available {
-                    "ctx-needy dispatch arm pending wire-up (W11 PR-2); doc stays in source state"
-                } else {
-                    "ctx-needy dispatch deferred to runtime composition (W11+); doc stays in source state"
-                },
-            });
-            audit_log::append(
-                pool,
-                "fiscal_document",
-                &hex_lower(doc_id.as_bytes()),
-                "BOOT_DISPATCH_DEFERRED",
-                crate::db::models::enums::Severity::Warning,
-                None,
-                Some(&payload.to_string()),
-            )
-            .await?;
+        // Ctx-needy states: per-state dispatch.  W11 PR-2 wires
+        // SIGNED + ERROR_RETRYABLE through `stage_send::run`; SENT
+        // + PREPARED are wired in the same PR's subsequent commits.
+        //
+        // None-path (`reconcile_pending` legacy entry) preserves the
+        // W9 BOOT_DISPATCH_DEFERRED behaviour for ALL four states —
+        // doc stays in source state, deps_available=false in audit.
+        DocState::Signed => match deps {
+            Some(d) => match stage_send::run(pool, d.dps, doc_id, Some(d.signing_ctx)).await {
+                Ok(_) => histogram.signed_dispatched += 1,
+                Err(e) => {
+                    emit_dispatch_error(pool, doc_id, "c-signed", &anyhow::Error::new(e), histogram)
+                        .await?
+                }
+            },
+            None => {
+                emit_ctx_needy_deferred(pool, doc_id, doc.state, deps_available).await?;
+                histogram.signed_deferred += 1;
+            }
+        },
+        DocState::ErrorRetryable => match deps {
+            Some(d) => match stage_send::run(pool, d.dps, doc_id, Some(d.signing_ctx)).await {
+                Ok(_) => histogram.error_retryable_dispatched += 1,
+                Err(e) => {
+                    emit_dispatch_error(
+                        pool,
+                        doc_id,
+                        "c-error-retryable",
+                        &anyhow::Error::new(e),
+                        histogram,
+                    )
+                    .await?
+                }
+            },
+            None => {
+                emit_ctx_needy_deferred(pool, doc_id, doc.state, deps_available).await?;
+                histogram.error_retryable_deferred += 1;
+            }
+        },
+        // PREPARED + SENT — still DEFERRED in BOTH Some/None paths
+        // until PR-2 subsequent commits land their wiring.
+        DocState::Prepared | DocState::Sent => {
+            emit_ctx_needy_deferred(pool, doc_id, doc.state, deps_available).await?;
             match doc.state {
                 DocState::Prepared => histogram.prepared_deferred += 1,
-                DocState::Signed => histogram.signed_deferred += 1,
                 DocState::Sent => histogram.sent_deferred += 1,
-                DocState::ErrorRetryable => histogram.error_retryable_deferred += 1,
                 _ => unreachable!(),
             }
         }
@@ -956,6 +984,44 @@ async fn emit_dispatch_error(
     )
     .await?;
     histogram.dispatch_errors += 1;
+    Ok(())
+}
+
+/// Emit a `BOOT_DISPATCH_DEFERRED` audit for a ctx-needy state whose
+/// dispatch arm is not (yet) wired.  Centralises the W9 deferral
+/// audit shape that PR-1a + PR-2 share across multiple match arms.
+///
+/// `deps_available = true` indicates the caller invoked
+/// `App::reconcile_pending_with` (runtime composition is in place),
+/// but the dispatch arm itself is still pending wire-up.
+/// `deps_available = false` mirrors the pre-W11 legacy
+/// `App::reconcile_pending` ctx-free entry.
+async fn emit_ctx_needy_deferred(
+    pool: &SqlitePool,
+    doc_id: DocumentId,
+    state: crate::db::models::enums::DocState,
+    deps_available: bool,
+) -> anyhow::Result<()> {
+    let payload = serde_json::json!({
+        "document_id": hex_lower(doc_id.as_bytes()),
+        "observed_state": state.as_str(),
+        "deps_available": deps_available,
+        "rationale": if deps_available {
+            "ctx-needy dispatch arm pending wire-up (W11 PR-2 subsequent commits); doc stays in source state"
+        } else {
+            "ctx-needy dispatch deferred to runtime composition (W11+); doc stays in source state"
+        },
+    });
+    audit_log::append(
+        pool,
+        "fiscal_document",
+        &hex_lower(doc_id.as_bytes()),
+        "BOOT_DISPATCH_DEFERRED",
+        crate::db::models::enums::Severity::Warning,
+        None,
+        Some(&payload.to_string()),
+    )
+    .await?;
     Ok(())
 }
 

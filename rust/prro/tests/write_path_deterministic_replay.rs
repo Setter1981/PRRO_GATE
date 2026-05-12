@@ -30,8 +30,17 @@ use common::{ack, det_signing_ctx, StubDpsChannel};
 use prro::config::AppConfig;
 use prro::db::models::ids::DocumentId;
 use prro::services::reconciliation::ReconciliationRuntime;
+use prro::transports::dps::dto::CheckSignBlob;
 use prro::App;
 use sqlx::SqlitePool;
+
+/// Dummy DPS identity blob for fixtures.  The stub channel does not
+/// verify the blob's contents — this matches the existing
+/// `last_chk_probe::tests::fn_sign()` shape at
+/// `rust/prro/src/services/reconciliation/last_chk_probe.rs:157-158`.
+fn dummy_fn_sign() -> CheckSignBlob {
+    CheckSignBlob(vec![0xDEu8, 0xAD, 0xBE, 0xEF])
+}
 
 // ─── Harness ───────────────────────────────────────────────────────
 
@@ -283,9 +292,11 @@ async fn fixture_3_sending_crash_pattern_b_no_resend() {
         }),
     );
     let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
     let deps = ReconciliationRuntime {
         dps: &stub,
         signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
     };
 
     app.reconcile_pending_with(deps)
@@ -351,9 +362,11 @@ async fn fixture_7_kvt1_crash_passive_hold_no_dps() {
         "§6.5 KVT1 recovery must not query DPS (no per-doc KVT2 receipt API in M3a)",
     );
     let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
     let deps = ReconciliationRuntime {
         dps: &stub,
         signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
     };
 
     app.reconcile_pending_with(deps)
@@ -445,9 +458,11 @@ async fn fixture_8_kvt2_crash_no_dps_query() {
         "§6.6 KVT2 is protocol-final — recovery executes stage_finalize::run only, NO DPS",
     );
     let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
     let deps = ReconciliationRuntime {
         dps: &stub,
         signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
     };
 
     app.reconcile_pending_with(deps)
@@ -523,5 +538,154 @@ async fn fixture_8_kvt2_crash_no_dps_query() {
         stub.call_count(),
         0,
         "§6.6 KVT2 protocol-final: send_chk must NOT be invoked during KVT2 recovery"
+    );
+}
+
+// ─── Helper for PR-2 fixtures #2 / #9 (SIGNED / ERROR_RETRYABLE) ───
+//
+// Seeds a `fiscal_documents` row in the requested state + the
+// `SIGNED_XML` artifact `stage_send::run`'s 4-pre read requires.
+async fn seed_doc_with_signed_xml(
+    pool: &SqlitePool,
+    fn_id: &str,
+    doc_byte: u8,
+    state: &str,
+) -> DocumentId {
+    let doc = seed_doc_in_state(pool, fn_id, doc_byte, state).await;
+    insert_document_file(pool, doc, "SIGNED_XML", &[0xEE; 64]).await;
+    doc
+}
+
+async fn read_mac_recovery_attempts(pool: &SqlitePool, doc: DocumentId) -> i64 {
+    sqlx::query_scalar("SELECT mac_recovery_attempts FROM fiscal_documents WHERE document_id = ?")
+        .bind(doc)
+        .fetch_one(pool)
+        .await
+        .expect("read mac_recovery_attempts")
+}
+
+// ─── Fixture #2 — §6.2 SIGNED crash-resume (fresh first send) ──────
+//
+// W0-3 §6.2:693-708 mandates: SIGNED crash means the worker reached
+// SIGNED state but never submitted to DPS.  Recovery: drive forward
+// via stage 4 (Pattern B 4-pre/4a/4b).  No duplicate-send hazard at
+// DPS because no prior submission ever happened.
+//
+// Assertions:
+// 1. State advances past SIGNED — happy `send_chk` produces SENT.
+// 2. `send_chk_count == 1` (one fresh wire send during recovery).
+// 3. `histogram.signed_dispatched == 1` (W11 PR-2 wiring observable).
+
+#[tokio::test]
+async fn fixture_2_signed_crash_replays_to_sent_one_send_chk() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let doc = seed_doc_with_signed_xml(app.db(), fn_id, 0x22, "SIGNED").await;
+
+    let stub = StubDpsChannel::new(Ok(ack("server-fiscal-sent-22")));
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    app.reconcile_pending_with(deps)
+        .await
+        .expect("reconcile_pending_with green");
+
+    // (1) State advances past SIGNED via Pattern B send path.
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "SENT",
+        "§6.2 happy `send_chk` drives Signed → Sending → Sent"
+    );
+
+    // (2) Exactly one send_chk invocation (fresh first send).
+    assert_eq!(
+        stub.call_count(),
+        1,
+        "§6.2 — one wire send during recovery (no resend hazard since no prior submission)"
+    );
+}
+
+// ─── Fixture #9 — §6.7 ERROR_RETRYABLE crash-resume (no MAC burn) ──
+//
+// W0-3 §6.7:831-854 mandates: ERROR_RETRYABLE retry drives through
+// `stage_send::run` (ADR-M3-A9 step 5-6 allows the
+// `ErrorRetryable → Sending` CAS).  Happy retry must NOT consume the
+// W10 MAC-recovery single-bit budget (`mac_recovery_attempts`) —
+// that budget is reserved for hash-mismatch MAC-recovery, not for
+// general retry.
+//
+// Assertions:
+// 1. State advances past ERROR_RETRYABLE (happy `send_chk` → SENT).
+// 2. `send_chk_count == 1`.
+// 3. `mac_recovery_attempts` unchanged at 0.
+// 4. No `MAC_RECOVERY_*` audit emitted.
+// 5. `histogram.error_retryable_dispatched == 1`.
+
+#[tokio::test]
+async fn fixture_9_error_retryable_retries_without_mac_counter_burn() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let doc = seed_doc_with_signed_xml(app.db(), fn_id, 0x99, "ERROR_RETRYABLE").await;
+
+    // Pre-state sanity — MAC budget starts at 0 (no prior recovery).
+    assert_eq!(
+        read_mac_recovery_attempts(app.db(), doc).await,
+        0,
+        "pre-state: mac_recovery_attempts must start at 0"
+    );
+
+    let stub = StubDpsChannel::new(Ok(ack("server-fiscal-retry-99")));
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    app.reconcile_pending_with(deps)
+        .await
+        .expect("reconcile_pending_with green");
+
+    // (1) State advances past ERROR_RETRYABLE.
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "SENT",
+        "§6.7 + ADR-M3-A9 step 5-6 — happy retry drives ErrorRetryable → Sending → Sent"
+    );
+
+    // (2) Exactly one send_chk invocation.
+    assert_eq!(stub.call_count(), 1, "§6.7 — one wire send during recovery");
+
+    // (3) CRITICAL — MAC-recovery budget untouched.
+    // The W10 single-bit `mac_recovery_attempts` is reserved for
+    // hash-mismatch MAC-recovery (ADR-M3-A10 §2 + migration 013); a
+    // happy ERROR_RETRYABLE retry must NOT burn it.  Pre/post check
+    // proves the W10 budget is orthogonal to the W9 retry counter.
+    assert_eq!(
+        read_mac_recovery_attempts(app.db(), doc).await,
+        0,
+        "mac_recovery_attempts must stay 0 — happy retry must not burn the MAC-hint budget"
+    );
+
+    // (4) No MAC-recovery audits fired.
+    assert_eq!(
+        audit_count(app.db(), "MAC_RECOVERY_CLAIM").await,
+        0,
+        "MAC recovery must not be invoked for non-MAC retry"
+    );
+    assert_eq!(
+        audit_count(app.db(), "MAC_RECOVERY_RESIGNED").await,
+        0,
+        "MAC recovery resign must not fire for non-MAC retry"
     );
 }
