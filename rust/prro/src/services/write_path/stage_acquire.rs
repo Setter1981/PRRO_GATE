@@ -25,6 +25,12 @@ use super::types::{CanonicalFiscalCommand, RejectionReason, WorkerContext, Worke
 /// runs the lease + guard + lnd-allocate + INSERT PREPARED + audit
 /// sequence atomically.  See module-level docs for ADR anchors.
 ///
+/// Note: "lease" in this module means the inbox-row lease taken by
+/// `ingress_inbox::acquire_lease`, which is keyed on `request_id`.
+/// It is **not** an FN-scope lock — see ADR-M3-A10 for the M3a
+/// single-writer-per-FN invariant and its current enforcement
+/// mechanism (global-single-writer + `BEGIN IMMEDIATE`).
+///
 /// Invariants:
 /// - On `Proceed`: lease=PROCESSING, lnd advanced, fiscal_documents
 ///   row PREPARED, audit `doc_prepared` appended.  All committed

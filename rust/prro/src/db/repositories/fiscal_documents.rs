@@ -661,8 +661,9 @@ pub struct FinalizeInputs {
 /// post-CAS bookkeeping in a single SELECT inside the same
 /// `with_immediate` envelope as the CAS `Kvt2 → Ack`.  Returns
 /// `None` when the row vanished between the CAS Applied and this
-/// read (impossible under M3a single-writer + the CAS we just
-/// committed, but typed defensively rather than panicking).
+/// read (impossible under M3a's single-writer-per-FN invariant —
+/// see ADR-M3-A10 — + the CAS we just committed, but typed
+/// defensively rather than panicking).
 pub async fn fetch_finalize_inputs_tx(
     tx: &mut WriteTxConn<'_>,
     doc_id: DocumentId,
