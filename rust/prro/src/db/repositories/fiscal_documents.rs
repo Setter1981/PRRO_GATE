@@ -142,6 +142,15 @@ pub fn allowed_transition(from: DocState, to: DocState) -> bool {
             | (Sent, Kvt1)
             | (Sent, ErrorRetryable)
             | (Sent, Rejected)
+            // W11 PR-2b — SENT last_chk mismatch escalation per W0-3 §6.4-b
+            // (`docs/superpowers/specs/2026-05-06-m3-w0-3-retry-recovery.md:771-772`).
+            // When boot-recovery probe yields `CheckAck { id != transport_request_id }`,
+            // the doc cannot be reconciled automatically: we have on-record a SENT
+            // marker but DPS reports a different fiscal id.  Direct transition to
+            // RequiresManualReconciliation is the operator-handoff edge — no prior
+            // hop through ErrorRetryable, because the situation is not retryable
+            // (DPS state and local state diverged at the protocol layer).
+            | (Sent, RequiresManualReconciliation)
             | (Kvt1, Kvt2)
             | (Kvt1, ErrorRetryable)
             | (Kvt2, Ack)

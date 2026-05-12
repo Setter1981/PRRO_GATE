@@ -317,6 +317,9 @@ fn allowed_transition_exhaustive_matrix() {
         (Sent, Kvt1),
         (Sent, ErrorRetryable),
         (Sent, Rejected),
+        // W11 PR-2b addition: SENT last_chk-mismatch escalation
+        // (§6.4-b operator-handoff edge).
+        (Sent, RequiresManualReconciliation),
         (Kvt1, Kvt2),
         (Kvt1, ErrorRetryable),
         (Kvt2, Ack),
@@ -361,10 +364,10 @@ fn allowed_transition_exhaustive_matrix() {
         }
     }
     assert_eq!(
-        allowed_count, 25,
-        "expected 17 base + 7 Pattern B + 1 MAC recovery dispatch terminal = 25 allowed pairs"
+        allowed_count, 26,
+        "expected 17 base + 7 Pattern B + 1 MAC recovery dispatch terminal + 1 W11 PR-2b SENT→RM = 26 allowed pairs"
     );
-    assert_eq!(forbidden_count, 169 - 25);
+    assert_eq!(forbidden_count, 169 - 26);
 }
 
 /// Negative coverage of intentional whitelist gaps from ADR-M3-A8 / A9.
