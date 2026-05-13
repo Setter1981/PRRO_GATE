@@ -14,7 +14,7 @@
 
 use sqlx::SqlitePool;
 
-use crate::db::models::enums::{NodeMode, ShiftState};
+use crate::db::models::enums::{NodeMode, Protocol, ShiftState};
 use crate::db::models::ids::{DocumentId, ShiftId};
 use crate::db::repositories::{audit_log, document_files, transport_trace};
 use crate::db::tx::with_immediate;
@@ -58,6 +58,28 @@ pub struct DispatchHistogram {
     /// composed dispatcher drove forward through `stage_send::run`
     /// (which allows `ErrorRetryable → Sending` per ADR-M3-A9).
     pub error_retryable_dispatched: usize,
+    /// W11 PR-2b — SENT crash-recovery via `last_chk_probe::probe`,
+    /// `ProbeOutcome::Match` arm.  Doc transitioned Sent → Kvt1 via
+    /// `advance_sent_to_kvt1_from_probe`.
+    pub sent_match_to_kvt1: usize,
+    /// W11 PR-2b — SENT crash-recovery, `ProbeOutcome::Mismatch` arm.
+    /// Doc transitioned Sent → RequiresManualReconciliation via the
+    /// W11 prep-PR whitelist edge (operator handoff per W0-3 §6.4-b).
+    pub sent_mismatch_to_manual: usize,
+    /// W11 PR-2b — SENT crash-recovery, `ProbeOutcome::NotFound` arm.
+    /// Doc transitioned Sent → ErrorRetryable; tick-2 of two-tick
+    /// retry path (ADR-M3-A9 step 3) re-drives via Pattern B.
+    pub sent_not_found_to_error_retryable: usize,
+    /// W11 PR-2b — SENT crash-recovery probe failure (TransportRetry
+    /// / DecodeEscalate / Unexpected).  Doc state left at SENT; next
+    /// boot tick re-attempts the probe.  Forensic audit
+    /// `BOOT_SENT_PROBE_DEFERRED` fires alongside.
+    pub sent_probe_failure_deferred: usize,
+    /// W11 PR-2b — counter for PREPARED docs that the runtime-composed
+    /// dispatcher drove forward through `stage_sign::run` →
+    /// `stage_send::run` chain.  Increments on successful dispatch
+    /// invocation regardless of the doc's final state.
+    pub prepared_dispatched: usize,
     /// W9.4 M3 fix counter — per-doc dispatch failures absorbed by
     /// the try-and-audit shim (helper-level Err that's NOT fatal at
     /// branch level).  Operator dashboard surfaces these via
@@ -78,6 +100,11 @@ impl DispatchHistogram {
             + self.error_retryable_deferred
             + self.signed_dispatched
             + self.error_retryable_dispatched
+            + self.sent_match_to_kvt1
+            + self.sent_mismatch_to_manual
+            + self.sent_not_found_to_error_retryable
+            + self.sent_probe_failure_deferred
+            + self.prepared_dispatched
             + self.dispatch_errors
     }
 
@@ -93,6 +120,11 @@ impl DispatchHistogram {
         self.error_retryable_deferred += other.error_retryable_deferred;
         self.signed_dispatched += other.signed_dispatched;
         self.error_retryable_dispatched += other.error_retryable_dispatched;
+        self.sent_match_to_kvt1 += other.sent_match_to_kvt1;
+        self.sent_mismatch_to_manual += other.sent_mismatch_to_manual;
+        self.sent_not_found_to_error_retryable += other.sent_not_found_to_error_retryable;
+        self.sent_probe_failure_deferred += other.sent_probe_failure_deferred;
+        self.prepared_dispatched += other.prepared_dispatched;
         self.dispatch_errors += other.dispatch_errors;
     }
 }
@@ -375,6 +407,250 @@ pub async fn advance_sent_to_kvt1_from_probe(
             .await?;
 
             Ok::<bool, anyhow::Error>(true)
+        })
+    })
+    .await
+}
+
+/// W11 PR-2b — SENT crash-recovery, `ProbeOutcome::Mismatch` arm.
+///
+/// CAS `Sent → RequiresManualReconciliation` via the W11 prep-PR
+/// whitelist edge + complete the in-flight `transport_trace` row
+/// with `OutcomeKind::Rejected` (DPS protocol-state divergence is
+/// recorded as a doc-level rejection from the local PoV) + audit
+/// `BOOT_SENT_LAST_CHK_MISMATCH_RM`.
+///
+/// All three writes commit inside one `with_immediate` envelope.
+/// `actual_id` carries the DPS-returned id for forensic audit
+/// (operator inspects to understand why the divergence happened).
+pub async fn cas_sent_to_manual_reconciliation_from_probe(
+    pool: &SqlitePool,
+    doc_id: DocumentId,
+    attempt_no: i32,
+    actual_id: &str,
+    wire_call_started_at: &str,
+    wire_call_finished_at: &str,
+) -> anyhow::Result<bool> {
+    let actual_id_owned = actual_id.to_string();
+    let wire_started = wire_call_started_at.to_string();
+    let wire_finished = wire_call_finished_at.to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // (1) CAS Sent → RequiresManualReconciliation
+            // (whitelist edge added in prep PR per W0-3 §6.4-b).
+            let cas = sqlx::query(
+                "UPDATE fiscal_documents SET state = 'REQUIRES_MANUAL_RECONCILIATION' \
+                 WHERE document_id = ? AND state = 'SENT'",
+            )
+            .bind(doc_id)
+            .execute(&mut **tx)
+            .await?;
+            if cas.rows_affected() != 1 {
+                // CAS conflict — bail early, no partial trail.
+                return Ok::<bool, anyhow::Error>(false);
+            }
+
+            // (2) Complete transport_trace row with Rejected outcome
+            // and the DPS-returned id captured for forensics.
+            let n = transport_trace::complete_tx(
+                tx,
+                doc_id,
+                attempt_no,
+                transport_trace::AttemptCompletion {
+                    wire_call_started_at: wire_started,
+                    wire_call_finished_at: wire_finished,
+                    outcome_kind: transport_trace::OutcomeKind::Rejected,
+                    server_fiscal_no: Some(actual_id_owned.clone()),
+                    server_status_code: None,
+                    error_kind: Some("LAST_CHK_MISMATCH".to_string()),
+                    error_message: Some(format!(
+                        "DPS last_chk returned id={actual_id_owned} not matching transport_request_id; operator handoff"
+                    )),
+                    retry_class: None,
+                },
+            )
+            .await?;
+            if n != 1 {
+                anyhow::bail!(
+                    "transport_trace mismatch completion: rows_affected = {n} (expected 1; doc {doc_id:?}, attempt_no = {attempt_no})"
+                );
+            }
+
+            // (3) Audit BOOT_SENT_LAST_CHK_MISMATCH_RM.
+            let payload = serde_json::json!({
+                "document_id": hex_lower(doc_id.as_bytes()),
+                "branch": "c-sent-mismatch",
+                "attempt_no": attempt_no,
+                "actual_id_from_dps": actual_id_owned,
+                "rationale":
+                    "last_chk returned different id than recorded transport_request_id — protocol-state divergence; operator handoff via RequiresManualReconciliation",
+            });
+            audit_log::append_tx(
+                tx,
+                "fiscal_document",
+                &hex_lower(doc_id.as_bytes()),
+                "BOOT_SENT_LAST_CHK_MISMATCH_RM",
+                crate::db::models::enums::Severity::Error,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await?;
+            Ok::<bool, anyhow::Error>(true)
+        })
+    })
+    .await
+}
+
+/// W11 PR-2b — SENT crash-recovery, `ProbeOutcome::NotFound` arm.
+///
+/// CAS `Sent → ErrorRetryable` + complete the in-flight
+/// `transport_trace` row with `OutcomeKind::RetryableServer` (DPS
+/// has no record — server-side condition, retryable) + audit
+/// `BOOT_SENT_LAST_CHK_NOTFOUND`.
+///
+/// This is the first tick of the two-tick recovery path
+/// (operator-decided 2026-05-12 per W11 design doc §9 Q1).  Second
+/// tick: ERROR_RETRYABLE dispatch via `stage_send::run` re-drives
+/// via Pattern B `ErrorRetryable → Sending → wire send`.  ADR-M3-A9
+/// step 3 forbids the direct `Sent → Sending` edge.
+pub async fn cas_sent_to_error_retryable_from_probe(
+    pool: &SqlitePool,
+    doc_id: DocumentId,
+    attempt_no: i32,
+    wire_call_started_at: &str,
+    wire_call_finished_at: &str,
+) -> anyhow::Result<bool> {
+    let wire_started = wire_call_started_at.to_string();
+    let wire_finished = wire_call_finished_at.to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // (1) CAS Sent → ErrorRetryable (whitelisted at base).
+            let cas = sqlx::query(
+                "UPDATE fiscal_documents SET state = 'ERROR_RETRYABLE' \
+                 WHERE document_id = ? AND state = 'SENT'",
+            )
+            .bind(doc_id)
+            .execute(&mut **tx)
+            .await?;
+            if cas.rows_affected() != 1 {
+                return Ok::<bool, anyhow::Error>(false);
+            }
+
+            // (2) Complete transport_trace row with RetryableServer outcome.
+            let n = transport_trace::complete_tx(
+                tx,
+                doc_id,
+                attempt_no,
+                transport_trace::AttemptCompletion {
+                    wire_call_started_at: wire_started,
+                    wire_call_finished_at: wire_finished,
+                    outcome_kind: transport_trace::OutcomeKind::RetryableServer,
+                    server_fiscal_no: None,
+                    server_status_code: None,
+                    error_kind: Some("LAST_CHK_NOTFOUND".to_string()),
+                    error_message: Some(
+                        "DPS last_chk returned NotFound; tick-2 of two-tick retry path will re-drive via Pattern B".to_string()
+                    ),
+                    retry_class: None,
+                },
+            )
+            .await?;
+            if n != 1 {
+                anyhow::bail!(
+                    "transport_trace notfound completion: rows_affected = {n} (expected 1; doc {doc_id:?}, attempt_no = {attempt_no})"
+                );
+            }
+
+            // (3) Audit BOOT_SENT_LAST_CHK_NOTFOUND.
+            let payload = serde_json::json!({
+                "document_id": hex_lower(doc_id.as_bytes()),
+                "branch": "c-sent-notfound",
+                "attempt_no": attempt_no,
+                "rationale":
+                    "last_chk returned NotFound — DPS has no record of doc with this transport_request_id; tick-1 transition Sent → ErrorRetryable (ADR-M3-A9 step 3 two-tick retry path)",
+            });
+            audit_log::append_tx(
+                tx,
+                "fiscal_document",
+                &hex_lower(doc_id.as_bytes()),
+                "BOOT_SENT_LAST_CHK_NOTFOUND",
+                crate::db::models::enums::Severity::Warning,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await?;
+            Ok::<bool, anyhow::Error>(true)
+        })
+    })
+    .await
+}
+
+/// W11 PR-2b — SENT crash-recovery probe failure (TransportRetry /
+/// DecodeEscalate / Unexpected ProbeOutcome variants).
+///
+/// Complete the in-flight `transport_trace` row with the supplied
+/// outcome kind + emit `BOOT_SENT_PROBE_DEFERRED` audit.  **No state
+/// transition** — doc stays in SENT; next boot tick re-attempts the
+/// probe.  Single `with_immediate` envelope.
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_probe_trace_no_state_change(
+    pool: &SqlitePool,
+    doc_id: DocumentId,
+    attempt_no: i32,
+    wire_call_started_at: &str,
+    wire_call_finished_at: &str,
+    outcome_kind: transport_trace::OutcomeKind,
+    failure_label: &'static str,
+    failure_reason: &str,
+) -> anyhow::Result<()> {
+    let wire_started = wire_call_started_at.to_string();
+    let wire_finished = wire_call_finished_at.to_string();
+    let reason_owned = failure_reason.to_string();
+    let failure_label_owned = failure_label.to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            let n = transport_trace::complete_tx(
+                tx,
+                doc_id,
+                attempt_no,
+                transport_trace::AttemptCompletion {
+                    wire_call_started_at: wire_started,
+                    wire_call_finished_at: wire_finished,
+                    outcome_kind,
+                    server_fiscal_no: None,
+                    server_status_code: None,
+                    error_kind: Some(failure_label_owned.clone()),
+                    error_message: Some(reason_owned.clone()),
+                    retry_class: None,
+                },
+            )
+            .await?;
+            if n != 1 {
+                anyhow::bail!(
+                    "transport_trace probe-failure completion: rows_affected = {n} (expected 1; doc {doc_id:?}, attempt_no = {attempt_no})"
+                );
+            }
+
+            let payload = serde_json::json!({
+                "document_id": hex_lower(doc_id.as_bytes()),
+                "branch": "c-sent-probe-deferred",
+                "attempt_no": attempt_no,
+                "failure_label": failure_label_owned,
+                "failure_reason": reason_owned,
+                "rationale":
+                    "last_chk probe failed mid-recovery; doc stays in SENT; next boot tick re-attempts",
+            });
+            audit_log::append_tx(
+                tx,
+                "fiscal_document",
+                &hex_lower(doc_id.as_bytes()),
+                "BOOT_SENT_PROBE_DEFERRED",
+                crate::db::models::enums::Severity::Warning,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
         })
     })
     .await
@@ -742,6 +1018,11 @@ pub async fn run_boot_reconciliation(
             "error_retryable_deferred": histogram.error_retryable_deferred,
             "signed_dispatched": histogram.signed_dispatched,
             "error_retryable_dispatched": histogram.error_retryable_dispatched,
+            "sent_match_to_kvt1": histogram.sent_match_to_kvt1,
+            "sent_mismatch_to_manual": histogram.sent_mismatch_to_manual,
+            "sent_not_found_to_error_retryable": histogram.sent_not_found_to_error_retryable,
+            "sent_probe_failure_deferred": histogram.sent_probe_failure_deferred,
+            "prepared_dispatched": histogram.prepared_dispatched,
             "dispatch_errors": histogram.dispatch_errors,
         },
         "pending_visited": histogram.total_visited(),
@@ -760,6 +1041,418 @@ pub async fn run_boot_reconciliation(
         histogram,
         sub_branch,
     })
+}
+
+/// W11 PR-2b — SENT crash-recovery orchestrator.  Allocates a fresh
+/// `transport_trace` row, runs `last_chk_probe::probe` (network,
+/// OUTSIDE any `with_immediate`), then dispatches on `ProbeOutcome`:
+///
+/// - **Match**: `advance_sent_to_kvt1_from_probe` → state Sent → Kvt1
+///   + KVT1_RAW persisted from ack.data_sign + trace completion.
+/// - **Mismatch**: `cas_sent_to_manual_reconciliation_from_probe` →
+///   state Sent → RequiresManualReconciliation (operator handoff per
+///   W0-3 §6.4-b; whitelist edge from prep PR #35) + trace completion
+///   with `Rejected` outcome.
+/// - **NotFound**: `cas_sent_to_error_retryable_from_probe` → state
+///   Sent → ErrorRetryable + trace completion with `RetryableServer`
+///   outcome.  Tick-2 of the two-tick retry path
+///   (operator-decided per W11 design doc §9 Q1).
+/// - **TransportRetry / DecodeEscalate / Unexpected**:
+///   `complete_probe_trace_no_state_change` → trace completion +
+///   `BOOT_SENT_PROBE_DEFERRED` audit; doc stays in SENT for next
+///   boot tick.
+///
+/// Doc with `server_fiscal_no = None` is a structural breach (SENT
+/// requires the transport_request_id to have been recorded); we emit
+/// `BOOT_DISPATCH_ERROR` + return without further dispatch.
+async fn dispatch_sent_via_probe(
+    pool: &SqlitePool,
+    deps: &super::ReconciliationRuntime<'_>,
+    doc: &crate::db::repositories::fiscal_documents::DocumentRow,
+    histogram: &mut DispatchHistogram,
+) -> anyhow::Result<()> {
+    use super::last_chk_probe::{self, ProbeOutcome};
+    let doc_id = doc.document_id;
+
+    // Read expected wire id from the persisted SENT marker.
+    let expected_id = match doc.server_fiscal_no.clone() {
+        Some(s) => s,
+        None => {
+            emit_dispatch_error(
+                pool,
+                doc_id,
+                "c-sent-no-server-fiscal-no",
+                &anyhow::anyhow!(
+                    "doc {doc_id:?} in SENT lacks server_fiscal_no — cannot probe last_chk"
+                ),
+                histogram,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    // Allocate transport_trace recovery row inside a dedicated tx —
+    // BEGIN IMMEDIATE serialises the `MAX(attempt_no)+1` read.
+    // `request_envelope_sha256` is zero-bytes because a probe is a
+    // query, not a wire submit; there is no envelope payload.
+    let backend_id = doc.backend_profile_id.clone();
+    let transport_id = doc.transport_profile_id.clone();
+    let attempt_no = with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            transport_trace::allocate_and_insert_tx(
+                tx,
+                doc_id,
+                transport_trace::NewAttempt {
+                    backend_profile_id: backend_id,
+                    transport_profile_id: transport_id,
+                    request_envelope_sha256: [0u8; 32],
+                },
+            )
+            .await
+            .map_err(anyhow::Error::from)
+        })
+    })
+    .await?;
+
+    // Capture wire times around the probe (network call, no tx).
+    let wire_started = iso8601_now();
+    let outcome = last_chk_probe::probe(deps.dps, deps.fn_sign, &expected_id).await;
+    let wire_finished = iso8601_now();
+
+    match outcome {
+        ProbeOutcome::Match { ack } => {
+            match advance_sent_to_kvt1_from_probe(
+                pool,
+                doc_id,
+                attempt_no,
+                &ack,
+                &wire_started,
+                &wire_finished,
+            )
+            .await
+            {
+                Ok(_) => histogram.sent_match_to_kvt1 += 1,
+                Err(e) => emit_dispatch_error(pool, doc_id, "c-sent-match", &e, histogram).await?,
+            }
+        }
+        ProbeOutcome::Mismatch { actual_id } => match cas_sent_to_manual_reconciliation_from_probe(
+            pool,
+            doc_id,
+            attempt_no,
+            &actual_id,
+            &wire_started,
+            &wire_finished,
+        )
+        .await
+        {
+            Ok(_) => histogram.sent_mismatch_to_manual += 1,
+            Err(e) => emit_dispatch_error(pool, doc_id, "c-sent-mismatch", &e, histogram).await?,
+        },
+        ProbeOutcome::NotFound => {
+            match cas_sent_to_error_retryable_from_probe(
+                pool,
+                doc_id,
+                attempt_no,
+                &wire_started,
+                &wire_finished,
+            )
+            .await
+            {
+                Ok(_) => histogram.sent_not_found_to_error_retryable += 1,
+                Err(e) => {
+                    emit_dispatch_error(pool, doc_id, "c-sent-notfound", &e, histogram).await?
+                }
+            }
+        }
+        ProbeOutcome::TransportRetry { reason } => {
+            match complete_probe_trace_no_state_change(
+                pool,
+                doc_id,
+                attempt_no,
+                &wire_started,
+                &wire_finished,
+                transport_trace::OutcomeKind::RetryableTransport,
+                "LAST_CHK_TRANSPORT_RETRY",
+                &reason,
+            )
+            .await
+            {
+                Ok(_) => histogram.sent_probe_failure_deferred += 1,
+                Err(e) => {
+                    emit_dispatch_error(pool, doc_id, "c-sent-probe-transport", &e, histogram)
+                        .await?
+                }
+            }
+        }
+        ProbeOutcome::DecodeEscalate { reason } => {
+            match complete_probe_trace_no_state_change(
+                pool,
+                doc_id,
+                attempt_no,
+                &wire_started,
+                &wire_finished,
+                transport_trace::OutcomeKind::RetryableServer,
+                "LAST_CHK_DECODE_ESCALATE",
+                &reason,
+            )
+            .await
+            {
+                Ok(_) => histogram.sent_probe_failure_deferred += 1,
+                Err(e) => {
+                    emit_dispatch_error(pool, doc_id, "c-sent-probe-decode", &e, histogram).await?
+                }
+            }
+        }
+        ProbeOutcome::Unexpected { dps_error } => {
+            match complete_probe_trace_no_state_change(
+                pool,
+                doc_id,
+                attempt_no,
+                &wire_started,
+                &wire_finished,
+                transport_trace::OutcomeKind::RetryableServer,
+                "LAST_CHK_UNEXPECTED",
+                &dps_error,
+            )
+            .await
+            {
+                Ok(_) => histogram.sent_probe_failure_deferred += 1,
+                Err(e) => {
+                    emit_dispatch_error(pool, doc_id, "c-sent-probe-unexpected", &e, histogram)
+                        .await?
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Tiny ISO-8601 helper for `last_chk` wire-time capture.  Uses
+/// `chrono::Utc::now()` — same source the W7 stage_send wire-time
+/// path uses.  Lives here (not in a shared module) because boot
+/// recovery is the only ctx-needy reader.
+fn iso8601_now() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+/// W11 PR-2b — PREPARED crash-recovery orchestrator.
+///
+/// W0-3 §6.1 mandates: a PREPARED doc crashed before sign / send.
+/// Recovery drives forward through the canonical W6 + W7 chain:
+/// `stage_sign::run` (Prepared → Signed) → `stage_send::run`
+/// (Signed → Sending → Sent / routed target).  Both stages manage
+/// their own `with_immediate` envelopes; `dispatch_prepared_via_chain`
+/// itself does NO crypto / network IO inside any envelope (W3
+/// invariant preserved structurally).
+///
+/// **WorkerContext reconstruction.**  `DocumentRow` does not carry
+/// the payload columns stage_sign needs (`business_ts`,
+/// `payload_json`, `total_sum_kop`, `payload_sha256_canonical`); the
+/// inbox row, node_state, and active_shift also live outside the
+/// dispatcher's signature.  A single short `with_immediate` envelope
+/// reads all five in one atomic snapshot:
+///   1. raw SELECT of fiscal_documents payload extras (no DocumentRow
+///      extension to keep PR-2b minimal-diff);
+///   2. raw SELECT of the matching inbox row (no `ingress_inbox`
+///      pool/tx reader exists — this is the sole caller, so the read
+///      lives inline);
+///   3. `node_state::get_tx` (single source of truth — the live worker
+///      reads node_state inside stage 1 the same way);
+///   4. `shifts::get_tx` when `node_state.shift_state == Opened` AND
+///      `current_shift_id IS Some`.
+///
+/// The envelope contains ONLY reads + struct decoding; foreign IO
+/// (crypto, DPS) is invoked AFTER the envelope returns.
+///
+/// **histogram contract.**  `prepared_dispatched += 1` on the
+/// stage_send happy path.  Both stage_sign and stage_send errors
+/// route through `emit_dispatch_error` (M3 try-and-audit shim);
+/// doc state stays in PREPARED (stage_sign error before CAS) or
+/// SIGNED (stage_sign succeeded, stage_send error) depending on
+/// where the chain failed — next boot tick re-dispatches via the
+/// appropriate arm.
+async fn dispatch_prepared_via_chain(
+    pool: &SqlitePool,
+    deps: &super::ReconciliationRuntime<'_>,
+    doc: &crate::db::repositories::fiscal_documents::DocumentRow,
+    histogram: &mut DispatchHistogram,
+) -> anyhow::Result<()> {
+    use crate::db::repositories::{ingress_inbox::InboxRow, node_state, shifts};
+    use crate::services::write_path::stage_sign;
+    use crate::services::write_path::types::{CanonicalFiscalCommand, WorkerContext};
+    use sqlx::Row as _;
+
+    let doc_id = doc.document_id;
+    let fn_id_for_read = doc.fiscal_number.clone();
+    // Capture doc.doc_type as owned `Copy` value BEFORE the
+    // `with_immediate` closure — the closure must not borrow the
+    // `&DocumentRow` parameter (its lifetime is non-`'static`, but
+    // `Box::pin(async move {...})` futures returned by `with_immediate`
+    // need to be `'static`).
+    let doc_type_copy = doc.doc_type;
+
+    type PreparedInputs = (
+        CanonicalFiscalCommand,
+        InboxRow,
+        node_state::NodeStateRow,
+        Option<shifts::ShiftRow>,
+    );
+
+    // (1) Atomic snapshot — fiscal_documents extras + inbox + node_state
+    // + active_shift, all inside one short `with_immediate` envelope.
+    // No foreign IO; W3 invariant preserved.
+    let inputs_result: anyhow::Result<PreparedInputs> = with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // (1a) Read payload columns + request_id from fiscal_documents.
+            let fd_row = sqlx::query(
+                "SELECT request_id, business_ts, total_sum_kop, payload_json, \
+                        payload_sha256_canonical \
+                 FROM fiscal_documents WHERE document_id = ?",
+            )
+            .bind(doc_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            let request_id_v: Vec<u8> = fd_row.try_get("request_id")?;
+            let request_id: [u8; 16] = request_id_v.as_slice().try_into().map_err(|_| {
+                anyhow::anyhow!("fiscal_documents.request_id length != 16 for doc {doc_id:?}")
+            })?;
+            let business_ts: String = fd_row.try_get("business_ts")?;
+            let total_sum_kop: Option<i64> = fd_row.try_get("total_sum_kop")?;
+            let payload_json: String = fd_row.try_get("payload_json")?;
+            let sha_v: Vec<u8> = fd_row.try_get("payload_sha256_canonical")?;
+            let payload_sha: [u8; 32] = sha_v.as_slice().try_into().map_err(|_| {
+                anyhow::anyhow!(
+                    "fiscal_documents.payload_sha256_canonical length != 32 for doc {doc_id:?}"
+                )
+            })?;
+
+            // (1b) Read the matching inbox row.  No `ingress_inbox`
+            // pool/tx reader exists today; PR-2b is the sole caller,
+            // so the read lives inline rather than adding a one-off
+            // repo helper.
+            let req_slice: &[u8] = &request_id;
+            let inbox_row_db = sqlx::query(
+                "SELECT request_id, fiscal_number, protocol, operation_type, \
+                        idempotency_key, status, payload_json, \
+                        payload_sha256_canonical, correlation_id, received_at \
+                 FROM ingress_inbox WHERE request_id = ?",
+            )
+            .bind(req_slice)
+            .fetch_one(&mut **tx)
+            .await?;
+            let inbox_request_id_v: Vec<u8> = inbox_row_db.try_get("request_id")?;
+            let inbox_request_id: [u8; 16] =
+                inbox_request_id_v.as_slice().try_into().map_err(|_| {
+                    anyhow::anyhow!("ingress_inbox.request_id length != 16 for doc {doc_id:?}")
+                })?;
+            let inbox_sha_v: Vec<u8> = inbox_row_db.try_get("payload_sha256_canonical")?;
+            let inbox_sha: [u8; 32] = inbox_sha_v.as_slice().try_into().map_err(|_| {
+                anyhow::anyhow!(
+                    "ingress_inbox.payload_sha256_canonical length != 32 for doc {doc_id:?}"
+                )
+            })?;
+            let inbox_row = InboxRow {
+                request_id: inbox_request_id,
+                fiscal_number: inbox_row_db.try_get("fiscal_number")?,
+                protocol: inbox_row_db.try_get::<Protocol, _>("protocol")?,
+                operation_type: inbox_row_db.try_get("operation_type")?,
+                idempotency_key: inbox_row_db.try_get("idempotency_key")?,
+                status: inbox_row_db.try_get("status")?,
+                payload_json: inbox_row_db.try_get("payload_json")?,
+                payload_sha256_canonical: inbox_sha,
+                correlation_id: inbox_row_db.try_get("correlation_id")?,
+                received_at: inbox_row_db.try_get("received_at")?,
+            };
+
+            // (1c) Read node_state via the tx-bound repo helper.
+            let ns = node_state::get_tx(tx, &fn_id_for_read)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "node_state missing for fn {fn_id_for_read} during PREPARED recovery"
+                    )
+                })?;
+
+            // (1d) Resolve active_shift only when node_state advertises
+            // an open shift — mirrors stage_acquire step 5.  Recovery
+            // does NOT escalate ShiftInvariantViolation (the live worker
+            // does that on first ingress; boot recovery just passes
+            // None through and lets stage_sign drive on the persisted
+            // doc).
+            let active_shift = match (ns.shift_state, &ns.current_shift_id) {
+                (ShiftState::Opened, Some(sid)) => shifts::get_tx(tx, *sid).await?,
+                _ => None,
+            };
+
+            let command = CanonicalFiscalCommand {
+                doc_type: doc_type_copy,
+                business_ts,
+                total_sum_kop,
+                payload_json,
+                payload_sha256_canonical: payload_sha,
+            };
+
+            Ok::<PreparedInputs, anyhow::Error>((command, inbox_row, ns, active_shift))
+        })
+    })
+    .await;
+
+    let (command, inbox, node_state, active_shift) = match inputs_result {
+        Ok(t) => t,
+        Err(e) => {
+            // Snapshot read failed — emit dispatch_error and bail
+            // without further state mutation; doc stays in PREPARED.
+            emit_dispatch_error(pool, doc_id, "c-prepared-inputs", &e, histogram).await?;
+            return Ok(());
+        }
+    };
+
+    let worker_ctx = WorkerContext {
+        inbox,
+        command,
+        node_state,
+        active_shift,
+        document: doc.clone(),
+    };
+
+    // (2) stage_sign::run drives PREPARED → SIGNED via its own
+    // envelopes (pin-then-persist).  Crypto invoked between the two
+    // envelopes per W6 Pattern A; W3 scanner accepts.  On Err the
+    // doc stays in PREPARED — next boot tick re-dispatches here.
+    if let Err(sign_err) = stage_sign::run(pool, deps.signing_ctx, worker_ctx).await {
+        emit_dispatch_error(
+            pool,
+            doc_id,
+            "c-prepared-sign",
+            &anyhow::Error::new(sign_err),
+            histogram,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // (3) stage_send::run drives SIGNED → SENT (or routed target) via
+    // Pattern B.  Doc-id only — stage_send re-reads from the pool;
+    // the runtime composition supplies `Some(signing_ctx)` for the
+    // optional MAC-recovery loop body.  On Err the doc stays in
+    // SIGNED — next boot tick re-dispatches via the PR-2a SIGNED arm.
+    match stage_send::run(pool, deps.dps, doc_id, Some(deps.signing_ctx)).await {
+        Ok(_) => histogram.prepared_dispatched += 1,
+        Err(send_err) => {
+            emit_dispatch_error(
+                pool,
+                doc_id,
+                "c-prepared-send",
+                &anyhow::Error::new(send_err),
+                histogram,
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Per-DocState dispatch inside branch (c)/(e1) iteration.  Ctx-free
@@ -910,16 +1603,20 @@ async fn dispatch_pending_doc(
                 histogram.error_retryable_deferred += 1;
             }
         },
-        // PREPARED + SENT — still DEFERRED in BOTH Some/None paths
-        // until PR-2 subsequent commits land their wiring.
-        DocState::Prepared | DocState::Sent => {
-            emit_ctx_needy_deferred(pool, doc_id, doc.state, deps_available).await?;
-            match doc.state {
-                DocState::Prepared => histogram.prepared_deferred += 1,
-                DocState::Sent => histogram.sent_deferred += 1,
-                _ => unreachable!(),
+        DocState::Sent => match deps {
+            Some(d) => dispatch_sent_via_probe(pool, d, doc, histogram).await?,
+            None => {
+                emit_ctx_needy_deferred(pool, doc_id, doc.state, deps_available).await?;
+                histogram.sent_deferred += 1;
             }
-        }
+        },
+        DocState::Prepared => match deps {
+            Some(d) => dispatch_prepared_via_chain(pool, d, doc, histogram).await?,
+            None => {
+                emit_ctx_needy_deferred(pool, doc_id, doc.state, deps_available).await?;
+                histogram.prepared_deferred += 1;
+            }
+        },
         // Terminal states should NEVER appear in `list_pending_for_fn`
         // per its WHERE clause (excludes ACK/REJECTED/CANCELLED/
         // OFFLINE_LOCAL_ACK/REQUIRES_MANUAL_RECONCILIATION).  If we

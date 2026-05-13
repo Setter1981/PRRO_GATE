@@ -27,10 +27,18 @@ mod common;
 
 use common::{ack, det_signing_ctx, StubDpsChannel};
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+
 use prro::config::AppConfig;
 use prro::db::models::ids::DocumentId;
 use prro::services::reconciliation::ReconciliationRuntime;
-use prro::transports::dps::dto::CheckSignBlob;
+use prro::transports::dps::channel::DpsChannel;
+use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
+use prro::transports::dps::error::DpsError;
 use prro::App;
 use sqlx::SqlitePool;
 
@@ -736,5 +744,795 @@ async fn fixture_9_error_retryable_retries_without_mac_counter_burn() {
         audit_count(app.db(), "MAC_RECOVERY_RESIGNED").await,
         0,
         "MAC recovery resign must not fire for non-MAC retry"
+    );
+}
+
+// ─── Local recovery stub — DpsChannel with last_chk + send_chk queues ──
+//
+// W11 PR-2b operator-decided design (2026-05-12 §9 Q4): the SENT
+// recovery fixtures need a DpsChannel that exercises `last_chk` AND
+// `send_chk` independently — the shared `StubDpsChannel` from
+// `tests/common/mod.rs:79-150` has `last_chk = unreachable!()` as a
+// default, which would panic the moment `dispatch_sent_via_probe`
+// fires its first probe.  We did NOT extend the shared stub: SENT
+// recovery is a recovery-specific shape (separate response queues per
+// method + per-method counters); shaping the shared stub around
+// `last_chk` would balloon the API surface and complicate the W7.5
+// `send_chk`-only fixtures.  Local stub keeps each test surface
+// minimal.
+//
+// **Concurrency contract.**  `std::sync::Mutex` (not
+// `tokio::sync::Mutex`) — these fixtures drive recovery from a single
+// task per fixture; locks are short-held and never cross an `.await`
+// while held.
+
+struct RecoveryDpsStub {
+    last_chk_queue: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
+    send_chk_queue: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
+    last_chk_count: AtomicUsize,
+    send_chk_count: AtomicUsize,
+}
+
+impl RecoveryDpsStub {
+    /// Tick-1 / single-probe use: only `last_chk` is consulted.  The
+    /// `send_chk` queue stays empty — any call would pop nothing and
+    /// panic, which is the desired "no resend during probe" guarantee.
+    fn for_last_chk(responses: Vec<Result<CheckAck, DpsError>>) -> Self {
+        Self {
+            last_chk_queue: Mutex::new(responses.into()),
+            send_chk_queue: Mutex::new(VecDeque::new()),
+            last_chk_count: AtomicUsize::new(0),
+            send_chk_count: AtomicUsize::new(0),
+        }
+    }
+
+    /// Tick-2 use (e.g. fixture #6 retry tick): only `send_chk` is
+    /// exercised because the doc is in ERROR_RETRYABLE and recovery
+    /// dispatches through `stage_send::run` (ADR-M3-A9 step 5-6, NOT
+    /// via the SENT probe path).
+    fn for_send_chk(responses: Vec<Result<CheckAck, DpsError>>) -> Self {
+        Self {
+            last_chk_queue: Mutex::new(VecDeque::new()),
+            send_chk_queue: Mutex::new(responses.into()),
+            last_chk_count: AtomicUsize::new(0),
+            send_chk_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn last_chk_count(&self) -> usize {
+        self.last_chk_count.load(Ordering::SeqCst)
+    }
+
+    fn send_chk_count(&self) -> usize {
+        self.send_chk_count.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl DpsChannel for RecoveryDpsStub {
+    async fn send_chk(&self, _envelope: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        self.send_chk_count.fetch_add(1, Ordering::SeqCst);
+        self.send_chk_queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("RecoveryDpsStub.send_chk queue empty (caller forgot to enqueue)")
+    }
+
+    async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
+        self.last_chk_count.fetch_add(1, Ordering::SeqCst);
+        self.last_chk_queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("RecoveryDpsStub.last_chk queue empty (caller forgot to enqueue)")
+    }
+
+    async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        unreachable!("RecoveryDpsStub: ping not exercised");
+    }
+
+    async fn status_rro(&self, _: &CheckSignBlob) -> Result<StatusSnapshot, DpsError> {
+        unreachable!("RecoveryDpsStub: status_rro not exercised");
+    }
+
+    async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
+        unreachable!("RecoveryDpsStub: info_rro not exercised");
+    }
+}
+
+// ─── Seed helper for SENT crash-recovery fixtures (#4 / #5 / #6) ───────
+//
+// A doc in SENT state structurally implies: the W7 worker reached
+// 4-b on a prior run, persisted `server_fiscal_no` from the wire ack
+// alongside CAS `Sending → Sent`, and crashed before the W8 KVT1
+// handoff.  Recovery probes `last_chk` against the persisted
+// `server_fiscal_no` (== `transport_request_id` per W7.4
+// canonicalisation).  Fixtures must mirror this shape: state=SENT,
+// SIGNED_XML persisted, `server_fiscal_no` set.
+async fn seed_doc_sent_with_server_fiscal_no(
+    pool: &SqlitePool,
+    fn_id: &str,
+    doc_byte: u8,
+    server_fiscal_no: &str,
+) -> DocumentId {
+    let doc = seed_doc_with_signed_xml(pool, fn_id, doc_byte, "SENT").await;
+    sqlx::query("UPDATE fiscal_documents SET server_fiscal_no = ? WHERE document_id = ?")
+        .bind(server_fiscal_no)
+        .bind(doc)
+        .execute(pool)
+        .await
+        .expect("seed server_fiscal_no on SENT doc");
+    doc
+}
+
+/// Read the most-recent `transport_trace` row for a doc — used by
+/// SENT recovery fixtures to assert the outcome shape committed by
+/// the dispatch tx.  Returns `(outcome_kind, server_fiscal_no)`.
+async fn read_latest_transport_trace(
+    pool: &SqlitePool,
+    doc: DocumentId,
+) -> (Option<String>, Option<String>) {
+    sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT outcome_kind, server_fiscal_no FROM transport_trace \
+         WHERE document_id = ? ORDER BY attempt_no DESC LIMIT 1",
+    )
+    .bind(doc)
+    .fetch_one(pool)
+    .await
+    .expect("read transport_trace row")
+}
+
+async fn count_transport_trace(pool: &SqlitePool, doc: DocumentId) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM transport_trace WHERE document_id = ?")
+        .bind(doc)
+        .fetch_one(pool)
+        .await
+        .expect("count transport_trace rows")
+}
+
+async fn read_server_fiscal_no(pool: &SqlitePool, doc: DocumentId) -> Option<String> {
+    sqlx::query_scalar("SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?")
+        .bind(doc)
+        .fetch_one(pool)
+        .await
+        .expect("read server_fiscal_no")
+}
+
+// ─── Fixture #4 — §6.4-a SENT probe Match → KVT1 ───────────────────────
+//
+// W0-3 §6.4-a:744-762 mandates: a SENT doc whose `last_chk` returns
+// an ack matching the persisted `transport_request_id` was
+// successfully fiscalised pre-crash; recovery advances state
+// `Sent → Kvt1` locally and persists the receipt bytes
+// (`ack.data_sign`) as the KVT1_RAW artifact.
+//
+// **Critical assertions:**
+//   (1) state SENT → KVT1.
+//   (2) KVT1_RAW persisted byte-for-byte from `ack.data_sign`.
+//   (3) `last_chk_count == 1`, `send_chk_count == 0` — recovery is
+//       probe-only on the match branch.
+//   (4) histogram counter `sent_match_to_kvt1 == 1`, peers zero.
+//   (5) Zero `BOOT_DISPATCH_DEFERRED` audit — SENT dispatch arm
+//       wired in PR-2b (this PR); deferred audit must not fire.
+//   (6) `transport_trace` recovery row completed with `outcome_kind=OK`.
+
+#[tokio::test]
+async fn fixture_4_sent_last_chk_match_advances_to_kvt1() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let expected_id = "expected-id-44";
+    let doc = seed_doc_sent_with_server_fiscal_no(app.db(), fn_id, 0x44, expected_id).await;
+
+    let ack_data_sign = vec![0xDDu8; 32];
+    let stub = RecoveryDpsStub::for_last_chk(vec![Ok(CheckAck {
+        id: expected_id.into(),
+        id_sign: vec![],
+        data_sign: ack_data_sign.clone(),
+    })]);
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile_pending_with green");
+
+    // (1) State SENT → KVT1.
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "KVT1",
+        "§6.4-a Match must advance Sent → Kvt1"
+    );
+
+    // (2) KVT1_RAW persisted byte-for-byte from ack.data_sign.
+    assert_eq!(
+        read_document_file_kind(app.db(), doc, "KVT1_RAW")
+            .await
+            .as_deref(),
+        Some(ack_data_sign.as_slice()),
+        "§6.4-a KVT1_RAW must carry ack.data_sign verbatim"
+    );
+
+    // (3) Exactly one last_chk call; zero send_chk (no re-send).
+    assert_eq!(
+        stub.last_chk_count(),
+        1,
+        "§6.4-a Match: exactly one last_chk probe issued"
+    );
+    assert_eq!(
+        stub.send_chk_count(),
+        0,
+        "§6.4-a Match: send_chk must NOT be invoked during probe recovery"
+    );
+
+    // (4) Histogram — sent_match_to_kvt1 = 1, peers zero.
+    assert_eq!(
+        summary.docs_advanced.sent_match_to_kvt1, 1,
+        "PR-2b wiring: probe Match increments sent_match_to_kvt1"
+    );
+    assert_eq!(
+        summary.docs_advanced.sent_deferred, 0,
+        "PR-2b wiring: SENT must NOT fall through to DEFERRED under Some(deps)"
+    );
+    assert_eq!(
+        summary.docs_advanced.sent_mismatch_to_manual, 0,
+        "peer counter must stay zero"
+    );
+    assert_eq!(
+        summary.docs_advanced.sent_not_found_to_error_retryable, 0,
+        "peer counter must stay zero"
+    );
+    assert_eq!(
+        summary.docs_advanced.sent_probe_failure_deferred, 0,
+        "peer counter must stay zero"
+    );
+    assert_eq!(
+        summary.docs_advanced.total_visited(),
+        1,
+        "exactly one pending doc dispatched"
+    );
+
+    // (5) No deferred audit — PR-2b wires the SENT arm.
+    assert_eq!(
+        audit_count(app.db(), "BOOT_DISPATCH_DEFERRED").await,
+        0,
+        "SENT dispatch arm wired in PR-2b; deferred audit must not fire"
+    );
+
+    // (6) transport_trace recovery row committed with OK outcome.
+    let (outcome_kind, _) = read_latest_transport_trace(app.db(), doc).await;
+    assert_eq!(
+        outcome_kind.as_deref(),
+        Some("OK"),
+        "§6.4-a Match: transport_trace recovery row completed with OK outcome"
+    );
+
+    // (7) Forensic audit fired — proves the match codepath ran end-
+    //     to-end (not a CAS short-circuit).
+    assert_eq!(
+        audit_count(app.db(), "BOOT_LAST_CHK_MATCH_KVT1").await,
+        1,
+        "§6.4-a Match: BOOT_LAST_CHK_MATCH_KVT1 audit fires exactly once"
+    );
+}
+
+// ─── Fixture #5 — §6.4-b SENT probe Mismatch → RequiresManualReconciliation ──
+//
+// W0-3 §6.4-b:766-784 mandates: a SENT doc whose `last_chk` returns
+// an ack with a DIFFERENT id (DPS has a different last-submitted
+// check than ours) cannot be locally proven fiscalised.  Either DPS
+// never received our doc, or another doc was submitted between our
+// crash and reboot; either way the operator must triage.  Recovery
+// transitions `Sent → RequiresManualReconciliation` via the W11
+// prep-PR whitelist edge (PR #35).
+//
+// **Critical assertions:**
+//   (1) state SENT → REQUIRES_MANUAL_RECONCILIATION.
+//   (2) `last_chk_count == 1`, `send_chk_count == 0`.
+//   (3) histogram counter `sent_mismatch_to_manual == 1`, peers zero.
+//   (4) audit `BOOT_SENT_LAST_CHK_MISMATCH_RM` fires (Severity::Error).
+//   (5) `transport_trace` row with `outcome_kind=REJECTED` AND
+//       `server_fiscal_no = Some(actual_id_from_dps)` for forensics.
+
+#[tokio::test]
+async fn fixture_5_sent_last_chk_mismatch_to_manual_reconciliation() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let expected_id = "expected-id-55";
+    let actual_id = "different-id-55";
+    let doc = seed_doc_sent_with_server_fiscal_no(app.db(), fn_id, 0x55, expected_id).await;
+
+    let stub = RecoveryDpsStub::for_last_chk(vec![Ok(CheckAck {
+        id: actual_id.into(),
+        id_sign: vec![],
+        data_sign: vec![],
+    })]);
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile_pending_with green");
+
+    // (1) State SENT → REQUIRES_MANUAL_RECONCILIATION.
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "§6.4-b Mismatch must transition Sent → RequiresManualReconciliation (whitelist edge from PR #35)"
+    );
+
+    // (2) Exactly one last_chk; zero send_chk.
+    assert_eq!(stub.last_chk_count(), 1, "§6.4-b: exactly one last_chk");
+    assert_eq!(
+        stub.send_chk_count(),
+        0,
+        "§6.4-b: send_chk must NOT be invoked"
+    );
+
+    // (3) Histogram — sent_mismatch_to_manual = 1, peers zero.
+    assert_eq!(
+        summary.docs_advanced.sent_mismatch_to_manual, 1,
+        "PR-2b wiring: probe Mismatch increments sent_mismatch_to_manual"
+    );
+    assert_eq!(
+        summary.docs_advanced.sent_match_to_kvt1, 0,
+        "peer counter must stay zero"
+    );
+    assert_eq!(
+        summary.docs_advanced.sent_deferred, 0,
+        "PR-2b wiring: SENT must NOT fall through to DEFERRED under Some(deps)"
+    );
+    assert_eq!(
+        summary.docs_advanced.total_visited(),
+        1,
+        "exactly one pending doc dispatched"
+    );
+
+    // (4) Audit fired exactly once with Error severity (operator
+    //     handoff signal).
+    assert_eq!(
+        audit_count(app.db(), "BOOT_SENT_LAST_CHK_MISMATCH_RM").await,
+        1,
+        "§6.4-b: BOOT_SENT_LAST_CHK_MISMATCH_RM audit fires exactly once"
+    );
+    assert_eq!(
+        audit_count(app.db(), "BOOT_DISPATCH_DEFERRED").await,
+        0,
+        "SENT dispatch arm wired in PR-2b; deferred audit must not fire"
+    );
+
+    // (5) transport_trace row with REJECTED outcome + actual_id from DPS.
+    let (outcome_kind, server_fiscal_no) = read_latest_transport_trace(app.db(), doc).await;
+    assert_eq!(
+        outcome_kind.as_deref(),
+        Some("REJECTED"),
+        "§6.4-b Mismatch: transport_trace recovery row completed with REJECTED outcome"
+    );
+    assert_eq!(
+        server_fiscal_no.as_deref(),
+        Some(actual_id),
+        "§6.4-b Mismatch: transport_trace records the DPS-returned actual_id for forensics"
+    );
+}
+
+// ─── Fixture #6 — §6.4-c SENT probe NotFound → two-tick retry path ─────
+//
+// W0-3 §6.4-c:788-820 mandates: a SENT doc whose `last_chk` returns
+// `NotFound` (DPS has no record of any check for our FN_sign) was
+// safely NOT received — Pattern B re-drive via
+// `ErrorRetryable → Sending → wire` is the correct recovery.
+// ADR-M3-A9 step 3 forbids the direct `Sent → Sending` edge: recovery
+// MUST hop through `ErrorRetryable`.  This is the two-tick path,
+// operator-decided per W11 design doc §9 Q1 (2026-05-12).
+//
+// **CRITICAL — the load-bearing fixture in PR-2b.**  Proves the
+// two-tick driver is structural, not inline:
+//   - Tick 1: probe → state `Sent → ErrorRetryable`, NO send_chk.
+//   - Tick 2: NEW deps (separate stub with happy `send_chk` queue),
+//     dispatch via `stage_send::run` drives `ER → Sending → Sent`.
+//
+// **Hard assertions:**
+//   (1.a) Tick-1 state → ERROR_RETRYABLE.
+//   (1.b) Tick-1 `last_chk_count == 1`, `send_chk_count == 0`.
+//   (1.c) Tick-1 `sent_not_found_to_error_retryable == 1`.
+//   (1.d) Tick-1 `BOOT_SENT_LAST_CHK_NOTFOUND` audit fires.
+//   (1.e) Tick-1: NO `BOOT_RESUME_*` audit (NO direct Sent → Sending).
+//   (2.a) Tick-2 state → SENT.
+//   (2.b) Tick-2 NEW stub's `send_chk_count == 1`.
+//   (2.c) Tick-2 `error_retryable_dispatched == 1`.
+//   (2.d) Total `transport_trace` rows == 2 (one per tick).
+//   (2.e) Doc's server_fiscal_no updated to tick-2's fresh id.
+
+#[tokio::test]
+async fn fixture_6_sent_last_chk_notfound_two_tick_retry_path() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let expected_id = "expected-id-66";
+    let doc = seed_doc_sent_with_server_fiscal_no(app.db(), fn_id, 0x66, expected_id).await;
+
+    // ── Tick 1 — last_chk NotFound → CAS Sent → ErrorRetryable ─────
+    let tick1_stub = RecoveryDpsStub::for_last_chk(vec![Err(DpsError::NotFound)]);
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let tick1_deps = ReconciliationRuntime {
+        dps: &tick1_stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let tick1_summary = app
+        .reconcile_pending_with(tick1_deps)
+        .await
+        .expect("tick 1 reconcile_pending_with green");
+
+    // (1.a) State → ERROR_RETRYABLE.
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "ERROR_RETRYABLE",
+        "§6.4-c tick-1 NotFound must CAS Sent → ErrorRetryable (NOT direct Sent → Sending per ADR-M3-A9 step 3)"
+    );
+
+    // (1.b) One last_chk, zero send_chk on tick 1.
+    assert_eq!(
+        tick1_stub.last_chk_count(),
+        1,
+        "tick-1: exactly one last_chk"
+    );
+    assert_eq!(
+        tick1_stub.send_chk_count(),
+        0,
+        "tick-1: send_chk MUST NOT fire — recovery is probe-only on the NotFound branch"
+    );
+
+    // (1.c) Histogram — sent_not_found_to_error_retryable == 1.
+    assert_eq!(
+        tick1_summary
+            .docs_advanced
+            .sent_not_found_to_error_retryable,
+        1,
+        "PR-2b wiring: NotFound increments sent_not_found_to_error_retryable"
+    );
+    assert_eq!(
+        tick1_summary.docs_advanced.error_retryable_dispatched, 0,
+        "tick-1: ER dispatch must NOT fire (doc was SENT at tick start)"
+    );
+    assert_eq!(
+        tick1_summary.docs_advanced.total_visited(),
+        1,
+        "tick-1: exactly one pending doc dispatched"
+    );
+
+    // (1.d) Forensic audit fired.
+    assert_eq!(
+        audit_count(app.db(), "BOOT_SENT_LAST_CHK_NOTFOUND").await,
+        1,
+        "§6.4-c tick-1: BOOT_SENT_LAST_CHK_NOTFOUND audit fires exactly once"
+    );
+
+    // (1.e) **Load-bearing**: NO direct Sent → Sending audit.  ADR-M3-A9
+    //       step 3 forbids the direct edge; the only audit on this
+    //       tick must be BOOT_SENT_LAST_CHK_NOTFOUND.  W9's
+    //       `BOOT_RESUME_SENDING_TO_ERROR_RETRYABLE` could only fire
+    //       if the doc were in SENDING (it is not — fixture seeds SENT).
+    assert_eq!(
+        audit_count(app.db(), "BOOT_RESUME_SENDING_TO_ERROR_RETRYABLE").await,
+        0,
+        "two-tick contract: no SENDING-resume audit (doc was SENT, not SENDING)"
+    );
+    assert_eq!(
+        audit_count(app.db(), "STAGE_SEND_RESULT").await,
+        0,
+        "two-tick contract: stage_send::run must NOT run on tick-1 (probe-only branch)"
+    );
+    assert_eq!(
+        count_transport_trace(app.db(), doc).await,
+        1,
+        "tick-1: exactly one transport_trace row (the probe recovery row)"
+    );
+
+    // ── Tick 2 — NEW deps + happy send_chk → ER → Sending → Sent ───
+    let fresh_id = "fresh-fiscal-66";
+    let tick2_stub = RecoveryDpsStub::for_send_chk(vec![Ok(CheckAck {
+        id: fresh_id.into(),
+        id_sign: vec![],
+        data_sign: vec![],
+    })]);
+    let tick2_deps = ReconciliationRuntime {
+        dps: &tick2_stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let tick2_summary = app
+        .reconcile_pending_with(tick2_deps)
+        .await
+        .expect("tick 2 reconcile_pending_with green");
+
+    // (2.a) State → SENT.
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "SENT",
+        "§6.4-c tick-2 + ADR-M3-A9 steps 5-6: stage_send::run drives ER → Sending → Sent"
+    );
+
+    // (2.b) Tick-2 NEW stub: send_chk count == 1.
+    assert_eq!(
+        tick2_stub.send_chk_count(),
+        1,
+        "tick-2: exactly one fresh send_chk on the retry"
+    );
+    assert_eq!(
+        tick2_stub.last_chk_count(),
+        0,
+        "tick-2: last_chk must NOT fire — doc is in ER, not SENT, when tick-2 starts"
+    );
+
+    // (2.c) Tick-2 histogram — error_retryable_dispatched == 1
+    //       (from PR-2a wiring; PR-2b reuses unchanged).
+    assert_eq!(
+        tick2_summary.docs_advanced.error_retryable_dispatched, 1,
+        "tick-2: PR-2a ER dispatch wiring increments error_retryable_dispatched"
+    );
+    assert_eq!(
+        tick2_summary
+            .docs_advanced
+            .sent_not_found_to_error_retryable,
+        0,
+        "tick-2: NotFound branch must NOT re-fire (doc was ER at tick start)"
+    );
+    assert_eq!(
+        tick2_summary.docs_advanced.total_visited(),
+        1,
+        "tick-2: exactly one pending doc dispatched"
+    );
+
+    // (2.d) Total transport_trace rows across both ticks == 2.
+    assert_eq!(
+        count_transport_trace(app.db(), doc).await,
+        2,
+        "two-tick contract: tick-1 probe row + tick-2 send row"
+    );
+
+    // (2.e) Doc's server_fiscal_no updated by stage_send 4b.
+    assert_eq!(
+        read_server_fiscal_no(app.db(), doc).await.as_deref(),
+        Some(fresh_id),
+        "tick-2 stage_send 4b: server_fiscal_no overwritten with fresh wire id"
+    );
+
+    // (3) Sanity: no deferred audit at any tick.
+    assert_eq!(
+        audit_count(app.db(), "BOOT_DISPATCH_DEFERRED").await,
+        0,
+        "two-tick: PR-2a (ER) + PR-2b (SENT) arms wired; deferred audit must not fire"
+    );
+}
+
+// ─── Seed helpers for fixture #1 (PREPARED end-to-end) ─────────────────
+//
+// PREPARED crash recovery dispatches via `stage_sign::run` → typed
+// payload parse → canonical XML build.  The seed must therefore
+// carry a real SELL payload (not the `'{}'` sentinel
+// `seed_doc_in_state` uses) AND a matching ingress_inbox row in
+// PROCESSING (the live worker flips inbox → PROCESSING in stage 1;
+// stage_finalize step 5 will flip it → DONE later).  W6 stage_sign
+// also needs an Opened shift in node_state (`check_shift_guard`
+// passes only for SELL on `ShiftState::Opened`).
+
+const FIXTURE_1_PAYLOAD_JSON: &str = r#"{"items":[{"code":"A1","name":"X","price_kop":15000,"quantity_thousandths":1000,"sum_kop":15000}],"payments":[{"name":"CASH","sum_kop":15000,"type_code":"0"}]}"#;
+
+const FIXTURE_1_TOTAL_SUM_KOP: i64 = 15000;
+
+/// Seed a PREPARED SELL doc end-to-end so `dispatch_prepared_via_chain`
+/// can drive it through `stage_sign::run` + `stage_send::run`.
+async fn seed_doc_prepared_full(
+    pool: &SqlitePool,
+    fn_id: &str,
+    doc_byte: u8,
+) -> (DocumentId, [u8; 16]) {
+    let doc_bytes = vec![doc_byte; 16];
+    let req_bytes = vec![doc_byte ^ 0xFF; 16];
+    let sha = vec![0u8; 32];
+    let lnd = doc_byte as i64;
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            total_sum_kop, payload_json, payload_sha256_canonical) \
+         VALUES (?, ?, ?, ?, 'SELL', 'PREPARED', 'b1', 't1', 'ONLINE', \
+            '2026-04-22T12:00:00Z', ?, ?, ?)",
+    )
+    .bind(&doc_bytes)
+    .bind(&req_bytes)
+    .bind(fn_id)
+    .bind(lnd)
+    .bind(FIXTURE_1_TOTAL_SUM_KOP)
+    .bind(FIXTURE_1_PAYLOAD_JSON)
+    .bind(&sha)
+    .execute(pool)
+    .await
+    .unwrap();
+    let doc_id = DocumentId::from_bytes(<[u8; 16]>::try_from(doc_bytes.as_slice()).unwrap());
+    let req_arr: [u8; 16] = <[u8; 16]>::try_from(req_bytes.as_slice()).unwrap();
+    (doc_id, req_arr)
+}
+
+/// Seed an `ingress_inbox` row in PROCESSING with the matching SELL
+/// payload — required by `dispatch_prepared_via_chain` snapshot read
+/// AND (downstream) `stage_finalize::mark_done_tx` if the chain ever
+/// reaches Ack.  Seed payload matches the doc's so a future
+/// payload-hash invariant guard wouldn't trip.
+async fn seed_inbox_processing_for_sell(pool: &SqlitePool, fn_id: &str, req_id: &[u8; 16]) {
+    let sha = vec![0u8; 32];
+    let req_slice: &[u8] = req_id;
+    sqlx::query(
+        "INSERT INTO ingress_inbox(request_id, fiscal_number, protocol, operation_type, \
+            idempotency_key, payload_json, payload_sha256_canonical, status) \
+         VALUES (?, ?, 'REST', 'SELL', ?, ?, ?, 'PROCESSING')",
+    )
+    .bind(req_slice)
+    .bind(fn_id)
+    .bind(format!("idem-{:02x}", req_id[0]))
+    .bind(FIXTURE_1_PAYLOAD_JSON)
+    .bind(&sha)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn seed_open_shift_and_node(
+    pool: &SqlitePool,
+    fn_id: &str,
+) -> prro::db::models::ids::ShiftId {
+    use prro::db::models::ids::ShiftId;
+    let shift_id = ShiftId::new();
+    sqlx::query(
+        "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, cash_balance_kop) \
+         VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0)",
+    )
+    .bind(shift_id)
+    .bind(fn_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO node_state (fiscal_number, mode, shift_state, current_shift_id, \
+            next_lnd, backend_profile_id, transport_profile_id) \
+         VALUES (?, 'ONLINE', 'OPENED', ?, 1, 'b1', 't1')",
+    )
+    .bind(fn_id)
+    .bind(shift_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    shift_id
+}
+
+// ─── Fixture #1 — §6.1 PREPARED crash → stage_sign + stage_send chain ──
+//
+// W0-3 §6.1:670-689 mandates: a PREPARED doc crashed BEFORE the W6
+// signing stage ran.  Recovery drives forward through the canonical
+// `stage_sign::run` → `stage_send::run` chain.  This fixture is the
+// end-to-end proof that PR-2b's `dispatch_prepared_via_chain` wiring
+// reconstructs `WorkerContext` from DB rows AND lets the chain
+// produce the same final-state shape as the live `process_request`
+// path.
+//
+// **Assertions:**
+//   (1) state PREPARED → SENT (drives sign + send chain to wire ack).
+//   (2) SIGNED_XML + PAYLOAD_XML document_files rows created by
+//       stage_sign 3-PERSIST.
+//   (3) send_chk fired exactly once (no resend).
+//   (4) histogram counter `prepared_dispatched == 1`, peers zero.
+//   (5) Zero `BOOT_DISPATCH_DEFERRED` audit — PREPARED arm wired in
+//       PR-2b; deferred audit must not fire under Some(deps).
+//   (6) transport_trace OK row recorded (proves stage_send 4-b
+//       committed cleanly).
+
+#[tokio::test]
+async fn fixture_1_prepared_crash_replays_to_sent_via_sign_send_chain() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    let _shift_id = seed_open_shift_and_node(app.db(), fn_id).await;
+    let (doc, req_id) = seed_doc_prepared_full(app.db(), fn_id, 0x11).await;
+    seed_inbox_processing_for_sell(app.db(), fn_id, &req_id).await;
+
+    let stub = StubDpsChannel::new(Ok(ack("server-fiscal-prepared-11")));
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile_pending_with green");
+
+    // (1) State PREPARED → SENT (sign + send chain drove it forward).
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "SENT",
+        "§6.1: dispatch_prepared_via_chain drives Prepared → Signed → Sending → Sent"
+    );
+
+    // (2) Both stage_sign artefacts persisted by 3-PERSIST.
+    assert!(
+        read_document_file_kind(app.db(), doc, "SIGNED_XML")
+            .await
+            .is_some(),
+        "stage_sign 3-PERSIST must INSERT SIGNED_XML document_files row"
+    );
+    assert!(
+        read_document_file_kind(app.db(), doc, "PAYLOAD_XML")
+            .await
+            .is_some(),
+        "stage_sign 3-PERSIST must INSERT PAYLOAD_XML document_files row"
+    );
+
+    // (3) Exactly one send_chk fired.
+    assert_eq!(
+        stub.call_count(),
+        1,
+        "§6.1: exactly one wire send during PREPARED recovery"
+    );
+
+    // (4) Histogram — prepared_dispatched == 1, peers zero.
+    assert_eq!(
+        summary.docs_advanced.prepared_dispatched, 1,
+        "PR-2b wiring: PREPARED Some(deps) path increments prepared_dispatched"
+    );
+    assert_eq!(
+        summary.docs_advanced.prepared_deferred, 0,
+        "PR-2b wiring: PREPARED must NOT fall through to DEFERRED arm under Some(deps)"
+    );
+    assert_eq!(
+        summary.docs_advanced.signed_dispatched, 0,
+        "peer counter must stay zero — recovery entered via PREPARED, not SIGNED"
+    );
+    assert_eq!(
+        summary.docs_advanced.total_visited(),
+        1,
+        "exactly one pending doc dispatched"
+    );
+
+    // (5) No deferred audit — PREPARED arm wired in PR-2b.
+    assert_eq!(
+        audit_count(app.db(), "BOOT_DISPATCH_DEFERRED").await,
+        0,
+        "PREPARED dispatch arm wired in PR-2b; deferred audit must not fire"
+    );
+
+    // (6) transport_trace OK row recorded by stage_send 4-b.
+    let (outcome_kind, server_fiscal_no) = read_latest_transport_trace(app.db(), doc).await;
+    assert_eq!(
+        outcome_kind.as_deref(),
+        Some("OK"),
+        "stage_send 4-b committed transport_trace with OK outcome"
+    );
+    assert_eq!(
+        server_fiscal_no.as_deref(),
+        Some("server-fiscal-prepared-11"),
+        "transport_trace records the wire-returned server_fiscal_no"
     );
 }
