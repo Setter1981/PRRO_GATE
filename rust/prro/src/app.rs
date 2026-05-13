@@ -265,19 +265,32 @@ impl App {
             .map_err(BootError::Database)?;
         let mut summary = ReconciliationSummary::default();
         for fn_cfg in &fns {
+            // M3a hardening pass 1: resolve per-FN RuntimeView BEFORE
+            // dispatching.  `ReconciliationRuntime::resolve` returns
+            // `Some(view)` only when the caller's resolver acknowledges
+            // a binding for this specific FN; `None` falls through to
+            // the ctx-free path (emits `BOOT_DISPATCH_DEFERRED` for any
+            // ctx-needy pending docs).  Recovery NEVER substitutes
+            // foreign identity — see `runtime::ReconciliationRuntime`
+            // doc-comment.
+            let per_fn_view = deps.and_then(|r| r.resolve(&fn_cfg.fiscal_number));
             // MED-B fix (cycle-2): route per-FN failures through
             // ReconciliationFailed which preserves `fiscal_number`
             // attribution + `source` anyhow::Error chain.  Only raw
             // sqlx::Error downcasts to Database (existing pattern).
-            let outcome = boot_phase::run_boot_reconciliation(pool, &fn_cfg.fiscal_number, deps)
-                .await
-                .map_err(|e| match e.downcast::<sqlx::Error>() {
-                    Ok(sqlx_err) => BootError::Database(sqlx_err),
-                    Err(other) => BootError::ReconciliationFailed {
-                        fiscal_number: fn_cfg.fiscal_number.clone(),
-                        source: other,
-                    },
-                })?;
+            let outcome = boot_phase::run_boot_reconciliation(
+                pool,
+                &fn_cfg.fiscal_number,
+                per_fn_view.as_ref(),
+            )
+            .await
+            .map_err(|e| match e.downcast::<sqlx::Error>() {
+                Ok(sqlx_err) => BootError::Database(sqlx_err),
+                Err(other) => BootError::ReconciliationFailed {
+                    fiscal_number: fn_cfg.fiscal_number.clone(),
+                    source: other,
+                },
+            })?;
             if let BranchOutcome::OfflineRefusal { .. } = outcome {
                 return Err(BootError::OfflineModeRefusal {
                     fiscal_number: fn_cfg.fiscal_number.clone(),

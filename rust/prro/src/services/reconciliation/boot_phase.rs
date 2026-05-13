@@ -80,6 +80,42 @@ pub struct DispatchHistogram {
     /// `stage_send::run` chain.  Increments on successful dispatch
     /// invocation regardless of the doc's final state.
     pub prepared_dispatched: usize,
+    /// M3a hardening pass 1 — ER docs whose durable `retry_class`
+    /// (per `transport_trace.retry_class`) indicates the recovery
+    /// branch is NOT auto-retryable.  Doc transitioned `ErrorRetryable
+    /// → RequiresManualReconciliation` with audit
+    /// `BOOT_ER_ESCALATED_TO_MANUAL`.  Applies to retry classes:
+    /// `FnConfigError` / `WrapperBug` / `OperatorEscalation` /
+    /// `MacRecovery` (Severity::Error) and `TerminalReject`
+    /// (Severity::Critical — indicates a structurally inconsistent
+    /// durable state, since TerminalReject routes targets `Rejected`
+    /// directly and should never land in ErrorRetryable).
+    pub error_retryable_escalated_to_manual: usize,
+    /// M3a hardening pass 1 — ER docs whose durable `retry_class` is
+    /// `ProbeRequired` (status `-2` / `-15` close-shift, status `0`
+    /// decode-unknown).  Recovery does NOT auto-retry — submit-time
+    /// `last_chk` reconciliation is deferred to M5's generic SENDING
+    /// reconciler (per PRRO_GATE-6bj M3a closure annotation).  Doc
+    /// stays in ER with audit `BOOT_ER_PROBE_DEFERRED`
+    /// (Severity::Warning).
+    pub error_retryable_probe_deferred: usize,
+    /// M3a hardening pass 1 — ER docs whose durable `retry_class`
+    /// row is missing OR carries an unknown wire-string OR is
+    /// pre-migration-012 NULL.  Recovery has no durable evidence
+    /// to choose a class; per `RetryClass::from_wire_str` contract,
+    /// indeterminate state is held without auto-retry.  Doc stays
+    /// in ER with audit `BOOT_ER_RETRY_CLASS_INDETERMINATE`
+    /// (Severity::Error — durable forensic evidence is missing).
+    pub error_retryable_indeterminate_deferred: usize,
+    /// M3a hardening pass 1 — PREPARED docs whose
+    /// `dispatch_prepared_via_chain` snapshot detected drift
+    /// between `fiscal_documents` extras and the matching
+    /// `ingress_inbox` row (mismatch on `fiscal_number`,
+    /// `payload_sha256_canonical`, or `doc_type` vs
+    /// `operation_type`).  Doc stays in PREPARED with audit
+    /// `BOOT_PREPARED_REPLAY_DRIFT` (Severity::Critical).  Operator
+    /// manual intervention required.
+    pub prepared_replay_drift_deferred: usize,
     /// W9.4 M3 fix counter — per-doc dispatch failures absorbed by
     /// the try-and-audit shim (helper-level Err that's NOT fatal at
     /// branch level).  Operator dashboard surfaces these via
@@ -105,6 +141,10 @@ impl DispatchHistogram {
             + self.sent_not_found_to_error_retryable
             + self.sent_probe_failure_deferred
             + self.prepared_dispatched
+            + self.error_retryable_escalated_to_manual
+            + self.error_retryable_probe_deferred
+            + self.error_retryable_indeterminate_deferred
+            + self.prepared_replay_drift_deferred
             + self.dispatch_errors
     }
 
@@ -125,6 +165,10 @@ impl DispatchHistogram {
         self.sent_not_found_to_error_retryable += other.sent_not_found_to_error_retryable;
         self.sent_probe_failure_deferred += other.sent_probe_failure_deferred;
         self.prepared_dispatched += other.prepared_dispatched;
+        self.error_retryable_escalated_to_manual += other.error_retryable_escalated_to_manual;
+        self.error_retryable_probe_deferred += other.error_retryable_probe_deferred;
+        self.error_retryable_indeterminate_deferred += other.error_retryable_indeterminate_deferred;
+        self.prepared_replay_drift_deferred += other.prepared_replay_drift_deferred;
         self.dispatch_errors += other.dispatch_errors;
     }
 }
@@ -536,7 +580,16 @@ pub async fn cas_sent_to_error_retryable_from_probe(
                 return Ok::<bool, anyhow::Error>(false);
             }
 
-            // (2) Complete transport_trace row with RetryableServer outcome.
+            // (2) Complete transport_trace row with RetryableServer
+            // outcome.  M3a hardening pass 1 — `retry_class =
+            // TransientRetry` is the semantically correct durable
+            // label: probe `NotFound` means DPS has no record, so
+            // tick-2 of the ADR-M3-A9 retry path is the canonical
+            // transient retry path.  The new ER dispatcher
+            // (`dispatch_error_retryable_by_class`) routes
+            // TransientRetry rows through `stage_send::run`.  Writing
+            // `None` here would route the doc to the indeterminate-
+            // hold branch and break the two-tick contract.
             let n = transport_trace::complete_tx(
                 tx,
                 doc_id,
@@ -551,7 +604,11 @@ pub async fn cas_sent_to_error_retryable_from_probe(
                     error_message: Some(
                         "DPS last_chk returned NotFound; tick-2 of two-tick retry path will re-drive via Pattern B".to_string()
                     ),
-                    retry_class: None,
+                    retry_class: Some(
+                        crate::services::write_path::error_routing::RetryClass::TransientRetry
+                            .as_str()
+                            .to_string(),
+                    ),
                 },
             )
             .await?;
@@ -797,7 +854,7 @@ impl BranchOutcome {
 pub async fn run_boot_reconciliation(
     pool: &SqlitePool,
     fiscal_number: &str,
-    deps: Option<&super::ReconciliationRuntime<'_>>,
+    deps: Option<&super::RuntimeView<'_>>,
 ) -> anyhow::Result<BranchOutcome> {
     use crate::db::repositories::{fiscal_documents, node_state};
 
@@ -1023,6 +1080,10 @@ pub async fn run_boot_reconciliation(
             "sent_not_found_to_error_retryable": histogram.sent_not_found_to_error_retryable,
             "sent_probe_failure_deferred": histogram.sent_probe_failure_deferred,
             "prepared_dispatched": histogram.prepared_dispatched,
+            "error_retryable_escalated_to_manual": histogram.error_retryable_escalated_to_manual,
+            "error_retryable_probe_deferred": histogram.error_retryable_probe_deferred,
+            "error_retryable_indeterminate_deferred": histogram.error_retryable_indeterminate_deferred,
+            "prepared_replay_drift_deferred": histogram.prepared_replay_drift_deferred,
             "dispatch_errors": histogram.dispatch_errors,
         },
         "pending_visited": histogram.total_visited(),
@@ -1067,7 +1128,7 @@ pub async fn run_boot_reconciliation(
 /// `BOOT_DISPATCH_ERROR` + return without further dispatch.
 async fn dispatch_sent_via_probe(
     pool: &SqlitePool,
-    deps: &super::ReconciliationRuntime<'_>,
+    deps: &super::RuntimeView<'_>,
     doc: &crate::db::repositories::fiscal_documents::DocumentRow,
     histogram: &mut DispatchHistogram,
 ) -> anyhow::Result<()> {
@@ -1228,6 +1289,269 @@ async fn dispatch_sent_via_probe(
     Ok(())
 }
 
+/// M3a hardening pass 1 — CAS `ErrorRetryable → RequiresManualReconciliation`
+/// for ER docs whose durable `retry_class` indicates the recovery
+/// branch is NOT auto-retryable (FnConfigError, WrapperBug,
+/// OperatorEscalation, MacRecovery, TerminalReject).
+///
+/// Single `with_immediate` envelope: CAS `ErrorRetryable →
+/// RequiresManualReconciliation` (whitelisted at base — see
+/// `fiscal_documents::allowed_transition` line 160) + audit
+/// `BOOT_ER_ESCALATED_TO_MANUAL`.  No DPS call; no signing.
+///
+/// **Severity selection.**  Caller passes `severity` per class:
+///   - `Severity::Error` for FnConfigError / WrapperBug /
+///     OperatorEscalation / MacRecovery (durable evidence indicates
+///     operator action needed; not retryable but expected).
+///   - `Severity::Critical` for TerminalReject (a TerminalReject row
+///     should have landed the doc directly in `Rejected`, never in
+///     `ErrorRetryable` — observing it here is a structural breach).
+///
+/// CAS guard `WHERE state = 'ERROR_RETRYABLE'` makes a second
+/// invocation a no-op (idempotent under boot replay).
+pub async fn cas_error_retryable_to_manual_reconciliation(
+    pool: &SqlitePool,
+    doc_id: DocumentId,
+    retry_class_str: &str,
+    severity: crate::db::models::enums::Severity,
+) -> anyhow::Result<bool> {
+    let retry_class_owned = retry_class_str.to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            let cas = sqlx::query(
+                "UPDATE fiscal_documents SET state = 'REQUIRES_MANUAL_RECONCILIATION' \
+                 WHERE document_id = ? AND state = 'ERROR_RETRYABLE'",
+            )
+            .bind(doc_id)
+            .execute(&mut **tx)
+            .await?;
+            if cas.rows_affected() != 1 {
+                return Ok::<bool, anyhow::Error>(false);
+            }
+
+            let payload = serde_json::json!({
+                "document_id": hex_lower(doc_id.as_bytes()),
+                "branch": "c-error-retryable-escalated",
+                "retry_class": retry_class_owned,
+                "rationale":
+                    "ErrorRetryable + non-retryable durable retry_class — operator triage required; no auto-retry per stage_send §4.2",
+            });
+            audit_log::append_tx(
+                tx,
+                "fiscal_document",
+                &hex_lower(doc_id.as_bytes()),
+                "BOOT_ER_ESCALATED_TO_MANUAL",
+                severity,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await?;
+            Ok::<bool, anyhow::Error>(true)
+        })
+    })
+    .await
+}
+
+/// M3a hardening pass 1 — emit a forensic audit for an ER doc held
+/// without state change (ProbeRequired / indeterminate `retry_class`).
+/// No CAS, no DPS — the doc stays in `ErrorRetryable` until M5's
+/// generic SENDING reconciler (ProbeRequired) handles it OR an
+/// operator manually resolves the indeterminate state.
+async fn emit_error_retryable_hold_audit(
+    pool: &SqlitePool,
+    doc_id: DocumentId,
+    event_type: &'static str,
+    severity: crate::db::models::enums::Severity,
+    retry_class_label: &str,
+    rationale: &'static str,
+) -> anyhow::Result<()> {
+    let payload = serde_json::json!({
+        "document_id": hex_lower(doc_id.as_bytes()),
+        "branch": "c-error-retryable-hold",
+        "retry_class": retry_class_label,
+        "rationale": rationale,
+    });
+    audit_log::append(
+        pool,
+        "fiscal_document",
+        &hex_lower(doc_id.as_bytes()),
+        event_type,
+        severity,
+        None,
+        Some(&payload.to_string()),
+    )
+    .await?;
+    Ok(())
+}
+
+/// M3a hardening pass 1 — ER recovery orchestrator.  Reads the
+/// doc's last-attempt `retry_class` from `transport_trace` and
+/// dispatches by class:
+///
+///   - **`TransientRetry`** → `stage_send::run` (Pattern B
+///     `ErrorRetryable → Sending → wire`).  Existing W11 PR-2a
+///     wiring; histogram counter `error_retryable_dispatched`.
+///   - **`FnConfigError` / `WrapperBug` / `OperatorEscalation` /
+///     `MacRecovery`** → CAS `ErrorRetryable →
+///     RequiresManualReconciliation` (Severity::Error).
+///     `BOOT_ER_ESCALATED_TO_MANUAL`; counter
+///     `error_retryable_escalated_to_manual`.
+///   - **`TerminalReject`** → same CAS but `Severity::Critical`
+///     (structurally inconsistent: TerminalReject should target
+///     `Rejected` directly, never ER).
+///   - **`ProbeRequired`** → hold; audit `BOOT_ER_PROBE_DEFERRED`
+///     (Severity::Warning); counter `error_retryable_probe_deferred`.
+///     Submit-time `last_chk` reconciliation is deferred to M5 per
+///     PRRO_GATE-6bj M3a closure annotation.
+///   - **`None` (missing / unknown / pre-migration-012 NULL)** →
+///     hold; audit `BOOT_ER_RETRY_CLASS_INDETERMINATE`
+///     (Severity::Error — durable evidence missing); counter
+///     `error_retryable_indeterminate_deferred`.
+///
+/// **Why the filter is mandatory.**  `stage_send::run`'s module
+/// docs (lines 33-40) explicitly call out that calling `run`
+/// repeatedly on a non-`TransientRetry` ER doc produces an
+/// unbounded crash-loop: same envelope, same server reply, same
+/// `ErrorRetryable` landing.  This dispatcher implements the
+/// "tests + ops scripts MUST manually filter" guidance the W7
+/// design freeze flagged.
+async fn dispatch_error_retryable_by_class(
+    pool: &SqlitePool,
+    deps: &super::RuntimeView<'_>,
+    doc: &crate::db::repositories::fiscal_documents::DocumentRow,
+    histogram: &mut DispatchHistogram,
+) -> anyhow::Result<()> {
+    use crate::db::repositories::transport_trace as tt;
+    use crate::services::write_path::error_routing::RetryClass;
+
+    let doc_id = doc.document_id;
+
+    let retry_class = tt::last_attempt_retry_class_for(pool, doc_id).await?;
+
+    match retry_class {
+        Some(RetryClass::TransientRetry) => {
+            match stage_send::run(pool, deps.dps, doc_id, Some(deps.signing_ctx)).await {
+                Ok(_) => histogram.error_retryable_dispatched += 1,
+                Err(e) => {
+                    emit_dispatch_error(
+                        pool,
+                        doc_id,
+                        "c-error-retryable-transient",
+                        &anyhow::Error::new(e),
+                        histogram,
+                    )
+                    .await?
+                }
+            }
+        }
+        Some(rc @ (RetryClass::FnConfigError
+        | RetryClass::WrapperBug
+        | RetryClass::OperatorEscalation
+        | RetryClass::MacRecovery)) => {
+            match cas_error_retryable_to_manual_reconciliation(
+                pool,
+                doc_id,
+                rc.as_str(),
+                crate::db::models::enums::Severity::Error,
+            )
+            .await
+            {
+                Ok(_) => histogram.error_retryable_escalated_to_manual += 1,
+                Err(e) => {
+                    emit_dispatch_error(
+                        pool,
+                        doc_id,
+                        "c-error-retryable-escalate",
+                        &e,
+                        histogram,
+                    )
+                    .await?
+                }
+            }
+        }
+        Some(RetryClass::TerminalReject) => {
+            // Structurally inconsistent: TerminalReject targets `Rejected`
+            // directly per `error_routing::route_dps_error`; an ER doc
+            // tagged TerminalReject is durable evidence of a routing /
+            // CAS skew.  Escalate with CRITICAL severity.
+            match cas_error_retryable_to_manual_reconciliation(
+                pool,
+                doc_id,
+                RetryClass::TerminalReject.as_str(),
+                crate::db::models::enums::Severity::Critical,
+            )
+            .await
+            {
+                Ok(_) => histogram.error_retryable_escalated_to_manual += 1,
+                Err(e) => {
+                    emit_dispatch_error(
+                        pool,
+                        doc_id,
+                        "c-error-retryable-terminal-inconsistent",
+                        &e,
+                        histogram,
+                    )
+                    .await?
+                }
+            }
+        }
+        Some(RetryClass::ProbeRequired) => {
+            match emit_error_retryable_hold_audit(
+                pool,
+                doc_id,
+                "BOOT_ER_PROBE_DEFERRED",
+                crate::db::models::enums::Severity::Warning,
+                RetryClass::ProbeRequired.as_str(),
+                "ProbeRequired retry_class — submit-time last_chk reconciliation deferred to M5 generic SENDING reconciler (per PRRO_GATE-6bj M3a annotation); doc stays in ERROR_RETRYABLE",
+            )
+            .await
+            {
+                Ok(_) => histogram.error_retryable_probe_deferred += 1,
+                Err(e) => {
+                    emit_dispatch_error(
+                        pool,
+                        doc_id,
+                        "c-error-retryable-probe",
+                        &e,
+                        histogram,
+                    )
+                    .await?
+                }
+            }
+        }
+        None => {
+            // Durable retry_class is missing / unknown / pre-migration-012
+            // NULL — recovery has no evidence to choose a class.  Per
+            // `RetryClass::from_wire_str` contract (`error_routing.rs:125-140`),
+            // None is treated as "indeterminate from durable evidence",
+            // forwarded to manual triage rather than auto-retried.
+            match emit_error_retryable_hold_audit(
+                pool,
+                doc_id,
+                "BOOT_ER_RETRY_CLASS_INDETERMINATE",
+                crate::db::models::enums::Severity::Error,
+                "<none>",
+                "ER doc has no durable retry_class (transport_trace row missing OR retry_class NULL/unknown); operator triage required; doc stays in ERROR_RETRYABLE",
+            )
+            .await
+            {
+                Ok(_) => histogram.error_retryable_indeterminate_deferred += 1,
+                Err(e) => {
+                    emit_dispatch_error(
+                        pool,
+                        doc_id,
+                        "c-error-retryable-indeterminate",
+                        &e,
+                        histogram,
+                    )
+                    .await?
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Tiny ISO-8601 helper for `last_chk` wire-time capture.  Uses
 /// `chrono::Utc::now()` — same source the W7 stage_send wire-time
 /// path uses.  Lives here (not in a shared module) because boot
@@ -1276,7 +1600,7 @@ fn iso8601_now() -> String {
 /// appropriate arm.
 async fn dispatch_prepared_via_chain(
     pool: &SqlitePool,
-    deps: &super::ReconciliationRuntime<'_>,
+    deps: &super::RuntimeView<'_>,
     doc: &crate::db::repositories::fiscal_documents::DocumentRow,
     histogram: &mut DispatchHistogram,
 ) -> anyhow::Result<()> {
@@ -1294,6 +1618,14 @@ async fn dispatch_prepared_via_chain(
     // need to be `'static`).
     let doc_type_copy = doc.doc_type;
 
+    // M3a hardening pass 1 — Patch 3 (PREPARED replay drift detection).
+    // The snapshot envelope cross-checks `fiscal_documents` row against
+    // its matching `ingress_inbox` row (per stage_acquire step 1b at
+    // `stage_acquire.rs:58-89`).  On any mismatch, return the `Drift`
+    // outcome WITHOUT proceeding to stage_sign; the caller emits a
+    // CRITICAL audit + holds the doc in PREPARED.  Live `stage_acquire`
+    // already fail-closes on drift at first ingress; recovery
+    // re-asserts the same invariant on every boot tick.
     type PreparedInputs = (
         CanonicalFiscalCommand,
         InboxRow,
@@ -1301,14 +1633,31 @@ async fn dispatch_prepared_via_chain(
         Option<shifts::ShiftRow>,
     );
 
+    enum SnapshotOutcome {
+        // PreparedInputs is large (≈ 250 bytes — InboxRow + NodeStateRow +
+        // optional ShiftRow); box the success variant to keep the enum
+        // discriminant cheap (clippy::large_enum_variant).
+        Ok(Box<PreparedInputs>),
+        Drift {
+            fd_fiscal_number: String,
+            inbox_fiscal_number: String,
+            fd_payload_sha_hex: String,
+            inbox_payload_sha_hex: String,
+            fd_doc_type: String,
+            inbox_operation_type: String,
+        },
+    }
+
     // (1) Atomic snapshot — fiscal_documents extras + inbox + node_state
     // + active_shift, all inside one short `with_immediate` envelope.
     // No foreign IO; W3 invariant preserved.
-    let inputs_result: anyhow::Result<PreparedInputs> = with_immediate(pool, move |tx| {
+    let inputs_result: anyhow::Result<SnapshotOutcome> = with_immediate(pool, move |tx| {
         Box::pin(async move {
-            // (1a) Read payload columns + request_id from fiscal_documents.
+            // (1a) Read payload columns + request_id + fiscal_number
+            // from fiscal_documents (fiscal_number additionally needed
+            // for the drift cross-check against inbox row).
             let fd_row = sqlx::query(
-                "SELECT request_id, business_ts, total_sum_kop, payload_json, \
+                "SELECT request_id, fiscal_number, business_ts, total_sum_kop, payload_json, \
                         payload_sha256_canonical \
                  FROM fiscal_documents WHERE document_id = ?",
             )
@@ -1319,6 +1668,7 @@ async fn dispatch_prepared_via_chain(
             let request_id: [u8; 16] = request_id_v.as_slice().try_into().map_err(|_| {
                 anyhow::anyhow!("fiscal_documents.request_id length != 16 for doc {doc_id:?}")
             })?;
+            let fd_fiscal_number: String = fd_row.try_get("fiscal_number")?;
             let business_ts: String = fd_row.try_get("business_ts")?;
             let total_sum_kop: Option<i64> = fd_row.try_get("total_sum_kop")?;
             let payload_json: String = fd_row.try_get("payload_json")?;
@@ -1367,6 +1717,30 @@ async fn dispatch_prepared_via_chain(
                 received_at: inbox_row_db.try_get("received_at")?,
             };
 
+            // M3a hardening pass 1 — Patch 3 (drift cross-check).
+            // stage_acquire step 1b establishes the invariant at first
+            // ingress: `(fd.fiscal_number, fd.payload_sha256_canonical,
+            // fd.doc_type)` MUST equal `(inbox.fiscal_number,
+            // inbox.payload_sha256_canonical, inbox.operation_type)`.
+            // Recovery re-asserts the same invariant on every boot
+            // tick.  Drift = DB corruption, hand-edit, OR migration
+            // artifact — never a business-level reject.  Fail-closed
+            // hold pattern: return `Drift` outcome (no state mutation,
+            // no sign/send invocation); caller emits CRITICAL audit.
+            let drift = fd_fiscal_number != inbox_row.fiscal_number
+                || payload_sha != inbox_row.payload_sha256_canonical
+                || doc_type_copy.as_str() != inbox_row.operation_type;
+            if drift {
+                return Ok::<SnapshotOutcome, anyhow::Error>(SnapshotOutcome::Drift {
+                    fd_fiscal_number,
+                    inbox_fiscal_number: inbox_row.fiscal_number.clone(),
+                    fd_payload_sha_hex: hex_lower(&payload_sha),
+                    inbox_payload_sha_hex: hex_lower(&inbox_row.payload_sha256_canonical),
+                    fd_doc_type: doc_type_copy.as_str().to_string(),
+                    inbox_operation_type: inbox_row.operation_type.clone(),
+                });
+            }
+
             // (1c) Read node_state via the tx-bound repo helper.
             let ns = node_state::get_tx(tx, &fn_id_for_read)
                 .await?
@@ -1395,13 +1769,57 @@ async fn dispatch_prepared_via_chain(
                 payload_sha256_canonical: payload_sha,
             };
 
-            Ok::<PreparedInputs, anyhow::Error>((command, inbox_row, ns, active_shift))
+            Ok::<SnapshotOutcome, anyhow::Error>(SnapshotOutcome::Ok(Box::new((
+                command,
+                inbox_row,
+                ns,
+                active_shift,
+            ))))
         })
     })
     .await;
 
     let (command, inbox, node_state, active_shift) = match inputs_result {
-        Ok(t) => t,
+        Ok(SnapshotOutcome::Ok(boxed)) => *boxed,
+        Ok(SnapshotOutcome::Drift {
+            fd_fiscal_number,
+            inbox_fiscal_number,
+            fd_payload_sha_hex,
+            inbox_payload_sha_hex,
+            fd_doc_type,
+            inbox_operation_type,
+        }) => {
+            // M3a hardening pass 1 — Patch 3.  Drift between
+            // fiscal_documents and ingress_inbox detected; emit
+            // CRITICAL audit + counter += 1, doc stays in PREPARED,
+            // no sign/send invoked.  Operator manual intervention
+            // required (drift is corruption / migration artifact;
+            // recovery cannot decide direction safely).
+            let payload = serde_json::json!({
+                "document_id": hex_lower(doc_id.as_bytes()),
+                "branch": "c-prepared-replay-drift",
+                "fd_fiscal_number": fd_fiscal_number,
+                "inbox_fiscal_number": inbox_fiscal_number,
+                "fd_payload_sha256_canonical_hex": fd_payload_sha_hex,
+                "inbox_payload_sha256_canonical_hex": inbox_payload_sha_hex,
+                "fd_doc_type": fd_doc_type,
+                "inbox_operation_type": inbox_operation_type,
+                "rationale":
+                    "fiscal_documents ↔ ingress_inbox drift (mismatch on fiscal_number / payload_sha256_canonical / doc_type vs operation_type); recovery holds doc in PREPARED — operator triage required",
+            });
+            audit_log::append(
+                pool,
+                "fiscal_document",
+                &hex_lower(doc_id.as_bytes()),
+                "BOOT_PREPARED_REPLAY_DRIFT",
+                crate::db::models::enums::Severity::Critical,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await?;
+            histogram.prepared_replay_drift_deferred += 1;
+            return Ok(());
+        }
         Err(e) => {
             // Snapshot read failed — emit dispatch_error and bail
             // without further state mutation; doc stays in PREPARED.
@@ -1475,7 +1893,7 @@ async fn dispatch_prepared_via_chain(
 async fn dispatch_pending_doc(
     pool: &SqlitePool,
     doc: &crate::db::repositories::fiscal_documents::DocumentRow,
-    deps: Option<&super::ReconciliationRuntime<'_>>,
+    deps: Option<&super::RuntimeView<'_>>,
     histogram: &mut DispatchHistogram,
 ) -> anyhow::Result<()> {
     use crate::db::models::enums::DocState;
@@ -1585,19 +2003,7 @@ async fn dispatch_pending_doc(
             }
         },
         DocState::ErrorRetryable => match deps {
-            Some(d) => match stage_send::run(pool, d.dps, doc_id, Some(d.signing_ctx)).await {
-                Ok(_) => histogram.error_retryable_dispatched += 1,
-                Err(e) => {
-                    emit_dispatch_error(
-                        pool,
-                        doc_id,
-                        "c-error-retryable",
-                        &anyhow::Error::new(e),
-                        histogram,
-                    )
-                    .await?
-                }
-            },
+            Some(d) => dispatch_error_retryable_by_class(pool, d, doc, histogram).await?,
             None => {
                 emit_ctx_needy_deferred(pool, doc_id, doc.state, deps_available).await?;
                 histogram.error_retryable_deferred += 1;
