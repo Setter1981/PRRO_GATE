@@ -196,7 +196,7 @@ Unchanged from M3-W0 §3.5: `OPERATIONS.md` runbooks (backup / restore / key rot
 
 ### 6.1 User approval of M3a exit posture (this document §1–§5)
 
-The PR ladder, test surface, closed contracts, and bd-closure mapping are PROPOSED — they become committed M3a closure only after explicit user GO.  Approval can be all-or-nothing or per-section; deferred items stay flagged and the corresponding M3b prep tasks fall out of scope.
+The PR ladder, test surface, closed contracts, and bd-closure mapping in §1–§5 are the committed M3a closure baseline after PR #37–#42.  Remaining items in §5 are explicit carry-forward scope, not blockers for opening the M3b implementation plan unless called out as pilot/production prerequisites.
 
 ### 6.2 bd hygiene
 
