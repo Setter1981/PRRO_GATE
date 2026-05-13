@@ -203,18 +203,18 @@ impl App {
     /// committed (each per-FN `with_immediate` envelope is atomic);
     /// the summary that would have been returned is discarded.
     ///
-    /// **Ctx-needy dispatch deferral (W9.3).**  Per-DocState
+    /// **Ctx-needy dispatch deferral on this entry.**  Per-DocState
     /// dispatches that require `DpsChannel` / `SigningContext`
     /// (PREPARED / SIGNED / SENT / ERROR_RETRYABLE) emit
     /// `BOOT_DISPATCH_DEFERRED` audit and leave the doc in its source
-    /// state.  Runtime composition (W11) lands via
-    /// [`reconcile_pending_with`] — that entry point accepts a
-    /// [`ReconciliationRuntime`] which carries `DpsChannel` +
-    /// `SigningContext`.  PR-1a plumbs the new entry; PR-2 wires the
-    /// four ctx-needy arms.  Until PR-2 lands, even
-    /// `reconcile_pending_with` emits `BOOT_DISPATCH_DEFERRED` for
-    /// those four states, but with `deps_available: true` in the
-    /// audit payload (vs `false` from this ctx-free path).
+    /// state when invoked through `reconcile_pending` (ctx-free entry).
+    /// Runtime composition lands via [`reconcile_pending_with`] —
+    /// that entry point accepts a [`ReconciliationRuntime`] resolver
+    /// that the dispatcher consults per FN to drive the ctx-needy
+    /// arms forward.  Use this entry only for ctx-free recovery
+    /// (e.g. test harnesses or operator probes that do not need to
+    /// touch DPS / crypto); production boot should call
+    /// [`reconcile_pending_with`] with the operator-bound runtime.
     ///
     /// [`reconcile_pending_with`]: Self::reconcile_pending_with
     /// [`ReconciliationRuntime`]: crate::services::reconciliation::ReconciliationRuntime
@@ -222,21 +222,37 @@ impl App {
         self.reconcile_pending_inner(None).await
     }
 
-    /// W11 runtime-composed boot reconciliation.  Accepts a
-    /// [`ReconciliationRuntime`] carrying the `DpsChannel` and
-    /// `SigningContext` that ctx-needy dispatch arms (PREPARED /
-    /// SIGNED / SENT / ERROR_RETRYABLE) require.
+    /// Runtime-composed boot reconciliation.  Accepts a
+    /// [`ReconciliationRuntime`] resolver that the dispatcher calls
+    /// per FN to obtain the `DpsChannel` / `SigningContext` /
+    /// `CheckSignBlob` bundle ([`RuntimeView`]) for each FN.
     ///
-    /// PR-1a (W11) ships the plumbing.  PR-1b adds the KVT2 / KVT1
-    /// fixture proofs (those branches are already ctx-free in W9 —
-    /// they consume only `pool + doc_id`).  PR-2 wires the four
-    /// ctx-needy arms to consume `deps`.
+    /// **Per-FN resolver contract (M3a hardening pass 1).**  Inside
+    /// [`reconcile_pending_inner`], for each FN under recovery,
+    /// `deps.resolve(&fn_id)` is invoked BEFORE
+    /// `run_boot_reconciliation`.  The dispatcher threads
+    /// `Option<&RuntimeView>` (not `Option<&ReconciliationRuntime>`)
+    /// through the dispatch tree.  `resolve` returning `None` for an
+    /// FN with ctx-needy pending docs falls through to the legacy
+    /// ctx-free path (emits `BOOT_DISPATCH_DEFERRED`); recovery
+    /// NEVER substitutes foreign identity.
     ///
-    /// Under PR-1a, calling `reconcile_pending_with` is observationally
-    /// identical to [`reconcile_pending`] for the four ctx-needy
-    /// states — both emit `BOOT_DISPATCH_DEFERRED` — but the audit
-    /// payload carries `deps_available: true`, providing operator
-    /// trace of which boot tick had the runtime composition in place.
+    /// **Dispatch surface.**  Under this entry:
+    ///   - PREPARED → `dispatch_prepared_via_chain` (snapshot
+    ///     envelope + `stage_sign::run` → `stage_send::run`).
+    ///     Drift between `fiscal_documents` and `ingress_inbox`
+    ///     emits `BOOT_PREPARED_REPLAY_DRIFT` CRITICAL and holds.
+    ///   - SIGNED → `stage_send::run` (Pattern B SENDING marker).
+    ///   - SENT → `dispatch_sent_via_probe` (3-way `last_chk`
+    ///     classification: Match → KVT1, Mismatch → RM, NotFound →
+    ///     ER tick-1 of two-tick retry).
+    ///   - ERROR_RETRYABLE → `dispatch_error_retryable_by_class`
+    ///     reads durable `retry_class` from `transport_trace` and
+    ///     routes: TransientRetry → `stage_send::run`;
+    ///     FnConfigError / WrapperBug / OperatorEscalation /
+    ///     MacRecovery / TerminalReject → CAS to
+    ///     RequiresManualReconciliation; ProbeRequired and None →
+    ///     hold without state change.
     ///
     /// Per ADR-M3-A10: under the global-single-writer invariant, this
     /// call holds the dispatcher task for the duration of one boot
@@ -244,7 +260,9 @@ impl App {
     /// not supported.
     ///
     /// [`reconcile_pending`]: Self::reconcile_pending
+    /// [`reconcile_pending_inner`]: Self::reconcile_pending_inner
     /// [`ReconciliationRuntime`]: crate::services::reconciliation::ReconciliationRuntime
+    /// [`RuntimeView`]: crate::services::reconciliation::RuntimeView
     pub async fn reconcile_pending_with<'a>(
         &self,
         deps: crate::services::reconciliation::ReconciliationRuntime<'a>,
@@ -265,19 +283,32 @@ impl App {
             .map_err(BootError::Database)?;
         let mut summary = ReconciliationSummary::default();
         for fn_cfg in &fns {
+            // M3a hardening pass 1: resolve per-FN RuntimeView BEFORE
+            // dispatching.  `ReconciliationRuntime::resolve` returns
+            // `Some(view)` only when the caller's resolver acknowledges
+            // a binding for this specific FN; `None` falls through to
+            // the ctx-free path (emits `BOOT_DISPATCH_DEFERRED` for any
+            // ctx-needy pending docs).  Recovery NEVER substitutes
+            // foreign identity — see `runtime::ReconciliationRuntime`
+            // doc-comment.
+            let per_fn_view = deps.and_then(|r| r.resolve(&fn_cfg.fiscal_number));
             // MED-B fix (cycle-2): route per-FN failures through
             // ReconciliationFailed which preserves `fiscal_number`
             // attribution + `source` anyhow::Error chain.  Only raw
             // sqlx::Error downcasts to Database (existing pattern).
-            let outcome = boot_phase::run_boot_reconciliation(pool, &fn_cfg.fiscal_number, deps)
-                .await
-                .map_err(|e| match e.downcast::<sqlx::Error>() {
-                    Ok(sqlx_err) => BootError::Database(sqlx_err),
-                    Err(other) => BootError::ReconciliationFailed {
-                        fiscal_number: fn_cfg.fiscal_number.clone(),
-                        source: other,
-                    },
-                })?;
+            let outcome = boot_phase::run_boot_reconciliation(
+                pool,
+                &fn_cfg.fiscal_number,
+                per_fn_view.as_ref(),
+            )
+            .await
+            .map_err(|e| match e.downcast::<sqlx::Error>() {
+                Ok(sqlx_err) => BootError::Database(sqlx_err),
+                Err(other) => BootError::ReconciliationFailed {
+                    fiscal_number: fn_cfg.fiscal_number.clone(),
+                    source: other,
+                },
+            })?;
             if let BranchOutcome::OfflineRefusal { .. } = outcome {
                 return Err(BootError::OfflineModeRefusal {
                     fiscal_number: fn_cfg.fiscal_number.clone(),

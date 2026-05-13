@@ -35,7 +35,7 @@ use async_trait::async_trait;
 
 use prro::config::AppConfig;
 use prro::db::models::ids::DocumentId;
-use prro::services::reconciliation::ReconciliationRuntime;
+use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
 use prro::transports::dps::error::DpsError;
@@ -301,11 +301,11 @@ async fn fixture_3_sending_crash_pattern_b_no_resend() {
     );
     let signing_ctx = det_signing_ctx();
     let fn_sign = dummy_fn_sign();
-    let deps = ReconciliationRuntime {
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
         dps: &stub,
         signing_ctx: &signing_ctx,
         fn_sign: &fn_sign,
-    };
+    });
 
     app.reconcile_pending_with(deps)
         .await
@@ -371,11 +371,11 @@ async fn fixture_7_kvt1_crash_passive_hold_no_dps() {
     );
     let signing_ctx = det_signing_ctx();
     let fn_sign = dummy_fn_sign();
-    let deps = ReconciliationRuntime {
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
         dps: &stub,
         signing_ctx: &signing_ctx,
         fn_sign: &fn_sign,
-    };
+    });
 
     app.reconcile_pending_with(deps)
         .await
@@ -467,11 +467,11 @@ async fn fixture_8_kvt2_crash_no_dps_query() {
     );
     let signing_ctx = det_signing_ctx();
     let fn_sign = dummy_fn_sign();
-    let deps = ReconciliationRuntime {
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
         dps: &stub,
         signing_ctx: &signing_ctx,
         fn_sign: &fn_sign,
-    };
+    });
 
     app.reconcile_pending_with(deps)
         .await
@@ -595,11 +595,11 @@ async fn fixture_2_signed_crash_replays_to_sent_one_send_chk() {
     let stub = StubDpsChannel::new(Ok(ack("server-fiscal-sent-22")));
     let signing_ctx = det_signing_ctx();
     let fn_sign = dummy_fn_sign();
-    let deps = ReconciliationRuntime {
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
         dps: &stub,
         signing_ctx: &signing_ctx,
         fn_sign: &fn_sign,
-    };
+    });
 
     let summary = app
         .reconcile_pending_with(deps)
@@ -669,6 +669,24 @@ async fn fixture_9_error_retryable_retries_without_mac_counter_burn() {
     seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
     let doc = seed_doc_with_signed_xml(app.db(), fn_id, 0x99, "ERROR_RETRYABLE").await;
 
+    // M3a hardening pass 1 — seed durable retry_class evidence.  The
+    // new `dispatch_error_retryable_by_class` dispatcher routes ER
+    // docs by their last-attempt `retry_class`; without a
+    // transport_trace row the dispatcher would hold the doc as
+    // indeterminate.  This fixture's intent (happy retry without
+    // MAC budget burn) requires `TransientRetry` to invoke
+    // stage_send::run.
+    //
+    // **Boundary note (H2 closure boundary).**  `seed_completed_
+    // transport_trace` writes exactly one row (`attempt_no=1`); the
+    // H2 budget cap fires only when
+    // `transport_trace::attempts_used(doc) >= MAX_BOOT_ATTEMPTS`
+    // (=5).  1 < 5, so the TransientRetry arm proceeds to
+    // stage_send::run as designed.  Fixture #9g covers the
+    // budget-exhausted case (5 seeded attempts).
+    seed_completed_transport_trace(app.db(), doc, "RETRYABLE_TRANSPORT", Some("TransientRetry"))
+        .await;
+
     // Pre-state sanity — MAC budget starts at 0 (no prior recovery).
     assert_eq!(
         read_mac_recovery_attempts(app.db(), doc).await,
@@ -679,11 +697,11 @@ async fn fixture_9_error_retryable_retries_without_mac_counter_burn() {
     let stub = StubDpsChannel::new(Ok(ack("server-fiscal-retry-99")));
     let signing_ctx = det_signing_ctx();
     let fn_sign = dummy_fn_sign();
-    let deps = ReconciliationRuntime {
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
         dps: &stub,
         signing_ctx: &signing_ctx,
         fn_sign: &fn_sign,
-    };
+    });
 
     let summary = app
         .reconcile_pending_with(deps)
@@ -891,6 +909,51 @@ async fn count_transport_trace(pool: &SqlitePool, doc: DocumentId) -> i64 {
         .expect("count transport_trace rows")
 }
 
+/// Seed a completed `transport_trace` row with a specific durable
+/// `retry_class`.  Used by ER recovery fixtures to drive the new
+/// `dispatch_error_retryable_by_class` dispatcher.  Default fields
+/// match a minimal "happy enough" attempt that already completed:
+/// `attempt_no=1`, `outcome_kind` provided by caller, dummy
+/// `request_envelope_sha256`.
+async fn seed_completed_transport_trace(
+    pool: &SqlitePool,
+    doc: DocumentId,
+    outcome_kind: &str,
+    retry_class: Option<&str>,
+) {
+    seed_completed_transport_trace_at_attempt(pool, doc, 1, outcome_kind, retry_class).await;
+}
+
+/// Seed a completed `transport_trace` row at a specific
+/// `attempt_no`.  H2 budget-cap fixtures seed multiple rows
+/// (`attempt_no = 1..=N`) so `transport_trace::attempts_used`
+/// returns the total count and the dispatcher trips the
+/// `MAX_BOOT_ATTEMPTS` cap.
+async fn seed_completed_transport_trace_at_attempt(
+    pool: &SqlitePool,
+    doc: DocumentId,
+    attempt_no: i32,
+    outcome_kind: &str,
+    retry_class: Option<&str>,
+) {
+    let envelope_sha = vec![0u8; 32];
+    sqlx::query(
+        "INSERT INTO transport_trace (document_id, attempt_no, backend_profile_id, \
+            transport_profile_id, request_envelope_sha256, completed_at, \
+            wire_call_started_at, wire_call_finished_at, outcome_kind, retry_class) \
+         VALUES (?, ?, 'b1', 't1', ?, '2026-04-22T12:00:00Z', \
+            '2026-04-22T12:00:00Z', '2026-04-22T12:00:01Z', ?, ?)",
+    )
+    .bind(doc)
+    .bind(attempt_no)
+    .bind(&envelope_sha)
+    .bind(outcome_kind)
+    .bind(retry_class)
+    .execute(pool)
+    .await
+    .expect("seed transport_trace row");
+}
+
 async fn read_server_fiscal_no(pool: &SqlitePool, doc: DocumentId) -> Option<String> {
     sqlx::query_scalar("SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?")
         .bind(doc)
@@ -934,11 +997,11 @@ async fn fixture_4_sent_last_chk_match_advances_to_kvt1() {
     })]);
     let signing_ctx = det_signing_ctx();
     let fn_sign = dummy_fn_sign();
-    let deps = ReconciliationRuntime {
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
         dps: &stub,
         signing_ctx: &signing_ctx,
         fn_sign: &fn_sign,
-    };
+    });
 
     let summary = app
         .reconcile_pending_with(deps)
@@ -1059,11 +1122,11 @@ async fn fixture_5_sent_last_chk_mismatch_to_manual_reconciliation() {
     })]);
     let signing_ctx = det_signing_ctx();
     let fn_sign = dummy_fn_sign();
-    let deps = ReconciliationRuntime {
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
         dps: &stub,
         signing_ctx: &signing_ctx,
         fn_sign: &fn_sign,
-    };
+    });
 
     let summary = app
         .reconcile_pending_with(deps)
@@ -1172,11 +1235,11 @@ async fn fixture_6_sent_last_chk_notfound_two_tick_retry_path() {
     let tick1_stub = RecoveryDpsStub::for_last_chk(vec![Err(DpsError::NotFound)]);
     let signing_ctx = det_signing_ctx();
     let fn_sign = dummy_fn_sign();
-    let tick1_deps = ReconciliationRuntime {
+    let tick1_deps = ReconciliationRuntime::single_fn(RuntimeView {
         dps: &tick1_stub,
         signing_ctx: &signing_ctx,
         fn_sign: &fn_sign,
-    };
+    });
 
     let tick1_summary = app
         .reconcile_pending_with(tick1_deps)
@@ -1255,11 +1318,11 @@ async fn fixture_6_sent_last_chk_notfound_two_tick_retry_path() {
         id_sign: vec![],
         data_sign: vec![],
     })]);
-    let tick2_deps = ReconciliationRuntime {
+    let tick2_deps = ReconciliationRuntime::single_fn(RuntimeView {
         dps: &tick2_stub,
         signing_ctx: &signing_ctx,
         fn_sign: &fn_sign,
-    };
+    });
 
     let tick2_summary = app
         .reconcile_pending_with(tick2_deps)
@@ -1458,11 +1521,11 @@ async fn fixture_1_prepared_crash_replays_to_sent_via_sign_send_chain() {
     let stub = StubDpsChannel::new(Ok(ack("server-fiscal-prepared-11")));
     let signing_ctx = det_signing_ctx();
     let fn_sign = dummy_fn_sign();
-    let deps = ReconciliationRuntime {
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
         dps: &stub,
         signing_ctx: &signing_ctx,
         fn_sign: &fn_sign,
-    };
+    });
 
     let summary = app
         .reconcile_pending_with(deps)
@@ -1534,5 +1597,647 @@ async fn fixture_1_prepared_crash_replays_to_sent_via_sign_send_chain() {
         server_fiscal_no.as_deref(),
         Some("server-fiscal-prepared-11"),
         "transport_trace records the wire-returned server_fiscal_no"
+    );
+}
+
+// ─── M3a hardening pass 1 — per-FN resolver multi-FN proof ─────────────
+//
+// Closes HIGH #2 (singleton deps risk).  Proves the resolver shape:
+// two FNs with distinct fn_sign blobs, each in SENT crash-recovery,
+// resolved to its own RuntimeView at dispatch time.  A per-FN stub
+// records which fn_sign blob `last_chk` received per call; the
+// fixture asserts FN-A's recovery used fn_sign-A and FN-B's used
+// fn_sign-B.
+
+/// Records the fn_sign blob bytes per `last_chk` call so the
+/// fixture can prove the per-FN resolver delivered the right
+/// identity to each recovery branch.  The scripted response queue
+/// drives `last_chk` outcomes; `send_chk` is panic-armed because
+/// SENT probe recovery must NEVER fire a resend.
+struct PerFnRecordingDpsStub {
+    recorded_blobs: Mutex<Vec<Vec<u8>>>,
+    scripted: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
+}
+
+impl PerFnRecordingDpsStub {
+    fn new(responses: Vec<Result<CheckAck, DpsError>>) -> Self {
+        Self {
+            recorded_blobs: Mutex::new(Vec::new()),
+            scripted: Mutex::new(responses.into()),
+        }
+    }
+
+    fn recorded_fn_signs(&self) -> Vec<Vec<u8>> {
+        self.recorded_blobs.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl DpsChannel for PerFnRecordingDpsStub {
+    async fn send_chk(&self, _envelope: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        panic!("PerFnRecordingDpsStub: send_chk must not fire during SENT probe recovery")
+    }
+
+    async fn last_chk(&self, blob: &CheckSignBlob) -> Result<CheckAck, DpsError> {
+        self.recorded_blobs.lock().unwrap().push(blob.0.clone());
+        self.scripted
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("PerFnRecordingDpsStub.last_chk queue empty")
+    }
+
+    async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        unreachable!("PerFnRecordingDpsStub: ping not exercised");
+    }
+    async fn status_rro(&self, _: &CheckSignBlob) -> Result<StatusSnapshot, DpsError> {
+        unreachable!("PerFnRecordingDpsStub: status_rro not exercised");
+    }
+    async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
+        unreachable!("PerFnRecordingDpsStub: info_rro not exercised");
+    }
+}
+
+#[tokio::test]
+async fn multi_fn_reconcile_pending_with_resolves_runtime_per_fn() {
+    let (_dir, app) = fresh_app().await;
+    let fn_a = "1111111110";
+    let fn_b = "2222222220";
+
+    // Seed both FNs as registered + both with SENT crash-resume
+    // pending docs and the persisted server_fiscal_no required by
+    // the SENT probe path.
+    seed_fn_config(app.db(), fn_a).await;
+    seed_fn_config(app.db(), fn_b).await;
+    seed_node_state(app.db(), fn_a, "ONLINE", "CLOSED", 1).await;
+    seed_node_state(app.db(), fn_b, "ONLINE", "CLOSED", 1).await;
+    let doc_a = seed_doc_sent_with_server_fiscal_no(app.db(), fn_a, 0xAA, "fiscal-A").await;
+    let doc_b = seed_doc_sent_with_server_fiscal_no(app.db(), fn_b, 0xBB, "fiscal-B").await;
+
+    // Two distinct fn_sign blobs.  In production each blob is the
+    // operator DPS identity for that FN; in this test we just need
+    // them to be byte-distinguishable so the recording stub can
+    // prove the resolver delivered the right one per FN.
+    let fn_sign_a = CheckSignBlob(vec![0xA1u8; 8]);
+    let fn_sign_b = CheckSignBlob(vec![0xB2u8; 8]);
+
+    let stub_a = PerFnRecordingDpsStub::new(vec![Ok(CheckAck {
+        id: "fiscal-A".into(),
+        id_sign: vec![],
+        data_sign: vec![0xAA; 32],
+    })]);
+    let stub_b = PerFnRecordingDpsStub::new(vec![Ok(CheckAck {
+        id: "fiscal-B".into(),
+        id_sign: vec![],
+        data_sign: vec![0xBB; 32],
+    })]);
+
+    let signing_ctx = det_signing_ctx();
+
+    // Per-FN resolver: FN-A → (stub_a, fn_sign_a); FN-B → (stub_b,
+    // fn_sign_b); anything else → None (proves the "no foreign
+    // identity" guarantee).
+    let deps = ReconciliationRuntime::with_resolver(|fn_id: &str| -> Option<RuntimeView<'_>> {
+        if fn_id == fn_a {
+            Some(RuntimeView {
+                dps: &stub_a,
+                signing_ctx: &signing_ctx,
+                fn_sign: &fn_sign_a,
+            })
+        } else if fn_id == fn_b {
+            Some(RuntimeView {
+                dps: &stub_b,
+                signing_ctx: &signing_ctx,
+                fn_sign: &fn_sign_b,
+            })
+        } else {
+            None
+        }
+    });
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("multi-FN reconcile_pending_with green");
+
+    // (1) Both docs advanced via probe Match (last_chk returned
+    // the expected ack.id).
+    assert_eq!(
+        doc_state(app.db(), doc_a).await,
+        "KVT1",
+        "FN-A SENT probe Match must drive Sent → KVT1"
+    );
+    assert_eq!(
+        doc_state(app.db(), doc_b).await,
+        "KVT1",
+        "FN-B SENT probe Match must drive Sent → KVT1"
+    );
+
+    // (2) Histogram aggregates both: 2 sent_match_to_kvt1.
+    assert_eq!(
+        summary.docs_advanced.sent_match_to_kvt1, 2,
+        "PR-2b multi-FN: both FNs produce sent_match_to_kvt1"
+    );
+
+    // (3) **Load-bearing**: each FN's stub received exactly one
+    // last_chk call AND that call carried its OWN fn_sign blob.
+    let calls_a = stub_a.recorded_fn_signs();
+    let calls_b = stub_b.recorded_fn_signs();
+    assert_eq!(
+        calls_a.len(),
+        1,
+        "FN-A stub: exactly one last_chk call (its own SENT doc)"
+    );
+    assert_eq!(
+        calls_b.len(),
+        1,
+        "FN-B stub: exactly one last_chk call (its own SENT doc)"
+    );
+    assert_eq!(
+        calls_a[0], fn_sign_a.0,
+        "HIGH #2 closure: FN-A's stub MUST receive fn_sign_a (NOT fn_sign_b — that would be foreign identity leak)"
+    );
+    assert_eq!(
+        calls_b[0], fn_sign_b.0,
+        "HIGH #2 closure: FN-B's stub MUST receive fn_sign_b (NOT fn_sign_a — that would be foreign identity leak)"
+    );
+
+    // (4) Cross-check: blobs are byte-distinguishable, so a false
+    // positive (both ended up with the same blob) is impossible.
+    assert_ne!(
+        fn_sign_a.0, fn_sign_b.0,
+        "fixture pre-condition: fn_sign blobs must differ to be distinguishable"
+    );
+}
+
+// ─── M3a hardening pass 1 — ER retry_class dispatcher fixtures ─────────
+
+// Fixture 9b — FnConfigError (-13/-14) escalation to manual.
+#[tokio::test]
+async fn fixture_9b_er_fn_config_error_escalates_to_manual_reconciliation() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let doc = seed_doc_with_signed_xml(app.db(), fn_id, 0xCB, "ERROR_RETRYABLE").await;
+    seed_completed_transport_trace(app.db(), doc, "REJECTED", Some("FnConfigError")).await;
+
+    let stub = dps_panic_on_any_method(
+        "FnConfigError → manual escalation must NOT touch DPS (Pattern B no-resend)",
+    );
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile green");
+
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "FnConfigError must escalate ER → RequiresManualReconciliation"
+    );
+    assert_eq!(stub.call_count(), 0, "manual escalation: zero DPS calls");
+    assert_eq!(
+        summary.docs_advanced.error_retryable_escalated_to_manual, 1,
+        "histogram: FnConfigError increments escalated counter"
+    );
+    assert_eq!(
+        summary.docs_advanced.error_retryable_dispatched, 0,
+        "TransientRetry dispatch path must NOT fire for FnConfigError"
+    );
+    assert_eq!(
+        audit_count(app.db(), "BOOT_ER_ESCALATED_TO_MANUAL").await,
+        1,
+        "BOOT_ER_ESCALATED_TO_MANUAL audit emitted exactly once"
+    );
+}
+
+// Fixture 9c — ProbeRequired retry_class held without state change.
+#[tokio::test]
+async fn fixture_9c_er_probe_required_defers_with_audit() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let doc = seed_doc_with_signed_xml(app.db(), fn_id, 0xCC, "ERROR_RETRYABLE").await;
+    seed_completed_transport_trace(app.db(), doc, "RETRYABLE_SERVER", Some("ProbeRequired")).await;
+
+    let stub = dps_panic_on_any_method(
+        "ProbeRequired hold must NOT touch DPS (submit-time probe deferred to M5)",
+    );
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile green");
+
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "ERROR_RETRYABLE",
+        "ProbeRequired hold: doc stays in ER, no state change"
+    );
+    assert_eq!(stub.call_count(), 0, "ProbeRequired hold: zero DPS calls");
+    assert_eq!(
+        summary.docs_advanced.error_retryable_probe_deferred, 1,
+        "histogram: ProbeRequired increments probe-deferred counter"
+    );
+    assert_eq!(
+        summary.docs_advanced.error_retryable_escalated_to_manual, 0,
+        "ProbeRequired must NOT escalate to manual (different from FnConfigError)"
+    );
+    assert_eq!(
+        audit_count(app.db(), "BOOT_ER_PROBE_DEFERRED").await,
+        1,
+        "BOOT_ER_PROBE_DEFERRED audit emitted exactly once"
+    );
+}
+
+// Fixture 9d — Indeterminate (missing / NULL / unknown) retry_class held.
+#[tokio::test]
+async fn fixture_9d_er_indeterminate_retry_class_defers_with_audit() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let doc = seed_doc_with_signed_xml(app.db(), fn_id, 0xCD, "ERROR_RETRYABLE").await;
+    // NO transport_trace row seeded → `last_attempt_retry_class_for`
+    // returns None → indeterminate hold.
+
+    let stub =
+        dps_panic_on_any_method("Indeterminate hold must NOT touch DPS (no durable evidence)");
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile green");
+
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "ERROR_RETRYABLE",
+        "Indeterminate hold: doc stays in ER, no state change"
+    );
+    assert_eq!(stub.call_count(), 0, "Indeterminate hold: zero DPS calls");
+    assert_eq!(
+        summary.docs_advanced.error_retryable_indeterminate_deferred, 1,
+        "histogram: indeterminate increments indeterminate-deferred counter"
+    );
+    assert_eq!(
+        summary.docs_advanced.error_retryable_dispatched, 0,
+        "Indeterminate must NOT route to stage_send (would crash-loop)"
+    );
+    assert_eq!(
+        audit_count(app.db(), "BOOT_ER_RETRY_CLASS_INDETERMINATE").await,
+        1,
+        "BOOT_ER_RETRY_CLASS_INDETERMINATE audit emitted exactly once"
+    );
+}
+
+// Fixture 9e — TerminalReject in ER is structurally inconsistent;
+// escalate with CRITICAL severity.
+#[tokio::test]
+async fn fixture_9e_er_terminal_reject_escalates_critical() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let doc = seed_doc_with_signed_xml(app.db(), fn_id, 0xCE, "ERROR_RETRYABLE").await;
+    // Synthetic inconsistency: TerminalReject SHOULD have routed the
+    // doc to Rejected directly per error_routing::route_dps_error,
+    // so observing it in ER is durable evidence of routing/CAS skew.
+    seed_completed_transport_trace(app.db(), doc, "REJECTED", Some("TerminalReject")).await;
+
+    let stub = dps_panic_on_any_method(
+        "TerminalReject in ER is inconsistent durable state — no DPS contact",
+    );
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile green");
+
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "TerminalReject in ER must escalate ER → RequiresManualReconciliation"
+    );
+    assert_eq!(
+        summary.docs_advanced.error_retryable_escalated_to_manual, 1,
+        "histogram: TerminalReject increments escalated counter"
+    );
+    // Verify the audit payload carries Critical severity (operator
+    // alerting on structural-skew vs ordinary operator-triage class).
+    let critical_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'BOOT_ER_ESCALATED_TO_MANUAL' AND severity = 'CRITICAL'",
+    )
+    .fetch_one(app.db())
+    .await
+    .expect("count critical escalation audits");
+    assert_eq!(
+        critical_count, 1,
+        "TerminalReject escalation MUST emit Severity::Critical (structural inconsistency)"
+    );
+}
+
+// Fixture 9f — resolver returns None for an FN with ctx-needy docs:
+// recovery falls through to the deferred path, NO foreign identity
+// substitution.  Closes the "what if resolver yields None" half of
+// HIGH #2.
+#[tokio::test]
+async fn fixture_9f_resolver_none_defers_with_audit() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let doc = seed_doc_with_signed_xml(app.db(), fn_id, 0xCF, "ERROR_RETRYABLE").await;
+    seed_completed_transport_trace(app.db(), doc, "RETRYABLE_TRANSPORT", Some("TransientRetry"))
+        .await;
+
+    // Resolver intentionally returns None for every FN — simulates
+    // the operator not having registered an identity binding for
+    // this FN.  Hardening contract: recovery MUST NOT borrow a
+    // singleton "default" identity; doc falls through to the
+    // deferred path.
+    let deps =
+        ReconciliationRuntime::with_resolver(|_fn_id: &str| -> Option<RuntimeView<'_>> { None });
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile green");
+
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "ERROR_RETRYABLE",
+        "resolver=None: doc stays in ER, no recovery dispatched"
+    );
+    assert_eq!(
+        summary.docs_advanced.error_retryable_deferred, 1,
+        "resolver=None must fall through to legacy deferred path"
+    );
+    assert_eq!(
+        summary.docs_advanced.error_retryable_dispatched, 0,
+        "no TransientRetry dispatch despite class match — deps unavailable"
+    );
+    assert_eq!(
+        summary.docs_advanced.error_retryable_escalated_to_manual, 0,
+        "no escalation either — resolver=None is operator config gap, not durable evidence"
+    );
+    // The deferred audit fires through the existing
+    // emit_ctx_needy_deferred path (deps_available=false).
+    assert_eq!(
+        audit_count(app.db(), "BOOT_DISPATCH_DEFERRED").await,
+        1,
+        "BOOT_DISPATCH_DEFERRED audit fires for ctx-needy doc under resolver=None"
+    );
+}
+
+// ─── M3a hardening pass 1 — PREPARED replay drift fixture ──────────────
+
+#[tokio::test]
+async fn fixture_1b_prepared_replay_drift_holds_with_critical_audit() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    let _shift = seed_open_shift_and_node(app.db(), fn_id).await;
+    let (doc, req_id) = seed_doc_prepared_full(app.db(), fn_id, 0x1B).await;
+
+    // Seed the inbox row with a DIFFERENT payload hash than the doc.
+    // Live stage_acquire would have rejected this combination at
+    // first ingress (command vs inbox mismatch); recovery encounters
+    // it post-hoc only if the DB drifted between sessions.
+    let mismatched_sha = vec![0xEE; 32];
+    let req_slice: &[u8] = &req_id;
+    sqlx::query(
+        "INSERT INTO ingress_inbox(request_id, fiscal_number, protocol, operation_type, \
+            idempotency_key, payload_json, payload_sha256_canonical, status) \
+         VALUES (?, ?, 'REST', 'SELL', ?, ?, ?, 'PROCESSING')",
+    )
+    .bind(req_slice)
+    .bind(fn_id)
+    .bind(format!("idem-{:02x}", req_id[0]))
+    .bind(FIXTURE_1_PAYLOAD_JSON)
+    .bind(&mismatched_sha)
+    .execute(app.db())
+    .await
+    .unwrap();
+
+    let stub = dps_panic_on_any_method("PREPARED drift hold must NOT touch DPS");
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile green");
+
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "PREPARED",
+        "drift detected: doc stays in PREPARED, no sign/send invoked"
+    );
+    assert_eq!(stub.call_count(), 0, "drift hold: zero DPS calls");
+    assert_eq!(
+        summary.docs_advanced.prepared_replay_drift_deferred, 1,
+        "histogram: drift increments prepared_replay_drift_deferred"
+    );
+    assert_eq!(
+        summary.docs_advanced.prepared_dispatched, 0,
+        "drift must NOT proceed to stage_sign + stage_send"
+    );
+    // Verify CRITICAL severity (structural inconsistency, not
+    // business reject).
+    let critical_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'BOOT_PREPARED_REPLAY_DRIFT' AND severity = 'CRITICAL'",
+    )
+    .fetch_one(app.db())
+    .await
+    .expect("count critical drift audits");
+    assert_eq!(
+        critical_count, 1,
+        "BOOT_PREPARED_REPLAY_DRIFT must emit Severity::Critical"
+    );
+    // Sanity: no SIGNED_XML / PAYLOAD_XML created (stage_sign was
+    // never invoked).
+    assert!(
+        read_document_file_kind(app.db(), doc, "SIGNED_XML")
+            .await
+            .is_none(),
+        "stage_sign must NOT run on drift detection"
+    );
+    assert!(
+        read_document_file_kind(app.db(), doc, "PAYLOAD_XML")
+            .await
+            .is_none(),
+        "stage_sign must NOT run on drift detection"
+    );
+}
+
+// ─── M3a hardening pass 1 — H2 closure: TransientRetry budget cap ──────
+//
+// W9 freeze §4.0 declares `MAX_BOOT_ATTEMPTS = 5` (the cap
+// `transport_trace::attempts_used(doc_id) >= MAX_BOOT_ATTEMPTS →
+// escalate to RequiresManualReconciliation`).  Without enforcement
+// at dispatch, an infinitely-failing TransientRetry doc would
+// re-burn `send_chk` on every boot tick forever.  This fixture
+// pins the cap.
+//
+// **Assertions:**
+//   (1) state ER → REQUIRES_MANUAL_RECONCILIATION.
+//   (2) `send_chk_count == 0` — zero DPS contact at budget exhaust.
+//   (3) `BOOT_ER_BUDGET_EXHAUSTED` audit emitted exactly once with
+//       Severity::Error and payload carrying `attempts_used`,
+//       `max_boot_attempts`, `retry_class`.
+//   (4) histogram counter `error_retryable_budget_exhausted == 1`.
+//   (5) `error_retryable_dispatched == 0` — stage_send::run did
+//       NOT fire (budget gate intercepted).
+//   (6) No `BOOT_ER_ESCALATED_TO_MANUAL` audit — that is the
+//       per-class escalation event; budget-exhausted has its own
+//       distinct event type for operator-dashboard separation.
+
+#[tokio::test]
+async fn fixture_9g_er_transient_retry_budget_exhausted_escalates() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let doc = seed_doc_with_signed_xml(app.db(), fn_id, 0x9C, "ERROR_RETRYABLE").await;
+
+    // Seed 5 completed transport_trace rows (attempts 1..=5), each
+    // tagged TransientRetry.  `attempts_used` returns COALESCE(MAX,
+    // 0) = 5; the dispatcher's budget gate (`attempts >= 5`) trips.
+    for attempt in 1..=5 {
+        seed_completed_transport_trace_at_attempt(
+            app.db(),
+            doc,
+            attempt,
+            "RETRYABLE_TRANSPORT",
+            Some("TransientRetry"),
+        )
+        .await;
+    }
+
+    let stub =
+        dps_panic_on_any_method("H2 budget cap: zero DPS contact on TransientRetry budget exhaust");
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile green");
+
+    // (1) State ER → REQUIRES_MANUAL_RECONCILIATION.
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "budget exhausted: ER → RequiresManualReconciliation via CAS"
+    );
+
+    // (2) Zero DPS contact — the gate fires BEFORE stage_send::run.
+    assert_eq!(
+        stub.call_count(),
+        0,
+        "H2: budget-exhausted dispatch must not invoke send_chk"
+    );
+
+    // (3) Distinct budget-exhausted audit emitted once.
+    assert_eq!(
+        audit_count(app.db(), "BOOT_ER_BUDGET_EXHAUSTED").await,
+        1,
+        "BOOT_ER_BUDGET_EXHAUSTED audit fires exactly once"
+    );
+    // Severity::Error per design (operator triage needed; not a
+    // structural breach — the doc IS retryable in principle, just
+    // out of automatic budget).
+    let error_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'BOOT_ER_BUDGET_EXHAUSTED' AND severity = 'ERROR'",
+    )
+    .fetch_one(app.db())
+    .await
+    .expect("count error budget audits");
+    assert_eq!(
+        error_count, 1,
+        "BOOT_ER_BUDGET_EXHAUSTED must emit Severity::Error"
+    );
+    // Payload should record attempts_used + max + retry_class for forensics.
+    let payload: String = sqlx::query_scalar(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE event_type = 'BOOT_ER_BUDGET_EXHAUSTED'",
+    )
+    .fetch_one(app.db())
+    .await
+    .expect("read audit payload");
+    assert!(
+        payload.contains("\"attempts_used\":5"),
+        "audit payload must record attempts_used=5: {payload}"
+    );
+    assert!(
+        payload.contains("\"max_boot_attempts\":5"),
+        "audit payload must record max_boot_attempts=5: {payload}"
+    );
+    assert!(
+        payload.contains("\"retry_class\":\"TransientRetry\""),
+        "audit payload must record retry_class=TransientRetry: {payload}"
+    );
+
+    // (4) Histogram counter.
+    assert_eq!(
+        summary.docs_advanced.error_retryable_budget_exhausted, 1,
+        "histogram: budget-exhausted increments error_retryable_budget_exhausted"
+    );
+
+    // (5) stage_send::run path must NOT have fired.
+    assert_eq!(
+        summary.docs_advanced.error_retryable_dispatched, 0,
+        "stage_send::run dispatch path must NOT increment under budget exhaust"
+    );
+
+    // (6) NO per-class escalation audit — budget-exhausted has its
+    // own distinct event, the per-class arm did not fire.
+    assert_eq!(
+        audit_count(app.db(), "BOOT_ER_ESCALATED_TO_MANUAL").await,
+        0,
+        "budget-exhausted must NOT also emit BOOT_ER_ESCALATED_TO_MANUAL (distinct dashboards)"
     );
 }

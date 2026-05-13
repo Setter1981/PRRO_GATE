@@ -25,4 +25,4 @@ pub mod boot_phase;
 pub mod last_chk_probe;
 pub mod runtime;
 
-pub use runtime::ReconciliationRuntime;
+pub use runtime::{ReconciliationRuntime, RuntimeView};
