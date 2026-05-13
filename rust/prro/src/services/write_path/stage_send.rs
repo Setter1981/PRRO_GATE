@@ -31,13 +31,29 @@
 //! | `OperatorEscalation` (-6)                        | NO — operator |
 //!
 //! Calling [`run`] repeatedly on a non-`TransientRetry` `ErrorRetryable`
-//! doc produces an unbounded crash-loop: same envelope, same server
-//! reply, same `ErrorRetryable` landing.  Until the worker dispatcher
-//! lands (W11+), tests + ops scripts MUST manually filter via
+//! doc would produce an unbounded crash-loop: same envelope, same
+//! server reply, same `ErrorRetryable` landing.  **This hazard is
+//! mitigated at the boot dispatcher layer** by
+//! [`crate::services::reconciliation::boot_phase::dispatch_error_retryable_by_class`]
+//! (M3a hardening pass 1, PR #38), which reads
 //! [`crate::db::repositories::transport_trace::last_attempt_retry_class_for`]
-//! (durable column added in migration 012; encoded by the closed
-//! `RetryClass::as_str` map and decoded via `RetryClass::from_wire_str`).
-//! See freeze §4.2.
+//! (durable column added in migration 012; encoded by
+//! `RetryClass::as_str`, decoded via `RetryClass::from_wire_str`) and
+//! routes only `TransientRetry` docs back to [`run`].  Non-transient
+//! classes are CAS'd to `RequiresManualReconciliation` instead of
+//! re-invoking the wire send.  Additionally,
+//! [`crate::db::repositories::transport_trace::attempts_used`] is
+//! gated against `MAX_BOOT_ATTEMPTS = 5` (hardening pass 2, PR #40)
+//! before the `TransientRetry` → wire arm is entered, so even valid
+//! transient retries cannot loop indefinitely on a doc that keeps
+//! failing every boot.
+//!
+//! **Caller obligation today:** if you bypass the boot dispatcher and
+//! invoke [`run`] directly (e.g. ops scripts, ad-hoc test harness),
+//! you MUST still respect the `RetryClass` table above — or replicate
+//! the dispatcher's class/budget guard.  Production callers go
+//! through `App::reconcile_pending_with`, which uses the dispatcher
+//! and therefore inherits both guards.  See freeze §4.2.
 //!
 //! Anchored on:
 //!   - W7 design freeze §4.3 (envelope builder)
