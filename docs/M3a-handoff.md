@@ -222,9 +222,36 @@ Step-by-step before closing `PRRO_GATE-9qd.1`:
 4. **Final-state verification:** `bd list --parent PRRO_GATE-9qd.1` MUST return zero rows before `bd close 9qd.1`.  If it does not, repeat §6.2.1 / §6.2.2 for the residue.
 5. Comment `PRRO_GATE-9qd.1` with the handoff commit hash (from this PR, after merge) + this document path; `bd close 9qd.1`.
 
-### 6.3 ONLINE-against-test-DPS smoke (ADR D3 gate #4)
+### 6.3 Pilot gates
+
+Three checks MUST be discharged **before pilot deployment** (not merely before M3b open).  The first is the ADR-D3 gate carried in from M3a; the second and third are M2 carry-forward bd issues that affect production DPS connectivity and therefore must be promoted to pilot-gating now that fiscal driver work is complete.  Each gate has an explicit discharge condition + named owner action.
+
+#### 6.3.1 ONLINE-against-test-DPS smoke (ADR D3 gate #4)
 
 Mandatory if a non-production DPS contour is available.  Memory `project_sprint7_complete` already records a successful full live DPS cycle (SHIFT_OPEN → SELL → Z_REPORT on `cabinet.tax.gov.ua:9443`); that artifact is sufficient evidence for the ADR-D3 gate if the operator agrees to map Python-stack Sprint-7 evidence onto Rust-stack M3a exit.  Otherwise discharge by explicit owner waiver committed before M3b.
+
+Discharge condition: either
+- (a) Sprint-7 evidence accepted by the operator as cross-stack equivalent (Python-stack DPS cycle mapped onto Rust-stack M3a exit), or
+- (b) a fresh ONLINE Rust-stack cycle SHIFT_OPEN → SELL → Z_REPORT against a non-production DPS contour, with the resulting `transport_trace` row, audit log, and `DpsError` distribution attached to the pilot dossier, or
+- (c) explicit owner waiver committed before pilot rollout (not just before M3b).
+
+#### 6.3.2 TLS CA bundle wiring for `GrpcDpsChannel` — `PRRO_GATE-k54` (P1)
+
+Filed at M2 close (`docs/M2-handoff.md` table row, 2026-05-06).  M2's `GrpcDpsChannel` uses tonic's default system trust store; production DPS endpoints require explicit CA pinning to defend against trust-store rot and to match how WebCheck loads a CA bundle PEM file (`docs/superpowers/specs/2026-05-05-webcheck-pilot-parity-findings.md:47`).  M3a did not touch this surface — `tls_root_certs` config plumbing remains as drafted in the M2 wire spec (`docs/superpowers/specs/2026-05-04-m2-w0-1-dps-wire.md:449`).
+
+Discharge condition: either
+- (a) `tls_root_certs` PEM-bytes / PEM-path config option implemented end-to-end on `GrpcDpsChannel`, with a smoke test against production DPS (or a representative TLS contour) verifying the custom CA path is actually exercised — not silently falling back to the system store, or
+- (b) explicit owner waiver acknowledging the pilot will operate against system-trust-store DPS endpoints only, with the trust-store rot risk transferred to operations.
+
+#### 6.3.3 DPS proto drift parity vs WebCheck — `PRRO_GATE-0ps` (P1)
+
+Filed at M2 close.  M2 vendored six methods from the DPS proto surface; WebCheck's decompiled `TaxGrpc` shows a larger field/method set, and `apiver=1` / `lastChk` / `delLast*` semantics may diverge from what M3a expects in pilot field cycles.  W0-3 §2 (Decode rule for `status=0` proto-default) already encodes M3a's "fail-loudly on protocol drift" stance, but a pre-pilot proto-surface audit is still required to know whether any pilot-relevant message has drifted under our feet.
+
+Discharge condition: either
+- (a) a recorded decision in `PRRO_GATE-0ps` covering at minimum (i) which DPS method versions are pilot-supported, (ii) whether `apiver` is wire-pinned or accepted-on-receipt, and (iii) the disposition of `delLast` / `lastChk` field-shape variants observed in WebCheck decompilation but not vendored in M2's proto subset, or
+- (b) explicit owner waiver narrowing pilot fiscal-document types to a subset that provably does not depend on the drift surface, with the narrowed subset committed in `docs/M3a-handoff.md` as a follow-up.
+
+Both 6.3.2 and 6.3.3 are *pilot-gating*, not *M3b-gating* — opening M3b is fine while they remain open, but pilot rollout MUST NOT proceed until each is discharged via condition (a) or (b) above and recorded in the pilot dossier.
 
 ### 6.4 ADR open items O1 / O2 / O3
 
