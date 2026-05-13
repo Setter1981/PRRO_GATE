@@ -120,6 +120,24 @@ struct Inner {
     /// dead_code lint because the field is never read directly.
     #[allow(dead_code)]
     singleton: PidLock,
+    /// M3a hardening pass 2 — structural enforcement of ADR-M3-A10
+    /// (`docs/superpowers/specs/2026-05-12-adr-m3-a10-global-single-writer.md`).
+    /// The ADR mandates "runtime enforces global-single-writer" + "one
+    /// tokio worker"; prior to this field the invariant was convention-
+    /// only.  `App: Clone` allows multiple handles, and
+    /// `reconcile_pending_with` is `pub`, so two parallel calls could
+    /// each CAS Signed → Sending + fire `send_chk` between the 4-pre
+    /// and 4-b envelopes.  The mutex serialises every boot-recovery
+    /// dispatcher call so the per-row CAS + `BEGIN IMMEDIATE` envelope
+    /// guarantees compose with a top-level App-scoped serialisation.
+    ///
+    /// `tokio::sync::Mutex` (not `std::sync::Mutex`) because the
+    /// critical section spans `.await` points across many short
+    /// per-FN envelopes — holding a `std::sync::Mutex` across `.await`
+    /// would block the runtime under contention.  Mutex held for the
+    /// duration of one `reconcile_pending_inner` call; concurrent
+    /// callers serialise without panicking.
+    reconcile_mutex: tokio::sync::Mutex<()>,
 }
 
 impl App {
@@ -177,6 +195,7 @@ impl App {
                 config,
                 db,
                 singleton,
+                reconcile_mutex: tokio::sync::Mutex::new(()),
             }),
         })
     }
@@ -276,6 +295,19 @@ impl App {
     ) -> Result<ReconciliationSummary, BootError> {
         use crate::db::repositories::fiscal_number_config;
         use crate::services::reconciliation::boot_phase::{self, BranchOutcome};
+
+        // M3a hardening pass 2 — structural enforcement of ADR-M3-A10
+        // (global-single-writer).  Acquire the App-scoped recon mutex
+        // BEFORE any state read or per-FN dispatch.  Two concurrent
+        // `reconcile_pending_with` calls on the same `App` (or on
+        // distinct `Arc<Inner>` clones) serialise here instead of
+        // racing each other through the per-row CAS + per-FN
+        // `BEGIN IMMEDIATE` envelopes.  Mutex is `tokio::sync::Mutex`
+        // because the critical section spans `.await` points across
+        // many short per-FN envelopes; held for the duration of one
+        // recon call (caller is the dispatcher task, single-task by
+        // construction in production).
+        let _recon_lock = self.inner.reconcile_mutex.lock().await;
 
         let pool = self.db();
         let fns = fiscal_number_config::list_all(pool)

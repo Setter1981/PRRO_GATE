@@ -296,32 +296,65 @@ pub async fn list_for_document(
         .collect()
 }
 
-/// W10.2 review fix-up: read the durable `retry_class` of the most
-/// recent (highest `attempt_no`) **completed** trace row for `doc_id`.
-/// Used by the worker dispatcher (W11+) and ops scripts to decide
-/// whether a doc currently in `ErrorRetryable` warrants another wire
-/// send per the table in `stage_send.rs` module docstring + freeze §4.2.
+/// Read the durable `retry_class` of the **latest** trace row
+/// (highest `attempt_no`) for `doc_id`, regardless of whether the
+/// attempt completed.  Used by the worker dispatcher (W11+) and ops
+/// scripts to decide whether a doc currently in `ErrorRetryable`
+/// warrants another wire send per the table in `stage_send.rs`
+/// module docstring + freeze §4.2.
 ///
-/// Returns:
-///   - `Ok(None)`  — no completed attempt yet (4-pre allocated but
-///     4-b never committed) OR the doc has no trace rows at all OR the
-///     row is pre-migration-012 (NULL `retry_class`).  Caller should
-///     treat as "indeterminate; do NOT auto-retry".
-///   - `Ok(Some(rc))` — last completed attempt's retry class.  Caller
+/// ## M3a hardening pass 2 — latest-attempt authoritative
+///
+/// **Earlier shape (W10.2 review fix-up)** filtered `WHERE
+/// completed_at IS NOT NULL` and returned the latest **completed**
+/// attempt.  That filter created a duplicate-send hazard across
+/// consecutive boots:
+///
+///   1. Boot N: doc in ER with completed `TransientRetry` trace →
+///      dispatcher routes to `stage_send::run`.
+///   2. `stage_send` 4-pre: CAS ER → Sending + INSERT new trace
+///      row (`completed_at = NULL`, `retry_class = NULL`).
+///   3. Crash between `send_chk` and 4-b: doc stays Sending, new
+///      trace row stays unfinished.
+///   4. Boot N+1: SENDING arm → `resume_sending_to_error_retryable`
+///      CAS Sending → ER (does not touch the unfinished trace).
+///   5. Boot N+2 (or same boot via fresh snapshot): ER arm reads
+///      `last_attempt_retry_class_for`.  Under the OLD filter, the
+///      unfinished trace was hidden; the dispatcher saw the OLDER
+///      completed `TransientRetry` and re-invoked `stage_send::run`
+///      on the SAME envelope.  Duplicate `send_chk` on a doc DPS
+///      did not deduplicate.
+///
+/// Removing the `completed_at IS NOT NULL` filter makes the latest
+/// attempt by `attempt_no` authoritative.  When the latest attempt
+/// is unfinished, `retry_class` is `NULL` → `from_wire_str` returns
+/// `None` → dispatcher routes to the indeterminate-hold branch
+/// (`BOOT_ER_RETRY_CLASS_INDETERMINATE`); no wire re-send.
+///
+/// ## Return semantics
+///   - `Ok(None)` — latest attempt's `retry_class` is missing
+///     (NULL — unfinished OR pre-migration-012 OR known wire-string
+///     not in `RetryClass::from_wire_str` map) OR the doc has no
+///     trace rows at all.  Caller treats as "indeterminate; do NOT
+///     auto-retry".
+///   - `Ok(Some(rc))` — latest attempt's retry class.  Caller
 ///     filters per the docstring contract: only `TransientRetry` is
 ///     auto-retryable; the other six classes need higher-layer
 ///     orchestration.
 ///
 /// Reads outside any tx — pool-bound; safe to call from the dispatcher
 /// scheduling loop without entering a write lock.  WAL semantics: the
-/// row is visible after the 4-b `with_immediate` envelope commits.
+/// row is visible after the 4-pre `with_immediate` envelope commits
+/// (the row is INSERTed at 4-pre allocation; `completed_at` is set
+/// later at 4-b but that's not required to satisfy this query under
+/// hardening pass 2).
 pub async fn last_attempt_retry_class_for(
     pool: &sqlx::SqlitePool,
     doc_id: DocumentId,
 ) -> sqlx::Result<Option<crate::services::write_path::error_routing::RetryClass>> {
     let opt: Option<Option<String>> = sqlx::query_scalar(
         "SELECT retry_class FROM transport_trace \
-         WHERE document_id = ? AND completed_at IS NOT NULL \
+         WHERE document_id = ? \
          ORDER BY attempt_no DESC LIMIT 1",
     )
     .bind(doc_id)

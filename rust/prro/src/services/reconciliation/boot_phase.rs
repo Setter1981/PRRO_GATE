@@ -1748,6 +1748,14 @@ async fn dispatch_prepared_via_chain(
             inbox_payload_sha_hex: String,
             fd_doc_type: String,
             inbox_operation_type: String,
+            /// M3a hardening pass 2 — Finding 4 closure: byte-equality
+            /// check between `fd.payload_json` and `inbox.payload_json`
+            /// catches drift the hash-only check would miss (DB
+            /// corruption / hand-edit where one column was updated
+            /// without the other; payload-level mutation between
+            /// stage_acquire write and recovery read).  `true` when
+            /// the two `payload_json` strings differ verbatim.
+            payload_json_mismatch: bool,
         },
     }
 
@@ -1825,14 +1833,32 @@ async fn dispatch_prepared_via_chain(
             // ingress: `(fd.fiscal_number, fd.payload_sha256_canonical,
             // fd.doc_type)` MUST equal `(inbox.fiscal_number,
             // inbox.payload_sha256_canonical, inbox.operation_type)`.
-            // Recovery re-asserts the same invariant on every boot
-            // tick.  Drift = DB corruption, hand-edit, OR migration
-            // artifact — never a business-level reject.  Fail-closed
-            // hold pattern: return `Drift` outcome (no state mutation,
-            // no sign/send invocation); caller emits CRITICAL audit.
+            //
+            // M3a hardening pass 2 — Finding 4: extended with explicit
+            // `payload_json` byte-equality between fd and inbox.  The
+            // hash-only check from pass 1 left a defence-in-depth gap:
+            // DB corruption / hand-edit could mutate one row's
+            // `payload_json` without re-hashing the other's
+            // `payload_sha256_canonical`, and the snapshot would have
+            // built `WorkerContext.command` from `fd.payload_json` even
+            // though that bytes no longer matched what inbox / hash
+            // attested to.  Adding the byte-equality closes that gap
+            // before stage_sign runs canonical-XML build on
+            // `command.payload_json`.  Recompute of canonical hash is
+            // intentionally deferred to follow-up (no Rust-side
+            // canonicalization helper exists in M3a; ingress adapter
+            // chain lands in M4).
+            //
+            // Recovery re-asserts the invariant on every boot tick.
+            // Drift = DB corruption / hand-edit / migration artifact —
+            // never a business-level reject.  Fail-closed hold:
+            // return `Drift` (no state mutation, no sign/send); caller
+            // emits CRITICAL audit.
+            let payload_json_mismatch = payload_json != inbox_row.payload_json;
             let drift = fd_fiscal_number != inbox_row.fiscal_number
                 || payload_sha != inbox_row.payload_sha256_canonical
-                || doc_type_copy.as_str() != inbox_row.operation_type;
+                || doc_type_copy.as_str() != inbox_row.operation_type
+                || payload_json_mismatch;
             if drift {
                 return Ok::<SnapshotOutcome, anyhow::Error>(SnapshotOutcome::Drift {
                     fd_fiscal_number,
@@ -1841,6 +1867,7 @@ async fn dispatch_prepared_via_chain(
                     inbox_payload_sha_hex: hex_lower(&inbox_row.payload_sha256_canonical),
                     fd_doc_type: doc_type_copy.as_str().to_string(),
                     inbox_operation_type: inbox_row.operation_type.clone(),
+                    payload_json_mismatch,
                 });
             }
 
@@ -1891,13 +1918,15 @@ async fn dispatch_prepared_via_chain(
             inbox_payload_sha_hex,
             fd_doc_type,
             inbox_operation_type,
+            payload_json_mismatch,
         }) => {
-            // M3a hardening pass 1 — Patch 3.  Drift between
-            // fiscal_documents and ingress_inbox detected; emit
-            // CRITICAL audit + counter += 1, doc stays in PREPARED,
-            // no sign/send invoked.  Operator manual intervention
-            // required (drift is corruption / migration artifact;
-            // recovery cannot decide direction safely).
+            // M3a hardening pass 1 — Patch 3 + pass 2 Finding 4.
+            // Drift between fiscal_documents and ingress_inbox
+            // detected; emit CRITICAL audit + counter += 1, doc
+            // stays in PREPARED, no sign/send invoked.  Operator
+            // manual intervention required (drift is corruption /
+            // migration artifact; recovery cannot decide direction
+            // safely).
             let payload = serde_json::json!({
                 "document_id": hex_lower(doc_id.as_bytes()),
                 "branch": "c-prepared-replay-drift",
@@ -1907,8 +1936,9 @@ async fn dispatch_prepared_via_chain(
                 "inbox_payload_sha256_canonical_hex": inbox_payload_sha_hex,
                 "fd_doc_type": fd_doc_type,
                 "inbox_operation_type": inbox_operation_type,
+                "payload_json_mismatch": payload_json_mismatch,
                 "rationale":
-                    "fiscal_documents ↔ ingress_inbox drift (mismatch on fiscal_number / payload_sha256_canonical / doc_type vs operation_type); recovery holds doc in PREPARED — operator triage required",
+                    "fiscal_documents ↔ ingress_inbox drift (mismatch on fiscal_number / payload_sha256_canonical / doc_type vs operation_type / payload_json byte-equality); recovery holds doc in PREPARED — operator triage required",
             });
             audit_log::append(
                 pool,
