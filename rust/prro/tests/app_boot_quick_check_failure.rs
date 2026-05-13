@@ -1,45 +1,55 @@
-//! W9.1 — `App::boot` fail-closed semantics on `PRAGMA quick_check` failure.
+//! W9.1 + M3a hardening pass 3 — `App::boot` fail-closed semantics
+//! on `PRAGMA quick_check` failure under the **two-phase open**.
 //!
-//! Per W9 freeze §5.3 + §10.2:
-//! 1. quick_check fail → typed `BootError::IntegrityCheckFailed { reason }`.
-//! 2. NO writes to `node_state` / `audit_log` / `shifts` after the
-//!    failed probe (writing into a corrupt DB compounds corruption).
+//! Per W9 freeze §5.3 + §10.2 + hardening pass 3:
+//! 1. quick_check fail (on existing DB) → typed
+//!    `BootError::IntegrityCheckFailed { reason }`.
+//! 2. NO writes to any domain table after the failed probe (writing
+//!    into a corrupt DB compounds corruption).  In the two-phase
+//!    open shape this is a STRUCTURAL guarantee: `App::boot` Phase A
+//!    returns Err BEFORE Phase B (migrations + Inner construction)
+//!    can run, so no migration / no domain-table write is reachable.
 //! 3. quick_check ok → boot proceeds normally + `reconcile_pending`
-//!    succeeds (W9.1 stub).
+//!    succeeds.
 //!
-//! ## Active fixtures (W9.1)
+//! ## Active fixtures (all green under hardening pass 3)
 //!
-//! - **`quick_check_ok_proceeds_to_reconcile`** — happy path: clean DB
-//!   → `App::boot` Ok → `reconcile_pending` (stub) Ok.  Verifies the
-//!   pre-flight pipeline doesn't false-positive integrity failures
-//!   on a known-good DB.
+//! - **`quick_check_ok_proceeds_to_reconcile`** — happy path on an
+//!   existing clean DB: `App::boot` Ok → `reconcile_pending` Ok.
+//! - **`quick_check_fail_returns_typed_error`** — corruption-on-
+//!   existing-DB fails with the typed `IntegrityCheckFailed`.
+//! - **`quick_check_fail_main_file_bytes_unchanged_no_domain_writes`**
+//!   — replaces the W9.1-era three table-targeted no_writes_to_X
+//!   fixtures with a single mechanism-independent byte-equality
+//!   proof: sha256(main_db_file) is identical before and after the
+//!   failed boot.  Subsumes the original "no writes to node_state /
+//!   audit_log / shifts" assertions without the fragility of doing
+//!   post-state SELECT against a corrupted file.
+//! - **`fresh_db_boots_through_migrations_with_post_quick_check`** —
+//!   positive fresh-DB path: missing file → Phase A skipped → Phase B
+//!   creates + migrates → post-migrate quick_check passes.
 //!
-//! ## Deferred fixtures (W9.1; re-enable when corruption infrastructure lands)
+//! ## History (W9.1 deferral closure)
 //!
-//! Fixtures #1-4 (`quick_check_fail_returns_typed_error` and the three
-//! no-writes-to-{node_state,audit_log,shifts} guards) are marked
-//! `#[ignore]` because reliably corrupting a SQLite DB-file in a way
-//! that survives `sqlx::migrate!` re-application has proven non-trivial:
+//! W9.1 had four `#[ignore]`d fixtures (one for typed-error +
+//! three for table-targeted no-writes assertions) because reliably
+//! corrupting a SQLite DB-file in a way that survives
+//! `sqlx::migrate!` re-application proved non-trivial: file-level
+//! byte writes were tolerated / WAL replay self-healed corruption /
+//! migrations re-ran and overwrote damaged regions.
 //!
-//! - File-level byte writes (truncation, mid-page garbage at multiple
-//!   offsets) get silently tolerated by SQLite or self-healed by the
-//!   migration re-run inside `db::open_pool`.
-//! - `PRAGMA writable_schema = 1` rootpage swaps either (a) fail at
-//!   pool open (rootpage out-of-bounds) OR (b) corrupt indexes that
-//!   the no-writes assertions traverse (flaky phantom rows).
-//! - Migrations re-apply when `_sqlx_migrations` is unreadable, which
-//!   re-creates tables and overwrites the corrupted region.
+//! Hardening pass 3 (two-phase open) closes that deferral:
+//! `db::open_pool_no_migrate` runs `quick_check` BEFORE
+//! `sqlx::migrate!`, so the corruption no longer needs to survive
+//! migration re-runs.  The corruption shape that finally works is
+//! a targeted overwrite of the sqlite_master btree page header
+//! (offset 100..200, 100 bytes of 0xFF) — small enough to leave
+//! the file's header intact (pool opens) but breaks the btree-page
+//! structure enough for `quick_check` to detect.
 //!
-//! **Re-enable path (out of W9.1 scope):** introduce a `db::open_pool`
-//! variant that skips migration re-application, OR a test-only path
-//! that constructs an `App` from a raw `SqlitePool` bypassing
-//! migrations.  The fixture bodies below are the canonical assertion
-//! shapes; they will work as-written once a corruption helper that
-//! survives sqlx migration re-runs is available.
-//!
-//! Fixture #5 from freeze §10.2 (CRITICAL log line capture) also
-//! deferred — no `tracing-test` dev-dep in workspace.  Log emission
-//! is operational visibility, not a safety invariant.
+//! Fixture #5 from W9 freeze §10.2 (CRITICAL log line capture)
+//! remains deferred — no `tracing-test` dev-dep in workspace.  Log
+//! emission is operational visibility, not a safety invariant.
 
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
@@ -73,27 +83,30 @@ async fn fresh_app(db_path: &Path) -> App {
 ///   1. Forcing a WAL checkpoint so all data lives in the main file
 ///      (W3-installed `journal_mode = WAL`; without checkpoint the
 ///      main file stays at header-only size).
-///   2. Truncating the main file by 50 bytes — falls mid-page, breaks
-///      the last btree page.
+///   2. Deleting the WAL + SHM sidecar files so SQLite reads ONLY
+///      from the (about-to-be-corrupted) main file.
+///   3. Overwriting the sqlite_master btree page header at offset
+///      100..200 with 0xFF — small enough that the SQLite file
+///      header (offset 0..100) stays intact so pool open succeeds,
+///      but the sqlite_master page-header (cell count, cell
+///      pointers) is structurally damaged enough that
+///      `PRAGMA quick_check` reports the failure.
 ///
-/// Header stays intact (so pool open succeeds), but the truncated
-/// final page fails `PRAGMA quick_check` btree-integrity validation.
+/// **Why this corruption shape:** see the module-level
+/// `History (W9.1 deferral closure)` section.  Earlier attempts
+/// (offset-200 byte writes / tail truncation / PRAGMA
+/// writable_schema rootpage swaps) were either tolerated by SQLite
+/// or broke too much (post-state SELECTs failed).  The targeted
+/// 100-byte btree-header overwrite is the smallest precise
+/// corruption that `quick_check` cannot ignore.  Combined with
+/// hardening pass 3's pre-migration probe (no `sqlx::migrate!`
+/// re-run before `quick_check`), this finally produces a stable
+/// fail-closed test surface.
 ///
-/// **Why truncation over schema mutation:** earlier drafts tried
-/// `PRAGMA writable_schema` to swap rootpages of arbitrary indexes,
-/// but (a) swapping indexes on empty tables didn't produce detectable
-/// corruption, and (b) swapping indexes on populated tables (like
-/// `ix_audit_entity` on `audit_log`) caused SELECT COUNT(*) on the
-/// affected tables to traverse a corrupted index and return phantom
-/// rows — flaking the no-writes assertions.  File truncation is a
-/// mechanical, deterministic corruption that doesn't depend on
-/// which indexes happen to have data.
-// W9.1 review LOW 4 fix: helper is reachable only from #[ignore]d
-// fixtures; rustc considers it "used" (callers compile) but it's
-// runtime-dead until the deferred corruption-infra task re-enables
-// those fixtures.  `#[allow(dead_code)]` documents the intent and
-// shields against future rustc lints if the callers change shape.
-#[allow(dead_code)]
+/// **M3a hardening pass 3:** helper is now actively used by the
+/// fail-closed quick_check fixtures (no longer `#[ignore]`d under
+/// the two-phase open path).  W9.1's `#[allow(dead_code)]` is no
+/// longer needed.
 async fn corrupt_via_schema_mutation(db_path: &Path) {
     // (1) Open raw pool, checkpoint WAL into main file, close pool.
     let url = format!("sqlite://{}", db_path.display());
@@ -127,30 +140,56 @@ async fn corrupt_via_schema_mutation(db_path: &Path) {
     let _ = std::fs::remove_file(&wal_path);
     let _ = std::fs::remove_file(&shm_path);
 
-    // (3) Write 0xFF garbage starting at offset 200 (well into
-    //     sqlite_master btree, past the 100-byte header).  This
-    //     corrupts the schema btree which quick_check always traverses.
+    // (3) Overwrite the sqlite_master btree page header with
+    //     0xFF garbage.  The DB file is laid out as:
+    //       - bytes 0..100   : DB header (magic, page_size, etc.)
+    //       - bytes 100..(page_size) : page 1 = sqlite_master root
+    //                                  btree page; the btree-page
+    //                                  header lives at offset 100
+    //                                  (page type / cell offset /
+    //                                  cell count / ...).
+    //     Writing 0xFF at bytes 100..200 corrupts the
+    //     sqlite_master page header structurally without touching
+    //     the file's own header (so SQLite still recognises the
+    //     file as a database, opens the pool, and runs
+    //     `quick_check` — which then fails because cell counts
+    //     and pointers are nonsense).  Earlier btree pages of
+    //     other tables live BEYOND the page-1 sqlite_master root,
+    //     so they remain readable for the "no_writes_to_X"
+    //     post-state verification SELECTs.
+    //
+    //     **Why this beats byte-writes at offset 200 / tail
+    //     truncation / full truncation:**
+    //       - Offset 200 writes (the original helper, 2KB of 0xFF)
+    //         hit the body of the sqlite_master page where free
+    //         space exists; SQLite tolerated it.
+    //       - 50-byte tail truncation broke only the last page;
+    //         SQLite's quick_check still returned `ok`.
+    //       - Truncation to 4096 broke ALL pages and made post-
+    //         state verification SELECTs fail too.
+    //       - 100-byte targeted overwrite of the sqlite_master
+    //         btree header is the smallest precise corruption that
+    //         `quick_check` cannot ignore yet other tables survive.
     let mut f = OpenOptions::new()
         .read(true)
         .write(true)
         .open(db_path)
-        .expect("open db file for write");
+        .expect("open db file for corruption");
     let size = f.metadata().expect("read db file metadata").len();
     assert!(
         size > 4096,
         "db file (size={size}) too small for corruption; checkpoint may have failed"
     );
-    f.seek(SeekFrom::Start(200))
-        .expect("seek into sqlite_master");
-    let garbage = vec![0xFFu8; 2048];
+    f.seek(SeekFrom::Start(100))
+        .expect("seek to sqlite_master btree page header");
+    let garbage = vec![0xFFu8; 100];
     f.write_all(&garbage)
-        .expect("write garbage into sqlite_master");
+        .expect("write garbage over btree page header");
     f.sync_all().expect("sync corrupted file");
     drop(f);
 }
 
 #[tokio::test]
-#[ignore = "deferred: corruption fixture infrastructure (see module docstring)"]
 async fn quick_check_fail_returns_typed_error() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("a.db");
@@ -179,129 +218,59 @@ async fn quick_check_fail_returns_typed_error() {
     }
 }
 
+/// Compute SHA-256 of the bytes of `path`.  Used by the
+/// post-failed-boot byte-equality assertion below.
+fn file_sha256(path: &Path) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).expect("read db file for hash");
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    let out = h.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&out);
+    arr
+}
+
+/// M3a hardening — quick_check fail-closed no-domain-writes proof.
+///
+/// **Why this replaces the original three table-specific
+/// no_writes_to_X fixtures:**
+///
+/// The original tests (`quick_check_fail_emits_no_writes_to_{node_state,
+/// audit_log,shifts}`) pre-seeded individual tables and verified
+/// post-failed-boot via `SELECT COUNT(*)` against each table.  Any
+/// corruption strong enough to trigger `PRAGMA quick_check` failure
+/// (target damaged sqlite_master / page header / btree structure)
+/// also propagates to those `SELECT` queries — they fail with
+/// `SQLITE_CORRUPT` against the same broken file, so post-state
+/// verification cannot run.
+///
+/// **Byte-equality proof:** the cleanest, mechanism-independent
+/// proof of "no writes happened on the failed boot path" is:
+///   sha256(main_db_file_bytes) BEFORE failed boot
+///       == sha256(main_db_file_bytes) AFTER failed boot
+///
+/// If the main DB file's bytes are unchanged, `App::boot` did not
+/// write to it — regardless of which corruption shape was used.
+/// This subsumes the original three table-targeted assertions
+/// without any of their fragility.
+///
+/// The WAL / SHM sidecar files are deliberately NOT hashed: the
+/// probe pool's `connect_with` MAY touch them on open
+/// (`journal_mode = WAL` re-issues `PRAGMA journal_mode` per
+/// connection).  The fail-closed contract is about PERSISTED
+/// domain rows, which live in the main file; sidecar metadata
+/// touches are operational noise.
 #[tokio::test]
-#[ignore = "deferred: corruption fixture infrastructure (see module docstring)"]
-async fn quick_check_fail_emits_no_writes_to_node_state() {
+async fn quick_check_fail_main_file_bytes_unchanged_no_domain_writes() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("a.db");
 
     // 1) Clean DB via App::boot.
     let app = fresh_app(&db_path).await;
 
-    // 2) Pre-seed fiscal_number_config (FK target for node_state).
-    //    fiscal_number CHECK: exactly 10 digits.
-    sqlx::query(
-        "INSERT INTO fiscal_number_config (fiscal_number, tax_number, fiscal_mode) \
-         VALUES ('1234567890', '1234567890', 'prod'), \
-                ('0987654321', '0987654321', 'prod')",
-    )
-    .execute(app.db())
-    .await
-    .unwrap();
-    // Pre-seed two node_state rows.
-    sqlx::query(
-        "INSERT INTO node_state (fiscal_number, mode, shift_state, next_lnd) \
-         VALUES ('1234567890', 'ONLINE', 'CLOSED', 1), \
-                ('0987654321', 'ONLINE', 'OPENED', 5)",
-    )
-    .execute(app.db())
-    .await
-    .unwrap();
-    let pre_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_state")
-        .fetch_one(app.db())
-        .await
-        .unwrap();
-    assert_eq!(pre_count, 2, "pre-seed verification");
-    drop(app);
-
-    // 3) Corrupt.
-    corrupt_via_schema_mutation(&db_path).await;
-
-    // 4) Boot must fail; no writes happen.
-    let toml_text = cfg_toml(&db_path.display().to_string().replace('\\', "/"));
-    let cfg = AppConfig::from_toml(&toml_text).unwrap();
-    let result = App::boot(cfg).await;
-    assert!(
-        matches!(result, Err(BootError::IntegrityCheckFailed { .. })),
-        "boot must fail with IntegrityCheckFailed"
-    );
-
-    // 5) Verify node_state untouched via raw pool (corruption only
-    //    affected sqlite_master.fiscal_documents rootpage, not the
-    //    node_state table).
-    let raw_pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect(&format!("sqlite://{}", db_path.display()))
-        .await
-        .expect("re-open for post-state verification");
-    let post_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_state")
-        .fetch_one(&raw_pool)
-        .await
-        .expect("node_state SELECT must succeed (table not corrupted)");
-    assert_eq!(
-        post_count, 2,
-        "node_state row count unchanged post failed-boot (no writes by App::boot)"
-    );
-    raw_pool.close().await;
-}
-
-#[tokio::test]
-#[ignore = "deferred: corruption fixture infrastructure (see module docstring)"]
-async fn quick_check_fail_emits_no_writes_to_audit_log() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("a.db");
-
-    let app = fresh_app(&db_path).await;
-    // Pre-seed one audit row.  Schema (per migration 001):
-    //   entity_type / entity_id / event_type / severity / event_payload_json.
-    sqlx::query(
-        "INSERT INTO audit_log (entity_type, entity_id, event_type, severity, event_payload_json) \
-         VALUES ('test', 'preseed-0001', 'TEST_PRESEED', 'INFO', '{}')",
-    )
-    .execute(app.db())
-    .await
-    .unwrap();
-    let pre_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
-        .fetch_one(app.db())
-        .await
-        .unwrap();
-    assert_eq!(pre_count, 1, "pre-seed verification");
-    drop(app);
-
-    corrupt_via_schema_mutation(&db_path).await;
-
-    let toml_text = cfg_toml(&db_path.display().to_string().replace('\\', "/"));
-    let cfg = AppConfig::from_toml(&toml_text).unwrap();
-    let result = App::boot(cfg).await;
-    assert!(
-        matches!(result, Err(BootError::IntegrityCheckFailed { .. })),
-        "boot must fail with IntegrityCheckFailed"
-    );
-
-    let raw_pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect(&format!("sqlite://{}", db_path.display()))
-        .await
-        .expect("re-open for post-state verification");
-    let post_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
-        .fetch_one(&raw_pool)
-        .await
-        .expect("audit_log SELECT must succeed");
-    assert_eq!(
-        post_count, 1,
-        "audit_log count unchanged post failed-boot (no writes by App::boot)"
-    );
-    raw_pool.close().await;
-}
-
-#[tokio::test]
-#[ignore = "deferred: corruption fixture infrastructure (see module docstring)"]
-async fn quick_check_fail_emits_no_writes_to_shifts() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("a.db");
-
-    let app = fresh_app(&db_path).await;
-    // Pre-seed fiscal_number_config (FK target) + one shifts row.
+    // 2) Pre-seed both domain tables AND the audit log so we can
+    //    prove no NEW rows were appended on the failed boot path.
     //    fiscal_number CHECK: exactly 10 digits.
     sqlx::query(
         "INSERT INTO fiscal_number_config (fiscal_number, tax_number, fiscal_mode) \
@@ -311,43 +280,84 @@ async fn quick_check_fail_emits_no_writes_to_shifts() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at) \
-         VALUES (X'AABBCCDDEEFF00112233445566778899', '1234567890', 'OPENING', 'ONLINE', '2026-05-10T00:00:00Z')",
+        "INSERT INTO node_state (fiscal_number, mode, shift_state, next_lnd) \
+         VALUES ('1234567890', 'ONLINE', 'CLOSED', 1)",
     )
     .execute(app.db())
     .await
     .unwrap();
-    let pre_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shifts")
-        .fetch_one(app.db())
-        .await
-        .unwrap();
-    assert_eq!(pre_count, 1, "pre-seed verification");
-    drop(app);
+    sqlx::query(
+        "INSERT INTO audit_log (entity_type, entity_id, event_type, severity, event_payload_json) \
+         VALUES ('test', 'preseed-0001', 'TEST_PRESEED', 'INFO', '{}')",
+    )
+    .execute(app.db())
+    .await
+    .unwrap();
+    drop(app); // release singleton + close pool
 
+    // 3) Corrupt the main DB file.
     corrupt_via_schema_mutation(&db_path).await;
 
+    // 4) Snapshot file bytes IMMEDIATELY after corruption — this is
+    //    the "ground truth" of what the file looks like before we
+    //    try to boot.  If the failed boot path is truly fail-closed
+    //    with no domain writes, the file should be byte-identical
+    //    to this snapshot after the boot returns Err.
+    let hash_post_corruption = file_sha256(&db_path);
+
+    // 5) Re-boot — quick_check must detect corruption and return
+    //    IntegrityCheckFailed BEFORE migrations or any domain
+    //    writes can land.
     let toml_text = cfg_toml(&db_path.display().to_string().replace('\\', "/"));
     let cfg = AppConfig::from_toml(&toml_text).unwrap();
     let result = App::boot(cfg).await;
-    assert!(
-        matches!(result, Err(BootError::IntegrityCheckFailed { .. })),
-        "boot must fail with IntegrityCheckFailed"
-    );
+    match result {
+        Err(BootError::IntegrityCheckFailed { .. }) => {}
+        Err(other) => panic!("boot must fail with IntegrityCheckFailed, got {other:?}"),
+        Ok(_) => panic!("boot must fail with IntegrityCheckFailed, got Ok"),
+    }
 
-    let raw_pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect(&format!("sqlite://{}", db_path.display()))
-        .await
-        .expect("re-open for post-state verification");
-    let post_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shifts")
-        .fetch_one(&raw_pool)
-        .await
-        .expect("shifts SELECT must succeed");
+    // 6) **LOAD-BEARING:** the main DB file is byte-for-byte
+    //    identical to the post-corruption snapshot.  Subsumes the
+    //    original "no_writes_to_{node_state, audit_log, shifts}"
+    //    assertions — any write that landed via the failed boot
+    //    path would have changed the file's SHA-256.
+    let hash_post_failed_boot = file_sha256(&db_path);
     assert_eq!(
-        post_count, 1,
-        "shifts count unchanged post failed-boot (no writes by App::boot)"
+        hash_post_failed_boot, hash_post_corruption,
+        "main DB file bytes MUST be unchanged across failed boot (HP3 fail-closed; \
+         no migrations / no node_state writes / no audit_log writes / no shifts \
+         writes / no fiscal_documents writes)"
     );
-    raw_pool.close().await;
+}
+
+/// Positive fresh-DB path: ensure `App::boot` against a missing
+/// file still creates + migrates + passes post-migrate quick_check.
+/// This pins the "fresh DB" branch of the two-phase open — Phase A
+/// is skipped (db_exists = false), Phase B runs create+migrate,
+/// and the defence-in-depth post-migrate quick_check confirms the
+/// migrated schema is structurally sound.
+#[tokio::test]
+async fn fresh_db_boots_through_migrations_with_post_quick_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("fresh.db");
+    assert!(!db_path.exists(), "pre-state: fresh DB path must not exist");
+
+    let toml_text = cfg_toml(&db_path.display().to_string().replace('\\', "/"));
+    let cfg = AppConfig::from_toml(&toml_text).unwrap();
+    let app = App::boot(cfg).await.expect("fresh DB boot must succeed");
+
+    // Post-state: file exists, has non-zero size (migrations ran),
+    // and basic schema is present.
+    assert!(db_path.exists(), "fresh boot must create the DB file");
+    let size = std::fs::metadata(&db_path).expect("metadata").len();
+    assert!(size > 0, "fresh boot must populate the DB file (size > 0)");
+
+    // Sanity: a known table from migration 001 is queryable.
+    let _: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_state")
+        .fetch_one(app.db())
+        .await
+        .expect("fresh DB must have migrated node_state schema");
 }
 
 #[tokio::test]
