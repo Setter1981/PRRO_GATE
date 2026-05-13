@@ -2241,3 +2241,458 @@ async fn fixture_9g_er_transient_retry_budget_exhausted_escalates() {
         "budget-exhausted must NOT also emit BOOT_ER_ESCALATED_TO_MANUAL (distinct dashboards)"
     );
 }
+
+// ─── M3a hardening pass 2 — H1 closure: latest-attempt authoritative ───
+//
+// W11 fixture #3 proves Pattern B no-resend on first-boot SENDING
+// crash.  Hardening pass 2 closes the across-boot duplicate-send
+// hazard: when stage_send crashes mid-attempt (SENDING + unfinished
+// trace), the next boot's SENDING→ER CAS leaves the unfinished
+// trace as-is, and the subsequent ER recovery dispatch must NOT
+// fall back to an older completed `TransientRetry` trace.
+//
+// Pre-hardening shape: `last_attempt_retry_class_for` filtered
+// `WHERE completed_at IS NOT NULL`, hiding the unfinished trace
+// from the dispatcher's eye.  Stale completed `TransientRetry`
+// won; dispatcher routed to `stage_send::run` again → duplicate
+// `send_chk` on the same envelope.
+//
+// Post-hardening: filter removed; latest attempt by `attempt_no`
+// dominates.  Unfinished trace has `retry_class = NULL` →
+// `from_wire_str` returns `None` → dispatcher routes to the
+// indeterminate-hold branch.  Zero DPS contact; doc held in ER.
+
+#[tokio::test]
+async fn fixture_9h_er_latest_unfinished_trace_holds_no_send() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let doc = seed_doc_with_signed_xml(app.db(), fn_id, 0x9A, "ERROR_RETRYABLE").await;
+
+    // attempt 1 — completed, TransientRetry.  Pre-hardening, this
+    // would have been read by `last_attempt_retry_class_for` and
+    // mis-routed the doc to a duplicate send.
+    seed_completed_transport_trace_at_attempt(
+        app.db(),
+        doc,
+        1,
+        "RETRYABLE_TRANSPORT",
+        Some("TransientRetry"),
+    )
+    .await;
+    // attempt 2 — UNFINISHED (completed_at IS NULL, retry_class IS
+    // NULL).  Simulates the crash between stage_send 4-pre
+    // (INSERT trace + CAS Signed/ER → Sending) and the wire
+    // `send_chk` reply.  Boot's SENDING arm subsequently CAS'd
+    // Sending → ER without touching this row.
+    sqlx::query(
+        "INSERT INTO transport_trace (document_id, attempt_no, backend_profile_id, \
+            transport_profile_id, request_envelope_sha256) \
+         VALUES (?, 2, 'b1', 't1', ?)",
+    )
+    .bind(doc)
+    .bind(vec![0u8; 32])
+    .execute(app.db())
+    .await
+    .expect("seed unfinished trace row");
+
+    // Sanity — count: 2 rows, latest unfinished.
+    assert_eq!(
+        count_transport_trace(app.db(), doc).await,
+        2,
+        "pre-state: 2 trace rows seeded (1 completed TransientRetry + 1 unfinished)"
+    );
+
+    let stub = dps_panic_on_any_method(
+        "H1/hardening-pass-2: latest unfinished trace must hold, NEVER re-send",
+    );
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile green");
+
+    // (1) Doc held in ER (indeterminate hold branch).
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "ERROR_RETRYABLE",
+        "latest unfinished trace: indeterminate hold; no state change"
+    );
+
+    // (2) Zero DPS contact.  This is the load-bearing assertion —
+    // the pre-hardening bug would have invoked send_chk via
+    // stage_send::run.
+    assert_eq!(
+        stub.call_count(),
+        0,
+        "H1 closure: zero send_chk on latest-unfinished hold path"
+    );
+
+    // (3) Indeterminate-hold counter increments, NOT the dispatch
+    // or escalation counters.
+    assert_eq!(
+        summary.docs_advanced.error_retryable_indeterminate_deferred, 1,
+        "latest-unfinished → indeterminate-hold counter"
+    );
+    assert_eq!(
+        summary.docs_advanced.error_retryable_dispatched, 0,
+        "latest-unfinished must NOT route to stage_send::run (would be duplicate-send)"
+    );
+    assert_eq!(
+        summary.docs_advanced.error_retryable_escalated_to_manual, 0,
+        "latest-unfinished is NOT per-class escalation (different signal)"
+    );
+    assert_eq!(
+        summary.docs_advanced.error_retryable_budget_exhausted, 0,
+        "latest-unfinished is NOT budget exhaust (different signal)"
+    );
+
+    // (4) Forensic audit emitted at Severity::Error.
+    assert_eq!(
+        audit_count(app.db(), "BOOT_ER_RETRY_CLASS_INDETERMINATE").await,
+        1,
+        "BOOT_ER_RETRY_CLASS_INDETERMINATE audit fires once"
+    );
+}
+
+// ─── Fixture 3b — two-boot SENDING-crash after TransientRetry ──────────
+//
+// End-to-end across two reconcile_pending_with calls.  Combined
+// zero `send_chk_count` across BOTH ticks is the load-bearing
+// safety contract.
+
+#[tokio::test]
+async fn fixture_3b_sending_crash_after_transient_retry_second_boot_no_resend() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let doc = seed_doc_with_signed_xml(app.db(), fn_id, 0x3B, "SENDING").await;
+
+    // Prior completed TransientRetry attempt (attempt 1).
+    seed_completed_transport_trace_at_attempt(
+        app.db(),
+        doc,
+        1,
+        "RETRYABLE_TRANSPORT",
+        Some("TransientRetry"),
+    )
+    .await;
+    // Current unfinished attempt (attempt 2) — this is the in-flight
+    // SENDING row left behind by the crashed stage_send::run.
+    sqlx::query(
+        "INSERT INTO transport_trace (document_id, attempt_no, backend_profile_id, \
+            transport_profile_id, request_envelope_sha256) \
+         VALUES (?, 2, 'b1', 't1', ?)",
+    )
+    .bind(doc)
+    .bind(vec![0u8; 32])
+    .execute(app.db())
+    .await
+    .expect("seed unfinished trace row");
+
+    let stub = dps_panic_on_any_method(
+        "two-boot SENDING/ER: zero send_chk across BOTH ticks (Pattern B + H1 closure)",
+    );
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+
+    // ── Boot 1: SENDING → ER ────────────────────────────────────────
+    let boot1_deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+    let boot1 = app
+        .reconcile_pending_with(boot1_deps)
+        .await
+        .expect("boot 1 reconcile green");
+
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "ERROR_RETRYABLE",
+        "boot 1: SENDING → ErrorRetryable via Pattern B crash-resume"
+    );
+    assert_eq!(
+        boot1.docs_advanced.sending_resumed, 1,
+        "boot 1: sending_resumed counter"
+    );
+    assert_eq!(
+        audit_count(app.db(), "BOOT_RESUME_SENDING_TO_ERROR_RETRYABLE").await,
+        1,
+        "boot 1: SENDING-resume audit"
+    );
+    // Trace row 2 stays unfinished — boot 1 CAS only touched
+    // fiscal_documents.state, not transport_trace.
+    assert_eq!(
+        count_transport_trace(app.db(), doc).await,
+        2,
+        "boot 1: trace row count unchanged (resume helper does not touch trace)"
+    );
+
+    // ── Boot 2: ER recovery sees unfinished latest trace ────────────
+    let boot2_deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+    let boot2 = app
+        .reconcile_pending_with(boot2_deps)
+        .await
+        .expect("boot 2 reconcile green");
+
+    // (1) Doc stays in ER (indeterminate hold).
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "ERROR_RETRYABLE",
+        "boot 2: ER + unfinished latest trace → indeterminate hold; NO Pattern B re-drive"
+    );
+
+    // (2) Indeterminate-hold counter increments on boot 2.
+    assert_eq!(
+        boot2.docs_advanced.error_retryable_indeterminate_deferred, 1,
+        "boot 2: latest-unfinished routes to indeterminate hold"
+    );
+    assert_eq!(
+        boot2.docs_advanced.error_retryable_dispatched, 0,
+        "boot 2: stage_send::run must NOT fire on latest-unfinished"
+    );
+
+    // (3) **LOAD-BEARING combined**: zero DPS contact across BOTH
+    //     ticks.  Pre-hardening, boot 2 would have triggered a
+    //     duplicate send_chk on the same envelope as the crashed
+    //     attempt — the exact hazard H1 reports.
+    assert_eq!(
+        stub.call_count(),
+        0,
+        "H1 closure: zero send_chk across TWO consecutive boots (SENDING crash + ER recovery)"
+    );
+}
+
+// ─── HP2-3 / ADR-M3-A10 structural enforcement ─────────────────────────
+//
+// Two `reconcile_pending_with` calls on the same `App` MUST
+// serialise through the recon mutex.  A stub DPS channel records
+// peak in-flight concurrency on `last_chk`; under the mutex
+// max-in-flight stays at 1.
+
+struct SequenceProbingDpsStub {
+    started: AtomicUsize,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+impl SequenceProbingDpsStub {
+    fn new() -> Self {
+        Self {
+            started: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        }
+    }
+    fn max_concurrency_observed(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+    fn calls_started(&self) -> usize {
+        self.started.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl DpsChannel for SequenceProbingDpsStub {
+    async fn send_chk(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        unreachable!("SequenceProbingDpsStub: send_chk not exercised")
+    }
+    async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(cur, Ordering::SeqCst);
+        // Pause inside the critical section so an un-serialised
+        // parallel caller would visibly increment in_flight > 1.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        Ok(CheckAck {
+            id: "expected-id-CC".into(),
+            id_sign: vec![],
+            data_sign: vec![0xCC; 32],
+        })
+    }
+    async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        unreachable!()
+    }
+    async fn status_rro(&self, _: &CheckSignBlob) -> Result<StatusSnapshot, DpsError> {
+        unreachable!()
+    }
+    async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn concurrent_reconcile_pending_with_same_app_serializes() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let _doc = seed_doc_sent_with_server_fiscal_no(app.db(), fn_id, 0xCC, "expected-id-CC").await;
+
+    let stub = SequenceProbingDpsStub::new();
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let app_b = app.clone();
+
+    // tokio::join! multiplexes two futures on the same task — when
+    // future A hits `tokio::time::sleep` inside last_chk, future B
+    // is polled.  Absent the recon mutex, B would enter
+    // reconcile_pending_inner and re-invoke last_chk on the same
+    // SENT doc before A's critical section released.  With the
+    // mutex, B awaits the lock and never enters the dispatcher.
+    let deps_a = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+    let deps_b = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    let (result_a, result_b) = tokio::join!(
+        app.reconcile_pending_with(deps_a),
+        app_b.reconcile_pending_with(deps_b),
+    );
+    let result_a = result_a.expect("recon A green");
+    let result_b = result_b.expect("recon B green");
+
+    // Exactly one boot processed the SENT doc (the other reconcile
+    // saw it already advanced past pending).
+    let total_sent_match =
+        result_a.docs_advanced.sent_match_to_kvt1 + result_b.docs_advanced.sent_match_to_kvt1;
+    assert_eq!(
+        total_sent_match, 1,
+        "ADR-M3-A10 serialised: exactly one boot processed the SENT doc"
+    );
+
+    // **LOAD-BEARING:** max in-flight last_chk == 1.  Absent the
+    // mutex, the 50ms sleep inside last_chk would let both calls
+    // overlap and max_in_flight would reach 2.
+    assert_eq!(
+        stub.max_concurrency_observed(),
+        1,
+        "HP2-3 / ADR-M3-A10: last_chk MUST NOT overlap across concurrent reconcile_pending_with on the same App"
+    );
+    assert_eq!(
+        stub.calls_started(),
+        1,
+        "serialised: second boot has nothing pending after first commits"
+    );
+}
+
+// ─── Fixture 1c — PREPARED replay payload_json byte-equality drift ─────
+//
+// HP2-4 closure: extends fixture 1b's hash-only drift detection
+// with explicit `payload_json` byte-equality.  Seeds fd.payload_json
+// and inbox.payload_json with DIFFERENT JSON but the SAME
+// `payload_sha256_canonical` and SAME `doc_type` — the hash-only
+// check from pass 1 would have missed this drift.  Pass-2 check
+// catches it via the byte-equality predicate.
+
+#[tokio::test]
+async fn fixture_1c_prepared_replay_payload_json_drift_holds() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    let _shift = seed_open_shift_and_node(app.db(), fn_id).await;
+    let (doc, req_id) = seed_doc_prepared_full(app.db(), fn_id, 0x1C).await;
+
+    // Seed inbox with DIFFERENT payload_json but the SAME hash and
+    // SAME operation_type as the doc.  Pass-1 drift check would
+    // pass; pass-2 byte-equality catches the mismatch.
+    let inbox_sha = vec![0u8; 32];
+    let req_slice: &[u8] = &req_id;
+    let mutated_payload_json = r#"{"items":[{"code":"DRIFT","name":"Y","price_kop":1,"quantity_thousandths":1,"sum_kop":1}],"payments":[{"name":"CASH","sum_kop":1,"type_code":"0"}]}"#;
+    sqlx::query(
+        "INSERT INTO ingress_inbox(request_id, fiscal_number, protocol, operation_type, \
+            idempotency_key, payload_json, payload_sha256_canonical, status) \
+         VALUES (?, ?, 'REST', 'SELL', ?, ?, ?, 'PROCESSING')",
+    )
+    .bind(req_slice)
+    .bind(fn_id)
+    .bind(format!("idem-{:02x}", req_id[0]))
+    .bind(mutated_payload_json)
+    .bind(&inbox_sha)
+    .execute(app.db())
+    .await
+    .unwrap();
+
+    let stub =
+        dps_panic_on_any_method("HP2-4: payload_json drift must NOT touch DPS / sign / send");
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile green");
+
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "PREPARED",
+        "payload_json drift: doc stays in PREPARED, no sign/send"
+    );
+    assert_eq!(
+        stub.call_count(),
+        0,
+        "payload_json drift hold: zero DPS calls"
+    );
+    assert_eq!(
+        summary.docs_advanced.prepared_replay_drift_deferred, 1,
+        "HP2-4: payload_json byte mismatch increments drift counter"
+    );
+    assert_eq!(
+        summary.docs_advanced.prepared_dispatched, 0,
+        "drift must NOT proceed to stage_sign + stage_send"
+    );
+
+    let critical_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'BOOT_PREPARED_REPLAY_DRIFT' AND severity = 'CRITICAL'",
+    )
+    .fetch_one(app.db())
+    .await
+    .expect("count critical drift audits");
+    assert_eq!(critical_count, 1, "drift emits Severity::Critical");
+
+    let audit_payload: String = sqlx::query_scalar(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE event_type = 'BOOT_PREPARED_REPLAY_DRIFT'",
+    )
+    .fetch_one(app.db())
+    .await
+    .expect("read drift audit payload");
+    assert!(
+        audit_payload.contains("\"payload_json_mismatch\":true"),
+        "audit payload must surface payload_json_mismatch=true: {audit_payload}"
+    );
+
+    assert!(
+        read_document_file_kind(app.db(), doc, "SIGNED_XML")
+            .await
+            .is_none(),
+        "stage_sign must NOT run on payload_json drift"
+    );
+}
