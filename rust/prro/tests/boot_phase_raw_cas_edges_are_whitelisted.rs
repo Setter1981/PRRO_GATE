@@ -12,12 +12,11 @@
 //! ADR-M3-A10 and the carry-forward residual called out in
 //! `docs/M3a-handoff.md §6.1`.
 //!
-//! Bypassing the helper means bypassing the whitelist check.  A code
-//! refactor that drops an edge from `allowed_transition` (e.g. tightening
-//! the state machine) would leave boot_phase quietly issuing forbidden
-//! CAS — the UPDATE would no-op (CAS predicate mismatches the row's
-//! state at runtime), and a stuck boot would surface only via passive
-//! audit or a confused operator.
+//! Bypassing the helper means bypassing the whitelist check.  If an
+//! edge is removed from `allowed_transition` but a raw boot_phase
+//! CAS remains, the raw SQL would still apply the transition whenever
+//! the row state matches, silently violating the state-machine
+//! whitelist.  This test catches that drift at `cargo test` time.
 //!
 //! This test is the cheap-fix for HIGH-2 (option B in the M3a review):
 //! at compile time it scans the boot_phase source as a string, extracts
