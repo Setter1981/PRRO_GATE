@@ -65,7 +65,7 @@ Plus one chore commit on top of `a7369b9`: `08fc6c4` (`chore(plan/m3a): mark W6/
   - #8 KVT2 — `stage_finalize::run` drives Kvt2 → Ack without DPS query (protocol-final).
   - #9 ERROR_RETRYABLE — happy retry without MAC budget burn.
 
-Five `#[ignore]`d fixtures live in `tests/app_boot_quick_check_failure.rs` — corruption-fixture infra (sqlx::migrate! re-application self-heals).  Deferred to M3b infra cleanup; not gating M3a exit.
+The 5 ignored entries break down as 4 `#[ignore]`d integration fixtures in `tests/app_boot_quick_check_failure.rs` (corruption-fixture infrastructure — sqlx::migrate! re-application self-heals; lines 153 / 183 / 249 / 298) plus 1 ignored library doc-test (`services::write_path::types::bridge_anyhow_to`, line 119).  All five deferred to M3b infra cleanup; none gate M3a exit.
 
 CI: 5 platforms green on `rust-gateway` HEAD (`fmt + clippy (gnu)`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `x86_64-pc-windows-msvc`, `aarch64-unknown-linux-gnu`).
 
@@ -104,20 +104,20 @@ W0-3 §6 mandates: for every pending `DocState`, `App::reconcile_pending(_with)`
 
 ---
 
-## 4. bd issues closed by implementation proof
+## 4. bd issues — M3a implementation proof vs full closure scope
 
-All 5 entry-decision bd issues (W0 exit criteria) have their closure-gate satisfied by code on `rust-gateway`:
+The 5 entry-decision bd issues each have an M3a-scoped portion that is **demonstrably closed by code on `rust-gateway`** and, for two of them, a **non-M3a residual scope** (Python-stack audit / retry-pacing / offline-id path) that MUST stay open or be split before closing the parent bd issue.  Read the table as "implementation proof landed", NOT "issue ready to close".
 
-| bd | Closure proof on `rust-gateway` |
-|----|--------------------------------|
-| **PRRO_GATE-ddn** | UNIQUE migration `007_lnd_unique.sql` (W1) + `next_lnd` sequencer via `node_state::allocate_next_lnd` (W5).  `tests/migrations_007_008.rs` + `tests/write_path_stage1_acquire.rs::stage1_unique_fn_lnd_collision_fails_closed` green. |
-| **PRRO_GATE-zti** | `stage_sign::derive_wire_artifact_kind` maps `ShiftClose` and `ZReport` to `WireArtifactKind::ZReport` at the W6 builder boundary; ZReport-only fixtures in `tests/write_path_stage3_sign.rs`. |
-| **PRRO_GATE-k99** | `WriteTxConn<'_>` sealed newtype in `db/tx.rs` (W2); 4 trybuild compile-fail fixtures + `transition_state_atomicity` 2/2 green. |
-| **PRRO_GATE-6bj** | `error_routing::route_send_result` (W10) — 21 routing fixtures + MAC recovery -12 fixture green.  `DocState::Sending` + crash-resume rule in W11 fixture #3. |
-| **PRRO_GATE-ah8** | `tests/app_boot_reconciliation.rs::ah8_shift_state_opened_preserved_across_boot` green (PRRO_GATE-ah8 verbatim acceptance). |
+| bd | M3a-scoped proof on `rust-gateway` | Residual scope outside M3a | Recommended action |
+|----|-------------------------------------|----------------------------|--------------------|
+| **PRRO_GATE-ddn** | UNIQUE migration `007_lnd_unique.sql` (W1) + `next_lnd` sequencer via `node_state::allocate_next_lnd` (W5).  `tests/migrations_007_008.rs` + `tests/write_path_stage1_acquire.rs::stage1_unique_fn_lnd_collision_fails_closed` green. | — (M3a-scoped issue; acceptance fully covered.) | **Closeable** with "superseded by W1 + W5 implementation at `a7369b9`" comment. |
+| **PRRO_GATE-zti** | `stage_sign::derive_wire_artifact_kind` maps `ShiftClose` and `ZReport` to `WireArtifactKind::ZReport` at the W6 Rust builder boundary; ZReport-only fixtures in `tests/write_path_stage3_sign.rs`. | The bd acceptance text also lists: (1) audit of Python `src/prro_gateway/transports/` for `SHIFT_CLOSE` references; (2) audit of Python `src/prro_gateway/services/`; (3) schema audit of `fiscal_documents.doc_type` for what's currently stored.  These are Python-stack items, intentionally out of scope under ADR-D1 (Rust-only pilot path). | **Do NOT close as-is.**  Either (a) annotate "M3a proof landed at builder boundary; Python audit explicitly superseded by ADR-D1 Rust-only path" and close, OR (b) retitle / split the bd issue into "M3a Rust boundary mapping" (close) and "Python adapter retirement audit" (close as superseded under ADR-D1). |
+| **PRRO_GATE-k99** | `WriteTxConn<'_>` sealed newtype in `db/tx.rs` (W2); 4 trybuild compile-fail fixtures + `transition_state_atomicity` 2/2 green. | — (M3a-scoped issue; acceptance fully covered.) | **Closeable** with "superseded by W2 implementation at `a7369b9`" comment. |
+| **PRRO_GATE-6bj** | `error_routing::route_send_result` (W10) — 21 routing fixtures + MAC recovery -12 fixture green.  `DocState::Sending` + Pattern B crash-resume rule in W11 fixture #3.  W11 fixture #6 proves `last_chk` reconciliation on SENT crash (one specific lastChk use). | bd acceptance is broader: (1) status `-3` bounded retry/backoff with exponential backoff + per-retry audit (NOT in M3a — error_routing only maps to `ErrorRetryable`; retry-pacing is deferred to M5's generic SENDING reconciler per `project_m3a_starting_point` memory); (2) status `-15` / `0` lastChk reconciliation **at submit time** (M3a covers boot-time lastChk only — W11 §6.4 SENT recovery — not the submit-time variant SubmitPtr.cs:50 describes); (3) status `-16` offline-id / technical-offline path decision (M3b — offline lifecycle); (4) targeted mocked-DpsChannel tests per branch (only the routing-classification branch landed; retry-pacing + submit-time-lastChk + offline-id branches not tested). | **Do NOT close as-is.**  Mark as "M3a proof landed for routing + boot-time lastChk recovery + invariant #1 in `with_immediate`; retry/backoff carried to M5 SENDING reconciler; submit-time lastChk carried to M5; -16 offline-id carried to M3b" and keep open OR split into 4 child issues (one per acceptance bullet) and close only the W10/W11-covered ones. |
+| **PRRO_GATE-ah8** | `tests/app_boot_reconciliation.rs::ah8_shift_state_opened_preserved_across_boot` green (PRRO_GATE-ah8 verbatim acceptance fixture). | — (M3a-scoped issue; acceptance fully covered.) | **Closeable** with "superseded by W9 implementation at `a7369b9`" comment. |
 
 **Cross-link items:**
-- **PRRO_GATE-9qd.1** (M3a epic) — should close once this handoff is approved AND all 5 children above are flipped to closed.  bd verification step lives in §6.2 below.
+- **PRRO_GATE-9qd.1** (M3a epic) — closure waits until (a) `ddn` / `k99` / `ah8` close cleanly, (b) `zti` / `6bj` are either retitled-and-closed or annotated-as-partial-and-kept-open per the recommendations above, (c) the 2 P3 W6-follow-up children (`9qd.1.1` / `9qd.1.2`) are re-parented or explicitly carried forward.  bd verification procedure lives in §6.2 below.
 - **PRRO_GATE-iap** (COM/1C compat) — pilot decision; ADR-M3-A2 preserves the constraint but does NOT close the issue.  Stays open into M3b/M4.
 
 **Procedural note:** the user explicitly asked NOT to close `PRRO_GATE-9qd.1` "по отчёту" — closure happens only after physical verification each child is `closed` OR explicitly superseded by implementation proof.
@@ -161,9 +161,18 @@ The PR ladder, test surface, closed contracts, and bd-closure mapping are PROPOS
 
 Before closing `PRRO_GATE-9qd.1` (M3a epic):
 
-1. Verify each of the 5 entry-decision children (ddn / zti / k99 / 6bj / ah8) is physically in `closed` state via `bd list --parent PRRO_GATE-9qd.1 --status closed`; any still `open` must either be closed with a "superseded by code at <commit>" comment OR re-opened as M3b carry-forward.
-2. Verify the M3 parent epic `PRRO_GATE-9qd` has only this one M3a child plus an M3b placeholder (open at M3b plan time).
-3. Comment `PRRO_GATE-9qd.1` with the handoff commit hash + this document path; close.
+1. **Resolve the 5 entry-decision children** per the §4 recommendations:
+   - `PRRO_GATE-ddn` / `PRRO_GATE-k99` / `PRRO_GATE-ah8` — `bd close <id>` with "superseded by [W1+W5 / W2 / W9] implementation at `a7369b9`" comment.
+   - `PRRO_GATE-zti` — retitle to "M3a Rust builder boundary mapping (Python adapter audit superseded by ADR-D1)" and close, OR keep open with annotation that the Python audit is no longer applicable.
+   - `PRRO_GATE-6bj` — keep open with annotation "M3a proof landed for routing + boot-time lastChk + invariant #1; retry-pacing → M5, submit-time lastChk → M5, -16 offline-id → M3b", OR split into 4 child issues and close only the W10/W11-covered ones.
+2. **Resolve the 2 P3 W6-follow-up children** (`PRRO_GATE-9qd.1.1` document_files `query!` macro migration, `PRRO_GATE-9qd.1.2` feature-gate `test_hook`):
+   - Either re-parent under a new M3a-tail-cleanup or M3b-prep epic, OR close with explicit "carry-forward to dedicated cleanup PR" comment.  Both are non-functional code-hygiene items per `project_m3a_starting_point` memory's carry-forward section.
+3. **Verify the M3 parent epic `PRRO_GATE-9qd` real phase chain.**  Current actual state (verified `bd list --parent PRRO_GATE-9qd`): the M-series chain `PRRO_GATE-9qd.{1,2,3,4,5}` (M3a, M3b, M4, M5, M6) is **already declared** as a single nested phase chain.  Confirm:
+   - `9qd.1` (M3a) → ready to close once §6.2.1 + §6.2.2 resolved.
+   - `9qd.2` (M3b) → stays open / blocked as next phase.
+   - `9qd.3` (M4) / `9qd.4` (M5) / `9qd.5` (M6) → preserved as placeholders for downstream sizing (ADR open items O1 / O2 / O3 are the bottleneck on filling these in — see §6.4).
+   - No additional M3a child should be created on top of this structure; the chain is correct as-is.
+4. Comment `PRRO_GATE-9qd.1` with the handoff commit hash (from this PR, after merge) + this document path; close.
 
 ### 6.3 ONLINE-against-test-DPS smoke (ADR D3 gate #4)
 
