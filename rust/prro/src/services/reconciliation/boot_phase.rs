@@ -116,6 +116,17 @@ pub struct DispatchHistogram {
     /// `BOOT_PREPARED_REPLAY_DRIFT` (Severity::Critical).  Operator
     /// manual intervention required.
     pub prepared_replay_drift_deferred: usize,
+    /// M3a hardening pass 1 — ER docs that would otherwise route
+    /// to `stage_send::run` via the TransientRetry arm but have
+    /// `attempts_used(doc_id) >= MAX_BOOT_ATTEMPTS` (W9 freeze
+    /// §4.0).  Doc transitions `ErrorRetryable →
+    /// RequiresManualReconciliation` with audit
+    /// `BOOT_ER_BUDGET_EXHAUSTED` (Severity::Error).  Closes
+    /// H2 (boot-attempt budget cap declared in
+    /// `MAX_BOOT_ATTEMPTS` but never enforced — without this an
+    /// infinitely-failing TransientRetry doc would re-dispatch
+    /// `send_chk` on every boot tick forever).
+    pub error_retryable_budget_exhausted: usize,
     /// W9.4 M3 fix counter — per-doc dispatch failures absorbed by
     /// the try-and-audit shim (helper-level Err that's NOT fatal at
     /// branch level).  Operator dashboard surfaces these via
@@ -145,6 +156,7 @@ impl DispatchHistogram {
             + self.error_retryable_probe_deferred
             + self.error_retryable_indeterminate_deferred
             + self.prepared_replay_drift_deferred
+            + self.error_retryable_budget_exhausted
             + self.dispatch_errors
     }
 
@@ -169,6 +181,7 @@ impl DispatchHistogram {
         self.error_retryable_probe_deferred += other.error_retryable_probe_deferred;
         self.error_retryable_indeterminate_deferred += other.error_retryable_indeterminate_deferred;
         self.prepared_replay_drift_deferred += other.prepared_replay_drift_deferred;
+        self.error_retryable_budget_exhausted += other.error_retryable_budget_exhausted;
         self.dispatch_errors += other.dispatch_errors;
     }
 }
@@ -1084,6 +1097,7 @@ pub async fn run_boot_reconciliation(
             "error_retryable_probe_deferred": histogram.error_retryable_probe_deferred,
             "error_retryable_indeterminate_deferred": histogram.error_retryable_indeterminate_deferred,
             "prepared_replay_drift_deferred": histogram.prepared_replay_drift_deferred,
+            "error_retryable_budget_exhausted": histogram.error_retryable_budget_exhausted,
             "dispatch_errors": histogram.dispatch_errors,
         },
         "pending_visited": histogram.total_visited(),
@@ -1352,6 +1366,63 @@ pub async fn cas_error_retryable_to_manual_reconciliation(
     .await
 }
 
+/// M3a hardening pass 1 — H2 closure: CAS `ErrorRetryable →
+/// RequiresManualReconciliation` for ER/TransientRetry docs whose
+/// boot-attempt budget (`attempts_used(doc_id) >=
+/// MAX_BOOT_ATTEMPTS`) is exhausted.  Same single `with_immediate`
+/// envelope as the per-class escalation helper, but with a
+/// distinct audit type so operator dashboards can alert on the
+/// "infinite TransientRetry stuck" signal separately from
+/// per-class non-retryable escalations.
+///
+/// Payload carries `attempts_used`, `max_boot_attempts`, and
+/// `retry_class` for forensics.  Severity::Error (operator triage
+/// required, but not a structural breach).
+async fn cas_error_retryable_budget_exhausted(
+    pool: &SqlitePool,
+    doc_id: DocumentId,
+    attempts_used: i64,
+    retry_class_str: &str,
+) -> anyhow::Result<bool> {
+    let retry_class_owned = retry_class_str.to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            let cas = sqlx::query(
+                "UPDATE fiscal_documents SET state = 'REQUIRES_MANUAL_RECONCILIATION' \
+                 WHERE document_id = ? AND state = 'ERROR_RETRYABLE'",
+            )
+            .bind(doc_id)
+            .execute(&mut **tx)
+            .await?;
+            if cas.rows_affected() != 1 {
+                return Ok::<bool, anyhow::Error>(false);
+            }
+
+            let payload = serde_json::json!({
+                "document_id": hex_lower(doc_id.as_bytes()),
+                "branch": "c-error-retryable-budget-exhausted",
+                "retry_class": retry_class_owned,
+                "attempts_used": attempts_used,
+                "max_boot_attempts": MAX_BOOT_ATTEMPTS,
+                "rationale":
+                    "TransientRetry boot-attempt budget exhausted (attempts_used >= MAX_BOOT_ATTEMPTS); doc would re-burn DPS quota every boot tick without escalation; operator triage required per W9 freeze §4.0",
+            });
+            audit_log::append_tx(
+                tx,
+                "fiscal_document",
+                &hex_lower(doc_id.as_bytes()),
+                "BOOT_ER_BUDGET_EXHAUSTED",
+                crate::db::models::enums::Severity::Error,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await?;
+            Ok::<bool, anyhow::Error>(true)
+        })
+    })
+    .await
+}
+
 /// M3a hardening pass 1 — emit a forensic audit for an ER doc held
 /// without state change (ProbeRequired / indeterminate `retry_class`).
 /// No CAS, no DPS — the doc stays in `ErrorRetryable` until M5's
@@ -1430,6 +1501,38 @@ async fn dispatch_error_retryable_by_class(
 
     match retry_class {
         Some(RetryClass::TransientRetry) => {
+            // M3a hardening pass 1 — H2 closure: enforce the
+            // boot-attempt budget cap BEFORE re-dispatching.
+            // `MAX_BOOT_ATTEMPTS = 5` is declared in W9 freeze §4.0;
+            // without this gate an infinitely-failing TransientRetry
+            // doc would re-burn DPS quota on every boot tick.
+            // `attempts_used` counts ALL transport_trace rows for
+            // the doc (both completed and in-flight), so the cap
+            // covers crash-mid-send attempts too per W9 docstring.
+            let attempts = tt::attempts_used(pool, doc_id).await?;
+            if attempts >= MAX_BOOT_ATTEMPTS {
+                match cas_error_retryable_budget_exhausted(
+                    pool,
+                    doc_id,
+                    attempts,
+                    RetryClass::TransientRetry.as_str(),
+                )
+                .await
+                {
+                    Ok(_) => histogram.error_retryable_budget_exhausted += 1,
+                    Err(e) => {
+                        emit_dispatch_error(
+                            pool,
+                            doc_id,
+                            "c-error-retryable-budget",
+                            &e,
+                            histogram,
+                        )
+                        .await?
+                    }
+                }
+                return Ok(());
+            }
             match stage_send::run(pool, deps.dps, doc_id, Some(deps.signing_ctx)).await {
                 Ok(_) => histogram.error_retryable_dispatched += 1,
                 Err(e) => {

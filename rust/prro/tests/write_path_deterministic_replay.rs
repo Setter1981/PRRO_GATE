@@ -676,6 +676,14 @@ async fn fixture_9_error_retryable_retries_without_mac_counter_burn() {
     // indeterminate.  This fixture's intent (happy retry without
     // MAC budget burn) requires `TransientRetry` to invoke
     // stage_send::run.
+    //
+    // **Boundary note (H2 closure boundary).**  `seed_completed_
+    // transport_trace` writes exactly one row (`attempt_no=1`); the
+    // H2 budget cap fires only when
+    // `transport_trace::attempts_used(doc) >= MAX_BOOT_ATTEMPTS`
+    // (=5).  1 < 5, so the TransientRetry arm proceeds to
+    // stage_send::run as designed.  Fixture #9g covers the
+    // budget-exhausted case (5 seeded attempts).
     seed_completed_transport_trace(app.db(), doc, "RETRYABLE_TRANSPORT", Some("TransientRetry"))
         .await;
 
@@ -913,15 +921,31 @@ async fn seed_completed_transport_trace(
     outcome_kind: &str,
     retry_class: Option<&str>,
 ) {
+    seed_completed_transport_trace_at_attempt(pool, doc, 1, outcome_kind, retry_class).await;
+}
+
+/// Seed a completed `transport_trace` row at a specific
+/// `attempt_no`.  H2 budget-cap fixtures seed multiple rows
+/// (`attempt_no = 1..=N`) so `transport_trace::attempts_used`
+/// returns the total count and the dispatcher trips the
+/// `MAX_BOOT_ATTEMPTS` cap.
+async fn seed_completed_transport_trace_at_attempt(
+    pool: &SqlitePool,
+    doc: DocumentId,
+    attempt_no: i32,
+    outcome_kind: &str,
+    retry_class: Option<&str>,
+) {
     let envelope_sha = vec![0u8; 32];
     sqlx::query(
         "INSERT INTO transport_trace (document_id, attempt_no, backend_profile_id, \
             transport_profile_id, request_envelope_sha256, completed_at, \
             wire_call_started_at, wire_call_finished_at, outcome_kind, retry_class) \
-         VALUES (?, 1, 'b1', 't1', ?, '2026-04-22T12:00:00Z', \
+         VALUES (?, ?, 'b1', 't1', ?, '2026-04-22T12:00:00Z', \
             '2026-04-22T12:00:00Z', '2026-04-22T12:00:01Z', ?, ?)",
     )
     .bind(doc)
+    .bind(attempt_no)
     .bind(&envelope_sha)
     .bind(outcome_kind)
     .bind(retry_class)
@@ -2080,5 +2104,140 @@ async fn fixture_1b_prepared_replay_drift_holds_with_critical_audit() {
             .await
             .is_none(),
         "stage_sign must NOT run on drift detection"
+    );
+}
+
+// ─── M3a hardening pass 1 — H2 closure: TransientRetry budget cap ──────
+//
+// W9 freeze §4.0 declares `MAX_BOOT_ATTEMPTS = 5` (the cap
+// `transport_trace::attempts_used(doc_id) >= MAX_BOOT_ATTEMPTS →
+// escalate to RequiresManualReconciliation`).  Without enforcement
+// at dispatch, an infinitely-failing TransientRetry doc would
+// re-burn `send_chk` on every boot tick forever.  This fixture
+// pins the cap.
+//
+// **Assertions:**
+//   (1) state ER → REQUIRES_MANUAL_RECONCILIATION.
+//   (2) `send_chk_count == 0` — zero DPS contact at budget exhaust.
+//   (3) `BOOT_ER_BUDGET_EXHAUSTED` audit emitted exactly once with
+//       Severity::Error and payload carrying `attempts_used`,
+//       `max_boot_attempts`, `retry_class`.
+//   (4) histogram counter `error_retryable_budget_exhausted == 1`.
+//   (5) `error_retryable_dispatched == 0` — stage_send::run did
+//       NOT fire (budget gate intercepted).
+//   (6) No `BOOT_ER_ESCALATED_TO_MANUAL` audit — that is the
+//       per-class escalation event; budget-exhausted has its own
+//       distinct event type for operator-dashboard separation.
+
+#[tokio::test]
+async fn fixture_9g_er_transient_retry_budget_exhausted_escalates() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let doc = seed_doc_with_signed_xml(app.db(), fn_id, 0x9C, "ERROR_RETRYABLE").await;
+
+    // Seed 5 completed transport_trace rows (attempts 1..=5), each
+    // tagged TransientRetry.  `attempts_used` returns COALESCE(MAX,
+    // 0) = 5; the dispatcher's budget gate (`attempts >= 5`) trips.
+    for attempt in 1..=5 {
+        seed_completed_transport_trace_at_attempt(
+            app.db(),
+            doc,
+            attempt,
+            "RETRYABLE_TRANSPORT",
+            Some("TransientRetry"),
+        )
+        .await;
+    }
+
+    let stub =
+        dps_panic_on_any_method("H2 budget cap: zero DPS contact on TransientRetry budget exhaust");
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile green");
+
+    // (1) State ER → REQUIRES_MANUAL_RECONCILIATION.
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "budget exhausted: ER → RequiresManualReconciliation via CAS"
+    );
+
+    // (2) Zero DPS contact — the gate fires BEFORE stage_send::run.
+    assert_eq!(
+        stub.call_count(),
+        0,
+        "H2: budget-exhausted dispatch must not invoke send_chk"
+    );
+
+    // (3) Distinct budget-exhausted audit emitted once.
+    assert_eq!(
+        audit_count(app.db(), "BOOT_ER_BUDGET_EXHAUSTED").await,
+        1,
+        "BOOT_ER_BUDGET_EXHAUSTED audit fires exactly once"
+    );
+    // Severity::Error per design (operator triage needed; not a
+    // structural breach — the doc IS retryable in principle, just
+    // out of automatic budget).
+    let error_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'BOOT_ER_BUDGET_EXHAUSTED' AND severity = 'ERROR'",
+    )
+    .fetch_one(app.db())
+    .await
+    .expect("count error budget audits");
+    assert_eq!(
+        error_count, 1,
+        "BOOT_ER_BUDGET_EXHAUSTED must emit Severity::Error"
+    );
+    // Payload should record attempts_used + max + retry_class for forensics.
+    let payload: String = sqlx::query_scalar(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE event_type = 'BOOT_ER_BUDGET_EXHAUSTED'",
+    )
+    .fetch_one(app.db())
+    .await
+    .expect("read audit payload");
+    assert!(
+        payload.contains("\"attempts_used\":5"),
+        "audit payload must record attempts_used=5: {payload}"
+    );
+    assert!(
+        payload.contains("\"max_boot_attempts\":5"),
+        "audit payload must record max_boot_attempts=5: {payload}"
+    );
+    assert!(
+        payload.contains("\"retry_class\":\"TransientRetry\""),
+        "audit payload must record retry_class=TransientRetry: {payload}"
+    );
+
+    // (4) Histogram counter.
+    assert_eq!(
+        summary.docs_advanced.error_retryable_budget_exhausted, 1,
+        "histogram: budget-exhausted increments error_retryable_budget_exhausted"
+    );
+
+    // (5) stage_send::run path must NOT have fired.
+    assert_eq!(
+        summary.docs_advanced.error_retryable_dispatched, 0,
+        "stage_send::run dispatch path must NOT increment under budget exhaust"
+    );
+
+    // (6) NO per-class escalation audit — budget-exhausted has its
+    // own distinct event, the per-class arm did not fire.
+    assert_eq!(
+        audit_count(app.db(), "BOOT_ER_ESCALATED_TO_MANUAL").await,
+        0,
+        "budget-exhausted must NOT also emit BOOT_ER_ESCALATED_TO_MANUAL (distinct dashboards)"
     );
 }
