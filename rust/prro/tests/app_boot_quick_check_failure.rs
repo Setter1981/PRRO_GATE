@@ -255,12 +255,33 @@ fn file_sha256(path: &Path) -> [u8; 32] {
 /// This subsumes the original three table-targeted assertions
 /// without any of their fragility.
 ///
-/// The WAL / SHM sidecar files are deliberately NOT hashed: the
-/// probe pool's `connect_with` MAY touch them on open
-/// (`journal_mode = WAL` re-issues `PRAGMA journal_mode` per
-/// connection).  The fail-closed contract is about PERSISTED
-/// domain rows, which live in the main file; sidecar metadata
-/// touches are operational noise.
+/// ## Scope of the assertion — explicit carve-out (HP3 post-merge)
+///
+/// **What this fixture proves:**
+///   - `App::boot` does NOT run `sqlx::migrate!` on the corrupted
+///     existing DB (Phase B is unreachable because Phase A returns
+///     `Err(IntegrityCheckFailed)`).
+///   - No persisted domain DML — `node_state` / `audit_log` /
+///     `shifts` / `fiscal_documents` rows are not touched — because
+///     the main DB file is byte-identical across the failed boot.
+///
+/// **What this fixture does NOT prove — and intentionally so:**
+///   - The WAL / SHM sidecar files (`*-wal` / `*-shm`) are NOT
+///     hashed.  Phase A's probe pool issues `PRAGMA journal_mode =
+///     WAL` on `connect_with`, which legitimately touches sidecar
+///     metadata (WAL header initialisation, SHM mapping) without
+///     constituting domain DML.  This is platform-dependent SQLite
+///     behaviour: byte sizes of the sidecars after a probe-open are
+///     not constant across SQLite versions / OS / filesystem, so
+///     asserting "sidecar unchanged" would flake on legitimate
+///     metadata writes.
+///   - The Finding-2 closure contract is "do not migrate; do not
+///     write domain rows before fail-closed return", NOT "do not
+///     touch WAL metadata ever".  Sidecar touches are operational
+///     noise; not a safety contract.
+///
+/// Asserting the main-file SHA-equality is the correct, minimal,
+/// mechanism-independent proof of the closure contract.
 #[tokio::test]
 async fn quick_check_fail_main_file_bytes_unchanged_no_domain_writes() {
     let dir = tempfile::tempdir().unwrap();
