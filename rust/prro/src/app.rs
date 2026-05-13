@@ -157,11 +157,105 @@ impl App {
         let singleton = crate::runtime::singleton::acquire(&config.database.db_path)
             .map_err(|e| BootError::Internal(format!("singleton lock: {e}")))?;
 
-        // (3) Pool open + migrations (sqlx::migrate! inside `open_pool`).
-        //     `open_pool` returns `anyhow::Error`; if the underlying cause
-        //     is `sqlx::Error` preserve that as `BootError::Database`
-        //     (W9.1 review LOW 1 fix — type-information preservation).
-        //     Otherwise fall back to `BootError::Internal`.
+        // (3a) M3a hardening pass 3 — pre-migration integrity probe
+        //      for existing DBs.  Per Finding 2 of the second deep
+        //      review: `sqlx::migrate!` re-applies on corrupted DBs
+        //      and can silently overwrite the corrupted region (the
+        //      4 `#[ignore]`d fixtures in `app_boot_quick_check_failure.rs`
+        //      were blocked by exactly this).  Two-phase open:
+        //        (a) Existing DB → probe-only open WITHOUT migrate
+        //            → `PRAGMA quick_check(1)` → close.  If
+        //            quick_check fails, return
+        //            `BootError::IntegrityCheckFailed` BEFORE any
+        //            migration runs against the corrupted file; no
+        //            domain writes (audit_log / node_state / shifts)
+        //            can land on a broken DB.
+        //        (b) Fresh DB → skip Phase A (file is empty / absent;
+        //            quick_check on header-only file would either
+        //            fail spuriously or pass trivially); fall through
+        //            to the standard create+migrate path at (3b).
+        //      Singleton lock (step 2) already prevents another
+        //      process from racing this two-phase open.
+        let db_path = &config.database.db_path;
+        let db_exists = db_path.try_exists().unwrap_or(false)
+            && std::fs::metadata(db_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+        if db_exists {
+            // Phase A.  Attempt probe-open; if that itself fails on
+            // an EXISTING file (which we just verified above), the
+            // most likely cause is structural damage that prevents
+            // SQLite from even initialising the pager.  Surface as
+            // `IntegrityCheckFailed` — same fail-closed semantics as
+            // a malformed-row quick_check result.  Transient I/O
+            // errors are extremely rare on a local SQLite file we
+            // already metadata'd one syscall ago; if they happen,
+            // the operator will retry boot.
+            let probe = match crate::db::open_pool_no_migrate(db_path).await {
+                Ok(p) => p,
+                Err(open_err) => {
+                    let sqlx_err_opt = open_err.downcast::<sqlx::Error>();
+                    let reason = match &sqlx_err_opt {
+                        Ok(e) => format!("probe pool open failed: {e}"),
+                        Err(other) => format!("probe pool open failed: {other}"),
+                    };
+                    tracing::error!(
+                        target: "prro::boot",
+                        phase = "pre_migrate_open",
+                        quick_check = %reason,
+                        "DB_INTEGRITY_CHECK_FAILED"
+                    );
+                    return Err(BootError::IntegrityCheckFailed { reason });
+                }
+            };
+            // Run quick_check + map SQLite corruption-class errors
+            // to `IntegrityCheckFailed`.  When the file's btree
+            // pages are damaged but the header still parses,
+            // `connect_with` succeeds but `PRAGMA quick_check(1)`
+            // returns `SQLITE_CORRUPT` (code 11) at query execution
+            // rather than completing with a malformed-row report.
+            // Both shapes must produce the same operator-facing
+            // signal: the DB is broken; do NOT migrate.
+            let quick_check_result = sqlx::query_scalar::<_, String>("PRAGMA quick_check(1)")
+                .fetch_all(&probe)
+                .await;
+            // Close the probe pool BEFORE returning OR re-opening
+            // with migrate.  We don't want two pools racing the WAL
+            // lock, and we don't want a leaked probe handle on the
+            // fail path either.
+            probe.close().await;
+            let reason = match quick_check_result {
+                Ok(rows) => match rows.as_slice() {
+                    [s] if s == "ok" => None,
+                    [first, ..] => Some(first.clone()),
+                    [] => Some(String::from("quick_check returned zero rows")),
+                },
+                // Any sqlx error at quick_check time on an existing
+                // DB indicates the file is damaged enough that
+                // SQLite couldn't complete the structural check.
+                // Same fail-closed treatment as a malformed-row
+                // result: surface as IntegrityCheckFailed and abort
+                // before migrations can write into the file.
+                Err(err) => Some(format!("quick_check query failed: {err}")),
+            };
+            if let Some(reason) = reason {
+                tracing::error!(
+                    target: "prro::boot",
+                    phase = "pre_migrate",
+                    quick_check = %reason,
+                    "DB_INTEGRITY_CHECK_FAILED"
+                );
+                // Critical: return BEFORE any migration runs.  No
+                // domain writes touch the corrupted file.
+                return Err(BootError::IntegrityCheckFailed { reason });
+            }
+        }
+
+        // (3b) Pool open + migrations (sqlx::migrate! inside `open_pool`).
+        //      `open_pool` returns `anyhow::Error`; if the underlying cause
+        //      is `sqlx::Error` preserve that as `BootError::Database`
+        //      (W9.1 review LOW 1 fix — type-information preservation).
+        //      Otherwise fall back to `BootError::Internal`.
         let db = crate::db::open_pool(&config.database.db_path)
             .await
             .map_err(|e| match e.downcast::<sqlx::Error>() {
@@ -169,10 +263,12 @@ impl App {
                 Err(other) => BootError::Internal(format!("open_pool: {other}")),
             })?;
 
-        // (4) Integrity probe — `PRAGMA quick_check(1)` (cap at first
-        // error; we only need fail-closed signal).  Use `query_scalar`
-        // for single-column result (cycle-7 LOW 1 fix).  `fetch_all`
-        // is defensive against zero-row corruption shapes.
+        // (4) Defence-in-depth post-migrate `PRAGMA quick_check(1)`.
+        //     For existing DBs this is redundant with Phase A (3a);
+        //     for fresh DBs this is the first opportunity to validate
+        //     that sqlx::migrate! produced a structurally sound file.
+        //     `query_scalar` + `fetch_all` defensive against
+        //     zero-row corruption shapes (cycle-7 LOW 1 fix).
         let rows: Vec<String> = sqlx::query_scalar("PRAGMA quick_check(1)")
             .fetch_all(&db)
             .await?;
@@ -184,6 +280,7 @@ impl App {
         if let Some(reason) = reason {
             tracing::error!(
                 target: "prro::boot",
+                phase = "post_migrate",
                 quick_check = %reason,
                 "DB_INTEGRITY_CHECK_FAILED"
             );
