@@ -1,6 +1,6 @@
 # M3a Handoff — exit gate before M3b implementation plan
 
-**Status:** M3a implementation phase closed.  rust-gateway HEAD = `a7369b9` (Merge PR #36 from Setter1981/m3a/W11-pr2b-runtime).  All 12 plan tasks (`docs/superpowers/plans/2026-05-07-m3a-implementation.md`) marked `completed` in commit `08fc6c4`.  Full crate test surface: **448 passed / 0 failed / 5 ignored** across 27 integration test files; all 9 W11 deterministic-replay fixtures green.
+**Status:** M3a implementation phase closed + post-handoff hardening pass 1 landed.  rust-gateway HEAD = `acba165` (Merge PR #38 from Setter1981/m3a/hardening-pass-1).  All 12 plan tasks marked `completed` in commit `08fc6c4`.  Full crate test surface: **456 passed / 0 failed / 5 ignored** across 27 integration test files; **17 W11 deterministic-replay fixtures green** (9 original + 1 PREPARED drift + 6 ER retry_class arms + 1 multi-FN per-FN resolver proof).
 
 This handoff is the **gate document** — M3b implementation plan MUST NOT open until this handoff is approved.  Mirrors the M3-W0 handoff pattern (`docs/M3-W0-handoff.md`).
 
@@ -20,7 +20,7 @@ This handoff is the **gate document** — M3b implementation plan MUST NOT open 
 
 ## 1. M3a PR ladder (chronological)
 
-Every M3a code change landed via `gh pr merge --merge` (regular merge commit; preserves the per-PR ladder in `git log --merges`).  18 PRs total: 16 W-task PRs + 1 CI infra fix (#20) + 1 docs-only (#28).
+Every M3a code change landed via `gh pr merge --merge` (regular merge commit; preserves the per-PR ladder in `git log --merges`).  20 PRs total through hardening pass 1: 16 W-task PRs + 1 CI infra fix (#20) + 1 docs-only (#28) + 1 handoff (#37) + 1 hardening pass 1 (#38).
 
 | PR | Branch | Merge commit | W-task | Summary |
 |----|--------|--------------|--------|---------|
@@ -41,7 +41,9 @@ Every M3a code change landed via `gh pr merge --merge` (regular merge commit; pr
 | #33 | `m3a/W11-pr1b` | `dcab82f` | W11/PR-1b | KVT2 fixture #8 + KVT1 corrected fixture #7 |
 | #34 | `m3a/W11-pr2a` | `1a8b4f5` | W11/PR-2a | SIGNED + ERROR_RETRYABLE wirings + fixtures #2 + #9 |
 | #35 | `m3a/W11-sent-rm-edge` | `669dbe3` | W11 prep | `(Sent, RequiresManualReconciliation)` whitelist edge for §6.4-b operator handoff |
-| #36 | `m3a/W11-pr2b-runtime` | `a7369b9` | W11/PR-2b | SENT 3-way + PREPARED + fixtures #1/#4/#5/#6 (M3a closing PR) |
+| #36 | `m3a/W11-pr2b-runtime` | `a7369b9` | W11/PR-2b | SENT 3-way + PREPARED + fixtures #1/#4/#5/#6 (W11 closing PR) |
+| #37 | `m3a/handoff` | `79ca2d6` | — | M3a handoff doc draft + plan tasks.json status flip |
+| #38 | `m3a/hardening-pass-1` | `acba165` | — | Post-handoff hardening: H1 ER retry_class filter + H2 budget cap + H3 per-FN resolver + M1 PREPARED drift detection (closes 3 HIGH + 1 MED reviewer findings) |
 
 Plus one chore commit on top of `a7369b9`: `08fc6c4` (`chore(plan/m3a): mark W6/W7/W8/W10/W9/W11 completed`) — surgical plan tasks.json status flip + lastUpdated bump; no content rewrite.
 
@@ -49,21 +51,31 @@ Plus one chore commit on top of `a7369b9`: `08fc6c4` (`chore(plan/m3a): mark W6/
 
 ## 2. Final test surface
 
-`cargo test -p prro` on `rust-gateway` post-`a7369b9`:
+`cargo test -p prro` on `rust-gateway` post-`acba165` (M3a + hardening pass 1):
 
-- **448 passed / 0 failed / 5 ignored.**
+- **456 passed / 0 failed / 5 ignored.**
 - 27 integration test files plus the lib unit-test surface and 1 trybuild driver.
 - W3 static scanner test (`tests/with_immediate_no_foreign_io.rs`) — 8 / 0 / 0 green; production source has zero foreign IO inside any `with_immediate` body.
-- W11 deterministic-replay (`tests/write_path_deterministic_replay.rs`) — **9 / 0 / 0** green:
-  - #1 PREPARED — `dispatch_prepared_via_chain` drives sign + send chain to SENT.
-  - #2 SIGNED — `stage_send::run` drives Signed → Sending → Sent on happy `send_chk`.
-  - #3 SENDING — Pattern B no-resend (`send_chk_count == 0` during recovery).
-  - #4 SENT/§6.4-a — `last_chk` Match → KVT1 + KVT1_RAW from `ack.data_sign`.
-  - #5 SENT/§6.4-b — `last_chk` Mismatch → RequiresManualReconciliation (operator handoff via PR #35 whitelist edge).
-  - #6 SENT/§6.4-c — `last_chk` NotFound → ErrorRetryable (tick 1) → SENT via `stage_send::run` (tick 2); **explicit two-tick driver per ADR-M3-A9 step 3**.
-  - #7 KVT1 — passive hold (no DPS query; M3b active-poll deferred).
-  - #8 KVT2 — `stage_finalize::run` drives Kvt2 → Ack without DPS query (protocol-final).
-  - #9 ERROR_RETRYABLE — happy retry without MAC budget burn.
+- W11 deterministic-replay (`tests/write_path_deterministic_replay.rs`) — **17 / 0 / 0** green:
+  - **Original M3a fixtures (PR #32–#36):**
+    - #1 PREPARED — `dispatch_prepared_via_chain` drives sign + send chain to SENT.
+    - #2 SIGNED — `stage_send::run` drives Signed → Sending → Sent on happy `send_chk`.
+    - #3 SENDING — Pattern B no-resend (`send_chk_count == 0` during recovery).
+    - #4 SENT/§6.4-a — `last_chk` Match → KVT1 + KVT1_RAW from `ack.data_sign`.
+    - #5 SENT/§6.4-b — `last_chk` Mismatch → RequiresManualReconciliation (operator handoff via PR #35 whitelist edge).
+    - #6 SENT/§6.4-c — `last_chk` NotFound → ErrorRetryable (tick 1) → SENT via `stage_send::run` (tick 2); **explicit two-tick driver per ADR-M3-A9 step 3**.
+    - #7 KVT1 — passive hold (no DPS query; M3b active-poll deferred).
+    - #8 KVT2 — `stage_finalize::run` drives Kvt2 → Ack without DPS query (protocol-final).
+    - #9 ERROR_RETRYABLE — happy retry without MAC budget burn (now with explicit `attempts_used < MAX_BOOT_ATTEMPTS` boundary comment).
+  - **Hardening pass 1 fixtures (PR #38):**
+    - `multi_fn_reconcile_pending_with_resolves_runtime_per_fn` — LOAD-BEARING H3 proof; two FNs + two distinct `fn_sign` blobs; `PerFnRecordingDpsStub` records the blob bytes of every `last_chk` and asserts each FN received its own identity (no foreign-identity leak).
+    - `fixture_9b_er_fn_config_error_escalates_to_manual_reconciliation` — H1 closure: FnConfigError → CAS ER → RM + Severity::Error.
+    - `fixture_9c_er_probe_required_defers_with_audit` — H1: ProbeRequired → hold + Severity::Warning; submit-time `last_chk` reconciliation correctly deferred to M5 (per PRRO_GATE-6bj annotation).
+    - `fixture_9d_er_indeterminate_retry_class_defers_with_audit` — H1: missing/NULL retry_class → hold + Severity::Error (durable evidence missing).
+    - `fixture_9e_er_terminal_reject_escalates_critical` — H1: TerminalReject in ER (structural skew) → CAS ER → RM + Severity::Critical.
+    - `fixture_9f_resolver_none_defers_with_audit` — H3 negative: per-FN resolver returns `None` → recovery falls through to deferred path, NEVER substitutes foreign identity.
+    - `fixture_9g_er_transient_retry_budget_exhausted_escalates` — H2 closure: 5 seeded transport_trace rows → `attempts_used >= MAX_BOOT_ATTEMPTS` → CAS ER → RM + `BOOT_ER_BUDGET_EXHAUSTED` Severity::Error + zero DPS.
+    - `fixture_1b_prepared_replay_drift_holds_with_critical_audit` — M1 closure: mismatched inbox/fiscal_documents payload hash → state stays PREPARED + `BOOT_PREPARED_REPLAY_DRIFT` Severity::Critical + zero sign/send.
 
 The 5 ignored entries break down into two unrelated buckets:
 - **4 integration corruption fixtures** in `tests/app_boot_quick_check_failure.rs` (lines 153 / 183 / 249 / 298), `#[ignore]`d because reliably corrupting a SQLite DB file in a way that survives sqlx::migrate! re-application requires infra not yet in tree.  Deferred to M3b infra cleanup; not an M3a gate.
@@ -84,25 +96,31 @@ CI: 5 platforms green on `rust-gateway` HEAD (`fmt + clippy (gnu)`, `x86_64-unkn
 | **A3** | implemented | `tokio::task_local!` IN_WITH_IMMEDIATE + AST static scanner in `tests/with_immediate_no_foreign_io.rs` (W3); runtime guard `assert_not_in_with_immediate` at every M2 substrate entry. |
 | **A4** | implemented | `WriteTxConn<'_>` sealed newtype with module-private `fn new` + 4 trybuild compile-fail fixtures (W2). |
 | **A5** | implemented | Pattern A at stage 3 (W6 `stage_sign::run` — sign outside, persist inside); Pattern B mandatory at stage 4 (W7 `stage_send::run` — 4-pre / 4a / 4b with SENDING marker). |
-| **A6** | implemented | `error_routing::route_send_result` table-driven dispatch (W10); 21 routing fixtures + MAC recovery -12 fixture green. |
+| **A6** | implemented + consumed | `error_routing::route_send_result` table-driven dispatch (W10); 21 routing fixtures + MAC recovery -12 fixture green.  **Hardening pass 1 (PR #38):** `dispatch_error_retryable_by_class` now consumes `transport_trace.retry_class` durable label at recovery time — TransientRetry → `stage_send::run`; non-transient classes (FnConfigError / WrapperBug / OperatorEscalation / MacRecovery / TerminalReject) → CAS ER → RequiresManualReconciliation; ProbeRequired / None → hold without state change.  `MAX_BOOT_ATTEMPTS` budget cap enforced via `attempts_used()` gate before TransientRetry dispatch.  Closes the previously documented `stage_send.rs:33-40` "crash-loop hazard". |
 | **A7** | implemented | `App::boot` 6-branch decision tree in `boot_phase::run_boot_reconciliation` (W9); 9 fixtures in `tests/app_boot_reconciliation.rs`; PRRO_GATE-ah8 verbatim acceptance fixture green. |
-| **A8** | implemented | `list_pending_for_fn` whitelist 7→8 with `Sending`; intentional whitelist gaps preserved (`intentional_whitelist_gaps_remain_forbidden`). |
+| **A8** | implemented + unhappy paths covered | `list_pending_for_fn` whitelist 7→8 with `Sending`; intentional whitelist gaps preserved (`intentional_whitelist_gaps_remain_forbidden`).  **Hardening pass 1 (PR #38):** deterministic-replay surface extended to 17 fixtures covering non-transient ErrorRetryable classes (9b/9c/9d/9e/9f/9g), multi-FN per-FN resolver (`multi_fn_...`), and PREPARED replay drift detection (1b).  Previous "happy paths only" gap closed. |
 | **A9** | implemented | `DocState::Sending` value + migration 008 + Pattern B crash-resume (CAS Sending → ErrorRetryable, **never** auto re-send).  Fixture #3 proves zero `send_chk` during SENDING recovery; fixture #6 proves the two-tick path through ErrorRetryable (NO direct `Sent → Sending`). |
-| **A10** | implemented | ADR-M3-A10 codifies the M3a global-single-writer invariant; docstring rename `lease` → `invariant`; smoke test pins ADR existence (PR #31). |
+| **A10** | documented, not structurally enforced | ADR-M3-A10 codifies the M3a global-single-writer invariant; docstring rename `lease` → `invariant`; smoke test pins ADR existence (PR #31).  **Known gap (carry-forward to M3b):** `App::reconcile_pending_with` does not encode `!Send`/`!Sync` at the type level; structural enforcement is convention-only under M3a's single-task pilot scope.  Under multi-task / multi-worker deployments this needs a behavioural concurrency guard (e.g. `tokio::sync::Mutex` inside `App::Inner`) — see §5.1 carry-forward. |
 
 ### 3.2 Pattern A / Pattern B
 
 - **Pattern A** (stage 3 sign): chain-pin in 3-PRE `with_immediate`, crypto outside, persist (CAS Prepared → Signed + PAYLOAD_XML + SIGNED_XML + audit) in 3-PERSIST `with_immediate`.  Timestamp ordering proof: `test_hook::COUNTER` + spy crypto provider; sign call seq < persist first stmt seq, structurally.
 - **Pattern B** (stage 4 send): 4-pre `with_immediate` (CAS Signed/Encrypted/ErrorRetryable → Sending + allocate `transport_trace` + `submission_attempted_at`) → wire `send_chk` OUTSIDE any envelope → 4-b `with_immediate` (post-wire CAS Sending → Sent/routed + `set_server_fiscal_no_tx` + `transport_trace::complete_tx` + audit).  W3 scanner enforces structural separation: `send_chk` is never reached from inside `with_immediate`.
 
-### 3.3 Deterministic-replay invariant (W11)
+### 3.3 Deterministic-replay invariant (W11 + hardening pass 1)
 
-W0-3 §6 mandates: for every pending `DocState`, `App::reconcile_pending(_with)` converges to the same final state whether the prior process crashed mid-pipeline or completed uninterrupted.  PR-1a..PR-2b prove this end-to-end across all 7 pending states + the 3 SENT sub-cases (a / b / c).  Critical structural assertions:
+W0-3 §6 mandates: for every pending `DocState`, `App::reconcile_pending(_with)` converges to the same final state whether the prior process crashed mid-pipeline or completed uninterrupted.  Original PR-1a..PR-2b proved this across all 7 pending states + the 3 SENT sub-cases (a / b / c); **hardening pass 1 (PR #38)** extended coverage to non-transient ErrorRetryable classes, multi-FN identity binding, and PREPARED replay drift detection — converting the previously "happy-paths-only" surface into proven unhappy-path coverage too.
 
-- **§6.3 Pattern B no-resend** — SENDING recovery does NOT invoke `send_chk`.
-- **§6.4-c two-tick contract** — SENT/NotFound recovery hops through ErrorRetryable; the retry happens on a separate boot tick with a new `ReconciliationRuntime`; **never** a direct `Sent → Sending` edge.
-- **§6.5 KVT1 passive hold** — KVT2-receipt API not exposed by `DpsChannel` in M3a; active polling deferred to M3b.
-- **§6.6 KVT2 protocol-final** — `stage_finalize::run` drives Kvt2 → Ack without DPS query.
+Critical structural assertions (all proven by fixtures on `rust-gateway`):
+
+- **§6.3 Pattern B no-resend** — SENDING recovery does NOT invoke `send_chk` (fixture #3).
+- **§6.4-c two-tick contract** — SENT/NotFound recovery hops through ErrorRetryable; the retry happens on a separate boot tick with a new `ReconciliationRuntime`; **never** a direct `Sent → Sending` edge (fixture #6).
+- **§6.5 KVT1 passive hold** — KVT2-receipt API not exposed by `DpsChannel` in M3a; active polling deferred to M3b (fixture #7).
+- **§6.6 KVT2 protocol-final** — `stage_finalize::run` drives Kvt2 → Ack without DPS query (fixture #8).
+- **Hardening §H1 retry_class consumption** — `dispatch_error_retryable_by_class` reads `transport_trace.retry_class` and routes per class: TransientRetry → wire; FnConfigError / WrapperBug / OperatorEscalation / MacRecovery / TerminalReject → CAS to RequiresManualReconciliation; ProbeRequired / None → hold (fixtures 9b/9c/9d/9e).
+- **Hardening §H2 budget cap** — TransientRetry path gated on `attempts_used(doc) >= MAX_BOOT_ATTEMPTS=5`; budget exhaust → CAS to RequiresManualReconciliation + `BOOT_ER_BUDGET_EXHAUSTED` Severity::Error (fixture 9g).
+- **Hardening §H3 per-FN identity binding** — `ReconciliationRuntime` enum (`SingleFn` / `PerFn(resolver)`) resolves a `RuntimeView` per FN inside `reconcile_pending_inner`; resolver returning `None` falls through to deferred path; recovery NEVER substitutes foreign identity (fixtures `multi_fn_...` + 9f).
+- **Hardening §M1 PREPARED replay drift** — `dispatch_prepared_via_chain` snapshot envelope cross-checks `(fd.fiscal_number, fd.payload_sha256_canonical, fd.doc_type)` against `(inbox.fiscal_number, inbox.payload_sha256_canonical, inbox.operation_type)`; mismatch → hold + `BOOT_PREPARED_REPLAY_DRIFT` Severity::Critical (fixture 1b).
 
 ---
 
@@ -115,7 +133,7 @@ The 5 entry-decision bd issues each have an M3a-scoped portion that is **demonst
 | **PRRO_GATE-ddn** | UNIQUE migration `007_lnd_unique.sql` (W1) + `next_lnd` sequencer via `node_state::allocate_next_lnd` (W5).  `tests/migrations_007_008.rs` + `tests/write_path_stage1_acquire.rs::stage1_unique_fn_lnd_collision_fails_closed` green. | — (M3a-scoped issue; acceptance fully covered.) | **Closeable** with "superseded by W1 + W5 implementation at `a7369b9`" comment. |
 | **PRRO_GATE-zti** | `stage_sign::derive_wire_artifact_kind` maps `ShiftClose` and `ZReport` to `WireArtifactKind::ZReport` at the W6 Rust builder boundary; ZReport-only fixtures in `tests/write_path_stage3_sign.rs`. | The bd acceptance text also lists: (1) audit of Python `src/prro_gateway/transports/` for `SHIFT_CLOSE` references; (2) audit of Python `src/prro_gateway/services/`; (3) schema audit of `fiscal_documents.doc_type` for what's currently stored.  These are Python-stack items, intentionally out of scope under ADR-D1 (Rust-only pilot path). | **Cannot stay open under `9qd.1`.**  Pick one before closing the epic: (zti-A) retitle to "M3a Rust builder boundary mapping (Python adapter audit superseded by ADR-D1)" and `bd close zti`, OR (zti-B) `bd update zti --parent <downstream-epic>` to remove from under `9qd.1` and keep `open` as a historical record.  Either path satisfies the §6.2 closure rule. |
 | **PRRO_GATE-k99** | `WriteTxConn<'_>` sealed newtype in `db/tx.rs` (W2); 4 trybuild compile-fail fixtures + `transition_state_atomicity` 2/2 green. | — (M3a-scoped issue; acceptance fully covered.) | **Closeable** with "superseded by W2 implementation at `a7369b9`" comment. |
-| **PRRO_GATE-6bj** | `error_routing::route_send_result` (W10) — 21 routing fixtures + MAC recovery -12 fixture green.  `DocState::Sending` + Pattern B crash-resume rule in W11 fixture #3.  W11 fixture #6 proves `last_chk` reconciliation on SENT crash (one specific lastChk use). | bd acceptance is broader: (1) status `-3` bounded retry/backoff with exponential backoff + per-retry audit (NOT in M3a — error_routing only maps to `ErrorRetryable`; retry-pacing is deferred to M5's generic SENDING reconciler per `project_m3a_starting_point` memory); (2) status `-15` / `0` lastChk reconciliation **at submit time** (M3a covers boot-time lastChk only — W11 §6.4 SENT recovery — not the submit-time variant SubmitPtr.cs:50 describes); (3) status `-16` offline-id / technical-offline path decision (M3b — offline lifecycle); (4) targeted mocked-DpsChannel tests per branch (only the routing-classification branch landed; retry-pacing + submit-time-lastChk + offline-id branches not tested). | **Cannot stay open under `9qd.1`.**  Pick one before closing the epic: (6bj-A) split into 4 child issues per acceptance bullet, close the W10/W11-covered slice, re-parent the rest to their downstream epics (M5 / M3b), then `bd close 6bj` with a "split-and-superseded" comment; OR (6bj-B) `bd update 6bj --parent PRRO_GATE-9qd.4` (M5 dominates the residual scope) with an annotation listing the M3a-covered portion and the deferred bullets, keep `open`.  Either path satisfies the §6.2 closure rule. |
+| **PRRO_GATE-6bj** | `error_routing::route_send_result` (W10) — 21 routing fixtures + MAC recovery -12 fixture green.  `DocState::Sending` + Pattern B crash-resume rule in W11 fixture #3.  W11 fixture #6 proves `last_chk` reconciliation on SENT crash.  **Hardening pass 1 (PR #38) additionally covers:** boot-time retry_class consumption (fixtures 9b/9c/9d/9e) + `MAX_BOOT_ATTEMPTS` budget cap (fixture 9g) — `dispatch_error_retryable_by_class` reads `transport_trace.retry_class` and gates on `attempts_used()` before TransientRetry → `stage_send::run`. | **Narrowed after hardening pass 1.**  M5 residual scope: (1) submit-time `last_chk` reconciliation on -15/0 (recovery covers boot-time only; live-worker variant `SubmitPtr.cs:50` describes still M5); (2) retry-pacing / exponential backoff between boot ticks (M5 generic SENDING reconciler — recovery currently retries at every boot if attempts_used < MAX, no inter-tick spacing).  M3b residual: status `-16` offline-id / technical-offline path decision (offline lifecycle). | **Resolved 2026-05-13 via 6bj-B + post-hardening narrowing:** `bd update 6bj --parent PRRO_GATE-9qd.4` (M5) already applied; M5 scope now formally narrowed by PR #38 closure of boot-time retry_class consumption + budget cap.  M3b sub-item (`-16` offline-id) carried as cross-link annotation. |
 | **PRRO_GATE-ah8** | `tests/app_boot_reconciliation.rs::ah8_shift_state_opened_preserved_across_boot` green (PRRO_GATE-ah8 verbatim acceptance fixture). | — (M3a-scoped issue; acceptance fully covered.) | **Closeable** with "superseded by W9 implementation at `a7369b9`" comment. |
 
 **Cross-link items:**
@@ -135,6 +153,8 @@ The 5 entry-decision bd issues each have an M3a-scoped portion that is **demonst
 | Inline raw SQL in PREPARED snapshot read | `boot_phase::dispatch_prepared_via_chain` step (1a)/(1b) | Sole caller; no second reader yet; minimal-diff per PR-2b scope.  Adds 2 raw `sqlx::query` invocations (fiscal_documents payload extras + ingress_inbox by request_id). | If a second reader of inbox by request_id emerges OR a second reader of fiscal_documents payload extras emerges in M3b — promote to repo helpers (`ingress_inbox::get_by_request_id_tx`, `fiscal_documents::DocumentRow` extension). |
 | `DocumentRow` payload-extras gap | `db::repositories::fiscal_documents::DocumentRow` | Doesn't carry `request_id`, `business_ts`, `total_sum_kop`, `payload_json`, `payload_sha256_canonical` despite all being NOT NULL on the schema.  Recovery and any future readers must raw-SELECT to retrieve them. | When `DocumentRow` callers grow past the current ~12 read sites OR when a non-recovery code path needs the same extras. |
 | Inbox `protocol` enum decoded via runtime `try_get::<Protocol, _>` | Same boot_phase snapshot read | Works (sqlx::Type round-trip) but bypasses the offline-prepared `query!` macro path the rest of `ingress_inbox.rs` uses. | Bundled with the promote-to-helper item above. |
+| **M2 — Runtime W3 guard is `debug_assert!` only** | `db/tx.rs:64-70` `assert_not_in_with_immediate` | Static scanner (`tests/with_immediate_no_foreign_io.rs`) exhaustive over `src/` at compile time; runtime guard compiles to no-op in release.  Mitigated by the static scanner's inline-closure + UFCS + spawn_blocking detection.  Reviewer-classified LOW-MEDIUM. | Optional Patch P4: either add CI job `cargo test -p prro --release` to keep the runtime guard live in CI, OR promote `debug_assert!` → `assert!` (paid cost: one task-local check per substrate call).  Document choice in `db/tx.rs` module docs.  Not blocking single-task pilot. |
+| **M3 — Global single-writer is convention, not structural enforcement** | `services/reconciliation/runtime.rs`; `app.rs` | ADR-M3-A10 declares the invariant + BEGIN IMMEDIATE serialises per-row mutations, but `App: Clone` and `ReconciliationRuntime` does not encode `!Send`/`!Sync` at the type level.  Two parallel `reconcile_pending_with` calls could each CAS Signed → Sending and fire `send_chk` outside the envelope.  Reviewer-classified MEDIUM, acceptable for single-task pilot. | Add `tokio::sync::Mutex` inside `App::Inner` gating `reconcile_pending_inner`, OR document the constraint as operator runbook prerequisite.  Pre-requisite to any multi-worker dispatcher slice (per ADR-M3-A10 §4 carry-forward). |
 
 ### 5.2 Cross-M3a-boundary defers (M3b / M4 / M5 / M6) — unchanged from M3-W0 §3
 
@@ -194,8 +214,9 @@ Closure of O1 (1С OLE scope) / O2 (onboarding / cert provisioning automation) /
 ### 6.5 Worktree cleanup
 
 After this handoff lands:
-- `git worktree remove /mnt/d/PRRO_GATE-m3a-w11-pr2b-runtime` — work tree no longer needed for code work.
-- Local branch `m3a/W11-pr2b-runtime` (and other m3a/* feature branches) can be pruned via `git branch -d` once their PRs are confirmed merged on `origin/rust-gateway`.
+- `git worktree remove /mnt/d/PRRO_GATE-m3a-hardening` — hardening pass 1 worktree no longer needed for code work (PR #38 merged at `acba165`).  Local branch `m3a/hardening-pass-1` can be pruned via `git branch -d` once remote merge is confirmed.
+- `m3a/W11-pr1b` and `m3a/W11-pr2b-runtime` worktrees already removed at the original handoff close (2026-05-13); branches `m3a/W11-pr1b`, `m3a/W11-pr2b-runtime` already deleted.
+- Other `m3a/*` feature branches (`m3a/W1-migrations`, `m3a/W2-write-txconn`, `m3a/W3-with-immediate-enforcement`, `m3a/W4-dps-auth`, `m3a/W5-stages-1-2`, `m3a/W6-stage3-sign`, `m3a/W7-send-routing`, `m3a/W8-stage5-finalize`, `m3a/W9-boot-recovery`, `m3a/W10-dps-dispatch`, `m3a/med1-lease-rename`, `m3a/W11-deterministic-replay`, `m3a/W11-pr2a`, `m3a/W11-sent-rm-edge`, `m3a/handoff`) — prune as time permits; all merged to `rust-gateway`.
 
 ### 6.6 Memory hygiene
 
