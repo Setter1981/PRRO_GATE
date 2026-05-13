@@ -14,7 +14,7 @@
 
 use sqlx::SqlitePool;
 
-use crate::db::models::enums::{NodeMode, ShiftState};
+use crate::db::models::enums::{NodeMode, Protocol, ShiftState};
 use crate::db::models::ids::{DocumentId, ShiftId};
 use crate::db::repositories::{audit_log, document_files, transport_trace};
 use crate::db::tx::with_immediate;
@@ -1238,6 +1238,223 @@ fn iso8601_now() -> String {
         .to_string()
 }
 
+/// W11 PR-2b — PREPARED crash-recovery orchestrator.
+///
+/// W0-3 §6.1 mandates: a PREPARED doc crashed before sign / send.
+/// Recovery drives forward through the canonical W6 + W7 chain:
+/// `stage_sign::run` (Prepared → Signed) → `stage_send::run`
+/// (Signed → Sending → Sent / routed target).  Both stages manage
+/// their own `with_immediate` envelopes; `dispatch_prepared_via_chain`
+/// itself does NO crypto / network IO inside any envelope (W3
+/// invariant preserved structurally).
+///
+/// **WorkerContext reconstruction.**  `DocumentRow` does not carry
+/// the payload columns stage_sign needs (`business_ts`,
+/// `payload_json`, `total_sum_kop`, `payload_sha256_canonical`); the
+/// inbox row, node_state, and active_shift also live outside the
+/// dispatcher's signature.  A single short `with_immediate` envelope
+/// reads all five in one atomic snapshot:
+///   1. raw SELECT of fiscal_documents payload extras (no DocumentRow
+///      extension to keep PR-2b minimal-diff);
+///   2. raw SELECT of the matching inbox row (no `ingress_inbox`
+///      pool/tx reader exists — this is the sole caller, so the read
+///      lives inline);
+///   3. `node_state::get_tx` (single source of truth — the live worker
+///      reads node_state inside stage 1 the same way);
+///   4. `shifts::get_tx` when `node_state.shift_state == Opened` AND
+///      `current_shift_id IS Some`.
+///
+/// The envelope contains ONLY reads + struct decoding; foreign IO
+/// (crypto, DPS) is invoked AFTER the envelope returns.
+///
+/// **histogram contract.**  `prepared_dispatched += 1` on the
+/// stage_send happy path.  Both stage_sign and stage_send errors
+/// route through `emit_dispatch_error` (M3 try-and-audit shim);
+/// doc state stays in PREPARED (stage_sign error before CAS) or
+/// SIGNED (stage_sign succeeded, stage_send error) depending on
+/// where the chain failed — next boot tick re-dispatches via the
+/// appropriate arm.
+async fn dispatch_prepared_via_chain(
+    pool: &SqlitePool,
+    deps: &super::ReconciliationRuntime<'_>,
+    doc: &crate::db::repositories::fiscal_documents::DocumentRow,
+    histogram: &mut DispatchHistogram,
+) -> anyhow::Result<()> {
+    use crate::db::repositories::{ingress_inbox::InboxRow, node_state, shifts};
+    use crate::services::write_path::stage_sign;
+    use crate::services::write_path::types::{CanonicalFiscalCommand, WorkerContext};
+    use sqlx::Row as _;
+
+    let doc_id = doc.document_id;
+    let fn_id_for_read = doc.fiscal_number.clone();
+    // Capture doc.doc_type as owned `Copy` value BEFORE the
+    // `with_immediate` closure — the closure must not borrow the
+    // `&DocumentRow` parameter (its lifetime is non-`'static`, but
+    // `Box::pin(async move {...})` futures returned by `with_immediate`
+    // need to be `'static`).
+    let doc_type_copy = doc.doc_type;
+
+    type PreparedInputs = (
+        CanonicalFiscalCommand,
+        InboxRow,
+        node_state::NodeStateRow,
+        Option<shifts::ShiftRow>,
+    );
+
+    // (1) Atomic snapshot — fiscal_documents extras + inbox + node_state
+    // + active_shift, all inside one short `with_immediate` envelope.
+    // No foreign IO; W3 invariant preserved.
+    let inputs_result: anyhow::Result<PreparedInputs> = with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // (1a) Read payload columns + request_id from fiscal_documents.
+            let fd_row = sqlx::query(
+                "SELECT request_id, business_ts, total_sum_kop, payload_json, \
+                        payload_sha256_canonical \
+                 FROM fiscal_documents WHERE document_id = ?",
+            )
+            .bind(doc_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            let request_id_v: Vec<u8> = fd_row.try_get("request_id")?;
+            let request_id: [u8; 16] = request_id_v.as_slice().try_into().map_err(|_| {
+                anyhow::anyhow!("fiscal_documents.request_id length != 16 for doc {doc_id:?}")
+            })?;
+            let business_ts: String = fd_row.try_get("business_ts")?;
+            let total_sum_kop: Option<i64> = fd_row.try_get("total_sum_kop")?;
+            let payload_json: String = fd_row.try_get("payload_json")?;
+            let sha_v: Vec<u8> = fd_row.try_get("payload_sha256_canonical")?;
+            let payload_sha: [u8; 32] = sha_v.as_slice().try_into().map_err(|_| {
+                anyhow::anyhow!(
+                    "fiscal_documents.payload_sha256_canonical length != 32 for doc {doc_id:?}"
+                )
+            })?;
+
+            // (1b) Read the matching inbox row.  No `ingress_inbox`
+            // pool/tx reader exists today; PR-2b is the sole caller,
+            // so the read lives inline rather than adding a one-off
+            // repo helper.
+            let req_slice: &[u8] = &request_id;
+            let inbox_row_db = sqlx::query(
+                "SELECT request_id, fiscal_number, protocol, operation_type, \
+                        idempotency_key, status, payload_json, \
+                        payload_sha256_canonical, correlation_id, received_at \
+                 FROM ingress_inbox WHERE request_id = ?",
+            )
+            .bind(req_slice)
+            .fetch_one(&mut **tx)
+            .await?;
+            let inbox_request_id_v: Vec<u8> = inbox_row_db.try_get("request_id")?;
+            let inbox_request_id: [u8; 16] =
+                inbox_request_id_v.as_slice().try_into().map_err(|_| {
+                    anyhow::anyhow!("ingress_inbox.request_id length != 16 for doc {doc_id:?}")
+                })?;
+            let inbox_sha_v: Vec<u8> = inbox_row_db.try_get("payload_sha256_canonical")?;
+            let inbox_sha: [u8; 32] = inbox_sha_v.as_slice().try_into().map_err(|_| {
+                anyhow::anyhow!(
+                    "ingress_inbox.payload_sha256_canonical length != 32 for doc {doc_id:?}"
+                )
+            })?;
+            let inbox_row = InboxRow {
+                request_id: inbox_request_id,
+                fiscal_number: inbox_row_db.try_get("fiscal_number")?,
+                protocol: inbox_row_db.try_get::<Protocol, _>("protocol")?,
+                operation_type: inbox_row_db.try_get("operation_type")?,
+                idempotency_key: inbox_row_db.try_get("idempotency_key")?,
+                status: inbox_row_db.try_get("status")?,
+                payload_json: inbox_row_db.try_get("payload_json")?,
+                payload_sha256_canonical: inbox_sha,
+                correlation_id: inbox_row_db.try_get("correlation_id")?,
+                received_at: inbox_row_db.try_get("received_at")?,
+            };
+
+            // (1c) Read node_state via the tx-bound repo helper.
+            let ns = node_state::get_tx(tx, &fn_id_for_read)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "node_state missing for fn {fn_id_for_read} during PREPARED recovery"
+                    )
+                })?;
+
+            // (1d) Resolve active_shift only when node_state advertises
+            // an open shift — mirrors stage_acquire step 5.  Recovery
+            // does NOT escalate ShiftInvariantViolation (the live worker
+            // does that on first ingress; boot recovery just passes
+            // None through and lets stage_sign drive on the persisted
+            // doc).
+            let active_shift = match (ns.shift_state, &ns.current_shift_id) {
+                (ShiftState::Opened, Some(sid)) => shifts::get_tx(tx, *sid).await?,
+                _ => None,
+            };
+
+            let command = CanonicalFiscalCommand {
+                doc_type: doc_type_copy,
+                business_ts,
+                total_sum_kop,
+                payload_json,
+                payload_sha256_canonical: payload_sha,
+            };
+
+            Ok::<PreparedInputs, anyhow::Error>((command, inbox_row, ns, active_shift))
+        })
+    })
+    .await;
+
+    let (command, inbox, node_state, active_shift) = match inputs_result {
+        Ok(t) => t,
+        Err(e) => {
+            // Snapshot read failed — emit dispatch_error and bail
+            // without further state mutation; doc stays in PREPARED.
+            emit_dispatch_error(pool, doc_id, "c-prepared-inputs", &e, histogram).await?;
+            return Ok(());
+        }
+    };
+
+    let worker_ctx = WorkerContext {
+        inbox,
+        command,
+        node_state,
+        active_shift,
+        document: doc.clone(),
+    };
+
+    // (2) stage_sign::run drives PREPARED → SIGNED via its own
+    // envelopes (pin-then-persist).  Crypto invoked between the two
+    // envelopes per W6 Pattern A; W3 scanner accepts.  On Err the
+    // doc stays in PREPARED — next boot tick re-dispatches here.
+    if let Err(sign_err) = stage_sign::run(pool, deps.signing_ctx, worker_ctx).await {
+        emit_dispatch_error(
+            pool,
+            doc_id,
+            "c-prepared-sign",
+            &anyhow::Error::new(sign_err),
+            histogram,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // (3) stage_send::run drives SIGNED → SENT (or routed target) via
+    // Pattern B.  Doc-id only — stage_send re-reads from the pool;
+    // the runtime composition supplies `Some(signing_ctx)` for the
+    // optional MAC-recovery loop body.  On Err the doc stays in
+    // SIGNED — next boot tick re-dispatches via the PR-2a SIGNED arm.
+    match stage_send::run(pool, deps.dps, doc_id, Some(deps.signing_ctx)).await {
+        Ok(_) => histogram.prepared_dispatched += 1,
+        Err(send_err) => {
+            emit_dispatch_error(
+                pool,
+                doc_id,
+                "c-prepared-send",
+                &anyhow::Error::new(send_err),
+                histogram,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Per-DocState dispatch inside branch (c)/(e1) iteration.  Ctx-free
 /// states get fully driven; ctx-needy states emit a
 /// `BOOT_DISPATCH_DEFERRED` WARN audit (W11+ wires the rest).
@@ -1393,12 +1610,13 @@ async fn dispatch_pending_doc(
                 histogram.sent_deferred += 1;
             }
         },
-        // PREPARED — still DEFERRED in BOTH Some/None paths until
-        // C3 (PR-2b PREPARED wiring) lands.
-        DocState::Prepared => {
-            emit_ctx_needy_deferred(pool, doc_id, doc.state, deps_available).await?;
-            histogram.prepared_deferred += 1;
-        }
+        DocState::Prepared => match deps {
+            Some(d) => dispatch_prepared_via_chain(pool, d, doc, histogram).await?,
+            None => {
+                emit_ctx_needy_deferred(pool, doc_id, doc.state, deps_available).await?;
+                histogram.prepared_deferred += 1;
+            }
+        },
         // Terminal states should NEVER appear in `list_pending_for_fn`
         // per its WHERE clause (excludes ACK/REJECTED/CANCELLED/
         // OFFLINE_LOCAL_ACK/REQUIRES_MANUAL_RECONCILIATION).  If we
