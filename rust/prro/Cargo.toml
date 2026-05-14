@@ -12,6 +12,25 @@ path = "src/main.rs"
 name = "prro"
 path = "src/lib.rs"
 
+[features]
+# Default feature set — production / release builds use this; the
+# test-support seam is intentionally EXCLUDED so production callers
+# cannot mint a `ReconcileGuard` without acquiring the App mutex
+# (M3b W2 structural enforcement of ADR-M3-A10).
+default = []
+
+# Exposes integration-test seams that production code MUST NOT call.
+# Currently gates:
+#   - `services::reconciliation::guard::ReconcileGuard::for_integration_test_only`
+#     (W2 lock-token; production path mints via `from_app_mutex` after
+#     acquiring the App recon mutex)
+#
+# CI test invocations and local `cargo test` for tests that touch
+# `boot_phase::run_boot_reconciliation` directly MUST pass
+# `--features test-support`.  Without it, those test targets fail to
+# compile — by design.
+test-support = []
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }

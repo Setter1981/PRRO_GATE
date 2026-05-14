@@ -941,7 +941,21 @@ impl BranchOutcome {
 /// docs that the boot tick observed but couldn't drive forward.
 /// W11+ runtime composition will wire the missing dispatches; until
 /// then those docs stay in their source state.
+///
+/// **Module-level enforcement of ADR-M3-A10 (since M3b W2).**  The
+/// first parameter is a `&ReconcileGuard<'_>` lock-token proving the
+/// caller holds (or is exempt from, via the test seam) the App
+/// reconcile mutex.  Production callers obtain the token from
+/// `App::reconcile_pending_inner` after `reconcile_mutex.lock().await`;
+/// the token's lifetime ties to the `MutexGuard`, so mutex release
+/// follows token drop.  Integration tests use
+/// `ReconcileGuard::for_integration_test_only()` (explicit test seam;
+/// see `guard.rs` for the contract).  Token does not change
+/// behaviour — its sole purpose is to enforce at compile time that
+/// no caller can invoke `run_boot_reconciliation` while bypassing the
+/// App mutex.  Closes the bypass left over from M3a HP2.
 pub async fn run_boot_reconciliation(
+    _guard: &super::ReconcileGuard<'_>,
     pool: &SqlitePool,
     fiscal_number: &str,
     deps: Option<&super::RuntimeView<'_>>,

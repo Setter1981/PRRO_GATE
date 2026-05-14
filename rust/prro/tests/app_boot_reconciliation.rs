@@ -29,7 +29,19 @@
 
 use prro::db::models::ids::DocumentId;
 use prro::services::reconciliation::boot_phase::{self, BranchOutcome, SubBranch};
+use prro::services::reconciliation::ReconcileGuard;
 use sqlx::SqlitePool;
+
+/// W2 module-level enforcement helper — every integration test that
+/// invokes `boot_phase::run_boot_reconciliation` directly must pass
+/// a `ReconcileGuard<'_>`.  Tests have no App mutex to acquire, so
+/// they use the explicit test seam (`for_integration_test_only`)
+/// declared in `services::reconciliation::guard`.  Wrapped in a
+/// helper fn for terseness; temporary-lifetime extension makes
+/// `&recon_guard()` a valid borrow argument.
+fn recon_guard() -> ReconcileGuard<'static> {
+    ReconcileGuard::for_integration_test_only()
+}
 
 async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -130,7 +142,7 @@ async fn branch_a_bootstraps_missing_fn_row() {
     let (_dir, pool) = fresh_pool().await;
     seed_fn_config(&pool, "1234567890").await;
     // No node_state row seeded.
-    let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     assert_eq!(outcome, BranchOutcome::Bootstrapped);
@@ -148,7 +160,7 @@ async fn branch_b_idempotent_no_op_preserves_row() {
     // Pre-seed with shift_state=Opened (NOT Closed) — proves no
     // upsert_initial-style overwrite (PRRO_GATE-ah8 invariant).
     seed_node_state(&pool, "1234567890", "ONLINE", "OPENED", 42).await;
-    let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     assert_eq!(outcome, BranchOutcome::IdempotentNoop);
@@ -167,7 +179,7 @@ async fn branch_c_dispatches_sending_to_resume_helper() {
     seed_fn_config(&pool, "1234567890").await;
     seed_node_state(&pool, "1234567890", "ONLINE", "CLOSED", 1).await;
     let doc = seed_doc_in_state(&pool, "1234567890", 0x11, "SENDING").await;
-    let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     match outcome {
@@ -195,7 +207,7 @@ async fn branch_c_dispatches_kvt1_to_passive_hold() {
     seed_fn_config(&pool, "1234567890").await;
     seed_node_state(&pool, "1234567890", "ONLINE", "CLOSED", 1).await;
     let doc = seed_doc_in_state(&pool, "1234567890", 0x12, "KVT1").await;
-    boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     assert_eq!(
@@ -212,7 +224,7 @@ async fn branch_c_dispatches_encrypted_to_error_retryable() {
     seed_fn_config(&pool, "1234567890").await;
     seed_node_state(&pool, "1234567890", "ONLINE", "CLOSED", 1).await;
     let doc = seed_doc_in_state(&pool, "1234567890", 0x13, "ENCRYPTED").await;
-    boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     assert_eq!(
@@ -235,7 +247,7 @@ async fn branch_c_ctx_needy_states_emit_deferred_audit() {
     let ds = seed_doc_in_state(&pool, "1234567890", 0x21, "SIGNED").await;
     let dt = seed_doc_in_state(&pool, "1234567890", 0x22, "SENT").await;
     let de = seed_doc_in_state(&pool, "1234567890", 0x23, "ERROR_RETRYABLE").await;
-    boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     // All 4 stayed in source state.
@@ -255,9 +267,10 @@ async fn branch_d_refuses_boot_on_offline_mode() {
         let (_dir, pool) = fresh_pool().await;
         seed_fn_config(&pool, "1234567890").await;
         seed_node_state(&pool, "1234567890", mode, "CLOSED", 1).await;
-        let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
-            .await
-            .unwrap();
+        let outcome =
+            boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
+                .await
+                .unwrap();
         match outcome {
             BranchOutcome::OfflineRefusal { observed_mode } => {
                 assert_eq!(observed_mode.as_str(), *mode);
@@ -285,7 +298,7 @@ async fn fixture_5_ah8_verbatim_preserves_opened_shift_state() {
     // One pending SHIFT_OPEN-equivalent doc — we use SELL for simplicity
     // (the assertion is about node_state.shift_state, not the doc type).
     let doc = seed_doc_in_state(&pool, "1234567890", 0x30, "SENT").await;
-    let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     match outcome {
@@ -335,7 +348,7 @@ async fn branch_e2_orphan_shift_resolves_to_error_and_resets_shift_state() {
     .execute(&pool)
     .await
     .unwrap();
-    let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     assert_eq!(
@@ -369,7 +382,7 @@ async fn fixture_5_strict_branch_e1_with_opening_shift_and_pending_doc() {
     seed_fn_config(&pool, "1234567890").await;
     seed_node_state(&pool, "1234567890", "ONLINE", "OPENING", 1).await;
     let doc = seed_doc_in_state(&pool, "1234567890", 0x31, "SENDING").await;
-    let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     match outcome {
@@ -428,7 +441,7 @@ async fn branch_e2_handles_multiple_orphan_shifts() {
         .await
         .unwrap();
     }
-    let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     assert_eq!(
@@ -470,7 +483,7 @@ async fn branch_e2_idempotent_second_boot_dispatches_to_b() {
     .await
     .unwrap();
     // First boot: (e2) fires.
-    let r1 = boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    let r1 = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     assert_eq!(
@@ -481,7 +494,7 @@ async fn branch_e2_idempotent_second_boot_dispatches_to_b() {
     );
     // Second boot: shifts.state is now ERROR, node_state.shift_state is
     // Closed, no pending docs → branch (b).
-    let r2 = boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    let r2 = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     assert_eq!(r2, BranchOutcome::IdempotentNoop);
@@ -500,7 +513,7 @@ async fn branch_f_preserves_blocked_mode() {
     let (_dir, pool) = fresh_pool().await;
     seed_fn_config(&pool, "1234567890").await;
     seed_node_state(&pool, "1234567890", "BLOCKED", "CLOSED", 7).await;
-    let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     assert_eq!(outcome, BranchOutcome::PreservedBlocked);
@@ -519,7 +532,7 @@ async fn branch_f_preserves_stop_mode() {
     let (_dir, pool) = fresh_pool().await;
     seed_fn_config(&pool, "1234567890").await;
     seed_node_state(&pool, "1234567890", "STOP_MODE", "CLOSED", 7).await;
-    let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     assert_eq!(outcome, BranchOutcome::PreservedStopMode);
@@ -534,7 +547,7 @@ async fn branch_f_preserves_crypto_degraded() {
     let (_dir, pool) = fresh_pool().await;
     seed_fn_config(&pool, "1234567890").await;
     seed_node_state(&pool, "1234567890", "CRYPTO_DEGRADED", "CLOSED", 7).await;
-    let outcome = boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     assert_eq!(outcome, BranchOutcome::PreservedCryptoDegraded);
@@ -551,13 +564,13 @@ async fn idempotency_two_consecutive_boots_on_ok_fn() {
     let (_dir, pool) = fresh_pool().await;
     seed_fn_config(&pool, "1234567890").await;
     // First boot: branch (a) bootstraps.
-    let r1 = boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    let r1 = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     assert_eq!(r1, BranchOutcome::Bootstrapped);
     // Second boot: branch (b) idempotent (FN row now exists, no
     // pending, mode=Online).
-    let r2 = boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    let r2 = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     assert_eq!(r2, BranchOutcome::IdempotentNoop);
@@ -778,7 +791,7 @@ async fn branch_partition_exhaustive_matrix() {
         if *has_pending {
             seed_doc_in_state(&pool, &fn_id, (0x80 + i) as u8, "KVT1").await;
         }
-        let outcome = boot_phase::run_boot_reconciliation(&pool, &fn_id, None)
+        let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, &fn_id, None)
             .await
             .unwrap_or_else(|e| panic!("case {i} ({mode},{shift_state},{has_pending}): {e}"));
         assert_eq!(
