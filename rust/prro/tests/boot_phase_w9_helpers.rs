@@ -571,15 +571,25 @@ async fn transition_state_stamps_first_kvt1_at_on_sent_to_kvt1() {
     );
 }
 
-/// W3 plan §Task 3 acceptance: `transition_state` does NOT
-/// overwrite `first_kvt1_at` on idempotent re-entry.  Today the
-/// `(Kvt1, Kvt1)` pair is NOT in the whitelist (would return
-/// `Forbidden`), so this test validates the `COALESCE` semantics
-/// indirectly: stamp + back-date + observe stamp preserved across
-/// a subsequent NON-Kvt1 transition.  Verifies that no `to != Kvt1`
-/// arm clobbers the column.
+/// W3 plan §Task 3 acceptance: `transition_state` COALESCE branch
+/// preserves `first_kvt1_at` on Kvt1 RE-ENTRY.  Exercises the
+/// COALESCE-with-non-NULL path explicitly via the whitelisted
+/// `ErrorRetryable → Kvt1` re-entry edge (which exists in
+/// `allowed_transition` for the M3a two-tick retry path).
+///
+/// Cycle (3 transitions, all whitelisted):
+///   1. `Sent → Kvt1`          — stamps first_kvt1_at via COALESCE NULL arm
+///   2. (manual UPDATE: replace stamp with sentinel `'2020-01-01 00:00:00'`)
+///   3. `Kvt1 → ErrorRetryable` — non-Kvt1 arm; column untouched
+///   4. `ErrorRetryable → Kvt1` — Kvt1 RE-ENTRY; COALESCE-non-NULL arm
+///                                 fires → ORIGINAL sentinel preserved
+///
+/// Directly exercises COALESCE with both NULL input (step 1) and
+/// non-NULL input (step 4).  Operator review pin (2026-05-14): this
+/// is the load-bearing acceptance proof; the pre-PR fixture only
+/// covered the non-Kvt1 no-touch case indirectly.
 #[tokio::test]
-async fn transition_state_preserves_first_kvt1_at_across_non_kvt1_transitions() {
+async fn transition_state_coalesce_preserves_first_kvt1_at_on_kvt1_re_entry() {
     use prro::db::models::enums::DocState;
     use prro::db::repositories::fiscal_documents::{self, TransitionOutcome};
     use prro::db::tx::with_immediate;
@@ -587,7 +597,7 @@ async fn transition_state_preserves_first_kvt1_at_across_non_kvt1_transitions() 
     let (_dir, pool) = fresh_pool().await;
     let doc = seed_doc_in_state(&pool, 0xC8, "SENT").await;
 
-    // Step 1: Sent → Kvt1 (stamps first_kvt1_at).
+    // Step 1: Sent → Kvt1 — COALESCE NULL arm stamps CURRENT_TIMESTAMP.
     let outcome_1: TransitionOutcome = with_immediate(&pool, move |tx| {
         Box::pin(async move {
             let o = fiscal_documents::transition_state(tx, doc, DocState::Sent, DocState::Kvt1)
@@ -599,28 +609,29 @@ async fn transition_state_preserves_first_kvt1_at_across_non_kvt1_transitions() 
     .await
     .expect("Sent → Kvt1");
     assert!(matches!(outcome_1, TransitionOutcome::Applied));
-
     let stamp_after_step1: Option<String> =
         sqlx::query_scalar("SELECT first_kvt1_at FROM fiscal_documents WHERE document_id = ?")
             .bind(doc)
             .fetch_one(&pool)
             .await
             .unwrap();
-    let stamp_step1 = stamp_after_step1.expect("step 1 must stamp");
+    assert!(stamp_after_step1.is_some(), "step 1 must stamp");
 
-    // Back-date to a known earlier value so we can detect any
-    // accidental overwrite by a non-Kvt1 transition.
-    sqlx::query(
-        "UPDATE fiscal_documents SET first_kvt1_at = '2020-01-01 00:00:00' WHERE document_id = ?",
-    )
-    .bind(doc)
-    .execute(&pool)
-    .await
-    .expect("backdate first_kvt1_at to a sentinel");
+    // Step 2: replace stamp with a known sentinel.  Both subsequent
+    // transitions must leave this exact string in place; any clobber
+    // (by either the non-Kvt1 arm at step 3 OR the COALESCE-non-NULL
+    // arm at step 4) is detectable.
+    const SENTINEL: &str = "2020-01-01 00:00:00";
+    sqlx::query("UPDATE fiscal_documents SET first_kvt1_at = ? WHERE document_id = ?")
+        .bind(SENTINEL)
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .expect("backdate first_kvt1_at to sentinel");
 
-    // Step 2: Kvt1 → ErrorRetryable (a non-Kvt1 transition).  Must
-    // leave first_kvt1_at untouched.
-    let outcome_2: TransitionOutcome = with_immediate(&pool, move |tx| {
+    // Step 3: Kvt1 → ErrorRetryable — non-Kvt1 arm of transition_state;
+    // first_kvt1_at must stay = SENTINEL.
+    let outcome_3: TransitionOutcome = with_immediate(&pool, move |tx| {
         Box::pin(async move {
             let o = fiscal_documents::transition_state(
                 tx,
@@ -635,18 +646,51 @@ async fn transition_state_preserves_first_kvt1_at_across_non_kvt1_transitions() 
     })
     .await
     .expect("Kvt1 → ErrorRetryable");
-    assert!(matches!(outcome_2, TransitionOutcome::Applied));
-
-    let stamp_after_step2: Option<String> =
+    assert!(matches!(outcome_3, TransitionOutcome::Applied));
+    let stamp_after_step3: Option<String> =
         sqlx::query_scalar("SELECT first_kvt1_at FROM fiscal_documents WHERE document_id = ?")
             .bind(doc)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        stamp_after_step2.as_deref(),
-        Some("2020-01-01 00:00:00"),
-        "non-Kvt1 transition must NOT touch first_kvt1_at; step-1 stamp was {stamp_step1:?}"
+        stamp_after_step3.as_deref(),
+        Some(SENTINEL),
+        "non-Kvt1 transition must NOT touch first_kvt1_at"
+    );
+
+    // Step 4: ErrorRetryable → Kvt1 — Kvt1 RE-ENTRY.  The
+    // transition_state Kvt1-arm SQL is
+    //   SET state = ?, first_kvt1_at = COALESCE(first_kvt1_at, CURRENT_TIMESTAMP)
+    // COALESCE sees the SENTINEL (non-NULL) and preserves it.  This
+    // is the load-bearing COALESCE-non-NULL test that operator
+    // review pinned.
+    let outcome_4: TransitionOutcome = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            let o = fiscal_documents::transition_state(
+                tx,
+                doc,
+                DocState::ErrorRetryable,
+                DocState::Kvt1,
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+            Ok::<_, anyhow::Error>(o)
+        })
+    })
+    .await
+    .expect("ErrorRetryable → Kvt1");
+    assert!(matches!(outcome_4, TransitionOutcome::Applied));
+    let stamp_after_step4: Option<String> =
+        sqlx::query_scalar("SELECT first_kvt1_at FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stamp_after_step4.as_deref(),
+        Some(SENTINEL),
+        "Kvt1 re-entry via ErrorRetryable → Kvt1 must preserve original first_kvt1_at via COALESCE"
     );
 }
 

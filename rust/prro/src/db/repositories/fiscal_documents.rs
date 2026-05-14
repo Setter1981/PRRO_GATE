@@ -227,11 +227,11 @@ pub async fn insert_prepared(pool: &SqlitePool, n: &NewDocument) -> sqlx::Result
 /// `first_kvt1_at = COALESCE(first_kvt1_at, CURRENT_TIMESTAMP)` in
 /// the same atomic statement.  `COALESCE` semantics:
 ///   - **first Kvt1 entry** (column is NULL): set to `CURRENT_TIMESTAMP`;
-///   - **idempotent re-entry** (column already populated; happens
-///     when boot recovery touches an already-Kvt1 doc via the
-///     allowed `Kvt1 → Kvt1` no-op path, though that pair is NOT in
-///     the whitelist today, so this is forward-compat): preserve
-///     the original timestamp.
+///   - **re-entry into Kvt1** (column already populated; happens
+///     when a doc cycles back into Kvt1 via a whitelisted re-entry
+///     path such as `ErrorRetryable → Kvt1`, e.g. after a transient
+///     wire failure during the M3a `Sent → Kvt1` recovery probe):
+///     preserve the original timestamp.
 ///
 /// Non-Kvt1 transitions leave the column unchanged.  Tested in
 /// `tests/boot_phase_w9_helpers.rs` (W3 acceptance fixtures).
