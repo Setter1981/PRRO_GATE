@@ -404,7 +404,18 @@ impl App {
         // many short per-FN envelopes; held for the duration of one
         // recon call (caller is the dispatcher task, single-task by
         // construction in production).
-        let _recon_lock = self.inner.reconcile_mutex.lock().await;
+        //
+        // **M3b W2 — module-level enforcement.**  Wrap the
+        // `MutexGuard` in a `ReconcileGuard` lock-token immediately
+        // after acquisition.  `run_boot_reconciliation` (below) requires
+        // a `&ReconcileGuard<'_>` as its first parameter, closing the
+        // pre-W2 bypass where direct callers could skip the mutex.
+        // The token's lifetime is bound to the `MutexGuard`, so the
+        // mutex is released exactly when `_recon_guard` drops at the
+        // end of this function.  See `services::reconciliation::guard`.
+        let _recon_guard = crate::services::reconciliation::ReconcileGuard::from_app_mutex(
+            self.inner.reconcile_mutex.lock().await,
+        );
 
         let pool = self.db();
         let fns = fiscal_number_config::list_all(pool)
@@ -426,6 +437,7 @@ impl App {
             // attribution + `source` anyhow::Error chain.  Only raw
             // sqlx::Error downcasts to Database (existing pattern).
             let outcome = boot_phase::run_boot_reconciliation(
+                &_recon_guard,
                 pool,
                 &fn_cfg.fiscal_number,
                 per_fn_view.as_ref(),

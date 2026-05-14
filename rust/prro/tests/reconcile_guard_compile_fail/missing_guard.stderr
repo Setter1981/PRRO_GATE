@@ -1,0 +1,15 @@
+error[E0061]: this function takes 4 arguments but 3 arguments were supplied
+  --> tests/reconcile_guard_compile_fail/missing_guard.rs:19:13
+   |
+19 |     let _ = boot_phase::run_boot_reconciliation(pool, "1234567890", None).await;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---- argument #1 of type `&ReconcileGuard<'_>` is missing
+   |
+note: function defined here
+  --> src/services/reconciliation/boot_phase.rs
+   |
+   | pub async fn run_boot_reconciliation(
+   |              ^^^^^^^^^^^^^^^^^^^^^^^
+help: provide the argument
+   |
+19 |     let _ = boot_phase::run_boot_reconciliation(/* &ReconcileGuard<'_> */, pool, "1234567890", None).await;
+   |                                                 ++++++++++++++++++++++++++

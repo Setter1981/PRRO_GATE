@@ -13,8 +13,15 @@ use prro::db::models::ids::DocumentId;
 use prro::db::repositories::transport_trace;
 use prro::db::tx::with_immediate;
 use prro::services::reconciliation::boot_phase;
+use prro::services::reconciliation::ReconcileGuard;
 use prro::transports::dps::dto::CheckAck;
 use sqlx::SqlitePool;
+
+/// W2 module-level enforcement helper — see
+/// `tests/app_boot_reconciliation.rs::recon_guard` for the contract.
+fn recon_guard() -> ReconcileGuard<'static> {
+    ReconcileGuard::for_integration_test_only()
+}
 
 async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -520,7 +527,7 @@ async fn run_boot_reconciliation_stub_returns_ok() {
     .execute(&pool)
     .await
     .unwrap();
-    boot_phase::run_boot_reconciliation(&pool, "1234567890", None)
+    boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .expect("W9.2 stub returns Ok(()) — W9.3 wires dispatch");
 }
