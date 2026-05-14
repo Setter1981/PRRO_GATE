@@ -477,6 +477,8 @@ async fn migration_001_offline_bounds_check_enforced() {
 
 #[tokio::test]
 async fn migration_004_offline_codes_value_must_be_positive() {
+    // M3b W4 (migration 015): post-normalization the column is
+    // `code_lnd` not `code_value`; same CHECK predicate (> 0).
     let (_d, pool) = fresh_pool().await;
     sqlx::query(
         "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
@@ -488,21 +490,21 @@ async fn migration_004_offline_codes_value_must_be_positive() {
 
     for bad in [0i64, -1, -1000] {
         let err = sqlx::query(
-            "INSERT INTO offline_codes(fiscal_number, code_value) VALUES ('1234567890', ?)",
+            "INSERT INTO offline_codes(fiscal_number, code_lnd) VALUES ('1234567890', ?)",
         )
         .bind(bad)
         .execute(&pool)
         .await
-        .expect_err("non-positive code_value must violate CHECK");
+        .expect_err("non-positive code_lnd must violate CHECK");
         assert!(
             err.to_string().to_lowercase().contains("check"),
             "bad={bad}"
         );
     }
-    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_value) VALUES ('1234567890', 1)")
+    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_lnd) VALUES ('1234567890', 1)")
         .execute(&pool)
         .await
-        .expect("code_value = 1 must be allowed");
+        .expect("code_lnd = 1 must be allowed");
 }
 
 #[tokio::test]
@@ -518,7 +520,8 @@ async fn migration_002_delete_offline_session_blocked_by_doc_reference() {
 
     let session_id = vec![0xAAu8; 16];
     sqlx::query(
-        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, status, opened_at) \
+        // M3b W4 (migration 015): column renamed `status` → `state`.
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, '1234567890', 'OPEN', '2026-01-01T00:00:00Z')",
     )
     .bind(&session_id)
@@ -707,4 +710,577 @@ async fn migration_001_strict_typing_rejects_text_in_int_column() {
         msg.contains("integer") || msg.contains("strict") || msg.contains("type"),
         "expected STRICT/type-mismatch error, got: {msg}"
     );
+}
+
+// ─── M3b W4: migration 015 offline normalization ─────────────────────
+//
+// Operator review criteria (saved 2026-05-14 in
+// memory `project_m3b_w4_review_criteria`) tested by the fixtures
+// below.  Layout: 2 distinct "apply" fixtures (criterion #7) + 3
+// invariant fixtures (criteria #4, #5, #6).
+
+/// W4 criterion #1 + #7a — migration applies cleanly on a fresh DB
+/// and the post-015 schema has the target shape: tables renamed,
+/// new indices in place, immutability trigger registered.
+#[tokio::test]
+async fn migration_015_normalize_apply_fresh_db() {
+    let (_d, pool) = fresh_pool().await;
+
+    // Tables exist with new shape — query pragma to confirm columns.
+    let session_cols: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('offline_sessions') ORDER BY cid")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        session_cols.contains(&"state".to_string()),
+        "offline_sessions must have `state` column post-W4, got: {session_cols:?}"
+    );
+    assert!(
+        !session_cols.contains(&"status".to_string()),
+        "offline_sessions must NOT have legacy `status` column post-W4, got: {session_cols:?}"
+    );
+    assert!(
+        session_cols.contains(&"drained_at".to_string()),
+        "offline_sessions must have new `drained_at` column"
+    );
+    assert!(
+        session_cols.contains(&"reason_abort".to_string()),
+        "offline_sessions must have new `reason_abort` column"
+    );
+
+    let code_cols: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('offline_codes') ORDER BY cid")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        code_cols.contains(&"code_lnd".to_string()),
+        "offline_codes must have `code_lnd` column post-W4, got: {code_cols:?}"
+    );
+    assert!(
+        !code_cols.contains(&"code_value".to_string()),
+        "offline_codes must NOT have legacy `code_value` column"
+    );
+    assert!(
+        code_cols.contains(&"consumed_at".to_string()),
+        "offline_codes must have `consumed_at` column"
+    );
+    assert!(
+        !code_cols.contains(&"used_at".to_string()),
+        "offline_codes must NOT have legacy `used_at` column"
+    );
+    assert!(
+        code_cols.contains(&"consumed_by_document_id".to_string()),
+        "offline_codes must have `consumed_by_document_id` column"
+    );
+    assert!(
+        !code_cols.contains(&"used_by_doc".to_string()),
+        "offline_codes must NOT have legacy `used_by_doc` column"
+    );
+    // No `consumed` bool — semantic is `consumed_at IS NULL`.
+    assert!(
+        !code_cols.contains(&"consumed".to_string()),
+        "offline_codes must NOT have a `consumed` bool column; semantic is `consumed_at IS NULL`"
+    );
+
+    // Indices: partial UNIQUE on active sessions + partial UNIQUE on consumed-link.
+    let index_names: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='index' ORDER BY 1")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        index_names.contains(&"ux_offline_active".to_string()),
+        "missing partial UNIQUE ux_offline_active"
+    );
+    assert!(
+        index_names.contains(&"ux_offline_codes_consumed_by_doc".to_string()),
+        "missing partial UNIQUE ux_offline_codes_consumed_by_doc"
+    );
+    assert!(
+        index_names.contains(&"ix_offline_codes_available".to_string()),
+        "missing ix_offline_codes_available (consumed_at IS NULL)"
+    );
+
+    // Trigger registered.
+    let trigger_names: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY 1")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        trigger_names.contains(&"offline_codes_consumed_immutable".to_string()),
+        "missing immutability trigger, got triggers: {trigger_names:?}"
+    );
+}
+
+/// W4 criterion #7b + #1 + #2 — migration applies on a 004-era
+/// populated DB without row loss; `CLOSING → DRAINING` semantic
+/// transform applied; column renames preserve data.
+///
+/// Method: after `open_pool` (which has already applied 015),
+/// drop the post-015 tables, recreate the 004-era shape, INSERT
+/// representative rows (including `CLOSING` to exercise the value
+/// transform), then re-run the 015 migration SQL inline.  Assert
+/// (a) row counts preserved, (b) `CLOSING → DRAINING`, (c)
+/// columns renamed, (d) `drained_at` back-filled for ex-CLOSING.
+#[tokio::test]
+async fn migration_015_normalize_apply_populated_db_preserves_rows() {
+    let (_d, pool) = fresh_pool().await;
+
+    // Reset to 004-era shape.
+    sqlx::query("DROP TRIGGER IF EXISTS offline_codes_consumed_immutable")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE offline_codes")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE offline_sessions")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Re-create the 004-era shape verbatim (from migrations/004).
+    sqlx::query(
+        "CREATE TABLE offline_sessions (
+            offline_session_id BLOB PRIMARY KEY CHECK (length(offline_session_id) = 16),
+            fiscal_number      TEXT NOT NULL,
+            status             TEXT NOT NULL CHECK (status IN ('OPENING','OPEN','CLOSING','CLOSED','ABORTED')),
+            opened_at          TEXT NOT NULL,
+            closed_at          TEXT,
+            last_known_unsigned_xml_sha256 BLOB,
+            docs_count         INTEGER NOT NULL DEFAULT 0,
+            created_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            updated_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            FOREIGN KEY (fiscal_number) REFERENCES fiscal_number_config(fiscal_number) ON DELETE RESTRICT
+        ) STRICT",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE offline_codes (
+            fiscal_number TEXT NOT NULL,
+            code_value    INTEGER NOT NULL CHECK (code_value > 0),
+            used_at       TEXT,
+            used_by_doc   BLOB,
+            PRIMARY KEY (fiscal_number, code_value),
+            FOREIGN KEY (fiscal_number) REFERENCES fiscal_number_config(fiscal_number) ON DELETE RESTRICT
+        ) STRICT",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Seed 5 FN configs — one per legacy status.  Use distinct FNs
+    // because M3b's tightened `ux_offline_active` partial UNIQUE
+    // permits at most one active (OPENING/OPEN/DRAINING) session
+    // per FN; M3a runtime maintained this by convention without the
+    // UNIQUE enforcement, but realistic pre-migration data MUST
+    // respect it (otherwise the W4 migration fails fail-closed at
+    // CREATE UNIQUE INDEX — operator's responsibility to clean up
+    // pre-W4 violations before deploying W4).
+    let session_seeds: &[(&[u8], &str, &str)] = &[
+        (&[0xA1; 16], "1111111111", "OPENING"),
+        (&[0xA2; 16], "2222222222", "OPEN"),
+        (&[0xA3; 16], "3333333333", "CLOSING"), // ← maps to DRAINING
+        (&[0xA4; 16], "4444444444", "CLOSED"),
+        (&[0xA5; 16], "5555555555", "ABORTED"),
+    ];
+    for (_id, fn_id, _status) in session_seeds {
+        sqlx::query(
+            "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+             VALUES (?, '12345678', 'test')",
+        )
+        .bind(*fn_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    // Also seed the FN used below for offline_codes test data.
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES ('1234567890', '12345678', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    for (id, fn_id, status) in session_seeds {
+        sqlx::query(
+            "INSERT INTO offline_sessions(offline_session_id, fiscal_number, status, opened_at, updated_at) \
+             VALUES (?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')",
+        )
+        .bind(*id)
+        .bind(*fn_id)
+        .bind(*status)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Codes: 1 unused + 1 used.  Per FK requirement, used_by_doc
+    // must reference an existing fiscal_documents row; create one.
+    let doc_id = vec![0xC1u8; 16];
+    let req_id = vec![0xC2u8; 16];
+    let sha = vec![0u8; 32];
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical) \
+         VALUES (?, ?, '1234567890', 1, 'SELL', 'PREPARED', 'b', 't', 'OFFLINE', \
+            '2026-01-01T00:00:00Z', '{}', ?)",
+    )
+    .bind(&doc_id)
+    .bind(&req_id)
+    .bind(&sha)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_value) VALUES ('1234567890', 10)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO offline_codes(fiscal_number, code_value, used_at, used_by_doc) \
+         VALUES ('1234567890', 20, '2026-01-03T00:00:00Z', ?)",
+    )
+    .bind(&doc_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Pre-migration counts.
+    let sessions_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM offline_sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let codes_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM offline_codes")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(sessions_before, 5);
+    assert_eq!(codes_before, 2);
+
+    // Apply migration 015 inline via raw_sql (multi-statement aware;
+    // single-statement sqlx::query splits the file across many
+    // implicit transactions and confuses SQLite's schema cache on
+    // DROP-then-RENAME).
+    let sql_015 = include_str!("../migrations/015_offline_normalize.sql");
+    sqlx::raw_sql(sql_015)
+        .execute(&pool)
+        .await
+        .expect("migration 015 must apply on populated 004-era DB");
+
+    // Post-migration assertions.
+    let sessions_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM offline_sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let codes_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM offline_codes")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(sessions_after, 5, "row count must be preserved");
+    assert_eq!(codes_after, 2, "row count must be preserved");
+
+    // CLOSING → DRAINING transform applied.
+    let draining_id: Vec<u8> = sqlx::query_scalar(
+        "SELECT offline_session_id FROM offline_sessions WHERE state = 'DRAINING'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        draining_id,
+        vec![0xA3u8; 16],
+        "CLOSING row mapped to DRAINING"
+    );
+    let still_closing: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM offline_sessions WHERE state = 'CLOSING'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        still_closing, 0,
+        "no row may remain in CLOSING post-migration"
+    );
+
+    // drained_at back-filled for ex-CLOSING row (criterion #1 forensics).
+    let drained_at: Option<String> =
+        sqlx::query_scalar("SELECT drained_at FROM offline_sessions WHERE offline_session_id = ?")
+            .bind(&[0xA3u8; 16][..])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        drained_at.is_some(),
+        "drained_at must be back-filled for ex-CLOSING row"
+    );
+
+    // code_value → code_lnd; used_at → consumed_at.
+    let consumed_for_doc: Option<i64> =
+        sqlx::query_scalar("SELECT code_lnd FROM offline_codes WHERE consumed_by_document_id = ?")
+            .bind(&doc_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        consumed_for_doc,
+        Some(20),
+        "used_by_doc → consumed_by_document_id rename"
+    );
+    let consumed_at: Option<String> =
+        sqlx::query_scalar("SELECT consumed_at FROM offline_codes WHERE code_lnd = 20")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        consumed_at.as_deref(),
+        Some("2026-01-03T00:00:00Z"),
+        "used_at → consumed_at rename preserves value"
+    );
+}
+
+/// W4 criterion #4 — partial UNIQUE `ux_offline_active` covers only
+/// active states (OPENING/OPEN/DRAINING).  Closed/Aborted rows are
+/// invisible to the index so they don't block a new active session
+/// on the same FN.
+#[tokio::test]
+async fn migration_015_ux_offline_active_rejects_duplicate_active_only() {
+    let (_d, pool) = fresh_pool().await;
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES ('1234567890', '12345678', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert a CLOSED session — should NOT block a subsequent active session.
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at, closed_at) \
+         VALUES (?, '1234567890', 'CLOSED', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')",
+    )
+    .bind(&[0xC0u8; 16][..])
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, '1234567890', 'OPEN', '2026-02-01T00:00:00Z')",
+    )
+    .bind(&[0xAAu8; 16][..])
+    .execute(&pool)
+    .await
+    .expect("CLOSED row must NOT block a new active session on the same FN");
+
+    // ABORTED also must NOT count as active.
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, '1234567890', 'ABORTED', '2026-03-01T00:00:00Z')",
+    )
+    .bind(&[0xBBu8; 16][..])
+    .execute(&pool)
+    .await
+    .expect("ABORTED row must coexist with OPEN row on same FN");
+
+    // Second OPEN on same FN: must fail (UNIQUE violation).
+    let err = sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, '1234567890', 'OPEN', '2026-04-01T00:00:00Z')",
+    )
+    .bind(&[0xDDu8; 16][..])
+    .execute(&pool)
+    .await
+    .expect_err("second OPEN on same FN must violate ux_offline_active");
+    assert!(
+        err.to_string().to_lowercase().contains("unique"),
+        "expected UNIQUE error, got: {err}"
+    );
+
+    // Same FN: OPENING also blocked by existing OPEN (any active state combo).
+    let err2 = sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, '1234567890', 'OPENING', '2026-05-01T00:00:00Z')",
+    )
+    .bind(&[0xEEu8; 16][..])
+    .execute(&pool)
+    .await
+    .expect_err("OPENING vs existing OPEN on same FN must violate ux_offline_active");
+    assert!(err2.to_string().to_lowercase().contains("unique"));
+}
+
+/// W4 criterion #5 — consumed-link uniqueness + immutability trigger.
+/// Verifies all three boundaries:
+///   (a) legal first consume (NULL → first-doc) is allowed;
+///   (b) re-attribution (first-doc → other-doc) is blocked;
+///   (c) un-consume (first-doc → NULL) is blocked.
+/// Also (d): `ux_offline_codes_consumed_by_doc` blocks two different
+/// code rows from linking to the same document.
+#[tokio::test]
+async fn migration_015_consumed_link_uniqueness_and_immutability_trigger() {
+    let (_d, pool) = fresh_pool().await;
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES ('1234567890', '12345678', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Create two distinct docs to attribute codes to.
+    let doc_a = vec![0xA0u8; 16];
+    let doc_b = vec![0xB0u8; 16];
+    for (doc_id, req_byte) in [(&doc_a, 0xA1u8), (&doc_b, 0xB1u8)] {
+        let req_id = vec![req_byte; 16];
+        let sha = vec![0u8; 32];
+        sqlx::query(
+            "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+                state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+                payload_sha256_canonical) \
+             VALUES (?, ?, '1234567890', ?, 'SELL', 'PREPARED', 'b', 't', 'OFFLINE', \
+                '2026-01-01T00:00:00Z', '{}', ?)",
+        )
+        .bind(doc_id)
+        .bind(&req_id)
+        .bind(req_byte as i64)
+        .bind(&sha)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Seed two code rows; pre-consume.
+    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_lnd) VALUES ('1234567890', 1)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_lnd) VALUES ('1234567890', 2)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // (a) First consume: NULL → doc_a.  Trigger MUST allow this
+    // because OLD.consumed_at IS NULL (the trigger gates on
+    // OLD.consumed_at IS NOT NULL).
+    sqlx::query(
+        "UPDATE offline_codes SET consumed_at = '2026-01-01T01:00:00Z', \
+            consumed_by_document_id = ? \
+         WHERE fiscal_number = '1234567890' AND code_lnd = 1",
+    )
+    .bind(&doc_a)
+    .execute(&pool)
+    .await
+    .expect("first consume (NULL → doc_a) must be allowed");
+
+    // (b) Re-attribution: doc_a → doc_b.  Trigger MUST block.
+    let err_reattr = sqlx::query(
+        "UPDATE offline_codes SET consumed_by_document_id = ? \
+         WHERE fiscal_number = '1234567890' AND code_lnd = 1",
+    )
+    .bind(&doc_b)
+    .execute(&pool)
+    .await
+    .expect_err("re-attribution of consumed code must be blocked by trigger");
+    let msg_reattr = err_reattr.to_string().to_lowercase();
+    assert!(
+        msg_reattr.contains("immutable") || msg_reattr.contains("admin repair"),
+        "expected immutability error, got: {msg_reattr}"
+    );
+
+    // (c) Un-consume: consumed_at → NULL.  Trigger MUST block.
+    let err_unconsume = sqlx::query(
+        "UPDATE offline_codes SET consumed_at = NULL \
+         WHERE fiscal_number = '1234567890' AND code_lnd = 1",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("un-consume must be blocked by trigger");
+    let msg_unconsume = err_unconsume.to_string().to_lowercase();
+    assert!(
+        msg_unconsume.contains("immutable") || msg_unconsume.contains("admin repair"),
+        "expected immutability error, got: {msg_unconsume}"
+    );
+
+    // (d) Link uniqueness: another code row trying to link to doc_a
+    // (which is already linked to code_lnd=1) must violate the
+    // partial UNIQUE ux_offline_codes_consumed_by_doc.  Since
+    // code_lnd=2 has OLD.consumed_at IS NULL, the trigger DOES NOT
+    // block this UPDATE; the partial UNIQUE index is the guard.
+    let err_dup_link = sqlx::query(
+        "UPDATE offline_codes SET consumed_at = '2026-01-01T02:00:00Z', \
+            consumed_by_document_id = ? \
+         WHERE fiscal_number = '1234567890' AND code_lnd = 2",
+    )
+    .bind(&doc_a)
+    .execute(&pool)
+    .await
+    .expect_err("second code linking to doc_a must violate ux_offline_codes_consumed_by_doc");
+    let msg_dup = err_dup_link.to_string().to_lowercase();
+    assert!(
+        msg_dup.contains("unique"),
+        "expected UNIQUE error on second link, got: {msg_dup}"
+    );
+}
+
+/// W4 criterion #6 — FK on `consumed_by_document_id` references
+/// `fiscal_documents.document_id` with ON DELETE RESTRICT.
+/// Attempting to DELETE the referenced doc must be rejected.
+#[tokio::test]
+async fn migration_015_consumed_by_document_id_fk_restrict() {
+    let (_d, pool) = fresh_pool().await;
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES ('1234567890', '12345678', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let doc_id = vec![0xD0u8; 16];
+    let req_id = vec![0xD1u8; 16];
+    let sha = vec![0u8; 32];
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical) \
+         VALUES (?, ?, '1234567890', 1, 'SELL', 'PREPARED', 'b', 't', 'OFFLINE', \
+            '2026-01-01T00:00:00Z', '{}', ?)",
+    )
+    .bind(&doc_id)
+    .bind(&req_id)
+    .bind(&sha)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert an unconsumed code, then mark it consumed pointing at doc_id.
+    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_lnd) VALUES ('1234567890', 1)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE offline_codes SET consumed_at = CURRENT_TIMESTAMP, consumed_by_document_id = ? \
+         WHERE fiscal_number = '1234567890' AND code_lnd = 1",
+    )
+    .bind(&doc_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // DELETE fiscal_documents row referenced by a code → FK RESTRICT must reject.
+    let err = sqlx::query("DELETE FROM fiscal_documents WHERE document_id = ?")
+        .bind(&doc_id)
+        .execute(&pool)
+        .await
+        .expect_err(
+            "ON DELETE RESTRICT must block deletion of fiscal_documents row \
+             referenced by offline_codes.consumed_by_document_id",
+        );
+    let msg = err.to_string().to_lowercase();
+    assert!(msg.contains("foreign key"), "expected FK error, got: {msg}");
 }
