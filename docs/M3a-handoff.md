@@ -228,7 +228,7 @@ Three checks MUST be discharged **before pilot deployment** (not merely before M
 
 #### 6.3.1 ONLINE-against-test-DPS smoke (ADR D3 gate #4)
 
-Mandatory if a non-production DPS contour is available.  Memory `project_sprint7_complete` already records a successful full live DPS cycle (SHIFT_OPEN → SELL → Z_REPORT on `cabinet.tax.gov.ua:9443`); that artifact is sufficient evidence for the ADR-D3 gate if the operator agrees to map Python-stack Sprint-7 evidence onto Rust-stack M3a exit.  Otherwise discharge by explicit owner waiver committed before M3b.
+Mandatory if a non-production DPS contour is available.  Memory `project_sprint7_complete` already records a successful full live DPS cycle (SHIFT_OPEN → SELL → Z_REPORT on `cabinet.tax.gov.ua:9443`); that artifact is sufficient evidence for the ADR-D3 gate if the operator agrees to map Python-stack Sprint-7 evidence onto Rust-stack M3a exit.  Otherwise discharge by explicit owner waiver committed before pilot rollout.
 
 Discharge condition: either
 - (a) Sprint-7 evidence accepted by the operator as cross-stack equivalent (Python-stack DPS cycle mapped onto Rust-stack M3a exit), or
@@ -245,7 +245,7 @@ Discharge condition: either
 
 #### 6.3.3 DPS proto drift parity vs WebCheck — `PRRO_GATE-0ps` (P1)
 
-Filed at M2 close.  M2 vendored six methods from the DPS proto surface; WebCheck's decompiled `TaxGrpc` shows a larger field/method set, and `apiver=1` / `lastChk` / `delLast*` semantics may diverge from what M3a expects in pilot field cycles.  W0-3 §2 (Decode rule for `status=0` proto-default) already encodes M3a's "fail-loudly on protocol drift" stance, but a pre-pilot proto-surface audit is still required to know whether any pilot-relevant message has drifted under our feet.
+Filed at M2 close.  M2 vendored five methods from the DPS proto surface (`sendChkV2`, `lastChk`, `ping`, `statusRro`, `infoRro` — see `rust/prro/proto/fiscal_server.proto:8`); WebCheck's decompiled `TaxGrpc` shows a larger field/method set, and `apiver=1` / `lastChk` / `delLast*` semantics may diverge from what M3a expects in pilot field cycles.  W0-3 §2 (Decode rule for `status=0` proto-default) already encodes M3a's "fail-loudly on protocol drift" stance, but a pre-pilot proto-surface audit is still required to know whether any pilot-relevant message has drifted under our feet.
 
 Discharge condition: either
 - (a) a recorded decision in `PRRO_GATE-0ps` covering at minimum (i) which DPS method versions are pilot-supported, (ii) whether `apiver` is wire-pinned or accepted-on-receipt, and (iii) the disposition of `delLast` / `lastChk` field-shape variants observed in WebCheck decompilation but not vendored in M2's proto subset, or
