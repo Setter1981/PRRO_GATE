@@ -364,6 +364,150 @@ async fn passive_hold_kvt1_idempotent_each_call_emits_one_audit() {
     assert_eq!(read_state(&pool, doc).await, "KVT1");
 }
 
+/// Helper: drop the `fd_updated_at` trigger so a follow-up direct
+/// `UPDATE … SET updated_at = …` can land without being clobbered
+/// by the trigger's `AFTER UPDATE` write-back to `CURRENT_TIMESTAMP`.
+/// Test pools are throwaway tempdir-backed, so dropping the trigger
+/// is harmless for the rest of the test.
+async fn drop_fd_updated_at_trigger(pool: &SqlitePool) {
+    sqlx::query("DROP TRIGGER IF EXISTS fd_updated_at")
+        .execute(pool)
+        .await
+        .expect("drop fd_updated_at trigger");
+}
+
+/// Convenience wrapper for the literal-string case (e.g. malformed
+/// timestamps for the parser-fallback test).
+async fn set_kvt1_updated_at_literal(pool: &SqlitePool, doc: DocumentId, sqlite_ts: &str) {
+    drop_fd_updated_at_trigger(pool).await;
+    sqlx::query("UPDATE fiscal_documents SET updated_at = ? WHERE document_id = ?")
+        .bind(sqlite_ts)
+        .bind(doc)
+        .execute(pool)
+        .await
+        .expect("set updated_at to literal");
+}
+
+/// Read the most recent BOOT_KVT1_HOLD_DEFERRED audit row's severity
+/// + payload for the given doc.  Used by the three age-bucket tests.
+async fn read_latest_kvt1_hold_audit(
+    pool: &SqlitePool,
+    doc: DocumentId,
+) -> (String, serde_json::Value) {
+    let entity_id = doc
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
+    let (severity, payload_json): (String, String) = sqlx::query_as(
+        "SELECT severity, event_payload_json FROM audit_log \
+         WHERE event_type = 'BOOT_KVT1_HOLD_DEFERRED' AND entity_id = ? \
+         ORDER BY audit_id DESC LIMIT 1",
+    )
+    .bind(&entity_id)
+    .fetch_one(pool)
+    .await
+    .expect("audit row present");
+    let payload: serde_json::Value =
+        serde_json::from_str(&payload_json).expect("payload is valid JSON");
+    (severity, payload)
+}
+
+#[tokio::test]
+async fn passive_hold_kvt1_emits_info_severity_for_fresh_hold() {
+    let (_dir, pool) = fresh_pool().await;
+    let doc = seed_doc_in_state(&pool, 0xC3, "KVT1").await;
+    // Default seed → updated_at = CURRENT_TIMESTAMP → age ~ 0s → Info.
+    boot_phase::passive_hold_kvt1(&pool, doc).await.unwrap();
+    let (severity, payload) = read_latest_kvt1_hold_audit(&pool, doc).await;
+    assert_eq!(severity, "INFO", "fresh hold must stay Info");
+    assert_eq!(payload["severity_threshold"], "INFO");
+    let age = payload["kvt1_age_seconds"]
+        .as_i64()
+        .expect("kvt1_age_seconds is i64");
+    assert!(
+        (0..60).contains(&age),
+        "fresh seed should have age in [0, 60), got {age}"
+    );
+    assert!(
+        payload["first_kvt1_at"].is_string(),
+        "first_kvt1_at must be present as a string"
+    );
+}
+
+#[tokio::test]
+async fn passive_hold_kvt1_escalates_to_warning_after_one_hour() {
+    let (_dir, pool) = fresh_pool().await;
+    let doc = seed_doc_in_state(&pool, 0xC4, "KVT1").await;
+    // Back-date the updated_at by 2 hours — well into the Warning
+    // bucket (1h ≤ age < 24h).  Use SQLite `datetime('now', '-2 hours')`
+    // so the age stays inside (3600, 86400) regardless of when the
+    // test runs.
+    drop_fd_updated_at_trigger(&pool).await;
+    sqlx::query(
+        "UPDATE fiscal_documents SET updated_at = datetime('now', '-2 hours') WHERE document_id = ?",
+    )
+    .bind(doc)
+    .execute(&pool)
+    .await
+    .expect("backdate to -2h");
+    boot_phase::passive_hold_kvt1(&pool, doc).await.unwrap();
+    let (severity, payload) = read_latest_kvt1_hold_audit(&pool, doc).await;
+    assert_eq!(severity, "WARNING", "2h hold must escalate to Warning");
+    assert_eq!(payload["severity_threshold"], "WARNING");
+    let age = payload["kvt1_age_seconds"]
+        .as_i64()
+        .expect("kvt1_age_seconds is i64");
+    assert!(
+        (3600..86_400).contains(&age),
+        "2h back-date age should be in [3600, 86400), got {age}"
+    );
+}
+
+#[tokio::test]
+async fn passive_hold_kvt1_escalates_to_error_after_twenty_four_hours() {
+    let (_dir, pool) = fresh_pool().await;
+    let doc = seed_doc_in_state(&pool, 0xC5, "KVT1").await;
+    drop_fd_updated_at_trigger(&pool).await;
+    // Back-date to 25 hours ago — clears the 86400s Error threshold.
+    sqlx::query(
+        "UPDATE fiscal_documents SET updated_at = datetime('now', '-25 hours') WHERE document_id = ?",
+    )
+    .bind(doc)
+    .execute(&pool)
+    .await
+    .expect("backdate to -25h");
+    boot_phase::passive_hold_kvt1(&pool, doc).await.unwrap();
+    let (severity, payload) = read_latest_kvt1_hold_audit(&pool, doc).await;
+    assert_eq!(severity, "ERROR", "25h hold must escalate to Error");
+    assert_eq!(payload["severity_threshold"], "ERROR");
+    let age = payload["kvt1_age_seconds"]
+        .as_i64()
+        .expect("kvt1_age_seconds is i64");
+    assert!(
+        age >= 86_400,
+        "25h back-date should give age ≥ 86400s, got {age}"
+    );
+}
+
+#[tokio::test]
+async fn passive_hold_kvt1_unparseable_updated_at_falls_back_to_info_age_zero() {
+    let (_dir, pool) = fresh_pool().await;
+    let doc = seed_doc_in_state(&pool, 0xC6, "KVT1").await;
+    // Deliberate corruption of updated_at to verify the parser
+    // failure mode is "degrade-and-emit" rather than "crash".
+    set_kvt1_updated_at_literal(&pool, doc, "not-a-timestamp").await;
+    boot_phase::passive_hold_kvt1(&pool, doc).await.unwrap();
+    let (severity, payload) = read_latest_kvt1_hold_audit(&pool, doc).await;
+    assert_eq!(
+        severity, "INFO",
+        "unparseable updated_at must fall back to Info (degrade-and-emit, not crash)"
+    );
+    assert_eq!(payload["kvt1_age_seconds"], 0);
+    // Echoed verbatim — operator can see the malformed value.
+    assert_eq!(payload["first_kvt1_at"], "not-a-timestamp");
+}
+
 // ─── run_boot_reconciliation stub ──────────────────────────────────────
 
 #[tokio::test]
