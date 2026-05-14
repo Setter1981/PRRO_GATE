@@ -170,7 +170,19 @@ fn scan_cas_call_sites(src: &str) -> Vec<CasCallSite> {
             // search to the next ~600 bytes (well past a typical
             // 5-line rustfmt'd call) so we don't accidentally pair
             // across function bodies.
-            let scan_end = (cursor + 600).min(src.len());
+            //
+            // **UTF-8 char-boundary safety (Windows CI fix,
+            // 2026-05-14).**  `cursor + 600` can land in the middle
+            // of a multi-byte UTF-8 char (e.g. the `—` em-dash that
+            // appears in boot_phase.rs module-level docs).  On
+            // Windows checkouts with CRLF line endings the byte
+            // positions shift vs LF, so a slice that's safe on
+            // Linux can panic on Windows mid-char.  Walk the bound
+            // down to the nearest char boundary before slicing.
+            let mut scan_end = (cursor + 600).min(src.len());
+            while scan_end > cursor && !src.is_char_boundary(scan_end) {
+                scan_end -= 1;
+            }
             let region = &src[cursor..scan_end];
 
             let Some((from_variant, after_from)) = find_next_doc_state(region, 0) else {
@@ -271,6 +283,36 @@ fn scanner_extracts_helper_call_site() {
     let sites = scan_cas_call_sites(synthetic);
     assert_eq!(sites.len(), 1);
     assert_eq!(sites[0].kind, CasCallKind::HelperServiceLayer);
+    assert_eq!(sites[0].from_variant, "Sending");
+    assert_eq!(sites[0].to_variant, "ErrorRetryable");
+}
+
+/// Regression: scanner must not panic when the 600-byte bound from
+/// a call site lands inside a multi-byte UTF-8 character (e.g. the
+/// `—` em-dash that appears in module-level docs).  Pre-2026-05-14
+/// Windows CI run hit this — CRLF line endings shifted byte
+/// positions so `cursor + 600` landed inside `—`, panicking with
+/// "end byte index … is not a char boundary".
+#[test]
+fn scanner_safe_on_multibyte_chars_within_lookahead_window() {
+    // Synthetic source where the call marker is followed by a long
+    // run of em-dashes, guaranteeing `cursor + 600` lands inside
+    // one of them.  Without the char-boundary walk-back, this panics.
+    let mut synthetic = String::from(
+        "let outcome = transition_with_audit(\n    tx,\n    doc_id,\n    DocState::Sending,\n    DocState::ErrorRetryable,\n",
+    );
+    for _ in 0..250 {
+        synthetic.push_str("    // — — — long em-dash comment line — — —\n");
+    }
+    synthetic.push_str(
+        "    \"BOOT_FOO\",\n    Severity::Error,\n    || serde_json::json!({}),\n).await?;\n",
+    );
+    // The first two DocState::<Variant> tokens are within the first
+    // ~150 bytes so scanner still finds them; the test asserts that
+    // the scan_end-clamp walk doesn't panic on the em-dashes far
+    // past those tokens but within the 600-byte window.
+    let sites = scan_cas_call_sites(&synthetic);
+    assert_eq!(sites.len(), 1);
     assert_eq!(sites[0].from_variant, "Sending");
     assert_eq!(sites[0].to_variant, "ErrorRetryable");
 }
