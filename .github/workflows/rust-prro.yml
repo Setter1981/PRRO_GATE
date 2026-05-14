@@ -54,7 +54,10 @@ jobs:
         working-directory: rust
         # Crate-scoped on purpose: workspace-wide clippy is not a T16 gate
         # until prro_crypto / prro_escpos get their own hardening pass.
-        run: cargo clippy -p prro --all-targets --no-deps -- -D warnings
+        # --features test-support: builds the integration test targets
+        # that consume the W2 ReconcileGuard test seam. Production
+        # builds never enable this feature.
+        run: cargo clippy -p prro --all-targets --no-deps --features test-support -- -D warnings
 
   build:
     name: ${{ matrix.target }}
@@ -101,7 +104,11 @@ jobs:
       - name: Test (cross-target binary)
         if: matrix.target != 'x86_64-unknown-linux-musl'
         working-directory: rust
-        run: cargo test -p prro --target ${{ matrix.target }} --locked
+        # --features test-support: required by integration tests that
+        # call `boot_phase::run_boot_reconciliation` via the W2
+        # ReconcileGuard test seam (M3b structural enforcement of
+        # ADR-M3-A10). Production builds do NOT enable this feature.
+        run: cargo test -p prro --target ${{ matrix.target }} --features test-support --locked
 
       - name: Test (musl built for target, executed on host gnu)
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -109,4 +116,5 @@ jobs:
         # Native execution on the host gnu runner — the musl `cargo build`
         # above proves the target compiles; tests run via host gnu because
         # GH ubuntu-latest doesn't ship a musl libc by default.
-        run: cargo test -p prro --locked
+        # --features test-support: see W2 note on the cross-target step.
+        run: cargo test -p prro --features test-support --locked

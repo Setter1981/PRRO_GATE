@@ -28,17 +28,19 @@
 //!   `MutexGuard`, so dropping the token releases the mutex.
 //!
 //! - `ReconcileGuard::for_integration_test_only()` is the test seam.
-//!   `#[doc(hidden)]` + the explicit `_for_integration_test_only`
-//!   naming + this doc-comment are the signal that production callers
-//!   MUST NOT use it.  It exists because the M3a-era integration
-//!   tests in `tests/app_boot_reconciliation.rs` +
-//!   `tests/boot_phase_w9_helpers.rs` exercise specific dispatch
-//!   branches by calling `run_boot_reconciliation` directly; refactoring
-//!   each of those tests to go through `App::reconcile_pending_with`
-//!   would require building a full `App` (config + boot pipeline +
-//!   quick_check + migrations) and matching against the aggregated
-//!   `ReconciliationSummary` rather than per-FN `BranchOutcome` —
-//!   well beyond the < 0.5 day boundary in plan §Task 2 OQ2.
+//!   **Gated behind `#[cfg(any(test, feature = "test-support"))]`** —
+//!   production builds (no `test-support` feature) do not compile this
+//!   constructor at all, so production code physically cannot call it.
+//!   The function exists ONLY when:
+//!     - the lib's own unit tests compile (`cfg(test)`), OR
+//!     - a downstream test target opts in via
+//!       `cargo test --features test-support` (the canonical
+//!       invocation, documented in CI workflow + `Cargo.toml` feature
+//!       comment).
+//!
+//!   This is the hard structural gate operator review 2026-05-14
+//!   demanded — `#[doc(hidden)]` + naming alone are insufficient
+//!   discouragement for W0b scoped-YES correctness.
 //!
 //! Both constructors return a `ReconcileGuard` of the same nominal
 //! type; the only behavioural difference is the lock-holding inner.
@@ -65,10 +67,12 @@ enum ReconcileGuardKind<'a> {
     /// released when the token drops) — Rust's lint doesn't see it
     /// as "read", but its presence is the whole point.
     Production(#[allow(dead_code)] tokio::sync::MutexGuard<'a, ()>),
-    /// Test-only variant — no lock held.  Constructed via
-    /// `ReconcileGuard::for_integration_test_only()`, which is
-    /// `#[doc(hidden)] pub` and named explicitly to discourage
-    /// production use.
+    /// Test-only variant — no lock held.  Gated behind
+    /// `cfg(any(test, feature = "test-support"))` so production
+    /// builds physically cannot represent this variant.  Constructed
+    /// exclusively via `ReconcileGuard::for_integration_test_only()`,
+    /// which is itself cfg-gated.
+    #[cfg(any(test, feature = "test-support"))]
     TestOnly,
 }
 
@@ -84,6 +88,25 @@ impl<'a> ReconcileGuard<'a> {
     }
 }
 
+/// Test-only constructor, gated by `cfg(any(test, feature = "test-support"))`.
+///
+/// **Production builds do NOT compile this `impl` block** — the
+/// constructor physically does not exist in release binaries or in
+/// any consumer build that does not enable `test-support`.  This is
+/// the hard structural gate that W0b scoped-YES correctness requires
+/// (see module-level docs).
+///
+/// Visible to:
+///   - The lib crate's own unit tests (`cfg(test)`).
+///   - Integration tests in `tests/` that opt in via
+///     `cargo test --features test-support` (canonical CI invocation;
+///     see `.github/workflows/rust-prro.yml`).
+///
+/// Not visible to:
+///   - `cargo build` (debug or release) with default features.
+///   - `cargo build --release` (production binary).
+///   - `cargo clippy` without `--features test-support`.
+#[cfg(any(test, feature = "test-support"))]
 impl ReconcileGuard<'static> {
     /// **TEST SEAM — DO NOT CALL FROM PRODUCTION CODE.**
     ///
@@ -96,7 +119,8 @@ impl ReconcileGuard<'static> {
     ///
     /// Naming is intentionally awkward (`_for_integration_test_only`)
     /// + `#[doc(hidden)]` to discourage IDE autocomplete from
-    /// surfacing this in production callers.
+    /// surfacing this even within test code.  The `cfg`-gating above
+    /// is the hard guarantee; the naming/doc are belt-and-suspenders.
     #[doc(hidden)]
     pub fn for_integration_test_only() -> Self {
         Self {
