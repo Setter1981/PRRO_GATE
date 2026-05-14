@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers-extended-cc:subagent-driven-development` (recommended) or `superpowers-extended-cc:executing-plans` to execute this plan task-by-task.
 
-**Goal.** Land the Rust **offline subsystem** sufficient to discharge `docs/PILOT_ACCEPTANCE_TEST_PLAN.md` Phase 6 ("Offline With One Fiscal Number") in the pilot dossier, *plus* close four structural M3a carry-forwards that affect production resilience: raw-CAS helper promotion, dedicated `first_kvt1_at` column, module-level single-writer enforcement, and conditional active KVT2 polling.  Exit with: offline session lifecycle + `OFFLINE_LOCAL_ACK` transition whitelist + Pattern C stage-and-flip + Z-report guard + return-online detection + idempotent backlog sync — all under W11-extended deterministic replay covering offline crash points.
+**Goal.** Land the Rust **offline subsystem** sufficient to discharge `docs/PILOT_ACCEPTANCE_TEST_PLAN.md` Phase 6 ("Offline With One Fiscal Number") in the pilot dossier, *plus* close four structural M3a carry-forwards that affect production resilience: raw-CAS helper promotion, dedicated `first_kvt1_at` column, module-level single-writer enforcement, and W0b-scoped in-drain KVT2 confirmation.  Exit with: offline session lifecycle + `OFFLINE_LOCAL_ACK` transition whitelist + Pattern C stage-and-flip + Z-report guard + return-online detection + idempotent backlog sync — all under W11-extended deterministic replay covering offline crash points.
 
 **Non-regression invariant (load-bearing).**  M3a ONLINE happy path stays baseline.  The 5-stage write path MUST NOT break.  W11 deterministic replay (21/21 fixtures green on `e183b82`) MUST stay green.  Every M3b task adds tests; no M3b task removes or skips an M3a test.
 
@@ -12,6 +12,7 @@
 - ADR-M3-A1..A10 in `docs/superpowers/specs/2026-05-04-m2-pre-plan-adr.md` + `2026-05-12-adr-m3-a10-global-single-writer.md` — M3a state-machine + lock invariants that M3b must preserve.
 - W0-1 / W0-2 / W0-3 freeze docs — state sequences, lock discipline, retry-recovery.
 - Operator scope thesis (memory `project_m3b_scope_thesis`, set 2026-05-14) — frame for what M3b is and is NOT.
+- `docs/superpowers/specs/2026-05-14-m3b-w0b-w12-gate-decision.md` — W0b verdict: **YES, drain-time/latest-doc only**.
 
 **Architecture.**  Rust crate `prro` extends with:
 - `services::offline_session` — offline-session state machine + repository contracts.
@@ -23,7 +24,7 @@
 - `services::reconciliation::boot_phase` — service-layer `transition_with_audit` helper composes existing `fiscal_documents::transition_state`; 7 raw-CAS sites refactored.  LOW 3 scanner pivots (NOT deleted) to enumerate helper call sites.
 - Module-level write enforcement: `boot_phase::run_boot_reconciliation` made `pub(crate)` or otherwise re-routed through `App::reconcile_pending_with` to close the HP2 mutex bypass.
 
-**Pattern C** is the central new structural pattern (M3a had Pattern A = compute outside / persist inside; Pattern B = `Sending` intent-marker before wire send).  **Pattern C** = durable `OFFLINE_LOCAL_ACK` first inside `with_immediate` via `stage_offline_ack` (pre-send, post-sign), then *later* (return-online tick) a separate `with_immediate` envelope drives the doc through the M3a `Sending → Sent → Kvt1` ladder via backlog sync — and IF the W0b gate verdict is YES, further through `Kvt2 → Ack` via W12 active polling.  IF W0b = NO, the doc rests at `Kvt1` + passive hold (M3c/M4 deferral, explicit Phase 6 waiver).
+**Pattern C** is the central new structural pattern (M3a had Pattern A = compute outside / persist inside; Pattern B = `Sending` intent-marker before wire send).  **Pattern C** = durable `OFFLINE_LOCAL_ACK` first inside `with_immediate` via `stage_offline_ack` (pre-send, post-sign), then *later* (return-online tick) a separate `with_immediate` envelope drives the doc through the M3a `Sending → Sent → Kvt1` ladder via backlog sync, then W12 confirms the just-sent latest doc with `lastChk(fn_sign)` and advances through `Kvt2 → Ack`.  W12 is **not** a general boot-time KVT2 poller; stale/pre-existing `Kvt1` docs stay on `passive_hold_kvt1`.
 
 **Tech stack.**  Unchanged from M3a: Rust 1.95 + sqlx 0.8 (SQLite STRICT, WAL) + tonic 0.12 + tokio 1.x + tracing 0.1 + `tokio::task_local!`.  No new crate dependencies required.
 
@@ -74,12 +75,12 @@ W7,W8 ────────────────────────�
                                                            │
 W5..W10 ──────────────────────────────────────────────────W11-Δ (deterministic-replay extension)
                                                                │
-                                                               W12 (IF W0b=YES: active KVT2 polling; IF NO: dropped)
+                                                               W12 (in-drain KVT2 confirmation via lastChk)
                                                                    │
                                                                    W13 (M3b handoff doc + memory)
 ```
 
-W0b runs first because the W12 gate verdict (YES/NO on authoritative per-doc KVT2 evidence) sets the M3b exit criteria branch — the plan cannot proceed without knowing whether final-ACK closure is achievable in M3b or requires a Phase 6 waiver.  W1 + W2 are parallel (different failure domains; both are M3a structural cleanups).  W3 + W4 are sequential schema migrations (numbered in order to avoid conflicts).
+W0b ran first because the W12 gate verdict sets the M3b exit criteria branch.  Verdict recorded 2026-05-14: **YES, drain-time/latest-doc only** via `lastChk(fn_sign)` + `response.id == doc.server_fiscal_no`, under W2/ADR-M3-A10 single-writer discipline.  W1 + W2 are parallel (different failure domains; both are M3a structural cleanups).  W3 + W4 are sequential schema migrations (numbered in order to avoid conflicts).
 
 ---
 
@@ -111,53 +112,35 @@ W0b runs first because the W12 gate verdict (YES/NO on authoritative per-doc KVT
 
 ### Task 0b (W0b): W12 gate decision — authoritative per-doc KVT2 evidence
 
-**Goal.**  Resolve the W12 gate up-front, BEFORE implementation begins, because the verdict sets the M3b exit-criteria branch (see "Exit criteria for M3b" below).  Without this verdict, the team cannot tell whether M3b's Phase-6 exit reaches "final DPS ACK" or stalls at "Kvt1 + explicit Phase 6 waiver".
+**Status:** RESOLVED 2026-05-14.
 
-**Gate condition (verbatim from W12 spec).**  Examine the DPS surface (`status_rro`, `infoRro`, `lastChk`) and answer:
+**Verdict.**  **YES — with explicit scope restriction.**  `lastChk(fn_sign)` + `response.id == doc.server_fiscal_no` is authoritative per-doc KVT2 evidence only for the **latest** DPS document on a fiscal number, under ADR-M3-A10 / W2 single-writer discipline.  This is sufficient for W9's drain-time per-doc loop, where W12 runs immediately after `stage_send(doc_i)` and before any `doc_i+1` send can occur.  It is not sufficient for arbitrary boot-time polling of stale/pre-existing `Kvt1` docs.
 
-> *Does any DPS RPC produce **authoritative per-doc KVT2 evidence**?*
+**Decision file.** `docs/superpowers/specs/2026-05-14-m3b-w0b-w12-gate-decision.md`.
 
-**"Authoritative per-doc evidence" is defined by all THREE conditions holding simultaneously:**
-
-1. **Per-doc identifier match.** The DPS response carries an identifier that unambiguously matches a single local fiscal document — one of `document_id`, `request_id`, `id_offline`, `id_sign`, or a server-fiscal pair `(server_fiscal_no, server_fiscal_date)` that the gateway recorded at stage 4.  RRO-wide aggregates (`status_rro` numeric, `last_signer`, `lnum`, `name_pay`, totals) do **NOT** count.
-2. **Signed payload.** The response carries an authoritative DPS-signed KVT2 payload or KVT2-equivalent artifact (e.g. `data_sign` from `CheckResponse`).  An unsigned status code alone is not sufficient.
-3. **No-side-effect poll.** The polling RPC produces no fiscal-document-level state change on the DPS side — it is a pure read operation that can be invoked repeatedly without altering DPS records.
-
-**All three conditions MUST hold.**  Any one missing → gate verdict = NO → W12 is DROPPED from M3b and **M3b exit criteria switch to the "NO" branch** (Phase 6 closure via explicit waiver, not final ACK).
-
-**Approach.**  ~1 hour review.  Inspect `rust/prro/proto/fiscal_server.proto:8-14` (5 RPCs: `sendChkV2`, `lastChk`, `ping`, `statusRro`, `infoRro`) + the response message shapes.  Strong prior: `statusRro` returns `bool open_shift` + `bool online` + `string last_signer` (RRO-wide aggregates only); `infoRro` adds `int32 status_rro` + operator list (also aggregate); `lastChk` is per-doc but reports the **last** chk, not specifically KVT2 evidence.  Operator may also spot-check 1–2 real DPS responses in dev contour.  The gate verdict is the operator's call, not a plan presupposition.
-
-**Files (proposed).**
-- `docs/superpowers/specs/2026-XX-XX-m3b-w0b-w12-gate-decision.md` — new spec.  Records:
-  - The three-condition checklist with per-RPC evaluation.
-  - Final verdict: YES or NO.
-  - Rationale + cited proto fields.
-  - If NO: explicit pointer to "M3b exit criteria — NO branch" (Phase 6 waiver path) in this plan.
-
-**Day budget:** ~1 hour (decision-only).
+**Gate evidence.**
+- `lastChk` takes `CheckRequest { rro_fn_sign }` and returns `CheckResponse` (`id`, `status`, `id_sign`, `data_sign`, `error_message`) per `rust/prro/proto/fiscal_server.proto:8-61`.
+- M2 W0-1 records `response.id == transport_request_id` as the recovery match rule and maps `data_sign` to DPS signature of the full payload.
+- `PRRO_GATE-5js` records the same WebCheck pattern: ByServerFiscalNo is `lastChk(fn_sign)` + `response.id` match, not a direct server-id lookup.
 
 **Acceptance.**
-- Spec file lands; verdict is unambiguous (YES or NO; no "TBD").
-- If YES: W12 stays in the plan; M3b exit criteria item #1 reads as written below ("final DPS ACK").
-- If NO: W12 is removed from the plan (or struck through with rationale); M3b exit criteria item #1 switches to "Phase 6 discharged via documented waiver; backlog drained to Kvt1 + passive_hold_kvt1".  Plan is updated in the same PR that lands the spec.
+- W12 stays in M3b, but is renamed/scoped to **in-drain KVT2 confirmation via `lastChk`**.
+- W12 MUST NOT become a boot-time arbitrary `Kvt1` poller.
+- `passive_hold_kvt1` remains the primary boot-time handler for stale/pre-existing `Kvt1` documents.
+- M3b exit criteria final `Ack` applies only to the M3b offline-drain backlog.
 
 **Verify.**
 ```
-ls docs/superpowers/specs/2026-*-m3b-w0b-w12-gate-decision.md
-grep -l "Verdict: YES\|Verdict: NO" docs/superpowers/specs/2026-*-m3b-w0b-w12-gate-decision.md
+grep -l "YES - with explicit scope restriction" docs/superpowers/specs/2026-05-14-m3b-w0b-w12-gate-decision.md
+grep -n "in-drain KVT2 confirmation" docs/superpowers/plans/2026-05-14-m3b-implementation.md
 ```
 
 **BlockedBy.** W0a.
 
-**Invariant impact.** None directly (decision-only task).  Sets the boundary condition for I8 (recovery preserves state-machine correctness) — if NO, the recovery surface ends at Kvt1, not Ack.
-
-**Where the NO verdict is recorded** (load-bearing — M3a-handoff is sealed and MUST NOT be mutated):
-- Primary record: this spec file (`docs/superpowers/specs/2026-XX-XX-m3b-w0b-w12-gate-decision.md`).
-- Mirrored summary line: `docs/M3b-handoff.md` §"Deferred to M3c/M4" (added by W13).
-- An M3a-handoff cross-reference is acceptable ONLY as a one-line pointer to the M3b decision file; do NOT edit M3a-handoff §6.1 — that carry-forward list is the M3a closure record and stays frozen.
+**Invariant impact.** Strengthens I8 for M3b offline-drain replay without widening the boot-time recovery surface.  I2 remains load-bearing: W9/W12 correctness requires W2 module-level enforcement so no same-FN send interleaves between `stage_send(doc_i)` and `lastChk(fn_sign)`.
 
 ```json:metadata
-{"files":["docs/superpowers/specs/2026-XX-XX-m3b-w0b-w12-gate-decision.md"],"verifyCommand":"grep -l 'Verdict: YES\\|Verdict: NO' docs/superpowers/specs/2026-*-m3b-w0b-w12-gate-decision.md","acceptanceCriteria":["spec file lands","verdict unambiguous","M3b exit criteria branch selected","NO verdict recorded ONLY in m3b spec + later m3b handoff, never in m3a handoff"]}
+{"files":["docs/superpowers/specs/2026-05-14-m3b-w0b-w12-gate-decision.md","docs/superpowers/plans/2026-05-14-m3b-implementation.md"],"verifyCommand":"grep -l 'YES - with explicit scope restriction' docs/superpowers/specs/2026-05-14-m3b-w0b-w12-gate-decision.md && grep -n 'in-drain KVT2 confirmation' docs/superpowers/plans/2026-05-14-m3b-implementation.md","acceptanceCriteria":["spec file lands","verdict unambiguous","W12 scoped to drain-time latest-doc confirmation","passive_hold_kvt1 retained for stale boot-time Kvt1"]}
 ```
 
 ---
@@ -623,25 +606,23 @@ cargo test -p prro --test return_online_probe_idempotent      # new
 
 ### Task 9 (W9): backlog drain — Pattern C stage-and-flip
 
-**Goal.** When node mode is `GoingOnline` and there is at least one `OfflineLocalAck` doc, drain the backlog sequentially.  **Drain target depends on the W0b verdict** (HIGH-3 branching, 2026-05-14 second review):
+**Goal.** When node mode is `GoingOnline` and there is at least one `OfflineLocalAck` doc, drain the backlog sequentially.  W0b is resolved as scoped YES, so the M3b drain target is `Ack` for the offline-drain backlog:
 
-- **W0b = YES path**: drive each doc through the full M3a wire-send + finalize ladder `OfflineLocalAck → Sending → Sent → Kvt1 → Kvt2 → Ack` via existing `stage_send::run` (widened) + `stage_finalize::run` + W12 active KVT2 polling.  Final state per doc: `Ack`.
-- **W0b = NO path**: drive each doc through `OfflineLocalAck → Sending → Sent → Kvt1` only.  W12 is dropped from M3b; `passive_hold_kvt1` from PR #45 remains.  Final state per doc: `Kvt1` (passive hold).  No `Kvt2 → Ack` advancement in M3b — that is M3c/M4 scope per the W0b spec.
+- Drive each doc through the full M3a wire-send + finalize ladder `OfflineLocalAck → Sending → Sent → Kvt1 → Kvt2 → Ack` via existing `stage_send::run` (widened) + W12 in-drain `lastChk` confirmation + `stage_finalize::run`.  Final state per drained backlog doc: `Ack`.
 
-In both branches, the drain is idempotent: a doc that DPS reports as already-sent (`lastChk` match for `server_fiscal_no IS NOT NULL` docs only — see MED-4 narrowing below) skips wire-send and advances directly.  After all backlog drained to the appropriate target state, node mode advances `GoingOnline → Online` and offline session transitions `Draining → Closed`.
+The drain is idempotent: a doc that DPS reports as already-sent (`lastChk` match for `server_fiscal_no IS NOT NULL` docs only — see MED-4 narrowing below) skips wire-send and advances directly.  After all backlog docs reach `Ack`, node mode advances `GoingOnline → Online` and offline session transitions `Draining → Closed`.
 
 **Files (proposed).**
 - `src/services/offline_sync/backlog_drain.rs` — new module.
 - `src/services/write_path/stage_send.rs` — **widening required** (HIGH-3 fix, 2026-05-14 review): the 4-pre CAS source-state set extends from `{Signed, ErrorRetryable}` (M3a, `stage_send.rs:489, 835`) to `{Signed, ErrorRetryable, OfflineLocalAck}`.  The wire-send semantics downstream of the 4-pre CAS are identical regardless of source state (build CheckEnvelope, sign envelope, wire send, post-wire CAS).  Adding a sibling `stage_send_offline_replay::run` would duplicate ~500 lines of code — the W9 default is **widen `stage_send`**.  The `allowed_transition` whitelist already gains `(OfflineLocalAck, Sending)` in W6; the runtime precondition in `stage_send::run` must match.  Decision recorded in W9 PR; OQ4-adjacent.
 - Entry: `App::drain_offline_backlog_with(&self, fiscal_number: &str) -> Result<DrainSummary, BootError>`.  Holds the App reconcile mutex (W2 enforcement applies).
 - Per-doc loop:
-  1. **Conditional `lastChk` pre-flight** (MED-4 narrowing): IF `doc.server_fiscal_no IS NOT NULL` (doc was previously sent at least once and DPS may have recorded it), issue `lastChk` probe.  If DPS reports id match → advance directly via `Sent → Kvt1` arm (M3a path).  IF `doc.server_fiscal_no IS NULL` (pure `OfflineLocalAck` that has never been wired to DPS) → SKIP pre-flight; proceed to step 2.  Pure offline-acked docs have no server-side state to be idempotent-against; idempotency comes from local CAS + Pattern B `Sending` marker on first send attempt (M3a's existing mechanism).
+  1. **Conditional `lastChk` pre-flight** (MED-4 narrowing): IF `doc.server_fiscal_no IS NOT NULL` (doc was previously sent at least once and DPS may have recorded it), issue `lastChk` probe.  If DPS reports `status == OK`, id match, and non-empty `data_sign`, reuse that same response as W12 evidence and advance the doc to `Ack` without re-wiring.  IF `doc.server_fiscal_no IS NULL` (pure `OfflineLocalAck` that has never been wired to DPS) → SKIP pre-flight; proceed to step 2.  Pure offline-acked docs have no server-side state to be idempotent-against; idempotency comes from local CAS + Pattern B `Sending` marker on first send attempt (M3a's existing mechanism).
   2. CAS `OfflineLocalAck → Sending` via the W1 helper composition (uses existing `fiscal_documents::transition_state` + service-layer audit — see W1 MED-3 resolution).
   3. Reuse `stage_send::run` (widened in this task per HIGH-3 fix above) for wire send.
-  4. **Branched on W0b verdict:**
-     - **W0b = YES**: invoke `stage_finalize::run` *Kvt2 → Ack* arm (M3a unchanged) once W12 active polling lands `Kvt2` evidence.  Drain target = `Ack`.
-     - **W0b = NO**: STOP the per-doc loop at `Kvt1`; do NOT invoke `stage_finalize::run` (no `Kvt2` evidence available without W12).  Drain target = `Kvt1` + passive hold.  This is **not** a regression — it is the explicit M3b NO branch contract.  Pre-Kvt2 transitions (`Sending → Sent → Kvt1`) happen inside `stage_send` 4-b post-wire CAS + reuse of M3a probes; M3b adds no new logic for them.
-  5. Audit each doc transition (event_type carries the branch: `OFFLINE_DRAIN_TO_ACK` vs `OFFLINE_DRAIN_TO_KVT1`).
+  4. **Hard W12 precondition:** before the drain sends any later doc on the same FN, call W12 for the current doc.  No same-FN send may interleave between `stage_send(doc_i)` and `lastChk(fn_sign)`.  This relies on W2 module-level enforcement + ADR-M3-A10 single-writer discipline.
+  5. W12 calls `lastChk(fn_sign)` and requires `status == OK`, `response.id == doc.server_fiscal_no`, and non-empty `data_sign`.  On success, W12 advances through `Kvt1 → Kvt2` with audited evidence, then invokes/reuses the existing `stage_finalize::run` *Kvt2 → Ack* arm (M3a unchanged).  Drain target = `Ack`.
+  6. Audit each doc transition (`OFFLINE_DRAIN_TO_ACK`).
 - Failure handling: a single doc failing surfaces as `BootError::OfflineDrainFailed { document_id, source }` (per-doc attribution).  Sibling docs in the backlog continue, mirroring M3a try-and-audit shim.
 
 **Day budget:** 3–4 days.  This is the largest task.
@@ -650,16 +631,15 @@ In both branches, the drain is idempotent: a doc that DPS reports as already-sen
 - `stage_send::run` source-state set widened to `{Signed, ErrorRetryable, OfflineLocalAck}`; M3a 4-pre CAS allowlist updated; existing M3a tests for `Signed → Sending` and `ErrorRetryable → Sending` pass unchanged; new test covers `OfflineLocalAck → Sending`.
 - Backlog of N docs drains **strictly in `lnd` ASC order** (MAC chain order).  Plan default is strict ASC; if OQ4 later resolves to permit a DPS-tolerated alternative ordering, a recorded design decision (companion file `2026-XX-XX-m3b-w9-pattern-c-design.md`) must update this acceptance bullet *before* W9 implementation lands.  Until then, strict ASC is contract.
 - **`lastChk` pre-flight is the idempotency seam — but ONLY for docs with prior server evidence.**  For each doc in the backlog:
-  - IF `doc.server_fiscal_no IS NOT NULL` (replay state — doc was sent at least once before this drain attempt): drain issues a `lastChk` probe; on id match, CAS-transition directly via `Sent → Kvt1` arm.
+  - IF `doc.server_fiscal_no IS NOT NULL` (replay state — doc was sent at least once before this drain attempt): drain issues a `lastChk` probe; on `status == OK` + id match + non-empty `data_sign`, W12 reuses that response as KVT2 evidence and advances to `Ack` without re-wiring.
   - IF `doc.server_fiscal_no IS NULL` (pure `OfflineLocalAck` never wired): SKIP pre-flight; CAS `OfflineLocalAck → Sending` and invoke `stage_send::run`.  Idempotency for pure-offline docs is provided by local CAS (the `OfflineLocalAck → Sending` whitelist gate fails on the second attempt) + Pattern B `Sending` marker post-first-send.
   - Verified via two dedicated fixtures: `backlog_drain_lastchk_preflight_skips_wire_for_already_sent_doc` (replay path) and `backlog_drain_pure_offline_skips_preflight_relies_on_pattern_b` (pure-offline path).
-- **Drain target acceptance is branched on W0b verdict** (HIGH-3 second review):
-  - **W0b = YES**: backlog of N docs drains sequentially; all N reach `Ack` (via W12 polling).  Verified via fixture `backlog_drain_yes_branch_all_reach_ack`.
-  - **W0b = NO**: backlog of N docs drains sequentially; all N reach `Kvt1` (passive hold).  No doc reaches `Kvt2`/`Ack` — that requires W12.  Verified via fixture `backlog_drain_no_branch_all_reach_kvt1_only`.
-- Idempotent re-drain: if drain is interrupted mid-loop and restarted, no doc is re-wired if DPS already accepted it (proven by the `lastChk` pre-flight + the `Sending → Sent` whitelist gate inherited from M3a).  Applies in both YES and NO branches.
+- Backlog of N docs drains sequentially; all N reach `Ack` via W12 in-drain `lastChk` confirmation.  Verified via fixture `backlog_drain_scoped_yes_all_reach_ack`.
+- W12 interleave guard verified: the drain cannot send `doc_i+1` before `doc_i` completes `lastChk` confirmation and reaches `Ack`.
+- Idempotent re-drain: if drain is interrupted mid-loop and restarted, no doc is re-wired if DPS already accepted it (proven by the `lastChk` pre-flight + the `Sending → Sent` whitelist gate inherited from M3a).
 - Per-doc error does not abort drain; sibling docs continue.
-- After successful drain: node mode `Online`; session `Closed`; `offline_codes` rows untouched (codes were consumed at W7 time, drain just advances doc state — never re-allocates codes).  In NO branch, session closes with backlog of `Kvt1` docs still pending passive hold — explicitly NOT a "stuck" state but a "deferred-to-M3c/M4" state recorded in audit.
-- MAC chain is not broken after drain (every doc consumed an offline code in the order they were issued; drain walks them in strict `lnd` ASC).  Applies in both branches.
+- After successful drain: node mode `Online`; session `Closed`; `offline_codes` rows untouched (codes were consumed at W7 time, drain just advances doc state — never re-allocates codes).
+- MAC chain is not broken after drain (every doc consumed an offline code in the order they were issued; drain walks them in strict `lnd` ASC).
 
 **Verify.**
 ```
@@ -674,7 +654,7 @@ cargo test -p prro --test backlog_drain_mac_chain_preserved    # new
 **Invariant impact.** I4 (idempotency) — central to drain correctness; I8 (state-machine correctness) — drain must hit only whitelisted transitions; W11-Δ proves the cross-stage replay invariant.
 
 ```json:metadata
-{"files":["rust/prro/src/services/offline_sync/backlog_drain.rs","rust/prro/src/app.rs"],"verifyCommand":"cargo test -p prro --test backlog_drain_happy_path --test backlog_drain_idempotent_replay --test backlog_drain_per_doc_failure_sibling_continues --test backlog_drain_mac_chain_preserved --test backlog_drain_yes_branch_all_reach_ack --test backlog_drain_no_branch_all_reach_kvt1_only","acceptanceCriteria":["N-doc backlog drains to target state per W0b verdict (Ack if YES, Kvt1 if NO)","interrupted+replay is idempotent","per-doc failure → sibling continues","node mode Online + session Closed after success","MAC chain preserved","branched fixtures cover both verdicts"]}
+{"files":["rust/prro/src/services/offline_sync/backlog_drain.rs","rust/prro/src/app.rs"],"verifyCommand":"cargo test -p prro --test backlog_drain_happy_path --test backlog_drain_idempotent_replay --test backlog_drain_per_doc_failure_sibling_continues --test backlog_drain_mac_chain_preserved --test backlog_drain_scoped_yes_all_reach_ack","acceptanceCriteria":["N-doc backlog drains to Ack under scoped W0b YES","interrupted+replay is idempotent","per-doc failure → sibling continues","node mode Online + session Closed after success","MAC chain preserved","W12 interleave guard covered"]}
 ```
 
 ---
@@ -722,32 +702,32 @@ cargo test -p prro --test z_report_allowed_after_drain        # new
 
 ---
 
-### Task 11 (W11-Δ): deterministic-replay extension for offline crash points (branched by W0b verdict)
+### Task 11 (W11-Δ): deterministic-replay extension for offline crash points
 
-**Goal.** Extend `tests/write_path_deterministic_replay.rs` with fixtures covering offline-specific crash points.  Mirrors M3a's W11 design: each fixture pre-seeds a doc at a specific crash point and asserts `App::reconcile_pending → App::drain_offline_backlog_with` converges to the same final state regardless of where the crash happened.  Per HIGH-3 second-review branching, the "post-drain final state" assertion is **W0b-aware**: YES branch fixtures assert `Ack`, NO branch fixtures assert `Kvt1`.
+**Goal.** Extend `tests/write_path_deterministic_replay.rs` with fixtures covering offline-specific crash points.  Mirrors M3a's W11 design: each fixture pre-seeds a doc at a specific crash point and asserts `App::reconcile_pending → App::drain_offline_backlog_with` converges to the same final state regardless of where the crash happened.  W0b is scoped YES, so the post-drain final state for the M3b offline backlog is `Ack`; stale/pre-existing boot-time `Kvt1` docs remain outside this fixture set and stay covered by `passive_hold_kvt1`.
 
-**New fixtures (proposed) — apply to both W0b branches (transitions to OfflineLocalAck are protocol-identical regardless of W12 verdict):**
+**New fixtures (proposed) — offline entry / return-online shared surface:**
 - `replay_crash_in_offline_acquire_code` — crash between `acquire_code_tx` and `transition_state(Signed, OfflineLocalAck)`; expect rollback (with_immediate envelope semantics) — doc stays in `Signed`, code row has `consumed_at IS NULL`.
 - `replay_crash_at_offline_local_ack_emit` — crash immediately after `OfflineLocalAck` lands; reboot → doc stays in `OfflineLocalAck`, audit visible.
 - `replay_crash_during_return_online_probe` — probe in-flight crash; reboot → node mode unchanged (probe failure is rollback-equivalent).
 
-**New fixtures (proposed) — branched by W0b verdict (drain-target assertions differ):**
-- `replay_crash_mid_backlog_drain_yes_branch` (only lands if W0b = YES) — crash mid-loop (after doc #2 of 5 reaches Ack); reboot → docs #1+#2 stay `Ack`, docs #3+#4+#5 stay `OfflineLocalAck`; second drain resumes from #3 and lands them at `Ack` via W12 polling.
-- `replay_crash_mid_backlog_drain_no_branch` (only lands if W0b = NO) — crash mid-loop (after doc #2 of 5 reaches Kvt1); reboot → docs #1+#2 stay `Kvt1`, docs #3+#4+#5 stay `OfflineLocalAck`; second drain resumes from #3 and lands them at `Kvt1` only (passive hold).
-- `replay_crash_after_drain_before_session_close_yes_branch` (only W0b = YES) — crash after all docs Ack but before session → Closed; reboot → session closes on next reconcile.
-- `replay_crash_after_drain_before_session_close_no_branch` (only W0b = NO) — crash after all docs reached Kvt1 but before session → Closed; reboot → session closes on next reconcile (with backlog of Kvt1 docs documented in audit as deferred-to-M3c/M4, not "stuck").
+**New fixtures (proposed) — scoped W0b YES drain target:**
+- `replay_crash_mid_backlog_drain_scoped_yes` — crash mid-loop (after doc #2 of 5 reaches Ack); reboot → docs #1+#2 stay `Ack`, docs #3+#4+#5 stay `OfflineLocalAck`; second drain resumes from #3 and lands them at `Ack` via W12 in-drain confirmation.
+- `replay_crash_between_stage_send_and_lastchk` — crash after `stage_send(doc_i)` records `server_fiscal_no` but before W12 confirms `lastChk`; reboot → W9 resumes `doc_i`, uses `lastChk` id match, and lands `Ack` without re-wiring the doc.
+- `replay_lastchk_mismatch_after_stage_send_no_ack` — DPS returns a different `id` for the current doc; reboot leaves the doc replayable and never synthesizes `Ack`.
+- `replay_crash_after_drain_before_session_close_scoped_yes` — crash after all docs Ack but before session → Closed; reboot → session closes on next reconcile.
 
-**Day budget:** 2 days (YES branch) or 1.5 days (NO branch — one fewer pair).
+**Day budget:** 2 days.
 
 **Acceptance.**
-- 7 new fixtures total in YES branch (3 shared + 2 YES-only + 2 YES-only); 6 new fixtures in NO branch (3 shared + 2 NO-only + 1 NO-only because no `Kvt2`/`Ack` advancement to replay).
-- W11 total goes from 21 → 28 (YES) or 21 → 27 (NO).
-- Each fixture proves the deterministic-replay invariant (same final state regardless of crash point).  "Final state" definition depends on the active W0b branch: `Ack` (YES) or `Kvt1` (NO).
+- 7 new fixtures total (3 shared + 4 scoped-YES drain fixtures).
+- W11 total goes from 21 → 28.
+- Each fixture proves the deterministic-replay invariant (same final state regardless of crash point).  For the M3b offline-drain backlog, final state is `Ack`.
 - `cargo test -p prro --test write_path_deterministic_replay` is the single command that runs all fixtures.
 
 **Verify.**
 ```
-cargo test -p prro --test write_path_deterministic_replay   # 28 passed if W0b=YES; 27 passed if W0b=NO
+cargo test -p prro --test write_path_deterministic_replay   # 28 passed
 ```
 
 **BlockedBy.** W9 (backlog drain implementation exists).
@@ -755,39 +735,48 @@ cargo test -p prro --test write_path_deterministic_replay   # 28 passed if W0b=Y
 **Invariant impact.** I8 (recovery preserves state-machine correctness) — proven across offline crash surface.
 
 ```json:metadata
-{"files":["rust/prro/tests/write_path_deterministic_replay.rs"],"verifyCommand":"cargo test -p prro --test write_path_deterministic_replay","acceptanceCriteria":["7 new fixtures if W0b=YES (3 shared + 2 YES-only + 2 YES-only); 6 new fixtures if W0b=NO (3 shared + 2 NO-only + 1 NO-only)","total 28 fixtures pass if W0b=YES; 27 if W0b=NO","each fixture proves replay invariant: final state is Ack on YES branch or Kvt1 on NO branch"]}
+{"files":["rust/prro/tests/write_path_deterministic_replay.rs"],"verifyCommand":"cargo test -p prro --test write_path_deterministic_replay","acceptanceCriteria":["7 new fixtures total","total 28 fixtures pass","each fixture proves replay invariant: final state is Ack for M3b offline-drain backlog"]}
 ```
 
 ---
 
-### Task 12 (W12 — gated by W0b verdict): active KVT2 polling
+### Task 12 (W12): in-drain KVT2 confirmation via `lastChk`
 
-**Gate.** This task runs ONLY IF `W0b` verdict is YES (see Task 0b above).  If `W0b` verdict is NO, this task is **removed** from the plan in the same PR that lands the W0b decision spec; M3b exit criteria switches to the "NO" branch (Phase 6 waiver).  The plan does NOT leave W12 as "optional, decide later" — the verdict is binding.
+**Gate.** W0b is resolved as **YES — with explicit scope restriction** (`docs/superpowers/specs/2026-05-14-m3b-w0b-w12-gate-decision.md`).  W12 is in scope only for W9 drain-time latest-doc confirmation.  W12 is NOT a boot-time arbitrary `Kvt1` poller.
 
-**Goal (W0b = YES).** Implement active polling that drives `Kvt1 → Kvt2 → Ack` using the authoritative per-doc evidence identified in the W0b spec.  Retire `passive_hold_kvt1` (PR #45) in favour of active resolution.
+**Goal.** Implement the W9 per-doc confirmation step that drives the currently drained doc through `Kvt1 → Kvt2 → Ack` using `lastChk(fn_sign)` evidence.  The call occurs immediately after `stage_send(doc_i)` records `doc_i.server_fiscal_no` and before the drain attempts any later document on the same FN.
 
-**Files (proposed — W0b = YES path).**
-- `src/services/reconciliation/boot_phase.rs` — `passive_hold_kvt1` deprecated (kept as fallback for malformed-timestamp degrade path); new `poll_kvt2_active` invoked by the boot dispatcher for Kvt1 docs.
-- `src/services/offline_sync/kvt2_poll.rs` (or similar) — polling loop with configurable tick interval (`config.kvt2_poll_interval_seconds`, default 60).
-- Audit events `KVT2_POLL_ATTEMPT`, `KVT2_POLL_SUCCESS`, `KVT2_POLL_FAILED`.  Age-bucket severity from PR #45 is repurposed onto polling failure (consecutive failures over thresholds → Warning / Error).
+**Files (proposed).**
+- `src/services/offline_sync/kvt2_confirm.rs` (or similar) — W12 confirmation helper invoked only from W9 backlog drain.
+- `src/services/offline_sync/backlog_drain.rs` — calls W12 after `stage_send::run` and before advancing to the next doc.
+- `src/services/reconciliation/boot_phase.rs` — keep `passive_hold_kvt1` as the primary boot-time handler for stale/pre-existing `Kvt1` docs; no generic boot-time KVT2 polling dispatcher is added in M3b.
+- Audit events `KVT2_CONFIRM_ATTEMPT`, `KVT2_CONFIRM_SUCCESS`, `KVT2_CONFIRM_FAILED`.
 
-**Day budget:** 2–3 days.
+**Day budget:** 1.5–2 days (narrower than the original generic polling task).
 
-**Acceptance (W0b = YES path).**
-- `poll_kvt2_active` extracts per-doc KVT2 evidence per the W0b three-condition rule.
-- On success: CAS `Kvt1 → Kvt2 → Ack` via the W1 helper composition.
-- On failure: audit `KVT2_POLL_FAILED` with age-escalated severity; doc state unchanged.
-- Polling tick interval configurable.
-- `passive_hold_kvt1` is no longer the primary handler for Kvt1 docs — only invoked as malformed-timestamp degrade fallback.
+**Acceptance.**
+- W12 is invoked only from W9 drain-time flow, for the current document being drained.
+- Hard precondition enforced/tested: no same-FN send may interleave between `stage_send(doc_i)` and `lastChk(fn_sign)`; W12 relies on W2 module-level enforcement + ADR-M3-A10 single-writer discipline.
+- Success requires all evidence checks:
+  - `lastChk.status == OK`;
+  - `response.id == doc.server_fiscal_no`;
+  - `data_sign` is present and non-empty.
+- On success: persist/audit the KVT2 evidence and CAS `Kvt1 → Kvt2 → Ack` via the W1 helper composition + existing `stage_finalize` for `Kvt2 → Ack`.
+- On `status != OK`, id mismatch, missing/empty `data_sign`, or lost CAS: emit `KVT2_CONFIRM_FAILED` with typed error; doc does NOT reach `Ack`.
+- `passive_hold_kvt1` remains the primary boot-time handler for arbitrary/stale `Kvt1` docs.
+- Fixture coverage:
+  - `kvt2_confirm_lastchk_match_advances_to_ack`;
+  - `kvt2_confirm_lastchk_id_mismatch_no_ack`;
+  - `kvt2_confirm_missing_data_sign_no_ack`;
+  - `boot_time_stale_kvt1_still_passive_hold`;
+  - `backlog_drain_no_next_send_before_current_lastchk`.
 
-**BlockedBy.** W0b (verdict = YES), W1 (helper composition), W11-Δ (replay extension covers Kvt1 → Kvt2 → Ack path).
+**BlockedBy.** W0b spec accepted, W1 (helper composition), W2 (module-level enforcement), W9 (backlog drain implementation exists), W11-Δ (replay extension covers the drain-time confirmation window).
 
-**Invariant impact (W0b = YES).** Strengthens I8 — recovery now resolves stuck Kvt1 docs without operator intervention.
-
-**If W0b = NO:** This task is DROPPED.  M3b retains `passive_hold_kvt1` from PR #45; Kvt1 docs surface via escalating-severity audit but do NOT auto-advance.  Phase 6 closure relies on the documented waiver (M3b exit criteria NO branch).
+**Invariant impact.** Strengthens I8 for M3b offline-drain replay while preserving the existing boot-time recovery boundary.  I2 is load-bearing: correctness depends on W2 closing the direct boot-phase bypass so a same-FN send cannot interleave between W9 send and W12 confirm.
 
 ```json:metadata
-{"files":["rust/prro/src/services/reconciliation/boot_phase.rs","rust/prro/src/services/offline_sync/kvt2_poll.rs"],"verifyCommand":"cargo test -p prro --test kvt2_poll","acceptanceCriteria":["W0b verdict = YES (this task only opens if verdict is YES)","poll_kvt2_active extracts per-doc evidence per W0b rule","Kvt1→Kvt2→Ack on success","KVT2_POLL_FAILED with age-escalated severity","passive_hold_kvt1 deprecated to fallback"]}
+{"files":["rust/prro/src/services/offline_sync/kvt2_confirm.rs","rust/prro/src/services/offline_sync/backlog_drain.rs","rust/prro/src/services/reconciliation/boot_phase.rs"],"verifyCommand":"cargo test -p prro --test kvt2_confirm --test backlog_drain_scoped_yes_all_reach_ack --test boot_phase_w9_helpers","acceptanceCriteria":["W12 invoked only from W9 drain-time flow","lastChk status/id/data_sign evidence checks","Kvt1→Kvt2→Ack on success","typed failure with no Ack on mismatch/missing evidence","passive_hold_kvt1 remains primary for stale boot-time Kvt1","no same-FN send interleave before current lastChk"]}
 ```
 
 ---
@@ -814,7 +803,7 @@ ls docs/M3b-handoff.md
 grep -l m3b_starting_point ~/.claude/projects/*/memory/MEMORY.md
 ```
 
-**BlockedBy.** W11-Δ AND W0b verdict resolved.  W13 can land after W11-Δ provided the W0b verdict is recorded and W12 has reached its terminal state for that verdict: if W0b = YES, W12 must be landed (active polling + tests green); if W0b = NO, W12 must be explicitly dropped with rationale in the W0b spec file.  W12 is NOT "optional" — it is binding-conditional on W0b.
+**BlockedBy.** W11-Δ AND W12.  W13 can land after the W0b verdict is recorded and W12 scoped-YES in-drain confirmation has landed with tests green.  W12 is NOT optional, but its scope is limited to W9 drain-time latest-doc confirmation; stale/pre-existing boot-time `Kvt1` docs remain documented as `passive_hold_kvt1` carry-forward.
 
 **Invariant impact.** None directly; codifies M3b closure state.
 
@@ -826,22 +815,20 @@ grep -l m3b_starting_point ~/.claude/projects/*/memory/MEMORY.md
 
 ## Exit criteria for M3b
 
-M3b is CLOSED when ALL of the following hold.  Item 1 has **two branches** selected by the W0b gate verdict (Task 0b above):
+M3b is CLOSED when ALL of the following hold.  W0b selected the scoped-YES branch: final `Ack` applies to the **M3b offline-drain backlog only**, not to historical/pre-existing stale `Kvt1` documents.
 
-### Item 1 — branched on W0b verdict
+### Item 1 — offline-drain backlog reaches final ACK
 
-**If W0b verdict = YES** (authoritative per-doc KVT2 evidence available):
-1a. **Phase 6 of `docs/PILOT_ACCEPTANCE_TEST_PLAN.md` discharged end-to-end** in a dev contour to **final DPS ACK**: enter offline → issue receipts as `OFFLINE_LOCAL_ACK` → block Z-report while backlog exists → return online → sync backlog → finalize **all backlog docs reach `Ack`** via W12 active polling.  Evidence attached to pilot dossier (transport_trace + audit_log rows + DpsError distribution + KVT2_POLL_* events).
+1. **Phase 6 of `docs/PILOT_ACCEPTANCE_TEST_PLAN.md` discharged end-to-end** in a dev contour to **final DPS ACK for the M3b offline-drain backlog**: enter offline → issue receipts as `OFFLINE_LOCAL_ACK` → block Z-report while backlog exists → return online → sync backlog → finalize **all M3b backlog docs reach `Ack`** via W12 in-drain `lastChk` confirmation.  Evidence attached to pilot dossier (transport_trace + audit_log rows + DpsError distribution + KVT2_CONFIRM_* events).
 
-**If W0b verdict = NO** (no authoritative per-doc evidence):
-1b. **Phase 6 discharged in a dev contour with explicit waiver** as far as the protocol permits: enter offline → issue receipts as `OFFLINE_LOCAL_ACK` → block Z-report while backlog exists → return online → sync backlog → **all backlog docs reach `Kvt1`** (passive hold from PR #45 remains).  A waiver document is attached to the pilot dossier explaining that final-ACK resolution is M3c/M4 scope; the audit trail (`BOOT_KVT1_HOLD_DEFERRED` with age-bucket severity) is offered as operator-visible proxy for stuck-Kvt1 detection.  Phase 6 step 9 ("Confirm all offline documents receive final DPS sandbox ACK") is explicitly **waived in writing**.
+Historical/pre-existing stale `Kvt1` docs remain out of M3b W12 scope and continue to surface through `passive_hold_kvt1` with age-bucket severity.
 
-### Items 2–8 (apply regardless of W0b verdict)
+### Items 2–8
 
 2. **W1..W11-Δ all merged** to `rust-gateway` with regular merge commits (per `feedback_pr_merge_style` memory).
-3. **W0b verdict recorded** in `docs/superpowers/specs/2026-XX-XX-m3b-w0b-w12-gate-decision.md` AND W12 task either landed (if YES) or struck from plan with rationale (if NO).
+3. **W0b verdict recorded** in `docs/superpowers/specs/2026-05-14-m3b-w0b-w12-gate-decision.md` AND W12 scoped in-drain confirmation landed.
 4. **W13 handoff doc landed**, including the appropriate branch of Item 1 in M3b closure summary.
-5. **W11 + W11-Δ pass green**: full `cargo test -p prro --test write_path_deterministic_replay` returns ≥28 passed (W0b = YES branch) or ≥27 passed (W0b = NO branch).
+5. **W11 + W11-Δ pass green**: full `cargo test -p prro --test write_path_deterministic_replay` returns ≥28 passed.
 6. **No M3a test broken**: full `cargo test -p prro` returns ≥470 passed / 0 failed / 1 ignored (M3a baseline) + W11-Δ + W5/W6/W7/W8/W9/W10 new tests; total ~520+ tests.
 7. **Frozen invariants 1–10 preserved** — verified per W-task acceptance.
 8. **M3b epic in bd closed** with all child issues resolved.
@@ -858,7 +845,7 @@ Explicit non-goals (per operator thesis 2026-05-14):
 - ❌ Web admin UI.  None of any form.
 - ❌ Backup/restore, CA/key rotation, rollback rehearsal.  Parallel ops/docs prerequisites, not M3b code scope.
 - ❌ 36h / 168h / 24h shift-limit enforcement unless explicitly promoted by operator.  Otherwise: record pilot risk acceptance and defer.
-- ❌ Active KVT2 polling without per-doc evidence.  W12-gate prevents fake polling.
+- ❌ Generic boot-time KVT2 polling for arbitrary/stale `Kvt1` docs.  W12 is scoped to W9 drain-time latest-doc confirmation only.
 - ❌ Channel switch with open shift.  Frozen invariant 3 absolute; M3b reinforces.
 
 ---
@@ -874,7 +861,7 @@ Explicit non-goals (per operator thesis 2026-05-14):
 - `docs/superpowers/specs/2026-XX-XX-m3b-pre-plan-adr.md` — optional design freeze if W5/W7/W9 surface ADRs requiring sign-off (parallel to ADR-M3-A1..A10).
 - `docs/superpowers/specs/2026-XX-XX-m3b-w8-return-online-probe.md` — W8 design freeze (DPS RPC choice + tick interval + audit shape).
 - `docs/superpowers/specs/2026-XX-XX-m3b-w9-pattern-c-design.md` — W9 design freeze (drain loop + idempotency + lastChk pre-flight).
-- `docs/superpowers/specs/2026-XX-XX-m3b-w0b-w12-gate-decision.md` — W0b/W12 gate verdict + three-condition checklist + rationale (renumbered: W0b is the gate task, W12 is the implementation task).
+- `docs/superpowers/specs/2026-05-14-m3b-w0b-w12-gate-decision.md` — W0b/W12 scoped-YES verdict + three-condition checklist + rationale.
 - `docs/M3b-handoff.md` — closure doc (W13).
 
 ---
@@ -884,10 +871,10 @@ Explicit non-goals (per operator thesis 2026-05-14):
 | ID | Invariant | Risk window | Mitigation |
 |---|---|---|---|
 | I1 | No DPS / network inside SQLite write tx | W7 `stage_offline_ack` (new stage, post-sign / pre-send), W9 drain loop | Code-pool consumption is pure DB; wire calls are between `with_immediate` envelopes, never inside |
-| I2 | One FN, one writer | W9 drain concurrent with potential boot reconcile | W2 module-level enforcement + W9 holds App mutex |
-| I4 | Idempotency | W9 drain replay after crash (both W0b branches) | `lastChk` pre-flight probe for `server_fiscal_no IS NOT NULL` docs + `transition_state` CAS short-circuit for pure-offline docs |
+| I2 | One FN, one writer | W9 send-to-lastChk confirmation window | W2 module-level enforcement + W9 holds App mutex; no same-FN send may interleave between `stage_send(doc_i)` and W12 `lastChk(fn_sign)` |
+| I4 | Idempotency | W9 drain replay after crash | `lastChk` pre-flight probe for `server_fiscal_no IS NOT NULL` docs + `transition_state` CAS short-circuit for pure-offline docs + W12 replay fixture between `stage_send` and `lastChk` |
 | I5 | Offline bounded by code availability + limits | W5 `acquire_code_tx`, W7 `stage_offline_ack` | `offline_codes.consumed_at IS NOT NULL` is durable; partial UNIQUE index `ux_offline_codes_consumed_by_doc` + `offline_codes_consumed_immutable` trigger prevent over-issue and unset-to-NULL; typed `CodePoolExhausted` error |
-| I8 | Recovery preserves state-machine correctness | W11-Δ proves across offline crash points (branched by W0b verdict) | W1 service-layer helper composes existing `fiscal_documents::transition_state` which enforces whitelist on every CAS; W11-Δ replay fixtures branched by W0b verdict (drain target = Ack if YES; Kvt1 if NO) |
+| I8 | Recovery preserves state-machine correctness | W11-Δ proves across offline crash points | W1 service-layer helper composes existing `fiscal_documents::transition_state` which enforces whitelist on every CAS; W11-Δ replay fixtures prove M3b offline-drain target = Ack while stale boot-time Kvt1 stays on passive hold |
 | I9 | Graceful shutdown leaves replayable state | W8 probe task, W9 drain loop | Shutdown channel respected by both; pending transitions roll back inside `with_immediate` |
 
 ---
@@ -900,7 +887,7 @@ To be resolved during W0a or earlier in M3b execution (NOT plan-blocking):
 - **OQ2**: W2 implementation choice — `pub(crate)` visibility OR `ReconcileGuard` token type?  Decision criteria pinned in W2 section above (no external callers + < 0.5 day fix → `pub(crate)`; otherwise token).  Token is non-`Clone`; `Send` only if call graph requires it.  Decision recorded in W2 PR.
 - **OQ3**: W8 probe DPS RPC choice — `ping` (lighter) or `statusRro` (richer signal)?  Decision in W8 design freeze.
 - **OQ4**: W9 backlog drain ordering — strictly by `lnd` ASC (MAC chain order) or accept DPS-permitted alternative orderings?  Decision in W9 design freeze.
-- **OQ5**: W0b gate verdict (YES/NO) — see Task 0b above.  Decision is REQUIRED before W1+ work starts (W0b blocks the plan), not optional.  Once recorded, this OQ is closed.
+- ~~**OQ5**~~: **CLOSED 2026-05-14.** W0b verdict = YES with explicit scope restriction: W12 is in-drain latest-doc confirmation via `lastChk`, not generic boot-time KVT2 polling.
 
 ---
 
@@ -913,8 +900,7 @@ To be resolved during W0a or earlier in M3b execution (NOT plan-blocking):
 | Schema | W3, W4 | 2 / 3 |
 | Offline lifecycle | W5, W6, W7 | 4.5 / 6 |
 | Sync/finalize | W8, W9, W10 | 5 / 7 |
-| Tests/docs | W11-Δ, W12 (only if W0b=YES), W13 | 4 / 6 (W12=YES) or 2 / 3 (W12=NO) |
-| **Total — W0b=YES path** | **14 tasks** | **19 days / 27.5 days** ≈ **3 weeks / 5.5 weeks** |
-| **Total — W0b=NO path** | **13 tasks** (W12 dropped) | **17 days / 24.5 days** ≈ **2.5 weeks / 5 weeks** |
+| Tests/docs | W11-Δ, W12, W13 | 4 / 6 |
+| **Total — scoped-YES path** | **14 tasks** | **19 days / 27.5 days** ≈ **3 weeks / 5.5 weeks** |
 
-Confidence: realistic 5-5.5-week estimate has more buffer than M3a (which took ~6–8 weeks for ~3× the scope).  W0b verdict resolves on day 1 of M3b execution and determines which exit-criteria branch (and W12 task) applies.
+Confidence: realistic 5-5.5-week estimate has more buffer than M3a (which took ~6–8 weeks for ~3× the scope).  W0b is resolved before W1+: W12 remains in M3b, narrowed to in-drain latest-doc confirmation.
