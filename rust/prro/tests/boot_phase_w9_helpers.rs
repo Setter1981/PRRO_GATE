@@ -32,6 +32,15 @@ async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
 }
 
 /// Seed an FN config + a fiscal_documents row in the requested state.
+///
+/// **W3 (M3b)**: for `state == "KVT1"`, also populates the W3
+/// `first_kvt1_at` column with `CURRENT_TIMESTAMP`.  Pre-W3 tests
+/// relied on `updated_at` as proxy + the `fd_updated_at` trigger
+/// auto-populating it; post-W3 the canonical column is
+/// `first_kvt1_at`, which has no auto-stamping for direct INSERTs
+/// (the W3 stamp lives inside `fiscal_documents::transition_state`,
+/// which test seeds bypass).  So tests must populate it explicitly
+/// here to mimic production semantics.
 async fn seed_doc_in_state(pool: &SqlitePool, doc_byte: u8, state: &str) -> DocumentId {
     sqlx::query(
         "INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
@@ -47,15 +56,17 @@ async fn seed_doc_in_state(pool: &SqlitePool, doc_byte: u8, state: &str) -> Docu
     sqlx::query(
         "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
             state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
-            payload_sha256_canonical) \
+            payload_sha256_canonical, first_kvt1_at) \
          VALUES (?, ?, '1234567890', ?, 'SELL', ?, 'b1', 't1', 'ONLINE', \
-            '2026-01-01T00:00:00Z', '{}', ?)",
+            '2026-01-01T00:00:00Z', '{}', ?, \
+            CASE WHEN ? = 'KVT1' THEN CURRENT_TIMESTAMP ELSE NULL END)",
     )
     .bind(&doc_bytes)
     .bind(&req_bytes)
     .bind(lnd)
     .bind(state)
     .bind(&sha)
+    .bind(state)
     .execute(pool)
     .await
     .expect("seed fiscal_documents");
@@ -371,28 +382,19 @@ async fn passive_hold_kvt1_idempotent_each_call_emits_one_audit() {
     assert_eq!(read_state(&pool, doc).await, "KVT1");
 }
 
-/// Helper: drop the `fd_updated_at` trigger so a follow-up direct
-/// `UPDATE … SET updated_at = …` can land without being clobbered
-/// by the trigger's `AFTER UPDATE` write-back to `CURRENT_TIMESTAMP`.
-/// Test pools are throwaway tempdir-backed, so dropping the trigger
-/// is harmless for the rest of the test.
-async fn drop_fd_updated_at_trigger(pool: &SqlitePool) {
-    sqlx::query("DROP TRIGGER IF EXISTS fd_updated_at")
-        .execute(pool)
-        .await
-        .expect("drop fd_updated_at trigger");
-}
-
-/// Convenience wrapper for the literal-string case (e.g. malformed
-/// timestamps for the parser-fallback test).
-async fn set_kvt1_updated_at_literal(pool: &SqlitePool, doc: DocumentId, sqlite_ts: &str) {
-    drop_fd_updated_at_trigger(pool).await;
-    sqlx::query("UPDATE fiscal_documents SET updated_at = ? WHERE document_id = ?")
+/// W3 (M3b) — set `first_kvt1_at` to a literal SQLite timestamp
+/// string.  Replaces the pre-W3
+/// `drop_fd_updated_at_trigger` + `UPDATE updated_at` shape: now
+/// that `first_kvt1_at` is a dedicated column with no auto-stamp
+/// trigger, tests can write to it directly.  Also used for the
+/// malformed-timestamp degrade test (literal `"not-a-timestamp"`).
+async fn set_first_kvt1_at_literal(pool: &SqlitePool, doc: DocumentId, sqlite_ts: &str) {
+    sqlx::query("UPDATE fiscal_documents SET first_kvt1_at = ? WHERE document_id = ?")
         .bind(sqlite_ts)
         .bind(doc)
         .execute(pool)
         .await
-        .expect("set updated_at to literal");
+        .expect("set first_kvt1_at to literal");
 }
 
 /// Read the most recent BOOT_KVT1_HOLD_DEFERRED audit row's severity
@@ -446,18 +448,18 @@ async fn passive_hold_kvt1_emits_info_severity_for_fresh_hold() {
 async fn passive_hold_kvt1_escalates_to_warning_after_one_hour() {
     let (_dir, pool) = fresh_pool().await;
     let doc = seed_doc_in_state(&pool, 0xC4, "KVT1").await;
-    // Back-date the updated_at by 2 hours — well into the Warning
+    // Back-date `first_kvt1_at` by 2 hours — well into the Warning
     // bucket (1h ≤ age < 24h).  Use SQLite `datetime('now', '-2 hours')`
     // so the age stays inside (3600, 86400) regardless of when the
-    // test runs.
-    drop_fd_updated_at_trigger(&pool).await;
+    // test runs.  W3: dedicated column has no auto-stamp trigger,
+    // so direct UPDATE works without trigger surgery.
     sqlx::query(
-        "UPDATE fiscal_documents SET updated_at = datetime('now', '-2 hours') WHERE document_id = ?",
+        "UPDATE fiscal_documents SET first_kvt1_at = datetime('now', '-2 hours') WHERE document_id = ?",
     )
     .bind(doc)
     .execute(&pool)
     .await
-    .expect("backdate to -2h");
+    .expect("backdate first_kvt1_at to -2h");
     boot_phase::passive_hold_kvt1(&pool, doc).await.unwrap();
     let (severity, payload) = read_latest_kvt1_hold_audit(&pool, doc).await;
     assert_eq!(severity, "WARNING", "2h hold must escalate to Warning");
@@ -475,15 +477,15 @@ async fn passive_hold_kvt1_escalates_to_warning_after_one_hour() {
 async fn passive_hold_kvt1_escalates_to_error_after_twenty_four_hours() {
     let (_dir, pool) = fresh_pool().await;
     let doc = seed_doc_in_state(&pool, 0xC5, "KVT1").await;
-    drop_fd_updated_at_trigger(&pool).await;
-    // Back-date to 25 hours ago — clears the 86400s Error threshold.
+    // Back-date `first_kvt1_at` to 25 hours ago — clears the
+    // 86400s Error threshold.  W3: dedicated column, no trigger.
     sqlx::query(
-        "UPDATE fiscal_documents SET updated_at = datetime('now', '-25 hours') WHERE document_id = ?",
+        "UPDATE fiscal_documents SET first_kvt1_at = datetime('now', '-25 hours') WHERE document_id = ?",
     )
     .bind(doc)
     .execute(&pool)
     .await
-    .expect("backdate to -25h");
+    .expect("backdate first_kvt1_at to -25h");
     boot_phase::passive_hold_kvt1(&pool, doc).await.unwrap();
     let (severity, payload) = read_latest_kvt1_hold_audit(&pool, doc).await;
     assert_eq!(severity, "ERROR", "25h hold must escalate to Error");
@@ -498,12 +500,12 @@ async fn passive_hold_kvt1_escalates_to_error_after_twenty_four_hours() {
 }
 
 #[tokio::test]
-async fn passive_hold_kvt1_unparseable_updated_at_falls_back_to_info_age_zero() {
+async fn passive_hold_kvt1_unparseable_first_kvt1_at_falls_back_to_info_age_zero() {
     let (_dir, pool) = fresh_pool().await;
     let doc = seed_doc_in_state(&pool, 0xC6, "KVT1").await;
-    // Deliberate corruption of updated_at to verify the parser
+    // Deliberate corruption of first_kvt1_at to verify the parser
     // failure mode is "degrade-and-emit" rather than "crash".
-    set_kvt1_updated_at_literal(&pool, doc, "not-a-timestamp").await;
+    set_first_kvt1_at_literal(&pool, doc, "not-a-timestamp").await;
     boot_phase::passive_hold_kvt1(&pool, doc).await.unwrap();
     let (severity, payload) = read_latest_kvt1_hold_audit(&pool, doc).await;
     assert_eq!(
@@ -513,6 +515,194 @@ async fn passive_hold_kvt1_unparseable_updated_at_falls_back_to_info_age_zero() 
     assert_eq!(payload["kvt1_age_seconds"], 0);
     // Echoed verbatim — operator can see the malformed value.
     assert_eq!(payload["first_kvt1_at"], "not-a-timestamp");
+}
+
+// ─── M3b W3: fiscal_documents::transition_state Kvt1 arm + first_kvt1_at column ────────
+
+/// W3 plan §Task 3 acceptance: `transition_state` stamps
+/// `first_kvt1_at` on the `Sent → Kvt1` arm.  Lives in this test
+/// file (not a fiscal_documents-repo test) because it exercises the
+/// W3 end-to-end CAS-then-read path via a seeded fiscal doc, which
+/// is the existing pattern this module already supports.
+#[tokio::test]
+async fn transition_state_stamps_first_kvt1_at_on_sent_to_kvt1() {
+    use prro::db::models::enums::DocState;
+    use prro::db::repositories::fiscal_documents::{self, TransitionOutcome};
+    use prro::db::tx::with_immediate;
+
+    let (_dir, pool) = fresh_pool().await;
+    let doc = seed_doc_in_state(&pool, 0xC7, "SENT").await;
+
+    let outcome: TransitionOutcome = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            let o = fiscal_documents::transition_state(tx, doc, DocState::Sent, DocState::Kvt1)
+                .await
+                .map_err(anyhow::Error::from)?;
+            Ok::<_, anyhow::Error>(o)
+        })
+    })
+    .await
+    .expect("transition_state envelope");
+    assert!(matches!(outcome, TransitionOutcome::Applied));
+
+    let first_kvt1_at: Option<String> =
+        sqlx::query_scalar("SELECT first_kvt1_at FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        first_kvt1_at.is_some(),
+        "first_kvt1_at must be stamped on Sent → Kvt1; got NULL"
+    );
+    // Sanity check on shape: SQLite `CURRENT_TIMESTAMP` returns
+    // `YYYY-MM-DD HH:MM:SS`.  Don't compare the actual value (race
+    // with wall clock), just shape.
+    let ts = first_kvt1_at.unwrap();
+    assert_eq!(
+        ts.len(),
+        19,
+        "stamp must be SQLite default ISO shape, got: {ts:?}"
+    );
+    assert!(ts.chars().nth(4) == Some('-'), "missing date separator");
+    assert!(
+        ts.chars().nth(10) == Some(' '),
+        "missing date/time separator"
+    );
+}
+
+/// W3 plan §Task 3 acceptance: `transition_state` does NOT
+/// overwrite `first_kvt1_at` on idempotent re-entry.  Today the
+/// `(Kvt1, Kvt1)` pair is NOT in the whitelist (would return
+/// `Forbidden`), so this test validates the `COALESCE` semantics
+/// indirectly: stamp + back-date + observe stamp preserved across
+/// a subsequent NON-Kvt1 transition.  Verifies that no `to != Kvt1`
+/// arm clobbers the column.
+#[tokio::test]
+async fn transition_state_preserves_first_kvt1_at_across_non_kvt1_transitions() {
+    use prro::db::models::enums::DocState;
+    use prro::db::repositories::fiscal_documents::{self, TransitionOutcome};
+    use prro::db::tx::with_immediate;
+
+    let (_dir, pool) = fresh_pool().await;
+    let doc = seed_doc_in_state(&pool, 0xC8, "SENT").await;
+
+    // Step 1: Sent → Kvt1 (stamps first_kvt1_at).
+    let outcome_1: TransitionOutcome = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            let o = fiscal_documents::transition_state(tx, doc, DocState::Sent, DocState::Kvt1)
+                .await
+                .map_err(anyhow::Error::from)?;
+            Ok::<_, anyhow::Error>(o)
+        })
+    })
+    .await
+    .expect("Sent → Kvt1");
+    assert!(matches!(outcome_1, TransitionOutcome::Applied));
+
+    let stamp_after_step1: Option<String> =
+        sqlx::query_scalar("SELECT first_kvt1_at FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let stamp_step1 = stamp_after_step1.expect("step 1 must stamp");
+
+    // Back-date to a known earlier value so we can detect any
+    // accidental overwrite by a non-Kvt1 transition.
+    sqlx::query(
+        "UPDATE fiscal_documents SET first_kvt1_at = '2020-01-01 00:00:00' WHERE document_id = ?",
+    )
+    .bind(doc)
+    .execute(&pool)
+    .await
+    .expect("backdate first_kvt1_at to a sentinel");
+
+    // Step 2: Kvt1 → ErrorRetryable (a non-Kvt1 transition).  Must
+    // leave first_kvt1_at untouched.
+    let outcome_2: TransitionOutcome = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            let o = fiscal_documents::transition_state(
+                tx,
+                doc,
+                DocState::Kvt1,
+                DocState::ErrorRetryable,
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+            Ok::<_, anyhow::Error>(o)
+        })
+    })
+    .await
+    .expect("Kvt1 → ErrorRetryable");
+    assert!(matches!(outcome_2, TransitionOutcome::Applied));
+
+    let stamp_after_step2: Option<String> =
+        sqlx::query_scalar("SELECT first_kvt1_at FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stamp_after_step2.as_deref(),
+        Some("2020-01-01 00:00:00"),
+        "non-Kvt1 transition must NOT touch first_kvt1_at; step-1 stamp was {stamp_step1:?}"
+    );
+}
+
+/// W3 plan §Task 3 acceptance: migration 014 backfills `first_kvt1_at`
+/// from `updated_at` for rows already in KVT1 at the time of migration.
+/// Test scenario: seed a doc with state KVT1 + NULL first_kvt1_at
+/// (simulating pre-W3 state), then run the backfill manually
+/// (simulates re-running migration on a populated DB) and verify
+/// the row got `first_kvt1_at == updated_at`.
+#[tokio::test]
+async fn migration_014_backfill_populates_first_kvt1_at_for_pre_w3_kvt1_rows() {
+    let (_dir, pool) = fresh_pool().await;
+    let doc = seed_doc_in_state(&pool, 0xC9, "KVT1").await;
+    // Simulate pre-W3 state: clear first_kvt1_at (seed helper
+    // auto-populates it post-W3; clear it back to mimic a row that
+    // existed before the migration ran).
+    sqlx::query("UPDATE fiscal_documents SET first_kvt1_at = NULL WHERE document_id = ?")
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cleared: Option<String> =
+        sqlx::query_scalar("SELECT first_kvt1_at FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(cleared.is_none(), "precondition: first_kvt1_at NULL");
+
+    // Re-run the migration backfill statement (matches
+    // migrations/014_first_kvt1_at.sql).
+    sqlx::query(
+        "UPDATE fiscal_documents SET first_kvt1_at = updated_at \
+         WHERE state = 'KVT1' AND first_kvt1_at IS NULL",
+    )
+    .execute(&pool)
+    .await
+    .expect("backfill statement");
+
+    let backfilled: Option<String> =
+        sqlx::query_scalar("SELECT first_kvt1_at FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let updated_at: String =
+        sqlx::query_scalar("SELECT updated_at FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        backfilled.as_deref(),
+        Some(updated_at.as_str()),
+        "backfill must equal updated_at for pre-W3 Kvt1 rows"
+    );
 }
 
 // ─── run_boot_reconciliation stub ──────────────────────────────────────

@@ -221,6 +221,20 @@ pub async fn insert_prepared(pool: &SqlitePool, n: &NewDocument) -> sqlx::Result
 /// callers obtain it from a `with_immediate` closure, which guarantees
 /// the CAS UPDATE and the disambiguation SELECT run on the same
 /// connection inside the same BEGIN IMMEDIATE envelope.
+///
+/// **M3b W3 — `first_kvt1_at` stamp on Kvt1 transitions.**  When
+/// `to == DocState::Kvt1`, the CAS UPDATE additionally sets
+/// `first_kvt1_at = COALESCE(first_kvt1_at, CURRENT_TIMESTAMP)` in
+/// the same atomic statement.  `COALESCE` semantics:
+///   - **first Kvt1 entry** (column is NULL): set to `CURRENT_TIMESTAMP`;
+///   - **idempotent re-entry** (column already populated; happens
+///     when boot recovery touches an already-Kvt1 doc via the
+///     allowed `Kvt1 → Kvt1` no-op path, though that pair is NOT in
+///     the whitelist today, so this is forward-compat): preserve
+///     the original timestamp.
+///
+/// Non-Kvt1 transitions leave the column unchanged.  Tested in
+/// `tests/boot_phase_w9_helpers.rs` (W3 acceptance fixtures).
 pub async fn transition_state(
     tx: &mut WriteTxConn<'_>,
     id: DocumentId,
@@ -230,13 +244,29 @@ pub async fn transition_state(
     if !allowed_transition(from, to) {
         return Ok(TransitionOutcome::Forbidden);
     }
-    let res =
+    // M3b W3 — Kvt1 arm stamps `first_kvt1_at` atomically with the
+    // state CAS.  Branching in Rust (not SQL) keeps the non-Kvt1
+    // hot path identical to M3a and avoids parameter-driven
+    // UPDATE complications.
+    let res = if to == DocState::Kvt1 {
+        sqlx::query(
+            "UPDATE fiscal_documents \
+             SET state = ?, first_kvt1_at = COALESCE(first_kvt1_at, CURRENT_TIMESTAMP) \
+             WHERE document_id = ? AND state = ?",
+        )
+        .bind(to)
+        .bind(id)
+        .bind(from)
+        .execute(&mut **tx)
+        .await?
+    } else {
         sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ? AND state = ?")
             .bind(to)
             .bind(id)
             .bind(from)
             .execute(&mut **tx)
-            .await?;
+            .await?
+    };
     if res.rows_affected() == 1 {
         return Ok(TransitionOutcome::Applied);
     }
