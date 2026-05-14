@@ -6,21 +6,114 @@
 //! - W9.3 wires the 6-branch decision tree on top.
 //!
 //! All helpers wrap exactly ONE `with_immediate` envelope each (W3
-//! single-writer invariant; no foreign IO inside).  CAS state
-//! transitions use direct UPDATE SQL inside the envelope because the
-//! existing `fiscal_documents::transition_state` is pool-bound — for
-//! W9.2 boot helpers we need tx-bound CAS to land alongside audit +
-//! artifact writes atomically.
+//! single-writer invariant; no foreign IO inside).
+//!
+//! **M3b W1 — service-layer transition_with_audit helper.**
+//! Pre-M3b, the boot-phase helpers issued raw `UPDATE fiscal_documents
+//! SET state = '<X>' WHERE … AND state = '<Y>'` SQL directly inside
+//! their `with_immediate` envelopes, bypassing
+//! [`crate::db::repositories::fiscal_documents::transition_state`]
+//! (which is tx-bound and whitelist-gated).  That left the whitelist
+//! gate not running on boot-phase CAS, which the M3a-handoff §6.1
+//! carry-forward called out as a structural drift hazard.
+//!
+//! W1 closes that gap by introducing a service-layer composition
+//! helper, [`transition_with_audit`], that:
+//!   1. delegates the CAS to the existing repository
+//!      `fiscal_documents::transition_state` (whitelist still the
+//!      single source of truth);
+//!   2. writes the boot-phase audit row via [`audit_log::append_tx`]
+//!      ONLY when the transition outcome is
+//!      [`TransitionOutcome::Applied`] — `Conflict` / `NotFound` /
+//!      `Forbidden` paths leave no audit trail.
+//!
+//! The 7 prior raw-CAS sites are refactored to compose this helper
+//! (simple sites) or to use `fiscal_documents::transition_state`
+//! directly (sites that need supplementary writes ordered between
+//! CAS and audit — see `advance_sent_to_kvt1_from_probe`,
+//! `cas_sent_to_manual_reconciliation_from_probe`,
+//! `cas_sent_to_error_retryable_from_probe`).  Repository layer is
+//! unchanged: no new pub fn on `fiscal_documents`.
 
 use sqlx::SqlitePool;
 
-use crate::db::models::enums::{NodeMode, Protocol, ShiftState};
+use crate::db::models::enums::{DocState, NodeMode, Protocol, Severity, ShiftState};
 use crate::db::models::ids::{DocumentId, ShiftId};
+use crate::db::repositories::fiscal_documents::{self, TransitionOutcome};
 use crate::db::repositories::{audit_log, document_files, transport_trace};
-use crate::db::tx::with_immediate;
+use crate::db::tx::{with_immediate, WriteTxConn};
 use crate::services::write_path::stage_send;
 use crate::services::write_path::types::hex_encode_lower as hex_lower;
 use crate::transports::dps::dto::CheckAck;
+
+/// M3b W1 — service-layer transition + audit composition helper.
+///
+/// Drives a fiscal-document state transition via the repository
+/// [`fiscal_documents::transition_state`] (which gates on the
+/// `allowed_transition` whitelist — the single source of truth for
+/// valid `(from, to)` pairs) and, **only when the transition is
+/// `Applied`**, writes one `audit_log` row with the supplied
+/// `event_type` + `severity` + payload built by the closure.
+///
+/// Operator review criteria (M3b W1, 2026-05-14):
+///   - Helper must call existing `fiscal_documents::transition_state`,
+///     so the whitelist stays a single source of truth.  ✓
+///   - Audit row written ONLY on `TransitionOutcome::Applied`.  ✓
+///   - `Conflict` / `NotFound` / `Forbidden` outcomes leave NO audit
+///     row (caller observes outcome + decides what to do).  ✓
+///   - Stays inside the caller's `with_immediate` envelope — no
+///     network, no crypto, no extra DB transaction.  ✓
+///
+/// **Closure shape.**  `FnOnce() -> serde_json::Value` (sync,
+/// monomorphised, no async-lifetime complexity per plan OQ1 closure
+/// — closed in-plan 2026-05-14).  Caller pre-computes any DB-read
+/// data needed for the payload OUTSIDE the closure, capturing the
+/// values, so the closure body itself does only JSON construction.
+/// The closure is invoked ONLY on `Applied` — its side-effects (if
+/// any beyond JSON building) only happen on the success path.
+///
+/// **Idempotency / replay.**  Identical to the prior raw-CAS shape:
+/// a second invocation against the same `(doc_id, from, to)` after
+/// the first applied returns `TransitionOutcome::Conflict` (doc
+/// already in `to`), no audit row.  Replay-safe.
+///
+/// **Forbidden handling.**  If the `(from, to)` pair is not in the
+/// `allowed_transition` whitelist (which should never happen for the
+/// 7 boot_phase sites — all their pairs are explicitly whitelisted
+/// at base, see fiscal_documents.rs:131-180), the helper returns
+/// `Ok(TransitionOutcome::Forbidden)` without touching the DB.  No
+/// CAS attempted, no audit row written.  Callers can treat this as
+/// a programmer error (matches an `unreachable!` in a more strict
+/// design, but plumbing the outcome through preserves the existing
+/// caller contract that just inspects "rows_affected == 1").
+async fn transition_with_audit<F>(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+    from: DocState,
+    to: DocState,
+    event_type: &str,
+    severity: Severity,
+    payload_fn: F,
+) -> anyhow::Result<TransitionOutcome>
+where
+    F: FnOnce() -> serde_json::Value,
+{
+    let outcome = fiscal_documents::transition_state(tx, doc_id, from, to).await?;
+    if matches!(outcome, TransitionOutcome::Applied) {
+        let payload = payload_fn();
+        audit_log::append_tx(
+            tx,
+            "fiscal_document",
+            &hex_lower(doc_id.as_bytes()),
+            event_type,
+            severity,
+            None,
+            Some(&payload.to_string()),
+        )
+        .await?;
+    }
+    Ok(outcome)
+}
 
 /// Per W9 freeze §4.0: budget cap for `attempts_used(doc_id)` →
 /// `RequiresManualReconciliation` escalation in §4.8 ERROR_RETRYABLE
@@ -314,33 +407,27 @@ pub async fn resume_sending_to_error_retryable(
 ) -> anyhow::Result<bool> {
     with_immediate(pool, move |tx| {
         Box::pin(async move {
-            let res = sqlx::query(
-                "UPDATE fiscal_documents SET state = 'ERROR_RETRYABLE' \
-                 WHERE document_id = ? AND state = 'SENDING'",
+            // M3b W1 — service-layer helper: gates CAS through
+            // `fiscal_documents::transition_state` (whitelist single
+            // source of truth) and writes audit ONLY when Applied.
+            let outcome = transition_with_audit(
+                tx,
+                doc_id,
+                DocState::Sending,
+                DocState::ErrorRetryable,
+                "BOOT_RESUME_SENDING_TO_ERROR_RETRYABLE",
+                Severity::Error,
+                || {
+                    serde_json::json!({
+                        "document_id": hex_lower(doc_id.as_bytes()),
+                        "branch": "c-sending",
+                        "rationale":
+                            "DPS does not deduplicate; re-sending would be duplicate-document hazard",
+                    })
+                },
             )
-            .bind(doc_id)
-            .execute(&mut **tx)
             .await?;
-            let applied = res.rows_affected() == 1;
-            if applied {
-                let payload = serde_json::json!({
-                    "document_id": hex_lower(doc_id.as_bytes()),
-                    "branch": "c-sending",
-                    "rationale":
-                        "DPS does not deduplicate; re-sending would be duplicate-document hazard",
-                });
-                audit_log::append_tx(
-                    tx,
-                    "fiscal_document",
-                    &hex_lower(doc_id.as_bytes()),
-                    "BOOT_RESUME_SENDING_TO_ERROR_RETRYABLE",
-                    crate::db::models::enums::Severity::Error,
-                    None,
-                    Some(&payload.to_string()),
-                )
-                .await?;
-            }
-            Ok::<bool, anyhow::Error>(applied)
+            Ok::<bool, anyhow::Error>(matches!(outcome, TransitionOutcome::Applied))
         })
     })
     .await
@@ -401,18 +488,19 @@ pub async fn advance_sent_to_kvt1_from_probe(
     let wire_finished = wire_call_finished_at.to_string();
     with_immediate(pool, move |tx| {
         Box::pin(async move {
-            // (1) CAS Sent → Kvt1.
-            let cas = sqlx::query(
-                "UPDATE fiscal_documents SET state = 'KVT1' \
-                 WHERE document_id = ? AND state = 'SENT'",
-            )
-            .bind(doc_id)
-            .execute(&mut **tx)
-            .await?;
-            if cas.rows_affected() != 1 {
-                // CAS conflict — leave envelope unchanged (RAII rollback
-                // via `?` on the next steps would also work, but bail
-                // out early to avoid emitting a partial trail).
+            // (1) CAS Sent → Kvt1 — M3b W1: routed through the
+            // repository `transition_state` so the whitelist gate
+            // runs.  Supplementary writes (KVT1_RAW + transport_trace
+            // completion) and the audit row land BELOW because they
+            // need to be ordered after the CAS but before the audit;
+            // they cannot fit into the generic `transition_with_audit`
+            // closure shape.  All four writes still commit (or roll
+            // back) atomically inside this one `with_immediate`.
+            let cas =
+                fiscal_documents::transition_state(tx, doc_id, DocState::Sent, DocState::Kvt1)
+                    .await?;
+            if !matches!(cas, TransitionOutcome::Applied) {
+                // Conflict / NotFound — bail out early, no partial trail.
                 return Ok::<bool, anyhow::Error>(false);
             }
 
@@ -494,16 +582,20 @@ pub async fn cas_sent_to_manual_reconciliation_from_probe(
     with_immediate(pool, move |tx| {
         Box::pin(async move {
             // (1) CAS Sent → RequiresManualReconciliation
-            // (whitelist edge added in prep PR per W0-3 §6.4-b).
-            let cas = sqlx::query(
-                "UPDATE fiscal_documents SET state = 'REQUIRES_MANUAL_RECONCILIATION' \
-                 WHERE document_id = ? AND state = 'SENT'",
+            // (whitelist edge added in prep PR per W0-3 §6.4-b;
+            // M3b W1 routes through repository `transition_state`
+            // so the whitelist gate runs).  Supplementary writes
+            // (transport_trace completion + audit) land below because
+            // they need to be ordered after the CAS — same envelope.
+            let cas = fiscal_documents::transition_state(
+                tx,
+                doc_id,
+                DocState::Sent,
+                DocState::RequiresManualReconciliation,
             )
-            .bind(doc_id)
-            .execute(&mut **tx)
             .await?;
-            if cas.rows_affected() != 1 {
-                // CAS conflict — bail early, no partial trail.
+            if !matches!(cas, TransitionOutcome::Applied) {
+                // Conflict / NotFound — bail early, no partial trail.
                 return Ok::<bool, anyhow::Error>(false);
             }
 
@@ -581,15 +673,18 @@ pub async fn cas_sent_to_error_retryable_from_probe(
     let wire_finished = wire_call_finished_at.to_string();
     with_immediate(pool, move |tx| {
         Box::pin(async move {
-            // (1) CAS Sent → ErrorRetryable (whitelisted at base).
-            let cas = sqlx::query(
-                "UPDATE fiscal_documents SET state = 'ERROR_RETRYABLE' \
-                 WHERE document_id = ? AND state = 'SENT'",
+            // (1) CAS Sent → ErrorRetryable (whitelisted at base;
+            // M3b W1 routes through repository `transition_state`).
+            // Supplementary writes (transport_trace completion +
+            // audit) land below — same envelope.
+            let cas = fiscal_documents::transition_state(
+                tx,
+                doc_id,
+                DocState::Sent,
+                DocState::ErrorRetryable,
             )
-            .bind(doc_id)
-            .execute(&mut **tx)
             .await?;
-            if cas.rows_affected() != 1 {
+            if !matches!(cas, TransitionOutcome::Applied) {
                 return Ok::<bool, anyhow::Error>(false);
             }
 
@@ -1423,35 +1518,27 @@ pub async fn cas_error_retryable_to_manual_reconciliation(
     let retry_class_owned = retry_class_str.to_string();
     with_immediate(pool, move |tx| {
         Box::pin(async move {
-            let cas = sqlx::query(
-                "UPDATE fiscal_documents SET state = 'REQUIRES_MANUAL_RECONCILIATION' \
-                 WHERE document_id = ? AND state = 'ERROR_RETRYABLE'",
-            )
-            .bind(doc_id)
-            .execute(&mut **tx)
-            .await?;
-            if cas.rows_affected() != 1 {
-                return Ok::<bool, anyhow::Error>(false);
-            }
-
-            let payload = serde_json::json!({
-                "document_id": hex_lower(doc_id.as_bytes()),
-                "branch": "c-error-retryable-escalated",
-                "retry_class": retry_class_owned,
-                "rationale":
-                    "ErrorRetryable + non-retryable durable retry_class — operator triage required; no auto-retry per stage_send §4.2",
-            });
-            audit_log::append_tx(
+            // M3b W1 — service-layer helper: whitelist gate + audit
+            // only on Applied.
+            let outcome = transition_with_audit(
                 tx,
-                "fiscal_document",
-                &hex_lower(doc_id.as_bytes()),
+                doc_id,
+                DocState::ErrorRetryable,
+                DocState::RequiresManualReconciliation,
                 "BOOT_ER_ESCALATED_TO_MANUAL",
                 severity,
-                None,
-                Some(&payload.to_string()),
+                || {
+                    serde_json::json!({
+                        "document_id": hex_lower(doc_id.as_bytes()),
+                        "branch": "c-error-retryable-escalated",
+                        "retry_class": retry_class_owned,
+                        "rationale":
+                            "ErrorRetryable + non-retryable durable retry_class — operator triage required; no auto-retry per stage_send §4.2",
+                    })
+                },
             )
             .await?;
-            Ok::<bool, anyhow::Error>(true)
+            Ok::<bool, anyhow::Error>(matches!(outcome, TransitionOutcome::Applied))
         })
     })
     .await
@@ -1478,37 +1565,28 @@ async fn cas_error_retryable_budget_exhausted(
     let retry_class_owned = retry_class_str.to_string();
     with_immediate(pool, move |tx| {
         Box::pin(async move {
-            let cas = sqlx::query(
-                "UPDATE fiscal_documents SET state = 'REQUIRES_MANUAL_RECONCILIATION' \
-                 WHERE document_id = ? AND state = 'ERROR_RETRYABLE'",
-            )
-            .bind(doc_id)
-            .execute(&mut **tx)
-            .await?;
-            if cas.rows_affected() != 1 {
-                return Ok::<bool, anyhow::Error>(false);
-            }
-
-            let payload = serde_json::json!({
-                "document_id": hex_lower(doc_id.as_bytes()),
-                "branch": "c-error-retryable-budget-exhausted",
-                "retry_class": retry_class_owned,
-                "attempts_used": attempts_used,
-                "max_boot_attempts": MAX_BOOT_ATTEMPTS,
-                "rationale":
-                    "TransientRetry boot-attempt budget exhausted (attempts_used >= MAX_BOOT_ATTEMPTS); doc would re-burn DPS quota every boot tick without escalation; operator triage required per W9 freeze §4.0",
-            });
-            audit_log::append_tx(
+            // M3b W1 — service-layer helper composition.
+            let outcome = transition_with_audit(
                 tx,
-                "fiscal_document",
-                &hex_lower(doc_id.as_bytes()),
+                doc_id,
+                DocState::ErrorRetryable,
+                DocState::RequiresManualReconciliation,
                 "BOOT_ER_BUDGET_EXHAUSTED",
-                crate::db::models::enums::Severity::Error,
-                None,
-                Some(&payload.to_string()),
+                Severity::Error,
+                || {
+                    serde_json::json!({
+                        "document_id": hex_lower(doc_id.as_bytes()),
+                        "branch": "c-error-retryable-budget-exhausted",
+                        "retry_class": retry_class_owned,
+                        "attempts_used": attempts_used,
+                        "max_boot_attempts": MAX_BOOT_ATTEMPTS,
+                        "rationale":
+                            "TransientRetry boot-attempt budget exhausted (attempts_used >= MAX_BOOT_ATTEMPTS); doc would re-burn DPS quota every boot tick without escalation; operator triage required per W9 freeze §4.0",
+                    })
+                },
             )
             .await?;
-            Ok::<bool, anyhow::Error>(true)
+            Ok::<bool, anyhow::Error>(matches!(outcome, TransitionOutcome::Applied))
         })
     })
     .await
@@ -2142,29 +2220,32 @@ async fn dispatch_pending_doc(
         },
         DocState::Encrypted => {
             // 1-tick deferral per freeze §4.3 MED 6 fix.
+            // M3b W1 — service-layer helper: whitelist gate via
+            // repository `transition_state` + audit only on Applied.
+            // Pre-W1 the audit fired unconditionally even on CAS
+            // no-op (e.g. parallel writer raced); W1 tightens this
+            // per operator review criterion ("RowsAffected = 0 path
+            // должен не создавать audit row").  Under ADR-M3-A10
+            // single-writer-per-FN the race cannot occur in
+            // practice, so this is a strict invariant tightening, not
+            // a behavioural change in production.
             let result = with_immediate(pool, move |tx| {
                 Box::pin(async move {
-                    sqlx::query(
-                        "UPDATE fiscal_documents SET state = 'ERROR_RETRYABLE' \
-                         WHERE document_id = ? AND state = 'ENCRYPTED'",
-                    )
-                    .bind(doc_id)
-                    .execute(&mut **tx)
-                    .await?;
-                    let payload = serde_json::json!({
-                        "document_id": hex_lower(doc_id.as_bytes()),
-                        "branch": "c-encrypted",
-                        "rationale":
-                            "M3a is Pattern B + ONLINE; ENCRYPTED is Checkbox-only contour",
-                    });
-                    audit_log::append_tx(
+                    transition_with_audit(
                         tx,
-                        "fiscal_document",
-                        &hex_lower(doc_id.as_bytes()),
+                        doc_id,
+                        DocState::Encrypted,
+                        DocState::ErrorRetryable,
                         "BOOT_ENCRYPTED_REROUTED",
-                        crate::db::models::enums::Severity::Warning,
-                        None,
-                        Some(&payload.to_string()),
+                        Severity::Warning,
+                        || {
+                            serde_json::json!({
+                                "document_id": hex_lower(doc_id.as_bytes()),
+                                "branch": "c-encrypted",
+                                "rationale":
+                                    "M3a is Pattern B + ONLINE; ENCRYPTED is Checkbox-only contour",
+                            })
+                        },
                     )
                     .await?;
                     Ok::<(), anyhow::Error>(())
