@@ -16,8 +16,14 @@
 //!
 //! W2 closes the bypass by making `run_boot_reconciliation` require a
 //! `&ReconcileGuard<'_>` as its first parameter.  The token is
-//! non-`Clone` and (by default `!Send` on its production variant; see
-//! below) cannot be smuggled out of the call site that minted it.
+//! non-`Clone` and lifetime-bound to the `MutexGuard` it wraps, so
+//! it cannot be minted (nor outlive its lock) without holding the
+//! App mutex.  `Send`-ness is inherited from the wrapped
+//! `MutexGuard<'_, ()>` (which is `Send` because `()` is `Send`);
+//! callers that need a stricter cross-task discipline can carry an
+//! explicit `PhantomData<*const ()>` in future hardening, but the
+//! load-bearing guarantee here is the lock-scoped lifetime, not
+//! `Send` exclusion.
 //!
 //! ## Constructors
 //!
@@ -117,7 +123,7 @@ impl ReconcileGuard<'static> {
     /// `App::reconcile_pending_with`, which mints the token via
     /// [`Self::from_app_mutex`] inside the App mutex critical section.
     ///
-    /// Naming is intentionally awkward (`_for_integration_test_only`)
+    /// Naming is intentionally awkward (`for_integration_test_only`)
     /// + `#[doc(hidden)]` to discourage IDE autocomplete from
     /// surfacing this even within test code.  The `cfg`-gating above
     /// is the hard guarantee; the naming/doc are belt-and-suspenders.
