@@ -823,27 +823,35 @@ pub async fn complete_probe_trace_no_state_change(
 
 /// W9 freeze §4.6 (HIGH 6 fix option A) — passive hold for `Kvt1`
 /// docs.  No DPS call; no state mutation; no `transport_trace`
-/// write.  Single audit-row INSERT documenting that active KVT2
-/// polling is deferred to M3b.
+/// write.  Single audit-row INSERT documenting that this Kvt1
+/// doc is held under passive observation only.
 ///
 /// **Why no state change.**  Per W0-1 §2.1, `Kvt1 → Kvt2` requires
-/// authoritative DPS evidence (the second receipt).  M3a's
-/// `DpsChannel` trait doesn't yet expose a 2nd-receipt API
-/// (`status_rro` returns RRO-wide state, not per-doc KVT2).  Until
-/// M3b lands active polling, recovery for `Kvt1` is observation-
-/// only.  Operator-driven manual reconciliation is the escape
-/// hatch.
+/// authoritative DPS evidence (the second receipt).  The DPS proto
+/// surface as inspected during the W0b gate decision
+/// (`docs/superpowers/specs/2026-05-14-m3b-w0b-w12-gate-decision.md`)
+/// does not produce per-doc KVT2 evidence for arbitrary stale Kvt1
+/// rows: `status_rro` / `infoRro` are RRO-wide aggregates, and
+/// `lastChk(fn_sign)` returns evidence ONLY for the latest doc on
+/// the FN (insufficient for a stale doc that's no longer the
+/// latest).  W0b verdict is scoped YES: M3b's W12 confirmation
+/// step (in-drain `lastChk` after `stage_send(doc_i)`) advances
+/// the **currently-being-drained** doc through `Kvt1 → Kvt2 →
+/// Ack`; this `passive_hold_kvt1` helper continues to handle
+/// stale / pre-existing / random-boot-time Kvt1 docs that fall
+/// outside the W9 drain window.  Resolving those is M3c/M4 scope
+/// or operator-driven manual reconciliation.
 ///
 /// **M3a follow-up — age-based severity escalation.**  Senior-review
 /// finding noted that an unbounded passive hold can mask a genuinely
 /// stuck doc: if DPS never delivers the second receipt, the doc
 /// stays in Kvt1 forever and the only operator-visible signal is a
 /// stream of identical `INFO`-severity audit rows on every reboot.
-/// We now compute the time the doc has been in Kvt1 (from
-/// `fiscal_documents.updated_at`, which the `fd_updated_at` trigger
-/// bumps on every UPDATE — for a doc currently in Kvt1, the most
-/// recent UPDATE is the Sent → Kvt1 transition, so `updated_at`
-/// equals "first_kvt1_at") and escalate audit severity:
+/// We compute the time the doc has been in Kvt1 (from
+/// `fiscal_documents.first_kvt1_at`, the dedicated column added in
+/// M3b W3 migration 014 — pre-W3 the code read `updated_at` as a
+/// proxy via the `fd_updated_at` trigger) and escalate audit
+/// severity:
 ///   - age `< 1h`              → `Severity::Info`     (normal hold window)
 ///   - age `1h ..< 24h`        → `Severity::Warning`  (operator should investigate)
 ///   - age `>= 24h`            → `Severity::Error`    (likely stuck; manual reconciliation indicated)
@@ -859,11 +867,29 @@ pub async fn passive_hold_kvt1(pool: &SqlitePool, doc_id: DocumentId) -> anyhow:
             // firing on a non-Kvt1 doc would produce a misleading
             // audit trail.  W9.3 dispatch will guard this externally
             // too, but in-helper check hardens against ad-hoc
-            // admin / test callers.  Reads `updated_at` in the same
-            // round-trip so the age computation below stays accurate
-            // (no read-then-write race window inside the envelope).
-            let (state, updated_at_text): (String, String) = sqlx::query_as(
-                "SELECT state, updated_at FROM fiscal_documents WHERE document_id = ?",
+            // admin / test callers.
+            //
+            // **M3b W3** — read `first_kvt1_at` (dedicated column
+            // added in migration 014) instead of `updated_at`.
+            // PR #45's `updated_at` proxy worked under M3a's "no
+            // other UPDATE during Kvt1 hold" property, but the
+            // dedicated column makes the Kvt1-entry timestamp
+            // unambiguous and decouples it from the
+            // `fd_updated_at` trigger.  Stamped automatically by
+            // `fiscal_documents::transition_state` on every
+            // `to == Kvt1` CAS (W3 extension, COALESCE semantics
+            // preserve the timestamp on idempotent re-entry).
+            //
+            // The column is nullable for non-Kvt1 rows; on Kvt1 rows
+            // post-migration 014 it is ALWAYS populated (either by
+            // the W3 transition_state stamp or by the migration
+            // backfill from `updated_at`).  We read as
+            // `Option<String>` and treat `None` as a database-shape
+            // regression: degrade to age=0 + Info severity rather
+            // than crashing boot reconcile (consistent with PR #45
+            // unparseable-timestamp fallback policy).
+            let (state, first_kvt1_at_text): (String, Option<String>) = sqlx::query_as(
+                "SELECT state, first_kvt1_at FROM fiscal_documents WHERE document_id = ?",
             )
             .bind(doc_id)
             .fetch_one(&mut **tx)
@@ -874,19 +900,30 @@ pub async fn passive_hold_kvt1(pool: &SqlitePool, doc_id: DocumentId) -> anyhow:
             );
 
             // SQLite `CURRENT_TIMESTAMP` format: `YYYY-MM-DD HH:MM:SS`
-            // (UTC, no T separator, no Z suffix).  If parsing fails
+            // (UTC, no T separator, no Z suffix).  If the column is
+            // NULL (database-shape regression — should be impossible
+            // post-W3 migration on a doc in Kvt1) or parsing fails,
             // we fall back to age=0 + Info severity rather than
-            // crashing the boot reconcile — a malformed timestamp
-            // is a database-shape regression, but the audit row
-            // should still emit so the operator gets the signal.
-            let (kvt1_age_seconds, severity) =
-                age_and_severity_for_kvt1(&updated_at_text, chrono::Utc::now());
+            // crashing the boot reconcile; the audit row still emits
+            // so the operator gets the signal.
+            let timestamp_for_audit = first_kvt1_at_text.clone().unwrap_or_default();
+            let (kvt1_age_seconds, severity) = age_and_severity_for_kvt1(
+                first_kvt1_at_text.as_deref().unwrap_or(""),
+                chrono::Utc::now(),
+            );
 
             let payload = serde_json::json!({
                 "document_id": hex_lower(doc_id.as_bytes()),
                 "branch": "c-kvt1",
-                "deferred_to": "M3b active KVT2 polling",
-                "first_kvt1_at": updated_at_text,
+                // M3b W0b verdict: KVT2 evidence is achievable only
+                // for the doc CURRENTLY being drained (W12 in-drain
+                // lastChk after stage_send(doc_i)).  This helper
+                // covers stale / pre-existing / random-boot-time
+                // Kvt1 docs that are NOT in the active drain window
+                // — their KVT2 resolution is M3c/M4 scope or
+                // operator manual reconciliation.
+                "deferred_to": "M3c/M4 or operator manual reconciliation (out of W9 drain window; W12 covers only the current drain doc)",
+                "first_kvt1_at": timestamp_for_audit,
                 "kvt1_age_seconds": kvt1_age_seconds,
                 "severity_threshold": severity.as_str(),
             });
@@ -909,7 +946,7 @@ pub async fn passive_hold_kvt1(pool: &SqlitePool, doc_id: DocumentId) -> anyhow:
 /// Bucket the Kvt1 hold age into a severity level.  Pulled out as a
 /// free function so the boundary logic is unit-testable without an
 /// in-memory pool.  Returns `(age_seconds, severity)`; on parse
-/// failure of `updated_at_text` returns `(0, Severity::Info)` —
+/// failure of `first_kvt1_at_text` returns `(0, Severity::Info)` —
 /// preferring to emit the audit row with a degraded signal over
 /// crashing boot reconcile on a malformed timestamp.
 ///
@@ -918,22 +955,28 @@ pub async fn passive_hold_kvt1(pool: &SqlitePool, doc_id: DocumentId) -> anyhow:
 ///   - `3600 ≤ age < 86400` → `Severity::Warning`
 ///   - `age ≥ 86400`     → `Severity::Error`
 ///
-/// Negative ages (clock skew, e.g. the row's `updated_at` is in the
-/// future relative to `now`) are clamped to 0.
+/// Negative ages (clock skew, e.g. the row's `first_kvt1_at` is in
+/// the future relative to `now`) are clamped to 0.
+///
+/// **W3 (M3b)**: parameter renamed from `updated_at_text` to
+/// `first_kvt1_at_text` to reflect the W3 column switch (was a
+/// `fiscal_documents.updated_at` proxy pre-W3; now reads the
+/// dedicated `first_kvt1_at` column populated by migration 014 +
+/// `fiscal_documents::transition_state` Kvt1 arm stamp).
 fn age_and_severity_for_kvt1(
-    updated_at_text: &str,
+    first_kvt1_at_text: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> (i64, crate::db::models::enums::Severity) {
     use crate::db::models::enums::Severity;
     // SQLite default datetime format used by `CURRENT_TIMESTAMP`.
-    let parsed = chrono::NaiveDateTime::parse_from_str(updated_at_text, "%Y-%m-%d %H:%M:%S")
+    let parsed = chrono::NaiveDateTime::parse_from_str(first_kvt1_at_text, "%Y-%m-%d %H:%M:%S")
         .map(|naive| naive.and_utc())
         // Also accept RFC3339 / ISO-8601 (Z-suffixed or `+00:00`),
-        // so test fixtures or future migrations that store
-        // updated_at in that form keep working without
+        // so test fixtures or future migrations that store the
+        // timestamp in that form keep working without
         // round-tripping through the SQLite default format.
         .or_else(|_| {
-            chrono::DateTime::parse_from_rfc3339(updated_at_text)
+            chrono::DateTime::parse_from_rfc3339(first_kvt1_at_text)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
         });
     let Ok(kvt1_at) = parsed else {
