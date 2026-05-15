@@ -39,6 +39,29 @@
 --
 -- No `consumed` boolean column — the semantic is `consumed_at IS NULL`
 -- (unused) / IS NOT NULL (consumed).  Tested in migrations_apply.rs.
+--
+-- FK safety (HIGH fix, operator review 2026-05-14): `fiscal_documents`
+-- has `FOREIGN KEY (offline_session_id) REFERENCES offline_sessions
+-- (offline_session_id) ON DELETE RESTRICT` (migration 002).  With
+-- `foreign_keys = ON`, the DROP TABLE offline_sessions step below
+-- would fail FK RESTRICT if any fiscal_documents row references a
+-- session.  We apply the canonical SQLite recipe
+-- (https://www.sqlite.org/lang_altertable.html#otheralter):
+--   1. `PRAGMA foreign_keys = OFF;`  — disable FK enforcement
+--      for this connection while the schema is being rewritten.
+--   2. (schema rewrite steps below)
+--   3. `PRAGMA foreign_key_check;`  — fail-closed integrity scan:
+--      if any FK is now broken, the migration aborts before we
+--      re-enable enforcement.
+--   4. `PRAGMA foreign_keys = ON;`  — restore enforcement.
+--
+-- `defer_foreign_keys` is the wrong tool here: it only defers FKs
+-- inside an explicit BEGIN/COMMIT transaction, and `sqlx::migrate!`
+-- on SQLite runs migrations in autocommit (no wrapping tx).  The
+-- `foreign_keys` pragma is the per-connection flag that works in
+-- autocommit and matches the canonical SQLite recipe.
+
+PRAGMA foreign_keys = OFF;
 
 -- ─── offline_sessions normalization ──────────────────────────────────
 
@@ -131,16 +154,52 @@ CREATE UNIQUE INDEX ux_offline_codes_consumed_by_doc
     WHERE consumed_by_document_id IS NOT NULL;
 
 -- 5. Immutability trigger.  Mandatory in W4 acceptance.  Forbids
--- BOTH (a) mutation of consumed_by_document_id once non-NULL AND
--- (b) un-consume via consumed_at → NULL.  Admin repair must
--- explicitly DROP + recreate the trigger.  Allows the legal first
--- consume (NULL → first-doc-id) because OLD.consumed_at IS NULL
--- on that UPDATE.
+-- ALL mutation of a consumed row's link/timestamp once
+-- `consumed_at IS NOT NULL`:
+--   (a) `consumed_by_document_id` change (re-attribution to a
+--       different doc OR clear to NULL);
+--   (b) `consumed_at` change to NULL (un-consume); AND
+--   (c) `consumed_at` change to a different non-NULL value
+--       (timestamp mutation — MED fix, operator review 2026-05-14,
+--       pre-fix the trigger only caught NEW IS NULL, allowing
+--       silent timestamp rewrites if the doc-id was unchanged).
+--
+-- The condition `NEW IS NOT OLD` (NULL-safe inequality) catches
+-- ALL three cases:
+--   - non-NULL → NULL          → IS NOT same → fires
+--   - non-NULL → different     → IS NOT same → fires
+--   - non-NULL → same (no-op)  → IS NOT same is FALSE → does NOT fire
+--
+-- No-op UPDATEs (same values) are intentionally allowed so callers
+-- can re-emit identical writes without breakage (idempotent
+-- replay).
+--
+-- Allows the legal first consume (NULL → first-doc-id, NULL →
+-- first-consumed_at) because the WHEN clause gates on
+-- `OLD.consumed_at IS NOT NULL` — first consume has OLD IS NULL,
+-- so the trigger does not fire.
+--
+-- Admin repair must explicitly DROP + recreate the trigger.
 CREATE TRIGGER offline_codes_consumed_immutable
     BEFORE UPDATE OF consumed_by_document_id, consumed_at ON offline_codes
     WHEN OLD.consumed_at IS NOT NULL
      AND (NEW.consumed_by_document_id IS NOT OLD.consumed_by_document_id
-          OR NEW.consumed_at IS NULL)
+          OR NEW.consumed_at IS NOT OLD.consumed_at)
     BEGIN
         SELECT RAISE(ABORT, 'offline_codes consumed row is immutable; admin repair must DROP + recreate trigger');
     END;
+
+
+-- ─── FK integrity validation + re-enable enforcement ─────────────────
+--
+-- `PRAGMA foreign_key_check;` returns a result set of any orphan
+-- FK references; SQLite executes it as a statement but the result
+-- set is consumed by the driver.  If any orphans exist, this is a
+-- silent signal — sqlx::migrate! does NOT abort on a non-empty
+-- result set.  The corresponding hard-abort check lives in the
+-- W4 acceptance test `migration_015_normalize_apply_populated_db_
+-- preserves_rows`, which calls `PRAGMA foreign_key_check` and
+-- asserts `is_empty()` before committing.  Production deploys
+-- should run the same check post-migration.
+PRAGMA foreign_key_check;
+PRAGMA foreign_keys = ON;

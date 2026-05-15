@@ -927,16 +927,26 @@ async fn migration_015_normalize_apply_populated_db_preserves_rows() {
     let doc_id = vec![0xC1u8; 16];
     let req_id = vec![0xC2u8; 16];
     let sha = vec![0u8; 32];
+    // HIGH-fix coverage (operator review 2026-05-14): the
+    // fiscal_documents row references one of the migrated
+    // offline_sessions via `offline_session_id` FK.  This proves
+    // the W4 migration is FK-safe — without `defer_foreign_keys =
+    // ON` the DROP TABLE offline_sessions step would fail RESTRICT
+    // on this reference.  We pick the FN+session that the seeder
+    // labelled `OPEN` (FN `2222222222`, session id 0xA2…) so the
+    // doc references an active session that survives the rename.
+    let referenced_session_id: Vec<u8> = vec![0xA2u8; 16];
     sqlx::query(
         "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
             state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
-            payload_sha256_canonical) \
-         VALUES (?, ?, '1234567890', 1, 'SELL', 'PREPARED', 'b', 't', 'OFFLINE', \
-            '2026-01-01T00:00:00Z', '{}', ?)",
+            payload_sha256_canonical, offline_session_id) \
+         VALUES (?, ?, '2222222222', 1, 'SELL', 'PREPARED', 'b', 't', 'OFFLINE', \
+            '2026-01-01T00:00:00Z', '{}', ?, ?)",
     )
     .bind(&doc_id)
     .bind(&req_id)
     .bind(&sha)
+    .bind(&referenced_session_id)
     .execute(&pool)
     .await
     .unwrap();
@@ -965,15 +975,33 @@ async fn migration_015_normalize_apply_populated_db_preserves_rows() {
     assert_eq!(sessions_before, 5);
     assert_eq!(codes_before, 2);
 
-    // Apply migration 015 inline via raw_sql (multi-statement aware;
-    // single-statement sqlx::query splits the file across many
-    // implicit transactions and confuses SQLite's schema cache on
-    // DROP-then-RENAME).
+    // Apply migration 015 inline via `sqlx::raw_sql` in autocommit
+    // mode (no wrapping BEGIN/COMMIT).  The migration itself
+    // toggles `PRAGMA foreign_keys = OFF` at the top + restores it
+    // with `PRAGMA foreign_keys = ON` at the end, which is the
+    // canonical SQLite recipe for FK-safe schema rewrites and ONLY
+    // works outside an explicit transaction.  In production
+    // `sqlx::migrate!` for SQLite also runs migrations in
+    // autocommit (not in a wrapping tx); the test mirrors that.
     let sql_015 = include_str!("../migrations/015_offline_normalize.sql");
     sqlx::raw_sql(sql_015)
         .execute(&pool)
         .await
         .expect("migration 015 must apply on populated 004-era DB");
+
+    // Post-migration integrity scan: no orphan FK references.  The
+    // migration runs `PRAGMA foreign_key_check` itself but does not
+    // hard-abort on a non-empty result set (sqlx::migrate! ignores
+    // pragma result sets).  Production deploys should run the same
+    // post-migration check; the test enforces it here.
+    let fk_check: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+    assert!(
+        fk_check.is_empty(),
+        "post-migration foreign_key_check must be empty; got violations: {fk_check:?}"
+    );
 
     // Post-migration assertions.
     let sessions_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM offline_sessions")
@@ -1043,6 +1071,39 @@ async fn migration_015_normalize_apply_populated_db_preserves_rows() {
         Some("2026-01-03T00:00:00Z"),
         "used_at → consumed_at rename preserves value"
     );
+
+    // HIGH-fix assertion (operator review 2026-05-14):
+    // `fiscal_documents.offline_session_id` FK must still resolve
+    // to the (renamed) offline_sessions table after migration.
+    // Verifies that `PRAGMA defer_foreign_keys = ON` correctly
+    // deferred FK enforcement until COMMIT and the INSERT…SELECT
+    // step preserved the referenced `offline_session_id` value.
+    let resolved_session: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT s.offline_session_id \
+         FROM fiscal_documents d \
+         JOIN offline_sessions s ON s.offline_session_id = d.offline_session_id \
+         WHERE d.document_id = ?",
+    )
+    .bind(&doc_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        resolved_session.as_deref(),
+        Some(&[0xA2u8; 16][..]),
+        "fiscal_documents.offline_session_id FK must resolve to the renamed offline_sessions row post-migration"
+    );
+    // Also verify the referenced session ended up in the expected
+    // post-migration state (OPEN was a legal active session, so
+    // it should still be OPEN; the migration value transform only
+    // touches CLOSING).
+    let session_state: String =
+        sqlx::query_scalar("SELECT state FROM offline_sessions WHERE offline_session_id = ?")
+            .bind(&[0xA2u8; 16][..])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(session_state, "OPEN", "OPEN session must remain OPEN");
 }
 
 /// W4 criterion #4 — partial UNIQUE `ux_offline_active` covers only
@@ -1205,6 +1266,34 @@ async fn migration_015_consumed_link_uniqueness_and_immutability_trigger() {
         msg_unconsume.contains("immutable") || msg_unconsume.contains("admin repair"),
         "expected immutability error, got: {msg_unconsume}"
     );
+
+    // (c2) Timestamp mutation: consumed_at non-NULL → different
+    // non-NULL.  Trigger MUST block (MED fix, operator review
+    // 2026-05-14 — pre-fix the trigger only caught NEW IS NULL,
+    // allowing silent timestamp rewrites if doc-id was unchanged).
+    let err_ts_mutate = sqlx::query(
+        "UPDATE offline_codes SET consumed_at = '2099-12-31T23:59:59Z' \
+         WHERE fiscal_number = '1234567890' AND code_lnd = 1",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("consumed_at timestamp mutation must be blocked by trigger");
+    let msg_ts = err_ts_mutate.to_string().to_lowercase();
+    assert!(
+        msg_ts.contains("immutable") || msg_ts.contains("admin repair"),
+        "expected immutability error on timestamp mutation, got: {msg_ts}"
+    );
+
+    // (c3) No-op UPDATE with same consumed_at value: trigger does
+    // NOT fire (idempotent replay).  Verifies the `IS NOT same`
+    // condition correctly excludes no-ops.
+    sqlx::query(
+        "UPDATE offline_codes SET consumed_at = '2026-01-01T01:00:00Z' \
+         WHERE fiscal_number = '1234567890' AND code_lnd = 1",
+    )
+    .execute(&pool)
+    .await
+    .expect("no-op UPDATE (same consumed_at) must succeed for idempotent replay");
 
     // (d) Link uniqueness: another code row trying to link to doc_a
     // (which is already linked to code_lnd=1) must violate the
