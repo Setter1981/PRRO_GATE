@@ -936,17 +936,24 @@ async fn migration_015_normalize_apply_populated_db_preserves_rows() {
     // labelled `OPEN` (FN `2222222222`, session id 0xA2…) so the
     // doc references an active session that survives the rename.
     let referenced_session_id: Vec<u8> = vec![0xA2u8; 16];
+    // Pin `updated_at` to a far-historical value via explicit INSERT
+    // column (INSERT does NOT fire the `fd_updated_at` AFTER-UPDATE
+    // trigger, so the literal value is preserved verbatim).  W4
+    // operator HIGH-finding 2026-05-15: migration's service-UPDATEs
+    // on fiscal_documents must NOT mutate this timestamp.
+    let pinned_updated_at = "2000-01-01T00:00:00Z";
     sqlx::query(
         "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
             state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
-            payload_sha256_canonical, offline_session_id) \
+            payload_sha256_canonical, offline_session_id, updated_at) \
          VALUES (?, ?, '2222222222', 1, 'SELL', 'PREPARED', 'b', 't', 'OFFLINE', \
-            '2026-01-01T00:00:00Z', '{}', ?, ?)",
+            '2026-01-01T00:00:00Z', '{}', ?, ?, ?)",
     )
     .bind(&doc_id)
     .bind(&req_id)
     .bind(&sha)
     .bind(&referenced_session_id)
+    .bind(pinned_updated_at)
     .execute(&pool)
     .await
     .unwrap();
@@ -1122,6 +1129,63 @@ async fn migration_015_normalize_apply_populated_db_preserves_rows() {
             .await
             .unwrap();
     assert_eq!(session_state, "OPEN", "OPEN session must remain OPEN");
+
+    // HIGH-fix assertion (operator review 2026-05-15, Round 4):
+    // the migration's service-UPDATEs on fiscal_documents (stash +
+    // restore inbound FK) must NOT mutate historical `updated_at`.
+    // The pre-migration value `2000-01-01T00:00:00Z` was set via
+    // explicit INSERT column (INSERT bypasses the `fd_updated_at`
+    // AFTER-UPDATE trigger).  Migration 015 step 2a drops that
+    // trigger before its UPDATEs and step 9b recreates it
+    // identically — so this assertion proves the trigger
+    // suppression is scoped correctly to the migration's
+    // bookkeeping writes and historical metadata is preserved.
+    let preserved_updated_at: String =
+        sqlx::query_scalar("SELECT updated_at FROM fiscal_documents WHERE document_id = ?")
+            .bind(&doc_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        preserved_updated_at, "2000-01-01T00:00:00Z",
+        "W4 migration must NOT mutate fiscal_documents.updated_at — fd_updated_at trigger must be suppressed across the service-UPDATEs and restored after"
+    );
+
+    // Belt-and-braces: the trigger must exist again post-migration
+    // so normal runtime UPDATEs on fiscal_documents still refresh
+    // `updated_at` correctly.
+    let trigger_present: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'fd_updated_at'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        trigger_present, 1,
+        "fd_updated_at trigger must be recreated by migration 015 step 9b"
+    );
+
+    // Prove the recreated trigger still functions: a runtime UPDATE
+    // on the doc (not via the migration) must refresh `updated_at`
+    // away from the pinned historical value.  We update an
+    // unrelated business column (`state`) to trigger the AFTER
+    // UPDATE.  Use a column the doc actually permits transitioning
+    // to from PREPARED; SIGNED is the canonical first transition.
+    sqlx::query("UPDATE fiscal_documents SET state = 'SIGNED' WHERE document_id = ?")
+        .bind(&doc_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let after_runtime_update: String =
+        sqlx::query_scalar("SELECT updated_at FROM fiscal_documents WHERE document_id = ?")
+            .bind(&doc_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(
+        after_runtime_update, "2000-01-01T00:00:00Z",
+        "post-migration runtime UPDATE on fiscal_documents must fire `fd_updated_at` (proves trigger was recreated functional)"
+    );
 }
 
 /// W4 criterion #4 — partial UNIQUE `ux_offline_active` covers only
@@ -1390,4 +1454,150 @@ async fn migration_015_consumed_by_document_id_fk_restrict() {
         );
     let msg = err.to_string().to_lowercase();
     assert!(msg.contains("foreign key"), "expected FK error, got: {msg}");
+}
+
+/// W4 LOW-fix (operator review 2026-05-15, Round 4) — negative
+/// fixture for the migration's hard-abort FK guard.
+///
+/// The guard at the tail of `015_offline_normalize.sql`:
+///
+/// ```sql
+/// CREATE TEMP TABLE __w4_fk_guard__ (
+///     fk_violation_count INTEGER NOT NULL CHECK (fk_violation_count = 0)
+/// );
+/// INSERT INTO __w4_fk_guard__ (fk_violation_count)
+/// SELECT 1 FROM pragma_foreign_key_check;
+/// DROP TABLE __w4_fk_guard__;
+/// ```
+///
+/// is load-bearing fail-closed: if `pragma_foreign_key_check`
+/// returns ANY violations, the INSERT puts at least one row with
+/// value `1` into the CHECK-constrained table; CHECK fails with
+/// `SQLITE_CONSTRAINT_CHECK` and the entire migration aborts.
+///
+/// Test methodology: reset to 004-era shape, seed FN + a
+/// fiscal_documents row, then INSERT an offline_codes row whose
+/// `used_by_doc` references a NON-EXISTENT document (orphan FK).
+/// This is only possible with `PRAGMA foreign_keys = OFF` in
+/// autocommit — the 004 schema DOES enforce the FK at INSERT time
+/// when foreign_keys is ON, so we must disable enforcement to
+/// engineer a pre-migration violation.  Then we apply migration
+/// 015 inside `pool.begin()/tx.commit()` (production semantics)
+/// and assert it fails with a CHECK constraint error originating
+/// from the guard.
+#[tokio::test]
+async fn migration_015_hard_abort_fk_guard_rejects_orphan_consumed_by_doc() {
+    let (_d, pool) = fresh_pool().await;
+
+    // Reset to 004-era shape (same approach as the populated-DB test).
+    sqlx::query("DROP TRIGGER IF EXISTS offline_codes_consumed_immutable")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE offline_codes")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE offline_sessions")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE offline_sessions (
+            offline_session_id BLOB PRIMARY KEY CHECK (length(offline_session_id) = 16),
+            fiscal_number      TEXT NOT NULL,
+            status             TEXT NOT NULL CHECK (status IN ('OPENING','OPEN','CLOSING','CLOSED','ABORTED')),
+            opened_at          TEXT NOT NULL,
+            closed_at          TEXT,
+            last_known_unsigned_xml_sha256 BLOB,
+            docs_count         INTEGER NOT NULL DEFAULT 0,
+            created_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            updated_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            FOREIGN KEY (fiscal_number) REFERENCES fiscal_number_config(fiscal_number) ON DELETE RESTRICT
+        ) STRICT",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE offline_codes (
+            fiscal_number TEXT NOT NULL,
+            code_value    INTEGER NOT NULL CHECK (code_value > 0),
+            used_at       TEXT,
+            used_by_doc   BLOB,
+            PRIMARY KEY (fiscal_number, code_value),
+            FOREIGN KEY (fiscal_number) REFERENCES fiscal_number_config(fiscal_number) ON DELETE RESTRICT
+        ) STRICT",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Seed FN config.
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES ('1234567890', '12345678', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Engineer the orphan: bypass FK enforcement and insert a code
+    // referencing a non-existent document_id.  `PRAGMA foreign_keys
+    // = OFF` works in autocommit (not inside a tx — confirmed
+    // through sqlx source inspection); we are in autocommit here.
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let orphan_doc_id: Vec<u8> = vec![0xDEu8; 16]; // does NOT exist in fiscal_documents
+    sqlx::query(
+        "INSERT INTO offline_codes(fiscal_number, code_value, used_at, used_by_doc) \
+         VALUES ('1234567890', 99, '2026-01-01T00:00:00Z', ?)",
+    )
+    .bind(&orphan_doc_id)
+    .execute(&pool)
+    .await
+    .expect("INSERT must succeed with foreign_keys=OFF");
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Note: pre-migration `PRAGMA foreign_key_check` returns
+    // EMPTY here.  The 004-era `offline_codes` schema declares NO
+    // FK on `used_by_doc` (only on `fiscal_number`).  The W4
+    // rebuild adds `FOREIGN KEY (consumed_by_document_id)
+    // REFERENCES fiscal_documents(document_id)` — that's the FK
+    // that makes the orphan visible.  After step 11–14 of 015
+    // (snapshot → drop → recreate with new FK → INSERT…SELECT, all
+    // under defer_foreign_keys=ON), the orphan row exists in the
+    // rebuilt offline_codes with `consumed_by_document_id =
+    // 0xDE…` pointing at a non-existent document.  THAT's what the
+    // hard-abort guard at the tail catches via
+    // `pragma_foreign_key_check`.
+
+    // Apply migration 015 inside a tx (mirrors sqlx::migrate!).
+    // EXPECT failure at the hard-abort guard.
+    let sql_015 = include_str!("../migrations/015_offline_normalize.sql");
+    let mut tx = pool.begin().await.expect("begin tx");
+    let err = sqlx::raw_sql(sql_015).execute(&mut *tx).await.expect_err(
+        "migration 015 must fail at the hard-abort FK guard when an orphan \
+         consumed_by_document_id is present",
+    );
+    // The SQLite error originates from the CHECK constraint on the
+    // `__w4_fk_guard__` temp table.  Accept any error wording that
+    // identifies a CHECK constraint or the guard table (sqlx may
+    // wrap SQLite errors differently across versions; match
+    // loosely on either signal).
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("check") || msg.contains("__w4_fk_guard__") || msg.contains("constraint"),
+        "expected CHECK/constraint error from hard-abort FK guard, got: {msg}"
+    );
+    // Tx is dropped (rolled back) — the orphan row remains in
+    // pre-migration shape (004-era), and the migration's table
+    // rewrites are undone.  No assertion needed on post-state; the
+    // important property is that the migration refused to commit.
+    drop(tx);
 }

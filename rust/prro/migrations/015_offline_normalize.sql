@@ -93,7 +93,18 @@ PRAGMA defer_foreign_keys = ON;
 
 -- ─── offline_sessions normalization ──────────────────────────────────
 
--- Step 2: temporary holding column on fiscal_documents for the
+-- Step 2a: drop the `fd_updated_at` AFTER-UPDATE trigger from
+-- migration 008 so our own service-UPDATEs on fiscal_documents
+-- (steps 3 + 8) do NOT mutate historical `updated_at` timestamps.
+-- The trigger rewrites `updated_at = CURRENT_TIMESTAMP` for every
+-- updated row; for normal business writes that's correct, but our
+-- migration UPDATEs are bookkeeping (stash + null + restore inbound
+-- FK), not business writes, so historical row metadata must be
+-- preserved verbatim.  Trigger is recreated identically at step 9b
+-- below (operator review pin, 2026-05-15 — HIGH-fix).
+DROP TRIGGER fd_updated_at;
+
+-- Step 2b: temporary holding column on fiscal_documents for the
 -- inbound FK values.  ALTER TABLE ADD COLUMN is supported since
 -- SQLite 3.2; ADD COLUMN cannot include a FK constraint, which is
 -- exactly what we want — we want this column to NOT participate in
@@ -102,7 +113,8 @@ ALTER TABLE fiscal_documents ADD COLUMN _w4_offline_session_id_tmp BLOB;
 
 -- Step 3: stash + null the FK column so DROP TABLE offline_sessions
 -- below can succeed without triggering RESTRICT.  Single UPDATE
--- copies and clears in one pass.
+-- copies and clears in one pass.  `fd_updated_at` is dropped (step
+-- 2a) so this UPDATE does NOT touch `updated_at`.
 UPDATE fiscal_documents
    SET _w4_offline_session_id_tmp = offline_session_id,
        offline_session_id         = NULL
@@ -163,14 +175,29 @@ FROM __w4_offline_sessions_tmp__;
 -- Step 8: restore the inbound FK column.  At this point
 -- `fiscal_documents.offline_session_id` FK targets the rebuilt
 -- offline_sessions table (same name, same row data).  With
--- defer_foreign_keys=ON, validation is deferred to COMMIT.
+-- defer_foreign_keys=ON, validation is deferred to COMMIT.  The
+-- `fd_updated_at` trigger remains dropped here so this restore
+-- does NOT touch `updated_at` either.
 UPDATE fiscal_documents
    SET offline_session_id = _w4_offline_session_id_tmp
  WHERE _w4_offline_session_id_tmp IS NOT NULL;
 
--- Step 9: drop the temp column on fiscal_documents.  Requires
+-- Step 9a: drop the temp column on fiscal_documents.  Requires
 -- SQLite ≥ 3.35 (DROP COLUMN); libsqlite3-sys 0.30 bundles 3.46+.
 ALTER TABLE fiscal_documents DROP COLUMN _w4_offline_session_id_tmp;
+
+-- Step 9b: recreate `fd_updated_at` trigger verbatim (matches
+-- migration 008 line 154).  Schema-level DROP+CREATE inside a tx is
+-- safe in SQLite.  From this point on any future UPDATE on
+-- fiscal_documents (post-migration runtime writes) correctly
+-- refreshes `updated_at` again — the suppression was scoped to
+-- migration 015's bookkeeping UPDATEs only.  Operator review pin,
+-- 2026-05-15 (HIGH-fix).
+CREATE TRIGGER fd_updated_at
+AFTER UPDATE ON fiscal_documents
+BEGIN
+    UPDATE fiscal_documents SET updated_at = CURRENT_TIMESTAMP WHERE document_id = NEW.document_id;
+END;
 
 -- Step 10: drop the offline_sessions snapshot.
 DROP TABLE __w4_offline_sessions_tmp__;
