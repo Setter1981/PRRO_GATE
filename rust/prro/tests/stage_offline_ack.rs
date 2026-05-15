@@ -438,21 +438,19 @@ async fn second_run_after_applied_returns_err_and_does_not_double_consume() {
     ));
 
     // Second run on the same doc.  Doc is now in OFFLINE_LOCAL_ACK,
-    // but the W4 partial UNIQUE `ux_offline_codes_consumed_by_doc`
-    // catches the violation BEFORE the transition_state CAS — the
-    // attempt to link code_lnd=2 to the same doc_id (already linked
-    // to code_lnd=1) fires the UNIQUE, classified by W5 into the
-    // typed `OfflineCodeAlreadyConsumed` variant.  Envelope rolls
-    // back; code_lnd=2 stays unconsumed (I5 preserved STRUCTURALLY
-    // via schema, not just by W7-helper logic — defence-in-depth).
-    let err = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap_err();
-    let typed = err.downcast_ref::<offline_sessions::OfflineSessionError>();
+    // not SIGNED.  Operator W7 Round 1 LOW/MED fix (2026-05-15):
+    // the new pre-check in stage_offline_ack catches this BEFORE
+    // touching `offline_codes` and surfaces typed
+    // `Refused(DocStateConflict)`.  No code consumption attempted;
+    // I5 preserved at the pre-check layer (in addition to W4
+    // schema's UNIQUE — defence-in-depth).
+    let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
     assert!(
         matches!(
-            typed,
-            Some(offline_sessions::OfflineSessionError::OfflineCodeAlreadyConsumed)
+            outcome,
+            OfflineAckOutcome::Refused(RefusalReason::DocStateConflict)
         ),
-        "expected typed OfflineCodeAlreadyConsumed on idempotent replay (schema-enforced via ux_offline_codes_consumed_by_doc); got: {err:?}"
+        "expected typed Refused(DocStateConflict) on idempotent replay; got: {outcome:?}"
     );
     // I5 invariant: code_lnd=2 must remain unconsumed.
     let consumed: i64 = fetch_consumed_count(&pool, FN).await;
@@ -460,6 +458,11 @@ async fn second_run_after_applied_returns_err_and_does_not_double_consume() {
         consumed, 1,
         "only code_lnd=1 was legally consumed; code_lnd=2 must stay unconsumed (I5)"
     );
+    // Refusal audit emitted.
+    let events = fetch_audit_events(&pool, doc_id).await;
+    assert_eq!(events.len(), 2, "Applied + Refused");
+    assert_eq!(events[0].0, "OFFLINE_LOCAL_ACK_APPLIED");
+    assert_eq!(events[1].0, "OFFLINE_ACK_REFUSED");
     // The originally-consumed code's link unchanged.
     let link: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT consumed_by_document_id FROM offline_codes WHERE fiscal_number = ? AND code_lnd = 1",
@@ -474,17 +477,12 @@ async fn second_run_after_applied_returns_err_and_does_not_double_consume() {
 // ─── Doc-not-found (programmer bug surface) ─────────────────────────
 
 #[tokio::test]
-async fn unknown_doc_id_propagates_fk_error_with_rollback() {
-    // Production invariant: doc exists when stage_offline_ack runs
-    // (stage 3 sign just emitted it).  An unknown doc_id is a
-    // programmer-bug surface.  The W4 FK on
-    // `offline_codes.consumed_by_document_id → fiscal_documents`
-    // catches it: `acquire_code_tx` attempts UPDATE with a non-
-    // existent doc_id, SQLite returns FOREIGN KEY constraint failed
-    // BEFORE the envelope reaches `transition_to_offline_local_ack_tx`.
-    // The FK error propagates as `OfflineSessionError::Database`
-    // (catch-all variant for unmatched DB errors), which our test
-    // recovers via downcast.
+async fn unknown_doc_id_returns_typed_refused_doc_not_found() {
+    // Operator W7 Round 1 LOW/MED fix (2026-05-15): pre-check in
+    // stage_offline_ack catches missing doc BEFORE touching
+    // `offline_codes`.  Was previously surfacing as FK-driven Err
+    // via acquire_code_tx; now structured as typed
+    // `Refused(DocNotFound)`.  Code pool stays untouched.
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::Opened).await;
     let session_id = OfflineSessionId::new();
@@ -492,23 +490,84 @@ async fn unknown_doc_id_propagates_fk_error_with_rollback() {
     seed_code(&pool, FN, 1).await;
 
     let unknown_doc_id = DocumentId::new();
-    let err = stage_offline_ack::run(&pool, unknown_doc_id, FN)
+    let outcome = stage_offline_ack::run(&pool, unknown_doc_id, FN)
         .await
-        .unwrap_err();
-    // Either typed Database(sqlx::Error) or string-match on FK
-    // constraint name — anyhow preserves the wrapped error type.
-    let typed = err.downcast_ref::<offline_sessions::OfflineSessionError>();
-    let matched_typed = matches!(
-        typed,
-        Some(offline_sessions::OfflineSessionError::Database(_))
-    );
-    let matched_msg = err.to_string().to_lowercase().contains("foreign key");
+        .unwrap();
     assert!(
-        matched_typed || matched_msg,
-        "expected FK-driven Err (typed Database variant OR 'FOREIGN KEY' in message); got: {err:?}"
+        matches!(
+            outcome,
+            OfflineAckOutcome::Refused(RefusalReason::DocNotFound)
+        ),
+        "expected typed Refused(DocNotFound); got: {outcome:?}"
     );
-    // Envelope rolled back — code stays unconsumed.
+    // Code stays unconsumed (pre-check catches before acquire).
     assert_eq!(fetch_consumed_count(&pool, FN).await, 0);
+    // Refusal audit emitted.
+    let events = fetch_audit_events(&pool, unknown_doc_id).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "OFFLINE_ACK_REFUSED");
+}
+
+#[tokio::test]
+async fn cross_fn_doc_and_code_attribution_is_rejected() {
+    // Operator W7 Round 1 HIGH-2 fix (2026-05-15): caller MUST
+    // pass the FN the doc belongs to.  Mismatched FN must NOT
+    // result in fiscal-integrity breach (doc of FN A stamped
+    // with code/session of FN B).  Pre-check + helper WHERE
+    // clause both filter on fiscal_number; the typed
+    // Refused(DocStateConflict) surfaces because the pre-check
+    // catches the mismatch.
+    let (_d, pool) = fresh_pool().await;
+    const FN_A: &str = "1111111111";
+    const FN_B: &str = "2222222222";
+    seed_fn(&pool, FN_A).await;
+    seed_fn(&pool, FN_B).await;
+    seed_node_state(&pool, FN_A, NodeMode::Offline, ShiftState::Opened).await;
+    seed_node_state(&pool, FN_B, NodeMode::Offline, ShiftState::Opened).await;
+    let session_a = OfflineSessionId::new();
+    let session_b = OfflineSessionId::new();
+    seed_offline_session(&pool, FN_A, session_a, OfflineSessionState::Open).await;
+    seed_offline_session(&pool, FN_B, session_b, OfflineSessionState::Open).await;
+    seed_code(&pool, FN_A, 100).await;
+    seed_code(&pool, FN_B, 200).await;
+    // Doc belongs to FN_A.
+    let doc_a = insert_signed_doc(&pool, FN_A, 1).await;
+
+    // Call stage with FN_B — would attempt to bind FN_A's doc to
+    // FN_B's code + session.  Must refuse.
+    let outcome = stage_offline_ack::run(&pool, doc_a, FN_B).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            OfflineAckOutcome::Refused(RefusalReason::DocStateConflict)
+        ),
+        "cross-FN attribution MUST be refused (operator HIGH-2 fix); got: {outcome:?}"
+    );
+    // Neither FN's code pool touched.
+    assert_eq!(
+        fetch_consumed_count(&pool, FN_A).await,
+        0,
+        "FN_A code pool untouched"
+    );
+    assert_eq!(
+        fetch_consumed_count(&pool, FN_B).await,
+        0,
+        "FN_B code pool untouched (the integrity-critical case)"
+    );
+    // Doc still in SIGNED.
+    assert_eq!(fetch_doc_state(&pool, doc_a).await, "SIGNED");
+    // Doc's offline columns remain NULL (no cross-FN stamping).
+    let row: (Option<i64>, Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT offline_fiscal_no, offline_fiscal_date, offline_session_id \
+         FROM fiscal_documents WHERE document_id = ?",
+    )
+    .bind(doc_a)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, None, "offline_fiscal_no must stay NULL");
+    assert_eq!(row.1, None, "offline_fiscal_date must stay NULL");
+    assert_eq!(row.2, None, "offline_session_id must stay NULL");
 }
 
 // ─── Concurrent stage_offline_ack on different docs same FN ─────────

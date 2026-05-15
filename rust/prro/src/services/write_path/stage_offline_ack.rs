@@ -206,24 +206,77 @@ pub async fn run(
                     }
                 };
 
-            // ─── Step 5: acquire code (atomic single-statement CAS) ─
+            // ─── Step 5: pre-check doc state + FN match ─────────────
             //
-            // Validations all passed.  This is the first point a
-            // write touches `offline_codes` — any earlier refusal
-            // returned BEFORE this call, so code pool stays intact
-            // on refusal.  `CodePoolExhausted` propagates as
+            // Operator W7 Round 1 LOW/MED fix (2026-05-15): the
+            // `DocStateConflict` / `DocNotFound` typed refusal
+            // variants were documented but unreachable previously
+            // (CAS-conflict path bailed with Err).  This pre-check
+            // makes them reachable AS REFUSALS: read the doc's
+            // state + fiscal_number inside the envelope BEFORE
+            // touching the code pool, then surface typed Refused
+            // with no acquire_code_tx side effect.  Doubles as the
+            // cross-FN guard from operator W7 Round 1 HIGH-2 —
+            // mismatched FN is caught here before any code is
+            // consumed.  The CAS in step 7 below remains as
+            // defence-in-depth (race window between this read and
+            // that CAS is closed by BEGIN IMMEDIATE; the CAS would
+            // need to fail only if there's a logic bug here).
+            let doc_meta: Option<(String, String)> = sqlx::query_as(
+                "SELECT state, fiscal_number \
+                 FROM fiscal_documents WHERE document_id = ? LIMIT 1",
+            )
+            .bind(doc_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            match doc_meta {
+                None => {
+                    return audit_and_return_refused(
+                        tx,
+                        doc_id,
+                        &fn_id,
+                        RefusalReason::DocNotFound,
+                    )
+                    .await;
+                }
+                Some((state, doc_fn)) if state != "SIGNED" || doc_fn != fn_id => {
+                    // State diverged OR cross-FN mismatch.  Either
+                    // way: typed DocStateConflict refusal.  Operator
+                    // W7 Round 1 HIGH-2: cross-FN doc/code attribution
+                    // is fiscal-integrity-critical; caught here
+                    // before code consumption.
+                    return audit_and_return_refused(
+                        tx,
+                        doc_id,
+                        &fn_id,
+                        RefusalReason::DocStateConflict,
+                    )
+                    .await;
+                }
+                Some(_) => {}
+            }
+
+            // ─── Step 6: acquire code (atomic single-statement CAS) ─
+            //
+            // Validations + pre-check all passed.  This is the first
+            // point a write touches `offline_codes` — any earlier
+            // refusal returned BEFORE this call, so code pool stays
+            // intact on refusal.  `CodePoolExhausted` propagates as
             // typed-via-anyhow Err (W5 contract) — caller's
             // responsibility to enter STOP_MODE.
             let acquired = offline_sessions::acquire_code_tx(tx, &fn_id, doc_id).await?;
 
-            // ─── Step 6: transition Signed → OfflineLocalAck ────────
+            // ─── Step 7: transition Signed → OfflineLocalAck ────────
             //
             // Single UPDATE stamps state + offline_fiscal_no +
             // offline_fiscal_date + offline_session_id atomically
-            // (operator W7 criterion 5).
+            // (operator W7 criterion 5).  Helper now also takes
+            // `fiscal_number` and filters on it in the WHERE clause
+            // (operator W7 Round 1 HIGH-2 fix).
             let outcome = fd::transition_to_offline_local_ack_tx(
                 tx,
                 doc_id,
+                &fn_id,
                 acquired.code_lnd,
                 &acquired.consumed_at,
                 session_id,
@@ -232,7 +285,7 @@ pub async fn run(
 
             match outcome {
                 TransitionOutcome::Applied => {
-                    // ─── Step 7: emit Applied audit ─────────────────
+                    // ─── Step 8: emit Applied audit ─────────────────
                     let payload = json!({
                         "document_id": hex_lower(doc_id.as_bytes()),
                         "code_lnd": acquired.code_lnd,
@@ -257,31 +310,37 @@ pub async fn run(
                     })
                 }
                 TransitionOutcome::Forbidden => {
-                    // Unreachable via the typed helper —
-                    // `(Signed, OfflineLocalAck)` is locked in the W6
-                    // edge-set test.  Surface as Internal error so a
-                    // future regression (W6 edge removed) fails loud.
+                    // Whitelist gate failed — would only happen if
+                    // a future PR removed `(Signed, OfflineLocalAck)`
+                    // from `allowed_transition` without updating
+                    // this stage.  Operator W7 Round 1 HIGH-3 fix:
+                    // the helper now actually returns this in
+                    // release builds (was `debug_assert!` no-op
+                    // previously).  Bail to surface the regression
+                    // loud.
                     anyhow::bail!(
-                        "(Signed, OfflineLocalAck) whitelist gate unexpectedly returned Forbidden"
+                        "(Signed, OfflineLocalAck) whitelist gate returned Forbidden — W6 locked-edge test regression?"
                     )
                 }
                 TransitionOutcome::Conflict => {
-                    // Doc state diverged from Signed — concurrent
-                    // change.  Code WAS just acquired (step 5); the
-                    // envelope rollback below via Err... wait, we
-                    // need to abort the envelope so the code
-                    // consumption is undone.
+                    // Defence-in-depth: pre-check (step 5) caught
+                    // state/FN mismatch already, so we should not
+                    // see this in single-writer BEGIN IMMEDIATE
+                    // semantics.  If we do, it's a real bug —
+                    // bail to roll back the envelope (code stays
+                    // unconsumed; I5 preserved).
                     anyhow::bail!(
-                        "stage_offline_ack: doc state diverged from Signed mid-envelope (Conflict); \
-                         tx rollback to preserve I5 (code stays unconsumed)"
+                        "stage_offline_ack: CAS Conflict after pre-check passed — \
+                         logic bug or external write to fiscal_documents mid-envelope; \
+                         tx rollback to preserve I5"
                     )
                 }
                 TransitionOutcome::NotFound => {
-                    // Doc row vanished — programmer bug; rollback to
-                    // preserve I5.
+                    // Same as Conflict: pre-check (step 5) caught
+                    // missing row already.  Defence-in-depth bail.
                     anyhow::bail!(
-                        "stage_offline_ack: doc row vanished mid-envelope (NotFound); \
-                         tx rollback to preserve I5"
+                        "stage_offline_ack: CAS NotFound after pre-check passed — \
+                         doc row vanished mid-envelope; tx rollback to preserve I5"
                     )
                 }
             }
