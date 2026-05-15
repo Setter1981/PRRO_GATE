@@ -155,6 +155,20 @@ pub fn allowed_transition(from: DocState, to: DocState) -> bool {
             | (Kvt1, ErrorRetryable)
             | (Kvt2, Ack)
             | (OfflineLocalAck, Sent)
+            // M3b W6 — Pattern C edges per spec §5.3 / M3b plan
+            // §Task 6.  The W4/W5 offline subsystem produces docs
+            // in `OfflineLocalAck` while node is offline; on
+            // return-online the W7 drain stage flips them through
+            // `Sending` (Pattern B intent-marker, mirroring the
+            // online ladder) and `Cancelled` is the manual-operator
+            // escape if the drain is abandoned mid-flight.  Locked
+            // edge set + count pinned in
+            // `tests/fiscal_documents_offline_local_ack_edges_locked.rs`.
+            // The legacy M3a `(OfflineLocalAck, Sent)` placeholder
+            // immediately above is preserved (W6 scope: add-only,
+            // no removals; runtime wiring of the new edges is W7).
+            | (OfflineLocalAck, Sending)
+            | (OfflineLocalAck, Cancelled)
             | (ErrorRetryable, Sent)
             | (ErrorRetryable, Kvt1)
             | (ErrorRetryable, RequiresManualReconciliation)
