@@ -1475,16 +1475,21 @@ async fn migration_015_consumed_by_document_id_fk_restrict() {
 /// value `1` into the CHECK-constrained table; CHECK fails with
 /// `SQLITE_CONSTRAINT_CHECK` and the entire migration aborts.
 ///
-/// Test methodology: reset to 004-era shape, seed FN + a
-/// fiscal_documents row, then INSERT an offline_codes row whose
-/// `used_by_doc` references a NON-EXISTENT document (orphan FK).
-/// This is only possible with `PRAGMA foreign_keys = OFF` in
-/// autocommit — the 004 schema DOES enforce the FK at INSERT time
-/// when foreign_keys is ON, so we must disable enforcement to
-/// engineer a pre-migration violation.  Then we apply migration
-/// 015 inside `pool.begin()/tx.commit()` (production semantics)
-/// and assert it fails with a CHECK constraint error originating
-/// from the guard.
+/// Test methodology: reset to 004-era shape, seed FN, then INSERT
+/// an offline_codes row whose `used_by_doc` references a
+/// NON-EXISTENT document_id.  The 004-era `offline_codes` schema
+/// declares NO FK on `used_by_doc` (only on `fiscal_number` — see
+/// `migrations/004_offline_and_routing.sql:19`), so the INSERT
+/// succeeds without any pragma toggling — no pooled-connection
+/// side effect.  Then we apply migration 015 inside
+/// `pool.begin()/tx.commit()` (mirrors `sqlx::migrate!`
+/// production semantics).  The W4 rebuild INTRODUCES the FK on
+/// `consumed_by_document_id`; after the rebuild's INSERT…SELECT
+/// rehydrates the orphan into the new schema (under
+/// `defer_foreign_keys=ON` so validation is deferred), the
+/// hard-abort guard's `pragma_foreign_key_check` scan finds the
+/// violation and the CHECK on `__w4_fk_guard__` rejects the
+/// INSERT, aborting the migration.
 #[tokio::test]
 async fn migration_015_hard_abort_fk_guard_rejects_orphan_consumed_by_doc() {
     let (_d, pool) = fresh_pool().await;
@@ -1542,14 +1547,14 @@ async fn migration_015_hard_abort_fk_guard_rejects_orphan_consumed_by_doc() {
     .await
     .unwrap();
 
-    // Engineer the orphan: bypass FK enforcement and insert a code
-    // referencing a non-existent document_id.  `PRAGMA foreign_keys
-    // = OFF` works in autocommit (not inside a tx — confirmed
-    // through sqlx source inspection); we are in autocommit here.
-    sqlx::query("PRAGMA foreign_keys = OFF")
-        .execute(&pool)
-        .await
-        .unwrap();
+    // Engineer the orphan: INSERT a code with `used_by_doc`
+    // pointing at a non-existent document_id.  The 004-era schema
+    // has NO FK on `used_by_doc` (only on `fiscal_number`), so
+    // this INSERT succeeds with FK enforcement ON — no pragma
+    // toggling needed.  Avoiding `PRAGMA foreign_keys = OFF`
+    // matters because the sqlx pool may reuse the same connection;
+    // a sticky `foreign_keys = OFF` would leak FK-bypass behaviour
+    // into subsequent test bodies sharing the connection.
     let orphan_doc_id: Vec<u8> = vec![0xDEu8; 16]; // does NOT exist in fiscal_documents
     sqlx::query(
         "INSERT INTO offline_codes(fiscal_number, code_value, used_at, used_by_doc) \
@@ -1558,11 +1563,7 @@ async fn migration_015_hard_abort_fk_guard_rejects_orphan_consumed_by_doc() {
     .bind(&orphan_doc_id)
     .execute(&pool)
     .await
-    .expect("INSERT must succeed with foreign_keys=OFF");
-    sqlx::query("PRAGMA foreign_keys = ON")
-        .execute(&pool)
-        .await
-        .unwrap();
+    .expect("INSERT must succeed — 004-era schema has no FK on used_by_doc");
 
     // Note: pre-migration `PRAGMA foreign_key_check` returns
     // EMPTY here.  The 004-era `offline_codes` schema declares NO
