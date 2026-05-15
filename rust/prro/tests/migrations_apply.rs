@@ -975,25 +975,42 @@ async fn migration_015_normalize_apply_populated_db_preserves_rows() {
     assert_eq!(sessions_before, 5);
     assert_eq!(codes_before, 2);
 
-    // Apply migration 015 inline via `sqlx::raw_sql` in autocommit
-    // mode (no wrapping BEGIN/COMMIT).  The migration itself
-    // toggles `PRAGMA foreign_keys = OFF` at the top + restores it
-    // with `PRAGMA foreign_keys = ON` at the end, which is the
-    // canonical SQLite recipe for FK-safe schema rewrites and ONLY
-    // works outside an explicit transaction.  In production
-    // `sqlx::migrate!` for SQLite also runs migrations in
-    // autocommit (not in a wrapping tx); the test mirrors that.
+    // Apply migration 015 inline via `sqlx::raw_sql` wrapped in an
+    // explicit `pool.begin()/tx.commit()`.  This MIRRORS production
+    // `sqlx::migrate!` semantics: sqlx-sqlite 0.8.6's `Migrator::apply`
+    // always wraps each migration's SQL in `self.begin().await` (see
+    // sqlx-sqlite-0.8.6/src/migrate.rs:136).  The `-- no-transaction`
+    // directive that sqlx-core 0.8.6 parses is NOT honoured by sqlx-
+    // sqlite 0.8.6, so a migration that "needs autocommit" simply
+    // doesn't have that option on SQLite.  Consequently the migration
+    // MUST be safe inside an open transaction; this test proves it.
+    //
+    // The migration itself uses `PRAGMA defer_foreign_keys = ON` +
+    // the NULL-the-FK-column trick + the 008-style DROP-and-recreate-
+    // under-same-name pattern (NOT ALTER RENAME — RENAME breaks
+    // deferred FK validation; documented in migration 008).  At the
+    // end the migration runs a hard-abort FK guard via an INSERT
+    // into a TEMP CHECK-constrained table seeded from
+    // `pragma_foreign_key_check`; if any FK violation exists the
+    // CHECK fails and the whole migration aborts with
+    // SQLITE_CONSTRAINT_CHECK — fail-closed BEFORE COMMIT.
     let sql_015 = include_str!("../migrations/015_offline_normalize.sql");
-    sqlx::raw_sql(sql_015)
-        .execute(&pool)
+    let mut tx = pool
+        .begin()
         .await
-        .expect("migration 015 must apply on populated 004-era DB");
+        .expect("begin tx mirroring sqlx::migrate!");
+    sqlx::raw_sql(sql_015).execute(&mut *tx).await.expect(
+        "migration 015 must apply on populated 004-era DB inside a tx (mirrors sqlx::migrate!)",
+    );
+    tx.commit()
+        .await
+        .expect("commit tx — deferred FK validation must succeed");
 
     // Post-migration integrity scan: no orphan FK references.  The
-    // migration runs `PRAGMA foreign_key_check` itself but does not
-    // hard-abort on a non-empty result set (sqlx::migrate! ignores
-    // pragma result sets).  Production deploys should run the same
-    // post-migration check; the test enforces it here.
+    // migration's own hard-abort guard already enforces this inside
+    // the tx (CHECK-table INSERT trick — see migration 015 tail);
+    // this assertion is belt-and-braces, proving the wrapping COMMIT
+    // also sees a clean state.
     let fk_check: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
         .fetch_all(&pool)
         .await
@@ -1072,12 +1089,13 @@ async fn migration_015_normalize_apply_populated_db_preserves_rows() {
         "used_at → consumed_at rename preserves value"
     );
 
-    // HIGH-fix assertion (operator review 2026-05-14):
+    // HIGH-fix assertion (operator review 2026-05-14/15):
     // `fiscal_documents.offline_session_id` FK must still resolve
-    // to the (renamed) offline_sessions table after migration.
-    // Verifies that `PRAGMA defer_foreign_keys = ON` correctly
-    // deferred FK enforcement until COMMIT and the INSERT…SELECT
-    // step preserved the referenced `offline_session_id` value.
+    // to the rebuilt (same-name) offline_sessions table after
+    // migration.  Verifies that the migration's "stash + NULL the
+    // inbound FK column → DROP+CREATE-same-name → restore the FK
+    // column" recipe, combined with `PRAGMA defer_foreign_keys = ON`,
+    // correctly preserved the FK targets through the rebuild.
     let resolved_session: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT s.offline_session_id \
          FROM fiscal_documents d \
