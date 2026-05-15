@@ -341,6 +341,17 @@ fn allowed_transition_exhaustive_matrix() {
         // `override_to_rejected_with_failed_repeat_audit`
         // (services/write_path/stage_send.rs).
         (ErrorRetryable, Rejected),
+        // 2 M3b W6 additions per spec §5.3 Pattern C / M3b plan §Task 6:
+        //   - (OfflineLocalAck, Sending) — Pattern C drain entry on
+        //     return-online (W7 will wire the runtime callsite).
+        //   - (OfflineLocalAck, Cancelled) — manual operator escape
+        //     during drain (operator decides to abandon the offline
+        //     doc; alternative to flipping through the online ladder).
+        // Locked-edge set + count for OfflineLocalAck-touching edges
+        // separately pinned in
+        // `tests/fiscal_documents_offline_local_ack_edges_locked.rs`.
+        (OfflineLocalAck, Sending),
+        (OfflineLocalAck, Cancelled),
     ]
     .into_iter()
     .collect();
@@ -364,10 +375,10 @@ fn allowed_transition_exhaustive_matrix() {
         }
     }
     assert_eq!(
-        allowed_count, 26,
-        "expected 17 base + 7 Pattern B + 1 MAC recovery dispatch terminal + 1 W11 PR-2b SENT→RM = 26 allowed pairs"
+        allowed_count, 28,
+        "expected 17 base + 7 Pattern B + 1 MAC recovery dispatch terminal + 1 W11 PR-2b SENT→RM + 2 W6 Pattern C OfflineLocalAck edges = 28 allowed pairs"
     );
-    assert_eq!(forbidden_count, 169 - 26);
+    assert_eq!(forbidden_count, 169 - 28);
 }
 
 /// Negative coverage of intentional whitelist gaps from ADR-M3-A8 / A9.
