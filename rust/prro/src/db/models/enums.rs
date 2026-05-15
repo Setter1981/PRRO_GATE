@@ -47,6 +47,18 @@ str_enum!(DocState {
     RequiresManualReconciliation => "REQUIRES_MANUAL_RECONCILIATION",
 });
 
+// M3b W5 — OfflineSession state machine vocabulary, aligned with
+// migration 015's CHECK constraint on `offline_sessions.state`.
+// Whitelist + transition semantics live in
+// `db::repositories::offline_sessions`.  See M3b plan §Task 5.
+str_enum!(OfflineSessionState {
+    Opening  => "OPENING",
+    Open     => "OPEN",
+    Draining => "DRAINING",
+    Closed   => "CLOSED",
+    Aborted  => "ABORTED",
+});
+
 str_enum!(ShiftState {
     Created => "CREATED",
     Opening => "OPENING",

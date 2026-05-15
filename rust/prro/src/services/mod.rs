@@ -6,5 +6,6 @@
 //! W5's static check enforces that boundary at build time.
 
 pub mod cert_refresher;
+pub mod offline_session;
 pub mod reconciliation;
 pub mod write_path;
