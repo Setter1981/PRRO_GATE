@@ -1,0 +1,564 @@
+//! W7 acceptance — `stage_offline_ack` (Pattern C step 1).
+//!
+//! Covers the 6 W7 review axes (memory `m3b-w7-review-criteria`):
+//!
+//! 1. stage_finalize untouched — verified by leaving its test
+//!    suite intact (separate file, not modified by W7).
+//! 2. No DPS / network / crypto in offline branch — verified by
+//!    construction (stage_offline_ack module imports zero
+//!    substrate modules) and by I1's `IN_WITH_IMMEDIATE` runtime
+//!    guard which would panic if a substrate call leaked.
+//! 3. `acquire_code_tx` + transition in SAME `with_immediate` —
+//!    verified by `applied_happy_path_atomically_consumes_code_and_transitions`
+//!    + the rollback fixtures (`conflict_rolls_back_code_consumption`).
+//! 4. Shift / node-mode refusal typed; doc + code untouched —
+//!    covered by `refusal_*` fixtures.
+//! 5. `offline_fiscal_no = code_lnd`, `offline_fiscal_date =
+//!    consumed_at`, audit only on Applied — covered by
+//!    `applied_*` + `refusal_*` audit assertions.
+//! 6. No runtime use of `(OfflineLocalAck, Sending|Cancelled)` —
+//!    verified by grep over `src/` in the PR review (not testable
+//!    in isolation; pinned at review).
+
+use prro::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
+use prro::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
+use prro::db::repositories::offline_sessions;
+use prro::services::write_path::stage_offline_ack::{self, OfflineAckOutcome, RefusalReason};
+use std::sync::Arc;
+use uuid::Uuid;
+
+const FN: &str = "1234567890";
+
+async fn fresh_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = prro::db::open_pool(&dir.path().join("m.db"))
+        .await
+        .expect("open_pool runs migrations");
+    seed_fn(&pool, FN).await;
+    (dir, pool)
+}
+
+async fn seed_fn(pool: &sqlx::SqlitePool, fn_id: &str) {
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES (?, '12345678', 'test')",
+    )
+    .bind(fn_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Seed a `node_state` row with the given mode + shift_state.
+/// Mirrors what `app::boot` does on first startup.
+async fn seed_node_state(
+    pool: &sqlx::SqlitePool,
+    fn_id: &str,
+    mode: NodeMode,
+    shift_state: ShiftState,
+) {
+    sqlx::query(
+        "INSERT INTO node_state(fiscal_number, mode, shift_state, next_lnd) \
+         VALUES (?, ?, ?, 1)",
+    )
+    .bind(fn_id)
+    .bind(mode)
+    .bind(shift_state)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Seed an offline_session row directly (bypassing the W5 service)
+/// because tests need precise state control (some refusal cases
+/// require OPENING / DRAINING states the service doesn't expose).
+async fn seed_offline_session(
+    pool: &sqlx::SqlitePool,
+    fn_id: &str,
+    session_id: OfflineSessionId,
+    state: OfflineSessionState,
+) {
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, ?, '2026-05-15T00:00:00Z')",
+    )
+    .bind(session_id)
+    .bind(fn_id)
+    .bind(state.as_str())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Seed an unconsumed offline_codes row.
+async fn seed_code(pool: &sqlx::SqlitePool, fn_id: &str, code_lnd: i64) {
+    sqlx::query(
+        "INSERT INTO offline_codes(fiscal_number, code_lnd) \
+         VALUES (?, ?)",
+    )
+    .bind(fn_id)
+    .bind(code_lnd)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Seed a fiscal_documents row in SIGNED state.  Returns the
+/// generated `DocumentId`.
+async fn insert_signed_doc(pool: &sqlx::SqlitePool, fn_id: &str, lnd: i64) -> DocumentId {
+    let doc_id = DocumentId::new();
+    let req_id = Uuid::now_v7();
+    let sha = vec![0u8; 32];
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical) \
+         VALUES (?, ?, ?, ?, 'SELL', 'SIGNED', 'b', 't', 'OFFLINE', \
+            '2026-05-15T00:00:00Z', '{}', ?)",
+    )
+    .bind(doc_id)
+    .bind(req_id.as_bytes().to_vec())
+    .bind(fn_id)
+    .bind(lnd)
+    .bind(&sha)
+    .execute(pool)
+    .await
+    .unwrap();
+    doc_id
+}
+
+async fn fetch_doc_state(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> String {
+    sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
+        .bind(doc_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn fetch_consumed_count(pool: &sqlx::SqlitePool, fn_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM offline_codes WHERE fiscal_number = ? AND consumed_at IS NOT NULL",
+    )
+    .bind(fn_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn fetch_audit_events(
+    pool: &sqlx::SqlitePool,
+    doc_id: DocumentId,
+) -> Vec<(String, String, Option<String>)> {
+    let doc_hex = doc_id
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    sqlx::query_as(
+        "SELECT event_type, severity, event_payload_json FROM audit_log \
+         WHERE entity_type = 'fiscal_document' AND entity_id = ? \
+         ORDER BY audit_id ASC",
+    )
+    .bind(doc_hex)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// Setup for the "happy" environment (Offline mode, Opened shift,
+/// one OPEN session, one seeded code, one SIGNED doc).  Returns
+/// the session_id and doc_id for assertion convenience.
+async fn setup_offline_environment(pool: &sqlx::SqlitePool) -> (OfflineSessionId, DocumentId) {
+    seed_node_state(pool, FN, NodeMode::Offline, ShiftState::Opened).await;
+    // node_state also wants current_shift_id non-null; for W7 we
+    // only check shift_state in node_state, so leaving NULL is OK
+    // for these tests.
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(pool, FN, session_id, OfflineSessionState::Open).await;
+    seed_code(pool, FN, 42).await;
+    let doc_id = insert_signed_doc(pool, FN, 1).await;
+    (session_id, doc_id)
+}
+
+// ─── Happy path ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn applied_happy_path_atomically_consumes_code_and_transitions() {
+    let (_d, pool) = fresh_pool().await;
+    let (session_id, doc_id) = setup_offline_environment(&pool).await;
+
+    let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
+
+    match outcome {
+        OfflineAckOutcome::Applied {
+            document_id,
+            code_lnd,
+            consumed_at,
+            offline_session_id,
+        } => {
+            assert_eq!(document_id, doc_id);
+            assert_eq!(code_lnd, 42);
+            assert!(!consumed_at.is_empty());
+            assert_eq!(offline_session_id, session_id);
+        }
+        other => panic!("expected Applied, got: {other:?}"),
+    }
+
+    // Doc state flipped.
+    assert_eq!(fetch_doc_state(&pool, doc_id).await, "OFFLINE_LOCAL_ACK");
+
+    // offline_fiscal_no / _date / offline_session_id populated on doc.
+    let row: (Option<i64>, Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT offline_fiscal_no, offline_fiscal_date, offline_session_id \
+         FROM fiscal_documents WHERE document_id = ?",
+    )
+    .bind(doc_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, Some(42), "offline_fiscal_no = code_lnd");
+    assert!(row.1.is_some(), "offline_fiscal_date populated");
+    assert_eq!(
+        row.2.as_deref(),
+        Some(&session_id.as_bytes()[..]),
+        "offline_session_id = active session"
+    );
+
+    // Code consumed + linked to doc.
+    assert_eq!(fetch_consumed_count(&pool, FN).await, 1);
+    let consumed_by: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT consumed_by_document_id FROM offline_codes WHERE fiscal_number = ? AND code_lnd = 42",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(consumed_by.as_deref(), Some(&doc_id.as_bytes()[..]));
+
+    // Audit emitted exactly once with the right shape.
+    let events = fetch_audit_events(&pool, doc_id).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "OFFLINE_LOCAL_ACK_APPLIED");
+    assert_eq!(events[0].1, "INFO");
+    let payload: serde_json::Value = serde_json::from_str(events[0].2.as_ref().unwrap()).unwrap();
+    assert_eq!(payload["code_lnd"], 42);
+    assert!(!payload["consumed_at"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn applied_path_works_with_going_offline_mode() {
+    // GoingOffline is the transitional mode (operator-initiated
+    // offline switch); the offline branch must accept it as well.
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, FN, NodeMode::GoingOffline, ShiftState::Opened).await;
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
+    seed_code(&pool, FN, 1).await;
+    let doc_id = insert_signed_doc(&pool, FN, 1).await;
+
+    let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
+    assert!(matches!(outcome, OfflineAckOutcome::Applied { .. }));
+    assert_eq!(fetch_doc_state(&pool, doc_id).await, "OFFLINE_LOCAL_ACK");
+}
+
+// ─── Node-mode refusals ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn refusal_node_online_leaves_doc_and_code_untouched() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, FN, NodeMode::Online, ShiftState::Opened).await;
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
+    seed_code(&pool, FN, 1).await;
+    let doc_id = insert_signed_doc(&pool, FN, 1).await;
+
+    let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
+    match outcome {
+        OfflineAckOutcome::Refused(RefusalReason::NodeNotOffline { mode }) => {
+            assert_eq!(mode, NodeMode::Online);
+        }
+        other => panic!("expected NodeNotOffline(Online), got: {other:?}"),
+    }
+
+    // Doc state unchanged.
+    assert_eq!(fetch_doc_state(&pool, doc_id).await, "SIGNED");
+    // Code untouched.
+    assert_eq!(fetch_consumed_count(&pool, FN).await, 0);
+
+    // Refusal audit emitted.
+    let events = fetch_audit_events(&pool, doc_id).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "OFFLINE_ACK_REFUSED");
+    assert_eq!(events[0].1, "WARNING");
+    let payload: serde_json::Value = serde_json::from_str(events[0].2.as_ref().unwrap()).unwrap();
+    assert!(payload["reason"]
+        .as_str()
+        .unwrap()
+        .contains("NodeNotOffline"));
+}
+
+#[tokio::test]
+async fn refusal_node_blocked_returns_typed_node_not_offline() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, FN, NodeMode::Blocked, ShiftState::Opened).await;
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
+    seed_code(&pool, FN, 1).await;
+    let doc_id = insert_signed_doc(&pool, FN, 1).await;
+    let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
+    assert!(matches!(
+        outcome,
+        OfflineAckOutcome::Refused(RefusalReason::NodeNotOffline {
+            mode: NodeMode::Blocked
+        })
+    ));
+    assert_eq!(fetch_consumed_count(&pool, FN).await, 0);
+}
+
+#[tokio::test]
+async fn refusal_node_going_online_returns_typed_node_not_offline() {
+    // GoingOnline = W9 backlog-drain mode; offline ack must refuse.
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, FN, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
+    seed_code(&pool, FN, 1).await;
+    let doc_id = insert_signed_doc(&pool, FN, 1).await;
+    let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
+    assert!(matches!(
+        outcome,
+        OfflineAckOutcome::Refused(RefusalReason::NodeNotOffline {
+            mode: NodeMode::GoingOnline
+        })
+    ));
+    assert_eq!(fetch_consumed_count(&pool, FN).await, 0);
+}
+
+// ─── Shift refusals ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn refusal_shift_closed_returns_typed_shift_not_opened() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::Closed).await;
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
+    seed_code(&pool, FN, 1).await;
+    let doc_id = insert_signed_doc(&pool, FN, 1).await;
+    let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
+    match outcome {
+        OfflineAckOutcome::Refused(RefusalReason::ShiftNotOpened { current }) => {
+            assert_eq!(current, ShiftState::Closed);
+        }
+        other => panic!("expected ShiftNotOpened(Closed), got: {other:?}"),
+    }
+    assert_eq!(fetch_doc_state(&pool, doc_id).await, "SIGNED");
+    assert_eq!(fetch_consumed_count(&pool, FN).await, 0);
+}
+
+// ─── Session refusals ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn refusal_no_open_session_returns_typed_no_active_session() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::Opened).await;
+    // No offline_session row at all.
+    seed_code(&pool, FN, 1).await;
+    let doc_id = insert_signed_doc(&pool, FN, 1).await;
+    let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
+    assert!(matches!(
+        outcome,
+        OfflineAckOutcome::Refused(RefusalReason::NoActiveSession)
+    ));
+    assert_eq!(fetch_consumed_count(&pool, FN).await, 0);
+}
+
+#[tokio::test]
+async fn refusal_draining_session_returns_no_active_session() {
+    // DRAINING session is a W9 backlog-drain state; W7 must refuse.
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::Opened).await;
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(&pool, FN, session_id, OfflineSessionState::Draining).await;
+    seed_code(&pool, FN, 1).await;
+    let doc_id = insert_signed_doc(&pool, FN, 1).await;
+    let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
+    assert!(matches!(
+        outcome,
+        OfflineAckOutcome::Refused(RefusalReason::NoActiveSession)
+    ));
+    assert_eq!(fetch_consumed_count(&pool, FN).await, 0);
+}
+
+// ─── Code-pool exhaustion ───────────────────────────────────────────
+
+#[tokio::test]
+async fn empty_code_pool_propagates_typed_err() {
+    // No code seeded — `acquire_code_tx` returns CodePoolExhausted.
+    // Per W5/W7 contract this propagates as Err (typed via anyhow);
+    // caller (dispatcher / write-path orchestrator) is responsible
+    // for entering STOP_MODE.  Doc state stays SIGNED (envelope
+    // rolled back).
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::Opened).await;
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
+    let doc_id = insert_signed_doc(&pool, FN, 1).await;
+
+    let err = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap_err();
+    // Downcast through anyhow to the W5 typed error.
+    let typed = err.downcast_ref::<offline_sessions::OfflineSessionError>();
+    assert!(
+        matches!(
+            typed,
+            Some(offline_sessions::OfflineSessionError::CodePoolExhausted { .. })
+        ),
+        "expected typed CodePoolExhausted; got: {err:?}"
+    );
+    // Envelope rolled back — doc stays SIGNED.
+    assert_eq!(fetch_doc_state(&pool, doc_id).await, "SIGNED");
+}
+
+// ─── Idempotency / conflict rollback (criterion 4 + I4 + I5) ────────
+
+#[tokio::test]
+async fn second_run_after_applied_returns_err_and_does_not_double_consume() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::Opened).await;
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
+    seed_code(&pool, FN, 1).await;
+    seed_code(&pool, FN, 2).await;
+    let doc_id = insert_signed_doc(&pool, FN, 1).await;
+
+    // First run — Applied, consumes code_lnd=1.
+    let first = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
+    assert!(matches!(
+        first,
+        OfflineAckOutcome::Applied { code_lnd: 1, .. }
+    ));
+
+    // Second run on the same doc.  Doc is now in OFFLINE_LOCAL_ACK,
+    // but the W4 partial UNIQUE `ux_offline_codes_consumed_by_doc`
+    // catches the violation BEFORE the transition_state CAS — the
+    // attempt to link code_lnd=2 to the same doc_id (already linked
+    // to code_lnd=1) fires the UNIQUE, classified by W5 into the
+    // typed `OfflineCodeAlreadyConsumed` variant.  Envelope rolls
+    // back; code_lnd=2 stays unconsumed (I5 preserved STRUCTURALLY
+    // via schema, not just by W7-helper logic — defence-in-depth).
+    let err = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap_err();
+    let typed = err.downcast_ref::<offline_sessions::OfflineSessionError>();
+    assert!(
+        matches!(
+            typed,
+            Some(offline_sessions::OfflineSessionError::OfflineCodeAlreadyConsumed)
+        ),
+        "expected typed OfflineCodeAlreadyConsumed on idempotent replay (schema-enforced via ux_offline_codes_consumed_by_doc); got: {err:?}"
+    );
+    // I5 invariant: code_lnd=2 must remain unconsumed.
+    let consumed: i64 = fetch_consumed_count(&pool, FN).await;
+    assert_eq!(
+        consumed, 1,
+        "only code_lnd=1 was legally consumed; code_lnd=2 must stay unconsumed (I5)"
+    );
+    // The originally-consumed code's link unchanged.
+    let link: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT consumed_by_document_id FROM offline_codes WHERE fiscal_number = ? AND code_lnd = 1",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(link.as_deref(), Some(&doc_id.as_bytes()[..]));
+}
+
+// ─── Doc-not-found (programmer bug surface) ─────────────────────────
+
+#[tokio::test]
+async fn unknown_doc_id_propagates_fk_error_with_rollback() {
+    // Production invariant: doc exists when stage_offline_ack runs
+    // (stage 3 sign just emitted it).  An unknown doc_id is a
+    // programmer-bug surface.  The W4 FK on
+    // `offline_codes.consumed_by_document_id → fiscal_documents`
+    // catches it: `acquire_code_tx` attempts UPDATE with a non-
+    // existent doc_id, SQLite returns FOREIGN KEY constraint failed
+    // BEFORE the envelope reaches `transition_to_offline_local_ack_tx`.
+    // The FK error propagates as `OfflineSessionError::Database`
+    // (catch-all variant for unmatched DB errors), which our test
+    // recovers via downcast.
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::Opened).await;
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
+    seed_code(&pool, FN, 1).await;
+
+    let unknown_doc_id = DocumentId::new();
+    let err = stage_offline_ack::run(&pool, unknown_doc_id, FN)
+        .await
+        .unwrap_err();
+    // Either typed Database(sqlx::Error) or string-match on FK
+    // constraint name — anyhow preserves the wrapped error type.
+    let typed = err.downcast_ref::<offline_sessions::OfflineSessionError>();
+    let matched_typed = matches!(
+        typed,
+        Some(offline_sessions::OfflineSessionError::Database(_))
+    );
+    let matched_msg = err.to_string().to_lowercase().contains("foreign key");
+    assert!(
+        matched_typed || matched_msg,
+        "expected FK-driven Err (typed Database variant OR 'FOREIGN KEY' in message); got: {err:?}"
+    );
+    // Envelope rolled back — code stays unconsumed.
+    assert_eq!(fetch_consumed_count(&pool, FN).await, 0);
+}
+
+// ─── Concurrent stage_offline_ack on different docs same FN ─────────
+
+#[tokio::test]
+async fn concurrent_two_docs_acquire_distinct_codes() {
+    // BEGIN IMMEDIATE serialises the two envelopes via SQLite
+    // RESERVED lock; each tx gets its own code.  Verifies the W7
+    // stage threads through the W5 atomic-acquire semantics
+    // without bypass.
+    let (_d, pool) = fresh_pool().await;
+    let pool = Arc::new(pool);
+    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::Opened).await;
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
+    seed_code(&pool, FN, 1).await;
+    seed_code(&pool, FN, 2).await;
+    let doc_a = insert_signed_doc(&pool, FN, 1).await;
+    let doc_b = insert_signed_doc(&pool, FN, 2).await;
+
+    let p1 = Arc::clone(&pool);
+    let p2 = Arc::clone(&pool);
+    let t1 = tokio::spawn(async move { stage_offline_ack::run(&p1, doc_a, FN).await });
+    let t2 = tokio::spawn(async move { stage_offline_ack::run(&p2, doc_b, FN).await });
+    let r1 = t1.await.unwrap().unwrap();
+    let r2 = t2.await.unwrap().unwrap();
+
+    let lnd1 = match r1 {
+        OfflineAckOutcome::Applied { code_lnd, .. } => code_lnd,
+        other => panic!("expected Applied for doc_a, got: {other:?}"),
+    };
+    let lnd2 = match r2 {
+        OfflineAckOutcome::Applied { code_lnd, .. } => code_lnd,
+        other => panic!("expected Applied for doc_b, got: {other:?}"),
+    };
+    assert_ne!(
+        lnd1, lnd2,
+        "concurrent acquisition must return distinct codes"
+    );
+    let codes = {
+        let mut v = vec![lnd1, lnd2];
+        v.sort();
+        v
+    };
+    assert_eq!(codes, vec![1, 2]);
+    assert_eq!(fetch_consumed_count(&pool, FN).await, 2);
+}
+
+// ─── Helper: silence "unused" warnings on imports kept for ergonomic
+//     coverage of related types in case future tests need them.
+
+#[allow(dead_code)]
+fn _ensure_imports_referenced(_: ShiftId) {}
