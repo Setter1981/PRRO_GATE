@@ -7,18 +7,16 @@
 //!
 //! ## Repository policy
 //!
-//! - Mutating helpers take `&mut WriteTxConn<'_>` — callers obtain it
-//!   from a `with_immediate` closure, which guarantees BEGIN IMMEDIATE
-//!   envelope hygiene (no foreign IO inside; single-writer-per-FN
-//!   via SQLite WAL RESERVED-lock serialisation).  This is the W5
-//!   review axis 2 ("all writes through `WriteTxConn` /
-//!   `with_immediate`").
-//! - `seed_code_range` is the one exception: it is an **admin
-//!   seam** invoked outside the runtime write path (e.g., during
-//!   provisioning when an operator pushes a DPS-issued code range
-//!   into local storage).  It runs in autocommit on the pool — the
-//!   single INSERT OR IGNORE statement is itself atomic, and there
-//!   is no other writer to contend with at provisioning time.
+//! - **Every** mutating helper takes `&mut WriteTxConn<'_>` —
+//!   callers obtain it from a `with_immediate` closure, which
+//!   guarantees BEGIN IMMEDIATE envelope hygiene (no foreign IO
+//!   inside; single-writer-per-FN via SQLite WAL RESERVED-lock
+//!   serialisation).  This is the W5 review axis 2 ("all writes
+//!   through `WriteTxConn` / `with_immediate`") — no exceptions
+//!   for "admin seams"; if a future admin API wants pool-level
+//!   ergonomics, it wraps the tx-bound primitive in a service
+//!   method that opens `with_immediate` (see
+//!   [`crate::services::offline_session::OfflineSessionService::seed_code_range`]).
 //! - `list_pending_for_session` is a read; pool-bound.
 //!
 //! ## Typed-error surface (W5 review axis 4)
@@ -298,20 +296,26 @@ pub async fn transition_state(
     })
 }
 
-/// Admin seam.  Idempotent INSERT OR IGNORE for every
-/// `(fiscal_number, code_lnd)` in the inclusive range
-/// `[first_lnd ..= last_lnd]`.  Returns the count of rows actually
-/// inserted (i.e., the count of codes that were NOT already
-/// present).  An empty range (`first_lnd > last_lnd`) is a no-op
-/// returning 0.
+/// Idempotent INSERT OR IGNORE for every `(fiscal_number, code_lnd)`
+/// in the inclusive range `[first_lnd ..= last_lnd]`.  Returns the
+/// count of rows actually inserted (i.e., the count of codes that
+/// were NOT already present).  An empty range (`first_lnd > last_lnd`)
+/// is a no-op returning 0.
 ///
-/// Pool-bound (not transactional) because this is the
-/// provisioning seam — runs in autocommit, before the runtime
-/// write path is engaged, with no other writer to contend with.
-/// The single CTE-driven INSERT is itself atomic w.r.t. SQLite
-/// statement semantics.
-pub async fn seed_code_range(
-    pool: &SqlitePool,
+/// **Tx-bound** per W5 review axis 2: every write into
+/// `offline_codes` must run inside a `with_immediate` envelope.
+/// For service-layer ergonomics (admin / provisioning APIs that
+/// don't already hold a `WriteTxConn`), see
+/// [`crate::services::offline_session::OfflineSessionService::seed_code_range`]
+/// — that wrapper opens its own envelope and delegates here.
+///
+/// Operator review pin (PR #54 Round 1 HIGH, 2026-05-15): an
+/// earlier pool-bound shape was rejected as a discipline weakening.
+/// Even at provisioning time when there is no concurrent writer,
+/// keeping the primitive tx-bound preserves the compile-time
+/// invariant that the WriteTxConn seal enforces.
+pub async fn seed_code_range_tx(
+    tx: &mut WriteTxConn<'_>,
     fiscal_number: &str,
     first_lnd: i64,
     last_lnd: i64,
@@ -334,7 +338,7 @@ pub async fn seed_code_range(
     .bind(first_lnd)
     .bind(last_lnd)
     .bind(fiscal_number)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(res.rows_affected())
 }
@@ -408,10 +412,23 @@ pub async fn acquire_code_tx(
     }
 }
 
-/// All `fiscal_documents` rows tied to this session that are still
-/// in flight — i.e., NOT terminal (ACK / REJECTED / CANCELLED /
-/// REQUIRES_MANUAL_RECONCILIATION) and NOT the post-final
-/// `OFFLINE_LOCAL_ACK` (already locally durable, awaiting drain).
+/// All `fiscal_documents` rows tied to this session that are NOT
+/// in a terminal state.
+///
+/// **Non-terminal set** (9 states, returned):
+/// `PREPARED`, `SIGNED`, `ENCRYPTED`, `SENDING`, `SENT`, `KVT1`,
+/// `KVT2`, `ERROR_RETRYABLE`, `OFFLINE_LOCAL_ACK`.
+///
+/// **Terminal set** (excluded): `ACK`, `REJECTED`, `CANCELLED`,
+/// `REQUIRES_MANUAL_RECONCILIATION`.
+///
+/// `OFFLINE_LOCAL_ACK` IS included — it's the durable-local
+/// pre-drain state, and the W9 backlog-drain loop needs to see
+/// these rows to flip them through the online ladder
+/// (`OFFLINE_LOCAL_ACK → SENDING → SENT → KVT1 …`) after
+/// return-online.  Operator review pin (PR #54 Round 1 MED-1,
+/// 2026-05-15): the SQL is right, the prior docstring was wrong;
+/// covered by `list_pending_for_session_includes_offline_local_ack`.
 ///
 /// Ordered by `lnd ASC` so the drain stage can replay in fiscal
 /// chain order.  This is the input set for W7's `stage_offline_ack`

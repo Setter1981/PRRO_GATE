@@ -637,13 +637,17 @@ async fn service_abort_session_emits_audit_with_reason() {
     assert_eq!(row.0, "OFFLINE_SESSION_ABORTED");
     assert_eq!(row.1, "WARNING");
     let payload = row.2.expect("audit payload must be present");
-    assert!(
-        payload.contains("OPEN"),
-        "payload must mention from-state: {payload}"
-    );
-    assert!(
-        payload.contains("ABORTED"),
-        "payload must mention to-state: {payload}"
+    // Parse the payload as JSON so the assertions check structure,
+    // not just substring presence (operator pin PR #54 Round 1
+    // MED-2, 2026-05-15: the audit payload must carry the abort
+    // reason so the audit trail is operationally complete).
+    let v: serde_json::Value =
+        serde_json::from_str(&payload).expect("audit payload must be valid JSON");
+    assert_eq!(v["from"], "OPEN", "payload must mention from-state");
+    assert_eq!(v["to"], "ABORTED", "payload must mention to-state");
+    assert_eq!(
+        v["reason_abort"], "shift cutoff",
+        "OFFLINE_SESSION_ABORTED audit payload MUST include reason_abort verbatim"
     );
 }
 

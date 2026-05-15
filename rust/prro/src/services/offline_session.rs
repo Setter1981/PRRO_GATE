@@ -204,10 +204,18 @@ impl OfflineSessionService {
                 .await?;
                 if outcome == TransitionOutcome::Applied {
                     let id_hex = hex_lower(session_id.as_bytes());
+                    // Operator review pin (PR #54 Round 1 MED-2,
+                    // 2026-05-15): include `reason_abort` in the
+                    // ABORTED audit payload so the audit trail
+                    // captures the operator's rationale, not just
+                    // the bare from→to transition.  Non-ABORTED
+                    // transitions emit null for the field; this
+                    // keeps the audit payload schema uniform.
                     let payload = serde_json::json!({
                         "offline_session_id": id_hex,
                         "from": from.as_str(),
                         "to": to.as_str(),
+                        "reason_abort": reason_owned,
                     });
                     audit_log::append_tx(
                         tx,
@@ -221,6 +229,36 @@ impl OfflineSessionService {
                     .await?;
                 }
                 Ok::<TransitionOutcome, anyhow::Error>(outcome)
+            })
+        })
+        .await
+    }
+
+    /// Admin/provisioning seam: seed the FN-scoped code pool with
+    /// codes in the inclusive range `[first_lnd ..= last_lnd]`.
+    /// Idempotent via INSERT OR IGNORE.  Returns the count of rows
+    /// actually inserted.
+    ///
+    /// Pool-level ergonomic wrapper around the tx-bound
+    /// [`offline_sessions::seed_code_range_tx`] — opens its own
+    /// `with_immediate` envelope so admin callers don't need to
+    /// hold a `WriteTxConn` themselves.  Operator review pin (PR
+    /// #54 Round 1 HIGH, 2026-05-15): the seed primitive itself
+    /// MUST be tx-bound (W5 axis 2 discipline); pool-level
+    /// ergonomics live in the service layer.
+    pub async fn seed_code_range(
+        &self,
+        fiscal_number: &str,
+        first_lnd: i64,
+        last_lnd: i64,
+    ) -> anyhow::Result<u64> {
+        let fn_owned: String = fiscal_number.to_string();
+        with_immediate(&self.pool, move |tx| {
+            Box::pin(async move {
+                let inserted =
+                    offline_sessions::seed_code_range_tx(tx, &fn_owned, first_lnd, last_lnd)
+                        .await?;
+                Ok::<u64, anyhow::Error>(inserted)
             })
         })
         .await
