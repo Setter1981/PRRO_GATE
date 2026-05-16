@@ -485,9 +485,18 @@ pub fn spawn_probe_loop(
                                     "fiscal_number": &spec.fiscal_number,
                                     "error": format!("{e:#}"),
                                 });
+                                // W8b Round 1 LOW #3: anchor on
+                                // `return_online_probe` (generic
+                                // tick-source) — the underlying
+                                // `Err` may come from `node_state`
+                                // read OR from audit_log insert
+                                // inside the primitive; entity_type
+                                // = "node_state" would mis-attribute
+                                // the latter.  entity_id stays the
+                                // FN since the tick is per-FN.
                                 if let Err(audit_err) = audit_log::append(
                                     &pool,
-                                    "node_state",
+                                    "return_online_probe",
                                     &spec.fiscal_number,
                                     "RETURN_ONLINE_PROBE_LOOP_ERROR",
                                     Severity::Critical,

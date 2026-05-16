@@ -140,6 +140,13 @@ Validation contract: the field stores the raw operator value verbatim — the `D
   - `probe_respects_shutdown_signal_at_app_level` — boot → SIGTERM → clean task exit within bounded timeout.
   - `probe_audit_dedup_collapses_consecutive_same_class_failures` — N consecutive ticks against a same-class DPS failure → exactly one `_FAILED` row durably persisted (or one per M-tick refresh window), not N; first failure of a different class emits a fresh row.
 
+### 7b. W8b accepted residuals (PR #59 Round 1 review L1 + L2)
+
+Documented as residuals; **not** addressed in W8b.  Listed here so a future runtime-composition / probe-respawn task picks them up explicitly rather than re-discovering them.
+
+- **L1 — Clamp WARN audit dedup on respawn.**  `App::spawn_return_online_probe` currently emits the `RETURN_ONLINE_PROBE_INTERVAL_CLAMPED` WARN audit unconditionally on every call when `was_clamped == true`.  At W8b's single-boot caller this is one row per process; future runtime composition that re-spawns the probe on config reload would emit a duplicate WARN row per reload with the same payload.  **Why deferred**: the dedup decision (process-wide, per-App-lifecycle, or per-effective-config-hash) is a property of the lifecycle owner, which does not exist in the codebase yet.  Picking one now would constrain the future runtime-composition layer.  **When to fix**: when the first runtime-composition caller that re-spawns the probe lands; emit-once-per-effective-config (hash of clamped value + bounds) is the likely shape, but defer the choice to the lifecycle owner.
+- **L2 — Partial WARN audit trail on missing-signer-loop audit failure.**  `App::spawn_return_online_probe` walks configured FNs and emits a `RETURN_ONLINE_PROBE_FN_SKIPPED_NO_SIGNER` WARN audit per FN absent from `deps.fn_signs`.  These appends are NOT wrapped in a single `with_immediate` envelope: if the audit insert fails mid-iteration, the method returns `Err` and the probe never spawns, leaving the WARN rows for FNs already processed durably persisted as a partial trail.  **Why accepted**: this is a cold-boot forensic write path, not a fiscal state-transition path; a partial WARN trail is operationally clearer than silent suppression on audit failure.  Wrapping N+1 audit rows in one envelope to gain atomicity would force the App method to compose its own transaction and conflict with primitive-side `with_immediate` discipline.  **When to fix**: only if a future incident shows partial WARN rows mislead operator triage; otherwise leave as a documented behaviour.
+
 ## 8. Test plan
 
 Three acceptance tests (plan §Task 8 line 591-595):
