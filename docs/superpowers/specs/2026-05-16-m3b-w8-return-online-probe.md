@@ -128,12 +128,13 @@ Validation contract: the field stores the raw operator value verbatim — the `D
 
 ### 7a. W8b scope (deferred from W8a, closes §Task 8)
 
-- `App::boot` wires `spawn_probe_loop`: reads `clamped_probe_interval_seconds()`, enumerates `(Offline | GoingOffline)` FNs (or documents exact selection rule), constructs `Vec<ProbeSpec>`, owns the resulting `JoinHandle<()>` and the `watch::Sender<bool>`.
+- `App::boot` wires `spawn_probe_loop`: reads `clamped_probe_interval_seconds()`, enumerates **ALL configured FNs** (not just `(Offline | GoingOffline)` ones), constructs `Vec<ProbeSpec>`, owns the resulting `JoinHandle<()>` and the `watch::Sender<bool>`.  Rationale: `ProbeSpec` is frozen at spawn (per primitive §5), so a boot-time mode filter would orphan FNs that start `Online` and later transition to `Offline` — they would never be probed.  The tick-level mode re-read (operator hard line 5) already filters `Online` / `GoingOnline` cheaply BEFORE the wire call, so enumerating all FNs at boot is the correct selection rule and costs nothing in steady state.
 - `main` propagates shutdown into the watch::Sender on SIGINT / SIGTERM; the loop's clean-exit guarantee (test #7) is exercised end-to-end.
-- WARN audit on parse-time interval clamp (operator-supplied value outside `[5, 3600]`) emitted from the boot site, not from the primitive.
+- WARN audit on helper-side interval clamp (operator-supplied value outside `[5, 3600]`) emitted from the boot site, not from the primitive.  Boot reads the raw config field, passes it through `clamped_probe_interval_seconds()`, and emits the audit when `was_clamped == true`.
 - Loop-level error visibility (review MED #2): on `run_tick_for_fn` `Err(_)`, emit a CRITICAL `RETURN_ONLINE_PROBE_LOOP_ERROR` audit row in addition to `tracing::error!`; supervisor restart NOT required (loop already continues on next tick), but the operator must see a durable record.
 - Boot-level integration tests:
-  - `probe_does_not_spawn_for_online_fn` — Online-only FN list → no `_ATTEMPT` audit ever fires.
+  - `probe_no_attempt_audit_while_fn_is_online` — FN that starts `Online` produces zero `_ATTEMPT` audit rows across N ticks (validates tick-level skip-Online + the "enumerate all FNs" rule together).
+  - `probe_attempts_after_online_to_offline_flip` — FN that starts `Online` and is flipped to `Offline` mid-test gets its first `_ATTEMPT` audit on the next tick (validates that the "enumerate all" boot rule actually catches the late transition).
   - `probe_respects_shutdown_signal_at_app_level` — boot → SIGTERM → clean task exit within bounded timeout.
 
 ## 8. Test plan
@@ -144,9 +145,7 @@ Three acceptance tests (plan §Task 8 line 591-595):
 2. `return_online_probe_failure` — stub returns `Err(DpsError::Transport(...))`; mode unchanged; failed audit with `dps_error_class = "Transport"` (stable taxonomy mapped from variant name).
 3. `return_online_probe_idempotent` — first success flips to GoingOnline; second success on GoingOnline is no-op (no mode write, no duplicate `_SUCCESS` audit).
 
-Plus 1-2 boot-level integration tests:
-- `probe_does_not_spawn_on_online_fn` — Online FN; no `_ATTEMPT` audit ever fires.
-- `probe_respects_shutdown_signal` — shutdown channel triggers clean task exit; no panic.
+Plus the boot-level integration tests enumerated in §7a (W8b scope): `probe_no_attempt_audit_while_fn_is_online`, `probe_attempts_after_online_to_offline_flip`, `probe_respects_shutdown_signal_at_app_level`.  These exercise the "enumerate all configured FNs at boot, tick-level skip filters Online/GoingOnline" rule end-to-end.
 
 ## 9. Operator-pinned implementation hard lines (2026-05-16)
 
