@@ -1181,6 +1181,82 @@ async fn w9a_offline_local_ack_with_null_offline_fiscal_no_surfaces_typed_error(
     );
 }
 
+// ─── Fixture 6b''' — M3b W9a R2 LOW #1: offline_fiscal_no <= 0 ────────
+
+#[tokio::test]
+async fn w9a_offline_local_ack_with_non_positive_offline_fiscal_no_surfaces_typed_error() {
+    // M3b W9a Round 2 LOW #1 fix: producer-side W7a writes
+    // `offline_fiscal_no = consumed code_lnd`, and `offline_codes`
+    // carries a schema CHECK `code_lnd > 0` — so a positive value
+    // is guaranteed by the W7a path.  `fiscal_documents.offline_fiscal_no`
+    // itself has no CHECK (migrations/002_fiscal_documents.sql:25),
+    // so a raw-SQL bypass or future schema regression could leak `0`
+    // / negative.  Stage_send::run must surface
+    // `OfflineFiscalNoNonPositive` BEFORE any CAS / wire side
+    // effect, distinguishing it from the NULL case
+    // (`OfflineFiscalNoMissing`) for forensic clarity.
+    //
+    // Parametrised across the realistic non-positive set
+    // (0 + negative) to prove the guard handles `<= 0` not just
+    // `== 0`.
+    let (_d, pool) = fresh_pool().await;
+    let cases: Vec<(u8, i64)> = vec![(0xC4, 0), (0xC5, -1)];
+    for (byte_seed, bad_offline_fiscal_no) in cases {
+        let doc = seed_signed_doc_with_xml(
+            &pool,
+            byte_seed,
+            "SELL",
+            byte_seed as i64,
+            "OFFLINE_LOCAL_ACK",
+        )
+        .await;
+        // Backfill offline_fiscal_no = 0 (or -1) directly via raw
+        // UPDATE.  This is the producer-side invariant breach the
+        // guard exists to catch — the row is otherwise W7a-shaped
+        // (state is OFFLINE_LOCAL_ACK) but the column carries an
+        // invalid payload.
+        sqlx::query("UPDATE fiscal_documents SET offline_fiscal_no = ? WHERE document_id = ?")
+            .bind(bad_offline_fiscal_no)
+            .bind(doc)
+            .execute(&pool)
+            .await
+            .expect("backfill non-positive offline_fiscal_no");
+        let stub = StubDpsChannel::new(Ok(ack("SHOULD-NEVER-BE-USED")));
+
+        let err = stage_send::run(&pool, &stub, doc, None)
+            .await
+            .expect_err("non-positive offline_fiscal_no on OfflineLocalAck must fail");
+        match err {
+            stage_send::StageSendError::OfflineFiscalNoNonPositive {
+                document_id,
+                observed,
+            } => {
+                assert_eq!(
+                    document_id, doc,
+                    "case n={bad_offline_fiscal_no}: document_id"
+                );
+                assert_eq!(
+                    observed, bad_offline_fiscal_no,
+                    "case n={bad_offline_fiscal_no}: observed"
+                );
+            }
+            other => panic!(
+                "case n={bad_offline_fiscal_no}: expected OfflineFiscalNoNonPositive, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            stub.call_count(),
+            0,
+            "case n={bad_offline_fiscal_no}: no wire call before W7a invariant guard fires"
+        );
+        assert_eq!(
+            read_doc_state(&pool, doc).await,
+            "OFFLINE_LOCAL_ACK",
+            "case n={bad_offline_fiscal_no}: no state mutation before the guard fires"
+        );
+    }
+}
+
 // ─── Fixture 6c — non-{Signed, ErrorRetryable, OfflineLocalAck} short-circuits ────────
 
 #[tokio::test]
