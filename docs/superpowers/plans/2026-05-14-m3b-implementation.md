@@ -2,6 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers-extended-cc:subagent-driven-development` (recommended) or `superpowers-extended-cc:executing-plans` to execute this plan task-by-task.
 
+> **M3b shift state expansion design freeze landed 2026-05-17 (PR #63 merged at `e04031b`):** `docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md` is the **authoritative state-machine + recovery contract** for tasks below. Key cross-references:
+> - **Task 5 (W5 OfflineSession state machine)**: align with §3.1 9-state ShiftState enum + §3.3 online-ops-resume rule (drain-completion precondition for `OpenedLocalPendingDrain → Opened`).
+> - **Task 6 (W6 DocState whitelist)**: align with §16.1 DB-vs-log separation pin — `OFFLINE_LOCAL_ACK` is durable customer-receipt-issued state; failed DPS rejections go to `audit_log` only.
+> - **Task 7 (W7 stage_offline_ack)**: per §16.11 — offline docs unsigned at ingress; sign at drain time.
+> - **Task 8 (W8 return-online probe)**: per §16.21 — single probe success → `Offline → GoingOnline`; W9b drain completion → `Online`. NO 2-consecutive guard (richer state model handles it).
+> - **Task 9 (W9 backlog drain)**: per §6.3 universal `EscalateManual` on drain reject (real Manual recon trigger per §16.7).
+> - **Task 10 (W10 policy guard)**: per §16.5 36h offline ingress cap + §7 reserve=2 for offline SHIFT_OPEN; W10a + W10b split per §12.
+> - **W14a impl PR** (post-this-plan): migration 016 (9-state expansion + `shifts.opened_by_cashier_id` NOT NULL + `shifts.closed_by_cashier_id` + `cashier_certs.deferred_cert_id` per §16.17) + enum + repository + scanner test + W14a-to-W10b bridge per §11.
+
 **Goal.** Land the Rust **offline subsystem** sufficient to discharge `docs/PILOT_ACCEPTANCE_TEST_PLAN.md` Phase 6 ("Offline With One Fiscal Number") in the pilot dossier, *plus* close four structural M3a carry-forwards that affect production resilience: raw-CAS helper promotion, dedicated `first_kvt1_at` column, module-level single-writer enforcement, and W0b-scoped in-drain KVT2 confirmation.  Exit with: offline session lifecycle + `OFFLINE_LOCAL_ACK` transition whitelist + Pattern C stage-and-flip + **W10 offline shift close/open policy guard (ONLINE Z-report block + OFFLINE local Z_REPORT close — see `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0)** + return-online detection + idempotent backlog sync — all under W11-extended deterministic replay covering offline crash points.
 
 **Non-regression invariant (load-bearing).**  M3a ONLINE happy path stays baseline.  The 5-stage write path MUST NOT break.  W11 deterministic replay (21/21 fixtures green on `e183b82`) MUST stay green.  Every M3b task adds tests; no M3b task removes or skips an M3a test.

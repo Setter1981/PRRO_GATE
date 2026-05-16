@@ -76,16 +76,21 @@ Ingress script (scripts/run_*.py)
 **Persistence:** SQLite WAL (`repositories/`) — sole source of truth. Lease model ensures single-writer per `fiscal_number`. Migration runner uses checksum verification (`migrations/runner.py`).
 
 **State machines to know:**
-- Document: `PREPARED → SIGNED → ENCRYPTED → SENT → KVT1 → KVT2 → ACK / REJECTED / ERROR_*`
-- Shift: `CREATED → OPENING → OPENED → CLOSING → CLOSED / ERROR`
+- Document: `PREPARED → SIGNED → ENCRYPTED → SENT → KVT1 → KVT2 → ACK / REJECTED / ERROR_*` (M3a Pattern B happy path). M3b Pattern C adds `OFFLINE_LOCAL_ACK` as durable offline state preceding drain.
+- Shift (M3b 9-state expansion per `docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md`): `Created → Opening → OpenedLocalPendingDrain → Opened → ClosingLocalPendingDrain → Closing → Closed / RequiresManualReconciliation / Error`. Manual reconciliation is "ЧП из ЧП" (extremely rare per 4-year operator empirics); EscalateManual reserved for truly unrecoverable cases — most failures route to AutoOfflineFallback / TechSupportEscalation / KeyRotationPending / MacReseedRecovery / TechSupportRepair recovery classes.
 - Offline session: `OPENING → OPEN → CLOSING → CLOSED / ABORTED`
 - Node: `ONLINE / GOING_OFFLINE / OFFLINE / GOING_ONLINE / BLOCKED / STOP_MODE / CRYPTO_DEGRADED`
+
+**Persistence model** (M3b architectural pin): `fiscal_documents` table is a **ledger of issued receipts only** — failed DPS rejections + invalid ingress payloads go to `audit_log` only, NOT to `fiscal_documents`. Transport-class failures persist as `Sending` / `ErrorRetryable` for crash-recovery. Manual recon triggers narrow to (a) FN deregistered while offline with OFFLINE_LOCAL_ACK backlog, (b) ambiguous wire timeout on online SHIFT_OPEN / Z_REPORT, (c) operator-driven force seam.
 
 **Crypto:** pluggable — `passthrough` (dev) or `sidecar` HTTP proxy (prod), configured in `config.yaml → crypto.provider`.
 
 **Health endpoints:** `/health/live`, `/health/ready` (post-recovery), `/health/startup`; metrics at `/metrics`.
 
-**Key docs:** `docs/Multi-Protocol_PRRO_Gateway.md` — technical specification with full state machines and contract testing strategy.
+**Key docs:**
+- `docs/Multi-Protocol_PRRO_Gateway.md` — primary technical specification (M2/M3a baseline; M3b state expansion supersedes §9/§11 shift lifecycle wording).
+- `docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md` — M3b shift state machine 9-state authoritative spec (§16 contains Round 8-9 operational reality alignment overriding earlier §§3-15 where they conflict).
+- `docs/LEGAL_INVARIANTS.md` — legal invariants (INV-01 through INV-16) — INV-03/04 align with M3b 9-state shift; INV-08-INV-14 use `OFFLINE_LOCAL_ACK` (M3b naming) for Pattern C durable offline state.
 
 ---
 

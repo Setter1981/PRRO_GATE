@@ -2,6 +2,8 @@
 
 **Status:** W0 research phase closed (commits `18e2247`, `f8ec32c`, `9455ed4`, `dec9f62` on `rust-gateway`).  3 spec docs landed (~3760 lines, ~120 path:line citations).  This handoff is the **gate document** — M3a implementation plan MUST NOT open until this handoff is approved.
 
+> **M3b update 2026-05-17 (PR #63 merged at `e04031b`):** ADR-A9 (`DocState::Sending` + migration `008_doc_state_sending.sql`) referenced below remains valid. ADR-A6 (DpsError routing class taxonomy) is **refined by M3b**: the binary `EscalateManual` default for unknown errors is REPLACED with a 5-class recovery taxonomy (`AutoOfflineFallback` / `TechSupportEscalation` / `KeyRotationPending` / `MacReseedRecovery` / `TechSupportRepair`) per `docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md` §16.3. Unknown DPS errors → `AutoOfflineFallback` (auto-switch to OFFLINE + tech support notify), NOT Manual recon.
+
 **Sources cited (do not re-summarise here):**
 - `docs/superpowers/specs/2026-05-06-m3-w0-1-state-sequence.md` (W0-1)
 - `docs/superpowers/specs/2026-05-06-m3-w0-2-lock-discipline.md` (W0-2)

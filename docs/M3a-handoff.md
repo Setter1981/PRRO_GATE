@@ -2,6 +2,8 @@
 
 **Status:** M3a implementation phase closed + post-handoff hardening passes 1, 2, and 3 landed.  rust-gateway HEAD = `c12ba61` (Merge PR #41 from Setter1981/m3a/boot-quickcheck-two-phase).  All 12 plan tasks marked `completed` in commit `08fc6c4`.  Full crate test surface: **463 passed / 0 failed / 1 ignored** across 27 integration test files; **21 W11 deterministic-replay fixtures green** (9 original + 8 hardening-pass-1 + 4 hardening-pass-2); 4 quick_check fail-closed fixtures un-ignored under the two-phase open path.  Only ignored entry remaining is 1 illustrative markdown ` ```ignore ` doc-test (documentation, not a deferred test).
 
+> **M3b update 2026-05-17 (PR #63 merged at `e04031b`):** Carry-forwards listed below remain valid as M3b prerequisites. M3b additionally expands the recovery classification space beyond M3a's binary `Rejected` / `RequiresManualReconciliation` endpoint to include 5 new recovery classes (`AutoOfflineFallback` / `TechSupportEscalation` / `KeyRotationPending` / `MacReseedRecovery` / `TechSupportRepair`) per `docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md` §16.3. M3b also adds 1-cashier-per-shift invariant (`shifts.opened_by_cashier_id` NOT NULL — REVERSES Round 6 B-M5 inference; per §16.8) + 36h cert-expiry SHIFT_OPEN gate with deferred key swap (per §16.10, WebCheck-validated).
+
 This handoff is the **gate document** — M3b implementation plan MUST NOT open until this handoff is approved.  Mirrors the M3-W0 handoff pattern (`docs/M3-W0-handoff.md`).
 
 **Sources cited (do not re-summarise here):**

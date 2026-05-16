@@ -4,6 +4,8 @@
 breakdown.  Not yet a plan; M2 plan (`docs/superpowers/plans/2026-MM-DD-…`)
 must not be written until this ADR is reviewed.
 
+> **M3b update 2026-05-17 (PR #63 merged at `e04031b`):** ADR-M2-1..M2-6 + ADR-M3-A1..A10 (committed `8c72a14` + `bbd9e29`) remain valid as architectural baseline. M3b adds the shift state expansion design freeze (`docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md`) as a **spec freeze**, not a new ADR — it doesn't replace any existing ADR. It does refine ADR-A6 (DpsError routing class taxonomy): the binary `EscalateManual` default for unknown errors is REPLACED with a 5-class recovery taxonomy (`AutoOfflineFallback` / `TechSupportEscalation` / `KeyRotationPending` / `MacReseedRecovery` / `TechSupportRepair`) per §16.3.
+
 **Scope:** decisions that have to be locked before any code lands on
 `rust/prro/src/crypto/`, `rust/prro/src/transports/`, write-path
 staging, or test-vector capture.
