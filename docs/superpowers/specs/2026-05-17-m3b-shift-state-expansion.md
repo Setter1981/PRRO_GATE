@@ -69,7 +69,7 @@ str_enum!(ShiftState {
 | State | Wire | Operator UI collapses to | Ops permitted | Recovery branch |
 |---|---|---|---|---|
 | Created | `CREATED` | "starting" | none | new shift not yet committed |
-| Opening | `OPENING` | "opening" | none (anti-ops) | online open in flight; if rejected → Opened on `DocumentReject`, else manual |
+| Opening | `OPENING` | "opening" | none (anti-ops) | online open in flight; Ack on any attempt → Opened (edge 3).  Recoverable rejection (operator re-issues SHIFT_OPEN with corrected payload) keeps shift in Opening — the retry-loop is doc-state-machine territory, not a shift edge.  Hard reject or operator-driven give-up → RequiresManualReconciliation (edge 4) |
 | **OpenedLocalPendingDrain** | `OPENED_LOCAL_PENDING_DRAIN` | "opened" | **offline ops only** (see §3.3) | drain-driven; → Opened on `SHIFT_OPEN` final ACK; → manual on drain reject |
 | Opened | `OPENED` | "opened" | all fiscal ops | M3a happy path |
 | **ClosingLocalPendingDrain** | `CLOSING_LOCAL_PENDING_DRAIN` | "closing" | none (post-local-close lockout) | drain-driven; → Closed on `Z_REPORT` final ACK; → manual on drain reject |
@@ -130,10 +130,10 @@ Total: **14 edges** (HIGH-fix Round 1 — the earlier "Opening → Opened on Doc
 - **No blanket `Closing → Opened`**: see §6 — only `Authorization::DocumentReject` warrants rollback.  Hard rejects + drain rejects route to `RequiresManualReconciliation`.
 - **No `ClosingLocalPendingDrain → Opened`**: once an offline `Z_REPORT` lands `OFFLINE_LOCAL_ACK`, the shift cannot rollback to `Opened` automatically.  Local Pattern C commitment + post-local-close lockout are durable; only operator-driven `force_*` seam can undo, with full audit trail.
 - **No `OpenedLocalPendingDrain → Closed` directly**: the only path to `Closed` from a locally-opened shift is via `ClosingLocalPendingDrain` (offline `Z_REPORT` first) or through full drain to `Opened` + then `Closing → Closed` (online close after drain).  Skipping `ClosingLocalPendingDrain` would mean the close happened without a `z_report_document_id` link.
-- **No edge ever fires from drain ACK of a non-`Z_REPORT` doc**: backlog drain ACKs for `SELL` / `RETURN` / `SERVICE_*` / `SHIFT_OPEN` are doc-state transitions only; shift state stays in whichever locally-pending state it was in (`OpenedLocalPendingDrain` or `ClosingLocalPendingDrain`).  Only the close-`Z_REPORT` ACK (final backlog doc per ordering rule) advances the shift to `Closed` — and only when predicate §4.3 holds.
+- **While in `ClosingLocalPendingDrain`, drain ACK of a non-`Z_REPORT` doc does NOT fire a shift edge** (HIGH-fix Round 2): drain ACKs for `SELL` / `RETURN` / `SERVICE_*` / offline `SHIFT_OPEN` on the close-path are doc-state transitions only; the shift stays in `ClosingLocalPendingDrain` until the close `Z_REPORT` itself ACKs AND predicate §4.3 holds.  Only then edge 13 (`→ Closed`) fires.  This forbidden pattern is **scoped to `ClosingLocalPendingDrain`** — it does NOT apply to `OpenedLocalPendingDrain`, where edge 5 (`→ Opened`) is precisely triggered by `SHIFT_OPEN` drain ACK + empty trailing backlog.
 - **No `OpenedLocalPendingDrain → Opening`**: state graph is forward-only on the open-side; can't "downgrade" a locally-committed open back to an online-intent state.
 
-### 4.3 Force-error / manual seam
+### 4.5 Force-error / manual seam
 
 ```rust
 // rust/prro/src/db/repositories/shifts.rs (proposed)
@@ -164,19 +164,58 @@ If `node_state.shift_state` is inconsistent with `shifts.state` post-recovery, t
 
 ## 6. Closing recovery taxonomy (narrow whitelist)
 
-Reuses the `RetryClass` taxonomy already established by `fiscal_documents` W10.x dispatcher (`rust/prro/src/services/write_path/error_routing.rs`):
+> **Round 2 HIGH fix (2026-05-17):** This section originally proposed to reuse `RetryClass` from `fiscal_documents` W10.x dispatcher (`rust/prro/src/services/write_path/error_routing.rs`) as the discriminator for the `Closing → Opened` vs `Closing → RequiresManualReconciliation` decision.  That mapping was **dangerous**: `RetryClass::TerminalReject` is a *coarse* class assigned to multiple DPS rejection shapes — not only `DpsError::Authorization { kind: DocumentReject }` (genuinely operator-recoverable by re-issue) but also `Server { -1 else branch }` (verify failure with Critical severity, lines 411-417), `Server { code in -5/-7/-8/-9/-10 }` (XML/builder hard-rejects, Critical, line 437), and `Server { code: -11 }` (168h legal limit, node→`Blocked`, Critical, line 460).  Routing all of those back to `Opened` would re-open a shift on a hard-reject — exactly the catastrophic case this design exists to prevent.  Reverse-classification on the W10.x dispatcher's `RetryClass` cannot be safe because it strips the discriminating information (the underlying `DpsError` variant + the server code) that determines whether re-issue is meaningful.
 
-| `RetryClass` of last close-doc attempt | Shift recovery branch |
-|---|---|
-| `TransientRetry` | stay in `Closing`; W9b-style retry (online send wrapper) re-attempts |
-| `TerminalReject` (Authorization::DocumentReject) | `Closing → Opened` — operator can re-issue close with corrected payload |
-| `FnConfigError` | `Closing → RequiresManualReconciliation` — FN config breach; operator must rotate creds |
-| `WrapperBug` | `Closing → RequiresManualReconciliation` — wrapper-internal failure |
-| `ProbeRequired` | hold in `Closing` (in-drain probe path); W9b/W12 handles |
-| `MacRecovery` | hold in `Closing` (orchestrator runs); after MAC recovery either continues or escalates |
-| `OperatorEscalation` | `Closing → RequiresManualReconciliation` |
+### 6.1 `ShiftCloseRecoveryClass` — typed, shift-specific
 
-For drain-rejected docs on `ClosingLocalPendingDrain` or `OpenedLocalPendingDrain` paths: drain-side reject ALWAYS routes to `RequiresManualReconciliation` regardless of `RetryClass`.  Rationale: drain has already crossed the local-commit threshold; ordinary retry would mean re-sending an offline-acked doc through the wire, which has different semantics (need `lastChk` evidence per W12 to confirm whether DPS actually accepted).  Manual reconciliation is the safer landing.
+The shift-close recovery decision uses a separate, narrower taxonomy.  Implementation PR adds an enum (proposed name; final pinned in impl):
+
+```rust
+// rust/prro/src/services/write_path/shift_close_recovery.rs (proposed location)
+#[non_exhaustive]
+pub enum ShiftCloseRecoveryClass {
+    /// W9b-style retry continues; shift stays in Closing.  Caller MUST
+    /// be prepared for the next-tick wrapper to re-attempt.
+    HoldRetry,
+    /// Operator-recoverable: the rejected close doc can be re-issued
+    /// with corrected payload (DocumentReject specifically — signature /
+    /// cert / canonical-payload re-build).  Shift rolls back Closing →
+    /// Opened so a new close attempt can land.
+    RollbackToOpened,
+    /// Terminal but recoverable via operator action: hard rejects, FN
+    /// config breach, 168h limit breach, builder bugs, wrapper bugs,
+    /// id mismatch.  Shift advances Closing → RequiresManualReconciliation.
+    EscalateManual,
+    /// MAC-recovery orchestrator is running; hold until it completes,
+    /// then re-classify.
+    MacRecoveryInProgress,
+}
+```
+
+### 6.2 Classification — by `DpsError` variant, NOT by `RetryClass`
+
+Implementation MUST classify by matching the underlying `DpsError` variant + (where applicable) `AuthorizationKind` + the wire `code` field — NOT by reading `RoutingDecision.retry_class` from the doc-state-machine layer.
+
+| Underlying error | `ShiftCloseRecoveryClass` | Shift edge |
+|---|---|---|
+| `DpsError::Transport(_)` (after `stage_send` wire-loop budget reaches retry ceiling) | `HoldRetry` | none — stays `Closing` |
+| `DpsError::Authorization { kind: DocumentReject, .. }` | `RollbackToOpened` | `Closing → Opened` (edge 11) — operator re-issues close |
+| `DpsError::Authorization { kind: FiscalNumberNotRegistered, .. }` | `EscalateManual` | `Closing → RequiresManualReconciliation` (edge 12) |
+| `DpsError::Server { code: -1 }` (verify failure branch, NOT mapped to `DocumentReject`) | `EscalateManual` | `Closing → RequiresManualReconciliation` |
+| `DpsError::Server { code: -5 / -7 / -8 / -9 / -10 }` (XML / builder hard-rejects) | `EscalateManual` | same |
+| `DpsError::Server { code: -11 }` (168h cumulative-offline limit; node→`Blocked`) | `EscalateManual` | same |
+| `DpsError::Server { code: -6 }` (`ERROR_NOT_PREV_ZREPORT`, operator-recoverable) | `EscalateManual` | same — operator must close the prior Z first |
+| `DpsError::Server { code: -3 }` (transient retry) | `HoldRetry` | none |
+| `DpsError::Decode(_)` | `EscalateManual` | upstream-contract drift; investigate manually |
+| `DpsError::ServerFiscalIdMismatch { .. }` | `EscalateManual` | reconciliation territory |
+| `DpsError::Internal(_)` / `QueryNotSupported(_)` | `EscalateManual` | wrapper-side bug — fix code |
+| Doc state observed in `MacRecovery` orchestrator run | `MacRecoveryInProgress` | hold; re-classify after orchestrator completes |
+
+The decision MUST be made on the actual `DpsError` (from `transport_trace` or directly from the wire response that triggered the close-doc state transition).  Implementation MUST NOT short-circuit on `retry_class == TerminalReject` because that bucket conflates `DocumentReject` (rollback-safe) with `Server -5/-7/-8/-9/-10/-11` (catastrophic if rolled back).
+
+### 6.3 Drain-side rejection — universal `EscalateManual`
+
+For docs rejected during W9b drain on `ClosingLocalPendingDrain` or `OpenedLocalPendingDrain` paths: ANY rejection routes to `EscalateManual` regardless of the wire-side `DpsError`.  Rationale: drain has already crossed the local-commit threshold (the doc is `OFFLINE_LOCAL_ACK` durable); ordinary `RollbackToOpened` semantics don't apply — re-issue would mean re-sending an offline-acked doc through the wire, which has different idempotency / `lastChk`-evidence shape (W12 territory).  Manual reconciliation is the only safe landing.
 
 ## 7. Reserve rule extension (W10 docs follow-up)
 
@@ -347,7 +386,7 @@ cargo test -p prro --features test-support  # full suite — no regressions
 ```
 
 **Acceptance criteria**:
-1. 9-state `ShiftState` enum in code + 15-edge whitelist.
+1. 9-state `ShiftState` enum in code + 14-edge whitelist (drift-guard contract — locked-count test enforces the exact number).
 2. Migration rebuilds both `shifts` + `node_state` CHECK constraints atomically.
 3. No silent path to `Error` / `RequiresManualReconciliation` from `transition_state`.
 4. `force_to_error_with_audit` seam exists + audited per §8.
@@ -355,19 +394,42 @@ cargo test -p prro --features test-support  # full suite — no regressions
 6. Full M3a + M3b regression suite green (no fixture rewrites required by this expansion).
 7. `node_state.shift_state` mirror invariant preserved by tests (existing `tests/node_state_*` extended to cover new states).
 
-## 12. W10 policy guard PR shape (deferred — separate freeze later)
+## 12. W10 phasing — W10a (policy) + W10b (offline `SHIFT_OPEN` wiring)
 
-After implementation PR lands.  W10 policy guard (per `docs/superpowers/plans/2026-05-14-m3b-implementation.md` §Task 10) coded directly against the 9-state model:
+> **Round 2 MED-fix (2026-05-17):** the freeze originally deferred offline `SHIFT_OPEN` ingress wiring to "post-W10", but W10's reserve=2 rule for offline `SHIFT_OPEN` would have no caller without that ingress — dead policy.  W10 splits into two slices in the W7a/W7b pattern.
 
-- `PolicyDecision::AllowOfflineLocalClose` references `ShiftState::OpenedLocalPendingDrain` and `Opened` both as valid sources.
-- `PolicyDecision::RefuseAfterLocalClose` applies for `ClosingLocalPendingDrain` (post-local-close lockout).
-- `PolicyDecision::RefuseShiftOpenPendingDrain` (new) — refuses online op when shift in `OpenedLocalPendingDrain` and node mode Online/GoingOnline.
-- W10 acceptance tests reference the new states; no rewrites needed because W10 hasn't been coded yet.
+After the implementation PR lands (`m3b/shift-state-expansion-impl` per §11), W10 implementation proceeds as **two PRs**:
+
+### 12.1 W10a — policy guard primitive (no offline `SHIFT_OPEN` ingress yet)
+
+- New `services::offline_guard::evaluate_z_report_policy(pool, fiscal_number, requested_doc_type) → PolicyDecision`.
+- `PolicyDecision` variants: `AllowOnline`, `AllowOfflineLocalClose`, `RefuseOnlineBacklogPending`, `RefuseOfflineNoCode`, `RefuseAfterLocalClose`, `RefuseShiftOpenPendingDrain` (new — refuses online op when shift in `OpenedLocalPendingDrain` and node mode `Online`/`GoingOnline`).
+- Reserve checks:
+  - close-reserve = 1 (PR #62 rule) — `OFFLINE_CODE_RESERVED_FOR_CLOSE` audit.
+  - **offline `SHIFT_OPEN` gate = pool ≥ 2** (specified per §7) — the policy *seam* is implemented in W10a, but it can only refuse with `OFFLINE_SHIFT_OPEN_REFUSED_INSUFFICIENT_RESERVE` if and when an offline `SHIFT_OPEN` request reaches it.  In W10a no caller yet routes offline `SHIFT_OPEN` through this evaluation; the gate exists as a *typed seam waiting for its caller*, not as an active path.
+- W10a fixtures verify policy decisions on a stub-driven ingress (no `stage_offline_ack` integration); the offline `SHIFT_OPEN` reserve check is fixture-only proof, not production-active.
+- `stage_acquire`, `stage_offline_ack`, `boot_phase` arms for `OpenedLocalPendingDrain` / `ClosingLocalPendingDrain` / `RequiresManualReconciliation` are wired (matches shift-state-expansion-impl from §11), but the **doc_type discriminator** for offline `SHIFT_OPEN` is left out of `stage_offline_ack` until W10b.
+- W10a acceptance tests reference the new states; no rewrites because W10 hasn't been coded yet.
+
+### 12.2 W10b — offline `SHIFT_OPEN` ingress + stage_offline_ack extension
+
+- `stage_offline_ack::run` extended to accept `DocType::ShiftOpen` source (today only `SELL` / `RETURN` / `SERVICE_*` / `Z_REPORT`).  Pattern C landing: SHIFT_OPEN doc → `OFFLINE_LOCAL_ACK`; shift state edge `Created → OpenedLocalPendingDrain` (edge 2 per §4.1) fires inside the same `with_immediate` envelope.
+- Ingress / write-path wiring routes offline `SHIFT_OPEN` through the W10a policy guard *before* reaching `stage_offline_ack` — reserve=2 check becomes active and `OFFLINE_SHIFT_OPEN_REFUSED_INSUFFICIENT_RESERVE` (Critical) starts firing on real attempts.
+- `boot_phase` recovery branch for `OpenedLocalPendingDrain` populated to actually drive the offline `SHIFT_OPEN` doc through W9b drain on return-online (W10a stubbed the arm; W10b lights it up).
+- W10b fixtures cover the full offline-open path end to end:
+  - `w10b_offline_shift_open_landed_local_ack` — pool=2; offline SHIFT_OPEN consumes 1; shift → `OpenedLocalPendingDrain`; reserve check confirms pool=1 remaining = close-reserve floor.
+  - `w10b_offline_shift_open_refused_pool_1` — pool=1 (less than reserve=2 gate); refusal + `OFFLINE_SHIFT_OPEN_REFUSED_INSUFFICIENT_RESERVE` Critical audit.
+  - `w10b_offline_shift_open_drain_acks_lands_opened` — happy path: drain SHIFT_OPEN to Ack with empty trailing backlog → shift edge 5 fires → `Opened` after node mode `GoingOnline → Online`.
+  - `w10b_offline_shift_open_drain_rejects_lands_manual` — edge 6 fires → `RequiresManualReconciliation`; orphan offline SELL/RETURN docs on the shift remain queryable for operator compensation.
+
+### 12.3 W10a→W10b sequencing rationale
+
+W10a alone is reviewable as "policy decision seam + integration with existing stage_acquire / stage_offline_ack / boot_phase arms".  W10b adds the offline `SHIFT_OPEN` doc-type ingress + the recovery drive — a distinct change surface (touches doc-type whitelist + new ingress validation + drain recovery path).  Splitting matches the W7a/W7b pattern and keeps review focused per slice.  W10b is **mandatory follow-up** before §Task 10 in the plan is considered closed; W10a alone does not satisfy the offline-shift-open use case.
 
 ## 13. Out of W14a (this freeze) scope (deferred)
 
 - **State machine is channel-neutral.**  Transport-specific drain evidence (`lastChk` ticket on WebCheck/gRPC vs `/fs/pck` package response on DFS) remains backend-specific; the state machine model is shared across WebCheck/gRPC and future DFS HTTP/XML channels.  Per-channel transport adapter consumes the same state transitions; only the evidence shape that triggers `OpenedLocalPendingDrain → Opened` (or → `RequiresManualReconciliation` on reject) varies by channel.  DFS-side adapter when it lands does not require state machine changes.
-- **Offline `SHIFT_OPEN` ingress wiring.**  `stage_offline_ack` currently routes `SELL` / `RETURN` / `SERVICE_*` / `Z_REPORT`; extending to accept `SHIFT_OPEN` doc_type is a separate task (post-W10).  This freeze defines the target state model; the ingress + stage wiring follows.
+- **Offline `SHIFT_OPEN` ingress wiring** is **W10b** per §12.2 — NOT deferred indefinitely.  `stage_offline_ack` extension to accept `DocType::ShiftOpen` lands in the W10b follow-up immediately after the W10a policy-guard PR.  W10a's reserve=2 gate exists as a typed seam that becomes production-active when W10b wires the caller.  §Task 10 in the plan is closed only after W10b merges; W10a alone is insufficient for the offline-shift-open use case.
 - **W12 KVT2 confirmation extension** for `SHIFT_OPEN`.  W12 currently confirms `Sent → Kvt1 → Kvt2 → Ack` for fiscal docs; the same shape applies to drained `SHIFT_OPEN`.  Implementation detail for the W12 follow-up; freeze flags it but doesn't specify.
 - **Operator UI / dashboard convention.**  Producing collapsed-3-state operator-facing UI vs 9-state forensic dashboard is an operations concern, not a state-machine design concern.  Documented as a recommendation; out of scope to enforce.
 - **DFS-channel state mapping.**  Same — channel-neutral state model means DFS adapter inherits the state machine; freeze does not pre-specify the DFS-side drain evidence shape.
@@ -380,7 +442,7 @@ After implementation PR lands.  W10 policy guard (per `docs/superpowers/plans/20
 | Cognitive load on operators reading 9 states | Operator UI collapses to 3 (opened/closing/closed); forensic dashboards expand to 9 |
 | Force-error seam misused as escape hatch | `tests/shifts_no_silent_error_paths.rs` scanner test enforces only the seam reaches Error/Manual |
 | `node_state.shift_state` drift from `shifts.state` | Existing mirror-write discipline + tests pin the invariant; expanded states preserve same writer |
-| Whitelist matrix size grows (5→15 edges) | Locked-edge count test prevents accidental additions; same shape as `fiscal_documents` W6 pattern |
+| Whitelist matrix size grows (5→14 edges) | Locked-edge count test prevents accidental additions; same shape as `fiscal_documents` W6 pattern |
 | New audit Critical events flood dashboards under sustained outage | Future audit-dedup rule (PR #62 §7b L3 residual) addresses cardinality independently of state machine |
 | Code paths that pattern-match on `ShiftState` break with new variants | Rust exhaustive `match` enforces compile-time coverage; non-exhaustive paths surface as compiler errors at impl PR time |
 
