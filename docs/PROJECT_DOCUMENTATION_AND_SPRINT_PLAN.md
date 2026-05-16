@@ -102,7 +102,7 @@ Baseline test state (2026-04-15, Sprint 10 wave 2):
 
 - `pytest -q` result: `586 passed, 0 failed`;
 - ФСКО protocol complete: `<D>/<S>` discounts, `<L>` comments, `<EPZ>` Z-report, `<E>` full attrs, `<CA>`, `<CZD>`;
-- all P0 legal gaps closed: `OFFLINE_LOCAL_ACK`, `OfflineSyncService`, Z-report offline backlog guard, receipt validator;
+- all P0 legal gaps closed: `OFFLINE_LOCAL_ACK`, `OfflineSyncService`, Z-report offline backlog guard *(Python-era — blanket-blocker shape; superseded by the M3b W10 ONLINE-vs-OFFLINE-distinguished policy in the Rust gateway, see `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0)*, receipt validator;
 - full fiscal lifecycle E2E test: SHIFT_OPEN → SELL → SELL → SERVICE_IN → SERVICE_OUT → RETURN → Z_REPORT.
 
 ## 5. High-Level Architecture
@@ -873,7 +873,7 @@ Minimum acceptance tests before pilot:
 - DPS PRRO fiscal server channel can submit/poll mocked fiscal documents;
 - reconciliation preserves original submission channel;
 - cross-channel retry during an open shift is rejected;
-- Z-report blocked while legally required offline sync is pending;
+- **online** Z-report blocked while legally required offline sync is pending; **offline-mode** Z_REPORT local close-of-day is the explicit allowed Pattern C exit per M3b W10 (`docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0) and is NOT covered by this blocker;
 - recovery after crash during prepared/signed/sent/offline states;
 - crypto timeout moves document to retryable/manual path;
 - transport timeout moves document to retryable/manual path;

@@ -314,7 +314,7 @@ Required negative cases:
 
 - Sale without an open shift.
 - Duplicate shift open.
-- Z-report with pending offline backlog.
+- **Online** Z-report with pending offline backlog (must be blocked).  Offline-mode local Z_REPORT close-of-day is a separate path covered by Phase 6 and is NOT a negative case — see Phase 6 and `docs/OFFLINE_SHIFT_CLOSE_DECISION.md`.
 - Return without valid original receipt reference, if the selected mode requires
   return linkage.
 - Missing or invalid excise mark.
@@ -333,7 +333,13 @@ Exit criteria:
 
 ## Phase 6 - Offline With One Fiscal Number
 
-Objective: prove offline lifecycle and later synchronization.
+Objective: prove offline lifecycle, offline close-of-day, and later synchronization.
+
+> **Correction (2026-05-16).**  Earlier wording asserted "Z-report is blocked while offline backlog exists" as a blanket rule.  That conflates two distinct close-of-day paths and would trap an offline shift against the 24h legal limit.  The corrected pilot scenario distinguishes:
+> - **Online Z-report over a pending offline backlog** — MUST be blocked (DPS would record a Z that omits offline receipts not yet drained).
+> - **Offline-mode local Z_REPORT close-of-day** — MUST be allowed as a Pattern C `OFFLINE_LOCAL_ACK` document, consuming an offline code, ordered after prior offline docs by `lnd`, and later drained through the wire-send ladder on return-online.
+>
+> See `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` for the authoritative policy and the M3b W10 guard surface that implements both decisions.
 
 Scenario:
 
@@ -341,27 +347,31 @@ Scenario:
 2. Enter offline mode.
 3. Run several sales through Maria 304 while offline.
 4. Verify responses are `OFFLINE_LOCAL_ACK`, not final `ACK`.
-5. Attempt Z-report while offline backlog is pending.
-6. Confirm Z-report is blocked.
-7. Return online.
-8. Run offline synchronization.
-9. Confirm all offline documents receive final DPS sandbox `ACK`.
-10. Run Z-report after backlog is empty.
+5. Attempt an **online** Z-report path while offline backlog is pending.
+6. Confirm the online Z-report attempt is blocked with audit `ONLINE_Z_REPORT_BLOCKED_BACKLOG`.
+7. While still in offline mode and close-of-day approaches, emit an **offline** Z_REPORT through the Pattern C local close path.
+8. Confirm the offline Z_REPORT lands as `OFFLINE_LOCAL_ACK`, consumes an offline code, and is ordered after the prior offline sales by `lnd`.
+9. Confirm post-local-close behaviour: new sale / return attempts are refused with audit `POST_LOCAL_CLOSE_SALE_REFUSED` until the next allowed shift-open policy is satisfied.
+10. Return online.
+11. Run offline synchronization (drain backlog in strict `lnd` ASC, including the offline Z_REPORT).
+12. Confirm all offline documents (sales / returns / the offline Z_REPORT) receive final DPS sandbox `ACK` via W9b drain + W12 in-drain `lastChk` confirmation.
 
 Verify:
 
 - Offline fiscal numbers are unique.
-- Offline limits are enforced.
-- Offline documents remain distinguishable from final DPS-accepted documents.
-- Synchronization preserves ordering.
+- Offline limits are enforced (offline code budget; legal 24h shift / 36h continuous offline / 168h monthly offline — see `docs/LEGAL_INVARIANTS.md`).
+- Offline documents (including the offline Z_REPORT) remain distinguishable from final DPS-accepted documents.
+- Synchronization preserves strict `lnd` ASC ordering, including the offline Z_REPORT relative to prior offline sales.
 - MAC chain is not broken after offline replay.
-- No pending offline backlog remains before Z-report.
+- Audit log distinguishes `ONLINE_Z_REPORT_BLOCKED_BACKLOG` (step 6) from `OFFLINE_Z_REPORT_LOCAL_CLOSE_ACCEPTED` (step 8) and `POST_LOCAL_CLOSE_SALE_REFUSED` (step 9).
 
 Exit criteria:
 
-- Offline receipts are locally acknowledged only.
-- Synchronization finishes with final DPS ACK.
-- Z-report is allowed only after offline backlog is synchronized.
+- Online Z-report over pending offline backlog is correctly blocked.
+- Offline Z_REPORT local close-of-day is correctly accepted as `OFFLINE_LOCAL_ACK`.
+- Post-local-close sale lockout enforced until next allowed shift-open.
+- Drain replays all offline docs (including the offline Z_REPORT) in `lnd` order; each reaches final DPS `ACK` after W12 confirmation.
+- The 24h shift / 36h continuous offline / 168h monthly offline limits behave per `docs/LEGAL_INVARIANTS.md` — either enforced, or explicitly risk-accepted with a sign-off recorded in the pilot log.
 
 ## Phase 7 - Restart And Recovery
 
@@ -504,6 +514,6 @@ Any of the following blocks live pilot:
 - Duplicate LND or skipped LND not explained by accepted fiscal behavior.
 - Duplicate fiscalization on retry.
 - Offline document treated as final DPS ACK before synchronization.
-- Pending offline backlog while allowing Z-report.
+- Pending offline backlog while allowing an **online** Z-report (offline-mode local Z_REPORT close as a Pattern C `OFFLINE_LOCAL_ACK` document is the explicit *exception* under the corrected W10 policy and is NOT a no-go — see Phase 6 + `docs/OFFLINE_SHIFT_CLOSE_DECISION.md`).
 - Missing audit or trace for an accepted fiscal document.
 - Production-like configuration using stub transport or passthrough signing.

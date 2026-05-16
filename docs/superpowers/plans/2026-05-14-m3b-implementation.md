@@ -71,7 +71,7 @@ W7 ─────────────────────────�
                                                   │
 W7,W8 ────────────────────────────────────────────W9  (backlog drain — Pattern C stage-and-flip)
                                                        │
-                                                       W10 (Z-report guard while backlog non-empty)
+                                                       W10 (offline shift close/open policy guard)
                                                            │
 W5..W10 ──────────────────────────────────────────────────W11-Δ (deterministic-replay extension)
                                                                │
@@ -665,45 +665,54 @@ cargo test -p prro --test backlog_drain_mac_chain_preserved    # new
 
 ---
 
-### Task 10 (W10): Z-report guard while offline backlog non-empty
+### Task 10 (W10): offline shift close/open policy guard
 
-**Goal.** Block Z-report (DocType::ZReport) issuance whenever there is at least one `OfflineLocalAck` doc OR an active offline session in `OPEN`/`DRAINING` state for this FN.  Refusal is typed; emits audit `Z_REPORT_BLOCKED_BACKLOG_NON_EMPTY` Warning severity.
+> **W10 correction (2026-05-16).**  Earlier framing of W10 as a blanket *"block Z-report whenever offline backlog or active offline session exists"* was an architectural error.  It conflated two distinct operations: (a) attempting an **online** Z-report over a stale offline backlog (must be blocked — DPS would record a Z without knowing the offline receipts to come), versus (b) closing the day **locally in offline mode** via a Pattern C `OFFLINE_LOCAL_ACK` Z_REPORT (must be allowed — the whole point of offline mode is to keep the cash desk operating, including close-of-day reporting).  A blanket Z-block would trap an offline shift against the 24h legal limit with no compliant exit path.  W10 is redesigned accordingly: it is an **offline shift close/open policy guard**, not a simple Z-report blocker.  See [`docs/OFFLINE_SHIFT_CLOSE_DECISION.md`](../../OFFLINE_SHIFT_CLOSE_DECISION.md) §"M3b correction 2026-05-16" for the authoritative policy note.
+
+**Goal.** Apply policy gates that decide whether a `Z_REPORT` / `SHIFT_OPEN` / `SHIFT_CLOSE` attempt is *allowed*, *refused*, or *routed to local Pattern C close* based on the combination of node mode, shift state, offline-session state, offline backlog, and legal timers (24h shift / 36h continuous offline / 168h monthly offline — see [`docs/LEGAL_INVARIANTS.md`](../../LEGAL_INVARIANTS.md)).  Refusal is typed; outcomes audit-distinguished between `ONLINE_Z_REPORT_BLOCKED_BACKLOG`, `OFFLINE_Z_REPORT_LOCAL_CLOSE_ACCEPTED`, `OFFLINE_Z_REPORT_LOCAL_CLOSE_REFUSED`, and analogous SHIFT_OPEN / SHIFT_CLOSE audits.
+
+**Out of W10 scope (explicit deferrals).**
+- W10 does NOT drain the offline backlog — that is W9b.
+- W10 does NOT implement W12 in-drain `lastChk` KVT2 confirmation.
+- W10 does NOT itself transition documents through state edges; it gates *which doc types may enter* the existing pipeline given the current shift/offline policy.
 
 **Files (proposed).**
+- `src/services/offline_guard.rs` (or `src/services/write_path/policy_guard.rs`) — new module exposing the decision surface, e.g. `evaluate_z_report_policy(pool, fiscal_number, requested_doc_type) -> Result<PolicyDecision, _>` with `PolicyDecision::{AllowOnline, AllowOfflineLocalClose, RefuseOnlineBacklogPending, RefuseOfflineNoCode, RefuseAfterLocalClose, ...}`.
 - `src/services/write_path/stage_acquire.rs` (or wherever doc-type entry validation lives) — pre-flight check before the doc enters the 5-stage pipeline.
-- `src/services/offline_guard.rs` — new module with `assert_no_offline_backlog_for_fn(pool, fiscal_number, doc_type)`.  Returns `Err(WritePathError::ZReportBlocked { backlog_count })` if `doc_type == ZReport && backlog_count > 0`.
-- The guard runs OUTSIDE `with_immediate` (read-only check); the actual block happens at stage_acquire entry before any write tx opens.
+- Audit event vocabulary: `ONLINE_Z_REPORT_BLOCKED_BACKLOG`, `OFFLINE_Z_REPORT_LOCAL_CLOSE_ACCEPTED`, `OFFLINE_Z_REPORT_LOCAL_CLOSE_REFUSED`, `POST_LOCAL_CLOSE_SALE_REFUSED`.  All Warning severity (operator-visible) except `_ACCEPTED` (Info).
 
-**Day budget:** 1 day.
+**Day budget:** 1.5–2 days (was 1 day; widened to cover the policy decision surface).
 
 **Acceptance.**
-- **Guard placement (load-bearing): the guard MUST run BEFORE any cryptographic operation (sign / canonicalize / hash), BEFORE any DPS / network call, BEFORE `fiscal_documents` row insert, BEFORE `ingress_inbox` mutation, AND BEFORE any `lnd` advancement.**  Refused Z-reports must leave system state exactly as if the request never arrived (modulo the audit-row trail).
-- Verified via fixture `z_report_blocked_leaves_system_state_unchanged` asserting ALL of the following for a refused Z-report:
-  - **No `fiscal_documents` row** with this `request_id` exists post-refusal.
-  - **No `ingress_inbox` row** is mutated — inbox CAS short-circuits on the guard refusal before any `acquire_lease`-style write.
-  - **No `transport_trace` row** exists with this `document_id` (because no document_id was minted).
-  - **No `lnd` advancement** for the FN — `MAX(lnd)` query before and after the refused Z-report returns the same value.
-  - **No `unsigned_xml_sha256` write** anywhere (no canonicalization).
-  - **No crypto provider invocation** (verified via test-only spy on the crypto seam: `sign_count == 0`).
-  - Audit row `Z_REPORT_BLOCKED_BACKLOG_NON_EMPTY` Warning severity IS present (the one observable side effect — operator visibility).
-- Implementation seam: guard runs at `stage_acquire::run` entry (stage 1 of 5), strictly before stage 3 (`stage_sign`) and stage 4 (`stage_send`).
-- Z-report with empty backlog + closed offline sessions → proceeds normally (M3a happy path).
-- Z-report with ≥1 `OfflineLocalAck` doc → typed refusal + audit row.
-- Z-report with active offline session (state in {OPEN, DRAINING}) → typed refusal + audit row.
-- Non-Z-report doc types unaffected.
+1. **Online Z_REPORT + non-empty OfflineLocalAck backlog → typed refusal + `ONLINE_Z_REPORT_BLOCKED_BACKLOG` audit.**  This is the original M3a-leaning case: DPS must not record a Z that omits offline receipts not yet drained.
+2. **Online Z_REPORT + active offline session OPEN/DRAINING → typed refusal + `ONLINE_Z_REPORT_BLOCKED_BACKLOG` audit.**  Same reasoning: the session may yet produce more offline docs before drain.
+3. **Offline / GoingOffline Z_REPORT + OPEN shift + active OPEN offline_session + available offline code → routed to Pattern C local close path (`stage_offline_ack` ladder, NOT the online ladder).**  Audit `OFFLINE_Z_REPORT_LOCAL_CLOSE_ACCEPTED` Info.
+4. **Offline Z_REPORT consumes an offline code and lands in `OfflineLocalAck`.**  Drain (W9b) later replays it through the wire-send ladder; the offline Z_REPORT itself becomes a backlog doc, drained in `lnd` order alongside sales/returns.
+5. **Offline Z_REPORT is ordered after all prior local offline docs by `lnd`.**  Strict ASC enforced by the existing `lnd` allocator; W9b drain order preserves it.
+6. **After local offline Z_REPORT close (the Z_REPORT doc has reached `OfflineLocalAck`), new sale / return docs are refused with `POST_LOCAL_CLOSE_SALE_REFUSED` until the next allowed shift-open policy is satisfied** (next online `SHIFT_OPEN`, or, where policy permits, a fresh offline `SHIFT_OPEN` document — exact rule TBD by operator + legal review; W10 leaves the seam typed so the rule can land in a follow-up).
+7. **Non-Z doc types unaffected EXCEPT** where the post-local-close block from (6) applies.  Returns of prior sales completed before close are out of scope here (handled separately by return policy).
+8. **Audit vocabulary distinguishes** `ONLINE_Z_REPORT_BLOCKED_BACKLOG` (online refusal due to backlog) from `OFFLINE_Z_REPORT_LOCAL_CLOSE_ACCEPTED` / `_REFUSED` (offline-mode local close outcomes) and `POST_LOCAL_CLOSE_SALE_REFUSED` (post-close sale lockout).  Operators consuming audit logs can correlate refusals to root cause without parsing payload.
+
+**Guard placement (load-bearing): the guard MUST run BEFORE any cryptographic operation (sign / canonicalize / hash), BEFORE any DPS / network call, BEFORE `fiscal_documents` row insert, BEFORE `ingress_inbox` mutation, AND BEFORE any `lnd` advancement** *for refused outcomes*.  For the routed `AllowOfflineLocalClose` outcome, the doc DOES proceed into the pipeline (stage_acquire continues, stage_sign canonicalizes, `stage_offline_ack` lands `OFFLINE_LOCAL_ACK`) — the policy decision routes the doc, it does not block it.  Refused outcomes leave system state exactly as if the request never arrived (modulo the audit-row trail).
+
+**Implementation seam:** guard runs at `stage_acquire::run` entry (stage 1 of 5), strictly before stage 3 (`stage_sign`).  For refused outcomes the call short-circuits the pipeline.  For `AllowOfflineLocalClose` the policy result is threaded through to the W7b post-sign dispatcher so the doc routes to `stage_offline_ack` (the existing W7 ladder), not `stage_send` (the online wire-send ladder).
 
 **Verify.**
 ```
-cargo test -p prro --test z_report_blocked_on_backlog         # new
-cargo test -p prro --test z_report_allowed_after_drain        # new
+cargo test -p prro --test w10_online_z_report_blocked_with_backlog         # new
+cargo test -p prro --test w10_online_z_report_blocked_with_open_session    # new
+cargo test -p prro --test w10_offline_z_report_local_close_accepted        # new
+cargo test -p prro --test w10_offline_z_report_local_close_ordered_after_sales  # new
+cargo test -p prro --test w10_post_local_close_sale_refused                # new
+cargo test -p prro --test w10_no_state_mutation_on_refused_outcome         # new
 ```
 
-**BlockedBy.** W5 (offline_sessions repository exists), W7 (OfflineLocalAck transitions exist).
+**BlockedBy.** W5 (offline_sessions repository exists), W7 (OfflineLocalAck transitions exist), W9a (stage_send accepts OfflineLocalAck source — needed so the drained offline Z_REPORT can later re-wire through the online ladder via W9b).
 
-**Invariant impact.** Pilot acceptance Phase 6 step 6 ("Confirm Z-report is blocked") is directly tied to this guard.
+**Invariant impact.** Pilot acceptance Phase 6 split into two test cases (see `docs/PILOT_ACCEPTANCE_TEST_PLAN.md`): (a) online Z-report blocked, (b) offline local Z_REPORT close accepted.  W10 is the single seam that decides both.  Legal invariants 24h / 36h / 168h are flagged as active engineering risks in `docs/LEGAL_INVARIANTS.md` — W10 must not resurrect the blanket-blocker design that would trap an offline shift against the 24h limit.
 
 ```json:metadata
-{"files":["rust/prro/src/services/write_path/stage_acquire.rs","rust/prro/src/services/offline_guard.rs","rust/prro/tests/z_report_blocked_on_backlog.rs","rust/prro/tests/z_report_allowed_after_drain.rs"],"verifyCommand":"cargo test -p prro --test z_report_blocked_on_backlog --test z_report_allowed_after_drain","acceptanceCriteria":["Z-report+empty backlog → ok","Z-report+OfflineLocalAck → refused+audit","Z-report+active session → refused+audit","non-Z doc types unaffected"]}
+{"files":["rust/prro/src/services/offline_guard.rs","rust/prro/src/services/write_path/stage_acquire.rs"],"verifyCommand":"cargo test -p prro --test w10_online_z_report_blocked_with_backlog --test w10_online_z_report_blocked_with_open_session --test w10_offline_z_report_local_close_accepted --test w10_offline_z_report_local_close_ordered_after_sales --test w10_post_local_close_sale_refused --test w10_no_state_mutation_on_refused_outcome","acceptanceCriteria":["online Z + backlog → blocked + audit","online Z + OPEN/DRAINING session → blocked + audit","offline Z + OPEN shift + code → routed to Pattern C local close","offline Z consumes code and lands OfflineLocalAck","offline Z ordered after prior offline docs by lnd","post-local-close sale refused until next shift-open","non-Z doc types unaffected except by post-close lockout","audit vocab distinguishes online block vs offline accept/refuse"]}
 ```
 
 ---
@@ -825,7 +834,7 @@ M3b is CLOSED when ALL of the following hold.  W0b selected the scoped-YES branc
 
 ### Item 1 — offline-drain backlog reaches final ACK
 
-1. **Phase 6 of `docs/PILOT_ACCEPTANCE_TEST_PLAN.md` discharged end-to-end** in a dev contour to **final DPS ACK for the M3b offline-drain backlog**: enter offline → issue receipts as `OFFLINE_LOCAL_ACK` → block Z-report while backlog exists → return online → sync backlog → finalize **all M3b backlog docs reach `Ack`** via W12 in-drain `lastChk` confirmation.  Evidence attached to pilot dossier (transport_trace + audit_log rows + DpsError distribution + KVT2_CONFIRM_* events).
+1. **Phase 6 of `docs/PILOT_ACCEPTANCE_TEST_PLAN.md` discharged end-to-end** in a dev contour to **final DPS ACK for the M3b offline-drain backlog**: enter offline → issue receipts as `OFFLINE_LOCAL_ACK` → block **online** Z-report while backlog exists → emit **offline** Z_REPORT local close-of-day as Pattern C `OFFLINE_LOCAL_ACK` document → enforce post-local-close sale lockout → return online → sync backlog (in strict `lnd` ASC, including the offline Z_REPORT) → finalize **all M3b backlog docs reach `Ack`** via W12 in-drain `lastChk` confirmation.  Evidence attached to pilot dossier (transport_trace + audit_log rows including `ONLINE_Z_REPORT_BLOCKED_BACKLOG` + `OFFLINE_Z_REPORT_LOCAL_CLOSE_ACCEPTED` + `POST_LOCAL_CLOSE_SALE_REFUSED` + DpsError distribution + KVT2_CONFIRM_* events).
 
 Historical/pre-existing stale `Kvt1` docs remain out of M3b W12 scope and continue to surface through `passive_hold_kvt1` with age-bucket severity.
 

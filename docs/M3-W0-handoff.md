@@ -53,13 +53,19 @@ sources, not work items for Python implementation.
 
 Deferred from M3a; the minimum Rust offline subsystem required to pass
 `PILOT_ACCEPTANCE_TEST_PLAN` Phase 6 (offline lifecycle: enter offline,
-issue receipts under `OFFLINE_LOCAL_ACK`, block Z-report on backlog,
-return online, sync, finalize).
+issue receipts under `OFFLINE_LOCAL_ACK`, block **online** Z-report
+while backlog pending, emit **offline-mode** Z_REPORT local close-of-day
+as Pattern C `OFFLINE_LOCAL_ACK` document, return online, sync, finalize).
+See `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0 (M3b correction 2026-05-16)
+for the authoritative ONLINE-vs-OFFLINE close-of-day policy.
 
-36h / 168h offline-limit enforcement and the 24h shift guard are **not**
-part of Phase-6-min acceptance unless promoted into M3b scope, but
-omitting them from a live pilot requires **explicit owner risk
-acceptance** recorded before Go.  Offline-code availability and
+36h / 168h offline-limit enforcement and the 24h shift guard were
+originally framed as **not** part of Phase-6-min acceptance.  Per the
+2026-05-16 M3b W10 / `LEGAL_INVARIANTS.md` correction, all three are
+now **active engineering risks / pilot gates** — they must be enforced
+OR explicitly risk-accepted with operator sign-off before live pilot.
+The offline Z_REPORT local close-of-day path exists precisely so the
+24h shift limit has a compliant exit even when DPS is unreachable.  Offline-code availability and
 offline-code-pool bounds remain in M3b — without them Phase 6 has no
 meaning.
 

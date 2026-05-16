@@ -1,5 +1,18 @@
 # Offline SHIFT_CLOSE Decision
 
+## 0. M3b correction 2026-05-16 (authoritative)
+
+This document is the **authoritative policy note** for offline shift close-of-day in the Rust gateway.  After Round 0 of the M3b W10 design we corrected an architectural error in the earlier framing: a blanket *"block Z-report whenever offline backlog or active offline session exists"* rule would trap an offline shift against the 24h legal limit with no compliant close-of-day exit.  The corrected policy distinguishes two distinct close-of-day paths:
+
+1. **Online Z_REPORT over a pending offline backlog → MUST be blocked.**  DPS would record a Z-report that omits offline receipts not yet drained — illegal and forensically unrecoverable.
+2. **Offline-mode local Z_REPORT close-of-day → MUST be allowed** as a Pattern C document.  The Z_REPORT is emitted via the offline ladder (`Signed → OfflineLocalAck`), consumes an offline code, and becomes the final local document of the offline shift.  W9b drain later replays it through the wire-send ladder in strict `lnd` ASC after all prior offline sales/returns, and W12 confirms KVT2 → final `ACK`.
+3. **Post-local-close lockout.**  After the offline Z_REPORT lands in `OfflineLocalAck`, new sale / return documents on the same shift MUST be refused until the next allowed shift-open policy is satisfied.  Until that policy is precisely defined (operator + legal review), W10 leaves the audit seam typed so the rule can land in a follow-up without resurrecting the blanket-blocker design.
+4. **Legal timers (24h shift / 36h continuous offline / 168h monthly offline) are active engineering risks**, not non-goals — see [`docs/LEGAL_INVARIANTS.md`](LEGAL_INVARIANTS.md).  The offline-mode local Z_REPORT path exists precisely so the 24h shift limit can be honoured even when DPS is unreachable; sales may be blocked at limits, but the close/reporting path must always have an exit.
+
+W10 is the single seam that implements both decisions.  See `docs/superpowers/plans/2026-05-14-m3b-implementation.md` §Task 10 for the gate surface (`PolicyDecision::{AllowOnline, AllowOfflineLocalClose, RefuseOnlineBacklogPending, ...}`) and audit vocabulary (`ONLINE_Z_REPORT_BLOCKED_BACKLOG`, `OFFLINE_Z_REPORT_LOCAL_CLOSE_ACCEPTED`, `POST_LOCAL_CLOSE_SALE_REFUSED`).
+
+The older "Step A — legal blocker first" recommendation in §10 below is preserved as historical context — it described a stop-gap before the full compound contour landed.  The corrected W10 supersedes it: the policy must be ONLINE-vs-OFFLINE-aware from the first implementation, not a blanket blocker that gets refined later.
+
 ## 1. Problem Statement
 
 Проєкт уже підтримує `OFFLINE_LOCAL_ACK` для офлайн-документів та ручний `OfflineSyncService`, але контур закриття зміни/дня залишається неповним.
@@ -171,12 +184,15 @@ Shift record повинен бути зв'язаний з документами
    - є pending offline documents того самого `fiscal_number`;
    - або вже існує unresolved close/day-close contour попередньої зміни.
 
-2. `Z_REPORT` online must be blocked if:
+2. **Online** `Z_REPORT` must be blocked if:
    - offline backlog, який має потрапити до денного контуру, ще не доставлений або не узгоджений з close-of-day semantics.
+
+   **Offline-mode local** `Z_REPORT` close-of-day is the explicit *allowed* path under these conditions — see §0 above and W10 plan task.  It MUST NOT be conflated with the online block.
 
 3. `SHIFT_OPEN` must be blocked if:
    - попередня зміна знаходиться в `CLOSING`;
-   - linked close/day-close documents не мають фінального допустимого стану.
+   - linked close/day-close documents не мають фінального допустимого стану;
+   - або попередній shift був закритий локально через offline `Z_REPORT` і нова shift-open policy ще не виконана (`POST_LOCAL_CLOSE_SALE_REFUSED` lockout — see §0).
 
 4. Close/day-close during or after offline must remain single-device / single-channel scoped:
    - не можна допускати закриття зміни на іншому пристрої/іншому каналі під час unresolved offline contour.
@@ -186,9 +202,10 @@ Shift record повинен бути зв'язаний з документами
 Поки compound contour не реалізований:
 
 - не слід відкривати в runtime **standalone direct** `offline SHIFT_CLOSE`, який локально закриває зміну без повного day-close contour;
-- `SHIFT_CLOSE` / `Z_REPORT` online слід блокувати при наявності `OFFLINE_LOCAL_ACK` backlog для того ж `fiscal_number`, де це юридично необхідно.
+- **online** `SHIFT_CLOSE` / **online** `Z_REPORT` слід блокувати при наявності `OFFLINE_LOCAL_ACK` backlog для того ж `fiscal_number`, де це юридично необхідно;
+- **offline-mode local** `Z_REPORT` close-of-day, навпаки, MUST бути дозволений як Pattern C `OFFLINE_LOCAL_ACK` document (див. §0 + W10 plan task) — це не "проміжна позиція", це фінальна архітектурна гарантія, що 24h shift limit має compliant exit.
 
-Це проміжна, але безпечна позиція.
+Це безпечна позиція до повного compound contour'у: ONLINE block чітко відокремлений від OFFLINE local close.
 
 ## 8. Recovery / Restart Semantics
 
@@ -210,12 +227,15 @@ Shift record повинен бути зв'язаний з документами
 
 ## 10. Recommended Bounded Implementation Sequence
 
-### Step A — legal blocker first
+### Step A — legal blocker first (historical, superseded by M3b W10 — see §0)
+
+> **Superseded 2026-05-16.**  The original "Step A" wording below described a stop-gap blanket-blocker.  M3b W10 implements the corrected ONLINE-vs-OFFLINE-distinguished policy directly — the stop-gap is skipped.
 
 Зробити вузький guard:
 
-- блокувати `SHIFT_CLOSE` та `Z_REPORT` там, де є pending `OFFLINE_LOCAL_ACK` backlog для відповідного `fiscal_number`, якщо повний close-of-day contour ще не реалізований;
-- додати окремий canonical error code для legal blocker.
+- блокувати **online** `SHIFT_CLOSE` та **online** `Z_REPORT` там, де є pending `OFFLINE_LOCAL_ACK` backlog для відповідного `fiscal_number`, якщо повний close-of-day contour ще не реалізований;
+- **offline-mode** local `Z_REPORT` close-of-day MUST залишатися дозволеним як Pattern C document — це не частина блокатора, це окрема routed-acceptance ARM (див. §0);
+- додати окремий canonical error code для legal blocker (online refusal) та окремий audit event для offline accepted-local-close (`OFFLINE_Z_REPORT_LOCAL_CLOSE_ACCEPTED`).
 
 ### Step B — shift/document linkage
 

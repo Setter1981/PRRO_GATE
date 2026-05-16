@@ -33,10 +33,14 @@ not get lost over the multi-month execution window:
    `docs/PILOT_ACCEPTANCE_TEST_PLAN.md`; expected to commit alongside or before
    this ADR) defines a dedicated mandatory **Phase 6 — Offline With One Fiscal
    Number**: enter offline mode, issue receipts under `OFFLINE_LOCAL_ACK` (not
-   final `ACK`), block Z-report while offline backlog is pending, return online,
-   run synchronization, finalize. The same plan's **Final Go Criteria** lists
-   "Offline lifecycle passes" as binding, and its **No-Go Conditions** forbid
-   "Production-like configuration using stub transport or passthrough signing".
+   final `ACK`), block **online** Z-report while offline backlog is pending,
+   emit **offline-mode** Z_REPORT local close-of-day as a Pattern C
+   `OFFLINE_LOCAL_ACK` document (per the M3b W10 correction — see
+   `docs/OFFLINE_SHIFT_CLOSE_DECISION.md`), return online, run synchronization
+   in strict `lnd` ASC order, finalize. The same plan's **Final Go Criteria**
+   lists "Offline lifecycle passes" as binding, and its **No-Go Conditions**
+   forbid "Production-like configuration using stub transport or passthrough
+   signing".
 
    The ADR carries this evidence inline so its argument does not depend on the
    acceptance plan being indexable at the moment of reading; the cross-reference
