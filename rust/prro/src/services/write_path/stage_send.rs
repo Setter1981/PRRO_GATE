@@ -486,9 +486,13 @@ enum PreOutcome {
     /// the typed error; no side effects.
     EnvelopeBuildFailed(StageSendError),
     /// W10.2: 4-pre source-state CAS rejected.  Either `inputs.state`
-    /// was outside `{Signed, ErrorRetryable}` (we never attempt the
-    /// CAS), OR the CAS `(observed_source) → Sending` returned
-    /// `Conflict`.  No marker, no trace, no audit, no wire.
+    /// was outside `{Signed, ErrorRetryable, OfflineLocalAck}`
+    /// (we never attempt the CAS), OR the CAS `(observed_source) →
+    /// Sending` returned `Conflict`.  No marker, no trace, no
+    /// audit, no wire.  `OfflineLocalAck` joined the allowed set
+    /// in M3b W9a — it is the source state of the W9 Pattern C
+    /// drain (offline-acked doc replays through the wire-send
+    /// ladder on return-online).
     StateConflict { observed: DocState },
 }
 
@@ -831,15 +835,25 @@ async fn run_one_attempt(
                 Err(err) => return Ok(PreOutcome::EnvelopeBuildFailed(err)),
             };
 
-            // W10.2 HIGH 3 §4.2: 4-pre source-state CAS accepts
-            // {Signed, ErrorRetryable} → Sending.  ErrorRetryable is
-            // the Pattern B retry-path edge per ADR-M3-A9 step 5-6:
-            // a routed failure in 4-b transitions Sending → ErrorRetryable,
-            // and the next worker tick re-enters via this CAS.  Any
+            // W10.2 HIGH 3 §4.2 + M3b W9a widening (2026-05-16): 4-pre
+            // source-state CAS accepts {Signed, ErrorRetryable,
+            // OfflineLocalAck} → Sending.  Online path: Signed and
+            // ErrorRetryable enter via M3a Pattern B (ADR-M3-A9 step
+            // 5-6 — a routed failure in 4-b transitions Sending →
+            // ErrorRetryable, and the next worker tick re-enters via
+            // this CAS).  Offline-drain path: OfflineLocalAck enters
+            // only via the W9b backlog drain caller; no current
+            // boot-phase dispatcher routes OfflineLocalAck through
+            // stage_send (it is treated as terminal by
+            // `dispatch_pending_doc` until W9b wires the drain).  The
+            // `(OfflineLocalAck, Sending)` edge was added to the
+            // `allowed_transition` whitelist by M3b W6 (PR #55).  Any
             // other observed state is a structural rejection — no CAS
             // attempt, no wire call.
             let source_state = match inputs.state {
-                DocState::Signed | DocState::ErrorRetryable => inputs.state,
+                DocState::Signed | DocState::ErrorRetryable | DocState::OfflineLocalAck => {
+                    inputs.state
+                }
                 other => return Ok(PreOutcome::StateConflict { observed: other }),
             };
             match fd::transition_state(tx, doc, source_state, DocState::Sending).await? {

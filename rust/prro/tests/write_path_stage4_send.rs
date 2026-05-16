@@ -814,12 +814,13 @@ async fn rerun_on_sent_state_conflict_short_circuits_with_zero_wire_calls() {
 
 #[test]
 fn whitelist_4pre_source_states_regression_guard() {
-    // W7.4 F4 + W10.2 HIGH 3 §4.2 close: stage_send.rs 4-pre relies on
-    // both `(Signed, Sending)` and `(ErrorRetryable, Sending)` being
-    // whitelisted; a future migration that drops either entry would
-    // make the `unreachable!` in the Forbidden arm fire in production.
-    // This sub-millisecond test catches the regression at CI before it
-    // ever ships.
+    // W7.4 F4 + W10.2 HIGH 3 §4.2 + M3b W9a widening (2026-05-16):
+    // stage_send.rs 4-pre relies on `(Signed, Sending)`,
+    // `(ErrorRetryable, Sending)`, and `(OfflineLocalAck, Sending)`
+    // all being whitelisted; a future migration that drops any of
+    // these entries would make the `unreachable!` in the Forbidden
+    // arm fire in production.  This sub-millisecond test catches the
+    // regression at CI before it ever ships.
     assert!(
         allowed_transition(DocState::Signed, DocState::Sending),
         "(Signed, Sending) MUST stay in the allowed_transition whitelist; \
@@ -829,6 +830,12 @@ fn whitelist_4pre_source_states_regression_guard() {
         allowed_transition(DocState::ErrorRetryable, DocState::Sending),
         "(ErrorRetryable, Sending) MUST stay in the allowed_transition whitelist; \
          stage_send::run depends on this for the 4-pre CAS (W10.2 retry path)"
+    );
+    assert!(
+        allowed_transition(DocState::OfflineLocalAck, DocState::Sending),
+        "(OfflineLocalAck, Sending) MUST stay in the allowed_transition whitelist; \
+         stage_send::run depends on this for the 4-pre CAS (M3b W9a offline-drain path; \
+         edge added by W6 in PR #55)"
     );
     // W10.4 step 2d: MAC recovery failure overrides terminate the
     // doc directly from `ErrorRetryable` → `Rejected` without a
@@ -882,7 +889,61 @@ async fn retry_path_error_retryable_to_sending_drives_through_4_pre() {
     assert_eq!(read_doc_state(&pool, doc).await, "SENT");
 }
 
-// ─── Fixture 6c — non-{Signed, ErrorRetryable} short-circuits ────────
+// ─── Fixture 6b' — M3b W9a Pattern C drain: OfflineLocalAck → Sending ─
+
+#[tokio::test]
+async fn w9a_offline_local_ack_to_sending_drives_through_4_pre() {
+    // M3b W9a: stage_send::run's 4-pre source-state CAS now accepts
+    // `OfflineLocalAck` as a third allowed source, alongside `Signed`
+    // and `ErrorRetryable`.  The new edge is the entry to W9 Pattern C
+    // drain: an offline-acked doc replays through the wire-send ladder
+    // on return-online.  This fixture seeds in `OFFLINE_LOCAL_ACK`,
+    // runs stage_send::run, and asserts:
+    //   - the 4-pre CAS Applied (no StateConflict) — the new source
+    //     state is in the allowlist;
+    //   - the (OfflineLocalAck, Sending) whitelist edge (added in W6)
+    //     was consumed via fiscal_documents::transition_state (NOT a
+    //     raw UPDATE bypass);
+    //   - wire send_chk WAS called;
+    //   - 4-b CAS Sending → Sent committed.
+    //
+    // Scope note: W9a is transport-ladder widening ONLY.  W9b will
+    // wire the actual drain caller (App::drain_offline_backlog_with).
+    // This fixture proves the seam is ready, not that it is wired.
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_signed_doc_with_xml(&pool, 0xC0, "SELL", 1, "OFFLINE_LOCAL_ACK").await;
+    let stub = StubDpsChannel::new(Ok(ack("DPS-FN-W9A-DRAIN")));
+
+    let outcome = stage_send::run(&pool, &stub, doc, None)
+        .await
+        .expect("drain from OfflineLocalAck must succeed");
+
+    match outcome {
+        StageSendOutcome::Sent {
+            server_fiscal_no,
+            attempt_no: _,
+        } => {
+            assert_eq!(server_fiscal_no, "DPS-FN-W9A-DRAIN");
+        }
+        other => panic!("expected Sent on W9a drain-path, got {other:?}"),
+    }
+    assert_eq!(
+        stub.call_count(),
+        1,
+        "W9a drain-path must invoke send_chk exactly once"
+    );
+    assert_eq!(read_doc_state(&pool, doc).await, "SENT");
+
+    // Pattern B intent-marker pair audit landed at the OfflineLocalAck
+    // → Sending edge — same audit pair shape as the Signed and
+    // ErrorRetryable paths.  No new audit event types in W9a.
+    assert_eq!(
+        read_audit_event_types(&pool, doc).await,
+        vec!["STAGE_SEND_INTENT_MARKED", "STAGE_SEND_RESULT"]
+    );
+}
+
+// ─── Fixture 6c — non-{Signed, ErrorRetryable, OfflineLocalAck} short-circuits ────────
 
 #[tokio::test]
 async fn rerun_on_non_allowlisted_states_short_circuits_with_zero_wire_calls() {
