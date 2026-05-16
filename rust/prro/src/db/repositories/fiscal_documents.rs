@@ -686,8 +686,18 @@ pub async fn update_unsigned_xml_sha256_tx(
 /// strict subset of [`DocumentRow`]: only what stage 4 reads.  No
 /// unsigned-xml hash, no Z-allocation seed, no offline session id —
 /// those are 4-pre's not-our-concern (`document_files::SignedXml` is
-/// read separately; `id_offline`/`id_cancel` are W11 / future cancel
-/// territory and stay empty in W7).
+/// read separately).  `id_cancel` is future cancel territory and
+/// stays empty in W7.
+///
+/// **M3b W9a (2026-05-16):** `offline_fiscal_no` is now read here so
+/// the W9 backlog drain (which pushes `OfflineLocalAck → Sending → …`
+/// through this same stage) can populate `CheckEnvelope.id_offline`
+/// with the offline-acquired fiscal-no per DPS wire contract
+/// (`docs/superpowers/specs/2026-05-04-m2-w0-1-dps-wire.md:116`).  For
+/// `Signed` / `ErrorRetryable` online docs the column is `NULL` and
+/// `id_offline` stays empty; for `OfflineLocalAck` docs the W7a
+/// `transition_to_offline_local_ack_tx` invariant guarantees it is
+/// set to the consumed `code_lnd`.
 #[derive(Debug, Clone)]
 pub struct SendInputs {
     /// Pre-CAS observed state.  Stage 4-pre reads this BEFORE the
@@ -715,6 +725,14 @@ pub struct SendInputs {
     /// Pass-through to `transport_trace::NewAttempt`.
     pub backend_profile_id: String,
     pub transport_profile_id: String,
+    /// **M3b W9a.**  `offline_fiscal_no` column (W7a writes this =
+    /// consumed `code_lnd` when staging `Signed → OfflineLocalAck`).
+    /// `None` for docs never staged offline (M3a online happy path,
+    /// also ErrorRetryable retries of M3a online docs).  `Some(n)`
+    /// is required when `state == OfflineLocalAck` (W7a invariant);
+    /// `build_send_envelope` enforces this with a typed error before
+    /// any CAS attempt.
+    pub offline_fiscal_no: Option<i64>,
 }
 
 /// W7 stage 4-pre — read the minimal field set required by stage 4 in
@@ -738,7 +756,8 @@ pub async fn fetch_send_inputs_tx(
                   doc_type             as "doc_type: DocType",
                   business_ts,
                   backend_profile_id,
-                  transport_profile_id
+                  transport_profile_id,
+                  offline_fiscal_no
            FROM fiscal_documents WHERE document_id = ?"#,
         doc_id
     )
@@ -753,6 +772,7 @@ pub async fn fetch_send_inputs_tx(
         business_ts: r.business_ts,
         backend_profile_id: r.backend_profile_id,
         transport_profile_id: r.transport_profile_id,
+        offline_fiscal_no: r.offline_fiscal_no,
     }))
 }
 
