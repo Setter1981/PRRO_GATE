@@ -173,6 +173,22 @@ pub struct DispatchHistogram {
     /// `stage_send::run` chain.  Increments on successful dispatch
     /// invocation regardless of the doc's final state.
     pub prepared_dispatched: usize,
+    /// M3b W7b — counter for docs that the post-sign dispatcher
+    /// routed to `stage_offline_ack::run` and that resulted in an
+    /// `Applied` outcome (offline_local_ack emitted, code consumed).
+    /// Increments for both PREPARED→dispatched (via
+    /// `dispatch_prepared_via_chain`) and SIGNED→dispatched (boot
+    /// recovery of a doc resumed in SIGNED with current mode
+    /// Offline/GoingOffline) outcomes.
+    pub offline_local_ack_emitted: usize,
+    /// M3b W7b — counter for docs that the post-sign dispatcher
+    /// REFUSED (mode in {Blocked, StopMode, CryptoDegraded,
+    /// GoingOnline}) OR that stage_offline_ack itself refused at
+    /// its internal validation layer (Refused outcome).  Either way:
+    /// doc state unchanged; audit row emitted.  `dispatch_post_sign`
+    /// emits `WRITE_PATH_DISPATCH_REFUSED`; stage_offline_ack emits
+    /// `OFFLINE_ACK_REFUSED`.
+    pub write_path_dispatch_refused: usize,
     /// M3a hardening pass 1 — ER docs whose durable `retry_class`
     /// (per `transport_trace.retry_class`) indicates the recovery
     /// branch is NOT auto-retryable.  Doc transitioned `ErrorRetryable
@@ -245,6 +261,8 @@ impl DispatchHistogram {
             + self.sent_not_found_to_error_retryable
             + self.sent_probe_failure_deferred
             + self.prepared_dispatched
+            + self.offline_local_ack_emitted
+            + self.write_path_dispatch_refused
             + self.error_retryable_escalated_to_manual
             + self.error_retryable_probe_deferred
             + self.error_retryable_indeterminate_deferred
@@ -270,6 +288,8 @@ impl DispatchHistogram {
         self.sent_not_found_to_error_retryable += other.sent_not_found_to_error_retryable;
         self.sent_probe_failure_deferred += other.sent_probe_failure_deferred;
         self.prepared_dispatched += other.prepared_dispatched;
+        self.offline_local_ack_emitted += other.offline_local_ack_emitted;
+        self.write_path_dispatch_refused += other.write_path_dispatch_refused;
         self.error_retryable_escalated_to_manual += other.error_retryable_escalated_to_manual;
         self.error_retryable_probe_deferred += other.error_retryable_probe_deferred;
         self.error_retryable_indeterminate_deferred += other.error_retryable_indeterminate_deferred;
@@ -2197,22 +2217,56 @@ async fn dispatch_prepared_via_chain(
         return Ok(());
     }
 
-    // (3) stage_send::run drives SIGNED → SENT (or routed target) via
-    // Pattern B.  Doc-id only — stage_send re-reads from the pool;
-    // the runtime composition supplies `Some(signing_ctx)` for the
-    // optional MAC-recovery loop body.  On Err the doc stays in
-    // SIGNED — next boot tick re-dispatches via the PR-2a SIGNED arm.
-    match stage_send::run(pool, deps.dps, doc_id, Some(deps.signing_ctx)).await {
-        Ok(_) => histogram.prepared_dispatched += 1,
-        Err(send_err) => {
-            emit_dispatch_error(
-                pool,
-                doc_id,
-                "c-prepared-send",
-                &anyhow::Error::new(send_err),
-                histogram,
-            )
-            .await?;
+    // (3) M3b W7b post-sign dispatcher: route based on current
+    // node mode.  Online → stage_send::run (unchanged M3a happy
+    // path).  Offline / GoingOffline → stage_offline_ack::run;
+    // pipeline TERMINATES here for this doc — no stage_send call.
+    // 4 non-routable modes (Blocked / StopMode / CryptoDegraded /
+    // GoingOnline) → typed dispatcher refusal + audit; doc stays
+    // in SIGNED.  See `services::write_path::dispatch`.
+    use crate::services::write_path::dispatch::{self, PostSignRoute};
+    use crate::services::write_path::stage_offline_ack::OfflineAckOutcome;
+    match dispatch::dispatch_post_sign(pool, doc_id, &doc.fiscal_number).await {
+        Ok(PostSignRoute::Online { .. }) => {
+            // Existing M3a online ladder.  stage_send::run drives
+            // SIGNED → SENT (or routed target) via Pattern B.
+            match stage_send::run(pool, deps.dps, doc_id, Some(deps.signing_ctx)).await {
+                Ok(_) => histogram.prepared_dispatched += 1,
+                Err(send_err) => {
+                    emit_dispatch_error(
+                        pool,
+                        doc_id,
+                        "c-prepared-send",
+                        &anyhow::Error::new(send_err),
+                        histogram,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(PostSignRoute::Offline { outcome, .. }) => {
+            // Pipeline terminates here — no stage_send / stage_finalize.
+            match outcome {
+                OfflineAckOutcome::Applied { .. } => {
+                    histogram.offline_local_ack_emitted += 1;
+                }
+                OfflineAckOutcome::Refused(_) => {
+                    // stage_offline_ack already emitted
+                    // OFFLINE_ACK_REFUSED audit; histogram bumps
+                    // the same bucket as dispatcher-level refusal
+                    // (both represent "doc not advanced").
+                    histogram.write_path_dispatch_refused += 1;
+                }
+            }
+        }
+        Ok(PostSignRoute::Refused(_)) => {
+            // Dispatcher-level refusal (Blocked / StopMode /
+            // CryptoDegraded / GoingOnline).  WRITE_PATH_DISPATCH_REFUSED
+            // audit already emitted by dispatch_post_sign.
+            histogram.write_path_dispatch_refused += 1;
+        }
+        Err(e) => {
+            emit_dispatch_error(pool, doc_id, "c-prepared-dispatch", &e, histogram).await?;
         }
     }
     Ok(())
@@ -2338,13 +2392,48 @@ async fn dispatch_pending_doc(
         // W9 BOOT_DISPATCH_DEFERRED behaviour for ALL four states —
         // doc stays in source state, deps_available=false in audit.
         DocState::Signed => match deps {
-            Some(d) => match stage_send::run(pool, d.dps, doc_id, Some(d.signing_ctx)).await {
-                Ok(_) => histogram.signed_dispatched += 1,
-                Err(e) => {
-                    emit_dispatch_error(pool, doc_id, "c-signed", &anyhow::Error::new(e), histogram)
-                        .await?
+            // M3b W7b: a doc resumed in SIGNED at boot may have
+            // been crashed-recovered with a node mode that has
+            // since flipped to Offline / GoingOffline.  Route
+            // through the post-sign dispatcher so the offline
+            // branch is reachable here too (criterion 1: wiring
+            // happens after any path that produces a SIGNED doc).
+            Some(d) => {
+                use crate::services::write_path::dispatch::{self, PostSignRoute};
+                use crate::services::write_path::stage_offline_ack::OfflineAckOutcome;
+                match dispatch::dispatch_post_sign(pool, doc_id, &doc.fiscal_number).await {
+                    Ok(PostSignRoute::Online { .. }) => {
+                        match stage_send::run(pool, d.dps, doc_id, Some(d.signing_ctx)).await {
+                            Ok(_) => histogram.signed_dispatched += 1,
+                            Err(e) => {
+                                emit_dispatch_error(
+                                    pool,
+                                    doc_id,
+                                    "c-signed",
+                                    &anyhow::Error::new(e),
+                                    histogram,
+                                )
+                                .await?
+                            }
+                        }
+                    }
+                    Ok(PostSignRoute::Offline { outcome, .. }) => match outcome {
+                        OfflineAckOutcome::Applied { .. } => {
+                            histogram.offline_local_ack_emitted += 1;
+                        }
+                        OfflineAckOutcome::Refused(_) => {
+                            histogram.write_path_dispatch_refused += 1;
+                        }
+                    },
+                    Ok(PostSignRoute::Refused(_)) => {
+                        histogram.write_path_dispatch_refused += 1;
+                    }
+                    Err(e) => {
+                        emit_dispatch_error(pool, doc_id, "c-signed-dispatch", &e, histogram)
+                            .await?;
+                    }
                 }
-            },
+            }
             None => {
                 emit_ctx_needy_deferred(pool, doc_id, doc.state, deps_available).await?;
                 histogram.signed_deferred += 1;
