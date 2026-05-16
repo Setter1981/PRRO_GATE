@@ -300,6 +300,95 @@ pub async fn transition_state(
     })
 }
 
+/// M3b W7 — atomic `Signed → OfflineLocalAck` transition with
+/// simultaneous stamping of the W4-era offline columns.
+///
+/// Single UPDATE statement: flips state AND stamps
+/// `offline_fiscal_no` (= acquired `code_lnd`) AND
+/// `offline_fiscal_date` (= the `consumed_at` returned by W5's
+/// `acquire_code_tx`) AND `offline_session_id` (= the FN's current
+/// active OPEN session).  All four columns become non-NULL
+/// atomically with the state flip — caller never observes a doc
+/// in OFFLINE_LOCAL_ACK with NULL offline_fiscal_no / _date /
+/// session_id.
+///
+/// Parallel shape to [`transition_state`]: **whitelist gate runs
+/// BEFORE the DB call** (mirrors W1 discipline; release-build-
+/// effective, not debug-only).  Successful CAS returns `Applied`;
+/// CAS miss disambiguates `Conflict` vs `NotFound` via a follow-up
+/// SELECT.
+///
+/// **Cross-FN guard (operator W7 Round 1 HIGH-2 fix, 2026-05-15)**:
+/// the UPDATE WHERE clause filters on `document_id = ? AND
+/// fiscal_number = ? AND state = 'SIGNED'`.  Caller MUST pass the
+/// FN that the doc actually belongs to; mismatched FN → zero
+/// rows_affected → `Conflict` / `NotFound` disambiguation.  This
+/// closes a fiscal-integrity hole where a caller misusing the
+/// helper could stamp doc of FN A with code/session of FN B (the
+/// W4 schema's FK on offline_session_id is NOT composite with
+/// fiscal_number, so SQL constraints alone wouldn't catch it).
+///
+/// Pre-conditions (caller's responsibility — `stage_offline_ack`
+/// enforces them inside the same `with_immediate` envelope as this
+/// call, so a refusal aborts the tx before any column is touched):
+///   1. Node mode ∈ {Offline, GoingOffline}.
+///   2. Shift state == Opened.
+///   3. Active OPEN session exists for the FN.
+///   4. Code acquired from `offline_sessions::acquire_code_tx` —
+///      `code_lnd` + `consumed_at` come from that helper's return.
+///   5. Pre-check that the doc row exists, is in `Signed`, and
+///      belongs to the same FN — surfaces typed refusals before
+///      any code is consumed.
+pub async fn transition_to_offline_local_ack_tx(
+    tx: &mut WriteTxConn<'_>,
+    id: DocumentId,
+    fiscal_number: &str,
+    code_lnd: i64,
+    consumed_at: &str,
+    offline_session_id: OfflineSessionId,
+) -> sqlx::Result<TransitionOutcome> {
+    // Whitelist gate — RELEASE-effective per operator W7 Round 1
+    // HIGH-3 fix (2026-05-15).  Was `debug_assert!` previously;
+    // that compiles to no-op in release and would let raw state
+    // updates through if the W6 edge ever flipped to false.
+    if !allowed_transition(DocState::Signed, DocState::OfflineLocalAck) {
+        return Ok(TransitionOutcome::Forbidden);
+    }
+
+    let res = sqlx::query(
+        "UPDATE fiscal_documents \
+         SET state = 'OFFLINE_LOCAL_ACK', \
+             offline_fiscal_no = ?, \
+             offline_fiscal_date = ?, \
+             offline_session_id = ? \
+         WHERE document_id = ? AND fiscal_number = ? AND state = 'SIGNED'",
+    )
+    .bind(code_lnd)
+    .bind(consumed_at)
+    .bind(offline_session_id)
+    .bind(id)
+    .bind(fiscal_number)
+    .execute(&mut **tx)
+    .await?;
+
+    if res.rows_affected() == 1 {
+        return Ok(TransitionOutcome::Applied);
+    }
+    // CAS missed — disambiguate row-missing vs state-diverged
+    // (vs cross-FN mismatch, which also surfaces as Conflict —
+    // the doc EXISTS but its fiscal_number doesn't match).
+    let exists: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM fiscal_documents WHERE document_id = ? LIMIT 1")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(if exists.is_some() {
+        TransitionOutcome::Conflict
+    } else {
+        TransitionOutcome::NotFound
+    })
+}
+
 /// Returns documents in non-final, non-handed-off states for the given FN,
 /// in deterministic order suitable for fiscal-chain recovery.
 ///

@@ -412,6 +412,41 @@ pub async fn acquire_code_tx(
     }
 }
 
+/// M3b W7 — read the FN's currently-active OPEN offline session.
+///
+/// Returns `Some(session_id)` if exactly one session for `fiscal_number`
+/// is in state `OPEN`; returns `None` otherwise.  Strict `OPEN` filter
+/// (not `OPEN|OPENING|DRAINING`) because W7's `stage_offline_ack`:
+///   - sees OPENING only in a race window the W5
+///     `OfflineSessionService::open_session` closes inside a single
+///     `with_immediate` envelope (Opening → Open is atomic);
+///   - DRAINING means W9 backlog drain is in progress — emitting
+///     new `OFFLINE_LOCAL_ACK` docs into a draining session would
+///     extend the drain set, which is W7-out-of-scope per operator
+///     pin (memory `m3b-w7-review-criteria` criterion 6).
+///
+/// Tx-bound per W5 axis 2 — read inside the same `with_immediate`
+/// envelope as the `acquire_code_tx` + transition composition, so
+/// a concurrent session state flip can't slip between read and
+/// write.
+///
+/// Schema guarantee: partial UNIQUE `ux_offline_active` (W4)
+/// ensures at most one session in OPENING/OPEN/DRAINING per FN;
+/// this query further narrows to OPEN, so at most one row possible.
+pub async fn current_active_session_id_tx(
+    tx: &mut WriteTxConn<'_>,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<OfflineSessionId>> {
+    sqlx::query_scalar::<_, OfflineSessionId>(
+        "SELECT offline_session_id FROM offline_sessions \
+         WHERE fiscal_number = ? AND state = 'OPEN' \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
 /// All `fiscal_documents` rows tied to this session that are NOT
 /// in a terminal state.
 ///

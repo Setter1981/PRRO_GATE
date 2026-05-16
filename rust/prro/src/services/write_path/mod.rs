@@ -14,6 +14,7 @@ pub mod error_routing;
 pub mod mac_recovery;
 pub mod stage_acquire;
 pub mod stage_finalize;
+pub mod stage_offline_ack;
 pub mod stage_send;
 pub mod stage_sign;
 pub mod types;
