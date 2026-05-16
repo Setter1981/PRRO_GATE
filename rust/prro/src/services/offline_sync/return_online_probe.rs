@@ -96,6 +96,38 @@ pub struct ProbeSpec {
     pub fn_sign: CheckSignBlob,
 }
 
+/// W8b — runtime dependencies supplied by the composition root to
+/// [`crate::App::spawn_return_online_probe`].  Carries only what the
+/// App cannot derive from its own state:
+///
+///   - `dps` — the DPS wire channel, owned (`Arc<dyn DpsChannel>`)
+///     so the spawned probe task can hold it `'static`.  Future
+///     two-channel deployments will substitute an `Arc<dyn
+///     DpsChannelRouter>` here without touching App boot semantics.
+///   - `fn_signs` — per-FN signer blob, owned by value.  The App
+///     method enumerates ALL configured FNs via
+///     `fiscal_number_config::list_all` and joins each FN with this
+///     map.  FNs present in `fiscal_number_config` but absent from
+///     this map are NOT added to the probe loop's `Vec<ProbeSpec>`;
+///     a `RETURN_ONLINE_PROBE_FN_SKIPPED_NO_SIGNER` WARN audit is
+///     emitted instead, and other FNs continue.  Graceful skip
+///     keeps the probe loop multi-FN-resilient against config drift
+///     on a single FN.
+///
+/// Tick interval is NOT in this struct — the App method reads it
+/// from `config.offline.clamped_probe_interval_seconds()` and emits
+/// the WARN clamp-audit itself.  Production callers cannot pre-clamp
+/// or override; the clamp + audit live under one App-owned seam.
+///
+/// `Vec<ProbeSpec>` is NOT in this struct — the App method enumerates
+/// FNs and builds the spec list internally; callers cannot
+/// pre-build it or skip enumeration.  This is what makes "enumerate
+/// ALL configured FNs" a verifiable App-method property.
+pub struct ReturnOnlineProbeDeps {
+    pub dps: Arc<dyn DpsChannel>,
+    pub fn_signs: std::collections::HashMap<String, CheckSignBlob>,
+}
+
 /// Outcome of one probe tick for one FN.  Used by the tick-level
 /// API (`run_tick_for_fn`) — the spawn-loop wrapper discards
 /// outcomes (audits are the durable artefact).
@@ -432,11 +464,44 @@ pub fn spawn_probe_loop(
                         {
                             Ok(_) => {}
                             Err(e) => {
-                                tracing::warn!(
+                                // W8b: durable CRITICAL audit on tick
+                                // infrastructure error (DB unreachable
+                                // / audit insert failure inside
+                                // run_tick_for_fn).  Operator MUST see
+                                // a persistent record; tracing alone
+                                // is not sufficient.  If the audit
+                                // append itself fails (e.g. same DB
+                                // issue that caused the tick Err),
+                                // fall back to tracing::error! and
+                                // continue — the loop ticks again on
+                                // the next interval, and audit will
+                                // succeed when the DB recovers.
+                                tracing::error!(
                                     error = %e,
                                     fiscal_number = %spec.fiscal_number,
-                                    "return_online_probe: tick error (DB or audit insert failure); continuing"
+                                    "return_online_probe: tick error (DB or audit insert failure)"
                                 );
+                                let payload = serde_json::json!({
+                                    "fiscal_number": &spec.fiscal_number,
+                                    "error": format!("{e:#}"),
+                                });
+                                if let Err(audit_err) = audit_log::append(
+                                    &pool,
+                                    "node_state",
+                                    &spec.fiscal_number,
+                                    "RETURN_ONLINE_PROBE_LOOP_ERROR",
+                                    Severity::Critical,
+                                    None,
+                                    Some(&payload.to_string()),
+                                )
+                                .await
+                                {
+                                    tracing::error!(
+                                        audit_error = %audit_err,
+                                        fiscal_number = %spec.fiscal_number,
+                                        "return_online_probe: CRITICAL audit insert failed; loop continues"
+                                    );
+                                }
                             }
                         }
                     }
