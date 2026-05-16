@@ -136,23 +136,51 @@ Total: **14 edges** (HIGH-fix Round 1 — the earlier "Opening → Opened on Doc
 ### 4.5 Force-error / manual seam
 
 ```rust
-// rust/prro/src/db/repositories/shifts.rs (proposed)
+// rust/prro/src/db/repositories/shifts.rs (proposed — two methods, not one)
 impl ShiftRepository {
-    /// Operator-driven force-transition into Error / RequiresManualReconciliation.
-    /// Bypasses the whitelist intentionally; requires explicit `evidence_json`
-    /// audit payload describing why the operator (or supervisory automation)
-    /// is short-circuiting normal recovery.  Emits `SHIFT_FORCE_*` audit row
-    /// with Critical severity.
+    /// Operator-driven force-transition into `Error`.  Bypasses the
+    /// whitelist intentionally; requires explicit `evidence_json`
+    /// audit payload describing why the operator (or supervisory
+    /// automation) is short-circuiting normal recovery.  Emits
+    /// `SHIFT_FORCE_TO_ERROR` audit row with Critical severity.
+    ///
+    /// **`Error` is reachable ONLY through this seam.**  No whitelist
+    /// edge in §4.1 lands on `Error`; this is the entire entry surface.
+    /// Operator-action territory (e.g. unrecoverable schema corruption
+    /// manually flagged) — NOT a fallback for unexpected transition
+    /// outcomes.
     pub async fn force_to_error_with_audit(
         tx: &mut WriteTxConn<'_>,
         shift_id: ShiftId,
-        target: ShiftState, // must be Error or RequiresManualReconciliation
+        evidence_json: &str,
+    ) -> sqlx::Result<()>;
+
+    /// Operator-driven force-transition into `RequiresManual
+    /// Reconciliation`.  Bypasses the whitelist intentionally;
+    /// requires explicit `evidence_json` audit payload.  Emits
+    /// `SHIFT_FORCE_TO_MANUAL_RECONCILIATION` audit row with Critical
+    /// severity.
+    ///
+    /// **`RequiresManualReconciliation` is reachable via whitelist
+    /// edges 4 / 6 / 12 / 14 (per §4.1) AND via this seam — and
+    /// nothing else.**  The seam exists for operator-initiated
+    /// escalation outside the normal recovery flow (e.g. operator
+    /// declares a shift unsalvageable based on context the state
+    /// machine can't observe).
+    pub async fn force_to_manual_reconciliation_with_audit(
+        tx: &mut WriteTxConn<'_>,
+        shift_id: ShiftId,
         evidence_json: &str,
     ) -> sqlx::Result<()>;
 }
 ```
 
-Test contract (load-bearing): `transition_state` MUST NOT have a code path reaching `Error` or `RequiresManualReconciliation` outside the whitelist edges in §4.1; force-seam is the only entry.  A `tests/shifts_no_silent_error_paths.rs` scanner test pins this.
+**Two methods, not one with a `target` parameter.**  A single method `force_to_error_with_audit(target: ShiftState)` would invite bugs (caller passes the wrong target) and is harder to grep/audit (`grep "force_to_error_with_audit"` returns sites for both Error and Manual; with two methods grep distinguishes intent).  Type-system overhead is one extra `pub async fn`; safety benefit is structural.
+
+**Test contract (load-bearing — two-tier)**: `tests/shifts_no_silent_error_paths.rs` scanner enforces both tiers:
+
+- **Tier (a) — Error**: `transition_state` MUST NOT have any code path reaching `Error`.  Only `force_to_error_with_audit` reaches `Error`.  No exception.
+- **Tier (b) — RequiresManualReconciliation**: `transition_state` MUST reach `RequiresManualReconciliation` ONLY through edges 4, 6, 12, 14 of §4.1; `force_to_manual_reconciliation_with_audit` is the alternative seam.  No silent path (e.g. `TransitionOutcome::Forbidden` swept into Manual, blanket `_ => RequiresManualReconciliation`).
 
 ## 5. node_state.shift_state synchronisation
 
@@ -283,19 +311,24 @@ Two tables rebuild — `shifts` AND `node_state` — both via the W4-established
 - **`shifts`**:
   - Trigger to restore byte-identically: `shifts_updated_at` (`migrations/001_core_identities.sql:52`).
   - Inbound FK: `fiscal_documents.shift_id → shifts.shift_id ON DELETE RESTRICT` (declared in `migrations/002_fiscal_documents.sql:38` AND re-declared during the W3-era rebuild in `migrations/008_doc_state_sending.sql:118` — the second is the live one).  **CRITICAL: this FK requires the W4 NULL-FK / holding-column dance, NOT bare `defer_foreign_keys`.**  `PRAGMA defer_foreign_keys = ON` defers FK *validation* to COMMIT, but FK *actions* (`RESTRICT`, `CASCADE`) fire at statement time — so `DROP TABLE shifts` with any child `fiscal_documents.shift_id IS NOT NULL` row would fail the `ON DELETE RESTRICT` immediately on populated DBs (the W4 lesson is explicit on this, see `migrations/015_offline_normalize.sql:52-80` for the worked example with `offline_sessions` + the same `ON DELETE RESTRICT` shape).  `fiscal_documents.shift_id` is `BLOB` (nullable per `migrations/008_doc_state_sending.sql:87`), which makes the W4 NULL-stash dance applicable directly.
-  - **Required step sequence for `shifts` rebuild** (mirrors `migrations/015_offline_normalize.sql` exactly):
+  - **Required step sequence for `shifts` rebuild** (mirrors `migrations/015_offline_normalize.sql` exactly, including the `fd_updated_at` suppression dance):
     1. `PRAGMA defer_foreign_keys = ON` — defers FK validation; FK actions still fire at statement time.
-    2. Add temporary holding column on `fiscal_documents` (e.g. `shift_id_stash BLOB`) to preserve values.
-    3. Copy `fiscal_documents.shift_id` into the holding column.
-    4. `UPDATE fiscal_documents SET shift_id = NULL` — so `RESTRICT` action sees no children.
-    5. Snapshot `shifts` into a no-FK temp table.
-    6. `DROP TABLE shifts` — succeeds because no `fiscal_documents.shift_id` row points at it.
-    7. `CREATE TABLE shifts (… state TEXT CHECK (state IN (9 values)) …)` under the SAME name (NOT `_new` + RENAME — that breaks deferred FK validation per W4 lesson).
-    8. Restore `shifts` rows from snapshot (identity map for the 6 existing state values; pre-pilot has zero rows, but the dance must work for populated DBs too).
-    9. Restore `fiscal_documents.shift_id` from the holding column.  By now FK references point at the rebuilt `shifts` (same name); `defer_foreign_keys` defers validation to COMMIT.
-    10. Drop the holding column on `fiscal_documents`.
-    11. Re-create `shifts_updated_at` trigger byte-identically (snapshot DDL before drop; diff after restore must be empty).
-    12. Re-create any indexes on `shifts(state)` byte-identically.
+    2. **Snapshot `fd_updated_at` trigger DDL** (per `migrations/008_doc_state_sending.sql` — the AFTER-UPDATE trigger on `fiscal_documents` that rewrites `updated_at = CURRENT_TIMESTAMP` on any row UPDATE).  `SELECT sql FROM sqlite_master WHERE type='trigger' AND name='fd_updated_at'` captured for byte-identical restore at step 13.
+    3. **`DROP TRIGGER fd_updated_at`** — load-bearing per W4 HIGH-fix lesson (`migrations/015_offline_normalize.sql:96`).  Without this drop, the bookkeeping UPDATEs in steps 6 + 11 would mutate `fiscal_documents.updated_at` for every document with a non-NULL `shift_id`.  Those UPDATEs are FK plumbing, NOT business writes — historical row metadata MUST be preserved verbatim, otherwise migration corrupts the audit trail (per-doc `updated_at` becomes the migration's wall-clock time, not the last real business event).
+    4. Add temporary holding column on `fiscal_documents` (e.g. `shift_id_stash BLOB`) to preserve values.
+    5. Copy `fiscal_documents.shift_id` into the holding column.
+    6. `UPDATE fiscal_documents SET shift_id = NULL` — so `RESTRICT` action sees no children.  **Trigger `fd_updated_at` is suppressed (step 3) so `updated_at` stays untouched.**
+    7. Snapshot `shifts` into a no-FK temp table.
+    8. `DROP TABLE shifts` — succeeds because no `fiscal_documents.shift_id` row points at it.
+    9. `CREATE TABLE shifts (… state TEXT CHECK (state IN (9 values)) …)` under the SAME name (NOT `_new` + RENAME — that breaks deferred FK validation per W4 lesson).
+    10. Restore `shifts` rows from snapshot (identity map for the 6 existing state values; pre-pilot has zero rows, but the dance must work for populated DBs too).
+    11. Restore `fiscal_documents.shift_id` from the holding column.  By now FK references point at the rebuilt `shifts` (same name); `defer_foreign_keys` defers validation to COMMIT.  **Trigger `fd_updated_at` still suppressed.**
+    12. Drop the holding column on `fiscal_documents`.
+    13. **Re-create `fd_updated_at` trigger byte-identically** from the step-2 snapshot.  Diff between captured DDL and post-restore DDL must be empty (acceptance test enforces this).
+    14. Re-create `shifts_updated_at` trigger byte-identically (snapshot DDL before drop; diff after restore must be empty).
+    15. Re-create any indexes on `shifts(state)` byte-identically.
+
+  - **Acceptance test for `fiscal_documents.updated_at` preservation**: implementation PR MUST include a fixture that (a) seeds a `fiscal_documents` row with a known `updated_at` timestamp + non-NULL `shift_id`, (b) runs migration 016, (c) asserts the row's `updated_at` is byte-identical to the seeded value.  Without this test, regression of the `fd_updated_at` suppression dance is silent.
   - Hard FK guard at end (per W4 lesson + step 14 of §9.2 code sketch): `INSERT INTO __m016_fk_guard__ … SELECT count(*) FROM pragma_foreign_key_check` — non-zero count fails the temp table's CHECK constraint and aborts the migration before sqlx commits.
   - Indexes: verify with `SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='shifts'` snapshot before drop.
 
@@ -322,24 +355,31 @@ CREATE TEMP TABLE __m016_fk_guard__ (
 -- ── shifts rebuild — W4 NULL-FK / holding-column dance ───────────
 -- Required because fiscal_documents.shift_id has ON DELETE RESTRICT
 -- and defer_foreign_keys does NOT defer FK ACTIONS (only validation).
--- See migrations/015_offline_normalize.sql:52-80 for the worked
--- example with offline_sessions.
--- (1)  Snapshot trigger DDL + index DDL for diff-zero restore.
--- (2)  ALTER TABLE fiscal_documents ADD COLUMN shift_id_stash BLOB;
--- (3)  UPDATE fiscal_documents SET shift_id_stash = shift_id;
--- (4)  UPDATE fiscal_documents SET shift_id = NULL;
--- (5)  CREATE TEMP TABLE shifts_snapshot AS SELECT … FROM shifts;
--- (6)  DROP TRIGGER shifts_updated_at;
--- (7)  DROP TABLE shifts;
--- (8)  CREATE TABLE shifts (… state TEXT CHECK (state IN (9 values)) …)
+-- See migrations/015_offline_normalize.sql:52-105 for the worked
+-- example with offline_sessions + fd_updated_at suppression.
+-- (1)  Snapshot trigger DDL (fd_updated_at, shifts_updated_at) +
+--      index DDL for diff-zero restore.
+-- (2)  DROP TRIGGER fd_updated_at;
+--      (HIGH per W4 lesson — bookkeeping UPDATEs on fiscal_documents
+--      in steps 5+10 must NOT mutate updated_at; trigger recreated
+--      identically at step 12.)
+-- (3)  ALTER TABLE fiscal_documents ADD COLUMN shift_id_stash BLOB;
+-- (4)  UPDATE fiscal_documents SET shift_id_stash = shift_id;
+-- (5)  UPDATE fiscal_documents SET shift_id = NULL;
+-- (6)  CREATE TEMP TABLE shifts_snapshot AS SELECT … FROM shifts;
+-- (7)  DROP TRIGGER shifts_updated_at;
+-- (8)  DROP TABLE shifts;
+-- (9)  CREATE TABLE shifts (… state TEXT CHECK (state IN (9 values)) …)
 --      — SAME NAME (no _new + RENAME).
--- (9)  INSERT INTO shifts SELECT … FROM shifts_snapshot;
+-- (10) INSERT INTO shifts SELECT … FROM shifts_snapshot;
 --      (identity map for the 6 existing states; pre-pilot zero rows
 --      but dance MUST work for populated DBs.)
--- (10) UPDATE fiscal_documents SET shift_id = shift_id_stash;
--- (11) ALTER TABLE fiscal_documents DROP COLUMN shift_id_stash;
--- (12) Re-create shifts_updated_at trigger byte-identically.
--- (13) Re-create indexes byte-identically.
+-- (11) UPDATE fiscal_documents SET shift_id = shift_id_stash;
+-- (12) ALTER TABLE fiscal_documents DROP COLUMN shift_id_stash;
+-- (13) Re-create fd_updated_at trigger byte-identically from step-1
+--      snapshot.
+-- (14) Re-create shifts_updated_at trigger byte-identically.
+-- (15) Re-create indexes byte-identically.
 
 -- ── node_state rebuild — simpler (no inbound FK on shift_state) ──
 -- (1)  Snapshot trigger DDL + index DDL.
@@ -425,8 +465,9 @@ cargo test -p prro --features test-support  # full suite — no regressions
 **Acceptance criteria**:
 1. 9-state `ShiftState` enum in code + 14-edge whitelist (drift-guard contract — locked-count test enforces the exact number).
 2. Migration rebuilds both `shifts` + `node_state` CHECK constraints atomically.
-3. No silent path to `Error` / `RequiresManualReconciliation` from `transition_state`.
-4. `force_to_error_with_audit` seam exists + audited per §8.
+3. Two-tier scanner contract enforced by `tests/shifts_no_silent_error_paths.rs`: (a) `Error` reachable ONLY via `force_to_error_with_audit` seam — no whitelist edge ever lands on `Error`; (b) `RequiresManualReconciliation` reachable ONLY via whitelist edges 4 / 6 / 12 / 14 of §4.1 OR via `force_to_manual_reconciliation_with_audit` seam — no silent path through `TransitionOutcome::Forbidden`, no blanket `_ → Manual`.
+4. Two distinct force seams exist + audited per §8: `force_to_error_with_audit` emits `SHIFT_FORCE_TO_ERROR` (Critical); `force_to_manual_reconciliation_with_audit` emits `SHIFT_FORCE_TO_MANUAL_RECONCILIATION` (Critical).  No single `force_to_*` method with a `target: ShiftState` parameter — type-system distinction is structural per §4.5 rationale.
+4a. `fiscal_documents.updated_at` byte-identical preservation across migration 016 (per §9.2 step 13 + acceptance test).
 5. 5 new W11-Δ replay fixtures green (total 33).
 6. Full M3a + M3b regression suite green (no fixture rewrites required by this expansion).
 7. `node_state.shift_state` mirror invariant preserved by tests (existing `tests/node_state_*` extended to cover new states).
@@ -453,15 +494,28 @@ After the implementation PR lands (`m3b/shift-state-expansion-impl` per §11), W
 - `stage_offline_ack::run` extended to accept `DocType::ShiftOpen` source (today only `SELL` / `RETURN` / `SERVICE_*` / `Z_REPORT`).  Pattern C landing: SHIFT_OPEN doc → `OFFLINE_LOCAL_ACK`; shift state edge `Created → OpenedLocalPendingDrain` (edge 2 per §4.1) fires inside the same `with_immediate` envelope.
 - Ingress / write-path wiring routes offline `SHIFT_OPEN` through the W10a policy guard *before* reaching `stage_offline_ack` — reserve=2 check becomes active and `OFFLINE_SHIFT_OPEN_REFUSED_INSUFFICIENT_RESERVE` (Critical) starts firing on real attempts.
 - `boot_phase` recovery branch for `OpenedLocalPendingDrain` populated to actually drive the offline `SHIFT_OPEN` doc through W9b drain on return-online (W10a stubbed the arm; W10b lights it up).
-- W10b fixtures cover the full offline-open path end to end:
-  - `w10b_offline_shift_open_landed_local_ack` — pool=2; offline SHIFT_OPEN consumes 1; shift → `OpenedLocalPendingDrain`; reserve check confirms pool=1 remaining = close-reserve floor.
-  - `w10b_offline_shift_open_refused_pool_1` — pool=1 (less than reserve=2 gate); refusal + `OFFLINE_SHIFT_OPEN_REFUSED_INSUFFICIENT_RESERVE` Critical audit.
-  - `w10b_offline_shift_open_drain_acks_lands_opened` — happy path: drain SHIFT_OPEN to Ack with empty trailing backlog → shift edge 5 fires → `Opened` after node mode `GoingOnline → Online`.
-  - `w10b_offline_shift_open_drain_rejects_lands_manual` — edge 6 fires → `RequiresManualReconciliation`; orphan offline SELL/RETURN docs on the shift remain queryable for operator compensation.
+- W10b fixtures split by external-dependency tier:
+  - **Tier 1 — local-only fixtures (no W9b/W12 dependency, land with W10b itself)**:
+    - `w10b_offline_shift_open_landed_local_ack` — pool=2; offline SHIFT_OPEN consumes 1; shift → `OpenedLocalPendingDrain`; reserve check confirms pool=1 remaining = close-reserve floor.
+    - `w10b_offline_shift_open_refused_pool_1` — pool=1 (less than reserve=2 gate); refusal + `OFFLINE_SHIFT_OPEN_REFUSED_INSUFFICIENT_RESERVE` Critical audit.
+  - **Tier 2 — drain-to-Ack fixtures (REQUIRE W9b + W12 merged BEFORE W10b can verify them)**: depend on the W9b backlog-drain orchestrator + W12 KVT2 confirmation extension for `SHIFT_OPEN` (per §13 deferred — W12 today confirms `Sent → Kvt1 → Kvt2 → Ack` only for fiscal docs that went through the online ladder; SHIFT_OPEN-as-`OFFLINE_LOCAL_ACK` confirmation needs a W12 follow-up).  Until W9b + W12 are merged, these fixtures cannot turn green.
+    - `w10b_offline_shift_open_drain_acks_lands_opened` — happy path: drain SHIFT_OPEN to Ack with empty trailing backlog → shift edge 5 fires → `Opened` after node mode `GoingOnline → Online`.
+    - `w10b_offline_shift_open_drain_rejects_lands_manual` — edge 6 fires → `RequiresManualReconciliation`; orphan offline SELL/RETURN docs on the shift remain queryable for operator compensation.
 
-### 12.3 W10a→W10b sequencing rationale
+  Per the sequencing rule in §12.3 below: **W10b is BlockedBy W9b + W12 for the Tier 2 acceptance**.  Operator decides at W10b open-time whether: (a) W10b waits for W9b + W12 to merge before it opens (preferred — single PR closes both ingress and drain proof), OR (b) W10b ships Tier 1 only and Tier 2 lands as a separate "W10b.drain" follow-up after W9b + W12.  Either way, `§Task 10` in the plan closes only when ALL Tier 1 + Tier 2 fixtures are green.
+
+### 12.3 W10a→W10b sequencing + W9b/W12 dependency
 
 W10a alone is reviewable as "policy decision seam + integration with existing stage_acquire / stage_offline_ack / boot_phase arms".  W10b adds the offline `SHIFT_OPEN` doc-type ingress + the recovery drive — a distinct change surface (touches doc-type whitelist + new ingress validation + drain recovery path).  Splitting matches the W7a/W7b pattern and keeps review focused per slice.  W10b is **mandatory follow-up** before §Task 10 in the plan is considered closed; W10a alone does not satisfy the offline-shift-open use case.
+
+**Cross-task dependency**: W10b Tier 2 acceptance fixtures (`w10b_offline_shift_open_drain_acks_lands_opened`, `w10b_offline_shift_open_drain_rejects_lands_manual`) drive a doc end-to-end from `OFFLINE_LOCAL_ACK` through W9b backlog drain to W12 KVT2 confirmation, ending at final DPS `Ack`.  W9b orchestrator and W12 confirmation helper must both exist for those fixtures to turn green.  As of this freeze, neither has landed.  Two viable sequencings:
+
+| Path | Order | Pros | Cons |
+|---|---|---|---|
+| **A — W10b waits for W9b + W12** (recommended) | W10a → W9b → W12 → W10b (single PR covers Tier 1 + Tier 2) | Single PR closes both ingress and drain proof; reviewer sees the full offline-open lifecycle at once | W10a lands earliest; W10b delayed until W9b + W12 stable |
+| **B — W10b ships Tier 1 only, Tier 2 as W10b.drain follow-up** | W10a → W10b (Tier 1 only, ingress + reserve gate) → W9b → W12 → W10b.drain (adds Tier 2 fixtures) | W10b ingress reviewable independently; Tier 2 fixtures land when W9b + W12 are ready | Three slices instead of two on the W10 axis; "§Task 10 closed" criterion harder to track |
+
+Operator picks at W10b open-time.  **`§Task 10` in the plan closes only when ALL W10b Tier 1 + Tier 2 fixtures are green, regardless of which path is chosen** — Path A satisfies this in one PR, Path B in two (W10b ingress merge does NOT close §Task 10 by itself).
 
 ## 13. Out of W14a (this freeze) scope (deferred)
 
