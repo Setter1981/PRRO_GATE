@@ -445,13 +445,17 @@ async fn second_run_after_applied_returns_err_and_does_not_double_consume() {
     // I5 preserved at the pre-check layer (in addition to W4
     // schema's UNIQUE — defence-in-depth).
     let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
-    assert!(
-        matches!(
-            outcome,
-            OfflineAckOutcome::Refused(RefusalReason::DocStateConflict)
+    match &outcome {
+        OfflineAckOutcome::Refused(RefusalReason::DocStateConflict { observed_state }) => {
+            assert_eq!(
+                observed_state, "OFFLINE_LOCAL_ACK",
+                "operator W7 Round 2 LOW-4: observed_state must carry the actual state for audit"
+            );
+        }
+        other => panic!(
+            "expected typed Refused(DocStateConflict {{ observed_state: ... }}); got: {other:?}"
         ),
-        "expected typed Refused(DocStateConflict) on idempotent replay; got: {outcome:?}"
-    );
+    }
     // I5 invariant: code_lnd=2 must remain unconsumed.
     let consumed: i64 = fetch_consumed_count(&pool, FN).await;
     assert_eq!(
@@ -534,15 +538,24 @@ async fn cross_fn_doc_and_code_attribution_is_rejected() {
     let doc_a = insert_signed_doc(&pool, FN_A, 1).await;
 
     // Call stage with FN_B — would attempt to bind FN_A's doc to
-    // FN_B's code + session.  Must refuse.
+    // FN_B's code + session.  Must refuse with the distinct
+    // `CrossFnMismatch` typed variant (operator W7 Round 2 LOW-4:
+    // separate signal from `DocStateConflict` so audit can
+    // distinguish caller-bug-FN from operational state race).
     let outcome = stage_offline_ack::run(&pool, doc_a, FN_B).await.unwrap();
-    assert!(
-        matches!(
-            outcome,
-            OfflineAckOutcome::Refused(RefusalReason::DocStateConflict)
+    match &outcome {
+        OfflineAckOutcome::Refused(RefusalReason::CrossFnMismatch {
+            observed_fiscal_number,
+        }) => {
+            assert_eq!(
+                observed_fiscal_number, FN_A,
+                "observed_fiscal_number must carry the doc's actual FN for audit"
+            );
+        }
+        other => panic!(
+            "cross-FN attribution MUST be refused as typed CrossFnMismatch (operator HIGH-2 + LOW-4); got: {other:?}"
         ),
-        "cross-FN attribution MUST be refused (operator HIGH-2 fix); got: {outcome:?}"
-    );
+    }
     // Neither FN's code pool touched.
     assert_eq!(
         fetch_consumed_count(&pool, FN_A).await,
@@ -614,6 +627,74 @@ async fn concurrent_two_docs_acquire_distinct_codes() {
     };
     assert_eq!(codes, vec![1, 2]);
     assert_eq!(fetch_consumed_count(&pool, FN).await, 2);
+}
+
+// ─── Named coverage for all refused node modes (W7 Round 2 LOW-3) ───
+//
+// Plan §Task 7 line 545 explicitly names `Blocked` / `StopMode` /
+// `CryptoDegraded` / `GoingOnline` as refused modes.  The catch-all
+// `!matches!(Offline | GoingOffline)` branch covers them
+// structurally, but explicit named coverage per operator W7 Round 2
+// LOW-3 pin protects against a future refactor that accidentally
+// narrows the catch-all (e.g., `!= Offline` would silently let
+// GoingOffline pass but also let nothing else through).  Single
+// table-test exhausts all five non-offline modes.
+
+#[tokio::test]
+async fn all_non_offline_modes_refused_with_typed_node_not_offline() {
+    // FN per iteration — partial UNIQUE ux_offline_active permits
+    // at most one active session per FN, so reusing the same FN
+    // across iterations would conflict.  Each iteration uses a
+    // distinct 10-digit FN.
+    let cases: &[(&str, NodeMode)] = &[
+        ("1111111111", NodeMode::Online),
+        ("2222222222", NodeMode::Blocked),
+        ("3333333333", NodeMode::StopMode),
+        ("4444444444", NodeMode::CryptoDegraded),
+        ("5555555555", NodeMode::GoingOnline),
+    ];
+    for (fn_id, mode) in cases {
+        let (_d, pool) = fresh_pool().await;
+        // Override the FN from the default fresh_pool seed so each
+        // test case is self-contained on its own DB.
+        seed_fn(&pool, fn_id).await;
+        seed_node_state(&pool, fn_id, *mode, ShiftState::Opened).await;
+        let session_id = OfflineSessionId::new();
+        seed_offline_session(&pool, fn_id, session_id, OfflineSessionState::Open).await;
+        seed_code(&pool, fn_id, 1).await;
+        let doc_id = insert_signed_doc(&pool, fn_id, 1).await;
+
+        let outcome = stage_offline_ack::run(&pool, doc_id, fn_id).await.unwrap();
+        match &outcome {
+            OfflineAckOutcome::Refused(RefusalReason::NodeNotOffline { mode: observed }) => {
+                assert_eq!(
+                    observed, mode,
+                    "NodeNotOffline must carry the observed mode for audit"
+                );
+            }
+            other => panic!(
+                "FN={fn_id} mode={mode:?}: expected Refused(NodeNotOffline{{mode: {mode:?}}}); got: {other:?}"
+            ),
+        }
+        // Code untouched + doc still SIGNED + audit emitted.
+        assert_eq!(
+            fetch_consumed_count(&pool, fn_id).await,
+            0,
+            "FN={fn_id} mode={mode:?}: code pool must stay untouched"
+        );
+        assert_eq!(
+            fetch_doc_state(&pool, doc_id).await,
+            "SIGNED",
+            "FN={fn_id} mode={mode:?}: doc must stay SIGNED"
+        );
+        let events = fetch_audit_events(&pool, doc_id).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "FN={fn_id} mode={mode:?}: one refusal audit"
+        );
+        assert_eq!(events[0].0, "OFFLINE_ACK_REFUSED");
+    }
 }
 
 // ─── Helper: silence "unused" warnings on imports kept for ergonomic

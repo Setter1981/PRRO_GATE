@@ -110,9 +110,9 @@ pub enum OfflineAckOutcome {
 /// `NodeNotOffline` / `ShiftNotOpened` / `NoActiveSession` are
 /// operational conditions the dispatcher may react to (e.g.,
 /// route back to online path or surface to operator).
-/// `DocStateConflict` / `DocNotFound` correspond to
-/// [`TransitionOutcome::Conflict`] / [`TransitionOutcome::NotFound`]
-/// — race conditions or programming bugs respectively.
+/// `DocStateConflict` / `CrossFnMismatch` / `DocNotFound` are
+/// pre-check failures, carrying observed values for audit
+/// forensics (operator W7 Round 2 LOW-4 fix, 2026-05-16).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefusalReason {
     /// Node mode is not `Offline` or `GoingOffline`.  Carries the
@@ -125,14 +125,23 @@ pub enum RefusalReason {
     /// (race) / `DRAINING` (W9 drain in progress) / `CLOSED` /
     /// `ABORTED` terminal states.
     NoActiveSession,
-    /// `transition_to_offline_local_ack_tx` CAS missed because
-    /// the doc's state is no longer `Signed`.  Concurrent state
-    /// change (e.g., admin override) — caller may re-route the
-    /// doc per the current state.
-    DocStateConflict,
-    /// `transition_to_offline_local_ack_tx` CAS missed because
-    /// the doc row vanished.  Programming bug or DB corruption —
-    /// the doc should exist because stage 3 just signed it.
+    /// Step 5 pre-check found the doc in a state other than
+    /// `Signed` (FN matches the caller's FN).  Concurrent state
+    /// change (e.g., admin override) or idempotent replay —
+    /// caller may re-route the doc per the observed state.
+    /// `observed_state` is the SQLite-text form (e.g.,
+    /// `"OFFLINE_LOCAL_ACK"`, `"PREPARED"`).
+    DocStateConflict { observed_state: String },
+    /// Step 5 pre-check found the doc but with a different
+    /// `fiscal_number` than the caller passed.  Operationally a
+    /// caller bug (mis-passed FN) or, worse, an attempt at cross-
+    /// FN attribution.  Distinct variant from `DocStateConflict`
+    /// per operator W7 Round 2 LOW-4 — fiscal integrity violation
+    /// deserves its own audit signal.
+    CrossFnMismatch { observed_fiscal_number: String },
+    /// Step 5 pre-check did not find the doc row.  Programming
+    /// bug or DB corruption — the doc should exist because stage 3
+    /// just signed it.
     DocNotFound,
 }
 
@@ -254,17 +263,35 @@ pub async fn run(
                     )
                     .await;
                 }
-                Some((state, doc_fn)) if state != "SIGNED" || doc_fn != fn_id => {
-                    // State diverged OR cross-FN mismatch.  Either
-                    // way: typed DocStateConflict refusal.  Operator
-                    // W7 Round 1 HIGH-2: cross-FN doc/code attribution
-                    // is fiscal-integrity-critical; caught here
-                    // before code consumption.
+                Some((_, doc_fn)) if doc_fn != fn_id => {
+                    // Cross-FN mismatch (operator W7 Round 1 HIGH-2
+                    // + Round 2 LOW-4): caller passed FN_B but doc
+                    // belongs to FN_A.  Fiscal-integrity-critical;
+                    // distinct typed variant from state conflict so
+                    // operator audit can distinguish caller-bug
+                    // (mis-passed FN) from operational race (state
+                    // diverged).
                     return audit_and_return_refused(
                         tx,
                         doc_id,
                         &fn_id,
-                        RefusalReason::DocStateConflict,
+                        RefusalReason::CrossFnMismatch {
+                            observed_fiscal_number: doc_fn,
+                        },
+                    )
+                    .await;
+                }
+                Some((state, _)) if state != "SIGNED" => {
+                    // State diverged (FN matches): concurrent
+                    // admin override / idempotent replay.  Caller
+                    // may re-route the doc per observed state.
+                    return audit_and_return_refused(
+                        tx,
+                        doc_id,
+                        &fn_id,
+                        RefusalReason::DocStateConflict {
+                            observed_state: state,
+                        },
                     )
                     .await;
                 }
