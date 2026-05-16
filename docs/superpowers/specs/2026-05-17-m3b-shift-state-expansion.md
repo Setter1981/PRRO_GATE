@@ -96,6 +96,47 @@ While `shift.state == OpenedLocalPendingDrain`:
 
   W9b drain failure paths re-enter §4.1 edges 6 (open-doc reject → manual) and 14 (close-doc reject → manual) via the §6.3 universal `EscalateManual` rule, NOT the per-class taxonomy of §6.2/§6.4 (drain crossed the local-commit threshold; wire-side recovery semantics don't apply).
 
+### 3.5 Operational gravity of `RequiresManualReconciliation` (load-bearing philosophy pin — Round 7)
+
+**`RequiresManualReconciliation` is a "ЧП из ЧП" (emergency-of-emergencies) state — NOT a normal recovery target.**  This is a load-bearing design principle that constrains all subsequent decisions (recovery taxonomies §6, retry budgets, audit cardinality, operational alerting).  Implementation MUST treat every Manual landing as a catastrophe-budget event.
+
+**Real-world cost per Manual landing**:
+1. **Customer impact**: orphan SELL receipts are in customer hands with fiscal-looking stamps that DPS does not honour.  Refunds blocked via normal RETURN flow (per §5.7 L3) — customer must wait for operator's manual correction filing.
+2. **Operator cost**: ручне фіскальне коригування filing in DPS cabinet by operator's accountant — typically 4-16 hours of accountant time per stuck shift, depending on doc count.  Per 140-FN pilot scale, even a 1%/year Manual rate = ~1.4 incidents/year * 8h average = ~11 person-hours/year minimum.  10% rate = catastrophic.
+3. **Tax inspector exposure**: every Manual landing creates a permanent forensic trail (per §8 Critical retention ≥ 7 years).  Tax inspector visits MUST be able to reproduce the full landing context — wire trace, canonical payload, DPS response, node state, shift timeline.  Missing forensic data = potential штраф under UA fiscal regulations.
+4. **Operational alert**: Manual landing during business hours is page-able — operator's accountant + IT need to know within minutes, NOT discovered next morning when X-report shows the shift status.
+
+**Design implications (cross-cut all §§4-12)**:
+- **Recovery taxonomies (§6) MUST bias toward `HoldRetry` / `RollbackToOpened` / `StayOpeningReissue` over `EscalateManual` wherever physically safe.**  `EscalateManual` is the last-resort verdict, NOT a default bucket for "we don't know what to do".
+- **Retry budgets MUST be generous** before classifier may switch from `HoldRetry` to `EscalateManual` — see §6.5 (Round 7) for minimum-retry-attempts pin.
+- **Every Manual landing audit row MUST include a forensic snapshot** capturing the full landing context for tax-inspector reproducibility — see §8 forensic-snapshot requirement (Round 7).
+- **Every Manual landing MUST trigger an out-of-band operator alert** within ≤ 60 seconds — see §8 pager/alert delivery channel pin (Round 7).
+- **No `force_resolve_manual_reconciliation_with_audit` seam (§15 Q2 RESOLVED)** — once stuck, the shift_id is terminal.  Adding an exit seam would invite "fix later" muscle memory and dilute the gravity.
+
+**What this principle FORBIDS in future PRs**:
+- Code paths that silently bucket "unknown error" → `EscalateManual` without enumeration in §6.x classification tables.
+- Manual landings without forensic snapshot capture.
+- Manual landings without out-of-band alert dispatch.
+- Refactors that conflate `RequiresManualReconciliation` with `Error` (their gravity profiles are distinct — Manual is operator-fixable via accounting; Error is structural breach requiring engineering investigation).
+
+Reviewer MUST refuse impl PRs that violate any of the above.  Future architecture decisions (W10 / W12 / M3c orphan-compensation-surface) MUST cite this section when proposing changes that could increase Manual-landing rates or weaken forensic/alert requirements.
+
+**Empirical calibration (operator-pinned, Round 7)**: per operator's 4+ years of UA PRRO production operations experience (across retail + HoReCa, multiple operator IDs, prior generations of fiscal hardware/software), **Manual-recon-class incidents have effectively zero observed base rate** — not once in 4 years has the operator personally witnessed a drain-reject / hard-close-reject / orphan-doc-class catastrophe in normal operations.  This is the calibration target: the system is being designed for **failure modes that have not been seen but cannot be ruled out**.
+
+**Failure modes considered (non-exhaustive enumeration; each justifies design gravity)**:
+1. **DPS server-side bug** — DPS rejects a perfectly valid `SHIFT_OPEN` / `Z_REPORT` with a hard-reject code that normally fires only for malformed payloads.  Operator-side cannot prevent; recovery via DPS bug-fix + re-submission window.
+2. **Gateway-side canonical payload corruption** — library version mismatch on deploy, ECC-RAM bit flip mid-build, race-condition on the build path we haven't caught, memory pressure causing partial OOM-kill recovery.  Crypto signature applies to corrupted bytes; DPS rejects.
+3. **Certificate / schema rotation gone wrong** — DPS rolls cert chain or canonical schema in a maintenance window; gateway misses the rotation announcement; every payload starts rejecting until operator's IT deploys the updated cert/lib.  Window of damage = minutes to hours.
+4. **MAC chain desync** — fresh-DB-vs-DPS-history mismatch (per `project_dps_mac_bootstrap` memory) OR manual DB intervention that desyncs the chain.  Every subsequent doc fails MAC verification at DPS.
+5. **168h cumulative-offline budget exhaustion during outage** — node enters `Blocked`; any in-flight close attempt during that window forced to Manual via Server -11 (legal limit).  Per §6.5 retry table: -11 = 0 attempts, immediate `EscalateManual`.
+6. **Hardware failure during commit** — disk write failure mid-transaction, WAL corruption.  sqlx single-tx + W4 discipline should catch these via FK guard + transaction rollback, but edge cases (mid-fsync power loss with WAL not yet checkpointed) could leave inconsistent state requiring boot-time §5.3 mirror check + force-transition.
+7. **Tax-law / regulation change** — DPS server-side starts enforcing previously-optional fields (e.g. new excise marker requirement under updated regulations); all in-flight close docs reject until gateway code adapts.  Window of damage = time from law change to gateway deploy.
+8. **Operator IT misconfiguration during deploy** — wrong cert installed for FN, wrong endpoint URL, wrong key-to-FN binding.  Usually caught at boot via crypto smoke test, but edge cases (cert valid but FN-binding wrong) reach DPS and reject as `FiscalNumberNotRegistered`.
+9. **Adversarial / abnormal DPS response** — DPS returns malformed XML, unexpected status code, or unauthenticated response.  Captured by `DpsError::Decode` → §6.5 immediate `EscalateManual`.  Extremely unlikely but theoretically possible.
+10. **Cosmic-ray-class transport corruption** — TLS layer should catch this via MAC, but bit flips before TLS encapsulation OR after TLS decapsulation in gateway memory could corrupt canonical bytes silently.  Defence: re-verify canonical hash post-deserialize before commit.
+
+The empirical rarity is a **feature** of the operating environment (DPS is robust; UA fiscal regulations are stable; operators are professional), NOT a license to weaken the design.  A fire alarm that has never gone off in 4 years must remain trustworthy precisely because, when it does fire, it will be a once-in-a-decade event with full forensic load on the system that captured it.
+
 ### 3.4 Scope exclusion — operator identity NOT modeled (Round 6 B-M5)
 
 The shift state machine deliberately does NOT model the cashier / operator who owns a given shift.  Reasoning:
@@ -497,6 +538,30 @@ pub enum ShiftOpenRecoveryClass {
 
 **Boot-recovery branch matches on `ShiftOpenRecoveryClass`**: when boot reconciliation walks a shift in `Opening` with linked `SHIFT_OPEN` doc in `Rejected` / `ErrorRetryable`, it classifies via the table above (NOT via `RoutingDecision.retry_class` from the doc-state-machine layer) and drives the appropriate shift edge.
 
+### 6.5 Retry budget minimums before `EscalateManual` (Round 7 — operational gravity §3.5)
+
+Per the §3.5 "ЧП из ЧП" principle, the classifier MUST NOT switch from `HoldRetry` to `EscalateManual` on a transient-class error until a **minimum retry budget** has been exhausted.  Switching too aggressively burns the catastrophe budget on what was actually a transient DPS hiccup.
+
+**Pinned minimums** (impl PR may set higher per W9b/stage_send config, MUST NOT set lower):
+
+| Error class | Minimum attempts before `EscalateManual` permitted | Backoff shape | Rationale |
+|---|---|---|---|
+| `DpsError::Transport(_)` (TCP timeout, connection refused, TLS handshake fail, HTTP 5xx) | **20 attempts** spread over ≥ **30 minutes** wall-clock | exponential 1s → 2s → 4s → … capped at 60s; jitter ±10% | Real-world DPS test-server outages can last 5-15 min (per `project_dps_rate_limit` memory: status=-4 cooldown 5+ min); 20-attempt budget covers the rate-limit window comfortably without false-escalating |
+| `DpsError::Server { code: -3 }` (transient DPS-side retry signal) | **30 attempts** spread over ≥ **60 minutes** | exponential capped at 120s; jitter ±10% | -3 is DPS's explicit "try again later" signal — operator should NOT see Manual landing on this class until DPS has been continuously sending -3 for over an hour (genuine outage signal) |
+| `DpsError::Server { code: -11 }` (168h cumulative-offline limit; node→`Blocked`) | **0 attempts** — `EscalateManual` immediate | n/a | Legal limit; retry cannot resolve.  Operator must intervene |
+| `DpsError::Server { code: -5 / -7 / -8 / -9 / -10 }` (XML/builder hard rejects) | **3 attempts** spread over ≥ **5 minutes** | linear 60s | Hard rejects are deterministic — retry primarily to rule out transient parse-state glitches; 3 attempts confirm the reject is persistent |
+| `DpsError::Authorization { kind: FiscalNumberNotRegistered }` | **0 attempts** — `EscalateManual` immediate | n/a | Configuration error; retry cannot fix |
+| `DpsError::Decode(_)` / `ServerFiscalIdMismatch` / `Internal` / `QueryNotSupported` | **0 attempts** — `EscalateManual` immediate | n/a | Wrapper/contract bugs; engineering investigation required |
+| MAC-recovery orchestrator running | hold indefinitely (`MacRecoveryInProgress`); re-classify after orchestrator completes | n/a | Different state machine |
+
+**Implementation contract**:
+- `ShiftCloseRecoveryClass::HoldRetry` and `ShiftOpenRecoveryClass::HoldRetry` MUST carry an internal `attempt_count` + `first_failure_at` to enforce the minimums.
+- Classifier MUST refuse to escalate transient-class errors until BOTH (a) attempt count ≥ minimum AND (b) wall-clock elapsed ≥ minimum window.
+- Each retry attempt emits a `SHIFT_RECOVERY_RETRY_ATTEMPTED` (Info severity, NEW audit — added to §8) row with `{shift_id, recovery_class, attempt_count, prior_error_class}` for forensic timeline reconstruction.
+- Operator-driven force seam (`force_to_manual_reconciliation_with_audit`) bypasses the retry budget — operator may declare "stop retrying" out-of-band if they have business-context the system doesn't (e.g. they know the DPS server is down for scheduled maintenance over the weekend).
+
+**Calibration empirics (Round 7 — operator-pinned)**: per operator's 4+ years of UA PRRO production experience (`feedback_manual_recon_catastrophe` memory), Manual-recon-class landings have effectively zero base rate in normal operation.  The retry minimums above are sized so that an aggressive operator-set retry ceiling (e.g. impl PR sets `Transport` to 50 attempts) still respects the "ЧП из ЧП" bar; tightening below the table values would erode the bar.
+
 ## 7. Reserve rule extension (W10 docs follow-up)
 
 The PR #62 reserve rule is **close-code reserve = 1** (FN-scoped, while shift open and offline Z_REPORT not emitted).  This freeze extends it for the offline-open seam:
@@ -570,6 +635,95 @@ POS UI MAY surface a "remaining offline codes" counter to give the cashier early
 | `RETURN_REFERENCES_ORPHAN_SALE` | **Critical** | `{fiscal_number, attempted_return_request_id, referenced_doc_id, referenced_doc_state, referenced_shift_state}` | RETURN ingress references a `fiscal_documents` row on a shift in `RequiresManualReconciliation` — refused at ingress (Round 6 B-H1 / §5.7 L3) |
 
 Critical severity events MUST surface immediately on operator audit dashboards.
+
+### 8.1 Forensic snapshot capture for Manual landings (Round 7 — operational gravity §3.5)
+
+**Every Manual-landing audit row MUST carry a forensic snapshot in its `evidence_json` payload** sufficient for tax-inspector reproducibility 7+ years later.  Triggering events: `SHIFT_OPEN_DRAIN_REJECTED` / `SHIFT_CLOSE_DRAIN_REJECTED` / `SHIFT_REQUIRES_MANUAL_RECONCILIATION` / `SHIFT_FORCE_TO_MANUAL_RECONCILIATION` / `SHIFT_STATE_MIRROR_DRIFT_DETECTED` / `SHIFT_LINKED_DOC_STATE_INCOMPATIBLE` / `OFFLINE_SHIFT_OPEN_REFUSED_INSUFFICIENT_RESERVE` / `RETURN_REFERENCES_ORPHAN_SALE`.
+
+Pinned snapshot shape (the four sections are the contract floor; impl may extend):
+
+```json
+{
+  "snapshot_version": "1.0",
+  "captured_at_kyiv_epoch": <integer — same TZ convention as §9.3 timestamp pin>,
+
+  "wire_context": {
+    "transport_trace_last_n": [/* last 10 DPS request/response pairs, full headers + body, redacted of sensitive cert material */],
+    "last_dps_response_raw": "<base64 or escaped — DPS server's exact bytes>",
+    "last_dps_error_class": "DpsError::Authorization { kind: DocumentReject } | ...",
+    "last_dps_server_code": -8,
+    "channel_used": "WebCheck | DfsHttp | ...",
+    "channel_endpoint": "<URL>",
+    "tls_session_summary": "<TLS version, cipher suite, peer cert fingerprint>"
+  },
+
+  "canonical_payload": {
+    "doc_id": "<UUID>",
+    "doc_type": "SHIFT_OPEN | Z_REPORT | ...",
+    "schema_version": "<canonical envelope schema_version per INV-07>",
+    "canonical_bytes": "<base64 — exact bytes that were hashed + signed>",
+    "canonical_hash": "<hex>",
+    "signature_present": true,
+    "signature_alg": "DSTU 4145-2002"
+  },
+
+  "shift_timeline": {
+    "shift_id": "<UUID>",
+    "transitions_last_n": [
+      {"from": "Created", "to": "OpenedLocalPendingDrain", "at_kyiv_epoch": ..., "trigger_audit_event_id": "..."},
+      ...
+    ],
+    "linked_open_doc_id": "<UUID or null>",
+    "linked_open_doc_state": "OfflineLocalAck | Ack | ...",
+    "linked_close_doc_id": "<UUID or null>",
+    "linked_close_doc_state": "..."
+  },
+
+  "node_state_snapshot": {
+    "fiscal_number": "...",
+    "mode": "Offline | GoingOnline | Online | ...",
+    "shift_state": "...",
+    "current_shift_id": "...",
+    "last_known_mac": "<hex or null>",
+    "offline_session_id": "<UUID or null>",
+    "offline_codes_free": <integer>,
+    "offline_codes_total": <integer>,
+    "cumulative_offline_ms_in_168h_window": <integer>,
+    "node_state_updated_at_kyiv_epoch": ...
+  }
+}
+```
+
+**Implementation MUST refuse to land a Manual transition without the snapshot present.**  This is a runtime invariant: `force_to_manual_reconciliation_with_audit` and all whitelist edges 4 / 6 / 12 / 14 land via a helper that validates `evidence_json` against the snapshot schema (serde_json::Value parse + schema-version check + required-field presence) and **panics on missing fields in debug builds, hard-errors in release**.  Refusal mode = "the Manual transition does NOT commit; the original error is re-raised so the caller sees the bug".  Better to fail loudly than to lose forensic evidence.
+
+**Size budget**: snapshot is bounded by `transport_trace_last_n = 10` + `transitions_last_n = 20`.  Realistic max per-snapshot size = ~50 KiB.  At 1.4 Manual landings/year worst case at 140-FN pilot scale (per §3.5 calibration), aggregate storage = ~70 KiB/year — negligible.
+
+**Redaction rule**: sensitive material in `wire_context.transport_trace_last_n` (private key bytes, cert chain private components if accidentally captured) MUST be redacted at snapshot capture time, NOT at retention/audit-query time.  Redaction in the helper before insert; tested via `tests/forensic_snapshot_redaction.rs` (new).
+
+### 8.2 Out-of-band operator alert delivery (Round 7 — operational gravity §3.5)
+
+**Every Manual-landing Critical audit MUST trigger an out-of-band operator alert within ≤ 60 seconds wall-clock.**  Logging Critical to `audit_log` is necessary but NOT sufficient — operator MUST be paged immediately so they can intervene before more orphan docs accumulate.
+
+**Pinned contract** (impl PR specifies the delivery adapter; spec pins the requirements):
+
+| Aspect | Requirement |
+|---|---|
+| Delivery channels | Pluggable (operator config); MUST support at minimum: Telegram bot webhook, generic HTTP POST webhook, SMTP email.  SMS / Slack / etc may be added as optional adapters |
+| Channel parallelism | Operator MAY configure ≥ 1 channel; ≥ 1 channel is mandatory at runtime (boot validates) |
+| Delivery deadline | ≤ 60 seconds from audit_log row commit to first successful channel acknowledgment.  Retry budget per channel: 3 attempts at 5s/15s/45s — if all fail, escalate to next channel; if all channels fail, surface `OPERATOR_ALERT_DELIVERY_FAILED` Critical audit (loss-of-loss-detection event) |
+| Idempotency | Each Manual landing produces exactly ONE alert dispatch attempt; alert helper keyed by `audit_log.audit_id` to prevent double-paging on retry |
+| Acknowledgment trail | When operator acknowledges receipt (Telegram /ack command, webhook ack URL, email reply parser), helper writes `OPERATOR_ALERT_ACKNOWLEDGED` Info audit with `{audit_id, channel, acknowledged_at_kyiv_epoch, ack_operator_handle}` — closes the loop for tax inspector forensic timeline |
+| Boot-time validation | At `App::boot`, the alert helper MUST verify ≥ 1 configured channel is reachable (smoke ping); refuse boot with `STARTUP_REFUSED_ALERT_UNREACHABLE` if not.  Rationale: a system that can land in Manual but cannot tell the operator is operationally hostile — block boot rather than ship a silent failure mode |
+| Payload | Alert MUST include: `fiscal_number`, `shift_id`, `audit event type`, `severity`, `evidence_json.snapshot_version` reference, `kyiv-local timestamp`, deep link to operator dashboard (configurable URL template) for one-click investigation |
+| Out-of-scope (impl PR responsibility, NOT this freeze) | Specific Telegram bot token storage / SMTP server config / channel adapter code lives in `services/operator_alert/` (NEW module per impl PR); freeze pins the contract floor only |
+
+**Two new audit events added to §8 table for the alert subsystem**:
+
+| Event type | Severity | Payload | Trigger |
+|---|---|---|---|
+| `OPERATOR_ALERT_DELIVERY_FAILED` | **Critical** | `{fiscal_number, shift_id, source_audit_id, attempted_channels, last_error_per_channel}` | all configured alert channels failed to deliver within 60s budget — loss-of-loss-detection event |
+| `OPERATOR_ALERT_ACKNOWLEDGED` | Info | `{source_audit_id, channel, acknowledged_at_kyiv_epoch, ack_operator_handle}` | operator confirmed receipt via configured ack channel |
+| `SHIFT_RECOVERY_RETRY_ATTEMPTED` | Info | `{shift_id, recovery_class, attempt_count, prior_error_class, prior_dps_code}` | per §6.5 retry budget — each attempt emits one row for forensic timeline reconstruction |
 
 **Audit-cardinality residual** (cross-ref PR #62 §7b L3 — `OFFLINE_Z_REPORT_FAILED` dedup deferred): under sustained offline period or sustained drain-reject loop, several of the new audits (`SHIFT_OPEN_PENDING_DRAIN_OP_REFUSED` Warning per failed online op; `OFFLINE_CODE_RESERVED_FOR_CLOSE` Warning per refused offline op once reserve floor reached) can flood at scale.  The PR #62 §7b L3 dedup design (collapse consecutive same-class rows into one durable row with `first/last_failure_at` + `consecutive_count`) applies symmetrically here — future runtime-composition layer should adopt the same dedup pattern for shift-state-machine events when it lands.  Not blocking for W14a; flagged so the impl PR review does not require dedup engineering up front.
 
