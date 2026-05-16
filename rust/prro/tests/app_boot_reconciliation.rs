@@ -12,8 +12,11 @@
 //!   #1   (a) FN absent → bootstrap.
 //!   #2   (b) FN+ONLINE+no pending → idempotent no-op.
 //!   #3   (c) per-DocState dispatch matrix (subset for W9.3).
-//!   #4   (d) OFFLINE refusal — parametrised over Offline /
-//!        GoingOffline / GoingOnline (freeze §10.1 #4-bis).
+//!   #4   (d) GOING_ONLINE refusal — M3b W7b update (2026-05-16):
+//!        only GoingOnline still refuses at branch (d); Offline /
+//!        GoingOffline fall through to per-doc dispatch via the
+//!        W7b post-sign dispatcher
+//!        (`services::write_path::dispatch::dispatch_post_sign`).
 //!   #5   (e1)→(c) cascade: PRRO_GATE-ah8 verbatim — shift_state=
 //!        Opened + pending doc → no `upsert_initial`.
 //!   #6   (e2) orphan shift no-doc → shift→Error + node_state.
@@ -889,4 +892,149 @@ async fn branch_partition_exhaustive_matrix() {
              expected {expected}, got {outcome:?}"
         );
     }
+}
+
+// ─── M3b W7b boot-level integration (deps=Some, full production path) ──
+//
+// Operator PR #57 Round 2 MED fix (2026-05-16): prior round delivered
+// only a deps=None proof (boot reaches per-doc dispatch).  Existing
+// test infrastructure (`StubDpsChannel` + `det_signing_ctx` from
+// `common::*`) makes the deps=Some path testable without 170-LOC
+// substrate mock construction.  This test closes the production-path
+// proof gap: full chain `run_boot_reconciliation → dispatch_pending_doc
+// → dispatch_post_sign → stage_offline_ack`.
+
+mod common;
+
+#[tokio::test]
+async fn boot_with_deps_routes_offline_signed_doc_to_offline_local_ack() {
+    use common::{ack, det_signing_ctx, StubDpsChannel};
+    use prro::config::AppConfig;
+    use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
+    use prro::transports::dps::dto::CheckSignBlob;
+    use prro::App;
+
+    // Build App + DB.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("w7b.db");
+    let toml_text = format!(
+        r#"
+app_name = "prro"
+version  = "0.1.0"
+
+[database]
+db_path = "{}"
+
+[admin_ui]
+enabled = false
+listen  = "127.0.0.1:8443"
+"#,
+        db_path.display().to_string().replace('\\', "/")
+    );
+    let cfg = AppConfig::from_toml(&toml_text).expect("config parse");
+    let app = App::boot(cfg).await.expect("App::boot");
+    let pool = app.db().clone();
+
+    // Seed: FN OFFLINE + OPENED + active OPEN session + 1 code +
+    // 1 SIGNED doc.  This is the exact end-to-end fixture operator
+    // specified.
+    seed_fn_config(&pool, "1234567890").await;
+    seed_node_state(&pool, "1234567890", "OFFLINE", "OPENED", 1).await;
+    let session_id_bytes: [u8; 16] = [0xAA; 16];
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, 'OPEN', '2026-05-16T00:00:00Z')",
+    )
+    .bind(&session_id_bytes[..])
+    .bind("1234567890")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_lnd) VALUES (?, ?)")
+        .bind("1234567890")
+        .bind(42_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let doc = seed_doc_in_state(&pool, "1234567890", 0x77, "SIGNED").await;
+
+    // StubDpsChannel: empty response queue + spy panicking on any
+    // call — proves stage_send is NEVER invoked on offline branch
+    // (criterion 6 of `m3b-w7b-review-criteria` end-to-end).
+    let stub = StubDpsChannel::with_spy(
+        Ok(ack("unused-W7b-violation")),
+        Box::new(|| {
+            panic!(
+                "W7b violation: stage_send/DPS must NOT be invoked on offline branch \
+                 (operator W7b criterion 6)"
+            )
+        }),
+    );
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xDEu8, 0xAD, 0xBE, 0xEF]);
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    // Run full boot reconciliation with deps.
+    app.reconcile_pending_with(deps)
+        .await
+        .expect("reconcile_pending_with must succeed on offline branch");
+
+    // Critical: doc transitioned Signed → OfflineLocalAck.
+    assert_eq!(
+        doc_state(&pool, doc).await,
+        "OFFLINE_LOCAL_ACK",
+        "boot + W7b dispatcher must route offline SIGNED doc to OFFLINE_LOCAL_ACK"
+    );
+    // Code consumed.
+    let consumed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM offline_codes \
+         WHERE fiscal_number = ? AND consumed_at IS NOT NULL",
+    )
+    .bind("1234567890")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        consumed, 1,
+        "exactly one offline code consumed via boot dispatch"
+    );
+    // transport_trace stays empty (stage_send never invoked).
+    let tt_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transport_trace")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        tt_count, 0,
+        "transport_trace must stay empty — stage_send not invoked on offline boot path"
+    );
+    // StubDpsChannel call count == 0.
+    assert_eq!(
+        stub.call_count(),
+        0,
+        "StubDpsChannel.send_chk must not be invoked"
+    );
+    // OFFLINE_LOCAL_ACK_APPLIED audit present.
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_LOCAL_ACK_APPLIED").await,
+        1,
+        "exactly one OFFLINE_LOCAL_ACK_APPLIED audit row"
+    );
+    // NODE_STATE_BOOT_RECONCILED audit present + by_outcome.offline_local_ack_emitted == 1.
+    let payload: String = sqlx::query_scalar(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE event_type = 'NODE_STATE_BOOT_RECONCILED' LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        v["by_outcome"]["offline_local_ack_emitted"], 1,
+        "histogram bucket offline_local_ack_emitted must be 1 in audit payload"
+    );
+    assert_eq!(v["pending_visited"], 1, "exactly one pending doc visited");
 }

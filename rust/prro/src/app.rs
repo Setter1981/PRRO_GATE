@@ -42,7 +42,17 @@ pub enum BootError {
     #[error("DB integrity check failed: {reason}")]
     IntegrityCheckFailed { reason: String },
 
-    #[error("FN {fiscal_number} is in OFFLINE mode — start with --recover-offline M3b CLI")]
+    /// M3b W7b update (2026-05-16): post-merge, only `GoingOnline`
+    /// mode triggers this fail-fast at boot.  `Offline` /
+    /// `GoingOffline` modes no longer abort boot — boot reconciliation
+    /// processes their docs through the W7b post-sign dispatcher
+    /// (`services::write_path::dispatch::dispatch_post_sign`).  This
+    /// variant name is preserved for ABI continuity but the
+    /// operator-facing message reflects the new semantic.
+    #[error(
+        "FN {fiscal_number} is in GOING_ONLINE mode — W9 backlog drain owns this FN's reconciliation; \
+         re-run boot once the drain has completed and node_state.mode is Online or Offline again"
+    )]
     OfflineModeRefusal { fiscal_number: String },
 
     #[error("database error during boot: {0}")]

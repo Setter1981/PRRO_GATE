@@ -1029,8 +1029,14 @@ pub enum BranchOutcome {
         histogram: DispatchHistogram,
         sub_branch: SubBranch,
     },
-    /// (d) Mode ∈ {Offline, GoingOffline, GoingOnline} → refuse
-    /// boot; caller surfaces `BootError::OfflineModeRefusal`.
+    /// (d) M3b W7b update (2026-05-16): mode == `GoingOnline` →
+    /// refuse boot; caller surfaces `BootError::OfflineModeRefusal`.
+    /// Pre-W7b this also covered `Offline` / `GoingOffline`, but
+    /// those modes now fall through to per-doc dispatch via W7b's
+    /// `dispatch_post_sign` (see `dispatch_pending_doc::DocState::Signed`
+    /// and `dispatch_prepared_via_chain`).  `GoingOnline` stays
+    /// refused because that's W9 backlog-drain territory and
+    /// boot reconciliation defers to W9 for those FNs.
     OfflineRefusal {
         observed_mode: NodeMode,
     },
@@ -1229,12 +1235,29 @@ pub async fn run_boot_reconciliation(
         return Ok(outcome);
     }
 
-    // From here: row.mode == NodeMode::Online.
+    // From here: row.mode is one of {Online, Offline, GoingOffline}.
+    // (M3b W7b: branches d + f already returned for refused modes;
+    // Offline / GoingOffline fall through to per-doc dispatch via
+    // W7b's `dispatch_post_sign`.)
     // Decision: pending docs?  shift_state ∈ {Opening, Closing}?
     let pending = fiscal_documents::list_pending_for_fn(pool, fiscal_number).await?;
 
     // ── Branch (e2) — mid-transition shift orphan (no pending) ───
-    if matches!(row.shift_state, ShiftState::Opening | ShiftState::Closing) && pending.is_empty() {
+    //
+    // M3b W7b operator PR #57 Round 2 HIGH fix (2026-05-16):
+    // gated on `row.mode == NodeMode::Online`.  Branch (e2)
+    // performs invasive shift recovery (orphan shifts → ERROR
+    // + node_state.shift_state → CLOSED) which is an
+    // online-mode invariant.  For Offline / GoingOffline modes
+    // shift lifecycle is managed by the W4-W6 offline session
+    // machinery, NOT by boot reconciliation; (e2) must NOT
+    // touch shift state for those modes.  Offline / GoingOffline
+    // + no pending falls through to branch (b) below
+    // (idempotent no-op).
+    if row.mode == NodeMode::Online
+        && matches!(row.shift_state, ShiftState::Opening | ShiftState::Closing)
+        && pending.is_empty()
+    {
         // LOW 5 fix: SELECT shifts + per-shift UPDATE + node_state
         // reset ALL inside a single `with_immediate` envelope.  The
         // BEGIN IMMEDIATE serialisation removes the read-then-update
