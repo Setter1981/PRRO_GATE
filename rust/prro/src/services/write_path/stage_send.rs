@@ -9,14 +9,19 @@
 //! W7 minimal `SendOutcome` / `classify_send_outcome` shim was dropped
 //! wholesale and replaced with `WireDecision::{Sent, Routed(decision)}`
 //! dispatch (freeze §3 + W0-3 §2 + §2.1).  4-pre source-state CAS is
-//! extended from `Signed → Sending` to `(Signed | ErrorRetryable) → Sending`
-//! per HIGH 3 §4.2 — Pattern B retry-path edge.
+//! extended from `Signed → Sending` to
+//! `(Signed | ErrorRetryable | OfflineLocalAck) → Sending` per HIGH 3
+//! §4.2 (Pattern B retry-path edge) + M3b W9a (Pattern C drain-path
+//! edge: the W9 backlog drain replays offline-acked docs through this
+//! same 4-pre/4a/4b ladder).
 //!
 //! # Caller obligation — retry-loop policy (R-W10.2-review HIGH 1)
 //!
-//! 4-pre CAS allowlist `(Signed | ErrorRetryable) → Sending` makes
-//! [`run`] willing to re-attempt any doc in `ErrorRetryable`,
-//! regardless of which `RetryClass` put it there.  The routing fn is
+//! 4-pre CAS allowlist `(Signed | ErrorRetryable | OfflineLocalAck)
+//! → Sending` makes [`run`] willing to re-attempt any doc in
+//! `ErrorRetryable`, regardless of which `RetryClass` put it there;
+//! `OfflineLocalAck` source is reserved for the W9 backlog drain
+//! caller (M3b W9b).  The routing fn is
 //! pure; the policy of "which retry classes warrant another wire
 //! send" lives one layer up (worker dispatcher, W11+).  Callers MUST
 //! respect this table:
@@ -125,6 +130,22 @@ pub enum StageSendError {
     /// rather than a silent narrowing.
     #[error("stage 4 lnd out of i32 range: {lnd}")]
     LndOutOfRangeI32 { lnd: i64 },
+
+    /// **M3b W9a (2026-05-16):** the doc is in `OfflineLocalAck` but
+    /// `fiscal_documents.offline_fiscal_no` is NULL — a W7a invariant
+    /// breach.  W7a's `transition_to_offline_local_ack_tx` writes
+    /// `offline_fiscal_no = consumed code_lnd` atomically with the
+    /// state flip; the only way to observe `OfflineLocalAck` with
+    /// NULL `offline_fiscal_no` is a raw-SQL bypass or a future
+    /// schema migration regression.  Surfaced BEFORE 4-pre CAS so
+    /// no `Sending` marker is written without the data needed to
+    /// populate `CheckEnvelope.id_offline` (DPS wire contract:
+    /// `id_offline = offline_fiscal_no.to_string()`).
+    #[error(
+        "stage 4 W9 drain: doc {document_id:?} is in OfflineLocalAck but offline_fiscal_no is NULL \
+         (W7a invariant breach: transition_to_offline_local_ack_tx writes both atomically)"
+    )]
+    OfflineFiscalNoMissing { document_id: DocumentId },
 
     /// `inputs.business_ts` could not be parsed as UTC ISO-8601, or the
     /// Kyiv-local components could not be re-interpreted as UTC for
@@ -314,10 +335,19 @@ fn wire_artifact_to_check_type(k: WireArtifactKind) -> DpsCheckType {
 /// `local_number = 0` regardless of `inputs.lnd`.  All other kinds
 /// pass `inputs.lnd` through after a checked `i32::try_from`.
 ///
-/// **`id_offline` / `id_cancel`.**  Empty strings for the W7
-/// happy path — DPS interprets empty `id_offline` as "online" and
-/// empty `id_cancel` as "not a cancellation".  Offline wiring lands
-/// in W11; the cancel slice is future work.
+/// **`id_offline` / `id_cancel`.**  `id_offline` is set from
+/// `inputs.offline_fiscal_no` (stringified) when present — this
+/// covers the M3b W9 backlog drain replay path where the doc was
+/// originally staged offline (W7a writes `offline_fiscal_no =
+/// consumed code_lnd`).  For pure-online M3a docs `offline_fiscal_no`
+/// is NULL and `id_offline` stays empty (DPS interprets empty as
+/// "online", per the proven Sprint-7 Python contract
+/// `dps_fiscal_server.py:196`).  `id_cancel` stays empty in W9a;
+/// the cancel slice is future work.  The W7a invariant
+/// "OfflineLocalAck implies offline_fiscal_no IS NOT NULL" is
+/// enforced upstream of this call by `run_one_attempt`'s 4-pre
+/// closure — a typed `StageSendError::OfflineFiscalNoMissing`
+/// surfaces BEFORE any CAS or wire side effect.
 pub fn build_send_envelope(
     inputs: &SendInputs,
     signed_payload: Vec<u8>,
@@ -346,13 +376,26 @@ pub fn build_send_envelope(
 
     let date_time = kyiv_local_epoch(&inputs.business_ts)?;
 
+    // M3b W9a (2026-05-16): `id_offline` carries the offline-acquired
+    // fiscal-no for W9 backlog-drain replays.  W7a writes
+    // `fiscal_documents.offline_fiscal_no = consumed code_lnd` at the
+    // Signed → OfflineLocalAck transition; the wire contract
+    // (docs/superpowers/specs/2026-05-04-m2-w0-1-dps-wire.md:116)
+    // requires `id_offline = offline_fiscal_no.to_string()`.  For
+    // M3a online docs this is `NULL` and the empty string maps to
+    // DPS-interpreted "online" per the Sprint-7 Python contract.
+    let id_offline = inputs
+        .offline_fiscal_no
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+
     Ok(CheckEnvelope {
         rro_fn: inputs.fiscal_number.clone(),
         date_time,
         check_sign: signed_payload,
         local_number,
         check_type,
-        id_offline: String::new(),
+        id_offline,
         id_cancel: String::new(),
     })
 }
@@ -411,12 +454,12 @@ fn kyiv_local_epoch(business_ts: &str) -> Result<i64, StageSendError> {
 ///     `audit_event`, `node_mode_flip`, `probe_hint`,
 ///     `mac_recovery_hint`); the worker dispatcher and W9
 ///     reconciliation read it to decide next-tick behaviour.
-///   - `StateConflict` — 4-pre CAS `(Signed | ErrorRetryable) → Sending`
-///     missed: the doc was past `Signed` AND not in `ErrorRetryable`
-///     either (e.g. `Sent` from a prior worker, or transitioned to a
-///     non-Signed state by reconciliation).  Stage 4 did NOT call
-///     `send_chk`.  Idempotent re-entry — the dispatcher should NOT
-///     treat this as failure.
+///   - `StateConflict` — 4-pre CAS
+///     `(Signed | ErrorRetryable | OfflineLocalAck) → Sending`
+///     missed: the doc was outside the allowlist (e.g. `Sent` from a
+///     prior worker, or transitioned to a non-Signed state by
+///     reconciliation).  Stage 4 did NOT call `send_chk`.  Idempotent
+///     re-entry — the dispatcher should NOT treat this as failure.
 ///   - `DocumentMissing` — the `(doc_id)` row was not present at 4-pre
 ///     read.  Race with a delete (offline reconciliation, manual
 ///     operator action).  Stage 4 did NOT call `send_chk`.
@@ -461,12 +504,13 @@ pub enum StageSendOutcome {
 /// the `SENDING` marker, allocated the trace row, and written the
 /// `STAGE_SEND_INTENT_MARKED` audit entry.
 enum PreOutcome {
-    /// CAS `(Signed | ErrorRetryable) → Sending` applied; trace row
-    /// allocated; audit written.  Wire send is the next step (4a, no
-    /// lock).  `doc_type` is propagated out of the closure so 4-a can
-    /// pass it to `route_send_result`; `fiscal_number` is propagated
-    /// out so 4-b can call `node_state::set_mode_blocked_tx` for the
-    /// W10.3 `-11` flip without a separate read.
+    /// CAS `(Signed | ErrorRetryable | OfflineLocalAck) → Sending`
+    /// applied; trace row allocated; audit written.  Wire send is the
+    /// next step (4a, no lock).  `doc_type` is propagated out of the
+    /// closure so 4-a can pass it to `route_send_result`;
+    /// `fiscal_number` is propagated out so 4-b can call
+    /// `node_state::set_mode_blocked_tx` for the W10.3 `-11` flip
+    /// without a separate read.
     Marked {
         envelope: CheckEnvelope,
         attempt_no: i32,
@@ -827,6 +871,24 @@ async fn run_one_attempt(
                     Some(b) => b,
                     None => return Ok(PreOutcome::SignedArtifactMissing),
                 };
+
+            // M3b W9a invariant guard: an `OfflineLocalAck` row
+            // MUST carry `offline_fiscal_no` (W7a writes this =
+            // consumed code_lnd atomically with the state flip in
+            // `transition_to_offline_local_ack_tx`).  If we observe
+            // the state but the column is NULL, the row was created
+            // via raw-SQL bypass — surface a typed
+            // `OfflineFiscalNoMissing` BEFORE any CAS / wire side
+            // effect.  Online states (Signed / ErrorRetryable) leave
+            // `offline_fiscal_no` NULL by design — envelope builder
+            // maps that to empty `id_offline` per DPS contract.
+            if inputs.state == DocState::OfflineLocalAck
+                && inputs.offline_fiscal_no.is_none()
+            {
+                return Ok(PreOutcome::EnvelopeBuildFailed(
+                    StageSendError::OfflineFiscalNoMissing { document_id: doc },
+                ));
+            }
 
             // Build envelope BEFORE CAS — fail-closed on
             // UnsupportedDocType / Lnd / TS without writing SENDING.
@@ -1324,6 +1386,11 @@ mod tests {
             business_ts: business_ts.into(),
             backend_profile_id: "b1".into(),
             transport_profile_id: "t1".into(),
+            // M3b W9a: M3a online docs (Signed source) have NULL
+            // offline_fiscal_no by design — envelope builder maps
+            // that to empty id_offline per the Sprint-7-proven
+            // contract.
+            offline_fiscal_no: None,
         }
     }
 

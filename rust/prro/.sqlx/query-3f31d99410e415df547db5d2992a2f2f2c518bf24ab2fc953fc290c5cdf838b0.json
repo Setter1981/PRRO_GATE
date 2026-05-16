@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT state                as \"state: DocState\",\n                  fiscal_number,\n                  lnd,\n                  doc_type             as \"doc_type: DocType\",\n                  business_ts,\n                  backend_profile_id,\n                  transport_profile_id\n           FROM fiscal_documents WHERE document_id = ?",
+  "query": "SELECT state                as \"state: DocState\",\n                  fiscal_number,\n                  lnd,\n                  doc_type             as \"doc_type: DocType\",\n                  business_ts,\n                  backend_profile_id,\n                  transport_profile_id,\n                  offline_fiscal_no\n           FROM fiscal_documents WHERE document_id = ?",
   "describe": {
     "columns": [
       {
@@ -37,6 +37,11 @@
         "name": "transport_profile_id",
         "ordinal": 6,
         "type_info": "Text"
+      },
+      {
+        "name": "offline_fiscal_no",
+        "ordinal": 7,
+        "type_info": "Integer"
       }
     ],
     "parameters": {
@@ -49,8 +54,9 @@
       false,
       false,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "31a8c5967820580b5b1367b7ee072f50dc9831dfddfdcbf02776c01b26692a36"
+  "hash": "3f31d99410e415df547db5d2992a2f2f2c518bf24ab2fc953fc290c5cdf838b0"
 }

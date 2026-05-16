@@ -33,7 +33,8 @@ use prro::db::repositories::fiscal_documents::allowed_transition;
 use prro::db::repositories::transport_trace;
 use prro::services::write_path::error_routing::RetryClass;
 use prro::services::write_path::stage_send::{self, StageSendError, StageSendOutcome};
-use prro::transports::dps::dto::CheckAck;
+use prro::transports::dps::channel::DpsChannel;
+use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob};
 use prro::transports::dps::error::{AuthorizationKind, DpsError};
 
 mod common;
@@ -889,6 +890,60 @@ async fn retry_path_error_retryable_to_sending_drives_through_4_pre() {
     assert_eq!(read_doc_state(&pool, doc).await, "SENT");
 }
 
+// ─── M3b W9a helper: realistic W7a-acked offline state ──────────────
+
+/// Seeds a fiscal_documents row in `OFFLINE_LOCAL_ACK` state with all
+/// W7a-required offline columns populated, plus the associated
+/// `offline_sessions` row in `OPEN` and the `offline_codes` row
+/// flagged as consumed by this document.  Mirrors what W7a's
+/// `transition_to_offline_local_ack_tx` produces, without going
+/// through the full `stage_offline_ack::run` path (which would
+/// require additional node_state/shift seeding).
+///
+/// W7a invariant: an `OFFLINE_LOCAL_ACK` row MUST carry
+/// `offline_fiscal_no = consumed code_lnd`,
+/// `offline_fiscal_date = consumed_at`, and
+/// `offline_session_id = the open session's id`.  Synthetic seeds
+/// that skip these columns (the W9a Round 1 review L1 finding)
+/// produce a state that W7a guarantees cannot exist in production
+/// and would mask real bugs in the `id_offline` plumbing.
+async fn seed_w7a_offline_local_ack(pool: &SqlitePool, doc_byte: u8, code_lnd: i64) -> DocumentId {
+    let doc = seed_signed_doc_with_xml(pool, doc_byte, "SELL", 1, "OFFLINE_LOCAL_ACK").await;
+    let session_id = vec![doc_byte ^ 0x55; 16];
+    let consumed_at = "2026-05-16T00:00:01Z";
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, '1234567890', 'OPEN', '2026-05-16T00:00:00Z')",
+    )
+    .bind(&session_id)
+    .execute(pool)
+    .await
+    .expect("seed offline_session");
+    sqlx::query(
+        "INSERT INTO offline_codes(fiscal_number, code_lnd, consumed_at, consumed_by_document_id) \
+         VALUES ('1234567890', ?, ?, ?)",
+    )
+    .bind(code_lnd)
+    .bind(consumed_at)
+    .bind(doc)
+    .execute(pool)
+    .await
+    .expect("seed offline_code (consumed by this doc)");
+    sqlx::query(
+        "UPDATE fiscal_documents \
+         SET offline_fiscal_no = ?, offline_fiscal_date = ?, offline_session_id = ? \
+         WHERE document_id = ?",
+    )
+    .bind(code_lnd)
+    .bind(consumed_at)
+    .bind(&session_id)
+    .bind(doc)
+    .execute(pool)
+    .await
+    .expect("backfill W7a columns on fiscal_documents");
+    doc
+}
+
 // ─── Fixture 6b' — M3b W9a Pattern C drain: OfflineLocalAck → Sending ─
 
 #[tokio::test]
@@ -897,8 +952,10 @@ async fn w9a_offline_local_ack_to_sending_drives_through_4_pre() {
     // `OfflineLocalAck` as a third allowed source, alongside `Signed`
     // and `ErrorRetryable`.  The new edge is the entry to W9 Pattern C
     // drain: an offline-acked doc replays through the wire-send ladder
-    // on return-online.  This fixture seeds in `OFFLINE_LOCAL_ACK`,
-    // runs stage_send::run, and asserts:
+    // on return-online.  This fixture seeds a realistic W7a state
+    // (offline_fiscal_no + offline_fiscal_date + offline_session_id +
+    // a consumed offline_codes row + the associated OPEN
+    // offline_sessions row), runs stage_send::run, and asserts:
     //   - the 4-pre CAS Applied (no StateConflict) — the new source
     //     state is in the allowlist;
     //   - the (OfflineLocalAck, Sending) whitelist edge (added in W6)
@@ -907,11 +964,15 @@ async fn w9a_offline_local_ack_to_sending_drives_through_4_pre() {
     //   - wire send_chk WAS called;
     //   - 4-b CAS Sending → Sent committed.
     //
+    // Round 1 L1 fix: seed shape now matches W7a invariants exactly,
+    // so the OfflineFiscalNoMissing guard does NOT fire (offline
+    // columns are populated as W7a would have produced them).
+    //
     // Scope note: W9a is transport-ladder widening ONLY.  W9b will
     // wire the actual drain caller (App::drain_offline_backlog_with).
     // This fixture proves the seam is ready, not that it is wired.
     let (_d, pool) = fresh_pool().await;
-    let doc = seed_signed_doc_with_xml(&pool, 0xC0, "SELL", 1, "OFFLINE_LOCAL_ACK").await;
+    let doc = seed_w7a_offline_local_ack(&pool, 0xC0, 42).await;
     let stub = StubDpsChannel::new(Ok(ack("DPS-FN-W9A-DRAIN")));
 
     let outcome = stage_send::run(&pool, &stub, doc, None)
@@ -943,12 +1004,165 @@ async fn w9a_offline_local_ack_to_sending_drives_through_4_pre() {
     );
 }
 
+// ─── Fixture 6b'' — M3b W9a: id_offline carries offline_fiscal_no ────
+
+/// Recording DpsChannel that captures every `send_chk` envelope.
+/// Used by the wire-correctness fixture to assert that
+/// `CheckEnvelope.id_offline` is populated from
+/// `fiscal_documents.offline_fiscal_no` for the W9 drain replay path
+/// and left empty for the M3a online path.
+struct EnvelopeRecorder {
+    response: Result<CheckAck, DpsError>,
+    captured: std::sync::Mutex<Vec<CheckEnvelope>>,
+}
+
+impl EnvelopeRecorder {
+    fn new(response: Result<CheckAck, DpsError>) -> Self {
+        Self {
+            response,
+            captured: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+    fn first(&self) -> CheckEnvelope {
+        self.captured
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("send_chk never called")
+    }
+}
+
+#[async_trait::async_trait]
+impl DpsChannel for EnvelopeRecorder {
+    async fn send_chk(&self, envelope: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        self.captured.lock().unwrap().push(envelope);
+        match &self.response {
+            Ok(a) => Ok(a.clone()),
+            Err(_) => Err(DpsError::Transport("recorder: primed error".into())),
+        }
+    }
+    async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
+        unreachable!("EnvelopeRecorder: last_chk not exercised")
+    }
+    async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        unreachable!("EnvelopeRecorder: ping not exercised")
+    }
+    async fn status_rro(
+        &self,
+        _: &CheckSignBlob,
+    ) -> Result<prro::transports::dps::dto::StatusSnapshot, DpsError> {
+        unreachable!("EnvelopeRecorder: status_rro not exercised")
+    }
+    async fn info_rro(
+        &self,
+        _: &CheckSignBlob,
+    ) -> Result<prro::transports::dps::dto::RroInfo, DpsError> {
+        unreachable!("EnvelopeRecorder: info_rro not exercised")
+    }
+}
+
+#[tokio::test]
+async fn w9a_offline_drain_wire_envelope_carries_id_offline_stringified() {
+    // M3b W9a wire-contract fixture (Round 1 HIGH fix): when
+    // stage_send::run drains an `OfflineLocalAck` doc, the
+    // `CheckEnvelope` sent over the wire MUST carry
+    // `id_offline = offline_fiscal_no.to_string()` per
+    // `docs/superpowers/specs/2026-05-04-m2-w0-1-dps-wire.md:116`.
+    // The Sprint-7 proven Python contract (`dps_fiscal_server.py:196`)
+    // makes empty `id_offline` mean "online"; a drain that sends
+    // empty `id_offline` would mis-identify the receipt to DPS.
+    //
+    // Setup: seed W7a state with `offline_fiscal_no = 42`, drive
+    // stage_send::run, then assert the recorded envelope has
+    // `id_offline == "42"`.
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_w7a_offline_local_ack(&pool, 0xC1, 42).await;
+    let recorder = EnvelopeRecorder::new(Ok(ack("DPS-FN-W9A-WIRE")));
+
+    let outcome = stage_send::run(&pool, &recorder, doc, None)
+        .await
+        .expect("drain wire-envelope test must succeed");
+    assert!(
+        matches!(outcome, StageSendOutcome::Sent { .. }),
+        "expected Sent, got {outcome:?}"
+    );
+
+    let env = recorder.first();
+    assert_eq!(
+        env.id_offline, "42",
+        "id_offline must equal offline_fiscal_no stringified (DPS wire contract)"
+    );
+    assert_eq!(env.id_cancel, "", "id_cancel stays empty in W9a");
+    assert_eq!(env.rro_fn, "1234567890");
+}
+
+#[tokio::test]
+async fn w9a_online_signed_wire_envelope_id_offline_is_empty() {
+    // Negative-side proof of the same Round 1 HIGH fix: an M3a
+    // online doc (Signed source, NULL offline_fiscal_no) must emit
+    // `id_offline = ""` so DPS treats it as a live online receipt.
+    // Without this assertion the wire-contract test above could
+    // pass via a "always populate id_offline" bug that breaks M3a.
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_signed_doc_with_xml(&pool, 0xC2, "SELL", 1, "SIGNED").await;
+    let recorder = EnvelopeRecorder::new(Ok(ack("DPS-FN-W9A-ONLINE")));
+
+    let outcome = stage_send::run(&pool, &recorder, doc, None)
+        .await
+        .expect("online wire-envelope test must succeed");
+    assert!(
+        matches!(outcome, StageSendOutcome::Sent { .. }),
+        "expected Sent on online path, got {outcome:?}"
+    );
+
+    let env = recorder.first();
+    assert_eq!(
+        env.id_offline, "",
+        "M3a online path must keep id_offline empty (Sprint-7 contract)"
+    );
+}
+
+#[tokio::test]
+async fn w9a_offline_local_ack_with_null_offline_fiscal_no_surfaces_typed_error() {
+    // Round 1 HIGH guard: if the OfflineLocalAck row is observed
+    // with NULL `offline_fiscal_no` (raw-SQL bypass or schema
+    // regression — W7a guarantees this cannot happen organically),
+    // stage_send::run must surface `OfflineFiscalNoMissing` BEFORE
+    // any CAS / wire side effect.  Proven by seeding the unhealthy
+    // synthetic state (the old W9a Round 0 seed shape) and asserting
+    // the typed error.
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_signed_doc_with_xml(&pool, 0xC3, "SELL", 1, "OFFLINE_LOCAL_ACK").await;
+    // NB: no W7a backfill — offline_fiscal_no stays NULL.
+    let stub = StubDpsChannel::new(Ok(ack("SHOULD-NEVER-BE-USED")));
+
+    let err = stage_send::run(&pool, &stub, doc, None)
+        .await
+        .expect_err("NULL offline_fiscal_no on OfflineLocalAck must fail");
+    assert!(
+        matches!(err, stage_send::StageSendError::OfflineFiscalNoMissing { document_id } if document_id == doc),
+        "expected OfflineFiscalNoMissing typed error, got {err:?}"
+    );
+    assert_eq!(
+        stub.call_count(),
+        0,
+        "no wire call before W7a invariant guard fires"
+    );
+    assert_eq!(
+        read_doc_state(&pool, doc).await,
+        "OFFLINE_LOCAL_ACK",
+        "no state mutation before the guard fires"
+    );
+}
+
 // ─── Fixture 6c — non-{Signed, ErrorRetryable, OfflineLocalAck} short-circuits ────────
 
 #[tokio::test]
 async fn rerun_on_non_allowlisted_states_short_circuits_with_zero_wire_calls() {
-    // W10.2 HIGH 3 §4.2: 4-pre CAS only accepts Signed | ErrorRetryable.
-    // Any other source state (Prepared / Kvt1 / Kvt2 / Sending / Rejected
+    // W10.2 HIGH 3 §4.2 + M3b W9a widening (2026-05-16): 4-pre CAS
+    // only accepts Signed | ErrorRetryable | OfflineLocalAck.  Any
+    // other source state (Prepared / Kvt1 / Kvt2 / Sending / Rejected
     // / etc.) MUST yield StateConflict + zero wire calls.
     //
     // R-W10.2-review LOW 3 close: parametrise across the realistic ban
