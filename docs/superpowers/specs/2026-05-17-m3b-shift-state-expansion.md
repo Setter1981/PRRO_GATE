@@ -96,6 +96,15 @@ While `shift.state == OpenedLocalPendingDrain`:
 
   W9b drain failure paths re-enter §4.1 edges 6 (open-doc reject → manual) and 14 (close-doc reject → manual) via the §6.3 universal `EscalateManual` rule, NOT the per-class taxonomy of §6.2/§6.4 (drain crossed the local-commit threshold; wire-side recovery semantics don't apply).
 
+### 3.4 Scope exclusion — operator identity NOT modeled (Round 6 B-M5)
+
+The shift state machine deliberately does NOT model the cashier / operator who owns a given shift.  Reasoning:
+- Real-world cashier handover happens mid-shift (operator A opens, operator B closes); pinning shift state to a single operator_id would force artificial shift-splits at handover, breaking the legal "one fiscal day = one shift" alignment.
+- Operator identity per fiscal action is sufficient and is captured per-document on `fiscal_documents` (M3a-era convention) + per-audit event on `audit_log.evidence_json.operator_id` (force seams already require this — §4.5).
+- Force-seam `evidence_json.operator_id` field is **per-action operator**, NOT shift-owning operator — naming is intentional.
+
+**Implementation pin**: implementation MUST NOT add `shifts.opened_by_operator_id` / `shifts.closed_by_operator_id` columns.  If a future business case (e.g. tax compliance reporting per cashier) requires per-shift operator attribution, that becomes a separate denormalised reporting table built on top of audit_log queries, NOT a shift-state-machine extension.  Reviewer MUST refuse impl PRs that introduce shift-owning-operator columns into `shifts` / `node_state`.
+
 ## 4. Allowed transitions (whitelist enumerated)
 
 ### 4.1 Allowed edges
@@ -186,6 +195,22 @@ impl ShiftRepository {
 
 **Two methods, not one with a `target` parameter.**  A single method `force_to_error_with_audit(target: ShiftState)` would invite bugs (caller passes the wrong target) and is harder to grep/audit (`grep "force_to_error_with_audit"` returns sites for both Error and Manual; with two methods grep distinguishes intent).  Type-system overhead is one extra `pub async fn`; safety benefit is structural.
 
+**Allowed source-state restriction (Round 6 A-H1 — load-bearing)**: both force seams MUST enumerate their allowed source states and refuse with a typed error otherwise.  Without this restriction a stray `force_to_*` call on a terminal-happy shift (`Closed`) would silently advance it to `Error` / `Manual` and create a forensic puzzle ("why did this successfully-closed shift land in Error post-merge?").
+
+| Force seam | Allowed source states | Forbidden source states | Refusal error |
+|---|---|---|---|
+| `force_to_error_with_audit` | `Opening`, `OpenedLocalPendingDrain`, `Opened`, `Closing`, `ClosingLocalPendingDrain`, `RequiresManualReconciliation` | `Created`, `Closed`, `Error` | `ForceSeamForbiddenSource { current_state, attempted_seam: "force_to_error" }` |
+| `force_to_manual_reconciliation_with_audit` | `Opening`, `OpenedLocalPendingDrain`, `Opened`, `Closing`, `ClosingLocalPendingDrain` | `Created`, `Closed`, `Error`, `RequiresManualReconciliation` | `ForceSeamForbiddenSource { current_state, attempted_seam: "force_to_manual" }` |
+
+Rationale per forbidden source:
+- `Created` — no fiscal commitment exists yet; the correct action is to delete the shift row, not force-terminal it.  If a future code path needs "abort a Created shift", that becomes a separate seam.
+- `Closed` — terminal happy path; forcing it backward to `Error` / `Manual` would corrupt forensic queries ("which shifts closed cleanly?") and the audit trail.
+- `Error` — already terminal force-seam landing; idempotency requires refusal.
+- `RequiresManualReconciliation` (for `force_to_manual_reconciliation_with_audit` only) — already in target state; per §15 Q2 RESOLVED, this state is strictly terminal for the current shift_id, so re-forcing it has no semantic.
+- `RequiresManualReconciliation → Error` via `force_to_error_with_audit` IS allowed — operator may escalate "operator-fixable" to "structural breach" if forensic investigation reveals worse damage (e.g. schema corruption discovered during recon).
+
+**UI mapping pin (Round 6 B-L3)**: the operator-facing "abort shift" / "ditch this shift" UI button MUST map to `force_to_manual_reconciliation_with_audit` (NOT `force_to_error_with_audit`).  The Manual seam preserves operator-action recovery semantics (compensation filings); Error implies structural breach.  Force-to-error is reserved for supervisor-level escalation when the shift cannot be salvaged via accounting compensation.
+
 **Test contract (load-bearing — two-tier)**: `tests/shifts_no_silent_error_paths.rs` scanner enforces both tiers:
 
 - **Tier (a) — Error**: `transition_state` MUST NOT have any code path reaching `Error`.  Only `force_to_error_with_audit` reaches `Error`.  No exception.
@@ -235,6 +260,14 @@ match (node_state.shift_state, &node_state.current_shift_id) {
 ```
 
 Rationale: `OpenedLocalPendingDrain` IS an "open" shift for offline-channel doc ingress (per §3.3 ops-permitted contract).  Without this widening, offline `SELL` / `RETURN` / `SERVICE_*` / offline `Z_REPORT` ingress on a `OpenedLocalPendingDrain` shift would fail active-shift resolution → silent refusal with confusing "no active shift" error.  Online-channel ingress on `OpenedLocalPendingDrain` still gets refused — but via the explicit `SHIFT_OPEN_PENDING_DRAIN_OP_REFUSED` audit per §3.3, NOT via active-shift-resolution failure.
+
+**Concurrent SHIFT_OPEN ingress race protection (Round 6 A-M1)**: a real-world cashier may double-click "Open shift" in the POS UI, generating two `SHIFT_OPEN` requests in flight simultaneously.  The race is protected by **three** existing mechanisms acting together (no new locking required by this freeze):
+
+1. **Ingress idempotency** — same `request_id` → second request short-circuited by the inbox dedup (M3a-era).
+2. **Single-writer-per-FN** (INV-01, W2 `ReconcileGuard`) — distinct `request_id` → both requests serialize at the write layer; only one enters `with_immediate` at a time.
+3. **§5.6 `check_shift_guard` matrix** — once the first request advances `shifts.state` from `Created` to `Opening` (online) or `OpenedLocalPendingDrain` (offline) and commits, the second request hits the matrix at `(ShiftOpen, Opening) → ✗-ShiftOpeningInFlight` or `(ShiftOpen, OpenedLocalPendingDrain) → ✗-ShiftAlreadyOpen` and refuses cleanly with a typed `RejectionReason`.
+
+The race is therefore not a state-machine concern — the existing single-writer pin + the matrix together close it.  Implementation MUST NOT add a "have I already started opening?" pre-check in ingress; the matrix is the authoritative gate.  Documented here so future reviewers don't try to introduce a redundant guard.
 
 ### 5.2 "Open shift" enumeration for INV-05 (channel-switch invariant)
 
@@ -319,15 +352,48 @@ Doc types from `DocType` enum: `ShiftOpen`, `ShiftClose`, `ZReport`, `XReport`, 
 
 **W10 routing rows**: `⤳-W10` in the table means the doc-type may be permitted OR refused based on the W10 policy guard's `PolicyDecision`.  W10a (per §12.1) implements these decisions; W10b (§12.2) wires offline `ShiftOpen` ingress.  Until W10a lands, these cells default to `✗-`PolicyNotYetImplemented` (typed bail per §11 W14a recovery branch).
 
+**Cancel doc type — NOT in current `DocType` enum (Round 6 A-L1)**: the current `DocType` enum (`rust/prro/src/db/models/enums.rs:91-99`) enumerates `ShiftOpen` / `ShiftClose` / `Sell` / `Return` / `ServiceIn` / `ServiceOut` / `XReport` / `Z_Report` — no `Cancel` variant.  The DPS `<C T="1">` cancellation primitive (per Python-era reverse-engineering memory) is currently modeled as a `Return` variant with `cancel_flag` semantics in the payload, NOT a separate doc type.  If a future PR adds `DocType::Cancel`, the §5.6 matrix row inherits from `Sell` / `Return` (cancellation is doc-class-equivalent to a corrective sale-side op).  No matrix-column change required by this freeze.
+
 ### 5.7 Cross-doc invariants (pinned for implementation author)
 
 #### L1 — XReport non-transition (cross-ref PR #62 LEGAL_INVARIANTS "X-report read-only")
 
 `XReport` triggers NO shift state transition regardless of source state.  It does not write `fiscal_documents`, does not advance `lnd`, does not consume an offline code (WebCheck channel) or an offline local ordinal (DFS channel), does not allocate a Z-report sequence number.  W10 policy guard does NOT block `XReport` on offline backlog.  If backlog exists the response MAY carry a warning/forensic note but MUST NOT mutate fiscal state.  This is consistent with the WebCheck reverse-engineering finding (X-report not signed/submitted) and with the reference DFS dispatcher (`PRRODPS/Maria/Session/MariaDispatcher.cs::ZREP → X-report`, no `/fs/doc` post).  **The §5.6 matrix shows `✓ (read-only)` for `XReport` in every state — it is the only column that is universally permitted.**
 
+**Manual-state X-report payload pin (Round 6 A-L2)**: when shift is in `RequiresManualReconciliation` or `Error`, the X-report response payload SHOULD include a structured `shift_status` field so the cashier UI surfaces a supervisor-escalation alert.  Recommended shape:
+
+```json
+{
+  "shift_status": "requires_manual_reconciliation" | "error" | "ok",
+  "shift_id": "<UUID>",
+  "operator_action_required": true | false,
+  "operator_message": "Shift requires manual reconciliation — issue refunds via correction filing only; new sales blocked"
+}
+```
+
+`shift_status: "ok"` covers all non-stuck states (`Created` / `Opening` / `OpenedLocalPendingDrain` / `Opened` / `Closing` / `ClosingLocalPendingDrain` / `Closed`).  Cashier UI MUST refuse to start a new SELL flow when `operator_action_required: true` and surface the operator-facing message via a modal.  X-report remains read-only — the payload is informational; no state mutation.
+
 #### L2 — Offline standalone `ShiftClose` forbidden (cross-ref `OFFLINE_SHIFT_CLOSE_DECISION.md` §5.1 + §7.2)
 
 `stage_offline_ack` does NOT accept `DocType::ShiftClose` — the §5.6 matrix shows `✗-OfflineShiftCloseNotSupported` for the `(ShiftClose, OpenedLocalPendingDrain)` cell.  Offline close-of-day is Pattern C via offline `Z_REPORT` exclusively; standalone offline `ShiftClose` is rejected per the operator-pinned decision in `OFFLINE_SHIFT_CLOSE_DECISION.md` §5.1 ("offline SHIFT_CLOSE як окрема пряма transport-level операція не повинна відкриватися").  The refusal is typed at `stage_acquire` entry — no `stage_offline_ack` invocation, no doc landing.
+
+#### L3 — Return-of-failed-offline-sale path NOT modeled by shift state machine (Round 6 B-H1)
+
+**Business scenario**: customer comes back N days later to refund a SELL receipt issued under `OFFLINE_LOCAL_ACK` on a shift that ultimately landed in `RequiresManualReconciliation` (drain reject path; `SHIFT_OPEN` or close `Z_REPORT` rejected).  The original SELL doc is **orphan** — `server_fiscal_no IS NULL` (DPS never accepted it).  Operator cannot issue a normal `RETURN` document referencing the orphan SELL's server fiscal number because there isn't one.
+
+**Shift state machine scope (pin)**: the shift state model deliberately **does NOT** include a recovery path for orphan-doc returns.  Reasoning:
+- Orphan compensation is operations/accounting territory (manual fiscal correction filing with DPS per §15 Q2 RESOLVED), NOT a state-machine concern.
+- The currently-active shift on which the customer-facing RETURN would land is independent of the original-sale shift; that current shift has its own state and lifecycle.
+- Forcing the state machine to model "this RETURN compensates an orphan in shift X" would require coupling that breaks INV-01 (single-writer-per-FN — shift X is in `RequiresManualReconciliation` and its single-writer pin is the operator's manual flow, not the runtime).
+
+**What the operator is expected to do** (out-of-state-machine flow, documented here for completeness):
+1. File a ручне фіскальне коригування (manual fiscal correction) in the DPS cabinet against the orphan SELL — paperwork, no gateway involvement.
+2. Issue the physical refund to the customer via cash drawer / acquiring (POS-side, out-of-fiscal-scope).
+3. Optionally issue a `SERVICE_OUT` doc on the current shift to mark the cash outflow for the operator's books — but NOT linked to the orphan SELL by fiscal id (no link exists; only operator's free-text reference).
+
+**What the runtime MUST refuse** (defence against accidental orphan-linkage attempts): if any future ingress adds a `related_receipt_id` field referencing a `fiscal_documents` row whose `state ∈ {OfflineLocalAck, Sending, ErrorRetryable, Rejected}` AND whose shift is in `RequiresManualReconciliation`, ingress MUST refuse with audit `RETURN_REFERENCES_ORPHAN_SALE` (Critical) and surface operator-facing message "original sale is on a shift requiring manual reconciliation; issue refund via correction filing instead".  Without this guard a naive RETURN could mutate the orphan SELL's state ad-hoc and break forensic integrity.
+
+**Defer to future scope**: the operator-UI workflow for surfacing orphan-doc lists per FN (so the operator knows which DPS filings they owe) is a tooling task layered above the state machine; tracked as future M3c "orphan compensation surface" work (not in M3b scope).
 
 ## 6. Closing recovery taxonomy (narrow whitelist)
 
@@ -462,6 +528,29 @@ Edge case: `free == 1` is a particularly nasty trap — superficially "we have a
 | OpenedLocalPendingDrain / Opened | 0 | Refused (no code at all) | **Refused** `OFFLINE_Z_REPORT_LOCAL_CLOSE_REFUSED { reason: "code_pool_exhausted" }` (Critical) | **Refused** |
 | ClosingLocalPendingDrain | any | Refused (post-local-close lockout, `POST_LOCAL_CLOSE_SALE_REFUSED`) | Refused (already closing) | Refused |
 
+### 7.3 Out-of-state-machine constraints (cross-link pin — Round 6 B-L1)
+
+The shift state machine does **NOT** enforce the following legal limits — they are external to the state model and enforced elsewhere:
+
+| Limit | Enforced by | Cross-ref |
+|---|---|---|
+| 24h max shift duration | `services/shift_lifecycle/*` ticker (runtime) + DPS server-side rejection on close attempts past the window | `docs/LEGAL_INVARIANTS.md` §INV-04 |
+| 36h max single offline session | `node_state.mode` flip orchestrator (W7-W8) + DPS Server `code: -11` on submit | `docs/LEGAL_INVARIANTS.md` §INV-11 + this freeze §6.2 |
+| 168h cumulative offline (rolling) | W11 budget tracker + DPS Server `code: -11` on submit; node → `Blocked` | `docs/LEGAL_INVARIANTS.md` §INV-11 + this freeze §6.2/§6.4 |
+
+Shift state expansion does NOT change enforcement of any of these — they remain orthogonal to the 9-state model.  Reviewer MUST refuse impl PRs that bake any of these limits into `shifts.transition_state` (would conflate orthogonal concerns and create silent drift between runtime guard + state machine).
+
+### 7.4 Offline code refill semantics — unchanged (Round 6 B-L4)
+
+Offline code pool refill (`ASK_OFFLINE_CODES` per WebCheck channel; equivalent `/fs/pck` exchange on DFS) is **online-only**.  An FN that exhausts its offline code pool while offline cannot refill until DPS recovers and `node_state.mode` returns to `Online`.
+
+The shift state expansion does NOT change this semantics:
+- W10 reserve=2 gate (§7.1) operates against the *current* pool count, not a future-refill projection.
+- `OFFLINE_SHIFT_OPEN_REFUSED_INSUFFICIENT_RESERVE` (Critical) fires when current pool < 2, regardless of whether an online refill is "expected soon".
+- Operator action when refused: wait for DPS recovery → refill → re-attempt offline `SHIFT_OPEN`.
+
+POS UI MAY surface a "remaining offline codes" counter to give the cashier early warning; this is a future tooling task (see §11 read-API pin) and does NOT affect the state-machine refusal semantics.
+
 ## 8. Audit event vocabulary (additions)
 
 | Event type | Severity | Payload sketch | Trigger |
@@ -477,10 +566,26 @@ Edge case: `free == 1` is a particularly nasty trap — superficially "we have a
 | `SHIFT_FORCE_TO_MANUAL_RECONCILIATION` | **Critical** | same shape | `force_to_manual_reconciliation_with_audit` seam invoked |
 | `SHIFT_STATE_MIRROR_DRIFT_DETECTED` | **Critical** | `{fiscal_number, shift_id, observed_node_state_shift_state, observed_shifts_state}` | boot-time §5.3 mirror invariant check found `node_state.shift_state != shifts.state` for active shift — structural breach evidence; shift force-transitions to `RequiresManualReconciliation` |
 | `SHIFT_LINKED_DOC_STATE_INCOMPATIBLE` | **Critical** | `{fiscal_number, shift_id, shift_state, linked_open_doc_id, linked_open_doc_state, linked_close_doc_id, linked_close_doc_state}` | boot-time §5.4 (shift_state × linked_doc.state) matrix detected an inconsistent pair — shift force-transitions to `RequiresManualReconciliation` |
+| `SHIFT_FORCE_SEAM_REFUSED` | Warning | `{fiscal_number, shift_id, current_state, attempted_seam, evidence_json}` | force seam invoked from a forbidden source state per §4.5 — operation refused; recorded for forensic traceability (Round 6 A-H1) |
+| `RETURN_REFERENCES_ORPHAN_SALE` | **Critical** | `{fiscal_number, attempted_return_request_id, referenced_doc_id, referenced_doc_state, referenced_shift_state}` | RETURN ingress references a `fiscal_documents` row on a shift in `RequiresManualReconciliation` — refused at ingress (Round 6 B-H1 / §5.7 L3) |
 
 Critical severity events MUST surface immediately on operator audit dashboards.
 
 **Audit-cardinality residual** (cross-ref PR #62 §7b L3 — `OFFLINE_Z_REPORT_FAILED` dedup deferred): under sustained offline period or sustained drain-reject loop, several of the new audits (`SHIFT_OPEN_PENDING_DRAIN_OP_REFUSED` Warning per failed online op; `OFFLINE_CODE_RESERVED_FOR_CLOSE` Warning per refused offline op once reserve floor reached) can flood at scale.  The PR #62 §7b L3 dedup design (collapse consecutive same-class rows into one durable row with `first/last_failure_at` + `consecutive_count`) applies symmetrically here — future runtime-composition layer should adopt the same dedup pattern for shift-state-machine events when it lands.  Not blocking for W14a; flagged so the impl PR review does not require dedup engineering up front.
+
+**Concrete cardinality at pilot scale (Round 6 A-M3 quantification)**: pilot operator profile = ~140 FNs (50 points × ~2-3 cash desks each).  Sustained-outage worst-case write rate calculation:
+- W8 return-online probe ticks at 60s default (per §3.3 W8/W9b/shift-state chain — W8a primitive default).
+- Per-FN sustained-fail event mix: at most 1 `SHIFT_OPEN_PENDING_DRAIN_OP_REFUSED` per attempted online op + 1 `OFFLINE_CODE_RESERVED_FOR_CLOSE` per refused offline op at reserve floor.  Realistic ceiling: ~5 events/FN/probe-tick under heavy degradation (cashier retry pressure).
+- Aggregate: `140 FN × 60 ticks/hr × 5 events/tick = ~42 000 audit rows/hour` (~12 writes/sec sustained).
+- SQLite WAL on commodity SSD sustains ~1 000 commits/sec — 12/sec is **1.2% of bandwidth**, comfortable margin.
+- Long-term storage: `42 K × 24h × 30d = ~30 M rows/month` worst case.  Typical (no sustained outage): 50-100x less.
+
+Implementation MUST size `audit_log` retention windows accordingly (Round 6 B-L5 retention cross-link):
+- **Critical events** (`SHIFT_FORCE_*`, `SHIFT_*_DRAIN_REJECTED`, `SHIFT_REQUIRES_MANUAL_RECONCILIATION`, `SHIFT_STATE_MIRROR_DRIFT_DETECTED`, `SHIFT_LINKED_DOC_STATE_INCOMPATIBLE`, `OFFLINE_SHIFT_OPEN_REFUSED_INSUFFICIENT_RESERVE`, `RETURN_REFERENCES_ORPHAN_SALE`): **retain indefinitely** (or ≥ 7 years per UA tax inspector audit window).  Forensic load-bearing; tax inspector visits MUST be able to reproduce every Critical event from the past 7 fiscal years.
+- **Warning events** (`SHIFT_OPEN_PENDING_DRAIN_OP_REFUSED`, `OFFLINE_CODE_RESERVED_FOR_CLOSE`): retain ≥ 90 days for operational triage; rotate older rows via separate retention job (NOT this freeze's scope).
+- **Info events** (`SHIFT_OPENED_LOCAL_PENDING_DRAIN`, `SHIFT_CLOSING_LOCAL_PENDING_DRAIN`): retain ≥ 30 days for ops dashboards.
+
+Retention policy itself is **NOT** in W14a impl PR scope — it lives in a future "audit retention" task with cross-doc reference to `docs/LEGAL_INVARIANTS.md`.  Flagged here so the pilot-scale storage planning has a concrete number to work from.
 
 ## 9. Migration design
 
@@ -599,6 +704,8 @@ The implementation PR materialises the full DDL; this freeze pins the **shape** 
 - **sqlx prepare**: regen `.sqlx/` after schema change (per W9a Round 1 lesson — `cargo sqlx prepare` from `rust/prro/` package root, commit the updated cache).
 - **Migration atomicity (W4 lesson)**: sqlx-sqlite 0.8.6 wraps every migration body in `self.begin()` automatically — the entire 15-step `shifts` rebuild + 8-step `node_state` rebuild + hard FK guard runs inside ONE transaction.  Crash anywhere mid-migration rolls back to the pre-migration shape.  `PRAGMA defer_foreign_keys = ON` is honoured by this wrapping tx (W4 §2.1 explicit); the `-- no-transaction` sqlx directive is NOT applicable here (and not honoured by sqlx-sqlite per W4 lesson §2.1).
 - **Single-connection discipline**: `PRAGMA defer_foreign_keys` is connection-scoped sticky state (W4 lesson §2.1).  Migration runs on the dedicated `sqlx::migrate!` connection, separate from the pool — no leakage into application queries.  Implementation MUST NOT toggle this PRAGMA from non-migration code; if it ever does, a separate test must verify per-query reset.
+- **Timestamp TZ pin (Round 6 B-L2)**: `shifts.opened_at` / `shifts.closed_at` (and any other timestamp columns added by migration 016) inherit the existing DPS-contract convention pinned in `rust/prro/src/transports/dps/dto.rs:35-42` — Kyiv-local-as-epoch (NOT UTC).  This matches the M3a-era convention for `fiscal_documents.business_ts` so cross-table forensic JOINs do not require timezone arithmetic.  Implementation MUST NOT introduce a column with a different TZ convention; if a future "UTC native" migration ever happens, it must be a coordinated cross-table refactor, not a per-table drift.
+- **Pre-pilot scope pin (Round 6 A-M4)**: this migration's identity-map for the 6 existing states is designed for the **Rust gateway pre-pilot** (zero or near-zero rows).  It is **NOT** a Python→Rust data-migration tool.  The pilot operator has Python-era production data per operator-profile memory; importing that data into the Rust gateway is a **separate task** with its own state-mapping decisions (Python `CLOSING` may not be 1:1 with Rust `Closing`; payload JSON shapes differ; offline-session linkage differs).  Reviewer MUST refuse impl PRs that try to bundle Python data-import into migration 016 — that would couple two independent migration concerns and create silent data-shape failures.
 
 ## 10. W11-Δ replay coverage (new fixtures)
 
@@ -651,6 +758,26 @@ The next code PR after this freeze merges.  Operator-driven; this section is inf
 *Documentation*:
 - Sync `docs/superpowers/plans/2026-05-14-m3b-implementation.md` §Task 10 audit vocabulary table with the new shift-level events.
 
+*Read API surface for POS UI (Round 6 A-M2 — pinned for W10b, NOT W14a)*:
+- POS-facing UI needs proactive visibility into the offline code pool so the cashier sees pool depletion **before** they hit the reserve floor.  Without this, the cashier learns about the refusal only when a customer is mid-checkout — operationally hostile.
+- Add a read-only query helper (location TBD by impl author — likely `rust/prro/src/db/repositories/offline_codes.rs`):
+  ```rust
+  pub async fn read_pool_state_for_fn(
+      conn: &SqlitePool,
+      fiscal_number: &str,
+  ) -> sqlx::Result<OfflinePoolState> { ... }
+
+  pub struct OfflinePoolState {
+      pub total_codes: u32,
+      pub free_codes: u32,
+      pub reserved_codes: u32,     // 1 if shift open + no offline Z_REPORT yet, else 0
+      pub usable_now: u32,         // free_codes saturating_sub reserved_codes
+      pub shift_open_gate_pass: bool,  // free_codes >= 2 (§7 reserve=2 rule)
+  }
+  ```
+- The helper is read-only (no `WriteTxConn`, no mutation).  Used by ingress controllers to surface counter in API responses + by future watermark monitors.
+- **Scope**: this surface is **NOT** part of W14a (this freeze's impl PR).  W14a remains migration + enum + repository + scanner test only.  The read API lands with W10b (offline `SHIFT_OPEN` ingress wiring) so the cashier sees the same numbers the refusal logic is evaluating.  Pinned here so W10b review does NOT bikeshed the field set — the four fields above are the contract floor.
+
 **Verify command**:
 ```bash
 cargo test -p prro --features test-support --test shifts_no_silent_error_paths --test shift_state_whitelist_matrix --test write_path_deterministic_replay
@@ -663,6 +790,7 @@ cargo test -p prro --features test-support  # full suite — no regressions
 2. Migration rebuilds both `shifts` + `node_state` CHECK constraints atomically.
 3. Two-tier scanner contract enforced by `tests/shifts_no_silent_error_paths.rs`: (a) `Error` reachable ONLY via `force_to_error_with_audit` seam — no whitelist edge ever lands on `Error`; (b) `RequiresManualReconciliation` reachable ONLY via whitelist edges 4 / 6 / 12 / 14 of §4.1 OR via `force_to_manual_reconciliation_with_audit` seam — no silent path through `TransitionOutcome::Forbidden`, no blanket `_ → Manual`.
 4. Two distinct force seams exist + audited per §8: `force_to_error_with_audit` emits `SHIFT_FORCE_TO_ERROR` (Critical); `force_to_manual_reconciliation_with_audit` emits `SHIFT_FORCE_TO_MANUAL_RECONCILIATION` (Critical).  No single `force_to_*` method with a `target: ShiftState` parameter — type-system distinction is structural per §4.5 rationale.
+4b. **Force-seam source-state restriction enforced (Round 6 A-H1)**: both seams MUST refuse with typed `ForceSeamForbiddenSource { current_state, attempted_seam }` when invoked from a forbidden source per the table in §4.5.  Acceptance: dedicated unit-test `tests/shifts_force_seam_source_guard.rs` covers all 81 (9 states × 2 seams) call sites — permitted sources succeed + emit the expected Critical audit; forbidden sources refuse with the typed error and emit NO `SHIFT_FORCE_*` audit (refusal is silent on audit-log because the operation never happened — separate `SHIFT_FORCE_SEAM_REFUSED` Warning audit fires on the refusal path so attempts remain forensically traceable).
 4a. `fiscal_documents.updated_at` byte-identical preservation across migration 016 (per §9.2 step 13 + acceptance test).
 5. 5 new W11-Δ replay fixtures green (total 33).
 6. Full M3a + M3b regression suite green (no fixture rewrites required by this expansion).
@@ -740,6 +868,8 @@ Operator picks at W10b open-time.  **`§Task 10` in the plan closes only when AL
 3. **Reserve = 2 configurability**.  Should the offline-SHIFT_OPEN reserve floor be operator-configurable, or invariant?  Recommend invariant — making it configurable risks operators tightening it to 1 (no close reserve) and re-asserting the 24h trap.  Audit alert if a future config knob is added.
 4. **Crash mid-W10-policy-decision behaviour** for ops attempted while shift in transient states.  Crash window analysis specific to W10 implementation; cross-reference at impl PR time.
 5. **`Closing → Opened` rollback audit shape** — what audit event surfaces a recoverable rejection that drove rollback?  Propose `SHIFT_ONLINE_CLOSE_RECOVERABLE_REJECT` (Warning), distinct from `SHIFT_CLOSE_DRAIN_REJECTED` (Critical) — operator triage benefit.
+
+6. **Orphan-doc RETURN compensation surface — when?** (Round 6 B-H1).  §5.7 L3 pins that the state machine deliberately does NOT model the orphan-RETURN path; operator-facing workflow is manual fiscal correction filing.  The state-machine pin is correct.  **Open**: when does the operator UI / dashboard get a surface that lists orphan docs per FN (so the operator knows which DPS corrections they owe)?  Recommend: future M3c "orphan compensation surface" task — out of M3b scope but pre-pilot blocker (pilot operator at 140-FN scale cannot manually grep audit_log for orphans across all FNs).  Operator to confirm timing — defer to M3c (post-pilot ramp-up) OR pull into M3b critical path (pre-pilot tooling)?  Default if no decision: defer to M3c.
 
 ---
 
