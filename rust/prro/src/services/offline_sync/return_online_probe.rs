@@ -51,7 +51,40 @@ use crate::db::repositories::{audit_log, node_state};
 use crate::db::tx::with_immediate;
 use crate::transports::dps::channel::DpsChannel;
 use crate::transports::dps::dto::CheckSignBlob;
-use crate::transports::dps::error::DpsError;
+use crate::transports::dps::error::{AuthorizationKind, DpsError};
+
+/// Stable string taxonomy for [`DpsError`] variants, embedded in
+/// `RETURN_ONLINE_PROBE_FAILED` audit payloads under the
+/// `dps_error_class` key.  Stable means: contract-grade — callers
+/// (audit log consumers, dashboards, alert rules) can match exact
+/// strings without parsing Debug repr.  Any future variant MUST
+/// extend this match arm.
+fn dps_error_class(err: &DpsError) -> &'static str {
+    match err {
+        DpsError::Transport(_) => "Transport",
+        DpsError::Authorization { .. } => "Authorization",
+        DpsError::Decode(_) => "Decode",
+        DpsError::Server { .. } => "Server",
+        DpsError::NotFound => "NotFound",
+        DpsError::ServerFiscalIdMismatch { .. } => "ServerFiscalIdMismatch",
+        DpsError::QueryNotSupported(_) => "QueryNotSupported",
+        DpsError::Internal(_) => "Internal",
+    }
+}
+
+/// Sub-classification key for [`DpsError::Authorization`], emitted
+/// alongside `dps_error_class = "Authorization"` so consumers can
+/// route `DocumentReject` vs `FiscalNumberNotRegistered` without
+/// re-parsing.  `None` for all other variants.
+fn authorization_kind_class(err: &DpsError) -> Option<&'static str> {
+    match err {
+        DpsError::Authorization { kind, .. } => Some(match kind {
+            AuthorizationKind::DocumentReject => "DocumentReject",
+            AuthorizationKind::FiscalNumberNotRegistered => "FiscalNumberNotRegistered",
+        }),
+        _ => None,
+    }
+}
 
 /// One FN entry in the probe's iteration list.  Frozen at spawn —
 /// the probe task iterates the same `Vec<ProbeSpec>` each tick.
@@ -189,6 +222,7 @@ pub async fn run_tick_for_fn(
     let payload_attempt = serde_json::json!({
         "fiscal_number": fiscal_number,
         "observed_mode_pre": ns_pre.mode.as_str(),
+        "tick_at": chrono::Utc::now().to_rfc3339(),
     });
     audit_log::append(
         pool,
@@ -209,12 +243,20 @@ pub async fn run_tick_for_fn(
         Ok(s) => s,
         Err(err) => {
             // Failure: emit audit + return.  Mode unchanged.
-            let payload_failed = serde_json::json!({
+            // `dps_error_class` is a stable string taxonomy (NOT
+            // Debug repr) so audit consumers can match exact
+            // variants without parsing.  See `dps_error_class()`
+            // helper at module top.
+            let mut payload_failed = serde_json::json!({
                 "fiscal_number": fiscal_number,
                 "observed_mode_pre": ns_pre.mode.as_str(),
-                "dps_error_class": format!("{err:?}"),
+                "dps_error_class": dps_error_class(&err),
+                "dps_error_detail": format!("{err}"),
                 "reason": "dps_error",
             });
+            if let Some(kind) = authorization_kind_class(&err) {
+                payload_failed["authorization_kind"] = serde_json::json!(kind);
+            }
             audit_log::append(
                 pool,
                 "node_state",

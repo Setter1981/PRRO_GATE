@@ -87,15 +87,19 @@ The success-path mode write goes through `with_immediate` (W2 / W5 axis 2 discip
 |----------------------------------|----------|-------------------------------------------------------------------------------------------------------------|
 | `RETURN_ONLINE_PROBE_ATTEMPT`    | Info     | `{fiscal_number, observed_mode_pre, tick_at}`                                                               |
 | `RETURN_ONLINE_PROBE_SUCCESS`    | Info     | `{fiscal_number, observed_mode_pre, observed_mode_post, dps_open_shift, dps_online, dps_last_signer}`       |
-| `RETURN_ONLINE_PROBE_FAILED`     | Warning  | `{fiscal_number, observed_mode_pre, dps_error_class?, dps_snapshot?, reason}`                               |
+| `RETURN_ONLINE_PROBE_FAILED`     | Warning  | `{fiscal_number, observed_mode_pre, dps_error_class?, dps_error_detail?, authorization_kind?, dps_snapshot?, reason}` |
 
 `entity_type` = `"node_state"`; `entity_id` = fiscal_number.
 
 `dps_error_class` and `dps_snapshot` are mutually exclusive — DPS Err sets the former, DPS Ok-with-offline sets the latter.
 
-The `reason` field on `_FAILED` is a typed-string enum: `"dps_error"`, `"dps_reports_offline"`, `"ambiguous_response"`.  Typed via Rust enum mapped to fixed string at audit emission site; downstream consumers can string-match safely.
+`dps_error_class` is a **stable string taxonomy** mapped from `DpsError` variants — `"Transport"`, `"Authorization"`, `"Decode"`, `"Server"`, `"NotFound"`, `"ServerFiscalIdMismatch"`, `"QueryNotSupported"`, `"Internal"`.  Audit consumers (dashboards, alert rules) can match exact strings without parsing Debug repr.  `authorization_kind` is emitted only when class is `"Authorization"` — values `"DocumentReject"` / `"FiscalNumberNotRegistered"`.  `dps_error_detail` carries the `Display` message verbatim for forensics.
+
+The `reason` field on `_FAILED` is a typed-string enum: `"dps_error"`, `"dps_reports_offline"`, `"cas_miss_concurrent_mode_change"`.  Typed via Rust enum mapped to fixed string at audit emission site; downstream consumers can string-match safely.
 
 ## 5. Runtime task lifecycle
+
+> **W8a / W8b split (2026-05-16).**  W8a ships the tested **primitive** (`run_tick_for_fn` + `spawn_probe_loop`) plus the `OfflineCfg` schema delta with parse-time clamp.  W8a does NOT wire the loop into `App::boot` — that is W8b's scope (ownership of `JoinHandle`, watch::Sender placement, FN → `fn_sign` resolution, shutdown plumbing from `main`, boot-level "no probe for Online FNs" + "clean shutdown" integration tests, and emission of the WARN audit when the operator-supplied interval is clamped).  §Task 8 remains OPEN until W8b lands.  The bullet list below describes the **end state** that W8b realises; W8a's `spawn_probe_loop` already implements the per-task discipline, only the App-level wiring is deferred.
 
 - Probe is a single tokio task spawned at App boot (one task that iterates FNs each tick, NOT per-FN tasks — simpler shutdown discipline).
 - Tick driven by `tokio::time::interval` with `MissedTickBehavior::Skip` (no queue-up of missed ticks).
@@ -121,12 +125,22 @@ Validation: parse-time clamp + WARN audit if operator-supplied value was clamped
 - Stage_acquire offline-mode ingress — W7 follow-up territory (M3b W8b / M3c per operator decision).
 - Multi-FN coordination beyond single-task iteration — defer to a future scaling task if pilot reveals contention.
 
+### 7a. W8b scope (deferred from W8a, closes §Task 8)
+
+- `App::boot` wires `spawn_probe_loop`: reads `clamped_probe_interval_seconds()`, enumerates `(Offline | GoingOffline)` FNs (or documents exact selection rule), constructs `Vec<ProbeSpec>`, owns the resulting `JoinHandle<()>` and the `watch::Sender<bool>`.
+- `main` propagates shutdown into the watch::Sender on SIGINT / SIGTERM; the loop's clean-exit guarantee (test #7) is exercised end-to-end.
+- WARN audit on parse-time interval clamp (operator-supplied value outside `[5, 3600]`) emitted from the boot site, not from the primitive.
+- Loop-level error visibility (review MED #2): on `run_tick_for_fn` `Err(_)`, emit a CRITICAL `RETURN_ONLINE_PROBE_LOOP_ERROR` audit row in addition to `tracing::error!`; supervisor restart NOT required (loop already continues on next tick), but the operator must see a durable record.
+- Boot-level integration tests:
+  - `probe_does_not_spawn_for_online_fn` — Online-only FN list → no `_ATTEMPT` audit ever fires.
+  - `probe_respects_shutdown_signal_at_app_level` — boot → SIGTERM → clean task exit within bounded timeout.
+
 ## 8. Test plan
 
 Three acceptance tests (plan §Task 8 line 591-595):
 
 1. `return_online_probe_success` — stub returns `StatusSnapshot { online: true, ... }`; mode flips `Offline → GoingOnline`; audit row exists.
-2. `return_online_probe_failure` — stub returns `Err(DpsError::TransientRetry)`; mode unchanged; failed audit with `dps_error_class = "TransientRetry"`.
+2. `return_online_probe_failure` — stub returns `Err(DpsError::Transport(...))`; mode unchanged; failed audit with `dps_error_class = "Transport"` (stable taxonomy mapped from variant name).
 3. `return_online_probe_idempotent` — first success flips to GoingOnline; second success on GoingOnline is no-op (no mode write, no duplicate `_SUCCESS` audit).
 
 Plus 1-2 boot-level integration tests:

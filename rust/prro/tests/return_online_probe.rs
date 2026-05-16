@@ -109,33 +109,111 @@ fn fn_sign() -> CheckSignBlob {
     CheckSignBlob(vec![0xAB, 0xCD, 0xEF, 0x12])
 }
 
-/// Snapshot of row counts across fiscal-data tables.  Used by the
+/// Content snapshot across fiscal-data tables.  Used by the
 /// negative scanner (test #6) to assert the probe has zero side
-/// effects on these tables.
+/// effects on these tables — both row counts AND row contents.
+/// Plain counts would miss accidental UPDATEs that preserve row
+/// count (e.g. state column flipped on an existing fiscal_document);
+/// the per-row digest string catches those.
+///
+/// Each table contributes a `Vec<String>` of identifying columns +
+/// state/content columns, ordered by primary key.  Two snapshots
+/// compare equal iff every row in every table is byte-identical.
 #[derive(Debug, PartialEq, Eq)]
-struct FiscalTableCounts {
-    fiscal_documents: i64,
-    offline_sessions: i64,
-    offline_codes: i64,
-    transport_trace: i64,
+struct FiscalTableSnapshot {
+    fiscal_documents: Vec<String>,
+    offline_sessions: Vec<String>,
+    offline_codes: Vec<String>,
+    transport_trace: Vec<String>,
 }
 
-async fn fiscal_table_counts(pool: &SqlitePool) -> FiscalTableCounts {
-    let count = |q: &'static str| {
-        let pool = pool.clone();
-        async move {
-            sqlx::query_scalar::<_, i64>(q)
-                .fetch_one(&pool)
-                .await
-                .unwrap()
-        }
-    };
-    FiscalTableCounts {
-        fiscal_documents: count("SELECT COUNT(*) FROM fiscal_documents").await,
-        offline_sessions: count("SELECT COUNT(*) FROM offline_sessions").await,
-        offline_codes: count("SELECT COUNT(*) FROM offline_codes").await,
-        transport_trace: count("SELECT COUNT(*) FROM transport_trace").await,
+type FiscalDocRow = (Vec<u8>, String, i64, String, String, Vec<u8>);
+
+async fn fiscal_table_snapshot(pool: &SqlitePool) -> FiscalTableSnapshot {
+    // fiscal_documents: identify + state-bearing columns.  Probe
+    // is forbidden from touching state, business_ts, payload_json,
+    // payload_sha256_canonical — so capturing those proves a clean
+    // negative scanner.
+    let fd: Vec<FiscalDocRow> = sqlx::query_as(
+        "SELECT document_id, state, lnd, fs_mode, payload_json, payload_sha256_canonical \
+         FROM fiscal_documents ORDER BY document_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let fd = fd
+        .into_iter()
+        .map(|(id, st, lnd, fs, pj, sha)| {
+            format!(
+                "{}:{}:{}:{}:{}:{}",
+                hex_lower(&id),
+                st,
+                lnd,
+                fs,
+                pj,
+                hex_lower(&sha)
+            )
+        })
+        .collect();
+
+    let os: Vec<(Vec<u8>, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT offline_session_id, state, opened_at, COALESCE(closed_at, '') \
+         FROM offline_sessions ORDER BY offline_session_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let os = os
+        .into_iter()
+        .map(|(id, st, op, cl)| {
+            format!(
+                "{}:{}:{}:{}",
+                hex_lower(&id),
+                st,
+                op,
+                cl.unwrap_or_default()
+            )
+        })
+        .collect();
+
+    let oc: Vec<(String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT fiscal_number, code_lnd, consumed_at \
+         FROM offline_codes ORDER BY fiscal_number, code_lnd",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let oc = oc
+        .into_iter()
+        .map(|(fnum, cl, ca)| format!("{}:{}:{}", fnum, cl, ca.unwrap_or_default()))
+        .collect();
+
+    let tt: Vec<(Vec<u8>, i64, String, String)> = sqlx::query_as(
+        "SELECT document_id, attempt_no, request_kind, retry_class \
+         FROM transport_trace ORDER BY document_id, attempt_no",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let tt = tt
+        .into_iter()
+        .map(|(id, n, k, rc)| format!("{}:{}:{}:{}", hex_lower(&id), n, k, rc))
+        .collect();
+
+    FiscalTableSnapshot {
+        fiscal_documents: fd,
+        offline_sessions: os,
+        offline_codes: oc,
+        transport_trace: tt,
     }
+}
+
+fn hex_lower(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for byte in b {
+        s.push_str(&format!("{:02x}", byte));
+    }
+    s
 }
 
 // ─── 1. Happy path ──────────────────────────────────────────────────
@@ -202,14 +280,56 @@ async fn probe_failure_dps_error_keeps_mode_and_audits_typed_class() {
         .await
         .unwrap();
     assert_eq!(payload["reason"], "dps_error");
+    // Stable taxonomy: exact-string match, not Debug substring.
+    assert_eq!(payload["dps_error_class"], "Transport");
+    // Detail message preserved separately for forensics.
     assert!(
-        payload["dps_error_class"]
+        payload["dps_error_detail"]
             .as_str()
             .unwrap()
-            .contains("Transport"),
-        "audit must carry DpsError class for forensics; got: {}",
-        payload["dps_error_class"]
+            .contains("test-transient"),
+        "audit must carry Display detail for forensics; got: {}",
+        payload["dps_error_detail"]
     );
+    // No authorization_kind on Transport variant.
+    assert!(payload.get("authorization_kind").is_none());
+}
+
+// ─── 2b. Authorization variant — kind sub-field ────────────────────
+
+#[tokio::test]
+async fn probe_failure_authorization_emits_kind_subfield() {
+    // Covers the W8a review MED #1 ask: stable taxonomy + the
+    // Authorization-only `authorization_kind` discriminator so
+    // audit consumers can split DocumentReject from
+    // FiscalNumberNotRegistered without re-parsing.
+    use prro::transports::dps::error::AuthorizationKind;
+    let (_d, pool) = fresh_pool().await;
+    seed_fn_config(&pool, FN).await;
+    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::Closed).await;
+    let stub = StubDpsChannel::with_status_result(Err(DpsError::Authorization {
+        code: -13,
+        kind: AuthorizationKind::FiscalNumberNotRegistered,
+        message: "RRO not registered (test)".into(),
+    }));
+    let signer = fn_sign();
+    let outcome = return_online_probe::run_tick_for_fn(&pool, &stub, FN, &signer)
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        TickOutcome::Failed {
+            reason: FailureReason::DpsError,
+            ..
+        }
+    ));
+    assert_eq!(read_node_mode(&pool, FN).await, "OFFLINE");
+    let payload = audit_payload(&pool, "RETURN_ONLINE_PROBE_FAILED")
+        .await
+        .unwrap();
+    assert_eq!(payload["reason"], "dps_error");
+    assert_eq!(payload["dps_error_class"], "Authorization");
+    assert_eq!(payload["authorization_kind"], "FiscalNumberNotRegistered");
 }
 
 // ─── 3. DPS reports online=false ────────────────────────────────────
@@ -393,17 +513,20 @@ async fn probe_no_fiscal_side_effects_on_success_failure_or_skip() {
         .await
         .ok(); // schema may differ; allow Err — not load-bearing for the assert.
 
-        let pre = fiscal_table_counts(&pool).await;
+        let pre = fiscal_table_snapshot(&pool).await;
 
         let signer = fn_sign();
         let _outcome = return_online_probe::run_tick_for_fn(&pool, &stub, FN, &signer)
             .await
             .unwrap();
 
-        let post = fiscal_table_counts(&pool).await;
+        let post = fiscal_table_snapshot(&pool).await;
+        // Content-level equality catches UPDATEs that preserve row
+        // count as well as INSERT/DELETE — stronger than the
+        // count-only baseline that the W8a review flagged.
         assert_eq!(
             pre, post,
-            "probe path '{case_name}' must NOT touch fiscal-data tables (operator pin)"
+            "probe path '{case_name}' must NOT touch fiscal-data table CONTENTS (operator pin)"
         );
     }
 }
