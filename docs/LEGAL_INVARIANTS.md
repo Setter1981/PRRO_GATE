@@ -162,6 +162,7 @@ Failover між `DPS_UNIFIED_WINDOW` і `DPS_PRRO_FISCAL_SERVER` дозволе�
 | Offline state model (`OfflineLocalAck` typed state) | ✅ Реалізовано (M3b W4 + W6 + W7) |
 | Offline sync service (W9 backlog drain) | ⚠ In progress — M3b W9a merged (`stage_send` widened for OfflineLocalAck source); W9b backlog drain orchestration + W12 KVT2 confirmation pending |
 | **Z-report / shift close policy** | ⚠ M3b W10 redesigned (2026-05-16) — **ONLINE Z_REPORT** over pending offline backlog MUST be blocked; **OFFLINE-mode local Z_REPORT** close-of-day MUST be allowed as Pattern C document (consumes offline code, lands `OfflineLocalAck`, drained later in `lnd` order).  Earlier blanket-block framing was an error — see `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0.  W10 implementation pending. |
+| **Hard close-code reserve = 1** | ⚠ M3b W10 rule (2026-05-16) — while a shift is open and the offline `Z_REPORT` has NOT yet been emitted, ordinary offline `SELL` / `RETURN` / `SERVICE_*` docs MUST NOT consume the last free offline code (refused with `OFFLINE_CODE_RESERVED_FOR_CLOSE` audit; code row stays unconsumed).  The offline `Z_REPORT` close-of-day MAY consume the reserved code.  **Hard reserve is exactly 1** — it is the *last-line* legal guarantee that the offline Z_REPORT close path always has a code while a shift is open, NOT an operational refill watermark.  The operational watermark (`min_offline_codes`, commonly ~10) sits well above 1 and triggers refill *before* exhaustion; it is a recommendation, not the legal reserve.  pool=0 at close time → `OFFLINE_Z_REPORT_LOCAL_CLOSE_REFUSED` with `reason: "code_pool_exhausted"`; pilot-critical signal that the operational watermark failed upstream.  Without this reserve, ordinary docs could exhaust the pool before close-of-day, leaving the offline Z_REPORT path empty and re-asserting the 24h trap.  W10 implementation pending. |
 | Crypto seam (passthrough/sidecar) | ✅ Реалізовано і покрито тестами |
 | Production crypto startup gate | ✅ Реалізовано (M3a) |
 | Excise mark protection | ✅ Часткове — no fiscal validator |
@@ -175,7 +176,8 @@ Failover між `DPS_UNIFIED_WINDOW` і `DPS_PRRO_FISCAL_SERVER` дозволе�
 2. 36h continuous offline limit is enforced OR explicitly risk-accepted.
 3. 168h monthly offline limit is enforced OR explicitly risk-accepted.
 4. M3b W10 ONLINE-vs-OFFLINE Z-report policy is implemented + pilot-tested (Phase 6 in `docs/PILOT_ACCEPTANCE_TEST_PLAN.md` covers both paths).
-5. M3b W9b backlog drain + W12 KVT2 confirmation deliver every offline doc to final DPS `ACK`.
+5. M3b W10 hard close-code reserve = 1 is implemented + pilot-tested (pool=1 sale refused, pool=1 Z_REPORT accepted, pool=0 Z_REPORT refused with `code_pool_exhausted`).
+6. M3b W9b backlog drain + W12 KVT2 confirmation deliver every offline doc to final DPS `ACK`.
 
 The offline Z_REPORT local close-of-day path is the architectural answer to the "24h trap": without it, an offline shift would have no compliant way to close at the 24h wall.  With it, the cash desk keeps operating (and reporting) even during DPS outages, with sync to final ACK on return-online.
 

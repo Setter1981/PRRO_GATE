@@ -365,12 +365,21 @@ Verify:
 - Synchronization preserves strict `lnd` ASC ordering, including the offline Z_REPORT relative to prior offline sales.
 - MAC chain is not broken after offline replay.
 - Audit log distinguishes `ONLINE_Z_REPORT_BLOCKED_BACKLOG` (step 6) from `OFFLINE_Z_REPORT_LOCAL_CLOSE_ACCEPTED` (step 8) and `POST_LOCAL_CLOSE_SALE_REFUSED` (step 9).
+- **Hard close-code reserve = 1 offline code per active offline shift.**  While a shift is open and the offline Z_REPORT has NOT yet been emitted, ordinary offline SELL / RETURN / SERVICE_* docs MUST NOT consume the last free offline code: at pool=1 such an attempt is refused with audit `OFFLINE_CODE_RESERVED_FOR_CLOSE` (Warning) and the code row remains `consumed_at IS NULL`.  The offline Z_REPORT, in contrast, MAY consume the reserved code.  This is the legal escape hatch from the 24h shift-limit trap — without it ordinary docs could exhaust the pool before close-of-day, leaving the offline Z_REPORT path empty.  See plan §Task 10 bullets 9-11 + `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0 + `docs/LEGAL_INVARIANTS.md` §8.  Operational refill watermark (`min_offline_codes`, commonly ~10) is a separate, upstream concern and is NOT the legal reserve.
+
+Edge-case verification (pilot dossier must record one or more of):
+
+- **pool=1 ordinary sale refused** — submit a SELL while exactly one offline code remains; assert refusal + `OFFLINE_CODE_RESERVED_FOR_CLOSE` audit + offline_code row still `consumed_at IS NULL` + no fiscal_documents insert.
+- **pool=1 offline Z_REPORT accepted** — same state; submit Z_REPORT; assert routed to Pattern C local close, lands `OfflineLocalAck`, the reserved code is consumed by the Z_REPORT row.
+- **pool=2 → sale consumes one → next sale refused → Z_REPORT consumes last** — exercises the reserve as the pool drains down to the floor.
+- **pool=0 offline Z_REPORT refused** — exhausted pool; offline Z_REPORT close also refused with `OFFLINE_Z_REPORT_LOCAL_CLOSE_REFUSED` + `reason: "code_pool_exhausted"`.  This is the pilot-critical "trap reasserted" branch — the operational refill watermark failed upstream.
 
 Exit criteria:
 
 - Online Z-report over pending offline backlog is correctly blocked.
 - Offline Z_REPORT local close-of-day is correctly accepted as `OFFLINE_LOCAL_ACK`.
 - Post-local-close sale lockout enforced until next allowed shift-open.
+- **Hard close-code reserve = 1 enforced**: ordinary fiscal docs cannot consume the last code while the offline Z_REPORT is still pending; offline Z_REPORT may consume it.  pool=0 surfaces the pilot-critical `OFFLINE_Z_REPORT_LOCAL_CLOSE_REFUSED` audit so triage can distinguish "trap reasserted" from a refused-by-shift-or-mode condition.
 - Drain replays all offline docs (including the offline Z_REPORT) in `lnd` order; each reaches final DPS `ACK` after W12 confirmation.
 - The 24h shift / 36h continuous offline / 168h monthly offline limits behave per `docs/LEGAL_INVARIANTS.md` — either enforced, or explicitly risk-accepted with a sign-off recorded in the pilot log.
 
