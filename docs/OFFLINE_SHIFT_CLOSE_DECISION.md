@@ -275,14 +275,16 @@ Shift record повинен бути зв'язаний з документами
 
 ## 11. Final Recommendation
 
-**Safest implementable interpretation:**
+**Safest implementable interpretation (updated 2026-05-16 per §0 correction):**
 
 - продукт повинен підтримати offline close-of-day;
-- але `offline SHIFT_CLOSE` не слід відкривати як окрему пряму операцію в поточній архітектурі;
-- offline close-of-day потрібно моделювати через `Z_REPORT`-centric contour;
-- до реалізації цього contour система має:
-  - не відкривати standalone direct offline `SHIFT_CLOSE`;
-  - додати legal blockers для `SHIFT_CLOSE` / `Z_REPORT` при pending offline backlog;
-  - довести linkage між shift і close/day-close documents.
+- але `offline SHIFT_CLOSE` як окрема пряма transport-level операція не повинна відкриватися в поточній архітектурі;
+- offline close-of-day моделюється через `Z_REPORT`-centric contour: **offline-mode local `Z_REPORT` close → Pattern C `OFFLINE_LOCAL_ACK` document** (consumes offline code, ordered after prior offline docs by `lnd`, drained later through online ladder);
+- legal blockers застосовуються **тільки до ONLINE-варіантів** при pending offline backlog:
+  - **online** `SHIFT_CLOSE` blocked → typed refusal + audit;
+  - **online** `Z_REPORT` blocked → `ONLINE_Z_REPORT_BLOCKED_BACKLOG` audit;
+  - **offline-mode local** `Z_REPORT` close-of-day, навпаки, MUST бути дозволений як Pattern C document — це **не** частина блокатора, це окрема routed-acceptance ARM (`OFFLINE_Z_REPORT_LOCAL_CLOSE_ACCEPTED`);
+- post-local-close lockout: після того як offline `Z_REPORT` досяг `OfflineLocalAck`, нові sale / return документи MUST бути refused (`POST_LOCAL_CLOSE_SALE_REFUSED`) until next allowed shift-open policy satisfied;
+- довести linkage між shift і close/day-close documents (`close_document_id` / `z_report_document_id`).
 
-Це рішення є консервативним, але воно мінімізує ризик юридично хибного `shift closed` без завершеного фіскального денного контуру.
+Це рішення мінімізує ризик юридично хибного `shift closed` без завершеного фіскального денного контуру AND гарантує compliant exit з offline shift'а проти 24h legal limit ("24h trap" mitigation — see §0 + `docs/LEGAL_INVARIANTS.md` §8).

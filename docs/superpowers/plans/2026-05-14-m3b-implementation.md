@@ -17,7 +17,7 @@
 **Architecture.**  Rust crate `prro` extends with:
 - `services::offline_session` — offline-session state machine + repository contracts.
 - `services::offline_sync` — return-online detection + backlog drain (Pattern C "stage and flip").
-- `services::offline_guard` — Z-report block while backlog non-empty.
+- `services::offline_guard` (or `services::write_path::policy_guard`) — **M3b W10 offline shift close/open policy guard**: blocks ONLINE Z_REPORT / SHIFT_CLOSE over pending offline backlog, ROUTES offline-mode Z_REPORT to Pattern C local close (lands `OfflineLocalAck`, drained later in `lnd` ASC), enforces post-local-close sale lockout.  See plan §Task 10 + `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0 for the corrected policy.
 - `services::write_path::stage_offline_ack` — **new stage** (W7).  Post-sign dispatcher routes Offline / GoingOffline docs here.  `stage_finalize` is **untouched** — it remains strictly `Kvt2 → Ack`.
 - `db::repositories::offline_sessions` — session + code pool persistence (normalization migration of existing 004-era tables — see W4).
 - `db::repositories::fiscal_documents` whitelist extended with the offline edges; existing `transition_state` extended (W3) to stamp `first_kvt1_at` on `Sent → Kvt1`.
@@ -859,7 +859,7 @@ Explicit non-goals (per operator thesis 2026-05-14):
 - ❌ Operator manual reconciliation UI.  No CLI / admin / web surface in M3b unless a pilot blocker forces a narrow shim — even then, in-scope decision deferred to operator.
 - ❌ Web admin UI.  None of any form.
 - ❌ Backup/restore, CA/key rotation, rollback rehearsal.  Parallel ops/docs prerequisites, not M3b code scope.
-- ❌ 36h / 168h / 24h shift-limit enforcement unless explicitly promoted by operator.  Otherwise: record pilot risk acceptance and defer.
+- ⚠ 36h / 168h / 24h shift-limit enforcement — **promoted from non-goal to active engineering risk / pilot gate** (2026-05-16, see `docs/LEGAL_INVARIANTS.md` §8).  Enforcement may land after W10 (the offline shift close/open policy guard) rather than inside W10 itself, but it MUST be implemented OR explicitly risk-accepted with operator sign-off before live pilot / production.  The offline Z_REPORT local close path (W10) exists precisely so the 24h shift limit has a compliant exit even when DPS is unreachable.
 - ❌ Generic boot-time KVT2 polling for arbitrary/stale `Kvt1` docs.  W12 is scoped to W9 drain-time latest-doc confirmation only.
 - ❌ Channel switch with open shift.  Frozen invariant 3 absolute; M3b reinforces.
 
