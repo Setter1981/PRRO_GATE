@@ -175,7 +175,7 @@ Scenario:
 6. Replay the WebCheck-derived sale dataset through Maria 304.
 7. Replay the return dataset through Maria 304.
 8. Run service-out operation.
-9. Run X-report if supported as read-only.
+9. Run X-report.  **X-report is strictly read-only**: it MUST NOT sign, transport, persist as `fiscal_documents`, advance `lnd`, consume an offline code (WebCheck channel) or an offline local ordinal (DFS channel), or allocate a Z-report sequence number.  Verify the pilot run produces no `fiscal_documents` row and no DPS submission for the X-report request.  See `docs/LEGAL_INVARIANTS.md` "X-report read-only" row for the full invariant.
 10. Close shift with Z-report.
 
 For every document, verify:
@@ -336,6 +336,8 @@ Exit criteria:
 
 Objective: prove offline lifecycle, offline close-of-day, and later synchronization.
 
+> **Channel scope (2026-05-16).**  Phase 6 acceptance is **scoped to the WebCheck / gRPC DPS channel** (the target M3a + M3b W7-W9a-W10 build against).  The Ukrainian tax DPS also exposes a second channel — DFS HTTP / XML (`/fs/cmd` + `/fs/doc` + `/fs/pck` per `PRRODPS.DFS`) — with a fundamentally different offline-numbering pipeline (`OfflineSessionId.localOfflineNum.controlNumber` via `MakeOfflineNum`) and package-drain shape (`/fs/pck` chunked upload).  DFS pilot is a future deliverable, NOT part of M3b Phase 6.  See `docs/superpowers/plans/2026-05-14-m3b-implementation.md` §"DPS Channel Taxonomy" for the channel comparison.  Maria 304 is the ingress / POS adapter shape (same role as REST / XML-RPC / Maria-TCP shells), NOT a DPS channel.
+>
 > **Correction (2026-05-16).**  Earlier wording asserted "Z-report is blocked while offline backlog exists" as a blanket rule.  That conflates two distinct close-of-day paths and would trap an offline shift against the 24h legal limit.  The corrected pilot scenario distinguishes:
 > - **Online Z-report over a pending offline backlog** — MUST be blocked (DPS would record a Z that omits offline receipts not yet drained).
 > - **Offline-mode local Z_REPORT close-of-day** — MUST be allowed as a Pattern C `OFFLINE_LOCAL_ACK` document, consuming an offline code, ordered after prior offline docs by `lnd`, and later drained through the wire-send ladder on return-online.

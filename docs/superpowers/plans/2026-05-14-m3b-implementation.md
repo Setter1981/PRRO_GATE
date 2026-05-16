@@ -26,6 +26,38 @@
 
 **Pattern C** is the central new structural pattern (M3a had Pattern A = compute outside / persist inside; Pattern B = `Sending` intent-marker before wire send).  **Pattern C** = durable `OFFLINE_LOCAL_ACK` first inside `with_immediate` via `stage_offline_ack` (pre-send, post-sign), then *later* (return-online tick) a separate `with_immediate` envelope drives the doc through the M3a `Sending → Sent → Kvt1` ladder via backlog sync, then W12 confirms the just-sent latest doc with `lastChk(fn_sign)` and advances through `Kvt2 → Ack`.  W12 is **not** a general boot-time KVT2 poller; stale/pre-existing `Kvt1` docs stay on `passive_hold_kvt1`.
 
+### DPS Channel Taxonomy (2026-05-16)
+
+The Ukrainian tax DPS exposes **two distinct fiscal channels**.  M3a + M3b have been built and reviewed against one of them; the second is recognised here as a future scope item.  **`DpsChannel` in the Rust gateway is a backend abstraction**; per-channel semantics are pluggable behind it, and the core write-path / offline-session / document state machine remains channel-neutral.
+
+**Channel 1 — WebCheck / gRPC** (M3a + M3b W7/W8/W9a in-scope).
+- Wire surface: gRPC `CheckEnvelope` → `send_chk` / `last_chk` / `status_rro` (`rust/prro/src/transports/dps/channel.rs`).
+- Evidence shape: per-document `lastChk` ticket carrying `data_sign`; KVT2 confirmation reads `response.id == doc.server_fiscal_no` + non-empty `data_sign`.
+- Offline numbering: **pre-fetched offline code pool** in `offline_codes(fiscal_number, code_lnd, …)`; W7a writes `fiscal_documents.offline_fiscal_no = consumed code_lnd` at the `Signed → OfflineLocalAck` transition.
+- Drain: W9b per-doc replay through the wire-send ladder; W12 in-drain `lastChk` confirmation gives the doc final `Ack`.
+
+**Channel 2 — DFS HTTP / XML** (recognised future scope; NOT implemented in Rust M3b).
+- Wire surface: HTTPS endpoints documented in the `PRRODPS.DFS` reference codebase under `/mnt/d/prrodps_src/`:
+  - `/fs/cmd` — JSON commands (open-shift / close-shift / package metadata).
+  - `/fs/doc` — fiscal XML documents (CAdES-signed + gzip).
+  - `/fs/pck` — offline package drain (chunked upload of accumulated offline docs after return-online).
+- Evidence shape: DFS-side tickets returned by `/fs/doc` and `/fs/pck`, parsed channel-specifically; the M3a `lastChk` shape does NOT apply.
+- Offline numbering: NOT a pool.  DFS constructs the offline fiscal-number string per-document from `OfflineSeed`, `OfflineSessionId`, local ordinal, RRO fiscal/local number, document timestamp, sum, and previous-doc hash — yielding `OfflineSessionId.localOfflineNum.controlNumber`.  Evidence: `PRRODPS.DFS/DFSApi.cs::MakeOfflineNum` + the `SendCheck` / `SendZReport` offline branches; the offline-package drain entry is `SendChunk` against `/fs/pck`.
+- Drain: a separate future implementation must own `/fs/pck` package construction + DFS-ticket parsing.  The W9b WebCheck/gRPC drain CANNOT be reused as-is.
+
+**Maria 304 is NOT a DPS channel.**  It is an **ingress / POS adapter** — the same role that `services::ingress::*` plays for the Rust gateway's REST / XML-RPC / Maria-TCP shells.  In the reference codebase Maria 304 dispatches POS messages (`COMP → RegisterCheck`, `NREP → Z-report`, `ZREP → X-report`) into the `MainData` orchestrator, which in turn picks **one** DPS channel (WebCheck or DFS).  Maria's presence in `PRRODPS/Maria/Session/MariaDispatcher.cs` MUST NOT be cited as a "channel" — it sits on the ingress side of the same boundary that REST / XML-RPC live on.
+
+**Backend-specific concerns** for any future M3b+ task that touches transports:
+- endpoint family (gRPC vs `/fs/cmd` + `/fs/doc` + `/fs/pck`);
+- evidence / ticket shape (`lastChk` snapshot vs DFS XML ticket);
+- offline number derivation (code-pool consumption vs constructed string with control number);
+- package drain (per-doc replay vs `/fs/pck` chunked upload);
+- recovery probes (`status_rro` + `last_chk` vs DFS-side equivalents).
+
+**Channel-neutral** components (core write-path / offline-session lifecycle / `fiscal_documents` state machine / Pattern A/B/C semantics / single-writer-per-FN invariant / 24h-trap mitigation policy) MUST remain unchanged across channel choice.  Only the `DpsChannel` trait surface and channel-specific helpers vary.
+
+**Invariant pin (frozen).**  **No channel switch with open shift.**  Once a shift is opened against one DPS channel family, the channel is pinned for that shift until `Z_REPORT` close-of-day completes AND any offline backlog from that shift drains to final ACK on that same channel.  This invariant is consequence of the channel-specific offline numbering and ticket shapes — switching mid-shift would lose forensic continuity and break per-doc evidence reconciliation.  This is a strengthening of frozen invariant 3 (channel switch forbidden with open shift), not a new invariant.
+
 **Tech stack.**  Unchanged from M3a: Rust 1.95 + sqlx 0.8 (SQLite STRICT, WAL) + tonic 0.12 + tokio 1.x + tracing 0.1 + `tokio::task_local!`.  No new crate dependencies required.
 
 **Bundle code + tests in every production W-task.**  No separate production-code tail tasks — for M3b a task is not landed without its targeted fixtures green.  **W11-Δ is the explicit cross-stage deterministic-replay extension gate**: it is test-only by design because the replay invariant cannot be proven inside any single offline-stage task.
@@ -612,6 +644,8 @@ cargo test -p prro --test return_online_probe_idempotent      # new
 
 ### Task 9 (W9): backlog drain — Pattern C stage-and-flip
 
+> **Channel scope (2026-05-16).**  W9 + W9b are scoped to the **WebCheck / gRPC** channel only (see plan §"DPS Channel Taxonomy").  The drain replays each backlog doc through the M3a wire-send ladder via the gRPC `send_chk` / `last_chk` surface.  The DFS HTTP / XML channel has a fundamentally different drain shape (`/fs/pck` chunked package upload, no per-doc `lastChk` ticket — see `PRRODPS.DFS/DFSApi.cs::SendChunk` in the reference codebase) and is **out of M3b scope**.  A future task must own DFS-side `/fs/pck` package construction + DFS ticket parsing; do not retrofit W9b for it.
+
 **Goal.** When node mode is `GoingOnline` and there is at least one `OfflineLocalAck` doc, drain the backlog sequentially.  W0b is resolved as scoped YES, so the M3b drain target is `Ack` for the offline-drain backlog:
 
 - Drive each doc through the full M3a wire-send + finalize ladder `OfflineLocalAck → Sending → Sent → Kvt1 → Kvt2 → Ack` via existing `stage_send::run` (widened) + W12 in-drain `lastChk` confirmation + `stage_finalize::run`.  Final state per drained backlog doc: `Ack`.
@@ -695,6 +729,8 @@ cargo test -p prro --test backlog_drain_mac_chain_preserved    # new
 9. **Hard close-code reserve = 1 offline code per active offline shift** (legal escape hatch from the 24h shift-limit trap, NOT an operational watermark — see `docs/LEGAL_INVARIANTS.md` §8 + `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0).  While a shift is open and the offline local Z_REPORT has NOT yet been emitted, ordinary offline `SELL` / `RETURN` / `SERVICE_*` docs MUST NOT consume the last free offline code: the policy guard refuses such an attempt with audit `OFFLINE_CODE_RESERVED_FOR_CLOSE` (Warning) and leaves the code row `consumed_at IS NULL` (no W5 `acquire_code_tx` CAS attempted on this path).  Operationally distinct from the `min_offline_codes` / refill watermark (which is a *recommendation* threshold operators set high — e.g. 10 — to trigger refill before exhaustion); the hard reserve is *exactly 1* and is enforced by W10 regardless of the configured watermark.
 10. **Offline-mode local Z_REPORT close-of-day MAY consume the reserved code.**  When the policy guard routes a Z_REPORT to `AllowOfflineLocalClose` (per bullet 3) and exactly one free offline code remains, the offline Z_REPORT proceeds and consumes that last code via the normal W5 `acquire_code_tx` path; the reserve check does NOT fire for Z_REPORT source.  This is the architectural mechanism that prevents the 24h trap: ordinary docs hit the reserve floor at 1, the close-of-day Z_REPORT punches through it.
 11. **Zero free offline codes → offline Z_REPORT close also refused.**  If the pool is exhausted (no `consumed_at IS NULL` row remains) at the moment the policy guard evaluates an offline Z_REPORT, the decision is `AllowOfflineLocalClose` → routed → W5 `acquire_code_tx` returns `CodePoolExhausted` → typed refusal + `OFFLINE_Z_REPORT_LOCAL_CLOSE_REFUSED` audit (Warning).  This is a **pilot-critical / legal-critical condition**: the operator has lost the compliant close-of-day exit even with the reserve rule in place; the audit row carries `reason: "code_pool_exhausted"` so triage can distinguish it from a `_REFUSED` due to mode/shift/session conditions.  Refill watermark monitoring (`min_offline_codes` operational warning) is the upstream mitigation; the W10 guard is the last line.
+12. **Reserve semantics are channel-specific** (see plan §"DPS Channel Taxonomy").  On the **WebCheck / gRPC** channel (W10 in-scope target) the reserved slot is exactly one row in `offline_codes` left `consumed_at IS NULL` per active offline shift.  On the future **DFS HTTP / XML** channel the reserved slot is one offline local ordinal / control-number slot in the `OfflineSessionId.localOfflineNum.controlNumber` derivation (per `PRRODPS.DFS/DFSApi.cs::MakeOfflineNum`); the concept is the same — exactly one close-capable slot held back from ordinary docs — but the storage mechanism differs.  M3b W10 implements the WebCheck variant only.  The audit event vocabulary (`OFFLINE_CODE_RESERVED_FOR_CLOSE` / `OFFLINE_Z_REPORT_LOCAL_CLOSE_REFUSED` with `reason: "code_pool_exhausted"`) is channel-neutral; the underlying "what is consumed" is channel-specific.
+13. **X_REPORT is read-only and outside W10 fiscal scope.**  `X_REPORT` is an operational report (cash drawer / mid-shift snapshot).  The Rust gateway MUST NOT sign, transport, persist as `fiscal_documents`, advance `lnd`, consume an offline code (WebCheck) or an offline local ordinal (DFS), or allocate a Z-report sequence number for an `X_REPORT` request.  W10 policy does NOT block `X_REPORT` on offline backlog — it is a no-fiscal-side-effect read; if backlog exists the response MAY carry a warning / forensic note for the operator, but MUST NOT mutate fiscal state.  This is consistent with the WebCheck reverse-engineering finding (`X-report not signed/submitted`) and with the reference DFS dispatcher (`PRRODPS/Maria/Session/MariaDispatcher.cs::ZREP → X-report`, no `/fs/doc` post).  `Z_REPORT`, in contrast, IS the fiscal close-of-day document and MAY be the offline local close (per bullets 3-11 above).
 
 **Guard placement (load-bearing): the guard MUST run BEFORE any cryptographic operation (sign / canonicalize / hash), BEFORE any DPS / network call, BEFORE `fiscal_documents` row insert, BEFORE `ingress_inbox` mutation, AND BEFORE any `lnd` advancement** *for refused outcomes*.  For the routed `AllowOfflineLocalClose` outcome, the doc DOES proceed into the pipeline (stage_acquire continues, stage_sign canonicalizes, `stage_offline_ack` lands `OFFLINE_LOCAL_ACK`) — the policy decision routes the doc, it does not block it.  Refused outcomes leave system state exactly as if the request never arrived (modulo the audit-row trail).
 
@@ -774,6 +810,8 @@ cargo test -p prro --test write_path_deterministic_replay   # 28 passed
 ---
 
 ### Task 12 (W12): in-drain KVT2 confirmation via `lastChk`
+
+> **Channel scope (2026-05-16).**  W12 is the **WebCheck / gRPC** confirmation path only (see plan §"DPS Channel Taxonomy").  The `lastChk(fn_sign)` evidence shape — `status == OK` + `response.id == doc.server_fiscal_no` + non-empty `data_sign` — is gRPC-channel-specific.  The DFS HTTP / XML channel returns DFS-side tickets through `/fs/pck` / `/fs/doc` parsing rather than `lastChk` snapshots; a future M3+ task must implement DFS-ticket-driven KVT2 confirmation as a separate helper.  Do not claim DFS-side confirmation implemented in M3b.
 
 **Gate.** W0b is resolved as **YES — with explicit scope restriction** (`docs/superpowers/specs/2026-05-14-m3b-w0b-w12-gate-decision.md`).  W12 is in scope only for W9 drain-time latest-doc confirmation.  W12 is NOT a boot-time arbitrary `Kvt1` poller.
 
