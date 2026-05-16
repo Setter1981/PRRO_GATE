@@ -1143,29 +1143,43 @@ pub async fn run_boot_reconciliation(
         return Ok(BranchOutcome::Bootstrapped);
     };
 
-    // ── Branch (d) — OFFLINE-class modes ─────────────────────────
-    match row.mode {
-        NodeMode::Offline | NodeMode::GoingOffline | NodeMode::GoingOnline => {
-            let payload = serde_json::json!({
-                "fiscal_number": fiscal_number,
-                "observed_mode": row.mode.as_str(),
-                "message": "FN in OFFLINE mode — start with --recover-offline M3b CLI",
-            });
-            audit_log::append(
-                pool,
-                "node_state",
-                fiscal_number,
-                "NODE_STATE_BOOT_OFFLINE_REFUSAL",
-                crate::db::models::enums::Severity::Error,
-                None,
-                Some(&payload.to_string()),
-            )
-            .await?;
-            return Ok(BranchOutcome::OfflineRefusal {
-                observed_mode: row.mode,
-            });
-        }
-        _ => {}
+    // ── Branch (d) — GoingOnline refused at boot ─────────────────
+    //
+    // M3b W7b update (operator PR #57 Round 1 HIGH, 2026-05-16):
+    // pre-W7 this branch refused ALL three offline-class modes
+    // (Offline / GoingOffline / GoingOnline) because boot
+    // reconciliation had no W7-aware path.  Post-W7, boot CAN
+    // process docs in Offline / GoingOffline modes — per-doc
+    // dispatch routes them through `dispatch_post_sign` →
+    // `stage_offline_ack::run` (see `dispatch_pending_doc` SIGNED
+    // arm and `dispatch_prepared_via_chain` PREPARED arm).
+    //
+    // `GoingOnline` stays refused at THIS branch — it's W9
+    // backlog-drain mode and boot reconciliation defers to W9's
+    // drain loop (out of W7b scope per memory
+    // `m3b-w7-review-criteria` criterion 6 + `m3b-w7b-review-criteria`
+    // criterion 4).  Per-FN single refusal audit here (vs
+    // per-doc spam if we let dispatch_post_sign handle it for
+    // every pending doc).
+    if matches!(row.mode, NodeMode::GoingOnline) {
+        let payload = serde_json::json!({
+            "fiscal_number": fiscal_number,
+            "observed_mode": row.mode.as_str(),
+            "message": "FN in GOING_ONLINE mode — W9 backlog drain owns this FN's reconciliation",
+        });
+        audit_log::append(
+            pool,
+            "node_state",
+            fiscal_number,
+            "NODE_STATE_BOOT_OFFLINE_REFUSAL",
+            crate::db::models::enums::Severity::Error,
+            None,
+            Some(&payload.to_string()),
+        )
+        .await?;
+        return Ok(BranchOutcome::OfflineRefusal {
+            observed_mode: row.mode,
+        });
     }
 
     // ── Branch (f) — Blocked / StopMode / CryptoDegraded ─────────
@@ -1342,6 +1356,11 @@ pub async fn run_boot_reconciliation(
             "sent_not_found_to_error_retryable": histogram.sent_not_found_to_error_retryable,
             "sent_probe_failure_deferred": histogram.sent_probe_failure_deferred,
             "prepared_dispatched": histogram.prepared_dispatched,
+            // M3b W7b — post-sign dispatcher outcomes (operator PR
+            // #57 Round 1 MED-3 fix, 2026-05-16): bucket sums in
+            // `by_outcome` must reconcile to `pending_visited`.
+            "offline_local_ack_emitted": histogram.offline_local_ack_emitted,
+            "write_path_dispatch_refused": histogram.write_path_dispatch_refused,
             "error_retryable_escalated_to_manual": histogram.error_retryable_escalated_to_manual,
             "error_retryable_probe_deferred": histogram.error_retryable_probe_deferred,
             "error_retryable_indeterminate_deferred": histogram.error_retryable_indeterminate_deferred,
