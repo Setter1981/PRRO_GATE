@@ -14,7 +14,7 @@
 
 ## 2. Problem statement
 
-The current 6-state `ShiftState` (`Created → Opening → Opened → Closing → Closed / Error`, `rust/prro/src/db/models/enums.rs:50`) has three architectural gaps that surface as soon as M3b W10 (and the related W7 offline path) needs to support offline shift open + correct recovery semantics.
+The current 6-state `ShiftState` (`Created → Opening → Opened → Closing → Closed / Error`, `rust/prro/src/db/models/enums.rs:62`) has three architectural gaps that surface as soon as M3b W10 (and the related W7 offline path) needs to support offline shift open + correct recovery semantics.
 
 ### 2.1 Offline `SHIFT_OPEN` catch-22
 
@@ -84,7 +84,8 @@ While `shift.state == OpenedLocalPendingDrain`:
 - **Offline-channel `SELL` / `RETURN` / `SERVICE_*` PERMITTED.**  The shift is locally committed via Pattern C `OFFLINE_LOCAL_ACK` SHIFT_OPEN doc; subsequent offline ops Pattern-C-land their own `OFFLINE_LOCAL_ACK` docs.
 - **Offline-channel `Z_REPORT` PERMITTED** (operator can close-of-day even before the SHIFT_OPEN drains, e.g. shift hits 24h limit while still offline).
 - **Online-channel ops REFUSED.**  If `node_state.mode` is `Online` / `GoingOnline` and the shift is still in `OpenedLocalPendingDrain`, a new online `SELL` / `RETURN` / `SERVICE_*` MUST be refused with audit `SHIFT_OPEN_PENDING_DRAIN_OP_REFUSED` (Warning).  Rationale: DPS hasn't confirmed the shift open; sending a SELL online before the SHIFT_OPEN drains would arrive at DPS before the open marker — breaks INV-03 ("shift opened before fiscal operations") on the DPS side.
-- **Drain ordering rule.**  When `node_state.mode` returns to `GoingOnline` and W9b backlog drain runs, it MUST drain by strict `lnd` ASC; the offline `SHIFT_OPEN` document must be the first document of that local shift in `lnd` order — its `lnd` is whatever the FN-global allocator assigned at offline-open time, NOT necessarily `1` (lifecycle docs from prior shifts may have allocated earlier `lnd` values).  Only after `SHIFT_OPEN` reaches final DPS `Ack` may online ops on the same FN resume; W9b enforces this by walking docs in `lnd` ASC and refusing to drain doc N+1 before doc N has reached `Ack` via W12 confirmation.
+- **Drain ordering rule.**  When `node_state.mode` returns to `GoingOnline` and W9b backlog drain runs, it MUST drain by strict `lnd` ASC; the offline `SHIFT_OPEN` document must be the first document of that local shift in `lnd` order — its `lnd` is whatever the FN-global allocator assigned at offline-open time, NOT necessarily `1` (lifecycle docs from prior shifts may have allocated earlier `lnd` values).  W9b enforces this by walking docs in `lnd` ASC and refusing to drain doc N+1 before doc N has reached `Ack` via W12 confirmation.
+- **Online-ops-resume rule (CORRECTED).**  Drain ACK of `SHIFT_OPEN` alone is **not sufficient** to resume online ops — the FN backlog may still contain offline `SELL` / `RETURN` / `SERVICE_*` / `Z_REPORT` docs queued in `lnd` ASC after the open doc.  Allowing a new online op while drain is still mid-backlog would break strict `lnd` ASC ordering: the new online op would arrive at DPS interleaved with later backlog docs.  Therefore online ops on the FN resume only after **all** of the following hold: (a) W9b full backlog drain for this FN completes (zero `OFFLINE_LOCAL_ACK` / `Sent` / `Kvt1` / `Kvt2` docs remain on this FN), AND (b) `node_state.mode` flips `GoingOnline → Online`.  The W8 return-online probe + W9b drain finalization together drive (b); until then `OpenedLocalPendingDrain` continues to refuse online ops via `SHIFT_OPEN_PENDING_DRAIN_OP_REFUSED` audit.  Shift state edge `OpenedLocalPendingDrain → Opened` (edge 5 in §4.1) fires when the full drain criterion in (a) is met AND `SHIFT_OPEN` has acked; the two events typically coincide (last doc to ack on the shift can be either SHIFT_OPEN if no other backlog, or the last trailing SELL/Z_REPORT — the shift edge fires once on the combined criterion).
 
 ## 4. Allowed transitions (whitelist enumerated)
 
@@ -92,31 +93,44 @@ While `shift.state == OpenedLocalPendingDrain`:
 
 The `fiscal_documents::allowed_transition`-style whitelist for shifts.  Every edge enumerated with rationale; **anything not listed is forbidden** and the W6/W7 `transition_state` helper must surface a typed `Forbidden` outcome.
 
-| From | To | Trigger | Rationale |
-|---|---|---|---|
-| Created | Opening | online `SHIFT_OPEN` ingress | M3a Pattern B intent-marker |
-| Created | OpenedLocalPendingDrain | offline `SHIFT_OPEN` ingress (Pattern C) | offline-open seam (new) |
-| Opening | Opened | online send → DPS Ack | M3a happy path |
-| Opening | Opened | online send → `DocumentReject` + operator retry → next attempt Ack | M3a recoverable retry (per case-1 below) |
-| Opening | RequiresManualReconciliation | online send → hard reject (FnConfigError / Server hard / id-mismatch) | recovery taxonomy §6 |
-| OpenedLocalPendingDrain | Opened | W9b drain SHIFT_OPEN → final DPS Ack via W12 | offline-open happy path (new) |
-| OpenedLocalPendingDrain | RequiresManualReconciliation | drain SHIFT_OPEN rejected | catastrophic-rollback path (new) |
-| OpenedLocalPendingDrain | ClosingLocalPendingDrain | offline `Z_REPORT` ingress while still locally-open | offline close-of-day before SHIFT_OPEN drains (new) |
-| Opened | Closing | online `Z_REPORT` / `SHIFT_CLOSE` ingress | M3a Pattern B intent-marker |
-| Opened | ClosingLocalPendingDrain | offline `Z_REPORT` ingress (Pattern C) | offline-close seam (new) |
-| Closing | Closed | online send → DPS Ack | M3a happy path |
-| Closing | Opened | online send → `DocumentReject` (specific recoverable class) | narrow rollback (case 1; §6) |
-| Closing | RequiresManualReconciliation | online send → hard reject | recovery taxonomy §6 |
-| ClosingLocalPendingDrain | Closed | W9b drain Z_REPORT → final DPS Ack via W12 | offline-close happy path (new) |
-| ClosingLocalPendingDrain | RequiresManualReconciliation | drain Z_REPORT rejected | catastrophic-rollback path (new) |
+| # | From | To | Trigger | Rationale |
+|---|---|---|---|---|
+| 1 | Created | Opening | online `SHIFT_OPEN` ingress | M3a Pattern B intent-marker |
+| 2 | Created | OpenedLocalPendingDrain | offline `SHIFT_OPEN` ingress (Pattern C) | offline-open seam (new) |
+| 3 | Opening | Opened | online send → DPS Ack on **any** attempt (first or after operator-driven re-issue) | M3a happy path; retry-loop is doc-state-machine concern, not shift edge |
+| 4 | Opening | RequiresManualReconciliation | online send → hard reject (`FnConfigError` / `Server` hard / id-mismatch) OR operator gives up on the open attempts | recovery taxonomy §6 |
+| 5 | OpenedLocalPendingDrain | Opened | W9b drain `SHIFT_OPEN` → final DPS Ack via W12; **no other backlog docs remain** | offline-open happy path with empty trailing backlog |
+| 6 | OpenedLocalPendingDrain | RequiresManualReconciliation | drain `SHIFT_OPEN` rejected | catastrophic-rollback path (new) |
+| 7 | OpenedLocalPendingDrain | ClosingLocalPendingDrain | offline `Z_REPORT` ingress while shift still locally-open and `SHIFT_OPEN` not yet drained | offline close-of-day before SHIFT_OPEN drains (new) |
+| 8 | Opened | Closing | online `Z_REPORT` / `SHIFT_CLOSE` ingress | M3a Pattern B intent-marker |
+| 9 | Opened | ClosingLocalPendingDrain | offline `Z_REPORT` ingress (Pattern C) | offline-close seam (new) |
+| 10 | Closing | Closed | online send → DPS Ack | M3a happy path |
+| 11 | Closing | Opened | online send → `Authorization::DocumentReject` only (specific recoverable class per §6) | narrow rollback |
+| 12 | Closing | RequiresManualReconciliation | online send → hard reject | recovery taxonomy §6 |
+| 13 | ClosingLocalPendingDrain | Closed | W9b drain reached final DPS Ack via W12 for **every backlog doc including** prior offline `SHIFT_OPEN` and the close `Z_REPORT` | offline-close happy path; see §4.3 for the "all-prior-acks" predicate |
+| 14 | ClosingLocalPendingDrain | RequiresManualReconciliation | drain rejected **any** backlog doc (offline `SHIFT_OPEN`, intermediate `SELL`/`RETURN`/`SERVICE_*`, or close `Z_REPORT` itself) | catastrophic-rollback path; reject of any drained doc terminates the close path |
 
-Total: **15 edges**, vs M3a's 5-edge linear graph.
+Total: **14 edges** (HIGH-fix Round 1 — the earlier "Opening → Opened on DocumentReject + retry" line was a duplicate; retry is doc-state-machine territory, not a separate shift edge).
 
-### 4.2 Forbidden patterns
+### 4.3 ClosingLocalPendingDrain — drain progress vs state transition
+
+`ClosingLocalPendingDrain` carries an **internal predicate** that determines when edge 13 fires.  Drain-ACK of an individual backlog doc (offline `SHIFT_OPEN`, prior `SELL`, intermediate offline ops, close `Z_REPORT`) does NOT itself change `ShiftState` — the doc transitions to `Ack` in `fiscal_documents.state` and the shift stays in `ClosingLocalPendingDrain`.  Edge 13 (`→ Closed`) fires when **ALL** of the following are true:
+
+1. The shift's `z_report_document_id` doc has reached `fiscal_documents.state = Ack` via W9b drain + W12 confirmation.
+2. Every backlog doc with `shift_id == this_shift.shift_id` AND `lnd <= z_report.lnd` has also reached `Ack` (no `OFFLINE_LOCAL_ACK` / `Sent` / `Kvt1` / `Kvt2` doc remains on the shift).
+3. If the shift entered `ClosingLocalPendingDrain` via edge 7 (offline `Z_REPORT` issued while `SHIFT_OPEN` still locally-pending), the offline `SHIFT_OPEN` doc is one of the docs counted in (2) and must also be `Ack` — its earlier-`lnd` position in strict ASC ordering means W9b drains it first regardless.
+
+**Drain-ACK-of-SHIFT_OPEN-from-ClosingLocalPendingDrain semantics**: when shift is in `ClosingLocalPendingDrain` and drain processes the offline `SHIFT_OPEN` doc to `Ack`, this records the open confirmation **on the doc**, but does NOT transition the shift back to `Opened` (the shift is past `Opened`; rollback would re-enable ordinary fiscal ops on a shift that operator already locally closed — invariant breach).  The shift state machine has no edge "ClosingLocalPendingDrain → Opened" by design (per §4.4 forbidden list below).  The W9b drain orchestrator must NOT mistake "first-doc-of-shift acked" for "shift opened"; the close-down sequence is doc-by-doc until predicate (1)+(2)+(3) holds, at which point edge 13 fires once.
+
+**Drain-REJECT-of-SHIFT_OPEN-from-ClosingLocalPendingDrain semantics**: if drain rejects the offline `SHIFT_OPEN` doc while shift is in `ClosingLocalPendingDrain`, edge 14 fires immediately — shift → `RequiresManualReconciliation`, same operator-action shape as a reject from `OpenedLocalPendingDrain`.  The doc rejection cascades through the shift state regardless of subsequent doc states.  W9b drain MUST halt as soon as any backlog doc on the shift rejects (per W9b ordering rule — don't continue draining doc N+1 if doc N has just rejected; the rejection invalidates the shift's close path).
+
+### 4.4 Forbidden patterns
 
 - **No blanket `* → Error`**: the only way to reach `Error` is via an explicit, audited `ShiftRepository::force_to_error_with_audit(shift_id, reason, audit_evidence)` seam.  This seam is operator-action territory (e.g. unrecoverable schema corruption manually flagged), NOT a fallback for unexpected transition outcomes.  Unexpected transitions surface as `TransitionOutcome::Forbidden` (typed error to caller) so the bug is observable, not silently swept into `Error`.
-- **No blanket `Closing → Opened`**: see §6 — only specific recoverable rejection classes warrant rollback.  Hard rejects + drain rejects route to `RequiresManualReconciliation`.
+- **No blanket `Closing → Opened`**: see §6 — only `Authorization::DocumentReject` warrants rollback.  Hard rejects + drain rejects route to `RequiresManualReconciliation`.
 - **No `ClosingLocalPendingDrain → Opened`**: once an offline `Z_REPORT` lands `OFFLINE_LOCAL_ACK`, the shift cannot rollback to `Opened` automatically.  Local Pattern C commitment + post-local-close lockout are durable; only operator-driven `force_*` seam can undo, with full audit trail.
+- **No `OpenedLocalPendingDrain → Closed` directly**: the only path to `Closed` from a locally-opened shift is via `ClosingLocalPendingDrain` (offline `Z_REPORT` first) or through full drain to `Opened` + then `Closing → Closed` (online close after drain).  Skipping `ClosingLocalPendingDrain` would mean the close happened without a `z_report_document_id` link.
+- **No edge ever fires from drain ACK of a non-`Z_REPORT` doc**: backlog drain ACKs for `SELL` / `RETURN` / `SERVICE_*` / `SHIFT_OPEN` are doc-state transitions only; shift state stays in whichever locally-pending state it was in (`OpenedLocalPendingDrain` or `ClosingLocalPendingDrain`).  Only the close-`Z_REPORT` ACK (final backlog doc per ordering rule) advances the shift to `Closed` — and only when predicate §4.3 holds.
 - **No `OpenedLocalPendingDrain → Opening`**: state graph is forward-only on the open-side; can't "downgrade" a locally-committed open back to an online-intent state.
 
 ### 4.3 Force-error / manual seam
@@ -222,9 +236,26 @@ Both via the W4-established **DROP+CREATE-same-name** pattern (not `ALTER TABLE`
 
 ### 9.2 Migration sketch (`migrations/016_shift_state_expansion.sql`)
 
+Two tables rebuild — `shifts` AND `node_state` — both via the W4-established DROP+CREATE-same-name pattern.  Two table rebuilds means two trigger restores + one inbound-FK handling.
+
+**Per-table concerns** (table-specific, NOT generic W4 templating):
+
+- **`shifts`**:
+  - Trigger to restore byte-identically: `shifts_updated_at` (`migrations/001_core_identities.sql:52`).
+  - Inbound FK: `fiscal_documents.shift_id → shifts.shift_id ON DELETE RESTRICT` (declared in `migrations/002_fiscal_documents.sql:38` AND re-declared during the W3-era rebuild in `migrations/008_doc_state_sending.sql:118` — the second is the live one).  During the rebuild this FK must be **deferred** via `PRAGMA defer_foreign_keys = ON`, and `fiscal_documents.shift_id` left unmolested (it doesn't need NULL'ing; the FK simply re-validates against the rebuilt `shifts` table at commit time).
+  - Indexes: any existing indexes on `shifts(state)` (if any) must be recreated; verify with `SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='shifts'` snapshot before drop.
+
+- **`node_state`**:
+  - Trigger to restore byte-identically: `node_state_updated_at` (`migrations/001_core_identities.sql:76`).
+  - Inbound FK: none directly on `shift_state` (the column is denormalised mirror of `shifts.state` for the active shift; FK lives on the `fiscal_number` boundary, not on state).  No special FK handling needed beyond the standard W4 `defer_foreign_keys` discipline.
+  - Indexes: verify any existing indexes on `node_state(shift_state)` before drop.
+
+- **Triggers MUST be re-DROPped + re-CREATEd byte-identically** (W4 lesson: `fd_updated_at` snapshot/restore).  The migration's BEFORE state of trigger DDL must equal AFTER state — diff zero.  Audit hygiene check goes via `SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN ('shifts','node_state')` snapshot pair.
+
 ```sql
 -- M3b shift-state expansion (per design freeze 2026-05-17).
--- W4-style schema rebuild for both shifts + node_state.
+-- W4-style schema rebuild ×2 (shifts + node_state) — table-specific
+-- trigger/index/FK concerns enumerated in §9.2 above.
 
 PRAGMA defer_foreign_keys = ON;
 
@@ -234,25 +265,27 @@ CREATE TEMP TABLE __m016_fk_guard__ (
 );
 -- INSERT happens at end of migration; failure short-circuits commit.
 
--- ── shifts.state expansion ────────────────────────────────────────
--- NULL the inbound FK column before DROP (defer_foreign_keys discipline).
--- ... (full DDL TBD in implementation PR; pattern matches migrations/015)
+-- ── shifts rebuild ────────────────────────────────────────────────
+-- (1) Snapshot triggers + indexes for diff-zero restore.
+-- (2) DROP TRIGGER shifts_updated_at; DROP TABLE shifts;
+-- (3) CREATE TABLE shifts (… state TEXT CHECK (state IN (9 values)) …)
+-- (4) Restore data (identity map for the 6 existing states; pre-pilot has no rows).
+-- (5) Recreate trigger shifts_updated_at byte-identically.
+-- (6) Recreate any indexes byte-identically.
+-- Inbound FK from fiscal_documents.shift_id stays valid because we
+-- preserve shift_id values + the deferred FK re-validates at commit.
 
--- ── node_state.shift_state expansion ──────────────────────────────
--- Same pattern.
-
--- ── Triggers ──────────────────────────────────────────────────────
--- Existing fd_updated_at trigger on related tables: drop and recreate
--- byte-identically.  Audit hygiene: snapshot trigger DDL before drop;
--- diff after recreate must be empty.
+-- ── node_state rebuild ────────────────────────────────────────────
+-- Same pattern; trigger node_state_updated_at restored byte-identically.
 
 -- ── FK guard exit ─────────────────────────────────────────────────
 INSERT INTO __m016_fk_guard__ (fk_violation_count)
-SELECT 1 FROM pragma_foreign_key_check;
--- If any FK violations exist, CHECK fails and migration aborts.
+SELECT count(*) FROM pragma_foreign_key_check;
+-- CHECK constraint on the temp table requires count == 0; any FK
+-- violation aborts the migration BEFORE the surrounding sqlx tx commits.
 ```
 
-The implementation PR materialises the full DDL; this freeze pins the **shape** + the load-bearing W4 lessons.
+The implementation PR materialises the full DDL; this freeze pins the **shape** + the table-specific concerns above.  Author MUST NOT mechanically copy W4 DDL — `fd_updated_at` is not the trigger here; `shifts_updated_at` + `node_state_updated_at` are.
 
 ### 9.3 Backward compatibility
 
@@ -279,14 +312,32 @@ The next code PR after this freeze merges.  Operator-driven; this section is inf
 **Branch**: `m3b/shift-state-expansion-impl` (off post-freeze-merge HEAD).
 
 **Files touched**:
-- `rust/prro/src/db/models/enums.rs` — `ShiftState` extended to 9 variants.
-- `rust/prro/migrations/016_shift_state_expansion.sql` — new migration per §9.
-- `rust/prro/src/db/repositories/shifts.rs` — whitelist extended to 15 edges; new `force_to_error_with_audit` seam; `transition_state` typed errors.
-- `rust/prro/src/db/repositories/node_state.rs` — if extends; the `shift_state` column read/write paths must accept the new variants.
-- `rust/prro/.sqlx/` — query cache regen (mandatory after CHECK constraint change).
-- `rust/prro/tests/shifts_no_silent_error_paths.rs` — new scanner test pinning that `transition_state` cannot reach Error / RequiresManualReconciliation outside force-seam.
-- `rust/prro/tests/shift_state_whitelist_matrix.rs` — extended whitelist matrix (15 edges + forbidden pairs).
+
+*Core enum + schema + repository*:
+- `rust/prro/src/db/models/enums.rs` — `ShiftState` extended to 9 variants (replaces the 6-variant `str_enum!` at line 62).
+- `rust/prro/migrations/016_shift_state_expansion.sql` — new migration per §9.  Rebuilds `shifts` + `node_state` CHECK constraints AND their `_updated_at` triggers (both currently in `migrations/001_core_identities.sql:52` for `shifts_updated_at`, `:76` for `node_state_updated_at`).  Handles inbound FK from `fiscal_documents.shift_id` (declared in `migrations/002_fiscal_documents.sql:38` + `migrations/008_doc_state_sending.sql:118` — second declaration is the W3 rebuild).
+- `rust/prro/src/db/repositories/shifts.rs` — whitelist extended to 14 edges (per §4.1); new `force_to_error_with_audit` + `force_to_manual_reconciliation_with_audit` seams; `transition_state` typed errors.
+- `rust/prro/src/db/repositories/node_state.rs` — `shift_state` column read/write paths accept new variants; mirror-write discipline preserved (per §5).
+- `rust/prro/.sqlx/` — query cache regen (mandatory after CHECK constraint change — `cargo sqlx prepare` from `rust/prro/` per W9a Round 1 lesson; commit `.sqlx/` delta).
+
+*Hot-path code consuming `ShiftState` (load-bearing — exhaustive match arms expand)*:
+- `rust/prro/src/services/write_path/stage_acquire.rs` (around line 346 — `check_shift_guard`-style gating).  `Opening | Closing` branches today; expansion must:
+  - Add `OpenedLocalPendingDrain` arm that permits offline-channel ops (per §3.3) and refuses online-channel ops with `SHIFT_OPEN_PENDING_DRAIN_OP_REFUSED` audit.
+  - Add `ClosingLocalPendingDrain` arm that refuses all fiscal ops (post-local-close lockout).
+  - Add `RequiresManualReconciliation` arm that refuses all fiscal ops with operator-action message.
+- `rust/prro/src/services/write_path/stage_offline_ack.rs` (around line 206 — currently asserts `ShiftState::Opened` only).  Expansion must accept `ShiftState::OpenedLocalPendingDrain` as a valid source for offline `SELL` / `RETURN` / `SERVICE_*` / `Z_REPORT` doc landing in `OFFLINE_LOCAL_ACK`.  Edge 7 (`OpenedLocalPendingDrain → ClosingLocalPendingDrain`) is triggered by `Z_REPORT` source from this state and the W10 policy guard's `AllowOfflineLocalClose` routing.
+- `rust/prro/src/services/reconciliation/boot_phase.rs` — recovery branch matching today on `Opening | Closing` for shift state; expansion adds branches for `OpenedLocalPendingDrain` (resume drain), `ClosingLocalPendingDrain` (resume drain), `RequiresManualReconciliation` (skip — operator action awaited).  Replay fixtures in §10 lock these branches.
+- *Anywhere else* that pattern-matches `ShiftState` exhaustively — Rust's `match` exhaustiveness check surfaces these at compile time on impl PR.  The author MUST `grep -rn "ShiftState::" rust/prro/src/` and audit every match block (W9a Round 1 lesson: shotgun rewrite is cheaper than missing a code path).
+
+*Tests*:
+- `rust/prro/tests/shifts_no_silent_error_paths.rs` — new scanner test pinning that `transition_state` cannot reach `Error` / `RequiresManualReconciliation` outside force-seam.
+- `rust/prro/tests/shift_state_whitelist_matrix.rs` — extended whitelist matrix (14 edges + forbidden pairs per §4.4).
+- `rust/prro/tests/stage_acquire_shift_guard.rs` (if exists, else new) — coverage for the 3 new arms in stage_acquire.
+- `rust/prro/tests/stage_offline_ack_shift_states.rs` (if exists, else new) — coverage for `OpenedLocalPendingDrain` as a valid source.
 - W11-Δ replay fixtures per §10.
+
+*Documentation*:
+- Sync `docs/superpowers/plans/2026-05-14-m3b-implementation.md` §Task 10 audit vocabulary table with the new shift-level events.
 
 **Verify command**:
 ```bash
