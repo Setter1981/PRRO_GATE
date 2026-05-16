@@ -1270,6 +1270,44 @@ Round 7 self-review produced 4 HIGH + 7 MED + 13 LOW findings. Round 8 operator-
 - **R7-H4 (Server -6 inconsistency)**: Closed by §16.3 — added Server -6 row to §6.5 as 0 attempts → EscalateManual per existing §6.2 wording.
 - R7-M1 through R7-M7 + R7-L1 through R7-L13: most remain as polish/operational improvements; tracked for impl PR per §11. None block Round 8 spec freeze.
 
+### 16.21 Offline transition criteria strategy (Round 9 — research-synthesized)
+
+Online → Offline + Offline → Online transition criteria, synthesized from two reference implementations (WebCheck decompiled + PRRODPS DFS reference) per operator-delegated decision 2026-05-17.
+
+**Online → Offline (auto, no user dialog)**:
+
+| DpsError class | Mode transition |
+|---|---|
+| `Transport(_)` / `Decode(_)` / `Internal(_)` / `QueryNotSupported(_)` / TLS handshake fail | immediate `Online → GoingOffline`; next attempt fail → `Offline` |
+| `Server { code: -3 }` (transient) | retry with backoff first; if persistent → offline |
+| `Authorization { DocumentReject }` | NO mode change (error to POS) |
+| `Authorization { FiscalNumberNotRegistered }` | NO mode change (KeyRotationPending or Case 10 Manual) |
+| `Server { -5/-7/-8/-9/-10 }` (hard rejects) | NO mode change (TechSupportEscalation) |
+| `Server { -11 }` (168h limit) | NO mode change (Blocked state) |
+| `ServerFiscalIdMismatch` | NO mode change (immediate EscalateManual) |
+
+**Offline → Online (probe-driven, no user action)**:
+
+| Trigger | Mode transition |
+|---|---|
+| W8 probe single success | `Offline → GoingOnline` |
+| W9b drain completes successfully | `GoingOnline → Online` |
+| W9b drain partial failure | `GoingOnline → Offline` + Critical audit |
+
+**Defaults**:
+- W8 probe interval: 60 sec (configurable lower bound 30s) — per existing W8b implementation.
+- Probe HTTP timeout: 10 sec (PRRODPS-aligned).
+- Fiscal-send HTTP timeout: 30-90 sec.
+
+**Design choices vs reference implementations**:
+- NO user dialog (PRRODPS pattern rejected per Round 8 Case 9 — cashier mid-checkout cannot make infrastructure decisions).
+- NO 2-consecutive-success probe guard (PRRODPS pattern) — our 7-state node_state.mode has GoingOnline intermediate buffer + W9b drain that catches false positives without explicit guard.
+- NO `AutomatOfflineOn` config flag (WebCheck pattern rejected — offline always permitted in production context).
+- KEEP probe-based return-online (both refs use this pattern).
+- KEEP network-fail vs DPS-reject differentiation (both refs differentiate; aligns with §16.3 recovery taxonomy).
+
+Cross-ref: `feedback_offline_transition_strategy` memory; `project_m3b_w8_review_criteria` for probe implementation contract.
+
 ### 16.20 Summary of Round 8 spec impact
 
 - 5 new memory files (`feedback_db_vs_log_separation`, `feedback_ingress_validation_first_line`, `feedback_auto_offline_unknown_errors`, `feedback_webcheck_offline_sign_at_drain`, `feedback_webcheck_36h_key_expiry_gate`).
