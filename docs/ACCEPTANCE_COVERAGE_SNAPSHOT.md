@@ -1,10 +1,21 @@
 # ACCEPTANCE_COVERAGE_SNAPSHOT.md
 
+> **Python-era snapshot; partially superseded by Rust gateway M3b (2026-05-16).**
+>
+> This document is a **point-in-time coverage snapshot** of the Python gateway (`pytest -q → 837 passed`, version `1.4.1`, Sprint 12 baseline 2026-04-17).  Several invariant rows below reflect the Python implementation and are NOT a statement about the Rust gateway M3b path.  Specifically:
+>
+> - **INV-15 (Z-report block on pending offline)** — the Python row's `✅ Покрито via OFFLINE_BACKLOG_NOT_SYNCED guard` is a **blanket-blocker**.  The Rust gateway M3b W10 supersedes that with an **ONLINE-vs-OFFLINE-distinguished** policy: online Z_REPORT over pending backlog → blocked (`ONLINE_Z_REPORT_BLOCKED_BACKLOG`); offline-mode local Z_REPORT close-of-day → allowed as Pattern C `OFFLINE_LOCAL_ACK` document (`OFFLINE_Z_REPORT_LOCAL_CLOSE_ACCEPTED`).  See `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0 + `docs/superpowers/plans/2026-05-14-m3b-implementation.md` §Task 10.
+> - **SHIFT-CLOSE-01** (Gate 3, line 114) — "closed by OFFLINE_BACKLOG_NOT_SYNCED" is the Python-era closure.  Rust M3b reframes the same gap as the W10 policy guard surface.
+> - **INV-09 / INV-10 (36h / 168h offline limits)** — `✅ Покрито` is Python-era enforcement.  The Rust gateway has NOT implemented these yet — see `docs/LEGAL_INVARIANTS.md` §8 status table, where they are flagged as `⚠ active engineering risks` for the Rust M3b pilot path.
+> - **Rust M3b hard close-code reserve = 1** is a NEW invariant not represented in this Python-era snapshot.  See `docs/LEGAL_INVARIANTS.md` §8 (row "Hard close-code reserve = 1") + `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0 point (5) + `docs/superpowers/plans/2026-05-14-m3b-implementation.md` §Task 10 bullets 9-11.  The rule is the *last-line* legal guarantee against the 24h-trap re-assertion when the operational refill watermark fails; it is W10's responsibility, not a row covered by this Python-era table.
+>
+> Rows not annotated above remain Python-era statements.  This snapshot SHOULD NOT be treated as active coverage for the Rust gateway pilot — see `docs/LEGAL_INVARIANTS.md` and the M3b plan for the corrected Rust-side status.
+
 ## Multi-Protocol PRRO Gateway — Snapshot покриття вимог тестами
 
-**Версія:** Sprint 12 QA coverage sprint snapshot, 2026-04-17  
+**Версія:** Sprint 12 QA coverage sprint snapshot, 2026-04-17 (Python gateway)  
 **Baseline тести:** `pytest -q` → **837 passed, 0 failed** (+106 vs Sprint 12 baseline 731)  
-**Версія коду:** `1.4.1`  
+**Версія коду:** `1.4.1` (Python gateway)  
 **Джерела вимог:** `docs/LEGAL_INVARIANTS.md`, `docs/PROJECT_DOCUMENTATION_AND_SPRINT_PLAN.md`, ФСКО протокол v2.2.3  
 **Authoritative DPS contract:** `transports/proto/fiscal_server.proto` + `docs/dps_protocol/262576_(1).md` (gRPC API)  
 **ФСКО XML format:** `docs/dps_protocol/530962.md` (v2.2.3 rev3.1, 18.02.2025) — broader XML spec, not sole authority for runtime behavior  

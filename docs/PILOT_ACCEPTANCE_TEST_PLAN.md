@@ -175,7 +175,7 @@ Scenario:
 6. Replay the WebCheck-derived sale dataset through Maria 304.
 7. Replay the return dataset through Maria 304.
 8. Run service-out operation.
-9. Run X-report if supported as read-only.
+9. Run X-report.  **X-report is strictly read-only**: it MUST NOT sign, transport, persist as `fiscal_documents`, advance `lnd`, consume an offline code (WebCheck channel) or an offline local ordinal (DFS channel), or allocate a Z-report sequence number.  Verify the pilot run produces no `fiscal_documents` row and no DPS submission for the X-report request.  See `docs/LEGAL_INVARIANTS.md` "X-report read-only" row for the full invariant.
 10. Close shift with Z-report.
 
 For every document, verify:
@@ -227,7 +227,7 @@ contract:
 - samples without return linkage or regulated-goods classification are excluded
   from the positive pool and used as negative or manual-mapping cases.
 
-Example console output:
+Example console output (the `z_report` row below is the **online** Z-report negative path — DPS would otherwise record a Z that omits offline receipts still in the backlog.  The corrected M3b W10 policy ALSO allows an **offline-mode** local Z_REPORT close-of-day as a separate routed-acceptance ARM; see Phase 6 and `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0):
 
 ```text
 [001/042] sell_with_excise webcheck__ksef_123 FN=4000162280 total=315.00
@@ -235,9 +235,10 @@ Example console output:
   -> ProcessCheck goods=2 payments=1 excise=2 uktzed=1
   <- OK 184 ms document_id=doc_... state=ACK
 
-[002/042] z_report webcheck__ksef_140 FN=4000162280
+[002/042] z_report (online) webcheck__ksef_140 FN=4000162280
   -> CloseShift
-  <- FAIL 91 ms error=OFFLINE_BACKLOG_NOT_SYNCED
+  <- FAIL 91 ms error=ONLINE_Z_REPORT_BLOCKED_BACKLOG (Rust M3b W10 audit)
+                 / OFFLINE_BACKLOG_NOT_SYNCED (Python-era equivalent)
 ```
 
 The emulator must also write machine-readable logs:
@@ -314,7 +315,7 @@ Required negative cases:
 
 - Sale without an open shift.
 - Duplicate shift open.
-- Z-report with pending offline backlog.
+- **Online** Z-report with pending offline backlog (must be blocked).  Offline-mode local Z_REPORT close-of-day is a separate path covered by Phase 6 and is NOT a negative case — see Phase 6 and `docs/OFFLINE_SHIFT_CLOSE_DECISION.md`.
 - Return without valid original receipt reference, if the selected mode requires
   return linkage.
 - Missing or invalid excise mark.
@@ -333,7 +334,15 @@ Exit criteria:
 
 ## Phase 6 - Offline With One Fiscal Number
 
-Objective: prove offline lifecycle and later synchronization.
+Objective: prove offline lifecycle, offline close-of-day, and later synchronization.
+
+> **Channel scope (2026-05-16).**  Phase 6 acceptance is **scoped to the WebCheck / gRPC DPS channel** (the target M3a + M3b W7-W9a-W10 build against).  The Ukrainian tax DPS also exposes a second channel — DFS HTTP / XML (`/fs/cmd` + `/fs/doc` + `/fs/pck` per `PRRODPS.DFS`) — with a fundamentally different offline-numbering pipeline (`OfflineSessionId.localOfflineNum.controlNumber` via `MakeOfflineNum`) and package-drain shape (`/fs/pck` chunked upload).  DFS pilot is a future deliverable, NOT part of M3b Phase 6.  See `docs/superpowers/plans/2026-05-14-m3b-implementation.md` §"DPS Channel Taxonomy" for the channel comparison.  Maria 304 is the ingress / POS adapter shape (same role as REST / XML-RPC / Maria-TCP shells), NOT a DPS channel.
+>
+> **Correction (2026-05-16).**  Earlier wording asserted "Z-report is blocked while offline backlog exists" as a blanket rule.  That conflates two distinct close-of-day paths and would trap an offline shift against the 24h legal limit.  The corrected pilot scenario distinguishes:
+> - **Online Z-report over a pending offline backlog** — MUST be blocked (DPS would record a Z that omits offline receipts not yet drained).
+> - **Offline-mode local Z_REPORT close-of-day** — MUST be allowed as a Pattern C `OFFLINE_LOCAL_ACK` document, consuming an offline code, ordered after prior offline docs by `lnd`, and later drained through the wire-send ladder on return-online.
+>
+> See `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` for the authoritative policy and the M3b W10 guard surface that implements both decisions.
 
 Scenario:
 
@@ -341,27 +350,40 @@ Scenario:
 2. Enter offline mode.
 3. Run several sales through Maria 304 while offline.
 4. Verify responses are `OFFLINE_LOCAL_ACK`, not final `ACK`.
-5. Attempt Z-report while offline backlog is pending.
-6. Confirm Z-report is blocked.
-7. Return online.
-8. Run offline synchronization.
-9. Confirm all offline documents receive final DPS sandbox `ACK`.
-10. Run Z-report after backlog is empty.
+5. Attempt an **online** Z-report path while offline backlog is pending.
+6. Confirm the online Z-report attempt is blocked with audit `ONLINE_Z_REPORT_BLOCKED_BACKLOG`.
+7. While still in offline mode and close-of-day approaches, emit an **offline** Z_REPORT through the Pattern C local close path.
+8. Confirm the offline Z_REPORT lands as `OFFLINE_LOCAL_ACK`, consumes an offline code, and is ordered after the prior offline sales by `lnd`.
+9. Confirm post-local-close behaviour: new sale / return attempts are refused with audit `POST_LOCAL_CLOSE_SALE_REFUSED` until the next allowed shift-open policy is satisfied.
+10. Return online.
+11. Run offline synchronization (drain backlog in strict `lnd` ASC, including the offline Z_REPORT).
+12. Confirm all offline documents (sales / returns / the offline Z_REPORT) receive final DPS sandbox `ACK` via W9b drain + W12 in-drain `lastChk` confirmation.
 
 Verify:
 
 - Offline fiscal numbers are unique.
-- Offline limits are enforced.
-- Offline documents remain distinguishable from final DPS-accepted documents.
-- Synchronization preserves ordering.
+- Offline limits are enforced (offline code budget; legal 24h shift / 36h continuous offline / 168h monthly offline — see `docs/LEGAL_INVARIANTS.md`).
+- Offline documents (including the offline Z_REPORT) remain distinguishable from final DPS-accepted documents.
+- Synchronization preserves strict `lnd` ASC ordering, including the offline Z_REPORT relative to prior offline sales.
 - MAC chain is not broken after offline replay.
-- No pending offline backlog remains before Z-report.
+- Audit log distinguishes `ONLINE_Z_REPORT_BLOCKED_BACKLOG` (step 6) from `OFFLINE_Z_REPORT_LOCAL_CLOSE_ACCEPTED` (step 8) and `POST_LOCAL_CLOSE_SALE_REFUSED` (step 9).
+- **Hard close-code reserve = 1 currently-unconsumed code in the FN-scoped pool** while that FN has an open shift and the local offline Z_REPORT has NOT yet been emitted (FN-scoped because `offline_codes` PK is `(fiscal_number, code_lnd)` — `rust/prro/migrations/015_offline_normalize.sql:227`).  While the predicate holds, ordinary offline SELL / RETURN / SERVICE_* docs MUST NOT consume the last `consumed_at IS NULL` row in that FN's pool: at pool=1 such an attempt is refused with audit `OFFLINE_CODE_RESERVED_FOR_CLOSE` (Warning) and the code row remains `consumed_at IS NULL`.  The offline Z_REPORT, in contrast, MAY consume the reserved code.  This is the legal escape hatch from the 24h shift-limit trap — without it ordinary docs could exhaust the pool before close-of-day, leaving the offline Z_REPORT path empty.  See plan §Task 10 bullets 9-11 + `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0 + `docs/LEGAL_INVARIANTS.md` §8.  Operational refill watermark (`min_offline_codes`, commonly ~10) is a separate, upstream concern and is NOT the legal reserve.
+
+Edge-case verification (pilot dossier must record one or more of):
+
+- **pool=1 ordinary sale refused** — submit a SELL while exactly one offline code remains; assert refusal + `OFFLINE_CODE_RESERVED_FOR_CLOSE` audit + offline_code row still `consumed_at IS NULL` + no fiscal_documents insert.
+- **pool=1 offline Z_REPORT accepted** — same state; submit Z_REPORT; assert routed to Pattern C local close, lands `OfflineLocalAck`, the reserved code is consumed by the Z_REPORT row.
+- **pool=2 → sale consumes one → next sale refused → Z_REPORT consumes last** — exercises the reserve as the pool drains down to the floor.
+- **pool=0 offline Z_REPORT refused** — exhausted pool; offline Z_REPORT close also refused with `OFFLINE_Z_REPORT_LOCAL_CLOSE_REFUSED` + `reason: "code_pool_exhausted"` + **severity Critical** (NOT Warning).  This is the pilot-critical "trap reasserted" branch — the operational refill watermark failed upstream; the 24h shift-limit trap is functionally re-asserted for this FN and audit dashboards must surface the event immediately.
 
 Exit criteria:
 
-- Offline receipts are locally acknowledged only.
-- Synchronization finishes with final DPS ACK.
-- Z-report is allowed only after offline backlog is synchronized.
+- Online Z-report over pending offline backlog is correctly blocked.
+- Offline Z_REPORT local close-of-day is correctly accepted as `OFFLINE_LOCAL_ACK`.
+- Post-local-close sale lockout enforced until next allowed shift-open.
+- **Hard close-code reserve = 1 enforced**: ordinary fiscal docs cannot consume the last code while the offline Z_REPORT is still pending; offline Z_REPORT may consume it.  pool=0 surfaces the pilot-critical `OFFLINE_Z_REPORT_LOCAL_CLOSE_REFUSED` audit so triage can distinguish "trap reasserted" from a refused-by-shift-or-mode condition.
+- Drain replays all offline docs (including the offline Z_REPORT) in `lnd` order; each reaches final DPS `ACK` after W12 confirmation.
+- The 24h shift / 36h continuous offline / 168h monthly offline limits behave per `docs/LEGAL_INVARIANTS.md` — either enforced, or explicitly risk-accepted with a sign-off recorded in the pilot log.
 
 ## Phase 7 - Restart And Recovery
 
@@ -504,6 +526,6 @@ Any of the following blocks live pilot:
 - Duplicate LND or skipped LND not explained by accepted fiscal behavior.
 - Duplicate fiscalization on retry.
 - Offline document treated as final DPS ACK before synchronization.
-- Pending offline backlog while allowing Z-report.
+- Pending offline backlog while allowing an **online** Z-report (offline-mode local Z_REPORT close as a Pattern C `OFFLINE_LOCAL_ACK` document is the explicit *exception* under the corrected W10 policy and is NOT a no-go — see Phase 6 + `docs/OFFLINE_SHIFT_CLOSE_DECISION.md`).
 - Missing audit or trace for an accepted fiscal document.
 - Production-like configuration using stub transport or passthrough signing.

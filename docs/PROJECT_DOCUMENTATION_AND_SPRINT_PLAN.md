@@ -35,6 +35,8 @@ Regulation can change. Before production release, the team must re-check the cur
 
 The product must explicitly support two DPS-side submission channels for checks, Z-reports, and related PRRO service documents:
 
+> **Rust gateway channel-taxonomy mapping (2026-05-16).**  The Rust gateway formalises these two channels under the names **WebCheck / gRPC channel** (M3a + M3b W7-W9a-W10 target — corresponds to the project's `DPS_PRRO_FISCAL_SERVER` family below) and **DFS HTTP / XML channel** (future implementation, NOT in M3b — corresponds to a `/fs/cmd` + `/fs/doc` + `/fs/pck` HTTPS endpoint family per the reference `PRRODPS.DFS` codebase, with offline numbering via `OfflineSessionId.localOfflineNum.controlNumber` instead of a pre-fetched code pool).  See `docs/superpowers/plans/2026-05-14-m3b-implementation.md` §"DPS Channel Taxonomy" for the channel comparison.  The exact mapping between the Python-era channel labels and the Rust channel taxonomy is left for the runtime-composition task that constructs the production `DpsChannel` backend.  Maria 304 is NOT a DPS channel — it is an ingress / POS adapter on the same boundary as REST / XML-RPC / Maria-TCP shells.
+
 1. `DPS_UNIFIED_WINDOW`
    - Ukrainian name: `Єдине вікно подання електронної звітності`;
    - project transport meaning: reporting-window / XML-document submission contour;
@@ -48,7 +50,7 @@ The product must explicitly support two DPS-side submission channels for checks,
    - project transport meaning: direct PRRO fiscal server API contour;
    - current project analogue: `DPS_PRRO_GRPC_ECABINET`, but the final implementation name should be reviewed after confirming the current DPS API protocol.
 
-These channels must be represented in configuration, routing, audit, transport traces, readiness, and acceptance tests. While a shift is open, switching between `DPS_UNIFIED_WINDOW` and `DPS_PRRO_FISCAL_SERVER` is strictly forbidden. A receipt submitted through one DPS channel must not be retried through the other channel during the same open shift.
+These channels must be represented in configuration, routing, audit, transport traces, readiness, and acceptance tests. While a shift is open, switching between `DPS_UNIFIED_WINDOW` and `DPS_PRRO_FISCAL_SERVER` is strictly forbidden (Rust gateway: no channel switch between WebCheck/gRPC and DFS HTTP/XML while a shift is open — see `docs/LEGAL_INVARIANTS.md` INV-05). A receipt submitted through one DPS channel must not be retried through the other channel during the same open shift.
 
 ## 3. Legal Engineering Invariants
 
@@ -102,7 +104,7 @@ Baseline test state (2026-04-15, Sprint 10 wave 2):
 
 - `pytest -q` result: `586 passed, 0 failed`;
 - ФСКО protocol complete: `<D>/<S>` discounts, `<L>` comments, `<EPZ>` Z-report, `<E>` full attrs, `<CA>`, `<CZD>`;
-- all P0 legal gaps closed: `OFFLINE_LOCAL_ACK`, `OfflineSyncService`, Z-report offline backlog guard, receipt validator;
+- all P0 legal gaps closed: `OFFLINE_LOCAL_ACK`, `OfflineSyncService`, Z-report offline backlog guard *(Python-era — blanket-blocker shape; superseded by the M3b W10 ONLINE-vs-OFFLINE-distinguished policy in the Rust gateway, see `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0)*, receipt validator;
 - full fiscal lifecycle E2E test: SHIFT_OPEN → SELL → SELL → SERVICE_IN → SERVICE_OUT → RETURN → Z_REPORT.
 
 ## 5. High-Level Architecture
@@ -873,7 +875,7 @@ Minimum acceptance tests before pilot:
 - DPS PRRO fiscal server channel can submit/poll mocked fiscal documents;
 - reconciliation preserves original submission channel;
 - cross-channel retry during an open shift is rejected;
-- Z-report blocked while legally required offline sync is pending;
+- **online** Z-report blocked while legally required offline sync is pending; **offline-mode** Z_REPORT local close-of-day is the explicit allowed Pattern C exit per M3b W10 (`docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0) and is NOT covered by this blocker;
 - recovery after crash during prepared/signed/sent/offline states;
 - crypto timeout moves document to retryable/manual path;
 - transport timeout moves document to retryable/manual path;

@@ -39,13 +39,19 @@ Local Document Number повинен збільшуватись атомарно
 **Порушення:** подвійна фіскалізація, неузгодженість контрольної стрічки.
 
 ### INV-05 — Зміна каналу під час активної зміни заборонена
-Перемикання між `DPS_UNIFIED_WINDOW` і `DPS_PRRO_FISCAL_SERVER` під час відкритої зміни заборонено безумовно.
+Перемикання між DPS-каналами під час відкритої зміни заборонено безумовно.  Це поширюється на обидва канали, які підтримує DPS:
+- **WebCheck / gRPC channel** (target M3a + M3b W7/W8/W9a in-scope).
+- **DFS HTTP / XML channel** (`/fs/cmd` + `/fs/doc` + `/fs/pck` per `PRRODPS.DFS`; future implementation, NOT in Rust M3b).
+
+Once a shift is opened against one channel family, the channel is **pinned** for that shift until `Z_REPORT` close-of-day completes AND any offline backlog from that shift drains to final ACK on that same channel.  Mid-shift switching would lose forensic continuity: offline numbers (code-pool vs `OfflineSessionId.localOfflineNum.controlNumber`), ticket shapes (`lastChk` vs DFS XML ticket), and KVT2 evidence formats are channel-specific.  See plan §"DPS Channel Taxonomy" for the channel comparison.
+
+`Maria 304` is NOT a DPS channel — it is an ingress / POS adapter on the same boundary as REST / XML-RPC / Maria-TCP shells.  INV-05 governs the DPS-side channel pinned to the open shift, NOT which ingress accepts the POS message.
 
 **Engineering enforcement:** channel lock через `backend_profile_id + transport_profile_id + protocol + integration_owner`; перевірка в write-path guard stage.  
 **Порушення:** фіскальні документи в одній зміні через різні канали — юридично недійсно.
 
 ### INV-06 — Failover між DPS-каналами тільки поза активною зміною
-Failover між `DPS_UNIFIED_WINDOW` і `DPS_PRRO_FISCAL_SERVER` дозволений тільки: поза активною зміною, або після контрольованого закриття/відкриття зміни з явним рішенням оператора, аудит-подією та доказом ідемпотентності.
+Failover між DPS-каналами (WebCheck/gRPC ↔ DFS HTTP/XML) дозволений тільки: поза активною зміною, або після контрольованого закриття/відкриття зміни з явним рішенням оператора, аудит-подією та доказом ідемпотентності.  Operationally this means: close the current shift on the existing channel (online `Z_REPORT` if backlog clean, offline local `Z_REPORT` close + drain to final ACK if backlog pending) BEFORE the next `SHIFT_OPEN` on the new channel.
 
 **Engineering enforcement:** зараз не реалізований явно — gap (див. ACCEPTANCE_COVERAGE_SNAPSHOT.md INV-06-GAP).
 
@@ -147,25 +153,41 @@ Failover між `DPS_UNIFIED_WINDOW` і `DPS_PRRO_FISCAL_SERVER` дозволе�
 
 ## 8. Статус відносно production
 
-| Категорія | Статус |
+> **Status correction 2026-05-16 (Rust gateway M3b context).**  The original table below described the Python-era status snapshot at the time of Sprint 0.  Several rows are misleading for the Rust gateway pilot path: the Rust gateway is being built standalone (the Python path remains the production gateway today; the Rust gateway has not yet shipped) and does not yet implement the offline time-limit enforcement that the Python row claims.  The corrected status column below uses ⚠ for **active engineering risks / pilot gates** that the Rust gateway must address before production, alongside ✅ / ❌ for items unchanged.
+
+| Категорія | Статус (Rust gateway M3b, 2026-05-16) |
 |---|---|
-| Single-writer / LND | ✅ Реалізовано і покрито тестами |
+| Single-writer / LND | ✅ Реалізовано і покрито тестами (M3a + M3b W2) |
 | Shift lifecycle guards | ✅ Реалізовано і покрито тестами |
 | Channel lock enforcement | ✅ Реалізовано і покрито тестами |
 | Idempotency | ✅ Реалізовано і покрито тестами |
-| Offline time limits (36h / 168h) | ✅ Реалізовано і покрито тестами |
-| Offline range allocation | ✅ Реалізовано і покрито тестами |
-| Offline state model (OFFLINE_LOCAL vs DPS_ACK) | ❌ GAP — Sprint 1 |
-| Offline sync service | ❌ GAP — Sprint 2 |
-| Z-report / shift close blocking | ❌ GAP — Sprint 2+ |
+| **24h shift limit** | ⚠ **Active engineering risk** — not yet enforced in the Rust gateway; must be enforced before production OR explicitly risk-accepted with a sign-off in the pilot log.  The offline Z_REPORT local close-of-day path (M3b W10) exists precisely so this limit has a compliant exit even when DPS is unreachable — without it the system would trap an offline shift against the 24h wall. |
+| **36h continuous offline limit** | ⚠ **Active engineering risk** — Python-era enforcement (the original ✅ row) does NOT apply to the Rust gateway, which is being built standalone.  Must be enforced before production OR explicitly risk-accepted.  Sales may be blocked at the limit; the close/reporting path must always have an exit (offline Z_REPORT local close). |
+| **168h monthly offline limit** | ⚠ **Active engineering risk** — same shape as 36h.  Must be enforced before production OR explicitly risk-accepted. |
+| Offline range allocation | ✅ Реалізовано і покрито тестами (M3b W4 + W5) |
+| Offline state model (`OfflineLocalAck` typed state) | ✅ Реалізовано (M3b W4 + W6 + W7) |
+| Offline sync service (W9 backlog drain) | ⚠ In progress — M3b W9a merged (`stage_send` widened for OfflineLocalAck source); W9b backlog drain orchestration + W12 KVT2 confirmation pending |
+| **Z-report / shift close policy** | ⚠ M3b W10 redesigned (2026-05-16) — **ONLINE Z_REPORT** over pending offline backlog MUST be blocked; **OFFLINE-mode local Z_REPORT** close-of-day MUST be allowed as Pattern C document (consumes offline code, lands `OfflineLocalAck`, drained later in `lnd` order).  Earlier blanket-block framing was an error — see `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0.  W10 implementation pending. |
+| **Hard close-code reserve = 1** | ⚠ M3b W10 rule (2026-05-16) — reserve = one currently-unconsumed code in the FN-scoped pool (`offline_codes` PK `(fiscal_number, code_lnd)`) while that FN has an open shift and the local offline `Z_REPORT` has NOT yet been emitted; ordinary offline `SELL` / `RETURN` / `SERVICE_*` docs MUST NOT consume that last `consumed_at IS NULL` row (refused with `OFFLINE_CODE_RESERVED_FOR_CLOSE` audit; code row stays unconsumed).  The offline `Z_REPORT` close-of-day MAY consume the reserved code.  **Hard reserve is exactly 1** — it is the *last-line* legal guarantee that the offline Z_REPORT close path always has a code while a shift is open, NOT an operational refill watermark.  The operational watermark (`min_offline_codes`, commonly ~10) sits well above 1 and triggers refill *before* exhaustion; it is a recommendation, not the legal reserve.  pool=0 at close time → `OFFLINE_Z_REPORT_LOCAL_CLOSE_REFUSED` with `reason: "code_pool_exhausted"` and **severity Critical** (NOT Warning — the 24h shift-limit trap is functionally re-asserted for the FN; audit dashboards must surface this immediately); pilot-critical / legal-critical signal that the operational watermark failed upstream.  Without this reserve, ordinary docs could exhaust the pool before close-of-day, leaving the offline Z_REPORT path empty and re-asserting the 24h trap.  **Reserve shape is channel-specific** (see plan §"DPS Channel Taxonomy"): WebCheck/gRPC = one row in `offline_codes` left `consumed_at IS NULL`; DFS HTTP/XML = one offline local ordinal / control-number slot in the `OfflineSessionId.localOfflineNum.controlNumber` derivation.  M3b W10 implements the WebCheck variant; the audit vocabulary is channel-neutral.  W10 implementation pending. |
+| **X-report read-only** | ✅ Invariant (Rust gateway, 2026-05-16) — `X_REPORT` is a mid-shift / cash-drawer **operational report**, NOT a fiscal close-of-day document.  The Rust gateway MUST NOT sign, transport, persist as `fiscal_documents`, advance `lnd`, consume an offline code (WebCheck channel) or an offline local ordinal (DFS channel), or allocate a Z-report sequence number for an `X_REPORT` request.  W10 policy does NOT block `X_REPORT` on offline backlog — it is a no-fiscal-side-effect read; if backlog exists the response MAY carry a warning / forensic note but MUST NOT mutate fiscal state.  Consistent with the WebCheck reverse-engineering finding (X-report not signed/submitted) and with the reference DFS dispatcher (`PRRODPS/Maria/Session/MariaDispatcher.cs::ZREP → X-report`, no `/fs/doc` post).  `Z_REPORT`, in contrast, IS the fiscal close-of-day document and MAY be the offline local close — see "Z-report / shift close policy" row above. |
 | Crypto seam (passthrough/sidecar) | ✅ Реалізовано і покрито тестами |
-| Production crypto startup gate | ✅ Реалізовано |
+| Production crypto startup gate | ✅ Реалізовано (M3a) |
 | Excise mark protection | ✅ Часткове — no fiscal validator |
 | Ukrainian fiscal receipt validator | ❌ GAP — P0 |
-| Real DPS transports | ❌ Stub — P1 |
-| Recovery / reconciliation | ✅ Реалізовано і покрито тестами |
+| Real DPS transports | ⚠ M3a wire-send + W7b dispatcher live on test DPS; production-channel selection (direct DPS vs WebCheck-compatible) pending runtime-composition task |
+| Recovery / reconciliation | ✅ Реалізовано і покрито тестами (M3a + M3b W2) |
 | Audit / trace | ✅ Реалізовано і покрито тестами |
+
+**Compliance gate (production-ready criterion).**  The Rust gateway MUST NOT be declared production-compliant until:
+1. 24h shift limit is enforced OR explicitly risk-accepted with operator sign-off.
+2. 36h continuous offline limit is enforced OR explicitly risk-accepted.
+3. 168h monthly offline limit is enforced OR explicitly risk-accepted.
+4. M3b W10 ONLINE-vs-OFFLINE Z-report policy is implemented + pilot-tested (Phase 6 in `docs/PILOT_ACCEPTANCE_TEST_PLAN.md` covers both paths).
+5. M3b W10 hard close-code reserve = 1 is implemented + pilot-tested (pool=1 sale refused, pool=1 Z_REPORT accepted, pool=0 Z_REPORT refused with `code_pool_exhausted`).
+6. M3b W9b backlog drain + W12 KVT2 confirmation deliver every offline doc to final DPS `ACK`.
+
+The offline Z_REPORT local close-of-day path is the architectural answer to the "24h trap": without it, an offline shift would have no compliant way to close at the 24h wall.  With it, the cash desk keeps operating (and reporting) even during DPS outages, with sync to final ACK on return-online.
 
 ---
 
-*Цей документ фіксує стан на дату Sprint 0. Потребує оновлення після Sprint 1 та перед production release.*
+*Цей документ фіксує стан на дату Sprint 0 (Python-era baseline), оновлений 2026-05-16 для Rust gateway M3b context.  Потребує наступного оновлення після M3b W10 / W9b / W12 landing та перед production release.*
