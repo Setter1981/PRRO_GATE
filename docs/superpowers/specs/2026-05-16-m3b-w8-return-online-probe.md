@@ -99,24 +99,25 @@ The `reason` field on `_FAILED` is a typed-string enum: `"dps_error"`, `"dps_rep
 
 ## 5. Runtime task lifecycle
 
-> **W8a / W8b split (2026-05-16).**  W8a ships the tested **primitive** (`run_tick_for_fn` + `spawn_probe_loop`) plus the `OfflineCfg` schema delta with parse-time clamp.  W8a does NOT wire the loop into `App::boot` — that is W8b's scope (ownership of `JoinHandle`, watch::Sender placement, FN → `fn_sign` resolution, shutdown plumbing from `main`, boot-level "no probe for Online FNs" + "clean shutdown" integration tests, and emission of the WARN audit when the operator-supplied interval is clamped).  §Task 8 remains OPEN until W8b lands.  The bullet list below describes the **end state** that W8b realises; W8a's `spawn_probe_loop` already implements the per-task discipline, only the App-level wiring is deferred.
+> **W8a / W8b split (2026-05-16).**  W8a ships the tested **primitive** (`run_tick_for_fn` + `spawn_probe_loop`) plus the `OfflineCfg` schema delta and the `clamped_probe_interval_seconds()` helper.  W8a does NOT wire the loop into `App::boot` — that is W8b's scope (ownership of `JoinHandle`, watch::Sender placement, FN → `fn_sign` resolution, shutdown plumbing from `main`, boot-level "no probe for Online FNs" + "clean shutdown" integration tests, and emission of the WARN audit when the operator-supplied interval is outside `[5, 3600]`).  §Task 8 remains OPEN until W8b lands.  The bullet list below describes the **end state** that W8b realises; W8a's `spawn_probe_loop` already implements the per-task discipline, only the App-level wiring is deferred.
 
 - Probe is a single tokio task spawned at App boot (one task that iterates FNs each tick, NOT per-FN tasks — simpler shutdown discipline).
 - Tick driven by `tokio::time::interval` with `MissedTickBehavior::Skip` (no queue-up of missed ticks).
 - Default interval: 60 seconds (per plan §Task 8 line 576).
-- Configurable via `AppConfig.offline.return_online_probe_interval_seconds`.
-- Lower bound enforced at config parse: 5 seconds (operator safety against accidental DDoS).
-- Upper bound enforced at config parse: 3600 seconds (1 hour).
+- Configurable via `AppConfig.offline.return_online_probe_interval_seconds` (raw operator value).
+- Boot callers obtain the safe value via `OfflineCfg::clamped_probe_interval_seconds()` (helper-side clamp; the field itself stores the raw value verbatim).
+- Lower bound enforced by the helper: 5 seconds (operator safety against accidental DPS overload).
+- Upper bound enforced by the helper: 3600 seconds (1 hour).
 - App shutdown: `select!` over `interval.tick()` + `shutdown.recv()`; task exits cleanly.
 
 ## 6. AppConfig schema delta
 
 ```toml
 [offline]
-return_online_probe_interval_seconds = 60  # default; clamped to [5, 3600]
+return_online_probe_interval_seconds = 60  # default; helper-clamped to [5, 3600] at boot
 ```
 
-Validation: parse-time clamp + WARN audit if operator-supplied value was clamped.
+Validation contract: the field stores the raw operator value verbatim — the `Deserialize` impl does NOT clamp.  Boot callers MUST invoke `OfflineCfg::clamped_probe_interval_seconds() -> (clamped: u64, was_clamped: bool)` to obtain the safe value and emit a WARN audit when `was_clamped == true`.  Reading the raw field directly in a runtime hot path is an API contract violation.
 
 ## 7. Out of W8 scope (explicit deferral)
 

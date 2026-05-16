@@ -39,9 +39,17 @@ pub struct AdminUiCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct OfflineCfg {
     /// Tick interval for the return-online probe (seconds).  Default
-    /// 60s per M3b plan §Task 8 line 576.  Clamped at parse time to
-    /// `[5, 3600]` — lower bound guards against accidental
-    /// DPS-DoS; upper bound is one hour (operator pin).
+    /// 60s per M3b plan §Task 8 line 576.
+    ///
+    /// **Raw value.**  This field stores the operator-supplied value
+    /// verbatim; it is NOT clamped at parse time.  Boot callers MUST
+    /// route through [`OfflineCfg::clamped_probe_interval_seconds`]
+    /// to obtain the safe `[PROBE_INTERVAL_MIN_SECONDS,
+    /// PROBE_INTERVAL_MAX_SECONDS]` value and emit a WARN audit if
+    /// the supplied value was outside bounds.  Reading this field
+    /// directly is an API contract violation for runtime hot paths.
+    /// Lower bound guards against accidental DPS overload; upper
+    /// bound is one hour (operator pin).
     #[serde(default = "default_return_online_probe_interval_seconds")]
     pub return_online_probe_interval_seconds: u64,
 }

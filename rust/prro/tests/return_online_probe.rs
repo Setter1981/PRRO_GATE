@@ -111,14 +111,26 @@ fn fn_sign() -> CheckSignBlob {
 
 /// Content snapshot across fiscal-data tables.  Used by the
 /// negative scanner (test #6) to assert the probe has zero side
-/// effects on these tables — both row counts AND row contents.
-/// Plain counts would miss accidental UPDATEs that preserve row
-/// count (e.g. state column flipped on an existing fiscal_document);
-/// the per-row digest string catches those.
+/// effects on these tables — both row counts AND row contents for
+/// the **selected critical columns** listed below.  Plain row
+/// counts would miss accidental UPDATEs that preserve row count
+/// (e.g. a state column flipped on an existing fiscal_document);
+/// the per-row digest string of these columns catches that class
+/// of regression.
 ///
-/// Each table contributes a `Vec<String>` of identifying columns +
-/// state/content columns, ordered by primary key.  Two snapshots
-/// compare equal iff every row in every table is byte-identical.
+/// **Scope of guarantee.**  The snapshot is column-selective, not
+/// full-row byte equality.  We capture the columns the probe is
+/// most plausibly tempted to mutate (state, lnd, fs_mode, the
+/// payload identity columns; offline_session state + timestamps;
+/// offline_code consumption marker; transport_trace start time +
+/// completion / retry_class).  Columns NOT in the SELECT (e.g.
+/// fiscal_documents.created_at, transport_trace.error_message)
+/// are NOT covered — drift there must be caught by a future
+/// scanner upgrade.  This is honest about what test #6 proves.
+///
+/// Each table contributes a `Vec<String>` of identifying + content
+/// columns, ordered by primary key.  Two snapshots compare equal
+/// iff every captured column on every row matches.
 #[derive(Debug, PartialEq, Eq)]
 struct FiscalTableSnapshot {
     fiscal_documents: Vec<String>,
@@ -128,6 +140,7 @@ struct FiscalTableSnapshot {
 }
 
 type FiscalDocRow = (Vec<u8>, String, i64, String, String, Vec<u8>);
+type TransportTraceRow = (Vec<u8>, i64, String, String, String, String, String);
 
 async fn fiscal_table_snapshot(pool: &SqlitePool) -> FiscalTableSnapshot {
     // fiscal_documents: identify + state-bearing columns.  Probe
@@ -188,16 +201,31 @@ async fn fiscal_table_snapshot(pool: &SqlitePool) -> FiscalTableSnapshot {
         .map(|(fnum, cl, ca)| format!("{}:{}:{}", fnum, cl, ca.unwrap_or_default()))
         .collect();
 
-    let tt: Vec<(Vec<u8>, i64, String, String)> = sqlx::query_as(
-        "SELECT document_id, attempt_no, request_kind, retry_class \
+    // transport_trace: identifying PK + start time + the W7
+    // backend/transport profile context + completion / retry
+    // markers.  Columns match migration 010 (+ 012 retry_class).
+    let tt: Vec<TransportTraceRow> = sqlx::query_as(
+        "SELECT document_id, attempt_no, started_at, backend_profile_id, transport_profile_id, \
+                COALESCE(outcome_kind, ''), COALESCE(retry_class, '') \
          FROM transport_trace ORDER BY document_id, attempt_no",
     )
     .fetch_all(pool)
     .await
-    .unwrap_or_default();
+    .unwrap();
     let tt = tt
         .into_iter()
-        .map(|(id, n, k, rc)| format!("{}:{}:{}:{}", hex_lower(&id), n, k, rc))
+        .map(|(id, n, sa, bp, tp, ok, rc)| {
+            format!(
+                "{}:{}:{}:{}:{}:{}:{}",
+                hex_lower(&id),
+                n,
+                sa,
+                bp,
+                tp,
+                ok,
+                rc
+            )
+        })
         .collect();
 
     FiscalTableSnapshot {
@@ -500,18 +528,25 @@ async fn probe_no_fiscal_side_effects_on_success_failure_or_skip() {
             .await
             .unwrap();
 
-        // Seed transport_trace row directly (raw SQL — schema-permitted).
+        // Seed transport_trace row directly using the real W7
+        // schema (migration 010 + 012).  An incomplete-attempt row
+        // — completion columns NULL — is the cheapest shape that
+        // also exercises retry_class (migration 012 nullable column).
+        // Unwrap deliberately: if the seed shape ever drifts from
+        // schema, this test must FAIL, not silently skip the
+        // transport_trace branch of the negative scanner.
         let trace_doc_id = doc_id.clone();
+        let envelope_sha = vec![0xCCu8; 32];
         sqlx::query(
-            "INSERT INTO transport_trace(document_id, attempt_no, attempted_at, \
-                request_kind, request_id_blob, retry_class) \
-             VALUES (?, 1, '2026-05-16T00:00:00Z', 'SEND_CHK', ?, 'TransientRetry')",
+            "INSERT INTO transport_trace(document_id, attempt_no, started_at, \
+                backend_profile_id, transport_profile_id, request_envelope_sha256) \
+             VALUES (?, 1, '2026-05-16T00:00:00Z', 'b', 't', ?)",
         )
         .bind(&trace_doc_id)
-        .bind(req_id.as_bytes().to_vec())
+        .bind(&envelope_sha)
         .execute(&pool)
         .await
-        .ok(); // schema may differ; allow Err — not load-bearing for the assert.
+        .unwrap();
 
         let pre = fiscal_table_snapshot(&pool).await;
 
