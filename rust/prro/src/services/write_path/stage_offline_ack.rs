@@ -1,23 +1,32 @@
-//! M3b W7 — `stage_offline_ack`: Pattern C step 1 (pre-send local ack).
+//! M3b W7a — `stage_offline_ack`: Pattern C step 1 (pre-send local ack).
 //!
 //! Post-sign, pre-send write-path branch invoked when the node is in
 //! `Offline` / `GoingOffline` mode.  In ONE `with_immediate`
 //! envelope (BEGIN IMMEDIATE) the stage:
 //!
-//!   1. Re-reads `node_state` (fresh snapshot; the `WorkerContext`
-//!      copy taken at stage 1 may be stale w.r.t. a concurrent
+//!   1. Re-reads `node_state` (fresh snapshot; any earlier
+//!      WorkerContext copy may be stale w.r.t. a concurrent
 //!      shift-close or node-mode flip).
 //!   2. Validates node mode ∈ {Offline, GoingOffline}.
 //!   3. Validates shift state == Opened.
 //!   4. Reads the FN's currently-active OPEN offline session.
-//!   5. Acquires an unconsumed code from the FN pool via W5's
+//!   5. **Pre-checks doc state + FN match** (operator W7 Round 1
+//!      LOW/MED fix, 2026-05-15): reads the doc's `(state,
+//!      fiscal_number)` and surfaces typed `Refused(DocNotFound)`
+//!      / `Refused(DocStateConflict)` BEFORE any code touch.  Also
+//!      doubles as the cross-FN guard (operator W7 Round 1 HIGH-2
+//!      fix) — caller-supplied `fiscal_number` MUST match the
+//!      doc's persisted FN.
+//!   6. Acquires an unconsumed code from the FN pool via W5's
 //!      `acquire_code_tx` (atomic single-statement CAS).
-//!   6. Transitions `Signed → OfflineLocalAck` stamping
+//!   7. Transitions `Signed → OfflineLocalAck` stamping
 //!      `offline_fiscal_no = code_lnd`,
 //!      `offline_fiscal_date = consumed_at`,
 //!      `offline_session_id = session_id` in one UPDATE (W7 helper
-//!      `transition_to_offline_local_ack_tx`).
-//!   7. Emits `OFFLINE_LOCAL_ACK_APPLIED` audit on success;
+//!      `transition_to_offline_local_ack_tx`).  The helper's
+//!      UPDATE WHERE clause filters on `fiscal_number` too —
+//!      defence-in-depth on the pre-check.
+//!   8. Emits `OFFLINE_LOCAL_ACK_APPLIED` audit on success;
 //!      `OFFLINE_ACK_REFUSED` audit on validation refusal.
 //!
 //! ## Invariant preservation
@@ -31,9 +40,13 @@
 //! - **I2** (one FN, one writer): BEGIN IMMEDIATE serialises
 //!   writers on the SQLite RESERVED lock.
 //! - **I4** (idempotency): re-invocation after `Applied` sees the
-//!   doc in `OfflineLocalAck`, the W7 helper's CAS misses with
-//!   `Conflict`, audit emits `OFFLINE_ACK_REFUSED { DocStateConflict }`;
-//!   the original `Applied` artefact stays intact.
+//!   doc in `OfflineLocalAck`; Step 5 pre-check catches it BEFORE
+//!   `acquire_code_tx`, returns typed `Refused(DocStateConflict)`,
+//!   audit emits `OFFLINE_ACK_REFUSED`; the original `Applied`
+//!   artefact stays intact AND the code pool is never touched on
+//!   the retry.  Three defence-in-depth layers: (a) Step 5 pre-
+//!   check, (b) helper UPDATE WHERE state='SIGNED', (c) W4 partial
+//!   UNIQUE `ux_offline_codes_consumed_by_doc`.
 //! - **I5** (offline bounded by codes): refusal paths leave the
 //!   code pool UNTOUCHED — `acquire_code_tx` is only invoked
 //!   after all validations pass.  Code-pool exhaustion surfaces
@@ -45,16 +58,18 @@
 //!
 //! ## Scope discipline (operator W7 review pin)
 //!
-//! - W7 emits `OFFLINE_LOCAL_ACK`; it does NOT advance docs to
-//!   `Sending` / `Cancelled`.  Those W6-added edges are W9's
-//!   responsibility (return-online backlog drain).
+//! - W7a (this module) emits `OFFLINE_LOCAL_ACK`; it does NOT
+//!   advance docs to `Sending` / `Cancelled`.  Those W6-added
+//!   edges are W9's responsibility (return-online backlog drain).
 //! - `stage_finalize` and `stage_send` are untouched.
-//! - This stage does NOT extend `WorkerContext`; it consumes the
-//!   existing snapshot.
-//! - Dispatcher wiring (calling this stage from ingress / boot
-//!   recovery) is intentionally out of W7 scope — the stage is
-//!   self-contained and tested directly; production wiring lifts
-//!   to a follow-up that touches ingress + boot_phase + app.
+//! - This stage takes `(pool, doc_id, fiscal_number)` directly;
+//!   it does NOT extend `WorkerContext`.
+//! - **W7b (mandatory follow-up)**: dispatcher wiring that calls
+//!   this stage from ingress + boot_phase + app paths, plus the
+//!   `write_path_dispatcher_post_sign` integration test per plan
+//!   §Task 7 line 524.  W7a delivers the stage primitive in
+//!   isolation; "M3b §Task 7 closed" requires both W7a (this PR)
+//!   AND W7b merged.
 
 use crate::db::models::enums::{NodeMode, Severity, ShiftState};
 use crate::db::models::ids::{DocumentId, OfflineSessionId};
