@@ -24,6 +24,24 @@
 //!      `select!` over `interval.tick()` + `shutdown.recv()` with
 //!      shutdown branch ALWAYS winning (no panic, no dangling tx).
 //!
+//! ## DPS surface choice: `statusRro` (not `ping`)
+//!
+//! The probe calls `DpsChannel::status_rro`, NOT
+//! `DpsChannel::ping`.  Rationale (per design freeze §10 +
+//! memory `m3b-w8-review-criteria` axis 6): `statusRro` is a
+//! read-only surface that returns the full [`StatusSnapshot`]
+//! shape — `online`, `open_shift`, `last_signer`.  The single
+//! success predicate is `StatusSnapshot::online == true`
+//! (operator hard line 1); `open_shift` and `last_signer` are
+//! AUDIT FIELDS ONLY (operator hard line 2) and are recorded
+//! verbatim in `RETURN_ONLINE_PROBE_SUCCESS` /
+//! `RETURN_ONLINE_PROBE_FAILED` payloads for forensics.  `ping`
+//! was the lighter alternative but does not carry the snapshot
+//! fields, so it cannot satisfy hard line 2.  Future
+//! maintainers tempted to switch to the cheaper call must
+//! preserve the snapshot fields in the audit (or re-pin hard
+//! line 2 with the operator).
+//!
 //! ## Invariant preservation
 //!
 //! - **I1** (no foreign IO inside SQLite write tx): probe's

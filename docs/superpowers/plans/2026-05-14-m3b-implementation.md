@@ -571,7 +571,7 @@ cargo test -p prro --test write_path_stage4_send               # existing — mu
 
 > **W8a / W8b split (2026-05-16).**  After Round 1 review on PR #58, this task was split into two PRs:
 > - **W8a** (PR #58, in-review) — tested primitive: `run_tick_for_fn` + `spawn_probe_loop` + `OfflineCfg::return_online_probe_interval_seconds` (raw operator value) + `clamped_probe_interval_seconds()` helper-side clamp + stable `dps_error_class` audit taxonomy.
-> - **W8b** (future PR) — App::boot wiring: enumerate ALL configured FNs (boot-time mode filter would orphan late `Online → Offline` transitions; tick-level skip already handles `Online` / `GoingOnline` cheaply), own the `JoinHandle` + `watch::Sender`, propagate shutdown from `main`, route the raw config field through `clamped_probe_interval_seconds()` and emit WARN audit when `was_clamped == true`, durable `RETURN_ONLINE_PROBE_LOOP_ERROR` CRITICAL audit on tick error.
+> - **W8b** (PR #59) — App-owned runtime seam (`App::spawn_return_online_probe`): NOT a change to `App::boot` itself.  The seam is wired by the future composition root (the runtime layer that constructs the concrete DPS channel); `main.rs` Serve remains M1-idle for the duration of W8b.  Seam responsibilities: enumerate ALL configured FNs (boot-time mode filter would orphan late `Online → Offline` transitions; tick-level skip already handles `Online` / `GoingOnline` cheaply), return the `JoinHandle` to the caller (caller owns `watch::Sender` + `JoinHandle`; App does not track lifecycle), route the raw config field through `clamped_probe_interval_seconds()` and emit WARN audit when `was_clamped == true`, durable `RETURN_ONLINE_PROBE_LOOP_ERROR` CRITICAL audit on tick error.  §Task 8 closes on API + tested App seam, NOT on production `main.rs` caller — that is a separate future runtime-composition task gated on DPS channel selection (direct DPS vs WebCheck-compatible vs future router).
 >
 > **§Task 8 remains OPEN until W8b merges.**  See design freeze §5 (split note) + §7a (W8b scope) — `docs/superpowers/specs/2026-05-16-m3b-w8-return-online-probe.md`.
 
@@ -587,11 +587,11 @@ cargo test -p prro --test write_path_stage4_send               # existing — mu
 **Day budget:** 1–2 days.
 
 **Acceptance.**
-- Probe runs on a tokio task spawned at App boot; respects graceful shutdown (frozen invariant 9).
-- Probe failure → node mode unchanged; audit `RETURN_ONLINE_PROBE_FAILED` emitted with `DpsError` class.
+- Probe runs on a tokio task spawned through the App-owned seam (`App::spawn_return_online_probe`); production `main.rs` caller deferred to a future runtime-composition task.  Loop respects graceful shutdown (frozen invariant 9) — caller owns the `watch::Sender<bool>` and `JoinHandle<()>`.
+- Probe failure → node mode unchanged; audit `RETURN_ONLINE_PROBE_FAILED` emitted with stable-string `dps_error_class` taxonomy.
 - Probe success → node mode `Offline → GoingOnline`; audit `RETURN_ONLINE_PROBE_SUCCESS` emitted.
-- A second successful probe while in `GoingOnline` is a no-op (idempotency).
-- No state write while node is `Online` (probe should not even spawn).
+- A second successful probe while in `GoingOnline` is a no-op (idempotency, hard line 4).
+- No state write while node is `Online` — tick-level skip filters `Online` / `GoingOnline` BEFORE the wire call (hard line 5).
 
 **Verify.**
 ```
