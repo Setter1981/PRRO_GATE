@@ -147,6 +147,31 @@ pub enum StageSendError {
     )]
     OfflineFiscalNoMissing { document_id: DocumentId },
 
+    /// **M3b W9a Round 2 LOW #1 fix (2026-05-16):** the doc is in
+    /// `OfflineLocalAck` and `fiscal_documents.offline_fiscal_no` is
+    /// present but non-positive (`<= 0`).  W7a writes
+    /// `offline_fiscal_no = consumed code_lnd`, and `offline_codes`
+    /// carries a schema CHECK `code_lnd > 0` — so the producer path
+    /// guarantees a positive value.  `fiscal_documents.offline_fiscal_no`
+    /// itself has no CHECK (`migrations/002_fiscal_documents.sql:25`),
+    /// so a raw-SQL bypass or future schema regression could leak
+    /// `0` / negative.  Surfaced BEFORE 4-pre CAS for the same
+    /// reason as `OfflineFiscalNoMissing`: a `Sending` marker on a
+    /// row whose `id_offline` would stringify to `"0"` would
+    /// mis-identify the receipt to DPS.  Forensically split from
+    /// `OfflineFiscalNoMissing` (NULL = column not written;
+    /// `<= 0` = column written with invalid payload) so audit logs
+    /// distinguish the two producer-side bug classes.
+    #[error(
+        "stage 4 W9 drain: doc {document_id:?} is in OfflineLocalAck but offline_fiscal_no is \
+         non-positive ({observed}); offline_codes CHECK code_lnd > 0 forbids this on the W7a \
+         producer path"
+    )]
+    OfflineFiscalNoNonPositive {
+        document_id: DocumentId,
+        observed: i64,
+    },
+
     /// `inputs.business_ts` could not be parsed as UTC ISO-8601, or the
     /// Kyiv-local components could not be re-interpreted as UTC for
     /// the DPS Kyiv-local-as-epoch shape.
@@ -873,21 +898,41 @@ async fn run_one_attempt(
                 };
 
             // M3b W9a invariant guard: an `OfflineLocalAck` row
-            // MUST carry `offline_fiscal_no` (W7a writes this =
-            // consumed code_lnd atomically with the state flip in
-            // `transition_to_offline_local_ack_tx`).  If we observe
-            // the state but the column is NULL, the row was created
-            // via raw-SQL bypass — surface a typed
-            // `OfflineFiscalNoMissing` BEFORE any CAS / wire side
-            // effect.  Online states (Signed / ErrorRetryable) leave
-            // `offline_fiscal_no` NULL by design — envelope builder
-            // maps that to empty `id_offline` per DPS contract.
-            if inputs.state == DocState::OfflineLocalAck
-                && inputs.offline_fiscal_no.is_none()
-            {
-                return Ok(PreOutcome::EnvelopeBuildFailed(
-                    StageSendError::OfflineFiscalNoMissing { document_id: doc },
-                ));
+            // MUST carry a positive `offline_fiscal_no` (W7a writes
+            // this = consumed code_lnd atomically with the state
+            // flip in `transition_to_offline_local_ack_tx`, and
+            // `offline_codes.code_lnd` has a schema CHECK `> 0`).
+            // Two failure modes are forensically split (R2 LOW #1):
+            //   - NULL → `OfflineFiscalNoMissing` (column not
+            //     written; raw-SQL bypass that skipped the column).
+            //   - `<= 0` → `OfflineFiscalNoNonPositive` (column
+            //     written with invalid payload; raw-SQL bypass that
+            //     wrote a non-positive value, or a future schema
+            //     regression that drops the producer-side CHECK).
+            // Both surface BEFORE any CAS / wire side effect; the
+            // envelope builder would otherwise stringify the
+            // invalid value into `CheckEnvelope.id_offline` and
+            // mis-identify the receipt to DPS.  Online states
+            // (Signed / ErrorRetryable) leave `offline_fiscal_no`
+            // NULL by design — envelope builder maps that to empty
+            // `id_offline` per DPS contract.
+            if inputs.state == DocState::OfflineLocalAck {
+                match inputs.offline_fiscal_no {
+                    None => {
+                        return Ok(PreOutcome::EnvelopeBuildFailed(
+                            StageSendError::OfflineFiscalNoMissing { document_id: doc },
+                        ));
+                    }
+                    Some(n) if n <= 0 => {
+                        return Ok(PreOutcome::EnvelopeBuildFailed(
+                            StageSendError::OfflineFiscalNoNonPositive {
+                                document_id: doc,
+                                observed: n,
+                            },
+                        ));
+                    }
+                    Some(_) => {}
+                }
             }
 
             // Build envelope BEFORE CAS — fail-closed on
