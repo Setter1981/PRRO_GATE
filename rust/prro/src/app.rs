@@ -488,4 +488,154 @@ impl App {
     pub fn db(&self) -> &SqlitePool {
         &self.inner.db
     }
+
+    /// M3b W8b — App-owned return-online probe wiring seam.
+    ///
+    /// Spawns the periodic return-online probe loop bound to this
+    /// App's pool + config.  This is the **App runtime boundary**:
+    /// composition root supplies the transport channel + per-FN
+    /// signer blobs via [`ReturnOnlineProbeDeps`]; App owns
+    /// enumeration, clamp/audit, and lifecycle.
+    ///
+    /// Composed responsibilities (W8b deliverables):
+    /// 1. Read `self.config().offline.clamped_probe_interval_seconds()`.
+    /// 2. Emit `RETURN_ONLINE_PROBE_INTERVAL_CLAMPED` WARN audit when
+    ///    the operator-supplied value was outside `[5, 3600]`.
+    /// 3. Enumerate **ALL** configured FNs via
+    ///    `fiscal_number_config::list_all` (NOT only
+    ///    `(Offline | GoingOffline)` — the tick-level skip in the W8a
+    ///    primitive filters `Online` / `GoingOnline` cheaply BEFORE
+    ///    the wire call, and a boot-time mode filter would orphan
+    ///    FNs that start `Online` and later transition to `Offline`).
+    /// 4. Join each enumerated FN with `deps.fn_signs`.  FNs present
+    ///    in `fiscal_number_config` but absent from `fn_signs` emit
+    ///    a `RETURN_ONLINE_PROBE_FN_SKIPPED_NO_SIGNER` WARN audit
+    ///    and are excluded from `Vec<ProbeSpec>`; the loop spawns
+    ///    with the surviving FNs only.  Graceful skip (NOT fail-fast)
+    ///    keeps the probe multi-FN-resilient against single-FN
+    ///    config drift.
+    /// 5. Spawn the W8a primitive `spawn_probe_loop` with
+    ///    `Arc::new(self.db().clone())` (sqlx::SqlitePool is itself
+    ///    internally Arc-shared; double-wrap is harmless — primitive
+    ///    signature cleanup is out of W8b scope).
+    /// 6. Return the `JoinHandle`.  Caller owns the
+    ///    `watch::Sender<bool>` (built outside) and the
+    ///    `JoinHandle`; App does NOT track either.
+    ///
+    /// **Production wiring intentionally deferred.**  M1 `main.rs`
+    /// remains idle.  The first production caller of this method is
+    /// a future runtime-composition task where the concrete DPS
+    /// channel (and any future channel router) is constructed.
+    /// This separation lets W8b ship the App-side seam without
+    /// committing to a specific DPS transport implementation; the
+    /// project's planned two-channel DPS architecture (direct DPS +
+    /// WebCheck-compatible channel) is unaffected by this method's
+    /// shape.
+    ///
+    /// Errors: DB-level only (`fiscal_number_config::list_all` failure
+    /// or audit-append failure).  Wrapped in `anyhow::Error` because
+    /// the failure modes are heterogeneous and not part of
+    /// [`BootError`].
+    ///
+    /// Empty FN list: spawns the loop with an empty
+    /// `Vec<ProbeSpec>`.  The loop ticks but does no per-FN work;
+    /// cost is one `tokio::time::interval`.  Avoids changing the
+    /// return type to `Option<JoinHandle>` for the cold-boot case.
+    pub async fn spawn_return_online_probe(
+        &self,
+        deps: crate::services::offline_sync::return_online_probe::ReturnOnlineProbeDeps,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+        use crate::config::{PROBE_INTERVAL_MAX_SECONDS, PROBE_INTERVAL_MIN_SECONDS};
+        use crate::db::models::enums::Severity;
+        use crate::db::repositories::{audit_log, fiscal_number_config};
+        use crate::services::offline_sync::return_online_probe::{self, ProbeSpec};
+
+        let pool = self.db();
+
+        // (1) Clamp interval + WARN audit if operator-supplied value
+        //     was outside the safe bounds.  Audit payload carries both
+        //     raw and clamped values so operators can diagnose the
+        //     misconfiguration source.  entity_type = "app",
+        //     entity_id = "" — app-wide config event, not FN-scoped.
+        let (clamped_seconds, was_clamped) =
+            self.inner.config.offline.clamped_probe_interval_seconds();
+        if was_clamped {
+            let raw = self
+                .inner
+                .config
+                .offline
+                .return_online_probe_interval_seconds;
+            let payload = serde_json::json!({
+                "raw_seconds": raw,
+                "clamped_seconds": clamped_seconds,
+                "min_seconds": PROBE_INTERVAL_MIN_SECONDS,
+                "max_seconds": PROBE_INTERVAL_MAX_SECONDS,
+            });
+            audit_log::append(
+                pool,
+                "app",
+                "",
+                "RETURN_ONLINE_PROBE_INTERVAL_CLAMPED",
+                Severity::Warning,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await?;
+        }
+
+        // (2) Enumerate ALL configured FNs.  Boot-time mode filter
+        //     would orphan late `Online -> Offline` transitions; the
+        //     tick-level skip filters `Online` / `GoingOnline`
+        //     cheaply.  See module-level doc on the W8a primitive.
+        let fns = fiscal_number_config::list_all(pool).await?;
+
+        // (3) Join with `deps.fn_signs`; emit WARN audit + skip per
+        //     FN missing a signer blob.  Anchor the audit on
+        //     `fiscal_number_config` (config-layer drift, not runtime
+        //     mode drift — see W8b operator decision).
+        let mut specs: Vec<ProbeSpec> = Vec::with_capacity(fns.len());
+        for fn_cfg in &fns {
+            match deps.fn_signs.get(&fn_cfg.fiscal_number) {
+                Some(fn_sign) => {
+                    specs.push(ProbeSpec {
+                        fiscal_number: fn_cfg.fiscal_number.clone(),
+                        fn_sign: fn_sign.clone(),
+                    });
+                }
+                None => {
+                    let payload = serde_json::json!({
+                        "fiscal_number": &fn_cfg.fiscal_number,
+                        "reason": "missing_fn_sign",
+                        "configured_fn": true,
+                    });
+                    audit_log::append(
+                        pool,
+                        "fiscal_number_config",
+                        &fn_cfg.fiscal_number,
+                        "RETURN_ONLINE_PROBE_FN_SKIPPED_NO_SIGNER",
+                        Severity::Warning,
+                        None,
+                        Some(&payload.to_string()),
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        // (4) Spawn the W8a primitive loop.  `Arc::new(self.db().clone())`
+        //     — sqlx::SqlitePool is itself internally Arc-shared; the
+        //     double-wrap is harmless.  Primitive signature cleanup
+        //     (SqlitePool by value instead of Arc<SqlitePool>) is out
+        //     of W8b scope; tracked as future cleanup.
+        let interval = std::time::Duration::from_secs(clamped_seconds);
+        let handle = return_online_probe::spawn_probe_loop(
+            std::sync::Arc::new(pool.clone()),
+            deps.dps,
+            specs,
+            interval,
+            shutdown_rx,
+        );
+        Ok(handle)
+    }
 }
