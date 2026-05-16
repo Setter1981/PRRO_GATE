@@ -137,14 +137,23 @@ Reviewer MUST refuse impl PRs that violate any of the above.  Future architectur
 
 The empirical rarity is a **feature** of the operating environment (DPS is robust; UA fiscal regulations are stable; operators are professional), NOT a license to weaken the design.  A fire alarm that has never gone off in 4 years must remain trustworthy precisely because, when it does fire, it will be a once-in-a-decade event with full forensic load on the system that captured it.
 
-### 3.4 Scope exclusion — operator identity NOT modeled (Round 6 B-M5)
+### 3.4 Operator identity IS modeled (Round 8 — REVERSES Round 6 B-M5)
 
-The shift state machine deliberately does NOT model the cashier / operator who owns a given shift.  Reasoning:
-- Real-world cashier handover happens mid-shift (operator A opens, operator B closes); pinning shift state to a single operator_id would force artificial shift-splits at handover, breaking the legal "one fiscal day = one shift" alignment.
-- Operator identity per fiscal action is sufficient and is captured per-document on `fiscal_documents` (M3a-era convention) + per-audit event on `audit_log.evidence_json.operator_id` (force seams already require this — §4.5).
-- Force-seam `evidence_json.operator_id` field is **per-action operator**, NOT shift-owning operator — naming is intentional.
+> **Round 8 correction (2026-05-17, operator-driven)**: My Round 6 B-M5 finding inferred that real-world cashier handover happens mid-shift, justifying "no `opened_by_cashier_id` column". This inference was **WRONG**. Operator confirmed: "в смене может быть только 1 кассир" — within a single shift only one cashier is permitted by both legal regulation and operational practice. Handover requires shift close + new shift open. The state machine MUST model the opening cashier as a load-bearing invariant.
 
-**Implementation pin**: implementation MUST NOT add `shifts.opened_by_operator_id` / `shifts.closed_by_operator_id` columns.  If a future business case (e.g. tax compliance reporting per cashier) requires per-shift operator attribution, that becomes a separate denormalised reporting table built on top of audit_log queries, NOT a shift-state-machine extension.  Reviewer MUST refuse impl PRs that introduce shift-owning-operator columns into `shifts` / `node_state`.
+**1-cashier-per-shift hard invariant** (legal + operational):
+- Shift opened by cashier X → all receipts within that shift MUST be signed by cashier X.
+- Exception: SHIFT_CLOSE / Z_REPORT may be signed by cashier X OR by a senior cashier (per 5-ПРРО senior cashier role).
+- Senior cashier close is a legitimate seam, NOT a force seam; it produces a clean close with `senior_cashier_id` recorded in evidence.
+
+**Implementation MUST add**:
+- `shifts.opened_by_cashier_id` column (NOT NULL, foreign key to cashier registry).
+- Optional `shifts.closed_by_cashier_id` column (NULLABLE — equals `opened_by_cashier_id` for normal close; equals senior cashier ID for senior-cashier close).
+- Per-doc verification at sign-time: `fiscal_documents.signed_by_cashier_id == shift.opened_by_cashier_id` for all non-close docs; close docs may carry either ID.
+
+**Scenario it prevents**: Vasya opens shift, accumulates unsigned offline receipts, Vasya's key expires. Senior cashier comes, closes shift with own key (legitimate via senior seam), but CANNOT sign Vasya's accumulated offline receipts (1-cashier invariant). Vasya's receipts orphan → Manual recon (Round 8 Case 10b — though also prevented by 36h SHIFT_OPEN cert gate per §16.10).
+
+**Cross-ref**: §16.8 (1-cashier-per-shift invariant detail) + §16.9 (senior cashier close seam).
 
 ## 4. Allowed transitions (whitelist enumerated)
 
@@ -1023,7 +1032,258 @@ Operator picks at W10b open-time.  **`§Task 10` in the plan closes only when AL
 4. **Crash mid-W10-policy-decision behaviour** for ops attempted while shift in transient states.  Crash window analysis specific to W10 implementation; cross-reference at impl PR time.
 5. **`Closing → Opened` rollback audit shape** — what audit event surfaces a recoverable rejection that drove rollback?  Propose `SHIFT_ONLINE_CLOSE_RECOVERABLE_REJECT` (Warning), distinct from `SHIFT_CLOSE_DRAIN_REJECTED` (Critical) — operator triage benefit.
 
-6. **Orphan-doc RETURN compensation surface — when?** (Round 6 B-H1).  §5.7 L3 pins that the state machine deliberately does NOT model the orphan-RETURN path; operator-facing workflow is manual fiscal correction filing.  The state-machine pin is correct.  **Open**: when does the operator UI / dashboard get a surface that lists orphan docs per FN (so the operator knows which DPS corrections they owe)?  Recommend: future M3c "orphan compensation surface" task — out of M3b scope but pre-pilot blocker (pilot operator at 140-FN scale cannot manually grep audit_log for orphans across all FNs).  Operator to confirm timing — defer to M3c (post-pilot ramp-up) OR pull into M3b critical path (pre-pilot tooling)?  Default if no decision: defer to M3c.
+6. **Orphan-doc RETURN compensation surface — RESOLVED 2026-05-17 (Round 8)**: Deferred to **future M3c "orphan compensation surface"** task per operator's `feedback_manual_recon_catastrophe` 4-year empirical (zero observed Manual incidents in legacy systems). Under Round 8 operator-model alignment (DB vs log separation per §16.1 + ingress validation per §16.2 + 36h cert gate per §16.10), real-world orphan creation rate is so low that on-demand SQL JOIN query against `fiscal_documents` (per §16.16 Question 21 resolved as option C — pragmatic) is sufficient for pilot. Dashboard surface lands post-pilot when operator can quantify actual orphan-incident rate from production data.
+
+---
+
+## 16. Round 8 — operational reality alignment (2026-05-17)
+
+> **Round 8 context**: This section consolidates 24 spec changes derived from extended operator dialogue + decompiled-WebCheck reference research (`/mnt/d/PRRO_GATE-m3b-specs-shift/docs/webcheck_reverse/`). Operator's 4+ years of UA PRRO production practice + reference implementation behaviors corrected several inferences I made earlier. This section is **authoritative over earlier wording** in §§3-15 where they conflict; impl PR reviewer MUST cross-check §16 first.
+
+### 16.1 DB vs log separation — fundamental architectural pin (Round 8 Case 19)
+
+`fiscal_documents` table is the **ledger of issued receipts only**. Two row classes permitted:
+1. Successfully DPS-ack'd online docs (state `Ack`).
+2. Offline-issued docs in `OFFLINE_LOCAL_ACK` (customer holds physical receipt; drain pending).
+
+Failed docs (DPS rejection of any kind, invalid ingress payloads) MUST NOT be persisted in `fiscal_documents` — they go to `audit_log` only. Transport-class failures persist as `Sending` / `ErrorRetryable` ONLY for crash-recovery purposes (in-flight tracking; not a terminal state).
+
+**Why this matters**: real-world Manual recon triggers narrow dramatically. Most "what if DPS rejects" scenarios reduce to "log + return error to POS", not state-machine recovery. Operator's empirical zero-Manual-recon-rate over 4 years is explained by this architectural property (consistent across WebCheck legacy + Python adapter + Rust gateway design).
+
+**Reviewer enforcement**: refuse impl PRs that persist failed DPS responses in `fiscal_documents` beyond Sending/ErrorRetryable crash-recovery purposes.
+
+Cross-ref: `feedback_db_vs_log_separation` memory.
+
+### 16.2 Ingress validation as first line of defense (Round 8 Case 8)
+
+Ingress (REST / XML-RPC / Maria TCP) MUST validate incoming payloads BEFORE any DB write or pipeline invocation. Validation covers:
+- Structural (XML/JSON parse).
+- Business (sum totals reconcile, required fields present, FN registered, cashier valid).
+- State-machine (doc type permitted in current shift state per §5.6).
+
+If validation fails: error returned to caller (POS), `audit_log` entry written, `fiscal_documents` NOT touched. New audit event `INGRESS_PAYLOAD_REFUSED` (Info default; Warning if pattern suggests malicious or systematically-buggy POS).
+
+**§5.6 matrix amendment**: every cell MUST short-circuit invalid payloads BEFORE `check_shift_guard` evaluation.
+
+Cross-ref: `feedback_ingress_validation_first_line` memory.
+
+### 16.3 Recovery class taxonomy expansion (Round 8 Cases 2, 4, 6, 7, 9, 12)
+
+§6 recovery taxonomies (close-side §6.2 + open-side §6.4 + drain §6.3 + retry budgets §6.5) extended with new classes per operator's real-world workflows. These classes route the doc state machine without landing the shift in Manual recon:
+
+| Class | Trigger | Action | New audit events |
+|---|---|---|---|
+| `AutoOfflineFallback` | unknown/ambiguous DPS error (`DpsError::Decode`, `Internal`, `QueryNotSupported`, unexpected Server code, TLS handshake fail, non-XML HTTP body) | flip `node_state.mode` to `Offline`; continue accepting offline ingress; notify tech support | `UNKNOWN_DPS_ERROR_AUTO_OFFLINE` (Critical) + `TECH_SUPPORT_NOTIFIED` (Info) |
+| `TechSupportEscalation` | hard rejects (Server -5/-7/-8/-9/-10) that survive ingress validation (defensive — bug in ingress check or DPS regression mid-day) | hold shift in current state; surface to tech support for triage; tech support may invoke force seam OR fix gateway/config | `SHIFT_CLOSE_PENDING_TECH_SUPPORT` (Critical) |
+| `KeyRotationPending` | cashier's primary cert close to expiry detected AT SHIFT_OPEN time | refuse SHIFT_OPEN OR auto-swap to deferred key if registered | `SHIFT_OPEN_REFUSED_KEY_NEAR_EXPIRY` (Warning) + `KEY_AUTO_SWAPPED_TO_DEFERRED` (Info) |
+| `MacReseedRecovery` | MAC chain desync detected (DPS rejects with MAC mismatch on next doc) | gateway auto-fetches DPS's expected MAC anchor via WebCheck-style probe doc; re-seeds local chain | `MAC_CHAIN_RESEEDED_FROM_DPS` (Warning) + `MAC_RESEED_FAILED` (Critical → escalate) |
+| `TechSupportRepair` | boot-time mirror invariant breach OR shift-state-incompatible-with-linked-doc.state pair detected (per §5.3, §5.4) | open audited manual recovery seam `tech_support_repair_inconsistent_state_with_audit(shift_id, repair_evidence_json, tech_support_id)` permitting controlled DB fix outside Manual recon | `TECH_SUPPORT_REPAIR_INVOKED` (Critical) |
+
+**Important**: `EscalateManual` is now reserved STRICTLY for truly unrecoverable cases (per §16.7). Most prior `EscalateManual` paths in §6.2/§6.4 are superseded by the new classes above. Round 7 §6.5 retry-budget table updated correspondingly (`AutoOfflineFallback` replaces immediate-`EscalateManual` for unknown/Decode/Internal errors).
+
+Cross-ref: `feedback_auto_offline_unknown_errors` memory.
+
+### 16.4 Transport budget — UNBOUNDED (Round 8 Case 3 — operator-pinned)
+
+> **Reverses §6.5 (Round 7) `Transport(_)` row**: previous spec said "20 attempts / 30 min" minimum. Operator: "ЗАЧЕМ ОГРАНИЧЕНИЕ ждем пока не появится хоть год."
+
+`DpsError::Transport(_)` retry budget is **effectively unbounded** for shift-close and open paths. Gateway retries indefinitely (with exponential backoff capped at 60-120s + jitter ±10%) until DPS responds OR operator manually intervenes via force seam OR FN hits 36h offline cap (§16.5).
+
+No time/attempt ceiling on Transport-class. Transport class **NEVER** auto-lands in Manual recon. Only path to Manual from Transport: 36h offline cap exceeded (ingress refused — see §16.5) AND operator manually force-Manuals the shift via force seam (after declaring DPS won't return in business-acceptable timeframe).
+
+R7-H2 fleet-wide circuit breaker becomes **less critical** under unbounded Transport budget (the trigger condition — mass simultaneous EscalateManual transitions — no longer fires from Transport class). Fleet-wide alert single-row is still nice-to-have for operator visibility but not load-bearing for safety.
+
+### 16.5 36h offline ingress cap — refuse ingress, NOT Manual recon (Round 8 Case 15a)
+
+Per `LEGAL_INVARIANTS` 36h max offline session (INV-11 component): after `node_state.offline_session_started_at + 36h < now`, ingress for that FN MUST refuse all new docs (SHIFT_OPEN / SELL / RETURN / SERVICE_* / Z_REPORT). POS receives error; cashier stops serving customers; operator notices "all my points dead" pressure → calls tech support / IT.
+
+New audit event `OFFLINE_LIMIT_EXCEEDED_INGRESS_REFUSED` (Critical) + operator pager dispatch per §8.2.
+
+**Not a Manual recon trigger**: existing OFFLINE_LOCAL_ACK docs remain queryable; drain executes normally when DPS returns. Shift state itself unaffected — just ingress for that FN frozen.
+
+TLS-layer failures (handshake fail, cipher suite mismatch, DPS cert chain validation fail on our side) treated as `Transport(_)` class (§16.4) — auto-escalation via 36h cap (`feedback_webcheck_offline_sign_at_drain` cross-ref). No special TLS detection logic; natural escalation suffices.
+
+### 16.6 Infrastructure errors (Round 8 Case 16)
+
+Disk full / RAM exhaustion / DB lock timeout > threshold → ingress returns error to POS, NO DB write attempted (impossible), no shift state advance, `audit_log` entry best-effort (may also fail if disk full). Operationally unlikely (POS or OS infrastructure fails first per operator practice), but spec pins behavior for defensive completeness.
+
+### 16.7 Confirmed real Manual recon triggers (Round 8 — narrowed scope)
+
+After Round 8 operator-model alignment, the real Manual recon trigger surface narrows to:
+
+1. **FN deregistered during offline period with accumulated OFFLINE_LOCAL_ACK backlog** (Case 10 — operator-confirmed real scenario). Drain fails because FN no longer registered at DPS; orphan customer-facing receipts → Manual filing via DPS cabinet correction process.
+2. **Ambiguous wire timeout** for online SHIFT_OPEN or Z_REPORT (we sent the doc, never got response, can't determine if DPS accepted). Per §6.5 hold-pending-Tech-Support before EscalateManual. Edges 4 + 12 fire only for this ambiguous case, NOT for clean DPS rejections.
+3. **Force seam invocation** by operator declaring shift unsalvageable based on out-of-band context (e.g. confirmed week-long DPS maintenance during a stuck shift).
+
+Drain rejects from OFFLINE_LOCAL_ACK docs (per §6.3 universal EscalateManual + edges 6/14) are the **primary Manual recon trigger surface** — these have crossed the local-commit threshold (customer receipt outstanding) so the rollback semantics don't apply. Aligns with Case 10 root cause.
+
+**Removed from Manual recon trigger list** (now handled differently):
+- Most §3.5 enumerated failure modes (DPS server bug → AutoOfflineFallback; cert rotation → KeyRotationPending; canonical payload corruption → caught at ingress; tax law change → ingress validation refuses if regulation pre-updated, else AutoOfflineFallback if unknown response shape; cosmic ray → defensive only, never observed; adversarial DPS response → AutoOfflineFallback; hardware failure → TechSupportRepair seam).
+
+### 16.8 1-cashier-per-shift signing invariant (Round 8 Cases 17, 18 — REVERSES Round 6 B-M5)
+
+Hard invariant: all `fiscal_documents` rows with `shift_id == X` MUST have `signed_by_cashier_id == X.opened_by_cashier_id`. Exception: SHIFT_CLOSE / Z_REPORT may have `signed_by_cashier_id == opened_by_cashier_id` OR `senior_cashier_id` (per 5-ПРРО senior cashier role; see §16.9).
+
+Implementation MUST:
+- Add `shifts.opened_by_cashier_id` column (NOT NULL, FK to cashier registry) in migration 016.
+- Add optional `shifts.closed_by_cashier_id` column (NULLABLE — equals opener for normal close; senior for senior close).
+- Verify at sign-time (W9b drain stage_send + online stage_send): refuse if signer != cashier-of-record (except close docs).
+- New typed error: `SignerCashierMismatch { shift_id, expected_cashier_id, attempted_signer_id, doc_type }`.
+
+§3.4 fully reverses Round 6 B-M5 inference. See §3.4 amendment block.
+
+### 16.9 Senior cashier close seam (Round 8 Case 20)
+
+Explicit seam separate from force seams (§4.5):
+```rust
+pub async fn senior_cashier_close_shift_with_audit(
+    tx: &mut WriteTxConn<'_>,
+    shift_id: ShiftId,
+    senior_cashier_id: CashierId,
+    z_report_doc_id: DocumentId,
+    evidence_json: &str,
+) -> sqlx::Result<()>;
+```
+
+NOT a force seam (no force-to-Error / force-to-Manual semantics). Legitimate alternative close path where senior cashier closes another cashier's shift via 5-ПРРО role privilege. Emits `SHIFT_CLOSED_BY_SENIOR_CASHIER` (Info) audit with `{shift_id, opened_by_cashier_id, closed_by_cashier_id, evidence_json}`.
+
+Compatible with KeyRotationPending: if Vasya's key expires before close, senior cashier may close shift; Vasya's accumulated offline receipts handled per `KeyRotationPending` flow (Vasya gets new key → signs accumulated → drain). If Vasya truly unavailable AND no replacement key → unsigned offline backlog → Manual recon (Case 10b — prevented by §16.10).
+
+### 16.10 36h cert-expiry SHIFT_OPEN gate + deferred key swap (Round 8 Case 22 — WebCheck-validated)
+
+> **Verified in decompiled WebCheck** (`ClassFiscal.cs:57` `LimitCertificate = 2160` minutes; `Signature.cs:679` `DateDiff((DateInterval)8 [=Minute], now, cert.NotAfter)`). 36-hour threshold mathematically matches 36h offline cap (§16.5), preventing cert expiry mid-offline session by design.
+
+**New invariant**: SHIFT_OPEN MUST be refused if `cert.NotAfter - now < 2160 minutes (36 hours)` AND no deferred replacement cert is registered for this cashier. If deferred replacement cert exists → automatic swap (primary becomes deferred, deferred becomes primary) + warning + operator retries SHIFT_OPEN.
+
+**Schema additions** (migration 016):
+- New table `cashier_certs` (or extension of existing): `(cashier_id, primary_cert_id, deferred_cert_id, updated_at)`. `primary_cert_id` NOT NULL; `deferred_cert_id` NULLABLE.
+- OR equivalent denormalised columns on existing cashier table.
+
+**Config** (`ops/config.yaml`):
+- `cashier_cert_expiry_threshold_minutes` (default 2160 = 36 hours; operator MAY set lower for earlier warning; MUST NOT set higher than legal offline cap minus safety margin).
+
+**New audit events** (per §16.18):
+- `SHIFT_OPEN_REFUSED_KEY_NEAR_EXPIRY` (Warning) — refuse path, no deferred.
+- `KEY_AUTO_SWAPPED_TO_DEFERRED` (Info) — auto-swap path.
+
+**Mathematical synergy** (per `feedback_webcheck_36h_key_expiry_gate`): cert validates at SHIFT_OPEN with > 36h remaining + offline session max 36h → cert cannot expire mid-offline. Case 10b ("cashier-unavailable mid-offline with unsigned backlog") fully prevented by design.
+
+Cross-ref: `feedback_webcheck_36h_key_expiry_gate` memory.
+
+### 16.11 Offline-signing-at-drain pin (Round 8 Case 5 — WebCheck + Python both validated)
+
+§3.3 already implicit. Now authoritative pin: **OFFLINE_LOCAL_ACK docs are stored UNSIGNED at ingress time**. Signature applied only at DRAIN time when the document is being submitted to DPS through the W9a-widened stage_send path. MAC chain computed sequentially at drain (placeholder substituted with real previous-doc MAC from DPS's last ack response).
+
+Reference: WebCheck `SendingOfflineChecks.cs:65` calls `SF.SignatureFile()` ONLY at drain; placeholder `"mmmaaaccc"`. Python adapter `offline_sync.py:85-155` writes `DOCUMENT_SIGN_DEFERRED` audit at offline ingress, signs at drain. Both reference implementations agree.
+
+**Consequence**: mid-offline cert/key expiry does NOT corrupt offline-ack docs (because they're not yet signed); only blocks drain until new cert obtained.
+
+**Implementation contract**: `fiscal_documents.signed_xml_bytes` (or equivalent) MUST be NULL for `OFFLINE_LOCAL_ACK` state; populated only on transition to `Sending` during drain.
+
+Cross-ref: `feedback_webcheck_offline_sign_at_drain` memory.
+
+### 16.12 DPS-DB shift state discrepancy check at boot (Round 8 Case 13)
+
+Extend §5.3 boot-time mirror invariant check. At `App::boot` reconciliation per-FN walk, **also query DPS** for `lastShiftState` (or equivalent — channel-specific endpoint) and compare with local `shifts.state`:
+
+- Local `Closed` + DPS reports `Opened` → discrepancy. Action: invoke `senior_cashier_close_shift_with_audit` (§16.9) OR `tech_support_repair_inconsistent_state_with_audit` (§16.3 TechSupportRepair) to reconcile. Audit `DPS_LOCAL_SHIFT_STATE_DRIFT` (Critical) + tech support alert.
+- Local `Opened` + DPS reports `Closed` → also discrepancy; same recovery path.
+
+UI consideration (out-of-scope for state machine, pinned for cross-link): POS UI MUST provide an **emergency shift close** button accessible to senior cashier — used when operator detects discrepancy out-of-band (e.g. tax inspector query reveals open shift in DPS that operator already closed locally).
+
+### 16.13 Single-cashier-per-FN operational note (Round 8 Case 14)
+
+Multi-POS deployments on a single FN are operationally enforced to single-cashier discipline per operator's `feedback_manual_recon_catastrophe`-era practice: "не может они всеравно работают из под одного кассира" — physical POS terminals on shared FN serve the same cashier session. Race conditions between cashiers on same FN cannot occur by operational convention, in addition to INV-01 gateway-side single-writer enforcement.
+
+Defence in depth — both layers must hold for production correctness. Spec does not enforce operational layer (operator's POS configuration responsibility), but acknowledges and relies on it.
+
+### 16.14 Count-mismatch invariant note (Round 8 Case 11)
+
+Cashier count vs DPS count mismatch on Z_REPORT is **impossible by design**:
+- If `node_state.mode == Online` → all SELL/RETURN/SERVICE_* receipts already drained to DPS (drain completion is precondition for online ops per §3.3) → counts match by construction.
+- If offline → ingress refuses Z_REPORT until drain completes OR operator goes offline-Z_REPORT per Pattern C (which DPS will ack with offline-context understanding).
+
+§3.3 online-ops-resume rule + edge 5 OpenedLocalPendingDrain → Opened (only after full drain) jointly prevent the mismatch scenario.
+
+### 16.15 Server -11 (168h) practice note (Round 8 Case 1)
+
+Per operator's 4-year empirical: DPS does **not** in practice return `Server -11` for cumulative 168h offline limit. The limit exists in regulations but is not programmatically enforced by the DPS endpoint operator has interacted with. §6.5 row for -11 stays as defensive `EscalateManual = 0 attempts` (immediate, no retry), but spec acknowledges low practical incidence.
+
+PR #62 24h-trap mitigation narrative remains valid (the OPERATOR-side workflow of closing-of-day with offline Z_REPORT is what avoids the regulatory issue, regardless of whether DPS programmatically blocks at 168h). Spec design unchanged; just documenting empirical rarity.
+
+### 16.16 Doc-level Manual recon — RESOLVED as option C pragmatic (Round 8 Question 21)
+
+No new `RequiresManualReconciliation` doc state added to `fiscal_documents.state` enum. Orphan offline docs (resulting from drain rejects landing shift in Manual) detected via SQL JOIN query:
+
+```sql
+SELECT *
+FROM fiscal_documents fd
+JOIN shifts s ON fd.shift_id = s.shift_id
+WHERE fd.state = 'OfflineLocalAck'
+  AND s.state IN ('Closed', 'RequiresManualReconciliation')
+```
+
+`audit_log` per-shift Manual events carry `orphan_doc_count` in `evidence_json` for forensic-trail completeness without doc-state schema growth.
+
+Rationale: doc-state machine remains simple (terminal states `Ack` + `OfflineLocalAck` for persisted docs; failures don't persist per §16.1). Orphan management is reporting/dashboard layer concern, not state-machine concern. Pilot operator can query orphans on-demand; M3c "orphan compensation surface" task (per §15 Open Question #6 RESOLVED) provides dashboard tooling when needed.
+
+### 16.17 Schema additions for migration 016 (consolidated)
+
+Beyond the existing 9-state CHECK extension (§9.2), migration 016 MUST also add:
+
+1. `shifts.opened_by_cashier_id` (NOT NULL, FK to cashier registry) — §16.8.
+2. `shifts.closed_by_cashier_id` (NULLABLE, FK to cashier registry) — §16.9 senior cashier close support.
+3. `cashier_certs.deferred_cert_id` (NULLABLE, FK to cert) — §16.10 deferred key swap mechanism. If `cashier_certs` table doesn't exist yet, migration 016 creates it (or amends `operator_certs` if that's the right existing table).
+
+Standard W4 NULL-FK / holding-column dance applies for any inbound FK additions on populated DBs (pre-pilot has zero rows, but dance MUST work). Trigger DDL preserved byte-identically per §9.2 contract.
+
+### 16.18 Audit vocabulary additions (consolidated from §16.3-16.12)
+
+Additions to §8 audit event vocabulary:
+
+| Event type | Severity | Section |
+|---|---|---|
+| `INGRESS_PAYLOAD_REFUSED` | Info (Warning if pattern-matching malicious/buggy POS) | §16.2 |
+| `UNKNOWN_DPS_ERROR_AUTO_OFFLINE` | **Critical** | §16.3 AutoOfflineFallback |
+| `TECH_SUPPORT_NOTIFIED` | Info | §16.3 AutoOfflineFallback |
+| `SHIFT_CLOSE_PENDING_TECH_SUPPORT` | **Critical** | §16.3 TechSupportEscalation |
+| `SHIFT_OPEN_REFUSED_KEY_NEAR_EXPIRY` | Warning | §16.10 KeyRotationPending |
+| `KEY_AUTO_SWAPPED_TO_DEFERRED` | Info | §16.10 KeyRotationPending |
+| `MAC_CHAIN_RESEEDED_FROM_DPS` | Warning | §16.3 MacReseedRecovery |
+| `MAC_RESEED_FAILED` | **Critical** | §16.3 MacReseedRecovery escalation |
+| `TECH_SUPPORT_REPAIR_INVOKED` | **Critical** | §16.3 TechSupportRepair seam |
+| `SHIFT_CLOSED_BY_SENIOR_CASHIER` | Info | §16.9 senior cashier close |
+| `OFFLINE_LIMIT_EXCEEDED_INGRESS_REFUSED` | **Critical** | §16.5 36h ingress cap |
+| `DPS_LOCAL_SHIFT_STATE_DRIFT` | **Critical** | §16.12 boot DPS-DB check |
+| `SHIFT_CASHIER_UNAVAILABLE_OFFLINE_ORPHANS` | **Critical** | Case 10b — rare residual after §16.10 prevention |
+| `RETURN_REFERENCES_ORPHAN_SALE` | **Critical** | Round 6 B-H1 (cross-ref, no change) |
+
+All Critical events trigger §8.2 out-of-band operator pager dispatch + §8.1 forensic snapshot capture per Round 7 contract.
+
+### 16.19 Round 7 reconciliation (which Round 7 findings remain vs superseded)
+
+Round 7 self-review produced 4 HIGH + 7 MED + 13 LOW findings. Round 8 operator-model alignment resolves several:
+
+- **R7-H1 (retry persistence)**: Resolved by §16.4 — Transport budget unbounded means attempt-count persistence is no longer load-bearing for safety (infinite retry without crash means no Manual landing from Transport class). Optional `recovery_attempt_count` column for forensic timeline only; not required for crash-recovery safety.
+- **R7-H2 (fleet-wide circuit breaker)**: Significantly downgraded by §16.4 — primary trigger condition (mass simultaneous Transport-class EscalateManual) eliminated by unbounded budget. Single-row `FLEET_DPS_OUTAGE_DETECTED` Info audit nice-to-have for operator visibility; not load-bearing for safety. Demoted from HIGH to LOW.
+- **R7-H3 (loss-of-loss recovery)**: Still HIGH. Boot-time un-acked-alert queue replay required. Tracked for impl PR.
+- **R7-H4 (Server -6 inconsistency)**: Closed by §16.3 — added Server -6 row to §6.5 as 0 attempts → EscalateManual per existing §6.2 wording.
+- R7-M1 through R7-M7 + R7-L1 through R7-L13: most remain as polish/operational improvements; tracked for impl PR per §11. None block Round 8 spec freeze.
+
+### 16.20 Summary of Round 8 spec impact
+
+- 5 new memory files (`feedback_db_vs_log_separation`, `feedback_ingress_validation_first_line`, `feedback_auto_offline_unknown_errors`, `feedback_webcheck_offline_sign_at_drain`, `feedback_webcheck_36h_key_expiry_gate`).
+- 5 new recovery classes (`AutoOfflineFallback`, `TechSupportEscalation`, `KeyRotationPending`, `MacReseedRecovery`, `TechSupportRepair`).
+- 1 new explicit seam (`senior_cashier_close_shift_with_audit`).
+- 14 new audit events (per §16.18).
+- 3 new schema additions for migration 016 (per §16.17).
+- 1 new hard invariant (1-cashier-per-shift signing per §16.8).
+- 1 reversed Round 6 finding (B-M5 — operator identity MUST be modeled).
+- Manual recon trigger surface narrowed from theoretical full-enumeration (10 cases in §3.5) to 3 real-world cases (per §16.7).
+- Doc-level Manual recon question RESOLVED as pragmatic JOIN (no schema growth).
+- §15 Open Question #6 RESOLVED (defer M3c orphan-compensation-surface).
+
+This spec is now aligned with operator's 4-year UA PRRO production empirics + decompiled WebCheck reference behaviors. Manual recon retains its "ЧП из ЧП" gravity (Round 7 §3.5) — and the design now makes that gravity match observed reality (rare-by-construction).
 
 ---
 
