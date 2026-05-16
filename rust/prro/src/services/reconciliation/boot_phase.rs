@@ -173,6 +173,22 @@ pub struct DispatchHistogram {
     /// `stage_send::run` chain.  Increments on successful dispatch
     /// invocation regardless of the doc's final state.
     pub prepared_dispatched: usize,
+    /// M3b W7b — counter for docs that the post-sign dispatcher
+    /// routed to `stage_offline_ack::run` and that resulted in an
+    /// `Applied` outcome (offline_local_ack emitted, code consumed).
+    /// Increments for both PREPARED→dispatched (via
+    /// `dispatch_prepared_via_chain`) and SIGNED→dispatched (boot
+    /// recovery of a doc resumed in SIGNED with current mode
+    /// Offline/GoingOffline) outcomes.
+    pub offline_local_ack_emitted: usize,
+    /// M3b W7b — counter for docs that the post-sign dispatcher
+    /// REFUSED (mode in {Blocked, StopMode, CryptoDegraded,
+    /// GoingOnline}) OR that stage_offline_ack itself refused at
+    /// its internal validation layer (Refused outcome).  Either way:
+    /// doc state unchanged; audit row emitted.  `dispatch_post_sign`
+    /// emits `WRITE_PATH_DISPATCH_REFUSED`; stage_offline_ack emits
+    /// `OFFLINE_ACK_REFUSED`.
+    pub write_path_dispatch_refused: usize,
     /// M3a hardening pass 1 — ER docs whose durable `retry_class`
     /// (per `transport_trace.retry_class`) indicates the recovery
     /// branch is NOT auto-retryable.  Doc transitioned `ErrorRetryable
@@ -245,6 +261,8 @@ impl DispatchHistogram {
             + self.sent_not_found_to_error_retryable
             + self.sent_probe_failure_deferred
             + self.prepared_dispatched
+            + self.offline_local_ack_emitted
+            + self.write_path_dispatch_refused
             + self.error_retryable_escalated_to_manual
             + self.error_retryable_probe_deferred
             + self.error_retryable_indeterminate_deferred
@@ -270,6 +288,8 @@ impl DispatchHistogram {
         self.sent_not_found_to_error_retryable += other.sent_not_found_to_error_retryable;
         self.sent_probe_failure_deferred += other.sent_probe_failure_deferred;
         self.prepared_dispatched += other.prepared_dispatched;
+        self.offline_local_ack_emitted += other.offline_local_ack_emitted;
+        self.write_path_dispatch_refused += other.write_path_dispatch_refused;
         self.error_retryable_escalated_to_manual += other.error_retryable_escalated_to_manual;
         self.error_retryable_probe_deferred += other.error_retryable_probe_deferred;
         self.error_retryable_indeterminate_deferred += other.error_retryable_indeterminate_deferred;
@@ -1009,8 +1029,14 @@ pub enum BranchOutcome {
         histogram: DispatchHistogram,
         sub_branch: SubBranch,
     },
-    /// (d) Mode ∈ {Offline, GoingOffline, GoingOnline} → refuse
-    /// boot; caller surfaces `BootError::OfflineModeRefusal`.
+    /// (d) M3b W7b update (2026-05-16): mode == `GoingOnline` →
+    /// refuse boot; caller surfaces `BootError::OfflineModeRefusal`.
+    /// Pre-W7b this also covered `Offline` / `GoingOffline`, but
+    /// those modes now fall through to per-doc dispatch via W7b's
+    /// `dispatch_post_sign` (see `dispatch_pending_doc::DocState::Signed`
+    /// and `dispatch_prepared_via_chain`).  `GoingOnline` stays
+    /// refused because that's W9 backlog-drain territory and
+    /// boot reconciliation defers to W9 for those FNs.
     OfflineRefusal {
         observed_mode: NodeMode,
     },
@@ -1053,26 +1079,42 @@ impl BranchOutcome {
 /// Returns the [`BranchOutcome`] so the caller can aggregate without
 /// re-reading the DB.
 ///
-/// **Branch (d) — OFFLINE refusal.**  Returns
-/// `BranchOutcome::OfflineRefusal { observed_mode }` rather than
-/// erroring directly; the caller (`App::reconcile_pending`) maps this
-/// outcome to `BootError::OfflineModeRefusal` and fails-fast on the
-/// FIRST OFFLINE FN encountered (per freeze §13.3).
+/// **Branch (d) — GoingOnline refusal** (M3b W7b update,
+/// 2026-05-16).  Returns `BranchOutcome::OfflineRefusal {
+/// observed_mode }` rather than erroring directly; the caller
+/// (`App::reconcile_pending`) maps this outcome to
+/// `BootError::OfflineModeRefusal` and fails-fast on the first
+/// GoingOnline FN encountered.  Pre-W7b this also covered Offline
+/// / GoingOffline (per freeze §13.3); post-W7b those modes fall
+/// through to the per-doc dispatch loop where the W7b post-sign
+/// dispatcher (`services::write_path::dispatch::dispatch_post_sign`)
+/// routes SIGNED / PREPARED docs to `stage_offline_ack::run` for
+/// local fiscalisation.  Only `GoingOnline` (W9 backlog-drain
+/// territory) still aborts boot at this branch — boot reconciliation
+/// defers to W9's drain loop for those FNs.
 ///
 /// **Branch (c)/(e1) — per-doc dispatch scope.**  W9.3 ships the
 /// dispatch shell that loops `list_pending_for_fn` in
 /// `(lnd, created_at, document_id)` order.  Per-DocState routing:
 ///
-///   | DocState        | W9.3 action                            |
+///   | DocState        | action (ctx-free / ctx-wired, post-W7b)|
 ///   | --------------- | -------------------------------------- |
 ///   | `Sending`       | `resume_sending_to_error_retryable`    |
 ///   | `Kvt1`          | `passive_hold_kvt1`                    |
 ///   | `Encrypted`     | transition → ErrorRetryable + audit    |
 ///   | `Kvt2`          | `stage_finalize::run` (W8; no ctx)     |
-///   | `Prepared`      | DEFERRED audit (W11 wires SigningCtx)  |
-///   | `Signed`        | DEFERRED audit (W11 wires DpsChannel)  |
-///   | `Sent`          | DEFERRED audit (W11 wires DpsChannel)  |
-///   | `ErrorRetryable`| DEFERRED audit (W11 wires DpsChannel)  |
+///   | `Prepared`      | deps=None: DEFERRED audit; deps=Some:  |
+///   |                 | `dispatch_prepared_via_chain` →        |
+///   |                 | stage_sign → **W7b post-sign           |
+///   |                 | dispatcher** → stage_send OR           |
+///   |                 | stage_offline_ack (per node mode)      |
+///   | `Signed`        | deps=None: DEFERRED audit; deps=Some:  |
+///   |                 | **W7b post-sign dispatcher** routes by |
+///   |                 | node mode (Online → stage_send;        |
+///   |                 | Offline/GoingOffline → stage_offline_ack;|
+///   |                 | non-routable modes → typed refusal)    |
+///   | `Sent`          | DEFERRED audit / `dispatch_sent_via_probe` |
+///   | `ErrorRetryable`| DEFERRED audit / `dispatch_error_retryable_by_class` |
 ///
 /// Ctx-needy DocStates (Prepared/Signed/Sent/ErrorRetryable) emit
 /// `BOOT_DISPATCH_DEFERRED` WARN per occurrence so operators see the
@@ -1123,29 +1165,43 @@ pub async fn run_boot_reconciliation(
         return Ok(BranchOutcome::Bootstrapped);
     };
 
-    // ── Branch (d) — OFFLINE-class modes ─────────────────────────
-    match row.mode {
-        NodeMode::Offline | NodeMode::GoingOffline | NodeMode::GoingOnline => {
-            let payload = serde_json::json!({
-                "fiscal_number": fiscal_number,
-                "observed_mode": row.mode.as_str(),
-                "message": "FN in OFFLINE mode — start with --recover-offline M3b CLI",
-            });
-            audit_log::append(
-                pool,
-                "node_state",
-                fiscal_number,
-                "NODE_STATE_BOOT_OFFLINE_REFUSAL",
-                crate::db::models::enums::Severity::Error,
-                None,
-                Some(&payload.to_string()),
-            )
-            .await?;
-            return Ok(BranchOutcome::OfflineRefusal {
-                observed_mode: row.mode,
-            });
-        }
-        _ => {}
+    // ── Branch (d) — GoingOnline refused at boot ─────────────────
+    //
+    // M3b W7b update (operator PR #57 Round 1 HIGH, 2026-05-16):
+    // pre-W7 this branch refused ALL three offline-class modes
+    // (Offline / GoingOffline / GoingOnline) because boot
+    // reconciliation had no W7-aware path.  Post-W7, boot CAN
+    // process docs in Offline / GoingOffline modes — per-doc
+    // dispatch routes them through `dispatch_post_sign` →
+    // `stage_offline_ack::run` (see `dispatch_pending_doc` SIGNED
+    // arm and `dispatch_prepared_via_chain` PREPARED arm).
+    //
+    // `GoingOnline` stays refused at THIS branch — it's W9
+    // backlog-drain mode and boot reconciliation defers to W9's
+    // drain loop (out of W7b scope per memory
+    // `m3b-w7-review-criteria` criterion 6 + `m3b-w7b-review-criteria`
+    // criterion 4).  Per-FN single refusal audit here (vs
+    // per-doc spam if we let dispatch_post_sign handle it for
+    // every pending doc).
+    if matches!(row.mode, NodeMode::GoingOnline) {
+        let payload = serde_json::json!({
+            "fiscal_number": fiscal_number,
+            "observed_mode": row.mode.as_str(),
+            "message": "FN in GOING_ONLINE mode — W9 backlog drain owns this FN's reconciliation",
+        });
+        audit_log::append(
+            pool,
+            "node_state",
+            fiscal_number,
+            "NODE_STATE_BOOT_OFFLINE_REFUSAL",
+            crate::db::models::enums::Severity::Error,
+            None,
+            Some(&payload.to_string()),
+        )
+        .await?;
+        return Ok(BranchOutcome::OfflineRefusal {
+            observed_mode: row.mode,
+        });
     }
 
     // ── Branch (f) — Blocked / StopMode / CryptoDegraded ─────────
@@ -1195,12 +1251,29 @@ pub async fn run_boot_reconciliation(
         return Ok(outcome);
     }
 
-    // From here: row.mode == NodeMode::Online.
+    // From here: row.mode is one of {Online, Offline, GoingOffline}.
+    // (M3b W7b: branches d + f already returned for refused modes;
+    // Offline / GoingOffline fall through to per-doc dispatch via
+    // W7b's `dispatch_post_sign`.)
     // Decision: pending docs?  shift_state ∈ {Opening, Closing}?
     let pending = fiscal_documents::list_pending_for_fn(pool, fiscal_number).await?;
 
     // ── Branch (e2) — mid-transition shift orphan (no pending) ───
-    if matches!(row.shift_state, ShiftState::Opening | ShiftState::Closing) && pending.is_empty() {
+    //
+    // M3b W7b operator PR #57 Round 2 HIGH fix (2026-05-16):
+    // gated on `row.mode == NodeMode::Online`.  Branch (e2)
+    // performs invasive shift recovery (orphan shifts → ERROR
+    // + node_state.shift_state → CLOSED) which is an
+    // online-mode invariant.  For Offline / GoingOffline modes
+    // shift lifecycle is managed by the W4-W6 offline session
+    // machinery, NOT by boot reconciliation; (e2) must NOT
+    // touch shift state for those modes.  Offline / GoingOffline
+    // + no pending falls through to branch (b) below
+    // (idempotent no-op).
+    if row.mode == NodeMode::Online
+        && matches!(row.shift_state, ShiftState::Opening | ShiftState::Closing)
+        && pending.is_empty()
+    {
         // LOW 5 fix: SELECT shifts + per-shift UPDATE + node_state
         // reset ALL inside a single `with_immediate` envelope.  The
         // BEGIN IMMEDIATE serialisation removes the read-then-update
@@ -1322,6 +1395,11 @@ pub async fn run_boot_reconciliation(
             "sent_not_found_to_error_retryable": histogram.sent_not_found_to_error_retryable,
             "sent_probe_failure_deferred": histogram.sent_probe_failure_deferred,
             "prepared_dispatched": histogram.prepared_dispatched,
+            // M3b W7b — post-sign dispatcher outcomes (operator PR
+            // #57 Round 1 MED-3 fix, 2026-05-16): bucket sums in
+            // `by_outcome` must reconcile to `pending_visited`.
+            "offline_local_ack_emitted": histogram.offline_local_ack_emitted,
+            "write_path_dispatch_refused": histogram.write_path_dispatch_refused,
             "error_retryable_escalated_to_manual": histogram.error_retryable_escalated_to_manual,
             "error_retryable_probe_deferred": histogram.error_retryable_probe_deferred,
             "error_retryable_indeterminate_deferred": histogram.error_retryable_indeterminate_deferred,
@@ -2197,22 +2275,56 @@ async fn dispatch_prepared_via_chain(
         return Ok(());
     }
 
-    // (3) stage_send::run drives SIGNED → SENT (or routed target) via
-    // Pattern B.  Doc-id only — stage_send re-reads from the pool;
-    // the runtime composition supplies `Some(signing_ctx)` for the
-    // optional MAC-recovery loop body.  On Err the doc stays in
-    // SIGNED — next boot tick re-dispatches via the PR-2a SIGNED arm.
-    match stage_send::run(pool, deps.dps, doc_id, Some(deps.signing_ctx)).await {
-        Ok(_) => histogram.prepared_dispatched += 1,
-        Err(send_err) => {
-            emit_dispatch_error(
-                pool,
-                doc_id,
-                "c-prepared-send",
-                &anyhow::Error::new(send_err),
-                histogram,
-            )
-            .await?;
+    // (3) M3b W7b post-sign dispatcher: route based on current
+    // node mode.  Online → stage_send::run (unchanged M3a happy
+    // path).  Offline / GoingOffline → stage_offline_ack::run;
+    // pipeline TERMINATES here for this doc — no stage_send call.
+    // 4 non-routable modes (Blocked / StopMode / CryptoDegraded /
+    // GoingOnline) → typed dispatcher refusal + audit; doc stays
+    // in SIGNED.  See `services::write_path::dispatch`.
+    use crate::services::write_path::dispatch::{self, PostSignRoute};
+    use crate::services::write_path::stage_offline_ack::OfflineAckOutcome;
+    match dispatch::dispatch_post_sign(pool, doc_id, &doc.fiscal_number).await {
+        Ok(PostSignRoute::Online { .. }) => {
+            // Existing M3a online ladder.  stage_send::run drives
+            // SIGNED → SENT (or routed target) via Pattern B.
+            match stage_send::run(pool, deps.dps, doc_id, Some(deps.signing_ctx)).await {
+                Ok(_) => histogram.prepared_dispatched += 1,
+                Err(send_err) => {
+                    emit_dispatch_error(
+                        pool,
+                        doc_id,
+                        "c-prepared-send",
+                        &anyhow::Error::new(send_err),
+                        histogram,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(PostSignRoute::Offline { outcome, .. }) => {
+            // Pipeline terminates here — no stage_send / stage_finalize.
+            match outcome {
+                OfflineAckOutcome::Applied { .. } => {
+                    histogram.offline_local_ack_emitted += 1;
+                }
+                OfflineAckOutcome::Refused(_) => {
+                    // stage_offline_ack already emitted
+                    // OFFLINE_ACK_REFUSED audit; histogram bumps
+                    // the same bucket as dispatcher-level refusal
+                    // (both represent "doc not advanced").
+                    histogram.write_path_dispatch_refused += 1;
+                }
+            }
+        }
+        Ok(PostSignRoute::Refused(_)) => {
+            // Dispatcher-level refusal (Blocked / StopMode /
+            // CryptoDegraded / GoingOnline).  WRITE_PATH_DISPATCH_REFUSED
+            // audit already emitted by dispatch_post_sign.
+            histogram.write_path_dispatch_refused += 1;
+        }
+        Err(e) => {
+            emit_dispatch_error(pool, doc_id, "c-prepared-dispatch", &e, histogram).await?;
         }
     }
     Ok(())
@@ -2338,13 +2450,48 @@ async fn dispatch_pending_doc(
         // W9 BOOT_DISPATCH_DEFERRED behaviour for ALL four states —
         // doc stays in source state, deps_available=false in audit.
         DocState::Signed => match deps {
-            Some(d) => match stage_send::run(pool, d.dps, doc_id, Some(d.signing_ctx)).await {
-                Ok(_) => histogram.signed_dispatched += 1,
-                Err(e) => {
-                    emit_dispatch_error(pool, doc_id, "c-signed", &anyhow::Error::new(e), histogram)
-                        .await?
+            // M3b W7b: a doc resumed in SIGNED at boot may have
+            // been crashed-recovered with a node mode that has
+            // since flipped to Offline / GoingOffline.  Route
+            // through the post-sign dispatcher so the offline
+            // branch is reachable here too (criterion 1: wiring
+            // happens after any path that produces a SIGNED doc).
+            Some(d) => {
+                use crate::services::write_path::dispatch::{self, PostSignRoute};
+                use crate::services::write_path::stage_offline_ack::OfflineAckOutcome;
+                match dispatch::dispatch_post_sign(pool, doc_id, &doc.fiscal_number).await {
+                    Ok(PostSignRoute::Online { .. }) => {
+                        match stage_send::run(pool, d.dps, doc_id, Some(d.signing_ctx)).await {
+                            Ok(_) => histogram.signed_dispatched += 1,
+                            Err(e) => {
+                                emit_dispatch_error(
+                                    pool,
+                                    doc_id,
+                                    "c-signed",
+                                    &anyhow::Error::new(e),
+                                    histogram,
+                                )
+                                .await?
+                            }
+                        }
+                    }
+                    Ok(PostSignRoute::Offline { outcome, .. }) => match outcome {
+                        OfflineAckOutcome::Applied { .. } => {
+                            histogram.offline_local_ack_emitted += 1;
+                        }
+                        OfflineAckOutcome::Refused(_) => {
+                            histogram.write_path_dispatch_refused += 1;
+                        }
+                    },
+                    Ok(PostSignRoute::Refused(_)) => {
+                        histogram.write_path_dispatch_refused += 1;
+                    }
+                    Err(e) => {
+                        emit_dispatch_error(pool, doc_id, "c-signed-dispatch", &e, histogram)
+                            .await?;
+                    }
                 }
-            },
+            }
             None => {
                 emit_ctx_needy_deferred(pool, doc_id, doc.state, deps_available).await?;
                 histogram.signed_deferred += 1;

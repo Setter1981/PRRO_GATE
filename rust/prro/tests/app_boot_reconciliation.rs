@@ -12,8 +12,11 @@
 //!   #1   (a) FN absent → bootstrap.
 //!   #2   (b) FN+ONLINE+no pending → idempotent no-op.
 //!   #3   (c) per-DocState dispatch matrix (subset for W9.3).
-//!   #4   (d) OFFLINE refusal — parametrised over Offline /
-//!        GoingOffline / GoingOnline (freeze §10.1 #4-bis).
+//!   #4   (d) GOING_ONLINE refusal — M3b W7b update (2026-05-16):
+//!        only GoingOnline still refuses at branch (d); Offline /
+//!        GoingOffline fall through to per-doc dispatch via the
+//!        W7b post-sign dispatcher
+//!        (`services::write_path::dispatch::dispatch_post_sign`).
 //!   #5   (e1)→(c) cascade: PRRO_GATE-ah8 verbatim — shift_state=
 //!        Opened + pending doc → no `upsert_initial`.
 //!   #6   (e2) orphan shift no-doc → shift→Error + node_state.
@@ -259,29 +262,106 @@ async fn branch_c_ctx_needy_states_emit_deferred_audit() {
     assert_eq!(audit_count(&pool, "BOOT_DISPATCH_DEFERRED").await, 4);
 }
 
-// ─── #4 — branch (d) OFFLINE-class refusal ────────────────────────────
+// ─── #4 — branch (d) refuses ONLY GoingOnline (M3b W7b update) ────────
+//
+// Post-W7b semantics (operator PR #57 Round 1 HIGH, 2026-05-16):
+// branch (d) refuses ONLY `GoingOnline` (W9 backlog-drain mode).
+// Offline / GoingOffline modes now DROP THROUGH to per-doc dispatch,
+// which routes via `dispatch_post_sign` → `stage_offline_ack::run`.
+// Pre-W7b this branch refused all three modes; the W7-aware
+// behaviour makes boot reconciliation usable in offline mode.
 
 #[tokio::test]
-async fn branch_d_refuses_boot_on_offline_mode() {
-    for mode in &["OFFLINE", "GOING_OFFLINE", "GOING_ONLINE"] {
+async fn branch_d_refuses_boot_on_going_online_mode() {
+    let (_dir, pool) = fresh_pool().await;
+    seed_fn_config(&pool, "1234567890").await;
+    seed_node_state(&pool, "1234567890", "GOING_ONLINE", "CLOSED", 1).await;
+    let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
+        .await
+        .unwrap();
+    match outcome {
+        BranchOutcome::OfflineRefusal { observed_mode } => {
+            assert_eq!(observed_mode.as_str(), "GOING_ONLINE");
+        }
+        other => panic!("expected OfflineRefusal for GOING_ONLINE, got {other:?}"),
+    }
+    let row = read_node_state(&pool, "1234567890").await;
+    assert_eq!(row.unwrap().0, "GOING_ONLINE", "row UNCHANGED post-refusal");
+    assert!(
+        audit_count(&pool, "NODE_STATE_BOOT_OFFLINE_REFUSAL").await >= 1,
+        "audit emitted before refusal return"
+    );
+}
+
+#[tokio::test]
+async fn boot_in_offline_mode_reaches_per_doc_dispatch_not_branch_d_refusal() {
+    // M3b W7b boot-level integration (operator PR #57 Round 1
+    // MED-1 partial, 2026-05-16): with FN in OFFLINE mode +
+    // pending SIGNED doc, boot reconciliation MUST reach
+    // per-doc dispatch (not short-circuit at branch (d)).
+    //
+    // This test uses `deps=None` — SIGNED docs are DEFERRED
+    // through the deps-needy path (BOOT_DISPATCH_DEFERRED audit
+    // + signed_deferred histogram bump), NOT routed to
+    // stage_offline_ack.  The HIGH-fix property tested here is:
+    // boot does NOT short-circuit at branch (d) when mode is
+    // OFFLINE; it proceeds to the per-doc loop where W7b's
+    // dispatcher CAN run when deps=Some.
+    //
+    // The full end-to-end "deps=Some + offline doc reaches
+    // stage_offline_ack via boot" test requires substrate mocks
+    // (SigningContext + DpsChannel) — deferred to a follow-up
+    // PR (see `tests/write_path_dispatcher_post_sign.rs` for the
+    // dispatcher-level proof).
+    let (_dir, pool) = fresh_pool().await;
+    seed_fn_config(&pool, "1234567890").await;
+    seed_node_state(&pool, "1234567890", "OFFLINE", "OPENED", 1).await;
+    // Seed a SIGNED doc — would be a candidate for offline
+    // dispatch if deps were present.
+    let _doc = seed_doc_in_state(&pool, "1234567890", 0x77, "SIGNED").await;
+    let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
+        .await
+        .unwrap();
+    // Critical assertion: NOT OfflineRefusal.  This proves the
+    // HIGH-fix: branch (d) no longer cuts OFFLINE mode.
+    assert!(
+        !matches!(outcome, BranchOutcome::OfflineRefusal { .. }),
+        "post-W7b: OFFLINE mode must NOT short-circuit at branch (d); got: {outcome:?}"
+    );
+    // Boot reached the reconciled-FN audit (NOT the offline-
+    // refusal audit).
+    assert!(
+        audit_count(&pool, "NODE_STATE_BOOT_RECONCILED").await >= 1,
+        "boot reached the reconciled-FN audit path (per-doc loop entered)"
+    );
+    // No offline-refusal audit for this FN — branch (d) skipped.
+    assert_eq!(
+        audit_count(&pool, "NODE_STATE_BOOT_OFFLINE_REFUSAL").await,
+        0,
+        "branch (d) refusal audit MUST NOT fire on OFFLINE mode post-W7b"
+    );
+}
+
+#[tokio::test]
+async fn branch_d_no_longer_refuses_offline_or_going_offline() {
+    // Post-W7b: these modes drop through to per-doc dispatch.
+    // With no pending docs in this test, the cascade reaches the
+    // pending-docs loop, finds zero docs, and emits
+    // NODE_STATE_BOOT_RECONCILED with empty histogram — NOT
+    // OfflineRefusal.
+    for mode in &["OFFLINE", "GOING_OFFLINE"] {
         let (_dir, pool) = fresh_pool().await;
         seed_fn_config(&pool, "1234567890").await;
+        // For Offline mode the shift must NOT be OPENED for the
+        // (e2)/(b) cascade to be benign; use CLOSED.
         seed_node_state(&pool, "1234567890", mode, "CLOSED", 1).await;
         let outcome =
             boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
                 .await
                 .unwrap();
-        match outcome {
-            BranchOutcome::OfflineRefusal { observed_mode } => {
-                assert_eq!(observed_mode.as_str(), *mode);
-            }
-            other => panic!("expected OfflineRefusal for {mode}, got {other:?}"),
-        }
-        let row = read_node_state(&pool, "1234567890").await;
-        assert_eq!(row.unwrap().0, *mode, "row UNCHANGED post-refusal");
         assert!(
-            audit_count(&pool, "NODE_STATE_BOOT_OFFLINE_REFUSAL").await >= 1,
-            "audit emitted before refusal return"
+            !matches!(outcome, BranchOutcome::OfflineRefusal { .. }),
+            "post-W7b: {mode} must NOT short-circuit at branch (d); got: {outcome:?}"
         );
     }
 }
@@ -640,10 +720,15 @@ listen  = "127.0.0.1:8443"
     );
     let cfg = AppConfig::from_toml(&toml_text).unwrap();
     let app = App::boot(cfg).await.unwrap();
-    // Seed two FNs: one OFFLINE (sorted first alphabetically), one OK.
+    // Seed two FNs: one GOING_ONLINE (sorted first alphabetically),
+    // one OK.  Post-W7b (operator PR #57 Round 1 HIGH fix,
+    // 2026-05-16): only GOING_ONLINE still triggers branch (d)
+    // fail-fast at the App level (W9 backlog-drain territory).
+    // Offline / GoingOffline no longer fail-fast — they drop
+    // through to per-doc dispatch via dispatch_post_sign.
     seed_fn_config(app.db(), "1111111111").await;
     seed_fn_config(app.db(), "2222222222").await;
-    seed_node_state(app.db(), "1111111111", "OFFLINE", "CLOSED", 1).await;
+    seed_node_state(app.db(), "1111111111", "GOING_ONLINE", "CLOSED", 1).await;
     // Note: 2222222222 has no node_state — would dispatch to (a) if reached.
     let result = app.reconcile_pending().await;
     match result {
@@ -741,9 +826,15 @@ async fn branch_partition_exhaustive_matrix() {
     let cases: &[(&str, &str, bool, &str, Option<&str>)] = &[
         // Branch (a) — node_state row absent (mode="<absent>" sentinel).
         ("<absent>", "<n/a>", false, "a", None),
-        // Branch (d) — Offline-class modes regardless of shift_state/pending.
-        ("OFFLINE", "CLOSED", false, "d", None),
-        ("GOING_OFFLINE", "CLOSED", false, "d", None),
+        // Branch (d) — M3b W7b update: only GOING_ONLINE refuses
+        // here (W9 backlog-drain mode).  Offline / GoingOffline
+        // drop through to (b)/(c)/(e1) cascade so the W7b
+        // dispatcher can route docs to stage_offline_ack.  With
+        // no pending docs + CLOSED shift, the offline modes
+        // resolve to branch (b) (idempotent no-op for empty FN
+        // in that mode + shift).
+        ("OFFLINE", "CLOSED", false, "b", None),
+        ("GOING_OFFLINE", "CLOSED", false, "b", None),
         ("GOING_ONLINE", "CLOSED", false, "d", None),
         // Branch (f) — preserved modes.
         ("BLOCKED", "CLOSED", false, "f1", None),
@@ -801,4 +892,149 @@ async fn branch_partition_exhaustive_matrix() {
              expected {expected}, got {outcome:?}"
         );
     }
+}
+
+// ─── M3b W7b boot-level integration (deps=Some, full production path) ──
+//
+// Operator PR #57 Round 2 MED fix (2026-05-16): prior round delivered
+// only a deps=None proof (boot reaches per-doc dispatch).  Existing
+// test infrastructure (`StubDpsChannel` + `det_signing_ctx` from
+// `common::*`) makes the deps=Some path testable without 170-LOC
+// substrate mock construction.  This test closes the production-path
+// proof gap: full chain `run_boot_reconciliation → dispatch_pending_doc
+// → dispatch_post_sign → stage_offline_ack`.
+
+mod common;
+
+#[tokio::test]
+async fn boot_with_deps_routes_offline_signed_doc_to_offline_local_ack() {
+    use common::{ack, det_signing_ctx, StubDpsChannel};
+    use prro::config::AppConfig;
+    use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
+    use prro::transports::dps::dto::CheckSignBlob;
+    use prro::App;
+
+    // Build App + DB.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("w7b.db");
+    let toml_text = format!(
+        r#"
+app_name = "prro"
+version  = "0.1.0"
+
+[database]
+db_path = "{}"
+
+[admin_ui]
+enabled = false
+listen  = "127.0.0.1:8443"
+"#,
+        db_path.display().to_string().replace('\\', "/")
+    );
+    let cfg = AppConfig::from_toml(&toml_text).expect("config parse");
+    let app = App::boot(cfg).await.expect("App::boot");
+    let pool = app.db().clone();
+
+    // Seed: FN OFFLINE + OPENED + active OPEN session + 1 code +
+    // 1 SIGNED doc.  This is the exact end-to-end fixture operator
+    // specified.
+    seed_fn_config(&pool, "1234567890").await;
+    seed_node_state(&pool, "1234567890", "OFFLINE", "OPENED", 1).await;
+    let session_id_bytes: [u8; 16] = [0xAA; 16];
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, 'OPEN', '2026-05-16T00:00:00Z')",
+    )
+    .bind(&session_id_bytes[..])
+    .bind("1234567890")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_lnd) VALUES (?, ?)")
+        .bind("1234567890")
+        .bind(42_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let doc = seed_doc_in_state(&pool, "1234567890", 0x77, "SIGNED").await;
+
+    // StubDpsChannel: empty response queue + spy panicking on any
+    // call — proves stage_send is NEVER invoked on offline branch
+    // (criterion 6 of `m3b-w7b-review-criteria` end-to-end).
+    let stub = StubDpsChannel::with_spy(
+        Ok(ack("unused-W7b-violation")),
+        Box::new(|| {
+            panic!(
+                "W7b violation: stage_send/DPS must NOT be invoked on offline branch \
+                 (operator W7b criterion 6)"
+            )
+        }),
+    );
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xDEu8, 0xAD, 0xBE, 0xEF]);
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    // Run full boot reconciliation with deps.
+    app.reconcile_pending_with(deps)
+        .await
+        .expect("reconcile_pending_with must succeed on offline branch");
+
+    // Critical: doc transitioned Signed → OfflineLocalAck.
+    assert_eq!(
+        doc_state(&pool, doc).await,
+        "OFFLINE_LOCAL_ACK",
+        "boot + W7b dispatcher must route offline SIGNED doc to OFFLINE_LOCAL_ACK"
+    );
+    // Code consumed.
+    let consumed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM offline_codes \
+         WHERE fiscal_number = ? AND consumed_at IS NOT NULL",
+    )
+    .bind("1234567890")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        consumed, 1,
+        "exactly one offline code consumed via boot dispatch"
+    );
+    // transport_trace stays empty (stage_send never invoked).
+    let tt_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transport_trace")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        tt_count, 0,
+        "transport_trace must stay empty — stage_send not invoked on offline boot path"
+    );
+    // StubDpsChannel call count == 0.
+    assert_eq!(
+        stub.call_count(),
+        0,
+        "StubDpsChannel.send_chk must not be invoked"
+    );
+    // OFFLINE_LOCAL_ACK_APPLIED audit present.
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_LOCAL_ACK_APPLIED").await,
+        1,
+        "exactly one OFFLINE_LOCAL_ACK_APPLIED audit row"
+    );
+    // NODE_STATE_BOOT_RECONCILED audit present + by_outcome.offline_local_ack_emitted == 1.
+    let payload: String = sqlx::query_scalar(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE event_type = 'NODE_STATE_BOOT_RECONCILED' LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        v["by_outcome"]["offline_local_ack_emitted"], 1,
+        "histogram bucket offline_local_ack_emitted must be 1 in audit payload"
+    );
+    assert_eq!(v["pending_visited"], 1, "exactly one pending doc visited");
 }

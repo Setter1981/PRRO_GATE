@@ -42,7 +42,17 @@ pub enum BootError {
     #[error("DB integrity check failed: {reason}")]
     IntegrityCheckFailed { reason: String },
 
-    #[error("FN {fiscal_number} is in OFFLINE mode — start with --recover-offline M3b CLI")]
+    /// M3b W7b update (2026-05-16): post-merge, only `GoingOnline`
+    /// mode triggers this fail-fast at boot.  `Offline` /
+    /// `GoingOffline` modes no longer abort boot — boot reconciliation
+    /// processes their docs through the W7b post-sign dispatcher
+    /// (`services::write_path::dispatch::dispatch_post_sign`).  This
+    /// variant name is preserved for ABI continuity but the
+    /// operator-facing message reflects the new semantic.
+    #[error(
+        "FN {fiscal_number} is in GOING_ONLINE mode — W9 backlog drain owns this FN's reconciliation; \
+         re-run boot once the drain has completed and node_state.mode is Online or Offline again"
+    )]
     OfflineModeRefusal { fiscal_number: String },
 
     #[error("database error during boot: {0}")]
@@ -353,12 +363,21 @@ impl App {
     /// ctx-free path (emits `BOOT_DISPATCH_DEFERRED`); recovery
     /// NEVER substitutes foreign identity.
     ///
-    /// **Dispatch surface.**  Under this entry:
+    /// **Dispatch surface.**  Under this entry (M3b W7b updated
+    /// 2026-05-16):
     ///   - PREPARED → `dispatch_prepared_via_chain` (snapshot
-    ///     envelope + `stage_sign::run` → `stage_send::run`).
-    ///     Drift between `fiscal_documents` and `ingress_inbox`
-    ///     emits `BOOT_PREPARED_REPLAY_DRIFT` CRITICAL and holds.
-    ///   - SIGNED → `stage_send::run` (Pattern B SENDING marker).
+    ///     envelope + `stage_sign::run` → **W7b post-sign
+    ///     dispatcher**: Online → `stage_send::run` (M3a online
+    ///     ladder unchanged); Offline | GoingOffline →
+    ///     `stage_offline_ack::run` (pipeline terminates at
+    ///     `OFFLINE_LOCAL_ACK`); Blocked | StopMode |
+    ///     CryptoDegraded | GoingOnline → typed dispatcher refusal
+    ///     `WRITE_PATH_DISPATCH_REFUSED`).  Drift between
+    ///     `fiscal_documents` and `ingress_inbox` emits
+    ///     `BOOT_PREPARED_REPLAY_DRIFT` CRITICAL and holds.
+    ///   - SIGNED → **W7b post-sign dispatcher** (same routing as
+    ///     PREPARED post-stage_sign; covers crash-recovery of docs
+    ///     that crashed between sign and send in a prior tick).
     ///   - SENT → `dispatch_sent_via_probe` (3-way `last_chk`
     ///     classification: Match → KVT1, Mismatch → RM, NotFound →
     ///     ER tick-1 of two-tick retry).
@@ -368,7 +387,9 @@ impl App {
     ///     FnConfigError / WrapperBug / OperatorEscalation /
     ///     MacRecovery / TerminalReject → CAS to
     ///     RequiresManualReconciliation; ProbeRequired and None →
-    ///     hold without state change.
+    ///     hold without state change.  (TransientRetry retry is
+    ///     NOT gated by the W7b dispatcher — it is a resume of an
+    ///     in-progress online send, not a post-sign decision.)
     ///
     /// Per ADR-M3-A10: under the global-single-writer invariant, this
     /// call holds the dispatcher task for the duration of one boot
