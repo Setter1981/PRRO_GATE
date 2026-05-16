@@ -363,12 +363,21 @@ impl App {
     /// ctx-free path (emits `BOOT_DISPATCH_DEFERRED`); recovery
     /// NEVER substitutes foreign identity.
     ///
-    /// **Dispatch surface.**  Under this entry:
+    /// **Dispatch surface.**  Under this entry (M3b W7b updated
+    /// 2026-05-16):
     ///   - PREPARED → `dispatch_prepared_via_chain` (snapshot
-    ///     envelope + `stage_sign::run` → `stage_send::run`).
-    ///     Drift between `fiscal_documents` and `ingress_inbox`
-    ///     emits `BOOT_PREPARED_REPLAY_DRIFT` CRITICAL and holds.
-    ///   - SIGNED → `stage_send::run` (Pattern B SENDING marker).
+    ///     envelope + `stage_sign::run` → **W7b post-sign
+    ///     dispatcher**: Online → `stage_send::run` (M3a online
+    ///     ladder unchanged); Offline | GoingOffline →
+    ///     `stage_offline_ack::run` (pipeline terminates at
+    ///     `OFFLINE_LOCAL_ACK`); Blocked | StopMode |
+    ///     CryptoDegraded | GoingOnline → typed dispatcher refusal
+    ///     `WRITE_PATH_DISPATCH_REFUSED`).  Drift between
+    ///     `fiscal_documents` and `ingress_inbox` emits
+    ///     `BOOT_PREPARED_REPLAY_DRIFT` CRITICAL and holds.
+    ///   - SIGNED → **W7b post-sign dispatcher** (same routing as
+    ///     PREPARED post-stage_sign; covers crash-recovery of docs
+    ///     that crashed between sign and send in a prior tick).
     ///   - SENT → `dispatch_sent_via_probe` (3-way `last_chk`
     ///     classification: Match → KVT1, Mismatch → RM, NotFound →
     ///     ER tick-1 of two-tick retry).
@@ -378,7 +387,9 @@ impl App {
     ///     FnConfigError / WrapperBug / OperatorEscalation /
     ///     MacRecovery / TerminalReject → CAS to
     ///     RequiresManualReconciliation; ProbeRequired and None →
-    ///     hold without state change.
+    ///     hold without state change.  (TransientRetry retry is
+    ///     NOT gated by the W7b dispatcher — it is a resume of an
+    ///     in-progress online send, not a post-sign decision.)
     ///
     /// Per ADR-M3-A10: under the global-single-writer invariant, this
     /// call holds the dispatcher task for the duration of one boot

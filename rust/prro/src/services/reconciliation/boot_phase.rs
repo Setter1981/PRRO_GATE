@@ -1079,26 +1079,42 @@ impl BranchOutcome {
 /// Returns the [`BranchOutcome`] so the caller can aggregate without
 /// re-reading the DB.
 ///
-/// **Branch (d) — OFFLINE refusal.**  Returns
-/// `BranchOutcome::OfflineRefusal { observed_mode }` rather than
-/// erroring directly; the caller (`App::reconcile_pending`) maps this
-/// outcome to `BootError::OfflineModeRefusal` and fails-fast on the
-/// FIRST OFFLINE FN encountered (per freeze §13.3).
+/// **Branch (d) — GoingOnline refusal** (M3b W7b update,
+/// 2026-05-16).  Returns `BranchOutcome::OfflineRefusal {
+/// observed_mode }` rather than erroring directly; the caller
+/// (`App::reconcile_pending`) maps this outcome to
+/// `BootError::OfflineModeRefusal` and fails-fast on the first
+/// GoingOnline FN encountered.  Pre-W7b this also covered Offline
+/// / GoingOffline (per freeze §13.3); post-W7b those modes fall
+/// through to the per-doc dispatch loop where the W7b post-sign
+/// dispatcher (`services::write_path::dispatch::dispatch_post_sign`)
+/// routes SIGNED / PREPARED docs to `stage_offline_ack::run` for
+/// local fiscalisation.  Only `GoingOnline` (W9 backlog-drain
+/// territory) still aborts boot at this branch — boot reconciliation
+/// defers to W9's drain loop for those FNs.
 ///
 /// **Branch (c)/(e1) — per-doc dispatch scope.**  W9.3 ships the
 /// dispatch shell that loops `list_pending_for_fn` in
 /// `(lnd, created_at, document_id)` order.  Per-DocState routing:
 ///
-///   | DocState        | W9.3 action                            |
+///   | DocState        | action (ctx-free / ctx-wired, post-W7b)|
 ///   | --------------- | -------------------------------------- |
 ///   | `Sending`       | `resume_sending_to_error_retryable`    |
 ///   | `Kvt1`          | `passive_hold_kvt1`                    |
 ///   | `Encrypted`     | transition → ErrorRetryable + audit    |
 ///   | `Kvt2`          | `stage_finalize::run` (W8; no ctx)     |
-///   | `Prepared`      | DEFERRED audit (W11 wires SigningCtx)  |
-///   | `Signed`        | DEFERRED audit (W11 wires DpsChannel)  |
-///   | `Sent`          | DEFERRED audit (W11 wires DpsChannel)  |
-///   | `ErrorRetryable`| DEFERRED audit (W11 wires DpsChannel)  |
+///   | `Prepared`      | deps=None: DEFERRED audit; deps=Some:  |
+///   |                 | `dispatch_prepared_via_chain` →        |
+///   |                 | stage_sign → **W7b post-sign           |
+///   |                 | dispatcher** → stage_send OR           |
+///   |                 | stage_offline_ack (per node mode)      |
+///   | `Signed`        | deps=None: DEFERRED audit; deps=Some:  |
+///   |                 | **W7b post-sign dispatcher** routes by |
+///   |                 | node mode (Online → stage_send;        |
+///   |                 | Offline/GoingOffline → stage_offline_ack;|
+///   |                 | non-routable modes → typed refusal)    |
+///   | `Sent`          | DEFERRED audit / `dispatch_sent_via_probe` |
+///   | `ErrorRetryable`| DEFERRED audit / `dispatch_error_retryable_by_class` |
 ///
 /// Ctx-needy DocStates (Prepared/Signed/Sent/ErrorRetryable) emit
 /// `BOOT_DISPATCH_DEFERRED` WARN per occurrence so operators see the
