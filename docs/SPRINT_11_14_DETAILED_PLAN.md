@@ -1,8 +1,18 @@
 # Sprint 11–14: Detailed Implementation Plan
 
-**Версія:** 1.0, 2026-04-15  
+> **Python-era plan; superseded by Rust gateway M3b (2026-05-16).**
+>
+> This document plans Sprint 11–14 for the **Python gateway**.  Several rules below — including step 11.2's "`GO_ONLINE` blocked by existing `OFFLINE_LOCAL_ACK` backlog", step 11.4 Z_REPORT blanket blocker, and other offline-shift rules — reflect the Python implementation and conflict with the Rust gateway M3b return-online + Pattern C drain design (`Offline → GoingOnline → drain in lnd ASC → Online`).
+>
+> The Rust gateway uses:
+> - `node_state.mode` transitions `Offline → GoingOnline` are driven by the W8 return-online probe; `GoingOnline → Online` lands after the W9b backlog drain plus W12 KVT2 confirmation deliver every offline doc to final DPS `ACK`.  There is no blanket "GO_ONLINE refused while backlog exists" — the drain *is* what closes the backlog.
+> - W10 offline shift close/open policy guard distinguishes **ONLINE** Z_REPORT (blocked over pending backlog) from **OFFLINE-mode local** Z_REPORT close-of-day (allowed as Pattern C `OFFLINE_LOCAL_ACK` document).  See `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0 + `docs/superpowers/plans/2026-05-14-m3b-implementation.md` §Task 10.
+>
+> The Python-era plan below remains accurate for the Python gateway scope; do not back-port its rules to the Rust gateway without consulting the M3b plan first.
+
+**Версія:** 1.0, 2026-04-15 (Python gateway)  
 **На основі:** `ACCEPTANCE_COVERAGE_SNAPSHOT.md` §10, аудиту коду  
-**Стан коду:** Sprint 10 wave 2, 586 passed
+**Стан коду:** Sprint 10 wave 2, 586 passed (Python gateway)
 
 ---
 

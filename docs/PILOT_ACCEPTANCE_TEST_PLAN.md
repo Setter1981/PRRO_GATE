@@ -227,7 +227,7 @@ contract:
 - samples without return linkage or regulated-goods classification are excluded
   from the positive pool and used as negative or manual-mapping cases.
 
-Example console output:
+Example console output (the `z_report` row below is the **online** Z-report negative path — DPS would otherwise record a Z that omits offline receipts still in the backlog.  The corrected M3b W10 policy ALSO allows an **offline-mode** local Z_REPORT close-of-day as a separate routed-acceptance ARM; see Phase 6 and `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0):
 
 ```text
 [001/042] sell_with_excise webcheck__ksef_123 FN=4000162280 total=315.00
@@ -235,9 +235,10 @@ Example console output:
   -> ProcessCheck goods=2 payments=1 excise=2 uktzed=1
   <- OK 184 ms document_id=doc_... state=ACK
 
-[002/042] z_report webcheck__ksef_140 FN=4000162280
+[002/042] z_report (online) webcheck__ksef_140 FN=4000162280
   -> CloseShift
-  <- FAIL 91 ms error=OFFLINE_BACKLOG_NOT_SYNCED
+  <- FAIL 91 ms error=ONLINE_Z_REPORT_BLOCKED_BACKLOG (Rust M3b W10 audit)
+                 / OFFLINE_BACKLOG_NOT_SYNCED (Python-era equivalent)
 ```
 
 The emulator must also write machine-readable logs:
