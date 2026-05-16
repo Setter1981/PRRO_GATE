@@ -569,6 +569,12 @@ cargo test -p prro --test write_path_stage4_send               # existing — mu
 
 ### Task 8 (W8): return-online detection probe
 
+> **W8a / W8b split (2026-05-16).**  After Round 1 review on PR #58, this task was split into two PRs:
+> - **W8a** (PR #58, in-review) — tested primitive: `run_tick_for_fn` + `spawn_probe_loop` + `OfflineCfg::return_online_probe_interval_seconds` (raw operator value) + `clamped_probe_interval_seconds()` helper-side clamp + stable `dps_error_class` audit taxonomy.
+> - **W8b** (future PR) — App::boot wiring: enumerate ALL configured FNs (boot-time mode filter would orphan late `Online → Offline` transitions; tick-level skip already handles `Online` / `GoingOnline` cheaply), own the `JoinHandle` + `watch::Sender`, propagate shutdown from `main`, route the raw config field through `clamped_probe_interval_seconds()` and emit WARN audit when `was_clamped == true`, durable `RETURN_ONLINE_PROBE_LOOP_ERROR` CRITICAL audit on tick error.
+>
+> **§Task 8 remains OPEN until W8b merges.**  See design freeze §5 (split note) + §7a (W8b scope) — `docs/superpowers/specs/2026-05-16-m3b-w8-return-online-probe.md`.
+
 **Goal.** Periodic background tick that, when node is `Offline` / `GoingOnline`, calls a lightweight DPS probe (`ping` or `statusRro` — choice recorded in the W8 design freeze) to detect that DPS is reachable + this FN's shift state is consistent with local.  On success: drive node mode `Offline → GoingOnline`.  Strictly read-only over the network; no fiscal documents.
 
 **Files (proposed).**
