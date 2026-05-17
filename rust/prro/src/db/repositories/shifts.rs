@@ -521,7 +521,7 @@ pub async fn force_to_error_with_audit(
                 actor: normalized_actor,
                 rows_affected,
             },
-            serde_json::Value::Null,
+            None,
         )
         .await?;
         return Ok(ForceSeamOutcome::TxIsolationViolation {
@@ -632,7 +632,7 @@ pub async fn force_to_manual_reconciliation_with_audit(
                 actor: normalized_actor,
                 rows_affected,
             },
-            serde_json::Value::Null,
+            None,
         )
         .await?;
         return Ok(ForceSeamOutcome::TxIsolationViolation {
@@ -656,23 +656,26 @@ struct CasFailureContext<'a> {
     rows_affected: u64,
 }
 
-/// PR #66 R3 H-R2-1 + R4 L-R4-3 — shared helper for force-seam AND
-/// senior-close CAS-WHERE-state graceful failure paths.  Re-reads
-/// observed state for diagnostics + emits the given Critical
+/// PR #66 R3 H-R2-1 + R4 L-R4-3 + R5 L-R5-1/L-R5-3 — shared helper for
+/// force-seam AND senior-close CAS-WHERE-state graceful failure paths.
+/// Re-reads observed state for diagnostics + emits the given Critical
 /// `audit_event_type` audit (forensic via Ok-return contract) + returns
 /// `Option<ShiftState>` (observed-at-update) so caller can wrap into
 /// its specific outcome variant (`ForceSeamOutcome::TxIsolationViolation`
 /// OR `SeniorCloseOutcome::TxIsolationViolation`).
 ///
-/// `extra_payload_fields` is merged into the audit payload (used by
-/// senior-close to carry `senior_cashier_id` + `z_report_document_id`;
-/// force seams pass `serde_json::Value::Null` for no extras).
+/// `extra_payload_fields` (R5 L-R5-1 fix): type-safe via
+/// `Option<serde_json::Map<String, serde_json::Value>>` — caller cannot
+/// accidentally pass `Number` / `Array` / `String` value that would
+/// silently no-op.  Senior close passes `Some(map)` with
+/// `senior_cashier_id` + `z_report_document_id`; force seams pass
+/// `None` for no extras.
 async fn emit_cas_isolation_violation_audit(
     tx: &mut WriteTxConn<'_>,
     audit_event_type: &str,
     attempted_seam: &'static str,
     ctx: CasFailureContext<'_>,
-    extra_payload_fields: serde_json::Value,
+    extra_payload_fields: Option<serde_json::Map<String, serde_json::Value>>,
 ) -> sqlx::Result<Option<ShiftState>> {
     // Re-read for diagnostics — same tx, serialised with the failed UPDATE.
     let observed: Option<ShiftState> =
@@ -689,9 +692,9 @@ async fn emit_cas_isolation_violation_audit(
         "rows_affected": ctx.rows_affected,
         "reason": "cas_where_state_hit_zero_rows",
     });
-    // Merge extras (e.g. senior_cashier_id + z_report_document_id) — only
-    // when the extras object is a non-null JSON object.
-    if let serde_json::Value::Object(extras) = extra_payload_fields {
+    // Merge extras (e.g. senior_cashier_id + z_report_document_id).
+    // Type-safe via Option<Map> — no silent no-op on wrong shape.
+    if let Some(extras) = extra_payload_fields {
         if let serde_json::Value::Object(ref mut base) = payload {
             for (k, v) in extras {
                 base.insert(k, v);
@@ -955,9 +958,18 @@ pub async fn senior_cashier_close_shift_with_audit(
                 actor: Some(senior_cashier_id.as_str()),
                 rows_affected,
             },
-            serde_json::json!({
-                "senior_cashier_id": senior_cashier_id.as_str(),
-                "z_report_document_id": z_report_doc_hex,
+            Some({
+                // PR #66 R5 L-R5-1: typed Map (was serde_json::Value).
+                let mut extras = serde_json::Map::new();
+                extras.insert(
+                    "senior_cashier_id".to_string(),
+                    serde_json::Value::String(senior_cashier_id.as_str().to_string()),
+                );
+                extras.insert(
+                    "z_report_document_id".to_string(),
+                    serde_json::Value::String(z_report_doc_hex.clone()),
+                );
+                extras
             }),
         )
         .await?;
