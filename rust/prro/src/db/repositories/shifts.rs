@@ -288,7 +288,7 @@ pub const FORCE_SEAM_EVIDENCE_MAX_BYTES: usize = 8 * 1024;
 
 /// W14a-2a force-seam invocation outcome.  Returned inside `Ok(_)` so
 /// the surrounding `with_immediate` envelope COMMITS even on
-/// `ForbiddenSource` — preserving the `SHIFT_FORCE_SEAM_REFUSED` audit
+/// `ForbiddenSource` / `TxIsolationViolation` — preserving the audit
 /// row per spec §8 forensic-traceability requirement (Round 7 §8.1
 /// load-bearing pin).  Caller pattern-matches on this enum to know
 /// whether the state actually changed.
@@ -302,6 +302,22 @@ pub enum ForceSeamOutcome {
     ForbiddenSource {
         current_state: ShiftState,
         attempted_seam: &'static str,
+    },
+    /// PR #66 R3 H-R2-1: CAS-WHERE-state UPDATE hit `rows_affected != 1`
+    /// despite the state having been read inside the same tx.  This
+    /// indicates either: (a) `BEGIN IMMEDIATE` isolation broke (SQLite /
+    /// kernel bug), (b) the seam was invoked outside a `with_immediate`
+    /// envelope (caller bug — future refactor), OR (c) the row vanished
+    /// between read and UPDATE (orthogonal admin path).  Replaces R2
+    /// MED-3 panic — failure mode is now graceful per established
+    /// `fiscal_documents.rs:351` HIGH-3 convention ("Was `debug_assert!`
+    /// previously").  State UNCHANGED; `SHIFT_FORCE_SEAM_TX_ISOLATION_
+    /// VIOLATION` Critical audit emitted with `observed_state_at_update`
+    /// + `rows_affected` for forensic forensics.
+    TxIsolationViolation {
+        observed_state_at_update: Option<ShiftState>,
+        attempted_seam: &'static str,
+        rows_affected: u64,
     },
 }
 
@@ -413,7 +429,9 @@ pub async fn force_to_error_with_audit(
     validate_evidence_json(evidence_json)?;
     // PR #66 R2 LOW-1: collapse state+fiscal_number to single round-trip
     // (matches senior_close pattern at line 655).
-    let actor_id = actor_id.filter(|s| !s.is_empty());  // R2 LOW-4: drop Some("")
+    // PR #66 R3 LOW-R3-1: renamed local from shadowing parameter `actor_id`
+    // to `normalized_actor` for readability.
+    let normalized_actor = actor_id.filter(|s| !s.is_empty());  // R2 LOW-4: drop Some("")
     let row: Option<(ShiftState, String)> = sqlx::query_as(
         r#"SELECT state as "state: ShiftState", fiscal_number FROM shifts WHERE shift_id = ?"#,
     )
@@ -433,15 +451,16 @@ pub async fn force_to_error_with_audit(
             FORCE_TO_ERROR_SEAM_NAME,
             evidence_json,
         );
-        // PR #66 R1 M2: actor_id populated on `audit_log.actor` column
-        // (was: None; forensic-attribution gap per reviewer M2).
+        // PR #66 R1 M2 + R2 LOW-4: actor_id populated on `audit_log.actor`
+        // column with empty-string filter (was: None; forensic-attribution
+        // gap per reviewer M2 + accidental Some("") sentinel pollution).
         audit_log::append_tx(
             tx,
             "shift",
             &shift_id_hex,
             "SHIFT_FORCE_SEAM_REFUSED",
             Severity::Warning,
-            actor_id,
+            normalized_actor,
             Some(&payload),
         )
         .await?;
@@ -467,27 +486,34 @@ pub async fn force_to_error_with_audit(
         &shift_id_hex,
         "SHIFT_FORCE_TO_ERROR",
         Severity::Critical,
-        actor_id,
+        normalized_actor,
         Some(&success_payload),
     )
     .await?;
-    // PR #66 R2 MED-3: CAS-WHERE-state guard — defensive depth.  BEGIN
-    // IMMEDIATE serialises today, but the guard documents intent at the
-    // SQL layer + protects against future refactors that might invoke
-    // the seam outside a `with_immediate` envelope.
+    // PR #66 R2 MED-3 + R3 H-R2-1: CAS-WHERE-state guard with graceful
+    // failure path (replaces R2's `assert_eq!` panic).  Per established
+    // `fiscal_documents.rs:351` HIGH-3 convention: NEVER panic on
+    // rows_affected anomalies in production paths — surface as typed
+    // outcome + Critical audit.  Process keeps serving other FNs.
     let res = sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ? AND state = ?")
         .bind(ShiftState::Error)
         .bind(shift_id)
         .bind(current_state)
         .execute(&mut **tx)
         .await?;
-    assert_eq!(
-        res.rows_affected(),
-        1,
-        "force_to_error_with_audit CAS-WHERE-state guard hit 0 rows — \
-         BEGIN IMMEDIATE isolation broke OR shift_id raced; this is a bug \
-         in tx envelope discipline, not a recoverable runtime state"
-    );
+    if res.rows_affected() != 1 {
+        return emit_force_seam_tx_isolation_violation(
+            tx,
+            shift_id,
+            &shift_id_hex,
+            &fiscal_number,
+            current_state,
+            FORCE_TO_ERROR_SEAM_NAME,
+            normalized_actor,
+            res.rows_affected(),
+        )
+        .await;
+    }
     Ok(ForceSeamOutcome::Applied)
 }
 
@@ -511,8 +537,9 @@ pub async fn force_to_manual_reconciliation_with_audit(
     evidence_json: &str,
 ) -> Result<ForceSeamOutcome, ForceSeamError> {
     validate_evidence_json(evidence_json)?;
-    // PR #66 R2 LOW-1 + LOW-4: single round-trip + actor_id empty filter.
-    let actor_id = actor_id.filter(|s| !s.is_empty());
+    // PR #66 R2 LOW-1 + LOW-4 + R3 LOW-R3-1: single round-trip + actor_id
+    // empty filter + rename to avoid parameter shadowing.
+    let normalized_actor = actor_id.filter(|s| !s.is_empty());
     let row: Option<(ShiftState, String)> = sqlx::query_as(
         r#"SELECT state as "state: ShiftState", fiscal_number FROM shifts WHERE shift_id = ?"#,
     )
@@ -532,14 +559,14 @@ pub async fn force_to_manual_reconciliation_with_audit(
             FORCE_TO_MANUAL_SEAM_NAME,
             evidence_json,
         );
-        // PR #66 R1 M2: actor_id populated for forensic attribution.
+        // PR #66 R1 M2 + R2 LOW-4: actor_id forensic attribution + empty filter.
         audit_log::append_tx(
             tx,
             "shift",
             &shift_id_hex,
             "SHIFT_FORCE_SEAM_REFUSED",
             Severity::Warning,
-            actor_id,
+            normalized_actor,
             Some(&payload),
         )
         .await?;
@@ -563,26 +590,84 @@ pub async fn force_to_manual_reconciliation_with_audit(
         &shift_id_hex,
         "SHIFT_FORCE_TO_MANUAL_RECONCILIATION",
         Severity::Critical,
-        actor_id,
+        normalized_actor,
         Some(&success_payload),
     )
     .await?;
-    // PR #66 R2 MED-3: CAS-WHERE-state guard — see force_to_error_with_audit
-    // for rationale (defensive depth + future-refactor protection).
+    // PR #66 R2 MED-3 + R3 H-R2-1: CAS-WHERE-state guard with graceful
+    // failure path (see force_to_error_with_audit for rationale).
     let res = sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ? AND state = ?")
         .bind(ShiftState::RequiresManualReconciliation)
         .bind(shift_id)
         .bind(current_state)
         .execute(&mut **tx)
         .await?;
-    assert_eq!(
-        res.rows_affected(),
-        1,
-        "force_to_manual_reconciliation_with_audit CAS-WHERE-state guard hit \
-         0 rows — BEGIN IMMEDIATE isolation broke OR shift_id raced; bug \
-         in tx envelope discipline, not a recoverable runtime state"
-    );
+    if res.rows_affected() != 1 {
+        return emit_force_seam_tx_isolation_violation(
+            tx,
+            shift_id,
+            &shift_id_hex,
+            &fiscal_number,
+            current_state,
+            FORCE_TO_MANUAL_SEAM_NAME,
+            normalized_actor,
+            res.rows_affected(),
+        )
+        .await;
+    }
     Ok(ForceSeamOutcome::Applied)
+}
+
+/// PR #66 R3 H-R2-1 — shared helper for force-seam CAS-WHERE-state
+/// graceful failure path.  Re-reads observed state for diagnostics +
+/// emits `SHIFT_FORCE_SEAM_TX_ISOLATION_VIOLATION` Critical audit
+/// (forensic via Ok-return contract) + returns
+/// `Ok(ForceSeamOutcome::TxIsolationViolation { ... })`.
+///
+/// 8 args is above clippy's default 7-arg threshold; bundling them
+/// into a struct would obscure call-site readability for 2 callers.
+#[allow(clippy::too_many_arguments)]
+async fn emit_force_seam_tx_isolation_violation(
+    tx: &mut WriteTxConn<'_>,
+    shift_id: ShiftId,
+    shift_id_hex: &str,
+    fiscal_number: &str,
+    current_state_read_was: ShiftState,
+    attempted_seam: &'static str,
+    actor: Option<&str>,
+    rows_affected: u64,
+) -> Result<ForceSeamOutcome, ForceSeamError> {
+    // Re-read for diagnostics — same tx, serialised with the failed UPDATE.
+    let observed: Option<ShiftState> =
+        sqlx::query_scalar(r#"SELECT state as "state: ShiftState" FROM shifts WHERE shift_id = ?"#)
+            .bind(shift_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let payload = serde_json::json!({
+        "fiscal_number": fiscal_number,
+        "shift_id": shift_id_hex,
+        "current_state_at_read": current_state_read_was.as_str(),
+        "observed_state_at_update": observed.map(|s| s.as_str()),
+        "attempted_seam": attempted_seam,
+        "rows_affected": rows_affected,
+        "reason": "cas_where_state_hit_zero_rows",
+    })
+    .to_string();
+    audit_log::append_tx(
+        tx,
+        "shift",
+        shift_id_hex,
+        "SHIFT_FORCE_SEAM_TX_ISOLATION_VIOLATION",
+        Severity::Critical,
+        actor,
+        Some(&payload),
+    )
+    .await?;
+    Ok(ForceSeamOutcome::TxIsolationViolation {
+        observed_state_at_update: observed,
+        attempted_seam,
+        rows_affected,
+    })
 }
 
 // ─── M3b W14a-2a: senior cashier close seam ──────────────────────────
@@ -622,6 +707,17 @@ pub enum SeniorCloseOutcome {
     RefusedCashierNotRegistered {
         senior_cashier_id: CashierId,
         fiscal_number: String,
+    },
+    /// PR #66 R3 H-R2-1: CAS-WHERE-state UPDATE hit `rows_affected != 1`
+    /// despite the state having been read + validated inside the same tx.
+    /// Symmetric with [`ForceSeamOutcome::TxIsolationViolation`].
+    /// State UNCHANGED; `SHIFT_SENIOR_CLOSE_TX_ISOLATION_VIOLATION`
+    /// Critical audit emitted with `observed_state_at_update` +
+    /// `rows_affected` for forensics.  Replaces R2 MED-3 panic per
+    /// `fiscal_documents.rs:351` HIGH-3 convention.
+    TxIsolationViolation {
+        observed_state_at_update: Option<ShiftState>,
+        rows_affected: u64,
     },
 }
 
@@ -781,11 +877,9 @@ pub async fn senior_cashier_close_shift_with_audit(
 
     // 6. UPDATE shifts — state + closed_by_cashier_id + z_report ref +
     //    closed_at.  Single statement, in-tx.
-    // PR #66 R2 MED-3: CAS-WHERE-state guard — defensive depth.  We
-    // already validated `current_state ∈ {Opened, ClosingLocalPendingDrain}`
-    // at step 3, but the explicit WHERE state = ? + asserted rows_affected
-    // documents intent + protects against future refactors that might
-    // invoke outside `with_immediate`.
+    // PR #66 R2 MED-3 + R3 H-R2-1: CAS-WHERE-state guard with graceful
+    // failure path (see emit_force_seam_tx_isolation_violation helper +
+    // ForceSeamOutcome::TxIsolationViolation rationale).
     let res = sqlx::query(
         "UPDATE shifts SET state = ?, closed_by_cashier_id = ?, z_report_document_id = ?, \
             closed_at = CURRENT_TIMESTAMP \
@@ -798,12 +892,41 @@ pub async fn senior_cashier_close_shift_with_audit(
     .bind(current_state)
     .execute(&mut **tx)
     .await?;
-    assert_eq!(
-        res.rows_affected(),
-        1,
-        "senior_cashier_close_shift_with_audit CAS-WHERE-state guard hit \
-         0 rows — BEGIN IMMEDIATE isolation broke OR shift_id raced; bug \
-         in tx envelope discipline, not a recoverable runtime state"
-    );
+    if res.rows_affected() != 1 {
+        // Re-read for diagnostics + emit Critical audit (forensic via
+        // Ok-return contract) + return outcome variant.
+        let observed: Option<ShiftState> = sqlx::query_scalar(
+            r#"SELECT state as "state: ShiftState" FROM shifts WHERE shift_id = ?"#,
+        )
+        .bind(shift_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let isolation_payload = serde_json::json!({
+            "fiscal_number": fiscal_number,
+            "shift_id": shift_id_hex,
+            "current_state_at_read": current_state.as_str(),
+            "observed_state_at_update": observed.map(|s| s.as_str()),
+            "attempted_seam": "senior_cashier_close_shift_with_audit",
+            "senior_cashier_id": senior_cashier_id.as_str(),
+            "z_report_document_id": z_report_doc_hex,
+            "rows_affected": res.rows_affected(),
+            "reason": "cas_where_state_hit_zero_rows",
+        })
+        .to_string();
+        audit_log::append_tx(
+            tx,
+            "shift",
+            &shift_id_hex,
+            "SHIFT_SENIOR_CLOSE_TX_ISOLATION_VIOLATION",
+            Severity::Critical,
+            Some(senior_cashier_id.as_str()),
+            Some(&isolation_payload),
+        )
+        .await?;
+        return Ok(SeniorCloseOutcome::TxIsolationViolation {
+            observed_state_at_update: observed,
+            rows_affected: res.rows_affected(),
+        });
+    }
     Ok(SeniorCloseOutcome::Applied)
 }

@@ -1254,6 +1254,8 @@ Additions to §8 audit event vocabulary:
 | `TECH_SUPPORT_REPAIR_INVOKED` | **Critical** | §16.3 TechSupportRepair seam |
 | `SHIFT_CLOSED_BY_SENIOR_CASHIER` | Info | §16.9 senior cashier close |
 | `SHIFT_SENIOR_CLOSE_REFUSED` | Warning | §16.9 senior cashier close — refused-audit emitted on `NotClosable` (shift state not in {Opened, ClosingLocalPendingDrain}) OR `CashierNotRegistered` (senior_cashier_id not in `cashier_certs` for shift's fiscal_number).  Forensic-traceability per spec §8 + Round 7 §8.1 (Ok-return contract preserves audit via `with_immediate` commit).  Added 2026-05-17 in PR #66 R1 M3 (W14a-2a senior close refactor). |
+| `SHIFT_FORCE_SEAM_TX_ISOLATION_VIOLATION` | **Critical** | §4.5 force seams — CAS-WHERE-state guard hit `rows_affected != 1` despite state having been read in the same tx.  Indicates BEGIN IMMEDIATE isolation broke OR seam invoked outside `with_immediate` envelope OR row vanished mid-tx.  Payload: `{shift_id, current_state_at_read, observed_state_at_update, attempted_seam, rows_affected, reason}`.  Forensic-traceability per Ok-return contract.  Added 2026-05-17 in PR #66 R3 H-R2-1 (replaces R2 MED-3 `assert_eq!` panic per `fiscal_documents.rs:351` HIGH-3 convention). |
+| `SHIFT_SENIOR_CLOSE_TX_ISOLATION_VIOLATION` | **Critical** | §16.9 senior close — symmetric to above for senior_cashier_close_shift_with_audit seam.  Added 2026-05-17 in PR #66 R3 H-R2-1. |
 | `OFFLINE_LIMIT_EXCEEDED_INGRESS_REFUSED` | **Critical** | §16.5 36h ingress cap |
 | `DPS_LOCAL_SHIFT_STATE_DRIFT` | **Critical** | §16.12 boot DPS-DB check |
 | `SHIFT_CASHIER_UNAVAILABLE_OFFLINE_ORPHANS` | **Critical** | Case 10b — rare residual after §16.10 prevention |

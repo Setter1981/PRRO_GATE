@@ -13,7 +13,7 @@ use prro::db::models::enums::{FiscalMode, ShiftState};
 use prro::db::models::ids::{CashierId, DocumentId, ShiftId};
 use prro::db::open_pool;
 use prro::db::repositories::fiscal_number_config::{self as fn_repo, NewFnConfig};
-use prro::db::repositories::shifts::{self, SeniorCloseOutcome};
+use prro::db::repositories::shifts::{self, SeniorCloseError, SeniorCloseOutcome};
 use prro::db::tx::with_immediate;
 
 const ALL_NON_CLOSABLE_STATES: [ShiftState; 7] = [
@@ -296,5 +296,86 @@ async fn senior_close_refused_cashier_not_registered() {
     assert_eq!(
         count_audit_events(&pool, &shift_id_hex(&pool, shift_id).await, "SHIFT_SENIOR_CLOSE_REFUSED").await,
         1
+    );
+}
+
+// ─── PR #66 R3 LOW-R3-3: error path tests ────────────────────────────
+
+#[tokio::test]
+async fn senior_close_error_invalid_evidence_json() {
+    let (pool, fn_id) = fresh_with_fn().await;
+    let senior = CashierId::new("senior-err-1").unwrap();
+    seed_cashier_cert_binding(&pool, &fn_id, senior.as_str()).await;
+    let shift_id = seed_shift_in_state(&pool, &fn_id, ShiftState::Opened).await;
+    let z_doc_id = DocumentId::new();
+    let hex_at_start = shift_id_hex(&pool, shift_id).await;
+
+    // Invalid JSON evidence — must return Err(InvalidEvidenceJson)
+    // BEFORE any state mutation or audit emission.
+    let result: Result<SeniorCloseOutcome, SeniorCloseError> = {
+        let senior = senior.clone();
+        let res: anyhow::Result<Result<SeniorCloseOutcome, SeniorCloseError>> =
+            with_immediate(&pool, move |tx| {
+                Box::pin(async move {
+                    // Capture the typed error inside the closure.
+                    let r = shifts::senior_cashier_close_shift_with_audit(
+                        tx, shift_id, &senior, z_doc_id, "not-json-at-all",
+                    )
+                    .await;
+                    anyhow::Ok(r)
+                })
+            })
+            .await;
+        res.unwrap()
+    };
+
+    assert!(
+        matches!(result, Err(SeniorCloseError::InvalidEvidenceJson(_))),
+        "expected InvalidEvidenceJson error, got {result:?}"
+    );
+
+    // State must be unchanged + no audit emitted (validation rejects
+    // BEFORE any DB write).
+    assert_eq!(
+        shifts::get(&pool, shift_id).await.unwrap().unwrap().state,
+        ShiftState::Opened
+    );
+    assert_eq!(
+        count_audit_events(&pool, &hex_at_start, "SHIFT_CLOSED_BY_SENIOR_CASHIER").await,
+        0
+    );
+    assert_eq!(
+        count_audit_events(&pool, &hex_at_start, "SHIFT_SENIOR_CLOSE_REFUSED").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn senior_close_error_shift_not_found() {
+    let (pool, _fn_id) = fresh_with_fn().await;
+    let senior = CashierId::new("senior-err-2").unwrap();
+    // Intentionally NOT seeded — shift_id is stale.
+    let stale_id = ShiftId::new();
+    let z_doc_id = DocumentId::new();
+
+    let result: Result<SeniorCloseOutcome, SeniorCloseError> = {
+        let senior = senior.clone();
+        let res: anyhow::Result<Result<SeniorCloseOutcome, SeniorCloseError>> =
+            with_immediate(&pool, move |tx| {
+                Box::pin(async move {
+                    let r = shifts::senior_cashier_close_shift_with_audit(
+                        tx, stale_id, &senior, z_doc_id, EVIDENCE,
+                    )
+                    .await;
+                    anyhow::Ok(r)
+                })
+            })
+            .await;
+        res.unwrap()
+    };
+
+    assert!(
+        matches!(result, Err(SeniorCloseError::ShiftNotFound { .. })),
+        "expected ShiftNotFound error, got {result:?}"
     );
 }
