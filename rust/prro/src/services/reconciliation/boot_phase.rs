@@ -1295,13 +1295,21 @@ pub async fn run_boot_reconciliation(
                 .await?;
                 let orphans_resolved = orphans.len();
                 for (shift_id, current) in orphans {
-                    // LOW 4 fix: whitelist alignment — `any → ERROR`
-                    // is allowed per W0-1 §2.2 (operator-forced
-                    // terminal state).  Raw UPDATE bypasses
-                    // `shifts::transition_state` but preserves I8.
-                    // Future maintainers MUST keep aligned; switch to
-                    // `shifts::transition_state_tx` when a tx-bound
-                    // variant is introduced.
+                    // Branch e2 system-context recovery — raw UPDATE to
+                    // 'ERROR' bypasses `shifts::transition_state` (which
+                    // would `Forbidden` per §4.1 whitelist) AND bypasses
+                    // `force_to_error_with_audit` (which requires
+                    // operator evidence_json — system-context has no
+                    // operator identity at boot).
+                    //
+                    // PR #66 R6 HIGH clarification: codified in spec §4.4
+                    // as ONE OF TWO entry surfaces for `Error` (the other
+                    // being operator-driven force seam).  Audit shape
+                    // `SHIFT_BOOT_ORPHAN_ERROR` (spec §8) distinct from
+                    // `SHIFT_FORCE_TO_ERROR` so forensic queries separate
+                    // boot recovery from operator escalation.  I8
+                    // preserved (no silent transition; audit emitted with
+                    // observed pre-state + branch context).
                     sqlx::query("UPDATE shifts SET state = 'ERROR' WHERE shift_id = ?")
                         .bind(shift_id)
                         .execute(&mut **tx)
