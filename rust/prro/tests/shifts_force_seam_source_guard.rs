@@ -137,7 +137,7 @@ async fn force_to_error_with_audit_source_guard_9_cases() {
 
         let outcome = with_immediate(&pool, move |tx| {
             Box::pin(async move {
-                let o = shifts::force_to_error_with_audit(tx, shift_id, EVIDENCE)
+                let o = shifts::force_to_error_with_audit(tx, shift_id, Some("op-007"), EVIDENCE)
                     .await
                     .map_err(|e| anyhow::anyhow!("force-seam: {e}"))?;
                 anyhow::Ok(o)
@@ -203,7 +203,7 @@ async fn force_to_manual_reconciliation_with_audit_source_guard_9_cases() {
 
         let outcome = with_immediate(&pool, move |tx| {
             Box::pin(async move {
-                let o = shifts::force_to_manual_reconciliation_with_audit(tx, shift_id, EVIDENCE)
+                let o = shifts::force_to_manual_reconciliation_with_audit(tx, shift_id, Some("op-007"), EVIDENCE)
                     .await
                     .map_err(|e| anyhow::anyhow!("force-seam: {e}"))?;
                 anyhow::Ok(o)

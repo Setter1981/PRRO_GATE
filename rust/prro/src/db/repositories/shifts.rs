@@ -79,9 +79,9 @@ pub fn allowed_transition(from: ShiftState, to: ShiftState) -> bool {
 
 /// M3b W14a-2a — typed outcome of `transition_state` CAS attempt.
 ///
-/// Replaces the M3a `bool` return of `transition` with a 3-way distinction
-/// so callers can react precisely without re-reading the DB on the cold
-/// path.  Per spec §11 acceptance #3:
+/// Replaces the M3a `bool` return of `transition` with a 4-way
+/// distinction so callers can react precisely without re-reading the DB
+/// on the cold path.  Per spec §11 acceptance #3:
 /// - `Applied` — exactly one row UPDATEd; the transition is durable.
 /// - `Forbidden { from, to }` — the pair is not in the §4.1 whitelist;
 ///   no DB write attempted, no audit emitted (caller's responsibility to
@@ -89,6 +89,12 @@ pub fn allowed_transition(from: ShiftState, to: ShiftState) -> bool {
 /// - `CASMiss { observed }` — whitelist passed but the row's current
 ///   state differs from `from` (concurrent writer or stale snapshot).
 ///   Caller decides retry / refuse.
+/// - `RowGone` — whitelist passed and CAS UPDATE matched 0 rows AND
+///   the row no longer exists at all (caller bug: stale `ShiftId` OR
+///   shift deleted by an orthogonal admin path).  Distinct from
+///   `CASMiss` so caller can surface a clean "shift not found" error
+///   without re-querying.  Symmetric with `load_state_tx` /
+///   `force_to_*` `ShiftNotFound` handling (PR #66 R1 M1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransitionOutcome {
     Applied,
@@ -99,6 +105,7 @@ pub enum TransitionOutcome {
     CASMiss {
         observed: ShiftState,
     },
+    RowGone,
 }
 
 pub async fn insert_created(
@@ -235,12 +242,20 @@ pub async fn transition_state(
     }
     // CAS miss: re-read current state for the caller's diagnostics.
     // Use the same tx so the read is serialised with our failed UPDATE.
-    let observed: ShiftState =
+    // PR #66 R1 M1: `fetch_optional` (not `fetch_one`) — symmetric with
+    // `load_state_tx` / force-seam helpers below.  `None` → caller's
+    // `ShiftId` is stale OR the row was deleted by an admin path;
+    // surface as `RowGone` so callers don't have to map opaque
+    // `sqlx::Error::RowNotFound`.
+    let observed: Option<ShiftState> =
         sqlx::query_scalar(r#"SELECT state as "state: ShiftState" FROM shifts WHERE shift_id = ?"#)
             .bind(id)
-            .fetch_one(&mut **tx)
+            .fetch_optional(&mut **tx)
             .await?;
-    Ok(TransitionOutcome::CASMiss { observed })
+    match observed {
+        Some(state) => Ok(TransitionOutcome::CASMiss { observed: state }),
+        None => Ok(TransitionOutcome::RowGone),
+    }
 }
 
 // ─── M3b W14a-2a: force seams + source-state guard + audit ────────────
@@ -397,6 +412,7 @@ fn build_refused_audit_payload(
 pub async fn force_to_error_with_audit(
     tx: &mut WriteTxConn<'_>,
     shift_id: ShiftId,
+    actor_id: Option<&str>,
     evidence_json: &str,
 ) -> Result<ForceSeamOutcome, ForceSeamError> {
     validate_evidence_json(evidence_json)?;
@@ -416,13 +432,15 @@ pub async fn force_to_error_with_audit(
             FORCE_TO_ERROR_SEAM_NAME,
             evidence_json,
         );
+        // PR #66 R1 M2: actor_id populated on `audit_log.actor` column
+        // (was: None; forensic-attribution gap per reviewer M2).
         audit_log::append_tx(
             tx,
             "shift",
             &shift_id_hex,
             "SHIFT_FORCE_SEAM_REFUSED",
             Severity::Warning,
-            None,
+            actor_id,
             Some(&payload),
         )
         .await?;
@@ -448,7 +466,7 @@ pub async fn force_to_error_with_audit(
         &shift_id_hex,
         "SHIFT_FORCE_TO_ERROR",
         Severity::Critical,
-        None,
+        actor_id,
         Some(&success_payload),
     )
     .await?;
@@ -476,6 +494,7 @@ pub async fn force_to_error_with_audit(
 pub async fn force_to_manual_reconciliation_with_audit(
     tx: &mut WriteTxConn<'_>,
     shift_id: ShiftId,
+    actor_id: Option<&str>,
     evidence_json: &str,
 ) -> Result<ForceSeamOutcome, ForceSeamError> {
     validate_evidence_json(evidence_json)?;
@@ -495,13 +514,14 @@ pub async fn force_to_manual_reconciliation_with_audit(
             FORCE_TO_MANUAL_SEAM_NAME,
             evidence_json,
         );
+        // PR #66 R1 M2: actor_id populated for forensic attribution.
         audit_log::append_tx(
             tx,
             "shift",
             &shift_id_hex,
             "SHIFT_FORCE_SEAM_REFUSED",
             Severity::Warning,
-            None,
+            actor_id,
             Some(&payload),
         )
         .await?;
@@ -525,7 +545,7 @@ pub async fn force_to_manual_reconciliation_with_audit(
         &shift_id_hex,
         "SHIFT_FORCE_TO_MANUAL_RECONCILIATION",
         Severity::Critical,
-        None,
+        actor_id,
         Some(&success_payload),
     )
     .await?;
@@ -551,30 +571,39 @@ pub async fn force_to_manual_reconciliation_with_audit(
 // - Source state MUST be Opened or ClosingLocalPendingDrain (the only
 //   states where senior close is meaningful per spec §5.6 matrix).
 
-/// W14a-2a senior-close-seam invocation error.  Distinct from
-/// [`ForceSeamError`]: senior close is a legitimate clean-close path,
-/// not an operator escalation.
-#[derive(Debug, thiserror::Error)]
-pub enum SeniorCloseError {
-    /// Current shift state is not closable via senior path (per spec
-    /// §5.6, senior close meaningful only from Opened / ClosingLocal
-    /// PendingDrain).  No transition committed.
-    #[error("senior close refused: current state {current_state:?} not closable")]
-    NotClosable { current_state: ShiftState },
-
+/// W14a-2a senior-close-seam outcome.  Mirrors the [`ForceSeamOutcome`]
+/// Ok-return pattern (PR #66 R1 M3): legitimate refusals are returned
+/// inside `Ok(_)` so the surrounding `with_immediate` envelope COMMITS
+/// the `SHIFT_SENIOR_CLOSE_REFUSED` Warning audit row.  This preserves
+/// the forensic trail for abuse detection (bad actor scanning senior
+/// cashier IDs leaves a record), mirroring spec §8 + Round 7 §8.1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeniorCloseOutcome {
+    /// State transitioned to `Closed`; Info audit emitted with actor =
+    /// senior cashier id.
+    Applied,
+    /// Shift state was not closable per spec §5.6 (only `Opened` /
+    /// `ClosingLocalPendingDrain` accept senior close); state UNCHANGED;
+    /// `SHIFT_SENIOR_CLOSE_REFUSED` Warning audit emitted with
+    /// `reason: "not_closable"`.
+    RefusedNotClosable { current_state: ShiftState },
     /// `senior_cashier_id` is not registered in `cashier_certs` for the
-    /// shift's fiscal_number.  No transition committed.  Operator UI
-    /// responsibility to ensure the senior cashier has a cert binding
-    /// before invoking the seam.
-    #[error(
-        "senior cashier {senior_cashier_id} not registered in cashier_certs \
-         for fiscal_number {fiscal_number}"
-    )]
-    SeniorCashierNotRegistered {
+    /// shift's fiscal_number; state UNCHANGED;
+    /// `SHIFT_SENIOR_CLOSE_REFUSED` Warning audit emitted with
+    /// `reason: "cashier_not_registered"`.
+    RefusedCashierNotRegistered {
         senior_cashier_id: CashierId,
         fiscal_number: String,
     },
+}
 
+/// W14a-2a senior-close-seam pre-flight validation error.  Reserved for
+/// caller bugs (malformed evidence_json, stale shift_id) + DB-side
+/// failures.  Legitimate refusal cases (`NotClosable`,
+/// `SeniorCashierNotRegistered`) are NOT here — they're outcomes
+/// because the tx must commit the refused-audit row.
+#[derive(Debug, thiserror::Error)]
+pub enum SeniorCloseError {
     /// `evidence_json` is not valid JSON OR exceeds
     /// [`FORCE_SEAM_EVIDENCE_MAX_BYTES`].
     #[error("evidence_json invalid: {0}")]
@@ -609,7 +638,7 @@ pub async fn senior_cashier_close_shift_with_audit(
     senior_cashier_id: &CashierId,
     z_report_doc_id: DocumentId,
     evidence_json: &str,
-) -> Result<(), SeniorCloseError> {
+) -> Result<SeniorCloseOutcome, SeniorCloseError> {
     // 1. Validate evidence (size + JSON shape).
     if evidence_json.len() > FORCE_SEAM_EVIDENCE_MAX_BYTES {
         return Err(SeniorCloseError::InvalidEvidenceJson(format!(
@@ -632,16 +661,46 @@ pub async fn senior_cashier_close_shift_with_audit(
     let (current_state, fiscal_number) = row.ok_or_else(|| SeniorCloseError::ShiftNotFound {
         shift_id_hex: hex_lower(shift_id.as_bytes()),
     })?;
+    let shift_id_hex = hex_lower(shift_id.as_bytes());
 
-    // 3. Source-state restriction per spec §5.6.
+    // PR #66 R1 M3: build refused-audit payload helper for both
+    // legitimate-refusal branches (NotClosable + CashierNotRegistered).
+    // Per spec §8 + Round 7 §8.1: Ok-return contract preserves the
+    // refused audit row via with_immediate commit (forensic trail for
+    // abuse detection — bad actor scanning senior IDs leaves a record).
+    let make_refused_payload = |reason: &str| -> String {
+        serde_json::json!({
+            "fiscal_number": fiscal_number,
+            "shift_id": shift_id_hex,
+            "current_state": current_state.as_str(),
+            "attempted_seam": "senior_cashier_close_shift_with_audit",
+            "senior_cashier_id": senior_cashier_id.as_str(),
+            "z_report_document_id": hex_lower(z_report_doc_id.as_bytes()),
+            "reason": reason,
+            "evidence_json": evidence_json,
+        })
+        .to_string()
+    };
+
+    // 3. Source-state restriction per spec §5.6 — refused if not closable.
     use ShiftState::*;
     if !matches!(current_state, Opened | ClosingLocalPendingDrain) {
-        return Err(SeniorCloseError::NotClosable { current_state });
+        let payload = make_refused_payload("not_closable");
+        audit_log::append_tx(
+            tx,
+            "shift",
+            &shift_id_hex,
+            "SHIFT_SENIOR_CLOSE_REFUSED",
+            Severity::Warning,
+            Some(senior_cashier_id.as_str()),
+            Some(&payload),
+        )
+        .await?;
+        return Ok(SeniorCloseOutcome::RefusedNotClosable { current_state });
     }
 
     // 4. Runtime existence check: senior cashier MUST be registered in
-    //    cashier_certs for THIS fiscal_number.  Schema-enforced (PK on
-    //    cashier_id, fiscal_number).  Per operator decision 2026-05-17.
+    //    cashier_certs for THIS fiscal_number.  Refused with audit if not.
     let registered: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM cashier_certs WHERE cashier_id = ? AND fiscal_number = ?",
     )
@@ -650,15 +709,24 @@ pub async fn senior_cashier_close_shift_with_audit(
     .fetch_one(&mut **tx)
     .await?;
     if registered == 0 {
-        return Err(SeniorCloseError::SeniorCashierNotRegistered {
+        let payload = make_refused_payload("cashier_not_registered");
+        audit_log::append_tx(
+            tx,
+            "shift",
+            &shift_id_hex,
+            "SHIFT_SENIOR_CLOSE_REFUSED",
+            Severity::Warning,
+            Some(senior_cashier_id.as_str()),
+            Some(&payload),
+        )
+        .await?;
+        return Ok(SeniorCloseOutcome::RefusedCashierNotRegistered {
             senior_cashier_id: senior_cashier_id.clone(),
             fiscal_number,
         });
     }
 
-    // 5. Emit Info audit first (so the audit row commits if the UPDATE
-    //    fails the surrounding tx — forensic evidence of the attempt).
-    let shift_id_hex = hex_lower(shift_id.as_bytes());
+    // 5. Allowed path — emit Info audit first, then commit transition.
     let payload = serde_json::json!({
         "fiscal_number": fiscal_number,
         "shift_id": shift_id_hex,
@@ -693,5 +761,5 @@ pub async fn senior_cashier_close_shift_with_audit(
     .bind(shift_id)
     .execute(&mut **tx)
     .await?;
-    Ok(())
+    Ok(SeniorCloseOutcome::Applied)
 }

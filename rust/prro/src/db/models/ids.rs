@@ -172,6 +172,18 @@ impl<'r> Decode<'r, Sqlite> for CashierId {
         // checked at insert time; bypass the constructor checks to avoid
         // rejecting historical rows that pre-date W14a-2a (including the
         // `__pre_w14a1__` sentinel from migration 016 back-fill).
+        //
+        // PR #66 R1 L1: defensive observability — emit `tracing::warn!`
+        // if a stored cashier_id ever exceeds MAX_LEN.  No panic, no
+        // Decode error (would reject the row); operators detect schema
+        // drift via logs.
+        if s.len() > Self::MAX_LEN {
+            tracing::warn!(
+                cashier_id_len = s.len(),
+                max_len = Self::MAX_LEN,
+                "CashierId decoded value exceeds MAX_LEN — possible upstream schema drift"
+            );
+        }
         Ok(Self(s))
     }
 }
