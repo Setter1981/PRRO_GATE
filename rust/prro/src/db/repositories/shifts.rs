@@ -81,20 +81,25 @@ pub fn allowed_transition(from: ShiftState, to: ShiftState) -> bool {
 ///
 /// Replaces the M3a `bool` return of `transition` with a 4-way
 /// distinction so callers can react precisely without re-reading the DB
-/// on the cold path.  Per spec §11 acceptance #3:
+/// on the cold path.  Per spec §11 acceptance #3.  Variant naming
+/// mirrors [`crate::db::repositories::fiscal_documents::TransitionOutcome`]
+/// (Applied / Forbidden / Conflict / NotFound) for cross-repository
+/// consistency (PR #66 R2 MED-1).  This enum extends the convention
+/// with metadata in `Forbidden` + `Conflict` for richer caller
+/// diagnostics:
 /// - `Applied` — exactly one row UPDATEd; the transition is durable.
 /// - `Forbidden { from, to }` — the pair is not in the §4.1 whitelist;
 ///   no DB write attempted, no audit emitted (caller's responsibility to
 ///   surface as bug or recoverable state machine drift).
-/// - `CASMiss { observed }` — whitelist passed but the row's current
+/// - `Conflict { observed }` — whitelist passed but the row's current
 ///   state differs from `from` (concurrent writer or stale snapshot).
-///   Caller decides retry / refuse.
-/// - `RowGone` — whitelist passed and CAS UPDATE matched 0 rows AND
+///   Caller decides retry / refuse.  Matches `fiscal_documents::Conflict`
+///   semantics.
+/// - `NotFound` — whitelist passed and CAS UPDATE matched 0 rows AND
 ///   the row no longer exists at all (caller bug: stale `ShiftId` OR
-///   shift deleted by an orthogonal admin path).  Distinct from
-///   `CASMiss` so caller can surface a clean "shift not found" error
-///   without re-querying.  Symmetric with `load_state_tx` /
-///   `force_to_*` `ShiftNotFound` handling (PR #66 R1 M1).
+///   shift deleted by an orthogonal admin path).  Matches
+///   `fiscal_documents::NotFound`.  Symmetric with `load_state_tx` /
+///   `force_to_*` `ShiftNotFound` handling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransitionOutcome {
     Applied,
@@ -102,10 +107,10 @@ pub enum TransitionOutcome {
         from: ShiftState,
         to: ShiftState,
     },
-    CASMiss {
+    Conflict {
         observed: ShiftState,
     },
-    RowGone,
+    NotFound,
 }
 
 pub async fn insert_created(
@@ -181,7 +186,7 @@ pub async fn get_tx(tx: &mut WriteTxConn<'_>, id: ShiftId) -> sqlx::Result<Optio
 ///
 /// Preserved for backward-compat with M3a callers (test harness).
 /// M3b W14a-2a callers SHOULD prefer [`transition_state`] for the typed
-/// `TransitionOutcome` distinction between Forbidden / CASMiss.
+/// `TransitionOutcome` distinction between Forbidden / Conflict.
 ///
 /// The `allowed_transition` whitelist is enforced in code (cheap)
 /// before hitting the DB.
@@ -245,16 +250,17 @@ pub async fn transition_state(
     // PR #66 R1 M1: `fetch_optional` (not `fetch_one`) — symmetric with
     // `load_state_tx` / force-seam helpers below.  `None` → caller's
     // `ShiftId` is stale OR the row was deleted by an admin path;
-    // surface as `RowGone` so callers don't have to map opaque
-    // `sqlx::Error::RowNotFound`.
+    // surface as `NotFound` (PR #66 R2 MED-1: matches
+    // `fiscal_documents::TransitionOutcome::NotFound` naming) so callers
+    // don't have to map opaque `sqlx::Error::RowNotFound`.
     let observed: Option<ShiftState> =
         sqlx::query_scalar(r#"SELECT state as "state: ShiftState" FROM shifts WHERE shift_id = ?"#)
             .bind(id)
             .fetch_optional(&mut **tx)
             .await?;
     match observed {
-        Some(state) => Ok(TransitionOutcome::CASMiss { observed: state }),
-        None => Ok(TransitionOutcome::RowGone),
+        Some(state) => Ok(TransitionOutcome::Conflict { observed: state }),
+        None => Ok(TransitionOutcome::NotFound),
     }
 }
 
@@ -359,20 +365,9 @@ fn validate_evidence_json(s: &str) -> Result<(), ForceSeamError> {
         .map_err(|e| ForceSeamError::InvalidEvidenceJson(format!("not valid JSON: {e}")))
 }
 
-/// Internal: load current shift state inside `tx` for force-seam guards.
-async fn load_state_tx(
-    tx: &mut WriteTxConn<'_>,
-    shift_id: ShiftId,
-) -> Result<ShiftState, ForceSeamError> {
-    let row: Option<ShiftState> =
-        sqlx::query_scalar(r#"SELECT state as "state: ShiftState" FROM shifts WHERE shift_id = ?"#)
-            .bind(shift_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    row.ok_or_else(|| ForceSeamError::ShiftNotFound {
-        shift_id_hex: hex_lower(shift_id.as_bytes()),
-    })
-}
+// PR #66 R2 LOW-1: `load_state_tx` removed — both force seams now load
+// state + fiscal_number in a single `query_as` (matches senior_close
+// pattern).  Symmetry retained at the SQL layer.
 
 /// Internal: build the refused-seam audit payload combining metadata +
 /// the full evidence_json the caller provided per spec §8 (forensic
@@ -416,13 +411,19 @@ pub async fn force_to_error_with_audit(
     evidence_json: &str,
 ) -> Result<ForceSeamOutcome, ForceSeamError> {
     validate_evidence_json(evidence_json)?;
-    let current_state = load_state_tx(tx, shift_id).await?;
+    // PR #66 R2 LOW-1: collapse state+fiscal_number to single round-trip
+    // (matches senior_close pattern at line 655).
+    let actor_id = actor_id.filter(|s| !s.is_empty());  // R2 LOW-4: drop Some("")
+    let row: Option<(ShiftState, String)> = sqlx::query_as(
+        r#"SELECT state as "state: ShiftState", fiscal_number FROM shifts WHERE shift_id = ?"#,
+    )
+    .bind(shift_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let (current_state, fiscal_number) = row.ok_or_else(|| ForceSeamError::ShiftNotFound {
+        shift_id_hex: hex_lower(shift_id.as_bytes()),
+    })?;
     let shift_id_hex = hex_lower(shift_id.as_bytes());
-    let fiscal_number: String =
-        sqlx::query_scalar("SELECT fiscal_number FROM shifts WHERE shift_id = ?")
-            .bind(shift_id)
-            .fetch_one(&mut **tx)
-            .await?;
 
     if !force_to_error_allows_source(current_state) {
         let payload = build_refused_audit_payload(
@@ -470,11 +471,23 @@ pub async fn force_to_error_with_audit(
         Some(&success_payload),
     )
     .await?;
-    sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ?")
+    // PR #66 R2 MED-3: CAS-WHERE-state guard — defensive depth.  BEGIN
+    // IMMEDIATE serialises today, but the guard documents intent at the
+    // SQL layer + protects against future refactors that might invoke
+    // the seam outside a `with_immediate` envelope.
+    let res = sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ? AND state = ?")
         .bind(ShiftState::Error)
         .bind(shift_id)
+        .bind(current_state)
         .execute(&mut **tx)
         .await?;
+    assert_eq!(
+        res.rows_affected(),
+        1,
+        "force_to_error_with_audit CAS-WHERE-state guard hit 0 rows — \
+         BEGIN IMMEDIATE isolation broke OR shift_id raced; this is a bug \
+         in tx envelope discipline, not a recoverable runtime state"
+    );
     Ok(ForceSeamOutcome::Applied)
 }
 
@@ -498,13 +511,18 @@ pub async fn force_to_manual_reconciliation_with_audit(
     evidence_json: &str,
 ) -> Result<ForceSeamOutcome, ForceSeamError> {
     validate_evidence_json(evidence_json)?;
-    let current_state = load_state_tx(tx, shift_id).await?;
+    // PR #66 R2 LOW-1 + LOW-4: single round-trip + actor_id empty filter.
+    let actor_id = actor_id.filter(|s| !s.is_empty());
+    let row: Option<(ShiftState, String)> = sqlx::query_as(
+        r#"SELECT state as "state: ShiftState", fiscal_number FROM shifts WHERE shift_id = ?"#,
+    )
+    .bind(shift_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let (current_state, fiscal_number) = row.ok_or_else(|| ForceSeamError::ShiftNotFound {
+        shift_id_hex: hex_lower(shift_id.as_bytes()),
+    })?;
     let shift_id_hex = hex_lower(shift_id.as_bytes());
-    let fiscal_number: String =
-        sqlx::query_scalar("SELECT fiscal_number FROM shifts WHERE shift_id = ?")
-            .bind(shift_id)
-            .fetch_one(&mut **tx)
-            .await?;
 
     if !force_to_manual_allows_source(current_state) {
         let payload = build_refused_audit_payload(
@@ -549,11 +567,21 @@ pub async fn force_to_manual_reconciliation_with_audit(
         Some(&success_payload),
     )
     .await?;
-    sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ?")
+    // PR #66 R2 MED-3: CAS-WHERE-state guard — see force_to_error_with_audit
+    // for rationale (defensive depth + future-refactor protection).
+    let res = sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ? AND state = ?")
         .bind(ShiftState::RequiresManualReconciliation)
         .bind(shift_id)
+        .bind(current_state)
         .execute(&mut **tx)
         .await?;
+    assert_eq!(
+        res.rows_affected(),
+        1,
+        "force_to_manual_reconciliation_with_audit CAS-WHERE-state guard hit \
+         0 rows — BEGIN IMMEDIATE isolation broke OR shift_id raced; bug \
+         in tx envelope discipline, not a recoverable runtime state"
+    );
     Ok(ForceSeamOutcome::Applied)
 }
 
@@ -662,6 +690,9 @@ pub async fn senior_cashier_close_shift_with_audit(
         shift_id_hex: hex_lower(shift_id.as_bytes()),
     })?;
     let shift_id_hex = hex_lower(shift_id.as_bytes());
+    // PR #66 R2 LOW-2: hoist z_report hex (computed twice in R1 — once
+    // inside refused closure, once in success payload).
+    let z_report_doc_hex = hex_lower(z_report_doc_id.as_bytes());
 
     // PR #66 R1 M3: build refused-audit payload helper for both
     // legitimate-refusal branches (NotClosable + CashierNotRegistered).
@@ -675,7 +706,7 @@ pub async fn senior_cashier_close_shift_with_audit(
             "current_state": current_state.as_str(),
             "attempted_seam": "senior_cashier_close_shift_with_audit",
             "senior_cashier_id": senior_cashier_id.as_str(),
-            "z_report_document_id": hex_lower(z_report_doc_id.as_bytes()),
+            "z_report_document_id": z_report_doc_hex,
             "reason": reason,
             "evidence_json": evidence_json,
         })
@@ -733,7 +764,7 @@ pub async fn senior_cashier_close_shift_with_audit(
         "from_state": current_state.as_str(),
         "to_state": ShiftState::Closed.as_str(),
         "closed_by_senior_cashier_id": senior_cashier_id.as_str(),
-        "z_report_document_id": hex_lower(z_report_doc_id.as_bytes()),
+        "z_report_document_id": z_report_doc_hex,
         "evidence_json": evidence_json,
     })
     .to_string();
@@ -750,16 +781,29 @@ pub async fn senior_cashier_close_shift_with_audit(
 
     // 6. UPDATE shifts — state + closed_by_cashier_id + z_report ref +
     //    closed_at.  Single statement, in-tx.
-    sqlx::query(
+    // PR #66 R2 MED-3: CAS-WHERE-state guard — defensive depth.  We
+    // already validated `current_state ∈ {Opened, ClosingLocalPendingDrain}`
+    // at step 3, but the explicit WHERE state = ? + asserted rows_affected
+    // documents intent + protects against future refactors that might
+    // invoke outside `with_immediate`.
+    let res = sqlx::query(
         "UPDATE shifts SET state = ?, closed_by_cashier_id = ?, z_report_document_id = ?, \
             closed_at = CURRENT_TIMESTAMP \
-         WHERE shift_id = ?",
+         WHERE shift_id = ? AND state = ?",
     )
     .bind(ShiftState::Closed)
     .bind(senior_cashier_id.as_str())
     .bind(z_report_doc_id)
     .bind(shift_id)
+    .bind(current_state)
     .execute(&mut **tx)
     .await?;
+    assert_eq!(
+        res.rows_affected(),
+        1,
+        "senior_cashier_close_shift_with_audit CAS-WHERE-state guard hit \
+         0 rows — BEGIN IMMEDIATE isolation broke OR shift_id raced; bug \
+         in tx envelope discipline, not a recoverable runtime state"
+    );
     Ok(SeniorCloseOutcome::Applied)
 }

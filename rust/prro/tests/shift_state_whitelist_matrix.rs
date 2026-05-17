@@ -164,3 +164,31 @@ async fn whitelist_matrix_14_allowed_67_forbidden_via_transition_state() {
     assert_eq!(applied_count, 14, "spec §4.1: 14 whitelist edges");
     assert_eq!(forbidden_count, 9 * 9 - 14, "9*9 - 14 = 67 forbidden pairs");
 }
+
+/// PR #66 R2 LOW-6: regression test for `TransitionOutcome::NotFound`
+/// (renamed from `RowGone` in R2 MED-1).  Calls `transition_state` with
+/// a never-seeded `ShiftId::new()` — the CAS-WHERE-state UPDATE matches
+/// 0 rows AND the row doesn't exist → `NotFound` (was: opaque
+/// `sqlx::Error::RowNotFound` pre-R1).
+#[tokio::test]
+async fn transition_state_returns_not_found_for_stale_shift_id() {
+    use prro::db::tx::with_immediate;
+
+    let (pool, _fn_id) = fresh_with_fn().await;
+    let stale_id = ShiftId::new();
+
+    let outcome = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            let o = shifts::transition_state(tx, stale_id, ShiftState::Created, ShiftState::Opening)
+                .await?;
+            anyhow::Ok(o)
+        })
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(outcome, TransitionOutcome::NotFound),
+        "stale ShiftId must surface as NotFound, got {outcome:?}"
+    );
+}

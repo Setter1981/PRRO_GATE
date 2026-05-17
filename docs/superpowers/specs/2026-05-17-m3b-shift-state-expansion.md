@@ -1253,6 +1253,7 @@ Additions to §8 audit event vocabulary:
 | `MAC_RESEED_FAILED` | **Critical** | §16.3 MacReseedRecovery escalation |
 | `TECH_SUPPORT_REPAIR_INVOKED` | **Critical** | §16.3 TechSupportRepair seam |
 | `SHIFT_CLOSED_BY_SENIOR_CASHIER` | Info | §16.9 senior cashier close |
+| `SHIFT_SENIOR_CLOSE_REFUSED` | Warning | §16.9 senior cashier close — refused-audit emitted on `NotClosable` (shift state not in {Opened, ClosingLocalPendingDrain}) OR `CashierNotRegistered` (senior_cashier_id not in `cashier_certs` for shift's fiscal_number).  Forensic-traceability per spec §8 + Round 7 §8.1 (Ok-return contract preserves audit via `with_immediate` commit).  Added 2026-05-17 in PR #66 R1 M3 (W14a-2a senior close refactor). |
 | `OFFLINE_LIMIT_EXCEEDED_INGRESS_REFUSED` | **Critical** | §16.5 36h ingress cap |
 | `DPS_LOCAL_SHIFT_STATE_DRIFT` | **Critical** | §16.12 boot DPS-DB check |
 | `SHIFT_CASHIER_UNAVAILABLE_OFFLINE_ORPHANS` | **Critical** | Case 10b — rare residual after §16.10 prevention |
