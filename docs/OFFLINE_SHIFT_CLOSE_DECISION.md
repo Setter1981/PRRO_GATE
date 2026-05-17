@@ -1,5 +1,7 @@
 # Offline SHIFT_CLOSE Decision
 
+> **M3b update 2026-05-17 (PR #63 merged at `e04031b`):** The 3-case `Closing` state overload analysis in §6.2 (online SHIFT_CLOSE in flight, offline local Z_REPORT, crash-recovery) drove the M3b shift state expansion. RESOLVED by introducing `ClosingLocalPendingDrain` + `RequiresManualReconciliation` states per `docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md` §3.1. Offline Z_REPORT now lands in `ClosingLocalPendingDrain` (not `Closing`), then drain → `Closed` (edge 13) or drain reject → `RequiresManualReconciliation` (edge 14). The "Closing overload" problem this doc identified is now design-resolved.
+
 ## 0. M3b correction 2026-05-16 (authoritative)
 
 This document is the **authoritative policy note** for offline shift close-of-day in the Rust gateway.  After Round 0 of the M3b W10 design we corrected an architectural error in the earlier framing: a blanket *"block Z-report whenever offline backlog or active offline session exists"* rule would trap an offline shift against the 24h legal limit with no compliant close-of-day exit.  The corrected policy distinguishes two distinct close-of-day paths:

@@ -1,6 +1,8 @@
 # M3 W0-1 findings — state + sequence
 
 > **Status update 2026-05-07:** ADR-M3-A1..A9 were approved and committed in `8c72a14` (`docs/superpowers/specs/2026-05-04-m2-pre-plan-adr.md`).  Any `PROPOSED — NOT COMMITTED` wording below is historical research-time wording; canonical ADR status is the committed ADR block.
+>
+> **M3b update 2026-05-17 (PR #63 merged at `e04031b`):** This doc describes M3a 6-state ShiftState baseline. M3b expands to 9 states (adds `OpenedLocalPendingDrain`, `ClosingLocalPendingDrain`, `RequiresManualReconciliation`) per `docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md`. M3a doc state machine (`PREPARED → SIGNED → ENCRYPTED → SENT → KVT1 → KVT2 → ACK / REJECTED / ERROR_*`) extended with `OFFLINE_LOCAL_ACK` durable Pattern C state preceding drain. For M3b runtime state contracts, consult the shift state expansion spec §3.1 (9-state enum table) + §16 (operational reality alignment).
 
 **Status:** research findings, not yet ratified.  Closes nothing — bd
 issues PRRO_GATE-ddn and PRRO_GATE-zti remain open until M3a

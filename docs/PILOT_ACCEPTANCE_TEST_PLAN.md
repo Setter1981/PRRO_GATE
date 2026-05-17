@@ -4,6 +4,8 @@
 **Date:** 2026-04-21  
 **Scope:** controlled pilot readiness for the Maria 304 to PRRO Gateway to DPS sandbox contour  
 
+> **M3b update 2026-05-17 (PR #63 merged at `e04031b`):** Phase 6 (Offline) + Phase 7 (Restart/Recovery) scenarios should reference M3b 9-state shift machine + new recovery class taxonomy per `docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md`. Specifically: offline shift open lifecycle uses `OpenedLocalPendingDrain` state; offline close-of-day uses `ClosingLocalPendingDrain`; drain success → `Closed`, drain reject → `RequiresManualReconciliation` (real Manual recon trigger per §16.7). Acceptance criteria for Phase 6/7 unaffected; state names refined.
+
 This document defines the proposed testing method before a live pilot. It is a
 test plan, not evidence that the pilot has already passed.
 

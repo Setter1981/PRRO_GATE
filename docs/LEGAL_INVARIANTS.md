@@ -35,7 +35,8 @@ Local Document Number повинен збільшуватись атомарно
 ### INV-04 — Не може бути двох активних змін для одного fiscal_number
 Спроба відкрити другу зміну при вже відкритій повинна бути відхилена.
 
-**Engineering enforcement:** `UNIQUE INDEX uq_active_shift_per_fiscal ON shifts(fiscal_number) WHERE state NOT IN ('CLOSED','ERROR')`.  
+**Engineering enforcement (M3b 9-state):** `UNIQUE INDEX uq_active_shift_per_fiscal ON shifts(fiscal_number) WHERE state NOT IN ('CLOSED','ERROR','REQUIRES_MANUAL_RECONCILIATION')`. Partial index whitelist excludes all terminal states; active in-progress states (`OPENING`, `OPENED_LOCAL_PENDING_DRAIN`, `OPENED`, `CLOSING_LOCAL_PENDING_DRAIN`, `CLOSING`) are covered by the index — only one row in any active state per fiscal_number permitted.  
+Cross-ref: M3b shift state expansion spec §3.1 (9-state enum) + §5.6 (`(ShiftOpen, *active*) → ✗-ShiftAlreadyOpen`) for the runtime guard layered on top of the partial index.  
 **Порушення:** подвійна фіскалізація, неузгодженість контрольної стрічки.
 
 ### INV-05 — Зміна каналу під час активної зміни заборонена
@@ -77,13 +78,19 @@ Failover між DPS-каналами (WebCheck/gRPC ↔ DFS HTTP/XML) дозво
 ### INV-09 — Офлайн-тривалість не більше 36 годин безперервно
 Безперервна тривалість офлайн-сесії не може перевищувати 36 годин.
 
-**Engineering enforcement:** `WritePathWorker.MAX_OFFLINE_CONTINUOUS_SECONDS = 36 * 3600`; `_check_offline_limits()` в write-path.  
+**Engineering enforcement (M3b):** після 36 годин **безперервної офлайн-сесії** (continuous, not cumulative — cumulative monthly cap is INV-10 / 168h) для FN, ingress відхиляє всі нові документи (`OFFLINE_LIMIT_EXCEEDED_INGRESS_REFUSED` Critical audit + operator pager per M3b shift state expansion spec §16.5). Threshold пов'язаний з `node_state.offline_session_started_at + 36h < now`. Існуючі OFFLINE_LOCAL_ACK документи зберігаються; drain виконується при поверненні online. Це **НЕ** Manual recon trigger — просто freeze ingress для FN.
+
+Synergy з 36h SHIFT_OPEN cert gate (§16.10): cert validates at SHIFT_OPEN з > 36h до expiry → offline session max 36h → cert не може expire mid-offline by design.
+
 **Джерело:** Наказ МФ №317.
 
 ### INV-10 — Офлайн не більше 168 годин на календарний місяць
 Накопичений офлайн-час за поточний місяць не може перевищувати 168 годин.
 
-**Engineering enforcement:** `WritePathWorker.MAX_OFFLINE_MONTH_SECONDS = 168 * 3600`; `current_month_offline_seconds` в `node_state`.  
+**Engineering enforcement (M3b):** `WritePathWorker.MAX_OFFLINE_MONTH_SECONDS = 168 * 3600`; `current_month_offline_seconds` в `node_state`.
+
+**Practice note (per 4-year operator empirics):** DPS server **does NOT** in practice return `Server -11` (168h cumulative limit) — обмеження існує в регуляціях але не enforced програмно DPS endpoint'ом з яким operator взаємодіяв. Defensive gateway-side enforcement remains as safety floor; landing in `Blocked` state if hit. Cross-ref M3b spec §16.15.
+
 **Джерело:** Наказ МФ №317.
 
 ### INV-11 — Офлайн-операція вимагає попередньо виданого діапазону фіскальних номерів
@@ -99,17 +106,21 @@ Failover між DPS-каналами (WebCheck/gRPC ↔ DFS HTTP/XML) дозво
 ### INV-13 — Офлайн-чек не є фінальним підтвердженням DPS до передачі та ACK
 Локально створений офлайн-документ є тимчасовим. Він стає фіскально легітимним тільки після отримання ACK від DPS.
 
-**Engineering enforcement:** **КРИТИЧНИЙ GAP** — зараз офлайн-документ повертається з `document_state=ACK`, що неправильно. Потрібні стани `OFFLINE_LOCAL_ACK → OFFLINE_PENDING_SYNC → DPS_ACK`. Виправлення в Sprint 1.
+**Engineering enforcement (M3b):** Pattern C state machine — `OFFLINE_LOCAL_ACK → Sending → Sent → Kvt1 → Kvt2 → Ack`. Документ зберігається в `fiscal_documents` з state `OFFLINE_LOCAL_ACK` (customer-facing receipt issued); drain виконується пізніше через W9b backlog drain + W12 KVT2 confirmation. Підпис застосовується **at drain time, NOT at ingress** (validated проти WebCheck decompiled + Python adapter — cross-ref M3b spec §16.11).
+
+**Round 8 architectural pin (§16.1):** `fiscal_documents` = ledger of issued receipts only. OFFLINE_LOCAL_ACK документи там legitimately persisted because customer has physical receipt; failed online attempts (DPS rejection) → audit_log only, NOT persisted.
 
 ### INV-14 — Офлайн-документи зберігаються локально до підтвердження DPS
-Документи в стані `OFFLINE_LOCAL_ACK` або `OFFLINE_PENDING_SYNC` не повинні видалятись або архівуватись до отримання `DPS_ACK`.
+Документи в стані `OFFLINE_LOCAL_ACK` не повинні видалятись або архівуватись до отримання `Ack` через drain pipeline.
 
-**Engineering enforcement:** **GAP** — `OfflineSyncService` не реалізований. Виправлення в Sprint 2.
+**Engineering enforcement (M3b):** W9b backlog drain orchestrator (per M3b plan §Task 9, BlockedBy W7 + W8) виконує drain в lnd ASC порядку через W9a-widened stage_send pipeline. Документи переходять `OFFLINE_LOCAL_ACK → Sending → Sent → Kvt1 → Kvt2 → Ack`. Archive / cleanup тільки після final Ack.
 
 ### INV-15 — Z-звіт / зміна не може закритись при наявності непереданих офлайн-документів
-Фіскальний денний звіт та закриття зміни повинні блокуватись при наявності офлайн-документів без DPS-підтвердження.
+Online Z_REPORT blocked while offline backlog pending. Offline-mode Z_REPORT (Pattern C local close) is the alternative escape hatch.
 
-**Engineering enforcement:** **GAP** — shift close guard не перевіряє `OFFLINE_PENDING_SYNC` документи. Виправлення в Sprint 2+.
+**Engineering enforcement (M3b):** W10 policy guard (per M3b plan §Task 10 — W10a primitive + W10b ingress wiring) перевіряє offline backlog state перед routing Z_REPORT. Online Z_REPORT з non-empty OFFLINE_LOCAL_ACK backlog → refuse з `ONLINE_Z_REPORT_BLOCKED_BACKLOG` audit (per PR #62 policy correction). Offline Z_REPORT через Pattern C → ClosingLocalPendingDrain state → drain через W9b → final Closed (cross-ref M3b spec §4.1 edge 13).
+
+Online ops resume only after FULL drain completes for FN (per M3b spec §3.3 online-ops-resume rule) — count mismatch on Z_REPORT is impossible by design (§16.14).
 
 ---
 
@@ -142,7 +153,19 @@ Failover між DPS-каналами (WebCheck/gRPC ↔ DFS HTTP/XML) дозво
 ### INV-19 — Кожен перехід стану повинен бути відновлюваним або явно позначеним для ручної звірки
 Жоден документ не повинен застрягати в невизначеному стані без діагностики та recovery-шляху.
 
-**Engineering enforcement:** `ReconciliationService`; стани `ERROR_RETRYABLE`, `REQUIRES_MANUAL_RECONCILIATION`; admin retry endpoint; recovery ceiling.
+**Engineering enforcement (M3b expanded taxonomy per spec §16.3):** замість бінарного `ERROR_RETRYABLE` / `REQUIRES_MANUAL_RECONCILIATION` — повна taxonomy з 5 recovery classes:
+- **`AutoOfflineFallback`** — unknown DPS errors → auto-switch to OFFLINE + tech support notification (NOT Manual recon)
+- **`TechSupportEscalation`** — hard rejects що пройшли ingress validation → hold for tech support triage
+- **`KeyRotationPending`** — cashier cert near expiry → refuse SHIFT_OPEN OR auto-swap to deferred key (per §16.10 36h gate)
+- **`MacReseedRecovery`** — MAC chain desync → auto-fetch DPS anchor via probe doc (WebCheck pattern)
+- **`TechSupportRepair`** — boot-time mirror breach → audited manual DB repair seam (NOT Manual recon)
+
+Manual recon ("ЧП из ЧП" per `feedback_manual_recon_catastrophe` memory + spec §3.5) **confirmed trigger families** (per spec §16.7):
+- **(1) Any W9b drain reject of an `OFFLINE_LOCAL_ACK` backlog doc** on `OpenedLocalPendingDrain` / `ClosingLocalPendingDrain` → `RequiresManualReconciliation` per §6.3 universal `EscalateManual` rule + edges 6 / 14. This is the **primary Manual recon surface** because drain has crossed the local-commit threshold (customer-facing receipt outstanding); rollback semantics don't apply regardless of underlying `DpsError` class. **FN deregistered while offline** is the operator-confirmed real-world subtype (Case 10).
+- **(2) Ambiguous wire timeout** on online `SHIFT_OPEN` (edge 4) or online `Z_REPORT` (edge 12) — we sent the lifecycle doc but got no response, cannot determine if DPS accepted.
+- **(3) Operator-driven force seam** invocation declaring shift unsalvageable based on out-of-band context (e.g. confirmed week-long DPS maintenance).
+
+Every Manual landing → Critical audit + forensic snapshot capture (§8.1) + ≤60s out-of-band operator pager (§8.2).
 
 ### INV-20 — Канал подання чека є частиною фіскального маршруту і повинен бути в аудиті
 Кожен фіскальний документ повинен мати записаний `submission_channel`, `backend_profile_id`, `transport_profile_id`.

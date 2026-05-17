@@ -1,6 +1,13 @@
 # M3 W0-3 findings — retry / recovery policy
 
 > **Status update 2026-05-07:** ADR-M3-A1..A9 were approved and committed in `8c72a14` (`docs/superpowers/specs/2026-05-04-m2-pre-plan-adr.md`).  Any `PROPOSED — NOT COMMITTED` wording below is historical research-time wording; canonical ADR status is the committed ADR block.
+>
+> **M3b update 2026-05-17 (PR #63 merged at `e04031b`):** Several contracts in this doc are OVERRIDDEN by `docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md` §16 (Round 8 operational reality alignment) + §16.21 (Round 9 offline transition strategy):
+> - **Retry budgets (§1.1 below)**: Round 7 had proposed 20-attempts/30min cap для Transport class. **M3b §16.4 reverses this: Transport budget UNBOUNDED** per operator-pinned decision ("ждём хоть год пока DPS не вернётся"). Hard rejects retain bounded budgets (0-3 attempts per error class).
+> - **Recovery routing (§2 DpsError → retry policy table)**: M3b §16.3 introduces 5 new recovery classes (`AutoOfflineFallback` / `TechSupportEscalation` / `KeyRotationPending` / `MacReseedRecovery` / `TechSupportRepair`) — `EscalateManual` no longer the default for unknown DPS errors. Unknown / ambiguous **non-lifecycle** DPS errors (e.g. `SELL` / `RETURN` / `SERVICE_*`) → `AutoOfflineFallback` (auto-switch to OFFLINE + tech support notification, NOT Manual recon). **Ambiguous wire timeout after online `SHIFT_OPEN` / online `Z_REPORT`** (lifecycle docs that drive shift state edges 4 + 12) stays on the Manual / tech-support path per §16.7 — these are explicitly enumerated as real Manual recon triggers because the shift state machine cannot determine whether DPS accepted or rejected the lifecycle transition.
+> - **DB-vs-log persistence (§16.1)**: failed DPS rejections + invalid ingress payloads → audit_log only, NOT `fiscal_documents`. Transport-class failures persist as `Sending` / `ErrorRetryable` for crash-recovery purposes only.
+>
+> Tables and per-status classifications below remain valid as M3a research baseline; for M3b runtime contracts, consult `2026-05-17-m3b-shift-state-expansion.md` §16 first.
 
 **Status:** research findings, not yet ratified.  Closes nothing —
 PRRO_GATE-6bj and PRRO_GATE-ah8 remain open until M3a implementation
