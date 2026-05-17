@@ -421,8 +421,8 @@ async fn branch_e2_orphan_shift_resolves_to_error_and_resets_shift_state() {
     // Orphan shift row in OPENING with NO matching pending doc.
     let shift_bytes = vec![0xAB; 16];
     sqlx::query(
-        "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at) \
-         VALUES (?, '1234567890', 'OPENING', 'ONLINE', '2026-05-10T00:00:00Z')",
+        "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at, opened_by_cashier_id) \
+         VALUES (?, '1234567890', 'OPENING', 'ONLINE', '2026-05-10T00:00:00Z', 'test-cashier')",
     )
     .bind(&shift_bytes)
     .execute(&pool)
@@ -512,8 +512,8 @@ async fn branch_e2_handles_multiple_orphan_shifts() {
     ] {
         let shift_bytes = vec![*i; 16];
         sqlx::query(
-            "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at) \
-             VALUES (?, '1234567890', ?, 'ONLINE', '2026-05-10T00:00:00Z')",
+            "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at, opened_by_cashier_id) \
+             VALUES (?, '1234567890', ?, 'ONLINE', '2026-05-10T00:00:00Z', 'test-cashier')",
         )
         .bind(&shift_bytes)
         .bind(*state)
@@ -555,8 +555,8 @@ async fn branch_e2_idempotent_second_boot_dispatches_to_b() {
     seed_node_state(&pool, "1234567890", "ONLINE", "OPENING", 1).await;
     let shift_bytes = vec![0xAB; 16];
     sqlx::query(
-        "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at) \
-         VALUES (?, '1234567890', 'OPENING', 'ONLINE', '2026-05-10T00:00:00Z')",
+        "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at, opened_by_cashier_id) \
+         VALUES (?, '1234567890', 'OPENING', 'ONLINE', '2026-05-10T00:00:00Z', 'test-cashier')",
     )
     .bind(&shift_bytes)
     .execute(&pool)
@@ -786,8 +786,8 @@ listen  = "127.0.0.1:8443"
     seed_fn_config(app.db(), "5555555555").await;
     seed_node_state(app.db(), "5555555555", "ONLINE", "OPENING", 1).await;
     sqlx::query(
-        "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at) \
-         VALUES (?, '5555555555', 'OPENING', 'ONLINE', '2026-05-10T00:00:00Z')",
+        "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at, opened_by_cashier_id) \
+         VALUES (?, '5555555555', 'OPENING', 'ONLINE', '2026-05-10T00:00:00Z', 'test-cashier')",
     )
     .bind(vec![0x55u8; 16])
     .execute(app.db())
@@ -869,8 +869,8 @@ async fn branch_partition_exhaustive_matrix() {
         // requires one (e1 strict + e2).
         if let Some(shift_state) = seed_shifts_row {
             sqlx::query(
-                "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at) \
-                 VALUES (?, ?, ?, 'ONLINE', '2026-05-10T00:00:00Z')",
+                "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at, opened_by_cashier_id) \
+                 VALUES (?, ?, ?, 'ONLINE', '2026-05-10T00:00:00Z', 'test-cashier')",
             )
             .bind(vec![i as u8; 16])
             .bind(&fn_id)

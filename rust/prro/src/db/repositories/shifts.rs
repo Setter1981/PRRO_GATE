@@ -40,14 +40,17 @@ pub async fn insert_created(
     id: ShiftId,
     fiscal_number: &str,
     open_mode: &str,
+    opened_by_cashier_id: &str,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, cash_balance_kop) \
-         VALUES (?, ?, 'CREATED', ?, 0)",
+        "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, cash_balance_kop, \
+            opened_by_cashier_id) \
+         VALUES (?, ?, 'CREATED', ?, 0, ?)",
     )
     .bind(id)
     .bind(fiscal_number)
     .bind(open_mode)
+    .bind(opened_by_cashier_id)
     .execute(pool)
     .await?;
     Ok(())

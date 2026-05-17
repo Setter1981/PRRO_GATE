@@ -51,7 +51,7 @@ async fn fresh_with_fn() -> (sqlx::SqlitePool, String) {
 async fn insert_created_then_get() {
     let (pool, fn_id) = fresh_with_fn().await;
     let id = ShiftId::new();
-    shifts::insert_created(&pool, id, &fn_id, "ONLINE")
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier")
         .await
         .unwrap();
     let row = shifts::get(&pool, id).await.unwrap().unwrap();
@@ -66,7 +66,7 @@ async fn insert_created_then_get() {
 async fn allowed_transitions_succeed() {
     let (pool, fn_id) = fresh_with_fn().await;
     let id = ShiftId::new();
-    shifts::insert_created(&pool, id, &fn_id, "ONLINE")
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier")
         .await
         .unwrap();
     assert!(
@@ -90,7 +90,7 @@ async fn forbidden_transitions_blocked_in_code() {
     // Code-level whitelist must short-circuit BEFORE touching the DB.
     let (pool, fn_id) = fresh_with_fn().await;
     let id = ShiftId::new();
-    shifts::insert_created(&pool, id, &fn_id, "ONLINE")
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier")
         .await
         .unwrap();
     let did_it = tx_shift_transition(&pool, id, ShiftState::Created, ShiftState::Closed)
@@ -109,7 +109,7 @@ async fn cas_blocks_when_state_diverged() {
     // Allowed transition Opening → Opened, but row is in Created — CAS must reject.
     let (pool, fn_id) = fresh_with_fn().await;
     let id = ShiftId::new();
-    shifts::insert_created(&pool, id, &fn_id, "ONLINE")
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier")
         .await
         .unwrap();
     let did_it = tx_shift_transition(&pool, id, ShiftState::Opening, ShiftState::Opened)
