@@ -90,8 +90,8 @@ async fn shift_id_roundtrips_through_shifts_blob_column() {
     let id = ShiftId::new();
     sqlx::query(
         "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at, \
-            cash_balance_kop) VALUES (?, '5555555555', 'CREATED', 'ONLINE', \
-            '2026-04-22T00:00:00Z', 0)",
+            cash_balance_kop, opened_by_cashier_id) VALUES (?, '5555555555', 'CREATED', 'ONLINE', \
+            '2026-04-22T00:00:00Z', 0, 'test-cashier')",
     )
     .bind(id)
     .execute(&pool)

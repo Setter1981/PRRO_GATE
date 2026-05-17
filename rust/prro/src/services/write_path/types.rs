@@ -62,6 +62,15 @@ pub enum RejectionReason {
     },
     ShiftAlreadyOpen,
     ShiftInError,
+    /// Shift is in `RequiresManualReconciliation` (M3b §16.7 — drain
+    /// rejected an OFFLINE_LOCAL_ACK backlog doc OR ambiguous wire
+    /// timeout OR operator force seam).  Distinct from `ShiftInError`
+    /// because Manual is operator-action-territory (compensation
+    /// filings) rather than structural-breach territory; semantically
+    /// distinct surface for audit / metrics / operator UI labelling.
+    /// Per spec §5.6 (shift_state × doc_type matrix): ANY doc type
+    /// against `RequiresManualReconciliation` returns this reason.
+    ShiftRequiresOperatorAttention,
     /// `shift_state == Opened` but `current_shift_id IS NULL` OR the
     /// resolved shift is not itself `Opened`.  Per ADR-M3-A7 the
     /// canonical source of truth is `node_state.current_shift_id`;

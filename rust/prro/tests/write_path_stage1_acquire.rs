@@ -101,8 +101,8 @@ async fn seed_fn_with_profiles(
 async fn seed_open_shift(pool: &sqlx::SqlitePool) -> ShiftId {
     let shift_id = ShiftId::new();
     sqlx::query(
-        "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, cash_balance_kop) \
-         VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0)",
+        "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
     )
     .bind(shift_id)
     .bind(FN)

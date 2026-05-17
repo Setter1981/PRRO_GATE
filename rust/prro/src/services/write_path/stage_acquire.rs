@@ -328,16 +328,31 @@ async fn reject(
 /// Stage 2 shift-state guard.  Returns `Some(reason)` if the
 /// (doc_type, shift_state) pair is forbidden, `None` if allowed.
 ///
-/// **Order matters**: `ShiftState::Error` is terminal and applies
-/// uniformly to every doc_type, so the `(_, Error)` arm runs FIRST
-/// — before any `(SHIFT_OPEN, _)` / `(SHIFT_CLOSE, _)` / `(Z_REPORT, _)`
-/// catch-all that would otherwise mislabel an Error-state shift as
-/// `ShiftAlreadyOpen` / `ShiftNotOpen`.
+/// **Order matters**: `ShiftState::Error` and
+/// `ShiftState::RequiresManualReconciliation` are both terminal /
+/// operator-action states that apply uniformly to every doc_type, so
+/// their catch-all arms run FIRST — before any
+/// `(SHIFT_OPEN, _)` / `(SHIFT_CLOSE, _)` / `(Z_REPORT, _)` catch-all
+/// that would otherwise mislabel them as `ShiftAlreadyOpen` /
+/// `ShiftNotOpen`.  Per spec §5.6 matrix:
+///   - `(_, Error)` → `ShiftInError` (structural-breach surface).
+///   - `(_, RequiresManualReconciliation)` → `ShiftRequiresOperatorAttention`
+///     (operator-action / accounting-compensation surface; per M3b §16.7
+///     drain rejected an OFFLINE_LOCAL_ACK backlog doc, ambiguous wire
+///     timeout, or force seam).
 fn check_shift_guard(doc_type: DocType, shift_state: ShiftState) -> Option<RejectionReason> {
     match (doc_type, shift_state) {
         // ERROR is terminal — reject everything.  Must precede every
         // doc_type-specific catch-all below.
         (_, ShiftState::Error) => Some(RejectionReason::ShiftInError),
+        // REQUIRES_MANUAL_RECONCILIATION is operator-action territory — reject
+        // everything with the operator-attention surface (PR #65 R1 M1 per
+        // spec §5.6).  Distinct from `ShiftInError` so audit/metrics/UI
+        // can label appropriately (Manual = accounting compensation,
+        // Error = structural breach).
+        (_, ShiftState::RequiresManualReconciliation) => {
+            Some(RejectionReason::ShiftRequiresOperatorAttention)
+        }
         // Shift-management ops require specific shift states.
         (DocType::ShiftOpen, ShiftState::Closed) => None,
         (DocType::ShiftOpen, _) => Some(RejectionReason::ShiftAlreadyOpen),
@@ -370,16 +385,19 @@ fn check_shift_guard(doc_type: DocType, shift_state: ShiftState) -> Option<Rejec
         ) => Some(RejectionReason::ShiftNotOpen {
             current: shift_state,
         }),
-        // W14a-1 minimal compile coverage for the 3 new M3b shift states.
-        // Fiscal ops against `OpenedLocalPendingDrain` / `ClosingLocalPendingDrain`
-        // / `RequiresManualReconciliation` defensively refused via the existing
-        // `ShiftNotOpen` reason.  Full semantics land in W14a-2 (channel-aware
-        // offline ops on OpenedLocalPendingDrain per spec §3.3; explicit
-        // POST_LOCAL_CLOSE_SALE_REFUSED for ClosingLocalPendingDrain per
-        // PR #62 §W10; ShiftRequiresOperatorAttention reason for Manual per
-        // spec §5.6).  ShiftOpen + new states is already caught upstream by
-        // the `(ShiftOpen, _)` arm above (→ ShiftAlreadyOpen).  ShiftClose /
-        // ZReport + new states is caught by the catch-all below.
+        // W14a-1 minimal compile coverage for the 2 new in-flight M3b
+        // shift states.  Fiscal ops against `OpenedLocalPendingDrain` /
+        // `ClosingLocalPendingDrain` defensively refused via the existing
+        // `ShiftNotOpen` reason.  Full semantics land in W14a-2
+        // (channel-aware offline ops on OpenedLocalPendingDrain per spec
+        // §3.3; explicit POST_LOCAL_CLOSE_SALE_REFUSED for
+        // ClosingLocalPendingDrain per PR #62 §W10).
+        // (`RequiresManualReconciliation` is caught earlier by the
+        // `(_, ShiftState::RequiresManualReconciliation)` arm above —
+        // PR #65 R1 M1 fix per spec §5.6.)
+        // ShiftOpen + these in-flight states is already caught upstream
+        // by the `(ShiftOpen, _)` arm above (→ ShiftAlreadyOpen).
+        // ShiftClose / ZReport + these is caught by the catch-all below.
         (
             DocType::Sell
             | DocType::Return
@@ -388,8 +406,7 @@ fn check_shift_guard(doc_type: DocType, shift_state: ShiftState) -> Option<Rejec
             | DocType::CashWithdrawal
             | DocType::XReport,
             ShiftState::OpenedLocalPendingDrain
-            | ShiftState::ClosingLocalPendingDrain
-            | ShiftState::RequiresManualReconciliation,
+            | ShiftState::ClosingLocalPendingDrain,
         ) => Some(RejectionReason::ShiftNotOpen {
             current: shift_state,
         }),

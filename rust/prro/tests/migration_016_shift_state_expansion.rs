@@ -59,8 +59,8 @@ async fn migration_016_accepts_three_new_shift_states() {
     {
         let shift_id = vec![0xA0 + i as u8; 16];
         sqlx::query(
-            "INSERT INTO shifts(shift_id, fiscal_number, state, open_mode) \
-             VALUES (?, '9000000001', ?, 'OFFLINE')",
+            "INSERT INTO shifts(shift_id, fiscal_number, state, open_mode, opened_by_cashier_id) \
+             VALUES (?, '9000000001', ?, 'OFFLINE', 'test-cashier')",
         )
         .bind(&shift_id)
         .bind(*state)
@@ -107,8 +107,8 @@ async fn migration_016_preserves_existing_six_shift_states() {
     {
         let shift_id = vec![0xC0 + i as u8; 16];
         sqlx::query(
-            "INSERT INTO shifts(shift_id, fiscal_number, state, open_mode) \
-             VALUES (?, '9000000003', ?, 'ONLINE')",
+            "INSERT INTO shifts(shift_id, fiscal_number, state, open_mode, opened_by_cashier_id) \
+             VALUES (?, '9000000003', ?, 'ONLINE', 'test-cashier')",
         )
         .bind(&shift_id)
         .bind(*state)
@@ -181,63 +181,87 @@ async fn migration_016_shifts_has_new_cashier_columns() {
     assert_eq!(closed, None, "closed_by_cashier_id must default NULL");
 }
 
-// ─── (6) operator_certs.deferred column + partial unique index ───────
+// ─── (6) cashier_certs table — cashier-scoped primary + deferred binding ───
+// Per PR #65 R1 H2 fix: replaced earlier FN-scoped operator_certs.deferred
+// boolean with proper cashier-scoped cashier_certs table per spec §16.17.
 
-#[tokio::test]
-async fn migration_016_operator_certs_has_deferred_column() {
-    let (_d, pool) = fresh_pool().await;
-    seed_fn(&pool, "9000002000").await;
-
-    // ski_hex CHECK requires length=64 hex chars.
-    let ski = "a".repeat(64);
+async fn seed_op_cert(pool: &SqlitePool, fn_id: &str, ski_hex: &str) {
     sqlx::query(
         "INSERT INTO operator_certs(ski_hex, fiscal_number, cert_fingerprint, cert_der, \
-            fetched_at, source, active, deferred) \
-         VALUES (?, '9000002000', 'fp01', X'AB', '2026-05-17T00:00:00Z', 'manual', 0, 1)",
+            fetched_at, source, active) \
+         VALUES (?, ?, 'fp', X'AB', '2026-05-17T00:00:00Z', 'manual', 0)",
     )
-    .bind(&ski)
-    .execute(&pool)
+    .bind(ski_hex)
+    .bind(fn_id)
+    .execute(pool)
     .await
-    .expect("deferred=1 must be accepted");
-
-    let deferred: i64 =
-        sqlx::query_scalar("SELECT deferred FROM operator_certs WHERE ski_hex = ?")
-            .bind(&ski)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(deferred, 1);
+    .expect("seed operator_cert");
 }
 
 #[tokio::test]
-async fn migration_016_operator_certs_deferred_unique_per_fn() {
+async fn migration_016_cashier_certs_table_accepts_primary_and_deferred() {
+    let (_d, pool) = fresh_pool().await;
+    seed_fn(&pool, "9000002000").await;
+    let primary_ski = "a".repeat(64);
+    let deferred_ski = "b".repeat(64);
+    seed_op_cert(&pool, "9000002000", &primary_ski).await;
+    seed_op_cert(&pool, "9000002000", &deferred_ski).await;
+
+    sqlx::query(
+        "INSERT INTO cashier_certs(cashier_id, fiscal_number, primary_cert_ski_hex, deferred_cert_ski_hex) \
+         VALUES ('cashier-vasya', '9000002000', ?, ?)",
+    )
+    .bind(&primary_ski)
+    .bind(&deferred_ski)
+    .execute(&pool)
+    .await
+    .expect("primary + deferred binding must be accepted");
+
+    let (got_primary, got_deferred): (String, Option<String>) = sqlx::query_as(
+        "SELECT primary_cert_ski_hex, deferred_cert_ski_hex FROM cashier_certs \
+         WHERE cashier_id = 'cashier-vasya' AND fiscal_number = '9000002000'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(got_primary, primary_ski);
+    assert_eq!(got_deferred.as_deref(), Some(deferred_ski.as_str()));
+}
+
+#[tokio::test]
+async fn migration_016_cashier_certs_deferred_ski_unique_across_bindings() {
+    // Same physical deferred cert MUST NOT bind to two different (cashier,
+    // FN) tuples — defence against accidental dual-binding per §16.17.
     let (_d, pool) = fresh_pool().await;
     seed_fn(&pool, "9000003000").await;
+    let p1 = "c".repeat(64);
+    let p2 = "d".repeat(64);
+    let deferred = "e".repeat(64);
+    seed_op_cert(&pool, "9000003000", &p1).await;
+    seed_op_cert(&pool, "9000003000", &p2).await;
+    seed_op_cert(&pool, "9000003000", &deferred).await;
 
-    let ski1 = "b".repeat(64);
-    let ski2 = "c".repeat(64);
-
-    // First deferred cert — succeeds.
     sqlx::query(
-        "INSERT INTO operator_certs(ski_hex, fiscal_number, cert_fingerprint, cert_der, \
-            fetched_at, source, active, deferred) \
-         VALUES (?, '9000003000', 'fp_d1', X'CD', '2026-05-17T00:00:00Z', 'manual', 0, 1)",
+        "INSERT INTO cashier_certs(cashier_id, fiscal_number, primary_cert_ski_hex, deferred_cert_ski_hex) \
+         VALUES ('cashier-A', '9000003000', ?, ?)",
     )
-    .bind(&ski1)
+    .bind(&p1)
+    .bind(&deferred)
     .execute(&pool)
     .await
     .unwrap();
 
-    // Second deferred cert for the same FN — must violate partial unique index.
+    // Second binding referring to the same deferred SKI — must violate the
+    // ux_cashier_certs_deferred_ski partial unique index.
     let res = sqlx::query(
-        "INSERT INTO operator_certs(ski_hex, fiscal_number, cert_fingerprint, cert_der, \
-            fetched_at, source, active, deferred) \
-         VALUES (?, '9000003000', 'fp_d2', X'EF', '2026-05-17T00:00:00Z', 'manual', 0, 1)",
+        "INSERT INTO cashier_certs(cashier_id, fiscal_number, primary_cert_ski_hex, deferred_cert_ski_hex) \
+         VALUES ('cashier-B', '9000003000', ?, ?)",
     )
-    .bind(&ski2)
+    .bind(&p2)
+    .bind(&deferred)
     .execute(&pool)
     .await;
-    let err = res.expect_err("partial unique index ux_op_certs_deferred_per_fn must block 2nd deferred");
+    let err = res.expect_err("ux_cashier_certs_deferred_ski must block dual-bind of same deferred");
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("unique") || msg.contains("constraint"),
@@ -263,6 +287,10 @@ async fn migration_016_triggers_preserved_post_rebuild() {
         (
             "node_state_updated_at",
             "CREATE TRIGGER node_state_updated_at\nAFTER UPDATE ON node_state\nBEGIN\n    UPDATE node_state SET updated_at = CURRENT_TIMESTAMP WHERE fiscal_number = NEW.fiscal_number;\nEND",
+        ),
+        (
+            "cashier_certs_updated_at",
+            "CREATE TRIGGER cashier_certs_updated_at\nAFTER UPDATE ON cashier_certs\nBEGIN\n    UPDATE cashier_certs SET updated_at = CURRENT_TIMESTAMP\n    WHERE cashier_id = NEW.cashier_id AND fiscal_number = NEW.fiscal_number;\nEND",
         ),
     ];
 
@@ -332,7 +360,9 @@ async fn migration_016_preserves_fd_updated_at_during_w4_dance() {
     .await
     .unwrap();
 
-    // Seed shift row in pre-016 6-state schema (state='OPENED').
+    // Seed shift row in pre-016 6-state schema (state='OPENED').  Pre-016
+    // schema has no opened_by_cashier_id column — migration 016 back-fills
+    // the sentinel '__pre_w14a1__' per spec §16.17.
     let shift_id: Vec<u8> = vec![0xE0u8; 16];
     sqlx::query(
         "INSERT INTO shifts(shift_id, fiscal_number, state, open_mode, opened_at) \
@@ -432,5 +462,20 @@ async fn migration_016_preserves_fd_updated_at_during_w4_dance() {
     assert_eq!(
         stash_present, 0,
         "_w14a1_shift_id_tmp column must be dropped after W4 dance completes"
+    );
+
+    // PR #65 R1 H1: confirm the pre-W14a-1 sentinel back-fill populated
+    // opened_by_cashier_id for the legacy row (spec §16.17 NOT NULL).
+    let back_filled: String = sqlx::query_scalar(
+        "SELECT opened_by_cashier_id FROM shifts WHERE shift_id = ?",
+    )
+    .bind(&shift_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        back_filled, "__pre_w14a1__",
+        "migration 016 must back-fill opened_by_cashier_id with sentinel for pre-W14a-1 rows \
+         (operator IT can later UPDATE to real cashier identity via remediation script)"
     );
 }

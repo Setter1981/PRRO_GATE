@@ -128,8 +128,8 @@ CREATE TABLE shifts (
     close_document_id      BLOB,
     z_report_document_id   BLOB,
     cash_balance_kop       INTEGER NOT NULL DEFAULT 0,
-    opened_by_cashier_id   TEXT,                        -- NEW (W14a-1): cashier identity, NULL allowed in W14a-1
-    closed_by_cashier_id   TEXT,                        -- NEW (W14a-1): senior cashier close support per §16.9
+    opened_by_cashier_id   TEXT    NOT NULL,            -- NEW (W14a-1, spec §16.8 + §16.17): cashier identity required for 1-cashier-per-shift invariant; FK to cashier registry deferred to W14a-2 (registry table not yet in schema)
+    closed_by_cashier_id   TEXT,                        -- NEW (W14a-1, spec §16.9): senior cashier close support; NULL = not yet closed OR same cashier as opener; populated via senior_cashier_close_shift_with_audit seam (W14a-2)
     created_at             TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
     updated_at             TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
     FOREIGN KEY (fiscal_number) REFERENCES fiscal_number_config(fiscal_number) ON DELETE RESTRICT
@@ -137,9 +137,17 @@ CREATE TABLE shifts (
 
 -- Step 8: restore rows from snapshot.  Identity map for the 6 existing
 -- state values (CREATED / OPENING / OPENED / CLOSING / CLOSED / ERROR);
--- new columns default to NULL.  Pre-pilot has zero rows but the dance
--- MUST work for populated DBs too (fixture test pinned in spec §9.2
--- acceptance).
+-- new opened_by_cashier_id back-filled with sentinel for pre-W14a-1 rows
+-- (NOT NULL column per spec §16.17 — no NULL accumulation possible).
+-- Pre-pilot has zero shifts rows so this back-fill is unreachable in
+-- normal pre-pilot deploys; for any populated dev/CI DB that ran
+-- pre-W14a-1 code, the sentinel '__pre_w14a1__' is operator-visible and
+-- queryable for retroactive cashier-identity remediation (operator IT
+-- can UPDATE shifts SET opened_by_cashier_id = '<real-cashier>' WHERE
+-- opened_by_cashier_id = '__pre_w14a1__' once the identity is known).
+-- closed_by_cashier_id is NULLABLE (only populated for senior-cashier
+-- close path per §16.9; legacy rows default to NULL = same cashier as
+-- opener OR not yet closed — semantics resolved at runtime).
 INSERT INTO shifts (
     shift_id, fiscal_number, serial, state, open_mode, opened_at, closed_at,
     open_document_id, close_document_id, z_report_document_id, cash_balance_kop,
@@ -148,8 +156,8 @@ INSERT INTO shifts (
 SELECT
     shift_id, fiscal_number, serial, state, open_mode, opened_at, closed_at,
     open_document_id, close_document_id, z_report_document_id, cash_balance_kop,
-    NULL AS opened_by_cashier_id,     -- back-fill: pre-W14a-1 had no cashier identity captured
-    NULL AS closed_by_cashier_id,     -- same
+    '__pre_w14a1__' AS opened_by_cashier_id,    -- spec §16.17 NOT NULL; sentinel for legacy rows (unreachable in pre-pilot but defensive for dev/CI)
+    NULL AS closed_by_cashier_id,               -- §16.9: senior-cashier-close only
     created_at, updated_at
 FROM __w14a1_shifts_tmp__;
 
@@ -252,17 +260,54 @@ END;
 DROP TABLE __w14a1_node_state_tmp__;
 
 
--- ─── operator_certs extension — deferred replacement key support ────
--- Mirrors the existing `active` flag pattern from 003.  When an operator
--- pre-registers a backup cert for the same fiscal_number, gateway W14a-2
--- KeyRotationPending recovery class (§16.3) checks deferred=1 at SHIFT_OPEN
--- time and auto-swaps if primary cert is within 36h of expiry (§16.10).
-ALTER TABLE operator_certs ADD COLUMN deferred INTEGER NOT NULL DEFAULT 0  CHECK (deferred IN (0, 1));
+-- ─── cashier_certs — cashier-scoped primary + deferred cert binding ──
+-- Spec §16.17: "If `cashier_certs` table doesn't exist yet, migration
+-- 016 creates it (or amends `operator_certs` if that's the right
+-- existing table)."  Reviewer-pinned per PR #65 R1 H2: FN-scoped boolean
+-- (initial W14a-1 design) was too weak — multiple cashiers on the same
+-- FN would compete for the single deferred slot.  Proper cashier-scoped
+-- binding here per §16.10 36h key-expiry SHIFT_OPEN gate semantics.
+--
+-- Schema: each (cashier_id, fiscal_number) tuple may bind a primary cert
+-- (active for sign operations) and an optional deferred cert (used by
+-- W14a-2 auto-swap when primary nears 36h expiry per §16.10).  Both cert
+-- references key operator_certs.ski_hex (the cert PK from 003).
+--
+-- W14a-2 KeyRotationPending recovery class (§16.3) reads this table at
+-- SHIFT_OPEN time; if primary cert.NotAfter - now < 36h AND
+-- deferred_cert_ski_hex IS NOT NULL, it swaps (primary ← deferred,
+-- deferred ← NULL) inside the same with_immediate envelope.
 
--- Partial unique index — at most one deferred cert per fiscal_number at any
--- given time.  Mirrors `ux_op_certs_active_per_fn` from 003.
-CREATE UNIQUE INDEX ux_op_certs_deferred_per_fn
-    ON operator_certs(fiscal_number) WHERE deferred = 1;
+CREATE TABLE cashier_certs (
+    cashier_id              TEXT    NOT NULL,
+    fiscal_number           TEXT    NOT NULL,
+    primary_cert_ski_hex    TEXT    NOT NULL  CHECK (length(primary_cert_ski_hex) = 64),
+    deferred_cert_ski_hex   TEXT              CHECK (deferred_cert_ski_hex IS NULL OR length(deferred_cert_ski_hex) = 64),
+    created_at              TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    updated_at              TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    PRIMARY KEY (cashier_id, fiscal_number),
+    FOREIGN KEY (fiscal_number)         REFERENCES fiscal_number_config(fiscal_number) ON DELETE RESTRICT,
+    FOREIGN KEY (primary_cert_ski_hex)  REFERENCES operator_certs(ski_hex)             ON DELETE RESTRICT,
+    FOREIGN KEY (deferred_cert_ski_hex) REFERENCES operator_certs(ski_hex)             ON DELETE RESTRICT
+) STRICT;
+
+-- Index for FN-wide cashier enumeration (operator-IT queries: "all
+-- cashiers registered to this FN").
+CREATE INDEX ix_cashier_certs_fn ON cashier_certs(fiscal_number);
+
+-- Partial unique index — each cert can be a deferred for at most one
+-- (cashier, FN) tuple (defence against accidental dual-binding of the
+-- same physical cert as deferred for multiple cashiers).
+CREATE UNIQUE INDEX ux_cashier_certs_deferred_ski
+    ON cashier_certs(deferred_cert_ski_hex) WHERE deferred_cert_ski_hex IS NOT NULL;
+
+-- Trigger to refresh updated_at on UPDATE (mirrors pattern from 001).
+CREATE TRIGGER cashier_certs_updated_at
+AFTER UPDATE ON cashier_certs
+BEGIN
+    UPDATE cashier_certs SET updated_at = CURRENT_TIMESTAMP
+    WHERE cashier_id = NEW.cashier_id AND fiscal_number = NEW.fiscal_number;
+END;
 
 
 -- ─── FK guard exit ──────────────────────────────────────────────────
