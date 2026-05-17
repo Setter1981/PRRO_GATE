@@ -219,3 +219,6 @@ W14a-2a in-scope items (final):
 Out of W14a-2a (deferred to W14a-2b):
 - Channel-aware stage_acquire rewrite for OpenedLocalPendingDrain / ClosingLocalPendingDrain.
 - Sign-time cashier enforcement (SigningContext plumbing).
+
+Pre-merge senior review residuals (PR #66 final round; non-blocking, deferred to W14a-2b polish):
+- **LOW** — direct test for `shifts::TransitionOutcome::Conflict` variant.  Currently `Conflict { observed: <other_state> }` is variant-defined + reachable through integration paths, but not exercised by a dedicated unit test in `tests/shift_state_whitelist_matrix.rs`.  `fiscal_documents` repo has the equivalent test at `repo_fiscal_documents_state_cas.rs:117`.  W14a-2b should add a parallel test for shifts: seed shift in `Opened`, mutate state to `Closing` via direct UPDATE inside `with_immediate`, then invoke `transition_state(Opened → Closing)` (whitelist-allowed) and assert `Conflict { observed: Closing }`.  ~10 LoC; locks the diagnostic re-read logic against future regression.
