@@ -125,20 +125,39 @@ async fn cas_blocks_when_state_diverged() {
 #[tokio::test]
 async fn allowed_transition_table_matrix() {
     use ShiftState::*;
-    // Allowed (must be true).
-    assert!(shifts::allowed_transition(Created, Opening));
-    assert!(shifts::allowed_transition(Opening, Opened));
-    assert!(shifts::allowed_transition(Opening, Error));
-    assert!(shifts::allowed_transition(Opened, Closing));
-    assert!(shifts::allowed_transition(Closing, Closed));
-    assert!(shifts::allowed_transition(Closing, Error));
-    assert!(shifts::allowed_transition(Error, Closed));
+    // M3b W14a-2a: 14-edge whitelist per spec §4.1.
+    // Allowed (must be true) — 14 edges.
+    assert!(shifts::allowed_transition(Created, Opening));                            // 1
+    assert!(shifts::allowed_transition(Created, OpenedLocalPendingDrain));            // 2
+    assert!(shifts::allowed_transition(Opening, Opened));                             // 3
+    assert!(shifts::allowed_transition(Opening, RequiresManualReconciliation));       // 4
+    assert!(shifts::allowed_transition(OpenedLocalPendingDrain, Opened));             // 5
+    assert!(shifts::allowed_transition(OpenedLocalPendingDrain, RequiresManualReconciliation));   // 6
+    assert!(shifts::allowed_transition(OpenedLocalPendingDrain, ClosingLocalPendingDrain));       // 7
+    assert!(shifts::allowed_transition(Opened, Closing));                             // 8
+    assert!(shifts::allowed_transition(Opened, ClosingLocalPendingDrain));            // 9
+    assert!(shifts::allowed_transition(Closing, Closed));                             // 10
+    assert!(shifts::allowed_transition(Closing, Opened));                             // 11 — DocumentReject rollback
+    assert!(shifts::allowed_transition(Closing, RequiresManualReconciliation));       // 12
+    assert!(shifts::allowed_transition(ClosingLocalPendingDrain, Closed));            // 13
+    assert!(shifts::allowed_transition(ClosingLocalPendingDrain, RequiresManualReconciliation));  // 14
 
-    // Forbidden (must be false).
-    assert!(!shifts::allowed_transition(Closed, Opening)); // re-open final state
-    assert!(!shifts::allowed_transition(Created, Opened)); // skipped Opening
-    assert!(!shifts::allowed_transition(Created, Closed)); // skipped pipeline
-    assert!(!shifts::allowed_transition(Opened, Created)); // backwards
-    assert!(!shifts::allowed_transition(Closed, Closed)); // self-loop
-    assert!(!shifts::allowed_transition(Error, Opened)); // recovery → not back to Opened
+    // Forbidden (must be false) — sample of structural violations.
+    // Per spec §4.4: Error is reachable ONLY via force_to_error_with_audit seam;
+    // no whitelist edge ever lands on Error.
+    assert!(!shifts::allowed_transition(Opening, Error));   // M3a edge REMOVED per §4.4
+    assert!(!shifts::allowed_transition(Closing, Error));   // M3a edge REMOVED per §4.4
+    assert!(!shifts::allowed_transition(Error, Closed));    // M3a recovery edge REMOVED — terminal force-seam state
+    assert!(!shifts::allowed_transition(Closed, Opening));  // re-open final state
+    assert!(!shifts::allowed_transition(Created, Opened));  // skipped Opening
+    assert!(!shifts::allowed_transition(Created, Closed));  // skipped pipeline
+    assert!(!shifts::allowed_transition(Opened, Created));  // backwards
+    assert!(!shifts::allowed_transition(Closed, Closed));   // self-loop
+    assert!(!shifts::allowed_transition(Error, Opened));    // recovery → not back to Opened (terminal)
+    // Forbidden: ClosingLocalPendingDrain → Opened (per §4.4 "No ClosingLocalPendingDrain → Opened")
+    assert!(!shifts::allowed_transition(ClosingLocalPendingDrain, Opened));
+    // Forbidden: OpenedLocalPendingDrain → Closed directly (must route via ClosingLocalPendingDrain)
+    assert!(!shifts::allowed_transition(OpenedLocalPendingDrain, Closed));
+    // Forbidden: OpenedLocalPendingDrain → Opening (forward-only on open-side)
+    assert!(!shifts::allowed_transition(OpenedLocalPendingDrain, Opening));
 }

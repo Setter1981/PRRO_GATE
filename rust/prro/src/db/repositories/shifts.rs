@@ -8,8 +8,13 @@
 //!   whitelist.  CAS ensures concurrent transitions cannot race; the whitelist
 //!   short-circuits forbidden moves before touching the DB.
 
-use crate::db::models::{enums::ShiftState, ids::ShiftId};
+use crate::db::models::{
+    enums::{Severity, ShiftState},
+    ids::{CashierId, DocumentId, ShiftId},
+};
+use crate::db::repositories::audit_log;
 use crate::db::tx::WriteTxConn;
+use crate::services::write_path::types::hex_encode_lower as hex_lower;
 use sqlx::SqlitePool;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,18 +26,79 @@ pub struct ShiftRow {
     pub cash_balance_kop: i64,
 }
 
+/// M3b W14a-2a — whitelist of allowed shift state transitions per spec
+/// `docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md` §4.1.
+///
+/// Drift-guard: edge count is locked at **14**.  Any addition / removal
+/// MUST update both this function body AND the matching scanner test
+/// `tests/shift_state_whitelist_matrix.rs` (9×9 = 81 (from, to) pairs:
+/// 14 Applied + 67 Forbidden).
+///
+/// Per spec §4.4 forbidden patterns:
+/// - **`Error` is reachable ONLY via `force_to_error_with_audit` seam.**
+///   No whitelist edge ever lands on `Error`.
+/// - **`RequiresManualReconciliation` is reachable via edges 4 / 6 / 12 / 14
+///   OR via `force_to_manual_reconciliation_with_audit` seam.**  Nothing
+///   else.
+///
+/// The 14 edges (#N matches spec §4.1 numbering):
+///   1.  Created → Opening                      (online SHIFT_OPEN ingress)
+///   2.  Created → OpenedLocalPendingDrain      (offline SHIFT_OPEN ingress, Pattern C)
+///   3.  Opening → Opened                       (online send → DPS Ack)
+///   4.  Opening → RequiresManualReconciliation (hard reject / operator give-up)
+///   5.  OpenedLocalPendingDrain → Opened       (drain SHIFT_OPEN Ack + empty backlog)
+///   6.  OpenedLocalPendingDrain → RequiresManualReconciliation (drain reject)
+///   7.  OpenedLocalPendingDrain → ClosingLocalPendingDrain     (offline Z_REPORT before drain)
+///   8.  Opened → Closing                       (online Z_REPORT / SHIFT_CLOSE ingress)
+///   9.  Opened → ClosingLocalPendingDrain      (offline Z_REPORT, Pattern C)
+///   10. Closing → Closed                       (online send → DPS Ack)
+///   11. Closing → Opened                       (`Authorization::DocumentReject` only per §6.2)
+///   12. Closing → RequiresManualReconciliation (hard reject)
+///   13. ClosingLocalPendingDrain → Closed      (drain reached final Ack on all backlog)
+///   14. ClosingLocalPendingDrain → RequiresManualReconciliation (drain reject)
 pub fn allowed_transition(from: ShiftState, to: ShiftState) -> bool {
     use ShiftState::*;
     matches!(
         (from, to),
-        (Created, Opening)
-            | (Opening, Opened)
-            | (Opening, Error)
-            | (Opened, Closing)
-            | (Closing, Closed)
-            | (Closing, Error)
-            | (Error, Closed) // operator-driven recovery close
+        (Created, Opening)                                  // 1
+            | (Created, OpenedLocalPendingDrain)            // 2
+            | (Opening, Opened)                             // 3
+            | (Opening, RequiresManualReconciliation)       // 4
+            | (OpenedLocalPendingDrain, Opened)             // 5
+            | (OpenedLocalPendingDrain, RequiresManualReconciliation)   // 6
+            | (OpenedLocalPendingDrain, ClosingLocalPendingDrain)       // 7
+            | (Opened, Closing)                             // 8
+            | (Opened, ClosingLocalPendingDrain)            // 9
+            | (Closing, Closed)                             // 10
+            | (Closing, Opened)                             // 11
+            | (Closing, RequiresManualReconciliation)       // 12
+            | (ClosingLocalPendingDrain, Closed)            // 13
+            | (ClosingLocalPendingDrain, RequiresManualReconciliation)  // 14
     )
+}
+
+/// M3b W14a-2a — typed outcome of `transition_state` CAS attempt.
+///
+/// Replaces the M3a `bool` return of `transition` with a 3-way distinction
+/// so callers can react precisely without re-reading the DB on the cold
+/// path.  Per spec §11 acceptance #3:
+/// - `Applied` — exactly one row UPDATEd; the transition is durable.
+/// - `Forbidden { from, to }` — the pair is not in the §4.1 whitelist;
+///   no DB write attempted, no audit emitted (caller's responsibility to
+///   surface as bug or recoverable state machine drift).
+/// - `CASMiss { observed }` — whitelist passed but the row's current
+///   state differs from `from` (concurrent writer or stale snapshot).
+///   Caller decides retry / refuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransitionOutcome {
+    Applied,
+    Forbidden {
+        from: ShiftState,
+        to: ShiftState,
+    },
+    CASMiss {
+        observed: ShiftState,
+    },
 }
 
 pub async fn insert_created(
@@ -101,10 +167,14 @@ pub async fn get_tx(tx: &mut WriteTxConn<'_>, id: ShiftId) -> sqlx::Result<Optio
     }))
 }
 
-/// Atomic CAS state transition.  Returns true if exactly one row
-/// changed (transition succeeded), false otherwise.  Caller decides
-/// what to do on `false` (typically: load current state and decide
-/// whether to retry or give up).
+/// Atomic CAS state transition (M3a — bool return).  Returns true if
+/// exactly one row changed (transition succeeded), false otherwise.
+/// Caller decides what to do on `false` (typically: load current state
+/// and decide whether to retry or give up).
+///
+/// Preserved for backward-compat with M3a callers (test harness).
+/// M3b W14a-2a callers SHOULD prefer [`transition_state`] for the typed
+/// `TransitionOutcome` distinction between Forbidden / CASMiss.
 ///
 /// The `allowed_transition` whitelist is enforced in code (cheap)
 /// before hitting the DB.
@@ -128,4 +198,500 @@ pub async fn transition(
         .execute(&mut **tx)
         .await?;
     Ok(res.rows_affected() == 1)
+}
+
+/// M3b W14a-2a — typed-outcome CAS state transition.
+///
+/// Same semantics as [`transition`] but returns [`TransitionOutcome`]
+/// for precise caller reaction:
+/// - `Applied` — exactly one row UPDATEd; the transition is durable.
+/// - `Forbidden { from, to }` — the pair is not in the [`allowed_transition`]
+///   whitelist; **no DB write attempted, no audit emitted**.  Caller
+///   should surface as bug / structural drift (not a normal recovery
+///   path; per spec §4.4 forbidden patterns).
+/// - `CASMiss { observed }` — whitelist passed but the row's current
+///   state differs from `from` (concurrent writer or stale snapshot).
+///   Caller decides retry / refuse based on `observed`.
+///
+/// `with_immediate` envelope discipline preserved per W2 ReconcileGuard:
+/// caller obtains `&mut WriteTxConn<'_>` from `with_immediate` closure.
+pub async fn transition_state(
+    tx: &mut WriteTxConn<'_>,
+    id: ShiftId,
+    from: ShiftState,
+    to: ShiftState,
+) -> sqlx::Result<TransitionOutcome> {
+    if !allowed_transition(from, to) {
+        return Ok(TransitionOutcome::Forbidden { from, to });
+    }
+    let res = sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ? AND state = ?")
+        .bind(to)
+        .bind(id)
+        .bind(from)
+        .execute(&mut **tx)
+        .await?;
+    if res.rows_affected() == 1 {
+        return Ok(TransitionOutcome::Applied);
+    }
+    // CAS miss: re-read current state for the caller's diagnostics.
+    // Use the same tx so the read is serialised with our failed UPDATE.
+    let observed: ShiftState =
+        sqlx::query_scalar(r#"SELECT state as "state: ShiftState" FROM shifts WHERE shift_id = ?"#)
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await?;
+    Ok(TransitionOutcome::CASMiss { observed })
+}
+
+// ─── M3b W14a-2a: force seams + source-state guard + audit ────────────
+//
+// Per spec §4.5 ("Force-error / manual seam") + §16.7 (real Manual recon
+// trigger surface) + §8 audit vocabulary.  Two distinct methods (not one
+// with `target: ShiftState` parameter) so grep `force_to_error_with_audit`
+// vs `force_to_manual_reconciliation_with_audit` cleanly distinguishes
+// intent in audit / forensic queries.
+//
+// Source-state restriction per Round 6 A-H1:
+// - `force_to_error_with_audit` allowed from: Opening, OpenedLocalPending
+//   Drain, Opened, Closing, ClosingLocalPendingDrain, RequiresManual
+//   Reconciliation.  Forbidden from: Created, Closed, Error.
+// - `force_to_manual_reconciliation_with_audit` allowed from: Opening,
+//   OpenedLocalPendingDrain, Opened, Closing, ClosingLocalPendingDrain.
+//   Forbidden from: Created, Closed, Error, RequiresManualReconciliation.
+
+/// Maximum byte length of evidence_json payload for force seams.  Sized
+/// generously for forensic completeness while preventing accidental
+/// large-blob storage in audit_log.  Spec §8: secrets-forbidden by
+/// convention; size cap defends against attack-shaped evidence floods.
+pub const FORCE_SEAM_EVIDENCE_MAX_BYTES: usize = 8 * 1024;
+
+/// W14a-2a force-seam invocation outcome.  Returned inside `Ok(_)` so
+/// the surrounding `with_immediate` envelope COMMITS even on
+/// `ForbiddenSource` — preserving the `SHIFT_FORCE_SEAM_REFUSED` audit
+/// row per spec §8 forensic-traceability requirement (Round 7 §8.1
+/// load-bearing pin).  Caller pattern-matches on this enum to know
+/// whether the state actually changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForceSeamOutcome {
+    /// State transitioned to the seam's target; Critical audit emitted.
+    Applied,
+    /// Current state was in the forbidden-sources list per spec §4.5;
+    /// state UNCHANGED; `SHIFT_FORCE_SEAM_REFUSED` Warning audit emitted
+    /// with full evidence_json envelope (forensic record of the attempt).
+    ForbiddenSource {
+        current_state: ShiftState,
+        attempted_seam: &'static str,
+    },
+}
+
+/// W14a-2a force-seam pre-flight validation error.  Reserved for caller
+/// bugs (malformed evidence_json, stale shift_id) + DB-side failures.
+/// `ForbiddenSource` is NOT here — it's a legitimate outcome (see
+/// [`ForceSeamOutcome::ForbiddenSource`]) because the tx must commit the
+/// refused-audit row.
+#[derive(Debug, thiserror::Error)]
+pub enum ForceSeamError {
+    /// `evidence_json` is not valid JSON OR exceeds [`FORCE_SEAM_EVIDENCE_MAX_BYTES`].
+    /// No transition committed; no audit emitted (caller bug; not an operator
+    /// action worth recording).
+    #[error("evidence_json invalid: {0}")]
+    InvalidEvidenceJson(String),
+
+    /// Shift row not found for the given id.  Caller bug (stale id) — no
+    /// transition committed.
+    #[error("shift {shift_id_hex} not found")]
+    ShiftNotFound { shift_id_hex: String },
+
+    /// Wrapped sqlx error (DB-side failure).
+    #[error("sqlx error: {0}")]
+    Db(#[from] sqlx::Error),
+}
+
+const FORCE_TO_ERROR_SEAM_NAME: &str = "force_to_error_with_audit";
+const FORCE_TO_MANUAL_SEAM_NAME: &str = "force_to_manual_reconciliation_with_audit";
+
+fn force_to_error_allows_source(state: ShiftState) -> bool {
+    use ShiftState::*;
+    matches!(
+        state,
+        Opening
+            | OpenedLocalPendingDrain
+            | Opened
+            | Closing
+            | ClosingLocalPendingDrain
+            | RequiresManualReconciliation
+    )
+}
+
+fn force_to_manual_allows_source(state: ShiftState) -> bool {
+    use ShiftState::*;
+    matches!(
+        state,
+        Opening | OpenedLocalPendingDrain | Opened | Closing | ClosingLocalPendingDrain
+    )
+}
+
+fn validate_evidence_json(s: &str) -> Result<(), ForceSeamError> {
+    if s.len() > FORCE_SEAM_EVIDENCE_MAX_BYTES {
+        return Err(ForceSeamError::InvalidEvidenceJson(format!(
+            "evidence_json {} bytes exceeds cap {}",
+            s.len(),
+            FORCE_SEAM_EVIDENCE_MAX_BYTES
+        )));
+    }
+    serde_json::from_str::<serde_json::Value>(s)
+        .map(|_| ())
+        .map_err(|e| ForceSeamError::InvalidEvidenceJson(format!("not valid JSON: {e}")))
+}
+
+/// Internal: load current shift state inside `tx` for force-seam guards.
+async fn load_state_tx(
+    tx: &mut WriteTxConn<'_>,
+    shift_id: ShiftId,
+) -> Result<ShiftState, ForceSeamError> {
+    let row: Option<ShiftState> =
+        sqlx::query_scalar(r#"SELECT state as "state: ShiftState" FROM shifts WHERE shift_id = ?"#)
+            .bind(shift_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    row.ok_or_else(|| ForceSeamError::ShiftNotFound {
+        shift_id_hex: hex_lower(shift_id.as_bytes()),
+    })
+}
+
+/// Internal: build the refused-seam audit payload combining metadata +
+/// the full evidence_json the caller provided per spec §8 (forensic
+/// traceability of refused force-seam invocations).
+fn build_refused_audit_payload(
+    fiscal_number: &str,
+    shift_id_hex: &str,
+    current_state: ShiftState,
+    attempted_seam: &str,
+    evidence_json: &str,
+) -> String {
+    // We embed the raw evidence_json as a string value (NOT a parsed
+    // sub-object) so the audit row remains a single self-contained JSON
+    // document even if the evidence was invalid JSON.  Wrap defensively
+    // via serde_json::Value to escape quotes/backslashes correctly.
+    let envelope = serde_json::json!({
+        "fiscal_number": fiscal_number,
+        "shift_id": shift_id_hex,
+        "current_state": current_state.as_str(),
+        "attempted_seam": attempted_seam,
+        "evidence_json": evidence_json,
+    });
+    envelope.to_string()
+}
+
+/// Operator-driven force-transition into [`ShiftState::Error`].  Bypasses
+/// the whitelist intentionally; the seam IS the only entry to `Error`
+/// per spec §4.5.  Requires explicit `evidence_json` (parse-validated as
+/// JSON, size-capped at [`FORCE_SEAM_EVIDENCE_MAX_BYTES`]) per spec §8.
+///
+/// On success: emits `SHIFT_FORCE_TO_ERROR` Critical audit then UPDATEs
+/// state.  Returns `Ok(())`.
+///
+/// On forbidden source (per spec §4.5): emits `SHIFT_FORCE_SEAM_REFUSED`
+/// Warning audit with full evidence_json metadata (forensic) then returns
+/// [`ForceSeamError::ForbiddenSource`].  No state change.
+pub async fn force_to_error_with_audit(
+    tx: &mut WriteTxConn<'_>,
+    shift_id: ShiftId,
+    evidence_json: &str,
+) -> Result<ForceSeamOutcome, ForceSeamError> {
+    validate_evidence_json(evidence_json)?;
+    let current_state = load_state_tx(tx, shift_id).await?;
+    let shift_id_hex = hex_lower(shift_id.as_bytes());
+    let fiscal_number: String =
+        sqlx::query_scalar("SELECT fiscal_number FROM shifts WHERE shift_id = ?")
+            .bind(shift_id)
+            .fetch_one(&mut **tx)
+            .await?;
+
+    if !force_to_error_allows_source(current_state) {
+        let payload = build_refused_audit_payload(
+            &fiscal_number,
+            &shift_id_hex,
+            current_state,
+            FORCE_TO_ERROR_SEAM_NAME,
+            evidence_json,
+        );
+        audit_log::append_tx(
+            tx,
+            "shift",
+            &shift_id_hex,
+            "SHIFT_FORCE_SEAM_REFUSED",
+            Severity::Warning,
+            None,
+            Some(&payload),
+        )
+        .await?;
+        // Forensic audit committed via Ok return — spec §8 + Round 7 §8.1.
+        return Ok(ForceSeamOutcome::ForbiddenSource {
+            current_state,
+            attempted_seam: FORCE_TO_ERROR_SEAM_NAME,
+        });
+    }
+
+    // Allowed source — emit Critical audit first, then commit transition.
+    let success_payload = serde_json::json!({
+        "fiscal_number": fiscal_number,
+        "shift_id": shift_id_hex,
+        "from_state": current_state.as_str(),
+        "to_state": ShiftState::Error.as_str(),
+        "evidence_json": evidence_json,
+    })
+    .to_string();
+    audit_log::append_tx(
+        tx,
+        "shift",
+        &shift_id_hex,
+        "SHIFT_FORCE_TO_ERROR",
+        Severity::Critical,
+        None,
+        Some(&success_payload),
+    )
+    .await?;
+    sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ?")
+        .bind(ShiftState::Error)
+        .bind(shift_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(ForceSeamOutcome::Applied)
+}
+
+/// Operator-driven force-transition into [`ShiftState::RequiresManualReconciliation`].
+/// Allowed alongside whitelist edges 4 / 6 / 12 / 14 per spec §4.5; the
+/// seam is the operator-initiated escalation surface when normal recovery
+/// flow doesn't fit.
+///
+/// On success: emits `SHIFT_FORCE_TO_MANUAL_RECONCILIATION` Critical audit
+/// then UPDATEs state.  Returns `Ok(ForceSeamOutcome::Applied)`.
+///
+/// On forbidden source: emits `SHIFT_FORCE_SEAM_REFUSED` Warning audit
+/// with full evidence_json envelope + returns
+/// `Ok(ForceSeamOutcome::ForbiddenSource { .. })`.  The Ok return ensures
+/// the surrounding `with_immediate` tx commits — preserving the refused-
+/// audit row per spec §8 + Round 7 §8.1 forensic-traceability invariant.
+pub async fn force_to_manual_reconciliation_with_audit(
+    tx: &mut WriteTxConn<'_>,
+    shift_id: ShiftId,
+    evidence_json: &str,
+) -> Result<ForceSeamOutcome, ForceSeamError> {
+    validate_evidence_json(evidence_json)?;
+    let current_state = load_state_tx(tx, shift_id).await?;
+    let shift_id_hex = hex_lower(shift_id.as_bytes());
+    let fiscal_number: String =
+        sqlx::query_scalar("SELECT fiscal_number FROM shifts WHERE shift_id = ?")
+            .bind(shift_id)
+            .fetch_one(&mut **tx)
+            .await?;
+
+    if !force_to_manual_allows_source(current_state) {
+        let payload = build_refused_audit_payload(
+            &fiscal_number,
+            &shift_id_hex,
+            current_state,
+            FORCE_TO_MANUAL_SEAM_NAME,
+            evidence_json,
+        );
+        audit_log::append_tx(
+            tx,
+            "shift",
+            &shift_id_hex,
+            "SHIFT_FORCE_SEAM_REFUSED",
+            Severity::Warning,
+            None,
+            Some(&payload),
+        )
+        .await?;
+        return Ok(ForceSeamOutcome::ForbiddenSource {
+            current_state,
+            attempted_seam: FORCE_TO_MANUAL_SEAM_NAME,
+        });
+    }
+
+    let success_payload = serde_json::json!({
+        "fiscal_number": fiscal_number,
+        "shift_id": shift_id_hex,
+        "from_state": current_state.as_str(),
+        "to_state": ShiftState::RequiresManualReconciliation.as_str(),
+        "evidence_json": evidence_json,
+    })
+    .to_string();
+    audit_log::append_tx(
+        tx,
+        "shift",
+        &shift_id_hex,
+        "SHIFT_FORCE_TO_MANUAL_RECONCILIATION",
+        Severity::Critical,
+        None,
+        Some(&success_payload),
+    )
+    .await?;
+    sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ?")
+        .bind(ShiftState::RequiresManualReconciliation)
+        .bind(shift_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(ForceSeamOutcome::Applied)
+}
+
+// ─── M3b W14a-2a: senior cashier close seam ──────────────────────────
+//
+// Per spec §16.9 — legitimate alternative close path via 5-ПРРО senior
+// cashier role privilege.  NOT a force seam (no force-to-Error / force-
+// to-Manual semantics); explicit clean-close surface where the closing
+// cashier differs from `opened_by_cashier_id`.
+//
+// Runtime validation per W14a-2a operator decision (2026-05-17):
+// - `senior_cashier_id` MUST exist in `cashier_certs` for the SAME
+//   fiscal_number as the shift.  Role/privilege validation is UI/operator
+//   responsibility until a real role registry exists.
+// - Source state MUST be Opened or ClosingLocalPendingDrain (the only
+//   states where senior close is meaningful per spec §5.6 matrix).
+
+/// W14a-2a senior-close-seam invocation error.  Distinct from
+/// [`ForceSeamError`]: senior close is a legitimate clean-close path,
+/// not an operator escalation.
+#[derive(Debug, thiserror::Error)]
+pub enum SeniorCloseError {
+    /// Current shift state is not closable via senior path (per spec
+    /// §5.6, senior close meaningful only from Opened / ClosingLocal
+    /// PendingDrain).  No transition committed.
+    #[error("senior close refused: current state {current_state:?} not closable")]
+    NotClosable { current_state: ShiftState },
+
+    /// `senior_cashier_id` is not registered in `cashier_certs` for the
+    /// shift's fiscal_number.  No transition committed.  Operator UI
+    /// responsibility to ensure the senior cashier has a cert binding
+    /// before invoking the seam.
+    #[error(
+        "senior cashier {senior_cashier_id} not registered in cashier_certs \
+         for fiscal_number {fiscal_number}"
+    )]
+    SeniorCashierNotRegistered {
+        senior_cashier_id: CashierId,
+        fiscal_number: String,
+    },
+
+    /// `evidence_json` is not valid JSON OR exceeds
+    /// [`FORCE_SEAM_EVIDENCE_MAX_BYTES`].
+    #[error("evidence_json invalid: {0}")]
+    InvalidEvidenceJson(String),
+
+    /// Shift row not found for the given id.
+    #[error("shift {shift_id_hex} not found")]
+    ShiftNotFound { shift_id_hex: String },
+
+    /// Wrapped sqlx error.
+    #[error("sqlx error: {0}")]
+    Db(#[from] sqlx::Error),
+}
+
+/// Senior cashier close-shift seam per spec §16.9.
+///
+/// Allowed source states: `Opened` (online close path) and
+/// `ClosingLocalPendingDrain` (offline-Z drain finalisation path).  Per
+/// spec §5.6 matrix, no other states accept senior close.
+///
+/// Side effects on success:
+/// - UPDATE `shifts.state = 'CLOSED'`, `closed_by_cashier_id = senior_cashier_id`,
+///   `z_report_document_id = z_report_doc_id`, `closed_at = CURRENT_TIMESTAMP`.
+/// - Emit `SHIFT_CLOSED_BY_SENIOR_CASHIER` Info audit with evidence_json envelope.
+///
+/// Source-state restriction is NOT routed through the [`allowed_transition`]
+/// whitelist — this seam has its own contract.  Audit event distinguishes
+/// this path from normal `Opened → Closing → Closed` whitelist edges 8 + 10.
+pub async fn senior_cashier_close_shift_with_audit(
+    tx: &mut WriteTxConn<'_>,
+    shift_id: ShiftId,
+    senior_cashier_id: &CashierId,
+    z_report_doc_id: DocumentId,
+    evidence_json: &str,
+) -> Result<(), SeniorCloseError> {
+    // 1. Validate evidence (size + JSON shape).
+    if evidence_json.len() > FORCE_SEAM_EVIDENCE_MAX_BYTES {
+        return Err(SeniorCloseError::InvalidEvidenceJson(format!(
+            "evidence_json {} bytes exceeds cap {}",
+            evidence_json.len(),
+            FORCE_SEAM_EVIDENCE_MAX_BYTES
+        )));
+    }
+    serde_json::from_str::<serde_json::Value>(evidence_json).map_err(|e| {
+        SeniorCloseError::InvalidEvidenceJson(format!("not valid JSON: {e}"))
+    })?;
+
+    // 2. Load current shift state + fiscal_number (single tx-bound read).
+    let row: Option<(ShiftState, String)> = sqlx::query_as(
+        r#"SELECT state as "state: ShiftState", fiscal_number FROM shifts WHERE shift_id = ?"#,
+    )
+    .bind(shift_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let (current_state, fiscal_number) = row.ok_or_else(|| SeniorCloseError::ShiftNotFound {
+        shift_id_hex: hex_lower(shift_id.as_bytes()),
+    })?;
+
+    // 3. Source-state restriction per spec §5.6.
+    use ShiftState::*;
+    if !matches!(current_state, Opened | ClosingLocalPendingDrain) {
+        return Err(SeniorCloseError::NotClosable { current_state });
+    }
+
+    // 4. Runtime existence check: senior cashier MUST be registered in
+    //    cashier_certs for THIS fiscal_number.  Schema-enforced (PK on
+    //    cashier_id, fiscal_number).  Per operator decision 2026-05-17.
+    let registered: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cashier_certs WHERE cashier_id = ? AND fiscal_number = ?",
+    )
+    .bind(senior_cashier_id.as_str())
+    .bind(&fiscal_number)
+    .fetch_one(&mut **tx)
+    .await?;
+    if registered == 0 {
+        return Err(SeniorCloseError::SeniorCashierNotRegistered {
+            senior_cashier_id: senior_cashier_id.clone(),
+            fiscal_number,
+        });
+    }
+
+    // 5. Emit Info audit first (so the audit row commits if the UPDATE
+    //    fails the surrounding tx — forensic evidence of the attempt).
+    let shift_id_hex = hex_lower(shift_id.as_bytes());
+    let payload = serde_json::json!({
+        "fiscal_number": fiscal_number,
+        "shift_id": shift_id_hex,
+        "from_state": current_state.as_str(),
+        "to_state": ShiftState::Closed.as_str(),
+        "closed_by_senior_cashier_id": senior_cashier_id.as_str(),
+        "z_report_document_id": hex_lower(z_report_doc_id.as_bytes()),
+        "evidence_json": evidence_json,
+    })
+    .to_string();
+    audit_log::append_tx(
+        tx,
+        "shift",
+        &shift_id_hex,
+        "SHIFT_CLOSED_BY_SENIOR_CASHIER",
+        Severity::Info,
+        Some(senior_cashier_id.as_str()),
+        Some(&payload),
+    )
+    .await?;
+
+    // 6. UPDATE shifts — state + closed_by_cashier_id + z_report ref +
+    //    closed_at.  Single statement, in-tx.
+    sqlx::query(
+        "UPDATE shifts SET state = ?, closed_by_cashier_id = ?, z_report_document_id = ?, \
+            closed_at = CURRENT_TIMESTAMP \
+         WHERE shift_id = ?",
+    )
+    .bind(ShiftState::Closed)
+    .bind(senior_cashier_id.as_str())
+    .bind(z_report_doc_id)
+    .bind(shift_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
