@@ -60,12 +60,15 @@ str_enum!(OfflineSessionState {
 });
 
 str_enum!(ShiftState {
-    Created => "CREATED",
-    Opening => "OPENING",
-    Opened  => "OPENED",
-    Closing => "CLOSING",
-    Closed  => "CLOSED",
-    Error   => "ERROR",
+    Created                      => "CREATED",
+    Opening                      => "OPENING",
+    OpenedLocalPendingDrain      => "OPENED_LOCAL_PENDING_DRAIN",    // M3b W14a-1: offline-open Pattern C destination
+    Opened                       => "OPENED",
+    ClosingLocalPendingDrain     => "CLOSING_LOCAL_PENDING_DRAIN",   // M3b W14a-1: offline-close Pattern C destination
+    Closing                      => "CLOSING",
+    Closed                       => "CLOSED",
+    RequiresManualReconciliation => "REQUIRES_MANUAL_RECONCILIATION",// M3b W14a-1: drain-reject terminal (per spec §16.7)
+    Error                        => "ERROR",
 });
 
 str_enum!(NodeMode {

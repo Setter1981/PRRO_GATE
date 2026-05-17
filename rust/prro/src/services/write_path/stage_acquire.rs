@@ -370,6 +370,29 @@ fn check_shift_guard(doc_type: DocType, shift_state: ShiftState) -> Option<Rejec
         ) => Some(RejectionReason::ShiftNotOpen {
             current: shift_state,
         }),
+        // W14a-1 minimal compile coverage for the 3 new M3b shift states.
+        // Fiscal ops against `OpenedLocalPendingDrain` / `ClosingLocalPendingDrain`
+        // / `RequiresManualReconciliation` defensively refused via the existing
+        // `ShiftNotOpen` reason.  Full semantics land in W14a-2 (channel-aware
+        // offline ops on OpenedLocalPendingDrain per spec §3.3; explicit
+        // POST_LOCAL_CLOSE_SALE_REFUSED for ClosingLocalPendingDrain per
+        // PR #62 §W10; ShiftRequiresOperatorAttention reason for Manual per
+        // spec §5.6).  ShiftOpen + new states is already caught upstream by
+        // the `(ShiftOpen, _)` arm above (→ ShiftAlreadyOpen).  ShiftClose /
+        // ZReport + new states is caught by the catch-all below.
+        (
+            DocType::Sell
+            | DocType::Return
+            | DocType::ServiceIn
+            | DocType::ServiceOut
+            | DocType::CashWithdrawal
+            | DocType::XReport,
+            ShiftState::OpenedLocalPendingDrain
+            | ShiftState::ClosingLocalPendingDrain
+            | ShiftState::RequiresManualReconciliation,
+        ) => Some(RejectionReason::ShiftNotOpen {
+            current: shift_state,
+        }),
         // Catch-all: SHIFT_CLOSE / Z_REPORT against non-Opened.
         (DocType::ShiftClose, _) | (DocType::ZReport, _) => Some(RejectionReason::ShiftNotOpen {
             current: shift_state,
