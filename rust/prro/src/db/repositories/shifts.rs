@@ -35,8 +35,10 @@ pub struct ShiftRow {
 /// 14 Applied + 67 Forbidden).
 ///
 /// Per spec §4.4 forbidden patterns:
-/// - **`Error` is reachable ONLY via `force_to_error_with_audit` seam.**
-///   No whitelist edge ever lands on `Error`.
+/// - **`Error` is reachable via `force_to_error_with_audit` seam (operator-driven)
+///   OR `boot_phase` branch e2 system-context recovery (audit shape
+///   `SHIFT_BOOT_ORPHAN_ERROR`, distinct from `SHIFT_FORCE_TO_ERROR`).**  No
+///   whitelist edge ever lands on `Error`.
 /// - **`RequiresManualReconciliation` is reachable via edges 4 / 6 / 12 / 14
 ///   OR via `force_to_manual_reconciliation_with_audit` seam.**  Nothing
 ///   else.
@@ -416,16 +418,24 @@ fn build_refused_audit_payload(
 }
 
 /// Operator-driven force-transition into [`ShiftState::Error`].  Bypasses
-/// the whitelist intentionally; the seam IS the only entry to `Error`
-/// per spec §4.5.  Requires explicit `evidence_json` (parse-validated as
-/// JSON, size-capped at [`FORCE_SEAM_EVIDENCE_MAX_BYTES`]) per spec §8.
+/// the whitelist intentionally; the seam IS the only **operator-driven**
+/// entry to `Error` per spec §4.5.  System-context boot recovery
+/// (`boot_phase` branch e2, audit shape `SHIFT_BOOT_ORPHAN_ERROR`) is a
+/// distinct second surface per spec §4.4.  Requires explicit
+/// `evidence_json` (parse-validated as JSON, size-capped at
+/// [`FORCE_SEAM_EVIDENCE_MAX_BYTES`]) per spec §8.
 ///
-/// On success: emits `SHIFT_FORCE_TO_ERROR` Critical audit then UPDATEs
-/// state.  Returns `Ok(())`.
+/// On success: UPDATEs state (CAS-guarded on `WHERE shift_id = ? AND
+/// state = ?`); on `rows_affected == 1` emits `SHIFT_FORCE_TO_ERROR`
+/// Critical audit AFTER, returns `Ok(ForceSeamOutcome::Applied)`.  On
+/// `rows_affected != 1` emits `SHIFT_FORCE_SEAM_TX_ISOLATION_VIOLATION`
+/// Critical audit + returns `Ok(ForceSeamOutcome::TxIsolationViolation
+/// { .. })` per PR #66 R6 MED audit-ordering fix (success audit must
+/// NEVER precede the guarded UPDATE).
 ///
 /// On forbidden source (per spec §4.5): emits `SHIFT_FORCE_SEAM_REFUSED`
 /// Warning audit with full evidence_json metadata (forensic) then returns
-/// [`ForceSeamError::ForbiddenSource`].  No state change.
+/// `Ok(ForceSeamOutcome::ForbiddenSource { .. })`.  No state change.
 pub async fn force_to_error_with_audit(
     tx: &mut WriteTxConn<'_>,
     shift_id: ShiftId,
@@ -543,8 +553,14 @@ pub async fn force_to_error_with_audit(
 /// seam is the operator-initiated escalation surface when normal recovery
 /// flow doesn't fit.
 ///
-/// On success: emits `SHIFT_FORCE_TO_MANUAL_RECONCILIATION` Critical audit
-/// then UPDATEs state.  Returns `Ok(ForceSeamOutcome::Applied)`.
+/// On success: UPDATEs state (CAS-guarded on `WHERE shift_id = ? AND
+/// state = ?`); on `rows_affected == 1` emits
+/// `SHIFT_FORCE_TO_MANUAL_RECONCILIATION` Critical audit AFTER, returns
+/// `Ok(ForceSeamOutcome::Applied)`.  On `rows_affected != 1` emits
+/// `SHIFT_FORCE_SEAM_TX_ISOLATION_VIOLATION` Critical audit + returns
+/// `Ok(ForceSeamOutcome::TxIsolationViolation { .. })` per PR #66 R6
+/// MED audit-ordering fix (success audit must NEVER precede the
+/// guarded UPDATE).
 ///
 /// On forbidden source: emits `SHIFT_FORCE_SEAM_REFUSED` Warning audit
 /// with full evidence_json envelope + returns
@@ -802,10 +818,16 @@ pub enum SeniorCloseError {
 /// `ClosingLocalPendingDrain` (offline-Z drain finalisation path).  Per
 /// spec §5.6 matrix, no other states accept senior close.
 ///
-/// Side effects on success:
+/// Side effects on success (in this order per PR #66 R6 MED audit-
+/// ordering fix — success audit must NEVER precede the guarded UPDATE):
 /// - UPDATE `shifts.state = 'CLOSED'`, `closed_by_cashier_id = senior_cashier_id`,
-///   `z_report_document_id = z_report_doc_id`, `closed_at = CURRENT_TIMESTAMP`.
-/// - Emit `SHIFT_CLOSED_BY_SENIOR_CASHIER` Info audit with evidence_json envelope.
+///   `z_report_document_id = z_report_doc_id`, `closed_at = CURRENT_TIMESTAMP`
+///   (CAS-guarded on `WHERE shift_id = ? AND state = ?`).
+/// - On `rows_affected == 1`: emit `SHIFT_CLOSED_BY_SENIOR_CASHIER` Info audit
+///   AFTER, return `Ok(SeniorCloseOutcome::Applied)`.
+/// - On `rows_affected != 1`: emit `SHIFT_SENIOR_CLOSE_TX_ISOLATION_VIOLATION`
+///   Critical audit + return `Ok(SeniorCloseOutcome::TxIsolationViolation
+///   { .. })` (no success audit emitted on this defensive branch).
 ///
 /// Source-state restriction is NOT routed through the [`allowed_transition`]
 /// whitelist — this seam has its own contract.  Audit event distinguishes
