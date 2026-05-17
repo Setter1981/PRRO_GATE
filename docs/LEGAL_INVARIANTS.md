@@ -78,7 +78,7 @@ Failover між DPS-каналами (WebCheck/gRPC ↔ DFS HTTP/XML) дозво
 ### INV-09 — Офлайн-тривалість не більше 36 годин безперервно
 Безперервна тривалість офлайн-сесії не може перевищувати 36 годин.
 
-**Engineering enforcement (M3b):** після 36 годин cumulative offline для FN, ingress відхиляє всі нові документи (`OFFLINE_LIMIT_EXCEEDED_INGRESS_REFUSED` Critical audit + operator pager per M3b shift state expansion spec §16.5). Існуючі OFFLINE_LOCAL_ACK документи зберігаються; drain виконується при поверненні online. Це **НЕ** Manual recon trigger — просто freeze ingress для FN.
+**Engineering enforcement (M3b):** після 36 годин **безперервної офлайн-сесії** (continuous, not cumulative — cumulative monthly cap is INV-10 / 168h) для FN, ingress відхиляє всі нові документи (`OFFLINE_LIMIT_EXCEEDED_INGRESS_REFUSED` Critical audit + operator pager per M3b shift state expansion spec §16.5). Threshold пов'язаний з `node_state.offline_session_started_at + 36h < now`. Існуючі OFFLINE_LOCAL_ACK документи зберігаються; drain виконується при поверненні online. Це **НЕ** Manual recon trigger — просто freeze ingress для FN.
 
 Synergy з 36h SHIFT_OPEN cert gate (§16.10): cert validates at SHIFT_OPEN з > 36h до expiry → offline session max 36h → cert не може expire mid-offline by design.
 
