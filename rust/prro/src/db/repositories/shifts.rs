@@ -292,7 +292,13 @@ pub const FORCE_SEAM_EVIDENCE_MAX_BYTES: usize = 8 * 1024;
 /// row per spec §8 forensic-traceability requirement (Round 7 §8.1
 /// load-bearing pin).  Caller pattern-matches on this enum to know
 /// whether the state actually changed.
+///
+/// PR #66 R4 L-R4-2: `#[non_exhaustive]` — future seam outcome
+/// variants (e.g. partial-commit edge cases) MUST NOT break callers
+/// in the absence of a wildcard arm.  Downstream consumers must
+/// pattern-match with `_ =>` to remain forward-compatible.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ForceSeamOutcome {
     /// State transitioned to the seam's target; Critical audit emitted.
     Applied,
@@ -502,17 +508,27 @@ pub async fn force_to_error_with_audit(
         .execute(&mut **tx)
         .await?;
     if res.rows_affected() != 1 {
-        return emit_force_seam_tx_isolation_violation(
+        let rows_affected = res.rows_affected();
+        let observed = emit_cas_isolation_violation_audit(
             tx,
-            shift_id,
-            &shift_id_hex,
-            &fiscal_number,
-            current_state,
+            "SHIFT_FORCE_SEAM_TX_ISOLATION_VIOLATION",
             FORCE_TO_ERROR_SEAM_NAME,
-            normalized_actor,
-            res.rows_affected(),
+            CasFailureContext {
+                shift_id,
+                shift_id_hex: &shift_id_hex,
+                fiscal_number: &fiscal_number,
+                current_state_read_was: current_state,
+                actor: normalized_actor,
+                rows_affected,
+            },
+            serde_json::Value::Null,
         )
-        .await;
+        .await?;
+        return Ok(ForceSeamOutcome::TxIsolationViolation {
+            observed_state_at_update: observed,
+            attempted_seam: FORCE_TO_ERROR_SEAM_NAME,
+            rows_affected,
+        });
     }
     Ok(ForceSeamOutcome::Applied)
 }
@@ -603,71 +619,96 @@ pub async fn force_to_manual_reconciliation_with_audit(
         .execute(&mut **tx)
         .await?;
     if res.rows_affected() != 1 {
-        return emit_force_seam_tx_isolation_violation(
+        let rows_affected = res.rows_affected();
+        let observed = emit_cas_isolation_violation_audit(
             tx,
-            shift_id,
-            &shift_id_hex,
-            &fiscal_number,
-            current_state,
+            "SHIFT_FORCE_SEAM_TX_ISOLATION_VIOLATION",
             FORCE_TO_MANUAL_SEAM_NAME,
-            normalized_actor,
-            res.rows_affected(),
+            CasFailureContext {
+                shift_id,
+                shift_id_hex: &shift_id_hex,
+                fiscal_number: &fiscal_number,
+                current_state_read_was: current_state,
+                actor: normalized_actor,
+                rows_affected,
+            },
+            serde_json::Value::Null,
         )
-        .await;
+        .await?;
+        return Ok(ForceSeamOutcome::TxIsolationViolation {
+            observed_state_at_update: observed,
+            attempted_seam: FORCE_TO_MANUAL_SEAM_NAME,
+            rows_affected,
+        });
     }
     Ok(ForceSeamOutcome::Applied)
 }
 
-/// PR #66 R3 H-R2-1 — shared helper for force-seam CAS-WHERE-state
-/// graceful failure path.  Re-reads observed state for diagnostics +
-/// emits `SHIFT_FORCE_SEAM_TX_ISOLATION_VIOLATION` Critical audit
-/// (forensic via Ok-return contract) + returns
-/// `Ok(ForceSeamOutcome::TxIsolationViolation { ... })`.
-///
-/// 8 args is above clippy's default 7-arg threshold; bundling them
-/// into a struct would obscure call-site readability for 2 callers.
-#[allow(clippy::too_many_arguments)]
-async fn emit_force_seam_tx_isolation_violation(
-    tx: &mut WriteTxConn<'_>,
+/// PR #66 R4 L-R4-4 — bundles the CAS-WHERE-state failure diagnostic
+/// arguments into a single struct.  Reduces helper arg count below
+/// clippy's 7-arg threshold and makes call sites self-documenting.
+struct CasFailureContext<'a> {
     shift_id: ShiftId,
-    shift_id_hex: &str,
-    fiscal_number: &str,
+    shift_id_hex: &'a str,
+    fiscal_number: &'a str,
     current_state_read_was: ShiftState,
-    attempted_seam: &'static str,
-    actor: Option<&str>,
+    actor: Option<&'a str>,
     rows_affected: u64,
-) -> Result<ForceSeamOutcome, ForceSeamError> {
+}
+
+/// PR #66 R3 H-R2-1 + R4 L-R4-3 — shared helper for force-seam AND
+/// senior-close CAS-WHERE-state graceful failure paths.  Re-reads
+/// observed state for diagnostics + emits the given Critical
+/// `audit_event_type` audit (forensic via Ok-return contract) + returns
+/// `Option<ShiftState>` (observed-at-update) so caller can wrap into
+/// its specific outcome variant (`ForceSeamOutcome::TxIsolationViolation`
+/// OR `SeniorCloseOutcome::TxIsolationViolation`).
+///
+/// `extra_payload_fields` is merged into the audit payload (used by
+/// senior-close to carry `senior_cashier_id` + `z_report_document_id`;
+/// force seams pass `serde_json::Value::Null` for no extras).
+async fn emit_cas_isolation_violation_audit(
+    tx: &mut WriteTxConn<'_>,
+    audit_event_type: &str,
+    attempted_seam: &'static str,
+    ctx: CasFailureContext<'_>,
+    extra_payload_fields: serde_json::Value,
+) -> sqlx::Result<Option<ShiftState>> {
     // Re-read for diagnostics — same tx, serialised with the failed UPDATE.
     let observed: Option<ShiftState> =
         sqlx::query_scalar(r#"SELECT state as "state: ShiftState" FROM shifts WHERE shift_id = ?"#)
-            .bind(shift_id)
+            .bind(ctx.shift_id)
             .fetch_optional(&mut **tx)
             .await?;
-    let payload = serde_json::json!({
-        "fiscal_number": fiscal_number,
-        "shift_id": shift_id_hex,
-        "current_state_at_read": current_state_read_was.as_str(),
+    let mut payload = serde_json::json!({
+        "fiscal_number": ctx.fiscal_number,
+        "shift_id": ctx.shift_id_hex,
+        "current_state_at_read": ctx.current_state_read_was.as_str(),
         "observed_state_at_update": observed.map(|s| s.as_str()),
         "attempted_seam": attempted_seam,
-        "rows_affected": rows_affected,
+        "rows_affected": ctx.rows_affected,
         "reason": "cas_where_state_hit_zero_rows",
-    })
-    .to_string();
+    });
+    // Merge extras (e.g. senior_cashier_id + z_report_document_id) — only
+    // when the extras object is a non-null JSON object.
+    if let serde_json::Value::Object(extras) = extra_payload_fields {
+        if let serde_json::Value::Object(ref mut base) = payload {
+            for (k, v) in extras {
+                base.insert(k, v);
+            }
+        }
+    }
     audit_log::append_tx(
         tx,
         "shift",
-        shift_id_hex,
-        "SHIFT_FORCE_SEAM_TX_ISOLATION_VIOLATION",
+        ctx.shift_id_hex,
+        audit_event_type,
         Severity::Critical,
-        actor,
-        Some(&payload),
+        ctx.actor,
+        Some(&payload.to_string()),
     )
     .await?;
-    Ok(ForceSeamOutcome::TxIsolationViolation {
-        observed_state_at_update: observed,
-        attempted_seam,
-        rows_affected,
-    })
+    Ok(observed)
 }
 
 // ─── M3b W14a-2a: senior cashier close seam ──────────────────────────
@@ -690,7 +731,11 @@ async fn emit_force_seam_tx_isolation_violation(
 /// the `SHIFT_SENIOR_CLOSE_REFUSED` Warning audit row.  This preserves
 /// the forensic trail for abuse detection (bad actor scanning senior
 /// cashier IDs leaves a record), mirroring spec §8 + Round 7 §8.1.
+///
+/// PR #66 R4 L-R4-2: `#[non_exhaustive]` per [`ForceSeamOutcome`]
+/// rationale — downstream consumers must use wildcard pattern arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SeniorCloseOutcome {
     /// State transitioned to `Closed`; Info audit emitted with actor =
     /// senior cashier id.
@@ -893,39 +938,32 @@ pub async fn senior_cashier_close_shift_with_audit(
     .execute(&mut **tx)
     .await?;
     if res.rows_affected() != 1 {
-        // Re-read for diagnostics + emit Critical audit (forensic via
-        // Ok-return contract) + return outcome variant.
-        let observed: Option<ShiftState> = sqlx::query_scalar(
-            r#"SELECT state as "state: ShiftState" FROM shifts WHERE shift_id = ?"#,
-        )
-        .bind(shift_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        let isolation_payload = serde_json::json!({
-            "fiscal_number": fiscal_number,
-            "shift_id": shift_id_hex,
-            "current_state_at_read": current_state.as_str(),
-            "observed_state_at_update": observed.map(|s| s.as_str()),
-            "attempted_seam": "senior_cashier_close_shift_with_audit",
-            "senior_cashier_id": senior_cashier_id.as_str(),
-            "z_report_document_id": z_report_doc_hex,
-            "rows_affected": res.rows_affected(),
-            "reason": "cas_where_state_hit_zero_rows",
-        })
-        .to_string();
-        audit_log::append_tx(
+        // PR #66 R4 L-R4-3: DRY via shared helper with extras for the
+        // senior-close-specific payload fields (senior_cashier_id +
+        // z_report_document_id).  Helper handles re-read + audit emit +
+        // returns observed state for outcome wrapping.
+        let rows_affected = res.rows_affected();
+        let observed = emit_cas_isolation_violation_audit(
             tx,
-            "shift",
-            &shift_id_hex,
             "SHIFT_SENIOR_CLOSE_TX_ISOLATION_VIOLATION",
-            Severity::Critical,
-            Some(senior_cashier_id.as_str()),
-            Some(&isolation_payload),
+            "senior_cashier_close_shift_with_audit",
+            CasFailureContext {
+                shift_id,
+                shift_id_hex: &shift_id_hex,
+                fiscal_number: &fiscal_number,
+                current_state_read_was: current_state,
+                actor: Some(senior_cashier_id.as_str()),
+                rows_affected,
+            },
+            serde_json::json!({
+                "senior_cashier_id": senior_cashier_id.as_str(),
+                "z_report_document_id": z_report_doc_hex,
+            }),
         )
         .await?;
         return Ok(SeniorCloseOutcome::TxIsolationViolation {
             observed_state_at_update: observed,
-            rows_affected: res.rows_affected(),
+            rows_affected,
         });
     }
     Ok(SeniorCloseOutcome::Applied)
