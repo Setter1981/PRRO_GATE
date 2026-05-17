@@ -477,30 +477,16 @@ pub async fn force_to_error_with_audit(
         });
     }
 
-    // Allowed source — emit Critical audit first, then commit transition.
-    let success_payload = serde_json::json!({
-        "fiscal_number": fiscal_number,
-        "shift_id": shift_id_hex,
-        "from_state": current_state.as_str(),
-        "to_state": ShiftState::Error.as_str(),
-        "evidence_json": evidence_json,
-    })
-    .to_string();
-    audit_log::append_tx(
-        tx,
-        "shift",
-        &shift_id_hex,
-        "SHIFT_FORCE_TO_ERROR",
-        Severity::Critical,
-        normalized_actor,
-        Some(&success_payload),
-    )
-    .await?;
+    // Allowed source — attempt CAS UPDATE FIRST; emit success audit
+    // only after rows_affected == 1.  PR #66 R6 MED fix: previously
+    // success audit was emitted BEFORE the UPDATE; if rows_affected
+    // != 1 fired the violation path, audit log carried BOTH
+    // SHIFT_FORCE_TO_ERROR success AND SHIFT_FORCE_SEAM_TX_ISOLATION_
+    // VIOLATION on the same shift — false-success forensic record.
+    //
     // PR #66 R2 MED-3 + R3 H-R2-1: CAS-WHERE-state guard with graceful
-    // failure path (replaces R2's `assert_eq!` panic).  Per established
-    // `fiscal_documents.rs:351` HIGH-3 convention: NEVER panic on
-    // rows_affected anomalies in production paths — surface as typed
-    // outcome + Critical audit.  Process keeps serving other FNs.
+    // failure path (replaces R2's `assert_eq!` panic) per established
+    // `fiscal_documents.rs:351` HIGH-3 convention.
     let res = sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ? AND state = ?")
         .bind(ShiftState::Error)
         .bind(shift_id)
@@ -530,6 +516,25 @@ pub async fn force_to_error_with_audit(
             rows_affected,
         });
     }
+    // Success path — UPDATE applied; emit canonical Critical audit.
+    let success_payload = serde_json::json!({
+        "fiscal_number": fiscal_number,
+        "shift_id": shift_id_hex,
+        "from_state": current_state.as_str(),
+        "to_state": ShiftState::Error.as_str(),
+        "evidence_json": evidence_json,
+    })
+    .to_string();
+    audit_log::append_tx(
+        tx,
+        "shift",
+        &shift_id_hex,
+        "SHIFT_FORCE_TO_ERROR",
+        Severity::Critical,
+        normalized_actor,
+        Some(&success_payload),
+    )
+    .await?;
     Ok(ForceSeamOutcome::Applied)
 }
 
@@ -592,26 +597,9 @@ pub async fn force_to_manual_reconciliation_with_audit(
         });
     }
 
-    let success_payload = serde_json::json!({
-        "fiscal_number": fiscal_number,
-        "shift_id": shift_id_hex,
-        "from_state": current_state.as_str(),
-        "to_state": ShiftState::RequiresManualReconciliation.as_str(),
-        "evidence_json": evidence_json,
-    })
-    .to_string();
-    audit_log::append_tx(
-        tx,
-        "shift",
-        &shift_id_hex,
-        "SHIFT_FORCE_TO_MANUAL_RECONCILIATION",
-        Severity::Critical,
-        normalized_actor,
-        Some(&success_payload),
-    )
-    .await?;
-    // PR #66 R2 MED-3 + R3 H-R2-1: CAS-WHERE-state guard with graceful
-    // failure path (see force_to_error_with_audit for rationale).
+    // PR #66 R6 MED + R2 MED-3 + R3 H-R2-1: CAS-WHERE-state guard FIRST,
+    // success audit AFTER (avoids false-success audit on isolation
+    // violation path — see force_to_error_with_audit for rationale).
     let res = sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ? AND state = ?")
         .bind(ShiftState::RequiresManualReconciliation)
         .bind(shift_id)
@@ -641,6 +629,24 @@ pub async fn force_to_manual_reconciliation_with_audit(
             rows_affected,
         });
     }
+    let success_payload = serde_json::json!({
+        "fiscal_number": fiscal_number,
+        "shift_id": shift_id_hex,
+        "from_state": current_state.as_str(),
+        "to_state": ShiftState::RequiresManualReconciliation.as_str(),
+        "evidence_json": evidence_json,
+    })
+    .to_string();
+    audit_log::append_tx(
+        tx,
+        "shift",
+        &shift_id_hex,
+        "SHIFT_FORCE_TO_MANUAL_RECONCILIATION",
+        Severity::Critical,
+        normalized_actor,
+        Some(&success_payload),
+    )
+    .await?;
     Ok(ForceSeamOutcome::Applied)
 }
 
@@ -901,30 +907,11 @@ pub async fn senior_cashier_close_shift_with_audit(
         });
     }
 
-    // 5. Allowed path — emit Info audit first, then commit transition.
-    let payload = serde_json::json!({
-        "fiscal_number": fiscal_number,
-        "shift_id": shift_id_hex,
-        "from_state": current_state.as_str(),
-        "to_state": ShiftState::Closed.as_str(),
-        "closed_by_senior_cashier_id": senior_cashier_id.as_str(),
-        "z_report_document_id": z_report_doc_hex,
-        "evidence_json": evidence_json,
-    })
-    .to_string();
-    audit_log::append_tx(
-        tx,
-        "shift",
-        &shift_id_hex,
-        "SHIFT_CLOSED_BY_SENIOR_CASHIER",
-        Severity::Info,
-        Some(senior_cashier_id.as_str()),
-        Some(&payload),
-    )
-    .await?;
-
-    // 6. UPDATE shifts — state + closed_by_cashier_id + z_report ref +
-    //    closed_at.  Single statement, in-tx.
+    // 5. Allowed path — CAS UPDATE FIRST, Info audit AFTER.  PR #66 R6
+    //    MED fix: was emitting success audit BEFORE the CAS UPDATE; if
+    //    rows_affected != 1 hit the violation path, audit log carried
+    //    BOTH SHIFT_CLOSED_BY_SENIOR_CASHIER + SHIFT_SENIOR_CLOSE_TX_
+    //    ISOLATION_VIOLATION — false-success forensic record.
     // PR #66 R2 MED-3 + R3 H-R2-1: CAS-WHERE-state guard with graceful
     // failure path (see emit_force_seam_tx_isolation_violation helper +
     // ForceSeamOutcome::TxIsolationViolation rationale).
@@ -978,5 +965,28 @@ pub async fn senior_cashier_close_shift_with_audit(
             rows_affected,
         });
     }
+
+    // 6. Success — UPDATE applied; emit canonical Info audit AFTER the
+    //    CAS UPDATE success per PR #66 R6 MED audit-ordering fix.
+    let payload = serde_json::json!({
+        "fiscal_number": fiscal_number,
+        "shift_id": shift_id_hex,
+        "from_state": current_state.as_str(),
+        "to_state": ShiftState::Closed.as_str(),
+        "closed_by_senior_cashier_id": senior_cashier_id.as_str(),
+        "z_report_document_id": z_report_doc_hex,
+        "evidence_json": evidence_json,
+    })
+    .to_string();
+    audit_log::append_tx(
+        tx,
+        "shift",
+        &shift_id_hex,
+        "SHIFT_CLOSED_BY_SENIOR_CASHIER",
+        Severity::Info,
+        Some(senior_cashier_id.as_str()),
+        Some(&payload),
+    )
+    .await?;
     Ok(SeniorCloseOutcome::Applied)
 }

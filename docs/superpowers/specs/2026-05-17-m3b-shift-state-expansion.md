@@ -194,7 +194,10 @@ Total: **14 edges** (HIGH-fix Round 1 — the earlier "Opening → Opened on Doc
 
 ### 4.4 Forbidden patterns
 
-- **No blanket `* → Error`**: the only way to reach `Error` is via an explicit, audited `ShiftRepository::force_to_error_with_audit(shift_id, reason, audit_evidence)` seam.  This seam is operator-action territory (e.g. unrecoverable schema corruption manually flagged), NOT a fallback for unexpected transition outcomes.  Unexpected transitions surface as `TransitionOutcome::Forbidden` (typed error to caller) so the bug is observable, not silently swept into `Error`.
+- **No blanket `* → Error`**: `Error` has TWO explicit entry surfaces (PR #66 R6 HIGH clarification — boot recovery is a system-context exception, not a violation):
+  1. **Operator-driven** — `ShiftRepository::force_to_error_with_audit(shift_id, actor_id, evidence_json)` seam.  Operator-action territory (e.g. unrecoverable schema corruption manually flagged); requires evidence_json with operator identity + reason_code.  Emits `SHIFT_FORCE_TO_ERROR` Critical audit (spec §8).
+  2. **System-context boot recovery** — `boot_phase.rs` branch e2 (orphan shift in `OPENING` / `CLOSING` with no pending doc) marks `Error` via raw UPDATE inside its own `with_immediate` envelope; no operator identity available at boot.  Emits `SHIFT_BOOT_ORPHAN_ERROR` Critical audit (spec §8) carrying observed pre-state + branch context.  Audit shape distinct from operator-driven seam so forensic queries can separate operator escalation from system recovery.
+  Unexpected transitions outside these 2 paths surface as `TransitionOutcome::Forbidden` (typed error to caller) so the bug is observable, not silently swept into `Error`.
 - **No blanket `Closing → Opened`**: see §6 — only `Authorization::DocumentReject` warrants rollback.  Hard rejects + drain rejects route to `RequiresManualReconciliation`.
 - **No `ClosingLocalPendingDrain → Opened`**: once an offline `Z_REPORT` lands `OFFLINE_LOCAL_ACK`, the shift cannot rollback to `Opened` automatically.  Local Pattern C commitment + post-local-close lockout are durable; only operator-driven `force_*` seam can undo, with full audit trail.
 - **No `OpenedLocalPendingDrain → Closed` directly**: the only path to `Closed` from a locally-opened shift is via `ClosingLocalPendingDrain` (offline `Z_REPORT` first) or through full drain to `Opened` + then `Closing → Closed` (online close after drain).  Skipping `ClosingLocalPendingDrain` would mean the close happened without a `z_report_document_id` link.
@@ -212,11 +215,14 @@ impl ShiftRepository {
     /// automation) is short-circuiting normal recovery.  Emits
     /// `SHIFT_FORCE_TO_ERROR` audit row with Critical severity.
     ///
-    /// **`Error` is reachable ONLY through this seam.**  No whitelist
-    /// edge in §4.1 lands on `Error`; this is the entire entry surface.
-    /// Operator-action territory (e.g. unrecoverable schema corruption
-    /// manually flagged) — NOT a fallback for unexpected transition
-    /// outcomes.
+    /// **`Error` is reachable via this seam OR via `boot_phase` system
+    /// recovery (PR #66 R6 — branch e2 orphan-shift resolution, emits
+    /// `SHIFT_BOOT_ORPHAN_ERROR` instead of `SHIFT_FORCE_TO_ERROR`).**
+    /// No whitelist edge in §4.1 lands on `Error`; these are the two
+    /// entry surfaces.  Operator-driven escalation here is operator-
+    /// action territory (e.g. unrecoverable schema corruption manually
+    /// flagged) — NOT a fallback for unexpected transition outcomes.
+    /// See §4.4 for the full reachability contract.
     pub async fn force_to_error_with_audit(
         tx: &mut WriteTxConn<'_>,
         shift_id: ShiftId,
@@ -263,7 +269,7 @@ Rationale per forbidden source:
 
 **Test contract (load-bearing — two-tier)**: `tests/shifts_no_silent_error_paths.rs` scanner enforces both tiers:
 
-- **Tier (a) — Error**: `transition_state` MUST NOT have any code path reaching `Error`.  Only `force_to_error_with_audit` reaches `Error`.  No exception.
+- **Tier (a) — Error**: `transition_state` MUST NOT have any code path reaching `Error`.  `Error` is reachable via `force_to_error_with_audit` seam OR via `boot_phase` system recovery (branch e2 — per §4.4 system-context exception).  Scanner test enforces `transition_state` Tier (a) contract; system-recovery audit shape (`SHIFT_BOOT_ORPHAN_ERROR`) is forensically distinct from operator seam (`SHIFT_FORCE_TO_ERROR`).
 - **Tier (b) — RequiresManualReconciliation**: `transition_state` MUST reach `RequiresManualReconciliation` ONLY through edges 4, 6, 12, 14 of §4.1; `force_to_manual_reconciliation_with_audit` is the alternative seam.  No silent path (e.g. `TransitionOutcome::Forbidden` swept into Manual, blanket `_ => RequiresManualReconciliation`).
 
 **`evidence_json` schema (recommended)**: both force seams accept `evidence_json: &str` to keep the API flexible.  Implementation MUST parse-validate it as `serde_json::Value` before persistence (reject ill-formed JSON to prevent storing un-queryable garbage in the audit log).  The recommended minimum-fields shape (implementation may extend but not omit):
@@ -637,6 +643,7 @@ POS UI MAY surface a "remaining offline codes" counter to give the cashier early
 | `SHIFT_REQUIRES_MANUAL_RECONCILIATION` | **Critical** | `{fiscal_number, shift_id, transition_from, transition_reason}` | shift landed `RequiresManualReconciliation` from any allowed edge |
 | `OFFLINE_SHIFT_OPEN_REFUSED_INSUFFICIENT_RESERVE` | **Critical** | `{fiscal_number, requested_doc_type: "SHIFT_OPEN", free_pool_count, required: 2}` | offline SHIFT_OPEN attempt with `free < 2` |
 | `SHIFT_FORCE_TO_ERROR` | **Critical** | `{fiscal_number, shift_id, from_state, evidence_json}` | `force_to_error_with_audit` seam invoked |
+| `SHIFT_BOOT_ORPHAN_ERROR` | **Critical** | `{fiscal_number, shift_id, observed_shift_state_pre, node_shift_state_post, branch}` | `boot_phase` branch e2 system-recovery (orphan shift in `OPENING` / `CLOSING` with no pending doc) marks `Error` via raw UPDATE per §4.4 system-context exception.  Audit shape distinct from `SHIFT_FORCE_TO_ERROR` so forensic queries can separate operator escalation from boot recovery.  Pre-dates W14a-2a (M3a-era) — codified in spec PR #66 R6 HIGH clarification. |
 | `SHIFT_FORCE_TO_MANUAL_RECONCILIATION` | **Critical** | same shape | `force_to_manual_reconciliation_with_audit` seam invoked |
 | `SHIFT_STATE_MIRROR_DRIFT_DETECTED` | **Critical** | `{fiscal_number, shift_id, observed_node_state_shift_state, observed_shifts_state}` | boot-time §5.3 mirror invariant check found `node_state.shift_state != shifts.state` for active shift — structural breach evidence; shift force-transitions to `RequiresManualReconciliation` |
 | `SHIFT_LINKED_DOC_STATE_INCOMPATIBLE` | **Critical** | `{fiscal_number, shift_id, shift_state, linked_open_doc_id, linked_open_doc_state, linked_close_doc_id, linked_close_doc_state}` | boot-time §5.4 (shift_state × linked_doc.state) matrix detected an inconsistent pair — shift force-transitions to `RequiresManualReconciliation` |
@@ -951,7 +958,7 @@ cargo test -p prro --features test-support  # full suite — no regressions
 **Acceptance criteria**:
 1. 9-state `ShiftState` enum in code + 14-edge whitelist (drift-guard contract — locked-count test enforces the exact number).
 2. Migration rebuilds both `shifts` + `node_state` CHECK constraints atomically.
-3. Two-tier scanner contract enforced by `tests/shifts_no_silent_error_paths.rs`: (a) `Error` reachable ONLY via `force_to_error_with_audit` seam — no whitelist edge ever lands on `Error`; (b) `RequiresManualReconciliation` reachable ONLY via whitelist edges 4 / 6 / 12 / 14 of §4.1 OR via `force_to_manual_reconciliation_with_audit` seam — no silent path through `TransitionOutcome::Forbidden`, no blanket `_ → Manual`.
+3. Two-tier scanner contract enforced by `tests/shifts_no_silent_error_paths.rs`: (a) `transition_state` MUST NOT reach `Error` — only `force_to_error_with_audit` seam reaches `Error` from operator-driven flow, OR `boot_phase` branch e2 (system-context recovery; emits `SHIFT_BOOT_ORPHAN_ERROR` per §4.4 exception); (b) `RequiresManualReconciliation` reachable ONLY via whitelist edges 4 / 6 / 12 / 14 of §4.1 OR via `force_to_manual_reconciliation_with_audit` seam — no silent path through `TransitionOutcome::Forbidden`, no blanket `_ → Manual`.
 4. Two distinct force seams exist + audited per §8: `force_to_error_with_audit` emits `SHIFT_FORCE_TO_ERROR` (Critical); `force_to_manual_reconciliation_with_audit` emits `SHIFT_FORCE_TO_MANUAL_RECONCILIATION` (Critical).  No single `force_to_*` method with a `target: ShiftState` parameter — type-system distinction is structural per §4.5 rationale.
 4b. **Force-seam source-state restriction enforced (Round 6 A-H1)**: both seams MUST refuse with typed `ForceSeamForbiddenSource { current_state, attempted_seam }` when invoked from a forbidden source per the table in §4.5.  Acceptance: dedicated unit-test `tests/shifts_force_seam_source_guard.rs` covers all 81 (9 states × 2 seams) call sites — permitted sources succeed + emit the expected Critical audit; forbidden sources refuse with the typed error and emit NO `SHIFT_FORCE_*` audit (refusal is silent on audit-log because the operation never happened — separate `SHIFT_FORCE_SEAM_REFUSED` Warning audit fires on the refusal path so attempts remain forensically traceable).
 4a. `fiscal_documents.updated_at` byte-identical preservation across migration 016 (per §9.2 step 13 + acceptance test).
@@ -1018,7 +1025,7 @@ Operator picks at W10b open-time.  **`§Task 10` in the plan closes only when AL
 |---|---|
 | Migration cost (table rebuild ×2) | W4 lessons captured; pre-pilot status means no production data to migrate |
 | Cognitive load on operators reading 9 states | Operator UI collapses to 3 (opened/closing/closed); forensic dashboards expand to 9 |
-| Force-error seam misused as escape hatch | `tests/shifts_no_silent_error_paths.rs` scanner test enforces a *two-tier* contract: (a) **`Error` is reachable ONLY via the `force_to_error_with_audit` seam** — no whitelist edge ever lands on `Error`; (b) **`RequiresManualReconciliation` is reachable via specific whitelist edges (4, 6, 12, 14 per §4.1) AND via the `force_to_manual_reconciliation_with_audit` seam — and NOTHING ELSE** (no silent path through `TransitionOutcome::Forbidden` etc.).  The scanner enumerates `transition_state` call sites + audits exhaustively against the whitelist; any silent landing on `Error` OR on `RequiresManualReconciliation` outside (a)+(b) surfaces as a CI failure. |
+| Force-error seam misused as escape hatch | `tests/shifts_no_silent_error_paths.rs` scanner test enforces a *two-tier* contract: (a) **`transition_state` MUST NOT reach `Error`** — `Error` reachable via `force_to_error_with_audit` seam (operator) OR `boot_phase` branch e2 system-recovery (per §4.4 exception, emits `SHIFT_BOOT_ORPHAN_ERROR` audit); (b) **`RequiresManualReconciliation` is reachable via specific whitelist edges (4, 6, 12, 14 per §4.1) AND via the `force_to_manual_reconciliation_with_audit` seam — and NOTHING ELSE** (no silent path through `TransitionOutcome::Forbidden` etc.).  The scanner enumerates `transition_state` call sites + audits exhaustively against the whitelist; any silent landing on `Error` OR on `RequiresManualReconciliation` outside (a)+(b) surfaces as a CI failure. |
 | `node_state.shift_state` drift from `shifts.state` | Existing mirror-write discipline + tests pin the invariant; expanded states preserve same writer |
 | Whitelist matrix size grows (5→14 edges) | Locked-edge count test prevents accidental additions; same shape as `fiscal_documents` W6 pattern |
 | New audit Critical events flood dashboards under sustained outage | Future audit-dedup rule (PR #62 §7b L3 residual) addresses cardinality independently of state machine |
