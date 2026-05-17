@@ -277,6 +277,20 @@ DROP TABLE __w14a1_node_state_tmp__;
 -- SHIFT_OPEN time; if primary cert.NotAfter - now < 36h AND
 -- deferred_cert_ski_hex IS NOT NULL, it swaps (primary ← deferred,
 -- deferred ← NULL) inside the same with_immediate envelope.
+--
+-- PR #65 R2 H2 fix — same-FN cert ownership enforced at schema level:
+-- composite FK from (cert_ski_hex, fiscal_number) → operator_certs
+-- (ski_hex, fiscal_number) prevents binding cashier@FN_A to a cert
+-- that physically belongs to FN_B (cross-FN cert leakage = invalid
+-- auto-swap binding that would trust a cert not authorised for this FN).
+-- CHECK (deferred != primary) prevents the "replacement" being the same
+-- expiring cert (degenerate self-swap that breaks §16.10 invariant).
+
+-- Composite UNIQUE INDEX on operator_certs(ski_hex, fiscal_number) so
+-- the composite FK below has a valid UNIQUE target.  ski_hex is already
+-- PK alone, but SQLite FK requires the referenced columns be explicitly
+-- UNIQUE — this index satisfies that.
+CREATE UNIQUE INDEX ux_op_certs_ski_fn ON operator_certs(ski_hex, fiscal_number);
 
 CREATE TABLE cashier_certs (
     cashier_id              TEXT    NOT NULL,
@@ -286,9 +300,16 @@ CREATE TABLE cashier_certs (
     created_at              TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
     updated_at              TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
     PRIMARY KEY (cashier_id, fiscal_number),
-    FOREIGN KEY (fiscal_number)         REFERENCES fiscal_number_config(fiscal_number) ON DELETE RESTRICT,
-    FOREIGN KEY (primary_cert_ski_hex)  REFERENCES operator_certs(ski_hex)             ON DELETE RESTRICT,
-    FOREIGN KEY (deferred_cert_ski_hex) REFERENCES operator_certs(ski_hex)             ON DELETE RESTRICT
+    -- Same-cert defence (PR #65 R2 H2): deferred MUST be physically
+    -- different from primary; auto-swap of cert to itself = no-op trap.
+    CHECK (deferred_cert_ski_hex IS NULL OR deferred_cert_ski_hex <> primary_cert_ski_hex),
+    FOREIGN KEY (fiscal_number) REFERENCES fiscal_number_config(fiscal_number) ON DELETE RESTRICT,
+    -- Composite FK locks cert ownership to the binding FN — cross-FN
+    -- cert binding is impossible at schema level (PR #65 R2 H2).
+    FOREIGN KEY (primary_cert_ski_hex, fiscal_number)
+        REFERENCES operator_certs(ski_hex, fiscal_number) ON DELETE RESTRICT,
+    FOREIGN KEY (deferred_cert_ski_hex, fiscal_number)
+        REFERENCES operator_certs(ski_hex, fiscal_number) ON DELETE RESTRICT
 ) STRICT;
 
 -- Index for FN-wide cashier enumeration (operator-IT queries: "all

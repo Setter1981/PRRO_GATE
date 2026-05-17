@@ -269,6 +269,60 @@ async fn migration_016_cashier_certs_deferred_ski_unique_across_bindings() {
     );
 }
 
+// ─── PR #65 R2 H2 fix — cross-FN cert ownership enforced at schema ──
+
+#[tokio::test]
+async fn migration_016_cashier_certs_composite_fk_rejects_cross_fn_binding() {
+    // Setup: cert physically belongs to FN_A; attempt to bind it as
+    // primary for cashier@FN_B must fail composite FK validation per
+    // §16.10 same-FN cert ownership invariant.
+    let (_d, pool) = fresh_pool().await;
+    seed_fn(&pool, "9000010001").await;  // FN_A
+    seed_fn(&pool, "9000010002").await;  // FN_B
+    let cert_ski = "f".repeat(64);
+    seed_op_cert(&pool, "9000010001", &cert_ski).await;  // cert owned by FN_A
+
+    let res = sqlx::query(
+        "INSERT INTO cashier_certs(cashier_id, fiscal_number, primary_cert_ski_hex) \
+         VALUES ('cashier-X', '9000010002', ?)",
+    )
+    .bind(&cert_ski)
+    .execute(&pool)
+    .await;
+    let err = res.expect_err("composite FK must block cross-FN cert binding");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("foreign") || msg.contains("constraint"),
+        "expected FK-class error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn migration_016_cashier_certs_check_rejects_same_primary_and_deferred() {
+    // Setup: cert exists at FN_A; attempt to bind it as BOTH primary
+    // and deferred for the same cashier — must fail same-cert CHECK
+    // per §16.10 (deferred IS NULL OR deferred != primary).
+    let (_d, pool) = fresh_pool().await;
+    seed_fn(&pool, "9000011000").await;
+    let cert_ski = "9".repeat(64);
+    seed_op_cert(&pool, "9000011000", &cert_ski).await;
+
+    let res = sqlx::query(
+        "INSERT INTO cashier_certs(cashier_id, fiscal_number, primary_cert_ski_hex, deferred_cert_ski_hex) \
+         VALUES ('cashier-Y', '9000011000', ?, ?)",
+    )
+    .bind(&cert_ski)
+    .bind(&cert_ski)
+    .execute(&pool)
+    .await;
+    let err = res.expect_err("CHECK must block primary == deferred (degenerate self-swap)");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("check") || msg.contains("constraint"),
+        "expected CHECK-class error, got: {msg}"
+    );
+}
+
 // ─── (7) Triggers preserved byte-identical post-rebuild ──────────────
 
 #[tokio::test]
