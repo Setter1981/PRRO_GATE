@@ -160,7 +160,12 @@ Online ops resume only after FULL drain completes for FN (per M3b spec §3.3 onl
 - **`MacReseedRecovery`** — MAC chain desync → auto-fetch DPS anchor via probe doc (WebCheck pattern)
 - **`TechSupportRepair`** — boot-time mirror breach → audited manual DB repair seam (NOT Manual recon)
 
-Manual recon ("ЧП из ЧП" per `feedback_manual_recon_catastrophe` memory + spec §3.5) reserved STRICTLY для 3 real-world triggers (per §16.7): (a) FN dereg while offline with OFFLINE_LOCAL_ACK backlog, (b) ambiguous wire timeout on SHIFT_OPEN / Z_REPORT, (c) operator-driven force seam. Every Manual landing → Critical audit + forensic snapshot capture (§8.1) + ≤60s out-of-band operator pager (§8.2).
+Manual recon ("ЧП из ЧП" per `feedback_manual_recon_catastrophe` memory + spec §3.5) **confirmed trigger families** (per spec §16.7):
+- **(1) Any W9b drain reject of an `OFFLINE_LOCAL_ACK` backlog doc** on `OpenedLocalPendingDrain` / `ClosingLocalPendingDrain` → `RequiresManualReconciliation` per §6.3 universal `EscalateManual` rule + edges 6 / 14. This is the **primary Manual recon surface** because drain has crossed the local-commit threshold (customer-facing receipt outstanding); rollback semantics don't apply regardless of underlying `DpsError` class. **FN deregistered while offline** is the operator-confirmed real-world subtype (Case 10).
+- **(2) Ambiguous wire timeout** on online `SHIFT_OPEN` (edge 4) or online `Z_REPORT` (edge 12) — we sent the lifecycle doc but got no response, cannot determine if DPS accepted.
+- **(3) Operator-driven force seam** invocation declaring shift unsalvageable based on out-of-band context (e.g. confirmed week-long DPS maintenance).
+
+Every Manual landing → Critical audit + forensic snapshot capture (§8.1) + ≤60s out-of-band operator pager (§8.2).
 
 ### INV-20 — Канал подання чека є частиною фіскального маршруту і повинен бути в аудиті
 Кожен фіскальний документ повинен мати записаний `submission_channel`, `backend_profile_id`, `transport_profile_id`.
