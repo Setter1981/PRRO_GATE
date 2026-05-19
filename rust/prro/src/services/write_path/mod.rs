@@ -13,6 +13,7 @@
 pub mod dispatch;
 pub mod error_routing;
 pub mod mac_recovery;
+pub mod signer_guard;
 pub mod stage_acquire;
 pub mod stage_finalize;
 pub mod stage_offline_ack;

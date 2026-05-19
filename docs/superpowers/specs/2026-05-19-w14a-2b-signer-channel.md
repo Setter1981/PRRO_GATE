@@ -157,19 +157,45 @@ New enum in `services/write_path/signer_guard.rs`:
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SignerCashierMismatch {
-    /// `signed_by_cashier_id` field is None on the SendInputs.  Caller
+    /// `SendInputs.signed_by_cashier_id` field is None.  Caller
     /// (ingress adapter) failed to attribute the signer.  Surfaces as
     /// `PreOutcome::SignerRefused` with `Ok` to preserve audit.
     #[error("stage send signer id missing for document {document_id:?}")]
     SignerIdMissing { document_id: DocumentId },
 
-    /// Non-close fiscal doc has no resolvable shift_id.  Structural
-    /// caller bug — stage_acquire should have refused at shift-guard
-    /// time.  Surfaces as Ok refusal so audit row commits.
-    #[error("stage send: non-close fiscal doc {document_id:?} of type {doc_type:?} has no resolvable shift_id")]
+    /// Non-bypass fiscal doc has no resolvable shift binding —
+    /// `shift` arg is `None` OR `inputs.shift_id` is `None`.
+    /// Structural caller bug; stage_acquire should have refused at
+    /// shift-guard time.  Surfaces as Ok refusal so audit row commits.
+    #[error("stage send: non-bypass fiscal doc {document_id:?} of type {doc_type:?} has no resolvable shift_id")]
     ShiftMissingForFiscalDoc {
         document_id: DocumentId,
         doc_type: DocType,
+    },
+
+    /// MED-C3-1 — `inputs.shift_id` is `Some(X)` but the supplied
+    /// `shift.shift_id` is `Y` with `X != Y`.  Caller loaded a sibling
+    /// shift row (e.g. "any open shift on this FN") instead of the
+    /// document's persisted shift binding.  Without this check,
+    /// equality on cashier-id would pass tautologically if the FN has
+    /// a single active cashier.
+    #[error("stage send: shift_id mismatch for document {document_id:?} of type {doc_type:?} — expected {expected_shift_id:?}, supplied {supplied_shift_id:?}")]
+    ShiftIdMismatch {
+        document_id: DocumentId,
+        doc_type: DocType,
+        expected_shift_id: Option<ShiftId>,
+        supplied_shift_id: ShiftId,
+    },
+
+    /// NIT-C3-2 — `inputs.fiscal_number != shift.fiscal_number`.
+    /// Structural caller bug; defence-in-depth for W9b drain-time
+    /// consumer that loads `SendInputs` + `ShiftRow` independently
+    /// from persisted ledger rows.
+    #[error("stage send: cross-FN binding for document {document_id:?} — inputs FN {inputs_fiscal_number}, shift FN {shift_fiscal_number}")]
+    CrossFnMismatch {
+        document_id: DocumentId,
+        inputs_fiscal_number: String,
+        shift_fiscal_number: String,
     },
 
     /// Signer cashier id ≠ shift's opening cashier id.  Operator/UI
@@ -186,7 +212,19 @@ pub enum SignerCashierMismatch {
 }
 ```
 
-**Routing:** all 3 variants surface as `Ok(PreOutcome::SignerRefused(SignerCashierMismatch::*))` from stage_send 4-pre tx.  Document state stays at `Signed` (Pattern B — no state mutation on refusal; matches W14a-2a force-seam Ok-return convention).  The refusal is observed by the worker loop; subsequent retry attempts that don't fix the signer id continue to fail (operator must reissue with correct cashier).
+**Bypass set (operator-resolved 2026-05-19, MED-C3-2):** the helper bypasses for `DocType::ShiftClose` / `DocType::ZReport` (per §16.9 senior-cashier seam owns validation) AND for `DocType::ShiftOpen` (at stage_send time the doc has `shift_id = NULL` because stage_acquire allows ShiftOpen only from `ShiftState::Closed` and resolves `active_shift = None`; the shift row is created during stage_finalize after DPS Ack, so the signer's `signed_by_cashier_id` BECOMES `shifts.opened_by_cashier_id` by construction).  Validating before creation is semantically empty.
+
+**Routing:** all 5 variants surface as `Ok(PreOutcome::SignerRefused(SignerCashierMismatch::*))` from stage_send 4-pre tx.  Document state stays at `Signed` (Pattern B — no state mutation on refusal; matches W14a-2a force-seam Ok-return convention).  The refusal is observed by the worker loop; subsequent retry attempts that don't fix the signer id continue to fail (operator must reissue with correct cashier).
+
+**Decision-order precedence:**
+
+  1. `ShiftMissingForFiscalDoc` (shift arg = None OR inputs.shift_id = None)
+  2. `ShiftIdMismatch` (inputs.shift_id != shift.shift_id)
+  3. `CrossFnMismatch` (inputs.fiscal_number != shift.fiscal_number)
+  4. `SignerIdMissing` (inputs.signed_by_cashier_id = None)
+  5. `Mismatch` (signer != opening cashier)
+
+Structural caller bugs (missing shift / wrong shift / cross-FN) surface BEFORE attribution bugs so the operator sees the root cause rather than a derived symptom.
 
 ### 2.5 Audit event
 
@@ -198,8 +236,21 @@ New audit event `SIGNER_CASHIER_MISMATCH`:
 | entity_id | hex(document_id) |
 | event_type | `SIGNER_CASHIER_MISMATCH` |
 | severity | **Warning** |
-| actor | `attempted_signer_id` (so forensic queries surface "who tried") |
-| payload | `{"fiscal_number": ..., "document_id": hex, "doc_type": ..., "shift_id": hex, "expected_cashier_id": ..., "attempted_signer_id": ..., "variant": "Mismatch" \| "SignerIdMissing" \| "ShiftMissingForFiscalDoc", "refused_at_stage": "stage_send_pre"}` |
+| actor | variant-specific (see below) |
+| payload | variant-specific (see below) |
+
+**Variant-specific audit payloads (Commit 5 wiring):**
+
+- `SignerIdMissing`: `{"fiscal_number": ..., "document_id": hex, "doc_type": ..., "variant": "SignerIdMissing", "refused_at_stage": "stage_send_pre"}` — no shift / signer fields (both unavailable).
+- `ShiftMissingForFiscalDoc`: `{"fiscal_number": ..., "document_id": hex, "doc_type": ..., "variant": "ShiftMissingForFiscalDoc", "refused_at_stage": "stage_send_pre"}`.
+- `ShiftIdMismatch`: `{"fiscal_number": ..., "document_id": hex, "doc_type": ..., "expected_shift_id": hex_or_null, "supplied_shift_id": hex, "variant": "ShiftIdMismatch", "refused_at_stage": "stage_send_pre"}`.
+- `CrossFnMismatch`: `{"document_id": hex, "inputs_fiscal_number": ..., "shift_fiscal_number": ..., "variant": "CrossFnMismatch", "refused_at_stage": "stage_send_pre"}` — both FN values surfaced so forensic queries see the cross-FN binding explicitly.
+- `Mismatch`: `{"fiscal_number": ..., "document_id": hex, "doc_type": ..., "shift_id": hex, "expected_cashier_id": ..., "attempted_signer_id": ..., "variant": "Mismatch", "refused_at_stage": "stage_send_pre"}`.
+
+**Actor attribution per variant:**
+
+- `Mismatch`: `actor = attempted_signer_id` (forensic queries surface "who tried").
+- `SignerIdMissing` / `ShiftMissingForFiscalDoc` / `ShiftIdMismatch` / `CrossFnMismatch`: `actor = None` (no operator identity available OR root cause is a dispatcher / caller bug, not an operator action).
 
 **Severity rationale:** Warning (not Critical) because (a) state never mutated — no fiscal commitment leaked; (b) refusal happens BEFORE wire send — no DPS interaction; (c) most likely cause is benign (operator typed wrong id or shift handoff misconfiguration).  Critical would be appropriate only if a wire send had already happened.
 
