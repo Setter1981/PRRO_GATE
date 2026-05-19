@@ -324,6 +324,8 @@ fn make_worker_context(
         z_report_number: None,
         unsigned_xml_sha256: None,
         signing_inputs_pinned_at: None,
+        // W14a-2b Commit 1: plumbing-only; helper not yet using the field.
+        signed_by_cashier_id: None,
     };
     WorkerContext {
         inbox: prro::db::repositories::ingress_inbox::InboxRow {

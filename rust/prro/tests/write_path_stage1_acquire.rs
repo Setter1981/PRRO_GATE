@@ -849,6 +849,8 @@ fn _unused_imports_suppression() {
         z_report_number: None,
         unsigned_xml_sha256: None,
         signing_inputs_pinned_at: None,
+        // W14a-2b additive.
+        signed_by_cashier_id: None,
     };
     let _ = Severity::Info;
     let _ = shifts::ShiftRow {
@@ -857,5 +859,11 @@ fn _unused_imports_suppression() {
         serial: None,
         state: ShiftState::Closed,
         cash_balance_kop: 0,
+        // W14a-2b additive — placeholder; sentinel back-fill semantics
+        // mirror the W14a-1 production rows.
+        opened_by_cashier_id: prro::db::models::ids::CashierId::new(
+            "__test_unused_imports__",
+        )
+        .expect("valid cashier id"),
     };
 }

@@ -248,6 +248,9 @@ pub async fn run(
                 payload_sha256_canonical: command.payload_sha256_canonical,
                 unsigned_xml_sha256: None,
                 previous_hash: None,
+                // W14a-2b Commit 1: plumbing-only — None until Commit 2
+                // threads CanonicalFiscalCommand.signed_by_cashier_id.
+                signed_by_cashier_id: None,
             };
             fd::insert_prepared_tx(tx, &new_doc).await?;
 
@@ -287,6 +290,9 @@ pub async fn run(
                 z_report_number: None,
                 unsigned_xml_sha256: None,
                 signing_inputs_pinned_at: None,
+                // W14a-2b Commit 1: carries the value from new_doc (None
+                // until Commit 2 plumbs CanonicalFiscalCommand).
+                signed_by_cashier_id: new_doc.signed_by_cashier_id.clone(),
             };
 
             Ok(WorkerProcessResult::Proceed(WorkerContext {

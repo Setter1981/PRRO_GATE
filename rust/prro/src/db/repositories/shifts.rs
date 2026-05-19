@@ -24,6 +24,12 @@ pub struct ShiftRow {
     pub serial: Option<i64>,
     pub state: ShiftState,
     pub cash_balance_kop: i64,
+    /// W14a-2b §2.2 — cashier identity from `shifts.opened_by_cashier_id`.
+    /// PR #66 L3 was deferred; W14a-2b makes it in-scope so
+    /// `signer_guard::enforce_signer_cashier_match` (Commit 3) can compare
+    /// against this value.  Always `Some` post-W14a-1 (column is NOT NULL
+    /// in 016_shift_state_expansion.sql via sentinel back-fill).
+    pub opened_by_cashier_id: CashierId,
 }
 
 /// M3b W14a-2a — whitelist of allowed shift state transitions per spec
@@ -142,7 +148,8 @@ pub async fn get(pool: &SqlitePool, id: ShiftId) -> sqlx::Result<Option<ShiftRow
                   fiscal_number,
                   serial,
                   state          as "state: ShiftState",
-                  cash_balance_kop
+                  cash_balance_kop,
+                  opened_by_cashier_id as "opened_by_cashier_id: CashierId"
            FROM shifts WHERE shift_id = ?"#,
         id
     )
@@ -154,6 +161,7 @@ pub async fn get(pool: &SqlitePool, id: ShiftId) -> sqlx::Result<Option<ShiftRow
         serial: r.serial,
         state: r.state,
         cash_balance_kop: r.cash_balance_kop,
+        opened_by_cashier_id: r.opened_by_cashier_id,
     }))
 }
 
@@ -166,7 +174,8 @@ pub async fn get_tx(tx: &mut WriteTxConn<'_>, id: ShiftId) -> sqlx::Result<Optio
                   fiscal_number,
                   serial,
                   state          as "state: ShiftState",
-                  cash_balance_kop
+                  cash_balance_kop,
+                  opened_by_cashier_id as "opened_by_cashier_id: CashierId"
            FROM shifts WHERE shift_id = ?"#,
         id
     )
@@ -178,6 +187,7 @@ pub async fn get_tx(tx: &mut WriteTxConn<'_>, id: ShiftId) -> sqlx::Result<Optio
         serial: r.serial,
         state: r.state,
         cash_balance_kop: r.cash_balance_kop,
+        opened_by_cashier_id: r.opened_by_cashier_id,
     }))
 }
 

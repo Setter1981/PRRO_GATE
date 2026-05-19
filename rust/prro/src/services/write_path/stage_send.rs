@@ -1391,6 +1391,12 @@ mod tests {
             // that to empty id_offline per the Sprint-7-proven
             // contract.
             offline_fiscal_no: None,
+            // W14a-2b Commit 1: SendInputs gained document_id /
+            // shift_id / signed_by_cashier_id; plumbing-only here —
+            // helper is not yet consuming them.
+            document_id: crate::db::models::ids::DocumentId::new(),
+            shift_id: None,
+            signed_by_cashier_id: None,
         }
     }
 
