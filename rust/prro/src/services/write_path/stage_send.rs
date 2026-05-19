@@ -85,10 +85,13 @@ use crate::db::repositories::{
     audit_log, document_files,
     document_files::DocumentFileKind,
     fiscal_documents::{self as fd, TransitionOutcome},
-    node_state,
+    node_state, shifts,
     transport_trace::{self, AttemptCompletion, NewAttempt},
 };
 use crate::db::tx::with_immediate;
+use crate::services::write_path::signer_guard::{
+    self, SignerCashierMismatch,
+};
 use crate::transports::dps::channel::DpsChannel;
 use crate::transports::dps::dto::{CheckEnvelope, DpsCheckType};
 use crate::transports::dps::error::DpsError;
@@ -494,6 +497,13 @@ pub enum StageSendOutcome {
         observed: DocState,
     },
     DocumentMissing,
+    /// W14a-2b Commit 5 — signer-guard refusal at 4-pre BEFORE
+    /// envelope/CAS/trace/wire.  `SIGNER_CASHIER_MISMATCH` Warning
+    /// audit row has been committed to the same `with_immediate` tx
+    /// (preserves forensic trail per spec §2.5 + W14a-2a Round 7 §8.1
+    /// Ok-return contract).  No state mutation; subsequent retry
+    /// without fixing the signer id re-triggers the same refusal.
+    SignerRefused(SignerCashierMismatch),
 }
 
 // ─── Worker step (Pattern B 3-segment, 2 locks) ──────────────────────
@@ -538,6 +548,13 @@ enum PreOutcome {
     /// drain (offline-acked doc replays through the wire-send
     /// ladder on return-online).
     StateConflict { observed: DocState },
+    /// W14a-2b Commit 5 — signer_guard refused inside the 4-pre tx.
+    /// `SIGNER_CASHIER_MISMATCH` Warning audit has been emitted within
+    /// the same `with_immediate` envelope BEFORE this `Ok` return so
+    /// the commit preserves the forensic record (spec §2.5 + W14a-2a
+    /// Round 7 §8.1 Ok-return contract).  No CAS, no trace, no marker,
+    /// no wire.
+    SignerRefused(SignerCashierMismatch),
 }
 
 /// SHA-256 over the **full** prost-encoded `gen::Check` proto bytes
@@ -546,6 +563,118 @@ enum PreOutcome {
 /// hashing only `check_sign` would miss drift in non-CMS fields
 /// between retries; the trace's forensic value depends on the hash
 /// covering every byte that goes on the wire.
+/// W14a-2b Commit 5 — emit `SIGNER_CASHIER_MISMATCH` Warning audit
+/// inside the surrounding `with_immediate` 4-pre tx.
+///
+/// Per spec §2.5:
+/// - Severity = `Warning` (refused BEFORE wire — no fiscal commitment
+///   leaked).
+/// - Actor = `attempted_signer_id` for `Mismatch` (forensic "who
+///   tried" query); `None` for the 4 structural-bug variants (no
+///   operator identity OR root cause is caller bug).
+/// - Payload includes variant tag + variant-specific fields per
+///   spec §2.5 table.
+async fn emit_signer_cashier_mismatch_audit_tx(
+    tx: &mut crate::db::tx::WriteTxConn<'_>,
+    doc: DocumentId,
+    inputs: &SendInputs,
+    mismatch: &SignerCashierMismatch,
+) -> Result<(), sqlx::Error> {
+    let doc_hex = format!("{doc:?}");
+    let (variant_tag, actor, mut payload_obj): (&'static str, Option<String>, serde_json::Value) =
+        match mismatch {
+            SignerCashierMismatch::SignerIdMissing { document_id } => (
+                "SignerIdMissing",
+                None,
+                serde_json::json!({
+                    "fiscal_number": inputs.fiscal_number,
+                    "document_id": format!("{document_id:?}"),
+                    "doc_type": inputs.doc_type.as_str(),
+                }),
+            ),
+            SignerCashierMismatch::ShiftMissingForFiscalDoc {
+                document_id,
+                doc_type,
+            } => (
+                "ShiftMissingForFiscalDoc",
+                None,
+                serde_json::json!({
+                    "fiscal_number": inputs.fiscal_number,
+                    "document_id": format!("{document_id:?}"),
+                    "doc_type": doc_type.as_str(),
+                }),
+            ),
+            SignerCashierMismatch::ShiftIdMismatch {
+                document_id,
+                doc_type,
+                expected_shift_id,
+                supplied_shift_id,
+            } => (
+                "ShiftIdMismatch",
+                None,
+                serde_json::json!({
+                    "fiscal_number": inputs.fiscal_number,
+                    "document_id": format!("{document_id:?}"),
+                    "doc_type": doc_type.as_str(),
+                    "expected_shift_id": expected_shift_id.map(|s| format!("{s:?}")),
+                    "supplied_shift_id": format!("{supplied_shift_id:?}"),
+                }),
+            ),
+            SignerCashierMismatch::CrossFnMismatch {
+                document_id,
+                inputs_fiscal_number,
+                shift_fiscal_number,
+            } => (
+                "CrossFnMismatch",
+                None,
+                serde_json::json!({
+                    "document_id": format!("{document_id:?}"),
+                    "inputs_fiscal_number": inputs_fiscal_number,
+                    "shift_fiscal_number": shift_fiscal_number,
+                }),
+            ),
+            SignerCashierMismatch::Mismatch {
+                shift_id,
+                document_id,
+                expected_cashier_id,
+                attempted_signer_id,
+                doc_type,
+            } => (
+                "Mismatch",
+                Some(attempted_signer_id.as_str().to_string()),
+                serde_json::json!({
+                    "fiscal_number": inputs.fiscal_number,
+                    "document_id": format!("{document_id:?}"),
+                    "doc_type": doc_type.as_str(),
+                    "shift_id": format!("{shift_id:?}"),
+                    "expected_cashier_id": expected_cashier_id.as_str(),
+                    "attempted_signer_id": attempted_signer_id.as_str(),
+                }),
+            ),
+        };
+    if let serde_json::Value::Object(map) = &mut payload_obj {
+        map.insert(
+            "variant".to_string(),
+            serde_json::Value::String(variant_tag.into()),
+        );
+        map.insert(
+            "refused_at_stage".to_string(),
+            serde_json::Value::String("stage_send_pre".into()),
+        );
+    }
+    audit_log::append_tx(
+        tx,
+        "fiscal_document",
+        &doc_hex,
+        "SIGNER_CASHIER_MISMATCH",
+        Severity::Warning,
+        actor.as_deref(),
+        Some(&payload_obj.to_string()),
+    )
+    .await?;
+    Ok(())
+}
+
 fn compute_envelope_hash(envelope: &CheckEnvelope) -> [u8; 32] {
     let proto: gen::Check = envelope.clone().into();
     let bytes = proto.encode_to_vec();
@@ -863,6 +992,60 @@ async fn run_one_attempt(
                 None => return Ok::<_, anyhow::Error>(PreOutcome::DocumentMissing),
             };
 
+            // ── W14a-2b Commit 5 MED-C5-1 fix (2026-05-20) ───────────
+            //
+            // Source-state allowlist gate FIRST — before signer guard,
+            // SIGNED_XML read, envelope build, CAS.  Stale terminal /
+            // out-of-band docs (SENT / KVT1 / Ack / Cancelled / etc.)
+            // must surface as `StateConflict { observed }` regardless
+            // of their shift_id / signed_by_cashier_id attribution.
+            // Pre-fix ordering ran signer_guard first → forensic
+            // noise: a stale SENT doc with NULL shift_id produced
+            // `SIGNER_CASHIER_MISMATCH(ShiftMissingForFiscalDoc)`
+            // instead of the correct StateConflict surface.
+            //
+            // CAS itself still fires later (after envelope build), but
+            // the allowlist filter here is the structural gate.
+            if !matches!(
+                inputs.state,
+                DocState::Signed | DocState::ErrorRetryable | DocState::OfflineLocalAck,
+            ) {
+                return Ok(PreOutcome::StateConflict {
+                    observed: inputs.state,
+                });
+            }
+
+            // ── W14a-2b Commit 5: signer-cashier enforcement ─────────
+            //
+            // Per spec §2.3 + §16.8: validate that
+            // `inputs.signed_by_cashier_id == shift.opened_by_cashier_id`
+            // (with full structural prerequisites — shift binding,
+            // cross-FN, shift_id mismatch) BEFORE SIGNED_XML / envelope /
+            // CAS / trace / `STAGE_SEND_INTENT_MARKED` / wire send.
+            //
+            // Ok-return contract (spec §2.5 + W14a-2a Round 7 §8.1):
+            // refusal surfaces as `Ok(PreOutcome::SignerRefused)` — NOT
+            // `Err` — so the surrounding `with_immediate` tx COMMITS
+            // the `SIGNER_CASHIER_MISMATCH` audit row.  An `Err` return
+            // would roll back the audit alongside any aborted state
+            // mutation.
+            //
+            // ShiftClose / ZReport / ShiftOpen bypass per
+            // `signer_guard` module contract (§16.9 senior-cashier seam
+            // owns ShiftClose/ZReport validation; ShiftOpen has no
+            // shift row pre-finalize).
+            let shift_for_signer: Option<shifts::ShiftRow> = match inputs.shift_id {
+                Some(sid) => shifts::get_tx(tx, sid).await?,
+                None => None,
+            };
+            if let Err(mismatch) = signer_guard::enforce_signer_cashier_match(
+                &inputs,
+                shift_for_signer.as_ref(),
+            ) {
+                emit_signer_cashier_mismatch_audit_tx(tx, doc, &inputs, &mismatch).await?;
+                return Ok(PreOutcome::SignerRefused(mismatch));
+            }
+
             // Read SIGNED_XML ahead of CAS — if it's missing we
             // surface a state-invariant breach (typed error after
             // closure return) without touching state.
@@ -909,14 +1092,22 @@ async fn run_one_attempt(
             // stage_send (it is treated as terminal by
             // `dispatch_pending_doc` until W9b wires the drain).  The
             // `(OfflineLocalAck, Sending)` edge was added to the
-            // `allowed_transition` whitelist by M3b W6 (PR #55).  Any
-            // other observed state is a structural rejection — no CAS
-            // attempt, no wire call.
+            // `allowed_transition` whitelist by M3b W6 (PR #55).
+            //
+            // MED-C5-1 fix (2026-05-20): the structural allowlist
+            // filter now sits at the TOP of the 4-pre body so signer
+            // guard / envelope build / CAS never run on stale terminal
+            // docs (SENT / KVT1 / etc.).  At this point `inputs.state`
+            // is one of the 3 allowed values by construction; the
+            // `unreachable!()` arm guards against future filter drift.
             let source_state = match inputs.state {
                 DocState::Signed | DocState::ErrorRetryable | DocState::OfflineLocalAck => {
                     inputs.state
                 }
-                other => return Ok(PreOutcome::StateConflict { observed: other }),
+                other => unreachable!(
+                    "MED-C5-1 invariant: top-of-4-pre allowlist already filtered \
+                     non-{{Signed,ErrorRetryable,OfflineLocalAck}}; got {other:?}"
+                ),
             };
             match fd::transition_state(tx, doc, source_state, DocState::Sending).await? {
                 TransitionOutcome::Applied => {}
@@ -1001,6 +1192,9 @@ async fn run_one_attempt(
         PreOutcome::EnvelopeBuildFailed(e) => return Err(e),
         PreOutcome::StateConflict { observed } => {
             return Ok(StageSendOutcome::StateConflict { observed })
+        }
+        PreOutcome::SignerRefused(mismatch) => {
+            return Ok(StageSendOutcome::SignerRefused(mismatch))
         }
     };
 

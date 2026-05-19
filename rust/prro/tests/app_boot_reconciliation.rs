@@ -138,6 +138,36 @@ async fn doc_state(pool: &SqlitePool, doc: DocumentId) -> String {
         .unwrap()
 }
 
+/// Boilerplate shared by the 3 boot-driven dispatch tests (W7b offline
+/// happy path + 2 NIT-C5-4 signer-refused acceptance).  Builds an
+/// `App` rooted in a fresh tempdir SQLite DB and returns the tempdir
+/// (held for lifetime) + the booted `App` + a clone of its pool.
+async fn boot_app_with_db(
+    db_filename: &str,
+) -> (tempfile::TempDir, prro::App, SqlitePool) {
+    use prro::config::AppConfig;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join(db_filename);
+    let toml_text = format!(
+        r#"
+app_name = "prro"
+version  = "0.1.0"
+
+[database]
+db_path = "{}"
+
+[admin_ui]
+enabled = false
+listen  = "127.0.0.1:8443"
+"#,
+        db_path.display().to_string().replace('\\', "/")
+    );
+    let cfg = AppConfig::from_toml(&toml_text).expect("config parse");
+    let app = prro::App::boot(cfg).await.expect("App::boot");
+    let pool = app.db().clone();
+    (dir, app, pool)
+}
+
 // ─── #1 — branch (a) FN absent → upsert_initial + audit ───────────────
 
 #[tokio::test]
@@ -909,31 +939,10 @@ mod common;
 #[tokio::test]
 async fn boot_with_deps_routes_offline_signed_doc_to_offline_local_ack() {
     use common::{ack, det_signing_ctx, StubDpsChannel};
-    use prro::config::AppConfig;
     use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
     use prro::transports::dps::dto::CheckSignBlob;
-    use prro::App;
 
-    // Build App + DB.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db_path = dir.path().join("w7b.db");
-    let toml_text = format!(
-        r#"
-app_name = "prro"
-version  = "0.1.0"
-
-[database]
-db_path = "{}"
-
-[admin_ui]
-enabled = false
-listen  = "127.0.0.1:8443"
-"#,
-        db_path.display().to_string().replace('\\', "/")
-    );
-    let cfg = AppConfig::from_toml(&toml_text).expect("config parse");
-    let app = App::boot(cfg).await.expect("App::boot");
-    let pool = app.db().clone();
+    let (_dir, app, pool) = boot_app_with_db("w7b.db").await;
 
     // Seed: FN OFFLINE + OPENED + active OPEN session + 1 code +
     // 1 SIGNED doc.  This is the exact end-to-end fixture operator
@@ -1037,4 +1046,210 @@ listen  = "127.0.0.1:8443"
         "histogram bucket offline_local_ack_emitted must be 1 in audit payload"
     );
     assert_eq!(v["pending_visited"], 1, "exactly one pending doc visited");
+}
+
+// ─── #18 — NIT-C5-4: boot-driven signer-refusal increments histogram ─
+
+/// Verifies the W14a-2b Commit 5 NIT-C5-2 + NIT-C5-5 split:
+/// boot-phase dispatch of a SIGNED doc with mismatched signer routes
+/// through `stage_send::run` → `Ok(SignerRefused(Mismatch))` →
+/// `histogram.signer_refused_mismatch += 1` (NOT generic
+/// `signed_dispatched`).  Also verifies the structural-bug counter
+/// stays at 0 and the audit payload exposes both buckets distinctly.
+#[tokio::test]
+async fn boot_signed_dispatch_signer_mismatch_increments_mismatch_bucket() {
+    use common::{ack, det_signing_ctx, StubDpsChannel};
+    use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
+    use prro::transports::dps::dto::CheckSignBlob;
+
+    let (_dir, app, pool) = boot_app_with_db("c5n4.db").await;
+
+    seed_fn_config(&pool, "1234567890").await;
+    // ONLINE mode + OPENED shift_state so dispatch_post_sign routes
+    // to the Online branch + stage_send::run; SIGNED doc opens via
+    // signer_guard mismatch refusal.
+    let shift_id_bytes: [u8; 16] = [0x99; 16];
+    sqlx::query(
+        "INSERT INTO shifts(shift_id, fiscal_number, serial, state, open_mode, \
+            cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, '1234567890', 1, 'OPENED', 'ONLINE', 0, 'cashier-vasya')",
+    )
+    .bind(&shift_id_bytes[..])
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO node_state(fiscal_number, mode, shift_state, next_lnd, \
+            current_shift_id, backend_profile_id, transport_profile_id) \
+         VALUES (?, 'ONLINE', 'OPENED', 1, ?, 'b1', 't1')",
+    )
+    .bind("1234567890")
+    .bind(&shift_id_bytes[..])
+    .execute(&pool)
+    .await
+    .unwrap();
+    // SIGNED SELL with shift_id bound but signer ≠ opener — triggers
+    // Mismatch variant.
+    let doc_bytes = vec![0x55u8; 16];
+    let req_bytes = vec![0xAAu8; 16];
+    let sha = vec![0u8; 32];
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
+            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical, signed_by_cashier_id) \
+         VALUES (?, ?, '1234567890', ?, 1, 'SELL', 'SIGNED', 'b1', 't1', 'ONLINE', \
+            '2026-05-20T12:00:00Z', '{}', ?, 'cashier-petya')",
+    )
+    .bind(&doc_bytes)
+    .bind(&req_bytes)
+    .bind(&shift_id_bytes[..])
+    .bind(&sha)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO document_files(document_id, kind, content) \
+         VALUES (?, 'SIGNED_XML', ?)",
+    )
+    .bind(&doc_bytes)
+    .bind(b"FAKE-CMS".to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // StubDpsChannel with panic spy — proves wire send NEVER fires
+    // (signer_guard refuses before wire send per spec §2.3).
+    let stub = StubDpsChannel::with_spy(
+        Ok(ack("MUST-NOT-BE-CALLED")),
+        Box::new(|| {
+            panic!(
+                "signer_guard refusal MUST NOT reach wire send (spec §2.3 \
+                 BEFORE envelope/CAS/trace/wire)"
+            )
+        }),
+    );
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    app.reconcile_pending_with(deps)
+        .await
+        .expect("reconcile_pending_with must succeed on signer-refused path");
+
+    // Doc stays SIGNED — Pattern B preserved, no state mutation.
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM fiscal_documents WHERE document_id = ?",
+    )
+    .bind(&doc_bytes)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "SIGNED", "doc state MUST stay SIGNED on signer refusal");
+
+    // SIGNER_CASHIER_MISMATCH audit committed via Ok-return.
+    assert_eq!(
+        audit_count(&pool, "SIGNER_CASHIER_MISMATCH").await,
+        1,
+        "SIGNER_CASHIER_MISMATCH audit MUST be emitted from 4-pre tx",
+    );
+
+    // NIT-C5-2 + NIT-C5-5 verification: histogram payload exposes
+    // signer_refused_mismatch == 1 + signer_refused_structural_bug == 0.
+    let payload: String = sqlx::query_scalar(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE event_type = 'NODE_STATE_BOOT_RECONCILED' LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        v["by_outcome"]["signer_refused_mismatch"], 1,
+        "Mismatch variant MUST increment signer_refused_mismatch bucket"
+    );
+    assert_eq!(
+        v["by_outcome"]["signer_refused_structural_bug"], 0,
+        "structural-bug bucket MUST stay 0 on operator-Mismatch path"
+    );
+    assert_eq!(
+        v["by_outcome"]["signed_dispatched"], 0,
+        "generic signed_dispatched MUST NOT count signer-refused docs"
+    );
+}
+
+// ─── #19 — NIT-C5-4: structural-bug bucket increments for missing shift ─
+
+#[tokio::test]
+async fn boot_signed_dispatch_shift_missing_increments_structural_bug_bucket() {
+    use common::{ack, det_signing_ctx, StubDpsChannel};
+    use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
+    use prro::transports::dps::dto::CheckSignBlob;
+
+    let (_dir, app, pool) = boot_app_with_db("c5n4b.db").await;
+
+    seed_fn_config(&pool, "1234567890").await;
+    // ONLINE + CLOSED shift_state — node_state has no active shift,
+    // so the SIGNED doc dispatched below has shift_id = NULL →
+    // signer_guard surfaces ShiftMissingForFiscalDoc (structural bug).
+    seed_node_state(&pool, "1234567890", "ONLINE", "CLOSED", 1).await;
+    let doc_bytes = vec![0x66u8; 16];
+    let req_bytes = vec![0xBBu8; 16];
+    let sha = vec![0u8; 32];
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, \
+            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical, signed_by_cashier_id) \
+         VALUES (?, ?, '1234567890', 1, 'SELL', 'SIGNED', 'b1', 't1', 'ONLINE', \
+            '2026-05-20T12:00:00Z', '{}', ?, 'cashier-vasya')",
+    )
+    .bind(&doc_bytes)
+    .bind(&req_bytes)
+    .bind(&sha)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO document_files(document_id, kind, content) \
+         VALUES (?, 'SIGNED_XML', ?)",
+    )
+    .bind(&doc_bytes)
+    .bind(b"FAKE-CMS".to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let stub = StubDpsChannel::with_spy(
+        Ok(ack("MUST-NOT-BE-CALLED")),
+        Box::new(|| panic!("structural-bug refusal MUST NOT reach wire send")),
+    );
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xCA, 0xFE, 0xBA, 0xBE]);
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    app.reconcile_pending_with(deps).await.unwrap();
+
+    let payload: String = sqlx::query_scalar(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE event_type = 'NODE_STATE_BOOT_RECONCILED' LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        v["by_outcome"]["signer_refused_structural_bug"], 1,
+        "ShiftMissingForFiscalDoc MUST increment structural_bug bucket"
+    );
+    assert_eq!(
+        v["by_outcome"]["signer_refused_mismatch"], 0,
+        "operator-Mismatch bucket MUST stay 0 on caller-bug path"
+    );
 }
