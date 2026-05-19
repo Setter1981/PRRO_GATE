@@ -540,7 +540,7 @@ pub enum RejectionReason {
 
 | RejectionReason | Audit event | Severity | Rationale |
 |---|---|---|---|
-| `NodeGoingOnlineDrainInFlight` | `STAGE_ACQUIRE_GOING_ONLINE_REFUSED` | Info | Expected during return-online drain; transient |
+| `NodeGoingOnlineDrainInFlight` | `STAGE_ACQUIRE_GOING_ONLINE_REFUSED` | Warning | Operator-visible refusal (NIT-C4-2: Warning chosen for parity with other mode-side refusals; transient nature noted in rationale but audit severity stays at operator-visible level) |
 | `NodeBlocked` | `STAGE_ACQUIRE_BLOCKED_REFUSED` | Warning | Operator manual-recovery state — forensic |
 | `NodeStopMode` | `STAGE_ACQUIRE_STOP_MODE_REFUSED` | Warning | Regulatory pause; rare |
 | `NodeCryptoDegraded` | `STAGE_ACQUIRE_CRYPTO_DEGRADED_REFUSED` | **Critical** | Key/sidecar degradation — operator must intervene before next op succeeds |

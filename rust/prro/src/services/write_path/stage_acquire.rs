@@ -17,9 +17,10 @@ use crate::db::repositories::{
     ingress_inbox, node_state, shifts,
 };
 use crate::db::tx::with_immediate;
+use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
-use super::types::{CanonicalFiscalCommand, RejectionReason, WorkerContext, WorkerProcessResult};
+use super::types::{Channel, CanonicalFiscalCommand, RejectionReason, WorkerContext, WorkerProcessResult};
 
 /// Public stage-1 entry.  Opens one `with_immediate` envelope and
 /// runs the lease + guard + lnd-allocate + INSERT PREPARED + audit
@@ -73,6 +74,7 @@ pub async fn run(
                     },
                     "command_inbox_mismatch",
                     Severity::Critical,
+                    None,
                 )
                 .await;
             }
@@ -85,6 +87,7 @@ pub async fn run(
                     },
                     "command_inbox_mismatch",
                     Severity::Critical,
+                    None,
                 )
                 .await;
             }
@@ -94,17 +97,90 @@ pub async fn run(
                 .await?
                 .with_context(|| format!("node_state row missing for fn={fn_id}"))?;
 
-            // [Step 3a] Fast-path: NodeMode != Online → reject.
-            if node_state.mode != NodeMode::Online {
-                return reject(
-                    tx,
-                    &request_id,
-                    RejectionReason::NodeOffline,
-                    "node_offline_reject",
-                    Severity::Warning,
-                )
-                .await;
-            }
+            // [Step 3a] W14a-2b Commit 4 — mode guard rewrite per spec §3.3.
+            // Replaces the pre-W14a-2b `mode != Online → NodeOffline` binary.
+            //
+            // Mapping:
+            //   Online                      → Channel::Online, proceed
+            //   Offline | GoingOffline      → Channel::Offline, proceed
+            //   GoingOnline                 → reject (return-online drain in flight)
+            //   Blocked                     → reject (operator manual recovery)
+            //   StopMode                    → reject (legal hold)
+            //   CryptoDegraded              → reject (crypto subsystem degraded)
+            let channel = match node_state.mode {
+                NodeMode::Online => Channel::Online,
+                NodeMode::Offline | NodeMode::GoingOffline => Channel::Offline,
+                NodeMode::GoingOnline => {
+                    // NIT-C4-2 fix: Warning (not Info) for parity with
+                    // other mode-side refusals.  Operator dashboards
+                    // need consistent visibility on refused ops — the
+                    // "transient" nature of GoingOnline is documented
+                    // in the rationale but doesn't justify a lower
+                    // audit-severity gate.
+                    return reject(
+                        tx,
+                        &request_id,
+                        RejectionReason::NodeGoingOnlineDrainInFlight,
+                        "node_going_online_drain_in_flight",
+                        Severity::Warning,
+                        Some(mode_refusal_context(
+                            &fn_id,
+                            command.doc_type,
+                            node_state.mode,
+                            Some("Online"),
+                        )),
+                    )
+                    .await;
+                }
+                NodeMode::Blocked => {
+                    return reject(
+                        tx,
+                        &request_id,
+                        RejectionReason::NodeBlocked,
+                        "node_blocked",
+                        Severity::Warning,
+                        Some(mode_refusal_context(
+                            &fn_id,
+                            command.doc_type,
+                            node_state.mode,
+                            None,
+                        )),
+                    )
+                    .await;
+                }
+                NodeMode::StopMode => {
+                    return reject(
+                        tx,
+                        &request_id,
+                        RejectionReason::NodeStopMode,
+                        "node_stop_mode",
+                        Severity::Warning,
+                        Some(mode_refusal_context(
+                            &fn_id,
+                            command.doc_type,
+                            node_state.mode,
+                            None,
+                        )),
+                    )
+                    .await;
+                }
+                NodeMode::CryptoDegraded => {
+                    return reject(
+                        tx,
+                        &request_id,
+                        RejectionReason::NodeCryptoDegraded,
+                        "node_crypto_degraded",
+                        Severity::Critical,
+                        Some(mode_refusal_context(
+                            &fn_id,
+                            command.doc_type,
+                            node_state.mode,
+                            None,
+                        )),
+                    )
+                    .await;
+                }
+            };
 
             // [Step 3b] Profile-binding guard — schema permits NULL,
             // submissions cannot proceed without resolved bindings.
@@ -117,55 +193,87 @@ pub async fn run(
                     RejectionReason::MissingProfileBinding,
                     "profile_binding_missing",
                     Severity::Warning,
+                    None,
                 )
                 .await;
             }
 
-            // [Step 4] Shift-state guard — keyed on doc_type.
-            if let Some(reason) = check_shift_guard(command.doc_type, node_state.shift_state) {
+            // [Step 4] Shift-state guard — channel-aware (W14a-2b Commit 4).
+            if let Some(reason) =
+                check_shift_guard(command.doc_type, node_state.shift_state, channel)
+            {
                 return reject(
                     tx,
                     &request_id,
                     reason,
                     "guard_rejected",
                     Severity::Warning,
+                    Some(shift_guard_refusal_context(
+                        &fn_id,
+                        command.doc_type,
+                        node_state.shift_state,
+                        channel,
+                        node_state.current_shift_id.as_ref(),
+                    )),
                 )
                 .await;
             }
 
             // [Step 5] Resolve active_shift via node_state.current_shift_id.
             //          Single source of truth; no scan-for-latest-open.
-            let active_shift = match (node_state.shift_state, &node_state.current_shift_id) {
-                (ShiftState::Opened, Some(shift_id)) => {
-                    let row = shifts::get_tx(tx, *shift_id).await?;
-                    match row {
-                        Some(s) if s.state == ShiftState::Opened => Some(s),
-                        _ => {
-                            // shift_state=Opened but resolved row missing or not Opened.
-                            return reject(
-                                tx,
-                                &request_id,
-                                RejectionReason::ShiftInvariantViolation,
-                                "shift_invariant_violation",
-                                Severity::Critical,
-                            )
-                            .await;
+            //
+            // HIGH-C4-1 fix (operator-flagged 2026-05-19): resolver widened
+            // to `Opened | OpenedLocalPendingDrain` per spec §3.6a.  Without
+            // this, regular fiscal docs in `OpenedLocalPendingDrain + Offline`
+            // (now allowed by §3.4 matrix) would be inserted with
+            // `fiscal_documents.shift_id = NULL` — breaking forensic
+            // attribution + future W9b drain-time signer enforcement
+            // (signer_guard would surface `ShiftMissingForFiscalDoc` for
+            // legitimate offline docs).
+            let active_shift =
+                match (node_state.shift_state, &node_state.current_shift_id) {
+                    (
+                        ShiftState::Opened | ShiftState::OpenedLocalPendingDrain,
+                        Some(shift_id),
+                    ) => {
+                        let expected = node_state.shift_state;
+                        let row = shifts::get_tx(tx, *shift_id).await?;
+                        match row {
+                            Some(s) if s.state == expected => Some(s),
+                            _ => {
+                                // node_state.shift_state says (Opened |
+                                // OpenedLocalPendingDrain) but resolved
+                                // row missing OR state diverges from
+                                // node_state mirror — structural breach.
+                                return reject(
+                                    tx,
+                                    &request_id,
+                                    RejectionReason::ShiftInvariantViolation,
+                                    "shift_invariant_violation",
+                                    Severity::Critical,
+                                    None,
+                                )
+                                .await;
+                            }
                         }
                     }
-                }
-                (ShiftState::Opened, None) => {
-                    // shift_state=Opened but current_shift_id IS NULL.
-                    return reject(
-                        tx,
-                        &request_id,
-                        RejectionReason::ShiftInvariantViolation,
-                        "shift_invariant_violation",
-                        Severity::Critical,
-                    )
-                    .await;
-                }
-                _ => None,
-            };
+                    (
+                        ShiftState::Opened | ShiftState::OpenedLocalPendingDrain,
+                        None,
+                    ) => {
+                        // shift_state says open but current_shift_id IS NULL.
+                        return reject(
+                            tx,
+                            &request_id,
+                            RejectionReason::ShiftInvariantViolation,
+                            "shift_invariant_violation",
+                            Severity::Critical,
+                            None,
+                        )
+                        .await;
+                    }
+                    _ => None,
+                };
 
             // [Step 6] Resume-detect — pending lookup only.  Terminal
             //          rows (ACK / REJECTED / CANCELLED /
@@ -213,6 +321,7 @@ pub async fn run(
                     },
                     "terminal_document_for_request_id",
                     Severity::Critical,
+                    None,
                 )
                 .await;
             }
@@ -231,6 +340,16 @@ pub async fn run(
                 .clone()
                 .expect("profile-binding guard ensures Some");
             let document_id = DocumentId::new();
+            // MED-C4-3 fix (operator-flagged 2026-05-19): derive fs_mode
+            // from the channel resolved at Step 3a.  Pre-fix hardcoded
+            // "ONLINE" produced a ledger-drift for offline-channel
+            // inserts allowed by C4 (Sell|... + OpenedLocalPendingDrain
+            // + Offline) — the persisted row would report ONLINE for a
+            // doc that later transitions to OFFLINE_LOCAL_ACK.
+            let fs_mode = match channel {
+                Channel::Online => "ONLINE",
+                Channel::Offline => "OFFLINE",
+            };
             let new_doc = NewDocument {
                 document_id,
                 request_id: request_id_typed,
@@ -241,7 +360,7 @@ pub async fn run(
                 doc_type: command.doc_type,
                 backend_profile_id,
                 transport_profile_id,
-                fs_mode: "ONLINE",
+                fs_mode,
                 business_ts: command.business_ts.clone(),
                 total_sum_kop: command.total_sum_kop,
                 payload_json: command.payload_json.clone(),
@@ -311,14 +430,94 @@ pub async fn run(
 /// Apply a guard rejection: mark inbox REJECTED + append audit row.
 /// No `fiscal_documents` row, no lnd allocation — the inbox carries
 /// the rejection.
+/// MED-C4-2: build per-spec §3.6 audit payload for mode-guard refusals.
+/// Shape: `{fiscal_number, doc_type, current_mode, requested_channel?}`.
+fn mode_refusal_context(
+    fn_id: &str,
+    doc_type: DocType,
+    current_mode: NodeMode,
+    requested_channel: Option<&'static str>,
+) -> Value {
+    let mut obj = json!({
+        "fiscal_number": fn_id,
+        "doc_type": doc_type.as_str(),
+        "current_mode": format!("{current_mode:?}"),
+    });
+    if let (Some(req), Value::Object(map)) = (requested_channel, &mut obj) {
+        map.insert("requested_channel".to_string(), Value::String(req.into()));
+    }
+    obj
+}
+
+/// MED-C4-2: build per-spec §3.6 audit payload for shift-guard refusals.
+/// Shape: `{fiscal_number, doc_type, current_state, current_channel,
+/// shift_id?}` (shift_id from `node_state.current_shift_id` if present).
+fn shift_guard_refusal_context(
+    fn_id: &str,
+    doc_type: DocType,
+    current_state: ShiftState,
+    current_channel: Channel,
+    shift_id: Option<&crate::db::models::ids::ShiftId>,
+) -> Value {
+    let channel_str = match current_channel {
+        Channel::Online => "Online",
+        Channel::Offline => "Offline",
+    };
+    let mut obj = json!({
+        "fiscal_number": fn_id,
+        "doc_type": doc_type.as_str(),
+        "current_state": current_state.as_str(),
+        "current_channel": channel_str,
+    });
+    if let (Some(sid), Value::Object(map)) = (shift_id, &mut obj) {
+        map.insert(
+            "shift_id".to_string(),
+            Value::String(hex_encode(sid.as_bytes())),
+        );
+    }
+    obj
+}
+
+/// MED-C4-2: per-spec §3.6 audit-event names for W14a-2b variants.
+/// `None` falls back to the legacy `event_type` argument passed by the
+/// caller (`guard_rejected` for pre-existing shift refusals, etc.).
+fn spec_event_for(reason: &RejectionReason) -> Option<&'static str> {
+    use RejectionReason::*;
+    match reason {
+        NodeGoingOnlineDrainInFlight => Some("STAGE_ACQUIRE_GOING_ONLINE_REFUSED"),
+        NodeBlocked => Some("STAGE_ACQUIRE_BLOCKED_REFUSED"),
+        NodeStopMode => Some("STAGE_ACQUIRE_STOP_MODE_REFUSED"),
+        NodeCryptoDegraded => Some("STAGE_ACQUIRE_CRYPTO_DEGRADED_REFUSED"),
+        ShiftOpenPendingDrainOpRefused => Some("SHIFT_OPEN_PENDING_DRAIN_OP_REFUSED"),
+        PostLocalCloseSaleRefused => Some("POST_LOCAL_CLOSE_SALE_REFUSED"),
+        OfflineShiftCloseNotSupported => Some("OFFLINE_SHIFT_CLOSE_REFUSED"),
+        ShiftClosingInFlight => Some("SHIFT_CLOSING_IN_FLIGHT_OP_REFUSED"),
+        ZReportBlockedBacklogDrainPending => Some("OFFLINE_Z_REPORT_BACKLOG_DRAIN_PENDING_REFUSED"),
+        _ => None,
+    }
+}
+
 async fn reject(
     tx: &mut crate::db::tx::WriteTxConn<'_>,
     request_id: &[u8; 16],
     reason: RejectionReason,
-    event_type: &'static str,
+    legacy_event_type: &'static str,
     severity: Severity,
+    extra_context: Option<Value>,
 ) -> anyhow::Result<WorkerProcessResult> {
     ingress_inbox::mark_rejected_tx(tx, request_id).await?;
+    // MED-C4-2: derive spec §3.6 event name for W14a-2b variants.
+    let event_type = spec_event_for(&reason).unwrap_or(legacy_event_type);
+    // MED-C4-2: build per-spec audit payload; legacy callers pass
+    // `None` and keep the minimal `{"reason": ...}` shape.
+    let mut payload = json!({"reason": format!("{reason:?}")});
+    if let Some(Value::Object(extras)) = extra_context {
+        if let Value::Object(base) = &mut payload {
+            for (k, v) in extras {
+                base.insert(k, v);
+            }
+        }
+    }
     audit_log::append_tx(
         tx,
         "ingress_inbox",
@@ -326,101 +525,128 @@ async fn reject(
         event_type,
         severity,
         None,
-        Some(&format!(r#"{{"reason":"{reason:?}"}}"#)),
+        Some(&payload.to_string()),
     )
     .await?;
     Ok(WorkerProcessResult::Rejected { reason })
 }
 
-/// Stage 2 shift-state guard.  Returns `Some(reason)` if the
-/// (doc_type, shift_state) pair is forbidden, `None` if allowed.
+/// Stage 2 shift-state guard — W14a-2b Commit 4 channel-aware.
+/// Returns `Some(reason)` if the (doc_type, shift_state, channel)
+/// triple is forbidden, `None` if allowed.
 ///
-/// **Order matters**: `ShiftState::Error` and
-/// `ShiftState::RequiresManualReconciliation` are both terminal /
-/// operator-action states that apply uniformly to every doc_type, so
-/// their catch-all arms run FIRST — before any
-/// `(SHIFT_OPEN, _)` / `(SHIFT_CLOSE, _)` / `(Z_REPORT, _)` catch-all
-/// that would otherwise mislabel them as `ShiftAlreadyOpen` /
-/// `ShiftNotOpen`.  Per spec §5.6 matrix:
-///   - `(_, Error)` → `ShiftInError` (structural-breach surface).
-///   - `(_, RequiresManualReconciliation)` → `ShiftRequiresOperatorAttention`
-///     (operator-action / accounting-compensation surface; per M3b §16.7
-///     drain rejected an OFFLINE_LOCAL_ACK backlog doc, ambiguous wire
-///     timeout, or force seam).
-fn check_shift_guard(doc_type: DocType, shift_state: ShiftState) -> Option<RejectionReason> {
-    match (doc_type, shift_state) {
-        // ERROR is terminal — reject everything.  Must precede every
-        // doc_type-specific catch-all below.
-        (_, ShiftState::Error) => Some(RejectionReason::ShiftInError),
-        // REQUIRES_MANUAL_RECONCILIATION is operator-action territory — reject
-        // everything with the operator-attention surface (PR #65 R1 M1 per
-        // spec §5.6).  Distinct from `ShiftInError` so audit/metrics/UI
-        // can label appropriately (Manual = accounting compensation,
-        // Error = structural breach).
-        (_, ShiftState::RequiresManualReconciliation) => {
+/// **Order matters**: terminal / operator-action shift states are
+/// matched FIRST (channel-irrelevant), then doc-type-specific arms.
+/// Per spec §3.4 + §5.6:
+///   - `(_, Error, _)` → `ShiftInError` (structural-breach surface).
+///   - `(_, RequiresManualReconciliation, _)` → `ShiftRequiresOperatorAttention`.
+///   - W14a-2b matrix: 9 doc types × 9 shift states × 2 channels = 162
+///     cells.  Explicit arms cover all non-trivial pairs; catch-all
+///     `ShiftNotOpen` handles the residual.
+///
+/// **Channel semantics:**
+///   - `Channel::Online`: classical write-path.  Refused on
+///     `OpenedLocalPendingDrain` for regular fiscal ops + Z_REPORT
+///     (operator must wait for drain or reissue offline).
+///   - `Channel::Offline`: Pattern C resilience surface.  Regular
+///     fiscal ops succeed on `OpenedLocalPendingDrain` (pre-W10
+///     Z_REPORT is blocked unconditionally pending coupled pool/
+///     backlog/edge-7 logic).
+///
+/// **`ClosingLocalPendingDrain`** is the post-local-close lockout
+/// (PR #62 §W10): every doc type is refused regardless of channel.
+fn check_shift_guard(
+    doc_type: DocType,
+    shift_state: ShiftState,
+    channel: Channel,
+) -> Option<RejectionReason> {
+    use Channel::*;
+    use DocType::*;
+    use ShiftState::*;
+    match (doc_type, shift_state, channel) {
+        // ── Terminal / operator-action arms — channel-irrelevant ──
+        (_, Error, _) => Some(RejectionReason::ShiftInError),
+        (_, RequiresManualReconciliation, _) => {
             Some(RejectionReason::ShiftRequiresOperatorAttention)
         }
-        // Shift-management ops require specific shift states.
-        (DocType::ShiftOpen, ShiftState::Closed) => None,
-        (DocType::ShiftOpen, _) => Some(RejectionReason::ShiftAlreadyOpen),
-        (DocType::ShiftClose, ShiftState::Opened) => None,
-        (DocType::ZReport, ShiftState::Opened) => None,
-        // Mid-transition (Opening / Closing / Created) — block everything.
-        (_, ShiftState::Created | ShiftState::Opening | ShiftState::Closing) => {
-            Some(RejectionReason::ShiftNotOpen {
-                current: shift_state,
-            })
+
+        // ── Shift-management ops ──
+        (ShiftOpen, Closed, _) => None,
+        // NIT-C4-1 fix: spec §3.4 matrix specifies distinct refusal
+        // reason for (ShiftOpen, ClosingLocalPendingDrain).  Shift is
+        // mid-close, not "already open"; ShiftClosingInFlight is the
+        // forensic-accurate label.
+        (ShiftOpen, ClosingLocalPendingDrain, _) => {
+            Some(RejectionReason::ShiftClosingInFlight)
         }
-        // Regular fiscal ops require Opened.
+        (ShiftOpen, _, _) => Some(RejectionReason::ShiftAlreadyOpen),
+        (ShiftClose, Opened, _) => None,
+        (ShiftClose, OpenedLocalPendingDrain, _) => {
+            // Spec §5.7 L2 — offline shift close not modeled.
+            Some(RejectionReason::OfflineShiftCloseNotSupported)
+        }
+        (ShiftClose, ClosingLocalPendingDrain, _) => {
+            Some(RejectionReason::ShiftClosingInFlight)
+        }
+        (ZReport, Opened, _) => None,
+        (ZReport, OpenedLocalPendingDrain, _) => {
+            // Pre-W10 guardrail (both channels).  Spec §3.4 + operator
+            // correction #3 (2026-05-19): W10 later replaces this
+            // refusal with coupled pool/backlog/edge-7 logic.
+            Some(RejectionReason::ZReportBlockedBacklogDrainPending)
+        }
+        (ZReport, ClosingLocalPendingDrain, _) => {
+            Some(RejectionReason::ShiftClosingInFlight)
+        }
+        // ShiftClose / ZReport against `Closed` — shift is terminal,
+        // operator should issue ShiftOpen first.
+        (ShiftClose | ZReport, Closed, _) => {
+            Some(RejectionReason::ShiftNotOpen { current: shift_state })
+        }
+
+        // ── Mid-transition (Created / Opening / Closing) — block all.
+        (_, Created | Opening | Closing, _) => {
+            Some(RejectionReason::ShiftNotOpen { current: shift_state })
+        }
+
+        // ── Regular fiscal ops in Opened — channel-irrelevant happy.
         (
-            DocType::Sell
-            | DocType::Return
-            | DocType::ServiceIn
-            | DocType::ServiceOut
-            | DocType::CashWithdrawal
-            | DocType::XReport,
-            ShiftState::Opened,
+            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+            Opened,
+            _,
         ) => None,
+
+        // ── Regular fiscal ops in Closed — channel-irrelevant refusal.
         (
-            DocType::Sell
-            | DocType::Return
-            | DocType::ServiceIn
-            | DocType::ServiceOut
-            | DocType::CashWithdrawal
-            | DocType::XReport,
-            ShiftState::Closed,
-        ) => Some(RejectionReason::ShiftNotOpen {
-            current: shift_state,
-        }),
-        // W14a-1 minimal compile coverage for the 2 new in-flight M3b
-        // shift states.  Fiscal ops against `OpenedLocalPendingDrain` /
-        // `ClosingLocalPendingDrain` defensively refused via the existing
-        // `ShiftNotOpen` reason.  Full semantics land in W14a-2
-        // (channel-aware offline ops on OpenedLocalPendingDrain per spec
-        // §3.3; explicit POST_LOCAL_CLOSE_SALE_REFUSED for
-        // ClosingLocalPendingDrain per PR #62 §W10).
-        // (`RequiresManualReconciliation` is caught earlier by the
-        // `(_, ShiftState::RequiresManualReconciliation)` arm above —
-        // PR #65 R1 M1 fix per spec §5.6.)
-        // ShiftOpen + these in-flight states is already caught upstream
-        // by the `(ShiftOpen, _)` arm above (→ ShiftAlreadyOpen).
-        // ShiftClose / ZReport + these is caught by the catch-all below.
+            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+            Closed,
+            _,
+        ) => Some(RejectionReason::ShiftNotOpen { current: shift_state }),
+
+        // ── W14a-2b channel-aware OpenedLocalPendingDrain ──
+        // Offline channel: Pattern C resilience surface — allowed.
         (
-            DocType::Sell
-            | DocType::Return
-            | DocType::ServiceIn
-            | DocType::ServiceOut
-            | DocType::CashWithdrawal
-            | DocType::XReport,
-            ShiftState::OpenedLocalPendingDrain
-            | ShiftState::ClosingLocalPendingDrain,
-        ) => Some(RejectionReason::ShiftNotOpen {
-            current: shift_state,
-        }),
-        // Catch-all: SHIFT_CLOSE / Z_REPORT against non-Opened.
-        (DocType::ShiftClose, _) | (DocType::ZReport, _) => Some(RejectionReason::ShiftNotOpen {
-            current: shift_state,
-        }),
+            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+            OpenedLocalPendingDrain,
+            Offline,
+        ) => None,
+        // Online channel: operator should reissue offline or wait
+        // for drain — refused with typed audit shape.
+        (
+            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+            OpenedLocalPendingDrain,
+            Online,
+        ) => Some(RejectionReason::ShiftOpenPendingDrainOpRefused),
+
+        // ── ClosingLocalPendingDrain — post-local-close lockout ──
+        // ALL regular fiscal ops refused (PR #62 §W10).  Channel-
+        // irrelevant — once a Z-report has been locally acked, no
+        // further sale-flavour ops accepted regardless of channel.
+        (
+            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+            ClosingLocalPendingDrain,
+            _,
+        ) => Some(RejectionReason::PostLocalCloseSaleRefused),
     }
 }
 
