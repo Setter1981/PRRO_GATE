@@ -103,30 +103,65 @@ pub fn enforce_signer_cashier_match(
     inputs: &SendInputs,
     shift: Option<&ShiftRow>,
 ) -> Result<(), SignerCashierMismatch> {
-    // §16.9 bypass: SHIFT_CLOSE / Z_REPORT may be signed by senior cashier.
-    // The senior_cashier_close_shift_with_audit seam (W14a-2a) has its own
-    // runtime validation via cashier_certs; this helper trusts that layer.
-    if matches!(inputs.doc_type, DocType::ShiftClose | DocType::ZReport) {
+    // Bypass set (MED-C3-2 resolution): SHIFT_CLOSE / Z_REPORT use the
+    // senior-cashier seam (§16.9); SHIFT_OPEN has no shift row yet at
+    // stage_send time (stage_acquire allows only from ShiftState::Closed,
+    // inserts with shift_id = NULL; shift row created post-finalize).
+    if matches!(
+        inputs.doc_type,
+        DocType::ShiftClose | DocType::ZReport | DocType::ShiftOpen,
+    ) {
         return Ok(());
     }
 
-    // Non-close fiscal ops require an active shift.  If shift_id is None
-    // here, the doc was constructed outside a shift context — structural
-    // refusal (caller bug: stage_acquire should have refused at guard time).
-    let shift = shift.ok_or_else(|| SignerCashierMismatch::ShiftMissingForFiscalDoc {
+    // (1a) Non-bypass fiscal docs MUST have a resolvable shift row.
+    let shift = shift.ok_or(SignerCashierMismatch::ShiftMissingForFiscalDoc {
         document_id: inputs.document_id,
         doc_type: inputs.doc_type,
     })?;
 
-    let attempted = inputs.signed_by_cashier_id.as_ref().ok_or_else(||
-        SignerCashierMismatch::SignerIdMissing { document_id: inputs.document_id }
+    // (1b) MED-C3-1: inputs.shift_id MUST be Some; absence = no
+    // resolvable binding for signer validation.
+    let inputs_shift_id = inputs.shift_id.ok_or(
+        SignerCashierMismatch::ShiftMissingForFiscalDoc {
+            document_id: inputs.document_id,
+            doc_type: inputs.doc_type,
+        },
     )?;
-    let expected = &shift.opened_by_cashier_id;
-    if attempted.as_str() != expected.as_str() {
+
+    // (2) MED-C3-1: supplied shift row MUST be the document's own shift,
+    // NOT a sibling same-FN shift.  Without this, equality on cashier-id
+    // would pass tautologically when the FN has a single active cashier.
+    if inputs_shift_id != shift.shift_id {
+        return Err(SignerCashierMismatch::ShiftIdMismatch {
+            document_id: inputs.document_id,
+            doc_type: inputs.doc_type,
+            expected_shift_id: Some(inputs_shift_id),
+            supplied_shift_id: shift.shift_id,
+        });
+    }
+
+    // (3) NIT-C3-2 cross-FN defence-in-depth.
+    if inputs.fiscal_number != shift.fiscal_number {
+        return Err(SignerCashierMismatch::CrossFnMismatch {
+            document_id: inputs.document_id,
+            inputs_fiscal_number: inputs.fiscal_number.clone(),
+            shift_fiscal_number: shift.fiscal_number.clone(),
+        });
+    }
+
+    // (4) Signer attribution required for non-bypass fiscal docs.
+    let attempted = inputs.signed_by_cashier_id.as_ref().ok_or(
+        SignerCashierMismatch::SignerIdMissing { document_id: inputs.document_id },
+    )?;
+
+    // (5) Equality check via `as_str()` to avoid double-clone'ing CashierId
+    // on the happy path; clones occur only on the Mismatch construction.
+    if attempted.as_str() != shift.opened_by_cashier_id.as_str() {
         return Err(SignerCashierMismatch::Mismatch {
             shift_id: shift.shift_id,
             document_id: inputs.document_id,
-            expected_cashier_id: expected.clone(),
+            expected_cashier_id: shift.opened_by_cashier_id.clone(),
             attempted_signer_id: attempted.clone(),
             doc_type: inputs.doc_type,
         });
