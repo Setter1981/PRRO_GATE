@@ -154,6 +154,10 @@ fn cmd(doc_type: DocType) -> CanonicalFiscalCommand {
         total_sum_kop: Some(15000),
         payload_json: r#"{"goods":[]}"#.into(),
         payload_sha256_canonical: [0u8; 32],
+        // W14a-2b Commit 2: stage_acquire test fixtures don't exercise
+        // signer enforcement (Commits 3+5); None baseline matches W14a-1
+        // semantics.
+        signed_by_cashier_id: None,
     }
 }
 

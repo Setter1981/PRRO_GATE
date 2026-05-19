@@ -299,6 +299,10 @@ fn make_command(
         total_sum_kop,
         payload_json: payload_json.into(),
         payload_sha256_canonical: dummy_payload_sha256(),
+        // W14a-2b Commit 2: stage_sign test fixtures pre-date signer
+        // enforcement (Commits 3+5); None baseline matches existing
+        // suite behavior.
+        signed_by_cashier_id: None,
     }
 }
 

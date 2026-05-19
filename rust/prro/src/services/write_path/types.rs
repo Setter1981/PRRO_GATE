@@ -7,6 +7,7 @@
 //! stage boundaries by the dispatcher.
 
 use crate::db::models::enums::{DocType, ShiftState};
+use crate::db::models::ids::CashierId;
 use crate::db::repositories::fiscal_documents::DocumentRow;
 use crate::db::repositories::ingress_inbox::InboxRow;
 use crate::db::repositories::node_state::NodeStateRow;
@@ -23,6 +24,20 @@ pub struct CanonicalFiscalCommand {
     pub total_sum_kop: Option<i64>,
     pub payload_json: String,
     pub payload_sha256_canonical: [u8; 32],
+    /// W14a-2b §1.4 — operator/cashier id that will sign this document.
+    /// Carries through stage 1 (PREPARED insert) → stage 3 (sign) →
+    /// stage 4 (send envelope) and is consumed by `signer_guard` at
+    /// stage_send 4-pre (see spec §1.4 + §2.3).  `None` whenever
+    /// operator attribution is unavailable: system-context paths
+    /// (e.g. boot-phase snapshot reconstruction), test fixtures that
+    /// don't exercise signer enforcement, and current ingress
+    /// adapters that have not yet been plumbed.
+    ///
+    /// **Operator-resolved (spec §8 OQ #1):** `CanonicalFiscalCommand`
+    /// is not currently `Deserialize`, so adding a field is a Rust-
+    /// struct-literal breakage only (all callers updated in this
+    /// commit).  No serde concern.
+    pub signed_by_cashier_id: Option<CashierId>,
 }
 
 /// Snapshot handed from stage 1 to subsequent stages.  Contains

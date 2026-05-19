@@ -248,9 +248,10 @@ pub async fn run(
                 payload_sha256_canonical: command.payload_sha256_canonical,
                 unsigned_xml_sha256: None,
                 previous_hash: None,
-                // W14a-2b Commit 1: plumbing-only — None until Commit 2
-                // threads CanonicalFiscalCommand.signed_by_cashier_id.
-                signed_by_cashier_id: None,
+                // W14a-2b Commit 2: threaded from CanonicalFiscalCommand
+                // (Commit 1 plumbed `None` baseline; field now flows
+                // from ingress through stage_acquire → INSERT PREPARED).
+                signed_by_cashier_id: command.signed_by_cashier_id.clone(),
             };
             fd::insert_prepared_tx(tx, &new_doc).await?;
 

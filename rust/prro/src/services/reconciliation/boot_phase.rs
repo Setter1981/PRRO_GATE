@@ -2195,6 +2195,16 @@ async fn dispatch_prepared_via_chain(
                 total_sum_kop,
                 payload_json,
                 payload_sha256_canonical: payload_sha,
+                // W14a-2b Commit 2: boot-phase snapshot reconstruction
+                // path — `signed_by_cashier_id` is NOT persisted on the
+                // ingress_inbox row (only on `fiscal_documents` post-
+                // INSERT PREPARED).  Boot snapshot is used for resume-
+                // detect / canonical-hash verification, not as the
+                // authoritative signer surface — the doc row itself
+                // carries the persisted `signed_by_cashier_id` and
+                // signer_guard reads it from `SendInputs` (Commits 3 +
+                // 5).  Boot-context surface stays `None` here.
+                signed_by_cashier_id: None,
             };
 
             Ok::<SnapshotOutcome, anyhow::Error>(SnapshotOutcome::Ok(Box::new((
