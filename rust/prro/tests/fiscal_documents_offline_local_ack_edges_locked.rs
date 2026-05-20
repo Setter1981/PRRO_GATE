@@ -103,7 +103,7 @@ fn offline_local_ack_inbound_edges_are_exactly_signed() {
 }
 
 #[test]
-fn offline_local_ack_outbound_edges_are_exactly_sent_sending_cancelled() {
+fn offline_local_ack_outbound_edges_are_exactly_sent_sending_cancelled_kvt2() {
     for &to in ALL_STATES {
         let actual = allowed_transition(DocState::OfflineLocalAck, to);
         let expected = EXPECTED_OUTBOUND.contains(&to);
