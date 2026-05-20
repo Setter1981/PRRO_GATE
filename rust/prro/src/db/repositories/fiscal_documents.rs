@@ -812,6 +812,52 @@ pub async fn fetch_send_inputs_tx(
     }))
 }
 
+/// W14a-2b Commit 6 §3.7 — minimal field set `stage_offline_ack::run`
+/// needs to drive its doc-type-scoped shift-state validation +
+/// pre-CAS cross-FN / doc-state checks.  Strict subset of
+/// `DocumentRow` — only what stage_offline_ack reads.
+///
+/// **Defence-in-depth (operator correction #4):**
+/// `stage_offline_ack::run` does NOT trust upstream `stage_acquire` to
+/// have filtered `doc_type` correctly — the widened shift-state set
+/// (`Opened | OpenedLocalPendingDrain`) applies ONLY to regular
+/// fiscal docs (Sell / Return / ServiceIn / ServiceOut /
+/// CashWithdrawal / XReport).  Other doc types stay scoped to
+/// `Opened` only.
+///
+/// Returned `state` is the pre-CAS observation — caller uses it for
+/// `DocStateConflict` diagnostic if not `SIGNED`.
+#[derive(Debug, Clone)]
+pub struct OfflineAckInputs {
+    pub state: DocState,
+    pub doc_type: DocType,
+    pub fiscal_number: String,
+}
+
+/// W14a-2b Commit 6 §3.7 — single-SELECT inputs reader for
+/// `stage_offline_ack::run`.  Returns `None` when the row is missing;
+/// caller maps to `RefusalReason::DocNotFound`.
+pub async fn fetch_offline_ack_inputs_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+) -> sqlx::Result<Option<OfflineAckInputs>> {
+    let row = sqlx::query!(
+        r#"SELECT state        as "state: DocState",
+                  doc_type     as "doc_type: DocType",
+                  fiscal_number
+           FROM fiscal_documents WHERE document_id = ?"#,
+        doc_id
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(r) = row else { return Ok(None) };
+    Ok(Some(OfflineAckInputs {
+        state: r.state,
+        doc_type: r.doc_type,
+        fiscal_number: r.fiscal_number,
+    }))
+}
+
 /// W8 stage 5 — minimal field set the finalize stage needs to write
 /// `node_state.last_known_unsigned_xml_sha256` (seed advance), the
 /// `outbox` row (sequence + canonical payload hash), the inbox-DONE

@@ -697,6 +697,126 @@ async fn all_non_offline_modes_refused_with_typed_node_not_offline() {
     }
 }
 
+// ─── W14a-2b Commit 6 §3.7 — doc_type-scoped shift-state widening ────
+
+/// Seed a SIGNED doc with caller-chosen `doc_type` so the §3.7
+/// widening matrix can be exercised across (regular fiscal | non-
+/// fiscal) variants.
+async fn insert_signed_doc_with_type(
+    pool: &sqlx::SqlitePool,
+    fn_id: &str,
+    lnd: i64,
+    doc_type: &str,
+) -> DocumentId {
+    let doc_id = DocumentId::new();
+    let req_id = Uuid::now_v7();
+    let sha = vec![0u8; 32];
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical) \
+         VALUES (?, ?, ?, ?, ?, 'SIGNED', 'b', 't', 'OFFLINE', \
+            '2026-05-20T00:00:00Z', '{}', ?)",
+    )
+    .bind(doc_id)
+    .bind(req_id.as_bytes().to_vec())
+    .bind(fn_id)
+    .bind(lnd)
+    .bind(doc_type)
+    .bind(&sha)
+    .execute(pool)
+    .await
+    .unwrap();
+    doc_id
+}
+
+/// MED-C6-1 + §3.7 acceptance: SELL doc on `OpenedLocalPendingDrain`
+/// shift in `Offline` mode → Applied (widened state allowed for
+/// regular fiscal doc_type).  Pre-W14a-2b stage_offline_ack would
+/// have refused with `ShiftNotOpened`.
+#[tokio::test]
+async fn applied_path_works_with_opened_local_pending_drain_for_sell() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::OpenedLocalPendingDrain).await;
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
+    seed_code(&pool, FN, 42).await;
+    let doc_id = insert_signed_doc_with_type(&pool, FN, 1, "SELL").await;
+
+    let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
+    match outcome {
+        OfflineAckOutcome::Applied { code_lnd, .. } => assert_eq!(code_lnd, 42),
+        other => panic!("expected Applied on widened OpenedLocalPendingDrain, got {other:?}"),
+    }
+    assert_eq!(fetch_doc_state(&pool, doc_id).await, "OFFLINE_LOCAL_ACK");
+    assert_eq!(fetch_consumed_count(&pool, FN).await, 1);
+}
+
+/// §3.7 doc-type-scoped widening: RETURN also gets widened path.
+#[tokio::test]
+async fn applied_path_works_with_opened_local_pending_drain_for_return() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::OpenedLocalPendingDrain).await;
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
+    seed_code(&pool, FN, 43).await;
+    let doc_id = insert_signed_doc_with_type(&pool, FN, 2, "RETURN").await;
+
+    let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
+    assert!(matches!(outcome, OfflineAckOutcome::Applied { .. }));
+    assert_eq!(fetch_doc_state(&pool, doc_id).await, "OFFLINE_LOCAL_ACK");
+}
+
+/// §3.7 defence-in-depth (operator correction #4): non-fiscal doc
+/// types (SHIFT_OPEN here) MUST NOT participate in widening — they
+/// stay scoped to `Opened` only.  Verifies stage_offline_ack reads
+/// doc_type internally and does NOT trust upstream stage_acquire's
+/// filtering.
+#[tokio::test]
+async fn refusal_shift_open_on_opened_local_pending_drain_returns_shift_not_opened() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::OpenedLocalPendingDrain).await;
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
+    seed_code(&pool, FN, 44).await;
+    let doc_id = insert_signed_doc_with_type(&pool, FN, 3, "SHIFT_OPEN").await;
+
+    let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
+    match outcome {
+        OfflineAckOutcome::Refused(RefusalReason::ShiftNotOpened { current }) => {
+            assert_eq!(current, ShiftState::OpenedLocalPendingDrain);
+        }
+        other => panic!("non-regular doc_type MUST NOT get widened path, got {other:?}"),
+    }
+    // Defence-in-depth verified: doc stays SIGNED, no code consumed.
+    assert_eq!(fetch_doc_state(&pool, doc_id).await, "SIGNED");
+    assert_eq!(fetch_consumed_count(&pool, FN).await, 0);
+}
+
+/// §3.7 invariant: regular fiscal doc on `ClosingLocalPendingDrain`
+/// STILL refused — widening covers only `OpenedLocalPendingDrain`,
+/// not the closing-drain state.  ClosingLocalPendingDrain remains
+/// post-local-close lockout per PR #62 §W10.
+#[tokio::test]
+async fn refusal_sell_on_closing_local_pending_drain_returns_shift_not_opened() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::ClosingLocalPendingDrain).await;
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
+    seed_code(&pool, FN, 45).await;
+    let doc_id = insert_signed_doc_with_type(&pool, FN, 4, "SELL").await;
+
+    let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
+    assert!(matches!(
+        outcome,
+        OfflineAckOutcome::Refused(RefusalReason::ShiftNotOpened {
+            current: ShiftState::ClosingLocalPendingDrain
+        })
+    ));
+    assert_eq!(fetch_doc_state(&pool, doc_id).await, "SIGNED");
+    assert_eq!(fetch_consumed_count(&pool, FN).await, 0);
+}
+
 // ─── Helper: silence "unused" warnings on imports kept for ergonomic
 //     coverage of related types in case future tests need them.
 

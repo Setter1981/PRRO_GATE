@@ -604,8 +604,16 @@ W14a-2b widens the allowed set for regular fiscal docs — **AND** must independ
 
 ```rust
 // W14a-2b §3.7: read doc_type alongside doc state in the existing pre-check.
-// fetch_offline_ack_inputs_tx (new helper or widening of existing read) returns
-// at minimum: { doc_type, current_state, fiscal_number, shift_id, signed_by_cashier_id }.
+// fetch_offline_ack_inputs_tx (new helper) returns the minimal set
+// stage_offline_ack actually consumes at this commit:
+//   { state, doc_type, fiscal_number }
+// NIT-C6-1 clarification (2026-05-20): an earlier draft of this sample
+// listed `shift_id` and `signed_by_cashier_id` as "at minimum" fields,
+// but neither is consumed by stage_offline_ack (no signer enforcement
+// on offline path per §2.7 — deferred to W9b drain).  W9b drain
+// orchestrator can widen this helper OR load shift / signer attribution
+// via the existing `fetch_send_inputs_tx` (SendInputs already carries
+// shift_id + signed_by_cashier_id) at its own integration point.
 let inputs = fd::fetch_offline_ack_inputs_tx(tx, doc_id).await?;
 // Cross-FN mismatch guard preserved from W7a.
 if inputs.fiscal_number != fiscal_number {
