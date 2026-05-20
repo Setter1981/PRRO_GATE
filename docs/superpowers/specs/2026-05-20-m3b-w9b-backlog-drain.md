@@ -8,6 +8,47 @@
 
 ---
 
+## Amendment 2026-05-21 — sibling-continue scope + unfinished cohort + halt-on-reject
+
+Operator decisions during C4 senior review (2026-05-21) clarify three points the original spec text under-specified:
+
+1. **Sibling-continue scope + manual-recon class definition (§2.5 + §6.3 clarification)**.  W9b sibling-continue applies ONLY to non-manual-recon-class per-doc failures.  Manual-recon-class on pending-drain shift escalates: shift → `RequiresManualReconciliation` via edges 6 / 14 (per `LEGAL_INVARIANTS.md` §INV-19 + `m3b-shift-state-expansion.md` §6.3), `node_state.shift_state` mirror updated in the same `with_immediate` envelope (per `m3b-shift-state-expansion.md` §5 load-bearing invariant), `Critical` `OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL` audit emitted, and the FN drain STOPS.  Subsequent backlog docs are NOT processed in the same drain tick.
+
+   **Manual-recon class** (operator-pinned per `m3b-shift-state-expansion.md` §3.5 "Manual is last resort" + §6.2 wire-error taxonomy):
+   - `RetryClass::TerminalReject` (Authorization{DocumentReject}, Server -1 / -2 non-shift / -5 / -7..-10 / -16)
+   - `RetryClass::FnConfigError` (Server -13 / -14)
+   - `RetryClass::WrapperBug` (Internal / NotFound on live / QueryNotSupported on live / ServerFiscalIdMismatch / unknown Server code)
+   - `RetryClass::MacRecovery` (orchestrator already burned its retry — second -12)
+   - `RetryClass::OperatorEscalation` (Server -6 ERROR_NOT_PREV_ZREPORT)
+   - `StateConflict`, `DocumentMissing`, `SignerRefused` (structural drift / signer mismatch)
+   - All `StageSendError` variants (structural invariant breach)
+
+   **Non-manual class** (transient / retry-budget-preserving — sibling-continue applies EVEN on pending-drain shifts):
+   - `RetryClass::TransientRetry` (Transport / Server -3) — retry within budget; shift stays in pending-drain awaiting next-tick drain
+   - `RetryClass::ProbeRequired` (Decode / -2 close-shift / -15 close-shift) — W9 probe territory; not immediate Manual
+
+   The W9b drain audit payload carries `manual_recon_class: bool` for operator-dashboard filtering.
+
+2. **Unfinished drain cohort (§2.2 step 2 + §3.1 clarification + HIGH-C4-8 widening)**.  The backlog read MUST cover the full unfinished cohort, not only `OFFLINE_LOCAL_ACK`.  The C1 helper `list_offline_local_ack_for_fn_ordered_by_lnd` lands the OFFLINE_LOCAL_ACK-only scan in C1 but is renamed and widened in **C5** to `list_drain_candidates_for_fn_ordered_by_lnd`, returning rows in `state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','KVT2','ERROR_RETRYABLE') AND fiscal_number = ?` ordered by `lnd ASC`.  Empty-backlog skip applies only when zero unfinished candidates exist.  Per-doc dispatch by persisted state:
+   - `OFFLINE_LOCAL_ACK` → `stage_send::run` (current C4 path)
+   - `ERROR_RETRYABLE` → `stage_send::run` (W9a 4-pre source whitelist already accepts ErrorRetryable; re-drives Pattern B).  **Without this state in the cohort, a C4 drain that produced TransientRetry on a doc strands the pending-drain shift forever** — the doc moves OFFLINE_LOCAL_ACK → Sending → ErrorRetryable on Transport / Server -3 wire failure, exits the C4 OFFLINE_LOCAL_ACK-only scan, but the shift's `pending-drain` state holds the FN until that doc completes.  HIGH-C4-8 operator finding (2026-05-21) locks this gap-fix as part of the C5 walker widening contract.
+   - `SENT` → C5 `lastChk` pre-flight / W12 seam (replay rediscovery — closes I4 restart safety)
+   - `KVT1` → W12 continuation (Kvt2 confirmation)
+   - `KVT2` → finalize continuation via `stage_finalize::run`
+   - Terminal states (`ACK` / `REJECTED` / `CANCELLED` / `REQUIRES_MANUAL_RECONCILIATION`) excluded by the SELECT.
+
+3. **C4/C5 split**.  **C4** lands the inline `Sent → Kvt1` advance via the typed W12 stub seam — so `advanced_to_kvt1` counter, audit `to_state="KVT1"`, and persisted DB state stay consistent within a single C4-only flow.  **C5** widens the walker to the unfinished cohort + adds `lastChk` pre-flight + extracts the inline transition into `apply_w12_confirmation` helper.  **C5 is a blocker** before any "C4 approved" verdict at the PR level — pre-C5 the drain is NOT restart-safe for crashed-mid-drain SENT docs (M3a `boot_phase` covers SENT recovery in the meantime, but spec §6 I4 requires drain to own the rediscovery path post-W12).
+
+The audit vocabulary (§4) gains one new event:
+
+| Event | Severity | Payload |
+|---|---|---|
+| `OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL` | Critical | `{fiscal_number, shift_id, document_id, failure_class, current_shift_state, halt_position}` |
+
+`halt_position` = the 0-based index of the doc in the backlog that triggered the halt; subsequent docs were NOT visited.
+
+---
+
 ## 1. Scope (per M3b plan §Task 9)
 
 **Operator-chosen Path A**: W9b lands after W14a-2b closure.  This is the **largest task in M3b** (3-4 day budget) per plan.
@@ -167,9 +208,9 @@ W9b pre-W12 behaviour: every successful wire-send doc lands in `advanced_to_kvt1
 
 ### 2.5 Per-doc failure handling
 
-A single doc failing surfaces as `BootError::OfflineDrainFailed { document_id, source: anyhow::Error }`.  Sibling docs continue — mirrors M3a try-and-audit shim convention.
+**Superseded by the 2026-05-21 amendment** (see top of file): sibling-continue applies only to non-manual-recon-class failures.  Manual-recon-class failures on a pending-drain shift halt the drain and escalate the shift to `RequiresManualReconciliation`.  TransientRetry and ProbeRequired are explicitly **non-manual** per operator pin — they retain the retry budget; sibling-continue applies even on pending-drain shifts.
 
-The orchestrator catches per-doc Err's, audits them, and continues.  Only **infrastructure failures** (DB connection lost, pool exhausted) propagate as Err to the caller.
+The orchestrator catches per-doc outcomes, records them in `DrainSummary`, audits them, and continues per the amended scope.  Only **infrastructure failures** (DB connection lost, pool exhausted, audit-append sqlx error, mirror UPDATE drift) propagate as `BootError::*` to the caller.
 
 ---
 
@@ -211,19 +252,28 @@ Added to `audit_log` via standard `audit_log::append_tx` / `append` surface.  Se
 | `OFFLINE_DRAIN_STARTED` | Info | `{fiscal_number, backlog_size, session_id, started_at_iso}` |
 | `OFFLINE_DRAIN_SKIPPED_NOT_GOING_ONLINE` | Info | `{fiscal_number, current_mode}` |
 | `OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG` | Info | `{fiscal_number, current_mode}` |
-| `OFFLINE_DRAIN_DOC_ADVANCED` | Info | `{document_id, from_state, to_state, replay_short_circuit, attempt_no, server_fiscal_no?}` |
-| `OFFLINE_DRAIN_DOC_FAILED` | Warning | `{document_id, failure_class, attempt_no?, observed_state?, wire_error_message?}` |
+| `OFFLINE_DRAIN_DOC_ADVANCED` | Info | `{document_id, from_state, to_state, replay_short_circuit, attempt_no, server_fiscal_no, w12_status}` |
+| `OFFLINE_DRAIN_DOC_FAILED` | Warning | `{document_id, failure_class, manual_recon_class, retry_class?, target_state?, observed_state?, attempt_no?, wire_status_code?, wire_error_message?, mismatch_detail?, send_error_detail?}` |
+| `OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL` | Critical | `{fiscal_number, shift_id, document_id, failure_class, current_shift_state, halt_position}` |
 | `OFFLINE_DRAIN_COMPLETED` | Info | full `DrainSummary` payload |
 | `OFFLINE_DRAIN_PARTIAL` | Warning | full `DrainSummary` payload — non-finalized state |
 
-`failure_class` is a stable string taxonomy (matches W8a `dps_error_class` convention):
-- `"signer_refused"` — `SignerRefused(_)` outcome.
-- `"state_conflict"` — observed state diverged.
-- `"wire_routing"` — `Routed { decision: TerminalReject / ProbeRequired / TransientRetry }`.
-- `"transport"` — Transport error.
-- `"authorization"` — Authorization error.
-- `"server_<code>"` — Server status code error.
-- `"decode"` / `"internal"` / `"not_found"` — etc.
+`failure_class` is a stable string taxonomy aligned with the C2 `FailureClass` enum (matches W8a `dps_error_class` convention):
+
+| String | Source outcome |
+|---|---|
+| `"signer_refused"` | `StageSendOutcome::SignerRefused(_)` |
+| `"state_conflict"` | `StageSendOutcome::StateConflict { .. }` |
+| `"not_found"` | `StageSendOutcome::DocumentMissing` OR `StageSendError::DocumentMissingForRecovery` |
+| `"wire_routing_terminal_reject"` | `Routed { decision: TerminalReject }` (Authorization{DocumentReject}, Server -1/-2 non-shift/-5/-7..-10/-16) |
+| `"wire_routing_transient_retry"` | `Routed { decision: TransientRetry }` (Transport, Server -3) |
+| `"wire_routing_probe_required"` | `Routed { decision: ProbeRequired }` (Decode, -2/-15 close-shift) |
+| `"authorization"` | `Routed { decision: FnConfigError }` (-13 / -14) |
+| `"server"` | `Routed { decision: OperatorEscalation }` (-6) |
+| `"internal"` | `Routed { decision: WrapperBug / MacRecovery }` OR most `StageSendError` variants |
+| `"offline_fiscal_no_missing"` | `StageSendError::OfflineFiscalNoMissing` |
+
+The audit payload also carries `manual_recon_class: bool` — operator dashboards filter on this flag.  Mapping per operator pin (`m3b-shift-state-expansion.md` §3.5): `wire_routing_transient_retry` and `wire_routing_probe_required` are **false** (retry budget retained); everything else is **true** (manual-recon class).
 
 ---
 
