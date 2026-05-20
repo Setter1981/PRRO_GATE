@@ -520,7 +520,7 @@ pub enum RejectionReason {
     /// Audit shape: `POST_LOCAL_CLOSE_SALE_REFUSED` (per PR #62 §W10).
     PostLocalCloseSaleRefused,
     /// W14a-2b §1.5 — SHIFT_CLOSE on offline-locked shift.
-    /// Audit shape: `OFFLINE_SHIFT_CLOSE_NOT_SUPPORTED` (per spec §5.7 L2).
+    /// Audit shape: `OFFLINE_SHIFT_CLOSE_REFUSED` (per spec §5.7 L2).
     OfflineShiftCloseNotSupported,
     /// W14a-2b §1.5 — op while ClosingLocalPendingDrain is in-flight.
     /// Audit shape: `SHIFT_CLOSING_IN_FLIGHT`.
@@ -532,7 +532,7 @@ pub enum RejectionReason {
 }
 ```
 
-**Note on `#[non_exhaustive]`** (operator correction): `RejectionReason` is NOT currently `#[non_exhaustive]`.  W14a-2b adds 8 new variants; consider adding `#[non_exhaustive]` in the SAME commit as the variant additions so downstream consumers gain the forward-compat guarantee for future M3b/M3c additions.  **Default**: add `#[non_exhaustive]` (low-cost, prevents future patch-breakage in audit dispatch / metrics code).
+**Note on `#[non_exhaustive]`** (operator correction): `RejectionReason` was NOT `#[non_exhaustive]` pre-W14a-2b.  W14a-2b adds **9 new variants** (4 mode-side + 5 channel-aware shift-guard) AND adds `#[non_exhaustive]` in the SAME commit so downstream consumers gain the forward-compat guarantee for future M3b/M3c additions.  Decision landed (low-cost, prevents future patch-breakage in audit dispatch / metrics code).
 
 ### 3.6 Audit events (per refusal)
 

@@ -49,12 +49,14 @@ pub struct WorkerContext {
     pub inbox: InboxRow,
     pub command: CanonicalFiscalCommand,
     pub node_state: NodeStateRow,
-    /// `Some` when `node_state.shift_state == Opened` AND the
-    /// referenced shift is itself in `Opened`; `None` for
-    /// shift-management ops (SHIFT_OPEN) where there is no active
+    /// `Some` when `node_state.shift_state` is either `Opened` OR
+    /// `OpenedLocalPendingDrain` (W14a-2b HIGH-C4-1 widening per spec
+    /// §3.6a) AND the referenced shift row mirrors that state.  `None`
+    /// for shift-management ops (SHIFT_OPEN) where there is no active
     /// shift yet.  Stage 2's shift-invariant guard rejects the
-    /// inconsistent middle (`shift_state == Opened` but no resolvable
-    /// `current_shift_id`).
+    /// inconsistent middle (`shift_state` says open but
+    /// `current_shift_id` IS NULL — `ShiftInvariantViolation` Critical
+    /// audit).
     pub active_shift: Option<ShiftRow>,
     /// The fiscal_documents row that stages 3+ will continue
     /// processing.  For `Proceed` this is freshly INSERTed PREPARED;

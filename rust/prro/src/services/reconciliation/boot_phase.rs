@@ -2225,11 +2225,15 @@ async fn dispatch_prepared_via_chain(
                 })?;
 
             // (1d) Resolve active_shift only when node_state advertises
-            // an open shift — mirrors stage_acquire step 5.  Recovery
-            // does NOT escalate ShiftInvariantViolation (the live worker
-            // does that on first ingress; boot recovery just passes
-            // None through and lets stage_sign drive on the persisted
-            // doc).
+            // an open shift.  Recovery deliberately uses a NARROWER
+            // filter than stage_acquire step 5 (which post-W14a-2b
+            // §3.6a widens to `Opened | OpenedLocalPendingDrain`):
+            // boot recovery just passes None through and lets stage_sign
+            // drive on the persisted doc — it does NOT escalate
+            // ShiftInvariantViolation (the live worker does that on
+            // first ingress).  Pre-W14a-2b mirror parity dropped on
+            // purpose; offline-context boot uses the same `None`
+            // fallback for both Opened and OpenedLocalPendingDrain.
             let active_shift = match (ns.shift_state, &ns.current_shift_id) {
                 (ShiftState::Opened, Some(sid)) => shifts::get_tx(tx, *sid).await?,
                 _ => None,
