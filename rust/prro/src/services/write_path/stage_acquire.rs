@@ -659,3 +659,175 @@ fn hex_encode(bytes: &[u8]) -> String {
             acc
         })
 }
+
+#[cfg(test)]
+mod channel_aware_matrix_tests {
+    //! W14a-2b Commit 7 §3 — pure-function 162-cell coverage matrix
+    //! for [`check_shift_guard`].  9 DocType × 9 ShiftState × 2
+    //! Channel = 162 cells; each cell has an explicit verdict
+    //! locked by [`expected_outcome`].
+    //!
+    //! Pins spec §3.4 matrix contract: every channel-aware refusal
+    //! variant + every happy-path None is verified per-cell, NOT
+    //! via group fallthroughs.  Future matrix edits MUST update
+    //! [`expected_outcome`] in lockstep with the production arm.
+    //!
+    //! Run with `cargo test -p prro --features test-support
+    //! channel_aware_matrix`.
+    use super::*;
+
+    const ALL_DOC_TYPES: &[DocType] = &[
+        DocType::ShiftOpen,
+        DocType::ShiftClose,
+        DocType::Sell,
+        DocType::Return,
+        DocType::ServiceIn,
+        DocType::ServiceOut,
+        DocType::CashWithdrawal,
+        DocType::XReport,
+        DocType::ZReport,
+    ];
+    const ALL_SHIFT_STATES: &[ShiftState] = &[
+        ShiftState::Created,
+        ShiftState::Opening,
+        ShiftState::OpenedLocalPendingDrain,
+        ShiftState::Opened,
+        ShiftState::ClosingLocalPendingDrain,
+        ShiftState::Closing,
+        ShiftState::Closed,
+        ShiftState::RequiresManualReconciliation,
+        ShiftState::Error,
+    ];
+    const ALL_CHANNELS: &[Channel] = &[Channel::Online, Channel::Offline];
+
+    /// Independent re-implementation of the spec §3.4 matrix used as
+    /// the test oracle.  Authoritative `check_shift_guard` MUST agree
+    /// with this verdict per cell.
+    fn expected_outcome(
+        doc: DocType,
+        state: ShiftState,
+        ch: Channel,
+    ) -> Option<RejectionReason> {
+        use Channel::*;
+        use DocType::*;
+        use ShiftState::*;
+        // Terminal / operator-action arms — channel-irrelevant.
+        match state {
+            Error => return Some(RejectionReason::ShiftInError),
+            RequiresManualReconciliation => {
+                return Some(RejectionReason::ShiftRequiresOperatorAttention)
+            }
+            _ => {}
+        }
+        // Shift-management surfaces.
+        match (doc, state) {
+            (ShiftOpen, Closed) => return None,
+            (ShiftOpen, ClosingLocalPendingDrain) => {
+                return Some(RejectionReason::ShiftClosingInFlight)
+            }
+            (ShiftOpen, _) => return Some(RejectionReason::ShiftAlreadyOpen),
+            (ShiftClose, Opened) => return None,
+            (ShiftClose, OpenedLocalPendingDrain) => {
+                return Some(RejectionReason::OfflineShiftCloseNotSupported)
+            }
+            (ShiftClose, ClosingLocalPendingDrain) => {
+                return Some(RejectionReason::ShiftClosingInFlight)
+            }
+            (ZReport, Opened) => return None,
+            (ZReport, OpenedLocalPendingDrain) => {
+                return Some(RejectionReason::ZReportBlockedBacklogDrainPending)
+            }
+            (ZReport, ClosingLocalPendingDrain) => {
+                return Some(RejectionReason::ShiftClosingInFlight)
+            }
+            (ShiftClose | ZReport, Closed) => {
+                return Some(RejectionReason::ShiftNotOpen { current: state })
+            }
+            _ => {}
+        }
+        // Mid-transition channel-irrelevant.
+        if matches!(state, Created | Opening | Closing) {
+            return Some(RejectionReason::ShiftNotOpen { current: state });
+        }
+        // Regular fiscal ops.
+        match (doc, state, ch) {
+            (
+                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+                Opened,
+                _,
+            ) => None,
+            (
+                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+                Closed,
+                _,
+            ) => Some(RejectionReason::ShiftNotOpen { current: state }),
+            (
+                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+                OpenedLocalPendingDrain,
+                Offline,
+            ) => None,
+            (
+                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+                OpenedLocalPendingDrain,
+                Online,
+            ) => Some(RejectionReason::ShiftOpenPendingDrainOpRefused),
+            (
+                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+                ClosingLocalPendingDrain,
+                _,
+            ) => Some(RejectionReason::PostLocalCloseSaleRefused),
+            _ => unreachable!(
+                "matrix oracle: unhandled cell ({doc:?}, {state:?}, {ch:?})"
+            ),
+        }
+    }
+
+    #[test]
+    fn check_shift_guard_matches_oracle_for_all_162_cells() {
+        let mut total = 0usize;
+        let mut none_count = 0usize;
+        let mut some_count = 0usize;
+        for &doc in ALL_DOC_TYPES {
+            for &state in ALL_SHIFT_STATES {
+                for &ch in ALL_CHANNELS {
+                    let actual = check_shift_guard(doc, state, ch);
+                    let expected = expected_outcome(doc, state, ch);
+                    assert_eq!(
+                        actual, expected,
+                        "cell ({doc:?}, {state:?}, {ch:?}): actual {actual:?} != expected {expected:?}"
+                    );
+                    total += 1;
+                    match actual {
+                        Some(_) => some_count += 1,
+                        None => none_count += 1,
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            total, 162,
+            "matrix MUST cover 9 doc_types × 9 shift_states × 2 channels = 162"
+        );
+        // Drift-guard: pin the absolute None vs Some split to catch
+        // accidental matrix widening / narrowing.
+        // Allowed (None) cells:
+        // - (ShiftOpen, Closed, _) → 2
+        // - (ShiftClose, Opened, _) → 2
+        // - (ZReport, Opened, _) → 2
+        // - (Sell|Return|ServiceIn|ServiceOut|CashWithdrawal|XReport, Opened, _) → 6×2 = 12
+        // - (Sell|Return|ServiceIn|ServiceOut|CashWithdrawal|XReport, OpenedLocalPendingDrain, Offline) → 6×1 = 6
+        // Total None = 24; Some = 162 - 24 = 138.
+        assert_eq!(none_count, 24, "spec §3.4: 24 happy-path None cells");
+        assert_eq!(some_count, 138, "spec §3.4: 138 refusal cells");
+    }
+
+    #[test]
+    fn matrix_constants_have_exactly_expected_arity() {
+        // Drift guard: if a new DocType / ShiftState lands, the
+        // matrix above MUST be updated.  Pinning arity here breaks
+        // the matrix test loud + early.
+        assert_eq!(ALL_DOC_TYPES.len(), 9, "M3b W14a-1: 9 doc types");
+        assert_eq!(ALL_SHIFT_STATES.len(), 9, "M3b W14a-1: 9 shift states");
+        assert_eq!(ALL_CHANNELS.len(), 2, "W14a-2b Commit 4: Online / Offline");
+    }
+}
