@@ -179,6 +179,16 @@ pub fn allowed_transition(from: DocState, to: DocState) -> bool {
             // no removals; runtime wiring of the new edges is W7).
             | (OfflineLocalAck, Sending)
             | (OfflineLocalAck, Cancelled)
+            // M3b W9b §5.1 — lastChk replay short-circuit edge.
+            // When backlog_drain issues a lastChk pre-flight on a
+            // doc with `server_fiscal_no IS NOT NULL` AND DPS confirms
+            // `status == OK` + id match + non-empty data_sign, the
+            // doc has already been wire-acknowledged by DPS — drain
+            // skips wire send and advances Kvt2 directly (W12 PR
+            // reuses the same lastChk response as KVT2 evidence).
+            // Final hop Kvt2 → Ack is the existing M3a edge below.
+            // Locked-edge count drift-guard: 28 → 29.
+            | (OfflineLocalAck, Kvt2)
             | (ErrorRetryable, Sent)
             | (ErrorRetryable, Kvt1)
             | (ErrorRetryable, RequiresManualReconciliation)
@@ -447,6 +457,71 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
            FROM fiscal_documents
            WHERE fiscal_number = ?
              AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')
+           ORDER BY lnd, created_at, document_id"#,
+        fn_id
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(DocumentRow {
+                document_id: r.document_id,
+                fiscal_number: r.fiscal_number,
+                lnd: r.lnd,
+                state: r.state,
+                doc_type: r.doc_type,
+                server_fiscal_no: r.server_fiscal_no,
+                submission_attempted_at: r.submission_attempted_at,
+                backend_profile_id: r.backend_profile_id,
+                transport_profile_id: r.transport_profile_id,
+                previous_hash: decode_blob32(r.previous_hash, "previous_hash")?,
+                z_report_number: r.z_report_number,
+                unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
+                signing_inputs_pinned_at: r.signing_inputs_pinned_at,
+                signed_by_cashier_id: r.signed_by_cashier_id,
+            })
+        })
+        .collect()
+}
+
+/// M3b W9b §3.1 — strict `lnd ASC` walker for backlog drain
+/// orchestration.  Returns all `OFFLINE_LOCAL_ACK` docs for the FN,
+/// ordered by MAC chain position.
+///
+/// **Why `lnd` is authoritative**: `lnd` is the Local Numerator of
+/// Document — strictly monotonic per FN (W7a `acquire_code_tx` +
+/// `transition_to_offline_local_ack_tx` enforce this atomically).
+/// `created_at` is second-granular in SQLite (`CURRENT_TIMESTAMP`),
+/// so multi-doc bursts can share the same timestamp; `lnd` is the
+/// only stable chain-recovery key.  `document_id` is the final
+/// tiebreaker (random UUID; never matches across docs).
+///
+/// **Why include MAC-chain-pinned fields?** Caller (drain_orchestrator)
+/// needs `server_fiscal_no` to decide between the lastChk pre-flight
+/// short-circuit (replay) and the full wire-send (pure-offline) path.
+/// Read in the same SELECT — single round-trip vs N+1 reads per doc.
+pub async fn list_offline_local_ack_for_fn_ordered_by_lnd(
+    pool: &SqlitePool,
+    fn_id: &str,
+) -> sqlx::Result<Vec<DocumentRow>> {
+    let rows = sqlx::query!(
+        r#"SELECT document_id    as "document_id: DocumentId",
+                  fiscal_number,
+                  lnd,
+                  state           as "state: DocState",
+                  doc_type        as "doc_type: DocType",
+                  server_fiscal_no,
+                  submission_attempted_at,
+                  backend_profile_id,
+                  transport_profile_id,
+                  previous_hash         as "previous_hash: Vec<u8>",
+                  z_report_number,
+                  unsigned_xml_sha256   as "unsigned_xml_sha256: Vec<u8>",
+                  signing_inputs_pinned_at,
+                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId"
+           FROM fiscal_documents
+           WHERE fiscal_number = ?
+             AND state = 'OFFLINE_LOCAL_ACK'
            ORDER BY lnd, created_at, document_id"#,
         fn_id
     )

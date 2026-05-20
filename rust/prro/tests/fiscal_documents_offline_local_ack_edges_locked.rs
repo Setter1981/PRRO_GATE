@@ -19,15 +19,21 @@
 //!
 //! ### `from == OfflineLocalAck`
 //!
-//! Exactly **3** edges:
+//! Exactly **4** edges:
 //!   - `(OfflineLocalAck, Sent)` — M3a placeholder; preserved per
 //!     W6 add-only scope.
 //!   - `(OfflineLocalAck, Sending)` — Pattern C drain entry
 //!     (NEW in W6).
 //!   - `(OfflineLocalAck, Cancelled)` — manual operator escape
 //!     during drain (NEW in W6).
+//!   - `(OfflineLocalAck, Kvt2)` — W9b lastChk replay short-circuit
+//!     edge.  Drain pre-flight on docs with `server_fiscal_no IS NOT
+//!     NULL` short-circuits Sending/Sent/Kvt1 when DPS confirms via
+//!     lastChk + id match + non-empty data_sign.  W12 PR consumes
+//!     this edge; W9b lands the whitelist only (helper at
+//!     `fiscal_documents::list_offline_local_ack_for_fn_ordered_by_lnd`).
 //!
-//! **Total `OfflineLocalAck`-touching edges: 4.**
+//! **Total `OfflineLocalAck`-touching edges: 5.**
 
 use prro::db::models::enums::DocState;
 use prro::db::repositories::fiscal_documents::allowed_transition;
@@ -57,7 +63,12 @@ const ALL_STATES: &[DocState] = &[
 const EXPECTED_INBOUND: &[DocState] = &[DocState::Signed];
 
 /// The exact set of edges where `from == OfflineLocalAck`.
-const EXPECTED_OUTBOUND: &[DocState] = &[DocState::Sent, DocState::Sending, DocState::Cancelled];
+const EXPECTED_OUTBOUND: &[DocState] = &[
+    DocState::Sent,
+    DocState::Sending,
+    DocState::Cancelled,
+    DocState::Kvt2,
+];
 
 #[test]
 fn doc_state_enum_total_count_is_locked() {
@@ -106,9 +117,11 @@ fn offline_local_ack_outbound_edges_are_exactly_sent_sending_cancelled() {
 }
 
 #[test]
-fn total_offline_local_ack_touching_edge_count_is_four() {
+fn total_offline_local_ack_touching_edge_count_is_five() {
     // Count every allowed edge where OfflineLocalAck appears as
-    // either endpoint.  Total locked at 4: 1 inbound + 3 outbound.
+    // either endpoint.  Total locked at 5: 1 inbound + 4 outbound
+    // (4th outbound = `(OfflineLocalAck, Kvt2)` W9b lastChk replay
+    // short-circuit edge).
     let mut count = 0usize;
     for &x in ALL_STATES {
         if allowed_transition(x, DocState::OfflineLocalAck) {
@@ -121,12 +134,12 @@ fn total_offline_local_ack_touching_edge_count_is_four() {
     // Note: (OfflineLocalAck, OfflineLocalAck) would be counted
     // twice if it were allowed.  It is NOT allowed (idempotent
     // self-loop on a terminal-adjacent state is meaningless), so
-    // the count is exactly 4.  If self-loop ever became allowed,
+    // the count is exactly 5.  If self-loop ever became allowed,
     // the EXPECTED_INBOUND/OUTBOUND assertions above would fail
     // first.
     assert_eq!(
-        count, 4,
-        "OfflineLocalAck-touching edge count drifted from 4; \
+        count, 5,
+        "OfflineLocalAck-touching edge count drifted from 5; \
          see EXPECTED_INBOUND ({EXPECTED_INBOUND:?}) + EXPECTED_OUTBOUND ({EXPECTED_OUTBOUND:?})"
     );
 }
@@ -170,4 +183,21 @@ fn w6_inbound_edge_named_positive_case() {
         DocState::Signed,
         DocState::OfflineLocalAck
     ));
+}
+
+/// W9b §5.1 focused: lock the lastChk replay short-circuit edge.
+///
+/// Drain orchestrator pre-flight on docs with `server_fiscal_no IS
+/// NOT NULL` may advance directly OfflineLocalAck → Kvt2 (skipping
+/// Sending/Sent/Kvt1) when DPS confirms via lastChk.  W12 PR
+/// consumes this edge for the replay path; W9b lands the whitelist
+/// only.  This positive case + the count/inbound/outbound guards
+/// above are the drift-catch envelope.
+#[test]
+fn w9b_outbound_edge_named_positive_case_offline_local_ack_to_kvt2() {
+    assert!(
+        allowed_transition(DocState::OfflineLocalAck, DocState::Kvt2),
+        "W9b lastChk replay short-circuit edge (OfflineLocalAck, Kvt2) \
+         MUST be whitelisted; drain pre-flight relies on this"
+    );
 }

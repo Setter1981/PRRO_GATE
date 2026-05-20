@@ -353,6 +353,13 @@ fn allowed_transition_exhaustive_matrix() {
         // `tests/fiscal_documents_offline_local_ack_edges_locked.rs`.
         (OfflineLocalAck, Sending),
         (OfflineLocalAck, Cancelled),
+        // M3b W9b §5.1 — lastChk replay short-circuit edge.  When
+        // backlog_drain pre-flight on a doc with `server_fiscal_no IS
+        // NOT NULL` confirms via lastChk (status OK + id match +
+        // non-empty data_sign), drain skips wire send and advances
+        // Kvt2 directly.  Final Kvt2 → Ack via existing M3a edge.
+        // Drift-guard count above bumped 28 → 29.
+        (OfflineLocalAck, Kvt2),
     ]
     .into_iter()
     .collect();
@@ -376,10 +383,10 @@ fn allowed_transition_exhaustive_matrix() {
         }
     }
     assert_eq!(
-        allowed_count, 28,
-        "expected 17 base + 7 Pattern B + 1 MAC recovery dispatch terminal + 1 W11 PR-2b SENT→RM + 2 W6 Pattern C OfflineLocalAck edges = 28 allowed pairs"
+        allowed_count, 29,
+        "expected 17 base + 7 Pattern B + 1 MAC recovery dispatch terminal + 1 W11 PR-2b SENT→RM + 2 W6 Pattern C OfflineLocalAck edges + 1 W9b lastChk replay short-circuit edge = 29 allowed pairs"
     );
-    assert_eq!(forbidden_count, 169 - 28);
+    assert_eq!(forbidden_count, 169 - 29);
 }
 
 /// Negative coverage of intentional whitelist gaps from ADR-M3-A8 / A9.
