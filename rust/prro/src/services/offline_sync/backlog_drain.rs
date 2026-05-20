@@ -1,15 +1,19 @@
-//! W9b backlog drain orchestration — types + API-level invariants
-//! (Commit 2).
+//! W9b backlog drain orchestration — types, API-level invariants, and
+//! orchestrator skeleton (Commits 2-3).
 //!
 //! This module is shipped in two phases:
 //!
-//! - **Commit 2 (this file)** — pure types: [`W12ConfirmOutcome`] typed
-//!   seam, [`DrainSummary`] with private counters + invariant-enforcing
+//! - **Commit 2** — pure types: [`W12ConfirmOutcome`] typed seam,
+//!   [`DrainSummary`] with private counters + invariant-enforcing
 //!   API, [`FinalizeEligibility`] decision enum, [`failure_class_for`]
-//!   stable-string taxonomy.  Zero orchestrator logic; pure data +
-//!   methods.
-//! - **Commits 3-7** — orchestrator skeleton (prerequisites), per-doc
-//!   loop, lastChk pre-flight, finalization branch, App entry.
+//!   stable-string taxonomy.
+//! - **Commit 3 (this file, [`drain`])** — orchestrator skeleton: pure-
+//!   function entry that reads prerequisites (mode, backlog, offline
+//!   session state), transitions session Open → Draining via inline
+//!   `with_immediate` envelope, emits `OFFLINE_DRAIN_STARTED` audit.
+//!   **No per-doc loop yet** — Commit 4 wires that.
+//! - **Commits 4-7** — per-doc loop, lastChk pre-flight, finalization
+//!   branch, App entry.
 //!
 //! ## Pre-W12 invariant pin (operator-flagged 2026-05-20, sign-off pin)
 //!
@@ -34,7 +38,15 @@
 //! Tests in `tests/backlog_drain_types.rs` (Commit 2) lock all four
 //! invariants at the API boundary.
 
+use crate::app::BootError;
+use crate::db::models::enums::{NodeMode, OfflineSessionState, Severity};
 use crate::db::models::ids::DocumentId;
+use crate::db::repositories::fiscal_documents::TransitionOutcome;
+use crate::db::repositories::{audit_log, fiscal_documents, node_state, offline_sessions};
+use crate::db::tx::with_immediate;
+use crate::services::reconciliation::runtime::RuntimeView;
+use crate::services::write_path::types::hex_encode_lower as hex_lower;
+use sqlx::SqlitePool;
 
 // ─── Typed W12 seam ──────────────────────────────────────────────────
 
@@ -312,4 +324,209 @@ pub enum FailureClass {
     Internal,
     NotFound,
     OfflineFiscalNoMissing,
+}
+
+// ─── C3: orchestrator skeleton (prerequisites + audit emit) ──────────
+
+/// Audit entity_type for FN-scoped drain lifecycle events
+/// (`OFFLINE_DRAIN_*`).  Mirrors the `return_online_probe` convention
+/// — drain is an FN-scoped operation, indexed by `fiscal_number`.
+/// Per-session events (`OFFLINE_SESSION_DRAIN_STARTED`) continue to
+/// use `entity_type = "offline_session"` per W5 convention.
+const AUDIT_ENTITY_DRAIN_FN: &str = "node_state";
+
+/// W9b §2.1 entry (b) — pure-function drain entry for the boot
+/// reconciliation path and integration tests.  The App-owned entry
+/// `App::drain_offline_backlog_with` (C7) wraps this with the App
+/// reconcile mutex (OQ-5 operator pin).
+///
+/// **Commit 3 scope (skeleton):** runs the spec §2.2 prerequisites
+/// only — mode-check, backlog read, offline-session transition, and
+/// `OFFLINE_DRAIN_STARTED` audit emit.  **No per-doc loop yet** —
+/// Commit 4 invokes `stage_send::run` per doc in `lnd ASC` order;
+/// Commits 5-6 add lastChk pre-flight + finalization branch.
+///
+/// `_deps` is the per-FN runtime bundle (`dps`, `signing_ctx`,
+/// `fn_sign`).  Unused in the prerequisites pass — drain skeleton
+/// must never reach the wire (I1) — but pinned in the signature
+/// so the per-doc loop (which DOES consume it) can be added without
+/// churning the entry shape (operator pin: signature-stable entry).
+///
+/// ## Return contract
+///
+/// On prerequisite skip (mode ≠ `GoingOnline` OR empty backlog) the
+/// returned [`DrainSummary`] has `backlog_size_before = 0`; audit
+/// `OFFLINE_DRAIN_SKIPPED_*` row is emitted to the entity row
+/// `(AUDIT_ENTITY_DRAIN_FN, fiscal_number)`.  Otherwise the summary
+/// carries `backlog_size_before = backlog.len()` but ZERO advance /
+/// failure counters (per-doc loop deferred).  Caller observing this
+/// intermediate result MUST NOT treat the chain as finalized — the
+/// `OFFLINE_DRAIN_STARTED` audit has fired but `OFFLINE_DRAIN_
+/// COMPLETED|PARTIAL` has not, and `finalize_eligibility` returns
+/// `NotEligible{AckCountMismatch}` by construction (acked == 0,
+/// backlog_size_before > 0).
+///
+/// ## Errors
+///
+/// - `BootError::Database` — sqlx error on a read/append/CAS.
+/// - `BootError::Internal` — structural drift: missing `node_state`
+///   row, backlog non-empty without active session, or session CAS
+///   Open→Draining produced non-`Applied` outcome (Conflict / NotFound
+///   under App mutex implies racing writer — invariant breach).
+/// - `BootError::ReconciliationFailed` — `with_immediate` envelope
+///   propagated a non-sqlx anyhow chain (e.g. audit insert failure).
+pub async fn drain(
+    pool: &SqlitePool,
+    _deps: &RuntimeView<'_>,
+    fiscal_number: &str,
+) -> Result<DrainSummary, BootError> {
+    // ─── Step 1: read node_state mode (must be GoingOnline) ──────────
+    let ns = node_state::get(pool, fiscal_number)
+        .await
+        .map_err(BootError::Database)?
+        .ok_or_else(|| {
+            BootError::Internal(format!(
+                "backlog_drain({fiscal_number}): node_state row missing"
+            ))
+        })?;
+
+    if ns.mode != NodeMode::GoingOnline {
+        let payload = serde_json::json!({
+            "fiscal_number": fiscal_number,
+            "current_mode": ns.mode.as_str(),
+        });
+        audit_log::append(
+            pool,
+            AUDIT_ENTITY_DRAIN_FN,
+            fiscal_number,
+            "OFFLINE_DRAIN_SKIPPED_NOT_GOING_ONLINE",
+            Severity::Info,
+            None,
+            Some(&payload.to_string()),
+        )
+        .await
+        .map_err(BootError::Database)?;
+        return Ok(DrainSummary::new(fiscal_number.to_string(), 0));
+    }
+
+    // ─── Step 2: read backlog (strict lnd ASC) ───────────────────────
+    let backlog =
+        fiscal_documents::list_offline_local_ack_for_fn_ordered_by_lnd(pool, fiscal_number)
+            .await
+            .map_err(BootError::Database)?;
+
+    if backlog.is_empty() {
+        let payload = serde_json::json!({
+            "fiscal_number": fiscal_number,
+            "current_mode": ns.mode.as_str(),
+        });
+        audit_log::append(
+            pool,
+            AUDIT_ENTITY_DRAIN_FN,
+            fiscal_number,
+            "OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG",
+            Severity::Info,
+            None,
+            Some(&payload.to_string()),
+        )
+        .await
+        .map_err(BootError::Database)?;
+        return Ok(DrainSummary::new(fiscal_number.to_string(), 0));
+    }
+
+    // ─── Step 3: read active offline session (OPEN|DRAINING) ─────────
+    //
+    // Backlog non-empty ⇒ an active session MUST exist (W7's
+    // stage_offline_ack stamps `offline_session_id` on every
+    // OFFLINE_LOCAL_ACK doc + W4's partial UNIQUE keeps at most one
+    // active session per FN).  Missing session is a structural drift
+    // — bail with Internal so the operator sees the signal.
+    let (session_id, session_state) =
+        offline_sessions::current_open_or_draining_session(pool, fiscal_number)
+            .await
+            .map_err(BootError::Database)?
+            .ok_or_else(|| {
+                BootError::Internal(format!(
+                    "backlog_drain({fiscal_number}): backlog of {n} OFFLINE_LOCAL_ACK docs but no active session (OPEN|DRAINING).  Structural drift — investigate offline_sessions consistency.",
+                    n = backlog.len(),
+                ))
+            })?;
+
+    // If session is OPEN, transition to DRAINING + emit W5 audit in
+    // one with_immediate envelope (mirrors OfflineSessionService::
+    // start_drain shape).  Re-entry (state already DRAINING) is a
+    // no-op for the session-state branch.
+    if session_state == OfflineSessionState::Open {
+        let session_id_for_tx = session_id;
+        let outcome = with_immediate(pool, move |tx| {
+            Box::pin(async move {
+                let outcome = offline_sessions::transition_state(
+                    tx,
+                    session_id_for_tx,
+                    OfflineSessionState::Open,
+                    OfflineSessionState::Draining,
+                    None,
+                )
+                .await?;
+                if outcome == TransitionOutcome::Applied {
+                    let id_hex = hex_lower(session_id_for_tx.as_bytes());
+                    let payload = serde_json::json!({
+                        "offline_session_id": id_hex,
+                        "from": OfflineSessionState::Open.as_str(),
+                        "to": OfflineSessionState::Draining.as_str(),
+                        "reason_abort": serde_json::Value::Null,
+                    });
+                    audit_log::append_tx(
+                        tx,
+                        "offline_session",
+                        &id_hex,
+                        "OFFLINE_SESSION_DRAIN_STARTED",
+                        Severity::Info,
+                        None,
+                        Some(&payload.to_string()),
+                    )
+                    .await?;
+                }
+                Ok::<TransitionOutcome, anyhow::Error>(outcome)
+            })
+        })
+        .await
+        .map_err(|source| BootError::ReconciliationFailed {
+            fiscal_number: fiscal_number.to_string(),
+            source,
+        })?;
+
+        if outcome != TransitionOutcome::Applied {
+            return Err(BootError::Internal(format!(
+                "backlog_drain({fiscal_number}): session {sid} CAS Open→Draining produced {outcome:?} (App reconcile mutex should prevent races; investigate concurrent writers)",
+                sid = hex_lower(session_id.as_bytes()),
+            )));
+        }
+    }
+
+    // ─── Step 4: emit OFFLINE_DRAIN_STARTED ──────────────────────────
+    let payload = serde_json::json!({
+        "fiscal_number": fiscal_number,
+        "backlog_size": backlog.len(),
+        "session_id": hex_lower(session_id.as_bytes()),
+        "started_at_iso": chrono::Utc::now().to_rfc3339(),
+    });
+    audit_log::append(
+        pool,
+        AUDIT_ENTITY_DRAIN_FN,
+        fiscal_number,
+        "OFFLINE_DRAIN_STARTED",
+        Severity::Info,
+        None,
+        Some(&payload.to_string()),
+    )
+    .await
+    .map_err(BootError::Database)?;
+
+    // Per-doc loop / lastChk pre-flight / finalization deferred to
+    // C4-C6.  Return a summary carrying the backlog size; counters
+    // are zero — by construction `finalize_eligibility` returns
+    // `NotEligible{AckCountMismatch}` so any caller that misuses
+    // this C3-intermediate result as a final summary cannot finalize.
+    Ok(DrainSummary::new(fiscal_number.to_string(), backlog.len()))
 }
