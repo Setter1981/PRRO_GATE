@@ -77,7 +77,7 @@ async fn seed_node_state(
 }
 
 /// Convenience wrapper for tests with no shift (Closed / lease miss /
-/// SHIFT_OPEN happy path / NodeOffline / MissingProfileBinding).
+/// SHIFT_OPEN happy path / mode-side reject / MissingProfileBinding).
 async fn seed_fn_with_profiles(
     pool: &sqlx::SqlitePool,
     backend: Option<&str>,
@@ -110,6 +110,29 @@ async fn seed_open_shift(pool: &sqlx::SqlitePool) -> ShiftId {
     .await
     .unwrap();
     shift_id
+}
+
+/// LOW-C4-1: seed a shift with explicit caller-chosen state + opener
+/// id.  Used by the W14a-2b channel-aware shift-guard tests to model
+/// `OpenedLocalPendingDrain` / `ClosingLocalPendingDrain` cells of the
+/// spec §3.4 matrix.
+async fn seed_shift_with_state(
+    pool: &sqlx::SqlitePool,
+    shift_id: ShiftId,
+    state: ShiftState,
+    opener: &str,
+) {
+    sqlx::query(
+        "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, ?, 1, ?, 'ONLINE', 0, ?)",
+    )
+    .bind(shift_id)
+    .bind(FN)
+    .bind(state)
+    .bind(opener)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 /// Seed a NEW inbox row whose `operation_type` is the canonical
@@ -154,6 +177,10 @@ fn cmd(doc_type: DocType) -> CanonicalFiscalCommand {
         total_sum_kop: Some(15000),
         payload_json: r#"{"goods":[]}"#.into(),
         payload_sha256_canonical: [0u8; 32],
+        // W14a-2b Commit 2: stage_acquire test fixtures don't exercise
+        // signer enforcement (Commits 3+5); None baseline matches W14a-1
+        // semantics.
+        signed_by_cashier_id: None,
     }
 }
 
@@ -530,16 +557,24 @@ async fn stage1_shift_close_with_opened_shift_proceeds() {
     assert_eq!(doc_count(&pool).await, 1);
 }
 
-// ─── 9. NodeMode != Online → reject with audit ───────────────────────
+// ─── 9. Mode-guard reject (W14a-2b Commit 4: NodeOffline → 4 explicit) ──
 
+/// W14a-2b Commit 4: `NodeOffline` semantic bucket retired.  The four
+/// explicit mode-side refusals (`NodeGoingOnlineDrainInFlight` /
+/// `NodeBlocked` / `NodeStopMode` / `NodeCryptoDegraded`) are the new
+/// surface — `NodeMode::Offline` itself now maps to `Channel::Offline`
+/// and proceeds to the shift guard.  This test exercises the
+/// `NodeMode::Blocked → NodeBlocked` path; the other three classes
+/// share the same dispatch / audit pattern (covered by the per-mode
+/// matrix test below).
 #[tokio::test]
-async fn stage1_node_offline_rejects_with_audit() {
+async fn stage1_node_blocked_rejects_with_audit() {
     let pool = fresh_pool().await;
     seed_fn_with_profiles(
         &pool,
         Some("b"),
         Some("t"),
-        NodeMode::Offline,
+        NodeMode::Blocked,
         ShiftState::Closed,
         None,
     )
@@ -554,7 +589,7 @@ async fn stage1_node_offline_rejects_with_audit() {
         matches!(
             result,
             WorkerProcessResult::Rejected {
-                reason: RejectionReason::NodeOffline
+                reason: RejectionReason::NodeBlocked
             }
         ),
         "got {result:?}"
@@ -562,7 +597,384 @@ async fn stage1_node_offline_rejects_with_audit() {
     assert_eq!(doc_count(&pool).await, 0);
     assert_eq!(next_lnd(&pool).await, 1);
     assert_eq!(inbox_status(&pool, &req_id).await, "REJECTED");
-    assert_eq!(audit_count_for_event(&pool, "node_offline_reject").await, 1);
+    assert_eq!(
+        audit_count_for_event(&pool, "STAGE_ACQUIRE_BLOCKED_REFUSED").await,
+        1
+    );
+}
+
+// MED-C4-1 — 3 additional mode-guard tests for parity with the
+// stage1_node_blocked_rejects_with_audit above.  Together with that
+// test, covers all 4 mode-side refusal classes from spec §3.3
+// (operator-required "плюс отдельные mode guard tests").
+
+#[tokio::test]
+async fn stage1_node_going_online_rejects_with_audit() {
+    let pool = fresh_pool().await;
+    seed_fn_with_profiles(
+        &pool,
+        Some("b"),
+        Some("t"),
+        NodeMode::GoingOnline,
+        ShiftState::Closed,
+        None,
+    )
+    .await;
+    let req_id = seed_inbox_new(&pool, DocType::Sell).await;
+    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::NodeGoingOnlineDrainInFlight
+            }
+        ),
+        "got {result:?}"
+    );
+    assert_eq!(doc_count(&pool).await, 0);
+    assert_eq!(
+        audit_count_for_event(&pool, "STAGE_ACQUIRE_GOING_ONLINE_REFUSED").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn stage1_node_stop_mode_rejects_with_audit() {
+    let pool = fresh_pool().await;
+    seed_fn_with_profiles(
+        &pool,
+        Some("b"),
+        Some("t"),
+        NodeMode::StopMode,
+        ShiftState::Closed,
+        None,
+    )
+    .await;
+    let req_id = seed_inbox_new(&pool, DocType::Sell).await;
+    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::NodeStopMode
+            }
+        ),
+        "got {result:?}"
+    );
+    assert_eq!(doc_count(&pool).await, 0);
+    assert_eq!(
+        audit_count_for_event(&pool, "STAGE_ACQUIRE_STOP_MODE_REFUSED").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn stage1_node_crypto_degraded_rejects_with_audit() {
+    let pool = fresh_pool().await;
+    seed_fn_with_profiles(
+        &pool,
+        Some("b"),
+        Some("t"),
+        NodeMode::CryptoDegraded,
+        ShiftState::Closed,
+        None,
+    )
+    .await;
+    let req_id = seed_inbox_new(&pool, DocType::Sell).await;
+    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::NodeCryptoDegraded
+            }
+        ),
+        "got {result:?}"
+    );
+    assert_eq!(doc_count(&pool).await, 0);
+    assert_eq!(
+        audit_count_for_event(&pool, "STAGE_ACQUIRE_CRYPTO_DEGRADED_REFUSED").await,
+        1
+    );
+}
+
+// LOW-C4-1 — minimal channel-aware shift-guard coverage for the 5 new
+// refusal variants.  Full 162-cell matrix coverage lands in Commit 7
+// per spec §10; these 5 tests pin variant reachability + audit-event
+// names per spec §3.6.
+
+/// LOW-C4-1 helper: full seed for shift+node_state in a specific
+/// ShiftState (preserves FK order — fn_config → shift → node_state).
+async fn seed_for_shift_state_test(
+    pool: &sqlx::SqlitePool,
+    mode: NodeMode,
+    shift_state: ShiftState,
+    opener: &str,
+) -> ShiftId {
+    let shift_id = ShiftId::new();
+    seed_fn_config(pool).await;
+    seed_shift_with_state(pool, shift_id, shift_state, opener).await;
+    seed_node_state(
+        pool,
+        Some("b"),
+        Some("t"),
+        mode,
+        shift_state,
+        Some(shift_id),
+    )
+    .await;
+    shift_id
+}
+
+#[tokio::test]
+async fn stage1_offline_op_on_online_channel_with_pending_drain_refused() {
+    // (Sell, OpenedLocalPendingDrain, Online) → ShiftOpenPendingDrainOpRefused.
+    let pool = fresh_pool().await;
+    seed_for_shift_state_test(
+        &pool,
+        NodeMode::Online,
+        ShiftState::OpenedLocalPendingDrain,
+        "cashier-vasya",
+    )
+    .await;
+    let req_id = seed_inbox_new(&pool, DocType::Sell).await;
+    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::ShiftOpenPendingDrainOpRefused
+            }
+        ),
+        "got {result:?}"
+    );
+    assert_eq!(doc_count(&pool).await, 0);
+    assert_eq!(
+        audit_count_for_event(&pool, "SHIFT_OPEN_PENDING_DRAIN_OP_REFUSED").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn stage1_sale_on_closing_local_pending_drain_refused() {
+    // (Sell, ClosingLocalPendingDrain, _) → PostLocalCloseSaleRefused.
+    let pool = fresh_pool().await;
+    seed_for_shift_state_test(
+        &pool,
+        NodeMode::Online,
+        ShiftState::ClosingLocalPendingDrain,
+        "cashier-vasya",
+    )
+    .await;
+    let req_id = seed_inbox_new(&pool, DocType::Sell).await;
+    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::PostLocalCloseSaleRefused
+            }
+        ),
+        "got {result:?}"
+    );
+    assert_eq!(
+        audit_count_for_event(&pool, "POST_LOCAL_CLOSE_SALE_REFUSED").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn stage1_shift_close_on_opened_local_pending_drain_refused() {
+    // (ShiftClose, OpenedLocalPendingDrain, _) → OfflineShiftCloseNotSupported.
+    let pool = fresh_pool().await;
+    seed_for_shift_state_test(
+        &pool,
+        NodeMode::Online,
+        ShiftState::OpenedLocalPendingDrain,
+        "cashier-vasya",
+    )
+    .await;
+    let req_id = seed_inbox_new(&pool, DocType::ShiftClose).await;
+    let result = stage_acquire::run(&pool, req_id, cmd(DocType::ShiftClose))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::OfflineShiftCloseNotSupported
+            }
+        ),
+        "got {result:?}"
+    );
+    assert_eq!(
+        audit_count_for_event(&pool, "OFFLINE_SHIFT_CLOSE_REFUSED").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn stage1_shift_open_on_closing_local_pending_drain_refused() {
+    // NIT-C4-1 fix: (ShiftOpen, ClosingLocalPendingDrain, _) → ShiftClosingInFlight
+    // (NOT ShiftAlreadyOpen — pre-fix code mis-labelled this cell).
+    let pool = fresh_pool().await;
+    seed_for_shift_state_test(
+        &pool,
+        NodeMode::Online,
+        ShiftState::ClosingLocalPendingDrain,
+        "cashier-vasya",
+    )
+    .await;
+    let req_id = seed_inbox_new(&pool, DocType::ShiftOpen).await;
+    let result = stage_acquire::run(&pool, req_id, cmd(DocType::ShiftOpen))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::ShiftClosingInFlight
+            }
+        ),
+        "got {result:?} (must be ShiftClosingInFlight per spec §3.4 matrix, NOT ShiftAlreadyOpen)"
+    );
+    assert_eq!(
+        audit_count_for_event(&pool, "SHIFT_CLOSING_IN_FLIGHT_OP_REFUSED").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn stage1_offline_sell_on_opened_local_pending_drain_carries_shift_id() {
+    // HIGH-C4-1 acceptance: (Sell, OpenedLocalPendingDrain, Offline) is
+    // allowed by §3.4 matrix, AND active_shift resolver widening (§3.6a)
+    // ensures the persisted fiscal_documents.shift_id IS NOT NULL.
+    // Without this, the doc would orphan its shift binding and break
+    // future W9b drain-time signer enforcement.
+    let pool = fresh_pool().await;
+    let shift_id = seed_for_shift_state_test(
+        &pool,
+        NodeMode::Offline,
+        ShiftState::OpenedLocalPendingDrain,
+        "cashier-vasya",
+    )
+    .await;
+    let req_id = seed_inbox_new(&pool, DocType::Sell).await;
+    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+        .await
+        .unwrap();
+    let ctx = match result {
+        WorkerProcessResult::Proceed(c) => c,
+        other => panic!("expected Proceed, got {other:?}"),
+    };
+    let active_shift = ctx
+        .active_shift
+        .expect("HIGH-C4-1 invariant: active_shift must be Some for OpenedLocalPendingDrain offline path");
+    assert_eq!(active_shift.shift_id, shift_id);
+    assert_eq!(active_shift.state, ShiftState::OpenedLocalPendingDrain);
+    assert_eq!(ctx.document.doc_type, DocType::Sell);
+    // Verify the persisted ledger row carries shift_id (NOT NULL).
+    let persisted_shift_id: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT shift_id FROM fiscal_documents WHERE document_id = ?",
+    )
+    .bind(ctx.document.document_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        persisted_shift_id.expect("shift_id must be NOT NULL"),
+        shift_id.as_bytes().to_vec(),
+        "fiscal_documents.shift_id must match active shift",
+    );
+    // MED-C4-3: persisted fs_mode must reflect the offline channel —
+    // NOT the pre-fix hardcoded "ONLINE".
+    let persisted_fs_mode: String = sqlx::query_scalar(
+        "SELECT fs_mode FROM fiscal_documents WHERE document_id = ?",
+    )
+    .bind(ctx.document.document_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        persisted_fs_mode, "OFFLINE",
+        "fs_mode must be derived from channel; offline path → 'OFFLINE'",
+    );
+}
+
+#[tokio::test]
+async fn stage1_offline_op_on_opened_local_pending_drain_missing_shift_id_is_invariant_breach() {
+    // HIGH-C4-1 invariant guard: OpenedLocalPendingDrain + current_shift_id
+    // = None must surface as ShiftInvariantViolation, NOT silently
+    // proceed with shift_id = None.
+    let pool = fresh_pool().await;
+    seed_fn_with_profiles(
+        &pool,
+        Some("b"),
+        Some("t"),
+        NodeMode::Offline,
+        ShiftState::OpenedLocalPendingDrain,
+        None, // invariant breach
+    )
+    .await;
+    let req_id = seed_inbox_new(&pool, DocType::Sell).await;
+    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::ShiftInvariantViolation
+            }
+        ),
+        "got {result:?}"
+    );
+    assert_eq!(doc_count(&pool).await, 0);
+}
+
+#[tokio::test]
+async fn stage1_z_report_on_opened_local_pending_drain_offline_blocked() {
+    // (ZReport, OpenedLocalPendingDrain, Offline) → ZReportBlockedBacklogDrainPending.
+    // Pre-W10 guardrail per operator correction #3 (2026-05-19).
+    let pool = fresh_pool().await;
+    seed_for_shift_state_test(
+        &pool,
+        NodeMode::Offline,
+        ShiftState::OpenedLocalPendingDrain,
+        "cashier-vasya",
+    )
+    .await;
+    let req_id = seed_inbox_new(&pool, DocType::ZReport).await;
+    let result = stage_acquire::run(&pool, req_id, cmd(DocType::ZReport))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::ZReportBlockedBacklogDrainPending
+            }
+        ),
+        "got {result:?}"
+    );
+    assert_eq!(
+        audit_count_for_event(
+            &pool,
+            "OFFLINE_Z_REPORT_BACKLOG_DRAIN_PENDING_REFUSED"
+        )
+        .await,
+        1
+    );
 }
 
 // ─── 10. Shift invariant violation: Opened but current_shift_id=None ──
@@ -849,6 +1261,8 @@ fn _unused_imports_suppression() {
         z_report_number: None,
         unsigned_xml_sha256: None,
         signing_inputs_pinned_at: None,
+        // W14a-2b additive.
+        signed_by_cashier_id: None,
     };
     let _ = Severity::Info;
     let _ = shifts::ShiftRow {
@@ -857,5 +1271,11 @@ fn _unused_imports_suppression() {
         serial: None,
         state: ShiftState::Closed,
         cash_balance_kop: 0,
+        // W14a-2b additive — placeholder; sentinel back-fill semantics
+        // mirror the W14a-1 production rows.
+        opened_by_cashier_id: prro::db::models::ids::CashierId::new(
+            "__test_unused_imports__",
+        )
+        .expect("valid cashier id"),
     };
 }

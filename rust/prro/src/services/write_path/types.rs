@@ -7,6 +7,7 @@
 //! stage boundaries by the dispatcher.
 
 use crate::db::models::enums::{DocType, ShiftState};
+use crate::db::models::ids::CashierId;
 use crate::db::repositories::fiscal_documents::DocumentRow;
 use crate::db::repositories::ingress_inbox::InboxRow;
 use crate::db::repositories::node_state::NodeStateRow;
@@ -23,6 +24,20 @@ pub struct CanonicalFiscalCommand {
     pub total_sum_kop: Option<i64>,
     pub payload_json: String,
     pub payload_sha256_canonical: [u8; 32],
+    /// W14a-2b §1.4 — operator/cashier id that will sign this document.
+    /// Carries through stage 1 (PREPARED insert) → stage 3 (sign) →
+    /// stage 4 (send envelope) and is consumed by `signer_guard` at
+    /// stage_send 4-pre (see spec §1.4 + §2.3).  `None` whenever
+    /// operator attribution is unavailable: system-context paths
+    /// (e.g. boot-phase snapshot reconstruction), test fixtures that
+    /// don't exercise signer enforcement, and current ingress
+    /// adapters that have not yet been plumbed.
+    ///
+    /// **Operator-resolved (spec §8 OQ #1):** `CanonicalFiscalCommand`
+    /// is not currently `Deserialize`, so adding a field is a Rust-
+    /// struct-literal breakage only (all callers updated in this
+    /// commit).  No serde concern.
+    pub signed_by_cashier_id: Option<CashierId>,
 }
 
 /// Snapshot handed from stage 1 to subsequent stages.  Contains
@@ -34,12 +49,14 @@ pub struct WorkerContext {
     pub inbox: InboxRow,
     pub command: CanonicalFiscalCommand,
     pub node_state: NodeStateRow,
-    /// `Some` when `node_state.shift_state == Opened` AND the
-    /// referenced shift is itself in `Opened`; `None` for
-    /// shift-management ops (SHIFT_OPEN) where there is no active
+    /// `Some` when `node_state.shift_state` is either `Opened` OR
+    /// `OpenedLocalPendingDrain` (W14a-2b HIGH-C4-1 widening per spec
+    /// §3.6a) AND the referenced shift row mirrors that state.  `None`
+    /// for shift-management ops (SHIFT_OPEN) where there is no active
     /// shift yet.  Stage 2's shift-invariant guard rejects the
-    /// inconsistent middle (`shift_state == Opened` but no resolvable
-    /// `current_shift_id`).
+    /// inconsistent middle (`shift_state` says open but
+    /// `current_shift_id` IS NULL — `ShiftInvariantViolation` Critical
+    /// audit).
     pub active_shift: Option<ShiftRow>,
     /// The fiscal_documents row that stages 3+ will continue
     /// processing.  For `Proceed` this is freshly INSERTed PREPARED;
@@ -54,9 +71,18 @@ pub struct WorkerContext {
 /// Reason for a stage-2 guard rejection.  Carried by
 /// `WorkerProcessResult::Rejected`.  Distinct variants so the
 /// audit / metrics layer can label without parsing strings.
+///
+/// W14a-2b Commit 4: `#[non_exhaustive]` added together with the 9
+/// new channel-aware / mode-guard variants.  Downstream consumers
+/// (audit dispatch, metrics labelling) MUST use a wildcard `_` arm so
+/// future variant additions don't compile-break the matrix.  The 9
+/// new variants explicitly REPLACE the prior `NodeOffline` semantic
+/// bucket — the binary "mode == Online or refuse" guard is replaced
+/// by `Online / Offline / GoingOffline → Channel` + typed refusals
+/// for the four unsupportable modes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RejectionReason {
-    NodeOffline,
     ShiftNotOpen {
         current: ShiftState,
     },
@@ -85,6 +111,74 @@ pub enum RejectionReason {
     InvalidPayload {
         detail: String,
     },
+
+    // ─── W14a-2b Commit 4 — channel-aware + mode guard rewrite ────────
+    //
+    // The four mode-side variants below replace the prior `NodeOffline`
+    // bucket.  Per spec §3.3: `Online` and `Offline | GoingOffline` map
+    // to `Channel::Online` / `Channel::Offline` and proceed to the
+    // shift guard; the four below are refused BEFORE the shift guard.
+
+    /// Mode = `GoingOnline` — return-online drain in flight.  Operator
+    /// MUST wait for `GoingOnline → Online` transition before issuing
+    /// new fiscal ops.  Transient; expected during return-online cycle.
+    NodeGoingOnlineDrainInFlight,
+    /// Mode = `Blocked` — operator manual-recovery state.  Forensic
+    /// (W14a-2a force seam may have brought us here).
+    NodeBlocked,
+    /// Mode = `StopMode` — legal hold / regulatory pause.  Rare.
+    NodeStopMode,
+    /// Mode = `CryptoDegraded` — crypto subsystem degraded
+    /// (key expiry imminent, sidecar down).  Operator MUST intervene
+    /// before next op succeeds.
+    NodeCryptoDegraded,
+
+    // ─── Channel-aware shift-guard refusals ──────────────────────────
+
+    /// Online op attempted while shift is in `OpenedLocalPendingDrain`
+    /// (offline `SHIFT_OPEN` landed local ack but DPS hasn't confirmed
+    /// the open yet).  Audit shape:
+    /// `SHIFT_OPEN_PENDING_DRAIN_OP_REFUSED`.
+    ShiftOpenPendingDrainOpRefused,
+    /// Any op attempted while shift is in `ClosingLocalPendingDrain`
+    /// (offline `Z_REPORT` issued; post-local-close lockout per
+    /// PR #62 §W10).  Channel-irrelevant.  Audit shape:
+    /// `POST_LOCAL_CLOSE_SALE_REFUSED`.
+    PostLocalCloseSaleRefused,
+    /// `SHIFT_CLOSE` attempted on `OpenedLocalPendingDrain` shift.
+    /// Per spec §5.7 L2 — offline shift close is not modeled (only
+    /// online close after drain reaches `Opened` OR offline `Z_REPORT`
+    /// → `ClosingLocalPendingDrain`).  Audit shape:
+    /// `OFFLINE_SHIFT_CLOSE_REFUSED`.
+    OfflineShiftCloseNotSupported,
+    /// Op attempted while shift is in `ClosingLocalPendingDrain` AND
+    /// the doc is a shift-management type (`SHIFT_OPEN` / `SHIFT_CLOSE`).
+    /// Transient; operator should retry after drain completion.
+    /// Audit shape: `SHIFT_CLOSING_IN_FLIGHT_OP_REFUSED`.
+    ShiftClosingInFlight,
+    /// `Z_REPORT` attempted on `OpenedLocalPendingDrain` shift in
+    /// either channel.  Pre-W10 guardrail (coupled pool/backlog/edge-7
+    /// logic lands in W10).  W14a-2b refuses unconditionally to avoid
+    /// the window where Z-report can be issued while backlog non-empty.
+    /// Audit shape: `OFFLINE_Z_REPORT_BACKLOG_DRAIN_PENDING_REFUSED`.
+    ZReportBlockedBacklogDrainPending,
+}
+
+/// W14a-2b Commit 4 — channel derived from node mode at stage_acquire
+/// time.  Threaded into `check_shift_guard` so the matrix can refuse
+/// online ops on `OpenedLocalPendingDrain` while allowing offline ops
+/// per spec §3.3.  Not persisted; lives in write-path scope only.
+///
+/// Mapping per spec §3.3:
+/// - `NodeMode::Online` → `Channel::Online`
+/// - `NodeMode::Offline` / `NodeMode::GoingOffline` → `Channel::Offline`
+/// - `NodeMode::GoingOnline` / `NodeMode::Blocked` / `NodeMode::StopMode`
+///   / `NodeMode::CryptoDegraded` → REJECTED at mode guard (BEFORE
+///   `check_shift_guard` is invoked); no `Channel` value produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    Online,
+    Offline,
 }
 
 /// Result of stage 1 (acquire+validate+guard) per W0-1 §3.1.

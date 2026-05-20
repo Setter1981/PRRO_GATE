@@ -192,3 +192,56 @@ async fn transition_state_returns_not_found_for_stale_shift_id() {
         "stale ShiftId must surface as NotFound, got {outcome:?}"
     );
 }
+
+/// W14a-2b Commit 7 §1.6 (R7 carry-forward LOW): direct unit test
+/// for `shifts::TransitionOutcome::Conflict` variant.  Mirrors the
+/// `fiscal_documents` pattern at `repo_fiscal_documents_state_cas.rs:117`.
+///
+/// Scenario: caller passes a whitelist-allowed `from→to` pair, but the
+/// observed `current_state` at CAS time has drifted (e.g. concurrent
+/// admin path / force seam ran in parallel).  Whitelist check passes,
+/// the CAS-WHERE-state UPDATE matches 0 rows, but the row still exists
+/// → `Conflict { observed: <other_state> }`.
+///
+/// Locks the diagnostic re-read logic in `transition_state` against
+/// future regression.
+#[tokio::test]
+async fn transition_state_returns_conflict_when_observed_state_drifted() {
+    use prro::db::tx::with_immediate;
+
+    let (pool, fn_id) = fresh_with_fn().await;
+    let shift_id = seed_shift_in_state(&pool, &fn_id, ShiftState::Opened).await;
+
+    let outcome = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            // Mutate state to Closing OUTSIDE the whitelist seam via
+            // raw UPDATE (simulates a concurrent admin path that
+            // bypassed the typed transition surface).
+            sqlx::query("UPDATE shifts SET state = 'CLOSING' WHERE shift_id = ?")
+                .bind(shift_id)
+                .execute(&mut **tx)
+                .await?;
+            // Whitelist-allowed transition (Opened → Closing edge 8)
+            // BUT current state at UPDATE will be 'CLOSING', not
+            // 'OPENED'.  CAS WHERE shift_id = ? AND state = 'OPENED'
+            // → 0 rows.  Diagnostic re-read returns 'CLOSING' →
+            // Conflict { observed: Closing }.
+            let o = shifts::transition_state(
+                tx,
+                shift_id,
+                ShiftState::Opened,
+                ShiftState::Closing,
+            )
+            .await?;
+            anyhow::Ok(o)
+        })
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        TransitionOutcome::Conflict { observed: ShiftState::Closing },
+        "post-drift transition_state MUST surface Conflict with observed=Closing"
+    );
+}

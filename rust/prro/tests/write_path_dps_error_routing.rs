@@ -81,25 +81,48 @@ async fn seed_doc(
     .execute(pool)
     .await
     .unwrap();
+
+    // W14a-2b Commit 5: non-bypass doc types need shift + signer
+    // attribution for signer_guard at stage_send 4-pre.
+    let bypass = matches!(doc_type, "SHIFT_OPEN" | "SHIFT_CLOSE" | "Z_REPORT");
+    let (shift_id_bytes, cashier): (Option<Vec<u8>>, Option<&'static str>) = if bypass {
+        (None, None)
+    } else {
+        let shift_byte = doc_byte ^ 0x80;
+        let shift_bytes = vec![shift_byte; 16];
+        sqlx::query(
+            "INSERT OR IGNORE INTO shifts(shift_id, fiscal_number, serial, state, \
+                open_mode, cash_balance_kop, opened_by_cashier_id) \
+             VALUES (?, '1234567890', 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
+        )
+        .bind(&shift_bytes)
+        .execute(pool)
+        .await
+        .expect("seed shift for non-bypass doc");
+        (Some(shift_bytes), Some("test-cashier"))
+    };
+
     let doc_bytes = vec![doc_byte; 16];
     let req_bytes = vec![doc_byte ^ 0xFF; 16];
     let sha = vec![0u8; 32];
     let lnd = doc_byte as i64;
     sqlx::query(
-        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
-            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
-            payload_sha256_canonical, total_sum_kop) \
-         VALUES (?, ?, '1234567890', ?, ?, ?, 'b1', 't1', 'ONLINE', \
-            '2026-05-09T12:34:56Z', ?, ?, ?)",
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
+            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical, total_sum_kop, signed_by_cashier_id) \
+         VALUES (?, ?, '1234567890', ?, ?, ?, ?, 'b1', 't1', 'ONLINE', \
+            '2026-05-09T12:34:56Z', ?, ?, ?, ?)",
     )
     .bind(&doc_bytes)
     .bind(&req_bytes)
+    .bind(shift_id_bytes.as_deref())
     .bind(lnd)
     .bind(doc_type)
     .bind(state)
     .bind(payload_json)
     .bind(&sha)
     .bind(total_sum_kop)
+    .bind(cashier)
     .execute(pool)
     .await
     .expect("seed fiscal_documents");

@@ -71,7 +71,7 @@
 //!   isolation; "M3b §Task 7 closed" requires both W7a (this PR)
 //!   AND W7b merged.
 
-use crate::db::models::enums::{NodeMode, Severity, ShiftState};
+use crate::db::models::enums::{DocState, DocType, NodeMode, Severity, ShiftState};
 use crate::db::models::ids::{DocumentId, OfflineSessionId};
 use crate::db::repositories::audit_log;
 use crate::db::repositories::fiscal_documents::{self as fd, TransitionOutcome};
@@ -202,8 +202,85 @@ pub async fn run(
                 .await;
             }
 
-            // ─── Step 3: validate shift state ───────────────────────
-            if ns.shift_state != ShiftState::Opened {
+            // ─── Step 2b: read doc inputs (W14a-2b Commit 6 §3.7) ───
+            //
+            // Defence-in-depth (operator correction #4): read doc_type
+            // + state + fiscal_number BEFORE shift-state validation so
+            // we can scope the widened {Opened | OpenedLocalPendingDrain}
+            // allowlist by doc_type — non-bypass regular fiscal docs
+            // get the widened set; other doc types stay scoped to
+            // Opened only.  Without this, an arbitrary upstream caller
+            // could route a non-fiscal doc through the offline-ack
+            // path on OpenedLocalPendingDrain — defeating the §3.4
+            // matrix contract.
+            //
+            // Returned `inputs.state` is the pre-CAS observation;
+            // surfaces typed `DocStateConflict` if not SIGNED.
+            let inputs = match fd::fetch_offline_ack_inputs_tx(tx, doc_id).await? {
+                Some(i) => i,
+                None => {
+                    return audit_and_return_refused(
+                        tx,
+                        doc_id,
+                        &fn_id,
+                        RefusalReason::DocNotFound,
+                    )
+                    .await;
+                }
+            };
+            // Cross-FN guard (operator W7 Round 1 HIGH-2 + Round 2
+            // LOW-4): caller passed FN_B but doc belongs to FN_A.
+            if inputs.fiscal_number != fn_id {
+                return audit_and_return_refused(
+                    tx,
+                    doc_id,
+                    &fn_id,
+                    RefusalReason::CrossFnMismatch {
+                        observed_fiscal_number: inputs.fiscal_number,
+                    },
+                )
+                .await;
+            }
+            // Doc-state guard: only SIGNED docs proceed to offline-ack.
+            if inputs.state != DocState::Signed {
+                return audit_and_return_refused(
+                    tx,
+                    doc_id,
+                    &fn_id,
+                    RefusalReason::DocStateConflict {
+                        observed_state: inputs.state.as_str().to_string(),
+                    },
+                )
+                .await;
+            }
+
+            // ─── Step 3: validate shift state (doc_type-scoped) ─────
+            //
+            // W14a-2b Commit 6 §3.7 widening (operator correction #4):
+            // regular fiscal docs (Sell / Return / ServiceIn /
+            // ServiceOut / CashWithdrawal / XReport) accept
+            // `Opened | OpenedLocalPendingDrain` per spec §3.3 +
+            // §5.6 — Pattern C resilience surface.  Other doc types
+            // (SHIFT_OPEN — handled here for offline Pattern C open;
+            // others should not reach stage_offline_ack per the §3.4
+            // matrix, but the helper enforces it defensively) stay
+            // scoped to `Opened` only.
+            let shift_state_ok = match inputs.doc_type {
+                DocType::Sell
+                | DocType::Return
+                | DocType::ServiceIn
+                | DocType::ServiceOut
+                | DocType::CashWithdrawal
+                | DocType::XReport => matches!(
+                    ns.shift_state,
+                    ShiftState::Opened | ShiftState::OpenedLocalPendingDrain,
+                ),
+                // SHIFT_OPEN / SHIFT_CLOSE / Z_REPORT and any other
+                // doc type stay scoped to Opened only — non-regular
+                // fiscal docs do NOT participate in the §3.7 widening.
+                _ => ns.shift_state == ShiftState::Opened,
+            };
+            if !shift_state_ok {
                 return audit_and_return_refused(
                     tx,
                     doc_id,
@@ -229,74 +306,6 @@ pub async fn run(
                         .await;
                     }
                 };
-
-            // ─── Step 5: pre-check doc state + FN match ─────────────
-            //
-            // Operator W7 Round 1 LOW/MED fix (2026-05-15): the
-            // `DocStateConflict` / `DocNotFound` typed refusal
-            // variants were documented but unreachable previously
-            // (CAS-conflict path bailed with Err).  This pre-check
-            // makes them reachable AS REFUSALS: read the doc's
-            // state + fiscal_number inside the envelope BEFORE
-            // touching the code pool, then surface typed Refused
-            // with no acquire_code_tx side effect.  Doubles as the
-            // cross-FN guard from operator W7 Round 1 HIGH-2 —
-            // mismatched FN is caught here before any code is
-            // consumed.  The CAS in step 7 below remains as
-            // defence-in-depth (race window between this read and
-            // that CAS is closed by BEGIN IMMEDIATE; the CAS would
-            // need to fail only if there's a logic bug here).
-            let doc_meta: Option<(String, String)> = sqlx::query_as(
-                "SELECT state, fiscal_number \
-                 FROM fiscal_documents WHERE document_id = ? LIMIT 1",
-            )
-            .bind(doc_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-            match doc_meta {
-                None => {
-                    return audit_and_return_refused(
-                        tx,
-                        doc_id,
-                        &fn_id,
-                        RefusalReason::DocNotFound,
-                    )
-                    .await;
-                }
-                Some((_, doc_fn)) if doc_fn != fn_id => {
-                    // Cross-FN mismatch (operator W7 Round 1 HIGH-2
-                    // + Round 2 LOW-4): caller passed FN_B but doc
-                    // belongs to FN_A.  Fiscal-integrity-critical;
-                    // distinct typed variant from state conflict so
-                    // operator audit can distinguish caller-bug
-                    // (mis-passed FN) from operational race (state
-                    // diverged).
-                    return audit_and_return_refused(
-                        tx,
-                        doc_id,
-                        &fn_id,
-                        RefusalReason::CrossFnMismatch {
-                            observed_fiscal_number: doc_fn,
-                        },
-                    )
-                    .await;
-                }
-                Some((state, _)) if state != "SIGNED" => {
-                    // State diverged (FN matches): concurrent
-                    // admin override / idempotent replay.  Caller
-                    // may re-route the doc per observed state.
-                    return audit_and_return_refused(
-                        tx,
-                        doc_id,
-                        &fn_id,
-                        RefusalReason::DocStateConflict {
-                            observed_state: state,
-                        },
-                    )
-                    .await;
-                }
-                Some(_) => {}
-            }
 
             // ─── Step 6: acquire code (atomic single-statement CAS) ─
             //

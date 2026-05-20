@@ -404,6 +404,8 @@ pub async fn run(
         z_report_number,
         unsigned_xml_sha256: Some(unsigned_xml_sha256),
         signing_inputs_pinned_at: document.signing_inputs_pinned_at.or(Some(now_iso)),
+        // W14a-2b Commit 1: pass-through from input DocumentRow.
+        signed_by_cashier_id: document.signed_by_cashier_id,
     };
 
     Ok(SigningOutcome {

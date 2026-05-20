@@ -68,22 +68,47 @@ async fn seed_signed_doc_with_xml(
     .execute(pool)
     .await
     .unwrap();
+
+    // W14a-2b Commit 5: non-bypass doc types need a matching shift +
+    // signer attribution so signer_guard at stage_send 4-pre passes
+    // (signer == opening cashier).  Bypass doc types (SHIFT_OPEN /
+    // SHIFT_CLOSE / Z_REPORT) skip signer enforcement.
+    let bypass = matches!(doc_type, "SHIFT_OPEN" | "SHIFT_CLOSE" | "Z_REPORT");
+    let (shift_id_bytes, cashier): (Option<Vec<u8>>, Option<&'static str>) = if bypass {
+        (None, None)
+    } else {
+        let shift_byte = doc_byte ^ 0x80;
+        let shift_bytes = vec![shift_byte; 16];
+        sqlx::query(
+            "INSERT OR IGNORE INTO shifts(shift_id, fiscal_number, serial, state, \
+                open_mode, cash_balance_kop, opened_by_cashier_id) \
+             VALUES (?, '1234567890', 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
+        )
+        .bind(&shift_bytes)
+        .execute(pool)
+        .await
+        .expect("seed shift for non-bypass doc");
+        (Some(shift_bytes), Some("test-cashier"))
+    };
+
     let doc_bytes = vec![doc_byte; 16];
     let req_bytes = vec![doc_byte ^ 0xFF; 16];
     let sha = vec![0u8; 32];
     sqlx::query(
-        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
-            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
-            payload_sha256_canonical) \
-         VALUES (?, ?, '1234567890', ?, ?, ?, 'b1', 't1', 'ONLINE', \
-            '2026-05-09T12:34:56Z', '{}', ?)",
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
+            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical, signed_by_cashier_id) \
+         VALUES (?, ?, '1234567890', ?, ?, ?, ?, 'b1', 't1', 'ONLINE', \
+            '2026-05-09T12:34:56Z', '{}', ?, ?)",
     )
     .bind(&doc_bytes)
     .bind(&req_bytes)
+    .bind(shift_id_bytes.as_deref())
     .bind(lnd)
     .bind(doc_type)
     .bind(state)
     .bind(&sha)
+    .bind(cashier)
     .execute(pool)
     .await
     .expect("seed fiscal_documents");
@@ -1313,18 +1338,33 @@ async fn signed_xml_missing_surfaces_typed_error_no_state_mutation() {
     .execute(&pool)
     .await
     .unwrap();
+    // W14a-2b Commit 5: signer_guard at 4-pre runs BEFORE the
+    // SIGNED_XML read; seed a matching shift + signer so the test
+    // reaches its intended SignedArtifactMissing path (would otherwise
+    // surface ShiftMissingForFiscalDoc first).
+    let shift_bytes = vec![0xE6u8; 16];
+    sqlx::query(
+        "INSERT INTO shifts(shift_id, fiscal_number, serial, state, open_mode, \
+            cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, '1234567890', 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
+    )
+    .bind(&shift_bytes)
+    .execute(&pool)
+    .await
+    .unwrap();
     let doc_bytes = vec![0x66u8; 16];
     let req_bytes = vec![0x99u8; 16];
     let sha = vec![0u8; 32];
     sqlx::query(
-        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
-            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
-            payload_sha256_canonical) \
-         VALUES (?, ?, '1234567890', 1, 'SELL', 'SIGNED', 'b1', 't1', 'ONLINE', \
-            '2026-05-09T12:34:56Z', '{}', ?)",
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
+            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical, signed_by_cashier_id) \
+         VALUES (?, ?, '1234567890', ?, 1, 'SELL', 'SIGNED', 'b1', 't1', 'ONLINE', \
+            '2026-05-09T12:34:56Z', '{}', ?, 'test-cashier')",
     )
     .bind(&doc_bytes)
     .bind(&req_bytes)
+    .bind(&shift_bytes)
     .bind(&sha)
     .execute(&pool)
     .await
@@ -1374,24 +1414,41 @@ async fn seed_error_retryable_doc_with_artifacts(pool: &SqlitePool, doc_byte: u8
     .execute(pool)
     .await
     .unwrap();
+
+    // W14a-2b Commit 5: non-bypass SELL doc needs shift + signer
+    // attribution so signer_guard at stage_send 4-pre returns Ok.
+    let shift_byte = doc_byte ^ 0x80;
+    let shift_bytes = vec![shift_byte; 16];
+    sqlx::query(
+        "INSERT OR IGNORE INTO shifts(shift_id, fiscal_number, serial, state, open_mode, \
+            cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, '1234567890', 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
+    )
+    .bind(&shift_bytes)
+    .execute(pool)
+    .await
+    .expect("seed shift for SELL retry test");
+
     let doc_bytes = vec![doc_byte; 16];
     let req_bytes = vec![doc_byte ^ 0xFF; 16];
     let sha = vec![0u8; 32];
     let lnd = doc_byte as i64;
     let prev_hash = [0xAAu8; 32];
     sqlx::query(
-        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
-            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
-            payload_sha256_canonical, total_sum_kop, previous_hash) \
-         VALUES (?, ?, '1234567890', ?, 'SELL', 'ERROR_RETRYABLE', 'b1', 't1', 'ONLINE', \
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
+            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical, total_sum_kop, previous_hash, \
+            signed_by_cashier_id) \
+         VALUES (?, ?, '1234567890', ?, ?, 'SELL', 'ERROR_RETRYABLE', 'b1', 't1', 'ONLINE', \
             '2026-05-09T12:34:56Z', \
             '{\"items\":[{\"code\":\"p-1\",\"name\":\"Item A\",\"price_kop\":1500,\
               \"quantity_thousandths\":1000,\"sum_kop\":1500}],\
               \"payments\":[{\"name\":\"Cash\",\"sum_kop\":1500,\"type_code\":\"0\"}]}', \
-            ?, 1500, ?)",
+            ?, 1500, ?, 'test-cashier')",
     )
     .bind(&doc_bytes)
     .bind(&req_bytes)
+    .bind(&shift_bytes)
     .bind(lnd)
     .bind(&sha)
     .bind(&prev_hash[..])

@@ -21,7 +21,7 @@
 
 use crate::db::models::{
     enums::{DocState, DocType},
-    ids::{DocumentId, OfflineSessionId, RequestId, ShiftId},
+    ids::{CashierId, DocumentId, OfflineSessionId, RequestId, ShiftId},
 };
 use crate::db::tx::WriteTxConn;
 use sqlx::SqlitePool;
@@ -44,6 +44,11 @@ pub struct NewDocument {
     pub payload_sha256_canonical: [u8; 32],
     pub unsigned_xml_sha256: Option<[u8; 32]>,
     pub previous_hash: Option<[u8; 32]>,
+    /// W14a-2b §1.4 — cashier id that will sign this document.  Persisted
+    /// on the ledger row at stage 1 INSERT PREPARED; consumed at
+    /// stage_send 4-pre by signer_guard.  None for system-context paths
+    /// without operator attribution (none currently).
+    pub signed_by_cashier_id: Option<CashierId>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +87,11 @@ pub struct DocumentRow {
     /// `previous_hash` and `z_report_number` columns are now
     /// authoritative for retry.
     pub signing_inputs_pinned_at: Option<String>,
+    /// W14a-2b §1.4 — cashier id that signed (or will sign) this
+    /// document.  Persisted at INSERT PREPARED; consumed at stage_send
+    /// 4-pre by signer_guard.  `None` for pre-W14a-2b ledger rows
+    /// (column added in migration 017_signed_by_cashier_id.sql).
+    pub signed_by_cashier_id: Option<CashierId>,
 }
 
 /// W6 — decode a length-32 BLOB into a fixed `[u8; 32]`.  Fail-closed:
@@ -202,8 +212,9 @@ pub async fn insert_prepared(pool: &SqlitePool, n: &NewDocument) -> sqlx::Result
              document_id, request_id, fiscal_number, shift_id, offline_session_id,
              lnd, doc_type, state, backend_profile_id, transport_profile_id,
              fs_mode, business_ts, total_sum_kop, payload_json,
-             payload_sha256_canonical, unsigned_xml_sha256, previous_hash
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+             payload_sha256_canonical, unsigned_xml_sha256, previous_hash,
+             signed_by_cashier_id
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(n.document_id)
     .bind(n.request_id)
@@ -221,6 +232,7 @@ pub async fn insert_prepared(pool: &SqlitePool, n: &NewDocument) -> sqlx::Result
     .bind(&n.payload_sha256_canonical[..])
     .bind(n.unsigned_xml_sha256.as_ref().map(|b| &b[..]))
     .bind(n.previous_hash.as_ref().map(|b| &b[..]))
+    .bind(n.signed_by_cashier_id.as_ref().map(|c| c.as_str()))
     .execute(pool)
     .await?;
     Ok(())
@@ -430,7 +442,8 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
                   previous_hash         as "previous_hash: Vec<u8>",
                   z_report_number,
                   unsigned_xml_sha256   as "unsigned_xml_sha256: Vec<u8>",
-                  signing_inputs_pinned_at
+                  signing_inputs_pinned_at,
+                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId"
            FROM fiscal_documents
            WHERE fiscal_number = ?
              AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')
@@ -455,6 +468,7 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
                 z_report_number: r.z_report_number,
                 unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
                 signing_inputs_pinned_at: r.signing_inputs_pinned_at,
+                signed_by_cashier_id: r.signed_by_cashier_id,
             })
         })
         .collect()
@@ -491,7 +505,8 @@ pub async fn get_pending_by_request_id_tx(
                   previous_hash         as "previous_hash: Vec<u8>",
                   z_report_number,
                   unsigned_xml_sha256   as "unsigned_xml_sha256: Vec<u8>",
-                  signing_inputs_pinned_at
+                  signing_inputs_pinned_at,
+                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId"
            FROM fiscal_documents
            WHERE request_id = ?
              AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')"#,
@@ -514,6 +529,7 @@ pub async fn get_pending_by_request_id_tx(
         z_report_number: r.z_report_number,
         unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
         signing_inputs_pinned_at: r.signing_inputs_pinned_at,
+        signed_by_cashier_id: r.signed_by_cashier_id,
     }))
 }
 
@@ -558,8 +574,9 @@ pub async fn insert_prepared_tx(tx: &mut WriteTxConn<'_>, n: &NewDocument) -> sq
              document_id, request_id, fiscal_number, shift_id, offline_session_id,
              lnd, doc_type, state, backend_profile_id, transport_profile_id,
              fs_mode, business_ts, total_sum_kop, payload_json,
-             payload_sha256_canonical, unsigned_xml_sha256, previous_hash
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+             payload_sha256_canonical, unsigned_xml_sha256, previous_hash,
+             signed_by_cashier_id
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(n.document_id)
     .bind(n.request_id)
@@ -577,6 +594,7 @@ pub async fn insert_prepared_tx(tx: &mut WriteTxConn<'_>, n: &NewDocument) -> sq
     .bind(&n.payload_sha256_canonical[..])
     .bind(n.unsigned_xml_sha256.as_ref().map(|b| &b[..]))
     .bind(n.previous_hash.as_ref().map(|b| &b[..]))
+    .bind(n.signed_by_cashier_id.as_ref().map(|c| c.as_str()))
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -733,6 +751,19 @@ pub struct SendInputs {
     /// `build_send_envelope` enforces this with a typed error before
     /// any CAS attempt.
     pub offline_fiscal_no: Option<i64>,
+    /// W14a-2b §2.2 — document_id surfaced for signer_guard's
+    /// `SignerCashierMismatch::*` outcomes (Commit 3); needed for
+    /// audit row attribution.
+    pub document_id: DocumentId,
+    /// W14a-2b §2.2 — shift_id (Option because system-level docs may
+    /// have no shift binding, e.g. SHIFT_OPEN itself).  Drives
+    /// signer_guard's "non-close fiscal doc must have a resolvable
+    /// shift" structural check (`ShiftMissingForFiscalDoc`).
+    pub shift_id: Option<ShiftId>,
+    /// W14a-2b §1.4 — operator/cashier id that signs this document.
+    /// Consumed by signer_guard 4-pre check.  `None` for pre-W14a-2b
+    /// ledger rows (column added in migration 017).
+    pub signed_by_cashier_id: Option<CashierId>,
 }
 
 /// W7 stage 4-pre — read the minimal field set required by stage 4 in
@@ -757,7 +788,9 @@ pub async fn fetch_send_inputs_tx(
                   business_ts,
                   backend_profile_id,
                   transport_profile_id,
-                  offline_fiscal_no
+                  offline_fiscal_no,
+                  shift_id             as "shift_id: ShiftId",
+                  signed_by_cashier_id as "signed_by_cashier_id: CashierId"
            FROM fiscal_documents WHERE document_id = ?"#,
         doc_id
     )
@@ -773,6 +806,55 @@ pub async fn fetch_send_inputs_tx(
         backend_profile_id: r.backend_profile_id,
         transport_profile_id: r.transport_profile_id,
         offline_fiscal_no: r.offline_fiscal_no,
+        document_id: doc_id,
+        shift_id: r.shift_id,
+        signed_by_cashier_id: r.signed_by_cashier_id,
+    }))
+}
+
+/// W14a-2b Commit 6 §3.7 — minimal field set `stage_offline_ack::run`
+/// needs to drive its doc-type-scoped shift-state validation +
+/// pre-CAS cross-FN / doc-state checks.  Strict subset of
+/// `DocumentRow` — only what stage_offline_ack reads.
+///
+/// **Defence-in-depth (operator correction #4):**
+/// `stage_offline_ack::run` does NOT trust upstream `stage_acquire` to
+/// have filtered `doc_type` correctly — the widened shift-state set
+/// (`Opened | OpenedLocalPendingDrain`) applies ONLY to regular
+/// fiscal docs (Sell / Return / ServiceIn / ServiceOut /
+/// CashWithdrawal / XReport).  Other doc types stay scoped to
+/// `Opened` only.
+///
+/// Returned `state` is the pre-CAS observation — caller uses it for
+/// `DocStateConflict` diagnostic if not `SIGNED`.
+#[derive(Debug, Clone)]
+pub struct OfflineAckInputs {
+    pub state: DocState,
+    pub doc_type: DocType,
+    pub fiscal_number: String,
+}
+
+/// W14a-2b Commit 6 §3.7 — single-SELECT inputs reader for
+/// `stage_offline_ack::run`.  Returns `None` when the row is missing;
+/// caller maps to `RefusalReason::DocNotFound`.
+pub async fn fetch_offline_ack_inputs_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+) -> sqlx::Result<Option<OfflineAckInputs>> {
+    let row = sqlx::query!(
+        r#"SELECT state        as "state: DocState",
+                  doc_type     as "doc_type: DocType",
+                  fiscal_number
+           FROM fiscal_documents WHERE document_id = ?"#,
+        doc_id
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(r) = row else { return Ok(None) };
+    Ok(Some(OfflineAckInputs {
+        state: r.state,
+        doc_type: r.doc_type,
+        fiscal_number: r.fiscal_number,
     }))
 }
 

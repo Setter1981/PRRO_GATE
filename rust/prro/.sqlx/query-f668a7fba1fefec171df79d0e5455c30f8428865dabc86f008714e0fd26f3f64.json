@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT state                as \"state: DocState\",\n                  fiscal_number,\n                  lnd,\n                  doc_type             as \"doc_type: DocType\",\n                  business_ts,\n                  backend_profile_id,\n                  transport_profile_id,\n                  offline_fiscal_no\n           FROM fiscal_documents WHERE document_id = ?",
+  "query": "SELECT state                as \"state: DocState\",\n                  fiscal_number,\n                  lnd,\n                  doc_type             as \"doc_type: DocType\",\n                  business_ts,\n                  backend_profile_id,\n                  transport_profile_id,\n                  offline_fiscal_no,\n                  shift_id             as \"shift_id: ShiftId\",\n                  signed_by_cashier_id as \"signed_by_cashier_id: CashierId\"\n           FROM fiscal_documents WHERE document_id = ?",
   "describe": {
     "columns": [
       {
@@ -42,6 +42,16 @@
         "name": "offline_fiscal_no",
         "ordinal": 7,
         "type_info": "Integer"
+      },
+      {
+        "name": "shift_id: ShiftId",
+        "ordinal": 8,
+        "type_info": "Blob"
+      },
+      {
+        "name": "signed_by_cashier_id: CashierId",
+        "ordinal": 9,
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -55,8 +65,10 @@
       false,
       false,
       false,
+      true,
+      true,
       true
     ]
   },
-  "hash": "3f31d99410e415df547db5d2992a2f2f2c518bf24ab2fc953fc290c5cdf838b0"
+  "hash": "f668a7fba1fefec171df79d0e5455c30f8428865dabc86f008714e0fd26f3f64"
 }

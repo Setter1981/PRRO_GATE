@@ -299,6 +299,10 @@ fn make_command(
         total_sum_kop,
         payload_json: payload_json.into(),
         payload_sha256_canonical: dummy_payload_sha256(),
+        // W14a-2b Commit 2: stage_sign test fixtures pre-date signer
+        // enforcement (Commits 3+5); None baseline matches existing
+        // suite behavior.
+        signed_by_cashier_id: None,
     }
 }
 
@@ -324,6 +328,8 @@ fn make_worker_context(
         z_report_number: None,
         unsigned_xml_sha256: None,
         signing_inputs_pinned_at: None,
+        // W14a-2b Commit 1: plumbing-only; helper not yet using the field.
+        signed_by_cashier_id: None,
     };
     WorkerContext {
         inbox: prro::db::repositories::ingress_inbox::InboxRow {

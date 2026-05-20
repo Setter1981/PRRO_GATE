@@ -111,20 +111,37 @@ async fn seed_doc_in_state(
     doc_byte: u8,
     state: &str,
 ) -> DocumentId {
+    // W14a-2b Commit 5: SELL is a non-bypass doc; signer_guard at
+    // stage_send 4-pre needs shift_id + signed_by_cashier_id matching
+    // the shift's opening cashier.  Seed a shift row + bind both.
+    let shift_byte = doc_byte ^ 0x80;
+    let shift_bytes = vec![shift_byte; 16];
+    sqlx::query(
+        "INSERT OR IGNORE INTO shifts(shift_id, fiscal_number, serial, state, open_mode, \
+            cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
+    )
+    .bind(&shift_bytes)
+    .bind(fn_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
     let doc_bytes = vec![doc_byte; 16];
     let req_bytes = vec![doc_byte ^ 0xFF; 16];
     let sha = vec![0u8; 32];
     let lnd = doc_byte as i64;
     sqlx::query(
-        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
-            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
-            payload_sha256_canonical) \
-         VALUES (?, ?, ?, ?, 'SELL', ?, 'b1', 't1', 'ONLINE', \
-            '2026-01-01T00:00:00Z', '{}', ?)",
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
+            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical, signed_by_cashier_id) \
+         VALUES (?, ?, ?, ?, ?, 'SELL', ?, 'b1', 't1', 'ONLINE', \
+            '2026-01-01T00:00:00Z', '{}', ?, 'test-cashier')",
     )
     .bind(&doc_bytes)
     .bind(&req_bytes)
     .bind(fn_id)
+    .bind(&shift_bytes)
     .bind(lnd)
     .bind(state)
     .bind(&sha)
@@ -1411,20 +1428,36 @@ async fn seed_doc_prepared_full(
     fn_id: &str,
     doc_byte: u8,
 ) -> (DocumentId, [u8; 16]) {
+    // W14a-2b Commit 5: SELL needs shift_id + signer attribution so
+    // signer_guard at stage_send 4-pre returns Ok.
+    let shift_byte = doc_byte ^ 0x80;
+    let shift_bytes = vec![shift_byte; 16];
+    sqlx::query(
+        "INSERT OR IGNORE INTO shifts(shift_id, fiscal_number, serial, state, open_mode, \
+            cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
+    )
+    .bind(&shift_bytes)
+    .bind(fn_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
     let doc_bytes = vec![doc_byte; 16];
     let req_bytes = vec![doc_byte ^ 0xFF; 16];
     let sha = vec![0u8; 32];
     let lnd = doc_byte as i64;
     sqlx::query(
-        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
-            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
-            total_sum_kop, payload_json, payload_sha256_canonical) \
-         VALUES (?, ?, ?, ?, 'SELL', 'PREPARED', 'b1', 't1', 'ONLINE', \
-            '2026-04-22T12:00:00Z', ?, ?, ?)",
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
+            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            total_sum_kop, payload_json, payload_sha256_canonical, signed_by_cashier_id) \
+         VALUES (?, ?, ?, ?, ?, 'SELL', 'PREPARED', 'b1', 't1', 'ONLINE', \
+            '2026-04-22T12:00:00Z', ?, ?, ?, 'test-cashier')",
     )
     .bind(&doc_bytes)
     .bind(&req_bytes)
     .bind(fn_id)
+    .bind(&shift_bytes)
     .bind(lnd)
     .bind(FIXTURE_1_TOTAL_SUM_KOP)
     .bind(FIXTURE_1_PAYLOAD_JSON)

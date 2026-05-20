@@ -42,6 +42,7 @@ use crate::db::models::ids::{DocumentId, ShiftId};
 use crate::db::repositories::fiscal_documents::{self, TransitionOutcome};
 use crate::db::repositories::{audit_log, document_files, transport_trace};
 use crate::db::tx::{with_immediate, WriteTxConn};
+use crate::services::write_path::signer_guard::SignerCashierMismatch as Scm;
 use crate::services::write_path::stage_send;
 use crate::services::write_path::types::hex_encode_lower as hex_lower;
 use crate::transports::dps::dto::CheckAck;
@@ -241,6 +242,23 @@ pub struct DispatchHistogram {
     /// branch level).  Operator dashboard surfaces these via
     /// `BOOT_DISPATCH_ERROR` audit rows AND this counter.
     pub dispatch_errors: usize,
+    /// W14a-2b Commit 5 — counter for operator-actionable
+    /// `SignerCashierMismatch::Mismatch` refusals at stage_send 4-pre
+    /// (spec §16.8 1-cashier-per-shift sign-time enforcement).  This
+    /// bucket counts "operator typed wrong cashier id / signer pipeline
+    /// misconfigured" — the operator can fix by reissuing with the
+    /// correct cashier.  Distinct from the structural-bug bucket
+    /// below so dashboards distinguish actionable from engineering
+    /// concern (NIT-C5-5 split, 2026-05-20).
+    pub signer_refused_mismatch: usize,
+    /// W14a-2b Commit 5 — counter for structural caller-bug
+    /// `SignerCashierMismatch` variants (`SignerIdMissing` /
+    /// `ShiftMissingForFiscalDoc` / `ShiftIdMismatch` /
+    /// `CrossFnMismatch`) at stage_send 4-pre.  These indicate
+    /// ingress adapter / dispatcher / caller bugs — operator cannot
+    /// remediate via reissue.  Engineering-tier signal; spikes here
+    /// require ingress / dispatcher investigation.
+    pub signer_refused_structural_bug: usize,
 }
 
 impl DispatchHistogram {
@@ -269,6 +287,8 @@ impl DispatchHistogram {
             + self.prepared_replay_drift_deferred
             + self.error_retryable_budget_exhausted
             + self.dispatch_errors
+            + self.signer_refused_mismatch
+            + self.signer_refused_structural_bug
     }
 
     fn merge(&mut self, other: &DispatchHistogram) {
@@ -296,6 +316,8 @@ impl DispatchHistogram {
         self.prepared_replay_drift_deferred += other.prepared_replay_drift_deferred;
         self.error_retryable_budget_exhausted += other.error_retryable_budget_exhausted;
         self.dispatch_errors += other.dispatch_errors;
+        self.signer_refused_mismatch += other.signer_refused_mismatch;
+        self.signer_refused_structural_bug += other.signer_refused_structural_bug;
     }
 }
 
@@ -1016,7 +1038,15 @@ fn age_and_severity_for_kvt1(
 /// W9.3 — per-FN decision-tree dispatch.  Closed-enum outcome lets
 /// the caller (`App::reconcile_pending`) accumulate per-FN
 /// histograms without re-reading the DB.
+///
+/// Size delta tolerated (W14a-2b NIT-C5-5 added 2 more `usize`
+/// counters to `DispatchHistogram`): `Reconciled` carries the
+/// histogram inline, dwarfing the small unit-like variants
+/// (`Bootstrapped` / `OfflineRefusal`).  Boxing the histogram would
+/// trade allocation cost on every call for memory savings; current
+/// call-path is hot enough that staying inline is the right tradeoff.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum BranchOutcome {
     /// (a) FN row absent → upsert_initial executed.
     Bootstrapped,
@@ -1414,6 +1444,12 @@ pub async fn run_boot_reconciliation(
             "prepared_replay_drift_deferred": histogram.prepared_replay_drift_deferred,
             "error_retryable_budget_exhausted": histogram.error_retryable_budget_exhausted,
             "dispatch_errors": histogram.dispatch_errors,
+            // W14a-2b Commit 5 NIT-C5-2 + NIT-C5-5: signer-refused
+            // split into operator-actionable Mismatch vs structural
+            // caller-bug bucket so dashboards can route alerts to the
+            // right responder (operator vs engineering).
+            "signer_refused_mismatch": histogram.signer_refused_mismatch,
+            "signer_refused_structural_bug": histogram.signer_refused_structural_bug,
         },
         "pending_visited": histogram.total_visited(),
     });
@@ -1832,6 +1868,16 @@ async fn dispatch_error_retryable_by_class(
                 return Ok(());
             }
             match stage_send::run(pool, deps.dps, doc_id, Some(deps.signing_ctx)).await {
+                // W14a-2b Commit 5 NIT-C5-2 + NIT-C5-5: split
+                // SignerRefused off the generic dispatched bucket
+                // AND split Mismatch (operator-actionable) from the
+                // structural caller-bug variants (engineering signal).
+                Ok(stage_send::StageSendOutcome::SignerRefused(Scm::Mismatch { .. })) => {
+                    histogram.signer_refused_mismatch += 1
+                }
+                Ok(stage_send::StageSendOutcome::SignerRefused(_)) => {
+                    histogram.signer_refused_structural_bug += 1
+                }
                 Ok(_) => histogram.error_retryable_dispatched += 1,
                 Err(e) => {
                     emit_dispatch_error(
@@ -2179,11 +2225,15 @@ async fn dispatch_prepared_via_chain(
                 })?;
 
             // (1d) Resolve active_shift only when node_state advertises
-            // an open shift — mirrors stage_acquire step 5.  Recovery
-            // does NOT escalate ShiftInvariantViolation (the live worker
-            // does that on first ingress; boot recovery just passes
-            // None through and lets stage_sign drive on the persisted
-            // doc).
+            // an open shift.  Recovery deliberately uses a NARROWER
+            // filter than stage_acquire step 5 (which post-W14a-2b
+            // §3.6a widens to `Opened | OpenedLocalPendingDrain`):
+            // boot recovery just passes None through and lets stage_sign
+            // drive on the persisted doc — it does NOT escalate
+            // ShiftInvariantViolation (the live worker does that on
+            // first ingress).  Pre-W14a-2b mirror parity dropped on
+            // purpose; offline-context boot uses the same `None`
+            // fallback for both Opened and OpenedLocalPendingDrain.
             let active_shift = match (ns.shift_state, &ns.current_shift_id) {
                 (ShiftState::Opened, Some(sid)) => shifts::get_tx(tx, *sid).await?,
                 _ => None,
@@ -2195,6 +2245,16 @@ async fn dispatch_prepared_via_chain(
                 total_sum_kop,
                 payload_json,
                 payload_sha256_canonical: payload_sha,
+                // W14a-2b Commit 2: boot-phase snapshot reconstruction
+                // path — `signed_by_cashier_id` is NOT persisted on the
+                // ingress_inbox row (only on `fiscal_documents` post-
+                // INSERT PREPARED).  Boot snapshot is used for resume-
+                // detect / canonical-hash verification, not as the
+                // authoritative signer surface — the doc row itself
+                // carries the persisted `signed_by_cashier_id` and
+                // signer_guard reads it from `SendInputs` (Commits 3 +
+                // 5).  Boot-context surface stays `None` here.
+                signed_by_cashier_id: None,
             };
 
             Ok::<SnapshotOutcome, anyhow::Error>(SnapshotOutcome::Ok(Box::new((
@@ -2470,6 +2530,17 @@ async fn dispatch_pending_doc(
                 match dispatch::dispatch_post_sign(pool, doc_id, &doc.fiscal_number).await {
                     Ok(PostSignRoute::Online { .. }) => {
                         match stage_send::run(pool, d.dps, doc_id, Some(d.signing_ctx)).await {
+                            // W14a-2b Commit 5 NIT-C5-2 + NIT-C5-5:
+                            // split SignerRefused off the generic
+                            // signed_dispatched counter; Mismatch =
+                            // operator-actionable bucket; structural
+                            // bug bucket otherwise.
+                            Ok(stage_send::StageSendOutcome::SignerRefused(
+                                Scm::Mismatch { .. },
+                            )) => histogram.signer_refused_mismatch += 1,
+                            Ok(stage_send::StageSendOutcome::SignerRefused(_)) => {
+                                histogram.signer_refused_structural_bug += 1
+                            }
                             Ok(_) => histogram.signed_dispatched += 1,
                             Err(e) => {
                                 emit_dispatch_error(
