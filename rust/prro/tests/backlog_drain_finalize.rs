@@ -198,10 +198,7 @@ async fn audit_count(pool: &SqlitePool, event_type: &str) -> i64 {
         .unwrap()
 }
 
-async fn audit_latest_payload(
-    pool: &SqlitePool,
-    event_type: &str,
-) -> Option<serde_json::Value> {
+async fn audit_latest_payload(pool: &SqlitePool, event_type: &str) -> Option<serde_json::Value> {
     let raw: Option<String> = sqlx::query_scalar(
         "SELECT event_payload_json FROM audit_log WHERE event_type = ? \
          ORDER BY audit_id DESC LIMIT 1",
@@ -255,13 +252,33 @@ async fn c6_pre_w12_partial_when_all_advances_are_deferred_kvt1() {
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
-    let _a = seed_doc(&pool, 1, 100, session_id, shift_id, "OFFLINE_LOCAL_ACK", None).await;
-    let _b = seed_doc(&pool, 2, 101, session_id, shift_id, "OFFLINE_LOCAL_ACK", None).await;
+    let _a = seed_doc(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "OFFLINE_LOCAL_ACK",
+        None,
+    )
+    .await;
+    let _b = seed_doc(
+        &pool,
+        2,
+        101,
+        session_id,
+        shift_id,
+        "OFFLINE_LOCAL_ACK",
+        None,
+    )
+    .await;
 
     let c = carriers(vec![Ok(ack("A")), Ok(ack("B"))]);
     let view = view_for(&c);
 
-    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
 
     // Both docs advanced as DeferredKvt1 → finalize_eligibility blocked.
     assert_eq!(summary.backlog_size_before(), 2);
@@ -294,7 +311,16 @@ async fn c6_partial_when_per_doc_failures_present() {
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
-    let _doc = seed_doc(&pool, 1, 100, session_id, shift_id, "OFFLINE_LOCAL_ACK", None).await;
+    let _doc = seed_doc(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "OFFLINE_LOCAL_ACK",
+        None,
+    )
+    .await;
 
     // TerminalReject → per-doc failure on plain Opened shift (sibling
     // continues; no halt because shift is NOT pending-drain).
@@ -305,7 +331,9 @@ async fn c6_partial_when_per_doc_failures_present() {
     })]);
     let view = view_for(&c);
 
-    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
 
     assert_eq!(summary.per_doc_failures().len(), 1);
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_PARTIAL").await, 1);
@@ -329,7 +357,12 @@ async fn c6_partial_when_per_doc_failures_present() {
 #[tokio::test]
 async fn c6_halt_escalate_path_does_not_fire_partial() {
     let (_d, pool) = fresh_pool().await;
-    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::OpenedLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        NodeMode::GoingOnline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
     // Need a pending-drain shift + current_shift_id wired.
     let shift_id = ShiftId::new();
     sqlx::query(
@@ -351,7 +384,16 @@ async fn c6_halt_escalate_path_does_not_fire_partial() {
         .unwrap();
 
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
-    let _doc = seed_doc(&pool, 1, 100, session_id, shift_id, "OFFLINE_LOCAL_ACK", None).await;
+    let _doc = seed_doc(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "OFFLINE_LOCAL_ACK",
+        None,
+    )
+    .await;
 
     // TerminalReject on pending-drain shift → manual-recon class →
     // halt-escalate (NOT PARTIAL).
@@ -362,7 +404,9 @@ async fn c6_halt_escalate_path_does_not_fire_partial() {
     })]);
     let view = view_for(&c);
 
-    let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+    let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
 
     // Halt-escalate audit fired; finalize branch (PARTIAL/COMPLETED)
     // was NOT reached because drain returned early.
@@ -388,7 +432,9 @@ async fn c6_skip_paths_do_not_fire_partial() {
         seed_node_state(&pool, NodeMode::Offline, ShiftState::Opened).await;
         let c = carriers(vec![]);
         let view = view_for(&c);
-        let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+        let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+            .await
+            .unwrap();
         assert_eq!(
             audit_count(&pool, "OFFLINE_DRAIN_SKIPPED_NOT_GOING_ONLINE").await,
             1
@@ -403,7 +449,9 @@ async fn c6_skip_paths_do_not_fire_partial() {
         seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
         let c = carriers(vec![]);
         let view = view_for(&c);
-        let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+        let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+            .await
+            .unwrap();
         assert_eq!(
             audit_count(&pool, "OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG").await,
             1

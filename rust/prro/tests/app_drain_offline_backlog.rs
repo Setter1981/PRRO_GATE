@@ -300,10 +300,7 @@ async fn app_drain_partial_path_pre_w12_steady_state() {
     // Full audit chain: STARTED + SESSION_DRAIN_STARTED + 2 DOC_ADVANCED
     // + PARTIAL.
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_STARTED").await, 1);
-    assert_eq!(
-        audit_count(&pool, "OFFLINE_SESSION_DRAIN_STARTED").await,
-        1
-    );
+    assert_eq!(audit_count(&pool, "OFFLINE_SESSION_DRAIN_STARTED").await, 1);
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_ADVANCED").await, 2);
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_PARTIAL").await, 1);
 

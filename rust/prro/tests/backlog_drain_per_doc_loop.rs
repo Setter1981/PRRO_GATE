@@ -236,10 +236,7 @@ async fn audit_count(pool: &SqlitePool, event_type: &str) -> i64 {
         .unwrap()
 }
 
-async fn audit_payloads_for(
-    pool: &SqlitePool,
-    event_type: &str,
-) -> Vec<serde_json::Value> {
+async fn audit_payloads_for(pool: &SqlitePool, event_type: &str) -> Vec<serde_json::Value> {
     let raw: Vec<Option<String>> = sqlx::query_scalar(
         "SELECT event_payload_json FROM audit_log \
          WHERE event_type = ? \
@@ -307,7 +304,9 @@ async fn c4_happy_path_two_docs_advance_to_kvt1_and_emit_doc_advanced() {
     let carriers = carriers_with_responses(vec![Ok(ack("DPS-FN-A")), Ok(ack("DPS-FN-B"))]);
     let view = view_for(&carriers);
 
-    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
 
     assert_eq!(summary.backlog_size_before(), 2);
     assert_eq!(
@@ -361,7 +360,9 @@ async fn c4_routed_terminal_reject_records_wire_routing_failure_class() {
     })]);
     let view = view_for(&carriers);
 
-    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
 
     assert_eq!(summary.backlog_size_before(), 1);
     assert_eq!(summary.advanced_to_kvt1(), 0);
@@ -376,7 +377,10 @@ async fn c4_routed_terminal_reject_records_wire_routing_failure_class() {
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_FAILED").await, 1);
 
     let failed_payloads = audit_payloads_for(&pool, "OFFLINE_DRAIN_DOC_FAILED").await;
-    assert_eq!(failed_payloads[0]["failure_class"], "wire_routing_terminal_reject");
+    assert_eq!(
+        failed_payloads[0]["failure_class"],
+        "wire_routing_terminal_reject"
+    );
     assert_eq!(failed_payloads[0]["retry_class"], "TerminalReject");
 }
 
@@ -399,7 +403,9 @@ async fn c4_signer_refused_records_signer_refused_class_and_sibling_continues() 
     let carriers = carriers_with_responses(vec![Ok(ack("DPS-FN-B-ONLY"))]);
     let view = view_for(&carriers);
 
-    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
 
     assert_eq!(summary.backlog_size_before(), 2);
     assert_eq!(summary.advanced_to_kvt1(), 1, "only doc B advances");
@@ -449,14 +455,13 @@ async fn c4_processes_backlog_in_lnd_asc_order() {
     // 3 OK responses — assigned in stub-queue order, which equals the
     // drain processing order.  Each id is distinct so we can pin
     // which doc consumed which response.
-    let carriers = carriers_with_responses(vec![
-        Ok(ack("LND-2")),
-        Ok(ack("LND-5")),
-        Ok(ack("LND-8")),
-    ]);
+    let carriers =
+        carriers_with_responses(vec![Ok(ack("LND-2")), Ok(ack("LND-5")), Ok(ack("LND-8"))]);
     let view = view_for(&carriers);
 
-    let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+    let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
 
     // Verify ordering via audit row sequence — audit_log.audit_id is
     // AUTOINCREMENT, so ASC order == chronological emit order.  Each
@@ -517,7 +522,9 @@ async fn c4_accounting_advanced_plus_failures_equals_backlog() {
     ]);
     let view = view_for(&carriers);
 
-    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
 
     assert_eq!(summary.backlog_size_before(), 3);
     assert_eq!(summary.advanced_to_kvt1(), 2, "doc A + doc C");
@@ -573,9 +580,13 @@ async fn c4_pending_drain_shift_reject_halts_and_transitions_shift_to_manual() {
     // a linked shift row in the same state.  This is the operator-
     // confirmed pending-drain configuration where any drain reject
     // = Manual.
-    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::OpenedLocalPendingDrain).await;
-    let shift_id =
-        seed_shift_with_state(&pool, CASHIER_OK, "OPENED_LOCAL_PENDING_DRAIN").await;
+    seed_node_state(
+        &pool,
+        NodeMode::GoingOnline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
+    let shift_id = seed_shift_with_state(&pool, CASHIER_OK, "OPENED_LOCAL_PENDING_DRAIN").await;
     set_node_current_shift(&pool, shift_id).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
 
@@ -604,7 +615,9 @@ async fn c4_pending_drain_shift_reject_halts_and_transitions_shift_to_manual() {
     ]);
     let view = view_for(&carriers);
 
-    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
 
     // Drain halted after doc B: doc A advanced, doc B failed, doc C
     // never visited.
@@ -662,14 +675,16 @@ async fn c4_pending_drain_shift_reject_halts_and_transitions_shift_to_manual() {
     let halt_payloads = audit_payloads_for(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await;
     assert_eq!(halt_payloads.len(), 1);
     assert_eq!(halt_payloads[0]["fiscal_number"], FN);
-    assert_eq!(halt_payloads[0]["failure_class"], "wire_routing_terminal_reject");
+    assert_eq!(
+        halt_payloads[0]["failure_class"],
+        "wire_routing_terminal_reject"
+    );
     assert_eq!(
         halt_payloads[0]["current_shift_state"],
         "OPENED_LOCAL_PENDING_DRAIN"
     );
     assert_eq!(
-        halt_payloads[0]["halt_position"],
-        1,
+        halt_payloads[0]["halt_position"], 1,
         "doc B is at 0-based index 1 in the backlog"
     );
 }
@@ -684,9 +699,13 @@ async fn c4_pending_drain_shift_reject_halts_and_transitions_shift_to_manual() {
 #[tokio::test]
 async fn c4_pending_drain_shift_transient_retry_sibling_continues_no_halt() {
     let (_d, pool) = fresh_pool().await;
-    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::OpenedLocalPendingDrain).await;
-    let shift_id =
-        seed_shift_with_state(&pool, CASHIER_OK, "OPENED_LOCAL_PENDING_DRAIN").await;
+    seed_node_state(
+        &pool,
+        NodeMode::GoingOnline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
+    let shift_id = seed_shift_with_state(&pool, CASHIER_OK, "OPENED_LOCAL_PENDING_DRAIN").await;
     set_node_current_shift(&pool, shift_id).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
 
@@ -708,7 +727,9 @@ async fn c4_pending_drain_shift_transient_retry_sibling_continues_no_halt() {
     ]);
     let view = view_for(&carriers);
 
-    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
 
     assert_eq!(summary.backlog_size_before(), 3);
     assert_eq!(
@@ -754,13 +775,11 @@ async fn c4_pending_drain_shift_transient_retry_sibling_continues_no_halt() {
     let failed_payloads = audit_payloads_for(&pool, "OFFLINE_DRAIN_DOC_FAILED").await;
     assert_eq!(failed_payloads.len(), 1);
     assert_eq!(
-        failed_payloads[0]["retry_class"],
-        "TransientRetry",
+        failed_payloads[0]["retry_class"], "TransientRetry",
         "wire error_routing routed Transport → TransientRetry"
     );
     assert_eq!(
-        failed_payloads[0]["manual_recon_class"],
-        false,
+        failed_payloads[0]["manual_recon_class"], false,
         "TransientRetry is NOT manual-recon class — operator dashboards filter on this"
     );
 }

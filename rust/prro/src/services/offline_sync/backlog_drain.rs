@@ -192,11 +192,7 @@ impl DrainSummary {
     /// `false` for wire-send completions.  Counted in
     /// `advanced_via_lastchk_replay` regardless of W12 outcome
     /// (replay can land at Kvt1 too if W12 stub is in place).
-    pub fn record_doc_advanced(
-        &mut self,
-        outcome: &W12ConfirmOutcome,
-        via_lastchk_replay: bool,
-    ) {
+    pub fn record_doc_advanced(&mut self, outcome: &W12ConfirmOutcome, via_lastchk_replay: bool) {
         match outcome {
             W12ConfirmOutcome::DeferredKvt1 => self.advanced_to_kvt1 += 1,
             W12ConfirmOutcome::Acked { .. } => self.advanced_to_ack += 1,
@@ -253,9 +249,7 @@ impl DrainSummary {
                 self.finalized = true;
                 Ok(())
             }
-            FinalizeEligibility::NotEligible { reason } => {
-                Err(FinalizeError::NotEligible(reason))
-            }
+            FinalizeEligibility::NotEligible { reason } => Err(FinalizeError::NotEligible(reason)),
         }
     }
 
@@ -771,9 +765,7 @@ async fn process_one_doc(
         DocState::OfflineLocalAck | DocState::ErrorRetryable => {
             process_via_stage_send(pool, deps, fiscal_number, doc, summary).await
         }
-        DocState::Sent => {
-            process_via_lastchk_replay(pool, deps, fiscal_number, doc, summary).await
-        }
+        DocState::Sent => process_via_lastchk_replay(pool, deps, fiscal_number, doc, summary).await,
         DocState::Kvt1 => process_via_w12_only(pool, fiscal_number, doc, summary).await,
         other => Err(BootError::Internal(format!(
             "backlog_drain({fiscal_number}): cohort walker returned unexpected \
@@ -1452,8 +1444,7 @@ async fn escalate_drain_to_manual(
     let failure_class_owned = failure_class.to_string();
     let outcome = with_immediate(pool, move |tx| {
         Box::pin(async move {
-            let outcome =
-                shifts::transition_state(tx, shift_id, from_state, to_state).await?;
+            let outcome = shifts::transition_state(tx, shift_id, from_state, to_state).await?;
             if let shifts::TransitionOutcome::Applied = outcome {
                 mirror_node_state_shift_state_tx(
                     tx,
@@ -1722,13 +1713,8 @@ async fn commit_finalize_envelope(
             // no shift transition.
             if let Some(target) = shift_finalize_target {
                 let shift_id = shift_id_opt.expect("checked before envelope");
-                let shift_outcome = shifts::transition_state(
-                    tx,
-                    shift_id,
-                    shift_state_from,
-                    target,
-                )
-                .await?;
+                let shift_outcome =
+                    shifts::transition_state(tx, shift_id, shift_state_from, target).await?;
                 if !matches!(shift_outcome, shifts::TransitionOutcome::Applied) {
                     return Err(anyhow::anyhow!(
                         "backlog_drain({fn_id}): finalize CAS shift {from} → \
@@ -1789,12 +1775,12 @@ async fn commit_finalize_envelope(
     // would Err if anything changed mid-envelope — but we already
     // checked eligibility before opening the tx, so this is a
     // defensive double-check.
-    summary
-        .mark_finalized()
-        .map_err(|err| BootError::Internal(format!(
+    summary.mark_finalized().map_err(|err| {
+        BootError::Internal(format!(
             "backlog_drain({fiscal_number}): mark_finalized failed after envelope \
              commit: {err}"
-        )))?;
+        ))
+    })?;
     Ok(())
 }
 
@@ -2019,10 +2005,7 @@ mod eligible_arm_tests {
             .unwrap()
     }
 
-    async fn audit_latest_payload(
-        pool: &sqlx::SqlitePool,
-        event_type: &str,
-    ) -> serde_json::Value {
+    async fn audit_latest_payload(pool: &sqlx::SqlitePool, event_type: &str) -> serde_json::Value {
         let raw: String = sqlx::query_scalar(
             "SELECT event_payload_json FROM audit_log \
              WHERE event_type = ? ORDER BY audit_id DESC LIMIT 1",
@@ -2042,10 +2025,7 @@ mod eligible_arm_tests {
             .unwrap()
     }
 
-    async fn read_session_state(
-        pool: &sqlx::SqlitePool,
-        session_id: OfflineSessionId,
-    ) -> String {
+    async fn read_session_state(pool: &sqlx::SqlitePool, session_id: OfflineSessionId) -> String {
         sqlx::query_scalar("SELECT state FROM offline_sessions WHERE offline_session_id = ?")
             .bind(session_id)
             .fetch_one(pool)

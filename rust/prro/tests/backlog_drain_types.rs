@@ -167,7 +167,10 @@ fn finalize_eligibility_blocked_by_per_doc_failure_even_if_others_acked() {
         },
         false,
     );
-    s.record_doc_failure(DocumentId::new(), failure_class_for(FailureClass::Transport).into());
+    s.record_doc_failure(
+        DocumentId::new(),
+        failure_class_for(FailureClass::Transport).into(),
+    );
     match s.finalize_eligibility() {
         FinalizeEligibility::NotEligible {
             reason: NotEligibleReason::PerDocFailuresPresent { count: 1 },
@@ -321,7 +324,10 @@ fn failure_class_stable_strings_table_covers_all_12_variants() {
         (FailureClass::Decode, "decode"),
         (FailureClass::Internal, "internal"),
         (FailureClass::NotFound, "not_found"),
-        (FailureClass::OfflineFiscalNoMissing, "offline_fiscal_no_missing"),
+        (
+            FailureClass::OfflineFiscalNoMissing,
+            "offline_fiscal_no_missing",
+        ),
     ];
     for (cls, expected) in cases {
         assert_eq!(failure_class_for(*cls), *expected, "class {cls:?}");

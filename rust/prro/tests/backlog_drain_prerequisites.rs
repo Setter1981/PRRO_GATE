@@ -159,10 +159,7 @@ async fn audit_count(pool: &SqlitePool, event_type: &str) -> i64 {
         .unwrap()
 }
 
-async fn audit_latest_payload(
-    pool: &SqlitePool,
-    event_type: &str,
-) -> Option<serde_json::Value> {
+async fn audit_latest_payload(pool: &SqlitePool, event_type: &str) -> Option<serde_json::Value> {
     let raw: Option<String> = sqlx::query_scalar(
         "SELECT event_payload_json FROM audit_log \
          WHERE event_type = ? \
@@ -217,7 +214,9 @@ async fn c3_skips_when_mode_not_going_online() {
 
     let carriers = build_deps_carriers();
     let view = view_for(&carriers);
-    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
 
     assert_eq!(summary.fiscal_number(), FN);
     assert_eq!(summary.backlog_size_before(), 0);
@@ -263,7 +262,9 @@ async fn c3_skips_when_backlog_empty() {
 
     let carriers = build_deps_carriers();
     let view = view_for(&carriers);
-    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
 
     assert_eq!(summary.backlog_size_before(), 0);
     assert_eq!(
@@ -276,10 +277,7 @@ async fn c3_skips_when_backlog_empty() {
         "wrong skip class must not fire"
     );
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_STARTED").await, 0);
-    assert_eq!(
-        audit_count(&pool, "OFFLINE_SESSION_DRAIN_STARTED").await,
-        0
-    );
+    assert_eq!(audit_count(&pool, "OFFLINE_SESSION_DRAIN_STARTED").await, 0);
 }
 
 // ─── Test 3: happy path — Open → Draining + STARTED audit ────────────
@@ -295,7 +293,9 @@ async fn c3_transitions_session_open_to_draining_and_emits_started() {
 
     let carriers = build_deps_carriers();
     let view = view_for(&carriers);
-    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
 
     // C3 reports the backlog size but does NOT mutate per-doc counters
     // (per-doc loop deferred to C4); finalized stays false.
@@ -312,10 +312,7 @@ async fn c3_transitions_session_open_to_draining_and_emits_started() {
     );
 
     // Both audit events emitted, exactly once each.
-    assert_eq!(
-        audit_count(&pool, "OFFLINE_SESSION_DRAIN_STARTED").await,
-        1
-    );
+    assert_eq!(audit_count(&pool, "OFFLINE_SESSION_DRAIN_STARTED").await, 1);
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_STARTED").await, 1);
 
     let session_hex_expected: String = session_id
@@ -365,7 +362,9 @@ async fn c3_idempotent_when_session_already_draining() {
 
     let carriers = build_deps_carriers();
     let view = view_for(&carriers);
-    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
 
     assert_eq!(summary.backlog_size_before(), 1);
 
@@ -433,8 +432,5 @@ async fn c3_drain_skips_when_only_closed_session_exists() {
         "audit payload must carry the distinct reason field for forensic clarity"
     );
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_STARTED").await, 0);
-    assert_eq!(
-        audit_count(&pool, "OFFLINE_SESSION_DRAIN_STARTED").await,
-        0
-    );
+    assert_eq!(audit_count(&pool, "OFFLINE_SESSION_DRAIN_STARTED").await, 0);
 }
