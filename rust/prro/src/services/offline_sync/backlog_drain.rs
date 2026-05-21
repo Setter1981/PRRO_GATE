@@ -77,7 +77,7 @@
 
 use crate::app::BootError;
 use crate::db::models::enums::{DocState, NodeMode, OfflineSessionState, Severity, ShiftState};
-use crate::db::models::ids::{DocumentId, ShiftId};
+use crate::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
 use crate::db::repositories::fiscal_documents::TransitionOutcome;
 use crate::db::repositories::{
     audit_log, document_files, fiscal_documents, node_state, offline_sessions, shifts,
@@ -654,6 +654,30 @@ pub async fn drain(
             }
         }
     }
+
+    // ─── Step 6 (C6): finalization branch ────────────────────────────
+    //
+    // Spec §2.4 + amendment 2026-05-21: evaluate
+    // `summary.finalize_eligibility()` and route to one of:
+    //
+    //   - Eligible → CAS `node_state.mode: GoingOnline → Online`,
+    //     CAS `offline_session: Draining → Closed`, mark summary
+    //     finalized, emit `OFFLINE_DRAIN_COMPLETED` audit.  All four
+    //     writes commit in ONE `with_immediate` envelope so the
+    //     drain cannot leave half-finalized state (mode flipped but
+    //     session still Draining, etc).
+    //   - NotEligible{reason} → emit `OFFLINE_DRAIN_PARTIAL` audit
+    //     with the typed reason payload.  Node + session stay in
+    //     their pre-drain states; next drain tick re-evaluates.
+    //
+    // Operator-pinned pre-W12 invariant: the C5 stub
+    // `apply_w12_confirmation` ALWAYS returns `DeferredKvt1`, so
+    // `advanced_to_kvt1 > 0` blocks finalize via
+    // `NotEligibleReason::DocsDeferredAtKvt1`.  The Eligible branch
+    // is structurally unreachable pre-W12 (drain cannot synthesize
+    // real Ack proof).  W12 PR plugs `lastChk` evidence → Acked
+    // outcomes → eligibility flips to Eligible.
+    finalize_drain(pool, fiscal_number, session_id, &ns, &mut summary).await?;
     Ok(summary)
 }
 
@@ -1503,6 +1527,258 @@ async fn mirror_node_state_shift_state_tx(
     Ok(())
 }
 
+/// W9b C6 finalization branch (spec §2.4 + amendment 2026-05-21).
+///
+/// Evaluates [`DrainSummary::finalize_eligibility`] and routes:
+///
+/// - `Eligible` → CAS `node_state.mode: GoingOnline → Online` +
+///   CAS `offline_session: Draining → Closed` +
+///   `OFFLINE_SESSION_CLOSED` audit + `OFFLINE_DRAIN_COMPLETED`
+///   audit, all in ONE `with_immediate` envelope.  Both CAS guards
+///   use the from-state value so a concurrent writer cannot smuggle
+///   a different mode/state past finalize.  Non-`Applied` outcome
+///   on either CAS rolls back the entire envelope and propagates
+///   as `BootError::ReconciliationFailed` (single-writer invariant
+///   breach per ADR-M3-A10).  `summary.mark_finalized()` runs
+///   **after** the envelope commits (defensive double-check; the
+///   in-memory mutation cannot rollback with the DB, so the
+///   COMPLETED audit payload encodes `finalized=true` directly).
+/// - `NotEligible{reason}` → emit `OFFLINE_DRAIN_PARTIAL` audit
+///   (Warning) with the typed `reason` payload + summary
+///   read-only accessors.  Node + session stay in their pre-drain
+///   states (`GoingOnline` + `Draining`); next drain tick
+///   re-evaluates.
+///
+/// Pre-W12 operator-pinned invariant: drain can finalize ONLY when
+/// every doc returned `Acked { server_fiscal_no }` — pre-W12 stub
+/// always returns `DeferredKvt1` so `advanced_to_kvt1 > 0` blocks
+/// eligibility via `NotEligibleReason::DocsDeferredAtKvt1`.  The
+/// Eligible arm is structurally unreachable until W12 PR plugs in
+/// real lastChk evidence.
+async fn finalize_drain(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    session_id: OfflineSessionId,
+    ns: &crate::db::repositories::node_state::NodeStateRow,
+    summary: &mut DrainSummary,
+) -> Result<(), BootError> {
+    match summary.finalize_eligibility() {
+        FinalizeEligibility::Eligible => {
+            commit_finalize_envelope(pool, fiscal_number, session_id, ns, summary).await
+        }
+        FinalizeEligibility::NotEligible { reason } => {
+            emit_partial(pool, fiscal_number, session_id, summary, &reason).await
+        }
+    }
+}
+
+/// Eligible-arm helper: atomic node-mode CAS + session CAS +
+/// `OFFLINE_SESSION_CLOSED` audit + `OFFLINE_DRAIN_COMPLETED` audit
+/// in ONE `with_immediate` envelope.  `summary.mark_finalized()`
+/// runs **after** the envelope commits (defensive double-check);
+/// the COMPLETED audit payload encodes `finalized=true` directly to
+/// avoid the in-memory/audit-row drift that would otherwise result
+/// from the post-envelope mutation ordering.
+async fn commit_finalize_envelope(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    session_id: OfflineSessionId,
+    ns: &crate::db::repositories::node_state::NodeStateRow,
+    summary: &mut DrainSummary,
+) -> Result<(), BootError> {
+    let fiscal_number_owned = fiscal_number.to_string();
+    let node_mode_from = ns.mode;
+    // MED-C6-1 fix (2026-05-21): override `finalized=true` in the
+    // COMPLETED payload.  `summary.mark_finalized()` runs AFTER the
+    // envelope commits, so without this override the audit row would
+    // carry `finalized=false` (the summary's in-memory state at
+    // build time).  Eligible arm intent is "we are finalizing"; if
+    // the envelope rolls back, the audit row never lands either, so
+    // the optimistic `true` is structurally honest.
+    let mut payload = build_finalize_payload(summary, session_id, "COMPLETED", None);
+    payload["finalized"] = serde_json::Value::Bool(true);
+    let payload_owned = payload.to_string();
+    // MED-C6-2 fix (2026-05-21): W5 session-lifecycle audit shape for
+    // the Draining → Closed transition (matches `OfflineSessionService::
+    // close_session` convention).
+    let session_id_hex = hex_lower(session_id.as_bytes());
+    let session_closed_payload = serde_json::json!({
+        "offline_session_id": session_id_hex,
+        "from": OfflineSessionState::Draining.as_str(),
+        "to": OfflineSessionState::Closed.as_str(),
+        "reason_abort": serde_json::Value::Null,
+    });
+    let session_closed_payload_owned = session_closed_payload.to_string();
+    let session_id_hex_owned = session_id_hex.clone();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // (1) CAS node_state.mode GoingOnline → Online (W8 inverse).
+            // Symmetric bind for both to-state and from-state (LOW-C6-2
+            // 2026-05-21): str_enum drift would otherwise silently
+            // skip the CAS if NodeMode::Online wire form ever changed.
+            let mode_rows = sqlx::query(
+                "UPDATE node_state SET mode = ? \
+                 WHERE fiscal_number = ? AND mode = ?",
+            )
+            .bind(NodeMode::Online)
+            .bind(&fiscal_number_owned)
+            .bind(node_mode_from)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+            if mode_rows != 1 {
+                return Err(anyhow::anyhow!(
+                    "backlog_drain({fn_id}): finalize CAS node_state.mode \
+                     {from} → ONLINE produced rows_affected={rows} (App reconcile \
+                     mutex should prevent races)",
+                    fn_id = fiscal_number_owned,
+                    from = node_mode_from.as_str(),
+                    rows = mode_rows,
+                ));
+            }
+            // (2) CAS offline_session Draining → Closed via W5 helper.
+            let session_outcome = offline_sessions::transition_state(
+                tx,
+                session_id,
+                OfflineSessionState::Draining,
+                OfflineSessionState::Closed,
+                None,
+            )
+            .await?;
+            if session_outcome != TransitionOutcome::Applied {
+                return Err(anyhow::anyhow!(
+                    "backlog_drain({fn_id}): finalize CAS session \
+                     Draining → Closed produced {outcome} for session {sid}",
+                    fn_id = fiscal_number_owned,
+                    outcome = outcome_as_str(session_outcome),
+                    sid = session_id_hex_owned,
+                ));
+            }
+            // (3) Audit OFFLINE_SESSION_CLOSED (W5 session-lifecycle
+            // contract — MED-C6-2 2026-05-21).
+            audit_log::append_tx(
+                tx,
+                "offline_session",
+                &session_id_hex_owned,
+                "OFFLINE_SESSION_CLOSED",
+                Severity::Info,
+                None,
+                Some(&session_closed_payload_owned),
+            )
+            .await?;
+            // (4) Audit OFFLINE_DRAIN_COMPLETED.
+            audit_log::append_tx(
+                tx,
+                AUDIT_ENTITY_DRAIN_FN,
+                &fiscal_number_owned,
+                "OFFLINE_DRAIN_COMPLETED",
+                Severity::Info,
+                None,
+                Some(&payload_owned),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(|source| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source,
+    })?;
+    // (4) Mark summary finalized AFTER envelope commits.  The typed
+    // `mark_finalized()` guard re-runs `finalize_eligibility()` and
+    // would Err if anything changed mid-envelope — but we already
+    // checked eligibility before opening the tx, so this is a
+    // defensive double-check.
+    summary
+        .mark_finalized()
+        .map_err(|err| BootError::Internal(format!(
+            "backlog_drain({fiscal_number}): mark_finalized failed after envelope \
+             commit: {err}"
+        )))?;
+    Ok(())
+}
+
+/// NotEligible-arm helper: emit `OFFLINE_DRAIN_PARTIAL` audit with the
+/// typed reason payload.
+async fn emit_partial(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    session_id: OfflineSessionId,
+    summary: &DrainSummary,
+    reason: &NotEligibleReason,
+) -> Result<(), BootError> {
+    let payload = build_finalize_payload(summary, session_id, "PARTIAL", Some(reason));
+    audit_log::append(
+        pool,
+        AUDIT_ENTITY_DRAIN_FN,
+        fiscal_number,
+        "OFFLINE_DRAIN_PARTIAL",
+        Severity::Warning,
+        None,
+        Some(&payload.to_string()),
+    )
+    .await
+    .map_err(BootError::Database)?;
+    Ok(())
+}
+
+/// Build `OFFLINE_DRAIN_COMPLETED` / `OFFLINE_DRAIN_PARTIAL` audit
+/// payload from the summary state.  Shared shape so operator
+/// dashboards parsing on `outcome` field can switch on the literal
+/// value without dual schemas.
+fn build_finalize_payload(
+    summary: &DrainSummary,
+    session_id: OfflineSessionId,
+    outcome: &'static str,
+    reason: Option<&NotEligibleReason>,
+) -> serde_json::Value {
+    let per_doc_failures: Vec<serde_json::Value> = summary
+        .per_doc_failures()
+        .iter()
+        .map(|(doc_id, class)| {
+            serde_json::json!({
+                "document_id": hex_lower(doc_id.as_bytes()),
+                "failure_class": class,
+            })
+        })
+        .collect();
+    let mut payload = serde_json::json!({
+        "fiscal_number": summary.fiscal_number(),
+        "session_id": hex_lower(session_id.as_bytes()),
+        "outcome": outcome,
+        "backlog_size_before": summary.backlog_size_before(),
+        "advanced_to_ack": summary.advanced_to_ack(),
+        "advanced_to_kvt1": summary.advanced_to_kvt1(),
+        "advanced_via_lastchk_replay": summary.advanced_via_lastchk_replay(),
+        "per_doc_failures": per_doc_failures,
+        "finalized": summary.finalized(),
+    });
+    if let Some(reason) = reason {
+        payload["not_eligible_reason"] = not_eligible_reason_as_json(reason);
+    }
+    payload
+}
+
+/// Stable JSON encoding of [`NotEligibleReason`] for audit consumers.
+fn not_eligible_reason_as_json(reason: &NotEligibleReason) -> serde_json::Value {
+    match reason {
+        NotEligibleReason::PerDocFailuresPresent { count } => serde_json::json!({
+            "kind": "PerDocFailuresPresent",
+            "count": count,
+        }),
+        NotEligibleReason::DocsDeferredAtKvt1 { count } => serde_json::json!({
+            "kind": "DocsDeferredAtKvt1",
+            "count": count,
+        }),
+        NotEligibleReason::AckCountMismatch { expected, actual } => serde_json::json!({
+            "kind": "AckCountMismatch",
+            "expected": expected,
+            "actual": actual,
+        }),
+    }
+}
+
 /// Emit `OFFLINE_DRAIN_DOC_FAILED` audit row.  Severity is always
 /// `Warning` per spec §4 (operator dashboards filter by severity).
 async fn emit_doc_failed(
@@ -1572,5 +1848,189 @@ fn failure_class_for_send_err(err: &StageSendError) -> FailureClass {
         | StageSendError::TraceMissingAtComplete { .. }
         | StageSendError::Db(_)
         | StageSendError::Internal(_) => FailureClass::Internal,
+    }
+}
+
+// ─── C6 amend2 (MED-C6-3): Eligible-arm integration tests ────────────
+//
+// Pre-W12 the C5 `apply_w12_confirmation` stub always returns
+// `DeferredKvt1`, so the public `drain()` entry cannot naturally
+// reach the Eligible arm.  These inline `#[cfg(test)]` tests
+// construct a `DrainSummary` with `Acked` outcomes manually + call
+// `commit_finalize_envelope` directly (crate-internal access) to
+// prove the Eligible-arm CAS chain + audit emission contract pre-W12.
+// W12 PR replaces these with full-flow integration tests once
+// real Ack proof is constructible from drain.
+
+#[cfg(test)]
+mod eligible_arm_tests {
+    use super::*;
+    use crate::db::models::ids::OfflineSessionId;
+    use crate::db::repositories::node_state::NodeStateRow;
+
+    const FN: &str = "1234567890";
+
+    async fn fresh_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = crate::db::open_pool(&dir.path().join("c6_eligible.db"))
+            .await
+            .expect("open_pool runs migrations");
+        sqlx::query(
+            "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+             VALUES (?, '12345678', 'test')",
+        )
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
+        (dir, pool)
+    }
+
+    async fn seed_node_state_going_online(pool: &sqlx::SqlitePool) -> NodeStateRow {
+        sqlx::query(
+            "INSERT INTO node_state(fiscal_number, mode, shift_state, next_lnd) \
+             VALUES (?, 'GOING_ONLINE', 'OPENED', 100)",
+        )
+        .bind(FN)
+        .execute(pool)
+        .await
+        .unwrap();
+        node_state::get(pool, FN).await.unwrap().unwrap()
+    }
+
+    async fn seed_draining_session(pool: &sqlx::SqlitePool) -> OfflineSessionId {
+        let session_id = OfflineSessionId::new();
+        sqlx::query(
+            "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at, drained_at) \
+             VALUES (?, ?, 'DRAINING', '2026-05-21T00:00:00Z', '2026-05-21T00:00:01Z')",
+        )
+        .bind(session_id)
+        .bind(FN)
+        .execute(pool)
+        .await
+        .unwrap();
+        session_id
+    }
+
+    async fn audit_count(pool: &sqlx::SqlitePool, event_type: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE event_type = ?")
+            .bind(event_type)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn audit_latest_payload(
+        pool: &sqlx::SqlitePool,
+        event_type: &str,
+    ) -> serde_json::Value {
+        let raw: String = sqlx::query_scalar(
+            "SELECT event_payload_json FROM audit_log \
+             WHERE event_type = ? ORDER BY audit_id DESC LIMIT 1",
+        )
+        .bind(event_type)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    async fn read_node_mode(pool: &sqlx::SqlitePool) -> String {
+        sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+            .bind(FN)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn read_session_state(
+        pool: &sqlx::SqlitePool,
+        session_id: OfflineSessionId,
+    ) -> String {
+        sqlx::query_scalar("SELECT state FROM offline_sessions WHERE offline_session_id = ?")
+            .bind(session_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// MED-C6-3 (2026-05-21): Eligible-arm full contract.  Construct
+    /// a DrainSummary with 2 Acked outcomes manually, call
+    /// `commit_finalize_envelope` directly, assert:
+    ///   - `node_state.mode` GoingOnline → Online
+    ///   - `offline_session.state` Draining → Closed
+    ///   - `OFFLINE_SESSION_CLOSED` audit emitted with W5 payload shape
+    ///   - `OFFLINE_DRAIN_COMPLETED` audit emitted with `finalized=true`
+    ///   - `summary.finalized() == true` post-helper
+    #[tokio::test]
+    async fn c6_eligible_arm_commits_mode_session_audits_and_finalizes_summary() {
+        let (_d, pool) = fresh_pool().await;
+        let ns = seed_node_state_going_online(&pool).await;
+        let session_id = seed_draining_session(&pool).await;
+
+        // Build a DrainSummary with 2 Acked outcomes → finalize_eligibility
+        // returns Eligible.
+        let mut summary = DrainSummary::new(FN.to_string(), 2);
+        summary.record_doc_advanced(
+            &W12ConfirmOutcome::Acked {
+                server_fiscal_no: "DPS-A".into(),
+            },
+            false,
+        );
+        summary.record_doc_advanced(
+            &W12ConfirmOutcome::Acked {
+                server_fiscal_no: "DPS-B".into(),
+            },
+            false,
+        );
+        assert!(matches!(
+            summary.finalize_eligibility(),
+            FinalizeEligibility::Eligible
+        ));
+
+        commit_finalize_envelope(&pool, FN, session_id, &ns, &mut summary)
+            .await
+            .expect("Eligible commit must succeed on properly-seeded fixture");
+
+        // DB state.
+        assert_eq!(read_node_mode(&pool).await, "ONLINE");
+        assert_eq!(read_session_state(&pool, session_id).await, "CLOSED");
+
+        // Audit emission.
+        assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_COMPLETED").await, 1);
+        assert_eq!(audit_count(&pool, "OFFLINE_SESSION_CLOSED").await, 1);
+
+        // OFFLINE_DRAIN_COMPLETED payload contract (MED-C6-1 fix).
+        let completed = audit_latest_payload(&pool, "OFFLINE_DRAIN_COMPLETED").await;
+        assert_eq!(completed["outcome"], "COMPLETED");
+        assert_eq!(
+            completed["finalized"], true,
+            "MED-C6-1: COMPLETED audit MUST carry finalized=true"
+        );
+        assert_eq!(completed["advanced_to_ack"], 2);
+        assert_eq!(completed["advanced_to_kvt1"], 0);
+        assert_eq!(completed["backlog_size_before"], 2);
+        assert_eq!(completed["per_doc_failures"].as_array().unwrap().len(), 0);
+
+        // OFFLINE_SESSION_CLOSED payload contract (MED-C6-2 fix; W5 shape).
+        let closed = audit_latest_payload(&pool, "OFFLINE_SESSION_CLOSED").await;
+        assert_eq!(closed["from"], "DRAINING");
+        assert_eq!(closed["to"], "CLOSED");
+        assert!(
+            closed["reason_abort"].is_null(),
+            "W5 close payload: reason_abort=null on normal close"
+        );
+        let session_hex: String = session_id
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(closed["offline_session_id"], session_hex);
+
+        // Summary state.
+        assert!(
+            summary.finalized(),
+            "summary.mark_finalized() MUST set finalized=true after Eligible envelope commits"
+        );
     }
 }
