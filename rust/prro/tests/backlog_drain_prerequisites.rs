@@ -22,7 +22,6 @@ mod common;
 
 use std::sync::Arc;
 
-use prro::app::BootError;
 use prro::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId};
 use prro::services::offline_sync::backlog_drain;
@@ -385,18 +384,19 @@ async fn c3_idempotent_when_session_already_draining() {
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_STARTED").await, 1);
 }
 
-// ─── Test 5: structural drift — backlog without active session ───────
+// ─── Test 5: no active session → drain skips with empty-backlog ──────
 
+/// Updated for HIGH-C5-1 (2026-05-21): the walker now scopes to
+/// `offline_session_id = ?`, so a stale CLOSED session + doc
+/// referencing it cannot leak into the cohort.  Drain skips with
+/// SKIPPED_EMPTY_BACKLOG (reason=`"no_active_offline_session"`) +
+/// returns Ok(empty summary).  Old C3 contract (Internal error)
+/// no longer applies — the new contract is "no active session =
+/// no offline cohort = safe empty skip".
 #[tokio::test]
-async fn c3_returns_internal_when_backlog_without_active_session() {
+async fn c3_drain_skips_when_only_closed_session_exists() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, FN, NodeMode::GoingOnline, ShiftState::Opened).await;
-    // Direct INSERT of a CLOSED session — W4 partial UNIQUE
-    // `ux_offline_active` covers only OPENING|OPEN|DRAINING, so a
-    // CLOSED row is permitted.  Drain looks for OPEN|DRAINING and
-    // sees nothing, treating this as "no active session".  Doc's FK
-    // still points at the existing CLOSED row, preserving referential
-    // integrity (ON DELETE RESTRICT, INSERT side is unaffected).
     let stale_session = OfflineSessionId::new();
     seed_offline_session_with_closed_at(
         &pool,
@@ -406,25 +406,32 @@ async fn c3_returns_internal_when_backlog_without_active_session() {
         Some("2026-05-20T01:00:00Z"),
     )
     .await;
+    // Doc references the CLOSED session.  Pre HIGH-C5-1 this caused
+    // BootError::Internal; post-fix the walker filters by
+    // active_session_id which is absent, so the doc is NOT in the
+    // cohort.  Doc remains in OFFLINE_LOCAL_ACK; M3a boot_phase or a
+    // future operator-initiated reconciliation handles it.
     let _doc = seed_offline_local_ack_doc(&pool, FN, 1, 300, stale_session).await;
 
     let carriers = build_deps_carriers();
     let view = view_for(&carriers);
-    let result = backlog_drain::drain(&pool, &view, FN).await;
+    let summary = backlog_drain::drain(&pool, &view, FN)
+        .await
+        .expect("no-active-session path must be Ok(empty summary), not Internal");
 
-    match result {
-        Err(BootError::Internal(msg)) => {
-            assert!(
-                msg.contains("backlog of 1") && msg.contains("no active session"),
-                "Internal error message must call out backlog + missing session; got: {msg}"
-            );
-        }
-        other => panic!(
-            "expected BootError::Internal on backlog-without-active-session, got {other:?}"
-        ),
-    }
-    // Defensive: no spurious audits emitted on the drift path
-    // (better to surface the error to the caller than scatter audits).
+    assert_eq!(summary.backlog_size_before(), 0);
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG").await,
+        1,
+        "EMPTY_BACKLOG audit must fire — distinguishes safe skip from drift"
+    );
+    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG")
+        .await
+        .expect("EMPTY_BACKLOG payload present");
+    assert_eq!(
+        payload["reason"], "no_active_offline_session",
+        "audit payload must carry the distinct reason field for forensic clarity"
+    );
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_STARTED").await, 0);
     assert_eq!(
         audit_count(&pool, "OFFLINE_SESSION_DRAIN_STARTED").await,

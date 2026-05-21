@@ -29,12 +29,12 @@ Operator decisions during C4 senior review (2026-05-21) clarify three points the
 
    The W9b drain audit payload carries `manual_recon_class: bool` for operator-dashboard filtering.
 
-2. **Unfinished drain cohort (§2.2 step 2 + §3.1 clarification + HIGH-C4-8 widening)**.  The backlog read MUST cover the full unfinished cohort, not only `OFFLINE_LOCAL_ACK`.  The C1 helper `list_offline_local_ack_for_fn_ordered_by_lnd` lands the OFFLINE_LOCAL_ACK-only scan in C1 but is renamed and widened in **C5** to `list_drain_candidates_for_fn_ordered_by_lnd`, returning rows in `state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','KVT2','ERROR_RETRYABLE') AND fiscal_number = ?` ordered by `lnd ASC`.  Empty-backlog skip applies only when zero unfinished candidates exist.  Per-doc dispatch by persisted state:
-   - `OFFLINE_LOCAL_ACK` → `stage_send::run` (current C4 path)
-   - `ERROR_RETRYABLE` → `stage_send::run` (W9a 4-pre source whitelist already accepts ErrorRetryable; re-drives Pattern B).  **Without this state in the cohort, a C4 drain that produced TransientRetry on a doc strands the pending-drain shift forever** — the doc moves OFFLINE_LOCAL_ACK → Sending → ErrorRetryable on Transport / Server -3 wire failure, exits the C4 OFFLINE_LOCAL_ACK-only scan, but the shift's `pending-drain` state holds the FN until that doc completes.  HIGH-C4-8 operator finding (2026-05-21) locks this gap-fix as part of the C5 walker widening contract.
-   - `SENT` → C5 `lastChk` pre-flight / W12 seam (replay rediscovery — closes I4 restart safety)
-   - `KVT1` → W12 continuation (Kvt2 confirmation)
-   - `KVT2` → finalize continuation via `stage_finalize::run`
+2. **Unfinished drain cohort (§2.2 step 2 + §3.1 clarification + HIGH-C4-8 widening + HIGH-C5-1 session scoping + MED-C5-4 KVT2 deferral)**.  The backlog read MUST cover the full unfinished cohort, not only `OFFLINE_LOCAL_ACK`.  The C1 helper `list_offline_local_ack_for_fn_ordered_by_lnd` lands the OFFLINE_LOCAL_ACK-only scan in C1 but is renamed and widened in **C5** to `list_drain_candidates_for_fn_ordered_by_lnd(pool, fn_id, session_id)`, returning rows in `state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE') AND fiscal_number = ? AND offline_session_id = ? AND fs_mode = 'OFFLINE'` ordered by `lnd ASC`.  Empty-backlog skip applies only when zero unfinished candidates exist.  Per-doc dispatch by persisted state:
+   - `OFFLINE_LOCAL_ACK` → `stage_send::run` (current C4 path).
+   - `ERROR_RETRYABLE` → `stage_send::run` (W9a 4-pre source whitelist already accepts ErrorRetryable; re-drives Pattern B).  **Without this state in the cohort, a C4 drain that produced TransientRetry on a doc strands the pending-drain shift forever** — the doc moves OFFLINE_LOCAL_ACK → Sending → ErrorRetryable on Transport / Server -3 wire failure, exits the C4 OFFLINE_LOCAL_ACK-only scan, but the shift's `pending-drain` state holds the FN until that doc completes.  HIGH-C4-8 operator finding (2026-05-21) locks this gap-fix.
+   - `SENT` → C5 `lastChk` pre-flight via `process_via_lastchk_replay` (closes I4 restart safety per spec §6).  Match path persists `KVT1_RAW = ack.data_sign` byte-for-byte inside the same `with_immediate` envelope as the Sent→Kvt1 CAS + audit (HIGH-C5-2 forensic evidence contract).  NotFound path downgrades to ErrorRetryable for safe Pattern B re-drive next tick (HIGH-C5-3, non-manual class).  Mismatch / Decode / Unexpected → per-doc failure (manual recon class).  TransportRetry → per-doc failure (non-manual; retry budget retained).
+   - `KVT1` → `process_via_w12_only`: pre-W12 stub records DeferredKvt1 without DB mutation.  W12 PR adds lastChk evidence + `Kvt2 → Ack` via `stage_finalize::run`.
+   - `KVT2` — **deferred to W12 PR (MED-C5-4)**.  Pre-W12 drain has no clean path: counting KVT2 as DeferredKvt1 mis-audits; advancing Kvt2→Ack would violate the operator-pinned "drain cannot finalize without real Ack proof" invariant.  W12 PR re-adds KVT2 to the cohort with `stage_finalize::run`.
    - Terminal states (`ACK` / `REJECTED` / `CANCELLED` / `REQUIRES_MANUAL_RECONCILIATION`) excluded by the SELECT.
 
 3. **C4/C5 split**.  **C4** lands the inline `Sent → Kvt1` advance via the typed W12 stub seam — so `advanced_to_kvt1` counter, audit `to_state="KVT1"`, and persisted DB state stay consistent within a single C4-only flow.  **C5** widens the walker to the unfinished cohort + adds `lastChk` pre-flight + extracts the inline transition into `apply_w12_confirmation` helper.  **C5 is a blocker** before any "C4 approved" verdict at the PR level — pre-C5 the drain is NOT restart-safe for crashed-mid-drain SENT docs (M3a `boot_phase` covers SENT recovery in the meantime, but spec §6 I4 requires drain to own the rediscovery path post-W12).
@@ -121,12 +121,13 @@ Boot path can invoke this when post-W8 probe transitions `Offline → GoingOnlin
 
 ### 2.2 Drain prerequisites
 
-Before per-doc loop runs:
+Before per-doc loop runs (post HIGH-C5-1 step reordering):
 
 1. Read `node_state.mode`.  MUST be `GoingOnline`.  If not → return `DrainSummary` with `backlog_size_before = 0` + audit `OFFLINE_DRAIN_SKIPPED_NOT_GOING_ONLINE` (no Err).
-2. Read backlog: `fiscal_documents::list_offline_local_ack_for_fn_ordered_by_lnd(pool, fn_id) -> Vec<DocumentRow>`.  Strict `ORDER BY lnd ASC`.  If empty → return `DrainSummary` with all-zero counts + audit `OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG` (no Err).
-3. Read active offline session: `offline_sessions::current_active_session_id(pool, fn_id)`.  MUST be in `Draining` or `Open` state.  If `Open` → transition to `Draining` via service-layer `offline_session::transition_to_draining` (W5 surface — already shipped) + audit `OFFLINE_SESSION_DRAIN_STARTED`.
-4. Emit `OFFLINE_DRAIN_STARTED` audit with `{fiscal_number, backlog_size, session_id}` payload.
+2. **Read active offline session FIRST** (HIGH-C5-1 reordering): `offline_sessions::current_open_or_draining_session(pool, fn_id)`.  Missing session → `OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG` audit with `reason="no_active_offline_session"` + return `DrainSummary::new(fn, 0)`.  This replaces the prior "Internal error on backlog-without-active-session" contract: the cohort walker (step 3) scopes by `offline_session_id`, so absent session means absent cohort by construction.
+3. Read backlog scoped to the session: `fiscal_documents::list_drain_candidates_for_fn_ordered_by_lnd(pool, fn_id, session_id) -> Vec<DocumentRow>`.  SELECT filter: `state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE') AND offline_session_id = ? AND fs_mode = 'OFFLINE'`.  Strict `ORDER BY lnd ASC`.  If empty → return `DrainSummary` with all-zero counts + audit `OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG` (no Err).
+4. If session is in `Open` → transition to `Draining` via inline CAS + `OFFLINE_SESSION_DRAIN_STARTED` audit in one `with_immediate` envelope.
+5. Emit `OFFLINE_DRAIN_STARTED` audit with `{fiscal_number, backlog_size, session_id}` payload.
 
 ### 2.3 Per-doc loop (sequential, strict `lnd` ASC)
 
@@ -134,21 +135,31 @@ For each `doc` in `backlog` (in order):
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│ Step A: Conditional lastChk pre-flight                   │
-│   IF doc.server_fiscal_no IS NOT NULL:                   │
-│     Issue lastChk(fn_sign) probe.                        │
-│     IF response.status == OK                             │
-│        AND response.id == doc.server_fiscal_no            │
-│        AND !response.data_sign.is_empty():               │
-│       → REPLAY HIT: W12 reuses this response as KVT2     │
-│         evidence; advance doc Kvt1 → Kvt2 → Ack          │
-│         via stage_finalize::run.  Audit OFFLINE_DRAIN_   │
-│         DOC_ADVANCED with replay_short_circuit=true.     │
-│       → continue to next doc.                            │
-│     IF lastChk reports anything else → fall through to   │
-│       Step B (wire send).                                │
-│   IF doc.server_fiscal_no IS NULL:                       │
-│     → SKIP pre-flight; go directly to Step B.            │
+│ Step A: per-state dispatch (C5 amendment 2026-05-21)     │
+│   doc.state ∈ {OFFLINE_LOCAL_ACK, ERROR_RETRYABLE}       │
+│     → process_via_stage_send (Step B wire send + inline  │
+│       Sent→Kvt1 via apply_w12_confirmation stub).        │
+│   doc.state == SENT (cohort rediscovery)                 │
+│     → process_via_lastchk_replay:                        │
+│         Issue lastChk(fn_sign) probe.                    │
+│         Match (id == doc.server_fiscal_no AND            │
+│           !ack.data_sign.is_empty())                     │
+│         → advance Sent→Kvt1 via apply_w12_confirmation   │
+│           + persist KVT1_RAW = ack.data_sign in same     │
+│           with_immediate envelope (HIGH-C5-2).           │
+│         NotFound → CAS Sent → ErrorRetryable + audit;    │
+│           non-manual class; next tick re-drives via ER   │
+│           cohort (HIGH-C5-3, matches M3a boot_phase).    │
+│         Mismatch / Decode / Unexpected → per-doc failure │
+│           (manual recon class on pending-drain shift).   │
+│         TransportRetry → per-doc failure (non-manual;    │
+│           retry budget retained per spec §3.5).          │
+│         NO wire fall-through on SENT (would double-      │
+│         fiscalize via W9a 4-pre source whitelist).       │
+│   doc.state == KVT1                                      │
+│     → process_via_w12_only: pre-W12 stub records         │
+│       DeferredKvt1 without DB mutation; W12 PR adds      │
+│       lastChk + Kvt2→Ack.                                │
 │                                                          │
 │ Step B: Wire send via widened stage_send::run            │
 │   Invoke stage_send::run(pool, dps, doc.id, sign_ctx).   │
@@ -216,22 +227,28 @@ The orchestrator catches per-doc outcomes, records them in `DrainSummary`, audit
 
 ## 3. Repository surface additions
 
-### 3.1 New: `list_offline_local_ack_for_fn_ordered_by_lnd`
+### 3.1 `list_drain_candidates_for_fn_ordered_by_lnd` (C5 + HIGH-C5-1)
 
 ```rust
 // rust/prro/src/db/repositories/fiscal_documents.rs
 
-/// W9b §3.1 — strict `lnd ASC` walker for backlog drain orchestration.
-/// Returns all `OFFLINE_LOCAL_ACK` docs for the FN, ordered by MAC chain
-/// position (`lnd` is the authoritative chain-recovery key — `created_at`
-/// is second-granular and unstable for tiebreakers).
-pub async fn list_offline_local_ack_for_fn_ordered_by_lnd(
+/// W9b §3.1 + spec amendment 2026-05-21 — strict `lnd ASC` walker
+/// for the unfinished drain cohort, scoped to a specific offline
+/// session.  Returns docs in
+/// `state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE')`
+/// AND `offline_session_id = ?` AND `fs_mode = 'OFFLINE'` for the
+/// FN, ordered by MAC chain position (`lnd` authoritative;
+/// `created_at` + `document_id` are tiebreakers).
+pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
     pool: &SqlitePool,
     fn_id: &str,
+    session_id: OfflineSessionId,
 ) -> sqlx::Result<Vec<DocumentRow>> { ... }
 ```
 
-Filter: `state = 'OFFLINE_LOCAL_ACK' AND fiscal_number = ?` ORDER BY `lnd ASC, created_at ASC, document_id ASC`.
+**KVT2 deferred to W12 PR (MED-C5-4)**: KVT2 docs require `Kvt2 → Ack` via `stage_finalize::run`, which pre-W12 would violate the operator-pinned "drain cannot finalize without real Ack proof" invariant.  W12 PR re-adds KVT2 to the cohort along with the finalize path.
+
+**Session scoping rationale (HIGH-C5-1)**: without `offline_session_id = ?` + `fs_mode = 'OFFLINE'`, the widened cohort could capture online docs of the same FN (online SENT/KVT1/ERROR_RETRYABLE).  Those are M3a `boot_phase` reconciliation territory; drain MUST NOT cross-process them.
 
 ### 3.2 No other repository changes
 
@@ -399,7 +416,7 @@ pub enum W12ConfirmOutcome {
 }
 ```
 
-**Q3 — `lastChk` pre-flight FAILED behavior**: **RESOLVED** — fall through to wire send.  No sleep, no re-poll inside drain.  Pre-flight is best-effort replay optimization; authoritative routing stays in `stage_send::run` + `error_routing`.  Any rate-limit / transport / server failure on pre-flight is silently dropped; the wire send hits the same response with proper routing surface.
+**Q3 — `lastChk` pre-flight FAILED behavior**: **RESOLVED + AMENDED (C5 2026-05-21 + HIGH-C5-3)** — the original "fall through to wire send" answer was correct for OFFLINE_LOCAL_ACK / ERROR_RETRYABLE source states (and remains so in C5: those branches go through `stage_send::run` directly without lastChk pre-flight; `server_fiscal_no` is NULL by construction on these states).  For the SENT cohort (rediscovered crashed-mid-drain docs, HIGH-C4-1), wire fall-through is FORBIDDEN — re-driving a SENT doc through `stage_send::run` would be rejected by the W9a 4-pre source whitelist (Sent not in `{Signed, ErrorRetryable, OfflineLocalAck}`) and would risk double-fiscalization if the whitelist ever changed.  C5 instead routes per `last_chk_probe::ProbeOutcome`: Match → advance via `apply_w12_confirmation`; NotFound → downgrade to ErrorRetryable for next-tick Pattern B re-drive (HIGH-C5-3); Mismatch / Decode / Unexpected → per-doc manual-recon failure; TransportRetry → per-doc non-manual failure (retain retry budget).
 
 **Q4 — replay-short-circuit audit shape**: **RESOLVED** — boolean flag, no new event.  `OFFLINE_DRAIN_DOC_ADVANCED { replay_short_circuit: true|false, w12_status: "DeferredKvt1"|"Acked", final_state, ... }`.
 

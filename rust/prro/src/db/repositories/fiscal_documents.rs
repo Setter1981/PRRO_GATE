@@ -484,9 +484,42 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
         .collect()
 }
 
-/// M3b W9b §3.1 — strict `lnd ASC` walker for backlog drain
-/// orchestration.  Returns all `OFFLINE_LOCAL_ACK` docs for the FN,
-/// ordered by MAC chain position.
+/// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 + HIGH-C4-8
+/// resolution + HIGH-C5-1 session scoping + MED-C5-4 KVT2 deferral) —
+/// strict `lnd ASC` walker for the unfinished drain cohort, scoped
+/// to a specific offline session.  Returns docs in
+/// `state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE')`
+/// AND `offline_session_id = ?` AND `fs_mode = 'OFFLINE'` for the
+/// FN, ordered by MAC chain position.
+///
+/// **Cohort rationale (operator-pinned 2026-05-21):**
+/// - `OFFLINE_LOCAL_ACK` — primary backlog (offline-acked docs awaiting
+///   wire send via Pattern C drain).
+/// - `SENT` — crashed-mid-drain rediscovery: doc went OFFLINE_LOCAL_ACK
+///   → Sending → Sent before the orchestrator crashed; next drain
+///   tick rediscovers via `lastChk` pre-flight (spec §6 I4 idempotency).
+/// - `KVT1` — post-wire-send, awaiting W12 KVT2 confirmation.
+/// - `ERROR_RETRYABLE` — drain produced TransientRetry / ProbeRequired
+///   on previous tick; current tick re-drives via W9a 4-pre source
+///   whitelist.  Without this state in the cohort, transient-class
+///   failures would strand pending-drain shifts forever (HIGH-C4-8
+///   operator finding).
+///
+/// **KVT2 deferred to W12 PR (MED-C5-4)**: pre-W12 a KVT2 doc has
+/// `data_sign` evidence already persisted (boot_phase's
+/// `advance_kvt1_to_kvt2_from_probe` is the M3a path) and the proper
+/// advance is `Kvt2 → Ack` via `stage_finalize::run`.  Pre-W12 drain
+/// has no clean way to discharge KVT2 — counting them as
+/// `advanced_to_kvt1` would mis-audit; advancing to Ack would
+/// violate the operator-pinned "drain cannot finalize without real
+/// Ack proof" invariant.  W12 PR re-adds KVT2 to the cohort with
+/// the Kvt2 → Ack path.
+///
+/// **Session scoping (HIGH-C5-1)**: filter by `offline_session_id =
+/// active_session_id` AND `fs_mode = 'OFFLINE'` so the widened
+/// cohort cannot accidentally capture online docs of the same FN
+/// (online SENT/KVT1/ERROR_RETRYABLE docs have
+/// `offline_session_id = NULL` and are M3a `boot_phase` territory).
 ///
 /// **Why `lnd` is authoritative**: `lnd` is the Local Numerator of
 /// Document — strictly monotonic per FN (W7a `acquire_code_tx` +
@@ -500,9 +533,10 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
 /// needs `server_fiscal_no` to decide between the lastChk pre-flight
 /// short-circuit (replay) and the full wire-send (pure-offline) path.
 /// Read in the same SELECT — single round-trip vs N+1 reads per doc.
-pub async fn list_offline_local_ack_for_fn_ordered_by_lnd(
+pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
     pool: &SqlitePool,
     fn_id: &str,
+    session_id: OfflineSessionId,
 ) -> sqlx::Result<Vec<DocumentRow>> {
     let rows = sqlx::query!(
         r#"SELECT document_id    as "document_id: DocumentId",
@@ -521,9 +555,12 @@ pub async fn list_offline_local_ack_for_fn_ordered_by_lnd(
                   signed_by_cashier_id  as "signed_by_cashier_id: CashierId"
            FROM fiscal_documents
            WHERE fiscal_number = ?
-             AND state = 'OFFLINE_LOCAL_ACK'
+             AND offline_session_id = ?
+             AND fs_mode = 'OFFLINE'
+             AND state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE')
            ORDER BY lnd, created_at, document_id"#,
-        fn_id
+        fn_id,
+        session_id,
     )
     .fetch_all(pool)
     .await?;

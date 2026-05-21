@@ -31,7 +31,8 @@
 //!     NULL` short-circuits Sending/Sent/Kvt1 when DPS confirms via
 //!     lastChk + id match + non-empty data_sign.  W12 PR consumes
 //!     this edge; W9b lands the whitelist only (helper at
-//!     `fiscal_documents::list_offline_local_ack_for_fn_ordered_by_lnd`).
+//!     `fiscal_documents::list_drain_candidates_for_fn_ordered_by_lnd`
+//!     — renamed in C5 from the OFFLINE_LOCAL_ACK-only variant).
 //!
 //! **Total `OfflineLocalAck`-touching edges: 5.**
 

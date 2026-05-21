@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT document_id    as \"document_id: DocumentId\",\n                  fiscal_number,\n                  lnd,\n                  state           as \"state: DocState\",\n                  doc_type        as \"doc_type: DocType\",\n                  server_fiscal_no,\n                  submission_attempted_at,\n                  backend_profile_id,\n                  transport_profile_id,\n                  previous_hash         as \"previous_hash: Vec<u8>\",\n                  z_report_number,\n                  unsigned_xml_sha256   as \"unsigned_xml_sha256: Vec<u8>\",\n                  signing_inputs_pinned_at,\n                  signed_by_cashier_id  as \"signed_by_cashier_id: CashierId\"\n           FROM fiscal_documents\n           WHERE fiscal_number = ?\n             AND state = 'OFFLINE_LOCAL_ACK'\n           ORDER BY lnd, created_at, document_id",
+  "query": "SELECT document_id    as \"document_id: DocumentId\",\n                  fiscal_number,\n                  lnd,\n                  state           as \"state: DocState\",\n                  doc_type        as \"doc_type: DocType\",\n                  server_fiscal_no,\n                  submission_attempted_at,\n                  backend_profile_id,\n                  transport_profile_id,\n                  previous_hash         as \"previous_hash: Vec<u8>\",\n                  z_report_number,\n                  unsigned_xml_sha256   as \"unsigned_xml_sha256: Vec<u8>\",\n                  signing_inputs_pinned_at,\n                  signed_by_cashier_id  as \"signed_by_cashier_id: CashierId\"\n           FROM fiscal_documents\n           WHERE fiscal_number = ?\n             AND offline_session_id = ?\n             AND fs_mode = 'OFFLINE'\n             AND state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE')\n           ORDER BY lnd, created_at, document_id",
   "describe": {
     "columns": [
       {
@@ -75,7 +75,7 @@
       }
     ],
     "parameters": {
-      "Right": 1
+      "Right": 2
     },
     "nullable": [
       false,
@@ -94,5 +94,5 @@
       true
     ]
   },
-  "hash": "26ea4fc0ffe7c151ad29ba6bde387b8a4cfa66237e0eb1eb211ee627cb35d980"
+  "hash": "7292166a9b5973a6f821c9d85b331c8c3e0f75735e02b724ed51f6655c9b6aeb"
 }
