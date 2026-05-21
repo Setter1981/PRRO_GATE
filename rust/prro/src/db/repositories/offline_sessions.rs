@@ -447,6 +447,46 @@ pub async fn current_active_session_id_tx(
     .await
 }
 
+/// M3b W9b §2.2 step 3 — pool-bound read of the FN's currently-active
+/// session, widened to `OPEN|DRAINING`.
+///
+/// The drain orchestrator's prerequisites step must distinguish:
+///   - state `OPEN`  → first drain entry; transition to DRAINING
+///     before the per-doc loop.
+///   - state `DRAINING` → re-entry (crash mid-drain OR multi-tick
+///     orchestration); skip the Open→Draining transition, audit
+///     `OFFLINE_DRAIN_STARTED` directly and continue draining.
+///   - `None` → no active session for this FN.  HIGH-C5-1 fix
+///     (2026-05-21): the W9b walker is now scoped by
+///     `offline_session_id`, so absent session means absent cohort
+///     by construction; the drain caller treats this as the
+///     empty-backlog skip path (`OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG`
+///     audit with `reason="no_active_offline_session"`), NOT as
+///     `BootError::Internal`.  Pre-HIGH-C5-1 the contract was to
+///     propagate Internal; the walker scoping fix made the
+///     missing-session path safe to skip.
+///
+/// Distinct name from `current_active_session_id_tx` to avoid
+/// silently widening that helper's `OPEN`-only contract for W7
+/// callers (operator pin: stage_offline_ack stays strict-OPEN).
+///
+/// Schema guarantee: partial UNIQUE `ux_offline_active` (W4)
+/// ensures at most one session in OPENING/OPEN/DRAINING per FN;
+/// this query narrows to OPEN/DRAINING, so at most one row possible.
+pub async fn current_open_or_draining_session(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<(OfflineSessionId, OfflineSessionState)>> {
+    sqlx::query_as::<_, (OfflineSessionId, OfflineSessionState)>(
+        "SELECT offline_session_id, state FROM offline_sessions \
+         WHERE fiscal_number = ? AND state IN ('OPEN', 'DRAINING') \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await
+}
+
 /// All `fiscal_documents` rows tied to this session that are NOT
 /// in a terminal state.
 ///

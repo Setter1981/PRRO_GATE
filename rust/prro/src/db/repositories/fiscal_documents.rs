@@ -179,6 +179,16 @@ pub fn allowed_transition(from: DocState, to: DocState) -> bool {
             // no removals; runtime wiring of the new edges is W7).
             | (OfflineLocalAck, Sending)
             | (OfflineLocalAck, Cancelled)
+            // M3b W9b §5.1 — lastChk replay short-circuit edge.
+            // When backlog_drain issues a lastChk pre-flight on a
+            // doc with `server_fiscal_no IS NOT NULL` AND DPS confirms
+            // `status == OK` + id match + non-empty data_sign, the
+            // doc has already been wire-acknowledged by DPS — drain
+            // skips wire send and advances Kvt2 directly (W12 PR
+            // reuses the same lastChk response as KVT2 evidence).
+            // Final hop Kvt2 → Ack is the existing M3a edge below.
+            // Locked-edge count drift-guard: 28 → 29.
+            | (OfflineLocalAck, Kvt2)
             | (ErrorRetryable, Sent)
             | (ErrorRetryable, Kvt1)
             | (ErrorRetryable, RequiresManualReconciliation)
@@ -449,6 +459,108 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
              AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')
            ORDER BY lnd, created_at, document_id"#,
         fn_id
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(DocumentRow {
+                document_id: r.document_id,
+                fiscal_number: r.fiscal_number,
+                lnd: r.lnd,
+                state: r.state,
+                doc_type: r.doc_type,
+                server_fiscal_no: r.server_fiscal_no,
+                submission_attempted_at: r.submission_attempted_at,
+                backend_profile_id: r.backend_profile_id,
+                transport_profile_id: r.transport_profile_id,
+                previous_hash: decode_blob32(r.previous_hash, "previous_hash")?,
+                z_report_number: r.z_report_number,
+                unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
+                signing_inputs_pinned_at: r.signing_inputs_pinned_at,
+                signed_by_cashier_id: r.signed_by_cashier_id,
+            })
+        })
+        .collect()
+}
+
+/// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 + HIGH-C4-8
+/// resolution + HIGH-C5-1 session scoping + MED-C5-4 KVT2 deferral) —
+/// strict `lnd ASC` walker for the unfinished drain cohort, scoped
+/// to a specific offline session.  Returns docs in
+/// `state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE')`
+/// AND `offline_session_id = ?` AND `fs_mode = 'OFFLINE'` for the
+/// FN, ordered by MAC chain position.
+///
+/// **Cohort rationale (operator-pinned 2026-05-21):**
+/// - `OFFLINE_LOCAL_ACK` — primary backlog (offline-acked docs awaiting
+///   wire send via Pattern C drain).
+/// - `SENT` — crashed-mid-drain rediscovery: doc went OFFLINE_LOCAL_ACK
+///   → Sending → Sent before the orchestrator crashed; next drain
+///   tick rediscovers via `lastChk` pre-flight (spec §6 I4 idempotency).
+/// - `KVT1` — post-wire-send, awaiting W12 KVT2 confirmation.
+/// - `ERROR_RETRYABLE` — drain produced TransientRetry / ProbeRequired
+///   on previous tick; current tick re-drives via W9a 4-pre source
+///   whitelist.  Without this state in the cohort, transient-class
+///   failures would strand pending-drain shifts forever (HIGH-C4-8
+///   operator finding).
+///
+/// **KVT2 deferred to W12 PR (MED-C5-4)**: pre-W12 a KVT2 doc has
+/// `data_sign` evidence already persisted (boot_phase's
+/// `advance_kvt1_to_kvt2_from_probe` is the M3a path) and the proper
+/// advance is `Kvt2 → Ack` via `stage_finalize::run`.  Pre-W12 drain
+/// has no clean way to discharge KVT2 — counting them as
+/// `advanced_to_kvt1` would mis-audit; advancing to Ack would
+/// violate the operator-pinned "drain cannot finalize without real
+/// Ack proof" invariant.  W12 PR re-adds KVT2 to the cohort with
+/// the Kvt2 → Ack path.
+///
+/// **Session scoping (HIGH-C5-1)**: filter by `offline_session_id =
+/// active_session_id` AND `fs_mode = 'OFFLINE'` so the widened
+/// cohort cannot accidentally capture online docs of the same FN
+/// (online SENT/KVT1/ERROR_RETRYABLE docs have
+/// `offline_session_id = NULL` and are M3a `boot_phase` territory).
+///
+/// **Why `lnd` is authoritative**: `lnd` is the Local Numerator of
+/// Document — strictly monotonic per FN (W7a `acquire_code_tx` +
+/// `transition_to_offline_local_ack_tx` enforce this atomically).
+/// `created_at` is second-granular in SQLite (`CURRENT_TIMESTAMP`),
+/// so multi-doc bursts can share the same timestamp; `lnd` is the
+/// only stable chain-recovery key.  `document_id` is the final
+/// tiebreaker (random UUID; never matches across docs).
+///
+/// **Why include MAC-chain-pinned fields?** Caller (drain_orchestrator)
+/// needs `server_fiscal_no` to decide between the lastChk pre-flight
+/// short-circuit (replay) and the full wire-send (pure-offline) path.
+/// Read in the same SELECT — single round-trip vs N+1 reads per doc.
+pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
+    pool: &SqlitePool,
+    fn_id: &str,
+    session_id: OfflineSessionId,
+) -> sqlx::Result<Vec<DocumentRow>> {
+    let rows = sqlx::query!(
+        r#"SELECT document_id    as "document_id: DocumentId",
+                  fiscal_number,
+                  lnd,
+                  state           as "state: DocState",
+                  doc_type        as "doc_type: DocType",
+                  server_fiscal_no,
+                  submission_attempted_at,
+                  backend_profile_id,
+                  transport_profile_id,
+                  previous_hash         as "previous_hash: Vec<u8>",
+                  z_report_number,
+                  unsigned_xml_sha256   as "unsigned_xml_sha256: Vec<u8>",
+                  signing_inputs_pinned_at,
+                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId"
+           FROM fiscal_documents
+           WHERE fiscal_number = ?
+             AND offline_session_id = ?
+             AND fs_mode = 'OFFLINE'
+             AND state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE')
+           ORDER BY lnd, created_at, document_id"#,
+        fn_id,
+        session_id,
     )
     .fetch_all(pool)
     .await?;
