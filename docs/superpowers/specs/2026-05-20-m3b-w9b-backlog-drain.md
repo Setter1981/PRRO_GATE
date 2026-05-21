@@ -305,13 +305,14 @@ Drain reuses existing whitelisted edges from W6 + M3a:
 - `Kvt1 → Kvt2 → Ack` (W12, deferred — W9b stops at Kvt1).
 
 Plus replay-short-circuit path (added in W9b):
-- `OfflineLocalAck → Kvt2` (NEW WHITELIST EDGE — W9b adds via lastChk pre-flight).
-- `Kvt2 → Ack` (M3a).
+- `OfflineLocalAck → Kvt2` (W9b C1 whitelist edge, M3b W6 extension — locked in `tests/fiscal_documents_offline_local_ack_edges_locked.rs`).  Edge is **whitelisted but not yet consumed pre-W12**: C5's lastChk pre-flight (HIGH-C5-2 amendment 2026-05-21) advances `Sent → Kvt1` on Match (the cohort walker rediscovers crashed-mid-drain SENT docs and replays via this path), and pre-W12 the C5 stub `apply_w12_confirmation` always returns `DeferredKvt1`.  W12 PR consumes the `(OfflineLocalAck, Kvt2)` edge when an OFFLINE_LOCAL_ACK doc with `server_fiscal_no IS NOT NULL` gets a lastChk Match — it short-circuits to KVT2 directly + completes `Kvt2 → Ack` via `stage_finalize::run`.
+- `Sent → Kvt1` (M3a + C5 lastChk replay path — operative pre-W12 via `apply_w12_confirmation::Sent` stub).
+- `Kvt2 → Ack` (M3a; W12 PR consumes via finalize path).
 
 **Whitelist edge addition (`fiscal_documents::allowed_transition`):**
 
 ```rust
-// W9b — lastChk replay short-circuit edge.
+// W9b C1 — lastChk replay short-circuit edge (consumed by W12 PR).
 | (OfflineLocalAck, Kvt2)   // 27 (NEW)
 ```
 

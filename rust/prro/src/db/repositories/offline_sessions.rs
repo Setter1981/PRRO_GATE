@@ -456,8 +456,15 @@ pub async fn current_active_session_id_tx(
 ///   - state `DRAINING` → re-entry (crash mid-drain OR multi-tick
 ///     orchestration); skip the Open→Draining transition, audit
 ///     `OFFLINE_DRAIN_STARTED` directly and continue draining.
-///   - `None` → backlog exists but no active session: structural
-///     drift signal; caller propagates as `BootError::Internal`.
+///   - `None` → no active session for this FN.  HIGH-C5-1 fix
+///     (2026-05-21): the W9b walker is now scoped by
+///     `offline_session_id`, so absent session means absent cohort
+///     by construction; the drain caller treats this as the
+///     empty-backlog skip path (`OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG`
+///     audit with `reason="no_active_offline_session"`), NOT as
+///     `BootError::Internal`.  Pre-HIGH-C5-1 the contract was to
+///     propagate Internal; the walker scoping fix made the
+///     missing-session path safe to skip.
 ///
 /// Distinct name from `current_active_session_id_tx` to avoid
 /// silently widening that helper's `OPEN`-only contract for W7

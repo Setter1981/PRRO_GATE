@@ -87,20 +87,6 @@ pub enum BootError {
 
     #[error("internal boot error: {0}")]
     Internal(String),
-
-    /// W9b Commit 2 — per-doc drain failure attribution.  Sibling
-    /// docs in the backlog continue per spec §2.5 / plan §Task 9
-    /// "try-and-audit shim".  Caller (drain orchestrator) catches
-    /// these and records in `DrainSummary::per_doc_failures`; only
-    /// infrastructure failures (DB connection lost, etc.) propagate
-    /// to the caller as `Database` / `Internal`.
-    #[error("offline drain ({fiscal_number}) per-doc failure on {document_id:?}: {source}")]
-    OfflineDrainFailed {
-        fiscal_number: String,
-        document_id: crate::db::models::ids::DocumentId,
-        #[source]
-        source: anyhow::Error,
-    },
 }
 
 impl BootError {
@@ -115,11 +101,6 @@ impl BootError {
             Self::ConfigParse(_) => 65,              // EX_DATAERR (config IS data)
             Self::ReconciliationFailed { .. } => 70, // EX_SOFTWARE — per-FN internal
             Self::Internal(_) => 70,                 // EX_SOFTWARE
-            // W9b Commit 2: per-doc drain failure — recoverable
-            // application error, same class as ReconciliationFailed
-            // (sibling docs continued; only this doc's processing
-            // was abandoned).
-            Self::OfflineDrainFailed { .. } => 70,   // EX_SOFTWARE
         }
     }
 }

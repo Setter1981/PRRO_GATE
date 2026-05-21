@@ -1585,12 +1585,31 @@ async fn finalize_drain(
 }
 
 /// Eligible-arm helper: atomic node-mode CAS + session CAS +
-/// `OFFLINE_SESSION_CLOSED` audit + `OFFLINE_DRAIN_COMPLETED` audit
-/// in ONE `with_immediate` envelope.  `summary.mark_finalized()`
-/// runs **after** the envelope commits (defensive double-check);
-/// the COMPLETED audit payload encodes `finalized=true` directly to
-/// avoid the in-memory/audit-row drift that would otherwise result
-/// from the post-envelope mutation ordering.
+/// shift CAS (pending-drain ladder closure) + node_state.shift_state
+/// mirror UPDATE + `OFFLINE_SESSION_CLOSED` audit +
+/// `OFFLINE_DRAIN_COMPLETED` audit in ONE `with_immediate` envelope.
+///
+/// **Shift transition (MED-W9B-1 fix, 2026-05-21)**: when the drain
+/// finalizes successfully, the shift state must close the
+/// pending-drain ladder per `m3b-shift-state-expansion.md` §§4.1 / 6.x:
+///   - `OpenedLocalPendingDrain` → `Opened` (edge 5) when the
+///     SHIFT_OPEN backlog Ack'd → shift is now operationally Opened.
+///   - `ClosingLocalPendingDrain` → `Closed` (edge 13) when the
+///     close-drain predicate is satisfied (drain Ack'd the Z_REPORT
+///     AND all earlier shift docs).  Pre-W12 the predicate is
+///     enforced via the C2 `finalize_eligibility` gate (Eligible
+///     only when every drain doc returned Acked); W12 PR adds
+///     explicit predicate verification post-lastChk.
+///   - `Opened` (online finalize case) → no shift transition.
+///   - Other states → BootError::Internal (structural drift; finalize
+///     should not run on shift states outside `{Opened,
+///     OpenedLocalPendingDrain, ClosingLocalPendingDrain}`).
+///
+/// `summary.mark_finalized()` runs **after** the envelope commits
+/// (defensive double-check); the COMPLETED audit payload encodes
+/// `finalized=true` directly to avoid the in-memory/audit-row drift
+/// that would otherwise result from the post-envelope mutation
+/// ordering.
 async fn commit_finalize_envelope(
     pool: &SqlitePool,
     fiscal_number: &str,
@@ -1600,6 +1619,36 @@ async fn commit_finalize_envelope(
 ) -> Result<(), BootError> {
     let fiscal_number_owned = fiscal_number.to_string();
     let node_mode_from = ns.mode;
+    let shift_state_from = ns.shift_state;
+    let shift_id_opt = ns.current_shift_id;
+    // MED-W9B-1 fix (2026-05-21): pre-compute pending-drain shift
+    // transition.  Drain finalize closes the pending-drain ladder
+    // per `m3b-shift-state-expansion.md` §4.1 + §16.4:
+    //   - OpenedLocalPendingDrain → Opened (edge 5)
+    //   - ClosingLocalPendingDrain → Closed (edge 13)
+    //   - Opened → no-op (online finalize)
+    //   - Other → Internal (structural drift; finalize shouldn't
+    //     run on other shift states pre-W12).
+    let shift_finalize_target: Option<ShiftState> = match shift_state_from {
+        ShiftState::OpenedLocalPendingDrain => Some(ShiftState::Opened),
+        ShiftState::ClosingLocalPendingDrain => Some(ShiftState::Closed),
+        ShiftState::Opened => None,
+        other => {
+            return Err(BootError::Internal(format!(
+                "backlog_drain({fiscal_number}): finalize Eligible on unexpected \
+                 shift_state {state} — drain orchestrator expected \
+                 {{Opened, OpenedLocalPendingDrain, ClosingLocalPendingDrain}}",
+                state = other.as_str(),
+            )));
+        }
+    };
+    if shift_finalize_target.is_some() && shift_id_opt.is_none() {
+        return Err(BootError::Internal(format!(
+            "backlog_drain({fiscal_number}): pending-drain shift_state {state} but \
+             node_state.current_shift_id is NULL — structural drift",
+            state = shift_state_from.as_str(),
+        )));
+    }
     // MED-C6-1 fix (2026-05-21): override `finalized=true` in the
     // COMPLETED payload.  `summary.mark_finalized()` runs AFTER the
     // envelope commits, so without this override the audit row would
@@ -1666,7 +1715,45 @@ async fn commit_finalize_envelope(
                     sid = session_id_hex_owned,
                 ));
             }
-            // (3) Audit OFFLINE_SESSION_CLOSED (W5 session-lifecycle
+            // (3) MED-W9B-1 (2026-05-21): close the pending-drain
+            // shift ladder atomically with the mode + session
+            // transition.  Only fires if the prereq pass observed
+            // a pending-drain shift; Opened (online finalize) has
+            // no shift transition.
+            if let Some(target) = shift_finalize_target {
+                let shift_id = shift_id_opt.expect("checked before envelope");
+                let shift_outcome = shifts::transition_state(
+                    tx,
+                    shift_id,
+                    shift_state_from,
+                    target,
+                )
+                .await?;
+                if !matches!(shift_outcome, shifts::TransitionOutcome::Applied) {
+                    return Err(anyhow::anyhow!(
+                        "backlog_drain({fn_id}): finalize CAS shift {from} → \
+                         {to} produced {outcome:?} for shift {sid} (App reconcile \
+                         mutex should prevent races)",
+                        fn_id = fiscal_number_owned,
+                        from = shift_state_from.as_str(),
+                        to = target.as_str(),
+                        outcome = shift_outcome,
+                        sid = hex_lower(shift_id.as_bytes()),
+                    ));
+                }
+                // Mirror node_state.shift_state per
+                // m3b-shift-state-expansion.md §5 load-bearing
+                // invariant.  Reuses C4's mirror helper.
+                mirror_node_state_shift_state_tx(
+                    tx,
+                    &fiscal_number_owned,
+                    shift_id,
+                    shift_state_from,
+                    target,
+                )
+                .await?;
+            }
+            // (4) Audit OFFLINE_SESSION_CLOSED (W5 session-lifecycle
             // contract — MED-C6-2 2026-05-21).
             audit_log::append_tx(
                 tx,
@@ -2044,5 +2131,155 @@ mod eligible_arm_tests {
             summary.finalized(),
             "summary.mark_finalized() MUST set finalized=true after Eligible envelope commits"
         );
+    }
+
+    // ─── MED-W9B-1 (2026-05-21) — pending-drain shift closure ────────
+
+    use crate::db::models::ids::ShiftId;
+
+    async fn seed_node_state_with_shift(
+        pool: &sqlx::SqlitePool,
+        mode: &str,
+        shift_state: &str,
+        shift_id: ShiftId,
+    ) -> NodeStateRow {
+        sqlx::query(
+            "INSERT INTO node_state(fiscal_number, mode, shift_state, current_shift_id, next_lnd) \
+             VALUES (?, ?, ?, ?, 100)",
+        )
+        .bind(FN)
+        .bind(mode)
+        .bind(shift_state)
+        .bind(shift_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        node_state::get(pool, FN).await.unwrap().unwrap()
+    }
+
+    async fn seed_shift_in_state(pool: &sqlx::SqlitePool, state: &str) -> ShiftId {
+        let shift_id = ShiftId::new();
+        sqlx::query(
+            "INSERT INTO shifts(shift_id, fiscal_number, serial, state, \
+                open_mode, cash_balance_kop, opened_by_cashier_id) \
+             VALUES (?, ?, 1, ?, 'OFFLINE', 0, 'test-cashier')",
+        )
+        .bind(shift_id)
+        .bind(FN)
+        .bind(state)
+        .execute(pool)
+        .await
+        .unwrap();
+        shift_id
+    }
+
+    async fn read_shift_state(pool: &sqlx::SqlitePool, shift_id: ShiftId) -> String {
+        sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+            .bind(shift_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn read_node_shift_state(pool: &sqlx::SqlitePool) -> String {
+        sqlx::query_scalar("SELECT shift_state FROM node_state WHERE fiscal_number = ?")
+            .bind(FN)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn ack_summary_2() -> DrainSummary {
+        let mut summary = DrainSummary::new(FN.to_string(), 2);
+        summary.record_doc_advanced(
+            &W12ConfirmOutcome::Acked {
+                server_fiscal_no: "DPS-A".into(),
+            },
+            false,
+        );
+        summary.record_doc_advanced(
+            &W12ConfirmOutcome::Acked {
+                server_fiscal_no: "DPS-B".into(),
+            },
+            false,
+        );
+        summary
+    }
+
+    /// MED-W9B-1: shift in `OpenedLocalPendingDrain` at finalize time
+    /// → drain transitions `OpenedLocalPendingDrain → Opened` (edge 5)
+    /// + mirrors `node_state.shift_state` in the same envelope.
+    #[tokio::test]
+    async fn c6_finalize_closes_opened_local_pending_drain_ladder_to_opened() {
+        let (_d, pool) = fresh_pool().await;
+        let shift_id = seed_shift_in_state(&pool, "OPENED_LOCAL_PENDING_DRAIN").await;
+        let ns = seed_node_state_with_shift(
+            &pool,
+            "GOING_ONLINE",
+            "OPENED_LOCAL_PENDING_DRAIN",
+            shift_id,
+        )
+        .await;
+        let session_id = seed_draining_session(&pool).await;
+        let mut summary = ack_summary_2();
+
+        commit_finalize_envelope(&pool, FN, session_id, &ns, &mut summary)
+            .await
+            .expect("Eligible commit on pending-drain shift must succeed");
+
+        // Mode + session + shift + node_state mirror all finalized.
+        assert_eq!(read_node_mode(&pool).await, "ONLINE");
+        assert_eq!(read_session_state(&pool, session_id).await, "CLOSED");
+        assert_eq!(read_shift_state(&pool, shift_id).await, "OPENED");
+        assert_eq!(
+            read_node_shift_state(&pool).await,
+            "OPENED",
+            "node_state.shift_state MUST mirror shifts.state per §5 invariant"
+        );
+
+        // Audit chain.
+        assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_COMPLETED").await, 1);
+        assert_eq!(audit_count(&pool, "OFFLINE_SESSION_CLOSED").await, 1);
+
+        assert!(summary.finalized());
+    }
+
+    /// MED-W9B-1: shift in `ClosingLocalPendingDrain` at finalize time
+    /// → drain transitions `ClosingLocalPendingDrain → Closed`
+    /// (edge 13) + mirrors `node_state.shift_state`.  Pre-W12 the
+    /// close-drain predicate is enforced via the C2
+    /// `finalize_eligibility` gate (Eligible only when every drain
+    /// doc returned Acked — Z_REPORT included).
+    #[tokio::test]
+    async fn c6_finalize_closes_closing_local_pending_drain_ladder_to_closed() {
+        let (_d, pool) = fresh_pool().await;
+        let shift_id = seed_shift_in_state(&pool, "CLOSING_LOCAL_PENDING_DRAIN").await;
+        let ns = seed_node_state_with_shift(
+            &pool,
+            "GOING_ONLINE",
+            "CLOSING_LOCAL_PENDING_DRAIN",
+            shift_id,
+        )
+        .await;
+        let session_id = seed_draining_session(&pool).await;
+        let mut summary = ack_summary_2();
+
+        commit_finalize_envelope(&pool, FN, session_id, &ns, &mut summary)
+            .await
+            .expect("Eligible commit on closing-pending-drain shift must succeed");
+
+        assert_eq!(read_node_mode(&pool).await, "ONLINE");
+        assert_eq!(read_session_state(&pool, session_id).await, "CLOSED");
+        assert_eq!(read_shift_state(&pool, shift_id).await, "CLOSED");
+        assert_eq!(
+            read_node_shift_state(&pool).await,
+            "CLOSED",
+            "node_state.shift_state MUST mirror shifts.state"
+        );
+
+        assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_COMPLETED").await, 1);
+        assert_eq!(audit_count(&pool, "OFFLINE_SESSION_CLOSED").await, 1);
+
+        assert!(summary.finalized());
     }
 }
