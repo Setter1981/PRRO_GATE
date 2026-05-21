@@ -22,11 +22,12 @@
 //!   Sibling-continue applies ONLY to per-doc failures on
 //!   non-pending-drain shifts.  **No lastChk pre-flight yet** (C5);
 //!   **no finalize branch yet** (C6).
-//! - **Commits 5-7** — widen walker to the full unfinished cohort
-//!   (`OFFLINE_LOCAL_ACK | SENT | KVT1 | KVT2 | ERROR_RETRYABLE`),
-//!   add lastChk pre-flight, extract the inline `Sent → Kvt1` into
-//!   the `apply_w12_confirmation` helper, add the finalization
-//!   branch, and add the App entry.
+//! - **Commits 5-7** — widen walker to the unfinished cohort
+//!   (`OFFLINE_LOCAL_ACK | SENT | KVT1 | ERROR_RETRYABLE`; KVT2
+//!   deferred to W12 PR per MED-C5-4), add lastChk pre-flight,
+//!   extract the inline `Sent → Kvt1` into the
+//!   `apply_w12_confirmation` helper, add the finalization branch,
+//!   and add the App entry.
 //!
 //! ## C4 known gaps (C5 blocker before "C4 approved")
 //!
@@ -47,10 +48,11 @@
 //!   stranded.
 //!
 //! **C5 closes both gaps** by widening the walker to
-//! `state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','KVT2','ERROR_
-//! RETRYABLE')` and dispatching by `doc.state` (ErrorRetryable →
-//! stage_send re-drive via W9a 4-pre source whitelist).  C5 is
-//! a blocker before any "C4 approved" verdict at the PR level.
+//! `state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE')`
+//! (KVT2 deferred to W12 PR per MED-C5-4) and dispatching by
+//! `doc.state` (ErrorRetryable → stage_send re-drive via W9a 4-pre
+//! source whitelist).  C5 is a blocker before any "C4 approved"
+//! verdict at the PR level.
 //!
 //! ## Pre-W12 invariant pin (operator-flagged 2026-05-20, sign-off pin)
 //!
@@ -83,6 +85,7 @@ use crate::db::repositories::{
     audit_log, document_files, fiscal_documents, node_state, offline_sessions, shifts,
 };
 use crate::db::tx::{with_immediate, WriteTxConn};
+use crate::services::reconciliation::guard::ReconcileGuard;
 use crate::services::reconciliation::last_chk_probe::{self, ProbeOutcome};
 use crate::services::reconciliation::runtime::RuntimeView;
 use crate::services::write_path::error_routing::RetryClass;
@@ -395,6 +398,14 @@ const AUDIT_ENTITY_DOC: &str = "fiscal_document";
 /// Commit 4 invokes `stage_send::run` per doc in `lnd ASC` order;
 /// Commits 5-6 add lastChk pre-flight + finalization branch.
 ///
+/// `_recon_guard` is the W2 lock-token proving the caller holds the
+/// App reconcile mutex (NIT-C7-R1 hardening 2026-05-21).  Production
+/// callers construct it via `App::drain_offline_backlog_with`;
+/// integration tests use `ReconcileGuard::for_integration_test_only()`
+/// (gated behind `test-support` feature).  Without the token, the
+/// drain entry physically cannot be called — closes the W2 bypass
+/// hole symmetric to `boot_phase::run_boot_reconciliation`.
+///
 /// `deps` is the per-FN runtime bundle (`dps`, `signing_ctx`,
 /// `fn_sign`).  The prerequisites pass touches nothing on it (I1
 /// guard); the per-doc loop consumes `deps.dps` + `deps.signing_ctx`
@@ -434,7 +445,8 @@ const AUDIT_ENTITY_DOC: &str = "fiscal_document";
 ///   under App mutex implies racing writer — invariant breach).
 /// - `BootError::ReconciliationFailed` — `with_immediate` envelope
 ///   propagated a non-sqlx anyhow chain (e.g. audit insert failure).
-pub async fn drain(
+pub async fn drain<'a>(
+    _recon_guard: &ReconcileGuard<'a>,
     pool: &SqlitePool,
     deps: &RuntimeView<'_>,
     fiscal_number: &str,

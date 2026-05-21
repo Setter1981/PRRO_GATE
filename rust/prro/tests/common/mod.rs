@@ -223,3 +223,12 @@ pub fn ack(id: &str) -> CheckAck {
         data_sign: vec![],
     }
 }
+
+/// W9b NIT-C7-R1 helper (2026-05-21): construct the W2 lock-token
+/// for integration tests that call `backlog_drain::drain` directly
+/// (bypassing the App entry).  Uses the test-only constructor
+/// (gated behind `test-support` feature) so production builds
+/// physically cannot mint a token without the App mutex.
+pub fn drain_test_guard() -> prro::services::reconciliation::ReconcileGuard<'static> {
+    prro::services::reconciliation::ReconcileGuard::for_integration_test_only()
+}

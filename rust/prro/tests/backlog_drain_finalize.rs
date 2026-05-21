@@ -261,7 +261,7 @@ async fn c6_pre_w12_partial_when_all_advances_are_deferred_kvt1() {
     let c = carriers(vec![Ok(ack("A")), Ok(ack("B"))]);
     let view = view_for(&c);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     // Both docs advanced as DeferredKvt1 → finalize_eligibility blocked.
     assert_eq!(summary.backlog_size_before(), 2);
@@ -305,7 +305,7 @@ async fn c6_partial_when_per_doc_failures_present() {
     })]);
     let view = view_for(&c);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     assert_eq!(summary.per_doc_failures().len(), 1);
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_PARTIAL").await, 1);
@@ -362,7 +362,7 @@ async fn c6_halt_escalate_path_does_not_fire_partial() {
     })]);
     let view = view_for(&c);
 
-    let _summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     // Halt-escalate audit fired; finalize branch (PARTIAL/COMPLETED)
     // was NOT reached because drain returned early.
@@ -388,7 +388,7 @@ async fn c6_skip_paths_do_not_fire_partial() {
         seed_node_state(&pool, NodeMode::Offline, ShiftState::Opened).await;
         let c = carriers(vec![]);
         let view = view_for(&c);
-        let _summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+        let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
         assert_eq!(
             audit_count(&pool, "OFFLINE_DRAIN_SKIPPED_NOT_GOING_ONLINE").await,
             1
@@ -403,7 +403,7 @@ async fn c6_skip_paths_do_not_fire_partial() {
         seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
         let c = carriers(vec![]);
         let view = view_for(&c);
-        let _summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+        let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
         assert_eq!(
             audit_count(&pool, "OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG").await,
             1

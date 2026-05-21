@@ -307,7 +307,7 @@ async fn c4_happy_path_two_docs_advance_to_kvt1_and_emit_doc_advanced() {
     let carriers = carriers_with_responses(vec![Ok(ack("DPS-FN-A")), Ok(ack("DPS-FN-B"))]);
     let view = view_for(&carriers);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     assert_eq!(summary.backlog_size_before(), 2);
     assert_eq!(
@@ -361,7 +361,7 @@ async fn c4_routed_terminal_reject_records_wire_routing_failure_class() {
     })]);
     let view = view_for(&carriers);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     assert_eq!(summary.backlog_size_before(), 1);
     assert_eq!(summary.advanced_to_kvt1(), 0);
@@ -399,7 +399,7 @@ async fn c4_signer_refused_records_signer_refused_class_and_sibling_continues() 
     let carriers = carriers_with_responses(vec![Ok(ack("DPS-FN-B-ONLY"))]);
     let view = view_for(&carriers);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     assert_eq!(summary.backlog_size_before(), 2);
     assert_eq!(summary.advanced_to_kvt1(), 1, "only doc B advances");
@@ -456,7 +456,7 @@ async fn c4_processes_backlog_in_lnd_asc_order() {
     ]);
     let view = view_for(&carriers);
 
-    let _summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     // Verify ordering via audit row sequence — audit_log.audit_id is
     // AUTOINCREMENT, so ASC order == chronological emit order.  Each
@@ -517,7 +517,7 @@ async fn c4_accounting_advanced_plus_failures_equals_backlog() {
     ]);
     let view = view_for(&carriers);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     assert_eq!(summary.backlog_size_before(), 3);
     assert_eq!(summary.advanced_to_kvt1(), 2, "doc A + doc C");
@@ -604,7 +604,7 @@ async fn c4_pending_drain_shift_reject_halts_and_transitions_shift_to_manual() {
     ]);
     let view = view_for(&carriers);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     // Drain halted after doc B: doc A advanced, doc B failed, doc C
     // never visited.
@@ -708,7 +708,7 @@ async fn c4_pending_drain_shift_transient_retry_sibling_continues_no_halt() {
     ]);
     let view = view_for(&carriers);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     assert_eq!(summary.backlog_size_before(), 3);
     assert_eq!(

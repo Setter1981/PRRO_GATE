@@ -217,7 +217,7 @@ async fn c3_skips_when_mode_not_going_online() {
 
     let carriers = build_deps_carriers();
     let view = view_for(&carriers);
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     assert_eq!(summary.fiscal_number(), FN);
     assert_eq!(summary.backlog_size_before(), 0);
@@ -263,7 +263,7 @@ async fn c3_skips_when_backlog_empty() {
 
     let carriers = build_deps_carriers();
     let view = view_for(&carriers);
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     assert_eq!(summary.backlog_size_before(), 0);
     assert_eq!(
@@ -295,7 +295,7 @@ async fn c3_transitions_session_open_to_draining_and_emits_started() {
 
     let carriers = build_deps_carriers();
     let view = view_for(&carriers);
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     // C3 reports the backlog size but does NOT mutate per-doc counters
     // (per-doc loop deferred to C4); finalized stays false.
@@ -365,7 +365,7 @@ async fn c3_idempotent_when_session_already_draining() {
 
     let carriers = build_deps_carriers();
     let view = view_for(&carriers);
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     assert_eq!(summary.backlog_size_before(), 1);
 
@@ -415,7 +415,7 @@ async fn c3_drain_skips_when_only_closed_session_exists() {
 
     let carriers = build_deps_carriers();
     let view = view_for(&carriers);
-    let summary = backlog_drain::drain(&pool, &view, FN)
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
         .await
         .expect("no-active-session path must be Ok(empty summary), not Internal");
 

@@ -500,6 +500,55 @@ impl App {
         Ok(summary)
     }
 
+    /// W9b §2.1 (a) — App-owned entry for the offline backlog drain
+    /// orchestrator.  Acquires the App reconcile mutex (W2 enforcement
+    /// per ADR-M3-A10 + spec §9 OQ-5) and delegates to the pure-
+    /// function entry [`backlog_drain::drain`].
+    ///
+    /// **Mutex scope**: the App reconcile mutex is held for the ENTIRE
+    /// drain — per spec §9 OQ-5 operator pin (2026-05-20).  The mutex
+    /// is the LOGICAL App-level guard; the inner drain does NOT wrap
+    /// the per-doc loop in a single SQLite write transaction (per-doc
+    /// DB tx scopes live INSIDE `stage_send::run` /
+    /// `apply_w12_confirmation` / `commit_finalize_envelope`).
+    /// Concurrent invocation across the same `App` instance serializes
+    /// without panic; pilot UX cost (10+s block on large backlog) is
+    /// accepted as the correctness tradeoff against double-advance /
+    /// mis-finalize races with `boot_phase` reconciliation.
+    ///
+    /// `deps` is the per-FN [`RuntimeView`] bundle (`dps`,
+    /// `signing_ctx`, `fn_sign`).  Boot-recovery callers should
+    /// construct a [`ReconciliationRuntime`] resolver and call
+    /// `.resolve(fn_id)` to obtain the view BEFORE invoking this
+    /// entry; pilot single-operator-single-FN deployments can pass
+    /// a static view directly.
+    ///
+    /// [`backlog_drain::drain`]: crate::services::offline_sync::backlog_drain::drain
+    /// [`RuntimeView`]: crate::services::reconciliation::RuntimeView
+    /// [`ReconciliationRuntime`]: crate::services::reconciliation::ReconciliationRuntime
+    pub async fn drain_offline_backlog_with<'a>(
+        &self,
+        fiscal_number: &str,
+        deps: &crate::services::reconciliation::RuntimeView<'a>,
+    ) -> Result<crate::services::offline_sync::backlog_drain::DrainSummary, BootError> {
+        // NIT-C7-R1 hardening (2026-05-21): mint the W2 lock-token from
+        // the App reconcile mutex.  Token lifetime ties to the
+        // MutexGuard — dropping the token releases the mutex.  Drain
+        // requires the token in its signature so direct callers cannot
+        // bypass the App-level serialization (symmetric to
+        // `boot_phase::run_boot_reconciliation` gating).
+        let mutex_guard = self.inner.reconcile_mutex.lock().await;
+        let recon_guard =
+            crate::services::reconciliation::ReconcileGuard::from_app_mutex(mutex_guard);
+        crate::services::offline_sync::backlog_drain::drain(
+            &recon_guard,
+            self.db(),
+            deps,
+            fiscal_number,
+        )
+        .await
+    }
+
     pub fn config(&self) -> &AppConfig {
         &self.inner.config
     }

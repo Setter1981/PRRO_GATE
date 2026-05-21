@@ -354,7 +354,7 @@ async fn c5_sent_doc_lastchk_match_advances_to_kvt1_with_replay_flag() {
     );
     let view = view_for(&c);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     assert_eq!(summary.backlog_size_before(), 1);
     assert_eq!(summary.advanced_to_kvt1(), 1);
@@ -410,7 +410,7 @@ async fn c5_kvt1_doc_w12_only_no_db_mutation_records_deferred() {
     let c = carriers(vec![], vec![]);
     let view = view_for(&c);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     assert_eq!(summary.backlog_size_before(), 1);
     assert_eq!(summary.advanced_to_kvt1(), 1);
@@ -458,7 +458,7 @@ async fn c5_error_retryable_doc_re_driven_via_stage_send_to_kvt1() {
     let c = carriers(vec![Ok(ack("DPS-FN-RETRIED", vec![1, 2, 3]))], vec![]);
     let view = view_for(&c);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     assert_eq!(summary.advanced_to_kvt1(), 1);
     assert_eq!(
@@ -507,7 +507,7 @@ async fn c5_sent_doc_lastchk_mismatch_records_per_doc_failure_no_wire_resend() {
     );
     let view = view_for(&c);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     assert_eq!(summary.advanced_to_kvt1(), 0);
     assert_eq!(summary.per_doc_failures().len(), 1);
@@ -567,7 +567,7 @@ async fn c5_empty_skip_when_only_terminal_state_docs_exist() {
     let c = carriers(vec![], vec![]);
     let view = view_for(&c);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     // Empty-backlog skip fires even though 2 docs exist for the FN —
     // both are in terminal states which the walker SELECT excludes.
@@ -647,7 +647,7 @@ async fn c5_walker_scope_excludes_online_cross_session_docs() {
     let c = carriers(vec![Ok(ack("DPS-OFFLINE", vec![0xCD]))], vec![]);
     let view = view_for(&c);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     // Cohort size 1 (offline doc only); online doc not visited.
     assert_eq!(
@@ -693,7 +693,7 @@ async fn c5_lastchk_match_persists_kvt1_raw_byte_for_byte() {
     );
     let view = view_for(&c);
 
-    let _summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
     // KVT1_RAW byte-for-byte equality.
@@ -736,7 +736,7 @@ async fn c5_sent_doc_lastchk_not_found_downgrades_to_error_retryable_non_manual(
     let c = carriers(vec![], vec![Err(DpsError::NotFound)]);
     let view = view_for(&c);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     // Per HIGH-C5-3: doc downgrades to ER for retry (no manual recon).
     assert_eq!(read_doc_state(&pool, doc).await, "ERROR_RETRYABLE");
@@ -786,7 +786,7 @@ async fn c5_kvt2_doc_excluded_from_cohort_pre_w12() {
     let c = carriers(vec![], vec![]);
     let view = view_for(&c);
 
-    let summary = backlog_drain::drain(&pool, &view, FN).await.unwrap();
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await.unwrap();
 
     // Walker SQL filter excludes KVT2 → cohort empty → SKIPPED.
     assert_eq!(
