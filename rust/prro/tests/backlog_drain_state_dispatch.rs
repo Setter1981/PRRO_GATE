@@ -56,6 +56,7 @@ use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
 use prro::transports::dps::error::DpsError;
+use prro::BootError;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -1370,4 +1371,117 @@ async fn w12_kvt2_cohort_entry_dispatches_to_stage_finalize_and_reaches_ack() {
             .await
             .unwrap();
     assert_eq!(inbox_status, "DONE");
+}
+
+// ─── M3b W12 Commit 3 amend — Err-path routing coverage ──────────────
+//
+// LOW-W12C3-01 close-out (post-narrow-review 2026-05-22):
+//
+// `process_via_w12_kvt2_advance` has 4 outcome arms after
+// `stage_finalize::run` returns; the happy `Acked` arm is covered by
+// `w12_kvt2_cohort_entry_dispatches_to_stage_finalize_and_reaches_ack`.
+// The remaining 3 success-shape arms (`AlreadyAcked` / `StateConflict`
+// / `DocumentMissing`) are **forensic-only concurrency-race outcomes**
+// — they are not reachable via single-threaded `drain()` integration
+// path because the cohort SELECT IN list filter requires `KVT2` state
+// at SELECT time, after which `drain()` processes docs linearly with
+// no concurrent writer in the test harness.  Their **generation** is
+// already covered at the `stage_finalize::run` level in
+// `write_path_stage5_finalize.rs`:
+//   - `AlreadyAcked` → fixture `idempotent_rerun_on_ack_is_no_op`
+//     (lines 410-455).
+//   - `StateConflict` → fixture
+//     `non_kvt2_state_short_circuits_no_seed_advance` (lines 459-485).
+//   - `DocumentMissing` → fixture
+//     `document_missing_returns_outcome_not_error` (lines 543-560).
+// Their **routing** in this helper is straight-line per-arm match
+// (~10 lines each) and structurally mirrors the `Acked` arm; routing
+// regressions would surface at the higher-level boot reconcile suite.
+//
+// What IS reproducible via `drain()` single-threaded is the
+// `Err(StageFinalizeError)` arm — seeding a KVT2 doc with broken
+// preconds forces `stage_finalize::run` into a typed-error path, and
+// the helper's `map_err` must wrap it as
+// `BootError::ReconciliationFailed { fiscal_number, source }` with
+// per-FN attribution preserved (W9.4 cycle-2 MED-B convention).
+// Fixture below covers that routing explicitly.
+
+#[tokio::test]
+async fn w12_kvt2_stage_finalize_typed_error_routes_to_boot_error_reconciliation_failed() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+
+    // Seed KVT2 doc with full preconds, then NULL out
+    // `unsigned_xml_sha256` to force `stage_finalize::run` into the
+    // `UnsignedXmlShaMissing` typed-error path (proven path per
+    // `write_path_stage5_finalize.rs::unsigned_xml_sha_missing_typed_error_full_rollback`).
+    let (doc, _req_id_bytes) = seed_kvt2_doc_for_stage_finalize(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "DPS-FN-KVT2-TYPED-ERR",
+    )
+    .await;
+    sqlx::query("UPDATE fiscal_documents SET unsigned_xml_sha256 = NULL WHERE document_id = ?")
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // No DPS calls expected.
+    let c = carriers(vec![], vec![]);
+    let view = view_for(&c);
+
+    let err = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .expect_err(
+            "UnsignedXmlShaMissing typed error must surface as \
+             BootError::ReconciliationFailed",
+        );
+
+    match err {
+        BootError::ReconciliationFailed {
+            fiscal_number: fn_tag,
+            source,
+        } => {
+            assert_eq!(fn_tag, FN, "per-FN attribution preserved (MED-B W9.4)");
+            let chain = format!("{source:#}");
+            assert!(
+                chain.contains("unsigned_xml_sha256"),
+                "source chain should mention unsigned_xml_sha256 \
+                 (got: {chain})",
+            );
+        }
+        other => panic!("expected BootError::ReconciliationFailed, got {other:?}"),
+    }
+
+    // Err-path short-circuits BEFORE any audit emission in the
+    // helper (Acked/AlreadyAcked paths emit OFFLINE_DRAIN_DOC_ADVANCED;
+    // StateConflict/DocumentMissing paths emit OFFLINE_DRAIN_DOC_FAILED).
+    // `stage_finalize::run` rolled back its envelope (W8.2 F5-bis
+    // integrated rollback proof) — no STAGE_FINALIZE_ACK either.
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_DOC_ADVANCED").await,
+        0,
+        "Err path must NOT emit OFFLINE_DRAIN_DOC_ADVANCED"
+    );
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_DOC_FAILED").await,
+        0,
+        "Err path must NOT emit OFFLINE_DRAIN_DOC_FAILED"
+    );
+    assert_eq!(
+        audit_count(&pool, "STAGE_FINALIZE_ACK").await,
+        0,
+        "stage_finalize rollback proof: ACK audit must NOT exist"
+    );
+
+    // Doc state preserved as KVT2 (rollback proof).  Next drain tick
+    // re-encounters the same broken-preconds doc → same Err →
+    // operator observability via repeated BootError audit chain.
+    assert_eq!(read_doc_state(&pool, doc).await, "KVT2");
 }
