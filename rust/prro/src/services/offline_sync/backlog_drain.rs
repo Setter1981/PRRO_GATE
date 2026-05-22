@@ -984,9 +984,13 @@ fn is_manual_recon_retry_class(retry: RetryClass) -> bool {
 ///   the next tick to re-probe.
 /// - `KVT1` → `process_via_w12_only` (no wire, no pre-flight;
 ///   pre-W12 stub records DeferredKvt1).
+/// - `KVT2` → **M3b W12 Commit 3** `process_via_w12_kvt2_advance`
+///   (calls `stage_finalize::run` for idempotent Kvt2→Ack advance;
+///   reverses MED-C5-4 deferral).  Surfaces mid-tick crash recovery
+///   between Envelope 1 (W12 Kvt1→Kvt2 advance) and Envelope 2
+///   (`stage_finalize::run` Kvt2→Ack).
 /// - Other states → `BootError::Internal` (cohort walker SELECT
-///   filter breach).  `KVT2` is deferred to W12 PR per MED-C5-4 —
-///   pre-W12 drain has no clean discharge path.
+///   filter breach).
 ///
 /// Each branch appends to [`DrainSummary`] + emits exactly one audit
 /// row (`OFFLINE_DRAIN_DOC_ADVANCED` / `_DOC_FAILED`).  Only
@@ -1009,11 +1013,12 @@ async fn process_one_doc(
         }
         DocState::Sent => process_via_lastchk_replay(pool, deps, fiscal_number, doc, summary).await,
         DocState::Kvt1 => process_via_w12_only(pool, fiscal_number, doc, summary).await,
+        DocState::Kvt2 => process_via_w12_kvt2_advance(pool, fiscal_number, doc, summary).await,
         other => Err(BootError::Internal(format!(
             "backlog_drain({fiscal_number}): cohort walker returned unexpected \
              doc.state {state} for doc {hex} (SELECT must filter to drain \
-             candidates: OFFLINE_LOCAL_ACK | SENT | KVT1 | ERROR_RETRYABLE post \
-             MED-C5-4 KVT2 deferral)",
+             candidates: OFFLINE_LOCAL_ACK | SENT | KVT1 | KVT2 | ERROR_RETRYABLE \
+             post M3b W12 Commit 3 KVT2 cohort widening)",
             state = other.as_str(),
             hex = hex_lower(doc.document_id.as_bytes()),
         ))),
@@ -1674,6 +1679,167 @@ async fn process_via_w12_only(
     .await?;
     summary.record_doc_advanced(&w12, false);
     Ok(DocVerdict::Advanced)
+}
+
+/// **M3b W12 Commit 3** — KVT2 cohort dispatch helper (reverses
+/// MED-C5-4 deferral per plan §"Crash-recovery convergence" §19 +
+/// §"Cohort widening" §14-15).
+///
+/// Invokes `stage_finalize::run(pool, doc_id)` for idempotent
+/// `Kvt2 → Ack` advance.  Surfaces mid-tick crash recovery between
+/// Envelope 1 (W12 Kvt1→Kvt2 advance, lands in Commits 4/5/5b) and
+/// Envelope 2 (`stage_finalize::run` Kvt2→Ack).  M3a `AlreadyAcked`
+/// contract means a doc already in `Ack` returns
+/// `StageFinalizeOutcome::AlreadyAcked` (no-op success-shape;
+/// concurrent finish-doc race or replay arrived after boot recovery
+/// already finalized).
+///
+/// **Outcome routing** per plan §15:
+/// - `Acked { fiscal_number, lnd }` → [`DocVerdict::Advanced`] +
+///   summary `record_doc_advanced(W12ConfirmOutcome::Acked {
+///   server_fiscal_no }, via_lastchk_replay=false)` +
+///   `OFFLINE_DRAIN_DOC_ADVANCED` forensic audit
+///   (`dispatch_via="w12_kvt2_recovery"`).
+/// - `AlreadyAcked` → same Advanced+record as Acked (idempotent
+///   replay; doc IS at Ack now).
+/// - `StateConflict { observed }` → [`DocVerdict::Failed`] with
+///   `FailureClass::StateConflict` + `manual_recon: true` (concurrent
+///   writer past App reconcile mutex; system-level signal).
+/// - `DocumentMissing` → [`DocVerdict::Failed`] with
+///   `FailureClass::NotFound` + `manual_recon: true` (cohort race
+///   with delete; should not happen in production but defensive).
+/// - `Err(StageFinalizeError)` → propagate as
+///   [`BootError::ReconciliationFailed`] (infrastructure failure).
+///
+/// **I1 preserved**: `stage_finalize::run` is pool-only and owns its
+/// own `with_immediate` envelope per M3a W8 contract; this helper
+/// adds no envelope around the call.  Forensic audits
+/// (`OFFLINE_DRAIN_DOC_ADVANCED` / `_DOC_FAILED`) are pool-bound and
+/// emitted AFTER stage_finalize commits.
+async fn process_via_w12_kvt2_advance(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    doc: &fiscal_documents::DocumentRow,
+    summary: &mut DrainSummary,
+) -> Result<DocVerdict, BootError> {
+    use crate::services::write_path::stage_finalize::{self, StageFinalizeOutcome};
+
+    let id_hex = hex_lower(doc.document_id.as_bytes());
+    let outcome = stage_finalize::run(pool, doc.document_id)
+        .await
+        .map_err(|source| BootError::ReconciliationFailed {
+            fiscal_number: fiscal_number.to_string(),
+            source: anyhow::Error::new(source),
+        })?;
+
+    // Acked + AlreadyAcked share the "doc reached Ack" forensic
+    // shape; pre-compute the success payload once, then dispatch on
+    // outcome.  doc.server_fiscal_no is `Some(..)` per stage_send 4-b
+    // invariant (doc in KVT2 state implies original Sent advance
+    // stamped it); empty-string fallback avoids an extra error path
+    // for the structurally-impossible None case.
+    match outcome {
+        StageFinalizeOutcome::Acked {
+            fiscal_number: ack_fn,
+            lnd,
+        } => {
+            let server_fiscal_no = doc.server_fiscal_no.clone().unwrap_or_default();
+            let payload = serde_json::json!({
+                "document_id": id_hex,
+                "from_state": doc.state.as_str(),
+                "to_state": DocState::Ack.as_str(),
+                "replay_short_circuit": false,
+                "w12_status": W12ConfirmOutcome::Acked {
+                    server_fiscal_no: server_fiscal_no.clone(),
+                }
+                .w12_status_str(),
+                "dispatch_via": "w12_kvt2_recovery",
+                "stage_finalize_outcome": "Acked",
+                "stage_finalize_lnd": lnd,
+                "stage_finalize_fiscal_number": ack_fn,
+            });
+            audit_log::append(
+                pool,
+                AUDIT_ENTITY_DOC,
+                &id_hex,
+                "OFFLINE_DRAIN_DOC_ADVANCED",
+                Severity::Info,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await
+            .map_err(BootError::Database)?;
+            summary.record_doc_advanced(
+                &W12ConfirmOutcome::Acked { server_fiscal_no },
+                /* via_lastchk_replay */ false,
+            );
+            Ok(DocVerdict::Advanced)
+        }
+        StageFinalizeOutcome::AlreadyAcked => {
+            let server_fiscal_no = doc.server_fiscal_no.clone().unwrap_or_default();
+            let payload = serde_json::json!({
+                "document_id": id_hex,
+                "from_state": doc.state.as_str(),
+                "to_state": DocState::Ack.as_str(),
+                "replay_short_circuit": false,
+                "w12_status": W12ConfirmOutcome::Acked {
+                    server_fiscal_no: server_fiscal_no.clone(),
+                }
+                .w12_status_str(),
+                "dispatch_via": "w12_kvt2_recovery",
+                "stage_finalize_outcome": "AlreadyAcked",
+            });
+            audit_log::append(
+                pool,
+                AUDIT_ENTITY_DOC,
+                &id_hex,
+                "OFFLINE_DRAIN_DOC_ADVANCED",
+                Severity::Info,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await
+            .map_err(BootError::Database)?;
+            summary.record_doc_advanced(
+                &W12ConfirmOutcome::Acked { server_fiscal_no },
+                /* via_lastchk_replay */ false,
+            );
+            Ok(DocVerdict::Advanced)
+        }
+        StageFinalizeOutcome::StateConflict { observed } => {
+            let class = FailureClass::StateConflict;
+            let class_str = failure_class_for(class);
+            summary.record_doc_failure(doc.document_id, class_str.to_string());
+            let payload = serde_json::json!({
+                "document_id": id_hex,
+                "failure_class": class_str,
+                "observed_state": observed.as_str(),
+                "dispatch_via": "w12_kvt2_recovery",
+                "manual_recon_class": true,
+            });
+            emit_doc_failed(pool, &id_hex, &payload).await?;
+            Ok(DocVerdict::Failed {
+                class,
+                manual_recon: true,
+            })
+        }
+        StageFinalizeOutcome::DocumentMissing => {
+            let class = FailureClass::NotFound;
+            let class_str = failure_class_for(class);
+            summary.record_doc_failure(doc.document_id, class_str.to_string());
+            let payload = serde_json::json!({
+                "document_id": id_hex,
+                "failure_class": class_str,
+                "dispatch_via": "w12_kvt2_recovery",
+                "manual_recon_class": true,
+            });
+            emit_doc_failed(pool, &id_hex, &payload).await?;
+            Ok(DocVerdict::Failed {
+                class,
+                manual_recon: true,
+            })
+        }
+    }
 }
 
 /// W9b C5 W12 stub seam (spec §2.3 Step C + §9 OQ-2).  Pre-W12

@@ -484,13 +484,23 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
         .collect()
 }
 
-/// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 + HIGH-C4-8
-/// resolution + HIGH-C5-1 session scoping + MED-C5-4 KVT2 deferral) —
-/// strict `lnd ASC` walker for the unfinished drain cohort, scoped
-/// to a specific offline session.  Returns docs in
-/// `state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE')`
-/// AND `offline_session_id = ?` AND `fs_mode = 'OFFLINE'` for the
-/// FN, ordered by MAC chain position.
+/// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 / HIGH-C4-8
+/// resolution; HIGH-C5-1 session scoping; MED-C5-4 KVT2 deferral
+/// reversed by **M3b W12 Commit 3**) — strict `lnd ASC` walker for
+/// the unfinished drain cohort, scoped to a specific offline
+/// session.  Returns docs in `state IN ('OFFLINE_LOCAL_ACK','SENT',
+/// 'KVT1','ERROR_RETRYABLE','KVT2')` AND `offline_session_id = ?`
+/// AND `fs_mode = 'OFFLINE'` for the FN, ordered by MAC chain
+/// position.
+///
+/// **KVT2 included (W12 Commit 3, reverses MED-C5-4):** mid-tick
+/// crash between Envelope 1 (W12 Kvt1→Kvt2 advance) and Envelope 2
+/// (`stage_finalize::run` Kvt2→Ack) leaves the doc in `Kvt2`.
+/// W9b's cohort previously deferred KVT2 to W12 PR because pre-W12
+/// drain had no clean discharge path; now `process_via_w12_kvt2_advance`
+/// in `backlog_drain` invokes `stage_finalize::run` (idempotent under
+/// M3a `AlreadyAcked` contract) so the same drain tick converges to
+/// `Ack` without waiting for boot.
 ///
 /// **Cohort rationale (operator-pinned 2026-05-21):**
 /// - `OFFLINE_LOCAL_ACK` — primary backlog (offline-acked docs awaiting
@@ -557,7 +567,7 @@ pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
            WHERE fiscal_number = ?
              AND offline_session_id = ?
              AND fs_mode = 'OFFLINE'
-             AND state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE')
+             AND state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE','KVT2')
            ORDER BY lnd, created_at, document_id"#,
         fn_id,
         session_id,

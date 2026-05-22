@@ -1092,55 +1092,16 @@ async fn c5_sent_doc_lastchk_not_found_downgrades_to_error_retryable_non_manual(
     );
 }
 
-// ─── Test 9: KVT2 doc excluded from cohort (MED-C5-4 defensive) ──────
-
-/// MED-C5-4 (2026-05-21): KVT2 docs are explicitly deferred to the
-/// W12 PR.  The cohort walker SQL filter excludes `KVT2` from
-/// `state IN (...)`.  Defensive coverage so a future refactor that
-/// re-adds KVT2 to the SELECT without also reviving the dispatcher
-/// arm + apply_w12_confirmation Kvt2 branch will break this test.
-#[tokio::test]
-async fn c5_kvt2_doc_excluded_from_cohort_pre_w12() {
-    let (_d, pool) = fresh_pool().await;
-    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
-    let shift_id = seed_open_shift(&pool).await;
-    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
-    let kvt2_doc = seed_doc_in_state(
-        &pool,
-        1,
-        100,
-        session_id,
-        shift_id,
-        "KVT2",
-        Some("DPS-FN-KVT2-PRE-W12"),
-    )
-    .await;
-
-    let c = carriers(vec![], vec![]);
-    let view = view_for(&c);
-
-    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
-        .await
-        .unwrap();
-
-    // Walker SQL filter excludes KVT2 → cohort empty → SKIPPED.
-    assert_eq!(
-        summary.backlog_size_before(),
-        0,
-        "KVT2 docs MUST NOT appear in pre-W12 drain cohort"
-    );
-    assert_eq!(
-        audit_count(&pool, "OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG").await,
-        1
-    );
-    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_ADVANCED").await, 0);
-    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_FAILED").await, 0);
-
-    // KVT2 doc state unchanged.
-    assert_eq!(read_doc_state(&pool, kvt2_doc).await, "KVT2");
-    assert_eq!(c.dps.send_chk_count(), 0);
-    assert_eq!(c.dps.last_chk_count(), 0);
-}
+// ─── Test 9: KVT2 cohort widening (W12 Commit 3 reversal of MED-C5-4) ──
+//
+// The pre-W12 fixture `c5_kvt2_doc_excluded_from_cohort_pre_w12`
+// asserted KVT2 was DEFERRED from the cohort SELECT IN list per
+// MED-C5-4 — that defensive lock is **intentionally retired** by
+// M3b W12 Commit 3, which re-adds KVT2 to the cohort and wires
+// `process_via_w12_kvt2_advance` through `stage_finalize::run` for
+// idempotent Kvt2→Ack advance.  See the new positive coverage at
+// `w12_kvt2_cohort_entry_dispatches_to_stage_finalize_and_reaches_ack`
+// below the W9b pending-drain halt section.
 
 // ─── W9b ER-class-guard pending-drain halt proof ─────────────────────
 //
@@ -1239,4 +1200,174 @@ async fn er_guard_pending_drain_manual_class_halts_and_escalates_shift() {
     assert_eq!(halt["fiscal_number"], FN);
     assert_eq!(halt["failure_class"], "authorization");
     assert_eq!(halt["current_shift_state"], "OPENED_LOCAL_PENDING_DRAIN");
+}
+
+// ─── M3b W12 Commit 3: KVT2 cohort dispatch → stage_finalize → Ack ──
+//
+// Per plan §Phasing Commit 3 + §"Cohort widening" §14-15: KVT2 is
+// re-added to the cohort SELECT IN list, and `process_via_w12_kvt2_advance`
+// invokes `stage_finalize::run` for idempotent Kvt2→Ack advance.
+// Test seeds a KVT2 doc with all stage_finalize::run preconditions
+// (inbox PROCESSING row, chain seed match, KVT raw files), runs drain,
+// asserts doc reaches Ack + summary records advanced_to_ack.
+
+async fn seed_kvt2_doc_for_stage_finalize(
+    pool: &SqlitePool,
+    lnd: i64,
+    code_lnd: i64,
+    session_id: OfflineSessionId,
+    shift_id: ShiftId,
+    server_fiscal_no: &str,
+) -> (DocumentId, [u8; 16]) {
+    let doc_id = DocumentId::new();
+    let req_id = Uuid::now_v7();
+    let req_bytes = *req_id.as_bytes();
+    let payload_sha = vec![0x77u8; 32];
+    let unsigned_xml_sha: [u8; 32] = [0xABu8; 32];
+    let previous_hash: [u8; 32] = [0xCDu8; 32];
+
+    // ingress_inbox in PROCESSING — finalize marks it DONE.
+    sqlx::query(
+        "INSERT INTO ingress_inbox(request_id, fiscal_number, protocol, operation_type, \
+            idempotency_key, payload_json, payload_sha256_canonical, status) \
+         VALUES (?, ?, 'REST', 'sell', ?, '{}', ?, 'PROCESSING')",
+    )
+    .bind(&req_bytes[..])
+    .bind(FN)
+    .bind(format!("idem-kvt2-{lnd}"))
+    .bind(&payload_sha)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // KVT2 fiscal_documents row with chain hashes + server_fiscal_no.
+    sqlx::query(
+        "INSERT INTO fiscal_documents( \
+            document_id, request_id, fiscal_number, shift_id, lnd, doc_type, state, \
+            backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical, unsigned_xml_sha256, previous_hash, \
+            signed_by_cashier_id, offline_session_id, offline_fiscal_no, \
+            offline_fiscal_date, server_fiscal_no \
+         ) VALUES ( \
+            ?, ?, ?, ?, ?, 'SELL', 'KVT2', \
+            'b', 't', 'OFFLINE', '2026-05-21T00:00:00Z', \
+            '{}', ?, ?, ?, \
+            ?, ?, ?, '2026-05-21T00:00:00Z', ? \
+         )",
+    )
+    .bind(doc_id)
+    .bind(&req_bytes[..])
+    .bind(FN)
+    .bind(shift_id)
+    .bind(lnd)
+    .bind(&payload_sha)
+    .bind(&unsigned_xml_sha[..])
+    .bind(&previous_hash[..])
+    .bind(CASHIER_OK)
+    .bind(session_id)
+    .bind(code_lnd)
+    .bind(server_fiscal_no)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // SIGNED_XML + KVT1_RAW + KVT2_RAW per finalize-helpers convention.
+    for (kind, content) in [
+        ("SIGNED_XML", b"FAKE-CMS".as_slice()),
+        ("KVT1_RAW", b"FAKE-KVT1-PROTOBUF".as_slice()),
+        ("KVT2_RAW", b"FAKE-KVT2-PROTOBUF".as_slice()),
+    ] {
+        sqlx::query(
+            "INSERT INTO document_files(document_id, kind, content) \
+             VALUES (?, ?, ?)",
+        )
+        .bind(doc_id)
+        .bind(kind)
+        .bind(content)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // Chain seed pinned to doc.previous_hash so stage_finalize's W8 F2
+    // chain-continuity guard passes.
+    sqlx::query(
+        "UPDATE node_state SET last_known_unsigned_xml_sha256 = ? \
+         WHERE fiscal_number = ?",
+    )
+    .bind(&previous_hash[..])
+    .bind(FN)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO offline_codes(fiscal_number, code_lnd, consumed_at, consumed_by_document_id) \
+         VALUES (?, ?, '2026-05-21T00:00:01Z', ?)",
+    )
+    .bind(FN)
+    .bind(code_lnd)
+    .bind(doc_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    (doc_id, req_bytes)
+}
+
+#[tokio::test]
+async fn w12_kvt2_cohort_entry_dispatches_to_stage_finalize_and_reaches_ack() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+
+    let (doc, req_id_bytes) =
+        seed_kvt2_doc_for_stage_finalize(&pool, 1, 100, session_id, shift_id, "DPS-FN-KVT2-COHORT")
+            .await;
+
+    // No DPS calls — KVT2 dispatch goes through stage_finalize::run only.
+    let c = carriers(vec![], vec![]);
+    let view = view_for(&c);
+
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(c.dps.send_chk_count(), 0, "no wire call from KVT2 dispatch");
+    assert_eq!(
+        c.dps.last_chk_count(),
+        0,
+        "no lastChk call from KVT2 dispatch"
+    );
+
+    // KVT2 cohort entry advanced to Ack via stage_finalize::run.
+    assert_eq!(read_doc_state(&pool, doc).await, "ACK");
+
+    assert_eq!(summary.backlog_size_before(), 1);
+    assert_eq!(summary.advanced_to_ack(), 1);
+    assert_eq!(summary.advanced_to_kvt1(), 0);
+    assert!(summary.per_doc_failures().is_empty());
+
+    // Forensic audit: OFFLINE_DRAIN_DOC_ADVANCED with dispatch_via=
+    // w12_kvt2_recovery + stage_finalize_outcome="Acked".
+    let advanced = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_ADVANCED")
+        .await
+        .unwrap();
+    assert_eq!(advanced["from_state"], "KVT2");
+    assert_eq!(advanced["to_state"], "ACK");
+    assert_eq!(advanced["dispatch_via"], "w12_kvt2_recovery");
+    assert_eq!(advanced["stage_finalize_outcome"], "Acked");
+
+    // stage_finalize's STAGE_FINALIZE_ACK audit also emitted.
+    assert_eq!(audit_count(&pool, "STAGE_FINALIZE_ACK").await, 1);
+
+    // inbox row marked DONE by stage_finalize's W8 step 5.
+    let inbox_status: String =
+        sqlx::query_scalar("SELECT status FROM ingress_inbox WHERE request_id = ?")
+            .bind(&req_id_bytes[..])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(inbox_status, "DONE");
 }
