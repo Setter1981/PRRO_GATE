@@ -17,7 +17,9 @@ Replace the W9b pre-W12 `apply_w12_confirmation` stub (`backlog_drain.rs:1470`, 
 2. **`Kvt1` re-entry (cohort)**: drain cohort walker emits `Kvt1` docs (KVT1 already in W9b cohort filter); these are docs Held on a prior tick after a successful Sent→Kvt1 mid-tick advance, OR docs landed in Kvt1 by the legacy stub before W12 merges; kvt2_confirm re-issues lastChk on the **still-latest** doc and either advances or Holds again.
 3. **`Sent` re-entry / replay (cohort)** (HIGH-PR70-R3-01 fix): drain cohort walker emits persisted `Sent` docs that crashed mid-tick BEFORE the Envelope 1a chain committed (e.g. inside Envelope 1a rollback OR before Envelope 1a started). The current `process_via_lastchk_replay` arm is rewritten to be **W12-aware**: it invokes `kvt2_confirm::confirm_drain_doc` (same helper as Sent-fresh and Kvt1 entries), routes Acked through Envelope 1a (same atomic Sent→Kvt1→Kvt2 chain), routes Hold through `DocVerdict::HoldFnDrain` (NOT current sibling-continue), routes StructuralDrift through `BootError::Internal`. This closes the W0b latest-doc precondition gap that existed in the prior R2 revision: a Sent-source crash-recovery path that fell back to current W9b replay semantics could allow later same-FN sends after a Held doc.
 
-In all three cases:
+Plus, the **Sent-replay arm uniquely retains the HIGH-C5-3 safe-redrive case** (HIGH-PR70-R4-01 fix): on `last_chk_probe::ProbeOutcome::NotFound` (DPS has zero history of the doc's `server_fiscal_no`), the W12 outcome is `Kvt2ConfirmOutcome::SentNotFoundDowngrade` (distinct from Hold) — atomically commit `Sent → ErrorRetryable` + stamp durable `TransientRetry` retry_class label + emit audit + return `DocVerdict::HoldFnDrain`.  Next tick: doc enters ER cohort → W9b ER class guard bounded-redrive (`MAX_BOOT_ATTEMPTS=5` cap) → `stage_send::run` Pattern B redrive → eventually Match (Ack) OR ER budget-exhausted manual.  Preserves boot dispatcher's existing two-tick replay contract (see `boot_phase.rs:733` for reference pattern).  Holding indefinitely on a Sent-replay NotFound would never resend → liveness hole on a known crash-recovery outcome.
+
+In all three cases (Acked / Hold / StructuralDrift outcomes — SentNotFoundDowngrade exclusively from Sent-replay arm):
 
 - Reads the doc's `server_fiscal_no` (from `stage_send::run` 4-b OR from the prior-tick row).
 - Issues `lastChk(fn_sign)` and validates evidence per W0b §Verdict: `response.status == OK` + `response.id == doc.server_fiscal_no` + non-empty `response.data_sign`.
@@ -84,7 +86,30 @@ All four operations commit atomically.  Two whitelisted edges (`Sent → Kvt1`, 
   })
 ```
 
-### Envelope 2 — identical for both source states
+#### (c) Source state = `Sent` (Sent-replay), `last_chk_probe::ProbeOutcome::NotFound` (HIGH-PR70-R4-01 safe-redrive)
+
+```
+[Envelope 1c: W12-owned, Sent-replay NotFound only]
+  with_immediate(pool, |tx| async {
+    1. fiscal_documents::transition_state(tx, doc_id, Sent, ErrorRetryable)
+       (whitelisted edge per W9b W6 + HIGH-C5-3 contract; safe Pattern B
+        redrive precondition; doc is missing on DPS side, repeated
+        lastChk cannot create the record — only stage_send resend can).
+    2. Stamp durable `TransientRetry` retry_class label via the same
+       transport_trace mechanism the boot dispatcher uses; see
+       `boot_phase.rs:733` for the reference pattern.  This makes the
+       ER class guard's evaluate_er_redrive policy authorize bounded
+       redrive on the next tick (`MAX_BOOT_ATTEMPTS=5` cap applies).
+    3. audit_log::append_tx(tx, "OFFLINE_DRAIN_SENT_NOT_FOUND_DOWNGRADE",
+       payload).
+  })
+  // Caller returns DocVerdict::HoldFnDrain — drain stops at this doc
+  // for W0b ordering; doc_i+1 NOT sent in this tick.
+```
+
+Outcome class `Kvt2ConfirmOutcome::SentNotFoundDowngrade` is exclusive to the Sent-replay arm.  Sent-fresh + Kvt1 re-entry never emit this variant (NotFound from those contexts indicates a stage_send / state-machine drift, not safe-redrive — routed as `StructuralDrift` instead).
+
+### Envelope 2 — identical for all success paths
 
 ```
 [Envelope 2: stage_finalize::run-owned, called from drain after envelope 1 commits]
@@ -126,7 +151,7 @@ W12 is the **WebCheck / gRPC** confirmation path only.  The `lastChk(fn_sign)` e
 ## Files (proposed)
 
 - **NEW** `rust/prro/src/services/offline_sync/kvt2_confirm.rs` — typed surface + helper:
-  - `pub enum Kvt2ConfirmOutcome { Acked { kvt1_raw_bytes: Vec<u8> }, Hold(Kvt2ConfirmHoldReason), StructuralDrift(Kvt2ConfirmStructuralReason) }`
+  - `pub enum Kvt2ConfirmOutcome { Acked { kvt1_raw_bytes: Vec<u8> }, Hold(Kvt2ConfirmHoldReason), StructuralDrift(Kvt2ConfirmStructuralReason), SentNotFoundDowngrade }` — last variant Sent-replay only; carries no fields because the routing is fixed (Sent → ER + TransientRetry stamp).
   - `pub enum Kvt2ConfirmHoldReason { DpsTransport(String), DpsServer(String), DpsAuthorization(String), DpsDecode(String), LastChkIdMismatch{observed:String, expected:String}, LastChkDataSignEmpty }` — **all hold; doc state UNCHANGED per W0b §97-102**; drain-control = **STOP FN DRAIN** at this doc (NOT sibling-continue; preserves W0b latest-doc precondition); replayable next tick via the appropriate cohort re-entry seam (Sent OR Kvt1). **MED-PR70-R3-02 fix**: variant set aligned with the actual `DpsChannel::last_chk -> Result<CheckAck, DpsError>` surface at `rust/prro/src/transports/dps/channel.rs:24`.  `CheckAck` is the status==OK payload only (`rust/prro/src/transports/dps/dto.rs:62`); non-OK statuses are decoded into `DpsError::{Transport, Server, Authorization, Decode}` upstream (`rust/prro/src/transports/dps/dto.rs:148`).  `LastChkStatusNotOk` removed as unobservable through this surface.  `LastChkIdMismatch` + `LastChkDataSignEmpty` remain because they apply to a successful `Ok(CheckAck)` whose decoded fields fail the W0b evidence check.
   - `pub enum Kvt2ConfirmStructuralReason { ServerFiscalNoMissing, CasMissOnAdvance{from:DocState, to:DocState, observed:DocState} }` — structural-invariant breach (stage_send 4-b set server_fiscal_no NOT NULL invariant broken / concurrent writer skew); surfaces as `BootError::Internal` for fail-loud forensics.  NOT manual-recon escalation — these indicate higher-level state corruption that operator triage cannot heal at the doc-level.
   - `pub async fn confirm_drain_doc(pool, dps, doc_id, fn_sign) -> Result<Kvt2ConfirmOutcome, BootError>` — pure helper; `lastChk` DPS call OUTSIDE any `with_immediate` per I1.  Invoked from BOTH Sent-source AND Kvt1-source drain dispatch arms.
@@ -138,11 +163,17 @@ W12 is the **WebCheck / gRPC** confirmation path only.  The `lastChk(fn_sign)` e
     - **`HoldFnDrain` → STOP this FN's drain at the held doc**; subsequent backlog docs in this tick NOT processed; summary records held-at-Kvt1 counter; finalize-eligibility check returns `NotEligible { DocsHeldAtKvt1 }`.  NO shift escalation.  NO sibling-continue.  This is the W0b latest-doc precondition enforcement (HIGH-PR70-R2-01 fix).
   - Replace `apply_w12_confirmation` stub body with kvt2_confirm-backed implementation.  The function continues to be invoked from `process_via_stage_send` post-`StageSendOutcome::Sent` AND from the rewritten `process_via_w12_only`.
   - Rewrite `process_via_w12_only` (currently a stub that always returns `DeferredKvt1`): on `DocState::Kvt1` cohort dispatch, invoke `kvt2_confirm::confirm_drain_doc` with the doc's existing `server_fiscal_no` (from prior-tick `Sent → Kvt1` advance) → route outcomes per the Acked/Hold/StructuralDrift table.  This is the **Kvt1 re-entry seam** required for HIGH-PR70-R2-01 fix.  Source state Kvt1 means the doc was Held on a prior tick after a successful Sent→Kvt1 mid-tick advance (legacy stub) OR persisted Kvt1 from an in-tick crash AFTER Envelope 1a's Sent→Kvt1 step but before the Kvt1→Kvt2 step.  kvt2_confirm re-runs the same evidence check; the W0b latest-doc precondition holds because Hold stops further same-FN sends.
-  - **Rewrite `process_via_lastchk_replay`** to be W12-aware (HIGH-PR70-R3-01 fix): on `DocState::Sent` cohort dispatch, invoke `kvt2_confirm::confirm_drain_doc` (same helper as Sent-fresh and Kvt1 entries).  Route outcomes:
-    - `Acked { kvt1_raw_bytes }` → Envelope 1a chain (Kvt1Raw via `document_files::replace_tx` + `Sent → Kvt1` + `Kvt1 → Kvt2` + audit) then Envelope 2 (`stage_finalize::run`).  Audit `dispatch_via="kvt2_confirm_sent_replay"` for forensic distinction from Sent-fresh `kvt2_confirm_sent_fresh` and Kvt1 `kvt2_confirm_kvt1_reentry`.  Summary `record_doc_advanced` with `via_lastchk_replay=true` (preserves W9b replay-flag semantic).
-    - `Hold(_)` → `DocVerdict::HoldFnDrain` (stops FN drain at this doc; doc stays in Sent; next-tick re-entry through same Sent-replay seam).  Replaces current sibling-continue routing for `TransportRetry` / `NotFound` / `Mismatch` / `Decode` / `Unexpected` outcomes.
-    - `StructuralDrift(_)` → `BootError::Internal` (halt entire FN drain).
-  - Retire current process_via_lastchk_replay's separate per-outcome routing (TransportRetry / NotFound downgrade-to-ER / Mismatch / Decode / Unexpected) **in favor of unified W12 verdicts via kvt2_confirm**.  The HIGH-C5-3 `NotFound → ErrorRetryable downgrade` is replaced by W12-Hold semantics (doc stays Sent, next-tick re-enters Sent replay seam) — operator-pinned trade-off: NotFound on a Sent doc with stamped `server_fiscal_no` is no more recoverable through ER class guard than through repeated Sent-replay attempts, and unifying through Hold preserves the W0b latest-doc precondition.  This is a deliberate scope decision flagged for operator review during W12 implementation.
+  - **Rewrite `process_via_lastchk_replay`** to be W12-aware (HIGH-PR70-R3-01 fix) while **preserving HIGH-C5-3 NotFound safe-redrive semantics** (HIGH-PR70-R4-01 reversal of prior R3 over-reach): on `DocState::Sent` cohort dispatch, run lastChk probe and route the underlying `last_chk_probe::ProbeOutcome` variants into W12 verdicts:
+    - `Match` (id+data_sign evidence ok) → `Kvt2ConfirmOutcome::Acked` → Envelope 1a chain (Kvt1Raw via `document_files::replace_tx` + `Sent → Kvt1` + `Kvt1 → Kvt2` + audit) then Envelope 2 (`stage_finalize::run`).  Audit `dispatch_via="kvt2_confirm_sent_replay"` for forensic distinction from Sent-fresh `kvt2_confirm_sent_fresh` and Kvt1 `kvt2_confirm_kvt1_reentry`.  Summary `record_doc_advanced` with `via_lastchk_replay=true` (preserves W9b replay-flag semantic).
+    - `NotFound` (DPS has zero history of `server_fiscal_no`) → **NEW** `Kvt2ConfirmOutcome::SentNotFoundDowngrade` outcome (Sent-replay arm only).  This is the safe Pattern B redrive case per `last_chk_probe.rs:19` + W9b spec HIGH-C5-3 contract: the doc is missing on DPS side, repeated lastChk will never create the record — the recovery action is **resend through stage_send**, not poll forever.  Routing:
+      - **Envelope 1c (NEW, W12-owned, Sent-replay NotFound only)**: atomically commits `Sent → ErrorRetryable` via `transition_state` + stamps durable `TransientRetry` label via the same `transport_trace` mechanism the boot dispatcher uses (see `boot_phase.rs:733` for the reference pattern) + emits `OFFLINE_DRAIN_SENT_NOT_FOUND_DOWNGRADE` audit.  No DPS call inside envelope (I1 preserved).
+      - Returns `DocVerdict::HoldFnDrain { class: FailureClass::SentNotFoundDowngrade }` — **stops current FN drain at this doc** for W0b ordering (HIGH-PR70-R3-01 invariant; doc_i+1 NOT sent in this tick).
+      - **Next tick**: doc is in `ErrorRetryable` state; cohort walker emits via ER dispatch arm (W9b ER class guard).  ER guard reads durable `retry_class='TransientRetry'` + `attempts_used` budget via `evaluate_er_redrive` → if under-budget calls `stage_send::run` (Pattern B `ErrorRetryable → Sending → Sent` redrive).  Post-redrive `Sent` outcome runs `kvt2_confirm` on the new server_fiscal_no.  If DPS now has the record → Match → Acked path.  If still NotFound → loop bounded by ER class guard's `MAX_BOOT_ATTEMPTS=5` budget cap → eventually `Kvt2ConfirmOutcome::Hold` (via boot_phase's `cas_error_retryable_budget_exhausted` ER manual escalation; M3a hardening pass).  No infinite Hold loop; no W0b ordering violation.
+    - `TransportRetry` (DpsError::Transport from last_chk; network blip) → `Kvt2ConfirmOutcome::Hold(DpsTransport)` → `DocVerdict::HoldFnDrain`; doc stays Sent; next-tick Sent-replay re-entry.
+    - `Mismatch` (response.id != server_fiscal_no) → `Kvt2ConfirmOutcome::StructuralDrift(LastChkIdMismatch)` → `BootError::Internal`.  Operator-pinned: id mismatch on a Sent-stamped doc means DPS / local state divergence past the App reconcile mutex; this is system-level, not per-doc operator-actionable.
+    - `Decode` (DpsError::Decode) → `Kvt2ConfirmOutcome::Hold(DpsDecode)` → `DocVerdict::HoldFnDrain`; transient malformed response.
+    - `Unexpected` (other DpsError variants surfacing through probe; e.g. Authorization, Server) → `Kvt2ConfirmOutcome::Hold(DpsServer | DpsAuthorization)` per actual variant → `DocVerdict::HoldFnDrain`.
+  - **Why NotFound stays in the safe-redrive contract**: a Held Sent-replay NotFound that NEVER downgrades to ER would never resend → DPS never receives the doc → lastChk indefinitely returns NotFound → drain blocks at this doc forever (liveness hole flagged by operator finding HIGH-PR70-R4-01).  The boot-time `boot_phase` Sent-NotFound dispatcher already uses the `Sent → ErrorRetryable + TransientRetry stamp` pattern with successful M3a/M3b two-tick replay convergence; W12 reuses the same shape.  This is NOT a reversion of HIGH-PR70-R3-01: drain still stops at the held doc this tick (`HoldFnDrain` drain control preserved); next-tick redrive goes through the bounded ER class guard path; the W0b latest-doc precondition is preserved because no later same-FN send can occur this tick AND any next-tick redrive runs through the same FN-scoped drain loop under App reconcile mutex.
   - Route `Kvt2ConfirmOutcome::Acked { kvt1_raw_bytes }` through the **two-envelope ladder** (see §"Transaction envelope shape").  Envelope 1 is state-specific:
     - Sent-source: persist `Kvt1Raw` artefact via `document_files::replace_tx` + CAS `Sent → Kvt1` + CAS `Kvt1 → Kvt2` + `OFFLINE_DRAIN_KVT2_ADVANCED` audit (atomic).
     - Kvt1-source: persist `Kvt1Raw` + CAS `Kvt1 → Kvt2` + audit (atomic).
@@ -177,7 +208,7 @@ See §"Day-budget breakdown" for commit-level allocation.
 - **Commit 3 — cohort widening + Kvt2 dispatch arm**: `fiscal_documents::list_drain_candidates_for_fn_ordered_by_lnd` SELECT IN list extended to include `KVT2` (reverses MED-C5-4); `backlog_drain.rs::process_one_doc` adds `DocState::Kvt2` dispatch arm routing to new `process_via_w12_kvt2_advance` (calls `stage_finalize::run`).  Integration test: KVT2 cohort entry dispatches to stage_finalize and reaches Ack.
 - **Commit 4 — Sent-source W12 wiring (Envelope 1a + Envelope 2)**: replace `apply_w12_confirmation` stub body — on `StageSendOutcome::Sent` outcome, call `kvt2_confirm::confirm_drain_doc`; on `Acked` route through Envelope 1a (Kvt1Raw via `document_files::replace_tx` + `Sent → Kvt1` CAS + `Kvt1 → Kvt2` CAS + `OFFLINE_DRAIN_KVT2_ADVANCED` audit, all atomic) then Envelope 2 (`stage_finalize::run`).
 - **Commit 5 — Kvt1-source W12 wiring (Envelope 1b + Envelope 2)**: rewrite `process_via_w12_only` to invoke `kvt2_confirm::confirm_drain_doc` on doc's existing `server_fiscal_no`; on `Acked` route through Envelope 1b (Kvt1Raw + `Kvt1 → Kvt2` + audit) then Envelope 2.  This is the **Kvt1 re-entry seam** for prior-tick-Held docs (HIGH-PR70-R2-01 fix).
-- **Commit 5b — Sent-replay W12 wiring (Envelope 1a + Envelope 2)** (HIGH-PR70-R3-01 fix): rewrite `process_via_lastchk_replay` to invoke `kvt2_confirm::confirm_drain_doc` (same helper); on `Acked` route through Envelope 1a chain (Sent→Kvt1→Kvt2 + Kvt1Raw + audit with `dispatch_via="kvt2_confirm_sent_replay"`, `via_lastchk_replay=true`) then Envelope 2.  Retire current per-outcome routing (TransportRetry/NotFound-downgrade/Mismatch/Decode/Unexpected → sibling-continue and manual-recon mix) in favor of unified W12 Acked/Hold/StructuralDrift verdicts.  This closes the W0b latest-doc precondition gap: Sent replay/crash-recovery no longer allows later same-FN sends after a Held doc.  Includes deliberate retirement of HIGH-C5-3 `NotFound → ErrorRetryable` downgrade flagged for operator confirmation during W12 implementation.
+- **Commit 5b — Sent-replay W12 wiring (Envelope 1a + Envelope 1c + Envelope 2)** (HIGH-PR70-R3-01 + HIGH-PR70-R4-01 fixes): rewrite `process_via_lastchk_replay` to drive lastChk probe and route ProbeOutcome variants into W12 verdicts.  Match → Envelope 1a chain (Sent→Kvt1→Kvt2 + Kvt1Raw + audit, `dispatch_via="kvt2_confirm_sent_replay"`, `via_lastchk_replay=true`) then Envelope 2.  **NotFound → SentNotFoundDowngrade outcome** (HIGH-PR70-R4-01 reversal of R3 over-reach): Envelope 1c (atomic Sent→ER + TransientRetry retry_class stamp + audit) + HoldFnDrain drain control; preserves HIGH-C5-3 safe-redrive semantics while enforcing W0b ordering.  TransportRetry/Decode → Hold(DpsTransport|DpsDecode) → HoldFnDrain.  Mismatch → StructuralDrift.  Other DpsError → Hold(DpsServer|DpsAuthorization).  Closes W0b latest-doc precondition gap AND preserves the safe Pattern B redrive for "DPS has zero history" case.
 - **Commit 6 — Hold path (W0b state-unchanged + drain-stop conformance)**: route `Kvt2ConfirmOutcome::Hold(_)` through `DocVerdict::HoldFnDrain { class: hold-specific FailureClass }`; emit `KVT2_CONFIRM_HOLD` Warning audit with typed reason payload; no CAS.  Drain loop stops at this doc for this tick (per Commit 2 semantics).  Pending-drain shifts: Hold neither halts via Manual escalation nor continues past held doc.
 - **Commit 7 — StructuralDrift path**: route `Kvt2ConfirmOutcome::StructuralDrift(_)` as `BootError::Internal` propagation; halts entire FN drain.  NO per-doc Manual CAS (would mask systemic skew).
 - **Commit 8 — fixture acceptance**: 9 helper-typed + 10 drain-integration fixtures including Sent-fresh Acked, Sent-replay Acked, Kvt1-reentry Acked, all 6 Hold reasons (DpsTransport / DpsServer / DpsAuthorization / DpsDecode / LastChkIdMismatch / LastChkDataSignEmpty), 2 StructuralDrift sub-cases, plus all three Hold-blocks-doc-i+1 entry-point proofs (see Acceptance §Fixture matrix).
@@ -216,6 +247,7 @@ See §"Day-budget breakdown" for commit-level allocation.
    - `Kvt1Raw` bytes match `lastChk.data_sign` byte-for-byte (HIGH-C5-2 contract preserved; W9b lastChk-replay-match path's KVT1_RAW persistence pattern reused).
 6. **W0b §97-102 state-unchanged conformance for evidence failures**: on `status != OK` OR id mismatch OR missing/empty `data_sign` OR DPS transport/server errors → `Kvt2ConfirmOutcome::Hold(reason)` → `DocVerdict::HoldFnDrain` → doc state UNCHANGED → `KVT2_CONFIRM_HOLD` Warning audit with typed reason payload → **STOP FN DRAIN this tick**.  No CAS to Manual.  No sibling-continue past held doc.
 7. **Structural-drift failures**: `ServerFiscalNoMissing` (stage_send 4-b invariant breach) OR `CasMissOnAdvance` (concurrent writer past App mutex) → `Kvt2ConfirmOutcome::StructuralDrift(reason)` → `BootError::Internal` propagation halts entire FN drain.  No per-doc Manual CAS (would mask systemic skew).
+7a. **Sent-replay NotFound safe-redrive (HIGH-PR70-R4-01 reversal of R3 over-reach)**: on Sent-replay arm only, `last_chk_probe::ProbeOutcome::NotFound` → `Kvt2ConfirmOutcome::SentNotFoundDowngrade` → Envelope 1c (atomic `Sent → ErrorRetryable` + durable `TransientRetry` retry_class stamp + audit) → `DocVerdict::HoldFnDrain` drain control (stops FN drain this tick).  Next tick: ER cohort dispatch → W9b ER class guard `evaluate_er_redrive` reads `TransientRetry` + budget → bounded Pattern B redrive via `stage_send::run`.  Preserves HIGH-C5-3 + boot dispatcher Sent-NotFound shape; closes the indefinite-Hold liveness hole that R3 over-reach would have created.  NotFound from Sent-fresh OR Kvt1 re-entry routes as `StructuralDrift` instead (those contexts have no safe-redrive interpretation — would indicate state-machine drift past App mutex).
 8. `passive_hold_kvt1` remains the primary boot-time handler for arbitrary/stale `Kvt1` docs outside drain context.  W12 does NOT change boot-time KVT1 dispatch.  Drain Kvt1 re-entry seam is distinct from boot-time stale-Kvt1 handling.
 9. **Kvt2 boot-recovery path preserved**: `boot_phase::dispatch_pending_doc::DocState::Kvt2` arm (line 2468) continues to drive any orphaned `Kvt2` docs through `stage_finalize::run`; W12 does NOT touch this arm.
 
@@ -242,7 +274,7 @@ See §"Day-budget breakdown" for commit-level allocation.
 19. Crash between Envelope 1 commit and Envelope 2 invocation: doc in `Kvt2` → boot recovery via `boot_phase::dispatch_pending_doc::DocState::Kvt2` (existing M3a path) OR mid-tick cohort widening dispatches to `process_via_w12_kvt2_advance` and lands `Ack` idempotently in the same tick.
 20. Crash mid-Envelope 2 (`stage_finalize::run` internal): doc in `Kvt2` (CAS not applied) → same boot/in-tick recovery lands `Ack`.
 
-### Fixture matrix (23 fixtures total)
+### Fixture matrix (31 fixtures total)
 
 W12-confirm helper (typed surface validation, no DB) — **6 fixtures**, one per retained Hold class + happy + StructuralDrift:
 - `kvt2_confirm_lastchk_match_returns_acked` (Acked success path)
@@ -254,8 +286,11 @@ W12-confirm helper (typed surface validation, no DB) — **6 fixtures**, one per
 - `kvt2_confirm_dps_decode_error_returns_hold_dps_decode` (Hold::DpsDecode — malformed lastChk response)
 - `kvt2_confirm_no_server_fiscal_no_returns_structural_drift` (StructuralDrift::ServerFiscalNoMissing → BootError::Internal upstream)
 - `kvt2_confirm_cas_miss_on_kvt1_to_kvt2_returns_structural_drift` (StructuralDrift::CasMissOnAdvance)
+- `kvt2_confirm_sent_replay_lastchk_not_found_returns_sent_not_found_downgrade` (SentNotFoundDowngrade — Sent-replay arm only)
+- `kvt2_confirm_sent_fresh_lastchk_not_found_returns_structural_drift` (NotFound from Sent-fresh = state-machine drift, distinct from Sent-replay safe-redrive)
+- `kvt2_confirm_kvt1_reentry_lastchk_not_found_returns_structural_drift` (same; Kvt1 NotFound = drift)
 
-(Helper subtotal: 9 fixtures — every Hold variant has one named fixture per LOW-PR70-R3-03 fix.)
+(Helper subtotal: 12 fixtures — every Kvt2ConfirmOutcome variant has at least one named fixture, plus context-disambiguation for NotFound.)
 
 Drain integration — W0b latest-doc precondition proofs (HIGH-PR70-R2-01 + R3-01 CORE) — **9 fixtures**:
 - `w12_sent_fresh_acked_runs_envelope_1a_chain_to_ack` (Sent-fresh → Acked → Envelope 1a Sent→Kvt1→Kvt2 + Envelope 2 Kvt2→Ack; Kvt1Raw persisted via document_files::replace_tx)
@@ -268,8 +303,13 @@ Drain integration — W0b latest-doc precondition proofs (HIGH-PR70-R2-01 + R3-0
 - `w12_pending_drain_hold_does_not_escalate_shift_but_does_not_continue` (OpenedLocalPendingDrain: Hold neither manual-escalates NOR sibling-continues; covers all three entry points)
 - `backlog_drain_no_next_send_before_current_lastchk` (W0b interleave proof per umbrella plan)
 - `backlog_drain_completes_finalize_after_w12_acked` (finalize unblock proof)
+- `w12_sent_replay_not_found_atomically_downgrades_to_er_with_transient_retry_label` (Envelope 1c proof — atomic CAS + retry_class stamp + audit; HIGH-PR70-R4-01 core)
+- `w12_sent_replay_not_found_blocks_doc_i_plus_1_send_in_same_tick` (HoldFnDrain drain control preserved; W0b ordering maintained)
+- `w12_sent_replay_not_found_next_tick_redrives_through_er_class_guard_to_ack` (full safe-redrive cycle: tick-N NotFound → tick-N+1 ER → stage_send Pattern B → Sent → kvt2_confirm Match → Ack)
+- `w12_sent_replay_not_found_negative_no_direct_sent_to_sending_resend` (negative proof: no whitelist bypass; Sent→Sending only via stage_send 4-pre after Sent→ER downgrade lands the doc in ER)
+- `w12_sent_replay_not_found_indefinite_failure_bounded_by_er_budget` (after MAX_BOOT_ATTEMPTS=5 redrive ticks all returning NotFound, doc lands in RequiresManualReconciliation via ER class guard budget-exhausted path; no infinite Hold loop)
 
-(Drain integration subtotal: 10 fixtures.)
+(Drain integration subtotal: 15 fixtures.)
 
 Crash-recovery convergence (MANDATORY per MED-PR70-01) — **4 fixtures**:
 - `replay_crash_inside_envelope_1a_rollback_then_next_tick_reaches_ack_via_sent_replay`
@@ -277,7 +317,7 @@ Crash-recovery convergence (MANDATORY per MED-PR70-01) — **4 fixtures**:
 - `replay_crash_between_envelope_1_and_envelope_2_lands_ack_via_boot_or_intick_kvt2_dispatch`
 - `replay_crash_mid_envelope_2_lands_ack_idempotent`
 
-**Total: 23 fixtures** (9 helper + 10 drain integration + 4 crash-recovery).  Each retained `Kvt2ConfirmHoldReason` variant has exactly one named helper fixture; each entry point (Sent-fresh / Sent-replay / Kvt1) has matched Acked + Hold drain proofs.
+**Total: 31 fixtures** (12 helper + 15 drain integration + 4 crash-recovery).  Each retained `Kvt2ConfirmOutcome` variant has at least one named helper fixture; each entry point (Sent-fresh / Sent-replay / Kvt1) has matched Acked + Hold drain proofs; Sent-replay NotFound safe-redrive (HIGH-PR70-R4-01) has 5 dedicated fixtures covering atomic Envelope 1c + drain stop + next-tick redrive + negative whitelist proof + budget-bounded liveness.
 
 ---
 
@@ -337,7 +377,7 @@ W12 introduces no per-doc Manual CAS (failure semantics revised to Hold per W0b 
 | Commit 3 (cohort widening + KVT2 dispatch) | 0.25 | SELECT IN widening + new process_via_w12_kvt2_advance arm |
 | Commit 4 (Sent-source W12 wiring) | 0.5 | Envelope 1a (Kvt1Raw + Sent→Kvt1 + Kvt1→Kvt2 + audit) + Envelope 2 chain |
 | Commit 5 (Kvt1-source W12 wiring) | 0.5 | process_via_w12_only rewrite; Envelope 1b + Envelope 2 chain |
-| Commit 5b (Sent-replay W12 wiring, HIGH-PR70-R3-01) | 0.5 | process_via_lastchk_replay rewrite; W12-aware Acked/Hold/StructuralDrift unification; retires HIGH-C5-3 ER downgrade |
+| Commit 5b (Sent-replay W12 wiring, HIGH-PR70-R3-01 + R4-01) | 0.75 | process_via_lastchk_replay rewrite; W12-aware Acked/Hold/StructuralDrift + SentNotFoundDowngrade; Envelope 1c (Sent→ER + retry_class stamp); preserves HIGH-C5-3 safe-redrive |
 | Commit 6 (Hold path) | 0.25 | DocVerdict::HoldFnDrain routing + KVT2_CONFIRM_HOLD audit |
 | Commit 7 (StructuralDrift path) | 0.25 | BootError::Internal propagation |
 | Commit 8 (12 fixture acceptance) | 0.75 | scripted DpsChannel stub fixtures including all Hold sub-classes + Sent/Kvt1 source path proofs |
@@ -346,7 +386,7 @@ W12 introduces no per-doc Manual CAS (failure semantics revised to Hold per W0b 
 | Commit 11 (crash-recovery convergence, MANDATORY) | 0.5 | 4 deterministic-replay fixtures (#18-20) |
 | Review rounds + polish | 0.5 | per M3b convention (1-3 rounds typical for hot-zone PRs) |
 
-**Total: ~5.5d** (revised upward after third-pass operator review; HIGH-PR70-R3-01 adds a third W12 entry point — process_via_lastchk_replay rewrite — plus retired HIGH-C5-3 NotFound→ER downgrade requires deliberate operator confirmation during implementation).  Previous totals: 1.5–2d (umbrella plan estimate) → 2.5–3d (post first-pass MED fixes) → ~5d (post-R2 HoldFnDrain infrastructure) → ~5.5d (post-R3 Sent replay W12-awareness).
+**Total: ~6d** (revised after four operator review passes).  HIGH-PR70-R3-01 added the third W12 entry point (process_via_lastchk_replay rewrite); HIGH-PR70-R4-01 reversed the R3 over-reach on HIGH-C5-3 retirement, added `Kvt2ConfirmOutcome::SentNotFoundDowngrade` + Envelope 1c (atomic Sent→ER + TransientRetry stamp) + 5 dedicated NotFound safe-redrive fixtures.  Previous totals: 1.5–2d (umbrella estimate) → 2.5–3d (first-pass MEDs) → ~5d (R2 HoldFnDrain) → ~5.5d (R3 Sent replay W12-awareness) → ~6d (R4 NotFound safe-redrive preserved).
 
 ---
 
@@ -402,10 +442,11 @@ cargo fmt -p prro -- --check
     "Pending-drain Hold does NOT escalate shift AND does NOT continue past held doc",
     "kvt1_raw_bytes persisted byte-for-byte via document_files::replace_tx(Kvt1Raw) (HIGH-C5-2 contract preserved)",
     "crash-recovery convergence proofs MANDATORY: Envelope-1a/1b rollback / between-1-and-2 / mid-Envelope-2",
-    "23 fixtures total: 9 helper-typed (1 Acked + 6 Hold variants + 2 StructuralDrift) + 10 drain integration (3 Acked entry points + 3 Hold-block-doc-i+1 + finalize/interleave/consecutive-Hold/pending-drain) + 4 crash-recovery convergence"
+    "31 fixtures total: 12 helper-typed (1 Acked + 6 Hold variants + 2 StructuralDrift + SentNotFoundDowngrade + 2 NotFound-context-disambiguation) + 15 drain integration (3 Acked entry points + 3 Hold-block-doc-i+1 + finalize/interleave/consecutive-Hold/pending-drain + 5 Sent-replay NotFound safe-redrive fixtures) + 4 crash-recovery convergence",
+    "HIGH-PR70-R4-01: Sent-replay NotFound preserves HIGH-C5-3 safe Pattern B redrive via SentNotFoundDowngrade outcome (atomic Sent→ER + TransientRetry stamp + audit), bounded by ER class guard MAX_BOOT_ATTEMPTS=5 budget; HoldFnDrain drain control preserves W0b ordering"
   ],
   "blockedBy": ["W0b", "W1", "W2", "W3", "W9b", "W9b-er-class-guard"],
   "unblocks": ["W13", "M3b-closure-final", "Phase-6-pilot-acceptance"],
-  "operatorFindingsClosed": ["MED-PR70-01", "MED-PR70-02", "HIGH-PR70-R2-01", "MED-PR70-R2-02", "LOW-PR70-R2-03", "HIGH-PR70-R3-01", "MED-PR70-R3-02", "LOW-PR70-R3-03"]
+  "operatorFindingsClosed": ["MED-PR70-01", "MED-PR70-02", "HIGH-PR70-R2-01", "MED-PR70-R2-02", "LOW-PR70-R2-03", "HIGH-PR70-R3-01", "MED-PR70-R3-02", "LOW-PR70-R3-03", "HIGH-PR70-R4-01"]
 }
 ```
