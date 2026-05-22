@@ -2,4 +2,5 @@
 //! drain coordinator).
 
 pub mod backlog_drain;
+pub mod kvt2_confirm;
 pub mod return_online_probe;
