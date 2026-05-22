@@ -403,7 +403,12 @@ pub enum FinalizeEligibility {
 
 /// Why the drain cannot finalize.  Used in `OFFLINE_DRAIN_PARTIAL`
 /// audit payload for operator forensic triage.
+///
+/// `#[non_exhaustive]` — semver-stability for downstream pattern
+/// matching as new finalize-blocker categories arrive (W12 Commit 2
+/// added 3 new W12-projection variants; future tasks may add more).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NotEligibleReason {
     /// At least one doc failed per-doc processing.  Sibling docs
     /// may have succeeded but at least one failure prevents finalize.
