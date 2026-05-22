@@ -60,8 +60,14 @@ Envelope 1 owns the source-state-specific advance from the pre-W12 state to `Kvt
        (whitelisted edge; transitions immediately within the same envelope to
         avoid a Kvt1-intermediate window inside this drain tick).
     4. audit_log::append_tx(tx, "OFFLINE_DRAIN_KVT2_ADVANCED", payload)
-       (W12 evidence trail; payload includes from_state="SENT", to_state="KVT2",
-        dispatch_via="kvt2_confirm", server_fiscal_no, kvt1_raw_sha256_hex).
+       (W12 evidence trail; payload includes from_state=doc.state.as_str(),
+        to_state="KVT2", dispatch_via="kvt2_confirm", server_fiscal_no,
+        kvt1_raw_sha256_hex.  LOW-PR70-R12-02 fix: `from_state` preserves
+        cohort-entry convention from current W9b code at
+        `backlog_drain.rs:848` — yields "OFFLINE_LOCAL_ACK" or
+        "ERROR_RETRYABLE" for pure-offline drains, distinct from
+        Sent-replay's literal "SENT".  Operator dashboards filtering
+        by cohort-entry state continue to work).
   })
 ```
 
@@ -302,9 +308,9 @@ W12 is the **WebCheck / gRPC** confirmation path only.  The `lastChk(fn_sign)` e
 
   `confirm_drain_doc` is **helper-heavy**: it owns ALL envelope commits up to and including the state advance to `Kvt2` (for Acked path) or to `ErrorRetryable` (for SentNotFoundDowngrade path) or trace-completion-with-no-state-change (for Hold path) or trace-completion-with-fail-loud (for StructuralDrift path).  Specifically:
 
-  - **Sent-fresh source**: helper runs Envelope 1a (Kvt1Raw + Sent→Kvt1 + Kvt1→Kvt2 + audit) on Acked; no envelope on Hold (returns outcome with state unchanged); no envelope on StructuralDrift (returns outcome with state unchanged + `BootError::Internal` propagation via caller).
-  - **Sent-replay source**: helper runs Envelope 1c-pre (trace allocate) → DPS call → outcome-specific completion envelope (1a-replay / 1c-post / 1c-hold / 1c-drift).
-  - **Kvt1 re-entry source**: helper runs Envelope 1b (Kvt1Raw + Kvt1→Kvt2 + audit) on Acked; no envelope on Hold/StructuralDrift.
+  - **Sent-fresh source**: helper runs Envelope 1a (Kvt1Raw + Sent→Kvt1 + Kvt1→Kvt2 + `OFFLINE_DRAIN_KVT2_ADVANCED` audit) on Acked.  On Hold, helper runs **Envelope 1c-hold-light** (audit-only) — one `with_immediate` containing only `audit_log::append_tx("KVT2_CONFIRM_HOLD", ...)`; doc state unchanged.  On StructuralDrift, helper runs **Envelope 1c-drift-light** (audit-only) — one `with_immediate` containing only `audit_log::append_tx("KVT2_CONFIRM_STRUCTURAL_DRIFT", ...)`; doc state unchanged.  Then helper returns the outcome variant for caller to project to `DocVerdict` and (for StructuralDrift) propagate `BootError::Internal` (MED-PR70-R12-01 fix: helper-heavy ownership extended to audit emission for Hold/StructuralDrift contexts that don't allocate trace rows; cross-context consistency with SentReplay's bundled 1c-hold and 1c-drift envelopes).
+  - **Sent-replay source**: helper runs Envelope 1c-pre (trace allocate) → DPS call → outcome-specific completion envelope (1a-replay on Acked / 1c-post on NotFound / 1c-hold on Hold / 1c-drift on StructuralDrift) — each bundles trace.complete + audit atomically.
+  - **Kvt1 re-entry source**: helper runs Envelope 1b (Kvt1Raw + Kvt1→Kvt2 + `OFFLINE_DRAIN_KVT2_ADVANCED` audit) on Acked.  On Hold, helper runs Envelope 1c-hold-light (audit-only `KVT2_CONFIRM_HOLD` emit; doc state unchanged in Kvt1).  On StructuralDrift, helper runs Envelope 1c-drift-light (audit-only `KVT2_CONFIRM_STRUCTURAL_DRIFT` emit; doc state unchanged in Kvt1) → caller propagates `BootError::Internal`.
 
   Helper returns `Kvt2ConfirmOutcome` carrying ONLY forensic data needed for caller projection:
   - `Acked { kvt1_raw_bytes, sent_replay_trace_attempt_no }` — Envelope 1 ALREADY committed; doc state is `Kvt2`; caller invokes Envelope 2 (`stage_finalize::run`).
@@ -586,10 +592,10 @@ W12 introduces no per-doc Manual CAS (failure semantics revised to Hold per W0b 
 | Commit 3 (cohort widening + KVT2 dispatch) | 0.25 | SELECT IN widening + new process_via_w12_kvt2_advance arm |
 | Commit 4 (Sent-source W12 wiring) | 0.5 | Envelope 1a (Kvt1Raw + Sent→Kvt1 + Kvt1→Kvt2 + audit) + Envelope 2 chain |
 | Commit 5 (Kvt1-source W12 wiring) | 0.5 | process_via_w12_only rewrite; Envelope 1b + Envelope 2 chain |
-| Commit 5b (Sent-replay W12 wiring, HIGH-PR70-R3-01 + R4-01 + R8-01) | 0.75 | process_via_lastchk_replay rewrite using canonical `dps.by_server_fiscal_no(fn_sign, &doc.server_fiscal_no)`; full envelope chain: 1c-pre (allocate_and_insert_tx) → 1a-replay on Acked (trace.complete OK + Kvt1Raw + Sent→Kvt1 + Kvt1→Kvt2) → 1c-post on NotFound (trace.complete TransientRetry + Sent→ER) → 1c-hold on Hold (trace.complete RetryableTransport|Server) → 1c-drift on ServerFiscalIdMismatch (trace.complete structural + BootError::Internal); preserves HIGH-C5-3 safe-redrive via SentNotFoundDowngrade |
+| Commit 5b (Sent-replay W12 wiring, HIGH-PR70-R3-01 + R4-01 + R8-01 + R11-01) | 0.75 | process_via_lastchk_replay rewrite using canonical `dps.by_server_fiscal_no(fn_sign, expected_server_fiscal_no)` where `expected_server_fiscal_no = doc.server_fiscal_no.as_deref().ok_or(StructuralDrift::ServerFiscalNoMissing)?` (MED-PR70-R11-01 handoff); full envelope chain: 1c-pre (allocate_and_insert_tx) → 1a-replay on Acked (trace.complete OK + Kvt1Raw + Sent→Kvt1 + Kvt1→Kvt2) → 1c-post on NotFound (trace.complete TransientRetry + Sent→ER) → 1c-hold on Hold (trace.complete RetryableTransport|Server) → 1c-drift on ServerFiscalIdMismatch (trace.complete structural + BootError::Internal); preserves HIGH-C5-3 safe-redrive via SentNotFoundDowngrade |
 | Commit 6 (Hold path) | 0.25 | DocVerdict::HoldFnDrain routing + KVT2_CONFIRM_HOLD audit |
 | Commit 7 (StructuralDrift path) | 0.25 | BootError::Internal propagation |
-| Commit 8 (33-fixture acceptance) | 0.75 | scripted DpsChannel stub fixtures: 14 helper-typed + 15 drain integration + 4 crash-recovery |
+| Commit 8 (35-fixture acceptance) | 0.75 | scripted DpsChannel stub fixtures: 14 helper-typed + 17 drain integration + 4 crash-recovery |
 | Commit 9 (W0b latest-doc precondition proofs) | 0.5 | 4 fixtures per Acceptance §3 + §10 (CORE HIGH-PR70-R2-01 verification) |
 | Commit 10 (interleave proof) | 0.25 | extends Commit 9 with send_chk count assertion |
 | Commit 11 (crash-recovery convergence, MANDATORY) | 0.5 | 4 deterministic-replay fixtures (#18-20) |
@@ -651,13 +657,13 @@ cargo fmt -p prro -- --check
     "Pending-drain Hold does NOT escalate shift AND does NOT continue past held doc",
     "kvt1_raw_bytes persisted byte-for-byte via document_files::replace_tx(Kvt1Raw) (HIGH-C5-2 contract preserved)",
     "crash-recovery convergence proofs MANDATORY: Envelope-1a/1b rollback / between-1-and-2 / mid-Envelope-2",
-    "35 fixtures total: 14 helper-typed (1 Acked + 5 Hold variants + 2 StructuralDrift base + SentNotFoundDowngrade + NotFound × 3 contexts + Mismatch × 3 contexts via MED-PR70-R5-01 source-context routing matrix) + 15 drain integration + 4 crash-recovery convergence",
+    "35 fixtures total: 14 helper-typed (1 Acked + 5 Hold variants + 2 StructuralDrift base + SentNotFoundDowngrade + NotFound × 3 contexts + Mismatch × 3 contexts via MED-PR70-R5-01 source-context routing matrix) + 17 drain integration (3 Acked entry-points + 3 Hold-blocks-doc-i+1 + pending-drain Hold + consecutive Hold + W0b interleave + finalize unblock + 5 SentReplay NotFound safe-redrive + 2 MED-PR70-R11-01 expected-id handoff proofs) + 4 crash-recovery convergence",
     "MED-PR70-R5-01: source-aware helper signature confirm_drain_doc(..., source: Kvt2ConfirmSource) explicitly distinguishes SentFresh / SentReplay / Kvt1Reentry contexts; LastChkIdMismatch moved Hold → StructuralDrift consistently across all 3 contexts; NotFound routes via context-discriminating matrix (SentReplay → SentNotFoundDowngrade safe-redrive; Sent-fresh + Kvt1 re-entry → StructuralDrift)",
     "MED-PR70-R5-02: Envelope 1c split into 1c-pre (transport_trace::allocate_and_insert_tx allocates fresh recovery row pre-lastChk) + 1c-post (transport_trace::complete_tx completes that exact row with retry_class=TransientRetry; never rewrites prior completed stage_send attempts); mirrors boot_phase.rs:1521-1542 + boot_phase.rs:743-770 reference pattern; ER guard's last_attempt_retry_class_for reads the freshly-completed row via attempt_no DESC LIMIT 1",
     "HIGH-PR70-R4-01: Sent-replay NotFound preserves HIGH-C5-3 safe Pattern B redrive via SentNotFoundDowngrade outcome (atomic Sent→ER + TransientRetry stamp + audit), bounded by ER class guard MAX_BOOT_ATTEMPTS=5 budget; HoldFnDrain drain control preserves W0b ordering"
   ],
   "blockedBy": ["W0b", "W1", "W2", "W3", "W9b", "W9b-er-class-guard"],
   "unblocks": ["W13", "M3b-closure-final", "Phase-6-pilot-acceptance"],
-  "operatorFindingsClosed": ["MED-PR70-01", "MED-PR70-02", "HIGH-PR70-R2-01", "MED-PR70-R2-02", "LOW-PR70-R2-03", "HIGH-PR70-R3-01", "MED-PR70-R3-02", "LOW-PR70-R3-03", "HIGH-PR70-R4-01", "MED-PR70-R5-01", "MED-PR70-R5-02", "MED-PR70-R6-01", "MED-PR70-R6-02", "LOW-PR70-R6-03", "MED-PR70-R7-01", "MED-PR70-R7-02", "LOW-PR70-R7-03", "HIGH-PR70-R8-01", "LOW-PR70-R8-02", "LOW-PR70-R9-01", "LOW-PR70-R10-01", "LOW-PR70-R10-02", "LOW-PR70-R10-03", "MED-PR70-R11-01"]
+  "operatorFindingsClosed": ["MED-PR70-01", "MED-PR70-02", "HIGH-PR70-R2-01", "MED-PR70-R2-02", "LOW-PR70-R2-03", "HIGH-PR70-R3-01", "MED-PR70-R3-02", "LOW-PR70-R3-03", "HIGH-PR70-R4-01", "MED-PR70-R5-01", "MED-PR70-R5-02", "MED-PR70-R6-01", "MED-PR70-R6-02", "LOW-PR70-R6-03", "MED-PR70-R7-01", "MED-PR70-R7-02", "LOW-PR70-R7-03", "HIGH-PR70-R8-01", "LOW-PR70-R8-02", "LOW-PR70-R9-01", "LOW-PR70-R10-01", "LOW-PR70-R10-02", "LOW-PR70-R10-03", "MED-PR70-R11-01", "MED-PR70-R12-01", "LOW-PR70-R12-02", "LOW-PR70-R12-03"]
 }
 ```
