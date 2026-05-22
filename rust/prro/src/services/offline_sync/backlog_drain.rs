@@ -670,6 +670,49 @@ pub async fn drain<'a>(
     .map_err(BootError::Database)?;
 
     if backlog.is_empty() {
+        // MED-W12C3-01 (2026-05-22) — drain-finalize crash-recovery
+        // branch.  Pre-Commit-3, KVT2 → Ack advance was structurally
+        // unreachable from drain context, so empty cohort always meant
+        // "nothing to drain" (either fresh session or earlier tick
+        // already finalized).  Post-Commit-3, drain itself can advance
+        // KVT2 → Ack durably via `stage_finalize::run`, opening a
+        // crash window between that envelope commit and the
+        // `finalize_drain` 5-write closure: if the process dies in
+        // between, the next tick sees empty cohort (doc is now Ack,
+        // excluded by the IN list filter) but node/session/shift are
+        // still in pre-finalize states.  Reviewer-flagged MED finding
+        // 2026-05-22 (closed in this Δ commit).
+        //
+        // Recovery predicate (conservative, operator-pinned):
+        //   - session_state must be `Draining` (Open + all-Ack is
+        //     structural drift — drain Open→Draining mid-pass
+        //     transition would have committed before any doc reached
+        //     Ack, so Open + all-Ack cannot legitimately occur);
+        //   - all session docs must be in terminal `ACK` state
+        //     (`is_session_drain_completable` predicate;
+        //     `REJECTED`/`MANUAL` deliberately NOT included — those
+        //     require explicit operator treatment per session-closure
+        //     semantics).
+        // Both conditions true → finalize via `CrashRecovery` entry
+        // (distinct `OFFLINE_DRAIN_RECOVERED_FINALIZE` audit).
+        // Otherwise → existing empty-backlog skip path.
+        if session_state == OfflineSessionState::Draining
+            && fiscal_documents::is_session_drain_completable(pool, session_id)
+                .await
+                .map_err(BootError::Database)?
+        {
+            let mut recovery_summary = DrainSummary::new(fiscal_number.to_string(), 0);
+            commit_finalize_envelope(
+                pool,
+                fiscal_number,
+                session_id,
+                &ns,
+                &mut recovery_summary,
+                FinalizeEntry::CrashRecovery,
+            )
+            .await?;
+            return Ok(recovery_summary);
+        }
         let payload = serde_json::json!({
             "fiscal_number": fiscal_number,
             "current_mode": ns.mode.as_str(),
@@ -2228,10 +2271,63 @@ async fn finalize_drain(
 ) -> Result<(), BootError> {
     match summary.finalize_eligibility() {
         FinalizeEligibility::Eligible => {
-            commit_finalize_envelope(pool, fiscal_number, session_id, ns, summary).await
+            commit_finalize_envelope(
+                pool,
+                fiscal_number,
+                session_id,
+                ns,
+                summary,
+                FinalizeEntry::NormalEligible,
+            )
+            .await
         }
         FinalizeEligibility::NotEligible { reason } => {
             emit_partial(pool, fiscal_number, session_id, summary, &reason).await
+        }
+    }
+}
+
+/// **M3b W12 Commit 3 Δ** (MED-W12C3-01 fix, 2026-05-22) — entry-point
+/// taxonomy for [`commit_finalize_envelope`].  Distinguishes the
+/// per-tick "drain processed docs to Ack" path from the post-crash
+/// "drain found session already completable" recovery path so audit
+/// monitoring can tell them apart cleanly.
+///
+/// **Why distinct entries**: the recovery path runs with a fresh
+/// [`DrainSummary`] (0 in-flight docs this tick) but commits the same
+/// 5-write finalize envelope.  Operators reading the
+/// `OFFLINE_DRAIN_COMPLETED` audit row stream would otherwise see
+/// `backlog_size_before=0, advanced_to_ack=0` and have no signal that
+/// THIS finalize was driven by post-crash recovery rather than a
+/// genuinely empty drain pass.  The distinct event name
+/// (`OFFLINE_DRAIN_RECOVERED_FINALIZE`) + `entry_reason` payload
+/// field make the recovery case grep-able for forensic dashboards.
+#[derive(Debug, Clone, Copy)]
+enum FinalizeEntry {
+    /// Per-tick drain processed docs to Ack and is finalizing as
+    /// usual via `FinalizeEligibility::Eligible`.
+    NormalEligible,
+    /// MED-W12C3-01 crash-recovery entry: empty cohort + session in
+    /// `Draining` + `is_session_drain_completable` proved all session
+    /// docs already in `Ack`.  Prior drain tick committed
+    /// `stage_finalize::run` Kvt2 → Ack durably but crashed before
+    /// reaching `finalize_drain`.  This tick closes the session via
+    /// the same 5-write envelope with distinct audit shape.
+    CrashRecovery,
+}
+
+impl FinalizeEntry {
+    fn audit_event_name(self) -> &'static str {
+        match self {
+            Self::NormalEligible => "OFFLINE_DRAIN_COMPLETED",
+            Self::CrashRecovery => "OFFLINE_DRAIN_RECOVERED_FINALIZE",
+        }
+    }
+
+    fn entry_reason_str(self) -> &'static str {
+        match self {
+            Self::NormalEligible => "normal_eligible",
+            Self::CrashRecovery => "crash_recovery",
         }
     }
 }
@@ -2268,6 +2364,7 @@ async fn commit_finalize_envelope(
     session_id: OfflineSessionId,
     ns: &crate::db::repositories::node_state::NodeStateRow,
     summary: &mut DrainSummary,
+    entry: FinalizeEntry,
 ) -> Result<(), BootError> {
     let fiscal_number_owned = fiscal_number.to_string();
     let node_mode_from = ns.mode;
@@ -2310,7 +2407,12 @@ async fn commit_finalize_envelope(
     // the optimistic `true` is structurally honest.
     let mut payload = build_finalize_payload(summary, session_id, "COMPLETED", None);
     payload["finalized"] = serde_json::Value::Bool(true);
+    // MED-W12C3-01 (2026-05-22): tag entry path so operators can grep
+    // the post-crash recovery finalizes apart from per-tick finalizes
+    // (both share the 5-write envelope; only audit shape differs).
+    payload["entry_reason"] = serde_json::Value::String(entry.entry_reason_str().to_string());
     let payload_owned = payload.to_string();
+    let audit_event_name = entry.audit_event_name();
     // MED-C6-2 fix (2026-05-21): W5 session-lifecycle audit shape for
     // the Draining → Closed transition (matches `OfflineSessionService::
     // close_session` convention).
@@ -2412,12 +2514,14 @@ async fn commit_finalize_envelope(
                 Some(&session_closed_payload_owned),
             )
             .await?;
-            // (4) Audit OFFLINE_DRAIN_COMPLETED.
+            // (4) Audit OFFLINE_DRAIN_COMPLETED — or
+            // OFFLINE_DRAIN_RECOVERED_FINALIZE per [`FinalizeEntry`]
+            // (MED-W12C3-01 2026-05-22).
             audit_log::append_tx(
                 tx,
                 AUDIT_ENTITY_DRAIN_FN,
                 &fiscal_number_owned,
-                "OFFLINE_DRAIN_COMPLETED",
+                audit_event_name,
                 Severity::Info,
                 None,
                 Some(&payload_owned),
@@ -2747,9 +2851,16 @@ mod eligible_arm_tests {
             FinalizeEligibility::Eligible
         ));
 
-        commit_finalize_envelope(&pool, FN, session_id, &ns, &mut summary)
-            .await
-            .expect("Eligible commit must succeed on properly-seeded fixture");
+        commit_finalize_envelope(
+            &pool,
+            FN,
+            session_id,
+            &ns,
+            &mut summary,
+            FinalizeEntry::NormalEligible,
+        )
+        .await
+        .expect("Eligible commit must succeed on properly-seeded fixture");
 
         // DB state.
         assert_eq!(read_node_mode(&pool).await, "ONLINE");
@@ -2883,9 +2994,16 @@ mod eligible_arm_tests {
         let session_id = seed_draining_session(&pool).await;
         let mut summary = ack_summary_2();
 
-        commit_finalize_envelope(&pool, FN, session_id, &ns, &mut summary)
-            .await
-            .expect("Eligible commit on pending-drain shift must succeed");
+        commit_finalize_envelope(
+            &pool,
+            FN,
+            session_id,
+            &ns,
+            &mut summary,
+            FinalizeEntry::NormalEligible,
+        )
+        .await
+        .expect("Eligible commit on pending-drain shift must succeed");
 
         // Mode + session + shift + node_state mirror all finalized.
         assert_eq!(read_node_mode(&pool).await, "ONLINE");
@@ -2924,9 +3042,16 @@ mod eligible_arm_tests {
         let session_id = seed_draining_session(&pool).await;
         let mut summary = ack_summary_2();
 
-        commit_finalize_envelope(&pool, FN, session_id, &ns, &mut summary)
-            .await
-            .expect("Eligible commit on closing-pending-drain shift must succeed");
+        commit_finalize_envelope(
+            &pool,
+            FN,
+            session_id,
+            &ns,
+            &mut summary,
+            FinalizeEntry::NormalEligible,
+        )
+        .await
+        .expect("Eligible commit on closing-pending-drain shift must succeed");
 
         assert_eq!(read_node_mode(&pool).await, "ONLINE");
         assert_eq!(read_session_state(&pool, session_id).await, "CLOSED");

@@ -1402,8 +1402,30 @@ async fn w12_kvt2_cohort_entry_dispatches_to_stage_finalize_and_reaches_ack() {
 //     `document_missing_returns_outcome_not_error` (bogus doc id
 //     race-with-delete proxy).
 // Their **routing** in this helper is straight-line per-arm match
-// (~10 lines each) and structurally mirrors the `Acked` arm; routing
-// regressions would surface at the higher-level boot reconcile suite.
+// (~10 lines each) and structurally mirrors the `Acked` arm.
+//
+// **Accepted-deferral on routing-projection coverage** (LOW-W12C3-02
+// 2026-05-22): direct projection assertions for these three forensic
+// outcomes (helper → `DocVerdict::Failed{manual_recon:true}` +
+// `OFFLINE_DRAIN_DOC_FAILED` audit shape) are NOT covered by the
+// current fixtures and are NOT structurally reachable via the
+// public `drain()` entry in single-threaded tests.  Reaching them
+// would require either (a) exposing `process_via_w12_kvt2_advance`
+// as `pub(crate)` for a direct unit test (project anti-pattern —
+// sibling helpers `process_via_stage_send` / `process_via_w12_only`
+// are all private), OR (b) adding a `cfg(test)` projection-only
+// seam.  Both routes were deliberately deferred 2026-05-22 to keep
+// the Commit 3 production diff minimal.  Coverage will be added in
+// a focused follow-up commit (a small `cfg(test)` seam exposing the
+// routing-only projection logic, allowing 3 direct unit
+// assertions) when the operator decides scope expansion is
+// warranted.  Until then, **routing regressions for these arms
+// would NOT be caught at integration test level** — caller (this
+// helper) is the sole projection site, so a single-character bug
+// in (e.g.) `FailureClass::StateConflict` vs `FailureClass::NotFound`
+// for the wrong outcome would slip integration.  The structural
+// mirroring to the well-tested `Acked` arm is the only current
+// safeguard.
 //
 // What IS reproducible via `drain()` single-threaded is the
 // `Err(StageFinalizeError)` arm — seeding a KVT2 doc with broken
