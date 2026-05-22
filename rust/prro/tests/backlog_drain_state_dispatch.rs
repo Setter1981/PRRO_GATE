@@ -1388,12 +1388,19 @@ async fn w12_kvt2_cohort_entry_dispatches_to_stage_finalize_and_reaches_ack() {
 // no concurrent writer in the test harness.  Their **generation** is
 // already covered at the `stage_finalize::run` level in
 // `write_path_stage5_finalize.rs`:
-//   - `AlreadyAcked` → fixture `idempotent_rerun_on_ack_is_no_op`
-//     (lines 410-455).
+//   - `AlreadyAcked` → fixture `rerun_on_ack_is_idempotent_no_op`
+//     (idempotent replay short-circuit) AND
+//     `concurrent_finalize_yields_one_acked_and_one_already_acked`
+//     (TRUE concurrency-race proof: two parallel `stage_finalize::run`
+//     against the same doc yield exactly one Acked + one AlreadyAcked,
+//     which is the production-realistic generation path for the
+//     forensic outcome).
 //   - `StateConflict` → fixture
-//     `non_kvt2_state_short_circuits_no_seed_advance` (lines 459-485).
+//     `non_kvt2_state_short_circuits_no_seed_advance` (e.g. doc
+//     observed as Kvt1 at stage_finalize CAS time).
 //   - `DocumentMissing` → fixture
-//     `document_missing_returns_outcome_not_error` (lines 543-560).
+//     `document_missing_returns_outcome_not_error` (bogus doc id
+//     race-with-delete proxy).
 // Their **routing** in this helper is straight-line per-arm match
 // (~10 lines each) and structurally mirrors the `Acked` arm; routing
 // regressions would surface at the higher-level boot reconcile suite.
