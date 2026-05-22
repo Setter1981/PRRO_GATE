@@ -539,11 +539,11 @@ W12 introduces no per-doc Manual CAS (failure semantics revised to Hold per W0b 
 | Slice | Day | Detail |
 |---|---|---|
 | Commit 1 (helper + types) | 0.5 | source-aware typed surface (Kvt2ConfirmSource + Kvt2ConfirmOutcome) + routing matrix + evidence checks; MED-PR70-R5-01 + R5-02 lifecycle |
-| Commit 2 (HoldFnDrain verdict + summary + eligibility) | 0.5 | new DocVerdict variant; drain loop control; held_at_kvt1 counter; NotEligible reason |
+| Commit 2 (HoldFnDrain verdict + projection-aware summary + eligibility) | 0.5 | new DocVerdict::HoldFnDrain variant with projection: HoldFnDrainProjection field; drain loop control (stops FN drain on any HoldFnDrain); three DrainSummary recording methods + three counters (held_at_kvt1 + held_at_sent + er_redrive_queued); three NotEligible reasons (DocsHeldAtKvt1 / DocsHeldAtSent / DocsErRedriveQueued); finalize_eligibility blocks on any nonzero W12 counter with multi-reason payload |
 | Commit 3 (cohort widening + KVT2 dispatch) | 0.25 | SELECT IN widening + new process_via_w12_kvt2_advance arm |
 | Commit 4 (Sent-source W12 wiring) | 0.5 | Envelope 1a (Kvt1Raw + Sent→Kvt1 + Kvt1→Kvt2 + audit) + Envelope 2 chain |
 | Commit 5 (Kvt1-source W12 wiring) | 0.5 | process_via_w12_only rewrite; Envelope 1b + Envelope 2 chain |
-| Commit 5b (Sent-replay W12 wiring, HIGH-PR70-R3-01 + R4-01) | 0.75 | process_via_lastchk_replay rewrite; W12-aware Acked/Hold/StructuralDrift + SentNotFoundDowngrade; Envelope 1c (Sent→ER + retry_class stamp); preserves HIGH-C5-3 safe-redrive |
+| Commit 5b (Sent-replay W12 wiring, HIGH-PR70-R3-01 + R4-01 + R8-01) | 0.75 | process_via_lastchk_replay rewrite using canonical `dps.by_server_fiscal_no(fn_sign, &doc.server_fiscal_no)`; full envelope chain: 1c-pre (allocate_and_insert_tx) → 1a-replay on Acked (trace.complete OK + Kvt1Raw + Sent→Kvt1 + Kvt1→Kvt2) → 1c-post on NotFound (trace.complete TransientRetry + Sent→ER) → 1c-hold on Hold (trace.complete RetryableTransport|Server) → 1c-drift on ServerFiscalIdMismatch (trace.complete structural + BootError::Internal); preserves HIGH-C5-3 safe-redrive via SentNotFoundDowngrade |
 | Commit 6 (Hold path) | 0.25 | DocVerdict::HoldFnDrain routing + KVT2_CONFIRM_HOLD audit |
 | Commit 7 (StructuralDrift path) | 0.25 | BootError::Internal propagation |
 | Commit 8 (33-fixture acceptance) | 0.75 | scripted DpsChannel stub fixtures: 14 helper-typed + 15 drain integration + 4 crash-recovery |
@@ -604,7 +604,7 @@ cargo fmt -p prro -- --check
     "drain cohort widened to include KVT2 (reverses MED-C5-4); new process_via_w12_kvt2_advance arm",
     "Kvt2 boot-recovery path (boot_phase.rs:2468 DocState::Kvt2 arm) preserved unchanged",
     "no same-FN send interleave before current lastChk (W2 mutex + ADR-M3-A10 + Hold stop-drain semantics)",
-    "drain Eligible arm unblocks finalize after Acked outcomes; held_at_kvt1 counter blocks NotEligible{DocsHeldAtKvt1}",
+    "drain Eligible arm requires zero on ALL THREE W12 counters (held_at_kvt1 + held_at_sent + er_redrive_queued); any nonzero counter returns NotEligible with projection-correct reason (DocsHeldAtKvt1 | DocsHeldAtSent | DocsErRedriveQueued) and multi-reason payload when multiple nonzero",
     "Pending-drain Hold does NOT escalate shift AND does NOT continue past held doc",
     "kvt1_raw_bytes persisted byte-for-byte via document_files::replace_tx(Kvt1Raw) (HIGH-C5-2 contract preserved)",
     "crash-recovery convergence proofs MANDATORY: Envelope-1a/1b rollback / between-1-and-2 / mid-Envelope-2",
@@ -615,6 +615,6 @@ cargo fmt -p prro -- --check
   ],
   "blockedBy": ["W0b", "W1", "W2", "W3", "W9b", "W9b-er-class-guard"],
   "unblocks": ["W13", "M3b-closure-final", "Phase-6-pilot-acceptance"],
-  "operatorFindingsClosed": ["MED-PR70-01", "MED-PR70-02", "HIGH-PR70-R2-01", "MED-PR70-R2-02", "LOW-PR70-R2-03", "HIGH-PR70-R3-01", "MED-PR70-R3-02", "LOW-PR70-R3-03", "HIGH-PR70-R4-01", "MED-PR70-R5-01", "MED-PR70-R5-02", "MED-PR70-R6-01", "MED-PR70-R6-02", "LOW-PR70-R6-03", "MED-PR70-R7-01", "MED-PR70-R7-02", "LOW-PR70-R7-03", "HIGH-PR70-R8-01", "LOW-PR70-R8-02"]
+  "operatorFindingsClosed": ["MED-PR70-01", "MED-PR70-02", "HIGH-PR70-R2-01", "MED-PR70-R2-02", "LOW-PR70-R2-03", "HIGH-PR70-R3-01", "MED-PR70-R3-02", "LOW-PR70-R3-03", "HIGH-PR70-R4-01", "MED-PR70-R5-01", "MED-PR70-R5-02", "MED-PR70-R6-01", "MED-PR70-R6-02", "LOW-PR70-R6-03", "MED-PR70-R7-01", "MED-PR70-R7-02", "LOW-PR70-R7-03", "HIGH-PR70-R8-01", "LOW-PR70-R8-02", "LOW-PR70-R9-01"]
 }
 ```
