@@ -21,13 +21,24 @@
 //!   4. Empty-skip fires only when zero unfinished candidates exist
 //!      (terminal-state docs do NOT keep drain running).
 //!
-//! Tests (5):
+//! Tests (5 original + 8 W9b ER-class-guard 2026-05-22):
 //!
 //!   1. `c5_sent_doc_lastchk_match_advances_to_kvt1_with_replay_flag`
 //!   2. `c5_kvt1_doc_w12_only_no_db_mutation_records_deferred`
 //!   3. `c5_error_retryable_doc_re_driven_via_stage_send_to_kvt1`
+//!      (rewritten 2026-05-22: now seeds durable
+//!      `TransientRetry` + under-budget attempts before asserting wire
+//!      redrive, per W9b ER-class-guard caller obligation).
 //!   4. `c5_sent_doc_lastchk_mismatch_records_per_doc_failure_no_wire_resend`
 //!   5. `c5_empty_skip_when_only_terminal_state_docs_exist`
+//!   6. `er_guard_budget_exhausted_no_wire_escalates_to_manual`
+//!   7. `er_guard_fn_config_error_no_wire_escalates_to_manual`
+//!   8. `er_guard_wrapper_bug_no_wire_escalates_to_manual`
+//!   9. `er_guard_operator_escalation_no_wire_escalates_to_manual`
+//!  10. `er_guard_mac_recovery_no_wire_escalates_to_manual`
+//!  11. `er_guard_terminal_reject_no_wire_escalates_critical_inconsistent`
+//!  12. `er_guard_probe_required_no_wire_holds_in_er_sibling_continue`
+//!  13. `er_guard_indeterminate_no_trace_no_wire_holds_in_er_sibling_continue`
 
 mod common;
 
@@ -277,6 +288,42 @@ async fn read_doc_state(pool: &SqlitePool, doc_id: DocumentId) -> String {
         .unwrap()
 }
 
+/// W9b ER-class-guard test helper (2026-05-22): seed a COMPLETE
+/// `transport_trace` row for `doc_id` so `last_attempt_retry_class_for`
+/// + `attempts_used` return deterministic values during the drain tick.
+///
+/// `retry_class = None` writes NULL — exercises the `HoldIndeterminate`
+/// arm (alongside the "no row at all" sub-case).  The completion
+/// columns are populated to satisfy the migration-013 self-consistency
+/// CHECK (row is either fully incomplete or fully complete).
+async fn seed_transport_trace_attempt(
+    pool: &SqlitePool,
+    doc_id: DocumentId,
+    attempt_no: i32,
+    retry_class: Option<&str>,
+) {
+    let sha = vec![0x42u8; 32];
+    sqlx::query(
+        "INSERT INTO transport_trace( \
+            document_id, attempt_no, started_at, \
+            backend_profile_id, transport_profile_id, request_envelope_sha256, \
+            completed_at, wire_call_started_at, wire_call_finished_at, \
+            outcome_kind, server_status_code, error_kind, error_message, retry_class \
+         ) VALUES ( \
+            ?, ?, '2026-05-22T00:00:00Z', 'b', 't', ?, \
+            '2026-05-22T00:00:02Z', '2026-05-22T00:00:01Z', '2026-05-22T00:00:02Z', \
+            'RETRYABLE_SERVER', -1, 'Server', 'seed-er-class-guard', ? \
+         )",
+    )
+    .bind(doc_id)
+    .bind(attempt_no)
+    .bind(&sha)
+    .bind(retry_class)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn audit_count(pool: &SqlitePool, event_type: &str) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE event_type = ?")
         .bind(event_type)
@@ -435,6 +482,13 @@ async fn c5_kvt1_doc_w12_only_no_db_mutation_records_deferred() {
 }
 
 // ─── Test 3: ERROR_RETRYABLE doc → re-drive via stage_send → KVT1 ────
+//
+// W9b ER-class-guard 2026-05-22 rewrite: durable `TransientRetry` +
+// under-budget attempts MUST be seeded in `transport_trace` before
+// asserting wire redrive.  Previously, this test asserted re-drive
+// against a plain ER doc with no trace history — locking the unsafe
+// behavior fixed by HIGH-M3B-01 (the ER class guard now holds
+// `HoldIndeterminate` for that input).
 
 #[tokio::test]
 async fn c5_error_retryable_doc_re_driven_via_stage_send_to_kvt1() {
@@ -446,6 +500,9 @@ async fn c5_error_retryable_doc_re_driven_via_stage_send_to_kvt1() {
     // server_fiscal_no NULL because 4-b never stamps it on transient
     // failure paths.
     let doc = seed_doc_in_state(&pool, 1, 100, session_id, shift_id, "ERROR_RETRYABLE", None).await;
+    // W9b ER-class-guard authorization gate: durable TransientRetry
+    // last-attempt + attempts_used = 1 < MAX_BOOT_ATTEMPTS (5).
+    seed_transport_trace_attempt(&pool, doc, 1, Some("TransientRetry")).await;
 
     let c = carriers(vec![Ok(ack("DPS-FN-RETRIED", vec![1, 2, 3]))], vec![]);
     let view = view_for(&c);
@@ -471,6 +528,290 @@ async fn c5_error_retryable_doc_re_driven_via_stage_send_to_kvt1() {
     assert_eq!(payload["to_state"], "KVT1");
     assert_eq!(payload["dispatch_via"], "stage_send");
     assert_eq!(payload["replay_short_circuit"], false);
+}
+
+// ─── W9b ER-class-guard 2026-05-22 negative-coverage matrix ──────────
+//
+// HIGH-M3B-01 fix: each non-redrive `ErRedriveDecision` arm MUST hold
+// the doc out of `stage_send::run` (no wire re-drive) AND project the
+// correct manual-recon / sibling-continue verdict.  These tests
+// individually seed the durable `retry_class` (or absence thereof) and
+// assert `send_chk_count == 0` + the appropriate state outcome +
+// `OFFLINE_DRAIN_DOC_FAILED` payload shape.
+
+// Helper for the 7 "ER + retry_class set" negative cases.
+async fn seed_er_with_class(
+    pool: &SqlitePool,
+    retry_class: &str,
+    attempt_no: i32,
+) -> (DocumentId, ShiftId, OfflineSessionId) {
+    seed_node_state(pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(pool).await;
+    let session_id = seed_offline_session(pool, OfflineSessionState::Open).await;
+    let doc = seed_doc_in_state(pool, 1, 100, session_id, shift_id, "ERROR_RETRYABLE", None).await;
+    seed_transport_trace_attempt(pool, doc, attempt_no, Some(retry_class)).await;
+    (doc, shift_id, session_id)
+}
+
+#[tokio::test]
+async fn er_guard_budget_exhausted_no_wire_escalates_to_manual() {
+    let (_d, pool) = fresh_pool().await;
+    // attempt_no = MAX_BOOT_ATTEMPTS (5) → attempts_used = 5 → exhausted.
+    let (doc, _shift, _sess) = seed_er_with_class(&pool, "TransientRetry", 5).await;
+
+    let c = carriers(vec![], vec![]);
+    let view = view_for(&c);
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        c.dps.send_chk_count(),
+        0,
+        "budget exhausted MUST NOT re-drive via stage_send"
+    );
+    assert_eq!(c.dps.last_chk_count(), 0);
+    assert_eq!(summary.advanced_to_kvt1(), 0);
+    assert_eq!(summary.per_doc_failures().len(), 1);
+    assert_eq!(
+        read_doc_state(&pool, doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "doc CAS'd off ER per stage_send.rs:18 budget cap"
+    );
+
+    // Atomic CAS + audit envelope (er_class_guard helper).
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_ER_ESCALATED_TO_MANUAL").await,
+        1
+    );
+    // Per-doc audit with full payload.
+    let p = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_FAILED")
+        .await
+        .unwrap();
+    assert_eq!(p["failure_class"], "budget_exhausted");
+    assert_eq!(p["retry_class"], "TransientRetry");
+    assert_eq!(p["attempts_used"], 5);
+    assert_eq!(p["max_boot_attempts"], 5);
+    assert_eq!(p["manual_recon_class"], true);
+    assert_eq!(p["dispatch_via"], "er_class_guard");
+}
+
+#[tokio::test]
+async fn er_guard_fn_config_error_no_wire_escalates_to_manual() {
+    let (_d, pool) = fresh_pool().await;
+    let (doc, _shift, _sess) = seed_er_with_class(&pool, "FnConfigError", 1).await;
+
+    let c = carriers(vec![], vec![]);
+    let view = view_for(&c);
+    backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        c.dps.send_chk_count(),
+        0,
+        "FnConfigError MUST NOT re-drive via stage_send"
+    );
+    assert_eq!(
+        read_doc_state(&pool, doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
+    let p = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_FAILED")
+        .await
+        .unwrap();
+    assert_eq!(p["failure_class"], "authorization");
+    assert_eq!(p["retry_class"], "FnConfigError");
+    assert_eq!(p["manual_recon_class"], true);
+    assert_eq!(p["dispatch_via"], "er_class_guard");
+}
+
+#[tokio::test]
+async fn er_guard_wrapper_bug_no_wire_escalates_to_manual() {
+    let (_d, pool) = fresh_pool().await;
+    let (doc, _shift, _sess) = seed_er_with_class(&pool, "WrapperBug", 1).await;
+
+    let c = carriers(vec![], vec![]);
+    let view = view_for(&c);
+    backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(c.dps.send_chk_count(), 0, "WrapperBug MUST NOT re-drive");
+    assert_eq!(
+        read_doc_state(&pool, doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
+    let p = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_FAILED")
+        .await
+        .unwrap();
+    assert_eq!(p["failure_class"], "internal");
+    assert_eq!(p["retry_class"], "WrapperBug");
+    assert_eq!(p["manual_recon_class"], true);
+}
+
+#[tokio::test]
+async fn er_guard_operator_escalation_no_wire_escalates_to_manual() {
+    let (_d, pool) = fresh_pool().await;
+    let (doc, _shift, _sess) = seed_er_with_class(&pool, "OperatorEscalation", 1).await;
+
+    let c = carriers(vec![], vec![]);
+    let view = view_for(&c);
+    backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        c.dps.send_chk_count(),
+        0,
+        "OperatorEscalation MUST NOT re-drive"
+    );
+    assert_eq!(
+        read_doc_state(&pool, doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
+    let p = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_FAILED")
+        .await
+        .unwrap();
+    assert_eq!(p["failure_class"], "server");
+    assert_eq!(p["retry_class"], "OperatorEscalation");
+    assert_eq!(p["manual_recon_class"], true);
+}
+
+#[tokio::test]
+async fn er_guard_mac_recovery_no_wire_escalates_to_manual() {
+    let (_d, pool) = fresh_pool().await;
+    let (doc, _shift, _sess) = seed_er_with_class(&pool, "MacRecovery", 1).await;
+
+    let c = carriers(vec![], vec![]);
+    let view = view_for(&c);
+    backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(c.dps.send_chk_count(), 0, "MacRecovery MUST NOT re-drive");
+    assert_eq!(
+        read_doc_state(&pool, doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
+    let p = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_FAILED")
+        .await
+        .unwrap();
+    assert_eq!(p["failure_class"], "internal");
+    assert_eq!(p["retry_class"], "MacRecovery");
+    assert_eq!(p["manual_recon_class"], true);
+}
+
+#[tokio::test]
+async fn er_guard_terminal_reject_no_wire_escalates_critical_inconsistent() {
+    let (_d, pool) = fresh_pool().await;
+    let (doc, _shift, _sess) = seed_er_with_class(&pool, "TerminalReject", 1).await;
+
+    let c = carriers(vec![], vec![]);
+    let view = view_for(&c);
+    backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        c.dps.send_chk_count(),
+        0,
+        "TerminalReject MUST NOT re-drive (structural inconsistency)"
+    );
+    assert_eq!(
+        read_doc_state(&pool, doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
+    // Atomic CAS + audit row tagged structural inconsistency.
+    let p = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_FAILED")
+        .await
+        .unwrap();
+    assert_eq!(p["failure_class"], "wire_routing_terminal_reject");
+    assert_eq!(p["retry_class"], "TerminalReject");
+    assert_eq!(p["manual_recon_class"], true);
+    assert_eq!(p["structural_inconsistency"], true);
+    // Sanity: the inner CAS+audit envelope still committed under
+    // Critical severity (operator dashboard signal).
+    let sev: String = sqlx::query_scalar(
+        "SELECT severity FROM audit_log \
+         WHERE event_type = 'OFFLINE_DRAIN_ER_ESCALATED_TO_MANUAL' \
+         ORDER BY audit_id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sev, "CRITICAL");
+}
+
+#[tokio::test]
+async fn er_guard_probe_required_no_wire_holds_in_er_sibling_continue() {
+    let (_d, pool) = fresh_pool().await;
+    let (doc, _shift, _sess) = seed_er_with_class(&pool, "ProbeRequired", 1).await;
+
+    let c = carriers(vec![], vec![]);
+    let view = view_for(&c);
+    backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(c.dps.send_chk_count(), 0, "ProbeRequired MUST NOT re-drive");
+    // No CAS — doc stays in ER; sibling-continue.
+    assert_eq!(read_doc_state(&pool, doc).await, "ERROR_RETRYABLE");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_ER_ESCALATED_TO_MANUAL").await,
+        0,
+        "ProbeRequired hold MUST NOT emit escalation audit"
+    );
+    let p = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_FAILED")
+        .await
+        .unwrap();
+    assert_eq!(p["failure_class"], "wire_routing_probe_required");
+    assert_eq!(p["retry_class"], "ProbeRequired");
+    assert_eq!(
+        p["manual_recon_class"], false,
+        "ProbeRequired is hold, not manual-recon"
+    );
+    assert_eq!(p["hold_reason"], "probe_required");
+}
+
+#[tokio::test]
+async fn er_guard_indeterminate_no_trace_no_wire_holds_in_er_sibling_continue() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    // No transport_trace row at all — `last_attempt_retry_class_for`
+    // returns None → HoldIndeterminate arm.
+    let doc = seed_doc_in_state(&pool, 1, 100, session_id, shift_id, "ERROR_RETRYABLE", None).await;
+
+    let c = carriers(vec![], vec![]);
+    let view = view_for(&c);
+    backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        c.dps.send_chk_count(),
+        0,
+        "indeterminate retry_class MUST NOT re-drive"
+    );
+    assert_eq!(read_doc_state(&pool, doc).await, "ERROR_RETRYABLE");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_ER_ESCALATED_TO_MANUAL").await,
+        0
+    );
+    let p = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_FAILED")
+        .await
+        .unwrap();
+    assert_eq!(p["failure_class"], "retry_class_indeterminate");
+    assert!(
+        p["retry_class"].is_null(),
+        "retry_class MUST be null in payload"
+    );
+    assert_eq!(
+        p["manual_recon_class"], false,
+        "indeterminate is hold per operator-pinned 2026-05-22 scope"
+    );
+    assert_eq!(p["hold_reason"], "retry_class_indeterminate");
 }
 
 // ─── Test 4: SENT doc → lastChk Mismatch → per-doc failure (no wire) ─
@@ -799,4 +1140,103 @@ async fn c5_kvt2_doc_excluded_from_cohort_pre_w12() {
     assert_eq!(read_doc_state(&pool, kvt2_doc).await, "KVT2");
     assert_eq!(c.dps.send_chk_count(), 0);
     assert_eq!(c.dps.last_chk_count(), 0);
+}
+
+// ─── W9b ER-class-guard pending-drain halt proof ─────────────────────
+//
+// Spec amendment 2026-05-21 + LEGAL_INVARIANTS.md §INV-19: a manual-
+// recon-class drain reject on a pending-drain shift halts the FN drain
+// (CAS shift → RequiresManualReconciliation via edge 6, Critical
+// `OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL` audit).  The W9b ER-class-
+// guard 2026-05-22 fix introduces a NEW manual-recon-class verdict
+// path (ER + non-transient durable retry_class) that MUST drive the
+// halt ladder identically — without re-entering `stage_send::run`.
+//
+// Test pattern: pending-drain shift + ER doc + durable retry_class
+// FnConfigError.  Drain MUST NOT wire-send; MUST CAS doc to manual;
+// MUST CAS shift to manual; MUST emit halt audit.
+#[tokio::test]
+async fn er_guard_pending_drain_manual_class_halts_and_escalates_shift() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(
+        &pool,
+        NodeMode::GoingOnline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
+    // Seed shift directly in OPENED_LOCAL_PENDING_DRAIN.
+    let shift_id = ShiftId::new();
+    sqlx::query(
+        "INSERT INTO shifts(shift_id, fiscal_number, serial, state, \
+            open_mode, cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, ?, 1, 'OPENED_LOCAL_PENDING_DRAIN', 'ONLINE', 0, ?)",
+    )
+    .bind(shift_id)
+    .bind(FN)
+    .bind(CASHIER_OK)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
+        .bind(shift_id)
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+
+    let doc = seed_doc_in_state(&pool, 1, 100, session_id, shift_id, "ERROR_RETRYABLE", None).await;
+    seed_transport_trace_attempt(&pool, doc, 1, Some("FnConfigError")).await;
+
+    // Empty DPS queues: any wire access = test crash.  Asserts the
+    // halt happens BEFORE `stage_send::run` is entered.
+    let c = carriers(vec![], vec![]);
+    let view = view_for(&c);
+
+    backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        c.dps.send_chk_count(),
+        0,
+        "ER-class-guard manual halt MUST NOT touch the wire"
+    );
+
+    // Doc CAS'd off ER into Manual via the ER class guard envelope.
+    assert_eq!(
+        read_doc_state(&pool, doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
+
+    // Shift CAS'd via edge 6 (pending-drain ladder).
+    let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(shift_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
+
+    // node_state.shift_state mirrors the shifts row inside the same tx
+    // (HIGH-C4-5 load-bearing invariant).
+    let node_shift: String =
+        sqlx::query_scalar("SELECT shift_state FROM node_state WHERE fiscal_number = ?")
+            .bind(FN)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(node_shift, "REQUIRES_MANUAL_RECONCILIATION");
+
+    // Halt audit emitted exactly once + carries the ER-class-guard
+    // failure_class.
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1
+    );
+    let halt = audit_latest_payload(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL")
+        .await
+        .unwrap();
+    assert_eq!(halt["fiscal_number"], FN);
+    assert_eq!(halt["failure_class"], "authorization");
+    assert_eq!(halt["current_shift_state"], "OPENED_LOCAL_PENDING_DRAIN");
 }

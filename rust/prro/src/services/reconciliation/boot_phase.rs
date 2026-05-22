@@ -1826,47 +1826,24 @@ async fn dispatch_error_retryable_by_class(
     doc: &crate::db::repositories::fiscal_documents::DocumentRow,
     histogram: &mut DispatchHistogram,
 ) -> anyhow::Result<()> {
-    use crate::db::repositories::transport_trace as tt;
+    use crate::services::reconciliation::er_redrive_policy::{
+        evaluate_er_redrive, ErRedriveDecision,
+    };
     use crate::services::write_path::error_routing::RetryClass;
 
     let doc_id = doc.document_id;
 
-    let retry_class = tt::last_attempt_retry_class_for(pool, doc_id).await?;
+    // M3b W9b ER-class-guard: the redrive-vs-escalate decision is
+    // shared with the W9b backlog drain.  Boot owns the BOOT_ER_* audit
+    // taxonomy + DispatchHistogram counter projection below; drain owns
+    // its OFFLINE_DRAIN_* projection separately
+    // (`backlog_drain::process_via_er_class_guard`).
+    let decision = evaluate_er_redrive(pool, doc_id).await?;
 
-    match retry_class {
-        Some(RetryClass::TransientRetry) => {
-            // M3a hardening pass 1 — H2 closure: enforce the
-            // boot-attempt budget cap BEFORE re-dispatching.
-            // `MAX_BOOT_ATTEMPTS = 5` is declared in W9 freeze §4.0;
-            // without this gate an infinitely-failing TransientRetry
-            // doc would re-burn DPS quota on every boot tick.
-            // `attempts_used` counts ALL transport_trace rows for
-            // the doc (both completed and in-flight), so the cap
-            // covers crash-mid-send attempts too per W9 docstring.
-            let attempts = tt::attempts_used(pool, doc_id).await?;
-            if attempts >= MAX_BOOT_ATTEMPTS {
-                match cas_error_retryable_budget_exhausted(
-                    pool,
-                    doc_id,
-                    attempts,
-                    RetryClass::TransientRetry.as_str(),
-                )
-                .await
-                {
-                    Ok(_) => histogram.error_retryable_budget_exhausted += 1,
-                    Err(e) => {
-                        emit_dispatch_error(
-                            pool,
-                            doc_id,
-                            "c-error-retryable-budget",
-                            &e,
-                            histogram,
-                        )
-                        .await?
-                    }
-                }
-                return Ok(());
-            }
+    match decision {
+        ErRedriveDecision::Redrive => {
+            // TransientRetry + attempts < MAX_BOOT_ATTEMPTS — Pattern B
+            // retry path (existing W11 PR-2a wiring).
             match stage_send::run(pool, deps.dps, doc_id, Some(deps.signing_ctx)).await {
                 // W14a-2b Commit 5 NIT-C5-2 + NIT-C5-5: split
                 // SignerRefused off the generic dispatched bucket
@@ -1891,10 +1868,30 @@ async fn dispatch_error_retryable_by_class(
                 }
             }
         }
-        Some(rc @ (RetryClass::FnConfigError
-        | RetryClass::WrapperBug
-        | RetryClass::OperatorEscalation
-        | RetryClass::MacRecovery)) => {
+        ErRedriveDecision::BudgetExhausted { attempts_used } => {
+            // M3a hardening pass 1 — H2 closure: enforce the
+            // boot-attempt budget cap.  `MAX_BOOT_ATTEMPTS = 5` is
+            // declared in W9 freeze §4.0; without this gate an
+            // infinitely-failing TransientRetry doc would re-burn DPS
+            // quota on every boot tick.  `attempts_used` counts ALL
+            // transport_trace rows for the doc (both completed and
+            // in-flight), so the cap covers crash-mid-send attempts.
+            match cas_error_retryable_budget_exhausted(
+                pool,
+                doc_id,
+                attempts_used,
+                RetryClass::TransientRetry.as_str(),
+            )
+            .await
+            {
+                Ok(_) => histogram.error_retryable_budget_exhausted += 1,
+                Err(e) => {
+                    emit_dispatch_error(pool, doc_id, "c-error-retryable-budget", &e, histogram)
+                        .await?
+                }
+            }
+        }
+        ErRedriveDecision::EscalateManual { class: rc } => {
             match cas_error_retryable_to_manual_reconciliation(
                 pool,
                 doc_id,
@@ -1905,18 +1902,12 @@ async fn dispatch_error_retryable_by_class(
             {
                 Ok(_) => histogram.error_retryable_escalated_to_manual += 1,
                 Err(e) => {
-                    emit_dispatch_error(
-                        pool,
-                        doc_id,
-                        "c-error-retryable-escalate",
-                        &e,
-                        histogram,
-                    )
-                    .await?
+                    emit_dispatch_error(pool, doc_id, "c-error-retryable-escalate", &e, histogram)
+                        .await?
                 }
             }
         }
-        Some(RetryClass::TerminalReject) => {
+        ErRedriveDecision::EscalateInconsistent { class: rc } => {
             // Structurally inconsistent: TerminalReject targets `Rejected`
             // directly per `error_routing::route_dps_error`; an ER doc
             // tagged TerminalReject is durable evidence of a routing /
@@ -1924,7 +1915,7 @@ async fn dispatch_error_retryable_by_class(
             match cas_error_retryable_to_manual_reconciliation(
                 pool,
                 doc_id,
-                RetryClass::TerminalReject.as_str(),
+                rc.as_str(),
                 crate::db::models::enums::Severity::Critical,
             )
             .await
@@ -1942,7 +1933,7 @@ async fn dispatch_error_retryable_by_class(
                 }
             }
         }
-        Some(RetryClass::ProbeRequired) => {
+        ErRedriveDecision::HoldProbeRequired => {
             match emit_error_retryable_hold_audit(
                 pool,
                 doc_id,
@@ -1955,18 +1946,12 @@ async fn dispatch_error_retryable_by_class(
             {
                 Ok(_) => histogram.error_retryable_probe_deferred += 1,
                 Err(e) => {
-                    emit_dispatch_error(
-                        pool,
-                        doc_id,
-                        "c-error-retryable-probe",
-                        &e,
-                        histogram,
-                    )
-                    .await?
+                    emit_dispatch_error(pool, doc_id, "c-error-retryable-probe", &e, histogram)
+                        .await?
                 }
             }
         }
-        None => {
+        ErRedriveDecision::HoldIndeterminate => {
             // Durable retry_class is missing / unknown / pre-migration-012
             // NULL — recovery has no evidence to choose a class.  Per
             // `RetryClass::from_wire_str` contract (`error_routing.rs:125-140`),
@@ -2535,9 +2520,9 @@ async fn dispatch_pending_doc(
                             // signed_dispatched counter; Mismatch =
                             // operator-actionable bucket; structural
                             // bug bucket otherwise.
-                            Ok(stage_send::StageSendOutcome::SignerRefused(
-                                Scm::Mismatch { .. },
-                            )) => histogram.signer_refused_mismatch += 1,
+                            Ok(stage_send::StageSendOutcome::SignerRefused(Scm::Mismatch {
+                                ..
+                            })) => histogram.signer_refused_mismatch += 1,
                             Ok(stage_send::StageSendOutcome::SignerRefused(_)) => {
                                 histogram.signer_refused_structural_bug += 1
                             }
