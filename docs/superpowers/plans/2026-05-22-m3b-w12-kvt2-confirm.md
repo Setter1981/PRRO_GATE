@@ -11,39 +11,81 @@
 
 ## Goal
 
-Replace the W9b pre-W12 `apply_w12_confirmation` stub (`backlog_drain.rs:1470`, always returns `W12ConfirmOutcome::DeferredKvt1`) with a real in-drain KVT2 confirmation helper that:
+Replace the W9b pre-W12 `apply_w12_confirmation` stub (`backlog_drain.rs:1470`, always returns `W12ConfirmOutcome::DeferredKvt1`) with a real in-drain KVT2 confirmation helper invoked from TWO drain entry points (per HIGH-PR70-R2-01 fix; W12 is NOT Sent-only):
 
-1. Reads the just-recorded `doc.server_fiscal_no` (from `stage_send::run` 4-b OR from W9b `lastChk` replay short-circuit).
-2. Issues `lastChk(fn_sign)` immediately after `stage_send(doc_i)` and **before** the drain advances to `doc_{i+1}` on the same FN (W0b interleave precondition).
-3. Validates evidence per W0b §Verdict: `response.status == OK` + `response.id == doc.server_fiscal_no` + non-empty `response.data_sign`.
-4. **On success (two-envelope ladder; see §"Transaction envelope shape")**:
-   - **Envelope 1 (W12-owned)**: persist `kvt1_raw_bytes` + CAS `Kvt1 → Kvt2` atomically.
-   - **Envelope 2 (existing `stage_finalize::run`-owned)**: CAS `Kvt2 → Ack` + chain seed advance + inbox DONE + outbox + audit, atomically.
-5. **On failure (W0b §Failure Semantics conformance)**: doc state **unchanged**, replayable per W0b §95-102.  Typed `Kvt2ConfirmFailure` + `KVT2_CONFIRM_FAILED` audit emitted; doc stays in `Kvt1` for next-tick re-drive (within drain) or for `passive_hold_kvt1` (post-drain boot recovery).  **No manual-recon escalation on evidence-failure classes** — only structural-invariant breaches (e.g. `CasMissOnAdvance` indicating concurrent writer) surface as `BootError::Internal`.
+1. **`Sent` entry**: immediately after `stage_send::run` returns `StageSendOutcome::Sent` (doc has `server_fiscal_no` newly stamped); kvt2_confirm runs the lastChk evidence check; on success Envelope 1 includes the `Sent → Kvt1` step (existing W9b stub behavior, preserved).
+2. **`Kvt1` re-entry**: drain cohort walker emits `Kvt1` docs (KVT1 already in W9b cohort filter); these are docs Held on a prior tick whose `server_fiscal_no` is already persisted; kvt2_confirm re-issues lastChk on the **still-latest** doc and either advances or Holds again.
 
-Unblock W9b drain finalization **Eligible arm**: `DrainSummary::finalize_eligibility` currently always returns `NotEligible { reason: DocsDeferredAtKvt1 }` because the stub always reports `DeferredKvt1`. After W12, real `Acked` outcomes route through `DrainSummary::record_doc_advanced` → `advanced_to_ack += 1`, and zero deferred-at-KVT1 docs unlock the `Eligible` arm → `OFFLINE_DRAIN_COMPLETED` audit + node mode `GoingOnline → Online` + session `Draining → Closed`.
+In both cases:
+
+- Reads the doc's `server_fiscal_no` (from `stage_send::run` 4-b OR from the prior-tick row).
+- Issues `lastChk(fn_sign)` and validates evidence per W0b §Verdict: `response.status == OK` + `response.id == doc.server_fiscal_no` + non-empty `response.data_sign`.
+- **On success (two-envelope ladder; see §"Transaction envelope shape")**: Envelope 1 (W12-owned) atomically composes the source-state-specific advance (Sent source: `Sent → Kvt1 → Kvt2` + persist `KVT1_RAW`; Kvt1 source: `Kvt1 → Kvt2` + persist `KVT1_RAW`); Envelope 2 (`stage_finalize::run`-owned) runs `Kvt2 → Ack` atomically.
+- **On Hold (W0b §97-102 conformance + W0b §latest-doc precondition)**: doc state **unchanged** (stays in `Kvt1` if Sent source had a Sent→Kvt1 commit before the Hold detection — see §"Transaction envelope shape" for exact split; OR stays in current Kvt1 if Kvt1-re-entry source).  Typed `Kvt2ConfirmHoldReason` + `KVT2_CONFIRM_HOLD` Warning audit.  **`DocVerdict::HoldFnDrain` — stops THIS FN's drain at the held doc**, NOT sibling-continue.  Subsequent docs on the same FN are not processed in this tick.  Next drain tick: cohort walker re-visits the still-Kvt1 doc; kvt2_confirm re-runs on the **still-latest** doc per W0b precondition.  Pending-drain shifts: Hold does NOT trigger manual escalation (per W9b §3.5 + W0b state-unchanged), BUT it also does NOT continue past the held doc.
+- **On StructuralDrift**: `BootError::Internal` propagation halts the entire FN drain.  System-level fail-loud; NOT per-doc Manual CAS.
+
+Unblock W9b drain finalization **Eligible arm**: `DrainSummary::finalize_eligibility` currently always returns `NotEligible { reason: DocsDeferredAtKvt1 }` because the stub always reports `DeferredKvt1`.  After W12: real `Acked` outcomes route through `DrainSummary::record_doc_advanced` → `advanced_to_ack += 1`; real `Hold` outcomes route through new `DrainSummary::record_doc_held_at_kvt1` → `held_at_kvt1 += 1` blocking finalize (analog to current DeferredKvt1, but distinct counter for forensic clarity).  Zero held-at-Kvt1 docs unlock the `Eligible` arm → `OFFLINE_DRAIN_COMPLETED` audit + node mode `GoingOnline → Online` + session `Draining → Closed`.
+
+**Why W12 invocation is NOT Sent-only.**  The Hold semantics require Kvt1 docs to be re-driven through kvt2_confirm on a subsequent drain tick.  This is structurally NOT boot-time arbitrary `Kvt1` polling (which W0b explicitly excludes — see §line 88) — it is drain-time re-confirmation of a doc that was the latest-on-FN at the moment of `stage_send` AND remains the latest-on-FN because Hold stops further same-FN sends.  The W0b latest-doc precondition is preserved by Hold's stop-FN-drain semantics.  Boot-time stale Kvt1 (docs predating M3b drain context) continue to be handled by `passive_hold_kvt1`.
 
 ---
 
-## Transaction envelope shape (MED-PR70-01 resolution, 2026-05-22)
+## Transaction envelope shape (MED-PR70-01 + MED-PR70-R2-02 resolution, 2026-05-22)
 
 **Chosen form: two-envelope ladder** (NOT tx-local refactor of `stage_finalize`).
 
 **Rationale.**  `stage_finalize::run(pool, doc) -> Result<...>` (at `rust/prro/src/services/write_path/stage_finalize.rs:234`) is a load-bearing M3a contract.  It owns its own `with_immediate` envelope spanning the 5-write atomicity unit (CAS `Kvt2 → Ack` + chain-seed advance + inbox DONE + outbox row + `STAGE_FINALIZE_ACK` audit per W8 review F1 close).  Refactoring this into a tx-local variant would expose chain-seed / inbox / outbox manipulation across module boundaries and require a separate audit of all downstream consumers — **out of W12 scope**.
 
-**Two-envelope sequence:**
+### Envelope 1 — state-specific (MED-PR70-R2-02 fix)
+
+Envelope 1 owns the source-state-specific advance from the pre-W12 state to `Kvt2`, atomically.  Two source states reach W12 in the drain hot path:
+
+#### (a) Source state = `Sent` (fresh post-`stage_send` invocation)
 
 ```
-[Envelope 1: W12-owned, inside backlog_drain::apply_w12_confirmation]
+[Envelope 1a: W12-owned, called after StageSendOutcome::Sent]
   with_immediate(pool, |tx| async {
-    1. UPDATE fiscal_documents.kvt1_raw = ? WHERE document_id = ?
-       (HIGH-C5-2 contract: byte-for-byte data_sign persist).
-    2. transition_state(tx, doc_id, Kvt1, Kvt2)
-       (W1 service-layer helper; whitelisted edge).
-    3. audit_log::append_tx(tx, "OFFLINE_DRAIN_KVT2_ADVANCED", payload)
-       (W12 evidence trail).
+    1. document_files::replace_tx(tx, doc_id, DocumentFileKind::Kvt1Raw, &data_sign_bytes)
+       (HIGH-C5-2 contract: byte-for-byte `lastChk.data_sign` persist; W9b uses
+        document_files Kvt1Raw artefact kind via INSERT OR REPLACE — matches
+        the existing repository contract at
+        `rust/prro/src/db/repositories/document_files.rs:124`).
+    2. fiscal_documents::transition_state(tx, doc_id, Sent, Kvt1)
+       (whitelisted edge per `fiscal_documents.rs:141`; preserves the current
+        W9b stub's Sent → Kvt1 CAS — NOT dropped).
+    3. fiscal_documents::transition_state(tx, doc_id, Kvt1, Kvt2)
+       (whitelisted edge; transitions immediately within the same envelope to
+        avoid a Kvt1-intermediate window inside this drain tick).
+    4. audit_log::append_tx(tx, "OFFLINE_DRAIN_KVT2_ADVANCED", payload)
+       (W12 evidence trail; payload includes from_state="SENT", to_state="KVT2",
+        dispatch_via="kvt2_confirm", server_fiscal_no, kvt1_raw_sha256_hex).
   })
+```
 
+All four operations commit atomically.  Two whitelisted edges (`Sent → Kvt1`, `Kvt1 → Kvt2`) executed inside one tx — no direct `Sent → Kvt2` edge is invented (none exists in `fiscal_documents::allowed_transition` and none is introduced by W12).
+
+#### (b) Source state = `Kvt1` (drain cohort re-entry after prior-tick Hold)
+
+```
+[Envelope 1b: W12-owned, called on cohort dispatch for DocState::Kvt1]
+  with_immediate(pool, |tx| async {
+    1. document_files::replace_tx(tx, doc_id, DocumentFileKind::Kvt1Raw, &data_sign_bytes)
+       (idempotent: prior-tick Hold did not persist Kvt1Raw; replace_tx INSERT OR
+        REPLACE handles the no-prior-row case AND the re-write-same-bytes case;
+        byte-for-byte invariant means re-write is content-identical).
+    2. fiscal_documents::transition_state(tx, doc_id, Kvt1, Kvt2)
+       (single whitelisted edge; doc is already at Kvt1 from prior tick).
+    3. audit_log::append_tx(tx, "OFFLINE_DRAIN_KVT2_ADVANCED", payload)
+       (W12 evidence trail; payload from_state="KVT1", to_state="KVT2",
+        dispatch_via="kvt2_confirm_kvt1_reentry", server_fiscal_no,
+        kvt1_raw_sha256_hex, prior_hold_count: reads any prior KVT2_CONFIRM_HOLD
+        audit count for forensic continuity).
+  })
+```
+
+### Envelope 2 — identical for both source states
+
+```
 [Envelope 2: stage_finalize::run-owned, called from drain after envelope 1 commits]
   stage_finalize::run(pool, doc_id).await
     → with_immediate(pool, |tx| async {
@@ -51,16 +93,26 @@ Unblock W9b drain finalization **Eligible arm**: `DrainSummary::finalize_eligibi
       })
 ```
 
-**Crash-recovery contract.**  Crash between Envelope 1 commit and Envelope 2 start (OR mid-Envelope-2) leaves the doc in `DocState::Kvt2`.  Recovery path **already exists** at `boot_phase.rs:2468` — `dispatch_pending_doc::DocState::Kvt2` arm calls `stage_finalize::run(pool, doc_id)` directly with idempotent CAS `Kvt2 → Ack` (existing M3a invariant: `Conflict` outcome on already-Ack doc returns `StageFinalizeOutcome::AlreadyAcked`, no side effects).  No new boot dispatcher arm needed for W12 closure.
+### Crash-recovery contract (revised per state-specific Envelope 1)
 
-**Mid-drain crash recovery (same drain tick).**  W12 PR widens the W9b cohort walker filter (`fiscal_documents::list_drain_candidates_for_fn_ordered_by_lnd`) to include `DocState::Kvt2`, reversing the MED-C5-4 deferral.  Drain dispatch for `Kvt2` cohort entry routes through a new `process_via_w12_kvt2_advance` helper that invokes `stage_finalize::run` (same call as boot recovery) — sibling-continue with `DocVerdict::Advanced` on success, idempotent `AlreadyAcked` on replay.  This ensures crash mid-drain between Envelope 1 and Envelope 2 is recovered **within the same drain tick** without waiting for boot.
+**Recovery path coverage:**
+
+- **Crash inside Envelope 1**: rolled back atomically.  Doc state stays as the cohort-walker emitted (Sent OR Kvt1).
+  - If Sent: next drain tick re-enters via `StageSendOutcome::Sent` post-`stage_send` path — but `stage_send::run` 4-pre CAS `Sent → Sending` rejects (whitelist), so the cohort walker emits the `Sent` doc via the `process_via_lastchk_replay` arm (W9b existing). That arm's lastChk Match path advances Sent → Kvt1 (current stub behavior) — see Acceptance §18 below for the W12-aware refinement of this path.
+  - If Kvt1: next drain tick re-enters via cohort `Kvt1` dispatch → `process_via_w12_only` (rewritten in this PR) → kvt2_confirm → Envelope 1b → Envelope 2.
+- **Crash between Envelope 1 commit and Envelope 2 invocation**: doc in `Kvt2`.  Recovery path **already exists** at `boot_phase.rs:2468` — `dispatch_pending_doc::DocState::Kvt2` arm calls `stage_finalize::run(pool, doc_id)` directly with idempotent CAS `Kvt2 → Ack` (existing M3a invariant: `Conflict` outcome on already-Ack doc returns `StageFinalizeOutcome::AlreadyAcked`, no side effects).
+- **Crash mid-Envelope 2**: rolled back atomically; doc in `Kvt2`; same boot recovery path as above.
+- **Crash mid-drain after Envelope 1 commit but before tick exit**: doc in `Kvt2`.  W12 PR widens the W9b cohort walker filter (`fiscal_documents::list_drain_candidates_for_fn_ordered_by_lnd`) to include `DocState::Kvt2`, reversing the MED-C5-4 deferral.  Drain dispatch for `Kvt2` cohort entry routes through a new `process_via_w12_kvt2_advance` helper that invokes `stage_finalize::run` (same call as boot recovery) — `DocVerdict::Advanced` on success, idempotent `AlreadyAcked` on replay.  This ensures crash mid-drain is recovered **within the same drain tick** without waiting for boot.
 
 **Why not tx-local refactor.**  See above + W8 review F1 close docstring at `stage_finalize.rs:198-204` — the pool-only signature is a load-bearing safety property ("makes that bug class structurally impossible") that we do NOT want to weaken in W12.
 
-**Idempotency invariants under two-envelope.**
-- Envelope 1 CAS `Kvt1 → Kvt2` is gated by `WHERE state = 'KVT1'`; replay finds Kvt2 → `Conflict`; surfaces as structural drift only if `kvt1_raw` already differs from new evidence (HIGH-C5-2 byte-for-byte invariant catches this).
-- Envelope 2 CAS `Kvt2 → Ack` is gated by `WHERE state = 'KVT2'`; replay on Ack → `AlreadyAcked` (no-op).
-- Both gates together: crash recovery is convergent — every recovery path lands at `Ack`, never duplicates `STAGE_FINALIZE_ACK` audit or chain-seed advance.
+### Idempotency invariants under two-envelope
+
+- Envelope 1a CAS `Sent → Kvt1`: gated by `WHERE state = 'SENT'`; replay finds `Kvt1` (advanced) → `Conflict`; structural drift check via `kvt1_raw` byte-equiv (HIGH-C5-2: if bytes match, no drift; if differ, fail-loud).
+- Envelope 1a CAS `Kvt1 → Kvt2`: gated by `WHERE state = 'KVT1'`; replay finds `Kvt2` → `Conflict`; same byte-equiv check via document_files row read.
+- Envelope 1b CAS `Kvt1 → Kvt2`: same as Envelope 1a step (3); `document_files::replace_tx` for Kvt1Raw is INSERT OR REPLACE, content-identical replay is no-op.
+- Envelope 2 CAS `Kvt2 → Ack`: gated by `WHERE state = 'KVT2'`; replay on Ack → `AlreadyAcked` (no-op).
+- Cross-envelope: replay convergence proof in Acceptance §15-17.
 
 ---
 
@@ -74,16 +126,26 @@ W12 is the **WebCheck / gRPC** confirmation path only.  The `lastChk(fn_sign)` e
 
 - **NEW** `rust/prro/src/services/offline_sync/kvt2_confirm.rs` — typed surface + helper:
   - `pub enum Kvt2ConfirmOutcome { Acked { kvt1_raw_bytes: Vec<u8> }, Hold(Kvt2ConfirmHoldReason), StructuralDrift(Kvt2ConfirmStructuralReason) }`
-  - `pub enum Kvt2ConfirmHoldReason { DpsTransientError(String), DpsServerError{status:i32, message:String}, LastChkStatusNotOk{status:i32, message:String}, LastChkIdMismatch{observed:String, expected:String}, LastChkDataSignEmpty }` — **all hold; doc state UNCHANGED per W0b §97-102**; sibling-continue; replayable next tick.
+  - `pub enum Kvt2ConfirmHoldReason { DpsTransientError(String), DpsServerError{status:i32, message:String}, LastChkStatusNotOk{status:i32, message:String}, LastChkIdMismatch{observed:String, expected:String}, LastChkDataSignEmpty }` — **all hold; doc state UNCHANGED per W0b §97-102**; drain-control = **STOP FN DRAIN** at this doc (NOT sibling-continue; preserves W0b latest-doc precondition); replayable next tick via drain `Kvt1` cohort re-entry seam.
   - `pub enum Kvt2ConfirmStructuralReason { ServerFiscalNoMissing, CasMissOnAdvance{from:DocState, to:DocState, observed:DocState} }` — structural-invariant breach (stage_send 4-b set server_fiscal_no NOT NULL invariant broken / concurrent writer skew); surfaces as `BootError::Internal` for fail-loud forensics.  NOT manual-recon escalation — these indicate higher-level state corruption that operator triage cannot heal at the doc-level.
-  - `pub async fn confirm_drain_doc(pool, dps, doc_id, fn_sign) -> Result<Kvt2ConfirmOutcome, BootError>` — pure helper; `lastChk` DPS call OUTSIDE any `with_immediate` per I1.
+  - `pub async fn confirm_drain_doc(pool, dps, doc_id, fn_sign) -> Result<Kvt2ConfirmOutcome, BootError>` — pure helper; `lastChk` DPS call OUTSIDE any `with_immediate` per I1.  Invoked from BOTH Sent-source AND Kvt1-source drain dispatch arms.
 - **EDIT** `rust/prro/src/services/offline_sync/backlog_drain.rs`:
-  - Replace `apply_w12_confirmation` stub body to call `kvt2_confirm::confirm_drain_doc` on the `Sent` outcome path.
-  - Route `Kvt2ConfirmOutcome::Acked { kvt1_raw_bytes }` through the **two-envelope ladder** (see §"Transaction envelope shape"): Envelope 1 persists `kvt1_raw` + CAS `Kvt1 → Kvt2` + `OFFLINE_DRAIN_KVT2_ADVANCED` audit (atomic via `with_immediate`); then Envelope 2 invokes `stage_finalize::run(pool, doc_id)` for `Kvt2 → Ack`.  On both envelopes success: `DocVerdict::Advanced` + summary `record_doc_advanced(W12ConfirmOutcome::Acked, via_lastchk_replay=false)`.
-  - Route `Kvt2ConfirmOutcome::Hold(_)` → `DocVerdict::Failed { class: hold-specific FailureClass, manual_recon: false }` (sibling-continue; doc state **unchanged**, stays in `Kvt1` per W0b §97-102); emit `KVT2_CONFIRM_HOLD` Warning audit with typed hold reason payload.  **No CAS to Manual.**  Pending-drain shifts: hold class does NOT trigger halt (matches W9b §3.5 gravity rule + W0b state-unchanged contract).
-  - Route `Kvt2ConfirmOutcome::StructuralDrift(_)` → `BootError::Internal` propagation (fail-loud; halts entire FN drain via existing `BootError` plumbing).  This is the ONLY non-success path that exits sibling-continue.  Reasoning: structural-drift indicates concurrent writer race past App reconcile mutex OR stage_send invariant breach — both are higher-level system state corruption, not doc-level operator-actionable issues.  Operator triage starts with the BootError audit chain; per-doc Manual CAS would mask the systemic skew.
+  - Add new `DocVerdict::HoldFnDrain { class: FailureClass }` variant (third variant alongside `Advanced` + `Failed`).  Drain loop semantics:
+    - `Advanced` → sibling-continue (current behavior).
+    - `Failed { manual_recon: true }` on pending-drain shift → escalate shift Manual + halt (current W9b behavior).
+    - `Failed { _ }` otherwise → sibling-continue (current behavior for ER ProbeRequired / transient).
+    - **`HoldFnDrain` → STOP this FN's drain at the held doc**; subsequent backlog docs in this tick NOT processed; summary records held-at-Kvt1 counter; finalize-eligibility check returns `NotEligible { DocsHeldAtKvt1 }`.  NO shift escalation.  NO sibling-continue.  This is the W0b latest-doc precondition enforcement (HIGH-PR70-R2-01 fix).
+  - Replace `apply_w12_confirmation` stub body with kvt2_confirm-backed implementation.  The function continues to be invoked from `process_via_stage_send` post-`StageSendOutcome::Sent` AND from the rewritten `process_via_w12_only`.
+  - Rewrite `process_via_w12_only` (currently a stub that always returns `DeferredKvt1`): on `DocState::Kvt1` cohort dispatch, invoke `kvt2_confirm::confirm_drain_doc` with the doc's existing `server_fiscal_no` (from prior-tick `Sent → Kvt1` advance) → route outcomes per the Acked/Hold/StructuralDrift table.  This is the **Kvt1 re-entry seam** required for HIGH-PR70-R2-01 fix.  Source state Kvt1 means the doc was Held on a prior tick (or is post-`lastChk-replay-match` from `process_via_lastchk_replay`); kvt2_confirm re-runs the same evidence check; the W0b latest-doc precondition holds because Hold stops further same-FN sends.
+  - Route `Kvt2ConfirmOutcome::Acked { kvt1_raw_bytes }` through the **two-envelope ladder** (see §"Transaction envelope shape").  Envelope 1 is state-specific:
+    - Sent-source: persist `Kvt1Raw` artefact via `document_files::replace_tx` + CAS `Sent → Kvt1` + CAS `Kvt1 → Kvt2` + `OFFLINE_DRAIN_KVT2_ADVANCED` audit (atomic).
+    - Kvt1-source: persist `Kvt1Raw` + CAS `Kvt1 → Kvt2` + audit (atomic).
+    - Then Envelope 2 invokes `stage_finalize::run(pool, doc_id)` for `Kvt2 → Ack`.  Success: `DocVerdict::Advanced` + summary `record_doc_advanced(W12ConfirmOutcome::Acked, via_lastchk_replay=false)`.
+  - Route `Kvt2ConfirmOutcome::Hold(_)` → `DocVerdict::HoldFnDrain { class: hold-specific FailureClass }`; doc state **unchanged** per W0b §97-102 (stays in `Sent` if Sent-source hadn't yet committed Envelope 1, OR stays in `Kvt1` if Kvt1-source); emit `KVT2_CONFIRM_HOLD` Warning audit with typed hold reason payload.  Summary `record_doc_held_at_kvt1`.  **No CAS to Manual.  No sibling-continue.**  Pending-drain shifts: Hold neither halts via Manual nor continues.
+  - Route `Kvt2ConfirmOutcome::StructuralDrift(_)` → `BootError::Internal` propagation (fail-loud; halts entire FN drain via existing `BootError` plumbing).
   - **Widen drain cohort to include `DocState::Kvt2`** (reverses MED-C5-4 W9b deferral): update `fiscal_documents::list_drain_candidates_for_fn_ordered_by_lnd` SELECT IN list to `('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE','KVT2')`.  Dispatch `Kvt2` cohort entries via new `process_via_w12_kvt2_advance` that calls `stage_finalize::run` (idempotent under M3a `AlreadyAcked` contract).
-  - Update `W12ConfirmOutcome` enum docstring: stub-only invariant retired; `DeferredKvt1` remains as the documented post-stage_send pre-confirmation marker emitted ONLY when `Kvt2ConfirmOutcome::Hold` (state unchanged → cohort walker re-visits next tick).
+  - Add new `DrainSummary::record_doc_held_at_kvt1(doc_id, hold_class)` + private counter `held_at_kvt1: u32`.  `finalize_eligibility` returns `NotEligible { DocsHeldAtKvt1 }` when `held_at_kvt1 > 0`.  Distinct from `advanced_to_kvt1 > 0` (which currently blocks finalize via `DocsDeferredAtKvt1`) — the two counters track different forensic states post-W12: `advanced_to_kvt1` should approach zero after W12 lands (only `W12ConfirmOutcome::DeferredKvt1` produces it, which is now an inert stub-era artifact); `held_at_kvt1` is the live W12-era signal.
+  - Retire `W12ConfirmOutcome::DeferredKvt1` routing through `record_doc_advanced` → `advanced_to_kvt1` once W12 lands; keep the enum variant only for backward-compat with crash-recovered docs from pre-W12 history (no migration impact — variant is inert post-W12).
 - **EDIT** `rust/prro/src/services/offline_sync/mod.rs` (`pub mod kvt2_confirm`).
 - **EDIT** `rust/prro/src/db/repositories/fiscal_documents.rs` — widen drain-cohort SELECT IN list to include `KVT2` (MED-C5-4 W12 reversal).
 - **KEEP** `rust/prro/src/services/reconciliation/boot_phase.rs::passive_hold_kvt1` as the primary boot-time handler for stale/pre-existing `Kvt1` docs outside drain context.  W12 does not change boot-time KVT1 dispatch.
@@ -93,83 +155,108 @@ W12 is the **WebCheck / gRPC** confirmation path only.  The `lastChk(fn_sign)` e
 
 ## Day budget
 
-2.5–3 days (revised upward from umbrella plan §Task 12 1.5–2d estimate to cover: explicit two-envelope transaction scope per MED-PR70-01, W0b-conformant Hold/StructuralDrift failure split per MED-PR70-02, mandatory crash-recovery convergence proofs, and drain cohort widening to include KVT2).
+~5 days (revised upward from umbrella plan §Task 12 1.5–2d estimate after two operator review passes):
+- First pass (MED-PR70-01 + MED-PR70-02): +explicit two-envelope transaction scope, +W0b-conformant Hold/StructuralDrift failure split, +mandatory crash-recovery convergence proofs, +drain cohort widening to include KVT2.
+- Second pass (HIGH-PR70-R2-01 + MED-PR70-R2-02 + LOW-PR70-R2-03): +new `DocVerdict::HoldFnDrain` variant with drain-stop semantics, +Kvt1 re-entry seam (`process_via_w12_only` rewritten), +state-specific Envelope 1a/1b (Sent vs Kvt1 source), +`document_files::replace_tx(Kvt1Raw)` instead of `UPDATE fiscal_documents.kvt1_raw`, +4 dedicated W0b latest-doc precondition proofs.
+
+See §"Day-budget breakdown" for commit-level allocation.
 
 ---
 
 ## Phasing (commit-level)
 
 - **Commit 1 — helper + types**: `kvt2_confirm.rs` typed surface (`Outcome::{Acked, Hold(reason), StructuralDrift(reason)}`), evidence-check logic, no DB writes.  Unit tests against scripted `DpsChannel` stub.
-- **Commit 2 — cohort widening + drain stub replacement**: `fiscal_documents::list_drain_candidates_for_fn_ordered_by_lnd` SELECT IN list extended to include `KVT2` (reverses MED-C5-4); `backlog_drain.rs::process_one_doc` adds `DocState::Kvt2` dispatch arm routing to new `process_via_w12_kvt2_advance` (calls `stage_finalize::run`).  `apply_w12_confirmation` stub replaced — Envelope 1 (W12-owned, persists `kvt1_raw` + Kvt1→Kvt2 + audit) chained with Envelope 2 (`stage_finalize::run` pool-call).
-- **Commit 3 — Hold path (W0b state-unchanged conformance)**: route `Kvt2ConfirmOutcome::Hold(_)` through `DocVerdict::Failed { manual_recon: false }`; emit `KVT2_CONFIRM_HOLD` Warning audit with typed reason payload; no CAS.  Pending-drain halt parity NOT triggered (W9b §3.5 gravity rule preserved).
-- **Commit 4 — StructuralDrift path**: route `Kvt2ConfirmOutcome::StructuralDrift(_)` as `BootError::Internal` propagation; halts entire FN drain.  NO per-doc Manual CAS (would mask systemic skew).
-- **Commit 5 — fixture acceptance**: 6 success/hold-class fixtures (see Acceptance §Fixture matrix).
-- **Commit 6 — interleave proof**: `backlog_drain_no_next_send_before_current_lastchk` fixture (per umbrella plan §Task 12 acceptance).
-- **Commit 7 — crash-recovery convergence proof (MANDATORY, NOT optional)**: deterministic-replay fixtures covering 3 crash windows:
-  - crash between Envelope 1 commit and Envelope 2 start → doc in `Kvt2` → boot recovery via `boot_phase::dispatch_pending_doc::DocState::Kvt2` lands `Ack`;
-  - crash mid-Envelope-2 → doc in `Kvt2` (stage_finalize internal CAS not applied) → same boot recovery lands `Ack`;
-  - crash mid-drain after Envelope 1 commit → next drain tick re-visits doc via widened cohort (KVT2 included) → `process_via_w12_kvt2_advance` advances to `Ack` (idempotent under M3a `AlreadyAcked`).
-  These three proofs are load-bearing for W12 acceptance because the two-envelope ladder introduces a Kvt2 intermediate window that must be provably convergent.
+- **Commit 2 — `DocVerdict::HoldFnDrain` + drain loop control**: add new verdict variant; teach `drain()` loop to stop at `HoldFnDrain` (no further docs this tick); add `DrainSummary::record_doc_held_at_kvt1` + `held_at_kvt1` counter; extend `FinalizeEligibility::NotEligible` reason variant `DocsHeldAtKvt1`.  Update `finalize_eligibility()` to block on `held_at_kvt1 > 0` (in addition to existing `advanced_to_kvt1 > 0`).  Unit tests for verdict / summary / eligibility.
+- **Commit 3 — cohort widening + Kvt2 dispatch arm**: `fiscal_documents::list_drain_candidates_for_fn_ordered_by_lnd` SELECT IN list extended to include `KVT2` (reverses MED-C5-4); `backlog_drain.rs::process_one_doc` adds `DocState::Kvt2` dispatch arm routing to new `process_via_w12_kvt2_advance` (calls `stage_finalize::run`).  Integration test: KVT2 cohort entry dispatches to stage_finalize and reaches Ack.
+- **Commit 4 — Sent-source W12 wiring (Envelope 1a + Envelope 2)**: replace `apply_w12_confirmation` stub body — on `StageSendOutcome::Sent` outcome, call `kvt2_confirm::confirm_drain_doc`; on `Acked` route through Envelope 1a (Kvt1Raw via `document_files::replace_tx` + `Sent → Kvt1` CAS + `Kvt1 → Kvt2` CAS + `OFFLINE_DRAIN_KVT2_ADVANCED` audit, all atomic) then Envelope 2 (`stage_finalize::run`).
+- **Commit 5 — Kvt1-source W12 wiring (Envelope 1b + Envelope 2)**: rewrite `process_via_w12_only` to invoke `kvt2_confirm::confirm_drain_doc` on doc's existing `server_fiscal_no`; on `Acked` route through Envelope 1b (Kvt1Raw + `Kvt1 → Kvt2` + audit) then Envelope 2.  This is the **Kvt1 re-entry seam** for prior-tick-Held docs (HIGH-PR70-R2-01 fix).
+- **Commit 6 — Hold path (W0b state-unchanged + drain-stop conformance)**: route `Kvt2ConfirmOutcome::Hold(_)` through `DocVerdict::HoldFnDrain { class: hold-specific FailureClass }`; emit `KVT2_CONFIRM_HOLD` Warning audit with typed reason payload; no CAS.  Drain loop stops at this doc for this tick (per Commit 2 semantics).  Pending-drain shifts: Hold neither halts via Manual escalation nor continues past held doc.
+- **Commit 7 — StructuralDrift path**: route `Kvt2ConfirmOutcome::StructuralDrift(_)` as `BootError::Internal` propagation; halts entire FN drain.  NO per-doc Manual CAS (would mask systemic skew).
+- **Commit 8 — fixture acceptance**: 7+ success/hold-class fixtures including Sent-source Acked, Kvt1-source Acked, all 5 Hold reasons (see Acceptance §Fixture matrix).
+- **Commit 9 — W0b latest-doc precondition proofs (CORE)**:
+  - `w12_hold_on_doc_i_blocks_doc_i_plus_1_send_in_same_tick` (no `stage_send::run` call for lnd>held_lnd).
+  - `w12_kvt1_reentry_after_hold_advances_to_ack_when_evidence_recovers` (next tick re-enters via cohort, kvt2_confirm returns Acked, doc reaches Ack).
+  - `w12_kvt1_reentry_holds_again_blocks_finalize_with_docs_held_at_kvt1` (next tick Hold again → still NotEligible).
+  - `w12_pending_drain_hold_does_not_escalate_shift_but_does_not_continue` (shift state Opened**LocalPendingDrain unchanged; lnd>held_lnd docs not processed).
+- **Commit 10 — interleave proof (W0b interleave precondition)**: `backlog_drain_no_next_send_before_current_lastchk` fixture (per umbrella plan §Task 12 acceptance) — extends Commit 9 with explicit assertion that DpsChannel `send_chk` count remains at exactly the number of Acked docs processed pre-Hold.
+- **Commit 11 — crash-recovery convergence proof (MANDATORY)**: deterministic-replay fixtures covering 4 crash windows:
+  - crash inside Envelope 1a → rolled back; doc in Sent → next tick `process_via_lastchk_replay` advances via stub Sent→Kvt1 then next-tick Kvt1 cohort re-entry → W12 → Ack.
+  - crash inside Envelope 1b → rolled back; doc in Kvt1 → next tick Kvt1 cohort re-entry → W12 → Ack.
+  - crash between Envelope 1 commit and Envelope 2 start → doc in `Kvt2` → boot recovery via `boot_phase::dispatch_pending_doc::DocState::Kvt2` lands `Ack` OR mid-tick cohort widening lands `Ack` in same tick.
+  - crash mid-Envelope-2 → doc in `Kvt2` (stage_finalize internal CAS not applied) → same boot/in-tick recovery lands `Ack` idempotent.
 
 ---
 
 ## Acceptance criteria
 
-### W12 core (from umbrella plan §Task 12 + W0b verdict §97-102)
+### W12 core (from umbrella plan §Task 12 + W0b verdict §97-102 + HIGH-PR70-R2-01 fix)
 
-1. W12 confirmation is invoked **only** from the W9b drain `Sent` outcome path; no boot-time invocation seam added.
-2. **Hard interleave precondition**: no same-FN send may occur between `stage_send(doc_i)` and `lastChk(fn_sign)`.  Relies on W2 module-level enforcement + ADR-M3-A10 single-writer discipline; covered by App reconcile mutex (W9b carry-over).  Verified by `backlog_drain_no_next_send_before_current_lastchk` fixture.
-3. Success evidence checks:
+1. W12 confirmation is invoked **only from drain control flow** — never from boot-time arbitrary `Kvt1` polling.  Two drain entry points:
+   - `process_via_stage_send` post-`StageSendOutcome::Sent` (Sent-source path).
+   - `process_via_w12_only` post-cohort-dispatch for `DocState::Kvt1` (Kvt1 re-entry seam, used for prior-tick Held docs).
+2. **W0b interleave precondition**: no same-FN send may occur between `stage_send(doc_i)` and `lastChk(fn_sign)`.  Relies on W2 module-level enforcement + ADR-M3-A10 single-writer discipline; covered by App reconcile mutex (W9b carry-over).  Verified by `backlog_drain_no_next_send_before_current_lastchk` fixture.
+3. **W0b latest-doc precondition (HIGH-PR70-R2-01 fix)**: on `Kvt2ConfirmOutcome::Hold`, the drain MUST stop processing subsequent docs on the same FN this tick.  Otherwise `lastChk(fn_sign)` semantics break: a Held `doc_i` is no longer the latest on FN after `doc_{i+1}` sends, and scoped W12 can never re-prove KVT2 for `doc_i`.  Verified by `w12_hold_on_doc_i_blocks_doc_i_plus_1_send_in_same_tick`.
+4. Success evidence checks:
    - `lastChk.status == OK`;
    - `response.id == doc.server_fiscal_no`;
    - `response.data_sign` present AND non-empty.
-4. On success: **two-envelope ladder** (per §"Transaction envelope shape").  Envelope 1 atomically persists `kvt1_raw_bytes` (byte-for-byte, HIGH-C5-2 contract preserved) + CAS `Kvt1 → Kvt2` via W1 service-layer `transition_state` helper + `OFFLINE_DRAIN_KVT2_ADVANCED` audit.  Envelope 2 calls `stage_finalize::run` for `Kvt2 → Ack` (M3a unchanged).
-5. **W0b §97-102 state-unchanged conformance for evidence failures**: on `status != OK` OR id mismatch OR missing/empty `data_sign` OR DPS transport/server errors → `Kvt2ConfirmOutcome::Hold(reason)` → `DocVerdict::Failed { manual_recon: false }` → doc state UNCHANGED (stays in `Kvt1`) → `KVT2_CONFIRM_HOLD` Warning audit with typed reason payload → sibling-continue.  **No CAS to Manual.**  Doc remains replayable per W0b accepted contract.
-6. **Structural-drift failures**: `ServerFiscalNoMissing` (stage_send 4-b invariant breach) OR `CasMissOnAdvance` (concurrent writer past App mutex) → `Kvt2ConfirmOutcome::StructuralDrift(reason)` → `BootError::Internal` propagation halts entire FN drain.  No per-doc Manual CAS (would mask systemic skew).
-7. `passive_hold_kvt1` remains the primary boot-time handler for arbitrary/stale `Kvt1` docs outside drain context.
-8. **Kvt2 boot-recovery path preserved**: `boot_phase::dispatch_pending_doc::DocState::Kvt2` arm (line 2468) continues to drive any orphaned `Kvt2` docs through `stage_finalize::run`; W12 does NOT touch this arm.
+5. On success: **two-envelope ladder** (per §"Transaction envelope shape"):
+   - Envelope 1a (Sent source): persist `Kvt1Raw` via `document_files::replace_tx` + CAS `Sent → Kvt1` + CAS `Kvt1 → Kvt2` + `OFFLINE_DRAIN_KVT2_ADVANCED` audit, all atomic.
+   - Envelope 1b (Kvt1 source / re-entry): persist `Kvt1Raw` + CAS `Kvt1 → Kvt2` + audit, all atomic.
+   - Envelope 2: `stage_finalize::run` for `Kvt2 → Ack` (M3a unchanged).
+   - `Kvt1Raw` bytes match `lastChk.data_sign` byte-for-byte (HIGH-C5-2 contract preserved; W9b lastChk-replay-match path's KVT1_RAW persistence pattern reused).
+6. **W0b §97-102 state-unchanged conformance for evidence failures**: on `status != OK` OR id mismatch OR missing/empty `data_sign` OR DPS transport/server errors → `Kvt2ConfirmOutcome::Hold(reason)` → `DocVerdict::HoldFnDrain` → doc state UNCHANGED → `KVT2_CONFIRM_HOLD` Warning audit with typed reason payload → **STOP FN DRAIN this tick**.  No CAS to Manual.  No sibling-continue past held doc.
+7. **Structural-drift failures**: `ServerFiscalNoMissing` (stage_send 4-b invariant breach) OR `CasMissOnAdvance` (concurrent writer past App mutex) → `Kvt2ConfirmOutcome::StructuralDrift(reason)` → `BootError::Internal` propagation halts entire FN drain.  No per-doc Manual CAS (would mask systemic skew).
+8. `passive_hold_kvt1` remains the primary boot-time handler for arbitrary/stale `Kvt1` docs outside drain context.  W12 does NOT change boot-time KVT1 dispatch.  Drain Kvt1 re-entry seam is distinct from boot-time stale-Kvt1 handling.
+9. **Kvt2 boot-recovery path preserved**: `boot_phase::dispatch_pending_doc::DocState::Kvt2` arm (line 2468) continues to drive any orphaned `Kvt2` docs through `stage_finalize::run`; W12 does NOT touch this arm.
 
-### Drain finalization unblock
+### Drain control + finalization unblock
 
-9. With at least one real `Acked` outcome and zero held-at-Kvt1 docs, `DrainSummary::finalize_eligibility` returns `Eligible`; `OFFLINE_DRAIN_COMPLETED` audit emits; node mode `GoingOnline → Online`; session `Draining → Closed`.  Verified by `backlog_drain_completes_finalize_after_w12_acked` fixture.
-10. With at least one `Hold(_)` outcome on Kvt1 docs (deferred-at-Kvt1 > 0), `DrainSummary::finalize_eligibility` returns `NotEligible { DocsDeferredAtKvt1 }`; `OFFLINE_DRAIN_PARTIAL` audit emits; node + session stay in pre-drain state.  Pre-W12 stub behavior preserved as the deferred-hold case.
+10. New `DocVerdict::HoldFnDrain { class }` variant added; drain `drain()` loop stops processing subsequent docs in the current tick when this verdict surfaces.  Verified by `w12_hold_on_doc_i_blocks_doc_i_plus_1_send_in_same_tick` + `w12_pending_drain_hold_does_not_escalate_shift_but_does_not_continue` fixtures.
+11. New `DrainSummary::record_doc_held_at_kvt1` method + `held_at_kvt1: u32` counter.  `finalize_eligibility` returns `NotEligible { DocsHeldAtKvt1 }` when `held_at_kvt1 > 0` (distinct from `DocsDeferredAtKvt1` which tracks the inert post-W12 `W12ConfirmOutcome::DeferredKvt1` legacy routing).
+12. With at least one `Acked` outcome and zero held-at-Kvt1 docs AND zero deferred-at-Kvt1 docs, `DrainSummary::finalize_eligibility` returns `Eligible`; `OFFLINE_DRAIN_COMPLETED` audit emits; node mode `GoingOnline → Online`; session `Draining → Closed`.  Verified by `backlog_drain_completes_finalize_after_w12_acked`.
+13. With at least one `Hold(_)` outcome (held_at_kvt1 > 0), `DrainSummary::finalize_eligibility` returns `NotEligible { DocsHeldAtKvt1 }`; `OFFLINE_DRAIN_PARTIAL` audit emits; node + session stay in pre-drain state.
 
 ### Cohort widening (KVT2 added to drain cohort)
 
-11. `fiscal_documents::list_drain_candidates_for_fn_ordered_by_lnd` SELECT IN list extended from `('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE')` to `('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE','KVT2')` — reverses MED-C5-4 deferral.
-12. New drain dispatch arm `DocState::Kvt2 → process_via_w12_kvt2_advance` calls `stage_finalize::run` (idempotent under M3a `AlreadyAcked` contract); routes `Ok(Acked)` → `DocVerdict::Advanced`, `Ok(AlreadyAcked)` → `DocVerdict::Advanced` (no-op replay), `Err(_)` → typed failure surface.
+14. `fiscal_documents::list_drain_candidates_for_fn_ordered_by_lnd` SELECT IN list extended from `('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE')` to `('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE','KVT2')` — reverses MED-C5-4 deferral.
+15. New drain dispatch arm `DocState::Kvt2 → process_via_w12_kvt2_advance` calls `stage_finalize::run` (idempotent under M3a `AlreadyAcked` contract); routes `Ok(Acked)` → `DocVerdict::Advanced`, `Ok(AlreadyAcked)` → `DocVerdict::Advanced` (no-op replay), `Err(_)` → typed failure surface.
 
-### Pending-drain halt parity (W9b carry-over, REVISED per W0b conformance)
+### Pending-drain halt parity (W9b carry-over, REVISED per W0b conformance + drain-stop semantics)
 
-13. `Kvt2ConfirmOutcome::Hold(_)` on a pending-drain shift (`OpenedLocalPendingDrain` | `ClosingLocalPendingDrain`) does NOT halt — sibling-continue per W9b §3.5 gravity rule + W0b state-unchanged contract.  Operator finding MED-PR70-02 fix: evidence-failure classes never escalate to manual.
-14. `Kvt2ConfirmOutcome::StructuralDrift(_)` on a pending-drain shift halts entire FN drain via `BootError::Internal` propagation (different mechanism than W9b ER-guard's Manual CAS — structural drift is system-level, not operator-actionable).  No `OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL` audit (that's W9b ER-guard's manual-class halt only).
+16. `Kvt2ConfirmOutcome::Hold(_)` on a pending-drain shift (`OpenedLocalPendingDrain` | `ClosingLocalPendingDrain`) does NOT trigger shift Manual escalation (per W9b §3.5 gravity rule + W0b state-unchanged contract) **AND** does NOT sibling-continue (per HIGH-PR70-R2-01 latest-doc precondition).  Drain stops at held doc; shift state unchanged.
+17. `Kvt2ConfirmOutcome::StructuralDrift(_)` halts entire FN drain via `BootError::Internal` propagation (different mechanism than W9b ER-guard's Manual CAS — structural drift is system-level, not operator-actionable).  No `OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL` audit (that's W9b ER-guard's manual-class halt only).
 
 ### Crash-recovery convergence (MANDATORY per MED-PR70-01 fix)
 
-15. Crash between Envelope 1 commit and Envelope 2 invocation: doc in `Kvt2` → boot recovery via `boot_phase::dispatch_pending_doc::DocState::Kvt2` (existing M3a path) advances to `Ack` idempotently.
-16. Crash mid-Envelope 2 (`stage_finalize::run` internal): doc in `Kvt2` (CAS not applied) → same boot recovery path lands `Ack`.
-17. Crash mid-drain after Envelope 1: next drain tick re-visits the doc via widened cohort (KVT2 included) → `process_via_w12_kvt2_advance` advances to `Ack` idempotently; **same drain tick** recovery, no boot required.
+18. Crash inside Envelope 1a or 1b: rolled back atomically; doc state stays as cohort-emitted (Sent or Kvt1).  Next drain tick re-enters via the appropriate drain entry point.
+19. Crash between Envelope 1 commit and Envelope 2 invocation: doc in `Kvt2` → boot recovery via `boot_phase::dispatch_pending_doc::DocState::Kvt2` (existing M3a path) OR mid-tick cohort widening dispatches to `process_via_w12_kvt2_advance` and lands `Ack` idempotently in the same tick.
+20. Crash mid-Envelope 2 (`stage_finalize::run` internal): doc in `Kvt2` (CAS not applied) → same boot/in-tick recovery lands `Ack`.
 
-### Fixture matrix (7 + 3 crash recovery)
+### Fixture matrix (12 fixtures total)
 
-W12-confirm specific:
-- `kvt2_confirm_lastchk_match_advances_to_ack` (success path — Acked)
-- `kvt2_confirm_lastchk_status_not_ok_holds_in_kvt1` (Hold class — W0b conformance)
-- `kvt2_confirm_lastchk_id_mismatch_holds_in_kvt1` (Hold class — W0b conformance)
-- `kvt2_confirm_missing_data_sign_holds_in_kvt1` (Hold class — W0b conformance)
-- `kvt2_confirm_dps_transient_error_holds_in_kvt1` (Hold class)
-- `kvt2_confirm_no_server_fiscal_no_returns_structural_drift` (StructuralDrift; surfaces as BootError::Internal)
-- `kvt2_confirm_cas_miss_on_kvt1_to_kvt2_returns_structural_drift` (StructuralDrift)
+W12-confirm helper (typed surface validation, no DB):
+- `kvt2_confirm_lastchk_match_returns_acked` (success path)
+- `kvt2_confirm_lastchk_status_not_ok_returns_hold` (Hold class — W0b §97 conformance)
+- `kvt2_confirm_lastchk_id_mismatch_returns_hold` (Hold class — W0b §98 conformance)
+- `kvt2_confirm_missing_data_sign_returns_hold` (Hold class — W0b §99 conformance)
+- `kvt2_confirm_dps_transient_error_returns_hold` (Hold class — DPS transport)
+- `kvt2_confirm_no_server_fiscal_no_returns_structural_drift` (StructuralDrift surfaces as BootError::Internal upstream)
 
-Drain integration:
-- `backlog_drain_no_next_send_before_current_lastchk` (interleave proof, per umbrella plan)
+Drain integration — W0b latest-doc precondition proofs (HIGH-PR70-R2-01 CORE):
+- `w12_sent_source_acked_runs_envelope_1a_to_ack` (fresh Sent → Acked → Sent→Kvt1→Kvt2→Ack via two envelopes, Kvt1Raw persisted)
+- `w12_kvt1_reentry_after_prior_hold_advances_to_ack` (next tick after Hold: cohort emits Kvt1, kvt2_confirm Acked, Envelope 1b → Ack)
+- `w12_hold_on_doc_i_blocks_doc_i_plus_1_send_in_same_tick` (send_chk count proof: held doc stops drain; no further send_chk calls)
+- `w12_kvt1_reentry_holds_again_keeps_finalize_blocked_with_docs_held_at_kvt1` (two consecutive Hold ticks; NotEligible {DocsHeldAtKvt1} on both)
+- `w12_pending_drain_hold_does_not_escalate_shift_but_does_not_continue` (OpenedLocalPendingDrain: Hold doesn't manual-escalate AND doesn't sibling-continue)
+- `backlog_drain_no_next_send_before_current_lastchk` (interleave proof per umbrella plan)
 - `backlog_drain_completes_finalize_after_w12_acked` (finalize unblock proof)
-- `backlog_drain_hold_class_does_not_halt_pending_drain` (W9b §3.5 gravity rule verified post-W12)
 
 Crash-recovery convergence (MANDATORY):
-- `replay_crash_between_envelope_1_and_envelope_2_lands_ack_via_boot` (#15)
-- `replay_crash_mid_envelope_2_lands_ack_via_boot` (#16)
-- `replay_crash_mid_drain_after_envelope_1_lands_ack_in_same_tick` (#17)
+- `replay_crash_inside_envelope_1a_rollback_then_next_tick_reaches_ack`
+- `replay_crash_inside_envelope_1b_rollback_then_next_tick_reaches_ack`
+- `replay_crash_between_envelope_1_and_envelope_2_lands_ack_via_boot_or_intick_kvt2_dispatch`
+- `replay_crash_mid_envelope_2_lands_ack_idempotent`
 
 ---
 
@@ -208,9 +295,11 @@ Crash-recovery convergence (MANDATORY):
 
 ## Carry-forwards from M3b (W9b ER-class-guard PR #69 self-review LOWs, deferred as scope-conformant)
 
-- **LOW-1**: drain audit taxonomy does not have a distinct `OFFLINE_DRAIN_ER_BUDGET_EXHAUSTED` event_type (operator scope authorizes drain-specific audit projection).  W12 may consolidate: if `OFFLINE_DRAIN_KVT2_TERMINAL_FAILURE` audit taxonomy proves useful, retroactively split W9b ER manual-class events similarly.  Optional, not blocking.
-- **LOW-2**: in W9b ER class guard, `emit_doc_failed` runs in a separate envelope from the CAS+ESCALATED audit.  W12 should NOT replicate this pattern — `cas_kvt1_to_manual_via_drain` MUST emit `OFFLINE_DRAIN_KVT2_TERMINAL_FAILURE` + `OFFLINE_DRAIN_DOC_FAILED` inside the SAME `with_immediate` envelope (forensic completeness).  If feasible without taxonomy drift, also retroactively fix W9b ER guard in the same PR or follow-up.
-- **LOW-3**: drain CAS-helper returns `Err(BootError::Internal)` on non-Applied (stricter than boot's `Ok(bool)`).  W12 `cas_kvt1_to_manual_via_drain` should follow the same fail-loud pattern for consistency.  Operator-confirmed scope; not changing in this PR.
+W12 introduces no per-doc Manual CAS (failure semantics revised to Hold per W0b §97-102 + HIGH-PR70-R2-01 fix).  The W9b ER-class-guard LOWs below remain documented forensic notes; W12 does NOT inherit a `cas_kvt1_to_manual_via_drain` helper because no W12 outcome routes through Manual CAS.
+
+- **LOW-1**: drain audit taxonomy does not have a distinct `OFFLINE_DRAIN_ER_BUDGET_EXHAUSTED` event_type (operator scope authorizes drain-specific audit projection).  Not applicable to W12; W12 uses `KVT2_CONFIRM_HOLD` + `OFFLINE_DRAIN_KVT2_ADVANCED` audit types.
+- **LOW-2**: in W9b ER class guard, `emit_doc_failed` runs in a separate envelope from the CAS+ESCALATED audit.  W12 does NOT introduce an analogous gap — Envelope 1 (Sent or Kvt1 source) atomically emits `OFFLINE_DRAIN_KVT2_ADVANCED` inside the same `with_immediate` as the CAS chain via `audit_log::append_tx`.  W9b retroactive fix is out of W12 scope.
+- **LOW-3**: drain CAS-helper returns `Err(BootError::Internal)` on non-Applied (stricter than boot's `Ok(bool)`).  W12 follows the same fail-loud pattern via `Kvt2ConfirmOutcome::StructuralDrift` → `BootError::Internal`.  Consistent with W9b convention; no new variance introduced.
 
 ## Carry-forwards from M3b W14a-2a (operator-confirmed)
 
@@ -223,13 +312,19 @@ Crash-recovery convergence (MANDATORY):
 | Slice | Day | Detail |
 |---|---|---|
 | Commit 1 (helper + types) | 0.25 | typed surface with Hold/StructuralDrift split + evidence checks |
-| Commit 2 (cohort widening + drain wiring two-envelope) | 0.5 | KVT2 cohort + Envelope 1 + Envelope 2 chained; new `process_via_w12_kvt2_advance` arm |
-| Commit 3 (Hold path) | 0.25 | W0b state-unchanged conformance routing + `KVT2_CONFIRM_HOLD` audit |
-| Commit 4 (StructuralDrift path) | 0.25 | BootError::Internal propagation; halt mechanism |
-| Commit 5 (7 fixture acceptance) | 0.5 | scripted DpsChannel stub fixtures incl. all Hold sub-classes |
-| Commit 6 (interleave proof) | 0.25 | drain-loop integration test |
-| Commit 7 (crash-recovery convergence, MANDATORY) | 0.5 | 3 deterministic-replay fixtures (#15-17) |
+| Commit 2 (HoldFnDrain verdict + summary + eligibility) | 0.5 | new DocVerdict variant; drain loop control; held_at_kvt1 counter; NotEligible reason |
+| Commit 3 (cohort widening + KVT2 dispatch) | 0.25 | SELECT IN widening + new process_via_w12_kvt2_advance arm |
+| Commit 4 (Sent-source W12 wiring) | 0.5 | Envelope 1a (Kvt1Raw + Sent→Kvt1 + Kvt1→Kvt2 + audit) + Envelope 2 chain |
+| Commit 5 (Kvt1-source W12 wiring) | 0.5 | process_via_w12_only rewrite; Envelope 1b + Envelope 2 chain |
+| Commit 6 (Hold path) | 0.25 | DocVerdict::HoldFnDrain routing + KVT2_CONFIRM_HOLD audit |
+| Commit 7 (StructuralDrift path) | 0.25 | BootError::Internal propagation |
+| Commit 8 (12 fixture acceptance) | 0.75 | scripted DpsChannel stub fixtures including all Hold sub-classes + Sent/Kvt1 source path proofs |
+| Commit 9 (W0b latest-doc precondition proofs) | 0.5 | 4 fixtures per Acceptance §3 + §10 (CORE HIGH-PR70-R2-01 verification) |
+| Commit 10 (interleave proof) | 0.25 | extends Commit 9 with send_chk count assertion |
+| Commit 11 (crash-recovery convergence, MANDATORY) | 0.5 | 4 deterministic-replay fixtures (#18-20) |
 | Review rounds + polish | 0.5 | per M3b convention (1-3 rounds typical for hot-zone PRs) |
+
+**Total: ~5d** (revised upward from 2.5-3d after second-pass operator review; HIGH-PR70-R2-01 forces a substantially larger scope — new `DocVerdict::HoldFnDrain` variant + drain loop control + Kvt1 re-entry seam + 4 dedicated latest-doc precondition proofs).
 
 ---
 
@@ -269,21 +364,26 @@ cargo fmt -p prro -- --check
   ],
   "verifyCommand": "cargo test -p prro --features test-support --test kvt2_confirm --test backlog_drain_state_dispatch --test backlog_drain_finalize --test backlog_drain_per_doc_loop",
   "acceptanceCriteria": [
-    "W12 invoked only from W9 drain-time flow",
-    "lastChk status/id/data_sign evidence checks",
-    "two-envelope ladder: Envelope 1 (kvt1_raw + Kvt1→Kvt2) + Envelope 2 (stage_finalize::run Kvt2→Ack)",
+    "W12 invoked only from drain control flow (Sent post-stage_send OR Kvt1 cohort re-entry); never boot-time arbitrary KVT1 polling",
+    "lastChk evidence checks: status==OK + id==server_fiscal_no + non-empty data_sign",
+    "Sent-source: Envelope 1a atomically persists Kvt1Raw via document_files::replace_tx + Sent→Kvt1 + Kvt1→Kvt2 + audit",
+    "Kvt1-source (re-entry): Envelope 1b atomically persists Kvt1Raw + Kvt1→Kvt2 + audit",
+    "Envelope 2: stage_finalize::run Kvt2→Ack (M3a unchanged, idempotent AlreadyAcked)",
     "W0b §97-102 state-unchanged conformance for evidence failures (Hold class, no Manual CAS)",
+    "HIGH-PR70-R2-01 W0b latest-doc precondition: DocVerdict::HoldFnDrain stops FN drain at held doc (NOT sibling-continue)",
+    "next-tick re-entry: Kvt1 cohort dispatch re-runs kvt2_confirm on still-latest doc",
     "StructuralDrift class (ServerFiscalNoMissing / CasMissOnAdvance) → BootError::Internal halt; not per-doc Manual",
-    "drain cohort widened to include KVT2 (reverses MED-C5-4)",
-    "new dispatch arm process_via_w12_kvt2_advance uses stage_finalize::run idempotent AlreadyAcked",
+    "drain cohort widened to include KVT2 (reverses MED-C5-4); new process_via_w12_kvt2_advance arm",
     "Kvt2 boot-recovery path (boot_phase.rs:2468 DocState::Kvt2 arm) preserved unchanged",
-    "no same-FN send interleave before current lastChk (W2 mutex + ADR-M3-A10)",
-    "drain Eligible arm unblocks finalize after Acked outcomes",
-    "Hold class does NOT halt pending-drain shifts (W9b §3.5 gravity rule + W0b state-unchanged)",
-    "kvt1_raw_bytes persisted byte-for-byte (HIGH-C5-2 contract preserved)",
-    "crash-recovery convergence proofs MANDATORY: Envelope-1↔2 gap / mid-Envelope-2 / mid-drain after Envelope 1"
+    "no same-FN send interleave before current lastChk (W2 mutex + ADR-M3-A10 + Hold stop-drain semantics)",
+    "drain Eligible arm unblocks finalize after Acked outcomes; held_at_kvt1 counter blocks NotEligible{DocsHeldAtKvt1}",
+    "Pending-drain Hold does NOT escalate shift AND does NOT continue past held doc",
+    "kvt1_raw_bytes persisted byte-for-byte via document_files::replace_tx(Kvt1Raw) (HIGH-C5-2 contract preserved)",
+    "crash-recovery convergence proofs MANDATORY: Envelope-1a/1b rollback / between-1-and-2 / mid-Envelope-2",
+    "12 fixtures total: 6 helper-typed + 4 W0b latest-doc precondition + 2 finalize/interleave; plus 4 crash-recovery convergence"
   ],
   "blockedBy": ["W0b", "W1", "W2", "W3", "W9b", "W9b-er-class-guard"],
-  "unblocks": ["W13", "M3b-closure-final", "Phase-6-pilot-acceptance"]
+  "unblocks": ["W13", "M3b-closure-final", "Phase-6-pilot-acceptance"],
+  "operatorFindingsClosed": ["MED-PR70-01", "MED-PR70-02", "HIGH-PR70-R2-01", "MED-PR70-R2-02", "LOW-PR70-R2-03"]
 }
 ```
