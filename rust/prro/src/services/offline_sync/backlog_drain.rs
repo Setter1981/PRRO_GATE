@@ -341,6 +341,19 @@ pub fn failure_class_for(class: FailureClass) -> &'static str {
         FailureClass::Internal => "internal",
         FailureClass::NotFound => "not_found",
         FailureClass::OfflineFiscalNoMissing => "offline_fiscal_no_missing",
+        // M3b W9b ER-class-guard: TransientRetry with exhausted
+        // boot-attempt budget — operator triage required, doc CAS to
+        // RequiresManualReconciliation.  Distinct dashboard signal vs.
+        // the per-class manual escalation classes above so operators
+        // can spot "infinite retry loop" stuck docs separately.
+        FailureClass::BudgetExhausted => "budget_exhausted",
+        // M3b W9b ER-class-guard: durable `retry_class` missing OR
+        // unknown — drain has no evidence to choose a redrive path.
+        // Sibling-continue + hold (no CAS): matches boot semantics from
+        // `boot_phase::dispatch_error_retryable_by_class` HoldIndeterminate
+        // arm.  Reclassification to manual-class halt is a separate spec
+        // decision (operator-confirmed 2026-05-22 scope).
+        FailureClass::RetryClassIndeterminate => "retry_class_indeterminate",
     }
 }
 
@@ -363,6 +376,12 @@ pub enum FailureClass {
     Internal,
     NotFound,
     OfflineFiscalNoMissing,
+    /// M3b W9b ER-class-guard — TransientRetry boot-attempt budget cap
+    /// (`attempts_used >= MAX_BOOT_ATTEMPTS`) exhausted; manual-recon.
+    BudgetExhausted,
+    /// M3b W9b ER-class-guard — no durable `retry_class` recorded for
+    /// the ER doc; sibling-continue hold (non-manual).
+    RetryClassIndeterminate,
 }
 
 // ─── C3 + C4: orchestrator section ───────────────────────────────────
@@ -734,9 +753,19 @@ fn is_manual_recon_retry_class(retry: RetryClass) -> bool {
 }
 
 /// Dispatch one doc by its persisted `state` (spec amendment
-/// 2026-05-21 cohort dispatch contract; post MED-C5-4 KVT2 deferral):
-/// - `OFFLINE_LOCAL_ACK` / `ERROR_RETRYABLE` → wire send via
-///   `process_via_stage_send` (W9a 4-pre source whitelist).
+/// 2026-05-21 cohort dispatch contract; post MED-C5-4 KVT2 deferral;
+/// M3b W9b ER-class-guard 2026-05-22 ER split):
+/// - `OFFLINE_LOCAL_ACK` → wire send via [`process_via_stage_send`]
+///   (W9a 4-pre source whitelist).  No retry_class history is expected
+///   on this branch: the doc has been offline-acked but never sent to
+///   DPS, so no transport_trace row exists.
+/// - `ERROR_RETRYABLE` → [`process_via_er_class_guard`] reads the
+///   durable last-attempt `retry_class` and applies the
+///   redrive-vs-escalate policy shared with
+///   [`crate::services::reconciliation::boot_phase::dispatch_error_retryable_by_class`]
+///   (M3b W9b HIGH-M3B-01 fix).  Non-`TransientRetry` classes do NOT
+///   reach [`stage_send::run`] — re-driving would violate the
+///   `stage_send.rs:18` caller obligation table.
 /// - `SENT` → lastChk pre-flight via `process_via_lastchk_replay`
 ///   (closes I4 restart safety per spec §6).  No wire fall-through:
 ///   Mismatch / Decode / Unexpected route to manual-recon failure;
@@ -762,8 +791,11 @@ async fn process_one_doc(
     summary: &mut DrainSummary,
 ) -> Result<DocVerdict, BootError> {
     match doc.state {
-        DocState::OfflineLocalAck | DocState::ErrorRetryable => {
+        DocState::OfflineLocalAck => {
             process_via_stage_send(pool, deps, fiscal_number, doc, summary).await
+        }
+        DocState::ErrorRetryable => {
+            process_via_er_class_guard(pool, deps, fiscal_number, doc, summary).await
         }
         DocState::Sent => process_via_lastchk_replay(pool, deps, fiscal_number, doc, summary).await,
         DocState::Kvt1 => process_via_w12_only(pool, fiscal_number, doc, summary).await,
@@ -935,6 +967,259 @@ async fn process_via_stage_send(
             })
         }
     }
+}
+
+/// M3b W9b ER-class-guard (HIGH-M3B-01 fix, 2026-05-22).
+///
+/// Process a doc in `ERROR_RETRYABLE` state through the shared
+/// redrive-vs-escalate policy
+/// ([`crate::services::reconciliation::er_redrive_policy::evaluate_er_redrive`]).
+/// The policy gates wire re-drive on the durable last-attempt
+/// `retry_class` + `MAX_BOOT_ATTEMPTS` budget; only `TransientRetry`
+/// under budget is allowed to re-enter [`stage_send::run`] (matching
+/// the `stage_send.rs:18` caller obligation).  Other classes either:
+///   - escalate to `RequiresManualReconciliation` (manual-recon — halts
+///     pending-drain shifts via the outer loop's escalation ladder);
+///   - hold in `ERROR_RETRYABLE` (ProbeRequired / Indeterminate —
+///     sibling-continue, retains retry budget for a future tick where
+///     evidence may resolve).
+///
+/// Each branch:
+///   - escalations CAS `ErrorRetryable → RequiresManualReconciliation` and
+///     emit `OFFLINE_DRAIN_ER_ESCALATED_TO_MANUAL` audit inside ONE
+///     `with_immediate` envelope (atomic), then emit the standard
+///     per-doc `OFFLINE_DRAIN_DOC_FAILED` audit afterwards;
+///   - holds emit only the `OFFLINE_DRAIN_DOC_FAILED` audit (no CAS).
+///
+/// Both paths return `DocVerdict::Failed`; the `manual_recon` flag
+/// drives the outer pending-drain halt decision.
+async fn process_via_er_class_guard(
+    pool: &SqlitePool,
+    deps: &RuntimeView<'_>,
+    fiscal_number: &str,
+    doc: &fiscal_documents::DocumentRow,
+    summary: &mut DrainSummary,
+) -> Result<DocVerdict, BootError> {
+    use crate::services::reconciliation::boot_phase::MAX_BOOT_ATTEMPTS;
+    use crate::services::reconciliation::er_redrive_policy::{
+        evaluate_er_redrive, ErRedriveDecision,
+    };
+
+    let id_hex = hex_lower(doc.document_id.as_bytes());
+    let decision = evaluate_er_redrive(pool, doc.document_id)
+        .await
+        .map_err(BootError::Database)?;
+
+    match decision {
+        ErRedriveDecision::Redrive => {
+            // TransientRetry + attempts < MAX_BOOT_ATTEMPTS — Pattern B
+            // retry path.  Reuse the OfflineLocalAck wire-send branch
+            // verbatim: stage_send::run handles the 4-pre CAS
+            // `ErrorRetryable → Sending` per W7 / W9a freeze §4.2.
+            process_via_stage_send(pool, deps, fiscal_number, doc, summary).await
+        }
+        ErRedriveDecision::BudgetExhausted { attempts_used } => {
+            cas_er_to_manual_via_drain(
+                pool,
+                fiscal_number,
+                doc.document_id,
+                RetryClass::TransientRetry.as_str(),
+                Severity::Error,
+                "budget_exhausted",
+            )
+            .await?;
+            let class = FailureClass::BudgetExhausted;
+            let class_str = failure_class_for(class);
+            summary.record_doc_failure(doc.document_id, class_str.to_string());
+            let payload = serde_json::json!({
+                "document_id": id_hex,
+                "failure_class": class_str,
+                "retry_class": RetryClass::TransientRetry.as_str(),
+                "attempts_used": attempts_used,
+                "max_boot_attempts": MAX_BOOT_ATTEMPTS,
+                "manual_recon_class": true,
+                "dispatch_via": "er_class_guard",
+            });
+            emit_doc_failed(pool, &id_hex, &payload).await?;
+            Ok(DocVerdict::Failed {
+                class,
+                manual_recon: true,
+            })
+        }
+        ErRedriveDecision::EscalateManual { class: rc } => {
+            cas_er_to_manual_via_drain(
+                pool,
+                fiscal_number,
+                doc.document_id,
+                rc.as_str(),
+                Severity::Error,
+                "non_retryable_class",
+            )
+            .await?;
+            let class = failure_class_for_retry(rc);
+            let class_str = failure_class_for(class);
+            summary.record_doc_failure(doc.document_id, class_str.to_string());
+            let payload = serde_json::json!({
+                "document_id": id_hex,
+                "failure_class": class_str,
+                "retry_class": rc.as_str(),
+                "manual_recon_class": true,
+                "dispatch_via": "er_class_guard",
+            });
+            emit_doc_failed(pool, &id_hex, &payload).await?;
+            Ok(DocVerdict::Failed {
+                class,
+                manual_recon: true,
+            })
+        }
+        ErRedriveDecision::EscalateInconsistent { class: rc } => {
+            // TerminalReject + ER = structural inconsistency: routing
+            // module lands TerminalReject directly in `Rejected`, never
+            // in `ErrorRetryable`.  CRITICAL severity audit.
+            cas_er_to_manual_via_drain(
+                pool,
+                fiscal_number,
+                doc.document_id,
+                rc.as_str(),
+                Severity::Critical,
+                "terminal_reject_inconsistent",
+            )
+            .await?;
+            let class = failure_class_for_retry(rc);
+            let class_str = failure_class_for(class);
+            summary.record_doc_failure(doc.document_id, class_str.to_string());
+            let payload = serde_json::json!({
+                "document_id": id_hex,
+                "failure_class": class_str,
+                "retry_class": rc.as_str(),
+                "manual_recon_class": true,
+                "structural_inconsistency": true,
+                "dispatch_via": "er_class_guard",
+            });
+            emit_doc_failed(pool, &id_hex, &payload).await?;
+            Ok(DocVerdict::Failed {
+                class,
+                manual_recon: true,
+            })
+        }
+        ErRedriveDecision::HoldProbeRequired => {
+            // No CAS — doc stays in ER; sibling-continue.
+            // `manual_recon: false` preserves the per-spec §3.5 gravity
+            // rule (probe-required is not "last resort manual").
+            let class = FailureClass::WireRoutingProbeRequired;
+            let class_str = failure_class_for(class);
+            summary.record_doc_failure(doc.document_id, class_str.to_string());
+            let payload = serde_json::json!({
+                "document_id": id_hex,
+                "failure_class": class_str,
+                "retry_class": RetryClass::ProbeRequired.as_str(),
+                "manual_recon_class": false,
+                "hold_reason": "probe_required",
+                "dispatch_via": "er_class_guard",
+            });
+            emit_doc_failed(pool, &id_hex, &payload).await?;
+            Ok(DocVerdict::Failed {
+                class,
+                manual_recon: false,
+            })
+        }
+        ErRedriveDecision::HoldIndeterminate => {
+            // No CAS — durable retry_class evidence missing; mirror boot
+            // semantics (Severity::Error audit at the boot helper).  Drain
+            // surfaces the same forensic state via `OFFLINE_DRAIN_DOC_FAILED`
+            // + non-manual-recon flag (operator-pinned 2026-05-22 scope).
+            let class = FailureClass::RetryClassIndeterminate;
+            let class_str = failure_class_for(class);
+            summary.record_doc_failure(doc.document_id, class_str.to_string());
+            let payload = serde_json::json!({
+                "document_id": id_hex,
+                "failure_class": class_str,
+                "retry_class": serde_json::Value::Null,
+                "manual_recon_class": false,
+                "hold_reason": "retry_class_indeterminate",
+                "dispatch_via": "er_class_guard",
+            });
+            emit_doc_failed(pool, &id_hex, &payload).await?;
+            Ok(DocVerdict::Failed {
+                class,
+                manual_recon: false,
+            })
+        }
+    }
+}
+
+/// M3b W9b ER-class-guard helper — CAS `ErrorRetryable →
+/// RequiresManualReconciliation` + audit `OFFLINE_DRAIN_ER_ESCALATED_TO_MANUAL`
+/// inside ONE `with_immediate` envelope (atomic per I8: state machine
+/// CAS and audit row never split across tx boundaries).
+///
+/// The whitelisted edge `(ErrorRetryable, RequiresManualReconciliation)`
+/// is shared with the boot dispatcher (declared at
+/// `fiscal_documents::allowed_transition` line 194).  This helper is
+/// drain-flavored — uses `OFFLINE_DRAIN_*` audit event types instead of
+/// boot's `BOOT_ER_*`.
+///
+/// Idempotent under tick replay: the CAS `WHERE state = 'ERROR_RETRYABLE'`
+/// guard makes a second invocation produce `TransitionOutcome::Conflict`,
+/// which is treated as a structural drift (re-entering an already-escalated
+/// doc indicates a missed walker filter — surfaces as `BootError::Internal`).
+async fn cas_er_to_manual_via_drain(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    doc_id: DocumentId,
+    retry_class_label: &str,
+    severity: Severity,
+    rationale: &'static str,
+) -> Result<(), BootError> {
+    let retry_class_owned = retry_class_label.to_string();
+    let fiscal_number_owned = fiscal_number.to_string();
+    let outcome = with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            let outcome = fiscal_documents::transition_state(
+                tx,
+                doc_id,
+                DocState::ErrorRetryable,
+                DocState::RequiresManualReconciliation,
+            )
+            .await?;
+            if matches!(outcome, TransitionOutcome::Applied) {
+                let payload = serde_json::json!({
+                    "fiscal_number": fiscal_number_owned,
+                    "document_id": hex_lower(doc_id.as_bytes()),
+                    "retry_class": retry_class_owned,
+                    "rationale": rationale,
+                    "dispatch_via": "er_class_guard",
+                });
+                audit_log::append_tx(
+                    tx,
+                    AUDIT_ENTITY_DOC,
+                    &hex_lower(doc_id.as_bytes()),
+                    "OFFLINE_DRAIN_ER_ESCALATED_TO_MANUAL",
+                    severity,
+                    None,
+                    Some(&payload.to_string()),
+                )
+                .await?;
+            }
+            Ok::<TransitionOutcome, anyhow::Error>(outcome)
+        })
+    })
+    .await
+    .map_err(|source| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source,
+    })?;
+
+    if !matches!(outcome, TransitionOutcome::Applied) {
+        return Err(BootError::Internal(format!(
+            "backlog_drain({fiscal_number}): doc {doc_hex} CAS ErrorRetryable→RequiresManualReconciliation \
+             produced {outcome} (App reconcile mutex should prevent races; non-Applied here \
+             indicates structural drift — walker emitted a doc that is no longer in ER)",
+            doc_hex = hex_lower(doc_id.as_bytes()),
+            outcome = outcome_as_str(outcome),
+        )));
+    }
+    Ok(())
 }
 
 /// Process a doc in `SENT` state via `lastChk` pre-flight (spec
