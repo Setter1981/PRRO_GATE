@@ -164,6 +164,17 @@ pub struct DrainSummary {
     advanced_to_ack: usize,
     advanced_to_kvt1: usize,
     advanced_via_lastchk_replay: usize,
+    /// **M3b W12 Commit 2** — counter for `HoldFnDrainProjection::HeldAtKvt1`
+    /// (Kvt1 re-entry Hold).  Blocks finalize via `DocsHeldAtKvt1` reason.
+    held_at_kvt1: usize,
+    /// **M3b W12 Commit 2** — counter for `HoldFnDrainProjection::HeldAtSent`
+    /// (SentFresh + SentReplay Hold).  Blocks finalize via `DocsHeldAtSent` reason.
+    held_at_sent: usize,
+    /// **M3b W12 Commit 2** — counter for `HoldFnDrainProjection::ErRedriveQueued`
+    /// (SentNotFoundDowngrade).  Blocks finalize via `DocsErRedriveQueued` reason;
+    /// distinct from KVT1 hold because durable state is `ErrorRetryable`,
+    /// awaiting next-tick ER class-guard bounded redrive.
+    er_redrive_queued: usize,
     per_doc_failures: Vec<(DocumentId, String)>,
     finalized: bool,
 }
@@ -178,6 +189,9 @@ impl DrainSummary {
             advanced_to_ack: 0,
             advanced_to_kvt1: 0,
             advanced_via_lastchk_replay: 0,
+            held_at_kvt1: 0,
+            held_at_sent: 0,
+            er_redrive_queued: 0,
             per_doc_failures: Vec::new(),
             finalized: false,
         }
@@ -209,15 +223,87 @@ impl DrainSummary {
         self.per_doc_failures.push((document_id, failure_class));
     }
 
+    /// **M3b W12 Commit 2** — record a `HoldFnDrainProjection::HeldAtKvt1`
+    /// outcome.  Fed by `Kvt2ConfirmSource::Kvt1Reentry` Hold ONLY (per
+    /// MED-PR70-R7-02 projection matrix).  Doc state stays `Kvt1`.
+    /// Blocks `finalize_eligibility` with `DocsHeldAtKvt1` reason.
+    ///
+    /// `_doc_id` and `_hold_class` are accepted for forensic API
+    /// parity with `record_doc_failure` and for symmetry with the
+    /// other two W12 recording methods; counter-only update keeps
+    /// per-tick allocation footprint minimal.
+    pub fn record_doc_held_at_kvt1(&mut self, _doc_id: DocumentId, _hold_class: String) {
+        self.held_at_kvt1 += 1;
+    }
+
+    /// **M3b W12 Commit 2** — record a `HoldFnDrainProjection::HeldAtSent`
+    /// outcome.  Fed by `Kvt2ConfirmSource::SentFresh` Hold (pre-Envelope-1a)
+    /// AND `Kvt2ConfirmSource::SentReplay` Hold (post-Envelope-1c-hold).
+    /// Doc state stays `Sent`.  Blocks `finalize_eligibility` with
+    /// `DocsHeldAtSent` reason.
+    pub fn record_doc_held_at_sent(&mut self, _doc_id: DocumentId, _hold_class: String) {
+        self.held_at_sent += 1;
+    }
+
+    /// **M3b W12 Commit 2** — record a `HoldFnDrainProjection::ErRedriveQueued`
+    /// outcome.  Fed by `Kvt2ConfirmOutcome::SentNotFoundDowngrade` ONLY
+    /// (per plan §"Source-context routing matrix").  Durable state is
+    /// `ErrorRetryable` after Envelope 1c-post; awaiting next-tick W9b ER
+    /// class-guard bounded redrive (`MAX_BOOT_ATTEMPTS=5`).  Blocks
+    /// `finalize_eligibility` with `DocsErRedriveQueued` reason (NOT
+    /// `DocsHeldAtKvt1` — durable state is ER, not Kvt1).
+    pub fn record_doc_er_redrive_queued(&mut self, _doc_id: DocumentId, _downgrade_class: String) {
+        self.er_redrive_queued += 1;
+    }
+
     /// Decide whether the drain may finalize (node mode + offline
     /// session transitions).  Returns the typed eligibility — caller
-    /// MUST pattern-match.  Pre-W12 invariant pin: any `DeferredKvt1`
-    /// outcome (i.e. `advanced_to_kvt1 > 0`) blocks finalize.
+    /// MUST pattern-match.
+    ///
+    /// Precedence (any single nonzero blocker returns `NotEligible`):
+    /// 1. `per_doc_failures` non-empty (W9b);
+    /// 2. **M3b W12 Commit 2** — any of three W12 hold counters > 0:
+    ///    - `held_at_kvt1` → `DocsHeldAtKvt1`,
+    ///    - `held_at_sent` → `DocsHeldAtSent`,
+    ///    - `er_redrive_queued` → `DocsErRedriveQueued`;
+    /// 3. `advanced_to_kvt1` > 0 → `DocsDeferredAtKvt1` (legacy
+    ///    `W12ConfirmOutcome::DeferredKvt1`; inert post-W12 once full
+    ///    helper wiring lands in Commits 4 / 5 / 5b);
+    /// 4. `advanced_to_ack != backlog_size_before` → `AckCountMismatch`
+    ///    (defensive accounting drift guard).
+    ///
+    /// Forensic note: the chosen reason is the highest-precedence
+    /// blocker; `OFFLINE_DRAIN_PARTIAL` audit payload via
+    /// [`build_finalize_payload`] reports ALL counter values
+    /// regardless of which reason was selected, so operator
+    /// dashboards see the full per-counter breakdown when multiple
+    /// blockers coexist (multi-reason payload per plan §11).
     pub fn finalize_eligibility(&self) -> FinalizeEligibility {
         if !self.per_doc_failures.is_empty() {
             return FinalizeEligibility::NotEligible {
                 reason: NotEligibleReason::PerDocFailuresPresent {
                     count: self.per_doc_failures.len(),
+                },
+            };
+        }
+        if self.held_at_kvt1 > 0 {
+            return FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsHeldAtKvt1 {
+                    count: self.held_at_kvt1,
+                },
+            };
+        }
+        if self.held_at_sent > 0 {
+            return FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsHeldAtSent {
+                    count: self.held_at_sent,
+                },
+            };
+        }
+        if self.er_redrive_queued > 0 {
+            return FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsErRedriveQueued {
+                    count: self.er_redrive_queued,
                 },
             };
         }
@@ -279,6 +365,24 @@ impl DrainSummary {
         &self.per_doc_failures
     }
 
+    /// **M3b W12 Commit 2** — count of Kvt1Reentry Hold outcomes
+    /// recorded via [`record_doc_held_at_kvt1`].
+    pub fn held_at_kvt1(&self) -> usize {
+        self.held_at_kvt1
+    }
+
+    /// **M3b W12 Commit 2** — count of SentFresh + SentReplay Hold
+    /// outcomes recorded via [`record_doc_held_at_sent`].
+    pub fn held_at_sent(&self) -> usize {
+        self.held_at_sent
+    }
+
+    /// **M3b W12 Commit 2** — count of SentNotFoundDowngrade outcomes
+    /// recorded via [`record_doc_er_redrive_queued`].
+    pub fn er_redrive_queued(&self) -> usize {
+        self.er_redrive_queued
+    }
+
     pub fn finalized(&self) -> bool {
         self.finalized
     }
@@ -304,9 +408,32 @@ pub enum NotEligibleReason {
     /// At least one doc failed per-doc processing.  Sibling docs
     /// may have succeeded but at least one failure prevents finalize.
     PerDocFailuresPresent { count: usize },
+    /// **M3b W12 Commit 2** — at least one doc returned
+    /// `DocVerdict::HoldFnDrain { projection: HeldAtKvt1 }` from
+    /// `Kvt2ConfirmSource::Kvt1Reentry`.  Durable state stays `Kvt1`;
+    /// drain stopped at the held doc this tick.  Next tick re-enters
+    /// via Kvt1 cohort dispatch.
+    DocsHeldAtKvt1 { count: usize },
+    /// **M3b W12 Commit 2** — at least one doc returned
+    /// `DocVerdict::HoldFnDrain { projection: HeldAtSent }` from
+    /// `Kvt2ConfirmSource::SentFresh` (pre-Envelope-1a) OR
+    /// `Kvt2ConfirmSource::SentReplay` (post-Envelope-1c-hold).
+    /// Durable state stays `Sent`; drain stopped at the held doc
+    /// this tick.  Next tick re-enters via Sent-replay cohort dispatch.
+    DocsHeldAtSent { count: usize },
+    /// **M3b W12 Commit 2** — at least one doc returned
+    /// `DocVerdict::HoldFnDrain { projection: ErRedriveQueued }` from
+    /// `Kvt2ConfirmOutcome::SentNotFoundDowngrade`.  Durable state
+    /// advanced `Sent → ErrorRetryable` via Envelope 1c-post; awaiting
+    /// next-tick W9b ER class-guard bounded Pattern B redrive.
+    /// Distinct from `DocsHeldAtKvt1` because durable state is ER, not
+    /// Kvt1 (MED-PR70-R6-02 projection-correct reason).
+    DocsErRedriveQueued { count: usize },
     /// At least one doc returned `W12ConfirmOutcome::DeferredKvt1` —
-    /// pre-W12 invariant pin.  This is the steady-state result for
-    /// W9b pre-W12 PR.
+    /// legacy W9b pre-W12 stub pin.  Inert post-W12 once full helper
+    /// wiring lands (W12ConfirmOutcome::DeferredKvt1 no longer
+    /// produced by W12-aware paths); kept for backward-compat with
+    /// crash-recovered docs from pre-W12 history.
     DocsDeferredAtKvt1 { count: usize },
     /// `advanced_to_ack != backlog_size_before` despite no recorded
     /// failures.  Defensive: should be unreachable in practice
@@ -656,6 +783,30 @@ pub async fn drain<'a>(
     let mut summary = DrainSummary::new(fiscal_number.to_string(), backlog.len());
     for (position, doc) in backlog.iter().enumerate() {
         let verdict = process_one_doc(pool, deps, fiscal_number, doc, &mut summary).await?;
+        // M3b W12 Commit 2 — `HoldFnDrain` stops FN drain at the held
+        // doc regardless of shift state.  Records summary via the
+        // projection-specific method; loop breaks so the subsequent
+        // `finalize_drain` step sees the nonzero W12 counter and
+        // emits `OFFLINE_DRAIN_PARTIAL` with projection-correct
+        // reason (`DocsHeldAtKvt1` / `DocsHeldAtSent` /
+        // `DocsErRedriveQueued`).  Per W9b §3.5 + W0b state-unchanged
+        // contract: pending-drain shifts do NOT escalate on
+        // HoldFnDrain (only manual-recon-class `Failed` escalates).
+        if let DocVerdict::HoldFnDrain { class, projection } = &verdict {
+            let class_str = failure_class_for(*class).to_string();
+            match projection {
+                HoldFnDrainProjection::HeldAtKvt1 => {
+                    summary.record_doc_held_at_kvt1(doc.document_id, class_str);
+                }
+                HoldFnDrainProjection::HeldAtSent => {
+                    summary.record_doc_held_at_sent(doc.document_id, class_str);
+                }
+                HoldFnDrainProjection::ErRedriveQueued => {
+                    summary.record_doc_er_redrive_queued(doc.document_id, class_str);
+                }
+            }
+            break;
+        }
         // Halt ONLY on manual-recon-class failures on pending-drain
         // shifts.  TransientRetry / ProbeRequired stay in
         // sibling-continue per spec §3.5 (Manual is last resort;
@@ -731,6 +882,60 @@ enum DocVerdict {
         class: FailureClass,
         manual_recon: bool,
     },
+    /// **M3b W12 Commit 2** — drain-stop verdict introduced for the
+    /// W12 KVT2 confirmation flow.  Helper-heavy ownership in
+    /// `services::offline_sync::kvt2_confirm::confirm_drain_doc`
+    /// commits its envelope(s); caller (drain entry-point) maps the
+    /// outcome to this verdict.  Drain loop stops at the held doc
+    /// (no further docs this tick); pending-drain shifts do NOT
+    /// escalate to Manual on HoldFnDrain (W0b state-unchanged
+    /// contract); `projection` distinguishes durable doc state for
+    /// summary accounting per [`HoldFnDrainProjection`].
+    ///
+    /// `#[allow(dead_code)]` — production constructors arrive in
+    /// Commits 4 / 5 / 5b when drain dispatcher rewires call
+    /// `kvt2_confirm::confirm_drain_doc(...)` and project the
+    /// outcome.  Tests in `w12_control_surface_tests` construct the
+    /// variant directly to lock the projection + summary + finalize
+    /// contracts in isolation.
+    #[allow(dead_code)]
+    HoldFnDrain {
+        class: FailureClass,
+        projection: HoldFnDrainProjection,
+    },
+}
+
+/// **M3b W12 Commit 2** — projection for [`DocVerdict::HoldFnDrain`]
+/// that separates drain-stop CONTROL (shared) from durable-state
+/// ACCOUNTING (per-context).
+///
+/// Caller projects per `Kvt2ConfirmSource` (see plan
+/// §"Source-context routing matrix"):
+/// - `Kvt2ConfirmSource::SentFresh` Hold → `HeldAtSent` (pre-Envelope-1a
+///   commit; doc state still `Sent`).
+/// - `Kvt2ConfirmSource::SentReplay` Hold → `HeldAtSent` (doc state
+///   stays `Sent` after 1c-hold trace.complete-no-state-change).
+/// - `Kvt2ConfirmSource::Kvt1Reentry` Hold → `HeldAtKvt1` (doc state
+///   stays `Kvt1`).
+/// - `Kvt2ConfirmOutcome::SentNotFoundDowngrade` → `ErRedriveQueued`
+///   (durable state advanced to `ErrorRetryable` via Envelope 1c-post;
+///   awaiting next-tick W9b ER class-guard bounded redrive).
+///
+/// Routes to projection-specific [`DrainSummary`] recording method
+/// (`record_doc_held_at_kvt1` / `record_doc_held_at_sent` /
+/// `record_doc_er_redrive_queued`) which feeds the matching
+/// [`NotEligibleReason`] when `finalize_eligibility` is computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldFnDrainProjection {
+    /// Doc state stays `Kvt1` (Kvt1 re-entry Hold).
+    HeldAtKvt1,
+    /// Doc state stays `Sent` (SentFresh Hold pre-Envelope-1a OR
+    /// SentReplay Hold post-1c-hold).
+    HeldAtSent,
+    /// Doc state advanced `Sent → ErrorRetryable` via Envelope 1c-post;
+    /// next-tick ER cohort dispatch + bounded Pattern B redrive.
+    /// Exclusive to `SentNotFoundDowngrade` outcome.
+    ErRedriveQueued,
 }
 
 /// Map `RetryClass` → "is this a manual-recon-class outcome for
@@ -2121,6 +2326,13 @@ fn build_finalize_payload(
         "advanced_to_ack": summary.advanced_to_ack(),
         "advanced_to_kvt1": summary.advanced_to_kvt1(),
         "advanced_via_lastchk_replay": summary.advanced_via_lastchk_replay(),
+        // M3b W12 Commit 2 — per-counter breakdown for multi-reason
+        // forensic payload.  Operator dashboards filter on these even
+        // when `not_eligible_reason.kind` selects the
+        // highest-precedence single blocker.
+        "held_at_kvt1": summary.held_at_kvt1(),
+        "held_at_sent": summary.held_at_sent(),
+        "er_redrive_queued": summary.er_redrive_queued(),
         "per_doc_failures": per_doc_failures,
         "finalized": summary.finalized(),
     });
@@ -2135,6 +2347,18 @@ fn not_eligible_reason_as_json(reason: &NotEligibleReason) -> serde_json::Value 
     match reason {
         NotEligibleReason::PerDocFailuresPresent { count } => serde_json::json!({
             "kind": "PerDocFailuresPresent",
+            "count": count,
+        }),
+        NotEligibleReason::DocsHeldAtKvt1 { count } => serde_json::json!({
+            "kind": "DocsHeldAtKvt1",
+            "count": count,
+        }),
+        NotEligibleReason::DocsHeldAtSent { count } => serde_json::json!({
+            "kind": "DocsHeldAtSent",
+            "count": count,
+        }),
+        NotEligibleReason::DocsErRedriveQueued { count } => serde_json::json!({
+            "kind": "DocsErRedriveQueued",
             "count": count,
         }),
         NotEligibleReason::DocsDeferredAtKvt1 { count } => serde_json::json!({
@@ -2546,5 +2770,260 @@ mod eligible_arm_tests {
         assert_eq!(audit_count(&pool, "OFFLINE_SESSION_CLOSED").await, 1);
 
         assert!(summary.finalized());
+    }
+}
+
+// ─── M3b W12 Commit 2: HoldFnDrain control surface tests ─────────────
+//
+// Synthetic tests for the projection-aware DrainSummary +
+// FinalizeEligibility surface added in Commit 2.  No drain-loop
+// integration here — full helper wiring + drain dispatcher rewires
+// land in Commits 4 / 5 / 5b with their own integration tests.
+
+#[cfg(test)]
+mod w12_control_surface_tests {
+    use super::*;
+    use crate::db::models::ids::{DocumentId, OfflineSessionId};
+
+    const FN: &str = "1234567890";
+
+    fn doc() -> DocumentId {
+        DocumentId::new()
+    }
+
+    fn summary_with_size(backlog_size: usize) -> DrainSummary {
+        DrainSummary::new(FN.to_string(), backlog_size)
+    }
+
+    // ─── Counter increment per recording method ──────────────────────
+
+    #[test]
+    fn record_doc_held_at_kvt1_increments_counter() {
+        let mut s = summary_with_size(3);
+        assert_eq!(s.held_at_kvt1(), 0);
+        s.record_doc_held_at_kvt1(doc(), "wire_routing_probe_required".into());
+        assert_eq!(s.held_at_kvt1(), 1);
+        assert_eq!(s.held_at_sent(), 0);
+        assert_eq!(s.er_redrive_queued(), 0);
+    }
+
+    #[test]
+    fn record_doc_held_at_sent_increments_counter() {
+        let mut s = summary_with_size(3);
+        s.record_doc_held_at_sent(doc(), "transport".into());
+        assert_eq!(s.held_at_sent(), 1);
+        assert_eq!(s.held_at_kvt1(), 0);
+        assert_eq!(s.er_redrive_queued(), 0);
+    }
+
+    #[test]
+    fn record_doc_er_redrive_queued_increments_counter() {
+        let mut s = summary_with_size(3);
+        s.record_doc_er_redrive_queued(doc(), "sent_not_found_downgrade".into());
+        assert_eq!(s.er_redrive_queued(), 1);
+        assert_eq!(s.held_at_kvt1(), 0);
+        assert_eq!(s.held_at_sent(), 0);
+    }
+
+    // ─── finalize_eligibility per single W12 counter ─────────────────
+
+    #[test]
+    fn held_at_kvt1_blocks_finalize_with_docs_held_at_kvt1() {
+        let mut s = summary_with_size(1);
+        s.record_doc_held_at_kvt1(doc(), "transport".into());
+        match s.finalize_eligibility() {
+            FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsHeldAtKvt1 { count },
+            } => assert_eq!(count, 1),
+            other => panic!("expected DocsHeldAtKvt1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn held_at_sent_blocks_finalize_with_docs_held_at_sent() {
+        let mut s = summary_with_size(1);
+        s.record_doc_held_at_sent(doc(), "transport".into());
+        assert!(matches!(
+            s.finalize_eligibility(),
+            FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsHeldAtSent { count: 1 },
+            }
+        ));
+    }
+
+    #[test]
+    fn er_redrive_queued_blocks_finalize_with_docs_er_redrive_queued() {
+        let mut s = summary_with_size(1);
+        s.record_doc_er_redrive_queued(doc(), "sent_not_found_downgrade".into());
+        assert!(matches!(
+            s.finalize_eligibility(),
+            FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsErRedriveQueued { count: 1 },
+            }
+        ));
+    }
+
+    // ─── Precedence ──────────────────────────────────────────────────
+
+    #[test]
+    fn per_doc_failure_takes_precedence_over_w12_counters() {
+        let mut s = summary_with_size(3);
+        s.record_doc_failure(doc(), "transport".into());
+        s.record_doc_held_at_kvt1(doc(), "transport".into());
+        s.record_doc_held_at_sent(doc(), "transport".into());
+        s.record_doc_er_redrive_queued(doc(), "sent_not_found_downgrade".into());
+        assert!(matches!(
+            s.finalize_eligibility(),
+            FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::PerDocFailuresPresent { count: 1 },
+            }
+        ));
+    }
+
+    #[test]
+    fn held_at_kvt1_takes_precedence_over_held_at_sent_and_er_redrive() {
+        let mut s = summary_with_size(3);
+        s.record_doc_held_at_kvt1(doc(), "transport".into());
+        s.record_doc_held_at_sent(doc(), "transport".into());
+        s.record_doc_er_redrive_queued(doc(), "sent_not_found_downgrade".into());
+        assert!(matches!(
+            s.finalize_eligibility(),
+            FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsHeldAtKvt1 { count: 1 },
+            }
+        ));
+    }
+
+    #[test]
+    fn held_at_sent_takes_precedence_over_er_redrive_queued() {
+        let mut s = summary_with_size(2);
+        s.record_doc_held_at_sent(doc(), "transport".into());
+        s.record_doc_er_redrive_queued(doc(), "sent_not_found_downgrade".into());
+        assert!(matches!(
+            s.finalize_eligibility(),
+            FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsHeldAtSent { count: 1 },
+            }
+        ));
+    }
+
+    #[test]
+    fn w12_counters_take_precedence_over_legacy_deferred_at_kvt1() {
+        // Synthetic: simulate one legacy DeferredKvt1 (via
+        // record_doc_advanced) plus one W12 ErRedriveQueued.  Precedence
+        // says W12 counters block before the legacy stub counter.
+        let mut s = summary_with_size(2);
+        s.record_doc_advanced(
+            &W12ConfirmOutcome::DeferredKvt1,
+            /* via_lastchk_replay */ false,
+        );
+        s.record_doc_er_redrive_queued(doc(), "sent_not_found_downgrade".into());
+        assert!(matches!(
+            s.finalize_eligibility(),
+            FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsErRedriveQueued { count: 1 },
+            }
+        ));
+    }
+
+    // ─── Eligible only with ALL counters zero + Acked == backlog ─────
+
+    #[test]
+    fn eligible_only_when_all_w12_counters_zero_and_acked_complete() {
+        let mut s = summary_with_size(1);
+        s.record_doc_advanced(
+            &W12ConfirmOutcome::Acked {
+                server_fiscal_no: "FN-001".into(),
+            },
+            false,
+        );
+        assert_eq!(s.held_at_kvt1(), 0);
+        assert_eq!(s.held_at_sent(), 0);
+        assert_eq!(s.er_redrive_queued(), 0);
+        assert_eq!(s.advanced_to_ack(), 1);
+        assert_eq!(s.advanced_to_kvt1(), 0);
+        assert!(matches!(
+            s.finalize_eligibility(),
+            FinalizeEligibility::Eligible
+        ));
+    }
+
+    // ─── Multi-reason payload in OFFLINE_DRAIN_PARTIAL ───────────────
+
+    #[test]
+    fn build_finalize_payload_includes_all_three_w12_counters() {
+        let mut s = summary_with_size(3);
+        s.record_doc_held_at_kvt1(doc(), "transport".into());
+        s.record_doc_held_at_sent(doc(), "transport".into());
+        s.record_doc_er_redrive_queued(doc(), "sent_not_found_downgrade".into());
+
+        let reason = NotEligibleReason::DocsHeldAtKvt1 { count: 1 };
+        let session_id = OfflineSessionId::new();
+        let payload = build_finalize_payload(&s, session_id, "PARTIAL", Some(&reason));
+
+        // Multi-reason breakdown: all three W12 counters are present
+        // as separate JSON keys regardless of which one was selected
+        // for `not_eligible_reason.kind` (precedence picks one;
+        // payload carries all for forensic dashboards).
+        assert_eq!(payload["held_at_kvt1"], 1);
+        assert_eq!(payload["held_at_sent"], 1);
+        assert_eq!(payload["er_redrive_queued"], 1);
+        // not_eligible_reason carries the highest-precedence single
+        // blocker.
+        assert_eq!(payload["not_eligible_reason"]["kind"], "DocsHeldAtKvt1");
+        assert_eq!(payload["not_eligible_reason"]["count"], 1);
+    }
+
+    // ─── not_eligible_reason_as_json: all three new variants ─────────
+
+    #[test]
+    fn not_eligible_reason_as_json_docs_held_at_kvt1() {
+        let j = not_eligible_reason_as_json(&NotEligibleReason::DocsHeldAtKvt1 { count: 7 });
+        assert_eq!(j["kind"], "DocsHeldAtKvt1");
+        assert_eq!(j["count"], 7);
+    }
+
+    #[test]
+    fn not_eligible_reason_as_json_docs_held_at_sent() {
+        let j = not_eligible_reason_as_json(&NotEligibleReason::DocsHeldAtSent { count: 3 });
+        assert_eq!(j["kind"], "DocsHeldAtSent");
+        assert_eq!(j["count"], 3);
+    }
+
+    #[test]
+    fn not_eligible_reason_as_json_docs_er_redrive_queued() {
+        let j = not_eligible_reason_as_json(&NotEligibleReason::DocsErRedriveQueued { count: 2 });
+        assert_eq!(j["kind"], "DocsErRedriveQueued");
+        assert_eq!(j["count"], 2);
+    }
+
+    // ─── HoldFnDrain variant + HoldFnDrainProjection compile-time ────
+
+    #[test]
+    fn hold_fn_drain_variant_constructible_per_projection() {
+        let v_kvt1 = DocVerdict::HoldFnDrain {
+            class: FailureClass::WireRoutingProbeRequired,
+            projection: HoldFnDrainProjection::HeldAtKvt1,
+        };
+        let v_sent = DocVerdict::HoldFnDrain {
+            class: FailureClass::Transport,
+            projection: HoldFnDrainProjection::HeldAtSent,
+        };
+        let v_er = DocVerdict::HoldFnDrain {
+            class: FailureClass::BudgetExhausted,
+            projection: HoldFnDrainProjection::ErRedriveQueued,
+        };
+        // Construction does not panic; pattern-match arms are
+        // structurally distinguishable.
+        for v in [v_kvt1, v_sent, v_er] {
+            match v {
+                DocVerdict::HoldFnDrain { projection, .. } => {
+                    let _ = projection; // exhaustive arm reachable
+                }
+                DocVerdict::Advanced | DocVerdict::Failed { .. } => {
+                    panic!("unexpected non-HoldFnDrain variant")
+                }
+            }
+        }
     }
 }
