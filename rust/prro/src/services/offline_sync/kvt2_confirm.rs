@@ -485,10 +485,10 @@ pub async fn confirm_drain_doc(
             // atomic envelope (Kvt2→Ack + chain seed + inbox DONE +
             // outbox + STAGE_FINALIZE_ACK).  Acked/AlreadyAcked are
             // both success-shapes for W12.
-            let finalize_outcome = stage_finalize::run(pool, doc_id).await.map_err(|source| {
+            let finalize_outcome = stage_finalize::run(pool, doc_id).await.map_err(|err| {
                 BootError::ReconciliationFailed {
                     fiscal_number: fiscal_number.clone(),
-                    source: anyhow::Error::new(source),
+                    source: anyhow::Error::new(err),
                 }
             })?;
             match finalize_outcome {
@@ -676,9 +676,9 @@ async fn commit_sent_fresh_envelope_1a(
         })
     })
     .await
-    .map_err(|source| BootError::ReconciliationFailed {
+    .map_err(|err| BootError::ReconciliationFailed {
         fiscal_number: fiscal_number.to_string(),
-        source,
+        source: err,
     })?;
     Ok(())
 }
@@ -710,6 +710,21 @@ async fn commit_hold_envelope_1c_hold_light(
     source: Kvt2ConfirmSource,
     reason: &Kvt2ConfirmHoldReason,
 ) -> Result<(), BootError> {
+    // **LOW-W12C4B1-B defensive guard (2026-05-22)**: SentReplay
+    // uses its own bundled Envelope 1c-hold (trace.complete + audit)
+    // per plan §311 — this light variant is for SentFresh / Kvt1Reentry
+    // ONLY.  Routing a SentReplay outcome through here would silently
+    // skip the recovery-trace completion → forensic gap.  Today
+    // structurally safe via `confirm_drain_doc:396` scope guard, but
+    // Commits 5/5b/6 will lift that guard.  `debug_assert!` catches
+    // routing regressions at dev/CI time without runtime cost in
+    // release builds.
+    debug_assert!(
+        !matches!(source, Kvt2ConfirmSource::SentReplay),
+        "commit_hold_envelope_1c_hold_light: SentReplay must use bundled \
+         Envelope 1c-hold with trace.complete (Commit 5b scope); routing \
+         bug if SentReplay reaches the light variant",
+    );
     let payload = serde_json::json!({
         "document_id": id_hex,
         "source": source.audit_label(),
@@ -735,9 +750,9 @@ async fn commit_hold_envelope_1c_hold_light(
         })
     })
     .await
-    .map_err(|source| BootError::ReconciliationFailed {
+    .map_err(|err| BootError::ReconciliationFailed {
         fiscal_number: fiscal_number.to_string(),
-        source,
+        source: err,
     })?;
     Ok(())
 }
@@ -768,6 +783,19 @@ async fn commit_drift_envelope_1c_drift_light(
     source: Kvt2ConfirmSource,
     reason: &Kvt2ConfirmStructuralReason,
 ) -> Result<(), BootError> {
+    // **LOW-W12C4B1-B defensive guard (2026-05-22)**: see
+    // `commit_hold_envelope_1c_hold_light` for full rationale.
+    // SentReplay uses bundled Envelope 1c-drift (trace.complete +
+    // audit) per plan §311 / §220-234 — this light variant is for
+    // SentFresh / Kvt1Reentry ONLY.  `debug_assert!` catches future
+    // routing regressions when Commits 5/5b/6 lift the
+    // `confirm_drain_doc:396` SentFresh-only scope guard.
+    debug_assert!(
+        !matches!(source, Kvt2ConfirmSource::SentReplay),
+        "commit_drift_envelope_1c_drift_light: SentReplay must use bundled \
+         Envelope 1c-drift with trace.complete (Commit 5b scope); routing \
+         bug if SentReplay reaches the light variant",
+    );
     let payload = serde_json::json!({
         "document_id": id_hex,
         "source": source.audit_label(),
@@ -793,9 +821,9 @@ async fn commit_drift_envelope_1c_drift_light(
         })
     })
     .await
-    .map_err(|source| BootError::ReconciliationFailed {
+    .map_err(|err| BootError::ReconciliationFailed {
         fiscal_number: fiscal_number.to_string(),
-        source,
+        source: err,
     })?;
     Ok(())
 }
