@@ -53,6 +53,7 @@ use crate::db::models::ids::DocumentId;
 use crate::db::repositories::fiscal_documents::TransitionOutcome;
 use crate::db::repositories::{audit_log, document_files, fiscal_documents};
 use crate::db::tx::with_immediate;
+use crate::services::offline_sync::backlog_drain::AUDIT_ENTITY_DOC;
 use crate::services::write_path::stage_finalize;
 use crate::services::write_path::types::hex_encode_lower;
 use crate::transports::dps::channel::DpsChannel;
@@ -329,8 +330,11 @@ pub enum ConfirmDrainOutcome {
 /// W12 high-level helper — orchestrates the full Sent-source W12
 /// confirmation chain per plan §410 (Commit 4 wiring scope).
 ///
-/// **Source-context support matrix**:
-/// - [`Kvt2ConfirmSource::SentFresh`] → **WIRED** (this commit).
+/// **Source-context support matrix** (4a = library-wired; production
+/// consumer lands in 4b):
+/// - [`Kvt2ConfirmSource::SentFresh`] → **library-wired** (this commit;
+///   Commit 4b will replace `apply_w12_confirmation(Sent, ...)` in
+///   `process_via_stage_send` with the call site).
 ///   Caller = `process_via_stage_send` after `StageSendOutcome::Sent`.
 ///   `expected_server_fiscal_no` MUST be sourced from the
 ///   `StageSendOutcome::Sent` variant (`&outcome.server_fiscal_no`),
@@ -562,7 +566,7 @@ async fn commit_sent_fresh_envelope_1a(
             // (d) Forensic audit row.
             audit_log::append_tx(
                 tx,
-                "fiscal_document",
+                AUDIT_ENTITY_DOC,
                 &id_hex_owned,
                 "OFFLINE_DRAIN_KVT2_ADVANCED",
                 Severity::Info,

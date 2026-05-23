@@ -530,7 +530,15 @@ const AUDIT_ENTITY_DRAIN_FN: &str = "node_state";
 /// (`OFFLINE_DRAIN_DOC_ADVANCED` / `_DOC_FAILED`).  Matches the
 /// M3a / W7 convention: per-doc events anchor on `entity_type =
 /// "fiscal_document"` + `entity_id = doc_id_hex`.
-const AUDIT_ENTITY_DOC: &str = "fiscal_document";
+///
+/// **W12 Commit 4a hygiene (LOW-W12C4A-02, 2026-05-22)**:
+/// `pub(crate)` so sibling modules in `services::offline_sync` (W12
+/// `kvt2_confirm::commit_sent_fresh_envelope_1a` and follow-ups) can
+/// share the literal instead of duplicating `"fiscal_document"`
+/// strings.  Audit dashboards filter on this exact value; co-locating
+/// the const eliminates rename drift between drain orchestrator and
+/// helper Envelope 1a writes.
+pub(crate) const AUDIT_ENTITY_DOC: &str = "fiscal_document";
 
 /// W9b §2.1 entry (b) — pure-function drain entry for the boot
 /// reconciliation path and integration tests.  The App-owned entry
