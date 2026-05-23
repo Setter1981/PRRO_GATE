@@ -52,8 +52,9 @@ use crate::app::BootError;
 use crate::db::models::enums::{DocState, Severity};
 use crate::db::models::ids::DocumentId;
 use crate::db::repositories::fiscal_documents::TransitionOutcome;
-use crate::db::repositories::{audit_log, document_files, fiscal_documents};
+use crate::db::repositories::{audit_log, document_files, fiscal_documents, transport_trace};
 use crate::db::tx::with_immediate;
+use crate::services::offline_sync::backlog_drain::HoldFnDrainProjection;
 use crate::services::offline_sync::backlog_drain::AUDIT_ENTITY_DOC;
 use crate::services::write_path::stage_finalize;
 use crate::services::write_path::types::hex_encode_lower;
@@ -395,6 +396,30 @@ pub async fn evaluate_lastchk(
 /// 1a-replay / 1c-post / 1c-hold / 1c-drift chain per plan §412.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmDrainOutcome {
+    /// **M3b W12 Commit 5b.1 (plan §412, 2026-05-22)** — Hold path
+    /// (transient evidence failure) OR SentNotFoundDowngrade path
+    /// (HIGH-C5-3 safe-redrive).  Doc state is either:
+    ///   - `Sent` (unchanged) for SentReplay Hold contexts
+    ///     (Envelope 1c-hold-light or 1c-hold bundled emit only
+    ///     audit, no CAS); projection = `HeldAtSent`.
+    ///   - `Sent` (unchanged) for SentFresh Hold; projection =
+    ///     `HeldAtSent`.
+    ///   - `Kvt1` (unchanged) for Kvt1Reentry Hold; projection =
+    ///     `HeldAtKvt1`.
+    ///   - `ErrorRetryable` (advanced via Envelope 1c-post) for
+    ///     SentReplay SentNotFoundDowngrade; projection =
+    ///     `ErRedriveQueued` (HIGH-C5-3 safe-redrive — next-tick
+    ///     ER cohort dispatch + bounded Pattern B redrive via
+    ///     `stage_send::run`).
+    ///
+    /// Caller projects to `DocVerdict::HoldFnDrain { class,
+    /// projection }`.  Commit 6 will rewire SentFresh +
+    /// Kvt1Reentry Hold paths from `BootError::Internal` defensive
+    /// marker to this projection (5b.1 already returns it for
+    /// SentReplay-specific paths since plan §412 explicitly
+    /// names the ErRedriveQueued safe-redrive contract — cannot
+    /// defer without breaking pilot crash recovery).
+    HoldFnDrain { projection: HoldFnDrainProjection },
     /// Envelope 1a (Kvt1Raw persist + Sent→Kvt1 CAS + Kvt1→Kvt2 CAS +
     /// `OFFLINE_DRAIN_KVT2_ADVANCED` audit) committed atomically;
     /// Envelope 2 (`stage_finalize::run` Kvt2→Ack) committed.  Doc is
@@ -485,29 +510,44 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
     // attempt_no lives in `transport_trace`, NOT this surface).
     attempt_no: Option<i64>,
 ) -> Result<ConfirmDrainOutcome, BootError> {
-    // **M3b W12 Commit 5 scope (2026-05-22)**: SentFresh + Kvt1Reentry
-    // wired.  SentReplay still deferred to Commit 5b (needs Envelope
-    // 1c-pre `transport_trace.allocate_and_insert_tx` + bundled
-    // 1c-post/1c-hold/1c-drift envelopes per plan §412).
-    if matches!(source, Kvt2ConfirmSource::SentReplay) {
-        return Err(BootError::Internal(
-            "confirm_drain_doc: SentReplay not yet wired (Commit 5b will \
-             add Envelope 1c-pre trace-allocate + bundled completion \
-             envelopes per plan §412)"
-                .to_string(),
-        ));
-    }
+    // **M3b W12 Commit 5b.1 scope (2026-05-22)**: SentFresh +
+    // Kvt1Reentry + SentReplay all wired.  SentReplay path
+    // additionally allocates Envelope 1c-pre `transport_trace`
+    // recovery row BEFORE the DPS call, then routes outcomes through
+    // bundled (vs light) completion envelopes that include
+    // `transport_trace.complete_tx` atomically per plan §412.
+    let doc_id = doc.document_id;
+    let id_hex = hex_encode_lower(doc.document_id.as_bytes());
+    let fiscal_number = doc.fiscal_number.clone();
+    // For SentReplay: allocate recovery trace row + capture wire
+    // timing around the DPS call.  Other sources skip this — their
+    // light envelope variants do not have a trace row to complete.
+    let (sent_replay_trace_attempt_no, sent_replay_wire_started): (Option<i32>, Option<String>) =
+        match source {
+            Kvt2ConfirmSource::SentReplay => {
+                let attempt_no = commit_sent_replay_envelope_1c_pre(
+                    pool,
+                    &fiscal_number,
+                    doc_id,
+                    doc.backend_profile_id.clone(),
+                    doc.transport_profile_id.clone(),
+                )
+                .await?;
+                (Some(attempt_no), Some(iso8601_now()))
+            }
+            _ => (None, None),
+        };
     let outcome = evaluate_lastchk(
         dps,
         fn_sign,
         expected_server_fiscal_no,
         source,
-        /* sent_replay_trace_attempt_no */ None,
+        sent_replay_trace_attempt_no.map(i64::from),
     )
     .await;
-    let doc_id = doc.document_id;
-    let id_hex = hex_encode_lower(doc.document_id.as_bytes());
-    let fiscal_number = doc.fiscal_number.clone();
+    // Capture wire-finish timestamp AFTER DPS call returns (only
+    // meaningful for SentReplay context with allocated trace).
+    let sent_replay_wire_finished = sent_replay_wire_started.as_ref().map(|_| iso8601_now());
     match outcome {
         Kvt2ConfirmOutcome::Acked { kvt1_raw_bytes, .. } => {
             // **LOW-W12C4A-07 fix (4b.3, 2026-05-22)**: defensive
@@ -525,12 +565,14 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
                      Hold(LastChkDataSignEmpty); see kvt2_confirm.rs:188-192)"
                 )));
             }
-            // **M3b W12 Commit 5 (plan §313, 2026-05-22)**: source-
-            // specific Envelope 1 dispatch.  SentFresh → Envelope 1a
-            // (3-CAS: Kvt1Raw + Sent→Kvt1 + Kvt1→Kvt2 + audit).
-            // Kvt1Reentry → Envelope 1b (2-CAS only: Kvt1Raw +
-            // Kvt1→Kvt2 + audit; NO Sent→Kvt1 — doc was already at
-            // Kvt1 when the cohort walker picked it up).
+            // **M3b W12 Commit 5b.1 (plan §313+§412, 2026-05-22)**:
+            // source-specific Envelope 1 dispatch.  SentFresh →
+            // Envelope 1a (3-CAS: Kvt1Raw + Sent→Kvt1 + Kvt1→Kvt2 +
+            // audit).  Kvt1Reentry → Envelope 1b (2-CAS only:
+            // Kvt1Raw + Kvt1→Kvt2 + audit; NO Sent→Kvt1).
+            // SentReplay → Envelope 1a-replay (5-write bundled:
+            // trace.complete OK + Kvt1Raw + Sent→Kvt1 + Kvt1→Kvt2 +
+            // audit з replay_short_circuit=true marker).
             match source {
                 Kvt2ConfirmSource::SentFresh => {
                     commit_sent_fresh_envelope_1a(
@@ -556,10 +598,29 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
                     )
                     .await?;
                 }
-                Kvt2ConfirmSource::SentReplay => unreachable!(
-                    "SentReplay early-rejected by scope guard; \
-                     classify_check_result + scope guard contract violated"
-                ),
+                Kvt2ConfirmSource::SentReplay => {
+                    let trace_attempt_no = sent_replay_trace_attempt_no
+                        .expect("SentReplay implies 1c-pre allocated trace_attempt_no");
+                    let wire_started = sent_replay_wire_started
+                        .clone()
+                        .expect("SentReplay implies wire_started captured");
+                    let wire_finished = sent_replay_wire_finished
+                        .clone()
+                        .expect("SentReplay implies wire_finished captured");
+                    commit_sent_replay_envelope_1a_replay(
+                        pool,
+                        &fiscal_number,
+                        doc_id,
+                        &id_hex,
+                        kvt1_raw_bytes,
+                        expected_server_fiscal_no,
+                        doc.state,
+                        trace_attempt_no,
+                        wire_started,
+                        wire_finished,
+                    )
+                    .await?;
+                }
             }
             // Envelope 2: M3a stage_finalize::run owns its 5-write
             // atomic envelope (Kvt2→Ack + chain seed + inbox DONE +
@@ -598,57 +659,154 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
             }
         }
         Kvt2ConfirmOutcome::StructuralDrift { reason, .. } => {
-            // **M3b W12 Commit 4b.1 (plan §311 MED-PR70-R12-01,
-            // 2026-05-22)**: emit Envelope 1c-drift-light audit BEFORE
-            // BootError::Internal fail-loud — preserves forensic trail
-            // (KVT2_CONFIRM_STRUCTURAL_DRIFT) regardless of caller's
-            // downstream propagation.
-            commit_drift_envelope_1c_drift_light(
-                pool,
-                &fiscal_number,
-                &id_hex,
-                source,
-                &reason,
-            )
-            .await?;
+            // **M3b W12 Commit 5b.1 (plan §311 + §412, 2026-05-22)**:
+            // source-aware drift envelope.  SentFresh/Kvt1Reentry →
+            // 1c-drift-light (audit-only).  SentReplay → 1c-drift
+            // bundled (trace.complete + audit) — completes recovery
+            // trace row allocated by 1c-pre BEFORE BootError fail-loud
+            // per plan §412 MED-PR70-R6-01 trace lifecycle.
+            match source {
+                Kvt2ConfirmSource::SentReplay => {
+                    let trace_attempt_no = sent_replay_trace_attempt_no
+                        .expect("SentReplay implies 1c-pre allocated trace_attempt_no");
+                    let wire_started = sent_replay_wire_started
+                        .clone()
+                        .expect("SentReplay implies wire_started captured");
+                    let wire_finished = sent_replay_wire_finished
+                        .clone()
+                        .expect("SentReplay implies wire_finished captured");
+                    commit_sent_replay_envelope_1c_drift(
+                        pool,
+                        &fiscal_number,
+                        doc_id,
+                        &id_hex,
+                        trace_attempt_no,
+                        wire_started,
+                        wire_finished,
+                        &reason,
+                    )
+                    .await?;
+                }
+                _ => {
+                    commit_drift_envelope_1c_drift_light(
+                        pool,
+                        &fiscal_number,
+                        &id_hex,
+                        source,
+                        &reason,
+                    )
+                    .await?;
+                }
+            }
             Err(BootError::Internal(format!(
                 "confirm_drain_doc({source:?}): structural drift for doc {id_hex} \
-                 — {reason:?}.  NotFound/Mismatch from SentFresh/Kvt1Reentry context \
-                 indicates state-machine drift (server_fiscal_no not recognized by \
-                 DPS).  Halts FN drain per plan §410.  KVT2_CONFIRM_STRUCTURAL_DRIFT \
-                 audit emitted prior to halt."
+                 — {reason:?}.  NotFound/Mismatch indicates state-machine drift \
+                 (server_fiscal_no not recognized by DPS).  Halts FN drain per \
+                 plan §410.  KVT2_CONFIRM_STRUCTURAL_DRIFT audit emitted prior \
+                 to halt."
             )))
         }
         Kvt2ConfirmOutcome::Hold { reason, .. } => {
-            // **M3b W12 Commit 4b.1 (plan §311 MED-PR70-R12-01,
-            // 2026-05-22)**: emit Envelope 1c-hold-light audit BEFORE
-            // BootError::Internal defensive marker — preserves forensic
-            // trail (KVT2_CONFIRM_HOLD Warning) regardless of caller's
-            // downstream projection.  HoldFnDrain projection deferred
-            // to Commit 6 per plan §413.
-            commit_hold_envelope_1c_hold_light(
-                pool,
-                &fiscal_number,
-                &id_hex,
-                source,
-                &reason,
-            )
-            .await?;
-            Err(BootError::Internal(format!(
-                "confirm_drain_doc({source:?}): Hold audit emitted (KVT2_CONFIRM_HOLD) \
-                 for doc {id_hex} — reason={reason:?}.  HoldFnDrain projection not \
-                 yet wired (Commit 6 scope); caller observes BootError until then."
-            )))
+            // **M3b W12 Commit 5b.1 (plan §311 + §412, 2026-05-22)**:
+            // source-aware hold envelope.  SentFresh/Kvt1Reentry →
+            // 1c-hold-light (audit-only) + BootError::Internal
+            // defensive marker (HoldFnDrain projection deferred to
+            // Commit 6).  SentReplay → 1c-hold bundled
+            // (trace.complete Retryable* + audit) + Ok(HoldFnDrain
+            // { HeldAtSent }) per plan §412 (cannot defer because
+            // HIGH-C5-3 contract requires HoldFnDrain projection for
+            // SentReplay-specific safe-redrive accounting).
+            match source {
+                Kvt2ConfirmSource::SentReplay => {
+                    let trace_attempt_no = sent_replay_trace_attempt_no
+                        .expect("SentReplay implies 1c-pre allocated trace_attempt_no");
+                    let wire_started = sent_replay_wire_started
+                        .clone()
+                        .expect("SentReplay implies wire_started captured");
+                    let wire_finished = sent_replay_wire_finished
+                        .clone()
+                        .expect("SentReplay implies wire_finished captured");
+                    commit_sent_replay_envelope_1c_hold(
+                        pool,
+                        &fiscal_number,
+                        doc_id,
+                        &id_hex,
+                        trace_attempt_no,
+                        wire_started,
+                        wire_finished,
+                        &reason,
+                    )
+                    .await?;
+                    Ok(ConfirmDrainOutcome::HoldFnDrain {
+                        projection: HoldFnDrainProjection::HeldAtSent,
+                    })
+                }
+                _ => {
+                    commit_hold_envelope_1c_hold_light(
+                        pool,
+                        &fiscal_number,
+                        &id_hex,
+                        source,
+                        &reason,
+                    )
+                    .await?;
+                    Err(BootError::Internal(format!(
+                        "confirm_drain_doc({source:?}): Hold audit emitted \
+                         (KVT2_CONFIRM_HOLD) for doc {id_hex} — reason={reason:?}.  \
+                         HoldFnDrain projection not yet wired (Commit 6 scope); \
+                         caller observes BootError until then."
+                    )))
+                }
+            }
         }
         Kvt2ConfirmOutcome::SentNotFoundDowngrade { trace_attempt_no } => {
-            Err(BootError::Internal(format!(
-                "confirm_drain_doc({source:?}): SentNotFoundDowngrade(attempt_no={trace_attempt_no}) \
-                 is structurally unreachable for SentFresh/Kvt1Reentry per Commit 1 \
-                 classify_check_result routing — NotFound + non-SentReplay must \
-                 route to StructuralDrift::NotFoundOutsideSentReplay.  SentReplay \
-                 is scope-guarded at fn entry (Commit 5b not yet wired).  If \
-                 this surfaces, Commit 1 routing has regressed."
-            )))
+            // **M3b W12 Commit 5b.1 (plan §412 HIGH-C5-3 safe-redrive
+            // contract, 2026-05-22)**: SentReplay-exclusive outcome
+            // — DPS has zero history of `server_fiscal_no`, so doc
+            // should re-send via Pattern B next tick (NOT poll
+            // forever).  Commits Envelope 1c-post (trace.complete
+            // TransientRetry + Sent→ER + audit) then returns
+            // `HoldFnDrain { ErRedriveQueued }`.  Caller maps to
+            // `DocVerdict::HoldFnDrain { ErRedriveQueued }` — next-
+            // tick ER cohort dispatch via W9b ER-class-guard bounded
+            // Pattern B redrive through `stage_send::run`.
+            if !matches!(source, Kvt2ConfirmSource::SentReplay) {
+                return Err(BootError::Internal(format!(
+                    "confirm_drain_doc({source:?}): SentNotFoundDowngrade(attempt_no={trace_attempt_no}) \
+                     is structurally unreachable for non-SentReplay per Commit 1 \
+                     classify_check_result routing — NotFound + non-SentReplay must \
+                     route to StructuralDrift::NotFoundOutsideSentReplay.  If this \
+                     surfaces, Commit 1 routing has regressed."
+                )));
+            }
+            // trace_attempt_no is i64 from the outcome variant; the
+            // 1c-post helper takes i32 (transport_trace native).
+            let trace_attempt_no_i32: i32 = trace_attempt_no.try_into().map_err(|_| {
+                BootError::Internal(format!(
+                    "confirm_drain_doc(SentReplay): SentNotFoundDowngrade trace_attempt_no \
+                     {trace_attempt_no} overflows i32 for doc {id_hex}"
+                ))
+            })?;
+            let wire_started = sent_replay_wire_started
+                .clone()
+                .expect("SentReplay implies wire_started captured");
+            let wire_finished = sent_replay_wire_finished
+                .clone()
+                .expect("SentReplay implies wire_finished captured");
+            commit_sent_replay_envelope_1c_post(
+                pool,
+                &fiscal_number,
+                doc_id,
+                &id_hex,
+                trace_attempt_no_i32,
+                wire_started,
+                wire_finished,
+                expected_server_fiscal_no,
+            )
+            .await?;
+            Ok(ConfirmDrainOutcome::HoldFnDrain {
+                projection: HoldFnDrainProjection::ErRedriveQueued,
+            })
         }
     }
 }
@@ -1026,6 +1184,509 @@ pub(in crate::services::offline_sync) async fn commit_drift_envelope_1c_drift_li
     let id_hex_owned = id_hex.to_string();
     with_immediate(pool, move |tx| {
         Box::pin(async move {
+            audit_log::append_tx(
+                tx,
+                AUDIT_ENTITY_DOC,
+                &id_hex_owned,
+                "KVT2_CONFIRM_STRUCTURAL_DRIFT",
+                Severity::Error,
+                None,
+                Some(&payload_owned),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(|err| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source: err,
+    })?;
+    Ok(())
+}
+
+// ─── M3b W12 Commit 5b.1: SentReplay bundled envelopes ──────────────
+//
+// Plan §412 + §316-319 helper-heavy ownership: SentReplay context
+// allocates a `transport_trace` recovery row in **Envelope 1c-pre**
+// BEFORE the DPS call (so wire timing + outcome are bundled into a
+// single forensic record), then commits one of 4 outcome-specific
+// envelopes (each bundling `transport_trace::complete_tx` + outcome-
+// specific writes + audit atomically):
+//
+//   - 1a-replay (Acked): trace.complete OK + Kvt1Raw + Sent→Kvt1 +
+//     Kvt1→Kvt2 + audit (5 writes).
+//   - 1c-post (NotFound): trace.complete TransientRetry + Sent→ER +
+//     audit (3 writes).  HIGH-C5-3 safe-redrive seam.
+//   - 1c-hold (Hold): trace.complete Retryable* + audit (2 writes).
+//   - 1c-drift (StructuralDrift): trace.complete structural + audit
+//     (2 writes).
+//
+// Differs from SentFresh / Kvt1Reentry **-light** variants
+// (`commit_hold_envelope_1c_hold_light` / `commit_drift_envelope_1c
+// _drift_light`) which do NOT have a trace row to complete (no
+// 1c-pre allocation for those source contexts per plan §311).
+
+/// **M3b W12 Commit 5b.1 (plan §412, 2026-05-22)** — Local ISO-8601
+/// UTC timestamp renderer for `transport_trace` `wire_call_*` fields.
+/// Duplicated від `boot_phase::iso8601_now` per "boot recovery is the
+/// only ctx-needy reader" pattern + now W12 SentReplay is the second
+/// reader.  Format matches W7 stage_send wire-time convention.
+fn iso8601_now() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+/// **M3b W12 Commit 5b.1 (plan §412 Envelope 1c-pre, 2026-05-22)** —
+/// allocate `transport_trace` recovery row for SentReplay context
+/// BEFORE the DPS lastChk call.  Single `with_immediate` envelope.
+/// Returns the allocated `attempt_no` for threading into
+/// outcome-specific completion envelopes.
+///
+/// `request_envelope_sha256 = [0u8; 32]` placeholder per
+/// `boot_phase.rs:1521-1542` precedent: lastChk is a query, not a
+/// wire submit; there is no envelope payload to hash.
+///
+/// **Commit 5b.1 status**: helper defined; consumer is the
+/// `confirm_drain_doc` SentReplay branch (also added in 5b.1) which
+/// has no production caller until 5b.2 wires
+/// `process_via_lastchk_replay`.  `#[allow(dead_code)]` за helper
+/// (chain dead until 5b.2 caller landing).
+#[allow(dead_code)]
+async fn commit_sent_replay_envelope_1c_pre(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    doc_id: DocumentId,
+    backend_profile_id: String,
+    transport_profile_id: String,
+) -> Result<i32, BootError> {
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            transport_trace::allocate_and_insert_tx(
+                tx,
+                doc_id,
+                transport_trace::NewAttempt {
+                    backend_profile_id,
+                    transport_profile_id,
+                    request_envelope_sha256: [0u8; 32],
+                },
+            )
+            .await
+            .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .map_err(|err| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source: err,
+    })
+}
+
+/// **M3b W12 Commit 5b.1 (plan §412 Envelope 1a-replay, 2026-05-22)**
+/// — SentReplay Acked path: 5-write atomic envelope bundling
+/// `transport_trace::complete_tx` OK + Kvt1Raw persist + `Sent →
+/// Kvt1` CAS + `Kvt1 → Kvt2` CAS + `OFFLINE_DRAIN_KVT2_ADVANCED`
+/// audit з `replay_short_circuit=true` marker.
+///
+/// **Difference from SentFresh Envelope 1a**: also bundles
+/// `transport_trace::complete_tx` для recovery trace row allocated
+/// by Envelope 1c-pre.  `replay_short_circuit=true` payload field
+/// distinguishes SentReplay-advance from SentFresh-advance for
+/// operator dashboards.
+///
+/// `attempt_no` (caller's `sent_replay_trace_attempt_no` from
+/// 1c-pre allocation) feeds `transport_trace.complete_tx` —
+/// completes the row at the exact attempt allocated pre-DPS call.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)] // 9 args — symmetric з SentFresh 1a
+async fn commit_sent_replay_envelope_1a_replay(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    doc_id: DocumentId,
+    id_hex: &str,
+    kvt1_raw_bytes: Vec<u8>,
+    server_fiscal_no: &str,
+    doc_state_for_audit: DocState,
+    trace_attempt_no: i32,
+    wire_started: String,
+    wire_finished: String,
+) -> Result<(), BootError> {
+    let kvt1_raw_sha256_hex = format!("{:x}", Sha256::digest(&kvt1_raw_bytes));
+    let payload = serde_json::json!({
+        "document_id": id_hex,
+        "from_state": doc_state_for_audit.as_str(),
+        "to_state": DocState::Kvt2.as_str(),
+        "server_fiscal_no": server_fiscal_no,
+        "dispatch_via": "kvt2_confirm",
+        "evidence_source": "lastChk",
+        "kvt1_raw_sha256_hex": kvt1_raw_sha256_hex,
+        "replay_short_circuit": true,
+        "trace_attempt_no": trace_attempt_no,
+    });
+    let payload_owned = payload.to_string();
+    let id_hex_owned = id_hex.to_string();
+    let fn_owned = fiscal_number.to_string();
+    let server_fiscal_no_owned = server_fiscal_no.to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // (a) Complete recovery trace row з OK outcome.
+            let trace_rows = transport_trace::complete_tx(
+                tx,
+                doc_id,
+                trace_attempt_no,
+                transport_trace::AttemptCompletion {
+                    wire_call_started_at: wire_started,
+                    wire_call_finished_at: wire_finished,
+                    outcome_kind: transport_trace::OutcomeKind::Ok,
+                    server_fiscal_no: Some(server_fiscal_no_owned),
+                    server_status_code: None,
+                    error_kind: None,
+                    error_message: None,
+                    retry_class: None,
+                },
+            )
+            .await?;
+            if trace_rows != 1 {
+                return Err(anyhow::anyhow!(
+                    "backlog_drain({fn_id}): Envelope 1a-replay trace.complete \
+                     produced rows_affected={trace_rows} for doc {doc_hex} \
+                     attempt_no={trace_attempt_no} — append-then-complete \
+                     invariant breach (row missing OR already complete)",
+                    fn_id = fn_owned,
+                    doc_hex = id_hex_owned,
+                ));
+            }
+            // (b) Persist Kvt1Raw byte-for-byte.
+            document_files::replace_tx(
+                tx,
+                doc_id,
+                document_files::DocumentFileKind::Kvt1Raw,
+                &kvt1_raw_bytes,
+            )
+            .await?;
+            // (c) CAS Sent → Kvt1.
+            let sent_to_kvt1 =
+                fiscal_documents::transition_state(tx, doc_id, DocState::Sent, DocState::Kvt1)
+                    .await?;
+            if sent_to_kvt1 != TransitionOutcome::Applied {
+                return Err(anyhow::anyhow!(
+                    "backlog_drain({fn_id}): Envelope 1a-replay CAS Sent→Kvt1 \
+                     produced {outcome:?} for doc {doc_hex}",
+                    fn_id = fn_owned,
+                    outcome = sent_to_kvt1,
+                    doc_hex = id_hex_owned,
+                ));
+            }
+            // (d) CAS Kvt1 → Kvt2.
+            let kvt1_to_kvt2 =
+                fiscal_documents::transition_state(tx, doc_id, DocState::Kvt1, DocState::Kvt2)
+                    .await?;
+            if kvt1_to_kvt2 != TransitionOutcome::Applied {
+                return Err(anyhow::anyhow!(
+                    "backlog_drain({fn_id}): Envelope 1a-replay CAS Kvt1→Kvt2 \
+                     produced {outcome:?} for doc {doc_hex}",
+                    fn_id = fn_owned,
+                    outcome = kvt1_to_kvt2,
+                    doc_hex = id_hex_owned,
+                ));
+            }
+            // (e) Forensic audit row.
+            audit_log::append_tx(
+                tx,
+                AUDIT_ENTITY_DOC,
+                &id_hex_owned,
+                "OFFLINE_DRAIN_KVT2_ADVANCED",
+                Severity::Info,
+                None,
+                Some(&payload_owned),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(|err| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source: err,
+    })?;
+    Ok(())
+}
+
+/// **M3b W12 Commit 5b.1 (plan §412 Envelope 1c-post, 2026-05-22)**
+/// — SentReplay NotFound path: 3-write atomic envelope bundling
+/// `transport_trace::complete_tx` TransientRetry + `Sent →
+/// ErrorRetryable` CAS + `OFFLINE_DRAIN_DOC_FAILED` audit (failure_
+/// class="transport", manual_recon_class=false).  HIGH-C5-3 safe-
+/// redrive seam: doc lands in ER cohort for next-tick W9b ER-class-
+/// guard bounded Pattern B redrive via `stage_send::run`.
+///
+/// `retry_class=TransientRetry` enables next-tick `ErRedriveDecision::
+/// Redrive` per W9b guard contract (durable last-attempt retry_class
+/// must be TransientRetry + attempts_used < MAX_BOOT_ATTEMPTS).
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)] // 8 args — bundled envelope shape
+async fn commit_sent_replay_envelope_1c_post(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    doc_id: DocumentId,
+    id_hex: &str,
+    trace_attempt_no: i32,
+    wire_started: String,
+    wire_finished: String,
+    server_fiscal_no: &str,
+) -> Result<(), BootError> {
+    let payload = serde_json::json!({
+        "document_id": id_hex,
+        "failure_class": "transport",
+        "probe_outcome": "NotFound",
+        "expected_server_fiscal_no": server_fiscal_no,
+        "manual_recon_class": false,
+        "dispatch_via": "kvt2_confirm",
+        "trace_attempt_no": trace_attempt_no,
+        "downgrade_to": DocState::ErrorRetryable.as_str(),
+    });
+    let payload_owned = payload.to_string();
+    let id_hex_owned = id_hex.to_string();
+    let fn_owned = fiscal_number.to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // (a) Complete recovery trace row з TransientRetry
+            // outcome — enables W9b ER guard next-tick redrive.
+            let trace_rows = transport_trace::complete_tx(
+                tx,
+                doc_id,
+                trace_attempt_no,
+                transport_trace::AttemptCompletion {
+                    wire_call_started_at: wire_started,
+                    wire_call_finished_at: wire_finished,
+                    outcome_kind: transport_trace::OutcomeKind::RetryableTransport,
+                    server_fiscal_no: None,
+                    server_status_code: None,
+                    error_kind: Some("LASTCHK_NOT_FOUND".to_string()),
+                    error_message: Some(
+                        "DPS lastChk returned empty id (NotFound); \
+                         doc downgraded to ErrorRetryable for next-tick \
+                         Pattern B redrive (HIGH-C5-3 safe-redrive)"
+                            .to_string(),
+                    ),
+                    retry_class: Some("TransientRetry".to_string()),
+                },
+            )
+            .await?;
+            if trace_rows != 1 {
+                return Err(anyhow::anyhow!(
+                    "backlog_drain({fn_id}): Envelope 1c-post trace.complete \
+                     produced rows_affected={trace_rows} for doc {doc_hex} \
+                     attempt_no={trace_attempt_no}",
+                    fn_id = fn_owned,
+                    doc_hex = id_hex_owned,
+                ));
+            }
+            // (b) CAS Sent → ErrorRetryable.
+            let sent_to_er = fiscal_documents::transition_state(
+                tx,
+                doc_id,
+                DocState::Sent,
+                DocState::ErrorRetryable,
+            )
+            .await?;
+            if sent_to_er != TransitionOutcome::Applied {
+                return Err(anyhow::anyhow!(
+                    "backlog_drain({fn_id}): Envelope 1c-post CAS \
+                     Sent→ErrorRetryable produced {outcome:?} for doc {doc_hex}",
+                    fn_id = fn_owned,
+                    outcome = sent_to_er,
+                    doc_hex = id_hex_owned,
+                ));
+            }
+            // (c) Forensic audit row.
+            audit_log::append_tx(
+                tx,
+                AUDIT_ENTITY_DOC,
+                &id_hex_owned,
+                "OFFLINE_DRAIN_DOC_FAILED",
+                Severity::Warning,
+                None,
+                Some(&payload_owned),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(|err| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source: err,
+    })?;
+    Ok(())
+}
+
+/// **M3b W12 Commit 5b.1 (plan §412 Envelope 1c-hold, 2026-05-22)** —
+/// SentReplay Hold path: 2-write atomic envelope bundling
+/// `transport_trace::complete_tx` Retryable* + `KVT2_CONFIRM_HOLD`
+/// audit.  Doc state UNCHANGED (Sent) per W0b §97-102.
+///
+/// `outcome_kind` mapped per Hold reason: DpsTransport →
+/// RetryableTransport; DpsServer/DpsAuthorization/DpsDecode/
+/// LastChkDataSignEmpty → RetryableServer.  `retry_class` is NOT
+/// set because doc state stays Sent (no ER cohort entry); next-tick
+/// SentReplay re-allocates a fresh recovery row.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)] // 8 args — bundled envelope shape
+async fn commit_sent_replay_envelope_1c_hold(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    doc_id: DocumentId,
+    id_hex: &str,
+    trace_attempt_no: i32,
+    wire_started: String,
+    wire_finished: String,
+    reason: &Kvt2ConfirmHoldReason,
+) -> Result<(), BootError> {
+    // Hold reason → trace outcome_kind mapping per plan §200-205:
+    let outcome_kind = match reason {
+        Kvt2ConfirmHoldReason::DpsTransport(_) => transport_trace::OutcomeKind::RetryableTransport,
+        Kvt2ConfirmHoldReason::DpsServer(_)
+        | Kvt2ConfirmHoldReason::DpsAuthorization(_)
+        | Kvt2ConfirmHoldReason::DpsDecode(_)
+        | Kvt2ConfirmHoldReason::LastChkDataSignEmpty => {
+            transport_trace::OutcomeKind::RetryableServer
+        }
+    };
+    let payload = serde_json::json!({
+        "document_id": id_hex,
+        "source": Kvt2ConfirmSource::SentReplay.audit_label(),
+        "hold_reason": reason.audit_label(),
+        "hold_reason_detail": format!("{reason:?}"),
+        "dispatch_via": "kvt2_confirm",
+        "trace_attempt_no": trace_attempt_no,
+    });
+    let payload_owned = payload.to_string();
+    let id_hex_owned = id_hex.to_string();
+    let fn_owned = fiscal_number.to_string();
+    let error_label = reason.audit_label().to_string();
+    let error_detail = format!("{reason:?}");
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // (a) Complete recovery trace row з Retryable* outcome.
+            let trace_rows = transport_trace::complete_tx(
+                tx,
+                doc_id,
+                trace_attempt_no,
+                transport_trace::AttemptCompletion {
+                    wire_call_started_at: wire_started,
+                    wire_call_finished_at: wire_finished,
+                    outcome_kind,
+                    server_fiscal_no: None,
+                    server_status_code: None,
+                    error_kind: Some(error_label),
+                    error_message: Some(error_detail),
+                    // retry_class None: doc stays Sent (not ER); next-
+                    // tick SentReplay re-allocates fresh trace row.
+                    retry_class: None,
+                },
+            )
+            .await?;
+            if trace_rows != 1 {
+                return Err(anyhow::anyhow!(
+                    "backlog_drain({fn_id}): Envelope 1c-hold trace.complete \
+                     produced rows_affected={trace_rows} for doc {doc_hex} \
+                     attempt_no={trace_attempt_no}",
+                    fn_id = fn_owned,
+                    doc_hex = id_hex_owned,
+                ));
+            }
+            // (b) Forensic audit row.
+            audit_log::append_tx(
+                tx,
+                AUDIT_ENTITY_DOC,
+                &id_hex_owned,
+                "KVT2_CONFIRM_HOLD",
+                Severity::Warning,
+                None,
+                Some(&payload_owned),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(|err| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source: err,
+    })?;
+    Ok(())
+}
+
+/// **M3b W12 Commit 5b.1 (plan §412 Envelope 1c-drift, 2026-05-22)** —
+/// SentReplay StructuralDrift path: 2-write atomic envelope bundling
+/// `transport_trace::complete_tx` з outcome_kind=RetryableServer
+/// (structural drift treated as recoverable from trace lifecycle
+/// perspective — actual recovery via Manual / FN drain halt) +
+/// `KVT2_CONFIRM_STRUCTURAL_DRIFT` audit (Severity::Error).
+///
+/// Per plan §412: SentReplay structurally drifts only via
+/// `LastChkIdMismatch` (NotFoundOutsideSentReplay can NOT reach
+/// SentReplay by definition of routing matrix).  Caller propagates
+/// `BootError::Internal` after this envelope commits.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)] // 8 args — bundled envelope shape
+async fn commit_sent_replay_envelope_1c_drift(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    doc_id: DocumentId,
+    id_hex: &str,
+    trace_attempt_no: i32,
+    wire_started: String,
+    wire_finished: String,
+    reason: &Kvt2ConfirmStructuralReason,
+) -> Result<(), BootError> {
+    let payload = serde_json::json!({
+        "document_id": id_hex,
+        "source": Kvt2ConfirmSource::SentReplay.audit_label(),
+        "drift_reason": reason.audit_label(),
+        "drift_reason_detail": reason.detail_message(),
+        "dispatch_via": "kvt2_confirm",
+        "trace_attempt_no": trace_attempt_no,
+    });
+    let payload_owned = payload.to_string();
+    let id_hex_owned = id_hex.to_string();
+    let fn_owned = fiscal_number.to_string();
+    let error_label = format!("STRUCTURAL_DRIFT_{}", reason.audit_label());
+    let error_detail = reason.detail_message();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // (a) Complete recovery trace row з structural-drift
+            // marker (RetryableServer outcome_kind — closest fit;
+            // trace alone is not the recovery surface, audit row is
+            // authoritative).
+            let trace_rows = transport_trace::complete_tx(
+                tx,
+                doc_id,
+                trace_attempt_no,
+                transport_trace::AttemptCompletion {
+                    wire_call_started_at: wire_started,
+                    wire_call_finished_at: wire_finished,
+                    outcome_kind: transport_trace::OutcomeKind::RetryableServer,
+                    server_fiscal_no: None,
+                    server_status_code: None,
+                    error_kind: Some(error_label),
+                    error_message: Some(error_detail),
+                    retry_class: None,
+                },
+            )
+            .await?;
+            if trace_rows != 1 {
+                return Err(anyhow::anyhow!(
+                    "backlog_drain({fn_id}): Envelope 1c-drift trace.complete \
+                     produced rows_affected={trace_rows} for doc {doc_hex} \
+                     attempt_no={trace_attempt_no}",
+                    fn_id = fn_owned,
+                    doc_hex = id_hex_owned,
+                ));
+            }
+            // (b) Forensic audit row.
             audit_log::append_tx(
                 tx,
                 AUDIT_ENTITY_DOC,
