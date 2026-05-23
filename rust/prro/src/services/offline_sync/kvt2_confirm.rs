@@ -81,6 +81,21 @@ pub enum Kvt2ConfirmSource {
     Kvt1Reentry,
 }
 
+impl Kvt2ConfirmSource {
+    /// **M3b W12 Commit 4b.1 (plan §212 + §311, 2026-05-22)** —
+    /// stable string identifier for the `source` field in
+    /// `KVT2_CONFIRM_HOLD` / `KVT2_CONFIRM_STRUCTURAL_DRIFT` audit
+    /// payloads.  Operator dashboards filter on these literals; do not
+    /// rename without coordinating with the W12 audit-shape contract.
+    pub fn audit_label(self) -> &'static str {
+        match self {
+            Self::SentFresh => "sent_fresh",
+            Self::SentReplay => "sent_replay",
+            Self::Kvt1Reentry => "kvt1_reentry",
+        }
+    }
+}
+
 /// Helper outcome variants.  Caller projects to `DocVerdict` per plan
 /// §"Helper vs caller envelope ownership".
 ///
@@ -147,6 +162,24 @@ pub enum Kvt2ConfirmHoldReason {
     LastChkDataSignEmpty,
 }
 
+impl Kvt2ConfirmHoldReason {
+    /// **M3b W12 Commit 4b.1 (plan §211-212, 2026-05-22)** — stable
+    /// string identifier for the `hold_reason` field in
+    /// `KVT2_CONFIRM_HOLD` audit payloads.  Operator dashboards filter
+    /// on these literals; do not rename without coordinating with the
+    /// W12 audit-shape contract.  Detail string (transport/server/auth
+    /// error message) goes into separate `hold_reason_detail` field.
+    pub fn audit_label(&self) -> &'static str {
+        match self {
+            Self::DpsTransport(_) => "DPS_TRANSPORT",
+            Self::DpsServer(_) => "DPS_SERVER",
+            Self::DpsAuthorization(_) => "DPS_AUTHORIZATION",
+            Self::DpsDecode(_) => "DPS_DECODE",
+            Self::LastChkDataSignEmpty => "LASTCHK_DATA_SIGN_EMPTY",
+        }
+    }
+}
+
 /// Structural-drift reasons — system-level fail-loud as
 /// `BootError::Internal`.  NOT per-doc Manual escalation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +203,24 @@ pub enum Kvt2ConfirmStructuralReason {
     /// interpretation (Sent-fresh or Kvt1 re-entry).  NotFound from
     /// these contexts indicates state-machine drift, not absent-history.
     NotFoundOutsideSentReplay { source: Kvt2ConfirmSource },
+}
+
+impl Kvt2ConfirmStructuralReason {
+    /// **M3b W12 Commit 4b.1 (plan §311, 2026-05-22)** — stable string
+    /// identifier for the `drift_reason` field in
+    /// `KVT2_CONFIRM_STRUCTURAL_DRIFT` audit payloads.  Operator
+    /// dashboards filter on these literals; do not rename without
+    /// coordinating with the W12 audit-shape contract.  Detail string
+    /// (observed/expected ids, observed state) goes into separate
+    /// `drift_reason_detail` field.
+    pub fn audit_label(&self) -> &'static str {
+        match self {
+            Self::ServerFiscalNoMissing => "SERVER_FISCAL_NO_MISSING",
+            Self::CasMissOnAdvance { .. } => "CAS_MISS_ON_ADVANCE",
+            Self::LastChkIdMismatch { .. } => "LASTCHK_ID_MISMATCH",
+            Self::NotFoundOutsideSentReplay { .. } => "NOT_FOUND_OUTSIDE_SENT_REPLAY",
+        }
+    }
 }
 
 /// Pure evidence-routing function.  Maps the
@@ -466,17 +517,49 @@ pub async fn confirm_drain_doc(
                 }
             }
         }
-        Kvt2ConfirmOutcome::StructuralDrift { reason, .. } => Err(BootError::Internal(format!(
-            "confirm_drain_doc(SentFresh): structural drift for doc {id_hex} \
-             — {reason:?}.  NotFound/Mismatch from SentFresh context indicates \
-             state-machine drift (server_fiscal_no just stamped by stage_send \
-             4-b but DPS does not recognize it).  Halts FN drain per plan §410."
-        ))),
-        Kvt2ConfirmOutcome::Hold { reason, .. } => Err(BootError::Internal(format!(
-            "confirm_drain_doc(SentFresh): Hold path not yet wired for doc \
-             {id_hex} — reason={reason:?}.  Commit 6 will project to \
-             DocVerdict::HoldFnDrain {{ projection: HeldAtSent }}."
-        ))),
+        Kvt2ConfirmOutcome::StructuralDrift { reason, .. } => {
+            // **M3b W12 Commit 4b.1 (plan §311 MED-PR70-R12-01,
+            // 2026-05-22)**: emit Envelope 1c-drift-light audit BEFORE
+            // BootError::Internal fail-loud — preserves forensic trail
+            // (KVT2_CONFIRM_STRUCTURAL_DRIFT) regardless of caller's
+            // downstream propagation.
+            commit_drift_envelope_1c_drift_light(
+                pool,
+                &fiscal_number,
+                &id_hex,
+                source,
+                &reason,
+            )
+            .await?;
+            Err(BootError::Internal(format!(
+                "confirm_drain_doc(SentFresh): structural drift for doc {id_hex} \
+                 — {reason:?}.  NotFound/Mismatch from SentFresh context indicates \
+                 state-machine drift (server_fiscal_no just stamped by stage_send \
+                 4-b but DPS does not recognize it).  Halts FN drain per plan §410.  \
+                 KVT2_CONFIRM_STRUCTURAL_DRIFT audit emitted prior to halt."
+            )))
+        }
+        Kvt2ConfirmOutcome::Hold { reason, .. } => {
+            // **M3b W12 Commit 4b.1 (plan §311 MED-PR70-R12-01,
+            // 2026-05-22)**: emit Envelope 1c-hold-light audit BEFORE
+            // BootError::Internal defensive marker — preserves forensic
+            // trail (KVT2_CONFIRM_HOLD Warning) regardless of caller's
+            // downstream projection.  HoldFnDrain projection deferred
+            // to Commit 6 per plan §413.
+            commit_hold_envelope_1c_hold_light(
+                pool,
+                &fiscal_number,
+                &id_hex,
+                source,
+                &reason,
+            )
+            .await?;
+            Err(BootError::Internal(format!(
+                "confirm_drain_doc(SentFresh): Hold audit emitted (KVT2_CONFIRM_HOLD) \
+                 for doc {id_hex} — reason={reason:?}.  HoldFnDrain projection not \
+                 yet wired (Commit 6 scope); caller observes BootError until then."
+            )))
+        }
         Kvt2ConfirmOutcome::SentNotFoundDowngrade { trace_attempt_no } => {
             Err(BootError::Internal(format!(
                 "confirm_drain_doc(SentFresh): SentNotFoundDowngrade(attempt_no={trace_attempt_no}) \
@@ -585,6 +668,123 @@ async fn commit_sent_fresh_envelope_1a(
                 &id_hex_owned,
                 "OFFLINE_DRAIN_KVT2_ADVANCED",
                 Severity::Info,
+                None,
+                Some(&payload_owned),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(|source| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// **M3b W12 Commit 4b.1 (plan §311 + §449, 2026-05-22)** —
+/// Envelope 1c-hold-light: audit-only `with_immediate` emitting
+/// `KVT2_CONFIRM_HOLD` (Severity::Warning) for SentFresh and
+/// Kvt1Reentry Hold contexts.  Doc state UNCHANGED per W0b §97-102.
+///
+/// SentReplay context uses its own bundled Envelope 1c-hold (trace
+/// completion + audit) — Commit 5b will land it.  This light variant
+/// is for the two source contexts that do not allocate a recovery
+/// trace row.
+///
+/// **Helper-heavy ownership** (plan §311 MED-PR70-R12-01 fix): caller
+/// receives `Kvt2ConfirmOutcome::Hold` AFTER the audit row commits.
+/// Forensic trail lands regardless of subsequent caller projection
+/// (in 4b.1 helper still returns `BootError::Internal` defensive
+/// marker until Commit 6 lands `HoldFnDrain` projection).
+///
+/// **Commit 4b.1 status**: helper still has no production consumer;
+/// `#[allow(dead_code)]` removed in Commit 4b.2 when
+/// `process_via_stage_send` wires `confirm_drain_doc(SentFresh, ...)`.
+#[allow(dead_code)]
+async fn commit_hold_envelope_1c_hold_light(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    id_hex: &str,
+    source: Kvt2ConfirmSource,
+    reason: &Kvt2ConfirmHoldReason,
+) -> Result<(), BootError> {
+    let payload = serde_json::json!({
+        "document_id": id_hex,
+        "source": source.audit_label(),
+        "hold_reason": reason.audit_label(),
+        "hold_reason_detail": format!("{reason:?}"),
+        "dispatch_via": "kvt2_confirm",
+    });
+    let payload_owned = payload.to_string();
+    let id_hex_owned = id_hex.to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            audit_log::append_tx(
+                tx,
+                AUDIT_ENTITY_DOC,
+                &id_hex_owned,
+                "KVT2_CONFIRM_HOLD",
+                Severity::Warning,
+                None,
+                Some(&payload_owned),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(|source| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// **M3b W12 Commit 4b.1 (plan §311, 2026-05-22)** — Envelope
+/// 1c-drift-light: audit-only `with_immediate` emitting
+/// `KVT2_CONFIRM_STRUCTURAL_DRIFT` (Severity::Error) for SentFresh and
+/// Kvt1Reentry StructuralDrift contexts.  Doc state UNCHANGED;
+/// forensic trail preserved BEFORE caller's `BootError::Internal`
+/// fail-loud propagation halts the FN drain.
+///
+/// SentReplay context uses its own bundled Envelope 1c-drift (trace
+/// completion + audit) — Commit 5b will land it.  This light variant
+/// is for the two source contexts that do not allocate a recovery
+/// trace row.
+///
+/// `Severity::Error` (not Warning like Hold) because StructuralDrift
+/// signals state-machine invariant breach that halts FN drain — more
+/// severe than recoverable Hold.
+///
+/// **Commit 4b.1 status**: helper still has no production consumer;
+/// `#[allow(dead_code)]` removed in Commit 4b.2.
+#[allow(dead_code)]
+async fn commit_drift_envelope_1c_drift_light(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    id_hex: &str,
+    source: Kvt2ConfirmSource,
+    reason: &Kvt2ConfirmStructuralReason,
+) -> Result<(), BootError> {
+    let payload = serde_json::json!({
+        "document_id": id_hex,
+        "source": source.audit_label(),
+        "drift_reason": reason.audit_label(),
+        "drift_reason_detail": format!("{reason:?}"),
+        "dispatch_via": "kvt2_confirm",
+    });
+    let payload_owned = payload.to_string();
+    let id_hex_owned = id_hex.to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            audit_log::append_tx(
+                tx,
+                AUDIT_ENTITY_DOC,
+                &id_hex_owned,
+                "KVT2_CONFIRM_STRUCTURAL_DRIFT",
+                Severity::Error,
                 None,
                 Some(&payload_owned),
             )
