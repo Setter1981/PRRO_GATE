@@ -40,10 +40,20 @@
 //!   `KVT2_CONFIRM_STRUCTURAL_DRIFT` (Error) audit-only envelope
 //!   before `BootError::Internal` halt per plan §311 +
 //!   MED-PR70-R12-01.
-//! - **W12 Commits 5/5b/6 (pending)** — Kvt1Reentry source wiring,
-//!   SentReplay source wiring with `transport_trace` recovery row,
-//!   HoldFnDrain projection (replaces current Hold-path
-//!   `BootError::Internal` defensive marker).
+//! - **W12 Commit 5** wires Kvt1Reentry source via
+//!   `process_via_w12_only` → `kvt2_confirm::confirm_drain_doc(
+//!   Kvt1Reentry, ...)` → Envelope 1b (Kvt1Raw + Kvt1→Kvt2 +
+//!   KVT2_ADVANCED audit; NO Sent→Kvt1 since doc is already at
+//!   Kvt1) + Envelope 2 (`stage_finalize::run` Kvt2→Ack).  Caller
+//!   sources `expected_server_fiscal_no` from persisted
+//!   `doc.server_fiscal_no` with caller-level
+//!   `BootError::Internal` + KVT2_CONFIRM_STRUCTURAL_DRIFT audit
+//!   on None (state-machine invariant breach per MED-W12C5-01).
+//! - **W12 Commits 5b/6 (pending)** — SentReplay source wiring
+//!   with `transport_trace` recovery row, HoldFnDrain projection
+//!   (replaces current Hold-path `BootError::Internal` defensive
+//!   marker with `DocVerdict::HoldFnDrain { HeldAtSent |
+//!   HeldAtKvt1 }` per plan §413).
 //!
 //! ## C4 known gaps (C5 blocker before "C4 approved")
 //!
@@ -1057,8 +1067,11 @@ fn is_manual_recon_retry_class(retry: RetryClass) -> bool {
 ///   NotFound downgrades to `ErrorRetryable` for next-tick Pattern B
 ///   re-drive (HIGH-C5-3); TransportRetry keeps the doc SENT for
 ///   the next tick to re-probe.
-/// - `KVT1` → `process_via_w12_only` (no wire, no pre-flight;
-///   pre-W12 stub records DeferredKvt1).
+/// - `KVT1` → `process_via_w12_only` (no wire; reads persisted
+///   `doc.server_fiscal_no` + invokes
+///   `kvt2_confirm::confirm_drain_doc(Kvt1Reentry, ...)` → Envelope
+///   1b (2-CAS Kvt1Raw + Kvt1→Kvt2 + audit) + Envelope 2 on Acked
+///   per M3b W12 Commit 5).
 /// - `KVT2` → **M3b W12 Commit 3** `process_via_w12_kvt2_advance`
 ///   (calls `stage_finalize::run` for idempotent Kvt2→Ack advance;
 ///   reverses MED-C5-4 deferral).  Surfaces mid-tick crash recovery
@@ -1753,15 +1766,31 @@ async fn process_via_w12_only(
     let id_hex = hex_lower(doc.document_id.as_bytes());
     // Source the canonical expected_server_fiscal_no from persisted
     // doc row — Kvt1 state guarantees stage_send 4-b stamped it.
-    // Fail-loud on None (state-machine invariant breach).
-    let expected_server_fiscal_no = doc.server_fiscal_no.as_deref().ok_or_else(|| {
-        BootError::Internal(format!(
-            "process_via_w12_only({fn_id}): doc {id_hex} at state Kvt1 has \
-             NULL server_fiscal_no — stage_send 4-b stamp invariant breach \
-             (Kvt1 ALWAYS implies server_fiscal_no stamped by prior tick)",
-            fn_id = doc.fiscal_number,
-        ))
-    })?;
+    // **MED-W12C5-01 fix (5 Δ, 2026-05-22)**: emit durable
+    // KVT2_CONFIRM_STRUCTURAL_DRIFT audit (Severity::Error) via
+    // Envelope 1c-drift-light BEFORE the BootError::Internal halt
+    // so forensic operators see the structural breach in audit_log
+    // (not just the returned error string).  Doc state untouched.
+    let expected_server_fiscal_no = match doc.server_fiscal_no.as_deref() {
+        Some(s) => s,
+        None => {
+            kvt2_confirm::commit_drift_envelope_1c_drift_light(
+                pool,
+                &doc.fiscal_number,
+                &id_hex,
+                kvt2_confirm::Kvt2ConfirmSource::Kvt1Reentry,
+                &kvt2_confirm::Kvt2ConfirmStructuralReason::ServerFiscalNoMissing,
+            )
+            .await?;
+            return Err(BootError::Internal(format!(
+                "process_via_w12_only({fn_id}): doc {id_hex} at state Kvt1 has \
+                 NULL server_fiscal_no — stage_send 4-b stamp invariant breach \
+                 (Kvt1 ALWAYS implies server_fiscal_no stamped by prior tick).  \
+                 KVT2_CONFIRM_STRUCTURAL_DRIFT audit emitted prior to halt.",
+                fn_id = doc.fiscal_number,
+            )));
+        }
+    };
     let confirm_outcome = kvt2_confirm::confirm_drain_doc(
         pool,
         deps.dps,

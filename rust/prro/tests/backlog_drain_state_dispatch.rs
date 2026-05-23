@@ -14,21 +14,34 @@
 //!      - `SENT` → `lastChk` pre-flight (no wire fall-through;
 //!        NotFound downgrades to `ErrorRetryable` for next-tick
 //!        Pattern B re-drive per HIGH-C5-3).
-//!      - `KVT1` → `apply_w12_confirmation` stub only.
+//!      - `KVT1` → `process_via_w12_only` →
+//!        `kvt2_confirm::confirm_drain_doc(Kvt1Reentry, ...)` →
+//!        Envelope 1b + Envelope 2 → ACK (M3b W12 Commit 5).
 //!   3. SENT replay rediscovery via lastChk Match advances Sent→Kvt1
 //!      with audit `replay_short_circuit=true` AND persists
 //!      `KVT1_RAW = ack.data_sign` byte-for-byte (HIGH-C5-2).
 //!   4. Empty-skip fires only when zero unfinished candidates exist
 //!      (terminal-state docs do NOT keep drain running).
 //!
-//! Tests (5 original + 8 W9b ER-class-guard 2026-05-22):
+//! **M3b W12 Commit 5 update (2026-05-22)**: Kvt1 dispatch refactored
+//! to ACK-era; 4 new `w12_kvt1_reentry_*` integration fixtures added
+//! covering NotFound→Drift / Mismatch→Drift / Transport→Hold /
+//! ServerFiscalNoMissing→Drift (MED-W12C5-01 caller-level audit).
+//!
+//! Tests (5 original + 8 W9b ER-class-guard 2026-05-22 + 5 W12 4b
+//! 2026-05-22 + 5 W12 5 2026-05-22):
 //!
 //!   1. `c5_sent_doc_lastchk_match_advances_to_kvt1_with_replay_flag`
-//!   2. `c5_kvt1_doc_w12_only_no_db_mutation_records_deferred`
-//!   3. `c5_error_retryable_doc_re_driven_via_stage_send_to_kvt1`
-//!      (rewritten 2026-05-22: now seeds durable
+//!   2. `c5_kvt1_doc_w12_reentry_advances_to_ack`
+//!      (refactored 2026-05-22 W12 Commit 5: pre-W12 stub-locking
+//!      assertions replaced by Kvt1Reentry chain → Envelope 1b +
+//!      Envelope 2 → ACK; KVT1_RAW byte-for-byte + sha256 digest
+//!      locked per LOW-W12C5-03).
+//!   3. `c5_error_retryable_doc_re_driven_via_stage_send_to_ack_via_w12`
+//!      (rewritten 2026-05-22 W12 Commit 4b: now seeds durable
 //!      `TransientRetry` + under-budget attempts before asserting wire
-//!      redrive, per W9b ER-class-guard caller obligation).
+//!      redrive, per W9b ER-class-guard caller obligation; ACK-era
+//!      assertions).
 //!   4. `c5_sent_doc_lastchk_mismatch_records_per_doc_failure_no_wire_resend`
 //!   5. `c5_empty_skip_when_only_terminal_state_docs_exist`
 //!   6. `er_guard_budget_exhausted_no_wire_escalates_to_manual`
@@ -57,6 +70,7 @@ use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
 use prro::transports::dps::error::DpsError;
 use prro::BootError;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -521,6 +535,32 @@ async fn c5_kvt1_doc_w12_reentry_advances_to_ack() {
         payload.get("attempt_no").is_none() || payload["attempt_no"].is_null(),
         "Kvt1Reentry envelope 1b payload MUST NOT carry attempt_no \
          (no fresh wire attempt this tick); got: {payload:?}"
+    );
+
+    // **LOW-W12C5-03 fix (5 Δ, 2026-05-22)**: lock Envelope 1b
+    // evidence-persistence contract end-to-end.  KVT1_RAW row in
+    // document_files MUST equal lastChk.data_sign byte-for-byte
+    // (HIGH-C5-2 forensic anchor); audit payload's
+    // kvt1_raw_sha256_hex MUST equal SHA256 of those persisted
+    // bytes (MED-W12C4A-A plan §62 audit-digest contract).
+    let expected_data_sign = vec![0xAAu8; 32];
+    let persisted_kvt1_raw: Vec<u8> = sqlx::query_scalar(
+        "SELECT content FROM document_files WHERE document_id = ? AND kind = 'KVT1_RAW'",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .expect("Envelope 1b MUST persist KVT1_RAW row in document_files");
+    assert_eq!(
+        persisted_kvt1_raw, expected_data_sign,
+        "KVT1_RAW persisted bytes MUST equal lastChk.data_sign byte-for-byte \
+         (HIGH-C5-2 forensic anchor)"
+    );
+    let expected_digest_hex = format!("{:x}", Sha256::digest(&persisted_kvt1_raw));
+    assert_eq!(
+        payload["kvt1_raw_sha256_hex"], expected_digest_hex,
+        "OFFLINE_DRAIN_KVT2_ADVANCED.kvt1_raw_sha256_hex MUST equal SHA256 \
+         of persisted KVT1_RAW bytes (plan §62 audit-digest contract)"
     );
 }
 
@@ -1814,13 +1854,18 @@ async fn w12_kvt1_reentry_dps_transport_emits_hold_audit_and_halts_via_boot_erro
 }
 
 #[tokio::test]
-async fn w12_kvt1_reentry_doc_without_server_fiscal_no_halts_caller_level() {
+async fn w12_kvt1_reentry_doc_without_server_fiscal_no_emits_drift_audit_and_halts() {
     // MED-PR70-R11-01 caller-level handoff: Kvt1 state implies
     // stage_send 4-b stamped server_fiscal_no.  Doc at Kvt1 with
     // NULL server_fiscal_no is a state-machine invariant breach
     // detected at `process_via_w12_only` entry BEFORE confirm_drain_doc
-    // / DPS call.  Halts with `BootError::Internal`; no audit fires
-    // (no envelope opened).
+    // / DPS call.
+    //
+    // **MED-W12C5-01 fix (5 Δ, 2026-05-22)**: durable
+    // KVT2_CONFIRM_STRUCTURAL_DRIFT audit emitted via
+    // Envelope 1c-drift-light BEFORE BootError::Internal halt —
+    // forensic operators see the structural breach in audit_log,
+    // not just the error string.
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool).await;
@@ -1847,11 +1892,28 @@ async fn w12_kvt1_reentry_doc_without_server_fiscal_no_halts_caller_level() {
         "BootError must mention server_fiscal_no invariant; got: {err_str}"
     );
 
-    // Doc state unchanged; no DPS call; no envelope audits.
+    // Doc state unchanged at KVT1; no DPS call (caller-level fail
+    // BEFORE confirm_drain_doc invocation).
     assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
     assert_eq!(c.dps.send_chk_count(), 0);
     assert_eq!(c.dps.last_chk_count(), 0);
+
+    // **MED-W12C5-01: durable forensic audit landed BEFORE BootError**:
+    // KVT2_CONFIRM_STRUCTURAL_DRIFT (Severity::Error) with
+    // drift_reason=SERVER_FISCAL_NO_MISSING + source=kvt1_reentry.
+    assert_eq!(
+        audit_count(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await,
+        1,
+        "drift envelope MUST emit forensic audit BEFORE fail-loud"
+    );
+    let drift = audit_latest_payload(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT")
+        .await
+        .unwrap();
+    assert_eq!(drift["source"], "kvt1_reentry");
+    assert_eq!(drift["drift_reason"], "SERVER_FISCAL_NO_MISSING");
+    assert_eq!(drift["dispatch_via"], "kvt2_confirm");
+
+    // No advance / hold audit on this caller-level structural drift.
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 0);
     assert_eq!(audit_count(&pool, "KVT2_CONFIRM_HOLD").await, 0);
-    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await, 0);
 }

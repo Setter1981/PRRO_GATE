@@ -362,14 +362,16 @@ pub async fn evaluate_lastchk(
 /// [`BootError::Internal`] (defensive fail-loud until HoldFnDrain
 /// projection wiring lands in Commit 6).
 ///
-/// **M3b W12 Commit 4b status (2026-05-22)**: production-wired for
-/// SentFresh source via `process_via_stage_send` Sent branch.  Hold
-/// and StructuralDrift contexts emit forensic audit envelopes
-/// (`KVT2_CONFIRM_HOLD` / `KVT2_CONFIRM_STRUCTURAL_DRIFT`) BEFORE
-/// `BootError::Internal` halt per plan §311 MED-PR70-R12-01.
-/// Kvt1Reentry / SentReplay sources are scope-guarded at
-/// `confirm_drain_doc` entry and return `BootError::Internal` until
-/// Commits 5/5b land their Envelope 1b / 1c-pre chains.
+/// **M3b W12 Commit 5 status (2026-05-22)**: production-wired for
+/// SentFresh (process_via_stage_send) + Kvt1Reentry
+/// (process_via_w12_only).  Hold and StructuralDrift contexts emit
+/// forensic audit envelopes (`KVT2_CONFIRM_HOLD` /
+/// `KVT2_CONFIRM_STRUCTURAL_DRIFT`) BEFORE `BootError::Internal`
+/// halt per plan §311 MED-PR70-R12-01.  SentReplay remains
+/// scope-guarded at `confirm_drain_doc` entry — returns
+/// `BootError::Internal` until Commit 5b lands the Envelope 1c-pre
+/// `transport_trace.allocate_and_insert_tx` + bundled
+/// 1a-replay / 1c-post / 1c-hold / 1c-drift chain per plan §412.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmDrainOutcome {
     /// Envelope 1a (Kvt1Raw persist + Sent→Kvt1 CAS + Kvt1→Kvt2 CAS +
@@ -383,22 +385,26 @@ pub enum ConfirmDrainOutcome {
 /// W12 high-level helper — orchestrates the full Sent-source W12
 /// confirmation chain per plan §410 (Commit 4 wiring scope).
 ///
-/// **Source-context support matrix** (4a = library-wired; production
-/// consumer lands in 4b):
-/// - [`Kvt2ConfirmSource::SentFresh`] → **library-wired** (this commit;
-///   Commit 4b will replace `apply_w12_confirmation(Sent, ...)` in
-///   `process_via_stage_send` with the call site).
-///   Caller = `process_via_stage_send` after `StageSendOutcome::Sent`.
-///   `expected_server_fiscal_no` MUST be sourced from the
-///   `StageSendOutcome::Sent` variant (`&outcome.server_fiscal_no`),
-///   NOT from the pre-stage_send cohort snapshot `doc.server_fiscal_no`
-///   (which is `None` at cohort SELECT time per stage_send 4-b
-///   invariant — MED-PR70-R11-01 handoff).
-/// - [`Kvt2ConfirmSource::Kvt1Reentry`] → deferred to Commit 5
-///   (`process_via_w12_only` rewrite, Envelope 1b chain).
+/// **Source-context support matrix** (post W12 Commit 5):
+/// - [`Kvt2ConfirmSource::SentFresh`] → **production-wired** (Commit
+///   4b).  Caller = `process_via_stage_send` after
+///   `StageSendOutcome::Sent`.  `expected_server_fiscal_no` MUST be
+///   sourced from the `StageSendOutcome::Sent` variant
+///   (`&outcome.server_fiscal_no`), NOT from the pre-stage_send
+///   cohort snapshot `doc.server_fiscal_no` (which is `None` at
+///   cohort SELECT time per stage_send 4-b invariant —
+///   MED-PR70-R11-01 handoff).  On Acked → Envelope 1a (3-CAS).
+/// - [`Kvt2ConfirmSource::Kvt1Reentry`] → **production-wired**
+///   (Commit 5).  Caller = `process_via_w12_only` on Kvt1 cohort
+///   entry.  `expected_server_fiscal_no` MUST be sourced from
+///   persisted `doc.server_fiscal_no` with caller-level
+///   `BootError::Internal` fail-loud on None (state-machine
+///   invariant breach: Kvt1 ALWAYS implies stage_send 4-b stamped
+///   it).  On Acked → Envelope 1b (2-CAS — no Sent→Kvt1 because
+///   doc was already at Kvt1).
 /// - [`Kvt2ConfirmSource::SentReplay`] → deferred to Commit 5b
-///   (`process_via_lastchk_replay` rewrite, Envelope 1c-pre / 1a-replay
-///   / 1c-post / 1c-hold / 1c-drift chain).
+///   (`process_via_lastchk_replay` rewrite, Envelope 1c-pre /
+///   1a-replay / 1c-post / 1c-hold / 1c-drift chain per plan §412).
 ///
 /// **SentFresh happy path** (Commit 4):
 ///
@@ -955,7 +961,7 @@ async fn commit_hold_envelope_1c_hold_light(
 /// **Commit 4b status**: production-consumed via `confirm_drain_doc`
 /// StructuralDrift arm; emits forensic KVT2_CONFIRM_STRUCTURAL_DRIFT
 /// audit BEFORE caller propagates `BootError::Internal` fail-loud.
-async fn commit_drift_envelope_1c_drift_light(
+pub(in crate::services::offline_sync) async fn commit_drift_envelope_1c_drift_light(
     pool: &SqlitePool,
     fiscal_number: &str,
     id_hex: &str,
