@@ -601,11 +601,17 @@ pub(crate) const AUDIT_ENTITY_DOC: &str = "fiscal_document";
 /// Critical `OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL` audit; in that
 /// case the summary reflects state up to the halt position.
 ///
-/// Caller observing this intermediate result MUST NOT treat the
-/// chain as finalized — `OFFLINE_DRAIN_COMPLETED|PARTIAL` has not
-/// been emitted, and `finalize_eligibility` returns
-/// `NotEligible{DocsDeferredAtKvt1 | AckCountMismatch}` by
-/// construction (pre-W12 cannot produce real Ack proof).
+/// Post W12 Commit 4b (SentFresh production-wired), the SentFresh
+/// happy-path drain can reach the Eligible arm and emit
+/// `OFFLINE_DRAIN_COMPLETED` + close session/node/shift in the same
+/// public entry call.  Other source contexts (Kvt1Reentry /
+/// SentReplay) are scope-guarded at `confirm_drain_doc` until
+/// Commits 5/5b wire their Envelope 1b / 1c-pre chains; Hold paths
+/// return `BootError::Internal` until Commit 6 lands the
+/// `HoldFnDrain` projection.  Caller should check
+/// `summary.finalized()` to distinguish completed-Eligible from
+/// PARTIAL outcomes — `summary.mark_finalized()` only flips on the
+/// Eligible-arm envelope commit, so the flag is a reliable signal.
 ///
 /// ## Errors
 ///

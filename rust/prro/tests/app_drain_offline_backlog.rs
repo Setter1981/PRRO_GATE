@@ -4,25 +4,33 @@
 //! acquires the App reconcile mutex (W2 enforcement per ADR-M3-A10)
 //! and delegates to the pure-function `backlog_drain::drain`.
 //!
-//! Two integration tests:
+//! **M3b W12 Commit 4b update (2026-05-22)**: SentFresh production-
+//! wired via `process_via_stage_send` Sent branch.  App-owned
+//! happy path now reaches the Eligible arm (per `c6_eligible_*`
+//! fixtures' chain) end-to-end without bypassing public entry.
+//!
+//! Three integration tests:
 //!
 //!   1. `app_drain_skip_path_mode_not_going_online` — boots App,
 //!      seeds FN with `node_state.mode = Offline`, calls
 //!      `App::drain_offline_backlog_with`, asserts skip via
 //!      `SKIPPED_NOT_GOING_ONLINE` audit + empty summary.
-//!   2. `app_drain_partial_path_pre_w12_steady_state` — boots App,
-//!      seeds GoingOnline + Open session + 2 OFFLINE_LOCAL_ACK docs,
-//!      calls `App::drain_offline_backlog_with`, asserts pre-W12
-//!      stub flow: per-doc loop advances both as DeferredKvt1 →
-//!      finalize blocked → `OFFLINE_DRAIN_PARTIAL` audit; node stays
-//!      GoingOnline, session stays Draining.
+//!   2. `app_drain_eligible_path_via_w12_sent_fresh_steady_state`
+//!      (post W12 Commit 4b refactor) — boots App, seeds
+//!      GoingOnline + Open session + 2 OFFLINE_LOCAL_ACK docs +
+//!      W12 chain prereqs + lastChk Acked queue, calls
+//!      `App::drain_offline_backlog_with`, asserts SentFresh chain:
+//!      per-doc Envelope 1a + Envelope 2 → ACK; finalize Eligible
+//!      → `OFFLINE_DRAIN_COMPLETED` + `OFFLINE_SESSION_CLOSED`
+//!      audits; node ONLINE; session CLOSED.
+//!   3. `app_drain_concurrent_invocations_smoke_no_deadlock` —
+//!      W9b NIT-C7-R2 concurrent invocation smoke (mutex
+//!      serialization, no panic / no wedge under tokio::join).
 //!
-//! Eligible-arm full-flow integration via the public entry is
-//! **deferred to W12 PR** — pre-W12 the C5 stub
-//! `apply_w12_confirmation` always returns `DeferredKvt1`.  The
-//! Eligible-arm CAS chain + audit shape are covered by the inline
-//! `eligible_arm_tests` in `backlog_drain.rs` (calls
-//! `commit_finalize_envelope` directly via crate-internal access).
+//! Eligible-arm CAS chain + audit shape now exercised end-to-end
+//! through the public entry via test #2.  The inline
+//! `eligible_arm_tests` in `backlog_drain.rs` provide complementary
+//! direct-call coverage of `commit_finalize_envelope`.
 
 mod common;
 
