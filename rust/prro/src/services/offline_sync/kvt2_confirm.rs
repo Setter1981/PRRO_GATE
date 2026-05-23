@@ -442,14 +442,21 @@ pub enum ConfirmDrainOutcome {
 /// the 9 pre-W12 stub-locking tests against the W12 ACK-era
 /// acceptance shape (per plan §410).  `#[allow(dead_code)]` is the
 /// explicit "not-yet-wired" marker — remove in 4b.
-#[allow(dead_code)]
-pub async fn confirm_drain_doc(
+pub(in crate::services::offline_sync) async fn confirm_drain_doc(
     pool: &SqlitePool,
     dps: &dyn DpsChannel,
     doc: &fiscal_documents::DocumentRow,
     expected_server_fiscal_no: &str,
     fn_sign: &CheckSignBlob,
     source: Kvt2ConfirmSource,
+    // **LOW-W12C4A-04 / LOW-W12C4A-D fix (4b.3, 2026-05-22)**:
+    // `attempt_no` from `StageSendOutcome::Sent` threaded into
+    // Envelope 1a audit payload to preserve operator-dashboard
+    // continuity with the pre-W12 stub `attempt_no` field.  None
+    // for sources that do not carry an attempt counter
+    // (Kvt1Reentry has no fresh wire attempt; SentReplay's
+    // attempt_no lives in `transport_trace`, NOT this surface).
+    attempt_no: Option<i64>,
 ) -> Result<ConfirmDrainOutcome, BootError> {
     // Commit 4 scope guard — Kvt1Reentry / SentReplay deferred.
     if !matches!(source, Kvt2ConfirmSource::SentFresh) {
@@ -471,6 +478,21 @@ pub async fn confirm_drain_doc(
     let fiscal_number = doc.fiscal_number.clone();
     match outcome {
         Kvt2ConfirmOutcome::Acked { kvt1_raw_bytes, .. } => {
+            // **LOW-W12C4A-07 fix (4b.3, 2026-05-22)**: defensive
+            // non-empty guard.  classify_check_result routes empty
+            // data_sign to Hold(LastChkDataSignEmpty) per
+            // kvt2_confirm.rs:188-192 — empty kvt1_raw_bytes
+            // reaching Acked here means Commit 1 routing regression.
+            // Fail-loud BEFORE persisting empty Kvt1Raw row that
+            // would silently corrupt forensic evidence.
+            if kvt1_raw_bytes.is_empty() {
+                return Err(BootError::Internal(format!(
+                    "confirm_drain_doc(SentFresh): Acked outcome with empty \
+                     kvt1_raw_bytes for doc {id_hex} — classify_check_result \
+                     invariant violated (should route empty data_sign to \
+                     Hold(LastChkDataSignEmpty); see kvt2_confirm.rs:188-192)"
+                )));
+            }
             commit_sent_fresh_envelope_1a(
                 pool,
                 &fiscal_number,
@@ -479,6 +501,7 @@ pub async fn confirm_drain_doc(
                 kvt1_raw_bytes,
                 expected_server_fiscal_no,
                 doc.state,
+                attempt_no,
             )
             .await?;
             // Envelope 2: M3a stage_finalize::run owns its 5-write
@@ -586,7 +609,10 @@ pub async fn confirm_drain_doc(
 /// itself has no production consumer in 4a.  `#[allow(dead_code)]`
 /// is the "not-yet-wired" marker; remove in Commit 4b once
 /// `process_via_stage_send` wires `confirm_drain_doc(SentFresh, ...)`.
-#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)] // 8 args — caller has all
+                                     // context pre-bound; bundling
+                                     // into a struct would obscure
+                                     // the per-arg invariant docs.
 async fn commit_sent_fresh_envelope_1a(
     pool: &SqlitePool,
     fiscal_number: &str,
@@ -595,6 +621,12 @@ async fn commit_sent_fresh_envelope_1a(
     kvt1_raw_bytes: Vec<u8>,
     server_fiscal_no: &str,
     doc_state_for_audit: DocState,
+    // **LOW-W12C4A-04 fix (4b.3, 2026-05-22)**: threaded from
+    // `StageSendOutcome::Sent.attempt_no` via `confirm_drain_doc`;
+    // preserves operator-dashboard continuity with the pre-W12 stub
+    // audit `attempt_no` field at the SentFresh wire-attempt
+    // boundary.
+    attempt_no: Option<i64>,
 ) -> Result<(), BootError> {
     // **MED-W12C4A-A fix (plan §62-65 pinned audit contract,
     // 2026-05-22)**: SHA256 digest of the persisted Kvt1Raw evidence
@@ -617,6 +649,12 @@ async fn commit_sent_fresh_envelope_1a(
         "dispatch_via": "kvt2_confirm",
         "evidence_source": "lastChk",
         "kvt1_raw_sha256_hex": kvt1_raw_sha256_hex,
+        // **LOW-W12C4A-04 fix (4b.3, 2026-05-22)**: thread
+        // attempt_no from StageSendOutcome::Sent.  Preserves
+        // operator-dashboard continuity with pre-W12 stub field.
+        // None for sources that have no fresh wire attempt
+        // counter (Kvt1Reentry); serializes as JSON null.
+        "attempt_no": attempt_no,
     });
     let payload_owned = payload.to_string();
     let id_hex_owned = id_hex.to_string();

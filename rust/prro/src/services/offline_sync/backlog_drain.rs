@@ -85,6 +85,7 @@ use crate::db::repositories::{
     audit_log, document_files, fiscal_documents, node_state, offline_sessions, shifts,
 };
 use crate::db::tx::{with_immediate, WriteTxConn};
+use crate::services::offline_sync::kvt2_confirm;
 use crate::services::reconciliation::guard::ReconcileGuard;
 use crate::services::reconciliation::last_chk_probe::{self, ProbeOutcome};
 use crate::services::reconciliation::runtime::RuntimeView;
@@ -1084,7 +1085,14 @@ async fn process_one_doc(
 async fn process_via_stage_send(
     pool: &SqlitePool,
     deps: &RuntimeView<'_>,
-    fiscal_number: &str,
+    // M3b W12 Commit 4b.3 (2026-05-22): `fiscal_number` no longer
+    // used directly — Sent branch now delegates to
+    // `kvt2_confirm::confirm_drain_doc` which sources FN internally
+    // from `doc.fiscal_number`.  Param kept on signature for
+    // symmetry with sibling dispatch helpers
+    // (`process_via_lastchk_replay`, `process_via_w12_only`) and
+    // for future Commit 5/5b consumers.
+    _fiscal_number: &str,
     doc: &fiscal_documents::DocumentRow,
     summary: &mut DrainSummary,
 ) -> Result<DocVerdict, BootError> {
@@ -1096,62 +1104,50 @@ async fn process_via_stage_send(
             server_fiscal_no,
             attempt_no,
         }) => {
-            // C5 + LOW-C5-R1 (2026-05-21): pre-build the audit payload
-            // and pass it through to apply_w12_confirmation; the helper
-            // commits CAS Sent→Kvt1 + audit row inside ONE
-            // `with_immediate` envelope so audit append failure rolls
-            // back the CAS.  Pre-W12 stub return is always
-            // DeferredKvt1.
+            // **M3b W12 Commit 4b.3 (2026-05-22)** — Sent-source W12
+            // wiring per plan §410.  stage_send committed doc to Sent
+            // inside its own 4-b envelope; we now ask DPS via canonical
+            // `last_chk` / `by_server_fiscal_no` whether the receipt
+            // is recognized, then on Acked converge Sent→Kvt1→Kvt2→Ack
+            // via Envelope 1a (atomic) + Envelope 2 (`stage_finalize::
+            // run` Kvt2→Ack).
             //
-            // `doc.state` here is OfflineLocalAck or ErrorRetryable
-            // (per outer state dispatch); stage_send Sent outcome
-            // implies the doc has already transitioned through
-            // Sending → Sent inside stage_send's 4-b envelope.  The
-            // audit `from_state` reflects the drain-loop ENTRY state
-            // (pre-stage_send), not the inner Sending intermediate.
+            // **MED-PR70-R11-01 handoff**: `expected_server_fiscal_no`
+            // sourced from `StageSendOutcome::Sent { server_fiscal_no
+            // }` (just stamped this tick by stage_send 4-b), NOT from
+            // the pre-stage_send cohort snapshot `doc.server_fiscal_no`
+            // (which is `None` at SELECT time per stage_send 4-b
+            // invariant).
             //
-            // **M3b W12 Commit 4a status (2026-05-22)**: this is the
-            // pre-W12 stub call site.  Commit 4a (foundation-only)
-            // lands `kvt2_confirm::confirm_drain_doc` helper +
-            // `StubDpsChannel::with_last_chk_queue` test extension
-            // WITHOUT changing this call site.  Commit 4b will
-            // replace this `apply_w12_confirmation` call with
-            // `kvt2_confirm::confirm_drain_doc(SentFresh, &outcome.
-            // server_fiscal_no, ...)` per plan §410 + refactor the 9
-            // pre-W12 stub-locking tests to W12-era ACK assertions.
-            let audit_payload = serde_json::json!({
-                "document_id": id_hex,
-                "from_state": doc.state.as_str(),
-                "to_state": DocState::Kvt1.as_str(),
-                "replay_short_circuit": false,
-                "attempt_no": attempt_no,
-                "server_fiscal_no": server_fiscal_no,
-                "w12_status": W12ConfirmOutcome::DeferredKvt1.w12_status_str(),
-                "dispatch_via": "stage_send",
-            });
-            // Pass `DocState::Sent` literal so the helper routes
-            // through the Sent → Kvt1 CAS arm — at this point
-            // `stage_send::run` has already committed the doc to
-            // Sent inside its own envelope, even though `doc.state`
-            // (the cohort-walker snapshot) shows the pre-stage_send
-            // OFFLINE_LOCAL_ACK / ERROR_RETRYABLE.
-            //
-            // `kvt1_raw_bytes: None` — stage_send::Sent outcome does
-            // not surface `ack.data_sign` in its public outcome
-            // (only `server_fiscal_no` + `attempt_no`).  Pre-W12 gap;
-            // W12 PR closes by routing all Sent advances through the
-            // lastChk evidence path.
-            let w12 = apply_w12_confirmation(
+            // **SentFresh source-context routing** (helper-internal):
+            //   - Acked → Envelope 1a + Envelope 2 → Advanced.
+            //   - StructuralDrift (NotFound/Mismatch) → Envelope
+            //     1c-drift-light audit + BootError::Internal per plan
+            //     §410.
+            //   - Hold (Transport/Server/Auth/Decode/empty-data_sign)
+            //     → Envelope 1c-hold-light audit + BootError::Internal
+            //     ("Commit 6 will project to HoldFnDrain").
+            let confirm_outcome = kvt2_confirm::confirm_drain_doc(
                 pool,
-                fiscal_number,
-                doc.document_id,
-                DocState::Sent,
-                &audit_payload,
-                None,
+                deps.dps,
+                doc,
+                &server_fiscal_no,
+                deps.fn_sign,
+                kvt2_confirm::Kvt2ConfirmSource::SentFresh,
+                Some(attempt_no.into()),
             )
             .await?;
-            summary.record_doc_advanced(&w12, false);
-            Ok(DocVerdict::Advanced)
+            match confirm_outcome {
+                kvt2_confirm::ConfirmDrainOutcome::Advanced => {
+                    summary.record_doc_advanced(
+                        &W12ConfirmOutcome::Acked {
+                            server_fiscal_no: server_fiscal_no.clone(),
+                        },
+                        /* via_lastchk_replay */ false,
+                    );
+                    Ok(DocVerdict::Advanced)
+                }
+            }
         }
         Ok(StageSendOutcome::Routed {
             decision,

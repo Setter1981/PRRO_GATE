@@ -492,7 +492,11 @@ async fn c5_kvt1_doc_w12_only_no_db_mutation_records_deferred() {
 // `HoldIndeterminate` for that input).
 
 #[tokio::test]
-async fn c5_error_retryable_doc_re_driven_via_stage_send_to_kvt1() {
+async fn c5_error_retryable_doc_re_driven_via_stage_send_to_ack_via_w12() {
+    // **M3b W12 Commit 4b.3 (2026-05-22)** — refactored from
+    // pre-W12 `c5_error_retryable_doc_re_driven_via_stage_send_to_kvt1`.
+    // ER → stage_send re-drive → Sent → confirm_drain_doc(SentFresh)
+    // → Envelope 1a + Envelope 2 → ACK (full W12 chain).
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool).await;
@@ -504,31 +508,54 @@ async fn c5_error_retryable_doc_re_driven_via_stage_send_to_kvt1() {
     // W9b ER-class-guard authorization gate: durable TransientRetry
     // last-attempt + attempts_used = 1 < MAX_BOOT_ATTEMPTS (5).
     seed_transport_trace_attempt(&pool, doc, 1, Some("TransientRetry")).await;
+    // W12 chain bootstrap — single doc.
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
 
-    let c = carriers(vec![Ok(ack("DPS-FN-RETRIED", vec![1, 2, 3]))], vec![]);
+    let c = carriers(
+        vec![Ok(ack("DPS-FN-RETRIED", vec![1, 2, 3]))],
+        vec![Ok(ack("DPS-FN-RETRIED", vec![0xAA; 32]))],
+    );
     let view = view_for(&c);
 
     let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
         .await
         .unwrap();
 
-    assert_eq!(summary.advanced_to_kvt1(), 1);
+    assert_eq!(
+        summary.advanced_to_ack(),
+        1,
+        "ER re-drive → W12 SentFresh chain → ACK"
+    );
+    assert_eq!(summary.advanced_to_kvt1(), 0, "no DeferredKvt1 post-W12");
     assert_eq!(
         summary.advanced_via_lastchk_replay(),
         0,
-        "no replay flag — wire re-drive, not lastChk replay"
+        "no replay flag — wire re-drive (SentFresh), not lastChk replay (SentReplay)"
     );
     assert_eq!(c.dps.send_chk_count(), 1, "stage_send re-drove the doc");
-    assert_eq!(c.dps.last_chk_count(), 0);
-    assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
+    assert_eq!(c.dps.last_chk_count(), 1, "confirm_drain_doc lastChk × 1");
+    assert_eq!(read_doc_state(&pool, doc).await, "ACK");
 
-    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_ADVANCED")
+    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED")
         .await
         .unwrap();
+    // from_state is the cohort-walker snapshot (ERROR_RETRYABLE) per
+    // plan §65-70 LOW-PR70-R12-02 cohort-entry convention.
     assert_eq!(payload["from_state"], "ERROR_RETRYABLE");
-    assert_eq!(payload["to_state"], "KVT1");
-    assert_eq!(payload["dispatch_via"], "stage_send");
-    assert_eq!(payload["replay_short_circuit"], false);
+    assert_eq!(payload["to_state"], "KVT2");
+    assert_eq!(payload["dispatch_via"], "kvt2_confirm");
+    assert_eq!(payload["evidence_source"], "lastChk");
 }
 
 // ─── W9b ER-class-guard 2026-05-22 negative-coverage matrix ──────────
@@ -935,6 +962,20 @@ async fn c5_walker_scope_excludes_online_cross_session_docs() {
         None,
     )
     .await;
+    // M3b W12 Commit 4b.3: chain seed for the offline doc (online
+    // doc not in cohort → no W12 prereqs needed).
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        offline_doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
 
     // Online SENT doc of same FN — fs_mode=ONLINE, offline_session_id
     // NULL.  MUST NOT appear in cohort.
@@ -972,7 +1013,10 @@ async fn c5_walker_scope_excludes_online_cross_session_docs() {
     .await
     .unwrap();
 
-    let c = carriers(vec![Ok(ack("DPS-OFFLINE", vec![0xCD]))], vec![]);
+    let c = carriers(
+        vec![Ok(ack("DPS-OFFLINE", vec![0xCD]))],
+        vec![Ok(ack("DPS-OFFLINE", vec![0xAA; 32]))],
+    );
     let view = view_for(&c);
 
     let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
@@ -985,10 +1029,16 @@ async fn c5_walker_scope_excludes_online_cross_session_docs() {
         1,
         "walker MUST filter by offline_session_id + fs_mode; online doc excluded"
     );
-    assert_eq!(summary.advanced_to_kvt1(), 1);
+    assert_eq!(
+        summary.advanced_to_ack(),
+        1,
+        "offline doc reaches Ack via W12 SentFresh chain"
+    );
+    assert_eq!(summary.advanced_to_kvt1(), 0, "no DeferredKvt1 post-W12");
     assert_eq!(c.dps.send_chk_count(), 1, "only offline doc reached wire");
-    assert_eq!(read_doc_state(&pool, offline_doc).await, "KVT1");
-    // Online doc untouched.
+    assert_eq!(c.dps.last_chk_count(), 1, "lastChk × 1 (offline doc only)");
+    assert_eq!(read_doc_state(&pool, offline_doc).await, "ACK");
+    // Online doc untouched (excluded from cohort by walker filter).
     assert_eq!(read_doc_state(&pool, online_doc).await, "SENT");
 }
 
