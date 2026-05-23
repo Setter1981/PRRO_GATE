@@ -45,6 +45,7 @@
 //! | Err(Authorization)         | Hold            | Hold                    | Hold            |
 //! | Err(Decode)                | Hold            | Hold                    | Hold            |
 
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use crate::app::BootError;
@@ -512,13 +513,27 @@ async fn commit_sent_fresh_envelope_1a(
     server_fiscal_no: &str,
     doc_state_for_audit: DocState,
 ) -> Result<(), BootError> {
+    // **MED-W12C4A-A fix (plan §62-65 pinned audit contract,
+    // 2026-05-22)**: SHA256 digest of the persisted Kvt1Raw evidence
+    // bytes — gives operator dashboards an audit-trail cross-link to
+    // the `document_files.Kvt1Raw` blob.  Computed BEFORE the move
+    // into `with_immediate` closure (kvt1_raw_bytes is consumed by
+    // the inner `document_files::replace_tx` call).  Matches existing
+    // audit-shape convention (cf. `stage_finalize.rs:338`
+    // `unsigned_xml_sha256_hex`).
+    let kvt1_raw_sha256_hex = format!("{:x}", Sha256::digest(&kvt1_raw_bytes));
     let payload = serde_json::json!({
         "document_id": id_hex,
         "from_state": doc_state_for_audit.as_str(),
         "to_state": DocState::Kvt2.as_str(),
         "server_fiscal_no": server_fiscal_no,
-        "dispatch_via": "w12_sent_fresh",
+        // **MED-W12C4A-E fix (plan §64 pinned literal, 2026-05-22)**:
+        // dispatch_via value aligned with plan-anchored
+        // `"kvt2_confirm"` (was `"w12_sent_fresh"` in 4a foundation —
+        // operator-dashboard filter mismatch).
+        "dispatch_via": "kvt2_confirm",
         "evidence_source": "lastChk",
+        "kvt1_raw_sha256_hex": kvt1_raw_sha256_hex,
     });
     let payload_owned = payload.to_string();
     let id_hex_owned = id_hex.to_string();
