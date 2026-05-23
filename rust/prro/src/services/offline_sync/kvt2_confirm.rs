@@ -779,14 +779,17 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
                      surfaces, Commit 1 routing has regressed."
                 )));
             }
-            // trace_attempt_no is i64 from the outcome variant; the
-            // 1c-post helper takes i32 (transport_trace native).
-            let trace_attempt_no_i32: i32 = trace_attempt_no.try_into().map_err(|_| {
-                BootError::Internal(format!(
-                    "confirm_drain_doc(SentReplay): SentNotFoundDowngrade trace_attempt_no \
-                     {trace_attempt_no} overflows i32 for doc {id_hex}"
-                ))
-            })?;
+            // **LOW-W12C5B1-B fix (5b.1 Δ4, 2026-05-23)**: use our own
+            // 1c-pre allocation (i32, infallible-narrow) instead of the
+            // outcome's i64 echo + try_into.  Symmetric з Acked/Drift/
+            // Hold arms (all already consume sent_replay_trace_attempt_no
+            // directly).  The destructured `trace_attempt_no` from the
+            // variant stays in scope for the non-SentReplay diagnostic
+            // above; intentionally unused on the SentReplay production
+            // path (the outcome merely echoes what we passed at line 545).
+            let _ = trace_attempt_no;
+            let trace_attempt_no_i32 = sent_replay_trace_attempt_no
+                .expect("SentReplay implies 1c-pre allocated trace_attempt_no");
             let wire_started = sent_replay_wire_started
                 .clone()
                 .expect("SentReplay implies wire_started captured");
@@ -1248,12 +1251,11 @@ fn iso8601_now() -> String {
 /// `boot_phase.rs:1521-1542` precedent: lastChk is a query, not a
 /// wire submit; there is no envelope payload to hash.
 ///
-/// **Commit 5b.1 status**: helper defined; consumer is the
-/// `confirm_drain_doc` SentReplay branch (also added in 5b.1) which
-/// has no production caller until 5b.2 wires
-/// `process_via_lastchk_replay`.  `#[allow(dead_code)]` за helper
-/// (chain dead until 5b.2 caller landing).
-#[allow(dead_code)]
+/// **Commit 5b.1 status**: consumed by `confirm_drain_doc` SentReplay
+/// branch (also added in 5b.1).  No production caller invokes the
+/// SentReplay branch until 5b.2 wires `process_via_lastchk_replay`,
+/// but the static call graph reaches this helper through the match
+/// arm so dead_code does not fire.
 async fn commit_sent_replay_envelope_1c_pre(
     pool: &SqlitePool,
     fiscal_number: &str,
@@ -1298,7 +1300,6 @@ async fn commit_sent_replay_envelope_1c_pre(
 /// `attempt_no` (caller's `sent_replay_trace_attempt_no` from
 /// 1c-pre allocation) feeds `transport_trace.complete_tx` —
 /// completes the row at the exact attempt allocated pre-DPS call.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)] // 9 args — symmetric з SentFresh 1a
 async fn commit_sent_replay_envelope_1a_replay(
     pool: &SqlitePool,
@@ -1424,7 +1425,6 @@ async fn commit_sent_replay_envelope_1a_replay(
 /// `retry_class=TransientRetry` enables next-tick `ErRedriveDecision::
 /// Redrive` per W9b guard contract (durable last-attempt retry_class
 /// must be TransientRetry + attempts_used < MAX_BOOT_ATTEMPTS).
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)] // 8 args — bundled envelope shape
 async fn commit_sent_replay_envelope_1c_post(
     pool: &SqlitePool,
@@ -1532,7 +1532,6 @@ async fn commit_sent_replay_envelope_1c_post(
 /// LastChkDataSignEmpty → RetryableServer.  `retry_class` is NOT
 /// set because doc state stays Sent (no ER cohort entry); next-tick
 /// SentReplay re-allocates a fresh recovery row.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)] // 8 args — bundled envelope shape
 async fn commit_sent_replay_envelope_1c_hold(
     pool: &SqlitePool,
@@ -1630,7 +1629,6 @@ async fn commit_sent_replay_envelope_1c_hold(
 /// `LastChkIdMismatch` (NotFoundOutsideSentReplay can NOT reach
 /// SentReplay by definition of routing matrix).  Caller propagates
 /// `BootError::Internal` after this envelope commits.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)] // 8 args — bundled envelope shape
 async fn commit_sent_replay_envelope_1c_drift(
     pool: &SqlitePool,
