@@ -1912,6 +1912,21 @@ async fn w12_kvt1_reentry_doc_without_server_fiscal_no_emits_drift_audit_and_hal
     assert_eq!(drift["source"], "kvt1_reentry");
     assert_eq!(drift["drift_reason"], "SERVER_FISCAL_NO_MISSING");
     assert_eq!(drift["dispatch_via"], "kvt2_confirm");
+    // **LOW-W12C5-Δ2-A fix (5 Δ3, 2026-05-22)**: lock per-variant
+    // contextual `drift_reason_detail` content for ServerFiscalNoMissing
+    // (OBS-W12C5-1 closure).  Future regression to `detail_message()`
+    // that wipes the message OR reverts to literal variant-name would
+    // be caught by this assertion.
+    let detail = drift["drift_reason_detail"]
+        .as_str()
+        .expect("drift_reason_detail must be a string");
+    assert!(
+        detail.contains("Kvt1 with NULL server_fiscal_no")
+            && detail.contains("stage_send 4-b stamp invariant breach"),
+        "OBS-W12C5-1: contextual detail message MUST describe the \
+         specific invariant breach (Kvt1 + NULL server_fiscal_no + \
+         stage_send 4-b stamp); got: {detail}"
+    );
 
     // No advance / hold audit on this caller-level structural drift.
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 0);
