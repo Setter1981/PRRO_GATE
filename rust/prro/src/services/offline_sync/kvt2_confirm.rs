@@ -221,6 +221,27 @@ impl Kvt2ConfirmStructuralReason {
             Self::NotFoundOutsideSentReplay { .. } => "NOT_FOUND_OUTSIDE_SENT_REPLAY",
         }
     }
+
+    /// **M3b W12 Commit 5 Δ2 (OBS-W12C5-1, 2026-05-22)** — human-
+    /// readable detail string for `drift_reason_detail` field в
+    /// `KVT2_CONFIRM_STRUCTURAL_DRIFT` audit payload.  Variants із
+    /// inner data fall back to `{self:?}` Debug rendering
+    /// (preserves observed/expected ids for operator triage of
+    /// `LastChkIdMismatch` etc).  Unit variants return contextual
+    /// description instead of literal variant-name (which would
+    /// duplicate `drift_reason` field — value-add zero).
+    pub fn detail_message(&self) -> String {
+        match self {
+            Self::ServerFiscalNoMissing => "doc state at Kvt1 with NULL \
+                 server_fiscal_no — stage_send 4-b stamp invariant \
+                 breach; persisted Sent advance MUST always stamp \
+                 server_fiscal_no before transitioning to Sent"
+                .to_string(),
+            // Variants із inner data: Debug renders observed +
+            // expected fields — preserves operator triage signal.
+            other => format!("{other:?}"),
+        }
+    }
 }
 
 /// Pure evidence-routing function.  Maps the
@@ -990,7 +1011,15 @@ pub(in crate::services::offline_sync) async fn commit_drift_envelope_1c_drift_li
         "document_id": id_hex,
         "source": source.audit_label(),
         "drift_reason": reason.audit_label(),
-        "drift_reason_detail": format!("{reason:?}"),
+        // **OBS-W12C5-1 fix (5 Δ2, 2026-05-22)**: per-variant
+        // `detail_message()` replaces flat `Debug` format —
+        // unit variants now carry contextual description
+        // (ServerFiscalNoMissing) instead of duplicating
+        // `drift_reason` field; data-bearing variants
+        // (LastChkIdMismatch / CasMissOnAdvance / NotFoundOutside
+        // SentReplay) fall back to Debug for observed/expected
+        // operator-triage signal preserved.
+        "drift_reason_detail": reason.detail_message(),
         "dispatch_via": "kvt2_confirm",
     });
     let payload_owned = payload.to_string();
