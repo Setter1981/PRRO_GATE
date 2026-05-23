@@ -13,21 +13,37 @@
 //!   envelope, emits `OFFLINE_DRAIN_STARTED` audit.
 //! - **Commit 4 (this file, [`drain`])** — per-doc loop: iterates the
 //!   backlog in strict `lnd ASC` order, invokes `stage_send::run`,
-//!   inlines the W12-stub `Sent → Kvt1` advance so `advanced_to_kvt1`,
-//!   the audit `to_state="KVT1"`, and the persisted DB state all stay
-//!   consistent.  Audits per-doc `_DOC_ADVANCED` / `_DOC_FAILED`.
-//!   Routes manual-recon-class failures on pending-drain shifts to
+//!   then routes Sent outcome through the W12 chain (see W12
+//!   subsection below).  Audits per-doc `OFFLINE_DRAIN_KVT2_ADVANCED`
+//!   (Envelope 1a) + `STAGE_FINALIZE_ACK` (Envelope 2) on Acked path;
+//!   `OFFLINE_DRAIN_DOC_FAILED` on stage_send failures.  Routes
+//!   manual-recon-class failures on pending-drain shifts to
 //!   `RequiresManualReconciliation` and halts the drain (per spec
 //!   amendment 2026-05-21 and `LEGAL_INVARIANTS.md` §INV-19).
 //!   Sibling-continue applies ONLY to per-doc failures on
-//!   non-pending-drain shifts.  **No lastChk pre-flight yet** (C5);
-//!   **no finalize branch yet** (C6).
+//!   non-pending-drain shifts.
 //! - **Commits 5-7** — widen walker to the unfinished cohort
-//!   (`OFFLINE_LOCAL_ACK | SENT | KVT1 | ERROR_RETRYABLE`; KVT2
-//!   deferred to W12 PR per MED-C5-4), add lastChk pre-flight,
-//!   extract the inline `Sent → Kvt1` into the
-//!   `apply_w12_confirmation` helper, add the finalization branch,
-//!   and add the App entry.
+//!   (`OFFLINE_LOCAL_ACK | SENT | KVT1 | ERROR_RETRYABLE | KVT2`
+//!   post W12 Commit 3), add lastChk pre-flight, add the
+//!   finalization branch, and add the App entry.
+//!
+//! ## M3b W12 wiring (2026-05-22)
+//!
+//! - **W12 Commit 3** widens drain cohort to include `KVT2` (post-
+//!   crash advance via `stage_finalize::run` per
+//!   `process_via_w12_kvt2_advance`).
+//! - **W12 Commit 4b** wires `process_via_stage_send` Sent branch to
+//!   `kvt2_confirm::confirm_drain_doc(SentFresh, ...)` —
+//!   Envelope 1a (Kvt1Raw + Sent→Kvt1 + Kvt1→Kvt2 + KVT2_ADVANCED
+//!   audit) + Envelope 2 (`stage_finalize::run` Kvt2→Ack).
+//!   Non-Acked outcomes emit `KVT2_CONFIRM_HOLD` (Warning) or
+//!   `KVT2_CONFIRM_STRUCTURAL_DRIFT` (Error) audit-only envelope
+//!   before `BootError::Internal` halt per plan §311 +
+//!   MED-PR70-R12-01.
+//! - **W12 Commits 5/5b/6 (pending)** — Kvt1Reentry source wiring,
+//!   SentReplay source wiring with `transport_trace` recovery row,
+//!   HoldFnDrain projection (replaces current Hold-path
+//!   `BootError::Internal` defensive marker).
 //!
 //! ## C4 known gaps (C5 blocker before "C4 approved")
 //!
@@ -574,9 +590,10 @@ pub(crate) const AUDIT_ENTITY_DOC: &str = "fiscal_document";
 /// `(AUDIT_ENTITY_DRAIN_FN, fiscal_number)`.
 ///
 /// Otherwise the summary carries `backlog_size_before = backlog.len()`
-/// and per-doc counters reflecting C4's actual processing: each
-/// successful wire send increments `advanced_to_kvt1` (via the inline
-/// W12 stub Sent→Kvt1 advance); each non-Sent outcome appends to
+/// and per-doc counters reflecting actual processing: post W12 Commit
+/// 4b each successful wire send + lastChk Acked converges through
+/// `confirm_drain_doc(SentFresh)` → Envelope 1a + Envelope 2 → Ack,
+/// incrementing `advanced_to_ack`; each non-Sent outcome appends to
 /// `per_doc_failures`.  On a pending-drain shift, the loop halts
 /// early on a manual-recon-class failure (see
 /// [`is_manual_recon_retry_class`]), transitions shift and the

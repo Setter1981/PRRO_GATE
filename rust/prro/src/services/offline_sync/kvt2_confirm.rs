@@ -353,22 +353,23 @@ pub async fn evaluate_lastchk(
 
 /// Drain-projected outcome of [`confirm_drain_doc`].
 ///
-/// **Commit 4 surface** wires only the `Advanced` variant (SentFresh
-/// happy path).  Commits 5 / 5b / 6 will extend this enum with `Hold`,
-/// `SentNotFoundDowngrade`, and source-specific projections per plan
-/// §"Helper vs caller envelope ownership".  Pre-Commit-6 callers
-/// observe non-Acked outcomes as [`BootError::Internal`] (defensive
-/// fail-loud until projection wiring lands).
+/// **Commit 4b production surface** wires only the `Advanced` variant
+/// (SentFresh happy path; `process_via_stage_send` consumer).  Commits
+/// 5 / 5b / 6 will extend this enum with `Hold` (HoldFnDrain
+/// projection), `SentNotFoundDowngrade` (SentReplay safe-redrive), and
+/// source-specific projections per plan §"Helper vs caller envelope
+/// ownership".  Pre-Commit-6 callers observe non-Acked outcomes as
+/// [`BootError::Internal`] (defensive fail-loud until HoldFnDrain
+/// projection wiring lands in Commit 6).
 ///
-/// **M3b W12 Commit 4a status (2026-05-22)**: foundation-only landing
-/// — helper has NO production consumer yet (4a = library surface +
-/// `#[cfg(test)]` proof only).  Commit 4b will wire the consumer at
-/// `process_via_stage_send` and rebuild the pre-W12 stub-locking tests
-/// against the new ACK-era acceptance shape.  Until 4b lands, `dead_
-/// code` is expected — `#[allow(dead_code)]` on this enum + on
-/// `confirm_drain_doc` + on the Envelope 1a writer is the explicit
-/// "not-yet-wired" marker.
-#[allow(dead_code)]
+/// **M3b W12 Commit 4b status (2026-05-22)**: production-wired for
+/// SentFresh source via `process_via_stage_send` Sent branch.  Hold
+/// and StructuralDrift contexts emit forensic audit envelopes
+/// (`KVT2_CONFIRM_HOLD` / `KVT2_CONFIRM_STRUCTURAL_DRIFT`) BEFORE
+/// `BootError::Internal` halt per plan §311 MED-PR70-R12-01.
+/// Kvt1Reentry / SentReplay sources are scope-guarded at
+/// `confirm_drain_doc` entry and return `BootError::Internal` until
+/// Commits 5/5b land their Envelope 1b / 1c-pre chains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmDrainOutcome {
     /// Envelope 1a (Kvt1Raw persist + Sent→Kvt1 CAS + Kvt1→Kvt2 CAS +
@@ -434,14 +435,13 @@ pub enum ConfirmDrainOutcome {
 /// Envelope 1a is pool-only; Envelope 2 is owned by `stage_finalize::run`
 /// per M3a W8 contract.  No nested envelopes.
 ///
-/// **Commit 4a status**: this fn is defined but has no production
-/// consumer yet (foundation-only checkpoint per split 4a/4b).
-/// `process_via_stage_send` still routes through the pre-W12
-/// `apply_w12_confirmation` stub.  Commit 4b will replace that
-/// call site with `confirm_drain_doc(SentFresh, ...)` and rebuild
-/// the 9 pre-W12 stub-locking tests against the W12 ACK-era
-/// acceptance shape (per plan §410).  `#[allow(dead_code)]` is the
-/// explicit "not-yet-wired" marker — remove in 4b.
+/// **M3b W12 Commit 4b status (2026-05-22)**: production-wired for
+/// SentFresh via `process_via_stage_send` Sent branch (replaced
+/// pre-W12 `apply_w12_confirmation` call site).  Visibility narrowed
+/// to `pub(in crate::services::offline_sync)` — restricts call sites
+/// to sibling modules under `offline_sync`.  Kvt1Reentry / SentReplay
+/// scope-guarded at entry until Commits 5 / 5b land their source-
+/// specific envelope chains (Envelope 1b / 1c-pre).
 pub(in crate::services::offline_sync) async fn confirm_drain_doc(
     pool: &SqlitePool,
     dps: &dyn DpsChannel,
@@ -605,10 +605,8 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
 /// — stage_send::run advanced through Sending→Sent in its own
 /// envelope; this audit shows the user-visible "from" state).
 ///
-/// **Commit 4a status**: invoked only by `confirm_drain_doc`, which
-/// itself has no production consumer in 4a.  `#[allow(dead_code)]`
-/// is the "not-yet-wired" marker; remove in Commit 4b once
-/// `process_via_stage_send` wires `confirm_drain_doc(SentFresh, ...)`.
+/// **Commit 4b status**: production-consumed via `confirm_drain_doc`
+/// (which is itself called from `process_via_stage_send` Sent branch).
 #[allow(clippy::too_many_arguments)] // 8 args — caller has all
                                      // context pre-bound; bundling
                                      // into a struct would obscure
@@ -737,10 +735,11 @@ async fn commit_sent_fresh_envelope_1a(
 /// (in 4b.1 helper still returns `BootError::Internal` defensive
 /// marker until Commit 6 lands `HoldFnDrain` projection).
 ///
-/// **Commit 4b.1 status**: helper still has no production consumer;
-/// `#[allow(dead_code)]` removed in Commit 4b.2 when
-/// `process_via_stage_send` wires `confirm_drain_doc(SentFresh, ...)`.
-#[allow(dead_code)]
+/// **Commit 4b status**: production-consumed via `confirm_drain_doc`
+/// Hold arm; emits forensic KVT2_CONFIRM_HOLD audit BEFORE caller
+/// observes `BootError::Internal` defensive marker.  HoldFnDrain
+/// projection (post Commit 6) will replace that marker with
+/// `DocVerdict::HoldFnDrain { HeldAtSent | HeldAtKvt1 }`.
 async fn commit_hold_envelope_1c_hold_light(
     pool: &SqlitePool,
     fiscal_number: &str,
@@ -748,21 +747,24 @@ async fn commit_hold_envelope_1c_hold_light(
     source: Kvt2ConfirmSource,
     reason: &Kvt2ConfirmHoldReason,
 ) -> Result<(), BootError> {
-    // **LOW-W12C4B1-B defensive guard (2026-05-22)**: SentReplay
-    // uses its own bundled Envelope 1c-hold (trace.complete + audit)
-    // per plan §311 — this light variant is for SentFresh / Kvt1Reentry
-    // ONLY.  Routing a SentReplay outcome through here would silently
-    // skip the recovery-trace completion → forensic gap.  Today
-    // structurally safe via `confirm_drain_doc:396` scope guard, but
-    // Commits 5/5b/6 will lift that guard.  `debug_assert!` catches
-    // routing regressions at dev/CI time without runtime cost in
-    // release builds.
-    debug_assert!(
-        !matches!(source, Kvt2ConfirmSource::SentReplay),
-        "commit_hold_envelope_1c_hold_light: SentReplay must use bundled \
-         Envelope 1c-hold with trace.complete (Commit 5b scope); routing \
-         bug if SentReplay reaches the light variant",
-    );
+    // **LOW-W12C4B-03 fix (4b.3 Δ2, 2026-05-22)**: runtime guard
+    // (not debug-only) — when Commits 5/5b/6 lift the SentFresh-only
+    // scope guard at `confirm_drain_doc` entry, a routing bug that
+    // sends SentReplay outcome through this light helper would
+    // silently skip the recovery `transport_trace.complete_tx` row →
+    // forensic gap.  Runtime `BootError::Internal` catches the
+    // regression in release builds (not just dev/CI), and the audit
+    // row is NOT emitted (which is correct — the bundled 1c-hold
+    // envelope is the authoritative emission site for SentReplay).
+    if matches!(source, Kvt2ConfirmSource::SentReplay) {
+        return Err(BootError::Internal(format!(
+            "commit_hold_envelope_1c_hold_light: SentReplay routed to \
+             light variant for doc {id_hex} — SentReplay MUST use bundled \
+             Envelope 1c-hold (trace.complete + audit, Commit 5b scope).  \
+             Refusing to emit audit without trace.complete to avoid \
+             forensic gap."
+        )));
+    }
     let payload = serde_json::json!({
         "document_id": id_hex,
         "source": source.audit_label(),
@@ -811,9 +813,9 @@ async fn commit_hold_envelope_1c_hold_light(
 /// signals state-machine invariant breach that halts FN drain — more
 /// severe than recoverable Hold.
 ///
-/// **Commit 4b.1 status**: helper still has no production consumer;
-/// `#[allow(dead_code)]` removed in Commit 4b.2.
-#[allow(dead_code)]
+/// **Commit 4b status**: production-consumed via `confirm_drain_doc`
+/// StructuralDrift arm; emits forensic KVT2_CONFIRM_STRUCTURAL_DRIFT
+/// audit BEFORE caller propagates `BootError::Internal` fail-loud.
 async fn commit_drift_envelope_1c_drift_light(
     pool: &SqlitePool,
     fiscal_number: &str,
@@ -821,19 +823,24 @@ async fn commit_drift_envelope_1c_drift_light(
     source: Kvt2ConfirmSource,
     reason: &Kvt2ConfirmStructuralReason,
 ) -> Result<(), BootError> {
-    // **LOW-W12C4B1-B defensive guard (2026-05-22)**: see
-    // `commit_hold_envelope_1c_hold_light` for full rationale.
-    // SentReplay uses bundled Envelope 1c-drift (trace.complete +
-    // audit) per plan §311 / §220-234 — this light variant is for
-    // SentFresh / Kvt1Reentry ONLY.  `debug_assert!` catches future
-    // routing regressions when Commits 5/5b/6 lift the
-    // `confirm_drain_doc:396` SentFresh-only scope guard.
-    debug_assert!(
-        !matches!(source, Kvt2ConfirmSource::SentReplay),
-        "commit_drift_envelope_1c_drift_light: SentReplay must use bundled \
-         Envelope 1c-drift with trace.complete (Commit 5b scope); routing \
-         bug if SentReplay reaches the light variant",
-    );
+    // **LOW-W12C4B-03 fix (4b.3 Δ2, 2026-05-22)**: runtime guard
+    // (not debug-only) — same rationale as
+    // `commit_hold_envelope_1c_hold_light`.  When Commits 5/5b/6 lift
+    // the SentFresh-only scope guard at `confirm_drain_doc` entry, a
+    // routing bug that sends SentReplay outcome through this light
+    // helper would silently skip the recovery `transport_trace.
+    // complete_tx` row.  Runtime `BootError::Internal` catches the
+    // regression in release builds; audit row NOT emitted (bundled
+    // 1c-drift envelope is authoritative emission site for SentReplay).
+    if matches!(source, Kvt2ConfirmSource::SentReplay) {
+        return Err(BootError::Internal(format!(
+            "commit_drift_envelope_1c_drift_light: SentReplay routed to \
+             light variant for doc {id_hex} — SentReplay MUST use bundled \
+             Envelope 1c-drift (trace.complete + audit, Commit 5b scope).  \
+             Refusing to emit audit without trace.complete to avoid \
+             forensic gap."
+        )));
+    }
     let payload = serde_json::json!({
         "document_id": id_hex,
         "source": source.audit_label(),
