@@ -1,32 +1,43 @@
 //! W9b Commit 4 — `backlog_drain::drain` per-doc loop + Manual-
 //! escalation on pending-drain shift reject.
 //!
+//! **M3b W12 Commit 4b.3 update (2026-05-22)**: W9b C4 inline
+//! `Sent → Kvt1` stub replaced by W12 SentFresh chain
+//! (`process_via_stage_send` → `kvt2_confirm::confirm_drain_doc(
+//! SentFresh, ...)` → Envelope 1a + Envelope 2 → ACK).  The 6
+//! pre-W12 c4_* stub-locking fixtures were refactored to W12
+//! ACK-era assertions; 3 new `w12_sent_fresh_*` integration
+//! fixtures added (NotFound→Drift / Mismatch→Drift / Transport→Hold).
+//!
 //! Acceptance:
 //!   - Spec §2.3 Step B + §2.5: invoke `stage_send::run` per doc in
-//!     strict `lnd ASC`; route outcomes via private helpers; audit
-//!     `OFFLINE_DRAIN_DOC_ADVANCED` / `_DOC_FAILED`.
-//!   - Spec amendment 2026-05-21 (C4 senior review): inline
-//!     `Sent → Kvt1` via W12 stub so DB state, counters, and audit
-//!     all say KVT1 in C4 isolation.  Sibling-continue applies
-//!     ONLY to non-pending-drain shifts; pending-drain reject
-//!     halts the drain + transitions shift to
-//!     `RequiresManualReconciliation` per `LEGAL_INVARIANTS.md`
-//!     §INV-19 + `m3b-shift-state-expansion.md` §6.3.
+//!     strict `lnd ASC`; route outcomes via private helpers.  Post
+//!     W12: success path emits `OFFLINE_DRAIN_KVT2_ADVANCED` +
+//!     `STAGE_FINALIZE_ACK` (Envelope 1a + Envelope 2); pre-W12
+//!     `OFFLINE_DRAIN_DOC_ADVANCED` no longer fires from SentFresh
+//!     path.  `OFFLINE_DRAIN_DOC_FAILED` unchanged for stage_send
+//!     failure paths.  Sibling-continue applies ONLY to
+//!     non-pending-drain shifts; pending-drain reject halts the
+//!     drain + transitions shift to `RequiresManualReconciliation`
+//!     per `LEGAL_INVARIANTS.md` §INV-19 +
+//!     `m3b-shift-state-expansion.md` §6.3.
+//!   - W12 SentFresh non-Acked paths emit `KVT2_CONFIRM_HOLD`
+//!     (Severity::Warning) or `KVT2_CONFIRM_STRUCTURAL_DRIFT`
+//!     (Severity::Error) audit-only envelope BEFORE BootError::
+//!     Internal fail-loud per plan §311 MED-PR70-R12-01.
 //!
-//! **C5 blocker** (deferred from C4): SENT rediscovery on restart —
-//! the walker is OFFLINE_LOCAL_ACK-only here; C5 widens it to
-//! `OFFLINE_LOCAL_ACK | SENT | KVT1 | KVT2` for restart-safe drain.
-//! See module-doc on `backlog_drain.rs` for the full known-gaps list.
+//! Tests (10):
 //!
-//! Tests (7):
-//!
-//!   1. `c4_happy_path_two_docs_advance_to_kvt1_and_emit_doc_advanced`
+//!   1. `c4_happy_path_two_docs_advance_to_ack_via_w12` (renamed)
 //!   2. `c4_routed_terminal_reject_records_wire_routing_failure_class`
 //!   3. `c4_signer_refused_records_signer_refused_class_and_sibling_continues`
 //!   4. `c4_processes_backlog_in_lnd_asc_order`
 //!   5. `c4_accounting_advanced_plus_failures_equals_backlog`
 //!   6. `c4_pending_drain_shift_reject_halts_and_transitions_shift_to_manual`
 //!   7. `c4_pending_drain_shift_transient_retry_sibling_continues_no_halt`
+//!   8. `w12_sent_fresh_not_found_emits_drift_audit_and_halts_via_boot_error`
+//!   9. `w12_sent_fresh_mismatch_emits_drift_audit_and_halts_via_boot_error`
+//!  10. `w12_sent_fresh_dps_transport_emits_hold_audit_and_halts_via_boot_error`
 
 mod common;
 
@@ -39,6 +50,7 @@ use prro::services::reconciliation::runtime::RuntimeView;
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::dto::{CheckAck, CheckSignBlob};
 use prro::transports::dps::error::{AuthorizationKind, DpsError};
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -442,8 +454,19 @@ async fn c4_happy_path_two_docs_advance_to_ack_via_w12() {
     assert_eq!(advanced_payloads[0]["dispatch_via"], "kvt2_confirm");
     assert_eq!(advanced_payloads[0]["evidence_source"], "lastChk");
     assert_eq!(advanced_payloads[0]["server_fiscal_no"], "DPS-FN-A");
-    assert!(advanced_payloads[0]["kvt1_raw_sha256_hex"].is_string());
-    assert!(advanced_payloads[0]["attempt_no"].is_number());
+    // **LOW-W12C4B3-B fix (4b.3 Δ, 2026-05-22)**: assert digest
+    // value matches actual `kvt1_raw_bytes_for("DPS-FN-A")` bytes
+    // rather than just `is_string()` presence check.  Locks the
+    // plan-pinned MED-W12C4A-A audit-digest contract end-to-end
+    // (computation algorithm + byte ordering + hex format).
+    let expected_a_hex = format!("{:x}", Sha256::digest(kvt1_raw_bytes_for("DPS-FN-A")));
+    let expected_b_hex = format!("{:x}", Sha256::digest(kvt1_raw_bytes_for("DPS-FN-B")));
+    assert_eq!(advanced_payloads[0]["kvt1_raw_sha256_hex"], expected_a_hex);
+    assert_eq!(advanced_payloads[1]["kvt1_raw_sha256_hex"], expected_b_hex);
+    // attempt_no = 1 (first stage_send wire attempt per
+    // mark_submission_attempted_tx counter contract).
+    assert_eq!(advanced_payloads[0]["attempt_no"], 1);
+    assert_eq!(advanced_payloads[1]["attempt_no"], 1);
 }
 
 // ─── Test 2: routed terminal reject ──────────────────────────────────
