@@ -1101,6 +1101,16 @@ async fn process_via_stage_send(
             // Sending → Sent inside stage_send's 4-b envelope.  The
             // audit `from_state` reflects the drain-loop ENTRY state
             // (pre-stage_send), not the inner Sending intermediate.
+            //
+            // **M3b W12 Commit 4a status (2026-05-22)**: this is the
+            // pre-W12 stub call site.  Commit 4a (foundation-only)
+            // lands `kvt2_confirm::confirm_drain_doc` helper +
+            // `StubDpsChannel::with_last_chk_queue` test extension
+            // WITHOUT changing this call site.  Commit 4b will
+            // replace this `apply_w12_confirmation` call with
+            // `kvt2_confirm::confirm_drain_doc(SentFresh, &outcome.
+            // server_fiscal_no, ...)` per plan §410 + refactor the 9
+            // pre-W12 stub-locking tests to W12-era ACK assertions.
             let audit_payload = serde_json::json!({
                 "document_id": id_hex,
                 "from_state": doc.state.as_str(),

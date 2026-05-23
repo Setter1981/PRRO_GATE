@@ -45,7 +45,16 @@
 //! | Err(Authorization)         | Hold            | Hold                    | Hold            |
 //! | Err(Decode)                | Hold            | Hold                    | Hold            |
 
-use crate::db::models::enums::DocState;
+use sqlx::SqlitePool;
+
+use crate::app::BootError;
+use crate::db::models::enums::{DocState, Severity};
+use crate::db::models::ids::DocumentId;
+use crate::db::repositories::fiscal_documents::TransitionOutcome;
+use crate::db::repositories::{audit_log, document_files, fiscal_documents};
+use crate::db::tx::with_immediate;
+use crate::services::write_path::stage_finalize;
+use crate::services::write_path::types::hex_encode_lower;
 use crate::transports::dps::channel::DpsChannel;
 use crate::transports::dps::dto::{CheckAck, CheckSignBlob};
 use crate::transports::dps::error::DpsError;
@@ -285,6 +294,291 @@ pub async fn evaluate_lastchk(
         .by_server_fiscal_no(fn_sign, expected_server_fiscal_no)
         .await;
     classify_check_result(result, source, sent_replay_trace_attempt_no)
+}
+
+// ─── M3b W12 Commit 4 — confirm_drain_doc + Envelope 1a ─────────────
+
+/// Drain-projected outcome of [`confirm_drain_doc`].
+///
+/// **Commit 4 surface** wires only the `Advanced` variant (SentFresh
+/// happy path).  Commits 5 / 5b / 6 will extend this enum with `Hold`,
+/// `SentNotFoundDowngrade`, and source-specific projections per plan
+/// §"Helper vs caller envelope ownership".  Pre-Commit-6 callers
+/// observe non-Acked outcomes as [`BootError::Internal`] (defensive
+/// fail-loud until projection wiring lands).
+///
+/// **M3b W12 Commit 4a status (2026-05-22)**: foundation-only landing
+/// — helper has NO production consumer yet (4a = library surface +
+/// `#[cfg(test)]` proof only).  Commit 4b will wire the consumer at
+/// `process_via_stage_send` and rebuild the pre-W12 stub-locking tests
+/// against the new ACK-era acceptance shape.  Until 4b lands, `dead_
+/// code` is expected — `#[allow(dead_code)]` on this enum + on
+/// `confirm_drain_doc` + on the Envelope 1a writer is the explicit
+/// "not-yet-wired" marker.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmDrainOutcome {
+    /// Envelope 1a (Kvt1Raw persist + Sent→Kvt1 CAS + Kvt1→Kvt2 CAS +
+    /// `OFFLINE_DRAIN_KVT2_ADVANCED` audit) committed atomically;
+    /// Envelope 2 (`stage_finalize::run` Kvt2→Ack) committed.  Doc is
+    /// now in terminal `Ack` state.  Caller updates `DrainSummary`
+    /// with the Acked outcome.
+    Advanced,
+}
+
+/// W12 high-level helper — orchestrates the full Sent-source W12
+/// confirmation chain per plan §410 (Commit 4 wiring scope).
+///
+/// **Source-context support matrix**:
+/// - [`Kvt2ConfirmSource::SentFresh`] → **WIRED** (this commit).
+///   Caller = `process_via_stage_send` after `StageSendOutcome::Sent`.
+///   `expected_server_fiscal_no` MUST be sourced from the
+///   `StageSendOutcome::Sent` variant (`&outcome.server_fiscal_no`),
+///   NOT from the pre-stage_send cohort snapshot `doc.server_fiscal_no`
+///   (which is `None` at cohort SELECT time per stage_send 4-b
+///   invariant — MED-PR70-R11-01 handoff).
+/// - [`Kvt2ConfirmSource::Kvt1Reentry`] → deferred to Commit 5
+///   (`process_via_w12_only` rewrite, Envelope 1b chain).
+/// - [`Kvt2ConfirmSource::SentReplay`] → deferred to Commit 5b
+///   (`process_via_lastchk_replay` rewrite, Envelope 1c-pre / 1a-replay
+///   / 1c-post / 1c-hold / 1c-drift chain).
+///
+/// **SentFresh happy path** (Commit 4):
+///
+/// 1. Call `evaluate_lastchk(dps, fn_sign, expected_id, SentFresh,
+///    sent_replay_trace_attempt_no=None)` — DPS call sits OUTSIDE
+///    `with_immediate` per I1.
+/// 2. On `Kvt2ConfirmOutcome::Acked { kvt1_raw_bytes, .. }` commit
+///    Envelope 1a atomically in ONE `with_immediate`: (a)
+///    `document_files::replace_tx(Kvt1Raw)` persists `ack.data_sign`
+///    byte-for-byte (HIGH-C5-2 forensic contract); (b) CAS
+///    `Sent → Kvt1` (must produce `TransitionOutcome::Applied`; else
+///    structural drift); (c) CAS `Kvt1 → Kvt2` (must produce Applied;
+///    else structural drift); (d) `OFFLINE_DRAIN_KVT2_ADVANCED` audit
+///    append.
+/// 3. Then sequentially run Envelope 2: `stage_finalize::run(pool,
+///    doc_id)` converges `Kvt2 → Ack` via M3a's own 5-write atomic
+///    envelope.  Returned `Acked`/`AlreadyAcked` → `Advanced`; other
+///    outcomes surface as `BootError`.  Returns
+///    `Ok(ConfirmDrainOutcome::Advanced)`.
+///
+/// **Non-Acked outcomes (SentFresh)**:
+/// - [`Kvt2ConfirmOutcome::StructuralDrift`] →
+///   [`BootError::Internal`] per plan §410 (NotFound/Mismatch from
+///   SentFresh = state-machine drift, NOT safe-redrive).
+/// - [`Kvt2ConfirmOutcome::Hold`] → [`BootError::Internal`]
+///   ("Commit 6 not yet wired" — Commit 6 will project to
+///   `DocVerdict::HoldFnDrain { projection: HeldAtSent }`).
+/// - [`Kvt2ConfirmOutcome::SentNotFoundDowngrade`] →
+///   [`BootError::Internal`] (structurally unreachable for SentFresh
+///   per `classify_check_result` routing matrix; defensive fail-loud
+///   if it ever does fire = Commit 1 routing bug).
+///
+/// **I1 preserved**: the DPS call is OUTSIDE any `with_immediate`;
+/// Envelope 1a is pool-only; Envelope 2 is owned by `stage_finalize::run`
+/// per M3a W8 contract.  No nested envelopes.
+///
+/// **Commit 4a status**: this fn is defined but has no production
+/// consumer yet (foundation-only checkpoint per split 4a/4b).
+/// `process_via_stage_send` still routes through the pre-W12
+/// `apply_w12_confirmation` stub.  Commit 4b will replace that
+/// call site with `confirm_drain_doc(SentFresh, ...)` and rebuild
+/// the 9 pre-W12 stub-locking tests against the W12 ACK-era
+/// acceptance shape (per plan §410).  `#[allow(dead_code)]` is the
+/// explicit "not-yet-wired" marker — remove in 4b.
+#[allow(dead_code)]
+pub async fn confirm_drain_doc(
+    pool: &SqlitePool,
+    dps: &dyn DpsChannel,
+    doc: &fiscal_documents::DocumentRow,
+    expected_server_fiscal_no: &str,
+    fn_sign: &CheckSignBlob,
+    source: Kvt2ConfirmSource,
+) -> Result<ConfirmDrainOutcome, BootError> {
+    // Commit 4 scope guard — Kvt1Reentry / SentReplay deferred.
+    if !matches!(source, Kvt2ConfirmSource::SentFresh) {
+        return Err(BootError::Internal(format!(
+            "confirm_drain_doc: source {source:?} not yet wired (Commit 4 \
+             = SentFresh only; Kvt1Reentry/SentReplay land in Commits 5/5b)"
+        )));
+    }
+    let outcome = evaluate_lastchk(
+        dps,
+        fn_sign,
+        expected_server_fiscal_no,
+        source,
+        /* sent_replay_trace_attempt_no */ None,
+    )
+    .await;
+    let doc_id = doc.document_id;
+    let id_hex = hex_encode_lower(doc.document_id.as_bytes());
+    let fiscal_number = doc.fiscal_number.clone();
+    match outcome {
+        Kvt2ConfirmOutcome::Acked { kvt1_raw_bytes, .. } => {
+            commit_sent_fresh_envelope_1a(
+                pool,
+                &fiscal_number,
+                doc_id,
+                &id_hex,
+                kvt1_raw_bytes,
+                expected_server_fiscal_no,
+                doc.state,
+            )
+            .await?;
+            // Envelope 2: M3a stage_finalize::run owns its 5-write
+            // atomic envelope (Kvt2→Ack + chain seed + inbox DONE +
+            // outbox + STAGE_FINALIZE_ACK).  Acked/AlreadyAcked are
+            // both success-shapes for W12.
+            let finalize_outcome = stage_finalize::run(pool, doc_id).await.map_err(|source| {
+                BootError::ReconciliationFailed {
+                    fiscal_number: fiscal_number.clone(),
+                    source: anyhow::Error::new(source),
+                }
+            })?;
+            match finalize_outcome {
+                stage_finalize::StageFinalizeOutcome::Acked { .. }
+                | stage_finalize::StageFinalizeOutcome::AlreadyAcked => {
+                    Ok(ConfirmDrainOutcome::Advanced)
+                }
+                stage_finalize::StageFinalizeOutcome::StateConflict { observed } => {
+                    Err(BootError::Internal(format!(
+                        "confirm_drain_doc(SentFresh): stage_finalize::run \
+                         StateConflict {{ observed: {observed} }} for doc \
+                         {id_hex} — concurrent writer past App reconcile mutex \
+                         (Envelope 1a CAS Kvt1→Kvt2 just committed; another \
+                         writer must have rolled state forward to Ack/etc \
+                         between Envelope 1a commit and Envelope 2 read)",
+                        observed = observed.as_str(),
+                    )))
+                }
+                stage_finalize::StageFinalizeOutcome::DocumentMissing => {
+                    Err(BootError::Internal(format!(
+                        "confirm_drain_doc(SentFresh): stage_finalize::run \
+                         DocumentMissing for doc {id_hex} — row deleted between \
+                         Envelope 1a commit and Envelope 2 read (cannot happen \
+                         under single-writer App reconcile mutex)"
+                    )))
+                }
+            }
+        }
+        Kvt2ConfirmOutcome::StructuralDrift { reason, .. } => Err(BootError::Internal(format!(
+            "confirm_drain_doc(SentFresh): structural drift for doc {id_hex} \
+             — {reason:?}.  NotFound/Mismatch from SentFresh context indicates \
+             state-machine drift (server_fiscal_no just stamped by stage_send \
+             4-b but DPS does not recognize it).  Halts FN drain per plan §410."
+        ))),
+        Kvt2ConfirmOutcome::Hold { reason, .. } => Err(BootError::Internal(format!(
+            "confirm_drain_doc(SentFresh): Hold path not yet wired for doc \
+             {id_hex} — reason={reason:?}.  Commit 6 will project to \
+             DocVerdict::HoldFnDrain {{ projection: HeldAtSent }}."
+        ))),
+        Kvt2ConfirmOutcome::SentNotFoundDowngrade { trace_attempt_no } => {
+            Err(BootError::Internal(format!(
+                "confirm_drain_doc(SentFresh): SentNotFoundDowngrade(attempt_no={trace_attempt_no}) \
+                 is structurally unreachable for SentFresh per Commit 1 \
+                 classify_check_result routing — NotFound + SentFresh must \
+                 route to StructuralDrift::NotFoundOutsideSentReplay.  If \
+                 this surfaces, Commit 1 routing has regressed."
+            )))
+        }
+    }
+}
+
+/// Envelope 1a (Commit 4) — atomic Sent→Kvt1 + Kvt1→Kvt2 + Kvt1Raw
+/// persist + audit in ONE `with_immediate`.  Caller (`confirm_drain_doc`)
+/// has already verified the source is `SentFresh` + outcome is `Acked`
+/// + has the canonical `kvt1_raw_bytes` evidence in hand.
+///
+/// `doc_state_for_audit` is the cohort-walker snapshot state at drain
+/// loop entry (OfflineLocalAck / ErrorRetryable for the SentFresh path
+/// — stage_send::run advanced through Sending→Sent in its own
+/// envelope; this audit shows the user-visible "from" state).
+///
+/// **Commit 4a status**: invoked only by `confirm_drain_doc`, which
+/// itself has no production consumer in 4a.  `#[allow(dead_code)]`
+/// is the "not-yet-wired" marker; remove in Commit 4b once
+/// `process_via_stage_send` wires `confirm_drain_doc(SentFresh, ...)`.
+#[allow(dead_code)]
+async fn commit_sent_fresh_envelope_1a(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    doc_id: DocumentId,
+    id_hex: &str,
+    kvt1_raw_bytes: Vec<u8>,
+    server_fiscal_no: &str,
+    doc_state_for_audit: DocState,
+) -> Result<(), BootError> {
+    let payload = serde_json::json!({
+        "document_id": id_hex,
+        "from_state": doc_state_for_audit.as_str(),
+        "to_state": DocState::Kvt2.as_str(),
+        "server_fiscal_no": server_fiscal_no,
+        "dispatch_via": "w12_sent_fresh",
+        "evidence_source": "lastChk",
+    });
+    let payload_owned = payload.to_string();
+    let id_hex_owned = id_hex.to_string();
+    let fn_owned = fiscal_number.to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // (a) Persist Kvt1Raw evidence byte-for-byte.
+            document_files::replace_tx(
+                tx,
+                doc_id,
+                document_files::DocumentFileKind::Kvt1Raw,
+                &kvt1_raw_bytes,
+            )
+            .await?;
+            // (b) CAS Sent → Kvt1.  stage_send::run committed
+            // OfflineLocalAck/ErrorRetryable → Sending → Sent inside
+            // its own envelope earlier this tick; we observe Sent here.
+            let sent_to_kvt1 =
+                fiscal_documents::transition_state(tx, doc_id, DocState::Sent, DocState::Kvt1)
+                    .await?;
+            if sent_to_kvt1 != TransitionOutcome::Applied {
+                return Err(anyhow::anyhow!(
+                    "backlog_drain({fn_id}): Envelope 1a CAS Sent→Kvt1 produced \
+                     {outcome:?} for doc {doc_hex} (single-writer invariant \
+                     breach — App reconcile mutex should prevent races)",
+                    fn_id = fn_owned,
+                    outcome = sent_to_kvt1,
+                    doc_hex = id_hex_owned,
+                ));
+            }
+            // (c) CAS Kvt1 → Kvt2.  W12 advance proof now persisted.
+            let kvt1_to_kvt2 =
+                fiscal_documents::transition_state(tx, doc_id, DocState::Kvt1, DocState::Kvt2)
+                    .await?;
+            if kvt1_to_kvt2 != TransitionOutcome::Applied {
+                return Err(anyhow::anyhow!(
+                    "backlog_drain({fn_id}): Envelope 1a CAS Kvt1→Kvt2 produced \
+                     {outcome:?} for doc {doc_hex} (just CAS'd to Kvt1 in same \
+                     envelope — concurrent writer impossible)",
+                    fn_id = fn_owned,
+                    outcome = kvt1_to_kvt2,
+                    doc_hex = id_hex_owned,
+                ));
+            }
+            // (d) Forensic audit row.
+            audit_log::append_tx(
+                tx,
+                "fiscal_document",
+                &id_hex_owned,
+                "OFFLINE_DRAIN_KVT2_ADVANCED",
+                Severity::Info,
+                None,
+                Some(&payload_owned),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(|source| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source,
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]

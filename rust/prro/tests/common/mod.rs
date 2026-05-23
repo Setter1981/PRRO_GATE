@@ -80,6 +80,15 @@ pub struct StubDpsChannel {
     responses: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
     send_chk_calls: AtomicUsize,
     on_send_chk: Option<Box<dyn Fn() + Send + Sync>>,
+    /// M3b W12 Commit 4 (2026-05-22) — `lastChk` response queue.
+    /// `evaluate_lastchk` (via `by_server_fiscal_no` default impl)
+    /// calls `self.last_chk(fn_sign)` to fetch DPS evidence.  Pre-W12
+    /// drain code did not exercise `last_chk`; Commit 4 wires the
+    /// Sent-source path (OFFLINE_LOCAL_ACK / ER → stage_send Sent →
+    /// confirm_drain_doc → lastChk).  Tests that exercise the
+    /// happy-path Acked chain must enqueue at least one response here.
+    last_chk_responses: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
+    last_chk_calls: AtomicUsize,
 }
 
 impl StubDpsChannel {
@@ -90,6 +99,8 @@ impl StubDpsChannel {
             responses: Mutex::new(q),
             send_chk_calls: AtomicUsize::new(0),
             on_send_chk: None,
+            last_chk_responses: Mutex::new(VecDeque::new()),
+            last_chk_calls: AtomicUsize::new(0),
         }
     }
 
@@ -98,6 +109,8 @@ impl StubDpsChannel {
             responses: Mutex::new(responses.into()),
             send_chk_calls: AtomicUsize::new(0),
             on_send_chk: None,
+            last_chk_responses: Mutex::new(VecDeque::new()),
+            last_chk_calls: AtomicUsize::new(0),
         }
     }
 
@@ -111,11 +124,25 @@ impl StubDpsChannel {
             responses: Mutex::new(q),
             send_chk_calls: AtomicUsize::new(0),
             on_send_chk: Some(spy),
+            last_chk_responses: Mutex::new(VecDeque::new()),
+            last_chk_calls: AtomicUsize::new(0),
         }
     }
 
     pub fn call_count(&self) -> usize {
         self.send_chk_calls.load(Ordering::SeqCst)
+    }
+
+    /// M3b W12 Commit 4 — enqueue `last_chk` responses.  Builder-style
+    /// for fluent test setup.  Pre-W12 tests can ignore (lastChk path
+    /// is unreachable when stage_send returns non-Sent outcomes).
+    pub fn with_last_chk_queue(self, responses: Vec<Result<CheckAck, DpsError>>) -> Self {
+        *self.last_chk_responses.lock().unwrap() = responses.into();
+        self
+    }
+
+    pub fn last_chk_call_count(&self) -> usize {
+        self.last_chk_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -134,7 +161,20 @@ impl DpsChannel for StubDpsChannel {
     }
 
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
-        unreachable!("stub: last_chk not exercised");
+        self.last_chk_calls.fetch_add(1, Ordering::SeqCst);
+        self.last_chk_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| {
+                panic!(
+                    "stub: last_chk called but no response enqueued — \
+                     M3b W12 Commit 4 wired the Sent-source path through \
+                     lastChk; tests exercising stage_send Sent must \
+                     supply at least one last_chk response via \
+                     StubDpsChannel::with_last_chk_queue(...)"
+                )
+            })
     }
 
     async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
