@@ -1087,7 +1087,7 @@ async fn process_one_doc(
             process_via_er_class_guard(pool, deps, fiscal_number, doc, summary).await
         }
         DocState::Sent => process_via_lastchk_replay(pool, deps, fiscal_number, doc, summary).await,
-        DocState::Kvt1 => process_via_w12_only(pool, fiscal_number, doc, summary).await,
+        DocState::Kvt1 => process_via_w12_only(pool, fiscal_number, doc, summary, deps).await,
         DocState::Kvt2 => process_via_w12_kvt2_advance(pool, fiscal_number, doc, summary).await,
         other => Err(BootError::Internal(format!(
             "backlog_drain({fiscal_number}): cohort walker returned unexpected \
@@ -1722,43 +1722,69 @@ async fn process_via_lastchk_replay(
     }
 }
 
-/// Process a doc in `KVT1` or `KVT2` state via the W12 stub only
-/// (no wire, no pre-flight).  Pre-W12 the stub returns
-/// `DeferredKvt1` without DB mutation — the doc remains in its
-/// current state until W12 PR lands the `lastChk` evidence path.
-/// Each drain tick re-visits these docs and re-records DeferredKvt1
-/// (operator-pinned correct but inefficient pre-W12 steady-state).
+/// Process a doc in `KVT1` state via the W12 Kvt1Reentry chain
+/// (`confirm_drain_doc(Kvt1Reentry, ...)`).  The doc was previously
+/// advanced to `Kvt1` by a prior tick (boot recovery OR prior-tick
+/// W12 Hold) and is now eligible for the `lastChk` evidence path
+/// via the persisted `server_fiscal_no`.
+///
+/// **M3b W12 Commit 5 (plan §411, 2026-05-22)**: replaced pre-W12
+/// `apply_w12_confirmation` stub call with full W12 chain:
+/// `confirm_drain_doc(Kvt1Reentry, ...)` → Envelope 1b (Kvt1Raw +
+/// Kvt1→Kvt2 + audit) → Envelope 2 (`stage_finalize::run` Kvt2→Ack)
+/// on Acked.  NotFound/Mismatch surface as `StructuralDrift` →
+/// `BootError::Internal` per plan §410.  Hold path emits
+/// `KVT2_CONFIRM_HOLD` audit + returns BootError (HoldFnDrain
+/// projection deferred to Commit 6 per plan §413).
+///
+/// **MED-PR70-R11-01 handoff**: `expected_server_fiscal_no` sourced
+/// from persisted `doc.server_fiscal_no` (Kvt1 state guarantees
+/// stamp present per stage_send 4-b invariant) with explicit
+/// `BootError::Internal` fail-loud on None — Kvt1 without
+/// `server_fiscal_no` is a state-machine invariant breach (cohort
+/// walker should never have surfaced it).
 async fn process_via_w12_only(
     pool: &SqlitePool,
-    fiscal_number: &str,
+    _fiscal_number: &str,
     doc: &fiscal_documents::DocumentRow,
     summary: &mut DrainSummary,
+    deps: &RuntimeView<'_>,
 ) -> Result<DocVerdict, BootError> {
     let id_hex = hex_lower(doc.document_id.as_bytes());
-    let audit_payload = serde_json::json!({
-        "document_id": id_hex,
-        "from_state": doc.state.as_str(),
-        // Pre-W12 stub: no DB transition for Kvt1/Kvt2; to_state
-        // mirrors from_state.  W12 PR will set to_state="ACK" on
-        // the Kvt2 → Ack path via stage_finalize::run.
-        "to_state": doc.state.as_str(),
-        "replay_short_circuit": false,
-        "w12_status": W12ConfirmOutcome::DeferredKvt1.w12_status_str(),
-        "dispatch_via": "w12_only",
-    });
-    // Cohort walker filtered to KVT1 post MED-C5-4 (KVT2 deferred to
-    // W12 PR); pass `doc.state` through.
-    let w12 = apply_w12_confirmation(
+    // Source the canonical expected_server_fiscal_no from persisted
+    // doc row — Kvt1 state guarantees stage_send 4-b stamped it.
+    // Fail-loud on None (state-machine invariant breach).
+    let expected_server_fiscal_no = doc.server_fiscal_no.as_deref().ok_or_else(|| {
+        BootError::Internal(format!(
+            "process_via_w12_only({fn_id}): doc {id_hex} at state Kvt1 has \
+             NULL server_fiscal_no — stage_send 4-b stamp invariant breach \
+             (Kvt1 ALWAYS implies server_fiscal_no stamped by prior tick)",
+            fn_id = doc.fiscal_number,
+        ))
+    })?;
+    let confirm_outcome = kvt2_confirm::confirm_drain_doc(
         pool,
-        fiscal_number,
-        doc.document_id,
-        doc.state,
-        &audit_payload,
+        deps.dps,
+        doc,
+        expected_server_fiscal_no,
+        deps.fn_sign,
+        kvt2_confirm::Kvt2ConfirmSource::Kvt1Reentry,
+        // attempt_no: None — Kvt1Reentry has no fresh wire attempt
+        // this tick (no stage_send invocation).
         None,
     )
     .await?;
-    summary.record_doc_advanced(&w12, false);
-    Ok(DocVerdict::Advanced)
+    match confirm_outcome {
+        kvt2_confirm::ConfirmDrainOutcome::Advanced => {
+            summary.record_doc_advanced(
+                &W12ConfirmOutcome::Acked {
+                    server_fiscal_no: expected_server_fiscal_no.to_string(),
+                },
+                /* via_lastchk_replay */ false,
+            );
+            Ok(DocVerdict::Advanced)
+        }
+    }
 }
 
 /// **M3b W12 Commit 3** — KVT2 cohort dispatch helper (reverses

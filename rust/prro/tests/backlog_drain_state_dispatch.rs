@@ -433,10 +433,16 @@ async fn c5_sent_doc_lastchk_match_advances_to_kvt1_with_replay_flag() {
     assert_eq!(payload["w12_status"], "DeferredKvt1");
 }
 
-// ─── Test 2: KVT1 doc → W12-only path, no DB mutation ────────────────
+// ─── Test 2: KVT1 doc → W12 Kvt1Reentry chain → ACK ─────────────────
 
+/// **M3b W12 Commit 5 (2026-05-22)** — refactored from pre-W12
+/// `c5_kvt1_doc_w12_only_no_db_mutation_records_deferred`.  Post W12
+/// production wiring (`process_via_w12_only` → `confirm_drain_doc(
+/// Kvt1Reentry, ...)` → Envelope 1b + Envelope 2 → ACK), the Kvt1
+/// re-entry seam now drives the doc to terminal Ack via lastChk
+/// evidence persistence (Kvt1Raw) + Kvt1→Kvt2 CAS + stage_finalize.
 #[tokio::test]
-async fn c5_kvt1_doc_w12_only_no_db_mutation_records_deferred() {
+async fn c5_kvt1_doc_w12_reentry_advances_to_ack() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool).await;
@@ -451,10 +457,23 @@ async fn c5_kvt1_doc_w12_only_no_db_mutation_records_deferred() {
         Some("DPS-FN-KVT1"),
     )
     .await;
+    // W12 chain bootstrap — single Kvt1 doc.
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
 
-    // No DPS calls expected — KVT1 dispatch goes through
-    // apply_w12_confirmation stub only.
-    let c = carriers(vec![], vec![]);
+    // No send_chk (Kvt1 dispatch skips stage_send).
+    // 1 last_chk Acked response — Kvt1Reentry chain.
+    let c = carriers(vec![], vec![Ok(ack("DPS-FN-KVT1", vec![0xAAu8; 32]))]);
     let view = view_for(&c);
 
     let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
@@ -462,24 +481,47 @@ async fn c5_kvt1_doc_w12_only_no_db_mutation_records_deferred() {
         .unwrap();
 
     assert_eq!(summary.backlog_size_before(), 1);
-    assert_eq!(summary.advanced_to_kvt1(), 1);
+    assert_eq!(
+        summary.advanced_to_ack(),
+        1,
+        "Kvt1Reentry chain advances doc to Ack"
+    );
+    assert_eq!(summary.advanced_to_kvt1(), 0, "no DeferredKvt1 post-W12");
     assert_eq!(summary.advanced_via_lastchk_replay(), 0);
     assert!(summary.per_doc_failures().is_empty());
 
-    // Pre-W12 stub: no DB mutation; doc stays in KVT1.
-    assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
+    // Doc reaches ACK via Envelope 1b + Envelope 2.
+    assert_eq!(read_doc_state(&pool, doc).await, "ACK");
 
-    // No wire, no lastChk.
+    // No wire (no stage_send), 1 lastChk (Kvt1Reentry evidence).
     assert_eq!(c.dps.send_chk_count(), 0);
-    assert_eq!(c.dps.last_chk_count(), 0);
+    assert_eq!(c.dps.last_chk_count(), 1);
 
-    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_ADVANCED")
+    // Audit chain: KVT2_ADVANCED (Envelope 1b) + STAGE_FINALIZE_ACK
+    // (Envelope 2).  Pre-W12 OFFLINE_DRAIN_DOC_ADVANCED MUST NOT
+    // fire.
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await,
+        1,
+        "Envelope 1b emits KVT2_ADVANCED"
+    );
+    assert_eq!(audit_count(&pool, "STAGE_FINALIZE_ACK").await, 1);
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_ADVANCED").await, 0);
+
+    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED")
         .await
         .unwrap();
     assert_eq!(payload["from_state"], "KVT1");
-    assert_eq!(payload["to_state"], "KVT1");
-    assert_eq!(payload["dispatch_via"], "w12_only");
-    assert_eq!(payload["w12_status"], "DeferredKvt1");
+    assert_eq!(payload["to_state"], "KVT2");
+    assert_eq!(payload["dispatch_via"], "kvt2_confirm");
+    assert_eq!(payload["evidence_source"], "lastChk");
+    assert_eq!(payload["server_fiscal_no"], "DPS-FN-KVT1");
+    // Kvt1Reentry has no attempt_no (no fresh stage_send this tick).
+    assert!(
+        payload.get("attempt_no").is_none() || payload["attempt_no"].is_null(),
+        "Kvt1Reentry envelope 1b payload MUST NOT carry attempt_no \
+         (no fresh wire attempt this tick); got: {payload:?}"
+    );
 }
 
 // ─── Test 3: ERROR_RETRYABLE doc → re-drive via stage_send → KVT1 ────
@@ -1563,4 +1605,253 @@ async fn w12_kvt2_stage_finalize_typed_error_routes_to_boot_error_reconciliation
     // re-encounters the same broken-preconds doc → same Err →
     // operator observability via repeated BootError audit chain.
     assert_eq!(read_doc_state(&pool, doc).await, "KVT2");
+}
+
+// ─── M3b W12 Commit 5: Kvt1Reentry integration fixtures ─────────────
+//
+// Plan §411 acceptance for Commit 5: Kvt1Reentry end-to-end scenarios
+// covering the source-context routing matrix for the `process_via_
+// w12_only` → `confirm_drain_doc(Kvt1Reentry)` chain.
+//
+// 1. NotFound → Drift (DPS empty id) → BootError + drift audit.
+// 2. Mismatch → Drift (DPS different id) → BootError + drift audit.
+// 3. Transport → Hold → BootError + hold audit (HoldFnDrain
+//    projection deferred to Commit 6).
+// 4. ServerFiscalNoMissing → caller-level BootError (before DPS).
+
+#[tokio::test]
+async fn w12_kvt1_reentry_not_found_emits_drift_audit_and_halts_via_boot_error() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "KVT1",
+        Some("DPS-FN-NOT-FOUND"),
+    )
+    .await;
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+
+    // DPS returns empty id → NotFound → StructuralDrift::
+    // NotFoundOutsideSentReplay → Envelope 1c-drift-light audit
+    // → BootError.
+    let c = carriers(vec![], vec![Ok(ack("", vec![]))]);
+    let view = view_for(&c);
+
+    let err = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .expect_err("Kvt1Reentry NotFound MUST halt drain via BootError::Internal");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("structural drift") || err_str.contains("STRUCTURAL_DRIFT"),
+        "BootError must mention structural drift; got: {err_str}"
+    );
+
+    // Doc state UNCHANGED at KVT1 — Envelope 1b never fired.
+    assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
+
+    // Drift envelope audit landed BEFORE BootError.
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await, 1);
+    let drift = audit_latest_payload(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT")
+        .await
+        .unwrap();
+    assert_eq!(drift["source"], "kvt1_reentry");
+    assert_eq!(drift["drift_reason"], "NOT_FOUND_OUTSIDE_SENT_REPLAY");
+    assert_eq!(drift["dispatch_via"], "kvt2_confirm");
+
+    // No Envelope 1b / Envelope 2 fired.
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 0);
+    assert_eq!(audit_count(&pool, "STAGE_FINALIZE_ACK").await, 0);
+}
+
+#[tokio::test]
+async fn w12_kvt1_reentry_mismatch_emits_drift_audit_and_halts_via_boot_error() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "KVT1",
+        Some("EXPECTED-KVT1"),
+    )
+    .await;
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+
+    // DPS returns different id → ServerFiscalIdMismatch →
+    // StructuralDrift::LastChkIdMismatch → drift audit + BootError.
+    let c = carriers(vec![], vec![Ok(ack("DIFFERENT-KVT1", vec![0xAAu8; 32]))]);
+    let view = view_for(&c);
+
+    let err = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .expect_err("Kvt1Reentry Mismatch MUST halt drain via BootError::Internal");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("structural drift") || err_str.contains("STRUCTURAL_DRIFT"),
+        "BootError must mention structural drift; got: {err_str}"
+    );
+
+    assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await, 1);
+    let drift = audit_latest_payload(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT")
+        .await
+        .unwrap();
+    assert_eq!(drift["source"], "kvt1_reentry");
+    assert_eq!(drift["drift_reason"], "LASTCHK_ID_MISMATCH");
+    let detail = drift["drift_reason_detail"]
+        .as_str()
+        .expect("drift_reason_detail must be a string");
+    assert!(
+        detail.contains("DIFFERENT-KVT1") && detail.contains("EXPECTED-KVT1"),
+        "drift detail must carry observed+expected pair; got: {detail}"
+    );
+
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 0);
+    assert_eq!(audit_count(&pool, "STAGE_FINALIZE_ACK").await, 0);
+}
+
+#[tokio::test]
+async fn w12_kvt1_reentry_dps_transport_emits_hold_audit_and_halts_via_boot_error() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "KVT1",
+        Some("DPS-FN-HOLD"),
+    )
+    .await;
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+
+    // DPS Transport error → Hold(DpsTransport) → Envelope
+    // 1c-hold-light audit + BootError until Commit 6 wires
+    // HoldFnDrain.
+    let c = carriers(
+        vec![],
+        vec![Err(DpsError::Transport(
+            "simulated kvt1 lastChk timeout".into(),
+        ))],
+    );
+    let view = view_for(&c);
+
+    let err = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .expect_err("Kvt1Reentry Hold MUST halt drain via BootError until Commit 6");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("Hold") || err_str.contains("KVT2_CONFIRM_HOLD"),
+        "BootError must mention Hold; got: {err_str}"
+    );
+
+    // Doc state UNCHANGED at KVT1.
+    assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
+
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_HOLD").await, 1);
+    let hold = audit_latest_payload(&pool, "KVT2_CONFIRM_HOLD")
+        .await
+        .unwrap();
+    assert_eq!(hold["source"], "kvt1_reentry");
+    assert_eq!(hold["hold_reason"], "DPS_TRANSPORT");
+    assert_eq!(hold["dispatch_via"], "kvt2_confirm");
+    let detail = hold["hold_reason_detail"]
+        .as_str()
+        .expect("hold_reason_detail must be a string");
+    assert!(
+        detail.contains("simulated kvt1 lastChk timeout"),
+        "hold detail must carry DPS error message; got: {detail}"
+    );
+
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 0);
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await, 0);
+}
+
+#[tokio::test]
+async fn w12_kvt1_reentry_doc_without_server_fiscal_no_halts_caller_level() {
+    // MED-PR70-R11-01 caller-level handoff: Kvt1 state implies
+    // stage_send 4-b stamped server_fiscal_no.  Doc at Kvt1 with
+    // NULL server_fiscal_no is a state-machine invariant breach
+    // detected at `process_via_w12_only` entry BEFORE confirm_drain_doc
+    // / DPS call.  Halts with `BootError::Internal`; no audit fires
+    // (no envelope opened).
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    let doc = seed_doc_in_state(
+        &pool, 1, 100, session_id, shift_id, "KVT1",
+        // server_fiscal_no = None — invariant breach for KVT1 state.
+        None,
+    )
+    .await;
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+
+    let c = carriers(vec![], vec![]);
+    let view = view_for(&c);
+
+    let err = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .expect_err("KVT1 without server_fiscal_no MUST halt with BootError::Internal");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("NULL server_fiscal_no") || err_str.contains("stamp invariant breach"),
+        "BootError must mention server_fiscal_no invariant; got: {err_str}"
+    );
+
+    // Doc state unchanged; no DPS call; no envelope audits.
+    assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
+    assert_eq!(c.dps.send_chk_count(), 0);
+    assert_eq!(c.dps.last_chk_count(), 0);
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 0);
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_HOLD").await, 0);
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await, 0);
 }

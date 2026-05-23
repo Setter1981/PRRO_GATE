@@ -458,12 +458,17 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
     // attempt_no lives in `transport_trace`, NOT this surface).
     attempt_no: Option<i64>,
 ) -> Result<ConfirmDrainOutcome, BootError> {
-    // Commit 4 scope guard — Kvt1Reentry / SentReplay deferred.
-    if !matches!(source, Kvt2ConfirmSource::SentFresh) {
-        return Err(BootError::Internal(format!(
-            "confirm_drain_doc: source {source:?} not yet wired (Commit 4 \
-             = SentFresh only; Kvt1Reentry/SentReplay land in Commits 5/5b)"
-        )));
+    // **M3b W12 Commit 5 scope (2026-05-22)**: SentFresh + Kvt1Reentry
+    // wired.  SentReplay still deferred to Commit 5b (needs Envelope
+    // 1c-pre `transport_trace.allocate_and_insert_tx` + bundled
+    // 1c-post/1c-hold/1c-drift envelopes per plan §412).
+    if matches!(source, Kvt2ConfirmSource::SentReplay) {
+        return Err(BootError::Internal(
+            "confirm_drain_doc: SentReplay not yet wired (Commit 5b will \
+             add Envelope 1c-pre trace-allocate + bundled completion \
+             envelopes per plan §412)"
+                .to_string(),
+        ));
     }
     let outcome = evaluate_lastchk(
         dps,
@@ -487,23 +492,48 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
             // would silently corrupt forensic evidence.
             if kvt1_raw_bytes.is_empty() {
                 return Err(BootError::Internal(format!(
-                    "confirm_drain_doc(SentFresh): Acked outcome with empty \
+                    "confirm_drain_doc({source:?}): Acked outcome with empty \
                      kvt1_raw_bytes for doc {id_hex} — classify_check_result \
                      invariant violated (should route empty data_sign to \
                      Hold(LastChkDataSignEmpty); see kvt2_confirm.rs:188-192)"
                 )));
             }
-            commit_sent_fresh_envelope_1a(
-                pool,
-                &fiscal_number,
-                doc_id,
-                &id_hex,
-                kvt1_raw_bytes,
-                expected_server_fiscal_no,
-                doc.state,
-                attempt_no,
-            )
-            .await?;
+            // **M3b W12 Commit 5 (plan §313, 2026-05-22)**: source-
+            // specific Envelope 1 dispatch.  SentFresh → Envelope 1a
+            // (3-CAS: Kvt1Raw + Sent→Kvt1 + Kvt1→Kvt2 + audit).
+            // Kvt1Reentry → Envelope 1b (2-CAS only: Kvt1Raw +
+            // Kvt1→Kvt2 + audit; NO Sent→Kvt1 — doc was already at
+            // Kvt1 when the cohort walker picked it up).
+            match source {
+                Kvt2ConfirmSource::SentFresh => {
+                    commit_sent_fresh_envelope_1a(
+                        pool,
+                        &fiscal_number,
+                        doc_id,
+                        &id_hex,
+                        kvt1_raw_bytes,
+                        expected_server_fiscal_no,
+                        doc.state,
+                        attempt_no,
+                    )
+                    .await?;
+                }
+                Kvt2ConfirmSource::Kvt1Reentry => {
+                    commit_kvt1_reentry_envelope_1b(
+                        pool,
+                        &fiscal_number,
+                        doc_id,
+                        &id_hex,
+                        kvt1_raw_bytes,
+                        expected_server_fiscal_no,
+                    )
+                    .await?;
+                }
+                Kvt2ConfirmSource::SentReplay => unreachable!(
+                    "SentReplay early-rejected by scope guard; \
+                     classify_check_result + scope guard contract violated"
+                ),
+            }
             // Envelope 2: M3a stage_finalize::run owns its 5-write
             // atomic envelope (Kvt2→Ack + chain seed + inbox DONE +
             // outbox + STAGE_FINALIZE_ACK).  Acked/AlreadyAcked are
@@ -521,20 +551,20 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
                 }
                 stage_finalize::StageFinalizeOutcome::StateConflict { observed } => {
                     Err(BootError::Internal(format!(
-                        "confirm_drain_doc(SentFresh): stage_finalize::run \
+                        "confirm_drain_doc({source:?}): stage_finalize::run \
                          StateConflict {{ observed: {observed} }} for doc \
                          {id_hex} — concurrent writer past App reconcile mutex \
-                         (Envelope 1a CAS Kvt1→Kvt2 just committed; another \
+                         (Envelope 1 CAS Kvt1→Kvt2 just committed; another \
                          writer must have rolled state forward to Ack/etc \
-                         between Envelope 1a commit and Envelope 2 read)",
+                         between Envelope 1 commit and Envelope 2 read)",
                         observed = observed.as_str(),
                     )))
                 }
                 stage_finalize::StageFinalizeOutcome::DocumentMissing => {
                     Err(BootError::Internal(format!(
-                        "confirm_drain_doc(SentFresh): stage_finalize::run \
+                        "confirm_drain_doc({source:?}): stage_finalize::run \
                          DocumentMissing for doc {id_hex} — row deleted between \
-                         Envelope 1a commit and Envelope 2 read (cannot happen \
+                         Envelope 1 commit and Envelope 2 read (cannot happen \
                          under single-writer App reconcile mutex)"
                     )))
                 }
@@ -555,11 +585,11 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
             )
             .await?;
             Err(BootError::Internal(format!(
-                "confirm_drain_doc(SentFresh): structural drift for doc {id_hex} \
-                 — {reason:?}.  NotFound/Mismatch from SentFresh context indicates \
-                 state-machine drift (server_fiscal_no just stamped by stage_send \
-                 4-b but DPS does not recognize it).  Halts FN drain per plan §410.  \
-                 KVT2_CONFIRM_STRUCTURAL_DRIFT audit emitted prior to halt."
+                "confirm_drain_doc({source:?}): structural drift for doc {id_hex} \
+                 — {reason:?}.  NotFound/Mismatch from SentFresh/Kvt1Reentry context \
+                 indicates state-machine drift (server_fiscal_no not recognized by \
+                 DPS).  Halts FN drain per plan §410.  KVT2_CONFIRM_STRUCTURAL_DRIFT \
+                 audit emitted prior to halt."
             )))
         }
         Kvt2ConfirmOutcome::Hold { reason, .. } => {
@@ -578,17 +608,18 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
             )
             .await?;
             Err(BootError::Internal(format!(
-                "confirm_drain_doc(SentFresh): Hold audit emitted (KVT2_CONFIRM_HOLD) \
+                "confirm_drain_doc({source:?}): Hold audit emitted (KVT2_CONFIRM_HOLD) \
                  for doc {id_hex} — reason={reason:?}.  HoldFnDrain projection not \
                  yet wired (Commit 6 scope); caller observes BootError until then."
             )))
         }
         Kvt2ConfirmOutcome::SentNotFoundDowngrade { trace_attempt_no } => {
             Err(BootError::Internal(format!(
-                "confirm_drain_doc(SentFresh): SentNotFoundDowngrade(attempt_no={trace_attempt_no}) \
-                 is structurally unreachable for SentFresh per Commit 1 \
-                 classify_check_result routing — NotFound + SentFresh must \
-                 route to StructuralDrift::NotFoundOutsideSentReplay.  If \
+                "confirm_drain_doc({source:?}): SentNotFoundDowngrade(attempt_no={trace_attempt_no}) \
+                 is structurally unreachable for SentFresh/Kvt1Reentry per Commit 1 \
+                 classify_check_result routing — NotFound + non-SentReplay must \
+                 route to StructuralDrift::NotFoundOutsideSentReplay.  SentReplay \
+                 is scope-guarded at fn entry (Commit 5b not yet wired).  If \
                  this surfaces, Commit 1 routing has regressed."
             )))
         }
@@ -698,6 +729,114 @@ async fn commit_sent_fresh_envelope_1a(
                 ));
             }
             // (d) Forensic audit row.
+            audit_log::append_tx(
+                tx,
+                AUDIT_ENTITY_DOC,
+                &id_hex_owned,
+                "OFFLINE_DRAIN_KVT2_ADVANCED",
+                Severity::Info,
+                None,
+                Some(&payload_owned),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(|err| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source: err,
+    })?;
+    Ok(())
+}
+
+/// **M3b W12 Commit 5 (plan §313, 2026-05-22)** — Envelope 1b:
+/// atomic Kvt1Raw persist + `Kvt1 → Kvt2` CAS + audit in ONE
+/// `with_immediate`.  Caller (`confirm_drain_doc`) has already
+/// verified source == `Kvt1Reentry` + outcome == `Acked` + has the
+/// canonical `kvt1_raw_bytes` evidence.
+///
+/// **Difference from Envelope 1a** (SentFresh, see
+/// `commit_sent_fresh_envelope_1a`): NO `Sent → Kvt1` CAS.  Kvt1
+/// re-entry means the doc was ALREADY at `Kvt1` when the cohort
+/// walker picked it up (prior-tick Hold left doc state untouched
+/// at Kvt1 per W0b §97-102; HIGH-PR70-R2-01 fix).  The previous
+/// tick may have persisted Kvt1Raw too, but we re-persist via
+/// `INSERT OR REPLACE` to write the freshly-fetched canonical
+/// bytes (operator-pinned forensic contract: latest lastChk
+/// evidence wins).
+///
+/// **3-write envelope** vs 1a's 4-write:
+///   1. `document_files::replace_tx(Kvt1Raw)` — overwrite stale
+///      bytes from prior-tick Hold OR write for first time if
+///      doc came via M3a boot path.
+///   2. CAS `Kvt1 → Kvt2` (must produce `Applied`; else
+///      structural drift).
+///   3. `OFFLINE_DRAIN_KVT2_ADVANCED` audit append.
+///
+/// `attempt_no` is omitted from the payload because Kvt1Reentry
+/// has no fresh wire-attempt counter (no stage_send invocation
+/// this tick).  Operator-dashboard `attempt_no` field absence
+/// distinguishes Kvt1Reentry-advance from SentFresh-advance
+/// (which always carries `attempt_no >= 1`).
+#[allow(clippy::too_many_arguments)] // 6 args — symmetric with
+                                     // sibling envelope helpers'
+                                     // arg shape.
+async fn commit_kvt1_reentry_envelope_1b(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    doc_id: DocumentId,
+    id_hex: &str,
+    kvt1_raw_bytes: Vec<u8>,
+    server_fiscal_no: &str,
+) -> Result<(), BootError> {
+    let kvt1_raw_sha256_hex = format!("{:x}", Sha256::digest(&kvt1_raw_bytes));
+    let payload = serde_json::json!({
+        "document_id": id_hex,
+        // Kvt1Reentry: cohort-walker snapshot WAS Kvt1 (per
+        // dispatch arm at backlog_drain.rs:1090).  Pre-W12
+        // LOW-PR70-R12-02 cohort-entry convention preserved —
+        // dashboards filter by from_state.
+        "from_state": DocState::Kvt1.as_str(),
+        "to_state": DocState::Kvt2.as_str(),
+        "server_fiscal_no": server_fiscal_no,
+        "dispatch_via": "kvt2_confirm",
+        "evidence_source": "lastChk",
+        "kvt1_raw_sha256_hex": kvt1_raw_sha256_hex,
+        // attempt_no intentionally absent for Kvt1Reentry —
+        // no fresh stage_send invocation this tick.
+    });
+    let payload_owned = payload.to_string();
+    let id_hex_owned = id_hex.to_string();
+    let fn_owned = fiscal_number.to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // (a) Persist Kvt1Raw evidence (overwrite prior-tick
+            // bytes if any; INSERT OR REPLACE).
+            document_files::replace_tx(
+                tx,
+                doc_id,
+                document_files::DocumentFileKind::Kvt1Raw,
+                &kvt1_raw_bytes,
+            )
+            .await?;
+            // (b) CAS Kvt1 → Kvt2.  W12 advance proof persisted.
+            // No Sent → Kvt1 CAS — doc was at Kvt1 already.
+            let kvt1_to_kvt2 =
+                fiscal_documents::transition_state(tx, doc_id, DocState::Kvt1, DocState::Kvt2)
+                    .await?;
+            if kvt1_to_kvt2 != TransitionOutcome::Applied {
+                return Err(anyhow::anyhow!(
+                    "backlog_drain({fn_id}): Envelope 1b CAS Kvt1→Kvt2 produced \
+                     {outcome:?} for doc {doc_hex} (concurrent writer past App \
+                     reconcile mutex OR doc state drifted off Kvt1 between \
+                     cohort SELECT and Envelope 1b)",
+                    fn_id = fn_owned,
+                    outcome = kvt1_to_kvt2,
+                    doc_hex = id_hex_owned,
+                ));
+            }
+            // (c) Forensic audit row.
             audit_log::append_tx(
                 tx,
                 AUDIT_ENTITY_DOC,
