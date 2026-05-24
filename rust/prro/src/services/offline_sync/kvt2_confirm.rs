@@ -54,8 +54,9 @@ use crate::db::models::ids::DocumentId;
 use crate::db::repositories::fiscal_documents::TransitionOutcome;
 use crate::db::repositories::{audit_log, document_files, fiscal_documents, transport_trace};
 use crate::db::tx::with_immediate;
-use crate::services::offline_sync::backlog_drain::HoldFnDrainProjection;
-use crate::services::offline_sync::backlog_drain::AUDIT_ENTITY_DOC;
+use crate::services::offline_sync::backlog_drain::{
+    FailureClass, HoldFnDrainProjection, AUDIT_ENTITY_DOC,
+};
 use crate::services::write_path::stage_finalize;
 use crate::services::write_path::types::hex_encode_lower;
 use crate::transports::dps::channel::DpsChannel;
@@ -428,6 +429,27 @@ pub enum ConfirmDrainOutcome {
     HoldFnDrain {
         projection: HoldFnDrainProjection,
         consecutive_holds: i64,
+        /// **Commit 6.2 / Phase 2b REC-6 (2026-05-24)** — granular
+        /// `FailureClass` derived per Hold reason via
+        /// [`map_hold_reason_to_class`]:
+        ///   - `DpsTransport` → `FailureClass::Transport`
+        ///   - `DpsServer` → `FailureClass::Server`
+        ///   - `DpsAuthorization` → `FailureClass::Authorization`
+        ///   - `DpsDecode` → `FailureClass::Decode`
+        ///   - `LastChkDataSignEmpty` → `FailureClass::Internal`
+        ///   - SentNotFoundDowngrade → `FailureClass::NotFound`
+        ///     (not via helper — distinct outcome variant з direct
+        ///     hardcoded mapping; rationale: DPS healthy + functioning
+        ///     normally, NotFound is application-level negative result,
+        ///     NOT transport/decode failure → avoid auto-offline
+        ///     false-positives per memory `feedback_offline_transition_
+        ///     strategy`).
+        ///
+        /// Replaces Commit 6.1.2 hardcoded `FailureClass::Transport`
+        /// at all 3 caller sites — operator dashboards тепер можуть
+        /// distinguish "network glitch" від "DPS internal error"
+        /// vs "DPS auth issue" в hold counters.
+        class: FailureClass,
     },
     /// Envelope 1a (Kvt1Raw persist + Sent→Kvt1 CAS + Kvt1→Kvt2 CAS +
     /// `OFFLINE_DRAIN_KVT2_ADVANCED` audit) committed atomically;
@@ -749,6 +771,7 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
                     Ok(ConfirmDrainOutcome::HoldFnDrain {
                         projection: HoldFnDrainProjection::HeldAtSent,
                         consecutive_holds,
+                        class: map_hold_reason_to_class(&reason),
                     })
                 }
                 Kvt2ConfirmSource::SentFresh => {
@@ -764,6 +787,7 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
                     Ok(ConfirmDrainOutcome::HoldFnDrain {
                         projection: HoldFnDrainProjection::HeldAtSent,
                         consecutive_holds,
+                        class: map_hold_reason_to_class(&reason),
                     })
                 }
                 Kvt2ConfirmSource::Kvt1Reentry => {
@@ -779,6 +803,7 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
                     Ok(ConfirmDrainOutcome::HoldFnDrain {
                         projection: HoldFnDrainProjection::HeldAtKvt1,
                         consecutive_holds,
+                        class: map_hold_reason_to_class(&reason),
                     })
                 }
             }
@@ -836,9 +861,16 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
             // 1c-post atomically reset counter (Sent→ER advance =
             // any-advance-resets contract); ER class guard takes
             // over via transport_trace.retry_class budget.
+            // **REC-6 Phase 2b Commit 6.2 (2026-05-24)**: class =
+            // `FailureClass::NotFound` (semantically точно — DPS
+            // healthy + functioning, application-level negative
+            // result).  НЕ `Transport` бо це не network failure —
+            // запобігає false-positive auto-offline transitions per
+            // memory `feedback_offline_transition_strategy`.
             Ok(ConfirmDrainOutcome::HoldFnDrain {
                 projection: HoldFnDrainProjection::ErRedriveQueued,
                 consecutive_holds: 0,
+                class: FailureClass::NotFound,
             })
         }
     }
@@ -1287,6 +1319,37 @@ fn iso8601_now() -> String {
     chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string()
+}
+
+/// **M3b W12 Post-Closure Hardening Phase 2b Commit 6.2 / REC-6
+/// (2026-05-24)** — granular `FailureClass` mapping per `Kvt2ConfirmHoldReason`.
+///
+/// Replaces Commit 6.1.2 hardcoded `FailureClass::Transport` для всіх
+/// Hold-class outcomes.  Operator dashboards тепер можуть distinguish:
+///   - `DpsTransport` → `Transport` — network / TLS / DNS glitch.
+///   - `DpsServer` → `Server` — DPS returned non-OK status code.
+///   - `DpsAuthorization` → `Authorization` — DPS auth/config failure.
+///   - `DpsDecode` → `Decode` — DPS response decode failed (contract
+///     drift / malformed protobuf).
+///   - `LastChkDataSignEmpty` → `Internal` — structural breach (DPS
+///     matched id but returned empty data_sign; internal contract
+///     violation, NOT server-side error).
+///
+/// Note: `SentNotFoundDowngrade` outcome (NotFound from DPS) is
+/// dispatched separately в `confirm_drain_doc` з hardcoded
+/// `FailureClass::NotFound` (NOT через this helper — distinct
+/// outcome variant, distinct semantic).  Rationale: NotFound is
+/// application-level negative result with healthy DPS — must NOT
+/// trigger auto-offline false-positive per memory
+/// `feedback_offline_transition_strategy`.
+fn map_hold_reason_to_class(reason: &Kvt2ConfirmHoldReason) -> FailureClass {
+    match reason {
+        Kvt2ConfirmHoldReason::DpsTransport(_) => FailureClass::Transport,
+        Kvt2ConfirmHoldReason::DpsServer(_) => FailureClass::Server,
+        Kvt2ConfirmHoldReason::DpsAuthorization(_) => FailureClass::Authorization,
+        Kvt2ConfirmHoldReason::DpsDecode(_) => FailureClass::Decode,
+        Kvt2ConfirmHoldReason::LastChkDataSignEmpty => FailureClass::Internal,
+    }
 }
 
 /// **M3b W12 Commit 5b.1 (plan §412 Envelope 1c-pre, 2026-05-22)** —
@@ -2034,5 +2097,42 @@ mod tests {
         // that bypasses Envelope 1c-pre.
         let result = Err(DpsError::NotFound);
         let _ = classify_check_result(result, Kvt2ConfirmSource::SentReplay, None);
+    }
+
+    // ─── REC-6 Phase 2b helper unit test ────────────────────────────
+
+    /// **REC-6 unit test (Phase 2b Commit 6.2, 2026-05-24)** —
+    /// `map_hold_reason_to_class` 5-branch coverage.  Direct
+    /// verification без integration test overhead.
+    #[test]
+    fn map_hold_reason_to_class_covers_all_5_branches() {
+        // DpsTransport → Transport (network/TLS/DNS glitch).
+        assert_eq!(
+            map_hold_reason_to_class(&Kvt2ConfirmHoldReason::DpsTransport("timeout".into())),
+            FailureClass::Transport
+        );
+        // DpsServer → Server (DPS non-OK status code).
+        assert_eq!(
+            map_hold_reason_to_class(&Kvt2ConfirmHoldReason::DpsServer("status=-5".into())),
+            FailureClass::Server
+        );
+        // DpsAuthorization → Authorization (DPS auth/config failure).
+        assert_eq!(
+            map_hold_reason_to_class(&Kvt2ConfirmHoldReason::DpsAuthorization(
+                "DocumentReject(code=-1)".into()
+            )),
+            FailureClass::Authorization
+        );
+        // DpsDecode → Decode (response decode / contract drift).
+        assert_eq!(
+            map_hold_reason_to_class(&Kvt2ConfirmHoldReason::DpsDecode("malformed".into())),
+            FailureClass::Decode
+        );
+        // LastChkDataSignEmpty → Internal (structural breach — DPS
+        // matched id but empty data_sign payload).
+        assert_eq!(
+            map_hold_reason_to_class(&Kvt2ConfirmHoldReason::LastChkDataSignEmpty),
+            FailureClass::Internal
+        );
     }
 }
