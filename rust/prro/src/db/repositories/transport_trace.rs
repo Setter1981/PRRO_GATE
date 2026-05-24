@@ -47,6 +47,17 @@ pub enum OutcomeKind {
     /// `MacRecovery` `RetryClass` folds here; the orchestrator
     /// completes the recovery cycle out of band of stage 4-b.
     RetryableMacHashMismatch,
+    /// **W12 Post-Closure Hardening Phase 3 / REC-3 (2026-05-24)** —
+    /// orphan trace row closed by boot scanner after crash mid-DPS-call
+    /// (SIGKILL / OOM / power loss between Envelope 1c-pre `allocate_
+    /// and_insert_tx` and outcome envelope's `complete_tx`).  Boot
+    /// scanner runs `services/reconciliation/boot_phase.rs::close_
+    /// orphan_transport_traces` за first 60s post-restart; any trace
+    /// row з `outcome_kind IS NULL` AND `created_at` older than 60s
+    /// (TTL buffer для in-flight calls на graceful-shutdown boundary)
+    /// gets closed з this variant + paired `TRANSPORT_TRACE_ORPHAN_
+    /// CLOSED` Info audit row для operator health-metric dashboards.
+    SystemCrash,
 }
 
 impl OutcomeKind {
@@ -58,6 +69,7 @@ impl OutcomeKind {
             Self::RetryableServer => "RETRYABLE_SERVER",
             Self::RetryableAuthFn => "RETRYABLE_AUTH_FN",
             Self::RetryableMacHashMismatch => "RETRYABLE_MAC_HASH_MISMATCH",
+            Self::SystemCrash => "SYSTEM_CRASH",
         }
     }
 }

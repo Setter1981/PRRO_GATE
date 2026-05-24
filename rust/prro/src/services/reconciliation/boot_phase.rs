@@ -1164,6 +1164,131 @@ impl BranchOutcome {
 /// behaviour — its sole purpose is to enforce at compile time that
 /// no caller can invoke `run_boot_reconciliation` while bypassing the
 /// App mutex.  Closes the bypass left over from M3a HP2.
+/// **M3b W12 Post-Closure Hardening Phase 3 / REC-3 (2026-05-24)** —
+/// scan `transport_trace` for orphan rows (allocated by Envelope 1c-pre
+/// but never completed) that pre-date `ttl_secs` before now.  Close
+/// each з `outcome_kind=SystemCrash` + emit `TRANSPORT_TRACE_ORPHAN_
+/// CLOSED` Info audit.
+///
+/// **Scenario**: SentReplay path в `services/offline_sync/kvt2_confirm.
+/// rs::commit_sent_replay_envelope_1c_pre` allocates `transport_trace`
+/// row BEFORE DPS lastChk wire call.  If process crashes mid-call
+/// (SIGKILL / OOM / power loss), row stays in `Allocated` state
+/// (`outcome_kind = NULL`).  Next-tick SentReplay re-allocates a fresh
+/// row; orphan persists forever без this scanner.
+///
+/// **TTL buffer (default 60s)**: in-flight DPS calls на graceful-
+/// shutdown boundary may have started seconds before App restart;
+/// `ttl_secs` guards against false-positive close of legitimately
+/// in-flight rows that started right before App init started its own
+/// timer.  60s default = upper bound на typical DPS call duration +
+/// generous buffer.
+///
+/// **Atomicity (I4)**: per-row `with_immediate` envelope — each orphan
+/// closed з 1 UPDATE + 1 audit row.  Crash mid-scan leaves
+/// partially-closed traces; next boot scanner pass re-processes the
+/// remainder.  Idempotent (already-closed rows excluded by `WHERE
+/// outcome_kind IS NULL` predicate).
+///
+/// **Returns**: number of orphan rows closed (for boot summary +
+/// operator analytics).
+pub async fn close_orphan_transport_traces(
+    pool: &SqlitePool,
+    ttl_secs: i64,
+) -> anyhow::Result<usize> {
+    use crate::db::repositories::transport_trace;
+    use crate::db::tx::with_immediate;
+
+    // Snapshot orphan candidate rows pre-scan.  Per-row close envelopes
+    // avoid single-large-tx amplification (rare-event scanner) + give
+    // operator per-row audit visibility.
+    let orphans: Vec<(Vec<u8>, i32, String)> = sqlx::query_as(
+        "SELECT document_id, attempt_no, started_at \
+         FROM transport_trace \
+         WHERE outcome_kind IS NULL \
+           AND started_at < datetime('now', ?) \
+         ORDER BY started_at",
+    )
+    .bind(format!("-{ttl_secs} seconds"))
+    .fetch_all(pool)
+    .await?;
+
+    let mut closed_count = 0usize;
+    let now_iso = iso8601_now();
+    for (doc_id_bytes, attempt_no, started_at) in &orphans {
+        // Doc ID from BLOB → DocumentId.
+        let doc_id_arr: [u8; 16] = doc_id_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!(
+                "boot orphan scanner: transport_trace.document_id length != 16 для started_at={started_at}"
+            ))?;
+        let doc_id = crate::db::models::ids::DocumentId::from_bytes(doc_id_arr);
+        let id_hex = hex_lower(doc_id_bytes);
+        let payload = serde_json::json!({
+            "document_id": id_hex,
+            "attempt_no": attempt_no,
+            "started_at": started_at,
+            "closed_at": now_iso,
+            "outcome_kind": transport_trace::OutcomeKind::SystemCrash.as_str(),
+            "reason": "Process exited mid-wire-call; no outcome captured (boot scanner)",
+            "ttl_secs": ttl_secs,
+        });
+        let payload_owned = payload.to_string();
+        let id_hex_owned = id_hex.clone();
+        let started_at_owned = started_at.clone();
+        let now_iso_owned = now_iso.clone();
+        let attempt_no_owned = *attempt_no;
+        with_immediate(pool, move |tx| {
+            Box::pin(async move {
+                // (a) Close orphan з SystemCrash outcome.  Use the
+                // original started_at as wire_call_started_at (best-
+                // effort recovery — actual call may have started slightly
+                // later, but DDL CHECK requires all 4 completion fields
+                // NOT NULL).
+                let rows = sqlx::query(
+                    "UPDATE transport_trace SET \
+                        completed_at = ?, \
+                        wire_call_started_at = ?, \
+                        wire_call_finished_at = ?, \
+                        outcome_kind = 'SYSTEM_CRASH', \
+                        error_kind = 'ORPHANED_AT_BOOT_RECOVERY', \
+                        error_message = 'Process exited mid-wire-call; no outcome captured' \
+                     WHERE document_id = ? AND attempt_no = ? AND outcome_kind IS NULL",
+                )
+                .bind(&now_iso_owned)
+                .bind(&started_at_owned)
+                .bind(&now_iso_owned)
+                .bind(doc_id)
+                .bind(attempt_no_owned)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                // rows_affected==0 means another writer closed it
+                // between SELECT and UPDATE — race-safe skip (idempotent).
+                if rows == 0 {
+                    return Ok::<bool, anyhow::Error>(false);
+                }
+                // (b) Audit row.
+                audit_log::append_tx(
+                    tx,
+                    "transport_trace",
+                    &id_hex_owned,
+                    "TRANSPORT_TRACE_ORPHAN_CLOSED",
+                    crate::db::models::enums::Severity::Info,
+                    None,
+                    Some(&payload_owned),
+                )
+                .await?;
+                Ok(true)
+            })
+        })
+        .await?;
+        closed_count += 1;
+    }
+    Ok(closed_count)
+}
+
 pub async fn run_boot_reconciliation(
     _guard: &super::ReconcileGuard<'_>,
     pool: &SqlitePool,

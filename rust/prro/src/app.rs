@@ -439,6 +439,28 @@ impl App {
         );
 
         let pool = self.db();
+
+        // **M3b W12 Post-Closure Hardening Phase 3 / REC-3 (2026-05-24)** —
+        // boot orphan-trace scanner: closes any `transport_trace` rows
+        // allocated by Envelope 1c-pre but never completed (process
+        // crashed mid-DPS-call: SIGKILL / OOM / power loss).  Per-row
+        // atomic close + audit emit; 60s TTL guards against false-
+        // positive close of legitimate in-flight calls на graceful-
+        // shutdown boundary.  Runs BEFORE per-FN reconciliation loop
+        // so trace state is clean before any drain pass.
+        let orphans_closed = boot_phase::close_orphan_transport_traces(pool, 60)
+            .await
+            .map_err(|e| BootError::ReconciliationFailed {
+                fiscal_number: "<boot-orphan-scanner>".to_string(),
+                source: e,
+            })?;
+        if orphans_closed > 0 {
+            tracing::info!(
+                orphans_closed,
+                "boot orphan-trace scanner closed transport_trace rows"
+            );
+        }
+
         let fns = fiscal_number_config::list_all(pool)
             .await
             .map_err(BootError::Database)?;
