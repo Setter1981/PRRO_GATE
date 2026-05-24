@@ -142,9 +142,7 @@ async fn doc_state(pool: &SqlitePool, doc: DocumentId) -> String {
 /// happy path + 2 NIT-C5-4 signer-refused acceptance).  Builds an
 /// `App` rooted in a fresh tempdir SQLite DB and returns the tempdir
 /// (held for lifetime) + the booted `App` + a clone of its pool.
-async fn boot_app_with_db(
-    db_filename: &str,
-) -> (tempfile::TempDir, prro::App, SqlitePool) {
+async fn boot_app_with_db(db_filename: &str) -> (tempfile::TempDir, prro::App, SqlitePool) {
     use prro::config::AppConfig;
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join(db_filename);
@@ -1141,14 +1139,16 @@ async fn boot_signed_dispatch_signer_mismatch_increments_mismatch_bucket() {
         .expect("reconcile_pending_with must succeed on signer-refused path");
 
     // Doc stays SIGNED — Pattern B preserved, no state mutation.
-    let state: String = sqlx::query_scalar(
-        "SELECT state FROM fiscal_documents WHERE document_id = ?",
-    )
-    .bind(&doc_bytes)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(state, "SIGNED", "doc state MUST stay SIGNED on signer refusal");
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
+            .bind(&doc_bytes)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        state, "SIGNED",
+        "doc state MUST stay SIGNED on signer refusal"
+    );
 
     // SIGNER_CASHIER_MISMATCH audit committed via Ok-return.
     assert_eq!(
@@ -1251,5 +1251,218 @@ async fn boot_signed_dispatch_shift_missing_increments_structural_bug_bucket() {
     assert_eq!(
         v["by_outcome"]["signer_refused_mismatch"], 0,
         "operator-Mismatch bucket MUST stay 0 on caller-bug path"
+    );
+}
+
+// ─── Phase 3 REC-3: orphan transport_trace garbage collection ────────
+
+/// **Phase 3 / REC-3 (2026-05-24)** — boot orphan-trace scanner closes
+/// `transport_trace` rows allocated by Envelope 1c-pre but never
+/// completed (crash mid-DPS-call: SIGKILL / OOM / power loss).
+///
+/// Scenario:
+///   1. Seed fiscal_document (FK для transport_trace).
+///   2. Insert orphan transport_trace row з outcome_kind=NULL,
+///      started_at older than 60s.
+///   3. Invoke `close_orphan_transport_traces(pool, 60)`.
+///   4. Assert: orphan closed з outcome_kind=SYSTEM_CRASH +
+///      TRANSPORT_TRACE_ORPHAN_CLOSED Info audit emitted.
+#[tokio::test]
+async fn rec3_boot_orphan_trace_scanner_closes_old_allocated_rows() {
+    let (_d, pool) = fresh_pool().await;
+    seed_fn_config(&pool, "1234567890").await;
+    seed_node_state(&pool, "1234567890", "ONLINE", "CLOSED", 1).await;
+    let doc = seed_doc_in_state(&pool, "1234567890", 0x42, "SENT").await;
+
+    // Insert orphan transport_trace row — outcome_kind NULL, started_at
+    // 120s ago (well past 60s TTL).
+    sqlx::query(
+        "INSERT INTO transport_trace( \
+            document_id, attempt_no, started_at, backend_profile_id, \
+            transport_profile_id, request_envelope_sha256) \
+         VALUES (?, 1, datetime('now', '-120 seconds'), 'b1', 't1', ?)",
+    )
+    .bind(doc)
+    .bind(vec![0u8; 32])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Verify orphan present pre-scan.
+    let pre_outcome: Option<String> = sqlx::query_scalar(
+        "SELECT outcome_kind FROM transport_trace WHERE document_id = ? AND attempt_no = 1",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        pre_outcome.is_none(),
+        "pre-scan: orphan outcome_kind MUST be NULL"
+    );
+
+    // Run scanner з 60s TTL.
+    let closed = boot_phase::close_orphan_transport_traces(&pool, 60)
+        .await
+        .expect("scanner");
+    assert_eq!(closed, 1, "scanner MUST close exactly 1 orphan");
+
+    // Post-scan: outcome_kind SYSTEM_CRASH + completion fields populated.
+    let row: (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT outcome_kind, completed_at, wire_call_started_at, \
+                    wire_call_finished_at, error_kind \
+             FROM transport_trace WHERE document_id = ? AND attempt_no = 1",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "SYSTEM_CRASH");
+    assert!(row.1.is_some(), "completed_at MUST be set");
+    assert!(row.2.is_some(), "wire_call_started_at MUST be set");
+    assert!(row.3.is_some(), "wire_call_finished_at MUST be set");
+    assert_eq!(row.4.as_deref(), Some("ORPHANED_AT_BOOT_RECOVERY"));
+
+    // Audit emitted з Info severity + payload.
+    assert_eq!(audit_count(&pool, "TRANSPORT_TRACE_ORPHAN_CLOSED").await, 1);
+    let payload: String = sqlx::query_scalar(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE event_type = 'TRANSPORT_TRACE_ORPHAN_CLOSED' \
+         ORDER BY audit_id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(v["outcome_kind"], "SYSTEM_CRASH");
+    assert_eq!(v["ttl_secs"], 60);
+    assert_eq!(v["attempt_no"], 1);
+}
+
+/// **Phase 3 / REC-3 (2026-05-24)** — TTL guard: orphan rows YOUNGER
+/// than `ttl_secs` MUST NOT be closed (защита від false-positive close
+/// of legitimately in-flight DPS calls на graceful-shutdown boundary).
+#[tokio::test]
+async fn rec3_boot_orphan_trace_scanner_skips_rows_within_ttl_window() {
+    let (_d, pool) = fresh_pool().await;
+    seed_fn_config(&pool, "1234567890").await;
+    seed_node_state(&pool, "1234567890", "ONLINE", "CLOSED", 1).await;
+    let doc = seed_doc_in_state(&pool, "1234567890", 0x43, "SENT").await;
+
+    // Orphan з started_at TYLKO 10s ago — within 60s TTL window.
+    sqlx::query(
+        "INSERT INTO transport_trace( \
+            document_id, attempt_no, started_at, backend_profile_id, \
+            transport_profile_id, request_envelope_sha256) \
+         VALUES (?, 1, datetime('now', '-10 seconds'), 'b1', 't1', ?)",
+    )
+    .bind(doc)
+    .bind(vec![0u8; 32])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let closed = boot_phase::close_orphan_transport_traces(&pool, 60)
+        .await
+        .expect("scanner");
+    assert_eq!(closed, 0, "scanner MUST skip rows within TTL window");
+
+    // Orphan unchanged.
+    let outcome: Option<String> = sqlx::query_scalar(
+        "SELECT outcome_kind FROM transport_trace WHERE document_id = ? AND attempt_no = 1",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(outcome.is_none(), "within-TTL orphan MUST stay NULL");
+    assert_eq!(audit_count(&pool, "TRANSPORT_TRACE_ORPHAN_CLOSED").await, 0);
+}
+
+// ─── Phase 3 REC-8: W8 return-online vs drain race contract lock ─────
+
+/// **Phase 3 / REC-8 (2026-05-24)** — locks W2 single-writer invariant
+/// for node_state snapshot semantic.  Drain orchestrator reads
+/// `node_state` ONCE per tick via `node_state::get(pool, fn)` at
+/// `backlog_drain.rs:662`; `ns` snapshot used throughout drain
+/// decisions (mode check / shift state / cohort filtering / Tier
+/// trigger).  W8 `return_online_probe` may flip `mode` mid-tick BUT
+/// drain's decisions remain based on pre-tick snapshot.
+///
+/// This test verifies the contract is observable: change `node_state.
+/// mode` between two consecutive drain invocations and assert that
+/// each tick sees its own consistent snapshot (no stale read carry-
+/// over, no мid-tick re-read race).
+///
+/// Implementation note: full concurrent W8 spawn + drain race
+/// simulation requires complex tokio test orchestration; this
+/// тіck-to-tick test is a lighter contract lock that асserts the
+/// snapshot-per-tick semantic via observable side-effects.
+#[tokio::test]
+async fn rec8_drain_reads_node_state_snapshot_per_tick_not_mid_tick() {
+    let (_d, pool) = fresh_pool().await;
+    seed_fn_config(&pool, "1234567890").await;
+    // Start з ONLINE (drain MUST refuse в Step 1 з SKIPPED_NOT_GOING_
+    // ONLINE audit).
+    seed_node_state(&pool, "1234567890", "ONLINE", "CLOSED", 1).await;
+
+    // Tick 1: drain reads ONLINE snapshot → happy-path (no refusal).
+    let view = None::<&prro::services::reconciliation::RuntimeView>;
+    let _ = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", view)
+        .await
+        .expect("tick 1");
+    // Tick 1 з ONLINE mode does NOT emit OFFLINE_REFUSAL — refusal
+    // path triggers only on offline-class modes (GoingOnline / etc.).
+    let refusals_after_tick1 = audit_count(&pool, "NODE_STATE_BOOT_OFFLINE_REFUSAL").await;
+    assert_eq!(
+        refusals_after_tick1, 0,
+        "tick 1 з ONLINE snapshot MUST NOT emit OFFLINE_REFUSAL"
+    );
+
+    // External flip (simulating W8 probe success or operator action):
+    // ONLINE → GOING_ONLINE.  This change happens BETWEEN ticks.
+    sqlx::query("UPDATE node_state SET mode = 'GOING_ONLINE' WHERE fiscal_number = ?")
+        .bind("1234567890")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Tick 2: drain MUST re-read node_state (no carry-over from tick
+    // 1) and see GOING_ONLINE.  GoingOnline routes through branch (d)
+    // refusal — emits NODE_STATE_BOOT_OFFLINE_REFUSAL audit.
+    let _ = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", view)
+        .await
+        .expect("tick 2");
+
+    // Verify behavior CHANGED — second tick read fresh snapshot.
+    // GoingOnline emit ONE refusal audit (per-FN single emit per
+    // tick — see boot_phase.rs:1338-1340 "Per-FN single refusal").
+    let refusals_after_tick2 = audit_count(&pool, "NODE_STATE_BOOT_OFFLINE_REFUSAL").await;
+    assert_eq!(
+        refusals_after_tick2, 1,
+        "tick 2 з GOING_ONLINE snapshot MUST emit exactly 1 OFFLINE_REFUSAL \
+         audit (snapshot semantic — drain reads fresh node_state per tick)"
+    );
+
+    // Verify per-tick isolation — tick 2's refusal payload references
+    // GOING_ONLINE mode (NOT ONLINE from tick 1's stale snapshot).
+    let payload: String = sqlx::query_scalar(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE event_type = 'NODE_STATE_BOOT_OFFLINE_REFUSAL' \
+         ORDER BY audit_id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        v["observed_mode"], "GOING_ONLINE",
+        "tick 2 payload MUST carry fresh GOING_ONLINE mode, NOT stale ONLINE from tick 1"
     );
 }
