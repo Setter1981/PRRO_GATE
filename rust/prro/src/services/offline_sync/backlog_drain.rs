@@ -107,13 +107,10 @@ use crate::app::BootError;
 use crate::db::models::enums::{DocState, NodeMode, OfflineSessionState, Severity, ShiftState};
 use crate::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
 use crate::db::repositories::fiscal_documents::TransitionOutcome;
-use crate::db::repositories::{
-    audit_log, document_files, fiscal_documents, node_state, offline_sessions, shifts,
-};
+use crate::db::repositories::{audit_log, fiscal_documents, node_state, offline_sessions, shifts};
 use crate::db::tx::{with_immediate, WriteTxConn};
 use crate::services::offline_sync::kvt2_confirm;
 use crate::services::reconciliation::guard::ReconcileGuard;
-use crate::services::reconciliation::last_chk_probe::{self, ProbeOutcome};
 use crate::services::reconciliation::runtime::RuntimeView;
 use crate::services::write_path::error_routing::RetryClass;
 use crate::services::write_path::stage_send::{self, StageSendError, StageSendOutcome};
@@ -982,13 +979,12 @@ enum DocVerdict {
     /// contract); `projection` distinguishes durable doc state for
     /// summary accounting per [`HoldFnDrainProjection`].
     ///
-    /// `#[allow(dead_code)]` — production constructors arrive in
-    /// Commits 4 / 5 / 5b when drain dispatcher rewires call
-    /// `kvt2_confirm::confirm_drain_doc(...)` and project the
-    /// outcome.  Tests in `w12_control_surface_tests` construct the
-    /// variant directly to lock the projection + summary + finalize
-    /// contracts in isolation.
-    #[allow(dead_code)]
+    /// **5b.2 (2026-05-24)**: production-constructed by
+    /// `process_via_lastchk_replay` (SentReplay HoldFnDrain
+    /// projection mapping per plan §412); previously dead-coded for
+    /// 5b.1 foundation phase.  Tests in `w12_control_surface_tests`
+    /// also construct the variant directly to lock the projection +
+    /// summary + finalize contracts in isolation.
     HoldFnDrain {
         class: FailureClass,
         projection: HoldFnDrainProjection,
@@ -1561,6 +1557,52 @@ async fn cas_er_to_manual_via_drain(
 /// **Server_fiscal_no NULL on SENT** is a structural invariant breach
 /// (stage_send 4-b stamps both atomically with the CAS Sending→Sent);
 /// surfaces as a per-doc Internal-class failure for forensic audit.
+/// **M3b W12 Commit 5b.2 (plan §412 production wiring, 2026-05-24)**
+/// — replaces the pre-W12 `last_chk_probe::probe` → `ProbeOutcome` →
+/// `apply_w12_confirmation`/`downgrade_sent_to_error_retryable_for_retry`
+/// dispatch with the canonical `confirm_drain_doc(SentReplay)` W12
+/// chain.  All wire-call semantics now flow through the W12 routing
+/// matrix (`classify_check_result` + `evaluate_lastchk`).
+///
+/// **Behavioral pivot vs pre-W12** (operator runbook entry — significant
+/// audit semantics shift; see plan §412 MED-1):
+/// - **Match + non-empty data_sign**: pre-W12 stopped at `Kvt1` (stub
+///   `DeferredKvt1`); now advances all the way through
+///   `Sent → Kvt1 → Kvt2 → Ack` atomically via Envelope 1a-replay
+///   (5-write bundled) + Envelope 2 (`stage_finalize::run`).
+/// - **Match + empty data_sign**: pre-W12 marked
+///   `failure_class=Internal, manual_recon=true` (manual recon required);
+///   now classified `Hold(LastChkDataSignEmpty)` → `HoldFnDrain` with
+///   transient retry (next tick re-probes).  Operator dashboards
+///   transition from "manual recon needed" to "KVT2_CONFIRM_HOLD" audit.
+/// - **NotFound**: pre-W12 downgraded `Sent → ErrorRetryable` + per-doc
+///   `OFFLINE_DRAIN_DOC_FAILED` (Transport, manual_recon=false); W12
+///   bundles the downgrade with `transport_trace.complete_tx
+///   TransientRetry` + `OFFLINE_DRAIN_DOC_FAILED` in ONE envelope
+///   (1c-post atomic), returns `HoldFnDrain { ErRedriveQueued }` which
+///   halts current FN drain pending next-tick W9b ER-class-guard
+///   Pattern B redrive via `stage_send::run`.
+/// - **Mismatch**: pre-W12 per-doc `failure_class=Internal,
+///   manual_recon=true` (drain continued); W12 emits
+///   `KVT2_CONFIRM_STRUCTURAL_DRIFT` (Severity::Error) via bundled
+///   Envelope 1c-drift, then `BootError::Internal` halts the FN drain.
+///   Mismatch is now treated as state-machine drift (drain-halting)
+///   instead of per-doc failure.
+/// - **TransportRetry / DecodeEscalate / Unexpected**: pre-W12 per-doc
+///   failure (drain continued); W12 maps to `Hold(DpsTransport |
+///   DpsDecode | DpsServer | DpsAuthorization)` → bundled Envelope
+///   1c-hold + `HoldFnDrain { HeldAtSent }` (doc stays in Sent;
+///   drain halts; next tick re-probes via SentReplay).
+///
+/// **Invariants**:
+/// - I1: DPS call (`evaluate_lastchk`) sits OUTSIDE any `with_immediate`
+///   (1c-pre commits + releases tx BEFORE wire; outcome envelopes open
+///   NEW tx after wire returns).
+/// - I4: Acked path is 5-write atomic; crash between `transport_trace.
+///   complete_tx` and `Sent→Kvt1` CAS is single-tx undone; post-tx crash
+///   before stage_finalize recovers via `stage_finalize::run AlreadyAcked`.
+/// - I8: bundled trace.complete + outcome audit row per plan §412 (every
+///   outcome path emits both forensic markers atomically).
 async fn process_via_lastchk_replay(
     pool: &SqlitePool,
     deps: &RuntimeView<'_>,
@@ -1569,182 +1611,70 @@ async fn process_via_lastchk_replay(
     summary: &mut DrainSummary,
 ) -> Result<DocVerdict, BootError> {
     let id_hex = hex_lower(doc.document_id.as_bytes());
-
-    let Some(expected_id) = doc.server_fiscal_no.as_deref() else {
-        // Structural drift — record as Internal failure, mark
-        // manual-recon-class.
-        let class = FailureClass::Internal;
-        let class_str = failure_class_for(class);
-        summary.record_doc_failure(doc.document_id, class_str.to_string());
-        let payload = serde_json::json!({
-            "document_id": id_hex,
-            "failure_class": class_str,
-            "drift_reason": "SENT doc has server_fiscal_no = NULL (stage_send 4-b invariant breach)",
-            "manual_recon_class": true,
-            "dispatch_via": "lastchk_replay",
-        });
-        emit_doc_failed(pool, &id_hex, &payload).await?;
-        return Ok(DocVerdict::Failed {
-            class,
-            manual_recon: true,
-        });
-    };
-
-    let probe_outcome = last_chk_probe::probe(deps.dps, deps.fn_sign, expected_id).await;
-    match probe_outcome {
-        ProbeOutcome::Match { ack } => {
-            // Spec §2.3 Step A predicate also requires non-empty
-            // data_sign (KVT2 evidence).  Empty data_sign = "DPS
-            // matched the id but didn't return KVT2 bytes" — treat
-            // as a structural Match-but-no-evidence anomaly.
-            if ack.data_sign.is_empty() {
-                let class = FailureClass::Internal;
-                let class_str = failure_class_for(class);
-                summary.record_doc_failure(doc.document_id, class_str.to_string());
-                let payload = serde_json::json!({
-                    "document_id": id_hex,
-                    "failure_class": class_str,
-                    "probe_outcome": "MatchButEmptyDataSign",
-                    "manual_recon_class": true,
-                    "dispatch_via": "lastchk_replay",
-                });
-                emit_doc_failed(pool, &id_hex, &payload).await?;
-                return Ok(DocVerdict::Failed {
-                    class,
-                    manual_recon: true,
-                });
-            }
-            // REPLAY HIT.  Advance via W12 stub — CAS Sent→Kvt1 +
-            // audit row in ONE `with_immediate` envelope (LOW-C5-R1
-            // atomicity).
-            let audit_payload = serde_json::json!({
-                "document_id": id_hex,
-                "from_state": DocState::Sent.as_str(),
-                "to_state": DocState::Kvt1.as_str(),
-                "replay_short_circuit": true,
-                "server_fiscal_no": expected_id,
-                "w12_status": W12ConfirmOutcome::DeferredKvt1.w12_status_str(),
-                "dispatch_via": "lastchk_replay",
-            });
-            // Cohort walker filtered to SENT — pass the literal so
-            // the caller-side contract is grep-able alongside the
-            // dispatcher arm.  KVT1_RAW persisted in-envelope from
-            // `ack.data_sign` (HIGH-C5-2 fix: forensic evidence
-            // contract matches M3a `boot_phase::advance_sent_to_
-            // kvt1_from_probe`).
-            let w12 = apply_w12_confirmation(
+    // Source canonical expected_server_fiscal_no per MED-PR70-R11-01 —
+    // SENT cohort row was stage_send-stamped (4-b invariant); None
+    // here is state-machine breach.  Emit drift envelope + halt
+    // (mirrors `process_via_w12_only` Kvt1Reentry pattern from
+    // Commit 5 Δ MED-W12C5-01 fix).
+    let expected_server_fiscal_no = match doc.server_fiscal_no.as_deref() {
+        Some(s) => s,
+        None => {
+            kvt2_confirm::commit_drift_envelope_1c_drift_light(
                 pool,
                 fiscal_number,
-                doc.document_id,
-                DocState::Sent,
-                &audit_payload,
-                Some(&ack.data_sign),
+                &id_hex,
+                kvt2_confirm::Kvt2ConfirmSource::SentReplay,
+                &kvt2_confirm::Kvt2ConfirmStructuralReason::ServerFiscalNoMissing,
             )
             .await?;
-            summary.record_doc_advanced(&w12, true);
+            return Err(BootError::Internal(format!(
+                "process_via_lastchk_replay({fn_id}): doc {id_hex} at state Sent has \
+                 NULL server_fiscal_no — stage_send 4-b stamp invariant breach \
+                 (Sent cohort row ALWAYS implies stage_send stamped it).  \
+                 KVT2_CONFIRM_STRUCTURAL_DRIFT audit emitted prior to halt.",
+                fn_id = fiscal_number,
+            )));
+        }
+    };
+    let confirm_outcome = kvt2_confirm::confirm_drain_doc(
+        pool,
+        deps.dps,
+        doc,
+        expected_server_fiscal_no,
+        deps.fn_sign,
+        kvt2_confirm::Kvt2ConfirmSource::SentReplay,
+        // attempt_no: None — SentReplay's trace attempt_no lives in
+        // `transport_trace` (allocated by Envelope 1c-pre INSIDE
+        // confirm_drain_doc), NOT on confirm_drain_doc's audit-
+        // payload surface.
+        None,
+    )
+    .await?;
+    match confirm_outcome {
+        kvt2_confirm::ConfirmDrainOutcome::Advanced => {
+            summary.record_doc_advanced(
+                &W12ConfirmOutcome::Acked {
+                    server_fiscal_no: expected_server_fiscal_no.to_string(),
+                },
+                /* via_lastchk_replay */ true,
+            );
             Ok(DocVerdict::Advanced)
         }
-        ProbeOutcome::Mismatch { actual_id } => {
-            let class = FailureClass::Internal;
-            let class_str = failure_class_for(class);
-            summary.record_doc_failure(doc.document_id, class_str.to_string());
-            let payload = serde_json::json!({
-                "document_id": id_hex,
-                "failure_class": class_str,
-                "probe_outcome": "Mismatch",
-                "expected_server_fiscal_no": expected_id,
-                "actual_server_fiscal_no": actual_id,
-                "manual_recon_class": true,
-                "dispatch_via": "lastchk_replay",
-            });
-            emit_doc_failed(pool, &id_hex, &payload).await?;
-            Ok(DocVerdict::Failed {
-                class,
-                manual_recon: true,
-            })
-        }
-        ProbeOutcome::NotFound => {
-            // HIGH-C5-3 fix (2026-05-21): DPS NotFound is the safe
-            // Pattern B re-drive case — DPS has zero record of any
-            // check for this FN_sign, so re-sending via `stage_send`
-            // (next tick, through ERROR_RETRYABLE cohort) does NOT
-            // double-fiscalize.  Matches the existing M3a
-            // `boot_phase` last_chk NotFound contract (W9 freeze
-            // §4.5).  CAS Sent → ErrorRetryable + audit row in ONE
-            // `with_immediate` envelope so the downgrade is atomic
-            // with its forensic trail.  Non-manual class: pending-
-            // drain shifts retain retry budget (spec §3.5 "Manual is
-            // last resort").
-            downgrade_sent_to_error_retryable_for_retry(
-                pool,
-                fiscal_number,
-                doc.document_id,
-                &id_hex,
-                expected_id,
-            )
-            .await?;
-            let class = FailureClass::Transport;
-            let class_str = failure_class_for(class);
-            summary.record_doc_failure(doc.document_id, class_str.to_string());
-            Ok(DocVerdict::Failed {
-                class,
-                manual_recon: false,
-            })
-        }
-        ProbeOutcome::TransportRetry { reason } => {
-            // Non-manual: retain retry budget for next tick.  Doc
-            // stays in SENT; next drain tick re-probes.
-            let class = FailureClass::Transport;
-            let class_str = failure_class_for(class);
-            summary.record_doc_failure(doc.document_id, class_str.to_string());
-            let payload = serde_json::json!({
-                "document_id": id_hex,
-                "failure_class": class_str,
-                "probe_outcome": "TransportRetry",
-                "probe_reason": reason,
-                "manual_recon_class": false,
-                "dispatch_via": "lastchk_replay",
-            });
-            emit_doc_failed(pool, &id_hex, &payload).await?;
-            Ok(DocVerdict::Failed {
-                class,
-                manual_recon: false,
-            })
-        }
-        ProbeOutcome::DecodeEscalate { reason } => {
-            let class = FailureClass::Decode;
-            let class_str = failure_class_for(class);
-            summary.record_doc_failure(doc.document_id, class_str.to_string());
-            let payload = serde_json::json!({
-                "document_id": id_hex,
-                "failure_class": class_str,
-                "probe_outcome": "DecodeEscalate",
-                "probe_reason": reason,
-                "manual_recon_class": true,
-                "dispatch_via": "lastchk_replay",
-            });
-            emit_doc_failed(pool, &id_hex, &payload).await?;
-            Ok(DocVerdict::Failed {
-                class,
-                manual_recon: true,
-            })
-        }
-        ProbeOutcome::Unexpected { dps_error } => {
-            let class = FailureClass::Internal;
-            let class_str = failure_class_for(class);
-            summary.record_doc_failure(doc.document_id, class_str.to_string());
-            let payload = serde_json::json!({
-                "document_id": id_hex,
-                "failure_class": class_str,
-                "probe_outcome": "Unexpected",
-                "probe_error": dps_error,
-                "manual_recon_class": true,
-                "dispatch_via": "lastchk_replay",
-            });
-            emit_doc_failed(pool, &id_hex, &payload).await?;
-            Ok(DocVerdict::Failed {
-                class,
-                manual_recon: true,
+        kvt2_confirm::ConfirmDrainOutcome::HoldFnDrain { projection } => {
+            // SentReplay HoldFnDrain projection maps directly to
+            // DocVerdict::HoldFnDrain — drain orchestrator halts on
+            // this doc this tick; next tick re-evaluates via SentReplay
+            // (HeldAtSent: doc stays Sent, next tick re-probes) OR
+            // via W9b ER cohort (ErRedriveQueued: doc advanced to ER
+            // by 1c-post, next tick re-sends via stage_send).  Both
+            // projections classified FailureClass::Transport: operator-
+            // facing transient class, retain retry budget per W0b
+            // state-unchanged contract (pending-drain shifts do NOT
+            // escalate on HoldFnDrain per backlog_drain consumer
+            // logic — only manual-recon-class Failed escalates).
+            Ok(DocVerdict::HoldFnDrain {
+                class: FailureClass::Transport,
+                projection,
             })
         }
     }
@@ -2004,214 +1934,6 @@ async fn process_via_w12_kvt2_advance(
             })
         }
     }
-}
-
-/// W9b C5 W12 stub seam (spec §2.3 Step C + §9 OQ-2).  Pre-W12
-/// stub body ALWAYS returns [`W12ConfirmOutcome::DeferredKvt1`] —
-/// no real Ack proof is constructible by drain alone (operator-pinned
-/// invariant).  W12 PR replaces this body with the `lastChk` evidence
-/// path (`Kvt1 → Kvt2 → Ack` via `stage_finalize::run`).
-///
-/// **Per-state semantics**:
-/// - `Sent` → CAS `Sent → Kvt1` + `OFFLINE_DRAIN_DOC_ADVANCED` audit
-///   row atomically in one `with_immediate` envelope (LOW-C5-R1
-///   atomicity fix 2026-05-21: audit-append-after-commit would leave
-///   the doc advanced without forensic trail if audit append failed).
-/// - `Kvt1` / `Kvt2` → no DB CAS; emit pool-bound audit (atomicity
-///   not at risk — nothing else to be atomic with).  Pre-W12 drain
-///   re-encounters these states across ticks (the walker scans
-///   them); the stub records "still awaiting W12" without mutation.
-///   Post-W12, this arm gains the `Kvt2 → Ack` advance via
-///   `stage_finalize::run`.
-/// - Other states → `BootError::Internal` (caller bug — the cohort
-///   walker SELECT must filter to these states).
-///
-/// Single-writer invariant (App reconcile mutex + per-FN serialised
-/// drain) makes non-`Applied` CAS unreachable in production — a
-/// non-`Applied` outcome surfaces as `BootError::Internal` for
-/// operator triage rather than silent miscounting.
-///
-/// `audit_payload` is the pre-built `OFFLINE_DRAIN_DOC_ADVANCED`
-/// payload from the caller (carries dispatch-specific fields like
-/// `dispatch_via`, `replay_short_circuit`, `attempt_no`, etc.).  The
-/// helper emits the audit row inside the envelope to bind CAS +
-/// audit atomicity.
-///
-/// `current_state` is the state the caller asserts the doc is in at
-/// the moment of invocation (cohort-walker state for KVT1
-/// w12-only path; `DocState::Sent` literal after a successful
-/// `stage_send::run` Sent outcome OR after a lastChk replay HIT).
-/// Helper routes the per-state CAS arm by this value — the caller
-/// binds the contract at the call site.
-///
-/// `kvt1_raw_bytes` (HIGH-C5-2 fix 2026-05-21): when the caller
-/// has the `lastChk` ack's `data_sign` evidence in hand (replay HIT
-/// path), pass `Some(&ack.data_sign)` and the helper persists it
-/// into `document_files::Kvt1Raw` INSIDE the same envelope as the
-/// Sent→Kvt1 CAS + audit.  Matches the M3a `boot_phase::advance_
-/// sent_to_kvt1_from_probe` evidence contract (forensic KVT1_RAW
-/// per legal-trail requirements).  Pass `None` from the
-/// stage_send::Sent path (no `data_sign` in hand pre-W12; W12 PR
-/// closes this gap by routing all Sent advances through the
-/// lastChk evidence path).  Ignored on the `Kvt1` arm.
-async fn apply_w12_confirmation(
-    pool: &SqlitePool,
-    fiscal_number: &str,
-    doc_id: DocumentId,
-    current_state: DocState,
-    audit_payload: &serde_json::Value,
-    kvt1_raw_bytes: Option<&[u8]>,
-) -> Result<W12ConfirmOutcome, BootError> {
-    let id_hex = hex_lower(doc_id.as_bytes());
-    match current_state {
-        DocState::Sent => {
-            let payload_owned = audit_payload.to_string();
-            let id_hex_owned = id_hex.clone();
-            let fn_for_internal = fiscal_number.to_string();
-            let kvt1_raw_owned: Option<Vec<u8>> = kvt1_raw_bytes.map(|b| b.to_vec());
-            with_immediate(pool, move |tx| {
-                Box::pin(async move {
-                    let outcome = fiscal_documents::transition_state(
-                        tx,
-                        doc_id,
-                        DocState::Sent,
-                        DocState::Kvt1,
-                    )
-                    .await?;
-                    if outcome != TransitionOutcome::Applied {
-                        return Err(anyhow::anyhow!(
-                            "backlog_drain({fn_id}): apply_w12_confirmation CAS \
-                             Sent→Kvt1 produced {outcome} for doc {doc_hex} \
-                             (single-writer invariant breach)",
-                            fn_id = fn_for_internal,
-                            outcome = outcome_as_str(outcome),
-                            doc_hex = id_hex_owned,
-                        ));
-                    }
-                    if let Some(raw) = kvt1_raw_owned.as_deref() {
-                        document_files::replace_tx(
-                            tx,
-                            doc_id,
-                            document_files::DocumentFileKind::Kvt1Raw,
-                            raw,
-                        )
-                        .await?;
-                    }
-                    audit_log::append_tx(
-                        tx,
-                        AUDIT_ENTITY_DOC,
-                        &id_hex_owned,
-                        "OFFLINE_DRAIN_DOC_ADVANCED",
-                        Severity::Info,
-                        None,
-                        Some(&payload_owned),
-                    )
-                    .await?;
-                    Ok::<(), anyhow::Error>(())
-                })
-            })
-            .await
-            .map_err(|source| BootError::ReconciliationFailed {
-                fiscal_number: fiscal_number.to_string(),
-                source,
-            })?;
-            Ok(W12ConfirmOutcome::DeferredKvt1)
-        }
-        DocState::Kvt1 => {
-            audit_log::append(
-                pool,
-                AUDIT_ENTITY_DOC,
-                &id_hex,
-                "OFFLINE_DRAIN_DOC_ADVANCED",
-                Severity::Info,
-                None,
-                Some(&audit_payload.to_string()),
-            )
-            .await
-            .map_err(BootError::Database)?;
-            Ok(W12ConfirmOutcome::DeferredKvt1)
-        }
-        other => Err(BootError::Internal(format!(
-            "backlog_drain({fiscal_number}): apply_w12_confirmation invoked on \
-             unsupported state {state} for doc {doc_hex} (cohort walker should \
-             only surface Sent/Kvt1 to this helper post MED-C5-4 KVT2 deferral)",
-            state = other.as_str(),
-            doc_hex = id_hex,
-        ))),
-    }
-}
-
-/// HIGH-C5-3 helper (2026-05-21): on a `lastChk` NotFound for a
-/// SENT cohort doc, downgrade the doc to `ErrorRetryable` so the
-/// next drain tick re-drives it through the W9a 4-pre source
-/// whitelist (`stage_send::run`).  CAS + audit emit committed in
-/// ONE `with_immediate` envelope.
-///
-/// The audit event reuses `OFFLINE_DRAIN_DOC_FAILED` (Warning) with
-/// `failure_class="transport"` + `manual_recon_class=false` —
-/// matches the spec amendment 2026-05-21 contract that TransientRetry-
-/// class outcomes retain retry budget and do NOT halt pending-drain
-/// shifts.  Distinguishable from genuine Transport-on-stage_send via
-/// the `dispatch_via="lastchk_replay"` + `probe_outcome="NotFound"`
-/// payload fields.
-async fn downgrade_sent_to_error_retryable_for_retry(
-    pool: &SqlitePool,
-    fiscal_number: &str,
-    doc_id: DocumentId,
-    id_hex: &str,
-    expected_server_fiscal_no: &str,
-) -> Result<(), BootError> {
-    let class_str = failure_class_for(FailureClass::Transport);
-    let payload = serde_json::json!({
-        "document_id": id_hex,
-        "failure_class": class_str,
-        "probe_outcome": "NotFound",
-        "expected_server_fiscal_no": expected_server_fiscal_no,
-        "downgrade_target_state": DocState::ErrorRetryable.as_str(),
-        "manual_recon_class": false,
-        "dispatch_via": "lastchk_replay",
-    });
-    let payload_owned = payload.to_string();
-    let id_hex_owned = id_hex.to_string();
-    let fn_for_internal = fiscal_number.to_string();
-    with_immediate(pool, move |tx| {
-        Box::pin(async move {
-            let outcome = fiscal_documents::transition_state(
-                tx,
-                doc_id,
-                DocState::Sent,
-                DocState::ErrorRetryable,
-            )
-            .await?;
-            if outcome != TransitionOutcome::Applied {
-                return Err(anyhow::anyhow!(
-                    "backlog_drain({fn_id}): downgrade Sent→ErrorRetryable CAS \
-                     produced {outcome} for doc {doc_hex} (single-writer invariant \
-                     breach)",
-                    fn_id = fn_for_internal,
-                    outcome = outcome_as_str(outcome),
-                    doc_hex = id_hex_owned,
-                ));
-            }
-            audit_log::append_tx(
-                tx,
-                AUDIT_ENTITY_DOC,
-                &id_hex_owned,
-                "OFFLINE_DRAIN_DOC_FAILED",
-                Severity::Warning,
-                None,
-                Some(&payload_owned),
-            )
-            .await?;
-            Ok::<(), anyhow::Error>(())
-        })
-    })
-    .await
-    .map_err(|source| BootError::ReconciliationFailed {
-        fiscal_number: fiscal_number.to_string(),
-        source,
-    })?;
-    Ok(())
 }
 
 /// Wire-form string for the four `TransitionOutcome` variants.
