@@ -2008,7 +2008,7 @@ async fn w12_kvt1_reentry_mismatch_emits_drift_audit_and_halts_via_boot_error() 
 }
 
 #[tokio::test]
-async fn w12_kvt1_reentry_dps_transport_emits_hold_audit_and_halts_via_boot_error() {
+async fn w12_kvt1_reentry_dps_transport_holds_drain_and_projects_held_at_kvt1() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool).await;
@@ -2037,8 +2037,7 @@ async fn w12_kvt1_reentry_dps_transport_emits_hold_audit_and_halts_via_boot_erro
     .unwrap();
 
     // DPS Transport error → Hold(DpsTransport) → Envelope
-    // 1c-hold-light audit + BootError until Commit 6 wires
-    // HoldFnDrain.
+    // 1c-hold-light audit. Commit 6 projects Ok(HoldFnDrain { HeldAtKvt1 }).
     let c = carriers(
         vec![],
         vec![Err(DpsError::Transport(
@@ -2047,17 +2046,25 @@ async fn w12_kvt1_reentry_dps_transport_emits_hold_audit_and_halts_via_boot_erro
     );
     let view = view_for(&c);
 
-    let err = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
         .await
-        .expect_err("Kvt1Reentry Hold MUST halt drain via BootError until Commit 6");
-    let err_str = err.to_string();
-    assert!(
-        err_str.contains("Hold") || err_str.contains("KVT2_CONFIRM_HOLD"),
-        "BootError must mention Hold; got: {err_str}"
-    );
+        .unwrap();
 
     // Doc state UNCHANGED at KVT1.
     assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
+
+    // HoldFnDrain projection: HeldAtKvt1 (NOT HeldAtSent) per MED-PR70-R7-02.
+    assert_eq!(
+        summary.held_at_kvt1(),
+        1,
+        "Kvt1Reentry Hold MUST project HeldAtKvt1"
+    );
+    assert_eq!(
+        summary.held_at_sent(),
+        0,
+        "Kvt1Reentry Hold MUST NOT project HeldAtSent"
+    );
+    assert_eq!(summary.er_redrive_queued(), 0);
 
     assert_eq!(audit_count(&pool, "KVT2_CONFIRM_HOLD").await, 1);
     let hold = audit_latest_payload(&pool, "KVT2_CONFIRM_HOLD")
@@ -2156,4 +2163,87 @@ async fn w12_kvt1_reentry_doc_without_server_fiscal_no_emits_drift_audit_and_hal
     // No advance / hold audit on this caller-level structural drift.
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 0);
     assert_eq!(audit_count(&pool, "KVT2_CONFIRM_HOLD").await, 0);
+}
+
+// ─── Test 10: SentFresh Hold projection → HeldAtSent ─────────────────
+
+/// **M3b W12 Commit 6 (MED-PR70-R7-02, 2026-05-24)** — Integration test
+/// for SentFresh Hold projection.  When a doc at stage_send::run successfully
+/// submits to the wire (state transitions OFFLINE_LOCAL_ACK → SENT) but
+/// the subsequent W12 pre-flight confirm_drain_doc(SentFresh) encounters
+/// a transient DPS error (e.g. Transport timeout), the drain MUST NOT
+/// crash with BootError::Internal.
+///
+/// Instead, the doc is held at SENT (W0b state-unchanged contract),
+/// and the drain projects `HeldAtSent` (summary.held_at_sent() == 1,
+/// held_at_kvt1() == 0).  A transient KVT2_CONFIRM_HOLD audit row is
+/// emitted with source=sent_fresh.
+#[tokio::test]
+async fn c6_sent_fresh_hold_emits_hold_audit_and_projects_held_at_sent() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "OFFLINE_LOCAL_ACK",
+        None,
+    )
+    .await;
+
+    // stage_send::run succeeds (returns Ok(Sent)), but confirm_drain_doc
+    // encounters DpsError::Transport -> Hold(DpsTransport).
+    // projects Ok(HoldFnDrain { HeldAtSent }).
+    let c = carriers(
+        vec![Ok(ack("DPS-FN-HOLD", vec![0xCD]))],
+        vec![Err(DpsError::Transport(
+            "simulated fresh lastChk timeout".into(),
+        ))],
+    );
+    let view = view_for(&c);
+
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    // Doc remains in SENT (stage_send transitioned it, but Hold prevented Ack).
+    assert_eq!(read_doc_state(&pool, doc).await, "SENT");
+
+    // HoldFnDrain projection: HeldAtSent (NOT HeldAtKvt1) per MED-PR70-R7-02.
+    assert_eq!(
+        summary.held_at_sent(),
+        1,
+        "SentFresh Hold MUST project HeldAtSent"
+    );
+    assert_eq!(
+        summary.held_at_kvt1(),
+        0,
+        "SentFresh Hold MUST NOT project HeldAtKvt1"
+    );
+    assert_eq!(summary.er_redrive_queued(), 0);
+
+    assert_eq!(c.dps.send_chk_count(), 1, "stage_send reached wire");
+    assert_eq!(c.dps.last_chk_count(), 1, "confirm_drain_doc reached wire");
+
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_HOLD").await, 1);
+    let hold = audit_latest_payload(&pool, "KVT2_CONFIRM_HOLD")
+        .await
+        .unwrap();
+    assert_eq!(hold["source"], "sent_fresh");
+    assert_eq!(hold["hold_reason"], "DPS_TRANSPORT");
+    assert_eq!(hold["dispatch_via"], "kvt2_confirm");
+    let detail = hold["hold_reason_detail"]
+        .as_str()
+        .expect("hold_reason_detail must be a string");
+    assert!(
+        detail.contains("simulated fresh lastChk timeout"),
+        "hold detail must carry DPS error message; got: {detail}"
+    );
+
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 0);
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await, 0);
 }

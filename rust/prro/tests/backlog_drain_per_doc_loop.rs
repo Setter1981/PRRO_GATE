@@ -37,7 +37,10 @@
 //!   7. `c4_pending_drain_shift_transient_retry_sibling_continues_no_halt`
 //!   8. `w12_sent_fresh_not_found_emits_drift_audit_and_halts_via_boot_error`
 //!   9. `w12_sent_fresh_mismatch_emits_drift_audit_and_halts_via_boot_error`
-//!  10. `w12_sent_fresh_dps_transport_emits_hold_audit_and_halts_via_boot_error`
+//!  10. `w12_sent_fresh_dps_transport_holds_drain_and_projects_held_at_sent`
+//!      (refactored 2026-05-24 W12 Commit 6: replaces BootError-halt
+//!      assertion з HoldFnDrain projection + held_at_sent==1 per
+//!      MED-PR70-R7-02 projection matrix)
 
 mod common;
 
@@ -1222,11 +1225,19 @@ async fn w12_sent_fresh_mismatch_emits_drift_audit_and_halts_via_boot_error() {
 }
 
 #[tokio::test]
-async fn w12_sent_fresh_dps_transport_emits_hold_audit_and_halts_via_boot_error() {
-    // Hold path coverage (Commit 4b.1 envelope 1c-hold-light).  4b.1
-    // wired audit emission BEFORE BootError::Internal halt; HoldFnDrain
-    // projection (DocVerdict::HoldFnDrain { HeldAtSent }) is Commit 6
-    // scope — 4b.3 only locks the audit-trail contract.
+async fn w12_sent_fresh_dps_transport_holds_drain_and_projects_held_at_sent() {
+    // **M3b W12 Commit 6 (plan §413 production wiring, 2026-05-24)** —
+    // refactored from `w12_sent_fresh_dps_transport_emits_hold_audit_
+    // and_halts_via_boot_error`.  Pre-Commit-6: SentFresh Hold path
+    // halt-ed FN drain via defensive `BootError::Internal` (5b.1
+    // foundation).  Post-Commit-6: confirm_drain_doc Hold arm returns
+    // `Ok(ConfirmDrainOutcome::HoldFnDrain { HeldAtSent })` per
+    // MED-PR70-R7-02 projection matrix; `process_via_stage_send`
+    // forwards as `Ok(DocVerdict::HoldFnDrain { Transport, HeldAtSent })`
+    // → drain orchestrator halts on this doc (break), records
+    // `held_at_sent` counter, returns successful summary.  Pending-
+    // drain shifts do NOT escalate on HoldFnDrain (only manual-recon-
+    // class Failed escalates per backlog_drain consumer logic).
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool, CASHIER_OK).await;
@@ -1247,30 +1258,37 @@ async fn w12_sent_fresh_dps_transport_emits_hold_audit_and_halts_via_boot_error(
     .unwrap();
 
     // stage_send succeeds; lastChk fails with Transport error →
-    // classify_check_result → Hold(DpsTransport).
+    // classify_check_result → Hold(DpsTransport) → Commit-6 HoldFnDrain.
     let carriers = carriers_with_responses_and_last_chk(
         vec![Ok(ack("DPS-FRESH-HOLD"))],
         vec![Err(DpsError::Transport("simulated lastChk timeout".into()))],
     );
     let view = view_for(&carriers);
 
-    let err = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
         .await
-        .expect_err(
-            "SentFresh Hold MUST halt drain via BootError until Commit 6 wires HoldFnDrain",
-        );
+        .unwrap();
 
-    let err_str = err.to_string();
-    assert!(
-        err_str.contains("Hold") || err_str.contains("KVT2_CONFIRM_HOLD"),
-        "BootError must mention Hold path; got: {err_str}"
-    );
-
-    // Doc state unchanged (Sent — Envelope 1a never committed).
+    // Doc state unchanged (Sent — Envelope 1a never committed; 1c-hold
+    // does not CAS state per W0b state-unchanged contract).
     assert_eq!(read_doc_state(&pool, doc).await, "SENT");
 
-    // Envelope 1c-hold-light forensic audit fired BEFORE halt
-    // (Severity::Warning per plan §449).
+    // HoldFnDrain projection per MED-PR70-R7-02: SentFresh → HeldAtSent
+    // (NOT HeldAtKvt1; doc is Sent post-stage_send, hold doesn't advance).
+    assert_eq!(
+        summary.held_at_sent(),
+        1,
+        "SentFresh Hold MUST project HeldAtSent"
+    );
+    assert_eq!(
+        summary.held_at_kvt1(),
+        0,
+        "SentFresh Hold MUST NOT project HeldAtKvt1 (doc is Sent, not Kvt1)"
+    );
+    assert_eq!(summary.er_redrive_queued(), 0);
+
+    // Envelope 1c-hold-light forensic audit fired (Severity::Warning
+    // per plan §449); audit chain unchanged from 4b.1 foundation.
     assert_eq!(audit_count(&pool, "KVT2_CONFIRM_HOLD").await, 1);
     let hold_payloads = audit_payloads_for(&pool, "KVT2_CONFIRM_HOLD").await;
     assert_eq!(hold_payloads[0]["source"], "sent_fresh");
