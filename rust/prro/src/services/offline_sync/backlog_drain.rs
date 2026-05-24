@@ -1180,19 +1180,10 @@ async fn process_via_stage_send(
                     Ok(DocVerdict::Advanced)
                 }
                 kvt2_confirm::ConfirmDrainOutcome::HoldFnDrain { projection } => {
-                    // M3b W12 Commit 5b.1: defensive — SentFresh Hold
-                    // arm в `confirm_drain_doc` STILL returns
-                    // `BootError::Internal` defensive marker until
-                    // Commit 6 wires HoldFnDrain projection for
-                    // SentFresh.  Receiving HoldFnDrain here means
-                    // Commit 6 landed without updating this caller —
-                    // fail-loud з diagnostic.
-                    Err(BootError::Internal(format!(
-                        "process_via_stage_send: confirm_drain_doc(SentFresh) \
-                         returned HoldFnDrain {{ projection: {projection:?} }} \
-                         — structurally unreachable until Commit 6 rewires \
-                         SentFresh Hold caller-side projection"
-                    )))
+                    Ok(DocVerdict::HoldFnDrain {
+                        class: FailureClass::Transport,
+                        projection,
+                    })
                 }
             }
         }
@@ -1759,18 +1750,10 @@ async fn process_via_w12_only(
             Ok(DocVerdict::Advanced)
         }
         kvt2_confirm::ConfirmDrainOutcome::HoldFnDrain { projection } => {
-            // M3b W12 Commit 5b.1: defensive — Kvt1Reentry Hold arm
-            // в `confirm_drain_doc` STILL returns BootError::Internal
-            // defensive marker until Commit 6 wires HoldFnDrain
-            // projection for Kvt1Reentry.  Receiving HoldFnDrain here
-            // means Commit 6 landed without updating this caller —
-            // fail-loud з diagnostic.
-            Err(BootError::Internal(format!(
-                "process_via_w12_only: confirm_drain_doc(Kvt1Reentry) \
-                 returned HoldFnDrain {{ projection: {projection:?} }} \
-                 — structurally unreachable until Commit 6 rewires \
-                 Kvt1Reentry Hold caller-side projection"
-            )))
+            Ok(DocVerdict::HoldFnDrain {
+                class: FailureClass::Transport,
+                projection,
+            })
         }
     }
 }

@@ -741,7 +741,7 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
                         projection: HoldFnDrainProjection::HeldAtSent,
                     })
                 }
-                _ => {
+                Kvt2ConfirmSource::SentFresh => {
                     commit_hold_envelope_1c_hold_light(
                         pool,
                         &fiscal_number,
@@ -750,12 +750,22 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
                         &reason,
                     )
                     .await?;
-                    Err(BootError::Internal(format!(
-                        "confirm_drain_doc({source:?}): Hold audit emitted \
-                         (KVT2_CONFIRM_HOLD) for doc {id_hex} — reason={reason:?}.  \
-                         HoldFnDrain projection not yet wired (Commit 6 scope); \
-                         caller observes BootError until then."
-                    )))
+                    Ok(ConfirmDrainOutcome::HoldFnDrain {
+                        projection: HoldFnDrainProjection::HeldAtSent,
+                    })
+                }
+                Kvt2ConfirmSource::Kvt1Reentry => {
+                    commit_hold_envelope_1c_hold_light(
+                        pool,
+                        &fiscal_number,
+                        &id_hex,
+                        source,
+                        &reason,
+                    )
+                    .await?;
+                    Ok(ConfirmDrainOutcome::HoldFnDrain {
+                        projection: HoldFnDrainProjection::HeldAtKvt1,
+                    })
                 }
             }
         }
