@@ -1325,11 +1325,10 @@ pub async fn reset_consecutive_holds_tx(
     tx: &mut WriteTxConn<'_>,
     doc_id: DocumentId,
 ) -> sqlx::Result<bool> {
-    let res = sqlx::query(
-        "UPDATE fiscal_documents SET consecutive_holds = 0 WHERE document_id = ?",
-    )
-    .bind(doc_id)
-    .execute(&mut **tx)
-    .await?;
+    let res =
+        sqlx::query("UPDATE fiscal_documents SET consecutive_holds = 0 WHERE document_id = ?")
+            .bind(doc_id)
+            .execute(&mut **tx)
+            .await?;
     Ok(res.rows_affected() == 1)
 }
