@@ -68,7 +68,7 @@ use prro::services::reconciliation::runtime::RuntimeView;
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
-use prro::transports::dps::error::DpsError;
+use prro::transports::dps::error::{AuthorizationKind, DpsError};
 use prro::BootError;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
@@ -2685,4 +2685,173 @@ async fn c612_tier_2_stop_mode_escalation_fires_at_50_consecutive_holds() {
     assert_eq!(payload["consecutive_holds"], 50);
     assert_eq!(payload["node_mode_target"], "STOP_MODE");
     assert_eq!(payload["fiscal_number"], FN);
+}
+
+// ─── Phase 2b Commit 6.2 REC-6: granular FailureClass per Hold reason ──
+
+/// Test fixture builder: seed Kvt1 doc з prereqs, run drain з one
+/// specific DPS error, return the doc id for downstream assertions.
+async fn drive_kvt1_reentry_hold_with_dps_error(
+    pool: &SqlitePool,
+    expected_id: &str,
+    dps_err: DpsError,
+) -> DocumentId {
+    seed_node_state(pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(pool).await;
+    let session_id = seed_offline_session(pool, OfflineSessionState::Open).await;
+    let doc = seed_doc_in_state(
+        pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "KVT1",
+        Some(expected_id),
+    )
+    .await;
+    common::init_chain_seed(pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        pool,
+        FN,
+        doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+    let c = carriers(vec![], vec![Err(dps_err)]);
+    let view = view_for(&c);
+    let _ = backlog_drain::drain(&common::drain_test_guard(), pool, &view, FN)
+        .await
+        .unwrap();
+    doc
+}
+
+/// **REC-6 integration Test 1**: DpsError::Server →
+/// Kvt2ConfirmHoldReason::DpsServer → FailureClass::Server.
+/// Audit payload `hold_reason="DPS_SERVER"`.
+#[tokio::test]
+async fn c62_granular_failure_class_server() {
+    let (_d, pool) = fresh_pool().await;
+    let _doc = drive_kvt1_reentry_hold_with_dps_error(
+        &pool,
+        "DPS-FN-SERVER",
+        DpsError::Server {
+            code: -5,
+            message: "simulated server error".into(),
+        },
+    )
+    .await;
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_HOLD").await, 1);
+    let payload = audit_latest_payload(&pool, "KVT2_CONFIRM_HOLD")
+        .await
+        .unwrap();
+    assert_eq!(payload["source"], "kvt1_reentry");
+    assert_eq!(
+        payload["hold_reason"], "DPS_SERVER",
+        "DpsError::Server MUST map to hold_reason=DPS_SERVER"
+    );
+}
+
+/// **REC-6 integration Test 2**: DpsError::Authorization →
+/// Kvt2ConfirmHoldReason::DpsAuthorization → FailureClass::Authorization.
+/// Audit payload `hold_reason="DPS_AUTHORIZATION"`.
+#[tokio::test]
+async fn c62_granular_failure_class_auth() {
+    let (_d, pool) = fresh_pool().await;
+    let _doc = drive_kvt1_reentry_hold_with_dps_error(
+        &pool,
+        "DPS-FN-AUTH",
+        DpsError::Authorization {
+            code: -1,
+            kind: AuthorizationKind::DocumentReject,
+            message: "simulated auth reject".into(),
+        },
+    )
+    .await;
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_HOLD").await, 1);
+    let payload = audit_latest_payload(&pool, "KVT2_CONFIRM_HOLD")
+        .await
+        .unwrap();
+    assert_eq!(
+        payload["hold_reason"], "DPS_AUTHORIZATION",
+        "DpsError::Authorization MUST map to hold_reason=DPS_AUTHORIZATION"
+    );
+}
+
+/// **REC-6 integration Test 3**: DpsError::Decode →
+/// Kvt2ConfirmHoldReason::DpsDecode → FailureClass::Decode.
+/// Audit payload `hold_reason="DPS_DECODE"`.
+#[tokio::test]
+async fn c62_granular_failure_class_decode() {
+    let (_d, pool) = fresh_pool().await;
+    let _doc = drive_kvt1_reentry_hold_with_dps_error(
+        &pool,
+        "DPS-FN-DECODE",
+        DpsError::Decode("malformed protobuf".into()),
+    )
+    .await;
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_HOLD").await, 1);
+    let payload = audit_latest_payload(&pool, "KVT2_CONFIRM_HOLD")
+        .await
+        .unwrap();
+    assert_eq!(
+        payload["hold_reason"], "DPS_DECODE",
+        "DpsError::Decode MUST map to hold_reason=DPS_DECODE"
+    );
+}
+
+/// **REC-6 integration Test 4**: Match + empty data_sign →
+/// Kvt2ConfirmHoldReason::LastChkDataSignEmpty → FailureClass::Internal.
+/// Audit payload `hold_reason="LASTCHK_DATA_SIGN_EMPTY"`.  Driven
+/// з Ok(ack) (NOT Err) since this Hold variant only fires on
+/// successful DPS response з empty data_sign.
+#[tokio::test]
+async fn c62_granular_failure_class_data_sign_empty() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "KVT1",
+        Some("DPS-FN-EMPTY"),
+    )
+    .await;
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+    // Match + empty data_sign → Hold(LastChkDataSignEmpty).
+    let c = carriers(vec![], vec![Ok(ack("DPS-FN-EMPTY", vec![]))]);
+    let view = view_for(&c);
+    let _ = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_HOLD").await, 1);
+    let payload = audit_latest_payload(&pool, "KVT2_CONFIRM_HOLD")
+        .await
+        .unwrap();
+    assert_eq!(
+        payload["hold_reason"], "LASTCHK_DATA_SIGN_EMPTY",
+        "Match + empty data_sign MUST map to hold_reason=LASTCHK_DATA_SIGN_EMPTY"
+    );
+    // Doc state UNCHANGED at KVT1 per W0b.
+    assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
+    // Counter incremented to 1.
+    assert_eq!(read_consecutive_holds(&pool, doc).await, 1);
 }

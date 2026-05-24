@@ -252,10 +252,22 @@ impl DrainSummary {
     /// MED-PR70-R7-02 projection matrix).  Doc state stays `Kvt1`.
     /// Blocks `finalize_eligibility` with `DocsHeldAtKvt1` reason.
     ///
-    /// `_doc_id` and `_hold_class` are accepted for forensic API
-    /// parity with `record_doc_failure` and for symmetry with the
-    /// other two W12 recording methods; counter-only update keeps
-    /// per-tick allocation footprint minimal.
+    /// **Aggregation rationale (REC-7, Phase 2b 2026-05-24)**:
+    /// `_doc_id` and `_hold_class` are intentionally underscore-
+    /// prefixed (accepted-but-unused) per operator-pinned design
+    /// (memory `feedback_db_vs_log_separation`): detailed per-doc
+    /// forensic trace lives в `audit_log` (`KVT2_CONFIRM_HOLD`
+    /// events з payload {document_id, source, hold_reason,
+    /// hold_reason_detail, dispatch_via, trace_attempt_no}); the
+    /// in-memory `DrainSummary` deliberately aggregates only
+    /// counters для maximum CPU/RAM efficiency in the per-tick
+    /// drain hot path.  Args preserved для:
+    /// (a) API parity з `record_doc_failure` (which DOES persist
+    ///     per-doc detail в `per_doc_failures: Vec<(DocumentId, String)>`);
+    /// (b) future-readiness — Phase 3 might activate per-doc Hold
+    ///     tracking for advanced analytics (REC-1 admin CLI Tier 3
+    ///     surface, REC-8 W8 race detection telemetry, etc.) without
+    ///     a downstream API break.
     pub fn record_doc_held_at_kvt1(&mut self, _doc_id: DocumentId, _hold_class: String) {
         self.held_at_kvt1 += 1;
     }
@@ -265,6 +277,11 @@ impl DrainSummary {
     /// AND `Kvt2ConfirmSource::SentReplay` Hold (post-Envelope-1c-hold).
     /// Doc state stays `Sent`.  Blocks `finalize_eligibility` with
     /// `DocsHeldAtSent` reason.
+    ///
+    /// **Aggregation rationale (REC-7, Phase 2b 2026-05-24)**: see
+    /// [`record_doc_held_at_kvt1`] — same intentional aggregation
+    /// design; per-doc detail в `audit_log.KVT2_CONFIRM_HOLD` event
+    /// payload.
     pub fn record_doc_held_at_sent(&mut self, _doc_id: DocumentId, _hold_class: String) {
         self.held_at_sent += 1;
     }
@@ -276,6 +293,12 @@ impl DrainSummary {
     /// class-guard bounded redrive (`MAX_BOOT_ATTEMPTS=5`).  Blocks
     /// `finalize_eligibility` with `DocsErRedriveQueued` reason (NOT
     /// `DocsHeldAtKvt1` — durable state is ER, not Kvt1).
+    ///
+    /// **Aggregation rationale (REC-7, Phase 2b 2026-05-24)**: see
+    /// [`record_doc_held_at_kvt1`] — same intentional aggregation
+    /// design; per-doc detail в `audit_log.OFFLINE_DRAIN_DOC_FAILED`
+    /// event payload (з `dispatch_via=kvt2_confirm` +
+    /// `probe_outcome=NotFound` + `downgrade_to=ERROR_RETRYABLE`).
     pub fn record_doc_er_redrive_queued(&mut self, _doc_id: DocumentId, _downgrade_class: String) {
         self.er_redrive_queued += 1;
     }
@@ -1220,8 +1243,9 @@ async fn process_via_stage_send(
                 kvt2_confirm::ConfirmDrainOutcome::HoldFnDrain {
                     projection,
                     consecutive_holds,
+                    class,
                 } => Ok(DocVerdict::HoldFnDrain {
-                    class: FailureClass::Transport,
+                    class,
                     projection,
                     consecutive_holds,
                 }),
@@ -1694,21 +1718,20 @@ async fn process_via_lastchk_replay(
         kvt2_confirm::ConfirmDrainOutcome::HoldFnDrain {
             projection,
             consecutive_holds,
+            class,
         } => {
             // SentReplay HoldFnDrain projection maps directly to
             // DocVerdict::HoldFnDrain — drain orchestrator halts on
             // this doc this tick; next tick re-evaluates via SentReplay
             // (HeldAtSent: doc stays Sent, next tick re-probes) OR
             // via W9b ER cohort (ErRedriveQueued: doc advanced to ER
-            // by 1c-post, next tick re-sends via stage_send).  Both
-            // projections classified FailureClass::Transport: operator-
-            // facing transient class, retain retry budget per W0b
-            // state-unchanged contract (pending-drain shifts do NOT
-            // escalate on HoldFnDrain per backlog_drain consumer
-            // logic — only manual-recon-class Failed escalates).
+            // by 1c-post, next tick re-sends via stage_send).
             // **6.1.2**: consecutive_holds plumbed для Tier 1/2 triggers.
+            // **6.2 (REC-6)**: class plumbed from kvt2_confirm — granular
+            // per-Hold-reason mapping (Transport/Server/Authorization/
+            // Decode/Internal/NotFound) replaces hardcoded Transport.
             Ok(DocVerdict::HoldFnDrain {
-                class: FailureClass::Transport,
+                class,
                 projection,
                 consecutive_holds,
             })
@@ -1797,8 +1820,9 @@ async fn process_via_w12_only(
         kvt2_confirm::ConfirmDrainOutcome::HoldFnDrain {
             projection,
             consecutive_holds,
+            class,
         } => Ok(DocVerdict::HoldFnDrain {
-            class: FailureClass::Transport,
+            class,
             projection,
             consecutive_holds,
         }),
