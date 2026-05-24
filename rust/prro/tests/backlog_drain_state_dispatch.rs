@@ -1365,6 +1365,91 @@ async fn c5b2_sent_replay_lastchk_not_found_holds_fn_drain_er_redrive_queued() {
     );
 }
 
+// ─── Test 8a: SentReplay lastChk Match + EMPTY data_sign → Hold ──────
+
+/// **M3b W12 Commit 5b.2 Δ5 (closes external review MED-1, 2026-05-24)** —
+/// Match-but-empty-data_sign behavioral pivot vs pre-W12:
+/// pre-W12 path classified empty `ack.data_sign` as `failure_class=
+/// Internal, manual_recon=true` (Failed; manual recon required).  W12
+/// `classify_check_result` routes empty data_sign on a non-empty id
+/// match into `Kvt2ConfirmOutcome::Hold { reason:
+/// LastChkDataSignEmpty }` per kvt2_confirm.rs:188-192 — transient
+/// class, doc stays at Sent, next-tick re-probes.
+///
+/// Forensic chain: Envelope 1c-pre allocates trace row → DPS returns
+/// ack(id=expected, data_sign=empty) → classify_check_result emits
+/// `Hold(LastChkDataSignEmpty)` (NOT Acked — empty data_sign means DPS
+/// matched the id but didn't carry KVT2 evidence) → Envelope 1c-hold
+/// bundled (trace.complete RetryableServer + KVT2_CONFIRM_HOLD audit
+/// at Severity::Warning) → `Ok(HoldFnDrain { HeldAtSent })`.  Doc
+/// state UNCHANGED per W0b state-unchanged contract; drain halts on
+/// this doc this tick; pending-drain shifts do NOT escalate.
+#[tokio::test]
+async fn c5b2_sent_replay_lastchk_match_empty_data_sign_holds_drain() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "SENT",
+        Some("DPS-FN-MATCH-EMPTY"),
+    )
+    .await;
+
+    // lastChk returns OK з matching id but EMPTY data_sign — routed
+    // to Hold(LastChkDataSignEmpty), NOT Acked.  Drain halts з
+    // HoldFnDrain { HeldAtSent }; doc state untouched.
+    let c = carriers(vec![], vec![Ok(ack("DPS-FN-MATCH-EMPTY", vec![]))]);
+    let view = view_for(&c);
+
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    // W0b state-unchanged contract: doc stays SENT, no CAS fired.
+    assert_eq!(read_doc_state(&pool, doc).await, "SENT");
+    // HoldFnDrain projection: HeldAtSent (NOT ErRedriveQueued — only
+    // NotFound routes through 1c-post Sent→ER; empty data_sign stays
+    // at Sent for next-tick re-probe).
+    assert_eq!(
+        summary.held_at_sent(),
+        1,
+        "Hold(LastChkDataSignEmpty) MUST record HeldAtSent projection"
+    );
+    assert_eq!(
+        summary.er_redrive_queued(),
+        0,
+        "empty data_sign is Hold (doc stays Sent), not Sent→ER downgrade"
+    );
+    assert_eq!(summary.advanced_to_kvt1(), 0);
+    assert_eq!(summary.advanced_to_ack(), 0);
+    assert_eq!(c.dps.send_chk_count(), 0, "no wire-resend in this tick");
+    assert_eq!(c.dps.last_chk_count(), 1);
+
+    // Pre-W12 OFFLINE_DRAIN_DOC_FAILED MUST NOT fire (no per-doc
+    // failure on transient Hold path); KVT2_CONFIRM_HOLD audit at
+    // Severity::Warning emitted by Envelope 1c-hold bundled.
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_FAILED").await, 0);
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_HOLD").await, 1);
+
+    let payload = audit_latest_payload(&pool, "KVT2_CONFIRM_HOLD")
+        .await
+        .unwrap();
+    assert_eq!(payload["source"], "sent_replay");
+    assert_eq!(payload["hold_reason"], "LASTCHK_DATA_SIGN_EMPTY");
+    assert_eq!(payload["dispatch_via"], "kvt2_confirm");
+    assert!(
+        payload["trace_attempt_no"].is_i64(),
+        "1c-hold bundled payload MUST carry trace_attempt_no from 1c-pre allocation; \
+         got: {payload:?}"
+    );
+}
+
 // ─── Test 9: KVT2 cohort widening (W12 Commit 3 reversal of MED-C5-4) ──
 //
 // The pre-W12 fixture `c5_kvt2_doc_excluded_from_cohort_pre_w12`
