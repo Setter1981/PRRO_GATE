@@ -1290,9 +1290,11 @@ pub async fn mac_recovery_claim_counter_tx(
 /// uses it for Tier-1 (>= 10 → KVT2_CONFIRM_PROLONGED_HOLD audit) +
 /// Tier-2 (>= 50 → STOP_MODE CAS) trigger checks per plan §REC-1.
 ///
-/// `rows_affected == 0` → missing doc row → structural breach (cohort
-/// walker should never surface non-existent doc); caller surfaces as
-/// `BootError::Internal`.
+/// Missing doc row surfaces as `sqlx::Error::RowNotFound` from
+/// `fetch_one` (UPDATE ... RETURNING produces no row when WHERE
+/// matches nothing); caller propagates via `?` to `BootError::Internal`
+/// — cohort walker should never surface non-existent doc, so this
+/// is a structural breach.
 pub async fn increment_consecutive_holds_tx(
     tx: &mut WriteTxConn<'_>,
     doc_id: DocumentId,

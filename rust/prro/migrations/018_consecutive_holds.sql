@@ -1,4 +1,4 @@
--- Migration 025: per-document consecutive_holds counter для W12 Tiered
+-- Migration 018: per-document consecutive_holds counter для W12 Tiered
 -- Degradation (REC-1, post-W12 hardening Phase 2a.1).
 --
 -- Counts consecutive HoldFnDrain outcomes на конкретному документі
