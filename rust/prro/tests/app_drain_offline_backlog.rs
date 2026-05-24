@@ -4,25 +4,33 @@
 //! acquires the App reconcile mutex (W2 enforcement per ADR-M3-A10)
 //! and delegates to the pure-function `backlog_drain::drain`.
 //!
-//! Two integration tests:
+//! **M3b W12 Commit 4b update (2026-05-22)**: SentFresh production-
+//! wired via `process_via_stage_send` Sent branch.  App-owned
+//! happy path now reaches the Eligible arm (per `c6_eligible_*`
+//! fixtures' chain) end-to-end without bypassing public entry.
+//!
+//! Three integration tests:
 //!
 //!   1. `app_drain_skip_path_mode_not_going_online` — boots App,
 //!      seeds FN with `node_state.mode = Offline`, calls
 //!      `App::drain_offline_backlog_with`, asserts skip via
 //!      `SKIPPED_NOT_GOING_ONLINE` audit + empty summary.
-//!   2. `app_drain_partial_path_pre_w12_steady_state` — boots App,
-//!      seeds GoingOnline + Open session + 2 OFFLINE_LOCAL_ACK docs,
-//!      calls `App::drain_offline_backlog_with`, asserts pre-W12
-//!      stub flow: per-doc loop advances both as DeferredKvt1 →
-//!      finalize blocked → `OFFLINE_DRAIN_PARTIAL` audit; node stays
-//!      GoingOnline, session stays Draining.
+//!   2. `app_drain_eligible_path_via_w12_sent_fresh_steady_state`
+//!      (post W12 Commit 4b refactor) — boots App, seeds
+//!      GoingOnline + Open session + 2 OFFLINE_LOCAL_ACK docs +
+//!      W12 chain prereqs + lastChk Acked queue, calls
+//!      `App::drain_offline_backlog_with`, asserts SentFresh chain:
+//!      per-doc Envelope 1a + Envelope 2 → ACK; finalize Eligible
+//!      → `OFFLINE_DRAIN_COMPLETED` + `OFFLINE_SESSION_CLOSED`
+//!      audits; node ONLINE; session CLOSED.
+//!   3. `app_drain_concurrent_invocations_smoke_no_deadlock` —
+//!      W9b NIT-C7-R2 concurrent invocation smoke (mutex
+//!      serialization, no panic / no wedge under tokio::join).
 //!
-//! Eligible-arm full-flow integration via the public entry is
-//! **deferred to W12 PR** — pre-W12 the C5 stub
-//! `apply_w12_confirmation` always returns `DeferredKvt1`.  The
-//! Eligible-arm CAS chain + audit shape are covered by the inline
-//! `eligible_arm_tests` in `backlog_drain.rs` (calls
-//! `commit_finalize_envelope` directly via crate-internal access).
+//! Eligible-arm CAS chain + audit shape now exercised end-to-end
+//! through the public entry via test #2.  The inline
+//! `eligible_arm_tests` in `backlog_drain.rs` provide complementary
+//! direct-call coverage of `commit_finalize_envelope`.
 
 mod common;
 
@@ -230,6 +238,33 @@ fn carriers(responses: Vec<Result<CheckAck, DpsError>>) -> DepsCarriers {
     }
 }
 
+/// **M3b W12 Commit 4b.3 Δ2 (2026-05-22)** — DepsCarriers builder
+/// seeding both `send_chk` + `last_chk` queues.  Required for App
+/// public-entry tests exercising the Sent-source W12 chain
+/// (process_via_stage_send → confirm_drain_doc(SentFresh) → lastChk
+/// → Envelope 1a + Envelope 2 → ACK).
+fn carriers_with_last_chk(
+    send_chk: Vec<Result<CheckAck, DpsError>>,
+    last_chk: Vec<Result<CheckAck, DpsError>>,
+) -> DepsCarriers {
+    DepsCarriers {
+        dps: Arc::new(StubDpsChannel::with_queue(send_chk).with_last_chk_queue(last_chk)),
+        signing_ctx: det_signing_ctx(),
+        fn_sign: fn_sign(),
+    }
+}
+
+/// **M3b W12 Commit 4b.3 Δ2 (2026-05-22)** — lastChk Acked response
+/// with non-empty `data_sign` (classify_check_result routes empty
+/// to Hold).
+fn last_chk_ack(id: &str, data_sign: Vec<u8>) -> CheckAck {
+    CheckAck {
+        id: id.into(),
+        id_sign: vec![],
+        data_sign,
+    }
+}
+
 fn view_for<'a>(carriers: &'a DepsCarriers) -> RuntimeView<'a> {
     RuntimeView {
         dps: carriers.dps.as_ref(),
@@ -267,51 +302,97 @@ async fn app_drain_skip_path_mode_not_going_online() {
     assert_eq!(c.dps.call_count(), 0);
 }
 
-// ─── Test 2: partial path — full pre-W12 steady-state flow ──────────
+// ─── Test 2: App-entry happy path — full W12 SentFresh steady-state ─
 
+/// **M3b W12 Commit 4b.3 Δ2 (2026-05-22)** — refactored from
+/// pre-W12 `app_drain_partial_path_pre_w12_steady_state`.  Post W12
+/// production wiring (`process_via_stage_send` → `confirm_drain_doc(
+/// SentFresh, ...)` → Envelope 1a + Envelope 2 → ACK), both docs
+/// reach ACK; finalize_eligibility flips Eligible →
+/// `OFFLINE_DRAIN_COMPLETED` audit; node Online + session Closed.
+/// Pre-W12 DeferredKvt1 path is structurally unreachable.
 #[tokio::test]
-async fn app_drain_partial_path_pre_w12_steady_state() {
-    let (_d, app, pool) = boot_app("c7_partial.db").await;
+async fn app_drain_eligible_path_via_w12_sent_fresh_steady_state() {
+    let (_d, app, pool) = boot_app("c7_eligible.db").await;
     seed_fn_config(&pool).await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
-    let _doc_a = seed_offline_local_ack(&pool, 1, 100, session_id, shift_id).await;
-    let _doc_b = seed_offline_local_ack(&pool, 2, 101, session_id, shift_id).await;
+    let doc_a = seed_offline_local_ack(&pool, 1, 100, session_id, shift_id).await;
+    let doc_b = seed_offline_local_ack(&pool, 2, 101, session_id, shift_id).await;
+    // W12 chain bootstrap — anchor + per-doc finalize prereqs.
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc_a,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc_b,
+        common::chain_anchor(0x01),
+        common::chain_anchor(0x02),
+    )
+    .await
+    .unwrap();
 
-    let c = carriers(vec![Ok(ack("DPS-FN-A")), Ok(ack("DPS-FN-B"))]);
+    // send_chk × 2 + last_chk × 2 (SentFresh confirm per doc).
+    let c = carriers_with_last_chk(
+        vec![Ok(ack("DPS-FN-A")), Ok(ack("DPS-FN-B"))],
+        vec![
+            Ok(last_chk_ack("DPS-FN-A", vec![0xAAu8; 32])),
+            Ok(last_chk_ack("DPS-FN-B", vec![0xBBu8; 32])),
+        ],
+    );
     let view = view_for(&c);
 
     let summary = app
         .drain_offline_backlog_with(FN, &view)
         .await
-        .expect("App entry must return Ok on partial flow");
+        .expect("App entry must return Ok on happy flow");
 
-    // Both docs advanced to KVT1 via stub; finalize blocked by
-    // DocsDeferredAtKvt1.
+    // Both docs reached Ack via W12 SentFresh chain →
+    // finalize_eligibility == Eligible → COMPLETED.
     assert_eq!(summary.backlog_size_before(), 2);
-    assert_eq!(summary.advanced_to_kvt1(), 2);
-    assert_eq!(summary.advanced_to_ack(), 0);
+    assert_eq!(summary.advanced_to_ack(), 2);
+    assert_eq!(summary.advanced_to_kvt1(), 0, "no DeferredKvt1 post-W12");
     assert!(
-        !summary.finalized(),
-        "pre-W12 stub MUST NOT finalize (operator-pinned invariant)"
+        summary.finalized(),
+        "W12 SentFresh-Acked path enables Eligible finalize"
     );
 
-    // Full audit chain: STARTED + SESSION_DRAIN_STARTED + 2 DOC_ADVANCED
-    // + PARTIAL.
+    // Full W12 audit chain at App entry:
+    // STARTED + SESSION_DRAIN_STARTED + 2 KVT2_ADVANCED + 2
+    // STAGE_FINALIZE_ACK + COMPLETED + SESSION_CLOSED.
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_STARTED").await, 1);
     assert_eq!(audit_count(&pool, "OFFLINE_SESSION_DRAIN_STARTED").await, 1);
-    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_ADVANCED").await, 2);
-    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_PARTIAL").await, 1);
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 2);
+    assert_eq!(audit_count(&pool, "STAGE_FINALIZE_ACK").await, 2);
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_COMPLETED").await, 1);
+    assert_eq!(audit_count(&pool, "OFFLINE_SESSION_CLOSED").await, 1);
+    // Pre-W12 audit types MUST NOT fire post-W12 wiring.
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_DOC_ADVANCED").await,
+        0,
+        "pre-W12 stub audit MUST NOT fire post-W12 wiring"
+    );
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_PARTIAL").await, 0);
 
-    // Finalize did NOT fire — node + session stay pre-drain.
-    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_COMPLETED").await, 0);
-    assert_eq!(audit_count(&pool, "OFFLINE_SESSION_CLOSED").await, 0);
-    assert_eq!(read_node_mode(&pool).await, "GOING_ONLINE");
-    assert_eq!(read_session_state(&pool, session_id).await, "DRAINING");
+    // Node + session closed via Eligible-arm finalize envelope.
+    assert_eq!(read_node_mode(&pool).await, "ONLINE");
+    assert_eq!(read_session_state(&pool, session_id).await, "CLOSED");
 
-    // Wire stubs consumed.
+    // Wire stubs consumed — 2 send_chk (stage_send) + 2 lastChk
+    // (confirm_drain_doc SentFresh).
     assert_eq!(c.dps.call_count(), 2);
+    assert_eq!(c.dps.last_chk_call_count(), 2);
 }
 
 // ─── Test 3: concurrent invocation smoke (no-deadlock only) ──────────

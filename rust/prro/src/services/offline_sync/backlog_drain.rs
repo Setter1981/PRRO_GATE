@@ -13,21 +13,47 @@
 //!   envelope, emits `OFFLINE_DRAIN_STARTED` audit.
 //! - **Commit 4 (this file, [`drain`])** — per-doc loop: iterates the
 //!   backlog in strict `lnd ASC` order, invokes `stage_send::run`,
-//!   inlines the W12-stub `Sent → Kvt1` advance so `advanced_to_kvt1`,
-//!   the audit `to_state="KVT1"`, and the persisted DB state all stay
-//!   consistent.  Audits per-doc `_DOC_ADVANCED` / `_DOC_FAILED`.
-//!   Routes manual-recon-class failures on pending-drain shifts to
+//!   then routes Sent outcome through the W12 chain (see W12
+//!   subsection below).  Audits per-doc `OFFLINE_DRAIN_KVT2_ADVANCED`
+//!   (Envelope 1a) + `STAGE_FINALIZE_ACK` (Envelope 2) on Acked path;
+//!   `OFFLINE_DRAIN_DOC_FAILED` on stage_send failures.  Routes
+//!   manual-recon-class failures on pending-drain shifts to
 //!   `RequiresManualReconciliation` and halts the drain (per spec
 //!   amendment 2026-05-21 and `LEGAL_INVARIANTS.md` §INV-19).
 //!   Sibling-continue applies ONLY to per-doc failures on
-//!   non-pending-drain shifts.  **No lastChk pre-flight yet** (C5);
-//!   **no finalize branch yet** (C6).
+//!   non-pending-drain shifts.
 //! - **Commits 5-7** — widen walker to the unfinished cohort
-//!   (`OFFLINE_LOCAL_ACK | SENT | KVT1 | ERROR_RETRYABLE`; KVT2
-//!   deferred to W12 PR per MED-C5-4), add lastChk pre-flight,
-//!   extract the inline `Sent → Kvt1` into the
-//!   `apply_w12_confirmation` helper, add the finalization branch,
-//!   and add the App entry.
+//!   (`OFFLINE_LOCAL_ACK | SENT | KVT1 | ERROR_RETRYABLE | KVT2`
+//!   post W12 Commit 3), add lastChk pre-flight, add the
+//!   finalization branch, and add the App entry.
+//!
+//! ## M3b W12 wiring (2026-05-22)
+//!
+//! - **W12 Commit 3** widens drain cohort to include `KVT2` (post-
+//!   crash advance via `stage_finalize::run` per
+//!   `process_via_w12_kvt2_advance`).
+//! - **W12 Commit 4b** wires `process_via_stage_send` Sent branch to
+//!   `kvt2_confirm::confirm_drain_doc(SentFresh, ...)` —
+//!   Envelope 1a (Kvt1Raw + Sent→Kvt1 + Kvt1→Kvt2 + KVT2_ADVANCED
+//!   audit) + Envelope 2 (`stage_finalize::run` Kvt2→Ack).
+//!   Non-Acked outcomes emit `KVT2_CONFIRM_HOLD` (Warning) or
+//!   `KVT2_CONFIRM_STRUCTURAL_DRIFT` (Error) audit-only envelope
+//!   before `BootError::Internal` halt per plan §311 +
+//!   MED-PR70-R12-01.
+//! - **W12 Commit 5** wires Kvt1Reentry source via
+//!   `process_via_w12_only` → `kvt2_confirm::confirm_drain_doc(
+//!   Kvt1Reentry, ...)` → Envelope 1b (Kvt1Raw + Kvt1→Kvt2 +
+//!   KVT2_ADVANCED audit; NO Sent→Kvt1 since doc is already at
+//!   Kvt1) + Envelope 2 (`stage_finalize::run` Kvt2→Ack).  Caller
+//!   sources `expected_server_fiscal_no` from persisted
+//!   `doc.server_fiscal_no` with caller-level
+//!   `BootError::Internal` + KVT2_CONFIRM_STRUCTURAL_DRIFT audit
+//!   on None (state-machine invariant breach per MED-W12C5-01).
+//! - **W12 Commits 5b/6 (pending)** — SentReplay source wiring
+//!   with `transport_trace` recovery row, HoldFnDrain projection
+//!   (replaces current Hold-path `BootError::Internal` defensive
+//!   marker with `DocVerdict::HoldFnDrain { HeldAtSent |
+//!   HeldAtKvt1 }` per plan §413).
 //!
 //! ## C4 known gaps (C5 blocker before "C4 approved")
 //!
@@ -85,6 +111,7 @@ use crate::db::repositories::{
     audit_log, document_files, fiscal_documents, node_state, offline_sessions, shifts,
 };
 use crate::db::tx::{with_immediate, WriteTxConn};
+use crate::services::offline_sync::kvt2_confirm;
 use crate::services::reconciliation::guard::ReconcileGuard;
 use crate::services::reconciliation::last_chk_probe::{self, ProbeOutcome};
 use crate::services::reconciliation::runtime::RuntimeView;
@@ -164,6 +191,17 @@ pub struct DrainSummary {
     advanced_to_ack: usize,
     advanced_to_kvt1: usize,
     advanced_via_lastchk_replay: usize,
+    /// **M3b W12 Commit 2** — counter for `HoldFnDrainProjection::HeldAtKvt1`
+    /// (Kvt1 re-entry Hold).  Blocks finalize via `DocsHeldAtKvt1` reason.
+    held_at_kvt1: usize,
+    /// **M3b W12 Commit 2** — counter for `HoldFnDrainProjection::HeldAtSent`
+    /// (SentFresh + SentReplay Hold).  Blocks finalize via `DocsHeldAtSent` reason.
+    held_at_sent: usize,
+    /// **M3b W12 Commit 2** — counter for `HoldFnDrainProjection::ErRedriveQueued`
+    /// (SentNotFoundDowngrade).  Blocks finalize via `DocsErRedriveQueued` reason;
+    /// distinct from KVT1 hold because durable state is `ErrorRetryable`,
+    /// awaiting next-tick ER class-guard bounded redrive.
+    er_redrive_queued: usize,
     per_doc_failures: Vec<(DocumentId, String)>,
     finalized: bool,
 }
@@ -178,6 +216,9 @@ impl DrainSummary {
             advanced_to_ack: 0,
             advanced_to_kvt1: 0,
             advanced_via_lastchk_replay: 0,
+            held_at_kvt1: 0,
+            held_at_sent: 0,
+            er_redrive_queued: 0,
             per_doc_failures: Vec::new(),
             finalized: false,
         }
@@ -209,15 +250,87 @@ impl DrainSummary {
         self.per_doc_failures.push((document_id, failure_class));
     }
 
+    /// **M3b W12 Commit 2** — record a `HoldFnDrainProjection::HeldAtKvt1`
+    /// outcome.  Fed by `Kvt2ConfirmSource::Kvt1Reentry` Hold ONLY (per
+    /// MED-PR70-R7-02 projection matrix).  Doc state stays `Kvt1`.
+    /// Blocks `finalize_eligibility` with `DocsHeldAtKvt1` reason.
+    ///
+    /// `_doc_id` and `_hold_class` are accepted for forensic API
+    /// parity with `record_doc_failure` and for symmetry with the
+    /// other two W12 recording methods; counter-only update keeps
+    /// per-tick allocation footprint minimal.
+    pub fn record_doc_held_at_kvt1(&mut self, _doc_id: DocumentId, _hold_class: String) {
+        self.held_at_kvt1 += 1;
+    }
+
+    /// **M3b W12 Commit 2** — record a `HoldFnDrainProjection::HeldAtSent`
+    /// outcome.  Fed by `Kvt2ConfirmSource::SentFresh` Hold (pre-Envelope-1a)
+    /// AND `Kvt2ConfirmSource::SentReplay` Hold (post-Envelope-1c-hold).
+    /// Doc state stays `Sent`.  Blocks `finalize_eligibility` with
+    /// `DocsHeldAtSent` reason.
+    pub fn record_doc_held_at_sent(&mut self, _doc_id: DocumentId, _hold_class: String) {
+        self.held_at_sent += 1;
+    }
+
+    /// **M3b W12 Commit 2** — record a `HoldFnDrainProjection::ErRedriveQueued`
+    /// outcome.  Fed by `Kvt2ConfirmOutcome::SentNotFoundDowngrade` ONLY
+    /// (per plan §"Source-context routing matrix").  Durable state is
+    /// `ErrorRetryable` after Envelope 1c-post; awaiting next-tick W9b ER
+    /// class-guard bounded redrive (`MAX_BOOT_ATTEMPTS=5`).  Blocks
+    /// `finalize_eligibility` with `DocsErRedriveQueued` reason (NOT
+    /// `DocsHeldAtKvt1` — durable state is ER, not Kvt1).
+    pub fn record_doc_er_redrive_queued(&mut self, _doc_id: DocumentId, _downgrade_class: String) {
+        self.er_redrive_queued += 1;
+    }
+
     /// Decide whether the drain may finalize (node mode + offline
     /// session transitions).  Returns the typed eligibility — caller
-    /// MUST pattern-match.  Pre-W12 invariant pin: any `DeferredKvt1`
-    /// outcome (i.e. `advanced_to_kvt1 > 0`) blocks finalize.
+    /// MUST pattern-match.
+    ///
+    /// Precedence (any single nonzero blocker returns `NotEligible`):
+    /// 1. `per_doc_failures` non-empty (W9b);
+    /// 2. **M3b W12 Commit 2** — any of three W12 hold counters > 0:
+    ///    - `held_at_kvt1` → `DocsHeldAtKvt1`,
+    ///    - `held_at_sent` → `DocsHeldAtSent`,
+    ///    - `er_redrive_queued` → `DocsErRedriveQueued`;
+    /// 3. `advanced_to_kvt1` > 0 → `DocsDeferredAtKvt1` (legacy
+    ///    `W12ConfirmOutcome::DeferredKvt1`; inert post-W12 once full
+    ///    helper wiring lands in Commits 4 / 5 / 5b);
+    /// 4. `advanced_to_ack != backlog_size_before` → `AckCountMismatch`
+    ///    (defensive accounting drift guard).
+    ///
+    /// Forensic note: the chosen reason is the highest-precedence
+    /// blocker; `OFFLINE_DRAIN_PARTIAL` audit payload via
+    /// [`build_finalize_payload`] reports ALL counter values
+    /// regardless of which reason was selected, so operator
+    /// dashboards see the full per-counter breakdown when multiple
+    /// blockers coexist (multi-reason payload per plan §11).
     pub fn finalize_eligibility(&self) -> FinalizeEligibility {
         if !self.per_doc_failures.is_empty() {
             return FinalizeEligibility::NotEligible {
                 reason: NotEligibleReason::PerDocFailuresPresent {
                     count: self.per_doc_failures.len(),
+                },
+            };
+        }
+        if self.held_at_kvt1 > 0 {
+            return FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsHeldAtKvt1 {
+                    count: self.held_at_kvt1,
+                },
+            };
+        }
+        if self.held_at_sent > 0 {
+            return FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsHeldAtSent {
+                    count: self.held_at_sent,
+                },
+            };
+        }
+        if self.er_redrive_queued > 0 {
+            return FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsErRedriveQueued {
+                    count: self.er_redrive_queued,
                 },
             };
         }
@@ -279,6 +392,24 @@ impl DrainSummary {
         &self.per_doc_failures
     }
 
+    /// **M3b W12 Commit 2** — count of Kvt1Reentry Hold outcomes
+    /// recorded via [`record_doc_held_at_kvt1`].
+    pub fn held_at_kvt1(&self) -> usize {
+        self.held_at_kvt1
+    }
+
+    /// **M3b W12 Commit 2** — count of SentFresh + SentReplay Hold
+    /// outcomes recorded via [`record_doc_held_at_sent`].
+    pub fn held_at_sent(&self) -> usize {
+        self.held_at_sent
+    }
+
+    /// **M3b W12 Commit 2** — count of SentNotFoundDowngrade outcomes
+    /// recorded via [`record_doc_er_redrive_queued`].
+    pub fn er_redrive_queued(&self) -> usize {
+        self.er_redrive_queued
+    }
+
     pub fn finalized(&self) -> bool {
         self.finalized
     }
@@ -299,14 +430,42 @@ pub enum FinalizeEligibility {
 
 /// Why the drain cannot finalize.  Used in `OFFLINE_DRAIN_PARTIAL`
 /// audit payload for operator forensic triage.
+///
+/// `#[non_exhaustive]` — semver-stability for downstream pattern
+/// matching as new finalize-blocker categories arrive (W12 Commit 2
+/// added 3 new W12-projection variants; future tasks may add more).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NotEligibleReason {
     /// At least one doc failed per-doc processing.  Sibling docs
     /// may have succeeded but at least one failure prevents finalize.
     PerDocFailuresPresent { count: usize },
+    /// **M3b W12 Commit 2** — at least one doc returned
+    /// `DocVerdict::HoldFnDrain { projection: HeldAtKvt1 }` from
+    /// `Kvt2ConfirmSource::Kvt1Reentry`.  Durable state stays `Kvt1`;
+    /// drain stopped at the held doc this tick.  Next tick re-enters
+    /// via Kvt1 cohort dispatch.
+    DocsHeldAtKvt1 { count: usize },
+    /// **M3b W12 Commit 2** — at least one doc returned
+    /// `DocVerdict::HoldFnDrain { projection: HeldAtSent }` from
+    /// `Kvt2ConfirmSource::SentFresh` (pre-Envelope-1a) OR
+    /// `Kvt2ConfirmSource::SentReplay` (post-Envelope-1c-hold).
+    /// Durable state stays `Sent`; drain stopped at the held doc
+    /// this tick.  Next tick re-enters via Sent-replay cohort dispatch.
+    DocsHeldAtSent { count: usize },
+    /// **M3b W12 Commit 2** — at least one doc returned
+    /// `DocVerdict::HoldFnDrain { projection: ErRedriveQueued }` from
+    /// `Kvt2ConfirmOutcome::SentNotFoundDowngrade`.  Durable state
+    /// advanced `Sent → ErrorRetryable` via Envelope 1c-post; awaiting
+    /// next-tick W9b ER class-guard bounded Pattern B redrive.
+    /// Distinct from `DocsHeldAtKvt1` because durable state is ER, not
+    /// Kvt1 (MED-PR70-R6-02 projection-correct reason).
+    DocsErRedriveQueued { count: usize },
     /// At least one doc returned `W12ConfirmOutcome::DeferredKvt1` —
-    /// pre-W12 invariant pin.  This is the steady-state result for
-    /// W9b pre-W12 PR.
+    /// legacy W9b pre-W12 stub pin.  Inert post-W12 once full helper
+    /// wiring lands (W12ConfirmOutcome::DeferredKvt1 no longer
+    /// produced by W12-aware paths); kept for backward-compat with
+    /// crash-recovered docs from pre-W12 history.
     DocsDeferredAtKvt1 { count: usize },
     /// `advanced_to_ack != backlog_size_before` despite no recorded
     /// failures.  Defensive: should be unreachable in practice
@@ -398,7 +557,15 @@ const AUDIT_ENTITY_DRAIN_FN: &str = "node_state";
 /// (`OFFLINE_DRAIN_DOC_ADVANCED` / `_DOC_FAILED`).  Matches the
 /// M3a / W7 convention: per-doc events anchor on `entity_type =
 /// "fiscal_document"` + `entity_id = doc_id_hex`.
-const AUDIT_ENTITY_DOC: &str = "fiscal_document";
+///
+/// **W12 Commit 4a hygiene (LOW-W12C4A-02, 2026-05-22)**:
+/// `pub(crate)` so sibling modules in `services::offline_sync` (W12
+/// `kvt2_confirm::commit_sent_fresh_envelope_1a` and follow-ups) can
+/// share the literal instead of duplicating `"fiscal_document"`
+/// strings.  Audit dashboards filter on this exact value; co-locating
+/// the const eliminates rename drift between drain orchestrator and
+/// helper Envelope 1a writes.
+pub(crate) const AUDIT_ENTITY_DOC: &str = "fiscal_document";
 
 /// W9b §2.1 entry (b) — pure-function drain entry for the boot
 /// reconciliation path and integration tests.  The App-owned entry
@@ -433,9 +600,10 @@ const AUDIT_ENTITY_DOC: &str = "fiscal_document";
 /// `(AUDIT_ENTITY_DRAIN_FN, fiscal_number)`.
 ///
 /// Otherwise the summary carries `backlog_size_before = backlog.len()`
-/// and per-doc counters reflecting C4's actual processing: each
-/// successful wire send increments `advanced_to_kvt1` (via the inline
-/// W12 stub Sent→Kvt1 advance); each non-Sent outcome appends to
+/// and per-doc counters reflecting actual processing: post W12 Commit
+/// 4b each successful wire send + lastChk Acked converges through
+/// `confirm_drain_doc(SentFresh)` → Envelope 1a + Envelope 2 → Ack,
+/// incrementing `advanced_to_ack`; each non-Sent outcome appends to
 /// `per_doc_failures`.  On a pending-drain shift, the loop halts
 /// early on a manual-recon-class failure (see
 /// [`is_manual_recon_retry_class`]), transitions shift and the
@@ -443,11 +611,17 @@ const AUDIT_ENTITY_DOC: &str = "fiscal_document";
 /// Critical `OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL` audit; in that
 /// case the summary reflects state up to the halt position.
 ///
-/// Caller observing this intermediate result MUST NOT treat the
-/// chain as finalized — `OFFLINE_DRAIN_COMPLETED|PARTIAL` has not
-/// been emitted, and `finalize_eligibility` returns
-/// `NotEligible{DocsDeferredAtKvt1 | AckCountMismatch}` by
-/// construction (pre-W12 cannot produce real Ack proof).
+/// Post W12 Commit 4b (SentFresh production-wired), the SentFresh
+/// happy-path drain can reach the Eligible arm and emit
+/// `OFFLINE_DRAIN_COMPLETED` + close session/node/shift in the same
+/// public entry call.  Other source contexts (Kvt1Reentry /
+/// SentReplay) are scope-guarded at `confirm_drain_doc` until
+/// Commits 5/5b wire their Envelope 1b / 1c-pre chains; Hold paths
+/// return `BootError::Internal` until Commit 6 lands the
+/// `HoldFnDrain` projection.  Caller should check
+/// `summary.finalized()` to distinguish completed-Eligible from
+/// PARTIAL outcomes — `summary.mark_finalized()` only flips on the
+/// Eligible-arm envelope commit, so the flag is a reliable signal.
 ///
 /// ## Errors
 ///
@@ -538,6 +712,49 @@ pub async fn drain<'a>(
     .map_err(BootError::Database)?;
 
     if backlog.is_empty() {
+        // MED-W12C3-01 (2026-05-22) — drain-finalize crash-recovery
+        // branch.  Pre-Commit-3, KVT2 → Ack advance was structurally
+        // unreachable from drain context, so empty cohort always meant
+        // "nothing to drain" (either fresh session or earlier tick
+        // already finalized).  Post-Commit-3, drain itself can advance
+        // KVT2 → Ack durably via `stage_finalize::run`, opening a
+        // crash window between that envelope commit and the
+        // `finalize_drain` 5-write closure: if the process dies in
+        // between, the next tick sees empty cohort (doc is now Ack,
+        // excluded by the IN list filter) but node/session/shift are
+        // still in pre-finalize states.  Reviewer-flagged MED finding
+        // 2026-05-22 (closed in this Δ commit).
+        //
+        // Recovery predicate (conservative, operator-pinned):
+        //   - session_state must be `Draining` (Open + all-Ack is
+        //     structural drift — drain Open→Draining mid-pass
+        //     transition would have committed before any doc reached
+        //     Ack, so Open + all-Ack cannot legitimately occur);
+        //   - all session docs must be in terminal `ACK` state
+        //     (`is_session_drain_completable` predicate;
+        //     `REJECTED`/`MANUAL` deliberately NOT included — those
+        //     require explicit operator treatment per session-closure
+        //     semantics).
+        // Both conditions true → finalize via `CrashRecovery` entry
+        // (distinct `OFFLINE_DRAIN_RECOVERED_FINALIZE` audit).
+        // Otherwise → existing empty-backlog skip path.
+        if session_state == OfflineSessionState::Draining
+            && fiscal_documents::is_session_drain_completable(pool, session_id)
+                .await
+                .map_err(BootError::Database)?
+        {
+            let mut recovery_summary = DrainSummary::new(fiscal_number.to_string(), 0);
+            commit_finalize_envelope(
+                pool,
+                fiscal_number,
+                session_id,
+                &ns,
+                &mut recovery_summary,
+                FinalizeEntry::CrashRecovery,
+            )
+            .await?;
+            return Ok(recovery_summary);
+        }
         let payload = serde_json::json!({
             "fiscal_number": fiscal_number,
             "current_mode": ns.mode.as_str(),
@@ -656,6 +873,30 @@ pub async fn drain<'a>(
     let mut summary = DrainSummary::new(fiscal_number.to_string(), backlog.len());
     for (position, doc) in backlog.iter().enumerate() {
         let verdict = process_one_doc(pool, deps, fiscal_number, doc, &mut summary).await?;
+        // M3b W12 Commit 2 — `HoldFnDrain` stops FN drain at the held
+        // doc regardless of shift state.  Records summary via the
+        // projection-specific method; loop breaks so the subsequent
+        // `finalize_drain` step sees the nonzero W12 counter and
+        // emits `OFFLINE_DRAIN_PARTIAL` with projection-correct
+        // reason (`DocsHeldAtKvt1` / `DocsHeldAtSent` /
+        // `DocsErRedriveQueued`).  Per W9b §3.5 + W0b state-unchanged
+        // contract: pending-drain shifts do NOT escalate on
+        // HoldFnDrain (only manual-recon-class `Failed` escalates).
+        if let DocVerdict::HoldFnDrain { class, projection } = &verdict {
+            let class_str = failure_class_for(*class).to_string();
+            match projection {
+                HoldFnDrainProjection::HeldAtKvt1 => {
+                    summary.record_doc_held_at_kvt1(doc.document_id, class_str);
+                }
+                HoldFnDrainProjection::HeldAtSent => {
+                    summary.record_doc_held_at_sent(doc.document_id, class_str);
+                }
+                HoldFnDrainProjection::ErRedriveQueued => {
+                    summary.record_doc_er_redrive_queued(doc.document_id, class_str);
+                }
+            }
+            break;
+        }
         // Halt ONLY on manual-recon-class failures on pending-drain
         // shifts.  TransientRetry / ProbeRequired stay in
         // sibling-continue per spec §3.5 (Manual is last resort;
@@ -731,6 +972,60 @@ enum DocVerdict {
         class: FailureClass,
         manual_recon: bool,
     },
+    /// **M3b W12 Commit 2** — drain-stop verdict introduced for the
+    /// W12 KVT2 confirmation flow.  Helper-heavy ownership in
+    /// `services::offline_sync::kvt2_confirm::confirm_drain_doc`
+    /// commits its envelope(s); caller (drain entry-point) maps the
+    /// outcome to this verdict.  Drain loop stops at the held doc
+    /// (no further docs this tick); pending-drain shifts do NOT
+    /// escalate to Manual on HoldFnDrain (W0b state-unchanged
+    /// contract); `projection` distinguishes durable doc state for
+    /// summary accounting per [`HoldFnDrainProjection`].
+    ///
+    /// `#[allow(dead_code)]` — production constructors arrive in
+    /// Commits 4 / 5 / 5b when drain dispatcher rewires call
+    /// `kvt2_confirm::confirm_drain_doc(...)` and project the
+    /// outcome.  Tests in `w12_control_surface_tests` construct the
+    /// variant directly to lock the projection + summary + finalize
+    /// contracts in isolation.
+    #[allow(dead_code)]
+    HoldFnDrain {
+        class: FailureClass,
+        projection: HoldFnDrainProjection,
+    },
+}
+
+/// **M3b W12 Commit 2** — projection for [`DocVerdict::HoldFnDrain`]
+/// that separates drain-stop CONTROL (shared) from durable-state
+/// ACCOUNTING (per-context).
+///
+/// Caller projects per `Kvt2ConfirmSource` (see plan
+/// §"Source-context routing matrix"):
+/// - `Kvt2ConfirmSource::SentFresh` Hold → `HeldAtSent` (pre-Envelope-1a
+///   commit; doc state still `Sent`).
+/// - `Kvt2ConfirmSource::SentReplay` Hold → `HeldAtSent` (doc state
+///   stays `Sent` after 1c-hold trace.complete-no-state-change).
+/// - `Kvt2ConfirmSource::Kvt1Reentry` Hold → `HeldAtKvt1` (doc state
+///   stays `Kvt1`).
+/// - `Kvt2ConfirmOutcome::SentNotFoundDowngrade` → `ErRedriveQueued`
+///   (durable state advanced to `ErrorRetryable` via Envelope 1c-post;
+///   awaiting next-tick W9b ER class-guard bounded redrive).
+///
+/// Routes to projection-specific [`DrainSummary`] recording method
+/// (`record_doc_held_at_kvt1` / `record_doc_held_at_sent` /
+/// `record_doc_er_redrive_queued`) which feeds the matching
+/// [`NotEligibleReason`] when `finalize_eligibility` is computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldFnDrainProjection {
+    /// Doc state stays `Kvt1` (Kvt1 re-entry Hold).
+    HeldAtKvt1,
+    /// Doc state stays `Sent` (SentFresh Hold pre-Envelope-1a OR
+    /// SentReplay Hold post-1c-hold).
+    HeldAtSent,
+    /// Doc state advanced `Sent → ErrorRetryable` via Envelope 1c-post;
+    /// next-tick ER cohort dispatch + bounded Pattern B redrive.
+    /// Exclusive to `SentNotFoundDowngrade` outcome.
+    ErRedriveQueued,
 }
 
 /// Map `RetryClass` → "is this a manual-recon-class outcome for
@@ -772,11 +1067,18 @@ fn is_manual_recon_retry_class(retry: RetryClass) -> bool {
 ///   NotFound downgrades to `ErrorRetryable` for next-tick Pattern B
 ///   re-drive (HIGH-C5-3); TransportRetry keeps the doc SENT for
 ///   the next tick to re-probe.
-/// - `KVT1` → `process_via_w12_only` (no wire, no pre-flight;
-///   pre-W12 stub records DeferredKvt1).
+/// - `KVT1` → `process_via_w12_only` (no wire; reads persisted
+///   `doc.server_fiscal_no` + invokes
+///   `kvt2_confirm::confirm_drain_doc(Kvt1Reentry, ...)` → Envelope
+///   1b (2-CAS Kvt1Raw + Kvt1→Kvt2 + audit) + Envelope 2 on Acked
+///   per M3b W12 Commit 5).
+/// - `KVT2` → **M3b W12 Commit 3** `process_via_w12_kvt2_advance`
+///   (calls `stage_finalize::run` for idempotent Kvt2→Ack advance;
+///   reverses MED-C5-4 deferral).  Surfaces mid-tick crash recovery
+///   between Envelope 1 (W12 Kvt1→Kvt2 advance) and Envelope 2
+///   (`stage_finalize::run` Kvt2→Ack).
 /// - Other states → `BootError::Internal` (cohort walker SELECT
-///   filter breach).  `KVT2` is deferred to W12 PR per MED-C5-4 —
-///   pre-W12 drain has no clean discharge path.
+///   filter breach).
 ///
 /// Each branch appends to [`DrainSummary`] + emits exactly one audit
 /// row (`OFFLINE_DRAIN_DOC_ADVANCED` / `_DOC_FAILED`).  Only
@@ -798,12 +1100,13 @@ async fn process_one_doc(
             process_via_er_class_guard(pool, deps, fiscal_number, doc, summary).await
         }
         DocState::Sent => process_via_lastchk_replay(pool, deps, fiscal_number, doc, summary).await,
-        DocState::Kvt1 => process_via_w12_only(pool, fiscal_number, doc, summary).await,
+        DocState::Kvt1 => process_via_w12_only(pool, fiscal_number, doc, summary, deps).await,
+        DocState::Kvt2 => process_via_w12_kvt2_advance(pool, fiscal_number, doc, summary).await,
         other => Err(BootError::Internal(format!(
             "backlog_drain({fiscal_number}): cohort walker returned unexpected \
              doc.state {state} for doc {hex} (SELECT must filter to drain \
-             candidates: OFFLINE_LOCAL_ACK | SENT | KVT1 | ERROR_RETRYABLE post \
-             MED-C5-4 KVT2 deferral)",
+             candidates: OFFLINE_LOCAL_ACK | SENT | KVT1 | KVT2 | ERROR_RETRYABLE \
+             post M3b W12 Commit 3 KVT2 cohort widening)",
             state = other.as_str(),
             hex = hex_lower(doc.document_id.as_bytes()),
         ))),
@@ -818,7 +1121,14 @@ async fn process_one_doc(
 async fn process_via_stage_send(
     pool: &SqlitePool,
     deps: &RuntimeView<'_>,
-    fiscal_number: &str,
+    // M3b W12 Commit 4b.3 (2026-05-22): `fiscal_number` no longer
+    // used directly — Sent branch now delegates to
+    // `kvt2_confirm::confirm_drain_doc` which sources FN internally
+    // from `doc.fiscal_number`.  Param kept on signature for
+    // symmetry with sibling dispatch helpers
+    // (`process_via_lastchk_replay`, `process_via_w12_only`) and
+    // for future Commit 5/5b consumers.
+    _fiscal_number: &str,
     doc: &fiscal_documents::DocumentRow,
     summary: &mut DrainSummary,
 ) -> Result<DocVerdict, BootError> {
@@ -830,52 +1140,65 @@ async fn process_via_stage_send(
             server_fiscal_no,
             attempt_no,
         }) => {
-            // C5 + LOW-C5-R1 (2026-05-21): pre-build the audit payload
-            // and pass it through to apply_w12_confirmation; the helper
-            // commits CAS Sent→Kvt1 + audit row inside ONE
-            // `with_immediate` envelope so audit append failure rolls
-            // back the CAS.  Pre-W12 stub return is always
-            // DeferredKvt1.
+            // **M3b W12 Commit 4b.3 (2026-05-22)** — Sent-source W12
+            // wiring per plan §410.  stage_send committed doc to Sent
+            // inside its own 4-b envelope; we now ask DPS via canonical
+            // `last_chk` / `by_server_fiscal_no` whether the receipt
+            // is recognized, then on Acked converge Sent→Kvt1→Kvt2→Ack
+            // via Envelope 1a (atomic) + Envelope 2 (`stage_finalize::
+            // run` Kvt2→Ack).
             //
-            // `doc.state` here is OfflineLocalAck or ErrorRetryable
-            // (per outer state dispatch); stage_send Sent outcome
-            // implies the doc has already transitioned through
-            // Sending → Sent inside stage_send's 4-b envelope.  The
-            // audit `from_state` reflects the drain-loop ENTRY state
-            // (pre-stage_send), not the inner Sending intermediate.
-            let audit_payload = serde_json::json!({
-                "document_id": id_hex,
-                "from_state": doc.state.as_str(),
-                "to_state": DocState::Kvt1.as_str(),
-                "replay_short_circuit": false,
-                "attempt_no": attempt_no,
-                "server_fiscal_no": server_fiscal_no,
-                "w12_status": W12ConfirmOutcome::DeferredKvt1.w12_status_str(),
-                "dispatch_via": "stage_send",
-            });
-            // Pass `DocState::Sent` literal so the helper routes
-            // through the Sent → Kvt1 CAS arm — at this point
-            // `stage_send::run` has already committed the doc to
-            // Sent inside its own envelope, even though `doc.state`
-            // (the cohort-walker snapshot) shows the pre-stage_send
-            // OFFLINE_LOCAL_ACK / ERROR_RETRYABLE.
+            // **MED-PR70-R11-01 handoff**: `expected_server_fiscal_no`
+            // sourced from `StageSendOutcome::Sent { server_fiscal_no
+            // }` (just stamped this tick by stage_send 4-b), NOT from
+            // the pre-stage_send cohort snapshot `doc.server_fiscal_no`
+            // (which is `None` at SELECT time per stage_send 4-b
+            // invariant).
             //
-            // `kvt1_raw_bytes: None` — stage_send::Sent outcome does
-            // not surface `ack.data_sign` in its public outcome
-            // (only `server_fiscal_no` + `attempt_no`).  Pre-W12 gap;
-            // W12 PR closes by routing all Sent advances through the
-            // lastChk evidence path.
-            let w12 = apply_w12_confirmation(
+            // **SentFresh source-context routing** (helper-internal):
+            //   - Acked → Envelope 1a + Envelope 2 → Advanced.
+            //   - StructuralDrift (NotFound/Mismatch) → Envelope
+            //     1c-drift-light audit + BootError::Internal per plan
+            //     §410.
+            //   - Hold (Transport/Server/Auth/Decode/empty-data_sign)
+            //     → Envelope 1c-hold-light audit + BootError::Internal
+            //     ("Commit 6 will project to HoldFnDrain").
+            let confirm_outcome = kvt2_confirm::confirm_drain_doc(
                 pool,
-                fiscal_number,
-                doc.document_id,
-                DocState::Sent,
-                &audit_payload,
-                None,
+                deps.dps,
+                doc,
+                &server_fiscal_no,
+                deps.fn_sign,
+                kvt2_confirm::Kvt2ConfirmSource::SentFresh,
+                Some(attempt_no.into()),
             )
             .await?;
-            summary.record_doc_advanced(&w12, false);
-            Ok(DocVerdict::Advanced)
+            match confirm_outcome {
+                kvt2_confirm::ConfirmDrainOutcome::Advanced => {
+                    summary.record_doc_advanced(
+                        &W12ConfirmOutcome::Acked {
+                            server_fiscal_no: server_fiscal_no.clone(),
+                        },
+                        /* via_lastchk_replay */ false,
+                    );
+                    Ok(DocVerdict::Advanced)
+                }
+                kvt2_confirm::ConfirmDrainOutcome::HoldFnDrain { projection } => {
+                    // M3b W12 Commit 5b.1: defensive — SentFresh Hold
+                    // arm в `confirm_drain_doc` STILL returns
+                    // `BootError::Internal` defensive marker until
+                    // Commit 6 wires HoldFnDrain projection for
+                    // SentFresh.  Receiving HoldFnDrain here means
+                    // Commit 6 landed without updating this caller —
+                    // fail-loud з diagnostic.
+                    Err(BootError::Internal(format!(
+                        "process_via_stage_send: confirm_drain_doc(SentFresh) \
+                         returned HoldFnDrain {{ projection: {projection:?} }} \
+                         — structurally unreachable until Commit 6 rewires \
+                         SentFresh Hold caller-side projection"
+                    )))
+                }
+            }
         }
         Ok(StageSendOutcome::Routed {
             decision,
@@ -1427,43 +1750,260 @@ async fn process_via_lastchk_replay(
     }
 }
 
-/// Process a doc in `KVT1` or `KVT2` state via the W12 stub only
-/// (no wire, no pre-flight).  Pre-W12 the stub returns
-/// `DeferredKvt1` without DB mutation — the doc remains in its
-/// current state until W12 PR lands the `lastChk` evidence path.
-/// Each drain tick re-visits these docs and re-records DeferredKvt1
-/// (operator-pinned correct but inefficient pre-W12 steady-state).
+/// Process a doc in `KVT1` state via the W12 Kvt1Reentry chain
+/// (`confirm_drain_doc(Kvt1Reentry, ...)`).  The doc was previously
+/// advanced to `Kvt1` by a prior tick (boot recovery OR prior-tick
+/// W12 Hold) and is now eligible for the `lastChk` evidence path
+/// via the persisted `server_fiscal_no`.
+///
+/// **M3b W12 Commit 5 (plan §411, 2026-05-22)**: replaced pre-W12
+/// `apply_w12_confirmation` stub call with full W12 chain:
+/// `confirm_drain_doc(Kvt1Reentry, ...)` → Envelope 1b (Kvt1Raw +
+/// Kvt1→Kvt2 + audit) → Envelope 2 (`stage_finalize::run` Kvt2→Ack)
+/// on Acked.  NotFound/Mismatch surface as `StructuralDrift` →
+/// `BootError::Internal` per plan §410.  Hold path emits
+/// `KVT2_CONFIRM_HOLD` audit + returns BootError (HoldFnDrain
+/// projection deferred to Commit 6 per plan §413).
+///
+/// **MED-PR70-R11-01 handoff**: `expected_server_fiscal_no` sourced
+/// from persisted `doc.server_fiscal_no` (Kvt1 state guarantees
+/// stamp present per stage_send 4-b invariant) with explicit
+/// `BootError::Internal` fail-loud on None — Kvt1 without
+/// `server_fiscal_no` is a state-machine invariant breach (cohort
+/// walker should never have surfaced it).
 async fn process_via_w12_only(
+    pool: &SqlitePool,
+    _fiscal_number: &str,
+    doc: &fiscal_documents::DocumentRow,
+    summary: &mut DrainSummary,
+    deps: &RuntimeView<'_>,
+) -> Result<DocVerdict, BootError> {
+    let id_hex = hex_lower(doc.document_id.as_bytes());
+    // Source the canonical expected_server_fiscal_no from persisted
+    // doc row — Kvt1 state guarantees stage_send 4-b stamped it.
+    // **MED-W12C5-01 fix (5 Δ, 2026-05-22)**: emit durable
+    // KVT2_CONFIRM_STRUCTURAL_DRIFT audit (Severity::Error) via
+    // Envelope 1c-drift-light BEFORE the BootError::Internal halt
+    // so forensic operators see the structural breach in audit_log
+    // (not just the returned error string).  Doc state untouched.
+    let expected_server_fiscal_no = match doc.server_fiscal_no.as_deref() {
+        Some(s) => s,
+        None => {
+            kvt2_confirm::commit_drift_envelope_1c_drift_light(
+                pool,
+                &doc.fiscal_number,
+                &id_hex,
+                kvt2_confirm::Kvt2ConfirmSource::Kvt1Reentry,
+                &kvt2_confirm::Kvt2ConfirmStructuralReason::ServerFiscalNoMissing,
+            )
+            .await?;
+            return Err(BootError::Internal(format!(
+                "process_via_w12_only({fn_id}): doc {id_hex} at state Kvt1 has \
+                 NULL server_fiscal_no — stage_send 4-b stamp invariant breach \
+                 (Kvt1 ALWAYS implies server_fiscal_no stamped by prior tick).  \
+                 KVT2_CONFIRM_STRUCTURAL_DRIFT audit emitted prior to halt.",
+                fn_id = doc.fiscal_number,
+            )));
+        }
+    };
+    let confirm_outcome = kvt2_confirm::confirm_drain_doc(
+        pool,
+        deps.dps,
+        doc,
+        expected_server_fiscal_no,
+        deps.fn_sign,
+        kvt2_confirm::Kvt2ConfirmSource::Kvt1Reentry,
+        // attempt_no: None — Kvt1Reentry has no fresh wire attempt
+        // this tick (no stage_send invocation).
+        None,
+    )
+    .await?;
+    match confirm_outcome {
+        kvt2_confirm::ConfirmDrainOutcome::Advanced => {
+            summary.record_doc_advanced(
+                &W12ConfirmOutcome::Acked {
+                    server_fiscal_no: expected_server_fiscal_no.to_string(),
+                },
+                /* via_lastchk_replay */ false,
+            );
+            Ok(DocVerdict::Advanced)
+        }
+        kvt2_confirm::ConfirmDrainOutcome::HoldFnDrain { projection } => {
+            // M3b W12 Commit 5b.1: defensive — Kvt1Reentry Hold arm
+            // в `confirm_drain_doc` STILL returns BootError::Internal
+            // defensive marker until Commit 6 wires HoldFnDrain
+            // projection for Kvt1Reentry.  Receiving HoldFnDrain here
+            // means Commit 6 landed without updating this caller —
+            // fail-loud з diagnostic.
+            Err(BootError::Internal(format!(
+                "process_via_w12_only: confirm_drain_doc(Kvt1Reentry) \
+                 returned HoldFnDrain {{ projection: {projection:?} }} \
+                 — structurally unreachable until Commit 6 rewires \
+                 Kvt1Reentry Hold caller-side projection"
+            )))
+        }
+    }
+}
+
+/// **M3b W12 Commit 3** — KVT2 cohort dispatch helper (reverses
+/// MED-C5-4 deferral per plan §"Crash-recovery convergence" §19 +
+/// §"Cohort widening" §14-15).
+///
+/// Invokes `stage_finalize::run(pool, doc_id)` for idempotent
+/// `Kvt2 → Ack` advance.  Surfaces mid-tick crash recovery between
+/// Envelope 1 (W12 Kvt1→Kvt2 advance, lands in Commits 4/5/5b) and
+/// Envelope 2 (`stage_finalize::run` Kvt2→Ack).  M3a `AlreadyAcked`
+/// contract means a doc already in `Ack` returns
+/// `StageFinalizeOutcome::AlreadyAcked` (no-op success-shape;
+/// concurrent finish-doc race or replay arrived after boot recovery
+/// already finalized).
+///
+/// **Outcome routing** per plan §15:
+/// - `Acked { fiscal_number, lnd }` → [`DocVerdict::Advanced`] +
+///   summary `record_doc_advanced(W12ConfirmOutcome::Acked {
+///   server_fiscal_no }, via_lastchk_replay=false)` +
+///   `OFFLINE_DRAIN_DOC_ADVANCED` forensic audit
+///   (`dispatch_via="w12_kvt2_recovery"`).
+/// - `AlreadyAcked` → same Advanced+record as Acked (idempotent
+///   replay; doc IS at Ack now).
+/// - `StateConflict { observed }` → [`DocVerdict::Failed`] with
+///   `FailureClass::StateConflict` + `manual_recon: true` (concurrent
+///   writer past App reconcile mutex; system-level signal).
+/// - `DocumentMissing` → [`DocVerdict::Failed`] with
+///   `FailureClass::NotFound` + `manual_recon: true` (cohort race
+///   with delete; should not happen in production but defensive).
+/// - `Err(StageFinalizeError)` → propagate as
+///   [`BootError::ReconciliationFailed`] (infrastructure failure).
+///
+/// **I1 preserved**: `stage_finalize::run` is pool-only and owns its
+/// own `with_immediate` envelope per M3a W8 contract; this helper
+/// adds no envelope around the call.  Forensic audits
+/// (`OFFLINE_DRAIN_DOC_ADVANCED` / `_DOC_FAILED`) are pool-bound and
+/// emitted AFTER stage_finalize commits.
+async fn process_via_w12_kvt2_advance(
     pool: &SqlitePool,
     fiscal_number: &str,
     doc: &fiscal_documents::DocumentRow,
     summary: &mut DrainSummary,
 ) -> Result<DocVerdict, BootError> {
+    use crate::services::write_path::stage_finalize::{self, StageFinalizeOutcome};
+
     let id_hex = hex_lower(doc.document_id.as_bytes());
-    let audit_payload = serde_json::json!({
-        "document_id": id_hex,
-        "from_state": doc.state.as_str(),
-        // Pre-W12 stub: no DB transition for Kvt1/Kvt2; to_state
-        // mirrors from_state.  W12 PR will set to_state="ACK" on
-        // the Kvt2 → Ack path via stage_finalize::run.
-        "to_state": doc.state.as_str(),
-        "replay_short_circuit": false,
-        "w12_status": W12ConfirmOutcome::DeferredKvt1.w12_status_str(),
-        "dispatch_via": "w12_only",
-    });
-    // Cohort walker filtered to KVT1 post MED-C5-4 (KVT2 deferred to
-    // W12 PR); pass `doc.state` through.
-    let w12 = apply_w12_confirmation(
-        pool,
-        fiscal_number,
-        doc.document_id,
-        doc.state,
-        &audit_payload,
-        None,
-    )
-    .await?;
-    summary.record_doc_advanced(&w12, false);
-    Ok(DocVerdict::Advanced)
+    let outcome = stage_finalize::run(pool, doc.document_id)
+        .await
+        .map_err(|source| BootError::ReconciliationFailed {
+            fiscal_number: fiscal_number.to_string(),
+            source: anyhow::Error::new(source),
+        })?;
+
+    // Acked + AlreadyAcked share the "doc reached Ack" forensic
+    // shape; pre-compute the success payload once, then dispatch on
+    // outcome.  doc.server_fiscal_no is `Some(..)` per stage_send 4-b
+    // invariant (doc in KVT2 state implies original Sent advance
+    // stamped it); empty-string fallback avoids an extra error path
+    // for the structurally-impossible None case.
+    match outcome {
+        StageFinalizeOutcome::Acked {
+            fiscal_number: ack_fn,
+            lnd,
+        } => {
+            let server_fiscal_no = doc.server_fiscal_no.clone().unwrap_or_default();
+            let payload = serde_json::json!({
+                "document_id": id_hex,
+                "from_state": doc.state.as_str(),
+                "to_state": DocState::Ack.as_str(),
+                "replay_short_circuit": false,
+                "w12_status": W12ConfirmOutcome::Acked {
+                    server_fiscal_no: server_fiscal_no.clone(),
+                }
+                .w12_status_str(),
+                "dispatch_via": "w12_kvt2_recovery",
+                "stage_finalize_outcome": "Acked",
+                "stage_finalize_lnd": lnd,
+                "stage_finalize_fiscal_number": ack_fn,
+            });
+            audit_log::append(
+                pool,
+                AUDIT_ENTITY_DOC,
+                &id_hex,
+                "OFFLINE_DRAIN_DOC_ADVANCED",
+                Severity::Info,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await
+            .map_err(BootError::Database)?;
+            summary.record_doc_advanced(
+                &W12ConfirmOutcome::Acked { server_fiscal_no },
+                /* via_lastchk_replay */ false,
+            );
+            Ok(DocVerdict::Advanced)
+        }
+        StageFinalizeOutcome::AlreadyAcked => {
+            let server_fiscal_no = doc.server_fiscal_no.clone().unwrap_or_default();
+            let payload = serde_json::json!({
+                "document_id": id_hex,
+                "from_state": doc.state.as_str(),
+                "to_state": DocState::Ack.as_str(),
+                "replay_short_circuit": false,
+                "w12_status": W12ConfirmOutcome::Acked {
+                    server_fiscal_no: server_fiscal_no.clone(),
+                }
+                .w12_status_str(),
+                "dispatch_via": "w12_kvt2_recovery",
+                "stage_finalize_outcome": "AlreadyAcked",
+            });
+            audit_log::append(
+                pool,
+                AUDIT_ENTITY_DOC,
+                &id_hex,
+                "OFFLINE_DRAIN_DOC_ADVANCED",
+                Severity::Info,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await
+            .map_err(BootError::Database)?;
+            summary.record_doc_advanced(
+                &W12ConfirmOutcome::Acked { server_fiscal_no },
+                /* via_lastchk_replay */ false,
+            );
+            Ok(DocVerdict::Advanced)
+        }
+        StageFinalizeOutcome::StateConflict { observed } => {
+            let class = FailureClass::StateConflict;
+            let class_str = failure_class_for(class);
+            summary.record_doc_failure(doc.document_id, class_str.to_string());
+            let payload = serde_json::json!({
+                "document_id": id_hex,
+                "failure_class": class_str,
+                "observed_state": observed.as_str(),
+                "dispatch_via": "w12_kvt2_recovery",
+                "manual_recon_class": true,
+            });
+            emit_doc_failed(pool, &id_hex, &payload).await?;
+            Ok(DocVerdict::Failed {
+                class,
+                manual_recon: true,
+            })
+        }
+        StageFinalizeOutcome::DocumentMissing => {
+            let class = FailureClass::NotFound;
+            let class_str = failure_class_for(class);
+            summary.record_doc_failure(doc.document_id, class_str.to_string());
+            let payload = serde_json::json!({
+                "document_id": id_hex,
+                "failure_class": class_str,
+                "dispatch_via": "w12_kvt2_recovery",
+                "manual_recon_class": true,
+            });
+            emit_doc_failed(pool, &id_hex, &payload).await?;
+            Ok(DocVerdict::Failed {
+                class,
+                manual_recon: true,
+            })
+        }
+    }
 }
 
 /// W9b C5 W12 stub seam (spec §2.3 Step C + §9 OQ-2).  Pre-W12
@@ -1852,10 +2392,63 @@ async fn finalize_drain(
 ) -> Result<(), BootError> {
     match summary.finalize_eligibility() {
         FinalizeEligibility::Eligible => {
-            commit_finalize_envelope(pool, fiscal_number, session_id, ns, summary).await
+            commit_finalize_envelope(
+                pool,
+                fiscal_number,
+                session_id,
+                ns,
+                summary,
+                FinalizeEntry::NormalEligible,
+            )
+            .await
         }
         FinalizeEligibility::NotEligible { reason } => {
             emit_partial(pool, fiscal_number, session_id, summary, &reason).await
+        }
+    }
+}
+
+/// **M3b W12 Commit 3 Δ** (MED-W12C3-01 fix, 2026-05-22) — entry-point
+/// taxonomy for [`commit_finalize_envelope`].  Distinguishes the
+/// per-tick "drain processed docs to Ack" path from the post-crash
+/// "drain found session already completable" recovery path so audit
+/// monitoring can tell them apart cleanly.
+///
+/// **Why distinct entries**: the recovery path runs with a fresh
+/// [`DrainSummary`] (0 in-flight docs this tick) but commits the same
+/// 5-write finalize envelope.  Operators reading the
+/// `OFFLINE_DRAIN_COMPLETED` audit row stream would otherwise see
+/// `backlog_size_before=0, advanced_to_ack=0` and have no signal that
+/// THIS finalize was driven by post-crash recovery rather than a
+/// genuinely empty drain pass.  The distinct event name
+/// (`OFFLINE_DRAIN_RECOVERED_FINALIZE`) + `entry_reason` payload
+/// field make the recovery case grep-able for forensic dashboards.
+#[derive(Debug, Clone, Copy)]
+enum FinalizeEntry {
+    /// Per-tick drain processed docs to Ack and is finalizing as
+    /// usual via `FinalizeEligibility::Eligible`.
+    NormalEligible,
+    /// MED-W12C3-01 crash-recovery entry: empty cohort + session in
+    /// `Draining` + `is_session_drain_completable` proved all session
+    /// docs already in `Ack`.  Prior drain tick committed
+    /// `stage_finalize::run` Kvt2 → Ack durably but crashed before
+    /// reaching `finalize_drain`.  This tick closes the session via
+    /// the same 5-write envelope with distinct audit shape.
+    CrashRecovery,
+}
+
+impl FinalizeEntry {
+    fn audit_event_name(self) -> &'static str {
+        match self {
+            Self::NormalEligible => "OFFLINE_DRAIN_COMPLETED",
+            Self::CrashRecovery => "OFFLINE_DRAIN_RECOVERED_FINALIZE",
+        }
+    }
+
+    fn entry_reason_str(self) -> &'static str {
+        match self {
+            Self::NormalEligible => "normal_eligible",
+            Self::CrashRecovery => "crash_recovery",
         }
     }
 }
@@ -1892,6 +2485,7 @@ async fn commit_finalize_envelope(
     session_id: OfflineSessionId,
     ns: &crate::db::repositories::node_state::NodeStateRow,
     summary: &mut DrainSummary,
+    entry: FinalizeEntry,
 ) -> Result<(), BootError> {
     let fiscal_number_owned = fiscal_number.to_string();
     let node_mode_from = ns.mode;
@@ -1934,7 +2528,12 @@ async fn commit_finalize_envelope(
     // the optimistic `true` is structurally honest.
     let mut payload = build_finalize_payload(summary, session_id, "COMPLETED", None);
     payload["finalized"] = serde_json::Value::Bool(true);
+    // MED-W12C3-01 (2026-05-22): tag entry path so operators can grep
+    // the post-crash recovery finalizes apart from per-tick finalizes
+    // (both share the 5-write envelope; only audit shape differs).
+    payload["entry_reason"] = serde_json::Value::String(entry.entry_reason_str().to_string());
     let payload_owned = payload.to_string();
+    let audit_event_name = entry.audit_event_name();
     // MED-C6-2 fix (2026-05-21): W5 session-lifecycle audit shape for
     // the Draining → Closed transition (matches `OfflineSessionService::
     // close_session` convention).
@@ -2036,12 +2635,14 @@ async fn commit_finalize_envelope(
                 Some(&session_closed_payload_owned),
             )
             .await?;
-            // (4) Audit OFFLINE_DRAIN_COMPLETED.
+            // (4) Audit OFFLINE_DRAIN_COMPLETED — or
+            // OFFLINE_DRAIN_RECOVERED_FINALIZE per [`FinalizeEntry`]
+            // (MED-W12C3-01 2026-05-22).
             audit_log::append_tx(
                 tx,
                 AUDIT_ENTITY_DRAIN_FN,
                 &fiscal_number_owned,
-                "OFFLINE_DRAIN_COMPLETED",
+                audit_event_name,
                 Severity::Info,
                 None,
                 Some(&payload_owned),
@@ -2121,6 +2722,13 @@ fn build_finalize_payload(
         "advanced_to_ack": summary.advanced_to_ack(),
         "advanced_to_kvt1": summary.advanced_to_kvt1(),
         "advanced_via_lastchk_replay": summary.advanced_via_lastchk_replay(),
+        // M3b W12 Commit 2 — per-counter breakdown for multi-reason
+        // forensic payload.  Operator dashboards filter on these even
+        // when `not_eligible_reason.kind` selects the
+        // highest-precedence single blocker.
+        "held_at_kvt1": summary.held_at_kvt1(),
+        "held_at_sent": summary.held_at_sent(),
+        "er_redrive_queued": summary.er_redrive_queued(),
         "per_doc_failures": per_doc_failures,
         "finalized": summary.finalized(),
     });
@@ -2135,6 +2743,18 @@ fn not_eligible_reason_as_json(reason: &NotEligibleReason) -> serde_json::Value 
     match reason {
         NotEligibleReason::PerDocFailuresPresent { count } => serde_json::json!({
             "kind": "PerDocFailuresPresent",
+            "count": count,
+        }),
+        NotEligibleReason::DocsHeldAtKvt1 { count } => serde_json::json!({
+            "kind": "DocsHeldAtKvt1",
+            "count": count,
+        }),
+        NotEligibleReason::DocsHeldAtSent { count } => serde_json::json!({
+            "kind": "DocsHeldAtSent",
+            "count": count,
+        }),
+        NotEligibleReason::DocsErRedriveQueued { count } => serde_json::json!({
+            "kind": "DocsErRedriveQueued",
             "count": count,
         }),
         NotEligibleReason::DocsDeferredAtKvt1 { count } => serde_json::json!({
@@ -2352,9 +2972,16 @@ mod eligible_arm_tests {
             FinalizeEligibility::Eligible
         ));
 
-        commit_finalize_envelope(&pool, FN, session_id, &ns, &mut summary)
-            .await
-            .expect("Eligible commit must succeed on properly-seeded fixture");
+        commit_finalize_envelope(
+            &pool,
+            FN,
+            session_id,
+            &ns,
+            &mut summary,
+            FinalizeEntry::NormalEligible,
+        )
+        .await
+        .expect("Eligible commit must succeed on properly-seeded fixture");
 
         // DB state.
         assert_eq!(read_node_mode(&pool).await, "ONLINE");
@@ -2488,9 +3115,16 @@ mod eligible_arm_tests {
         let session_id = seed_draining_session(&pool).await;
         let mut summary = ack_summary_2();
 
-        commit_finalize_envelope(&pool, FN, session_id, &ns, &mut summary)
-            .await
-            .expect("Eligible commit on pending-drain shift must succeed");
+        commit_finalize_envelope(
+            &pool,
+            FN,
+            session_id,
+            &ns,
+            &mut summary,
+            FinalizeEntry::NormalEligible,
+        )
+        .await
+        .expect("Eligible commit on pending-drain shift must succeed");
 
         // Mode + session + shift + node_state mirror all finalized.
         assert_eq!(read_node_mode(&pool).await, "ONLINE");
@@ -2529,9 +3163,16 @@ mod eligible_arm_tests {
         let session_id = seed_draining_session(&pool).await;
         let mut summary = ack_summary_2();
 
-        commit_finalize_envelope(&pool, FN, session_id, &ns, &mut summary)
-            .await
-            .expect("Eligible commit on closing-pending-drain shift must succeed");
+        commit_finalize_envelope(
+            &pool,
+            FN,
+            session_id,
+            &ns,
+            &mut summary,
+            FinalizeEntry::NormalEligible,
+        )
+        .await
+        .expect("Eligible commit on closing-pending-drain shift must succeed");
 
         assert_eq!(read_node_mode(&pool).await, "ONLINE");
         assert_eq!(read_session_state(&pool, session_id).await, "CLOSED");
@@ -2546,5 +3187,260 @@ mod eligible_arm_tests {
         assert_eq!(audit_count(&pool, "OFFLINE_SESSION_CLOSED").await, 1);
 
         assert!(summary.finalized());
+    }
+}
+
+// ─── M3b W12 Commit 2: HoldFnDrain control surface tests ─────────────
+//
+// Synthetic tests for the projection-aware DrainSummary +
+// FinalizeEligibility surface added in Commit 2.  No drain-loop
+// integration here — full helper wiring + drain dispatcher rewires
+// land in Commits 4 / 5 / 5b with their own integration tests.
+
+#[cfg(test)]
+mod w12_control_surface_tests {
+    use super::*;
+    use crate::db::models::ids::{DocumentId, OfflineSessionId};
+
+    const FN: &str = "1234567890";
+
+    fn doc() -> DocumentId {
+        DocumentId::new()
+    }
+
+    fn summary_with_size(backlog_size: usize) -> DrainSummary {
+        DrainSummary::new(FN.to_string(), backlog_size)
+    }
+
+    // ─── Counter increment per recording method ──────────────────────
+
+    #[test]
+    fn record_doc_held_at_kvt1_increments_counter() {
+        let mut s = summary_with_size(3);
+        assert_eq!(s.held_at_kvt1(), 0);
+        s.record_doc_held_at_kvt1(doc(), "wire_routing_probe_required".into());
+        assert_eq!(s.held_at_kvt1(), 1);
+        assert_eq!(s.held_at_sent(), 0);
+        assert_eq!(s.er_redrive_queued(), 0);
+    }
+
+    #[test]
+    fn record_doc_held_at_sent_increments_counter() {
+        let mut s = summary_with_size(3);
+        s.record_doc_held_at_sent(doc(), "transport".into());
+        assert_eq!(s.held_at_sent(), 1);
+        assert_eq!(s.held_at_kvt1(), 0);
+        assert_eq!(s.er_redrive_queued(), 0);
+    }
+
+    #[test]
+    fn record_doc_er_redrive_queued_increments_counter() {
+        let mut s = summary_with_size(3);
+        s.record_doc_er_redrive_queued(doc(), "sent_not_found_downgrade".into());
+        assert_eq!(s.er_redrive_queued(), 1);
+        assert_eq!(s.held_at_kvt1(), 0);
+        assert_eq!(s.held_at_sent(), 0);
+    }
+
+    // ─── finalize_eligibility per single W12 counter ─────────────────
+
+    #[test]
+    fn held_at_kvt1_blocks_finalize_with_docs_held_at_kvt1() {
+        let mut s = summary_with_size(1);
+        s.record_doc_held_at_kvt1(doc(), "transport".into());
+        match s.finalize_eligibility() {
+            FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsHeldAtKvt1 { count },
+            } => assert_eq!(count, 1),
+            other => panic!("expected DocsHeldAtKvt1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn held_at_sent_blocks_finalize_with_docs_held_at_sent() {
+        let mut s = summary_with_size(1);
+        s.record_doc_held_at_sent(doc(), "transport".into());
+        assert!(matches!(
+            s.finalize_eligibility(),
+            FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsHeldAtSent { count: 1 },
+            }
+        ));
+    }
+
+    #[test]
+    fn er_redrive_queued_blocks_finalize_with_docs_er_redrive_queued() {
+        let mut s = summary_with_size(1);
+        s.record_doc_er_redrive_queued(doc(), "sent_not_found_downgrade".into());
+        assert!(matches!(
+            s.finalize_eligibility(),
+            FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsErRedriveQueued { count: 1 },
+            }
+        ));
+    }
+
+    // ─── Precedence ──────────────────────────────────────────────────
+
+    #[test]
+    fn per_doc_failure_takes_precedence_over_w12_counters() {
+        let mut s = summary_with_size(3);
+        s.record_doc_failure(doc(), "transport".into());
+        s.record_doc_held_at_kvt1(doc(), "transport".into());
+        s.record_doc_held_at_sent(doc(), "transport".into());
+        s.record_doc_er_redrive_queued(doc(), "sent_not_found_downgrade".into());
+        assert!(matches!(
+            s.finalize_eligibility(),
+            FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::PerDocFailuresPresent { count: 1 },
+            }
+        ));
+    }
+
+    #[test]
+    fn held_at_kvt1_takes_precedence_over_held_at_sent_and_er_redrive() {
+        let mut s = summary_with_size(3);
+        s.record_doc_held_at_kvt1(doc(), "transport".into());
+        s.record_doc_held_at_sent(doc(), "transport".into());
+        s.record_doc_er_redrive_queued(doc(), "sent_not_found_downgrade".into());
+        assert!(matches!(
+            s.finalize_eligibility(),
+            FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsHeldAtKvt1 { count: 1 },
+            }
+        ));
+    }
+
+    #[test]
+    fn held_at_sent_takes_precedence_over_er_redrive_queued() {
+        let mut s = summary_with_size(2);
+        s.record_doc_held_at_sent(doc(), "transport".into());
+        s.record_doc_er_redrive_queued(doc(), "sent_not_found_downgrade".into());
+        assert!(matches!(
+            s.finalize_eligibility(),
+            FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsHeldAtSent { count: 1 },
+            }
+        ));
+    }
+
+    #[test]
+    fn w12_counters_take_precedence_over_legacy_deferred_at_kvt1() {
+        // Synthetic: simulate one legacy DeferredKvt1 (via
+        // record_doc_advanced) plus one W12 ErRedriveQueued.  Precedence
+        // says W12 counters block before the legacy stub counter.
+        let mut s = summary_with_size(2);
+        s.record_doc_advanced(
+            &W12ConfirmOutcome::DeferredKvt1,
+            /* via_lastchk_replay */ false,
+        );
+        s.record_doc_er_redrive_queued(doc(), "sent_not_found_downgrade".into());
+        assert!(matches!(
+            s.finalize_eligibility(),
+            FinalizeEligibility::NotEligible {
+                reason: NotEligibleReason::DocsErRedriveQueued { count: 1 },
+            }
+        ));
+    }
+
+    // ─── Eligible only with ALL counters zero + Acked == backlog ─────
+
+    #[test]
+    fn eligible_only_when_all_w12_counters_zero_and_acked_complete() {
+        let mut s = summary_with_size(1);
+        s.record_doc_advanced(
+            &W12ConfirmOutcome::Acked {
+                server_fiscal_no: "FN-001".into(),
+            },
+            false,
+        );
+        assert_eq!(s.held_at_kvt1(), 0);
+        assert_eq!(s.held_at_sent(), 0);
+        assert_eq!(s.er_redrive_queued(), 0);
+        assert_eq!(s.advanced_to_ack(), 1);
+        assert_eq!(s.advanced_to_kvt1(), 0);
+        assert!(matches!(
+            s.finalize_eligibility(),
+            FinalizeEligibility::Eligible
+        ));
+    }
+
+    // ─── Multi-reason payload in OFFLINE_DRAIN_PARTIAL ───────────────
+
+    #[test]
+    fn build_finalize_payload_includes_all_three_w12_counters() {
+        let mut s = summary_with_size(3);
+        s.record_doc_held_at_kvt1(doc(), "transport".into());
+        s.record_doc_held_at_sent(doc(), "transport".into());
+        s.record_doc_er_redrive_queued(doc(), "sent_not_found_downgrade".into());
+
+        let reason = NotEligibleReason::DocsHeldAtKvt1 { count: 1 };
+        let session_id = OfflineSessionId::new();
+        let payload = build_finalize_payload(&s, session_id, "PARTIAL", Some(&reason));
+
+        // Multi-reason breakdown: all three W12 counters are present
+        // as separate JSON keys regardless of which one was selected
+        // for `not_eligible_reason.kind` (precedence picks one;
+        // payload carries all for forensic dashboards).
+        assert_eq!(payload["held_at_kvt1"], 1);
+        assert_eq!(payload["held_at_sent"], 1);
+        assert_eq!(payload["er_redrive_queued"], 1);
+        // not_eligible_reason carries the highest-precedence single
+        // blocker.
+        assert_eq!(payload["not_eligible_reason"]["kind"], "DocsHeldAtKvt1");
+        assert_eq!(payload["not_eligible_reason"]["count"], 1);
+    }
+
+    // ─── not_eligible_reason_as_json: all three new variants ─────────
+
+    #[test]
+    fn not_eligible_reason_as_json_docs_held_at_kvt1() {
+        let j = not_eligible_reason_as_json(&NotEligibleReason::DocsHeldAtKvt1 { count: 7 });
+        assert_eq!(j["kind"], "DocsHeldAtKvt1");
+        assert_eq!(j["count"], 7);
+    }
+
+    #[test]
+    fn not_eligible_reason_as_json_docs_held_at_sent() {
+        let j = not_eligible_reason_as_json(&NotEligibleReason::DocsHeldAtSent { count: 3 });
+        assert_eq!(j["kind"], "DocsHeldAtSent");
+        assert_eq!(j["count"], 3);
+    }
+
+    #[test]
+    fn not_eligible_reason_as_json_docs_er_redrive_queued() {
+        let j = not_eligible_reason_as_json(&NotEligibleReason::DocsErRedriveQueued { count: 2 });
+        assert_eq!(j["kind"], "DocsErRedriveQueued");
+        assert_eq!(j["count"], 2);
+    }
+
+    // ─── HoldFnDrain variant + HoldFnDrainProjection compile-time ────
+
+    #[test]
+    fn hold_fn_drain_variant_constructible_per_projection() {
+        let v_kvt1 = DocVerdict::HoldFnDrain {
+            class: FailureClass::WireRoutingProbeRequired,
+            projection: HoldFnDrainProjection::HeldAtKvt1,
+        };
+        let v_sent = DocVerdict::HoldFnDrain {
+            class: FailureClass::Transport,
+            projection: HoldFnDrainProjection::HeldAtSent,
+        };
+        let v_er = DocVerdict::HoldFnDrain {
+            class: FailureClass::BudgetExhausted,
+            projection: HoldFnDrainProjection::ErRedriveQueued,
+        };
+        // Construction does not panic; pattern-match arms are
+        // structurally distinguishable.
+        for v in [v_kvt1, v_sent, v_er] {
+            match v {
+                DocVerdict::HoldFnDrain { projection, .. } => {
+                    let _ = projection; // exhaustive arm reachable
+                }
+                DocVerdict::Advanced | DocVerdict::Failed { .. } => {
+                    panic!("unexpected non-HoldFnDrain variant")
+                }
+            }
+        }
     }
 }

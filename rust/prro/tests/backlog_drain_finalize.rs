@@ -236,6 +236,29 @@ fn carriers(responses: Vec<Result<CheckAck, DpsError>>) -> DepsCarriers {
     }
 }
 
+/// **M3b W12 Commit 4b.3 (2026-05-22)** — DepsCarriers builder
+/// seeding both `send_chk` + `last_chk` queues for SentFresh path.
+fn carriers_with_last_chk(
+    send_chk: Vec<Result<CheckAck, DpsError>>,
+    last_chk: Vec<Result<CheckAck, DpsError>>,
+) -> DepsCarriers {
+    DepsCarriers {
+        dps: Arc::new(StubDpsChannel::with_queue(send_chk).with_last_chk_queue(last_chk)),
+        signing_ctx: det_signing_ctx(),
+        fn_sign: fn_sign(),
+    }
+}
+
+/// **M3b W12 Commit 4b.3 (2026-05-22)** — non-empty `data_sign`
+/// CheckAck for lastChk Acked path.
+fn last_chk_ack(id: &str, data_sign: Vec<u8>) -> CheckAck {
+    CheckAck {
+        id: id.into(),
+        id_sign: vec![],
+        data_sign,
+    }
+}
+
 fn view_for<'a>(carriers: &'a DepsCarriers) -> RuntimeView<'a> {
     RuntimeView {
         dps: carriers.dps.as_ref(),
@@ -247,12 +270,18 @@ fn view_for<'a>(carriers: &'a DepsCarriers) -> RuntimeView<'a> {
 // ─── Test 1: pre-W12 partial steady-state (DocsDeferredAtKvt1) ───────
 
 #[tokio::test]
-async fn c6_pre_w12_partial_when_all_advances_are_deferred_kvt1() {
+async fn c6_eligible_completed_when_all_docs_reach_ack_via_w12() {
+    // **M3b W12 Commit 4b.3 (2026-05-22)** — refactored from pre-W12
+    // `c6_pre_w12_partial_when_all_advances_are_deferred_kvt1`.  Post
+    // W12 wiring, OFFLINE_LOCAL_ACK docs advance through SentFresh
+    // chain (Envelope 1a + Envelope 2) to Ack; `finalize_eligibility`
+    // flips Eligible → COMPLETED audit + node Online + session Closed.
+    // Pre-W12 DeferredKvt1 path is structurally unreachable.
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
-    let _a = seed_doc(
+    let doc_a = seed_doc(
         &pool,
         1,
         100,
@@ -262,7 +291,7 @@ async fn c6_pre_w12_partial_when_all_advances_are_deferred_kvt1() {
         None,
     )
     .await;
-    let _b = seed_doc(
+    let doc_b = seed_doc(
         &pool,
         2,
         101,
@@ -272,35 +301,71 @@ async fn c6_pre_w12_partial_when_all_advances_are_deferred_kvt1() {
         None,
     )
     .await;
+    // W12 chain bootstrap — 2-doc chain.
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc_a,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc_b,
+        common::chain_anchor(0x01),
+        common::chain_anchor(0x02),
+    )
+    .await
+    .unwrap();
 
-    let c = carriers(vec![Ok(ack("A")), Ok(ack("B"))]);
+    let c = carriers_with_last_chk(
+        vec![Ok(ack("A")), Ok(ack("B"))],
+        vec![
+            Ok(last_chk_ack("A", vec![0xAAu8; 32])),
+            Ok(last_chk_ack("B", vec![0xBBu8; 32])),
+        ],
+    );
     let view = view_for(&c);
 
     let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
         .await
         .unwrap();
 
-    // Both docs advanced as DeferredKvt1 → finalize_eligibility blocked.
+    // Both docs advanced to Ack via W12 SentFresh chain →
+    // finalize_eligibility == Eligible → COMPLETED.
     assert_eq!(summary.backlog_size_before(), 2);
-    assert_eq!(summary.advanced_to_kvt1(), 2);
-    assert!(!summary.finalized(), "pre-W12 stub cannot finalize");
+    assert_eq!(summary.advanced_to_ack(), 2);
+    assert_eq!(summary.advanced_to_kvt1(), 0, "no DeferredKvt1 post-W12");
+    assert!(
+        summary.finalized(),
+        "W12 SentFresh-Acked path enables Eligible finalize"
+    );
 
-    // PARTIAL audit fired exactly once with the typed reason.
-    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_PARTIAL").await, 1);
-    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_COMPLETED").await, 0);
-    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_PARTIAL")
+    // COMPLETED audit fires (not PARTIAL).
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_COMPLETED").await, 1);
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_PARTIAL").await, 0);
+    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_COMPLETED")
         .await
         .unwrap();
-    assert_eq!(payload["outcome"], "PARTIAL");
-    assert_eq!(payload["advanced_to_kvt1"], 2);
-    assert_eq!(payload["advanced_to_ack"], 0);
-    assert_eq!(payload["finalized"], false);
-    assert_eq!(payload["not_eligible_reason"]["kind"], "DocsDeferredAtKvt1");
-    assert_eq!(payload["not_eligible_reason"]["count"], 2);
+    assert_eq!(payload["outcome"], "COMPLETED");
+    assert_eq!(payload["advanced_to_ack"], 2);
+    assert_eq!(payload["advanced_to_kvt1"], 0);
+    assert_eq!(payload["finalized"], true);
+    assert_eq!(payload["entry_reason"], "normal_eligible");
 
-    // Node + session stay in their pre-drain states.
-    assert_eq!(read_node_mode(&pool).await, "GOING_ONLINE");
-    assert_eq!(read_session_state(&pool, session_id).await, "DRAINING");
+    // W12 per-doc audit chain — Envelope 1a + Envelope 2.
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 2);
+    assert_eq!(audit_count(&pool, "STAGE_FINALIZE_ACK").await, 2);
+
+    // Node + session closed via Eligible-arm finalize envelope.
+    assert_eq!(read_node_mode(&pool).await, "ONLINE");
+    assert_eq!(read_session_state(&pool, session_id).await, "CLOSED");
 }
 
 // ─── Test 2: per-doc failure → PARTIAL with PerDocFailuresPresent ────
@@ -459,4 +524,241 @@ async fn c6_skip_paths_do_not_fire_partial() {
         assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_PARTIAL").await, 0);
         assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_COMPLETED").await, 0);
     }
+}
+
+// ─── M3b W12 Commit 3 Δ (MED-W12C3-01) — drain-finalize crash-recovery ──
+//
+// Reviewer-flagged MED finding 2026-05-22.  Post-Commit-3, drain itself
+// commits `stage_finalize::run` Kvt2 → Ack durably for the W12 KVT2
+// cohort entry path.  If the process crashes BETWEEN that envelope
+// commit AND the `finalize_drain` 5-write closure, the next drain
+// tick sees an empty cohort (doc now ACK, excluded by SELECT IN
+// filter) — but node/session/shift remain in pre-finalize states.
+//
+// Fix (Commit 3 Δ): in the empty-cohort branch, when session_state is
+// `Draining` AND `is_session_drain_completable(session_id)` proves
+// all session docs are in `ACK`, route through `commit_finalize_
+// envelope` with `FinalizeEntry::CrashRecovery` (distinct
+// `OFFLINE_DRAIN_RECOVERED_FINALIZE` audit).  Otherwise → existing
+// empty-backlog skip path.
+
+/// Helper — seed a doc DIRECTLY in `ACK` terminal state.  Used to
+/// simulate the post-crash scenario where stage_finalize::run
+/// already committed Kvt2 → Ack durably in a prior drain tick.
+#[allow(clippy::too_many_arguments)]
+async fn seed_doc_in_ack(
+    pool: &SqlitePool,
+    lnd: i64,
+    code_lnd: i64,
+    session_id: OfflineSessionId,
+    shift_id: ShiftId,
+    server_fiscal_no: &str,
+) -> DocumentId {
+    seed_doc(
+        pool,
+        lnd,
+        code_lnd,
+        session_id,
+        shift_id,
+        "ACK",
+        Some(server_fiscal_no),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn w12_crash_recovery_finalizes_session_when_all_docs_already_ack() {
+    let (_d, pool) = fresh_pool().await;
+    // Seed: pending-drain shift state (real crash scenario — offline
+    // writes during pending-drain).  node_state.mode=GoingOnline,
+    // shift_state=OpenedLocalPendingDrain, session=Draining (prior
+    // tick mid-pass transition committed before crash).
+    seed_node_state(
+        &pool,
+        NodeMode::GoingOnline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
+    let shift_id = ShiftId::new();
+    sqlx::query(
+        "INSERT INTO shifts(shift_id, fiscal_number, serial, state, \
+            open_mode, cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, ?, 1, 'OPENED_LOCAL_PENDING_DRAIN', 'OFFLINE', 0, ?)",
+    )
+    .bind(shift_id)
+    .bind(FN)
+    .bind(CASHIER_OK)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
+        .bind(shift_id)
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Draining).await;
+
+    // Seed doc already in ACK — simulates stage_finalize::run committed
+    // Kvt2 → Ack durably in prior tick, then process crashed before
+    // reaching finalize_drain.
+    let _doc = seed_doc_in_ack(&pool, 1, 100, session_id, shift_id, "DPS-FN-RECOVERY").await;
+
+    // No DPS calls expected — recovery path is pool-only.
+    let c = carriers(vec![]);
+    let view = view_for(&c);
+
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    // Summary shape: 0 in-flight this tick (work landed in prior
+    // crashed tick), finalized=true because recovery branch
+    // converged.
+    assert_eq!(summary.backlog_size_before(), 0);
+    assert_eq!(summary.advanced_to_ack(), 0);
+    assert!(
+        summary.finalized(),
+        "recovery branch must set finalized=true via commit_finalize_envelope"
+    );
+
+    // DB state — full finalize closure.
+    assert_eq!(read_node_mode(&pool).await, "ONLINE");
+    assert_eq!(read_session_state(&pool, session_id).await, "CLOSED");
+    let shift_state_after: String =
+        sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+            .bind(shift_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        shift_state_after, "OPENED",
+        "OpenedLocalPendingDrain → Opened (edge 5) per pending-drain ladder"
+    );
+
+    // Audit emission — distinct RECOVERED_FINALIZE, NOT regular COMPLETED.
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_RECOVERED_FINALIZE").await,
+        1,
+        "crash-recovery branch emits distinct audit event"
+    );
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_COMPLETED").await,
+        0,
+        "regular COMPLETED audit MUST NOT fire on recovery path"
+    );
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG").await,
+        0,
+        "skip path MUST NOT fire when recovery branch takes over"
+    );
+    let recovery_payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_RECOVERED_FINALIZE")
+        .await
+        .unwrap();
+    assert_eq!(recovery_payload["entry_reason"], "crash_recovery");
+    assert_eq!(recovery_payload["finalized"], true);
+    assert_eq!(recovery_payload["backlog_size_before"], 0);
+    assert_eq!(recovery_payload["advanced_to_ack"], 0);
+
+    // OFFLINE_SESSION_CLOSED audit also fires per existing envelope.
+    assert_eq!(audit_count(&pool, "OFFLINE_SESSION_CLOSED").await, 1);
+}
+
+#[tokio::test]
+async fn w12_crash_recovery_skips_when_session_has_non_ack_terminal_docs() {
+    // Conservative predicate: REJECTED/MANUAL terminal docs DO NOT
+    // count as "completable" — session must NOT auto-finalize unless
+    // ALL docs are in ACK.
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Draining).await;
+
+    let _ack_doc = seed_doc_in_ack(&pool, 1, 100, session_id, shift_id, "DPS-FN-NEGATIVE-1").await;
+    // Seed second doc in REJECTED terminal state — predicate must
+    // reject the whole session as non-completable.
+    let _rejected_doc = seed_doc(
+        &pool,
+        2,
+        101,
+        session_id,
+        shift_id,
+        "REJECTED",
+        Some("DPS-FN-NEGATIVE-2"),
+    )
+    .await;
+
+    let c = carriers(vec![]);
+    let view = view_for(&c);
+
+    let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    // Skip path fires — recovery branch refused due to non-ACK
+    // terminal doc.  Node/session/shift untouched.
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG").await,
+        1,
+    );
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_RECOVERED_FINALIZE").await,
+        0
+    );
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_COMPLETED").await, 0);
+    assert_eq!(read_node_mode(&pool).await, "GOING_ONLINE");
+    assert_eq!(read_session_state(&pool, session_id).await, "DRAINING");
+}
+
+#[tokio::test]
+async fn w12_crash_recovery_skips_when_session_open_with_zero_docs() {
+    // Open session + empty docs — genuinely fresh session, NOT a
+    // crash-recovery case.  Existing skip path must fire.
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let _shift_id = seed_open_shift(&pool).await;
+    let _session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+
+    let c = carriers(vec![]);
+    let view = view_for(&c);
+
+    let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG").await,
+        1
+    );
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_RECOVERED_FINALIZE").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn w12_crash_recovery_skips_when_session_draining_with_zero_docs() {
+    // Draining session + zero docs — degenerate edge case
+    // (predicate requires total > 0).  Skip path must fire to
+    // avoid auto-finalizing a session that never had docs.
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let _shift_id = seed_open_shift(&pool).await;
+    let _session_id = seed_offline_session(&pool, OfflineSessionState::Draining).await;
+
+    let c = carriers(vec![]);
+    let view = view_for(&c);
+
+    let _summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_SKIPPED_EMPTY_BACKLOG").await,
+        1
+    );
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_RECOVERED_FINALIZE").await,
+        0
+    );
 }

@@ -484,13 +484,23 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
         .collect()
 }
 
-/// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 + HIGH-C4-8
-/// resolution + HIGH-C5-1 session scoping + MED-C5-4 KVT2 deferral) —
-/// strict `lnd ASC` walker for the unfinished drain cohort, scoped
-/// to a specific offline session.  Returns docs in
-/// `state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE')`
-/// AND `offline_session_id = ?` AND `fs_mode = 'OFFLINE'` for the
-/// FN, ordered by MAC chain position.
+/// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 / HIGH-C4-8
+/// resolution; HIGH-C5-1 session scoping; MED-C5-4 KVT2 deferral
+/// reversed by **M3b W12 Commit 3**) — strict `lnd ASC` walker for
+/// the unfinished drain cohort, scoped to a specific offline
+/// session.  Returns docs in `state IN ('OFFLINE_LOCAL_ACK','SENT',
+/// 'KVT1','ERROR_RETRYABLE','KVT2')` AND `offline_session_id = ?`
+/// AND `fs_mode = 'OFFLINE'` for the FN, ordered by MAC chain
+/// position.
+///
+/// **KVT2 included (W12 Commit 3, reverses MED-C5-4):** mid-tick
+/// crash between Envelope 1 (W12 Kvt1→Kvt2 advance) and Envelope 2
+/// (`stage_finalize::run` Kvt2→Ack) leaves the doc in `Kvt2`.
+/// W9b's cohort previously deferred KVT2 to W12 PR because pre-W12
+/// drain had no clean discharge path; now `process_via_w12_kvt2_advance`
+/// in `backlog_drain` invokes `stage_finalize::run` (idempotent under
+/// M3a `AlreadyAcked` contract) so the same drain tick converges to
+/// `Ack` without waiting for boot.
 ///
 /// **Cohort rationale (operator-pinned 2026-05-21):**
 /// - `OFFLINE_LOCAL_ACK` — primary backlog (offline-acked docs awaiting
@@ -557,7 +567,7 @@ pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
            WHERE fiscal_number = ?
              AND offline_session_id = ?
              AND fs_mode = 'OFFLINE'
-             AND state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE')
+             AND state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE','KVT2')
            ORDER BY lnd, created_at, document_id"#,
         fn_id,
         session_id,
@@ -584,6 +594,61 @@ pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
             })
         })
         .collect()
+}
+
+/// **M3b W12 Commit 3 Δ** (MED-W12C3-01 fix, 2026-05-22) —
+/// drain-finalize crash-recovery predicate.
+///
+/// Returns `true` iff the given offline session has at least one
+/// `fiscal_documents` row scoped to it (`offline_session_id = ?`,
+/// `fs_mode = 'OFFLINE'`) **AND** ALL such rows are in terminal
+/// `ACK` state.  Drain orchestrator's empty-cohort branch uses this
+/// to detect the post-Commit-3 crash window: prior tick advanced
+/// the last KVT2 doc to ACK via `stage_finalize::run` (durably
+/// committed), but the process crashed before reaching
+/// `finalize_drain`, leaving node/session/shift state stranded.
+///
+/// **Conservative scope (operator-pinned 2026-05-22)**: only `ACK`
+/// counts toward "completable".  `REJECTED` / `CANCELLED` /
+/// `REQUIRES_MANUAL_RECONCILIATION` deliberately do NOT make the
+/// session auto-finalizable — those terminal states require
+/// explicit operator treatment (Manual recon or future W12 explicit
+/// branch) before session closure is safe.  The conservative shape
+/// matches the existing drain success contract:
+/// `finalize_eligibility` only goes Eligible when
+/// `advanced_to_ack == backlog_size_before` — no other terminal
+/// state counts.
+///
+/// **Returns false** when:
+/// - session has 0 docs (genuinely empty session; not a crash
+///   recovery case) → drain skips normally;
+/// - session has at least one non-ACK doc (Sent / Kvt1 / ER /
+///   Rejected / Manual / etc.) → drain skips, normal Eligibility
+///   check on next tick.
+///
+/// **Crash-recovery liveness invariant**: caller must guard with
+/// `session_state == Draining` BEFORE invoking this predicate.
+/// Session in `Open` with all-ACK docs is a structural drift
+/// (drain Open→Draining mid-pass transition would have happened
+/// before any doc reached ACK) and should not auto-finalize.
+pub async fn is_session_drain_completable(
+    pool: &SqlitePool,
+    session_id: OfflineSessionId,
+) -> sqlx::Result<bool> {
+    let row = sqlx::query!(
+        r#"SELECT
+              COUNT(*)                                       AS "total!: i64",
+              SUM(CASE WHEN state = 'ACK' THEN 1 ELSE 0 END) AS "ack_count: i64"
+           FROM fiscal_documents
+           WHERE offline_session_id = ?
+             AND fs_mode = 'OFFLINE'"#,
+        session_id,
+    )
+    .fetch_one(pool)
+    .await?;
+    let total = row.total;
+    let ack_count = row.ack_count.unwrap_or(0);
+    Ok(total > 0 && total == ack_count)
 }
 
 /// W5 / W0-1 §3.1 stage 1 — resume-detect lookup by `request_id`

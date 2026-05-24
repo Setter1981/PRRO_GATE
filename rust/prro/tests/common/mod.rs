@@ -47,12 +47,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use sqlx::SqlitePool;
 
 use prro::crypto::errors::CryptoError;
 use prro::crypto::provider::{
     CertDer, CryptoProvider, DstuVerifyResult, SignCmsRequest, SignedCmsBytes,
 };
 use prro::crypto::session::SigningSession;
+use prro::db::models::ids::DocumentId;
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
@@ -80,6 +82,15 @@ pub struct StubDpsChannel {
     responses: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
     send_chk_calls: AtomicUsize,
     on_send_chk: Option<Box<dyn Fn() + Send + Sync>>,
+    /// M3b W12 Commit 4 (2026-05-22) — `lastChk` response queue.
+    /// `evaluate_lastchk` (via `by_server_fiscal_no` default impl)
+    /// calls `self.last_chk(fn_sign)` to fetch DPS evidence.  Pre-W12
+    /// drain code did not exercise `last_chk`; Commit 4 wires the
+    /// Sent-source path (OFFLINE_LOCAL_ACK / ER → stage_send Sent →
+    /// confirm_drain_doc → lastChk).  Tests that exercise the
+    /// happy-path Acked chain must enqueue at least one response here.
+    last_chk_responses: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
+    last_chk_calls: AtomicUsize,
 }
 
 impl StubDpsChannel {
@@ -90,6 +101,8 @@ impl StubDpsChannel {
             responses: Mutex::new(q),
             send_chk_calls: AtomicUsize::new(0),
             on_send_chk: None,
+            last_chk_responses: Mutex::new(VecDeque::new()),
+            last_chk_calls: AtomicUsize::new(0),
         }
     }
 
@@ -98,6 +111,8 @@ impl StubDpsChannel {
             responses: Mutex::new(responses.into()),
             send_chk_calls: AtomicUsize::new(0),
             on_send_chk: None,
+            last_chk_responses: Mutex::new(VecDeque::new()),
+            last_chk_calls: AtomicUsize::new(0),
         }
     }
 
@@ -111,11 +126,25 @@ impl StubDpsChannel {
             responses: Mutex::new(q),
             send_chk_calls: AtomicUsize::new(0),
             on_send_chk: Some(spy),
+            last_chk_responses: Mutex::new(VecDeque::new()),
+            last_chk_calls: AtomicUsize::new(0),
         }
     }
 
     pub fn call_count(&self) -> usize {
         self.send_chk_calls.load(Ordering::SeqCst)
+    }
+
+    /// M3b W12 Commit 4 — enqueue `last_chk` responses.  Builder-style
+    /// for fluent test setup.  Pre-W12 tests can ignore (lastChk path
+    /// is unreachable when stage_send returns non-Sent outcomes).
+    pub fn with_last_chk_queue(self, responses: Vec<Result<CheckAck, DpsError>>) -> Self {
+        *self.last_chk_responses.lock().unwrap() = responses.into();
+        self
+    }
+
+    pub fn last_chk_call_count(&self) -> usize {
+        self.last_chk_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -134,7 +163,20 @@ impl DpsChannel for StubDpsChannel {
     }
 
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
-        unreachable!("stub: last_chk not exercised");
+        self.last_chk_calls.fetch_add(1, Ordering::SeqCst);
+        self.last_chk_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| {
+                panic!(
+                    "stub: last_chk called but no response enqueued — \
+                     M3b W12 Commit 4 wired the Sent-source path through \
+                     lastChk; tests exercising stage_send Sent must \
+                     supply at least one last_chk response via \
+                     StubDpsChannel::with_last_chk_queue(...)"
+                )
+            })
     }
 
     async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
@@ -231,4 +273,147 @@ pub fn ack(id: &str) -> CheckAck {
 /// physically cannot mint a token without the App mutex.
 pub fn drain_test_guard() -> prro::services::reconciliation::ReconcileGuard<'static> {
     prro::services::reconciliation::ReconcileGuard::for_integration_test_only()
+}
+
+// ─── M3b W12 Commit 4b.2 — test infrastructure prep (Variant B) ─────
+//
+// Helpers below stage the per-doc + per-FN prereqs required by
+// `stage_finalize::run` to advance a doc Kvt2 → Ack atomically.
+// Operator-pinned 4b infra-only scope (no production change, no
+// behavioral test change): these helpers are defined-but-unused in
+// 4b.2 (`#[allow(dead_code)]`) and consumed in 4b.3 when broken
+// pre-W12 stub-locking fixtures migrate to W12 ACK-era assertions.
+//
+// Required prereqs for stage_finalize::run to succeed (per
+// `write_path/stage_finalize.rs` + W8 contract):
+//   1. fiscal_documents.unsigned_xml_sha256 — NOT NULL on Kvt2 docs
+//      (used as the new chain seed for the NEXT doc).
+//   2. fiscal_documents.previous_hash — MUST match
+//      node_state.last_known_unsigned_xml_sha256 (W8 F2 chain-
+//      continuity guard).
+//   3. fiscal_documents.signing_inputs_pinned_at — populated to
+//      satisfy W6 "signing inputs pinned" invariant.
+//   4. ingress_inbox row in PROCESSING — stage_finalize Step 5
+//      marks DONE atomically with the Kvt2→Ack CAS.
+//
+// The seed helpers assume the caller has already inserted the
+// fiscal_documents row + document_files SIGNED_XML (via the
+// per-file seed_doc / seed_complete_offline_local_ack patterns)
+// and only stages the W12 extras.
+
+/// **M3b W12 Commit 4b.2 (infra-only, 2026-05-22)** — stage the W12
+/// finalize prereqs onto an existing fiscal_documents row.
+///
+/// `prev_hash` MUST match the current `node_state.last_known_unsigned_
+/// xml_sha256` for this FN at the time `stage_finalize::run` is
+/// invoked.  For a chain of docs, caller stages doc 1 with
+/// `prev_hash = initial_chain_seed`, then after stage_finalize::run
+/// commits doc 1 → Ack (advancing node_state to doc 1's
+/// `unsigned_xml_sha256`), stages doc 2 with `prev_hash = doc 1's
+/// unsigned_xml_sha256`.
+///
+/// `unsigned_xml_sha256` value is the chain anchor that the NEXT
+/// doc's `previous_hash` must match.  Tests pick deterministic
+/// values keyed off doc lnd / id to keep chain bookkeeping simple.
+///
+/// Internally:
+///   1. UPDATE fiscal_documents SET unsigned_xml_sha256, previous_hash,
+///      signing_inputs_pinned_at WHERE document_id = ?.
+///   2. SELECT request_id FROM fiscal_documents WHERE document_id = ?
+///      (read-back to share request_id with ingress_inbox row).
+///   3. INSERT OR IGNORE INTO ingress_inbox (request_id, fiscal_number,
+///      protocol, operation_type, idempotency_key, payload_json,
+///      payload_sha256_canonical, status=PROCESSING).
+///
+/// `INSERT OR IGNORE` makes the helper safe to call multiple times
+/// on the same doc (idempotent — re-running enrichment in a test
+/// fixture refactor does not error).
+#[allow(dead_code)]
+pub async fn seed_w12_finalize_prereqs(
+    pool: &SqlitePool,
+    fn_id: &str,
+    doc_id: DocumentId,
+    prev_hash: [u8; 32],
+    unsigned_xml_sha: [u8; 32],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE fiscal_documents SET \
+            unsigned_xml_sha256 = ?, \
+            previous_hash = ?, \
+            signing_inputs_pinned_at = '2026-05-20T00:00:00Z' \
+         WHERE document_id = ?",
+    )
+    .bind(&unsigned_xml_sha[..])
+    .bind(&prev_hash[..])
+    .bind(doc_id)
+    .execute(pool)
+    .await?;
+    let request_id: Vec<u8> =
+        sqlx::query_scalar("SELECT request_id FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc_id)
+            .fetch_one(pool)
+            .await?;
+    let payload_sha = vec![0u8; 32];
+    let idempotency_key = format!("idem-w12-{}", hex_encode_lower(&request_id));
+    sqlx::query(
+        "INSERT OR IGNORE INTO ingress_inbox(request_id, fiscal_number, protocol, operation_type, \
+            idempotency_key, payload_json, payload_sha256_canonical, status) \
+         VALUES (?, ?, 'REST', 'sell', ?, '{}', ?, 'PROCESSING')",
+    )
+    .bind(&request_id[..])
+    .bind(fn_id)
+    .bind(&idempotency_key)
+    .bind(&payload_sha)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// **M3b W12 Commit 4b.2 (infra-only, 2026-05-22)** — seed the
+/// initial chain anchor in node_state.  Subsequent
+/// `stage_finalize::run` invocations advance this column as each
+/// doc reaches Ack (W8 F3 contract); caller stages the FIRST doc
+/// of a chain with `prev_hash = initial_seed`.
+///
+/// UPDATE on existing node_state row — caller MUST have already
+/// inserted node_state (via the per-file seed_node_state helper)
+/// before invoking this.
+#[allow(dead_code)]
+pub async fn init_chain_seed(
+    pool: &SqlitePool,
+    fn_id: &str,
+    initial_seed: [u8; 32],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE node_state SET last_known_unsigned_xml_sha256 = ? \
+         WHERE fiscal_number = ?",
+    )
+    .bind(&initial_seed[..])
+    .bind(fn_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// **M3b W12 Commit 4b.2 (infra-only, 2026-05-22)** — deterministic
+/// 32-byte chain anchor keyed off a single discriminator byte.
+/// Convenience for test fixtures building synthetic chains —
+/// `chain_anchor(0x01)` ≠ `chain_anchor(0x02)`, supports up to 256
+/// unique anchors per fixture which exceeds any realistic test
+/// chain depth.
+#[allow(dead_code)]
+pub fn chain_anchor(discriminator: u8) -> [u8; 32] {
+    [discriminator; 32]
+}
+
+/// Local helper — lowercase hex of arbitrary byte slice.  Inlined
+/// instead of importing `prro::services::write_path::types::
+/// hex_encode_lower` to avoid pulling production hex impl into
+/// tests-only module dependency surface.
+fn hex_encode_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
