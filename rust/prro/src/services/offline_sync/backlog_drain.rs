@@ -879,7 +879,12 @@ pub async fn drain<'a>(
         // `DocsErRedriveQueued`).  Per W9b §3.5 + W0b state-unchanged
         // contract: pending-drain shifts do NOT escalate on
         // HoldFnDrain (only manual-recon-class `Failed` escalates).
-        if let DocVerdict::HoldFnDrain { class, projection } = &verdict {
+        if let DocVerdict::HoldFnDrain {
+            class,
+            projection,
+            consecutive_holds,
+        } = &verdict
+        {
             let class_str = failure_class_for(*class).to_string();
             match projection {
                 HoldFnDrainProjection::HeldAtKvt1 => {
@@ -891,6 +896,29 @@ pub async fn drain<'a>(
                 HoldFnDrainProjection::ErRedriveQueued => {
                     summary.record_doc_er_redrive_queued(doc.document_id, class_str);
                 }
+            }
+            // **REC-1 Phase 2a.1 Commit 6.1.2 (2026-05-24)** — Tier 1+2
+            // degradation triggers per plan §REC-1.  ErRedriveQueued
+            // (consecutive_holds=0 by 1c-post reset) bypasses both tiers;
+            // only HeldAtSent/HeldAtKvt1 carry accumulated counter.
+            //
+            // Tier order: check Tier 2 FIRST (more severe), then Tier 1
+            // (Tier 2 implies Tier 1 was already triggered last cycle).
+            let counter = *consecutive_holds;
+            if counter >= 50
+                && matches!(
+                    projection,
+                    HoldFnDrainProjection::HeldAtSent | HoldFnDrainProjection::HeldAtKvt1
+                )
+            {
+                trigger_tier_2_stop_mode(pool, fiscal_number, doc.document_id, counter).await?;
+            } else if counter >= 10
+                && matches!(
+                    projection,
+                    HoldFnDrainProjection::HeldAtSent | HoldFnDrainProjection::HeldAtKvt1
+                )
+            {
+                trigger_tier_1_prolonged_hold(pool, doc.document_id, *projection, counter).await?;
             }
             break;
         }
@@ -985,9 +1013,19 @@ enum DocVerdict {
     /// 5b.1 foundation phase.  Tests in `w12_control_surface_tests`
     /// also construct the variant directly to lock the projection +
     /// summary + finalize contracts in isolation.
+    ///
+    /// **Commit 6.1.2 (2026-05-24) — REC-1 Tier wiring**: `consecutive_
+    /// holds` field plumbed from kvt2_confirm's
+    /// `ConfirmDrainOutcome::HoldFnDrain.consecutive_holds`.  Used by
+    /// drain orchestrator для Tier 1 (>= 10 → `KVT2_CONFIRM_PROLONGED_
+    /// HOLD` audit Warning) + Tier 2 (>= 50 → STOP_MODE CAS +
+    /// `OFFLINE_DRAIN_FN_STOP_MODE` audit Critical) trigger checks.
+    /// 0 для `ErRedriveQueued` projection (counter reset by Envelope
+    /// 1c-post atomically з Sent→ER advance).
     HoldFnDrain {
         class: FailureClass,
         projection: HoldFnDrainProjection,
+        consecutive_holds: i64,
     },
 }
 
@@ -1179,12 +1217,14 @@ async fn process_via_stage_send(
                     );
                     Ok(DocVerdict::Advanced)
                 }
-                kvt2_confirm::ConfirmDrainOutcome::HoldFnDrain { projection } => {
-                    Ok(DocVerdict::HoldFnDrain {
-                        class: FailureClass::Transport,
-                        projection,
-                    })
-                }
+                kvt2_confirm::ConfirmDrainOutcome::HoldFnDrain {
+                    projection,
+                    consecutive_holds,
+                } => Ok(DocVerdict::HoldFnDrain {
+                    class: FailureClass::Transport,
+                    projection,
+                    consecutive_holds,
+                }),
             }
         }
         Ok(StageSendOutcome::Routed {
@@ -1651,7 +1691,10 @@ async fn process_via_lastchk_replay(
             );
             Ok(DocVerdict::Advanced)
         }
-        kvt2_confirm::ConfirmDrainOutcome::HoldFnDrain { projection } => {
+        kvt2_confirm::ConfirmDrainOutcome::HoldFnDrain {
+            projection,
+            consecutive_holds,
+        } => {
             // SentReplay HoldFnDrain projection maps directly to
             // DocVerdict::HoldFnDrain — drain orchestrator halts on
             // this doc this tick; next tick re-evaluates via SentReplay
@@ -1663,9 +1706,11 @@ async fn process_via_lastchk_replay(
             // state-unchanged contract (pending-drain shifts do NOT
             // escalate on HoldFnDrain per backlog_drain consumer
             // logic — only manual-recon-class Failed escalates).
+            // **6.1.2**: consecutive_holds plumbed для Tier 1/2 triggers.
             Ok(DocVerdict::HoldFnDrain {
                 class: FailureClass::Transport,
                 projection,
+                consecutive_holds,
             })
         }
     }
@@ -1749,12 +1794,14 @@ async fn process_via_w12_only(
             );
             Ok(DocVerdict::Advanced)
         }
-        kvt2_confirm::ConfirmDrainOutcome::HoldFnDrain { projection } => {
-            Ok(DocVerdict::HoldFnDrain {
-                class: FailureClass::Transport,
-                projection,
-            })
-        }
+        kvt2_confirm::ConfirmDrainOutcome::HoldFnDrain {
+            projection,
+            consecutive_holds,
+        } => Ok(DocVerdict::HoldFnDrain {
+            class: FailureClass::Transport,
+            projection,
+            consecutive_holds,
+        }),
     }
 }
 
@@ -1930,6 +1977,127 @@ fn outcome_as_str(outcome: TransitionOutcome) -> &'static str {
         TransitionOutcome::Conflict => "Conflict",
         TransitionOutcome::NotFound => "NotFound",
     }
+}
+
+/// **REC-1 Phase 2a.1 Commit 6.1.2 (2026-05-24)** — Tier 1 prolonged-
+/// hold audit emit (Severity::Warning).  No state mutation; pure
+/// forensic signal that an FN doc reached >= 10 consecutive holds.
+///
+/// Operator dashboards can query rate
+/// `KVT2_CONFIRM_PROLONGED_HOLD` events / hour / FN to detect
+/// degrading-but-not-yet-stopped FN trends BEFORE Tier 2 fires.
+/// Counter accumulated по Hold/Advance lifecycle persisted в
+/// `fiscal_documents.consecutive_holds` (DDL 018, atomic increment
+/// inside Envelope 1c-hold).
+///
+/// Pool-only single audit row (no envelope; no state).  Idempotent
+/// per-tick — drain orchestrator only invokes on HoldFnDrain break
+/// AND counter >= 10; next-tick re-evaluation re-fires if counter
+/// still >= 10 (intended — operator sees prolonged-hold signal each
+/// tick that doc stays held).
+async fn trigger_tier_1_prolonged_hold(
+    pool: &SqlitePool,
+    doc_id: DocumentId,
+    projection: HoldFnDrainProjection,
+    consecutive_holds: i64,
+) -> Result<(), BootError> {
+    let id_hex = hex_lower(doc_id.as_bytes());
+    let projection_str = match projection {
+        HoldFnDrainProjection::HeldAtSent => "HeldAtSent",
+        HoldFnDrainProjection::HeldAtKvt1 => "HeldAtKvt1",
+        HoldFnDrainProjection::ErRedriveQueued => "ErRedriveQueued",
+    };
+    let payload = serde_json::json!({
+        "document_id": id_hex,
+        "projection": projection_str,
+        "consecutive_holds": consecutive_holds,
+        "tier": 1,
+        "tier_threshold": 10,
+    });
+    audit_log::append(
+        pool,
+        AUDIT_ENTITY_DOC,
+        &id_hex,
+        "KVT2_CONFIRM_PROLONGED_HOLD",
+        Severity::Warning,
+        None,
+        Some(&payload.to_string()),
+    )
+    .await
+    .map_err(BootError::Database)?;
+    Ok(())
+}
+
+/// **REC-1 Phase 2a.1 Commit 6.1.2 (2026-05-24)** — Tier 2 STOP_MODE
+/// escalation.  When an FN doc accumulates >= 50 consecutive holds,
+/// flip `node_state.mode` → `STOP_MODE` + emit Critical audit in ONE
+/// `with_immediate` envelope.
+///
+/// **Effect**: new чек ingress на цю FN rejected at adapter layer
+/// (existing STOP_MODE contract per app.rs:373 + return_online_probe);
+/// existing held docs remain в Sent/Kvt1 з накопиченим counter для
+/// auto-drain post-recovery.  Per operator memory `feedback_manual_
+/// recon_catastrophe`: STOP_MODE is intermediate tier, NOT эскалація
+/// в Manual.  Operator має 36h offline-cap window (до
+/// cert.NotAfter-2160min) для intervention.
+///
+/// **Atomicity (I4)**: bundled з audit row.  If CAS fails (missing FN
+/// row — structural breach), tx rolls back → no half-state.
+///
+/// Idempotent re-entry safe — repeated invocations re-CAS to STOP_MODE
+/// (no-op if already там) + emit additional Critical audit (signals
+/// continued degradation; operator dashboards aggregate per-hour).
+async fn trigger_tier_2_stop_mode(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    doc_id: DocumentId,
+    consecutive_holds: i64,
+) -> Result<(), BootError> {
+    let id_hex = hex_lower(doc_id.as_bytes());
+    let payload = serde_json::json!({
+        "document_id": id_hex,
+        "fiscal_number": fiscal_number,
+        "consecutive_holds": consecutive_holds,
+        "tier": 2,
+        "tier_threshold": 50,
+        "node_mode_target": "STOP_MODE",
+    });
+    let payload_owned = payload.to_string();
+    let id_hex_owned = id_hex.clone();
+    let fn_owned = fiscal_number.to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // (a) CAS node_state.mode → STOP_MODE (idempotent UPDATE).
+            let updated = node_state::set_mode_stop_mode_tx(tx, &fn_owned).await?;
+            if !updated {
+                return Err(anyhow::anyhow!(
+                    "backlog_drain({fn_owned}): Tier-2 STOP_MODE CAS produced \
+                     rows_affected=0 for doc {doc_hex} — missing node_state \
+                     row (structural breach)",
+                    fn_owned = fn_owned,
+                    doc_hex = id_hex_owned,
+                ));
+            }
+            // (b) Critical audit row.
+            audit_log::append_tx(
+                tx,
+                AUDIT_ENTITY_DOC,
+                &id_hex_owned,
+                "OFFLINE_DRAIN_FN_STOP_MODE",
+                Severity::Critical,
+                None,
+                Some(&payload_owned),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(|err| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source: err,
+    })?;
+    Ok(())
 }
 
 /// W9b C4 manual-escalation seam (spec amendment 2026-05-21 +
@@ -3126,14 +3294,17 @@ mod w12_control_surface_tests {
         let v_kvt1 = DocVerdict::HoldFnDrain {
             class: FailureClass::WireRoutingProbeRequired,
             projection: HoldFnDrainProjection::HeldAtKvt1,
+            consecutive_holds: 0,
         };
         let v_sent = DocVerdict::HoldFnDrain {
             class: FailureClass::Transport,
             projection: HoldFnDrainProjection::HeldAtSent,
+            consecutive_holds: 0,
         };
         let v_er = DocVerdict::HoldFnDrain {
             class: FailureClass::BudgetExhausted,
             projection: HoldFnDrainProjection::ErRedriveQueued,
+            consecutive_holds: 0,
         };
         // Construction does not panic; pattern-match arms are
         // structurally distinguishable.

@@ -182,6 +182,37 @@ pub async fn set_mode_blocked_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx:
     Ok(res.rows_affected() == 1)
 }
 
+/// **M3b W12 Post-Closure Hardening Phase 2a.1 Commit 6.1.2 / REC-1
+/// (2026-05-24)** — flip `node_state.mode` to `STOP_MODE` for the FN.
+/// Idempotent CAS-free shape mirroring [`set_mode_blocked_tx`] (single
+/// UPDATE; `rows_affected == 0` indicates missing FN row — structural
+/// breach).
+///
+/// Invoked from `backlog_drain` Tier-2 degradation path when an FN
+/// accumulates >= 50 consecutive HoldFnDrain outcomes на одному doc.
+/// Effect: new чек ingress на цю FN rejected at adapter layer
+/// (existing STOP_MODE contract per app.rs:373 + return_online_probe.rs:177);
+/// existing held docs лишаються в Sent/Kvt1 з накопиченим counter для
+/// auto-drain post-recovery.
+///
+/// **Operator runbook** (operator memory `feedback_manual_recon_
+/// catastrophe`): STOP_MODE — це проміжний degradation tier, НЕ
+/// эскалація в Manual.  Operator має 36h offline-cap window
+/// (до cert.NotAfter-2160min) для intervention; за цей час можна
+/// reset через admin CLI (Tier 3, Phase 2a.2 scope) АБО зачекати
+/// auto-recovery через W8 return_online_probe.
+///
+/// Carries no `node_state_updated_at` bump (column does not exist);
+/// change captured by paired `OFFLINE_DRAIN_FN_STOP_MODE` Critical
+/// audit row written by caller inside the same `with_immediate`.
+pub async fn set_mode_stop_mode_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<bool> {
+    let res = sqlx::query("UPDATE node_state SET mode = 'STOP_MODE' WHERE fiscal_number = ?")
+        .bind(fn_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStateRow>> {
     let row = sqlx::query!(
         r#"SELECT fiscal_number,

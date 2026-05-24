@@ -2426,3 +2426,263 @@ async fn c6_sent_fresh_hold_emits_hold_audit_and_projects_held_at_sent() {
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 0);
     assert_eq!(audit_count(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await, 0);
 }
+
+// ─── Phase 2a.1 Commit 6.1.2 REC-1: Tier 1+2 trigger tests ───────────
+
+/// Helper — read `consecutive_holds` counter from `fiscal_documents`.
+async fn read_consecutive_holds(pool: &SqlitePool, doc_id: DocumentId) -> i64 {
+    sqlx::query_scalar("SELECT consecutive_holds FROM fiscal_documents WHERE document_id = ?")
+        .bind(doc_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Helper — read `node_state.mode` for FN.
+async fn read_node_mode_state_dispatch(pool: &SqlitePool) -> String {
+    sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+        .bind(FN)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Helper — single Kvt1Reentry Hold drain tick: doc stays Kvt1, counter +1.
+async fn run_kvt1_hold_tick(pool: &SqlitePool) {
+    let c = carriers(
+        vec![],
+        vec![Err(DpsError::Transport(
+            "simulated kvt1 lastChk timeout".into(),
+        ))],
+    );
+    let view = view_for(&c);
+    let _ = backlog_drain::drain(&common::drain_test_guard(), pool, &view, FN)
+        .await
+        .unwrap();
+}
+
+/// **REC-1 Test 1 (Increment & Reset)**: послідовні Holds збільшують
+/// counter +1 кожного тіку; перший Advance скидає в 0 atomically per
+/// Envelope 1b reset semantics.
+#[tokio::test]
+async fn c612_consecutive_holds_increment_on_hold_reset_on_advance() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "KVT1",
+        Some("DPS-FN-INCR"),
+    )
+    .await;
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+
+    // Initial: counter == 0 (DDL DEFAULT 0).
+    assert_eq!(read_consecutive_holds(&pool, doc).await, 0);
+
+    // 3 consecutive Hold ticks → counter == 3.
+    for expected in 1..=3 {
+        run_kvt1_hold_tick(&pool).await;
+        assert_eq!(
+            read_consecutive_holds(&pool, doc).await,
+            expected,
+            "after {expected} consecutive Hold ticks counter MUST equal {expected}"
+        );
+    }
+
+    // Doc state UNCHANGED at KVT1 per W0b.
+    assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
+
+    // Reset on first Advance: DPS lastChk returns ack з matching id +
+    // KVT1 evidence → confirm_drain_doc(Kvt1Reentry, Acked) →
+    // Envelope 1b (3-write) → counter resets to 0.
+    let c = carriers(vec![], vec![Ok(ack("DPS-FN-INCR", vec![0xAAu8; 32]))]);
+    let view = view_for(&c);
+    let _ = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    // Doc reached ACK (via Envelope 1b + Envelope 2).
+    assert_eq!(read_doc_state(&pool, doc).await, "ACK");
+    // Counter reset to 0 by 1b's reset_consecutive_holds_tx call.
+    assert_eq!(
+        read_consecutive_holds(&pool, doc).await,
+        0,
+        "advance to Ack MUST atomically reset consecutive_holds via Envelope 1b"
+    );
+
+    // Tier 1 / Tier 2 audits MUST NOT fire (counter never reached threshold).
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_PROLONGED_HOLD").await, 0);
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_FN_STOP_MODE").await, 0);
+}
+
+/// **REC-1 Test 2 (Tier 1 Trigger)**: 10 consecutive Holds → first
+/// `KVT2_CONFIRM_PROLONGED_HOLD` audit at Severity::Warning, no state
+/// mutation.  Counter continues incrementing past 10 — each subsequent
+/// tick re-fires Tier 1 audit (intended: operator sees ongoing
+/// degradation signal per-tick).
+#[tokio::test]
+async fn c612_tier_1_prolonged_hold_audit_fires_at_10_consecutive_holds() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "KVT1",
+        Some("DPS-FN-TIER1"),
+    )
+    .await;
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+
+    // 9 Hold ticks — counter == 9, NO Tier 1 audit.
+    for _ in 0..9 {
+        run_kvt1_hold_tick(&pool).await;
+    }
+    assert_eq!(read_consecutive_holds(&pool, doc).await, 9);
+    assert_eq!(
+        audit_count(&pool, "KVT2_CONFIRM_PROLONGED_HOLD").await,
+        0,
+        "Tier 1 MUST NOT fire at counter < 10"
+    );
+
+    // 10th Hold tick — counter == 10, Tier 1 audit fires.
+    run_kvt1_hold_tick(&pool).await;
+    assert_eq!(read_consecutive_holds(&pool, doc).await, 10);
+    assert_eq!(
+        audit_count(&pool, "KVT2_CONFIRM_PROLONGED_HOLD").await,
+        1,
+        "Tier 1 MUST fire at counter >= 10"
+    );
+
+    // Node state UNCHANGED (Tier 1 = audit-only).
+    assert_eq!(read_node_mode_state_dispatch(&pool).await, "GOING_ONLINE");
+    // Doc state UNCHANGED at KVT1.
+    assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
+    // Tier 2 NOT fired.
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_FN_STOP_MODE").await, 0);
+
+    // Audit payload structure verification.
+    let payload = audit_latest_payload(&pool, "KVT2_CONFIRM_PROLONGED_HOLD")
+        .await
+        .unwrap();
+    assert_eq!(payload["tier"], 1);
+    assert_eq!(payload["tier_threshold"], 10);
+    assert_eq!(payload["consecutive_holds"], 10);
+    assert_eq!(payload["projection"], "HeldAtKvt1");
+}
+
+/// **REC-1 Test 3 (Tier 2 Trigger)**: 50 consecutive Holds → FN goes
+/// to STOP_MODE atomically with Critical `OFFLINE_DRAIN_FN_STOP_MODE`
+/// audit.  Tier 1 audit accumulated на 40 prior ticks (10..=49).
+#[tokio::test]
+async fn c612_tier_2_stop_mode_escalation_fires_at_50_consecutive_holds() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "KVT1",
+        Some("DPS-FN-TIER2"),
+    )
+    .await;
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+
+    // 49 Hold ticks — counter == 49, Tier 1 firing з tick 10 onwards
+    // (40 Tier-1 audits = ticks 10..=49).
+    for _ in 0..49 {
+        run_kvt1_hold_tick(&pool).await;
+    }
+    assert_eq!(read_consecutive_holds(&pool, doc).await, 49);
+    assert_eq!(
+        audit_count(&pool, "KVT2_CONFIRM_PROLONGED_HOLD").await,
+        40,
+        "Tier 1 fires every tick from 10 to 49 (40 ticks)"
+    );
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_FN_STOP_MODE").await,
+        0,
+        "Tier 2 MUST NOT fire at counter < 50"
+    );
+    assert_eq!(read_node_mode_state_dispatch(&pool).await, "GOING_ONLINE");
+
+    // 50th Hold tick — counter == 50, Tier 2 fires (NOT Tier 1; Tier
+    // ordering checks Tier 2 first via if/else).
+    run_kvt1_hold_tick(&pool).await;
+    assert_eq!(read_consecutive_holds(&pool, doc).await, 50);
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_FN_STOP_MODE").await,
+        1,
+        "Tier 2 MUST fire at counter >= 50"
+    );
+    // Tier 1 NOT re-fired on this tick (Tier 2 took precedence).
+    assert_eq!(
+        audit_count(&pool, "KVT2_CONFIRM_PROLONGED_HOLD").await,
+        40,
+        "Tier 1 MUST NOT fire on Tier-2-triggering tick (mutually \
+         exclusive per orchestrator if/else)"
+    );
+
+    // **CRITICAL ASSERTION**: FN now in STOP_MODE persistently.
+    assert_eq!(read_node_mode_state_dispatch(&pool).await, "STOP_MODE");
+    // Doc state UNCHANGED at KVT1 (STOP_MODE doesn't touch docs; only
+    // gates new ingress).
+    assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
+
+    // Tier 2 audit payload structure verification.
+    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_FN_STOP_MODE")
+        .await
+        .unwrap();
+    assert_eq!(payload["tier"], 2);
+    assert_eq!(payload["tier_threshold"], 50);
+    assert_eq!(payload["consecutive_holds"], 50);
+    assert_eq!(payload["node_mode_target"], "STOP_MODE");
+    assert_eq!(payload["fiscal_number"], FN);
+}

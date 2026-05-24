@@ -413,13 +413,22 @@ pub enum ConfirmDrainOutcome {
     ///     `stage_send::run`).
     ///
     /// Caller projects to `DocVerdict::HoldFnDrain { class,
-    /// projection }`.  Commit 6 will rewire SentFresh +
-    /// Kvt1Reentry Hold paths from `BootError::Internal` defensive
-    /// marker to this projection (5b.1 already returns it for
-    /// SentReplay-specific paths since plan §412 explicitly
-    /// names the ErRedriveQueued safe-redrive contract — cannot
-    /// defer without breaking pilot crash recovery).
-    HoldFnDrain { projection: HoldFnDrainProjection },
+    /// projection, consecutive_holds }`.  Post-Commit-6 wires
+    /// SentFresh + Kvt1Reentry Hold paths; Commit 6.1.2 adds
+    /// `consecutive_holds` field plumbing для drain-orchestrator
+    /// Tier 1 (>= 10) + Tier 2 (>= 50) trigger checks per REC-1.
+    ///
+    /// `consecutive_holds` semantics:
+    ///   - HeldAtSent / HeldAtKvt1 → post-increment value from
+    ///     Envelope 1c-hold-light (SentFresh/Kvt1Reentry) OR 1c-hold
+    ///     bundled (SentReplay) — guides Tier 1/2 trigger.
+    ///   - ErRedriveQueued → 0 (Envelope 1c-post resets counter
+    ///     atomically з Sent→ER CAS; ER class guard takes over via
+    ///     transport_trace.retry_class budget rather than counter).
+    HoldFnDrain {
+        projection: HoldFnDrainProjection,
+        consecutive_holds: i64,
+    },
     /// Envelope 1a (Kvt1Raw persist + Sent→Kvt1 CAS + Kvt1→Kvt2 CAS +
     /// `OFFLINE_DRAIN_KVT2_ADVANCED` audit) committed atomically;
     /// Envelope 2 (`stage_finalize::run` Kvt2→Ack) committed.  Doc is
@@ -726,7 +735,7 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
                     let wire_finished = sent_replay_wire_finished
                         .clone()
                         .expect("SentReplay implies wire_finished captured");
-                    commit_sent_replay_envelope_1c_hold(
+                    let consecutive_holds = commit_sent_replay_envelope_1c_hold(
                         pool,
                         &fiscal_number,
                         doc_id,
@@ -739,12 +748,14 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
                     .await?;
                     Ok(ConfirmDrainOutcome::HoldFnDrain {
                         projection: HoldFnDrainProjection::HeldAtSent,
+                        consecutive_holds,
                     })
                 }
                 Kvt2ConfirmSource::SentFresh => {
-                    commit_hold_envelope_1c_hold_light(
+                    let consecutive_holds = commit_hold_envelope_1c_hold_light(
                         pool,
                         &fiscal_number,
+                        doc_id,
                         &id_hex,
                         source,
                         &reason,
@@ -752,12 +763,14 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
                     .await?;
                     Ok(ConfirmDrainOutcome::HoldFnDrain {
                         projection: HoldFnDrainProjection::HeldAtSent,
+                        consecutive_holds,
                     })
                 }
                 Kvt2ConfirmSource::Kvt1Reentry => {
-                    commit_hold_envelope_1c_hold_light(
+                    let consecutive_holds = commit_hold_envelope_1c_hold_light(
                         pool,
                         &fiscal_number,
+                        doc_id,
                         &id_hex,
                         source,
                         &reason,
@@ -765,6 +778,7 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
                     .await?;
                     Ok(ConfirmDrainOutcome::HoldFnDrain {
                         projection: HoldFnDrainProjection::HeldAtKvt1,
+                        consecutive_holds,
                     })
                 }
             }
@@ -817,8 +831,14 @@ pub(in crate::services::offline_sync) async fn confirm_drain_doc(
                 expected_server_fiscal_no,
             )
             .await?;
+            // **REC-1 Phase 2a.1 Commit 6.1.2 (2026-05-24)**:
+            // ErRedriveQueued surface counter == 0 because Envelope
+            // 1c-post atomically reset counter (Sent→ER advance =
+            // any-advance-resets contract); ER class guard takes
+            // over via transport_trace.retry_class budget.
             Ok(ConfirmDrainOutcome::HoldFnDrain {
                 projection: HoldFnDrainProjection::ErRedriveQueued,
+                consecutive_holds: 0,
             })
         }
     }
@@ -1082,16 +1102,21 @@ async fn commit_kvt1_reentry_envelope_1b(
 ///
 /// **Commit 4b status**: production-consumed via `confirm_drain_doc`
 /// Hold arm; emits forensic KVT2_CONFIRM_HOLD audit BEFORE caller
-/// observes `BootError::Internal` defensive marker.  HoldFnDrain
-/// projection (post Commit 6) will replace that marker with
-/// `DocVerdict::HoldFnDrain { HeldAtSent | HeldAtKvt1 }`.
+/// observes `DocVerdict::HoldFnDrain { HeldAtSent | HeldAtKvt1 }`.
+///
+/// **Commit 6.1.2 (2026-05-24) — REC-1 Tier wiring**: now also
+/// increments `fiscal_documents.consecutive_holds` atomically inside
+/// the same `with_immediate` as the audit emission.  Returns the
+/// post-increment counter value (i64) for caller-side Tier 1/2
+/// trigger evaluation in drain orchestrator.
 async fn commit_hold_envelope_1c_hold_light(
     pool: &SqlitePool,
     fiscal_number: &str,
+    doc_id: DocumentId,
     id_hex: &str,
     source: Kvt2ConfirmSource,
     reason: &Kvt2ConfirmHoldReason,
-) -> Result<(), BootError> {
+) -> Result<i64, BootError> {
     // **LOW-W12C4B-03 fix (4b.3 Δ2, 2026-05-22)**: runtime guard
     // (not debug-only) — when Commits 5/5b/6 lift the SentFresh-only
     // scope guard at `confirm_drain_doc` entry, a routing bug that
@@ -1119,8 +1144,13 @@ async fn commit_hold_envelope_1c_hold_light(
     });
     let payload_owned = payload.to_string();
     let id_hex_owned = id_hex.to_string();
-    with_immediate(pool, move |tx| {
+    let new_counter: i64 = with_immediate(pool, move |tx| {
         Box::pin(async move {
+            // (a) **REC-1 Phase 2a.1 Commit 6.1.2 (2026-05-24)**:
+            // increment consecutive_holds counter; new value drives
+            // caller-side Tier 1 (>= 10) / Tier 2 (>= 50) triggers.
+            let counter = fiscal_documents::increment_consecutive_holds_tx(tx, doc_id).await?;
+            // (b) Forensic audit row.
             audit_log::append_tx(
                 tx,
                 AUDIT_ENTITY_DOC,
@@ -1131,7 +1161,7 @@ async fn commit_hold_envelope_1c_hold_light(
                 Some(&payload_owned),
             )
             .await?;
-            Ok::<(), anyhow::Error>(())
+            Ok::<i64, anyhow::Error>(counter)
         })
     })
     .await
@@ -1139,7 +1169,7 @@ async fn commit_hold_envelope_1c_hold_light(
         fiscal_number: fiscal_number.to_string(),
         source: err,
     })?;
-    Ok(())
+    Ok(new_counter)
 }
 
 /// **M3b W12 Commit 4b.1 (plan §311, 2026-05-22)** — Envelope
@@ -1560,6 +1590,12 @@ async fn commit_sent_replay_envelope_1c_post(
 /// LastChkDataSignEmpty → RetryableServer.  `retry_class` is NOT
 /// set because doc state stays Sent (no ER cohort entry); next-tick
 /// SentReplay re-allocates a fresh recovery row.
+///
+/// **Commit 6.1.2 (2026-05-24) — REC-1 Tier wiring**: now also
+/// increments `fiscal_documents.consecutive_holds` atomically inside
+/// the same `with_immediate` as trace.complete + audit (3-write
+/// bundled envelope).  Returns the post-increment counter value (i64)
+/// for caller-side Tier 1/2 trigger evaluation in drain orchestrator.
 #[allow(clippy::too_many_arguments)] // 8 args — bundled envelope shape
 async fn commit_sent_replay_envelope_1c_hold(
     pool: &SqlitePool,
@@ -1570,7 +1606,7 @@ async fn commit_sent_replay_envelope_1c_hold(
     wire_started: String,
     wire_finished: String,
     reason: &Kvt2ConfirmHoldReason,
-) -> Result<(), BootError> {
+) -> Result<i64, BootError> {
     // Hold reason → trace outcome_kind mapping per plan §200-205:
     let outcome_kind = match reason {
         Kvt2ConfirmHoldReason::DpsTransport(_) => transport_trace::OutcomeKind::RetryableTransport,
@@ -1594,7 +1630,7 @@ async fn commit_sent_replay_envelope_1c_hold(
     let fn_owned = fiscal_number.to_string();
     let error_label = reason.audit_label().to_string();
     let error_detail = format!("{reason:?}");
-    with_immediate(pool, move |tx| {
+    let new_counter: i64 = with_immediate(pool, move |tx| {
         Box::pin(async move {
             // (a) Complete recovery trace row з Retryable* outcome.
             let trace_rows = transport_trace::complete_tx(
@@ -1624,7 +1660,11 @@ async fn commit_sent_replay_envelope_1c_hold(
                     doc_hex = id_hex_owned,
                 ));
             }
-            // (b) Forensic audit row.
+            // (b) **REC-1 Phase 2a.1 Commit 6.1.2 (2026-05-24)**:
+            // increment consecutive_holds counter; new value drives
+            // caller-side Tier 1 (>= 10) / Tier 2 (>= 50) triggers.
+            let counter = fiscal_documents::increment_consecutive_holds_tx(tx, doc_id).await?;
+            // (c) Forensic audit row.
             audit_log::append_tx(
                 tx,
                 AUDIT_ENTITY_DOC,
@@ -1635,7 +1675,7 @@ async fn commit_sent_replay_envelope_1c_hold(
                 Some(&payload_owned),
             )
             .await?;
-            Ok::<(), anyhow::Error>(())
+            Ok::<i64, anyhow::Error>(counter)
         })
     })
     .await
@@ -1643,7 +1683,7 @@ async fn commit_sent_replay_envelope_1c_hold(
         fiscal_number: fiscal_number.to_string(),
         source: err,
     })?;
-    Ok(())
+    Ok(new_counter)
 }
 
 /// **M3b W12 Commit 5b.1 (plan §412 Envelope 1c-drift, 2026-05-22)** —
