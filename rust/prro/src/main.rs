@@ -29,6 +29,37 @@ enum Cmd {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Administrative operations (operator-only intervention paths).
+    Admin {
+        #[command(subcommand)]
+        cmd: AdminCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AdminCmd {
+    /// **M3b W12 Hardening Phase 2a.2 / REC-1 Tier 3 (2026-05-24)** —
+    /// reset STOP_MODE for a specific fiscal_number.  Use after
+    /// operator-verified resolution of the root cause that triggered
+    /// auto-escalation (50+ consecutive Hold ticks per Tier 2).
+    ///
+    /// Atomic: CAS node_state.mode STOP_MODE → GOING_ONLINE + reset
+    /// consecutive_holds for all held docs on FN + emit Critical audit
+    /// ADMIN_STOP_MODE_RESET.  Refuses if current mode != STOP_MODE
+    /// (operator wrong-command guard).
+    ResetStopMode {
+        #[arg(long)]
+        config: PathBuf,
+        /// Fiscal number that escalated to STOP_MODE (must match a
+        /// row in `node_state`).
+        #[arg(long)]
+        fiscal_number: String,
+        /// Operator-supplied non-empty description for forensic audit
+        /// trail.  Required (rejected if empty/whitespace).  Example:
+        /// "DPS connectivity restored 2026-05-24T10:30 UTC; verified ping OK".
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 /// Read config file → parse → boot.  On any `BootError`, prints the
@@ -122,5 +153,24 @@ async fn main() -> anyhow::Result<()> {
             drop(app);
             Ok(())
         }
+        Cmd::Admin { cmd } => match cmd {
+            AdminCmd::ResetStopMode {
+                config,
+                fiscal_number,
+                reason,
+            } => match prro::admin::run_reset_stop_mode(&config, &fiscal_number, &reason).await {
+                Ok(outcome) => {
+                    println!(
+                        "ADMIN_STOP_MODE_RESET OK fiscal_number={} docs_reset_count={}",
+                        outcome.fiscal_number, outcome.docs_reset_count
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    eprintln!("prro admin reset-stop-mode: {err}");
+                    std::process::exit(err.exit_code());
+                }
+            },
+        },
     }
 }

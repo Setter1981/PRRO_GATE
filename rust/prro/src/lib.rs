@@ -13,6 +13,7 @@
 //! - `rendering`      — receipt formatter + HTML/PDF/ESC-POS (M5)
 //! - `doctor`         — `prro doctor` diagnostics
 
+pub mod admin;
 pub mod app;
 pub mod config;
 pub mod crypto;
