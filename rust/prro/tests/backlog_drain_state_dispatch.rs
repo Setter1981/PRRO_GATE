@@ -1450,6 +1450,185 @@ async fn c5b2_sent_replay_lastchk_match_empty_data_sign_holds_drain() {
     );
 }
 
+// ─── Phase 1 REC-5 Δ: SentFresh empty data_sign → HoldFnDrain ────────
+
+/// **M3b W12 Post-Closure Hardening Phase 1 / REC-5 (2026-05-24)** —
+/// closes empty-data_sign Hold path test gap for SentFresh source.
+/// Symmetric counterpart to:
+///   - `c5b2_sent_replay_lastchk_match_empty_data_sign_holds_drain`
+///     (SentReplay path; Δ5 from 5b.2)
+///   - `c6_kvt1_reentry_match_empty_data_sign_holds_drain` (Kvt1Reentry
+///     path; this Δ).
+///
+/// Routing chain: cohort walker picks OFFLINE_LOCAL_ACK doc → stage_send::
+/// run transitions Sending→Sent з server_fiscal_no stamp →
+/// confirm_drain_doc(SentFresh, attempt_no=Some(_)) → DPS lastChk returns
+/// `ack(id=matching, data_sign=vec![])` → `classify_check_result` routes
+/// to `Hold(LastChkDataSignEmpty)` per kvt2_confirm.rs:188-192 (NOT Acked
+/// — empty data_sign means DPS matched id without KVT2 evidence) →
+/// SentFresh Hold arm (`commit_hold_envelope_1c_hold_light` from Commit 6)
+/// → `Ok(ConfirmDrainOutcome::HoldFnDrain { HeldAtSent })` → caller
+/// projects to `DocVerdict::HoldFnDrain { Transport, HeldAtSent }` →
+/// drain orchestrator break per W0b state-unchanged contract.
+#[tokio::test]
+async fn c6_sent_fresh_match_empty_data_sign_holds_drain() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    // OFFLINE_LOCAL_ACK so stage_send::run picks it up + transitions Sending→Sent.
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "OFFLINE_LOCAL_ACK",
+        None,
+    )
+    .await;
+
+    // stage_send::run succeeds (Sent з server_fiscal_no stamp); lastChk
+    // returns OK з matching id but EMPTY data_sign → Hold(LastChkDataSignEmpty)
+    // → SentFresh 1c-hold-light → HoldFnDrain { HeldAtSent }.
+    let c = carriers(
+        vec![Ok(ack("DPS-FN-FRESH-EMPTY", vec![0xCD]))],
+        vec![Ok(ack("DPS-FN-FRESH-EMPTY", vec![]))],
+    );
+    let view = view_for(&c);
+
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    // Doc lands in Sent (stage_send transitioned it; 1c-hold-light
+    // does NOT CAS state per W0b state-unchanged contract).
+    assert_eq!(read_doc_state(&pool, doc).await, "SENT");
+    // HoldFnDrain projection per MED-PR70-R7-02: SentFresh → HeldAtSent
+    // (NOT HeldAtKvt1; doc is Sent post-stage_send, Hold doesn't advance).
+    assert_eq!(
+        summary.held_at_sent(),
+        1,
+        "SentFresh empty-data_sign Hold MUST project HeldAtSent"
+    );
+    assert_eq!(
+        summary.held_at_kvt1(),
+        0,
+        "SentFresh empty-data_sign Hold MUST NOT project HeldAtKvt1"
+    );
+    assert_eq!(
+        summary.er_redrive_queued(),
+        0,
+        "empty data_sign is Hold (doc stays Sent), not Sent→ER downgrade"
+    );
+    assert_eq!(summary.advanced_to_kvt1(), 0);
+    assert_eq!(summary.advanced_to_ack(), 0);
+    // 1 send_chk (stage_send reached wire); 1 last_chk (confirm_drain_doc).
+    assert_eq!(c.dps.send_chk_count(), 1, "stage_send reached wire");
+    assert_eq!(c.dps.last_chk_count(), 1, "confirm_drain_doc reached wire");
+
+    // KVT2_CONFIRM_HOLD audit Severity::Warning з source=sent_fresh +
+    // hold_reason=LASTCHK_DATA_SIGN_EMPTY.
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_FAILED").await, 0);
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_HOLD").await, 1);
+    let payload = audit_latest_payload(&pool, "KVT2_CONFIRM_HOLD")
+        .await
+        .unwrap();
+    assert_eq!(payload["source"], "sent_fresh");
+    assert_eq!(payload["hold_reason"], "LASTCHK_DATA_SIGN_EMPTY");
+    assert_eq!(payload["dispatch_via"], "kvt2_confirm");
+}
+
+// ─── Phase 1 REC-5 Δ: Kvt1Reentry empty data_sign → HoldFnDrain ──────
+
+/// **M3b W12 Post-Closure Hardening Phase 1 / REC-5 (2026-05-24)** —
+/// closes empty-data_sign Hold path test gap for Kvt1Reentry source.
+/// Completes the empty-data_sign Hold coverage matrix:
+///   - SentReplay: `c5b2_sent_replay_lastchk_match_empty_data_sign_holds_drain` (Δ5)
+///   - SentFresh: `c6_sent_fresh_match_empty_data_sign_holds_drain` (this Δ)
+///   - Kvt1Reentry: this test
+///
+/// Routing chain: cohort walker picks KVT1 doc з persisted
+/// server_fiscal_no → `process_via_w12_only` → confirm_drain_doc(
+/// Kvt1Reentry, attempt_no=None) → DPS lastChk returns `ack(id=matching,
+/// data_sign=vec![])` → `classify_check_result` → `Hold(LastChkDataSignEmpty)`
+/// → Kvt1Reentry Hold arm → `Ok(HoldFnDrain { HeldAtKvt1 })` per
+/// MED-PR70-R7-02 projection matrix → caller projects to `DocVerdict::
+/// HoldFnDrain { Transport, HeldAtKvt1 }` → drain orchestrator break.
+#[tokio::test]
+async fn c6_kvt1_reentry_match_empty_data_sign_holds_drain() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    // KVT1 з persisted server_fiscal_no (stage_send 4-b invariant —
+    // Kvt1 ALWAYS implies prior tick stamped it).
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "KVT1",
+        Some("DPS-FN-KVT1-EMPTY"),
+    )
+    .await;
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+
+    // lastChk returns OK з matching id but EMPTY data_sign →
+    // Hold(LastChkDataSignEmpty) → Kvt1Reentry 1c-hold-light →
+    // HoldFnDrain { HeldAtKvt1 }.  No stage_send (Kvt1 dispatch skips).
+    let c = carriers(vec![], vec![Ok(ack("DPS-FN-KVT1-EMPTY", vec![]))]);
+    let view = view_for(&c);
+
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    // Doc state UNCHANGED at KVT1 per W0b.  1c-hold-light не CAS state.
+    assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
+    // HoldFnDrain projection per MED-PR70-R7-02: Kvt1Reentry → HeldAtKvt1
+    // (NOT HeldAtSent — doc stays at Kvt1 from prior tick's advance).
+    assert_eq!(
+        summary.held_at_kvt1(),
+        1,
+        "Kvt1Reentry empty-data_sign Hold MUST project HeldAtKvt1"
+    );
+    assert_eq!(
+        summary.held_at_sent(),
+        0,
+        "Kvt1Reentry empty-data_sign Hold MUST NOT project HeldAtSent (doc Kvt1, не Sent)"
+    );
+    assert_eq!(summary.er_redrive_queued(), 0);
+    assert_eq!(summary.advanced_to_kvt1(), 0);
+    assert_eq!(summary.advanced_to_ack(), 0);
+    // No wire send (Kvt1 dispatch skips stage_send); 1 last_chk.
+    assert_eq!(c.dps.send_chk_count(), 0);
+    assert_eq!(c.dps.last_chk_count(), 1);
+
+    // KVT2_CONFIRM_HOLD audit з source=kvt1_reentry +
+    // hold_reason=LASTCHK_DATA_SIGN_EMPTY.
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_FAILED").await, 0);
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_HOLD").await, 1);
+    let payload = audit_latest_payload(&pool, "KVT2_CONFIRM_HOLD")
+        .await
+        .unwrap();
+    assert_eq!(payload["source"], "kvt1_reentry");
+    assert_eq!(payload["hold_reason"], "LASTCHK_DATA_SIGN_EMPTY");
+    assert_eq!(payload["dispatch_via"], "kvt2_confirm");
+}
+
 // ─── Test 9: KVT2 cohort widening (W12 Commit 3 reversal of MED-C5-4) ──
 //
 // The pre-W12 fixture `c5_kvt2_doc_excluded_from_cohort_pre_w12`
