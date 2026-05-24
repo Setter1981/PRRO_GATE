@@ -454,3 +454,124 @@ async fn app_drain_concurrent_invocations_smoke_no_deadlock() {
     // (the views borrowed `&c` for the lifetime of the futures).
     drop(c);
 }
+
+// ─── Phase 4 REC-2: scheduled drain з per-FN exponential backoff ─────
+
+/// **Phase 4 / REC-2 (2026-05-24)** — first scheduled invocation runs
+/// drain (no prior backoff state).  Verifies `drain_offline_backlog_
+/// scheduled` returns `Ran(summary)` для fresh FN.
+#[tokio::test]
+async fn rec2_scheduled_first_call_runs_drain_with_no_prior_backoff() {
+    use prro::ScheduledDrainOutcome;
+    let (_d, app, pool) = boot_app("rec2_first.db").await;
+    seed_fn_config(&pool).await;
+    seed_node_state(&pool, NodeMode::Offline, ShiftState::Opened).await;
+    let c = carriers(vec![]);
+    let view = view_for(&c);
+
+    let outcome = app
+        .drain_offline_backlog_scheduled(FN, &view)
+        .await
+        .expect("scheduled drain");
+
+    match outcome {
+        ScheduledDrainOutcome::Ran(_) => {}
+        ScheduledDrainOutcome::SkippedBackoff { .. } => {
+            panic!("first scheduled call MUST run drain (no prior backoff state)")
+        }
+    }
+}
+
+/// **Phase 4 / REC-2 (2026-05-24)** — після Hold outcome (here: skip
+/// path via mode=Offline emits empty summary з 0 holds, BUT the
+/// integration test uses a true Hold via Kvt1Reentry).  Backoff state
+/// incremented; second invocation within window returns
+/// `SkippedBackoff { next_eligible }`.
+#[tokio::test]
+async fn rec2_scheduled_after_hold_skips_within_backoff_window() {
+    use prro::ScheduledDrainOutcome;
+    let (_d, app, pool) = boot_app("rec2_hold.db").await;
+    seed_fn_config(&pool).await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    // Seed KVT1 doc → drain dispatches Kvt1Reentry; з Transport DPS
+    // err → Hold(DpsTransport) → HoldFnDrain { HeldAtKvt1 }.
+    let doc_id = DocumentId::new();
+    let req_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO fiscal_documents( \
+            document_id, request_id, fiscal_number, shift_id, lnd, doc_type, state, \
+            backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical, signed_by_cashier_id, \
+            offline_session_id, offline_fiscal_no, offline_fiscal_date, \
+            server_fiscal_no) \
+         VALUES (?, ?, ?, ?, 100, 'SELL', 'KVT1', \
+            'b1', 't1', 'OFFLINE', '2026-05-21T00:00:00Z', \
+            '{}', ?, ?, ?, 100, '2026-05-21T00:00:00Z', ?)",
+    )
+    .bind(doc_id)
+    .bind(req_id.as_bytes().to_vec())
+    .bind(FN)
+    .bind(shift_id)
+    .bind(vec![0u8; 32])
+    .bind(CASHIER_OK)
+    .bind(session_id)
+    .bind("DPS-FN-REC2")
+    .execute(&pool)
+    .await
+    .unwrap();
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc_id,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+
+    // Carriers: lastChk returns Transport err → Hold.
+    let c = carriers_with_last_chk(vec![], vec![Err(DpsError::Transport("simulated".into()))]);
+    let view = view_for(&c);
+
+    // Tick 1: drain runs + observes Hold → backoff state transitions.
+    let outcome1 = app
+        .drain_offline_backlog_scheduled(FN, &view)
+        .await
+        .expect("tick 1 scheduled drain");
+    match outcome1 {
+        ScheduledDrainOutcome::Ran(summary) => {
+            assert_eq!(
+                summary.held_at_kvt1(),
+                1,
+                "tick 1 MUST register Kvt1Reentry Hold"
+            );
+        }
+        ScheduledDrainOutcome::SkippedBackoff { .. } => {
+            panic!("tick 1 MUST run drain — no prior backoff state")
+        }
+    }
+
+    // Tick 2 (immediate): within 30s backoff window → SkippedBackoff.
+    let outcome2 = app
+        .drain_offline_backlog_scheduled(FN, &view)
+        .await
+        .expect("tick 2 scheduled drain");
+    match outcome2 {
+        ScheduledDrainOutcome::Ran(_) => {
+            panic!(
+                "tick 2 within backoff window MUST be skipped (REC-2 \
+                 exponential backoff filter — Hold from tick 1 should \
+                 gate tick 2)"
+            )
+        }
+        ScheduledDrainOutcome::SkippedBackoff { next_eligible: _ } => {
+            // Success: backoff window honored.  next_eligible is
+            // ~30s в future (first Hold → 2^1 * 30s = 60s window).
+        }
+    }
+}

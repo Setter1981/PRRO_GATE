@@ -105,6 +105,22 @@ impl BootError {
     }
 }
 
+/// **M3b W12 Post-Closure Hardening Phase 4 / REC-2 (2026-05-24)** —
+/// outcome of [`App::drain_offline_backlog_scheduled`].  Caller (M3+
+/// runtime ticker / supervisor) pattern-matches:
+///   - [`Self::Ran`] — drain executed; inner `DrainSummary` carries
+///     full per-doc state (advanced / held / failures).  Caller
+///     logs / aggregates per existing pattern.
+///   - [`Self::SkippedBackoff`] — drain skipped due to per-FN backoff
+///     window not yet elapsed.  `next_eligible` is the earliest
+///     `Instant` at which the next tick на цій FN is eligible to
+///     fire — caller may use для sleep scheduling.
+#[derive(Debug)]
+pub enum ScheduledDrainOutcome {
+    Ran(crate::services::offline_sync::backlog_drain::DrainSummary),
+    SkippedBackoff { next_eligible: std::time::Instant },
+}
+
 /// Application root.
 ///
 /// **Singleton-lock lifetime semantics (W9.1 review NIT 2):**
@@ -148,6 +164,25 @@ struct Inner {
     /// duration of one `reconcile_pending_inner` call; concurrent
     /// callers serialise without panicking.
     reconcile_mutex: tokio::sync::Mutex<()>,
+    /// **M3b W12 Post-Closure Hardening Phase 4 / REC-2 (2026-05-24)** —
+    /// per-FN exponential backoff state.  Keyed by `fiscal_number`;
+    /// entry created on first Hold outcome via
+    /// [`drain_offline_backlog_scheduled`] post-drain update.  Reset
+    /// to fresh on any non-Hold outcome.
+    ///
+    /// In-memory only — backoff resets on App restart (pragmatic
+    /// design: if process restarted, ticker dispatch starts fresh).
+    /// Persistent counter for Tier-1/2 escalation lives on
+    /// `fiscal_documents.consecutive_holds` (DDL 018, REC-1) —
+    /// THIS backoff is purely tick-scheduler concern, separate from
+    /// the per-doc accumulation feeding Tier triggers.
+    ///
+    /// `tokio::sync::Mutex` (NOT std::sync) because the critical
+    /// section may cross `.await` points if helper logic grows;
+    /// short-held — only HashMap insert / lookup / update.
+    backoff_state: tokio::sync::Mutex<
+        std::collections::HashMap<String, crate::services::offline_sync::backoff::BackoffState>,
+    >,
 }
 
 impl App {
@@ -303,6 +338,7 @@ impl App {
                 db,
                 singleton,
                 reconcile_mutex: tokio::sync::Mutex::new(()),
+                backoff_state: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             }),
         })
     }
@@ -550,6 +586,73 @@ impl App {
             fiscal_number,
         )
         .await
+    }
+
+    /// **M3b W12 Post-Closure Hardening Phase 4 / REC-2 (2026-05-24)** —
+    /// scheduled drain entry з per-FN exponential backoff gating.
+    /// Wraps [`drain_offline_backlog_with`] з:
+    /// 1. Pre-call: check backoff window for `fiscal_number` — if
+    ///    `Instant::now() < state.next_eligible` → return
+    ///    `ScheduledDrainOutcome::SkippedBackoff { next_eligible }`
+    ///    без invoking drain (saves DPS wire-call + log noise).
+    /// 2. Post-call: inspect [`DrainSummary`] для Hold-class outcomes
+    ///    (held_at_kvt1 + held_at_sent + er_redrive_queued > 0) — if
+    ///    yes, transition backoff state via `backoff::on_hold` (counter
+    ///    increment + push next_eligible).  Else (Acked / drain
+    ///    advance / no-op) → `backoff::on_advance` (reset counter +
+    ///    immediate eligibility).
+    ///
+    /// Backoff schedule per [`backoff::compute_backoff_window`]:
+    /// `min(2^consecutive_holds * 30s, 30min)`.  Cap protects from
+    /// runaway scheduling; per-FN isolation prevents global Circuit
+    /// Breaker anti-pattern (memory `feedback_offline_transition_
+    /// strategy`).
+    ///
+    /// Caller (M3+ runtime ticker / supervisor) invokes this on the
+    /// scheduled drain interval; backoff transparently filters out
+    /// wasted retries on persistently-Hold-ing FNs.
+    ///
+    /// [`DrainSummary`]: crate::services::offline_sync::backlog_drain::DrainSummary
+    pub async fn drain_offline_backlog_scheduled<'a>(
+        &self,
+        fiscal_number: &str,
+        deps: &crate::services::reconciliation::RuntimeView<'a>,
+    ) -> Result<ScheduledDrainOutcome, BootError> {
+        use crate::services::offline_sync::backoff;
+        use std::time::Instant;
+
+        let now = Instant::now();
+        // Pre-call backoff check: short-held lock during HashMap read.
+        {
+            let map = self.inner.backoff_state.lock().await;
+            if let Some(until) = backoff::check_eligibility(&map, fiscal_number, now) {
+                return Ok(ScheduledDrainOutcome::SkippedBackoff {
+                    next_eligible: until,
+                });
+            }
+        }
+
+        // Run drain (W2 mutex acquired inside drain_offline_backlog_with).
+        let summary = self.drain_offline_backlog_with(fiscal_number, deps).await?;
+
+        // Post-call backoff state update based on summary shape.
+        let any_hold = summary.held_at_kvt1() > 0
+            || summary.held_at_sent() > 0
+            || summary.er_redrive_queued() > 0;
+        {
+            let now_post = Instant::now();
+            let mut map = self.inner.backoff_state.lock().await;
+            let entry = map
+                .entry(fiscal_number.to_string())
+                .or_insert_with(|| backoff::BackoffState::fresh(now_post));
+            if any_hold {
+                backoff::on_hold(entry, now_post);
+            } else {
+                backoff::on_advance(entry, now_post);
+            }
+        }
+
+        Ok(ScheduledDrainOutcome::Ran(summary))
     }
 
     pub fn config(&self) -> &AppConfig {
