@@ -385,10 +385,19 @@ fn view_for<'a>(carriers: &'a DepsCarriers) -> RuntimeView<'a> {
     }
 }
 
-// ─── Test 1: SENT doc → lastChk Match → Kvt1 with replay flag ────────
+// ─── Test 1: SENT doc → lastChk Match → SentReplay full chain → ACK ──
 
+/// **M3b W12 Commit 5b.2 (plan §412 production wiring, 2026-05-24)** —
+/// refactored from pre-W12 `c5_sent_doc_lastchk_match_advances_to_kvt1_
+/// with_replay_flag`.  Post-5b.2 production wiring
+/// (`process_via_lastchk_replay` → `confirm_drain_doc(SentReplay)` →
+/// Envelope 1c-pre + 1a-replay + Envelope 2 → ACK), the SENT-source
+/// lastChk replay path now drives the doc all the way through to
+/// terminal Ack via the bundled 5-write atomic envelope (trace.complete
+/// OK + Kvt1Raw persist + Sent→Kvt1 CAS + Kvt1→Kvt2 CAS + audit з
+/// replay_short_circuit=true).
 #[tokio::test]
-async fn c5_sent_doc_lastchk_match_advances_to_kvt1_with_replay_flag() {
+async fn c5b2_sent_replay_lastchk_match_advances_to_ack_with_replay_flag() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool).await;
@@ -404,9 +413,24 @@ async fn c5_sent_doc_lastchk_match_advances_to_kvt1_with_replay_flag() {
         Some("DPS-FN-SENT-A"),
     )
     .await;
+    // W12 chain bootstrap — Envelope 2 (stage_finalize::run) needs
+    // chain seed + finalize prereqs to reach terminal Ack.
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
 
-    // lastChk Match with non-empty data_sign → REPLAY HIT → advance
-    // Sent → Kvt1.  send_chk queue empty — drain MUST NOT wire-resend.
+    // lastChk Match with non-empty data_sign → REPLAY HIT → bundled
+    // Envelope 1a-replay (5-write atomic) + Envelope 2 → ACK.
+    // send_chk queue empty — drain MUST NOT wire-resend.
     let c = carriers(
         vec![],
         vec![Ok(ack("DPS-FN-SENT-A", vec![0xAA, 0xBB, 0xCC]))],
@@ -418,7 +442,12 @@ async fn c5_sent_doc_lastchk_match_advances_to_kvt1_with_replay_flag() {
         .unwrap();
 
     assert_eq!(summary.backlog_size_before(), 1);
-    assert_eq!(summary.advanced_to_kvt1(), 1);
+    assert_eq!(
+        summary.advanced_to_ack(),
+        1,
+        "SentReplay chain advances doc to Ack via 1a-replay + stage_finalize"
+    );
+    assert_eq!(summary.advanced_to_kvt1(), 0, "no DeferredKvt1 post-5b.2");
     assert_eq!(
         summary.advanced_via_lastchk_replay(),
         1,
@@ -426,25 +455,43 @@ async fn c5_sent_doc_lastchk_match_advances_to_kvt1_with_replay_flag() {
     );
     assert!(summary.per_doc_failures().is_empty());
 
-    // Doc advanced to KVT1 via the C5 stub (Sent → Kvt1 CAS).
-    assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
+    // Doc reaches terminal ACK via the W12 SentReplay chain.
+    assert_eq!(read_doc_state(&pool, doc).await, "ACK");
 
     // Wire send was NOT invoked (drain used lastChk pre-flight only).
     assert_eq!(c.dps.send_chk_count(), 0, "no wire fall-through for SENT");
     assert_eq!(c.dps.last_chk_count(), 1);
 
-    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_ADVANCED").await, 1);
-    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_ADVANCED")
+    // Audit chain: KVT2_ADVANCED (Envelope 1a-replay) + STAGE_FINALIZE_ACK
+    // (Envelope 2).  Pre-W12 OFFLINE_DRAIN_DOC_ADVANCED MUST NOT fire
+    // (replaced by KVT2_ADVANCED + STAGE_FINALIZE_ACK chain).
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await,
+        1,
+        "Envelope 1a-replay emits KVT2_ADVANCED"
+    );
+    assert_eq!(audit_count(&pool, "STAGE_FINALIZE_ACK").await, 1);
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_ADVANCED").await, 0);
+
+    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED")
         .await
         .unwrap();
     assert_eq!(payload["from_state"], "SENT");
-    assert_eq!(payload["to_state"], "KVT1");
+    assert_eq!(payload["to_state"], "KVT2");
+    assert_eq!(payload["server_fiscal_no"], "DPS-FN-SENT-A");
     assert_eq!(
         payload["replay_short_circuit"], true,
-        "replay flag MUST be true on lastChk Match path"
+        "SentReplay 1a-replay envelope MUST mark replay_short_circuit=true"
     );
-    assert_eq!(payload["dispatch_via"], "lastchk_replay");
-    assert_eq!(payload["w12_status"], "DeferredKvt1");
+    assert_eq!(payload["dispatch_via"], "kvt2_confirm");
+    assert_eq!(payload["evidence_source"], "lastChk");
+    // SentReplay-specific: trace_attempt_no threaded from Envelope 1c-pre
+    // allocation into 1a-replay audit payload (plan §412).
+    assert!(
+        payload["trace_attempt_no"].is_i64(),
+        "1a-replay payload MUST carry trace_attempt_no from 1c-pre allocation; \
+         got: {payload:?}"
+    );
 }
 
 // ─── Test 2: KVT1 doc → W12 Kvt1Reentry chain → ACK ─────────────────
@@ -924,10 +971,21 @@ async fn er_guard_indeterminate_no_trace_no_wire_holds_in_er_sibling_continue() 
     assert_eq!(p["hold_reason"], "retry_class_indeterminate");
 }
 
-// ─── Test 4: SENT doc → lastChk Mismatch → per-doc failure (no wire) ─
+// ─── Test 4: SentReplay lastChk Mismatch → structural drift halt ─────
 
+/// **M3b W12 Commit 5b.2 (plan §412 production wiring, 2026-05-24)** —
+/// refactored from pre-W12 `c5_sent_doc_lastchk_mismatch_records_per_
+/// doc_failure_no_wire_resend`.  Behavioral pivot: pre-W12 per-doc
+/// failure (manual_recon=true, drain continued) → W12 structural
+/// drift HALTS the FN drain via `BootError::Internal`.
+///
+/// Forensic chain: Envelope 1c-pre allocates trace row →
+/// `evaluate_lastchk` classifies LastChkIdMismatch → Envelope 1c-drift
+/// (bundled trace.complete RetryableServer + `KVT2_CONFIRM_STRUCTURAL
+/// _DRIFT` audit at Severity::Error) → `BootError::Internal` halt.
+/// Doc state UNCHANGED (Sent — drift envelope does not transition).
 #[tokio::test]
-async fn c5_sent_doc_lastchk_mismatch_records_per_doc_failure_no_wire_resend() {
+async fn c5b2_sent_replay_lastchk_mismatch_halts_drain_with_structural_drift_audit() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool).await;
@@ -943,21 +1001,28 @@ async fn c5_sent_doc_lastchk_mismatch_records_per_doc_failure_no_wire_resend() {
     )
     .await;
 
-    // lastChk returns OK but ack.id differs → Mismatch.  Drain MUST
-    // NOT wire-resend (would double-fiscalize on the SENT-source
-    // 4-pre source whitelist failure path).
+    // lastChk returns OK but ack.id differs → Mismatch routed to
+    // Kvt2ConfirmOutcome::StructuralDrift { LastChkIdMismatch }.
+    // Drain MUST halt with BootError::Internal AND emit drift audit
+    // BEFORE the halt (MED-W12C5-01 caller-level forensic contract).
     let c = carriers(vec![], vec![Ok(ack("DPS-FN-DIFFERENT-DOC", vec![0xFF]))]);
     let view = view_for(&c);
 
-    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
-        .await
-        .unwrap();
+    let result = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN).await;
+    let err = result.expect_err(
+        "SentReplay Mismatch MUST halt drain with BootError::Internal per W12 StructuralDrift",
+    );
+    match err {
+        BootError::Internal(msg) => assert!(
+            msg.contains("LastChkIdMismatch") && msg.contains("StructuralDrift")
+                || msg.contains("structural drift"),
+            "BootError::Internal message MUST reference LastChkIdMismatch / structural drift; \
+             got: {msg}"
+        ),
+        other => panic!("drain Err MUST be Internal; got: {other:?}"),
+    }
 
-    assert_eq!(summary.advanced_to_kvt1(), 0);
-    assert_eq!(summary.per_doc_failures().len(), 1);
-    assert_eq!(summary.per_doc_failures()[0].1, "internal");
-
-    // Doc stays in SENT (no fallthrough wire call).
+    // Doc state UNCHANGED — drift envelope does not CAS state.
     assert_eq!(read_doc_state(&pool, doc).await, "SENT");
     assert_eq!(
         c.dps.send_chk_count(),
@@ -966,15 +1031,30 @@ async fn c5_sent_doc_lastchk_mismatch_records_per_doc_failure_no_wire_resend() {
     );
     assert_eq!(c.dps.last_chk_count(), 1);
 
-    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_FAILED")
+    // Pre-W12 OFFLINE_DRAIN_DOC_FAILED MUST NOT fire (replaced by
+    // KVT2_CONFIRM_STRUCTURAL_DRIFT at Severity::Error).
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_FAILED").await, 0);
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await, 1);
+
+    let payload = audit_latest_payload(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT")
         .await
         .unwrap();
-    assert_eq!(payload["failure_class"], "internal");
-    assert_eq!(payload["probe_outcome"], "Mismatch");
-    assert_eq!(payload["expected_server_fiscal_no"], "DPS-FN-EXPECTED");
-    assert_eq!(payload["actual_server_fiscal_no"], "DPS-FN-DIFFERENT-DOC");
-    assert_eq!(payload["manual_recon_class"], true);
-    assert_eq!(payload["dispatch_via"], "lastchk_replay");
+    assert_eq!(payload["source"], "sent_replay");
+    assert_eq!(payload["drift_reason"], "LASTCHK_ID_MISMATCH");
+    // drift_reason_detail includes both observed + expected ids
+    // (OBS-W12C5-1 fix — per-variant detail message).
+    let detail = payload["drift_reason_detail"].as_str().unwrap();
+    assert!(
+        detail.contains("DPS-FN-DIFFERENT-DOC") && detail.contains("DPS-FN-EXPECTED"),
+        "drift_reason_detail MUST contain both observed + expected ids; got: {detail}"
+    );
+    assert_eq!(payload["dispatch_via"], "kvt2_confirm");
+    // SentReplay-specific: trace_attempt_no threaded from 1c-pre.
+    assert!(
+        payload["trace_attempt_no"].is_i64(),
+        "1c-drift bundled payload MUST carry trace_attempt_no from 1c-pre allocation; \
+         got: {payload:?}"
+    );
 }
 
 // ─── Test 5: empty-skip when only terminal-state docs exist ──────────
@@ -1124,15 +1204,18 @@ async fn c5_walker_scope_excludes_online_cross_session_docs() {
     assert_eq!(read_doc_state(&pool, online_doc).await, "SENT");
 }
 
-// ─── Test 7: lastChk Match persists KVT1_RAW byte-for-byte ───────────
+// ─── Test 7: SentReplay Match persists KVT1_RAW byte-for-byte ────────
 
-/// HIGH-C5-2 (2026-05-21): on lastChk REPLAY HIT, the helper MUST
-/// persist `ack.data_sign` into `document_files::Kvt1Raw` inside the
-/// same `with_immediate` envelope as the Sent→Kvt1 CAS + audit.
-/// Matches M3a `boot_phase::advance_sent_to_kvt1_from_probe` evidence
-/// contract (forensic KVT1_RAW per legal-trail requirements).
+/// HIGH-C5-2 (2026-05-21) + LOW-W12C5-03 (5 Δ) + **5b.2 (2026-05-24)**:
+/// on lastChk REPLAY HIT, Envelope 1a-replay MUST persist `ack.data_sign`
+/// into `document_files::Kvt1Raw` inside the same `with_immediate` as
+/// the Sent→Kvt1 CAS + Kvt1→Kvt2 CAS + trace.complete + audit.  The
+/// audit payload's `kvt1_raw_sha256_hex` MUST equal SHA256 of those
+/// persisted bytes (plan §62 audit-digest contract).  Refactored from
+/// pre-W12 fixture which only locked KVT1 stop-point; now locks full
+/// SentReplay chain to terminal ACK + KVT1_RAW forensic anchor.
 #[tokio::test]
-async fn c5_lastchk_match_persists_kvt1_raw_byte_for_byte() {
+async fn c5b2_sent_replay_lastchk_match_persists_kvt1_raw_byte_for_byte() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool).await;
@@ -1147,6 +1230,19 @@ async fn c5_lastchk_match_persists_kvt1_raw_byte_for_byte() {
         Some("DPS-FN-REPLAY"),
     )
     .await;
+    // W12 chain bootstrap — Envelope 2 reaches terminal ACK.
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
 
     let expected_data_sign: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x13, 0x37];
     let c = carriers(
@@ -1159,29 +1255,53 @@ async fn c5_lastchk_match_persists_kvt1_raw_byte_for_byte() {
         .await
         .unwrap();
 
-    assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
-    // KVT1_RAW byte-for-byte equality.
+    // Doc reaches terminal ACK via SentReplay chain (Envelope 1a-replay
+    // + Envelope 2).  KVT1_RAW persisted inside 1a-replay's
+    // with_immediate per HIGH-C5-2 forensic anchor.
+    assert_eq!(read_doc_state(&pool, doc).await, "ACK");
     let kvt1_raw: Vec<u8> = sqlx::query_scalar(
         "SELECT content FROM document_files WHERE document_id = ? AND kind = 'KVT1_RAW'",
     )
     .bind(doc)
     .fetch_one(&pool)
     .await
-    .expect("KVT1_RAW row MUST exist after lastChk Match");
+    .expect("KVT1_RAW row MUST exist after SentReplay 1a-replay envelope commit");
     assert_eq!(
         kvt1_raw, expected_data_sign,
-        "KVT1_RAW MUST equal ack.data_sign byte-for-byte"
+        "KVT1_RAW MUST equal ack.data_sign byte-for-byte (HIGH-C5-2 forensic anchor)"
+    );
+    // Plan §62 audit-digest contract: 1a-replay audit payload's
+    // kvt1_raw_sha256_hex MUST equal SHA256 of persisted KVT1_RAW.
+    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED")
+        .await
+        .unwrap();
+    let expected_digest_hex = format!("{:x}", Sha256::digest(&kvt1_raw));
+    assert_eq!(
+        payload["kvt1_raw_sha256_hex"], expected_digest_hex,
+        "OFFLINE_DRAIN_KVT2_ADVANCED.kvt1_raw_sha256_hex MUST equal SHA256 \
+         of persisted KVT1_RAW bytes (plan §62 audit-digest contract)"
     );
 }
 
-// ─── Test 8: lastChk NotFound → ER for retry, non-manual ─────────────
+// ─── Test 8: SentReplay lastChk NotFound → HoldFnDrain ErRedriveQueued ──
 
-/// HIGH-C5-3 (2026-05-21): on lastChk NotFound (DPS has no record
-/// for the FN_sign), the SENT doc downgrades to `ERROR_RETRYABLE`
-/// for safe Pattern B re-drive next tick.  Non-manual class — does
-/// NOT escalate pending-drain shifts.
+/// **M3b W12 Commit 5b.2 (plan §412 HIGH-C5-3 safe-redrive seam,
+/// 2026-05-24)** — refactored from pre-W12 `c5_sent_doc_lastchk_not_
+/// found_downgrades_to_error_retryable_non_manual`.  Behavioral pivot:
+/// pre-W12 per-doc failure (Transport, manual_recon=false, drain
+/// continued) → W12 `HoldFnDrain { ErRedriveQueued }` HALTS this-tick
+/// drain (DocVerdict::HoldFnDrain consumer logic at backlog_drain
+/// line 884 → break).
+///
+/// Forensic chain: Envelope 1c-pre allocates trace row → DPS NotFound
+/// classified to `Kvt2ConfirmOutcome::SentNotFoundDowngrade` → Envelope
+/// 1c-post (bundled: trace.complete RetryableTransport + Sent→ER CAS
+/// + OFFLINE_DRAIN_DOC_FAILED audit) → `Ok(HoldFnDrain {
+/// ErRedriveQueued })`.  Next tick: W9b ER-class-guard reads
+/// `retry_class=TransientRetry` + attempts_used<MAX → bounded Pattern
+/// B redrive through `stage_send::run`.
 #[tokio::test]
-async fn c5_sent_doc_lastchk_not_found_downgrades_to_error_retryable_non_manual() {
+async fn c5b2_sent_replay_lastchk_not_found_holds_fn_drain_er_redrive_queued() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool).await;
@@ -1204,24 +1324,44 @@ async fn c5_sent_doc_lastchk_not_found_downgrades_to_error_retryable_non_manual(
         .await
         .unwrap();
 
-    // Per HIGH-C5-3: doc downgrades to ER for retry (no manual recon).
+    // Doc downgraded to ER via Envelope 1c-post (Sent→ER CAS bundled
+    // з trace.complete + audit atomically).
     assert_eq!(read_doc_state(&pool, doc).await, "ERROR_RETRYABLE");
+    // W12 HoldFnDrain projection accounting: ErRedriveQueued counter
+    // (NOT per_doc_failures — that's pre-W12 path).
     assert_eq!(
-        summary.per_doc_failures()[0].1,
-        "transport",
-        "NotFound classified as transport (non-manual; retry budget retained)"
+        summary.er_redrive_queued(),
+        1,
+        "SentNotFoundDowngrade MUST record ErRedriveQueued projection"
     );
+    assert_eq!(
+        summary.held_at_sent(),
+        0,
+        "NotFound is downgrade (Sent→ER), not Hold-at-Sent"
+    );
+    assert_eq!(summary.advanced_to_kvt1(), 0);
+    assert_eq!(summary.advanced_to_ack(), 0);
     assert_eq!(c.dps.send_chk_count(), 0, "no wire-resend in this tick");
     assert_eq!(c.dps.last_chk_count(), 1);
 
+    // OFFLINE_DRAIN_DOC_FAILED audit comes from Envelope 1c-post,
+    // not the pre-W12 downgrade_sent_to_error_retryable_for_retry
+    // path.  Payload shape differs: `dispatch_via=kvt2_confirm`,
+    // `probe_outcome=NotFound`, `downgrade_to=ERROR_RETRYABLE`,
+    // `manual_recon_class=false`, `failure_class=transport`.
     let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_FAILED")
         .await
         .unwrap();
+    assert_eq!(payload["failure_class"], "transport");
     assert_eq!(payload["probe_outcome"], "NotFound");
-    assert_eq!(payload["downgrade_target_state"], "ERROR_RETRYABLE");
-    assert_eq!(
-        payload["manual_recon_class"], false,
-        "NotFound retains retry budget — MUST NOT be manual class"
+    assert_eq!(payload["downgrade_to"], "ERROR_RETRYABLE");
+    assert_eq!(payload["expected_server_fiscal_no"], "DPS-FN-REPLAY");
+    assert_eq!(payload["manual_recon_class"], false);
+    assert_eq!(payload["dispatch_via"], "kvt2_confirm");
+    assert!(
+        payload["trace_attempt_no"].is_i64(),
+        "1c-post payload MUST carry trace_attempt_no from 1c-pre allocation; \
+         got: {payload:?}"
     );
 }
 
