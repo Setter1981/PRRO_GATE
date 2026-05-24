@@ -926,7 +926,11 @@ async fn commit_sent_fresh_envelope_1a(
                     doc_hex = id_hex_owned,
                 ));
             }
-            // (d) Forensic audit row.
+            // (d) **REC-1 Phase 2a.1 (2026-05-24)**: reset
+            // consecutive_holds counter — advance through Sent→Kvt1→Kvt2
+            // clears any prior Hold accumulation per Tier reset semantics.
+            fiscal_documents::reset_consecutive_holds_tx(tx, doc_id).await?;
+            // (e) Forensic audit row.
             audit_log::append_tx(
                 tx,
                 AUDIT_ENTITY_DOC,
@@ -1034,7 +1038,11 @@ async fn commit_kvt1_reentry_envelope_1b(
                     doc_hex = id_hex_owned,
                 ));
             }
-            // (c) Forensic audit row.
+            // (c) **REC-1 Phase 2a.1 (2026-05-24)**: reset consecutive_
+            // holds counter — Kvt1Reentry advance clears any prior
+            // Hold accumulation per Tier reset semantics.
+            fiscal_documents::reset_consecutive_holds_tx(tx, doc_id).await?;
+            // (d) Forensic audit row.
             audit_log::append_tx(
                 tx,
                 AUDIT_ENTITY_DOC,
@@ -1402,7 +1410,11 @@ async fn commit_sent_replay_envelope_1a_replay(
                     doc_hex = id_hex_owned,
                 ));
             }
-            // (e) Forensic audit row.
+            // (e) **REC-1 Phase 2a.1 (2026-05-24)**: reset consecutive_
+            // holds counter — SentReplay advance clears any prior
+            // Hold accumulation per Tier reset semantics.
+            fiscal_documents::reset_consecutive_holds_tx(tx, doc_id).await?;
+            // (f) Forensic audit row.
             audit_log::append_tx(
                 tx,
                 AUDIT_ENTITY_DOC,
@@ -1510,7 +1522,13 @@ async fn commit_sent_replay_envelope_1c_post(
                     doc_hex = id_hex_owned,
                 ));
             }
-            // (c) Forensic audit row.
+            // (c) **REC-1 Phase 2a.1 (2026-05-24)**: reset consecutive_
+            // holds counter — SentNotFoundDowngrade Sent→ER advance
+            // clears any prior Hold accumulation per Tier reset semantics
+            // (doc now in ER cohort awaiting W9b Pattern B redrive next
+            // tick; previous Hold history irrelevant to new attempt budget).
+            fiscal_documents::reset_consecutive_holds_tx(tx, doc_id).await?;
+            // (d) Forensic audit row.
             audit_log::append_tx(
                 tx,
                 AUDIT_ENTITY_DOC,
