@@ -1,0 +1,21 @@
+-- Migration 025: per-document consecutive_holds counter для W12 Tiered
+-- Degradation (REC-1, post-W12 hardening Phase 2a.1).
+--
+-- Counts consecutive HoldFnDrain outcomes на конкретному документі
+-- (HeldAtSent | HeldAtKvt1).  Інкрементиться atomically всередині
+-- Envelope 1c-hold (light + bundled варіанти); скидається до 0 при
+-- будь-якому non-Hold advance (Envelope 1a / 1b / 1a-replay / 1c-post).
+--
+-- Drives 3-tier degradation per plan (`docs/superpowers/plans/
+-- 2026-05-24-m3b-w12-post-closure-hardening.md` REC-1):
+--   - Tier 1 (>= 10): emit KVT2_CONFIRM_PROLONGED_HOLD audit Warning.
+--   - Tier 2 (>= 50): CAS node_state.mode → STOP_MODE + emit
+--     OFFLINE_DRAIN_FN_STOP_MODE audit Critical.
+--   - Tier 3: admin CLI escalation (Phase 2a.2 scope; not this migration).
+--
+-- Persistence is critical (operator memory `feedback_manual_recon_
+-- catastrophe`): in-memory counter would lose context across crash/
+-- restart, allowing infinite-hold scenarios to bypass Tier 2 escalation
+-- + breach the 36h offline cap before operator intervention.
+ALTER TABLE fiscal_documents ADD COLUMN consecutive_holds INTEGER NOT NULL DEFAULT 0
+    CHECK (consecutive_holds >= 0);

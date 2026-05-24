@@ -1279,3 +1279,55 @@ pub async fn mac_recovery_claim_counter_tx(
     .await?;
     Ok(res.rows_affected() == 1)
 }
+
+/// **M3b W12 Post-Closure Hardening Phase 2a.1 / REC-1 (2026-05-24)**
+/// — increment `fiscal_documents.consecutive_holds` for `doc_id` and
+/// return the new value.  Called inside Envelope 1c-hold
+/// (light + bundled варіанти) atomically з audit emission per I4
+/// transactional invariant.
+///
+/// Returns the post-increment value (i64); caller (drain orchestrator)
+/// uses it for Tier-1 (>= 10 → KVT2_CONFIRM_PROLONGED_HOLD audit) +
+/// Tier-2 (>= 50 → STOP_MODE CAS) trigger checks per plan §REC-1.
+///
+/// `rows_affected == 0` → missing doc row → structural breach (cohort
+/// walker should never surface non-existent doc); caller surfaces as
+/// `BootError::Internal`.
+pub async fn increment_consecutive_holds_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+) -> sqlx::Result<i64> {
+    let row = sqlx::query_scalar::<_, i64>(
+        "UPDATE fiscal_documents \
+         SET consecutive_holds = consecutive_holds + 1 \
+         WHERE document_id = ? \
+         RETURNING consecutive_holds",
+    )
+    .bind(doc_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(row)
+}
+
+/// **M3b W12 Post-Closure Hardening Phase 2a.1 / REC-1 (2026-05-24)**
+/// — reset `fiscal_documents.consecutive_holds` to 0 for `doc_id`.
+/// Called inside non-Hold advance envelopes (Envelope 1a, 1b,
+/// 1a-replay, 1c-post — every path that moves the doc forward з Hold
+/// stuck state OR completes successfully).  Atomic з state CAS +
+/// audit per I4.
+///
+/// Idempotent — UPDATE without CAS guard; setting 0→0 is no-op.
+/// `rows_affected == 0` → missing doc row (structural breach);
+/// returned bool lets caller fail-loud.
+pub async fn reset_consecutive_holds_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "UPDATE fiscal_documents SET consecutive_holds = 0 WHERE document_id = ?",
+    )
+    .bind(doc_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
