@@ -194,7 +194,11 @@ impl SidecarConfig {
             return Err(ConfigError::Validation("dps.test.endpoint must not be empty".into()));
         }
 
-        // dev.skip_sign bypasses CMS signing — only allowed when DEV_MODE env var is set
+        // dev.skip_sign bypasses CMS signing, license checks, and idempotency — only
+        // allowed when DEV_MODE env var is set.
+        // SECURITY NOTE: for stricter enterprise profiles, additionally gate on
+        // #[cfg(debug_assertions)] or a dedicated allow_insecure_dev_mode config key;
+        // a bare env var can be set accidentally in production environments.
         if self.dev.skip_sign && std::env::var("DEV_MODE").is_err() {
             return Err(ConfigError::Validation(
                 "dev.skip_sign = true requires DEV_MODE env var to be set".into(),

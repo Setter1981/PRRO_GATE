@@ -313,7 +313,7 @@ mod tests {
 /// Classification of a COMP (fiscal document send) response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentOutcome {
-    /// DPS accepted the document — fiscal_id is valid; close receipt, store hash.
+    /// DPS accepted the document — `fiscal_id` is valid; close receipt, store hash.
     Accepted { fiscal_id: u64, sale: u64, ret: u64 },
     /// Terminal failure — DPS permanently rejected or signed with bad key.
     /// Receipt must be closed as rejected; caller cannot retry this document.
@@ -327,6 +327,7 @@ pub enum DocumentOutcome {
 ///
 /// Rationale: closing a receipt must reflect actual DPS outcome, not just
 /// whether the HTTP call succeeded (Invariant #4 — idempotency).
+#[must_use]
 pub fn classify_response(resp: &CanonicalResponse) -> DocumentOutcome {
     if resp.ok {
         match resp.fiscal_id.parse::<u64>() {

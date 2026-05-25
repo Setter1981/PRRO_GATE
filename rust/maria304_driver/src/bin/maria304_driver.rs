@@ -134,8 +134,7 @@ impl ClockSource for UtcNowClock {
         use std::time::{SystemTime, UNIX_EPOCH};
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         let (date, time) = format_utc(secs);
         (date, time)
     }
@@ -167,6 +166,27 @@ fn format_utc(secs: u64) -> (String, String) {
         format!("{y:04}{m:02}{d:02}"),
         format!("{hour:02}{minute:02}{second:02}"),
     )
+}
+
+fn check_no_duplicates(listeners: &[ListenerCfg]) -> Result<(), String> {
+    use std::collections::HashSet;
+    let mut seen_fns: HashSet<&str> = HashSet::new();
+    let mut seen_binds: HashSet<&str> = HashSet::new();
+    for l in listeners {
+        if !seen_fns.insert(l.fiscal_number.as_str()) {
+            return Err(format!(
+                "duplicate fiscal_number '{}' in [listeners] config — each listener must be unique",
+                l.fiscal_number
+            ));
+        }
+        if !seen_binds.insert(l.bind.as_str()) {
+            return Err(format!(
+                "duplicate bind address '{}' in [listeners] config — each listener must bind to a unique port",
+                l.bind
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn build_bridge(cfg: &BridgeCfg, mode: DeploymentMode) -> Result<Arc<dyn Bridge + Send + Sync>, String> {
@@ -237,9 +257,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     tracing::info!(?mode, "deployment mode");
 
+    if let Err(e) = check_no_duplicates(&cfg.listeners) {
+        eprintln!("configuration error: {e}");
+        std::process::exit(1);
+    }
+
     let bridge = build_bridge(&cfg.bridge, mode)?;
     let registry = Arc::new(Registry::new());
     let clock: Arc<dyn ClockSource> = Arc::new(UtcNowClock);
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let mut listener_handles = Vec::new();
 
     // Spawn each listener.
     for listener_cfg in &cfg.listeners {
@@ -253,7 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         lcfg.idle_timeout = Duration::from_secs(listener_cfg.idle_timeout_s);
         lcfg.cooldown = Duration::from_secs(listener_cfg.post_disconnect_cooldown_s);
 
-        let listener = FnListener::new(lcfg, Arc::clone(&bridge), Arc::clone(&clock));
+        let listener = FnListener::new(lcfg, Arc::clone(&bridge), Arc::clone(&clock), Arc::clone(&metrics));
         let gate = listener.gate();
         registry
             .register_fn(RegisteredFn {
@@ -264,11 +292,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             })
             .await;
 
-        tokio::spawn(async move {
-            if let Err(e) = listener.serve().await {
+        let token = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = listener.serve(token).await {
                 tracing::error!("listener died: {e}");
             }
         });
+        listener_handles.push(handle);
     }
 
     // Admin HTTP server (optional).
@@ -284,6 +314,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     tracing::info!("maria304_driver running; Ctrl-C to stop");
     signal::ctrl_c().await?;
-    tracing::info!("shutdown signal received");
+    tracing::info!("shutdown signal received; draining connections");
+    shutdown.cancel();
+
+    let timeout_s = cfg.deployment.graceful_shutdown_timeout_s;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(timeout_s),
+        async {
+            for h in listener_handles {
+                let _ = h.await;
+            }
+        },
+    ).await;
+    tracing::info!("shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod startup_validation_tests {
+    use super::{check_no_duplicates, ListenerCfg};
+
+    fn cfg(fn_: &str, bind: &str) -> ListenerCfg {
+        ListenerCfg {
+            fiscal_number: fn_.to_string(),
+            bind: bind.to_string(),
+            identity: None,
+            idle_timeout_s: 300,
+            post_disconnect_cooldown_s: 3,
+            cashier_password: None,
+        }
+    }
+
+    #[test]
+    fn unique_configs_pass() {
+        let cfgs = vec![cfg("FN001", "0.0.0.0:9001"), cfg("FN002", "0.0.0.0:9002")];
+        assert!(check_no_duplicates(&cfgs).is_ok());
+    }
+
+    #[test]
+    fn detect_duplicate_fiscal_number() {
+        let cfgs = vec![cfg("FN001", "0.0.0.0:9001"), cfg("FN001", "0.0.0.0:9002")];
+        let err = check_no_duplicates(&cfgs).unwrap_err();
+        assert!(err.contains("FN001"), "expected FN001 in error: {err}");
+    }
+
+    #[test]
+    fn detect_duplicate_bind() {
+        let cfgs = vec![cfg("FN001", "0.0.0.0:9001"), cfg("FN002", "0.0.0.0:9001")];
+        let err = check_no_duplicates(&cfgs).unwrap_err();
+        assert!(err.contains("9001"), "expected port in error: {err}");
+    }
 }

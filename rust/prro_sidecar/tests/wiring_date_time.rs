@@ -108,3 +108,227 @@ fn xml_builder_format_ts_uses_iana_kyiv_tz_not_fixed_utc_plus_3() {
          Check.date_time and with Python's zoneinfo-based path",
     );
 }
+
+
+// ── S2: envelope integrity ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod envelope_integrity {
+    use prro_sidecar::input::CanonicalCommand;
+    use sha2::{Digest, Sha256};
+    use serde_json::json;
+
+    fn make_cmd(schema_version: &str, payload_sha256: &str) -> CanonicalCommand {
+        serde_json::from_value(json!({
+            "schema_version":  schema_version,
+            "request_id":      "req-1",
+            "idempotency_key": "idem-1",
+            "operation_type":  "SELL",
+            "fiscal_number":   "9999999999",
+            "business_ts":     "2026-04-22T10:00:00+03:00",
+            "payload_sha256":  payload_sha256,
+            "payload":         {"receipt": {}}
+        }))
+        .expect("make_cmd: JSON must parse")
+    }
+
+    #[test]
+    fn unknown_schema_version_rejected() {
+        let cmd = make_cmd("2.0", "");
+        let err = prro_sidecar::validate_envelope(&cmd).unwrap_err();
+        assert!(err.contains("schema_version"), "got: {err}");
+    }
+
+    #[test]
+    fn known_schema_version_with_correct_sha256_passes() {
+        let payload = json!({"receipt": {}});
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let sha = hex::encode(Sha256::digest(&bytes));
+        let cmd = make_cmd("1.0", &sha);
+        assert!(prro_sidecar::validate_envelope(&cmd).is_ok());
+    }
+
+    #[test]
+    fn empty_payload_sha256_rejected() {
+        let cmd = make_cmd("1.0", "");
+        let err = prro_sidecar::validate_envelope(&cmd).unwrap_err();
+        assert!(err.contains("payload_sha256"), "got: {err}");
+    }
+
+    #[test]
+    fn correct_payload_sha256_passes() {
+        let payload = json!({"receipt": {}});
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let sha = hex::encode(Sha256::digest(&bytes));
+        let cmd = make_cmd("1.0", &sha);
+        assert!(prro_sidecar::validate_envelope(&cmd).is_ok());
+    }
+
+    #[test]
+    fn tampered_payload_sha256_rejected() {
+        let cmd = make_cmd("1.0", "deadbeef");
+        let err = prro_sidecar::validate_envelope(&cmd).unwrap_err();
+        assert!(err.contains("payload_sha256"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod idempotency {
+    use prro_sidecar::repo::{PendingInsertResult, Repo};
+
+    fn make_repo() -> Repo { Repo::open(":memory:").expect("in-memory repo") }
+    const OP: &str = "SELL";
+    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn fresh_key_returns_inserted() {
+        let repo = make_repo();
+        let r = repo.insert_pending_request("key-1", "FN001", OP, SHA, "").unwrap();
+        assert!(matches!(r, PendingInsertResult::Inserted));
+    }
+
+    #[test]
+    fn accepted_key_returns_cached_json() {
+        let repo = make_repo();
+        repo.insert_pending_request("key-1", "FN001", OP, SHA, "").unwrap();
+        repo.accept_request("key-1", r#"{"status":1}"#).unwrap();
+        match repo.insert_pending_request("key-1", "FN001", OP, SHA, "").unwrap() {
+            PendingInsertResult::DuplicateAccepted(json) => {
+                assert_eq!(json, r#"{"status":1}"#);
+            }
+            other => panic!("expected DuplicateAccepted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn different_key_returns_inserted() {
+        let repo = make_repo();
+        repo.insert_pending_request("key-A", "FN001", OP, SHA, "").unwrap();
+        repo.accept_request("key-A", r#"{"status":1}"#).unwrap();
+        let r = repo.insert_pending_request("key-B", "FN001", OP, SHA, "").unwrap();
+        assert!(matches!(r, PendingInsertResult::Inserted));
+    }
+
+    #[test]
+    fn fiscal_send_inner_contains_idempotency_wiring() {
+        let src = include_str!("../src/bin/prro_sidecar.rs");
+        assert!(src.contains("insert_pending_request"), "must call insert_pending_request");
+        assert!(src.contains("accept_request"), "must call accept_request");
+    }
+
+    #[test]
+    fn pre_migration_accepted_row_returns_cached_without_hard_conflict() {
+        // F4-fix: rows migrated from a pre-F2 schema have operation_type_key=''
+        // and payload_sha256_key=''.  A replay with the real op/hash would trigger
+        // HardConflict if the identity check ran before the status check.
+        // This test simulates a pre-migration accepted row by inserting with empty
+        // identity values and then replaying with real values.
+        let repo = make_repo();
+
+        // Insert with empty identity (simulates pre-F2 row after migration).
+        repo.insert_pending_request("legacy-key", "FN001", "", "", "").unwrap();
+        repo.accept_request("legacy-key", r#"{"status":99}"#).unwrap();
+
+        // Replay with real op/sha/ts — must return cached response, NOT HardConflict.
+        match repo.insert_pending_request("legacy-key", "FN001", "SELL", SHA, "2026-01-01T10:00:00+03:00").unwrap() {
+            PendingInsertResult::DuplicateAccepted(json) => {
+                assert_eq!(json, r#"{"status":99}"#);
+            }
+            other => panic!("expected DuplicateAccepted for pre-migration row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bound_accepted_row_with_different_identity_gives_hard_conflict() {
+        // F2/F4: accepted rows that are fully bound (non-empty identity columns)
+        // must still reject key reuse with a different payload — otherwise an
+        // attacker could retrieve a cached response by reusing a known accepted key
+        // with different content.
+        let repo = make_repo();
+        repo.insert_pending_request("bound-key", "FN001", OP, SHA, "").unwrap();
+        repo.accept_request("bound-key", r#"{"status":1}"#).unwrap();
+
+        // Different sha — must give HardConflict, not DuplicateAccepted.
+        let other_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        match repo.insert_pending_request("bound-key", "FN001", OP, other_sha, "").unwrap() {
+            PendingInsertResult::HardConflict(_) => {}
+            other => panic!("expected HardConflict for bound accepted with wrong sha, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_request_transitions_pending_to_rejected_allowing_fresh_retry() {
+        // F3-fix: permanent DPS errors mark the row 'rejected', which allows a
+        // fresh retry (unlike 'ambiguous' which blocks until reconciliation).
+        let repo = make_repo();
+        repo.insert_pending_request("key-perm", "FN001", OP, SHA, "").unwrap();
+        repo.reject_request("key-perm").unwrap();
+
+        // After rejection, a fresh insert with same identity must succeed.
+        let r = repo.insert_pending_request("key-perm", "FN001", OP, SHA, "").unwrap();
+        assert!(matches!(r, PendingInsertResult::Inserted),
+            "rejected row must allow fresh retry, got {r:?}");
+    }
+
+    #[test]
+    fn same_payload_different_business_ts_gives_hard_conflict() {
+        // R3: business_ts is stored in a dedicated column (business_ts_key).
+        // Same key + same payload + different business_ts must give HardConflict.
+        let repo = make_repo();
+        let ts1 = "2026-01-01T10:00:00+03:00";
+        let ts2 = "2026-01-02T10:00:00+03:00";
+        repo.insert_pending_request("key-ts", "FN001", OP, SHA, ts1).unwrap();
+        repo.accept_request("key-ts", r#"{"status":1}"#).unwrap();
+
+        match repo.insert_pending_request("key-ts", "FN001", OP, SHA, ts2).unwrap() {
+            PendingInsertResult::HardConflict(_) => {}
+            other => panic!("expected HardConflict for different business_ts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_r3_pending_row_with_empty_ts_key_returns_duplicate_pending_on_ts_mismatch() {
+        // Migration policy: rows inserted by a pre-R3 sidecar have business_ts_key=''.
+        // A replay from a new sidecar with a different business_ts must NOT give
+        // HardConflict — it returns DuplicatePending (row is still in-flight).
+        // This is the accepted tradeoff: the ambiguity window is bounded by the
+        // cleanup task (120 s → ambiguous), and DPS deduplicates on its side.
+        let repo = make_repo();
+        // Simulate pre-R3 insert: empty ts_key.
+        repo.insert_pending_request("key-pre-r3", "FN001", OP, SHA, "").unwrap();
+
+        let ts_new = "2026-01-01T10:00:00+03:00";
+        match repo.insert_pending_request("key-pre-r3", "FN001", OP, SHA, ts_new).unwrap() {
+            PendingInsertResult::DuplicatePending => {}
+            other => panic!(
+                "pre-R3 pending row with empty ts_key must return DuplicatePending, not {other:?}"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod dps_classifier_wire {
+    use prro_sidecar::grpc_client::{classify_dps_status, DpsErrorCategory};
+
+    #[test]
+    fn status_ok_returns_none() {
+        assert_eq!(classify_dps_status(1), None);
+    }
+    #[test]
+    fn status_minus3_is_transient() {
+        assert_eq!(classify_dps_status(-3), Some(DpsErrorCategory::Transient));
+    }
+    #[test]
+    fn status_minus1_is_permanent() {
+        assert_eq!(classify_dps_status(-1), Some(DpsErrorCategory::Permanent));
+    }
+    #[test]
+    fn status_zero_is_permanent() {
+        assert_eq!(classify_dps_status(0), Some(DpsErrorCategory::Permanent));
+    }
+    #[test]
+    fn status_minus12_is_transient() {
+        assert_eq!(classify_dps_status(-12), Some(DpsErrorCategory::Transient));
+    }
+}

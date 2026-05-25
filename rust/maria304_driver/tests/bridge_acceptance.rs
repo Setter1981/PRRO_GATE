@@ -74,9 +74,19 @@ fn sell_with_items_payments_slip_lands_canonical_envelope_on_bridge() {
     assert_eq!(env.cashier_id.as_deref(), Some("csh1"));
     assert_eq!(env.department.as_deref(), Some("Bar1"));
     assert_eq!(env.return_check_number, None);
-    assert_eq!(
-        env.idempotency_key,
-        format!("maria304:{}:sess-test:0", Identity::default().fiscal_number),
+    // F3: key is now content-stable — prefix is "maria304:{FN}:" + 64-hex SHA-256.
+    let fn_id = Identity::default().fiscal_number;
+    let expected_prefix = format!("maria304:{fn_id}:");
+    assert!(
+        env.idempotency_key.starts_with(&expected_prefix),
+        "idempotency_key must start with {expected_prefix:?}, got {:?}",
+        env.idempotency_key
+    );
+    let hash_part = &env.idempotency_key[expected_prefix.len()..];
+    assert_eq!(hash_part.len(), 64, "hash part must be 64 hex chars");
+    assert!(
+        hash_part.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "hash part must be lowercase hex"
     );
 
     // Dual-tax mode — Cyrillic А=1, Б=2.
@@ -159,30 +169,45 @@ fn bridge_typed_rejection_translates_to_specific_soft_code() {
     assert_eq!(out, vec![Response::Error(ErrorCode::SoftBadArt)]);
 }
 
+// F3: idempotency_key is now content-stable.
+// Two receipts with different content produce different keys.
+// The same receipt content produces the same key (supports dedup on TCP reconnect).
 #[test]
-fn idempotency_key_changes_per_receipt_sequence() {
+fn idempotency_key_is_content_stable() {
+    let fn_id = Identity::default().fiscal_number;
+    let prefix = format!("maria304:{fn_id}:");
+
+    // Receipt A: one item "X".
     let (mut session, bridge, mut correlation) = logged_in_session();
+    run(&mut session, &bridge, &mut correlation, Command::Prep("X".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Fisc("100item".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+    let key_a1 = bridge.last().unwrap().idempotency_key.clone();
 
-    // Three receipts in a row.
-    for _ in 0..3 {
-        run(&mut session, &bridge, &mut correlation, Command::Prep("X".to_string()));
-        run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+    // Receipt B: different item "Y".
+    run(&mut session, &bridge, &mut correlation, Command::Prep("Y".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Fisc("200item".to_string()));
+    run(&mut session, &bridge, &mut correlation, Command::Comp(String::new()));
+    let key_b = bridge.last().unwrap().idempotency_key.clone();
+
+    // Different content → different keys.
+    assert_ne!(key_a1, key_b, "different receipt content must produce different idempotency keys");
+
+    // Both keys have the right format.
+    for key in [&key_a1, &key_b] {
+        assert!(key.starts_with(&prefix), "key must start with {prefix:?}");
+        assert_eq!(&key[prefix.len()..].len(), &64, "hash part must be 64 chars");
     }
-    assert_eq!(bridge.call_count(), 3);
 
-    let keys: Vec<String> = bridge
-        .submitted()
-        .iter()
-        .map(|e| e.idempotency_key.clone())
-        .collect();
-    assert_eq!(
-        keys,
-        vec![
-            format!("maria304:{}:sess-test:0", Identity::default().fiscal_number),
-            format!("maria304:{}:sess-test:1", Identity::default().fiscal_number),
-            format!("maria304:{}:sess-test:2", Identity::default().fiscal_number),
-        ],
-    );
+    // Simulate retry: same receipt "X" (new session, same content) → same key.
+    let (mut session2, bridge2, mut corr2) = logged_in_session();
+    run(&mut session2, &bridge2, &mut corr2, Command::Prep("X".to_string()));
+    run(&mut session2, &bridge2, &mut corr2, Command::Fisc("100item".to_string()));
+    run(&mut session2, &bridge2, &mut corr2, Command::Comp(String::new()));
+    let key_a2 = bridge2.last().unwrap().idempotency_key.clone();
+
+    assert_eq!(key_a1, key_a2,
+        "same receipt content must produce the same key across sessions (content-stable)");
 }
 
 #[test]
@@ -210,11 +235,24 @@ fn comp_retry_after_bridge_failure_submits_same_canonical_envelope() {
     assert_eq!(bridge.call_count(), 1, "recovered submit is logged");
     assert!(!session.receipt_open());
 
-    // Frame order in the canonical envelope: what we sent + BOTH COMPs
-    // (because the first COMP also appended to raw_frames before failure).
+    // F1-fix: build_canonical deduplicates COMP frames — only one COMP in envelope
+    // even though raw_frames in session state has two (from the failed first attempt).
     let env = bridge.last().unwrap();
     let opcodes: Vec<&str> = env.payload.raw_frames.iter().map(|f| f.opcode.as_str()).collect();
-    assert_eq!(opcodes, vec!["FISC", "PSDt", "COMP", "COMP"]);
+    assert_eq!(opcodes, vec!["FISC", "PSDt", "COMP"]);
+
+    // F1-fix: the retry must use the SAME idempotency key as a clean first attempt.
+    // build_canonical deduplicates COMP to one frame, so the full-payload hash is
+    // identical whether this is the first attempt or a retry with an extra accumulated COMP.
+    let (mut clean, clean_b, mut clean_c) = logged_in_session();
+    run(&mut clean, &clean_b, &mut clean_c, Command::Prep("X".to_string()));
+    run(&mut clean, &clean_b, &mut clean_c, Command::Fisc("line".to_string()));
+    run(&mut clean, &clean_b, &mut clean_c, Command::Psdt("102ACQ".to_string()));
+    run(&mut clean, &clean_b, &mut clean_c, Command::Comp(String::new()));
+    let clean_key = clean_b.last().unwrap().idempotency_key;
+
+    assert_eq!(env.idempotency_key, clean_key,
+        "retry COMP must produce the same idempotency key as a clean attempt with identical content");
 }
 
 #[test]
@@ -304,6 +342,53 @@ fn return_line_opcode_marks_receipt_as_return() {
     let env = bridge.last().unwrap();
     assert_eq!(env.command_type, CommandType::Return);
     assert_eq!(env.return_check_number, None);
+}
+
+// ── Task 5: submit_report ok=false returns error ──────────────────────────────
+
+#[test]
+fn submit_report_bridge_ok_false_returns_error() {
+    // Regression guard: submit_report() must NOT return ok(None) when the
+    // bridge sets ok=false.  Previously the Ok(_) arm ignored resp.ok.
+    let (mut session, bridge, mut correlation) = logged_in_session();
+
+    // Inject ok=false for the ZREP submit.
+    bridge.set_next_response(canonical_response(false, "", "REJECTED"));
+
+    let responses = run(&mut session, &bridge, &mut correlation, Command::Zrep);
+
+    // Must return an error frame, not DONE+READY.
+    let has_error = responses.iter().any(|r| matches!(r, Response::Error(_)));
+    assert!(
+        has_error,
+        "expected Error when bridge ok=false, got: {responses:?}",
+    );
+
+    // Correlation sequence must NOT advance on failure.
+    assert_eq!(
+        correlation.receipt_seq, 0,
+        "sequence must not advance when submit_report fails",
+    );
+}
+
+#[test]
+fn submit_report_bridge_ok_true_returns_done_ready() {
+    // Positive case: ok=true must still produce DONE+READY (no regression).
+    let (mut session, bridge, mut correlation) = logged_in_session();
+
+    bridge.set_next_response(canonical_response(true, "0000000001", "ACK"));
+
+    let responses = run(&mut session, &bridge, &mut correlation, Command::Zrep);
+
+    let has_error = responses.iter().any(|r| matches!(r, Response::Error(_)));
+    assert!(
+        !has_error,
+        "expected no error when bridge ok=true, got: {responses:?}",
+    );
+    assert_eq!(
+        correlation.receipt_seq, 1,
+        "sequence must advance on success",
+    );
 }
 
 // ── Task 6: fail-close COMP dispatcher ───────────────────────────────────────
