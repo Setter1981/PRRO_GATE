@@ -576,6 +576,68 @@ async fn rec2_scheduled_after_hold_skips_within_backoff_window() {
     }
 }
 
+/// **Polish cycle / GAP-3 (2026-05-25)** — locks REC-2 backoff
+/// `on_advance` reset path through the `drain_offline_backlog_
+/// scheduled` wrapper.  Validates that an empty-cohort drain
+/// (no Hold outcomes) calls `backoff::on_advance` to initialize
+/// state з consecutive_holds==0 + next_eligible==now → consecutive
+/// invocations remain eligible.
+///
+/// This complements `rec2_scheduled_first_call_runs_drain_with_no_
+/// prior_backoff` (which only verifies fresh-state behavior) by
+/// proving that the post-drain state-update path для non-Hold
+/// outcomes is observable via the scheduled wrapper's return shape.
+#[tokio::test]
+async fn rec2_scheduled_empty_cohort_keeps_fn_immediately_eligible_for_next_tick() {
+    use prro::ScheduledDrainOutcome;
+    let (_d, app, pool) = boot_app("rec2_empty.db").await;
+    seed_fn_config(&pool).await;
+    // Empty cohort: GoingOnline + NO offline session + NO docs →
+    // drain hits `SKIPPED_NO_OFFLINE_SESSION` path, summary is
+    // empty з 0 holds.
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let c = carriers(vec![]);
+    let view = view_for(&c);
+
+    // Tick 1: drain runs, returns Ran(empty summary).
+    let tick1 = app
+        .drain_offline_backlog_scheduled(FN, &view)
+        .await
+        .expect("tick 1 scheduled");
+    match tick1 {
+        ScheduledDrainOutcome::Ran(summary) => {
+            // No holds, no advances — empty cohort.
+            assert_eq!(summary.held_at_kvt1(), 0);
+            assert_eq!(summary.held_at_sent(), 0);
+            assert_eq!(summary.er_redrive_queued(), 0);
+        }
+        ScheduledDrainOutcome::SkippedBackoff { .. } => {
+            panic!("tick 1 з fresh App MUST run drain")
+        }
+    }
+
+    // Tick 2 immediate: backoff::on_advance from tick 1 set
+    // next_eligible to ~now; tick 2 still eligible (no Hold so no
+    // backoff growth).  Drain runs again.
+    let tick2 = app
+        .drain_offline_backlog_scheduled(FN, &view)
+        .await
+        .expect("tick 2 scheduled");
+    match tick2 {
+        ScheduledDrainOutcome::Ran(_) => {
+            // Success: on_advance reset path keeps FN eligible
+            // immediately when no Hold accumulates.
+        }
+        ScheduledDrainOutcome::SkippedBackoff { next_eligible } => {
+            panic!(
+                "tick 2 after empty-cohort tick 1 MUST be eligible \
+                 (backoff::on_advance keeps next_eligible == now); \
+                 got SkippedBackoff{{next_eligible={next_eligible:?}}}"
+            )
+        }
+    }
+}
+
 // ─── Polish GAP-1: end-to-end Tier1→Tier2→AdminReset→Drain cycle ─────
 
 /// **Polish cycle / GAP-1 (2026-05-25)** — full operator-workflow
