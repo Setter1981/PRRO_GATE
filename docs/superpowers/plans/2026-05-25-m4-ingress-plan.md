@@ -1,6 +1,6 @@
 # M4 — Rust Ingress + maria304 Re-Bridge — Implementation Plan
 
-**Status:** REVISED-v3 (2026-05-25 — PR #90 senior review acceptance items folded into W2: HIGH-01 FK/CHECK enforcement; MED-01 partial-unique multi-cashier history; MED-02 threat model formalized; MED-03 missing-resolver boot semantics fully typed; MED-04 admin-runbook update mandated; LOW-01/02/03 misc cleanups)
+**Status:** REVISED-v4 (2026-05-25 — external architectural audit absorbed: HIGH-AUDIT-01 secure-db split for EDS keys; MED-AUDIT-01 tower limits on ingress; MED-AUDIT-02 verified ingress_inbox UNIQUE already present + lock test; MED-AUDIT-03 busy_timeout 5→10s + queue metrics; LOW-AUDIT-01/02 reload deferral + Conflict-audit PII hashing.  See §11.)
 **Branch start:** `docs/w12-audit-dashboard-spec` (M3b CLOSED at rust-gateway `49e11fc` per memory `project_w12_hardening_closure`)
 **Supersedes language about Python ingress in:** `docs/M3-W0-handoff.md §3` (already flagged by ADR 2026-05-07 §Propagation)
 **Anchors:**
@@ -138,13 +138,38 @@ These need an operator answer before W2+ touches code. List is short on purpose.
     we are NOT shipping that — 1С → Maria304 driver → Rust ingress is
     the path.
 
-- **A7 — Operator (cashier) EDS key storage.** *(added 2026-05-25)*
+- **A7 — Operator (cashier) EDS key storage.** *(added 2026-05-25; revised
+  by external audit HIGH-AUDIT-01 → separate DB)*
   - **WebCheck-style storage** in SQLite, NOT in TOML config. The
     decompiled WebCheck source persists per-cashier keys in an
     `OPERATORS` table (columns: `OPERATORNAME`, `INN`, `KEYPATH`,
     `KEYPASS`) with the password obfuscated via `Coding().Cod()`.
     Files are operator-supplied (`.dat` / `.pfx` / `.zs2` / `.pk8` /
     `.jks`) at paths the operator chooses.
+  - **Storage isolation — separate physical DB file** *(HIGH-AUDIT-01
+    fix)*: `operators` table lives in `var/secure.db`, NOT in
+    `var/prro.db`. Rationale: dashboard spec
+    (`2026-05-25-w12-audit-dashboard-spec.md` Option A) mounts
+    `var/prro.db` read-only into Grafana via SQLite datasource. If
+    `operators` shared the same file, any Grafana user з editor
+    rights (or via SQL-injection в a panel query) could execute
+    `SELECT key_path, key_pass_enc FROM operators` — since the
+    obfuscation is symmetric, that recovers EDS-key passwords for
+    all cashiers, enabling forged fiscal documents.
+    **Mitigation**: split storage:
+    - `var/prro.db` (chmod 644) — transactional documents +
+      audit_log + ingress_inbox + node_state + shifts. Mountable
+      read-only into Grafana.
+    - `var/secure.db` (chmod 600, root + prro service user only) —
+      `operators` table ONLY. NEVER mounted into ANY external
+      monitoring/diagnostic system. Grafana plugin has no access
+      path to this file.
+    Two `SqlitePool` instances inside App: `pool_main` (existing
+    one) + `pool_secure` (new, for operators registry only).
+    Cross-DB joins are not used by W2 — `BindingsRegistry::
+    build_from_db` reads `operators` rows from `pool_secure`,
+    then validates each `fiscal_number` against `fiscal_number_config`
+    in `pool_main` via a separate query.
   - **Recommendation: mirror this model in `prro` SQLite.** New
     migration adds:
     ```sql
@@ -155,9 +180,8 @@ These need an operator answer before W2+ touches code. List is short on purpose.
         key_pass_enc  BLOB NOT NULL,           -- obfuscated, NOT crypto-strong
         fiscal_number TEXT NOT NULL
             CHECK (LENGTH(fiscal_number) = 10
-                   AND fiscal_number GLOB '[0-9]*')
-            REFERENCES fiscal_number_config(fiscal_number)
-            ON DELETE RESTRICT,             -- HIGH-PR90-01 review fix
+                   AND fiscal_number GLOB '[0-9]*'),
+                                            -- HIGH-PR90-01 review fix
         is_active     INTEGER NOT NULL DEFAULT 1
             CHECK (is_active IN (0, 1)),    -- MED-PR90-01 review fix
         created_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
@@ -166,11 +190,20 @@ These need an operator answer before W2+ touches code. List is short on purpose.
         ON operators(fiscal_number, is_active)
         WHERE is_active = 1;
     ```
-    **HIGH-PR90-01 review fix:** `fiscal_number` carries the same
-    10-digit CHECK as other FN-bearing tables AND a FK reference to
-    `fiscal_number_config` — admin CLI cannot insert a row for an
-    unconfigured FN.  `ON DELETE RESTRICT` prevents removing an FN
-    from `fiscal_number_config` while operators still reference it.
+    **HIGH-PR90-01 + HIGH-AUDIT-01 combined fix:** `fiscal_number`
+    carries the 10-digit CHECK in-table.  **FK to
+    `fiscal_number_config` is NOT used** because that table lives
+    в `var/prro.db` while `operators` lives в `var/secure.db` —
+    SQLite cross-database FKs are not supported, and merging the
+    tables would re-introduce HIGH-AUDIT-01.  Instead, the admin
+    CLI (`prro admin add-operator`) performs the existence check
+    at insert time: SELECT against `pool_main.fiscal_number_config`
+    BEFORE INSERT into `pool_secure.operators`; refuse w typed
+    error if FN does not exist.  Same protection at boot:
+    `BindingsRegistry::build_from_db` cross-checks each
+    `operators.fiscal_number` against `fiscal_number_config`;
+    orphaned rows emit Critical audit `OPERATOR_ORPHAN_FN` + are
+    excluded from the registry.
     **MED-PR90-01 review fix:** UNIQUE on `fiscal_number` was too
     strict for the real production case (50 points / 70 casses → 1.4
     cashier/cash-register avg per `user_operator_profile`).  Relaxed
@@ -956,21 +989,21 @@ precedent.
 
 ---
 
-## 6. Estimates *(revised 2026-05-25 v3 — W2 +0.5d from PR #90 senior review)*
+## 6. Estimates *(revised 2026-05-25 v4 — external audit findings absorbed; see §11)*
 
 | Worklet | Estimate (working days) | Cumulative |
 |---|---:|---:|
 | W1 axum deps + module skeleton | 0.5 | 0.5 |
-| W2 OperatorBindings + migration 020 + admin CLI + review acceptance items | 2.5 | 3.0 |
-| W3 DTO parity + canonical mapping | 1.0 | 4.0 |
-| W4 Per-FN supervisor + worker | 2.5 | 6.5 |
-| W5 Response builder | 1.0 | 7.5 |
-| W6 HTTP handler + axum router | 2.0 | 9.5 |
-| W7 Cmd::Serve orchestration | 1.5 | 11.0 |
-| W8 maria304 re-bridge + smoke | 1.5 | 12.5 |
-| W9 Live DPS smoke via ingress | 1.0 | 13.5 |
+| W2 OperatorBindings + migration 020 + admin CLI + secure-db split + reviews | 3.0 | 3.5 |
+| W3 DTO parity + canonical mapping + inbox UNIQUE race test | 1.25 | 4.75 |
+| W4 Per-FN supervisor + worker | 2.5 | 7.25 |
+| W5 Response builder | 1.0 | 8.25 |
+| W6 HTTP handler + axum router + tower limits + PII hash | 2.5 | 10.75 |
+| W7 Cmd::Serve orchestration + busy_timeout bump + /metrics stub | 1.75 | 12.5 |
+| W8 maria304 re-bridge + smoke | 1.5 | 14.0 |
+| W9 Live DPS smoke via ingress | 1.0 | 15.0 |
 
-**Total M4 estimate: 13.5 working days ≈ 3 calendar weeks** at the
+**Total M4 estimate: 15.0 working days ≈ 3.5 calendar weeks** at the
 M3a/M3b discipline cadence (review cycles, scope-creep guards,
 operator pin checks). Matches ADR 2026-05-07's "M4 — 4-6 weeks" upper
 bound if review rounds add 1-2 weeks of cycle.
@@ -1075,3 +1108,91 @@ single PR. Each merges to `main` independently per project CLAUDE.md
 "branch / git behavior". Operator pin `feedback_autonomous_isolated_env`
 authorises file/branch operations without confirm, but per-worklet PR
 discipline is preserved.
+
+---
+
+## 11. External Architectural Audit — 2026-05-25
+
+External audit landed з 6 risk findings. Verification + plan response:
+
+| # | Risk | Severity | Verified state | Action |
+|---|---|---|---|---|
+| HIGH-AUDIT-01 | EDS keys в `operators` leak via Grafana SQLite datasource (read-only mount NOT sufficient — any SELECT can recover obfuscated passwords) | HIGH | **Real gap** — plan + dashboard spec together created vulnerability surface | Split DB: `var/prro.db` (Grafana-mountable) + `var/secure.db` (chmod 600, operators only). A7 + W2 updated above. |
+| MED-AUDIT-01 | Axum exhaustion on slow DPS (sync-await holds sockets open during 10-12s DPS roundtrip; cascading client timeouts + thread starvation) | MED | **Real gap** — W6 spec не specified tower limits | W6 acceptance items added below (ConcurrencyLimit + TimeoutLayer). |
+| MED-AUDIT-02 | `ingress_inbox` UNIQUE on `(fiscal_number, idempotency_key)` race — double fiscalization if missing | MED | **ALREADY MITIGATED** ✅ — verified `migrations/002_fiscal_documents.sql:91`: `CREATE UNIQUE INDEX ux_inbox_fn_idem ON ingress_inbox(fiscal_number, idempotency_key)`. | Add explicit verification test in W6 (`ingress_inbox_unique_race.rs`) to lock the guarantee against future schema drift. |
+| MED-AUDIT-03 | SQLite lock contention at 50-cash burst (busy_timeout may saturate) | MED | **PARTIAL** — `db/mod.rs:21` already sets `busy_timeout = 5s`; audit recommends 10s | Increase to 10s in `db/mod.rs` as part of W7 (boot wiring touches this file anyway). Add per-FN queue-depth + tx-duration metrics в `/metrics` stub. |
+| LOW-AUDIT-01 | Operator key fix requires full prro restart → service interruption на all FNs | LOW | **Real gap, deferred** | W2 acceptance: document the restart requirement в admin-runbook + create TD ticket для M5 dynamic-reload mechanism (`prro admin reload-operator --fn <FN>` style). |
+| LOW-AUDIT-02 | Conflict (409) audit logs full payload — possible PII (customer fiscal codes, names) | LOW | **Real gap** | W6 acceptance: Conflict audit logs `payload_sha256` (hex) + first 64 chars of payload, NOT full payload. |
+
+### Worklet acceptance updates from audit
+
+**A7 / W2** (above):
+- `operators` table moved to `var/secure.db` з chmod 600.
+- FK to `fiscal_number_config` replaced з admin-CLI + boot-time
+  cross-DB validation (`OPERATOR_ORPHAN_FN` Critical audit).
+- Test added: `tests/operators_db_isolation.rs` — assert
+  `var/prro.db` does NOT contain `operators` table; assert
+  `var/secure.db` chmod is `0o600`.
+- Test added: `tests/operators_orphan_fn_audit.rs` — INSERT row
+  with FN absent from `fiscal_number_config` (via direct sqlx in
+  test setup); boot → `OPERATOR_ORPHAN_FN` Critical audit + FN
+  absent from registry.
+
+**W6** (HTTP handler):
+- New acceptance: `tower::limit::ConcurrencyLimit::new(N)` wraps
+  the ingress router. `N` defaults to 32 (configurable via
+  `[ingress] max_concurrent_requests`). On limit-exceeded → 503
+  з `error_code = "GATEWAY_BUSY"` + `Retry-After: 1`.
+- New acceptance: `tower_http::timeout::TimeoutLayer::new(14s)`
+  wraps the ingress router. Client driver default is 15s → 14s
+  reserved для client-visible timeout window vs gateway-side
+  hard cut. Documented в plan §1.2 (sync-await rationale section).
+- New acceptance: Conflict audit (event_type =
+  `INGRESS_IDEMPOTENCY_CONFLICT`) logs:
+    - `payload_sha256` (hex, 64 chars)
+    - `payload_preview` (first 64 chars of payload — diagnostic
+      enough to spot the malformed prefix without exposing full
+      PII)
+    - NOT the full payload.
+- Test added: `tests/handler_concurrency_limit.rs` — submit 33
+  concurrent requests, assert 32 process + 1 gets 503/Retry-After.
+- Test added: `tests/handler_timeout_layer.rs` — mock DPS that
+  sleeps 20s, assert handler returns 504 at 14s з proper error
+  body; document doc transitions through reconciliation на next
+  boot (no orphaned in-flight state).
+- Test added: `tests/conflict_audit_no_pii.rs` — submit two
+  requests з same `idempotency_key` різний payload (з
+  PII-looking content); audit row's `payload_preview` field has
+  exactly 64 chars + has `payload_sha256` = expected hash;
+  audit_log does NOT contain the full payload as a substring.
+
+**W3** (DTO + canonical mapping):
+- New acceptance: `tests/ingress_inbox_unique_race.rs` — spawn 2
+  tokio tasks doing parallel `ingress_inbox::insert` for the same
+  `(fn, idem_key, payload_hash)` → exactly one wins з `Created`,
+  the other gets `Replay(row)`. Asserts the `ux_inbox_fn_idem`
+  index does its job under contention.
+
+**W7** (Cmd::Serve orchestration):
+- New acceptance: `rust/prro/src/db/mod.rs:21` `busy_timeout`
+  bumped from `5s` to `10s` (MED-AUDIT-03). Bump landed in W7 PR
+  not W2 — W7 already touches boot wiring + adds a `/metrics`
+  endpoint surface, natural home для the change.
+- New acceptance: `/metrics` stub exposes per-FN queue depth +
+  per-stage transaction duration histogram (Prometheus exposition
+  format).
+- New acceptance: admin-runbook documents the "restart prro after
+  operator key change" procedure (LOW-AUDIT-01).
+
+### Estimate impact
+
+| Worklet | v3 estimate | v4 (post-audit) | Delta reason |
+|---|---:|---:|---|
+| W2 | 2.5d | **3.0d** | +0.5d: cross-DB validation + orphan-FN audit + db isolation tests |
+| W3 | 1.0d | **1.25d** | +0.25d: ingress_inbox UNIQUE race test |
+| W6 | 2.0d | **2.5d** | +0.5d: tower limits + timeout + Conflict PII hash + 3 new tests |
+| W7 | 1.5d | **1.75d** | +0.25d: busy_timeout bump + /metrics stub |
+| **M4 total** | 13.5d | **15.0d** | +1.5d for hardened pilot |
+
+Plan estimate stays within ADR-2026-05-07's "M4 — 4-6 weeks" window
+(15 working days ≈ 3.5 calendar weeks at M3a/M3b discipline cadence).
