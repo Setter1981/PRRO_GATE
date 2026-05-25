@@ -7,6 +7,86 @@ use sqlx::SqlitePool;
 use std::path::Path;
 use std::str::FromStr;
 
+/// W2 / HIGH-AUDIT-01 — open the **secure** SQLite pool.
+///
+/// Distinct from [`open_pool`] in three ways:
+///
+///   1. Migration set is `./migrations_secure/` (currently a single
+///      migration 020 creating the `operators` table).  See
+///      `rust/prro/migrations_secure/README.md` for why this lives in
+///      a separate directory.
+///   2. After open, the underlying file is `chmod 0o600` (owner read/
+///      write only) on Unix.  Defense-in-depth: prevents accidental
+///      world-readable misconfiguration of the cashier-key store.
+///      Windows has no equivalent mode bit; the chmod is a no-op via
+///      `cfg(unix)` and the platform's ACL story applies separately.
+///   3. The pool has the same PRAGMA tuning as [`open_pool`] (WAL,
+///      foreign_keys ON, NORMAL synchronous, busy_timeout 5s) so the
+///      secure file behaves identically under concurrent access.
+///
+/// Failure modes:
+///
+///   - Path parent missing → sqlx returns the underlying IO error.
+///   - Migration checksum mismatch → sqlx refuses to apply.
+///   - `chmod` failure → returned as `anyhow::Error` so boot fails
+///     fast rather than silently leaving the file world-readable.
+pub async fn open_secure_pool(path: &Path) -> anyhow::Result<SqlitePool> {
+    let url = format!("sqlite:{}", path.display());
+    let opts = SqliteConnectOptions::from_str(&url)?
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_secs(5));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(4)
+        .connect_with(opts)
+        .await?;
+    sqlx::migrate!("./migrations_secure").run(&pool).await?;
+
+    // HIGH-AUDIT-01: enforce owner-only mode on the secure file AND
+    // its WAL sidecars.  SQLite in WAL journal mode produces three
+    // physical files: `<path>` (the main DB), `<path>-wal` (the
+    // un-checkpointed write-ahead log), and `<path>-shm` (the shared
+    // memory mapping).  Newly written rows — including the cashier
+    // `key_pass_enc` BLOBs that motivate this whole isolation —
+    // land in `-wal` before the next checkpoint flushes them to the
+    // main file.  If only the main file is chmod'd to 0o600 then
+    // `-wal` retains the process umask (typically 0o644 / 0o666),
+    // leaving the un-checkpointed write log world-readable on disk
+    // and defeating the HIGH-AUDIT-01 isolation guarantee.
+    //
+    // We chmod each sidecar to 0o600 if it exists.  Existence is
+    // checked because `-wal` and `-shm` are created lazily by SQLite
+    // on first write; the migration apply above performed writes so
+    // they are normally present, but we tolerate their absence (e.g.,
+    // pristine open then close without writes never creates them).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let main_path = path.as_os_str().to_owned();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut sidecar = main_path.clone();
+            sidecar.push(suffix);
+            let sidecar = std::path::PathBuf::from(sidecar);
+            // No TOCTOU: fetch metadata directly and tolerate NotFound
+            // (sidecars are lazy; SQLite may delete `-wal` between an
+            // existence check and the metadata call during a concurrent
+            // checkpoint).  Other IO errors propagate fail-closed.
+            let meta = match std::fs::metadata(&sidecar) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&sidecar, perms)?;
+        }
+    }
+
+    Ok(pool)
+}
+
 /// Open a connection pool against the given SQLite file.
 ///
 /// Sets WAL journal mode, busy_timeout 5s, foreign_keys ON, NORMAL synchronous.

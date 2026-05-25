@@ -8,6 +8,7 @@ version  = "0.1.0"
 
 [database]
 db_path = "{db_path}"
+secure_db_path = "{db_path}_secure"
 
 [admin_ui]
 enabled = false
@@ -24,6 +25,7 @@ version  = "0.1.0"
 
 [database]
 db_path = "/tmp/x.db"
+secure_db_path = "/tmp/x_secure.db"
 
 [admin_ui]
 enabled = true
@@ -44,6 +46,7 @@ version  = "0.1.0"
 
 [database]
 db_path = "/tmp/x.db"
+secure_db_path = "/tmp/x_secure.db"
 
 [admin_ui]
 enabled = false
@@ -61,6 +64,7 @@ version  = "0.1.0"
 
 [database]
 db_path = "/tmp/x.db"
+secure_db_path = "/tmp/x_secure.db"
 "#;
     AppConfig::from_toml(no_admin).expect_err("missing [admin_ui] must error");
 

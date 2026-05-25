@@ -22,6 +22,19 @@ pub struct AppConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DatabaseCfg {
     pub db_path: PathBuf,
+
+    /// W2 / HIGH-AUDIT-01 — physical path to the **secure** SQLite
+    /// database holding only the `operators` table (cashier EDS-key
+    /// registry).  Hard isolation from `db_path`: separate file,
+    /// separate pool, separate migrations dir (`migrations_secure/`),
+    /// chmod 0o600 enforced at open time.
+    ///
+    /// **No default** — fail-closed.  Operators must explicitly choose
+    /// a path so the secure DB never accidentally lands inside the
+    /// main DB's directory or under a world-readable tree.  Existing
+    /// configs predating W2 will fail to parse until updated; this is
+    /// intentional per the external architectural audit (HIGH-AUDIT-01).
+    pub secure_db_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,5 +100,56 @@ impl OfflineCfg {
 impl AppConfig {
     pub fn from_toml(s: &str) -> anyhow::Result<Self> {
         Ok(toml::from_str(s)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PR-A iter 1 — parses `[database].secure_db_path` field
+    /// (HIGH-AUDIT-01 secure-db hard isolation; W2 plan §3 W2).
+    #[test]
+    fn parses_secure_db_path_field() {
+        let toml = r#"
+            app_name = "prro"
+            version = "0.1.0"
+
+            [database]
+            db_path = "var/prro.db"
+            secure_db_path = "var/secure.db"
+
+            [admin_ui]
+            enabled = false
+            listen = "127.0.0.1:8081"
+        "#;
+        let cfg = AppConfig::from_toml(toml).expect("parse must succeed");
+        assert_eq!(cfg.database.secure_db_path, PathBuf::from("var/secure.db"));
+    }
+
+    /// PR-A iter 1 — missing `secure_db_path` is a parse error.
+    /// Fail-closed: HIGH-AUDIT-01 requires the operator to explicitly
+    /// choose a path so the secure DB never accidentally lands inside
+    /// the main DB's directory.  No silent default.
+    #[test]
+    fn missing_secure_db_path_is_parse_error() {
+        let toml = r#"
+            app_name = "prro"
+            version = "0.1.0"
+
+            [database]
+            db_path = "var/prro.db"
+
+            [admin_ui]
+            enabled = false
+            listen = "127.0.0.1:8081"
+        "#;
+        let err = AppConfig::from_toml(toml)
+            .expect_err("must fail without secure_db_path (fail-closed)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("secure_db_path"),
+            "expected error mentioning secure_db_path, got: {msg}"
+        );
     }
 }
