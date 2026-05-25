@@ -1,17 +1,22 @@
 //! W2 PR-A iter 3 — `db::open_secure_pool` opens the secure database,
-//! runs `migrations_secure/`, and chmods the file to 0o600.
+//! runs `migrations_secure/`, and chmods the file (and WAL sidecars)
+//! to 0o600.
 //!
-//! Three contracts:
+//! Four contracts:
 //!
 //!   1. Fresh open creates the file with the operators schema applied
 //!      and `_sqlx_migrations` recording version 20 (HIGH-AUDIT-01
 //!      isolation: the file MUST be the secure file, separate from
 //!      `db_path`).
-//!   2. The file is chmod 0o600 after open — owner read/write only.
-//!      Defense-in-depth against world-readable misconfiguration
-//!      (HIGH-AUDIT-01 hard-isolation callout).
-//!   3. Re-opening an existing secure DB is idempotent: no second
-//!      migration apply (checksum guard), permissions re-asserted.
+//!   2. The main file is chmod 0o600 after open — owner read/write
+//!      only.
+//!   3. The WAL sidecars (`-wal`, `-shm`) are also chmod 0o600 when
+//!      present — required by HIGH-AUDIT-01 because `-wal` contains
+//!      un-checkpointed writes (including `key_pass_enc` BLOBs from
+//!      PR-B's `add-operator` CLI) in plaintext.  Leaving them at
+//!      umask would defeat the isolation.
+//!   4. Re-opening an existing secure DB is idempotent: no second
+//!      migration apply (checksum guard).
 
 use sqlx::Row;
 use std::os::unix::fs::PermissionsExt;
@@ -65,8 +70,51 @@ async fn open_secure_pool_chmods_file_to_owner_only() {
     );
 }
 
+/// HIGH-AUDIT-01 — `-wal` and `-shm` sidecars must also be 0o600.
+/// SQLite creates them lazily on first write; the migration apply
+/// in `open_secure_pool` performs writes that materialize both.
+/// Without this chmod, un-checkpointed cashier-key BLOBs sit in
+/// `-wal` under the process umask, world-readable, defeating the
+/// isolation property the secure DB exists for.
+#[cfg(unix)]
+#[tokio::test]
+async fn open_secure_pool_chmods_wal_and_shm_sidecars() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("secure.db");
+
+    let pool = prro::db::open_secure_pool(&path).await.expect("open");
+
+    // Force WAL activity so sidecars exist and are non-empty.
+    sqlx::query(
+        "INSERT INTO operators \
+            (operator_id, fiscal_number, name, key_path, key_pass_enc) \
+         VALUES ('OP-CHMOD-WAL', '4000000001', 'Test', '/tmp/k.dat', X'cafe')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert forces WAL write");
+
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = std::path::PathBuf::from(format!(
+            "{}{}",
+            path.display(),
+            suffix
+        ));
+        assert!(
+            sidecar.exists(),
+            "sidecar {sidecar:?} must exist after WAL write"
+        );
+        let meta = std::fs::metadata(&sidecar).expect("stat sidecar");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "sidecar {sidecar:?} must be chmod 0o600 (got {mode:o})"
+        );
+    }
+}
+
 /// Re-opening the same secure DB does not re-apply migration 020
-/// (sqlx checksum gate) and re-asserts permissions.
+/// (sqlx checksum gate).
 #[tokio::test]
 async fn open_secure_pool_is_idempotent_on_second_open() {
     let dir = tempfile::tempdir().expect("tempdir");

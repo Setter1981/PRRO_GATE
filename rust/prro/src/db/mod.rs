@@ -44,14 +44,38 @@ pub async fn open_secure_pool(path: &Path) -> anyhow::Result<SqlitePool> {
         .await?;
     sqlx::migrate!("./migrations_secure").run(&pool).await?;
 
-    // HIGH-AUDIT-01: enforce owner-only mode on the secure file.
-    // Done after migrations so the file is guaranteed to exist.
+    // HIGH-AUDIT-01: enforce owner-only mode on the secure file AND
+    // its WAL sidecars.  SQLite in WAL journal mode produces three
+    // physical files: `<path>` (the main DB), `<path>-wal` (the
+    // un-checkpointed write-ahead log), and `<path>-shm` (the shared
+    // memory mapping).  Newly written rows — including the cashier
+    // `key_pass_enc` BLOBs that motivate this whole isolation —
+    // land in `-wal` before the next checkpoint flushes them to the
+    // main file.  If only the main file is chmod'd to 0o600 then
+    // `-wal` retains the process umask (typically 0o644 / 0o666),
+    // leaving the un-checkpointed write log world-readable on disk
+    // and defeating the HIGH-AUDIT-01 isolation guarantee.
+    //
+    // We chmod each sidecar to 0o600 if it exists.  Existence is
+    // checked because `-wal` and `-shm` are created lazily by SQLite
+    // on first write; the migration apply above performed writes so
+    // they are normally present, but we tolerate their absence (e.g.,
+    // pristine open then close without writes never creates them).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
+        let main_path = path.as_os_str().to_owned();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut sidecar = main_path.clone();
+            sidecar.push(suffix);
+            let sidecar = std::path::PathBuf::from(sidecar);
+            if !sidecar.exists() {
+                continue;
+            }
+            let mut perms = std::fs::metadata(&sidecar)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&sidecar, perms)?;
+        }
     }
 
     Ok(pool)

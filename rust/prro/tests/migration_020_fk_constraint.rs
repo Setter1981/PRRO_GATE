@@ -1,25 +1,17 @@
 //! W2 PR-A iter 5 — HIGH-PR90-01 CHECK enforcement on `operators`.
 //!
-//! Per plan §3 W2 Tests / Acceptance HIGH-PR90-01:
-//!   "migration 020 enforces 10-digit numeric `fiscal_number` CHECK +
-//!    FK to fiscal_number_config(fiscal_number) ON DELETE RESTRICT.
-//!    Test `migration_020_fk_constraint.rs` proves both rejections."
-//!
-//! ## FK gap
-//!
-//! The cross-DB FK from `operators.fiscal_number` (in `secure.db`) to
-//! `fiscal_number_config.fiscal_number` (in `prro.db`) **cannot be
-//! enforced by SQLite** — foreign keys do not cross database files.
-//! The W2 plan acknowledges this and pushes the FK semantics to two
-//! runtime compensating checks (CLI pre-INSERT + boot registry build).
-//! See `migrations_secure/020_operators.sql` doc-block "Cross-DB
-//! foreign-key gap" for the full rationale.
-//!
-//! This fixture therefore covers only the **CHECK constraint half**
-//! of HIGH-PR90-01: 11-digit, 9-digit, non-numeric, and empty
-//! `fiscal_number` are all rejected at the DB layer.  The FK half
-//! lands its tests in W2 PR-B alongside `BindingsRegistry::build_from_db`
-//! (file `operator_orphan_fn_audit.rs`) and the admin CLI pre-check.
+//! Per plan §3 W2 Acceptance HIGH-PR90-01: migration 020 enforces a
+//! 10-digit numeric `fiscal_number` CHECK at the DB layer plus an FK
+//! to `fiscal_number_config(fiscal_number)`.  The cross-DB FK half
+//! cannot be expressed as SQL because SQLite foreign keys do not span
+//! database files (see `migrations_secure/020_operators.sql` doc-block
+//! "Cross-DB foreign-key gap"); it is implemented as runtime
+//! compensating checks in PR-B (`BindingsRegistry::build_from_db` +
+//! admin CLI pre-INSERT).  This fixture covers **only the CHECK
+//! half**: 11-digit, 9-digit, non-numeric, and mixed alphanumeric
+//! `fiscal_number` are all DB-rejected; valid 10-digit numeric is
+//! accepted; out-of-range `is_active` is DB-rejected.  The FK-orphan
+//! coverage lands in W2 PR-B as `operator_orphan_fn_audit.rs`.
 
 use sqlx::SqlitePool;
 

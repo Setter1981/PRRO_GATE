@@ -52,6 +52,16 @@
 --     Rotation history rows (`is_active = 0`) are unconstrained.
 
 CREATE TABLE operators (
+    -- Surrogate `id` primary key.  `operator_id` is the cashier-facing
+    -- identifier (typically the cashier's INN per `prro admin
+    -- add-operator --inn`); it is intentionally NOT unique on its own
+    -- so the same cashier can appear as historical (is_active = 0)
+    -- rows across multiple FNs or repeat stints on the same FN.  The
+    -- partial unique index `operators_active_fn_uidx` enforces the
+    -- only structural uniqueness requirement: exactly one active
+    -- cashier per fiscal_number.  See PR-B's repository layer for
+    -- the CRUD contract.
+    id              INTEGER PRIMARY KEY,
     operator_id     TEXT    NOT NULL,
     fiscal_number   TEXT    NOT NULL
         CHECK (length(fiscal_number) = 10
@@ -62,7 +72,7 @@ CREATE TABLE operators (
     is_active       INTEGER NOT NULL DEFAULT 1
         CHECK (is_active IN (0, 1)),
     created_at      TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+) STRICT;
 
 -- MED-PR90-01: exactly one active cashier per fiscal_number.
 -- Historical rows (`is_active = 0`) are NOT covered by this index,
