@@ -63,6 +63,7 @@ version  = "0.1.0"
 
 [database]
 db_path = "{}"
+secure_db_path = "secure.db"
 
 [admin_ui]
 enabled = false

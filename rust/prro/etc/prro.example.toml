@@ -3,6 +3,7 @@ version  = "0.1.0"
 
 [database]
 db_path = "var/prro.sqlite3"
+secure_db_path = "var/prro_secure.sqlite3"
 
 [admin_ui]
 enabled = false

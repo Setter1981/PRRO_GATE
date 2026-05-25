@@ -7,6 +7,56 @@ use sqlx::SqlitePool;
 use std::path::Path;
 use std::str::FromStr;
 
+/// W2 / HIGH-AUDIT-01 — open the **secure** SQLite pool.
+///
+/// Distinct from [`open_pool`] in three ways:
+///
+///   1. Migration set is `./migrations_secure/` (currently a single
+///      migration 020 creating the `operators` table).  See
+///      `rust/prro/migrations_secure/README.md` for why this lives in
+///      a separate directory.
+///   2. After open, the underlying file is `chmod 0o600` (owner read/
+///      write only) on Unix.  Defense-in-depth: prevents accidental
+///      world-readable misconfiguration of the cashier-key store.
+///      Windows has no equivalent mode bit; the chmod is a no-op via
+///      `cfg(unix)` and the platform's ACL story applies separately.
+///   3. The pool has the same PRAGMA tuning as [`open_pool`] (WAL,
+///      foreign_keys ON, NORMAL synchronous, busy_timeout 5s) so the
+///      secure file behaves identically under concurrent access.
+///
+/// Failure modes:
+///
+///   - Path parent missing → sqlx returns the underlying IO error.
+///   - Migration checksum mismatch → sqlx refuses to apply.
+///   - `chmod` failure → returned as `anyhow::Error` so boot fails
+///     fast rather than silently leaving the file world-readable.
+pub async fn open_secure_pool(path: &Path) -> anyhow::Result<SqlitePool> {
+    let url = format!("sqlite:{}", path.display());
+    let opts = SqliteConnectOptions::from_str(&url)?
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_secs(5));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(4)
+        .connect_with(opts)
+        .await?;
+    sqlx::migrate!("./migrations_secure").run(&pool).await?;
+
+    // HIGH-AUDIT-01: enforce owner-only mode on the secure file.
+    // Done after migrations so the file is guaranteed to exist.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+
+    Ok(pool)
+}
+
 /// Open a connection pool against the given SQLite file.
 ///
 /// Sets WAL journal mode, busy_timeout 5s, foreign_keys ON, NORMAL synchronous.
