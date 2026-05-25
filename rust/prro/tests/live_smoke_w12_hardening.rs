@@ -74,6 +74,50 @@ fn resolve_endpoint() -> String {
     std::env::var(ENV_VAR_ENDPOINT).unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string())
 }
 
+/// **Live Smoke A0 — DPS connect-only handshake (2026-05-25)**.
+///
+/// **Purpose**: cheapest possible reachability test — just `GrpcDpsChannel
+/// ::connect`, no RPC call.  Separates "TCP + TLS handshake works" from
+/// "actual gRPC RPC reaches DPS application layer".  Use коли Smoke A
+/// fails з `gRPC Unknown: transport error` to differentiate:
+///   - A0 PASS + A FAIL = handshake works, but mTLS / client cert /
+///     gRPC negotiation issue post-handshake (likely operator-env mismatch).
+///   - A0 FAIL = TCP/TLS broken (DNS / network / firewall / cert
+///     trust store / endpoint URI).
+///
+/// **Method**: `GrpcDpsChannel::connect` only.  Connection is eagerly
+/// established per `connect()` doc — connect-time TLS handshake + HTTP/2
+/// SETTINGS exchange happen here.  Drop channel immediately after.
+///
+/// **Pass criterion**: connect succeeds.
+/// **Fail criterion**: connect returns Err (Transport / invalid URI / etc.).
+#[tokio::test]
+#[ignore = "live DPS endpoint required; opt-in via cargo test -- --ignored"]
+async fn live_smoke_a0_dps_connect_only_handshake() {
+    let endpoint = resolve_endpoint();
+    println!("\n=== Live Smoke A0: DPS connect-only handshake ===");
+    println!("Endpoint: {endpoint}");
+    println!("Timeout:  {SMOKE_TIMEOUT_SECS}s\n");
+
+    let result = GrpcDpsChannel::connect(&endpoint, Duration::from_secs(SMOKE_TIMEOUT_SECS)).await;
+
+    match result {
+        Ok(_channel) => {
+            println!(
+                "Smoke A0 PASS: TCP + TLS handshake + HTTP/2 SETTINGS exchange \
+                 OK (channel established eagerly per connect() contract)"
+            );
+        }
+        Err(e) => {
+            panic!(
+                "Smoke A0 FAIL: GrpcDpsChannel::connect — TCP / TLS handshake \
+                 / DNS / firewall / cert trust store broken.  Endpoint: \
+                 {endpoint}.  Error: {e:?}"
+            );
+        }
+    }
+}
+
 /// **Live Smoke A — DPS reachability ping (2026-05-25)**.
 ///
 /// **Purpose**: confirms Rust `GrpcDpsChannel` can establish TLS
