@@ -63,6 +63,7 @@ Rust gateway has **no Prometheus / metrics-exporter-prometheus** dependency. The
 - Pro: zero deploy footprint, queries в spec нижче ready-to-paste.
 - Con: SQLite WAL read concurrency limit on busy node; recommended `PRAGMA wal_autocheckpoint` + `journal_mode=WAL` (already set by Rust gateway init).
 - **Read-only mount mandatory**: dashboard plugin must not be able to write — audit_log integrity is forensic-grade.
+- **⚠ HARD ISOLATION REQUIREMENT (HIGH-AUDIT-01 fix, 2026-05-25):** Grafana **MUST NEVER** be granted access to `var/secure.db`. That file (chmod 600, root + prro service user only) holds the `operators` table з cashier EDS-key paths + obfuscated passwords. Mounting `secure.db` read-only into Grafana would expose `SELECT key_path, key_pass_enc FROM operators` to any user з editor rights (or via SQL injection in panel queries) — the symmetric obfuscation is NOT crypto-strong, and recovered passwords would enable forged fiscal documents. **Only `var/prro.db` is Grafana-mountable.** See M4 plan §11 (`docs/superpowers/plans/2026-05-25-m4-ingress-plan.md`) for the secure-db split decision in full.
 
 ### Option B — Periodic exporter sidecar (post-pilot evolution)
 
