@@ -35,6 +35,9 @@ impl MockBridge {
     }
 
     /// Force the next submit to return this response (one-shot).
+    ///
+    /// # Panics
+    /// If a concurrent submit poisoned the mutex.
     pub fn set_next_response(&self, resp: CanonicalResponse) {
         *self.forced_response.lock().expect("MockBridge mutex poisoned") = Some(resp);
     }

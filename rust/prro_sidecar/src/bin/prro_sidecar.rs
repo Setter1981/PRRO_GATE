@@ -40,7 +40,8 @@ use prro_sidecar::{
     grpc_client::DpsGrpcPool,
     input::{CanonicalCommand, OperationType},
     license::LicenseState,
-    repo::Repo,
+    repo::{PendingInsertResult, Repo},
+    validate_envelope,
     xml_builder::{self, BuildContext},
 };
 
@@ -78,6 +79,8 @@ async fn main() {
     } else {
         subscriber.json().init();
     }
+
+    prro_sidecar::license::check_embedded_pubkeys();
 
     let repo = Repo::open(&config.db.path).unwrap_or_else(|e| {
         eprintln!("db error: {e}");
@@ -125,6 +128,24 @@ async fn main() {
         });
     }
 
+    // C2: cleanup stale 'pending' idempotency rows every 60 s.
+    // Rows older than 120 s represent in-flight requests with unknown DPS outcome
+    // (timeout / crash).  They are transitioned to 'ambiguous' (not deleted) so
+    // subsequent retries are blocked until ops or reconciliation resolves them.
+    {
+        let cleanup_repo = Arc::clone(&state.repo);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                match cleanup_repo.cleanup_stale_pending(120) {
+                    Ok(n) if n > 0 => tracing::info!(n, "cleared stale pending idempotency rows"),
+                    Err(e) => tracing::warn!(err = %e, "cleanup_stale_pending failed"),
+                    _ => {}
+                }
+            }
+        });
+    }
+
     let app = Router::new()
         .route("/fiscal/send",  post(handle_fiscal_send))
         .route("/health/live",  get(health_live))
@@ -149,22 +170,35 @@ async fn health_live() -> StatusCode {
 }
 
 async fn health_ready(State(st): State<AppState>) -> StatusCode {
-    match st.repo.load_active_license() {
-        Ok(_)  => StatusCode::OK,
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    // Load the active row, then validate sig + expiry so an expired or
+    // tampered license is caught here rather than on the first fiscal send.
+    // TIN / FN membership is not checked — readiness is per-instance, not
+    // per fiscal-number (those are validated in handle_fiscal_send).
+    let row = match st.repo.load_active_license() {
+        Ok(r)  => r,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE,
+    };
+    let now = time::OffsetDateTime::now_utc();
+    match prro_sidecar::license::verify_signature_only(&row.payload_b64, &row.signature_b64, now) {
+        Ok(prro_sidecar::license::LicenseState::Valid)
+        | Ok(prro_sidecar::license::LicenseState::Grace { .. })
+        | Ok(prro_sidecar::license::LicenseState::Demo  { .. }) => StatusCode::OK,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
 // ── Fiscal send ───────────────────────────────────────────────────────────────
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct FiscalSendResponse {
-    status:        i32,
-    fiscal_id:     String,
+    status:             i32,
+    fiscal_id:          String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error_message: Option<String>,
+    error_message:      Option<String>,
     #[serde(default)]
-    chain_broken:  bool,
+    chain_broken:       bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dps_error_category: Option<String>,
 }
 
 async fn handle_fiscal_send(
@@ -173,7 +207,17 @@ async fn handle_fiscal_send(
 ) -> impl IntoResponse {
     // Per-request wall-clock timeout: TSP HTTP (≤5 s) + gRPC (≤? s) + signing.
     match tokio::time::timeout(REQUEST_TIMEOUT, fiscal_send_inner(&st, cmd)).await {
-        Ok(Ok(r))  => (StatusCode::OK, Json(r)).into_response(),
+        Ok(Ok(r)) => {
+            // Map DPS error category to HTTP status so callers get a clear non-success
+            // signal without needing to inspect the JSON body.  status > 0 is success.
+            let http_status = match r.dps_error_category.as_deref() {
+                Some("transient") => StatusCode::SERVICE_UNAVAILABLE,
+                Some("permanent") => StatusCode::UNPROCESSABLE_ENTITY,
+                _ if r.status <= 0 => StatusCode::BAD_GATEWAY,
+                _ => StatusCode::OK,
+            };
+            (http_status, Json(r)).into_response()
+        }
         Ok(Err(e)) => e.into_response(),
         Err(_)     => SidecarError::Internal("request timeout".into()).into_response(),
     }
@@ -183,6 +227,11 @@ async fn fiscal_send_inner(
     st:  &AppState,
     cmd: CanonicalCommand,
 ) -> Result<FiscalSendResponse, SidecarError> {
+    // ── S2: envelope integrity (schema_version allowlist + payload_sha256) ───
+    if let Err(msg) = validate_envelope(&cmd) {
+        return Err(SidecarError::InvalidInput(msg));
+    }
+
     // ── 1. Validate operation ─────────────────────────────────────────────────
     if !cmd.operation_type.is_sidecar_supported() {
         return Err(SidecarError::BadRequest(format!(
@@ -202,10 +251,11 @@ async fn fiscal_send_inner(
         // (step 3 below) would bail before reaching here in non-dev mode.
         let xml_bytes = build_dev_xml(st, fn_id, &cmd)?;
         return Ok(FiscalSendResponse {
-            status:        1, // synthetic OK
-            fiscal_id:     String::new(),
-            error_message: Some(format!("dev.skip_sign: {} bytes XML, DPS skipped", xml_bytes.len())),
-            chain_broken:  false,
+            status:             1, // synthetic OK
+            fiscal_id:          String::new(),
+            error_message:      Some(format!("dev.skip_sign: {} bytes XML, DPS skipped", xml_bytes.len())),
+            chain_broken:       false,
+            dps_error_category: None,
         });
     }
 
@@ -301,6 +351,44 @@ async fn fiscal_send_inner(
     if st.repo.is_degraded(fn_id)? {
         return Err(SidecarError::FnDegraded(fn_id.to_string()));
     }
+
+    // ── S4/C2: durable pending-state idempotency ─────────────────────────────
+    // Insert a 'pending' record BEFORE allocating local_number so that a concurrent
+    // retry with the same key sees DuplicatePending → 409 instead of allocating
+    // a second local_number.  On success the record is promoted to 'accepted'.
+    // Stale pending rows (DPS timeout / crash) are cleaned by a background task.
+    let op_type_str = format!("{:?}", cmd.operation_type);
+    let pending_key: Option<String> = if !cmd.idempotency_key.is_empty() {
+        match st.repo.insert_pending_request(
+            &cmd.idempotency_key, fn_id, &op_type_str, &cmd.payload_sha256, &cmd.business_ts,
+        )? {
+            PendingInsertResult::DuplicateAccepted(json) => {
+                let cached: FiscalSendResponse = serde_json::from_str(&json)
+                    .map_err(|e| SidecarError::Internal(format!("idempotency cache parse: {e}")))?;
+                return Ok(cached);
+            }
+            PendingInsertResult::DuplicatePending => {
+                return Err(SidecarError::DuplicateInFlight(
+                    cmd.idempotency_key.clone(),
+                ));
+            }
+            // F1: key timed out without confirmed DPS outcome — block new allocation.
+            PendingInsertResult::DuplicateAmbiguous => {
+                return Err(SidecarError::AmbiguousRequest(format!(
+                    "idempotency key {:?} is in ambiguous state (prior request timed out); \
+                     wait for reconciliation or contact support",
+                    cmd.idempotency_key
+                )));
+            }
+            // F2: key reused with different identity — hard conflict.
+            PendingInsertResult::HardConflict(detail) => {
+                return Err(SidecarError::IdempotencyConflict(detail));
+            }
+            PendingInsertResult::Inserted => Some(cmd.idempotency_key.clone()),
+        }
+    } else {
+        None
+    };
 
     // ── 9. Allocate local_number and load previous_hash (two short locks) ─────
     // local_num is incremented here — before CMS signing (step 11) and gRPC (step 12).
@@ -521,12 +609,47 @@ async fn fiscal_send_inner(
     } else {
         Some(resp.error_message.clone())
     };
-    Ok(FiscalSendResponse {
-        status:        resp.status,
-        fiscal_id:     resp.id.clone(),
-        error_message: error_msg,
+    use prro_sidecar::grpc_client::{classify_dps_status, DpsErrorCategory};
+    let dps_error_category = classify_dps_status(resp.status).map(|c| match c {
+        DpsErrorCategory::Transient => "transient".to_string(),
+        DpsErrorCategory::Permanent => "permanent".to_string(),
+    });
+    let is_permanent_reject = dps_error_category.as_deref() == Some("permanent");
+    let response = FiscalSendResponse {
+        status:             resp.status,
+        fiscal_id:          resp.id.clone(),
+        error_message:      error_msg,
         chain_broken,
-    })
+        dps_error_category,
+    };
+
+    // S4/C2: promote pending → accepted only for DPS-accepted documents (status > 0).
+    // F3-fix: on permanent DPS reject, transition to 'rejected' immediately so the
+    // operator can re-submit after investigation (rejected allows fresh retry).
+    // Transient errors leave the row pending — it expires to 'ambiguous' via the
+    // background cleanup task, signalling an unknown outcome to the caller.
+    if let Some(key) = &pending_key {
+        if resp.status > 0 {
+            if let Ok(json) = serde_json::to_string(&response) {
+                match st.repo.accept_request(key, &json) {
+                    Ok(false) => tracing::error!(%key,
+                        "journal state mismatch: DPS accepted but row not in pending state — \
+                         row may have expired to ambiguous; FN requires manual review"),
+                    Err(e) => tracing::error!(%key, %e, "journal accept failed after DPS success"),
+                    Ok(true) => {}
+                }
+            }
+        } else if is_permanent_reject {
+            match st.repo.reject_request(key) {
+                Ok(false) => tracing::warn!(%key,
+                    "journal reject: row not in pending state — already ambiguous or accepted"),
+                Err(e) => tracing::error!(%key, %e, "journal reject failed after permanent DPS error"),
+                Ok(true) => {}
+            }
+        }
+    }
+
+    Ok(response)
 }
 
 #[cfg(test)]

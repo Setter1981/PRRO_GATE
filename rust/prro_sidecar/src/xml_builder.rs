@@ -852,10 +852,8 @@ fn calc_tax(group_sum: i64, tax_rate: f64, additional_rate: f64, tax_algorithm: 
     let mut txsm: i64 = 0;
 
     match tax_algorithm {
-        0 => {
-            if tax_rate > 0.0 {
-                txsm = py_round(group_sum as f64 * tax_rate / (100.0 + tax_rate));
-            }
+        0 if tax_rate > 0.0 => {
+            txsm = py_round(group_sum as f64 * tax_rate / (100.0 + tax_rate));
         }
         1 => {
             if additional_rate > 0.0 {
