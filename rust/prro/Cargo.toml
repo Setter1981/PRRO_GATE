@@ -72,7 +72,14 @@ sha2 = "0.10"
 # DPS gRPC transport (M2 W3).
 prost = "0.13"
 prost-types = "0.13"
-tonic = "0.12"
+# **TLS fix 2026-05-25 (smoke A/B failure root cause)**: bare `tonic = "0.12"`
+# does NOT enable TLS — `https://` endpoints silently fail з
+# "transport error" because tonic falls through TLS layer without
+# rustls/native-tls.  Verified via Python smoke (server-only TLS suffices;
+# Rust pre-fix produced gRPC Unknown: transport error).  `tls` feature enables
+# tonic's TLS surface; `tls-native-roots` provides system trust store (matches
+# Python's `grpc.ssl_channel_credentials(root_certificates=None)` behaviour).
+tonic = { version = "0.12", features = ["tls", "tls-native-roots"] }
 
 # OS / fs
 fs4 = "0.9"
