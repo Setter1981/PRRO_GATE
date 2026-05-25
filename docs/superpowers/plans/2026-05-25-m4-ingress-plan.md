@@ -1,6 +1,6 @@
 # M4 — Rust Ingress + maria304 Re-Bridge — Implementation Plan
 
-**Status:** REVISED-v2 (2026-05-25 — A3/A7 revision after O1-O5 resolved by operator; W2 rewritten — `operators` table + admin CLI added; `fn_sign` removed as misnomer)
+**Status:** REVISED-v3 (2026-05-25 — PR #90 senior review acceptance items folded into W2: HIGH-01 FK/CHECK enforcement; MED-01 partial-unique multi-cashier history; MED-02 threat model formalized; MED-03 missing-resolver boot semantics fully typed; MED-04 admin-runbook update mandated; LOW-01/02/03 misc cleanups)
 **Branch start:** `docs/w12-audit-dashboard-spec` (M3b CLOSED at rust-gateway `49e11fc` per memory `project_w12_hardening_closure`)
 **Supersedes language about Python ingress in:** `docs/M3-W0-handoff.md §3` (already flagged by ADR 2026-05-07 §Propagation)
 **Anchors:**
@@ -101,12 +101,9 @@ These need an operator answer before W2+ touches code. List is short on purpose.
     `sign_ctx.sign_check_blob(fiscal_number, metadata)`. ДПС does not
     issue any persistent "fn_sign" artefact; the wire field
     `rro_fn_sign` is a derived signature, regenerated each call.
-    Verified by reading `rust/prro/src/transports/dps/dto.rs:55-60`
-    (doc-comment: "the wire field `rro_fn_sign` is a CMS-signed blob
-    containing the FN + caller metadata") and by reading WebCheck
-    decompiled source (`docs/webcheck_reverse/WebCheckMain/WebCheck/
-    FormOperator.cs:479,546-559`) which stores ONLY the cashier's EDS
-    key file path + encoded password, no DPS-issued FN identity blob.
+    See A7 for the cashier-key storage that backs `sign_ctx`.
+    *(LOW-PR90-03 review fix — full WebCheck file refs moved to A7
+    to avoid duplication.)*
 
 - **A4 — Boot order: recon → ingress listen → return-online probe.**
   - Per `App::boot` doc-comments + `BootError::OfflineModeRefusal`,
@@ -156,27 +153,92 @@ These need an operator answer before W2+ touches code. List is short on purpose.
         name          TEXT NOT NULL,
         key_path      TEXT NOT NULL,
         key_pass_enc  BLOB NOT NULL,           -- obfuscated, NOT crypto-strong
-        fiscal_number TEXT NOT NULL,           -- which FN this cashier serves
+        fiscal_number TEXT NOT NULL
+            CHECK (LENGTH(fiscal_number) = 10
+                   AND fiscal_number GLOB '[0-9]*')
+            REFERENCES fiscal_number_config(fiscal_number)
+            ON DELETE RESTRICT,             -- HIGH-PR90-01 review fix
+        is_active     INTEGER NOT NULL DEFAULT 1
+            CHECK (is_active IN (0, 1)),    -- MED-PR90-01 review fix
         created_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
     );
-    CREATE UNIQUE INDEX ix_operators_fn ON operators(fiscal_number);
+    CREATE INDEX ix_operators_fn_active
+        ON operators(fiscal_number, is_active)
+        WHERE is_active = 1;
     ```
-    For pilot 1-cashier / 1-FN, this is unique-by-FN; multi-cashier per
-    FN is M5-territory and would relax to a non-unique index + active
-    cashier selection at HTTP handler layer.
+    **HIGH-PR90-01 review fix:** `fiscal_number` carries the same
+    10-digit CHECK as other FN-bearing tables AND a FK reference to
+    `fiscal_number_config` — admin CLI cannot insert a row for an
+    unconfigured FN.  `ON DELETE RESTRICT` prevents removing an FN
+    from `fiscal_number_config` while operators still reference it.
+    **MED-PR90-01 review fix:** UNIQUE on `fiscal_number` was too
+    strict for the real production case (50 points / 70 casses → 1.4
+    cashier/cash-register avg per `user_operator_profile`).  Relaxed
+    to **conditional uniqueness via partial index** on `(fiscal_number,
+    is_active) WHERE is_active = 1` — multiple historical rows allowed
+    per FN, but only one active at a time.  Pilot 1-cashier still
+    works identically; multi-cashier-with-shift-changes does not need
+    a schema rebuild.
   - **Why NOT in TOML config:** matches WebCheck operator UX (operator
     adds cashier via UI/CLI without editing config files); avoids
     pushing secrets into shared config; supports rotation without
     restart in M5.
+  - **Threat model for `key_pass_enc` obfuscation** *(MED-PR90-02
+    review addition)*:
+    - ✅ **Protects against:** casual file inspection (`cat`,
+      `hexdump` from a non-target user / accidental log scrape /
+      shell history exposure).
+    - ❌ **Does NOT protect against:** anyone з read access to
+      `var/prro.db`.  Anyone who can read the SQLite file can run
+      the symmetric decoder and recover the password.
+    - **Operational mandates** (must surface in admin-runbook):
+      1. **Password rotation** is REQUIRED when a cashier leaves
+         the role.  CLI command `prro admin remove-operator --inn`
+         (deferred to M5 if not needed during pilot) toggles
+         `is_active = 0` + audit row; the operator must then
+         physically rotate the EDS key with the ЦСК.
+      2. **Backup encryption** mandatory if the DB backup escapes
+         the host (rsync to non-encrypted volume / cloud).  Pilot
+         single-host deployments without remote backup are OK
+         without an extra layer.
+    - **Post-pilot evolution path** (NOT in M4): OS keyring
+      integration (Linux Secret Service / macOS Keychain) for the
+      password.  Tracked as TD post-pilot, not pilot-gating.
   - **CLI registration** (M4 W2 scope): `prro admin add-operator
     --inn <INN> --name "..." --key-path /var/prro/keys/cashier-<INN>.dat
-    --fn <FN>` prompts interactively for password, encodes via the same
-    `Coding().Cod()` equivalent (small Rust helper), inserts row.
+    --fn <FN>` prompts interactively for password (TTY: double-input
+    confirmation; non-TTY: single stdin line — CI scenario), refuses
+    empty password з typed error, encodes via the symmetric helper,
+    inserts row.
   - **Per-cashier `SigningContext`** is constructed at boot by reading
-    `operators` rows, loading each EDS key file with its decoded
-    password, and wrapping in a `SigningContext`. Failed loads emit a
-    Critical audit + skip that FN (FN absent from registry → handler
-    returns 503 for requests on that FN until operator fixes it).
+    `operators WHERE is_active = 1` rows, loading each EDS key file
+    with its decoded password, and wrapping in a `SigningContext`.
+    Failed loads emit a Critical audit + skip that FN.
+
+  - **Missing-resolver / failed-key-load boot semantics** *(MED-PR90-03
+    review addition)*: if `BindingsRegistry::build_from_db` failed to
+    load operator for FN-X (broken `key_path` / wrong password / FN
+    has no `operators` row at all):
+    1. Critical audit row: event_type =
+       `OPERATOR_KEY_LOAD_FAILED`, entity_type = `"fn"`,
+       entity_id = `<FN-X>`, payload =
+       `{ "reason": "FileNotFound|WrongPassword|MissingRow|...",
+          "key_path": "/var/prro/keys/...", "operator_id": "<INN>" }`.
+    2. FN-X is **absent from registry**.
+    3. Boot **continues** (does NOT abort).  Other FNs proceed normal.
+    4. `App::reconcile_pending_with(resolver)` resolves
+       `resolver(FN-X)` → `None`.  Recon for FN-X is **skipped з
+       audit** (NOT a panic, NOT a typed error that aborts boot;
+       this guarantees one broken FN cannot block the rest).
+    5. HTTP handler receives a request with `fiscal_number = FN-X`
+       → returns 503 + `error_code = "OPERATOR_NOT_REGISTERED"`.
+    6. Return-online probe / scheduled drain SKIP FN-X з one-time
+       audit (avoid log flooding on each tick).
+    7. **Recovery path** (admin-runbook scenario):
+       `prro admin doctor --fiscal-number <FN-X>` shows operator key
+       diagnostic; operator fixes key file / re-runs add-operator;
+       restarts prro to re-build registry (no live re-registration
+       in M4 — M5 scope).
 
 ### 1.3 Architectural pins (constraints these worklets MUST honor)
 
@@ -355,38 +417,103 @@ and skips the FN — handler later returns 503 for that FN.
 
 **Tests:**
 - Migration test: `tests/migration_020_operators.rs` verifies
-  schema + unique index applied.
-- Repository test: `operators::insert` Created + duplicate FN Conflict.
+  schema + partial index applied + CHECK constraints enforced.
+- **HIGH-PR90-01 test**: `tests/migration_020_fk_constraint.rs` —
+  INSERT з `fiscal_number` що NOT in `fiscal_number_config` → SQLite
+  FK violation; INSERT з 11-digit `fiscal_number` → CHECK violation;
+  INSERT з non-numeric `fiscal_number` → CHECK violation.
+- **MED-PR90-01 test**: `tests/operators_multi_cashier_history.rs` —
+  INSERT two rows для same FN з first `is_active=0` (historical),
+  second `is_active=1` (current) → both rows present, partial unique
+  index не conflicting.  Then INSERT another `is_active=1` → unique
+  violation.
+- Repository test: `operators::insert` Created + duplicate active
+  cashier-on-FN Conflict.
 - Coding helper: `tests/coding_roundtrip.rs` — `Coding::encode(s)`
   then `Coding::decode(...)` returns original; non-empty output for
-  non-empty input.
-- Unit: `BindingsRegistry::build_from_db` with two `operators` rows
-  → registry has two FNs, single shared `Arc<DpsChannel>` instance,
-  each entry has a `SigningContext` whose underlying key file matches
-  the row's `key_path`.
-- Unit: `key_path` points to missing file → Critical audit row +
-  FN is absent from registry (NOT a panic).
-- Unit: `key_pass_enc` decodes to wrong password → Critical audit +
-  FN absent.
+  non-empty input; empty input → typed error.
+- Unit: `BindingsRegistry::build_from_db` з two `operators` rows
+  (`is_active=1`) → registry has two FNs, single shared
+  `Arc<DpsChannel>` instance, each entry has `SigningContext` whose
+  underlying key file matches the row's `key_path`.
+- **MED-PR90-03 test**: `tests/operator_key_load_failure_audits.rs` —
+  3 sub-cases:
+    1. `key_path` points to missing file → `OPERATOR_KEY_LOAD_FAILED`
+       Critical audit з `reason="FileNotFound"`; FN absent from
+       registry; boot continues.
+    2. `key_pass_enc` decodes to wrong password → audit з
+       `reason="WrongPassword"`; FN absent; boot continues.
+    3. No `operators` row для configured FN-X →
+       `OPERATOR_NOT_REGISTERED` audit (different event_type, INFO);
+       FN absent; boot continues.
+- **MED-PR90-03 integration test**:
+  `tests/handler_503_on_missing_operator.rs` — start prro з one
+  configured FN but operators table empty; submit HTTP request →
+  503 + `error_code = "OPERATOR_NOT_REGISTERED"`.  This proves the
+  full chain from boot-time absence → handler refusal.
+- **LOW-PR90-01 test**: `tests/add_operator_cli_password_input.rs` —
+  TTY simulation з two matching passwords → success; two mismatched
+  → refuse + non-zero exit; non-TTY stdin → single-line read;
+  empty stdin → typed error + non-zero exit.
 - Smoke (mock DPS): construct registry against `MockDps` + a temp
   test EDS key, call `App::reconcile_pending_with(resolver)` — should
   still pass the existing reconcile tests, now wired through new
   registry.
-- Admin CLI: `prro admin add-operator --inn ... --name ... --key-path
-  ... --fn ...` (password piped via stdin in test) inserts a row;
-  subsequent `BindingsRegistry::build_from_db` picks it up.
+- Admin CLI happy path: `prro admin add-operator --inn ... --name
+  ... --key-path ... --fn ...` (password piped via stdin in test)
+  inserts a row; subsequent `BindingsRegistry::build_from_db` picks
+  it up.
 
 **Acceptance:**
-- Migration 020 lands; `operators` table exists.
+- Migration 020 lands; `operators` table exists з all CHECKs + FK
+  enforced + partial unique index applied.
 - `prro admin add-operator` can register a cashier; row visible via
   `sqlite3 var/prro.db "SELECT * FROM operators"`.
 - Existing 256 + new tests green when reconcile invoked through
   `with_resolver(|fn| registry.get(fn))`.
-- Missing-key / bad-password cases produce Critical audits + 503-able
-  registry-absent state (NOT a panic / NOT a startup abort).
+- Missing-key / bad-password / missing-operator-row cases produce
+  the typed audit events (`OPERATOR_KEY_LOAD_FAILED` Critical for
+  load failures; `OPERATOR_NOT_REGISTERED` Info for missing-row) +
+  503-able registry-absent state (NOT a panic, NOT a startup abort).
+- **Review-gated acceptance items** *(from PR #90 senior review)*:
+  - **HIGH-PR90-01**: migration 020 enforces 10-digit numeric
+    `fiscal_number` CHECK + FK to `fiscal_number_config(fiscal_number)
+    ON DELETE RESTRICT`.  Test `migration_020_fk_constraint.rs`
+    proves both rejections.
+  - **MED-PR90-01**: schema supports multi-cashier-per-FN historical
+    rows via partial unique index `WHERE is_active = 1`; pilot
+    1-cashier behaves identically, no schema rebuild needed для
+    casher rotation. Test `operators_multi_cashier_history.rs`
+    proves the relaxed semantics.
+  - **MED-PR90-02**: `coding.rs` doc-comment declares threat model
+    explicitly (protects vs casual inspection, not vs DB read
+    access).  `key_pass_enc` rotation procedure documented в
+    admin-runbook update (see MED-PR90-04 item below).
+  - **MED-PR90-03**: missing-resolver behavior at boot is fully
+    audited + skipped, NEVER panics.  Tests
+    `operator_key_load_failure_audits.rs` +
+    `handler_503_on_missing_operator.rs` cover the chain.  Return-
+    online probe + scheduled drain SKIP unregistered FNs з
+    one-time audit (no log flooding).
+  - **MED-PR90-04**: `docs/operations/admin-runbook.md` updated в
+    the same PR з:
+      - `prro admin add-operator` syntax + password input pattern.
+      - `prro admin doctor --fiscal-number` diagnostic for
+        operator key state (W2 also adds this `doctor` subcommand
+        if not already present — verify against existing admin.rs).
+      - Recovery scenarios: corrupted key file, wrong password,
+        wrong FN typo in registered row (DELETE + re-INSERT pattern).
+      - Password rotation procedure on cashier turnover.
+  - **LOW-PR90-01**: password input behavior typed (TTY double-input
+    confirmation; non-TTY single stdin line; empty refusal). Test
+    `add_operator_cli_password_input.rs` covers all three branches.
+  - **LOW-PR90-02**: §8 rollback section updated to describe true
+    rollback procedure (manual DROP TABLE + delete migration version
+    row in `_sqlx_migrations`).
 
-**Estimate:** 2.0 days *(was 1.5; added 0.5 for migration + CLI +
-coding helper + key-load failure-class tests)*.
+**Estimate:** **2.5 days** *(was 2.0; +0.5 for HIGH/MED/LOW review-
+gated acceptance — additional CHECK/FK + partial-index tests +
+admin-runbook update + doctor subcommand verification)*.
 
 ---
 
@@ -829,21 +956,21 @@ precedent.
 
 ---
 
-## 6. Estimates *(revised 2026-05-25 — W2 +0.5d for migration/CLI/coding helper)*
+## 6. Estimates *(revised 2026-05-25 v3 — W2 +0.5d from PR #90 senior review)*
 
 | Worklet | Estimate (working days) | Cumulative |
 |---|---:|---:|
 | W1 axum deps + module skeleton | 0.5 | 0.5 |
-| W2 OperatorBindings + migration 020 + admin CLI | 2.0 | 2.5 |
-| W3 DTO parity + canonical mapping | 1.0 | 3.5 |
-| W4 Per-FN supervisor + worker | 2.5 | 6.0 |
-| W5 Response builder | 1.0 | 7.0 |
-| W6 HTTP handler + axum router | 2.0 | 9.0 |
-| W7 Cmd::Serve orchestration | 1.5 | 10.5 |
-| W8 maria304 re-bridge + smoke | 1.5 | 12.0 |
-| W9 Live DPS smoke via ingress | 1.0 | 13.0 |
+| W2 OperatorBindings + migration 020 + admin CLI + review acceptance items | 2.5 | 3.0 |
+| W3 DTO parity + canonical mapping | 1.0 | 4.0 |
+| W4 Per-FN supervisor + worker | 2.5 | 6.5 |
+| W5 Response builder | 1.0 | 7.5 |
+| W6 HTTP handler + axum router | 2.0 | 9.5 |
+| W7 Cmd::Serve orchestration | 1.5 | 11.0 |
+| W8 maria304 re-bridge + smoke | 1.5 | 12.5 |
+| W9 Live DPS smoke via ingress | 1.0 | 13.5 |
 
-**Total M4 estimate: 13.0 working days ≈ 3 calendar weeks** at the
+**Total M4 estimate: 13.5 working days ≈ 3 calendar weeks** at the
 M3a/M3b discipline cadence (review cycles, scope-creep guards,
 operator pin checks). Matches ADR 2026-05-07's "M4 — 4-6 weeks" upper
 bound if review rounds add 1-2 weeks of cycle.
@@ -877,6 +1004,16 @@ dependency order.
   by sqlx convention, so a revert leaves the `operators` table empty
   but present — harmless for write-path (nothing reads from it without
   registry construction).
+- **LOW-PR90-02 (true rollback procedure)**: if W2 needs true rollback
+  (rare — only for schema redesign), the manual procedure is:
+  1. Stop prro.
+  2. `sqlite3 var/prro.db "DROP TABLE operators; DELETE FROM _sqlx_migrations WHERE version = 20;"`
+  3. `git revert` the W2 PR.
+  4. Re-apply migrations (cargo run picks up clean state).
+  This is **operator-only** procedure; documented в admin-runbook
+  under "M4 rollback scenarios". Pilot context: unlikely to be
+  needed (W2 schema is conservative). If a future migration superseds
+  020, prefer forward-evolving migration over true rollback.
 - W7 is the only worklet that changes a hot file (`main.rs::Cmd::Serve`).
   Rollback restores M1 idle behavior, which is safe (binary keeps
   running, no traffic served, audit_log unaffected).
