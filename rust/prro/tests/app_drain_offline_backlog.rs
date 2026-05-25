@@ -575,3 +575,203 @@ async fn rec2_scheduled_after_hold_skips_within_backoff_window() {
         }
     }
 }
+
+// ─── Polish GAP-1: end-to-end Tier1→Tier2→AdminReset→Drain cycle ─────
+
+/// **Polish cycle / GAP-1 (2026-05-25)** — full operator-workflow
+/// integration: degradation → STOP_MODE → manual reset → recovery
+/// drain.  Locks the complete REC-1 tier-degradation lifecycle as
+/// single end-to-end fixture (regression protection if any transition
+/// point breaks between releases).
+///
+/// Scenario:
+///   1. Boot App, seed FN + Kvt1 doc + W12 chain prereqs.
+///   2. Loop 50 drain ticks з DPS Transport err →
+///      `consecutive_holds` counter increments tick-by-tick → Tier 1
+///      audit at counter ≥ 10 → Tier 2 STOP_MODE CAS at counter = 50.
+///   3. Verify Tier 2 triggered: node_state.mode = STOP_MODE +
+///      OFFLINE_DRAIN_FN_STOP_MODE Critical audit emitted exactly 1×.
+///   4. Operator-driven recovery via admin reset
+///      (`prro::admin::reset_stop_mode`).  Verify: counter reset to 0,
+///      mode → GOING_ONLINE, ADMIN_STOP_MODE_RESET Critical audit.
+///   5. Switch DPS carrier to lastChk Acked response.
+///   6. Drain again → Kvt1Reentry advances doc через Envelope 1b +
+///      Envelope 2 → ACK.
+///   7. Verify: doc state = ACK, OFFLINE_DRAIN_KVT2_ADVANCED + STAGE_
+///      FINALIZE_ACK audits, fresh `consecutive_holds = 0`.
+#[tokio::test]
+async fn polish_tier_degradation_then_admin_reset_then_drain_succeeds_end_to_end() {
+    let (_d, app, pool) = boot_app("polish_e2e.db").await;
+    seed_fn_config(&pool).await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+
+    // Seed Kvt1 doc (Kvt1Reentry dispatch). server_fiscal_no MUST
+    // be present per stage_send 4-b invariant.
+    let doc_id = DocumentId::new();
+    let req_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO fiscal_documents( \
+            document_id, request_id, fiscal_number, shift_id, lnd, doc_type, state, \
+            backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical, signed_by_cashier_id, \
+            offline_session_id, offline_fiscal_no, offline_fiscal_date, \
+            server_fiscal_no) \
+         VALUES (?, ?, ?, ?, 100, 'SELL', 'KVT1', \
+            'b1', 't1', 'OFFLINE', '2026-05-21T00:00:00Z', \
+            '{}', ?, ?, ?, 100, '2026-05-21T00:00:00Z', ?)",
+    )
+    .bind(doc_id)
+    .bind(req_id.as_bytes().to_vec())
+    .bind(FN)
+    .bind(shift_id)
+    .bind(vec![0u8; 32])
+    .bind(CASHIER_OK)
+    .bind(session_id)
+    .bind("DPS-FN-E2E")
+    .execute(&pool)
+    .await
+    .unwrap();
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc_id,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+
+    // ── Step 1-2: 50 hold ticks ──
+    for _ in 0..50 {
+        let c = carriers_with_last_chk(
+            vec![],
+            vec![Err(DpsError::Transport(
+                "e2e simulated transport err".into(),
+            ))],
+        );
+        let view = view_for(&c);
+        let _ = app
+            .drain_offline_backlog_with(FN, &view)
+            .await
+            .expect("hold tick");
+        drop(c);
+    }
+
+    // ── Step 3: verify Tier 2 fired ──
+    let counter: i64 =
+        sqlx::query_scalar("SELECT consecutive_holds FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(counter, 50, "counter MUST reach 50 after 50 hold ticks");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_FN_STOP_MODE").await,
+        1,
+        "Tier 2 STOP_MODE escalation MUST fire exactly once at counter==50"
+    );
+    assert_eq!(
+        read_node_mode(&pool).await,
+        "STOP_MODE",
+        "node_state.mode MUST be STOP_MODE post Tier 2"
+    );
+    // Tier 1 audits also accumulated (counter 10..=49 = 40 ticks).
+    assert_eq!(
+        audit_count(&pool, "KVT2_CONFIRM_PROLONGED_HOLD").await,
+        40,
+        "Tier 1 audits MUST fire on ticks 10..=49 (40 events)"
+    );
+
+    // ── Step 4: operator-driven admin reset ──
+    let reset_outcome = prro::admin::reset_stop_mode(
+        &pool,
+        FN,
+        "e2e test: DPS connectivity restored; operator verified",
+    )
+    .await
+    .expect("admin reset MUST succeed when mode==STOP_MODE");
+    assert_eq!(reset_outcome.fiscal_number, FN);
+    assert_eq!(
+        reset_outcome.docs_reset_count, 1,
+        "1 held doc on FN MUST be reset to consecutive_holds=0"
+    );
+    assert_eq!(
+        read_node_mode(&pool).await,
+        "GOING_ONLINE",
+        "admin reset MUST transition STOP_MODE → GOING_ONLINE"
+    );
+    let counter_post_reset: i64 =
+        sqlx::query_scalar("SELECT consecutive_holds FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        counter_post_reset, 0,
+        "admin reset MUST clear consecutive_holds для all held docs on FN"
+    );
+    assert_eq!(
+        audit_count(&pool, "ADMIN_STOP_MODE_RESET").await,
+        1,
+        "exactly 1 ADMIN_STOP_MODE_RESET Critical audit MUST emit per reset"
+    );
+
+    // Doc state UNCHANGED at KVT1 (admin reset doesn't touch doc state —
+    // only counter + node mode).
+    let doc_state_post_reset: String =
+        sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(doc_state_post_reset, "KVT1");
+
+    // ── Step 5-6: switch DPS to Acked + drain ──
+    let c_recovery = carriers_with_last_chk(
+        vec![],
+        vec![Ok(last_chk_ack("DPS-FN-E2E", vec![0xAAu8; 32]))],
+    );
+    let view_recovery = view_for(&c_recovery);
+    let summary_recovery = app
+        .drain_offline_backlog_with(FN, &view_recovery)
+        .await
+        .expect("recovery drain");
+
+    // ── Step 7: verify ACK reached ──
+    assert_eq!(
+        summary_recovery.advanced_to_ack(),
+        1,
+        "recovery drain MUST advance doc to ACK via Kvt1Reentry chain"
+    );
+    let doc_state_final: String =
+        sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(doc_state_final, "ACK");
+    assert!(
+        audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await >= 1,
+        "Envelope 1b OFFLINE_DRAIN_KVT2_ADVANCED MUST fire on recovery"
+    );
+    assert!(
+        audit_count(&pool, "STAGE_FINALIZE_ACK").await >= 1,
+        "Envelope 2 STAGE_FINALIZE_ACK MUST fire on recovery"
+    );
+    // Counter remains 0 (Envelope 1b reset_consecutive_holds_tx fires
+    // atomically з advance per REC-1 6.1.1 contract).
+    let counter_final: i64 =
+        sqlx::query_scalar("SELECT consecutive_holds FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(counter_final, 0);
+
+    drop(c_recovery);
+}
