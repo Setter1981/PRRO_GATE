@@ -2133,11 +2133,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "chrono",
  "chrono-tz",
  "clap",
  "fs4",
  "futures",
+ "hyper-util",
  "libsqlite3-sys",
  "pretty_assertions",
  "prost",
@@ -2160,6 +2162,8 @@ dependencies = [
  "toml 0.8.23",
  "tonic",
  "tonic-build",
+ "tower 0.5.3",
+ "tower-http 0.6.8",
  "tracing",
  "tracing-subscriber",
  "trybuild",
@@ -3722,9 +3726,11 @@ dependencies = [
  "http-body",
  "iri-string",
  "pin-project-lite",
+ "tokio",
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]

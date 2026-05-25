@@ -90,6 +90,15 @@ rand_core = { version = "0.6", features = ["std"] }
 # Async helpers — needed for `db::tx::with_immediate` higher-ranked closures
 futures = "0.3"
 
+# M4 W1 — HTTP ingress shell skeleton.  Axum gives the routing + handler
+# layer; tower-http supplies the trace + timeout middleware envisioned
+# for the per-request body envelope.  hyper-util is the connector
+# Axum builds on once we wire `serve(...)` in W3.
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
+hyper-util = "0.1"
+
 # Crate cross-deps (will be wired in M2+)
 prro_crypto = { path = "../prro_crypto" }
 prro_escpos = { path = "../prro_escpos" }
