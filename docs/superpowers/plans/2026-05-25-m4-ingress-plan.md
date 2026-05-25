@@ -1,6 +1,6 @@
 # M4 — Rust Ingress + maria304 Re-Bridge — Implementation Plan
 
-**Status:** DRAFT (W0 architecture-planner output, 2026-05-25)
+**Status:** REVISED-v2 (2026-05-25 — A3/A7 revision after O1-O5 resolved by operator; W2 rewritten — `operators` table + admin CLI added; `fn_sign` removed as misnomer)
 **Branch start:** `docs/w12-audit-dashboard-spec` (M3b CLOSED at rust-gateway `49e11fc` per memory `project_w12_hardening_closure`)
 **Supersedes language about Python ingress in:** `docs/M3-W0-handoff.md §3` (already flagged by ADR 2026-05-07 §Propagation)
 **Anchors:**
@@ -83,17 +83,30 @@ These need an operator answer before W2+ touches code. List is short on purpose.
     operations). The per-FN worker mutex is a *new* discipline at the
     supervisor seam, NOT a replacement for the App mutex.
 
-- **A3 — How is per-FN `RuntimeView` (DPS channel + SigningContext + fn_sign) constructed at boot?**
+- **A3 — How is per-FN `RuntimeView` (DPS channel + SigningContext) constructed at boot?** *(revised 2026-05-25 — `fn_sign` removed from bindings; see A7)*
   - The runtime composition for M3a/M3b was deliberately deferred
     (`App::spawn_return_online_probe` doc-comment §"Production wiring
     intentionally deferred"). M4 *is* that composition.
-  - **Recommendation:** read all FNs from `fiscal_number_config`,
-    construct one `Arc<GrpcDpsChannel>` shared across FNs (DPS endpoint
-    is global per environment), construct one `SigningContext` per FN
-    (per-operator keypair / cert), construct `CheckSignBlob` per FN
-    (operator DPS identity). Bundle into a
-    `HashMap<String, OperatorBindings>` owned by App. Resolver is a
-    closure that does HashMap lookup. Surface as `ReconciliationRuntime::with_resolver`.
+  - **Recommendation:** read operator → FN associations from a new
+    `operators` SQLite table (see A7), construct one
+    `Arc<GrpcDpsChannel>` shared across FNs (DPS endpoint is global
+    per environment), construct one `SigningContext` per cashier
+    operator (loaded from the operator's EDS key file). Bundle into a
+    `HashMap<String, OperatorBindings>` keyed by `fiscal_number`,
+    where `OperatorBindings { dps: Arc<dyn DpsChannel>, sign_ctx:
+    SigningContext }`. Resolver is a closure that does HashMap lookup.
+    Surface as `ReconciliationRuntime::with_resolver`.
+  - **`CheckSignBlob` is NOT stored** — it is a CMS-signed blob over
+    `(FN + caller metadata)` built **per-request at runtime** via
+    `sign_ctx.sign_check_blob(fiscal_number, metadata)`. ДПС does not
+    issue any persistent "fn_sign" artefact; the wire field
+    `rro_fn_sign` is a derived signature, regenerated each call.
+    Verified by reading `rust/prro/src/transports/dps/dto.rs:55-60`
+    (doc-comment: "the wire field `rro_fn_sign` is a CMS-signed blob
+    containing the FN + caller metadata") and by reading WebCheck
+    decompiled source (`docs/webcheck_reverse/WebCheckMain/WebCheck/
+    FormOperator.cs:479,546-559`) which stores ONLY the cashier's EDS
+    key file path + encoded password, no DPS-issued FN identity blob.
 
 - **A4 — Boot order: recon → ingress listen → return-online probe.**
   - Per `App::boot` doc-comments + `BootError::OfflineModeRefusal`,
@@ -127,6 +140,43 @@ These need an operator answer before W2+ touches code. List is short on purpose.
     the Maria 304 protocol surface (e.g. KSEF replay). For the pilot
     we are NOT shipping that — 1С → Maria304 driver → Rust ingress is
     the path.
+
+- **A7 — Operator (cashier) EDS key storage.** *(added 2026-05-25)*
+  - **WebCheck-style storage** in SQLite, NOT in TOML config. The
+    decompiled WebCheck source persists per-cashier keys in an
+    `OPERATORS` table (columns: `OPERATORNAME`, `INN`, `KEYPATH`,
+    `KEYPASS`) with the password obfuscated via `Coding().Cod()`.
+    Files are operator-supplied (`.dat` / `.pfx` / `.zs2` / `.pk8` /
+    `.jks`) at paths the operator chooses.
+  - **Recommendation: mirror this model in `prro` SQLite.** New
+    migration adds:
+    ```sql
+    CREATE TABLE operators (
+        operator_id   TEXT PRIMARY KEY,        -- ІПН касира
+        name          TEXT NOT NULL,
+        key_path      TEXT NOT NULL,
+        key_pass_enc  BLOB NOT NULL,           -- obfuscated, NOT crypto-strong
+        fiscal_number TEXT NOT NULL,           -- which FN this cashier serves
+        created_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+    );
+    CREATE UNIQUE INDEX ix_operators_fn ON operators(fiscal_number);
+    ```
+    For pilot 1-cashier / 1-FN, this is unique-by-FN; multi-cashier per
+    FN is M5-territory and would relax to a non-unique index + active
+    cashier selection at HTTP handler layer.
+  - **Why NOT in TOML config:** matches WebCheck operator UX (operator
+    adds cashier via UI/CLI without editing config files); avoids
+    pushing secrets into shared config; supports rotation without
+    restart in M5.
+  - **CLI registration** (M4 W2 scope): `prro admin add-operator
+    --inn <INN> --name "..." --key-path /var/prro/keys/cashier-<INN>.dat
+    --fn <FN>` prompts interactively for password, encodes via the same
+    `Coding().Cod()` equivalent (small Rust helper), inserts row.
+  - **Per-cashier `SigningContext`** is constructed at boot by reading
+    `operators` rows, loading each EDS key file with its decoded
+    password, and wrapping in a `SigningContext`. Failed loads emit a
+    Critical audit + skip that FN (FN absent from registry → handler
+    returns 503 for requests on that FN until operator fixes it).
 
 ### 1.3 Architectural pins (constraints these worklets MUST honor)
 
@@ -249,42 +299,94 @@ HEAD.
 
 ---
 
-### W2 — Operator-bindings registry (boot-time construction)
+### W2 — Operator-bindings registry + `operators` table + admin CLI
 
-**One-line:** struct `OperatorBindings { dps: Arc<dyn DpsChannel>,
-sign_ctx: SigningContext, fn_sign: CheckSignBlob }` and a builder that
-reads `fiscal_number_config` + crypto config + DPS config.
+*(revised 2026-05-25 after A7 decision — `fn_sign` removed from struct;
+WebCheck-style SQLite storage for cashier EDS keys; CLI registration
+command added; migration added.)*
+
+**One-line:** New `operators` SQLite table + builder that reads it,
+loads each cashier's EDS key file, constructs per-FN `OperatorBindings
+{ dps, sign_ctx }`. Adds `prro admin add-operator` CLI for
+registration.
 
 **Files changed:**
+- New `rust/prro/migrations/020_operators.sql` — DDL for `operators`
+  table per A7. Single migration; pure additive.
 - New `rust/prro/src/runtime/bindings.rs` — `pub struct
-  OperatorBindings`, `pub struct BindingsRegistry { inner:
-  HashMap<String, OperatorBindings> }`, `BindingsRegistry::build_from_config(&AppConfig, &SqlitePool) -> anyhow::Result<Self>`.
-- `rust/prro/src/runtime/mod.rs` — `pub mod bindings;`.
-- Potential cfg additions in `rust/prro/src/config/mod.rs` to hold:
-  `[dps]` endpoint URL (already exists), `[signing]` per-FN keystore
-  paths, `[fiscal_numbers.<fn>]` operator identity blob path. **Reuse
-  existing config structure where possible — do not rename anything.**
+  OperatorBindings { pub dps: Arc<dyn DpsChannel>, pub sign_ctx:
+  SigningContext }` (NO `fn_sign` field); `pub struct
+  BindingsRegistry { inner: HashMap<String, OperatorBindings> }`;
+  `BindingsRegistry::build_from_db(&AppConfig, &SqlitePool) ->
+  anyhow::Result<Self>` reads `operators` rows, loads each
+  `key_path`, decodes `key_pass_enc`, constructs `SigningContext`,
+  inserts into `HashMap` keyed by `fiscal_number`.
+- New `rust/prro/src/db/repositories/operators.rs` — typed CRUD:
+  `insert(operator_id, name, key_path, key_pass_enc, fn) ->
+  Result<(), OperatorsRepoError>`, `list_all() ->
+  Result<Vec<OperatorRow>, _>`, `find_by_fiscal_number(fn) ->
+  Result<Option<OperatorRow>, _>`.
+- New `rust/prro/src/admin/operators.rs` — extends existing admin
+  module with `add_operator` subcommand (reads `--inn`, `--name`,
+  `--key-path`, `--fn`; prompts password via `rpassword::prompt_password`;
+  encodes via `Coding::encode`; INSERTs via repository). Mirrors
+  pattern of existing `reset_stop_mode` admin command (`admin.rs:118`).
+- New `rust/prro/src/runtime/coding.rs` — tiny obfuscation helper
+  matching WebCheck's `Coding().Cod()` symmetry (NOT crypto-strong —
+  matches the WebCheck threat model: protect against casual file
+  inspection, NOT against an attacker with DB access). Could be a
+  simple XOR-with-constant or rotate-shift; explicit doc-comment
+  declaring this is obfuscation NOT encryption.
+- `rust/prro/src/main.rs` — add `AdminCmd::AddOperator { ... }` arm.
+- `rust/prro/src/runtime/mod.rs` — `pub mod bindings;`, `pub mod
+  coding;`.
 
-**Invariant impact:** None at runtime — registry is just construction.
-Invariant #1 not at risk: no SQLite writes inside boot construction
-beyond what `App::boot` already does. Invariant #10 protected: this
-worklet does NOT touch `signer_guard` logic or any sign/send path.
+**Migration safety:** pure additive. No data backfill needed (empty
+operators table is the natural pre-pilot state). Migration runs
+through existing `sqlx::migrate!` machinery.
+
+**Invariant impact:** None at runtime — registry construction is
+boot-only. Invariant #1 not at risk: no SQLite writes inside boot
+construction beyond migration + `App::boot` existing path. Invariant
+#10 protected: this worklet does NOT touch `signer_guard` logic or
+any sign/send path. **New surface**: cashier EDS keys are loaded by
+`prro` itself for the first time; failed load emits Critical audit
+and skips the FN — handler later returns 503 for that FN.
 
 **Tests:**
-- Unit: `BindingsRegistry::build_from_config` with a synthetic config
-  loading two FNs returns a registry with both FNs and the same
-  `Arc<DpsChannel>` instance behind both.
-- Unit: missing fn_sign blob path for an FN → typed error, not panic.
-- Unit: `ReconciliationRuntime::with_resolver(|fn| reg.get(fn))`
-  resolves `Some(view)` for known FN, `None` for unknown.
-- Smoke (mock DPS): construct registry against `MockDps` and call
-  `App::reconcile_pending_with(resolver)` — should still pass the
-  existing reconcile tests, just now wired through the new registry.
+- Migration test: `tests/migration_020_operators.rs` verifies
+  schema + unique index applied.
+- Repository test: `operators::insert` Created + duplicate FN Conflict.
+- Coding helper: `tests/coding_roundtrip.rs` — `Coding::encode(s)`
+  then `Coding::decode(...)` returns original; non-empty output for
+  non-empty input.
+- Unit: `BindingsRegistry::build_from_db` with two `operators` rows
+  → registry has two FNs, single shared `Arc<DpsChannel>` instance,
+  each entry has a `SigningContext` whose underlying key file matches
+  the row's `key_path`.
+- Unit: `key_path` points to missing file → Critical audit row +
+  FN is absent from registry (NOT a panic).
+- Unit: `key_pass_enc` decodes to wrong password → Critical audit +
+  FN absent.
+- Smoke (mock DPS): construct registry against `MockDps` + a temp
+  test EDS key, call `App::reconcile_pending_with(resolver)` — should
+  still pass the existing reconcile tests, now wired through new
+  registry.
+- Admin CLI: `prro admin add-operator --inn ... --name ... --key-path
+  ... --fn ...` (password piped via stdin in test) inserts a row;
+  subsequent `BindingsRegistry::build_from_db` picks it up.
 
-**Acceptance:** registry builds; existing reconcile tests still green
-when invoked through `with_resolver(closure)` instead of `single_fn`.
+**Acceptance:**
+- Migration 020 lands; `operators` table exists.
+- `prro admin add-operator` can register a cashier; row visible via
+  `sqlite3 var/prro.db "SELECT * FROM operators"`.
+- Existing 256 + new tests green when reconcile invoked through
+  `with_resolver(|fn| registry.get(fn))`.
+- Missing-key / bad-password cases produce Critical audits + 503-able
+  registry-absent state (NOT a panic / NOT a startup abort).
 
-**Estimate:** 1.5 days.
+**Estimate:** 2.0 days *(was 1.5; added 0.5 for migration + CLI +
+coding helper + key-load failure-class tests)*.
 
 ---
 
@@ -376,6 +478,12 @@ dispatch → send → finalize.
    - `Offline{ outcome: Refused(_) }` → reply with the typed refusal.
    - `Refused(reason)` → reply `Refused(reason)`.
 5. `stage_send::run(pool, &*deps.dps, doc_id, Some(sign_ctx))` →
+   *Note: `stage_send::run` itself builds the per-request
+   `CheckSignBlob` via `sign_ctx.sign_check_blob(fiscal_number,
+   metadata)` (CMS over FN + caller metadata, regenerated each call).
+   Worker passes `sign_ctx` only — does NOT pre-compute or cache a
+   blob. Per A3 (revised) the wire `rro_fn_sign` field has no
+   persistent storage form.*
    - `Sent { server_fiscal_no, .. }` → continue to step 6.
    - `Routed { decision, .. }` → reply
      `WireError(class=decision.retry_class)`. *NOT* finalize.
@@ -721,49 +829,54 @@ precedent.
 
 ---
 
-## 6. Estimates
+## 6. Estimates *(revised 2026-05-25 — W2 +0.5d for migration/CLI/coding helper)*
 
 | Worklet | Estimate (working days) | Cumulative |
 |---|---:|---:|
 | W1 axum deps + module skeleton | 0.5 | 0.5 |
-| W2 OperatorBindings registry | 1.5 | 2.0 |
-| W3 DTO parity + canonical mapping | 1.0 | 3.0 |
-| W4 Per-FN supervisor + worker | 2.5 | 5.5 |
-| W5 Response builder | 1.0 | 6.5 |
-| W6 HTTP handler + axum router | 2.0 | 8.5 |
-| W7 Cmd::Serve orchestration | 1.5 | 10.0 |
-| W8 maria304 re-bridge + smoke | 1.5 | 11.5 |
-| W9 Live DPS smoke via ingress | 1.0 | 12.5 |
+| W2 OperatorBindings + migration 020 + admin CLI | 2.0 | 2.5 |
+| W3 DTO parity + canonical mapping | 1.0 | 3.5 |
+| W4 Per-FN supervisor + worker | 2.5 | 6.0 |
+| W5 Response builder | 1.0 | 7.0 |
+| W6 HTTP handler + axum router | 2.0 | 9.0 |
+| W7 Cmd::Serve orchestration | 1.5 | 10.5 |
+| W8 maria304 re-bridge + smoke | 1.5 | 12.0 |
+| W9 Live DPS smoke via ingress | 1.0 | 13.0 |
 
-**Total M4 estimate: 12.5 working days ≈ 3 calendar weeks** at the
+**Total M4 estimate: 13.0 working days ≈ 3 calendar weeks** at the
 M3a/M3b discipline cadence (review cycles, scope-creep guards,
 operator pin checks). Matches ADR 2026-05-07's "M4 — 4-6 weeks" upper
 bound if review rounds add 1-2 weeks of cycle.
 
 ---
 
-## 7. Open questions
+## 7. Open questions — RESOLVED 2026-05-25
 
-| # | Question | Blocks | Owner |
+| # | Question | Resolution | Source |
 |---|---|---|---|
-| O1 | Confirm pilot does NOT include Checkbox-REST ingress | Drop /v1/ingress/checkout from M4 | operator |
-| O2 | Per-FN config shape: where does `fn_sign` blob path live in TOML? (extend existing `[fiscal_numbers.<fn>]` block?) | W2 | operator / arch |
-| O3 | Default ingress bind: `127.0.0.1:8000` single-host or `0.0.0.0:8000` server-shared? | W7 (config defaults) | operator |
-| O4 | Should ingress speak HTTPS even on loopback? | W7 / driver re-bridge config | operator |
-| O5 | Live DPS smoke waiver applicable (per ADR 2026-05-07 §Tests req. 4 model)? | W9 closure | operator |
+| O1 | Pilot includes Checkbox-REST ingress? | **NO** — Checkbox REST deferred to M5. Pilot is Maria 304 + 1С → maria304_driver only. | operator 2026-05-25 |
+| O2 | Where does cashier EDS key live? | **SQLite `operators` table** (WebCheck-style: per-cashier `key_path` + obfuscated `key_pass_enc`), NOT in TOML config. Migration 020 + `prro admin add-operator` CLI. `CheckSignBlob` (`rro_fn_sign`) is **derived runtime** from EDS key via CMS-sign over `(FN + metadata)` — NOT a persistent artefact, NOT issued by ДПС. | operator 2026-05-25 (corrected initial mis-interpretation); verified vs `transports/dps/dto.rs:55-60` + `webcheck_reverse/FormOperator.cs:479,546-559` |
+| O3 | Ingress bind address | **`127.0.0.1:8000`** for pilot (single-host, 1 каса). `0.0.0.0` configurable for multi-host post-pilot. | operator 2026-05-25 |
+| O4 | HTTPS on loopback? | **NO** — plain HTTP on loopback for pilot. TLS deferred until multi-host topology emerges. | operator 2026-05-25 |
+| O5 | Live DPS smoke waiver applicable for W9? | **YES** — waiver applicable per ADR 2026-05-07 §Tests precedent. W9 closes via documented waiver if test contour unavailable; otherwise live smoke runs. | operator 2026-05-25 |
 
-None of these block W1-W3 starting. O1/O2 must close before W4; O3/O4
-before W7; O5 before W9.
+**All open questions closed.** W1-W9 unblocked; can proceed in
+dependency order.
 
 ---
 
 ## 8. Rollback / containment
 
 - Each worklet is a single PR; revert is `git revert <pr-merge-commit>`.
-- W1-W6 are purely additive — none of them changes existing
+- W1, W3-W6 are purely additive — none of them changes existing
   `services/write_path/*`, `services/offline_sync/*`,
   `services/reconciliation/*`, repositories, or migrations.
-  **Schema is untouched.**
+- **W2 adds migration 020 (`operators` table) and one new repository
+  module (`operators.rs`).** Pure additive DDL; no existing data is
+  migrated. Rollback = `git revert` of W2 PR; migration is forward-only
+  by sqlx convention, so a revert leaves the `operators` table empty
+  but present — harmless for write-path (nothing reads from it without
+  registry construction).
 - W7 is the only worklet that changes a hot file (`main.rs::Cmd::Serve`).
   Rollback restores M1 idle behavior, which is safe (binary keeps
   running, no traffic served, audit_log unaffected).
@@ -807,8 +920,10 @@ All deferred items are explicitly in M5 or later per ADR 2026-05-07.
 This plan is **architecturally minimum-diff**:
 - Zero changes to `services/write_path/*`, `services/offline_sync/*`,
   `services/reconciliation/*`.
-- Zero changes to repositories.
-- Zero migrations.
+- One new repository module (`operators.rs`) for cashier EDS key
+  storage; no changes to existing repositories.
+- One new migration (`020_operators.sql`) — pure additive DDL, no
+  data backfill, no existing-row touch.
 - Zero changes to existing tests (256 stay green; new tests are
   additive).
 - Hot-zone files touched in production hot path: exactly one
