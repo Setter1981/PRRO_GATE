@@ -69,10 +69,16 @@ pub async fn open_secure_pool(path: &Path) -> anyhow::Result<SqlitePool> {
             let mut sidecar = main_path.clone();
             sidecar.push(suffix);
             let sidecar = std::path::PathBuf::from(sidecar);
-            if !sidecar.exists() {
-                continue;
-            }
-            let mut perms = std::fs::metadata(&sidecar)?.permissions();
+            // No TOCTOU: fetch metadata directly and tolerate NotFound
+            // (sidecars are lazy; SQLite may delete `-wal` between an
+            // existence check and the metadata call during a concurrent
+            // checkpoint).  Other IO errors propagate fail-closed.
+            let meta = match std::fs::metadata(&sidecar) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let mut perms = meta.permissions();
             perms.set_mode(0o600);
             std::fs::set_permissions(&sidecar, perms)?;
         }

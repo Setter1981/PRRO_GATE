@@ -61,6 +61,15 @@ CREATE TABLE operators (
     -- only structural uniqueness requirement: exactly one active
     -- cashier per fiscal_number.  See PR-B's repository layer for
     -- the CRUD contract.
+    --
+    -- Note on rowid reuse: `INTEGER PRIMARY KEY` (without AUTOINCREMENT)
+    -- is a rowid alias.  SQLite may reuse a rowid after DELETE once the
+    -- table's max rowid is reached, or during VACUUM.  Consumers MUST
+    -- NOT rely on `id` for monotonic ordering or as a stable external
+    -- identifier — use `created_at` for chronology and `operator_id`
+    -- for the cashier identity.  `id` exists purely to give the table
+    -- an explicit PK, matching the convention of every main migration
+    -- since 010.
     id              INTEGER PRIMARY KEY,
     operator_id     TEXT    NOT NULL,
     fiscal_number   TEXT    NOT NULL
