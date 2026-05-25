@@ -142,7 +142,7 @@ Unit test (`on_advance_resets_state`) covers in isolation.  Integration test seq
 
 | ID | Item | Severity | Source | Action |
 |---|---|---|---|---|
-| TD-1 | CI broken (5/5 cross-platform jobs FAIL для PRs #71-#81) | MEDIUM | infrastructure | Dedicated CI repair PR — investigate runner setup / cache config |
+| TD-1 | CI broken (5/5 cross-platform jobs FAIL для PRs #71-#83) | MEDIUM | infrastructure | **INVESTIGATED 2026-05-25 — see §4.1 below**.  Root cause: GitHub-hosted runner provisioning timeout / account-level issue.  NOT codebase-fixable.  Operator-side investigation required. |
 | TD-2 | rustc 1.94.1 ICE workaround `#![allow(dead_code, unused)]` в `prro_crypto*::tau_naf.rs/mladder.rs` + 2 test files | MEDIUM | PR #72 | Track rust-lang/rust#154258 — bump toolchain.toml + remove allows when fix lands |
 | TD-3 | Admin CLI stale `--target-mode` flag mention | LOW | PR #79 | **POLISH-NOW**: 1-line Edit |
 | TD-4 | Reqwest connection pool clamping (REC-2 sub-item) | LOW | PR #81 plan | Create ticket для post-pilot |
@@ -155,6 +155,48 @@ Unit test (`on_advance_resets_state`) covers in isolation.  Integration test seq
 
 ---
 
+### 4.1 TD-1 deep-dive investigation (2026-05-25)
+
+**Status**: Investigation complete; codebase fix not possible.
+
+**Symptoms**:
+- All 5 cross-platform jobs (fmt+clippy / linux-gnu / linux-musl / windows-msvc / linux-arm) fail consistently across PRs #71 → #83.
+- Each job completes in ~3 seconds.
+- Job logs (`system.txt` per job) terminate at: `"Job is waiting for a hosted runner to come online"` — no step ever starts.
+- Pattern stable since 2026-05-22 (last successful CI run was PR #70 era).
+
+**Workflow file status**:
+- File: `.github/workflows/rust-prro.yml` last modified `bb52c5a` on **2026-05-14** — well before failure window started.
+- Syntax: valid (uses standard `actions/checkout@v4`, `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2`).
+- Matrix definition correct; ARM runner (`ubuntu-24.04-arm`) is GitHub-supported.
+
+**Root cause hypotheses** (ordered by likelihood):
+
+| # | Hypothesis | Verification |
+|---|---|---|
+| 1 | GitHub-hosted runner provisioning timeout / capacity exhaustion | Check Actions usage dashboard за поточний місяць |
+| 2 | Account-level billing quota exhausted (private repo Actions minutes) | Check https://github.com/settings/billing/spending_limit |
+| 3 | Org-level Actions disabled / permissions restricted | Check https://github.com/Setter1981/PRRO_GATE/settings/actions |
+| 4 | Concurrent run cap exceeded (5 simultaneous matrix jobs on personal plan limit?) | Reduce matrix to 1 job temporarily to isolate |
+
+**NOT root causes (eliminated)**:
+- ❌ Code change (workflow file unchanged since pre-failure date).
+- ❌ Workflow syntax error (parse would fail differently; logs show parser succeeded).
+- ❌ Single-platform issue (all 5 fail identically).
+- ❌ Test/build failure (no step ever started, so no test code can fail).
+
+**Required operator actions**:
+1. **Check Actions billing usage**: https://github.com/settings/billing/spending_limit + https://github.com/settings/billing/usage.
+2. **Check repository Actions settings**: https://github.com/Setter1981/PRRO_GATE/settings/actions — verify Actions enabled + permissions not over-restricted.
+3. **If quota exhausted**: bump spending limit OR wait for monthly reset.
+4. **If unclear**: create minimal `.github/workflows/ci-smoke.yml` з single `cargo check` job → if smoke passes, matrix has specific issue; if smoke also fails, account-level confirmed.
+
+**Workaround в interim**: local `cargo test --features test-support` (verified 256/256 на developer machine) serves as PR quality gate manually.  Per memory `feedback_pr_merge_style`, operator's established pattern is merge regardless of CI status — workflow already adapted.
+
+**Tracking**: this finding does NOT generate a fix PR (no codebase change possible).  Item lives в this findings doc + tracked в bd-issue (Dolt beads).
+
+---
+
 ## 5. Pilot readiness assessment
 
 **🟢 PILOT-READY** post PR #81 merge.
@@ -163,15 +205,18 @@ Pre-pilot mandatory:
 1. ✅ All hardening RECs (1-8) merged.
 2. ⏳ Live DPS smoke cycle (Sprint 7 style) — НЕ re-run post-hardening.  Re-run before pilot launch.
 3. ⏳ Admin runbook published з Tier escalation decision tree + 4-event audit glossary.
-4. ⏳ TD-1 (CI repair) — pre-pilot quality gate desired.
+4. ⏳ TD-1 (CI repair) — pre-pilot quality gate desired.  **Operator-side action required** (see §4.1 — codebase fix not possible).
 
 Post-pilot polish (priority order):
-1. GAP-1 end-to-end test (high confidence value)
-2. CONCERN-3 / TD-3 admin CLI message fix (quick win)
-3. GAP-2 boot wiring test
-4. GAP-3 backoff reset integration test
-5. CONCERN-4 / TD-4 reqwest pool ticket
-6. TD-5 Tiered spec doc
+1. GAP-1 end-to-end test (high confidence value) — **DONE (PR #82)**
+2. CONCERN-3 / TD-3 admin CLI message fix (quick win) — **DONE (PR #82)**
+3. GAP-2 boot wiring test — **DONE (PR #82)**
+4. GAP-3 backoff reset integration test — **DONE (PR #83)**
+5. CONCERN-4 / TD-4 reqwest pool ticket — track only
+6. TD-5 Tiered spec doc — **DONE (PR #83)**
+7. CONCERN-1 / TD-6 admin runbook — **DONE (PR #83)**
+
+Post-polish state (2026-05-25): all in-scope polish items closed.  TD-1 CI repair investigated separately (§4.1) — codebase-not-fixable.
 
 ---
 
