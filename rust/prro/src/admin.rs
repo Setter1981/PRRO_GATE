@@ -57,7 +57,7 @@ pub enum AdminError {
     /// Operator using wrong command (FN is in different state).  Refuses
     /// to mutate to avoid masking legitimate state.
     #[error(
-        "admin: fiscal_number {fiscal_number:?} current mode is {observed_mode:?}, expected STOP_MODE — operator command misuse (use --target-mode flag or check intended FN)"
+        "admin: fiscal_number {fiscal_number:?} current mode is {observed_mode:?}, expected STOP_MODE — operator command misuse (FN is not in STOP_MODE; check intended FN or wait until Tier-2 escalation triggers)"
     )]
     NotInStopMode {
         fiscal_number: String,

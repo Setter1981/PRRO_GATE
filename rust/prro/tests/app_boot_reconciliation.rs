@@ -1254,6 +1254,76 @@ async fn boot_signed_dispatch_shift_missing_increments_structural_bug_bucket() {
     );
 }
 
+// ─── Polish GAP-2: orphan scanner App-boot wiring validation ─────────
+
+/// **Polish cycle / GAP-2 (2026-05-25)** — validates that
+/// `boot_phase::close_orphan_transport_traces` is actually wired into
+/// `App::reconcile_pending` (NOT just the function-level contract).
+/// Existing `rec3_*` tests call the scanner directly — pass even if
+/// someone removes the call from `app.rs::reconcile_pending_inner`.
+/// This test boots the full App, seeds a pre-boot orphan trace, then
+/// calls `App::reconcile_pending` and asserts the orphan was closed —
+/// false-positive proof for the boot-wiring contract.
+#[tokio::test]
+async fn rec3_app_boot_wires_orphan_trace_scanner() {
+    let (_d, app, pool) = boot_app_with_db("rec3_wiring.db").await;
+    sqlx::query(
+        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES ('1234567890', '12345678', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Pre-seed orphan trace BEFORE invoking reconcile.  Doc must exist
+    // for FK; reuse seed_doc_in_state helper.
+    let doc = seed_doc_in_state(&pool, "1234567890", 0x77, "SENT").await;
+    sqlx::query(
+        "INSERT INTO transport_trace( \
+            document_id, attempt_no, started_at, backend_profile_id, \
+            transport_profile_id, request_envelope_sha256) \
+         VALUES (?, 1, datetime('now', '-120 seconds'), 'b1', 't1', ?)",
+    )
+    .bind(doc)
+    .bind(vec![0u8; 32])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Pre-boot: orphan present.
+    let pre_outcome: Option<String> = sqlx::query_scalar(
+        "SELECT outcome_kind FROM transport_trace WHERE document_id = ? AND attempt_no = 1",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(pre_outcome.is_none(), "pre-reconcile orphan MUST be NULL");
+
+    // Invoke App::reconcile_pending — boot scanner MUST fire as
+    // first step inside reconcile_pending_inner.  We tolerate Err
+    // result (FN may have GoingOnline mode etc.) — only test that
+    // scanner ran (orphan closed).
+    let _ = app.reconcile_pending().await;
+
+    // Post-boot: orphan closed з SYSTEM_CRASH.
+    let post_outcome: String = sqlx::query_scalar(
+        "SELECT outcome_kind FROM transport_trace WHERE document_id = ? AND attempt_no = 1",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        post_outcome, "SYSTEM_CRASH",
+        "App::reconcile_pending MUST wire boot orphan scanner — orphan closed з SYSTEM_CRASH"
+    );
+    assert_eq!(
+        audit_count(&pool, "TRANSPORT_TRACE_ORPHAN_CLOSED").await,
+        1,
+        "1 TRANSPORT_TRACE_ORPHAN_CLOSED audit MUST emit via App wiring path"
+    );
+}
+
 // ─── Phase 3 REC-3: orphan transport_trace garbage collection ────────
 
 /// **Phase 3 / REC-3 (2026-05-24)** — boot orphan-trace scanner closes
