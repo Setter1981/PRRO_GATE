@@ -15,7 +15,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::Status;
 
 use super::channel::DpsChannel;
@@ -60,10 +60,23 @@ impl GrpcDpsChannel {
     /// on the first RPC.  Validates the URI and configures the
     /// default per-call deadline.
     pub async fn connect(endpoint: &str, request_timeout: Duration) -> Result<Self, DpsError> {
-        let ep = Endpoint::from_shared(endpoint.to_string())
+        let mut ep = Endpoint::from_shared(endpoint.to_string())
             .map_err(|e| DpsError::Transport(format!("invalid endpoint URI: {e}")))?
             .timeout(request_timeout)
             .connect_timeout(request_timeout);
+        // **TLS fix 2026-05-25 (smoke A/B root cause)**: `https://`
+        // endpoints require explicit `tls_config(...)` on tonic 0.12
+        // — without it the channel silently fails з "transport error"
+        // on first RPC.  `with_native_roots()` mirrors Python
+        // grpc.ssl_channel_credentials(root_certificates=None) behavior
+        // (uses OS native trust store).  Plain `http://` endpoints
+        // unaffected (used by in-process mock tests in
+        // dps_channel_smoke.rs).
+        if endpoint.starts_with("https://") {
+            ep = ep
+                .tls_config(ClientTlsConfig::new().with_native_roots())
+                .map_err(|e| DpsError::Transport(format!("tls config: {e}")))?;
+        }
         let channel = ep
             .connect()
             .await
