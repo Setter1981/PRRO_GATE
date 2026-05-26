@@ -659,6 +659,65 @@ dispatch → send → finalize.
   `DocumentMissing`.
 
 **Algorithm (per worker, per work item):**
+
+0. **DTO → stage_sign payload conversion + unsupported-DocType
+   reject policy** (W3 deferred surface — added per audit
+   2026-05-26).  BEFORE `stage_acquire::run`, the worker MUST
+   transform `command.payload_json` from the wire-shape
+   driver DTO (`ReceiptPayload { goods[], payments[], totals,
+   raw_frames }`) into the internal canonical shape that
+   `services/write_path/stage_sign::parse_payload` expects:
+
+      - `CheckJson { items[]: { code, name, price_kop,
+        quantity_thousandths, sum_kop }, payments[]: { name,
+        sum_kop, type_code } }`        — for SELL / RETURN.  Pure
+        structural conversion of `FiscalLine` + `CanonicalPayment`
+        — no ledger access needed.
+
+      - `ZReportJson { payments[]: { name, sum_in_kop, sum_out_kop,
+        type_code }, sell_count, return_count }`
+                                       — for SHIFT_CLOSE / Z_REPORT.
+        `sell_count` / `return_count` are repository-derived (count
+        rows since `shift_open_at_business_ts` grouped by direction).
+        REQUIRES pool access.
+
+      - `ShiftOpenJson { opening_sum_kop }`
+                                       — for SHIFT_OPEN.  Currently
+        not in W3 DTO `Totals`; if driver does not provide it the
+        worker uses 0 + writes an audit_log warning, OR (later)
+        plumbs through `raw_frames`.
+
+   For `command.doc_type ∈ { XReport, ServiceIn, ServiceOut,
+   CashWithdrawal }`: pick ONE of the following stances, with
+   single source of truth being `derive_wire_artifact_kind`'s
+   match:
+
+   - **Reject-at-boundary (preferred)** — worker calls
+     `derive_wire_artifact_kind(doc_type)` BEFORE acquire and
+     surfaces `Refused(UnsupportedDocType)` instead of letting
+     stage_sign reject post-acquire.  Saves a doc row write.
+
+   - **Reject-late (current behaviour)** — worker proceeds; sign
+     stage returns `SignError::UnsupportedDocType`; worker maps
+     to `WireError(Internal)`.
+
+   The two `#[ignore]`'d gap-documentation tests in
+   `rust/prro/tests/ingress_dto_parity.rs` —
+   `mapped_payload_json_is_wire_shape_not_stage_sign_ready` and
+   `xreport_servicein_serviceout_cashwithdrawal_map_but_signer_will_reject`
+   — MUST be unignored and inverted as part of this step:
+
+   - First: replace the wire-DTO field structural assertions
+     (`contains("price_kopecks")`) with positive parse-through
+     assertions calling stage_sign's payload parser on the
+     converted JSON.
+   - Second: replace the accept-loop with either an expect_err
+     loop (reject-at-boundary chosen) OR an expect_ok loop
+     (signer-side accept chosen).
+
+   See `docs/superpowers/plans/2026-05-25-m4-ingress-plan.md` §3
+   W3 acceptance addendum for the original audit finding.
+
 1. `stage_acquire::run(pool, request_id, command)` →
    - `Noop` → reply `DocumentMissing` (already-leased by another
      copy; should not happen under per-FN serialisation, but typed).
