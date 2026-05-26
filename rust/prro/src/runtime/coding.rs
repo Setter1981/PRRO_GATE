@@ -29,6 +29,7 @@
 //! `docs/superpowers/plans/2026-05-25-m4-ingress-plan.md` §3 W2.
 
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// XOR mask.  Single byte chosen arbitrarily; the constant is NOT a
 /// secret.  Documented only so a future reader knows the on-disk
@@ -60,10 +61,16 @@ impl Coding {
     }
 
     /// Deobfuscate.  Length-preserving; inverse of [`Self::encode`].
-    pub fn decode(obfuscated: &[u8]) -> Result<Vec<u8>, CodingError> {
+    ///
+    /// Returns the plaintext wrapped in [`Zeroizing`] so the recovered
+    /// secret is wiped from heap on drop.  Callers MUST pass the
+    /// resulting slice to consumers (e.g., [`crate::runtime::bindings::
+    /// OperatorKeyLoader::load`]) by reference, NOT by clone — cloning
+    /// loses the wipe guarantee for the duplicate buffer.
+    pub fn decode(obfuscated: &[u8]) -> Result<Zeroizing<Vec<u8>>, CodingError> {
         if obfuscated.is_empty() {
             return Err(CodingError::EmptyInput);
         }
-        Ok(obfuscated.iter().map(|b| b ^ MASK).collect())
+        Ok(Zeroizing::new(obfuscated.iter().map(|b| b ^ MASK).collect()))
     }
 }

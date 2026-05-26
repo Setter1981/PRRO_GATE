@@ -316,28 +316,45 @@ pub fn acquire_password<P: PasswordPrompter>(
     fn is_blank(s: &str) -> bool {
         s.is_empty() || s.chars().all(|c| c.is_whitespace())
     }
+    // Intermediate `String` values from the prompter are wrapped in
+    // `Zeroizing` immediately so the heap allocation of the typed
+    // password is wiped on drop — without this, `String::drop` leaves
+    // the bytes recoverable in freed heap pages until reuse.
+    // `Zeroizing<String>` is available because `zeroize` 1.8 with the
+    // default `alloc` feature implements `Zeroize for String` by
+    // overwriting the string's bytes before deallocation.
     if is_tty {
-        let first = prompter
-            .prompt("Cashier key password: ")
-            .map_err(|e| AdminError::PasswordReadIo(e.to_string()))?;
+        let first: Zeroizing<String> = Zeroizing::new(
+            prompter
+                .prompt("Cashier key password: ")
+                .map_err(|e| AdminError::PasswordReadIo(e.to_string()))?,
+        );
         if is_blank(&first) {
             return Err(AdminError::EmptyPassword);
         }
-        let second = prompter
-            .prompt("Repeat password: ")
-            .map_err(|e| AdminError::PasswordReadIo(e.to_string()))?;
-        if first != second {
+        let second: Zeroizing<String> = Zeroizing::new(
+            prompter
+                .prompt("Repeat password: ")
+                .map_err(|e| AdminError::PasswordReadIo(e.to_string()))?,
+        );
+        if *first != *second {
             return Err(AdminError::PasswordMismatch);
         }
-        Ok(Zeroizing::new(first.into_bytes()))
+        // Hand the bytes to the caller wrapped in Zeroizing so the
+        // owned Vec is also wiped on drop.  The intermediate
+        // `Zeroizing<String>` values (`first`, `second`) are wiped
+        // by their own Drop at end of scope.
+        Ok(Zeroizing::new(first.as_bytes().to_vec()))
     } else {
-        let one = prompter
-            .prompt("")
-            .map_err(|e| AdminError::PasswordReadIo(e.to_string()))?;
+        let one: Zeroizing<String> = Zeroizing::new(
+            prompter
+                .prompt("")
+                .map_err(|e| AdminError::PasswordReadIo(e.to_string()))?,
+        );
         if is_blank(&one) {
             return Err(AdminError::EmptyPassword);
         }
-        Ok(Zeroizing::new(one.into_bytes()))
+        Ok(Zeroizing::new(one.as_bytes().to_vec()))
     }
 }
 
@@ -351,7 +368,12 @@ pub fn acquire_password<P: PasswordPrompter>(
 /// Callers needing a second copy must construct a new
 /// `AddOperatorInput` explicitly so the duplication is visible at
 /// the call site.
-#[derive(Debug)]
+///
+/// **Custom `Debug`**: the derived `Debug` would delegate password
+/// formatting to `Zeroizing<Vec<u8>>` which in turn delegates to
+/// `Vec<u8>` — leaking the plaintext bytes via `{:?}` / `dbg!` /
+/// any `tracing::` macro that uses Debug formatter on the struct.
+/// We hand-implement Debug below to redact the password field.
 pub struct AddOperatorInput {
     /// Cashier identifier — typically the cashier's INN per CLI
     /// `--inn` flag.  Required.
@@ -372,6 +394,18 @@ pub struct AddOperatorInput {
     /// before storage and the wrapper ensures no stray copy survives
     /// past the encode call site.
     pub password: Zeroizing<Vec<u8>>,
+}
+
+impl std::fmt::Debug for AddOperatorInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AddOperatorInput")
+            .field("operator_id", &self.operator_id)
+            .field("name", &self.name)
+            .field("key_path", &self.key_path)
+            .field("fiscal_number", &self.fiscal_number)
+            .field("password", &"<redacted; len omitted>")
+            .finish()
+    }
 }
 
 /// W2 — register a new cashier (operator) bound to a fiscal_number.
@@ -446,16 +480,30 @@ pub async fn add_operator(
         key_pass_enc,
     };
 
-    match crate::db::repositories::operators::insert(pool_secure, &new_op).await {
-        Ok(()) => {}
-        Err(crate::db::repositories::operators::OperatorsRepoError::DuplicateActive(fn_id)) => {
-            return Err(AdminError::DuplicateActiveCashier(fn_id));
-        }
-        Err(crate::db::repositories::operators::OperatorsRepoError::Db(e)) => {
-            return Err(AdminError::Infrastructure(format!("INSERT operators: {e}")));
-        }
-    }
-
+    // ---- Atomicity discipline under SQLite cross-DB constraint ----
+    //
+    // SQLite cannot wrap an INSERT into `pool_secure.operators` and an
+    // INSERT into `pool_main.audit_log` in one transaction; the two
+    // pools are physically separate files (HIGH-AUDIT-01).
+    //
+    // We order the two writes audit-FIRST then INSERT-SECOND so a
+    // crash / OOM / disk-full between them leaves a recoverable
+    // forensic trail rather than a silent successful registration:
+    //
+    //   - audit append fails  -> no operator landed; operator can retry.
+    //   - audit succeeds, INSERT fails (DuplicateActive / DB error)
+    //     -> audit row carries the rejection-cause; pair is reconciled
+    //        by an operator runbook search on the FN.
+    //   - audit succeeds, process crashes BEFORE INSERT -> next
+    //     `prro` boot has no operator row for this FN, but the audit
+    //     trail proves an attempt was made; the operator runbook
+    //     calls for re-running `add-operator`.
+    //
+    // The reverse order (INSERT first, audit second) would create the
+    // worst case: a successful operator registration with NO audit row
+    // — an active signing operator with no forensic record.  External
+    // audit Round 2 finding #2 explicitly flagged that prior ordering.
+    //
     // Forensic audit — payload carries identifiers + key_path ONLY.
     // Password / encoded BLOB MUST NEVER appear in audit_log per
     // [[feedback_db_vs_log_separation]] memory + security-reviewer pin.
@@ -480,6 +528,16 @@ pub async fn add_operator(
     )
     .await
     .map_err(|e| AdminError::Infrastructure(format!("audit append: {e}")))?;
+
+    match crate::db::repositories::operators::insert(pool_secure, &new_op).await {
+        Ok(()) => {}
+        Err(crate::db::repositories::operators::OperatorsRepoError::DuplicateActive(fn_id)) => {
+            return Err(AdminError::DuplicateActiveCashier(fn_id));
+        }
+        Err(crate::db::repositories::operators::OperatorsRepoError::Db(e)) => {
+            return Err(AdminError::Infrastructure(format!("INSERT operators: {e}")));
+        }
+    }
 
     Ok(())
 }

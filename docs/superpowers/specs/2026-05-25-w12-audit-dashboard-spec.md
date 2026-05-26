@@ -339,6 +339,80 @@ GROUP BY ttl_secs
 ORDER BY ttl_secs ASC;
 ```
 
+### 4.9 W2 — Operator key-load failures (last 24h)
+
+**Panel**: stat + table, "Boot-time operator load failures (24h)".
+
+```sql
+SELECT
+  entity_id AS fiscal_number,
+  json_extract(event_payload_json, '$.reason') AS reason,
+  json_extract(event_payload_json, '$.key_path') AS key_path,
+  created_at
+FROM audit_log
+WHERE entity_type = 'operator'
+  AND event_type = 'OPERATOR_KEY_LOAD_FAILED'
+  AND created_at >= datetime('now', '-1 day')
+ORDER BY created_at DESC;
+```
+
+**Interpretation**: every row = one FN that started boot without a usable cashier key.  `reason ∈ {FileNotFound, WrongPassword, EmptyEncoded, Other}`.  Each FN listed here is currently 503-ing every fiscal request (no `BindingsRegistry` entry).  Runbook §6a recovery scenarios match each `reason`.
+
+### 4.10 W2 — Orphan operator rows (cross-DB FK violations)
+
+**Panel**: stat + table, "Orphan operator rows (HIGH-PR90-01)".
+
+```sql
+SELECT
+  entity_id AS fiscal_number,
+  json_extract(event_payload_json, '$.operator_id') AS operator_id,
+  json_extract(event_payload_json, '$.key_path') AS key_path,
+  created_at
+FROM audit_log
+WHERE entity_type = 'operator'
+  AND event_type = 'OPERATOR_ORPHAN_FN'
+  AND created_at >= datetime('now', '-30 days')
+ORDER BY created_at DESC;
+```
+
+**Interpretation**: every row = an `operators.fiscal_number` that has no matching `fiscal_number_config` row.  Caused by either (a) `fiscal_number_config` row deleted post-registration, or (b) operator typo at registration that PR-B's CLI pre-check missed (shouldn't happen but defence-in-depth).
+
+### 4.11 W2 — Configured FNs without operator registration
+
+**Panel**: stat, "Configured FNs without active cashier".
+
+```sql
+SELECT COUNT(DISTINCT entity_id) AS unregistered_fn_count
+FROM audit_log
+WHERE entity_type = 'operator'
+  AND event_type = 'OPERATOR_NOT_REGISTERED'
+  AND created_at >= datetime('now', '-1 hour');
+```
+
+**Interpretation**: each emit = one boot tick where a configured FN had no operators row.  Steady-state non-zero indicates an FN configured in `fiscal_number_config` is unusable until `prro admin add-operator` lands the registration.  Info severity — operator-awareness only.
+
+### 4.12 W2 — Operator registration trail (forensic)
+
+**Panel**: table, "Recent operator registrations (30d)".
+
+```sql
+SELECT
+  created_at,
+  entity_id AS fiscal_number,
+  json_extract(event_payload_json, '$.operator_id') AS operator_id,
+  json_extract(event_payload_json, '$.name')        AS cashier_name,
+  json_extract(event_payload_json, '$.key_path')    AS key_path
+FROM audit_log
+WHERE entity_type = 'operator'
+  AND event_type = 'ADMIN_OPERATOR_REGISTERED'
+  AND created_at >= datetime('now', '-30 days')
+ORDER BY created_at DESC;
+```
+
+**Interpretation**: every `prro admin add-operator` invocation lands a row here.  Used for cashier-rotation audit + reconciliation of "add-operator attempted but operators table unexpectedly empty" failure-mode (see atomicity discipline in `admin.rs::add_operator` — audit precedes INSERT so a partial failure leaves the audit trail).
+
+**⚠ PII NOTE**: panels 4.9 / 4.10 / 4.12 expose `operator_id` (cashier INN) and `key_path` (filesystem path that may contain cashier names) to anyone who can read this datasource.  See §9 "Out of scope" for the operational mandate on Grafana datasource access control.
+
 ---
 
 ## 5. Composite dashboard layout
@@ -376,8 +450,12 @@ Three distinct entity_type values спричиняють need for explicit join 
 | OFFLINE_DRAIN_FN_STOP_MODE | `fiscal_document` | doc_id hex | direct: `json_extract(event_payload_json, '$.fiscal_number')` OR same join as above |
 | ADMIN_STOP_MODE_RESET | `fn` | fiscal_number | direct: `entity_id` = fiscal_number |
 | TRANSPORT_TRACE_ORPHAN_CLOSED | `transport_trace` | doc_id hex | `JOIN fiscal_documents ON fd.document_id = al.entity_id` |
+| OPERATOR_KEY_LOAD_FAILED | `operator` | fiscal_number | direct: `entity_id` = fiscal_number |
+| OPERATOR_ORPHAN_FN | `operator` | fiscal_number | direct: `entity_id` = fiscal_number (BUT FN is missing from fiscal_number_config by definition — no join target on main side) |
+| OPERATOR_NOT_REGISTERED | `operator` | fiscal_number | direct: `entity_id` = fiscal_number |
+| ADMIN_OPERATOR_REGISTERED | `operator` | fiscal_number | direct: `entity_id` = fiscal_number |
 
-**Naming inconsistency note**: `entity_type = "fn"` для admin resets vs `"fiscal_document"` для drain Tier 1/2 is a real asymmetry в codebase. NOT recommended to retrofit ("fn" was the choice операторської фактично-FN-scoped action; "fiscal_document" reflects drain emission's per-doc-loop origin). Dashboards must use the column tags explicitly per table above.
+**Naming inconsistency note**: `entity_type = "fn"` для admin resets vs `"fiscal_document"` для drain Tier 1/2 vs `"operator"` для W2 boot-time events is a real asymmetry в codebase. NOT recommended to retrofit ("fn" was the choice операторської фактично-FN-scoped action; "fiscal_document" reflects drain emission's per-doc-loop origin). Dashboards must use the column tags explicitly per table above.
 
 ---
 
@@ -387,11 +465,15 @@ Three distinct entity_type values спричиняють need for explicit join 
 
 - `ADMIN_STOP_MODE_RESET` count > 0 in last 60min → page (operator should be aware of every reset).
 - `OFFLINE_DRAIN_FN_STOP_MODE` count > 0 in last 5min → page (Tier 2 = critical FN suspension).
+- **W2**: `OPERATOR_KEY_LOAD_FAILED` count > 0 in last 5min → page (FN cannot sign — every customer request 503s; operator runbook §6a recovery is required).
+- **W2**: `OPERATOR_ORPHAN_FN` count > 0 in last 60min → page (HIGH-PR90-01 cross-DB FK violation; either main-DB drift or operator typo at registration; runbook §6a recovery — DELETE operator row + re-register OR add missing `fiscal_number_config` row).
 
 ### 7.2 Notify on-call (P2, no page)
 
 - `KVT2_CONFIRM_PROLONGED_HOLD` distinct_docs > 5 in last 30min on single FN → notify (Tier 1 escalation candidate).
 - `TRANSPORT_TRACE_ORPHAN_CLOSED` > 0 in last 60min after a fresh boot → notify (verifies recovery worked).
+- **W2**: `OPERATOR_NOT_REGISTERED` count for a given FN > 0 sustained over multiple boots → notify (configured FN has no active cashier; operator should run `prro admin add-operator` per runbook §6a or accept the FN-deregistered state).
+- **W2**: `ADMIN_OPERATOR_REGISTERED` count > 0 → notify with payload (informational forensic trail; legitimate during cashier onboarding / rotation, anomalous outside operational windows).
 
 ### 7.3 Slow-burn anomaly (P3, daily digest)
 
@@ -431,6 +513,11 @@ ON audit_log(event_type, created_at DESC);
 - **Prometheus exporter sidecar** — Option B § 2, post-pilot M3+ scope.
 - **Long-term retention** — audit_log в SQLite grows unbounded; post-pilot need archival policy (rollover-to-parquet або similar). NOT in pilot scope; SQLite handles years of audit data fine for pilot scale.
 - **PII redaction** — `reason` field в ADMIN_STOP_MODE_RESET може містити operator notes. Pilot operator scope = trusted (per `feedback_autonomous_isolated_env`); production multi-tenant deployment would need redaction.
+- **W2 operator-event PII access control — OPERATIONAL MANDATE (NOT optional for production).** Panels §4.9 / §4.10 / §4.12 expose `operator_id` (cashier INN — Personal Identifiable Information under Ukrainian privacy law / GDPR) and `key_path` (filesystem path that may carry cashier names). The Grafana SQLite datasource that backs these panels reads `var/prro.db` directly; any user with read access to that datasource sees the PII. **Required before production deployment**:
+    1. EITHER restrict the Grafana datasource to a subset of Grafana users via Grafana RBAC + folder permissions (panels §4.9–§4.12 live in a "forensic / operator-PII" folder accessible only to compliance/security roles);
+    2. OR introduce a `audit_log_public` SQL view that redacts `operator_id` (hash with a salt held outside the datasource) and `key_path` (strip to basename / null), and point Grafana at the view only;
+    3. OR (multi-tenant only) move the operator-event payloads to a dedicated audit DB with its own ACL — out of pilot scope; deferred design.
+  Pilot scope (single-tenant, single-operator self-hosted per `feedback_autonomous_isolated_env`) accepts unredacted access because the dashboard reader IS the operator who registered the cashiers. The mandate above MUST be acted on BEFORE the gateway is exposed to any reader who is not the registering operator.
 - **Per-operator-tenant slicing** — single-tenant pilot; multi-tenant slicing deferred.
 
 ---

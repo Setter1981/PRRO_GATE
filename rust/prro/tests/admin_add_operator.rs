@@ -104,7 +104,7 @@ async fn happy_path_inserts_row_with_encoded_password_and_audit() {
     );
     // Decoded round-trips back to the plaintext.
     let decoded = Coding::decode(&row.key_pass_enc).unwrap();
-    assert_eq!(decoded, plaintext_pw);
+    assert_eq!(&decoded[..], plaintext_pw);
 
     // Audit: ADMIN_OPERATOR_REGISTERED Info, payload contains
     // operator_id + key_path but NOT the password.

@@ -32,7 +32,7 @@ fn roundtrip_all_byte_values_is_bijective() {
         "obfuscation must change at least one byte (output != input)"
     );
     let decoded = Coding::decode(&encoded).expect("decode round-trips");
-    assert_eq!(decoded, plain, "decode(encode(x)) == x for full byte range");
+    assert_eq!(&decoded[..], &plain[..], "decode(encode(x)) == x for full byte range");
 }
 
 #[test]
