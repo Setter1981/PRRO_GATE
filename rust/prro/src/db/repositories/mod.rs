@@ -5,6 +5,7 @@ pub mod fiscal_number_config;
 pub mod ingress_inbox;
 pub mod node_state;
 pub mod offline_sessions;
+pub mod operators;
 pub mod outbox;
 pub mod shifts;
 pub mod transport_trace;

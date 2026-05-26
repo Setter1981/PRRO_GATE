@@ -60,6 +60,31 @@ enum AdminCmd {
         #[arg(long)]
         reason: String,
     },
+
+    /// W2 — register a cashier (operator) and bind their EDS key to a
+    /// fiscal number.  Inserts a row into the secure DB's `operators`
+    /// table.  Password is acquired interactively: TTY mode requires
+    /// double-entry confirmation; non-TTY mode reads a single line
+    /// from stdin (CI / scripted use).
+    AddOperator {
+        #[arg(long)]
+        config: PathBuf,
+        /// Cashier identifier — typically the cashier's INN.
+        #[arg(long)]
+        inn: String,
+        /// Human-readable cashier name (forensic trail).
+        #[arg(long)]
+        name: String,
+        /// Filesystem path to the cashier's `.dat` / `.jks` EDS carrier.
+        #[arg(long)]
+        key_path: String,
+        /// Fiscal number to bind the cashier to.  Must exist in
+        /// `fiscal_number_config` (main DB) — pre-INSERT check
+        /// surfaces a clean error rather than letting the boot-time
+        /// `OPERATOR_ORPHAN_FN` audit catch the typo hours later.
+        #[arg(long = "fn")]
+        fiscal_number: String,
+    },
 }
 
 /// Read config file → parse → boot.  On any `BootError`, prints the
@@ -168,6 +193,30 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(err) => {
                     eprintln!("prro admin reset-stop-mode: {err}");
+                    std::process::exit(err.exit_code());
+                }
+            },
+            AdminCmd::AddOperator {
+                config,
+                inn,
+                name,
+                key_path,
+                fiscal_number,
+            } => match prro::admin::run_add_operator(
+                &config,
+                inn,
+                name,
+                key_path,
+                fiscal_number.clone(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    println!("ADMIN_OPERATOR_REGISTERED OK fiscal_number={fiscal_number}");
+                    Ok(())
+                }
+                Err(err) => {
+                    eprintln!("prro admin add-operator: {err}");
                     std::process::exit(err.exit_code());
                 }
             },

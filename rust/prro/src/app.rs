@@ -139,6 +139,19 @@ pub struct App {
 struct Inner {
     config: AppConfig,
     db: SqlitePool,
+    /// W2 / HIGH-AUDIT-01 — secure pool holding the `operators` table
+    /// (cashier EDS-key registry).  Lives in `var/secure.db` per
+    /// `DatabaseCfg.secure_db_path`; opened with `chmod 0o600` and
+    /// physically isolated from `db` per the external audit finding.
+    ///
+    /// W2 PR-B: pool is opened at boot so the secure file is created
+    /// + migrated alongside the main DB; the consumer that turns
+    /// `operators` rows into a `BindingsRegistry` lives in W7
+    /// (supervisor wiring).  No production code path reads from
+    /// `db_secure` in this PR; the field exists so the admin CLI
+    /// (`add-operator`) and W7 can share the same pool handle the
+    /// boot owner already locked + migrated.
+    db_secure: SqlitePool,
     /// Singleton process lock — held for App lifetime.  Dropped on App
     /// drop, releasing the OS advisory lock.  Per freeze NIT 1 fix:
     /// field has no underscore prefix because it IS load-bearing via
@@ -332,10 +345,35 @@ impl App {
             return Err(BootError::IntegrityCheckFailed { reason });
         }
 
+        // (4b) W2 / HIGH-AUDIT-01 — open the secure pool AFTER the main
+        //      pool's quick_check passes but BEFORE the App is handed
+        //      to recovery.  Secure pool failure aborts boot fail-closed:
+        //      operating without an operators store means every handler
+        //      returns 503; better to refuse to start than to silently
+        //      run un-bindable.  Same map_err split as `open_pool` so
+        //      sqlx errors keep their `BootError::Database` shape.
+        if let Some(parent) = config.database.secure_db_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    BootError::Internal(format!(
+                        "creating secure db parent dir {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+        }
+        let db_secure = crate::db::open_secure_pool(&config.database.secure_db_path)
+            .await
+            .map_err(|e| match e.downcast::<sqlx::Error>() {
+                Ok(sqlx_err) => BootError::Database(sqlx_err),
+                Err(other) => BootError::Internal(format!("open_secure_pool: {other}")),
+            })?;
+
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
                 db,
+                db_secure,
                 singleton,
                 reconcile_mutex: tokio::sync::Mutex::new(()),
                 backoff_state: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -661,6 +699,18 @@ impl App {
 
     pub fn db(&self) -> &SqlitePool {
         &self.inner.db
+    }
+
+    /// W2 / HIGH-AUDIT-01 — handle to the **secure** SQLite pool
+    /// (holds only the `operators` table; physically isolated from
+    /// `db`).  Used by the admin CLI's `add-operator` command and,
+    /// in W7, by the supervisor that builds
+    /// [`crate::runtime::bindings::BindingsRegistry`] at startup.
+    /// Production code MUST NOT mix this pool with `db` in a single
+    /// `with_immediate` envelope (cross-DB transactions are not a
+    /// thing in SQLite).
+    pub fn db_secure(&self) -> &SqlitePool {
+        &self.inner.db_secure
     }
 
     /// M3b W8b — App-owned return-online probe wiring seam.
