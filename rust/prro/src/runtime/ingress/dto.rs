@@ -207,15 +207,59 @@ pub fn to_canonical_fiscal_command(
         }
     };
 
+    // total_sum_kop derivation — explicit per variant so the None
+    // arms are intentional rather than the residue of a wildcard.
+    // Self-review finding #1 (2026-05-26): driver `Totals` struct only
+    // carries `sale_kopecks` + `return_kopecks`.  Cash-movement ops
+    // (ServiceIn / ServiceOut / CashWithdrawal) are MONETARY per UA
+    // fiscal protocol but the driver does not emit their amounts via
+    // `Totals` — the source data lives in `raw_frames` and is parsed
+    // by M5.  Until then `None` is the truthful answer: we don't
+    // know the cash amount at this layer.  `mac_recovery.rs` accepts
+    // NULL `total_sum_kop` (column is nullable) — the MAC chain
+    // input is `total_sum_kop OR 0` so a NULL doesn't break
+    // determinism, only obscures the cash subtotal in reporting
+    // queries.  SHIFT_OPEN / SHIFT_CLOSE / reports legitimately have
+    // no monetary total.
     let total_sum_kop = match cmd.command_type {
         CommandType::Sell => Some(cmd.payload.totals.sale_kopecks as i64),
         CommandType::Return => Some(cmd.payload.totals.return_kopecks as i64),
-        _ => None,
+        CommandType::ServiceIn
+        | CommandType::ServiceOut
+        | CommandType::CashWithdrawal => None, // M5: parse from raw_frames
+        CommandType::ShiftOpen
+        | CommandType::ShiftClose
+        | CommandType::XReport
+        | CommandType::ZReport => None, // no monetary total by design
+        CommandType::PeriodicReport => unreachable!(
+            "PeriodicReport rejected by command_type match arm above; \
+             control flow does not reach total_sum_kop derivation"
+        ),
     };
 
+    // business_ts at mapping time.  Wall-clock (`Utc::now()`) here
+    // means a retried `to_canonical_fiscal_command` call for the same
+    // logical fiscal event produces a DIFFERENT business_ts on each
+    // invocation.  `payload_sha256_canonical` is intentionally stable
+    // across retries (it hashes `cmd.payload` only — see below); but
+    // the persisted `fiscal_documents.business_ts` row differs between
+    // attempts, which the MAC-chain recovery path (`mac_recovery.rs`
+    // §business_ts read) treats as a fresh document.  Pre-pilot risk
+    // is bounded because `ingress_inbox::insert`'s idempotency_key
+    // probe blocks duplicate processing BEFORE business_ts lands.
+    // M5 plumbs the driver-supplied business clock through
+    // `raw_frames` parsing; this placeholder is the W3-scope contract.
     let business_ts = chrono::Utc::now().to_rfc3339();
 
-    let payload_json_bytes = canonical_json_bytes(cmd)?;
+    // Hash scope: `cmd.payload` ONLY — NOT the full envelope.  The
+    // field name `payload_sha256_canonical` promises payload-scope,
+    // and integrity-check semantics require that two retries with the
+    // same fiscal goods/payments but different `idempotency_key` /
+    // `cashier_id` / `department` produce the SAME hash (so an
+    // operator can detect payload tampering independently of routing
+    // metadata drift).  Envelope-level uniqueness is the
+    // `idempotency_key` field's job, not the hash's.
+    let payload_json_bytes = canonical_json_bytes(&cmd.payload)?;
     let payload_json = String::from_utf8(payload_json_bytes.clone())
         .expect("canonical JSON is always valid UTF-8 (serde_json output)");
     let payload_sha256_canonical: [u8; 32] = Sha256::digest(&payload_json_bytes).into();
