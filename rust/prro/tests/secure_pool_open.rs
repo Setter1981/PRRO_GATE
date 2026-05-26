@@ -19,6 +19,11 @@
 //!      migration apply (checksum guard).
 
 use sqlx::Row;
+// `PermissionsExt` is only available on Unix; the chmod-checking tests
+// below are `#[cfg(unix)]`-gated, so the import must be too — otherwise
+// `cargo test` on a Windows developer host fails compilation outright
+// (regression caught by external audit Round 4 finding B1).
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 /// Fresh secure pool — proves the migrations_secure set lands and

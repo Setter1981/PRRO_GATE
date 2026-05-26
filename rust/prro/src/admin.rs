@@ -586,7 +586,16 @@ pub async fn add_operator(
                 "reason": "DuplicateActiveCashier",
             })
             .to_string();
-            let _ = crate::db::repositories::audit_log::append(
+            // Audit-of-audit-failure observability (R4-3): the original
+            // intent of this branch is to surface the DuplicateActive
+            // error to the operator; we MUST NOT mask that error if the
+            // FAILED audit append itself fails.  But silent discard
+            // (the prior `let _ = ...`) leaves no forensic trail when
+            // the audit DB is the broken thing.  Compromise: log via
+            // `tracing::error!` so process logs at least record the
+            // audit failure cause; the primary error still propagates
+            // back to the operator as `DuplicateActiveCashier`.
+            if let Err(e) = crate::db::repositories::audit_log::append(
                 pool_main,
                 "operator",
                 &input.fiscal_number,
@@ -595,7 +604,16 @@ pub async fn add_operator(
                 None,
                 Some(&failed_payload),
             )
-            .await;
+            .await
+            {
+                tracing::error!(
+                    target: "prro::admin::add_operator",
+                    fiscal_number = %fn_id,
+                    cause = %e,
+                    "audit append for ADMIN_OPERATOR_REGISTRATION_FAILED \
+                     (DuplicateActive branch) FAILED — forensic trail missing"
+                );
+            }
             Err(AdminError::DuplicateActiveCashier(fn_id))
         }
         Err(crate::db::repositories::operators::OperatorsRepoError::Db(e)) => {
@@ -604,7 +622,8 @@ pub async fn add_operator(
                 "reason": format!("DbError: {e}"),
             })
             .to_string();
-            let _ = crate::db::repositories::audit_log::append(
+            // R4-3 observability — see DuplicateActive branch above.
+            if let Err(audit_err) = crate::db::repositories::audit_log::append(
                 pool_main,
                 "operator",
                 &input.fiscal_number,
@@ -613,7 +632,17 @@ pub async fn add_operator(
                 None,
                 Some(&failed_payload),
             )
-            .await;
+            .await
+            {
+                tracing::error!(
+                    target: "prro::admin::add_operator",
+                    fiscal_number = %input.fiscal_number,
+                    cause = %audit_err,
+                    insert_cause = %e,
+                    "audit append for ADMIN_OPERATOR_REGISTRATION_FAILED \
+                     (Db branch) FAILED — forensic trail missing"
+                );
+            }
             Err(AdminError::Infrastructure(format!("INSERT operators: {e}")))
         }
     }
