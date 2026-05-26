@@ -57,7 +57,7 @@ impl PasswordPrompter for ScriptedPrompter {
 fn tty_two_matching_passwords_returns_bytes() {
     let mut p = ScriptedPrompter::ok(&["matching-pw-123", "matching-pw-123"]);
     let bytes = acquire_password(&mut p, true).expect("matching passwords accepted");
-    assert_eq!(bytes, b"matching-pw-123");
+    assert_eq!(&bytes[..], b"matching-pw-123");
     assert_eq!(
         p.prompts_seen.len(),
         2,
@@ -77,7 +77,7 @@ fn tty_mismatched_passwords_returns_mismatch_error() {
 fn non_tty_single_line_returns_bytes() {
     let mut p = ScriptedPrompter::ok(&["scripted-pw-from-pipe"]);
     let bytes = acquire_password(&mut p, false).expect("non-TTY single line accepted");
-    assert_eq!(bytes, b"scripted-pw-from-pipe");
+    assert_eq!(&bytes[..], b"scripted-pw-from-pipe");
     assert_eq!(
         p.prompts_seen.len(),
         1,

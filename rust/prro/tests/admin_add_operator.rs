@@ -71,7 +71,7 @@ fn good_input(fn_id: &str, password: &[u8]) -> AddOperatorInput {
         name: "Test Cashier".into(),
         key_path: "/var/keys/cashier.dat".into(),
         fiscal_number: fn_id.into(),
-        password: password.to_vec(),
+        password: zeroize::Zeroizing::new(password.to_vec()),
     }
 }
 

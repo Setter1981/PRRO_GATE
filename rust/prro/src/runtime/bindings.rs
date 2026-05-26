@@ -173,13 +173,24 @@ impl BindingsRegistry {
 
         let mut inner: HashMap<String, OperatorBindings> = HashMap::new();
 
+        let total_active = active_rows.len();
+        let mut skipped_orphan: usize = 0;
+        let mut skipped_keyload: usize = 0;
+
         for row in active_rows {
             // Step 3a — cross-DB FK check.
             if !main_fns.contains(&row.fiscal_number) {
-                let payload = format!(
-                    r#"{{"operator_id":"{}","key_path":"{}"}}"#,
-                    row.operator_id, row.key_path,
+                tracing::warn!(
+                    target: "prro::runtime::bindings",
+                    fiscal_number = %row.fiscal_number,
+                    operator_id = %row.operator_id,
+                    "OPERATOR_ORPHAN_FN: operators row references FN not in fiscal_number_config; skipping"
                 );
+                let payload = serde_json::json!({
+                    "operator_id": row.operator_id,
+                    "key_path": row.key_path,
+                })
+                .to_string();
                 let _ = audit_log::append(
                     pool_main,
                     "operator",
@@ -190,6 +201,7 @@ impl BindingsRegistry {
                     Some(&payload),
                 )
                 .await;
+                skipped_orphan += 1;
                 continue;
             }
 
@@ -197,10 +209,19 @@ impl BindingsRegistry {
             let password = match Coding::decode(&row.key_pass_enc) {
                 Ok(p) => p,
                 Err(_) => {
-                    let payload = format!(
-                        r#"{{"operator_id":"{}","key_path":"{}","reason":"EmptyEncoded"}}"#,
-                        row.operator_id, row.key_path,
+                    tracing::warn!(
+                        target: "prro::runtime::bindings",
+                        fiscal_number = %row.fiscal_number,
+                        operator_id = %row.operator_id,
+                        reason = "EmptyEncoded",
+                        "OPERATOR_KEY_LOAD_FAILED: empty key_pass_enc BLOB; skipping"
                     );
+                    let payload = serde_json::json!({
+                        "operator_id": row.operator_id,
+                        "key_path": row.key_path,
+                        "reason": "EmptyEncoded",
+                    })
+                    .to_string();
                     let _ = audit_log::append(
                         pool_main,
                         "operator",
@@ -211,6 +232,7 @@ impl BindingsRegistry {
                         Some(&payload),
                     )
                     .await;
+                    skipped_keyload += 1;
                     continue;
                 }
             };
@@ -227,12 +249,19 @@ impl BindingsRegistry {
                     );
                 }
                 Err(e) => {
-                    let payload = format!(
-                        r#"{{"operator_id":"{}","key_path":"{}","reason":"{}"}}"#,
-                        row.operator_id,
-                        row.key_path,
-                        e.reason(),
+                    tracing::warn!(
+                        target: "prro::runtime::bindings",
+                        fiscal_number = %row.fiscal_number,
+                        operator_id = %row.operator_id,
+                        reason = e.reason(),
+                        "OPERATOR_KEY_LOAD_FAILED: loader rejected key; skipping"
                     );
+                    let payload = serde_json::json!({
+                        "operator_id": row.operator_id,
+                        "key_path": row.key_path,
+                        "reason": e.reason(),
+                    })
+                    .to_string();
                     let _ = audit_log::append(
                         pool_main,
                         "operator",
@@ -243,6 +272,7 @@ impl BindingsRegistry {
                         Some(&payload),
                     )
                     .await;
+                    skipped_keyload += 1;
                 }
             }
         }
@@ -250,6 +280,7 @@ impl BindingsRegistry {
         // Step 4 — emit OPERATOR_NOT_REGISTERED for configured FNs
         // without a registry entry (whether by orphan, key-fail, or
         // missing operators row).
+        let mut not_registered: usize = 0;
         for fn_id in configured_fns {
             if !inner.contains_key(fn_id) {
                 let _ = audit_log::append(
@@ -262,8 +293,19 @@ impl BindingsRegistry {
                     None,
                 )
                 .await;
+                not_registered += 1;
             }
         }
+
+        tracing::info!(
+            target: "prro::runtime::bindings",
+            registered = inner.len(),
+            total_operators_rows = total_active,
+            skipped_orphan = skipped_orphan,
+            skipped_keyload = skipped_keyload,
+            configured_fns_without_operator = not_registered,
+            "BindingsRegistry built"
+        );
 
         Ok(Self { inner })
     }

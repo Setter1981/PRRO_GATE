@@ -154,21 +154,17 @@ impl From<OperatorRowRaw> for OperatorRow {
     }
 }
 
-/// Distinguish a sqlite UNIQUE / PRIMARY-KEY constraint violation from
-/// other database errors.  Used to map the partial-unique-index hit on
+/// Distinguish a sqlite UNIQUE constraint violation from other database
+/// errors.  Used to map the partial-unique-index hit on
 /// `(fiscal_number, is_active=1)` to [`OperatorsRepoError::DuplicateActive`].
+///
+/// Delegates to sqlx 0.8's typed [`sqlx::error::DatabaseError::is_unique_violation`]
+/// rather than parsing extended-code strings — the typed API maps both
+/// `SQLITE_CONSTRAINT_UNIQUE` (2067) and `SQLITE_CONSTRAINT_PRIMARYKEY`
+/// (1555) to `ErrorKind::UniqueViolation`.  This module previously only
+/// expected the UNIQUE flavor; the PRIMARYKEY case is also benign in
+/// our schema (the surrogate `id INTEGER PRIMARY KEY` auto-allocates,
+/// so a PK collision would itself be a "duplicate cashier" semantically).
 fn is_unique_violation(e: &sqlx::Error) -> bool {
-    if let sqlx::Error::Database(db) = e {
-        // sqlite extended result codes: 1555 = SQLITE_CONSTRAINT_PRIMARYKEY,
-        // 2067 = SQLITE_CONSTRAINT_UNIQUE.  `code()` returns the extended
-        // code as a string; fall back to message inspection if absent.
-        if let Some(code) = db.code() {
-            if code == "2067" || code == "1555" {
-                return true;
-            }
-        }
-        let msg = db.message().to_ascii_lowercase();
-        return msg.contains("unique constraint") || msg.contains("unique");
-    }
-    false
+    matches!(e, sqlx::Error::Database(db) if db.is_unique_violation())
 }

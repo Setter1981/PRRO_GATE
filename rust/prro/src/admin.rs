@@ -40,6 +40,7 @@ use crate::db::tx::with_immediate;
 use sqlx::SqlitePool;
 use std::path::Path;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// Typed errors for admin operations.  Each variant maps to a clear
 /// operator-visible exit code (per `exit_code()`).
@@ -272,6 +273,16 @@ pub async fn reset_stop_mode(
 /// [`PasswordPrompter`] impl to drive [`acquire_password`] through
 /// match / mismatch / empty / IO-error branches without touching the
 /// real TTY.
+///
+/// # Executor safety
+///
+/// `prompt` is **synchronous and may block the calling thread for
+/// unbounded duration** (until the operator finishes typing, or until
+/// stdin returns EOF / IO error).  Callers MUST NOT invoke this trait
+/// from an async context that runs on a tokio worker thread without
+/// wrapping the call in `tokio::task::spawn_blocking`.  Acceptable
+/// call sites: synchronous CLI entry points before `Runtime::block_on`,
+/// or admin-only paths where the process is otherwise idle.
 pub trait PasswordPrompter {
     /// Read one line of password input.  `prompt` is the human-readable
     /// "Password:" / "Repeat:" hint (CLI prints to stderr; tests can
@@ -283,22 +294,33 @@ pub trait PasswordPrompter {
 /// [`PasswordPrompter`].  Behavior matrix:
 ///
 ///   - `is_tty = true`  → prompt twice, require exact match,
-///     reject empty.  Returns the verified password as bytes.
+///     reject empty + reject all-whitespace.  Returns the verified
+///     password.
 ///   - `is_tty = false` → single-line read from stdin pipe (no
-///     confirmation; CI / scripted use case), reject empty.
+///     confirmation; CI / scripted use case), reject empty +
+///     all-whitespace.
 ///
-/// Returns the plaintext as `Vec<u8>`; caller is responsible for
-/// passing it to [`add_operator`] (which immediately encodes it via
-/// [`crate::runtime::coding::Coding`]) and dropping any extra copies.
+/// Returns the plaintext as [`Zeroizing<Vec<u8>>`] so the byte buffer
+/// is wiped from memory on drop (defence-in-depth — the obfuscated
+/// BLOB lives in `operators.key_pass_enc` on disk, but the in-process
+/// plaintext should not survive past the encode call site).
+///
+/// # Executor safety
+///
+/// Synchronous; see [`PasswordPrompter`] doc-block for the
+/// blocking-thread caveat.
 pub fn acquire_password<P: PasswordPrompter>(
     prompter: &mut P,
     is_tty: bool,
-) -> Result<Vec<u8>, AdminError> {
+) -> Result<Zeroizing<Vec<u8>>, AdminError> {
+    fn is_blank(s: &str) -> bool {
+        s.is_empty() || s.chars().all(|c| c.is_whitespace())
+    }
     if is_tty {
         let first = prompter
             .prompt("Cashier key password: ")
             .map_err(|e| AdminError::PasswordReadIo(e.to_string()))?;
-        if first.is_empty() {
+        if is_blank(&first) {
             return Err(AdminError::EmptyPassword);
         }
         let second = prompter
@@ -307,15 +329,15 @@ pub fn acquire_password<P: PasswordPrompter>(
         if first != second {
             return Err(AdminError::PasswordMismatch);
         }
-        Ok(first.into_bytes())
+        Ok(Zeroizing::new(first.into_bytes()))
     } else {
         let one = prompter
             .prompt("")
             .map_err(|e| AdminError::PasswordReadIo(e.to_string()))?;
-        if one.is_empty() {
+        if is_blank(&one) {
             return Err(AdminError::EmptyPassword);
         }
-        Ok(one.into_bytes())
+        Ok(Zeroizing::new(one.into_bytes()))
     }
 }
 
@@ -323,7 +345,13 @@ pub fn acquire_password<P: PasswordPrompter>(
 /// acquired (by [`acquire_password`] or test injection); admin layer
 /// does not orchestrate stdin / TTY directly so the command logic
 /// stays testable without TTY simulation infrastructure.
-#[derive(Debug, Clone)]
+///
+/// **Not `Clone`**: the `password` field is intentionally not
+/// duplicatable to prevent accidental fan-out of the plaintext bytes.
+/// Callers needing a second copy must construct a new
+/// `AddOperatorInput` explicitly so the duplication is visible at
+/// the call site.
+#[derive(Debug)]
 pub struct AddOperatorInput {
     /// Cashier identifier — typically the cashier's INN per CLI
     /// `--inn` flag.  Required.
@@ -339,11 +367,11 @@ pub struct AddOperatorInput {
     /// FK pre-check verifies this exists in `fiscal_number_config`
     /// BEFORE INSERT (prevents orphan rows).
     pub fiscal_number: String,
-    /// Plaintext password bytes.  Passed by value so the caller can
-    /// `.zeroize()` their copy if desired; admin layer encodes via
-    /// [`crate::runtime::coding::Coding`] before storage and discards
-    /// the plaintext.
-    pub password: Vec<u8>,
+    /// Plaintext password bytes wrapped in [`Zeroizing`] — wiped on
+    /// drop.  Admin layer encodes via [`crate::runtime::coding::Coding`]
+    /// before storage and the wrapper ensures no stray copy survives
+    /// past the encode call site.
+    pub password: Zeroizing<Vec<u8>>,
 }
 
 /// W2 — register a new cashier (operator) bound to a fiscal_number.
@@ -385,7 +413,9 @@ pub async fn add_operator(
     if input.fiscal_number.trim().is_empty() {
         return Err(AdminError::EmptyArgument("fn"));
     }
-    if input.password.iter().all(|b| b.is_ascii_whitespace()) {
+    if input.password.is_empty()
+        || input.password.iter().all(|b| b.is_ascii_whitespace())
+    {
         return Err(AdminError::EmptyPassword);
     }
 
@@ -429,10 +459,16 @@ pub async fn add_operator(
     // Forensic audit — payload carries identifiers + key_path ONLY.
     // Password / encoded BLOB MUST NEVER appear in audit_log per
     // [[feedback_db_vs_log_separation]] memory + security-reviewer pin.
-    let payload = format!(
-        r#"{{"operator_id":"{}","name":"{}","key_path":"{}"}}"#,
-        input.operator_id, input.name, input.key_path,
-    );
+    //
+    // serde_json::json! escapes embedded `"` / `\` / control chars so
+    // an operator-supplied `--name "Cashier \"Iryna\""` cannot corrupt
+    // the audit row's JSON shape (regression-guard vs PR #98 review I1).
+    let payload = serde_json::json!({
+        "operator_id": input.operator_id,
+        "name": input.name,
+        "key_path": input.key_path,
+    })
+    .to_string();
     crate::db::repositories::audit_log::append(
         pool_main,
         "operator",
@@ -446,6 +482,91 @@ pub async fn add_operator(
     .map_err(|e| AdminError::Infrastructure(format!("audit append: {e}")))?;
 
     Ok(())
+}
+
+/// CLI entry-point for `prro admin add-operator`.  Reads config,
+/// opens singleton lock + both pools (main + secure), detects TTY
+/// mode from stdin, prompts for password via [`acquire_password`],
+/// then dispatches to [`add_operator`].  Returns BSD sysexits-aligned
+/// exit code.
+///
+/// Synchronous prompt path is executed BEFORE re-entering the tokio
+/// runtime — `acquire_password` blocks the calling thread but the
+/// runtime is not actively serving anything (this is an admin CLI).
+pub async fn run_add_operator(
+    config_path: &Path,
+    operator_id: String,
+    name: String,
+    key_path: String,
+    fiscal_number: String,
+) -> Result<(), AdminError> {
+    use std::io::IsTerminal;
+
+    let cfg_text = std::fs::read_to_string(config_path)
+        .map_err(|e| AdminError::Infrastructure(format!("read config: {e}")))?;
+    let cfg = crate::config::AppConfig::from_toml(&cfg_text)
+        .map_err(|e| AdminError::Infrastructure(format!("parse config: {e}")))?;
+
+    let _lock = crate::runtime::singleton::acquire(&cfg.database.db_path)
+        .map_err(|e| AdminError::Infrastructure(format!("singleton lock: {e}")))?;
+    let pool_main = crate::db::open_pool(&cfg.database.db_path)
+        .await
+        .map_err(|e| AdminError::Infrastructure(format!("open main pool: {e}")))?;
+    let pool_secure = crate::db::open_secure_pool(&cfg.database.secure_db_path)
+        .await
+        .map_err(|e| AdminError::Infrastructure(format!("open secure pool: {e}")))?;
+
+    let is_tty = std::io::stdin().is_terminal();
+    let mut prompter = StdinPasswordPrompter;
+    let password = acquire_password(&mut prompter, is_tty)?;
+
+    let input = AddOperatorInput {
+        operator_id,
+        name,
+        key_path,
+        fiscal_number,
+        password,
+    };
+    add_operator(&pool_main, &pool_secure, input).await?;
+
+    pool_secure.close().await;
+    pool_main.close().await;
+    Ok(())
+}
+
+/// Production [`PasswordPrompter`] — uses `rpassword::prompt_password`
+/// for TTY mode (no echo); falls back to a single-line stdin read in
+/// non-TTY mode via [`std::io::stdin`].
+///
+/// `rpassword` is NOT a dependency of `prro` today — to keep the W2
+/// PR-B diff minimal we read raw stdin even in TTY mode (passwords
+/// will echo).  A follow-up commit may add `rpassword = "7"` and
+/// switch to no-echo prompting.
+pub struct StdinPasswordPrompter;
+
+impl PasswordPrompter for StdinPasswordPrompter {
+    fn prompt(&mut self, msg: &str) -> std::io::Result<String> {
+        use std::io::{stderr, stdin, BufRead, Write};
+        if !msg.is_empty() {
+            let mut err = stderr().lock();
+            err.write_all(msg.as_bytes())?;
+            err.flush()?;
+        }
+        let mut line = String::new();
+        let stdin = stdin();
+        let mut handle = stdin.lock();
+        handle.read_line(&mut line)?;
+        // Strip the trailing newline (LF or CRLF) so the typed
+        // password matches what the operator entered, not the
+        // terminal's line-discipline artifact.
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        Ok(line)
+    }
 }
 
 /// CLI entry-point for `prro admin reset-stop-mode`.  Reads config,

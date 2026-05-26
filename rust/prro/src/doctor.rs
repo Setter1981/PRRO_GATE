@@ -35,10 +35,33 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
         .await?;
     println!("[OK]  migrations applied: {n}");
 
+    // 4b. W2 / HIGH-AUDIT-01 — secure pool preflight.  Mirrors the
+    //     boot-time secure-DB open in `App::boot` step (4b).  Without
+    //     this, `prro doctor` succeeds on a corrupted or missing
+    //     `secure.db` and the operator only learns about the failure
+    //     at the first `prro serve` invocation.
+    if let Some(parent) = cfg.database.secure_db_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+            println!("[OK]  secure db dir:  {}", parent.display());
+        }
+    }
+    let secure_pool = crate::db::open_secure_pool(&cfg.database.secure_db_path).await?;
+    let secure_mig: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+        .fetch_one(&secure_pool)
+        .await?;
+    let operators_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operators")
+        .fetch_one(&secure_pool)
+        .await?;
+    println!(
+        "[OK]  secure migrations applied: {secure_mig}, operators registered: {operators_count}"
+    );
+
     // 5. Admin UI listen address parses (whether or not enabled).
     let _: std::net::SocketAddr = cfg.admin_ui.listen.parse()?;
     println!("[OK]  admin_ui.listen: {}", cfg.admin_ui.listen);
 
+    drop(secure_pool);
     drop(pool);
     drop(lock);
     println!("== ALL CHECKS PASSED ==");
