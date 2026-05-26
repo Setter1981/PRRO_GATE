@@ -592,6 +592,47 @@ helper REJECTS payloads with mismatched schema_version (typed error).
 one that `ingress_inbox::insert` would compute (asserted by inserting
 and reading back).
 
+**Known scope gap (acceptance addendum after audit, 2026-05-26):**
+
+W3 mapper writes the driver-wire-shape canonical JSON into
+`CanonicalFiscalCommand.payload_json`.  `services/write_path/stage_sign::
+parse_payload` (the downstream consumer at signing time) uses
+`#[serde(deny_unknown_fields)]` and expects a different shape —
+`CheckJson { items[].code/price_kop/quantity_thousandths/sum_kop,
+payments[].type_code }` for SELL/RETURN, `ZReportJson { sell_count,
+return_count, payments[].sum_in_kop/sum_out_kop }` for SHIFT_CLOSE/
+Z_REPORT, `ShiftOpenJson { opening_sum_kop }` for SHIFT_OPEN.
+
+Field names do not align, AND some target fields (`ZReportJson.
+sell_count` / `return_count`) do not exist in the W3 DTO at all —
+they are derived from ledger rows since `shift_open_at_business_ts`,
+which is repository-touching code that does NOT belong in a pure DTO
+mapping helper.
+
+The DTO→CheckJson/ZReportJson/ShiftOpenJson conversion is therefore
+deferred from W3 to **W4 Algorithm step 0** (new — see W4 §"Algorithm"
+below; gated by repository access).  The W3 test file documents the
+gap in CI form via:
+
+```
+tests/ingress_dto_parity.rs::
+    mapped_payload_json_is_wire_shape_not_stage_sign_ready    [#[ignore]]
+    xreport_servicein_serviceout_cashwithdrawal_map_but_signer_will_reject
+                                                              [#[ignore]]
+```
+
+Both ignored — `cargo test -- --include-ignored` surfaces them as
+explicit, panicking gap-markers.  When W4 step 0 lands, both tests
+get unignored and inverted (positive assertion that converted payload
+parses through `stage_sign::parse_payload`).
+
+Coupled with this gap: **MED-2 audit finding** — the mapper accepts
+`X_REPORT / SERVICE_IN / SERVICE_OUT / CASH_WITHDRAWAL` as valid
+`DocType`s, but `stage_sign::derive_wire_artifact_kind` rejects them
+with typed `SignError::UnsupportedDocType`.  The reject-at-boundary
+decision (W3 mapper rejects these 4 types upfront) vs reject-late
+(signer rejects with single source of truth) is also W4-step-0 scope.
+
 **Estimate:** 1 day.
 
 ---

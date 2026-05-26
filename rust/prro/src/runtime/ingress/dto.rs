@@ -7,6 +7,53 @@
 //! the entire DB layer.  The wire contract is guarded by parity
 //! fixtures in `tests/ingress_dto_parity.rs` — rename in either side
 //! breaks the test.
+//!
+//! # Known scope gap — `payload_json` is wire-shape, NOT stage_sign-ready
+//!
+//! `to_canonical_fiscal_command` populates `CanonicalFiscalCommand.
+//! payload_json` with the **driver-wire-shape canonical JSON of
+//! `cmd.payload`** (i.e. the `ReceiptPayload` struct as serialised by
+//! serde with BTreeMap-sorted keys).  But `services/write_path/
+//! stage_sign.rs::parse_payload` (the consumer at signing time)
+//! uses `#[serde(deny_unknown_fields)]` and expects a DIFFERENT
+//! internal canonical shape:
+//!
+//!   - `CheckJson  { items[]: { code, name, price_kop,
+//!     quantity_thousandths, sum_kop }, payments[]: { name, sum_kop,
+//!     type_code } }`        — for SELL / RETURN.
+//!   - `ZReportJson { payments[]: { name, sum_in_kop, sum_out_kop,
+//!     type_code }, sell_count, return_count }`
+//!                            — for SHIFT_CLOSE / Z_REPORT.
+//!   - `ShiftOpenJson { opening_sum_kop }`
+//!                            — for SHIFT_OPEN.
+//!
+//! The W3 DTO emits `payload.goods[].price_kopecks /
+//! quantity_milli / tax_group_1 / ...` + `payments[].type:
+//! PaymentKind enum`.  Fields do not align by name OR by data —
+//! e.g. `ZReportJson.sell_count` does not exist anywhere in the W3
+//! DTO (the driver does not emit shift counters; they are derived
+//! from the ledger).
+//!
+//! Consequence — until a conversion layer lands, the first real
+//! receipt flowing through `to_canonical_fiscal_command` →
+//! `ingress_inbox::insert` → `stage_acquire` → `stage_sign` will
+//! fail with `SignError::PayloadSchema` at the parse_payload step.
+//! The fixture parity tests in `tests/ingress_dto_parity.rs` do
+//! NOT exercise this signing-time consumption — they assert the
+//! DTO→CanonicalFiscalCommand mapping shape only.
+//!
+//! Resolution: the conversion is deferred to W4 (per-FN supervisor)
+//! or a new conversion-stage worklet between mapper and stage_acquire
+//! — see plan §3 W3 acceptance note + W4 Algorithm step 0
+//! addendum.  The DTO→CheckJson/ZReportJson/ShiftOpenJson conversion
+//! requires ledger lookups for ZReport (sell_count, return_count
+//! derived from rows since `shift_open_at_business_ts`) — that is
+//! repository-touching code, not pure DTO transformation, so it
+//! does not belong in W3.
+//!
+//! See [`tests/ingress_dto_parity.rs::
+//! mapped_payload_json_is_wire_shape_not_stage_sign_ready`]
+//! (`#[ignore]`'d to document the gap loudly without breaking CI).
 
 use crate::db::models::enums::DocType;
 use crate::db::models::ids::{CashierId, CashierIdError};
@@ -264,10 +311,28 @@ pub fn to_canonical_fiscal_command(
         .expect("canonical JSON is always valid UTF-8 (serde_json output)");
     let payload_sha256_canonical: [u8; 32] = Sha256::digest(&payload_json_bytes).into();
 
+    // `cashier_id` mapping — explicit empty-vs-absent distinction.
+    // Self-review finding #3 (Round 2 audit, 2026-05-26):
+    //
+    //   `cashier_id: None`        → `signed_by_cashier_id = None`
+    //                                (operator intentionally omitted
+    //                                cashier id from envelope).
+    //   `cashier_id: Some(s)` where `s` non-empty
+    //                              → `Some(CashierId::new(s)?)`.
+    //   `cashier_id: Some("")`    → typed `InvalidCashierId(
+    //                                CashierIdError::Empty)` —
+    //                                empty string is MALFORMED input,
+    //                                NOT semantic-absent.  Previously
+    //                                `.filter(|s| !s.is_empty())`
+    //                                normalised it to `None` which
+    //                                (a) hid wire-bug from operator
+    //                                audit_log and (b) shifted the
+    //                                failure surface to the signer
+    //                                (where the precise context is
+    //                                gone).  Drop the filter.
     let signed_by_cashier_id = cmd
         .cashier_id
         .as_deref()
-        .filter(|s| !s.is_empty())
         .map(CashierId::new)
         .transpose()?;
 
