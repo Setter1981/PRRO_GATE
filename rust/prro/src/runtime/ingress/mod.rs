@@ -7,6 +7,8 @@
 //! arrives later worklets.  See
 //! `docs/superpowers/plans/2026-05-25-m4-ingress-plan.md` §3 W1.
 
+pub mod dto;
+
 pub struct IngressServer;
 
 impl IngressServer {
