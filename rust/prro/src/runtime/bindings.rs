@@ -115,6 +115,29 @@ impl KeyLoadFailure {
 /// tests inject a stub returning a deterministic [`SigningContext`].
 /// The seam exists so the W2 boot orchestration can land before the
 /// production loader (M5 crypto wiring task) is finished.
+///
+/// # Secret-material discipline (M5 implementor MUST read)
+///
+/// The `password` parameter arrives as a borrowed `&[u8]` slice that
+/// points into a [`Zeroizing<Vec<u8>>`] owned by [`BindingsRegistry::
+/// build_from_db`] — the caller wipes the underlying buffer on drop
+/// (PR-B audit Round 2 R2-4 closure).  Implementations MUST honor the
+/// zeroize discipline at the trait boundary:
+///
+///   1. **Do NOT clone the slice into a plain `Vec<u8>` / `String`
+///      / `Cow<[u8]>` / any other un-zeroized heap buffer.**  Such a
+///      copy survives past `load` return without the wipe guarantee,
+///      leaving the cashier password recoverable in freed heap pages.
+///   2. If a temporary owned copy is unavoidable (e.g., the underlying
+///      crypto library requires `Vec<u8>` by value), wrap it
+///      immediately in [`zeroize::Zeroizing::new`] so Drop wipes it.
+///   3. The returned [`SigningContext`] MUST NOT retain the plaintext
+///      password — it should derive the signing key (or a key handle)
+///      and discard the password before returning.
+///
+/// External audit Round 2 R2-4 explicitly flagged the trait boundary
+/// as the weakest link in the password chain; this doc-block is the
+/// load-bearing reminder for the M5 implementor.
 #[async_trait]
 pub trait OperatorKeyLoader: Send + Sync {
     async fn load(

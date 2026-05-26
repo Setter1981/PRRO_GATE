@@ -469,6 +469,26 @@ pub async fn add_operator(
         return Err(AdminError::FiscalNumberNotInConfig(input.fiscal_number));
     }
 
+    // Pre-flight: catch the common DuplicateActiveCashier case BEFORE
+    // any audit row lands.  This makes the most frequent operator-error
+    // path observable as a CLI rejection without polluting the audit
+    // trail with an ATTEMPTED→FAILED pair for an input the operator
+    // can fix and retry immediately.  Race window between this read
+    // and the eventual INSERT is acceptable: a concurrent add-operator
+    // on the same FN is operationally bizarre (admin CLI is operator-
+    // serialised), and the partial-unique-index in DDL is the
+    // structural guard anyway — see R3-1 doc-block below.
+    if let Some(existing) = crate::db::repositories::operators::find_by_fiscal_number(
+        pool_secure,
+        &input.fiscal_number,
+    )
+    .await
+    .map_err(|e| AdminError::Infrastructure(format!("active-cashier pre-flight: {e}")))?
+    {
+        let _ = existing; // discard row contents; FN is sufficient
+        return Err(AdminError::DuplicateActiveCashier(input.fiscal_number));
+    }
+
     let key_pass_enc = crate::runtime::coding::Coding::encode(&input.password)
         .map_err(|_| AdminError::EmptyPassword)?;
 
@@ -480,38 +500,42 @@ pub async fn add_operator(
         key_pass_enc,
     };
 
-    // ---- Atomicity discipline under SQLite cross-DB constraint ----
+    // ---- R3-1: Truthful audit-event semantics under cross-DB constraint ----
     //
     // SQLite cannot wrap an INSERT into `pool_secure.operators` and an
     // INSERT into `pool_main.audit_log` in one transaction; the two
     // pools are physically separate files (HIGH-AUDIT-01).
     //
-    // We order the two writes audit-FIRST then INSERT-SECOND so a
-    // crash / OOM / disk-full between them leaves a recoverable
-    // forensic trail rather than a silent successful registration:
+    // Round 2 reversed the order (audit-FIRST, INSERT-SECOND) to close
+    // the silent-active-no-audit gap.  Round 3 audit caught that the
+    // single `ADMIN_OPERATOR_REGISTERED` event_type lied on the
+    // INSERT-failure branch (audit said "registered" but no row landed,
+    // over-counting registrations in dashboards).
     //
-    //   - audit append fails  -> no operator landed; operator can retry.
-    //   - audit succeeds, INSERT fails (DuplicateActive / DB error)
-    //     -> audit row carries the rejection-cause; pair is reconciled
-    //        by an operator runbook search on the FN.
-    //   - audit succeeds, process crashes BEFORE INSERT -> next
-    //     `prro` boot has no operator row for this FN, but the audit
-    //     trail proves an attempt was made; the operator runbook
-    //     calls for re-running `add-operator`.
+    // Truthful three-event protocol:
     //
-    // The reverse order (INSERT first, audit second) would create the
-    // worst case: a successful operator registration with NO audit row
-    // — an active signing operator with no forensic record.  External
-    // audit Round 2 finding #2 explicitly flagged that prior ordering.
+    //   1. `ADMIN_OPERATOR_REGISTRATION_ATTEMPTED` (Info) — emitted
+    //      BEFORE the INSERT.  Carries identifiers; proves an attempt
+    //      was made.  Crash here -> no operator row; operator retries
+    //      and an attempted-no-completion pair can be reconciled
+    //      forensically.
+    //   2. On INSERT success -> `ADMIN_OPERATOR_REGISTERED` (Info).
+    //      This is the ONLY event dashboards count as a successful
+    //      registration (panel §4.12 query filters on this event_type
+    //      exclusively).
+    //   3. On INSERT failure -> `ADMIN_OPERATOR_REGISTRATION_FAILED`
+    //      (Critical) with `reason` (DuplicateActive | DbError text).
+    //      Paired with the prior ATTEMPTED row so a reviewer can grep
+    //      the FN and see the full lifecycle.
     //
-    // Forensic audit — payload carries identifiers + key_path ONLY.
-    // Password / encoded BLOB MUST NEVER appear in audit_log per
-    // [[feedback_db_vs_log_separation]] memory + security-reviewer pin.
+    // The pre-flight DuplicateActive check above means most operator-
+    // typo cases never reach the audit pair at all — they fail at the
+    // CLI with no audit pollution.  The ATTEMPTED/FAILED pair only
+    // fires for races, crashes, and unexpected DB-class failures.
     //
-    // serde_json::json! escapes embedded `"` / `\` / control chars so
-    // an operator-supplied `--name "Cashier \"Iryna\""` cannot corrupt
-    // the audit row's JSON shape (regression-guard vs PR #98 review I1).
-    let payload = serde_json::json!({
+    // Password / encoded BLOB NEVER appears in payload (security pin).
+    // serde_json::json! escapes embedded chars (PR-B F1 fix preserved).
+    let attempted_payload = serde_json::json!({
         "operator_id": input.operator_id,
         "name": input.name,
         "key_path": input.key_path,
@@ -521,25 +545,78 @@ pub async fn add_operator(
         pool_main,
         "operator",
         &input.fiscal_number,
-        "ADMIN_OPERATOR_REGISTERED",
+        "ADMIN_OPERATOR_REGISTRATION_ATTEMPTED",
         crate::db::models::enums::Severity::Info,
         None,
-        Some(&payload),
+        Some(&attempted_payload),
     )
     .await
-    .map_err(|e| AdminError::Infrastructure(format!("audit append: {e}")))?;
+    .map_err(|e| AdminError::Infrastructure(format!("audit append ATTEMPTED: {e}")))?;
 
     match crate::db::repositories::operators::insert(pool_secure, &new_op).await {
-        Ok(()) => {}
+        Ok(()) => {
+            // Successful INSERT -> emit the truthful REGISTERED event.
+            // Failure to append THIS event leaves the FN registered
+            // operationally but with only the ATTEMPTED audit row;
+            // the runbook §6a recovery scenarios cover the reconciliation.
+            let registered_payload = serde_json::json!({
+                "operator_id": input.operator_id,
+                "name": input.name,
+                "key_path": input.key_path,
+            })
+            .to_string();
+            crate::db::repositories::audit_log::append(
+                pool_main,
+                "operator",
+                &input.fiscal_number,
+                "ADMIN_OPERATOR_REGISTERED",
+                crate::db::models::enums::Severity::Info,
+                None,
+                Some(&registered_payload),
+            )
+            .await
+            .map_err(|e| {
+                AdminError::Infrastructure(format!("audit append REGISTERED: {e}"))
+            })?;
+            Ok(())
+        }
         Err(crate::db::repositories::operators::OperatorsRepoError::DuplicateActive(fn_id)) => {
-            return Err(AdminError::DuplicateActiveCashier(fn_id));
+            let failed_payload = serde_json::json!({
+                "operator_id": input.operator_id,
+                "reason": "DuplicateActiveCashier",
+            })
+            .to_string();
+            let _ = crate::db::repositories::audit_log::append(
+                pool_main,
+                "operator",
+                &input.fiscal_number,
+                "ADMIN_OPERATOR_REGISTRATION_FAILED",
+                crate::db::models::enums::Severity::Critical,
+                None,
+                Some(&failed_payload),
+            )
+            .await;
+            Err(AdminError::DuplicateActiveCashier(fn_id))
         }
         Err(crate::db::repositories::operators::OperatorsRepoError::Db(e)) => {
-            return Err(AdminError::Infrastructure(format!("INSERT operators: {e}")));
+            let failed_payload = serde_json::json!({
+                "operator_id": input.operator_id,
+                "reason": format!("DbError: {e}"),
+            })
+            .to_string();
+            let _ = crate::db::repositories::audit_log::append(
+                pool_main,
+                "operator",
+                &input.fiscal_number,
+                "ADMIN_OPERATOR_REGISTRATION_FAILED",
+                crate::db::models::enums::Severity::Critical,
+                None,
+                Some(&failed_payload),
+            )
+            .await;
+            Err(AdminError::Infrastructure(format!("INSERT operators: {e}")))
         }
     }
-
-    Ok(())
 }
 
 /// CLI entry-point for `prro admin add-operator`.  Reads config,

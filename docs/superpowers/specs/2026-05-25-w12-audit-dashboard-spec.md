@@ -87,7 +87,9 @@ Rust gateway has **no Prometheus / metrics-exporter-prometheus** dependency. The
 | `OPERATOR_KEY_LOAD_FAILED` | **`operator`** | fiscal_number | CRITICAL | W2 boot | #98 | `runtime/bindings.rs::build_from_db` |
 | `OPERATOR_ORPHAN_FN` | **`operator`** | fiscal_number | CRITICAL | W2 boot | #98 | `runtime/bindings.rs::build_from_db` |
 | `OPERATOR_NOT_REGISTERED` | **`operator`** | fiscal_number | INFO | W2 boot | #98 | `runtime/bindings.rs::build_from_db` |
-| `ADMIN_OPERATOR_REGISTERED` | **`operator`** | fiscal_number | INFO | W2 admin | #98 | `admin.rs::add_operator` |
+| `ADMIN_OPERATOR_REGISTRATION_ATTEMPTED` | **`operator`** | fiscal_number | INFO | W2 admin | #98 | `admin.rs::add_operator` (pre-INSERT) |
+| `ADMIN_OPERATOR_REGISTERED` | **`operator`** | fiscal_number | INFO | W2 admin | #98 | `admin.rs::add_operator` (POST-INSERT success — the ONLY event that counts as a successful registration) |
+| `ADMIN_OPERATOR_REGISTRATION_FAILED` | **`operator`** | fiscal_number | CRITICAL | W2 admin | #98 | `admin.rs::add_operator` (INSERT failure; paired with prior ATTEMPTED) |
 
 ⚠ Entity-type naming inconsistency callout: `ADMIN_STOP_MODE_RESET` uses entity_type `"fn"`; drain Tier 2 event uses entity_type `"fiscal_document"`; W2 operator-binding events use entity_type `"operator"`.  See § 6 for join strategy.
 
@@ -124,6 +126,18 @@ Rust gateway has **no Prometheus / metrics-exporter-prometheus** dependency. The
 
 Empty payload — entity_id is the FN itself.  **Info severity, not alerting.**  Configured FN has no active operators row; expected during initial deployment before `prro admin add-operator` is run, or after cashier rotation without re-registration.  Dashboard should panel-display the current count of "configured FNs without active cashier" for ops awareness.
 
+#### `ADMIN_OPERATOR_REGISTRATION_ATTEMPTED`
+
+```json
+{
+  "operator_id": "<cashier INN>",
+  "name":        "<human-readable cashier name>",
+  "key_path":    "<absolute path>"
+}
+```
+
+**Info-severity** — emitted by `admin.rs::add_operator` immediately BEFORE the INSERT into `operators`.  Carries the operator intent so a crash / process-kill between this row and the INSERT leaves a recoverable forensic trail.  **NOT counted as a successful registration** — pair this with the subsequent REGISTERED or FAILED event_type for the same FN at a later `created_at` to reconstruct the outcome.
+
 #### `ADMIN_OPERATOR_REGISTERED`
 
 ```json
@@ -134,7 +148,18 @@ Empty payload — entity_id is the FN itself.  **Info severity, not alerting.** 
 }
 ```
 
-**Info-severity forensic trail** for every `prro admin add-operator` invocation.  Payload constructed via `serde_json::json!` so embedded quotes / control chars escape correctly.  **Password and `key_pass_enc` BLOB NEVER appear** in payload (security-reviewer pin + PR-B external audit F1 fix).
+**Info-severity** — emitted by `admin.rs::add_operator` ONLY AFTER a successful INSERT into `operators`.  **This is the ONLY event_type that counts as a successful registration** — panels §4.12 / alerts §7.2 filter on this exclusively.  A REGISTERED row without a prior matching ATTEMPTED row is a forensic anomaly (audit_log write order broken or corrupted).
+
+#### `ADMIN_OPERATOR_REGISTRATION_FAILED`
+
+```json
+{
+  "operator_id": "<cashier INN>",
+  "reason":      "DuplicateActiveCashier | DbError: <text>"
+}
+```
+
+**Critical severity** — emitted by `admin.rs::add_operator` when the INSERT into `operators` fails after the ATTEMPTED row was committed.  Indicates either (a) a race with a concurrent registration that beat the pre-flight check, or (b) a DB-class infrastructure failure (disk full, schema corruption, etc.).  Pair with the prior ATTEMPTED row for the same FN.  Operator runbook §6a covers recovery — typically: investigate the FN's `operators` table state via `sudo -u prro sqlite3 var/secure.db "SELECT * FROM operators WHERE fiscal_number = '<FN>'"` and either re-run `add-operator` (if duplicate cleared) or escalate (if DB error).  Password / encoded BLOB NEVER appears in payload.
 
 ### 3.1 Payload JSON shapes
 
@@ -393,9 +418,14 @@ WHERE entity_type = 'operator'
 
 ### 4.12 W2 — Operator registration trail (forensic)
 
-**Panel**: table, "Recent operator registrations (30d)".
+**Panel**: table, "Successful operator registrations (30d)".
 
 ```sql
+-- IMPORTANT: filter on ADMIN_OPERATOR_REGISTERED ONLY.  Do NOT
+-- include ADMIN_OPERATOR_REGISTRATION_ATTEMPTED or _FAILED — those
+-- are intent/failure markers, not successful registrations (see
+-- §3.0a event taxonomy).  Counting all three would over-report
+-- success by including failed attempts.
 SELECT
   created_at,
   entity_id AS fiscal_number,
@@ -409,7 +439,29 @@ WHERE entity_type = 'operator'
 ORDER BY created_at DESC;
 ```
 
-**Interpretation**: every `prro admin add-operator` invocation lands a row here.  Used for cashier-rotation audit + reconciliation of "add-operator attempted but operators table unexpectedly empty" failure-mode (see atomicity discipline in `admin.rs::add_operator` — audit precedes INSERT so a partial failure leaves the audit trail).
+**Interpretation**: every successful `prro admin add-operator` invocation lands a row here.  Used for cashier-rotation audit + reconciliation of "add-operator attempted but operators table unexpectedly empty" failure-mode.
+
+### 4.13 W2 — Registration failures (paired with ATTEMPTED)
+
+**Panel**: table, "Failed registration attempts (30d)".
+
+```sql
+-- Pair each FAILED row with its prior ATTEMPTED for the same FN.
+-- The reason field distinguishes operator typos (DuplicateActiveCashier)
+-- from infrastructure failures (DbError: ...).
+SELECT
+  failed.created_at,
+  failed.entity_id AS fiscal_number,
+  json_extract(failed.event_payload_json, '$.operator_id') AS operator_id,
+  json_extract(failed.event_payload_json, '$.reason')      AS reason
+FROM audit_log AS failed
+WHERE failed.entity_type = 'operator'
+  AND failed.event_type = 'ADMIN_OPERATOR_REGISTRATION_FAILED'
+  AND failed.created_at >= datetime('now', '-30 days')
+ORDER BY failed.created_at DESC;
+```
+
+**Interpretation**: each row = one `add-operator` invocation that committed the ATTEMPTED audit row but failed at the INSERT step.  Most rows will be `DuplicateActiveCashier` from a race (the pre-flight check missed a concurrent register); rare `DbError: ...` rows indicate infrastructure issues warranting investigation.
 
 **⚠ PII NOTE**: panels 4.9 / 4.10 / 4.12 expose `operator_id` (cashier INN) and `key_path` (filesystem path that may contain cashier names) to anyone who can read this datasource.  See §9 "Out of scope" for the operational mandate on Grafana datasource access control.
 
@@ -417,24 +469,36 @@ ORDER BY created_at DESC;
 
 ## 5. Composite dashboard layout
 
-Recommended 6-panel single-screen layout для on-call rotation:
+Recommended 11-panel single-screen layout для on-call rotation
+(6 W12 panels + 5 W2 operator panels):
 
 ```
 +---------------------------------------------------+
-| Row 1 (alerts)                                    |
+| Row 1 (W12 alerts)                                 |
 |  [Stat: Tier 3 resets/24h]  [Stat: STOP_MODE       |
 |                              escalations/24h]      |
 +---------------------------------------------------+
-| Row 2 (Tier 2 detail)                              |
+| Row 2 (W12 Tier 2 detail)                          |
 |  [Table: Currently-in-STOP_MODE FNs (last 24h)]    |
 +---------------------------------------------------+
-| Row 3 (Tier 1 rate)                                |
+| Row 3 (W12 Tier 1 rate)                            |
 |  [Time-series: Prolonged holds per minute]         |
 |  [Table: Top-N held FNs (24h)]                     |
 +---------------------------------------------------+
-| Row 4 (forensic)                                   |
+| Row 4 (W12 forensic)                               |
 |  [Time-series: Orphan traces per boot (30d)]       |
 |  [Table: Recent Tier 3 resets (7d, з reason)]      |
++---------------------------------------------------+
+| Row 5 (W2 operator alerts — critical)              |
+|  [Table §4.9: Key-load failures (24h)]             |
+|  [Table §4.10: Orphan operator rows (30d)]         |
++---------------------------------------------------+
+| Row 6 (W2 operator awareness)                      |
+|  [Stat §4.11: Configured FNs without operator]     |
++---------------------------------------------------+
+| Row 7 (W2 admin forensic)                          |
+|  [Table §4.12: Successful registrations (30d)]     |
+|  [Table §4.13: Failed registration attempts (30d)] |
 +---------------------------------------------------+
 ```
 
@@ -527,11 +591,16 @@ ON audit_log(event_type, created_at DESC);
 To consider this dashboard wiring complete:
 
 1. ☐ Grafana SQLite datasource configured against read-only mount of `var/prro.db`.
-2. ☐ 6 panels imported per §5 layout.
+2. ☐ **11 panels** imported per §5 layout (6 W12 + 5 W2 operator panels §4.9–§4.13).
 3. ☐ Index `ix_audit_event_time` landed via migration 020 (§8).
-4. ☐ Alerting rules §7.1/7.2/7.3 wired в alerting provider (Grafana Alerting / Alertmanager / on-call PagerDuty integration).
+4. ☐ Alerting rules §7.1/7.2/7.3 wired в alerting provider (Grafana Alerting / Alertmanager / on-call PagerDuty integration), **including W2 P1 rules for `OPERATOR_KEY_LOAD_FAILED` + `OPERATOR_ORPHAN_FN` + `ADMIN_OPERATOR_REGISTRATION_FAILED`**.
 5. ☐ On-call rotation has read this spec + `docs/operations/admin-runbook.md`.
 6. ☐ Smoke test: trigger one of each event у dev environment, confirm panel reflects it within 30s refresh window.
+7. ☐ **PII access control gate (NON-OPTIONAL for production — see §9 mandate)** — exactly ONE of:
+    - ☐ Grafana RBAC restricts panels §4.9 / §4.10 / §4.12 / §4.13 to compliance/security folder; user list audited;
+    - ☐ `audit_log_public` redacted SQL view created; Grafana datasource points at view only (raw `audit_log` not exposed);
+    - ☐ Deployment explicitly marked single-operator self-hosted (the operator who registers cashiers IS the dashboard reader); note recorded in the deployment runbook.
+8. ☐ **W2 audit-event semantics smoke** — trigger a successful `prro admin add-operator`, then a duplicate-FN one, then verify §4.12 shows ONE success row and §4.13 shows ONE failure row.  This proves the ATTEMPTED→REGISTERED|FAILED triplet wires correctly to the panels (regression-guard vs PR #98 audit Round 3 R3-1).
 
 ---
 

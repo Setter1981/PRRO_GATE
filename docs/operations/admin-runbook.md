@@ -157,6 +157,11 @@ After any Hold outcome on FN-A, per-FN backoff schedules next drain tick:
 - [ ] Dashboards configured для 8 audit events listed above
 - [ ] Operator on-call rotation knows admin reset-stop-mode procedure
 - [ ] CI infrastructure repaired (TD-1 — see findings doc)
+- [ ] **W2 PII access-control gate** (NON-OPTIONAL for any non-single-operator deployment) — exactly ONE option chosen and documented in the deployment runbook:
+    - [ ] Grafana RBAC restricts panels §4.9 / §4.10 / §4.12 / §4.13 of the W12 dashboard spec to a compliance/security folder; user list audited; OR
+    - [ ] `audit_log_public` SQL view created that redacts `operator_id` (salted hash) and `key_path` (basename strip); Grafana datasource points at the view only (raw `audit_log` NOT exposed); OR
+    - [ ] Deployment marked single-operator self-hosted in writing (the operator who registers cashiers IS the dashboard reader; PII exposure to that operator is acceptable since they registered the data).  This option pre-approved for pilot per `feedback_autonomous_isolated_env`; production multi-tenant deployment MUST pick option (a) or (b).
+- [ ] W2 audit-event semantics smoke executed (one success + one duplicate-FN failure; verify §4.12 shows 1 success row, §4.13 shows 1 failure row — see dashboard spec §10 item 8).
 
 ---
 
