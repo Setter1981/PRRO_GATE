@@ -517,7 +517,11 @@ pub async fn run_add_operator(
         .map_err(|e| AdminError::Infrastructure(format!("open secure pool: {e}")))?;
 
     let is_tty = std::io::stdin().is_terminal();
-    let mut prompter = StdinPasswordPrompter;
+    let mut prompter = if is_tty {
+        StdinPasswordPrompter::tty()
+    } else {
+        StdinPasswordPrompter::stdin_pipe()
+    };
     let password = acquire_password(&mut prompter, is_tty)?;
 
     let input = AddOperatorInput {
@@ -534,38 +538,67 @@ pub async fn run_add_operator(
     Ok(())
 }
 
-/// Production [`PasswordPrompter`] — uses `rpassword::prompt_password`
-/// for TTY mode (no echo); falls back to a single-line stdin read in
-/// non-TTY mode via [`std::io::stdin`].
+/// Production [`PasswordPrompter`].
 ///
-/// `rpassword` is NOT a dependency of `prro` today — to keep the W2
-/// PR-B diff minimal we read raw stdin even in TTY mode (passwords
-/// will echo).  A follow-up commit may add `rpassword = "7"` and
-/// switch to no-echo prompting.
-pub struct StdinPasswordPrompter;
+/// Two paths based on construction:
+///
+///   - [`Self::tty`] uses `rpassword::prompt_password` — no-echo input
+///     (the terminal is put into a no-echo mode for the read; the
+///     password never appears on the operator's screen or in scrollback).
+///   - [`Self::stdin_pipe`] reads a single stdin line via [`std::io::stdin`] —
+///     for non-TTY contexts (CI, scripted use); echo is irrelevant
+///     because there is no terminal.
+///
+/// Callers select the correct flavor based on
+/// [`std::io::IsTerminal::is_terminal()`] for stdin; see
+/// [`run_add_operator`] for the production wiring.
+pub enum StdinPasswordPrompter {
+    Tty,
+    StdinPipe,
+}
+
+impl StdinPasswordPrompter {
+    pub fn tty() -> Self {
+        Self::Tty
+    }
+    pub fn stdin_pipe() -> Self {
+        Self::StdinPipe
+    }
+}
 
 impl PasswordPrompter for StdinPasswordPrompter {
     fn prompt(&mut self, msg: &str) -> std::io::Result<String> {
-        use std::io::{stderr, stdin, BufRead, Write};
-        if !msg.is_empty() {
-            let mut err = stderr().lock();
-            err.write_all(msg.as_bytes())?;
-            err.flush()?;
-        }
-        let mut line = String::new();
-        let stdin = stdin();
-        let mut handle = stdin.lock();
-        handle.read_line(&mut line)?;
-        // Strip the trailing newline (LF or CRLF) so the typed
-        // password matches what the operator entered, not the
-        // terminal's line-discipline artifact.
-        if line.ends_with('\n') {
-            line.pop();
-            if line.ends_with('\r') {
-                line.pop();
+        match self {
+            Self::Tty => {
+                // rpassword writes `msg` to /dev/tty (NOT stderr) and
+                // reads the password with terminal echo disabled.  No
+                // plaintext lands in the terminal scrollback or in any
+                // captured stderr stream.
+                rpassword::prompt_password(msg)
+            }
+            Self::StdinPipe => {
+                use std::io::{stderr, stdin, BufRead, Write};
+                if !msg.is_empty() {
+                    let mut err = stderr().lock();
+                    err.write_all(msg.as_bytes())?;
+                    err.flush()?;
+                }
+                let mut line = String::new();
+                let stdin = stdin();
+                let mut handle = stdin.lock();
+                handle.read_line(&mut line)?;
+                // Strip the trailing newline (LF or CRLF) so the typed
+                // password matches what the operator entered, not the
+                // terminal's line-discipline artifact.
+                if line.ends_with('\n') {
+                    line.pop();
+                    if line.ends_with('\r') {
+                        line.pop();
+                    }
+                }
+                Ok(line)
             }
         }
-        Ok(line)
     }
 }
 

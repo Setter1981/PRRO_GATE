@@ -112,7 +112,6 @@ async fn happy_single_operator_lands_in_registry() {
         &pool_main,
         dps(),
         &AlwaysOkLoader,
-        &["4000000001".to_string()],
     )
     .await
     .expect("build_from_db");
@@ -151,7 +150,6 @@ async fn two_operators_share_single_arc_dps_channel() {
         &pool_main,
         Arc::clone(&channel),
         &AlwaysOkLoader,
-        &["4000000001".to_string(), "4000000002".to_string()],
     )
     .await
     .expect("build");
@@ -201,7 +199,6 @@ async fn orphan_operator_fn_skipped_and_audited() {
         &pool_main,
         dps(),
         &AlwaysOkLoader,
-        &["4000000001".to_string()],
     )
     .await
     .expect("build");
@@ -239,7 +236,6 @@ async fn configured_fn_without_operator_row_emits_not_registered_audit() {
         &pool_main,
         dps(),
         &AlwaysOkLoader,
-        &["4000000099".to_string()],
     )
     .await
     .expect("build");

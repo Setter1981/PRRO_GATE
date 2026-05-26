@@ -205,7 +205,7 @@ The CLI performs the cross-DB foreign-key check that SQLite cannot enforce struc
 
 Cashier turnover or scheduled key rotation:
 
-1. `sqlite3 var/secure.db "UPDATE operators SET is_active = 0 WHERE fiscal_number = '<FN>' AND is_active = 1"`
+1. `sudo -u prro sqlite3 var/secure.db "UPDATE operators SET is_active = 0 WHERE fiscal_number = '<FN>' AND is_active = 1"` — must run as the `prro` service user; `secure.db` is `chmod 0o600 prro:prro` per HIGH-AUDIT-01, so a plain admin shell hits permission-denied.
 2. `prro admin add-operator --fn <FN> ...` with the new cashier's data.
 3. Verify boot audit log shows NO `OPERATOR_ORPHAN_FN` / `OPERATOR_KEY_LOAD_FAILED` for that FN on next start.
 
@@ -229,9 +229,11 @@ Recommended path: `/var/lib/prro/secure/secure.db` with `/var/lib/prro/secure/` 
 
 If migration 020 must be reverted (e.g., schema change in a follow-up makes the existing data incompatible):
 
+All `sqlite3` invocations below must run **as the `prro` service user** (via `sudo -u prro`); the secure DB is `chmod 0o600 prro:prro` per HIGH-AUDIT-01 and refuses access from other accounts.
+
 1. Stop `prro` (every connection holding the secure pool must close).
-2. `sqlite3 var/secure.db "DELETE FROM _sqlx_migrations WHERE version = 20"`
-3. `sqlite3 var/secure.db "DROP TABLE operators"` (and `DROP INDEX operators_active_fn_uidx`, `DROP INDEX operators_fiscal_number_idx` if present in earlier checksum revisions).
+2. `sudo -u prro sqlite3 var/secure.db "DELETE FROM _sqlx_migrations WHERE version = 20"`
+3. `sudo -u prro sqlite3 var/secure.db "DROP TABLE operators"` (and `DROP INDEX operators_active_fn_uidx`, `DROP INDEX operators_fiscal_number_idx` if present in earlier checksum revisions).
 4. Re-deploy with the corrected `migrations_secure/020*.sql` file (or revert the binary to a version that does not require the migration).
 5. Restart `prro` — `sqlx::migrate!` re-applies the corrected file and records a fresh checksum.
 

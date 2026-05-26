@@ -66,6 +66,11 @@ thiserror = "1"
 async-trait = "0.1"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
+# W2 PR-B — no-echo TTY password prompting for `prro admin add-operator`.
+# Eliminates the shoulder-surfing / terminal-scrollback leak surface that
+# raw stdin read created (external audit finding 2026-05-26).
+rpassword = "7"
+
 # Cert refresher (M2 W2) — fingerprinting helper.
 sha2 = "0.10"
 

@@ -128,7 +128,6 @@ async fn case_1_missing_key_file_emits_key_load_failed_audit() {
         &pool_main,
         dps(),
         &FileNotFoundLoader,
-        &["4000000001".to_string()],
     )
     .await
     .expect("boot must NOT abort on key-load failure");
@@ -170,7 +169,6 @@ async fn case_2_wrong_password_emits_key_load_failed_audit() {
         &pool_main,
         dps(),
         &WrongPasswordLoader,
-        &["4000000001".to_string()],
     )
     .await
     .expect("boot must NOT abort");
@@ -208,7 +206,6 @@ async fn case_3_no_operators_row_emits_not_registered_info_audit() {
         &pool_main,
         dps(),
         &FileNotFoundLoader, // any loader; never called
-        &["4000000001".to_string()],
     )
     .await
     .expect("boot continues");

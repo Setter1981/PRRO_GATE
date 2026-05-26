@@ -131,7 +131,11 @@ impl BindingsRegistry {
     ///
     ///   1. Load all `is_active = 1` operator rows from `pool_secure`.
     ///   2. Load all `fiscal_number_config.fiscal_number` rows from
-    ///      `pool_main` into a `HashSet` for the cross-DB FK check.
+    ///      `pool_main` into a `HashSet` — this set is both the
+    ///      cross-DB FK check (step 3a) AND the authoritative list of
+    ///      FNs that MUST have an operators row (step 4).  Callers
+    ///      do not pass the configured list separately; the main DB
+    ///      is the sole source of truth so caller-DB drift is impossible.
     ///   3. For each operator row:
     ///       a. If `fiscal_number` not in the FK set → emit
     ///          `OPERATOR_ORPHAN_FN` Critical audit + skip.
@@ -142,8 +146,8 @@ impl BindingsRegistry {
     ///          [`KeyLoadFailure`] → emit `OPERATOR_KEY_LOAD_FAILED`
     ///          Critical with `reason=<variant>` + skip.
     ///       d. On success → insert into registry.
-    ///   4. For each FN in `configured_fns` that ended up without a
-    ///      registry entry: emit `OPERATOR_NOT_REGISTERED` Info audit.
+    ///   4. For each FN in `main_fns` that ended up without a registry
+    ///      entry: emit `OPERATOR_NOT_REGISTERED` Info audit.
     ///
     /// Returns `Ok(Self)` even if every operator failed — the empty
     /// registry is operationally valid (every handler will 503).
@@ -154,7 +158,6 @@ impl BindingsRegistry {
         pool_main: &SqlitePool,
         dps: Arc<dyn DpsChannel>,
         loader: &dyn OperatorKeyLoader,
-        configured_fns: &[String],
     ) -> anyhow::Result<Self> {
         let rows = operators::list_all(pool_secure).await?;
         let active_rows: Vec<_> = rows.into_iter().filter(|r| r.is_active).collect();
@@ -179,11 +182,22 @@ impl BindingsRegistry {
 
         for row in active_rows {
             // Step 3a — cross-DB FK check.
+            //
+            // PII discipline: `tracing::warn!` MUST NOT include the raw
+            // `operator_id` field.  In the UA PRRO domain `operator_id`
+            // is the cashier's INN (Identification Tax Number) — Personal
+            // Identifiable Information under Ukrainian privacy law.
+            // Process logs (stderr → journald / Loki) are not designed
+            // for PII retention, so we log only the surrogate row id +
+            // the `fiscal_number` (which is the entity scope key, not
+            // personally identifying on its own).  The full payload
+            // (including operator_id) still lands in `audit_log`, which
+            // IS the appropriate retention surface for that data.
             if !main_fns.contains(&row.fiscal_number) {
                 tracing::warn!(
                     target: "prro::runtime::bindings",
                     fiscal_number = %row.fiscal_number,
-                    operator_id = %row.operator_id,
+                    operators_row_id = row.id,
                     "OPERATOR_ORPHAN_FN: operators row references FN not in fiscal_number_config; skipping"
                 );
                 let payload = serde_json::json!({
@@ -212,7 +226,7 @@ impl BindingsRegistry {
                     tracing::warn!(
                         target: "prro::runtime::bindings",
                         fiscal_number = %row.fiscal_number,
-                        operator_id = %row.operator_id,
+                        operators_row_id = row.id,
                         reason = "EmptyEncoded",
                         "OPERATOR_KEY_LOAD_FAILED: empty key_pass_enc BLOB; skipping"
                     );
@@ -252,7 +266,7 @@ impl BindingsRegistry {
                     tracing::warn!(
                         target: "prro::runtime::bindings",
                         fiscal_number = %row.fiscal_number,
-                        operator_id = %row.operator_id,
+                        operators_row_id = row.id,
                         reason = e.reason(),
                         "OPERATOR_KEY_LOAD_FAILED: loader rejected key; skipping"
                     );
@@ -277,11 +291,13 @@ impl BindingsRegistry {
             }
         }
 
-        // Step 4 — emit OPERATOR_NOT_REGISTERED for configured FNs
-        // without a registry entry (whether by orphan, key-fail, or
-        // missing operators row).
+        // Step 4 — emit OPERATOR_NOT_REGISTERED for every FN in
+        // fiscal_number_config that ended up without a registry entry
+        // (whether by orphan, key-fail, or missing operators row).
+        // Iterating over `main_fns` (the authoritative source) instead
+        // of a caller-passed list eliminates caller-DB drift.
         let mut not_registered: usize = 0;
-        for fn_id in configured_fns {
+        for fn_id in &main_fns {
             if !inner.contains_key(fn_id) {
                 let _ = audit_log::append(
                     pool_main,

@@ -115,7 +115,6 @@ listen  = "127.0.0.1:8443"
         app.db(),
         dps,
         &UnreachableLoader,
-        &["4000000001".to_string()],
     )
     .await
     .expect("build_from_db must not abort on empty operators");

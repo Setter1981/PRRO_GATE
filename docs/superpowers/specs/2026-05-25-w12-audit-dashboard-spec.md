@@ -84,8 +84,57 @@ Rust gateway has **no Prometheus / metrics-exporter-prometheus** dependency. The
 | `OFFLINE_DRAIN_FN_STOP_MODE` | `fiscal_document` | doc_id hex | CRITICAL | 2 | #77 | `services/offline_sync/backlog_drain.rs:2074` |
 | `ADMIN_STOP_MODE_RESET` | **`fn`** ⚠ | fiscal_number | CRITICAL | 3 | #79 | `admin.rs:118` |
 | `TRANSPORT_TRACE_ORPHAN_CLOSED` | `transport_trace` | doc_id hex | INFO | forensic | #80 | `services/reconciliation/boot_phase.rs:1273` |
+| `OPERATOR_KEY_LOAD_FAILED` | **`operator`** | fiscal_number | CRITICAL | W2 boot | #98 | `runtime/bindings.rs::build_from_db` |
+| `OPERATOR_ORPHAN_FN` | **`operator`** | fiscal_number | CRITICAL | W2 boot | #98 | `runtime/bindings.rs::build_from_db` |
+| `OPERATOR_NOT_REGISTERED` | **`operator`** | fiscal_number | INFO | W2 boot | #98 | `runtime/bindings.rs::build_from_db` |
+| `ADMIN_OPERATOR_REGISTERED` | **`operator`** | fiscal_number | INFO | W2 admin | #98 | `admin.rs::add_operator` |
 
-⚠ Entity-type naming inconsistency callout: `ADMIN_STOP_MODE_RESET` uses entity_type `"fn"`; drain Tier 2 event uses entity_type `"fiscal_document"`. See § 6 for join strategy.
+⚠ Entity-type naming inconsistency callout: `ADMIN_STOP_MODE_RESET` uses entity_type `"fn"`; drain Tier 2 event uses entity_type `"fiscal_document"`; W2 operator-binding events use entity_type `"operator"`.  See § 6 for join strategy.
+
+### 3.0a W2 operator-binding events — payload shapes (PR #98)
+
+#### `OPERATOR_KEY_LOAD_FAILED`
+
+```json
+{
+  "operator_id": "<cashier INN>",
+  "key_path":    "<absolute path to .dat/.jks>",
+  "reason":      "FileNotFound | WrongPassword | EmptyEncoded | Other"
+}
+```
+
+**Critical alert**: every occurrence pages on-call.  FN is absent from the BindingsRegistry until the operator re-registers; the HTTP handler will respond 503 OPERATOR_NOT_REGISTERED for any request on that FN.
+
+#### `OPERATOR_ORPHAN_FN`
+
+```json
+{
+  "operator_id": "<cashier INN>",
+  "key_path":    "<absolute path>"
+}
+```
+
+**Critical alert**: cross-DB FK violation — an `operators` row references a `fiscal_number` not in `fiscal_number_config`.  Caused by either (a) `fiscal_number_config` row deleted post-registration, or (b) operator typo at registration that PR-B's CLI pre-check missed.  Recovery: per admin-runbook §6a.
+
+#### `OPERATOR_NOT_REGISTERED`
+
+```json
+{}
+```
+
+Empty payload — entity_id is the FN itself.  **Info severity, not alerting.**  Configured FN has no active operators row; expected during initial deployment before `prro admin add-operator` is run, or after cashier rotation without re-registration.  Dashboard should panel-display the current count of "configured FNs without active cashier" for ops awareness.
+
+#### `ADMIN_OPERATOR_REGISTERED`
+
+```json
+{
+  "operator_id": "<cashier INN>",
+  "name":        "<human-readable cashier name>",
+  "key_path":    "<absolute path>"
+}
+```
+
+**Info-severity forensic trail** for every `prro admin add-operator` invocation.  Payload constructed via `serde_json::json!` so embedded quotes / control chars escape correctly.  **Password and `key_pass_enc` BLOB NEVER appear** in payload (security-reviewer pin + PR-B external audit F1 fix).
 
 ### 3.1 Payload JSON shapes
 
