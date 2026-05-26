@@ -160,8 +160,88 @@ After any Hold outcome on FN-A, per-FN backoff schedules next drain tick:
 
 ---
 
+## 6a. W2 add-operator (cashier EDS-key registration)
+
+`prro admin add-operator` registers a cashier (operator) by binding their EDS key file to a fiscal_number. The row lands in the **secure** SQLite database (`var/secure.db` per `[database].secure_db_path` config; hard-isolated from the main ledger per HIGH-AUDIT-01 — separate file, chmod 0o600, separate migration directory `migrations_secure/`).
+
+### Syntax
+
+```bash
+prro admin add-operator \
+    --config /etc/prro/config.toml \
+    --inn 3456789012 \
+    --name "Cashier Iryna" \
+    --key-path /var/keys/cashier-iryna.dat \
+    --fn 4000000001
+```
+
+### Password input
+
+Two modes, autodetected from `stdin`:
+
+- **TTY** (interactive operator at a terminal): password prompted twice. Mismatch → exit 64 (`EX_USAGE`) with `PasswordMismatch` error. Empty input → exit 64 with `EmptyPassword`.
+- **Non-TTY** (CI / scripted): single line read from stdin. Empty → exit 64.
+
+The plaintext password lives only in the CLI process memory; it is obfuscated via the WebCheck-symmetric `Coding` helper (NOT cryptography — see `rust/prro/src/runtime/coding.rs` doc-block for the threat model) and stored as the `key_pass_enc` BLOB. **The audit row `ADMIN_OPERATOR_REGISTERED` carries `operator_id`, `name`, `key_path` only — never the password or the encoded BLOB.**
+
+### Pre-INSERT validation
+
+The CLI performs the cross-DB foreign-key check that SQLite cannot enforce structurally (foreign keys do not span database files):
+
+- `--fn` must exist in `fiscal_number_config` (main DB). Missing → exit 64 with `FiscalNumberNotInConfig`. Prevents orphan rows that would only surface at boot via `OPERATOR_ORPHAN_FN` Critical audit.
+- `--inn`, `--name`, `--key-path`, `--fn` must be non-empty/non-whitespace. Empty → exit 64 with `EmptyArgument(<which>)`.
+- The partial unique index `operators_active_fn_uidx WHERE is_active = 1` rejects a second active cashier for the same FN. Mapped to `DuplicateActiveCashier` exit 64. Rotation procedure: mark the previous row `is_active = 0` (manual `UPDATE`), then re-run `add-operator`.
+
+### Recovery scenarios
+
+| Symptom at boot | Audit signal | Operator action |
+|---|---|---|
+| Handler returns 503 with `error_code = OPERATOR_NOT_REGISTERED` | `OPERATOR_NOT_REGISTERED` Info on the FN | Run `add-operator` for that FN |
+| Boot log shows `OPERATOR_ORPHAN_FN` Critical | Audit payload carries `operator_id` + `key_path` | Either add the missing FN to `fiscal_number_config` OR `DELETE FROM operators WHERE id = <id>` and re-register with correct FN |
+| Boot log shows `OPERATOR_KEY_LOAD_FAILED` reason=FileNotFound | Critical audit + FN absent from registry | Verify `key_path` exists on disk; if cashier rotated, `UPDATE operators SET is_active = 0 WHERE …` and re-add |
+| Boot log shows `OPERATOR_KEY_LOAD_FAILED` reason=WrongPassword | Critical | Cashier supplied wrong password during registration; rotate (mark old row inactive) and re-add |
+
+### Key-password rotation procedure
+
+Cashier turnover or scheduled key rotation:
+
+1. `sqlite3 var/secure.db "UPDATE operators SET is_active = 0 WHERE fiscal_number = '<FN>' AND is_active = 1"`
+2. `prro admin add-operator --fn <FN> ...` with the new cashier's data.
+3. Verify boot audit log shows NO `OPERATOR_ORPHAN_FN` / `OPERATOR_KEY_LOAD_FAILED` for that FN on next start.
+
+Historical rows (`is_active = 0`) accumulate intentionally for forensic continuity — they are NOT pruned automatically. Periodic ops cleanup (annual) may `DELETE` rows older than the legal retention window.
+
+### Secure DB directory permissions (HIGH-AUDIT-01 supplemental)
+
+`chmod 0o600` on `secure.db` + `secure.db-wal` + `secure.db-shm` prevents reading the cashier-key obfuscated BLOB by other local users.  **However**, write permissions on the *containing directory* allow any user with directory write access to **delete, rename, or truncate** the file regardless of its mode.  This is a Unix filesystem semantic, not a chmod bug.
+
+**Operational mandate**: the directory containing `secure_db_path` MUST be:
+
+- owned by the `prro` service user;
+- mode `0o700` (recommended) or `0o750` (acceptable if the service group also needs the secure DB visible for backup tooling);
+- NOT inside `/tmp`, `/var/tmp`, or any other world-writable location.
+
+Recommended path: `/var/lib/prro/secure/secure.db` with `/var/lib/prro/secure/` at `0o700 prro:prro`.
+
+`prro admin doctor` (W2 follow-up) MAY warn (not fail) when the parent directory mode is broader than `0o755`; for now the discipline is operator-enforced via this runbook.
+
+### W2 manual rollback (LOW-PR90-02)
+
+If migration 020 must be reverted (e.g., schema change in a follow-up makes the existing data incompatible):
+
+1. Stop `prro` (every connection holding the secure pool must close).
+2. `sqlite3 var/secure.db "DELETE FROM _sqlx_migrations WHERE version = 20"`
+3. `sqlite3 var/secure.db "DROP TABLE operators"` (and `DROP INDEX operators_active_fn_uidx`, `DROP INDEX operators_fiscal_number_idx` if present in earlier checksum revisions).
+4. Re-deploy with the corrected `migrations_secure/020*.sql` file (or revert the binary to a version that does not require the migration).
+5. Restart `prro` — `sqlx::migrate!` re-applies the corrected file and records a fresh checksum.
+
+`prro_gate.db` is **not touched** by this procedure — the main ledger remains intact through the rollback. This is the design payoff of the HIGH-AUDIT-01 split: rollback blast radius is contained to the secure DB.
+
+---
+
 ## 7. Related documents
 
+- `docs/superpowers/plans/2026-05-25-m4-ingress-plan.md` §3 W2 — W2 plan + review-gated acceptance items (HIGH-PR90-01, MED-PR90-01, MED-PR90-02, MED-PR90-03, MED-PR90-04, LOW-PR90-01, LOW-PR90-02)
 - `docs/superpowers/plans/2026-05-24-m3b-w12-post-closure-hardening.md` — hardening plan (8 RECs)
 - `docs/superpowers/specs/2026-05-25-w12-post-hardening-review-findings.md` — review findings (CONCERN/GAP/TD registry)
 - `docs/superpowers/specs/2026-05-25-w12-tiered-hold-degradation.md` — Tiered degradation spec (REC-1 + Tier 3)

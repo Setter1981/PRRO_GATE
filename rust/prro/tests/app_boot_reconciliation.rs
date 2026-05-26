@@ -152,8 +152,8 @@ app_name = "prro"
 version  = "0.1.0"
 
 [database]
-db_path = "{}"
-secure_db_path = "secure.db"
+db_path = "{0}"
+secure_db_path = "{0}_secure"
 
 [admin_ui]
 enabled = false
@@ -703,8 +703,8 @@ app_name = "prro"
 version  = "0.1.0"
 
 [database]
-db_path = "{}"
-secure_db_path = "secure.db"
+db_path = "{0}"
+secure_db_path = "{0}_secure"
 
 [admin_ui]
 enabled = false
@@ -740,8 +740,8 @@ app_name = "prro"
 version  = "0.1.0"
 
 [database]
-db_path = "{}"
-secure_db_path = "secure.db"
+db_path = "{0}"
+secure_db_path = "{0}_secure"
 
 [admin_ui]
 enabled = false
@@ -791,8 +791,8 @@ app_name = "prro"
 version  = "0.1.0"
 
 [database]
-db_path = "{}"
-secure_db_path = "secure.db"
+db_path = "{0}"
+secure_db_path = "{0}_secure"
 
 [admin_ui]
 enabled = false
