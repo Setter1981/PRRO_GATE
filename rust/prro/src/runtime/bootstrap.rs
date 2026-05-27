@@ -99,8 +99,20 @@ async fn seed_tax_groups(
     // letter, custom rate) survive untouched.  Rate fields are NOT
     // overwritten on reactivation — operator can `update-tax-rate`
     // separately if they want to restore the default.
+    //
+    // Audit Round-2 (2026-05-27): per-row try/log/continue.  If an
+    // operator soft-deleted a default (e.g. tx_num=1 letter=А) AND
+    // reassigned letter "А" to a custom tx_num=50, the reactivation
+    // of tx_num=1 violates the partial unique idx on (fn, letter)
+    // WHERE is_active=1.  Previously this `?` aborted the WHOLE
+    // bootstrap loop, stranding the FN without the remaining 10
+    // defaults / 4 payments / profile / flag.  Now: log the
+    // collision via tracing::warn!, audit downstream via
+    // ADMIN_FN_DEFAULTS_BOOTSTRAP_FAILED (caller emits), continue
+    // with the rest.  Operator can resolve the letter conflict
+    // manually via `prro admin update-tax-rate` afterward.
     for (tx_num, letter, dtpr, txpr, txal) in DEFAULT_TAX_GROUPS {
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO tax_groups \
                 (fn, tx_num, letter, dtpr, txpr, txal, txty) \
              VALUES (?, ?, ?, ?, ?, ?, 0) \
@@ -115,7 +127,19 @@ async fn seed_tax_groups(
         .bind(*txpr)
         .bind(*txal)
         .execute(pool)
-        .await?;
+        .await;
+
+        if let Err(e) = result {
+            tracing::warn!(
+                target: "prro::runtime::bootstrap",
+                fn_id = %fn_id,
+                tx_num = *tx_num,
+                letter = *letter,
+                cause = %e,
+                "tax_group seed row failed (likely letter-collision via prior operator \
+                 customisation) — continuing with remaining defaults"
+            );
+        }
     }
     Ok(())
 }
@@ -136,8 +160,13 @@ async fn seed_payment_methods(
 ) -> Result<(), BootstrapError> {
     // Same Audit Round-1 fix as `seed_tax_groups`: reactivate
     // soft-deleted defaults; leave active rows untouched.
+    //
+    // Audit Round-2 (2026-05-27): per-row try/log/continue — partial
+    // unique idx on (fn, name) collides if operator re-used the
+    // default name on a different pay_index.  Don't abort the whole
+    // loop on one collision.
     for (pay_index, name, iscash) in DEFAULT_PAYMENT_METHODS {
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO payment_methods \
                 (fn, pay_index, name, iscash) \
              VALUES (?, ?, ?, ?) \
@@ -150,7 +179,19 @@ async fn seed_payment_methods(
         .bind(*name)
         .bind(if *iscash { 1_i64 } else { 0 })
         .execute(pool)
-        .await?;
+        .await;
+
+        if let Err(e) = result {
+            tracing::warn!(
+                target: "prro::runtime::bootstrap",
+                fn_id = %fn_id,
+                pay_index = *pay_index,
+                name = *name,
+                cause = %e,
+                "payment_method seed row failed (likely name-collision via prior \
+                 operator customisation) — continuing with remaining defaults"
+            );
+        }
     }
     Ok(())
 }

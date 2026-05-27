@@ -113,7 +113,12 @@ fn evpz_parser_returns_typed_unimplemented() {
 // ─── Router: EVPZ in pilot returns ProfileNotImplemented ─────────
 
 #[tokio::test]
-async fn dispatch_returns_profile_not_implemented_for_evpz_dps() {
+async fn dispatch_surfaces_native_build_unimplemented_for_evpz_dps() {
+    // Audit Round-2 (2026-05-27): no hardcoded EvpzDps short-circuit
+    // in `dispatch_to_outgress`.  EVPZ flows through the trait chain
+    // and its native `Err(BuildError::Unimplemented)` propagates as
+    // `OutgressError::Build`.  Open-closed: third future profile
+    // adds its own `Unimplemented` without touching the router.
     let err = outgress::dispatch_to_outgress(
         OutgressProfile::EvpzDps,
         &dummy_cmd(),
@@ -122,14 +127,34 @@ async fn dispatch_returns_profile_not_implemented_for_evpz_dps() {
         &SignContext::default(),
     )
     .await
-    .expect_err("EVPZ_DPS must surface ProfileNotImplemented in pilot");
+    .expect_err("EVPZ_DPS must surface Build::Unimplemented in pilot");
 
-    match err {
-        OutgressError::ProfileNotImplemented { profile } => {
-            assert_eq!(profile, OutgressProfile::EvpzDps);
-        }
-        other => panic!("expected ProfileNotImplemented, got: {other:?}"),
-    }
+    assert!(matches!(
+        err,
+        OutgressError::Build(outgress::BuildError::Unimplemented(_))
+    ));
+}
+
+#[tokio::test]
+async fn dispatch_surfaces_fsco_build_unimplemented_too() {
+    // Audit Round-2 (2026-05-27): FSCO pilot skeletons return typed
+    // Unimplemented (NOT `todo!()` panic).  Pilot supervisor that
+    // accidentally dispatches FSCO_ZZD before W4-Z1..Z3 bodies land
+    // sees a safe error, not a tokio worker thread crash.
+    let err = outgress::dispatch_to_outgress(
+        OutgressProfile::FscoZzd,
+        &dummy_cmd(),
+        &dummy_builder_context(),
+        &dummy_target(),
+        &SignContext::default(),
+    )
+    .await
+    .expect_err("FSCO_ZZD body lands in W4-Z1..Z3 — typed Unimplemented expected");
+
+    assert!(matches!(
+        err,
+        OutgressError::Build(outgress::BuildError::Unimplemented(_))
+    ));
 }
 
 // ─── Quartet accessor: returns Arc<dyn Trait> per profile ────────

@@ -124,15 +124,22 @@ pub enum DriverIdError {
 impl DriverId {
     pub const MAX_LEN: usize = 64;
 
+    /// Audit Round-2 (2026-05-27): `.trim()` before length/empty check.
+    /// `driver_id` flows in from YAML listener config — whitespace
+    /// (leading newline, trailing space from a copy-paste) would
+    /// silently fail `driver_tax_mapping` lookups at runtime with no
+    /// hint to the operator.  Trim at construction, reject all-
+    /// whitespace as `Empty`.
     pub fn new(s: impl Into<String>) -> Result<Self, DriverIdError> {
-        let s = s.into();
-        if s.is_empty() {
+        let raw = s.into();
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
             return Err(DriverIdError::Empty);
         }
-        if s.len() > Self::MAX_LEN {
-            return Err(DriverIdError::TooLong(s.len()));
+        if trimmed.len() > Self::MAX_LEN {
+            return Err(DriverIdError::TooLong(trimmed.len()));
         }
-        Ok(Self(s))
+        Ok(Self(trimmed.to_string()))
     }
 
     pub fn as_str(&self) -> &str {

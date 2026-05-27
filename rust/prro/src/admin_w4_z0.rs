@@ -616,31 +616,49 @@ pub async fn show_outgress_profile(
 // pools, invoke the library function, then close pools.  Mirror of
 // W2 PR-B `admin::run_add_operator` pattern.
 
+/// Audit Round-2 (2026-05-27): every W4-Z0 mutating CLI command now
+/// acquires the singleton lock from `runtime::singleton::acquire`,
+/// matching `admin::run_add_operator` + `admin::run_reset_stop_mode`.
+/// Without the lock, a `prro admin add-tax-group` could race
+/// `prro serve`'s live secure.db reads (post-W4-Z1) or another
+/// admin command, causing config drift between read and use.
+///
+/// The lock is acquired BEFORE pool open; caller MUST keep the
+/// returned `SingletonGuard` alive for the duration of the command.
 async fn open_pools_from_config(
     config_path: &Path,
-) -> Result<(SqlitePool, SqlitePool), CfgAdminError> {
+) -> Result<(crate::runtime::singleton::PidLock, SqlitePool, SqlitePool), CfgAdminError> {
     let cfg_text = std::fs::read_to_string(config_path)
         .map_err(|e| CfgAdminError::Infrastructure(format!("read config: {e}")))?;
     let cfg = crate::config::AppConfig::from_toml(&cfg_text)
         .map_err(|e| CfgAdminError::Infrastructure(format!("parse config: {e}")))?;
+    let guard = crate::runtime::singleton::acquire(&cfg.database.db_path)
+        .map_err(|e| CfgAdminError::Infrastructure(format!("singleton lock: {e}")))?;
     let pool_main = crate::db::open_pool(&cfg.database.db_path)
         .await
         .map_err(|e| CfgAdminError::Infrastructure(format!("open main pool: {e}")))?;
     let pool_secure = crate::db::open_secure_pool(&cfg.database.secure_db_path)
         .await
         .map_err(|e| CfgAdminError::Infrastructure(format!("open secure pool: {e}")))?;
-    Ok((pool_main, pool_secure))
+    Ok((guard, pool_main, pool_secure))
 }
 
 /// Open pools + call body + close pools.  Inline form (closures + async
 /// move had lifetime issues with `&String` borrows captured into the
 /// returned future).
+///
+/// Audit Round-2 (2026-05-27): the singleton `_guard` returned from
+/// `open_pools_from_config` is bound here so it stays alive for the
+/// duration of the command body, then drops AFTER pool closure.
+/// Drop order: result async block (mutation + audit) → pools close
+/// → guard drop releases the lock file.
 macro_rules! with_pools {
     ($cfg:expr, $main:ident, $secure:ident, $body:block) => {{
-        let ($main, $secure) = open_pools_from_config($cfg).await?;
+        let (_guard, $main, $secure) = open_pools_from_config($cfg).await?;
         let result = async $body.await;
         $secure.close().await;
         $main.close().await;
+        drop(_guard);
         result
     }};
 }
@@ -672,7 +690,7 @@ pub async fn run_remove_tax_group(
 pub async fn run_list_tax_groups(
     cfg: &Path, fn_id: String,
 ) -> Result<Vec<TaxGroup>, CfgAdminError> {
-    with_pools!(cfg, _pm, ps, { list_tax_groups(&ps, &fn_id).await })
+    with_pools!(cfg, pm, ps, { list_tax_groups(&ps, &fn_id).await })
 }
 
 pub async fn run_add_payment_method(
@@ -701,7 +719,7 @@ pub async fn run_remove_payment_method(
 pub async fn run_list_payment_methods(
     cfg: &Path, fn_id: String,
 ) -> Result<Vec<PaymentMethod>, CfgAdminError> {
-    with_pools!(cfg, _pm, ps, { list_payment_methods(&ps, &fn_id).await })
+    with_pools!(cfg, pm, ps, { list_payment_methods(&ps, &fn_id).await })
 }
 
 pub async fn run_set_flag(
@@ -719,7 +737,7 @@ pub async fn run_set_national_receipt(
 pub async fn run_list_flags(
     cfg: &Path, fn_id: String,
 ) -> Result<Vec<FnIntegrationFlag>, CfgAdminError> {
-    with_pools!(cfg, _pm, ps, { list_flags(&ps, &fn_id).await })
+    with_pools!(cfg, pm, ps, { list_flags(&ps, &fn_id).await })
 }
 
 pub async fn run_add_driver_mapping(
@@ -750,7 +768,7 @@ pub async fn run_remove_driver_mapping(
 pub async fn run_list_driver_mappings(
     cfg: &Path, driver_id: String,
 ) -> Result<Vec<DriverTaxMapping>, CfgAdminError> {
-    with_pools!(cfg, _pm, ps, { list_driver_mappings(&ps, &driver_id).await })
+    with_pools!(cfg, pm, ps, { list_driver_mappings(&ps, &driver_id).await })
 }
 
 pub async fn run_set_outgress_profile(
@@ -764,7 +782,7 @@ pub async fn run_set_outgress_profile(
 pub async fn run_show_outgress_profile(
     cfg: &Path, fn_id: String,
 ) -> Result<OutgressProfile, CfgAdminError> {
-    with_pools!(cfg, _pm, ps, { show_outgress_profile(&ps, &fn_id).await })
+    with_pools!(cfg, pm, ps, { show_outgress_profile(&ps, &fn_id).await })
 }
 
 pub async fn run_bootstrap_defaults(

@@ -207,6 +207,15 @@ pub trait DpsResponseParser: Send + Sync {
 
 // ─── FSCO/ZZD pilot impls (skeleton; bodies land in W4-Z1..Z3) ────
 
+// Audit Round-2 (2026-05-27): pilot FSCO_ZZD is the DEFAULT outgress
+// profile.  If a supervisor task accidentally dispatches before
+// W4-Z1..Z3 fill in the bodies, `todo!()` would PANIC the tokio
+// worker thread — crashing the whole supervisor process.  Return
+// typed `Unimplemented` errors instead so accidental invocations
+// safely surface as `OutgressError::Build/Sign/Transport/Parse`
+// and the worker can re-route to offline-backlog or refuse the
+// command without aborting the runtime.
+
 pub struct FscoXmlBuilder;
 impl DpsXmlBuilder for FscoXmlBuilder {
     fn build_check(
@@ -216,10 +225,9 @@ impl DpsXmlBuilder for FscoXmlBuilder {
     ) -> Result<Vec<u8>, BuildError> {
         // W4-Z1 will land the real FSCO `<RQ><DAT><C>...` builder
         // mirroring `src/prro_gateway/serializers/dps_xml.py`.
-        // Today this is a slot — supervisor dispatch hits this path
-        // only if a downstream worklet stubs out the rest of the
-        // pipeline; nothing in pilot calls it yet.
-        todo!("W4-Z1 — FSCO XML builder")
+        Err(BuildError::Unimplemented(
+            "FSCO XML builder body lands in W4-Z1".to_string(),
+        ))
     }
 }
 
@@ -231,7 +239,9 @@ impl SignEnvelope for CmsOverDatEnvelope {
         _sign_ctx: &SignContext,
     ) -> Result<Vec<u8>, SignError> {
         // W4-Z2 — CMS sign over the `<DAT>` content via jkurwa sidecar.
-        todo!("W4-Z2 — CMS-over-DAT envelope")
+        Err(SignError::Unimplemented(
+            "CMS-over-DAT envelope body lands in W4-Z2".to_string(),
+        ))
     }
 }
 
@@ -244,7 +254,9 @@ impl DpsTransport for GrpcSendChkV2Transport {
         _target: &TargetEndpoint,
     ) -> Result<Vec<u8>, TransportError> {
         // W4-Z3 — gRPC `sendChkV2` to cabinet.tax.gov.ua:9443 / prro.tax.gov.ua:443.
-        todo!("W4-Z3 — gRPC sendChkV2 transport")
+        Err(TransportError::Unimplemented(
+            "gRPC sendChkV2 transport body lands in W4-Z3".to_string(),
+        ))
     }
 }
 
@@ -256,7 +268,9 @@ impl DpsResponseParser for FscoResponseParser {
         _cmd: &CanonicalFiscalCommand,
     ) -> Result<DpsOutcome, ParseError> {
         // W4-Z3 — decode KVT1/KVT2 protobuf per `sendChkV2.proto`.
-        todo!("W4-Z3 — FSCO response parser (KVT1/KVT2)")
+        Err(ParseError::Unimplemented(
+            "FSCO response parser (KVT1/KVT2) body lands in W4-Z3".to_string(),
+        ))
     }
 }
 
@@ -361,14 +375,15 @@ pub async fn dispatch_to_outgress(
     target: &TargetEndpoint,
     sign_ctx: &SignContext,
 ) -> Result<DpsOutcome, OutgressError> {
+    // Audit Round-2 (2026-05-27): no hardcoded `if profile ==
+    // EvpzDps` early-exit.  Open-closed principle — adding a third
+    // profile (e.g. Tax-1 / ОФД-aggregator) must not require
+    // modifying this router function.  Each impl's native
+    // `Err(...::Unimplemented)` flows through the `?` chain and
+    // converts to `OutgressError::{Build,Sign,Transport,Parse}`
+    // via the `#[from]` From impls.  Per-profile detail is in
+    // the error message body.
     let (builder, envelope, transport, parser) = quartet_for(profile);
-
-    // Early-exit: short-circuit the EVPZ slot before touching the
-    // todo!() FSCO skeletons.  Pilot supervisor sees a typed error
-    // for any FN configured to EVPZ_DPS.
-    if profile == OutgressProfile::EvpzDps {
-        return Err(OutgressError::ProfileNotImplemented { profile });
-    }
 
     let payload = builder.build_check(cmd, ctx)?;
     let signed = envelope.wrap(&payload, sign_ctx)?;

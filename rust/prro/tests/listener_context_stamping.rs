@@ -69,6 +69,22 @@ fn driver_id_validates_empty_string() {
     ));
 }
 
+/// Audit Round-2 (2026-05-27): whitespace-only strings would silently
+/// fail driver_tax_mapping lookups at runtime.  Trim at construction.
+#[test]
+fn driver_id_rejects_whitespace_only_string() {
+    for whitespace in ["   ", "\t", "\n\n", " \t \n"] {
+        let err = DriverId::new(whitespace).expect_err("whitespace-only rejected");
+        assert!(matches!(err, prro::db::models::ids::DriverIdError::Empty));
+    }
+}
+
+#[test]
+fn driver_id_trims_surrounding_whitespace() {
+    let id = DriverId::new("  maria304\n  ").expect("trim succeeds");
+    assert_eq!(id.as_str(), "maria304");
+}
+
 #[test]
 fn driver_id_validates_max_length() {
     let too_long = "x".repeat(65);
