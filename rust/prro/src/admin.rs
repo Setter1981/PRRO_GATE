@@ -578,6 +578,30 @@ pub async fn add_operator(
             .map_err(|e| {
                 AdminError::Infrastructure(format!("audit append REGISTERED: {e}"))
             })?;
+
+            // W4-Z0 piece 7: per-FN config bootstrap.  Idempotent
+            // (INSERT OR IGNORE for every row) so rotation /
+            // additional-cashier add-operator calls remain no-ops on
+            // the config tables.  Operator pre-customisations
+            // (set-tax-rate, set-outgress-profile=EVPZ_DPS) survive.
+            // Failure here does NOT roll back the operator INSERT
+            // (it has its own audit row) — but it DOES surface as an
+            // admin CLI error so the operator notices.  Recovery is
+            // simply re-running the same `add-operator` command, or
+            // manually invoking individual admin commands to populate
+            // missing defaults.
+            crate::runtime::bootstrap::bootstrap_fn_defaults(
+                pool_secure,
+                &input.fiscal_number,
+            )
+            .await
+            .map_err(|e| {
+                AdminError::Infrastructure(format!(
+                    "bootstrap_fn_defaults for fn={}: {e}",
+                    input.fiscal_number
+                ))
+            })?;
+
             Ok(())
         }
         Err(crate::db::repositories::operators::OperatorsRepoError::DuplicateActive(fn_id)) => {
