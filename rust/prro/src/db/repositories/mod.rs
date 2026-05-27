@@ -1,5 +1,6 @@
 pub mod audit_log;
 pub mod document_files;
+pub mod driver_tax_mapping;
 pub mod fiscal_documents;
 pub mod fiscal_number_config;
 pub mod ingress_inbox;
