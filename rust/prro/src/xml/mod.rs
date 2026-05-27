@@ -71,7 +71,10 @@
 //!   * `TaxGroupSummary` / `ZReportTaxSummary` callers populate
 //!     `txsm` / `dtsm` via `calc_tax(…)?` and must handle
 //!     `CalcTaxError::UnsupportedAlgorithm` (TXAL=3) +
-//!     `RateNotFinite` (corrupted config).
+//!     `InvalidRate` (corrupted config: NaN/Inf/negative) +
+//!     `IntermediateOverflow` (arithmetic blow-up) +
+//!     `AggregationOverflow` (i64 sum saturation) +
+//!     `TaxMappingNotWired` (empty tax_groups stub).
 //!   * `CheckItem.adjustments` is a `Vec` preserving caller order
 //!     (Python iterates `g['discounts']` insertion-order).  Mixed
 //!     `[Surcharge, Discount]` emits `<S>` before `<D>`.

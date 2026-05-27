@@ -118,12 +118,3 @@ pub fn derive_check_tax_summaries(
     Ok(summaries)
 }
 
-/// AUDIT5-IMP-3 (B) — deprecated alias for transitional builds.
-/// Caller migration will land alongside W4-Z2 dispatcher work.
-#[deprecated(note = "use derive_check_tax_summaries; Z-report needs a separate helper")]
-pub fn derive_tax_summaries(
-    items: &[CheckItem],
-    tax_groups: &HashMap<i64, ResolvedTaxGroup>,
-) -> Result<Vec<TaxGroupSummary>, CalcTaxError> {
-    derive_check_tax_summaries(items, tax_groups)
-}

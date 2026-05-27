@@ -104,9 +104,11 @@ pub enum SignError {
     PersistCasFailed { outcome: TransitionOutcome },
     #[error("stage 3-NO-TX canonical XML build failed: {0}")]
     Build(#[from] crate::xml::XmlBuildError),
-    /// W4-Z1 piece 7 — `derive_tax_summaries` returned a typed
-    /// `CalcTaxError` (UnsupportedAlgorithm / InvalidRate /
-    /// IntermediateOverflow).  Surface to audit_log + reject doc.
+    /// W4-Z1 piece 7 — `derive_check_tax_summaries` returned a typed
+    /// `CalcTaxError`: UnsupportedAlgorithm / InvalidRate /
+    /// IntermediateOverflow / AggregationOverflow / TaxMappingNotWired.
+    /// Surface to audit_log + reject doc (deterministic config /
+    /// payload defect — NEVER retry).
     #[error("stage 3-NO-TX tax-summary aggregation failed: {0}")]
     TaxSummary(#[from] crate::xml::CalcTaxError),
     #[error("stage 3-NO-TX CMS sign failed: {0}")]
@@ -942,11 +944,16 @@ fn build_canonical_doc(
 /// W4-Z1 piece 7 — full JSON → xml::CheckPayload conversion.
 ///
 /// Carries every optional W4-Z1 attr from the JSON shim plus
-/// derives `tax_summaries` via the pure `derive_tax_summaries`
+/// derives `tax_summaries` via the pure `derive_check_tax_summaries`
 /// helper (no DB / network).  Caller MUST pass a pre-resolved
 /// `tax_groups` snapshot (loaded once per receipt via
-/// `driver_tax_mapping` repo).  Empty map → no <TX> children
-/// (Python parity for unknown groups).
+/// `driver_tax_mapping` repo).
+///
+/// **Fail-closed behaviour** (AUDIT5-CRIT-1): when items reference
+/// `tax_group_1 == Some(_)` but the resolved map is EMPTY, the
+/// helper returns `CalcTaxError::TaxMappingNotWired` rather than
+/// silently emit no `<TX>`.  Partial maps (with miss) follow Python
+/// parity and skip the unknown group.
 ///
 /// Operator pin: aggregation lives HERE, not in adapters; adapter
 /// stays thin and transcribes wire fields only.  See module-level

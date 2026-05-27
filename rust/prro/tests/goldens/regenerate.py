@@ -32,10 +32,15 @@ Usage:
 
 The script is intentionally narrow:
 
-  - hard-coded fixture payloads chosen to exercise the W4 first-round
-    subset (the same subset the Rust builder ships in C1: items +
-    payments + closing E for SELL/RETURN, M-summary + NC for
-    Z_REPORT, no excise/discounts/header/footer/tax_groups);
+  - hard-coded fixture payloads exercising two layers:
+      * W4-C1 minimal subset (4 fixtures: items + payments + closing
+        E for SELL/RETURN, M-summary + NC for Z_REPORT) — frozen
+        back-compat oracle for the legacy minimal builder path;
+      * W4-Z1 extended subset (2 fixtures: sell_extended +
+        z_report_extended) — full ФСКО Table 23 coverage:
+        excise/UKTZED/TX groups/per-item discount/EPZ slip/check-
+        level adjustments/header+footer L/<TX> children in <E>/
+        <TXS> full form/<IO>/<EPZ>);
   - cp1251 encoding via ``str.encode('cp1251')`` — the same
     encoding the Python serializer's downstream signing path
     expects;
