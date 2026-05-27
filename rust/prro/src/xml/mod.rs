@@ -217,16 +217,63 @@ pub enum AdjustmentMode {
 }
 
 /// Single payment inside a SELL/RETURN check.  Mirrors Python's
-/// `<M>` shape with the W4 first-round attribute subset: `N / NM /
-/// SM / T`.
-#[derive(Debug, Clone)]
+/// `<M>` shape.
+///
+/// W4-Z1 (2026-05-27) extended the minimal subset (N/NM/SM/T) with
+/// the EPZ acquirer-slip attributes (Python `dps_xml.py:289-301`,
+/// WebCheck `DopTegE()`) + cash-only `RM` (change) + `SMP` (rounding).
+/// Empty `None` → attribute NOT emitted.  Cash payments (T="0") may
+/// carry RM/SMP; non-cash payments (T="1"+) carry EPZ slip attrs.
+#[derive(Debug, Clone, Default)]
 pub struct CheckPayment {
-    /// `<M NM=...>`.  Payment-type display name (e.g. `"CASH"`).
+    /// `<M NM=...>`.  Payment-type display name (e.g. `"Готівка"`).
     pub name: String,
     /// `<M SM=...>`.  Amount (kopecks).
     pub sum: i64,
-    /// `<M T=...>`.  Type code: `"0"` cash, `"2"` non-cash.
+    /// `<M T=...>`.  Type code per WebCheck PayForms ordering:
+    /// `"0"` = first cash slot (Готівка), `"1"+` = subsequent
+    /// cashless slots (Картка / Кредит / Сертифікат / custom).
     pub type_code: String,
+
+    // ─── W4-Z1: EPZ acquirer-slip attributes ─────────────────────
+    //
+    // Per Python `dps_xml.py:289-300` + WebCheck `StringXML.cs:663
+    // DopTegE()`.  Only emit when populated; non-cash payments
+    // typically carry several of these, cash payments carry none.
+
+    /// `<M PA=...>`.  Payment system / acquirer name (or first
+    /// EPZ slot per WebCheck `tegD.PA`).
+    pub pa: Option<String>,
+    /// `<M PB=...>`.  Terminal ID.
+    pub pb: Option<String>,
+    /// `<M PC=...>`.  Operation type / human label.
+    pub pc: Option<String>,
+    /// `<M PD=...>`.  Card mask (last 4 digits + masked PAN).
+    pub pd: Option<String>,
+    /// `<M PE=...>`.  Approval / authorisation code from acquirer.
+    pub pe: Option<String>,
+    /// `<M PF=...>`.  Commission / fee (kopecks).  Per Python
+    /// `:300` only emitted when commission > 0.
+    pub pf: Option<i64>,
+    /// `<M PSNM=...>`.  Payment-system name (e.g. "Visa"/"Mastercard").
+    pub psnm: Option<String>,
+    /// `<M RRN=...>`.  Retrieval Reference Number (acquirer
+    /// transaction ID).
+    pub rrn: Option<String>,
+
+    // ─── W4-Z1: Cash-only attrs ───────────────────────────────────
+
+    /// `<M RM=...>`.  Change returned to customer (kopecks).  Per
+    /// Python `:301-303` emitted ONLY on the FIRST cash payment
+    /// (T="0") and ONLY when total paid > total due.  Caller
+    /// (W4-Z1 piece 7) resolves the "first cash" semantics.
+    pub rm: Option<i64>,
+    /// `<M SMP=...>`.  Rounding adjustment (kopecks).  Per Python
+    /// `:304-306` emitted ONLY on the FIRST cash payment when
+    /// `receipt.rounding != 0`.  Carries the rounded-off amount
+    /// (positive = customer overpaid by N kopecks rounded to
+    /// hryvnia; negative = underpaid).
+    pub smp: Option<i64>,
 }
 
 /// Z_REPORT — shift-close fiscal document.  Per WebCheck + DPS
@@ -404,17 +451,54 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
     for pay in &p.payments {
         let n = item_no.to_string();
         let sm = pay.sum.to_string();
-        // Python `_build_check` m_attrs (subset): N, NM, SM, T.
-        tag_attrs(
-            out,
-            "M",
-            &[
-                ("N", &n),
-                ("NM", &pay.name),
-                ("SM", &sm),
-                ("T", &pay.type_code),
-            ],
-        );
+        // Owned String buffers for any numeric optional attrs so the
+        // &str borrow lives through the tag_attrs call.
+        let pf_str = pay.pf.map(|v| v.to_string());
+        let rm_str = pay.rm.map(|v| v.to_string());
+        let smp_str = pay.smp.map(|v| v.to_string());
+
+        // Python `_build_check` m_attrs: required N, NM, SM, T
+        // + optional EPZ slip (PA, PB, PC, PD, PE, PF, PSNM, RRN)
+        // + cash-only (RM, SMP).  tag_attrs internally sorts
+        // alphabetically.
+        let mut m_attrs: Vec<(&str, &str)> = Vec::with_capacity(12);
+        m_attrs.push(("N", &n));
+        m_attrs.push(("NM", &pay.name));
+        m_attrs.push(("SM", &sm));
+        m_attrs.push(("T", &pay.type_code));
+        // EPZ slip — emit only when populated
+        if let Some(v) = pay.pa.as_deref() {
+            m_attrs.push(("PA", v));
+        }
+        if let Some(v) = pay.pb.as_deref() {
+            m_attrs.push(("PB", v));
+        }
+        if let Some(v) = pay.pc.as_deref() {
+            m_attrs.push(("PC", v));
+        }
+        if let Some(v) = pay.pd.as_deref() {
+            m_attrs.push(("PD", v));
+        }
+        if let Some(v) = pay.pe.as_deref() {
+            m_attrs.push(("PE", v));
+        }
+        if let Some(v) = pf_str.as_deref() {
+            m_attrs.push(("PF", v));
+        }
+        if let Some(v) = pay.psnm.as_deref() {
+            m_attrs.push(("PSNM", v));
+        }
+        if let Some(v) = pay.rrn.as_deref() {
+            m_attrs.push(("RRN", v));
+        }
+        // Cash-only
+        if let Some(v) = rm_str.as_deref() {
+            m_attrs.push(("RM", v));
+        }
+        if let Some(v) = smp_str.as_deref() {
+            m_attrs.push(("SMP", v));
+        }
+        tag_attrs(out, "M", &m_attrs);
         close(out, "M");
         item_no += 1;
     }
@@ -669,6 +753,7 @@ mod tests {
             name: "CASH".into(),
             sum: 1500,
             type_code: "0".into(),
+            ..Default::default()
         }
     }
 

@@ -67,6 +67,7 @@ fn check_payload(local_number: u32) -> CheckPayload {
             name: "CASH".into(),
             sum: 1500,
             type_code: "0".into(),
+            ..Default::default()
         }],
         total_sum: 1500,
     }

@@ -842,6 +842,10 @@ fn check_payload_from(
                 name: p.name,
                 sum: p.sum_kop,
                 type_code: p.type_code,
+                // W4-Z1 optional EPZ/cash attrs default to None;
+                // populated by W4-Z1 piece 7 conversion-layer when
+                // canonical DTO carries acquirer-slip data.
+                ..Default::default()
             })
             .collect(),
         total_sum: total_sum_kop,
