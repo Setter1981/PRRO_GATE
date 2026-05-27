@@ -451,3 +451,63 @@ This spec is the SOLE wire-shape contract for W4-Z1.  Any change to it requires 
 
 Author: Claude (autonomous session 2026-05-26)
 Verified against: dps_xml.py (Sprint 7 ground truth) + StringXML.cs (WebCheck production ground truth) + ФСКО v2.2.3 (memory `project_fsko_protocol_gaps`)
+
+---
+
+## 11. Implementation outcome (2026-05-27, post-merge)
+
+**Status**: MERGED 2026-05-27 via PR #101 → rust-gateway `917c0e0`.
+15 commits + 6 audit rounds + self-review + 2-auditor PR review.
+1033/0/7 tests, 9/9 byte-equivalence goldens.  Memory pin:
+`project_m4_w4_z1_closure`.
+
+### Q1-Q5 resolutions
+
+**Q1 (AcquirerSlip → EPZ mapping)** — DEFERRED to caller.  `xml::CheckPayment` carries OPTIONAL fields `pa/pb/pc/pd/pe/pf/psnm/rrn/rm/smp` (`#[serde(default)]` JSON shim).  Adapter / piece-7 conversion layer is responsible for mapping W3 `AcquirerSlip` fields to these slots — `xml/` stays format-only.  No specific field-to-attr binding pinned at builder level; flexible per adapter need.
+
+**Q2 (PDV-not-object representation)** — RESOLVED.  `xml::CheckItem.tax_group_1: Option<i64>` (NOT u8/i8).  Supports `tx=-1` natively, plus `tx=0` ("звільнено") + any future tax_id without sentinel hacks.  W3 DTO `FiscalLine.tax_group_1: u8` is a separate concern (conversion-layer caller can map u8 sentinel to i64 or use a richer DTO).
+
+**Q3 (Check-level discount + L lines)** — IMPLEMENTED.  `CheckPayload.check_level_adjustments: Vec<CheckLevelAdjustment>` + `header_lines: Vec<String>` + `footer_lines: Vec<String>`.  Python parity: strip + skip + no-counter-increment on empty L lines (piece 4 + audit1 fix).  Check-level `<NI>` children auto-tracked from emitted `<P>` N values, with optional caller subset override for POS-precomputed cases ("знижка тільки на алкоголь" per operator clarification).
+
+**Q4 (TXAL=3)** — DEFERRED per operator confirmation "для палива поки не потрібен".  Returns `CalcTaxError::UnsupportedAlgorithm(3)` — fail-loud rather than silent zero.
+
+**Q5 (Z-report aggregation depth)** — IMPLEMENTED at xml/ layer.  `ZReportPayload` carries `tax_summaries: Vec<ZReportTaxSummary>` (full or short form via `tx_short_form: bool`), `service_sums: Vec<ZReportServiceSum>`, `epz: Option<ZReportEpzTotals>`.  Section ordering per Python `_build_z_report:435-491`: TXS → M → IO → NC → EPZ.  **Live stage_sign Z-report pathway is DEFERRED to W4-Z2** (`ZReportJson` minimal until then; see Beads `PRRO_GATE-n8g`).
+
+### §10 Out-of-scope revision
+
+The original §10 deferred check-level discount + header/footer L lines pending DTO extension.  POST-IMPLEMENTATION:
+- Check-level `<D TR="1">` / `<S TR="1">`: **IMPLEMENTED** (piece 3) — adapter passes via JSON shim `check_level_adjustments` field.
+- Header/footer `<L>`: **IMPLEMENTED** (piece 4) — adapter passes via JSON shim `header_lines` / `footer_lines` fields.
+- SERVICE_IN/OUT/CASH_WITHDRAWAL — still deferred (PR-C scope).
+- X_REPORT short-path — still deferred (PR-B scope).
+- TXAL=3 — still deferred (operator confirmed).
+- DPS live smoke — still deferred (W4-Z3 scope; Beads tracking).
+- canonical_doc_digest updates — still deferred (W4-Z2 scope).
+
+### §9 Implementation surface — actual landed
+
+§9 plan listed `xml::CheckItem.discount: Option<Discount>`.  ACTUAL: `xml::CheckItem.adjustments: Vec<LineAdjustment>` with `LineAdjustmentKind` enum (Discount | Surcharge).  Reason: round-2 audit found Option-based design hardcoded D-before-S wire order, breaking Python parity for `[Surcharge, Discount]` input.  `Vec` preserves caller order.
+
+§9 plan listed builder helpers in `xml/builders/`.  ACTUAL: helpers inlined into `xml/mod.rs::emit_check` + new pure module `services/write_path/tax_summary.rs` for aggregation (`derive_check_tax_summaries`).  Aggregation lives in conversion layer per operator architectural pin — adapter stays thin.
+
+Goldens: 2 NEW extended fixtures (`sell_extended.bin` 1047 B, `z_report_extended.bin` 630 B) captured via `regenerate.py` from Python oracle.  Pass byte-identical on first Rust run after piece 7.
+
+### Caller obligations introduced (W4-Z2 readers should review)
+
+The xml/ layer surfaces these typed errors that piece-7+ callers MUST handle:
+- `CalcTaxError::UnsupportedAlgorithm(i64)` — TXAL=3 etc.
+- `CalcTaxError::InvalidRate { txpr, dtpr }` — NaN/Inf/negative input rates (corrupted config).
+- `CalcTaxError::IntermediateOverflow { txpr, dtpr }` — arithmetic blow-up (valid inputs producing Inf intermediate).
+- `CalcTaxError::AggregationOverflow { tax_group }` — i64 sum saturation across items in same group.
+- `CalcTaxError::TaxMappingNotWired { referenced_groups }` — fail-closed when items reference `tax_group_1` but resolved map is empty (pre-W4-Z2 transition guard).
+- `XmlBuildError::OrphanCheckLevelNi { referenced_n, tracked }` — `applies_to_item_ns` override references non-existent `<P>` N.
+
+All deterministic — caller MUST audit_log + reject doc; NEVER retry.  Dispatcher classification deferred to W4-Z2 (Beads `PRRO_GATE-q5u`).
+
+### Follow-up Beads issues
+
+- `PRRO_GATE-8dx` — wire `driver_tax_mapping` repo into stage_sign tax_groups snapshot (replaces TaxMappingNotWired stub).
+- `PRRO_GATE-q5u` — SignError::TaxSummary dispatcher classification.
+- `PRRO_GATE-n8g` — Z-report aggregation via `derive_z_report_tax_summaries` helper + ZReportJson extension.
+- `PRRO_GATE-1er` — post-merge cleanup (test file rename + `#[non_exhaustive]` on CalcTaxError).
+- `PRRO_GATE-bw4` — operator runbook note for JSON-shim fail-loud posture.
