@@ -102,6 +102,25 @@ fn calc_tax_txal_3_returns_unsupported_algorithm_error() {
 }
 
 #[test]
+fn calc_tax_nan_and_inf_rates_are_guarded_no_panic() {
+    // AUDIT2-CRIT-1 (B) defensive: corrupted config could yield
+    // NaN/Inf rates.  Without a guard, NaN floor + saturating
+    // `as i64` could land on i64::MAX in the banker's-half branch
+    // and `MAX + 1` would overflow-panic in debug.  Empirically
+    // current code doesn't hit that path (NaN comparisons + guards
+    // route around), but pin the contract: NaN/Inf returns the
+    // typed `RateNotFinite` error rather than silent 0 or panic.
+    let err = calc_tax(10000, f64::NAN, 0.0, 0).expect_err("NaN txpr");
+    assert!(matches!(err, CalcTaxError::RateNotFinite { .. }));
+
+    let err = calc_tax(10000, f64::INFINITY, 0.0, 0).expect_err("Inf txpr");
+    assert!(matches!(err, CalcTaxError::RateNotFinite { .. }));
+
+    let err = calc_tax(10000, 20.0, f64::NAN, 1).expect_err("NaN dtpr");
+    assert!(matches!(err, CalcTaxError::RateNotFinite { .. }));
+}
+
+#[test]
 fn calc_tax_unknown_txal_also_errors() {
     // Forward-compat: any unknown txal returns typed error (NOT
     // silent zero).  Caller obligated to audit_log + decide policy.

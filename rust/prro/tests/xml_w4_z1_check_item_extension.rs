@@ -14,7 +14,7 @@
 
 use prro::xml::{
     build_canonical_xml, AdjustmentMode, CanonicalDoc, CheckItem, CheckPayload,
-    CheckPayment, DocumentHeader, LineAdjustment,
+    CheckPayment, DocumentHeader, LineAdjustment, LineAdjustmentKind,
 };
 
 fn dummy_header() -> DocumentHeader {
@@ -191,14 +191,15 @@ fn check_item_with_per_item_discount_emits_d_sibling_with_ni() {
         price: 1000,
         quantity: 1000,
         sum: 1000,
-        discount: Some(LineAdjustment {
+        adjustments: vec![LineAdjustment {
+            kind: LineAdjustmentKind::Discount,
             sum: 100,
             mode: AdjustmentMode::Value,
             percent: None,
             name: Some("Знижка постійному клієнту".to_string()),
             privilege: None,
             tax_code: None,
-        }),
+        }],
         ..Default::default()
     };
     let xml = build_sell(vec![item], vec![]);
@@ -219,14 +220,15 @@ fn check_item_with_per_item_percent_discount_emits_pr_attr() {
         price: 1000,
         quantity: 1000,
         sum: 1000,
-        discount: Some(LineAdjustment {
+        adjustments: vec![LineAdjustment {
+            kind: LineAdjustmentKind::Discount,
             sum: 100, // pre-resolved kopecks for 10% of 1000
             mode: AdjustmentMode::Percent,
             percent: Some("10.00".to_string()),
             name: None,
             privilege: None,
             tax_code: None,
-        }),
+        }],
         ..Default::default()
     };
     let xml = build_sell(vec![item], vec![]);
@@ -242,14 +244,15 @@ fn check_item_with_per_item_surcharge_emits_s_sibling() {
         price: 1000,
         quantity: 1000,
         sum: 1000,
-        surcharge: Some(LineAdjustment {
+        adjustments: vec![LineAdjustment {
+            kind: LineAdjustmentKind::Surcharge,
             sum: 50,
             mode: AdjustmentMode::Value,
             percent: None,
             name: None,
             privilege: None,
             tax_code: None,
-        }),
+        }],
         ..Default::default()
     };
     let xml = build_sell(vec![item], vec![]);

@@ -28,16 +28,50 @@
 //! deterministic output.  Byte-equivalence against the
 //! Python-captured goldens lands in C3.
 //!
-//! W4 first-round subset:  the typed payloads here mirror the Python
-//! `_build_check` / `_build_z_report` shapes for the SUBSET we ship
-//! goldens for in C2 — items/payments/closing-E for checks, and
-//! payment-summaries+check-count for Z-reports.  The omitted optional
-//! sections (per-item barcodes/excise/tax codes, per-item discounts,
-//! check-level discounts, header/footer text lines, EPZ payment
-//! attributes, TXS/IO/EPZ Z-report sections, tax_groups TX children
-//! inside `<E>`) are intentional — C2 fixtures will be designed
-//! against this subset, and tag/attr names ARE the Python names so a
-//! future expansion is purely additive.
+//! W4 first-round subset (W4-C1):  the typed payloads here mirror the
+//! Python `_build_check` / `_build_z_report` shapes for the SUBSET we
+//! ship goldens for in C2 — items/payments/closing-E for checks, and
+//! payment-summaries+check-count for Z-reports.
+//!
+//! W4-Z1 expansion (2026-05-27, this commit set) now covers the full
+//! ФСКО Table 23 surface — additively:
+//!   * piece 1: <P> extras (barcode CD, UKTZED CZD, TX/TX1 tax groups,
+//!     <CA> excise children, per-item <D>/<S> via `adjustments`).
+//!   * piece 2: <M> EPZ slip attrs (PA/PB/PC/PD/PE/PF/PSNM/RRN) +
+//!     cash-only RM/SMP.
+//!   * piece 3: check-level <D TR="1"> / <S TR="1"> with <NI> children.
+//!   * piece 4: <L N=... NM=...> header + footer text lines (Python
+//!     strip + skip + no-counter-increment-on-empty contract).
+//!   * piece 5: <TX> tax-group children inside <E> + `calc_tax` per
+//!     ФСКО TXAL formulas (banker's rounding, lex-by-stringified TX
+//!     sort, typed `CalcTaxError` for unsupported TXAL + non-finite
+//!     rates).
+//!   * piece 6: Z-report <TXS> / <IO> / <EPZ> aggregations with
+//!     Python-mirror section ordering TXS → M → IO → NC → EPZ.
+//!   * piece 6.5 + audit-round 2: per-item D/S go to a shared
+//!     discounts buffer flushed AFTER all <P> elements (Python
+//!     `_build_check:155-159, :209, :244, :271, :321-324` buffer-
+//!     then-concat semantics), preserving inline counter increments.
+//!
+//! **Back-compat invariant**: all expansion is additive.  Empty
+//! `Vec` / `None` / `Default::default()` produces the same bytes as
+//! the W4 minimal subset.  The four byte-equivalence goldens
+//! (xml/shift_open.bin, xml/sell.bin, xml/return.bin,
+//! xml/z_report.bin) remain authoritative; pieces 1-6 do not
+//! regenerate them.
+//!
+//! **Caller obligations** (piece 7+ conversion layer):
+//!   * `Option<String>` attrs MUST be `None` when absent; `Some("")`
+//!     emits `KEY=""` and diverges from Python's `if v:` skip.
+//!   * `header_lines` / `footer_lines` MAY contain raw `\n`-split
+//!     strings; emitter strips + skips empties.
+//!   * `TaxGroupSummary` / `ZReportTaxSummary` callers populate
+//!     `txsm` / `dtsm` via `calc_tax(…)?` and must handle
+//!     `CalcTaxError::UnsupportedAlgorithm` (TXAL=3) +
+//!     `RateNotFinite` (corrupted config).
+//!   * `CheckItem.adjustments` is a `Vec` preserving caller order
+//!     (Python iterates `g['discounts']` insertion-order).  Mixed
+//!     `[Surcharge, Discount]` emits `<S>` before `<D>`.
 
 pub mod cp1251;
 
@@ -176,10 +210,16 @@ pub struct TaxGroupSummary {
 /// (reject doc / fall back to 0 with explicit audit / surface to
 /// operator).  Silent (0,0) drops excise sums and would be an
 /// invariant violation.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, PartialEq)]
 pub enum CalcTaxError {
     #[error("calc_tax: unsupported TXAL={0} (only 0/1/2 supported in pre-pilot scope)")]
     UnsupportedAlgorithm(i64),
+    /// AUDIT2-CRIT-1 defensive: corrupted config could feed NaN /
+    /// ±Inf rates.  Surface a typed error rather than silently
+    /// computing 0 (Python would raise; we match the fail-loud
+    /// posture).  Caller MUST audit_log + reject the doc.
+    #[error("calc_tax: rate not finite (txpr={txpr}, dtpr={dtpr})")]
+    RateNotFinite { txpr: f64, dtpr: f64 },
 }
 
 /// W4-Z1 piece 5 — `_calc_tax` per ФСКО TXAL formulas.  Mirror of
@@ -222,6 +262,15 @@ pub fn calc_tax(
             let f = floor as i64;
             if f % 2 == 0 { f } else { f + 1 }
         }
+    }
+
+    // AUDIT2-CRIT-1 defensive guard.  NaN/Inf rates can only arise
+    // from corrupted operator config; surface as typed error rather
+    // than silently producing 0 (which would drop tax sums in a
+    // pilot doc) or panicking in the banker's-half branch (which
+    // could overflow on i64::MAX + 1 in debug).
+    if !txpr.is_finite() || !dtpr.is_finite() {
+        return Err(CalcTaxError::RateNotFinite { txpr, dtpr });
     }
 
     let g = group_sum as f64;
@@ -359,16 +408,18 @@ pub struct CheckItem {
     /// `ca_xml = ''.join(_tag('CA', {'CA': m}) for m in excise_marks)`.
     pub excise_stamps: Vec<String>,
 
-    /// Per-item discount.  When `Some`, a sibling `<D>` element is
-    /// emitted IMMEDIATELY after this `<P>`, with `NI=` referencing
-    /// the parent item's `N`.  Per spec §2 `<D>` per-item form + W4
-    /// PR-A conversion-layer pinning.
-    pub discount: Option<LineAdjustment>,
-
-    /// Per-item surcharge.  Like `discount` but emits `<S>` (per
-    /// Python `dps_xml.py:225` `xml_tag = 'S' if d_type ==
-    /// 'EXTRA_CHARGE'`).
-    pub surcharge: Option<LineAdjustment>,
+    /// Per-item adjustments (discount / surcharge).  Per Python
+    /// `dps_xml.py:217-244`: caller's `g.get('discounts') or []` is
+    /// a list iterated in insertion order; each entry can be a
+    /// discount (`<D>`) OR a surcharge (`<S>`) via `kind`.  Wire
+    /// preserves caller order — `[Surcharge, Discount]` emits
+    /// `<S>` BEFORE `<D>`.
+    ///
+    /// AUDIT2-IMP-1 fix: previously two `Option` slots (discount,
+    /// surcharge) which (a) lost multiplicity (no two discs on one
+    /// item) and (b) hardcoded D-before-S wire order.  Now a
+    /// `Vec` preserves both.
+    pub adjustments: Vec<LineAdjustment>,
 }
 
 /// Per-line adjustment (discount or surcharge) — shared shape for
@@ -383,6 +434,10 @@ pub struct CheckItem {
 /// unit-test level and surfaces as a piece-8 byte-equivalence break.
 #[derive(Debug, Clone)]
 pub struct LineAdjustment {
+    /// `<D>` (Discount) or `<S>` (Surcharge).  Per Python
+    /// `dps_xml.py:225`: `xml_tag = 'D' if d_type != 'EXTRA_CHARGE'
+    /// else 'S'`.
+    pub kind: LineAdjustmentKind,
     /// Sum in kopecks.  For percent-mode this is the resolved
     /// `round(item.sum * pr / 100)`; caller resolves percent at
     /// construction time (xml/ stays format-only).
@@ -399,6 +454,16 @@ pub struct LineAdjustment {
     pub privilege: Option<String>,
     /// `TX=` tax code.  Omit if empty.  Drives ПДВ-зачот calculations.
     pub tax_code: Option<String>,
+}
+
+/// Per-item-adjustment kind selector.  Drives `<D>` vs `<S>` tag
+/// name in `emit_line_adjustment`.  Per Python `:225`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineAdjustmentKind {
+    /// Emits `<D N=... NI=... TR="0" ...>`.  Default per-item form.
+    Discount,
+    /// Emits `<S N=... NI=... TR="0" ...>`.  Per Python `EXTRA_CHARGE`.
+    Surcharge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -650,11 +715,24 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
     open_dat(out, h, &di);
     tag_attrs(out, "C", &[("T", c_type)]);
 
-    // Item numbering N is shared across <L> + <P> + <D> + <S> + <M>;
-    // Python increments a single `item_no` counter.  Mirror that.
+    // AUDIT2-IMP-1 — Python `_build_check:155-159, :209, :244, :271,
+    // :321-324` accumulates SEPARATE buffers and concats in order:
+    //
+    //   header_xml + items_xml + discounts_xml + payments_xml
+    //                + footer_xml + total_xml
+    //
+    // Per-item D/S go into discounts_xml (NOT inline after the
+    // parent P), and the item_no counter increments INLINE inside
+    // the items loop while populating both buffers.  Wire wire-
+    // ordering: P P D D ... NOT P D P D ...  Mirror exactly for
+    // byte parity.
     let mut item_no: u32 = 1;
+    let mut items_buf = String::new();
+    let mut discounts_buf = String::new();
+    let mut payments_buf = String::new();
+    let mut footer_buf = String::new();
 
-    // W4-Z1 piece 4: header text lines BEFORE items (Python :172-178).
+    // header_xml — emitted directly into `out` (Python `:172-178`).
     // Python strips + skips empties + does NOT increment item_no on
     // skip.  Mirror exactly — caller may pass raw `\n`-split slices.
     for line in &p.header_lines {
@@ -668,6 +746,9 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
         item_no += 1;
     }
 
+    // items_xml + per-item discounts_xml — Python `:184-245`.
+    // Counter increments inline; <P> goes to items_buf, D/S goes to
+    // discounts_buf in caller order.
     for it in &p.items {
         let p_item_n = item_no;
         let n = p_item_n.to_string();
@@ -675,16 +756,9 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
         let q = it.quantity.to_string();
         let sm = it.sum.to_string();
 
-        // Build `<P>` attribute list dynamically — Python sorts
-        // alphabetically; we follow the same ordering convention
-        // mirrored by `tag_attrs_sorted` (lazily here: hand-built
-        // sorted form).  Required attrs: C, N, NM, PRC, Q, SM.
-        // Optional: CD (barcode), CZD (uktzed), TX, TX1.
-        //
-        // Construction note: we collect (&str, &str) pairs.  String
-        // arithmetic for optional Number fields (TX/TX1) needs owned
-        // String buffers; bind them outside the tuple so they outlive
-        // the slice.
+        // Build `<P>` attribute list — alphabetical (C, CD, CZD, N,
+        // NM, PRC, Q, SM, TX, TX1).  `tag_attrs` sorts; we build in
+        // alpha for readability + a tiny perf win.
         let tx_str = it.tax_group_1.map(|v| v.to_string());
         let tx1_str = it.tax_group_2.map(|v| v.to_string());
 
@@ -707,38 +781,35 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
         if let Some(tx1) = tx1_str.as_deref() {
             p_attrs.push(("TX1", tx1));
         }
-        // Note: caller responsibility to keep attrs in alphabetical
-        // order — we build in alpha order above (C, CD, CZD, N, NM,
-        // PRC, Q, SM, TX, TX1).  Python sorts dict keys; we lock
-        // ordering by construction.
-        tag_attrs(out, "P", &p_attrs);
+        tag_attrs(&mut items_buf, "P", &p_attrs);
 
-        // Emit `<CA>` excise stamp children (no children → `<P/>`
-        // form via the existing `close(out, "P")` call below).
-        // Python `:206` ca_xml = join over excise_marks.
+        // `<CA>` excise stamp children INSIDE <P>...</P>.  Python
+        // `:206` ca_xml = join over excise_marks.
         for stamp in &it.excise_stamps {
-            tag_attrs(out, "CA", &[("CA", stamp)]);
-            close(out, "CA");
+            tag_attrs(&mut items_buf, "CA", &[("CA", stamp)]);
+            close(&mut items_buf, "CA");
         }
-        close(out, "P");
+        close(&mut items_buf, "P");
         item_no += 1;
 
-        // Sibling `<D>` / `<S>` elements immediately after the
-        // parent `<P>`.  NI references parent_n.  Per Python
-        // `:217-244` per-item-discount branch.
-        if let Some(adj) = &it.discount {
-            emit_line_adjustment(out, "D", adj, item_no, p_item_n);
-            item_no += 1;
-        }
-        if let Some(adj) = &it.surcharge {
-            emit_line_adjustment(out, "S", adj, item_no, p_item_n);
+        // Per-item D/S go to discounts_buf in caller order.  Python
+        // `:217-245`: iterates `g.get('discounts') or []` preserving
+        // input order, picks `<D>` or `<S>` per `d_type`.  The
+        // counter increments INLINE — the D's N attr is one more
+        // than the parent P's N.
+        for adj in &it.adjustments {
+            let tag_name = match adj.kind {
+                LineAdjustmentKind::Discount => "D",
+                LineAdjustmentKind::Surcharge => "S",
+            };
+            emit_line_adjustment(&mut discounts_buf, tag_name, adj, item_no, p_item_n);
             item_no += 1;
         }
     }
 
-    // W4-Z1 piece 3: check-level discounts/surcharges, emitted AFTER
-    // all `<P>` + per-item adjustments, BEFORE `<M>` payments.
-    // Python `dps_xml.py:248-272` ordering.
+    // Check-level adjustments — Python `:248-272`.  They APPEND to
+    // the same `discounts_xml` buffer (per `:271 discounts_xml +=
+    // _tag(...)`), so they come after per-item D/S in wire order.
     for cla in &p.check_level_adjustments {
         let self_n = item_no;
         let self_n_str = self_n.to_string();
@@ -763,17 +834,18 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
         if let Some(name) = cla.name.as_deref() {
             attrs.push(("NM", name));
         }
-        tag_attrs(out, tag_name, &attrs);
+        tag_attrs(&mut discounts_buf, tag_name, &attrs);
         // `<NI NI="...">` children — one per affected item N.
         for &item_n in &cla.applies_to_item_ns {
             let item_n_str = item_n.to_string();
-            tag_attrs(out, "NI", &[("NI", &item_n_str)]);
-            close(out, "NI");
+            tag_attrs(&mut discounts_buf, "NI", &[("NI", &item_n_str)]);
+            close(&mut discounts_buf, "NI");
         }
-        close(out, tag_name);
+        close(&mut discounts_buf, tag_name);
         item_no += 1;
     }
 
+    // payments_xml — Python `:281-308`.
     for pay in &p.payments {
         let n = item_no.to_string();
         let sm = pay.sum.to_string();
@@ -783,16 +855,11 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
         let rm_str = pay.rm.map(|v| v.to_string());
         let smp_str = pay.smp.map(|v| v.to_string());
 
-        // Python `_build_check` m_attrs: required N, NM, SM, T
-        // + optional EPZ slip (PA, PB, PC, PD, PE, PF, PSNM, RRN)
-        // + cash-only (RM, SMP).  tag_attrs internally sorts
-        // alphabetically.
         let mut m_attrs: Vec<(&str, &str)> = Vec::with_capacity(12);
         m_attrs.push(("N", &n));
         m_attrs.push(("NM", &pay.name));
         m_attrs.push(("SM", &sm));
         m_attrs.push(("T", &pay.type_code));
-        // EPZ slip — emit only when populated
         if let Some(v) = pay.pa.as_deref() {
             m_attrs.push(("PA", v));
         }
@@ -817,31 +884,36 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
         if let Some(v) = pay.rrn.as_deref() {
             m_attrs.push(("RRN", v));
         }
-        // Cash-only
         if let Some(v) = rm_str.as_deref() {
             m_attrs.push(("RM", v));
         }
         if let Some(v) = smp_str.as_deref() {
             m_attrs.push(("SMP", v));
         }
-        tag_attrs(out, "M", &m_attrs);
-        close(out, "M");
+        tag_attrs(&mut payments_buf, "M", &m_attrs);
+        close(&mut payments_buf, "M");
         item_no += 1;
     }
 
-    // W4-Z1 piece 4: footer text lines AFTER payments + check-level
-    // adjustments, BEFORE closing <E> (Python :311-313).  Same
-    // strip+skip+no-increment-on-empty contract as header_lines.
+    // footer_xml — Python `:311-313`.  Same strip+skip+no-increment
+    // contract as header_lines.
     for line in &p.footer_lines {
         let stripped = line.trim();
         if stripped.is_empty() {
             continue;
         }
         let n = item_no.to_string();
-        tag_attrs(out, "L", &[("N", &n), ("NM", stripped)]);
-        close(out, "L");
+        tag_attrs(&mut footer_buf, "L", &[("N", &n), ("NM", stripped)]);
+        close(&mut footer_buf, "L");
         item_no += 1;
     }
+
+    // Python `:321-324` concat order: header is already in `out`;
+    // now items + discounts + payments + footer.
+    out.push_str(&items_buf);
+    out.push_str(&discounts_buf);
+    out.push_str(&payments_buf);
+    out.push_str(&footer_buf);
 
     // Closing <E FN N NO SM TS> per ФСКО Table 23 / Python
     // `_build_e_element`.  W4-Z1 piece 5: when `tax_summaries` is
