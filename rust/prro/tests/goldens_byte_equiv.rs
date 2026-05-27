@@ -89,16 +89,19 @@ fn z_report_doc() -> CanonicalDoc {
     CanonicalDoc::ZReport(ZReportPayload {
         header: fixture_header(),
         local_number: 100,
+        tax_summaries: Vec::new(),
         payments: vec![ZReportPaymentSum {
             name: "CASH".into(),
             sum_in: 5000,
             sum_out: 0,
             type_code: "0".into(),
         }],
+        service_sums: Vec::new(),
         check_count: ZReportCheckCount {
             sell_count: 17,
             return_count: 2,
         },
+        epz: None,
     })
 }
 

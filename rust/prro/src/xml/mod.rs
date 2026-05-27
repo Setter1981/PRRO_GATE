@@ -440,11 +440,85 @@ pub struct CheckPayment {
 pub struct ZReportPayload {
     pub header: DocumentHeader,
     pub local_number: u32,
+    /// W4-Z1 piece 6 — `<TXS>` per-tax-group inflow/outflow.
+    /// Emitted BEFORE `<M>` payments (Python `:435-458`).  Empty Vec
+    /// → no `<TXS>` emission (back-compat with minimal goldens).
+    pub tax_summaries: Vec<ZReportTaxSummary>,
     /// Per-payment-type aggregate sums.  Each entry emits one
     /// `<M NM SMI SMO T>` element.
     pub payments: Vec<ZReportPaymentSum>,
+    /// W4-Z1 piece 6 — `<IO>` service in/out summaries.  Emitted
+    /// AFTER `<M>` payments, BEFORE `<NC>` (Python `:470-477`).
+    pub service_sums: Vec<ZReportServiceSum>,
     /// `<NC NI=... NO=...>` check counts.
     pub check_count: ZReportCheckCount,
+    /// W4-Z1 piece 6 — `<EPZ>` electronic-payment-instrument totals.
+    /// Emitted LAST inside `<Z>` (Python `:484-491`).  None → no
+    /// emission.
+    pub epz: Option<ZReportEpzTotals>,
+}
+
+/// W4-Z1 piece 6 — per-tax-group inflow/outflow summary inside
+/// `<Z>`.  Mirrors Python `:435-458`.  Two emission modes:
+///
+///   * `tx_short_form = false` — full attrs (DTPR/SMI/SMO/TS/TX/TXAL
+///     /TXI/TXO/TXPR/TXTY) when the tax_groups lookup resolved.
+///   * `tx_short_form = true` — fallback when tax_group not found:
+///     only SMI/SMO/TX are emitted.
+///
+/// Caller (W4-Z1 piece 7 conversion layer) populates `txi` / `txo`
+/// via `calc_tax(smi/smo, txpr, dtpr, txal)` for the full form, OR
+/// flips `tx_short_form` and leaves rate fields empty for fallback.
+#[derive(Debug, Clone)]
+pub struct ZReportTaxSummary {
+    /// `<TXS TX=...>`.  Canonical tax group number.
+    pub tx: i64,
+    /// When true, emit only `SMI/SMO/TX`; ignore rate fields.
+    pub tx_short_form: bool,
+    /// `<TXS TXPR=...>`.  PDV rate, pre-formatted `"{:.2}"`.
+    pub txpr: String,
+    /// `<TXS TXAL=...>`.
+    pub txal: i64,
+    /// `<TXS TXTY=...>`.
+    pub txty: i64,
+    /// `<TXS DTPR=...>`.  Excise rate, pre-formatted `"{:.2}"`.
+    pub dtpr: String,
+    /// `<TXS SMI=...>`.  Inflow group sum (kopecks).
+    pub smi: i64,
+    /// `<TXS SMO=...>`.  Outflow group sum (kopecks).
+    pub smo: i64,
+    /// `<TXS TXI=...>`.  Inflow tax sum, pre-computed via `calc_tax`.
+    pub txi: i64,
+    /// `<TXS TXO=...>`.  Outflow tax sum, pre-computed via `calc_tax`.
+    pub txo: i64,
+    /// `<TXS TS=...>`.  Date prefix (`ts_str[:8]` = `YYYYMMDD`).
+    pub ts_prefix: String,
+}
+
+/// W4-Z1 piece 6 — service in/out summary inside `<Z>`.  Mirrors
+/// Python `:470-477`.  Emits `<IO NM SMI SMO T="0">`.
+#[derive(Debug, Clone)]
+pub struct ZReportServiceSum {
+    /// `<IO NM=...>`.  Service-type name (e.g. `"SERVICE_IN"`,
+    /// `"SERVICE_OUT"`).
+    pub name: String,
+    /// `<IO SMI=...>`.
+    pub sum_in: i64,
+    /// `<IO SMO=...>`.
+    pub sum_out: i64,
+}
+
+/// W4-Z1 piece 6 — electronic-payment-instrument totals inside
+/// `<Z>`.  Mirrors Python `:484-491`.  Single element with three
+/// attrs.
+#[derive(Debug, Clone)]
+pub struct ZReportEpzTotals {
+    /// `<EPZ EPC=...>`.  Count of EPI operations.
+    pub epc: i64,
+    /// `<EPZ EPCS=...>`.  Count of successful EPI operations.
+    pub epcs: i64,
+    /// `<EPZ EPSM=...>`.  Total sum across EPI operations (kopecks).
+    pub epsm: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -764,6 +838,49 @@ fn emit_z_report(p: &ZReportPayload, out: &mut String) {
     let zn = h.z_number.to_string();
     tag_attrs(out, "Z", &[("NO", &zn)]);
 
+    // W4-Z1 piece 6: <TXS> per-tax-group inflow/outflow.  Sorted by
+    // `tx` ascending so wire output is deterministic regardless of
+    // caller insertion order (mirrors Python `sorted(tax_sums.keys())`).
+    let mut sorted_txs: Vec<&ZReportTaxSummary> = p.tax_summaries.iter().collect();
+    sorted_txs.sort_by_key(|t| t.tx);
+    for ts in sorted_txs {
+        let tx_str = ts.tx.to_string();
+        let smi_str = ts.smi.to_string();
+        let smo_str = ts.smo.to_string();
+        if ts.tx_short_form {
+            // Fallback form (Python `:458`): SMI, SMO, TX only.
+            tag_attrs(
+                out,
+                "TXS",
+                &[("SMI", &smi_str), ("SMO", &smo_str), ("TX", &tx_str)],
+            );
+        } else {
+            // Full form (Python `:452-456`): DTPR, SMI, SMO, TS, TX,
+            // TXAL, TXI, TXO, TXPR, TXTY (alphabetical).
+            let txal_str = ts.txal.to_string();
+            let txi_str = ts.txi.to_string();
+            let txo_str = ts.txo.to_string();
+            let txty_str = ts.txty.to_string();
+            tag_attrs(
+                out,
+                "TXS",
+                &[
+                    ("DTPR", &ts.dtpr),
+                    ("SMI", &smi_str),
+                    ("SMO", &smo_str),
+                    ("TS", &ts.ts_prefix),
+                    ("TX", &tx_str),
+                    ("TXAL", &txal_str),
+                    ("TXI", &txi_str),
+                    ("TXO", &txo_str),
+                    ("TXPR", &ts.txpr),
+                    ("TXTY", &txty_str),
+                ],
+            );
+        }
+        close(out, "TXS");
+    }
+
     // Z body — per-payment-type <M NM SMI SMO T>.  Python iterates
     // `sorted(payment_sums.keys())`; we mirror that by sorting the
     // caller-supplied vec by `name` so the wire output is
@@ -786,6 +903,26 @@ fn emit_z_report(p: &ZReportPayload, out: &mut String) {
         close(out, "M");
     }
 
+    // W4-Z1 piece 6: <IO> service in/out summaries.  Python `:470-477`
+    // — NM, SMI, SMO, T="0" alphabetical.  Sort by name ascending.
+    let mut sorted_io: Vec<&ZReportServiceSum> = p.service_sums.iter().collect();
+    sorted_io.sort_by(|a, b| a.name.cmp(&b.name));
+    for io in sorted_io {
+        let smi = io.sum_in.to_string();
+        let smo = io.sum_out.to_string();
+        tag_attrs(
+            out,
+            "IO",
+            &[
+                ("NM", &io.name),
+                ("SMI", &smi),
+                ("SMO", &smo),
+                ("T", "0"),
+            ],
+        );
+        close(out, "IO");
+    }
+
     // Z body — <NC NI NO>.  Always emitted in W4 first-round shape
     // (Python emits if `check_count` is a dict, which it always is
     // in our typed payload).
@@ -793,6 +930,20 @@ fn emit_z_report(p: &ZReportPayload, out: &mut String) {
     let no = p.check_count.return_count.to_string();
     tag_attrs(out, "NC", &[("NI", &ni), ("NO", &no)]);
     close(out, "NC");
+
+    // W4-Z1 piece 6: <EPZ> electronic-payment-instrument totals.
+    // Python `:484-491` — EPC, EPCS, EPSM (already alphabetical).
+    if let Some(epz) = &p.epz {
+        let epc = epz.epc.to_string();
+        let epcs = epz.epcs.to_string();
+        let epsm = epz.epsm.to_string();
+        tag_attrs(
+            out,
+            "EPZ",
+            &[("EPC", &epc), ("EPCS", &epcs), ("EPSM", &epsm)],
+        );
+        close(out, "EPZ");
+    }
 
     close(out, "Z");
     tag_text(out, "TS", &h.ts_str);
@@ -1147,16 +1298,19 @@ mod tests {
         let doc = CanonicalDoc::ZReport(ZReportPayload {
             header: ascii_header(),
             local_number: 100,
+            tax_summaries: Vec::new(),
             payments: vec![ZReportPaymentSum {
                 name: "CASH".into(),
                 sum_in: 5000,
                 sum_out: 0,
                 type_code: "0".into(),
             }],
+            service_sums: Vec::new(),
             check_count: ZReportCheckCount {
                 sell_count: 17,
                 return_count: 2,
             },
+            epz: None,
         });
         let s = render_ascii(&doc);
         // <Z NO="..."> not <Z DC NO SM>.
@@ -1184,6 +1338,7 @@ mod tests {
         let doc = CanonicalDoc::ZReport(ZReportPayload {
             header: ascii_header(),
             local_number: 1,
+            tax_summaries: Vec::new(),
             payments: vec![
                 ZReportPaymentSum {
                     name: "CASH".into(),
@@ -1198,10 +1353,12 @@ mod tests {
                     type_code: "2".into(),
                 },
             ],
+            service_sums: Vec::new(),
             check_count: ZReportCheckCount {
                 sell_count: 0,
                 return_count: 0,
             },
+            epz: None,
         });
         let s = render_ascii(&doc);
         let card_idx = s.find(r#"NM="CARD""#).expect("CARD present");

@@ -783,6 +783,7 @@ fn build_canonical_doc(
             CanonicalDoc::ZReport(ZReportPayload {
                 header,
                 local_number,
+                tax_summaries: Vec::new(),
                 payments: p
                     .payments
                     .into_iter()
@@ -793,10 +794,12 @@ fn build_canonical_doc(
                         type_code: m.type_code,
                     })
                     .collect(),
+                service_sums: Vec::new(),
                 check_count: ZReportCheckCount {
                     sell_count: p.sell_count,
                     return_count: p.return_count,
                 },
+                epz: None,
             })
         }
         // (kind, payload) mismatch is unreachable: parse_payload
