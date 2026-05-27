@@ -230,8 +230,28 @@ pub enum CalcTaxError {
     /// Deprecated alias retained for transitional builds.  Prefer
     /// InvalidRate or IntermediateOverflow.  Will be removed once
     /// piece-7 caller switches to the split variants.
+    #[deprecated(note = "use InvalidRate or IntermediateOverflow; will be removed post-W4-Z2")]
     #[error("calc_tax: rate not finite (txpr={txpr}, dtpr={dtpr})")]
     RateNotFinite { txpr: f64, dtpr: f64 },
+    /// AUDIT5-IMP-1/3 — i64 overflow during per-group sum
+    /// accumulation.  Realistic only with maliciously huge items,
+    /// but pre-fix would panic in debug + silently wrap in release.
+    /// Caller (stage_sign) MUST audit_log + reject the doc; never
+    /// retry.
+    #[error("derive_check_tax_summaries: aggregation overflow for tax_group_1={tax_group}")]
+    AggregationOverflow { tax_group: i64 },
+    /// AUDIT5-CRIT-1 — pre-W4-Z2 transition guard.  Live
+    /// stage_sign currently passes an EMPTY `tax_groups` map (until
+    /// W4-Z2 wires the `driver_tax_mapping` repo).  When an item
+    /// carries `tax_group_1 == Some(_)` but the map is empty, the
+    /// pre-fix path silently dropped all `<TX>` children — visible
+    /// as missing tax info on the wire.  Fail-closed instead so
+    /// the gap surfaces at integration time rather than in pilot.
+    #[error(
+        "derive_check_tax_summaries: items reference tax_group_1 but tax_groups map is empty \
+         (driver_tax_mapping not wired yet — W4-Z2)"
+    )]
+    TaxMappingNotWired { referenced_groups: Vec<i64> },
 }
 
 /// W4-Z1 piece 5 — `_calc_tax` per ФСКО TXAL formulas.  Mirror of

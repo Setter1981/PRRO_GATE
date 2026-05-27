@@ -50,7 +50,7 @@ use crate::xml::{
     LineAdjustmentKind, ZReportCheckCount, ZReportPayload, ZReportPaymentSum,
 };
 
-use super::tax_summary::{derive_tax_summaries, ResolvedTaxGroup};
+use super::tax_summary::{derive_check_tax_summaries, ResolvedTaxGroup};
 use super::types::WorkerContext;
 
 use std::collections::HashMap;
@@ -889,6 +889,25 @@ fn build_canonical_doc(
             tax_groups,
         )?)),
         (WireArtifactKind::ZReport, TypedPayload::ZReport(p)) => {
+            // AUDIT5-CRIT-2 — Z-report aggregation gap (deferred):
+            // `tax_summaries` / `service_sums` / `epz` are hardcoded
+            // empty here.  Adapter pathway does NOT exist yet
+            // (ZReportJson is intentionally minimal — see definition
+            // for the supported subset).  Z-report wire-shape
+            // verification today uses a HAND-BUILT
+            // `z_report_extended_doc()` in goldens_byte_equiv.rs
+            // bypassing this arm.
+            //
+            // W4-Z2 will extend ZReportJson with optional
+            // `tax_sums` / `service_sums` / `epz_totals`,
+            // resolve them through a NEW `derive_z_report_tax_
+            // summaries` helper (Python `:444-458` short-form
+            // fallback semantics, distinct from the check-level
+            // `derive_check_tax_summaries`), and replace these
+            // hardcoded Vec::new() / None bindings with the
+            // resolved aggregations.  Until then the field shape
+            // is byte-identical to the W4 minimal Z-report
+            // golden.
             Ok(CanonicalDoc::ZReport(ZReportPayload {
                 header,
                 local_number,
@@ -985,7 +1004,7 @@ fn check_payload_from(
 
     // Derived per operator pin: NEVER taken from wire, always
     // computed from items + caller-resolved tax_groups snapshot.
-    let tax_summaries = derive_tax_summaries(&items, tax_groups)?;
+    let tax_summaries = derive_check_tax_summaries(&items, tax_groups)?;
 
     Ok(CheckPayload {
         header,

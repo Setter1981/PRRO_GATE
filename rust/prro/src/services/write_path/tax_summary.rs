@@ -56,14 +56,26 @@ pub struct ResolvedTaxGroup {
     pub txty: i64,
 }
 
+/// AUDIT5-IMP-3 (B) — renamed from `derive_tax_summaries` to bind
+/// the contract to CHECK-level `<E><TX>` semantics: unknown groups
+/// are SKIPPED (no `<TX>` for that tax_id).  Z-report `<TXS>` uses
+/// a DIFFERENT contract (short-form fallback with only `SMI/SMO/TX`
+/// per Python `:444-458`) and MUST use a separate helper.
+///
 /// Aggregate items by `tax_group_1`, resolve each group via the
 /// pre-passed map, and compute `TaxGroupSummary` entries.
 ///
-/// Unknown groups (lookup miss) are SKIPPED per Python check-level
-/// semantics.  Z-report short-form fallback is a caller concern.
-///
 /// Items with `tax_group_1 == None` are excluded from aggregation.
-pub fn derive_tax_summaries(
+///
+/// AUDIT5-CRIT-1 — fail-closed guard: when ANY item carries
+/// `tax_group_1 == Some(_)` but `tax_groups` is empty (pre-W4-Z2
+/// `driver_tax_mapping` wiring), return `TaxMappingNotWired`
+/// rather than silently emit no `<TX>` (which would be a silent
+/// production data loss invisible to byte goldens).
+///
+/// AUDIT5-IMP-1/3 — checked_add on per-group accumulation; surface
+/// `AggregationOverflow` rather than panic / wrap.
+pub fn derive_check_tax_summaries(
     items: &[CheckItem],
     tax_groups: &HashMap<i64, ResolvedTaxGroup>,
 ) -> Result<Vec<TaxGroupSummary>, CalcTaxError> {
@@ -71,8 +83,19 @@ pub fn derive_tax_summaries(
     let mut group_sums: BTreeMap<i64, i64> = BTreeMap::new();
     for item in items {
         if let Some(tg) = item.tax_group_1 {
-            *group_sums.entry(tg).or_insert(0) += item.sum;
+            let entry = group_sums.entry(tg).or_insert(0);
+            *entry = entry
+                .checked_add(item.sum)
+                .ok_or(CalcTaxError::AggregationOverflow { tax_group: tg })?;
         }
+    }
+
+    // AUDIT5-CRIT-1 fail-closed: items reference tax_group_1 but
+    // map is empty → silent <TX> drop hazard.  Surface up-front.
+    if !group_sums.is_empty() && tax_groups.is_empty() {
+        return Err(CalcTaxError::TaxMappingNotWired {
+            referenced_groups: group_sums.keys().copied().collect(),
+        });
     }
 
     let mut summaries = Vec::with_capacity(group_sums.len());
@@ -93,4 +116,14 @@ pub fn derive_tax_summaries(
         });
     }
     Ok(summaries)
+}
+
+/// AUDIT5-IMP-3 (B) — deprecated alias for transitional builds.
+/// Caller migration will land alongside W4-Z2 dispatcher work.
+#[deprecated(note = "use derive_check_tax_summaries; Z-report needs a separate helper")]
+pub fn derive_tax_summaries(
+    items: &[CheckItem],
+    tax_groups: &HashMap<i64, ResolvedTaxGroup>,
+) -> Result<Vec<TaxGroupSummary>, CalcTaxError> {
+    derive_check_tax_summaries(items, tax_groups)
 }

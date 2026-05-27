@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use std::collections::HashMap;
 
-use prro::services::write_path::tax_summary::{derive_tax_summaries, ResolvedTaxGroup};
+use prro::services::write_path::tax_summary::{derive_check_tax_summaries, ResolvedTaxGroup};
 use prro::xml::{
     build_canonical_xml, AdjustmentMode, CanonicalDoc, CheckItem, CheckLevelAdjustment,
     CheckLevelAdjustmentKind, CheckPayload, CheckPayment, DocumentHeader, LineAdjustment,
@@ -168,7 +168,7 @@ fn sell_extended_doc() -> CanonicalDoc {
     ];
     let tax_groups = extended_tax_groups();
     let tax_summaries =
-        derive_tax_summaries(&items, &tax_groups).expect("derive tax summaries");
+        derive_check_tax_summaries(&items, &tax_groups).expect("derive tax summaries");
 
     CanonicalDoc::Sell(CheckPayload {
         header: fixture_header(),
