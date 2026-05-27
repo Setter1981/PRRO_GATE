@@ -169,6 +169,19 @@ pub struct TaxGroupSummary {
     pub txty: i64,
 }
 
+/// W4-Z1 piece 5 — error surfaced when an unsupported tax algorithm
+/// is requested.  Pre-pilot scope ships TXAL 0/1/2 only; TXAL=3
+/// (per-unit excise) is deferred and returns `UnsupportedAlgorithm`.
+/// Caller obligation (piece 7+): audit_log warn + decide policy
+/// (reject doc / fall back to 0 with explicit audit / surface to
+/// operator).  Silent (0,0) drops excise sums and would be an
+/// invariant violation.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CalcTaxError {
+    #[error("calc_tax: unsupported TXAL={0} (only 0/1/2 supported in pre-pilot scope)")]
+    UnsupportedAlgorithm(i64),
+}
+
 /// W4-Z1 piece 5 — `_calc_tax` per ФСКО TXAL formulas.  Mirror of
 /// Python `dps_xml.py:536-563` exactly.
 ///
@@ -183,30 +196,46 @@ pub struct TaxGroupSummary {
 ///              txsm = (group_sum + dtsm) * txpr / (100 + txpr).
 ///   * TXAL=2 — Excise post-VAT: dtsm = group_sum * dtpr / (100 + dtpr);
 ///              txsm = (group_sum - dtsm) * txpr / (100 + txpr).
-///   * TXAL=3 — Absolute (per-unit) excise.  NOT SUPPORTED in this
-///              build (operator-confirmed: "TXAL=3 не потрібен").
-///              Returns (0, 0) for forward-compat; caller should
-///              audit_log warn if it hits this slot.
-pub fn calc_tax(group_sum: i64, txpr: f64, dtpr: f64, txal: i64) -> (i64, i64) {
+///   * TXAL=3 — Absolute (per-unit) excise.  Returns
+///              `Err(UnsupportedAlgorithm(3))` (operator-confirmed
+///              deferred).  Caller MUST audit_log + decide policy.
+pub fn calc_tax(
+    group_sum: i64,
+    txpr: f64,
+    dtpr: f64,
+    txal: i64,
+) -> Result<(i64, i64), CalcTaxError> {
     fn round_half_to_even(x: f64) -> i64 {
         // Python `round()` is banker's rounding (round-half-to-even).
-        // Mirror exactly so our kopeck integer math matches Python's
-        // for byte-equivalence.
-        x.round() as i64
+        // Rust's `f64::round()` is half-AWAY-from-zero — would diverge
+        // from the Python oracle on any `.5`-boundary value (e.g.
+        // 12.5 → Python 12, Rust 13).  Implement banker's explicitly
+        // so kopeck integer math matches Python byte-for-byte.
+        let floor = x.floor();
+        let diff = x - floor;
+        if diff < 0.5 {
+            floor as i64
+        } else if diff > 0.5 {
+            (floor + 1.0) as i64
+        } else {
+            // diff == 0.5 → pick the even neighbour.
+            let f = floor as i64;
+            if f % 2 == 0 { f } else { f + 1 }
+        }
     }
 
     let g = group_sum as f64;
     match txal {
         0 => {
             let txsm = if txpr > 0.0 { round_half_to_even(g * txpr / (100.0 + txpr)) } else { 0 };
-            (txsm, 0)
+            Ok((txsm, 0))
         }
         1 => {
             let dtsm = if dtpr > 0.0 { round_half_to_even(g * dtpr / 100.0) } else { 0 };
             let txsm = if txpr > 0.0 {
                 round_half_to_even((g + dtsm as f64) * txpr / (100.0 + txpr))
             } else { 0 };
-            (txsm, dtsm)
+            Ok((txsm, dtsm))
         }
         2 => {
             let dtsm = if dtpr > 0.0 {
@@ -215,15 +244,18 @@ pub fn calc_tax(group_sum: i64, txpr: f64, dtpr: f64, txal: i64) -> (i64, i64) {
             let txsm = if txpr > 0.0 {
                 round_half_to_even((g - dtsm as f64) * txpr / (100.0 + txpr))
             } else { 0 };
-            (txsm, dtsm)
+            Ok((txsm, dtsm))
         }
-        _ => (0, 0), // TXAL=3+ not supported in this slice
+        other => Err(CalcTaxError::UnsupportedAlgorithm(other)),
     }
 }
 
 /// Check-level discount or surcharge.  Distinct from per-item
 /// `LineAdjustment` because of the `TR="1"` flag + `<NI>` child
 /// elements naming affected items.
+///
+/// Same `Option<String>` empty-vs-`None` contract as
+/// [`LineAdjustment`]: caller MUST pass `None` for absent attrs.
 #[derive(Debug, Clone)]
 pub struct CheckLevelAdjustment {
     /// `D` for discount, `S` for surcharge.  Per Python
@@ -277,6 +309,11 @@ impl Default for CheckPayload {
 /// discount/surcharge).  Empty `None` / `Vec::new()` → attribute /
 /// child element NOT emitted (back-compat with existing minimal
 /// goldens).
+///
+/// **Optional-attr semantics**: caller MUST pass `None` for absent
+/// string attrs.  `Some("")` emits `KEY=""`, which diverges from
+/// Python's `if value:` skip semantics and would surface as a
+/// piece-8 byte-equivalence break.
 #[derive(Debug, Clone, Default)]
 pub struct CheckItem {
     /// `<P C=...>`.  Item code (article SKU).
@@ -337,6 +374,13 @@ pub struct CheckItem {
 /// Per-line adjustment (discount or surcharge) — shared shape for
 /// `<D>` and `<S>` sibling elements after `<P>`.  Per Python
 /// `dps_xml.py:226-244`.
+///
+/// **Optional-attr semantics** (apply to all `Option<String>` fields
+/// below).  Caller MUST normalize absent/empty values to `None`.
+/// Passing `Some("")` emits `KEY=""` which diverges from Python's
+/// `_tag` + caller-side `if d.get('name'):` skip semantics (Python
+/// omits the attr entirely).  Empty-string drift is silent at
+/// unit-test level and surfaces as a piece-8 byte-equivalence break.
 #[derive(Debug, Clone)]
 pub struct LineAdjustment {
     /// Sum in kopecks.  For percent-mode this is the resolved
@@ -375,6 +419,11 @@ pub enum AdjustmentMode {
 /// WebCheck `DopTegE()`) + cash-only `RM` (change) + `SMP` (rounding).
 /// Empty `None` → attribute NOT emitted.  Cash payments (T="0") may
 /// carry RM/SMP; non-cash payments (T="1"+) carry EPZ slip attrs.
+///
+/// **Optional-attr semantics**: caller MUST normalize empty/absent
+/// string fields to `None`.  `Some("")` emits `KEY=""` and diverges
+/// from Python (which skips falsy values).  Drift is invisible at
+/// unit-test level; surfaces at piece-8 byte-equivalence.
 #[derive(Debug, Clone, Default)]
 pub struct CheckPayment {
     /// `<M NM=...>`.  Payment-type display name (e.g. `"Готівка"`).
@@ -606,9 +655,15 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
     let mut item_no: u32 = 1;
 
     // W4-Z1 piece 4: header text lines BEFORE items (Python :172-178).
+    // Python strips + skips empties + does NOT increment item_no on
+    // skip.  Mirror exactly — caller may pass raw `\n`-split slices.
     for line in &p.header_lines {
+        let stripped = line.trim();
+        if stripped.is_empty() {
+            continue;
+        }
         let n = item_no.to_string();
-        tag_attrs(out, "L", &[("N", &n), ("NM", line)]);
+        tag_attrs(out, "L", &[("N", &n), ("NM", stripped)]);
         close(out, "L");
         item_no += 1;
     }
@@ -775,10 +830,15 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
     }
 
     // W4-Z1 piece 4: footer text lines AFTER payments + check-level
-    // adjustments, BEFORE closing <E> (Python :311-313).
+    // adjustments, BEFORE closing <E> (Python :311-313).  Same
+    // strip+skip+no-increment-on-empty contract as header_lines.
     for line in &p.footer_lines {
+        let stripped = line.trim();
+        if stripped.is_empty() {
+            continue;
+        }
         let n = item_no.to_string();
-        tag_attrs(out, "L", &[("N", &n), ("NM", line)]);
+        tag_attrs(out, "L", &[("N", &n), ("NM", stripped)]);
         close(out, "L");
         item_no += 1;
     }
@@ -801,7 +861,12 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
         ],
     );
     // <TX> tax-group children inside <E> (Python `_build_e_element:514-530`).
-    for ts in &p.tax_summaries {
+    // Python sorts by STRINGIFIED key (`sorted(group_sums.items())`,
+    // keys are str at `:214`), so "1" < "10" < "2" lex order — NOT
+    // numeric.  Mirror exactly for byte parity.
+    let mut sorted_tx: Vec<&TaxGroupSummary> = p.tax_summaries.iter().collect();
+    sorted_tx.sort_by_key(|t| t.tx.to_string());
+    for ts in sorted_tx {
         let tx_str = ts.tx.to_string();
         let txsm_str = ts.txsm.to_string();
         let dtsm_str = ts.dtsm.to_string();
@@ -838,11 +903,13 @@ fn emit_z_report(p: &ZReportPayload, out: &mut String) {
     let zn = h.z_number.to_string();
     tag_attrs(out, "Z", &[("NO", &zn)]);
 
-    // W4-Z1 piece 6: <TXS> per-tax-group inflow/outflow.  Sorted by
-    // `tx` ascending so wire output is deterministic regardless of
-    // caller insertion order (mirrors Python `sorted(tax_sums.keys())`).
+    // W4-Z1 piece 6: <TXS> per-tax-group inflow/outflow.  Python
+    // `_build_z_report:438` iterates `sorted(tax_sums.keys())` where
+    // keys are STRINGS at `:436` — lex sort: "1" < "10" < "2".
+    // Numeric sort would diverge; mirror Python exactly for byte
+    // parity.
     let mut sorted_txs: Vec<&ZReportTaxSummary> = p.tax_summaries.iter().collect();
-    sorted_txs.sort_by_key(|t| t.tx);
+    sorted_txs.sort_by_key(|t| t.tx.to_string());
     for ts in sorted_txs {
         let tx_str = ts.tx.to_string();
         let smi_str = ts.smi.to_string();

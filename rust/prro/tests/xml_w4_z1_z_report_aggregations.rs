@@ -122,6 +122,38 @@ fn txs_short_form_emits_only_smi_smo_tx() {
     assert!(!xml.contains(r#"TXAL="0""#));
 }
 
+#[test]
+fn txs_stringified_sort_handles_dual_digit_tx() {
+    // Python `_build_z_report:438` iterates `sorted(tax_sums.keys())`
+    // where keys are strings. Lex sort "1" < "10" < "2" — numeric
+    // sort would give 1, 2, 10.
+    let xml = build_z(
+        vec![
+            ZReportTaxSummary {
+                tx: 2, tx_short_form: true,
+                txpr: "".into(), txal: 0, txty: 0, dtpr: "".into(),
+                smi: 0, smo: 0, txi: 0, txo: 0, ts_prefix: "".into(),
+            },
+            ZReportTaxSummary {
+                tx: 10, tx_short_form: true,
+                txpr: "".into(), txal: 0, txty: 0, dtpr: "".into(),
+                smi: 0, smo: 0, txi: 0, txo: 0, ts_prefix: "".into(),
+            },
+            ZReportTaxSummary {
+                tx: 1, tx_short_form: true,
+                txpr: "".into(), txal: 0, txty: 0, dtpr: "".into(),
+                smi: 0, smo: 0, txi: 0, txo: 0, ts_prefix: "".into(),
+            },
+        ],
+        vec![], vec![], None,
+    );
+    let pos_1 = xml.find(r#"TX="1""#).expect("TX=1");
+    let pos_10 = xml.find(r#"TX="10""#).expect("TX=10");
+    let pos_2 = xml.find(r#"TX="2""#).expect("TX=2");
+    assert!(pos_1 < pos_10, "TX=1 before TX=10 (lex)");
+    assert!(pos_10 < pos_2, "TX=10 before TX=2 (lex) — NOT numeric");
+}
+
 // ─── <IO> — service in/out summaries ──────────────────────────────
 
 #[test]

@@ -168,10 +168,18 @@ fn check_item_with_excise_stamps_emits_ca_children() {
     // The stamps live INSIDE the <P> element.
     let p_open = xml.find("<P ").expect("P element present");
     let p_close = xml.find("</P>").expect("P close present");
-    let stamp_pos = xml.find(r#"<CA CA="UA1234567890""#).unwrap();
+    let stamp_pos_1 = xml.find(r#"<CA CA="UA1234567890""#).unwrap();
+    let stamp_pos_2 = xml.find(r#"<CA CA="UA0987654321""#).unwrap();
     assert!(
-        p_open < stamp_pos && stamp_pos < p_close,
+        p_open < stamp_pos_1 && stamp_pos_1 < p_close,
         "stamps must be CHILDREN of <P>, not siblings"
+    );
+    // Input order MUST be preserved (Python `:206` `for m in
+    // excise_marks` is insertion-ordered; Rust matches).  Pin so
+    // a future iterator regression surfaces.
+    assert!(
+        stamp_pos_1 < stamp_pos_2,
+        "excise stamps emit in caller-supplied order"
     );
 }
 

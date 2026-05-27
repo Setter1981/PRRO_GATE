@@ -102,6 +102,34 @@ fn header_and_footer_share_continuous_n_numbering_with_items() {
 }
 
 #[test]
+fn empty_and_whitespace_lines_are_skipped_and_do_not_consume_n() {
+    // Per Python `:173-178`: `line = line.strip(); if line: emit; n += 1`.
+    // Empty + whitespace-only lines MUST be skipped AND must NOT
+    // advance the item_no counter — otherwise per-piece counter
+    // drift breaks every subsequent <P>/<M>/<L> N attribute.
+    let xml = build_sell(
+        vec!["".to_string(), "  ".to_string(), "Header1".to_string()],
+        vec![item()],
+        vec!["".to_string(), "\t".to_string(), "Footer1".to_string()],
+    );
+    // Only ONE header L emitted (Header1 at N=1).
+    assert!(xml.contains(r#"<L N="1" NM="Header1""#),
+        "header empties skipped, Header1 at N=1: {xml}");
+    // P item gets N=2 (NOT N=4 — empties did not consume slots).
+    assert!(xml.contains(r#"<P C="ART-1" N="2""#),
+        "P item must be N=2 after empty-skip: {xml}");
+    // M at N=3.
+    assert!(xml.contains(r#"<M N="3""#),
+        "payment at N=3: {xml}");
+    // Footer Footer1 at N=4.
+    assert!(xml.contains(r#"<L N="4" NM="Footer1""#),
+        "footer empties skipped, Footer1 at N=4: {xml}");
+    // Sanity: no empty NM="" attribute emitted.
+    assert!(!xml.contains(r#"NM="""#), "no empty NM emitted");
+    assert!(!xml.contains(r#"NM="  ""#), "no whitespace-only NM emitted");
+}
+
+#[test]
 fn cyrillic_text_lines_emit_through_cp1251() {
     // Verify cp1251 encoding works on Ukrainian text.
     let xml = build_sell(
