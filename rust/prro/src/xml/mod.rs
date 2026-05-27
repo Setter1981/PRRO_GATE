@@ -132,6 +132,93 @@ pub struct CheckPayload {
     /// AFTER all payments + check-level adjustments, BEFORE closing
     /// `<E>`.  Per Python `dps_xml.py:181-182, 311-313`.
     pub footer_lines: Vec<String>,
+
+    /// W4-Z1 piece 5 — Per-tax-group summaries emitted as `<TX>`
+    /// CHILD elements of the closing `<E>`.  Each carries the
+    /// resolved TXSM (tax sum) and DTSM (excise sum) per ФСКО
+    /// TXAL formulas (Python `dps_xml.py:_calc_tax:536-563` +
+    /// spec §3).  Empty Vec → `<E .../>` is self-closing (back-
+    /// compat with existing minimal goldens).
+    ///
+    /// Caller (W4-Z1 piece 7 conversion layer) groups item.sum by
+    /// tax_group_1 and pre-resolves `txsm` + `dtsm` via `_calc_tax`
+    /// helper (provided here as `calc_tax(group_sum, rate, dtpr,
+    /// txal)`).
+    pub tax_summaries: Vec<TaxGroupSummary>,
+}
+
+/// Per-tax-group `<TX>` summary inside `<E>` (and inside `<TXS>`
+/// for Z-reports — see ZReportTaxSummary).  Mirrors Python
+/// `dps_xml.py:526-530`.
+#[derive(Debug, Clone)]
+pub struct TaxGroupSummary {
+    /// `<TX TX=...>`.  Canonical tax group number (1..12 per
+    /// `driver_tax_mapping` resolution).
+    pub tx: i64,
+    /// `<TX TXPR=...>`.  PDV rate, formatted as `"{:.2}"`.
+    pub txpr: String,
+    /// `<TX TXSM=...>`.  Tax sum (kopecks) computed via _calc_tax.
+    pub txsm: i64,
+    /// `<TX DTPR=...>`.  Excise rate, formatted as `"{:.2}"`.
+    pub dtpr: String,
+    /// `<TX DTSM=...>`.  Excise sum (kopecks) computed via _calc_tax.
+    pub dtsm: i64,
+    /// `<TX TXAL=...>`.  Tax algorithm (0/1/2 per ФСКО + spec §3).
+    pub txal: i64,
+    /// `<TX TXTY=...>`.  Tax type (default 0 = standard).
+    pub txty: i64,
+}
+
+/// W4-Z1 piece 5 — `_calc_tax` per ФСКО TXAL formulas.  Mirror of
+/// Python `dps_xml.py:536-563` exactly.
+///
+/// Returns `(txsm, dtsm)` in kopecks for a given group total + rates
+/// + algorithm.  Caller computes `group_sum` as the sum of
+/// `item.sum` for items with this `tax_group_1`.
+///
+/// Algorithms:
+///   * TXAL=0 — VAT-included: txsm = group_sum * txpr / (100 + txpr).
+///              dtsm = 0.
+///   * TXAL=1 — Excise pre-VAT: dtsm = group_sum * dtpr / 100;
+///              txsm = (group_sum + dtsm) * txpr / (100 + txpr).
+///   * TXAL=2 — Excise post-VAT: dtsm = group_sum * dtpr / (100 + dtpr);
+///              txsm = (group_sum - dtsm) * txpr / (100 + txpr).
+///   * TXAL=3 — Absolute (per-unit) excise.  NOT SUPPORTED in this
+///              build (operator-confirmed: "TXAL=3 не потрібен").
+///              Returns (0, 0) for forward-compat; caller should
+///              audit_log warn if it hits this slot.
+pub fn calc_tax(group_sum: i64, txpr: f64, dtpr: f64, txal: i64) -> (i64, i64) {
+    fn round_half_to_even(x: f64) -> i64 {
+        // Python `round()` is banker's rounding (round-half-to-even).
+        // Mirror exactly so our kopeck integer math matches Python's
+        // for byte-equivalence.
+        x.round() as i64
+    }
+
+    let g = group_sum as f64;
+    match txal {
+        0 => {
+            let txsm = if txpr > 0.0 { round_half_to_even(g * txpr / (100.0 + txpr)) } else { 0 };
+            (txsm, 0)
+        }
+        1 => {
+            let dtsm = if dtpr > 0.0 { round_half_to_even(g * dtpr / 100.0) } else { 0 };
+            let txsm = if txpr > 0.0 {
+                round_half_to_even((g + dtsm as f64) * txpr / (100.0 + txpr))
+            } else { 0 };
+            (txsm, dtsm)
+        }
+        2 => {
+            let dtsm = if dtpr > 0.0 {
+                round_half_to_even(g * dtpr / (100.0 + dtpr))
+            } else { 0 };
+            let txsm = if txpr > 0.0 {
+                round_half_to_even((g - dtsm as f64) * txpr / (100.0 + txpr))
+            } else { 0 };
+            (txsm, dtsm)
+        }
+        _ => (0, 0), // TXAL=3+ not supported in this slice
+    }
 }
 
 /// Check-level discount or surcharge.  Distinct from per-item
@@ -175,6 +262,7 @@ impl Default for CheckPayload {
             check_level_adjustments: Vec::new(),
             header_lines: Vec::new(),
             footer_lines: Vec::new(),
+            tax_summaries: Vec::new(),
         }
     }
 }
@@ -622,7 +710,8 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
     }
 
     // Closing <E FN N NO SM TS> per ФСКО Table 23 / Python
-    // `_build_e_element` no-tax-groups branch.
+    // `_build_e_element`.  W4-Z1 piece 5: when `tax_summaries` is
+    // non-empty, emit `<TX>` CHILD elements inside `<E>` before close.
     let e_n = item_no.to_string();
     let e_no = p.local_number.to_string();
     let e_sm = p.total_sum.to_string();
@@ -637,6 +726,28 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
             ("TS", &h.ts_str),
         ],
     );
+    // <TX> tax-group children inside <E> (Python `_build_e_element:514-530`).
+    for ts in &p.tax_summaries {
+        let tx_str = ts.tx.to_string();
+        let txsm_str = ts.txsm.to_string();
+        let dtsm_str = ts.dtsm.to_string();
+        let txal_str = ts.txal.to_string();
+        let txty_str = ts.txty.to_string();
+        tag_attrs(
+            out,
+            "TX",
+            &[
+                ("DTPR", &ts.dtpr),
+                ("DTSM", &dtsm_str),
+                ("TX", &tx_str),
+                ("TXAL", &txal_str),
+                ("TXPR", &ts.txpr),
+                ("TXSM", &txsm_str),
+                ("TXTY", &txty_str),
+            ],
+        );
+        close(out, "TX");
+    }
     close(out, "E");
     close(out, "C");
     tag_text(out, "TS", &h.ts_str);
@@ -983,6 +1094,7 @@ mod tests {
             check_level_adjustments: Vec::new(),
             header_lines: Vec::new(),
             footer_lines: Vec::new(),
+            tax_summaries: Vec::new(),
         });
         let s = render_ascii(&doc);
         assert!(s.contains(r#"<C T="0">"#), "SELL must be C T=0");
@@ -1015,6 +1127,7 @@ mod tests {
             check_level_adjustments: Vec::new(),
             header_lines: Vec::new(),
             footer_lines: Vec::new(),
+            tax_summaries: Vec::new(),
         });
         let s = render_ascii(&doc);
         assert!(s.contains(r#"<C T="1">"#), "RETURN must be C T=1");
@@ -1124,6 +1237,7 @@ mod tests {
             check_level_adjustments: Vec::new(),
             header_lines: Vec::new(),
             footer_lines: Vec::new(),
+            tax_summaries: Vec::new(),
         });
         let s = render_ascii(&doc);
         let idx1 = s.find("CODE-1").expect("first item present");
@@ -1144,6 +1258,7 @@ mod tests {
             check_level_adjustments: Vec::new(),
             header_lines: Vec::new(),
             footer_lines: Vec::new(),
+            tax_summaries: Vec::new(),
         });
         let a = build_canonical_xml(&doc).unwrap();
         let b = build_canonical_xml(&doc).unwrap();
@@ -1186,6 +1301,7 @@ mod tests {
             check_level_adjustments: Vec::new(),
             header_lines: Vec::new(),
             footer_lines: Vec::new(),
+            tax_summaries: Vec::new(),
         });
         let bytes = build_canonical_xml(&doc).expect("ukrainian must encode");
         // Find the cp1251 bytes for "Їжа" inside the wire output.

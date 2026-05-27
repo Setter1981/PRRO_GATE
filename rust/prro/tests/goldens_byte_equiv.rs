@@ -73,6 +73,7 @@ fn check_payload(local_number: u32) -> CheckPayload {
         check_level_adjustments: Vec::new(),
         header_lines: Vec::new(),
         footer_lines: Vec::new(),
+        tax_summaries: Vec::new(),
     }
 }
 

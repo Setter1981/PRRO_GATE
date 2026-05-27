@@ -857,5 +857,6 @@ fn check_payload_from(
         // piece 7 conversion-layer populates from DTO raw_frames.
         header_lines: Vec::new(),
         footer_lines: Vec::new(),
+        tax_summaries: Vec::new(),
     }
 }
