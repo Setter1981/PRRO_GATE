@@ -8,4 +8,5 @@ pub mod offline_sessions;
 pub mod operators;
 pub mod outbox;
 pub mod shifts;
+pub mod tax_groups;
 pub mod transport_trace;
