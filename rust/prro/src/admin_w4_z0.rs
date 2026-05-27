@@ -28,6 +28,7 @@
 //! reaffirms three-event-where-applicable.
 
 use sqlx::SqlitePool;
+use std::path::Path;
 use thiserror::Error;
 
 use crate::db::repositories::driver_tax_mapping::{
@@ -607,6 +608,169 @@ pub async fn show_outgress_profile(
         .await
         .map_err(|e| CfgAdminError::Infrastructure(format!("profile::get: {e}")))?
         .ok_or_else(|| CfgAdminError::OutgressProfileNotFound(fn_id.to_string()))
+}
+
+// ─── CLI entry-points (piece 8c) ───────────────────────────────────
+//
+// `run_*` wrappers read config, acquire singleton lock, open both
+// pools, invoke the library function, then close pools.  Mirror of
+// W2 PR-B `admin::run_add_operator` pattern.
+
+async fn open_pools_from_config(
+    config_path: &Path,
+) -> Result<(SqlitePool, SqlitePool), CfgAdminError> {
+    let cfg_text = std::fs::read_to_string(config_path)
+        .map_err(|e| CfgAdminError::Infrastructure(format!("read config: {e}")))?;
+    let cfg = crate::config::AppConfig::from_toml(&cfg_text)
+        .map_err(|e| CfgAdminError::Infrastructure(format!("parse config: {e}")))?;
+    let pool_main = crate::db::open_pool(&cfg.database.db_path)
+        .await
+        .map_err(|e| CfgAdminError::Infrastructure(format!("open main pool: {e}")))?;
+    let pool_secure = crate::db::open_secure_pool(&cfg.database.secure_db_path)
+        .await
+        .map_err(|e| CfgAdminError::Infrastructure(format!("open secure pool: {e}")))?;
+    Ok((pool_main, pool_secure))
+}
+
+/// Open pools + call body + close pools.  Inline form (closures + async
+/// move had lifetime issues with `&String` borrows captured into the
+/// returned future).
+macro_rules! with_pools {
+    ($cfg:expr, $main:ident, $secure:ident, $body:block) => {{
+        let ($main, $secure) = open_pools_from_config($cfg).await?;
+        let result = async $body.await;
+        $secure.close().await;
+        $main.close().await;
+        result
+    }};
+}
+
+pub async fn run_add_tax_group(
+    cfg: &Path, fn_id: String, tx_num: i64, letter: String,
+    dtpr: f64, txpr: f64, txal: i64,
+) -> Result<(), CfgAdminError> {
+    with_pools!(cfg, pm, ps, {
+        add_tax_group(&pm, &ps, &fn_id, tx_num, &letter, dtpr, txpr, txal).await
+    })
+}
+
+pub async fn run_update_tax_rate(
+    cfg: &Path, fn_id: String, tx_num: i64,
+    dtpr: Option<f64>, txpr: Option<f64>, txal: Option<i64>,
+) -> Result<(), CfgAdminError> {
+    with_pools!(cfg, pm, ps, {
+        update_tax_rate(&pm, &ps, &fn_id, tx_num, dtpr, txpr, txal).await
+    })
+}
+
+pub async fn run_remove_tax_group(
+    cfg: &Path, fn_id: String, tx_num: i64,
+) -> Result<(), CfgAdminError> {
+    with_pools!(cfg, pm, ps, { remove_tax_group(&pm, &ps, &fn_id, tx_num).await })
+}
+
+pub async fn run_list_tax_groups(
+    cfg: &Path, fn_id: String,
+) -> Result<Vec<TaxGroup>, CfgAdminError> {
+    with_pools!(cfg, _pm, ps, { list_tax_groups(&ps, &fn_id).await })
+}
+
+pub async fn run_add_payment_method(
+    cfg: &Path, fn_id: String, pay_index: i64, name: String, iscash: bool,
+) -> Result<(), CfgAdminError> {
+    with_pools!(cfg, pm, ps, {
+        add_payment_method(&pm, &ps, &fn_id, pay_index, &name, iscash).await
+    })
+}
+
+pub async fn run_update_payment_method(
+    cfg: &Path, fn_id: String, pay_index: i64,
+    name: Option<String>, iscash: Option<bool>,
+) -> Result<(), CfgAdminError> {
+    with_pools!(cfg, pm, ps, {
+        update_payment_method(&pm, &ps, &fn_id, pay_index, name.as_deref(), iscash).await
+    })
+}
+
+pub async fn run_remove_payment_method(
+    cfg: &Path, fn_id: String, pay_index: i64,
+) -> Result<(), CfgAdminError> {
+    with_pools!(cfg, pm, ps, { remove_payment_method(&pm, &ps, &fn_id, pay_index).await })
+}
+
+pub async fn run_list_payment_methods(
+    cfg: &Path, fn_id: String,
+) -> Result<Vec<PaymentMethod>, CfgAdminError> {
+    with_pools!(cfg, _pm, ps, { list_payment_methods(&ps, &fn_id).await })
+}
+
+pub async fn run_set_flag(
+    cfg: &Path, fn_id: String, name: String, value: String,
+) -> Result<(), CfgAdminError> {
+    with_pools!(cfg, pm, ps, { set_flag(&pm, &ps, &fn_id, &name, &value).await })
+}
+
+pub async fn run_set_national_receipt(
+    cfg: &Path, fn_id: String, enabled: bool,
+) -> Result<(), CfgAdminError> {
+    with_pools!(cfg, pm, ps, { set_national_receipt(&pm, &ps, &fn_id, enabled).await })
+}
+
+pub async fn run_list_flags(
+    cfg: &Path, fn_id: String,
+) -> Result<Vec<FnIntegrationFlag>, CfgAdminError> {
+    with_pools!(cfg, _pm, ps, { list_flags(&ps, &fn_id).await })
+}
+
+pub async fn run_add_driver_mapping(
+    cfg: &Path, driver_id: String, driver_number: i64,
+    canonical_tx_num: i64, driver_letter: Option<String>,
+) -> Result<(), CfgAdminError> {
+    with_pools!(cfg, pm, ps, {
+        add_driver_mapping(&pm, &ps, &driver_id, driver_number, canonical_tx_num, driver_letter.as_deref()).await
+    })
+}
+
+pub async fn run_update_driver_mapping(
+    cfg: &Path, driver_id: String, driver_number: i64, canonical_tx_num: i64,
+) -> Result<(), CfgAdminError> {
+    with_pools!(cfg, pm, ps, {
+        update_driver_mapping(&pm, &ps, &driver_id, driver_number, canonical_tx_num).await
+    })
+}
+
+pub async fn run_remove_driver_mapping(
+    cfg: &Path, driver_id: String, driver_number: i64,
+) -> Result<(), CfgAdminError> {
+    with_pools!(cfg, pm, ps, {
+        remove_driver_mapping(&pm, &ps, &driver_id, driver_number).await
+    })
+}
+
+pub async fn run_list_driver_mappings(
+    cfg: &Path, driver_id: String,
+) -> Result<Vec<DriverTaxMapping>, CfgAdminError> {
+    with_pools!(cfg, _pm, ps, { list_driver_mappings(&ps, &driver_id).await })
+}
+
+pub async fn run_set_outgress_profile(
+    cfg: &Path, fn_id: String, profile: String,
+) -> Result<(), CfgAdminError> {
+    with_pools!(cfg, pm, ps, {
+        set_outgress_profile(&pm, &ps, &fn_id, &profile).await
+    })
+}
+
+pub async fn run_show_outgress_profile(
+    cfg: &Path, fn_id: String,
+) -> Result<OutgressProfile, CfgAdminError> {
+    with_pools!(cfg, _pm, ps, { show_outgress_profile(&ps, &fn_id).await })
+}
+
+pub async fn run_bootstrap_defaults(
+    cfg: &Path, fn_id: String,
+) -> Result<(), CfgAdminError> {
+    with_pools!(cfg, pm, ps, { bootstrap_defaults(&pm, &ps, &fn_id).await })
 }
 
 // ─── recovery: standalone bootstrap-defaults command ──────────────
