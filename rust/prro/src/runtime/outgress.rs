@@ -12,11 +12,16 @@
 //!   * [`DpsTransport`]       — submit signed bytes to DPS endpoint
 //!   * [`DpsResponseParser`]  — decode raw response into [`DpsOutcome`]
 //!
-//! Pilot impls in this file are **skeletons** (`todo!()` bodies).
-//! W4-Z1 (builder), W4-Z2 (canonical_doc_digest), and W4-Z3 (live
-//! DPS smoke) fill them in.  EVPZ impls (`unimplemented!()` bodies)
-//! are POST-PILOT placeholders; runtime `dispatch_to_outgress`
-//! surfaces them as typed `OutgressError::ProfileNotImplemented`.
+//! Pilot impls in this file are **skeletons** returning typed
+//! `Err(BuildError::Unimplemented(...))` and equivalents (per Round-2
+//! audit: `todo!()` would panic the supervisor on accidental
+//! dispatch).  W4-Z1 (builder), W4-Z2 (canonical_doc_digest), and
+//! W4-Z3 (live DPS smoke) fill them in.  EVPZ impls are POST-PILOT
+//! placeholders returning the same typed Unimplemented; runtime
+//! `dispatch_to_outgress` surfaces both via the trait chain as
+//! `OutgressError::{Build,Sign,Transport,Parse}` (Round-3 audit
+//! removed the hardcoded EVPZ early-exit + dead
+//! `ProfileNotImplemented` variant).
 //!
 //! This piece's primary value: locking the public API surface so
 //! downstream worklets can be parallel-implemented without scope

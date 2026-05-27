@@ -470,9 +470,15 @@ pub async fn add_driver_mapping(
     canonical_tx_num: i64,
     driver_letter: Option<&str>,
 ) -> Result<(), CfgAdminError> {
-    if driver_id.trim().is_empty() {
-        return Err(CfgAdminError::EmptyArgument("driver-id"));
-    }
+    // Audit Round-4 (2026-05-27): normalize driver_id via the same
+    // `DriverId::new` trim/length validation the listener uses, so
+    // an operator typing `--driver-id ' maria304 '` (extra YAML-ish
+    // whitespace) DOES persist as the same value the supervisor
+    // will look up.  Pre-fix path stored the raw string → W4-Z1
+    // driver_tax_mapping lookup would silently miss.
+    let normalized = crate::db::models::ids::DriverId::new(driver_id)
+        .map_err(|_| CfgAdminError::EmptyArgument("driver-id"))?;
+    let driver_id = normalized.as_str();
 
     match dtm_repo::insert(
         pool_secure,
@@ -516,9 +522,10 @@ pub async fn update_driver_mapping(
     driver_number: i64,
     canonical_tx_num: i64,
 ) -> Result<(), CfgAdminError> {
-    if driver_id.trim().is_empty() {
-        return Err(CfgAdminError::EmptyArgument("driver-id"));
-    }
+    // Audit Round-4: normalize via DriverId::new (see add_driver_mapping).
+    let normalized = crate::db::models::ids::DriverId::new(driver_id)
+        .map_err(|_| CfgAdminError::EmptyArgument("driver-id"))?;
+    let driver_id = normalized.as_str();
     if !(1..=99).contains(&canonical_tx_num) {
         return Err(CfgAdminError::Infrastructure(format!(
             "canonical_tx_num {canonical_tx_num} out of range 1..=99"
@@ -551,6 +558,10 @@ pub async fn remove_driver_mapping(
     driver_id: &str,
     driver_number: i64,
 ) -> Result<(), CfgAdminError> {
+    // Audit Round-4: normalize via DriverId::new.
+    let normalized = crate::db::models::ids::DriverId::new(driver_id)
+        .map_err(|_| CfgAdminError::EmptyArgument("driver-id"))?;
+    let driver_id = normalized.as_str();
     dtm_repo::soft_delete(pool_secure, driver_id, driver_number).await.map_err(|e| match e {
         DriverTaxMappingRepoError::NotFound { driver_id, driver_number } => {
             CfgAdminError::DriverMappingNotFound(driver_id, driver_number)
@@ -568,7 +579,11 @@ pub async fn list_driver_mappings(
     pool_secure: &SqlitePool,
     driver_id: &str,
 ) -> Result<Vec<DriverTaxMapping>, CfgAdminError> {
-    dtm_repo::list_active_for_driver(pool_secure, driver_id)
+    // Audit Round-4: normalize via DriverId::new so list lookup
+    // matches the supervisor-stamped value.
+    let normalized = crate::db::models::ids::DriverId::new(driver_id)
+        .map_err(|_| CfgAdminError::EmptyArgument("driver-id"))?;
+    dtm_repo::list_active_for_driver(pool_secure, normalized.as_str())
         .await
         .map_err(|e| CfgAdminError::Infrastructure(format!("driver_tax_mapping::list: {e}")))
 }

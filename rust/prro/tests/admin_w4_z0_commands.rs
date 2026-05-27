@@ -385,6 +385,37 @@ async fn list_flags_returns_all_set_flags() {
 
 // ─── driver_tax_mapping family ─────────────────────────────────────
 
+/// Audit Round-4 (2026-05-27): admin driver-mapping CLI commands
+/// must normalise `driver_id` via `DriverId::new` so a `--driver-id
+/// ' maria304 '` (with whitespace) persists as `"maria304"` and
+/// matches the supervisor-stamped value at W4-Z1 lookup time.
+#[tokio::test]
+async fn add_driver_mapping_normalizes_whitespace_in_driver_id() {
+    let (_md, pool_main) = fresh_main_pool().await;
+    let (_sd, pool_secure) = fresh_secure_pool().await;
+
+    cli::add_driver_mapping(&pool_main, &pool_secure, "  maria304\n", 4, 4, Some("ГА"))
+        .await
+        .expect("trim succeeds");
+
+    // Looked up via the normalised id — would miss if raw was stored.
+    let rows = cli::list_driver_mappings(&pool_secure, "maria304").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].driver_id, "maria304");
+    assert_eq!(rows[0].canonical_tx_num, 4);
+}
+
+#[tokio::test]
+async fn driver_mapping_admin_rejects_whitespace_only_driver_id() {
+    let (_md, pool_main) = fresh_main_pool().await;
+    let (_sd, pool_secure) = fresh_secure_pool().await;
+
+    let err = cli::add_driver_mapping(&pool_main, &pool_secure, "   ", 1, 1, None)
+        .await
+        .expect_err("whitespace-only driver-id must reject");
+    assert!(matches!(err, CfgAdminError::EmptyArgument("driver-id")));
+}
+
 #[tokio::test]
 async fn add_driver_mapping_happy_path() {
     let (_md, pool_main) = fresh_main_pool().await;

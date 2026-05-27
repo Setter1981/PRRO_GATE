@@ -53,7 +53,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tax_groups_fn_letter
 ```sql
 CREATE TABLE IF NOT EXISTS payment_methods (
   fn          TEXT    NOT NULL,
-  pay_index   INTEGER NOT NULL CHECK (pay_index BETWEEN 0 AND 99),
+  pay_index   INTEGER NOT NULL CHECK (pay_index BETWEEN 1 AND 99),
   name        TEXT    NOT NULL,               -- 'Готівка' / 'Картка' / 'Кредит' / custom
   iscash      INTEGER NOT NULL DEFAULT 0 CHECK (iscash IN (0, 1)),
   -- XML T attribute value derived as (pay_index - 1) per WebCheck behaviour;
@@ -400,19 +400,16 @@ async fn dispatch_to_outgress(
     runtime: &AppRuntime,
 ) -> Result<DpsOutcome, OutgressError> {
     let profile = runtime.outgress_profile_for(fn_id).await?;
-    let (builder, envelope, transport, parser) = match profile {
-        OutgressProfile::FscoZzd => runtime.fsco_zzd_quartet(),
-        OutgressProfile::EvpzDps => runtime.evpz_dps_quartet(),  // returns OutgressError::ProfileNotImplemented in pilot
-    };
+    let (builder, envelope, transport, parser) = quartet_for(profile);
     let payload = builder.build_check(cmd, &runtime.builder_context_for(fn_id))?;
     let signed = envelope.wrap(&payload, &runtime.sign_ctx_for(fn_id))?;
     let raw_response = transport.submit(&signed, &runtime.target_for(fn_id)).await?;
     parser.parse_response(&raw_response, cmd)
-        .map_err(OutgressError::ParseFailure)
+        .map_err(OutgressError::from)
 }
 ```
 
-The **quartet** (builder + envelope + transport + parser) is plumbed by `runtime.{fsco_zzd,evpz_dps}_quartet()` accessors.  Each accessor returns the per-outgress trait-object set.  Pilot's `evpz_dps_quartet()` returns `OutgressError::ProfileNotImplemented` until W4-Y series lands real impls.
+The **quartet** (builder + envelope + transport + parser) is plumbed by `quartet_for(profile)` accessor.  Each profile returns its per-outgress trait-object set.  Audit Round-3 (2026-05-27) removed the hardcoded EVPZ early-exit + dead `ProfileNotImplemented` variant — EVPZ's `Unimplemented` now surfaces via the trait chain as `OutgressError::{Build,Sign,Transport,Parse}` with a per-class identifying message body.
 
 ---
 
@@ -433,7 +430,7 @@ Each table creation is idempotent (`CREATE TABLE IF NOT EXISTS`).  Bootstrap ins
 - Admin CLI integration tests (one per command).
 - Listener-stamped `driver_id` integration test: mock listener config → call mapping helper → assert `CanonicalFiscalCommand.driver_id` populated correctly.
 - FN-config-mismatch test: wire `fn = X`, listener `fn = Y` → typed error.
-- Outgress profile router test: `EVPZ_DPS` config → router returns `OutgressError::ProfileNotImplemented`.
+- Outgress profile router test: `EVPZ_DPS` config → router returns `OutgressError::Build(BuildError::Unimplemented(_))` (per trait-chain flow; Round-3 closed dead `ProfileNotImplemented` variant).
 - Trait abstraction compile test: assert `FscoXmlBuilder` implements `DpsXmlBuilder`.
 
 ---
