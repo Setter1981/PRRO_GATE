@@ -28,30 +28,33 @@
 //! deterministic output.  Byte-equivalence against the
 //! Python-captured goldens lands in C3.
 //!
-//! W4 first-round subset (W4-C1):  the typed payloads here mirror the
-//! Python `_build_check` / `_build_z_report` shapes for the SUBSET we
-//! ship goldens for in C2 — items/payments/closing-E for checks, and
-//! payment-summaries+check-count for Z-reports.
+//! W4-Z1 (2026-05-27) covers the full ФСКО Table 23 surface for the
+//! four signable doc types (ShiftOpen, Sell, Return, ZReport):
 //!
-//! W4-Z1 expansion (2026-05-27, this commit set) now covers the full
-//! ФСКО Table 23 surface — additively:
-//!   * piece 1: <P> extras (barcode CD, UKTZED CZD, TX/TX1 tax groups,
-//!     <CA> excise children, per-item <D>/<S> via `adjustments`).
-//!   * piece 2: <M> EPZ slip attrs (PA/PB/PC/PD/PE/PF/PSNM/RRN) +
+//!   * <P> extras — barcode CD, UKTZED CZD, TX/TX1 tax groups, <CA>
+//!     excise children, per-item <D>/<S> via `adjustments: Vec`.
+//!   * <M> extras — EPZ slip attrs (PA/PB/PC/PD/PE/PF/PSNM/RRN) +
 //!     cash-only RM/SMP.
-//!   * piece 3: check-level <D TR="1"> / <S TR="1"> with <NI> children.
-//!   * piece 4: <L N=... NM=...> header + footer text lines (Python
-//!     strip + skip + no-counter-increment-on-empty contract).
-//!   * piece 5: <TX> tax-group children inside <E> + `calc_tax` per
-//!     ФСКО TXAL formulas (banker's rounding, lex-by-stringified TX
-//!     sort, typed `CalcTaxError` for unsupported TXAL + non-finite
-//!     rates).
-//!   * piece 6: Z-report <TXS> / <IO> / <EPZ> aggregations with
-//!     Python-mirror section ordering TXS → M → IO → NC → EPZ.
-//!   * piece 6.5 + audit-round 2: per-item D/S go to a shared
-//!     discounts buffer flushed AFTER all <P> elements (Python
-//!     `_build_check:155-159, :209, :244, :271, :321-324` buffer-
-//!     then-concat semantics), preserving inline counter increments.
+//!   * Check-level <D TR="1"> / <S TR="1"> with auto-tracked
+//!     `p_item_numbers` driving <NI> children (caller may override
+//!     with an explicit subset for POS-precomputed cases).
+//!   * <L N=... NM=...> header + footer text lines (strip + skip +
+//!     no-counter-increment-on-empty per Python).
+//!   * <TX> tax-group children inside <E> + `calc_tax` per ФСКО
+//!     TXAL formulas (banker's rounding, lex-by-stringified TX
+//!     sort, typed `CalcTaxError` for unsupported TXAL + invalid
+//!     rates including NaN/Inf/negative + intermediate overflow).
+//!   * Z-report <TXS> / <IO> / <EPZ> aggregations with section
+//!     ordering TXS → M → IO → NC → EPZ.
+//!
+//! **emit_check pattern** mirrors Python `_build_check` exactly:
+//! buffer accumulation (`items_buf` / `discounts_buf` /
+//! `payments_buf` / `footer_buf`) flushed in concat order
+//! `header + items + discounts + payments + footer + total`.
+//! Per-item D/S land in `discounts_buf` AFTER all <P> elements;
+//! the item_no counter increments INLINE so a D's N attr can be
+//! lower than a subsequent P's N (non-monotonic wire-position-vs-N
+//! is intentional and Python-identical).
 //!
 //! **Back-compat invariant**: all expansion is additive.  Empty
 //! `Vec` / `None` / `Default::default()` produces the same bytes as
@@ -264,34 +267,55 @@ pub fn calc_tax(
         }
     }
 
-    // AUDIT2-CRIT-1 defensive guard.  NaN/Inf rates can only arise
-    // from corrupted operator config; surface as typed error rather
-    // than silently producing 0 (which would drop tax sums in a
-    // pilot doc) or panicking in the banker's-half branch (which
-    // could overflow on i64::MAX + 1 in debug).
-    if !txpr.is_finite() || !dtpr.is_finite() {
+    // AUDIT2-CRIT-1 + AUDIT3-CRIT-1: INPUT validation.  Reject:
+    //   - NaN / ±Inf (would cascade through arithmetic).
+    //   - Negative (Python `:548-560` raises ZeroDivisionError when
+    //     `100 + (-100) = 0` enters denominator; Rust's `if txpr > 0`
+    //     guard pre-fix would silently zero — Python parity demands
+    //     a fail-loud surface).
+    // Variant name kept as RateNotFinite for ABI continuity; covers
+    // both not-finite and negative as "rate unsuitable for the
+    // formula".
+    if !txpr.is_finite() || !dtpr.is_finite() || txpr < 0.0 || dtpr < 0.0 {
         return Err(CalcTaxError::RateNotFinite { txpr, dtpr });
     }
+
+    // AUDIT3-CRIT-1: post-arithmetic finite check.  Round-2 input
+    // guard does NOT protect against finite inputs that produce
+    // non-finite INTERMEDIATES:
+    //   - txpr=-100  → 100+txpr=0   → div-by-zero → ±Inf
+    //   - dtpr=-100  → 100+dtpr=0   → div-by-zero (TXAL=2)
+    //   - txpr=1e300 → g*txpr → Inf (overflow on multiplication)
+    // Without this guard, Inf reaches round_half_to_even and the
+    // banker's-half branch saturates `as i64 = i64::MAX`, then
+    // `MAX + 1` overflow-panics in debug.
+    let safe_round = |x: f64| -> Result<i64, CalcTaxError> {
+        if !x.is_finite() {
+            Err(CalcTaxError::RateNotFinite { txpr, dtpr })
+        } else {
+            Ok(round_half_to_even(x))
+        }
+    };
 
     let g = group_sum as f64;
     match txal {
         0 => {
-            let txsm = if txpr > 0.0 { round_half_to_even(g * txpr / (100.0 + txpr)) } else { 0 };
+            let txsm = if txpr > 0.0 { safe_round(g * txpr / (100.0 + txpr))? } else { 0 };
             Ok((txsm, 0))
         }
         1 => {
-            let dtsm = if dtpr > 0.0 { round_half_to_even(g * dtpr / 100.0) } else { 0 };
+            let dtsm = if dtpr > 0.0 { safe_round(g * dtpr / 100.0)? } else { 0 };
             let txsm = if txpr > 0.0 {
-                round_half_to_even((g + dtsm as f64) * txpr / (100.0 + txpr))
+                safe_round((g + dtsm as f64) * txpr / (100.0 + txpr))?
             } else { 0 };
             Ok((txsm, dtsm))
         }
         2 => {
             let dtsm = if dtpr > 0.0 {
-                round_half_to_even(g * dtpr / (100.0 + dtpr))
+                safe_round(g * dtpr / (100.0 + dtpr))?
             } else { 0 };
             let txsm = if txpr > 0.0 {
-                round_half_to_even((g - dtsm as f64) * txpr / (100.0 + txpr))
+                safe_round((g - dtsm as f64) * txpr / (100.0 + txpr))?
             } else { 0 };
             Ok((txsm, dtsm))
         }
@@ -731,6 +755,9 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
     let mut discounts_buf = String::new();
     let mut payments_buf = String::new();
     let mut footer_buf = String::new();
+    // AUDIT3-IMP-1 (B): track every emitted item's N for auto-fill
+    // of check-level <NI> children (Python `p_item_numbers` mirror).
+    let mut p_item_numbers: Vec<u32> = Vec::new();
 
     // header_xml — emitted directly into `out` (Python `:172-178`).
     // Python strips + skips empties + does NOT increment item_no on
@@ -797,7 +824,14 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
         // input order, picks `<D>` or `<S>` per `d_type`.  The
         // counter increments INLINE — the D's N attr is one more
         // than the parent P's N.
+        //
+        // AUDIT3-IMP-1 (A) — Python `:220-222 if d_value == 0:
+        // continue`: zero-sum adj skipped BEFORE emit + BEFORE
+        // counter increment.  Mirror exactly.
         for adj in &it.adjustments {
+            if adj.sum == 0 {
+                continue;
+            }
             let tag_name = match adj.kind {
                 LineAdjustmentKind::Discount => "D",
                 LineAdjustmentKind::Surcharge => "S",
@@ -805,12 +839,32 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
             emit_line_adjustment(&mut discounts_buf, tag_name, adj, item_no, p_item_n);
             item_no += 1;
         }
+
+        // AUDIT3-IMP-1 (B): track p_item_numbers for check-level
+        // auto-fill (Python `:208 p_item_numbers.append(item_no)`
+        // BEFORE inner discount loop — so ALL items get tracked).
+        // We push AFTER the P emit + AFTER the per-item disc loop,
+        // since we captured p_item_n at top of iteration.
+        p_item_numbers.push(p_item_n);
     }
 
     // Check-level adjustments — Python `:248-272`.  They APPEND to
     // the same `discounts_xml` buffer (per `:271 discounts_xml +=
     // _tag(...)`), so they come after per-item D/S in wire order.
+    //
+    // AUDIT3-IMP-1 (A): Python `:254-256` zero-skip without
+    // counter increment — mirror.
+    //
+    // AUDIT3-IMP-1 (B) + operator clarification: `applies_to_item_ns`
+    // is an OPTIONAL OVERRIDE.  Empty Vec → auto-fill with
+    // `p_item_numbers` (Python parity, `:260` `for n in
+    // p_item_numbers`).  Non-empty Vec → use caller-supplied subset
+    // (POS-precomputed real-world case, e.g. "discount only on
+    // alcohol items").
     for cla in &p.check_level_adjustments {
+        if cla.sum == 0 {
+            continue;
+        }
         let self_n = item_no;
         let self_n_str = self_n.to_string();
         let sm_str = cla.sum.to_string();
@@ -835,8 +889,15 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
             attrs.push(("NM", name));
         }
         tag_attrs(&mut discounts_buf, tag_name, &attrs);
-        // `<NI NI="...">` children — one per affected item N.
-        for &item_n in &cla.applies_to_item_ns {
+        // `<NI NI="...">` children: empty caller subset → auto-fill
+        // with all tracked p_item_numbers (Python parity); non-empty
+        // → use as-is (POS subset).
+        let ni_source: &[u32] = if cla.applies_to_item_ns.is_empty() {
+            &p_item_numbers
+        } else {
+            &cla.applies_to_item_ns
+        };
+        for &item_n in ni_source {
             let item_n_str = item_n.to_string();
             tag_attrs(&mut discounts_buf, "NI", &[("NI", &item_n_str)]);
             close(&mut discounts_buf, "NI");
