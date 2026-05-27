@@ -22,6 +22,16 @@
       "length": 225
     },
     {
+      "path": "goldens/xml/sell_extended.bin",
+      "sha256": "7eade954b5bb4af8a8a2414eeb36f0fb4e024b16dfff0e6ff1bbf5d496d03110",
+      "length": 1047
+    },
+    {
+      "path": "goldens/xml/z_report_extended.bin",
+      "sha256": "a425ddba79085018d79644cadcb55b614ec98382d0e84bc85338935c5b2c8da3",
+      "length": 630
+    },
+    {
       "path": "goldens/cms/deterministic_prefix.bin",
       "sha256": "5f00dd0edb6f8377aff64956948584f1ddf8f13b1db32a0cc2e31f8e22074400",
       "length": 327

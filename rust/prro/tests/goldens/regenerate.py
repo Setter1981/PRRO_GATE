@@ -32,10 +32,15 @@ Usage:
 
 The script is intentionally narrow:
 
-  - hard-coded fixture payloads chosen to exercise the W4 first-round
-    subset (the same subset the Rust builder ships in C1: items +
-    payments + closing E for SELL/RETURN, M-summary + NC for
-    Z_REPORT, no excise/discounts/header/footer/tax_groups);
+  - hard-coded fixture payloads exercising two layers:
+      * W4-C1 minimal subset (4 fixtures: items + payments + closing
+        E for SELL/RETURN, M-summary + NC for Z_REPORT) — frozen
+        back-compat oracle for the legacy minimal builder path;
+      * W4-Z1 extended subset (2 fixtures: sell_extended +
+        z_report_extended) — full ФСКО Table 23 coverage:
+        excise/UKTZED/TX groups/per-item discount/EPZ slip/check-
+        level adjustments/header+footer L/<TX> children in <E>/
+        <TXS> full form/<IO>/<EPZ>);
   - cp1251 encoding via ``str.encode('cp1251')`` — the same
     encoding the Python serializer's downstream signing path
     expects;
@@ -59,6 +64,7 @@ PYTHON_SRC = REPO_ROOT / "src"
 sys.path.insert(0, str(PYTHON_SRC))
 
 from prro_gateway.enums import OperationType  # noqa: E402
+from prro_gateway.repositories.tax_groups import TaxGroupDef  # noqa: E402
 from prro_gateway.serializers.dps_xml import build_dps_xml  # noqa: E402
 
 
@@ -181,6 +187,147 @@ def z_report_xml() -> str:
     )
 
 
+# ─── W4-Z1 piece 8 — extended-shape fixtures ──────────────────────────
+#
+# Goal: byte-equivalence verification of the EXTENDED FSCO Table 23
+# coverage that W4-Z1 added (excise / UKTZED / TX groups / per-item
+# discount / EPZ slip / check-level adjustments / header+footer L /
+# <TX> in <E> via tax_groups).  Each fixture exercises a distinct
+# code path in the Rust builder + the Python oracle.
+
+
+def _tax_group(tax_id: str, rate: float, algo: int = 0,
+               add_rate: float = 0.0, ttype: int = 0) -> TaxGroupDef:
+    """Synthetic tax group fixture (frozen for reproducibility)."""
+    return TaxGroupDef(
+        fiscal_number=FN,
+        tax_id=tax_id,
+        name=f"Tax {tax_id}",
+        tax_rate=rate,
+        additional_rate=add_rate,
+        tax_type=ttype,
+        tax_algorithm=algo,
+        requires_uktzed=False,
+        requires_excise_mark=False,
+        is_active=True,
+    )
+
+
+# Two-group fixture: TX=1 → 20% VAT, TX=2 → 7% VAT.  Used by both
+# the extended SELL fixture (<TX> children in <E>) and as a stable
+# parity oracle for the Rust `derive_tax_summaries` helper.
+TAX_GROUPS_EXTENDED = {
+    "1": _tax_group("1", 20.0, algo=0),
+    "2": _tax_group("2", 7.0, algo=0),
+}
+
+
+def sell_extended_xml() -> str:
+    """SELL with the full W4-Z1 attribute set:
+
+      - 2 items, both with tax_group_1 (one 20% VAT, one 7% VAT)
+      - per-item barcode + UKTZED on the wine item
+      - per-item excise stamps on the wine item
+      - per-item discount on the bread item
+      - 1 EPZ card payment with full acquirer slip
+      - check-level discount
+      - header + footer text lines
+      - <TX> children in <E> via tax_groups
+    """
+    return build_dps_xml(
+        operation_type=OperationType.SELL,
+        fiscal_number=FN,
+        local_number=99,
+        business_ts=BUSINESS_TS,
+        payload={
+            "receipt": {
+                "header": "ТОВ Магазинчик\nм. Київ, вул. Дніпровська 33",
+                "footer": "Дякуємо за покупку!",
+                "goods": [
+                    {
+                        "code": "WINE-001",
+                        "name": "Вино червоне",
+                        "price": 25000,
+                        "quantity": 1000,
+                        "sum": 25000,
+                        "barcode": "4820012345678",
+                        "uktzed": "22042100",
+                        "tax_id": "1",
+                        "excise_barcodes": ["UA1234567890", "UA0987654321"],
+                    },
+                    {
+                        "code": "BREAD-1",
+                        "name": "Хліб",
+                        "price": 1200,
+                        "quantity": 1000,
+                        "sum": 1200,
+                        "tax_id": "2",
+                        "discounts": [
+                            {"type": "DISCOUNT", "mode": "VALUE",
+                             "value": 100, "name": "Промо"},
+                        ],
+                    },
+                ],
+                "discounts": [
+                    {"type": "DISCOUNT", "mode": "VALUE", "value": 200,
+                     "name": "Лояльність"},
+                ],
+                "payments": [
+                    {
+                        "type": "CASHLESS_1",
+                        "amount": 25900,
+                        "rrn": "RRN-000123456",
+                        "payment_system": "VISA",
+                        "bank_name": "ПриватБанк",
+                        "terminal": "T-123",
+                        "label": "OnlineLabel",
+                        "card_mask": "411111****1234",
+                        "auth_code": "AUTH-9876",
+                        "commission": 100,
+                    },
+                ],
+                "totals": {"total_sum": 26200},
+            },
+        },
+        tax_number=TN,
+        z_number=Z_NUMBER,
+        previous_hash=PREVIOUS_HASH,
+        tax_groups=TAX_GROUPS_EXTENDED,
+    )
+
+
+def z_report_extended_xml() -> str:
+    """Z_REPORT with TXS / IO / EPZ aggregations."""
+    return build_dps_xml(
+        operation_type=OperationType.Z_REPORT,
+        fiscal_number=FN,
+        local_number=100,
+        business_ts=BUSINESS_TS,
+        payload={
+            "z_report_data": {
+                "tax_sums": {
+                    "1": {"smi": 12000, "smo": 0},
+                    "2": {"smi": 700, "smo": 0},
+                },
+                "payment_sums": {
+                    "CASH": {"smi": 5000, "smo": 0},
+                    "CARD": {"smi": 7700, "smo": 0},
+                },
+                "service_sums": {
+                    "SERVICE_IN": {"smi": 1000, "smo": 0},
+                    "SERVICE_OUT": {"smi": 0, "smo": 500},
+                },
+                "check_count": {"ni": 17, "no": 2},
+                "epz_sums": {"epc": 3, "epcs": 2, "epsm": 7700},
+            },
+        },
+        tax_number=TN,
+        z_number=Z_NUMBER,
+        previous_hash=PREVIOUS_HASH,
+        tax_groups=TAX_GROUPS_EXTENDED,
+    )
+
+
 # ─── CMS deterministic prefix + prevhash seed ─────────────────────────
 
 
@@ -231,6 +378,9 @@ def main() -> int:
         (SCRIPT_DIR / "xml" / "sell.bin", sell_xml().encode("cp1251")),
         (SCRIPT_DIR / "xml" / "return.bin", return_xml().encode("cp1251")),
         (SCRIPT_DIR / "xml" / "z_report.bin", z_report_xml().encode("cp1251")),
+        # W4-Z1 piece 8 — extended-shape fixtures
+        (SCRIPT_DIR / "xml" / "sell_extended.bin", sell_extended_xml().encode("cp1251")),
+        (SCRIPT_DIR / "xml" / "z_report_extended.bin", z_report_extended_xml().encode("cp1251")),
         (SCRIPT_DIR / "cms" / "deterministic_prefix.bin", cms_deterministic_prefix()),
         (SCRIPT_DIR / "prevhash" / "seed.bin", prevhash_seed()),
     ]
