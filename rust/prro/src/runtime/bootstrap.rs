@@ -90,11 +90,23 @@ async fn seed_tax_groups(
     pool: &SqlitePool,
     fn_id: &str,
 ) -> Result<(), BootstrapError> {
+    // Audit Round-1 (2026-05-27): plain `INSERT OR IGNORE` left a row
+    // stranded when operator had soft-deleted a default earlier (PK
+    // (fn, tx_num) still occupied, INSERT silently skipped → operator
+    // had no way to restore via CLI).  Pattern now: ON CONFLICT
+    // reactivates the row IF it was soft-deleted (is_active=0), but
+    // leaves active rows ALONE so operator customisations (custom
+    // letter, custom rate) survive untouched.  Rate fields are NOT
+    // overwritten on reactivation — operator can `update-tax-rate`
+    // separately if they want to restore the default.
     for (tx_num, letter, dtpr, txpr, txal) in DEFAULT_TAX_GROUPS {
         sqlx::query(
-            "INSERT OR IGNORE INTO tax_groups \
+            "INSERT INTO tax_groups \
                 (fn, tx_num, letter, dtpr, txpr, txal, txty) \
-             VALUES (?, ?, ?, ?, ?, ?, 0)",
+             VALUES (?, ?, ?, ?, ?, ?, 0) \
+             ON CONFLICT(fn, tx_num) DO UPDATE \
+               SET is_active = 1 \
+               WHERE tax_groups.is_active = 0",
         )
         .bind(fn_id)
         .bind(*tx_num)
@@ -122,11 +134,16 @@ async fn seed_payment_methods(
     pool: &SqlitePool,
     fn_id: &str,
 ) -> Result<(), BootstrapError> {
+    // Same Audit Round-1 fix as `seed_tax_groups`: reactivate
+    // soft-deleted defaults; leave active rows untouched.
     for (pay_index, name, iscash) in DEFAULT_PAYMENT_METHODS {
         sqlx::query(
-            "INSERT OR IGNORE INTO payment_methods \
+            "INSERT INTO payment_methods \
                 (fn, pay_index, name, iscash) \
-             VALUES (?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(fn, pay_index) DO UPDATE \
+               SET is_active = 1 \
+               WHERE payment_methods.is_active = 0",
         )
         .bind(fn_id)
         .bind(*pay_index)

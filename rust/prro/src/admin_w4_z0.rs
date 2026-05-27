@@ -76,6 +76,9 @@ pub enum CfgAdminError {
     #[error("admin(w4-z0): payment_method not found: fn={0} pay_index={1}")]
     PaymentMethodNotFound(String, i64),
 
+    #[error("admin(w4-z0): invalid pay_index {0} (must be 1..=99; 0 would yield XML T=-1)")]
+    InvalidPayIndex(i64),
+
     #[error("admin(w4-z0): flag not found: fn={0} name={1}")]
     FlagNotFound(String, String),
 
@@ -124,6 +127,19 @@ async fn ensure_fn_in_config(
     Ok(())
 }
 
+/// Best-effort audit emission.  Audit Round-1 fix (2026-05-27):
+/// previous implementation returned `Infrastructure` error when
+/// `audit_log::append` failed, which caused the whole command to
+/// surface as a CLI failure AFTER the config mutation had already
+/// landed on `pool_secure`.  System state diverged from audit trail
+/// — operator saw "add-tax-group failed" but the row existed.
+///
+/// Mirror of W2 PR-B `admin::add_operator` `tracing::error!` fallback
+/// pattern for the cross-DB audit-failure branch.  The Critical info
+/// here is that the mutation already landed; audit-loss is an
+/// observability gap, not a functional failure.  Operator can
+/// reconcile via `prro admin list-*` (the row exists) — audit-trail
+/// gap is captured in process tracing logs for forensics.
 async fn audit_info(
     pool_main: &SqlitePool,
     domain: &str,
@@ -131,7 +147,7 @@ async fn audit_info(
     event_type: &str,
     payload_json: &str,
 ) -> Result<(), CfgAdminError> {
-    crate::db::repositories::audit_log::append(
+    if let Err(e) = crate::db::repositories::audit_log::append(
         pool_main,
         domain,
         fn_id,
@@ -141,7 +157,16 @@ async fn audit_info(
         Some(payload_json),
     )
     .await
-    .map_err(|e| CfgAdminError::Infrastructure(format!("audit append {event_type}: {e}")))?;
+    {
+        tracing::error!(
+            target: "prro::admin_w4_z0",
+            event_type = %event_type,
+            entity = %fn_id,
+            cause = %e,
+            "audit append FAILED post-mutation — config row already \
+             landed on pool_secure; audit trail missing for this event"
+        );
+    }
     Ok(())
 }
 
@@ -283,6 +308,12 @@ pub async fn add_payment_method(
     }
     if name.trim().is_empty() {
         return Err(CfgAdminError::EmptyArgument("name"));
+    }
+    // Audit Round-1 (2026-05-27): pay_index=0 → XML T="-1" semantic error.
+    // DB CHECK enforces it too; admin-layer rejection surfaces a typed
+    // error instead of generic Infrastructure(CHECK violation).
+    if !(1..=99).contains(&pay_index) {
+        return Err(CfgAdminError::InvalidPayIndex(pay_index));
     }
     ensure_fn_in_config(pool_main, fn_id).await?;
 
@@ -472,6 +503,47 @@ pub async fn add_driver_mapping(
     }
 }
 
+/// Update an existing driver-tax-mapping row's canonical_tx_num.
+/// Audit Round-1 fix (2026-05-27): admin previously exposed only
+/// add/remove/list, but since soft-delete leaves the (driver_id,
+/// driver_number) PK occupied, operator could not correct a bad
+/// mapping via add-after-remove.  This is the missing UPDATE path.
+pub async fn update_driver_mapping(
+    pool_main: &SqlitePool,
+    pool_secure: &SqlitePool,
+    driver_id: &str,
+    driver_number: i64,
+    canonical_tx_num: i64,
+) -> Result<(), CfgAdminError> {
+    if driver_id.trim().is_empty() {
+        return Err(CfgAdminError::EmptyArgument("driver-id"));
+    }
+    if !(1..=99).contains(&canonical_tx_num) {
+        return Err(CfgAdminError::Infrastructure(format!(
+            "canonical_tx_num {canonical_tx_num} out of range 1..=99"
+        )));
+    }
+
+    dtm_repo::update_canonical(pool_secure, driver_id, driver_number, canonical_tx_num)
+        .await
+        .map_err(|e| match e {
+            DriverTaxMappingRepoError::NotFound { driver_id, driver_number } => {
+                CfgAdminError::DriverMappingNotFound(driver_id, driver_number)
+            }
+            other => CfgAdminError::Infrastructure(format!(
+                "driver_tax_mapping::update_canonical: {other}"
+            )),
+        })?;
+
+    let payload = serde_json::json!({
+        "driver_id": driver_id,
+        "driver_number": driver_number,
+        "canonical_tx_num": canonical_tx_num,
+    })
+    .to_string();
+    audit_info(pool_main, "driver_mapping", driver_id, "ADMIN_DRIVER_MAPPING_UPDATED", &payload).await
+}
+
 pub async fn remove_driver_mapping(
     pool_main: &SqlitePool,
     pool_secure: &SqlitePool,
@@ -535,4 +607,34 @@ pub async fn show_outgress_profile(
         .await
         .map_err(|e| CfgAdminError::Infrastructure(format!("profile::get: {e}")))?
         .ok_or_else(|| CfgAdminError::OutgressProfileNotFound(fn_id.to_string()))
+}
+
+// ─── recovery: standalone bootstrap-defaults command ──────────────
+
+/// Audit Round-1 fix (2026-05-27): explicit operator-driven
+/// re-bootstrap of per-FN config defaults.  Use case: bootstrap
+/// failed during `add-operator` (e.g. transient secure.db lock) and
+/// the FN was registered without the 11 tax_groups + 4 payment_
+/// methods + outgress_profile + useecheckmegovua flag.  Operator
+/// invokes this to seed the missing rows.
+///
+/// Idempotency semantics inherit from `bootstrap_fn_defaults`:
+/// existing active rows are preserved; soft-deleted defaults are
+/// reactivated; no row data is overwritten.
+pub async fn bootstrap_defaults(
+    pool_main: &SqlitePool,
+    pool_secure: &SqlitePool,
+    fn_id: &str,
+) -> Result<(), CfgAdminError> {
+    if fn_id.trim().is_empty() {
+        return Err(CfgAdminError::EmptyArgument("fn"));
+    }
+    ensure_fn_in_config(pool_main, fn_id).await?;
+
+    crate::runtime::bootstrap::bootstrap_fn_defaults(pool_secure, fn_id)
+        .await
+        .map_err(|e| CfgAdminError::Infrastructure(format!("bootstrap_fn_defaults: {e}")))?;
+
+    let payload = serde_json::json!({ "fn": fn_id }).to_string();
+    audit_info(pool_main, "operator", fn_id, "ADMIN_FN_DEFAULTS_BOOTSTRAPPED", &payload).await
 }

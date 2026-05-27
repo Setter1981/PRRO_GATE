@@ -130,6 +130,127 @@ async fn remove_tax_group_soft_deletes() {
 
 // ─── payment_methods family ────────────────────────────────────────
 
+// Audit Round-1 (2026-05-27) regression tests
+// ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn add_payment_method_rejects_pay_index_zero() {
+    let (_md, pool_main) = fresh_main_pool().await;
+    let (_sd, pool_secure) = fresh_secure_pool().await;
+    seed_fn(&pool_main, "4000000001").await;
+
+    let err = cli::add_payment_method(&pool_main, &pool_secure, "4000000001", 0, "Bogus", false)
+        .await
+        .expect_err("must reject pay_index=0");
+    assert!(matches!(err, CfgAdminError::InvalidPayIndex(0)));
+}
+
+#[tokio::test]
+async fn add_payment_method_rejects_pay_index_out_of_range() {
+    let (_md, pool_main) = fresh_main_pool().await;
+    let (_sd, pool_secure) = fresh_secure_pool().await;
+    seed_fn(&pool_main, "4000000001").await;
+
+    let err = cli::add_payment_method(&pool_main, &pool_secure, "4000000001", 100, "Bogus", false)
+        .await
+        .expect_err("must reject pay_index=100");
+    assert!(matches!(err, CfgAdminError::InvalidPayIndex(100)));
+}
+
+#[tokio::test]
+async fn bootstrap_defaults_recovery_command_seeds_missing() {
+    let (_md, pool_main) = fresh_main_pool().await;
+    let (_sd, pool_secure) = fresh_secure_pool().await;
+    seed_fn(&pool_main, "4000000001").await;
+
+    // Simulate "stranded FN" — FN exists in fn_cfg but secure.db has no
+    // config rows for it (bootstrap failed during add-operator).
+    let tax_rows_before = cli::list_tax_groups(&pool_secure, "4000000001").await.unwrap();
+    assert!(tax_rows_before.is_empty());
+
+    cli::bootstrap_defaults(&pool_main, &pool_secure, "4000000001")
+        .await
+        .expect("recovery bootstrap");
+
+    let tax_rows = cli::list_tax_groups(&pool_secure, "4000000001").await.unwrap();
+    assert_eq!(tax_rows.len(), 11);
+    let pay_rows = cli::list_payment_methods(&pool_secure, "4000000001").await.unwrap();
+    assert_eq!(pay_rows.len(), 4);
+    assert_eq!(count_audit_events(&pool_main, "ADMIN_FN_DEFAULTS_BOOTSTRAPPED").await, 1);
+}
+
+#[tokio::test]
+async fn bootstrap_defaults_is_idempotent_when_already_seeded() {
+    let (_md, pool_main) = fresh_main_pool().await;
+    let (_sd, pool_secure) = fresh_secure_pool().await;
+    seed_fn(&pool_main, "4000000001").await;
+
+    cli::bootstrap_defaults(&pool_main, &pool_secure, "4000000001").await.unwrap();
+    cli::bootstrap_defaults(&pool_main, &pool_secure, "4000000001")
+        .await
+        .expect("second invocation must be safe");
+
+    let tax_rows = cli::list_tax_groups(&pool_secure, "4000000001").await.unwrap();
+    assert_eq!(tax_rows.len(), 11);
+}
+
+#[tokio::test]
+async fn update_driver_mapping_changes_canonical_tx_num() {
+    let (_md, pool_main) = fresh_main_pool().await;
+    let (_sd, pool_secure) = fresh_secure_pool().await;
+
+    cli::add_driver_mapping(&pool_main, &pool_secure, "eccelio", 5, 5, Some("ГА"))
+        .await
+        .unwrap();
+    cli::update_driver_mapping(&pool_main, &pool_secure, "eccelio", 5, 4)
+        .await
+        .expect("update");
+
+    let rows = cli::list_driver_mappings(&pool_secure, "eccelio").await.unwrap();
+    assert_eq!(rows[0].canonical_tx_num, 4);
+    assert_eq!(count_audit_events(&pool_main, "ADMIN_DRIVER_MAPPING_UPDATED").await, 1);
+}
+
+#[tokio::test]
+async fn update_driver_mapping_on_missing_returns_not_found() {
+    let (_md, pool_main) = fresh_main_pool().await;
+    let (_sd, pool_secure) = fresh_secure_pool().await;
+
+    let err = cli::update_driver_mapping(&pool_main, &pool_secure, "eccelio", 99, 4)
+        .await
+        .expect_err("must surface NotFound");
+    assert!(matches!(err, CfgAdminError::DriverMappingNotFound(_, 99)));
+}
+
+#[tokio::test]
+async fn audit_failure_does_not_block_mutation() {
+    // Mutation succeeds on pool_secure; if pool_main's audit_log is
+    // somehow broken (here: dropped before the call), the command
+    // returns Ok and logs the audit failure via tracing.  The
+    // config row IS visible.
+    let (_md, pool_main) = fresh_main_pool().await;
+    let (_sd, pool_secure) = fresh_secure_pool().await;
+    seed_fn(&pool_main, "4000000001").await;
+
+    // Drop the audit_log table to simulate audit DB transient breakage
+    sqlx::query("DROP TABLE audit_log")
+        .execute(&pool_main)
+        .await
+        .expect("drop audit_log");
+
+    // Mutation must still succeed (best-effort audit)
+    cli::add_tax_group(&pool_main, &pool_secure, "4000000001", 1, "А", 0.0, 20.0, 0)
+        .await
+        .expect("mutation succeeds even when audit cannot land");
+
+    let rows = cli::list_tax_groups(&pool_secure, "4000000001").await.unwrap();
+    assert_eq!(rows.len(), 1, "tax_group row landed despite audit failure");
+}
+
+// ───────────────────────────────────────────────
+// Original W4-Z0 piece 8 tests follow
+// ───────────────────────────────────────────────
+
 #[tokio::test]
 async fn add_payment_method_happy_path() {
     let (_md, pool_main) = fresh_main_pool().await;

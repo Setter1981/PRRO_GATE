@@ -84,7 +84,12 @@ CREATE UNIQUE INDEX idx_tax_groups_fn_letter
 -- ───────────────────────────────────────────────────────────────────
 CREATE TABLE payment_methods (
     fn         TEXT    NOT NULL,
-    pay_index  INTEGER NOT NULL CHECK (pay_index BETWEEN 0 AND 99),
+    -- pay_index BETWEEN 1 AND 99: 0 is intentionally rejected because the
+    -- XML `<M T=...>` value is derived as `pay_index - 1` (per
+    -- 2026-05-26-w4-z1-dps-xml-wire-shape spec §M element + WebCheck
+    -- StringXML.cs:1014).  A pay_index=0 would emit T="-1" which is
+    -- semantically invalid.  Audit Round-1 finding (2026-05-27).
+    pay_index  INTEGER NOT NULL CHECK (pay_index BETWEEN 1 AND 99),
     name       TEXT    NOT NULL,
     iscash     INTEGER NOT NULL DEFAULT 0 CHECK (iscash IN (0, 1)),
     is_active  INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),

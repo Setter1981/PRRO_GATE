@@ -169,6 +169,50 @@ async fn bootstrap_does_not_overwrite_operator_customised_tax_rate() {
     assert_eq!(rows.len(), 11);
 }
 
+/// Audit Round-1 (2026-05-27): plain INSERT OR IGNORE previously left
+/// soft-deleted defaults stranded.  New ON CONFLICT DO UPDATE
+/// reactivates them WITHOUT overwriting operator customisations on
+/// active rows.
+#[tokio::test]
+async fn bootstrap_reactivates_soft_deleted_default() {
+    let (_dir, pool) = fresh_secure_pool().await;
+
+    bootstrap_fn_defaults(&pool, "4000000001").await.unwrap();
+    // Operator soft-deletes the default tax_group А (tx_num=1)
+    tax_groups::soft_delete(&pool, "4000000001", 1).await.unwrap();
+    let active_count = tax_groups::list_active_for_fn(&pool, "4000000001").await.unwrap().len();
+    assert_eq!(active_count, 10, "А soft-deleted, 10 remain active");
+
+    // Re-running bootstrap reactivates the soft-deleted row.
+    bootstrap_fn_defaults(&pool, "4000000001")
+        .await
+        .expect("recovery via re-bootstrap");
+
+    let active = tax_groups::list_active_for_fn(&pool, "4000000001").await.unwrap();
+    assert_eq!(active.len(), 11, "soft-deleted default reactivated");
+    assert!(active.iter().any(|r| r.letter == "А"), "А present again");
+}
+
+/// The reactivation must NOT overwrite a customised rate on an
+/// already-active row.  Pin the no-overwrite guarantee.
+#[tokio::test]
+async fn bootstrap_reactivation_does_not_overwrite_active_customised_rate() {
+    let (_dir, pool) = fresh_secure_pool().await;
+
+    bootstrap_fn_defaults(&pool, "4000000001").await.unwrap();
+    // Operator customises А txpr 20→18 (hypothetical VAT change)
+    tax_groups::update_rates(&pool, "4000000001", 1, 0.0, 18.0, 0, 0)
+        .await
+        .unwrap();
+
+    bootstrap_fn_defaults(&pool, "4000000001")
+        .await
+        .expect("bootstrap re-run");
+
+    let row = tax_groups::find(&pool, "4000000001", 1).await.unwrap().unwrap();
+    assert_eq!(row.txpr, 18.0, "active customisation NOT overwritten by re-bootstrap");
+}
+
 #[tokio::test]
 async fn bootstrap_does_not_overwrite_existing_profile() {
     let (_dir, pool) = fresh_secure_pool().await;
