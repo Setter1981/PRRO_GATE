@@ -71,6 +71,8 @@ fn check_payload(local_number: u32) -> CheckPayload {
         }],
         total_sum: 1500,
         check_level_adjustments: Vec::new(),
+        header_lines: Vec::new(),
+        footer_lines: Vec::new(),
     }
 }
 

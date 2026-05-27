@@ -123,6 +123,15 @@ pub struct CheckPayload {
     /// check-level form.
     #[doc(hidden)] // field is pub but defaults to empty for back-compat
     pub check_level_adjustments: Vec<CheckLevelAdjustment>,
+
+    /// W4-Z1 piece 4 — Header text lines emitted as `<L N=... NM=...>`
+    /// BEFORE the first `<P>` item.  Per Python `dps_xml.py:172-178`.
+    pub header_lines: Vec<String>,
+
+    /// W4-Z1 piece 4 — Footer text lines emitted as `<L N=... NM=...>`
+    /// AFTER all payments + check-level adjustments, BEFORE closing
+    /// `<E>`.  Per Python `dps_xml.py:181-182, 311-313`.
+    pub footer_lines: Vec<String>,
 }
 
 /// Check-level discount or surcharge.  Distinct from per-item
@@ -164,6 +173,8 @@ impl Default for CheckPayload {
             payments: Vec::new(),
             total_sum: 0,
             check_level_adjustments: Vec::new(),
+            header_lines: Vec::new(),
+            footer_lines: Vec::new(),
         }
     }
 }
@@ -428,9 +439,17 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
     open_dat(out, h, &di);
     tag_attrs(out, "C", &[("T", c_type)]);
 
-    // Item numbering N is shared across <P> + <M>; Python increments
-    // a single `item_no` counter.  Mirror that.
+    // Item numbering N is shared across <L> + <P> + <D> + <S> + <M>;
+    // Python increments a single `item_no` counter.  Mirror that.
     let mut item_no: u32 = 1;
+
+    // W4-Z1 piece 4: header text lines BEFORE items (Python :172-178).
+    for line in &p.header_lines {
+        let n = item_no.to_string();
+        tag_attrs(out, "L", &[("N", &n), ("NM", line)]);
+        close(out, "L");
+        item_no += 1;
+    }
 
     for it in &p.items {
         let p_item_n = item_no;
@@ -590,6 +609,15 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
         }
         tag_attrs(out, "M", &m_attrs);
         close(out, "M");
+        item_no += 1;
+    }
+
+    // W4-Z1 piece 4: footer text lines AFTER payments + check-level
+    // adjustments, BEFORE closing <E> (Python :311-313).
+    for line in &p.footer_lines {
+        let n = item_no.to_string();
+        tag_attrs(out, "L", &[("N", &n), ("NM", line)]);
+        close(out, "L");
         item_no += 1;
     }
 
@@ -953,6 +981,8 @@ mod tests {
             payments: vec![one_cash_payment()],
             total_sum: 1500,
             check_level_adjustments: Vec::new(),
+            header_lines: Vec::new(),
+            footer_lines: Vec::new(),
         });
         let s = render_ascii(&doc);
         assert!(s.contains(r#"<C T="0">"#), "SELL must be C T=0");
@@ -983,6 +1013,8 @@ mod tests {
             payments: vec![one_cash_payment()],
             total_sum: 1500,
             check_level_adjustments: Vec::new(),
+            header_lines: Vec::new(),
+            footer_lines: Vec::new(),
         });
         let s = render_ascii(&doc);
         assert!(s.contains(r#"<C T="1">"#), "RETURN must be C T=1");
@@ -1090,6 +1122,8 @@ mod tests {
             payments: vec![one_cash_payment()],
             total_sum: 200,
             check_level_adjustments: Vec::new(),
+            header_lines: Vec::new(),
+            footer_lines: Vec::new(),
         });
         let s = render_ascii(&doc);
         let idx1 = s.find("CODE-1").expect("first item present");
@@ -1108,6 +1142,8 @@ mod tests {
             payments: vec![one_cash_payment()],
             total_sum: 1500,
             check_level_adjustments: Vec::new(),
+            header_lines: Vec::new(),
+            footer_lines: Vec::new(),
         });
         let a = build_canonical_xml(&doc).unwrap();
         let b = build_canonical_xml(&doc).unwrap();
@@ -1148,6 +1184,8 @@ mod tests {
             payments: vec![one_cash_payment()],
             total_sum: 100,
             check_level_adjustments: Vec::new(),
+            header_lines: Vec::new(),
+            footer_lines: Vec::new(),
         });
         let bytes = build_canonical_xml(&doc).expect("ukrainian must encode");
         // Find the cp1251 bytes for "Їжа" inside the wire output.

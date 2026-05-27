@@ -28,6 +28,7 @@ fn build_check_with_adjustments(
         }],
         total_sum: 1000,
         check_level_adjustments: adjustments,
+        ..Default::default()
     });
     let bytes = build_canonical_xml(&doc).expect("build");
     bytes.iter().map(|&b| b as char).collect()

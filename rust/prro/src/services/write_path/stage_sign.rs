@@ -853,5 +853,9 @@ fn check_payload_from(
         // empty; populated by piece 7 conversion-layer when DTO
         // carries check-level adjustments.
         check_level_adjustments: Vec::new(),
+        // W4-Z1 piece 4: header/footer text lines default empty;
+        // piece 7 conversion-layer populates from DTO raw_frames.
+        header_lines: Vec::new(),
+        footer_lines: Vec::new(),
     }
 }
