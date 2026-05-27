@@ -59,7 +59,7 @@ fn calc_tax_txpr_minus_100_yields_typed_error_not_panic() {
     // surface as typed error.
     let err = calc_tax(10000, -100.0, 0.0, 0)
         .expect_err("txpr=-100 must error, not panic");
-    assert!(matches!(err, CalcTaxError::RateNotFinite { .. }));
+    assert!(matches!(err, CalcTaxError::InvalidRate { .. }));
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn calc_tax_dtpr_minus_100_for_txal_2_yields_typed_error() {
     // intermediate Inf.
     let err = calc_tax(10000, 20.0, -100.0, 2)
         .expect_err("dtpr=-100 with TXAL=2 must error");
-    assert!(matches!(err, CalcTaxError::RateNotFinite { .. }));
+    assert!(matches!(err, CalcTaxError::InvalidRate { .. }));
 }
 
 #[test]
@@ -80,7 +80,9 @@ fn calc_tax_huge_finite_txpr_overflow_yields_typed_error() {
     // typed error rather than silent saturation or panic.
     let err = calc_tax(1_000_000_000, 1e300, 0.0, 0)
         .expect_err("huge txpr arithmetic overflow must error");
-    assert!(matches!(err, CalcTaxError::RateNotFinite { .. }));
+    // Post-AUDIT4 split: arithmetic overflow → IntermediateOverflow
+    // (rates were finite + non-negative, intermediate broke).
+    assert!(matches!(err, CalcTaxError::IntermediateOverflow { .. }));
 }
 
 // ─── AUDIT3-IMP-1 (A): zero-sum adjustment filter ─────────────────

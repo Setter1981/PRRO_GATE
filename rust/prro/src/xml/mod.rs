@@ -217,10 +217,19 @@ pub struct TaxGroupSummary {
 pub enum CalcTaxError {
     #[error("calc_tax: unsupported TXAL={0} (only 0/1/2 supported in pre-pilot scope)")]
     UnsupportedAlgorithm(i64),
-    /// AUDIT2-CRIT-1 defensive: corrupted config could feed NaN /
-    /// ±Inf rates.  Surface a typed error rather than silently
-    /// computing 0 (Python would raise; we match the fail-loud
-    /// posture).  Caller MUST audit_log + reject the doc.
+    /// AUDIT4-MIN-1 split — INPUT validation failure: rate is NaN
+    /// / ±Inf / negative.  Caller config is corrupted.
+    #[error("calc_tax: invalid input rate (txpr={txpr}, dtpr={dtpr})")]
+    InvalidRate { txpr: f64, dtpr: f64 },
+    /// AUDIT4-IMP-3 — Rates were valid (finite + non-negative) but
+    /// the intermediate computation overflowed to ±Inf or NaN.
+    /// Distinct from InvalidRate so piece-7 operator debugging
+    /// doesn't get misdirected to rate config.
+    #[error("calc_tax: arithmetic intermediate overflow (txpr={txpr}, dtpr={dtpr})")]
+    IntermediateOverflow { txpr: f64, dtpr: f64 },
+    /// Deprecated alias retained for transitional builds.  Prefer
+    /// InvalidRate or IntermediateOverflow.  Will be removed once
+    /// piece-7 caller switches to the split variants.
     #[error("calc_tax: rate not finite (txpr={txpr}, dtpr={dtpr})")]
     RateNotFinite { txpr: f64, dtpr: f64 },
 }
@@ -267,31 +276,22 @@ pub fn calc_tax(
         }
     }
 
-    // AUDIT2-CRIT-1 + AUDIT3-CRIT-1: INPUT validation.  Reject:
-    //   - NaN / ±Inf (would cascade through arithmetic).
-    //   - Negative (Python `:548-560` raises ZeroDivisionError when
-    //     `100 + (-100) = 0` enters denominator; Rust's `if txpr > 0`
-    //     guard pre-fix would silently zero — Python parity demands
-    //     a fail-loud surface).
-    // Variant name kept as RateNotFinite for ABI continuity; covers
-    // both not-finite and negative as "rate unsuitable for the
-    // formula".
+    // INPUT validation — AUDIT2-CRIT-1 + AUDIT3-CRIT-1 + AUDIT4-MIN-1.
+    // Reject NaN / ±Inf / negative rates as InvalidRate (corrupted
+    // config), distinct from intermediate-arithmetic failures.
     if !txpr.is_finite() || !dtpr.is_finite() || txpr < 0.0 || dtpr < 0.0 {
-        return Err(CalcTaxError::RateNotFinite { txpr, dtpr });
+        return Err(CalcTaxError::InvalidRate { txpr, dtpr });
     }
 
-    // AUDIT3-CRIT-1: post-arithmetic finite check.  Round-2 input
-    // guard does NOT protect against finite inputs that produce
-    // non-finite INTERMEDIATES:
-    //   - txpr=-100  → 100+txpr=0   → div-by-zero → ±Inf
-    //   - dtpr=-100  → 100+dtpr=0   → div-by-zero (TXAL=2)
-    //   - txpr=1e300 → g*txpr → Inf (overflow on multiplication)
-    // Without this guard, Inf reaches round_half_to_even and the
-    // banker's-half branch saturates `as i64 = i64::MAX`, then
-    // `MAX + 1` overflow-panics in debug.
+    // AUDIT3-CRIT-1 + AUDIT4-IMP-3: post-arithmetic finite check.
+    // Rates can be valid yet produce non-finite intermediates:
+    //   - txpr=1e300 → g*txpr → Inf (multiplication overflow)
+    // Surface as IntermediateOverflow (NOT InvalidRate) so the
+    // operator-facing error message accurately points at the
+    // arithmetic rather than the config.
     let safe_round = |x: f64| -> Result<i64, CalcTaxError> {
         if !x.is_finite() {
-            Err(CalcTaxError::RateNotFinite { txpr, dtpr })
+            Err(CalcTaxError::IntermediateOverflow { txpr, dtpr })
         } else {
             Ok(round_half_to_even(x))
         }
@@ -698,6 +698,14 @@ pub enum CanonicalDoc {
 pub enum XmlBuildError {
     #[error("cp1251: cannot encode character {0:?} (U+{1:04X}) in payload field")]
     Cp1251Unmappable(char, u32),
+    /// AUDIT4-IMP-4 — `CheckLevelAdjustment.applies_to_item_ns`
+    /// override referenced an N value that does not correspond to
+    /// any emitted `<P>` element.  Pre-fix would emit `<NI NI="X">`
+    /// dangling reference and DPS would reject.  Caller MUST
+    /// validate the subset against the actual items vector before
+    /// passing to the builder.
+    #[error("check-level adjustment refers to N={referenced_n} but only items {tracked:?} were emitted")]
+    OrphanCheckLevelNi { referenced_n: u32, tracked: Vec<u32> },
 }
 
 /// Build the canonical wire XML for a `CanonicalDoc`.  Output is a
@@ -706,8 +714,8 @@ pub fn build_canonical_xml(doc: &CanonicalDoc) -> Result<Vec<u8>, XmlBuildError>
     let mut out = String::new();
     match doc {
         CanonicalDoc::ShiftOpen(p) => emit_shift_open(p, &mut out),
-        CanonicalDoc::Sell(p) => emit_check(p, "0", &mut out),
-        CanonicalDoc::Return(p) => emit_check(p, "1", &mut out),
+        CanonicalDoc::Sell(p) => emit_check(p, "0", &mut out)?,
+        CanonicalDoc::Return(p) => emit_check(p, "1", &mut out)?,
         CanonicalDoc::ZReport(p) => emit_z_report(p, &mut out),
     }
     cp1251::encode(&out)
@@ -732,7 +740,11 @@ fn emit_shift_open(p: &ShiftOpenPayload, out: &mut String) {
     close(out, "RQ");
 }
 
-fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
+fn emit_check(
+    p: &CheckPayload,
+    c_type: &str,
+    out: &mut String,
+) -> Result<(), XmlBuildError> {
     let h = &p.header;
     open_rq(out, h);
     let di = p.local_number.to_string();
@@ -825,11 +837,17 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
         // counter increments INLINE — the D's N attr is one more
         // than the parent P's N.
         //
-        // AUDIT3-IMP-1 (A) — Python `:220-222 if d_value == 0:
-        // continue`: zero-sum adj skipped BEFORE emit + BEFORE
-        // counter increment.  Mirror exactly.
+        // AUDIT3-IMP-1 (A) + AUDIT4-IMP-2 — Python `:220` reads
+        // `d_value` and skips on `d_value == 0`.  For PERCENT mode
+        // `d_value` is the RATE (not the resolved sum), so a free
+        // gift (item.sum=0) with 10% disc → Python emits
+        // `<D SM="0" PR="10.00">`.  Rust mirrors:
+        //   - VALUE mode: skip when `adj.sum == 0`.
+        //   - PERCENT mode: skip only when the rate string parses
+        //     to 0.0 (or is absent).  Resolved zero-sum from a
+        //     non-zero rate is NOT skipped.
         for adj in &it.adjustments {
-            if adj.sum == 0 {
+            if adjustment_is_zero(adj.mode, adj.sum, adj.percent.as_deref()) {
                 continue;
             }
             let tag_name = match adj.kind {
@@ -862,8 +880,30 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
     // (POS-precomputed real-world case, e.g. "discount only on
     // alcohol items").
     for cla in &p.check_level_adjustments {
-        if cla.sum == 0 {
+        // AUDIT4-IMP-2: percent-mode parity (see per-item branch).
+        if adjustment_is_zero(cla.mode, cla.sum, cla.percent.as_deref()) {
             continue;
+        }
+        // AUDIT4-IMP-1 — Python `:249 if check_discounts and
+        // p_item_numbers:` skips ENTIRE check-level block when no
+        // items.  Auto-fill source is empty → would emit orphan
+        // `<D TR="1">` w/o `<NI>` children → DPS reject.  Skip.
+        let auto_fill = cla.applies_to_item_ns.is_empty();
+        if auto_fill && p_item_numbers.is_empty() {
+            continue;
+        }
+        // AUDIT4-IMP-4 — override validation: every N in
+        // applies_to_item_ns must reference a tracked p_item_number.
+        // Surface as typed error rather than emit orphan `<NI>`.
+        if !auto_fill {
+            for &n in &cla.applies_to_item_ns {
+                if !p_item_numbers.contains(&n) {
+                    return Err(XmlBuildError::OrphanCheckLevelNi {
+                        referenced_n: n,
+                        tracked: p_item_numbers.clone(),
+                    });
+                }
+            }
         }
         let self_n = item_no;
         let self_n_str = self_n.to_string();
@@ -1026,6 +1066,27 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
     close(out, "DAT");
     tag_text(out, "MAC", &h.previous_hash);
     close(out, "RQ");
+    Ok(())
+}
+
+/// AUDIT4-IMP-2 helper — replicates Python `:220` zero-skip
+/// semantics across both per-item LineAdjustment and check-level
+/// CheckLevelAdjustment.  Python skips on `d_value == 0` where
+/// d_value is the SOURCE rate (for percent mode) or value (for
+/// value mode).  Rust must mirror:
+///
+///   - VALUE mode: skip when resolved sum is 0.
+///   - PERCENT mode: skip only when the rate STRING parses to
+///     0.0 (or is absent).  A non-zero rate producing a zero
+///     resolved sum (free gift + 10%) MUST emit, per Python.
+fn adjustment_is_zero(mode: AdjustmentMode, sum: i64, percent: Option<&str>) -> bool {
+    match mode {
+        AdjustmentMode::Value => sum == 0,
+        AdjustmentMode::Percent => percent
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .map(|r| r == 0.0)
+            .unwrap_or(true),
+    }
 }
 
 fn emit_z_report(p: &ZReportPayload, out: &mut String) {
