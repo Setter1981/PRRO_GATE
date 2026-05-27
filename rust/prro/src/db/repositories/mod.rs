@@ -4,6 +4,7 @@ pub mod driver_tax_mapping;
 pub mod fiscal_documents;
 pub mod fiscal_number_config;
 pub mod fn_integration_flags;
+pub mod fn_outgress_profile;
 pub mod ingress_inbox;
 pub mod node_state;
 pub mod offline_sessions;
