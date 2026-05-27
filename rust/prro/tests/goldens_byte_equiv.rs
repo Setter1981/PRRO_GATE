@@ -19,9 +19,14 @@
 
 use std::path::{Path, PathBuf};
 
+use std::collections::HashMap;
+
+use prro::services::write_path::tax_summary::{derive_tax_summaries, ResolvedTaxGroup};
 use prro::xml::{
-    build_canonical_xml, CanonicalDoc, CheckItem, CheckPayload, CheckPayment, DocumentHeader,
-    ShiftOpenPayload, ZReportCheckCount, ZReportPayload, ZReportPaymentSum,
+    build_canonical_xml, AdjustmentMode, CanonicalDoc, CheckItem, CheckLevelAdjustment,
+    CheckLevelAdjustmentKind, CheckPayload, CheckPayment, DocumentHeader, LineAdjustment,
+    LineAdjustmentKind, ShiftOpenPayload, ZReportCheckCount, ZReportEpzTotals, ZReportPayload,
+    ZReportPaymentSum, ZReportServiceSum, ZReportTaxSummary,
 };
 
 // ─── Fixture-payload mirrors of regenerate.py ────────────────────────
@@ -102,6 +107,183 @@ fn z_report_doc() -> CanonicalDoc {
             return_count: 2,
         },
         epz: None,
+    })
+}
+
+// ─── W4-Z1 piece 8 — extended-shape fixture builders ─────────────────
+//
+// Match regenerate.py extended payloads exactly.  Bytes are pinned
+// in goldens/xml/sell_extended.bin + z_report_extended.bin via the
+// Python oracle (TAX_GROUPS_EXTENDED = {1: 20% VAT, 2: 7% VAT}).
+
+fn extended_tax_groups() -> HashMap<i64, ResolvedTaxGroup> {
+    let mut m = HashMap::new();
+    m.insert(
+        1_i64,
+        ResolvedTaxGroup { tx: 1, txpr: 20.0, dtpr: 0.0, txal: 0, txty: 0 },
+    );
+    m.insert(
+        2_i64,
+        ResolvedTaxGroup { tx: 2, txpr: 7.0, dtpr: 0.0, txal: 0, txty: 0 },
+    );
+    m
+}
+
+fn sell_extended_doc() -> CanonicalDoc {
+    let items = vec![
+        CheckItem {
+            code: "WINE-001".into(),
+            name: "Вино червоне".into(),
+            price: 25000,
+            quantity: 1000,
+            sum: 25000,
+            barcode: Some("4820012345678".into()),
+            uktzed: Some("22042100".into()),
+            tax_group_1: Some(1),
+            tax_group_2: None,
+            excise_stamps: vec!["UA1234567890".into(), "UA0987654321".into()],
+            adjustments: vec![],
+        },
+        CheckItem {
+            code: "BREAD-1".into(),
+            name: "Хліб".into(),
+            price: 1200,
+            quantity: 1000,
+            sum: 1200,
+            barcode: None,
+            uktzed: None,
+            tax_group_1: Some(2),
+            tax_group_2: None,
+            excise_stamps: vec![],
+            adjustments: vec![LineAdjustment {
+                kind: LineAdjustmentKind::Discount,
+                sum: 100,
+                mode: AdjustmentMode::Value,
+                percent: None,
+                name: Some("Промо".into()),
+                privilege: None,
+                tax_code: None,
+            }],
+        },
+    ];
+    let tax_groups = extended_tax_groups();
+    let tax_summaries =
+        derive_tax_summaries(&items, &tax_groups).expect("derive tax summaries");
+
+    CanonicalDoc::Sell(CheckPayload {
+        header: fixture_header(),
+        local_number: 99,
+        items,
+        payments: vec![CheckPayment {
+            name: "CASHLESS_1".into(),
+            sum: 25900,
+            type_code: "2".into(),
+            pa: Some("ПриватБанк".into()),
+            pb: Some("T-123".into()),
+            pc: Some("OnlineLabel".into()),
+            pd: Some("411111****1234".into()),
+            pe: Some("AUTH-9876".into()),
+            pf: Some(100),
+            psnm: Some("VISA".into()),
+            rrn: Some("RRN-000123456".into()),
+            rm: None,
+            smp: None,
+        }],
+        total_sum: 26200,
+        check_level_adjustments: vec![CheckLevelAdjustment {
+            kind: CheckLevelAdjustmentKind::Discount,
+            sum: 200,
+            mode: AdjustmentMode::Value,
+            percent: None,
+            name: Some("Лояльність".into()),
+            applies_to_item_ns: vec![],
+        }],
+        header_lines: vec![
+            "ТОВ Магазинчик".into(),
+            "м. Київ, вул. Дніпровська 33".into(),
+        ],
+        footer_lines: vec!["Дякуємо за покупку!".into()],
+        tax_summaries,
+    })
+}
+
+fn z_report_extended_doc() -> CanonicalDoc {
+    // Python `_build_z_report:438-456`: TXS full form when tax_groups
+    // lookup hits, with TXI/TXO precomputed via _calc_tax(smi/smo).
+    let groups = extended_tax_groups();
+    let tx1 = &groups[&1_i64];
+    let tx2 = &groups[&2_i64];
+    let (txi1, _) =
+        prro::xml::calc_tax(12000, tx1.txpr, tx1.dtpr, tx1.txal).expect("tx1 calc");
+    let (txi2, _) =
+        prro::xml::calc_tax(700, tx2.txpr, tx2.dtpr, tx2.txal).expect("tx2 calc");
+
+    CanonicalDoc::ZReport(ZReportPayload {
+        header: fixture_header(),
+        local_number: 100,
+        tax_summaries: vec![
+            ZReportTaxSummary {
+                tx: 1,
+                tx_short_form: false,
+                txpr: format!("{:.2}", tx1.txpr),
+                txal: tx1.txal,
+                txty: tx1.txty,
+                dtpr: format!("{:.2}", tx1.dtpr),
+                smi: 12000,
+                smo: 0,
+                txi: txi1,
+                txo: 0,
+                ts_prefix: "20260506".into(),
+            },
+            ZReportTaxSummary {
+                tx: 2,
+                tx_short_form: false,
+                txpr: format!("{:.2}", tx2.txpr),
+                txal: tx2.txal,
+                txty: tx2.txty,
+                dtpr: format!("{:.2}", tx2.dtpr),
+                smi: 700,
+                smo: 0,
+                txi: txi2,
+                txo: 0,
+                ts_prefix: "20260506".into(),
+            },
+        ],
+        payments: vec![
+            ZReportPaymentSum {
+                name: "CARD".into(),
+                sum_in: 7700,
+                sum_out: 0,
+                type_code: "2".into(),
+            },
+            ZReportPaymentSum {
+                name: "CASH".into(),
+                sum_in: 5000,
+                sum_out: 0,
+                type_code: "0".into(),
+            },
+        ],
+        service_sums: vec![
+            ZReportServiceSum {
+                name: "SERVICE_IN".into(),
+                sum_in: 1000,
+                sum_out: 0,
+            },
+            ZReportServiceSum {
+                name: "SERVICE_OUT".into(),
+                sum_in: 0,
+                sum_out: 500,
+            },
+        ],
+        check_count: ZReportCheckCount {
+            sell_count: 17,
+            return_count: 2,
+        },
+        epz: Some(ZReportEpzTotals {
+            epc: 3,
+            epcs: 2,
+            epsm: 7700,
+        }),
     })
 }
 
@@ -227,6 +409,23 @@ fn xml_return_byte_equivalent() {
 #[test]
 fn xml_z_report_byte_equivalent_doubles_as_close_shift() {
     assert_xml_golden("xml/z_report.bin", &z_report_doc());
+}
+
+// ─── W4-Z1 piece 8 — extended-shape byte equivalence ─────────────────
+
+/// Full ФСКО Table 23 coverage: 2 items with barcode/UKTZED/excise/
+/// per-item disc, EPZ payment with full acquirer slip, check-level
+/// disc, header+footer L, <TX> children in <E>.
+#[test]
+fn xml_sell_extended_byte_equivalent() {
+    assert_xml_golden("xml/sell_extended.bin", &sell_extended_doc());
+}
+
+/// Z-report with <TXS> full form, <M> per-payment, <IO> service
+/// in/out, <NC> counts, <EPZ> totals.
+#[test]
+fn xml_z_report_extended_byte_equivalent() {
+    assert_xml_golden("xml/z_report_extended.bin", &z_report_extended_doc());
 }
 
 // ─── CMS deterministic prefix ────────────────────────────────────────
