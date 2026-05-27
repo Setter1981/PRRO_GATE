@@ -45,6 +45,38 @@ use thiserror::Error;
 pub enum BootstrapError {
     #[error("database error during bootstrap: {0}")]
     Db(#[from] sqlx::Error),
+
+    /// Audit Round-3 (2026-05-27): per-row partial failure within
+    /// the bootstrap loop.  Round-2 fix made each row's failure
+    /// non-fatal (tracing::warn! + continue), but the original
+    /// implementation also returned Ok unconditionally — which
+    /// SWALLOWED partial failures from `add_operator`'s audit
+    /// emission.  Now we aggregate row failures here so the caller
+    /// (`add_operator`) sees an `Err` and emits the Critical
+    /// `ADMIN_FN_DEFAULTS_BOOTSTRAP_FAILED` audit row while
+    /// continuing with operator registration.
+    #[error("bootstrap partial failure: {count} row(s) failed; first = {first_summary}")]
+    PartialFailure {
+        count: usize,
+        first_summary: String,
+        failures: Vec<RowFailure>,
+    },
+}
+
+/// Per-row failure context for `BootstrapError::PartialFailure`.
+/// Carried up to `add_operator` so the audit_log payload can name
+/// the exact (table, identifier, cause) triple for forensic recovery.
+#[derive(Debug, Clone)]
+pub struct RowFailure {
+    pub table: &'static str, // "tax_groups" / "payment_methods" / "fn_outgress_profile" / "fn_integration_flags"
+    pub identifier: String,  // human-readable row identifier (tx_num=1 letter=А, pay_index=2 name=Visa, etc.)
+    pub cause: String,       // sqlx error message
+}
+
+impl RowFailure {
+    fn summary(&self) -> String {
+        format!("{}({}): {}", self.table, self.identifier, self.cause)
+    }
 }
 
 /// Seed per-FN config defaults if not already present.  Idempotent
@@ -62,10 +94,26 @@ pub async fn bootstrap_fn_defaults(
     pool_secure: &SqlitePool,
     fn_id: &str,
 ) -> Result<(), BootstrapError> {
-    seed_tax_groups(pool_secure, fn_id).await?;
-    seed_payment_methods(pool_secure, fn_id).await?;
-    seed_outgress_profile(pool_secure, fn_id).await?;
-    seed_integration_flags(pool_secure, fn_id).await?;
+    // Audit Round-3 (2026-05-27): each seed_* function returns its
+    // per-row failures (typed `Vec<RowFailure>`).  We aggregate them
+    // across the 4 seed functions and surface as a single
+    // `BootstrapError::PartialFailure` so the caller's audit
+    // emission fires for ANY partial failure (was previously
+    // swallowed by per-row try/log/continue inside each seed_*).
+    let mut failures: Vec<RowFailure> = Vec::new();
+    failures.extend(seed_tax_groups(pool_secure, fn_id).await?);
+    failures.extend(seed_payment_methods(pool_secure, fn_id).await?);
+    failures.extend(seed_outgress_profile(pool_secure, fn_id).await?);
+    failures.extend(seed_integration_flags(pool_secure, fn_id).await?);
+
+    if !failures.is_empty() {
+        let first_summary = failures[0].summary();
+        return Err(BootstrapError::PartialFailure {
+            count: failures.len(),
+            first_summary,
+            failures,
+        });
+    }
     Ok(())
 }
 
@@ -89,28 +137,12 @@ const DEFAULT_TAX_GROUPS: &[(i64, &str, f64, f64, i64)] = &[
 async fn seed_tax_groups(
     pool: &SqlitePool,
     fn_id: &str,
-) -> Result<(), BootstrapError> {
-    // Audit Round-1 (2026-05-27): plain `INSERT OR IGNORE` left a row
-    // stranded when operator had soft-deleted a default earlier (PK
-    // (fn, tx_num) still occupied, INSERT silently skipped → operator
-    // had no way to restore via CLI).  Pattern now: ON CONFLICT
-    // reactivates the row IF it was soft-deleted (is_active=0), but
-    // leaves active rows ALONE so operator customisations (custom
-    // letter, custom rate) survive untouched.  Rate fields are NOT
-    // overwritten on reactivation — operator can `update-tax-rate`
-    // separately if they want to restore the default.
-    //
-    // Audit Round-2 (2026-05-27): per-row try/log/continue.  If an
-    // operator soft-deleted a default (e.g. tx_num=1 letter=А) AND
-    // reassigned letter "А" to a custom tx_num=50, the reactivation
-    // of tx_num=1 violates the partial unique idx on (fn, letter)
-    // WHERE is_active=1.  Previously this `?` aborted the WHOLE
-    // bootstrap loop, stranding the FN without the remaining 10
-    // defaults / 4 payments / profile / flag.  Now: log the
-    // collision via tracing::warn!, audit downstream via
-    // ADMIN_FN_DEFAULTS_BOOTSTRAP_FAILED (caller emits), continue
-    // with the rest.  Operator can resolve the letter conflict
-    // manually via `prro admin update-tax-rate` afterward.
+) -> Result<Vec<RowFailure>, BootstrapError> {
+    // Audit Round-1..3 (2026-05-27): ON CONFLICT DO UPDATE
+    // reactivates soft-deleted defaults; per-row failures are
+    // collected (not aborted, not swallowed); aggregated at
+    // `bootstrap_fn_defaults` for the caller's audit emission.
+    let mut failures = Vec::new();
     for (tx_num, letter, dtpr, txpr, txal) in DEFAULT_TAX_GROUPS {
         let result = sqlx::query(
             "INSERT INTO tax_groups \
@@ -139,9 +171,14 @@ async fn seed_tax_groups(
                 "tax_group seed row failed (likely letter-collision via prior operator \
                  customisation) — continuing with remaining defaults"
             );
+            failures.push(RowFailure {
+                table: "tax_groups",
+                identifier: format!("tx_num={} letter={}", tx_num, letter),
+                cause: e.to_string(),
+            });
         }
     }
-    Ok(())
+    Ok(failures)
 }
 
 /// WebCheck-derived payment defaults per `CreateDB.cs:459`.
@@ -157,14 +194,8 @@ const DEFAULT_PAYMENT_METHODS: &[(i64, &str, bool)] = &[
 async fn seed_payment_methods(
     pool: &SqlitePool,
     fn_id: &str,
-) -> Result<(), BootstrapError> {
-    // Same Audit Round-1 fix as `seed_tax_groups`: reactivate
-    // soft-deleted defaults; leave active rows untouched.
-    //
-    // Audit Round-2 (2026-05-27): per-row try/log/continue — partial
-    // unique idx on (fn, name) collides if operator re-used the
-    // default name on a different pay_index.  Don't abort the whole
-    // loop on one collision.
+) -> Result<Vec<RowFailure>, BootstrapError> {
+    let mut failures = Vec::new();
     for (pay_index, name, iscash) in DEFAULT_PAYMENT_METHODS {
         let result = sqlx::query(
             "INSERT INTO payment_methods \
@@ -191,37 +222,70 @@ async fn seed_payment_methods(
                 "payment_method seed row failed (likely name-collision via prior \
                  operator customisation) — continuing with remaining defaults"
             );
+            failures.push(RowFailure {
+                table: "payment_methods",
+                identifier: format!("pay_index={} name={}", pay_index, name),
+                cause: e.to_string(),
+            });
         }
     }
-    Ok(())
+    Ok(failures)
 }
 
 async fn seed_outgress_profile(
     pool: &SqlitePool,
     fn_id: &str,
-) -> Result<(), BootstrapError> {
+) -> Result<Vec<RowFailure>, BootstrapError> {
     // INSERT OR IGNORE — preserves any operator-set EVPZ_DPS choice
     // made before the first cashier was registered.
-    sqlx::query(
+    let result = sqlx::query(
         "INSERT OR IGNORE INTO fn_outgress_profile (fn, profile) VALUES (?, 'FSCO_ZZD')",
     )
     .bind(fn_id)
     .execute(pool)
-    .await?;
-    Ok(())
+    .await;
+    let mut failures = Vec::new();
+    if let Err(e) = result {
+        tracing::warn!(
+            target: "prro::runtime::bootstrap",
+            fn_id = %fn_id,
+            cause = %e,
+            "fn_outgress_profile seed failed — continuing with remaining defaults"
+        );
+        failures.push(RowFailure {
+            table: "fn_outgress_profile",
+            identifier: "profile=FSCO_ZZD".to_string(),
+            cause: e.to_string(),
+        });
+    }
+    Ok(failures)
 }
 
 async fn seed_integration_flags(
     pool: &SqlitePool,
     fn_id: &str,
-) -> Result<(), BootstrapError> {
+) -> Result<Vec<RowFailure>, BootstrapError> {
     // Per WebCheck UI: Національний чек integration off by default.
-    sqlx::query(
+    let result = sqlx::query(
         "INSERT OR IGNORE INTO fn_integration_flags (fn, flag_name, flag_value) \
          VALUES (?, 'useecheckmegovua', '0')",
     )
     .bind(fn_id)
     .execute(pool)
-    .await?;
-    Ok(())
+    .await;
+    let mut failures = Vec::new();
+    if let Err(e) = result {
+        tracing::warn!(
+            target: "prro::runtime::bootstrap",
+            fn_id = %fn_id,
+            cause = %e,
+            "fn_integration_flags useecheckmegovua seed failed — continuing"
+        );
+        failures.push(RowFailure {
+            table: "fn_integration_flags",
+            identifier: "flag_name=useecheckmegovua".to_string(),
+            cause: e.to_string(),
+        });
+    }
+    Ok(failures)
 }

@@ -141,14 +141,13 @@ pub enum ParseError {
 
 #[derive(Debug, Error)]
 pub enum OutgressError {
-    /// Selected `OutgressProfile` has no shipped impl quartet.
-    /// In pilot this fires whenever an FN's `fn_outgress_profile`
-    /// row is `EVPZ_DPS` — operator's choice is preserved at the
-    /// admin/DB layer but the supervisor refuses to dispatch
-    /// until W4-Y series lands real impls.
-    #[error("outgress profile {profile:?} has no shipped impl quartet (pilot=FSCO_ZZD only)")]
-    ProfileNotImplemented { profile: OutgressProfile },
-
+    // Audit Round-3 (2026-05-27): `ProfileNotImplemented` variant
+    // removed — Round-2 unwound the hardcoded EvpzDps early-exit, so
+    // the variant became dead code.  EVPZ profile's `Unimplemented`
+    // surfaces via the trait chain as `OutgressError::Build`
+    // (or `Sign`/`Transport`/`Parse` for the corresponding layer)
+    // with a per-error-class message body identifying which trait
+    // has no shipped impl yet.
     #[error("build: {0}")]
     Build(#[from] BuildError),
     #[error("sign: {0}")]

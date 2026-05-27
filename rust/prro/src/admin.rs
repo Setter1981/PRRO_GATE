@@ -616,12 +616,38 @@ pub async fn add_operator(
                      forensic trail recorded; operator must seed config \
                      defaults manually via per-table admin commands"
                 );
-                let bootstrap_failed_payload = serde_json::json!({
-                    "fiscal_number": input.fiscal_number,
-                    "operator_id": input.operator_id,
-                    "reason": format!("BootstrapError: {e}"),
-                })
-                .to_string();
+                // Audit Round-3 (2026-05-27): if the bootstrap surface
+                // produced a typed `PartialFailure`, unroll the per-row
+                // failure details into the audit payload so operators
+                // can grep the exact (table, identifier, cause) triples
+                // for forensic recovery — not just "BootstrapError: ...".
+                let bootstrap_failed_payload = match &e {
+                    crate::runtime::bootstrap::BootstrapError::PartialFailure {
+                        count,
+                        failures,
+                        ..
+                    } => serde_json::json!({
+                        "fiscal_number": input.fiscal_number,
+                        "operator_id": input.operator_id,
+                        "reason": "BootstrapError::PartialFailure",
+                        "failed_row_count": count,
+                        "failed_rows": failures
+                            .iter()
+                            .map(|f| serde_json::json!({
+                                "table": f.table,
+                                "identifier": f.identifier,
+                                "cause": f.cause,
+                            }))
+                            .collect::<Vec<_>>(),
+                    })
+                    .to_string(),
+                    other => serde_json::json!({
+                        "fiscal_number": input.fiscal_number,
+                        "operator_id": input.operator_id,
+                        "reason": format!("BootstrapError: {other}"),
+                    })
+                    .to_string(),
+                };
                 // Audit-append failure here is best-effort too —
                 // if even THIS audit can't land, log to tracing and
                 // continue (the operator row is the primary

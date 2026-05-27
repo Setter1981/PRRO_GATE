@@ -192,10 +192,16 @@ prro admin list-flags      --fn FN
 ### 3.4 Driver mapping
 
 ```
-prro admin add-driver-mapping --driver-id maria304 --driver-number 1 --canonical 1 [--letter А]
+prro admin add-driver-mapping    --driver-id maria304 --driver-number 1 --canonical 1 [--letter А]
+prro admin update-driver-mapping --driver-id maria304 --driver-number 1 --canonical 4
 prro admin remove-driver-mapping --driver-id maria304 --driver-number 1
-prro admin list-driver-mappings [--driver-id maria304]
+prro admin list-driver-mappings  --driver-id maria304
 ```
+
+`update-driver-mapping` exists because soft-delete leaves the PK
+`(driver_id, driver_number)` occupied — operator cannot re-add the
+same pair via `add-driver-mapping` after `remove-driver-mapping`.
+Audit Round-1 (2026-05-27) finding added this command.
 
 ### 3.5 Outgress profile
 

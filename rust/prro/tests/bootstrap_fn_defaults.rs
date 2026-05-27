@@ -193,6 +193,77 @@ async fn bootstrap_reactivates_soft_deleted_default() {
     assert!(active.iter().any(|r| r.letter == "А"), "А present again");
 }
 
+/// Audit Round-3 (2026-05-27): partial failures (per-row collisions)
+/// surface as typed `BootstrapError::PartialFailure` carrying the
+/// per-row failure details.  Caller's audit emission can serialise
+/// the full forensic trail.
+#[tokio::test]
+async fn bootstrap_partial_failure_surfaces_row_details() {
+    let (_dir, pool) = fresh_secure_pool().await;
+
+    // Pre-seed default А (tx_num=1) — operator soft-deletes it, then
+    // claims letter А at a different tx_num=50 (custom).  Now the
+    // re-bootstrap attempt to reactivate tx_num=1 will collide with
+    // the partial unique idx (fn, letter) on the active row tx_num=50.
+    tax_groups::insert(
+        &pool,
+        &tax_groups::NewTaxGroup {
+            fn_id: "4000000001".to_string(),
+            tx_num: 1,
+            letter: "А".to_string(),
+            dtpr: 0.0,
+            txpr: 20.0,
+            txal: 0,
+            txty: 0,
+        },
+    )
+    .await
+    .unwrap();
+    tax_groups::soft_delete(&pool, "4000000001", 1).await.unwrap();
+    tax_groups::insert(
+        &pool,
+        &tax_groups::NewTaxGroup {
+            fn_id: "4000000001".to_string(),
+            tx_num: 50,
+            letter: "А".to_string(),
+            dtpr: 0.0,
+            txpr: 18.0,
+            txal: 0,
+            txty: 0,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Re-bootstrap.  The tx_num=1 reactivation MUST collide with the
+    // active tx_num=50 active row holding the same letter.  Per-row
+    // continue means OTHER defaults still seed, but the typed error
+    // surfaces.
+    let err = bootstrap_fn_defaults(&pool, "4000000001")
+        .await
+        .expect_err("expected PartialFailure on letter collision");
+
+    match err {
+        prro::runtime::bootstrap::BootstrapError::PartialFailure {
+            count,
+            failures,
+            ..
+        } => {
+            assert!(count >= 1, "at least one row failure");
+            assert!(
+                failures.iter().any(|f| f.table == "tax_groups"
+                    && f.identifier.contains("letter=А")),
+                "letter-А collision must be reported in failures: {failures:?}"
+            );
+        }
+        other => panic!("expected PartialFailure, got: {other:?}"),
+    }
+
+    // Other defaults still seeded (per-row continue)
+    let rows = tax_groups::list_active_for_fn(&pool, "4000000001").await.unwrap();
+    assert!(rows.len() >= 10, "remaining defaults seeded despite collision");
+}
+
 /// The reactivation must NOT overwrite a customised rate on an
 /// already-active row.  Pin the no-overwrite guarantee.
 #[tokio::test]
