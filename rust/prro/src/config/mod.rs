@@ -17,6 +17,57 @@ pub struct AppConfig {
     /// config files that predate W8.
     #[serde(default)]
     pub offline: OfflineCfg,
+    /// W4-Z0 piece 9 + audit Round-2 (2026-05-27) — per-listener
+    /// ingress config: each `ListenerCfg` carries `(type, port,
+    /// driver_id, fn)`.  The listener stamps `(driver_id, fn)`
+    /// onto incoming canonical commands via
+    /// `to_canonical_fiscal_command_with_context` (see
+    /// `runtime/ingress/dto.rs`).  Optional + default = empty Vec
+    /// for back-compat with existing M1-M3b configs that have no
+    /// HTTP ingress yet; live wiring lands in W4 supervisor.
+    #[serde(default)]
+    pub listeners: Vec<ListenerCfg>,
+}
+
+/// Per-listener ingress config.  W4-Z0 piece 9 architectural pin —
+/// each port serves ONE `(driver_id, fn)` pair.  Multiple listeners
+/// of the same `driver_id` may bind to different FNs on different
+/// ports (e.g. 2 Maria emulators for 2 FNs).
+///
+/// `type` (renamed `kind` to avoid Rust keyword clash) selects the
+/// protocol shell that parses the wire DTO before handing off to
+/// `to_canonical_fiscal_command_with_context`.
+///
+/// Audit Round-3 (2026-05-27): typed enum so YAML typos
+/// (`type = "maria304"` missing `_tcp`) fail-fast at config parse
+/// time rather than at supervisor startup.
+///
+/// `driver_id` MUST be non-empty / non-whitespace per
+/// `DriverId::new` validation.  `fn` MUST exist in
+/// `fiscal_number_config` (validated at supervisor startup, not
+/// here at parse time — same boundary as `BindingsRegistry`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListenerCfg {
+    #[serde(rename = "type")]
+    pub kind: ListenerKind,
+    pub port: u16,
+    pub driver_id: String,
+    #[serde(rename = "fn")]
+    pub fiscal_number: String,
+}
+
+/// Listener protocol shell selector.  `#[serde(rename_all = "snake_case")]`
+/// matches the YAML form (e.g., `type = "maria304_tcp"`).  Unknown
+/// values fail-fast at TOML parse time with a clear serde error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerKind {
+    /// Legacy maria304 wire-protocol TCP shell.
+    Maria304Tcp,
+    /// XML-RPC shell for WebCheck-compatible drivers.
+    WebcheckXmlrpc,
+    /// M4 HTTP ingress (axum router).
+    RestHttp,
 }
 
 #[derive(Debug, Clone, Deserialize)]

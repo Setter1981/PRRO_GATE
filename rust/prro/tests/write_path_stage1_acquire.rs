@@ -181,6 +181,8 @@ fn cmd(doc_type: DocType) -> CanonicalFiscalCommand {
         // signer enforcement (Commits 3+5); None baseline matches W14a-1
         // semantics.
         signed_by_cashier_id: None,
+        // W4-Z0 piece 9: test fixtures don't exercise listener context.
+        driver_id: None,
     }
 }
 

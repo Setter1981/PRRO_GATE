@@ -38,6 +38,17 @@ pub struct CanonicalFiscalCommand {
     /// struct-literal breakage only (all callers updated in this
     /// commit).  No serde concern.
     pub signed_by_cashier_id: Option<CashierId>,
+
+    /// W4-Z0 piece 9 — listener-stamped driver vendor identifier.
+    /// `Some` whenever the ingress listener supplies it from
+    /// `ops/config.yaml` per-port `driver_id` config.  `None` for
+    /// system-context paths (boot reconcile, test fixtures, etc.).
+    ///
+    /// Used by the W4-Z1 conversion layer to look up
+    /// `driver_tax_mapping` for the vendor's letter→canonical
+    /// translation table.  NEVER appears in W3 wire DTO — runtime
+    /// context only.
+    pub driver_id: Option<crate::db::models::ids::DriverId>,
 }
 
 /// Snapshot handed from stage 1 to subsequent stages.  Contains

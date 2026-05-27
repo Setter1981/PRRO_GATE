@@ -136,8 +136,20 @@ async fn open_secure_pool_is_idempotent_on_second_open() {
         .await
         .expect("query")
         .get(0);
+    // First open applies the full `migrations_secure/` set (020 +
+    // 021 as of W4-Z0).  Second open MUST be idempotent — same
+    // row count, no duplicate inserts into `_sqlx_migrations`.
+    let mig_rows_first_open: i64 = sqlx::query("SELECT COUNT(*) FROM _sqlx_migrations")
+        .fetch_one(&pool2)
+        .await
+        .expect("query")
+        .get(0);
     assert_eq!(
-        mig_rows, 1,
-        "second open must not re-apply or duplicate migration 020"
+        mig_rows, mig_rows_first_open,
+        "second open must not re-apply or duplicate any migration"
+    );
+    assert!(
+        mig_rows >= 2,
+        "expected at least migration 020 + 021 recorded, got {mig_rows}"
     );
 }

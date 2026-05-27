@@ -578,6 +578,102 @@ pub async fn add_operator(
             .map_err(|e| {
                 AdminError::Infrastructure(format!("audit append REGISTERED: {e}"))
             })?;
+
+            // W4-Z0 piece 7 + audit Round-1 fix (2026-05-27): per-FN
+            // config bootstrap as **best-effort**.  Idempotent
+            // (INSERT OR IGNORE for every row) so rotation /
+            // additional-cashier add-operator calls remain no-ops on
+            // the config tables.  Operator pre-customisations
+            // (set-tax-rate, set-outgress-profile=EVPZ_DPS) survive.
+            //
+            // Pre-fix behaviour: bootstrap failure returned
+            // Infrastructure error.  Operator saw "add-operator
+            // failed" but operator row + REGISTERED audit had ALREADY
+            // landed → re-running `add-operator` failed with
+            // DuplicateActiveCashier → stranded operator with no
+            // shipped recovery CLI.
+            //
+            // Post-fix behaviour: bootstrap failure logs via
+            // tracing::error! + emits Critical audit
+            // `ADMIN_FN_DEFAULTS_BOOTSTRAP_FAILED` carrying the
+            // sqlite error text.  Operator row stays; add-operator
+            // returns Ok.  Operator can then invoke individual
+            // admin commands (`add-tax-group`, `add-payment`, ...)
+            // to seed the missing config rows manually.  When the
+            // standalone `bootstrap-defaults` admin command lands
+            // (follow-up), that path becomes the canonical recovery.
+            if let Err(e) = crate::runtime::bootstrap::bootstrap_fn_defaults(
+                pool_secure,
+                &input.fiscal_number,
+            )
+            .await
+            {
+                tracing::error!(
+                    target: "prro::admin::add_operator",
+                    fiscal_number = %input.fiscal_number,
+                    cause = %e,
+                    "bootstrap_fn_defaults failed AFTER operator INSERT — \
+                     forensic trail recorded; operator must seed config \
+                     defaults manually via per-table admin commands"
+                );
+                // Audit Round-3 (2026-05-27): if the bootstrap surface
+                // produced a typed `PartialFailure`, unroll the per-row
+                // failure details into the audit payload so operators
+                // can grep the exact (table, identifier, cause) triples
+                // for forensic recovery — not just "BootstrapError: ...".
+                let bootstrap_failed_payload = match &e {
+                    crate::runtime::bootstrap::BootstrapError::PartialFailure {
+                        count,
+                        failures,
+                        ..
+                    } => serde_json::json!({
+                        "fiscal_number": input.fiscal_number,
+                        "operator_id": input.operator_id,
+                        "reason": "BootstrapError::PartialFailure",
+                        "failed_row_count": count,
+                        "failed_rows": failures
+                            .iter()
+                            .map(|f| serde_json::json!({
+                                "table": f.table,
+                                "identifier": f.identifier,
+                                "cause": f.cause,
+                            }))
+                            .collect::<Vec<_>>(),
+                    })
+                    .to_string(),
+                    other => serde_json::json!({
+                        "fiscal_number": input.fiscal_number,
+                        "operator_id": input.operator_id,
+                        "reason": format!("BootstrapError: {other}"),
+                    })
+                    .to_string(),
+                };
+                // Audit-append failure here is best-effort too —
+                // if even THIS audit can't land, log to tracing and
+                // continue (the operator row is the primary
+                // artifact; operator can run `list-tax-groups` to
+                // confirm missing config and remediate).
+                if let Err(audit_err) = crate::db::repositories::audit_log::append(
+                    pool_main,
+                    "operator",
+                    &input.fiscal_number,
+                    "ADMIN_FN_DEFAULTS_BOOTSTRAP_FAILED",
+                    crate::db::models::enums::Severity::Critical,
+                    None,
+                    Some(&bootstrap_failed_payload),
+                )
+                .await
+                {
+                    tracing::error!(
+                        target: "prro::admin::add_operator",
+                        fiscal_number = %input.fiscal_number,
+                        cause = %audit_err,
+                        "audit append for ADMIN_FN_DEFAULTS_BOOTSTRAP_FAILED \
+                         FAILED — forensic trail missing"
+                    );
+                }
+            }
+
             Ok(())
         }
         Err(crate::db::repositories::operators::OperatorsRepoError::DuplicateActive(fn_id)) => {

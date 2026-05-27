@@ -14,6 +14,7 @@
 //! - `doctor`         — `prro doctor` diagnostics
 
 pub mod admin;
+pub mod admin_w4_z0;
 pub mod app;
 pub mod config;
 pub mod crypto;

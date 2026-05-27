@@ -660,63 +660,137 @@ dispatch → send → finalize.
 
 **Algorithm (per worker, per work item):**
 
-0. **DTO → stage_sign payload conversion + unsupported-DocType
-   reject policy** (W3 deferred surface — added per audit
-   2026-05-26).  BEFORE `stage_acquire::run`, the worker MUST
-   transform `command.payload_json` from the wire-shape
-   driver DTO (`ReceiptPayload { goods[], payments[], totals,
-   raw_frames }`) into the internal canonical shape that
-   `services/write_path/stage_sign::parse_payload` expects:
+0. **DTO → stage_sign payload conversion** (W3 deferred surface;
+   §0 was originally added in 2026-05-26 audit Round-3 with a
+   reject-at-boundary policy that subsequent repo-researcher
+   2026-05-26 invalidated — actual production drivers
+   (`maria304_driver/src/session/dispatcher.rs:322,398,408,647`,
+   Python adapters `webcheck_xmlrpc.py:13,16`, 1C OLE contract)
+   emit all 9 fiscal CommandTypes including X_REPORT, SERVICE_IN,
+   SERVICE_OUT, CASH_WITHDRAWAL, so reject-at-boundary would break
+   real operator flows; section rewritten 2026-05-26 v2 with
+   γ-split).
+
+   ### γ-split rationale
+
+   The 9 fiscal `CommandType` variants split into three
+   architectural tiers:
+
+   - **Tier 1 — pure DTO conversion → existing stage_sign
+     artifact** (SELL, RETURN, SHIFT_OPEN, SHIFT_CLOSE, Z_REPORT) —
+     `stage_sign::derive_wire_artifact_kind` already supports
+     these.  Conversion is structural except for Z-report
+     counters (see below).  Goes in **PR-A**.
+
+   - **Tier 2 — local short-path bypassing write_path**
+     (X_REPORT) — per `docs/LEGAL_INVARIANTS.md:195`, X-report is
+     read-only / no-fiscal-side-effect: NOT submitted to DPS, NOT
+     persisted in `fiscal_documents` (matches the ledger-only
+     invariant from `feedback_db_vs_log_separation.md`).
+     Implemented as a separate ingress short-path: snapshot
+     aggregation query → response builder → audit_log entry →
+     printer dispatch.  **PR-B scope.**
+
+   - **Tier 3 — new fiscal artifacts requiring stage_sign
+     expansion** (SERVICE_IN, SERVICE_OUT, CASH_WITHDRAWAL) — these
+     ARE monetary fiscal documents per UA fiscal protocol
+     (`C T="6"` service-cash, `C T="7"` cash-withdrawal per ФСКО
+     v2.2.3); they ARE submitted to DPS and persisted in
+     `fiscal_documents`.  `stage_sign::derive_wire_artifact_kind`
+     currently rejects them with `UnsupportedDocType` — must be
+     extended with new `ServiceJson` / `CashWithdrawalJson`
+     payload structs + corresponding wire artifact builders.
+     **PR-C scope.**
+
+   ### PR-A — Tier 1 conversion (this PR's step 0)
 
       - `CheckJson { items[]: { code, name, price_kop,
         quantity_thousandths, sum_kop }, payments[]: { name,
         sum_kop, type_code } }`        — for SELL / RETURN.  Pure
-        structural conversion of `FiscalLine` + `CanonicalPayment`
-        — no ledger access needed.
+        structural conversion: `FiscalLine.article_code`→`code`,
+        `FiscalLine.name`→`name`, `FiscalLine.price_kopecks`
+        →`price_kop`, `FiscalLine.quantity_milli`
+        →`quantity_thousandths` (rename only — 1 milli == 1
+        thousandth), `price_kop * quantity_thousandths / 1000`
+        →`sum_kop`.  `CanonicalPayment.kind` → human name +
+        `type_code` (CASH="0", CASHLESS_1..3=numeric per spec).
+        No ledger access.
 
-      - `ZReportJson { payments[]: { name, sum_in_kop, sum_out_kop,
-        type_code }, sell_count, return_count }`
+      - `ZReportJson { payments[]: { name, sum_in_kop,
+        sum_out_kop, type_code }, sell_count, return_count }`
                                        — for SHIFT_CLOSE / Z_REPORT.
-        `sell_count` / `return_count` are repository-derived (count
-        rows since `shift_open_at_business_ts` grouped by direction).
-        REQUIRES pool access.
+        `sell_count` / `return_count` are repository-derived by
+        a NEW repo method (mirroring Python `shift_aggregation.
+        aggregate_shift_data` at `src/prro_gateway/services/
+        shift_aggregation.py:1`):
+
+        ```sql
+        SELECT doc_type, COUNT(*)
+          FROM fiscal_documents
+         WHERE shift_id = ?
+           AND state IN ('ACK', 'OFFLINE_LOCAL_ACK')
+           AND doc_type IN ('SELL', 'RETURN')
+         GROUP BY doc_type;
+        ```
+
+        Note: boundary is `shift_id` (FK column), NOT
+        `shift_open_at_business_ts` (timestamp).  State filter to
+        terminal-acknowledged-only matches the M3b ledger
+        invariant.  Exclude-self via `document_id !=` is REDUNDANT
+        in Rust because the in-flight Z_REPORT doc is in
+        Prepared/Signed/Sending state when conversion runs (not
+        yet ACK/OFFLINE_LOCAL_ACK).  The conversion runs BEFORE
+        stage_acquire creates the row, OR inside stage_acquire's
+        with_immediate transaction reading committed rows only.
 
       - `ShiftOpenJson { opening_sum_kop }`
-                                       — for SHIFT_OPEN.  Currently
-        not in W3 DTO `Totals`; if driver does not provide it the
-        worker uses 0 + writes an audit_log warning, OR (later)
-        plumbs through `raw_frames`.
+                                       — for SHIFT_OPEN.  W3 DTO
+        `Totals` does NOT carry opening_sum.  Placeholder = 0 +
+        audit_log entry `ShiftOpenWithoutOpeningSum { fn_id,
+        idempotency_key, business_ts }`.  M5 plumbs the value
+        from `raw_frames` (driver opcode CAHHC for Maria304).
+        Pilot acceptance: SHIFT_OPEN with 0 opening_sum is legal
+        per UA protocol (no opening-cash declaration is
+        equivalent to opening with 0 cash on hand).
 
-   For `command.doc_type ∈ { XReport, ServiceIn, ServiceOut,
-   CashWithdrawal }`: pick ONE of the following stances, with
-   single source of truth being `derive_wire_artifact_kind`'s
-   match:
+   ### PR-A — temporary scaffolding for Tier 2/3 types
 
-   - **Reject-at-boundary (preferred)** — worker calls
-     `derive_wire_artifact_kind(doc_type)` BEFORE acquire and
-     surfaces `Refused(UnsupportedDocType)` instead of letting
-     stage_sign reject post-acquire.  Saves a doc row write.
+   PR-A introduces typed `MappingError::DeferredToLaterPR
+   { doc_type, pr_label }` returned to the worker as
+   `Refused(NotYetSupported)`.  This is TEMPORARY scaffolding
+   to be removed by PR-B (X_REPORT) and PR-C (SERVICE_IN/OUT/
+   CASH_WITHDRAWAL) merges.  Tracking comments include the
+   issue / PR number that closes each defer.
 
-   - **Reject-late (current behaviour)** — worker proceeds; sign
-     stage returns `SignError::UnsupportedDocType`; worker maps
-     to `WireError(Internal)`.
+   ### Gap-doc tests — inversion targets
 
-   The two `#[ignore]`'d gap-documentation tests in
-   `rust/prro/tests/ingress_dto_parity.rs` —
-   `mapped_payload_json_is_wire_shape_not_stage_sign_ready` and
-   `xreport_servicein_serviceout_cashwithdrawal_map_but_signer_will_reject`
-   — MUST be unignored and inverted as part of this step:
+   The two `#[ignore]`'d tests in `rust/prro/tests/
+   ingress_dto_parity.rs`:
 
-   - First: replace the wire-DTO field structural assertions
-     (`contains("price_kopecks")`) with positive parse-through
-     assertions calling stage_sign's payload parser on the
-     converted JSON.
-   - Second: replace the accept-loop with either an expect_err
-     loop (reject-at-boundary chosen) OR an expect_ok loop
-     (signer-side accept chosen).
+   - `mapped_payload_json_is_wire_shape_not_stage_sign_ready`
+     — unignored + inverted in **PR-A** to positive parse-through
+     assertions for the 5 Tier-1 types using `stage_sign::
+     parse_payload` exposed via `test-support` feature flag
+     mirroring `ReconcileGuard::for_integration_test_only()`
+     pattern at `services/reconciliation/guard.rs:131`.
 
-   See `docs/superpowers/plans/2026-05-25-m4-ingress-plan.md` §3
-   W3 acceptance addendum for the original audit finding.
+   - `xreport_servicein_serviceout_cashwithdrawal_map_but_signer_will_reject`
+     — unignored + inverted in three stages:
+       * **PR-A**: invert to assert
+         `MappingError::DeferredToLaterPR(_)` for all 4 types
+         (temporary scaffolding).
+       * **PR-B**: re-assert
+         `Refused(NotApplicableToWritePath { reason:
+         LocalShortPathOnly })` for X_REPORT.
+       * **PR-C**: re-assert positive parse-through for
+         SERVICE_IN/SERVICE_OUT/CASH_WITHDRAWAL after stage_sign
+         expansion.
+     Final state (after PR-C merge): all 9 fiscal types
+     positively covered; X_REPORT has dedicated short-path
+     assertion.
+
+   See §3 W3 acceptance addendum for the original W3-audit
+   finding that surfaced this gap.
 
 1. `stage_acquire::run(pool, request_id, command)` →
    - `Noop` → reply `DocumentMissing` (already-leased by another
