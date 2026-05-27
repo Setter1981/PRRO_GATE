@@ -826,6 +826,13 @@ fn check_payload_from(
                 price: it.price_kop,
                 quantity: it.quantity_thousandths,
                 sum: it.sum_kop,
+                // W4-Z1 optional fields default to None / empty Vec;
+                // populated when W4-Z1 piece 7 conversion-layer lands
+                // (carries excise / tax / discount / barcode / uktzed
+                // from canonical DTO).  Current stage_sign caller is
+                // the legacy minimal-subset path — preserves byte
+                // equivalence with existing goldens.
+                ..Default::default()
             })
             .collect(),
         payments: body

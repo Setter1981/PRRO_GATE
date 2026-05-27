@@ -61,6 +61,7 @@ fn check_payload(local_number: u32) -> CheckPayload {
             price: 1500,
             quantity: 1000,
             sum: 1500,
+            ..Default::default()
         }],
         payments: vec![CheckPayment {
             name: "CASH".into(),

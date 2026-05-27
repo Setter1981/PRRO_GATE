@@ -117,9 +117,16 @@ pub struct CheckPayload {
 }
 
 /// Single line item inside a SELL/RETURN check.  Mirrors Python
-/// `_build_check`'s `<P>` element with the W4 first-round attribute
-/// subset: `C / N / NM / PRC / Q / SM`.
-#[derive(Debug, Clone)]
+/// `_build_check`'s `<P>` element.
+///
+/// W4-Z1 (2026-05-27) extended the W4 minimal subset (C/N/NM/PRC/Q/SM)
+/// with the optional attributes the Python `dps_xml.py` serializer
+/// emits + the operator-confirmed pilot requirements per spec §2
+/// (excise marks, UKTZED, barcode, TX/TX1 tax groups, per-item
+/// discount/surcharge).  Empty `None` / `Vec::new()` → attribute /
+/// child element NOT emitted (back-compat with existing minimal
+/// goldens).
+#[derive(Debug, Clone, Default)]
 pub struct CheckItem {
     /// `<P C=...>`.  Item code (article SKU).
     pub code: String,
@@ -131,6 +138,82 @@ pub struct CheckItem {
     pub quantity: i64,
     /// `<P SM=...>`.  Line total (kopecks).
     pub sum: i64,
+
+    // ─── W4-Z1 optional attributes ─────────────────────────────────
+
+    /// `<P CD=...>`.  Barcode.  Per Python `dps_xml.py:197`:
+    /// `p_attrs['CD'] = barcode`.  Omit if `None`.
+    pub barcode: Option<String>,
+
+    /// `<P CZD=...>`.  УКТЗЕД (HS) code.  Per Python `:200`:
+    /// `p_attrs['CZD'] = uktzed`.  Omit if `None`.  NB this is NOT
+    /// the same as `CD` (which is barcode).
+    pub uktzed: Option<String>,
+
+    /// `<P TX=...>`.  Primary tax group code.  `Some(0)` = звільнено
+    /// (exempt), `Some(-1)` = не об'єкт ПДВ (not-VAT-object per
+    /// `feedback_pdv_zero` memory), `Some(1..)` = regular tax group.
+    /// `None` → attribute omitted (W4 refund variant per WebCheck
+    /// `StringXML.cs:957` opertyp=-8 branch).  `i64` so the field can
+    /// carry -1 even though canonical W3 DTO uses `u8` (W4-Z1 piece
+    /// 7 conversion layer maps DTO→CheckItem with sentinel handling).
+    pub tax_group_1: Option<i64>,
+
+    /// `<P TX1=...>`.  Secondary tax group (dual-tax mode per
+    /// Python `:204`).  Rare; only emit when operator explicitly
+    /// configured the line as dual-tax.
+    pub tax_group_2: Option<i64>,
+
+    /// Excise marks (DSTU 9095-04 acc-codes).  Per WebCheck
+    /// `StringXML.cs:1547 AAAAA()`: each stamp becomes a
+    /// `<CA CA='{stamp}'></CA>` child of `<P>`.  Empty → `<P .../>`
+    /// self-closing form (no children).  Per Python `:205-206`:
+    /// `ca_xml = ''.join(_tag('CA', {'CA': m}) for m in excise_marks)`.
+    pub excise_stamps: Vec<String>,
+
+    /// Per-item discount.  When `Some`, a sibling `<D>` element is
+    /// emitted IMMEDIATELY after this `<P>`, with `NI=` referencing
+    /// the parent item's `N`.  Per spec §2 `<D>` per-item form + W4
+    /// PR-A conversion-layer pinning.
+    pub discount: Option<LineAdjustment>,
+
+    /// Per-item surcharge.  Like `discount` but emits `<S>` (per
+    /// Python `dps_xml.py:225` `xml_tag = 'S' if d_type ==
+    /// 'EXTRA_CHARGE'`).
+    pub surcharge: Option<LineAdjustment>,
+}
+
+/// Per-line adjustment (discount or surcharge) — shared shape for
+/// `<D>` and `<S>` sibling elements after `<P>`.  Per Python
+/// `dps_xml.py:226-244`.
+#[derive(Debug, Clone)]
+pub struct LineAdjustment {
+    /// Sum in kopecks.  For percent-mode this is the resolved
+    /// `round(item.sum * pr / 100)`; caller resolves percent at
+    /// construction time (xml/ stays format-only).
+    pub sum: i64,
+    /// `TY=` mode flag.  `0` = VALUE (default), `1` = PERCENT.
+    pub mode: AdjustmentMode,
+    /// `PR=` percent value, formatted as `"{:.2}"`.  Only emitted
+    /// when `mode == AdjustmentMode::Percent`.
+    pub percent: Option<String>,
+    /// `NM=` operator-readable name (e.g. "Знижка постійному
+    /// клієнту").  Omit if empty.
+    pub name: Option<String>,
+    /// `DN=` privilege code.  Omit if empty.
+    pub privilege: Option<String>,
+    /// `TX=` tax code.  Omit if empty.  Drives ПДВ-зачот calculations.
+    pub tax_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdjustmentMode {
+    /// `TY="0"` — fixed-sum mode.  `sum` carries the value.
+    Value,
+    /// `TY="1"` — percent mode.  `percent` is the rate, `sum` is the
+    /// resolved kopeck amount (caller pre-computes from item sum ×
+    /// rate / 100).
+    Percent,
 }
 
 /// Single payment inside a SELL/RETURN check.  Mirrors Python's
@@ -251,25 +334,71 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
     let mut item_no: u32 = 1;
 
     for it in &p.items {
-        let n = item_no.to_string();
+        let p_item_n = item_no;
+        let n = p_item_n.to_string();
         let prc = it.price.to_string();
         let q = it.quantity.to_string();
         let sm = it.sum.to_string();
-        // Python `_build_check` p_attrs: C, N, NM, PRC, Q, SM.
-        tag_attrs(
-            out,
-            "P",
-            &[
-                ("C", &it.code),
-                ("N", &n),
-                ("NM", &it.name),
-                ("PRC", &prc),
-                ("Q", &q),
-                ("SM", &sm),
-            ],
-        );
+
+        // Build `<P>` attribute list dynamically — Python sorts
+        // alphabetically; we follow the same ordering convention
+        // mirrored by `tag_attrs_sorted` (lazily here: hand-built
+        // sorted form).  Required attrs: C, N, NM, PRC, Q, SM.
+        // Optional: CD (barcode), CZD (uktzed), TX, TX1.
+        //
+        // Construction note: we collect (&str, &str) pairs.  String
+        // arithmetic for optional Number fields (TX/TX1) needs owned
+        // String buffers; bind them outside the tuple so they outlive
+        // the slice.
+        let tx_str = it.tax_group_1.map(|v| v.to_string());
+        let tx1_str = it.tax_group_2.map(|v| v.to_string());
+
+        let mut p_attrs: Vec<(&str, &str)> = Vec::with_capacity(10);
+        p_attrs.push(("C", &it.code));
+        if let Some(barcode) = &it.barcode {
+            p_attrs.push(("CD", barcode));
+        }
+        if let Some(uktzed) = &it.uktzed {
+            p_attrs.push(("CZD", uktzed));
+        }
+        p_attrs.push(("N", &n));
+        p_attrs.push(("NM", &it.name));
+        p_attrs.push(("PRC", &prc));
+        p_attrs.push(("Q", &q));
+        p_attrs.push(("SM", &sm));
+        if let Some(tx) = tx_str.as_deref() {
+            p_attrs.push(("TX", tx));
+        }
+        if let Some(tx1) = tx1_str.as_deref() {
+            p_attrs.push(("TX1", tx1));
+        }
+        // Note: caller responsibility to keep attrs in alphabetical
+        // order — we build in alpha order above (C, CD, CZD, N, NM,
+        // PRC, Q, SM, TX, TX1).  Python sorts dict keys; we lock
+        // ordering by construction.
+        tag_attrs(out, "P", &p_attrs);
+
+        // Emit `<CA>` excise stamp children (no children → `<P/>`
+        // form via the existing `close(out, "P")` call below).
+        // Python `:206` ca_xml = join over excise_marks.
+        for stamp in &it.excise_stamps {
+            tag_attrs(out, "CA", &[("CA", stamp)]);
+            close(out, "CA");
+        }
         close(out, "P");
         item_no += 1;
+
+        // Sibling `<D>` / `<S>` elements immediately after the
+        // parent `<P>`.  NI references parent_n.  Per Python
+        // `:217-244` per-item-discount branch.
+        if let Some(adj) = &it.discount {
+            emit_line_adjustment(out, "D", adj, item_no, p_item_n);
+            item_no += 1;
+        }
+        if let Some(adj) = &it.surcharge {
+            emit_line_adjustment(out, "S", adj, item_no, p_item_n);
+            item_no += 1;
+        }
     }
 
     for pay in &p.payments {
@@ -413,6 +542,49 @@ fn tag_attrs(out: &mut String, name: &str, attrs: &[(&str, &str)]) {
     out.push('>');
 }
 
+/// W4-Z1: emit a `<D>` (discount) or `<S>` (surcharge) sibling
+/// element after a `<P>` line.  Per Python `dps_xml.py:217-244`
+/// per-item-adjustment branch + spec §2 `<D>`/`<S>` shape.
+///
+/// `parent_n` — the sibling `<P>`'s `N` (sequence number) referenced
+/// via `NI`.  `self_n` — this adjustment's own `N`.
+fn emit_line_adjustment(
+    out: &mut String,
+    tag_name: &str, // "D" or "S"
+    adj: &LineAdjustment,
+    self_n: u32,
+    parent_n: u32,
+) {
+    let self_n_str = self_n.to_string();
+    let parent_n_str = parent_n.to_string();
+    let sm_str = adj.sum.to_string();
+    let (ty_str, percent_str) = match adj.mode {
+        AdjustmentMode::Value => ("0", None),
+        AdjustmentMode::Percent => ("1", adj.percent.as_deref()),
+    };
+
+    let mut attrs: Vec<(&str, &str)> = Vec::with_capacity(8);
+    attrs.push(("N", &self_n_str));
+    attrs.push(("NI", &parent_n_str));
+    attrs.push(("SM", &sm_str));
+    attrs.push(("TR", "0")); // per-item flag (TR=1 is check-level form)
+    attrs.push(("TY", ty_str));
+    if let Some(pr) = percent_str {
+        attrs.push(("PR", pr));
+    }
+    if let Some(name) = adj.name.as_deref() {
+        attrs.push(("NM", name));
+    }
+    if let Some(dn) = adj.privilege.as_deref() {
+        attrs.push(("DN", dn));
+    }
+    if let Some(tx) = adj.tax_code.as_deref() {
+        attrs.push(("TX", tx));
+    }
+    tag_attrs(out, tag_name, &attrs);
+    close(out, tag_name);
+}
+
 /// Emit `<name>content</name>`.  Used for `<TS>` and `<MAC>`.
 ///
 /// **Content is NOT XML-escaped** — mirrors Python `_tag` exactly:
@@ -488,6 +660,7 @@ mod tests {
             price: 1500,
             quantity: 1000,
             sum: 1500,
+            ..Default::default()
         }
     }
 
@@ -726,6 +899,7 @@ mod tests {
                     price: 100,
                     quantity: 1000,
                     sum: 100,
+                    ..Default::default()
                 },
                 CheckItem {
                     code: "CODE-2".into(),
@@ -733,6 +907,7 @@ mod tests {
                     price: 100,
                     quantity: 1000,
                     sum: 100,
+                    ..Default::default()
                 },
             ],
             payments: vec![one_cash_payment()],
@@ -789,6 +964,7 @@ mod tests {
                 price: 100,
                 quantity: 1000,
                 sum: 100,
+                ..Default::default()
             }],
             payments: vec![one_cash_payment()],
             total_sum: 100,
