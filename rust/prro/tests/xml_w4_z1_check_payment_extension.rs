@@ -27,6 +27,7 @@ fn build_sell_with_payment(payment: CheckPayment) -> String {
         items: vec![item],
         payments: vec![payment],
         total_sum: 1000,
+        ..Default::default()
     });
     let bytes = build_canonical_xml(&doc).expect("build");
     bytes.iter().map(|&b| b as char).collect()

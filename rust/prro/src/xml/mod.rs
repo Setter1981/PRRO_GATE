@@ -105,15 +105,67 @@ pub struct CheckPayload {
     pub header: DocumentHeader,
     /// Per-FN local document number (`<DAT DI=...>`).
     pub local_number: u32,
-    /// Line items emitted as `<P>` elements (W4 first-round subset:
-    /// six required attrs only, no barcodes / excise / tax codes).
+    /// Line items emitted as `<P>` elements.
     pub items: Vec<CheckItem>,
-    /// Payments emitted as `<M>` elements after items (W4 first-round
-    /// subset: four required attrs only, no EPZ / change / rounding).
+    /// Payments emitted as `<M>` elements after items.
     pub payments: Vec<CheckPayment>,
     /// `<E SM=...>` total (kopecks).  The closing `<E>` element
     /// always emits `FN / N / NO / SM / TS` per ФСКО Table 23.
     pub total_sum: i64,
+
+    /// W4-Z1 piece 3 — Check-level discounts / surcharges.  Emitted
+    /// AFTER all `<P>` items + per-item `<D>` / `<S>` siblings, but
+    /// BEFORE `<M>` payments.  Each carries `TR="1"` (check-level
+    /// flag, vs `TR="0"` for per-item) + a list of `<NI>` children
+    /// naming each affected item's `N` sequence number.
+    ///
+    /// Per Python `dps_xml.py:248-272` + spec §2 `<D>` / `<S>`
+    /// check-level form.
+    #[doc(hidden)] // field is pub but defaults to empty for back-compat
+    pub check_level_adjustments: Vec<CheckLevelAdjustment>,
+}
+
+/// Check-level discount or surcharge.  Distinct from per-item
+/// `LineAdjustment` because of the `TR="1"` flag + `<NI>` child
+/// elements naming affected items.
+#[derive(Debug, Clone)]
+pub struct CheckLevelAdjustment {
+    /// `D` for discount, `S` for surcharge.  Per Python
+    /// `:259 xml_tag = 'D' if d_type != 'EXTRA_CHARGE' else 'S'`.
+    pub kind: CheckLevelAdjustmentKind,
+    /// `SM=` resolved sum in kopecks.  Caller pre-computes for
+    /// percent mode: `round(goods_total * value / 100)`.
+    pub sum: i64,
+    /// `TY=` mode (Value / Percent).
+    pub mode: AdjustmentMode,
+    /// `PR=` percent value (only emitted when mode = Percent).
+    pub percent: Option<String>,
+    /// `NM=` operator-readable name.
+    pub name: Option<String>,
+    /// `<NI NI=...>` children: each item-N this adjustment applies
+    /// to.  Caller populates with the parent `<P>` `N` values.
+    pub applies_to_item_ns: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckLevelAdjustmentKind {
+    /// Emits `<D TR="1">` ... `</D>`.  Default discount.
+    Discount,
+    /// Emits `<S TR="1">` ... `</S>`.  Surcharge / extra charge.
+    Surcharge,
+}
+
+impl Default for CheckPayload {
+    fn default() -> Self {
+        Self {
+            header: DocumentHeader::with_defaults("", "", 0, "", ""),
+            local_number: 0,
+            items: Vec::new(),
+            payments: Vec::new(),
+            total_sum: 0,
+            check_level_adjustments: Vec::new(),
+        }
+    }
 }
 
 /// Single line item inside a SELL/RETURN check.  Mirrors Python
@@ -446,6 +498,44 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) {
             emit_line_adjustment(out, "S", adj, item_no, p_item_n);
             item_no += 1;
         }
+    }
+
+    // W4-Z1 piece 3: check-level discounts/surcharges, emitted AFTER
+    // all `<P>` + per-item adjustments, BEFORE `<M>` payments.
+    // Python `dps_xml.py:248-272` ordering.
+    for cla in &p.check_level_adjustments {
+        let self_n = item_no;
+        let self_n_str = self_n.to_string();
+        let sm_str = cla.sum.to_string();
+        let (ty_str, percent_str) = match cla.mode {
+            AdjustmentMode::Value => ("0", None),
+            AdjustmentMode::Percent => ("1", cla.percent.as_deref()),
+        };
+        let tag_name = match cla.kind {
+            CheckLevelAdjustmentKind::Discount => "D",
+            CheckLevelAdjustmentKind::Surcharge => "S",
+        };
+
+        let mut attrs: Vec<(&str, &str)> = Vec::with_capacity(6);
+        attrs.push(("N", &self_n_str));
+        attrs.push(("SM", &sm_str));
+        attrs.push(("TR", "1")); // check-level flag
+        attrs.push(("TY", ty_str));
+        if let Some(pr) = percent_str {
+            attrs.push(("PR", pr));
+        }
+        if let Some(name) = cla.name.as_deref() {
+            attrs.push(("NM", name));
+        }
+        tag_attrs(out, tag_name, &attrs);
+        // `<NI NI="...">` children — one per affected item N.
+        for &item_n in &cla.applies_to_item_ns {
+            let item_n_str = item_n.to_string();
+            tag_attrs(out, "NI", &[("NI", &item_n_str)]);
+            close(out, "NI");
+        }
+        close(out, tag_name);
+        item_no += 1;
     }
 
     for pay in &p.payments {
@@ -862,6 +952,7 @@ mod tests {
             items: vec![one_check_item()],
             payments: vec![one_cash_payment()],
             total_sum: 1500,
+            check_level_adjustments: Vec::new(),
         });
         let s = render_ascii(&doc);
         assert!(s.contains(r#"<C T="0">"#), "SELL must be C T=0");
@@ -891,6 +982,7 @@ mod tests {
             items: vec![one_check_item()],
             payments: vec![one_cash_payment()],
             total_sum: 1500,
+            check_level_adjustments: Vec::new(),
         });
         let s = render_ascii(&doc);
         assert!(s.contains(r#"<C T="1">"#), "RETURN must be C T=1");
@@ -997,6 +1089,7 @@ mod tests {
             ],
             payments: vec![one_cash_payment()],
             total_sum: 200,
+            check_level_adjustments: Vec::new(),
         });
         let s = render_ascii(&doc);
         let idx1 = s.find("CODE-1").expect("first item present");
@@ -1014,6 +1107,7 @@ mod tests {
             items: vec![one_check_item()],
             payments: vec![one_cash_payment()],
             total_sum: 1500,
+            check_level_adjustments: Vec::new(),
         });
         let a = build_canonical_xml(&doc).unwrap();
         let b = build_canonical_xml(&doc).unwrap();
@@ -1053,6 +1147,7 @@ mod tests {
             }],
             payments: vec![one_cash_payment()],
             total_sum: 100,
+            check_level_adjustments: Vec::new(),
         });
         let bytes = build_canonical_xml(&doc).expect("ukrainian must encode");
         // Find the cp1251 bytes for "Їжа" inside the wire output.

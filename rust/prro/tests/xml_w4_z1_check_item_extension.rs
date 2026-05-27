@@ -34,6 +34,7 @@ fn minimal_check(items: Vec<CheckItem>, payments: Vec<CheckPayment>) -> CheckPay
         items,
         payments,
         total_sum: 0,
+        ..Default::default()
     }
 }
 

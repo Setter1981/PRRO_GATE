@@ -849,5 +849,9 @@ fn check_payload_from(
             })
             .collect(),
         total_sum: total_sum_kop,
+        // W4-Z1 piece 3: check-level discounts/surcharges default
+        // empty; populated by piece 7 conversion-layer when DTO
+        // carries check-level adjustments.
+        check_level_adjustments: Vec::new(),
     }
 }

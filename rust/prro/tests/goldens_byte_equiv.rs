@@ -70,6 +70,7 @@ fn check_payload(local_number: u32) -> CheckPayload {
             ..Default::default()
         }],
         total_sum: 1500,
+        check_level_adjustments: Vec::new(),
     }
 }
 
