@@ -2365,6 +2365,9 @@ async fn dispatch_prepared_via_chain(
                 // signer_guard reads it from `SendInputs` (Commits 3 +
                 // 5).  Boot-context surface stays `None` here.
                 signed_by_cashier_id: None,
+                // W4-Z0 piece 9 — boot reconcile is system context;
+                // no listener stamped this command.
+                driver_id: None,
             };
 
             Ok::<SnapshotOutcome, anyhow::Error>(SnapshotOutcome::Ok(Box::new((

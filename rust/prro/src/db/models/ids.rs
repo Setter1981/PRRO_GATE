@@ -102,6 +102,54 @@ pub enum CashierIdError {
     TooLong(usize),
 }
 
+/// Driver vendor identifier — stamped by the ingress listener from
+/// `ops/config.yaml` per-port `driver_id` config.  NEVER in W3 wire
+/// DTO; listener context only.  Used by the conversion layer (W4-Z1)
+/// to look up `driver_tax_mapping` for letter→canonical translation
+/// and route to the correct outgress quartet.
+///
+/// Per `project_m4_outgress_architecture` + `feedback_operator_ua_fiscal_authority`
+/// memory pins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverId(String);
+
+#[derive(Debug, thiserror::Error)]
+pub enum DriverIdError {
+    #[error("driver_id MUST be non-empty")]
+    Empty,
+    #[error("driver_id too long: {0} bytes (max 64)")]
+    TooLong(usize),
+}
+
+impl DriverId {
+    pub const MAX_LEN: usize = 64;
+
+    pub fn new(s: impl Into<String>) -> Result<Self, DriverIdError> {
+        let s = s.into();
+        if s.is_empty() {
+            return Err(DriverIdError::Empty);
+        }
+        if s.len() > Self::MAX_LEN {
+            return Err(DriverIdError::TooLong(s.len()));
+        }
+        Ok(Self(s))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for DriverId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 impl CashierId {
     /// Maximum byte length for a cashier identifier.  Sized generously
     /// for any reasonable POS-side handle (5-ПРРО registration strings,

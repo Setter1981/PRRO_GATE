@@ -216,6 +216,15 @@ pub struct Totals {
 
 #[derive(Debug, Error)]
 pub enum MappingError {
+    /// W4-Z0 piece 9 — wire `fiscal_number` does NOT match the
+    /// listener's configured FN (per `ops/config.yaml`).  Listener
+    /// rejects the receipt before any write-path work begins.
+    #[error("listener FN mismatch: wire={wire_fn:?} listener={listener_fn:?}")]
+    FnConfigMismatch {
+        wire_fn: String,
+        listener_fn: String,
+    },
+
     #[error("schema_version mismatch: expected {expected}, got {actual}")]
     SchemaVersionMismatch {
         expected: &'static str,
@@ -343,7 +352,29 @@ pub fn to_canonical_fiscal_command(
         payload_json,
         payload_sha256_canonical,
         signed_by_cashier_id,
+        driver_id: None, // W4-Z0 piece 9: set via `to_canonical_fiscal_command_with_context`
     })
+}
+
+/// W4-Z0 piece 9 — listener-stamped variant.  Validates wire
+/// `fiscal_number` matches the listener's configured FN, then maps
+/// + stamps the driver_id into the canonical command.  Listener
+/// catches the cross-FN typo at the source instead of letting the
+/// boot-time reconcile audit catch it hours later.
+pub fn to_canonical_fiscal_command_with_context(
+    cmd: &CanonicalCommand,
+    listener_driver_id: crate::db::models::ids::DriverId,
+    listener_fn: &str,
+) -> Result<CanonicalFiscalCommand, MappingError> {
+    if cmd.fiscal_number != listener_fn {
+        return Err(MappingError::FnConfigMismatch {
+            wire_fn: cmd.fiscal_number.clone(),
+            listener_fn: listener_fn.to_string(),
+        });
+    }
+    let mut canonical = to_canonical_fiscal_command(cmd)?;
+    canonical.driver_id = Some(listener_driver_id);
+    Ok(canonical)
 }
 
 pub fn canonical_json_bytes<T: Serialize>(v: &T) -> Result<Vec<u8>, serde_json::Error> {

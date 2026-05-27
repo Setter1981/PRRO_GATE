@@ -303,6 +303,8 @@ fn make_command(
         // enforcement (Commits 3+5); None baseline matches existing
         // suite behavior.
         signed_by_cashier_id: None,
+        // W4-Z0 piece 9: test fixtures don't exercise listener context.
+        driver_id: None,
     }
 }
 
