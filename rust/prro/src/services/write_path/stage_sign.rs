@@ -45,11 +45,15 @@ use crate::db::repositories::{
 };
 use crate::db::tx::with_immediate;
 use crate::xml::{
-    build_canonical_xml, CanonicalDoc, CheckItem, CheckPayload, CheckPayment, DocumentHeader,
-    ZReportCheckCount, ZReportPayload, ZReportPaymentSum,
+    build_canonical_xml, AdjustmentMode, CanonicalDoc, CheckItem, CheckLevelAdjustment,
+    CheckLevelAdjustmentKind, CheckPayload, CheckPayment, DocumentHeader, LineAdjustment,
+    LineAdjustmentKind, ZReportCheckCount, ZReportPayload, ZReportPaymentSum,
 };
 
+use super::tax_summary::{derive_tax_summaries, ResolvedTaxGroup};
 use super::types::WorkerContext;
+
+use std::collections::HashMap;
 
 // ─── Public types ─────────────────────────────────────────────────────
 
@@ -100,6 +104,11 @@ pub enum SignError {
     PersistCasFailed { outcome: TransitionOutcome },
     #[error("stage 3-NO-TX canonical XML build failed: {0}")]
     Build(#[from] crate::xml::XmlBuildError),
+    /// W4-Z1 piece 7 — `derive_tax_summaries` returned a typed
+    /// `CalcTaxError` (UnsupportedAlgorithm / InvalidRate /
+    /// IntermediateOverflow).  Surface to audit_log + reject doc.
+    #[error("stage 3-NO-TX tax-summary aggregation failed: {0}")]
+    TaxSummary(#[from] crate::xml::CalcTaxError),
     #[error("stage 3-NO-TX CMS sign failed: {0}")]
     Crypto(#[from] CryptoError),
     #[error("stage 3 db error: {0}")]
@@ -570,12 +579,19 @@ async fn build_canonical_and_sign_no_tx(
         previous_hash_hex,
     );
 
+    // W4-Z1 piece 7: tax-group snapshot.  TEMPORARY empty map —
+    // unknown groups are skipped (Python parity).  Wiring to
+    // `driver_tax_mapping` repo lands in a follow-up worklet
+    // (W4-Z2 / piece 7b); for now this preserves byte-equivalence
+    // with the 4 minimal goldens (no items carry tax_group_1).
+    let tax_groups: HashMap<i64, ResolvedTaxGroup> = HashMap::new();
     let canonical_doc = build_canonical_doc(
         inputs.wire_artifact_kind,
         header,
         local_number_u32,
         typed_payload,
-    );
+        &tax_groups,
+    )?;
     let unsigned_xml: Vec<u8> = build_canonical_xml(&canonical_doc)?;
 
     let unsigned_xml_sha256: [u8; 32] = {
@@ -667,6 +683,15 @@ struct ShiftOpenJson {
 struct CheckJson {
     items: Vec<CheckItemJson>,
     payments: Vec<CheckPaymentJson>,
+    /// W4-Z1 piece 7 — optional check-level extensions.  All
+    /// `#[serde(default)]` → back-compat with minimal-payload
+    /// adapter wire formats (existing callers unchanged).
+    #[serde(default)]
+    header_lines: Vec<String>,
+    #[serde(default)]
+    footer_lines: Vec<String>,
+    #[serde(default)]
+    check_level_adjustments: Vec<CheckLevelAdjustmentJson>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -677,6 +702,66 @@ struct CheckItemJson {
     price_kop: i64,
     quantity_thousandths: i64,
     sum_kop: i64,
+    // W4-Z1 piece 7 optional extensions — all default to None /
+    // empty Vec for back-compat with minimal callers.
+    #[serde(default)]
+    barcode: Option<String>,
+    #[serde(default)]
+    uktzed: Option<String>,
+    #[serde(default)]
+    tax_group_1: Option<i64>,
+    #[serde(default)]
+    tax_group_2: Option<i64>,
+    #[serde(default)]
+    excise_stamps: Vec<String>,
+    #[serde(default)]
+    adjustments: Vec<LineAdjustmentJson>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct LineAdjustmentJson {
+    kind: AdjustmentKindJson,
+    sum: i64,
+    mode: AdjustmentModeJson,
+    #[serde(default)]
+    percent: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    privilege: Option<String>,
+    #[serde(default)]
+    tax_code: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct CheckLevelAdjustmentJson {
+    kind: AdjustmentKindJson,
+    sum: i64,
+    mode: AdjustmentModeJson,
+    #[serde(default)]
+    percent: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    /// Empty → auto-fill with all p_item_numbers (Python parity);
+    /// non-empty → POS-precomputed subset (operator real-world).
+    #[serde(default)]
+    applies_to_item_ns: Vec<u32>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AdjustmentKindJson {
+    Discount,
+    Surcharge,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AdjustmentModeJson {
+    Value,
+    Percent,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -685,6 +770,27 @@ struct CheckPaymentJson {
     name: String,
     sum_kop: i64,
     type_code: String,
+    // W4-Z1 piece 7 — EPZ acquirer-slip + cash-only RM/SMP.
+    #[serde(default)]
+    pa: Option<String>,
+    #[serde(default)]
+    pb: Option<String>,
+    #[serde(default)]
+    pc: Option<String>,
+    #[serde(default)]
+    pd: Option<String>,
+    #[serde(default)]
+    pe: Option<String>,
+    #[serde(default)]
+    pf: Option<i64>,
+    #[serde(default)]
+    psnm: Option<String>,
+    #[serde(default)]
+    rrn: Option<String>,
+    #[serde(default)]
+    rm: Option<i64>,
+    #[serde(default)]
+    smp: Option<i64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -747,13 +853,14 @@ fn build_canonical_doc(
     header: DocumentHeader,
     local_number: u32,
     payload: TypedPayload,
-) -> CanonicalDoc {
+    tax_groups: &HashMap<i64, ResolvedTaxGroup>,
+) -> Result<CanonicalDoc, SignError> {
     match (kind, payload) {
         (WireArtifactKind::ShiftOpen, TypedPayload::ShiftOpen(p)) => {
-            CanonicalDoc::ShiftOpen(crate::xml::ShiftOpenPayload {
+            Ok(CanonicalDoc::ShiftOpen(crate::xml::ShiftOpenPayload {
                 header,
                 opening_sum: p.opening_sum_kop,
-            })
+            }))
         }
         (
             WireArtifactKind::Sell,
@@ -761,26 +868,28 @@ fn build_canonical_doc(
                 body,
                 total_sum_kop,
             },
-        ) => CanonicalDoc::Sell(check_payload_from(
+        ) => Ok(CanonicalDoc::Sell(check_payload_from(
             header,
             local_number,
             body,
             total_sum_kop,
-        )),
+            tax_groups,
+        )?)),
         (
             WireArtifactKind::Return,
             TypedPayload::Check {
                 body,
                 total_sum_kop,
             },
-        ) => CanonicalDoc::Return(check_payload_from(
+        ) => Ok(CanonicalDoc::Return(check_payload_from(
             header,
             local_number,
             body,
             total_sum_kop,
-        )),
+            tax_groups,
+        )?)),
         (WireArtifactKind::ZReport, TypedPayload::ZReport(p)) => {
-            CanonicalDoc::ZReport(ZReportPayload {
+            Ok(CanonicalDoc::ZReport(ZReportPayload {
                 header,
                 local_number,
                 tax_summaries: Vec::new(),
@@ -800,7 +909,7 @@ fn build_canonical_doc(
                     return_count: p.return_count,
                 },
                 epz: None,
-            })
+            }))
         }
         // (kind, payload) mismatch is unreachable: parse_payload
         // discriminates on `kind` and returns a TypedPayload variant
@@ -811,55 +920,117 @@ fn build_canonical_doc(
     }
 }
 
+/// W4-Z1 piece 7 — full JSON → xml::CheckPayload conversion.
+///
+/// Carries every optional W4-Z1 attr from the JSON shim plus
+/// derives `tax_summaries` via the pure `derive_tax_summaries`
+/// helper (no DB / network).  Caller MUST pass a pre-resolved
+/// `tax_groups` snapshot (loaded once per receipt via
+/// `driver_tax_mapping` repo).  Empty map → no <TX> children
+/// (Python parity for unknown groups).
+///
+/// Operator pin: aggregation lives HERE, not in adapters; adapter
+/// stays thin and transcribes wire fields only.  See module-level
+/// `tax_summary` for rationale.
 fn check_payload_from(
     header: DocumentHeader,
     local_number: u32,
     body: CheckJson,
     total_sum_kop: i64,
-) -> CheckPayload {
-    CheckPayload {
+    tax_groups: &HashMap<i64, ResolvedTaxGroup>,
+) -> Result<CheckPayload, SignError> {
+    let items: Vec<CheckItem> = body
+        .items
+        .into_iter()
+        .map(|it| CheckItem {
+            code: it.code,
+            name: it.name,
+            price: it.price_kop,
+            quantity: it.quantity_thousandths,
+            sum: it.sum_kop,
+            barcode: it.barcode,
+            uktzed: it.uktzed,
+            tax_group_1: it.tax_group_1,
+            tax_group_2: it.tax_group_2,
+            excise_stamps: it.excise_stamps,
+            adjustments: it.adjustments.into_iter().map(line_adjustment_from).collect(),
+        })
+        .collect();
+
+    let payments: Vec<CheckPayment> = body
+        .payments
+        .into_iter()
+        .map(|p| CheckPayment {
+            name: p.name,
+            sum: p.sum_kop,
+            type_code: p.type_code,
+            pa: p.pa,
+            pb: p.pb,
+            pc: p.pc,
+            pd: p.pd,
+            pe: p.pe,
+            pf: p.pf,
+            psnm: p.psnm,
+            rrn: p.rrn,
+            rm: p.rm,
+            smp: p.smp,
+        })
+        .collect();
+
+    let check_level_adjustments: Vec<CheckLevelAdjustment> = body
+        .check_level_adjustments
+        .into_iter()
+        .map(check_level_adjustment_from)
+        .collect();
+
+    // Derived per operator pin: NEVER taken from wire, always
+    // computed from items + caller-resolved tax_groups snapshot.
+    let tax_summaries = derive_tax_summaries(&items, tax_groups)?;
+
+    Ok(CheckPayload {
         header,
         local_number,
-        items: body
-            .items
-            .into_iter()
-            .map(|it| CheckItem {
-                code: it.code,
-                name: it.name,
-                price: it.price_kop,
-                quantity: it.quantity_thousandths,
-                sum: it.sum_kop,
-                // W4-Z1 optional fields default to None / empty Vec;
-                // populated when W4-Z1 piece 7 conversion-layer lands
-                // (carries excise / tax / discount / barcode / uktzed
-                // from canonical DTO).  Current stage_sign caller is
-                // the legacy minimal-subset path — preserves byte
-                // equivalence with existing goldens.
-                ..Default::default()
-            })
-            .collect(),
-        payments: body
-            .payments
-            .into_iter()
-            .map(|p| CheckPayment {
-                name: p.name,
-                sum: p.sum_kop,
-                type_code: p.type_code,
-                // W4-Z1 optional EPZ/cash attrs default to None;
-                // populated by W4-Z1 piece 7 conversion-layer when
-                // canonical DTO carries acquirer-slip data.
-                ..Default::default()
-            })
-            .collect(),
+        items,
+        payments,
         total_sum: total_sum_kop,
-        // W4-Z1 piece 3: check-level discounts/surcharges default
-        // empty; populated by piece 7 conversion-layer when DTO
-        // carries check-level adjustments.
-        check_level_adjustments: Vec::new(),
-        // W4-Z1 piece 4: header/footer text lines default empty;
-        // piece 7 conversion-layer populates from DTO raw_frames.
-        header_lines: Vec::new(),
-        footer_lines: Vec::new(),
-        tax_summaries: Vec::new(),
+        check_level_adjustments,
+        header_lines: body.header_lines,
+        footer_lines: body.footer_lines,
+        tax_summaries,
+    })
+}
+
+fn line_adjustment_from(adj: LineAdjustmentJson) -> LineAdjustment {
+    LineAdjustment {
+        kind: match adj.kind {
+            AdjustmentKindJson::Discount => LineAdjustmentKind::Discount,
+            AdjustmentKindJson::Surcharge => LineAdjustmentKind::Surcharge,
+        },
+        sum: adj.sum,
+        mode: match adj.mode {
+            AdjustmentModeJson::Value => AdjustmentMode::Value,
+            AdjustmentModeJson::Percent => AdjustmentMode::Percent,
+        },
+        percent: adj.percent,
+        name: adj.name,
+        privilege: adj.privilege,
+        tax_code: adj.tax_code,
+    }
+}
+
+fn check_level_adjustment_from(adj: CheckLevelAdjustmentJson) -> CheckLevelAdjustment {
+    CheckLevelAdjustment {
+        kind: match adj.kind {
+            AdjustmentKindJson::Discount => CheckLevelAdjustmentKind::Discount,
+            AdjustmentKindJson::Surcharge => CheckLevelAdjustmentKind::Surcharge,
+        },
+        sum: adj.sum,
+        mode: match adj.mode {
+            AdjustmentModeJson::Value => AdjustmentMode::Value,
+            AdjustmentModeJson::Percent => AdjustmentMode::Percent,
+        },
+        percent: adj.percent,
+        name: adj.name,
+        applies_to_item_ns: adj.applies_to_item_ns,
     }
 }
