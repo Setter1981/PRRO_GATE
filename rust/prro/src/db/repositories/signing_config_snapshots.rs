@@ -23,6 +23,7 @@
 use sqlx::SqlitePool;
 use thiserror::Error;
 
+use crate::db::tx::WriteTxConn;
 use crate::services::write_path::tax_summary::TaxResolutionSnapshot;
 
 /// Errors surfaced by the repository.
@@ -98,6 +99,47 @@ pub async fn insert_or_get_id(
     .bind(driver_id)
     .bind(sha256.as_slice())
     .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+/// W4-Z2a — tx-bound variant of [`insert_or_get_id`].  Same content-
+/// addressable semantics, but participates in the caller's
+/// `with_immediate` envelope so the resulting `id` is atomic with
+/// other writes (lease + fiscal_documents INSERT in stage_acquire).
+/// Race safety still via UNIQUE constraint.
+pub async fn insert_or_get_id_tx(
+    tx: &mut WriteTxConn<'_>,
+    fn_id: &str,
+    driver_id: &str,
+    snapshot: &TaxResolutionSnapshot,
+) -> Result<i64, SigningConfigSnapshotsRepoError> {
+    let canonical = snapshot.canonical_bytes();
+    let payload_json = std::str::from_utf8(&canonical)
+        .expect("canonical_bytes is ASCII-safe JSON");
+    let sha256 = snapshot.sha256();
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO signing_config_snapshots \
+            (fn, driver_id, kind, payload_json, payload_sha256) \
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(fn_id)
+    .bind(driver_id)
+    .bind(&snapshot.kind)
+    .bind(payload_json)
+    .bind(sha256.as_slice())
+    .execute(&mut **tx)
+    .await?;
+
+    let id: i64 = sqlx::query_scalar(
+        "SELECT id FROM signing_config_snapshots \
+         WHERE fn = ? AND driver_id = ? AND payload_sha256 = ?",
+    )
+    .bind(fn_id)
+    .bind(driver_id)
+    .bind(sha256.as_slice())
+    .fetch_one(&mut **tx)
     .await?;
     Ok(id)
 }

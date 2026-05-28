@@ -360,6 +360,14 @@ fn make_worker_context(
         },
         active_shift: None,
         document,
+        // W4-Z2a piece 6 — test helper uses empty snapshot.  These
+        // stage 3-sign fixtures exercise minimal-payload back-compat
+        // (no tax_group_1 items); empty snapshot triggers the
+        // group_sums-empty short-circuit in derive_check_tax_summaries,
+        // NOT TaxMappingNotWired.
+        tax_resolution_snapshot:
+            prro::services::write_path::tax_summary::TaxResolutionSnapshot::new(Vec::new()),
+        tax_resolution_snapshot_id: 0,
     }
 }
 

@@ -10,7 +10,7 @@
 
 use prro::db::models::enums::{DocType, FiscalMode, NodeMode, Severity, ShiftState};
 use prro::db::models::ids::{RequestId, ShiftId};
-use prro::db::open_pool;
+use prro::db::{open_pool, open_secure_pool};
 use prro::db::repositories::{
     fiscal_documents as fd, fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig,
     ingress_inbox as inbox, ingress_inbox::NewInboxEntry, shifts,
@@ -28,6 +28,21 @@ async fn fresh_pool() -> sqlx::SqlitePool {
     std::mem::forget(dir);
     open_pool(&path).await.unwrap()
 }
+
+// W4-Z2a piece 6 — stage_acquire now requires pool_secure (for
+// tax_snapshot load) + driver_id.  Tests with minimal payloads (no
+// tax_group_1 items) use an empty fresh secure pool — no tax_groups
+// configured → snapshot has empty groups → derive_check_tax_summaries
+// short-circuits without TaxMappingNotWired (which only fires when
+// items reference a tax_group_1).
+async fn fresh_secure_pool() -> sqlx::SqlitePool {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w5-secure.db");
+    std::mem::forget(dir);
+    open_secure_pool(&path).await.unwrap()
+}
+
+const TEST_DRIVER_ID: &str = "test-driver";
 
 async fn seed_fn_config(pool: &sqlx::SqlitePool) {
     fn_repo::insert(
@@ -230,6 +245,7 @@ mod hex {
 #[tokio::test]
 async fn stage1_sell_happy_path_with_opened_shift() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state(
@@ -243,7 +259,7 @@ async fn stage1_sell_happy_path_with_opened_shift() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
 
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
 
@@ -266,6 +282,7 @@ async fn stage1_sell_happy_path_with_opened_shift() {
 #[tokio::test]
 async fn stage1_shift_open_happy_path_with_closed_state() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_with_profiles(
         &pool,
         Some("b"),
@@ -277,7 +294,7 @@ async fn stage1_shift_open_happy_path_with_closed_state() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::ShiftOpen).await;
 
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::ShiftOpen))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ShiftOpen))
         .await
         .unwrap();
 
@@ -295,6 +312,7 @@ async fn stage1_shift_open_happy_path_with_closed_state() {
 #[tokio::test]
 async fn stage1_lease_miss_returns_noop_no_state_mutation_no_audit() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_with_profiles(
         &pool,
         Some("b"),
@@ -317,7 +335,7 @@ async fn stage1_lease_miss_returns_noop_no_state_mutation_no_audit() {
         .await
         .unwrap();
 
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::ShiftOpen))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ShiftOpen))
         .await
         .unwrap();
 
@@ -342,6 +360,7 @@ async fn stage1_lease_miss_returns_noop_no_state_mutation_no_audit() {
 #[tokio::test]
 async fn stage1_resume_detect_existing_prepared_doc_skips_lnd_alloc() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state(
@@ -356,7 +375,7 @@ async fn stage1_resume_detect_existing_prepared_doc_skips_lnd_alloc() {
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
 
     // First call: happy path — INSERTs PREPARED at lnd=1, advances to 2.
-    let _ = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let _ = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
     let lnd_after_first = next_lnd(&pool).await;
@@ -371,7 +390,7 @@ async fn stage1_resume_detect_existing_prepared_doc_skips_lnd_alloc() {
         .unwrap();
 
     // Second call: get_by_request_id_tx finds existing PREPARED → Resumed.
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
 
@@ -395,6 +414,7 @@ async fn stage1_resume_detect_existing_prepared_doc_skips_lnd_alloc() {
 #[tokio::test]
 async fn stage1_unique_fn_lnd_collision_fails_closed() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state(
@@ -409,7 +429,7 @@ async fn stage1_unique_fn_lnd_collision_fails_closed() {
 
     // First call: lnd=1.
     let req1 = seed_inbox_new(&pool, DocType::Sell).await;
-    stage_acquire::run(&pool, req1, cmd(DocType::Sell))
+    stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req1, cmd(DocType::Sell))
         .await
         .unwrap();
     assert_eq!(next_lnd(&pool).await, 2);
@@ -424,7 +444,7 @@ async fn stage1_unique_fn_lnd_collision_fails_closed() {
     // Second call: allocate_next_lnd will return 1 again →
     // INSERT fiscal_documents collision on ux_fd_fn_lnd → tx rollback.
     let req2 = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, req2, cmd(DocType::Sell)).await;
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req2, cmd(DocType::Sell)).await;
     assert!(result.is_err(), "UNIQUE collision must surface as Err");
     let msg = format!("{:?}", result.unwrap_err());
     assert!(
@@ -452,6 +472,7 @@ async fn stage1_unique_fn_lnd_collision_fails_closed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stage1_concurrent_writers_lnd_monotonic() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state(
@@ -468,8 +489,14 @@ async fn stage1_concurrent_writers_lnd_monotonic() {
 
     let p1 = pool.clone();
     let p2 = pool.clone();
-    let t1 = tokio::spawn(async move { stage_acquire::run(&p1, req_a, cmd(DocType::Sell)).await });
-    let t2 = tokio::spawn(async move { stage_acquire::run(&p2, req_b, cmd(DocType::Sell)).await });
+    let ps1 = pool_secure.clone();
+    let ps2 = pool_secure.clone();
+    let t1 = tokio::spawn(async move {
+        stage_acquire::run(&p1, &ps1, TEST_DRIVER_ID, req_a, cmd(DocType::Sell)).await
+    });
+    let t2 = tokio::spawn(async move {
+        stage_acquire::run(&p2, &ps2, TEST_DRIVER_ID, req_b, cmd(DocType::Sell)).await
+    });
     let r1 = t1.await.unwrap().unwrap();
     let r2 = t2.await.unwrap().unwrap();
 
@@ -499,6 +526,7 @@ async fn stage1_concurrent_writers_lnd_monotonic() {
 #[tokio::test]
 async fn stage1_sell_with_closed_shift_rejects_inbox_no_doc() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_with_profiles(
         &pool,
         Some("b"),
@@ -510,7 +538,7 @@ async fn stage1_sell_with_closed_shift_rejects_inbox_no_doc() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
 
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
 
@@ -534,6 +562,7 @@ async fn stage1_sell_with_closed_shift_rejects_inbox_no_doc() {
 #[tokio::test]
 async fn stage1_shift_close_with_opened_shift_proceeds() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state(
@@ -547,7 +576,7 @@ async fn stage1_shift_close_with_opened_shift_proceeds() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::ShiftClose).await;
 
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::ShiftClose))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ShiftClose))
         .await
         .unwrap();
 
@@ -572,6 +601,7 @@ async fn stage1_shift_close_with_opened_shift_proceeds() {
 #[tokio::test]
 async fn stage1_node_blocked_rejects_with_audit() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_with_profiles(
         &pool,
         Some("b"),
@@ -583,7 +613,7 @@ async fn stage1_node_blocked_rejects_with_audit() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
 
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
 
@@ -613,6 +643,7 @@ async fn stage1_node_blocked_rejects_with_audit() {
 #[tokio::test]
 async fn stage1_node_going_online_rejects_with_audit() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_with_profiles(
         &pool,
         Some("b"),
@@ -623,7 +654,7 @@ async fn stage1_node_going_online_rejects_with_audit() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
     assert!(
@@ -645,6 +676,7 @@ async fn stage1_node_going_online_rejects_with_audit() {
 #[tokio::test]
 async fn stage1_node_stop_mode_rejects_with_audit() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_with_profiles(
         &pool,
         Some("b"),
@@ -655,7 +687,7 @@ async fn stage1_node_stop_mode_rejects_with_audit() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
     assert!(
@@ -677,6 +709,7 @@ async fn stage1_node_stop_mode_rejects_with_audit() {
 #[tokio::test]
 async fn stage1_node_crypto_degraded_rejects_with_audit() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_with_profiles(
         &pool,
         Some("b"),
@@ -687,7 +720,7 @@ async fn stage1_node_crypto_degraded_rejects_with_audit() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
     assert!(
@@ -738,6 +771,7 @@ async fn seed_for_shift_state_test(
 async fn stage1_offline_op_on_online_channel_with_pending_drain_refused() {
     // (Sell, OpenedLocalPendingDrain, Online) → ShiftOpenPendingDrainOpRefused.
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_for_shift_state_test(
         &pool,
         NodeMode::Online,
@@ -746,7 +780,7 @@ async fn stage1_offline_op_on_online_channel_with_pending_drain_refused() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
     assert!(
@@ -769,6 +803,7 @@ async fn stage1_offline_op_on_online_channel_with_pending_drain_refused() {
 async fn stage1_sale_on_closing_local_pending_drain_refused() {
     // (Sell, ClosingLocalPendingDrain, _) → PostLocalCloseSaleRefused.
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_for_shift_state_test(
         &pool,
         NodeMode::Online,
@@ -777,7 +812,7 @@ async fn stage1_sale_on_closing_local_pending_drain_refused() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
     assert!(
@@ -799,6 +834,7 @@ async fn stage1_sale_on_closing_local_pending_drain_refused() {
 async fn stage1_shift_close_on_opened_local_pending_drain_refused() {
     // (ShiftClose, OpenedLocalPendingDrain, _) → OfflineShiftCloseNotSupported.
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_for_shift_state_test(
         &pool,
         NodeMode::Online,
@@ -807,7 +843,7 @@ async fn stage1_shift_close_on_opened_local_pending_drain_refused() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::ShiftClose).await;
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::ShiftClose))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ShiftClose))
         .await
         .unwrap();
     assert!(
@@ -830,6 +866,7 @@ async fn stage1_shift_open_on_closing_local_pending_drain_refused() {
     // NIT-C4-1 fix: (ShiftOpen, ClosingLocalPendingDrain, _) → ShiftClosingInFlight
     // (NOT ShiftAlreadyOpen — pre-fix code mis-labelled this cell).
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_for_shift_state_test(
         &pool,
         NodeMode::Online,
@@ -838,7 +875,7 @@ async fn stage1_shift_open_on_closing_local_pending_drain_refused() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::ShiftOpen).await;
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::ShiftOpen))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ShiftOpen))
         .await
         .unwrap();
     assert!(
@@ -864,6 +901,7 @@ async fn stage1_offline_sell_on_opened_local_pending_drain_carries_shift_id() {
     // Without this, the doc would orphan its shift binding and break
     // future W9b drain-time signer enforcement.
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     let shift_id = seed_for_shift_state_test(
         &pool,
         NodeMode::Offline,
@@ -872,7 +910,7 @@ async fn stage1_offline_sell_on_opened_local_pending_drain_carries_shift_id() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
     let ctx = match result {
@@ -919,6 +957,7 @@ async fn stage1_offline_op_on_opened_local_pending_drain_missing_shift_id_is_inv
     // = None must surface as ShiftInvariantViolation, NOT silently
     // proceed with shift_id = None.
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_with_profiles(
         &pool,
         Some("b"),
@@ -929,7 +968,7 @@ async fn stage1_offline_op_on_opened_local_pending_drain_missing_shift_id_is_inv
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
     assert!(
@@ -949,6 +988,7 @@ async fn stage1_z_report_on_opened_local_pending_drain_offline_blocked() {
     // (ZReport, OpenedLocalPendingDrain, Offline) → ZReportBlockedBacklogDrainPending.
     // Pre-W10 guardrail per operator correction #3 (2026-05-19).
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_for_shift_state_test(
         &pool,
         NodeMode::Offline,
@@ -957,7 +997,7 @@ async fn stage1_z_report_on_opened_local_pending_drain_offline_blocked() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::ZReport).await;
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::ZReport))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ZReport))
         .await
         .unwrap();
     assert!(
@@ -984,6 +1024,7 @@ async fn stage1_z_report_on_opened_local_pending_drain_offline_blocked() {
 #[tokio::test]
 async fn stage1_shift_invariant_violation_caught() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_with_profiles(
         &pool,
         Some("b"),
@@ -995,7 +1036,7 @@ async fn stage1_shift_invariant_violation_caught() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
 
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
 
@@ -1021,6 +1062,7 @@ async fn stage1_shift_invariant_violation_caught() {
 #[tokio::test]
 async fn stage1_missing_profile_binding_rejects_inbox_no_doc_no_lnd() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     // backend_profile_id explicitly NULL.
     seed_fn_with_profiles(
         &pool,
@@ -1033,7 +1075,7 @@ async fn stage1_missing_profile_binding_rejects_inbox_no_doc_no_lnd() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::ShiftOpen).await;
 
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::ShiftOpen))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ShiftOpen))
         .await
         .unwrap();
 
@@ -1070,6 +1112,7 @@ async fn stage1_missing_profile_binding_rejects_inbox_no_doc_no_lnd() {
 #[tokio::test]
 async fn stage1_command_inbox_hash_mismatch_rejects_no_doc_no_lnd() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state(
@@ -1084,7 +1127,7 @@ async fn stage1_command_inbox_hash_mismatch_rejects_no_doc_no_lnd() {
     // inbox carries a non-zero hash; cmd() carries [0u8; 32].
     let req_id = seed_inbox_with_overrides(&pool, DocType::Sell.as_str(), [0xAAu8; 32]).await;
 
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
 
@@ -1108,6 +1151,7 @@ async fn stage1_command_inbox_hash_mismatch_rejects_no_doc_no_lnd() {
 #[tokio::test]
 async fn stage1_command_inbox_doc_type_mismatch_rejects_no_doc_no_lnd() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state(
@@ -1122,7 +1166,7 @@ async fn stage1_command_inbox_doc_type_mismatch_rejects_no_doc_no_lnd() {
     // inbox.operation_type = "RETURN", cmd.doc_type = SELL — mismatch.
     let req_id = seed_inbox_with_overrides(&pool, "RETURN", [0u8; 32]).await;
 
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
 
@@ -1142,6 +1186,7 @@ async fn stage1_command_inbox_doc_type_mismatch_rejects_no_doc_no_lnd() {
 #[tokio::test]
 async fn stage1_terminal_existing_doc_rejects_not_resumed() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state(
@@ -1177,7 +1222,7 @@ async fn stage1_terminal_existing_doc_rejects_not_resumed() {
     .await
     .unwrap();
 
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::Sell))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
         .await
         .unwrap();
 
@@ -1213,6 +1258,7 @@ async fn stage1_terminal_existing_doc_rejects_not_resumed() {
 #[tokio::test]
 async fn stage1_shift_open_against_error_state_rejects_as_shift_in_error() {
     let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
     seed_fn_with_profiles(
         &pool,
         Some("b"),
@@ -1224,7 +1270,7 @@ async fn stage1_shift_open_against_error_state_rejects_as_shift_in_error() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::ShiftOpen).await;
 
-    let result = stage_acquire::run(&pool, req_id, cmd(DocType::ShiftOpen))
+    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ShiftOpen))
         .await
         .unwrap();
 

@@ -44,10 +44,27 @@ use super::types::{Channel, CanonicalFiscalCommand, RejectionReason, WorkerConte
 ///   appended.  NO fiscal_documents row, NO lnd advance.
 pub async fn run(
     pool: &SqlitePool,
+    pool_secure: &SqlitePool,
+    driver_id: &str,
     request_id: [u8; 16],
     command: CanonicalFiscalCommand,
 ) -> anyhow::Result<WorkerProcessResult> {
+    // W4-Z2a piece 6 — snapshot load + insert happen INSIDE the
+    // main with_immediate envelope below, AFTER lease provides
+    // `inbox.fiscal_number`.  Load reads pool_secure (separate DB
+    // per HIGH-AUDIT-01 isolation — no lock contention with main
+    // pool's write tx).  Insert via `insert_or_get_id_tx` is atomic
+    // with lease + fiscal_documents INSERT.  Failure aborts the
+    // entire envelope (lease rolled back; no orphan rows).
+    //
+    // Invariant 1 preserved: only short DB statements inside the
+    // tx (no network, no crypto, no long compute).
+    let pool_secure_clone = pool_secure.clone();
+    let driver_id_owned = driver_id.to_string();
+
     with_immediate(pool, move |tx| {
+        let pool_secure = pool_secure_clone.clone();
+        let driver_id = driver_id_owned.clone();
         Box::pin(async move {
             // [Step 1] Acquire lease — CAS NEW → PROCESSING.
             let inbox = match ingress_inbox::acquire_lease(tx, &request_id).await? {
@@ -55,6 +72,20 @@ pub async fn run(
                 None => return Ok(WorkerProcessResult::Noop),
             };
             let fn_id = inbox.fiscal_number.clone();
+
+            // [Step 1a] W4-Z2a piece 6 — load tax_groups from
+            //           pool_secure (separate DB; no lock contention).
+            //           Insert snapshot via tx-variant — atomic with
+            //           rest of envelope (lease + later fiscal_documents
+            //           INSERT).
+            let tax_snapshot = crate::runtime::tax_snapshot::load_for_fn_driver(
+                &pool_secure, &fn_id, &driver_id,
+            ).await?;
+            let tax_snapshot_id =
+                crate::db::repositories::signing_config_snapshots::insert_or_get_id_tx(
+                    tx, &fn_id, &driver_id, &tax_snapshot,
+                )
+                .await?;
 
             // [Step 1b] Command-vs-inbox cross-check.  The leased
             //           inbox row carries `payload_json`,
@@ -304,6 +335,8 @@ pub async fn run(
                     node_state,
                     active_shift,
                     document: existing,
+                    tax_resolution_snapshot: tax_snapshot.clone(),
+                    tax_resolution_snapshot_id: tax_snapshot_id,
                 }));
             }
 
@@ -421,6 +454,8 @@ pub async fn run(
                 node_state,
                 active_shift,
                 document,
+                tax_resolution_snapshot: tax_snapshot,
+                tax_resolution_snapshot_id: tax_snapshot_id,
             }))
         })
     })

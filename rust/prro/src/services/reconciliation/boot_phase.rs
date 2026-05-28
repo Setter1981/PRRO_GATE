@@ -2438,6 +2438,25 @@ async fn dispatch_prepared_via_chain(
         node_state,
         active_shift,
         document: doc.clone(),
+        // W4-Z2a piece 6 — recovery path placeholder.  Boot reconciliation
+        // can encounter docs in two states:
+        //   (a) PREPARED + pinned (signing_config_snapshot_id IS NOT NULL)
+        //   (b) PREPARED + not yet pinned (snapshot_id IS NULL)
+        // Per locked design rule #9 ("MAC recovery uses persisted
+        // snapshot_id, NEVER reloads current config"), case (a) MUST
+        // re-load via get_by_id.  Case (b) needs a fresh load just like
+        // stage_acquire does for new docs.  Piece 8/9 wires this
+        // properly via fd::get_signing_inputs_tx + branching.  For piece
+        // 6 we ship an empty placeholder snapshot; the doc's actual
+        // snapshot will be re-derived in stage_sign 3-PRE re-entry
+        // (existing PERSISTED previous_hash + reuse branch logic).
+        // Tests for back-compat docs (no tax_group_1 items) continue
+        // passing — empty snapshot + TaxMappingNotWired guard only fires
+        // for taxable items, none of which exist in the recovery test
+        // fixture set today.
+        tax_resolution_snapshot:
+            crate::services::write_path::tax_summary::TaxResolutionSnapshot::new(Vec::new()),
+        tax_resolution_snapshot_id: 0,
     };
 
     // (2) stage_sign::run drives PREPARED → SIGNED via its own

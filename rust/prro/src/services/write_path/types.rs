@@ -77,6 +77,21 @@ pub struct WorkerContext {
     /// PERSISTED bindings — stages 3+ MUST use these, not the
     /// possibly-drifted `node_state.*_profile_id`.
     pub document: DocumentRow,
+    /// W4-Z2a piece 6 — frozen tax-resolution snapshot for this
+    /// receipt.  Loaded at stage_acquire time from `pool_secure`
+    /// via `runtime::tax_snapshot::load_for_fn_driver` and
+    /// persisted in main pool via
+    /// `signing_config_snapshots::insert_or_get_id`.  Carried into
+    /// stage_sign verbatim (no re-load).  Recovery from MAC-recovery
+    /// / boot does NOT use this field — those paths re-load
+    /// snapshot by `signing_config_snapshot_id` persisted on the
+    /// fiscal_documents row (piece 9).
+    pub tax_resolution_snapshot: crate::services::write_path::tax_summary::TaxResolutionSnapshot,
+    /// W4-Z2a piece 6 — id from `signing_config_snapshots` for the
+    /// snapshot above.  Used by stage_sign 3-PRE pin (piece 8) to
+    /// atomically write `fiscal_documents.signing_config_snapshot_id`
+    /// alongside `previous_hash` + `z_report_number`.
+    pub tax_resolution_snapshot_id: i64,
 }
 
 /// Reason for a stage-2 guard rejection.  Carried by
