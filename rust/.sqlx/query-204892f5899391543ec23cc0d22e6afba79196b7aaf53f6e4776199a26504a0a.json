@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n              COUNT(*)                                       AS \"total!: i64\",\n              SUM(CASE WHEN state = 'ACK' THEN 1 ELSE 0 END) AS \"ack_count: i64\"\n           FROM fiscal_documents\n           WHERE offline_session_id = ?\n             AND fs_mode = 'OFFLINE'",
+  "describe": {
+    "columns": [
+      {
+        "name": "total!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "ack_count: i64",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "204892f5899391543ec23cc0d22e6afba79196b7aaf53f6e4776199a26504a0a"
+}

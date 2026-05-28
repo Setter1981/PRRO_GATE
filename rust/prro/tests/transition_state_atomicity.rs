@@ -77,6 +77,9 @@ fn sample_doc(fn_id: &str) -> NewDocument {
         unsigned_xml_sha256: None,
         previous_hash: None,
         signed_by_cashier_id: None,
+        // W4-Z2a piece 6b.1 — test fixture: None (test doesn't
+        // exercise FK semantics).
+        signing_config_snapshot_id: None,
     }
 }
 

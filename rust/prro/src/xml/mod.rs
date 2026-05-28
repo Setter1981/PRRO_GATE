@@ -255,6 +255,50 @@ pub enum CalcTaxError {
          (driver_tax_mapping not wired yet — W4-Z2)"
     )]
     TaxMappingNotWired { referenced_groups: Vec<i64> },
+    /// W4-Z2a piece 14 + 15 (external review CRIT + M1) — POS sent
+    /// `tax_group_<field> = driver_number` but the snapshot's
+    /// `driver_mapping` (non-empty) has no entry for that
+    /// driver_number → canonical_tx_num lookup MISS.  Fail-loud
+    /// here so we don't emit `<I TX="<driver_number>">` + drop
+    /// `<TX>` summary (silent fiscal divergence).  Operator
+    /// inspects via audit_log + reject doc — NEVER retry, NEVER
+    /// route to Manual reconciliation (per
+    /// `feedback_manual_recon_catastrophe` empirics).
+    ///
+    /// `field` discriminator: "tax_group_1" (primary) vs
+    /// "tax_group_2" (secondary, compound-tax line).  Both groups
+    /// are translated through the same driver_mapping; field-aware
+    /// surface tells operator which item slot drifted.
+    #[error(
+        "driver_tax_mapping miss: POS sent {field}={driver_number} \
+         but snapshot's driver_mapping has no entry — config drift / new driver"
+    )]
+    DriverMappingMiss {
+        driver_number: i64,
+        field: &'static str,
+    },
+    /// W4-Z2a piece 15 (external review round 2 H1) — snapshot
+    /// self-inconsistency: `driver_mapping` translates
+    /// `driver_number → canonical_tx_num` but `groups` has no
+    /// entry for that `canonical_tx_num`.  Without this guard,
+    /// `<I TX="<canonical_tx_num>">` would emit and
+    /// `derive_check_tax_summaries` would silently skip the
+    /// missing canonical group → silent fiscal divergence one
+    /// step later (same class as the original piece-14 CRIT).
+    ///
+    /// Should not happen with admin-validated snapshots
+    /// (`try_from_live` enforces); defensive guard at
+    /// `check_payload_from` after translation catches manual SQL
+    /// drift / corrupted snapshots loaded via `get_by_id`.
+    #[error(
+        "snapshot self-inconsistency: {field} driver_number={driver_number} \
+         maps to canonical_tx_num={canonical_tx_num} but tax_groups has no such entry"
+    )]
+    CanonicalTxNotInGroups {
+        driver_number: i64,
+        canonical_tx_num: i64,
+        field: &'static str,
+    },
 }
 
 /// W4-Z1 piece 5 — `_calc_tax` per ФСКО TXAL formulas.  Mirror of

@@ -49,6 +49,19 @@ pub struct NewDocument {
     /// stage_send 4-pre by signer_guard.  None for system-context paths
     /// without operator attribution (none currently).
     pub signed_by_cashier_id: Option<CashierId>,
+    /// W4-Z2a piece 6b.1 (external mid-review CRIT-2) — FK to
+    /// `signing_config_snapshots.id` for the snapshot row inserted
+    /// by stage_acquire in the SAME with_immediate envelope as
+    /// this row.  Setting FK at INSERT (not at 3-PRE pin) closes
+    /// the two-envelope crash window: any taxable PREPARED doc on
+    /// disk already references its frozen tax config snapshot.
+    ///
+    /// `Some(id)` is the only production value (stage_acquire
+    /// always inserts a snapshot row for the receipt's FN+driver).
+    /// `None` is reserved for pre-W4-Z2a docs persisted before
+    /// migration 020 ran — those rows already exist with NULL,
+    /// not via this fresh-INSERT path.
+    pub signing_config_snapshot_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +105,17 @@ pub struct DocumentRow {
     /// 4-pre by signer_guard.  `None` for pre-W14a-2b ledger rows
     /// (column added in migration 017_signed_by_cashier_id.sql).
     pub signed_by_cashier_id: Option<CashierId>,
+    /// W4-Z2a piece 6b mid-fix CRIT-2 (external mid-review) — FK to
+    /// `signing_config_snapshots.id` for the snapshot row pinned to
+    /// this document.  Set at INSERT PREPARED (atomic with lease in
+    /// stage_acquire) and never drifts (COALESCE-preserve in pin's
+    /// UPDATE).  Mirror of `PinnedSigningInputs.signing_config_snapshot_id`
+    /// — same row, both struct shapes now expose it to callers that
+    /// don't use the pinned-inputs read path (e.g., MAC recovery's
+    /// MR-NO-TX read in piece 9 / boot recovery in stage_acquire).
+    /// `None` for pre-W4-Z2a ledger rows (column added in migration
+    /// 020_signing_config_snapshots.sql).
+    pub signing_config_snapshot_id: Option<i64>,
 }
 
 /// W6 — decode a length-32 BLOB into a fixed `[u8; 32]`.  Fail-closed:
@@ -223,8 +247,8 @@ pub async fn insert_prepared(pool: &SqlitePool, n: &NewDocument) -> sqlx::Result
              lnd, doc_type, state, backend_profile_id, transport_profile_id,
              fs_mode, business_ts, total_sum_kop, payload_json,
              payload_sha256_canonical, unsigned_xml_sha256, previous_hash,
-             signed_by_cashier_id
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+             signed_by_cashier_id, signing_config_snapshot_id
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(n.document_id)
     .bind(n.request_id)
@@ -243,6 +267,7 @@ pub async fn insert_prepared(pool: &SqlitePool, n: &NewDocument) -> sqlx::Result
     .bind(n.unsigned_xml_sha256.as_ref().map(|b| &b[..]))
     .bind(n.previous_hash.as_ref().map(|b| &b[..]))
     .bind(n.signed_by_cashier_id.as_ref().map(|c| c.as_str()))
+    .bind(n.signing_config_snapshot_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -453,7 +478,8 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
                   z_report_number,
                   unsigned_xml_sha256   as "unsigned_xml_sha256: Vec<u8>",
                   signing_inputs_pinned_at,
-                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId"
+                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId",
+                  signing_config_snapshot_id
            FROM fiscal_documents
            WHERE fiscal_number = ?
              AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')
@@ -479,6 +505,7 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
                 unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
                 signing_inputs_pinned_at: r.signing_inputs_pinned_at,
                 signed_by_cashier_id: r.signed_by_cashier_id,
+                signing_config_snapshot_id: r.signing_config_snapshot_id,
             })
         })
         .collect()
@@ -562,7 +589,8 @@ pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
                   z_report_number,
                   unsigned_xml_sha256   as "unsigned_xml_sha256: Vec<u8>",
                   signing_inputs_pinned_at,
-                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId"
+                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId",
+                  signing_config_snapshot_id
            FROM fiscal_documents
            WHERE fiscal_number = ?
              AND offline_session_id = ?
@@ -591,6 +619,7 @@ pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
                 unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
                 signing_inputs_pinned_at: r.signing_inputs_pinned_at,
                 signed_by_cashier_id: r.signed_by_cashier_id,
+                signing_config_snapshot_id: r.signing_config_snapshot_id,
             })
         })
         .collect()
@@ -683,7 +712,8 @@ pub async fn get_pending_by_request_id_tx(
                   z_report_number,
                   unsigned_xml_sha256   as "unsigned_xml_sha256: Vec<u8>",
                   signing_inputs_pinned_at,
-                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId"
+                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId",
+                  signing_config_snapshot_id
            FROM fiscal_documents
            WHERE request_id = ?
              AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')"#,
@@ -707,7 +737,44 @@ pub async fn get_pending_by_request_id_tx(
         unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
         signing_inputs_pinned_at: r.signing_inputs_pinned_at,
         signed_by_cashier_id: r.signed_by_cashier_id,
+        signing_config_snapshot_id: r.signing_config_snapshot_id,
     }))
+}
+
+/// W4-Z2a piece 15 (review round 2 M2 — Resume reload hoist) —
+/// pool-bound minimal-info peek of a pending fiscal_documents row
+/// by `request_id`.  Returns `(document_id, signing_config_
+/// snapshot_id)` if a pending row exists.  Same state filter as
+/// [`get_pending_by_request_id_tx`].
+///
+/// **Use**: stage_acquire pre-tx peek to pre-load the persisted
+/// snapshot via `signing_config_snapshots::get_by_id` BEFORE
+/// opening the main `with_immediate` envelope.  Locked rule #9
+/// + INV-1 spirit: keep the write tx short, fail-loud reload
+/// failure via a separately-committed audit (pattern from
+/// `boot_phase::run_for_doc_prepared` piece 13 fix).
+///
+/// **Race semantics**: pool read happens before the lease CAS.
+/// Between this peek and the inside-tx `get_pending_by_request_
+/// id_tx`, the doc may transition to terminal (boot recon, MAC
+/// recovery, admin SQL).  Caller treats peek result as advisory:
+/// if tx-time check finds no pending row, the pre-loaded snapshot
+/// is silently discarded.  Tx-time check is authoritative.
+pub async fn peek_pending_doc_id_and_snapshot_id_by_request_id(
+    pool: &SqlitePool,
+    request_id: &RequestId,
+) -> sqlx::Result<Option<(DocumentId, Option<i64>)>> {
+    let row = sqlx::query!(
+        r#"SELECT document_id as "document_id: DocumentId",
+                  signing_config_snapshot_id
+           FROM fiscal_documents
+           WHERE request_id = ?
+             AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')"#,
+        request_id,
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| (r.document_id, r.signing_config_snapshot_id)))
 }
 
 /// W5 / W0-1 §3.1 stage 1 — companion to
@@ -752,8 +819,8 @@ pub async fn insert_prepared_tx(tx: &mut WriteTxConn<'_>, n: &NewDocument) -> sq
              lnd, doc_type, state, backend_profile_id, transport_profile_id,
              fs_mode, business_ts, total_sum_kop, payload_json,
              payload_sha256_canonical, unsigned_xml_sha256, previous_hash,
-             signed_by_cashier_id
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+             signed_by_cashier_id, signing_config_snapshot_id
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(n.document_id)
     .bind(n.request_id)
@@ -772,6 +839,7 @@ pub async fn insert_prepared_tx(tx: &mut WriteTxConn<'_>, n: &NewDocument) -> sq
     .bind(n.unsigned_xml_sha256.as_ref().map(|b| &b[..]))
     .bind(n.previous_hash.as_ref().map(|b| &b[..]))
     .bind(n.signed_by_cashier_id.as_ref().map(|c| c.as_str()))
+    .bind(n.signing_config_snapshot_id)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -792,6 +860,16 @@ pub struct PinnedSigningInputs {
     pub is_pinned: bool,
     pub previous_hash: Option<[u8; 32]>,
     pub z_report_number: Option<i64>,
+    /// W4-Z2a piece 4 — pinned `signing_config_snapshots.id` FK.
+    /// `None` for two semantically distinct cases:
+    ///   1. Pre-W4-Z2a doc (migration column added as nullable) —
+    ///      app-layer rule: NULL + no tax_group_1 items → ALLOW with
+    ///      info audit; NULL + ANY tax_group_1 item →
+    ///      RequiresManualReconciliation.
+    ///   2. Doc not yet pinned (`is_pinned == false`).
+    /// Disambiguate with `is_pinned`: pinned=true + None = case 1;
+    /// pinned=false = pin hasn't happened yet (any path).
+    pub signing_config_snapshot_id: Option<i64>,
 }
 
 /// W6 stage 3-PRE — read state + pin status atomically inside the
@@ -801,10 +879,11 @@ pub async fn get_signing_inputs_tx(
     doc_id: DocumentId,
 ) -> sqlx::Result<Option<PinnedSigningInputs>> {
     let row = sqlx::query!(
-        r#"SELECT state                    as "state: DocState",
-                  previous_hash            as "previous_hash: Vec<u8>",
+        r#"SELECT state                       as "state: DocState",
+                  previous_hash               as "previous_hash: Vec<u8>",
                   z_report_number,
-                  signing_inputs_pinned_at
+                  signing_inputs_pinned_at,
+                  signing_config_snapshot_id
            FROM fiscal_documents WHERE document_id = ?"#,
         doc_id
     )
@@ -816,6 +895,7 @@ pub async fn get_signing_inputs_tx(
         is_pinned: r.signing_inputs_pinned_at.is_some(),
         previous_hash: decode_blob32(r.previous_hash, "previous_hash")?,
         z_report_number: r.z_report_number,
+        signing_config_snapshot_id: r.signing_config_snapshot_id,
     }))
 }
 
@@ -840,19 +920,47 @@ pub async fn pin_signing_inputs_tx(
     doc_id: DocumentId,
     previous_hash: Option<&[u8; 32]>,
     z_report_number: Option<i64>,
+    signing_config_snapshot_id: Option<i64>,
 ) -> sqlx::Result<u64> {
+    // W4-Z2a piece 8a (CRIT-1 close per `PRRO_GATE-vax` +
+    // spec rule #14): UPDATE preserves INSERT-set FK via
+    // `COALESCE(existing, ?)` AND a WHERE-guard rejects the
+    // structural-conflict case where caller's `Some(Y)` differs
+    // from existing `Some(X)`.  Combined truth-table:
+    //   existing Some(X) + caller None     → keeps X       (rows=1, no wipe)
+    //   existing Some(X) + caller Some(X)  → keeps X       (rows=1, idempotent match)
+    //   existing Some(X) + caller Some(Y)  → guard rejects (rows=0, SnapshotIdMismatch)
+    //   existing NULL    + caller Some(Y)  → Y             (rows=1, legacy backfill)
+    //   existing NULL    + caller None     → NULL          (rows=1, unchanged)
+    //
+    // Disambiguation pattern (per ADR-M3-A4 / W0-2 §4.4): on
+    // rows_affected=0, caller (stage_sign 3-PRE) re-reads via
+    // `get_signing_inputs_tx` inside the same `with_immediate`
+    // envelope.  SQLite RESERVED-lock guarantees visibility.
+    // Caller compares persisted FK against its `caller_snapshot_id`
+    // to distinguish StateConflict / Reused / RowMissing from
+    // SnapshotIdMismatch (the CRIT-1 fail-loud case).
     let res = sqlx::query(
         "UPDATE fiscal_documents \
-         SET previous_hash            = ?, \
-             z_report_number          = ?, \
-             signing_inputs_pinned_at = CURRENT_TIMESTAMP \
+         SET previous_hash              = ?, \
+             z_report_number            = ?, \
+             signing_config_snapshot_id = COALESCE(signing_config_snapshot_id, ?), \
+             signing_inputs_pinned_at   = CURRENT_TIMESTAMP \
          WHERE document_id = ? \
            AND state = 'PREPARED' \
-           AND signing_inputs_pinned_at IS NULL",
+           AND signing_inputs_pinned_at IS NULL \
+           AND ( \
+                 signing_config_snapshot_id IS NULL \
+                 OR ? IS NULL \
+                 OR signing_config_snapshot_id = ? \
+               )",
     )
     .bind(previous_hash.map(|h| &h[..]))
     .bind(z_report_number)
+    .bind(signing_config_snapshot_id)
     .bind(doc_id)
+    .bind(signing_config_snapshot_id)
+    .bind(signing_config_snapshot_id)
     .execute(&mut **tx)
     .await?;
     Ok(res.rows_affected())

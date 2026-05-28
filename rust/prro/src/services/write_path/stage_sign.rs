@@ -50,10 +50,8 @@ use crate::xml::{
     LineAdjustmentKind, ZReportCheckCount, ZReportPayload, ZReportPaymentSum,
 };
 
-use super::tax_summary::{derive_check_tax_summaries, ResolvedTaxGroup};
+use super::tax_summary::{derive_check_tax_summaries, TaxResolutionSnapshot};
 use super::types::WorkerContext;
-
-use std::collections::HashMap;
 
 // ─── Public types ─────────────────────────────────────────────────────
 
@@ -84,6 +82,19 @@ pub enum SignError {
     #[error("stage 3-PRE state conflict: doc {document_id:?} observed in {observed:?}, expected Prepared")]
     StateConflict {
         observed: DocState,
+        document_id: DocumentId,
+    },
+    /// W4-Z2a piece 8a (CRIT-1 close per spec rule #14): caller's
+    /// `signing_config_snapshot_id = Some(caller)` differs from
+    /// the persisted `Some(existing)`.  Fail-loud drift surface —
+    /// signing path MUST NOT proceed, MAC chain would otherwise
+    /// be re-derived from a tax-config the persisted doc was not
+    /// pinned to.  Reject doc (deterministic config defect — never
+    /// retry).
+    #[error("stage 3-PRE snapshot_id mismatch: doc {document_id:?} persisted={existing}, caller={caller}")]
+    SnapshotIdMismatch {
+        existing: i64,
+        caller: i64,
         document_id: DocumentId,
     },
     #[error("stage 3 unsupported doc type: {doc_type:?}")]
@@ -185,7 +196,11 @@ pub async fn run(
     incoming: WorkerContext,
 ) -> Result<SigningOutcome, SignError> {
     let WorkerContext {
-        command, document, ..
+        command,
+        document,
+        tax_resolution_snapshot,
+        tax_resolution_snapshot_id,
+        ..
     } = incoming;
     let doc_id = document.document_id;
     let fn_id = document.fiscal_number.clone();
@@ -212,6 +227,15 @@ pub async fn run(
     // non-inline form (block expression, variable, fn pointer) since
     // those bypass closure-body inspection.
     let fn_id_for_pin = fn_id.clone();
+    // W4-Z2a piece 8b — caller's snapshot id is the FK that
+    // stage_acquire INSERT-set in the same fiscal_documents row.
+    // Variants:
+    //   Some(_)  Proceed path: matches existing FK; pin idempotent
+    //            (COALESCE existing-wins keeps the same value).
+    //   None     Resume / boot recovery / fixture paths: WHERE-guard
+    //            matches `? IS NULL`, COALESCE preserves existing FK.
+    //            Piece 9 wires MR-NO-TX to read persisted FK separately.
+    let caller_snapshot_id: Option<i64> = tax_resolution_snapshot_id;
     let pinned: PinResult = with_immediate(pool, move |tx| {
         let fn_id = fn_id_for_pin;
         Box::pin(async move {
@@ -224,6 +248,24 @@ pub async fn run(
                 return Ok(PinResult::StateConflict {
                     observed: inputs.state,
                 });
+            }
+
+            // W4-Z2a piece 8a — fail-loud drift surface.  If the
+            // caller passes `Some(caller)` AND existing FK is
+            // `Some(existing != caller)`, reject BEFORE the pin
+            // UPDATE (the SQL WHERE-guard is defence-in-depth for
+            // a hypothetical race between this re-read and the
+            // UPDATE — RESERVED-lock makes that impossible, but
+            // the guard documents intent).  Applies whether the
+            // row is already pinned (re-entry drift) or fresh
+            // (first-pin drift).
+            if let (Some(existing), Some(caller)) = (
+                inputs.signing_config_snapshot_id,
+                caller_snapshot_id,
+            ) {
+                if existing != caller {
+                    return Ok(PinResult::SnapshotIdMismatch { existing, caller });
+                }
             }
 
             if inputs.is_pinned {
@@ -251,7 +293,16 @@ pub async fn run(
                 _ => None,
             };
 
-            let rows = fd::pin_signing_inputs_tx(tx, doc_id, seed.as_ref(), z).await?;
+            // W4-Z2a piece 4: pin_signing_inputs_tx signature widened with
+            // signing_config_snapshot_id.  Piece 8 will populate from
+            // WorkerContext after stage_acquire loads + inserts snapshot.
+            // For piece 4 we pass None — preserves existing behaviour
+            // (column stays NULL); back-compat semantic per locked design:
+            // NULL + no tax_group_1 items → ALLOW (this commit's path).
+            let rows = fd::pin_signing_inputs_tx(
+                tx, doc_id, seed.as_ref(), z, caller_snapshot_id,
+            )
+            .await?;
 
             if rows == 0 {
                 // Pin-once guard rejected: re-read truth.  Either
@@ -311,6 +362,13 @@ pub async fn run(
                 document_id: doc_id,
             })
         }
+        PinResult::SnapshotIdMismatch { existing, caller } => {
+            return Err(SignError::SnapshotIdMismatch {
+                existing,
+                caller,
+                document_id: doc_id,
+            })
+        }
         PinResult::RowMissing | PinResult::PinLost => {
             return Err(SignError::RowMissing {
                 document_id: doc_id,
@@ -339,6 +397,19 @@ pub async fn run(
             lnd,
             z_report_number,
             previous_hash: previous_hash_raw.as_ref(),
+            // W4-Z2a piece 14 + 15 (CRIT-1 + R1 round-3 fixes) — full
+            // snapshot through for driver_mapping translation of BOTH
+            // tax_group_1 AND tax_group_2 (`translate_tax_group` invoked
+            // per-field with field discriminator), plus canonical_tx ∈
+            // groups validation, plus tax aggregation.  Variants:
+            //   - Proceed: Some(snapshot matches-FK)
+            //   - Resume (piece 15 hoist): Some(historic snapshot)
+            //     pre-loaded outside lease tx via pool-bound get_by_id
+            //   - Boot recovery (piece 13): Some(historic snapshot)
+            //     pre-loaded by boot_phase before constructing
+            //     WorkerContext
+            //   - Pre-W4-Z2a back-compat: None
+            tax_resolution: tax_resolution_snapshot,
         })
         .await?;
 
@@ -417,6 +488,9 @@ pub async fn run(
         signing_inputs_pinned_at: document.signing_inputs_pinned_at.or(Some(now_iso)),
         // W14a-2b Commit 1: pass-through from input DocumentRow.
         signed_by_cashier_id: document.signed_by_cashier_id,
+        // W4-Z2a piece 6b — FK pinned at INSERT PREPARED, never
+        // mutated by stage_sign; pass-through.
+        signing_config_snapshot_id: document.signing_config_snapshot_id,
     };
 
     Ok(SigningOutcome {
@@ -479,10 +553,11 @@ pub struct ReSignedArtifacts {
 /// CAS / state variants are NOT reachable because this fn does no
 /// DB I/O.
 ///
-/// **Argument count.**  10 args is intentional — every input is a
-/// distinct per-call value the orchestrator pulls from a different
-/// row / column.  Wrapping into an `ReSignInputs` struct adds one
-/// indirection without reducing the actual surface area.  Clippy
+/// **Argument count.**  11 args is intentional (piece 9 adds
+/// `tax_groups`) — every input is a distinct per-call value the
+/// orchestrator pulls from a different row / column / repository.
+/// Wrapping into an `ReSignInputs` struct adds one indirection
+/// without reducing the actual surface area.  Clippy
 /// `too_many_arguments` lint suppressed at the function level.
 #[allow(clippy::too_many_arguments)]
 pub async fn re_sign_after_mac_recovery(
@@ -496,6 +571,17 @@ pub async fn re_sign_after_mac_recovery(
     lnd: i64,
     z_report_number: Option<i64>,
     new_previous_hash: [u8; 32],
+    // W4-Z2a piece 14 (CRIT-1 fix) — pre-loaded persisted snapshot
+    // (was `tax_groups: HashMap` in piece 9; now the full
+    // TaxResolutionSnapshot so check_payload_from can translate
+    // driver_number → canonical TX via resolve_driver_number).
+    // Caller (`mac_recovery::run_mac_recovery`) reads the doc's
+    // `signing_config_snapshot_id`, hits `signing_config_snapshots::
+    // get_by_id` (sha256-verified, V1-validated), and passes the
+    // result here.  None for pre-W4-Z2a docs (FK NULL).  Preserves
+    // the "no DB read inside re_sign" contract — function stays
+    // pure-CPU + crypto.
+    tax_resolution: Option<TaxResolutionSnapshot>,
 ) -> Result<ReSignedArtifacts, SignError> {
     // R-W10.4-step2b-review MED 1 close: shared no-tx body with
     // `stage_sign::run` via `build_canonical_and_sign_no_tx`.
@@ -511,6 +597,7 @@ pub async fn re_sign_after_mac_recovery(
             lnd,
             z_report_number,
             previous_hash: Some(&new_previous_hash),
+            tax_resolution,
         })
         .await?;
     Ok(ReSignedArtifacts {
@@ -538,6 +625,30 @@ struct NoTxBuildSignInputs<'a> {
     /// `Some(_)` for everyday SELL/RETURN/Z_REPORT and for MAC
     /// recovery (where the recovered hash is always known).
     previous_hash: Option<&'a [u8; 32]>,
+    /// W4-Z2a piece 14 (external review CRIT-1 close) — full
+    /// `TaxResolutionSnapshot` instead of just the canonical-keyed
+    /// calc_map.  Drives BOTH:
+    ///   1. `check_payload_from`'s per-item `tax_group_1`
+    ///      translation via `resolve_driver_number` (POS
+    ///      driver_number → canonical TX).  Empty driver_mapping
+    ///      = identity.  Lookup miss → `CalcTaxError::DriverMapping
+    ///      Miss` fail-loud.
+    ///   2. `derive_check_tax_summaries`'s canonical-keyed map
+    ///      via `snapshot.to_calc_map()` (derived inside
+    ///      check_payload_from after translation).
+    /// Live sources per caller (updated piece 15 + 17):
+    ///   - W6 stage 3-NO-TX: `ctx.tax_resolution_snapshot` —
+    ///     Some on Proceed (fresh, matches FK), Some(historic)
+    ///     on Resume + boot recovery (pre-tx pool-bound reload
+    ///     via pieces 13 + 15 hoists), None for pre-W4-Z2a NULL-FK.
+    ///   - MAC recovery: pre-loaded by `mac_recovery::run_mac_
+    ///     recovery` via `signing_config_snapshots::get_by_id`
+    ///     (rule #9 persisted-snapshot reload).
+    /// None = pre-W4-Z2a NULL-FK back-compat path (no driver
+    /// mapping, no tax_groups → derive_check_tax_summaries
+    /// surfaces TaxMappingNotWired if items carry tax_group_1
+    /// OR tax_group_2 — translate_tax_group invoked per-field).
+    tax_resolution: Option<TaxResolutionSnapshot>,
 }
 
 /// W6 stage 3-NO-TX body, factored out so the W10.4 MAC recovery
@@ -581,18 +692,19 @@ async fn build_canonical_and_sign_no_tx(
         previous_hash_hex,
     );
 
-    // W4-Z1 piece 7: tax-group snapshot.  TEMPORARY empty map —
-    // unknown groups are skipped (Python parity).  Wiring to
-    // `driver_tax_mapping` repo lands in a follow-up worklet
-    // (W4-Z2 / piece 7b); for now this preserves byte-equivalence
-    // with the 4 minimal goldens (no items carry tax_group_1).
-    let tax_groups: HashMap<i64, ResolvedTaxGroup> = HashMap::new();
+    // W4-Z2a piece 14 (external review CRIT-1 close): pass the
+    // full snapshot through to `check_payload_from` so item
+    // `tax_group_1` (POS driver_number form) gets translated to
+    // canonical TX via `resolve_driver_number` BEFORE downstream
+    // aggregation.  Piece 6b.4 seam carried only the calc_map
+    // (canonical-keyed), which dropped the driver_mapping →
+    // silent fiscal divergence on non-identity drivers.
     let canonical_doc = build_canonical_doc(
         inputs.wire_artifact_kind,
         header,
         local_number_u32,
         typed_payload,
-        &tax_groups,
+        inputs.tax_resolution.as_ref(),
     )?;
     let unsigned_xml: Vec<u8> = build_canonical_xml(&canonical_doc)?;
 
@@ -630,6 +742,17 @@ enum PinResult {
     },
     StateConflict {
         observed: DocState,
+    },
+    /// W4-Z2a piece 8a (CRIT-1 close per spec rule #14): the
+    /// caller's `signing_config_snapshot_id` is `Some(caller)` but
+    /// the persisted row has `Some(existing)` with `existing != caller`.
+    /// Indicates config drift between INSERT-set FK and caller's
+    /// view — surfaced fail-loud rather than swallowed via
+    /// COALESCE existing-wins.  See `pin_signing_inputs_tx`
+    /// WHERE-guard SQL.
+    SnapshotIdMismatch {
+        existing: i64,
+        caller: i64,
     },
     RowMissing,
     PinLost,
@@ -855,7 +978,7 @@ fn build_canonical_doc(
     header: DocumentHeader,
     local_number: u32,
     payload: TypedPayload,
-    tax_groups: &HashMap<i64, ResolvedTaxGroup>,
+    tax_resolution: Option<&TaxResolutionSnapshot>,
 ) -> Result<CanonicalDoc, SignError> {
     match (kind, payload) {
         (WireArtifactKind::ShiftOpen, TypedPayload::ShiftOpen(p)) => {
@@ -875,7 +998,7 @@ fn build_canonical_doc(
             local_number,
             body,
             total_sum_kop,
-            tax_groups,
+            tax_resolution,
         )?)),
         (
             WireArtifactKind::Return,
@@ -888,7 +1011,7 @@ fn build_canonical_doc(
             local_number,
             body,
             total_sum_kop,
-            tax_groups,
+            tax_resolution,
         )?)),
         (WireArtifactKind::ZReport, TypedPayload::ZReport(p)) => {
             // AUDIT5-CRIT-2 — Z-report aggregation gap (deferred):
@@ -958,30 +1081,91 @@ fn build_canonical_doc(
 /// Operator pin: aggregation lives HERE, not in adapters; adapter
 /// stays thin and transcribes wire fields only.  See module-level
 /// `tax_summary` for rationale.
+/// W4-Z2a piece 16 (review round 3 R1 M2 close) — pub test seam.
+/// Parses the raw `body_json` (Sell / Return payload wire format)
+/// into the internal CheckJson DTO and dispatches to
+/// `check_payload_from`.  Used by `tests/w4_z2a_emit_integration.rs`
+/// to verify `translate_tax_group` is actually invoked at the
+/// conversion boundary for BOTH `tax_group_1` and `tax_group_2`
+/// (round 2 R1 noted: type system only guarantees snapshot reaches
+/// the function — not that it's USED per-field).
+///
+/// **Use**: tests only.  Production callers use
+/// `build_canonical_and_sign_no_tx` via `stage_sign::run` /
+/// `re_sign_after_mac_recovery`.
+///
+/// Piece 17 (round-4 D/J close): gated behind `test-support`
+/// feature so the test seam does not leak into production
+/// builds.  Matches the existing convention for integration-
+/// only seams.
+#[cfg(any(test, feature = "test-support"))]
+pub fn check_payload_from_json_for_testing(
+    header: DocumentHeader,
+    local_number: u32,
+    body_json: &str,
+    total_sum_kop: i64,
+    tax_resolution: Option<&TaxResolutionSnapshot>,
+) -> Result<CheckPayload, SignError> {
+    let body: CheckJson = serde_json::from_str(body_json).map_err(|e| {
+        SignError::PayloadSchema {
+            detail: format!("CheckJson parse: {e}"),
+        }
+    })?;
+    check_payload_from(header, local_number, body, total_sum_kop, tax_resolution)
+}
+
 fn check_payload_from(
     header: DocumentHeader,
     local_number: u32,
     body: CheckJson,
     total_sum_kop: i64,
-    tax_groups: &HashMap<i64, ResolvedTaxGroup>,
+    tax_resolution: Option<&TaxResolutionSnapshot>,
 ) -> Result<CheckPayload, SignError> {
-    let items: Vec<CheckItem> = body
+    // W4-Z2a piece 14 (CRIT-1) + 15 (round 2 H1+M1) — translate
+    // each item's `tax_group_1` AND `tax_group_2` from POS
+    // driver_number form to canonical TX BEFORE storing in
+    // CheckItem.  Per-field translation semantics:
+    //   - Some(raw) + snapshot Some + driver_mapping non-empty +
+    //     hit → Some(canonical_tx_num)
+    //   - Some(raw) + snapshot Some + driver_mapping empty →
+    //     Some(raw) (identity fallback)
+    //   - Some(raw) + snapshot Some + non-empty mapping + miss →
+    //     CalcTaxError::DriverMappingMiss { field } (fail-loud)
+    //   - Some(raw) + snapshot None → Some(raw) pass-through
+    //     (pre-W4-Z2a back-compat; downstream
+    //     derive_check_tax_summaries surfaces TaxMappingNotWired)
+    //   - None field → None (no translation attempted)
+    //
+    // After translation, validate that the canonical_tx_num
+    // resolves to a `groups` entry in the snapshot.  Without
+    // this guard, a mapping like (driver 5 → canonical 99) where
+    // groups has no tx=99 would silently emit `<I TX="99">` and
+    // `derive_check_tax_summaries` would skip the missing canonical
+    // group → silent fiscal divergence one step later (round 2 H1).
+    let translated_items: Vec<CheckItem> = body
         .items
         .into_iter()
-        .map(|it| CheckItem {
-            code: it.code,
-            name: it.name,
-            price: it.price_kop,
-            quantity: it.quantity_thousandths,
-            sum: it.sum_kop,
-            barcode: it.barcode,
-            uktzed: it.uktzed,
-            tax_group_1: it.tax_group_1,
-            tax_group_2: it.tax_group_2,
-            excise_stamps: it.excise_stamps,
-            adjustments: it.adjustments.into_iter().map(line_adjustment_from).collect(),
+        .map(|it| {
+            let canonical_tg1 =
+                translate_tax_group(it.tax_group_1, tax_resolution, "tax_group_1")?;
+            let canonical_tg2 =
+                translate_tax_group(it.tax_group_2, tax_resolution, "tax_group_2")?;
+            Ok(CheckItem {
+                code: it.code,
+                name: it.name,
+                price: it.price_kop,
+                quantity: it.quantity_thousandths,
+                sum: it.sum_kop,
+                barcode: it.barcode,
+                uktzed: it.uktzed,
+                tax_group_1: canonical_tg1,
+                tax_group_2: canonical_tg2,
+                excise_stamps: it.excise_stamps,
+                adjustments: it.adjustments.into_iter().map(line_adjustment_from).collect(),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, SignError>>()?;
+    let items = translated_items;
 
     let payments: Vec<CheckPayment> = body
         .payments
@@ -1011,7 +1195,12 @@ fn check_payload_from(
 
     // Derived per operator pin: NEVER taken from wire, always
     // computed from items + caller-resolved tax_groups snapshot.
-    let tax_summaries = derive_check_tax_summaries(&items, tax_groups)?;
+    // W4-Z2a piece 14: tax_groups map derived from snapshot here
+    // (callsite no longer pre-computes it — single source of truth).
+    let tax_groups = tax_resolution
+        .map(|s| s.to_calc_map())
+        .unwrap_or_default();
+    let tax_summaries = derive_check_tax_summaries(&items, &tax_groups)?;
 
     Ok(CheckPayload {
         header,
@@ -1024,6 +1213,63 @@ fn check_payload_from(
         footer_lines: body.footer_lines,
         tax_summaries,
     })
+}
+
+/// W4-Z2a piece 15 — per-field tax_group translation helper.
+///
+/// Returns canonical TX after applying snapshot's driver_mapping +
+/// validating the canonical resolves to a `groups` entry.  Field-
+/// aware error surfaces (`tax_group_1` vs `tax_group_2`) tell
+/// operator which item slot drifted on miss / inconsistency.
+///
+/// Variants per (raw, snapshot, mapping state):
+///   - None                  → None (no translation, no validation)
+///   - Some(raw), None       → Some(raw) (pre-W4-Z2a back-compat)
+///   - Some(raw), Some(snap) → resolve_driver_number + groups check:
+///       * hit (canonical in groups) → Some(canonical)
+///       * hit (canonical NOT in groups) → CanonicalTxNotInGroups
+///       * miss (non-empty mapping, no driver entry) → DriverMappingMiss
+fn translate_tax_group(
+    raw: Option<i64>,
+    tax_resolution: Option<&TaxResolutionSnapshot>,
+    field: &'static str,
+) -> Result<Option<i64>, SignError> {
+    let Some(raw) = raw else { return Ok(None) };
+    let Some(snapshot) = tax_resolution else {
+        // Pre-W4-Z2a back-compat — raw passes through; downstream
+        // derive_check_tax_summaries surfaces TaxMappingNotWired
+        // if items carry tax_group_1 (canonical-keyed map empty).
+        return Ok(Some(raw));
+    };
+    let canonical = match snapshot.resolve_driver_number(raw) {
+        Some(c) => c,
+        None => {
+            return Err(SignError::TaxSummary(
+                crate::xml::CalcTaxError::DriverMappingMiss {
+                    driver_number: raw,
+                    field,
+                },
+            ));
+        }
+    };
+    // H1: validate snapshot self-consistency at use site.
+    // Mapping says driver_number → canonical, but groups may not
+    // carry that canonical (admin-side inconsistency, corruption,
+    // manual SQL drift).  Fail-closed BEFORE XML emit.
+    if !snapshot
+        .groups()
+        .iter()
+        .any(|g| g.tx == canonical)
+    {
+        return Err(SignError::TaxSummary(
+            crate::xml::CalcTaxError::CanonicalTxNotInGroups {
+                driver_number: raw,
+                canonical_tx_num: canonical,
+                field,
+            },
+        ));
+    }
+    Ok(Some(canonical))
 }
 
 fn line_adjustment_from(adj: LineAdjustmentJson) -> LineAdjustment {

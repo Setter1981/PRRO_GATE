@@ -332,6 +332,9 @@ fn make_worker_context(
         signing_inputs_pinned_at: None,
         // W14a-2b Commit 1: plumbing-only; helper not yet using the field.
         signed_by_cashier_id: None,
+        // W4-Z2a piece 6b — test fixture: None (helper doesn't exercise
+        // snapshot FK plumbing; runtime path sets it in stage_acquire).
+        signing_config_snapshot_id: None,
     };
     WorkerContext {
         inbox: prro::db::repositories::ingress_inbox::InboxRow {
@@ -360,6 +363,13 @@ fn make_worker_context(
         },
         active_shift: None,
         document,
+        // W4-Z2a piece 6b external review: structural None for stage-3
+        // sign fixtures.  These exercise minimal-payload back-compat
+        // (no tax_group_1 items); piece-10 wiring would route to
+        // persisted-snapshot reload on a non-None FK, but these fixtures
+        // simulate the boot/Resume branch (no fresh snapshot in flight).
+        tax_resolution_snapshot: None,
+        tax_resolution_snapshot_id: None,
     }
 }
 

@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT fiscal_number,\n                  request_id                as \"request_id!: Vec<u8>\",\n                  lnd,\n                  unsigned_xml_sha256       as \"unsigned_xml_sha256: Vec<u8>\",\n                  previous_hash             as \"previous_hash: Vec<u8>\",\n                  payload_sha256_canonical  as \"payload_sha256_canonical!: Vec<u8>\"\n           FROM fiscal_documents WHERE document_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "fiscal_number",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "request_id!: Vec<u8>",
+        "ordinal": 1,
+        "type_info": "Blob"
+      },
+      {
+        "name": "lnd",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "unsigned_xml_sha256: Vec<u8>",
+        "ordinal": 3,
+        "type_info": "Blob"
+      },
+      {
+        "name": "previous_hash: Vec<u8>",
+        "ordinal": 4,
+        "type_info": "Blob"
+      },
+      {
+        "name": "payload_sha256_canonical!: Vec<u8>",
+        "ordinal": 5,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "29ba8f0ff831025cec83f971b7fe0b20796127f01de15a69b889773a6e86d30e"
+}

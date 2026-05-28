@@ -77,6 +77,46 @@ pub struct WorkerContext {
     /// PERSISTED bindings — stages 3+ MUST use these, not the
     /// possibly-drifted `node_state.*_profile_id`.
     pub document: DocumentRow,
+    /// W4-Z2a piece 6 — tax-resolution snapshot for this receipt.
+    /// Loaded at stage_acquire time from `pool_secure` via
+    /// `runtime::tax_snapshot::load_for_fn_driver` and persisted in
+    /// main pool via `signing_config_snapshots::insert_or_get_id`.
+    ///
+    /// **Resume / recovery semantics** (updated for piece 15 pre-tx
+    /// hoist):
+    /// - `Some(snapshot)` on `WorkerProcessResult::Proceed` —
+    ///   matches the just-inserted snapshot row referenced by
+    ///   `tax_resolution_snapshot_id`.  Safe to consume directly.
+    /// - `Some(historic_snapshot)` on
+    ///   `WorkerProcessResult::Resumed` for W4-Z2a-pinned docs —
+    ///   pre-tx pool-bound `signing_config_snapshots::get_by_id`
+    ///   reload of the snapshot the doc was originally pinned with
+    ///   (locked rule #9).  Companion `tax_resolution_snapshot_id`
+    ///   stays `None` to mark "this is a Resume, not a fresh
+    ///   Proceed" — downstream consumers branch on `_id` for the
+    ///   "is this a freshly-INSERTed snapshot" decision.
+    /// - `None` on `WorkerProcessResult::Resumed` for pre-W4-Z2a
+    ///   docs (FK NULL — migration window) AND on boot recovery
+    ///   re-entry paths that don't pre-load.  `derive_check_tax_
+    ///   summaries` surfaces `TaxMappingNotWired` if such a doc
+    ///   carries `tax_group_1`.
+    /// Compile-time `Option` wrapper prevents the MAC-recovery
+    /// footgun where a fresh-config tax_snapshot would silently
+    /// re-sign with the wrong configuration.
+    pub tax_resolution_snapshot: Option<crate::services::write_path::tax_summary::TaxResolutionSnapshot>,
+    /// W4-Z2a piece 6 — id from `signing_config_snapshots` for the
+    /// snapshot above.  Used by stage_sign 3-PRE pin (piece 8) to
+    /// atomically write `fiscal_documents.signing_config_snapshot_id`
+    /// alongside `previous_hash` + `z_report_number`.
+    ///
+    /// `Some(id)` — stage_acquire happy path successfully inserted /
+    /// retrieved a snapshot row; piece 8 writes this FK.
+    /// `None` — boot recovery placeholder OR test fixtures that
+    /// don't exercise snapshot persistence.  Piece 8 MUST branch on
+    /// this and either reload-by-id-from-doc-row or skip the pin's
+    /// snapshot_id write (per locked design rule #9: recovery uses
+    /// persisted id, NEVER current ctx).
+    pub tax_resolution_snapshot_id: Option<i64>,
 }
 
 /// Reason for a stage-2 guard rejection.  Carried by
@@ -204,9 +244,19 @@ pub enum WorkerProcessResult {
     Resumed(WorkerContext),
     /// Lease miss — inbox row was already `PROCESSING` / `DONE` /
     /// `REJECTED` / `ERROR`; another worker has it or processing
-    /// is complete.  No state mutation.  Per W5 design, no audit
-    /// row is appended on this path (would create churn under
-    /// healthy retry loops).
+    /// is complete.  **No business-state mutation**.  Per W5 design,
+    /// the routine lease-miss path appends no audit row (would
+    /// create churn under healthy retry loops).
+    ///
+    /// Piece 17 (round-4 B/C/G clarification): the
+    /// `c-acquire-snapshot-reload-failed` Critical audit is
+    /// appended ONLY by the winning worker (the one whose
+    /// `mark_rejected_if_new_tx` flipped NEW→REJECTED, `was_new
+    /// == true`).  Race-lost workers (`was_new == false`) still
+    /// return `Noop` but emit NO duplicate audit — preserves the
+    /// "no audit on Noop" contract under thundering-herd
+    /// scenarios where multiple workers race to reject the same
+    /// stuck request_id.
     Noop,
     /// Guard rejected the request.  `ingress_inbox.status =
     /// REJECTED` is persisted; an audit row is appended; NO

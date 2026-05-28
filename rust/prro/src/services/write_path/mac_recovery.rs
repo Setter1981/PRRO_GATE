@@ -61,7 +61,7 @@ use crate::db::models::enums::{DocType, Severity};
 use crate::db::models::ids::DocumentId;
 use crate::db::repositories::{
     audit_log, document_files, document_files::DocumentFileKind, fiscal_documents,
-    fiscal_number_config,
+    fiscal_number_config, signing_config_snapshots,
 };
 use crate::db::tx::with_immediate;
 
@@ -181,6 +181,12 @@ struct RecoveryInputs {
     /// `MAC_RECOVERY_RESIGNED` audit payload's `old_previous_hash_hex`
     /// forensic field.
     old_previous_hash: Option<[u8; 32]>,
+    /// W4-Z2a piece 9 — persisted snapshot FK for the MR-NO-TX
+    /// re-sign step.  Locked rule #9: MAC recovery uses the
+    /// snapshot the doc was originally pinned with, NEVER current
+    /// config.  `None` for pre-W4-Z2a docs (migration-window
+    /// back-compat — fall back to empty map = unchanged behaviour).
+    signing_config_snapshot_id: Option<i64>,
 }
 
 async fn read_recovery_inputs(
@@ -198,10 +204,12 @@ async fn read_recovery_inputs(
         Option<i64>,     // total_sum_kop
         Option<i64>,     // z_report_number
         Option<Vec<u8>>, // previous_hash
+        Option<i64>,     // signing_config_snapshot_id (W4-Z2a piece 9)
     );
     let row: Option<Row> = sqlx::query_as(
         r#"SELECT fiscal_number, doc_type, business_ts, payload_json,
-                  lnd, total_sum_kop, z_report_number, previous_hash
+                  lnd, total_sum_kop, z_report_number, previous_hash,
+                  signing_config_snapshot_id
            FROM fiscal_documents WHERE document_id = ?"#,
     )
     .bind(doc_id)
@@ -220,6 +228,7 @@ async fn read_recovery_inputs(
         total_sum_kop,
         z_report_number,
         previous_hash_bytes,
+        signing_config_snapshot_id,
     ) = row;
 
     let tax_number = match fiscal_number_config::get(pool, &fn_id)
@@ -263,6 +272,7 @@ async fn read_recovery_inputs(
         total_sum_kop,
         z_report_number,
         old_previous_hash,
+        signing_config_snapshot_id,
     })
 }
 
@@ -372,6 +382,25 @@ pub async fn run_mac_recovery(
         // alongside the override-to-TerminalReject path.
         return Ok(MacRecoveryOutcome::CounterExhausted);
     }
+    // W4-Z2a piece 9 + 14 — reload persisted snapshot via doc FK
+    // BEFORE re-sign.  Locked rule #9: MAC recovery uses the
+    // snapshot the doc was originally pinned with, NEVER current
+    // config (would catastrophically break MAC chain on retry).
+    // Pool-bound read outside any with_immediate envelope;
+    // `get_by_id` verifies SHA-256 and rejects non-V1 kind
+    // variants.  Pre-W4-Z2a docs (FK NULL) → None → empty path
+    // (back-compat).  Piece 14 passes the full snapshot (was just
+    // to_calc_map() result) so check_payload_from can translate
+    // driver_number → canonical TX.
+    let mr_tax_resolution = match inputs.signing_config_snapshot_id {
+        Some(id) => Some(
+            signing_config_snapshots::get_by_id(pool, id)
+                .await
+                .map_err(StageSendError::MacRecoverySnapshotReloadFailed)?,
+        ),
+        None => None,
+    };
+
     let resigned = stage_sign::re_sign_after_mac_recovery(
         ctx,
         wire_artifact_kind,
@@ -383,6 +412,7 @@ pub async fn run_mac_recovery(
         inputs.lnd,
         inputs.z_report_number,
         new_previous_hash,
+        mr_tax_resolution,
     )
     .await
     .map_err(StageSendError::MacRecoverySignFailed)?;

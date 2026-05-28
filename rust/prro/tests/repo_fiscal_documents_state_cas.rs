@@ -76,6 +76,7 @@ fn sample_doc(fn_id: &str) -> fd::NewDocument {
         unsigned_xml_sha256: None,
         previous_hash: None,
         signed_by_cashier_id: None,
+        signing_config_snapshot_id: None,
     }
 }
 

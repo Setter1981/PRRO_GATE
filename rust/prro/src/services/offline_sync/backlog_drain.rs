@@ -2731,6 +2731,7 @@ fn failure_class_for_send_err(err: &StageSendError) -> FailureClass {
         | StageSendError::MacRecoveryArtifactMissing { .. }
         | StageSendError::FnConfigMissingForRecovery { .. }
         | StageSendError::MacRecoverySignFailed(_)
+        | StageSendError::MacRecoverySnapshotReloadFailed(_)
         | StageSendError::SetServerFiscalNoMissing { .. }
         | StageSendError::TraceMissingAtComplete { .. }
         | StageSendError::Db(_)
