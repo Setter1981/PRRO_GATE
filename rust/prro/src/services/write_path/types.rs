@@ -244,9 +244,19 @@ pub enum WorkerProcessResult {
     Resumed(WorkerContext),
     /// Lease miss — inbox row was already `PROCESSING` / `DONE` /
     /// `REJECTED` / `ERROR`; another worker has it or processing
-    /// is complete.  No state mutation.  Per W5 design, no audit
-    /// row is appended on this path (would create churn under
-    /// healthy retry loops).
+    /// is complete.  **No business-state mutation**.  Per W5 design,
+    /// the routine lease-miss path appends no audit row (would
+    /// create churn under healthy retry loops).
+    ///
+    /// Piece 17 (round-4 B/C/G clarification): the
+    /// `c-acquire-snapshot-reload-failed` Critical audit is
+    /// appended ONLY by the winning worker (the one whose
+    /// `mark_rejected_if_new_tx` flipped NEW→REJECTED, `was_new
+    /// == true`).  Race-lost workers (`was_new == false`) still
+    /// return `Noop` but emit NO duplicate audit — preserves the
+    /// "no audit on Noop" contract under thundering-herd
+    /// scenarios where multiple workers race to reject the same
+    /// stuck request_id.
     Noop,
     /// Guard rejected the request.  `ingress_inbox.status =
     /// REJECTED` is persisted; an audit row is appended; NO

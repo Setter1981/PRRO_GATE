@@ -397,11 +397,18 @@ pub async fn run(
             lnd,
             z_report_number,
             previous_hash: previous_hash_raw.as_ref(),
-            // W4-Z2a piece 14 (CRIT-1 fix) — full snapshot through
-            // for both driver_mapping translation AND tax aggregation.
-            // Proceed: Some(snapshot matches-FK); Resume / boot
-            // recovery: None (pre-W4-Z2a or callers reload separately
-            // via pieces 9/13).
+            // W4-Z2a piece 14 + 15 (CRIT-1 + R1 round-3 fixes) — full
+            // snapshot through for driver_mapping translation of BOTH
+            // tax_group_1 AND tax_group_2 (`translate_tax_group` invoked
+            // per-field with field discriminator), plus canonical_tx ∈
+            // groups validation, plus tax aggregation.  Variants:
+            //   - Proceed: Some(snapshot matches-FK)
+            //   - Resume (piece 15 hoist): Some(historic snapshot)
+            //     pre-loaded outside lease tx via pool-bound get_by_id
+            //   - Boot recovery (piece 13): Some(historic snapshot)
+            //     pre-loaded by boot_phase before constructing
+            //     WorkerContext
+            //   - Pre-W4-Z2a back-compat: None
             tax_resolution: tax_resolution_snapshot,
         })
         .await?;
@@ -629,17 +636,18 @@ struct NoTxBuildSignInputs<'a> {
     ///   2. `derive_check_tax_summaries`'s canonical-keyed map
     ///      via `snapshot.to_calc_map()` (derived inside
     ///      check_payload_from after translation).
-    /// Live sources per caller:
+    /// Live sources per caller (updated piece 15 + 17):
     ///   - W6 stage 3-NO-TX: `ctx.tax_resolution_snapshot` —
-    ///     Some on Proceed (matches FK), None on Resume / boot
-    ///     recovery (callers use persisted FK reload via pieces
-    ///     9 + 13).
+    ///     Some on Proceed (fresh, matches FK), Some(historic)
+    ///     on Resume + boot recovery (pre-tx pool-bound reload
+    ///     via pieces 13 + 15 hoists), None for pre-W4-Z2a NULL-FK.
     ///   - MAC recovery: pre-loaded by `mac_recovery::run_mac_
     ///     recovery` via `signing_config_snapshots::get_by_id`
     ///     (rule #9 persisted-snapshot reload).
     /// None = pre-W4-Z2a NULL-FK back-compat path (no driver
     /// mapping, no tax_groups → derive_check_tax_summaries
-    /// surfaces TaxMappingNotWired if items carry tax_group_1).
+    /// surfaces TaxMappingNotWired if items carry tax_group_1
+    /// OR tax_group_2 — translate_tax_group invoked per-field).
     tax_resolution: Option<TaxResolutionSnapshot>,
 }
 
@@ -1085,6 +1093,12 @@ fn build_canonical_doc(
 /// **Use**: tests only.  Production callers use
 /// `build_canonical_and_sign_no_tx` via `stage_sign::run` /
 /// `re_sign_after_mac_recovery`.
+///
+/// Piece 17 (round-4 D/J close): gated behind `test-support`
+/// feature so the test seam does not leak into production
+/// builds.  Matches the existing convention for integration-
+/// only seams.
+#[cfg(any(test, feature = "test-support"))]
 pub fn check_payload_from_json_for_testing(
     header: DocumentHeader,
     local_number: u32,

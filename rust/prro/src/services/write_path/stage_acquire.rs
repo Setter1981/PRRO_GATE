@@ -140,16 +140,30 @@ pub async fn run(
                                     tx, &request_id,
                                 )
                                 .await?;
-                                audit_log::append_tx(
-                                    tx,
-                                    "fiscal_document",
-                                    &format!("{doc_id:?}"),
-                                    "c-acquire-snapshot-reload-failed",
-                                    Severity::Critical,
-                                    None,
-                                    Some(&forensic_payload),
-                                )
-                                .await?;
+                                // Piece 17 (round-4 C close): only the
+                                // winning worker (was_new=true) commits
+                                // the forensic event.  Under thundering
+                                // herd (dispatcher waking N workers for
+                                // the same stuck request_id), the
+                                // losing N-1 workers would otherwise
+                                // emit duplicate Critical audits for a
+                                // single deterministic reload failure —
+                                // alert spam without forensic signal.
+                                // First-writer-wins serialisation via
+                                // BEGIN IMMEDIATE makes "winner" well-
+                                // defined.
+                                if was_new {
+                                    audit_log::append_tx(
+                                        tx,
+                                        "fiscal_document",
+                                        &format!("{doc_id:?}"),
+                                        "c-acquire-snapshot-reload-failed",
+                                        Severity::Critical,
+                                        None,
+                                        Some(&forensic_payload),
+                                    )
+                                    .await?;
+                                }
                                 Ok::<_, anyhow::Error>(was_new)
                             })
                         })
@@ -441,6 +455,17 @@ pub async fn run(
             if let Some(existing) =
                 fd::get_pending_by_request_id_tx(tx, &request_id_typed).await?
             {
+                // Piece 17 (round-4 F close): serde_json::json! for
+                // pattern consistency with c-acquire-snapshot-reload-
+                // failed.  Current fields are injection-safe by domain
+                // (hex/enum/int) but the legacy format! pattern is a
+                // smell.
+                let resume_payload = serde_json::json!({
+                    "request_id": hex_encode(&request_id),
+                    "existing_state": existing.state.as_str(),
+                    "lnd": existing.lnd,
+                })
+                .to_string();
                 audit_log::append_tx(
                     tx,
                     "fiscal_document",
@@ -448,23 +473,25 @@ pub async fn run(
                     "resume_detected",
                     Severity::Info,
                     None,
-                    Some(&format!(
-                        r#"{{"request_id":"{request_id_hex}","existing_state":"{state}","lnd":{lnd}}}"#,
-                        request_id_hex = hex_encode(&request_id),
-                        state = existing.state.as_str(),
-                        lnd = existing.lnd
-                    )),
+                    Some(&resume_payload),
                 )
                 .await?;
-                // W4-Z2a piece 6b.2 (external mid-review IMP-1) — Resume
-                // branch returns `tax_resolution_snapshot_id: None` to
-                // FORCE downstream consumer (stage_sign 3-PRE re-entry,
-                // MAC recovery re_sign) to load the persisted FK from
-                // `fd::get_signing_inputs_tx`.  The fresh snapshot in
-                // ctx.tax_resolution_snapshot is ONLY a config-current
-                // view (kept for forensic / future use); piece-9 reload
-                // will replace it with the historic snapshot keyed by
-                // doc row's persisted FK.
+                // W4-Z2a piece 6b.2 + piece 15 + piece 17 (round-4 G/J
+                // close) — Resume branch contract, post-hoist semantics:
+                //   - `tax_resolution_snapshot_id` stays `None` to mark
+                //     "this is Resume, not fresh Proceed".  Downstream
+                //     consumers branch on `_id` for "freshly INSERTed
+                //     snapshot" decisions.
+                //   - `tax_resolution_snapshot` now carries
+                //     `Some(historic_snapshot)` for W4-Z2a-pinned docs
+                //     (pre-tx pool-bound `get_by_id` reload of the
+                //     snapshot the doc was originally pinned with —
+                //     locked rule #9).  `None` falls through only for
+                //     pre-W4-Z2a back-compat (FK NULL).
+                //   - Both tax_group_1 AND tax_group_2 are translated
+                //     through `translate_tax_group` at the
+                //     check_payload_from boundary; mapping miss surfaces
+                //     `DriverMappingMiss { field }` fail-loud.
                 //
                 // Why None over Some(fresh_id): doc-comment lock isn't
                 // enough — type-system None forces the branching at
@@ -615,6 +642,15 @@ pub async fn run(
             fd::insert_prepared_tx(tx, &new_doc).await?;
 
             // [Step 9] Audit success.
+            // Piece 17 (round-4 F close): serde_json::json! for pattern
+            // consistency.  Fields are injection-safe by domain
+            // (hex/int/enum) but legacy format! pattern is a smell.
+            let prepared_payload = serde_json::json!({
+                "request_id": hex_encode(&request_id),
+                "lnd": lnd,
+                "doc_type": command.doc_type.as_str(),
+            })
+            .to_string();
             audit_log::append_tx(
                 tx,
                 "fiscal_document",
@@ -622,11 +658,7 @@ pub async fn run(
                 "doc_prepared",
                 Severity::Info,
                 None,
-                Some(&format!(
-                    r#"{{"request_id":"{}","lnd":{lnd},"doc_type":"{doc_type}"}}"#,
-                    hex_encode(&request_id),
-                    doc_type = command.doc_type.as_str()
-                )),
+                Some(&prepared_payload),
             )
             .await?;
 
