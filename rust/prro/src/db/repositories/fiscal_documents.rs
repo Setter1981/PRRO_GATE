@@ -792,6 +792,16 @@ pub struct PinnedSigningInputs {
     pub is_pinned: bool,
     pub previous_hash: Option<[u8; 32]>,
     pub z_report_number: Option<i64>,
+    /// W4-Z2a piece 4 — pinned `signing_config_snapshots.id` FK.
+    /// `None` for two semantically distinct cases:
+    ///   1. Pre-W4-Z2a doc (migration column added as nullable) —
+    ///      app-layer rule: NULL + no tax_group_1 items → ALLOW with
+    ///      info audit; NULL + ANY tax_group_1 item →
+    ///      RequiresManualReconciliation.
+    ///   2. Doc not yet pinned (`is_pinned == false`).
+    /// Disambiguate with `is_pinned`: pinned=true + None = case 1;
+    /// pinned=false = pin hasn't happened yet (any path).
+    pub signing_config_snapshot_id: Option<i64>,
 }
 
 /// W6 stage 3-PRE — read state + pin status atomically inside the
@@ -801,10 +811,11 @@ pub async fn get_signing_inputs_tx(
     doc_id: DocumentId,
 ) -> sqlx::Result<Option<PinnedSigningInputs>> {
     let row = sqlx::query!(
-        r#"SELECT state                    as "state: DocState",
-                  previous_hash            as "previous_hash: Vec<u8>",
+        r#"SELECT state                       as "state: DocState",
+                  previous_hash               as "previous_hash: Vec<u8>",
                   z_report_number,
-                  signing_inputs_pinned_at
+                  signing_inputs_pinned_at,
+                  signing_config_snapshot_id
            FROM fiscal_documents WHERE document_id = ?"#,
         doc_id
     )
@@ -816,6 +827,7 @@ pub async fn get_signing_inputs_tx(
         is_pinned: r.signing_inputs_pinned_at.is_some(),
         previous_hash: decode_blob32(r.previous_hash, "previous_hash")?,
         z_report_number: r.z_report_number,
+        signing_config_snapshot_id: r.signing_config_snapshot_id,
     }))
 }
 
@@ -840,18 +852,21 @@ pub async fn pin_signing_inputs_tx(
     doc_id: DocumentId,
     previous_hash: Option<&[u8; 32]>,
     z_report_number: Option<i64>,
+    signing_config_snapshot_id: Option<i64>,
 ) -> sqlx::Result<u64> {
     let res = sqlx::query(
         "UPDATE fiscal_documents \
-         SET previous_hash            = ?, \
-             z_report_number          = ?, \
-             signing_inputs_pinned_at = CURRENT_TIMESTAMP \
+         SET previous_hash              = ?, \
+             z_report_number            = ?, \
+             signing_config_snapshot_id = ?, \
+             signing_inputs_pinned_at   = CURRENT_TIMESTAMP \
          WHERE document_id = ? \
            AND state = 'PREPARED' \
            AND signing_inputs_pinned_at IS NULL",
     )
     .bind(previous_hash.map(|h| &h[..]))
     .bind(z_report_number)
+    .bind(signing_config_snapshot_id)
     .bind(doc_id)
     .execute(&mut **tx)
     .await?;

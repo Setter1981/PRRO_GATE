@@ -251,7 +251,13 @@ pub async fn run(
                 _ => None,
             };
 
-            let rows = fd::pin_signing_inputs_tx(tx, doc_id, seed.as_ref(), z).await?;
+            // W4-Z2a piece 4: pin_signing_inputs_tx signature widened with
+            // signing_config_snapshot_id.  Piece 8 will populate from
+            // WorkerContext after stage_acquire loads + inserts snapshot.
+            // For piece 4 we pass None — preserves existing behaviour
+            // (column stays NULL); back-compat semantic per locked design:
+            // NULL + no tax_group_1 items → ALLOW (this commit's path).
+            let rows = fd::pin_signing_inputs_tx(tx, doc_id, seed.as_ref(), z, None).await?;
 
             if rows == 0 {
                 // Pin-once guard rejected: re-read truth.  Either

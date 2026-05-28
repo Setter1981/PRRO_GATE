@@ -1,0 +1,98 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT document_id    as \"document_id: DocumentId\",\n                  fiscal_number,\n                  lnd,\n                  state           as \"state: DocState\",\n                  doc_type        as \"doc_type: DocType\",\n                  server_fiscal_no,\n                  submission_attempted_at,\n                  backend_profile_id,\n                  transport_profile_id,\n                  previous_hash         as \"previous_hash: Vec<u8>\",\n                  z_report_number,\n                  unsigned_xml_sha256   as \"unsigned_xml_sha256: Vec<u8>\",\n                  signing_inputs_pinned_at,\n                  signed_by_cashier_id  as \"signed_by_cashier_id: CashierId\"\n           FROM fiscal_documents\n           WHERE fiscal_number = ?\n             AND offline_session_id = ?\n             AND fs_mode = 'OFFLINE'\n             AND state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE','KVT2')\n           ORDER BY lnd, created_at, document_id",
+  "describe": {
+    "columns": [
+      {
+        "name": "document_id: DocumentId",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "fiscal_number",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "lnd",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "state: DocState",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "doc_type: DocType",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "server_fiscal_no",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "submission_attempted_at",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "backend_profile_id",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "transport_profile_id",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "previous_hash: Vec<u8>",
+        "ordinal": 9,
+        "type_info": "Blob"
+      },
+      {
+        "name": "z_report_number",
+        "ordinal": 10,
+        "type_info": "Integer"
+      },
+      {
+        "name": "unsigned_xml_sha256: Vec<u8>",
+        "ordinal": 11,
+        "type_info": "Blob"
+      },
+      {
+        "name": "signing_inputs_pinned_at",
+        "ordinal": 12,
+        "type_info": "Text"
+      },
+      {
+        "name": "signed_by_cashier_id: CashierId",
+        "ordinal": 13,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "9023f20ead6931c0c41cc45db39a8362d8a7c52f6abf79cc81db0cbfeca237b9"
+}
