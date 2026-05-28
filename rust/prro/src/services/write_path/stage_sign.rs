@@ -572,6 +572,14 @@ pub async fn re_sign_after_mac_recovery(
     lnd: i64,
     z_report_number: Option<i64>,
     new_previous_hash: [u8; 32],
+    // W4-Z2a piece 9 — pre-loaded persisted tax-group map.  Caller
+    // (`mac_recovery::run_mac_recovery`) reads the doc's
+    // `signing_config_snapshot_id`, hits `signing_config_snapshots::
+    // get_by_id`, runs `to_calc_map()`, and passes the result here.
+    // Empty map for pre-W4-Z2a docs (FK NULL).  Preserves the
+    // "no DB read inside re_sign" contract — function stays
+    // pure-CPU + crypto.
+    tax_groups: HashMap<i64, ResolvedTaxGroup>,
 ) -> Result<ReSignedArtifacts, SignError> {
     // R-W10.4-step2b-review MED 1 close: shared no-tx body with
     // `stage_sign::run` via `build_canonical_and_sign_no_tx`.
@@ -587,9 +595,8 @@ pub async fn re_sign_after_mac_recovery(
             lnd,
             z_report_number,
             previous_hash: Some(&new_previous_hash),
-            // W4-Z2a piece 6b.4 seam — stub at callsite (piece 10
-            // replaces with the persisted snapshot reload via FK).
-            tax_groups: HashMap::new(),
+            // W4-Z2a piece 9 — persisted snapshot from MR-NO-TX read.
+            tax_groups,
         })
         .await?;
     Ok(ReSignedArtifacts {

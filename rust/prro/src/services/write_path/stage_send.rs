@@ -289,6 +289,22 @@ pub enum StageSendError {
     #[error("MAC recovery re-sign failed: {0}")]
     MacRecoverySignFailed(#[source] crate::services::write_path::stage_sign::SignError),
 
+    /// W4-Z2a piece 9 — MR-NO-TX snapshot reload failed.  Locked
+    /// rule #9: MAC recovery uses the persisted snapshot keyed by
+    /// `fiscal_documents.signing_config_snapshot_id`, NEVER the
+    /// live config.  Surfaces `signing_config_snapshots::get_by_id`
+    /// failures forensically: `NotFound` (orphan FK — corrupted
+    /// ledger), `ChecksumMismatch` (storage tamper or unfinished
+    /// write), `DeserializeFailed` / `UnsupportedKind` (schema
+    /// drift).  All catastrophic; orchestrator MUST NOT proceed
+    /// to re-sign with an empty / fresh-config fallback (would
+    /// silently break MAC chain).
+    #[error("MAC recovery snapshot reload failed: {0}")]
+    MacRecoverySnapshotReloadFailed(
+        #[source]
+        crate::db::repositories::signing_config_snapshots::SigningConfigSnapshotsRepoError,
+    ),
+
     /// Pass-through DB error from any helper.  Distinct variant so
     /// callers can route DB issues separately from state-invariant
     /// breaches.
