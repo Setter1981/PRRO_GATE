@@ -200,6 +200,7 @@ pub async fn run(
     let WorkerContext {
         command,
         document,
+        tax_resolution_snapshot,
         tax_resolution_snapshot_id,
         ..
     } = incoming;
@@ -398,9 +399,19 @@ pub async fn run(
             lnd,
             z_report_number,
             previous_hash: previous_hash_raw.as_ref(),
-            // W4-Z2a piece 6b.4 seam — stub at callsite (piece 10
-            // replaces with `ctx.tax_resolution_snapshot.to_calc_map()`).
-            tax_groups: HashMap::new(),
+            // W4-Z2a piece 8c — wire the live ctx snapshot through
+            // the 6b.4 seam.  On Proceed `tax_resolution_snapshot ==
+            // Some(matches-FK)` → resolved map drives `<TX>` emit for
+            // taxable items.  On Resume / boot recovery the field is
+            // None → empty map (Python parity: unknown groups
+            // skipped, preserves back-compat for non-taxable docs).
+            // Piece 9 wires MR-NO-TX (MAC recovery) to read the
+            // persisted snapshot via doc FK separately — that path
+            // still uses HashMap::new() until then.
+            tax_groups: tax_resolution_snapshot
+                .as_ref()
+                .map(|s| s.to_calc_map())
+                .unwrap_or_default(),
         })
         .await?;
 
