@@ -12,5 +12,6 @@ pub mod operators;
 pub mod outbox;
 pub mod payment_methods;
 pub mod shifts;
+pub mod signing_config_snapshots;
 pub mod tax_groups;
 pub mod transport_trace;
