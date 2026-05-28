@@ -182,6 +182,68 @@ async fn get_by_id_sha256_mismatch_returns_typed_error() {
 
 // ─── insert validation: kind format ───────────────────────────────
 
+// ─── insert_or_get_id_tx: direct test (mid-review IMP-3) ──────────
+
+#[tokio::test]
+async fn insert_or_get_id_tx_inserts_inside_with_immediate_envelope() {
+    use prro::db::tx::with_immediate;
+    let pool = fresh_pool().await;
+    let snapshot = fixture_snapshot();
+    let id = with_immediate(&pool, |tx| {
+        let snapshot = snapshot.clone();
+        Box::pin(async move {
+            signing_config_snapshots::insert_or_get_id_tx(
+                tx, "1234567890", "maria304", &snapshot,
+            )
+            .await
+            .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .expect("with_immediate succeeds");
+    assert!(id > 0);
+    // Verify row landed.
+    let loaded = signing_config_snapshots::get_by_id(&pool, id).await.unwrap();
+    assert_eq!(loaded.groups, snapshot.groups);
+}
+
+#[tokio::test]
+async fn insert_or_get_id_tx_idempotent_across_two_envelopes() {
+    use prro::db::tx::with_immediate;
+    let pool = fresh_pool().await;
+    let snapshot = fixture_snapshot();
+    let id_a = with_immediate(&pool, |tx| {
+        let snapshot = snapshot.clone();
+        Box::pin(async move {
+            signing_config_snapshots::insert_or_get_id_tx(
+                tx, "FN-A", "maria304", &snapshot,
+            )
+            .await
+            .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .unwrap();
+    let id_b = with_immediate(&pool, |tx| {
+        let snapshot = snapshot.clone();
+        Box::pin(async move {
+            signing_config_snapshots::insert_or_get_id_tx(
+                tx, "FN-A", "maria304", &snapshot,
+            )
+            .await
+            .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(id_a, id_b, "tx-variant idempotent across envelopes");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM signing_config_snapshots")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
 #[tokio::test]
 async fn insert_or_get_id_persists_kind_field() {
     // kind future-proof — must round-trip.

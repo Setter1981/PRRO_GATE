@@ -91,7 +91,15 @@ pub struct WorkerContext {
     /// snapshot above.  Used by stage_sign 3-PRE pin (piece 8) to
     /// atomically write `fiscal_documents.signing_config_snapshot_id`
     /// alongside `previous_hash` + `z_report_number`.
-    pub tax_resolution_snapshot_id: i64,
+    ///
+    /// `Some(id)` — stage_acquire happy path successfully inserted /
+    /// retrieved a snapshot row; piece 8 writes this FK.
+    /// `None` — boot recovery placeholder OR test fixtures that
+    /// don't exercise snapshot persistence.  Piece 8 MUST branch on
+    /// this and either reload-by-id-from-doc-row or skip the pin's
+    /// snapshot_id write (per locked design rule #9: recovery uses
+    /// persisted id, NEVER current ctx).
+    pub tax_resolution_snapshot_id: Option<i64>,
 }
 
 /// Reason for a stage-2 guard rejection.  Carried by

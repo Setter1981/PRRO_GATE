@@ -329,6 +329,17 @@ pub async fn run(
                     )),
                 )
                 .await?;
+                // W4-Z2a piece 6+7 + mid-review IMP-1: Resume branch
+                // populates ctx with FRESHLY-LOADED snapshot, but the
+                // resumed doc may ALREADY have a different
+                // `signing_config_snapshot_id` pinned at original 3-PRE.
+                // Piece-8 consumer (stage_sign 3-PRE re-entry) MUST
+                // call `fd::get_signing_inputs_tx` and branch on the
+                // persisted FK FIRST; the ctx fields below are the
+                // "fresh config view" only — used when the doc has
+                // not yet been pinned (signing_config_snapshot_id IS
+                // NULL).  Per locked design rule #9: "MAC recovery
+                // uses persisted snapshot_id, NEVER current config".
                 return Ok(WorkerProcessResult::Resumed(WorkerContext {
                     inbox,
                     command,
@@ -336,7 +347,7 @@ pub async fn run(
                     active_shift,
                     document: existing,
                     tax_resolution_snapshot: tax_snapshot.clone(),
-                    tax_resolution_snapshot_id: tax_snapshot_id,
+                    tax_resolution_snapshot_id: Some(tax_snapshot_id),
                 }));
             }
 
@@ -455,7 +466,7 @@ pub async fn run(
                 active_shift,
                 document,
                 tax_resolution_snapshot: tax_snapshot,
-                tax_resolution_snapshot_id: tax_snapshot_id,
+                tax_resolution_snapshot_id: Some(tax_snapshot_id),
             }))
         })
     })

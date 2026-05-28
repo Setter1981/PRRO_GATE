@@ -59,6 +59,14 @@ pub struct TaxResolutionSnapshot {
     /// Schema version — locks payload shape for future-proofing.
     /// "check_tax_mapping_v1" is the W4-Z2a launch shape.  Future
     /// EVPZ/Z-report extensions get distinct kinds.
+    ///
+    /// Field is `pub` for serde round-trip, but constructors
+    /// ([`new`], [`try_from_live`]) always hardcode `KIND_V1`.
+    /// Mid-review IMP-4: prevents caller from injecting
+    /// non-trivial / non-escaped JSON content into canonical bytes.
+    /// On `get_by_id` deserialize from row, any non-V1 kind is
+    /// surfaced via post-load `assert_kind_v1` check; future schema
+    /// bumps must add a distinct constructor + deserialization path.
     pub kind: String,
     /// Resolved canonical tax-group rates, sorted ascending by `tx`
     /// in canonical bytes (sort happens at serialize time —
@@ -225,10 +233,14 @@ fn validate_rate_to_bps(
     // Multiply by 100 and check exact integer round-trip.
     let scaled = rate * 100.0;
     let rounded = scaled.round() as i64;
-    // Must be exactly representable: (rounded as f64) / 100.0 == rate
-    // — and the rounding above must have been a no-op (no .5 boundary
-    // drift from float-to-int).
-    if (scaled - rounded as f64).abs() > f64::EPSILON {
+    // Tolerance: f64 representation error for `rate * 100.0` on common
+    // 2dp values is ~1e-13 (e.g. 19.99 → 1998.9999999999998).
+    // Using `f64::EPSILON` (~2.22e-16) rejects perfectly valid rates
+    // like 19.99, 10.05, etc — see mid-review CRIT-1.  Use `1e-9` —
+    // five orders of magnitude tighter than the 2dp resolution we
+    // care about, but loose enough for IEEE-754 representation drift.
+    const TWO_DP_TOLERANCE: f64 = 1e-9;
+    if (scaled - rounded as f64).abs() > TWO_DP_TOLERANCE {
         return Err(SnapshotBuildError::RateNotRoundTrippable {
             field,
             tx,

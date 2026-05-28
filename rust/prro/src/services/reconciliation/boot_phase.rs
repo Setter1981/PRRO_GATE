@@ -2456,7 +2456,11 @@ async fn dispatch_prepared_via_chain(
         // fixture set today.
         tax_resolution_snapshot:
             crate::services::write_path::tax_summary::TaxResolutionSnapshot::new(Vec::new()),
-        tax_resolution_snapshot_id: 0,
+        // W4-Z2a mid-review IMP-2: explicit None (not `0` sentinel)
+        // — boot recovery has no fresh snapshot.  Piece 9 will reload
+        // by persisted `fiscal_documents.signing_config_snapshot_id`
+        // from the doc row.
+        tax_resolution_snapshot_id: None,
     };
 
     // (2) stage_sign::run drives PREPARED → SIGNED via its own

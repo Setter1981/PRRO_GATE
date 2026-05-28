@@ -367,7 +367,9 @@ fn make_worker_context(
         // NOT TaxMappingNotWired.
         tax_resolution_snapshot:
             prro::services::write_path::tax_summary::TaxResolutionSnapshot::new(Vec::new()),
-        tax_resolution_snapshot_id: 0,
+        // W4-Z2a mid-review IMP-2: None — no fresh snapshot for stage-3
+        // sign test fixtures (minimal-payload back-compat path).
+        tax_resolution_snapshot_id: None,
     }
 }
 

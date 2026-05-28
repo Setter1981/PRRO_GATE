@@ -67,11 +67,22 @@ fn pinned_hash_for_known_input_locks_canonical_format() {
     // surface a diff.  Computed at implementation time and pasted here
     // — DO NOT silently regenerate; treat as fiscal-compat break.
     let h_hex: String = h.iter().map(|b| format!("{b:02x}")).collect();
-    // Pinned hash (computed once at implementation; locks canonical format):
-    // canonical_bytes = b"{\"groups\":[{\"dtpr_bps\":0,\"tx\":1,\"txal\":0,\"txpr_bps\":2000,\"txty\":0},{\"dtpr_bps\":0,\"tx\":2,\"txal\":0,\"txpr_bps\":700,\"txty\":0}],\"kind\":\"check_tax_mapping_v1\"}"
-    assert!(!h_hex.is_empty(), "sha256 hex emitted: {h_hex}");
-    // The implementation will paste the expected hex; for the RED-phase
-    // test we just assert deterministic non-empty output.
+    // PINNED (mid-review IMP-5): exact hash locks canonical format
+    // forever.  Any drift in `canonical_bytes` (key order, separator,
+    // whitespace, kind value) flips this hex → CI surfaces a
+    // fiscal-compatibility break BEFORE it can silently invalidate
+    // every existing signing_config_snapshots row's payload_sha256
+    // verify-on-read.  Computed once via Python oracle:
+    //   canonical_bytes = b"{\"groups\":[{\"dtpr_bps\":0,\"tx\":1,
+    //                       \"txal\":0,\"txpr_bps\":2000,\"txty\":0},
+    //                       {\"dtpr_bps\":0,\"tx\":2,\"txal\":0,
+    //                       \"txpr_bps\":700,\"txty\":0}],
+    //                       \"kind\":\"check_tax_mapping_v1\"}"
+    //   sha256 = 5d685ae1d5213df1f5837ab24d4553891bc27c6499f7f956c581dde3c10df22f
+    assert_eq!(
+        h_hex, "5d685ae1d5213df1f5837ab24d4553891bc27c6499f7f956c581dde3c10df22f",
+        "canonical bytes drift detected — every signing_config_snapshots row's payload_sha256 verify-on-read would now FAIL.  This is a fiscal-compatibility break.  Do NOT regenerate without explicit operator approval + migration plan."
+    );
 }
 
 // ─── BPS → f64 conversion (for calc_tax interop) ──────────────────
@@ -145,6 +156,38 @@ fn from_live_rates_rejects_non_round_trippable() {
     ]);
     let err = r.expect_err("20.005 cannot round-trip to 2dp exactly");
     assert!(matches!(err, SnapshotBuildError::RateNotRoundTrippable { .. }));
+}
+
+// CRIT-1 (mid-review) regression pins.  f64::EPSILON tolerance
+// rejected these real-world rates; 1e-9 tolerance accepts them.
+#[test]
+fn from_live_rates_accepts_19_99_percent_pdv_reform_scenario() {
+    let s = TaxResolutionSnapshot::try_from_live(vec![
+        ("1".to_string(), 1_i64, 19.99_f64, 0.0_f64, 0_i64, 0_i64),
+    ])
+    .expect("19.99 must round-trip — Ukrainian PDV reform scenario");
+    assert_eq!(s.groups[0].txpr_bps, 1999);
+}
+
+#[test]
+fn from_live_rates_accepts_10_05_percent() {
+    let s = TaxResolutionSnapshot::try_from_live(vec![
+        ("1".to_string(), 1_i64, 10.05_f64, 0.0_f64, 0_i64, 0_i64),
+    ])
+    .expect("10.05 must round-trip");
+    assert_eq!(s.groups[0].txpr_bps, 1005);
+}
+
+#[test]
+fn from_live_rates_accepts_low_fractional_rates() {
+    // 0.05% / 0.10% / 12.34% — admin-typeable values that should accept.
+    for (rate, expected_bps) in &[(0.05_f64, 5_i64), (0.10, 10), (12.34, 1234)] {
+        let s = TaxResolutionSnapshot::try_from_live(vec![
+            ("1".to_string(), 1_i64, *rate, 0.0_f64, 0_i64, 0_i64),
+        ])
+        .unwrap_or_else(|e| panic!("rate {rate} must accept: {e:?}"));
+        assert_eq!(s.groups[0].txpr_bps, *expected_bps, "rate={rate}");
+    }
 }
 
 #[test]
