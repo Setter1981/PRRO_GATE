@@ -77,15 +77,22 @@ pub struct WorkerContext {
     /// PERSISTED bindings — stages 3+ MUST use these, not the
     /// possibly-drifted `node_state.*_profile_id`.
     pub document: DocumentRow,
-    /// W4-Z2a piece 6 — frozen tax-resolution snapshot for this
-    /// receipt.  Loaded at stage_acquire time from `pool_secure`
-    /// via `runtime::tax_snapshot::load_for_fn_driver` and
-    /// persisted in main pool via
-    /// `signing_config_snapshots::insert_or_get_id`.  Carried into
-    /// stage_sign verbatim (no re-load).  Recovery from MAC-recovery
-    /// / boot does NOT use this field — those paths re-load
-    /// snapshot by `signing_config_snapshot_id` persisted on the
-    /// fiscal_documents row (piece 9).
+    /// W4-Z2a piece 6 — tax-resolution snapshot for this receipt.
+    /// Loaded at stage_acquire time from `pool_secure` via
+    /// `runtime::tax_snapshot::load_for_fn_driver` and persisted in
+    /// main pool via `signing_config_snapshots::insert_or_get_id`.
+    ///
+    /// **Resume / recovery semantics** (post-mid-fix): on
+    /// `WorkerProcessResult::Resumed`, this is the FRESH config
+    /// view at the moment of Resume — NOT the snapshot the doc
+    /// was originally pinned with.  Pinned (Resume + existing
+    /// taxable) docs MUST use the persisted FK
+    /// (`fiscal_documents.signing_config_snapshot_id`) via
+    /// `fd::get_signing_inputs_tx()` + `signing_config_snapshots::
+    /// get_by_id()` — piece 8/9 wires this path.  On
+    /// `WorkerProcessResult::Proceed`, the ctx struct + `_id`
+    /// match the just-inserted snapshot and are safe to use
+    /// directly.
     pub tax_resolution_snapshot: crate::services::write_path::tax_summary::TaxResolutionSnapshot,
     /// W4-Z2a piece 6 — id from `signing_config_snapshots` for the
     /// snapshot above.  Used by stage_sign 3-PRE pin (piece 8) to

@@ -869,11 +869,23 @@ pub async fn pin_signing_inputs_tx(
     z_report_number: Option<i64>,
     signing_config_snapshot_id: Option<i64>,
 ) -> sqlx::Result<u64> {
+    // W4-Z2a piece 6b mid-fix (post-self-review IMP):
+    // signing_config_snapshot_id uses `COALESCE(existing, ?)` — NOT
+    // unconditional assignment.  Locked-design rule: "INSERT-set FK
+    // is authoritative; pin must NEVER drift it".  Truth table:
+    //   existing Some(X) + caller None     → keeps X  (no wipe)
+    //   existing Some(X) + caller Some(Y)  → keeps X  (no drift)
+    //   existing NULL    + caller Some(Y)  → Y        (legacy backfill)
+    //   existing NULL    + caller None     → NULL     (unchanged; piece 8/9 classifies)
+    // This preserves 6b.1's atomicity claim across the pin barrier.
+    // A piece-8 caller that legitimately needs a DIFFERENT id should
+    // surface via typed error in a future WHERE-guard variant, not
+    // by silent overwrite.
     let res = sqlx::query(
         "UPDATE fiscal_documents \
          SET previous_hash              = ?, \
              z_report_number            = ?, \
-             signing_config_snapshot_id = ?, \
+             signing_config_snapshot_id = COALESCE(signing_config_snapshot_id, ?), \
              signing_inputs_pinned_at   = CURRENT_TIMESTAMP \
          WHERE document_id = ? \
            AND state = 'PREPARED' \

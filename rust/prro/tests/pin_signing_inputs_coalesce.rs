@@ -1,0 +1,219 @@
+//! W4-Z2a piece 6b mid-fix — `pin_signing_inputs_tx` COALESCE
+//! semantics for `signing_config_snapshot_id`.
+//!
+//! Locked-design rule: INSERT-set FK is authoritative.  Pin must
+//! NEVER drift it via overwrite from a downstream caller.  Truth
+//! table:
+//!   existing Some(X) + caller None     → keeps X  (no wipe)
+//!   existing Some(X) + caller Some(Y)  → keeps X  (no drift)
+//!   existing NULL    + caller Some(Y)  → Y        (legacy backfill)
+//!   existing NULL    + caller None     → NULL     (unchanged)
+
+use prro::db::models::ids::{DocumentId, RequestId};
+use prro::db::models::enums::DocType;
+use prro::db::open_pool;
+use prro::db::repositories::fiscal_documents::{
+    self as fd, NewDocument,
+};
+use prro::db::repositories::fiscal_number_config::{self as fn_repo, NewFnConfig};
+use prro::db::tx::with_immediate;
+
+const FN: &str = "4000000099";
+
+async fn fresh_pool() -> sqlx::SqlitePool {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pin-coalesce.db");
+    std::mem::forget(dir);
+    open_pool(&path).await.unwrap()
+}
+
+async fn seed_fn(pool: &sqlx::SqlitePool) {
+    fn_repo::insert(
+        pool,
+        &NewFnConfig {
+            fiscal_number: FN.into(),
+            tax_number: "12345678".into(),
+            vat_payer_inn: None,
+            fiscal_mode: prro::db::models::enums::FiscalMode::Test,
+            org_name: None,
+            point_name: None,
+            org_address: None,
+            tsp_enabled: false,
+            offline_enabled: true,
+            national_check_enabled: false,
+            min_offline_codes: 0,
+            max_offline_codes: 0,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+async fn seed_doc_with_snapshot(
+    pool: &sqlx::SqlitePool,
+    snapshot_id: Option<i64>,
+) -> DocumentId {
+    seed_fn(pool).await;
+    // First need to ensure a signing_config_snapshots row exists for
+    // the FK constraint.  Insert a stub row id=1 if test requests
+    // Some(_) — sqlite AUTOINCREMENT yields id=1 on first insert.
+    if let Some(id) = snapshot_id {
+        sqlx::query(
+            "INSERT INTO signing_config_snapshots \
+             (id, fn, driver_id, kind, payload_json, payload_sha256, created_at) \
+             VALUES (?, ?, 'test-driver', 'check_tax_mapping_v1', '{}', \
+                     X'0000000000000000000000000000000000000000000000000000000000000000', \
+                     '2026-05-28T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(FN)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    let doc_id = DocumentId::new();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            fd::insert_prepared_tx(
+                tx,
+                &NewDocument {
+                    document_id: doc_id,
+                    request_id: RequestId::new(),
+                    fiscal_number: FN.into(),
+                    shift_id: None,
+                    offline_session_id: None,
+                    lnd: 1,
+                    doc_type: DocType::Sell,
+                    backend_profile_id: "b".into(),
+                    transport_profile_id: "t".into(),
+                    fs_mode: "ONLINE",
+                    business_ts: "2026-05-28T12:00:00Z".into(),
+                    total_sum_kop: Some(1000),
+                    payload_json: r#"{"goods":[]}"#.into(),
+                    payload_sha256_canonical: [0u8; 32],
+                    unsigned_xml_sha256: None,
+                    previous_hash: None,
+                    signed_by_cashier_id: None,
+                    signing_config_snapshot_id: snapshot_id,
+                },
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+    })
+    .await
+    .unwrap();
+    doc_id
+}
+
+async fn fetch_snapshot_id(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT signing_config_snapshot_id FROM fiscal_documents WHERE document_id = ?",
+    )
+    .bind(doc_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn pin_with(pool: &sqlx::SqlitePool, doc_id: DocumentId, caller_snapshot: Option<i64>) {
+    // Need snapshot row for FK if backfill case (caller_snapshot Some(Y), Y not yet existing).
+    if let Some(y) = caller_snapshot {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM signing_config_snapshots WHERE id = ?",
+        )
+        .bind(y)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if exists == 0 {
+            sqlx::query(
+                "INSERT INTO signing_config_snapshots \
+                 (id, fn, driver_id, kind, payload_json, payload_sha256, created_at) \
+                 VALUES (?, ?, 'test-driver', 'check_tax_mapping_v1', '{}', \
+                         X'1111111111111111111111111111111111111111111111111111111111111111', \
+                         '2026-05-28T00:00:00Z')",
+            )
+            .bind(y)
+            .bind(FN)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            let _ = fd::pin_signing_inputs_tx(
+                tx, doc_id, None, None, caller_snapshot,
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+// ─── Truth-table cases ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn pin_existing_some_caller_none_preserves_existing() {
+    let pool = fresh_pool().await;
+    let doc_id = seed_doc_with_snapshot(&pool, Some(1)).await;
+    pin_with(&pool, doc_id, None).await;
+    assert_eq!(
+        fetch_snapshot_id(&pool, doc_id).await,
+        Some(1),
+        "pin caller None MUST NOT wipe INSERT-set FK"
+    );
+}
+
+#[tokio::test]
+async fn pin_existing_some_caller_some_other_preserves_existing_no_drift() {
+    // THE drift-prevention test: prevents future refactor reverting
+    // to reviewer's `COALESCE(?, existing)` form which would overwrite.
+    let pool = fresh_pool().await;
+    let doc_id = seed_doc_with_snapshot(&pool, Some(1)).await;
+    // Seed a second snapshot row (id=2) so FK is valid if drift bug exists.
+    sqlx::query(
+        "INSERT INTO signing_config_snapshots \
+         (id, fn, driver_id, kind, payload_json, payload_sha256, created_at) \
+         VALUES (2, ?, 'test-driver', 'check_tax_mapping_v1', '{}', \
+                 X'2222222222222222222222222222222222222222222222222222222222222222', \
+                 '2026-05-28T00:00:00Z')",
+    )
+    .bind(FN)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pin_with(&pool, doc_id, Some(2)).await;
+    assert_eq!(
+        fetch_snapshot_id(&pool, doc_id).await,
+        Some(1),
+        "pin caller Some(other) MUST NOT drift INSERT-set FK — locked-design rule"
+    );
+}
+
+#[tokio::test]
+async fn pin_existing_null_caller_some_backfills() {
+    let pool = fresh_pool().await;
+    let doc_id = seed_doc_with_snapshot(&pool, None).await;
+    pin_with(&pool, doc_id, Some(7)).await;
+    assert_eq!(
+        fetch_snapshot_id(&pool, doc_id).await,
+        Some(7),
+        "NULL FK with pin caller Some(Y) MUST backfill to Y (legacy / pre-W4-Z2a doc path)"
+    );
+}
+
+#[tokio::test]
+async fn pin_existing_null_caller_none_stays_null() {
+    let pool = fresh_pool().await;
+    let doc_id = seed_doc_with_snapshot(&pool, None).await;
+    pin_with(&pool, doc_id, None).await;
+    assert_eq!(
+        fetch_snapshot_id(&pool, doc_id).await,
+        None,
+        "NULL + None remains NULL — piece 8/9 classifies via NULL-semantics rule"
+    );
+}
