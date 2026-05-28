@@ -140,8 +140,8 @@ async fn get_by_id_round_trips_snapshot_bytes() {
     let loaded = signing_config_snapshots::get_by_id(&pool, id)
         .await
         .unwrap();
-    assert_eq!(loaded.kind, snapshot.kind);
-    assert_eq!(loaded.groups, snapshot.groups);
+    assert_eq!(loaded.kind(), snapshot.kind());
+    assert_eq!(loaded.groups(), snapshot.groups());
     assert_eq!(loaded.sha256(), snapshot.sha256());
 }
 
@@ -167,7 +167,7 @@ async fn get_by_id_sha256_mismatch_returns_typed_error() {
     .await.unwrap();
     // Corrupt payload (mutate without updating hash).
     sqlx::query("UPDATE signing_config_snapshots SET payload_json = ? WHERE id = ?")
-        .bind(r#"{"groups":[{"dtpr_bps":0,"tx":999,"txal":0,"txpr_bps":1234,"txty":0}],"kind":"check_tax_mapping_v1"}"#)
+        .bind(r#"{"driver_mapping":[],"groups":[{"dtpr_bps":0,"tx":999,"txal":0,"txpr_bps":1234,"txty":0}],"kind":"check_tax_mapping_v1"}"#)
         .bind(id)
         .execute(&pool)
         .await
@@ -204,7 +204,7 @@ async fn insert_or_get_id_tx_inserts_inside_with_immediate_envelope() {
     assert!(id > 0);
     // Verify row landed.
     let loaded = signing_config_snapshots::get_by_id(&pool, id).await.unwrap();
-    assert_eq!(loaded.groups, snapshot.groups);
+    assert_eq!(loaded.groups(), snapshot.groups());
 }
 
 #[tokio::test]
@@ -254,5 +254,5 @@ async fn insert_or_get_id_persists_kind_field() {
     )
     .await.unwrap();
     let loaded = signing_config_snapshots::get_by_id(&pool, id).await.unwrap();
-    assert_eq!(loaded.kind, TaxResolutionSnapshot::KIND_V1);
+    assert_eq!(loaded.kind(), TaxResolutionSnapshot::KIND_V1);
 }

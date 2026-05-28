@@ -73,14 +73,18 @@ fn pinned_hash_for_known_input_locks_canonical_format() {
     // fiscal-compatibility break BEFORE it can silently invalidate
     // every existing signing_config_snapshots row's payload_sha256
     // verify-on-read.  Computed once via Python oracle:
-    //   canonical_bytes = b"{\"groups\":[{\"dtpr_bps\":0,\"tx\":1,
-    //                       \"txal\":0,\"txpr_bps\":2000,\"txty\":0},
+    //   canonical_bytes = b"{\"driver_mapping\":[],\"groups\":[
+    //                       {\"dtpr_bps\":0,\"tx\":1,\"txal\":0,
+    //                       \"txpr_bps\":2000,\"txty\":0},
     //                       {\"dtpr_bps\":0,\"tx\":2,\"txal\":0,
     //                       \"txpr_bps\":700,\"txty\":0}],
     //                       \"kind\":\"check_tax_mapping_v1\"}"
-    //   sha256 = 5d685ae1d5213df1f5837ab24d4553891bc27c6499f7f956c581dde3c10df22f
+    //   sha256 = f651df940909fbd02fafc7bb80855cd9705712aeb84277de0f0d8e157922d832
+    // (Post-mid-review CRIT-1: driver_mapping field added to
+    // TaxResolutionSnapshot; canonical bytes top-level order is
+    // now driver_mapping → groups → kind.)
     assert_eq!(
-        h_hex, "5d685ae1d5213df1f5837ab24d4553891bc27c6499f7f956c581dde3c10df22f",
+        h_hex, "f651df940909fbd02fafc7bb80855cd9705712aeb84277de0f0d8e157922d832",
         "canonical bytes drift detected — every signing_config_snapshots row's payload_sha256 verify-on-read would now FAIL.  This is a fiscal-compatibility break.  Do NOT regenerate without explicit operator approval + migration plan."
     );
 }
@@ -142,7 +146,7 @@ fn from_live_rates_round_trip_validates() {
     // 20.0 → 2000 bps → "20.00" → 20.0 — round-trips exactly.
     let r = TaxResolutionSnapshot::try_from_live(vec![
         ("1".to_string(), 1_i64, 20.0_f64, 0.0_f64, 0_i64, 0_i64),
-    ]);
+    ], Vec::new());
     let s = r.expect("20.0 round-trips");
     assert_eq!(s.groups().len(), 1);
     assert_eq!(s.groups()[0].txpr_bps, 2000);
@@ -153,7 +157,7 @@ fn from_live_rates_rejects_non_round_trippable() {
     // 20.005 → 2000.5 bps — not representable as integer.  Reject.
     let r = TaxResolutionSnapshot::try_from_live(vec![
         ("1".to_string(), 1_i64, 20.005_f64, 0.0_f64, 0_i64, 0_i64),
-    ]);
+    ], Vec::new());
     let err = r.expect_err("20.005 cannot round-trip to 2dp exactly");
     assert!(matches!(err, SnapshotBuildError::RateNotRoundTrippable { .. }));
 }
@@ -164,18 +168,18 @@ fn from_live_rates_rejects_non_round_trippable() {
 fn from_live_rates_accepts_19_99_percent_pdv_reform_scenario() {
     let s = TaxResolutionSnapshot::try_from_live(vec![
         ("1".to_string(), 1_i64, 19.99_f64, 0.0_f64, 0_i64, 0_i64),
-    ])
+    ], Vec::new())
     .expect("19.99 must round-trip — Ukrainian PDV reform scenario");
-    assert_eq!(s.groups[0].txpr_bps, 1999);
+    assert_eq!(s.groups()[0].txpr_bps, 1999);
 }
 
 #[test]
 fn from_live_rates_accepts_10_05_percent() {
     let s = TaxResolutionSnapshot::try_from_live(vec![
         ("1".to_string(), 1_i64, 10.05_f64, 0.0_f64, 0_i64, 0_i64),
-    ])
+    ], Vec::new())
     .expect("10.05 must round-trip");
-    assert_eq!(s.groups[0].txpr_bps, 1005);
+    assert_eq!(s.groups()[0].txpr_bps, 1005);
 }
 
 #[test]
@@ -184,9 +188,9 @@ fn from_live_rates_accepts_low_fractional_rates() {
     for (rate, expected_bps) in &[(0.05_f64, 5_i64), (0.10, 10), (12.34, 1234)] {
         let s = TaxResolutionSnapshot::try_from_live(vec![
             ("1".to_string(), 1_i64, *rate, 0.0_f64, 0_i64, 0_i64),
-        ])
+        ], Vec::new())
         .unwrap_or_else(|e| panic!("rate {rate} must accept: {e:?}"));
-        assert_eq!(s.groups[0].txpr_bps, *expected_bps, "rate={rate}");
+        assert_eq!(s.groups()[0].txpr_bps, *expected_bps, "rate={rate}");
     }
 }
 
@@ -194,7 +198,7 @@ fn from_live_rates_accepts_low_fractional_rates() {
 fn from_live_rates_negative_rejected() {
     let r = TaxResolutionSnapshot::try_from_live(vec![
         ("1".to_string(), 1_i64, -1.0_f64, 0.0_f64, 0_i64, 0_i64),
-    ]);
+    ], Vec::new());
     let err = r.expect_err("negative rate must reject (consistent with CalcTaxError::InvalidRate)");
     assert!(matches!(err, SnapshotBuildError::NegativeRate { .. }));
 }
@@ -203,13 +207,13 @@ fn from_live_rates_negative_rejected() {
 fn from_live_rates_nan_inf_rejected() {
     let r = TaxResolutionSnapshot::try_from_live(vec![
         ("1".to_string(), 1_i64, f64::NAN, 0.0, 0, 0),
-    ]);
+    ], Vec::new());
     let err = r.expect_err("NaN rate rejected");
     assert!(matches!(err, SnapshotBuildError::RateNotFinite { .. }));
 
     let r = TaxResolutionSnapshot::try_from_live(vec![
         ("1".to_string(), 1_i64, f64::INFINITY, 0.0, 0, 0),
-    ]);
+    ], Vec::new());
     let err = r.expect_err("Inf rate rejected");
     assert!(matches!(err, SnapshotBuildError::RateNotFinite { .. }));
 }

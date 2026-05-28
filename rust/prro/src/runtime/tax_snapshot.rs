@@ -23,9 +23,10 @@
 use sqlx::SqlitePool;
 use thiserror::Error;
 
+use crate::db::repositories::driver_tax_mapping::{self, DriverTaxMappingRepoError};
 use crate::db::repositories::tax_groups::{self, TaxGroupsRepoError};
 use crate::services::write_path::tax_summary::{
-    SnapshotBuildError, TaxResolutionSnapshot,
+    DriverNumberMapping, SnapshotBuildError, TaxResolutionSnapshot,
 };
 
 #[derive(Debug, Error)]
@@ -49,6 +50,16 @@ pub enum LoadSnapshotError {
         #[source]
         source: SnapshotBuildError,
     },
+    /// External mid-review CRIT-1 — `driver_tax_mapping::
+    /// list_active_for_driver` DB failure.  Distinct from
+    /// `TaxGroupsLoad` so operator audit log distinguishes
+    /// "FN config corrupted" vs "driver mapping corrupted".
+    #[error("tax_snapshot: failed to load driver_tax_mapping for driver={driver_id}: {source}")]
+    DriverMappingLoad {
+        driver_id: String,
+        #[source]
+        source: DriverTaxMappingRepoError,
+    },
 }
 
 /// Load the active `tax_groups` for `fn_id` from `pool_secure`, run
@@ -67,7 +78,7 @@ pub enum LoadSnapshotError {
 pub async fn load_for_fn_driver(
     pool_secure: &SqlitePool,
     fn_id: &str,
-    _driver_id: &str,
+    driver_id: &str,
 ) -> Result<TaxResolutionSnapshot, LoadSnapshotError> {
     let raw = tax_groups::list_active_for_fn(pool_secure, fn_id)
         .await
@@ -76,12 +87,33 @@ pub async fn load_for_fn_driver(
             source,
         })?;
 
+    // External mid-review CRIT-1 — load active driver_tax_mapping
+    // for `driver_id`.  Each row maps the POS-side driver_number
+    // (FiscalLine.tax_group_1) to a canonical tx_num that resolves
+    // into our `groups` array.  Snapshot persists BOTH (canonical
+    // groups + driver mapping) so `check_payload_from` can
+    // deterministically translate driver_number→canonical even on
+    // MAC recovery via persisted snapshot_id.
+    let raw_mappings = driver_tax_mapping::list_active_for_driver(pool_secure, driver_id)
+        .await
+        .map_err(|source| LoadSnapshotError::DriverMappingLoad {
+            driver_id: driver_id.to_string(),
+            source,
+        })?;
+    let driver_mappings: Vec<DriverNumberMapping> = raw_mappings
+        .into_iter()
+        .map(|m| DriverNumberMapping {
+            driver_number: m.driver_number,
+            canonical_tx_num: m.canonical_tx_num,
+        })
+        .collect();
+
     let rows: Vec<(String, i64, f64, f64, i64, i64)> = raw
         .into_iter()
         .map(|g| (g.fn_id, g.tx_num, g.txpr, g.dtpr, g.txal, g.txty))
         .collect();
 
-    TaxResolutionSnapshot::try_from_live(rows).map_err(|source| {
+    TaxResolutionSnapshot::try_from_live(rows, driver_mappings).map_err(|source| {
         LoadSnapshotError::SnapshotBuild {
             fn_id: fn_id.to_string(),
             source,

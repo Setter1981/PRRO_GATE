@@ -62,7 +62,7 @@ async fn empty_fn_yields_empty_snapshot_no_error() {
     let snapshot = tax_snapshot::load_for_fn_driver(&pool, "1234567890", "maria304")
         .await
         .expect("empty config is valid");
-    assert!(snapshot.groups.is_empty());
+    assert!(snapshot.groups().is_empty());
 }
 
 #[tokio::test]
@@ -72,11 +72,11 @@ async fn two_groups_round_trip_to_bps_correctly() {
     let snapshot = tax_snapshot::load_for_fn_driver(&pool, "1234567890", "maria304")
         .await
         .expect("two-group load");
-    assert_eq!(snapshot.groups.len(), 2);
-    let g1 = snapshot.groups.iter().find(|g| g.tx == 1).expect("tx=1");
+    assert_eq!(snapshot.groups().len(), 2);
+    let g1 = snapshot.groups().iter().find(|g| g.tx == 1).expect("tx=1");
     assert_eq!(g1.txpr_bps, 2000); // 20.00% → 2000 bps
     assert_eq!(g1.dtpr_bps, 0);
-    let g2 = snapshot.groups.iter().find(|g| g.tx == 2).expect("tx=2");
+    let g2 = snapshot.groups().iter().find(|g| g.tx == 2).expect("tx=2");
     assert_eq!(g2.txpr_bps, 700); // 7.00% → 700 bps
 }
 
@@ -116,8 +116,8 @@ async fn snapshot_includes_only_active_groups() {
 
     let snap = tax_snapshot::load_for_fn_driver(&pool, "1234567890", "maria304")
         .await.unwrap();
-    assert_eq!(snap.groups.len(), 1, "soft-deleted group excluded");
-    assert_eq!(snap.groups[0].tx, 2);
+    assert_eq!(snap.groups().len(), 1, "soft-deleted group excluded");
+    assert_eq!(snap.groups()[0].tx, 2);
 }
 
 #[tokio::test]

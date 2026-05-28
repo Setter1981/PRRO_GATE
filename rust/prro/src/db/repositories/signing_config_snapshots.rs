@@ -54,6 +54,19 @@ pub enum SigningConfigSnapshotsRepoError {
         source: serde_json::Error,
     },
 
+    /// External mid-review IMP-3 — `kind` field in payload is not
+    /// the current `KIND_V1` constant.  Either a future schema bump
+    /// reached this row before the corresponding parser landed, OR
+    /// out-of-band INSERT injected non-V1 content via struct-literal
+    /// (which is now `pub(crate)`, but defense-in-depth).  Caller
+    /// MUST route to RequiresManualReconciliation.
+    #[error("signing_config_snapshots: unsupported kind for id={id}: expected={expected}, found={found}")]
+    UnsupportedKind {
+        id: i64,
+        expected: String,
+        found: String,
+    },
+
     #[error("signing_config_snapshots: database error: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -168,6 +181,18 @@ pub async fn get_by_id(
 
     let snapshot: TaxResolutionSnapshot = serde_json::from_str(&payload_json)
         .map_err(|source| SigningConfigSnapshotsRepoError::DeserializeFailed { id, source })?;
+
+    // External mid-review IMP-3 — validate kind == KIND_V1 BEFORE
+    // accepting the snapshot.  Defense-in-depth: future schema bumps
+    // would land alongside their own parser; until then any non-V1
+    // row is fail-loud.
+    if !snapshot.is_v1() {
+        return Err(SigningConfigSnapshotsRepoError::UnsupportedKind {
+            id,
+            expected: TaxResolutionSnapshot::KIND_V1.to_string(),
+            found: snapshot.kind().to_string(),
+        });
+    }
 
     let recomputed = snapshot.sha256();
     if recomputed.as_slice() != stored_sha256.as_slice() {

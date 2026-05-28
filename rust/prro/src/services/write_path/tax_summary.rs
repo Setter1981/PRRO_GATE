@@ -60,18 +60,45 @@ pub struct TaxResolutionSnapshot {
     /// "check_tax_mapping_v1" is the W4-Z2a launch shape.  Future
     /// EVPZ/Z-report extensions get distinct kinds.
     ///
-    /// Field is `pub` for serde round-trip, but constructors
-    /// ([`new`], [`try_from_live`]) always hardcode `KIND_V1`.
-    /// Mid-review IMP-4: prevents caller from injecting
-    /// non-trivial / non-escaped JSON content into canonical bytes.
-    /// On `get_by_id` deserialize from row, any non-V1 kind is
-    /// surfaced via post-load `assert_kind_v1` check; future schema
-    /// bumps must add a distinct constructor + deserialization path.
-    pub kind: String,
+    /// External mid-review IMP-3: field is `pub(crate)` so external
+    /// callers cannot inject non-V1 / malformed JSON content via
+    /// struct-literal syntax.  Constructors hardcode `KIND_V1`;
+    /// `get_by_id` post-load validates via `is_v1()` and surfaces
+    /// `UnsupportedKind` for any drift.
+    pub(crate) kind: String,
     /// Resolved canonical tax-group rates, sorted ascending by `tx`
-    /// in canonical bytes (sort happens at serialize time —
-    /// constructor accepts any order).
-    pub groups: Vec<ResolvedTaxGroupBps>,
+    /// in canonical bytes.
+    pub(crate) groups: Vec<ResolvedTaxGroupBps>,
+    /// External mid-review CRIT-1 — driver-side translation table.
+    /// Each entry maps a driver-specific `tax_group_1` value (as
+    /// received from W3 DTO `FiscalLine.tax_group_1: u8`) to a
+    /// canonical TX number that lives in `groups` (and ultimately
+    /// becomes the `<TX TX=...>` wire attribute).  Without this,
+    /// adapters would carry the driver's local code straight into
+    /// `<P TX="...">`, violating ФСКО canonical-TX requirement
+    /// + W4 "adapters stay thin, conversion-layer owns translation"
+    /// operator pin.
+    ///
+    /// Empty Vec means no driver-side translation is configured
+    /// (1:1 identity mapping assumed — caller's driver_number IS
+    /// the canonical tx_num).  This is the typical pilot config
+    /// where `tax_groups.tx_num` matches the POS-side coding.
+    pub(crate) driver_mapping: Vec<DriverNumberMapping>,
+}
+
+/// External mid-review CRIT-1 — driver→canonical translation entry.
+/// Sourced from `driver_tax_mapping` repo (rows `is_active=1` for
+/// the receipt's `driver_id`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DriverNumberMapping {
+    /// `driver_tax_mapping.driver_number` — the value POS sends
+    /// in `FiscalLine.tax_group_1` (and the JSON shim's
+    /// `tax_group_1` field at stage_sign parse_payload time).
+    pub driver_number: i64,
+    /// `driver_tax_mapping.canonical_tx_num` — the canonical TX
+    /// that resolves into `groups[].tx`, ends up on the wire as
+    /// `<P TX="...">` and `<TX TX="...">`.
+    pub canonical_tx_num: i64,
 }
 
 /// BPS-storage variant of [`ResolvedTaxGroup`].  Used for canonical
@@ -91,28 +118,65 @@ pub struct ResolvedTaxGroupBps {
 impl TaxResolutionSnapshot {
     pub const KIND_V1: &'static str = "check_tax_mapping_v1";
 
-    /// Construct from already-validated bps groups.  Use
-    /// [`try_from_live`] for the f64-input path with validation.
+    /// Construct from already-validated bps groups, with no driver
+    /// mapping (1:1 identity assumption).  Used by tests and
+    /// recovery placeholders.  Production stage_acquire uses
+    /// [`try_from_live`] which loads driver_tax_mapping too.
     pub fn new(groups: Vec<ResolvedTaxGroupBps>) -> Self {
         Self {
             kind: Self::KIND_V1.to_string(),
             groups,
+            driver_mapping: Vec::new(),
         }
+    }
+
+    /// External mid-review IMP-3 — accessor since `kind` is now
+    /// `pub(crate)`.  Returns the snapshot's schema-version tag.
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// External mid-review IMP-3 — V1 validation called by
+    /// `signing_config_snapshots::get_by_id` on every read.  Future
+    /// schema bumps (kind_v2, evpz_v1) will need a distinct accessor
+    /// + parsing path; today rejecting non-V1 is fail-loud.
+    pub fn is_v1(&self) -> bool {
+        self.kind == Self::KIND_V1
     }
 
     pub fn groups(&self) -> &[ResolvedTaxGroupBps] {
         &self.groups
     }
 
-    /// Construct from live (REAL/f64) tax_groups config with strict
-    /// round-trip validation.  Each `(fn_id_ignored, tx, txpr, dtpr,
-    /// txal, txty)` tuple must satisfy:
-    ///   - rates finite (not NaN / ±Inf)
-    ///   - rates non-negative
-    ///   - rates round-trip to 2 decimal places exactly (rate * 100
-    ///     must be representable as integer)
+    /// External mid-review CRIT-1 — driver-side mappings used at
+    /// `check_payload_from` translation step.
+    pub fn driver_mapping(&self) -> &[DriverNumberMapping] {
+        &self.driver_mapping
+    }
+
+    /// External mid-review CRIT-1 — resolve driver-side
+    /// `tax_group_1` (as received in W3 DTO / JSON shim) to
+    /// canonical tx_num.  Returns `None` if driver_mapping is
+    /// empty (1:1 identity assumption — caller's tax_group_1 IS
+    /// canonical) OR if the lookup misses (operator should treat
+    /// miss as `RequiresManualReconciliation`).
+    pub fn resolve_driver_number(&self, driver_number: i64) -> Option<i64> {
+        if self.driver_mapping.is_empty() {
+            // 1:1 identity: assume driver_number IS canonical tx_num.
+            // (Pre-pilot common case where POS coding matches ФСКО.)
+            return Some(driver_number);
+        }
+        self.driver_mapping
+            .iter()
+            .find(|m| m.driver_number == driver_number)
+            .map(|m| m.canonical_tx_num)
+    }
+
+    /// Construct from live (REAL/f64) tax_groups config + driver
+    /// mapping rows with strict round-trip validation.
     pub fn try_from_live(
         rows: Vec<(String, i64, f64, f64, i64, i64)>,
+        driver_mappings: Vec<DriverNumberMapping>,
     ) -> Result<Self, SnapshotBuildError> {
         let mut groups = Vec::with_capacity(rows.len());
         for (_fn_id, tx, txpr, dtpr, txal, txty) in rows {
@@ -126,24 +190,41 @@ impl TaxResolutionSnapshot {
                 txty,
             });
         }
-        Ok(Self::new(groups))
+        Ok(Self {
+            kind: Self::KIND_V1.to_string(),
+            groups,
+            driver_mapping: driver_mappings,
+        })
     }
 
     /// Canonical bytes per locked design: deterministic JSON with
-    /// groups sorted ascending by `tx`, sorted map keys, no
-    /// whitespace.  Any drift in this function breaks `payload_sha256`
-    /// verify-on-read for every existing snapshot row — treat
-    /// modifications as a fiscal-compat break.
+    /// groups + driver_mapping sorted ascending, sorted top-level
+    /// keys (alphabetical: driver_mapping / groups / kind), no
+    /// whitespace.  Any drift breaks `payload_sha256` verify-on-read
+    /// for every existing snapshot row — treat modifications as
+    /// fiscal-compat break.  Pinned hash test locks the format.
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut sorted = self.clone();
-        sorted.groups.sort_by_key(|g| g.tx);
-        // serde_json::to_vec uses field declaration order; we want
-        // alphabetical keys for stability across serde version bumps.
-        // Use a BTreeMap-based wrapper that forces sorted JSON keys.
-        // Simpler: hand-build the canonical JSON.
-        let mut out = Vec::with_capacity(256);
-        out.extend_from_slice(b"{\"groups\":[");
-        for (i, g) in sorted.groups.iter().enumerate() {
+        let mut sorted_groups: Vec<&ResolvedTaxGroupBps> = self.groups.iter().collect();
+        sorted_groups.sort_by_key(|g| g.tx);
+        let mut sorted_mapping: Vec<&DriverNumberMapping> =
+            self.driver_mapping.iter().collect();
+        sorted_mapping.sort_by_key(|m| m.driver_number);
+
+        let mut out = Vec::with_capacity(384);
+        // Top-level alphabetical: driver_mapping → groups → kind.
+        out.extend_from_slice(b"{\"driver_mapping\":[");
+        for (i, m) in sorted_mapping.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            out.extend_from_slice(b"{\"canonical_tx_num\":");
+            out.extend_from_slice(m.canonical_tx_num.to_string().as_bytes());
+            out.extend_from_slice(b",\"driver_number\":");
+            out.extend_from_slice(m.driver_number.to_string().as_bytes());
+            out.push(b'}');
+        }
+        out.extend_from_slice(b"],\"groups\":[");
+        for (i, g) in sorted_groups.iter().enumerate() {
             if i > 0 {
                 out.push(b',');
             }
@@ -160,7 +241,7 @@ impl TaxResolutionSnapshot {
             out.push(b'}');
         }
         out.extend_from_slice(b"],\"kind\":\"");
-        out.extend_from_slice(sorted.kind.as_bytes());
+        out.extend_from_slice(self.kind.as_bytes());
         out.extend_from_slice(b"\"}");
         out
     }
