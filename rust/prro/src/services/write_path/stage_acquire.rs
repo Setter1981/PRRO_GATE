@@ -366,31 +366,41 @@ pub async fn run(
                 // compile time.  Per locked design rule #9: "MAC
                 // recovery uses persisted snapshot_id, NEVER current
                 // config".
+                // W4-Z2a piece 14 (external review R2 Medium close):
+                // reload persisted snapshot for the Resumed doc.
+                // Mirror of piece 13's boot_phase reload semantic.
+                // Closes the latent footgun — if a future dispatcher
+                // routes the Resumed WorkerContext back through
+                // stage_sign::run, taxable docs would otherwise hit
+                // empty tax_groups → TaxMappingNotWired → infinite
+                // PREPARED loop.
+                //
+                // Note: uses `get_by_id_tx` (tx-bound variant added
+                // in piece 14) — re-uses the writer-tx connection
+                // instead of acquiring a separate pool connection,
+                // avoiding pool-contention deadlock potential.  PK
+                // SELECT with sha256 + V1 verify: short DB statement
+                // inside the envelope, INV-1 letter preserved.
+                // Reload failure (orphan FK / corruption / V1
+                // mismatch) → anyhow::Error::from → envelope rolls
+                // back and ingress sees a generic anyhow chain.
+                let resumed_snapshot = match existing.signing_config_snapshot_id {
+                    Some(id) => Some(
+                        crate::db::repositories::signing_config_snapshots::get_by_id_tx(
+                            tx, id,
+                        )
+                        .await
+                        .map_err(anyhow::Error::from)?,
+                    ),
+                    None => None,
+                };
                 return Ok(WorkerProcessResult::Resumed(WorkerContext {
                     inbox,
                     command,
                     node_state,
                     active_shift,
                     document: existing,
-                    // W4-Z2a piece 6b external review (R1+R2 High):
-                    // structural None on Resume — piece-8/9 author is
-                    // compile-time forced to fetch the persisted
-                    // snapshot via doc FK rather than accidentally
-                    // using a fresh-config view.
-                    //
-                    // TODO(W4-Z2a-followup): production dispatcher does
-                    // not route Resume through stage_sign today (boot
-                    // reconciliation has its own snapshot reconstruction
-                    // — see boot_phase::run_for_doc_prepared piece-13
-                    // reload).  If a future dispatcher EVER routes a
-                    // Resumed `WorkerContext` back through `stage_sign::
-                    // run`, the runtime will hit `derive_check_tax_
-                    // summaries → TaxMappingNotWired` for taxable docs.
-                    // Fix surface mirrors piece 13: pre-tx
-                    // `signing_config_snapshots::get_by_id` via
-                    // `existing.signing_config_snapshot_id` and pass
-                    // `Some(snapshot) + Some(id)`.
-                    tax_resolution_snapshot: None,
+                    tax_resolution_snapshot: resumed_snapshot,
                     tax_resolution_snapshot_id: None,
                 }));
             }

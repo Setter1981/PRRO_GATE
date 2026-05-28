@@ -150,7 +150,7 @@ async fn re_sign_deterministic_for_identical_inputs() {
         42,
         None,
         prev_hash,
-        std::collections::HashMap::new(),
+        None,
     )
     .await
     .expect("first re-sign");
@@ -166,7 +166,7 @@ async fn re_sign_deterministic_for_identical_inputs() {
         42,
         None,
         prev_hash,
-        std::collections::HashMap::new(),
+        None,
     )
     .await
     .expect("second re-sign");
@@ -221,7 +221,7 @@ async fn re_sign_propagates_new_previous_hash_into_canonical_xml() {
         42,
         None,
         hash_a,
-        std::collections::HashMap::new(),
+        None,
     )
     .await
     .expect("re-sign with hash_a");
@@ -237,7 +237,7 @@ async fn re_sign_propagates_new_previous_hash_into_canonical_xml() {
         42,
         None,
         hash_b,
-        std::collections::HashMap::new(),
+        None,
     )
     .await
     .expect("re-sign with hash_b");
@@ -306,7 +306,7 @@ async fn re_sign_provider_receives_rebuilt_xml_not_attempt_one_bytes() {
         42,
         None,
         [0x33u8; 32],
-        std::collections::HashMap::new(),
+        None,
     )
     .await
     .expect("re-sign");
@@ -342,7 +342,7 @@ async fn re_sign_z_report_propagates_z_number_into_canonical_xml() {
         100,
         Some(42),
         [0u8; 32],
-        std::collections::HashMap::new(),
+        None,
     )
     .await
     .expect("ZReport re-sign");
@@ -374,7 +374,7 @@ async fn re_sign_payload_schema_mismatch_returns_typed_error() {
         42,
         None,
         [0u8; 32],
-        std::collections::HashMap::new(),
+        None,
     )
     .await;
     match res {
@@ -405,7 +405,7 @@ async fn re_sign_invalid_business_ts_returns_typed_error() {
         42,
         None,
         [0u8; 32],
-        std::collections::HashMap::new(),
+        None,
     )
     .await;
     match res {
@@ -435,7 +435,7 @@ async fn re_sign_lnd_overflow_returns_range_error() {
         (u32::MAX as i64) + 1, // overflow
         None,
         [0u8; 32],
-        std::collections::HashMap::new(),
+        None,
     )
     .await;
     match res {
@@ -463,7 +463,7 @@ async fn re_sign_z_number_overflow_returns_range_error() {
         100,
         Some((u32::MAX as i64) + 1), // overflow
         [0u8; 32],
-        std::collections::HashMap::new(),
+        None,
     )
     .await;
     match res {
@@ -535,7 +535,7 @@ async fn re_sign_crypto_error_propagates_typed() {
         42,
         None,
         [0u8; 32],
-        std::collections::HashMap::new(),
+        None,
     )
     .await;
     match res {

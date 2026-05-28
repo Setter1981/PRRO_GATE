@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use prro::db::repositories::signing_config_snapshots;
 use prro::db::tx::with_immediate;
 use prro::services::write_path::tax_summary::{
-    ResolvedTaxGroup, ResolvedTaxGroupBps, TaxResolutionSnapshot,
+    DriverNumberMapping, ResolvedTaxGroup, ResolvedTaxGroupBps, TaxResolutionSnapshot,
 };
 
 const FN: &str = "4000000077";
@@ -169,6 +169,109 @@ fn none_snapshot_unwrap_or_default_yields_empty_map() {
 }
 
 // ─── Test 4 — idempotent insert under content-hash UNIQUE ───────────
+
+// ─── Piece 14 — driver_mapping translation regression (CRIT-1) ──────
+
+/// W4-Z2a piece 14 (external review CRIT-1 close) — verify
+/// `resolve_driver_number` translates POS driver_number to canonical
+/// TX (the primitive that `check_payload_from` invokes per-item
+/// inside the conversion layer).  Non-identity mapping case: driver
+/// 5 → canonical 1.  Without this translation an item with
+/// `tax_group_1 = Some(5)` would emit `<I TX="5">` in XML and the
+/// canonical `tax_groups` map keyed by 1 would miss → silent `<TX>`
+/// drop OR wrong-group aggregation if canonical 5 also exists.
+///
+/// Note: full XML-level assertion (`<I TX="1">` + `<TX TX="1">`)
+/// requires driving `check_payload_from` / `build_canonical_doc`
+/// which are crate-private.  This unit-level test against the
+/// translation primitive + the existing build success guarantees
+/// the wire-up.  An end-to-end XML assertion would require either
+/// exposing `check_payload_from` as `pub` or a stage_sign
+/// integration fixture with a full WorkerContext.
+#[test]
+fn driver_5_translates_to_canonical_1() {
+    let snapshot = TaxResolutionSnapshot::with_driver_mapping(
+        vec![ResolvedTaxGroupBps {
+            tx: 1,
+            txpr_bps: 2000, // 20.00% VAT — canonical TX = 1
+            dtpr_bps: 0,
+            txal: 0,
+            txty: 0,
+        }],
+        vec![DriverNumberMapping {
+            driver_number: 5,    // POS sends 5
+            canonical_tx_num: 1, // wire emits TX="1"
+        }],
+    );
+
+    assert_eq!(
+        snapshot.resolve_driver_number(5),
+        Some(1),
+        "POS driver_number=5 MUST translate to canonical TX=1 — \
+         without this, item.tax_group_1 stays 5, canonical tax_groups[1] lookup misses, \
+         <TX> summary silently dropped, fiscal divergence on the wire"
+    );
+
+    // Calc map keyed by canonical TX (NOT driver_number) — confirms
+    // the asymmetry that motivates translation in check_payload_from.
+    let calc_map = snapshot.to_calc_map();
+    assert!(
+        calc_map.contains_key(&1),
+        "calc_map MUST be keyed by canonical TX=1, not driver_number=5"
+    );
+    assert!(
+        !calc_map.contains_key(&5),
+        "calc_map MUST NOT carry driver_number=5 — that's the WHOLE point of translation"
+    );
+}
+
+/// W4-Z2a piece 14 — fail-loud surface for driver_mapping miss.
+/// A driver_number not present in driver_mapping (e.g., POS sends 99
+/// but mapping only knows {5→1}) MUST surface `None` from
+/// `resolve_driver_number`, which `check_payload_from` translates to
+/// `CalcTaxError::DriverMappingMiss` rather than silently emitting
+/// `<I TX="99">` with no matching `<TX>` summary.
+#[test]
+fn driver_unknown_returns_none_for_fail_loud() {
+    let snapshot = TaxResolutionSnapshot::with_driver_mapping(
+        vec![ResolvedTaxGroupBps {
+            tx: 1,
+            txpr_bps: 2000,
+            dtpr_bps: 0,
+            txal: 0,
+            txty: 0,
+        }],
+        vec![DriverNumberMapping {
+            driver_number: 5,
+            canonical_tx_num: 1,
+        }],
+    );
+
+    assert_eq!(
+        snapshot.resolve_driver_number(99),
+        None,
+        "unknown driver_number MUST return None — check_payload_from surfaces this as DriverMappingMiss fail-loud"
+    );
+}
+
+/// W4-Z2a piece 14 — identity fallback for empty driver_mapping.
+/// Pre-pilot or simple POS where POS coding equals canonical TX:
+/// driver_mapping is empty Vec, every lookup returns `Some(input)`
+/// unchanged (identity).
+#[test]
+fn empty_driver_mapping_yields_identity() {
+    let snapshot = TaxResolutionSnapshot::new(vec![ResolvedTaxGroupBps {
+        tx: 1,
+        txpr_bps: 2000,
+        dtpr_bps: 0,
+        txal: 0,
+        txty: 0,
+    }]);
+
+    assert_eq!(snapshot.resolve_driver_number(1), Some(1));
+    assert_eq!(snapshot.resolve_driver_number(2), Some(2));
+    assert_eq!(snapshot.resolve_driver_number(42), Some(42));
+}
 
 #[tokio::test]
 async fn insert_or_get_id_is_idempotent_under_same_payload() {

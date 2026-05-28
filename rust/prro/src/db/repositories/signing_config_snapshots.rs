@@ -173,7 +173,35 @@ pub async fn get_by_id(
     .bind(id)
     .fetch_optional(pool)
     .await?;
+    verify_and_decode(id, row)
+}
 
+/// W4-Z2a piece 14 — tx-bound variant for callers already inside a
+/// `with_immediate` envelope (e.g., `stage_acquire` Resume branch).
+/// Re-uses the writer-tx connection instead of acquiring a separate
+/// pool connection (avoids pool-contention deadlock potential under
+/// single-writer model + pool-size-of-N constraints).  Same sha256
+/// verify + V1 kind validation as [`get_by_id`].
+pub async fn get_by_id_tx(
+    tx: &mut WriteTxConn<'_>,
+    id: i64,
+) -> Result<TaxResolutionSnapshot, SigningConfigSnapshotsRepoError> {
+    let row = sqlx::query_as::<_, (String, Vec<u8>)>(
+        "SELECT payload_json, payload_sha256 \
+         FROM signing_config_snapshots WHERE id = ? LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    verify_and_decode(id, row)
+}
+
+/// Shared deserialise + V1 kind + sha256 verify logic for both
+/// pool-bound and tx-bound read variants.
+fn verify_and_decode(
+    id: i64,
+    row: Option<(String, Vec<u8>)>,
+) -> Result<TaxResolutionSnapshot, SigningConfigSnapshotsRepoError> {
     let (payload_json, stored_sha256) = match row {
         Some(r) => r,
         None => return Err(SigningConfigSnapshotsRepoError::NotFound { id }),

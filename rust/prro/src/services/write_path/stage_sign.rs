@@ -50,7 +50,7 @@ use crate::xml::{
     LineAdjustmentKind, ZReportCheckCount, ZReportPayload, ZReportPaymentSum,
 };
 
-use super::tax_summary::{derive_check_tax_summaries, ResolvedTaxGroup};
+use super::tax_summary::{derive_check_tax_summaries, ResolvedTaxGroup, TaxResolutionSnapshot};
 use super::types::WorkerContext;
 
 use std::collections::HashMap;
@@ -399,18 +399,12 @@ pub async fn run(
             lnd,
             z_report_number,
             previous_hash: previous_hash_raw.as_ref(),
-            // W4-Z2a piece 8c — live ctx snapshot through the 6b.4
-            // seam.  On Proceed `tax_resolution_snapshot == Some
-            // (matches-FK)` → resolved map drives `<TX>` emit for
-            // taxable items.  On Resume / boot recovery the field
-            // is None → empty map (Python parity: unknown groups
-            // skipped; back-compat for non-taxable docs).  MAC
-            // recovery has its own persisted-snapshot reload via
-            // piece 9 (`re_sign_after_mac_recovery` callsite).
-            tax_groups: tax_resolution_snapshot
-                .as_ref()
-                .map(|s| s.to_calc_map())
-                .unwrap_or_default(),
+            // W4-Z2a piece 14 (CRIT-1 fix) — full snapshot through
+            // for both driver_mapping translation AND tax aggregation.
+            // Proceed: Some(snapshot matches-FK); Resume / boot
+            // recovery: None (pre-W4-Z2a or callers reload separately
+            // via pieces 9/13).
+            tax_resolution: tax_resolution_snapshot,
         })
         .await?;
 
@@ -572,14 +566,17 @@ pub async fn re_sign_after_mac_recovery(
     lnd: i64,
     z_report_number: Option<i64>,
     new_previous_hash: [u8; 32],
-    // W4-Z2a piece 9 — pre-loaded persisted tax-group map.  Caller
-    // (`mac_recovery::run_mac_recovery`) reads the doc's
+    // W4-Z2a piece 14 (CRIT-1 fix) — pre-loaded persisted snapshot
+    // (was `tax_groups: HashMap` in piece 9; now the full
+    // TaxResolutionSnapshot so check_payload_from can translate
+    // driver_number → canonical TX via resolve_driver_number).
+    // Caller (`mac_recovery::run_mac_recovery`) reads the doc's
     // `signing_config_snapshot_id`, hits `signing_config_snapshots::
-    // get_by_id`, runs `to_calc_map()`, and passes the result here.
-    // Empty map for pre-W4-Z2a docs (FK NULL).  Preserves the
-    // "no DB read inside re_sign" contract — function stays
+    // get_by_id` (sha256-verified, V1-validated), and passes the
+    // result here.  None for pre-W4-Z2a docs (FK NULL).  Preserves
+    // the "no DB read inside re_sign" contract — function stays
     // pure-CPU + crypto.
-    tax_groups: HashMap<i64, ResolvedTaxGroup>,
+    tax_resolution: Option<TaxResolutionSnapshot>,
 ) -> Result<ReSignedArtifacts, SignError> {
     // R-W10.4-step2b-review MED 1 close: shared no-tx body with
     // `stage_sign::run` via `build_canonical_and_sign_no_tx`.
@@ -595,8 +592,7 @@ pub async fn re_sign_after_mac_recovery(
             lnd,
             z_report_number,
             previous_hash: Some(&new_previous_hash),
-            // W4-Z2a piece 9 — persisted snapshot from MR-NO-TX read.
-            tax_groups,
+            tax_resolution,
         })
         .await?;
     Ok(ReSignedArtifacts {
@@ -624,21 +620,29 @@ struct NoTxBuildSignInputs<'a> {
     /// `Some(_)` for everyday SELL/RETURN/Z_REPORT and for MAC
     /// recovery (where the recovered hash is always known).
     previous_hash: Option<&'a [u8; 32]>,
-    /// W4-Z2a piece 6b.4 + 8c + 9 — injectable tax-group map
-    /// (resolved `tax_group_1 i64 → ResolvedTaxGroup`).  Live
-    /// sources per caller:
-    ///   - W6 stage 3-NO-TX (`stage_sign::run`): `ctx.tax_resolution_
-    ///     snapshot.as_ref().map(to_calc_map).unwrap_or_default()`
-    ///     — Some on Proceed (matches FK), None on Resume / boot
-    ///     recovery (caller path uses persisted FK via piece 9).
-    ///   - MAC recovery (`re_sign_after_mac_recovery`): pre-loaded
-    ///     by `mac_recovery::run_mac_recovery` via
-    ///     `signing_config_snapshots::get_by_id` (persisted FK
-    ///     reload, locked rule #9).
-    /// Empty map = Python-parity skip for unknown groups (the
-    /// pre-W4-Z2a / NULL-FK back-compat path).  Owned by inputs to
-    /// avoid lifetime juggling at the callsites.
-    tax_groups: HashMap<i64, ResolvedTaxGroup>,
+    /// W4-Z2a piece 14 (external review CRIT-1 close) — full
+    /// `TaxResolutionSnapshot` instead of just the canonical-keyed
+    /// calc_map.  Drives BOTH:
+    ///   1. `check_payload_from`'s per-item `tax_group_1`
+    ///      translation via `resolve_driver_number` (POS
+    ///      driver_number → canonical TX).  Empty driver_mapping
+    ///      = identity.  Lookup miss → `CalcTaxError::DriverMapping
+    ///      Miss` fail-loud.
+    ///   2. `derive_check_tax_summaries`'s canonical-keyed map
+    ///      via `snapshot.to_calc_map()` (derived inside
+    ///      check_payload_from after translation).
+    /// Live sources per caller:
+    ///   - W6 stage 3-NO-TX: `ctx.tax_resolution_snapshot` —
+    ///     Some on Proceed (matches FK), None on Resume / boot
+    ///     recovery (callers use persisted FK reload via pieces
+    ///     9 + 13).
+    ///   - MAC recovery: pre-loaded by `mac_recovery::run_mac_
+    ///     recovery` via `signing_config_snapshots::get_by_id`
+    ///     (rule #9 persisted-snapshot reload).
+    /// None = pre-W4-Z2a NULL-FK back-compat path (no driver
+    /// mapping, no tax_groups → derive_check_tax_summaries
+    /// surfaces TaxMappingNotWired if items carry tax_group_1).
+    tax_resolution: Option<TaxResolutionSnapshot>,
 }
 
 /// W6 stage 3-NO-TX body, factored out so the W10.4 MAC recovery
@@ -682,18 +686,19 @@ async fn build_canonical_and_sign_no_tx(
         previous_hash_hex,
     );
 
-    // W4-Z2a piece 6b.4: tax-group map is now injectable via
-    // `inputs.tax_groups` (seam-only — no behaviour change).
-    // Current callers pass `HashMap::new()` (Python parity:
-    // unknown groups are skipped, preserves byte-equivalence with
-    // the 4 minimal goldens that don't carry tax_group_1).
-    // Piece 10 selects the live source per caller path.
+    // W4-Z2a piece 14 (external review CRIT-1 close): pass the
+    // full snapshot through to `check_payload_from` so item
+    // `tax_group_1` (POS driver_number form) gets translated to
+    // canonical TX via `resolve_driver_number` BEFORE downstream
+    // aggregation.  Piece 6b.4 seam carried only the calc_map
+    // (canonical-keyed), which dropped the driver_mapping →
+    // silent fiscal divergence on non-identity drivers.
     let canonical_doc = build_canonical_doc(
         inputs.wire_artifact_kind,
         header,
         local_number_u32,
         typed_payload,
-        &inputs.tax_groups,
+        inputs.tax_resolution.as_ref(),
     )?;
     let unsigned_xml: Vec<u8> = build_canonical_xml(&canonical_doc)?;
 
@@ -967,7 +972,7 @@ fn build_canonical_doc(
     header: DocumentHeader,
     local_number: u32,
     payload: TypedPayload,
-    tax_groups: &HashMap<i64, ResolvedTaxGroup>,
+    tax_resolution: Option<&TaxResolutionSnapshot>,
 ) -> Result<CanonicalDoc, SignError> {
     match (kind, payload) {
         (WireArtifactKind::ShiftOpen, TypedPayload::ShiftOpen(p)) => {
@@ -987,7 +992,7 @@ fn build_canonical_doc(
             local_number,
             body,
             total_sum_kop,
-            tax_groups,
+            tax_resolution,
         )?)),
         (
             WireArtifactKind::Return,
@@ -1000,7 +1005,7 @@ fn build_canonical_doc(
             local_number,
             body,
             total_sum_kop,
-            tax_groups,
+            tax_resolution,
         )?)),
         (WireArtifactKind::ZReport, TypedPayload::ZReport(p)) => {
             // AUDIT5-CRIT-2 — Z-report aggregation gap (deferred):
@@ -1075,25 +1080,59 @@ fn check_payload_from(
     local_number: u32,
     body: CheckJson,
     total_sum_kop: i64,
-    tax_groups: &HashMap<i64, ResolvedTaxGroup>,
+    tax_resolution: Option<&TaxResolutionSnapshot>,
 ) -> Result<CheckPayload, SignError> {
-    let items: Vec<CheckItem> = body
+    // W4-Z2a piece 14 (external review CRIT-1 close) — translate
+    // each item's `tax_group_1` from POS driver_number form to
+    // canonical TX BEFORE storing in CheckItem.  Empty driver_
+    // mapping → identity (resolve_driver_number returns
+    // Some(driver_number) unchanged).  Non-empty mapping + lookup
+    // miss → CalcTaxError::DriverMappingMiss fail-loud.
+    //
+    // Without this translation, items keyed by driver_number
+    // would later miss the canonical tax_groups map lookup in
+    // `derive_check_tax_summaries`, silently dropping `<TX>`
+    // summaries or aggregating against the wrong group.
+    let translated_items: Vec<CheckItem> = body
         .items
         .into_iter()
-        .map(|it| CheckItem {
-            code: it.code,
-            name: it.name,
-            price: it.price_kop,
-            quantity: it.quantity_thousandths,
-            sum: it.sum_kop,
-            barcode: it.barcode,
-            uktzed: it.uktzed,
-            tax_group_1: it.tax_group_1,
-            tax_group_2: it.tax_group_2,
-            excise_stamps: it.excise_stamps,
-            adjustments: it.adjustments.into_iter().map(line_adjustment_from).collect(),
+        .map(|it| {
+            let canonical_tg1 = match it.tax_group_1 {
+                Some(raw) => match tax_resolution {
+                    Some(snapshot) => match snapshot.resolve_driver_number(raw) {
+                        Some(canonical) => Some(canonical),
+                        None => {
+                            return Err(SignError::TaxSummary(
+                                crate::xml::CalcTaxError::DriverMappingMiss {
+                                    driver_number: raw,
+                                },
+                            ));
+                        }
+                    },
+                    // None snapshot path: pre-W4-Z2a back-compat.
+                    // Items keep their raw tax_group_1; downstream
+                    // derive_check_tax_summaries will fail loud
+                    // via TaxMappingNotWired if the map is empty.
+                    None => Some(raw),
+                },
+                None => None,
+            };
+            Ok(CheckItem {
+                code: it.code,
+                name: it.name,
+                price: it.price_kop,
+                quantity: it.quantity_thousandths,
+                sum: it.sum_kop,
+                barcode: it.barcode,
+                uktzed: it.uktzed,
+                tax_group_1: canonical_tg1,
+                tax_group_2: it.tax_group_2,
+                excise_stamps: it.excise_stamps,
+                adjustments: it.adjustments.into_iter().map(line_adjustment_from).collect(),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, SignError>>()?;
+    let items = translated_items;
 
     let payments: Vec<CheckPayment> = body
         .payments
@@ -1123,7 +1162,12 @@ fn check_payload_from(
 
     // Derived per operator pin: NEVER taken from wire, always
     // computed from items + caller-resolved tax_groups snapshot.
-    let tax_summaries = derive_check_tax_summaries(&items, tax_groups)?;
+    // W4-Z2a piece 14: tax_groups map derived from snapshot here
+    // (callsite no longer pre-computes it — single source of truth).
+    let tax_groups = tax_resolution
+        .map(|s| s.to_calc_map())
+        .unwrap_or_default();
+    let tax_summaries = derive_check_tax_summaries(&items, &tax_groups)?;
 
     Ok(CheckPayload {
         header,

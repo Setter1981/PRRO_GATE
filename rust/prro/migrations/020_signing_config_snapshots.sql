@@ -49,10 +49,25 @@ ALTER TABLE fiscal_documents
     ADD COLUMN signing_config_snapshot_id INTEGER
     REFERENCES signing_config_snapshots(id);
 
--- Forensic JOIN: "which docs signed with snapshot X" — needed for
--- admin audit ("what did we sign in the 14:30 window") + for
--- monitoring snapshot churn (snapshots referenced by zero docs may
--- indicate adapter misconfiguration).
+-- Forensic reverse-lookup affordance, NOT a runtime hot query.
+-- Used by future admin / audit / monitoring tools (NOT by stage_sign
+-- or recovery hot paths — those key into snapshots BY id, never the
+-- reverse direction).  Use cases per operator (4-year UA PRRO
+-- production):
+--   - "Which fiscal_documents are signed with snapshot X?" (audit
+--     window investigation after tax rate / driver mapping incident)
+--   - "Find orphan snapshots referenced by zero docs" (monitor
+--     adapter misconfiguration; expected count ≈ 0 at steady state)
+--   - "List docs that crossed an admin tax_groups update boundary"
+--
+-- Trade-off: minor write amplification (1 INTEGER partial-index
+-- entry per fiscal_document with non-NULL FK).  Filter
+-- `WHERE signing_config_snapshot_id IS NOT NULL` skips pre-W4-Z2a
+-- NULL-FK rows.  For pilot scale (50 points × 70 cashboxes × ~365
+-- docs/cashbox/day) the write cost is < 0.1% — acceptable.
+--
+-- Admin / monitoring tooling that lights up this index: tracked in
+-- Beads `PRRO_GATE-p4e` (W4-Z2a follow-up, P3 chore; not pilot-gating).
 CREATE INDEX idx_fiscal_documents_signing_config_snapshot_id
     ON fiscal_documents(signing_config_snapshot_id)
     WHERE signing_config_snapshot_id IS NOT NULL;

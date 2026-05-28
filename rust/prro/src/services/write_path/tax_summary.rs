@@ -130,6 +130,24 @@ impl TaxResolutionSnapshot {
         }
     }
 
+    /// W4-Z2a piece 14 — test / admin constructor with explicit
+    /// `driver_mapping`.  Production `stage_acquire` uses
+    /// [`try_from_live`] (loads both groups + mapping from
+    /// `tax_groups` + `driver_tax_mapping` repos).  Exposed pub so
+    /// regression tests and future admin CLIs can construct
+    /// snapshots with non-identity driver mappings without
+    /// reaching for the live-config loader path.
+    pub fn with_driver_mapping(
+        groups: Vec<ResolvedTaxGroupBps>,
+        driver_mapping: Vec<DriverNumberMapping>,
+    ) -> Self {
+        Self {
+            kind: Self::KIND_V1.to_string(),
+            groups,
+            driver_mapping,
+        }
+    }
+
     /// External mid-review IMP-3 — accessor since `kind` is now
     /// `pub(crate)`.  Returns the snapshot's schema-version tag.
     pub fn kind(&self) -> &str {

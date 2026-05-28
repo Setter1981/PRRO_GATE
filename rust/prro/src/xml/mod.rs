@@ -255,6 +255,20 @@ pub enum CalcTaxError {
          (driver_tax_mapping not wired yet — W4-Z2)"
     )]
     TaxMappingNotWired { referenced_groups: Vec<i64> },
+    /// W4-Z2a piece 14 (external review CRIT) — POS sent
+    /// `tax_group_1 = driver_number` but the snapshot's
+    /// `driver_mapping` (non-empty) has no entry for that
+    /// driver_number → canonical_tx_num lookup MISS.  Fail-loud
+    /// here so we don't emit `<I TX="<driver_number>">` + drop
+    /// `<TX>` summary (silent fiscal divergence).  Operator
+    /// inspects via audit_log + reject doc — NEVER retry, NEVER
+    /// route to Manual reconciliation (per
+    /// `feedback_manual_recon_catastrophe` empirics).
+    #[error(
+        "driver_tax_mapping miss: POS sent driver_number={driver_number} \
+         but snapshot's driver_mapping has no entry — config drift / new driver"
+    )]
+    DriverMappingMiss { driver_number: i64 },
 }
 
 /// W4-Z1 piece 5 — `_calc_tax` per ФСКО TXAL formulas.  Mirror of

@@ -382,22 +382,23 @@ pub async fn run_mac_recovery(
         // alongside the override-to-TerminalReject path.
         return Ok(MacRecoveryOutcome::CounterExhausted);
     }
-    // W4-Z2a piece 9 — reload persisted snapshot via doc FK BEFORE
-    // re-sign.  Locked rule #9: MAC recovery uses the snapshot the
-    // doc was originally pinned with, NEVER current config (would
-    // catastrophically break MAC chain on retry).  Pool-bound read
-    // outside any with_immediate envelope; `get_by_id` verifies
-    // SHA-256 and rejects non-V1 kind variants.  Pre-W4-Z2a docs
-    // (FK NULL) fall back to empty map — back-compat for the
-    // migration window.
-    let mr_tax_groups = match inputs.signing_config_snapshot_id {
-        Some(id) => {
-            let snapshot = signing_config_snapshots::get_by_id(pool, id)
+    // W4-Z2a piece 9 + 14 — reload persisted snapshot via doc FK
+    // BEFORE re-sign.  Locked rule #9: MAC recovery uses the
+    // snapshot the doc was originally pinned with, NEVER current
+    // config (would catastrophically break MAC chain on retry).
+    // Pool-bound read outside any with_immediate envelope;
+    // `get_by_id` verifies SHA-256 and rejects non-V1 kind
+    // variants.  Pre-W4-Z2a docs (FK NULL) → None → empty path
+    // (back-compat).  Piece 14 passes the full snapshot (was just
+    // to_calc_map() result) so check_payload_from can translate
+    // driver_number → canonical TX.
+    let mr_tax_resolution = match inputs.signing_config_snapshot_id {
+        Some(id) => Some(
+            signing_config_snapshots::get_by_id(pool, id)
                 .await
-                .map_err(StageSendError::MacRecoverySnapshotReloadFailed)?;
-            snapshot.to_calc_map()
-        }
-        None => std::collections::HashMap::new(),
+                .map_err(StageSendError::MacRecoverySnapshotReloadFailed)?,
+        ),
+        None => None,
     };
 
     let resigned = stage_sign::re_sign_after_mac_recovery(
@@ -411,7 +412,7 @@ pub async fn run_mac_recovery(
         inputs.lnd,
         inputs.z_report_number,
         new_previous_hash,
-        mr_tax_groups,
+        mr_tax_resolution,
     )
     .await
     .map_err(StageSendError::MacRecoverySignFailed)?;
