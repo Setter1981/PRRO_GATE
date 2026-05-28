@@ -86,6 +86,19 @@ pub enum SignError {
         observed: DocState,
         document_id: DocumentId,
     },
+    /// W4-Z2a piece 8a (CRIT-1 close per spec rule #14): caller's
+    /// `signing_config_snapshot_id = Some(caller)` differs from
+    /// the persisted `Some(existing)`.  Fail-loud drift surface —
+    /// signing path MUST NOT proceed, MAC chain would otherwise
+    /// be re-derived from a tax-config the persisted doc was not
+    /// pinned to.  Reject doc (deterministic config defect — never
+    /// retry).
+    #[error("stage 3-PRE snapshot_id mismatch: doc {document_id:?} persisted={existing}, caller={caller}")]
+    SnapshotIdMismatch {
+        existing: i64,
+        caller: i64,
+        document_id: DocumentId,
+    },
     #[error("stage 3 unsupported doc type: {doc_type:?}")]
     UnsupportedDocType { doc_type: DocType },
     #[error("stage 3 row missing for doc_id {document_id:?}")]
@@ -212,6 +225,15 @@ pub async fn run(
     // non-inline form (block expression, variable, fn pointer) since
     // those bypass closure-body inspection.
     let fn_id_for_pin = fn_id.clone();
+    // W4-Z2a piece 8a — caller's snapshot id intent.  Piece 8b
+    // replaces `None` with `ctx.tax_resolution_snapshot_id`.  For
+    // the foundation 8a closes the WHERE-guard SQL (see
+    // `pin_signing_inputs_tx`) + adds the pre-check disambiguation
+    // below so a future caller passing `Some(Y)` against existing
+    // `Some(X != Y)` is rejected with a typed
+    // `SignError::SnapshotIdMismatch` rather than swallowed by
+    // COALESCE.
+    let caller_snapshot_id: Option<i64> = None;
     let pinned: PinResult = with_immediate(pool, move |tx| {
         let fn_id = fn_id_for_pin;
         Box::pin(async move {
@@ -224,6 +246,24 @@ pub async fn run(
                 return Ok(PinResult::StateConflict {
                     observed: inputs.state,
                 });
+            }
+
+            // W4-Z2a piece 8a — fail-loud drift surface.  If the
+            // caller passes `Some(caller)` AND existing FK is
+            // `Some(existing != caller)`, reject BEFORE the pin
+            // UPDATE (the SQL WHERE-guard is defence-in-depth for
+            // a hypothetical race between this re-read and the
+            // UPDATE — RESERVED-lock makes that impossible, but
+            // the guard documents intent).  Applies whether the
+            // row is already pinned (re-entry drift) or fresh
+            // (first-pin drift).
+            if let (Some(existing), Some(caller)) = (
+                inputs.signing_config_snapshot_id,
+                caller_snapshot_id,
+            ) {
+                if existing != caller {
+                    return Ok(PinResult::SnapshotIdMismatch { existing, caller });
+                }
             }
 
             if inputs.is_pinned {
@@ -257,7 +297,10 @@ pub async fn run(
             // For piece 4 we pass None — preserves existing behaviour
             // (column stays NULL); back-compat semantic per locked design:
             // NULL + no tax_group_1 items → ALLOW (this commit's path).
-            let rows = fd::pin_signing_inputs_tx(tx, doc_id, seed.as_ref(), z, None).await?;
+            let rows = fd::pin_signing_inputs_tx(
+                tx, doc_id, seed.as_ref(), z, caller_snapshot_id,
+            )
+            .await?;
 
             if rows == 0 {
                 // Pin-once guard rejected: re-read truth.  Either
@@ -314,6 +357,13 @@ pub async fn run(
         PinResult::StateConflict { observed } => {
             return Err(SignError::StateConflict {
                 observed,
+                document_id: doc_id,
+            })
+        }
+        PinResult::SnapshotIdMismatch { existing, caller } => {
+            return Err(SignError::SnapshotIdMismatch {
+                existing,
+                caller,
                 document_id: doc_id,
             })
         }
@@ -654,6 +704,17 @@ enum PinResult {
     },
     StateConflict {
         observed: DocState,
+    },
+    /// W4-Z2a piece 8a (CRIT-1 close per spec rule #14): the
+    /// caller's `signing_config_snapshot_id` is `Some(caller)` but
+    /// the persisted row has `Some(existing)` with `existing != caller`.
+    /// Indicates config drift between INSERT-set FK and caller's
+    /// view — surfaced fail-loud rather than swallowed via
+    /// COALESCE existing-wins.  See `pin_signing_inputs_tx`
+    /// WHERE-guard SQL.
+    SnapshotIdMismatch {
+        existing: i64,
+        caller: i64,
     },
     RowMissing,
     PinLost,

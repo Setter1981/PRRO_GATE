@@ -217,3 +217,89 @@ async fn pin_existing_null_caller_none_stays_null() {
         "NULL + None remains NULL — piece 8/9 classifies via NULL-semantics rule"
     );
 }
+
+// ─── Piece 8a — WHERE-guard drift rejection (CRIT-1 close) ──────────
+
+/// Helper: fetch full pin state for invariant-preservation assertions.
+async fn fetch_pin_state(
+    pool: &sqlx::SqlitePool,
+    doc_id: DocumentId,
+) -> (Option<i64>, Option<String>) {
+    let row = sqlx::query(
+        "SELECT signing_config_snapshot_id, signing_inputs_pinned_at \
+         FROM fiscal_documents WHERE document_id = ?",
+    )
+    .bind(doc_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    use sqlx::Row;
+    (
+        row.try_get::<Option<i64>, _>(0).unwrap(),
+        row.try_get::<Option<String>, _>(1).unwrap(),
+    )
+}
+
+/// W4-Z2a piece 8a (CRIT-1 close per `PRRO_GATE-vax` + spec rule #14)
+/// — fail-loud drift rejection at the repository level.  When a caller
+/// passes `Some(Y)` AND the row already has `Some(X)` with `X != Y`,
+/// the WHERE-guard clause in `pin_signing_inputs_tx` MUST return
+/// `rows_affected = 0` and leave the row unchanged.  Direct-repo
+/// test — typed `SignError::SnapshotIdMismatch` mapping is exercised
+/// by stage_sign integration tests in piece 8b/8c.
+///
+/// This is the "5th case" that extends the COALESCE truth-table from
+/// 4 to 5 cases, per the acceptance gate mandate in
+/// `project_m4_w4_z2a_locked_design.md` rule #14.  Without this
+/// regression guard, a future refactor reverting the WHERE-guard
+/// would silently re-enable the drift bug.
+#[tokio::test]
+async fn pin_existing_some_caller_some_other_where_guard_rejects_rows_zero() {
+    let pool = fresh_pool().await;
+    let doc_id = seed_doc_with_snapshot(&pool, Some(1)).await;
+    // Seed a second snapshot row (id=2) so FK constraint allows
+    // a hypothetical drift attempt.
+    sqlx::query(
+        "INSERT INTO signing_config_snapshots \
+         (id, fn, driver_id, kind, payload_json, payload_sha256, created_at) \
+         VALUES (2, ?, 'test-driver', 'check_tax_mapping_v1', '{}', \
+                 X'3333333333333333333333333333333333333333333333333333333333333333', \
+                 '2026-05-28T00:00:00Z')",
+    )
+    .bind(FN)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (pre_id, pre_pinned_at) = fetch_pin_state(&pool, doc_id).await;
+    assert_eq!(pre_id, Some(1));
+    assert!(pre_pinned_at.is_none(), "row should be unpinned pre-test");
+
+    let rows_affected = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            let res = fd::pin_signing_inputs_tx(
+                tx, doc_id, None, None, Some(2),
+            )
+            .await?;
+            Ok::<u64, anyhow::Error>(res)
+        })
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        rows_affected, 0,
+        "WHERE-guard MUST reject caller-Some(Y) vs existing-Some(X != Y) — rows_affected stays 0"
+    );
+
+    let (post_id, post_pinned_at) = fetch_pin_state(&pool, doc_id).await;
+    assert_eq!(
+        post_id,
+        Some(1),
+        "FK MUST NOT drift to caller's Y — row unchanged"
+    );
+    assert!(
+        post_pinned_at.is_none(),
+        "signing_inputs_pinned_at MUST stay NULL — rejected pin must not set timestamp"
+    );
+}

@@ -886,18 +886,24 @@ pub async fn pin_signing_inputs_tx(
     z_report_number: Option<i64>,
     signing_config_snapshot_id: Option<i64>,
 ) -> sqlx::Result<u64> {
-    // W4-Z2a piece 6b mid-fix (post-self-review IMP):
-    // signing_config_snapshot_id uses `COALESCE(existing, ?)` — NOT
-    // unconditional assignment.  Locked-design rule: "INSERT-set FK
-    // is authoritative; pin must NEVER drift it".  Truth table:
-    //   existing Some(X) + caller None     → keeps X  (no wipe)
-    //   existing Some(X) + caller Some(Y)  → keeps X  (no drift)
-    //   existing NULL    + caller Some(Y)  → Y        (legacy backfill)
-    //   existing NULL    + caller None     → NULL     (unchanged; piece 8/9 classifies)
-    // This preserves 6b.1's atomicity claim across the pin barrier.
-    // A piece-8 caller that legitimately needs a DIFFERENT id should
-    // surface via typed error in a future WHERE-guard variant, not
-    // by silent overwrite.
+    // W4-Z2a piece 8a (CRIT-1 close per `PRRO_GATE-vax` +
+    // spec rule #14): UPDATE preserves INSERT-set FK via
+    // `COALESCE(existing, ?)` AND a WHERE-guard rejects the
+    // structural-conflict case where caller's `Some(Y)` differs
+    // from existing `Some(X)`.  Combined truth-table:
+    //   existing Some(X) + caller None     → keeps X       (rows=1, no wipe)
+    //   existing Some(X) + caller Some(X)  → keeps X       (rows=1, idempotent match)
+    //   existing Some(X) + caller Some(Y)  → guard rejects (rows=0, SnapshotIdMismatch)
+    //   existing NULL    + caller Some(Y)  → Y             (rows=1, legacy backfill)
+    //   existing NULL    + caller None     → NULL          (rows=1, unchanged)
+    //
+    // Disambiguation pattern (per ADR-M3-A4 / W0-2 §4.4): on
+    // rows_affected=0, caller (stage_sign 3-PRE) re-reads via
+    // `get_signing_inputs_tx` inside the same `with_immediate`
+    // envelope.  SQLite RESERVED-lock guarantees visibility.
+    // Caller compares persisted FK against its `caller_snapshot_id`
+    // to distinguish StateConflict / Reused / RowMissing from
+    // SnapshotIdMismatch (the CRIT-1 fail-loud case).
     let res = sqlx::query(
         "UPDATE fiscal_documents \
          SET previous_hash              = ?, \
@@ -906,12 +912,19 @@ pub async fn pin_signing_inputs_tx(
              signing_inputs_pinned_at   = CURRENT_TIMESTAMP \
          WHERE document_id = ? \
            AND state = 'PREPARED' \
-           AND signing_inputs_pinned_at IS NULL",
+           AND signing_inputs_pinned_at IS NULL \
+           AND ( \
+                 signing_config_snapshot_id IS NULL \
+                 OR ? IS NULL \
+                 OR signing_config_snapshot_id = ? \
+               )",
     )
     .bind(previous_hash.map(|h| &h[..]))
     .bind(z_report_number)
     .bind(signing_config_snapshot_id)
     .bind(doc_id)
+    .bind(signing_config_snapshot_id)
+    .bind(signing_config_snapshot_id)
     .execute(&mut **tx)
     .await?;
     Ok(res.rows_affected())
