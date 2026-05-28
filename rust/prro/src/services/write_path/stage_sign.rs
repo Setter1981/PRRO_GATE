@@ -399,15 +399,14 @@ pub async fn run(
             lnd,
             z_report_number,
             previous_hash: previous_hash_raw.as_ref(),
-            // W4-Z2a piece 8c — wire the live ctx snapshot through
-            // the 6b.4 seam.  On Proceed `tax_resolution_snapshot ==
-            // Some(matches-FK)` → resolved map drives `<TX>` emit for
-            // taxable items.  On Resume / boot recovery the field is
-            // None → empty map (Python parity: unknown groups
-            // skipped, preserves back-compat for non-taxable docs).
-            // Piece 9 wires MR-NO-TX (MAC recovery) to read the
-            // persisted snapshot via doc FK separately — that path
-            // still uses HashMap::new() until then.
+            // W4-Z2a piece 8c — live ctx snapshot through the 6b.4
+            // seam.  On Proceed `tax_resolution_snapshot == Some
+            // (matches-FK)` → resolved map drives `<TX>` emit for
+            // taxable items.  On Resume / boot recovery the field
+            // is None → empty map (Python parity: unknown groups
+            // skipped; back-compat for non-taxable docs).  MAC
+            // recovery has its own persisted-snapshot reload via
+            // piece 9 (`re_sign_after_mac_recovery` callsite).
             tax_groups: tax_resolution_snapshot
                 .as_ref()
                 .map(|s| s.to_calc_map())
@@ -555,10 +554,11 @@ pub struct ReSignedArtifacts {
 /// CAS / state variants are NOT reachable because this fn does no
 /// DB I/O.
 ///
-/// **Argument count.**  10 args is intentional — every input is a
-/// distinct per-call value the orchestrator pulls from a different
-/// row / column.  Wrapping into an `ReSignInputs` struct adds one
-/// indirection without reducing the actual surface area.  Clippy
+/// **Argument count.**  11 args is intentional (piece 9 adds
+/// `tax_groups`) — every input is a distinct per-call value the
+/// orchestrator pulls from a different row / column / repository.
+/// Wrapping into an `ReSignInputs` struct adds one indirection
+/// without reducing the actual surface area.  Clippy
 /// `too_many_arguments` lint suppressed at the function level.
 #[allow(clippy::too_many_arguments)]
 pub async fn re_sign_after_mac_recovery(
@@ -624,14 +624,20 @@ struct NoTxBuildSignInputs<'a> {
     /// `Some(_)` for everyday SELL/RETURN/Z_REPORT and for MAC
     /// recovery (where the recovered hash is always known).
     previous_hash: Option<&'a [u8; 32]>,
-    /// W4-Z2a piece 6b.4 — injectable tax-group map (resolved
-    /// `tax_group_1 i64 → ResolvedTaxGroup`).  Seam-only: callers
-    /// currently pass `HashMap::new()` (Python parity: unknown
-    /// groups are skipped); piece 10 selects the live source per
-    /// caller (Proceed/Resume = `ctx.tax_resolution_snapshot.
-    /// to_calc_map()`; MAC recovery = persisted snapshot reload).
-    /// Owned by inputs to avoid lifetime juggling at empty-map
-    /// callsites; replaced cheaply by piece 10's real source.
+    /// W4-Z2a piece 6b.4 + 8c + 9 — injectable tax-group map
+    /// (resolved `tax_group_1 i64 → ResolvedTaxGroup`).  Live
+    /// sources per caller:
+    ///   - W6 stage 3-NO-TX (`stage_sign::run`): `ctx.tax_resolution_
+    ///     snapshot.as_ref().map(to_calc_map).unwrap_or_default()`
+    ///     — Some on Proceed (matches FK), None on Resume / boot
+    ///     recovery (caller path uses persisted FK via piece 9).
+    ///   - MAC recovery (`re_sign_after_mac_recovery`): pre-loaded
+    ///     by `mac_recovery::run_mac_recovery` via
+    ///     `signing_config_snapshots::get_by_id` (persisted FK
+    ///     reload, locked rule #9).
+    /// Empty map = Python-parity skip for unknown groups (the
+    /// pre-W4-Z2a / NULL-FK back-compat path).  Owned by inputs to
+    /// avoid lifetime juggling at the callsites.
     tax_groups: HashMap<i64, ResolvedTaxGroup>,
 }
 
