@@ -108,22 +108,38 @@ pub async fn run(
                 {
                     Ok(snapshot) => Some((doc_id, Some(snapshot))),
                     Err(e) => {
-                        // Forensic Critical audit + inbox REJECTED
+                        // Forensic Critical audit + inbox REJECTED-if-NEW
                         // committed in a SEPARATE small with_immediate
                         // (not the lease tx — that one is never opened).
-                        // Pattern mirrors the in-tx `reject` helper but
-                        // pre-lease.  Inbox flip to REJECTED prevents
-                        // the request_id retrying indefinitely.
-                        let forensic_payload = format!(
-                            r#"{{"request_id":"{}","snapshot_id":{},"error":"{}"}}"#,
-                            hex_encode(&request_id),
-                            snapshot_id,
-                            e,
-                        );
-                        with_immediate(pool, move |tx| {
+                        //
+                        // Piece 16 (review round 3 R1 H1 close): uses
+                        // GUARDED variant `mark_rejected_if_new_tx` so a
+                        // race-lost case (another worker grabbed the
+                        // lease between our pool peek and this reject
+                        // tx) does NOT silently rewrite a `PROCESSING`
+                        // status to `REJECTED`.  rows_affected = 0 →
+                        // race lost → Noop (audit still committed —
+                        // snapshot reload failure is a real fiscal
+                        // observation regardless of who owns the lease).
+                        //
+                        // Piece 16 L3 close: forensic payload via
+                        // serde_json::json! — guarantees valid JSON
+                        // even if `e.to_string()` contains quotes /
+                        // control chars (DeserializeFailed / sqlx Db
+                        // chains can carry such bytes).
+                        let forensic_payload = serde_json::json!({
+                            "request_id": hex_encode(&request_id),
+                            "snapshot_id": snapshot_id,
+                            "error": e.to_string(),
+                        })
+                        .to_string();
+                        let was_new = with_immediate(pool, move |tx| {
                             let forensic_payload = forensic_payload.clone();
                             Box::pin(async move {
-                                ingress_inbox::mark_rejected_tx(tx, &request_id).await?;
+                                let was_new = ingress_inbox::mark_rejected_if_new_tx(
+                                    tx, &request_id,
+                                )
+                                .await?;
                                 audit_log::append_tx(
                                     tx,
                                     "fiscal_document",
@@ -134,15 +150,22 @@ pub async fn run(
                                     Some(&forensic_payload),
                                 )
                                 .await?;
-                                Ok::<_, anyhow::Error>(())
+                                Ok::<_, anyhow::Error>(was_new)
                             })
                         })
                         .await?;
-                        return Ok(WorkerProcessResult::Rejected {
-                            reason: RejectionReason::InvalidPayload {
-                                detail: "acquire_snapshot_reload_failed".into(),
-                            },
-                        });
+                        if was_new {
+                            return Ok(WorkerProcessResult::Rejected {
+                                reason: RejectionReason::InvalidPayload {
+                                    detail: "acquire_snapshot_reload_failed".into(),
+                                },
+                            });
+                        }
+                        // Race lost — another worker has the lease or
+                        // the inbox row already left NEW.  No state
+                        // mutation beyond the committed audit.  Same
+                        // semantic as `acquire_lease` miss.
+                        return Ok(WorkerProcessResult::Noop);
                     }
                 }
             }

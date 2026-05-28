@@ -82,21 +82,27 @@ pub struct WorkerContext {
     /// `runtime::tax_snapshot::load_for_fn_driver` and persisted in
     /// main pool via `signing_config_snapshots::insert_or_get_id`.
     ///
-    /// **Resume / recovery semantics** (post-external-review):
-    /// `Option` wrapper structurally enforces locked rule #9
-    /// (MAC recovery uses persisted snapshot, NEVER current
-    /// config).  Variants:
-    /// - `Some(snapshot)` on `WorkerProcessResult::Proceed`
-    ///   (matches the just-inserted snapshot row referenced by
-    ///   `tax_resolution_snapshot_id`).  Safe to consume directly
-    ///   (e.g., `to_calc_map()` at piece 10).
-    /// - `None` on `WorkerProcessResult::Resumed` AND boot/
-    ///   recovery / re-sign paths.  Piece 8/9 MUST fetch the
-    ///   persisted snapshot via `fiscal_documents.signing_
-    ///   config_snapshot_id` → `signing_config_snapshots::
-    ///   get_by_id()`.  Compile-time enforcement prevents the
-    ///   MAC-recovery footgun where a fresh-config tax_snapshot
-    ///   would silently re-sign with the wrong configuration.
+    /// **Resume / recovery semantics** (updated for piece 15 pre-tx
+    /// hoist):
+    /// - `Some(snapshot)` on `WorkerProcessResult::Proceed` —
+    ///   matches the just-inserted snapshot row referenced by
+    ///   `tax_resolution_snapshot_id`.  Safe to consume directly.
+    /// - `Some(historic_snapshot)` on
+    ///   `WorkerProcessResult::Resumed` for W4-Z2a-pinned docs —
+    ///   pre-tx pool-bound `signing_config_snapshots::get_by_id`
+    ///   reload of the snapshot the doc was originally pinned with
+    ///   (locked rule #9).  Companion `tax_resolution_snapshot_id`
+    ///   stays `None` to mark "this is a Resume, not a fresh
+    ///   Proceed" — downstream consumers branch on `_id` for the
+    ///   "is this a freshly-INSERTed snapshot" decision.
+    /// - `None` on `WorkerProcessResult::Resumed` for pre-W4-Z2a
+    ///   docs (FK NULL — migration window) AND on boot recovery
+    ///   re-entry paths that don't pre-load.  `derive_check_tax_
+    ///   summaries` surfaces `TaxMappingNotWired` if such a doc
+    ///   carries `tax_group_1`.
+    /// Compile-time `Option` wrapper prevents the MAC-recovery
+    /// footgun where a fresh-config tax_snapshot would silently
+    /// re-sign with the wrong configuration.
     pub tax_resolution_snapshot: Option<crate::services::write_path::tax_summary::TaxResolutionSnapshot>,
     /// W4-Z2a piece 6 — id from `signing_config_snapshots` for the
     /// snapshot above.  Used by stage_sign 3-PRE pin (piece 8) to

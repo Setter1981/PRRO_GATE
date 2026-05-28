@@ -29,9 +29,11 @@ use std::collections::HashMap;
 
 use prro::db::repositories::signing_config_snapshots;
 use prro::db::tx::with_immediate;
+use prro::services::write_path::stage_sign::{check_payload_from_json_for_testing, SignError};
 use prro::services::write_path::tax_summary::{
     DriverNumberMapping, ResolvedTaxGroup, ResolvedTaxGroupBps, TaxResolutionSnapshot,
 };
+use prro::xml::{CalcTaxError, DocumentHeader};
 
 const FN: &str = "4000000077";
 
@@ -352,6 +354,145 @@ fn driver_mapping_translates_both_tax_group_1_and_tax_group_2() {
     // check_payload_from maps to DriverMappingMiss with field
     // discriminator).
     assert_eq!(snapshot.resolve_driver_number(99), None);
+}
+
+// ─── Piece 16 — check_payload_from integration (R1 M2 close) ────────
+
+/// Helper: build a minimal Sell CheckJson string with one item
+/// carrying optional tax_group_1 + tax_group_2.  Mirrors the wire
+/// JSON shape adapters produce.
+fn sell_payload_json(tg1: Option<i64>, tg2: Option<i64>) -> String {
+    let tg1_s = tg1.map_or("null".to_string(), |v| v.to_string());
+    let tg2_s = tg2.map_or("null".to_string(), |v| v.to_string());
+    format!(
+        r#"{{
+          "items": [{{
+            "code": "ART-1",
+            "name": "Item",
+            "price_kop": 6000,
+            "quantity_thousandths": 1000,
+            "sum_kop": 6000,
+            "tax_group_1": {tg1_s},
+            "tax_group_2": {tg2_s}
+          }}],
+          "payments": [{{
+            "name": "CASH",
+            "sum_kop": 6000,
+            "type_code": "0"
+          }}]
+        }}"#
+    )
+}
+
+fn sample_header() -> DocumentHeader {
+    DocumentHeader::with_defaults(
+        "4000000001".to_string(),
+        "12345678".to_string(),
+        0,
+        "2026-05-28T12:00:00".to_string(),
+        String::new(),
+    )
+}
+
+fn snapshot_with_dual_mapping() -> TaxResolutionSnapshot {
+    TaxResolutionSnapshot::with_driver_mapping(
+        vec![
+            ResolvedTaxGroupBps { tx: 1, txpr_bps: 2000, dtpr_bps: 0, txal: 0, txty: 0 },
+            ResolvedTaxGroupBps { tx: 2, txpr_bps: 700, dtpr_bps: 0, txal: 0, txty: 0 },
+        ],
+        vec![
+            DriverNumberMapping { driver_number: 5, canonical_tx_num: 1 },
+            DriverNumberMapping { driver_number: 7, canonical_tx_num: 2 },
+        ],
+    )
+}
+
+/// W4-Z2a piece 16 (R1 M2 close, positive case) — drives the actual
+/// `check_payload_from` conversion path end-to-end at the conversion
+/// boundary (no DB / no crypto / no XML).  Asserts BOTH
+/// `tax_group_1` AND `tax_group_2` are translated from POS driver
+/// form to canonical TX via `translate_tax_group`.  Would FAIL if
+/// `translate_tax_group` were accidentally bypassed for either
+/// field (e.g., a future refactor copying raw `tax_group_2` into
+/// `CheckItem`) — the type-system / build-success path would NOT
+/// catch that regression.
+#[test]
+fn check_payload_from_translates_both_tax_group_1_and_tax_group_2_to_canonical() {
+    let snapshot = snapshot_with_dual_mapping();
+    let body_json = sell_payload_json(Some(5), Some(7));
+    let result = check_payload_from_json_for_testing(
+        sample_header(),
+        99,
+        &body_json,
+        6000,
+        Some(&snapshot),
+    )
+    .expect("check_payload_from succeeds for both-fields-translated case");
+
+    assert_eq!(
+        result.items.len(),
+        1,
+        "single item input → single item output"
+    );
+    let item = &result.items[0];
+    assert_eq!(
+        item.tax_group_1,
+        Some(1),
+        "tax_group_1 driver_number=5 MUST translate to canonical TX=1 — \
+         if this fails, translate_tax_group was bypassed for primary slot"
+    );
+    assert_eq!(
+        item.tax_group_2,
+        Some(2),
+        "tax_group_2 driver_number=7 MUST translate to canonical TX1=2 — \
+         if this fails, translate_tax_group was bypassed for secondary slot"
+    );
+}
+
+/// W4-Z2a piece 16 (R1 M2 close, fail-loud case) — drives the
+/// conversion boundary on a tax_group_2 miss.  Mapping has 5→1 only;
+/// item carries tg2=99 (no entry in mapping).  MUST surface typed
+/// `SignError::TaxSummary(CalcTaxError::DriverMappingMiss { field:
+/// "tax_group_2", driver_number: 99 })` — field discriminator
+/// preserved through the error chain.  Without this test, a swap of
+/// the field discriminator (e.g., always reporting "tax_group_1")
+/// would silently pass type-checks but degrade operator forensic
+/// observability for compound-tax drift.
+#[test]
+fn check_payload_from_field_aware_miss_surfaces_tax_group_2_discriminator() {
+    let snapshot = TaxResolutionSnapshot::with_driver_mapping(
+        vec![ResolvedTaxGroupBps {
+            tx: 1, txpr_bps: 2000, dtpr_bps: 0, txal: 0, txty: 0,
+        }],
+        vec![DriverNumberMapping {
+            driver_number: 5,
+            canonical_tx_num: 1,
+        }],
+    );
+    let body_json = sell_payload_json(Some(5), Some(99));
+    let err = check_payload_from_json_for_testing(
+        sample_header(),
+        99,
+        &body_json,
+        6000,
+        Some(&snapshot),
+    )
+    .expect_err("driver_number=99 not in mapping MUST fail-loud");
+
+    match err {
+        SignError::TaxSummary(CalcTaxError::DriverMappingMiss {
+            driver_number,
+            field,
+        }) => {
+            assert_eq!(driver_number, 99);
+            assert_eq!(
+                field, "tax_group_2",
+                "field discriminator MUST be 'tax_group_2' for secondary slot miss — \
+                 swapped or generic discriminator would degrade forensic observability"
+            );
+        }
+        other => panic!("expected DriverMappingMiss field=tax_group_2, got: {other:?}"),
+    }
 }
 
 /// W4-Z2a piece 14 — identity fallback for empty driver_mapping.

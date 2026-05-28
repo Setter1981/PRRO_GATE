@@ -264,6 +264,14 @@ pub async fn acquire_lease(
 /// mismatch, missing profile binding, invalid payload).  No
 /// `fiscal_documents` row is created and no `lnd` is allocated;
 /// the inbox row carries the rejection.
+///
+/// **CALLER OBLIGATION**: this SQL has NO source-state guard.
+/// It rewrites ANY status by `request_id`.  Safe ONLY when the
+/// caller has just CAS'd `acquire_lease` to `PROCESSING` within
+/// the same `with_immediate` envelope — that guarantees status
+/// was `NEW` immediately before this call.  Pre-lease callers
+/// (e.g., `stage_acquire` snapshot-reload reject path) MUST use
+/// the guarded variant [`mark_rejected_if_new_tx`].
 pub async fn mark_rejected_tx(tx: &mut WriteTxConn<'_>, request_id: &[u8; 16]) -> sqlx::Result<()> {
     let req_slice: &[u8] = request_id;
     sqlx::query(
@@ -275,6 +283,37 @@ pub async fn mark_rejected_tx(tx: &mut WriteTxConn<'_>, request_id: &[u8; 16]) -
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// W4-Z2a piece 16 (review round 3 R1 H1 close) — pre-lease
+/// reject variant with source-state guard.  Only flips
+/// `status = NEW → REJECTED`.  Returns `true` if the row was
+/// `NEW` and got marked, `false` otherwise (already
+/// `PROCESSING` / `DONE` / `REJECTED` / `ERROR` — race lost
+/// to another worker OR already terminal).
+///
+/// **Use**: pre-lease reject paths (`stage_acquire` snapshot
+/// reload failure pattern) where no `acquire_lease` was
+/// performed and the caller cannot assume current status.
+/// Race-safe: if another worker took the lease between the
+/// pool-bound peek and this small reject tx, the UPDATE
+/// affects zero rows and the existing PROCESSING lease is
+/// untouched.  Caller treats `false` as race-lost → return
+/// `Noop` semantically equivalent to lease-miss.
+pub async fn mark_rejected_if_new_tx(
+    tx: &mut WriteTxConn<'_>,
+    request_id: &[u8; 16],
+) -> sqlx::Result<bool> {
+    let req_slice: &[u8] = request_id;
+    let res = sqlx::query(
+        "UPDATE ingress_inbox \
+         SET status = 'REJECTED', processed_at = CURRENT_TIMESTAMP \
+         WHERE request_id = ? AND status = 'NEW'",
+    )
+    .bind(req_slice)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected() == 1)
 }
 
 /// W8 stage 5 finalize — finalise the inbox row to terminal `DONE`

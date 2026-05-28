@@ -1073,6 +1073,33 @@ fn build_canonical_doc(
 /// Operator pin: aggregation lives HERE, not in adapters; adapter
 /// stays thin and transcribes wire fields only.  See module-level
 /// `tax_summary` for rationale.
+/// W4-Z2a piece 16 (review round 3 R1 M2 close) — pub test seam.
+/// Parses the raw `body_json` (Sell / Return payload wire format)
+/// into the internal CheckJson DTO and dispatches to
+/// `check_payload_from`.  Used by `tests/w4_z2a_emit_integration.rs`
+/// to verify `translate_tax_group` is actually invoked at the
+/// conversion boundary for BOTH `tax_group_1` and `tax_group_2`
+/// (round 2 R1 noted: type system only guarantees snapshot reaches
+/// the function — not that it's USED per-field).
+///
+/// **Use**: tests only.  Production callers use
+/// `build_canonical_and_sign_no_tx` via `stage_sign::run` /
+/// `re_sign_after_mac_recovery`.
+pub fn check_payload_from_json_for_testing(
+    header: DocumentHeader,
+    local_number: u32,
+    body_json: &str,
+    total_sum_kop: i64,
+    tax_resolution: Option<&TaxResolutionSnapshot>,
+) -> Result<CheckPayload, SignError> {
+    let body: CheckJson = serde_json::from_str(body_json).map_err(|e| {
+        SignError::PayloadSchema {
+            detail: format!("CheckJson parse: {e}"),
+        }
+    })?;
+    check_payload_from(header, local_number, body, total_sum_kop, tax_resolution)
+}
+
 fn check_payload_from(
     header: DocumentHeader,
     local_number: u32,
