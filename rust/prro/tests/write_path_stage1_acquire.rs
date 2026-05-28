@@ -426,6 +426,15 @@ async fn stage1_resume_detect_existing_prepared_doc_skips_lnd_alloc() {
     match result {
         WorkerProcessResult::Resumed(ctx) => {
             assert_eq!(ctx.document.lnd, 1, "resumed reuses original lnd");
+            // W4-Z2a piece 6b.2 acceptance — Resume MUST return
+            // `tax_resolution_snapshot_id: None` to force piece-8
+            // consumer to load persisted FK from doc row (NOT use
+            // fresh config from ctx).  External mid-review IMP-1.
+            assert!(
+                ctx.tax_resolution_snapshot_id.is_none(),
+                "Resume branch MUST return tax_resolution_snapshot_id: None — \
+                 piece-8 / MAC recovery loads persisted FK, not fresh"
+            );
         }
         other => panic!("expected Resumed, got {other:?}"),
     }
