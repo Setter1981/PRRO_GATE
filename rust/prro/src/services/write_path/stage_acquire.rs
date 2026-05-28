@@ -102,16 +102,12 @@ pub async fn run(
                 );
             }
 
-            // [Step 1b] Insert tax_snapshot via tx-variant — atomic
-            //           with lease + later fiscal_documents INSERT.
-            //           Snapshot bytes already computed outside tx;
-            //           inside tx we only run a short
-            //           `INSERT OR IGNORE` + `SELECT id`.
-            let tax_snapshot_id =
-                crate::db::repositories::signing_config_snapshots::insert_or_get_id_tx(
-                    tx, &fn_id, &driver_id, &tax_snapshot,
-                )
-                .await?;
+            // W4-Z2a piece 6b-self-review Important #1 — snapshot
+            // insert MOVED to immediately before Step 8 INSERT PREPARED
+            // (after Step 6 Resume-detect and Step 6b terminal-detect
+            // both returned early).  Net effect: snapshot row is
+            // persisted ONLY on the Proceed path.  Resume / Reject /
+            // Terminal paths no longer commit forensic orphan rows.
 
             // [Step 1b] Command-vs-inbox cross-check.  The leased
             //           inbox row carries `payload_json`,
@@ -399,6 +395,20 @@ pub async fn run(
                 )
                 .await;
             }
+
+            // [Step 6c] W4-Z2a piece 6b-self-review Important #1 —
+            //           insert tax_snapshot ONLY now that we're
+            //           definitively on the Proceed path (Resume and
+            //           Terminal already returned early above).
+            //           Same `with_immediate` envelope → atomic with
+            //           lnd alloc + INSERT PREPARED.  Snapshot bytes
+            //           already computed outside tx; inside tx only
+            //           `INSERT OR IGNORE` + `SELECT id` runs.
+            let tax_snapshot_id =
+                crate::db::repositories::signing_config_snapshots::insert_or_get_id_tx(
+                    tx, &fn_id, &driver_id, &tax_snapshot,
+                )
+                .await?;
 
             // [Step 7] Allocate lnd atomically (UPDATE ... RETURNING).
             let lnd = node_state::allocate_next_lnd(tx, &fn_id).await?;
