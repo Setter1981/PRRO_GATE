@@ -112,15 +112,21 @@ pub async fn run(
                         // committed in a SEPARATE small with_immediate
                         // (not the lease tx — that one is never opened).
                         //
-                        // Piece 16 (review round 3 R1 H1 close): uses
-                        // GUARDED variant `mark_rejected_if_new_tx` so a
-                        // race-lost case (another worker grabbed the
-                        // lease between our pool peek and this reject
-                        // tx) does NOT silently rewrite a `PROCESSING`
-                        // status to `REJECTED`.  rows_affected = 0 →
-                        // race lost → Noop (audit still committed —
-                        // snapshot reload failure is a real fiscal
-                        // observation regardless of who owns the lease).
+                        // Piece 16 (round 3 R1 H1 close): uses GUARDED
+                        // variant `mark_rejected_if_new_tx` so a race-
+                        // lost case (another worker grabbed the lease
+                        // between our pool peek and this reject tx)
+                        // does NOT silently rewrite a `PROCESSING` /
+                        // `DONE` / `REJECTED` status.  rows_affected=0
+                        // → race lost → Noop.
+                        //
+                        // Piece 17 (round 4 C close): forensic audit
+                        // `c-acquire-snapshot-reload-failed` commits
+                        // ONLY when was_new=true (we won the race).
+                        // Losing workers commit no audit — thundering-
+                        // herd spam guard.  Winner's audit is the
+                        // single forensic record per deterministic
+                        // reload-failure incident.
                         //
                         // Piece 16 L3 close: forensic payload via
                         // serde_json::json! — guarantees valid JSON
@@ -177,8 +183,10 @@ pub async fn run(
                         }
                         // Race lost — another worker has the lease or
                         // the inbox row already left NEW.  No state
-                        // mutation beyond the committed audit.  Same
-                        // semantic as `acquire_lease` miss.
+                        // mutation; no audit (the winning worker
+                        // already committed the c-acquire-snapshot-
+                        // reload-failed forensic event under piece 17
+                        // C).  Same semantic as `acquire_lease` miss.
                         return Ok(WorkerProcessResult::Noop);
                     }
                 }

@@ -24,6 +24,10 @@ default = []
 #   - `services::reconciliation::guard::ReconcileGuard::for_integration_test_only`
 #     (W2 lock-token; production path mints via `from_app_mutex` after
 #     acquiring the App recon mutex)
+#   - `services::write_path::stage_sign::check_payload_from_json_for_testing`
+#     (W4-Z2a piece 16 + 17; conversion-boundary seam for
+#     `tests/w4_z2a_emit_integration.rs` — production callers drive
+#     `check_payload_from` via `build_canonical_and_sign_no_tx`)
 #
 # CI test invocations and local `cargo test` for tests that touch
 # `boot_phase::run_boot_reconciliation` directly MUST pass
