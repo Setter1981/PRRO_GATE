@@ -105,6 +105,17 @@ pub struct DocumentRow {
     /// 4-pre by signer_guard.  `None` for pre-W14a-2b ledger rows
     /// (column added in migration 017_signed_by_cashier_id.sql).
     pub signed_by_cashier_id: Option<CashierId>,
+    /// W4-Z2a piece 6b mid-fix CRIT-2 (external mid-review) — FK to
+    /// `signing_config_snapshots.id` for the snapshot row pinned to
+    /// this document.  Set at INSERT PREPARED (atomic with lease in
+    /// stage_acquire) and never drifts (COALESCE-preserve in pin's
+    /// UPDATE).  Mirror of `PinnedSigningInputs.signing_config_snapshot_id`
+    /// — same row, both struct shapes now expose it to callers that
+    /// don't use the pinned-inputs read path (e.g., MAC recovery's
+    /// MR-NO-TX read in piece 9 / boot recovery in stage_acquire).
+    /// `None` for pre-W4-Z2a ledger rows (column added in migration
+    /// 020_signing_config_snapshots.sql).
+    pub signing_config_snapshot_id: Option<i64>,
 }
 
 /// W6 — decode a length-32 BLOB into a fixed `[u8; 32]`.  Fail-closed:
@@ -467,7 +478,8 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
                   z_report_number,
                   unsigned_xml_sha256   as "unsigned_xml_sha256: Vec<u8>",
                   signing_inputs_pinned_at,
-                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId"
+                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId",
+                  signing_config_snapshot_id
            FROM fiscal_documents
            WHERE fiscal_number = ?
              AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')
@@ -493,6 +505,7 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
                 unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
                 signing_inputs_pinned_at: r.signing_inputs_pinned_at,
                 signed_by_cashier_id: r.signed_by_cashier_id,
+                signing_config_snapshot_id: r.signing_config_snapshot_id,
             })
         })
         .collect()
@@ -576,7 +589,8 @@ pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
                   z_report_number,
                   unsigned_xml_sha256   as "unsigned_xml_sha256: Vec<u8>",
                   signing_inputs_pinned_at,
-                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId"
+                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId",
+                  signing_config_snapshot_id
            FROM fiscal_documents
            WHERE fiscal_number = ?
              AND offline_session_id = ?
@@ -605,6 +619,7 @@ pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
                 unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
                 signing_inputs_pinned_at: r.signing_inputs_pinned_at,
                 signed_by_cashier_id: r.signed_by_cashier_id,
+                signing_config_snapshot_id: r.signing_config_snapshot_id,
             })
         })
         .collect()
@@ -697,7 +712,8 @@ pub async fn get_pending_by_request_id_tx(
                   z_report_number,
                   unsigned_xml_sha256   as "unsigned_xml_sha256: Vec<u8>",
                   signing_inputs_pinned_at,
-                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId"
+                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId",
+                  signing_config_snapshot_id
            FROM fiscal_documents
            WHERE request_id = ?
              AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')"#,
@@ -721,6 +737,7 @@ pub async fn get_pending_by_request_id_tx(
         unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
         signing_inputs_pinned_at: r.signing_inputs_pinned_at,
         signed_by_cashier_id: r.signed_by_cashier_id,
+        signing_config_snapshot_id: r.signing_config_snapshot_id,
     }))
 }
 

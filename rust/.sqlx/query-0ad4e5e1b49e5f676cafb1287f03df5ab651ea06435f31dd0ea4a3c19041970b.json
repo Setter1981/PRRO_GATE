@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT document_id    as \"document_id: DocumentId\",\n                  fiscal_number,\n                  lnd,\n                  state           as \"state: DocState\",\n                  doc_type        as \"doc_type: DocType\",\n                  server_fiscal_no,\n                  submission_attempted_at,\n                  backend_profile_id,\n                  transport_profile_id,\n                  previous_hash         as \"previous_hash: Vec<u8>\",\n                  z_report_number,\n                  unsigned_xml_sha256   as \"unsigned_xml_sha256: Vec<u8>\",\n                  signing_inputs_pinned_at,\n                  signed_by_cashier_id  as \"signed_by_cashier_id: CashierId\"\n           FROM fiscal_documents\n           WHERE fiscal_number = ?\n             AND offline_session_id = ?\n             AND fs_mode = 'OFFLINE'\n             AND state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE','KVT2')\n           ORDER BY lnd, created_at, document_id",
+  "query": "SELECT document_id    as \"document_id: DocumentId\",\n                  fiscal_number,\n                  lnd,\n                  state           as \"state: DocState\",\n                  doc_type        as \"doc_type: DocType\",\n                  server_fiscal_no,\n                  submission_attempted_at,\n                  backend_profile_id,\n                  transport_profile_id,\n                  previous_hash         as \"previous_hash: Vec<u8>\",\n                  z_report_number,\n                  unsigned_xml_sha256   as \"unsigned_xml_sha256: Vec<u8>\",\n                  signing_inputs_pinned_at,\n                  signed_by_cashier_id  as \"signed_by_cashier_id: CashierId\",\n                  signing_config_snapshot_id\n           FROM fiscal_documents\n           WHERE request_id = ?\n             AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')",
   "describe": {
     "columns": [
       {
@@ -72,10 +72,15 @@
         "name": "signed_by_cashier_id: CashierId",
         "ordinal": 13,
         "type_info": "Text"
+      },
+      {
+        "name": "signing_config_snapshot_id",
+        "ordinal": 14,
+        "type_info": "Integer"
       }
     ],
     "parameters": {
-      "Right": 2
+      "Right": 1
     },
     "nullable": [
       false,
@@ -91,8 +96,9 @@
       true,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "9023f20ead6931c0c41cc45db39a8362d8a7c52f6abf79cc81db0cbfeca237b9"
+  "hash": "0ad4e5e1b49e5f676cafb1287f03df5ab651ea06435f31dd0ea4a3c19041970b"
 }

@@ -467,6 +467,9 @@ pub async fn run(
                 // W14a-2b Commit 1: carries the value from new_doc (None
                 // until Commit 2 plumbs CanonicalFiscalCommand).
                 signed_by_cashier_id: new_doc.signed_by_cashier_id.clone(),
+                // W4-Z2a piece 6b — FK to signing_config_snapshots row
+                // just inserted in this same with_immediate envelope.
+                signing_config_snapshot_id: Some(tax_snapshot_id),
             };
 
             Ok(WorkerProcessResult::Proceed(WorkerContext {

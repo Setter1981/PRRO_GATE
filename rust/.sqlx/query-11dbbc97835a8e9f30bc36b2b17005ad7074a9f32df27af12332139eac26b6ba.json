@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT document_id    as \"document_id: DocumentId\",\n                  fiscal_number,\n                  lnd,\n                  state           as \"state: DocState\",\n                  doc_type        as \"doc_type: DocType\",\n                  server_fiscal_no,\n                  submission_attempted_at,\n                  backend_profile_id,\n                  transport_profile_id,\n                  previous_hash         as \"previous_hash: Vec<u8>\",\n                  z_report_number,\n                  unsigned_xml_sha256   as \"unsigned_xml_sha256: Vec<u8>\",\n                  signing_inputs_pinned_at,\n                  signed_by_cashier_id  as \"signed_by_cashier_id: CashierId\"\n           FROM fiscal_documents\n           WHERE request_id = ?\n             AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')",
+  "query": "SELECT document_id    as \"document_id: DocumentId\",\n                  fiscal_number,\n                  lnd,\n                  state           as \"state: DocState\",\n                  doc_type        as \"doc_type: DocType\",\n                  server_fiscal_no,\n                  submission_attempted_at,\n                  backend_profile_id,\n                  transport_profile_id,\n                  previous_hash         as \"previous_hash: Vec<u8>\",\n                  z_report_number,\n                  unsigned_xml_sha256   as \"unsigned_xml_sha256: Vec<u8>\",\n                  signing_inputs_pinned_at,\n                  signed_by_cashier_id  as \"signed_by_cashier_id: CashierId\",\n                  signing_config_snapshot_id\n           FROM fiscal_documents\n           WHERE fiscal_number = ?\n             AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')\n           ORDER BY lnd, created_at, document_id",
   "describe": {
     "columns": [
       {
@@ -72,6 +72,11 @@
         "name": "signed_by_cashier_id: CashierId",
         "ordinal": 13,
         "type_info": "Text"
+      },
+      {
+        "name": "signing_config_snapshot_id",
+        "ordinal": 14,
+        "type_info": "Integer"
       }
     ],
     "parameters": {
@@ -91,8 +96,9 @@
       true,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "fe023aeeb90def59abaaeb979f02881d9703c373a3eb1f1de15b7f494e16a4e3"
+  "hash": "11dbbc97835a8e9f30bc36b2b17005ad7074a9f32df27af12332139eac26b6ba"
 }

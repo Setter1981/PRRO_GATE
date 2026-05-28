@@ -1349,6 +1349,8 @@ fn _unused_imports_suppression() {
         signing_inputs_pinned_at: None,
         // W14a-2b additive.
         signed_by_cashier_id: None,
+        // W4-Z2a piece 6b additive.
+        signing_config_snapshot_id: None,
     };
     let _ = Severity::Info;
     let _ = shifts::ShiftRow {

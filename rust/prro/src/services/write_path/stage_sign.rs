@@ -423,6 +423,9 @@ pub async fn run(
         signing_inputs_pinned_at: document.signing_inputs_pinned_at.or(Some(now_iso)),
         // W14a-2b Commit 1: pass-through from input DocumentRow.
         signed_by_cashier_id: document.signed_by_cashier_id,
+        // W4-Z2a piece 6b — FK pinned at INSERT PREPARED, never
+        // mutated by stage_sign; pass-through.
+        signing_config_snapshot_id: document.signing_config_snapshot_id,
     };
 
     Ok(SigningOutcome {
