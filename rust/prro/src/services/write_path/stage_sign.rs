@@ -198,7 +198,10 @@ pub async fn run(
     incoming: WorkerContext,
 ) -> Result<SigningOutcome, SignError> {
     let WorkerContext {
-        command, document, ..
+        command,
+        document,
+        tax_resolution_snapshot_id,
+        ..
     } = incoming;
     let doc_id = document.document_id;
     let fn_id = document.fiscal_number.clone();
@@ -225,15 +228,15 @@ pub async fn run(
     // non-inline form (block expression, variable, fn pointer) since
     // those bypass closure-body inspection.
     let fn_id_for_pin = fn_id.clone();
-    // W4-Z2a piece 8a — caller's snapshot id intent.  Piece 8b
-    // replaces `None` with `ctx.tax_resolution_snapshot_id`.  For
-    // the foundation 8a closes the WHERE-guard SQL (see
-    // `pin_signing_inputs_tx`) + adds the pre-check disambiguation
-    // below so a future caller passing `Some(Y)` against existing
-    // `Some(X != Y)` is rejected with a typed
-    // `SignError::SnapshotIdMismatch` rather than swallowed by
-    // COALESCE.
-    let caller_snapshot_id: Option<i64> = None;
+    // W4-Z2a piece 8b — caller's snapshot id is the FK that
+    // stage_acquire INSERT-set in the same fiscal_documents row.
+    // Variants:
+    //   Some(_)  Proceed path: matches existing FK; pin idempotent
+    //            (COALESCE existing-wins keeps the same value).
+    //   None     Resume / boot recovery / fixture paths: WHERE-guard
+    //            matches `? IS NULL`, COALESCE preserves existing FK.
+    //            Piece 9 wires MR-NO-TX to read persisted FK separately.
+    let caller_snapshot_id: Option<i64> = tax_resolution_snapshot_id;
     let pinned: PinResult = with_immediate(pool, move |tx| {
         let fn_id = fn_id_for_pin;
         Box::pin(async move {
