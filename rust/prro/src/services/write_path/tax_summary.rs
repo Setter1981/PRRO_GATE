@@ -36,7 +36,232 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
 use crate::xml::{calc_tax, CalcTaxError, CheckItem, TaxGroupSummary};
+
+// ─── W4-Z2a foundation: TaxResolutionSnapshot + bps helpers ────────
+
+/// W4-Z2a piece 1 — per-receipt pinned tax-resolution snapshot.
+///
+/// Stored in `signing_config_snapshots` table (main pool) — append-only
+/// ledger of every UNIQUE `(fn, driver_id, payload_sha256)` triple seen
+/// by any signed receipt.  See [[project_m4_w4_z2a_locked_design]].
+///
+/// **Rates stored as integer basis points (i64)**, NOT f64.  This
+/// removes float/locale/format drift from canonical hash + decouples
+/// snapshot canonical bytes from XML wire format.  Conversion to
+/// `f64` happens at calc_tax site; conversion to 2-decimal string
+/// happens at XML emission site.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaxResolutionSnapshot {
+    /// Schema version — locks payload shape for future-proofing.
+    /// "check_tax_mapping_v1" is the W4-Z2a launch shape.  Future
+    /// EVPZ/Z-report extensions get distinct kinds.
+    pub kind: String,
+    /// Resolved canonical tax-group rates, sorted ascending by `tx`
+    /// in canonical bytes (sort happens at serialize time —
+    /// constructor accepts any order).
+    pub groups: Vec<ResolvedTaxGroupBps>,
+}
+
+/// BPS-storage variant of [`ResolvedTaxGroup`].  Used for canonical
+/// snapshot payload.  Converted to `ResolvedTaxGroup` (f64) via
+/// [`TaxResolutionSnapshot::to_calc_map`] at calc_tax boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResolvedTaxGroupBps {
+    pub tx: i64,
+    /// PDV rate in basis points (20.00% = 2000).
+    pub txpr_bps: i64,
+    /// Excise rate in basis points.
+    pub dtpr_bps: i64,
+    pub txal: i64,
+    pub txty: i64,
+}
+
+impl TaxResolutionSnapshot {
+    pub const KIND_V1: &'static str = "check_tax_mapping_v1";
+
+    /// Construct from already-validated bps groups.  Use
+    /// [`try_from_live`] for the f64-input path with validation.
+    pub fn new(groups: Vec<ResolvedTaxGroupBps>) -> Self {
+        Self {
+            kind: Self::KIND_V1.to_string(),
+            groups,
+        }
+    }
+
+    pub fn groups(&self) -> &[ResolvedTaxGroupBps] {
+        &self.groups
+    }
+
+    /// Construct from live (REAL/f64) tax_groups config with strict
+    /// round-trip validation.  Each `(fn_id_ignored, tx, txpr, dtpr,
+    /// txal, txty)` tuple must satisfy:
+    ///   - rates finite (not NaN / ±Inf)
+    ///   - rates non-negative
+    ///   - rates round-trip to 2 decimal places exactly (rate * 100
+    ///     must be representable as integer)
+    pub fn try_from_live(
+        rows: Vec<(String, i64, f64, f64, i64, i64)>,
+    ) -> Result<Self, SnapshotBuildError> {
+        let mut groups = Vec::with_capacity(rows.len());
+        for (_fn_id, tx, txpr, dtpr, txal, txty) in rows {
+            let txpr_bps = validate_rate_to_bps(txpr, "txpr", tx)?;
+            let dtpr_bps = validate_rate_to_bps(dtpr, "dtpr", tx)?;
+            groups.push(ResolvedTaxGroupBps {
+                tx,
+                txpr_bps,
+                dtpr_bps,
+                txal,
+                txty,
+            });
+        }
+        Ok(Self::new(groups))
+    }
+
+    /// Canonical bytes per locked design: deterministic JSON with
+    /// groups sorted ascending by `tx`, sorted map keys, no
+    /// whitespace.  Any drift in this function breaks `payload_sha256`
+    /// verify-on-read for every existing snapshot row — treat
+    /// modifications as a fiscal-compat break.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut sorted = self.clone();
+        sorted.groups.sort_by_key(|g| g.tx);
+        // serde_json::to_vec uses field declaration order; we want
+        // alphabetical keys for stability across serde version bumps.
+        // Use a BTreeMap-based wrapper that forces sorted JSON keys.
+        // Simpler: hand-build the canonical JSON.
+        let mut out = Vec::with_capacity(256);
+        out.extend_from_slice(b"{\"groups\":[");
+        for (i, g) in sorted.groups.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            out.extend_from_slice(b"{\"dtpr_bps\":");
+            out.extend_from_slice(g.dtpr_bps.to_string().as_bytes());
+            out.extend_from_slice(b",\"tx\":");
+            out.extend_from_slice(g.tx.to_string().as_bytes());
+            out.extend_from_slice(b",\"txal\":");
+            out.extend_from_slice(g.txal.to_string().as_bytes());
+            out.extend_from_slice(b",\"txpr_bps\":");
+            out.extend_from_slice(g.txpr_bps.to_string().as_bytes());
+            out.extend_from_slice(b",\"txty\":");
+            out.extend_from_slice(g.txty.to_string().as_bytes());
+            out.push(b'}');
+        }
+        out.extend_from_slice(b"],\"kind\":\"");
+        out.extend_from_slice(sorted.kind.as_bytes());
+        out.extend_from_slice(b"\"}");
+        out
+    }
+
+    /// SHA256 of [`canonical_bytes`].
+    pub fn sha256(&self) -> [u8; 32] {
+        let digest = Sha256::digest(self.canonical_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(digest.as_slice());
+        out
+    }
+
+    /// Bridge to W4-Z1 [`derive_check_tax_summaries`]: converts bps
+    /// → f64 at the calc_tax boundary.  XML wire rate strings come
+    /// from [`bps_to_decimal_string`] applied to the bps directly
+    /// (NOT format!("{:.2}", f64) — avoids decimal-vs-float drift).
+    pub fn to_calc_map(&self) -> HashMap<i64, ResolvedTaxGroup> {
+        self.groups
+            .iter()
+            .map(|g| {
+                (
+                    g.tx,
+                    ResolvedTaxGroup {
+                        tx: g.tx,
+                        txpr: bps_to_f64(g.txpr_bps),
+                        dtpr: bps_to_f64(g.dtpr_bps),
+                        txal: g.txal,
+                        txty: g.txty,
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+/// Convert basis points to f64 percentage (2000 → 20.0).
+#[inline]
+pub fn bps_to_f64(bps: i64) -> f64 {
+    bps as f64 / 100.0
+}
+
+/// Convert basis points to exact 2-decimal-place wire string
+/// (2000 → "20.00", 75 → "0.75", 0 → "0.00").  Used by XML emitter
+/// for TXPR/DTPR attribute formatting — bypasses any float→string
+/// formatting drift.
+pub fn bps_to_decimal_string(bps: i64) -> String {
+    let integer = bps / 100;
+    let fractional = (bps % 100).abs();
+    if bps < 0 {
+        format!("-{}.{:02}", integer.abs(), fractional)
+    } else {
+        format!("{}.{:02}", integer, fractional)
+    }
+}
+
+/// Validate an f64 rate (live config input) and convert to bps with
+/// strict round-trip requirement.  Reasoning + rules pinned in
+/// memory `project_m4_w4_z2a_locked_design.md`.
+fn validate_rate_to_bps(
+    rate: f64,
+    field: &'static str,
+    tx: i64,
+) -> Result<i64, SnapshotBuildError> {
+    if !rate.is_finite() {
+        return Err(SnapshotBuildError::RateNotFinite { field, tx, rate });
+    }
+    if rate < 0.0 {
+        return Err(SnapshotBuildError::NegativeRate { field, tx, rate });
+    }
+    // Multiply by 100 and check exact integer round-trip.
+    let scaled = rate * 100.0;
+    let rounded = scaled.round() as i64;
+    // Must be exactly representable: (rounded as f64) / 100.0 == rate
+    // — and the rounding above must have been a no-op (no .5 boundary
+    // drift from float-to-int).
+    if (scaled - rounded as f64).abs() > f64::EPSILON {
+        return Err(SnapshotBuildError::RateNotRoundTrippable {
+            field,
+            tx,
+            rate,
+        });
+    }
+    Ok(rounded)
+}
+
+/// Errors during [`TaxResolutionSnapshot::try_from_live`] validation.
+#[derive(Debug, Error, PartialEq)]
+pub enum SnapshotBuildError {
+    #[error("snapshot build: {field} rate not finite (tx={tx}, rate={rate})")]
+    RateNotFinite {
+        field: &'static str,
+        tx: i64,
+        rate: f64,
+    },
+    #[error("snapshot build: {field} rate negative (tx={tx}, rate={rate})")]
+    NegativeRate {
+        field: &'static str,
+        tx: i64,
+        rate: f64,
+    },
+    #[error("snapshot build: {field} rate not round-trippable to 2dp (tx={tx}, rate={rate}) — admin config must use rates representable as 2 decimal places")]
+    RateNotRoundTrippable {
+        field: &'static str,
+        tx: i64,
+        rate: f64,
+    },
+}
+
+// ─── End W4-Z2a foundation ─────────────────────────────────────────
 
 /// Caller-resolved tax group snapshot (already translated through
 /// `driver_tax_mapping`).  Fields mirror the ФСКО TX attributes.
