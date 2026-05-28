@@ -411,6 +411,12 @@ pub async fn run(
                 payload_sha256_canonical: command.payload_sha256_canonical,
                 unsigned_xml_sha256: None,
                 previous_hash: None,
+                // W4-Z2a piece 6b.1 (external mid-review CRIT-2) — FK set
+                // at INSERT in the same with_immediate envelope as the
+                // snapshot row INSERT.  Closes two-envelope crash window:
+                // any taxable PREPARED doc on disk already references its
+                // frozen tax config.
+                signing_config_snapshot_id: Some(tax_snapshot_id),
                 // W14a-2b Commit 2: threaded from CanonicalFiscalCommand
                 // (Commit 1 plumbed `None` baseline; field now flows
                 // from ingress through stage_acquire → INSERT PREPARED).

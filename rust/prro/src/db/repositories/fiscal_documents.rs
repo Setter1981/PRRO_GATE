@@ -49,6 +49,19 @@ pub struct NewDocument {
     /// stage_send 4-pre by signer_guard.  None for system-context paths
     /// without operator attribution (none currently).
     pub signed_by_cashier_id: Option<CashierId>,
+    /// W4-Z2a piece 6b.1 (external mid-review CRIT-2) — FK to
+    /// `signing_config_snapshots.id` for the snapshot row inserted
+    /// by stage_acquire in the SAME with_immediate envelope as
+    /// this row.  Setting FK at INSERT (not at 3-PRE pin) closes
+    /// the two-envelope crash window: any taxable PREPARED doc on
+    /// disk already references its frozen tax config snapshot.
+    ///
+    /// `Some(id)` is the only production value (stage_acquire
+    /// always inserts a snapshot row for the receipt's FN+driver).
+    /// `None` is reserved for pre-W4-Z2a docs persisted before
+    /// migration 020 ran — those rows already exist with NULL,
+    /// not via this fresh-INSERT path.
+    pub signing_config_snapshot_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -223,8 +236,8 @@ pub async fn insert_prepared(pool: &SqlitePool, n: &NewDocument) -> sqlx::Result
              lnd, doc_type, state, backend_profile_id, transport_profile_id,
              fs_mode, business_ts, total_sum_kop, payload_json,
              payload_sha256_canonical, unsigned_xml_sha256, previous_hash,
-             signed_by_cashier_id
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+             signed_by_cashier_id, signing_config_snapshot_id
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(n.document_id)
     .bind(n.request_id)
@@ -243,6 +256,7 @@ pub async fn insert_prepared(pool: &SqlitePool, n: &NewDocument) -> sqlx::Result
     .bind(n.unsigned_xml_sha256.as_ref().map(|b| &b[..]))
     .bind(n.previous_hash.as_ref().map(|b| &b[..]))
     .bind(n.signed_by_cashier_id.as_ref().map(|c| c.as_str()))
+    .bind(n.signing_config_snapshot_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -752,8 +766,8 @@ pub async fn insert_prepared_tx(tx: &mut WriteTxConn<'_>, n: &NewDocument) -> sq
              lnd, doc_type, state, backend_profile_id, transport_profile_id,
              fs_mode, business_ts, total_sum_kop, payload_json,
              payload_sha256_canonical, unsigned_xml_sha256, previous_hash,
-             signed_by_cashier_id
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+             signed_by_cashier_id, signing_config_snapshot_id
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(n.document_id)
     .bind(n.request_id)
@@ -772,6 +786,7 @@ pub async fn insert_prepared_tx(tx: &mut WriteTxConn<'_>, n: &NewDocument) -> sq
     .bind(n.unsigned_xml_sha256.as_ref().map(|b| &b[..]))
     .bind(n.previous_hash.as_ref().map(|b| &b[..]))
     .bind(n.signed_by_cashier_id.as_ref().map(|c| c.as_str()))
+    .bind(n.signing_config_snapshot_id)
     .execute(&mut **tx)
     .await?;
     Ok(())

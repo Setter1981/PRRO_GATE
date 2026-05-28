@@ -275,6 +275,35 @@ async fn stage1_sell_happy_path_with_opened_shift() {
     assert_eq!(next_lnd(&pool).await, 2, "next_lnd advanced 1→2");
     assert_eq!(inbox_status(&pool, &req_id).await, "PROCESSING");
     assert_eq!(audit_count_for_event(&pool, "doc_prepared").await, 1);
+
+    // W4-Z2a piece 6b.1 acceptance — `fiscal_documents.signing_config_snapshot_id`
+    // MUST be set at INSERT (NOT NULL, points to inserted snapshot row).
+    // Closes external-mid-review CRIT-2 two-envelope crash window.
+    let snapshot_id_persisted: Option<i64> = sqlx::query_scalar(
+        "SELECT signing_config_snapshot_id FROM fiscal_documents WHERE document_id = ?"
+    )
+    .bind(ctx.document.document_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        snapshot_id_persisted.is_some(),
+        "signing_config_snapshot_id MUST be set at INSERT (piece 6b.1 acceptance)"
+    );
+    let id = snapshot_id_persisted.unwrap();
+    assert_eq!(
+        id, ctx.tax_resolution_snapshot_id.expect("ctx FK populated"),
+        "persisted FK must match WorkerContext id (same insert_or_get_id_tx result)"
+    );
+    // Confirm snapshot row exists.
+    let snapshot_row_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM signing_config_snapshots WHERE id = ?"
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(snapshot_row_count, 1, "FK references existing snapshot row");
 }
 
 // ─── 2. SHIFT_OPEN happy path with Closed shift_state ─────────────────
