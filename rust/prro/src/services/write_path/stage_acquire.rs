@@ -20,6 +20,7 @@ use crate::db::tx::with_immediate;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
+use super::tax_summary::TaxResolutionSnapshot;
 use super::types::{Channel, CanonicalFiscalCommand, RejectionReason, WorkerContext, WorkerProcessResult};
 
 /// Public stage-1 entry.  Opens one `with_immediate` envelope and
@@ -70,14 +71,95 @@ pub async fn run(
         pool_secure, &peeked_fn_id, driver_id,
     ).await?;
 
+    // W4-Z2a piece 15 (review round 2 M2 close) — Resume snapshot
+    // reload hoist.  If a pending fiscal_documents row exists for
+    // this request_id with a persisted snapshot_id, pre-load the
+    // snapshot via pool-bound get_by_id (sha256 + V1 verify) HERE,
+    // OUTSIDE the main with_immediate envelope.  On failure:
+    // emit a pool-bound committed audit `c-acquire-snapshot-
+    // reload-failed` (Critical) AND return Rejected — never enter
+    // the lease tx.  Pattern mirrors boot_phase piece 13 reload
+    // semantic.
+    //
+    // Why hoist instead of inline get_by_id_tx: the inline pattern
+    // (piece 14b) rolled back the entire with_immediate envelope
+    // including the resume_detected audit on reload failure,
+    // losing the forensic event.  Pool-bound peek + load + audit
+    // commits the forensic event independently of the lease tx.
+    //
+    // Race semantics: pool peek is advisory.  Between this peek
+    // and the inside-tx `get_pending_by_request_id_tx`, the doc
+    // may transition to terminal.  If tx-time check finds no
+    // pending row, the pre-loaded snapshot is silently discarded
+    // (no harm).  Tx-time check remains authoritative.
+    let request_id_typed = RequestId::from_bytes(request_id);
+    let resume_preload =
+        crate::db::repositories::fiscal_documents::peek_pending_doc_id_and_snapshot_id_by_request_id(
+            pool, &request_id_typed,
+        )
+        .await?;
+    let preloaded_resume_snapshot: Option<(DocumentId, Option<TaxResolutionSnapshot>)> =
+        match resume_preload {
+            Some((doc_id, Some(snapshot_id))) => {
+                match crate::db::repositories::signing_config_snapshots::get_by_id(
+                    pool, snapshot_id,
+                )
+                .await
+                {
+                    Ok(snapshot) => Some((doc_id, Some(snapshot))),
+                    Err(e) => {
+                        // Forensic Critical audit + inbox REJECTED
+                        // committed in a SEPARATE small with_immediate
+                        // (not the lease tx — that one is never opened).
+                        // Pattern mirrors the in-tx `reject` helper but
+                        // pre-lease.  Inbox flip to REJECTED prevents
+                        // the request_id retrying indefinitely.
+                        let forensic_payload = format!(
+                            r#"{{"request_id":"{}","snapshot_id":{},"error":"{}"}}"#,
+                            hex_encode(&request_id),
+                            snapshot_id,
+                            e,
+                        );
+                        with_immediate(pool, move |tx| {
+                            let forensic_payload = forensic_payload.clone();
+                            Box::pin(async move {
+                                ingress_inbox::mark_rejected_tx(tx, &request_id).await?;
+                                audit_log::append_tx(
+                                    tx,
+                                    "fiscal_document",
+                                    &format!("{doc_id:?}"),
+                                    "c-acquire-snapshot-reload-failed",
+                                    Severity::Critical,
+                                    None,
+                                    Some(&forensic_payload),
+                                )
+                                .await?;
+                                Ok::<_, anyhow::Error>(())
+                            })
+                        })
+                        .await?;
+                        return Ok(WorkerProcessResult::Rejected {
+                            reason: RejectionReason::InvalidPayload {
+                                detail: "acquire_snapshot_reload_failed".into(),
+                            },
+                        });
+                    }
+                }
+            }
+            Some((doc_id, None)) => Some((doc_id, None)),
+            None => None,
+        };
+
     let driver_id_owned = driver_id.to_string();
     let peeked_fn_id_owned = peeked_fn_id.clone();
     let tax_snapshot_for_tx = tax_snapshot.clone();
+    let preloaded_resume_for_tx = preloaded_resume_snapshot.clone();
 
     with_immediate(pool, move |tx| {
         let driver_id = driver_id_owned.clone();
         let peeked_fn_id = peeked_fn_id_owned.clone();
         let tax_snapshot = tax_snapshot_for_tx.clone();
+        let preloaded_resume = preloaded_resume_for_tx.clone();
         Box::pin(async move {
             // [Step 1] Acquire lease — CAS NEW → PROCESSING.
             let inbox = match ingress_inbox::acquire_lease(tx, &request_id).await? {
@@ -366,33 +448,50 @@ pub async fn run(
                 // compile time.  Per locked design rule #9: "MAC
                 // recovery uses persisted snapshot_id, NEVER current
                 // config".
-                // W4-Z2a piece 14 (external review R2 Medium close):
-                // reload persisted snapshot for the Resumed doc.
-                // Mirror of piece 13's boot_phase reload semantic.
-                // Closes the latent footgun — if a future dispatcher
-                // routes the Resumed WorkerContext back through
-                // stage_sign::run, taxable docs would otherwise hit
-                // empty tax_groups → TaxMappingNotWired → infinite
-                // PREPARED loop.
+                // W4-Z2a piece 15 (review round 2 M2 close): use
+                // the pre-loaded snapshot from the outer pool-bound
+                // peek (load happened BEFORE this with_immediate
+                // envelope opened, OUTSIDE BEGIN IMMEDIATE — see
+                // start of `run`).  No DB reads inside the
+                // resume-detect branch beyond the pending lookup +
+                // audit_log::append_tx above.  INV-1 letter +
+                // spirit preserved.
                 //
-                // Note: uses `get_by_id_tx` (tx-bound variant added
-                // in piece 14) — re-uses the writer-tx connection
-                // instead of acquiring a separate pool connection,
-                // avoiding pool-contention deadlock potential.  PK
-                // SELECT with sha256 + V1 verify: short DB statement
-                // inside the envelope, INV-1 letter preserved.
-                // Reload failure (orphan FK / corruption / V1
-                // mismatch) → anyhow::Error::from → envelope rolls
-                // back and ingress sees a generic anyhow chain.
-                let resumed_snapshot = match existing.signing_config_snapshot_id {
-                    Some(id) => Some(
-                        crate::db::repositories::signing_config_snapshots::get_by_id_tx(
-                            tx, id,
-                        )
-                        .await
-                        .map_err(anyhow::Error::from)?,
-                    ),
-                    None => None,
+                // Race semantics: pool-peek + tx-time pending row
+                // MAY observe different state in concurrent worker
+                // / boot-reconciliation scenarios.  Defensive
+                // assertion: the doc_id from the pre-tx peek must
+                // match the doc_id from the tx-time
+                // get_pending_by_request_id_tx.  Mismatch =
+                // request_id colliding across docs (impossible
+                // under inbox UNIQUE) — fail-loud via bail.
+                let resumed_snapshot = match &preloaded_resume {
+                    Some((peeked_doc_id, snapshot_opt)) => {
+                        if *peeked_doc_id != existing.document_id {
+                            anyhow::bail!(
+                                "stage_acquire invariant: pre-tx peeked doc_id={:?} but tx-time \
+                                 resume-detect found {:?} for request_id={}",
+                                peeked_doc_id,
+                                existing.document_id,
+                                hex_encode(&request_id),
+                            );
+                        }
+                        snapshot_opt.clone()
+                    }
+                    // Pre-tx peek saw no pending row but tx-time
+                    // resume-detect found one — implies a doc was
+                    // INSERTed between the two reads, which under
+                    // single-writer-per-fn invariant should not
+                    // happen.  Defensive fail-loud (mirrors the
+                    // peeked_fn_id check above).
+                    None => {
+                        anyhow::bail!(
+                            "stage_acquire invariant: pre-tx peek saw no pending doc but \
+                             tx-time resume-detect found doc_id={:?} for request_id={}",
+                            existing.document_id,
+                            hex_encode(&request_id),
+                        );
+                    }
                 };
                 return Ok(WorkerProcessResult::Resumed(WorkerContext {
                     inbox,

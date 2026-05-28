@@ -741,6 +741,42 @@ pub async fn get_pending_by_request_id_tx(
     }))
 }
 
+/// W4-Z2a piece 15 (review round 2 M2 — Resume reload hoist) —
+/// pool-bound minimal-info peek of a pending fiscal_documents row
+/// by `request_id`.  Returns `(document_id, signing_config_
+/// snapshot_id)` if a pending row exists.  Same state filter as
+/// [`get_pending_by_request_id_tx`].
+///
+/// **Use**: stage_acquire pre-tx peek to pre-load the persisted
+/// snapshot via `signing_config_snapshots::get_by_id` BEFORE
+/// opening the main `with_immediate` envelope.  Locked rule #9
+/// + INV-1 spirit: keep the write tx short, fail-loud reload
+/// failure via a separately-committed audit (pattern from
+/// `boot_phase::run_for_doc_prepared` piece 13 fix).
+///
+/// **Race semantics**: pool read happens before the lease CAS.
+/// Between this peek and the inside-tx `get_pending_by_request_
+/// id_tx`, the doc may transition to terminal (boot recon, MAC
+/// recovery, admin SQL).  Caller treats peek result as advisory:
+/// if tx-time check finds no pending row, the pre-loaded snapshot
+/// is silently discarded.  Tx-time check is authoritative.
+pub async fn peek_pending_doc_id_and_snapshot_id_by_request_id(
+    pool: &SqlitePool,
+    request_id: &RequestId,
+) -> sqlx::Result<Option<(DocumentId, Option<i64>)>> {
+    let row = sqlx::query!(
+        r#"SELECT document_id as "document_id: DocumentId",
+                  signing_config_snapshot_id
+           FROM fiscal_documents
+           WHERE request_id = ?
+             AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')"#,
+        request_id,
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| (r.document_id, r.signing_config_snapshot_id)))
+}
+
 /// W5 / W0-1 §3.1 stage 1 — companion to
 /// [`get_pending_by_request_id_tx`].  Returns `true` when a
 /// fiscal_documents row with the given `request_id` exists in a

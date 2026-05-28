@@ -50,10 +50,8 @@ use crate::xml::{
     LineAdjustmentKind, ZReportCheckCount, ZReportPayload, ZReportPaymentSum,
 };
 
-use super::tax_summary::{derive_check_tax_summaries, ResolvedTaxGroup, TaxResolutionSnapshot};
+use super::tax_summary::{derive_check_tax_summaries, TaxResolutionSnapshot};
 use super::types::WorkerContext;
-
-use std::collections::HashMap;
 
 // ─── Public types ─────────────────────────────────────────────────────
 
@@ -1082,41 +1080,35 @@ fn check_payload_from(
     total_sum_kop: i64,
     tax_resolution: Option<&TaxResolutionSnapshot>,
 ) -> Result<CheckPayload, SignError> {
-    // W4-Z2a piece 14 (external review CRIT-1 close) — translate
-    // each item's `tax_group_1` from POS driver_number form to
-    // canonical TX BEFORE storing in CheckItem.  Empty driver_
-    // mapping → identity (resolve_driver_number returns
-    // Some(driver_number) unchanged).  Non-empty mapping + lookup
-    // miss → CalcTaxError::DriverMappingMiss fail-loud.
+    // W4-Z2a piece 14 (CRIT-1) + 15 (round 2 H1+M1) — translate
+    // each item's `tax_group_1` AND `tax_group_2` from POS
+    // driver_number form to canonical TX BEFORE storing in
+    // CheckItem.  Per-field translation semantics:
+    //   - Some(raw) + snapshot Some + driver_mapping non-empty +
+    //     hit → Some(canonical_tx_num)
+    //   - Some(raw) + snapshot Some + driver_mapping empty →
+    //     Some(raw) (identity fallback)
+    //   - Some(raw) + snapshot Some + non-empty mapping + miss →
+    //     CalcTaxError::DriverMappingMiss { field } (fail-loud)
+    //   - Some(raw) + snapshot None → Some(raw) pass-through
+    //     (pre-W4-Z2a back-compat; downstream
+    //     derive_check_tax_summaries surfaces TaxMappingNotWired)
+    //   - None field → None (no translation attempted)
     //
-    // Without this translation, items keyed by driver_number
-    // would later miss the canonical tax_groups map lookup in
-    // `derive_check_tax_summaries`, silently dropping `<TX>`
-    // summaries or aggregating against the wrong group.
+    // After translation, validate that the canonical_tx_num
+    // resolves to a `groups` entry in the snapshot.  Without
+    // this guard, a mapping like (driver 5 → canonical 99) where
+    // groups has no tx=99 would silently emit `<I TX="99">` and
+    // `derive_check_tax_summaries` would skip the missing canonical
+    // group → silent fiscal divergence one step later (round 2 H1).
     let translated_items: Vec<CheckItem> = body
         .items
         .into_iter()
         .map(|it| {
-            let canonical_tg1 = match it.tax_group_1 {
-                Some(raw) => match tax_resolution {
-                    Some(snapshot) => match snapshot.resolve_driver_number(raw) {
-                        Some(canonical) => Some(canonical),
-                        None => {
-                            return Err(SignError::TaxSummary(
-                                crate::xml::CalcTaxError::DriverMappingMiss {
-                                    driver_number: raw,
-                                },
-                            ));
-                        }
-                    },
-                    // None snapshot path: pre-W4-Z2a back-compat.
-                    // Items keep their raw tax_group_1; downstream
-                    // derive_check_tax_summaries will fail loud
-                    // via TaxMappingNotWired if the map is empty.
-                    None => Some(raw),
-                },
-                None => None,
-            };
+            let canonical_tg1 =
+                translate_tax_group(it.tax_group_1, tax_resolution, "tax_group_1")?;
+            let canonical_tg2 =
+                translate_tax_group(it.tax_group_2, tax_resolution, "tax_group_2")?;
             Ok(CheckItem {
                 code: it.code,
                 name: it.name,
@@ -1126,7 +1118,7 @@ fn check_payload_from(
                 barcode: it.barcode,
                 uktzed: it.uktzed,
                 tax_group_1: canonical_tg1,
-                tax_group_2: it.tax_group_2,
+                tax_group_2: canonical_tg2,
                 excise_stamps: it.excise_stamps,
                 adjustments: it.adjustments.into_iter().map(line_adjustment_from).collect(),
             })
@@ -1180,6 +1172,63 @@ fn check_payload_from(
         footer_lines: body.footer_lines,
         tax_summaries,
     })
+}
+
+/// W4-Z2a piece 15 — per-field tax_group translation helper.
+///
+/// Returns canonical TX after applying snapshot's driver_mapping +
+/// validating the canonical resolves to a `groups` entry.  Field-
+/// aware error surfaces (`tax_group_1` vs `tax_group_2`) tell
+/// operator which item slot drifted on miss / inconsistency.
+///
+/// Variants per (raw, snapshot, mapping state):
+///   - None                  → None (no translation, no validation)
+///   - Some(raw), None       → Some(raw) (pre-W4-Z2a back-compat)
+///   - Some(raw), Some(snap) → resolve_driver_number + groups check:
+///       * hit (canonical in groups) → Some(canonical)
+///       * hit (canonical NOT in groups) → CanonicalTxNotInGroups
+///       * miss (non-empty mapping, no driver entry) → DriverMappingMiss
+fn translate_tax_group(
+    raw: Option<i64>,
+    tax_resolution: Option<&TaxResolutionSnapshot>,
+    field: &'static str,
+) -> Result<Option<i64>, SignError> {
+    let Some(raw) = raw else { return Ok(None) };
+    let Some(snapshot) = tax_resolution else {
+        // Pre-W4-Z2a back-compat — raw passes through; downstream
+        // derive_check_tax_summaries surfaces TaxMappingNotWired
+        // if items carry tax_group_1 (canonical-keyed map empty).
+        return Ok(Some(raw));
+    };
+    let canonical = match snapshot.resolve_driver_number(raw) {
+        Some(c) => c,
+        None => {
+            return Err(SignError::TaxSummary(
+                crate::xml::CalcTaxError::DriverMappingMiss {
+                    driver_number: raw,
+                    field,
+                },
+            ));
+        }
+    };
+    // H1: validate snapshot self-consistency at use site.
+    // Mapping says driver_number → canonical, but groups may not
+    // carry that canonical (admin-side inconsistency, corruption,
+    // manual SQL drift).  Fail-closed BEFORE XML emit.
+    if !snapshot
+        .groups()
+        .iter()
+        .any(|g| g.tx == canonical)
+    {
+        return Err(SignError::TaxSummary(
+            crate::xml::CalcTaxError::CanonicalTxNotInGroups {
+                driver_number: raw,
+                canonical_tx_num: canonical,
+                field,
+            },
+        ));
+    }
+    Ok(Some(canonical))
 }
 
 fn line_adjustment_from(adj: LineAdjustmentJson) -> LineAdjustment {
