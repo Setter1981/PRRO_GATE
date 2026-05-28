@@ -2,7 +2,7 @@
 //!
 //! Append-only main-pool ledger of pinned tax-resolution snapshots,
 //! content-addressable via `(fn, driver_id, payload_sha256)` UNIQUE.
-//! See migration 022 + memory `project_m4_w4_z2a_locked_design`.
+//! See migration 020 + memory `project_m4_w4_z2a_locked_design`.
 //!
 //! ## Race safety
 //!

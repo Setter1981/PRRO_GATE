@@ -2161,7 +2161,9 @@ async fn dispatch_prepared_via_chain(
     doc: &crate::db::repositories::fiscal_documents::DocumentRow,
     histogram: &mut DispatchHistogram,
 ) -> anyhow::Result<()> {
-    use crate::db::repositories::{ingress_inbox::InboxRow, node_state, shifts};
+    use crate::db::repositories::{
+        ingress_inbox::InboxRow, node_state, shifts, signing_config_snapshots,
+    };
     use crate::services::write_path::stage_sign;
     use crate::services::write_path::types::{CanonicalFiscalCommand, WorkerContext};
     use sqlx::Row as _;
@@ -2432,34 +2434,49 @@ async fn dispatch_prepared_via_chain(
         }
     };
 
+    // W4-Z2a piece 13 (self-review IMP-1 close) — reload persisted
+    // snapshot via doc FK BEFORE re-entry.  Locked rule #9: boot
+    // recovery uses the snapshot the doc was originally pinned with,
+    // NEVER current config.  Required to drive 3-NO-TX `<TX>` emit
+    // for taxable items; without it, derive_check_tax_summaries fails
+    // with TaxMappingNotWired and the doc loops PREPARED forever.
+    //
+    // None branch covers pre-W4-Z2a docs (FK NULL — migration window
+    // back-compat); these docs by construction don't carry tax_group_1
+    // items, so empty map = unchanged behaviour.
+    let (tax_resolution_snapshot, tax_resolution_snapshot_id) =
+        match doc.signing_config_snapshot_id {
+            Some(id) => match signing_config_snapshots::get_by_id(pool, id).await {
+                Ok(s) => (Some(s), Some(id)),
+                Err(e) => {
+                    // Snapshot ledger drift / corruption / orphan FK —
+                    // catastrophic.  Surface via emit_dispatch_error
+                    // (same forensic class as the pre-existing recovery
+                    // errors above) and bail; doc stays in PREPARED for
+                    // operator inspection.  Audit log carries the typed
+                    // SigningConfigSnapshotsRepoError chain.
+                    emit_dispatch_error(
+                        pool,
+                        doc_id,
+                        "c-prepared-snapshot-reload",
+                        &anyhow::Error::new(e),
+                        histogram,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            },
+            None => (None, None),
+        };
+
     let worker_ctx = WorkerContext {
         inbox,
         command,
         node_state,
         active_shift,
         document: doc.clone(),
-        // W4-Z2a piece 6 — recovery path placeholder.  Boot reconciliation
-        // can encounter docs in two states:
-        //   (a) PREPARED + pinned (signing_config_snapshot_id IS NOT NULL)
-        //   (b) PREPARED + not yet pinned (snapshot_id IS NULL)
-        // Per locked design rule #9 ("MAC recovery uses persisted
-        // snapshot_id, NEVER reloads current config"), case (a) MUST
-        // re-load via get_by_id.  Case (b) needs a fresh load just like
-        // stage_acquire does for new docs.  Piece 8/9 wires this
-        // properly via fd::get_signing_inputs_tx + branching.  For piece
-        // 6 we ship an empty placeholder snapshot; the doc's actual
-        // snapshot will be re-derived in stage_sign 3-PRE re-entry
-        // (existing PERSISTED previous_hash + reuse branch logic).
-        // Tests for back-compat docs (no tax_group_1 items) continue
-        // passing — empty snapshot + TaxMappingNotWired guard only fires
-        // for taxable items, none of which exist in the recovery test
-        // fixture set today.
-        // W4-Z2a piece 6b external review: structural None — boot
-        // recovery NEVER carries a fresh snapshot; piece-9 reloads by
-        // persisted FK from the doc row.  Option<_> wrapper enforces
-        // this at compile-time (no accidental fresh-config re-sign).
-        tax_resolution_snapshot: None,
-        tax_resolution_snapshot_id: None,
+        tax_resolution_snapshot,
+        tax_resolution_snapshot_id,
     };
 
     // (2) stage_sign::run drives PREPARED → SIGNED via its own

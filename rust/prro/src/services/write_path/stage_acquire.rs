@@ -377,6 +377,19 @@ pub async fn run(
                     // compile-time forced to fetch the persisted
                     // snapshot via doc FK rather than accidentally
                     // using a fresh-config view.
+                    //
+                    // TODO(W4-Z2a-followup): production dispatcher does
+                    // not route Resume through stage_sign today (boot
+                    // reconciliation has its own snapshot reconstruction
+                    // — see boot_phase::run_for_doc_prepared piece-13
+                    // reload).  If a future dispatcher EVER routes a
+                    // Resumed `WorkerContext` back through `stage_sign::
+                    // run`, the runtime will hit `derive_check_tax_
+                    // summaries → TaxMappingNotWired` for taxable docs.
+                    // Fix surface mirrors piece 13: pre-tx
+                    // `signing_config_snapshots::get_by_id` via
+                    // `existing.signing_config_snapshot_id` and pass
+                    // `Some(snapshot) + Some(id)`.
                     tax_resolution_snapshot: None,
                     tax_resolution_snapshot_id: None,
                 }));
