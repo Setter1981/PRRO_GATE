@@ -49,22 +49,35 @@ pub async fn run(
     request_id: [u8; 16],
     command: CanonicalFiscalCommand,
 ) -> anyhow::Result<WorkerProcessResult> {
-    // W4-Z2a piece 6 — snapshot load + insert happen INSIDE the
-    // main with_immediate envelope below, AFTER lease provides
-    // `inbox.fiscal_number`.  Load reads pool_secure (separate DB
-    // per HIGH-AUDIT-01 isolation — no lock contention with main
-    // pool's write tx).  Insert via `insert_or_get_id_tx` is atomic
-    // with lease + fiscal_documents INSERT.  Failure aborts the
-    // entire envelope (lease rolled back; no orphan rows).
+    // W4-Z2a piece 6b.3 — secure-pool hoist.  Load tax_snapshot
+    // BEFORE opening the main with_immediate envelope to avoid
+    // holding BEGIN IMMEDIATE during a cross-DB read (INV-1 spirit:
+    // minimise non-essential work inside the write tx).
     //
-    // Invariant 1 preserved: only short DB statements inside the
-    // tx (no network, no crypto, no long compute).
-    let pool_secure_clone = pool_secure.clone();
+    // Pre-tx peek for `fiscal_number` is advisory (read-only, no
+    // CAS).  If the inbox has no NEW row → short-circuit Noop
+    // without opening main tx.  Otherwise load snapshot from
+    // pool_secure and proceed; the lease CAS inside the tx
+    // re-checks NEW state — race-OK (we discard an unused snapshot
+    // by simply not inserting it).
+    let peeked_fn_id = match ingress_inbox::peek_fiscal_number_by_request_id(
+        pool, &request_id,
+    ).await? {
+        Some(fn_id) => fn_id,
+        None => return Ok(WorkerProcessResult::Noop),
+    };
+    let tax_snapshot = crate::runtime::tax_snapshot::load_for_fn_driver(
+        pool_secure, &peeked_fn_id, driver_id,
+    ).await?;
+
     let driver_id_owned = driver_id.to_string();
+    let peeked_fn_id_owned = peeked_fn_id.clone();
+    let tax_snapshot_for_tx = tax_snapshot.clone();
 
     with_immediate(pool, move |tx| {
-        let pool_secure = pool_secure_clone.clone();
         let driver_id = driver_id_owned.clone();
+        let peeked_fn_id = peeked_fn_id_owned.clone();
+        let tax_snapshot = tax_snapshot_for_tx.clone();
         Box::pin(async move {
             // [Step 1] Acquire lease — CAS NEW → PROCESSING.
             let inbox = match ingress_inbox::acquire_lease(tx, &request_id).await? {
@@ -73,14 +86,27 @@ pub async fn run(
             };
             let fn_id = inbox.fiscal_number.clone();
 
-            // [Step 1a] W4-Z2a piece 6 — load tax_groups from
-            //           pool_secure (separate DB; no lock contention).
-            //           Insert snapshot via tx-variant — atomic with
-            //           rest of envelope (lease + later fiscal_documents
-            //           INSERT).
-            let tax_snapshot = crate::runtime::tax_snapshot::load_for_fn_driver(
-                &pool_secure, &fn_id, &driver_id,
-            ).await?;
+            // [Step 1a] W4-Z2a piece 6b.3 — defensive assertion that
+            //           the pre-tx peek read the same fiscal_number as
+            //           the leased inbox row.  Unreachable under
+            //           inbox PK invariant (request_id is unique),
+            //           but fails loud on regression (e.g., if a
+            //           future change ever lets request_id be reused
+            //           across FNs).  The snapshot was loaded against
+            //           `peeked_fn_id` — using it for a different fn
+            //           would persist the wrong tax-config pinning.
+            if inbox.fiscal_number != peeked_fn_id {
+                anyhow::bail!(
+                    "stage_acquire invariant: peeked fn={} but leased inbox fn={} for request_id={}",
+                    peeked_fn_id, inbox.fiscal_number, hex_encode(&request_id),
+                );
+            }
+
+            // [Step 1b] Insert tax_snapshot via tx-variant — atomic
+            //           with lease + later fiscal_documents INSERT.
+            //           Snapshot bytes already computed outside tx;
+            //           inside tx we only run a short
+            //           `INSERT OR IGNORE` + `SELECT id`.
             let tax_snapshot_id =
                 crate::db::repositories::signing_config_snapshots::insert_or_get_id_tx(
                     tx, &fn_id, &driver_id, &tax_snapshot,

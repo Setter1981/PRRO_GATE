@@ -163,6 +163,38 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
     .await
 }
 
+/// W4-Z2a piece 6b.3 — pre-tx fiscal_number lookup.  Read-only;
+/// no lease, no CAS.  Used by `stage_acquire` to hoist `pool_secure`
+/// tax_snapshot loading OUT of the main-pool `with_immediate`
+/// envelope (per INV-1 — minimise non-essential work inside the
+/// write tx).
+///
+/// Returns `Some(fn)` if a `status = 'NEW'` row exists for
+/// `request_id`, `None` otherwise.  A `Some` result is advisory only:
+/// by the time the caller opens `with_immediate` and calls
+/// [`acquire_lease`], another worker may have taken the row (CAS
+/// returns `None` → `Noop`).  Callers MUST assert
+/// `inbox.fiscal_number == peeked_fn` inside the tx — unreachable
+/// under inbox primary-key invariant, fails loud on regression.
+///
+/// Filter `status = 'NEW'` avoids loading the secure-pool snapshot
+/// for rows another worker has already leased.
+pub async fn peek_fiscal_number_by_request_id(
+    pool: &SqlitePool,
+    request_id: &[u8; 16],
+) -> sqlx::Result<Option<String>> {
+    let req_slice: &[u8] = request_id;
+    let row = sqlx::query!(
+        r#"SELECT fiscal_number
+           FROM ingress_inbox
+           WHERE request_id = ? AND status = 'NEW'"#,
+        req_slice
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.fiscal_number))
+}
+
 /// W5 / W0-1 §3.1 stage 1 — atomically claim an inbox row for
 /// processing.  CAS `status = 'NEW' → 'PROCESSING'` keyed on
 /// `request_id`.  Returns:
