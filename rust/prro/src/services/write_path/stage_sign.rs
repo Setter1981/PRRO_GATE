@@ -345,6 +345,9 @@ pub async fn run(
             lnd,
             z_report_number,
             previous_hash: previous_hash_raw.as_ref(),
+            // W4-Z2a piece 6b.4 seam — stub at callsite (piece 10
+            // replaces with `ctx.tax_resolution_snapshot.to_calc_map()`).
+            tax_groups: HashMap::new(),
         })
         .await?;
 
@@ -520,6 +523,9 @@ pub async fn re_sign_after_mac_recovery(
             lnd,
             z_report_number,
             previous_hash: Some(&new_previous_hash),
+            // W4-Z2a piece 6b.4 seam — stub at callsite (piece 10
+            // replaces with the persisted snapshot reload via FK).
+            tax_groups: HashMap::new(),
         })
         .await?;
     Ok(ReSignedArtifacts {
@@ -547,6 +553,15 @@ struct NoTxBuildSignInputs<'a> {
     /// `Some(_)` for everyday SELL/RETURN/Z_REPORT and for MAC
     /// recovery (where the recovered hash is always known).
     previous_hash: Option<&'a [u8; 32]>,
+    /// W4-Z2a piece 6b.4 — injectable tax-group map (resolved
+    /// `tax_group_1 i64 → ResolvedTaxGroup`).  Seam-only: callers
+    /// currently pass `HashMap::new()` (Python parity: unknown
+    /// groups are skipped); piece 10 selects the live source per
+    /// caller (Proceed/Resume = `ctx.tax_resolution_snapshot.
+    /// to_calc_map()`; MAC recovery = persisted snapshot reload).
+    /// Owned by inputs to avoid lifetime juggling at empty-map
+    /// callsites; replaced cheaply by piece 10's real source.
+    tax_groups: HashMap<i64, ResolvedTaxGroup>,
 }
 
 /// W6 stage 3-NO-TX body, factored out so the W10.4 MAC recovery
@@ -590,18 +605,18 @@ async fn build_canonical_and_sign_no_tx(
         previous_hash_hex,
     );
 
-    // W4-Z1 piece 7: tax-group snapshot.  TEMPORARY empty map —
-    // unknown groups are skipped (Python parity).  Wiring to
-    // `driver_tax_mapping` repo lands in a follow-up worklet
-    // (W4-Z2 / piece 7b); for now this preserves byte-equivalence
-    // with the 4 minimal goldens (no items carry tax_group_1).
-    let tax_groups: HashMap<i64, ResolvedTaxGroup> = HashMap::new();
+    // W4-Z2a piece 6b.4: tax-group map is now injectable via
+    // `inputs.tax_groups` (seam-only — no behaviour change).
+    // Current callers pass `HashMap::new()` (Python parity:
+    // unknown groups are skipped, preserves byte-equivalence with
+    // the 4 minimal goldens that don't carry tax_group_1).
+    // Piece 10 selects the live source per caller path.
     let canonical_doc = build_canonical_doc(
         inputs.wire_artifact_kind,
         header,
         local_number_u32,
         typed_payload,
-        &tax_groups,
+        &inputs.tax_groups,
     )?;
     let unsigned_xml: Vec<u8> = build_canonical_xml(&canonical_doc)?;
 
