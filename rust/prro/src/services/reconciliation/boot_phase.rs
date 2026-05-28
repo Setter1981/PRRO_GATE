@@ -2454,12 +2454,11 @@ async fn dispatch_prepared_via_chain(
         // passing — empty snapshot + TaxMappingNotWired guard only fires
         // for taxable items, none of which exist in the recovery test
         // fixture set today.
-        tax_resolution_snapshot:
-            crate::services::write_path::tax_summary::TaxResolutionSnapshot::new(Vec::new()),
-        // W4-Z2a mid-review IMP-2: explicit None (not `0` sentinel)
-        // — boot recovery has no fresh snapshot.  Piece 9 will reload
-        // by persisted `fiscal_documents.signing_config_snapshot_id`
-        // from the doc row.
+        // W4-Z2a piece 6b external review: structural None — boot
+        // recovery NEVER carries a fresh snapshot; piece-9 reloads by
+        // persisted FK from the doc row.  Option<_> wrapper enforces
+        // this at compile-time (no accidental fresh-config re-sign).
+        tax_resolution_snapshot: None,
         tax_resolution_snapshot_id: None,
     };
 

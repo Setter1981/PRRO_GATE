@@ -372,7 +372,12 @@ pub async fn run(
                     node_state,
                     active_shift,
                     document: existing,
-                    tax_resolution_snapshot: tax_snapshot.clone(),
+                    // W4-Z2a piece 6b external review (R1+R2 High):
+                    // structural None on Resume — piece-8/9 author is
+                    // compile-time forced to fetch the persisted
+                    // snapshot via doc FK rather than accidentally
+                    // using a fresh-config view.
+                    tax_resolution_snapshot: None,
                     tax_resolution_snapshot_id: None,
                 }));
             }
@@ -514,7 +519,9 @@ pub async fn run(
                 node_state,
                 active_shift,
                 document,
-                tax_resolution_snapshot: tax_snapshot,
+                // W4-Z2a piece 6b external review: Some on Proceed,
+                // matches just-inserted snapshot row.
+                tax_resolution_snapshot: Some(tax_snapshot),
                 tax_resolution_snapshot_id: Some(tax_snapshot_id),
             }))
         })

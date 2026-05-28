@@ -82,18 +82,22 @@ pub struct WorkerContext {
     /// `runtime::tax_snapshot::load_for_fn_driver` and persisted in
     /// main pool via `signing_config_snapshots::insert_or_get_id`.
     ///
-    /// **Resume / recovery semantics** (post-mid-fix): on
-    /// `WorkerProcessResult::Resumed`, this is the FRESH config
-    /// view at the moment of Resume — NOT the snapshot the doc
-    /// was originally pinned with.  Pinned (Resume + existing
-    /// taxable) docs MUST use the persisted FK
-    /// (`fiscal_documents.signing_config_snapshot_id`) via
-    /// `fd::get_signing_inputs_tx()` + `signing_config_snapshots::
-    /// get_by_id()` — piece 8/9 wires this path.  On
-    /// `WorkerProcessResult::Proceed`, the ctx struct + `_id`
-    /// match the just-inserted snapshot and are safe to use
-    /// directly.
-    pub tax_resolution_snapshot: crate::services::write_path::tax_summary::TaxResolutionSnapshot,
+    /// **Resume / recovery semantics** (post-external-review):
+    /// `Option` wrapper structurally enforces locked rule #9
+    /// (MAC recovery uses persisted snapshot, NEVER current
+    /// config).  Variants:
+    /// - `Some(snapshot)` on `WorkerProcessResult::Proceed`
+    ///   (matches the just-inserted snapshot row referenced by
+    ///   `tax_resolution_snapshot_id`).  Safe to consume directly
+    ///   (e.g., `to_calc_map()` at piece 10).
+    /// - `None` on `WorkerProcessResult::Resumed` AND boot/
+    ///   recovery / re-sign paths.  Piece 8/9 MUST fetch the
+    ///   persisted snapshot via `fiscal_documents.signing_
+    ///   config_snapshot_id` → `signing_config_snapshots::
+    ///   get_by_id()`.  Compile-time enforcement prevents the
+    ///   MAC-recovery footgun where a fresh-config tax_snapshot
+    ///   would silently re-sign with the wrong configuration.
+    pub tax_resolution_snapshot: Option<crate::services::write_path::tax_summary::TaxResolutionSnapshot>,
     /// W4-Z2a piece 6 — id from `signing_config_snapshots` for the
     /// snapshot above.  Used by stage_sign 3-PRE pin (piece 8) to
     /// atomically write `fiscal_documents.signing_config_snapshot_id`
