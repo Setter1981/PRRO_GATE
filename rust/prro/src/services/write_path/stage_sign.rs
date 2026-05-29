@@ -511,9 +511,10 @@ pub struct ReSignedArtifacts {
     /// writes this into `fiscal_documents.unsigned_xml_sha256` inside
     /// the MR-PERSIST `with_immediate` envelope.
     pub unsigned_xml_sha256: [u8; 32],
-    /// CMS detached signature produced by the configured provider over
-    /// `unsigned_xml`.  Caller writes it into `document_files.SIGNED_XML`
-    /// via `document_files::replace_tx`.
+    /// CMS signature produced by the configured provider over
+    /// `unsigned_xml` (ATTACHED encapsulation — the XML is embedded as
+    /// `eContent`, per DPS sendChkV2).  Caller writes it into
+    /// `document_files.SIGNED_XML` via `document_files::replace_tx`.
     pub signed_xml_cms: SignedCmsBytes,
 }
 

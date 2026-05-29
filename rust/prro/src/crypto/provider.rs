@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use crate::crypto::errors::CryptoError;
 use crate::crypto::session::SigningSession;
 
-/// Returned by `sign_cms_detached`.  Wraps the SignedData DER bytes.
+/// Returned by `sign_cms_detached`.  Wraps the ATTACHED CMS SignedData
+/// DER bytes (the `canonical_xml` is embedded as `eContent`).
 #[derive(Debug, Clone)]
 pub struct SignedCmsBytes(pub Vec<u8>);
 
@@ -46,7 +47,11 @@ pub struct SignCmsRequest<'a> {
 /// after pubkey-validation cache warm-up).
 #[async_trait]
 pub trait CryptoProvider: Send + Sync {
-    /// Build a CMS-detached signed envelope around `request.canonical_xml`.
+    /// Build a CMS signed envelope around `request.canonical_xml` using
+    /// ATTACHED encapsulation — the XML is embedded as `eContent`, the form
+    /// DPS `sendChkV2` requires (`check_sign` is the only document carrier on
+    /// the wire).  NOTE: the `_detached` suffix is retained for back-compat
+    /// only; the produced CMS is ATTACHED.  See `in_process.rs` for rationale.
     async fn sign_cms_detached(
         &self,
         request: SignCmsRequest<'_>,

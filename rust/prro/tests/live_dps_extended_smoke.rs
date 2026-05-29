@@ -1,3 +1,4 @@
+#![cfg(feature = "live-dps")]
 //! **W4-Z3 — Live DPS extended-XML fiscal-cycle smoke (2026-05-28)**.
 //!
 //! These tests drive the REAL Rust write-path against the REAL DPS test
@@ -67,8 +68,13 @@ const ENV_FN: &str = "PRRO_LIVE_DPS_FN";
 const DEFAULT_HOST: &str = "https://cabinet.tax.gov.ua:9443";
 const DEFAULT_FN: &str = "4000162280";
 
-/// The production endpoint — running the smoke against it is refused.
-const PROD_HOST_MARKER: &str = "prro.tax.gov.ua";
+/// Allowlist marker: the live smoke is permitted ONLY against a DPS *test*
+/// cabinet host (the default and any dev cabinet both contain this).  Any
+/// other host — including EVERY production endpoint (`prro.tax.gov.ua`,
+/// the legacy `prro2.tax.gov.ua`, `fs.tax.gov.ua`) — is refused, so the
+/// smoke can never accidentally fiscalize against production.  Default-deny
+/// is deliberate: a prod-host blocklist would miss variants like `prro2`.
+const TEST_HOST_MARKER: &str = "cabinet.tax.gov.ua";
 
 /// Per-call deadline.  15s is generous (typical DPS response ~1-3s);
 /// covers slow TLS handshake + intermittent network during manual runs.
@@ -99,11 +105,12 @@ fn live_armed(test_name: &str) -> bool {
         return false;
     }
     let host = resolve_host();
-    if host.contains(PROD_HOST_MARKER) {
+    if !host.contains(TEST_HOST_MARKER) {
         panic!(
-            "{test_name} REFUSED: {ENV_HOST}={host} targets the PRODUCTION \
-             endpoint ({PROD_HOST_MARKER}).  The live smoke is test-server only \
-             (default {DEFAULT_HOST}).  Refusing to fiscalize against production."
+            "{test_name} REFUSED: {ENV_HOST}={host} is not a DPS TEST cabinet \
+             (must contain `{TEST_HOST_MARKER}`).  The live smoke is test-server \
+             only (default {DEFAULT_HOST}); refusing to risk fiscalizing against \
+             a production endpoint (prro/prro2/fs.tax.gov.ua)."
         );
     }
     true

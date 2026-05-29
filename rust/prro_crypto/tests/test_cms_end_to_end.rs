@@ -196,6 +196,18 @@ fn test_attached_embeds_econtent_detached_does_not() {
         contains_subslice(&attached, content),
         "attached CMS must embed the content bytes as eContent"
     );
+    // Structural strengthening (not just a coincidental byte match): the
+    // content must be wrapped in a primitive DER OCTET STRING — i.e. preceded
+    // by `04 <len>` (single-byte length for our <128-byte content) — which is
+    // exactly the eContent encoding `[0] EXPLICIT OCTET STRING(content)`.
+    assert!(content.len() < 0x80, "test content must be < 128 bytes for the framing check");
+    let mut octet_framed = vec![0x04u8, content.len() as u8];
+    octet_framed.extend_from_slice(content);
+    assert!(
+        contains_subslice(&attached, &octet_framed),
+        "attached eContent must be a primitive OCTET STRING (04 {:02X}) wrapping the content",
+        content.len()
+    );
     assert!(
         !contains_subslice(&detached, content),
         "detached CMS must NOT carry the content bytes"
