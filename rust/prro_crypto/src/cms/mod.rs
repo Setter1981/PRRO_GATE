@@ -34,6 +34,7 @@
 pub mod asn1_util;
 pub mod attrs;
 pub mod builder;
+pub mod calendar;
 pub mod cmp;
 pub mod der_writer;
 pub mod envelope;

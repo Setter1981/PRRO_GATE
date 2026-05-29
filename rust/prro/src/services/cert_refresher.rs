@@ -139,9 +139,49 @@ pub(crate) async fn load_refresh_config(pool: &SqlitePool) -> sqlx::Result<Refre
     .fetch_one(pool)
     .await?;
     Ok(RefreshConfig {
-        refresh_within_days: row.0,
+        refresh_within_days: clamp_refresh_within_days(row.0),
         cmp_request_timeout: Duration::from_secs(row.1.max(1) as u64),
     })
+}
+
+/// Sane upper bound (~10 years) for `refresh_within_days`.
+const MAX_REFRESH_WITHIN_DAYS: i64 = 3650;
+
+/// Clamp the operator-configured `refresh_within_days` to `[0, MAX]`.
+///
+/// The raw value comes straight from `cert_provisioning_config` with no DB
+/// CHECK, so it can be misconfigured.  A NEGATIVE value makes
+/// `valid_to - now > Duration::days(neg)` almost always true → the cert is
+/// NEVER refreshed (it silently expires); a HUGE value overflows
+/// `chrono::Duration::days`.  Clamp: negative → 0 (refresh at expiry, safe),
+/// oversized → the 10-year cap.  (A DB CHECK on the column is a further
+/// follow-up.)
+fn clamp_refresh_within_days(raw: i64) -> i64 {
+    raw.clamp(0, MAX_REFRESH_WITHIN_DAYS)
+}
+
+#[cfg(test)]
+mod refresh_clamp_tests {
+    use super::{clamp_refresh_within_days, MAX_REFRESH_WITHIN_DAYS};
+
+    #[test]
+    fn refresh_within_days_clamped_to_sane_range() {
+        assert_eq!(clamp_refresh_within_days(30), 30, "in-range unchanged");
+        assert_eq!(clamp_refresh_within_days(0), 0);
+        assert_eq!(
+            clamp_refresh_within_days(MAX_REFRESH_WITHIN_DAYS),
+            MAX_REFRESH_WITHIN_DAYS
+        );
+        // Negative → 0: avoids the never-refresh footgun (refreshes at expiry).
+        assert_eq!(clamp_refresh_within_days(-1), 0);
+        assert_eq!(clamp_refresh_within_days(i64::MIN), 0);
+        // Huge → capped: avoids the chrono::Duration::days overflow panic.
+        assert_eq!(clamp_refresh_within_days(i64::MAX), MAX_REFRESH_WITHIN_DAYS);
+        assert_eq!(
+            clamp_refresh_within_days(1_000_000),
+            MAX_REFRESH_WITHIN_DAYS
+        );
+    }
 }
 
 pub(crate) async fn load_active_cert(

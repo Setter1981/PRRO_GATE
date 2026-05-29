@@ -660,17 +660,27 @@ fn parse_generalized_time(content: &[u8]) -> Result<u64, String> {
 /// deps. Handles the 1970-2099 range conservatively — good enough for
 /// OCSP validity windows, which never span that long. Returns `None`
 /// for out-of-range calendar values (month 0, day 32, hour 25…).
-fn ymd_hms_to_unix(year: u32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> Option<u64> {
+pub fn ymd_hms_to_unix(year: u32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> Option<u64> {
     // Range validation — OCSP responders shouldn't emit nonsense, but
     // a malformed GeneralizedTime on the wire (corrupt by bit-flip or
     // bad encoder) must surface loudly rather than quietly produce a
     // "revoked 1970-01-01" record that confuses the cert-watch loop.
+    //
+    // The day MUST be validated against the actual month/leap length (not a
+    // blanket 1..=31): Feb-31 / Apr-31 / Feb-29-in-a-non-leap-year would
+    // otherwise pass and be Hinnant-normalised into a different (wrong) date —
+    // exactly the "quietly produce a confusing record" the comment above warns
+    // against.  `days_in_month` returns 0 for an out-of-range month, but month
+    // is rejected first, so the day comparison only runs for a valid month.
+    // `second == 60` stays allowed (X.680 leap second; 1s normalisation is
+    // harmless for a validity-window comparison); 61+ is rejected.
     if !(1970..=2199).contains(&year)
         || !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
+        || day < 1
+        || day > crate::cms::calendar::days_in_month(year as i64, month)
         || hour > 23
         || minute > 59
-        || second > 60  // DER allows leap seconds (60)
+        || second > 60
     {
         return None;
     }
