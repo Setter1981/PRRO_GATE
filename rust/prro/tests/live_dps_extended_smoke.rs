@@ -278,11 +278,13 @@ fn load_signing_key(test_name: &str) -> Option<ExtractedKey> {
 /// reproduce the production signer path (`crypto::in_process`): native
 /// DSTU-4145 (PB-257) + GOST-34.311 digest, ATTACHED eContent, signingTime.
 fn sign_fn_blob(ek: &ExtractedKey, fiscal_number: &str) -> CheckSignBlob {
+    // Embed the SIGNING cert (KeyUsage=digitalSignature), NOT certs[0] — a UA
+    // EDS keystore holds both a signing AND a key-agreement (encryption) cert,
+    // and embedding the encryption cert makes DPS reject the signature
+    // (CryptBadSign).  `signing_cert()` (prro_crypto, PR #107) does the select.
     let cert_der: &[u8] = ek
-        .certs
-        .first()
-        .expect("JKS must carry the signer certificate")
-        .as_slice();
+        .signing_cert()
+        .expect("JKS must carry a signing certificate (KeyUsage=digitalSignature)");
     let curve = Curve::dstu_pb_257();
     let d = FieldEl::from_le_bytes(&ek.param_d[..], curve.mod_words);
     let signer = DstuInProcessSigner::new(d);
