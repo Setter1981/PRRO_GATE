@@ -120,8 +120,10 @@ impl SigningSession {
 ///   3. Decode plaintext as UTF-8 (rejects non-UTF-8 with a typed error).
 ///   4. Call `prro_crypto::interop::prro::containers::extract_private_key`
 ///      which routes to the JKS parser based on the file's magic bytes.
-///   5. Pick the first cert from the keystore as the operator's signing
-///      cert (the JKS reader returns them in stored order).
+///   5. Select the operator's SIGNING cert (KeyUsage=digitalSignature) via
+///      `ExtractedKey::signing_cert` — NOT `certs[0]`, which is often the
+///      key-agreement (encryption) cert and would make DPS reject the
+///      signature `CryptBadSign`.
 ///
 /// All intermediate plaintext (the unsealed password) is held in
 /// `Zeroizing` and dropped before this function returns.
