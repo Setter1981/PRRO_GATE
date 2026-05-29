@@ -135,3 +135,50 @@ fn signing_time_jan_feb_encode_correct_month_without_overflow() {
         );
     }
 }
+
+/// Sibling coverage for the date/time conversion (date bugs travel in packs):
+/// leap-day Feb 29, the Dec branch (Hinnant mp=9, opposite arm to Jan/Feb), a
+/// full time-of-day rollover, the UTCTIME upper cliff (2049 still valid), and
+/// the 2050 **fail-fast** — which MUST be an `Err`, NOT a panic and NOT a
+/// silently-wrong UTCTIME (UTCTIME per RFC 5652 only covers 1950–2049; 2050+
+/// requires GeneralizedTime — a tracked future follow-up).  All via the
+/// production `CmsSigner::sign_with` signingTime path.
+#[test]
+fn signing_time_date_boundaries_and_2050_cliff() {
+    let signer = StubSigner;
+    let cms_signer = CmsSigner {
+        cert_der: TEST_CERT_DER,
+        signer: &signer,
+        profile: CmsProfile::Dstu4145WithGost34311Pb,
+    };
+    let content = b"x";
+    let sign_at = |secs: u64| {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        cms_signer.sign_with(content, CmsBuildOptions { attached: true, signing_time: Some(t) })
+    };
+
+    // Valid dates → the correct UTCTIME must be present.
+    let ok: [(u64, &[u8]); 4] = [
+        (1_709_164_800, b"240229000000Z"), // 2024-02-29 00:00:00Z — leap day
+        (1_704_067_199, b"231231235959Z"), // 2023-12-31 23:59:59Z — Dec branch (mp=9) + time rollover
+        (2_524_521_600, b"491231000000Z"), // 2049-12-31 00:00:00Z — UTCTIME upper cliff, still valid
+        (1_609_459_200, b"210101000000Z"), // 2021-01-01 00:00:00Z — Jan sanity
+    ];
+    for (secs, utctime) in ok {
+        let cms = sign_at(secs)
+            .expect("valid signingTime must encode without panic/error")
+            .cms_der;
+        assert!(
+            contains(&cms, utctime),
+            "signingTime UTCTIME {:?} missing/wrong",
+            std::str::from_utf8(utctime).unwrap()
+        );
+    }
+
+    // 2050-01-01 → outside UTCTIME range → MUST fail-fast (Err), not panic, not
+    // a silently-wrong encoding.  Locks the deliberate 1950..=2049 gate.
+    assert!(
+        sign_at(2_524_608_000).is_err(),
+        "2050 signingTime must error (UTCTIME range exceeded), not silently encode"
+    );
+}
