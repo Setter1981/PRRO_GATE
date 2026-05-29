@@ -32,7 +32,11 @@ fn roundtrip_all_byte_values_is_bijective() {
         "obfuscation must change at least one byte (output != input)"
     );
     let decoded = Coding::decode(&encoded).expect("decode round-trips");
-    assert_eq!(&decoded[..], &plain[..], "decode(encode(x)) == x for full byte range");
+    assert_eq!(
+        &decoded[..],
+        &plain[..],
+        "decode(encode(x)) == x for full byte range"
+    );
 }
 
 #[test]
@@ -59,6 +63,9 @@ fn decode_empty_input_returns_typed_error() {
 fn encode_produces_non_empty_output_for_non_empty_input() {
     let plain = b"x";
     let encoded = Coding::encode(plain).expect("encode single byte");
-    assert!(!encoded.is_empty(), "non-empty input must produce non-empty output");
+    assert!(
+        !encoded.is_empty(),
+        "non-empty input must produce non-empty output"
+    );
     assert_eq!(encoded.len(), plain.len(), "length is preserved");
 }

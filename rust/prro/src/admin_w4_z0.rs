@@ -29,6 +29,7 @@
 
 use sqlx::SqlitePool;
 use std::path::Path;
+use std::str::FromStr;
 use thiserror::Error;
 
 use crate::db::repositories::driver_tax_mapping::{
@@ -111,17 +112,13 @@ impl CfgAdminError {
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-async fn ensure_fn_in_config(
-    pool_main: &SqlitePool,
-    fn_id: &str,
-) -> Result<(), CfgAdminError> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT fiscal_number FROM fiscal_number_config WHERE fiscal_number = ?",
-    )
-    .bind(fn_id)
-    .fetch_optional(pool_main)
-    .await
-    .map_err(|e| CfgAdminError::Infrastructure(format!("FN existence check: {e}")))?;
+async fn ensure_fn_in_config(pool_main: &SqlitePool, fn_id: &str) -> Result<(), CfgAdminError> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT fiscal_number FROM fiscal_number_config WHERE fiscal_number = ?")
+            .bind(fn_id)
+            .fetch_optional(pool_main)
+            .await
+            .map_err(|e| CfgAdminError::Infrastructure(format!("FN existence check: {e}")))?;
     if row.is_none() {
         return Err(CfgAdminError::FiscalNumberNotInConfig(fn_id.to_string()));
     }
@@ -173,16 +170,33 @@ async fn audit_info(
 
 // ─── tax_groups commands ────────────────────────────────────────────
 
+/// Domain parameters for [`add_tax_group`], bundled to keep the
+/// function signature within the `clippy::too_many_arguments` bound.
+/// Pure data carrier — no behavior change vs the prior flat-param form.
+pub struct AddTaxGroupArgs {
+    pub fn_id: String,
+    pub tx_num: i64,
+    pub letter: String,
+    pub dtpr: f64,
+    pub txpr: f64,
+    pub txal: i64,
+}
+
 pub async fn add_tax_group(
     pool_main: &SqlitePool,
     pool_secure: &SqlitePool,
-    fn_id: &str,
-    tx_num: i64,
-    letter: &str,
-    dtpr: f64,
-    txpr: f64,
-    txal: i64,
+    args: AddTaxGroupArgs,
 ) -> Result<(), CfgAdminError> {
+    let AddTaxGroupArgs {
+        fn_id,
+        tx_num,
+        letter,
+        dtpr,
+        txpr,
+        txal,
+    } = args;
+    let fn_id = fn_id.as_str();
+    let letter = letter.as_str();
     if fn_id.trim().is_empty() {
         return Err(CfgAdminError::EmptyArgument("fn"));
     }
@@ -215,7 +229,14 @@ pub async fn add_tax_group(
                 "txal": txal,
             })
             .to_string();
-            audit_info(pool_main, "tax_group", fn_id, "ADMIN_TAX_GROUP_ADDED", &payload).await?;
+            audit_info(
+                pool_main,
+                "tax_group",
+                fn_id,
+                "ADMIN_TAX_GROUP_ADDED",
+                &payload,
+            )
+            .await?;
             Ok(())
         }
         Err(TaxGroupsRepoError::DuplicateTxNum { fn_id, tx_num }) => {
@@ -224,7 +245,9 @@ pub async fn add_tax_group(
         Err(TaxGroupsRepoError::DuplicateActiveLetter { fn_id, letter }) => {
             Err(CfgAdminError::DuplicateActiveLetter(fn_id, letter))
         }
-        Err(e) => Err(CfgAdminError::Infrastructure(format!("tax_groups::insert: {e}"))),
+        Err(e) => Err(CfgAdminError::Infrastructure(format!(
+            "tax_groups::insert: {e}"
+        ))),
     }
 }
 
@@ -248,14 +271,22 @@ pub async fn update_tax_rate(
     let new_txpr = txpr.unwrap_or(current.txpr);
     let new_txal = txal.unwrap_or(current.txal);
 
-    tg_repo::update_rates(pool_secure, fn_id, tx_num, new_dtpr, new_txpr, new_txal, current.txty)
-        .await
-        .map_err(|e| match e {
-            TaxGroupsRepoError::NotFound { fn_id, tx_num } => {
-                CfgAdminError::TaxGroupNotFound(fn_id, tx_num)
-            }
-            other => CfgAdminError::Infrastructure(format!("tax_groups::update_rates: {other}")),
-        })?;
+    tg_repo::update_rates(
+        pool_secure,
+        fn_id,
+        tx_num,
+        new_dtpr,
+        new_txpr,
+        new_txal,
+        current.txty,
+    )
+    .await
+    .map_err(|e| match e {
+        TaxGroupsRepoError::NotFound { fn_id, tx_num } => {
+            CfgAdminError::TaxGroupNotFound(fn_id, tx_num)
+        }
+        other => CfgAdminError::Infrastructure(format!("tax_groups::update_rates: {other}")),
+    })?;
 
     let payload = serde_json::json!({
         "fn": fn_id, "tx_num": tx_num,
@@ -263,7 +294,14 @@ pub async fn update_tax_rate(
         "previous": { "dtpr": current.dtpr, "txpr": current.txpr, "txal": current.txal },
     })
     .to_string();
-    audit_info(pool_main, "tax_group", fn_id, "ADMIN_TAX_GROUP_UPDATED", &payload).await?;
+    audit_info(
+        pool_main,
+        "tax_group",
+        fn_id,
+        "ADMIN_TAX_GROUP_UPDATED",
+        &payload,
+    )
+    .await?;
     Ok(())
 }
 
@@ -273,15 +311,24 @@ pub async fn remove_tax_group(
     fn_id: &str,
     tx_num: i64,
 ) -> Result<(), CfgAdminError> {
-    tg_repo::soft_delete(pool_secure, fn_id, tx_num).await.map_err(|e| match e {
-        TaxGroupsRepoError::NotFound { fn_id, tx_num } => {
-            CfgAdminError::TaxGroupNotFound(fn_id, tx_num)
-        }
-        other => CfgAdminError::Infrastructure(format!("tax_groups::soft_delete: {other}")),
-    })?;
+    tg_repo::soft_delete(pool_secure, fn_id, tx_num)
+        .await
+        .map_err(|e| match e {
+            TaxGroupsRepoError::NotFound { fn_id, tx_num } => {
+                CfgAdminError::TaxGroupNotFound(fn_id, tx_num)
+            }
+            other => CfgAdminError::Infrastructure(format!("tax_groups::soft_delete: {other}")),
+        })?;
 
     let payload = serde_json::json!({ "fn": fn_id, "tx_num": tx_num }).to_string();
-    audit_info(pool_main, "tax_group", fn_id, "ADMIN_TAX_GROUP_REMOVED", &payload).await?;
+    audit_info(
+        pool_main,
+        "tax_group",
+        fn_id,
+        "ADMIN_TAX_GROUP_REMOVED",
+        &payload,
+    )
+    .await?;
     Ok(())
 }
 
@@ -334,7 +381,14 @@ pub async fn add_payment_method(
                 "fn": fn_id, "pay_index": pay_index, "name": name, "iscash": iscash,
             })
             .to_string();
-            audit_info(pool_main, "payment_method", fn_id, "ADMIN_PAYMENT_METHOD_ADDED", &payload).await
+            audit_info(
+                pool_main,
+                "payment_method",
+                fn_id,
+                "ADMIN_PAYMENT_METHOD_ADDED",
+                &payload,
+            )
+            .await
         }
         Err(PaymentMethodsRepoError::DuplicatePayIndex { fn_id, pay_index }) => {
             Err(CfgAdminError::DuplicatePaymentMethod(fn_id, pay_index))
@@ -342,7 +396,9 @@ pub async fn add_payment_method(
         Err(PaymentMethodsRepoError::DuplicateActiveName { fn_id, name }) => {
             Err(CfgAdminError::DuplicatePaymentName(fn_id, name))
         }
-        Err(e) => Err(CfgAdminError::Infrastructure(format!("payment_methods::insert: {e}"))),
+        Err(e) => Err(CfgAdminError::Infrastructure(format!(
+            "payment_methods::insert: {e}"
+        ))),
     }
 }
 
@@ -362,15 +418,17 @@ pub async fn update_payment_method(
     let new_name = name.unwrap_or(&current.name).to_string();
     let new_iscash = iscash.unwrap_or(current.iscash);
 
-    pm_repo::update(pool_secure, fn_id, pay_index, &new_name, new_iscash).await.map_err(|e| match e {
-        PaymentMethodsRepoError::NotFound { fn_id, pay_index } => {
-            CfgAdminError::PaymentMethodNotFound(fn_id, pay_index)
-        }
-        PaymentMethodsRepoError::DuplicateActiveName { fn_id, name } => {
-            CfgAdminError::DuplicatePaymentName(fn_id, name)
-        }
-        other => CfgAdminError::Infrastructure(format!("payment_methods::update: {other}")),
-    })?;
+    pm_repo::update(pool_secure, fn_id, pay_index, &new_name, new_iscash)
+        .await
+        .map_err(|e| match e {
+            PaymentMethodsRepoError::NotFound { fn_id, pay_index } => {
+                CfgAdminError::PaymentMethodNotFound(fn_id, pay_index)
+            }
+            PaymentMethodsRepoError::DuplicateActiveName { fn_id, name } => {
+                CfgAdminError::DuplicatePaymentName(fn_id, name)
+            }
+            other => CfgAdminError::Infrastructure(format!("payment_methods::update: {other}")),
+        })?;
 
     let payload = serde_json::json!({
         "fn": fn_id, "pay_index": pay_index,
@@ -378,7 +436,14 @@ pub async fn update_payment_method(
         "previous": { "name": current.name, "iscash": current.iscash },
     })
     .to_string();
-    audit_info(pool_main, "payment_method", fn_id, "ADMIN_PAYMENT_METHOD_UPDATED", &payload).await
+    audit_info(
+        pool_main,
+        "payment_method",
+        fn_id,
+        "ADMIN_PAYMENT_METHOD_UPDATED",
+        &payload,
+    )
+    .await
 }
 
 pub async fn remove_payment_method(
@@ -387,14 +452,25 @@ pub async fn remove_payment_method(
     fn_id: &str,
     pay_index: i64,
 ) -> Result<(), CfgAdminError> {
-    pm_repo::soft_delete(pool_secure, fn_id, pay_index).await.map_err(|e| match e {
-        PaymentMethodsRepoError::NotFound { fn_id, pay_index } => {
-            CfgAdminError::PaymentMethodNotFound(fn_id, pay_index)
-        }
-        other => CfgAdminError::Infrastructure(format!("payment_methods::soft_delete: {other}")),
-    })?;
+    pm_repo::soft_delete(pool_secure, fn_id, pay_index)
+        .await
+        .map_err(|e| match e {
+            PaymentMethodsRepoError::NotFound { fn_id, pay_index } => {
+                CfgAdminError::PaymentMethodNotFound(fn_id, pay_index)
+            }
+            other => {
+                CfgAdminError::Infrastructure(format!("payment_methods::soft_delete: {other}"))
+            }
+        })?;
     let payload = serde_json::json!({ "fn": fn_id, "pay_index": pay_index }).to_string();
-    audit_info(pool_main, "payment_method", fn_id, "ADMIN_PAYMENT_METHOD_REMOVED", &payload).await
+    audit_info(
+        pool_main,
+        "payment_method",
+        fn_id,
+        "ADMIN_PAYMENT_METHOD_REMOVED",
+        &payload,
+    )
+    .await
 }
 
 pub async fn list_payment_methods(
@@ -423,15 +499,24 @@ pub async fn set_flag(
     }
     ensure_fn_in_config(pool_main, fn_id).await?;
 
-    flags_repo::set_flag(pool_secure, fn_id, name, value).await.map_err(|e| match e {
-        FnIntegrationFlagsRepoError::Db(e) => {
-            CfgAdminError::Infrastructure(format!("flags::set_flag: {e}"))
-        }
-        other => CfgAdminError::Infrastructure(format!("flags::set_flag: {other}")),
-    })?;
+    flags_repo::set_flag(pool_secure, fn_id, name, value)
+        .await
+        .map_err(|e| match e {
+            FnIntegrationFlagsRepoError::Db(e) => {
+                CfgAdminError::Infrastructure(format!("flags::set_flag: {e}"))
+            }
+            other => CfgAdminError::Infrastructure(format!("flags::set_flag: {other}")),
+        })?;
 
     let payload = serde_json::json!({ "fn": fn_id, "name": name, "value": value }).to_string();
-    audit_info(pool_main, "integration_flag", fn_id, "ADMIN_FLAG_SET", &payload).await
+    audit_info(
+        pool_main,
+        "integration_flag",
+        fn_id,
+        "ADMIN_FLAG_SET",
+        &payload,
+    )
+    .await
 }
 
 /// Convenience alias for the Національний чек integration toggle.
@@ -501,12 +586,25 @@ pub async fn add_driver_mapping(
             .to_string();
             // Use driver_id as audit "fiscal_number" surrogate (driver_tax_mapping
             // is not per-FN; we record the driver scope in the payload).
-            audit_info(pool_main, "driver_mapping", driver_id, "ADMIN_DRIVER_MAPPING_ADDED", &payload).await
+            audit_info(
+                pool_main,
+                "driver_mapping",
+                driver_id,
+                "ADMIN_DRIVER_MAPPING_ADDED",
+                &payload,
+            )
+            .await
         }
-        Err(DriverTaxMappingRepoError::DuplicatePk { driver_id, driver_number }) => {
-            Err(CfgAdminError::DuplicateDriverMapping(driver_id, driver_number))
-        }
-        Err(e) => Err(CfgAdminError::Infrastructure(format!("driver_tax_mapping::insert: {e}"))),
+        Err(DriverTaxMappingRepoError::DuplicatePk {
+            driver_id,
+            driver_number,
+        }) => Err(CfgAdminError::DuplicateDriverMapping(
+            driver_id,
+            driver_number,
+        )),
+        Err(e) => Err(CfgAdminError::Infrastructure(format!(
+            "driver_tax_mapping::insert: {e}"
+        ))),
     }
 }
 
@@ -535,9 +633,10 @@ pub async fn update_driver_mapping(
     dtm_repo::update_canonical(pool_secure, driver_id, driver_number, canonical_tx_num)
         .await
         .map_err(|e| match e {
-            DriverTaxMappingRepoError::NotFound { driver_id, driver_number } => {
-                CfgAdminError::DriverMappingNotFound(driver_id, driver_number)
-            }
+            DriverTaxMappingRepoError::NotFound {
+                driver_id,
+                driver_number,
+            } => CfgAdminError::DriverMappingNotFound(driver_id, driver_number),
             other => CfgAdminError::Infrastructure(format!(
                 "driver_tax_mapping::update_canonical: {other}"
             )),
@@ -549,7 +648,14 @@ pub async fn update_driver_mapping(
         "canonical_tx_num": canonical_tx_num,
     })
     .to_string();
-    audit_info(pool_main, "driver_mapping", driver_id, "ADMIN_DRIVER_MAPPING_UPDATED", &payload).await
+    audit_info(
+        pool_main,
+        "driver_mapping",
+        driver_id,
+        "ADMIN_DRIVER_MAPPING_UPDATED",
+        &payload,
+    )
+    .await
 }
 
 pub async fn remove_driver_mapping(
@@ -562,17 +668,29 @@ pub async fn remove_driver_mapping(
     let normalized = crate::db::models::ids::DriverId::new(driver_id)
         .map_err(|_| CfgAdminError::EmptyArgument("driver-id"))?;
     let driver_id = normalized.as_str();
-    dtm_repo::soft_delete(pool_secure, driver_id, driver_number).await.map_err(|e| match e {
-        DriverTaxMappingRepoError::NotFound { driver_id, driver_number } => {
-            CfgAdminError::DriverMappingNotFound(driver_id, driver_number)
-        }
-        other => CfgAdminError::Infrastructure(format!("driver_tax_mapping::soft_delete: {other}")),
-    })?;
+    dtm_repo::soft_delete(pool_secure, driver_id, driver_number)
+        .await
+        .map_err(|e| match e {
+            DriverTaxMappingRepoError::NotFound {
+                driver_id,
+                driver_number,
+            } => CfgAdminError::DriverMappingNotFound(driver_id, driver_number),
+            other => {
+                CfgAdminError::Infrastructure(format!("driver_tax_mapping::soft_delete: {other}"))
+            }
+        })?;
     let payload = serde_json::json!({
         "driver_id": driver_id, "driver_number": driver_number,
     })
     .to_string();
-    audit_info(pool_main, "driver_mapping", driver_id, "ADMIN_DRIVER_MAPPING_REMOVED", &payload).await
+    audit_info(
+        pool_main,
+        "driver_mapping",
+        driver_id,
+        "ADMIN_DRIVER_MAPPING_REMOVED",
+        &payload,
+    )
+    .await
 }
 
 pub async fn list_driver_mappings(
@@ -599,20 +717,28 @@ pub async fn set_outgress_profile(
     if fn_id.trim().is_empty() {
         return Err(CfgAdminError::EmptyArgument("fn"));
     }
-    let profile = OutgressProfile::from_str(profile_str).map_err(|_| {
-        CfgAdminError::UnknownProfile(profile_str.to_string())
-    })?;
+    let profile = OutgressProfile::from_str(profile_str)
+        .map_err(|_| CfgAdminError::UnknownProfile(profile_str.to_string()))?;
     ensure_fn_in_config(pool_main, fn_id).await?;
 
-    profile_repo::set_profile(pool_secure, fn_id, profile).await.map_err(|e| match e {
-        FnOutgressProfileRepoError::Db(e) => {
-            CfgAdminError::Infrastructure(format!("profile::set_profile: {e}"))
-        }
-        other => CfgAdminError::Infrastructure(format!("profile::set_profile: {other}")),
-    })?;
+    profile_repo::set_profile(pool_secure, fn_id, profile)
+        .await
+        .map_err(|e| match e {
+            FnOutgressProfileRepoError::Db(e) => {
+                CfgAdminError::Infrastructure(format!("profile::set_profile: {e}"))
+            }
+            other => CfgAdminError::Infrastructure(format!("profile::set_profile: {other}")),
+        })?;
 
     let payload = serde_json::json!({ "fn": fn_id, "profile": profile.as_db_str() }).to_string();
-    audit_info(pool_main, "outgress_profile", fn_id, "ADMIN_OUTGRESS_PROFILE_SET", &payload).await
+    audit_info(
+        pool_main,
+        "outgress_profile",
+        fn_id,
+        "ADMIN_OUTGRESS_PROFILE_SET",
+        &payload,
+    )
+    .await
 }
 
 pub async fn show_outgress_profile(
@@ -679,17 +805,38 @@ macro_rules! with_pools {
 }
 
 pub async fn run_add_tax_group(
-    cfg: &Path, fn_id: String, tx_num: i64, letter: String,
-    dtpr: f64, txpr: f64, txal: i64,
+    cfg: &Path,
+    fn_id: String,
+    tx_num: i64,
+    letter: String,
+    dtpr: f64,
+    txpr: f64,
+    txal: i64,
 ) -> Result<(), CfgAdminError> {
     with_pools!(cfg, pm, ps, {
-        add_tax_group(&pm, &ps, &fn_id, tx_num, &letter, dtpr, txpr, txal).await
+        add_tax_group(
+            &pm,
+            &ps,
+            AddTaxGroupArgs {
+                fn_id,
+                tx_num,
+                letter,
+                dtpr,
+                txpr,
+                txal,
+            },
+        )
+        .await
     })
 }
 
 pub async fn run_update_tax_rate(
-    cfg: &Path, fn_id: String, tx_num: i64,
-    dtpr: Option<f64>, txpr: Option<f64>, txal: Option<i64>,
+    cfg: &Path,
+    fn_id: String,
+    tx_num: i64,
+    dtpr: Option<f64>,
+    txpr: Option<f64>,
+    txal: Option<i64>,
 ) -> Result<(), CfgAdminError> {
     with_pools!(cfg, pm, ps, {
         update_tax_rate(&pm, &ps, &fn_id, tx_num, dtpr, txpr, txal).await
@@ -697,19 +844,28 @@ pub async fn run_update_tax_rate(
 }
 
 pub async fn run_remove_tax_group(
-    cfg: &Path, fn_id: String, tx_num: i64,
+    cfg: &Path,
+    fn_id: String,
+    tx_num: i64,
 ) -> Result<(), CfgAdminError> {
-    with_pools!(cfg, pm, ps, { remove_tax_group(&pm, &ps, &fn_id, tx_num).await })
+    with_pools!(cfg, pm, ps, {
+        remove_tax_group(&pm, &ps, &fn_id, tx_num).await
+    })
 }
 
 pub async fn run_list_tax_groups(
-    cfg: &Path, fn_id: String,
+    cfg: &Path,
+    fn_id: String,
 ) -> Result<Vec<TaxGroup>, CfgAdminError> {
     with_pools!(cfg, pm, ps, { list_tax_groups(&ps, &fn_id).await })
 }
 
 pub async fn run_add_payment_method(
-    cfg: &Path, fn_id: String, pay_index: i64, name: String, iscash: bool,
+    cfg: &Path,
+    fn_id: String,
+    pay_index: i64,
+    name: String,
+    iscash: bool,
 ) -> Result<(), CfgAdminError> {
     with_pools!(cfg, pm, ps, {
         add_payment_method(&pm, &ps, &fn_id, pay_index, &name, iscash).await
@@ -717,8 +873,11 @@ pub async fn run_add_payment_method(
 }
 
 pub async fn run_update_payment_method(
-    cfg: &Path, fn_id: String, pay_index: i64,
-    name: Option<String>, iscash: Option<bool>,
+    cfg: &Path,
+    fn_id: String,
+    pay_index: i64,
+    name: Option<String>,
+    iscash: Option<bool>,
 ) -> Result<(), CfgAdminError> {
     with_pools!(cfg, pm, ps, {
         update_payment_method(&pm, &ps, &fn_id, pay_index, name.as_deref(), iscash).await
@@ -726,46 +885,75 @@ pub async fn run_update_payment_method(
 }
 
 pub async fn run_remove_payment_method(
-    cfg: &Path, fn_id: String, pay_index: i64,
+    cfg: &Path,
+    fn_id: String,
+    pay_index: i64,
 ) -> Result<(), CfgAdminError> {
-    with_pools!(cfg, pm, ps, { remove_payment_method(&pm, &ps, &fn_id, pay_index).await })
+    with_pools!(cfg, pm, ps, {
+        remove_payment_method(&pm, &ps, &fn_id, pay_index).await
+    })
 }
 
 pub async fn run_list_payment_methods(
-    cfg: &Path, fn_id: String,
+    cfg: &Path,
+    fn_id: String,
 ) -> Result<Vec<PaymentMethod>, CfgAdminError> {
     with_pools!(cfg, pm, ps, { list_payment_methods(&ps, &fn_id).await })
 }
 
 pub async fn run_set_flag(
-    cfg: &Path, fn_id: String, name: String, value: String,
+    cfg: &Path,
+    fn_id: String,
+    name: String,
+    value: String,
 ) -> Result<(), CfgAdminError> {
-    with_pools!(cfg, pm, ps, { set_flag(&pm, &ps, &fn_id, &name, &value).await })
+    with_pools!(cfg, pm, ps, {
+        set_flag(&pm, &ps, &fn_id, &name, &value).await
+    })
 }
 
 pub async fn run_set_national_receipt(
-    cfg: &Path, fn_id: String, enabled: bool,
+    cfg: &Path,
+    fn_id: String,
+    enabled: bool,
 ) -> Result<(), CfgAdminError> {
-    with_pools!(cfg, pm, ps, { set_national_receipt(&pm, &ps, &fn_id, enabled).await })
+    with_pools!(cfg, pm, ps, {
+        set_national_receipt(&pm, &ps, &fn_id, enabled).await
+    })
 }
 
 pub async fn run_list_flags(
-    cfg: &Path, fn_id: String,
+    cfg: &Path,
+    fn_id: String,
 ) -> Result<Vec<FnIntegrationFlag>, CfgAdminError> {
     with_pools!(cfg, pm, ps, { list_flags(&ps, &fn_id).await })
 }
 
 pub async fn run_add_driver_mapping(
-    cfg: &Path, driver_id: String, driver_number: i64,
-    canonical_tx_num: i64, driver_letter: Option<String>,
+    cfg: &Path,
+    driver_id: String,
+    driver_number: i64,
+    canonical_tx_num: i64,
+    driver_letter: Option<String>,
 ) -> Result<(), CfgAdminError> {
     with_pools!(cfg, pm, ps, {
-        add_driver_mapping(&pm, &ps, &driver_id, driver_number, canonical_tx_num, driver_letter.as_deref()).await
+        add_driver_mapping(
+            &pm,
+            &ps,
+            &driver_id,
+            driver_number,
+            canonical_tx_num,
+            driver_letter.as_deref(),
+        )
+        .await
     })
 }
 
 pub async fn run_update_driver_mapping(
-    cfg: &Path, driver_id: String, driver_number: i64, canonical_tx_num: i64,
+    cfg: &Path,
+    driver_id: String,
+    driver_number: i64,
+    canonical_tx_num: i64,
 ) -> Result<(), CfgAdminError> {
     with_pools!(cfg, pm, ps, {
         update_driver_mapping(&pm, &ps, &driver_id, driver_number, canonical_tx_num).await
@@ -773,7 +961,9 @@ pub async fn run_update_driver_mapping(
 }
 
 pub async fn run_remove_driver_mapping(
-    cfg: &Path, driver_id: String, driver_number: i64,
+    cfg: &Path,
+    driver_id: String,
+    driver_number: i64,
 ) -> Result<(), CfgAdminError> {
     with_pools!(cfg, pm, ps, {
         remove_driver_mapping(&pm, &ps, &driver_id, driver_number).await
@@ -781,13 +971,16 @@ pub async fn run_remove_driver_mapping(
 }
 
 pub async fn run_list_driver_mappings(
-    cfg: &Path, driver_id: String,
+    cfg: &Path,
+    driver_id: String,
 ) -> Result<Vec<DriverTaxMapping>, CfgAdminError> {
     with_pools!(cfg, pm, ps, { list_driver_mappings(&ps, &driver_id).await })
 }
 
 pub async fn run_set_outgress_profile(
-    cfg: &Path, fn_id: String, profile: String,
+    cfg: &Path,
+    fn_id: String,
+    profile: String,
 ) -> Result<(), CfgAdminError> {
     with_pools!(cfg, pm, ps, {
         set_outgress_profile(&pm, &ps, &fn_id, &profile).await
@@ -795,14 +988,13 @@ pub async fn run_set_outgress_profile(
 }
 
 pub async fn run_show_outgress_profile(
-    cfg: &Path, fn_id: String,
+    cfg: &Path,
+    fn_id: String,
 ) -> Result<OutgressProfile, CfgAdminError> {
     with_pools!(cfg, pm, ps, { show_outgress_profile(&ps, &fn_id).await })
 }
 
-pub async fn run_bootstrap_defaults(
-    cfg: &Path, fn_id: String,
-) -> Result<(), CfgAdminError> {
+pub async fn run_bootstrap_defaults(cfg: &Path, fn_id: String) -> Result<(), CfgAdminError> {
     with_pools!(cfg, pm, ps, { bootstrap_defaults(&pm, &ps, &fn_id).await })
 }
 
@@ -833,5 +1025,12 @@ pub async fn bootstrap_defaults(
         .map_err(|e| CfgAdminError::Infrastructure(format!("bootstrap_fn_defaults: {e}")))?;
 
     let payload = serde_json::json!({ "fn": fn_id }).to_string();
-    audit_info(pool_main, "operator", fn_id, "ADMIN_FN_DEFAULTS_BOOTSTRAPPED", &payload).await
+    audit_info(
+        pool_main,
+        "operator",
+        fn_id,
+        "ADMIN_FN_DEFAULTS_BOOTSTRAPPED",
+        &payload,
+    )
+    .await
 }

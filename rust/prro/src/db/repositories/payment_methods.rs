@@ -69,7 +69,12 @@ pub async fn insert(
 
     match result {
         Ok(_) => Ok(()),
-        Err(e) => Err(classify_insert_error(e, &new.fn_id, new.pay_index, &new.name)),
+        Err(e) => Err(classify_insert_error(
+            e,
+            &new.fn_id,
+            new.pay_index,
+            &new.name,
+        )),
     }
 }
 

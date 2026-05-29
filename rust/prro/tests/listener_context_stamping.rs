@@ -6,9 +6,7 @@
 //! as a typed error.
 
 use prro::db::models::ids::DriverId;
-use prro::runtime::ingress::dto::{
-    self, CanonicalCommand, CommandType, MappingError,
-};
+use prro::runtime::ingress::dto::{self, CanonicalCommand, MappingError};
 
 const SAMPLE_WIRE: &str = r#"{
   "schema_version": "1.0",
@@ -29,12 +27,9 @@ fn listener_context_stamps_driver_id_on_canonical_command() {
     let wire: CanonicalCommand = serde_json::from_str(SAMPLE_WIRE).unwrap();
     let driver_id = DriverId::new("maria304").unwrap();
 
-    let canonical = dto::to_canonical_fiscal_command_with_context(
-        &wire,
-        driver_id.clone(),
-        "4538765845",
-    )
-    .expect("listener context wraps mapper successfully");
+    let canonical =
+        dto::to_canonical_fiscal_command_with_context(&wire, driver_id.clone(), "4538765845")
+            .expect("listener context wraps mapper successfully");
 
     assert_eq!(canonical.driver_id.as_ref().unwrap().as_str(), "maria304");
 }
@@ -52,7 +47,10 @@ fn listener_fn_mismatch_returns_typed_error_before_mapping() {
     .expect_err("FN mismatch must surface typed error");
 
     match err {
-        MappingError::FnConfigMismatch { wire_fn, listener_fn } => {
+        MappingError::FnConfigMismatch {
+            wire_fn,
+            listener_fn,
+        } => {
             assert_eq!(wire_fn, "4538765845");
             assert_eq!(listener_fn, "9999999999");
         }
@@ -63,10 +61,7 @@ fn listener_fn_mismatch_returns_typed_error_before_mapping() {
 #[test]
 fn driver_id_validates_empty_string() {
     let err = DriverId::new("").expect_err("empty rejected");
-    assert!(matches!(
-        err,
-        prro::db::models::ids::DriverIdError::Empty
-    ));
+    assert!(matches!(err, prro::db::models::ids::DriverIdError::Empty));
 }
 
 /// Audit Round-2 (2026-05-27): whitespace-only strings would silently

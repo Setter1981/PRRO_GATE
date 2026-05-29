@@ -146,11 +146,11 @@ struct Inner {
     ///
     /// W2 PR-B: pool is opened at boot so the secure file is created
     /// + migrated alongside the main DB; the consumer that turns
-    /// `operators` rows into a `BindingsRegistry` lives in W7
-    /// (supervisor wiring).  No production code path reads from
-    /// `db_secure` in this PR; the field exists so the admin CLI
-    /// (`add-operator`) and W7 can share the same pool handle the
-    /// boot owner already locked + migrated.
+    ///   `operators` rows into a `BindingsRegistry` lives in W7
+    ///   (supervisor wiring).  No production code path reads from
+    ///   `db_secure` in this PR; the field exists so the admin CLI
+    ///   (`add-operator`) and W7 can share the same pool handle the
+    ///   boot owner already locked + migrated.
     db_secure: SqlitePool,
     /// Singleton process lock — held for App lifetime.  Dropped on App
     /// drop, releasing the OS advisory lock.  Per freeze NIT 1 fix:

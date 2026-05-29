@@ -447,9 +447,7 @@ pub async fn add_operator(
     if input.fiscal_number.trim().is_empty() {
         return Err(AdminError::EmptyArgument("fn"));
     }
-    if input.password.is_empty()
-        || input.password.iter().all(|b| b.is_ascii_whitespace())
-    {
+    if input.password.is_empty() || input.password.iter().all(|b| b.is_ascii_whitespace()) {
         return Err(AdminError::EmptyPassword);
     }
 
@@ -458,13 +456,12 @@ pub async fn add_operator(
     // the boot-time check in `BindingsRegistry::build_from_db` —
     // catching the typo here gives a clean operator-facing error
     // instead of a surprise audit hours later at the next boot.
-    let fn_present: Option<(String,)> = sqlx::query_as(
-        "SELECT fiscal_number FROM fiscal_number_config WHERE fiscal_number = ?",
-    )
-    .bind(&input.fiscal_number)
-    .fetch_optional(pool_main)
-    .await
-    .map_err(|e| AdminError::Infrastructure(format!("FN existence check: {e}")))?;
+    let fn_present: Option<(String,)> =
+        sqlx::query_as("SELECT fiscal_number FROM fiscal_number_config WHERE fiscal_number = ?")
+            .bind(&input.fiscal_number)
+            .fetch_optional(pool_main)
+            .await
+            .map_err(|e| AdminError::Infrastructure(format!("FN existence check: {e}")))?;
     if fn_present.is_none() {
         return Err(AdminError::FiscalNumberNotInConfig(input.fiscal_number));
     }
@@ -478,12 +475,10 @@ pub async fn add_operator(
     // on the same FN is operationally bizarre (admin CLI is operator-
     // serialised), and the partial-unique-index in DDL is the
     // structural guard anyway — see R3-1 doc-block below.
-    if let Some(existing) = crate::db::repositories::operators::find_by_fiscal_number(
-        pool_secure,
-        &input.fiscal_number,
-    )
-    .await
-    .map_err(|e| AdminError::Infrastructure(format!("active-cashier pre-flight: {e}")))?
+    if let Some(existing) =
+        crate::db::repositories::operators::find_by_fiscal_number(pool_secure, &input.fiscal_number)
+            .await
+            .map_err(|e| AdminError::Infrastructure(format!("active-cashier pre-flight: {e}")))?
     {
         let _ = existing; // discard row contents; FN is sufficient
         return Err(AdminError::DuplicateActiveCashier(input.fiscal_number));
@@ -575,9 +570,7 @@ pub async fn add_operator(
                 Some(&registered_payload),
             )
             .await
-            .map_err(|e| {
-                AdminError::Infrastructure(format!("audit append REGISTERED: {e}"))
-            })?;
+            .map_err(|e| AdminError::Infrastructure(format!("audit append REGISTERED: {e}")))?;
 
             // W4-Z0 piece 7 + audit Round-1 fix (2026-05-27): per-FN
             // config bootstrap as **best-effort**.  Idempotent
@@ -602,11 +595,9 @@ pub async fn add_operator(
             // to seed the missing config rows manually.  When the
             // standalone `bootstrap-defaults` admin command lands
             // (follow-up), that path becomes the canonical recovery.
-            if let Err(e) = crate::runtime::bootstrap::bootstrap_fn_defaults(
-                pool_secure,
-                &input.fiscal_number,
-            )
-            .await
+            if let Err(e) =
+                crate::runtime::bootstrap::bootstrap_fn_defaults(pool_secure, &input.fiscal_number)
+                    .await
             {
                 tracing::error!(
                     target: "prro::admin::add_operator",

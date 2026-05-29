@@ -89,9 +89,7 @@ use crate::db::repositories::{
     transport_trace::{self, AttemptCompletion, NewAttempt},
 };
 use crate::db::tx::with_immediate;
-use crate::services::write_path::signer_guard::{
-    self, SignerCashierMismatch,
-};
+use crate::services::write_path::signer_guard::{self, SignerCashierMismatch};
 use crate::transports::dps::channel::DpsChannel;
 use crate::transports::dps::dto::{CheckEnvelope, DpsCheckType};
 use crate::transports::dps::error::DpsError;

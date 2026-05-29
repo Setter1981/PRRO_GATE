@@ -120,11 +120,23 @@ fn extended_tax_groups() -> HashMap<i64, ResolvedTaxGroup> {
     let mut m = HashMap::new();
     m.insert(
         1_i64,
-        ResolvedTaxGroup { tx: 1, txpr: 20.0, dtpr: 0.0, txal: 0, txty: 0 },
+        ResolvedTaxGroup {
+            tx: 1,
+            txpr: 20.0,
+            dtpr: 0.0,
+            txal: 0,
+            txty: 0,
+        },
     );
     m.insert(
         2_i64,
-        ResolvedTaxGroup { tx: 2, txpr: 7.0, dtpr: 0.0, txal: 0, txty: 0 },
+        ResolvedTaxGroup {
+            tx: 2,
+            txpr: 7.0,
+            dtpr: 0.0,
+            txal: 0,
+            txty: 0,
+        },
     );
     m
 }
@@ -213,10 +225,8 @@ fn z_report_extended_doc() -> CanonicalDoc {
     let groups = extended_tax_groups();
     let tx1 = &groups[&1_i64];
     let tx2 = &groups[&2_i64];
-    let (txi1, _) =
-        prro::xml::calc_tax(12000, tx1.txpr, tx1.dtpr, tx1.txal).expect("tx1 calc");
-    let (txi2, _) =
-        prro::xml::calc_tax(700, tx2.txpr, tx2.dtpr, tx2.txal).expect("tx2 calc");
+    let (txi1, _) = prro::xml::calc_tax(12000, tx1.txpr, tx1.dtpr, tx1.txal).expect("tx1 calc");
+    let (txi2, _) = prro::xml::calc_tax(700, tx2.txpr, tx2.dtpr, tx2.txal).expect("tx2 calc");
 
     CanonicalDoc::ZReport(ZReportPayload {
         header: fixture_header(),

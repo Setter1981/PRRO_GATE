@@ -7,7 +7,7 @@
 //!
 //! Traits:
 //!   * [`DpsXmlBuilder`]      — serialise `CanonicalFiscalCommand`
-//!                              into outgress-specific bytes
+//!     into outgress-specific bytes
 //!   * [`SignEnvelope`]       — CMS / signed-file wrap
 //!   * [`DpsTransport`]       — submit signed bytes to DPS endpoint
 //!   * [`DpsResponseParser`]  — decode raw response into [`DpsOutcome`]
@@ -107,9 +107,7 @@ pub enum DpsOutcome {
     },
 
     /// Transport-level failure surfaced as retryable.
-    RetryablePending {
-        reason: String,
-    },
+    RetryablePending { reason: String },
 }
 
 #[derive(Debug, Error)]
@@ -180,11 +178,7 @@ pub trait SignEnvelope: Send + Sync {
     /// Wrap unsigned payload bytes in the outgress's signed envelope
     /// (CMS for FSCO, CMS-over-CHECK for EVPZ).  Output is the
     /// transport-ready signed blob.
-    fn wrap(
-        &self,
-        content: &[u8],
-        sign_ctx: &SignContext,
-    ) -> Result<Vec<u8>, SignError>;
+    fn wrap(&self, content: &[u8], sign_ctx: &SignContext) -> Result<Vec<u8>, SignError>;
 }
 
 #[async_trait]
@@ -237,11 +231,7 @@ impl DpsXmlBuilder for FscoXmlBuilder {
 
 pub struct CmsOverDatEnvelope;
 impl SignEnvelope for CmsOverDatEnvelope {
-    fn wrap(
-        &self,
-        _content: &[u8],
-        _sign_ctx: &SignContext,
-    ) -> Result<Vec<u8>, SignError> {
+    fn wrap(&self, _content: &[u8], _sign_ctx: &SignContext) -> Result<Vec<u8>, SignError> {
         // W4-Z2 — CMS sign over the `<DAT>` content via jkurwa sidecar.
         Err(SignError::Unimplemented(
             "CMS-over-DAT envelope body lands in W4-Z2".to_string(),
@@ -295,11 +285,7 @@ impl DpsXmlBuilder for EvpzXmlBuilder {
 
 pub struct CmsOverCheckSignedFileEnvelope;
 impl SignEnvelope for CmsOverCheckSignedFileEnvelope {
-    fn wrap(
-        &self,
-        _content: &[u8],
-        _sign_ctx: &SignContext,
-    ) -> Result<Vec<u8>, SignError> {
+    fn wrap(&self, _content: &[u8], _sign_ctx: &SignContext) -> Result<Vec<u8>, SignError> {
         Err(SignError::Unimplemented(
             "EVPZ CMS-over-CHECK signed-file envelope is post-pilot (W4-Y2)".to_string(),
         ))

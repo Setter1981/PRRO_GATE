@@ -121,9 +121,10 @@ async fn migration_017_true_upgrade_from_016_preserves_existing_rows() {
         .await
         .expect("connect for upgrade-sim");
 
-    let migrator = sqlx::migrate::Migrator::new(std::path::Path::new(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"),
-    ))
+    let migrator = sqlx::migrate::Migrator::new(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/migrations"
+    )))
     .await
     .expect("load migrator");
 
@@ -249,13 +250,12 @@ async fn migration_017_true_upgrade_from_016_preserves_existing_rows() {
 
     // And the row's other columns are intact (sanity — no
     // destructive ALTER side effects).
-    let state: String = sqlx::query_scalar(
-        "SELECT state FROM fiscal_documents WHERE document_id = ?",
-    )
-    .bind(&doc_bytes)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
+            .bind(&doc_bytes)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(state, "SIGNED", "pre-017 row state preserved");
 }
 
@@ -286,9 +286,10 @@ async fn migration_017_runner_rerun_is_noop_via_recorded_checksum() {
 
     // Re-run the migrator.  This MUST be a no-op (no panic, no
     // additional rows in `_sqlx_migrations`).
-    let migrator = sqlx::migrate::Migrator::new(std::path::Path::new(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"),
-    ))
+    let migrator = sqlx::migrate::Migrator::new(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/migrations"
+    )))
     .await
     .expect("load migrations");
     migrator

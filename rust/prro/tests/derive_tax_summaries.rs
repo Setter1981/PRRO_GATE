@@ -91,14 +91,20 @@ fn items_in_same_group_sum_aggregated_into_single_summary() {
 #[test]
 fn items_in_different_groups_yield_one_summary_each() {
     let items = vec![
-        item_with_group("ART-1", 6000, Some(1)),  // 20% VAT group
-        item_with_group("ART-2", 1400, Some(2)),  // 7% VAT group
+        item_with_group("ART-1", 6000, Some(1)), // 20% VAT group
+        item_with_group("ART-2", 1400, Some(2)), // 7% VAT group
     ];
     let mut groups = HashMap::new();
     groups.insert(1_i64, vat_20_group(1));
     groups.insert(
         2_i64,
-        ResolvedTaxGroup { tx: 2, txpr: 7.0, dtpr: 0.0, txal: 0, txty: 0 },
+        ResolvedTaxGroup {
+            tx: 2,
+            txpr: 7.0,
+            dtpr: 0.0,
+            txal: 0,
+            txty: 0,
+        },
     );
 
     let summaries = derive_check_tax_summaries(&items, &groups).expect("ok");
@@ -154,7 +160,13 @@ fn calc_tax_unsupported_txal_propagates() {
     let mut groups = HashMap::new();
     groups.insert(
         1_i64,
-        ResolvedTaxGroup { tx: 1, txpr: 20.0, dtpr: 0.0, txal: 3, txty: 0 },
+        ResolvedTaxGroup {
+            tx: 1,
+            txpr: 20.0,
+            dtpr: 0.0,
+            txal: 3,
+            txty: 0,
+        },
     );
     let err = derive_check_tax_summaries(&items, &groups).expect_err("TXAL=3 not supported");
     use prro::xml::CalcTaxError;

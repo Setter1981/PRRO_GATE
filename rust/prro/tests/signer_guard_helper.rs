@@ -79,10 +79,7 @@ fn sample_shift_with_fn(opened_by: CashierId, fn_id: &str) -> ShiftRow {
 
 /// MED-C3-1 helper: produce aligned `(SendInputs, ShiftRow)` so the
 /// shift_id + fiscal_number + cashier reach the equality check.
-fn aligned(
-    doc_type: DocType,
-    cashier_id: CashierId,
-) -> (SendInputs, ShiftRow) {
+fn aligned(doc_type: DocType, cashier_id: CashierId) -> (SendInputs, ShiftRow) {
     let shift = sample_shift(cashier_id.clone());
     let mut inputs = sample_inputs(doc_type, Some(cashier_id), Some(shift.shift_id));
     inputs.fiscal_number = shift.fiscal_number.clone();
@@ -99,17 +96,10 @@ fn shift_close_bypasses_signer_check_with_no_signer() {
 
 #[test]
 fn shift_close_bypasses_signer_check_with_mismatched_signer() {
-    let inputs = sample_inputs(
-        DocType::ShiftClose,
-        Some(cashier("senior-vera")),
-        None,
-    );
+    let inputs = sample_inputs(DocType::ShiftClose, Some(cashier("senior-vera")), None);
     let shift = sample_shift(cashier("cashier-vasya"));
     // §16.9: senior may close even if signer != opening cashier.
-    assert_eq!(
-        enforce_signer_cashier_match(&inputs, Some(&shift)),
-        Ok(())
-    );
+    assert_eq!(enforce_signer_cashier_match(&inputs, Some(&shift)), Ok(()));
 }
 
 #[test]
@@ -120,16 +110,9 @@ fn z_report_bypasses_signer_check_with_no_signer() {
 
 #[test]
 fn z_report_bypasses_signer_check_with_mismatched_signer() {
-    let inputs = sample_inputs(
-        DocType::ZReport,
-        Some(cashier("senior-vera")),
-        None,
-    );
+    let inputs = sample_inputs(DocType::ZReport, Some(cashier("senior-vera")), None);
     let shift = sample_shift(cashier("cashier-vasya"));
-    assert_eq!(
-        enforce_signer_cashier_match(&inputs, Some(&shift)),
-        Ok(())
-    );
+    assert_eq!(enforce_signer_cashier_match(&inputs, Some(&shift)), Ok(()));
 }
 
 #[test]
@@ -147,16 +130,9 @@ fn shift_open_bypasses_even_with_mismatched_signer() {
     // The signer's `signed_by_cashier_id` becomes `opened_by_cashier_id`
     // after stage_finalize creates the shift row — pre-creation
     // validation is semantically empty.
-    let inputs = sample_inputs(
-        DocType::ShiftOpen,
-        Some(cashier("cashier-petya")),
-        None,
-    );
+    let inputs = sample_inputs(DocType::ShiftOpen, Some(cashier("cashier-petya")), None);
     let shift = sample_shift(cashier("cashier-vasya"));
-    assert_eq!(
-        enforce_signer_cashier_match(&inputs, Some(&shift)),
-        Ok(())
-    );
+    assert_eq!(enforce_signer_cashier_match(&inputs, Some(&shift)), Ok(()));
 }
 
 // ─── ShiftMissingForFiscalDoc arm (1a + 1b) ──────────────────────────
@@ -188,11 +164,7 @@ fn sell_without_inputs_shift_id_returns_shift_missing() {
     // surface as ShiftMissingForFiscalDoc.  Without this arm, a future
     // caller could supply ANY shift row and signer would validate
     // against the wrong binding.
-    let inputs = sample_inputs(
-        DocType::Sell,
-        Some(cashier("cashier-vasya")),
-        None,
-    );
+    let inputs = sample_inputs(DocType::Sell, Some(cashier("cashier-vasya")), None);
     let shift = sample_shift(cashier("cashier-vasya"));
     assert!(matches!(
         enforce_signer_cashier_match(&inputs, Some(&shift)),
@@ -288,11 +260,7 @@ fn shift_id_mismatch_takes_precedence_over_cashier_mismatch() {
 fn sell_with_cross_fn_binding_returns_cross_fn_mismatch() {
     // Same shift_id reference but different fiscal_number on the rows.
     let shift = sample_shift_with_fn(cashier("c"), "2222222222");
-    let mut inputs = sample_inputs(
-        DocType::Sell,
-        Some(cashier("c")),
-        Some(shift.shift_id),
-    );
+    let mut inputs = sample_inputs(DocType::Sell, Some(cashier("c")), Some(shift.shift_id));
     inputs.fiscal_number = "1111111111".into();
 
     let res = enforce_signer_cashier_match(&inputs, Some(&shift));
@@ -325,11 +293,7 @@ fn cross_fn_takes_precedence_over_signer_missing() {
 #[test]
 fn cross_fn_takes_precedence_over_cashier_mismatch() {
     let shift = sample_shift_with_fn(cashier("c"), "2222222222");
-    let mut inputs = sample_inputs(
-        DocType::Sell,
-        Some(cashier("petya")),
-        Some(shift.shift_id),
-    );
+    let mut inputs = sample_inputs(DocType::Sell, Some(cashier("petya")), Some(shift.shift_id));
     inputs.fiscal_number = "1111111111".into();
     assert!(matches!(
         enforce_signer_cashier_match(&inputs, Some(&shift)),
@@ -340,16 +304,9 @@ fn cross_fn_takes_precedence_over_cashier_mismatch() {
 #[test]
 fn shift_close_with_cross_fn_still_bypasses() {
     let shift = sample_shift_with_fn(cashier("c"), "2222222222");
-    let mut inputs = sample_inputs(
-        DocType::ShiftClose,
-        None,
-        Some(shift.shift_id),
-    );
+    let mut inputs = sample_inputs(DocType::ShiftClose, None, Some(shift.shift_id));
     inputs.fiscal_number = "1111111111".into();
-    assert_eq!(
-        enforce_signer_cashier_match(&inputs, Some(&shift)),
-        Ok(())
-    );
+    assert_eq!(enforce_signer_cashier_match(&inputs, Some(&shift)), Ok(()));
 }
 
 // ─── SignerIdMissing arm ─────────────────────────────────────────────
@@ -424,19 +381,13 @@ fn service_out_with_mismatched_signer_returns_mismatch() {
 #[test]
 fn sell_with_matched_signer_and_aligned_shift_returns_ok() {
     let (inputs, shift) = aligned(DocType::Sell, cashier("cashier-vasya"));
-    assert_eq!(
-        enforce_signer_cashier_match(&inputs, Some(&shift)),
-        Ok(())
-    );
+    assert_eq!(enforce_signer_cashier_match(&inputs, Some(&shift)), Ok(()));
 }
 
 #[test]
 fn cash_withdrawal_with_matched_signer_returns_ok() {
     let (inputs, shift) = aligned(DocType::CashWithdrawal, cashier("c"));
-    assert_eq!(
-        enforce_signer_cashier_match(&inputs, Some(&shift)),
-        Ok(())
-    );
+    assert_eq!(enforce_signer_cashier_match(&inputs, Some(&shift)), Ok(()));
 }
 
 // ─── Structural pin (LOW-C3-4 strengthened) ──────────────────────────
@@ -470,7 +421,9 @@ fn all_five_known_variants_instantiate_and_match() {
         inputs_fiscal_number: "1".into(),
         shift_fiscal_number: "2".into(),
     };
-    let v4 = SignerCashierMismatch::SignerIdMissing { document_id: doc_id };
+    let v4 = SignerCashierMismatch::SignerIdMissing {
+        document_id: doc_id,
+    };
     let v5 = SignerCashierMismatch::Mismatch {
         shift_id: shift_id_a,
         document_id: doc_id,

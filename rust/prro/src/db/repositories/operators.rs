@@ -66,10 +66,7 @@ pub enum OperatorsRepoError {
 /// migration 020 DDL.  Returns [`OperatorsRepoError::DuplicateActive`]
 /// when the partial unique index rejects a second active row for the
 /// same fiscal_number.
-pub async fn insert(
-    pool: &SqlitePool,
-    new: &NewOperator,
-) -> Result<(), OperatorsRepoError> {
+pub async fn insert(pool: &SqlitePool, new: &NewOperator) -> Result<(), OperatorsRepoError> {
     let result = sqlx::query(
         "INSERT INTO operators \
             (operator_id, fiscal_number, name, key_path, key_pass_enc) \
@@ -85,9 +82,9 @@ pub async fn insert(
 
     match result {
         Ok(_) => Ok(()),
-        Err(e) if is_unique_violation(&e) => {
-            Err(OperatorsRepoError::DuplicateActive(new.fiscal_number.clone()))
-        }
+        Err(e) if is_unique_violation(&e) => Err(OperatorsRepoError::DuplicateActive(
+            new.fiscal_number.clone(),
+        )),
         Err(e) => Err(OperatorsRepoError::Db(e)),
     }
 }

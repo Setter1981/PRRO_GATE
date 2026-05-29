@@ -100,10 +100,11 @@ pub struct WorkerContext {
     ///   re-entry paths that don't pre-load.  `derive_check_tax_
     ///   summaries` surfaces `TaxMappingNotWired` if such a doc
     ///   carries `tax_group_1`.
-    /// Compile-time `Option` wrapper prevents the MAC-recovery
-    /// footgun where a fresh-config tax_snapshot would silently
-    /// re-sign with the wrong configuration.
-    pub tax_resolution_snapshot: Option<crate::services::write_path::tax_summary::TaxResolutionSnapshot>,
+    ///   Compile-time `Option` wrapper prevents the MAC-recovery
+    ///   footgun where a fresh-config tax_snapshot would silently
+    ///   re-sign with the wrong configuration.
+    pub tax_resolution_snapshot:
+        Option<crate::services::write_path::tax_summary::TaxResolutionSnapshot>,
     /// W4-Z2a piece 6 — id from `signing_config_snapshots` for the
     /// snapshot above.  Used by stage_sign 3-PRE pin (piece 8) to
     /// atomically write `fiscal_documents.signing_config_snapshot_id`
@@ -169,7 +170,6 @@ pub enum RejectionReason {
     // bucket.  Per spec §3.3: `Online` and `Offline | GoingOffline` map
     // to `Channel::Online` / `Channel::Offline` and proceed to the
     // shift guard; the four below are refused BEFORE the shift guard.
-
     /// Mode = `GoingOnline` — return-online drain in flight.  Operator
     /// MUST wait for `GoingOnline → Online` transition before issuing
     /// new fiscal ops.  Transient; expected during return-online cycle.
@@ -185,7 +185,6 @@ pub enum RejectionReason {
     NodeCryptoDegraded,
 
     // ─── Channel-aware shift-guard refusals ──────────────────────────
-
     /// Online op attempted while shift is in `OpenedLocalPendingDrain`
     /// (offline `SHIFT_OPEN` landed local ack but DPS hasn't confirmed
     /// the open yet).  Audit shape:

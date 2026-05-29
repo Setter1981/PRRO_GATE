@@ -69,8 +69,8 @@ pub enum BootstrapError {
 #[derive(Debug, Clone)]
 pub struct RowFailure {
     pub table: &'static str, // "tax_groups" / "payment_methods" / "fn_outgress_profile" / "fn_integration_flags"
-    pub identifier: String,  // human-readable row identifier (tx_num=1 letter=А, pay_index=2 name=Visa, etc.)
-    pub cause: String,       // sqlx error message
+    pub identifier: String, // human-readable row identifier (tx_num=1 letter=А, pay_index=2 name=Visa, etc.)
+    pub cause: String,      // sqlx error message
 }
 
 impl RowFailure {
@@ -121,17 +121,17 @@ pub async fn bootstrap_fn_defaults(
 /// reverse-engineered .NET source.  Each tuple is
 /// `(tx_num, letter, dtpr, txpr, txal)`.  `txty` always 0.
 const DEFAULT_TAX_GROUPS: &[(i64, &str, f64, f64, i64)] = &[
-    (1,  "А",  0.0, 20.0, 0),  // ПДВ 20% standard
-    (2,  "Б",  0.0,  0.0, 0),  // Звільнено від ПДВ
-    (3,  "В",  0.0,  7.0, 0),  // ПДВ 7% (медичні)
-    (4,  "ГА", 5.0, 20.0, 2),  // ПДВ 20% + акциз 5%
-    (5,  "ГБ", 5.0,  0.0, 2),  // Звільнено + акциз 5%
-    (6,  "ДА", 7.5, 20.0, 2),  // ПДВ 20% + акциз 7.5%
-    (7,  "ДБ", 7.5,  0.0, 2),  // Звільнено + акциз 7.5%
-    (8,  "Е",  0.0,  0.0, 0),  // (reserved)
-    (9,  "Ж",  0.0,  0.0, 0),  // (reserved)
-    (10, "З",  0.0,  0.0, 0),  // (reserved)
-    (11, "К",  0.0, 14.0, 0),  // ПДВ 14% (special category)
+    (1, "А", 0.0, 20.0, 0),  // ПДВ 20% standard
+    (2, "Б", 0.0, 0.0, 0),   // Звільнено від ПДВ
+    (3, "В", 0.0, 7.0, 0),   // ПДВ 7% (медичні)
+    (4, "ГА", 5.0, 20.0, 2), // ПДВ 20% + акциз 5%
+    (5, "ГБ", 5.0, 0.0, 2),  // Звільнено + акциз 5%
+    (6, "ДА", 7.5, 20.0, 2), // ПДВ 20% + акциз 7.5%
+    (7, "ДБ", 7.5, 0.0, 2),  // Звільнено + акциз 7.5%
+    (8, "Е", 0.0, 0.0, 0),   // (reserved)
+    (9, "Ж", 0.0, 0.0, 0),   // (reserved)
+    (10, "З", 0.0, 0.0, 0),  // (reserved)
+    (11, "К", 0.0, 14.0, 0), // ПДВ 14% (special category)
 ];
 
 async fn seed_tax_groups(
@@ -185,9 +185,9 @@ async fn seed_tax_groups(
 /// Tuple: `(pay_index, name, iscash)`.  XML `<M T=...>` value is
 /// `pay_index - 1` per WebCheck convention (cash → T=0, etc.).
 const DEFAULT_PAYMENT_METHODS: &[(i64, &str, bool)] = &[
-    (1, "Готівка",    true),
-    (2, "Картка",     false),
-    (3, "Кредит",     false),
+    (1, "Готівка", true),
+    (2, "Картка", false),
+    (3, "Кредит", false),
     (4, "Сертифікат", false),
 ];
 

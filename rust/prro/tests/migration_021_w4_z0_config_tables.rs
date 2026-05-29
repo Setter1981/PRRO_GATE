@@ -21,7 +21,9 @@ async fn fresh_secure_pool() -> (tempfile::TempDir, SqlitePool) {
     (dir, pool)
 }
 
-fn collect_columns(rows: Vec<sqlx::sqlite::SqliteRow>) -> std::collections::HashMap<String, (i64, bool)> {
+fn collect_columns(
+    rows: Vec<sqlx::sqlite::SqliteRow>,
+) -> std::collections::HashMap<String, (i64, bool)> {
     rows.into_iter()
         .map(|r| {
             let name: String = r.get("name");
@@ -43,7 +45,17 @@ async fn migration_021_creates_tax_groups_table() {
 
     let cols = collect_columns(rows);
 
-    for required in ["fn", "tx_num", "letter", "dtpr", "txpr", "txal", "txty", "is_active", "created_at"] {
+    for required in [
+        "fn",
+        "tx_num",
+        "letter",
+        "dtpr",
+        "txpr",
+        "txal",
+        "txty",
+        "is_active",
+        "created_at",
+    ] {
         let (notnull, _) = cols
             .get(required)
             .unwrap_or_else(|| panic!("tax_groups column {required} missing"));
@@ -91,7 +103,14 @@ async fn migration_021_creates_payment_methods_table() {
 
     let cols = collect_columns(rows);
 
-    for required in ["fn", "pay_index", "name", "iscash", "is_active", "created_at"] {
+    for required in [
+        "fn",
+        "pay_index",
+        "name",
+        "iscash",
+        "is_active",
+        "created_at",
+    ] {
         let (notnull, _) = cols
             .get(required)
             .unwrap_or_else(|| panic!("payment_methods column {required} missing"));
@@ -131,18 +150,30 @@ async fn migration_021_creates_driver_tax_mapping_table() {
 
     let cols = collect_columns(rows);
 
-    for required in ["driver_id", "driver_number", "canonical_tx_num", "is_active", "created_at"] {
+    for required in [
+        "driver_id",
+        "driver_number",
+        "canonical_tx_num",
+        "is_active",
+        "created_at",
+    ] {
         let (notnull, _) = cols
             .get(required)
             .unwrap_or_else(|| panic!("driver_tax_mapping column {required} missing"));
-        assert_eq!(*notnull, 1, "driver_tax_mapping.{required} must be NOT NULL");
+        assert_eq!(
+            *notnull, 1,
+            "driver_tax_mapping.{required} must be NOT NULL"
+        );
     }
 
     // driver_letter is nullable (optional audit field)
     let driver_letter = cols
         .get("driver_letter")
         .expect("driver_tax_mapping.driver_letter column missing");
-    assert_eq!(driver_letter.0, 0, "driver_tax_mapping.driver_letter must be nullable");
+    assert_eq!(
+        driver_letter.0, 0,
+        "driver_tax_mapping.driver_letter must be nullable"
+    );
 }
 
 #[tokio::test]
@@ -160,7 +191,10 @@ async fn migration_021_creates_fn_integration_flags_table() {
         let (notnull, _) = cols
             .get(required)
             .unwrap_or_else(|| panic!("fn_integration_flags column {required} missing"));
-        assert_eq!(*notnull, 1, "fn_integration_flags.{required} must be NOT NULL");
+        assert_eq!(
+            *notnull, 1,
+            "fn_integration_flags.{required} must be NOT NULL"
+        );
     }
 }
 
@@ -179,7 +213,10 @@ async fn migration_021_creates_fn_outgress_profile_table() {
         let (notnull, _) = cols
             .get(required)
             .unwrap_or_else(|| panic!("fn_outgress_profile column {required} missing"));
-        assert_eq!(*notnull, 1, "fn_outgress_profile.{required} must be NOT NULL");
+        assert_eq!(
+            *notnull, 1,
+            "fn_outgress_profile.{required} must be NOT NULL"
+        );
     }
 }
 
@@ -188,26 +225,21 @@ async fn migration_021_fn_outgress_profile_enforces_profile_check() {
     let (_dir, pool) = fresh_secure_pool().await;
 
     // Acceptable values: 'FSCO_ZZD', 'EVPZ_DPS'.
-    sqlx::query(
-        "INSERT INTO fn_outgress_profile (fn, profile) VALUES ('1234567890', 'FSCO_ZZD')",
-    )
-    .execute(&pool)
-    .await
-    .expect("FSCO_ZZD insert must succeed");
+    sqlx::query("INSERT INTO fn_outgress_profile (fn, profile) VALUES ('1234567890', 'FSCO_ZZD')")
+        .execute(&pool)
+        .await
+        .expect("FSCO_ZZD insert must succeed");
 
-    sqlx::query(
-        "INSERT INTO fn_outgress_profile (fn, profile) VALUES ('9876543210', 'EVPZ_DPS')",
-    )
-    .execute(&pool)
-    .await
-    .expect("EVPZ_DPS insert must succeed");
+    sqlx::query("INSERT INTO fn_outgress_profile (fn, profile) VALUES ('9876543210', 'EVPZ_DPS')")
+        .execute(&pool)
+        .await
+        .expect("EVPZ_DPS insert must succeed");
 
     // Non-acceptable value MUST be rejected by CHECK constraint.
-    let invalid = sqlx::query(
-        "INSERT INTO fn_outgress_profile (fn, profile) VALUES ('5555555555', 'BOGUS')",
-    )
-    .execute(&pool)
-    .await;
+    let invalid =
+        sqlx::query("INSERT INTO fn_outgress_profile (fn, profile) VALUES ('5555555555', 'BOGUS')")
+            .execute(&pool)
+            .await;
     assert!(
         invalid.is_err(),
         "fn_outgress_profile.profile CHECK must reject non-enum values"
@@ -231,26 +263,28 @@ async fn migration_021_tax_groups_enforces_txal_range() {
     }
 
     // Invalid txal=4
-    let invalid = sqlx::query("INSERT INTO tax_groups (fn, tx_num, letter, txal) VALUES (?, ?, ?, ?)")
-        .bind("2000000000")
-        .bind(1)
-        .bind("А")
-        .bind(4)
-        .execute(&pool)
-        .await;
-    assert!(invalid.is_err(), "tax_groups.txal=4 must be rejected (range 0..=3)");
+    let invalid =
+        sqlx::query("INSERT INTO tax_groups (fn, tx_num, letter, txal) VALUES (?, ?, ?, ?)")
+            .bind("2000000000")
+            .bind(1)
+            .bind("А")
+            .bind(4)
+            .execute(&pool)
+            .await;
+    assert!(
+        invalid.is_err(),
+        "tax_groups.txal=4 must be rejected (range 0..=3)"
+    );
 }
 
 #[tokio::test]
 async fn migration_021_recorded_with_version_21_in_sqlx_migrations() {
     let (_dir, pool) = fresh_secure_pool().await;
 
-    let version: i64 = sqlx::query(
-        "SELECT version FROM _sqlx_migrations WHERE version = 21",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("migration 021 row")
-    .get(0);
+    let version: i64 = sqlx::query("SELECT version FROM _sqlx_migrations WHERE version = 21")
+        .fetch_one(&pool)
+        .await
+        .expect("migration 021 row")
+        .get(0);
     assert_eq!(version, 21);
 }

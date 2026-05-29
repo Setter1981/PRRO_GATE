@@ -25,8 +25,8 @@ mod common;
 use async_trait::async_trait;
 use prro::db::models::enums::{FiscalMode, Severity};
 use prro::db::open_pool;
-use prro::db::repositories::{audit_log, fiscal_number_config as fn_cfg, operators as ops_repo};
 use prro::db::open_secure_pool;
+use prro::db::repositories::{audit_log, fiscal_number_config as fn_cfg, operators as ops_repo};
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
 use prro::services::write_path::stage_sign::SigningContext;
@@ -123,14 +123,10 @@ async fn case_1_missing_key_file_emits_key_load_failed_audit() {
     .await
     .unwrap();
 
-    let registry = BindingsRegistry::build_from_db(
-        &pool_secure,
-        &pool_main,
-        dps(),
-        &FileNotFoundLoader,
-    )
-    .await
-    .expect("boot must NOT abort on key-load failure");
+    let registry =
+        BindingsRegistry::build_from_db(&pool_secure, &pool_main, dps(), &FileNotFoundLoader)
+            .await
+            .expect("boot must NOT abort on key-load failure");
 
     assert!(registry.is_empty(), "FN absent from registry");
 
@@ -164,14 +160,10 @@ async fn case_2_wrong_password_emits_key_load_failed_audit() {
     .await
     .unwrap();
 
-    let registry = BindingsRegistry::build_from_db(
-        &pool_secure,
-        &pool_main,
-        dps(),
-        &WrongPasswordLoader,
-    )
-    .await
-    .expect("boot must NOT abort");
+    let registry =
+        BindingsRegistry::build_from_db(&pool_secure, &pool_main, dps(), &WrongPasswordLoader)
+            .await
+            .expect("boot must NOT abort");
 
     assert!(registry.is_empty());
 

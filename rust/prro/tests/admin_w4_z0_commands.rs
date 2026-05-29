@@ -10,9 +10,7 @@ use prro::admin_w4_z0::{self as cli, CfgAdminError};
 use prro::db::models::enums::{FiscalMode, Severity};
 use prro::db::repositories::audit_log;
 use prro::db::repositories::fn_outgress_profile::OutgressProfile;
-use prro::db::repositories::{
-    fiscal_number_config as fn_cfg, fn_integration_flags, fn_outgress_profile,
-};
+use prro::db::repositories::{fiscal_number_config as fn_cfg, fn_integration_flags};
 use prro::db::{open_pool, open_secure_pool};
 use sqlx::SqlitePool;
 
@@ -24,7 +22,9 @@ async fn fresh_main_pool() -> (tempfile::TempDir, SqlitePool) {
 
 async fn fresh_secure_pool() -> (tempfile::TempDir, SqlitePool) {
     let dir = tempfile::tempdir().unwrap();
-    let pool = open_secure_pool(&dir.path().join("secure.db")).await.unwrap();
+    let pool = open_secure_pool(&dir.path().join("secure.db"))
+        .await
+        .unwrap();
     (dir, pool)
 }
 
@@ -67,14 +67,30 @@ async fn add_tax_group_happy_path() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    cli::add_tax_group(&pool_main, &pool_secure, "4000000001", 1, "А", 0.0, 20.0, 0)
-        .await
-        .expect("add_tax_group");
+    cli::add_tax_group(
+        &pool_main,
+        &pool_secure,
+        cli::AddTaxGroupArgs {
+            fn_id: "4000000001".to_string(),
+            tx_num: 1,
+            letter: "А".to_string(),
+            dtpr: 0.0,
+            txpr: 20.0,
+            txal: 0,
+        },
+    )
+    .await
+    .expect("add_tax_group");
 
-    let rows = cli::list_tax_groups(&pool_secure, "4000000001").await.unwrap();
+    let rows = cli::list_tax_groups(&pool_secure, "4000000001")
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].letter, "А");
-    assert_eq!(count_audit_events(&pool_main, "ADMIN_TAX_GROUP_ADDED").await, 1);
+    assert_eq!(
+        count_audit_events(&pool_main, "ADMIN_TAX_GROUP_ADDED").await,
+        1
+    );
 }
 
 #[tokio::test]
@@ -82,11 +98,25 @@ async fn add_tax_group_rejects_unknown_fn() {
     let (_md, pool_main) = fresh_main_pool().await;
     let (_sd, pool_secure) = fresh_secure_pool().await;
 
-    let err = cli::add_tax_group(&pool_main, &pool_secure, "9999999999", 1, "А", 0.0, 20.0, 0)
-        .await
-        .expect_err("must reject unknown FN");
+    let err = cli::add_tax_group(
+        &pool_main,
+        &pool_secure,
+        cli::AddTaxGroupArgs {
+            fn_id: "9999999999".to_string(),
+            tx_num: 1,
+            letter: "А".to_string(),
+            dtpr: 0.0,
+            txpr: 20.0,
+            txal: 0,
+        },
+    )
+    .await
+    .expect_err("must reject unknown FN");
     assert!(matches!(err, CfgAdminError::FiscalNumberNotInConfig(_)));
-    assert_eq!(count_audit_events(&pool_main, "ADMIN_TAX_GROUP_ADDED").await, 0);
+    assert_eq!(
+        count_audit_events(&pool_main, "ADMIN_TAX_GROUP_ADDED").await,
+        0
+    );
 }
 
 #[tokio::test]
@@ -95,19 +125,43 @@ async fn update_tax_rate_partial_field() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    cli::add_tax_group(&pool_main, &pool_secure, "4000000001", 1, "А", 0.0, 20.0, 0)
-        .await
-        .unwrap();
+    cli::add_tax_group(
+        &pool_main,
+        &pool_secure,
+        cli::AddTaxGroupArgs {
+            fn_id: "4000000001".to_string(),
+            tx_num: 1,
+            letter: "А".to_string(),
+            dtpr: 0.0,
+            txpr: 20.0,
+            txal: 0,
+        },
+    )
+    .await
+    .unwrap();
 
     // Update only txpr; leave dtpr/txal untouched
-    cli::update_tax_rate(&pool_main, &pool_secure, "4000000001", 1, None, Some(18.0), None)
-        .await
-        .expect("update");
+    cli::update_tax_rate(
+        &pool_main,
+        &pool_secure,
+        "4000000001",
+        1,
+        None,
+        Some(18.0),
+        None,
+    )
+    .await
+    .expect("update");
 
-    let row = cli::list_tax_groups(&pool_secure, "4000000001").await.unwrap();
+    let row = cli::list_tax_groups(&pool_secure, "4000000001")
+        .await
+        .unwrap();
     assert_eq!(row[0].txpr, 18.0);
     assert_eq!(row[0].dtpr, 0.0);
-    assert_eq!(count_audit_events(&pool_main, "ADMIN_TAX_GROUP_UPDATED").await, 1);
+    assert_eq!(
+        count_audit_events(&pool_main, "ADMIN_TAX_GROUP_UPDATED").await,
+        1
+    );
 }
 
 #[tokio::test]
@@ -116,16 +170,32 @@ async fn remove_tax_group_soft_deletes() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    cli::add_tax_group(&pool_main, &pool_secure, "4000000001", 1, "А", 0.0, 20.0, 0)
-        .await
-        .unwrap();
+    cli::add_tax_group(
+        &pool_main,
+        &pool_secure,
+        cli::AddTaxGroupArgs {
+            fn_id: "4000000001".to_string(),
+            tx_num: 1,
+            letter: "А".to_string(),
+            dtpr: 0.0,
+            txpr: 20.0,
+            txal: 0,
+        },
+    )
+    .await
+    .unwrap();
     cli::remove_tax_group(&pool_main, &pool_secure, "4000000001", 1)
         .await
         .expect("remove");
 
-    let rows = cli::list_tax_groups(&pool_secure, "4000000001").await.unwrap();
+    let rows = cli::list_tax_groups(&pool_secure, "4000000001")
+        .await
+        .unwrap();
     assert!(rows.is_empty(), "removed tax_group excluded from list");
-    assert_eq!(count_audit_events(&pool_main, "ADMIN_TAX_GROUP_REMOVED").await, 1);
+    assert_eq!(
+        count_audit_events(&pool_main, "ADMIN_TAX_GROUP_REMOVED").await,
+        1
+    );
 }
 
 // ─── payment_methods family ────────────────────────────────────────
@@ -165,18 +235,27 @@ async fn bootstrap_defaults_recovery_command_seeds_missing() {
 
     // Simulate "stranded FN" — FN exists in fn_cfg but secure.db has no
     // config rows for it (bootstrap failed during add-operator).
-    let tax_rows_before = cli::list_tax_groups(&pool_secure, "4000000001").await.unwrap();
+    let tax_rows_before = cli::list_tax_groups(&pool_secure, "4000000001")
+        .await
+        .unwrap();
     assert!(tax_rows_before.is_empty());
 
     cli::bootstrap_defaults(&pool_main, &pool_secure, "4000000001")
         .await
         .expect("recovery bootstrap");
 
-    let tax_rows = cli::list_tax_groups(&pool_secure, "4000000001").await.unwrap();
+    let tax_rows = cli::list_tax_groups(&pool_secure, "4000000001")
+        .await
+        .unwrap();
     assert_eq!(tax_rows.len(), 11);
-    let pay_rows = cli::list_payment_methods(&pool_secure, "4000000001").await.unwrap();
+    let pay_rows = cli::list_payment_methods(&pool_secure, "4000000001")
+        .await
+        .unwrap();
     assert_eq!(pay_rows.len(), 4);
-    assert_eq!(count_audit_events(&pool_main, "ADMIN_FN_DEFAULTS_BOOTSTRAPPED").await, 1);
+    assert_eq!(
+        count_audit_events(&pool_main, "ADMIN_FN_DEFAULTS_BOOTSTRAPPED").await,
+        1
+    );
 }
 
 #[tokio::test]
@@ -185,12 +264,16 @@ async fn bootstrap_defaults_is_idempotent_when_already_seeded() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    cli::bootstrap_defaults(&pool_main, &pool_secure, "4000000001").await.unwrap();
+    cli::bootstrap_defaults(&pool_main, &pool_secure, "4000000001")
+        .await
+        .unwrap();
     cli::bootstrap_defaults(&pool_main, &pool_secure, "4000000001")
         .await
         .expect("second invocation must be safe");
 
-    let tax_rows = cli::list_tax_groups(&pool_secure, "4000000001").await.unwrap();
+    let tax_rows = cli::list_tax_groups(&pool_secure, "4000000001")
+        .await
+        .unwrap();
     assert_eq!(tax_rows.len(), 11);
 }
 
@@ -206,9 +289,14 @@ async fn update_driver_mapping_changes_canonical_tx_num() {
         .await
         .expect("update");
 
-    let rows = cli::list_driver_mappings(&pool_secure, "eccelio").await.unwrap();
+    let rows = cli::list_driver_mappings(&pool_secure, "eccelio")
+        .await
+        .unwrap();
     assert_eq!(rows[0].canonical_tx_num, 4);
-    assert_eq!(count_audit_events(&pool_main, "ADMIN_DRIVER_MAPPING_UPDATED").await, 1);
+    assert_eq!(
+        count_audit_events(&pool_main, "ADMIN_DRIVER_MAPPING_UPDATED").await,
+        1
+    );
 }
 
 #[tokio::test]
@@ -239,11 +327,24 @@ async fn audit_failure_does_not_block_mutation() {
         .expect("drop audit_log");
 
     // Mutation must still succeed (best-effort audit)
-    cli::add_tax_group(&pool_main, &pool_secure, "4000000001", 1, "А", 0.0, 20.0, 0)
-        .await
-        .expect("mutation succeeds even when audit cannot land");
+    cli::add_tax_group(
+        &pool_main,
+        &pool_secure,
+        cli::AddTaxGroupArgs {
+            fn_id: "4000000001".to_string(),
+            tx_num: 1,
+            letter: "А".to_string(),
+            dtpr: 0.0,
+            txpr: 20.0,
+            txal: 0,
+        },
+    )
+    .await
+    .expect("mutation succeeds even when audit cannot land");
 
-    let rows = cli::list_tax_groups(&pool_secure, "4000000001").await.unwrap();
+    let rows = cli::list_tax_groups(&pool_secure, "4000000001")
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1, "tax_group row landed despite audit failure");
 }
 
@@ -261,10 +362,15 @@ async fn add_payment_method_happy_path() {
         .await
         .expect("add");
 
-    let rows = cli::list_payment_methods(&pool_secure, "4000000001").await.unwrap();
+    let rows = cli::list_payment_methods(&pool_secure, "4000000001")
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].name, "Visa");
-    assert_eq!(count_audit_events(&pool_main, "ADMIN_PAYMENT_METHOD_ADDED").await, 1);
+    assert_eq!(
+        count_audit_events(&pool_main, "ADMIN_PAYMENT_METHOD_ADDED").await,
+        1
+    );
 }
 
 #[tokio::test]
@@ -296,9 +402,14 @@ async fn update_payment_method_changes_iscash() {
         .await
         .expect("update");
 
-    let rows = cli::list_payment_methods(&pool_secure, "4000000001").await.unwrap();
+    let rows = cli::list_payment_methods(&pool_secure, "4000000001")
+        .await
+        .unwrap();
     assert!(rows[0].iscash);
-    assert_eq!(count_audit_events(&pool_main, "ADMIN_PAYMENT_METHOD_UPDATED").await, 1);
+    assert_eq!(
+        count_audit_events(&pool_main, "ADMIN_PAYMENT_METHOD_UPDATED").await,
+        1
+    );
 }
 
 #[tokio::test]
@@ -314,9 +425,14 @@ async fn remove_payment_method_soft_deletes() {
         .await
         .expect("remove");
 
-    let rows = cli::list_payment_methods(&pool_secure, "4000000001").await.unwrap();
+    let rows = cli::list_payment_methods(&pool_secure, "4000000001")
+        .await
+        .unwrap();
     assert!(rows.is_empty());
-    assert_eq!(count_audit_events(&pool_main, "ADMIN_PAYMENT_METHOD_REMOVED").await, 1);
+    assert_eq!(
+        count_audit_events(&pool_main, "ADMIN_PAYMENT_METHOD_REMOVED").await,
+        1
+    );
 }
 
 // ─── integration_flags family ──────────────────────────────────────
@@ -327,9 +443,15 @@ async fn set_flag_happy_path() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    cli::set_flag(&pool_main, &pool_secure, "4000000001", "useecheckmegovua", "1")
-        .await
-        .expect("set");
+    cli::set_flag(
+        &pool_main,
+        &pool_secure,
+        "4000000001",
+        "useecheckmegovua",
+        "1",
+    )
+    .await
+    .expect("set");
 
     let v = fn_integration_flags::get_flag(&pool_secure, "4000000001", "useecheckmegovua")
         .await
@@ -372,12 +494,24 @@ async fn list_flags_returns_all_set_flags() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    cli::set_flag(&pool_main, &pool_secure, "4000000001", "useecheckmegovua", "1")
-        .await
-        .unwrap();
-    cli::set_flag(&pool_main, &pool_secure, "4000000001", "some_other_flag", "value")
-        .await
-        .unwrap();
+    cli::set_flag(
+        &pool_main,
+        &pool_secure,
+        "4000000001",
+        "useecheckmegovua",
+        "1",
+    )
+    .await
+    .unwrap();
+    cli::set_flag(
+        &pool_main,
+        &pool_secure,
+        "4000000001",
+        "some_other_flag",
+        "value",
+    )
+    .await
+    .unwrap();
 
     let flags = cli::list_flags(&pool_secure, "4000000001").await.unwrap();
     assert_eq!(flags.len(), 2);
@@ -399,7 +533,9 @@ async fn add_driver_mapping_normalizes_whitespace_in_driver_id() {
         .expect("trim succeeds");
 
     // Looked up via the normalised id — would miss if raw was stored.
-    let rows = cli::list_driver_mappings(&pool_secure, "maria304").await.unwrap();
+    let rows = cli::list_driver_mappings(&pool_secure, "maria304")
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].driver_id, "maria304");
     assert_eq!(rows[0].canonical_tx_num, 4);
@@ -425,11 +561,16 @@ async fn add_driver_mapping_happy_path() {
         .await
         .expect("add");
 
-    let rows = cli::list_driver_mappings(&pool_secure, "maria304").await.unwrap();
+    let rows = cli::list_driver_mappings(&pool_secure, "maria304")
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].canonical_tx_num, 4);
     assert_eq!(rows[0].driver_letter.as_deref(), Some("ГА"));
-    assert_eq!(count_audit_events(&pool_main, "ADMIN_DRIVER_MAPPING_ADDED").await, 1);
+    assert_eq!(
+        count_audit_events(&pool_main, "ADMIN_DRIVER_MAPPING_ADDED").await,
+        1
+    );
 }
 
 #[tokio::test]
@@ -444,9 +585,14 @@ async fn remove_driver_mapping_soft_deletes() {
         .await
         .expect("remove");
 
-    let rows = cli::list_driver_mappings(&pool_secure, "maria304").await.unwrap();
+    let rows = cli::list_driver_mappings(&pool_secure, "maria304")
+        .await
+        .unwrap();
     assert!(rows.is_empty());
-    assert_eq!(count_audit_events(&pool_main, "ADMIN_DRIVER_MAPPING_REMOVED").await, 1);
+    assert_eq!(
+        count_audit_events(&pool_main, "ADMIN_DRIVER_MAPPING_REMOVED").await,
+        1
+    );
 }
 
 // ─── fn_outgress_profile family ────────────────────────────────────
@@ -461,9 +607,14 @@ async fn set_outgress_profile_happy_path_fsco() {
         .await
         .expect("set FSCO_ZZD");
 
-    let profile = cli::show_outgress_profile(&pool_secure, "4000000001").await.unwrap();
+    let profile = cli::show_outgress_profile(&pool_secure, "4000000001")
+        .await
+        .unwrap();
     assert_eq!(profile, OutgressProfile::FscoZzd);
-    assert_eq!(count_audit_events(&pool_main, "ADMIN_OUTGRESS_PROFILE_SET").await, 1);
+    assert_eq!(
+        count_audit_events(&pool_main, "ADMIN_OUTGRESS_PROFILE_SET").await,
+        1
+    );
 }
 
 #[tokio::test]
@@ -477,7 +628,9 @@ async fn set_outgress_profile_accepts_evpz_dps_even_in_pilot() {
     cli::set_outgress_profile(&pool_main, &pool_secure, "4000000001", "EVPZ_DPS")
         .await
         .expect("EVPZ_DPS accepted at admin layer");
-    let profile = cli::show_outgress_profile(&pool_secure, "4000000001").await.unwrap();
+    let profile = cli::show_outgress_profile(&pool_secure, "4000000001")
+        .await
+        .unwrap();
     assert_eq!(profile, OutgressProfile::EvpzDps);
 }
 
@@ -510,15 +663,32 @@ async fn all_mutation_events_are_info_severity() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    cli::add_tax_group(&pool_main, &pool_secure, "4000000001", 1, "А", 0.0, 20.0, 0)
-        .await
-        .unwrap();
+    cli::add_tax_group(
+        &pool_main,
+        &pool_secure,
+        cli::AddTaxGroupArgs {
+            fn_id: "4000000001".to_string(),
+            tx_num: 1,
+            letter: "А".to_string(),
+            dtpr: 0.0,
+            txpr: 20.0,
+            txal: 0,
+        },
+    )
+    .await
+    .unwrap();
     cli::add_payment_method(&pool_main, &pool_secure, "4000000001", 5, "Visa", false)
         .await
         .unwrap();
-    cli::set_flag(&pool_main, &pool_secure, "4000000001", "useecheckmegovua", "1")
-        .await
-        .unwrap();
+    cli::set_flag(
+        &pool_main,
+        &pool_secure,
+        "4000000001",
+        "useecheckmegovua",
+        "1",
+    )
+    .await
+    .unwrap();
     cli::set_outgress_profile(&pool_main, &pool_secure, "4000000001", "FSCO_ZZD")
         .await
         .unwrap();

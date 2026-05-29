@@ -100,11 +100,16 @@ async fn different_fn_distinct_snapshots() {
     .unwrap();
 
     let snap_a = tax_snapshot::load_for_fn_driver(&pool, "FN-A", "maria304")
-        .await.unwrap();
+        .await
+        .unwrap();
     let snap_b = tax_snapshot::load_for_fn_driver(&pool, "FN-B", "maria304")
-        .await.unwrap();
-    assert_ne!(snap_a.sha256(), snap_b.sha256(),
-        "distinct FNs → distinct snapshots");
+        .await
+        .unwrap();
+    assert_ne!(
+        snap_a.sha256(),
+        snap_b.sha256(),
+        "distinct FNs → distinct snapshots"
+    );
 }
 
 #[tokio::test]
@@ -112,10 +117,13 @@ async fn snapshot_includes_only_active_groups() {
     let pool = fresh_secure_pool().await;
     seed_two_tax_groups(&pool, "1234567890").await;
     // Soft-delete tx=1
-    tax_groups::soft_delete(&pool, "1234567890", 1).await.unwrap();
+    tax_groups::soft_delete(&pool, "1234567890", 1)
+        .await
+        .unwrap();
 
     let snap = tax_snapshot::load_for_fn_driver(&pool, "1234567890", "maria304")
-        .await.unwrap();
+        .await
+        .unwrap();
     assert_eq!(snap.groups().len(), 1, "soft-deleted group excluded");
     assert_eq!(snap.groups()[0].tx, 2);
 }
@@ -142,6 +150,8 @@ async fn invalid_rate_in_db_surfaces_typed_snapshot_build_error() {
     let err = tax_snapshot::load_for_fn_driver(&pool, "1234567890", "maria304")
         .await
         .expect_err("non-round-trip rate must surface");
-    assert!(matches!(err, LoadSnapshotError::SnapshotBuild { .. }),
-        "expected SnapshotBuild, got {err:?}");
+    assert!(
+        matches!(err, LoadSnapshotError::SnapshotBuild { .. }),
+        "expected SnapshotBuild, got {err:?}"
+    );
 }

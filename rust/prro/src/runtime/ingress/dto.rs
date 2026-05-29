@@ -23,9 +23,9 @@
 //!     type_code } }`        — for SELL / RETURN.
 //!   - `ZReportJson { payments[]: { name, sum_in_kop, sum_out_kop,
 //!     type_code }, sell_count, return_count }`
-//!                            — for SHIFT_CLOSE / Z_REPORT.
+//!     — for SHIFT_CLOSE / Z_REPORT.
 //!   - `ShiftOpenJson { opening_sum_kop }`
-//!                            — for SHIFT_OPEN.
+//!     — for SHIFT_OPEN.
 //!
 //! The W3 DTO emits `payload.goods[].price_kopecks /
 //! quantity_milli / tax_group_1 / ...` + `payments[].type:
@@ -259,7 +259,9 @@ pub fn to_canonical_fiscal_command(
         CommandType::ServiceOut => DocType::ServiceOut,
         CommandType::CashWithdrawal => DocType::CashWithdrawal,
         CommandType::PeriodicReport => {
-            return Err(MappingError::UnsupportedCommandType(CommandType::PeriodicReport));
+            return Err(MappingError::UnsupportedCommandType(
+                CommandType::PeriodicReport,
+            ));
         }
     };
 
@@ -280,9 +282,7 @@ pub fn to_canonical_fiscal_command(
     let total_sum_kop = match cmd.command_type {
         CommandType::Sell => Some(cmd.payload.totals.sale_kopecks as i64),
         CommandType::Return => Some(cmd.payload.totals.return_kopecks as i64),
-        CommandType::ServiceIn
-        | CommandType::ServiceOut
-        | CommandType::CashWithdrawal => None, // M5: parse from raw_frames
+        CommandType::ServiceIn | CommandType::ServiceOut | CommandType::CashWithdrawal => None, // M5: parse from raw_frames
         CommandType::ShiftOpen
         | CommandType::ShiftClose
         | CommandType::XReport
@@ -339,11 +339,7 @@ pub fn to_canonical_fiscal_command(
     //                                failure surface to the signer
     //                                (where the precise context is
     //                                gone).  Drop the filter.
-    let signed_by_cashier_id = cmd
-        .cashier_id
-        .as_deref()
-        .map(CashierId::new)
-        .transpose()?;
+    let signed_by_cashier_id = cmd.cashier_id.as_deref().map(CashierId::new).transpose()?;
 
     Ok(CanonicalFiscalCommand {
         doc_type,
@@ -359,8 +355,8 @@ pub fn to_canonical_fiscal_command(
 /// W4-Z0 piece 9 — listener-stamped variant.  Validates wire
 /// `fiscal_number` matches the listener's configured FN, then maps
 /// + stamps the driver_id into the canonical command.  Listener
-/// catches the cross-FN typo at the source instead of letting the
-/// boot-time reconcile audit catch it hours later.
+///   catches the cross-FN typo at the source instead of letting the
+///   boot-time reconcile audit catch it hours later.
 pub fn to_canonical_fiscal_command_with_context(
     cmd: &CanonicalCommand,
     listener_driver_id: crate::db::models::ids::DriverId,

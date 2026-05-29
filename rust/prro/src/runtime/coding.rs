@@ -71,6 +71,8 @@ impl Coding {
         if obfuscated.is_empty() {
             return Err(CodingError::EmptyInput);
         }
-        Ok(Zeroizing::new(obfuscated.iter().map(|b| b ^ MASK).collect()))
+        Ok(Zeroizing::new(
+            obfuscated.iter().map(|b| b ^ MASK).collect(),
+        ))
     }
 }

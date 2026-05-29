@@ -58,16 +58,10 @@ async fn migration_020_creates_operators_table_with_expected_columns() {
     }
 
     // is_active has a default (1)
-    assert!(
-        cols["is_active"].1,
-        "is_active must have DEFAULT value"
-    );
+    assert!(cols["is_active"].1, "is_active must have DEFAULT value");
 
     // created_at has a default (CURRENT_TIMESTAMP)
-    assert!(
-        cols["created_at"].1,
-        "created_at must have DEFAULT value"
-    );
+    assert!(cols["created_at"].1, "created_at must have DEFAULT value");
 }
 
 #[tokio::test]
@@ -113,12 +107,10 @@ async fn migration_020_creates_partial_active_unique_index() {
 async fn migration_020_recorded_with_version_20_in_sqlx_migrations() {
     let (_dir, pool) = fresh_secure_pool().await;
 
-    let version: i64 = sqlx::query(
-        "SELECT version FROM _sqlx_migrations WHERE version = 20",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("migration 020 row")
-    .get(0);
+    let version: i64 = sqlx::query("SELECT version FROM _sqlx_migrations WHERE version = 20")
+        .fetch_one(&pool)
+        .await
+        .expect("migration 020 row")
+        .get(0);
     assert_eq!(version, 20);
 }

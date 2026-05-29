@@ -19,8 +19,8 @@
 
 use prro::xml::{
     build_canonical_xml, AdjustmentMode, CalcTaxError, CanonicalDoc, CheckItem,
-    CheckLevelAdjustment, CheckLevelAdjustmentKind, CheckPayload, CheckPayment,
-    DocumentHeader, LineAdjustment, LineAdjustmentKind,
+    CheckLevelAdjustment, CheckLevelAdjustmentKind, CheckPayload, CheckPayment, DocumentHeader,
+    LineAdjustment, LineAdjustmentKind,
 };
 
 fn header() -> DocumentHeader {
@@ -57,8 +57,7 @@ fn calc_tax_txpr_minus_100_yields_typed_error_not_panic() {
     // Round-2 guard only checks input finite-ness; -100.0 is finite.
     // Intermediate 100+(-100) = 0 → divide-by-zero → Inf.  Must
     // surface as typed error.
-    let err = calc_tax(10000, -100.0, 0.0, 0)
-        .expect_err("txpr=-100 must error, not panic");
+    let err = calc_tax(10000, -100.0, 0.0, 0).expect_err("txpr=-100 must error, not panic");
     assert!(matches!(err, CalcTaxError::InvalidRate { .. }));
 }
 
@@ -67,8 +66,7 @@ fn calc_tax_dtpr_minus_100_for_txal_2_yields_typed_error() {
     use prro::xml::calc_tax;
     // TXAL=2 formula uses (100.0 + dtpr).  dtpr=-100 → 0 →
     // intermediate Inf.
-    let err = calc_tax(10000, 20.0, -100.0, 2)
-        .expect_err("dtpr=-100 with TXAL=2 must error");
+    let err = calc_tax(10000, 20.0, -100.0, 2).expect_err("dtpr=-100 with TXAL=2 must error");
     assert!(matches!(err, CalcTaxError::InvalidRate { .. }));
 }
 
@@ -108,17 +106,21 @@ fn per_item_zero_sum_adjustment_is_skipped_no_counter_advance() {
                 adjustments: vec![
                     LineAdjustment {
                         kind: LineAdjustmentKind::Discount,
-                        sum: 0,  // zero — must be skipped per Python
+                        sum: 0, // zero — must be skipped per Python
                         mode: AdjustmentMode::Value,
-                        percent: None, name: None,
-                        privilege: None, tax_code: None,
+                        percent: None,
+                        name: None,
+                        privilege: None,
+                        tax_code: None,
                     },
                     LineAdjustment {
                         kind: LineAdjustmentKind::Discount,
                         sum: 50,
                         mode: AdjustmentMode::Value,
-                        percent: None, name: None,
-                        privilege: None, tax_code: None,
+                        percent: None,
+                        name: None,
+                        privilege: None,
+                        tax_code: None,
                     },
                 ],
                 ..item("ART-1", 1000)
@@ -126,7 +128,9 @@ fn per_item_zero_sum_adjustment_is_skipped_no_counter_advance() {
             item("ART-2", 2000),
         ],
         payments: vec![CheckPayment {
-            name: "CASH".into(), sum: 2950, type_code: "0".into(),
+            name: "CASH".into(),
+            sum: 2950,
+            type_code: "0".into(),
             ..Default::default()
         }],
         total_sum: 2950,
@@ -134,14 +138,21 @@ fn per_item_zero_sum_adjustment_is_skipped_no_counter_advance() {
     };
     let xml = build_sell_xml(payload);
     // Sanity: only ONE <D> emitted (zero-sum filtered).
-    assert_eq!(xml.matches("<D ").count(), 1,
-        "exactly one D emitted (zero filtered): {xml}");
+    assert_eq!(
+        xml.matches("<D ").count(),
+        1,
+        "exactly one D emitted (zero filtered): {xml}"
+    );
     // No <D SM="0"> in wire.
-    assert!(!xml.contains(r#"SM="0""#) || !xml.contains("<D"),
-        "no <D SM=0> emitted: {xml}");
+    assert!(
+        !xml.contains(r#"SM="0""#) || !xml.contains("<D"),
+        "no <D SM=0> emitted: {xml}"
+    );
     // Counter integrity: P2 at N=3 (NOT N=4 — zero did not consume).
-    assert!(xml.contains(r#"<P C="ART-2" N="3""#),
-        "ART-2 at N=3 (zero adj skipped): {xml}");
+    assert!(
+        xml.contains(r#"<P C="ART-2" N="3""#),
+        "ART-2 at N=3 (zero adj skipped): {xml}"
+    );
     // M at N=4.
     assert!(xml.contains(r#"<M N="4""#), "M at N=4: {xml}");
 }
@@ -154,28 +165,33 @@ fn check_level_zero_sum_adjustment_is_skipped_no_counter_advance() {
         local_number: 1,
         items: vec![item("ART-1", 1000)],
         payments: vec![CheckPayment {
-            name: "CASH".into(), sum: 1000, type_code: "0".into(),
+            name: "CASH".into(),
+            sum: 1000,
+            type_code: "0".into(),
             ..Default::default()
         }],
         total_sum: 1000,
-        check_level_adjustments: vec![
-            CheckLevelAdjustment {
-                kind: CheckLevelAdjustmentKind::Discount,
-                sum: 0,  // zero → skip
-                mode: AdjustmentMode::Value,
-                percent: None, name: None,
-                applies_to_item_ns: vec![],
-            },
-        ],
+        check_level_adjustments: vec![CheckLevelAdjustment {
+            kind: CheckLevelAdjustmentKind::Discount,
+            sum: 0, // zero → skip
+            mode: AdjustmentMode::Value,
+            percent: None,
+            name: None,
+            applies_to_item_ns: vec![],
+        }],
         ..Default::default()
     };
     let xml = build_sell_xml(payload);
     // No <D> emitted.
-    assert!(!xml.contains("<D "),
-        "zero check-level D must be skipped: {xml}");
+    assert!(
+        !xml.contains("<D "),
+        "zero check-level D must be skipped: {xml}"
+    );
     // M at N=2 (NOT N=3).
-    assert!(xml.contains(r#"<M N="2""#),
-        "M at N=2 (zero check-level did not consume): {xml}");
+    assert!(
+        xml.contains(r#"<M N="2""#),
+        "M at N=2 (zero check-level did not consume): {xml}"
+    );
 }
 
 // ─── AUDIT3-IMP-1 (B) MODIFIED: auto-track p_item_numbers ─────────
@@ -199,25 +215,29 @@ fn check_level_adjustment_empty_applies_auto_fills_all_p_item_numbers() {
             item("ART-3", 3000),
         ],
         payments: vec![CheckPayment {
-            name: "CASH".into(), sum: 5900, type_code: "0".into(),
+            name: "CASH".into(),
+            sum: 5900,
+            type_code: "0".into(),
             ..Default::default()
         }],
         total_sum: 5900,
-        check_level_adjustments: vec![
-            CheckLevelAdjustment {
-                kind: CheckLevelAdjustmentKind::Discount,
-                sum: 100,
-                mode: AdjustmentMode::Value,
-                percent: None, name: None,
-                applies_to_item_ns: vec![],  // empty → auto-fill ALL
-            },
-        ],
+        check_level_adjustments: vec![CheckLevelAdjustment {
+            kind: CheckLevelAdjustmentKind::Discount,
+            sum: 100,
+            mode: AdjustmentMode::Value,
+            percent: None,
+            name: None,
+            applies_to_item_ns: vec![], // empty → auto-fill ALL
+        }],
         ..Default::default()
     };
     let xml = build_sell_xml(payload);
     // 3 items → 3 <NI> children inside check-level <D>.
-    assert_eq!(xml.matches("<NI ").count(), 3,
-        "3 NI children auto-filled from p_item_numbers: {xml}");
+    assert_eq!(
+        xml.matches("<NI ").count(),
+        3,
+        "3 NI children auto-filled from p_item_numbers: {xml}"
+    );
     // NI values must be 1, 2, 3 (items' N values).
     assert!(xml.contains(r#"<NI NI="1""#));
     assert!(xml.contains(r#"<NI NI="2""#));
@@ -236,26 +256,32 @@ fn check_level_adjustment_subset_applies_uses_caller_values() {
             item("ART-3", 3000),
         ],
         payments: vec![CheckPayment {
-            name: "CASH".into(), sum: 5900, type_code: "0".into(),
+            name: "CASH".into(),
+            sum: 5900,
+            type_code: "0".into(),
             ..Default::default()
         }],
         total_sum: 5900,
-        check_level_adjustments: vec![
-            CheckLevelAdjustment {
-                kind: CheckLevelAdjustmentKind::Discount,
-                sum: 100,
-                mode: AdjustmentMode::Value,
-                percent: None, name: None,
-                applies_to_item_ns: vec![1, 3],  // POS subset
-            },
-        ],
+        check_level_adjustments: vec![CheckLevelAdjustment {
+            kind: CheckLevelAdjustmentKind::Discount,
+            sum: 100,
+            mode: AdjustmentMode::Value,
+            percent: None,
+            name: None,
+            applies_to_item_ns: vec![1, 3], // POS subset
+        }],
         ..Default::default()
     };
     let xml = build_sell_xml(payload);
-    assert_eq!(xml.matches("<NI ").count(), 2,
-        "2 NI children from caller subset: {xml}");
+    assert_eq!(
+        xml.matches("<NI ").count(),
+        2,
+        "2 NI children from caller subset: {xml}"
+    );
     assert!(xml.contains(r#"<NI NI="1""#));
     assert!(xml.contains(r#"<NI NI="3""#));
-    assert!(!xml.contains(r#"<NI NI="2""#),
-        "NI=2 NOT emitted (not in subset): {xml}");
+    assert!(
+        !xml.contains(r#"<NI NI="2""#),
+        "NI=2 NOT emitted (not in subset): {xml}"
+    );
 }

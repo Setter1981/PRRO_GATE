@@ -1,2 +1,9 @@
 [toolchain]
 channel = "1.94.1"
+# Pin the components/targets to the SAME toolchain CI actually builds under.
+# CI installs them via `dtolnay/rust-toolchain@stable`, but every `cargo`
+# invocation under `rust/` is overridden to 1.94.1 by this file — so rustfmt,
+# clippy and the musl std must be present for 1.94.1, not just for stable,
+# or the `fmt + clippy` and `*-musl` CI jobs fail before doing any work.
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-musl"]

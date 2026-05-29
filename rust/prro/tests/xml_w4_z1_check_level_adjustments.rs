@@ -78,8 +78,10 @@ fn check_level_value_discount_emits_d_tr_1_with_ni_children() {
     let d_open = xml.find("<D ").unwrap();
     let d_close = xml.find("</D>").unwrap();
     let ni_pos = xml.find(r#"<NI NI="1""#).unwrap();
-    assert!(d_open < ni_pos && ni_pos < d_close,
-        "NI must be a child of D, not a sibling: {xml}");
+    assert!(
+        d_open < ni_pos && ni_pos < d_close,
+        "NI must be a child of D, not a sibling: {xml}"
+    );
 }
 
 #[test]

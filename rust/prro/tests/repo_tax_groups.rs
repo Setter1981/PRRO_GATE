@@ -63,9 +63,7 @@ async fn insert_and_find_by_tx_num_roundtrip() {
 #[tokio::test]
 async fn find_missing_returns_none() {
     let (_dir, pool) = fresh_secure_pool().await;
-    let result = repo::find(&pool, "4000000099", 1)
-        .await
-        .expect("query");
+    let result = repo::find(&pool, "4000000099", 1).await.expect("query");
     assert!(result.is_none());
 }
 
@@ -212,18 +210,30 @@ async fn update_rates_on_missing_row_returns_not_found() {
 async fn list_active_for_fn_returns_only_active_rows() {
     let (_dir, pool) = fresh_secure_pool().await;
 
-    repo::insert(&pool, &sample("4000000001", 1, "А")).await.unwrap();
-    repo::insert(&pool, &sample("4000000001", 2, "Б")).await.unwrap();
-    repo::insert(&pool, &sample("4000000001", 3, "В")).await.unwrap();
+    repo::insert(&pool, &sample("4000000001", 1, "А"))
+        .await
+        .unwrap();
+    repo::insert(&pool, &sample("4000000001", 2, "Б"))
+        .await
+        .unwrap();
+    repo::insert(&pool, &sample("4000000001", 3, "В"))
+        .await
+        .unwrap();
     repo::soft_delete(&pool, "4000000001", 2).await.unwrap();
 
     // Other FN noise — must not appear
-    repo::insert(&pool, &sample("4000000099", 1, "А")).await.unwrap();
+    repo::insert(&pool, &sample("4000000099", 1, "А"))
+        .await
+        .unwrap();
 
     let rows = repo::list_active_for_fn(&pool, "4000000001")
         .await
         .expect("list query");
-    assert_eq!(rows.len(), 2, "soft-deleted row excluded, other FN excluded");
+    assert_eq!(
+        rows.len(),
+        2,
+        "soft-deleted row excluded, other FN excluded"
+    );
     let tx_nums: Vec<i64> = rows.iter().map(|r| r.tx_num).collect();
     assert!(tx_nums.contains(&1));
     assert!(tx_nums.contains(&3));

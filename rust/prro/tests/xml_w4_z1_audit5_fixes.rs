@@ -24,9 +24,7 @@
 
 use std::collections::HashMap;
 
-use prro::services::write_path::tax_summary::{
-    derive_check_tax_summaries, ResolvedTaxGroup,
-};
+use prro::services::write_path::tax_summary::{derive_check_tax_summaries, ResolvedTaxGroup};
 use prro::xml::{CalcTaxError, CheckItem};
 
 // ─── AUDIT5-IMP-1+3 (A) / IMP-1 (B): checked_add ──────────────────
@@ -60,12 +58,19 @@ fn aggregation_overflow_returns_typed_error_not_panic() {
     let mut groups = HashMap::new();
     groups.insert(
         1_i64,
-        ResolvedTaxGroup { tx: 1, txpr: 20.0, dtpr: 0.0, txal: 0, txty: 0 },
+        ResolvedTaxGroup {
+            tx: 1,
+            txpr: 20.0,
+            dtpr: 0.0,
+            txal: 0,
+            txty: 0,
+        },
     );
-    let err = derive_check_tax_summaries(&items, &groups)
-        .expect_err("must fail-loud on overflow");
-    assert!(matches!(err, CalcTaxError::AggregationOverflow { .. }),
-        "expected AggregationOverflow, got {err:?}");
+    let err = derive_check_tax_summaries(&items, &groups).expect_err("must fail-loud on overflow");
+    assert!(
+        matches!(err, CalcTaxError::AggregationOverflow { .. }),
+        "expected AggregationOverflow, got {err:?}"
+    );
 }
 
 // ─── AUDIT5-IMP-3 (B): renamed helper ─────────────────────────────
@@ -77,25 +82,31 @@ fn renamed_helper_has_check_semantics_skip_on_unknown() {
     // Setup: map has ONE entry (1) but items reference 99 — guard
     // doesn't trip (map non-empty), Python parity skip-on-miss
     // applies.
-    let items = vec![
-        CheckItem {
-            code: "ART-1".into(),
-            name: "Test".into(),
-            price: 1000,
-            quantity: 1000,
-            sum: 1000,
-            tax_group_1: Some(99), // unknown
-            ..Default::default()
-        },
-    ];
+    let items = vec![CheckItem {
+        code: "ART-1".into(),
+        name: "Test".into(),
+        price: 1000,
+        quantity: 1000,
+        sum: 1000,
+        tax_group_1: Some(99), // unknown
+        ..Default::default()
+    }];
     let mut groups = HashMap::new();
     groups.insert(
         1_i64,
-        ResolvedTaxGroup { tx: 1, txpr: 20.0, dtpr: 0.0, txal: 0, txty: 0 },
+        ResolvedTaxGroup {
+            tx: 1,
+            txpr: 20.0,
+            dtpr: 0.0,
+            txal: 0,
+            txty: 0,
+        },
     );
     let summaries = derive_check_tax_summaries(&items, &groups).expect("ok");
-    assert!(summaries.is_empty(),
-        "check-level helper SKIPS on unknown; Z-report short-form is a separate path");
+    assert!(
+        summaries.is_empty(),
+        "check-level helper SKIPS on unknown; Z-report short-form is a separate path"
+    );
 }
 
 // ─── AUDIT5-CRIT-1: live stage_sign fail-closed guard ─────────────
@@ -132,8 +143,10 @@ fn fail_closed_when_items_carry_tax_group_but_map_is_empty() {
     let groups = HashMap::new(); // empty stub (live stage_sign state)
     let err = derive_check_tax_summaries(&items, &groups)
         .expect_err("must fail-closed when tax map is empty but items carry groups");
-    assert!(matches!(err, CalcTaxError::TaxMappingNotWired { .. }),
-        "expected TaxMappingNotWired, got {err:?}");
+    assert!(
+        matches!(err, CalcTaxError::TaxMappingNotWired { .. }),
+        "expected TaxMappingNotWired, got {err:?}"
+    );
 }
 
 // ─── AUDIT5-CRIT-2: Z-report aggregation gap-doc test ─────────────
@@ -181,7 +194,6 @@ fn empty_map_with_no_tax_grouped_items_succeeds_back_compat() {
         tax_group_1: None,
         ..Default::default()
     }];
-    let summaries =
-        derive_check_tax_summaries(&items, &HashMap::new()).expect("back-compat path");
+    let summaries = derive_check_tax_summaries(&items, &HashMap::new()).expect("back-compat path");
     assert!(summaries.is_empty());
 }

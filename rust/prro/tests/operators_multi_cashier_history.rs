@@ -60,11 +60,12 @@ async fn historical_then_active_for_same_fn_both_succeed() {
         .await
         .expect("current is_active=1 row inserts despite historical present");
 
-    let total: i64 = sqlx::query("SELECT COUNT(*) FROM operators WHERE fiscal_number = '4000000001'")
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .get(0);
+    let total: i64 =
+        sqlx::query("SELECT COUNT(*) FROM operators WHERE fiscal_number = '4000000001'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get(0);
     assert_eq!(total, 2, "both rows must persist");
 
     let active: i64 = sqlx::query(

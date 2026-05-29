@@ -76,13 +76,11 @@ pub async fn delete_flag(
     fn_id: &str,
     flag_name: &str,
 ) -> Result<(), FnIntegrationFlagsRepoError> {
-    let result = sqlx::query(
-        "DELETE FROM fn_integration_flags WHERE fn = ? AND flag_name = ?",
-    )
-    .bind(fn_id)
-    .bind(flag_name)
-    .execute(pool)
-    .await?;
+    let result = sqlx::query("DELETE FROM fn_integration_flags WHERE fn = ? AND flag_name = ?")
+        .bind(fn_id)
+        .bind(flag_name)
+        .execute(pool)
+        .await?;
 
     if result.rows_affected() == 0 {
         return Err(FnIntegrationFlagsRepoError::NotFound {

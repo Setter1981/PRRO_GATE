@@ -48,9 +48,7 @@ async fn insert_and_find_roundtrip() {
 #[tokio::test]
 async fn find_missing_returns_none() {
     let (_dir, pool) = fresh_secure_pool().await;
-    let result = repo::find(&pool, "4000000099", 1)
-        .await
-        .expect("query");
+    let result = repo::find(&pool, "4000000099", 1).await.expect("query");
     assert!(result.is_none());
 }
 

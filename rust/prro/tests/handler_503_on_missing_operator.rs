@@ -38,9 +38,7 @@ use prro::admin::AdminError;
 use prro::config::AppConfig;
 use prro::db::models::enums::{FiscalMode, Severity};
 use prro::db::repositories::{audit_log, fiscal_number_config as fn_cfg};
-use prro::runtime::bindings::{
-    BindingsRegistry, KeyLoadFailure, OperatorKeyLoader,
-};
+use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
 use std::path::Path;
@@ -107,17 +105,12 @@ listen  = "127.0.0.1:8443"
     .await
     .expect("seed FN config");
 
-    let dps: Arc<dyn DpsChannel> =
-        Arc::new(common::StubDpsChannel::new(Ok(common::ack("ack"))));
+    let dps: Arc<dyn DpsChannel> = Arc::new(common::StubDpsChannel::new(Ok(common::ack("ack"))));
 
-    let registry = BindingsRegistry::build_from_db(
-        app.db_secure(),
-        app.db(),
-        dps,
-        &UnreachableLoader,
-    )
-    .await
-    .expect("build_from_db must not abort on empty operators");
+    let registry =
+        BindingsRegistry::build_from_db(app.db_secure(), app.db(), dps, &UnreachableLoader)
+            .await
+            .expect("build_from_db must not abort on empty operators");
 
     // Contract #5 — registry.get(fn) returns None.
     assert!(

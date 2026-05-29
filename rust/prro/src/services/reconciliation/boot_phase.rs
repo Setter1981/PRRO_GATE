@@ -2444,30 +2444,30 @@ async fn dispatch_prepared_via_chain(
     // None branch covers pre-W4-Z2a docs (FK NULL — migration window
     // back-compat); these docs by construction don't carry tax_group_1
     // items, so empty map = unchanged behaviour.
-    let (tax_resolution_snapshot, tax_resolution_snapshot_id) =
-        match doc.signing_config_snapshot_id {
-            Some(id) => match signing_config_snapshots::get_by_id(pool, id).await {
-                Ok(s) => (Some(s), Some(id)),
-                Err(e) => {
-                    // Snapshot ledger drift / corruption / orphan FK —
-                    // catastrophic.  Surface via emit_dispatch_error
-                    // (same forensic class as the pre-existing recovery
-                    // errors above) and bail; doc stays in PREPARED for
-                    // operator inspection.  Audit log carries the typed
-                    // SigningConfigSnapshotsRepoError chain.
-                    emit_dispatch_error(
-                        pool,
-                        doc_id,
-                        "c-prepared-snapshot-reload",
-                        &anyhow::Error::new(e),
-                        histogram,
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            },
-            None => (None, None),
-        };
+    let (tax_resolution_snapshot, tax_resolution_snapshot_id) = match doc.signing_config_snapshot_id
+    {
+        Some(id) => match signing_config_snapshots::get_by_id(pool, id).await {
+            Ok(s) => (Some(s), Some(id)),
+            Err(e) => {
+                // Snapshot ledger drift / corruption / orphan FK —
+                // catastrophic.  Surface via emit_dispatch_error
+                // (same forensic class as the pre-existing recovery
+                // errors above) and bail; doc stays in PREPARED for
+                // operator inspection.  Audit log carries the typed
+                // SigningConfigSnapshotsRepoError chain.
+                emit_dispatch_error(
+                    pool,
+                    doc_id,
+                    "c-prepared-snapshot-reload",
+                    &anyhow::Error::new(e),
+                    histogram,
+                )
+                .await?;
+                return Ok(());
+            }
+        },
+        None => (None, None),
+    };
 
     let worker_ctx = WorkerContext {
         inbox,

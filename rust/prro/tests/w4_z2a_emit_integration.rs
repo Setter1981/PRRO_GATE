@@ -19,8 +19,8 @@
 //!     the SAME downstream pipeline the goldens lock at byte level.
 //!   - Round-trip through `signing_config_snapshots::insert_or_get_id_tx`
 //!     + `get_by_id` (sha256-verified) + `to_calc_map()` preserves the
-//!     map identically.  Proves the persistence layer doesn't drift the
-//!     resolved values.
+//!       map identically.  Proves the persistence layer doesn't drift the
+//!       resolved values.
 //!   - NULL-FK / pre-W4-Z2a back-compat: `None.as_ref().map(to_calc_map)
 //!     .unwrap_or_default()` produces an EMPTY map — back-compat semantic
 //!     locked by piece 8c / piece 9.
@@ -397,12 +397,30 @@ fn sample_header() -> DocumentHeader {
 fn snapshot_with_dual_mapping() -> TaxResolutionSnapshot {
     TaxResolutionSnapshot::with_driver_mapping(
         vec![
-            ResolvedTaxGroupBps { tx: 1, txpr_bps: 2000, dtpr_bps: 0, txal: 0, txty: 0 },
-            ResolvedTaxGroupBps { tx: 2, txpr_bps: 700, dtpr_bps: 0, txal: 0, txty: 0 },
+            ResolvedTaxGroupBps {
+                tx: 1,
+                txpr_bps: 2000,
+                dtpr_bps: 0,
+                txal: 0,
+                txty: 0,
+            },
+            ResolvedTaxGroupBps {
+                tx: 2,
+                txpr_bps: 700,
+                dtpr_bps: 0,
+                txal: 0,
+                txty: 0,
+            },
         ],
         vec![
-            DriverNumberMapping { driver_number: 5, canonical_tx_num: 1 },
-            DriverNumberMapping { driver_number: 7, canonical_tx_num: 2 },
+            DriverNumberMapping {
+                driver_number: 5,
+                canonical_tx_num: 1,
+            },
+            DriverNumberMapping {
+                driver_number: 7,
+                canonical_tx_num: 2,
+            },
         ],
     )
 }
@@ -420,14 +438,9 @@ fn snapshot_with_dual_mapping() -> TaxResolutionSnapshot {
 fn check_payload_from_translates_both_tax_group_1_and_tax_group_2_to_canonical() {
     let snapshot = snapshot_with_dual_mapping();
     let body_json = sell_payload_json(Some(5), Some(7));
-    let result = check_payload_from_json_for_testing(
-        sample_header(),
-        99,
-        &body_json,
-        6000,
-        Some(&snapshot),
-    )
-    .expect("check_payload_from succeeds for both-fields-translated case");
+    let result =
+        check_payload_from_json_for_testing(sample_header(), 99, &body_json, 6000, Some(&snapshot))
+            .expect("check_payload_from succeeds for both-fields-translated case");
 
     assert_eq!(
         result.items.len(),
@@ -462,7 +475,11 @@ fn check_payload_from_translates_both_tax_group_1_and_tax_group_2_to_canonical()
 fn check_payload_from_field_aware_miss_surfaces_tax_group_2_discriminator() {
     let snapshot = TaxResolutionSnapshot::with_driver_mapping(
         vec![ResolvedTaxGroupBps {
-            tx: 1, txpr_bps: 2000, dtpr_bps: 0, txal: 0, txty: 0,
+            tx: 1,
+            txpr_bps: 2000,
+            dtpr_bps: 0,
+            txal: 0,
+            txty: 0,
         }],
         vec![DriverNumberMapping {
             driver_number: 5,
@@ -470,14 +487,9 @@ fn check_payload_from_field_aware_miss_surfaces_tax_group_2_discriminator() {
         }],
     );
     let body_json = sell_payload_json(Some(5), Some(99));
-    let err = check_payload_from_json_for_testing(
-        sample_header(),
-        99,
-        &body_json,
-        6000,
-        Some(&snapshot),
-    )
-    .expect_err("driver_number=99 not in mapping MUST fail-loud");
+    let err =
+        check_payload_from_json_for_testing(sample_header(), 99, &body_json, 6000, Some(&snapshot))
+            .expect_err("driver_number=99 not in mapping MUST fail-loud");
 
     match err {
         SignError::TaxSummary(CalcTaxError::DriverMappingMiss {
@@ -526,10 +538,8 @@ async fn insert_or_get_id_is_idempotent_under_same_payload() {
     let s1 = snapshot.clone();
     let id1 = with_immediate(&pool, move |tx| {
         Box::pin(async move {
-            let id = signing_config_snapshots::insert_or_get_id_tx(
-                tx, FN, "driver-77", &s1,
-            )
-            .await?;
+            let id =
+                signing_config_snapshots::insert_or_get_id_tx(tx, FN, "driver-77", &s1).await?;
             Ok::<i64, anyhow::Error>(id)
         })
     })
@@ -539,10 +549,8 @@ async fn insert_or_get_id_is_idempotent_under_same_payload() {
     let s2 = snapshot.clone();
     let id2 = with_immediate(&pool, move |tx| {
         Box::pin(async move {
-            let id = signing_config_snapshots::insert_or_get_id_tx(
-                tx, FN, "driver-77", &s2,
-            )
-            .await?;
+            let id =
+                signing_config_snapshots::insert_or_get_id_tx(tx, FN, "driver-77", &s2).await?;
             Ok::<i64, anyhow::Error>(id)
         })
     })
