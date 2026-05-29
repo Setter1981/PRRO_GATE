@@ -313,6 +313,43 @@ pub fn sign_detached_with_content_digest(
     assemble_signed_data(profile, cert_der, &attrs_der, &signature_value)
 }
 
+/// Attached counterpart of [`sign_detached_with_content_digest`].
+///
+/// Produces a CMS `SignedData` with **byte-identical signed-attributes and
+/// signature value** to the detached form — the signature is computed over
+/// the signed-attributes, whose `message-digest` is `H(content)` in both
+/// cases — but EMBEDS `content` as `encapContentInfo.eContent` (attached /
+/// enveloping encapsulation).
+///
+/// This is the form the Ukrainian DPS `sendChkV2` gRPC endpoint requires:
+/// the `Check.check_sign` field is the ONLY document carrier on the wire,
+/// so the receipt XML must travel INSIDE the CMS.  Confirmed against the
+/// proven-accepted WebCheck client (`CtxSignFile(.., external: false,
+/// appendCert: true)` = attached + embedded cert).
+///
+/// `content` MUST be the exact bytes whose digest is `content_digest`
+/// (the caller computes the digest once and passes both, so the embedded
+/// eContent and the `message-digest` attribute cannot drift apart).
+pub fn sign_attached_with_content_digest(
+    profile: CmsProfile,
+    cert_der: &[u8],
+    content: &[u8],
+    content_digest: &[u8],
+    signer: &dyn RawSigner,
+) -> Result<Vec<u8>, CmsError> {
+    let attrs = build_signed_attrs(profile, content_digest, cert_der)?;
+    let attrs_der = attrs.to_der_set_of()?;
+    let signed_attrs_digest = compute_digest(profile, &attrs_der)?;
+    let signature_value = signer.sign_digest(&signed_attrs_digest)?;
+    assemble_signed_data_with_opts(
+        profile,
+        cert_der,
+        &attrs_der,
+        &signature_value,
+        Some(content),
+    )
+}
+
 // ─── Hash dispatch ──────────────────────────────────────────────────────────
 
 /// Compute the digest matching the profile's hash algorithm.

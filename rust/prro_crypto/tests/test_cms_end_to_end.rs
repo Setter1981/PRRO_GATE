@@ -143,3 +143,75 @@ fn test_cms_round_trip_via_x509_parser() {
         result.cms_der.len()
     );
 }
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// W4-Z3 attached-CMS proof: `sign_attached_with_content_digest` embeds the
+/// content as `eContent` (the form DPS `sendChkV2` requires — the gateway's
+/// `InProcessProvider` now drives this), whereas the detached form does NOT
+/// carry the content.  Signed-attributes + signature value are identical
+/// between the two (same `content_digest`); only `eContent` is added.
+#[test]
+fn test_attached_embeds_econtent_detached_does_not() {
+    let (cert_der, key_d_bytes) = match load_signing_material() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: production JKS not available");
+            return;
+        }
+    };
+    let curve = prro_crypto::Curve::dstu_pb_257();
+    let d = bytes_le_to_field(&key_d_bytes, curve.mod_words);
+    let signer = DstuInProcessSigner::new(d);
+
+    // Distinctive content so we can byte-search for it in the CMS DER.
+    let content = b"<RQ V=\"1\">PRRO-W4Z3-ATTACHED-ECONTENT-PROOF</RQ>";
+    let profile = CmsProfile::default(); // Dstu4145WithGost34311Pb
+    let content_digest = prro_crypto::core::hash::gost_34_311_95(content).to_vec();
+
+    let detached = prro_crypto::cms::sign_detached_with_content_digest(
+        profile,
+        &cert_der,
+        &content_digest,
+        &signer,
+    )
+    .expect("detached sign failed");
+    let attached = prro_crypto::cms::sign_attached_with_content_digest(
+        profile,
+        &cert_der,
+        content,
+        &content_digest,
+        &signer,
+    )
+    .expect("attached sign failed");
+
+    // Both are well-formed ContentInfo DER (outer SEQUENCE).
+    assert_eq!(detached[0], 0x30, "detached not SEQUENCE");
+    assert_eq!(attached[0], 0x30, "attached not SEQUENCE");
+
+    // ATTACHED embeds the content (eContent); DETACHED does not.
+    assert!(
+        contains_subslice(&attached, content),
+        "attached CMS must embed the content bytes as eContent"
+    );
+    assert!(
+        !contains_subslice(&detached, content),
+        "detached CMS must NOT carry the content bytes"
+    );
+    // Attached exceeds detached by at least the embedded content length.
+    assert!(
+        attached.len() >= detached.len() + content.len(),
+        "attached ({}) must exceed detached ({}) by >= content ({})",
+        attached.len(),
+        detached.len(),
+        content.len()
+    );
+    eprintln!(
+        "✓ attached={} bytes (eContent embedded) vs detached={} bytes; content={} bytes",
+        attached.len(),
+        detached.len(),
+        content.len()
+    );
+}

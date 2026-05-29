@@ -114,15 +114,16 @@ fn sign_cms_blocking(
     session: &SigningSession,
     profile: prro_crypto::cms::profile::CmsProfile,
 ) -> Result<Vec<u8>, CryptoError> {
-    use prro_crypto::cms::builder::sign_detached_with_content_digest;
+    use prro_crypto::cms::builder::sign_attached_with_content_digest;
     use prro_crypto::cms::profile::CmsProfile;
     use prro_crypto::cms::signer::DstuInProcessSigner;
     use prro_crypto::core::curve::Curve;
     use prro_crypto::core::field::FieldEl;
     use prro_crypto::core::hash::{gost_34_311_95, kupyna_256};
 
-    // Build the content digest per profile.  `sign_detached_with_content_digest`
-    // owns signedAttrs hashing — we hand in the message digest.
+    // Build the content digest per profile.  `sign_attached_with_content_digest`
+    // owns signedAttrs hashing — we hand in the message digest AND the content
+    // bytes (the latter are embedded as `eContent`; see the ATTACHED note below).
     // `CmsProfile` is marked `#[non_exhaustive]` upstream; the wildcard
     // arm preserves forward-compat — a future profile we don't recognise
     // returns CurveMismatch (the closest existing reason; the wrapper
@@ -145,10 +146,25 @@ fn sign_cms_blocking(
     let d = FieldEl::from_le_bytes(&session.param_d()[..], curve.mod_words);
     let signer = DstuInProcessSigner::new(d);
 
-    sign_detached_with_content_digest(profile, session.cert_der(), &content_digest, &signer)
-        .map_err(|_| CryptoError::CmsSign {
-            reason: SignKind::BackendError,
-        })
+    // ATTACHED encapsulation: the canonical XML is embedded as the CMS
+    // `eContent`, because the DPS `sendChkV2` gRPC `Check.check_sign` field is
+    // the ONLY document carrier on the wire — a detached signature would reach
+    // DPS without the receipt and be rejected `-1 ERROR_VEREFY`.  Confirmed
+    // against the proven-accepted WebCheck client (`CtxSignFile(.., external:
+    // false, appendCert: true)`).  Signed-attributes + signature value are
+    // byte-identical to the detached form; only `eContent` is added.  (The
+    // `sign_cms_detached` trait-method name is retained to avoid cross-crate
+    // namespace churn; it now produces an ATTACHED CMS.)
+    sign_attached_with_content_digest(
+        profile,
+        session.cert_der(),
+        canonical_xml,
+        &content_digest,
+        &signer,
+    )
+    .map_err(|_| CryptoError::CmsSign {
+        reason: SignKind::BackendError,
+    })
 }
 
 fn verify_blocking(
