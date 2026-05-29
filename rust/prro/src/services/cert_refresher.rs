@@ -177,7 +177,10 @@ mod refresh_clamp_tests {
         assert_eq!(clamp_refresh_within_days(i64::MIN), 0);
         // Huge → capped: avoids the chrono::Duration::days overflow panic.
         assert_eq!(clamp_refresh_within_days(i64::MAX), MAX_REFRESH_WITHIN_DAYS);
-        assert_eq!(clamp_refresh_within_days(1_000_000), MAX_REFRESH_WITHIN_DAYS);
+        assert_eq!(
+            clamp_refresh_within_days(1_000_000),
+            MAX_REFRESH_WITHIN_DAYS
+        );
     }
 }
 
