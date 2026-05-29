@@ -34,9 +34,7 @@
 
 use prro::db::repositories::signing_config_snapshots;
 use prro::db::tx::with_immediate;
-use prro::services::write_path::tax_summary::{
-    ResolvedTaxGroupBps, TaxResolutionSnapshot,
-};
+use prro::services::write_path::tax_summary::{ResolvedTaxGroupBps, TaxResolutionSnapshot};
 
 const FN: &str = "4000000088";
 
@@ -70,16 +68,11 @@ fn snapshot_at_19_percent() -> TaxResolutionSnapshot {
     }])
 }
 
-async fn insert(
-    pool: &sqlx::SqlitePool,
-    snapshot: TaxResolutionSnapshot,
-) -> i64 {
+async fn insert(pool: &sqlx::SqlitePool, snapshot: TaxResolutionSnapshot) -> i64 {
     with_immediate(pool, move |tx| {
         Box::pin(async move {
-            let id = signing_config_snapshots::insert_or_get_id_tx(
-                tx, FN, "driver-88", &snapshot,
-            )
-            .await?;
+            let id = signing_config_snapshots::insert_or_get_id_tx(tx, FN, "driver-88", &snapshot)
+                .await?;
             Ok::<i64, anyhow::Error>(id)
         })
     })

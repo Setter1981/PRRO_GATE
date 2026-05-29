@@ -4,14 +4,13 @@
 //! EVPZ placeholders implement traits with typed Unimplemented errors,
 //! `dispatch_to_outgress` returns ProfileNotImplemented for EVPZ in pilot.
 
-use prro::db::models::ids::DriverId;
 use prro::db::models::enums::DocType;
+use prro::db::models::ids::DriverId;
 use prro::runtime::outgress::{
-    self, BuilderContext, CmsOverCheckSignedFileEnvelope, CmsOverDatEnvelope,
-    DpsResponseParser, DpsTransport, DpsXmlBuilder, EvpzResponseParser, EvpzXmlBuilder,
-    FscoResponseParser, FscoXmlBuilder, GrpcSendChkV2Transport, HttpsRestTransport,
-    OutgressError, OutgressProfile, SignContext, SignEnvelope,
-    TargetEndpoint,
+    self, BuilderContext, CmsOverCheckSignedFileEnvelope, CmsOverDatEnvelope, DpsResponseParser,
+    DpsTransport, DpsXmlBuilder, EvpzResponseParser, EvpzXmlBuilder, FscoResponseParser,
+    FscoXmlBuilder, GrpcSendChkV2Transport, HttpsRestTransport, OutgressError, OutgressProfile,
+    SignContext, SignEnvelope, TargetEndpoint,
 };
 use prro::services::write_path::types::CanonicalFiscalCommand;
 
@@ -162,8 +161,7 @@ async fn dispatch_surfaces_fsco_build_unimplemented_too() {
 
 #[test]
 fn quartet_for_fsco_returns_pilot_impls() {
-    let (builder, envelope, transport, parser) =
-        outgress::quartet_for(OutgressProfile::FscoZzd);
+    let (builder, envelope, transport, parser) = outgress::quartet_for(OutgressProfile::FscoZzd);
     // Pointer equality not possible across Arc<dyn>; we just check
     // they are constructable (compile + Arc::strong_count == 1).
     assert_eq!(std::sync::Arc::strong_count(&builder), 1);
@@ -174,8 +172,7 @@ fn quartet_for_fsco_returns_pilot_impls() {
 
 #[test]
 fn quartet_for_evpz_returns_placeholders() {
-    let (builder, _envelope, _transport, _parser) =
-        outgress::quartet_for(OutgressProfile::EvpzDps);
+    let (builder, _envelope, _transport, _parser) = outgress::quartet_for(OutgressProfile::EvpzDps);
     // Builder is the EVPZ placeholder; calling it returns Unimplemented.
     let result = builder.build_check(&dummy_cmd(), &dummy_builder_context());
     assert!(matches!(

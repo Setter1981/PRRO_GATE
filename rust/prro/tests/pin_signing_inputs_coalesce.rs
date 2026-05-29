@@ -9,12 +9,10 @@
 //!   existing NULL    + caller Some(Y)  → Y        (legacy backfill)
 //!   existing NULL    + caller None     → NULL     (unchanged)
 
-use prro::db::models::ids::{DocumentId, RequestId};
 use prro::db::models::enums::DocType;
+use prro::db::models::ids::{DocumentId, RequestId};
 use prro::db::open_pool;
-use prro::db::repositories::fiscal_documents::{
-    self as fd, NewDocument,
-};
+use prro::db::repositories::fiscal_documents::{self as fd, NewDocument};
 use prro::db::repositories::fiscal_number_config::{self as fn_repo, NewFnConfig};
 use prro::db::tx::with_immediate;
 
@@ -49,10 +47,7 @@ async fn seed_fn(pool: &sqlx::SqlitePool) {
     .unwrap();
 }
 
-async fn seed_doc_with_snapshot(
-    pool: &sqlx::SqlitePool,
-    snapshot_id: Option<i64>,
-) -> DocumentId {
+async fn seed_doc_with_snapshot(pool: &sqlx::SqlitePool, snapshot_id: Option<i64>) -> DocumentId {
     seed_fn(pool).await;
     // First need to ensure a signing_config_snapshots row exists for
     // the FK constraint.  Insert a stub row id=1 if test requests
@@ -119,13 +114,12 @@ async fn fetch_snapshot_id(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> Optio
 async fn pin_with(pool: &sqlx::SqlitePool, doc_id: DocumentId, caller_snapshot: Option<i64>) {
     // Need snapshot row for FK if backfill case (caller_snapshot Some(Y), Y not yet existing).
     if let Some(y) = caller_snapshot {
-        let exists: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM signing_config_snapshots WHERE id = ?",
-        )
-        .bind(y)
-        .fetch_one(pool)
-        .await
-        .unwrap();
+        let exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM signing_config_snapshots WHERE id = ?")
+                .bind(y)
+                .fetch_one(pool)
+                .await
+                .unwrap();
         if exists == 0 {
             sqlx::query(
                 "INSERT INTO signing_config_snapshots \
@@ -143,10 +137,7 @@ async fn pin_with(pool: &sqlx::SqlitePool, doc_id: DocumentId, caller_snapshot: 
     }
     with_immediate(pool, move |tx| {
         Box::pin(async move {
-            let _ = fd::pin_signing_inputs_tx(
-                tx, doc_id, None, None, caller_snapshot,
-            )
-            .await?;
+            let _ = fd::pin_signing_inputs_tx(tx, doc_id, None, None, caller_snapshot).await?;
             Ok::<_, anyhow::Error>(())
         })
     })
@@ -277,10 +268,7 @@ async fn pin_existing_some_caller_some_other_where_guard_rejects_rows_zero() {
 
     let rows_affected = with_immediate(&pool, move |tx| {
         Box::pin(async move {
-            let res = fd::pin_signing_inputs_tx(
-                tx, doc_id, None, None, Some(2),
-            )
-            .await?;
+            let res = fd::pin_signing_inputs_tx(tx, doc_id, None, None, Some(2)).await?;
             Ok::<u64, anyhow::Error>(res)
         })
     })

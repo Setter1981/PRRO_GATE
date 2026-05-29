@@ -7,9 +7,7 @@
 //! Plus list_all + find_by_fiscal_number happy-path coverage.
 
 use prro::db::open_secure_pool;
-use prro::db::repositories::operators::{
-    self as repo, NewOperator, OperatorsRepoError,
-};
+use prro::db::repositories::operators::{self as repo, NewOperator, OperatorsRepoError};
 use sqlx::SqlitePool;
 
 async fn fresh_secure_pool() -> (tempfile::TempDir, SqlitePool) {

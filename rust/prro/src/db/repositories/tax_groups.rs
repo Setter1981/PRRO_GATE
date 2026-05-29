@@ -83,10 +83,7 @@ pub enum TaxGroupsRepoError {
 /// migration 021 DDL.  Returns typed errors for PK and partial-
 /// unique-index violations so callers can render an actionable
 /// message rather than leaking raw sqlite text.
-pub async fn insert(
-    pool: &SqlitePool,
-    new: &NewTaxGroup,
-) -> Result<(), TaxGroupsRepoError> {
+pub async fn insert(pool: &SqlitePool, new: &NewTaxGroup) -> Result<(), TaxGroupsRepoError> {
     let result = sqlx::query(
         "INSERT INTO tax_groups \
             (fn, tx_num, letter, dtpr, txpr, txal, txty) \
@@ -104,7 +101,12 @@ pub async fn insert(
 
     match result {
         Ok(_) => Ok(()),
-        Err(e) => Err(classify_insert_error(e, &new.fn_id, new.tx_num, &new.letter)),
+        Err(e) => Err(classify_insert_error(
+            e,
+            &new.fn_id,
+            new.tx_num,
+            &new.letter,
+        )),
     }
 }
 
@@ -302,4 +304,3 @@ impl From<TaxGroupRowRaw> for TaxGroup {
         }
     }
 }
-

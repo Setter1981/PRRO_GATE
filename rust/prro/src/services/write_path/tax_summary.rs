@@ -224,8 +224,7 @@ impl TaxResolutionSnapshot {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut sorted_groups: Vec<&ResolvedTaxGroupBps> = self.groups.iter().collect();
         sorted_groups.sort_by_key(|g| g.tx);
-        let mut sorted_mapping: Vec<&DriverNumberMapping> =
-            self.driver_mapping.iter().collect();
+        let mut sorted_mapping: Vec<&DriverNumberMapping> = self.driver_mapping.iter().collect();
         sorted_mapping.sort_by_key(|m| m.driver_number);
 
         let mut out = Vec::with_capacity(384);
@@ -340,11 +339,7 @@ fn validate_rate_to_bps(
     // care about, but loose enough for IEEE-754 representation drift.
     const TWO_DP_TOLERANCE: f64 = 1e-9;
     if (scaled - rounded as f64).abs() > TWO_DP_TOLERANCE {
-        return Err(SnapshotBuildError::RateNotRoundTrippable {
-            field,
-            tx,
-            rate,
-        });
+        return Err(SnapshotBuildError::RateNotRoundTrippable { field, tx, rate });
     }
     Ok(rounded)
 }
@@ -453,4 +448,3 @@ pub fn derive_check_tax_summaries(
     }
     Ok(summaries)
 }
-

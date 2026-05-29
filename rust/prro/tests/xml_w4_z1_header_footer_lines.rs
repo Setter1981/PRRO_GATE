@@ -113,17 +113,22 @@ fn empty_and_whitespace_lines_are_skipped_and_do_not_consume_n() {
         vec!["".to_string(), "\t".to_string(), "Footer1".to_string()],
     );
     // Only ONE header L emitted (Header1 at N=1).
-    assert!(xml.contains(r#"<L N="1" NM="Header1""#),
-        "header empties skipped, Header1 at N=1: {xml}");
+    assert!(
+        xml.contains(r#"<L N="1" NM="Header1""#),
+        "header empties skipped, Header1 at N=1: {xml}"
+    );
     // P item gets N=2 (NOT N=4 — empties did not consume slots).
-    assert!(xml.contains(r#"<P C="ART-1" N="2""#),
-        "P item must be N=2 after empty-skip: {xml}");
+    assert!(
+        xml.contains(r#"<P C="ART-1" N="2""#),
+        "P item must be N=2 after empty-skip: {xml}"
+    );
     // M at N=3.
-    assert!(xml.contains(r#"<M N="3""#),
-        "payment at N=3: {xml}");
+    assert!(xml.contains(r#"<M N="3""#), "payment at N=3: {xml}");
     // Footer Footer1 at N=4.
-    assert!(xml.contains(r#"<L N="4" NM="Footer1""#),
-        "footer empties skipped, Footer1 at N=4: {xml}");
+    assert!(
+        xml.contains(r#"<L N="4" NM="Footer1""#),
+        "footer empties skipped, Footer1 at N=4: {xml}"
+    );
     // Sanity: no empty NM="" attribute emitted.
     assert!(!xml.contains(r#"NM="""#), "no empty NM emitted");
     assert!(!xml.contains(r#"NM="  ""#), "no whitespace-only NM emitted");

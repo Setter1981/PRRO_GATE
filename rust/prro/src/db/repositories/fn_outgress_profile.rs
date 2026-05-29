@@ -40,7 +40,9 @@ impl OutgressProfile {
         match s {
             "FSCO_ZZD" => Ok(Self::FscoZzd),
             "EVPZ_DPS" => Ok(Self::EvpzDps),
-            other => Err(FnOutgressProfileRepoError::UnknownProfile(other.to_string())),
+            other => Err(FnOutgressProfileRepoError::UnknownProfile(
+                other.to_string(),
+            )),
         }
     }
 }
@@ -90,12 +92,11 @@ pub async fn get_profile(
     pool: &SqlitePool,
     fn_id: &str,
 ) -> Result<Option<OutgressProfile>, FnOutgressProfileRepoError> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT profile FROM fn_outgress_profile WHERE fn = ? LIMIT 1",
-    )
-    .bind(fn_id)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT profile FROM fn_outgress_profile WHERE fn = ? LIMIT 1")
+            .bind(fn_id)
+            .fetch_optional(pool)
+            .await?;
     match row {
         None => Ok(None),
         Some((s,)) => OutgressProfile::from_str(&s).map(Some),
@@ -121,11 +122,10 @@ pub async fn delete_profile(
 pub async fn list_profiles(
     pool: &SqlitePool,
 ) -> Result<Vec<FnOutgressProfileRow>, FnOutgressProfileRepoError> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT fn, profile, updated_at FROM fn_outgress_profile ORDER BY fn ASC",
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT fn, profile, updated_at FROM fn_outgress_profile ORDER BY fn ASC")
+            .fetch_all(pool)
+            .await?;
 
     rows.into_iter()
         .map(|(fn_id, profile_str, updated_at)| {

@@ -22,8 +22,8 @@
 
 use prro::admin::{add_operator, AddOperatorInput, AdminError};
 use prro::db::models::enums::{FiscalMode, Severity};
-use prro::db::{open_pool, open_secure_pool, repositories::audit_log};
 use prro::db::repositories::{fiscal_number_config as fn_cfg, operators as ops_repo};
+use prro::db::{open_pool, open_secure_pool, repositories::audit_log};
 use prro::runtime::coding::Coding;
 use sqlx::SqlitePool;
 
@@ -131,13 +131,9 @@ async fn fn_missing_in_config_rejected_pre_insert() {
     let (_ds, pool_secure) = fresh_secure_pool().await;
     // Intentionally NOT seeding FN config.
 
-    let err = add_operator(
-        &pool_main,
-        &pool_secure,
-        good_input("9999999999", b"pw"),
-    )
-    .await
-    .expect_err("missing FN must reject");
+    let err = add_operator(&pool_main, &pool_secure, good_input("9999999999", b"pw"))
+        .await
+        .expect_err("missing FN must reject");
     match err {
         AdminError::FiscalNumberNotInConfig(fn_id) => {
             assert_eq!(fn_id, "9999999999");
@@ -157,13 +153,9 @@ async fn duplicate_active_cashier_for_same_fn_rejected() {
     let (_ds, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    add_operator(
-        &pool_main,
-        &pool_secure,
-        good_input("4000000001", b"first"),
-    )
-    .await
-    .expect("first add succeeds");
+    add_operator(&pool_main, &pool_secure, good_input("4000000001", b"first"))
+        .await
+        .expect("first add succeeds");
 
     let mut second = good_input("4000000001", b"second");
     second.operator_id = "9999999999".into();
@@ -185,22 +177,34 @@ async fn empty_required_string_args_rejected() {
     seed_fn(&pool_main, "4000000001").await;
 
     let cases: Vec<(&str, AddOperatorInput)> = vec![
-        ("inn", AddOperatorInput {
-            operator_id: " ".into(),
-            ..good_input("4000000001", b"pw")
-        }),
-        ("name", AddOperatorInput {
-            name: "".into(),
-            ..good_input("4000000001", b"pw")
-        }),
-        ("key-path", AddOperatorInput {
-            key_path: "  ".into(),
-            ..good_input("4000000001", b"pw")
-        }),
-        ("fn", AddOperatorInput {
-            fiscal_number: "".into(),
-            ..good_input("4000000001", b"pw")
-        }),
+        (
+            "inn",
+            AddOperatorInput {
+                operator_id: " ".into(),
+                ..good_input("4000000001", b"pw")
+            },
+        ),
+        (
+            "name",
+            AddOperatorInput {
+                name: "".into(),
+                ..good_input("4000000001", b"pw")
+            },
+        ),
+        (
+            "key-path",
+            AddOperatorInput {
+                key_path: "  ".into(),
+                ..good_input("4000000001", b"pw")
+            },
+        ),
+        (
+            "fn",
+            AddOperatorInput {
+                fiscal_number: "".into(),
+                ..good_input("4000000001", b"pw")
+            },
+        ),
     ];
     for (expected_arg, input) in cases {
         let err = add_operator(&pool_main, &pool_secure, input)
@@ -219,23 +223,15 @@ async fn empty_password_rejected() {
     let (_ds, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    let err = add_operator(
-        &pool_main,
-        &pool_secure,
-        good_input("4000000001", b""),
-    )
-    .await
-    .expect_err("empty password must reject");
+    let err = add_operator(&pool_main, &pool_secure, good_input("4000000001", b""))
+        .await
+        .expect_err("empty password must reject");
     assert!(matches!(err, AdminError::EmptyPassword));
 
     // Whitespace-only password also rejected.
-    let err2 = add_operator(
-        &pool_main,
-        &pool_secure,
-        good_input("4000000001", b"   "),
-    )
-    .await
-    .expect_err("whitespace-only password must reject");
+    let err2 = add_operator(&pool_main, &pool_secure, good_input("4000000001", b"   "))
+        .await
+        .expect_err("whitespace-only password must reject");
     assert!(matches!(err2, AdminError::EmptyPassword));
 
     // No row landed.

@@ -11,11 +11,10 @@
 //!   - validation: rates that cannot round-trip to 2dp at snapshot
 //!     creation are rejected (typed error)
 
-use prro::services::write_path::tax_summary::{
-    bps_to_decimal_string, bps_to_f64, ResolvedTaxGroup, SnapshotBuildError,
-    TaxResolutionSnapshot,
-};
 use prro::services::write_path::tax_summary::ResolvedTaxGroupBps;
+use prro::services::write_path::tax_summary::{
+    bps_to_decimal_string, bps_to_f64, ResolvedTaxGroup, SnapshotBuildError, TaxResolutionSnapshot,
+};
 
 // ─── Construction + validation ────────────────────────────────────
 
@@ -35,17 +34,56 @@ fn snapshot_canonical_bytes_sort_groups_by_tx_ascending() {
     // Caller may supply groups in any order; canonical bytes sort
     // by tx ascending so identical config → identical hash.
     let unsorted = TaxResolutionSnapshot::new(vec![
-        ResolvedTaxGroupBps { tx: 10, txpr_bps: 700, dtpr_bps: 0, txal: 0, txty: 0 },
-        ResolvedTaxGroupBps { tx: 1, txpr_bps: 2000, dtpr_bps: 0, txal: 0, txty: 0 },
-        ResolvedTaxGroupBps { tx: 2, txpr_bps: 700, dtpr_bps: 0, txal: 0, txty: 0 },
+        ResolvedTaxGroupBps {
+            tx: 10,
+            txpr_bps: 700,
+            dtpr_bps: 0,
+            txal: 0,
+            txty: 0,
+        },
+        ResolvedTaxGroupBps {
+            tx: 1,
+            txpr_bps: 2000,
+            dtpr_bps: 0,
+            txal: 0,
+            txty: 0,
+        },
+        ResolvedTaxGroupBps {
+            tx: 2,
+            txpr_bps: 700,
+            dtpr_bps: 0,
+            txal: 0,
+            txty: 0,
+        },
     ]);
     let sorted = TaxResolutionSnapshot::new(vec![
-        ResolvedTaxGroupBps { tx: 1, txpr_bps: 2000, dtpr_bps: 0, txal: 0, txty: 0 },
-        ResolvedTaxGroupBps { tx: 2, txpr_bps: 700, dtpr_bps: 0, txal: 0, txty: 0 },
-        ResolvedTaxGroupBps { tx: 10, txpr_bps: 700, dtpr_bps: 0, txal: 0, txty: 0 },
+        ResolvedTaxGroupBps {
+            tx: 1,
+            txpr_bps: 2000,
+            dtpr_bps: 0,
+            txal: 0,
+            txty: 0,
+        },
+        ResolvedTaxGroupBps {
+            tx: 2,
+            txpr_bps: 700,
+            dtpr_bps: 0,
+            txal: 0,
+            txty: 0,
+        },
+        ResolvedTaxGroupBps {
+            tx: 10,
+            txpr_bps: 700,
+            dtpr_bps: 0,
+            txal: 0,
+            txty: 0,
+        },
     ]);
-    assert_eq!(unsorted.sha256(), sorted.sha256(),
-        "canonical bytes must sort groups → same hash regardless of caller order");
+    assert_eq!(
+        unsorted.sha256(),
+        sorted.sha256(),
+        "canonical bytes must sort groups → same hash regardless of caller order"
+    );
 }
 
 #[test]
@@ -55,8 +93,20 @@ fn pinned_hash_for_known_input_locks_canonical_format() {
     // row's payload_sha256 becomes wrong on verify-on-read.  Treat as
     // a fiscal-compatibility break.
     let s = TaxResolutionSnapshot::new(vec![
-        ResolvedTaxGroupBps { tx: 1, txpr_bps: 2000, dtpr_bps: 0, txal: 0, txty: 0 },
-        ResolvedTaxGroupBps { tx: 2, txpr_bps: 700, dtpr_bps: 0, txal: 0, txty: 0 },
+        ResolvedTaxGroupBps {
+            tx: 1,
+            txpr_bps: 2000,
+            dtpr_bps: 0,
+            txal: 0,
+            txty: 0,
+        },
+        ResolvedTaxGroupBps {
+            tx: 2,
+            txpr_bps: 700,
+            dtpr_bps: 0,
+            txal: 0,
+            txty: 0,
+        },
     ]);
     let h = s.sha256();
     // The exact hash bytes are pinned in the assertion message after
@@ -144,9 +194,10 @@ fn bps_to_decimal_string_pads_single_digit_fractional() {
 #[test]
 fn from_live_rates_round_trip_validates() {
     // 20.0 → 2000 bps → "20.00" → 20.0 — round-trips exactly.
-    let r = TaxResolutionSnapshot::try_from_live(vec![
-        ("1".to_string(), 1_i64, 20.0_f64, 0.0_f64, 0_i64, 0_i64),
-    ], Vec::new());
+    let r = TaxResolutionSnapshot::try_from_live(
+        vec![("1".to_string(), 1_i64, 20.0_f64, 0.0_f64, 0_i64, 0_i64)],
+        Vec::new(),
+    );
     let s = r.expect("20.0 round-trips");
     assert_eq!(s.groups().len(), 1);
     assert_eq!(s.groups()[0].txpr_bps, 2000);
@@ -155,29 +206,35 @@ fn from_live_rates_round_trip_validates() {
 #[test]
 fn from_live_rates_rejects_non_round_trippable() {
     // 20.005 → 2000.5 bps — not representable as integer.  Reject.
-    let r = TaxResolutionSnapshot::try_from_live(vec![
-        ("1".to_string(), 1_i64, 20.005_f64, 0.0_f64, 0_i64, 0_i64),
-    ], Vec::new());
+    let r = TaxResolutionSnapshot::try_from_live(
+        vec![("1".to_string(), 1_i64, 20.005_f64, 0.0_f64, 0_i64, 0_i64)],
+        Vec::new(),
+    );
     let err = r.expect_err("20.005 cannot round-trip to 2dp exactly");
-    assert!(matches!(err, SnapshotBuildError::RateNotRoundTrippable { .. }));
+    assert!(matches!(
+        err,
+        SnapshotBuildError::RateNotRoundTrippable { .. }
+    ));
 }
 
 // CRIT-1 (mid-review) regression pins.  f64::EPSILON tolerance
 // rejected these real-world rates; 1e-9 tolerance accepts them.
 #[test]
 fn from_live_rates_accepts_19_99_percent_pdv_reform_scenario() {
-    let s = TaxResolutionSnapshot::try_from_live(vec![
-        ("1".to_string(), 1_i64, 19.99_f64, 0.0_f64, 0_i64, 0_i64),
-    ], Vec::new())
+    let s = TaxResolutionSnapshot::try_from_live(
+        vec![("1".to_string(), 1_i64, 19.99_f64, 0.0_f64, 0_i64, 0_i64)],
+        Vec::new(),
+    )
     .expect("19.99 must round-trip — Ukrainian PDV reform scenario");
     assert_eq!(s.groups()[0].txpr_bps, 1999);
 }
 
 #[test]
 fn from_live_rates_accepts_10_05_percent() {
-    let s = TaxResolutionSnapshot::try_from_live(vec![
-        ("1".to_string(), 1_i64, 10.05_f64, 0.0_f64, 0_i64, 0_i64),
-    ], Vec::new())
+    let s = TaxResolutionSnapshot::try_from_live(
+        vec![("1".to_string(), 1_i64, 10.05_f64, 0.0_f64, 0_i64, 0_i64)],
+        Vec::new(),
+    )
     .expect("10.05 must round-trip");
     assert_eq!(s.groups()[0].txpr_bps, 1005);
 }
@@ -186,9 +243,10 @@ fn from_live_rates_accepts_10_05_percent() {
 fn from_live_rates_accepts_low_fractional_rates() {
     // 0.05% / 0.10% / 12.34% — admin-typeable values that should accept.
     for (rate, expected_bps) in &[(0.05_f64, 5_i64), (0.10, 10), (12.34, 1234)] {
-        let s = TaxResolutionSnapshot::try_from_live(vec![
-            ("1".to_string(), 1_i64, *rate, 0.0_f64, 0_i64, 0_i64),
-        ], Vec::new())
+        let s = TaxResolutionSnapshot::try_from_live(
+            vec![("1".to_string(), 1_i64, *rate, 0.0_f64, 0_i64, 0_i64)],
+            Vec::new(),
+        )
         .unwrap_or_else(|e| panic!("rate {rate} must accept: {e:?}"));
         assert_eq!(s.groups()[0].txpr_bps, *expected_bps, "rate={rate}");
     }
@@ -196,24 +254,27 @@ fn from_live_rates_accepts_low_fractional_rates() {
 
 #[test]
 fn from_live_rates_negative_rejected() {
-    let r = TaxResolutionSnapshot::try_from_live(vec![
-        ("1".to_string(), 1_i64, -1.0_f64, 0.0_f64, 0_i64, 0_i64),
-    ], Vec::new());
+    let r = TaxResolutionSnapshot::try_from_live(
+        vec![("1".to_string(), 1_i64, -1.0_f64, 0.0_f64, 0_i64, 0_i64)],
+        Vec::new(),
+    );
     let err = r.expect_err("negative rate must reject (consistent with CalcTaxError::InvalidRate)");
     assert!(matches!(err, SnapshotBuildError::NegativeRate { .. }));
 }
 
 #[test]
 fn from_live_rates_nan_inf_rejected() {
-    let r = TaxResolutionSnapshot::try_from_live(vec![
-        ("1".to_string(), 1_i64, f64::NAN, 0.0, 0, 0),
-    ], Vec::new());
+    let r = TaxResolutionSnapshot::try_from_live(
+        vec![("1".to_string(), 1_i64, f64::NAN, 0.0, 0, 0)],
+        Vec::new(),
+    );
     let err = r.expect_err("NaN rate rejected");
     assert!(matches!(err, SnapshotBuildError::RateNotFinite { .. }));
 
-    let r = TaxResolutionSnapshot::try_from_live(vec![
-        ("1".to_string(), 1_i64, f64::INFINITY, 0.0, 0, 0),
-    ], Vec::new());
+    let r = TaxResolutionSnapshot::try_from_live(
+        vec![("1".to_string(), 1_i64, f64::INFINITY, 0.0, 0, 0)],
+        Vec::new(),
+    );
     let err = r.expect_err("Inf rate rejected");
     assert!(matches!(err, SnapshotBuildError::RateNotFinite { .. }));
 }
@@ -223,8 +284,20 @@ fn from_live_rates_nan_inf_rejected() {
 #[test]
 fn to_calc_map_yields_resolved_tax_group_keyed_by_tx() {
     let s = TaxResolutionSnapshot::new(vec![
-        ResolvedTaxGroupBps { tx: 1, txpr_bps: 2000, dtpr_bps: 0, txal: 0, txty: 0 },
-        ResolvedTaxGroupBps { tx: 2, txpr_bps: 700, dtpr_bps: 0, txal: 0, txty: 0 },
+        ResolvedTaxGroupBps {
+            tx: 1,
+            txpr_bps: 2000,
+            dtpr_bps: 0,
+            txal: 0,
+            txty: 0,
+        },
+        ResolvedTaxGroupBps {
+            tx: 2,
+            txpr_bps: 700,
+            dtpr_bps: 0,
+            txal: 0,
+            txty: 0,
+        },
     ]);
     let m = s.to_calc_map();
     assert_eq!(m.len(), 2);
@@ -240,9 +313,13 @@ fn to_calc_map_yields_resolved_tax_group_keyed_by_tx() {
 fn to_calc_map_pipes_into_derive_check_tax_summaries() {
     use prro::services::write_path::tax_summary::derive_check_tax_summaries;
     use prro::xml::CheckItem;
-    let s = TaxResolutionSnapshot::new(vec![
-        ResolvedTaxGroupBps { tx: 1, txpr_bps: 2000, dtpr_bps: 0, txal: 0, txty: 0 },
-    ]);
+    let s = TaxResolutionSnapshot::new(vec![ResolvedTaxGroupBps {
+        tx: 1,
+        txpr_bps: 2000,
+        dtpr_bps: 0,
+        txal: 0,
+        txty: 0,
+    }]);
     let items = vec![CheckItem {
         code: "ART-1".into(),
         name: "Test".into(),

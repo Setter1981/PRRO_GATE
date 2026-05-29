@@ -13,18 +13,12 @@
 //!   * `tax_group_1 = Some(-1)` (не об'єкт ПДВ) emits literal `TX="-1"`.
 
 use prro::xml::{
-    build_canonical_xml, AdjustmentMode, CanonicalDoc, CheckItem, CheckPayload,
-    CheckPayment, DocumentHeader, LineAdjustment, LineAdjustmentKind,
+    build_canonical_xml, AdjustmentMode, CanonicalDoc, CheckItem, CheckPayload, CheckPayment,
+    DocumentHeader, LineAdjustment, LineAdjustmentKind,
 };
 
 fn dummy_header() -> DocumentHeader {
-    DocumentHeader::with_defaults(
-        "4538765845",
-        "TN-12345",
-        0_u32,
-        "20260527100000",
-        "",
-    )
+    DocumentHeader::with_defaults("4538765845", "TN-12345", 0_u32, "20260527100000", "")
 }
 
 fn minimal_check(items: Vec<CheckItem>, payments: Vec<CheckPayment>) -> CheckPayload {
@@ -39,8 +33,8 @@ fn minimal_check(items: Vec<CheckItem>, payments: Vec<CheckPayment>) -> CheckPay
 }
 
 fn build_sell(items: Vec<CheckItem>, payments: Vec<CheckPayment>) -> String {
-    let bytes = build_canonical_xml(&CanonicalDoc::Sell(minimal_check(items, payments)))
-        .expect("build");
+    let bytes =
+        build_canonical_xml(&CanonicalDoc::Sell(minimal_check(items, payments))).expect("build");
     // For ASCII attr assertions, cp1251 ≈ ASCII slice — convert via
     // cp1251 → utf-8 round-trip via a permissive lossy decode.
     bytes.iter().map(|&b| b as char).collect()
@@ -156,10 +150,7 @@ fn check_item_with_excise_stamps_emits_ca_children() {
         price: 100,
         quantity: 1000,
         sum: 100,
-        excise_stamps: vec![
-            "UA1234567890".to_string(),
-            "UA0987654321".to_string(),
-        ],
+        excise_stamps: vec!["UA1234567890".to_string(), "UA0987654321".to_string()],
         ..Default::default()
     };
     let xml = build_sell(vec![item], vec![]);

@@ -12,13 +12,13 @@
 //!   state UNCHANGED, Warning audit emitted (`SHIFT_FORCE_SEAM_REFUSED`)
 //!   with full evidence_json envelope for forensic traceability per §8.
 
-use prro::db::models::enums::ShiftState;
 use prro::db::models::enums::FiscalMode;
+use prro::db::models::enums::ShiftState;
 use prro::db::models::ids::ShiftId;
+use prro::db::open_pool;
 use prro::db::repositories::fiscal_number_config::{self as fn_repo, NewFnConfig};
 use prro::db::repositories::shifts;
 use prro::db::tx::with_immediate;
-use prro::db::open_pool;
 
 const ALL_STATES: [ShiftState; 9] = [
     ShiftState::Created,
@@ -82,11 +82,7 @@ async fn fresh_with_fn() -> (sqlx::SqlitePool, String) {
     (pool, "9000082000".to_string())
 }
 
-async fn seed_shift_in_state(
-    pool: &sqlx::SqlitePool,
-    fn_id: &str,
-    state: ShiftState,
-) -> ShiftId {
+async fn seed_shift_in_state(pool: &sqlx::SqlitePool, fn_id: &str, state: ShiftState) -> ShiftId {
     let id = ShiftId::new();
     sqlx::query(
         "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, cash_balance_kop, \
@@ -102,11 +98,7 @@ async fn seed_shift_in_state(
     id
 }
 
-async fn count_audit_events(
-    pool: &sqlx::SqlitePool,
-    shift_id_hex: &str,
-    event_type: &str,
-) -> i64 {
+async fn count_audit_events(pool: &sqlx::SqlitePool, shift_id_hex: &str, event_type: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM audit_log WHERE entity_type = 'shift' \
          AND entity_id = ? AND event_type = ?",
@@ -147,7 +139,8 @@ async fn force_to_error_with_audit_source_guard_9_cases() {
         .unwrap();
 
         let observed_state = shifts::get(&pool, shift_id).await.unwrap().unwrap().state;
-        let critical_audits = count_audit_events(&pool, &shift_id_hex, "SHIFT_FORCE_TO_ERROR").await;
+        let critical_audits =
+            count_audit_events(&pool, &shift_id_hex, "SHIFT_FORCE_TO_ERROR").await;
         let refused_audits =
             count_audit_events(&pool, &shift_id_hex, "SHIFT_FORCE_SEAM_REFUSED").await;
 
@@ -162,8 +155,14 @@ async fn force_to_error_with_audit_source_guard_9_cases() {
                 ShiftState::Error,
                 "({from:?}, force_to_error) Applied must transition to Error"
             );
-            assert_eq!(critical_audits, 1, "({from:?}) must emit SHIFT_FORCE_TO_ERROR once");
-            assert_eq!(refused_audits, 0, "({from:?}) Applied must NOT emit refused audit");
+            assert_eq!(
+                critical_audits, 1,
+                "({from:?}) must emit SHIFT_FORCE_TO_ERROR once"
+            );
+            assert_eq!(
+                refused_audits, 0,
+                "({from:?}) Applied must NOT emit refused audit"
+            );
         } else {
             assert!(
                 matches!(outcome, ForceSeamOutcome::ForbiddenSource { .. }),
@@ -203,9 +202,14 @@ async fn force_to_manual_reconciliation_with_audit_source_guard_9_cases() {
 
         let outcome = with_immediate(&pool, move |tx| {
             Box::pin(async move {
-                let o = shifts::force_to_manual_reconciliation_with_audit(tx, shift_id, Some("op-007"), EVIDENCE)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("force-seam: {e}"))?;
+                let o = shifts::force_to_manual_reconciliation_with_audit(
+                    tx,
+                    shift_id,
+                    Some("op-007"),
+                    EVIDENCE,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("force-seam: {e}"))?;
                 anyhow::Ok(o)
             })
         })
@@ -213,12 +217,8 @@ async fn force_to_manual_reconciliation_with_audit_source_guard_9_cases() {
         .unwrap();
 
         let observed_state = shifts::get(&pool, shift_id).await.unwrap().unwrap().state;
-        let critical_audits = count_audit_events(
-            &pool,
-            &shift_id_hex,
-            "SHIFT_FORCE_TO_MANUAL_RECONCILIATION",
-        )
-        .await;
+        let critical_audits =
+            count_audit_events(&pool, &shift_id_hex, "SHIFT_FORCE_TO_MANUAL_RECONCILIATION").await;
         let refused_audits =
             count_audit_events(&pool, &shift_id_hex, "SHIFT_FORCE_SEAM_REFUSED").await;
 
@@ -233,8 +233,14 @@ async fn force_to_manual_reconciliation_with_audit_source_guard_9_cases() {
                 ShiftState::RequiresManualReconciliation,
                 "({from:?}, force_to_manual) Applied must transition to Manual"
             );
-            assert_eq!(critical_audits, 1, "({from:?}) must emit FORCE_TO_MANUAL once");
-            assert_eq!(refused_audits, 0, "({from:?}) Applied must NOT emit refused audit");
+            assert_eq!(
+                critical_audits, 1,
+                "({from:?}) must emit FORCE_TO_MANUAL once"
+            );
+            assert_eq!(
+                refused_audits, 0,
+                "({from:?}) Applied must NOT emit refused audit"
+            );
         } else {
             assert!(
                 matches!(outcome, ForceSeamOutcome::ForbiddenSource { .. }),
@@ -244,7 +250,10 @@ async fn force_to_manual_reconciliation_with_audit_source_guard_9_cases() {
                 observed_state, from,
                 "({from:?}, force_to_manual) Forbidden must NOT mutate state"
             );
-            assert_eq!(critical_audits, 0, "({from:?}) Forbidden must NOT emit FORCE_TO_MANUAL");
+            assert_eq!(
+                critical_audits, 0,
+                "({from:?}) Forbidden must NOT emit FORCE_TO_MANUAL"
+            );
             assert_eq!(
                 refused_audits, 1,
                 "({from:?}) Forbidden must emit SHIFT_FORCE_SEAM_REFUSED once (forensic, \

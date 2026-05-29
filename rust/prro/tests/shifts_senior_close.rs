@@ -86,11 +86,7 @@ async fn seed_cashier_cert_binding(pool: &sqlx::SqlitePool, fn_id: &str, cashier
     .unwrap();
 }
 
-async fn seed_shift_in_state(
-    pool: &sqlx::SqlitePool,
-    fn_id: &str,
-    state: ShiftState,
-) -> ShiftId {
+async fn seed_shift_in_state(pool: &sqlx::SqlitePool, fn_id: &str, state: ShiftState) -> ShiftId {
     let id = ShiftId::new();
     sqlx::query(
         "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, cash_balance_kop, \
@@ -106,11 +102,7 @@ async fn seed_shift_in_state(
     id
 }
 
-async fn count_audit_events(
-    pool: &sqlx::SqlitePool,
-    shift_id_hex: &str,
-    event_type: &str,
-) -> i64 {
+async fn count_audit_events(pool: &sqlx::SqlitePool, shift_id_hex: &str, event_type: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM audit_log WHERE entity_type = 'shift' \
          AND entity_id = ? AND event_type = ?",
@@ -160,11 +152,21 @@ async fn senior_close_applied_from_opened() {
     let row = shifts::get(&pool, shift_id).await.unwrap().unwrap();
     assert_eq!(row.state, ShiftState::Closed);
     assert_eq!(
-        count_audit_events(&pool, &shift_id_hex(&pool, shift_id).await, "SHIFT_CLOSED_BY_SENIOR_CASHIER").await,
+        count_audit_events(
+            &pool,
+            &shift_id_hex(&pool, shift_id).await,
+            "SHIFT_CLOSED_BY_SENIOR_CASHIER"
+        )
+        .await,
         1
     );
     assert_eq!(
-        count_audit_events(&pool, &shift_id_hex(&pool, shift_id).await, "SHIFT_SENIOR_CLOSE_REFUSED").await,
+        count_audit_events(
+            &pool,
+            &shift_id_hex(&pool, shift_id).await,
+            "SHIFT_SENIOR_CLOSE_REFUSED"
+        )
+        .await,
         0
     );
 }
@@ -176,8 +178,7 @@ async fn senior_close_applied_from_closing_local_pending_drain() {
     let (pool, fn_id) = fresh_with_fn().await;
     let senior = CashierId::new("senior-cashier-2").unwrap();
     seed_cashier_cert_binding(&pool, &fn_id, senior.as_str()).await;
-    let shift_id =
-        seed_shift_in_state(&pool, &fn_id, ShiftState::ClosingLocalPendingDrain).await;
+    let shift_id = seed_shift_in_state(&pool, &fn_id, ShiftState::ClosingLocalPendingDrain).await;
     let z_doc_id = DocumentId::new();
 
     let outcome = with_immediate(&pool, {
@@ -250,7 +251,12 @@ async fn senior_close_refused_not_closable_for_all_7_disallowed_sources() {
              (forensic, committed via Ok-return contract per spec §8 + Round 7 §8.1)"
         );
         assert_eq!(
-            count_audit_events(&pool, &shift_id_hex(&pool, shift_id).await, "SHIFT_CLOSED_BY_SENIOR_CASHIER").await,
+            count_audit_events(
+                &pool,
+                &shift_id_hex(&pool, shift_id).await,
+                "SHIFT_CLOSED_BY_SENIOR_CASHIER"
+            )
+            .await,
             0,
             "({from:?}) refused path must NOT emit success audit"
         );
@@ -294,7 +300,12 @@ async fn senior_close_refused_cashier_not_registered() {
     );
     // Forensic audit emitted.
     assert_eq!(
-        count_audit_events(&pool, &shift_id_hex(&pool, shift_id).await, "SHIFT_SENIOR_CLOSE_REFUSED").await,
+        count_audit_events(
+            &pool,
+            &shift_id_hex(&pool, shift_id).await,
+            "SHIFT_SENIOR_CLOSE_REFUSED"
+        )
+        .await,
         1
     );
 }
@@ -319,7 +330,11 @@ async fn senior_close_error_invalid_evidence_json() {
                 Box::pin(async move {
                     // Capture the typed error inside the closure.
                     let r = shifts::senior_cashier_close_shift_with_audit(
-                        tx, shift_id, &senior, z_doc_id, "not-json-at-all",
+                        tx,
+                        shift_id,
+                        &senior,
+                        z_doc_id,
+                        "not-json-at-all",
                     )
                     .await;
                     anyhow::Ok(r)

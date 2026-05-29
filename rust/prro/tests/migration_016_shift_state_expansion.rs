@@ -277,10 +277,10 @@ async fn migration_016_cashier_certs_composite_fk_rejects_cross_fn_binding() {
     // primary for cashier@FN_B must fail composite FK validation per
     // §16.10 same-FN cert ownership invariant.
     let (_d, pool) = fresh_pool().await;
-    seed_fn(&pool, "9000010001").await;  // FN_A
-    seed_fn(&pool, "9000010002").await;  // FN_B
+    seed_fn(&pool, "9000010001").await; // FN_A
+    seed_fn(&pool, "9000010002").await; // FN_B
     let cert_ski = "f".repeat(64);
-    seed_op_cert(&pool, "9000010001", &cert_ski).await;  // cert owned by FN_A
+    seed_op_cert(&pool, "9000010001", &cert_ski).await; // cert owned by FN_A
 
     let res = sqlx::query(
         "INSERT INTO cashier_certs(cashier_id, fiscal_number, primary_cert_ski_hex) \
@@ -520,13 +520,12 @@ async fn migration_016_preserves_fd_updated_at_during_w4_dance() {
 
     // PR #65 R1 H1: confirm the pre-W14a-1 sentinel back-fill populated
     // opened_by_cashier_id for the legacy row (spec §16.17 NOT NULL).
-    let back_filled: String = sqlx::query_scalar(
-        "SELECT opened_by_cashier_id FROM shifts WHERE shift_id = ?",
-    )
-    .bind(&shift_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let back_filled: String =
+        sqlx::query_scalar("SELECT opened_by_cashier_id FROM shifts WHERE shift_id = ?")
+            .bind(&shift_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         back_filled, "__pre_w14a1__",
         "migration 016 must back-fill opened_by_cashier_id with sentinel for pre-W14a-1 rows \

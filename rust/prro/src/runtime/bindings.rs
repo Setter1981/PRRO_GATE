@@ -36,9 +36,9 @@
 //! lacks the FN.  Handler then returns 503 + `OPERATOR_NOT_REGISTERED`
 //! for any request targeting an unregistered FN (W5 surface).
 
+use crate::db::models::enums::Severity;
 use crate::db::repositories::audit_log;
 use crate::db::repositories::operators;
-use crate::db::models::enums::Severity;
 use crate::runtime::coding::Coding;
 use crate::services::write_path::stage_sign::SigningContext;
 use crate::transports::dps::channel::DpsChannel;
@@ -188,14 +188,13 @@ impl BindingsRegistry {
         // Cross-DB FK set: every FN that exists in main's
         // fiscal_number_config.  An operators row whose fiscal_number
         // is NOT here is an orphan.
-        let main_fns: std::collections::HashSet<String> = sqlx::query(
-            "SELECT fiscal_number FROM fiscal_number_config",
-        )
-        .fetch_all(pool_main)
-        .await?
-        .into_iter()
-        .map(|r| r.get::<String, _>("fiscal_number"))
-        .collect();
+        let main_fns: std::collections::HashSet<String> =
+            sqlx::query("SELECT fiscal_number FROM fiscal_number_config")
+                .fetch_all(pool_main)
+                .await?
+                .into_iter()
+                .map(|r| r.get::<String, _>("fiscal_number"))
+                .collect();
 
         let mut inner: HashMap<String, OperatorBindings> = HashMap::new();
 

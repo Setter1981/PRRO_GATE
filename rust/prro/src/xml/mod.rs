@@ -339,7 +339,11 @@ pub fn calc_tax(
         } else {
             // diff == 0.5 → pick the even neighbour.
             let f = floor as i64;
-            if f % 2 == 0 { f } else { f + 1 }
+            if f % 2 == 0 {
+                f
+            } else {
+                f + 1
+            }
         }
     }
 
@@ -367,23 +371,37 @@ pub fn calc_tax(
     let g = group_sum as f64;
     match txal {
         0 => {
-            let txsm = if txpr > 0.0 { safe_round(g * txpr / (100.0 + txpr))? } else { 0 };
+            let txsm = if txpr > 0.0 {
+                safe_round(g * txpr / (100.0 + txpr))?
+            } else {
+                0
+            };
             Ok((txsm, 0))
         }
         1 => {
-            let dtsm = if dtpr > 0.0 { safe_round(g * dtpr / 100.0)? } else { 0 };
+            let dtsm = if dtpr > 0.0 {
+                safe_round(g * dtpr / 100.0)?
+            } else {
+                0
+            };
             let txsm = if txpr > 0.0 {
                 safe_round((g + dtsm as f64) * txpr / (100.0 + txpr))?
-            } else { 0 };
+            } else {
+                0
+            };
             Ok((txsm, dtsm))
         }
         2 => {
             let dtsm = if dtpr > 0.0 {
                 safe_round(g * dtpr / (100.0 + dtpr))?
-            } else { 0 };
+            } else {
+                0
+            };
             let txsm = if txpr > 0.0 {
                 safe_round((g - dtsm as f64) * txpr / (100.0 + txpr))?
-            } else { 0 };
+            } else {
+                0
+            };
             Ok((txsm, dtsm))
         }
         other => Err(CalcTaxError::UnsupportedAlgorithm(other)),
@@ -468,7 +486,6 @@ pub struct CheckItem {
     pub sum: i64,
 
     // ─── W4-Z1 optional attributes ─────────────────────────────────
-
     /// `<P CD=...>`.  Barcode.  Per Python `dps_xml.py:197`:
     /// `p_attrs['CD'] = barcode`.  Omit if `None`.
     pub barcode: Option<String>,
@@ -596,7 +613,6 @@ pub struct CheckPayment {
     // Per Python `dps_xml.py:289-300` + WebCheck `StringXML.cs:663
     // DopTegE()`.  Only emit when populated; non-cash payments
     // typically carry several of these, cash payments carry none.
-
     /// `<M PA=...>`.  Payment system / acquirer name (or first
     /// EPZ slot per WebCheck `tegD.PA`).
     pub pa: Option<String>,
@@ -618,7 +634,6 @@ pub struct CheckPayment {
     pub rrn: Option<String>,
 
     // ─── W4-Z1: Cash-only attrs ───────────────────────────────────
-
     /// `<M RM=...>`.  Change returned to customer (kopecks).  Per
     /// Python `:301-303` emitted ONLY on the FIRST cash payment
     /// (T="0") and ONLY when total paid > total due.  Caller
@@ -771,8 +786,13 @@ pub enum XmlBuildError {
     /// dangling reference and DPS would reject.  Caller MUST
     /// validate the subset against the actual items vector before
     /// passing to the builder.
-    #[error("check-level adjustment refers to N={referenced_n} but only items {tracked:?} were emitted")]
-    OrphanCheckLevelNi { referenced_n: u32, tracked: Vec<u32> },
+    #[error(
+        "check-level adjustment refers to N={referenced_n} but only items {tracked:?} were emitted"
+    )]
+    OrphanCheckLevelNi {
+        referenced_n: u32,
+        tracked: Vec<u32>,
+    },
 }
 
 /// Build the canonical wire XML for a `CanonicalDoc`.  Output is a
@@ -807,11 +827,7 @@ fn emit_shift_open(p: &ShiftOpenPayload, out: &mut String) {
     close(out, "RQ");
 }
 
-fn emit_check(
-    p: &CheckPayload,
-    c_type: &str,
-    out: &mut String,
-) -> Result<(), XmlBuildError> {
+fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) -> Result<(), XmlBuildError> {
     let h = &p.header;
     open_rq(out, h);
     let di = p.local_number.to_string();
@@ -1241,12 +1257,7 @@ fn emit_z_report(p: &ZReportPayload, out: &mut String) {
         tag_attrs(
             out,
             "IO",
-            &[
-                ("NM", &io.name),
-                ("SMI", &smi),
-                ("SMO", &smo),
-                ("T", "0"),
-            ],
+            &[("NM", &io.name), ("SMI", &smi), ("SMO", &smo), ("T", "0")],
         );
         close(out, "IO");
     }

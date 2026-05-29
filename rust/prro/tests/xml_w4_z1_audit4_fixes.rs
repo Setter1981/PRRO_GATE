@@ -16,8 +16,8 @@
 
 use prro::xml::{
     build_canonical_xml, AdjustmentMode, CalcTaxError, CanonicalDoc, CheckItem,
-    CheckLevelAdjustment, CheckLevelAdjustmentKind, CheckPayload, CheckPayment,
-    DocumentHeader, LineAdjustment, LineAdjustmentKind, XmlBuildError,
+    CheckLevelAdjustment, CheckLevelAdjustmentKind, CheckPayload, CheckPayment, DocumentHeader,
+    LineAdjustment, LineAdjustmentKind, XmlBuildError,
 };
 
 fn header() -> DocumentHeader {
@@ -45,9 +45,11 @@ fn check_level_adjustment_with_zero_items_is_skipped_no_orphan() {
     let doc = CanonicalDoc::Sell(CheckPayload {
         header: header(),
         local_number: 1,
-        items: vec![],  // empty!
+        items: vec![], // empty!
         payments: vec![CheckPayment {
-            name: "CASH".into(), sum: 0, type_code: "0".into(),
+            name: "CASH".into(),
+            sum: 0,
+            type_code: "0".into(),
             ..Default::default()
         }],
         total_sum: 0,
@@ -55,17 +57,19 @@ fn check_level_adjustment_with_zero_items_is_skipped_no_orphan() {
             kind: CheckLevelAdjustmentKind::Discount,
             sum: 100,
             mode: AdjustmentMode::Value,
-            percent: None, name: None,
-            applies_to_item_ns: vec![],  // empty → auto-fill, but empty p_item_numbers
+            percent: None,
+            name: None,
+            applies_to_item_ns: vec![], // empty → auto-fill, but empty p_item_numbers
         }],
         ..Default::default()
     });
     let bytes = build_canonical_xml(&doc).expect("build");
     let xml: String = bytes.iter().map(|&b| b as char).collect();
-    assert!(!xml.contains("<D "),
-        "orphan check-level D must be skipped when items empty: {xml}");
-    assert!(!xml.contains("<NI "),
-        "no orphan NI: {xml}");
+    assert!(
+        !xml.contains("<D "),
+        "orphan check-level D must be skipped when items empty: {xml}"
+    );
+    assert!(!xml.contains("<NI "), "no orphan NI: {xml}");
 }
 
 #[test]
@@ -79,7 +83,9 @@ fn check_level_with_override_subset_emits_even_with_zero_items() {
         local_number: 1,
         items: vec![],
         payments: vec![CheckPayment {
-            name: "CASH".into(), sum: 0, type_code: "0".into(),
+            name: "CASH".into(),
+            sum: 0,
+            type_code: "0".into(),
             ..Default::default()
         }],
         total_sum: 0,
@@ -87,14 +93,17 @@ fn check_level_with_override_subset_emits_even_with_zero_items() {
             kind: CheckLevelAdjustmentKind::Discount,
             sum: 100,
             mode: AdjustmentMode::Value,
-            percent: None, name: None,
-            applies_to_item_ns: vec![1],  // refers to non-existent P
+            percent: None,
+            name: None,
+            applies_to_item_ns: vec![1], // refers to non-existent P
         }],
         ..Default::default()
     });
     let err = build_canonical_xml(&doc).expect_err("must reject orphan NI ref");
-    assert!(matches!(err, XmlBuildError::OrphanCheckLevelNi { .. }),
-        "expected OrphanCheckLevelNi, got {err:?}");
+    assert!(
+        matches!(err, XmlBuildError::OrphanCheckLevelNi { .. }),
+        "expected OrphanCheckLevelNi, got {err:?}"
+    );
 }
 
 // ─── AUDIT4-IMP-2: percent-mode zero-skip parity ──────────────────
@@ -112,18 +121,24 @@ fn percent_mode_adjustment_with_zero_base_emits_not_skipped() {
         items: vec![CheckItem {
             code: "FREE-GIFT".into(),
             name: "Free".into(),
-            price: 0, quantity: 1000, sum: 0,  // base sum = 0
+            price: 0,
+            quantity: 1000,
+            sum: 0, // base sum = 0
             adjustments: vec![LineAdjustment {
                 kind: LineAdjustmentKind::Discount,
-                sum: 0,  // resolved: 0 * 10 / 100 = 0
+                sum: 0, // resolved: 0 * 10 / 100 = 0
                 mode: AdjustmentMode::Percent,
-                percent: Some("10.00".to_string()),  // non-zero rate
-                name: None, privilege: None, tax_code: None,
+                percent: Some("10.00".to_string()), // non-zero rate
+                name: None,
+                privilege: None,
+                tax_code: None,
             }],
             ..Default::default()
         }],
         payments: vec![CheckPayment {
-            name: "CASH".into(), sum: 0, type_code: "0".into(),
+            name: "CASH".into(),
+            sum: 0,
+            type_code: "0".into(),
             ..Default::default()
         }],
         total_sum: 0,
@@ -131,8 +146,10 @@ fn percent_mode_adjustment_with_zero_base_emits_not_skipped() {
     });
     let bytes = build_canonical_xml(&doc).expect("build");
     let xml: String = bytes.iter().map(|&b| b as char).collect();
-    assert!(xml.contains("<D "),
-        "percent-mode adj with non-zero rate MUST emit even at sum=0: {xml}");
+    assert!(
+        xml.contains("<D "),
+        "percent-mode adj with non-zero rate MUST emit even at sum=0: {xml}"
+    );
     assert!(xml.contains(r#"SM="0""#));
     assert!(xml.contains(r#"PR="10.00""#));
 }
@@ -148,13 +165,17 @@ fn percent_mode_adjustment_with_zero_rate_is_skipped() {
                 kind: LineAdjustmentKind::Discount,
                 sum: 0,
                 mode: AdjustmentMode::Percent,
-                percent: Some("0.00".to_string()),  // zero rate
-                name: None, privilege: None, tax_code: None,
+                percent: Some("0.00".to_string()), // zero rate
+                name: None,
+                privilege: None,
+                tax_code: None,
             }],
             ..item("ART-1", 1000)
         }],
         payments: vec![CheckPayment {
-            name: "CASH".into(), sum: 1000, type_code: "0".into(),
+            name: "CASH".into(),
+            sum: 1000,
+            type_code: "0".into(),
             ..Default::default()
         }],
         total_sum: 1000,
@@ -162,8 +183,10 @@ fn percent_mode_adjustment_with_zero_rate_is_skipped() {
     });
     let bytes = build_canonical_xml(&doc).expect("build");
     let xml: String = bytes.iter().map(|&b| b as char).collect();
-    assert!(!xml.contains("<D "),
-        "zero-rate percent-mode must skip: {xml}");
+    assert!(
+        !xml.contains("<D "),
+        "zero-rate percent-mode must skip: {xml}"
+    );
 }
 
 #[test]
@@ -177,13 +200,17 @@ fn value_mode_zero_sum_still_skipped() {
                 kind: LineAdjustmentKind::Discount,
                 sum: 0,
                 mode: AdjustmentMode::Value,
-                percent: None, name: None,
-                privilege: None, tax_code: None,
+                percent: None,
+                name: None,
+                privilege: None,
+                tax_code: None,
             }],
             ..item("ART-1", 1000)
         }],
         payments: vec![CheckPayment {
-            name: "CASH".into(), sum: 1000, type_code: "0".into(),
+            name: "CASH".into(),
+            sum: 1000,
+            type_code: "0".into(),
             ..Default::default()
         }],
         total_sum: 1000,
@@ -202,8 +229,7 @@ fn arithmetic_overflow_returns_intermediate_overflow_not_rate_invalid() {
     // when rates are FINE but `g * txpr` overflows.  Split into
     // dedicated variant so piece-7 debugging is accurate.
     use prro::xml::calc_tax;
-    let err = calc_tax(1_000_000_000, 1e300, 0.0, 0)
-        .expect_err("arithmetic overflow");
+    let err = calc_tax(1_000_000_000, 1e300, 0.0, 0).expect_err("arithmetic overflow");
     assert!(
         matches!(err, CalcTaxError::IntermediateOverflow { .. }),
         "expected IntermediateOverflow, got {err:?}"
@@ -215,8 +241,7 @@ fn negative_rate_returns_invalid_rate_not_overflow() {
     // After split: negative rates return InvalidRate (input-time
     // validation), NOT IntermediateOverflow.
     use prro::xml::calc_tax;
-    let err = calc_tax(10000, -100.0, 0.0, 0)
-        .expect_err("negative rate");
+    let err = calc_tax(10000, -100.0, 0.0, 0).expect_err("negative rate");
     assert!(
         matches!(err, CalcTaxError::InvalidRate { .. }),
         "expected InvalidRate, got {err:?}"
@@ -242,7 +267,9 @@ fn override_subset_with_invalid_n_is_rejected() {
         local_number: 1,
         items: vec![item("ART-1", 1000), item("ART-2", 2000)],
         payments: vec![CheckPayment {
-            name: "CASH".into(), sum: 2900, type_code: "0".into(),
+            name: "CASH".into(),
+            sum: 2900,
+            type_code: "0".into(),
             ..Default::default()
         }],
         total_sum: 2900,
@@ -250,14 +277,17 @@ fn override_subset_with_invalid_n_is_rejected() {
             kind: CheckLevelAdjustmentKind::Discount,
             sum: 100,
             mode: AdjustmentMode::Value,
-            percent: None, name: None,
-            applies_to_item_ns: vec![999],  // invalid
+            percent: None,
+            name: None,
+            applies_to_item_ns: vec![999], // invalid
         }],
         ..Default::default()
     });
     let err = build_canonical_xml(&doc).expect_err("must reject");
-    assert!(matches!(err, XmlBuildError::OrphanCheckLevelNi { .. }),
-        "expected OrphanCheckLevelNi, got {err:?}");
+    assert!(
+        matches!(err, XmlBuildError::OrphanCheckLevelNi { .. }),
+        "expected OrphanCheckLevelNi, got {err:?}"
+    );
 }
 
 #[test]
@@ -266,9 +296,15 @@ fn override_subset_with_valid_ns_succeeds() {
     let doc = CanonicalDoc::Sell(CheckPayload {
         header: header(),
         local_number: 1,
-        items: vec![item("ART-1", 1000), item("ART-2", 2000), item("ART-3", 3000)],
+        items: vec![
+            item("ART-1", 1000),
+            item("ART-2", 2000),
+            item("ART-3", 3000),
+        ],
         payments: vec![CheckPayment {
-            name: "CASH".into(), sum: 5900, type_code: "0".into(),
+            name: "CASH".into(),
+            sum: 5900,
+            type_code: "0".into(),
             ..Default::default()
         }],
         total_sum: 5900,
@@ -276,8 +312,9 @@ fn override_subset_with_valid_ns_succeeds() {
             kind: CheckLevelAdjustmentKind::Discount,
             sum: 100,
             mode: AdjustmentMode::Value,
-            percent: None, name: None,
-            applies_to_item_ns: vec![1, 3],  // valid subset of items at N=1,2,3
+            percent: None,
+            name: None,
+            applies_to_item_ns: vec![1, 3], // valid subset of items at N=1,2,3
         }],
         ..Default::default()
     });

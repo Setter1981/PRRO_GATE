@@ -16,10 +16,10 @@
 
 use prro::db::models::enums::{FiscalMode, ShiftState};
 use prro::db::models::ids::ShiftId;
+use prro::db::open_pool;
 use prro::db::repositories::fiscal_number_config::{self as fn_repo, NewFnConfig};
 use prro::db::repositories::shifts::{self, TransitionOutcome};
 use prro::db::tx::with_immediate;
-use prro::db::open_pool;
 
 const ALL_STATES: [ShiftState; 9] = [
     ShiftState::Created,
@@ -35,20 +35,35 @@ const ALL_STATES: [ShiftState; 9] = [
 
 /// Spec §4.1 — 14 allowed (from, to) edges.  Numbered per spec.
 const ALLOWED_EDGES: [(ShiftState, ShiftState); 14] = [
-    (ShiftState::Created, ShiftState::Opening),                                       // 1
-    (ShiftState::Created, ShiftState::OpenedLocalPendingDrain),                       // 2
-    (ShiftState::Opening, ShiftState::Opened),                                        // 3
-    (ShiftState::Opening, ShiftState::RequiresManualReconciliation),                  // 4
-    (ShiftState::OpenedLocalPendingDrain, ShiftState::Opened),                        // 5
-    (ShiftState::OpenedLocalPendingDrain, ShiftState::RequiresManualReconciliation),  // 6
-    (ShiftState::OpenedLocalPendingDrain, ShiftState::ClosingLocalPendingDrain),      // 7
-    (ShiftState::Opened, ShiftState::Closing),                                        // 8
-    (ShiftState::Opened, ShiftState::ClosingLocalPendingDrain),                       // 9
-    (ShiftState::Closing, ShiftState::Closed),                                        // 10
-    (ShiftState::Closing, ShiftState::Opened),                                        // 11
-    (ShiftState::Closing, ShiftState::RequiresManualReconciliation),                  // 12
-    (ShiftState::ClosingLocalPendingDrain, ShiftState::Closed),                       // 13
-    (ShiftState::ClosingLocalPendingDrain, ShiftState::RequiresManualReconciliation), // 14
+    (ShiftState::Created, ShiftState::Opening), // 1
+    (ShiftState::Created, ShiftState::OpenedLocalPendingDrain), // 2
+    (ShiftState::Opening, ShiftState::Opened),  // 3
+    (
+        ShiftState::Opening,
+        ShiftState::RequiresManualReconciliation,
+    ), // 4
+    (ShiftState::OpenedLocalPendingDrain, ShiftState::Opened), // 5
+    (
+        ShiftState::OpenedLocalPendingDrain,
+        ShiftState::RequiresManualReconciliation,
+    ), // 6
+    (
+        ShiftState::OpenedLocalPendingDrain,
+        ShiftState::ClosingLocalPendingDrain,
+    ), // 7
+    (ShiftState::Opened, ShiftState::Closing),  // 8
+    (ShiftState::Opened, ShiftState::ClosingLocalPendingDrain), // 9
+    (ShiftState::Closing, ShiftState::Closed),  // 10
+    (ShiftState::Closing, ShiftState::Opened),  // 11
+    (
+        ShiftState::Closing,
+        ShiftState::RequiresManualReconciliation,
+    ), // 12
+    (ShiftState::ClosingLocalPendingDrain, ShiftState::Closed), // 13
+    (
+        ShiftState::ClosingLocalPendingDrain,
+        ShiftState::RequiresManualReconciliation,
+    ), // 14
 ];
 
 /// Drift-guard: spec §11 acceptance #1 locks edge count at 14.  Any
@@ -93,11 +108,7 @@ async fn fresh_with_fn() -> (sqlx::SqlitePool, String) {
 /// Seed a shift row directly in the desired `state` (bypassing
 /// `transition_state` for test setup so we can exercise transitions
 /// from any of the 9 variants).
-async fn seed_shift_in_state(
-    pool: &sqlx::SqlitePool,
-    fn_id: &str,
-    state: ShiftState,
-) -> ShiftId {
+async fn seed_shift_in_state(pool: &sqlx::SqlitePool, fn_id: &str, state: ShiftState) -> ShiftId {
     let id = ShiftId::new();
     sqlx::query(
         "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, cash_balance_kop, \
@@ -179,8 +190,9 @@ async fn transition_state_returns_not_found_for_stale_shift_id() {
 
     let outcome = with_immediate(&pool, move |tx| {
         Box::pin(async move {
-            let o = shifts::transition_state(tx, stale_id, ShiftState::Created, ShiftState::Opening)
-                .await?;
+            let o =
+                shifts::transition_state(tx, stale_id, ShiftState::Created, ShiftState::Opening)
+                    .await?;
             anyhow::Ok(o)
         })
     })
@@ -226,13 +238,8 @@ async fn transition_state_returns_conflict_when_observed_state_drifted() {
             // 'OPENED'.  CAS WHERE shift_id = ? AND state = 'OPENED'
             // → 0 rows.  Diagnostic re-read returns 'CLOSING' →
             // Conflict { observed: Closing }.
-            let o = shifts::transition_state(
-                tx,
-                shift_id,
-                ShiftState::Opened,
-                ShiftState::Closing,
-            )
-            .await?;
+            let o = shifts::transition_state(tx, shift_id, ShiftState::Opened, ShiftState::Closing)
+                .await?;
             anyhow::Ok(o)
         })
     })
@@ -241,7 +248,9 @@ async fn transition_state_returns_conflict_when_observed_state_drifted() {
 
     assert_eq!(
         outcome,
-        TransitionOutcome::Conflict { observed: ShiftState::Closing },
+        TransitionOutcome::Conflict {
+            observed: ShiftState::Closing
+        },
         "post-drift transition_state MUST surface Conflict with observed=Closing"
     );
 }

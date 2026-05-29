@@ -94,14 +94,16 @@ fn per_item_d_carries_n_value_from_inline_counter_increment() {
     //
     // Wire: P(N=1) P(N=3) D(N=2 NI=1) M(N=4)
     let xml = build_sell_two_items_with_disc_on_first();
-    assert!(xml.contains(r#"<P C="ART-1" N="1""#),
-        "ART-1 at N=1: {xml}");
-    assert!(xml.contains(r#"<P C="ART-2" N="3""#),
-        "ART-2 at N=3 (D consumed N=2): {xml}");
-    assert!(xml.contains(r#"N="2" NI="1""#),
-        "D carries N=2 NI=1 (inline-incremented): {xml}");
-    assert!(xml.contains(r#"<M N="4""#),
-        "M at N=4: {xml}");
+    assert!(xml.contains(r#"<P C="ART-1" N="1""#), "ART-1 at N=1: {xml}");
+    assert!(
+        xml.contains(r#"<P C="ART-2" N="3""#),
+        "ART-2 at N=3 (D consumed N=2): {xml}"
+    );
+    assert!(
+        xml.contains(r#"N="2" NI="1""#),
+        "D carries N=2 NI=1 (inline-incremented): {xml}"
+    );
+    assert!(xml.contains(r#"<M N="4""#), "M at N=4: {xml}");
 }
 
 #[test]
@@ -125,13 +127,19 @@ fn adjustments_vec_preserves_input_order_d_or_s_mixed() {
                     kind: LineAdjustmentKind::Surcharge,
                     sum: 100,
                     mode: AdjustmentMode::Value,
-                    percent: None, name: None, privilege: None, tax_code: None,
+                    percent: None,
+                    name: None,
+                    privilege: None,
+                    tax_code: None,
                 },
                 LineAdjustment {
                     kind: LineAdjustmentKind::Discount,
                     sum: 50,
                     mode: AdjustmentMode::Value,
-                    percent: None, name: None, privilege: None, tax_code: None,
+                    percent: None,
+                    name: None,
+                    privilege: None,
+                    tax_code: None,
                 },
             ],
             ..Default::default()
@@ -149,8 +157,10 @@ fn adjustments_vec_preserves_input_order_d_or_s_mixed() {
     let xml: String = bytes.iter().map(|&b| b as char).collect();
     let s_pos = xml.find("<S ").expect("S present");
     let d_pos = xml.find("<D ").expect("D present");
-    assert!(s_pos < d_pos,
-        "S (Surcharge) MUST emit before D (Discount) when listed first: {xml}");
+    assert!(
+        s_pos < d_pos,
+        "S (Surcharge) MUST emit before D (Discount) when listed first: {xml}"
+    );
 }
 
 #[test]
@@ -180,23 +190,35 @@ fn cross_piece_n_counter_full_pipeline() {
         local_number: 1,
         items: vec![
             CheckItem {
-                code: "ART-1".into(), name: "G1".into(),
-                price: 1000, quantity: 1000, sum: 1000,
+                code: "ART-1".into(),
+                name: "G1".into(),
+                price: 1000,
+                quantity: 1000,
+                sum: 1000,
                 ..Default::default()
             },
             CheckItem {
-                code: "ART-2".into(), name: "G2".into(),
-                price: 2000, quantity: 1000, sum: 2000,
+                code: "ART-2".into(),
+                name: "G2".into(),
+                price: 2000,
+                quantity: 1000,
+                sum: 2000,
                 adjustments: vec![LineAdjustment {
                     kind: LineAdjustmentKind::Discount,
-                    sum: 50, mode: AdjustmentMode::Value,
-                    percent: None, name: None, privilege: None, tax_code: None,
+                    sum: 50,
+                    mode: AdjustmentMode::Value,
+                    percent: None,
+                    name: None,
+                    privilege: None,
+                    tax_code: None,
                 }],
                 ..Default::default()
             },
         ],
         payments: vec![CheckPayment {
-            name: "CASH".into(), sum: 2950, type_code: "0".into(),
+            name: "CASH".into(),
+            sum: 2950,
+            type_code: "0".into(),
             ..Default::default()
         }],
         total_sum: 2950,
@@ -204,8 +226,10 @@ fn cross_piece_n_counter_full_pipeline() {
         footer_lines: vec!["F1".into()],
         check_level_adjustments: vec![CheckLevelAdjustment {
             kind: CheckLevelAdjustmentKind::Discount,
-            sum: 100, mode: AdjustmentMode::Value,
-            percent: None, name: None,
+            sum: 100,
+            mode: AdjustmentMode::Value,
+            percent: None,
+            name: None,
             applies_to_item_ns: vec![2, 3],
         }],
         ..Default::default()
@@ -218,7 +242,10 @@ fn cross_piece_n_counter_full_pipeline() {
     assert!(xml.contains(r#"<P C="ART-1" N="2""#), "ART-1 at N=2: {xml}");
     assert!(xml.contains(r#"<P C="ART-2" N="3""#), "ART-2 at N=3: {xml}");
     // Per-item D for g2 at N=4 NI=3 (TR=0 implicit by per-item form).
-    assert!(xml.contains(r#"N="4" NI="3""#), "per-item D N=4 NI=3: {xml}");
+    assert!(
+        xml.contains(r#"N="4" NI="3""#),
+        "per-item D N=4 NI=3: {xml}"
+    );
     // Check-level D at N=5 (TR=1).
     assert!(xml.contains(r#"<D N="5""#), "check-level D at N=5: {xml}");
     assert!(xml.contains(r#"<M N="6""#), "M at N=6: {xml}");

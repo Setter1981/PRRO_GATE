@@ -36,8 +36,10 @@ pub enum SigningConfigSnapshotsRepoError {
     /// `payload_json`.  Indicates disk corruption, out-of-band
     /// UPDATE, or migration bug.  Caller MUST treat as critical
     /// (audit_log Critical + route doc to RequiresManualReconciliation).
-    #[error("signing_config_snapshots: payload_sha256 mismatch for id={id} \
-             (stored={stored_hex}, recomputed={recomputed_hex})")]
+    #[error(
+        "signing_config_snapshots: payload_sha256 mismatch for id={id} \
+             (stored={stored_hex}, recomputed={recomputed_hex})"
+    )]
     ChecksumMismatch {
         id: i64,
         stored_hex: String,
@@ -85,8 +87,7 @@ pub async fn insert_or_get_id(
     snapshot: &TaxResolutionSnapshot,
 ) -> Result<i64, SigningConfigSnapshotsRepoError> {
     let canonical = snapshot.canonical_bytes();
-    let payload_json = std::str::from_utf8(&canonical)
-        .expect("canonical_bytes is ASCII-safe JSON");
+    let payload_json = std::str::from_utf8(&canonical).expect("canonical_bytes is ASCII-safe JSON");
     let sha256 = snapshot.sha256();
 
     // Step 1: INSERT OR IGNORE — wins the race or no-op on conflict.
@@ -128,8 +129,7 @@ pub async fn insert_or_get_id_tx(
     snapshot: &TaxResolutionSnapshot,
 ) -> Result<i64, SigningConfigSnapshotsRepoError> {
     let canonical = snapshot.canonical_bytes();
-    let payload_json = std::str::from_utf8(&canonical)
-        .expect("canonical_bytes is ASCII-safe JSON");
+    let payload_json = std::str::from_utf8(&canonical).expect("canonical_bytes is ASCII-safe JSON");
     let sha256 = snapshot.sha256();
 
     sqlx::query(

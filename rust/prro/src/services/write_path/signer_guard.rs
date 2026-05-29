@@ -207,12 +207,13 @@ pub fn enforce_signer_cashier_match(
     // (1b) Non-close fiscal docs MUST have a persisted shift_id on
     // SendInputs.  Folded into ShiftMissingForFiscalDoc — semantically:
     // no resolvable binding for signer validation.  MED-C3-1 invariant.
-    let inputs_shift_id = inputs
-        .shift_id
-        .ok_or(SignerCashierMismatch::ShiftMissingForFiscalDoc {
-            document_id: inputs.document_id,
-            doc_type: inputs.doc_type,
-        })?;
+    let inputs_shift_id =
+        inputs
+            .shift_id
+            .ok_or(SignerCashierMismatch::ShiftMissingForFiscalDoc {
+                document_id: inputs.document_id,
+                doc_type: inputs.doc_type,
+            })?;
 
     // (2) Shift row MUST be the document's own shift, NOT a sibling
     // same-FN shift.  MED-C3-1: locks the invariant that signer
@@ -243,12 +244,13 @@ pub fn enforce_signer_cashier_match(
     }
 
     // (4) Signer attribution required for non-bypass fiscal docs.
-    let attempted = inputs
-        .signed_by_cashier_id
-        .as_ref()
-        .ok_or(SignerCashierMismatch::SignerIdMissing {
-            document_id: inputs.document_id,
-        })?;
+    let attempted =
+        inputs
+            .signed_by_cashier_id
+            .as_ref()
+            .ok_or(SignerCashierMismatch::SignerIdMissing {
+                document_id: inputs.document_id,
+            })?;
 
     // (5) Equality check via `&str` to avoid double-clone'ing CashierId.
     if attempted.as_str() != shift.opened_by_cashier_id.as_str() {

@@ -13,12 +13,12 @@
 //! deferred (heavy; needs multi-tokio-task coordination).  These
 //! state-transition repository tests prove the SQL contract.
 
+use prro::db::models::enums::Protocol;
 use prro::db::open_pool;
 use prro::db::repositories::ingress_inbox::{
     self, mark_rejected_if_new_tx, InboxInsertOutcome, NewInboxEntry,
 };
 use prro::db::tx::with_immediate;
-use prro::db::models::enums::Protocol;
 
 const FN: &str = "4000000010";
 

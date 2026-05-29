@@ -130,22 +130,48 @@ fn txs_stringified_sort_handles_dual_digit_tx() {
     let xml = build_z(
         vec![
             ZReportTaxSummary {
-                tx: 2, tx_short_form: true,
-                txpr: "".into(), txal: 0, txty: 0, dtpr: "".into(),
-                smi: 0, smo: 0, txi: 0, txo: 0, ts_prefix: "".into(),
+                tx: 2,
+                tx_short_form: true,
+                txpr: "".into(),
+                txal: 0,
+                txty: 0,
+                dtpr: "".into(),
+                smi: 0,
+                smo: 0,
+                txi: 0,
+                txo: 0,
+                ts_prefix: "".into(),
             },
             ZReportTaxSummary {
-                tx: 10, tx_short_form: true,
-                txpr: "".into(), txal: 0, txty: 0, dtpr: "".into(),
-                smi: 0, smo: 0, txi: 0, txo: 0, ts_prefix: "".into(),
+                tx: 10,
+                tx_short_form: true,
+                txpr: "".into(),
+                txal: 0,
+                txty: 0,
+                dtpr: "".into(),
+                smi: 0,
+                smo: 0,
+                txi: 0,
+                txo: 0,
+                ts_prefix: "".into(),
             },
             ZReportTaxSummary {
-                tx: 1, tx_short_form: true,
-                txpr: "".into(), txal: 0, txty: 0, dtpr: "".into(),
-                smi: 0, smo: 0, txi: 0, txo: 0, ts_prefix: "".into(),
+                tx: 1,
+                tx_short_form: true,
+                txpr: "".into(),
+                txal: 0,
+                txty: 0,
+                dtpr: "".into(),
+                smi: 0,
+                smo: 0,
+                txi: 0,
+                txo: 0,
+                ts_prefix: "".into(),
             },
         ],
-        vec![], vec![], None,
+        vec![],
+        vec![],
+        None,
     );
     let pos_1 = xml.find(r#"TX="1""#).expect("TX=1");
     let pos_10 = xml.find(r#"TX="10""#).expect("TX=10");
@@ -193,8 +219,8 @@ fn epz_emits_single_element_with_three_attrs() {
         vec![],
         vec![],
         Some(ZReportEpzTotals {
-            epc: 3,    // count of operations
-            epcs: 2,   // count of successful operations
+            epc: 3,     // count of operations
+            epcs: 2,    // count of successful operations
             epsm: 1500, // total sum (kopecks)
         }),
     );

@@ -195,8 +195,8 @@ mod tests {
             enabled = false
             listen = "127.0.0.1:8081"
         "#;
-        let err = AppConfig::from_toml(toml)
-            .expect_err("must fail without secure_db_path (fail-closed)");
+        let err =
+            AppConfig::from_toml(toml).expect_err("must fail without secure_db_path (fail-closed)");
         let msg = err.to_string();
         assert!(
             msg.contains("secure_db_path"),

@@ -15,10 +15,10 @@
 
 use prro::db::models::enums::{FiscalMode, ShiftState};
 use prro::db::models::ids::ShiftId;
+use prro::db::open_pool;
 use prro::db::repositories::fiscal_number_config::{self as fn_repo, NewFnConfig};
 use prro::db::repositories::shifts::{self, TransitionOutcome};
 use prro::db::tx::with_immediate;
-use prro::db::open_pool;
 
 const ALL_STATES: [ShiftState; 9] = [
     ShiftState::Created,
@@ -68,11 +68,7 @@ async fn fresh_with_fn() -> (sqlx::SqlitePool, String) {
     (pool, "9000081000".to_string())
 }
 
-async fn seed_shift_in_state(
-    pool: &sqlx::SqlitePool,
-    fn_id: &str,
-    state: ShiftState,
-) -> ShiftId {
+async fn seed_shift_in_state(pool: &sqlx::SqlitePool, fn_id: &str, state: ShiftState) -> ShiftId {
     let id = ShiftId::new();
     sqlx::query(
         "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, cash_balance_kop, \
@@ -97,8 +93,7 @@ async fn tier_a_error_unreachable_via_whitelist_from_any_source() {
         let shift_id = seed_shift_in_state(&pool, &fn_id, from).await;
         let outcome = with_immediate(&pool, move |tx| {
             Box::pin(async move {
-                let o =
-                    shifts::transition_state(tx, shift_id, from, ShiftState::Error).await?;
+                let o = shifts::transition_state(tx, shift_id, from, ShiftState::Error).await?;
                 anyhow::Ok(o)
             })
         })

@@ -46,12 +46,11 @@ async fn open_secure_pool_runs_migrations_secure_and_creates_operators_table() {
     assert_eq!(count, 0, "fresh secure DB has empty operators");
 
     // _sqlx_migrations recorded version 20 for the secure set
-    let version: i64 =
-        sqlx::query("SELECT version FROM _sqlx_migrations WHERE version = 20")
-            .fetch_one(&pool)
-            .await
-            .expect("migration 020 row present in _sqlx_migrations")
-            .get(0);
+    let version: i64 = sqlx::query("SELECT version FROM _sqlx_migrations WHERE version = 20")
+        .fetch_one(&pool)
+        .await
+        .expect("migration 020 row present in _sqlx_migrations")
+        .get(0);
     assert_eq!(version, 20);
 }
 
@@ -100,11 +99,7 @@ async fn open_secure_pool_chmods_wal_and_shm_sidecars() {
     .expect("insert forces WAL write");
 
     for suffix in ["-wal", "-shm"] {
-        let sidecar = std::path::PathBuf::from(format!(
-            "{}{}",
-            path.display(),
-            suffix
-        ));
+        let sidecar = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
         assert!(
             sidecar.exists(),
             "sidecar {sidecar:?} must exist after WAL write"

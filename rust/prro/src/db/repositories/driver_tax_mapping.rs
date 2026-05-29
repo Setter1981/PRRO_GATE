@@ -45,11 +45,19 @@ pub enum DriverTaxMappingRepoError {
     /// uniqueness is not scoped by `is_active`, so soft-deleted rows
     /// still occupy the slot.  Operator must use `update_canonical`
     /// for re-purpose, not re-insert.
-    #[error("duplicate (driver_id, driver_number): driver_id={driver_id} driver_number={driver_number}")]
-    DuplicatePk { driver_id: String, driver_number: i64 },
+    #[error(
+        "duplicate (driver_id, driver_number): driver_id={driver_id} driver_number={driver_number}"
+    )]
+    DuplicatePk {
+        driver_id: String,
+        driver_number: i64,
+    },
 
     #[error("driver_tax_mapping not found: driver_id={driver_id} driver_number={driver_number}")]
-    NotFound { driver_id: String, driver_number: i64 },
+    NotFound {
+        driver_id: String,
+        driver_number: i64,
+    },
 
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),

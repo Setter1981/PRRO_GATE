@@ -38,9 +38,7 @@
 //!      CASH_WITHDRAWAL) have a fixture exercising parse + map.
 
 use prro::db::models::enums::DocType;
-use prro::runtime::ingress::dto::{
-    self, CanonicalCommand, CommandType, MappingError,
-};
+use prro::runtime::ingress::dto::{self, CanonicalCommand, CommandType, MappingError};
 
 const FIXTURE_SELL: &str = r#"{
   "schema_version": "1.0",
@@ -301,22 +299,40 @@ fn each_fiscal_command_type_fixture_parses_and_maps() {
     // struct only carries SELL/RETURN amounts; cash-op amounts live
     // in `raw_frames` and are parsed by M5.
     for (label, fixture, expected_doc_type, expected_total) in [
-        ("SELL",            FIXTURE_SELL,            DocType::Sell,           Some(2500_i64)),
-        ("RETURN",          FIXTURE_RETURN,          DocType::Return,         Some(2500_i64)),
-        ("SHIFT_OPEN",      FIXTURE_SHIFT_OPEN,      DocType::ShiftOpen,      None),
-        ("SHIFT_CLOSE",     FIXTURE_SHIFT_CLOSE,     DocType::ShiftClose,     None),
-        ("X_REPORT",        FIXTURE_X_REPORT,        DocType::XReport,        None),
-        ("Z_REPORT",        FIXTURE_Z_REPORT,        DocType::ZReport,        None),
-        ("SERVICE_IN",      FIXTURE_SERVICE_IN,      DocType::ServiceIn,      None),
-        ("SERVICE_OUT",     FIXTURE_SERVICE_OUT,     DocType::ServiceOut,     None),
-        ("CASH_WITHDRAWAL", FIXTURE_CASH_WITHDRAWAL, DocType::CashWithdrawal, None),
+        ("SELL", FIXTURE_SELL, DocType::Sell, Some(2500_i64)),
+        ("RETURN", FIXTURE_RETURN, DocType::Return, Some(2500_i64)),
+        ("SHIFT_OPEN", FIXTURE_SHIFT_OPEN, DocType::ShiftOpen, None),
+        (
+            "SHIFT_CLOSE",
+            FIXTURE_SHIFT_CLOSE,
+            DocType::ShiftClose,
+            None,
+        ),
+        ("X_REPORT", FIXTURE_X_REPORT, DocType::XReport, None),
+        ("Z_REPORT", FIXTURE_Z_REPORT, DocType::ZReport, None),
+        ("SERVICE_IN", FIXTURE_SERVICE_IN, DocType::ServiceIn, None),
+        (
+            "SERVICE_OUT",
+            FIXTURE_SERVICE_OUT,
+            DocType::ServiceOut,
+            None,
+        ),
+        (
+            "CASH_WITHDRAWAL",
+            FIXTURE_CASH_WITHDRAWAL,
+            DocType::CashWithdrawal,
+            None,
+        ),
     ] {
-        let cmd: CanonicalCommand = serde_json::from_str(fixture)
-            .unwrap_or_else(|e| panic!("{label}: parse fixture: {e}"));
+        let cmd: CanonicalCommand =
+            serde_json::from_str(fixture).unwrap_or_else(|e| panic!("{label}: parse fixture: {e}"));
         let mapped = dto::to_canonical_fiscal_command(&cmd)
             .unwrap_or_else(|e| panic!("{label}: map: {e:?}"));
         assert_eq!(mapped.doc_type, expected_doc_type, "{label}: doc_type");
-        assert_eq!(mapped.total_sum_kop, expected_total, "{label}: total_sum_kop");
+        assert_eq!(
+            mapped.total_sum_kop, expected_total,
+            "{label}: total_sum_kop"
+        );
         assert!(
             mapped.signed_by_cashier_id.is_some(),
             "{label}: signed_by_cashier_id derived from non-empty cashier_id"
@@ -333,10 +349,9 @@ fn each_fiscal_command_type_fixture_parses_and_maps() {
 #[test]
 fn cashier_id_null_maps_to_signed_by_cashier_id_none() {
     // Contract #2 explicit `None`-branch coverage (self-review #7).
-    let cmd: CanonicalCommand = serde_json::from_str(FIXTURE_NULL_CASHIER)
-        .expect("parse null-cashier fixture");
-    let mapped = dto::to_canonical_fiscal_command(&cmd)
-        .expect("map null-cashier fixture");
+    let cmd: CanonicalCommand =
+        serde_json::from_str(FIXTURE_NULL_CASHIER).expect("parse null-cashier fixture");
+    let mapped = dto::to_canonical_fiscal_command(&cmd).expect("map null-cashier fixture");
     assert!(
         mapped.signed_by_cashier_id.is_none(),
         "cashier_id = null must map to signed_by_cashier_id = None"
@@ -345,10 +360,8 @@ fn cashier_id_null_maps_to_signed_by_cashier_id_none() {
 
 #[test]
 fn schema_version_mismatch_returns_typed_error() {
-    let cmd: CanonicalCommand =
-        serde_json::from_str(FIXTURE_BAD_SCHEMA).expect("parse");
-    let err = dto::to_canonical_fiscal_command(&cmd)
-        .expect_err("schema 2.0 must reject");
+    let cmd: CanonicalCommand = serde_json::from_str(FIXTURE_BAD_SCHEMA).expect("parse");
+    let err = dto::to_canonical_fiscal_command(&cmd).expect_err("schema 2.0 must reject");
     match err {
         MappingError::SchemaVersionMismatch { expected, actual } => {
             assert_eq!(expected, "1.0");
@@ -360,12 +373,13 @@ fn schema_version_mismatch_returns_typed_error() {
 
 #[test]
 fn periodic_report_command_type_is_unsupported_for_fiscal_pipeline() {
-    let cmd: CanonicalCommand =
-        serde_json::from_str(FIXTURE_PERIODIC_REPORT).expect("parse");
-    let err = dto::to_canonical_fiscal_command(&cmd)
-        .expect_err("PERIODIC_REPORT not in DocType");
+    let cmd: CanonicalCommand = serde_json::from_str(FIXTURE_PERIODIC_REPORT).expect("parse");
+    let err = dto::to_canonical_fiscal_command(&cmd).expect_err("PERIODIC_REPORT not in DocType");
     assert!(
-        matches!(err, MappingError::UnsupportedCommandType(CommandType::PeriodicReport)),
+        matches!(
+            err,
+            MappingError::UnsupportedCommandType(CommandType::PeriodicReport)
+        ),
         "got: {err:?}"
     );
 }
@@ -445,8 +459,8 @@ fn cashier_id_empty_string_returns_typed_invalid_error() {
     // failure surfaced downstream at the signer with the original
     // context erased.  Boundary rejection: `CashierId::new("")` →
     // `CashierIdError::Empty` → `MappingError::InvalidCashierId(_)`.
-    let cmd: CanonicalCommand = serde_json::from_str(FIXTURE_EMPTY_CASHIER)
-        .expect("parse empty-cashier fixture");
+    let cmd: CanonicalCommand =
+        serde_json::from_str(FIXTURE_EMPTY_CASHIER).expect("parse empty-cashier fixture");
     let err = dto::to_canonical_fiscal_command(&cmd)
         .expect_err("empty cashier_id must yield typed boundary error");
     assert!(
@@ -495,8 +509,8 @@ fn mapped_payload_json_is_wire_shape_not_stage_sign_ready() {
     // stage_sign") is the explicit W4/W5 surface.
 
     let cmd: CanonicalCommand = serde_json::from_str(FIXTURE_SELL).unwrap();
-    let mapped = dto::to_canonical_fiscal_command(&cmd)
-        .expect("DTO mapping is fine; the GAP is downstream");
+    let mapped =
+        dto::to_canonical_fiscal_command(&cmd).expect("DTO mapping is fine; the GAP is downstream");
 
     // Demonstrate the gap structurally — the wire-shape payload_json
     // contains DTO field names that stage_sign's CheckJson would
@@ -559,10 +573,14 @@ fn xreport_servicein_serviceout_cashwithdrawal_map_but_signer_will_reject() {
     // unsupported set is `derive_wire_artifact_kind`'s match).
 
     for (label, fixture, expected_doc_type) in [
-        ("X_REPORT",        FIXTURE_X_REPORT,        DocType::XReport),
-        ("SERVICE_IN",      FIXTURE_SERVICE_IN,      DocType::ServiceIn),
-        ("SERVICE_OUT",     FIXTURE_SERVICE_OUT,     DocType::ServiceOut),
-        ("CASH_WITHDRAWAL", FIXTURE_CASH_WITHDRAWAL, DocType::CashWithdrawal),
+        ("X_REPORT", FIXTURE_X_REPORT, DocType::XReport),
+        ("SERVICE_IN", FIXTURE_SERVICE_IN, DocType::ServiceIn),
+        ("SERVICE_OUT", FIXTURE_SERVICE_OUT, DocType::ServiceOut),
+        (
+            "CASH_WITHDRAWAL",
+            FIXTURE_CASH_WITHDRAWAL,
+            DocType::CashWithdrawal,
+        ),
     ] {
         let cmd: CanonicalCommand = serde_json::from_str(fixture).unwrap();
         let mapped = dto::to_canonical_fiscal_command(&cmd)

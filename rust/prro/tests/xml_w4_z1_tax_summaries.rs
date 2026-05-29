@@ -74,7 +74,10 @@ fn calc_tax_txal_1_excise_pre_vat() {
     //   txsm = (10000 + 500) * 20 / 120 = 10500 * 20 / 120 = 1750
     let (txsm, dtsm) = calc_tax_ok(10000, 20.0, 5.0, 1);
     assert_eq!(dtsm, 500, "TXAL=1 dtsm = group * dtpr / 100");
-    assert_eq!(txsm, 1750, "TXAL=1 txsm = (group + dtsm) * txpr / (100 + txpr)");
+    assert_eq!(
+        txsm, 1750,
+        "TXAL=1 txsm = (group + dtsm) * txpr / (100 + txpr)"
+    );
 }
 
 // ─── calc_tax: TXAL=2 (excise post-VAT) ───────────────────────────
@@ -172,7 +175,10 @@ fn calc_tax_txal_0_non_boundary_unchanged() {
 #[test]
 fn empty_tax_summaries_emits_no_tx_inside_e() {
     let xml = build_sell(vec![]);
-    assert!(!xml.contains("<TX "), "empty tax_summaries must not emit <TX>");
+    assert!(
+        !xml.contains("<TX "),
+        "empty tax_summaries must not emit <TX>"
+    );
     // <E> still closes properly.
     assert!(xml.contains("</E>"));
 }
@@ -192,15 +198,19 @@ fn tax_summary_emits_tx_child_inside_e_with_alphabetical_attrs() {
     }]);
     // Attrs alphabetical: DTPR, DTSM, TX, TXAL, TXPR, TXSM, TXTY.
     assert!(
-        xml.contains(r#"<TX DTPR="0.00" DTSM="0" TX="1" TXAL="0" TXPR="20.00" TXSM="2000" TXTY="0"></TX>"#),
+        xml.contains(
+            r#"<TX DTPR="0.00" DTSM="0" TX="1" TXAL="0" TXPR="20.00" TXSM="2000" TXTY="0"></TX>"#
+        ),
         "TX attrs must be alphabetical: got {xml}"
     );
     // TX is INSIDE <E>...</E>, not after.
     let e_open = xml.find("<E ").expect("E opens");
     let tx_pos = xml.find("<TX ").expect("TX present");
     let e_close = xml.find("</E>").expect("E closes");
-    assert!(e_open < tx_pos && tx_pos < e_close,
-        "<TX> must be a child of <E>, not a sibling: {xml}");
+    assert!(
+        e_open < tx_pos && tx_pos < e_close,
+        "<TX> must be a child of <E>, not a sibling: {xml}"
+    );
 }
 
 #[test]

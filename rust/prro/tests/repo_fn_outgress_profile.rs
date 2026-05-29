@@ -36,9 +36,7 @@ async fn set_and_get_roundtrip() {
 #[tokio::test]
 async fn get_missing_returns_none() {
     let (_dir, pool) = fresh_secure_pool().await;
-    let result = repo::get_profile(&pool, "4000000099")
-        .await
-        .expect("query");
+    let result = repo::get_profile(&pool, "4000000099").await.expect("query");
     assert!(result.is_none());
 }
 
@@ -91,9 +89,7 @@ async fn list_profiles_returns_all() {
         .await
         .unwrap();
 
-    let all = repo::list_profiles(&pool)
-        .await
-        .expect("list");
+    let all = repo::list_profiles(&pool).await.expect("list");
     assert_eq!(all.len(), 2);
 }
 
@@ -108,9 +104,7 @@ async fn delete_profile_removes_row() {
         .await
         .expect("delete");
 
-    let profile = repo::get_profile(&pool, "4000000001")
-        .await
-        .unwrap();
+    let profile = repo::get_profile(&pool, "4000000001").await.unwrap();
     assert!(profile.is_none());
 }
 

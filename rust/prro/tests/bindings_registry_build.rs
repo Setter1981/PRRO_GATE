@@ -18,11 +18,9 @@ mod common;
 use async_trait::async_trait;
 use prro::db::models::enums::{FiscalMode, Severity};
 use prro::db::open_pool;
-use prro::db::repositories::{audit_log, fiscal_number_config as fn_cfg, operators as ops_repo};
 use prro::db::open_secure_pool;
-use prro::runtime::bindings::{
-    BindingsRegistry, KeyLoadFailure, OperatorKeyLoader,
-};
+use prro::db::repositories::{audit_log, fiscal_number_config as fn_cfg, operators as ops_repo};
+use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
@@ -78,7 +76,12 @@ fn fn_config(fn_id: &str) -> fn_cfg::NewFnConfig {
     }
 }
 
-fn new_op(operator_id: &str, fn_id: &str, key_path: &str, password: &[u8]) -> ops_repo::NewOperator {
+fn new_op(
+    operator_id: &str,
+    fn_id: &str,
+    key_path: &str,
+    password: &[u8],
+) -> ops_repo::NewOperator {
     ops_repo::NewOperator {
         operator_id: operator_id.into(),
         fiscal_number: fn_id.into(),
@@ -107,14 +110,10 @@ async fn happy_single_operator_lands_in_registry() {
     .await
     .expect("seed operator");
 
-    let registry = BindingsRegistry::build_from_db(
-        &pool_secure,
-        &pool_main,
-        dps(),
-        &AlwaysOkLoader,
-    )
-    .await
-    .expect("build_from_db");
+    let registry =
+        BindingsRegistry::build_from_db(&pool_secure, &pool_main, dps(), &AlwaysOkLoader)
+            .await
+            .expect("build_from_db");
 
     assert_eq!(registry.len(), 1);
     assert!(registry.get("4000000001").is_some());
@@ -194,14 +193,10 @@ async fn orphan_operator_fn_skipped_and_audited() {
     .await
     .unwrap();
 
-    let registry = BindingsRegistry::build_from_db(
-        &pool_secure,
-        &pool_main,
-        dps(),
-        &AlwaysOkLoader,
-    )
-    .await
-    .expect("build");
+    let registry =
+        BindingsRegistry::build_from_db(&pool_secure, &pool_main, dps(), &AlwaysOkLoader)
+            .await
+            .expect("build");
 
     assert_eq!(registry.len(), 1, "only FN-A makes it; FN-B is orphan");
     assert!(registry.get("4000000001").is_some());
@@ -216,7 +211,11 @@ async fn orphan_operator_fn_skipped_and_audited() {
         .expect("OPERATOR_ORPHAN_FN audit emitted for FN-B");
     assert_eq!(orphan.severity, Severity::Critical);
     assert!(
-        orphan.event_payload_json.as_deref().unwrap_or("").contains("OP-B"),
+        orphan
+            .event_payload_json
+            .as_deref()
+            .unwrap_or("")
+            .contains("OP-B"),
         "audit payload should include the orphan operator_id"
     );
 }
@@ -231,14 +230,10 @@ async fn configured_fn_without_operator_row_emits_not_registered_audit() {
         .await
         .unwrap();
 
-    let registry = BindingsRegistry::build_from_db(
-        &pool_secure,
-        &pool_main,
-        dps(),
-        &AlwaysOkLoader,
-    )
-    .await
-    .expect("build");
+    let registry =
+        BindingsRegistry::build_from_db(&pool_secure, &pool_main, dps(), &AlwaysOkLoader)
+            .await
+            .expect("build");
 
     assert!(registry.is_empty(), "no operators row → empty registry");
 

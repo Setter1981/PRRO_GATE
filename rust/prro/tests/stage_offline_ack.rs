@@ -737,7 +737,13 @@ async fn insert_signed_doc_with_type(
 #[tokio::test]
 async fn applied_path_works_with_opened_local_pending_drain_for_sell() {
     let (_d, pool) = fresh_pool().await;
-    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::OpenedLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        FN,
+        NodeMode::Offline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
     let session_id = OfflineSessionId::new();
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
     seed_code(&pool, FN, 42).await;
@@ -756,7 +762,13 @@ async fn applied_path_works_with_opened_local_pending_drain_for_sell() {
 #[tokio::test]
 async fn applied_path_works_with_opened_local_pending_drain_for_return() {
     let (_d, pool) = fresh_pool().await;
-    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::OpenedLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        FN,
+        NodeMode::Offline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
     let session_id = OfflineSessionId::new();
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
     seed_code(&pool, FN, 43).await;
@@ -775,7 +787,13 @@ async fn applied_path_works_with_opened_local_pending_drain_for_return() {
 #[tokio::test]
 async fn refusal_shift_open_on_opened_local_pending_drain_returns_shift_not_opened() {
     let (_d, pool) = fresh_pool().await;
-    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::OpenedLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        FN,
+        NodeMode::Offline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
     let session_id = OfflineSessionId::new();
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
     seed_code(&pool, FN, 44).await;
@@ -800,7 +818,13 @@ async fn refusal_shift_open_on_opened_local_pending_drain_returns_shift_not_open
 #[tokio::test]
 async fn refusal_sell_on_closing_local_pending_drain_returns_shift_not_opened() {
     let (_d, pool) = fresh_pool().await;
-    seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::ClosingLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        FN,
+        NodeMode::Offline,
+        ShiftState::ClosingLocalPendingDrain,
+    )
+    .await;
     let session_id = OfflineSessionId::new();
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
     seed_code(&pool, FN, 45).await;

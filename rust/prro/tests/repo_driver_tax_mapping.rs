@@ -22,7 +22,12 @@ async fn fresh_secure_pool() -> (tempfile::TempDir, SqlitePool) {
     (dir, pool)
 }
 
-fn sample(driver_id: &str, driver_number: i64, letter: Option<&str>, canonical: i64) -> NewDriverTaxMapping {
+fn sample(
+    driver_id: &str,
+    driver_number: i64,
+    letter: Option<&str>,
+    canonical: i64,
+) -> NewDriverTaxMapping {
     NewDriverTaxMapping {
         driver_id: driver_id.to_string(),
         driver_number,

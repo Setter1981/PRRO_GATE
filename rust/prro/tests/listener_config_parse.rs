@@ -53,8 +53,7 @@ listen = "127.0.0.1:8080"
 
 #[test]
 fn config_parses_three_listeners_with_distinct_fn_per_port() {
-    let cfg = AppConfig::from_toml(SAMPLE_CONFIG_WITH_LISTENERS)
-        .expect("parse");
+    let cfg = AppConfig::from_toml(SAMPLE_CONFIG_WITH_LISTENERS).expect("parse");
     assert_eq!(cfg.listeners.len(), 3);
 
     let l0 = &cfg.listeners[0];
@@ -95,8 +94,7 @@ port = 9099
 driver_id = "maria304"
 fn = "4538765845"
 "#;
-    let err = AppConfig::from_toml(bogus_kind)
-        .expect_err("unknown listener kind must fail-fast");
+    let err = AppConfig::from_toml(bogus_kind).expect_err("unknown listener kind must fail-fast");
     let msg = format!("{err}");
     assert!(
         msg.contains("bogus_protocol_typo") || msg.contains("variant"),

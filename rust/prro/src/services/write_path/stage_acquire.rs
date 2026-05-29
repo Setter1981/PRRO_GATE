@@ -21,7 +21,9 @@ use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
 use super::tax_summary::TaxResolutionSnapshot;
-use super::types::{Channel, CanonicalFiscalCommand, RejectionReason, WorkerContext, WorkerProcessResult};
+use super::types::{
+    CanonicalFiscalCommand, Channel, RejectionReason, WorkerContext, WorkerProcessResult,
+};
 
 /// Public stage-1 entry.  Opens one `with_immediate` envelope and
 /// runs the lease + guard + lnd-allocate + INSERT PREPARED + audit
@@ -61,15 +63,14 @@ pub async fn run(
     // pool_secure and proceed; the lease CAS inside the tx
     // re-checks NEW state — race-OK (we discard an unused snapshot
     // by simply not inserting it).
-    let peeked_fn_id = match ingress_inbox::peek_fiscal_number_by_request_id(
-        pool, &request_id,
-    ).await? {
-        Some(fn_id) => fn_id,
-        None => return Ok(WorkerProcessResult::Noop),
-    };
-    let tax_snapshot = crate::runtime::tax_snapshot::load_for_fn_driver(
-        pool_secure, &peeked_fn_id, driver_id,
-    ).await?;
+    let peeked_fn_id =
+        match ingress_inbox::peek_fiscal_number_by_request_id(pool, &request_id).await? {
+            Some(fn_id) => fn_id,
+            None => return Ok(WorkerProcessResult::Noop),
+        };
+    let tax_snapshot =
+        crate::runtime::tax_snapshot::load_for_fn_driver(pool_secure, &peeked_fn_id, driver_id)
+            .await?;
 
     // W4-Z2a piece 15 (review round 2 M2 close) — Resume snapshot
     // reload hoist.  If a pending fiscal_documents row exists for
@@ -102,7 +103,8 @@ pub async fn run(
         match resume_preload {
             Some((doc_id, Some(snapshot_id))) => {
                 match crate::db::repositories::signing_config_snapshots::get_by_id(
-                    pool, snapshot_id,
+                    pool,
+                    snapshot_id,
                 )
                 .await
                 {
@@ -142,10 +144,8 @@ pub async fn run(
                         let was_new = with_immediate(pool, move |tx| {
                             let forensic_payload = forensic_payload.clone();
                             Box::pin(async move {
-                                let was_new = ingress_inbox::mark_rejected_if_new_tx(
-                                    tx, &request_id,
-                                )
-                                .await?;
+                                let was_new =
+                                    ingress_inbox::mark_rejected_if_new_tx(tx, &request_id).await?;
                                 // Piece 17 (round-4 C close): only the
                                 // winning worker (was_new=true) commits
                                 // the forensic event.  Under thundering
@@ -863,18 +863,14 @@ fn check_shift_guard(
         // reason for (ShiftOpen, ClosingLocalPendingDrain).  Shift is
         // mid-close, not "already open"; ShiftClosingInFlight is the
         // forensic-accurate label.
-        (ShiftOpen, ClosingLocalPendingDrain, _) => {
-            Some(RejectionReason::ShiftClosingInFlight)
-        }
+        (ShiftOpen, ClosingLocalPendingDrain, _) => Some(RejectionReason::ShiftClosingInFlight),
         (ShiftOpen, _, _) => Some(RejectionReason::ShiftAlreadyOpen),
         (ShiftClose, Opened, _) => None,
         (ShiftClose, OpenedLocalPendingDrain, _) => {
             // Spec §5.7 L2 — offline shift close not modeled.
             Some(RejectionReason::OfflineShiftCloseNotSupported)
         }
-        (ShiftClose, ClosingLocalPendingDrain, _) => {
-            Some(RejectionReason::ShiftClosingInFlight)
-        }
+        (ShiftClose, ClosingLocalPendingDrain, _) => Some(RejectionReason::ShiftClosingInFlight),
         (ZReport, Opened, _) => None,
         (ZReport, OpenedLocalPendingDrain, _) => {
             // Pre-W10 guardrail (both channels).  Spec §3.4 + operator
@@ -882,33 +878,27 @@ fn check_shift_guard(
             // refusal with coupled pool/backlog/edge-7 logic.
             Some(RejectionReason::ZReportBlockedBacklogDrainPending)
         }
-        (ZReport, ClosingLocalPendingDrain, _) => {
-            Some(RejectionReason::ShiftClosingInFlight)
-        }
+        (ZReport, ClosingLocalPendingDrain, _) => Some(RejectionReason::ShiftClosingInFlight),
         // ShiftClose / ZReport against `Closed` — shift is terminal,
         // operator should issue ShiftOpen first.
-        (ShiftClose | ZReport, Closed, _) => {
-            Some(RejectionReason::ShiftNotOpen { current: shift_state })
-        }
+        (ShiftClose | ZReport, Closed, _) => Some(RejectionReason::ShiftNotOpen {
+            current: shift_state,
+        }),
 
         // ── Mid-transition (Created / Opening / Closing) — block all.
-        (_, Created | Opening | Closing, _) => {
-            Some(RejectionReason::ShiftNotOpen { current: shift_state })
-        }
+        (_, Created | Opening | Closing, _) => Some(RejectionReason::ShiftNotOpen {
+            current: shift_state,
+        }),
 
         // ── Regular fiscal ops in Opened — channel-irrelevant happy.
-        (
-            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
-            Opened,
-            _,
-        ) => None,
+        (Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport, Opened, _) => None,
 
         // ── Regular fiscal ops in Closed — channel-irrelevant refusal.
-        (
-            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
-            Closed,
-            _,
-        ) => Some(RejectionReason::ShiftNotOpen { current: shift_state }),
+        (Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport, Closed, _) => {
+            Some(RejectionReason::ShiftNotOpen {
+                current: shift_state,
+            })
+        }
 
         // ── W14a-2b channel-aware OpenedLocalPendingDrain ──
         // Offline channel: Pattern C resilience surface — allowed.
@@ -990,11 +980,7 @@ mod channel_aware_matrix_tests {
     /// Independent re-implementation of the spec §3.4 matrix used as
     /// the test oracle.  Authoritative `check_shift_guard` MUST agree
     /// with this verdict per cell.
-    fn expected_outcome(
-        doc: DocType,
-        state: ShiftState,
-        ch: Channel,
-    ) -> Option<RejectionReason> {
+    fn expected_outcome(doc: DocType, state: ShiftState, ch: Channel) -> Option<RejectionReason> {
         use Channel::*;
         use DocType::*;
         use ShiftState::*;
@@ -1038,16 +1024,10 @@ mod channel_aware_matrix_tests {
         }
         // Regular fiscal ops.
         match (doc, state, ch) {
-            (
-                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
-                Opened,
-                _,
-            ) => None,
-            (
-                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
-                Closed,
-                _,
-            ) => Some(RejectionReason::ShiftNotOpen { current: state }),
+            (Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport, Opened, _) => None,
+            (Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport, Closed, _) => {
+                Some(RejectionReason::ShiftNotOpen { current: state })
+            }
             (
                 Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
                 OpenedLocalPendingDrain,
@@ -1063,9 +1043,7 @@ mod channel_aware_matrix_tests {
                 ClosingLocalPendingDrain,
                 _,
             ) => Some(RejectionReason::PostLocalCloseSaleRefused),
-            _ => unreachable!(
-                "matrix oracle: unhandled cell ({doc:?}, {state:?}, {ch:?})"
-            ),
+            _ => unreachable!("matrix oracle: unhandled cell ({doc:?}, {state:?}, {ch:?})"),
         }
     }
 

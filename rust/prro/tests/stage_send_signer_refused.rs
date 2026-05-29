@@ -135,8 +135,8 @@ async fn stage_send_signer_mismatch_returns_signer_refused_with_audit() {
         &pool,
         0x11,
         "SELL",
-        Some("cashier-petya"),  // signer
-        Some("cashier-vasya"),  // opener
+        Some("cashier-petya"), // signer
+        Some("cashier-vasya"), // opener
         true,
     )
     .await;
@@ -198,20 +198,16 @@ async fn stage_send_signer_mismatch_returns_signer_refused_with_audit() {
     assert_eq!(stub.call_count(), 0, "send_chk MUST NOT fire on refusal");
 
     // No transport_trace row (no intent marked).
-    let trace_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transport_trace WHERE document_id = ?",
-    )
-    .bind(doc)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let trace_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM transport_trace WHERE document_id = ?")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(trace_count, 0, "no transport_trace row on signer refusal");
 
     // No STAGE_SEND_INTENT_MARKED (we refused BEFORE marker).
-    assert_eq!(
-        audit_count(&pool, doc, "STAGE_SEND_INTENT_MARKED").await,
-        0
-    );
+    assert_eq!(audit_count(&pool, doc, "STAGE_SEND_INTENT_MARKED").await, 0);
 }
 
 // ─── SignerIdMissing arm ─────────────────────────────────────────────
@@ -311,19 +307,15 @@ async fn stage_send_sent_state_with_null_shift_returns_state_conflict_not_signer
         "MED-C5-1 invariant: stale terminal docs MUST NOT trigger signer_guard"
     );
     // No transport_trace row (no intent marked).
-    let trace_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transport_trace WHERE document_id = ?",
-    )
-    .bind(doc)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let trace_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM transport_trace WHERE document_id = ?")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(trace_count, 0);
     // No STAGE_SEND_INTENT_MARKED.
-    assert_eq!(
-        audit_count(&pool, doc, "STAGE_SEND_INTENT_MARKED").await,
-        0
-    );
+    assert_eq!(audit_count(&pool, doc, "STAGE_SEND_INTENT_MARKED").await, 0);
 }
 
 #[tokio::test]
@@ -377,9 +369,7 @@ async fn stage_send_shift_missing_returns_signer_refused() {
     let outcome = stage_send::run(&pool, &stub, doc, None).await.unwrap();
     assert!(matches!(
         outcome,
-        StageSendOutcome::SignerRefused(
-            SignerCashierMismatch::ShiftMissingForFiscalDoc { .. }
-        )
+        StageSendOutcome::SignerRefused(SignerCashierMismatch::ShiftMissingForFiscalDoc { .. })
     ));
     assert_eq!(audit_count(&pool, doc, "SIGNER_CASHIER_MISMATCH").await, 1);
     assert_eq!(stub.call_count(), 0);

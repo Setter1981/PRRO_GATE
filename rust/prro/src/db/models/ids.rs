@@ -255,10 +255,7 @@ mod cashier_id_tests {
     #[test]
     fn new_rejects_too_long() {
         let s = "x".repeat(CashierId::MAX_LEN + 1);
-        assert!(matches!(
-            CashierId::new(s),
-            Err(CashierIdError::TooLong(_))
-        ));
+        assert!(matches!(CashierId::new(s), Err(CashierIdError::TooLong(_))));
     }
 
     #[test]

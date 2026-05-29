@@ -10,11 +10,11 @@
 
 use prro::db::models::enums::{DocType, FiscalMode, NodeMode, Severity, ShiftState};
 use prro::db::models::ids::{RequestId, ShiftId};
-use prro::db::{open_pool, open_secure_pool};
 use prro::db::repositories::{
     fiscal_documents as fd, fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig,
     ingress_inbox as inbox, ingress_inbox::NewInboxEntry, shifts,
 };
+use prro::db::{open_pool, open_secure_pool};
 use prro::services::write_path::{
     stage_acquire,
     types::{CanonicalFiscalCommand, RejectionReason, WorkerProcessResult},
@@ -259,9 +259,15 @@ async fn stage1_sell_happy_path_with_opened_shift() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
 
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
 
     let ctx = match result {
         WorkerProcessResult::Proceed(c) => c,
@@ -280,7 +286,7 @@ async fn stage1_sell_happy_path_with_opened_shift() {
     // MUST be set at INSERT (NOT NULL, points to inserted snapshot row).
     // Closes external-mid-review CRIT-2 two-envelope crash window.
     let snapshot_id_persisted: Option<i64> = sqlx::query_scalar(
-        "SELECT signing_config_snapshot_id FROM fiscal_documents WHERE document_id = ?"
+        "SELECT signing_config_snapshot_id FROM fiscal_documents WHERE document_id = ?",
     )
     .bind(ctx.document.document_id)
     .fetch_one(&pool)
@@ -292,17 +298,17 @@ async fn stage1_sell_happy_path_with_opened_shift() {
     );
     let id = snapshot_id_persisted.unwrap();
     assert_eq!(
-        id, ctx.tax_resolution_snapshot_id.expect("ctx FK populated"),
+        id,
+        ctx.tax_resolution_snapshot_id.expect("ctx FK populated"),
         "persisted FK must match WorkerContext id (same insert_or_get_id_tx result)"
     );
     // Confirm snapshot row exists.
-    let snapshot_row_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM signing_config_snapshots WHERE id = ?"
-    )
-    .bind(id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let snapshot_row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM signing_config_snapshots WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(snapshot_row_count, 1, "FK references existing snapshot row");
 }
 
@@ -323,9 +329,15 @@ async fn stage1_shift_open_happy_path_with_closed_state() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::ShiftOpen).await;
 
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ShiftOpen))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::ShiftOpen),
+    )
+    .await
+    .unwrap();
 
     let ctx = match result {
         WorkerProcessResult::Proceed(c) => c,
@@ -364,9 +376,15 @@ async fn stage1_lease_miss_returns_noop_no_state_mutation_no_audit() {
         .await
         .unwrap();
 
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ShiftOpen))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::ShiftOpen),
+    )
+    .await
+    .unwrap();
 
     assert!(
         matches!(result, WorkerProcessResult::Noop),
@@ -404,9 +422,15 @@ async fn stage1_resume_detect_existing_prepared_doc_skips_lnd_alloc() {
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
 
     // First call: happy path — INSERTs PREPARED at lnd=1, advances to 2.
-    let _ = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let _ = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
     let lnd_after_first = next_lnd(&pool).await;
     assert_eq!(lnd_after_first, 2);
 
@@ -419,9 +443,15 @@ async fn stage1_resume_detect_existing_prepared_doc_skips_lnd_alloc() {
         .unwrap();
 
     // Second call: get_by_request_id_tx finds existing PREPARED → Resumed.
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
 
     match result {
         WorkerProcessResult::Resumed(ctx) => {
@@ -467,9 +497,15 @@ async fn stage1_unique_fn_lnd_collision_fails_closed() {
 
     // First call: lnd=1.
     let req1 = seed_inbox_new(&pool, DocType::Sell).await;
-    stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req1, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req1,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
     assert_eq!(next_lnd(&pool).await, 2);
 
     // Force collision: rewind next_lnd backwards.
@@ -482,7 +518,14 @@ async fn stage1_unique_fn_lnd_collision_fails_closed() {
     // Second call: allocate_next_lnd will return 1 again →
     // INSERT fiscal_documents collision on ux_fd_fn_lnd → tx rollback.
     let req2 = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req2, cmd(DocType::Sell)).await;
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req2,
+        cmd(DocType::Sell),
+    )
+    .await;
     assert!(result.is_err(), "UNIQUE collision must surface as Err");
     let msg = format!("{:?}", result.unwrap_err());
     assert!(
@@ -576,9 +619,15 @@ async fn stage1_sell_with_closed_shift_rejects_inbox_no_doc() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
 
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
 
     match result {
         WorkerProcessResult::Rejected {
@@ -614,9 +663,15 @@ async fn stage1_shift_close_with_opened_shift_proceeds() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::ShiftClose).await;
 
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ShiftClose))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::ShiftClose),
+    )
+    .await
+    .unwrap();
 
     let ctx = match result {
         WorkerProcessResult::Proceed(c) => c,
@@ -651,9 +706,15 @@ async fn stage1_node_blocked_rejects_with_audit() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
 
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
 
     assert!(
         matches!(
@@ -692,9 +753,15 @@ async fn stage1_node_going_online_rejects_with_audit() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(
             result,
@@ -725,9 +792,15 @@ async fn stage1_node_stop_mode_rejects_with_audit() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(
             result,
@@ -758,9 +831,15 @@ async fn stage1_node_crypto_degraded_rejects_with_audit() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(
             result,
@@ -818,9 +897,15 @@ async fn stage1_offline_op_on_online_channel_with_pending_drain_refused() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(
             result,
@@ -850,9 +935,15 @@ async fn stage1_sale_on_closing_local_pending_drain_refused() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(
             result,
@@ -881,9 +972,15 @@ async fn stage1_shift_close_on_opened_local_pending_drain_refused() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::ShiftClose).await;
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ShiftClose))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::ShiftClose),
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(
             result,
@@ -913,9 +1010,15 @@ async fn stage1_shift_open_on_closing_local_pending_drain_refused() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::ShiftOpen).await;
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ShiftOpen))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::ShiftOpen),
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(
             result,
@@ -948,27 +1051,32 @@ async fn stage1_offline_sell_on_opened_local_pending_drain_carries_shift_id() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
     let ctx = match result {
         WorkerProcessResult::Proceed(c) => c,
         other => panic!("expected Proceed, got {other:?}"),
     };
-    let active_shift = ctx
-        .active_shift
-        .expect("HIGH-C4-1 invariant: active_shift must be Some for OpenedLocalPendingDrain offline path");
+    let active_shift = ctx.active_shift.expect(
+        "HIGH-C4-1 invariant: active_shift must be Some for OpenedLocalPendingDrain offline path",
+    );
     assert_eq!(active_shift.shift_id, shift_id);
     assert_eq!(active_shift.state, ShiftState::OpenedLocalPendingDrain);
     assert_eq!(ctx.document.doc_type, DocType::Sell);
     // Verify the persisted ledger row carries shift_id (NOT NULL).
-    let persisted_shift_id: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT shift_id FROM fiscal_documents WHERE document_id = ?",
-    )
-    .bind(ctx.document.document_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let persisted_shift_id: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT shift_id FROM fiscal_documents WHERE document_id = ?")
+            .bind(ctx.document.document_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         persisted_shift_id.expect("shift_id must be NOT NULL"),
         shift_id.as_bytes().to_vec(),
@@ -976,13 +1084,12 @@ async fn stage1_offline_sell_on_opened_local_pending_drain_carries_shift_id() {
     );
     // MED-C4-3: persisted fs_mode must reflect the offline channel —
     // NOT the pre-fix hardcoded "ONLINE".
-    let persisted_fs_mode: String = sqlx::query_scalar(
-        "SELECT fs_mode FROM fiscal_documents WHERE document_id = ?",
-    )
-    .bind(ctx.document.document_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let persisted_fs_mode: String =
+        sqlx::query_scalar("SELECT fs_mode FROM fiscal_documents WHERE document_id = ?")
+            .bind(ctx.document.document_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         persisted_fs_mode, "OFFLINE",
         "fs_mode must be derived from channel; offline path → 'OFFLINE'",
@@ -1006,9 +1113,15 @@ async fn stage1_offline_op_on_opened_local_pending_drain_missing_shift_id_is_inv
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(
             result,
@@ -1035,9 +1148,15 @@ async fn stage1_z_report_on_opened_local_pending_drain_offline_blocked() {
     )
     .await;
     let req_id = seed_inbox_new(&pool, DocType::ZReport).await;
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ZReport))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::ZReport),
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(
             result,
@@ -1048,11 +1167,7 @@ async fn stage1_z_report_on_opened_local_pending_drain_offline_blocked() {
         "got {result:?}"
     );
     assert_eq!(
-        audit_count_for_event(
-            &pool,
-            "OFFLINE_Z_REPORT_BACKLOG_DRAIN_PENDING_REFUSED"
-        )
-        .await,
+        audit_count_for_event(&pool, "OFFLINE_Z_REPORT_BACKLOG_DRAIN_PENDING_REFUSED").await,
         1
     );
 }
@@ -1074,9 +1189,15 @@ async fn stage1_shift_invariant_violation_caught() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::Sell).await;
 
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
 
     assert!(
         matches!(
@@ -1113,9 +1234,15 @@ async fn stage1_missing_profile_binding_rejects_inbox_no_doc_no_lnd() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::ShiftOpen).await;
 
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ShiftOpen))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::ShiftOpen),
+    )
+    .await
+    .unwrap();
 
     assert!(
         matches!(
@@ -1165,9 +1292,15 @@ async fn stage1_command_inbox_hash_mismatch_rejects_no_doc_no_lnd() {
     // inbox carries a non-zero hash; cmd() carries [0u8; 32].
     let req_id = seed_inbox_with_overrides(&pool, DocType::Sell.as_str(), [0xAAu8; 32]).await;
 
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
 
     match result {
         WorkerProcessResult::Rejected {
@@ -1204,9 +1337,15 @@ async fn stage1_command_inbox_doc_type_mismatch_rejects_no_doc_no_lnd() {
     // inbox.operation_type = "RETURN", cmd.doc_type = SELL — mismatch.
     let req_id = seed_inbox_with_overrides(&pool, "RETURN", [0u8; 32]).await;
 
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
 
     match result {
         WorkerProcessResult::Rejected {
@@ -1260,9 +1399,15 @@ async fn stage1_terminal_existing_doc_rejects_not_resumed() {
     .await
     .unwrap();
 
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::Sell))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::Sell),
+    )
+    .await
+    .unwrap();
 
     match result {
         WorkerProcessResult::Rejected {
@@ -1308,9 +1453,15 @@ async fn stage1_shift_open_against_error_state_rejects_as_shift_in_error() {
     .await;
     let req_id = seed_inbox_new(&pool, DocType::ShiftOpen).await;
 
-    let result = stage_acquire::run(&pool, &pool_secure, TEST_DRIVER_ID, req_id, cmd(DocType::ShiftOpen))
-        .await
-        .unwrap();
+    let result = stage_acquire::run(
+        &pool,
+        &pool_secure,
+        TEST_DRIVER_ID,
+        req_id,
+        cmd(DocType::ShiftOpen),
+    )
+    .await
+    .unwrap();
 
     // Critical ordering: Error must take precedence over the
     // ShiftOpen catch-all (which would otherwise label this as
@@ -1361,9 +1512,7 @@ fn _unused_imports_suppression() {
         cash_balance_kop: 0,
         // W14a-2b additive — placeholder; sentinel back-fill semantics
         // mirror the W14a-1 production rows.
-        opened_by_cashier_id: prro::db::models::ids::CashierId::new(
-            "__test_unused_imports__",
-        )
-        .expect("valid cashier id"),
+        opened_by_cashier_id: prro::db::models::ids::CashierId::new("__test_unused_imports__")
+            .expect("valid cashier id"),
     };
 }

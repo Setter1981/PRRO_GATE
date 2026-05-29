@@ -81,7 +81,7 @@ pub fn allowed_transition(from: ShiftState, to: ShiftState) -> bool {
             | (Closing, Opened)                             // 11
             | (Closing, RequiresManualReconciliation)       // 12
             | (ClosingLocalPendingDrain, Closed)            // 13
-            | (ClosingLocalPendingDrain, RequiresManualReconciliation)  // 14
+            | (ClosingLocalPendingDrain, RequiresManualReconciliation) // 14
     )
 }
 
@@ -111,13 +111,8 @@ pub fn allowed_transition(from: ShiftState, to: ShiftState) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransitionOutcome {
     Applied,
-    Forbidden {
-        from: ShiftState,
-        to: ShiftState,
-    },
-    Conflict {
-        observed: ShiftState,
-    },
+    Forbidden { from: ShiftState, to: ShiftState },
+    Conflict { observed: ShiftState },
     NotFound,
 }
 
@@ -457,7 +452,7 @@ pub async fn force_to_error_with_audit(
     // (matches senior_close pattern at line 655).
     // PR #66 R3 LOW-R3-1: renamed local from shadowing parameter `actor_id`
     // to `normalized_actor` for readability.
-    let normalized_actor = actor_id.filter(|s| !s.is_empty());  // R2 LOW-4: drop Some("")
+    let normalized_actor = actor_id.filter(|s| !s.is_empty()); // R2 LOW-4: drop Some("")
     let row: Option<(ShiftState, String)> = sqlx::query_as(
         r#"SELECT state as "state: ShiftState", fiscal_number FROM shifts WHERE shift_id = ?"#,
     )
@@ -857,9 +852,8 @@ pub async fn senior_cashier_close_shift_with_audit(
             FORCE_SEAM_EVIDENCE_MAX_BYTES
         )));
     }
-    serde_json::from_str::<serde_json::Value>(evidence_json).map_err(|e| {
-        SeniorCloseError::InvalidEvidenceJson(format!("not valid JSON: {e}"))
-    })?;
+    serde_json::from_str::<serde_json::Value>(evidence_json)
+        .map_err(|e| SeniorCloseError::InvalidEvidenceJson(format!("not valid JSON: {e}")))?;
 
     // 2. Load current shift state + fiscal_number (single tx-bound read).
     let row: Option<(ShiftState, String)> = sqlx::query_as(

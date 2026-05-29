@@ -259,7 +259,9 @@ pub fn to_canonical_fiscal_command(
         CommandType::ServiceOut => DocType::ServiceOut,
         CommandType::CashWithdrawal => DocType::CashWithdrawal,
         CommandType::PeriodicReport => {
-            return Err(MappingError::UnsupportedCommandType(CommandType::PeriodicReport));
+            return Err(MappingError::UnsupportedCommandType(
+                CommandType::PeriodicReport,
+            ));
         }
     };
 
@@ -280,9 +282,7 @@ pub fn to_canonical_fiscal_command(
     let total_sum_kop = match cmd.command_type {
         CommandType::Sell => Some(cmd.payload.totals.sale_kopecks as i64),
         CommandType::Return => Some(cmd.payload.totals.return_kopecks as i64),
-        CommandType::ServiceIn
-        | CommandType::ServiceOut
-        | CommandType::CashWithdrawal => None, // M5: parse from raw_frames
+        CommandType::ServiceIn | CommandType::ServiceOut | CommandType::CashWithdrawal => None, // M5: parse from raw_frames
         CommandType::ShiftOpen
         | CommandType::ShiftClose
         | CommandType::XReport
@@ -339,11 +339,7 @@ pub fn to_canonical_fiscal_command(
     //                                failure surface to the signer
     //                                (where the precise context is
     //                                gone).  Drop the filter.
-    let signed_by_cashier_id = cmd
-        .cashier_id
-        .as_deref()
-        .map(CashierId::new)
-        .transpose()?;
+    let signed_by_cashier_id = cmd.cashier_id.as_deref().map(CashierId::new).transpose()?;
 
     Ok(CanonicalFiscalCommand {
         doc_type,

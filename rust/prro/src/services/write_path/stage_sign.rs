@@ -259,10 +259,9 @@ pub async fn run(
             // the guard documents intent).  Applies whether the
             // row is already pinned (re-entry drift) or fresh
             // (first-pin drift).
-            if let (Some(existing), Some(caller)) = (
-                inputs.signing_config_snapshot_id,
-                caller_snapshot_id,
-            ) {
+            if let (Some(existing), Some(caller)) =
+                (inputs.signing_config_snapshot_id, caller_snapshot_id)
+            {
                 if existing != caller {
                     return Ok(PinResult::SnapshotIdMismatch { existing, caller });
                 }
@@ -299,10 +298,8 @@ pub async fn run(
             // For piece 4 we pass None — preserves existing behaviour
             // (column stays NULL); back-compat semantic per locked design:
             // NULL + no tax_group_1 items → ALLOW (this commit's path).
-            let rows = fd::pin_signing_inputs_tx(
-                tx, doc_id, seed.as_ref(), z, caller_snapshot_id,
-            )
-            .await?;
+            let rows =
+                fd::pin_signing_inputs_tx(tx, doc_id, seed.as_ref(), z, caller_snapshot_id).await?;
 
             if rows == 0 {
                 // Pin-once guard rejected: re-read truth.  Either
@@ -1106,11 +1103,10 @@ pub fn check_payload_from_json_for_testing(
     total_sum_kop: i64,
     tax_resolution: Option<&TaxResolutionSnapshot>,
 ) -> Result<CheckPayload, SignError> {
-    let body: CheckJson = serde_json::from_str(body_json).map_err(|e| {
-        SignError::PayloadSchema {
+    let body: CheckJson =
+        serde_json::from_str(body_json).map_err(|e| SignError::PayloadSchema {
             detail: format!("CheckJson parse: {e}"),
-        }
-    })?;
+        })?;
     check_payload_from(header, local_number, body, total_sum_kop, tax_resolution)
 }
 
@@ -1146,10 +1142,8 @@ fn check_payload_from(
         .items
         .into_iter()
         .map(|it| {
-            let canonical_tg1 =
-                translate_tax_group(it.tax_group_1, tax_resolution, "tax_group_1")?;
-            let canonical_tg2 =
-                translate_tax_group(it.tax_group_2, tax_resolution, "tax_group_2")?;
+            let canonical_tg1 = translate_tax_group(it.tax_group_1, tax_resolution, "tax_group_1")?;
+            let canonical_tg2 = translate_tax_group(it.tax_group_2, tax_resolution, "tax_group_2")?;
             Ok(CheckItem {
                 code: it.code,
                 name: it.name,
@@ -1161,7 +1155,11 @@ fn check_payload_from(
                 tax_group_1: canonical_tg1,
                 tax_group_2: canonical_tg2,
                 excise_stamps: it.excise_stamps,
-                adjustments: it.adjustments.into_iter().map(line_adjustment_from).collect(),
+                adjustments: it
+                    .adjustments
+                    .into_iter()
+                    .map(line_adjustment_from)
+                    .collect(),
             })
         })
         .collect::<Result<Vec<_>, SignError>>()?;
@@ -1197,9 +1195,7 @@ fn check_payload_from(
     // computed from items + caller-resolved tax_groups snapshot.
     // W4-Z2a piece 14: tax_groups map derived from snapshot here
     // (callsite no longer pre-computes it — single source of truth).
-    let tax_groups = tax_resolution
-        .map(|s| s.to_calc_map())
-        .unwrap_or_default();
+    let tax_groups = tax_resolution.map(|s| s.to_calc_map()).unwrap_or_default();
     let tax_summaries = derive_check_tax_summaries(&items, &tax_groups)?;
 
     Ok(CheckPayload {
@@ -1256,11 +1252,7 @@ fn translate_tax_group(
     // Mapping says driver_number → canonical, but groups may not
     // carry that canonical (admin-side inconsistency, corruption,
     // manual SQL drift).  Fail-closed BEFORE XML emit.
-    if !snapshot
-        .groups()
-        .iter()
-        .any(|g| g.tx == canonical)
-    {
+    if !snapshot.groups().iter().any(|g| g.tx == canonical) {
         return Err(SignError::TaxSummary(
             crate::xml::CalcTaxError::CanonicalTxNotInGroups {
                 driver_number: raw,

@@ -73,11 +73,23 @@ async fn bootstrap_empty_fn_seeds_4_payment_methods() {
 
     // Per spec §2.2: 1=Готівка (cash), 2=Картка, 3=Кредит, 4=Сертифікат
     let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
-    assert_eq!(rows.iter().find(|r| r.pay_index == 1).unwrap().name, "Готівка");
+    assert_eq!(
+        rows.iter().find(|r| r.pay_index == 1).unwrap().name,
+        "Готівка"
+    );
     assert!(rows.iter().find(|r| r.pay_index == 1).unwrap().iscash);
-    assert_eq!(rows.iter().find(|r| r.pay_index == 2).unwrap().name, "Картка");
-    assert_eq!(rows.iter().find(|r| r.pay_index == 3).unwrap().name, "Кредит");
-    assert_eq!(rows.iter().find(|r| r.pay_index == 4).unwrap().name, "Сертифікат");
+    assert_eq!(
+        rows.iter().find(|r| r.pay_index == 2).unwrap().name,
+        "Картка"
+    );
+    assert_eq!(
+        rows.iter().find(|r| r.pay_index == 3).unwrap().name,
+        "Кредит"
+    );
+    assert_eq!(
+        rows.iter().find(|r| r.pay_index == 4).unwrap().name,
+        "Сертифікат"
+    );
     for r in &rows {
         if r.pay_index != 1 {
             assert!(!r.iscash, "{} must be cashless", r.name);
@@ -126,9 +138,13 @@ async fn bootstrap_is_idempotent() {
         .expect("second bootstrap call must be no-op, not error");
 
     // Counts must remain at defaults — no duplicate rows
-    let tax_rows = tax_groups::list_active_for_fn(&pool, "4000000001").await.unwrap();
+    let tax_rows = tax_groups::list_active_for_fn(&pool, "4000000001")
+        .await
+        .unwrap();
     assert_eq!(tax_rows.len(), 11);
-    let pay_rows = payment_methods::list_active_for_fn(&pool, "4000000001").await.unwrap();
+    let pay_rows = payment_methods::list_active_for_fn(&pool, "4000000001")
+        .await
+        .unwrap();
     assert_eq!(pay_rows.len(), 4);
 }
 
@@ -165,7 +181,9 @@ async fn bootstrap_does_not_overwrite_operator_customised_tax_rate() {
     assert_eq!(row.txpr, 18.0, "operator customisation preserved");
 
     // Other defaults still seeded
-    let rows = tax_groups::list_active_for_fn(&pool, "4000000001").await.unwrap();
+    let rows = tax_groups::list_active_for_fn(&pool, "4000000001")
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 11);
 }
 
@@ -179,8 +197,13 @@ async fn bootstrap_reactivates_soft_deleted_default() {
 
     bootstrap_fn_defaults(&pool, "4000000001").await.unwrap();
     // Operator soft-deletes the default tax_group А (tx_num=1)
-    tax_groups::soft_delete(&pool, "4000000001", 1).await.unwrap();
-    let active_count = tax_groups::list_active_for_fn(&pool, "4000000001").await.unwrap().len();
+    tax_groups::soft_delete(&pool, "4000000001", 1)
+        .await
+        .unwrap();
+    let active_count = tax_groups::list_active_for_fn(&pool, "4000000001")
+        .await
+        .unwrap()
+        .len();
     assert_eq!(active_count, 10, "А soft-deleted, 10 remain active");
 
     // Re-running bootstrap reactivates the soft-deleted row.
@@ -188,7 +211,9 @@ async fn bootstrap_reactivates_soft_deleted_default() {
         .await
         .expect("recovery via re-bootstrap");
 
-    let active = tax_groups::list_active_for_fn(&pool, "4000000001").await.unwrap();
+    let active = tax_groups::list_active_for_fn(&pool, "4000000001")
+        .await
+        .unwrap();
     assert_eq!(active.len(), 11, "soft-deleted default reactivated");
     assert!(active.iter().any(|r| r.letter == "А"), "А present again");
 }
@@ -219,7 +244,9 @@ async fn bootstrap_partial_failure_surfaces_row_details() {
     )
     .await
     .unwrap();
-    tax_groups::soft_delete(&pool, "4000000001", 1).await.unwrap();
+    tax_groups::soft_delete(&pool, "4000000001", 1)
+        .await
+        .unwrap();
     tax_groups::insert(
         &pool,
         &tax_groups::NewTaxGroup {
@@ -245,14 +272,13 @@ async fn bootstrap_partial_failure_surfaces_row_details() {
 
     match err {
         prro::runtime::bootstrap::BootstrapError::PartialFailure {
-            count,
-            failures,
-            ..
+            count, failures, ..
         } => {
             assert!(count >= 1, "at least one row failure");
             assert!(
-                failures.iter().any(|f| f.table == "tax_groups"
-                    && f.identifier.contains("letter=А")),
+                failures
+                    .iter()
+                    .any(|f| f.table == "tax_groups" && f.identifier.contains("letter=А")),
                 "letter-А collision must be reported in failures: {failures:?}"
             );
         }
@@ -260,8 +286,13 @@ async fn bootstrap_partial_failure_surfaces_row_details() {
     }
 
     // Other defaults still seeded (per-row continue)
-    let rows = tax_groups::list_active_for_fn(&pool, "4000000001").await.unwrap();
-    assert!(rows.len() >= 10, "remaining defaults seeded despite collision");
+    let rows = tax_groups::list_active_for_fn(&pool, "4000000001")
+        .await
+        .unwrap();
+    assert!(
+        rows.len() >= 10,
+        "remaining defaults seeded despite collision"
+    );
 }
 
 /// The reactivation must NOT overwrite a customised rate on an
@@ -280,8 +311,14 @@ async fn bootstrap_reactivation_does_not_overwrite_active_customised_rate() {
         .await
         .expect("bootstrap re-run");
 
-    let row = tax_groups::find(&pool, "4000000001", 1).await.unwrap().unwrap();
-    assert_eq!(row.txpr, 18.0, "active customisation NOT overwritten by re-bootstrap");
+    let row = tax_groups::find(&pool, "4000000001", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.txpr, 18.0,
+        "active customisation NOT overwritten by re-bootstrap"
+    );
 }
 
 #[tokio::test]
@@ -314,8 +351,12 @@ async fn bootstrap_different_fns_independent() {
     bootstrap_fn_defaults(&pool, "4000000001").await.unwrap();
     bootstrap_fn_defaults(&pool, "4000000002").await.unwrap();
 
-    let a = tax_groups::list_active_for_fn(&pool, "4000000001").await.unwrap();
-    let b = tax_groups::list_active_for_fn(&pool, "4000000002").await.unwrap();
+    let a = tax_groups::list_active_for_fn(&pool, "4000000001")
+        .await
+        .unwrap();
+    let b = tax_groups::list_active_for_fn(&pool, "4000000002")
+        .await
+        .unwrap();
     assert_eq!(a.len(), 11);
     assert_eq!(b.len(), 11);
 }
@@ -361,7 +402,10 @@ async fn add_operator_invokes_bootstrap_on_first_fn_registration() {
 
     // Pre-condition: secure DB has no config rows for this FN.
     assert_eq!(
-        tax_groups::list_active_for_fn(&pool_secure, "4000000001").await.unwrap().len(),
+        tax_groups::list_active_for_fn(&pool_secure, "4000000001")
+            .await
+            .unwrap()
+            .len(),
         0
     );
 
@@ -380,9 +424,13 @@ async fn add_operator_invokes_bootstrap_on_first_fn_registration() {
     .expect("add_operator must succeed and bootstrap");
 
     // Post-condition: bootstrap fired — defaults seeded.
-    let tg = tax_groups::list_active_for_fn(&pool_secure, "4000000001").await.unwrap();
+    let tg = tax_groups::list_active_for_fn(&pool_secure, "4000000001")
+        .await
+        .unwrap();
     assert_eq!(tg.len(), 11, "11 tax_groups seeded by bootstrap");
-    let pm = payment_methods::list_active_for_fn(&pool_secure, "4000000001").await.unwrap();
+    let pm = payment_methods::list_active_for_fn(&pool_secure, "4000000001")
+        .await
+        .unwrap();
     assert_eq!(pm.len(), 4, "4 payment_methods seeded by bootstrap");
     let profile = fn_outgress_profile::get_profile(&pool_secure, "4000000001")
         .await
