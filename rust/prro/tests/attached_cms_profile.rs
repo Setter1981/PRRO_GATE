@@ -181,4 +181,12 @@ fn signing_time_date_boundaries_and_2050_cliff() {
         sign_at(2_524_608_000).is_err(),
         "2050 signingTime must error (UTCTIME range exceeded), not silently encode"
     );
+
+    // Far-future (year 10000): MUST also Err, not silently encode.  Locks the r4
+    // fix that keeps `year` as i64 through the range check — a u32 cast could
+    // wrap a huge year back into 1950..=2049 and emit a bogus UTCTIME.
+    assert!(
+        sign_at(253_402_300_800).is_err(),
+        "year-10000 signingTime must error, not silently encode (year stays i64 pre-check)"
+    );
 }

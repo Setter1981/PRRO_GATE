@@ -133,9 +133,33 @@ fn live_armed(test_name: &str) -> bool {
 /// not a substring of the URL (e.g. a path or a lookalike domain).
 fn host_of(endpoint: &str) -> &str {
     let after_scheme = endpoint.split("://").nth(1).unwrap_or(endpoint);
-    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    // Isolate the AUTHORITY first: it ends at the first '/', '?', or '#'.  This
+    // MUST happen before userinfo stripping — otherwise a query/fragment like
+    // `prro.tax.gov.ua:9443?x=@cabinet.tax.gov.ua` would let the `@cabinet…` in
+    // the query masquerade as the host and bypass the prod-refusal allowlist
+    // (the real URI host there is prro.tax.gov.ua).
+    let authority = after_scheme
+        .split(|c: char| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or(after_scheme);
+    // Within the authority, strip userinfo (`user@host`) then the port.
     let hostport = authority.rsplit('@').next().unwrap_or(authority);
     hostport.split(':').next().unwrap_or(hostport)
+}
+
+#[test]
+fn host_of_isolates_authority_and_blocks_prod_tricks() {
+    // Real test cabinet (default).
+    assert_eq!(host_of("https://cabinet.tax.gov.ua:9443"), "cabinet.tax.gov.ua");
+    assert_eq!(host_of("https://cabinet.tax.gov.ua:9443/path"), "cabinet.tax.gov.ua");
+    // Valid test host WITH a query must still resolve to the cabinet (no false reject).
+    assert_eq!(host_of("https://cabinet.tax.gov.ua?param=1"), "cabinet.tax.gov.ua");
+    // Round-4 bypass: query/fragment `@cabinet…` must NOT be read as the host —
+    // the real authority host is the prod endpoint, which must be rejected.
+    assert_eq!(host_of("https://prro.tax.gov.ua:9443?x=@cabinet.tax.gov.ua"), "prro.tax.gov.ua");
+    assert_eq!(host_of("https://prro.tax.gov.ua:9443#@cabinet.tax.gov.ua"), "prro.tax.gov.ua");
+    // Userinfo trick: real host is AFTER the '@' inside the authority.
+    assert_eq!(host_of("https://cabinet.tax.gov.ua@evil.com"), "evil.com");
 }
 
 // ─── Piece 1 — connectivity probe ───────────────────────────────────────
