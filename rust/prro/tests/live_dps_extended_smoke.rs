@@ -57,7 +57,13 @@ use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::CheckSignBlob;
 use prro::transports::dps::error::DpsError;
 use prro::transports::dps::grpc::GrpcDpsChannel;
-use std::time::Duration;
+use prro_crypto::cms::builder::{CmsBuildOptions, CmsSigner};
+use prro_crypto::cms::profile::CmsProfile;
+use prro_crypto::cms::signer::DstuInProcessSigner;
+use prro_crypto::core::curve::Curve;
+use prro_crypto::core::field::FieldEl;
+use prro_crypto::interop::prro::containers::{extract_private_key, ExtractedKey};
+use std::time::{Duration, SystemTime};
 
 // ─── Env contract ──────────────────────────────────────────────────────
 
@@ -67,6 +73,10 @@ const ENV_GATE: &str = "PRRO_LIVE_DPS";
 const ENV_HOST: &str = "PRRO_LIVE_DPS_HOST";
 /// Test fiscal number override.
 const ENV_FN: &str = "PRRO_LIVE_DPS_FN";
+/// Path to the JKS key container (required for any signed RPC — pieces 2+).
+const ENV_JKS_PATH: &str = "PRRO_LIVE_DPS_JKS_PATH";
+/// JKS password (NEVER logged).
+const ENV_JKS_PASS: &str = "PRRO_LIVE_DPS_JKS_PASS";
 
 const DEFAULT_HOST: &str = "https://cabinet.tax.gov.ua:9443";
 const DEFAULT_FN: &str = "4000162280";
@@ -230,6 +240,136 @@ async fn live_smoke_1_connect_probe() {
             println!(
                 "Smoke 1 PASS: wire path operational (TLS + HTTP/2 + gRPC + \
                  response parse).  Ready for native-signed RPCs (pieces 2+)."
+            );
+        }
+    }
+}
+
+// ─── Piece 2 — native-signed lastChk (read the DPS chain tip) ───────────
+
+/// Load the signing key from `PRRO_LIVE_DPS_JKS_PATH` (+ `..._JKS_PASS`).
+/// Returns `None` (with a SKIP line) when the signing env is not provided,
+/// so a connectivity-only run (piece 1) still works without a key mounted.
+fn load_signing_key(test_name: &str) -> Option<ExtractedKey> {
+    let (Some(path), Some(pass)) = (
+        std::env::var(ENV_JKS_PATH).ok(),
+        std::env::var(ENV_JKS_PASS).ok(),
+    ) else {
+        println!(
+            "=== {test_name} SKIP: set {ENV_JKS_PATH} + {ENV_JKS_PASS} to run \
+             signed live RPCs (piece 2+) ==="
+        );
+        return None;
+    };
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("{test_name}: cannot read JKS at {path}: {e}"));
+    let ek = extract_private_key(&bytes, &pass).unwrap_or_else(|e| {
+        panic!("{test_name}: extract_private_key failed (wrong pass / not a JKS?): {e:?}")
+    });
+    Some(ek)
+}
+
+/// Build the `rro_fn_sign` blob for the read RPCs (`lastChk` / `statusRro`).
+///
+/// Per the DPS protocol (field `rro_fn_sign`: «Фіскальній номер пРРО
+/// підписаний електронним підписом з позначкою часу»), the signed content
+/// is the fiscal-number string and the signature carries a `signingTime` —
+/// i.e. exactly the ATTACHED CAdES-BES profile `sendChkV2` requires.  We
+/// reproduce the production signer path (`crypto::in_process`): native
+/// DSTU-4145 (PB-257) + GOST-34.311 digest, ATTACHED eContent, signingTime.
+fn sign_fn_blob(ek: &ExtractedKey, fiscal_number: &str) -> CheckSignBlob {
+    let cert_der: &[u8] = ek
+        .certs
+        .first()
+        .expect("JKS must carry the signer certificate")
+        .as_slice();
+    let curve = Curve::dstu_pb_257();
+    let d = FieldEl::from_le_bytes(&ek.param_d[..], curve.mod_words);
+    let signer = DstuInProcessSigner::new(d);
+    let cms = CmsSigner {
+        cert_der,
+        signer: &signer,
+        profile: CmsProfile::Dstu4145WithGost34311Pb,
+    };
+    let der = cms
+        .sign_with(
+            fiscal_number.as_bytes(),
+            CmsBuildOptions {
+                attached: true,
+                signing_time: Some(SystemTime::now()),
+            },
+        )
+        .expect("native attached CAdES-BES sign of FN must succeed")
+        .cms_der;
+    CheckSignBlob(der)
+}
+
+/// **W4-Z3 Smoke 2 — native-signed `lastChk` (read DPS chain tip)**.
+///
+/// Builds a REAL `rro_fn_sign` (FN signed with the operator EDS, ATTACHED
+/// CAdES-BES + signingTime — the same profile `sendChkV2` requires) and reads
+/// the FN's chain state from live DPS.  First RPC that exercises the native
+/// attached signer end-to-end against the real server; read-only (no fiscal
+/// mutation, no chain advance).
+///
+/// PASS: `last_chk` returns `Ok(CheckAck)` — DPS accepted our signature and
+/// returned its view of the chain (`data_sign` = the previous check's CMS;
+/// empty body for a virgin/genesis FN).  Rate-limit (`status=-4`) self-skips.
+/// `Transport` is the only hard FAIL; a signature rejection (`-1
+/// ERROR_VEREFY`) fails loudly because it means the attached-CMS profile does
+/// not match what DPS expects for `rro_fn_sign`.  Piece 3 will CMS-strip
+/// `data_sign` + sha256 it into `node_state` as the MAC-chain seed.
+#[tokio::test]
+#[ignore = "live DPS endpoint required; opt-in via --features live-dps + --ignored + PRRO_LIVE_DPS=1"]
+async fn live_smoke_2_last_chk_real() {
+    if !live_armed("W4-Z3 Smoke 2") {
+        return;
+    }
+    let Some(ek) = load_signing_key("W4-Z3 Smoke 2") else {
+        return;
+    };
+    let host = resolve_host();
+    let fiscal_number = resolve_fn();
+    println!("\n=== W4-Z3 Smoke 2: native-signed lastChk ===");
+    println!("Endpoint: {host}");
+    println!("FN:       {fiscal_number}\n");
+
+    let channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        .await
+        .unwrap_or_else(|e| panic!("Smoke 2 FAIL: GrpcDpsChannel::connect: {e:?}"));
+
+    let fn_sign = sign_fn_blob(&ek, &fiscal_number);
+    println!(
+        "rro_fn_sign: {} bytes (ATTACHED CAdES-BES over the FN string)",
+        fn_sign.0.len()
+    );
+
+    match channel.last_chk(&fn_sign).await {
+        Ok(ack) => {
+            println!(
+                "Smoke 2 PASS: lastChk ACCEPTED our native signature.\n  \
+                 id        = {:?}\n  id_sign   = {} bytes\n  \
+                 data_sign = {} bytes (previous check CMS; 0 = virgin/genesis FN)",
+                ack.id,
+                ack.id_sign.len(),
+                ack.data_sign.len()
+            );
+        }
+        Err(DpsError::Server { code: -4, message }) => {
+            println!(
+                "Smoke 2 SKIP: DPS rate-limit (status=-4): {message}. \
+                 Cool down 5+ minutes before re-running."
+            );
+        }
+        Err(DpsError::Transport(msg)) => {
+            panic!("Smoke 2 FAIL: wire-level Transport error on lastChk: {msg}");
+        }
+        Err(e) => {
+            panic!(
+                "Smoke 2 FAIL: lastChk REJECTED our native signature: {e:?}.  If this is \
+                 `-1 ERROR_VEREFY`, the ATTACHED-CMS profile (eContent / signingTime / \
+                 cert / signed content = FN bytes) does not match what DPS expects for \
+                 `rro_fn_sign` — re-check the signed-content encoding."
             );
         }
     }
