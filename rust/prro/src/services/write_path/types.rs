@@ -100,9 +100,9 @@ pub struct WorkerContext {
     ///   re-entry paths that don't pre-load.  `derive_check_tax_
     ///   summaries` surfaces `TaxMappingNotWired` if such a doc
     ///   carries `tax_group_1`.
-    /// Compile-time `Option` wrapper prevents the MAC-recovery
-    /// footgun where a fresh-config tax_snapshot would silently
-    /// re-sign with the wrong configuration.
+    ///   Compile-time `Option` wrapper prevents the MAC-recovery
+    ///   footgun where a fresh-config tax_snapshot would silently
+    ///   re-sign with the wrong configuration.
     pub tax_resolution_snapshot:
         Option<crate::services::write_path::tax_summary::TaxResolutionSnapshot>,
     /// W4-Z2a piece 6 — id from `signing_config_snapshots` for the

@@ -29,6 +29,7 @@
 
 use sqlx::SqlitePool;
 use std::path::Path;
+use std::str::FromStr;
 use thiserror::Error;
 
 use crate::db::repositories::driver_tax_mapping::{
@@ -169,16 +170,33 @@ async fn audit_info(
 
 // ─── tax_groups commands ────────────────────────────────────────────
 
+/// Domain parameters for [`add_tax_group`], bundled to keep the
+/// function signature within the `clippy::too_many_arguments` bound.
+/// Pure data carrier — no behavior change vs the prior flat-param form.
+pub struct AddTaxGroupArgs {
+    pub fn_id: String,
+    pub tx_num: i64,
+    pub letter: String,
+    pub dtpr: f64,
+    pub txpr: f64,
+    pub txal: i64,
+}
+
 pub async fn add_tax_group(
     pool_main: &SqlitePool,
     pool_secure: &SqlitePool,
-    fn_id: &str,
-    tx_num: i64,
-    letter: &str,
-    dtpr: f64,
-    txpr: f64,
-    txal: i64,
+    args: AddTaxGroupArgs,
 ) -> Result<(), CfgAdminError> {
+    let AddTaxGroupArgs {
+        fn_id,
+        tx_num,
+        letter,
+        dtpr,
+        txpr,
+        txal,
+    } = args;
+    let fn_id = fn_id.as_str();
+    let letter = letter.as_str();
     if fn_id.trim().is_empty() {
         return Err(CfgAdminError::EmptyArgument("fn"));
     }
@@ -796,7 +814,19 @@ pub async fn run_add_tax_group(
     txal: i64,
 ) -> Result<(), CfgAdminError> {
     with_pools!(cfg, pm, ps, {
-        add_tax_group(&pm, &ps, &fn_id, tx_num, &letter, dtpr, txpr, txal).await
+        add_tax_group(
+            &pm,
+            &ps,
+            AddTaxGroupArgs {
+                fn_id,
+                tx_num,
+                letter,
+                dtpr,
+                txpr,
+                txal,
+            },
+        )
+        .await
     })
 }
 

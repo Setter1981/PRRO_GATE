@@ -9,7 +9,7 @@
 //! `insert` distinguishes:
 //!   * `DuplicateTxNum`         — PRIMARY KEY (fn, tx_num) violation
 //!   * `DuplicateActiveLetter`  — partial unique idx on (fn, letter)
-//!                                 WHERE is_active=1
+//!     WHERE is_active=1
 //!
 //! `update_rates` / `soft_delete` distinguish:
 //!   * `NotFound`               — no matching (fn, tx_num) row

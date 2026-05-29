@@ -160,15 +160,15 @@ impl BindingsRegistry {
     ///      do not pass the configured list separately; the main DB
     ///      is the sole source of truth so caller-DB drift is impossible.
     ///   3. For each operator row:
-    ///       a. If `fiscal_number` not in the FK set → emit
-    ///          `OPERATOR_ORPHAN_FN` Critical audit + skip.
-    ///       b. Decode `key_pass_enc` via [`Coding::decode`]; on empty
-    ///          → emit `OPERATOR_KEY_LOAD_FAILED` Critical with
-    ///          `reason="EmptyEncoded"` + skip.
-    ///       c. Call `loader.load(&key_path, &password)`.  On
-    ///          [`KeyLoadFailure`] → emit `OPERATOR_KEY_LOAD_FAILED`
-    ///          Critical with `reason=<variant>` + skip.
-    ///       d. On success → insert into registry.
+    ///      a. If `fiscal_number` not in the FK set → emit
+    ///      `OPERATOR_ORPHAN_FN` Critical audit + skip.
+    ///      b. Decode `key_pass_enc` via [`Coding::decode`]; on empty
+    ///      → emit `OPERATOR_KEY_LOAD_FAILED` Critical with
+    ///      `reason="EmptyEncoded"` + skip.
+    ///      c. Call `loader.load(&key_path, &password)`.  On
+    ///      [`KeyLoadFailure`] → emit `OPERATOR_KEY_LOAD_FAILED`
+    ///      Critical with `reason=<variant>` + skip.
+    ///      d. On success → insert into registry.
     ///   4. For each FN in `main_fns` that ended up without a registry
     ///      entry: emit `OPERATOR_NOT_REGISTERED` Info audit.
     ///

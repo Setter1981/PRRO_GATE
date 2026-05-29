@@ -10,6 +10,8 @@
 //! repository accepts the value (the DB enum allows it), but the
 //! runtime quartet accessor refuses until W4-Y impl lands.
 
+use std::str::FromStr;
+
 use sqlx::SqlitePool;
 use thiserror::Error;
 
@@ -35,8 +37,12 @@ impl OutgressProfile {
             Self::EvpzDps => "EVPZ_DPS",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Result<Self, FnOutgressProfileRepoError> {
+impl FromStr for OutgressProfile {
+    type Err = FnOutgressProfileRepoError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "FSCO_ZZD" => Ok(Self::FscoZzd),
             "EVPZ_DPS" => Ok(Self::EvpzDps),

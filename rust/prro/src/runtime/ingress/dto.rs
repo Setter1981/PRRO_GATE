@@ -23,9 +23,9 @@
 //!     type_code } }`        — for SELL / RETURN.
 //!   - `ZReportJson { payments[]: { name, sum_in_kop, sum_out_kop,
 //!     type_code }, sell_count, return_count }`
-//!                            — for SHIFT_CLOSE / Z_REPORT.
+//!     — for SHIFT_CLOSE / Z_REPORT.
 //!   - `ShiftOpenJson { opening_sum_kop }`
-//!                            — for SHIFT_OPEN.
+//!     — for SHIFT_OPEN.
 //!
 //! The W3 DTO emits `payload.goods[].price_kopecks /
 //! quantity_milli / tax_group_1 / ...` + `payments[].type:
@@ -355,8 +355,8 @@ pub fn to_canonical_fiscal_command(
 /// W4-Z0 piece 9 — listener-stamped variant.  Validates wire
 /// `fiscal_number` matches the listener's configured FN, then maps
 /// + stamps the driver_id into the canonical command.  Listener
-/// catches the cross-FN typo at the source instead of letting the
-/// boot-time reconcile audit catch it hours later.
+///   catches the cross-FN typo at the source instead of letting the
+///   boot-time reconcile audit catch it hours later.
 pub fn to_canonical_fiscal_command_with_context(
     cmd: &CanonicalCommand,
     listener_driver_id: crate::db::models::ids::DriverId,

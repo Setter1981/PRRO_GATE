@@ -10,9 +10,7 @@ use prro::admin_w4_z0::{self as cli, CfgAdminError};
 use prro::db::models::enums::{FiscalMode, Severity};
 use prro::db::repositories::audit_log;
 use prro::db::repositories::fn_outgress_profile::OutgressProfile;
-use prro::db::repositories::{
-    fiscal_number_config as fn_cfg, fn_integration_flags, fn_outgress_profile,
-};
+use prro::db::repositories::{fiscal_number_config as fn_cfg, fn_integration_flags};
 use prro::db::{open_pool, open_secure_pool};
 use sqlx::SqlitePool;
 
@@ -69,9 +67,20 @@ async fn add_tax_group_happy_path() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    cli::add_tax_group(&pool_main, &pool_secure, "4000000001", 1, "А", 0.0, 20.0, 0)
-        .await
-        .expect("add_tax_group");
+    cli::add_tax_group(
+        &pool_main,
+        &pool_secure,
+        cli::AddTaxGroupArgs {
+            fn_id: "4000000001".to_string(),
+            tx_num: 1,
+            letter: "А".to_string(),
+            dtpr: 0.0,
+            txpr: 20.0,
+            txal: 0,
+        },
+    )
+    .await
+    .expect("add_tax_group");
 
     let rows = cli::list_tax_groups(&pool_secure, "4000000001")
         .await
@@ -89,9 +98,20 @@ async fn add_tax_group_rejects_unknown_fn() {
     let (_md, pool_main) = fresh_main_pool().await;
     let (_sd, pool_secure) = fresh_secure_pool().await;
 
-    let err = cli::add_tax_group(&pool_main, &pool_secure, "9999999999", 1, "А", 0.0, 20.0, 0)
-        .await
-        .expect_err("must reject unknown FN");
+    let err = cli::add_tax_group(
+        &pool_main,
+        &pool_secure,
+        cli::AddTaxGroupArgs {
+            fn_id: "9999999999".to_string(),
+            tx_num: 1,
+            letter: "А".to_string(),
+            dtpr: 0.0,
+            txpr: 20.0,
+            txal: 0,
+        },
+    )
+    .await
+    .expect_err("must reject unknown FN");
     assert!(matches!(err, CfgAdminError::FiscalNumberNotInConfig(_)));
     assert_eq!(
         count_audit_events(&pool_main, "ADMIN_TAX_GROUP_ADDED").await,
@@ -105,9 +125,20 @@ async fn update_tax_rate_partial_field() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    cli::add_tax_group(&pool_main, &pool_secure, "4000000001", 1, "А", 0.0, 20.0, 0)
-        .await
-        .unwrap();
+    cli::add_tax_group(
+        &pool_main,
+        &pool_secure,
+        cli::AddTaxGroupArgs {
+            fn_id: "4000000001".to_string(),
+            tx_num: 1,
+            letter: "А".to_string(),
+            dtpr: 0.0,
+            txpr: 20.0,
+            txal: 0,
+        },
+    )
+    .await
+    .unwrap();
 
     // Update only txpr; leave dtpr/txal untouched
     cli::update_tax_rate(
@@ -139,9 +170,20 @@ async fn remove_tax_group_soft_deletes() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    cli::add_tax_group(&pool_main, &pool_secure, "4000000001", 1, "А", 0.0, 20.0, 0)
-        .await
-        .unwrap();
+    cli::add_tax_group(
+        &pool_main,
+        &pool_secure,
+        cli::AddTaxGroupArgs {
+            fn_id: "4000000001".to_string(),
+            tx_num: 1,
+            letter: "А".to_string(),
+            dtpr: 0.0,
+            txpr: 20.0,
+            txal: 0,
+        },
+    )
+    .await
+    .unwrap();
     cli::remove_tax_group(&pool_main, &pool_secure, "4000000001", 1)
         .await
         .expect("remove");
@@ -285,9 +327,20 @@ async fn audit_failure_does_not_block_mutation() {
         .expect("drop audit_log");
 
     // Mutation must still succeed (best-effort audit)
-    cli::add_tax_group(&pool_main, &pool_secure, "4000000001", 1, "А", 0.0, 20.0, 0)
-        .await
-        .expect("mutation succeeds even when audit cannot land");
+    cli::add_tax_group(
+        &pool_main,
+        &pool_secure,
+        cli::AddTaxGroupArgs {
+            fn_id: "4000000001".to_string(),
+            tx_num: 1,
+            letter: "А".to_string(),
+            dtpr: 0.0,
+            txpr: 20.0,
+            txal: 0,
+        },
+    )
+    .await
+    .expect("mutation succeeds even when audit cannot land");
 
     let rows = cli::list_tax_groups(&pool_secure, "4000000001")
         .await
@@ -610,9 +663,20 @@ async fn all_mutation_events_are_info_severity() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    cli::add_tax_group(&pool_main, &pool_secure, "4000000001", 1, "А", 0.0, 20.0, 0)
-        .await
-        .unwrap();
+    cli::add_tax_group(
+        &pool_main,
+        &pool_secure,
+        cli::AddTaxGroupArgs {
+            fn_id: "4000000001".to_string(),
+            tx_num: 1,
+            letter: "А".to_string(),
+            dtpr: 0.0,
+            txpr: 20.0,
+            txal: 0,
+        },
+    )
+    .await
+    .unwrap();
     cli::add_payment_method(&pool_main, &pool_secure, "4000000001", 5, "Visa", false)
         .await
         .unwrap();

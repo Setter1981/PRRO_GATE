@@ -751,8 +751,8 @@ pub async fn get_pending_by_request_id_tx(
 /// snapshot via `signing_config_snapshots::get_by_id` BEFORE
 /// opening the main `with_immediate` envelope.  Locked rule #9
 /// + INV-1 spirit: keep the write tx short, fail-loud reload
-/// failure via a separately-committed audit (pattern from
-/// `boot_phase::run_for_doc_prepared` piece 13 fix).
+///   failure via a separately-committed audit (pattern from
+///   `boot_phase::run_for_doc_prepared` piece 13 fix).
 ///
 /// **Race semantics**: pool read happens before the lease CAS.
 /// Between this peek and the inside-tx `get_pending_by_request_
@@ -867,8 +867,8 @@ pub struct PinnedSigningInputs {
     ///      info audit; NULL + ANY tax_group_1 item →
     ///      RequiresManualReconciliation.
     ///   2. Doc not yet pinned (`is_pinned == false`).
-    /// Disambiguate with `is_pinned`: pinned=true + None = case 1;
-    /// pinned=false = pin hasn't happened yet (any path).
+    ///      Disambiguate with `is_pinned`: pinned=true + None = case 1;
+    ///      pinned=false = pin hasn't happened yet (any path).
     pub signing_config_snapshot_id: Option<i64>,
 }
 

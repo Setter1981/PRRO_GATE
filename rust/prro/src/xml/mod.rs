@@ -306,18 +306,18 @@ pub enum CalcTaxError {
 ///
 /// Returns `(txsm, dtsm)` in kopecks for a given group total + rates
 /// + algorithm.  Caller computes `group_sum` as the sum of
-/// `item.sum` for items with this `tax_group_1`.
+///   `item.sum` for items with this `tax_group_1`.
 ///
 /// Algorithms:
 ///   * TXAL=0 — VAT-included: txsm = group_sum * txpr / (100 + txpr).
-///              dtsm = 0.
+///     dtsm = 0.
 ///   * TXAL=1 — Excise pre-VAT: dtsm = group_sum * dtpr / 100;
-///              txsm = (group_sum + dtsm) * txpr / (100 + txpr).
+///     txsm = (group_sum + dtsm) * txpr / (100 + txpr).
 ///   * TXAL=2 — Excise post-VAT: dtsm = group_sum * dtpr / (100 + dtpr);
-///              txsm = (group_sum - dtsm) * txpr / (100 + txpr).
+///     txsm = (group_sum - dtsm) * txpr / (100 + txpr).
 ///   * TXAL=3 — Absolute (per-unit) excise.  Returns
-///              `Err(UnsupportedAlgorithm(3))` (operator-confirmed
-///              deferred).  Caller MUST audit_log + decide policy.
+///     `Err(UnsupportedAlgorithm(3))` (operator-confirmed
+///     deferred).  Caller MUST audit_log + decide policy.
 pub fn calc_tax(
     group_sum: i64,
     txpr: f64,

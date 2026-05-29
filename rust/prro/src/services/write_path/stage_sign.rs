@@ -633,7 +633,7 @@ struct NoTxBuildSignInputs<'a> {
     ///   2. `derive_check_tax_summaries`'s canonical-keyed map
     ///      via `snapshot.to_calc_map()` (derived inside
     ///      check_payload_from after translation).
-    /// Live sources per caller (updated piece 15 + 17):
+    ///      Live sources per caller (updated piece 15 + 17):
     ///   - W6 stage 3-NO-TX: `ctx.tax_resolution_snapshot` —
     ///     Some on Proceed (fresh, matches FK), Some(historic)
     ///     on Resume + boot recovery (pre-tx pool-bound reload
@@ -641,10 +641,10 @@ struct NoTxBuildSignInputs<'a> {
     ///   - MAC recovery: pre-loaded by `mac_recovery::run_mac_
     ///     recovery` via `signing_config_snapshots::get_by_id`
     ///     (rule #9 persisted-snapshot reload).
-    /// None = pre-W4-Z2a NULL-FK back-compat path (no driver
-    /// mapping, no tax_groups → derive_check_tax_summaries
-    /// surfaces TaxMappingNotWired if items carry tax_group_1
-    /// OR tax_group_2 — translate_tax_group invoked per-field).
+    ///     None = pre-W4-Z2a NULL-FK back-compat path (no driver
+    ///     mapping, no tax_groups → derive_check_tax_summaries
+    ///     surfaces TaxMappingNotWired if items carry tax_group_1
+    ///     OR tax_group_2 — translate_tax_group invoked per-field).
     tax_resolution: Option<TaxResolutionSnapshot>,
 }
 

@@ -4,6 +4,8 @@
 //! Pilot: every FN defaults to `FSCO_ZZD` at bootstrap; operator
 //! switches to `EVPZ_DPS` post-pilot when W4-Y series ships.
 
+use std::str::FromStr;
+
 use prro::db::open_secure_pool;
 use prro::db::repositories::fn_outgress_profile::{
     self as repo, FnOutgressProfileRepoError, OutgressProfile,
@@ -60,7 +62,7 @@ async fn set_profile_is_upsert() {
 
 #[tokio::test]
 async fn invalid_profile_string_in_db_surfaces_as_parse_error() {
-    let (_dir, pool) = fresh_secure_pool().await;
+    let (_dir, _pool) = fresh_secure_pool().await;
 
     // Direct INSERT must be rejected by DB-side CHECK (verified in
     // migration_021 test); we cannot trigger a "parse error" via the

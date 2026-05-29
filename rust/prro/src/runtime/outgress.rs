@@ -7,7 +7,7 @@
 //!
 //! Traits:
 //!   * [`DpsXmlBuilder`]      — serialise `CanonicalFiscalCommand`
-//!                              into outgress-specific bytes
+//!     into outgress-specific bytes
 //!   * [`SignEnvelope`]       — CMS / signed-file wrap
 //!   * [`DpsTransport`]       — submit signed bytes to DPS endpoint
 //!   * [`DpsResponseParser`]  — decode raw response into [`DpsOutcome`]

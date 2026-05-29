@@ -77,7 +77,7 @@ pub struct TaxResolutionSnapshot {
     /// adapters would carry the driver's local code straight into
     /// `<P TX="...">`, violating ФСКО canonical-TX requirement
     /// + W4 "adapters stay thin, conversion-layer owns translation"
-    /// operator pin.
+    ///   operator pin.
     ///
     /// Empty Vec means no driver-side translation is configured
     /// (1:1 identity mapping assumed — caller's driver_number IS

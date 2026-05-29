@@ -6,7 +6,7 @@
 //! as a typed error.
 
 use prro::db::models::ids::DriverId;
-use prro::runtime::ingress::dto::{self, CanonicalCommand, CommandType, MappingError};
+use prro::runtime::ingress::dto::{self, CanonicalCommand, MappingError};
 
 const SAMPLE_WIRE: &str = r#"{
   "schema_version": "1.0",

@@ -19,8 +19,8 @@
 //!     the SAME downstream pipeline the goldens lock at byte level.
 //!   - Round-trip through `signing_config_snapshots::insert_or_get_id_tx`
 //!     + `get_by_id` (sha256-verified) + `to_calc_map()` preserves the
-//!     map identically.  Proves the persistence layer doesn't drift the
-//!     resolved values.
+//!       map identically.  Proves the persistence layer doesn't drift the
+//!       resolved values.
 //!   - NULL-FK / pre-W4-Z2a back-compat: `None.as_ref().map(to_calc_map)
 //!     .unwrap_or_default()` produces an EMPTY map — back-compat semantic
 //!     locked by piece 8c / piece 9.
