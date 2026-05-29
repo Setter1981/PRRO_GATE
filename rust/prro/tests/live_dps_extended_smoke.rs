@@ -966,3 +966,316 @@ async fn live_smoke_4_extended_sell_native_sign() {
         payload_xml.len()
     );
 }
+
+// ─── Piece 5 — LIVE SHIFT_OPEN to DPS (first live fiscalization) ────────────
+//
+// **LIVE piece (mutates the FN chain).**  Unlike piece 4, these touch the
+// real test cabinet via `GrpcDpsChannel::send_chk` (= `sendChkV2`).  A
+// SHIFT_OPEN rides as `ServiceChk(3)` with `local_number=0` (per the wire
+// map) and OPENS the shift on the DPS side.
+//
+// Drive model (WebCheck-faithful): the gateway's LOCAL online shift-state
+// lifecycle is NOT wired (no `shifts`/`node_state.shift_state` flip on
+// online SHIFT_OPEN→ACK — an M4 gap), so the smoke drives the WIRE only: a
+// seeded PREPARED SHIFT_OPEN doc + `reconcile_pending_with` against the live
+// channel.  The MAC is seeded from the live `lastChk` chain tip per send
+// (trust DPS, not local state) — sidestepping the internal-chain
+// byte-exactness GAP.  Local shift tracking after ACK is intentionally out
+// of scope here (it is the M4 shift-state-wiring gap, reported separately).
+//
+// Gate: feature `live-dps` + `#[ignore]` + `PRRO_LIVE_DPS=1` + real JKS
+// (these CONTACT live DPS, so the full triple gate applies).
+
+/// Real taxpayer code (EDRPOU) for the test FN `4000162280` — the `TN`
+/// attribute in the canonical XML.  MUST match the FN's registered
+/// taxpayer (operator company ЄДРПОУ 13667753; the signer's individual ІПН
+/// is 2790008754 but the receipt TN is the company code) or DPS rejects.
+const LIVE_TN: &str = "13667753";
+
+/// Minimal SHIFT_OPEN payload (`ShiftOpenJson { opening_sum_kop }`).
+const SHIFT_OPEN_PAYLOAD_JSON: &str = r#"{"opening_sum_kop":0}"#;
+
+/// Current UTC instant as an RFC-3339 string for `business_ts`.  Live docs
+/// need a fresh timestamp — `stage_sign` converts it to the Kyiv-local
+/// `<TS>` / wire `date_time`, and DPS rejects a stale receipt time.
+fn iso_now() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Seed `fiscal_number_config` for the LIVE FN with the REAL taxpayer code.
+async fn seed_fn_config_live(pool: &SqlitePool, fn_id: &str) {
+    sqlx::query(
+        "INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES (?, ?, 'test')",
+    )
+    .bind(fn_id)
+    .bind(LIVE_TN)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Seed a PREPARED SHIFT_OPEN doc (doc_type SHIFT_OPEN, shift_id NULL — it
+/// bypasses signer_guard, no snapshot FK).  `business_ts` is a fresh UTC
+/// instant for the live wire time.
+async fn seed_shift_open_prepared(
+    pool: &SqlitePool,
+    fn_id: &str,
+    doc_byte: u8,
+    business_ts: &str,
+) -> (DocumentId, [u8; 16]) {
+    let doc_bytes = vec![doc_byte; 16];
+    let req_bytes = vec![doc_byte ^ 0xFF; 16];
+    let sha = vec![0u8; 32];
+    let lnd = doc_byte as i64;
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, \
+            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            total_sum_kop, payload_json, payload_sha256_canonical) \
+         VALUES (?, ?, ?, ?, 'SHIFT_OPEN', 'PREPARED', 'b1', 't1', 'ONLINE', \
+            ?, 0, ?, ?)",
+    )
+    .bind(&doc_bytes)
+    .bind(&req_bytes)
+    .bind(fn_id)
+    .bind(lnd)
+    .bind(business_ts)
+    .bind(SHIFT_OPEN_PAYLOAD_JSON)
+    .bind(&sha)
+    .execute(pool)
+    .await
+    .unwrap();
+    let doc_id = DocumentId::from_bytes(<[u8; 16]>::try_from(doc_bytes.as_slice()).unwrap());
+    let req_arr: [u8; 16] = <[u8; 16]>::try_from(req_bytes.as_slice()).unwrap();
+    (doc_id, req_arr)
+}
+
+/// Seed a matching `ingress_inbox` PROCESSING row.  `operation_type` MUST
+/// equal the doc_type string and `payload_json` must be byte-identical to
+/// the doc's, else the PREPARED-replay drift cross-check holds the doc.
+async fn seed_inbox_processing_generic(
+    pool: &SqlitePool,
+    fn_id: &str,
+    req_id: &[u8; 16],
+    op_type: &str,
+    payload_json: &str,
+) {
+    let sha = vec![0u8; 32];
+    let req_slice: &[u8] = req_id;
+    sqlx::query(
+        "INSERT INTO ingress_inbox(request_id, fiscal_number, protocol, operation_type, \
+            idempotency_key, payload_json, payload_sha256_canonical, status) \
+         VALUES (?, ?, 'REST', ?, ?, ?, ?, 'PROCESSING')",
+    )
+    .bind(req_slice)
+    .bind(fn_id)
+    .bind(op_type)
+    .bind(format!("idem-{:02x}", req_id[0]))
+    .bind(payload_json)
+    .bind(&sha)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Seed the MAC chain from the live `lastChk` chain tip (WebCheck model:
+/// the next check's `<MAC>` = sha256 of the CMS-stripped previous check as
+/// DPS returns it).  No-op for a genesis FN (empty data_sign).  Returns the
+/// hex seed for logging, or None for genesis.
+async fn seed_mac_from_lastchk(pool: &SqlitePool, fn_id: &str, ack: &CheckAck) -> Option<String> {
+    if ack.data_sign.is_empty() {
+        return None;
+    }
+    let inner = extract_econtent(&ack.data_sign)
+        .unwrap_or_else(|e| panic!("CMS-strip lastChk.data_sign: {e}"));
+    let mac_seed: [u8; 32] = Sha256::digest(&inner).into();
+    node_state::seed_prevhash(pool, fn_id, &mac_seed)
+        .await
+        .expect("seed_prevhash");
+    Some(hex_lower(&mac_seed))
+}
+
+/// Read the latest transport_trace outcome + the doc's server_fiscal_no —
+/// used to diagnose a non-ACK SHIFT_OPEN (which DPS code rejected it).
+async fn print_live_diagnostics(pool: &SqlitePool, doc: DocumentId) {
+    let trace: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT outcome_kind, server_fiscal_no FROM transport_trace \
+         WHERE document_id = ? ORDER BY attempt_no DESC LIMIT 1",
+    )
+    .bind(doc)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    println!("  transport_trace(latest): {trace:?}");
+    let audits: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT event_type, payload_json FROM audit_log ORDER BY rowid DESC LIMIT 8",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    for (et, pj) in &audits {
+        println!("  audit: {et}  {}", pj.as_deref().unwrap_or(""));
+    }
+}
+
+/// **W4-Z3 Smoke 5a — DPS shift-state probe (read-only)**.
+///
+/// `statusRro` + `lastChk` against the live cabinet — reports whether a
+/// shift is already OPEN on the FN and the current chain tip, so the
+/// operator can decide whether a SHIFT_OPEN (5b) is the right next move.
+/// Read-only: no fiscal mutation.
+#[tokio::test]
+#[ignore = "live DPS endpoint required; opt-in via --features live-dps + --ignored + PRRO_LIVE_DPS=1"]
+async fn live_smoke_5a_status_probe() {
+    if !live_armed("W4-Z3 Smoke 5a") {
+        return;
+    }
+    let Some(ek) = load_signing_key("W4-Z3 Smoke 5a") else {
+        return;
+    };
+    let host = resolve_host();
+    let fiscal_number = resolve_fn();
+    println!("\n=== W4-Z3 Smoke 5a: DPS shift-state probe (read-only) ===");
+    println!("FN: {fiscal_number}\n");
+
+    let channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        .await
+        .unwrap_or_else(|e| panic!("Smoke 5a FAIL: connect: {e:?}"));
+    let fn_sign = sign_fn_blob(&ek, &fiscal_number);
+
+    match channel.status_rro(&fn_sign).await {
+        Ok(s) => println!(
+            "  statusRro: open_shift={} online={} last_signer={:?}",
+            s.open_shift, s.online, s.last_signer
+        ),
+        Err(DpsError::Server { code: -4, message }) => {
+            println!("  Smoke 5a SKIP: DPS rate-limit (-4): {message}");
+            return;
+        }
+        Err(DpsError::Transport(msg)) => panic!("Smoke 5a FAIL: Transport on statusRro: {msg}"),
+        Err(e) => println!("  statusRro non-fatal error: {e:?}"),
+    }
+
+    match channel.last_chk(&fn_sign).await {
+        Ok(a) => println!(
+            "  lastChk: id={:?} data_sign={} bytes (0 = genesis)",
+            a.id,
+            a.data_sign.len()
+        ),
+        Err(DpsError::Server { code: -4, message }) => {
+            println!("  Smoke 5a SKIP: rate-limit (-4): {message}");
+            return;
+        }
+        Err(e) => println!("  lastChk non-fatal error: {e:?}"),
+    }
+    println!("Smoke 5a PASS: DPS shift-state + chain tip read.");
+}
+
+/// **W4-Z3 Smoke 5b — LIVE SHIFT_OPEN (fiscalizes; opens the DPS shift)**.
+///
+/// Drives a seeded PREPARED SHIFT_OPEN through the production write-path
+/// against the live cabinet: lastChk → seed MAC from the chain tip →
+/// reconcile → `sendChkV2` (ServiceChk, local_number=0).  ACK (status OK +
+/// non-empty id) advances the doc to SENT with `server_fiscal_no`.
+#[tokio::test]
+#[ignore = "live DPS endpoint required; opt-in via --features live-dps + --ignored + PRRO_LIVE_DPS=1"]
+async fn live_smoke_5b_shift_open() {
+    if !live_armed("W4-Z3 Smoke 5b") {
+        return;
+    }
+    let Some(ek) = load_signing_key("W4-Z3 Smoke 5b") else {
+        return;
+    };
+    let host = resolve_host();
+    let fiscal_number = resolve_fn();
+    println!("\n=== W4-Z3 Smoke 5b: LIVE SHIFT_OPEN → DPS ===");
+    println!("FN: {fiscal_number}  TN: {LIVE_TN}\n");
+
+    let channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        .await
+        .unwrap_or_else(|e| panic!("Smoke 5b FAIL: connect: {e:?}"));
+
+    let fn_sign = sign_fn_blob(&ek, &fiscal_number);
+    if let Ok(s) = channel.status_rro(&fn_sign).await {
+        println!(
+            "  pre statusRro: open_shift={} online={}",
+            s.open_shift, s.online
+        );
+    }
+    let ack = match channel.last_chk(&fn_sign).await {
+        Ok(a) => a,
+        Err(DpsError::Server { code: -4, message }) => {
+            println!("Smoke 5b SKIP: rate-limit (-4): {message}");
+            return;
+        }
+        Err(e) => panic!("Smoke 5b FAIL: lastChk: {e:?}"),
+    };
+
+    let (_dir, app) = boot_offline_app().await;
+    seed_fn_config_live(app.db(), &fiscal_number).await;
+    node_state::upsert_initial(
+        app.db(),
+        &fiscal_number,
+        NodeMode::Online,
+        ShiftState::Closed,
+        1,
+    )
+    .await
+    .expect("seed node_state");
+
+    match seed_mac_from_lastchk(app.db(), &fiscal_number, &ack).await {
+        Some(hex) => println!(
+            "  MAC seed from lastChk: {hex} ({} B data_sign)",
+            ack.data_sign.len()
+        ),
+        None => println!("  FN genesis (empty data_sign) — SHIFT_OPEN carries empty <MAC>"),
+    }
+
+    let business_ts = iso_now();
+    let (doc, req_id) =
+        seed_shift_open_prepared(app.db(), &fiscal_number, 0x51, &business_ts).await;
+    seed_inbox_processing_generic(
+        app.db(),
+        &fiscal_number,
+        &req_id,
+        "SHIFT_OPEN",
+        SHIFT_OPEN_PAYLOAD_JSON,
+    )
+    .await;
+
+    let signing_ctx = live_signing_ctx(&ek);
+    let drive_fn_sign = sign_fn_blob(&ek, &fiscal_number);
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &channel,
+        signing_ctx: &signing_ctx,
+        fn_sign: &drive_fn_sign,
+    });
+    app.reconcile_pending_with(deps)
+        .await
+        .expect("reconcile_pending_with green");
+
+    let state = doc_state_piece4(app.db(), doc).await;
+    let server_fiscal_no: Option<String> =
+        sqlx::query_scalar("SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc)
+            .fetch_one(app.db())
+            .await
+            .unwrap();
+    println!("  post-reconcile: state={state} server_fiscal_no={server_fiscal_no:?}");
+    print_live_diagnostics(app.db(), doc).await;
+
+    assert_eq!(
+        state, "SENT",
+        "SHIFT_OPEN must reach SENT (DPS ACK). If not, the diagnostics above carry the DPS code \
+         (e.g. -12 MAC, -8 date, -14 signer, -15 no-shift)."
+    );
+    assert!(
+        server_fiscal_no.is_some(),
+        "ACK must populate server_fiscal_no (the DPS-assigned receipt id)"
+    );
+    println!("Smoke 5b PASS: LIVE SHIFT_OPEN fiscalized — server_fiscal_no={server_fiscal_no:?}");
+}
