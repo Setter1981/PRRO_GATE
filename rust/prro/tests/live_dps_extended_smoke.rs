@@ -727,6 +727,7 @@ async fn seed_extended_sell_prepared(
     fn_id: &str,
     doc_byte: u8,
     snapshot_id: i64,
+    business_ts: &str,
 ) -> (DocumentId, [u8; 16]) {
     let shift_byte = doc_byte ^ 0x80;
     let shift_bytes = vec![shift_byte; 16];
@@ -751,13 +752,14 @@ async fn seed_extended_sell_prepared(
             total_sum_kop, payload_json, payload_sha256_canonical, signed_by_cashier_id, \
             signing_config_snapshot_id) \
          VALUES (?, ?, ?, ?, ?, 'SELL', 'PREPARED', 'b1', 't1', 'ONLINE', \
-            '2026-04-22T12:00:00Z', ?, ?, ?, 'test-cashier', ?)",
+            ?, ?, ?, ?, 'test-cashier', ?)",
     )
     .bind(&doc_bytes)
     .bind(&req_bytes)
     .bind(fn_id)
     .bind(&shift_bytes)
     .bind(lnd)
+    .bind(business_ts)
     .bind(EXTENDED_SELL_TOTAL_SUM_KOP)
     .bind(EXTENDED_SELL_PAYLOAD_JSON)
     .bind(&sha)
@@ -870,7 +872,9 @@ async fn live_smoke_4_extended_sell_native_sign() {
     .await
     .expect("insert signing_config_snapshot");
 
-    let (doc, req_id) = seed_extended_sell_prepared(app.db(), fn_id, 0x44, snapshot_id).await;
+    let (doc, req_id) =
+        seed_extended_sell_prepared(app.db(), fn_id, 0x44, snapshot_id, "2026-04-22T12:00:00Z")
+            .await;
     seed_inbox_processing_for_sell_piece4(app.db(), fn_id, &req_id).await;
 
     let stub = StubAckDps;
@@ -1100,19 +1104,33 @@ async fn seed_mac_from_lastchk(pool: &SqlitePool, fn_id: &str, ack: &CheckAck) -
 }
 
 /// Read the latest transport_trace outcome + the doc's server_fiscal_no —
-/// used to diagnose a non-ACK SHIFT_OPEN (which DPS code rejected it).
+/// used to diagnose a non-ACK send (which DPS code rejected it).
+// The diagnostic row is a 5-column projection read once on a failed live
+// send; a named struct would add ceremony for a print-only helper.
+#[allow(clippy::type_complexity)]
 async fn print_live_diagnostics(pool: &SqlitePool, doc: DocumentId) {
-    let trace: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT outcome_kind, server_fiscal_no FROM transport_trace \
-         WHERE document_id = ? ORDER BY attempt_no DESC LIMIT 1",
+    // transport_trace carries the DPS code in `server_status_code` (the
+    // -1..-16 reject code) plus error_kind / error_message.
+    let trace: Option<(
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT outcome_kind, server_status_code, error_kind, error_message, server_fiscal_no \
+         FROM transport_trace WHERE document_id = ? ORDER BY attempt_no DESC LIMIT 1",
     )
     .bind(doc)
     .fetch_optional(pool)
     .await
     .unwrap_or(None);
-    println!("  transport_trace(latest): {trace:?}");
+    println!(
+        "  transport_trace(latest) [outcome, dps_code, error_kind, error_message, sfn]: {trace:?}"
+    );
+    // audit_log's payload column is `event_payload_json`.
     let audits: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT event_type, payload_json FROM audit_log ORDER BY rowid DESC LIMIT 8",
+        "SELECT event_type, event_payload_json FROM audit_log ORDER BY rowid DESC LIMIT 8",
     )
     .fetch_all(pool)
     .await
@@ -1278,4 +1296,303 @@ async fn live_smoke_5b_shift_open() {
         "ACK must populate server_fiscal_no (the DPS-assigned receipt id)"
     );
     println!("Smoke 5b PASS: LIVE SHIFT_OPEN fiscalized — server_fiscal_no={server_fiscal_no:?}");
+}
+
+// ─── Piece 6/7 — LIVE extended SELL + Z_REPORT (complete the shift cycle) ───
+//
+// Run order (each its own temp DB; DPS state is server-side): 5b SHIFT_OPEN
+// (opens the DPS shift) → 6 SELL (into the open shift) → 7 Z_REPORT (closes
+// it).  Each doc re-seeds its `<MAC>` from the live `lastChk` chain tip
+// (WebCheck model), so the chain advances SHIFT_OPEN→SELL→Z automatically.
+// local_number is sequential (SHIFT_OPEN wire=0; SELL=1; Z=2).
+
+/// Pinned snapshot with the non-identity driver mapping the pilot uses:
+/// driver 5 → canonical TX=1 (20% VAT), driver 7 → canonical TX=2 (7% VAT).
+fn dual_mapping_snapshot() -> TaxResolutionSnapshot {
+    TaxResolutionSnapshot::with_driver_mapping(
+        vec![
+            ResolvedTaxGroupBps {
+                tx: 1,
+                txpr_bps: 2000,
+                dtpr_bps: 0,
+                txal: 0,
+                txty: 0,
+            },
+            ResolvedTaxGroupBps {
+                tx: 2,
+                txpr_bps: 700,
+                dtpr_bps: 0,
+                txal: 0,
+                txty: 0,
+            },
+        ],
+        vec![
+            DriverNumberMapping {
+                driver_number: 5,
+                canonical_tx_num: 1,
+            },
+            DriverNumberMapping {
+                driver_number: 7,
+                canonical_tx_num: 2,
+            },
+        ],
+    )
+}
+
+/// Minimal Z payload reflecting the shift's one SELL (9000 kop cash).
+/// `ZReportJson { payments, sell_count, return_count }`.
+const Z_REPORT_PAYLOAD_JSON: &str = r#"{"payments":[{"name":"CASH","sum_in_kop":9000,"sum_out_kop":0,"type_code":"0"}],"sell_count":1,"return_count":0}"#;
+
+/// Seed a PREPARED Z_REPORT doc bound to a local OPENED shift + signer
+/// (mirrors the SELL seed; no snapshot FK — Z does not translate tax).
+async fn seed_z_report_prepared(
+    pool: &SqlitePool,
+    fn_id: &str,
+    doc_byte: u8,
+    business_ts: &str,
+) -> (DocumentId, [u8; 16]) {
+    let shift_byte = doc_byte ^ 0x80;
+    let shift_bytes = vec![shift_byte; 16];
+    sqlx::query(
+        "INSERT OR IGNORE INTO shifts(shift_id, fiscal_number, serial, state, open_mode, \
+            cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
+    )
+    .bind(&shift_bytes)
+    .bind(fn_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let doc_bytes = vec![doc_byte; 16];
+    let req_bytes = vec![doc_byte ^ 0xFF; 16];
+    let sha = vec![0u8; 32];
+    let lnd = doc_byte as i64;
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
+            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            total_sum_kop, payload_json, payload_sha256_canonical, signed_by_cashier_id) \
+         VALUES (?, ?, ?, ?, ?, 'Z_REPORT', 'PREPARED', 'b1', 't1', 'ONLINE', \
+            ?, 0, ?, ?, 'test-cashier')",
+    )
+    .bind(&doc_bytes)
+    .bind(&req_bytes)
+    .bind(fn_id)
+    .bind(&shift_bytes)
+    .bind(lnd)
+    .bind(business_ts)
+    .bind(Z_REPORT_PAYLOAD_JSON)
+    .bind(&sha)
+    .execute(pool)
+    .await
+    .unwrap();
+    let doc_id = DocumentId::from_bytes(<[u8; 16]>::try_from(doc_bytes.as_slice()).unwrap());
+    let req_arr: [u8; 16] = <[u8; 16]>::try_from(req_bytes.as_slice()).unwrap();
+    (doc_id, req_arr)
+}
+
+/// **W4-Z3 Smoke 6 — LIVE extended SELL (W4-Z3 core: extended XML to DPS)**.
+///
+/// Requires the DPS shift to be OPEN (run 5b first).  Drives the piece-4
+/// extended SELL (driver 5→1, 7→2 + excise + UKTZED) against the live
+/// cabinet: lastChk → MAC seed → reconcile → sendChkV2 (Chk, local_number=1).
+#[tokio::test]
+#[ignore = "live DPS endpoint required; opt-in via --features live-dps + --ignored + PRRO_LIVE_DPS=1"]
+async fn live_smoke_6_extended_sell() {
+    if !live_armed("W4-Z3 Smoke 6") {
+        return;
+    }
+    let Some(ek) = load_signing_key("W4-Z3 Smoke 6") else {
+        return;
+    };
+    let host = resolve_host();
+    let fiscal_number = resolve_fn();
+    println!("\n=== W4-Z3 Smoke 6: LIVE extended SELL → DPS ===");
+    println!("FN: {fiscal_number}  TN: {LIVE_TN}\n");
+
+    let channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        .await
+        .unwrap_or_else(|e| panic!("Smoke 6 FAIL: connect: {e:?}"));
+
+    let fn_sign = sign_fn_blob(&ek, &fiscal_number);
+    match channel.status_rro(&fn_sign).await {
+        Ok(s) => {
+            println!(
+                "  pre statusRro: open_shift={} online={}",
+                s.open_shift, s.online
+            );
+            assert!(
+                s.open_shift,
+                "Smoke 6 requires an OPEN shift on DPS — run live_smoke_5b_shift_open first"
+            );
+        }
+        Err(e) => println!("  statusRro non-fatal: {e:?}"),
+    }
+    let ack = match channel.last_chk(&fn_sign).await {
+        Ok(a) => a,
+        Err(DpsError::Server { code: -4, message }) => {
+            println!("Smoke 6 SKIP: rate-limit (-4): {message}");
+            return;
+        }
+        Err(e) => panic!("Smoke 6 FAIL: lastChk: {e:?}"),
+    };
+
+    let (_dir, app) = boot_offline_app().await;
+    seed_fn_config_live(app.db(), &fiscal_number).await;
+    seed_open_shift_and_node_piece4(app.db(), &fiscal_number).await;
+    match seed_mac_from_lastchk(app.db(), &fiscal_number, &ack).await {
+        Some(hex) => println!("  MAC seed from lastChk: {hex}"),
+        None => println!("  genesis (empty data_sign)"),
+    }
+
+    let snapshot = dual_mapping_snapshot();
+    let fn_snap = fiscal_number.clone();
+    let snapshot_id = with_immediate(app.db(), move |tx| {
+        Box::pin(async move {
+            let id = signing_config_snapshots::insert_or_get_id_tx(
+                tx,
+                &fn_snap,
+                "driver-piece6",
+                &snapshot,
+            )
+            .await?;
+            Ok::<i64, anyhow::Error>(id)
+        })
+    })
+    .await
+    .expect("insert signing_config_snapshot");
+
+    let business_ts = iso_now();
+    let (doc, req_id) =
+        seed_extended_sell_prepared(app.db(), &fiscal_number, 0x01, snapshot_id, &business_ts)
+            .await;
+    seed_inbox_processing_for_sell_piece4(app.db(), &fiscal_number, &req_id).await;
+
+    let signing_ctx = live_signing_ctx(&ek);
+    let drive_fn_sign = sign_fn_blob(&ek, &fiscal_number);
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &channel,
+        signing_ctx: &signing_ctx,
+        fn_sign: &drive_fn_sign,
+    });
+    app.reconcile_pending_with(deps)
+        .await
+        .expect("reconcile_pending_with green");
+
+    let state = doc_state_piece4(app.db(), doc).await;
+    let server_fiscal_no: Option<String> =
+        sqlx::query_scalar("SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc)
+            .fetch_one(app.db())
+            .await
+            .unwrap();
+    println!("  post-reconcile: state={state} server_fiscal_no={server_fiscal_no:?}");
+    print_live_diagnostics(app.db(), doc).await;
+
+    assert_eq!(
+        state, "SENT",
+        "extended SELL must reach SENT (DPS ACK). Diagnostics above carry the DPS code on reject."
+    );
+    assert!(
+        server_fiscal_no.is_some(),
+        "ACK must populate server_fiscal_no"
+    );
+    println!(
+        "Smoke 6 PASS: LIVE extended SELL fiscalized (driver 5→1/7→2, excise, UKTZED) — \
+         server_fiscal_no={server_fiscal_no:?}"
+    );
+}
+
+/// **W4-Z3 Smoke 7 — LIVE Z_REPORT (closes the DPS shift; bookend)**.
+///
+/// Requires an OPEN shift with the SELL fiscalized (run 5b → 6 first).
+/// Drives a Z_REPORT against the live cabinet: lastChk → MAC seed →
+/// reconcile → sendChkV2 (ZReport, local_number=2).  NOTE: the Z report
+/// NUMBER is allocated fresh (1) from a fresh temp DB — if DPS enforces a
+/// per-RRO Z sequence, this may reject (-6/-10); the diagnostics surface
+/// the code for operator follow-up.
+#[tokio::test]
+#[ignore = "live DPS endpoint required; opt-in via --features live-dps + --ignored + PRRO_LIVE_DPS=1"]
+async fn live_smoke_7_z_report() {
+    if !live_armed("W4-Z3 Smoke 7") {
+        return;
+    }
+    let Some(ek) = load_signing_key("W4-Z3 Smoke 7") else {
+        return;
+    };
+    let host = resolve_host();
+    let fiscal_number = resolve_fn();
+    println!("\n=== W4-Z3 Smoke 7: LIVE Z_REPORT (close shift) → DPS ===");
+    println!("FN: {fiscal_number}  TN: {LIVE_TN}\n");
+
+    let channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        .await
+        .unwrap_or_else(|e| panic!("Smoke 7 FAIL: connect: {e:?}"));
+
+    let fn_sign = sign_fn_blob(&ek, &fiscal_number);
+    if let Ok(s) = channel.status_rro(&fn_sign).await {
+        println!(
+            "  pre statusRro: open_shift={} online={}",
+            s.open_shift, s.online
+        );
+    }
+    let ack = match channel.last_chk(&fn_sign).await {
+        Ok(a) => a,
+        Err(DpsError::Server { code: -4, message }) => {
+            println!("Smoke 7 SKIP: rate-limit (-4): {message}");
+            return;
+        }
+        Err(e) => panic!("Smoke 7 FAIL: lastChk: {e:?}"),
+    };
+
+    let (_dir, app) = boot_offline_app().await;
+    seed_fn_config_live(app.db(), &fiscal_number).await;
+    seed_open_shift_and_node_piece4(app.db(), &fiscal_number).await;
+    match seed_mac_from_lastchk(app.db(), &fiscal_number, &ack).await {
+        Some(hex) => println!("  MAC seed from lastChk: {hex}"),
+        None => println!("  genesis (empty data_sign)"),
+    }
+
+    let business_ts = iso_now();
+    let (doc, req_id) = seed_z_report_prepared(app.db(), &fiscal_number, 0x02, &business_ts).await;
+    seed_inbox_processing_generic(
+        app.db(),
+        &fiscal_number,
+        &req_id,
+        "Z_REPORT",
+        Z_REPORT_PAYLOAD_JSON,
+    )
+    .await;
+
+    let signing_ctx = live_signing_ctx(&ek);
+    let drive_fn_sign = sign_fn_blob(&ek, &fiscal_number);
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &channel,
+        signing_ctx: &signing_ctx,
+        fn_sign: &drive_fn_sign,
+    });
+    app.reconcile_pending_with(deps)
+        .await
+        .expect("reconcile_pending_with green");
+
+    let state = doc_state_piece4(app.db(), doc).await;
+    let server_fiscal_no: Option<String> =
+        sqlx::query_scalar("SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc)
+            .fetch_one(app.db())
+            .await
+            .unwrap();
+    println!("  post-reconcile: state={state} server_fiscal_no={server_fiscal_no:?}");
+    print_live_diagnostics(app.db(), doc).await;
+
+    assert_eq!(
+        state, "SENT",
+        "Z_REPORT must reach SENT (DPS ACK). If it rejected with a Z-sequence code (-6/-10), the \
+         Z report NUMBER needs to match the FN's per-RRO sequence — see diagnostics."
+    );
+    assert!(
+        server_fiscal_no.is_some(),
+        "ACK must populate server_fiscal_no"
+    );
+    println!("Smoke 7 PASS: LIVE Z_REPORT fiscalized — shift closed — server_fiscal_no={server_fiscal_no:?}");
 }
