@@ -715,9 +715,15 @@ pub fn parse_cert_basic_fields(cert_der: &[u8]) -> Result<BasicCertFields, Envel
 ///
 /// UTCTime is `YYMMDDHHMMSSZ` (13 chars).  RFC 5280 §4.1.2.5.1 defines
 /// the YY pivot: 00..49 → 2000..2049, 50..99 → 1950..1999.
-/// GeneralizedTime is `YYYYMMDDHHMMSSZ` (15 chars), optionally with a
-/// fractional-seconds component which we accept-and-drop.
-fn parse_asn1_time(content: &[u8], tag: u8) -> Result<String, EnvelopeError> {
+/// GeneralizedTime is `YYYYMMDDHHMMSSZ` (15 chars).
+///
+/// STRICT per the RFC 5280 cert-validity profile: the body before `Z` must be
+/// EXACTLY 12 (UTCTime) or 14 (GeneralizedTime) ASCII digits — trailing junk
+/// (`491231235959junkZ`) and fractional seconds (forbidden in cert validity)
+/// are rejected, NOT silently truncated.  The calendar fields are then
+/// range- and day-of-month-validated (rejects month 13, Feb 31, etc.) so an
+/// impossible time can never be turned into an impossible RFC-3339 string.
+pub fn parse_asn1_time(content: &[u8], tag: u8) -> Result<String, EnvelopeError> {
     let s = std::str::from_utf8(content)
         .map_err(|_| EnvelopeError::Asn1("ASN.1 Time content is not ASCII".into()))?;
     if !s.ends_with('Z') {
@@ -728,9 +734,11 @@ fn parse_asn1_time(content: &[u8], tag: u8) -> Result<String, EnvelopeError> {
     let body = &s[..s.len() - 1];
     let (year, mmddhhmmss): (i32, &str) = match tag {
         0x17 => {
-            // UTCTime: YYMMDDHHMMSS
-            if body.len() < 12 {
-                return Err(EnvelopeError::Asn1(format!("UTCTime too short: {s:?}")));
+            // UTCTime: EXACTLY YYMMDDHHMMSS (no trailing data).
+            if body.len() != 12 {
+                return Err(EnvelopeError::Asn1(format!(
+                    "UTCTime must be exactly YYMMDDHHMMSSZ: {s:?}"
+                )));
             }
             let yy: i32 = body[0..2]
                 .parse()
@@ -739,10 +747,11 @@ fn parse_asn1_time(content: &[u8], tag: u8) -> Result<String, EnvelopeError> {
             (year, &body[2..12])
         }
         0x18 => {
-            // GeneralizedTime: YYYYMMDDHHMMSS[.fff]
-            if body.len() < 14 {
+            // GeneralizedTime: EXACTLY YYYYMMDDHHMMSS — RFC 5280 cert validity
+            // forbids fractional seconds, so any extra chars are rejected.
+            if body.len() != 14 {
                 return Err(EnvelopeError::Asn1(format!(
-                    "GeneralizedTime too short: {s:?}"
+                    "GeneralizedTime must be exactly YYYYMMDDHHMMSSZ (no fractional seconds): {s:?}"
                 )));
             }
             let yyyy: i32 = body[0..4]
@@ -757,9 +766,25 @@ fn parse_asn1_time(content: &[u8], tag: u8) -> Result<String, EnvelopeError> {
             )));
         }
     };
-    if mmddhhmmss.len() != 10 || !mmddhhmmss.chars().all(|c| c.is_ascii_digit()) {
+    if !mmddhhmmss.chars().all(|c| c.is_ascii_digit()) {
         return Err(EnvelopeError::Asn1(format!(
-            "ASN.1 Time MMDDHHMMSS is not 10 digits in {s:?}"
+            "ASN.1 Time MMDDHHMMSS is not all digits in {s:?}"
+        )));
+    }
+    // Calendar validation — previously ABSENT, so month=13 / day=99 / Feb-31
+    // produced an impossible RFC-3339-shaped string that downstream callers
+    // stored without a parse-check.  The 2-char ASCII-digit slices always parse.
+    let f = |a: usize| mmddhhmmss[a..a + 2].parse::<u32>().unwrap();
+    let (mo, da, ho, mi, se) = (f(0), f(2), f(4), f(6), f(8));
+    if !(1..=12).contains(&mo)
+        || da < 1
+        || da > crate::cms::calendar::days_in_month(year as i64, mo)
+        || ho > 23
+        || mi > 59
+        || se > 60
+    {
+        return Err(EnvelopeError::Asn1(format!(
+            "ASN.1 Time has impossible calendar fields: {s:?}"
         )));
     }
     Ok(format!(
