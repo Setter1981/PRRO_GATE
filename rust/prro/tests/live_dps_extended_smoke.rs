@@ -53,16 +53,21 @@
 //! 3. **Native signing** (`prro_crypto::cms`, DSTU 4145-2002 + GOST 34.311,
 //!    CAdES-BES, ATTACHED) — no external sidecar.
 
+use prro::db::models::enums::{FiscalMode, NodeMode, ShiftState};
+use prro::db::open_pool;
+use prro::db::repositories::{fiscal_number_config as fn_cfg, node_state};
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::CheckSignBlob;
 use prro::transports::dps::error::DpsError;
 use prro::transports::dps::grpc::GrpcDpsChannel;
 use prro_crypto::cms::builder::{CmsBuildOptions, CmsSigner};
 use prro_crypto::cms::profile::CmsProfile;
+use prro_crypto::cms::signed_data::extract_econtent;
 use prro_crypto::cms::signer::DstuInProcessSigner;
 use prro_crypto::core::curve::Curve;
 use prro_crypto::core::field::FieldEl;
 use prro_crypto::interop::prro::containers::{extract_private_key, ExtractedKey};
+use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime};
 
 // ─── Env contract ──────────────────────────────────────────────────────
@@ -375,4 +380,129 @@ async fn live_smoke_2_last_chk_real() {
             );
         }
     }
+}
+
+// ─── Piece 3 — MAC-chain seed bootstrap from live lastChk ────────────────
+
+/// **W4-Z3 Smoke 3 — MAC-chain seed bootstrap**.
+///
+/// Closes the fresh-DB-vs-DPS-history gap: a fresh gateway DB has no MAC
+/// chain state, so its first online SELL would carry the wrong `<MAC>` and be
+/// rejected `-12 ERROR_BAD_HASH_PREV`. The fix (per the WebCheck-proven model)
+/// is to seed `node_state.last_known_unsigned_xml_sha256` from the DPS view:
+///
+///   1. `lastChk` → `CheckAck.data_sign` = the FN's PREVIOUS check (ATTACHED
+///      CMS). Empty body ⇒ genesis (virgin FN) — nothing to seed.
+///   2. `extract_econtent(data_sign)` → the CMS-stripped inner check bytes.
+///   3. `SHA-256` of those bytes = the MAC the NEXT check must carry.
+///   4. `node_state::seed_prevhash` persists it; read it back to confirm.
+///
+/// Read-only against DPS (one `lastChk`); all mutation is to a throwaway temp
+/// DB. The byte-exactness of this seed vs what DPS expects on the next SELL is
+/// the piece-3 mid-review focus and is finally proven by piece 5's `sendChkV2`.
+#[tokio::test]
+#[ignore = "live DPS endpoint required; opt-in via --features live-dps + --ignored + PRRO_LIVE_DPS=1"]
+async fn live_smoke_3_mac_seed() {
+    if !live_armed("W4-Z3 Smoke 3") {
+        return;
+    }
+    let Some(ek) = load_signing_key("W4-Z3 Smoke 3") else {
+        return;
+    };
+    let host = resolve_host();
+    let fiscal_number = resolve_fn();
+    println!("\n=== W4-Z3 Smoke 3: MAC-seed bootstrap from live lastChk ===");
+    println!("FN: {fiscal_number}\n");
+
+    let channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        .await
+        .unwrap_or_else(|e| panic!("Smoke 3 FAIL: connect: {e:?}"));
+
+    let fn_sign = sign_fn_blob(&ek, &fiscal_number);
+    let ack = match channel.last_chk(&fn_sign).await {
+        Ok(a) => a,
+        Err(DpsError::Server { code: -4, message }) => {
+            println!("Smoke 3 SKIP: DPS rate-limit (-4): {message}. Cool down 5+ min.");
+            return;
+        }
+        Err(e) => panic!("Smoke 3 FAIL: lastChk: {e:?}"),
+    };
+
+    if ack.data_sign.is_empty() {
+        println!(
+            "Smoke 3: FN is genesis (lastChk.data_sign empty) — the MAC chain has no \
+             previous check; the first SELL carries an empty <MAC> and there is nothing \
+             to seed. PASS (genesis path)."
+        );
+        return;
+    }
+
+    // CMS-strip the previous check + hash it = the next check's MAC.
+    let inner = extract_econtent(&ack.data_sign)
+        .unwrap_or_else(|e| panic!("Smoke 3 FAIL: cannot CMS-strip data_sign: {e}"));
+    let mac_seed: [u8; 32] = Sha256::digest(&inner).into();
+    let hex: String = mac_seed.iter().map(|b| format!("{b:02x}")).collect();
+    println!("  data_sign = {} bytes", ack.data_sign.len());
+    println!(
+        "  inner     = {} bytes (CMS-stripped previous check)",
+        inner.len()
+    );
+    println!("  MAC seed  = {hex}");
+
+    // Seed a throwaway node_state row + read it back.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = open_pool(&dir.path().join("prro.db"))
+        .await
+        .expect("open migrated temp pool");
+    // node_state.fiscal_number FK → fiscal_number_config: seed the parent row.
+    fn_cfg::insert(
+        &pool,
+        &fn_cfg::NewFnConfig {
+            fiscal_number: fiscal_number.clone(),
+            tax_number: "TN-test".to_string(),
+            vat_payer_inn: None,
+            fiscal_mode: FiscalMode::Test,
+            org_name: None,
+            point_name: None,
+            org_address: None,
+            tsp_enabled: false,
+            offline_enabled: true,
+            national_check_enabled: false,
+            min_offline_codes: 50,
+            max_offline_codes: 1000,
+        },
+    )
+    .await
+    .expect("seed fiscal_number_config (FK parent)");
+    node_state::upsert_initial(
+        &pool,
+        &fiscal_number,
+        NodeMode::Online,
+        ShiftState::Closed,
+        1,
+    )
+    .await
+    .expect("seed node_state row");
+
+    let updated = node_state::seed_prevhash(&pool, &fiscal_number, &mac_seed)
+        .await
+        .expect("seed_prevhash");
+    assert!(
+        updated,
+        "seed_prevhash must update the existing node_state row"
+    );
+
+    let row = node_state::get(&pool, &fiscal_number)
+        .await
+        .expect("node_state::get")
+        .expect("node_state row present");
+    assert_eq!(
+        row.last_known_unsigned_xml_sha256,
+        Some(mac_seed),
+        "the seeded MAC must round-trip through node_state.last_known_unsigned_xml_sha256"
+    );
+    println!(
+        "Smoke 3 PASS: MAC seed persisted + read back from node_state \
+         (next online SELL will chain off this hash)."
+    );
 }
