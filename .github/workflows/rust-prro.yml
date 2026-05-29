@@ -101,6 +101,15 @@ jobs:
         working-directory: rust
         run: cargo build -p prro --target ${{ matrix.target }} --locked
 
+      - name: Compile-only check — W4-Z3 live-dps smoke harness (never executed)
+        if: matrix.target != 'x86_64-unknown-linux-musl'
+        working-directory: rust
+        # The live-dps test target is gated `#![cfg(feature = "live-dps")]` and
+        # hits the REAL DPS server, so it is NEVER run in CI.  This step only
+        # COMPILES it (--no-run) so the harness cannot bit-rot (API drift in
+        # transports/dps, crypto, or env wiring) while normal suites stay green.
+        run: cargo test -p prro --target ${{ matrix.target }} --features live-dps --test live_dps_extended_smoke --no-run --locked
+
       - name: Test (cross-target binary)
         if: matrix.target != 'x86_64-unknown-linux-musl'
         working-directory: rust

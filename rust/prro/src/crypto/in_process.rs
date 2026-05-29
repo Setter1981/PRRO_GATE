@@ -114,29 +114,25 @@ fn sign_cms_blocking(
     session: &SigningSession,
     profile: prro_crypto::cms::profile::CmsProfile,
 ) -> Result<Vec<u8>, CryptoError> {
-    use prro_crypto::cms::builder::sign_attached_with_content_digest;
+    use prro_crypto::cms::builder::{CmsBuildOptions, CmsSigner};
     use prro_crypto::cms::profile::CmsProfile;
     use prro_crypto::cms::signer::DstuInProcessSigner;
     use prro_crypto::core::curve::Curve;
     use prro_crypto::core::field::FieldEl;
-    use prro_crypto::core::hash::{gost_34_311_95, kupyna_256};
 
-    // Build the content digest per profile.  `sign_attached_with_content_digest`
-    // owns signedAttrs hashing — we hand in the message digest AND the content
-    // bytes (the latter are embedded as `eContent`; see the ATTACHED note below).
-    // `CmsProfile` is marked `#[non_exhaustive]` upstream; the wildcard
-    // arm preserves forward-compat — a future profile we don't recognise
-    // returns CurveMismatch (the closest existing reason; the wrapper
-    // is locked to PB-257 + GOST-34.311 / Kupyna-256 in M2).
-    let content_digest: Vec<u8> = match profile {
-        CmsProfile::Dstu4145WithGost34311Pb => gost_34_311_95(canonical_xml).to_vec(),
-        CmsProfile::Dstu4145WithDstu7564Pb => kupyna_256(canonical_xml).to_vec(),
+    // `CmsProfile` is `#[non_exhaustive]` upstream, so the wildcard arm is
+    // mandatory here; we reject any unknown profile with a typed
+    // CurveMismatch (the wrapper is locked to PB-257 + GOST-34.311 /
+    // Kupyna-256 in M2).  `CmsSigner::sign_with` hashes the content with the
+    // matched profile's digest internally, so we do not pre-compute it.
+    match profile {
+        CmsProfile::Dstu4145WithGost34311Pb | CmsProfile::Dstu4145WithDstu7564Pb => {}
         _ => {
             return Err(CryptoError::CmsSign {
                 reason: SignKind::CurveMismatch,
             });
         }
-    };
+    }
 
     // Build the signer.  `FieldEl::from_le_bytes(bytes, mod_words)`
     // returns `Self` directly (PANICS on `bytes.len() > mod_words * 4`,
@@ -146,25 +142,37 @@ fn sign_cms_blocking(
     let d = FieldEl::from_le_bytes(&session.param_d()[..], curve.mod_words);
     let signer = DstuInProcessSigner::new(d);
 
-    // ATTACHED encapsulation: the canonical XML is embedded as the CMS
-    // `eContent`, because the DPS `sendChkV2` gRPC `Check.check_sign` field is
-    // the ONLY document carrier on the wire — a detached signature would reach
-    // DPS without the receipt and be rejected `-1 ERROR_VEREFY`.  Confirmed
-    // against the proven-accepted WebCheck client (`CtxSignFile(.., external:
-    // false, appendCert: true)`).  Signed-attributes + signature value are
-    // byte-identical to the detached form; only `eContent` is added.  (The
-    // `sign_cms_detached` trait-method name is retained to avoid cross-crate
-    // namespace churn; it now produces an ATTACHED CMS.)
-    sign_attached_with_content_digest(
+    // Sign as ATTACHED CAdES-BES WITH a `signingTime` signed-attribute — the
+    // exact profile DPS `sendChkV2` accepts:
+    //   * ATTACHED: the cp1251 receipt XML is embedded as `eContent`, because
+    //     the gRPC `Check.check_sign` bytes field is the ONLY document carrier
+    //     on the wire — a detached signature would arrive without the receipt
+    //     and be rejected `-1 ERROR_VEREFY`.
+    //   * signingTime: every official ЦЗО CAdES-BES reference vector
+    //     (`czo_test/*.p7s`) carries contentType + signingTime + messageDigest
+    //     + signingCertificateV2, and WebCheck (EUSignCP signLevel=1, TSP off)
+    //     produces the same.  Omitting it diverges from the accepted profile.
+    // `CmsSigner::sign_with` computes the per-profile content digest and stamps
+    // `signingTime = now()`; no TSP token (that is CAdES-T, off in the
+    // reference).  The `sign_cms_detached` trait-method name is retained for
+    // back-compat; the produced CMS is ATTACHED.
+    let cms_signer = CmsSigner {
+        cert_der: session.cert_der(),
+        signer: &signer,
         profile,
-        session.cert_der(),
-        canonical_xml,
-        &content_digest,
-        &signer,
-    )
-    .map_err(|_| CryptoError::CmsSign {
-        reason: SignKind::BackendError,
-    })
+    };
+    cms_signer
+        .sign_with(
+            canonical_xml,
+            CmsBuildOptions {
+                attached: true,
+                signing_time: Some(std::time::SystemTime::now()),
+            },
+        )
+        .map(|sig| sig.cms_der)
+        .map_err(|_| CryptoError::CmsSign {
+            reason: SignKind::BackendError,
+        })
 }
 
 fn verify_blocking(

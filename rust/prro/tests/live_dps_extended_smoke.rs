@@ -45,8 +45,11 @@
 //! 1. **DPS rate limit** (`project_dps_rate_limit`): the test server returns
 //!    `status=-4` after too many errors, with a 5+ minute per-FN cooldown.
 //!    Run sparsely and manually — NEVER in a loop and NEVER in CI.
-//! 2. **Production refusal**: tests refuse to run against the production
-//!    endpoint (`prro.tax.gov.ua`) — test host only.
+//! 2. **Test-host allowlist (default-deny)**: the resolved endpoint's HOST is
+//!    parsed and must be `cabinet.tax.gov.ua` (or a `*-cabinet`/`*.cabinet`
+//!    test/dev cabinet); ANY other host — every production endpoint
+//!    (`prro.tax.gov.ua`, legacy `prro2.tax.gov.ua`, `fs.tax.gov.ua`) and any
+//!    lookalike — is refused, so the smoke can never fiscalize against prod.
 //! 3. **Native signing** (`prro_crypto::cms`, DSTU 4145-2002 + GOST 34.311,
 //!    CAdES-BES, ATTACHED) — no external sidecar.
 
@@ -104,16 +107,35 @@ fn live_armed(test_name: &str) -> bool {
         );
         return false;
     }
-    let host = resolve_host();
-    if !host.contains(TEST_HOST_MARKER) {
+    let endpoint = resolve_host();
+    let host = host_of(&endpoint);
+    // Default-deny allowlist on the PARSED host (not a substring of the raw
+    // URL): exact `cabinet.tax.gov.ua`, a `.cabinet…` subdomain, or a
+    // `*-cabinet…` dev cabinet.  Rejects every prod endpoint (prro/prro2/fs)
+    // AND lookalikes like `cabinet.tax.gov.ua.evil.com`.
+    let allowed = host == TEST_HOST_MARKER
+        || host.ends_with(&format!(".{TEST_HOST_MARKER}"))
+        || host.ends_with(&format!("-{TEST_HOST_MARKER}"));
+    if !allowed {
         panic!(
-            "{test_name} REFUSED: {ENV_HOST}={host} is not a DPS TEST cabinet \
-             (must contain `{TEST_HOST_MARKER}`).  The live smoke is test-server \
-             only (default {DEFAULT_HOST}); refusing to risk fiscalizing against \
-             a production endpoint (prro/prro2/fs.tax.gov.ua)."
+            "{test_name} REFUSED: {ENV_HOST}={endpoint} resolves to host `{host}`, \
+             which is not a DPS TEST cabinet (allowlist: `{TEST_HOST_MARKER}` / \
+             `*-{TEST_HOST_MARKER}` / `*.{TEST_HOST_MARKER}`).  The live smoke is \
+             test-server only (default {DEFAULT_HOST}); refusing to risk \
+             fiscalizing against a production endpoint (prro/prro2/fs.tax.gov.ua)."
         );
     }
     true
+}
+
+/// Extract the bare hostname from an endpoint URL — strips scheme, optional
+/// userinfo, port, and any path — so the allowlist matches the real host and
+/// not a substring of the URL (e.g. a path or a lookalike domain).
+fn host_of(endpoint: &str) -> &str {
+    let after_scheme = endpoint.split("://").nth(1).unwrap_or(endpoint);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    hostport.split(':').next().unwrap_or(hostport)
 }
 
 // ─── Piece 1 — connectivity probe ───────────────────────────────────────

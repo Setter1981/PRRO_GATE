@@ -9,7 +9,7 @@
 //! pass since real production uses random rand_e per call.
 
 use prro_crypto::{
-    cms::{CmsProfile, CmsSigner, DstuInProcessSigner},
+    cms::{CmsBuildOptions, CmsProfile, CmsSigner, DstuInProcessSigner},
     interop::prro::{der, jks},
 };
 
@@ -148,11 +148,13 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// W4-Z3 attached-CMS proof: `sign_attached_with_content_digest` embeds the
-/// content as `eContent` (the form DPS `sendChkV2` requires — the gateway's
-/// `InProcessProvider` now drives this), whereas the detached form does NOT
-/// carry the content.  Signed-attributes + signature value are identical
-/// between the two (same `content_digest`); only `eContent` is added.
+/// W4-Z3 attached-CMS proof: the high-level `CmsSigner::sign_with(.., attached:
+/// true ..)` embeds the content as `eContent` (the form DPS `sendChkV2`
+/// requires — the gateway's `InProcessProvider` drives the same API with
+/// `signing_time: Some(now)`), whereas the detached form does NOT carry the
+/// content.  `signing_time` is `None` here ONLY to isolate the eContent
+/// variable for the comparison; the signature value differs per call anyway
+/// (DSTU draws a fresh random nonce), so we assert structure, not bytes.
 #[test]
 fn test_attached_embeds_econtent_detached_does_not() {
     let (cert_der, key_d_bytes) = match load_signing_material() {
@@ -168,24 +170,20 @@ fn test_attached_embeds_econtent_detached_does_not() {
 
     // Distinctive content so we can byte-search for it in the CMS DER.
     let content = b"<RQ V=\"1\">PRRO-W4Z3-ATTACHED-ECONTENT-PROOF</RQ>";
-    let profile = CmsProfile::default(); // Dstu4145WithGost34311Pb
-    let content_digest = prro_crypto::core::hash::gost_34_311_95(content).to_vec();
+    let cms_signer = CmsSigner {
+        cert_der: &cert_der,
+        signer: &signer,
+        profile: CmsProfile::default(), // Dstu4145WithGost34311Pb
+    };
 
-    let detached = prro_crypto::cms::sign_detached_with_content_digest(
-        profile,
-        &cert_der,
-        &content_digest,
-        &signer,
-    )
-    .expect("detached sign failed");
-    let attached = prro_crypto::cms::sign_attached_with_content_digest(
-        profile,
-        &cert_der,
-        content,
-        &content_digest,
-        &signer,
-    )
-    .expect("attached sign failed");
+    let detached = cms_signer
+        .sign_with(content, CmsBuildOptions { attached: false, signing_time: None })
+        .expect("detached sign failed")
+        .cms_der;
+    let attached = cms_signer
+        .sign_with(content, CmsBuildOptions { attached: true, signing_time: None })
+        .expect("attached sign failed")
+        .cms_der;
 
     // Both are well-formed ContentInfo DER (outer SEQUENCE).
     assert_eq!(detached[0], 0x30, "detached not SEQUENCE");

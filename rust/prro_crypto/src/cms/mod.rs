@@ -49,8 +49,7 @@ pub mod signer;
 pub mod tsp;
 
 pub use builder::{
-    sign_attached_with_content_digest, sign_detached_with_content_digest, CmsError, CmsSigner,
-    DetachedSignature,
+    sign_detached_with_content_digest, CmsBuildOptions, CmsError, CmsSigner, DetachedSignature,
 };
 pub use profile::CmsProfile;
 pub use signer::{DstuInProcessSigner, RawSigner, SignerError};
