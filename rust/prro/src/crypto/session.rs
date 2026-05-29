@@ -120,8 +120,10 @@ impl SigningSession {
 ///   3. Decode plaintext as UTF-8 (rejects non-UTF-8 with a typed error).
 ///   4. Call `prro_crypto::interop::prro::containers::extract_private_key`
 ///      which routes to the JKS parser based on the file's magic bytes.
-///   5. Pick the first cert from the keystore as the operator's signing
-///      cert (the JKS reader returns them in stored order).
+///   5. Select the operator's SIGNING cert (KeyUsage=digitalSignature) via
+///      `ExtractedKey::signing_cert` — NOT `certs[0]`, which is often the
+///      key-agreement (encryption) cert and would make DPS reject the
+///      signature `CryptBadSign`.
 ///
 /// All intermediate plaintext (the unsealed password) is held in
 /// `Zeroizing` and dropped before this function returns.
@@ -201,12 +203,17 @@ pub fn unseal_jks(sealed: SealedMaterial<'_>) -> Result<SigningSession, CryptoEr
         make_err(kind)
     })?;
 
-    // 5. First cert in the keystore is the operator's signing cert.
+    // 5. Embed the SIGNING cert (KeyUsage=digitalSignature), NOT certs[0].
+    //    A UA EDS keystore ships BOTH a signing cert and a key-agreement
+    //    (encryption) cert plus the CA chain; certs[0] is frequently the
+    //    encryption cert.  Embedding it makes a real DPS verifier check the
+    //    signature against the WRONG public key and reject it `CryptBadSign`
+    //    (confirmed live 2026-05-29 against the ДПС ЄВПЗ verifier; the old
+    //    "first cert is the signing cert" assumption was wrong).
     let cert_der = extracted
-        .certs
-        .into_iter()
-        .next()
-        .ok_or_else(|| make_err(SealKind::KeyExtractionFailed))?;
+        .signing_cert()
+        .ok_or_else(|| make_err(SealKind::KeyExtractionFailed))?
+        .to_vec();
 
     // Move the still-Zeroizing<[u8; 32]> into the session inner.  No
     // clone of the 32 bytes — the Zeroizing<...> is moved.
