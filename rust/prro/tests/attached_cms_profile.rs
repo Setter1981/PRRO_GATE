@@ -35,7 +35,9 @@ impl RawSigner for StubSigner {
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
+    !needle.is_empty()
+        && needle.len() <= haystack.len()
+        && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 #[test]
@@ -49,7 +51,10 @@ fn gateway_attached_cms_carries_econtent_signingtime_and_messagedigest() {
 
     // Distinctive content (< 128 bytes) so the byte-search + length framing hold.
     let content = b"<RQ V=\"1\">PRRO-W4Z3-PROFILE-PROOF</RQ>";
-    assert!(content.len() < 0x80, "content must be < 128 bytes for the framing checks");
+    assert!(
+        content.len() < 0x80,
+        "content must be < 128 bytes for the framing checks"
+    );
 
     // EXACTLY the gateway's production options (see crypto/in_process.rs).
     let cms = cms_signer
@@ -75,17 +80,22 @@ fn gateway_attached_cms_carries_econtent_signingtime_and_messagedigest() {
     );
 
     // (2) signingTime signed-attr — OID 1.2.840.113549.1.9.5 (ЦЗО profile requires it).
-    const OID_SIGNING_TIME: [u8; 11] =
-        [0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x05];
+    const OID_SIGNING_TIME: [u8; 11] = [
+        0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x05,
+    ];
     assert!(
         contains(&cms, &OID_SIGNING_TIME),
         "signingTime signed-attr missing — diverges from the accepted ЦЗО CAdES-BES profile"
     );
 
     // (3) messageDigest signed-attr — OID 1.2.840.113549.1.9.4 — value == GOST-34.311(content).
-    const OID_MESSAGE_DIGEST: [u8; 11] =
-        [0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04];
-    assert!(contains(&cms, &OID_MESSAGE_DIGEST), "messageDigest signed-attr missing");
+    const OID_MESSAGE_DIGEST: [u8; 11] = [
+        0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04,
+    ];
+    assert!(
+        contains(&cms, &OID_MESSAGE_DIGEST),
+        "messageDigest signed-attr missing"
+    );
     let digest = prro_crypto::core::hash::gost_34_311_95(content);
     let mut digest_framed = vec![0x04u8, digest.len() as u8];
     digest_framed.extend_from_slice(&digest);
@@ -95,9 +105,13 @@ fn gateway_attached_cms_carries_econtent_signingtime_and_messagedigest() {
     );
 
     // (4) contentType signed-attr — OID 1.2.840.113549.1.9.3 (CAdES-BES required).
-    const OID_CONTENT_TYPE: [u8; 11] =
-        [0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x03];
-    assert!(contains(&cms, &OID_CONTENT_TYPE), "contentType signed-attr missing");
+    const OID_CONTENT_TYPE: [u8; 11] = [
+        0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x03,
+    ];
+    assert!(
+        contains(&cms, &OID_CONTENT_TYPE),
+        "contentType signed-attr missing"
+    );
 }
 
 /// Regression for the `signingTime` UTCTIME conversion (`unix_secs_to_utc`):
@@ -125,7 +139,13 @@ fn signing_time_jan_feb_encode_correct_month_without_overflow() {
     for (unix, utctime) in cases {
         let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix);
         let cms = cms_signer
-            .sign_with(content, CmsBuildOptions { attached: true, signing_time: Some(t) })
+            .sign_with(
+                content,
+                CmsBuildOptions {
+                    attached: true,
+                    signing_time: Some(t),
+                },
+            )
             .expect("Jan/Feb signingTime must encode without panic/error")
             .cms_der;
         assert!(
@@ -154,7 +174,13 @@ fn signing_time_date_boundaries_and_2050_cliff() {
     let content = b"x";
     let sign_at = |secs: u64| {
         let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
-        cms_signer.sign_with(content, CmsBuildOptions { attached: true, signing_time: Some(t) })
+        cms_signer.sign_with(
+            content,
+            CmsBuildOptions {
+                attached: true,
+                signing_time: Some(t),
+            },
+        )
     };
 
     // Valid dates → the correct UTCTIME must be present.

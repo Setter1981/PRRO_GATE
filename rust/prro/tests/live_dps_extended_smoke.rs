@@ -150,14 +150,29 @@ fn host_of(endpoint: &str) -> &str {
 #[test]
 fn host_of_isolates_authority_and_blocks_prod_tricks() {
     // Real test cabinet (default).
-    assert_eq!(host_of("https://cabinet.tax.gov.ua:9443"), "cabinet.tax.gov.ua");
-    assert_eq!(host_of("https://cabinet.tax.gov.ua:9443/path"), "cabinet.tax.gov.ua");
+    assert_eq!(
+        host_of("https://cabinet.tax.gov.ua:9443"),
+        "cabinet.tax.gov.ua"
+    );
+    assert_eq!(
+        host_of("https://cabinet.tax.gov.ua:9443/path"),
+        "cabinet.tax.gov.ua"
+    );
     // Valid test host WITH a query must still resolve to the cabinet (no false reject).
-    assert_eq!(host_of("https://cabinet.tax.gov.ua?param=1"), "cabinet.tax.gov.ua");
+    assert_eq!(
+        host_of("https://cabinet.tax.gov.ua?param=1"),
+        "cabinet.tax.gov.ua"
+    );
     // Round-4 bypass: query/fragment `@cabinet…` must NOT be read as the host —
     // the real authority host is the prod endpoint, which must be rejected.
-    assert_eq!(host_of("https://prro.tax.gov.ua:9443?x=@cabinet.tax.gov.ua"), "prro.tax.gov.ua");
-    assert_eq!(host_of("https://prro.tax.gov.ua:9443#@cabinet.tax.gov.ua"), "prro.tax.gov.ua");
+    assert_eq!(
+        host_of("https://prro.tax.gov.ua:9443?x=@cabinet.tax.gov.ua"),
+        "prro.tax.gov.ua"
+    );
+    assert_eq!(
+        host_of("https://prro.tax.gov.ua:9443#@cabinet.tax.gov.ua"),
+        "prro.tax.gov.ua"
+    );
     // Userinfo trick: real host is AFTER the '@' inside the authority.
     assert_eq!(host_of("https://cabinet.tax.gov.ua@evil.com"), "evil.com");
 }
