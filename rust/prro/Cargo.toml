@@ -35,6 +35,16 @@ default = []
 # compile — by design.
 test-support = []
 
+# W4-Z3 live-DPS smoke gate.  Gates the `tests/live_dps_extended_smoke.rs`
+# target (whole file is `#![cfg(feature = "live-dps")]`), so it does NOT
+# compile — and cannot be run — unless explicitly built with
+# `--features live-dps`.  These tests hit the REAL DPS test server
+# (cabinet.tax.gov.ua:9443) with a REAL key + native prro_crypto signing,
+# so they are additionally `#[ignore]`'d AND guarded by a `PRRO_LIVE_DPS=1`
+# in-body env kill-switch (triple gate: feature + ignore + env).  NEVER run
+# in CI.  See the test file header for the env contract + rate-limit caveat.
+live-dps = []
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
