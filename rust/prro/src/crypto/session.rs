@@ -201,12 +201,17 @@ pub fn unseal_jks(sealed: SealedMaterial<'_>) -> Result<SigningSession, CryptoEr
         make_err(kind)
     })?;
 
-    // 5. First cert in the keystore is the operator's signing cert.
+    // 5. Embed the SIGNING cert (KeyUsage=digitalSignature), NOT certs[0].
+    //    A UA EDS keystore ships BOTH a signing cert and a key-agreement
+    //    (encryption) cert plus the CA chain; certs[0] is frequently the
+    //    encryption cert.  Embedding it makes a real DPS verifier check the
+    //    signature against the WRONG public key and reject it `CryptBadSign`
+    //    (confirmed live 2026-05-29 against the ДПС ЄВПЗ verifier; the old
+    //    "first cert is the signing cert" assumption was wrong).
     let cert_der = extracted
-        .certs
-        .into_iter()
-        .next()
-        .ok_or_else(|| make_err(SealKind::KeyExtractionFailed))?;
+        .signing_cert()
+        .ok_or_else(|| make_err(SealKind::KeyExtractionFailed))?
+        .to_vec();
 
     // Move the still-Zeroizing<[u8; 32]> into the session inner.  No
     // clone of the 32 bytes — the Zeroizing<...> is moved.
