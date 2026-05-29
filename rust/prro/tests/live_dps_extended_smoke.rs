@@ -70,6 +70,25 @@ use prro_crypto::interop::prro::containers::{extract_private_key, ExtractedKey};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime};
 
+// ── Piece 4 — production stage_sign drive of an extended SELL (native sign) ──
+use async_trait::async_trait;
+use prro::config::AppConfig;
+use prro::crypto::in_process::InProcessProvider;
+use prro::crypto::provider::CryptoProvider;
+use prro::crypto::session::SigningSession;
+use prro::db::models::ids::DocumentId;
+use prro::db::repositories::signing_config_snapshots;
+use prro::db::tx::with_immediate;
+use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
+use prro::services::write_path::stage_sign::SigningContext;
+use prro::services::write_path::tax_summary::{
+    DriverNumberMapping, ResolvedTaxGroupBps, TaxResolutionSnapshot,
+};
+use prro::transports::dps::dto::{CheckAck, CheckEnvelope, RroInfo, StatusSnapshot};
+use prro::App;
+use sqlx::SqlitePool;
+use std::sync::Arc;
+
 // ─── Env contract ──────────────────────────────────────────────────────
 
 /// Hard env kill-switch: every test self-skips unless this equals `"1"`.
@@ -154,7 +173,7 @@ fn host_of(endpoint: &str) -> &str {
     // the query masquerade as the host and bypass the prod-refusal allowlist
     // (the real URI host there is prro.tax.gov.ua).
     let authority = after_scheme
-        .split(|c: char| c == '/' || c == '?' || c == '#')
+        .split(['/', '?', '#'])
         .next()
         .unwrap_or(after_scheme);
     // Within the authority, strip userinfo (`user@host`) then the port.
@@ -504,5 +523,446 @@ async fn live_smoke_3_mac_seed() {
     println!(
         "Smoke 3 PASS: MAC seed persisted + read back from node_state \
          (next online SELL will chain off this hash)."
+    );
+}
+
+// ─── Piece 4 — extended SELL build + NATIVE sign via production stage_sign ──
+//
+// **Offline piece (NO live DPS).**  Unlike pieces 1-3, piece 4 never
+// touches the wire: it drives a PREPARED extended-SELL document through
+// the REAL production write-path (`App::reconcile_pending_with` →
+// `dispatch_prepared_via_chain` → `stage_sign::run` → `stage_send::run`)
+// with a STUB DpsChannel, so it proves the build+sign half of the cycle
+// without fiscalizing.  What it adds over pieces 1-3 and over the mock-
+// only goldens: the canonical XML is produced by the production
+// driver→canonical translation (`check_payload_from`, W4-Z2a) AND signed
+// by the REAL native in-process signer (`InProcessProvider` +
+// `prro_crypto`) using the REAL operator key — the exact combination
+// piece 5 then sends to live DPS.
+//
+// Gate: feature `live-dps` (file-level) + `#[ignore]` + a real JKS key
+// (`PRRO_LIVE_DPS_JKS_PATH` / `_PASS`).  It does NOT require
+// `PRRO_LIVE_DPS=1` because there is no DPS contact — the stub channel
+// answers `send_chk` locally and panics on every other method.
+//
+// **Assertions:**
+//   (1) PREPARED → SENT (full sign+send chain ran, stub ack).
+//   (2) PAYLOAD_XML carries CANONICAL tax groups `TX="1"` / `TX="2"`
+//       (driver 5/7 were translated) and NOT the raw driver numbers —
+//       this is the live proof of the W4-Z2a silent-fiscal-divergence
+//       fix on the production path.
+//   (3) extended attrs present: excise `<CA CA="…">` children + UKTZED
+//       `CZD="…"` + `<TX>` summaries for both canonical groups.
+//   (4) SIGNED_XML is a valid ATTACHED CMS whose eContent is byte-
+//       identical to PAYLOAD_XML — proves the native signer embedded the
+//       exact canonical XML (no re-encode / detached drift).
+
+/// Synthetic FN for the offline piece-4 drive.  NOT a real registered
+/// PRRO — piece 4 never contacts DPS, so any well-formed FN works; using
+/// a synthetic one keeps the offline test decoupled from live-cabinet
+/// registration state.
+const PIECE4_FN: &str = "4000000077";
+
+/// Extended SELL payload in the adapter wire-JSON shape consumed by
+/// `stage_sign`'s `CheckJson`.  Two items exercise the full extended
+/// surface via POS driver-numbers (translated by the pinned snapshot):
+///   - item 1: `tax_group_1=5` (→ canonical TX=1, 20% VAT) + UKTZED
+///     (`CZD`) + two excise stamps (`<CA>` children).
+///   - item 2: `tax_group_1=7` (→ canonical TX=2, 7% VAT), plain line.
+const EXTENDED_SELL_PAYLOAD_JSON: &str = r#"{
+  "items": [
+    {
+      "code": "ALC-001",
+      "name": "VODKA 0.5L",
+      "price_kop": 6000,
+      "quantity_thousandths": 1000,
+      "sum_kop": 6000,
+      "uktzed": "22042100",
+      "tax_group_1": 5,
+      "excise_stamps": ["UA1234567890", "UA0987654321"]
+    },
+    {
+      "code": "ART-002",
+      "name": "JUICE 1L",
+      "price_kop": 3000,
+      "quantity_thousandths": 1000,
+      "sum_kop": 3000,
+      "tax_group_1": 7
+    }
+  ],
+  "payments": [
+    { "name": "CASH", "sum_kop": 9000, "type_code": "0" }
+  ]
+}"#;
+
+/// Sum of the two item lines (6000 + 3000) — `command.total_sum_kop`,
+/// required by `parse_payload` for a Check artifact.
+const EXTENDED_SELL_TOTAL_SUM_KOP: i64 = 9000;
+
+/// Build a `SigningContext` over the REAL operator key + the REAL
+/// production native signer (`InProcessProvider` → `prro_crypto`).
+/// Mirrors `tests/common::det_signing_ctx` but swaps the deterministic
+/// stub provider/session for the live key — so `stage_sign` exercises
+/// the exact crypto path piece 5 sends to DPS.  Embeds the SIGNING cert
+/// (KeyUsage=digitalSignature) via `signing_cert()`, NOT `certs[0]`
+/// (the encryption cert — see `sign_fn_blob`).
+fn live_signing_ctx(ek: &ExtractedKey) -> SigningContext {
+    let cert_der = ek
+        .signing_cert()
+        .expect("JKS must carry a signing certificate (KeyUsage=digitalSignature)")
+        .to_vec();
+    let param_d: [u8; 32] = *ek.param_d;
+    SigningContext {
+        provider: Arc::new(InProcessProvider::new()) as Arc<dyn CryptoProvider>,
+        session: SigningSession::new_for_test(
+            "GALCHUN MYKOLA DMYTROVYCH".into(),
+            param_d,
+            cert_der,
+        ),
+        profile: CmsProfile::Dstu4145WithGost34311Pb,
+    }
+}
+
+/// Stub `DpsChannel` for the OFFLINE piece-4 drive: `send_chk` returns a
+/// fixed ack (so the PREPARED→SENT chain completes), every other method
+/// panics — proving the chain consults ONLY `send_chk`.
+struct StubAckDps;
+
+#[async_trait]
+impl DpsChannel for StubAckDps {
+    async fn send_chk(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        Ok(CheckAck {
+            id: "stub-fiscal-piece4".into(),
+            id_sign: vec![],
+            data_sign: vec![],
+        })
+    }
+    async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
+        unreachable!(
+            "piece 4 stub: last_chk must not be invoked (PREPARED→SENT uses send_chk only)"
+        )
+    }
+    async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        unreachable!("piece 4 stub: ping must not be invoked")
+    }
+    async fn status_rro(&self, _: &CheckSignBlob) -> Result<StatusSnapshot, DpsError> {
+        unreachable!("piece 4 stub: status_rro must not be invoked")
+    }
+    async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
+        unreachable!("piece 4 stub: info_rro must not be invoked")
+    }
+}
+
+/// Boot a real `App` over a throwaway temp DB (migrated, recovery run on
+/// an empty DB).  Mirrors `write_path_deterministic_replay::fresh_app`.
+async fn boot_offline_app() -> (tempfile::TempDir, App) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("w4z3-piece4.db");
+    let toml_text = format!(
+        r#"
+app_name = "prro"
+version  = "0.1.0"
+
+[database]
+db_path = "{0}"
+secure_db_path = "{0}_secure"
+
+[admin_ui]
+enabled = false
+listen  = "127.0.0.1:8443"
+"#,
+        db_path.display().to_string().replace('\\', "/")
+    );
+    let cfg = AppConfig::from_toml(&toml_text).expect("config parse");
+    let app = App::boot(cfg).await.expect("App::boot");
+    (dir, app)
+}
+
+async fn seed_fn_config_piece4(pool: &SqlitePool, fn_id: &str) {
+    sqlx::query(
+        "INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES (?, '12345678', 'test')",
+    )
+    .bind(fn_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Seed an OPENED shift + ONLINE node_state (next_lnd=1, b1/t1 profiles).
+/// Mirrors `write_path_deterministic_replay::seed_open_shift_and_node`.
+async fn seed_open_shift_and_node_piece4(pool: &SqlitePool, fn_id: &str) {
+    use prro::db::models::ids::ShiftId;
+    let shift_id = ShiftId::new();
+    sqlx::query(
+        "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
+    )
+    .bind(shift_id)
+    .bind(fn_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO node_state (fiscal_number, mode, shift_state, current_shift_id, \
+            next_lnd, backend_profile_id, transport_profile_id) \
+         VALUES (?, 'ONLINE', 'OPENED', ?, 1, 'b1', 't1')",
+    )
+    .bind(fn_id)
+    .bind(shift_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Seed a PREPARED extended-SELL `fiscal_documents` row with the
+/// snapshot FK set (so the PREPARED reconcile arm loads the snapshot and
+/// `derive_check_tax_summaries` can emit `<TX>`).  The doc's own shift
+/// (doc_byte^0x80) carries `opened_by_cashier_id='test-cashier'` matching
+/// `signed_by_cashier_id`, so stage_send 4-pre signer_guard passes.
+/// Mirrors `write_path_deterministic_replay::seed_doc_prepared_full` +
+/// the `signing_config_snapshot_id` FK.
+async fn seed_extended_sell_prepared(
+    pool: &SqlitePool,
+    fn_id: &str,
+    doc_byte: u8,
+    snapshot_id: i64,
+) -> (DocumentId, [u8; 16]) {
+    let shift_byte = doc_byte ^ 0x80;
+    let shift_bytes = vec![shift_byte; 16];
+    sqlx::query(
+        "INSERT OR IGNORE INTO shifts(shift_id, fiscal_number, serial, state, open_mode, \
+            cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
+    )
+    .bind(&shift_bytes)
+    .bind(fn_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let doc_bytes = vec![doc_byte; 16];
+    let req_bytes = vec![doc_byte ^ 0xFF; 16];
+    let sha = vec![0u8; 32];
+    let lnd = doc_byte as i64;
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
+            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            total_sum_kop, payload_json, payload_sha256_canonical, signed_by_cashier_id, \
+            signing_config_snapshot_id) \
+         VALUES (?, ?, ?, ?, ?, 'SELL', 'PREPARED', 'b1', 't1', 'ONLINE', \
+            '2026-04-22T12:00:00Z', ?, ?, ?, 'test-cashier', ?)",
+    )
+    .bind(&doc_bytes)
+    .bind(&req_bytes)
+    .bind(fn_id)
+    .bind(&shift_bytes)
+    .bind(lnd)
+    .bind(EXTENDED_SELL_TOTAL_SUM_KOP)
+    .bind(EXTENDED_SELL_PAYLOAD_JSON)
+    .bind(&sha)
+    .bind(snapshot_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    let doc_id = DocumentId::from_bytes(<[u8; 16]>::try_from(doc_bytes.as_slice()).unwrap());
+    let req_arr: [u8; 16] = <[u8; 16]>::try_from(req_bytes.as_slice()).unwrap();
+    (doc_id, req_arr)
+}
+
+/// Seed the matching `ingress_inbox` PROCESSING row (payload identical to
+/// the doc's so a payload-hash invariant guard wouldn't trip).
+async fn seed_inbox_processing_for_sell_piece4(pool: &SqlitePool, fn_id: &str, req_id: &[u8; 16]) {
+    let sha = vec![0u8; 32];
+    let req_slice: &[u8] = req_id;
+    sqlx::query(
+        "INSERT INTO ingress_inbox(request_id, fiscal_number, protocol, operation_type, \
+            idempotency_key, payload_json, payload_sha256_canonical, status) \
+         VALUES (?, ?, 'REST', 'SELL', ?, ?, ?, 'PROCESSING')",
+    )
+    .bind(req_slice)
+    .bind(fn_id)
+    .bind(format!("idem-{:02x}", req_id[0]))
+    .bind(EXTENDED_SELL_PAYLOAD_JSON)
+    .bind(&sha)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn doc_state_piece4(pool: &SqlitePool, doc: DocumentId) -> String {
+    sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
+        .bind(doc)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn read_document_file_piece4(
+    pool: &SqlitePool,
+    doc: DocumentId,
+    kind: &str,
+) -> Option<Vec<u8>> {
+    sqlx::query_scalar("SELECT content FROM document_files WHERE document_id = ? AND kind = ?")
+        .bind(doc)
+        .bind(kind)
+        .fetch_optional(pool)
+        .await
+        .expect("read document_files row")
+}
+
+/// **W4-Z3 Smoke 4 — extended SELL build + native sign (offline)**.
+#[tokio::test]
+#[ignore = "real JKS key required; opt-in via --features live-dps + --ignored + PRRO_LIVE_DPS_JKS_PATH/_PASS (no DPS contact)"]
+async fn live_smoke_4_extended_sell_native_sign() {
+    let Some(ek) = load_signing_key("W4-Z3 Smoke 4") else {
+        return;
+    };
+    println!("\n=== W4-Z3 Smoke 4: extended SELL build + native sign (offline, stub DPS) ===");
+
+    let (_dir, app) = boot_offline_app().await;
+    let fn_id = PIECE4_FN;
+    seed_fn_config_piece4(app.db(), fn_id).await;
+    seed_open_shift_and_node_piece4(app.db(), fn_id).await;
+
+    // Pin a snapshot with the non-identity driver mapping the pilot uses:
+    // driver 5 → canonical TX=1 (20% VAT), driver 7 → canonical TX=2 (7% VAT).
+    let snapshot = TaxResolutionSnapshot::with_driver_mapping(
+        vec![
+            ResolvedTaxGroupBps {
+                tx: 1,
+                txpr_bps: 2000,
+                dtpr_bps: 0,
+                txal: 0,
+                txty: 0,
+            },
+            ResolvedTaxGroupBps {
+                tx: 2,
+                txpr_bps: 700,
+                dtpr_bps: 0,
+                txal: 0,
+                txty: 0,
+            },
+        ],
+        vec![
+            DriverNumberMapping {
+                driver_number: 5,
+                canonical_tx_num: 1,
+            },
+            DriverNumberMapping {
+                driver_number: 7,
+                canonical_tx_num: 2,
+            },
+        ],
+    );
+    let snapshot_id = with_immediate(app.db(), move |tx| {
+        Box::pin(async move {
+            let id = signing_config_snapshots::insert_or_get_id_tx(
+                tx,
+                PIECE4_FN,
+                "driver-piece4",
+                &snapshot,
+            )
+            .await?;
+            Ok::<i64, anyhow::Error>(id)
+        })
+    })
+    .await
+    .expect("insert signing_config_snapshot");
+
+    let (doc, req_id) = seed_extended_sell_prepared(app.db(), fn_id, 0x44, snapshot_id).await;
+    seed_inbox_processing_for_sell_piece4(app.db(), fn_id, &req_id).await;
+
+    let stub = StubAckDps;
+    let signing_ctx = live_signing_ctx(&ek);
+    // fn_sign is unused by the stub (last_chk panics) — a dummy blob.
+    let fn_sign = CheckSignBlob(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    app.reconcile_pending_with(deps)
+        .await
+        .expect("reconcile_pending_with green");
+
+    // (1) PREPARED → SENT (sign + send chain ran).
+    assert_eq!(
+        doc_state_piece4(app.db(), doc).await,
+        "SENT",
+        "dispatch_prepared_via_chain must drive PREPARED → SIGNED → SENT (native sign + stub ack)"
+    );
+
+    // (2)+(3) PAYLOAD_XML carries CANONICAL groups + extended attrs.
+    let payload_xml = read_document_file_piece4(app.db(), doc, "PAYLOAD_XML")
+        .await
+        .expect("stage_sign 3-PERSIST must INSERT PAYLOAD_XML");
+    let signed_xml = read_document_file_piece4(app.db(), doc, "SIGNED_XML")
+        .await
+        .expect("stage_sign 3-PERSIST must INSERT SIGNED_XML");
+    let xml = String::from_utf8_lossy(&payload_xml);
+
+    // Driver→canonical translation reached the wire (W4-Z2a fix proof):
+    // emit canonical TX=1/TX=2, NEVER the raw driver numbers 5/7.
+    assert!(
+        xml.contains(r#"TX="1""#),
+        "driver 5 must emit canonical TX=\"1\" on the wire; xml=\n{xml}"
+    );
+    assert!(
+        xml.contains(r#"TX="2""#),
+        "driver 7 must emit canonical TX=\"2\" on the wire; xml=\n{xml}"
+    );
+    assert!(
+        !xml.contains(r#"TX="5""#) && !xml.contains(r#"TX="7""#),
+        "raw POS driver numbers (5/7) must NOT reach the wire — translation must happen; xml=\n{xml}"
+    );
+    // Extended attrs: excise stamps as <CA> children + UKTZED as CZD.
+    assert!(
+        xml.contains(r#"<CA CA="UA1234567890""#),
+        "excise stamp 1 must emit a <CA> child; xml=\n{xml}"
+    );
+    assert!(
+        xml.contains(r#"<CA CA="UA0987654321""#),
+        "excise stamp 2 must emit a <CA> child; xml=\n{xml}"
+    );
+    assert!(
+        xml.contains(r#"CZD="22042100""#),
+        "UKTZED must emit the CZD attr; xml=\n{xml}"
+    );
+    // <TX> summaries for both canonical groups (inside <E>; attrs are
+    // emitted in alphabetical order so TX is NOT the first attr).  Assert
+    // the snapshot rates flowed through (2000bps→20.00, 700bps→7.00) AND
+    // the VAT-inclusive amounts aggregated correctly per group:
+    //   group 1: 6000 kop @ 20% incl = 1000;  group 2: 3000 @ 7% incl = 196.
+    assert!(
+        xml.contains(r#"TXPR="20.00""#),
+        "group 1 (driver 5→canonical 1) <TX> summary must carry the 20.00% rate; xml=\n{xml}"
+    );
+    assert!(
+        xml.contains(r#"TXPR="7.00""#),
+        "group 2 (driver 7→canonical 2) <TX> summary must carry the 7.00% rate; xml=\n{xml}"
+    );
+    assert!(
+        xml.contains(r#"TX="1" TXAL="0" TXPR="20.00" TXSM="1000""#),
+        "group 1 <TX> must aggregate 6000 kop @ 20% VAT-incl = TXSM 1000; xml=\n{xml}"
+    );
+    assert!(
+        xml.contains(r#"TX="2" TXAL="0" TXPR="7.00" TXSM="196""#),
+        "group 2 <TX> must aggregate 3000 kop @ 7% VAT-incl = TXSM 196; xml=\n{xml}"
+    );
+
+    // (4) SIGNED_XML is a valid ATTACHED CMS whose eContent == PAYLOAD_XML.
+    let inner = extract_econtent(&signed_xml).expect("SIGNED_XML must be a parseable ATTACHED CMS");
+    assert_eq!(
+        inner, payload_xml,
+        "native signer's ATTACHED CMS eContent must be byte-identical to PAYLOAD_XML \
+         (no detached drift / no re-encode)"
+    );
+
+    println!(
+        "Smoke 4 PASS: extended SELL built via production stage_sign (driver 5→1, 7→2 translated \
+         to canonical TX), native ATTACHED CMS over {} bytes XML; eContent round-trips.",
+        payload_xml.len()
     );
 }
