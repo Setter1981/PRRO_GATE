@@ -201,7 +201,11 @@ fn unix_secs_to_utc(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = (mp + if mp < 10 { 3 } else { -9i64 as u64 }) as u32;
+    // Hinnant month: mp∈[0,11] → month = mp<10 ? mp+3 : mp-9 (Jan=mp10, Feb=mp11).
+    // MUST use signed arithmetic: the old `mp + (-9i64 as u64)` form overflowed
+    // for mp≥10 under overflow-checks (cargo test debug default) → panic on every
+    // Jan/Feb signingTime, and relied on wraparound otherwise.  mp is tiny (<12).
+    let month = (mp as i64 + if mp < 10 { 3 } else { -9 }) as u32;
     let year = (y + if month <= 2 { 1 } else { 0 }) as u32;
     (year, month, day, hour, minute, second)
 }
