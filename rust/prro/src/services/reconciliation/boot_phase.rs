@@ -1062,14 +1062,17 @@ pub enum BranchOutcome {
         histogram: DispatchHistogram,
         sub_branch: SubBranch,
     },
-    /// (d) M3b W7b update (2026-05-16): mode == `GoingOnline` →
-    /// refuse boot; caller surfaces `BootError::OfflineModeRefusal`.
-    /// Pre-W7b this also covered `Offline` / `GoingOffline`, but
-    /// those modes now fall through to per-doc dispatch via W7b's
+    /// (d) M3b W7b update (2026-05-16): mode == `GoingOnline` at boot.
+    /// The CALLER decides fatality (**RS-1 F7, 2026-05-30**): the ctx-free
+    /// boot-gate (`reconcile_pending`, `deps == None`) fails-closed and
+    /// surfaces `BootError::OfflineModeRefusal`; the runtime path
+    /// (`reconcile_pending_with`, `deps == Some`) DEFERS this FN to the W9
+    /// drain loop — records it in `branch_d_offline_refusal` and continues
+    /// the other FNs.  Pre-W7b this also covered `Offline` / `GoingOffline`,
+    /// but those modes now fall through to per-doc dispatch via W7b's
     /// `dispatch_post_sign` (see `dispatch_pending_doc::DocState::Signed`
-    /// and `dispatch_prepared_via_chain`).  `GoingOnline` stays
-    /// refused because that's W9 backlog-drain territory and
-    /// boot reconciliation defers to W9 for those FNs.
+    /// and `dispatch_prepared_via_chain`).  `GoingOnline` stays this
+    /// branch's outcome because that's W9 backlog-drain territory.
     OfflineRefusal {
         observed_mode: NodeMode,
     },
