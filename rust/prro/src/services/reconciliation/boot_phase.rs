@@ -353,11 +353,13 @@ pub struct ReconciliationSummary {
     pub branch_b: usize,
     pub branch_c: usize,
     /// W9.4 cycle-2 LOW-5 fix: symmetric field for branch (d).
-    /// Always 0 under M3a's fail-fast policy (caller maps
-    /// OfflineRefusal to `BootError::OfflineModeRefusal` before
-    /// recording).  Field exists for symmetry + future-proofing
-    /// (non-fail-fast variant could populate this without silent
-    /// loss).
+    /// 0 under the ctx-free boot-gate (`App::boot` / `reconcile_pending`,
+    /// `deps == None`), which still maps the FIRST OfflineRefusal to
+    /// `BootError::OfflineModeRefusal` and fails-fast.  **RS-1 F7
+    /// (2026-05-30):** under the runtime path (`reconcile_pending_with`,
+    /// `deps == Some`) a `GoingOnline` FN is no longer fatal — it is
+    /// deferred to the W9 drain loop and counted HERE, so this field is
+    /// the live count of FNs handed off to the drain loop at boot.
     pub branch_d_offline_refusal: usize,
     pub branch_e1: usize,
     pub branch_e2: usize,
@@ -393,12 +395,13 @@ impl ReconciliationSummary {
                 self.docs_advanced.merge(histogram);
             }
             BranchOutcome::OfflineRefusal { .. } => {
-                // LOW-5 symmetric field: populated for non-fail-fast
-                // future variant.  Under M3a's current fail-fast
-                // policy `App::reconcile_pending` returns Err before
-                // calling `record`, so this branch is dead code
-                // today — kept for future-proofing + debug_assert
-                // catches inadvertent call.
+                // LOW-5 symmetric field.  The ctx-free boot-gate
+                // (`deps == None`) returns `BootError::OfflineModeRefusal`
+                // before reaching `record`, so it never lands here.  RS-1
+                // F7 (2026-05-30) DOES reach here: the runtime reconcile
+                // path defers a `GoingOnline` FN to the W9 drain loop and
+                // records it instead of aborting — this counts those
+                // hand-offs.
                 self.branch_d_offline_refusal += 1;
             }
             BranchOutcome::OrphanShiftResolved { orphans_resolved } => {
@@ -1112,9 +1115,13 @@ impl BranchOutcome {
 /// **Branch (d) — GoingOnline refusal** (M3b W7b update,
 /// 2026-05-16).  Returns `BranchOutcome::OfflineRefusal {
 /// observed_mode }` rather than erroring directly; the caller
-/// (`App::reconcile_pending`) maps this outcome to
-/// `BootError::OfflineModeRefusal` and fails-fast on the first
-/// GoingOnline FN encountered.  Pre-W7b this also covered Offline
+/// decides fatality.  The ctx-free boot-gate (`App::reconcile_pending`,
+/// `deps == None`) maps this to `BootError::OfflineModeRefusal` and
+/// fails-fast on the first GoingOnline FN.  **RS-1 F7 (2026-05-30):**
+/// the runtime path (`reconcile_pending_with`, `deps == Some`) instead
+/// DEFERS the GoingOnline FN to the W9 drain loop (records it, continues
+/// the other FNs) so one transitioning FN cannot deny the runtime to all
+/// the rest.  Pre-W7b this also covered Offline
 /// / GoingOffline (per freeze §13.3); post-W7b those modes fall
 /// through to the per-doc dispatch loop where the W7b post-sign
 /// dispatcher (`services::write_path::dispatch::dispatch_post_sign`)

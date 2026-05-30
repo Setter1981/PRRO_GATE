@@ -14,14 +14,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use prro::config::AppConfig;
 use prro::crypto::session::SigningSession;
-use prro::db::models::enums::FiscalMode;
-use prro::db::repositories::{fiscal_number_config as fn_cfg, operators as ops_repo};
+use prro::db::models::enums::{FiscalMode, NodeMode, ShiftState};
+use prro::db::repositories::{fiscal_number_config as fn_cfg, node_state, operators as ops_repo};
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
 use prro::runtime::supervisor;
+use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
-use prro::App;
+use prro::{App, BootError};
 
 /// Real DER DSTU-4145 cert so per-tick `build_fn_sign` produces a well-formed
 /// CMS (the scalar is arbitrary — well-formedness, not on-wire acceptance).
@@ -176,4 +177,107 @@ async fn supervisor_runs_loops_over_one_fn_and_shuts_down_cleanly() {
     .await
     .expect("supervisor must not hang on the shutdown join");
     assert!(res.is_ok(), "supervisor must shut down cleanly: {res:?}");
+}
+
+/// F7 regression (multi-FN spine-brick): an FN in GOING_ONLINE at boot — a
+/// NORMAL state for an FN that was mid return-online-drain when the process
+/// last restarted — must NOT fail the whole reconcile and deny the runtime to
+/// the OTHER (healthy) FNs.  The GOING_ONLINE FN is deferred to the drain loop;
+/// the supervisor still spawns the loops and shuts down cleanly.  Pre-fix this
+/// returned `Err(OfflineModeRefusal)` and spawned no loops for ANY FN —
+/// self-perpetuating across restarts.
+#[tokio::test]
+async fn supervisor_does_not_brick_when_one_fn_is_going_online() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = AppConfig::from_toml(&cfg_toml(dir.path())).expect("parse cfg");
+    let app = App::boot(cfg).await.expect("boot");
+
+    // FN-A: GOING_ONLINE (owned by the drain loop).  FN-B: normal (reconcile
+    // bootstraps it Online — no pre-seeded node_state row).
+    fn_cfg::insert(app.db(), &fn_config("4000000001"))
+        .await
+        .expect("seed FN-A config");
+    fn_cfg::insert(app.db(), &fn_config("4000000002"))
+        .await
+        .expect("seed FN-B config");
+    ops_repo::insert(
+        app.db_secure(),
+        &new_op("OP-A", "4000000001", "/tmp/a.dat", b"sa"),
+    )
+    .await
+    .expect("seed OP-A");
+    ops_repo::insert(
+        app.db_secure(),
+        &new_op("OP-B", "4000000002", "/tmp/b.dat", b"sb"),
+    )
+    .await
+    .expect("seed OP-B");
+    node_state::upsert_initial(app.db(), "4000000001", NodeMode::GoingOnline, ShiftState::Closed, 1)
+        .await
+        .expect("seed FN-A GOING_ONLINE");
+
+    let dps: Arc<dyn DpsChannel> = Arc::new(common::StubDpsChannel::new(Ok(common::ack("t"))));
+    let registry = Arc::new(
+        BindingsRegistry::build_from_db(app.db_secure(), app.db(), dps, &FixtureLoader)
+            .await
+            .expect("build_from_db"),
+    );
+    assert_eq!(registry.len(), 2, "both FNs registered");
+
+    let shutdown = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        supervisor::run_with_registry(app, registry, shutdown),
+    )
+    .await
+    .expect("supervisor must not hang");
+    assert!(
+        res.is_ok(),
+        "a GOING_ONLINE FN must NOT brick the supervisor: {res:?}"
+    );
+}
+
+/// F7 semantics, sharp: a GOING_ONLINE FN is fail-closed under the ctx-free
+/// boot-gate (`reconcile_pending`, no drain loop exists) but DEFERRED
+/// (recorded in `branch_d_offline_refusal`, non-fatal) under the runtime
+/// reconcile path (`reconcile_pending_with`, the supervisor spawns the drain
+/// loop next).
+#[tokio::test]
+async fn reconcile_defers_going_online_under_runtime_but_fails_closed_ctx_free() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = AppConfig::from_toml(&cfg_toml(dir.path())).expect("parse cfg");
+    let app = App::boot(cfg).await.expect("boot");
+
+    fn_cfg::insert(app.db(), &fn_config("4000000001"))
+        .await
+        .expect("seed FN config");
+    node_state::upsert_initial(app.db(), "4000000001", NodeMode::GoingOnline, ShiftState::Closed, 1)
+        .await
+        .expect("seed GOING_ONLINE");
+
+    // ctx-free (deps = None): fail-closed — legacy M3a contract preserved.
+    let err = app
+        .reconcile_pending()
+        .await
+        .expect_err("ctx-free reconcile must fail-closed on GOING_ONLINE");
+    assert!(
+        matches!(err, BootError::OfflineModeRefusal { .. }),
+        "expected OfflineModeRefusal, got {err:?}"
+    );
+
+    // runtime path (deps = Some): deferred to the drain loop, non-fatal,
+    // recorded.  A None-resolving resolver is fine — branch (d) is decided by
+    // node_state mode, not the per-FN view.
+    let summary = app
+        .reconcile_pending_with(ReconciliationRuntime::with_resolver(
+            |_fn: &str| -> Option<RuntimeView<'_>> { None },
+        ))
+        .await
+        .expect("runtime reconcile must NOT fail on GOING_ONLINE (deferred to drain)");
+    assert_eq!(
+        summary.branch_d_offline_refusal, 1,
+        "the GOING_ONLINE FN must be recorded as a deferred refusal"
+    );
 }
