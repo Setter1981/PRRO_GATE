@@ -138,10 +138,20 @@ impl KeyLoadFailure {
 /// External audit Round 2 R2-4 explicitly flagged the trait boundary
 /// as the weakest link in the password chain; this doc-block is the
 /// load-bearing reminder for the M5 implementor.
+///
+/// # `operator_id`
+///
+/// `operator_id` is the authoritative cashier identity (the cashier's INN
+/// / ІПН) from the secure `operators` row.  It is **PII** — the impl MUST
+/// NOT log it to process logs (journald/Loki); it may land only in the
+/// `audit_log`.  The production loader threads it verbatim into the
+/// returned `SigningContext`'s `SigningSession` (no placeholder/fallback)
+/// so a downstream consumer never gets a silently-wrong value.
 #[async_trait]
 pub trait OperatorKeyLoader: Send + Sync {
     async fn load(
         &self,
+        operator_id: &str,
         key_path: &Path,
         password: &[u8],
     ) -> Result<SigningContext, KeyLoadFailure>;
@@ -165,7 +175,7 @@ impl BindingsRegistry {
     ///      b. Decode `key_pass_enc` via [`Coding::decode`]; on empty
     ///      → emit `OPERATOR_KEY_LOAD_FAILED` Critical with
     ///      `reason="EmptyEncoded"` + skip.
-    ///      c. Call `loader.load(&key_path, &password)`.  On
+    ///      c. Call `loader.load(&operator_id, &key_path, &password)`.  On
     ///      [`KeyLoadFailure`] → emit `OPERATOR_KEY_LOAD_FAILED`
     ///      Critical with `reason=<variant>` + skip.
     ///      d. On success → insert into registry.
@@ -273,8 +283,13 @@ impl BindingsRegistry {
                 }
             };
 
-            // Step 3c — call loader.
-            match loader.load(Path::new(&row.key_path), &password).await {
+            // Step 3c — call loader.  Pass the authoritative cashier
+            // `operator_id` (INN) from the row so it is threaded verbatim
+            // into the SigningSession (never a placeholder).
+            match loader
+                .load(&row.operator_id, Path::new(&row.key_path), &password)
+                .await
+            {
                 Ok(sign_ctx) => {
                     inner.insert(
                         row.fiscal_number.clone(),

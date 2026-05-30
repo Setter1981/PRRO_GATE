@@ -52,6 +52,7 @@ struct UnreachableLoader;
 impl OperatorKeyLoader for UnreachableLoader {
     async fn load(
         &self,
+        _operator_id: &str,
         _key_path: &Path,
         _password: &[u8],
     ) -> Result<SigningContext, KeyLoadFailure> {

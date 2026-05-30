@@ -38,10 +38,13 @@ struct AlwaysOkLoader;
 impl OperatorKeyLoader for AlwaysOkLoader {
     async fn load(
         &self,
+        operator_id: &str,
         _key_path: &Path,
         _password: &[u8],
     ) -> Result<SigningContext, KeyLoadFailure> {
-        Ok(common::det_signing_ctx())
+        // Thread the operator_id through so the registry test can assert
+        // it reaches the SigningSession (RS-1 trait extension).
+        Ok(common::det_signing_ctx_for(operator_id))
     }
 }
 
@@ -118,6 +121,21 @@ async fn happy_single_operator_lands_in_registry() {
     assert_eq!(registry.len(), 1);
     assert!(registry.get("4000000001").is_some());
     assert!(registry.get("9999999999").is_none());
+
+    // RS-1 — the authoritative operator_id (cashier INN) from the
+    // operators row threads through the loader into the SigningSession
+    // verbatim (no placeholder).  Guards against a future consumer
+    // silently reading a wrong/empty operator_id.
+    assert_eq!(
+        registry
+            .get("4000000001")
+            .unwrap()
+            .sign_ctx
+            .session
+            .operator_id(),
+        "OP-1",
+        "operator_id must reach the SigningSession verbatim",
+    );
 }
 
 #[tokio::test]

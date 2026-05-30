@@ -110,6 +110,46 @@ impl SigningSession {
             }),
         }
     }
+
+    /// Production constructor — assemble a `SigningSession` from a key the
+    /// caller already obtained via
+    /// [`prro_crypto::interop::prro::containers::extract_private_key`].
+    ///
+    /// This is the M5 crypto-wiring path used by the runtime
+    /// `OperatorKeyLoader` (RS-1 Piece 3).  It sits alongside
+    /// [`unseal_jks`] but takes the extracted key directly — sealing the
+    /// JKS password at-rest is a separate hardening task (tracked
+    /// follow-up), deliberately NOT done here.
+    ///
+    /// Embeds the SIGNING cert (`KeyUsage=digitalSignature`) via
+    /// [`ExtractedKey::signing_cert`] — NEVER `certs[0]`, which is often
+    /// the key-agreement (encryption) cert and would make DPS reject the
+    /// signature `CryptBadSign` (live-confirmed 2026-05-29).  Moves the
+    /// `Zeroizing<[u8; 32]>` scalar into the session inner (no clone of the
+    /// 32 secret bytes).  `operator_id` (the cashier INN) is stored
+    /// verbatim — no placeholder, no fallback.
+    pub fn from_extracted(
+        operator_id: String,
+        extracted: prro_crypto::interop::prro::containers::ExtractedKey,
+    ) -> Result<Self, CryptoError> {
+        let cert_der = extracted
+            .signing_cert()
+            .ok_or_else(|| CryptoError::JksUnseal {
+                operator_id: operator_id.clone(),
+                reason: SealKind::KeyExtractionFailed,
+            })?
+            .to_vec();
+        // Move the still-`Zeroizing<[u8; 32]>` scalar into the session
+        // inner — no clone of the 32 secret bytes (mirrors `unseal_jks`).
+        let param_d: Zeroizing<[u8; 32]> = extracted.param_d;
+        Ok(Self {
+            inner: Arc::new(SigningSessionInner {
+                operator_id,
+                param_d,
+                cert_der,
+            }),
+        })
+    }
 }
 
 /// Unseal a JKS keystore + extract the DSTU private scalar.
@@ -233,5 +273,56 @@ fn hex_digit(c: u8) -> Option<u8> {
         b'a'..=b'f' => Some(c - b'a' + 10),
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod from_extracted_tests {
+    use super::*;
+    use prro_crypto::interop::prro::containers::{ContainerFormat, ExtractedKey};
+
+    /// RS-1 Piece 2 — the operator_id (cashier INN) and the selected
+    /// signing cert are threaded verbatim into the session.  Operator
+    /// requirement: a test must prove operator_id reaches the
+    /// SigningSession (no placeholder / no fallback).
+    #[test]
+    fn from_extracted_threads_operator_id_and_cert() {
+        let ek = ExtractedKey {
+            format: ContainerFormat::Jks,
+            param_d: Zeroizing::new([7u8; 32]),
+            // Non-empty certs → signing_cert() falls back to certs[0]
+            // (no DER with a digitalSignature KeyUsage here, which is
+            // fine for this assembly test — cert content is opaque to
+            // from_extracted).
+            certs: vec![vec![0x30, 0x03, 0x01, 0x02, 0x03]],
+        };
+        let s = SigningSession::from_extracted("INN-1234567890".to_string(), ek)
+            .expect("from_extracted must succeed with a cert present");
+        assert_eq!(
+            s.operator_id(),
+            "INN-1234567890",
+            "operator_id must reach the SigningSession verbatim",
+        );
+        assert_eq!(s.cert_der(), &[0x30, 0x03, 0x01, 0x02, 0x03]);
+    }
+
+    /// RS-1 Piece 2 — an extracted key with NO certificate fails closed
+    /// (no signing cert to embed → never silently sign with nothing).
+    #[test]
+    fn from_extracted_no_cert_fails_closed() {
+        let ek = ExtractedKey {
+            format: ContainerFormat::Jks,
+            param_d: Zeroizing::new([0u8; 32]),
+            certs: vec![],
+        };
+        let err = SigningSession::from_extracted("INN-x".to_string(), ek)
+            .expect_err("no cert must fail closed");
+        assert!(matches!(
+            err,
+            CryptoError::JksUnseal {
+                reason: SealKind::KeyExtractionFailed,
+                ..
+            }
+        ));
     }
 }
