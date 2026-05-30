@@ -73,8 +73,14 @@ impl OperatorKeyLoader for JksOperatorKeyLoader {
         // `from_extracted` selects the SIGNING cert (KeyUsage=
         // digitalSignature — NOT certs[0], the -14 `CryptBadSign` trap)
         // and stores the real `operator_id` (cashier INN) verbatim.
+        // `from_extracted`'s only failure is a missing signing certificate.
+        // Use a FIXED, PII-free message: the `CryptoError` Debug embeds the
+        // `operator_id` (cashier INN), which must not land in a
+        // `KeyLoadFailure` string a future consumer might log/Display.
         let session = SigningSession::from_extracted(operator_id.to_string(), extracted)
-            .map_err(|e| KeyLoadFailure::Other(format!("signing session assembly failed: {e:?}")))?;
+            .map_err(|_| {
+                KeyLoadFailure::Other("no signing certificate in key container".to_string())
+            })?;
 
         Ok(SigningContext {
             provider: Arc::new(InProcessProvider::new()) as Arc<dyn CryptoProvider>,
