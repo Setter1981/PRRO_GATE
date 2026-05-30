@@ -247,6 +247,25 @@ All `sqlite3` invocations below must run **as the `prro` service user** (via `su
 
 ---
 
+## 6c. RS-1 runtime supervisor deployment (`supervisor.enabled = true`)
+
+The runtime supervisor (`prro serve` with `[supervisor] enabled = true`) drives boot reconciliation + the offline-backlog drain loop + the return-online probe loop. It ships **gated off by default** (`enabled = false` → the binary boots and idles, M1 behaviour). Before flipping it on for the pilot, the process must run under a **process supervisor with a restart policy**:
+
+- **systemd:** `Restart=on-failure` (and `TimeoutStopSec` GREATER than `supervisor.shutdown_grace_seconds`).
+- **docker / compose:** `restart: on-failure` (and `stop_grace_period` greater than `supervisor.shutdown_grace_seconds`).
+
+**Why `Restart=on-failure` is mandatory (F1):** a panic in a drain/probe tick loop is an *invariant bug*, not an operational error (wire/DB failures are caught and logged inside the tick). When a loop dies, the supervisor emits a CRITICAL `SUPERVISOR_LOOP_DIED` audit, winds down the sibling loop, and **exits non-zero** so the process supervisor re-launches. A fresh boot re-runs reconciliation and the W9b drain (both crash-safe), so no offline receipt is lost. WITHOUT a restart policy a single tick panic leaves the process up but the maintenance loop dead — a silent road to an offline-cap violation.
+
+**Why `TimeoutStopSec` / `stop_grace_period` must exceed `shutdown_grace_seconds`:** on SIGTERM the supervisor flips a shutdown watch and joins both loops within `shutdown_grace_seconds` (default 25s, clamp `[1, 80]`). If the orchestrator's stop timeout is shorter, it SIGKILLs mid-join. A SIGKILL is *safe* (the per-doc drain is crash-equivalent and re-drained next boot) but non-graceful; sizing the stop timeout above the grace lets the clean path run.
+
+### New audit event
+
+| Event | Severity | Meaning |
+|-------|----------|---------|
+| `SUPERVISOR_LOOP_DIED` | Critical | A drain/probe tick loop exited before shutdown (panic). Payload: `{ loop, panicked, detail }`. The supervisor then exits non-zero for an orchestrator restart. Investigate the `detail` — it is an invariant bug, not a routine failure. |
+
+---
+
 ## 7. Related documents
 
 - `docs/superpowers/plans/2026-05-25-m4-ingress-plan.md` §3 W2 — W2 plan + review-gated acceptance items (HIGH-PR90-01, MED-PR90-01, MED-PR90-02, MED-PR90-03, MED-PR90-04, LOW-PR90-01, LOW-PR90-02)

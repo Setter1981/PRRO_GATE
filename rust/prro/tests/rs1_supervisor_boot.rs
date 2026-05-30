@@ -14,8 +14,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use prro::config::AppConfig;
 use prro::crypto::session::SigningSession;
-use prro::db::models::enums::{FiscalMode, NodeMode, ShiftState};
-use prro::db::repositories::{fiscal_number_config as fn_cfg, node_state, operators as ops_repo};
+use prro::db::models::enums::{FiscalMode, NodeMode, Severity, ShiftState};
+use prro::db::repositories::{
+    audit_log, fiscal_number_config as fn_cfg, node_state, operators as ops_repo,
+};
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
 use prro::runtime::supervisor;
@@ -23,6 +25,7 @@ use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
 use prro::{App, BootError};
+use tokio::sync::watch;
 
 /// Real DER DSTU-4145 cert so per-tick `build_fn_sign` produces a well-formed
 /// CMS (the scalar is arbitrary — well-formedness, not on-wire acceptance).
@@ -279,5 +282,67 @@ async fn reconcile_defers_going_online_under_runtime_but_fails_closed_ctx_free()
     assert_eq!(
         summary.branch_d_offline_refusal, 1,
         "the GOING_ONLINE FN must be recorded as a deferred refusal"
+    );
+}
+
+/// F1: a tick loop dying BEFORE shutdown (a panic — operational errors are
+/// caught inside the tick bodies, so an early exit is an invariant bug) must
+/// FAIL the supervisor (return Err) and emit a CRITICAL `SUPERVISOR_LOOP_DIED`
+/// audit, so the process supervisor (systemd `Restart=on-failure`) restarts.
+/// Drives the loop-death path through the `supervise_until_shutdown` seam with
+/// an injected panicking handle — no real tick panic needed.
+#[tokio::test]
+async fn supervisor_fails_and_audits_when_a_loop_dies_before_shutdown() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = AppConfig::from_toml(&cfg_toml(dir.path())).expect("parse cfg");
+    let app = App::boot(cfg).await.expect("boot");
+    // Clone keeps the DB pool alive for the post-shutdown audit query
+    // (supervise_until_shutdown drops its own App clone at the end).
+    let app_q = app.clone();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // The "drain" loop panics immediately — stand-in for an invariant-bug panic
+    // in a real tick body.
+    let drain_handle = tokio::spawn(async { panic!("injected drain-loop panic") });
+    // The "probe" loop is healthy: it winds down when the watch flips.
+    let probe_handle = {
+        let mut rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let _ = rx.changed().await;
+        })
+    };
+
+    // A long shutdown future so the panic wins the biased select.
+    let shutdown = async {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    };
+
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        supervisor::supervise_until_shutdown(app, shutdown, shutdown_tx, drain_handle, probe_handle),
+    )
+    .await
+    .expect("supervise must not hang");
+    assert!(
+        res.is_err(),
+        "a loop dying before shutdown must fail the supervisor (for orchestrator restart): {res:?}"
+    );
+
+    let audits = audit_log::list_for_entity(app_q.db(), "supervisor", "drain", 10)
+        .await
+        .expect("query SUPERVISOR_LOOP_DIED audits");
+    let died = audits
+        .iter()
+        .find(|a| a.event_type == "SUPERVISOR_LOOP_DIED")
+        .expect("SUPERVISOR_LOOP_DIED audit emitted for the dead loop");
+    assert_eq!(died.severity, Severity::Critical);
+    assert!(
+        died.event_payload_json
+            .as_deref()
+            .unwrap_or("")
+            .contains("\"panicked\":true"),
+        "audit payload must record the panic, got {:?}",
+        died.event_payload_json
     );
 }

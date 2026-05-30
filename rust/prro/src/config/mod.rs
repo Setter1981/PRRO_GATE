@@ -188,17 +188,31 @@ pub struct SupervisorCfg {
     /// `drain_offline_backlog_scheduled`, so this is just the wake cadence.
     #[serde(default = "default_drain_interval_seconds")]
     pub drain_interval_seconds: u64,
+
+    /// Graceful-shutdown grace window (seconds) — the max time the
+    /// supervisor waits for a tick loop to finish its in-flight pass after
+    /// the shutdown signal before proceeding to `drop(App)` (F2).  **Raw
+    /// value** — route boot callers through
+    /// [`SupervisorCfg::clamped_shutdown_grace_seconds`].  On elapse the
+    /// supervisor proceeds anyway: the per-doc W9b drain is crash-safe, so a
+    /// cut between docs (or mid-DPS-call via idempotency) is crash-equivalent
+    /// and re-drained on next boot.  **Deployment:** set the orchestrator
+    /// stop timeout (systemd `TimeoutStopSec`, docker `stop_grace_period`)
+    /// GREATER than this value so the grace path runs before SIGKILL.
+    #[serde(default = "default_shutdown_grace_seconds")]
+    pub shutdown_grace_seconds: u64,
 }
 
 impl Default for SupervisorCfg {
     /// Hand-written (NOT derived) so a missing `[supervisor]` table yields
-    /// the same `drain_interval_seconds` as a present table with the field
-    /// omitted (a derived `Default` would give `0` → clamped to the floor).
+    /// the same field values as a present table with the fields omitted (a
+    /// derived `Default` would give `0` → clamped to the floor).
     fn default() -> Self {
         Self {
             enabled: false,
             dps: DpsCfg::default(),
             drain_interval_seconds: default_drain_interval_seconds(),
+            shutdown_grace_seconds: default_shutdown_grace_seconds(),
         }
     }
 }
@@ -207,9 +221,20 @@ fn default_drain_interval_seconds() -> u64 {
     60
 }
 
+fn default_shutdown_grace_seconds() -> u64 {
+    25
+}
+
 /// Inclusive clamp bounds for the drain-ticker cadence.
 pub const DRAIN_INTERVAL_MIN_SECONDS: u64 = 5;
 pub const DRAIN_INTERVAL_MAX_SECONDS: u64 = 3600;
+
+/// Inclusive clamp bounds for the shutdown grace window.  Upper bound is
+/// kept at the systemd default `TimeoutStopSec` (90s) minus headroom so a
+/// default unit file still SIGTERMs cleanly; operators who raise
+/// `TimeoutStopSec` can raise the grace to match.
+pub const SHUTDOWN_GRACE_MIN_SECONDS: u64 = 1;
+pub const SHUTDOWN_GRACE_MAX_SECONDS: u64 = 80;
 
 impl SupervisorCfg {
     /// Validate + clamp `drain_interval_seconds` to
@@ -218,6 +243,15 @@ impl SupervisorCfg {
     pub fn clamped_drain_interval_seconds(&self) -> (u64, bool) {
         let raw = self.drain_interval_seconds;
         let clamped = raw.clamp(DRAIN_INTERVAL_MIN_SECONDS, DRAIN_INTERVAL_MAX_SECONDS);
+        (clamped, clamped != raw)
+    }
+
+    /// Validate + clamp `shutdown_grace_seconds` to
+    /// `[SHUTDOWN_GRACE_MIN_SECONDS, SHUTDOWN_GRACE_MAX_SECONDS]`.  Returns
+    /// `(clamped_value, was_clamped)` for the WARN-audit pattern.
+    pub fn clamped_shutdown_grace_seconds(&self) -> (u64, bool) {
+        let raw = self.shutdown_grace_seconds;
+        let clamped = raw.clamp(SHUTDOWN_GRACE_MIN_SECONDS, SHUTDOWN_GRACE_MAX_SECONDS);
         (clamped, clamped != raw)
     }
 }
@@ -470,6 +504,7 @@ mod tests {
             enabled: true,
             dps: DpsCfg::default(),
             drain_interval_seconds: 0,
+            shutdown_grace_seconds: default_shutdown_grace_seconds(),
         };
         let (clamped, was_clamped) = sup.clamped_drain_interval_seconds();
         assert_eq!(clamped, DRAIN_INTERVAL_MIN_SECONDS);
@@ -477,6 +512,35 @@ mod tests {
 
         let (def, def_clamped) = SupervisorCfg::default().clamped_drain_interval_seconds();
         assert_eq!(def, default_drain_interval_seconds());
+        assert!(!def_clamped);
+    }
+
+    /// RS-1 F2 — shutdown grace window clamps to bounds; the hand-written
+    /// Default keeps it in-range whether or not the table is present.
+    #[test]
+    fn shutdown_grace_clamps_and_defaults_in_range() {
+        let sup = SupervisorCfg {
+            enabled: true,
+            dps: DpsCfg::default(),
+            drain_interval_seconds: default_drain_interval_seconds(),
+            shutdown_grace_seconds: 0,
+        };
+        let (clamped, was_clamped) = sup.clamped_shutdown_grace_seconds();
+        assert_eq!(clamped, SHUTDOWN_GRACE_MIN_SECONDS);
+        assert!(was_clamped);
+
+        let too_big = SupervisorCfg {
+            enabled: true,
+            dps: DpsCfg::default(),
+            drain_interval_seconds: default_drain_interval_seconds(),
+            shutdown_grace_seconds: 99_999,
+        };
+        let (clamped, was_clamped) = too_big.clamped_shutdown_grace_seconds();
+        assert_eq!(clamped, SHUTDOWN_GRACE_MAX_SECONDS);
+        assert!(was_clamped);
+
+        let (def, def_clamped) = SupervisorCfg::default().clamped_shutdown_grace_seconds();
+        assert_eq!(def, default_shutdown_grace_seconds());
         assert!(!def_clamped);
     }
 }
