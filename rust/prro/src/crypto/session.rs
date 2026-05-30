@@ -63,7 +63,11 @@ struct SigningSessionInner {
 impl std::fmt::Debug for SigningSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SigningSession")
-            .field("operator_id", &self.inner.operator_id)
+            // operator_id is the cashier INN (PII, ADR-M2-5 §4d).  Redact:
+            // post-RS-1 the REAL INN is threaded into production sessions
+            // (the operator key loader), so `?session` in any tracing event
+            // would otherwise leak it to process logs.
+            .field("operator_id", &"<redacted>")
             .field("param_d", &"<redacted>")
             .field(
                 "cert_der",
@@ -136,7 +140,7 @@ impl SigningSession {
             .signing_cert()
             .ok_or_else(|| CryptoError::JksUnseal {
                 operator_id: operator_id.clone(),
-                reason: SealKind::KeyExtractionFailed,
+                reason: SealKind::MissingSigningCert,
             })?
             .to_vec();
         // Move the still-`Zeroizing<[u8; 32]>` scalar into the session
@@ -320,7 +324,7 @@ mod from_extracted_tests {
         assert!(matches!(
             err,
             CryptoError::JksUnseal {
-                reason: SealKind::KeyExtractionFailed,
+                reason: SealKind::MissingSigningCert,
                 ..
             }
         ));

@@ -28,13 +28,18 @@ fn signing_session_debug_is_redacted() {
     // 32-byte ASCII canary so a successful redaction assertion below
     // is unambiguous (no UTF-8 lossy mapping).
     let secret: [u8; 32] = *b"super-secret-canary-32bytes-aaaa";
+    // "operator-1" stands in for the cashier INN (PII) that the RS-1 key
+    // loader now threads into PRODUCTION sessions — Debug must NOT reveal it.
     let session = SigningSession::new_for_test("operator-1".into(), secret, b"<cert-der>".to_vec());
     let s = format!("{session:?}");
     assert!(
-        s.contains("operator-1"),
-        "operator id should be visible: {s}"
+        !s.contains("operator-1"),
+        "operator_id (cashier INN / PII) must be redacted from Debug: {s}"
     );
-    assert!(s.contains("<redacted>"), "param_d should be redacted: {s}");
+    assert!(
+        s.contains("<redacted>"),
+        "operator_id + param_d should be redacted: {s}"
+    );
     // No contiguous prefix of the canary may leak through Debug.
     assert!(
         !s.contains("super-secret-canary"),

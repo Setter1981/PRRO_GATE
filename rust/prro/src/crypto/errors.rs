@@ -10,7 +10,11 @@ use std::fmt;
 
 #[derive(thiserror::Error)]
 pub enum CryptoError {
-    #[error("JKS unseal failed for operator {operator_id}: {reason:?}")]
+    // `operator_id` (the cashier INN) is PII (ADR-M2-5 §4d) — it is kept in
+    // the struct for audit enrichment but OMITTED from the Display message
+    // and redacted in the manual Debug below, so neither `%err` nor `?err`
+    // leaks it into process logs.
+    #[error("JKS unseal/extract failed: {reason:?}")]
     JksUnseal {
         operator_id: String,
         reason: SealKind,
@@ -29,11 +33,12 @@ impl fmt::Debug for CryptoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::JksUnseal {
-                operator_id,
+                operator_id: _,
                 reason,
             } => f
                 .debug_struct("JksUnseal")
-                .field("operator_id", operator_id)
+                // operator_id (INN) is PII — redact from Debug too.
+                .field("operator_id", &"<redacted>")
                 .field("reason", reason)
                 .finish(),
             Self::CmsSign { reason } => f.debug_struct("CmsSign").field("reason", reason).finish(),
@@ -58,6 +63,11 @@ pub enum SealKind {
     BadSalt,
     MalformedJks,
     KeyExtractionFailed,
+    /// The container decrypted/parsed successfully but carries NO signing
+    /// certificate (`KeyUsage=digitalSignature`) to embed.  Distinct from a
+    /// cryptographic failure — the bytes were fine, the payload is just
+    /// unusable for signing.  Raised by `SigningSession::from_extracted`.
+    MissingSigningCert,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

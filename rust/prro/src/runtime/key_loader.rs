@@ -24,7 +24,6 @@ use prro_crypto::core::curve::Curve;
 use prro_crypto::core::field::FieldEl;
 use prro_crypto::interop::prro::containers::{extract_private_key, ContainerError};
 use prro_crypto::interop::prro::jks::JksError;
-use zeroize::Zeroizing;
 
 use crate::crypto::in_process::InProcessProvider;
 use crate::crypto::provider::CryptoProvider;
@@ -32,6 +31,8 @@ use crate::crypto::session::SigningSession;
 use crate::runtime::bindings::{KeyLoadFailure, OperatorKeyLoader};
 use crate::services::write_path::stage_sign::SigningContext;
 use crate::transports::dps::dto::CheckSignBlob;
+// NOTE: no `Zeroizing` import — the loader borrows the caller's already-
+// zeroized password slice without making an owned copy.
 
 /// The DPS-proven CMS profile for the FN-sign blob + the operator
 /// signing context (DSTU-4145 sig + GOST-34.311 hash, curve PB-257).
@@ -54,20 +55,16 @@ impl OperatorKeyLoader for JksOperatorKeyLoader {
         let data = std::fs::read(key_path)
             .map_err(|_| KeyLoadFailure::FileNotFound(key_path.to_path_buf()))?;
 
-        // `extract_private_key` wants `&str`; the password arrives as a
-        // borrowed `&[u8]` into the caller's `Zeroizing` buffer.  Re-wrap
-        // the UTF-8 view in `Zeroizing<String>` so no plain `String`
-        // escapes (secret-material discipline at the trait boundary).
-        let password_str: Zeroizing<String> = match std::str::from_utf8(password) {
-            Ok(s) => Zeroizing::new(s.to_string()),
-            Err(_) => {
-                return Err(KeyLoadFailure::Other(
-                    "key password is not valid UTF-8".to_string(),
-                ));
-            }
-        };
+        // `extract_private_key` wants `&str`.  The password is already a
+        // borrowed `&[u8]` into the caller's `Zeroizing` buffer (wiped on
+        // drop), so borrow a `&str` VIEW directly — do NOT allocate an
+        // owned copy (`to_string()`/`Zeroizing<String>` would be an
+        // unnecessary SECOND copy of secret material; external review
+        // 2026-05-30).
+        let password_str = std::str::from_utf8(password)
+            .map_err(|_| KeyLoadFailure::Other("key password is not valid UTF-8".to_string()))?;
 
-        let extracted = extract_private_key(&data, password_str.as_str())
+        let extracted = extract_private_key(&data, password_str)
             .map_err(|e| map_container_err(e, key_path))?;
 
         // `from_extracted` selects the SIGNING cert (KeyUsage=
@@ -112,11 +109,22 @@ fn map_container_err(e: ContainerError, key_path: &Path) -> KeyLoadFailure {
 ///
 /// Reuses the already-loaded [`SigningSession`] (its `param_d` +
 /// embedded signing `cert_der`) — no second JKS read.  The supervisor
-/// (RS-1 Piece 5) calls this once per FN at boot to build the
-/// `fn_sign` map.  `attached: true` is load-bearing (the blob embeds the
-/// eContent, the ЦЗО CAdES-BES sample shape); `signing_cert()` selection
-/// already happened inside `from_extracted`, so `session.cert_der()` is
-/// the correct signing cert.
+/// `attached: true` is load-bearing (the blob embeds the eContent, the
+/// ЦЗО CAdES-BES sample shape); `signing_cert()` selection already
+/// happened inside `from_extracted`, so `session.cert_der()` is the
+/// correct signing cert.
+///
+/// # FRESHNESS — do NOT cache the result across RPCs
+///
+/// `signing_time` is stamped `SystemTime::now()` at CALL time, so the
+/// returned `CheckSignBlob` is TIME-SENSITIVE: DPS may reject a read-RPC
+/// (`lastChk` / `statusRro` / `infoRro`) signature whose `signingTime` is
+/// stale.  The W4-Z3 live cycle signed FRESH per call.  The supervisor
+/// (RS-1 Piece 5) MUST therefore build `fn_sign` fresh **per read-RPC /
+/// per probe-tick — NOT once at boot into a long-lived map** (external
+/// review 2026-05-30, HIGH).  Reconcile this with the existing
+/// `RuntimeView.fn_sign: &CheckSignBlob` (a cached blob) when wiring the
+/// loops in Piece 5.
 pub fn build_fn_sign(
     session: &SigningSession,
     fiscal_number: &str,
