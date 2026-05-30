@@ -358,15 +358,33 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Doctor { config } => prro::doctor::run(&config).await,
         Cmd::Serve { config } => {
             let app = boot_from_path_or_exit(&config).await;
-            tracing::info!(
-                version = env!("CARGO_PKG_VERSION"),
-                "prro listening (M1 — idle)"
-            );
-            // M3+ adds the supervisor + ingress shells.  M1 just idles.
-            let signal_name = await_shutdown_signal().await?;
-            tracing::info!(signal = signal_name, "shutting down");
-            drop(app);
-            Ok(())
+            if app.config().supervisor.enabled {
+                // RS-1 M3 — runtime supervisor (composition root + boot
+                // recovery + drain/probe loops).  Gated by config; default
+                // off → the M1-idle branch below, byte-identical to before.
+                tracing::info!(
+                    version = env!("CARGO_PKG_VERSION"),
+                    "prro starting (M3 — supervisor enabled)"
+                );
+                let shutdown = async {
+                    match await_shutdown_signal().await {
+                        Ok(sig) => tracing::info!(signal = sig, "shutting down"),
+                        Err(e) => {
+                            tracing::error!(error = %e, "signal wait failed; shutting down")
+                        }
+                    }
+                };
+                prro::runtime::supervisor::run(app, shutdown).await
+            } else {
+                tracing::info!(
+                    version = env!("CARGO_PKG_VERSION"),
+                    "prro listening (M1 — idle; supervisor disabled)"
+                );
+                let signal_name = await_shutdown_signal().await?;
+                tracing::info!(signal = signal_name, "shutting down");
+                drop(app);
+                Ok(())
+            }
         }
         Cmd::Admin { cmd } => match cmd {
             AdminCmd::ResetStopMode {

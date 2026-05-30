@@ -166,7 +166,7 @@ impl OfflineCfg {
 /// until the pilot DB + live DPS channel are validated.  This is the
 /// rollback seam: turning the supervisor on/off is a config flip, never a
 /// code revert.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SupervisorCfg {
     /// Master on/off for the runtime spine.  Default **false** = the
     /// binary boots and idles (M1 behaviour) regardless of the other
@@ -180,6 +180,46 @@ pub struct SupervisorCfg {
     /// still boots unchanged.
     #[serde(default)]
     pub dps: DpsCfg,
+
+    /// Offline-backlog drain-ticker cadence (seconds).  **Raw value** —
+    /// route boot callers through
+    /// [`SupervisorCfg::clamped_drain_interval_seconds`].  The per-FN
+    /// exponential-backoff gating lives inside
+    /// `drain_offline_backlog_scheduled`, so this is just the wake cadence.
+    #[serde(default = "default_drain_interval_seconds")]
+    pub drain_interval_seconds: u64,
+}
+
+impl Default for SupervisorCfg {
+    /// Hand-written (NOT derived) so a missing `[supervisor]` table yields
+    /// the same `drain_interval_seconds` as a present table with the field
+    /// omitted (a derived `Default` would give `0` → clamped to the floor).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dps: DpsCfg::default(),
+            drain_interval_seconds: default_drain_interval_seconds(),
+        }
+    }
+}
+
+fn default_drain_interval_seconds() -> u64 {
+    60
+}
+
+/// Inclusive clamp bounds for the drain-ticker cadence.
+pub const DRAIN_INTERVAL_MIN_SECONDS: u64 = 5;
+pub const DRAIN_INTERVAL_MAX_SECONDS: u64 = 3600;
+
+impl SupervisorCfg {
+    /// Validate + clamp `drain_interval_seconds` to
+    /// `[DRAIN_INTERVAL_MIN_SECONDS, DRAIN_INTERVAL_MAX_SECONDS]`.  Returns
+    /// `(clamped_value, was_clamped)` for the WARN-audit pattern.
+    pub fn clamped_drain_interval_seconds(&self) -> (u64, bool) {
+        let raw = self.drain_interval_seconds;
+        let clamped = raw.clamp(DRAIN_INTERVAL_MIN_SECONDS, DRAIN_INTERVAL_MAX_SECONDS);
+        (clamped, clamped != raw)
+    }
 }
 
 /// DPS fiscal-service connection config.  RS-1 is **wire-only**:
@@ -418,6 +458,25 @@ mod tests {
         // Default is in-range and not clamped.
         let (def, def_clamped) = DpsCfg::default().clamped_request_timeout_seconds();
         assert_eq!(def, default_dps_request_timeout_seconds());
+        assert!(!def_clamped);
+    }
+
+    /// RS-1 Piece 5a — drain-ticker cadence clamps to bounds; the
+    /// hand-written Default keeps it in-range whether or not the table is
+    /// present.
+    #[test]
+    fn drain_interval_clamps_and_defaults_in_range() {
+        let sup = SupervisorCfg {
+            enabled: true,
+            dps: DpsCfg::default(),
+            drain_interval_seconds: 0,
+        };
+        let (clamped, was_clamped) = sup.clamped_drain_interval_seconds();
+        assert_eq!(clamped, DRAIN_INTERVAL_MIN_SECONDS);
+        assert!(was_clamped);
+
+        let (def, def_clamped) = SupervisorCfg::default().clamped_drain_interval_seconds();
+        assert_eq!(def, default_drain_interval_seconds());
         assert!(!def_clamped);
     }
 }
