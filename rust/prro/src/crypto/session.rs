@@ -34,7 +34,9 @@ pub struct SealedMaterial<'a> {
 impl std::fmt::Debug for SealedMaterial<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SealedMaterial")
-            .field("operator_id", &self.operator_id)
+            // operator_id is the cashier INN (PII) — redact, uniform with
+            // SigningSession + CryptoError (ADR-M2-5 §4d).
+            .field("operator_id", &"<redacted>")
             .field("jks_bytes", &"<redacted>")
             .field("jks_password_hex", &"<redacted>")
             .field("cred_salt", &"<redacted>")
@@ -256,7 +258,9 @@ pub fn unseal_jks(sealed: SealedMaterial<'_>) -> Result<SigningSession, CryptoEr
     //    "first cert is the signing cert" assumption was wrong).
     let cert_der = extracted
         .signing_cert()
-        .ok_or_else(|| make_err(SealKind::KeyExtractionFailed))?
+        // Same no-signing-cert classification as `from_extracted`: the
+        // container decrypted/parsed fine, it just carries no signing cert.
+        .ok_or_else(|| make_err(SealKind::MissingSigningCert))?
         .to_vec();
 
     // Move the still-Zeroizing<[u8; 32]> into the session inner.  No

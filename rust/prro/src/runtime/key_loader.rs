@@ -117,12 +117,18 @@ fn map_container_err(e: ContainerError, key_path: &Path) -> KeyLoadFailure {
 /// # FRESHNESS — do NOT cache the result across RPCs
 ///
 /// `signing_time` is stamped `SystemTime::now()` at CALL time, so the
-/// returned `CheckSignBlob` is TIME-SENSITIVE: DPS may reject a read-RPC
-/// (`lastChk` / `statusRro` / `infoRro`) signature whose `signingTime` is
-/// stale.  The W4-Z3 live cycle signed FRESH per call.  The supervisor
-/// (RS-1 Piece 5) MUST therefore build `fn_sign` fresh **per read-RPC /
-/// per probe-tick — NOT once at boot into a long-lived map** (external
-/// review 2026-05-30, HIGH).  Reconcile this with the existing
+/// returned `CheckSignBlob` is TIME-SENSITIVE.  The ФСКО protocol requires
+/// `rro_fn_sign` to carry a time mark INSIDE the signed blob ("підписаний
+/// електронним підписом з позначкою часу"; the read RPCs have NO separate
+/// timestamp field), and BOTH reference clients re-sign it FRESH on every
+/// read RPC (WebCheck deletes + re-signs `FN.xml.p7s` per `lastChk`;
+/// PRRODPS signs per call with a `now`-nonce) — confirmed 2026-05-30.  A
+/// stale (boot-cached) `signingTime` is therefore non-conformant and risks
+/// DPS rejection.  The supervisor (RS-1 Piece 5) MUST build `fn_sign`
+/// fresh **per read-RPC / per probe-tick — NOT once at boot into a
+/// long-lived map**.  Per-tick rebuild (the ~60s return-online probe /
+/// keepalive cadence) is sufficient — uniqueness per individual RPC is not
+/// required.  Reconcile this with the existing
 /// `RuntimeView.fn_sign: &CheckSignBlob` (a cached blob) when wiring the
 /// loops in Piece 5.
 pub fn build_fn_sign(

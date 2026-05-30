@@ -66,7 +66,8 @@ pub enum SealKind {
     /// The container decrypted/parsed successfully but carries NO signing
     /// certificate (`KeyUsage=digitalSignature`) to embed.  Distinct from a
     /// cryptographic failure — the bytes were fine, the payload is just
-    /// unusable for signing.  Raised by `SigningSession::from_extracted`.
+    /// unusable for signing.  Raised by `SigningSession::from_extracted`
+    /// and `unseal_jks` (both share the `signing_cert()` selection).
     MissingSigningCert,
 }
 

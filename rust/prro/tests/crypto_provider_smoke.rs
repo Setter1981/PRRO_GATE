@@ -57,7 +57,12 @@ fn sealed_material_debug_is_redacted() {
         cred_salt: &salt,
     };
     let s = format!("{mat:?}");
-    assert!(s.contains("op-2"));
+    // operator_id is the cashier INN (PII) — must be redacted, uniform
+    // with SigningSession.
+    assert!(
+        !s.contains("op-2"),
+        "operator_id (INN/PII) must be redacted: {s}"
+    );
     assert!(s.contains("<redacted>"));
     // No password / salt / jks-bytes substring may leak.
     assert!(!s.contains("deadbeef"), "password leaked: {s}");
