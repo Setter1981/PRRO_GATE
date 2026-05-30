@@ -227,6 +227,8 @@ async fn supervisor_does_not_brick_when_one_fn_is_going_online() {
     );
     assert_eq!(registry.len(), 2, "both FNs registered");
 
+    // Keep the DB pool alive for the post-shutdown assertion.
+    let app_q = app.clone();
     let shutdown = async {
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
@@ -239,6 +241,20 @@ async fn supervisor_does_not_brick_when_one_fn_is_going_online() {
     assert!(
         res.is_ok(),
         "a GOING_ONLINE FN must NOT brick the supervisor: {res:?}"
+    );
+
+    // Positive proof the healthy FN was NOT silently dropped: reconcile
+    // bootstrapped FN-B's node_state to Online (branch a, absent row) during the
+    // SAME pass that deferred FN-A — so the GOING_ONLINE FN did not deny the
+    // runtime to its neighbour.
+    let fn_b = node_state::get(app_q.db(), "4000000002")
+        .await
+        .expect("query FN-B node_state")
+        .expect("reconcile must have bootstrapped FN-B's node_state row");
+    assert_eq!(
+        fn_b.mode,
+        NodeMode::Online,
+        "healthy FN-B must be bootstrapped to Online alongside the deferred GOING_ONLINE FN-A"
     );
 }
 

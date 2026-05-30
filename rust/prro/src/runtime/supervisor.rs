@@ -228,6 +228,12 @@ where
     let wake = {
         tokio::pin!(shutdown);
         tokio::select! {
+            // `biased`: shutdown is polled first, so a normal shutdown is never
+            // misread as a loop death.  In the rare poll where a loop panics AT
+            // THE SAME TIME as shutdown resolves, Shutdown wins and the
+            // SUPERVISOR_LOOP_DIED audit is suppressed — benign: the process is
+            // already going down on operator request, and the panic's effects
+            // are crash-equivalent (re-drained next boot).
             biased;
             () = &mut shutdown => Wake::Shutdown,
             res = &mut drain_handle => Wake::LoopDied { which: "drain", res },
@@ -252,8 +258,11 @@ where
     let result = match wake {
         Wake::Shutdown => {
             tracing::info!(target: "prro::runtime::supervisor", "supervisor: shutdown signal received; stopping loops");
-            join_with_grace(drain_handle, "drain", grace).await;
-            join_with_grace(probe_handle, "probe", grace).await;
+            // Join BOTH loops concurrently under ONE shared deadline (not two
+            // sequential graces) so total shutdown wall-clock is bounded by a
+            // single `grace` — matching the runbook's `TimeoutStopSec > grace`
+            // contract (1×, not 2×).
+            join_both_with_grace(drain_handle, probe_handle, grace).await;
             tracing::info!(target: "prro::runtime::supervisor", "supervisor: shut down");
             Ok(())
         }
@@ -290,7 +299,8 @@ enum Wake {
 /// Join one loop handle, bounded by the shutdown grace.  On grace-elapse we
 /// log + proceed (the handle is detached, not aborted): the per-doc W9b drain
 /// is crash-safe, so an in-flight tick cut at process exit is crash-equivalent
-/// and re-drained on next boot.
+/// and re-drained on next boot.  Used on the loop-death path (join the one
+/// surviving sibling).
 async fn join_with_grace(handle: JoinHandle<()>, name: &str, grace: Duration) {
     match tokio::time::timeout(grace, handle).await {
         Ok(Ok(())) => {}
@@ -305,6 +315,29 @@ async fn join_with_grace(handle: JoinHandle<()>, name: &str, grace: Duration) {
             loop_name = name,
             grace_secs = grace.as_secs(),
             "loop did not finish within the shutdown grace; proceeding (per-doc drain is crash-safe)"
+        ),
+    }
+}
+
+/// Join BOTH loops concurrently under a SINGLE shared `grace` deadline (used on
+/// the normal-shutdown path).  Sequential per-loop graces would make worst-case
+/// shutdown `2 × grace`, breaking the runbook's `TimeoutStopSec > grace` (1×)
+/// contract; one shared deadline keeps total shutdown bounded by one grace.  On
+/// elapse both handles detach (crash-safe — see [`join_with_grace`]).
+async fn join_both_with_grace(drain: JoinHandle<()>, probe: JoinHandle<()>, grace: Duration) {
+    match tokio::time::timeout(grace, async { tokio::join!(drain, probe) }).await {
+        Ok((d, p)) => {
+            if let Err(e) = d {
+                tracing::error!(target: "prro::runtime::supervisor", loop_name = "drain", error = %e, "loop join failed (task panicked)");
+            }
+            if let Err(e) = p {
+                tracing::error!(target: "prro::runtime::supervisor", loop_name = "probe", error = %e, "loop join failed (task panicked)");
+            }
+        }
+        Err(_elapsed) => tracing::warn!(
+            target: "prro::runtime::supervisor",
+            grace_secs = grace.as_secs(),
+            "loops did not finish within the shutdown grace; proceeding (per-doc drain is crash-safe)"
         ),
     }
 }
