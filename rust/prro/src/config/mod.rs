@@ -386,6 +386,25 @@ mod tests {
         );
     }
 
+    /// RS-1 Piece 1 (self-review LOW) — a DISABLED supervisor ignores a
+    /// set endpoint: `require_dps_endpoint` short-circuits to `Ok(None)`
+    /// so the binary stays M1-idle regardless of `[supervisor.dps]`.
+    #[test]
+    fn supervisor_disabled_ignores_set_endpoint() {
+        let toml = format!(
+            "{BASE_CFG}\n[supervisor]\nenabled = false\n[supervisor.dps]\nendpoint = \"https://cabinet.tax.gov.ua:9443\"\n"
+        );
+        let cfg = AppConfig::from_toml(&toml).expect("parse must succeed");
+        assert!(!cfg.supervisor.enabled);
+        assert_eq!(
+            cfg.supervisor
+                .require_dps_endpoint()
+                .expect("disabled = Ok(None)"),
+            None,
+            "disabled supervisor ignores a set endpoint",
+        );
+    }
+
     /// RS-1 Piece 1 — DPS request timeout clamps to bounds + reports it.
     #[test]
     fn dps_request_timeout_clamps_out_of_range() {
