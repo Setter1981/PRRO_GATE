@@ -54,12 +54,16 @@ fn picks_signing_cert_regardless_of_position() {
 }
 
 #[test]
-fn falls_back_to_first_when_no_digitalsignature() {
-    // No cert declares digitalSignature -> fall back to certs[0].
+fn returns_none_when_no_digitalsignature() {
+    // No cert declares digitalSignature -> NO certs[0] fallback (RS-1 F1):
+    // `None`, so the caller fails closed instead of embedding the wrong cert.
     let a = cert_with_keyusage(KU_KEY_AGREEMENT);
     let b = cert_with_keyusage(&[0x03, 0x02, 0x01, 0x06]); // keyCertSign-ish
-    let ek = mk(vec![a.clone(), b]);
-    assert_eq!(ek.signing_cert().unwrap(), a.as_slice());
+    let ek = mk(vec![a, b]);
+    assert!(
+        ek.signing_cert().is_none(),
+        "no digitalSignature cert -> None (no certs[0] fallback; CryptBadSign avoidance)"
+    );
 }
 
 #[test]

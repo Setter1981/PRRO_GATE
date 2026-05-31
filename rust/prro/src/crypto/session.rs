@@ -293,25 +293,39 @@ mod from_extracted_tests {
     /// signing cert are threaded verbatim into the session.  Operator
     /// requirement: a test must prove operator_id reaches the
     /// SigningSession (no placeholder / no fallback).
+    /// A minimal DER blob carrying a KeyUsage extension (OID 2.5.29.15)
+    /// asserting `digitalSignature` (BIT STRING `03 02 06 C0` =
+    /// digitalSignature+nonRepudiation) — enough for the STRICT
+    /// `signing_cert()` scanner to select it.  Mirrors the
+    /// `cert_with_keyusage` helper in
+    /// prro_crypto/tests/signing_cert_selection.rs.
+    fn sig_cert_der() -> Vec<u8> {
+        vec![
+            0x30, 0x00, // dummy outer SEQUENCE header (scanner ignores)
+            0x06, 0x03, 0x55, 0x1D, 0x0F, // OID 2.5.29.15 (KeyUsage)
+            0x04, 0x04, // extnValue OCTET STRING, len 4
+            0x03, 0x02, 0x06, 0xC0, // BIT STRING: digitalSignature + nonRepudiation
+        ]
+    }
+
     #[test]
     fn from_extracted_threads_operator_id_and_cert() {
+        let cert = sig_cert_der();
         let ek = ExtractedKey {
             format: ContainerFormat::Jks,
             param_d: Zeroizing::new([7u8; 32]),
-            // Non-empty certs → signing_cert() falls back to certs[0]
-            // (no DER with a digitalSignature KeyUsage here, which is
-            // fine for this assembly test — cert content is opaque to
-            // from_extracted).
-            certs: vec![vec![0x30, 0x03, 0x01, 0x02, 0x03]],
+            // Carries a digitalSignature KeyUsage so the STRICT signing_cert()
+            // selects it (RS-1 F1: there is no certs[0] fallback).
+            certs: vec![cert.clone()],
         };
         let s = SigningSession::from_extracted("INN-1234567890".to_string(), ek)
-            .expect("from_extracted must succeed with a cert present");
+            .expect("from_extracted must succeed with a signing cert present");
         assert_eq!(
             s.operator_id(),
             "INN-1234567890",
             "operator_id must reach the SigningSession verbatim",
         );
-        assert_eq!(s.cert_der(), &[0x30, 0x03, 0x01, 0x02, 0x03]);
+        assert_eq!(s.cert_der(), cert.as_slice());
     }
 
     /// RS-1 Piece 2 — an extracted key with NO certificate fails closed
@@ -325,6 +339,32 @@ mod from_extracted_tests {
         };
         let err = SigningSession::from_extracted("INN-x".to_string(), ek)
             .expect_err("no cert must fail closed");
+        assert!(matches!(
+            err,
+            CryptoError::JksUnseal {
+                reason: SealKind::MissingSigningCert,
+                ..
+            }
+        ));
+    }
+
+    /// RS-1 F1 (2026-05-30) — certs PRESENT but none declares
+    /// `digitalSignature` → fail closed (`MissingSigningCert`), NOT a
+    /// certs[0] fallback that would embed an encryption cert and re-open the
+    /// `CryptBadSign` DPS-rejection class.
+    #[test]
+    fn from_extracted_non_signing_cert_fails_closed() {
+        // KeyUsage = keyAgreement (encryption), BIT STRING `03 02 03 08`.
+        let enc_cert = vec![
+            0x30, 0x00, 0x06, 0x03, 0x55, 0x1D, 0x0F, 0x04, 0x04, 0x03, 0x02, 0x03, 0x08,
+        ];
+        let ek = ExtractedKey {
+            format: ContainerFormat::Jks,
+            param_d: Zeroizing::new([0u8; 32]),
+            certs: vec![enc_cert],
+        };
+        let err = SigningSession::from_extracted("INN-y".to_string(), ek)
+            .expect_err("a non-signing (encryption) cert must fail closed, not embed certs[0]");
         assert!(matches!(
             err,
             CryptoError::JksUnseal {

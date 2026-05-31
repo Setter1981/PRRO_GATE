@@ -237,7 +237,11 @@ impl BindingsRegistry {
                     "key_path": row.key_path,
                 })
                 .to_string();
-                let _ = audit_log::append(
+                // F3 (2026-05-30): a Critical forensic event whose audit
+                // insert FAILS must not be silently swallowed — propagate as a
+                // boot failure (DB/disk infra error) so the operator never gets
+                // a healthy-looking registry with a missing forensic row.
+                audit_log::append(
                     pool_main,
                     "operator",
                     &row.fiscal_number,
@@ -246,7 +250,13 @@ impl BindingsRegistry {
                     None,
                     Some(&payload),
                 )
-                .await;
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "registry: failed to persist Critical OPERATOR_ORPHAN_FN audit for FN {}: {e:?}",
+                        row.fiscal_number
+                    )
+                })?;
                 skipped_orphan += 1;
                 continue;
             }
@@ -268,7 +278,9 @@ impl BindingsRegistry {
                         "reason": "EmptyEncoded",
                     })
                     .to_string();
-                    let _ = audit_log::append(
+                    // F3 (2026-05-30): propagate a failed Critical audit insert
+                    // as a boot failure (see OPERATOR_ORPHAN_FN above).
+                    audit_log::append(
                         pool_main,
                         "operator",
                         &row.fiscal_number,
@@ -277,7 +289,13 @@ impl BindingsRegistry {
                         None,
                         Some(&payload),
                     )
-                    .await;
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "registry: failed to persist Critical OPERATOR_KEY_LOAD_FAILED audit for FN {}: {e:?}",
+                            row.fiscal_number
+                        )
+                    })?;
                     skipped_keyload += 1;
                     continue;
                 }
@@ -313,7 +331,9 @@ impl BindingsRegistry {
                         "reason": e.reason(),
                     })
                     .to_string();
-                    let _ = audit_log::append(
+                    // F3 (2026-05-30): propagate a failed Critical audit insert
+                    // as a boot failure (see OPERATOR_ORPHAN_FN above).
+                    audit_log::append(
                         pool_main,
                         "operator",
                         &row.fiscal_number,
@@ -322,7 +342,13 @@ impl BindingsRegistry {
                         None,
                         Some(&payload),
                     )
-                    .await;
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "registry: failed to persist Critical OPERATOR_KEY_LOAD_FAILED audit for FN {}: {e:?}",
+                            row.fiscal_number
+                        )
+                    })?;
                     skipped_keyload += 1;
                 }
             }
@@ -336,7 +362,10 @@ impl BindingsRegistry {
         let mut not_registered: usize = 0;
         for fn_id in &main_fns {
             if !inner.contains_key(fn_id) {
-                let _ = audit_log::append(
+                // F3 (2026-05-30): OPERATOR_NOT_REGISTERED is Info (a configured
+                // FN with no key, no leak) — stays non-fatal, but a failed audit
+                // insert is logged rather than silently dropped.
+                if let Err(e) = audit_log::append(
                     pool_main,
                     "operator",
                     fn_id,
@@ -345,7 +374,15 @@ impl BindingsRegistry {
                     None,
                     None,
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(
+                        target: "prro::runtime::bindings",
+                        fiscal_number = %fn_id,
+                        error = ?e,
+                        "failed to persist OPERATOR_NOT_REGISTERED audit; continuing"
+                    );
+                }
                 not_registered += 1;
             }
         }

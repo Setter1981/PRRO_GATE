@@ -100,13 +100,17 @@ impl ExtractedKey {
     /// (encryption) cert, plus the CA chain. Blindly taking `certs[0]` can
     /// embed the *encryption* cert (KeyUsage `keyAgreement`); a real verifier
     /// (incl. DPS) then checks the signature against the wrong public key and
-    /// returns `CryptBadSign`. Selects by the `digitalSignature` bit; falls
-    /// back to the first cert if none declares it.
+    /// returns `CryptBadSign`. Selects strictly by the `digitalSignature` bit.
+    ///
+    /// **No `certs[0]` fallback (RS-1 F1, 2026-05-30):** returns `None` when no
+    /// cert declares `digitalSignature`, so the caller fails closed
+    /// (`MissingSigningCert`) instead of silently embedding the wrong cert and
+    /// re-opening the `CryptBadSign` class. A fallback here would defeat the
+    /// whole point of selecting by KeyUsage.
     pub fn signing_cert(&self) -> Option<&[u8]> {
         self.certs
             .iter()
             .find(|c| cert_has_digital_signature(c))
-            .or_else(|| self.certs.first())
             .map(Vec::as_slice)
     }
 }
