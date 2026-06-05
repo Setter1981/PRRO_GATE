@@ -17,8 +17,12 @@
 //!     arithmetic; a non-/1000-divisible product is a typed error (NO
 //!     silent floor — rounding policy is deferred).
 //!   - `quantity_thousandths` ← `quantity_milli` (1:1).
-//!   - `tax_group_1/2` ← raw wire `u8` (faithful pass-through;
-//!     `stage_sign` does the driver→canonical TX translation).
+//!   - `tax_group_1` ← raw wire `u8` (faithful pass-through; `stage_sign`
+//!     does the driver→canonical TX translation; `0` = звільнено valid).
+//!   - `tax_group_2` (secondary `TX1=`) ← 3-way FAIL-CLOSED matrix:
+//!     dual-tax active → emit raw; no dual + `0` → omit; no dual +
+//!     non-zero → typed `SecondaryTaxRequiresDualTaxMode` (NOT a silent
+//!     drop). Do NOT revert to an unconditional pass-through.
 //!   - payments (D1 frozen slots): kind → candidate `pay_index`
 //!     (Cash=1, Cashless1=2, …); `type_code = pay_index-1`; `name` from
 //!     the per-FN `payment_methods` row; missing / inactive / `iscash`
