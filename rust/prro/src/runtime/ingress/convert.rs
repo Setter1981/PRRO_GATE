@@ -104,6 +104,19 @@ pub enum ConvertError {
         kind_is_cash: bool,
     },
 
+    /// The payment carries an `acquirer_slip` (EPZ requisites) whose
+    /// `AcquirerSlip → EPZ` attribute mapping is an open spec question
+    /// (W4-Z1 wire-shape §Q1).  Fail-closed rather than silently drop
+    /// the slip (which would also defeat the converted-payload hash).
+    #[error(
+        "fn {fiscal_number}: payment at pay_index {pay_index} carries an acquirer_slip; the \
+         AcquirerSlip→EPZ mapping is an open spec question (W4-Z1 §Q1) — fail-closed, not dropped"
+    )]
+    AcquirerSlipMappingDeferred {
+        fiscal_number: String,
+        pay_index: i64,
+    },
+
     /// `ShiftClose` / `ZReport` need the ledger aggregation — piece-2b.
     #[error("ZReport/ShiftClose conversion is deferred to RS-2 piece-2b")]
     ZReportDeferredToPiece2b,
@@ -195,7 +208,7 @@ fn item_sum_kop(line: &FiscalLine) -> Result<i64, ConvertError> {
     to_i64(product / 1000, "sum_kop")
 }
 
-fn convert_item(line: &FiscalLine) -> Result<CheckItemOut, ConvertError> {
+fn convert_item(line: &FiscalLine, dual_tax_active: bool) -> Result<CheckItemOut, ConvertError> {
     let code = match line.article_code {
         Some(x) => x.to_string(),
         None => {
@@ -229,9 +242,19 @@ fn convert_item(line: &FiscalLine) -> Result<CheckItemOut, ConvertError> {
         sum_kop: item_sum_kop(line)?,
         barcode: line.barcode.clone(),
         uktzed: line.uktzed.clone(),
-        // Faithful raw pass-through; stage_sign does driver→canonical TX.
+        // Primary tax (`TX=`) is always present; raw pass-through —
+        // stage_sign does the driver→canonical TX translation, and `0`
+        // is a valid group (звільнено). Secondary tax (`TX1=`) is ONLY
+        // emitted when dual taxation is active (spec
+        // `2026-05-26-w4-z1-dps-xml-wire-shape.md` §`TX1=`: "when
+        // dual_tax_mode = Some"); otherwise None so an ordinary
+        // single-tax receipt does not emit an unintended `TX1=0`.
         tax_group_1: Some(i64::from(line.tax_group_1)),
-        tax_group_2: Some(i64::from(line.tax_group_2)),
+        tax_group_2: if dual_tax_active {
+            Some(i64::from(line.tax_group_2))
+        } else {
+            None
+        },
         excise_stamps: line.excise_stamps.clone(),
         adjustments,
     })
@@ -274,6 +297,20 @@ async fn convert_payment(
             kind_is_cash,
         });
     }
+    // A card/acquirer slip carries EPZ requisites (terminal/RRN/PAN/
+    // payment-system). The signer's CheckPaymentJson supports the EPZ
+    // attrs (PA/PB/…), but the `AcquirerSlip → EPZ` field correspondence
+    // is an OPEN spec question (W4-Z1 wire-shape §Q1: "PA source —
+    // mapping ambiguity, defer; needs operator clarification"). Until it
+    // is approved we FAIL CLOSED rather than silently drop the slip data
+    // (which would also collapse two slip-distinct wire payloads to the
+    // same converted hash). EPZ mapping is a tracked follow-up.
+    if p.acquirer_slip.is_some() {
+        return Err(ConvertError::AcquirerSlipMappingDeferred {
+            fiscal_number: fiscal_number.to_string(),
+            pay_index,
+        });
+    }
     Ok(CheckPaymentOut {
         name: row.name,
         sum_kop: to_i64(p.amount_kopecks, "payment.amount_kopecks")?,
@@ -304,11 +341,12 @@ pub async fn convert_to_signer_payload(
     match cmd.command_type {
         CommandType::ShiftOpen => finalize(&ShiftOpenOut { opening_sum_kop: 0 }),
         CommandType::Sell | CommandType::Return => {
+            let dual_tax_active = cmd.payload.dual_tax_mode.is_some();
             let items = cmd
                 .payload
                 .goods
                 .iter()
-                .map(convert_item)
+                .map(|l| convert_item(l, dual_tax_active))
                 .collect::<Result<Vec<_>, _>>()?;
             let mut payments = Vec::with_capacity(cmd.payload.payments.len());
             for p in &cmd.payload.payments {
@@ -369,7 +407,7 @@ mod tests {
     fn item_missing_article_code_is_typed_error() {
         let l = line(None, "NoCode", 15000, 1000);
         assert!(matches!(
-            convert_item(&l),
+            convert_item(&l, false),
             Err(ConvertError::MissingItemCode { .. })
         ));
     }
@@ -377,16 +415,28 @@ mod tests {
     #[test]
     fn item_maps_code_quantity_tax_and_omits_zero_discount() {
         let l = line(Some(42), "Bread", 15000, 1000);
-        let out = convert_item(&l).unwrap();
+        let out = convert_item(&l, false).unwrap();
         assert_eq!(out.code, "42");
         assert_eq!(out.price_kop, 15000);
         assert_eq!(out.quantity_thousandths, 1000);
         assert_eq!(out.sum_kop, 15000);
         assert_eq!(out.tax_group_1, Some(1));
+        // Single-tax receipt (no dual_tax_mode) → no secondary TX1.
+        assert_eq!(out.tax_group_2, None, "single-tax must NOT emit TX1");
         assert!(
             out.adjustments.is_empty(),
             "absent discount → no adjustment"
         );
+    }
+
+    #[test]
+    fn secondary_tax_emitted_only_when_dual_tax_active() {
+        let mut l = line(Some(42), "Bread", 15000, 1000);
+        l.tax_group_2 = 3;
+        // dual-tax inactive → TX1 omitted regardless of the wire value.
+        assert_eq!(convert_item(&l, false).unwrap().tax_group_2, None);
+        // dual-tax active → TX1 = raw secondary group.
+        assert_eq!(convert_item(&l, true).unwrap().tax_group_2, Some(3));
     }
 
     #[test]
@@ -397,7 +447,7 @@ mod tests {
             name: "promo".to_string(),
             amount_kopecks: 500,
         });
-        let out = convert_item(&l).unwrap();
+        let out = convert_item(&l, false).unwrap();
         assert_eq!(out.adjustments.len(), 1);
         assert_eq!(out.adjustments[0].kind, "discount");
         assert_eq!(out.adjustments[0].sum, 500);
@@ -409,7 +459,10 @@ mod tests {
             name: "fee".to_string(),
             amount_kopecks: 300,
         });
-        assert_eq!(convert_item(&l).unwrap().adjustments[0].kind, "surcharge");
+        assert_eq!(
+            convert_item(&l, false).unwrap().adjustments[0].kind,
+            "surcharge"
+        );
 
         // Zero-amount → omitted (no hash-noise).
         l.discount = Some(super::super::dto::Discount {
@@ -417,7 +470,7 @@ mod tests {
             name: "zero".to_string(),
             amount_kopecks: 0,
         });
-        assert!(convert_item(&l).unwrap().adjustments.is_empty());
+        assert!(convert_item(&l, false).unwrap().adjustments.is_empty());
     }
 
     #[test]
@@ -434,7 +487,7 @@ mod tests {
     #[test]
     fn converted_check_items_parse_through_signer() {
         let out = CheckOut {
-            items: vec![convert_item(&line(Some(42), "Bread", 15000, 1000)).unwrap()],
+            items: vec![convert_item(&line(Some(42), "Bread", 15000, 1000), false).unwrap()],
             payments: Vec::new(),
         };
         let conv = finalize(&out).unwrap();
