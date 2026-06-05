@@ -30,9 +30,11 @@
 //!   - `discount` → at most one `adjustment` (zero/absent omitted).
 //!   - `ShiftOpenJson.opening_sum_kop` = 0 (no wire source).
 //!
-//! `ShiftClose` / `ZReport` need the ledger (sell/return counts +
-//! per-form sums since shift open) and land in **piece-2b**; here they
-//! return [`ConvertError::ZReportDeferredToPiece2b`].
+//! `ShiftClose` / `ZReport` (piece-2b) derive their summary from the
+//! ledger: [`aggregate_zreport`] over the current shift's issued
+//! (`ACK` / `OFFLINE_LOCAL_ACK`) `SELL` / `RETURN` receipts read from
+//! `main_pool` (`fiscal_documents` + `node_state.current_shift_id`),
+//! grouped by `(type_code, name)` — SELL→`sum_in_kop`, RETURN→`sum_out_kop`.
 //!
 //! [`to_canonical_fiscal_command`]: super::dto::to_canonical_fiscal_command
 
@@ -40,10 +42,12 @@ use super::dto::{
     canonical_json_bytes, CanonicalCommand, CanonicalPayment, CommandType, DiscountDirection,
     FiscalLine, PaymentKind,
 };
-use crate::db::repositories::payment_methods;
-use serde::Serialize;
+use crate::db::models::enums::DocType;
+use crate::db::repositories::{fiscal_documents, node_state, payment_methods};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// The signer-ready payload + its canonical hash (over the CONVERTED
@@ -163,9 +167,26 @@ pub enum ConvertError {
         pay_index: i64,
     },
 
-    /// `ShiftClose` / `ZReport` need the ledger aggregation — piece-2b.
-    #[error("ZReport/ShiftClose conversion is deferred to RS-2 piece-2b")]
-    ZReportDeferredToPiece2b,
+    /// `ZReport` / `ShiftClose` with no open shift — a Z closes the open
+    /// shift; closing when none is open is a state-machine breach.
+    #[error(
+        "fn {fiscal_number}: ZReport/ShiftClose with no open shift \
+         (node_state.current_shift_id is None)"
+    )]
+    NoOpenShiftForZReport { fiscal_number: String },
+
+    /// A Z-report per-payment-form turnover sum overflows i64.
+    #[error("ZReport turnover sum overflow (type_code {type_code}, name {name:?})")]
+    ZReportSumOverflow { type_code: String, name: String },
+
+    /// A shift-receipt ledger row had an unexpected doc_type — the query
+    /// filters to SELL/RETURN, so this is defensive (should not occur).
+    #[error("unexpected shift-receipt doc_type {0:?} (expected SELL/RETURN)")]
+    UnexpectedShiftReceiptDocType(DocType),
+
+    /// A read-side DB error (node_state / ledger) while building a Z.
+    #[error("ZReport ledger read failed: {0}")]
+    LedgerRead(sqlx::Error),
 
     /// A non-signable command reached the converter (the ingress
     /// command policy should reject these earlier; defensive).
@@ -228,6 +249,101 @@ struct CheckPaymentOut {
     name: String,
     sum_kop: i64,
     type_code: String,
+}
+
+// ─── ZReport (piece-2b) — ledger-derived shift summary ───────────────
+
+#[derive(Serialize)]
+struct ZReportOut {
+    payments: Vec<ZReportPaymentOut>,
+    sell_count: u32,
+    return_count: u32,
+}
+
+#[derive(Serialize)]
+struct ZReportPaymentOut {
+    name: String,
+    sum_in_kop: i64,
+    sum_out_kop: i64,
+    type_code: String,
+}
+
+/// Minimal view of a stored (converted) `CheckJson` — ONLY the payments
+/// the Z aggregates.  NOT `deny_unknown_fields`: it deliberately ignores
+/// `items` + every other field.  A parse failure surfaces as a typed
+/// error (a corrupt issued-receipt payload HALTS the Z — deliberately
+/// stricter than the Python parity, which silently skips a bad row).
+#[derive(Deserialize)]
+struct StoredCheckPayments {
+    #[serde(default)]
+    payments: Vec<StoredPayment>,
+}
+
+#[derive(Deserialize)]
+struct StoredPayment {
+    name: String,
+    sum_kop: i64,
+    type_code: String,
+}
+
+/// Aggregate a shift's issued `SELL`/`RETURN` receipts into the signer's
+/// ZReport shape.  Parses each stored converted `CheckJson`'s payments,
+/// groups by `(type_code, name)` (operator decision; `BTreeMap` →
+/// deterministic payment-array order), routes a `SELL` payment's `sum_kop`
+/// to `sum_in_kop` and a `RETURN`'s to `sum_out_kop` (both positive — the
+/// DPS `<M SMI/SMO>` contract), counts the docs, and does NOT synthesize
+/// zero-valued rows.  Pure (no I/O) — unit-testable without a DB.
+fn aggregate_zreport(receipts: &[(DocType, String)]) -> Result<ZReportOut, ConvertError> {
+    // (type_code, name) → (sum_in_kop, sum_out_kop)
+    let mut groups: BTreeMap<(String, String), (i64, i64)> = BTreeMap::new();
+    let mut sell_count: u32 = 0;
+    let mut return_count: u32 = 0;
+
+    for (doc_type, payload_json) in receipts {
+        let is_sell = match doc_type {
+            DocType::Sell => {
+                sell_count += 1;
+                true
+            }
+            DocType::Return => {
+                return_count += 1;
+                false
+            }
+            other => return Err(ConvertError::UnexpectedShiftReceiptDocType(*other)),
+        };
+        let parsed: StoredCheckPayments =
+            serde_json::from_str(payload_json).map_err(ConvertError::Serialise)?;
+        for p in parsed.payments {
+            let key = (p.type_code, p.name);
+            let entry = groups.entry(key.clone()).or_insert((0, 0));
+            let target = if is_sell { &mut entry.0 } else { &mut entry.1 };
+            *target =
+                target
+                    .checked_add(p.sum_kop)
+                    .ok_or_else(|| ConvertError::ZReportSumOverflow {
+                        type_code: key.0.clone(),
+                        name: key.1.clone(),
+                    })?;
+        }
+    }
+
+    let payments = groups
+        .into_iter()
+        .map(
+            |((type_code, name), (sum_in_kop, sum_out_kop))| ZReportPaymentOut {
+                name,
+                sum_in_kop,
+                sum_out_kop,
+                type_code,
+            },
+        )
+        .collect();
+
+    Ok(ZReportOut {
+        payments,
+        sell_count,
+        return_count,
+    })
 }
 
 fn to_i64(value: u64, context: &'static str) -> Result<i64, ConvertError> {
@@ -393,12 +509,15 @@ fn finalize<T: Serialize>(out: &T) -> Result<ConvertedPayload, ConvertError> {
 }
 
 /// Convert a wire [`CanonicalCommand`] into the signer-ready payload +
-/// recomputed canonical hash.  `secure_pool` is the secure DB pool that
-/// holds `payment_methods`.  `ShiftClose`/`ZReport` are deferred to
-/// piece-2b (typed error, never a silent wrong payload).
+/// recomputed canonical hash.  `secure_pool` holds `payment_methods`
+/// (SELL/RETURN payment names); `main_pool` holds the ledger +
+/// `node_state` for the `ZReport`/`ShiftClose` shift aggregation.
+/// All DB access is read-only and outside any write transaction
+/// (invariant #1).
 pub async fn convert_to_signer_payload(
     cmd: &CanonicalCommand,
     fiscal_number: &str,
+    main_pool: &SqlitePool,
     secure_pool: &SqlitePool,
 ) -> Result<ConvertedPayload, ConvertError> {
     match cmd.command_type {
@@ -433,7 +552,24 @@ pub async fn convert_to_signer_payload(
             finalize(&CheckOut { items, payments })
         }
         CommandType::ShiftClose | CommandType::ZReport => {
-            Err(ConvertError::ZReportDeferredToPiece2b)
+            // The Z closes the FN's open shift — aggregate that shift's
+            // issued (ACK / OFFLINE_LOCAL_ACK) SELL/RETURN receipts from
+            // the ledger.  Reads only (node_state + fiscal_documents),
+            // outside any write-tx (#1). End-to-end this yields 0/0 until
+            // RS-3 populates the ledger + WL-1 maintains current_shift_id
+            // (plan §0.6 dependency) — correct + testable now regardless.
+            let shift_id = node_state::get(main_pool, fiscal_number)
+                .await
+                .map_err(ConvertError::LedgerRead)?
+                .and_then(|ns| ns.current_shift_id)
+                .ok_or_else(|| ConvertError::NoOpenShiftForZReport {
+                    fiscal_number: fiscal_number.to_string(),
+                })?;
+            let receipts =
+                fiscal_documents::list_shift_issued_receipts(main_pool, fiscal_number, shift_id)
+                    .await
+                    .map_err(ConvertError::LedgerRead)?;
+            finalize(&aggregate_zreport(&receipts)?)
         }
         other => Err(ConvertError::NotSignable(other)),
     }
@@ -631,5 +767,105 @@ mod tests {
         validate_signer_payload_shape_for_testing(kind, &conv.payload_json, None)
             .expect("converted ShiftOpenJson must parse through stage_sign");
         assert_eq!(conv.payload_json, r#"{"opening_sum_kop":0}"#);
+    }
+
+    // ─── piece-2b: aggregate_zreport (pure) ───────────────────────
+
+    fn pay(name: &str, sum_kop: i64, type_code: &str) -> String {
+        format!(r#"{{"name":"{name}","sum_kop":{sum_kop},"type_code":"{type_code}"}}"#)
+    }
+    fn stored_check(payments: &[String]) -> String {
+        format!(r#"{{"items":[],"payments":[{}]}}"#, payments.join(","))
+    }
+
+    #[test]
+    fn aggregate_groups_sell_in_return_out() {
+        let receipts = vec![
+            (DocType::Sell, stored_check(&[pay("Готівка", 10000, "0")])),
+            (DocType::Return, stored_check(&[pay("Готівка", 3000, "0")])),
+        ];
+        let z = aggregate_zreport(&receipts).unwrap();
+        assert_eq!(z.sell_count, 1);
+        assert_eq!(z.return_count, 1);
+        assert_eq!(z.payments.len(), 1);
+        assert_eq!(z.payments[0].type_code, "0");
+        assert_eq!(z.payments[0].name, "Готівка");
+        assert_eq!(z.payments[0].sum_in_kop, 10000);
+        assert_eq!(z.payments[0].sum_out_kop, 3000);
+    }
+
+    #[test]
+    fn aggregate_distinct_names_same_type_code_split_into_two_rows() {
+        let receipts = vec![(
+            DocType::Sell,
+            stored_check(&[pay("AcqA", 5000, "1"), pay("AcqB", 7000, "1")]),
+        )];
+        let z = aggregate_zreport(&receipts).unwrap();
+        assert_eq!(
+            z.payments.len(),
+            2,
+            "distinct names under one type_code → 2 rows"
+        );
+        // BTreeMap order: ("1","AcqA") before ("1","AcqB").
+        assert_eq!(z.payments[0].name, "AcqA");
+        assert_eq!(z.payments[1].name, "AcqB");
+    }
+
+    #[test]
+    fn aggregate_accumulates_same_group_across_receipts() {
+        let receipts = vec![
+            (DocType::Sell, stored_check(&[pay("Готівка", 10000, "0")])),
+            (DocType::Sell, stored_check(&[pay("Готівка", 2500, "0")])),
+        ];
+        let z = aggregate_zreport(&receipts).unwrap();
+        assert_eq!(z.sell_count, 2);
+        assert_eq!(z.payments.len(), 1);
+        assert_eq!(z.payments[0].sum_in_kop, 12500);
+        assert_eq!(z.payments[0].sum_out_kop, 0);
+    }
+
+    #[test]
+    fn aggregate_empty_shift_is_zero_no_synthesized_rows() {
+        let z = aggregate_zreport(&[]).unwrap();
+        assert_eq!(z.sell_count, 0);
+        assert_eq!(z.return_count, 0);
+        assert!(
+            z.payments.is_empty(),
+            "no zero-valued payment rows synthesized"
+        );
+    }
+
+    #[test]
+    fn aggregate_malformed_stored_payload_is_typed_error() {
+        let receipts = vec![(DocType::Sell, "{not json".to_string())];
+        assert!(matches!(
+            aggregate_zreport(&receipts),
+            Err(ConvertError::Serialise(_))
+        ));
+    }
+
+    #[test]
+    fn aggregate_unexpected_doc_type_is_typed_error() {
+        let receipts = vec![(DocType::ShiftOpen, stored_check(&[]))];
+        assert!(matches!(
+            aggregate_zreport(&receipts),
+            Err(ConvertError::UnexpectedShiftReceiptDocType(
+                DocType::ShiftOpen
+            ))
+        ));
+    }
+
+    /// The aggregated ZReportJson must parse through the signer's private
+    /// `parse_payload` (deny_unknown_fields).
+    #[test]
+    fn aggregated_zreport_parses_through_signer() {
+        let receipts = vec![
+            (DocType::Sell, stored_check(&[pay("Готівка", 10000, "0")])),
+            (DocType::Return, stored_check(&[pay("Готівка", 3000, "0")])),
+        ];
+        let conv = finalize(&aggregate_zreport(&receipts).unwrap()).unwrap();
+        let kind = derive_wire_artifact_kind(DocType::ZReport).unwrap();
+        validate_signer_payload_shape_for_testing(kind, &conv.payload_json, None)
+            .expect("aggregated ZReportJson must parse through stage_sign");
     }
 }

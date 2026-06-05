@@ -511,6 +511,48 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
         .collect()
 }
 
+/// Raw `(doc_type, payload_json)` row for [`list_shift_issued_receipts`].
+#[derive(sqlx::FromRow)]
+struct ShiftReceiptRow {
+    doc_type: DocType,
+    payload_json: String,
+}
+
+/// RS-2 piece-2b — the issued `SELL` / `RETURN` receipts of a shift, for
+/// Z-report aggregation.  Returns `(doc_type, payload_json)` for docs in
+/// the given `shift_id` whose state is a terminal **issued receipt**
+/// (`ACK` or `OFFLINE_LOCAL_ACK` — the `fiscal_documents`=issued-ledger
+/// set; in-flight `SENDING`/`KVT*`/`ERROR_RETRYABLE` and `REJECTED` are
+/// intentionally excluded, matching the W4-Z1 `<NC>` spec + the Python
+/// `shift_aggregation` parity).  `payload_json` is the **converted**
+/// signer-ready `CheckJson` (RS-2 §0.4 H5), so callers aggregate its
+/// `payments[]` directly.
+///
+/// Runtime-bound `query_as` (NOT the `query!` macro) so it needs no
+/// `.sqlx` offline-cache entry — mirrors the secure-pool repos.
+pub async fn list_shift_issued_receipts(
+    pool: &SqlitePool,
+    fn_id: &str,
+    shift_id: ShiftId,
+) -> sqlx::Result<Vec<(DocType, String)>> {
+    let rows = sqlx::query_as::<_, ShiftReceiptRow>(
+        "SELECT doc_type, payload_json \
+         FROM fiscal_documents \
+         WHERE fiscal_number = ? AND shift_id = ? \
+           AND doc_type IN ('SELL','RETURN') \
+           AND state IN ('ACK','OFFLINE_LOCAL_ACK') \
+         ORDER BY lnd",
+    )
+    .bind(fn_id)
+    .bind(shift_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.doc_type, r.payload_json))
+        .collect())
+}
+
 /// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 / HIGH-C4-8
 /// resolution; HIGH-C5-1 session scoping; MED-C5-4 KVT2 deferral
 /// reversed by **M3b W12 Commit 3**) — strict `lnd ASC` walker for
