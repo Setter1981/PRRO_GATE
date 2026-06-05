@@ -15,6 +15,7 @@
 //!     receives mapped commands from the handler.
 
 pub mod dto;
+pub mod policy;
 
 pub struct IngressServer;
 
