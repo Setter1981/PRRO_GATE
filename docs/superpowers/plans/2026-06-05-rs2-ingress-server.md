@@ -96,6 +96,20 @@ Concrete body-limit (`axum::extract::DefaultBodyLimit` / `tower_http`); reconcil
 - **Piece 6** gains: explicit code-pool / last-fiscal-number read helpers (M3) + `schema_version` on the status DTO (H5).
 - **Piece 7** gains: invert BOTH parity tests (M5) + the H4 twin lifecycle test.
 
+### §0.4 round-3 carry-forwards (2026-06-05 — convergence gate: external + internal both PLAN-READY, no new High)
+
+Round 3 (1 external + 1 internal) both returned **PLAN-READY** — round-2 is faithfully folded, no architecture rework. Five implementation-placement details to pin so they are not lost during coding (none re-opens a blocker):
+
+- **CF1 — status endpoint must enforce `listener_fn`, not just the path `{fn}`** *(external M7)*. `GET /v1/status/{fn}` runs on a per-listener router where the listener is bound to ONE `(driver_id, fn)`. Mirror POST's `to_canonical_fiscal_command_with_context` FN-validation (`dto.rs:355`): **reject `{fn} != listener_fn` → 403/404**, else the read-only API is cross-FN data access (acute under D2 loopback/no-token). → piece-6.
+- **CF2 — D1 admin-guard is LIVE at the mutation surface, config-aware** *(external Med-2 + internal B1, converged)*. Enforce the protected-slot guard INSIDE `add_payment_method` / `update_payment_method` / `remove_payment_method` (`admin_w4_z0.rs:346/405/449`), NOT startup-only (the admin CLI opens pools directly, takes no singleton lock — `main.rs:500`, `singleton.rs:3`). Mechanism (internal B1): `with_pools!`→`open_pools_from_config` (`admin_w4_z0.rs:769/796`) **already parses the full `AppConfig` incl. `listeners` but drops it** — thread the derived **RS-2-enabled-FN set** (FNs with a `RestHttp` listener) through into the three fns. **Block** remove / inactivate / `iscash`-mutation of a protected slot when `fn_id` is RS-2-enabled; **allow** adding a missing protected slot only if it matches the required semantics. → piece-2 (+ admin guard).
+- **CF3 — D1 startup-validation site = `supervisor::run`, alongside `build_from_db`** *(internal B2)*. `supervisor::run` (`supervisor.rs:45`) has `app.config()` (incl. `listeners`) + `app.db()` + `app.db_secure()` (→ `payment_methods`) in scope, and runs BEFORE `run_with_registry` binds anything — the exact precedent is `BindingsRegistry::build_from_db` (`:77-85`). Pin the per-RS-2-FN payment-slot validation there. → piece-1/5.
+- **CF4 — D2 loopback guard semantics PINNED** *(internal B3 — the one real residual)*. `listen_addr` is **host-only** (port stays in `ListenerCfg.port`): (a) parse to `std::net::IpAddr` (NOT `SocketAddr`, NOT raw-string compare); (b) a hostname (`localhost`) does NOT parse as `IpAddr` → **fail-closed reject**; (c) classify via `IpAddr::is_loopback()` (true for `127.0.0.0/8` + `::1`); (d) `0.0.0.0` / `::` are `UNSPECIFIED` (all-interfaces) → **is_loopback()==false → REFUSED** (the footgun, correctly closed). Guard runs at the CF3 site, fail-closed before any bind. → piece-1.
+- **CF5 — pick `correlation_id` source before piece-4** *(internal Task-A M4 note)*. The wire `CanonicalCommand` has no correlation field; choose: mint server-side uuid-v7, or leave `None` for pilot (idempotency is carried by `idempotency_key`, not `correlation_id`). → decide at piece-4. **Default: `None` for pilot** unless an audit-trace need surfaces.
+
+Low doc-hygiene: §0.3's "non-loopback-bearer-required" test wording → under D2 the day-1 test is "a non-loopback `RestHttp` listener fails startup before the token-resolver lands"; the historical §4 "uuid v4" is superseded by H6 (uuid-v7) — §0 remains the sole basis.
+
+**Decomposition delta (round-3):** piece-1 += `listen_addr` IpAddr-parse + `is_loopback` guard (CF4) at the CF3 site; piece-1/5 += per-RS-2-FN payment-slot startup validation (CF3); piece-2 += live admin-guard on the three payment mutation fns (CF2); piece-6 += status `{fn}==listener_fn` enforcement (CF1).
+
 ---
 
 ## 1. Goal & non-goals
