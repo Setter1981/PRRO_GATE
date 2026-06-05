@@ -110,6 +110,18 @@ Low doc-hygiene: §0.3's "non-loopback-bearer-required" test wording → under D
 
 **Decomposition delta (round-3):** piece-1 += `listen_addr` IpAddr-parse + `is_loopback` guard (CF4) at the CF3 site; piece-1/5 += per-RS-2-FN payment-slot startup validation (CF3); piece-2 += live admin-guard on the three payment mutation fns (CF2); piece-6 += status `{fn}==listener_fn` enforcement (CF1).
 
+### §0.4 fresh-eyes carry-forwards (2026-06-05 — code review of committed piece-2a)
+
+A fresh-eyes review of the committed RS-2 code returned REVISE; all closed in `convert.rs` (commit `f07e6a6`) EXCEPT one decision:
+
+- **FE1 — `raw_frames` silent drop** → `ConvertError::RawFramesNotSupported` (fail-closed, M5-scope fiscal data; same posture as acquirer_slip). Closed.
+- **FE2 — zero-quantity line / empty-goods SELL** → `ZeroQuantityLine` / `EmptyGoods`. Closed.
+- **FE3 — maximal-item parse-through test** + `direction`-drop doc. Closed.
+- **MED-2 — RESOLVED (operator, option (a)):** the H5 hash stays over the converted `payload_json`; `payment_methods.name` stays a runtime table lookup; a retry after an operator **renames** a payment slot may yield `Conflict` (accepted pilot risk — replay must NOT pretend a rename-changed doc is the same one; this is honester than freezing `name` against D1). **Piece-4 obligation:** the replay/response path MUST label such a `Conflict` as a possible **config-drift conflict**, NOT tampering, in the audit/log/error envelope, so an operator rename does not read as an attack.
+- **EPZ follow-up (open):** `AcquirerSlip → EPZ` (PA/PB/…) attribute mapping + PA source (W4-Z1 §Q1) — operator decision, post-pilot-safe (RS-2 fails closed on slips today).
+
+**Decomposition delta (fresh-eyes):** piece-4 += config-drift-vs-tampering `Conflict` labeling (MED-2a) in the replay matrix + response/audit envelope.
+
 ---
 
 ## 1. Goal & non-goals
