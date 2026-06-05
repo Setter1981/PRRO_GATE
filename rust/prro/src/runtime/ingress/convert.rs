@@ -50,6 +50,17 @@ use thiserror::Error;
 /// shape, §0.4 H5).  Replaces the wire-shape `payload_json` /
 /// `payload_sha256_canonical` that `to_canonical_fiscal_command`
 /// produced, before the inbox insert.
+///
+/// **Idempotency note (review MEDIUM-2, decision-owed before RS-3 wires
+/// convert → `ingress_inbox::insert`):** because the hash is over the
+/// converted payload and `CheckPaymentJson.name` is sourced from the
+/// editable `payment_methods` row, the inbox replay/conflict key now
+/// depends on that name.  An operator renaming a payment slot between a
+/// POS submit and its retry would flip a legitimate retry from `Replay`
+/// to `Conflict`.  The hash MUST be over `payload_json` (the drift
+/// checks in `stage_acquire`/`boot_phase` require it), so this is not a
+/// pure code fix — resolve by either accepting + auditing the narrow
+/// race, or extending the D1 admin-guard to freeze the slot *name* too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConvertedPayload {
     pub payload_json: String,
@@ -62,6 +73,28 @@ pub enum ConvertError {
     /// NOT fabricate one (operator decision: no line-index fallback).
     #[error("item {item_name:?}: missing article_code (signer 'code' is required; no fallback)")]
     MissingItemCode { item_name: String },
+
+    /// A SELL/RETURN with no goods — a fiscal receipt must have ≥1 item.
+    #[error("SELL/RETURN with empty goods — a fiscal receipt must carry at least one item")]
+    EmptyGoods,
+
+    /// A line with `quantity_milli == 0` — fiscally meaningless; fail
+    /// closed rather than sign a zero-quantity line.
+    #[error("item {item_name:?}: quantity_milli is 0 (zero-quantity line is not fiscalizable)")]
+    ZeroQuantityLine { item_name: String },
+
+    /// The wire carries non-empty `raw_frames` on a Signable command.
+    /// `raw_frames` is the M5 carrier for check-level discounts / header
+    /// & footer text / service-movement amounts that the structured DTO
+    /// does not capture (spec `2026-05-26-w4-z1-dps-xml-wire-shape.md`).
+    /// Until that mapping lands we FAIL CLOSED — same posture as
+    /// `acquirer_slip` — rather than silently sign away the frames (which
+    /// would also collapse frame-distinct wire payloads to one hash).
+    #[error(
+        "Signable command carries {count} raw_frame(s); the raw_frames→signer mapping is not yet \
+         implemented (M5) — fail-closed, not silently dropped"
+    )]
+    RawFramesNotSupported { count: usize },
 
     /// `price_kopecks * quantity_milli` is not divisible by 1000 — we do
     /// NOT silently floor (operator decision: typed error until a
@@ -231,6 +264,12 @@ fn convert_item(line: &FiscalLine, dual_tax_active: bool) -> Result<CheckItemOut
         }
     };
 
+    if line.quantity_milli == 0 {
+        return Err(ConvertError::ZeroQuantityLine {
+            item_name: line.name.clone(),
+        });
+    }
+
     let adjustments = match &line.discount {
         Some(d) if d.amount_kopecks != 0 => {
             let kind = match d.direction {
@@ -365,6 +404,21 @@ pub async fn convert_to_signer_payload(
     match cmd.command_type {
         CommandType::ShiftOpen => finalize(&ShiftOpenOut { opening_sum_kop: 0 }),
         CommandType::Sell | CommandType::Return => {
+            // `raw_frames` carries M5-scope fiscal data (check-level
+            // discounts / header & footer / service amounts) the
+            // structured DTO does not capture — fail closed if present
+            // rather than sign it away (same posture as acquirer_slip).
+            if !cmd.payload.raw_frames.is_empty() {
+                return Err(ConvertError::RawFramesNotSupported {
+                    count: cmd.payload.raw_frames.len(),
+                });
+            }
+            if cmd.payload.goods.is_empty() {
+                return Err(ConvertError::EmptyGoods);
+            }
+            // `payload.direction` is intentionally NOT emitted — Sell vs
+            // Return is carried by `command_type` (→ `WireArtifactKind`),
+            // so the inner CheckJson is direction-agnostic (no data lost).
             let dual_tax_active = cmd.payload.dual_tax_mode.is_some();
             let items = cmd
                 .payload
@@ -529,6 +583,43 @@ mod tests {
         let kind = derive_wire_artifact_kind(DocType::Sell).unwrap();
         validate_signer_payload_shape_for_testing(kind, &conv.payload_json, Some(15000))
             .expect("converted CheckJson must parse through stage_sign");
+    }
+
+    #[test]
+    fn zero_quantity_line_is_typed_error() {
+        let l = line(Some(42), "Bread", 15000, 0);
+        assert!(matches!(
+            convert_item(&l, false),
+            Err(ConvertError::ZeroQuantityLine { .. })
+        ));
+    }
+
+    /// A maximal item (dual-tax secondary group + a discount adjustment +
+    /// barcode/uktzed/excise_stamps) must ALSO parse through the signer —
+    /// proves the rich optional fields + adjustment kind/mode strings
+    /// match `parse_payload` under `deny_unknown_fields`, not just the
+    /// minimal shape.
+    #[test]
+    fn maximal_item_parses_through_signer() {
+        let mut l = line(Some(42), "Bread", 15000, 1000);
+        l.tax_group_2 = 2;
+        l.barcode = Some("4820000000001".to_string());
+        l.uktzed = Some("1905310000".to_string());
+        l.excise_stamps = vec!["AB1234567".to_string()];
+        l.discount = Some(super::super::dto::Discount {
+            direction: DiscountDirection::Discount,
+            name: "promo".to_string(),
+            amount_kopecks: 500,
+        });
+        let out = CheckOut {
+            // dual_tax_active = true so the secondary TX1 is emitted.
+            items: vec![convert_item(&l, true).unwrap()],
+            payments: Vec::new(),
+        };
+        let conv = finalize(&out).unwrap();
+        let kind = derive_wire_artifact_kind(DocType::Sell).unwrap();
+        validate_signer_payload_shape_for_testing(kind, &conv.payload_json, Some(15000))
+            .expect("maximal converted CheckJson must parse through stage_sign");
     }
 
     /// A converted ShiftOpen `{opening_sum_kop:0}` parses through the

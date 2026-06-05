@@ -205,6 +205,72 @@ async fn secondary_tax_without_dual_mode_fails_closed_through_orchestrator() {
     );
 }
 
+/// A SELL carrying a non-empty `raw_frames` (M5-scope fiscal data).
+fn sell_with_raw_frames() -> CanonicalCommand {
+    let json = r#"{
+        "schema_version": "1.0",
+        "fiscal_number": "4000000001",
+        "command_type": "SELL",
+        "idempotency_key": "idem-frames",
+        "cashier_id": null,
+        "department": null,
+        "return_check_number": null,
+        "payload": {
+            "direction": "SALE",
+            "goods": [
+                {"name":"Bread","quantity_milli":1000,"price_kopecks":15000,
+                 "tax_group_1":1,"tax_group_2":0,"article_code":42}
+            ],
+            "payments": [{"type":"CASH","amount_kopecks":15000}],
+            "totals": {"sale_kopecks":15000,"return_kopecks":0},
+            "raw_frames": [{"opcode":"DISC","body":"check-level discount"}]
+        }
+    }"#;
+    serde_json::from_str(json).expect("parse SELL raw_frames fixture")
+}
+
+#[tokio::test]
+async fn raw_frames_fail_closed_through_orchestrator() {
+    let (_dir, pool) = fresh_secure_pool().await;
+    // Fires before the payment lookup → no payment_methods needed.
+    let err = convert_to_signer_payload(&sell_with_raw_frames(), FN, &pool)
+        .await
+        .expect_err("non-empty raw_frames must fail closed, not be dropped");
+    assert!(
+        matches!(err, ConvertError::RawFramesNotSupported { count: 1 }),
+        "got {err:?}"
+    );
+}
+
+/// A SELL with no goods.
+fn sell_with_no_goods() -> CanonicalCommand {
+    let json = r#"{
+        "schema_version": "1.0",
+        "fiscal_number": "4000000001",
+        "command_type": "SELL",
+        "idempotency_key": "idem-empty",
+        "cashier_id": null,
+        "department": null,
+        "return_check_number": null,
+        "payload": {
+            "direction": "SALE",
+            "goods": [],
+            "payments": [{"type":"CASH","amount_kopecks":0}],
+            "totals": {"sale_kopecks":0,"return_kopecks":0}
+        }
+    }"#;
+    serde_json::from_str(json).expect("parse SELL empty-goods fixture")
+}
+
+#[tokio::test]
+async fn empty_goods_sell_is_typed_error() {
+    let (_dir, pool) = fresh_secure_pool().await;
+    let err = convert_to_signer_payload(&sell_with_no_goods(), FN, &pool)
+        .await
+        .expect_err("SELL with empty goods must be a typed error");
+    assert!(matches!(err, ConvertError::EmptyGoods), "got {err:?}");
+}
+
 #[tokio::test]
 async fn iscash_mismatch_at_frozen_slot_is_typed_error() {
     let (_dir, pool) = fresh_secure_pool().await;
