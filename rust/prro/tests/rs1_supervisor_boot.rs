@@ -32,23 +32,30 @@ use tokio::sync::watch;
 const FIXTURE_CERT_DER: &[u8] = include_bytes!("fixtures/SELF_SIGNED_ENC_6929.cer");
 
 fn cfg_toml(dir: &Path) -> String {
-    let db = dir.join("main.db");
-    let secure = dir.join("secure.db");
+    // Windows tempdir paths contain backslashes; inside a TOML *basic* string
+    // `"..."` those are escape sequences (`C:\Users` → invalid `\U` escape),
+    // which fails `from_toml` on the windows-msvc CI target. Normalize to
+    // forward slashes — SQLite accepts them on every platform. Mirrors the
+    // convention in `app_boot.rs` / `app_boot_quick_check_failure.rs`.
+    let db = dir.join("main.db").display().to_string().replace('\\', "/");
+    let secure = dir
+        .join("secure.db")
+        .display()
+        .to_string()
+        .replace('\\', "/");
     format!(
         r#"
 app_name = "prro"
 version = "0.1.0"
 
 [database]
-db_path = "{}"
-secure_db_path = "{}"
+db_path = "{db}"
+secure_db_path = "{secure}"
 
 [admin_ui]
 enabled = false
 listen = "127.0.0.1:8081"
-"#,
-        db.display(),
-        secure.display()
+"#
     )
 }
 
