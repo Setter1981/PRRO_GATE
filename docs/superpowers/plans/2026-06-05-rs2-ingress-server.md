@@ -124,6 +124,26 @@ A fresh-eyes review of the committed RS-2 code returned REVISE; all closed in `c
 
 ---
 
+## 0.6 — piece-2b design (ZReport / ShiftClose ledger aggregation) — PRE-IMPLEMENTATION
+
+The conversion's second half: `Z_REPORT` and `SHIFT_CLOSE` both produce the signer's `ZReportJson { payments[]: {name, sum_in_kop, sum_out_kop, type_code}, sell_count, return_count }`. Unlike SELL/RETURN, this is **derived from the ledger**, not the wire — the wire `ZReport`/`ShiftClose` command carries no counters/sums. Operator-locked decisions (2026-06-05):
+
+- **Shift boundary = `current_shift_id`**, NOT `business_ts >= opened_at`. The shift being closed is the FN's open shift: `node_state::get(main_pool, fn).current_shift_id`. Match ledger rows on `fiscal_documents.shift_id = current_shift_id`.
+- **States = `ACK` + `OFFLINE_LOCAL_ACK` only** (the "issued receipts" ledger set; rejected/in-flight excluded).
+- **Counts:** `sell_count` / `return_count` = number of `SELL` / `RETURN` docs in that shift (in those states).
+- **Sums:** parse the **already-stored signer-ready `payload_json`** (the converted `CheckJson`) of each prior receipt, aggregate its `payments[]`; a `SELL` payment's `sum_kop` → that group's `sum_in_kop`, a `RETURN`'s → `sum_out_kop`; **group by `(type_code, name)`**. **Do NOT synthesize zero-valued payment rows.**
+- **RS-3 caveat:** if RS-3 later returns the online receipt response at `SENT` (not after finalize/`ACK`), then a just-issued online doc may not yet be `ACK` at Z time → either ZReport must wait for pending online docs to finalize, OR this state-matrix is explicitly revisited. (Today nothing is wired; flagged for RS-3.)
+
+**Planned implementation (de-risked):**
+- **repo** (`fiscal_documents.rs`): `list_shift_issued_receipts(pool, fn, shift_id) -> Vec<(DocType, payload_json)>` — a **runtime** `sqlx::query_as` (DocType derives `sqlx::Type`→Decode, so no `.sqlx`/`sqlx prepare` cache needed): `WHERE fiscal_number=? AND shift_id=? AND doc_type IN ('SELL','RETURN') AND state IN ('ACK','OFFLINE_LOCAL_ACK') ORDER BY lnd`.
+- **convert** (`convert.rs`): `aggregate_zreport(receipts: &[(DocType, String)]) -> Result<ZReportOut, ConvertError>` — pure: `BTreeMap<(type_code,name),(sum_in,sum_out)>` (deterministic payment order), checked sum adds, counts; parse each stored payload via a minimal non-`deny_unknown_fields` `StoredCheckPayments { payments: [{name, sum_kop, type_code}] }` (ignores `items`/extras).
+- **orchestrator** (`convert_to_signer_payload`): the `ShiftClose | ZReport` arm reads `current_shift_id` (→ typed error if `None`), queries the ledger, calls `aggregate_zreport`, `finalize`s. Signature gains `main_pool` (ripple: piece-2a payment tests pass a main pool too).
+- **tests:** pure `aggregate_zreport` units (group-by-(type_code,name); SELL→in / RETURN→out; no-zero-synthesis; multi-receipt; checked-overflow; malformed stored payload → typed error) + an integration test (seed `ACK` + `OFFLINE_LOCAL_ACK` SELL/RETURN docs in a shift + `node_state.current_shift_id` → ZReport convert asserts counts + grouped sums) + a parse-through of the produced `ZReportJson` via the test-support validator.
+
+**Open design questions for this review:** see the fresh-eyes prompt — esp. (a) in-flight docs (`Sending`/`Kvt1`/`ErrorRetryable`) at Z time are EXCLUDED by the ACK+OFFLINE_LOCAL_ACK filter → does a Z silently undercount, or must it refuse/wait? (b) `current_shift_id == None` at Z → typed error vs empty Z? (c) malformed/old-wire-shape stored payload handling; (d) is `sum_kop` the right per-payment field for both SELL and RETURN sums.
+
+---
+
 ## 1. Goal & non-goals
 
 **Goal.** Stand up the ingress HTTP server inside `supervisor::run` so that a fresh receipt from either front-end (`maria304_driver` today; the WebCheck COM-shim at pilot) flows: **HTTP POST `CanonicalCommand` JSON → FN-validate + driver_id stamp → wire→stage_sign-ready conversion → idempotent inbox insert (short RESERVED-tx) → write-path seam (inline) → typed `CanonicalResponse`**. The response is **inline-synchronous** (operator decision §3.1): the POST blocks until the receipt is fiscalized (or a typed pre-RS-3 not-yet-fiscalized) and carries `fiscal_id`/`document_state` when known.
