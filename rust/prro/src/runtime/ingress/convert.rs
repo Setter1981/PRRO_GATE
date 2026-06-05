@@ -72,6 +72,15 @@ pub enum ConvertError {
         quantity_milli: u64,
     },
 
+    /// The wire carries a non-zero secondary tax group on an item but
+    /// `dual_tax_mode` is absent — fail-closed rather than silently drop
+    /// the secondary tax (which would sign a single-tax payload).
+    #[error(
+        "item {item_name:?}: secondary tax_group_2 {tax_group_2} present without dual_tax_mode — \
+         secondary tax requires dual-tax mode (fail-closed, not dropped)"
+    )]
+    SecondaryTaxRequiresDualTaxMode { item_name: String, tax_group_2: u8 },
+
     /// A `u64` wire amount overflows the signer's `i64` field.
     #[error("value {value} overflows i64 (context: {context})")]
     ValueOverflow { value: u64, context: &'static str },
@@ -234,6 +243,25 @@ fn convert_item(line: &FiscalLine, dual_tax_active: bool) -> Result<CheckItemOut
         _ => Vec::new(),
     };
 
+    // Secondary tax (`TX1=`) — 3-way FAIL-CLOSED matrix (spec
+    // `2026-05-26-w4-z1-dps-xml-wire-shape.md` §`TX1=`: "when
+    // dual_tax_mode = Some"):
+    //   - dual active       → emit raw (incl. 0, valid under dual-tax);
+    //   - no dual, tg2 == 0  → omit `TX1` (ordinary single-tax check);
+    //   - no dual, tg2 != 0  → typed error: secondary tax data without
+    //     dual-tax mode must NOT be silently dropped (that would sign a
+    //     single-tax payload and lose fiscal tax data — a fail-open).
+    let tax_group_2 = if dual_tax_active {
+        Some(i64::from(line.tax_group_2))
+    } else if line.tax_group_2 != 0 {
+        return Err(ConvertError::SecondaryTaxRequiresDualTaxMode {
+            item_name: line.name.clone(),
+            tax_group_2: line.tax_group_2,
+        });
+    } else {
+        None
+    };
+
     Ok(CheckItemOut {
         code,
         name: line.name.clone(),
@@ -242,19 +270,11 @@ fn convert_item(line: &FiscalLine, dual_tax_active: bool) -> Result<CheckItemOut
         sum_kop: item_sum_kop(line)?,
         barcode: line.barcode.clone(),
         uktzed: line.uktzed.clone(),
-        // Primary tax (`TX=`) is always present; raw pass-through —
+        // Primary tax (`TX=`) always present; raw pass-through —
         // stage_sign does the driver→canonical TX translation, and `0`
-        // is a valid group (звільнено). Secondary tax (`TX1=`) is ONLY
-        // emitted when dual taxation is active (spec
-        // `2026-05-26-w4-z1-dps-xml-wire-shape.md` §`TX1=`: "when
-        // dual_tax_mode = Some"); otherwise None so an ordinary
-        // single-tax receipt does not emit an unintended `TX1=0`.
+        // is a valid group (звільнено).
         tax_group_1: Some(i64::from(line.tax_group_1)),
-        tax_group_2: if dual_tax_active {
-            Some(i64::from(line.tax_group_2))
-        } else {
-            None
-        },
+        tax_group_2,
         excise_stamps: line.excise_stamps.clone(),
         adjustments,
     })
@@ -430,13 +450,24 @@ mod tests {
     }
 
     #[test]
-    fn secondary_tax_emitted_only_when_dual_tax_active() {
+    fn secondary_tax_is_fail_closed_three_way_matrix() {
         let mut l = line(Some(42), "Bread", 15000, 1000);
+
+        // (1) dual active → emit raw secondary group (incl. 0).
         l.tax_group_2 = 3;
-        // dual-tax inactive → TX1 omitted regardless of the wire value.
-        assert_eq!(convert_item(&l, false).unwrap().tax_group_2, None);
-        // dual-tax active → TX1 = raw secondary group.
         assert_eq!(convert_item(&l, true).unwrap().tax_group_2, Some(3));
+        l.tax_group_2 = 0;
+        assert_eq!(convert_item(&l, true).unwrap().tax_group_2, Some(0));
+
+        // (2) no dual + tg2 == 0 → omit TX1 (ordinary single-tax check).
+        assert_eq!(convert_item(&l, false).unwrap().tax_group_2, None);
+
+        // (3) no dual + tg2 != 0 → typed error (NOT silently dropped).
+        l.tax_group_2 = 3;
+        assert!(matches!(
+            convert_item(&l, false),
+            Err(ConvertError::SecondaryTaxRequiresDualTaxMode { tax_group_2: 3, .. })
+        ));
     }
 
     #[test]

@@ -164,6 +164,47 @@ async fn acquirer_slip_fails_closed_until_epz_mapping_lands() {
     );
 }
 
+/// A SELL whose item carries a non-zero secondary tax_group_2 but the
+/// payload has NO `dual_tax_mode`.
+fn sell_with_secondary_tax_no_dual() -> CanonicalCommand {
+    let json = r#"{
+        "schema_version": "1.0",
+        "fiscal_number": "4000000001",
+        "command_type": "SELL",
+        "idempotency_key": "idem-tax2",
+        "cashier_id": null,
+        "department": null,
+        "return_check_number": null,
+        "payload": {
+            "direction": "SALE",
+            "goods": [
+                {"name":"Bread","quantity_milli":1000,"price_kopecks":15000,
+                 "tax_group_1":1,"tax_group_2":3,"article_code":42}
+            ],
+            "payments": [{"type":"CASH","amount_kopecks":15000}],
+            "totals": {"sale_kopecks":15000,"return_kopecks":0}
+        }
+    }"#;
+    serde_json::from_str(json).expect("parse SELL secondary-tax fixture")
+}
+
+#[tokio::test]
+async fn secondary_tax_without_dual_mode_fails_closed_through_orchestrator() {
+    let (_dir, pool) = fresh_secure_pool().await;
+    // No payment_methods seeded — the item-tax error fires before the
+    // payment lookup, proving fail-closed at the orchestrator level.
+    let err = convert_to_signer_payload(&sell_with_secondary_tax_no_dual(), FN, &pool)
+        .await
+        .expect_err("secondary tax without dual_tax_mode must fail closed");
+    assert!(
+        matches!(
+            err,
+            ConvertError::SecondaryTaxRequiresDualTaxMode { tax_group_2: 3, .. }
+        ),
+        "got {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn iscash_mismatch_at_frozen_slot_is_typed_error() {
     let (_dir, pool) = fresh_secure_pool().await;
