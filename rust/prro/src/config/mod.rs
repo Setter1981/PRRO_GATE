@@ -27,6 +27,15 @@ pub struct AppConfig {
     /// HTTP ingress yet; live wiring lands in W4 supervisor.
     #[serde(default)]
     pub listeners: Vec<ListenerCfg>,
+
+    /// RS-1 (2026-05-30) — runtime supervisor (composition root + boot
+    /// reconcile + drain/probe loops).  Optional + default-disabled:
+    /// existing M1-M3b configs with no `[supervisor]` section parse
+    /// unchanged and the binary stays M1-idle.  Turning it on is an
+    /// explicit config flip; rollback is the reverse flip, never a code
+    /// revert.
+    #[serde(default)]
+    pub supervisor: SupervisorCfg,
 }
 
 /// Per-listener ingress config.  W4-Z0 piece 9 architectural pin —
@@ -148,6 +157,192 @@ impl OfflineCfg {
     }
 }
 
+/// RS-1 — runtime supervisor configuration.  The supervisor (Serve path)
+/// builds the composition root (per-FN `DpsChannel` + `SigningContext` via
+/// the operator key loader), runs boot reconciliation under the global
+/// reconcile mutex, then spawns the drain + return-online loops.
+///
+/// Gated by `enabled` (default **false**) so the binary ships M1-idle
+/// until the pilot DB + live DPS channel are validated.  This is the
+/// rollback seam: turning the supervisor on/off is a config flip, never a
+/// code revert.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SupervisorCfg {
+    /// Master on/off for the runtime spine.  Default **false** = the
+    /// binary boots and idles (M1 behaviour) regardless of the other
+    /// fields.  Only when `true` does Serve construct the channel +
+    /// bindings + supervisor and spawn the loops.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// DPS fiscal-service wire config.  Validated at supervisor startup
+    /// (NOT at parse time) so a default-off binary with no `endpoint`
+    /// still boots unchanged.
+    #[serde(default)]
+    pub dps: DpsCfg,
+
+    /// Offline-backlog drain-ticker cadence (seconds).  **Raw value** —
+    /// route boot callers through
+    /// [`SupervisorCfg::clamped_drain_interval_seconds`].  The per-FN
+    /// exponential-backoff gating lives inside
+    /// `drain_offline_backlog_scheduled`, so this is just the wake cadence.
+    #[serde(default = "default_drain_interval_seconds")]
+    pub drain_interval_seconds: u64,
+
+    /// Graceful-shutdown grace window (seconds) — the max time the
+    /// supervisor waits for a tick loop to finish its in-flight pass after
+    /// the shutdown signal before proceeding to `drop(App)` (F2).  **Raw
+    /// value** — route boot callers through
+    /// [`SupervisorCfg::clamped_shutdown_grace_seconds`].  On elapse the
+    /// supervisor proceeds anyway: the per-doc W9b drain is crash-safe, so a
+    /// cut between docs (or mid-DPS-call via idempotency) is crash-equivalent
+    /// and re-drained on next boot.  **Deployment:** set the orchestrator
+    /// stop timeout (systemd `TimeoutStopSec`, docker `stop_grace_period`)
+    /// GREATER than this value so the grace path runs before SIGKILL.
+    #[serde(default = "default_shutdown_grace_seconds")]
+    pub shutdown_grace_seconds: u64,
+}
+
+impl Default for SupervisorCfg {
+    /// Hand-written (NOT derived) so a missing `[supervisor]` table yields
+    /// the same field values as a present table with the fields omitted (a
+    /// derived `Default` would give `0` → clamped to the floor).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dps: DpsCfg::default(),
+            drain_interval_seconds: default_drain_interval_seconds(),
+            shutdown_grace_seconds: default_shutdown_grace_seconds(),
+        }
+    }
+}
+
+fn default_drain_interval_seconds() -> u64 {
+    60
+}
+
+fn default_shutdown_grace_seconds() -> u64 {
+    25
+}
+
+/// Inclusive clamp bounds for the drain-ticker cadence.
+pub const DRAIN_INTERVAL_MIN_SECONDS: u64 = 5;
+pub const DRAIN_INTERVAL_MAX_SECONDS: u64 = 3600;
+
+/// Inclusive clamp bounds for the shutdown grace window.  Upper bound is
+/// kept at the systemd default `TimeoutStopSec` (90s) minus headroom so a
+/// default unit file still SIGTERMs cleanly; operators who raise
+/// `TimeoutStopSec` can raise the grace to match.
+pub const SHUTDOWN_GRACE_MIN_SECONDS: u64 = 1;
+pub const SHUTDOWN_GRACE_MAX_SECONDS: u64 = 80;
+
+impl SupervisorCfg {
+    /// Validate + clamp `drain_interval_seconds` to
+    /// `[DRAIN_INTERVAL_MIN_SECONDS, DRAIN_INTERVAL_MAX_SECONDS]`.  Returns
+    /// `(clamped_value, was_clamped)` for the WARN-audit pattern.
+    pub fn clamped_drain_interval_seconds(&self) -> (u64, bool) {
+        let raw = self.drain_interval_seconds;
+        let clamped = raw.clamp(DRAIN_INTERVAL_MIN_SECONDS, DRAIN_INTERVAL_MAX_SECONDS);
+        (clamped, clamped != raw)
+    }
+
+    /// Validate + clamp `shutdown_grace_seconds` to
+    /// `[SHUTDOWN_GRACE_MIN_SECONDS, SHUTDOWN_GRACE_MAX_SECONDS]`.  Returns
+    /// `(clamped_value, was_clamped)` for the WARN-audit pattern.
+    pub fn clamped_shutdown_grace_seconds(&self) -> (u64, bool) {
+        let raw = self.shutdown_grace_seconds;
+        let clamped = raw.clamp(SHUTDOWN_GRACE_MIN_SECONDS, SHUTDOWN_GRACE_MAX_SECONDS);
+        (clamped, clamped != raw)
+    }
+}
+
+/// DPS fiscal-service connection config.  RS-1 is **wire-only**:
+/// server-trust TLS (no client certificate) because DPS authentication is
+/// application-layer CMS, not mTLS.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DpsCfg {
+    /// Endpoint URL, e.g. `https://cabinet.tax.gov.ua:9443`.
+    ///
+    /// **`Option`, not a required field.**  Absence is a parse-time
+    /// no-op so an `enabled = false` binary boots without it (operator
+    /// refinement 2026-05-30).  It is **fail-closed at supervisor
+    /// startup** via [`SupervisorCfg::require_dps_endpoint`], which errors
+    /// when `enabled = true` and the endpoint is missing/blank — unlike
+    /// `secure_db_path`, which fails at parse time for ALL configs.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// Per-request gRPC deadline (seconds).  **Raw value** — route boot
+    /// callers through [`DpsCfg::clamped_request_timeout_seconds`].
+    #[serde(default = "default_dps_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+}
+
+fn default_dps_request_timeout_seconds() -> u64 {
+    30
+}
+
+impl Default for DpsCfg {
+    /// Hand-written (NOT derived) so that a missing `[supervisor.dps]`
+    /// table yields the SAME `request_timeout_seconds` as a present table
+    /// with the field omitted.  A derived `Default` would give `0`
+    /// (→ clamped to the 1s floor), making the effective timeout depend
+    /// on whether the operator wrote the `[supervisor.dps]` header — a
+    /// silent inconsistency.  Keep this in sync with the
+    /// `#[serde(default = ...)]` on `request_timeout_seconds`.
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            request_timeout_seconds: default_dps_request_timeout_seconds(),
+        }
+    }
+}
+
+/// Inclusive clamp bounds for the DPS per-request timeout.  Public so
+/// boot callers read the same source of truth.
+pub const DPS_REQUEST_TIMEOUT_MIN_SECONDS: u64 = 1;
+pub const DPS_REQUEST_TIMEOUT_MAX_SECONDS: u64 = 120;
+
+impl DpsCfg {
+    /// Validate + clamp `request_timeout_seconds` to
+    /// `[DPS_REQUEST_TIMEOUT_MIN_SECONDS, DPS_REQUEST_TIMEOUT_MAX_SECONDS]`.
+    /// Returns `(clamped_value, was_clamped)` so callers can emit a WARN
+    /// audit if the operator-supplied value was outside bounds.
+    pub fn clamped_request_timeout_seconds(&self) -> (u64, bool) {
+        let raw = self.request_timeout_seconds;
+        let clamped = raw.clamp(
+            DPS_REQUEST_TIMEOUT_MIN_SECONDS,
+            DPS_REQUEST_TIMEOUT_MAX_SECONDS,
+        );
+        (clamped, clamped != raw)
+    }
+}
+
+impl SupervisorCfg {
+    /// Fail-closed DPS endpoint resolution — invoked **at supervisor
+    /// startup**, not at config parse time.  Returns:
+    /// - `Ok(None)` when the supervisor is disabled (binary stays M1-idle);
+    /// - `Ok(Some(endpoint))` when enabled with a non-blank endpoint;
+    /// - `Err` when `enabled = true` but the endpoint is missing/blank.
+    ///
+    /// The parse-vs-startup split is deliberate (operator refinement
+    /// 2026-05-30): a default-off binary must boot without a
+    /// `[supervisor.dps] endpoint`, while an *enabled* supervisor must
+    /// fail-closed rather than silently dial nothing.
+    pub fn require_dps_endpoint(&self) -> anyhow::Result<Option<String>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        match self.dps.endpoint.as_deref().map(str::trim) {
+            Some(ep) if !ep.is_empty() => Ok(Some(ep.to_string())),
+            _ => anyhow::bail!(
+                "supervisor.enabled = true but supervisor.dps.endpoint is missing or blank \
+                 (fail-closed: an enabled supervisor must have an explicit DPS endpoint)"
+            ),
+        }
+    }
+}
+
 impl AppConfig {
     pub fn from_toml(s: &str) -> anyhow::Result<Self> {
         Ok(toml::from_str(s)?)
@@ -202,5 +397,152 @@ mod tests {
             msg.contains("secure_db_path"),
             "expected error mentioning secure_db_path, got: {msg}"
         );
+    }
+
+    const BASE_CFG: &str = r#"
+        app_name = "prro"
+        version = "0.1.0"
+
+        [database]
+        db_path = "var/prro.db"
+        secure_db_path = "var/secure.db"
+
+        [admin_ui]
+        enabled = false
+        listen = "127.0.0.1:8081"
+    "#;
+
+    /// RS-1 Piece 1 — a config with no `[supervisor]` section parses and
+    /// the supervisor is disabled by default; `require_dps_endpoint`
+    /// returns `Ok(None)` so the M1-idle binary boots without a DPS
+    /// endpoint (operator refinement: fail-closed ONLY when enabled).
+    #[test]
+    fn supervisor_absent_defaults_disabled_and_boots() {
+        let cfg = AppConfig::from_toml(BASE_CFG).expect("parse must succeed");
+        assert!(!cfg.supervisor.enabled, "supervisor disabled by default");
+        assert!(cfg.supervisor.dps.endpoint.is_none());
+        assert_eq!(
+            cfg.supervisor
+                .require_dps_endpoint()
+                .expect("disabled = Ok"),
+            None,
+            "disabled supervisor needs no endpoint",
+        );
+    }
+
+    /// RS-1 Piece 1 — an ENABLED supervisor with no DPS endpoint PARSES
+    /// (no parse-time failure, unlike secure_db_path) but fails closed at
+    /// supervisor startup.  This is the operator's parse-vs-startup split.
+    #[test]
+    fn supervisor_enabled_without_endpoint_parses_but_startup_fails() {
+        let toml = format!("{BASE_CFG}\n[supervisor]\nenabled = true\n");
+        let cfg = AppConfig::from_toml(&toml).expect("parse must succeed (no parse-time fail)");
+        assert!(cfg.supervisor.enabled);
+        let err = cfg
+            .supervisor
+            .require_dps_endpoint()
+            .expect_err("enabled + no endpoint must fail closed at startup");
+        assert!(
+            err.to_string().contains("endpoint"),
+            "expected endpoint error, got: {err}"
+        );
+    }
+
+    /// RS-1 Piece 1 — an enabled supervisor with a (whitespace-padded)
+    /// endpoint resolves to the trimmed value.
+    #[test]
+    fn supervisor_enabled_with_endpoint_resolves() {
+        let toml = format!(
+            "{BASE_CFG}\n[supervisor]\nenabled = true\n[supervisor.dps]\nendpoint = \"  https://cabinet.tax.gov.ua:9443  \"\n"
+        );
+        let cfg = AppConfig::from_toml(&toml).expect("parse must succeed");
+        assert_eq!(
+            cfg.supervisor.require_dps_endpoint().expect("Ok"),
+            Some("https://cabinet.tax.gov.ua:9443".to_string()),
+        );
+    }
+
+    /// RS-1 Piece 1 (self-review LOW) — a DISABLED supervisor ignores a
+    /// set endpoint: `require_dps_endpoint` short-circuits to `Ok(None)`
+    /// so the binary stays M1-idle regardless of `[supervisor.dps]`.
+    #[test]
+    fn supervisor_disabled_ignores_set_endpoint() {
+        let toml = format!(
+            "{BASE_CFG}\n[supervisor]\nenabled = false\n[supervisor.dps]\nendpoint = \"https://cabinet.tax.gov.ua:9443\"\n"
+        );
+        let cfg = AppConfig::from_toml(&toml).expect("parse must succeed");
+        assert!(!cfg.supervisor.enabled);
+        assert_eq!(
+            cfg.supervisor
+                .require_dps_endpoint()
+                .expect("disabled = Ok(None)"),
+            None,
+            "disabled supervisor ignores a set endpoint",
+        );
+    }
+
+    /// RS-1 Piece 1 — DPS request timeout clamps to bounds + reports it.
+    #[test]
+    fn dps_request_timeout_clamps_out_of_range() {
+        let dps = DpsCfg {
+            endpoint: None,
+            request_timeout_seconds: 99_999,
+        };
+        let (clamped, was_clamped) = dps.clamped_request_timeout_seconds();
+        assert_eq!(clamped, DPS_REQUEST_TIMEOUT_MAX_SECONDS);
+        assert!(was_clamped);
+        // Default is in-range and not clamped.
+        let (def, def_clamped) = DpsCfg::default().clamped_request_timeout_seconds();
+        assert_eq!(def, default_dps_request_timeout_seconds());
+        assert!(!def_clamped);
+    }
+
+    /// RS-1 Piece 5a — drain-ticker cadence clamps to bounds; the
+    /// hand-written Default keeps it in-range whether or not the table is
+    /// present.
+    #[test]
+    fn drain_interval_clamps_and_defaults_in_range() {
+        let sup = SupervisorCfg {
+            enabled: true,
+            dps: DpsCfg::default(),
+            drain_interval_seconds: 0,
+            shutdown_grace_seconds: default_shutdown_grace_seconds(),
+        };
+        let (clamped, was_clamped) = sup.clamped_drain_interval_seconds();
+        assert_eq!(clamped, DRAIN_INTERVAL_MIN_SECONDS);
+        assert!(was_clamped);
+
+        let (def, def_clamped) = SupervisorCfg::default().clamped_drain_interval_seconds();
+        assert_eq!(def, default_drain_interval_seconds());
+        assert!(!def_clamped);
+    }
+
+    /// RS-1 F2 — shutdown grace window clamps to bounds; the hand-written
+    /// Default keeps it in-range whether or not the table is present.
+    #[test]
+    fn shutdown_grace_clamps_and_defaults_in_range() {
+        let sup = SupervisorCfg {
+            enabled: true,
+            dps: DpsCfg::default(),
+            drain_interval_seconds: default_drain_interval_seconds(),
+            shutdown_grace_seconds: 0,
+        };
+        let (clamped, was_clamped) = sup.clamped_shutdown_grace_seconds();
+        assert_eq!(clamped, SHUTDOWN_GRACE_MIN_SECONDS);
+        assert!(was_clamped);
+
+        let too_big = SupervisorCfg {
+            enabled: true,
+            dps: DpsCfg::default(),
+            drain_interval_seconds: default_drain_interval_seconds(),
+            shutdown_grace_seconds: 99_999,
+        };
+        let (clamped, was_clamped) = too_big.clamped_shutdown_grace_seconds();
+        assert_eq!(clamped, SHUTDOWN_GRACE_MAX_SECONDS);
+        assert!(was_clamped);
+
+        let (def, def_clamped) = SupervisorCfg::default().clamped_shutdown_grace_seconds();
+        assert_eq!(def, default_shutdown_grace_seconds());
+        assert!(!def_clamped);
     }
 }

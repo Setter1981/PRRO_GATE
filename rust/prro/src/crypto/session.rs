@@ -34,7 +34,9 @@ pub struct SealedMaterial<'a> {
 impl std::fmt::Debug for SealedMaterial<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SealedMaterial")
-            .field("operator_id", &self.operator_id)
+            // operator_id is the cashier INN (PII) — redact, uniform with
+            // SigningSession + CryptoError (ADR-M2-5 §4d).
+            .field("operator_id", &"<redacted>")
             .field("jks_bytes", &"<redacted>")
             .field("jks_password_hex", &"<redacted>")
             .field("cred_salt", &"<redacted>")
@@ -63,7 +65,11 @@ struct SigningSessionInner {
 impl std::fmt::Debug for SigningSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SigningSession")
-            .field("operator_id", &self.inner.operator_id)
+            // operator_id is the cashier INN (PII, ADR-M2-5 §4d).  Redact:
+            // post-RS-1 the REAL INN is threaded into production sessions
+            // (the operator key loader), so `?session` in any tracing event
+            // would otherwise leak it to process logs.
+            .field("operator_id", &"<redacted>")
             .field("param_d", &"<redacted>")
             .field(
                 "cert_der",
@@ -109,6 +115,46 @@ impl SigningSession {
                 cert_der,
             }),
         }
+    }
+
+    /// Production constructor — assemble a `SigningSession` from a key the
+    /// caller already obtained via
+    /// [`prro_crypto::interop::prro::containers::extract_private_key`].
+    ///
+    /// This is the M5 crypto-wiring path used by the runtime
+    /// `OperatorKeyLoader` (RS-1 Piece 3).  It sits alongside
+    /// [`unseal_jks`] but takes the extracted key directly — sealing the
+    /// JKS password at-rest is a separate hardening task (tracked
+    /// follow-up), deliberately NOT done here.
+    ///
+    /// Embeds the SIGNING cert (`KeyUsage=digitalSignature`) via
+    /// [`ExtractedKey::signing_cert`] — NEVER `certs[0]`, which is often
+    /// the key-agreement (encryption) cert and would make DPS reject the
+    /// signature `CryptBadSign` (live-confirmed 2026-05-29).  Moves the
+    /// `Zeroizing<[u8; 32]>` scalar into the session inner (no clone of the
+    /// 32 secret bytes).  `operator_id` (the cashier INN) is stored
+    /// verbatim — no placeholder, no fallback.
+    pub fn from_extracted(
+        operator_id: String,
+        extracted: prro_crypto::interop::prro::containers::ExtractedKey,
+    ) -> Result<Self, CryptoError> {
+        let cert_der = extracted
+            .signing_cert()
+            .ok_or_else(|| CryptoError::JksUnseal {
+                operator_id: operator_id.clone(),
+                reason: SealKind::MissingSigningCert,
+            })?
+            .to_vec();
+        // Move the still-`Zeroizing<[u8; 32]>` scalar into the session
+        // inner — no clone of the 32 secret bytes (mirrors `unseal_jks`).
+        let param_d: Zeroizing<[u8; 32]> = extracted.param_d;
+        Ok(Self {
+            inner: Arc::new(SigningSessionInner {
+                operator_id,
+                param_d,
+                cert_der,
+            }),
+        })
     }
 }
 
@@ -212,7 +258,9 @@ pub fn unseal_jks(sealed: SealedMaterial<'_>) -> Result<SigningSession, CryptoEr
     //    "first cert is the signing cert" assumption was wrong).
     let cert_der = extracted
         .signing_cert()
-        .ok_or_else(|| make_err(SealKind::KeyExtractionFailed))?
+        // Same no-signing-cert classification as `from_extracted`: the
+        // container decrypted/parsed fine, it just carries no signing cert.
+        .ok_or_else(|| make_err(SealKind::MissingSigningCert))?
         .to_vec();
 
     // Move the still-Zeroizing<[u8; 32]> into the session inner.  No
@@ -233,5 +281,96 @@ fn hex_digit(c: u8) -> Option<u8> {
         b'a'..=b'f' => Some(c - b'a' + 10),
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod from_extracted_tests {
+    use super::*;
+    use prro_crypto::interop::prro::containers::{ContainerFormat, ExtractedKey};
+
+    /// RS-1 Piece 2 — the operator_id (cashier INN) and the selected
+    /// signing cert are threaded verbatim into the session.  Operator
+    /// requirement: a test must prove operator_id reaches the
+    /// SigningSession (no placeholder / no fallback).
+    /// A minimal DER blob carrying a KeyUsage extension (OID 2.5.29.15)
+    /// asserting `digitalSignature` (BIT STRING `03 02 06 C0` =
+    /// digitalSignature+nonRepudiation) — enough for the STRICT
+    /// `signing_cert()` scanner to select it.  Mirrors the
+    /// `cert_with_keyusage` helper in
+    /// prro_crypto/tests/signing_cert_selection.rs.
+    fn sig_cert_der() -> Vec<u8> {
+        vec![
+            0x30, 0x00, // dummy outer SEQUENCE header (scanner ignores)
+            0x06, 0x03, 0x55, 0x1D, 0x0F, // OID 2.5.29.15 (KeyUsage)
+            0x04, 0x04, // extnValue OCTET STRING, len 4
+            0x03, 0x02, 0x06, 0xC0, // BIT STRING: digitalSignature + nonRepudiation
+        ]
+    }
+
+    #[test]
+    fn from_extracted_threads_operator_id_and_cert() {
+        let cert = sig_cert_der();
+        let ek = ExtractedKey {
+            format: ContainerFormat::Jks,
+            param_d: Zeroizing::new([7u8; 32]),
+            // Carries a digitalSignature KeyUsage so the STRICT signing_cert()
+            // selects it (RS-1 F1: there is no certs[0] fallback).
+            certs: vec![cert.clone()],
+        };
+        let s = SigningSession::from_extracted("INN-1234567890".to_string(), ek)
+            .expect("from_extracted must succeed with a signing cert present");
+        assert_eq!(
+            s.operator_id(),
+            "INN-1234567890",
+            "operator_id must reach the SigningSession verbatim",
+        );
+        assert_eq!(s.cert_der(), cert.as_slice());
+    }
+
+    /// RS-1 Piece 2 — an extracted key with NO certificate fails closed
+    /// (no signing cert to embed → never silently sign with nothing).
+    #[test]
+    fn from_extracted_no_cert_fails_closed() {
+        let ek = ExtractedKey {
+            format: ContainerFormat::Jks,
+            param_d: Zeroizing::new([0u8; 32]),
+            certs: vec![],
+        };
+        let err = SigningSession::from_extracted("INN-x".to_string(), ek)
+            .expect_err("no cert must fail closed");
+        assert!(matches!(
+            err,
+            CryptoError::JksUnseal {
+                reason: SealKind::MissingSigningCert,
+                ..
+            }
+        ));
+    }
+
+    /// RS-1 F1 (2026-05-30) — certs PRESENT but none declares
+    /// `digitalSignature` → fail closed (`MissingSigningCert`), NOT a
+    /// certs[0] fallback that would embed an encryption cert and re-open the
+    /// `CryptBadSign` DPS-rejection class.
+    #[test]
+    fn from_extracted_non_signing_cert_fails_closed() {
+        // KeyUsage = keyAgreement (encryption), BIT STRING `03 02 03 08`.
+        let enc_cert = vec![
+            0x30, 0x00, 0x06, 0x03, 0x55, 0x1D, 0x0F, 0x04, 0x04, 0x03, 0x02, 0x03, 0x08,
+        ];
+        let ek = ExtractedKey {
+            format: ContainerFormat::Jks,
+            param_d: Zeroizing::new([0u8; 32]),
+            certs: vec![enc_cert],
+        };
+        let err = SigningSession::from_extracted("INN-y".to_string(), ek)
+            .expect_err("a non-signing (encryption) cert must fail closed, not embed certs[0]");
+        assert!(matches!(
+            err,
+            CryptoError::JksUnseal {
+                reason: SealKind::MissingSigningCert,
+                ..
+            }
+        ));
     }
 }

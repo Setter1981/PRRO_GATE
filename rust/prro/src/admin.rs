@@ -398,9 +398,12 @@ pub struct AddOperatorInput {
 
 impl std::fmt::Debug for AddOperatorInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // operator_id is the cashier INN (PII) and name may identify the
+        // cashier — both redacted (RS-1 F2, 2026-05-30): only audit_log may
+        // carry the unredacted values, never a Debug/trace sink.
         f.debug_struct("AddOperatorInput")
-            .field("operator_id", &self.operator_id)
-            .field("name", &self.name)
+            .field("operator_id", &"<redacted>")
+            .field("name", &"<redacted>")
             .field("key_path", &self.key_path)
             .field("fiscal_number", &self.fiscal_number)
             .field("password", &"<redacted; len omitted>")

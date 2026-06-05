@@ -23,7 +23,15 @@ use sqlx::SqlitePool;
 use thiserror::Error;
 
 /// Snapshot of an `operators` row.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` is **hand-written, not derived (RS-1 F2, 2026-05-30):** the row
+/// carries `operator_id` (cashier INN = PII), `name` (cashier identity), and
+/// `key_pass_enc` (the key password under reversible [`Coding`] encoding).
+/// Only `audit_log` may carry those values — a `tracing::debug!(?row)` must
+/// never leak the INN or recoverable password material.
+///
+/// [`Coding`]: crate::runtime::coding::Coding
+#[derive(Clone, PartialEq)]
 pub struct OperatorRow {
     pub id: i64,
     pub operator_id: String,
@@ -35,15 +43,45 @@ pub struct OperatorRow {
     pub created_at: String,
 }
 
+impl std::fmt::Debug for OperatorRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperatorRow")
+            .field("id", &self.id)
+            .field("operator_id", &"<redacted>")
+            .field("fiscal_number", &self.fiscal_number)
+            .field("name", &"<redacted>")
+            .field("key_path", &self.key_path)
+            .field("key_pass_enc", &"<redacted>")
+            .field("is_active", &self.is_active)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
 /// Payload for [`insert`].  `is_active` is intentionally not exposed —
 /// every fresh row starts active; rotation is a future-PR concern.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written for the same reason as [`OperatorRow`] (redacts the
+/// INN, cashier name, and reversibly-encoded password).
+#[derive(Clone)]
 pub struct NewOperator {
     pub operator_id: String,
     pub fiscal_number: String,
     pub name: String,
     pub key_path: String,
     pub key_pass_enc: Vec<u8>,
+}
+
+impl std::fmt::Debug for NewOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewOperator")
+            .field("operator_id", &"<redacted>")
+            .field("fiscal_number", &self.fiscal_number)
+            .field("name", &"<redacted>")
+            .field("key_path", &self.key_path)
+            .field("key_pass_enc", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Typed errors surfaced by the repository.

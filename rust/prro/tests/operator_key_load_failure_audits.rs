@@ -42,6 +42,7 @@ struct FileNotFoundLoader;
 impl OperatorKeyLoader for FileNotFoundLoader {
     async fn load(
         &self,
+        _operator_id: &str,
         key_path: &Path,
         _password: &[u8],
     ) -> Result<SigningContext, KeyLoadFailure> {
@@ -56,6 +57,7 @@ struct WrongPasswordLoader;
 impl OperatorKeyLoader for WrongPasswordLoader {
     async fn load(
         &self,
+        _operator_id: &str,
         key_path: &Path,
         _password: &[u8],
     ) -> Result<SigningContext, KeyLoadFailure> {

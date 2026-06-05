@@ -485,6 +485,7 @@ impl App {
         &self,
         deps: Option<&crate::services::reconciliation::ReconciliationRuntime<'_>>,
     ) -> Result<ReconciliationSummary, BootError> {
+        use crate::db::models::enums::NodeMode;
         use crate::db::repositories::fiscal_number_config;
         use crate::services::reconciliation::boot_phase::{self, BranchOutcome};
 
@@ -567,10 +568,37 @@ impl App {
                     source: other,
                 },
             })?;
-            if let BranchOutcome::OfflineRefusal { .. } = outcome {
-                return Err(BootError::OfflineModeRefusal {
-                    fiscal_number: fn_cfg.fiscal_number.clone(),
-                });
+            // F7 (RS-1 multi-FN spine-brick fix, 2026-05-30).  An FN in
+            // `GoingOnline` at boot surfaces as `OfflineRefusal` —
+            // boot_phase's deliberate "defer this FN to the W9 drain
+            // loop" signal (see boot_phase branch (d)).  Under the
+            // ctx-free boot-gate (`deps == None`, e.g. `App::boot`)
+            // there is no runtime drain loop, so this stays fail-closed:
+            // refuse boot (legacy M3a contract).  Under the RS-1 runtime
+            // path (`deps == Some`, the supervisor's reconcile-once) the
+            // drain loop is spawned right after this pass and OWNS the
+            // GoingOnline FN's recovery — so failing the whole reconcile
+            // on the first such FN would deny the runtime to ALL the
+            // other (healthy) FNs and is self-perpetuating across
+            // restarts.  Instead: record it as a deferred refusal
+            // (`branch_d_offline_refusal`, the field reserved for exactly
+            // this non-fail-fast variant) and CONTINUE.  Narrowed to
+            // `GoingOnline` (the only OfflineRefusal trigger today) so a
+            // future non-GoingOnline refusal is not silently swallowed.
+            if let BranchOutcome::OfflineRefusal { observed_mode } = &outcome {
+                let runtime_defers_to_drain =
+                    deps.is_some() && matches!(observed_mode, NodeMode::GoingOnline);
+                if !runtime_defers_to_drain {
+                    return Err(BootError::OfflineModeRefusal {
+                        fiscal_number: fn_cfg.fiscal_number.clone(),
+                    });
+                }
+                tracing::info!(
+                    fiscal_number = %fn_cfg.fiscal_number,
+                    observed_mode = observed_mode.as_str(),
+                    "boot reconcile: GoingOnline FN deferred to drain loop \
+                     (not fatal under the RS-1 runtime supervisor)"
+                );
             }
             summary.record(&outcome);
         }

@@ -257,6 +257,17 @@ pub fn det_signing_ctx() -> SigningContext {
     }
 }
 
+/// Like [`det_signing_ctx`] but with a caller-supplied `operator_id`, so
+/// a loader/registry test can assert the id threads through into the
+/// `SigningSession` (RS-1 `OperatorKeyLoader` trait extension).
+pub fn det_signing_ctx_for(operator_id: &str) -> SigningContext {
+    SigningContext {
+        provider: Arc::new(DetCrypto) as Arc<dyn CryptoProvider>,
+        session: SigningSession::new_for_test(operator_id.to_string(), [0u8; 32], vec![]),
+        profile: prro_crypto::cms::profile::CmsProfile::Dstu4145WithGost34311Pb,
+    }
+}
+
 /// Minimal `CheckAck` builder used by happy-path fixtures.
 pub fn ack(id: &str) -> CheckAck {
     CheckAck {
