@@ -48,7 +48,7 @@ An external read-only architecture review found the v1 draft directionally right
 4. **Response DTO + replay matrix** — edit `dto.rs::CanonicalResponse` (add `request_id`, typed-error envelope, optional `fiscal_id`, optional `report_xml` Q4); implement the §0.1 High-2 replay matrix (reads `fiscal_documents`).
 5. **Per-listener axum servers + auth middleware + named-handle supervisor refactor** — `serve()` real router per `RestHttp` listener + `with_graceful_shutdown`; **auth middleware (Q2: loopback→none, non-loopback→bearer from env/secret-ref)**; generalize `supervise_until_shutdown` to a named task set (re-review F1 seam).
 6. **`GET /v1/status/{fn}` read-only endpoint (Q1)** — node mode + shift state + last local/fiscal number + offline counters/pool, **pure reads, zero write-path side effects**; served on the same per-listener router.
-7. **Tests** — convert units (non-identity, payment_methods-backed incl. missing/inactive→typed error, ZReport ledger), handler integration (Created/Replay-matrix/Conflict/command-policy/NotImplemented-not-silent), status-endpoint read-only assertions, auth (loopback-no-token / non-loopback-bearer-required), lifecycle (graceful + axum-Err→loop-death), invariant (tx-released-before-seam), test-support payload validator (all 3 shapes), parity un-`#[ignore]`.
+7. **Tests** — convert units (non-identity, payment_methods-backed incl. missing/inactive→typed error, ZReport ledger), handler integration (Created/Replay-matrix/Conflict/command-policy/NotImplemented-not-silent), status-endpoint read-only assertions (incl. `{fn} == listener_fn` enforcement, CF1), auth/bind (loopback `RestHttp` accepted / **non-loopback `RestHttp` fails startup** — D2 loopback-only, no bearer day-1), lifecycle (graceful + axum-Err→loop-death), invariant (tx-released-before-seam), test-support payload validator (all 3 shapes), parity **invert** (M5).
 
 **Supersedes:** §1 non-goals (status endpoint may be in-scope per Q1), §3.3 router (per-listener bind, not single-bind-all-FNs), §4 (IngressCfg→listeners; 2→3→named handle set), §5 (drop IngressCfg.listen row; add `dto.rs` + `convert.rs` payment_methods + command-policy rows), §9 decomposition, §10 (§10.1/§10.2 resolved; §10.4/§10.7 → §0.2 Q1; new §0.2 Q2-Q4). §2 (investigation), §6 (invariants), §7 (edges), §8 (test plan) remain valid and are extended by §0.1. **Correction to §2.7:** the `Protocol` enum is the full six-variant set above.
 
@@ -186,7 +186,7 @@ POST /v1/ingress/{source}  (axum)
         (ZReport: ledger READ for sell_count/return_count — outside the write-tx)
         → overwrite canonical.payload_json with the stage_sign-ready JSON
         → recompute payload_sha256_canonical over the converted shape (see §7)
-  → mint request_id = uuid v4 → [u8;16]
+  → mint request_id = uuid v7 → [u8;16]   (§0.4 H6 — v7, NOT v4)
   → ingress_inbox::insert(NewInboxEntry{..protocol = source→Protocol..})   ← SHORT RESERVED-tx
         ├─ Conflict → 409 typed (idem_key reused with different payload)
         ├─ Replay   → 200 idempotent (return prior outcome; do NOT re-fiscalize)
@@ -280,7 +280,7 @@ RS-3 swaps `UnimplementedWritePath` for the real entry. The seam is the single i
 
 1. **`Protocol::WebCheck` variant vs reuse `Maria304`?** The shim emits the same canonical contract; reusing `Maria304` is zero-migration but loses audit provenance (you can't tell shim from driver in the inbox). Adding `WebCheck` is a new allowed enum string in `ingress_inbox.protocol` (schema-adjacent — confirm any CHECK constraint / migration). **Recommend: add `WebCheck`** for audit clarity. (operator call)
 2. **`payload_sha256_canonical` scope after conversion** (§7) — recompute over the converted shape (recommended) vs dual-hash. Correctness fork.
-3. **`request_id` mint** — uuid v4 random (idempotency is carried by `idem_key`, not `request_id`, so no determinism requirement). Confirm.
+3. **`request_id` mint** — uuid **v7** (§0.4 H6 supersedes the v4 note; idempotency is carried by `idem_key`, not `request_id`, so no determinism requirement — v7's time-ordering is a free win for the DB-stored id). Confirm.
 4. **`GET /v1/status/{fn}`** — the WebCheck shim's Initialization/GetCurrentStatus may need a read-only status endpoint on pilot day-1 (`webcheck-shim-ingress-spec.md` §6). In RS-2 scope or RS-later? (operator call)
 5. **`IngressCfg` gating** — separate `ingress.enabled` flag vs always-on when `supervisor.enabled`. Recommend a distinct flag (lets supervisor run maintenance-only without opening a listener).
 6. **Router A vs B** — defaulting to A (§3.3); confirm.
