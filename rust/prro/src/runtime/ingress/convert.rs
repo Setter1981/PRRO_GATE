@@ -171,9 +171,23 @@ pub enum ConvertError {
     /// shift; closing when none is open is a state-machine breach.
     #[error(
         "fn {fiscal_number}: ZReport/ShiftClose with no open shift \
-         (node_state.current_shift_id is None)"
+         (no node_state row, or current_shift_id is None)"
     )]
     NoOpenShiftForZReport { fiscal_number: String },
+
+    /// A stored issued-receipt payment carries a negative `sum_kop`.
+    /// Impossible on the normal pipeline (piece-2a maps from a `u64`
+    /// `amount_kopecks`), so this signals ledger corruption — halt the Z
+    /// rather than emit a negative-turnover fiscal report.
+    #[error(
+        "negative stored payment sum {sum_kop} (type_code {type_code}, name {name:?}) \
+         — ledger corruption"
+    )]
+    NegativeStoredPaymentSum {
+        type_code: String,
+        name: String,
+        sum_kop: i64,
+    },
 
     /// A Z-report per-payment-form turnover sum overflows i64.
     #[error("ZReport turnover sum overflow (type_code {type_code}, name {name:?})")]
@@ -270,12 +284,15 @@ struct ZReportPaymentOut {
 
 /// Minimal view of a stored (converted) `CheckJson` — ONLY the payments
 /// the Z aggregates.  NOT `deny_unknown_fields`: it deliberately ignores
-/// `items` + every other field.  A parse failure surfaces as a typed
-/// error (a corrupt issued-receipt payload HALTS the Z — deliberately
-/// stricter than the Python parity, which silently skips a bad row).
+/// `items` + every other field.  But `payments` is **REQUIRED** (no
+/// `#[serde(default)]`): piece-2a always emits a `payments` key, so a
+/// stored issued-receipt payload that lacks it is corrupt/wrong-shape —
+/// fail closed with a typed parse error rather than silently treat it as
+/// zero-turnover (which would underreport the Z).  A parse failure HALTS
+/// the Z (deliberately stricter than the Python parity, which silently
+/// skips a bad row).
 #[derive(Deserialize)]
 struct StoredCheckPayments {
-    #[serde(default)]
     payments: Vec<StoredPayment>,
 }
 
@@ -314,6 +331,13 @@ fn aggregate_zreport(receipts: &[(DocType, String)]) -> Result<ZReportOut, Conve
         let parsed: StoredCheckPayments =
             serde_json::from_str(payload_json).map_err(ConvertError::Serialise)?;
         for p in parsed.payments {
+            if p.sum_kop < 0 {
+                return Err(ConvertError::NegativeStoredPaymentSum {
+                    type_code: p.type_code,
+                    name: p.name,
+                    sum_kop: p.sum_kop,
+                });
+            }
             let key = (p.type_code, p.name);
             let entry = groups.entry(key.clone()).or_insert((0, 0));
             let target = if is_sell { &mut entry.0 } else { &mut entry.1 };
@@ -838,6 +862,29 @@ mod tests {
     #[test]
     fn aggregate_malformed_stored_payload_is_typed_error() {
         let receipts = vec![(DocType::Sell, "{not json".to_string())];
+        assert!(matches!(
+            aggregate_zreport(&receipts),
+            Err(ConvertError::Serialise(_))
+        ));
+    }
+
+    #[test]
+    fn aggregate_negative_stored_payment_sum_is_typed_error() {
+        // Impossible on the normal pipeline (sum_kop maps from a u64) →
+        // a negative stored sum signals ledger corruption; halt the Z.
+        let receipts = vec![(DocType::Sell, stored_check(&[pay("Готівка", -5, "0")]))];
+        assert!(matches!(
+            aggregate_zreport(&receipts),
+            Err(ConvertError::NegativeStoredPaymentSum { sum_kop: -5, .. })
+        ));
+    }
+
+    #[test]
+    fn aggregate_missing_payments_field_is_typed_error() {
+        // A stored payload lacking the `payments` key (corrupt / wrong
+        // shape) must HALT the Z, not be silently treated as zero
+        // turnover (which would underreport). `payments` is required.
+        let receipts = vec![(DocType::Sell, r#"{"items":[]}"#.to_string())];
         assert!(matches!(
             aggregate_zreport(&receipts),
             Err(ConvertError::Serialise(_))
