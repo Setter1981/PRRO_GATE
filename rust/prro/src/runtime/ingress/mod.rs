@@ -14,6 +14,7 @@
 //!   - **W7** (TBD) plumbs the per-FN supervisor channel that
 //!     receives mapped commands from the handler.
 
+pub mod convert;
 pub mod dto;
 pub mod policy;
 
