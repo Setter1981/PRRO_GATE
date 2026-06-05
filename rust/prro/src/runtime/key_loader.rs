@@ -64,8 +64,8 @@ impl OperatorKeyLoader for JksOperatorKeyLoader {
         let password_str = std::str::from_utf8(password)
             .map_err(|_| KeyLoadFailure::Other("key password is not valid UTF-8".to_string()))?;
 
-        let extracted = extract_private_key(&data, password_str)
-            .map_err(|e| map_container_err(e, key_path))?;
+        let extracted =
+            extract_private_key(&data, password_str).map_err(|e| map_container_err(e, key_path))?;
 
         // `from_extracted` selects the SIGNING cert (KeyUsage=
         // digitalSignature — NOT certs[0], the -14 `CryptBadSign` trap)
@@ -74,8 +74,8 @@ impl OperatorKeyLoader for JksOperatorKeyLoader {
         // Use a FIXED, PII-free message: the `CryptoError` Debug embeds the
         // `operator_id` (cashier INN), which must not land in a
         // `KeyLoadFailure` string a future consumer might log/Display.
-        let session = SigningSession::from_extracted(operator_id.to_string(), extracted)
-            .map_err(|_| {
+        let session =
+            SigningSession::from_extracted(operator_id.to_string(), extracted).map_err(|_| {
                 KeyLoadFailure::Other("no signing certificate in key container".to_string())
             })?;
 

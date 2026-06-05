@@ -422,7 +422,9 @@ mod tests {
         assert!(!cfg.supervisor.enabled, "supervisor disabled by default");
         assert!(cfg.supervisor.dps.endpoint.is_none());
         assert_eq!(
-            cfg.supervisor.require_dps_endpoint().expect("disabled = Ok"),
+            cfg.supervisor
+                .require_dps_endpoint()
+                .expect("disabled = Ok"),
             None,
             "disabled supervisor needs no endpoint",
         );

@@ -70,9 +70,7 @@ where
     let dps: Arc<dyn DpsChannel> = Arc::new(
         GrpcDpsChannel::connect(&endpoint, Duration::from_secs(timeout_secs))
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("supervisor: DPS connect to {endpoint} failed: {e:?}")
-            })?,
+            .map_err(|e| anyhow::anyhow!("supervisor: DPS connect to {endpoint} failed: {e:?}"))?,
     );
 
     // Build the per-FN bindings (operator EDS keys) from the secure DB.

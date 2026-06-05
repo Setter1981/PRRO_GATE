@@ -102,8 +102,11 @@ impl OperatorKeyLoader for FixtureLoader {
         _password: &[u8],
     ) -> Result<SigningContext, KeyLoadFailure> {
         let mut ctx = common::det_signing_ctx_for(operator_id);
-        ctx.session =
-            SigningSession::new_for_test(operator_id.to_string(), [7u8; 32], FIXTURE_CERT_DER.to_vec());
+        ctx.session = SigningSession::new_for_test(
+            operator_id.to_string(),
+            [7u8; 32],
+            FIXTURE_CERT_DER.to_vec(),
+        );
         Ok(ctx)
     }
 }
@@ -125,7 +128,12 @@ fn fn_config(fn_id: &str) -> fn_cfg::NewFnConfig {
     }
 }
 
-fn new_op(operator_id: &str, fn_id: &str, key_path: &str, password: &[u8]) -> ops_repo::NewOperator {
+fn new_op(
+    operator_id: &str,
+    fn_id: &str,
+    key_path: &str,
+    password: &[u8],
+) -> ops_repo::NewOperator {
     ops_repo::NewOperator {
         operator_id: operator_id.into(),
         fiscal_number: fn_id.into(),
@@ -215,9 +223,15 @@ async fn supervisor_does_not_brick_when_one_fn_is_going_online() {
     )
     .await
     .expect("seed OP-B");
-    node_state::upsert_initial(app.db(), "4000000001", NodeMode::GoingOnline, ShiftState::Closed, 1)
-        .await
-        .expect("seed FN-A GOING_ONLINE");
+    node_state::upsert_initial(
+        app.db(),
+        "4000000001",
+        NodeMode::GoingOnline,
+        ShiftState::Closed,
+        1,
+    )
+    .await
+    .expect("seed FN-A GOING_ONLINE");
 
     let dps: Arc<dyn DpsChannel> = Arc::new(common::StubDpsChannel::new(Ok(common::ack("t"))));
     let registry = Arc::new(
@@ -272,9 +286,15 @@ async fn reconcile_defers_going_online_under_runtime_but_fails_closed_ctx_free()
     fn_cfg::insert(app.db(), &fn_config("4000000001"))
         .await
         .expect("seed FN config");
-    node_state::upsert_initial(app.db(), "4000000001", NodeMode::GoingOnline, ShiftState::Closed, 1)
-        .await
-        .expect("seed GOING_ONLINE");
+    node_state::upsert_initial(
+        app.db(),
+        "4000000001",
+        NodeMode::GoingOnline,
+        ShiftState::Closed,
+        1,
+    )
+    .await
+    .expect("seed GOING_ONLINE");
 
     // ctx-free (deps = None): fail-closed — legacy M3a contract preserved.
     let err = app
@@ -336,7 +356,13 @@ async fn supervisor_fails_and_audits_when_a_loop_dies_before_shutdown() {
 
     let res = tokio::time::timeout(
         Duration::from_secs(5),
-        supervisor::supervise_until_shutdown(app, shutdown, shutdown_tx, drain_handle, probe_handle),
+        supervisor::supervise_until_shutdown(
+            app,
+            shutdown,
+            shutdown_tx,
+            drain_handle,
+            probe_handle,
+        ),
     )
     .await
     .expect("supervise must not hang");
