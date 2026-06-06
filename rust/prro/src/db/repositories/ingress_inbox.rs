@@ -57,9 +57,34 @@ pub enum InboxInsertOutcome {
     Created(InboxRow),
     Replay(InboxRow),
     Conflict {
+        /// The PERSISTED row's `request_id` (the original submission's id).
+        /// The conflict response references THIS id (not the rejected
+        /// submission's freshly-minted one), and the audit records both
+        /// identities + both hashes (RS-2 piece-4b/5a).
+        existing_request_id: [u8; 16],
         existing_payload_hash: [u8; 32],
         submitted_payload_hash: [u8; 32],
     },
+}
+
+/// RS-2 piece-5a — release a NOT-yet-durable inbox row after a seam
+/// fiscalization FAILURE (currently only `FiscalError::NotImplemented`,
+/// pre-RS-3).  **GUARDED `WHERE status = 'NEW'`:** it can NEVER delete a
+/// `PROCESSING` / `DONE` / terminal row — a future RS-3 error that fires
+/// AFTER the row advances must NOT reach this and must NOT remove a
+/// durable row.  Releasing the NEW gate lets a retry of a failed-pre-
+/// durable request re-attempt (`Created → seam` again) deterministically
+/// instead of becoming a stuck `IN_PROGRESS` replay.  Returns the rows
+/// deleted (0 if the row already advanced — benign).
+pub async fn delete_new_by_request_id(
+    pool: &SqlitePool,
+    request_id: &[u8; 16],
+) -> sqlx::Result<u64> {
+    let res = sqlx::query("DELETE FROM ingress_inbox WHERE request_id = ? AND status = 'NEW'")
+        .bind(&request_id[..])
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
 }
 
 pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<InboxInsertOutcome> {
@@ -112,6 +137,7 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
                     }));
                 } else {
                     return Ok(InboxInsertOutcome::Conflict {
+                        existing_request_id: request_id,
                         existing_payload_hash: existing_hash,
                         submitted_payload_hash: n.payload_sha256_canonical,
                     });

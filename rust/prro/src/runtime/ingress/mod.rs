@@ -16,6 +16,7 @@
 
 pub mod convert;
 pub mod dto;
+pub mod handler;
 pub mod policy;
 pub mod replay;
 pub mod seam;

@@ -4,7 +4,7 @@ use prro::db::{
     repositories::{
         fiscal_number_config as fn_repo,
         fiscal_number_config::NewFnConfig,
-        ingress_inbox::{insert, InboxInsertOutcome, NewInboxEntry},
+        ingress_inbox::{delete_new_by_request_id, insert, InboxInsertOutcome, NewInboxEntry},
     },
 };
 
@@ -102,20 +102,31 @@ async fn second_with_same_hash_replays() {
 #[tokio::test]
 async fn second_with_different_hash_conflicts() {
     let (pool, fn_id) = fresh_with_fn().await;
-    let _ = insert(&pool, &entry(&fn_id, "k1", [1u8; 32], r#"{"x":1}"#))
-        .await
-        .unwrap();
+    let first = entry(&fn_id, "k1", [1u8; 32], r#"{"x":1}"#);
+    let persisted_request_id = first.request_id;
+    let _ = insert(&pool, &first).await.unwrap();
 
     // Same idem_key but different payload hash — must surface as Conflict
-    // with both hashes so the caller can audit; never a silent replay.
-    let outcome = insert(&pool, &entry(&fn_id, "k1", [2u8; 32], r#"{"x":2}"#))
-        .await
-        .unwrap();
+    // with both hashes AND the PERSISTED row's request identity so the
+    // caller can build a config_drift response keyed to the durable row
+    // (RS-2 piece-4b/5a) and audit both ids; never a silent replay.
+    let second = entry(&fn_id, "k1", [2u8; 32], r#"{"x":2}"#);
+    let submitted_request_id = second.request_id;
+    let outcome = insert(&pool, &second).await.unwrap();
     match outcome {
         InboxInsertOutcome::Conflict {
+            existing_request_id,
             existing_payload_hash,
             submitted_payload_hash,
         } => {
+            assert_eq!(
+                existing_request_id, persisted_request_id,
+                "Conflict must report the PERSISTED (first) row's request_id"
+            );
+            assert_ne!(
+                existing_request_id, submitted_request_id,
+                "the persisted id must differ from the late submission's id"
+            );
             assert_eq!(existing_payload_hash, [1u8; 32]);
             assert_eq!(submitted_payload_hash, [2u8; 32]);
         }
@@ -169,4 +180,49 @@ async fn different_idempotency_keys_create_separate_rows() {
             .await
             .unwrap();
     assert_eq!(count, 2);
+}
+
+/// RS-2 piece-5a — `delete_new_by_request_id` releases exactly the NEW
+/// row (rows_affected pinned), and is idempotent once the row is gone.
+#[tokio::test]
+async fn delete_new_by_request_id_pins_rows_affected() {
+    let (pool, fn_id) = fresh_with_fn().await;
+    let e = entry(&fn_id, "k-del", [1u8; 32], r#"{"x":1}"#);
+    let rid = e.request_id;
+    assert!(matches!(
+        insert(&pool, &e).await.unwrap(),
+        InboxInsertOutcome::Created(_)
+    ));
+
+    let n = delete_new_by_request_id(&pool, &rid).await.unwrap();
+    assert_eq!(n, 1, "a NEW row must be released exactly once");
+
+    let n2 = delete_new_by_request_id(&pool, &rid).await.unwrap();
+    assert_eq!(n2, 0, "second delete affects no rows (idempotent release)");
+}
+
+/// The `WHERE status = 'NEW'` guard means an ADVANCED (durable) row is
+/// NEVER dropped — a future RS-3 error firing after the row leaves NEW
+/// must not be able to delete it.
+#[tokio::test]
+async fn delete_new_by_request_id_never_drops_advanced_row() {
+    let (pool, fn_id) = fresh_with_fn().await;
+    let e = entry(&fn_id, "k-adv", [2u8; 32], r#"{"x":1}"#);
+    let rid = e.request_id;
+    insert(&pool, &e).await.unwrap();
+    // RS-3 would advance the row out of NEW inside fiscalize.
+    sqlx::query("UPDATE ingress_inbox SET status = 'PROCESSING' WHERE request_id = ?")
+        .bind(&rid[..])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let n = delete_new_by_request_id(&pool, &rid).await.unwrap();
+    assert_eq!(n, 0, "guarded delete must never drop a PROCESSING row");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingress_inbox WHERE request_id = ?")
+        .bind(&rid[..])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "the durable row must survive");
 }
