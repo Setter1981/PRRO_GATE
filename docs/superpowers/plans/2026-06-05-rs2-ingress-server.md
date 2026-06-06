@@ -131,6 +131,13 @@ piece-4a made the gateway response `fiscal_id`/`fiscal_ts` `Option` (honest: off
 4. add a dispatcher/classify test so the offline response resolves to accepted-offline, not `Transport(json decode)` or `SoftBlock`.
 The pilot WebCheck shim (.NET, reads JSON) handles `null` natively, so nothing breaks today; the gateway keeps the honest `Option` contract.
 
+### §0.4 piece-4b review carry-forward (2026-06-06 — piece-5/RS-3 obligations)
+
+piece-4b (replay resolver, commit `849b16c`) ACCEPTed after fail-closed hardening (Ack-without-`server_fiscal_no` → `INBOX_LEDGER_DRIFT`; SELL/RETURN-missing-total → drift; `fiscal_ts` from `first_kvt1_at`, since `server_fiscal_date` is never written). Internal senior review surfaced obligations for **piece-5 / RS-3** (not piece-4b defects):
+1. **InProgress → retryable HTTP.** piece-5 must map `ReplayResolution::InProgress` to a retryable status (202/425), and the WebCheck shim must LOOP on `error_code == "IN_PROGRESS"` (distinct from a hard failure), not treat it as terminal.
+2. **Audit the Conflict hashes.** `ingress_inbox::insert` returns both `existing_payload_hash` + `submitted_payload_hash` on `Conflict`; piece-5 must AUDIT them (not only echo `config_drift=true`) so a genuine tampering divergence is forensically recoverable.
+3. **`fiscal_ts` parity.** RS-3's `seam::FiscalOutcome.fiscal_ts` MUST also source `first_kvt1_at` (or the DPS stamp), so the FIRST-pass response and a later REPLAY response for the same receipt carry the SAME `fiscal_ts`.
+
 ---
 
 ## 0.6 — piece-2b design (ZReport / ShiftClose ledger aggregation) — PRE-IMPLEMENTATION
