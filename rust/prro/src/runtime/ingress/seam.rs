@@ -30,6 +30,7 @@
 use crate::db::models::enums::DocState;
 use crate::db::repositories::ingress_inbox::InboxRow;
 use async_trait::async_trait;
+use thiserror::Error;
 
 /// What fiscalizing an inbox-accepted receipt produced — enough for the
 /// handler to render the response envelope.
@@ -53,12 +54,13 @@ pub struct FiscalOutcome {
 /// Why fiscalization could not complete.  Every variant carries enough
 /// context (at minimum the `request_id`) for the handler to build a
 /// typed, non-2xx error envelope WITHOUT losing the request identity.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum FiscalError {
     /// RS-3 is not yet wired — the entrypoint is [`UnimplementedWritePath`].
     /// The handler MUST map this to a non-2xx (e.g. 501/503), NEVER a 2xx
     /// success.  Carries `request_id` so the response can still reference
     /// the submitted command.
+    #[error("write-path not yet implemented (RS-3 pending); request_id={request_id:02x?}")]
     NotImplemented { request_id: [u8; 16] },
     // RS-3 will add real failure variants (ShiftNotOpen, SignFailure,
     // DpsRejected, OfflineRefused, …), each likewise carrying request_id.
