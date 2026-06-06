@@ -355,6 +355,39 @@ pub async fn handle_command(
             // on purpose so the delete-on-error policy is re-decided.
             Err(fe) => match fe {
                 FiscalError::NotImplemented { request_id } => {
+                    // Defense-in-depth (operator review): the handler OWNS the
+                    // persisted `row`, so the destructive release keys off
+                    // `row.request_id`, NEVER the id echoed back in the seam
+                    // error.  A buggy or future seam impl returning a
+                    // MISMATCHED id must not be able to delete a DIFFERENT
+                    // submission's NEW row (the `WHERE status='NEW'` guard
+                    // blocks PROCESSING/DONE, but not wrong-identity).  The
+                    // error's `request_id` is used ONLY to detect/audit a seam
+                    // contract breach.
+                    if request_id != row.request_id {
+                        tracing::warn!(
+                            row_request_id = %request_id_to_string(&row.request_id),
+                            seam_request_id = %request_id_to_string(&request_id),
+                            "write-path seam returned a request_id that does not match the inbox \
+                             row; releasing by the row's id (defense-in-depth)"
+                        );
+                        let _ = audit_log::append(
+                            main_pool,
+                            "ingress_inbox",
+                            &rid_hex,
+                            "SEAM_REQUEST_ID_MISMATCH",
+                            Severity::Warning,
+                            None,
+                            Some(
+                                &serde_json::json!({
+                                    "row_request_id": request_id_to_string(&row.request_id),
+                                    "seam_request_id": request_id_to_string(&request_id),
+                                })
+                                .to_string(),
+                            ),
+                        )
+                        .await;
+                    }
                     // Disposition 1 — release the still-NEW row so a retry
                     // re-attempts (guarded `WHERE status='NEW'`; can never
                     // drop a durable row).  The release is LOAD-BEARING: if
@@ -364,7 +397,8 @@ pub async fn handle_command(
                     // release MUST be observable (audit), never swallowed —
                     // under the multi-FN concurrent load a transient
                     // `SQLITE_BUSY` could otherwise wedge a receipt silently.
-                    match ingress_inbox::delete_new_by_request_id(main_pool, &request_id).await {
+                    match ingress_inbox::delete_new_by_request_id(main_pool, &row.request_id).await
+                    {
                         Ok(1) => {}
                         Ok(rows) => {
                             if let Err(ae) = audit_log::append(
@@ -446,14 +480,22 @@ pub async fn handle_command(
             submitted_payload_hash,
         } => {
             let e = conflict_response(&existing_request_id);
+            let existing_hex = request_id_to_string(&existing_request_id);
+            let submitted_hex = request_id_to_string(&request_id);
+            let existing_sha = hex32(&existing_payload_hash);
+            let submitted_sha = hex32(&submitted_payload_hash);
             let audit_payload = serde_json::json!({
-                "existing_request_id": request_id_to_string(&existing_request_id),
-                "submitted_request_id": request_id_to_string(&request_id),
-                "existing_payload_sha256": hex32(&existing_payload_hash),
-                "submitted_payload_sha256": hex32(&submitted_payload_hash),
+                "existing_request_id": existing_hex,
+                "submitted_request_id": submitted_hex,
+                "existing_payload_sha256": existing_sha,
+                "submitted_payload_sha256": submitted_sha,
             })
             .to_string();
-            let _ = audit_log::append(
+            // An audit error must not mask the 409 — but it must not vanish
+            // silently either (operator review): the forensic pair
+            // (existing/submitted ids + hashes) is the whole point of the
+            // conflict record, so fall back to an out-of-band trace.
+            if let Err(ae) = audit_log::append(
                 main_pool,
                 "ingress_inbox",
                 &e.request_id,
@@ -462,7 +504,17 @@ pub async fn handle_command(
                 None,
                 Some(&audit_payload),
             )
-            .await;
+            .await
+            {
+                tracing::warn!(
+                    existing_request_id = %existing_hex,
+                    submitted_request_id = %submitted_hex,
+                    existing_payload_sha256 = %existing_sha,
+                    submitted_payload_sha256 = %submitted_sha,
+                    audit_err = %ae,
+                    "idempotency conflict audit append failed; forensic pair traced out-of-band"
+                );
+            }
             wrap_error(e)
         }
     }
@@ -590,6 +642,22 @@ mod tests {
         }
     }
 
+    /// A buggy/hostile seam that returns `NotImplemented` with a request_id
+    /// that does NOT belong to the row it was handed — exercises the
+    /// defense-in-depth that the release keys off `row.request_id`.
+    struct WrongIdNotImplemented {
+        wrong_id: [u8; 16],
+    }
+
+    #[async_trait::async_trait]
+    impl WritePathEntry for WrongIdNotImplemented {
+        async fn fiscalize(&self, _row: &InboxRow) -> Result<FiscalOutcome, FiscalError> {
+            Err(FiscalError::NotImplemented {
+                request_id: self.wrong_id,
+            })
+        }
+    }
+
     fn ack_outcome() -> FiscalOutcome {
         FiscalOutcome {
             document_id: DocumentId::new(),
@@ -635,6 +703,76 @@ mod tests {
             r2.http_status, 501,
             "retry re-attempts (501), it must NOT become a stuck 202 replay"
         );
+    }
+
+    /// Defense-in-depth: the `NotImplemented` release keys off the OWNED
+    /// `row.request_id`, NOT the id echoed in the seam error.  A buggy seam
+    /// returning a DIFFERENT (existing) request_id must release only the
+    /// current submission's row and leave the other one intact — and audit
+    /// the contract breach.
+    #[tokio::test]
+    async fn release_deletes_only_owned_row_not_wrong_seam_id() {
+        let (_d, main, secure) = fresh_pools().await;
+        // A victim NEW row from an unrelated submission.
+        let victim_id = [0x11u8; 16];
+        ingress_inbox::insert(
+            &main,
+            &NewInboxEntry {
+                request_id: victim_id,
+                fiscal_number: FN.to_string(),
+                protocol: Protocol::Rest,
+                operation_type: "SELL".to_string(),
+                idempotency_key: "victim".to_string(),
+                payload_json: "{}".to_string(),
+                payload_sha256_canonical: [0xAAu8; 32],
+                correlation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // A seam that echoes the VICTIM's id on NotImplemented.
+        let wp = WrongIdNotImplemented {
+            wrong_id: victim_id,
+        };
+        let r = handle_command(
+            &shift_open_cmd("current"),
+            FN,
+            drv(),
+            Protocol::Rest,
+            &main,
+            &secure,
+            &wp,
+        )
+        .await;
+        assert_eq!(r.http_status, 501);
+
+        let current_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ingress_inbox WHERE idempotency_key = ?")
+                .bind("current")
+                .fetch_one(&main)
+                .await
+                .unwrap();
+        assert_eq!(current_rows, 0, "the handler must release its OWN NEW row");
+
+        let victim_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ingress_inbox WHERE request_id = ?")
+                .bind(&victim_id[..])
+                .fetch_one(&main)
+                .await
+                .unwrap();
+        assert_eq!(
+            victim_rows, 1,
+            "a wrong seam request_id must NOT delete another submission's row"
+        );
+
+        let mismatch: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE event_type = 'SEAM_REQUEST_ID_MISMATCH'",
+        )
+        .fetch_one(&main)
+        .await
+        .unwrap();
+        assert_eq!(mismatch, 1, "the seam id mismatch must be audited");
     }
 
     /// ACCEPTANCE #2 — a Z (`ZReport`/`ShiftClose`) is stored as WIRE
