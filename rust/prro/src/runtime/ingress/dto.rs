@@ -76,35 +76,62 @@ pub struct CanonicalCommand {
     pub payload: ReceiptPayload,
 }
 
-/// Success response envelope.  Decoded by `maria304_driver`
-/// (`bridge/http_client.rs`) and the WebCheck shim.  `ok` is always
-/// `true` here; failures use [`CanonicalErrorResponse`] (the driver tries
-/// the success shape first, then falls back to the error shape).
+/// Success response envelope (`ok == true`).  Failures use
+/// [`CanonicalErrorResponse`].  Decoded by the WebCheck shim (the pilot
+/// ingress consumer) and by `maria304_driver` (`bridge/http_client.rs`,
+/// which reads `ok`/`fiscal_id`/`document_state`/totals and ignores
+/// unknown fields — no `deny_unknown_fields` on its mirror, so the
+/// additive fields below are wire-safe).
 ///
-/// RS-2 piece-4 additions: `request_id` + `schema_version` (the response
-/// is an outbound canonical envelope, so #7 requires `schema_version`;
-/// `request_id` echoes the server-minted id for client correlation) and
-/// the optional Q4 `report_xml` (raw Z-report XML for WebCheck ReportZ;
-/// omitted for non-Z docs).  All additive — existing driver/shim decoders
-/// ignore unknown fields.
+/// RS-2 piece-4 additions: `request_id` + `schema_version` (#7 — the
+/// response is an outbound canonical envelope) and the optional Q4
+/// `report_xml`.  **`report_xml` is consumed by the WebCheck shim**
+/// (raw Z-report XML → `StatusBarXML` for `ReportZ`); `maria304_driver`
+/// has no field for it and ignores it.  The response *shapes* here are
+/// round-trip-guarded by this file's `response_tests` (the
+/// `ingress_dto_parity.rs` fixtures cover the **request** DTO only).
+///
+/// **`fiscal_id` / `fiscal_ts` are `Option`** (matching the seam's
+/// [`FiscalOutcome`]): an **offline-local-ack** receipt has no DPS
+/// fiscal id yet, so it serialises `null` with `document_state =
+/// "OFFLINE_LOCAL_ACK"` — NOT an empty string (which the driver's
+/// `classify_response` treats as a data-contract violation / SoftBlock).
+/// Online `ACK` carries `Some(server_fiscal_no)`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CanonicalResponse {
     pub ok: bool,
-    /// Server-minted request id (uuid string) echoed for correlation.
+    /// Server-minted request id as **lowercase 32-char hex** (see
+    /// [`request_id_to_string`]) echoed for correlation.
     pub request_id: String,
     pub schema_version: String,
     pub document_id: String,
-    pub fiscal_id: String,
-    pub fiscal_ts: String,
+    /// DPS fiscal id (`server_fiscal_no`); `null` for an offline-local-ack
+    /// receipt that has no DPS id yet (see the struct doc).
+    pub fiscal_id: Option<String>,
+    /// Fiscalization timestamp; `null` until DPS-confirmed.
+    pub fiscal_ts: Option<String>,
     pub document_state: String,
     #[serde(default)]
     pub sale_total_kopecks: u64,
     #[serde(default)]
     pub return_total_kopecks: u64,
-    /// Q4 — raw Z-report XML for WebCheck `ReportZ` (passthrough from
-    /// RS-3); omitted for every non-Z response.
+    /// Q4 — raw Z-report XML for the WebCheck shim's `ReportZ`
+    /// (passthrough from RS-3); omitted for every non-Z response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report_xml: Option<String>,
+}
+
+/// Format an internal `request_id` (`[u8; 16]`, uuid-v7 bytes) as the
+/// canonical wire/log string: **lowercase 32-char hex, no separators**.
+/// Pinned here (piece-4a) so the piece-5 handler + every other surface
+/// render the id identically (no hyphenated-UUID vs hex drift).
+pub fn request_id_to_string(request_id: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(32);
+    for b in request_id {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Typed error envelope.  The driver decodes `{ok:false, error_code,
@@ -454,8 +481,8 @@ mod response_tests {
             request_id: "req-1".to_string(),
             schema_version: SCHEMA_VERSION.to_string(),
             document_id: "doc-1".to_string(),
-            fiscal_id: "12345".to_string(),
-            fiscal_ts: "2026-06-06T00:00:00Z".to_string(),
+            fiscal_id: Some("12345".to_string()),
+            fiscal_ts: Some("2026-06-06T00:00:00Z".to_string()),
             document_state: "ACK".to_string(),
             sale_total_kopecks: 15000,
             return_total_kopecks: 0,
@@ -475,6 +502,49 @@ mod response_tests {
         assert_eq!(back, r);
     }
 
+    /// Offline-local-ack: no DPS fiscal id yet → `fiscal_id`/`fiscal_ts`
+    /// serialise `null` (NOT an empty string that the driver would treat
+    /// as SoftBlock), with `document_state = "OFFLINE_LOCAL_ACK"`.
+    #[test]
+    fn offline_local_ack_response_has_null_fiscal_id_not_empty() {
+        let r = CanonicalResponse {
+            ok: true,
+            request_id: "req-off".to_string(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            document_id: "doc-off".to_string(),
+            fiscal_id: None,
+            fiscal_ts: None,
+            document_state: "OFFLINE_LOCAL_ACK".to_string(),
+            sale_total_kopecks: 15000,
+            return_total_kopecks: 0,
+            report_xml: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(r#""fiscal_id":null"#), "{json}");
+        assert!(json.contains(r#""fiscal_ts":null"#));
+        assert!(json.contains(r#""document_state":"OFFLINE_LOCAL_ACK""#));
+        assert!(
+            !json.contains(r#""fiscal_id":"""#),
+            "must NOT be empty-string"
+        );
+        let back: CanonicalResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn request_id_to_string_is_lowercase_32_char_hex() {
+        let id = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10,
+        ];
+        let s = request_id_to_string(&id);
+        assert_eq!(s, "0123456789abcdeffedcba9876543210");
+        assert_eq!(s.len(), 32);
+        assert!(s
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
     /// Q4: report_xml is carried when present (WebCheck ReportZ).
     #[test]
     fn success_response_includes_report_xml_when_present() {
@@ -483,8 +553,8 @@ mod response_tests {
             request_id: "r".to_string(),
             schema_version: SCHEMA_VERSION.to_string(),
             document_id: "d".to_string(),
-            fiscal_id: "f".to_string(),
-            fiscal_ts: "t".to_string(),
+            fiscal_id: Some("f".to_string()),
+            fiscal_ts: Some("t".to_string()),
             document_state: "ACK".to_string(),
             sale_total_kopecks: 0,
             return_total_kopecks: 0,
