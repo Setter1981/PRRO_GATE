@@ -25,6 +25,12 @@
 //!    **exhaustive (no `_`)**: when RS-3 adds real failure variants
 //!    (`DpsRejected`, …) this stops compiling, forcing an explicit decision
 //!    NOT to delete a durable row for a genuine fiscal failure.
+//!    *Pre-RS-3 caveat (review round-2 Med-2):* the NEW row is COMMITTED
+//!    before the seam call, and there is no worker/reaper yet — so a crash
+//!    or a failed release between the insert and the delete leaks a NEW row
+//!    that wedges its `idempotency_key` at `202 IN_PROGRESS` forever.  The
+//!    closing fix is the RS-3 `acquire_lease` worker + a stale-NEW reaper
+//!    (tracked); pre-RS-3 a failed release is at least traced out-of-band.
 //!
 //! 2. **Z (`ZReport`/`ShiftClose`) is NOT pre-aggregated through
 //!    [`convert`].** The ledger Z-aggregation
@@ -41,6 +47,13 @@
 //!    truth, [`http_status_for_error_code`]) — NOT a blanket "failure →
 //!    4xx".  Conflict→409, read-only/unsupported→422, in-progress→202,
 //!    not-implemented→501, ledger drift→500, inbox/fiscal rejected→422.
+//!    *5b contract (review round-2 D-Low):* `IN_PROGRESS`→202 is the ONE
+//!    `ok:false` body that is NOT terminal — piece-5b MUST translate it for
+//!    a synchronous/blocking caller (re-resolve, or signal a retry the
+//!    shim understands), not surface it as a rejection.  And because the
+//!    422 bucket folds *prior-receipt* outcomes (`INBOX_REJECTED` /
+//!    `FISCAL_REJECTED`) in with *this-request* faults, a consumer MUST
+//!    switch on `error_code`, not on the HTTP status alone.
 //!
 //! [`convert`]: super::convert
 //! [`convert::convert_to_signer_payload`]: super::convert::convert_to_signer_payload
@@ -354,7 +367,7 @@ pub async fn handle_command(
                     match ingress_inbox::delete_new_by_request_id(main_pool, &request_id).await {
                         Ok(1) => {}
                         Ok(rows) => {
-                            let _ = audit_log::append(
+                            if let Err(ae) = audit_log::append(
                                 main_pool,
                                 "ingress_inbox",
                                 &rid_hex,
@@ -363,10 +376,25 @@ pub async fn handle_command(
                                 None,
                                 Some(&serde_json::json!({ "rows_affected": rows }).to_string()),
                             )
-                            .await;
+                            .await
+                            {
+                                tracing::warn!(
+                                    request_id = %rid_hex,
+                                    rows_affected = rows,
+                                    audit_err = %ae,
+                                    "inbox NEW-row release affected an unexpected row count; \
+                                     its audit append also failed"
+                                );
+                            }
                         }
                         Err(e) => {
-                            let _ = audit_log::append(
+                            // review round-2 Med-1: the audit append lives on
+                            // the SAME `main_pool` and so shares the very
+                            // SQLITE_BUSY that just failed the DELETE.  If both
+                            // fail, fall back to an OUT-OF-BAND trace (no DB) so
+                            // the (potentially 202-wedged) receipt is observable
+                            // even when the DB is unwritable.
+                            if let Err(ae) = audit_log::append(
                                 main_pool,
                                 "ingress_inbox",
                                 &rid_hex,
@@ -375,7 +403,17 @@ pub async fn handle_command(
                                 None,
                                 Some(&serde_json::json!({ "error": e.to_string() }).to_string()),
                             )
-                            .await;
+                            .await
+                            {
+                                tracing::error!(
+                                    request_id = %rid_hex,
+                                    db_err = %e,
+                                    audit_err = %ae,
+                                    "inbox NEW-row release FAILED and its audit append also failed \
+                                     (DB contention) — receipt may wedge at IN_PROGRESS until the \
+                                     RS-3 reaper sweeps it"
+                                );
+                            }
                         }
                     }
                     err(
