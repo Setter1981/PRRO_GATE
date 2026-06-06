@@ -76,9 +76,23 @@ pub struct CanonicalCommand {
     pub payload: ReceiptPayload,
 }
 
+/// Success response envelope.  Decoded by `maria304_driver`
+/// (`bridge/http_client.rs`) and the WebCheck shim.  `ok` is always
+/// `true` here; failures use [`CanonicalErrorResponse`] (the driver tries
+/// the success shape first, then falls back to the error shape).
+///
+/// RS-2 piece-4 additions: `request_id` + `schema_version` (the response
+/// is an outbound canonical envelope, so #7 requires `schema_version`;
+/// `request_id` echoes the server-minted id for client correlation) and
+/// the optional Q4 `report_xml` (raw Z-report XML for WebCheck ReportZ;
+/// omitted for non-Z docs).  All additive — existing driver/shim decoders
+/// ignore unknown fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CanonicalResponse {
     pub ok: bool,
+    /// Server-minted request id (uuid string) echoed for correlation.
+    pub request_id: String,
+    pub schema_version: String,
     pub document_id: String,
     pub fiscal_id: String,
     pub fiscal_ts: String,
@@ -87,6 +101,34 @@ pub struct CanonicalResponse {
     pub sale_total_kopecks: u64,
     #[serde(default)]
     pub return_total_kopecks: u64,
+    /// Q4 — raw Z-report XML for WebCheck `ReportZ` (passthrough from
+    /// RS-3); omitted for every non-Z response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_xml: Option<String>,
+}
+
+/// Typed error envelope.  The driver decodes `{ok:false, error_code,
+/// error_message}` when the success [`CanonicalResponse`] decode fails
+/// (`maria304_driver::bridge::http_client`), so those three fields are
+/// the load-bearing contract; `request_id`/`schema_version` echo the
+/// request for correlation.  A pre-RS-3 `NotImplemented`, a convert
+/// rejection, an inbox `Conflict`, etc. all render as this — **never** a
+/// success `CanonicalResponse` with empty fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CanonicalErrorResponse {
+    /// Always `false`.
+    pub ok: bool,
+    pub request_id: String,
+    pub schema_version: String,
+    /// Stable machine code (e.g. `PAYLOAD_SCHEMA`, `FN_MISMATCH`,
+    /// `NOT_IMPLEMENTED`, `IDEMPOTENCY_CONFLICT`).
+    pub error_code: String,
+    pub error_message: String,
+    /// MED-2 — `true` when an idempotency `Conflict` stems from an
+    /// operator payment-slot **rename** (config drift), so the client /
+    /// audit treats it as config drift, NOT tampering.  Default `false`.
+    #[serde(default)]
+    pub config_drift: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -397,4 +439,96 @@ pub fn canonical_json_bytes<T: Serialize>(v: &T) -> Result<Vec<u8>, serde_json::
     let mut value = serde_json::to_value(v)?;
     sort_recursive(&mut value);
     serde_json::to_vec(&value)
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    /// Success response: driver-decodable shape, the piece-4 additions
+    /// (request_id / schema_version) present, report_xml omitted when None.
+    #[test]
+    fn success_response_shape_and_omits_report_xml_when_none() {
+        let r = CanonicalResponse {
+            ok: true,
+            request_id: "req-1".to_string(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            document_id: "doc-1".to_string(),
+            fiscal_id: "12345".to_string(),
+            fiscal_ts: "2026-06-06T00:00:00Z".to_string(),
+            document_state: "ACK".to_string(),
+            sale_total_kopecks: 15000,
+            return_total_kopecks: 0,
+            report_xml: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(r#""ok":true"#));
+        assert!(json.contains(r#""document_id":"doc-1""#));
+        assert!(json.contains(r#""fiscal_id":"12345""#));
+        assert!(json.contains(r#""request_id":"req-1""#));
+        assert!(json.contains(r#""schema_version":"1.0""#));
+        assert!(
+            !json.contains("report_xml"),
+            "report_xml must be omitted when None: {json}"
+        );
+        let back: CanonicalResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+    }
+
+    /// Q4: report_xml is carried when present (WebCheck ReportZ).
+    #[test]
+    fn success_response_includes_report_xml_when_present() {
+        let r = CanonicalResponse {
+            ok: true,
+            request_id: "r".to_string(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            document_id: "d".to_string(),
+            fiscal_id: "f".to_string(),
+            fiscal_ts: "t".to_string(),
+            document_state: "ACK".to_string(),
+            sale_total_kopecks: 0,
+            return_total_kopecks: 0,
+            report_xml: Some("<ZREP/>".to_string()),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(r#""report_xml":"<ZREP/>""#), "{json}");
+    }
+
+    /// Error envelope: the load-bearing `{ok:false, error_code,
+    /// error_message}` shape the driver falls back to.
+    #[test]
+    fn error_response_is_driver_decodable() {
+        let e = CanonicalErrorResponse {
+            ok: false,
+            request_id: "req-2".to_string(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            error_code: "NOT_IMPLEMENTED".to_string(),
+            error_message: "write-path not yet implemented".to_string(),
+            config_drift: false,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""ok":false"#));
+        assert!(json.contains(r#""error_code":"NOT_IMPLEMENTED""#));
+        assert!(json.contains(r#""error_message":"#));
+        let back: CanonicalErrorResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
+    }
+
+    /// MED-2: a config-drift Conflict carries the distinguishing flag.
+    #[test]
+    fn conflict_error_carries_config_drift_flag() {
+        let e = CanonicalErrorResponse {
+            ok: false,
+            request_id: "r".to_string(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            error_code: "IDEMPOTENCY_CONFLICT".to_string(),
+            error_message: "payload hash differs".to_string(),
+            config_drift: true,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(
+            json.contains(r#""config_drift":true"#),
+            "MED-2 config-drift label must serialize: {json}"
+        );
+    }
 }
