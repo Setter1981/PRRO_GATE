@@ -28,6 +28,7 @@
 //! before the Z aggregates" obligation becomes enforceable.
 
 use crate::db::models::enums::DocState;
+use crate::db::models::ids::DocumentId;
 use crate::db::repositories::ingress_inbox::InboxRow;
 use async_trait::async_trait;
 use thiserror::Error;
@@ -36,8 +37,13 @@ use thiserror::Error;
 /// handler to render the response envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FiscalOutcome {
-    /// Gateway-internal document id.
-    pub document_id: String,
+    /// Gateway-internal document id, **typed** — this is the INTERNAL
+    /// ingress↔RS-3 contract, so it carries the canonical [`DocumentId`]
+    /// (not a string).  The piece-4 handler serialises it to a string for
+    /// the external `CanonicalResponse`; keeping it typed here stops RS-3
+    /// from returning a non-canonical id and stops string formatting from
+    /// leaking into the write-path.
+    pub document_id: DocumentId,
     /// DPS-assigned fiscal id once known (`server_fiscal_no`).  `None`
     /// for an offline-local-acked receipt that has no DPS id yet.
     pub fiscal_id: Option<String>,
@@ -137,7 +143,7 @@ mod tests {
     #[test]
     fn outcome_expresses_fiscal_id_state_and_report_xml() {
         let o = FiscalOutcome {
-            document_id: "doc-1".to_string(),
+            document_id: DocumentId::from_bytes([1u8; 16]),
             fiscal_id: Some("12345".to_string()),
             fiscal_ts: Some("2026-06-06T00:00:00Z".to_string()),
             document_state: DocState::Ack,
