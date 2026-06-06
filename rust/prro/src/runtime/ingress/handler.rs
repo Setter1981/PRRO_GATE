@@ -344,8 +344,40 @@ pub async fn handle_command(
                 FiscalError::NotImplemented { request_id } => {
                     // Disposition 1 — release the still-NEW row so a retry
                     // re-attempts (guarded `WHERE status='NEW'`; can never
-                    // drop a durable row).
-                    let _ = ingress_inbox::delete_new_by_request_id(main_pool, &request_id).await;
+                    // drop a durable row).  The release is LOAD-BEARING: if
+                    // it does not happen, every retry of this idempotency_key
+                    // resolves to a `202 IN_PROGRESS` replay forever (NEW
+                    // inbox row + no fiscal doc).  So a failed or unexpected
+                    // release MUST be observable (audit), never swallowed —
+                    // under the multi-FN concurrent load a transient
+                    // `SQLITE_BUSY` could otherwise wedge a receipt silently.
+                    match ingress_inbox::delete_new_by_request_id(main_pool, &request_id).await {
+                        Ok(1) => {}
+                        Ok(rows) => {
+                            let _ = audit_log::append(
+                                main_pool,
+                                "ingress_inbox",
+                                &rid_hex,
+                                "INGRESS_NEW_ROW_RELEASE_UNEXPECTED",
+                                Severity::Warning,
+                                None,
+                                Some(&serde_json::json!({ "rows_affected": rows }).to_string()),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            let _ = audit_log::append(
+                                main_pool,
+                                "ingress_inbox",
+                                &rid_hex,
+                                "INGRESS_NEW_ROW_RELEASE_FAILED",
+                                Severity::Warning,
+                                None,
+                                Some(&serde_json::json!({ "error": e.to_string() }).to_string()),
+                            )
+                            .await;
+                        }
+                    }
                     err(
                         &rid_hex,
                         "NOT_IMPLEMENTED",
@@ -728,6 +760,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(c, 0, "read-only command must not enter the inbox");
+    }
+
+    /// A convert failure (SELL with empty goods → `EMPTY_GOODS`) is rejected
+    /// 422 and, crucially, leaves NO inbox row — convert runs BEFORE the
+    /// inbox insert, so a client-faulty payload can never plant a NEW row
+    /// that a later retry would replay as `202 IN_PROGRESS`.
+    #[tokio::test]
+    async fn convert_error_rejected_422_without_inbox_row() {
+        let (_d, main, secure) = fresh_pools().await;
+        let wp = UnimplementedWritePath;
+        let cmd = parse(format!(
+            r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"SELL",
+                "idempotency_key":"idem-bad","cashier_id":null,"department":null,
+                "return_check_number":null,
+                "payload":{{"direction":"SALE","goods":[],"payments":[],
+                  "totals":{{"sale_kopecks":0,"return_kopecks":0}}}}}}"#
+        ));
+        let r = handle_command(&cmd, FN, drv(), Protocol::Rest, &main, &secure, &wp).await;
+        assert_eq!(r.http_status, 422);
+        match r.body {
+            IngressBody::Error(e) => assert_eq!(e.error_code, "EMPTY_GOODS"),
+            other => panic!("expected Error(EMPTY_GOODS), got {other:?}"),
+        }
+        let c: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingress_inbox")
+            .fetch_one(&main)
+            .await
+            .unwrap();
+        assert_eq!(
+            c, 0,
+            "a convert-rejected payload must not write an inbox row"
+        );
     }
 
     /// A `Replay` of the SAME payload while the ledger has no terminal doc
