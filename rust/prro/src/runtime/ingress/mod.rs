@@ -17,6 +17,7 @@
 pub mod convert;
 pub mod dto;
 pub mod policy;
+pub mod replay;
 pub mod seam;
 
 pub struct IngressServer;

@@ -553,6 +553,37 @@ pub async fn list_shift_issued_receipts(
         .collect())
 }
 
+/// RS-2 piece-4b — the current outcome of the receipt for a `request_id`,
+/// for the ingress replay resolver.  `document_id` is rendered as
+/// lowercase 32-char hex (`lower(hex(...))`) to match
+/// `runtime::ingress::dto::request_id_to_string`.  Read-only
+/// (`fetch_optional`), runtime `query_as` (no `.sqlx` cache), NO write-tx.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TerminalOutcome {
+    pub document_id: String,
+    pub state: DocState,
+    pub doc_type: DocType,
+    pub server_fiscal_no: Option<String>,
+    pub business_ts: String,
+    pub total_sum_kop: Option<i64>,
+}
+
+pub async fn terminal_outcome_by_request_id(
+    pool: &SqlitePool,
+    request_id: &[u8; 16],
+) -> sqlx::Result<Option<TerminalOutcome>> {
+    sqlx::query_as::<_, TerminalOutcome>(
+        "SELECT lower(hex(document_id)) AS document_id, \
+                state, doc_type, server_fiscal_no, business_ts, total_sum_kop \
+         FROM fiscal_documents \
+         WHERE request_id = ? \
+         LIMIT 1",
+    )
+    .bind(&request_id[..])
+    .fetch_optional(pool)
+    .await
+}
+
 /// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 / HIGH-C4-8
 /// resolution; HIGH-C5-1 session scoping; MED-C5-4 KVT2 deferral
 /// reversed by **M3b W12 Commit 3**) — strict `lnd ASC` walker for
