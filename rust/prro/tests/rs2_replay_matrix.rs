@@ -250,3 +250,49 @@ async fn processing_with_rejected_doc_is_failed() {
         other => panic!("expected Failed, got {other:?}"),
     }
 }
+
+/// NEW status (vs PROCESSING) + accepted fiscal doc → Completed (locks
+/// that NEW and PROCESSING share the lenient branch).
+#[tokio::test]
+async fn new_plus_ack_is_completed() {
+    let (_d, pool) = fresh_main_pool().await;
+    let rid = [8u8; 16];
+    seed_doc(
+        &pool,
+        rid,
+        DocType::Sell,
+        DocState::Ack,
+        Some("888002"),
+        Some(15000),
+    )
+    .await;
+    let res = resolve_replay(&inbox(rid, "NEW"), &pool).await.unwrap();
+    match res {
+        ReplayResolution::Completed(r) => assert_eq!(r.fiscal_id.as_deref(), Some("888002")),
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+/// PROCESSING + Cancelled fiscal doc (another terminally-failed state) →
+/// Failed.
+#[tokio::test]
+async fn processing_with_cancelled_doc_is_failed() {
+    let (_d, pool) = fresh_main_pool().await;
+    let rid = [9u8; 16];
+    seed_doc(
+        &pool,
+        rid,
+        DocType::Sell,
+        DocState::Cancelled,
+        None,
+        Some(15000),
+    )
+    .await;
+    let res = resolve_replay(&inbox(rid, "PROCESSING"), &pool)
+        .await
+        .unwrap();
+    match res {
+        ReplayResolution::Failed(e) => assert_eq!(e.error_code, "FISCAL_REJECTED"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}

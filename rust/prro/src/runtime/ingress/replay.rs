@@ -68,30 +68,70 @@ fn error(request_id: &str, error_code: &str, error_message: String) -> Canonical
     }
 }
 
-/// Build the truthful success response from a terminal-accepted fiscal
-/// document.  `fiscal_id`/`fiscal_ts` are present only with a DPS id
-/// (online `ACK`); an `OFFLINE_LOCAL_ACK` has neither yet (→ `null`).
-fn completed(request_id: &str, fd: &TerminalOutcome) -> CanonicalResponse {
+/// Build the response for an ACCEPTED fiscal document (`Ack` /
+/// `OfflineLocalAck`), **FAIL-CLOSED** on a malformed accepted row (which
+/// would otherwise be a fake success):
+///   - `Ack` MUST carry a non-empty `server_fiscal_no` (the DPS id);
+///     missing/empty → `INBOX_LEDGER_DRIFT` (an ACK without a DPS id is a
+///     corrupt ledger row, NOT an `ok:true` with `fiscal_id:null`).
+///   - `Sell`/`Return` MUST carry a `total_sum_kop >= 0`; missing/negative
+///     → drift (do not mask a corrupt total as 0 / a wrong-sum success).
+///
+/// `fiscal_id` = the DPS id (`None` only for `OfflineLocalAck`, which has
+/// none yet); `fiscal_ts` = `first_kvt1_at` (the truthful DPS-confirmed-at
+/// stamp; `None` for offline-local-ack, which never reaches KVT1).
+fn build_accepted(request_id: &str, fd: &TerminalOutcome) -> ReplayResolution {
+    let fiscal_id = match fd.state {
+        DocState::Ack => match fd.server_fiscal_no.as_deref() {
+            Some(s) if !s.is_empty() => Some(s.to_string()),
+            _ => {
+                return ReplayResolution::Failed(error(
+                    request_id,
+                    "INBOX_LEDGER_DRIFT",
+                    "fiscal document is ACK but has no server_fiscal_no".to_string(),
+                ))
+            }
+        },
+        // OfflineLocalAck (the only other accepted state) → no DPS id yet.
+        _ => None,
+    };
+
     let (sale_total_kopecks, return_total_kopecks) = match fd.doc_type {
-        DocType::Sell => (fd.total_sum_kop.unwrap_or(0).max(0) as u64, 0),
-        DocType::Return => (0, fd.total_sum_kop.unwrap_or(0).max(0) as u64),
+        DocType::Sell | DocType::Return => {
+            let total = match fd.total_sum_kop {
+                Some(t) if t >= 0 => t as u64,
+                _ => {
+                    return ReplayResolution::Failed(error(
+                        request_id,
+                        "INBOX_LEDGER_DRIFT",
+                        format!(
+                            "accepted {} fiscal document has missing/negative total_sum_kop",
+                            fd.doc_type.as_str()
+                        ),
+                    ))
+                }
+            };
+            if matches!(fd.doc_type, DocType::Sell) {
+                (total, 0)
+            } else {
+                (0, total)
+            }
+        }
         _ => (0, 0),
     };
-    // fiscal_ts is the DPS fiscalization stamp — only meaningful when a
-    // DPS fiscal id exists; for an offline-local-ack there is none yet.
-    let fiscal_ts = fd.server_fiscal_no.as_ref().map(|_| fd.business_ts.clone());
-    CanonicalResponse {
+
+    ReplayResolution::Completed(CanonicalResponse {
         ok: true,
         request_id: request_id.to_string(),
         schema_version: SCHEMA_VERSION.to_string(),
         document_id: fd.document_id.clone(),
-        fiscal_id: fd.server_fiscal_no.clone(),
-        fiscal_ts,
+        fiscal_id,
+        fiscal_ts: fd.first_kvt1_at.clone(),
         document_state: fd.state.as_str().to_string(),
         sale_total_kopecks,
         return_total_kopecks,
         report_xml: None,
-    }
+    })
 }
 
 /// Resolve a `Replay` inbox outcome (the already-read row) into a
@@ -119,9 +159,7 @@ pub async fn resolve_replay(
 
     let resolution = match (replayed.status.as_str(), fd) {
         // DONE must be backed by a terminal-accepted fiscal doc.
-        ("DONE", Some(o)) if is_accepted(o.state) => {
-            ReplayResolution::Completed(completed(&rid, &o))
-        }
+        ("DONE", Some(o)) if is_accepted(o.state) => build_accepted(&rid, &o),
         ("DONE", found) => ReplayResolution::Failed(error(
             &rid,
             "INBOX_LEDGER_DRIFT",
@@ -136,7 +174,7 @@ pub async fn resolve_replay(
 
         // NEW/PROCESSING: an accepted ledger doc means it IS complete
         // (incl. OFFLINE_LOCAL_ACK — a client-terminal accepted state).
-        (_, Some(o)) if is_accepted(o.state) => ReplayResolution::Completed(completed(&rid, &o)),
+        (_, Some(o)) if is_accepted(o.state) => build_accepted(&rid, &o),
 
         // A terminally-failed ledger doc.
         (_, Some(o)) if is_terminally_failed(o.state) => ReplayResolution::Failed(error(
@@ -206,40 +244,88 @@ mod tests {
         assert_eq!(e.request_id, "09090909090909090909090909090909");
     }
 
-    #[test]
-    fn completed_offline_local_ack_has_null_fiscal_id() {
-        let fd = TerminalOutcome {
+    fn outcome(
+        state: DocState,
+        doc_type: DocType,
+        server_fiscal_no: Option<&str>,
+        first_kvt1_at: Option<&str>,
+        total_sum_kop: Option<i64>,
+    ) -> TerminalOutcome {
+        TerminalOutcome {
             document_id: "abcd".to_string(),
-            state: DocState::OfflineLocalAck,
-            doc_type: DocType::Sell,
-            server_fiscal_no: None,
-            business_ts: "2026-06-06T00:00:00Z".to_string(),
-            total_sum_kop: Some(15000),
-        };
-        let r = completed("rid", &fd);
-        assert!(r.ok);
-        assert_eq!(r.document_state, "OFFLINE_LOCAL_ACK");
-        assert_eq!(r.fiscal_id, None, "offline-local-ack has no DPS id");
-        assert_eq!(r.fiscal_ts, None);
-        assert_eq!(r.sale_total_kopecks, 15000);
+            state,
+            doc_type,
+            server_fiscal_no: server_fiscal_no.map(str::to_string),
+            first_kvt1_at: first_kvt1_at.map(str::to_string),
+            total_sum_kop,
+        }
     }
 
     #[test]
-    fn completed_online_ack_carries_fiscal_id_and_ts() {
-        let fd = TerminalOutcome {
-            document_id: "ef01".to_string(),
-            state: DocState::Ack,
-            doc_type: DocType::Return,
-            server_fiscal_no: Some("12345".to_string()),
-            business_ts: "2026-06-06T01:00:00Z".to_string(),
-            total_sum_kop: Some(3000),
-        };
-        let r = completed("rid", &fd);
-        assert_eq!(r.fiscal_id.as_deref(), Some("12345"));
-        assert_eq!(r.fiscal_ts.as_deref(), Some("2026-06-06T01:00:00Z"));
-        assert_eq!(r.document_state, "ACK");
-        assert_eq!(r.return_total_kopecks, 3000);
-        assert_eq!(r.sale_total_kopecks, 0);
+    fn accepted_offline_local_ack_completed_null_fiscal_id_and_ts() {
+        let fd = outcome(
+            DocState::OfflineLocalAck,
+            DocType::Sell,
+            None,
+            None,
+            Some(15000),
+        );
+        match build_accepted("rid", &fd) {
+            ReplayResolution::Completed(r) => {
+                assert!(r.ok);
+                assert_eq!(r.document_state, "OFFLINE_LOCAL_ACK");
+                assert_eq!(r.fiscal_id, None, "offline-local-ack has no DPS id");
+                assert_eq!(r.fiscal_ts, None, "offline-local-ack never reaches KVT1");
+                assert_eq!(r.sale_total_kopecks, 15000);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepted_online_ack_carries_fiscal_id_and_first_kvt1_at() {
+        // fiscal_ts must come from first_kvt1_at, NOT business_ts.
+        let fd = outcome(
+            DocState::Ack,
+            DocType::Return,
+            Some("12345"),
+            Some("2026-06-06T01:00:00Z"),
+            Some(3000),
+        );
+        match build_accepted("rid", &fd) {
+            ReplayResolution::Completed(r) => {
+                assert_eq!(r.fiscal_id.as_deref(), Some("12345"));
+                assert_eq!(r.fiscal_ts.as_deref(), Some("2026-06-06T01:00:00Z"));
+                assert_eq!(r.document_state, "ACK");
+                assert_eq!(r.return_total_kopecks, 3000);
+                assert_eq!(r.sale_total_kopecks, 0);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// External-review High: an `Ack` with no `server_fiscal_no` is ledger
+    /// drift, NOT an `ok:true` success with `fiscal_id:null`.
+    #[test]
+    fn accepted_ack_without_server_fiscal_no_is_drift() {
+        for sfn in [None, Some("")] {
+            let fd = outcome(DocState::Ack, DocType::Sell, sfn, Some("t"), Some(15000));
+            match build_accepted("rid", &fd) {
+                ReplayResolution::Failed(e) => assert_eq!(e.error_code, "INBOX_LEDGER_DRIFT"),
+                other => panic!("ACK w/o server_fiscal_no must be drift, got {other:?}"),
+            }
+        }
+    }
+
+    /// External-review Medium: an accepted SELL/RETURN with a missing
+    /// total is drift, NOT a fake-0 success.
+    #[test]
+    fn accepted_sell_without_total_is_drift() {
+        let fd = outcome(DocState::Ack, DocType::Sell, Some("12345"), Some("t"), None);
+        match build_accepted("rid", &fd) {
+            ReplayResolution::Failed(e) => assert_eq!(e.error_code, "INBOX_LEDGER_DRIFT"),
+            other => panic!("SELL w/o total must be drift, got {other:?}"),
+        }
     }
 
     /// Pure-branch: inbox REJECTED short-circuits to Failed without an fd

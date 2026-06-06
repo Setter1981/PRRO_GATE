@@ -564,7 +564,13 @@ pub struct TerminalOutcome {
     pub state: DocState,
     pub doc_type: DocType,
     pub server_fiscal_no: Option<String>,
-    pub business_ts: String,
+    /// The gateway's "DPS-confirmed-at" stamp (`first_kvt1_at`, set at the
+    /// `Sent → Kvt1` CAS, preserved to `Ack`).  `None` until a KVT1 lands
+    /// — so it is `None` for an offline-local-ack (which never reaches
+    /// KVT1).  This is the truthful fiscalization timestamp; `business_ts`
+    /// (the client receipt time) and `server_fiscal_date` (never written)
+    /// are NOT used.
+    pub first_kvt1_at: Option<String>,
     pub total_sum_kop: Option<i64>,
 }
 
@@ -574,7 +580,7 @@ pub async fn terminal_outcome_by_request_id(
 ) -> sqlx::Result<Option<TerminalOutcome>> {
     sqlx::query_as::<_, TerminalOutcome>(
         "SELECT lower(hex(document_id)) AS document_id, \
-                state, doc_type, server_fiscal_no, business_ts, total_sum_kop \
+                state, doc_type, server_fiscal_no, first_kvt1_at, total_sum_kop \
          FROM fiscal_documents \
          WHERE request_id = ? \
          LIMIT 1",
