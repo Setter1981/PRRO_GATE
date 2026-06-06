@@ -437,6 +437,7 @@ mod tests {
     use crate::db::models::ids::DocumentId;
     use crate::db::repositories::fiscal_number_config::{insert as fn_insert, NewFnConfig};
     use crate::db::repositories::ingress_inbox::InboxRow;
+    use crate::db::repositories::payment_methods::{self, NewPaymentMethod};
     use crate::db::{open_pool, open_secure_pool};
     use crate::runtime::ingress::seam::UnimplementedWritePath;
     use std::sync::Mutex;
@@ -516,6 +517,21 @@ mod tests {
                 "idempotency_key":"{idem}","cashier_id":null,"department":null,
                 "return_check_number":null,
                 "payload":{{"direction":"SALE","totals":{{"sale_kopecks":0,"return_kopecks":0}}}}}}"#
+        ))
+    }
+
+    /// A SELL with one CASH payment (drives the `payment_methods`-backed
+    /// convert path, so the converted hash includes the slot `name`).
+    fn sell_cash_cmd(idem: &str) -> CanonicalCommand {
+        parse(format!(
+            r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"SELL",
+                "idempotency_key":"{idem}","cashier_id":null,"department":null,
+                "return_check_number":null,
+                "payload":{{"direction":"SALE",
+                  "goods":[{{"name":"Bread","quantity_milli":1000,"price_kopecks":10000,
+                            "tax_group_1":0,"tax_group_2":0,"article_code":42}}],
+                  "payments":[{{"type":"CASH","amount_kopecks":10000}}],
+                  "totals":{{"sale_kopecks":10000,"return_kopecks":0}}}}}}"#
         ))
     }
 
@@ -701,6 +717,94 @@ mod tests {
         assert!(payload.contains("submitted_request_id"), "{payload}");
         assert!(payload.contains("existing_payload_sha256"), "{payload}");
         assert!(payload.contains("submitted_payload_sha256"), "{payload}");
+    }
+
+    /// MED-2 (operator-locked option **a**): the idempotency key is the
+    /// hash over the CONVERTED (signer-ready) payload, whose payment `name`
+    /// is sourced from the editable `payment_methods` row.  A benign slot
+    /// RENAME between a submit and its retry changes the fiscal input — so
+    /// the retry of the SAME wire receipt is a `IDEMPOTENCY_CONFLICT`
+    /// (config_drift, NOT tampering), audited with both ids + both hashes —
+    /// NEVER a silent Replay of a now-stale payload (a silent Replay after
+    /// a rename would return the old fiscal input, which is worse).
+    #[tokio::test]
+    async fn slot_rename_mid_retry_is_config_drift_conflict() {
+        let (_d, main, secure) = fresh_pools().await;
+        payment_methods::insert(
+            &secure,
+            &NewPaymentMethod {
+                fn_id: FN.to_string(),
+                pay_index: 1,
+                name: "Готівка".to_string(),
+                iscash: true,
+            },
+        )
+        .await
+        .unwrap();
+        let wp = RecordingOk {
+            captured: Mutex::new(None),
+            out: ack_outcome(),
+        };
+
+        // First submit persists (seam Ok → NEW row; hash over name "Готівка").
+        let r1 = handle_command(
+            &sell_cash_cmd("idem-rename"),
+            FN,
+            drv(),
+            Protocol::Rest,
+            &main,
+            &secure,
+            &wp,
+        )
+        .await;
+        assert_eq!(r1.http_status, 200);
+        let persisted_hex =
+            request_id_to_string(&wp.captured.lock().unwrap().clone().unwrap().request_id);
+
+        // Operator renames the CASH slot — a benign, allowed admin op.
+        payment_methods::update(&secure, FN, 1, "Готівка UAH", true)
+            .await
+            .unwrap();
+
+        // The SAME wire receipt, retried → converted hash now differs.
+        let r2 = handle_command(
+            &sell_cash_cmd("idem-rename"),
+            FN,
+            drv(),
+            Protocol::Rest,
+            &main,
+            &secure,
+            &wp,
+        )
+        .await;
+        assert_eq!(
+            r2.http_status, 409,
+            "renamed-slot retry must Conflict, not silently Replay a stale payload"
+        );
+        match r2.body {
+            IngressBody::Error(e) => {
+                assert_eq!(e.error_code, "IDEMPOTENCY_CONFLICT");
+                assert!(e.config_drift, "slot rename is config_drift, not tampering");
+                assert_eq!(
+                    e.request_id, persisted_hex,
+                    "conflict references the persisted submission id"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let audit: String = sqlx::query_scalar(
+            "SELECT event_payload_json FROM audit_log WHERE event_type = 'IDEMPOTENCY_CONFLICT' LIMIT 1",
+        )
+        .fetch_one(&main)
+        .await
+        .unwrap();
+        assert!(
+            audit.contains(&persisted_hex),
+            "audit has existing id: {audit}"
+        );
+        assert!(audit.contains("submitted_request_id"), "{audit}");
+        assert!(audit.contains("existing_payload_sha256"), "{audit}");
+        assert!(audit.contains("submitted_payload_sha256"), "{audit}");
     }
 
     /// An offline-local-ack success serialises `fiscal_id: null` with
