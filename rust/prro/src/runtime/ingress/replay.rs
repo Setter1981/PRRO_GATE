@@ -130,6 +130,12 @@ fn build_accepted(request_id: &str, fd: &TerminalOutcome) -> ReplayResolution {
         document_state: fd.state.as_str().to_string(),
         sale_total_kopecks,
         return_total_kopecks,
+        // Q4 report_xml on a COMPLETED ZReport/ShiftClose REPLAY is
+        // deferred to piece-5/RS-3: it must read the stored Z XML from
+        // `document_files` (the SAME kind RS-3 emits in the first-pass
+        // `seam::FiscalOutcome.report_xml`, for first-pass↔replay parity)
+        // — see plan §0.4. Pre-RS-3 both paths are gated by the
+        // NotImplemented seam, so `None` here manifests no gap yet.
         report_xml: None,
     })
 }
