@@ -77,26 +77,37 @@ pub struct CanonicalCommand {
 }
 
 /// Success response envelope (`ok == true`).  Failures use
-/// [`CanonicalErrorResponse`].  Decoded by the WebCheck shim (the pilot
-/// ingress consumer) and by `maria304_driver` (`bridge/http_client.rs`,
-/// which reads `ok`/`fiscal_id`/`document_state`/totals and ignores
-/// unknown fields — no `deny_unknown_fields` on its mirror, so the
-/// additive fields below are wire-safe).
+/// [`CanonicalErrorResponse`].
 ///
-/// RS-2 piece-4 additions: `request_id` + `schema_version` (#7 — the
-/// response is an outbound canonical envelope) and the optional Q4
-/// `report_xml`.  **`report_xml` is consumed by the WebCheck shim**
-/// (raw Z-report XML → `StatusBarXML` for `ReportZ`); `maria304_driver`
-/// has no field for it and ignores it.  The response *shapes* here are
-/// round-trip-guarded by this file's `response_tests` (the
-/// `ingress_dto_parity.rs` fixtures cover the **request** DTO only).
+/// **Consumer compatibility (piece-4a ACCEPT scope):**
+///  - **WebCheck shim** — the *pilot* ingress consumer; FULL compatibility
+///    (reads every field, incl. `report_xml` and `fiscal_id: null` for
+///    offline-local-ack).  piece-4a's response contract is ACCEPTed
+///    against THIS route.
+///  - **`maria304_driver`** — PARTIAL, and NOT a live `prro` consumer yet
+///    (built against the Python gateway; re-pointing at `prro` is separate
+///    wiring — see plan §0).  Its mirror ignores unknown fields (no
+///    `deny_unknown_fields`), so the additive `request_id`/`schema_version`/
+///    `report_xml` are wire-safe for it.  BUT its `fiscal_id` is a required
+///    `String`, so an **`OFFLINE_LOCAL_ACK` response with `fiscal_id: null`
+///    would FAIL its JSON decode** (`BridgeError::Transport`), not merely
+///    mis-classify.  Updating the driver mirror to `Option` + an
+///    `OFFLINE_LOCAL_ACK` outcome is a **tracked obligation, prerequisite
+///    to re-pointing maria304 at `prro`** (plan §0 carry-forward) — out of
+///    RS-2 scope.
+///
+/// RS-2 piece-4 additions: `request_id` + `schema_version` (#7 — outbound
+/// canonical envelope) + optional Q4 `report_xml` (consumed by the
+/// WebCheck shim → `StatusBarXML` for `ReportZ`; `maria304_driver` has no
+/// field for it and ignores it).  Response *shapes* are round-trip-guarded
+/// by this file's `response_tests` (the `ingress_dto_parity.rs` fixtures
+/// cover the **request** DTO only).
 ///
 /// **`fiscal_id` / `fiscal_ts` are `Option`** (matching the seam's
-/// [`FiscalOutcome`]): an **offline-local-ack** receipt has no DPS
-/// fiscal id yet, so it serialises `null` with `document_state =
-/// "OFFLINE_LOCAL_ACK"` — NOT an empty string (which the driver's
-/// `classify_response` treats as a data-contract violation / SoftBlock).
-/// Online `ACK` carries `Some(server_fiscal_no)`.
+/// [`FiscalOutcome`]): an offline-local-ack receipt serialises `null`
+/// with `document_state = "OFFLINE_LOCAL_ACK"` (NOT an empty string,
+/// which the driver's `classify_response` would treat as a data-contract
+/// violation / SoftBlock); online `ACK` carries `Some(server_fiscal_no)`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CanonicalResponse {
     pub ok: bool,

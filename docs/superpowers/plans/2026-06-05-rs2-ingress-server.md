@@ -122,6 +122,15 @@ A fresh-eyes review of the committed RS-2 code returned REVISE; all closed in `c
 
 **Decomposition delta (fresh-eyes):** piece-4 += config-drift-vs-tampering `Conflict` labeling (MED-2a) in the replay matrix + response/audit envelope.
 
+### §0.4 piece-4a review carry-forward (2026-06-06 — maria304_driver re-point obligation)
+
+piece-4a made the gateway response `fiscal_id`/`fiscal_ts` `Option` (honest: offline-local-ack serialises `fiscal_id: null`, NOT a fake string).  Decision **B** (operator): do NOT widen the `maria304_driver` state machine inside RS-2, because it is **not a live `prro` consumer yet**.  **piece-4a is ACCEPTed for the WebCheck-pilot response route only**, NOT the maria304 live route.  **Obligation — before `maria304_driver` is re-pointed at `prro` (separate wiring, [[project-runtime-spine-gap]]):**
+1. update its mirror `fiscal_id`/`fiscal_ts` → `Option<String>` (its current required `String` fails JSON decode on `fiscal_id: null` → `BridgeError::Transport`, before `classify_response`);
+2. define a driver outcome for `document_state = "OFFLINE_LOCAL_ACK"` + `fiscal_id: null` (an accepted-offline state, NOT `SoftBlock`);
+3. add an HTTP-decode test on `fiscal_id: null`;
+4. add a dispatcher/classify test so the offline response resolves to accepted-offline, not `Transport(json decode)` or `SoftBlock`.
+The pilot WebCheck shim (.NET, reads JSON) handles `null` natively, so nothing breaks today; the gateway keeps the honest `Option` contract.
+
 ---
 
 ## 0.6 — piece-2b design (ZReport / ShiftClose ledger aggregation) — PRE-IMPLEMENTATION
