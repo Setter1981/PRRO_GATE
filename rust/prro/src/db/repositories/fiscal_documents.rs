@@ -595,7 +595,8 @@ pub async fn terminal_outcome_by_request_id(
 /// `server_fiscal_no` is present AND non-empty — this includes an
 /// offline-drained doc once DPS confirms it to terminal `ACK` (the filter is
 /// the terminal `state='ACK'`, NOT `fs_mode='ONLINE'`).  Excluded: an
-/// `OFFLINE_LOCAL_ACK` (no DPS number, and not terminal), and an empty
+/// `OFFLINE_LOCAL_ACK` (a TERMINAL local-accepted state, but excluded here
+/// because it has no DPS `server_fiscal_no` yet), and an empty
 /// `server_fiscal_no` on an ACK (corrupt — `replay::build_accepted` treats it
 /// as ledger drift, so this helper must not surface it as a real number).
 ///

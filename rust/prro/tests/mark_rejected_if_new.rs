@@ -65,6 +65,8 @@ async fn seed_inbox_new(pool: &sqlx::SqlitePool, request_id: [u8; 16]) {
         correlation_id: None,
         signed_by_cashier_id: None,
         driver_id: Some("drv-test".into()),
+        business_ts: None,
+        total_sum_kop: None,
     };
     match ingress_inbox::insert(pool, &entry).await.unwrap() {
         InboxInsertOutcome::Created(_) => {}

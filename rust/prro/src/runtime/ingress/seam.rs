@@ -148,6 +148,8 @@ mod tests {
             received_at: "2026-06-06T00:00:00Z".to_string(),
             signed_by_cashier_id: Some("csh-007".to_string()),
             driver_id: Some("drv-1".to_string()),
+            business_ts: Some("2026-06-06T00:00:00Z".to_string()),
+            total_sum_kop: Some(2500),
         }
     }
 

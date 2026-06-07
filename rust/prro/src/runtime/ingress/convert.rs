@@ -546,18 +546,21 @@ pub async fn convert_to_signer_payload(
     main_pool: &SqlitePool,
     secure_pool: &SqlitePool,
 ) -> Result<ConvertedPayload, ConvertError> {
+    // `raw_frames` carries M5-scope fiscal data (check-level discounts /
+    // header & footer / service amounts) the structured DTO does not capture
+    // — fail closed for EVERY converted doc-type if present, rather than sign
+    // it away (same posture as acquirer_slip).  Hoisted ABOVE the match: a
+    // SHIFT_OPEN finalizes to a fixed `{opening_sum_kop:0}` and would otherwise
+    // silently DROP raw_frames, collapsing two distinct submissions to the same
+    // converted payload + hash (an idempotency-key content collision).
+    if !cmd.payload.raw_frames.is_empty() {
+        return Err(ConvertError::RawFramesNotSupported {
+            count: cmd.payload.raw_frames.len(),
+        });
+    }
     match cmd.command_type {
         CommandType::ShiftOpen => finalize(&ShiftOpenOut { opening_sum_kop: 0 }),
         CommandType::Sell | CommandType::Return => {
-            // `raw_frames` carries M5-scope fiscal data (check-level
-            // discounts / header & footer / service amounts) the
-            // structured DTO does not capture — fail closed if present
-            // rather than sign it away (same posture as acquirer_slip).
-            if !cmd.payload.raw_frames.is_empty() {
-                return Err(ConvertError::RawFramesNotSupported {
-                    count: cmd.payload.raw_frames.len(),
-                });
-            }
             if cmd.payload.goods.is_empty() {
                 return Err(ConvertError::EmptyGoods);
             }

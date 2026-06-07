@@ -47,6 +47,13 @@ pub struct InboxRow {
     /// MUST fail closed on a missing `driver_id` for a row it processes.
     pub signed_by_cashier_id: Option<String>,
     pub driver_id: Option<String>,
+    /// RS-2 A-H1 follow-up (migration 022).  The receipt/document timestamp
+    /// (`Utc::now()` at ingest) + the wire's declared total — the two further
+    /// `CanonicalFiscalCommand` fields the write-path consumes (DPS TS + the
+    /// stage_sign sum cross-check).  `business_ts` is `None` only for pre-022
+    /// legacy rows; `total_sum_kop` is `None` for SHIFT_OPEN / Z (no total).
+    pub business_ts: Option<String>,
+    pub total_sum_kop: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +71,11 @@ pub struct NewInboxEntry {
     /// and `signed_by_cashier_id` from the VALIDATED command.
     pub signed_by_cashier_id: Option<String>,
     pub driver_id: Option<String>,
+    /// RS-2 A-H1 follow-up (migration 022) — see [`InboxRow::business_ts`] /
+    /// [`InboxRow::total_sum_kop`].  The handler populates `business_ts` for
+    /// every new row; `total_sum_kop` from the validated command (SELL/RETURN).
+    pub business_ts: Option<String>,
+    pub total_sum_kop: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,7 +130,9 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
                           correlation_id,
                           received_at,
                           signed_by_cashier_id,
-                          driver_id
+                          driver_id,
+                          business_ts,
+                          total_sum_kop
                    FROM ingress_inbox
                    WHERE fiscal_number = ? AND idempotency_key = ?"#,
                 n.fiscal_number,
@@ -152,6 +166,8 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
                         received_at: r.received_at,
                         signed_by_cashier_id: r.signed_by_cashier_id,
                         driver_id: r.driver_id,
+                        business_ts: r.business_ts,
+                        total_sum_kop: r.total_sum_kop,
                     }));
                 } else {
                     return Ok(InboxInsertOutcome::Conflict {
@@ -167,8 +183,8 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
                 "INSERT INTO ingress_inbox (
                      request_id, fiscal_number, protocol, operation_type,
                      idempotency_key, payload_json, payload_sha256_canonical, correlation_id,
-                     signed_by_cashier_id, driver_id
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     signed_by_cashier_id, driver_id, business_ts, total_sum_kop
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&n.request_id[..])
             .bind(&n.fiscal_number)
@@ -180,6 +196,8 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
             .bind(n.correlation_id.as_deref())
             .bind(n.signed_by_cashier_id.as_deref())
             .bind(n.driver_id.as_deref())
+            .bind(n.business_ts.as_deref())
+            .bind(n.total_sum_kop)
             .execute(&mut **conn)
             .await?;
 
@@ -206,6 +224,8 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
                 received_at,
                 signed_by_cashier_id: n.signed_by_cashier_id.clone(),
                 driver_id: n.driver_id.clone(),
+                business_ts: n.business_ts.clone(),
+                total_sum_kop: n.total_sum_kop,
             }))
         })
     })
@@ -279,7 +299,9 @@ pub async fn acquire_lease(
                      correlation_id,
                      received_at,
                      signed_by_cashier_id,
-                     driver_id"#,
+                     driver_id,
+                     business_ts,
+                     total_sum_kop"#,
         req_slice
     )
     .fetch_optional(&mut **tx)
@@ -308,6 +330,8 @@ pub async fn acquire_lease(
         received_at: r.received_at,
         signed_by_cashier_id: r.signed_by_cashier_id,
         driver_id: r.driver_id,
+        business_ts: r.business_ts,
+        total_sum_kop: r.total_sum_kop,
     }))
 }
 

@@ -357,6 +357,12 @@ pub async fn handle_command(
             .as_ref()
             .map(|c| c.as_str().to_string()),
         driver_id: canonical.driver_id.as_ref().map(|d| d.as_str().to_string()),
+        // A-H1 follow-up (022): the receipt timestamp (always present) + the
+        // wire's declared total (None for SHIFT_OPEN / Z), so the reaper drives
+        // the write-path from the row without re-minting `now()` or losing the
+        // stage_sign sum cross-check.
+        business_ts: Some(canonical.business_ts.clone()),
+        total_sum_kop: canonical.total_sum_kop,
     };
 
     let outcome = match ingress_inbox::insert(main_pool, &entry).await {
@@ -762,6 +768,19 @@ mod tests {
             Some("K-7"),
             "signed_by_cashier_id MUST be the VALIDATED command's cashier"
         );
+        // A-H1 follow-up (022): the row also carries the receipt timestamp +
+        // the wire's declared total, so the reaper need not re-mint now() nor
+        // lose the stage_sign sum cross-check.
+        assert!(
+            row.business_ts.as_deref().is_some_and(|s| !s.is_empty()),
+            "business_ts MUST be persisted (non-empty), got {:?}",
+            row.business_ts
+        );
+        assert_eq!(
+            row.total_sum_kop,
+            Some(10000),
+            "total_sum_kop MUST be the SELL's declared sale total"
+        );
     }
 
     /// ACCEPTANCE #1 — a `NotImplemented` seam failure RELEASES the NEW
@@ -814,6 +833,8 @@ mod tests {
                 correlation_id: None,
                 signed_by_cashier_id: None,
                 driver_id: Some("drv-test".to_string()),
+                business_ts: None,
+                total_sum_kop: None,
             },
         )
         .await
@@ -1189,6 +1210,35 @@ mod tests {
             c, 0,
             "a convert-rejected payload must not write an inbox row"
         );
+    }
+
+    /// External-review High-2 — a SHIFT_OPEN carrying non-empty `raw_frames`
+    /// is rejected 422 RAW_FRAMES_UNSUPPORTED (the convert guard is hoisted
+    /// ABOVE the doc-type match) and leaves NO inbox row, so two SHIFT_OPENs
+    /// differing ONLY in raw_frames can't collapse to one `{opening_sum_kop:0}`
+    /// converted payload + hash (an idempotency-key content collision).
+    #[tokio::test]
+    async fn shift_open_with_raw_frames_is_rejected_422_without_inbox_row() {
+        let (_d, main, secure) = fresh_pools().await;
+        let wp = UnimplementedWritePath;
+        let cmd = parse(format!(
+            r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"SHIFT_OPEN",
+                "idempotency_key":"idem-rf","cashier_id":null,"department":null,
+                "return_check_number":null,
+                "payload":{{"direction":"SALE","totals":{{"sale_kopecks":0,"return_kopecks":0}},
+                  "raw_frames":[{{"opcode":"DISC","body":"x"}}]}}}}"#
+        ));
+        let r = handle_command(&cmd, FN, drv(), Protocol::Rest, &main, &secure, &wp).await;
+        assert_eq!(r.http_status, 422);
+        match r.body {
+            IngressBody::Error(e) => assert_eq!(e.error_code, "RAW_FRAMES_UNSUPPORTED"),
+            other => panic!("expected Error(RAW_FRAMES_UNSUPPORTED), got {other:?}"),
+        }
+        let c: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingress_inbox")
+            .fetch_one(&main)
+            .await
+            .unwrap();
+        assert_eq!(c, 0, "a raw_frames reject must not write an inbox row");
     }
 
     /// A `Replay` of the SAME payload while the ledger has no terminal doc

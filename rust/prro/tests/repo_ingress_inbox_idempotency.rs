@@ -47,6 +47,8 @@ fn entry(fn_id: &str, idem: &str, hash: [u8; 32], payload: &str) -> NewInboxEntr
         correlation_id: None,
         signed_by_cashier_id: None,
         driver_id: Some("drv-test".into()),
+        business_ts: None,
+        total_sum_kop: None,
     }
 }
 
@@ -194,16 +196,20 @@ async fn different_idempotency_keys_create_separate_rows() {
 async fn recovery_identity_round_trips_created_replay_and_legacy_null() {
     let (pool, fn_id) = fresh_with_fn().await;
 
-    // Created carries both (driver + cashier).
+    // Created carries identity (driver + cashier) + amounts (ts + total).
     let mut e = entry(&fn_id, "k-id", [1u8; 32], r#"{"x":1}"#);
     e.driver_id = Some("DRV-9".into());
     e.signed_by_cashier_id = Some("K-7".into());
+    e.business_ts = Some("2026-06-07T10:00:00Z".into());
+    e.total_sum_kop = Some(2500);
     let created = match insert(&pool, &e).await.unwrap() {
         InboxInsertOutcome::Created(r) => r,
         other => panic!("expected Created, got {other:?}"),
     };
     assert_eq!(created.driver_id.as_deref(), Some("DRV-9"));
     assert_eq!(created.signed_by_cashier_id.as_deref(), Some("K-7"));
+    assert_eq!(created.business_ts.as_deref(), Some("2026-06-07T10:00:00Z"));
+    assert_eq!(created.total_sum_kop, Some(2500));
 
     // Replay (same key+hash) returns the PERSISTED identity, ignoring the
     // resubmission's `entry()` defaults (driver "drv-test" / cashier None).
@@ -220,6 +226,12 @@ async fn recovery_identity_round_trips_created_replay_and_legacy_null() {
         "Replay must return the durable driver_id, not the resubmitter's"
     );
     assert_eq!(replay.signed_by_cashier_id.as_deref(), Some("K-7"));
+    assert_eq!(
+        replay.business_ts.as_deref(),
+        Some("2026-06-07T10:00:00Z"),
+        "Replay must return the durable business_ts, not a fresh now()"
+    );
+    assert_eq!(replay.total_sum_kop, Some(2500));
 
     // NULL cashier preserved (a command with no cashier).
     let mut e2 = entry(&fn_id, "k-nocsh", [2u8; 32], r#"{"x":2}"#);
@@ -258,6 +270,11 @@ async fn recovery_identity_round_trips_created_replay_and_legacy_null() {
     assert_eq!(
         legacy.signed_by_cashier_id, None,
         "legacy row reads NULL cashier"
+    );
+    assert_eq!(legacy.business_ts, None, "legacy row reads NULL business_ts");
+    assert_eq!(
+        legacy.total_sum_kop, None,
+        "legacy row reads NULL total_sum_kop"
     );
 }
 

@@ -2265,7 +2265,7 @@ async fn dispatch_prepared_via_chain(
                 "SELECT request_id, fiscal_number, protocol, operation_type, \
                         idempotency_key, status, payload_json, \
                         payload_sha256_canonical, correlation_id, received_at, \
-                        signed_by_cashier_id, driver_id \
+                        signed_by_cashier_id, driver_id, business_ts, total_sum_kop \
                  FROM ingress_inbox WHERE request_id = ?",
             )
             .bind(req_slice)
@@ -2295,6 +2295,8 @@ async fn dispatch_prepared_via_chain(
                 received_at: inbox_row_db.try_get("received_at")?,
                 signed_by_cashier_id: inbox_row_db.try_get("signed_by_cashier_id")?,
                 driver_id: inbox_row_db.try_get("driver_id")?,
+                business_ts: inbox_row_db.try_get("business_ts")?,
+                total_sum_kop: inbox_row_db.try_get("total_sum_kop")?,
             };
 
             // M3a hardening pass 1 — Patch 3 (drift cross-check).

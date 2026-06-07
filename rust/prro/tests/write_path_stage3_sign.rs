@@ -258,6 +258,8 @@ async fn seed_prepared_doc(
             correlation_id: None,
             signed_by_cashier_id: None,
             driver_id: Some("drv-test".into()),
+            business_ts: None,
+            total_sum_kop: None,
         },
     )
     .await
@@ -352,6 +354,8 @@ fn make_worker_context(
             received_at: "2026-04-22T12:00:00Z".into(),
             signed_by_cashier_id: None,
             driver_id: Some("drv-test".into()),
+            business_ts: None,
+            total_sum_kop: None,
         },
         command: make_command(doc_type, payload_json, total_sum_kop),
         node_state: prro::db::repositories::node_state::NodeStateRow {

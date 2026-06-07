@@ -236,6 +236,8 @@ mod tests {
             received_at: "2026-06-06T00:00:00Z".to_string(),
             signed_by_cashier_id: None,
             driver_id: Some("drv-test".to_string()),
+            business_ts: None,
+            total_sum_kop: None,
         }
     }
 
