@@ -380,3 +380,87 @@ async fn last_server_fiscal_no_only_real_acks() {
         Some("888002")
     );
 }
+
+/// review-r1 HIGH regression: ranking is by `lnd`, NOT `first_kvt1_at`.  A
+/// NEWER ACK with `first_kvt1_at = NULL` (a pre-014 legacy terminal row that
+/// migration 014 never backfilled) must STILL win over an OLDER ACK with a
+/// non-null stamp — `first_kvt1_at DESC` would have surfaced the stale OLDER
+/// number (SQLite sorts NULL last under DESC).
+#[tokio::test]
+async fn last_server_fiscal_no_ranks_by_lnd_not_first_kvt1_at() {
+    let (_d, pool) = fresh_main_pool().await;
+    // Older ACK (lnd=10) WITH a non-null first_kvt1_at.
+    seed_doc_lnd(
+        &pool,
+        [31u8; 16],
+        10,
+        DocType::Sell,
+        DocState::Ack,
+        Some("OLD"),
+        Some(1000),
+    )
+    .await;
+    sqlx::query("UPDATE fiscal_documents SET first_kvt1_at = ? WHERE request_id = ?")
+        .bind("2026-01-01T00:00:00Z")
+        .bind(&[31u8; 16][..])
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Newer ACK (lnd=20) with NULL first_kvt1_at (legacy pre-014 terminal row).
+    seed_doc_lnd(
+        &pool,
+        [32u8; 16],
+        20,
+        DocType::Sell,
+        DocState::Ack,
+        Some("NEW"),
+        Some(2000),
+    )
+    .await;
+    assert_eq!(
+        fd::last_server_fiscal_no(&pool, FN)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("NEW"),
+        "lnd ranks recency; a newer NULL-first_kvt1_at ACK must not be shadowed by an older stamped one"
+    );
+}
+
+/// review-r2 HIGH-b: an ACK with an EMPTY `server_fiscal_no` is corrupt (NOT a
+/// real DPS number — `replay::build_accepted` treats it as drift), so it is
+/// excluded even at a higher lnd; the last NON-empty ACK wins.
+#[tokio::test]
+async fn last_server_fiscal_no_excludes_empty_string() {
+    let (_d, pool) = fresh_main_pool().await;
+    // A real ACK at lnd=1.
+    seed_doc_lnd(
+        &pool,
+        [41u8; 16],
+        1,
+        DocType::Sell,
+        DocState::Ack,
+        Some("REAL"),
+        Some(1000),
+    )
+    .await;
+    // A NEWER ACK (lnd=2) with an EMPTY server_fiscal_no — must be excluded.
+    seed_doc_lnd(
+        &pool,
+        [42u8; 16],
+        2,
+        DocType::Sell,
+        DocState::Ack,
+        Some(""),
+        Some(2000),
+    )
+    .await;
+    assert_eq!(
+        fd::last_server_fiscal_no(&pool, FN)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("REAL"),
+        "an empty-string ACK server_fiscal_no must not be surfaced as a real number"
+    );
+}

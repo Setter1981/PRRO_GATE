@@ -591,20 +591,35 @@ pub async fn terminal_outcome_by_request_id(
 }
 
 /// RS-2 piece-6 — the FN's most recent REAL server fiscal number, for the
-/// read-only status endpoint.  Considers ONLY a true online `ACK` with a
-/// non-null `server_fiscal_no` (operator: an `OFFLINE_LOCAL_ACK` has no DPS
-/// fiscal number and is NOT a candidate).  Ranked by `first_kvt1_at` DESC
-/// (the truthful DPS-confirmed-at stamp, consistent with the replay path —
-/// `server_fiscal_date` is never written), with `lnd` DESC as a same-stamp
-/// tiebreaker.  Pool-bound read, NO write-tx.
+/// read-only status endpoint.  Candidate = a terminal online `ACK` whose
+/// `server_fiscal_no` is present AND non-empty (operator: an
+/// `OFFLINE_LOCAL_ACK` has no DPS number and is NOT a candidate; and an empty
+/// `server_fiscal_no` on an ACK is corrupt — `replay::build_accepted` treats
+/// it as ledger drift, so this helper must not surface it as a real number).
+///
+/// **Ranked by `lnd` DESC** — the strictly-monotonic per-FN local fiscal
+/// sequence, i.e. true issuance recency.  We deliberately do NOT rank by
+/// `first_kvt1_at`: it is stamped ONLY at the `Sent → Kvt1` CAS, so a real
+/// later ACK can have `first_kvt1_at = NULL` — both for a legacy pre-014
+/// `KVT2`/`ACK` row (migration 014 backfilled only `state='KVT1'`) AND for any
+/// offline-drain ACK that reached terminal ACK without a KVT1 stamp.  SQLite
+/// sorts NULL LAST under `DESC`, so ranking by `first_kvt1_at` would let an
+/// OLDER stamped ACK shadow a NEWER NULL one and surface a STALE fiscal number
+/// (review HIGH).  `lnd` has no NULL hazard and is co-monotonic with issuance.
+///
+/// Note: an in-flight `KVT1`/`KVT2` row already carries a `server_fiscal_no`
+/// (stamped at the `Sending → Sent` CAS) but is intentionally EXCLUDED until
+/// it reaches terminal `ACK` — the status shows the last CONFIRMED number,
+/// not one still finalizing.  Pool-bound read, NO write-tx.
 pub async fn last_server_fiscal_no(
     pool: &SqlitePool,
     fiscal_number: &str,
 ) -> sqlx::Result<Option<String>> {
     sqlx::query_scalar::<_, String>(
         "SELECT server_fiscal_no FROM fiscal_documents \
-         WHERE fiscal_number = ? AND state = 'ACK' AND server_fiscal_no IS NOT NULL \
-         ORDER BY first_kvt1_at DESC, lnd DESC \
+         WHERE fiscal_number = ? AND state = 'ACK' \
+               AND server_fiscal_no IS NOT NULL AND length(server_fiscal_no) > 0 \
+         ORDER BY lnd DESC \
          LIMIT 1",
     )
     .bind(fiscal_number)

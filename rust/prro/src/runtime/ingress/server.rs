@@ -1,9 +1,11 @@
 //! RS-2 piece-5b-ii — per-listener axum HTTP ingress server.
 //!
 //! Wraps the axum-free [`handle_command`](super::handler::handle_command)
-//! (piece-5a) in a thin axum server: one `POST /v1/ingress/:source` route per
-//! `RestHttp` listener, a [`DefaultBodyLimit`], and graceful shutdown driven by
-//! the supervisor's shutdown `watch` (RS-2 piece-5b-i task set).
+//! (piece-5a) in a thin axum server per `RestHttp` listener: a
+//! `POST /v1/ingress/:source` ingress route + a read-only
+//! `GET /v1/status/:fn` route (piece-6), a [`DefaultBodyLimit`], and graceful
+//! shutdown driven by the supervisor's shutdown `watch` (RS-2 piece-5b-i task
+//! set).
 //!
 //! **Router A** (`/v1/ingress/:source`): both front-ends POST the identical
 //! [`CanonicalCommand`] JSON; `:source` (`webcheck` / `maria304`) is an
@@ -198,6 +200,14 @@ async fn status_get(
     Path(requested_fn): Path<String>,
 ) -> Response {
     // CF1 — only the listener's own FN is readable here.
+    //
+    // post-pilot LAN (review-r1 A-Low, deferred under D2 loopback-only): the
+    // 403 (cross-FN) vs 404 (own-FN-not-initialized) split + echoing the
+    // configured FN here is an FN-existence oracle, and `offline_session.id` /
+    // `current_shift_id` expose internal uuids.  Harmless under loopback (the
+    // caller is the local trusted shim + the FN is in the local config), but
+    // when the LAN bearer/token-resolver lands, collapse 403/404 to one opaque
+    // code, stop echoing the FN, and re-confirm the shim needs the ids.
     if requested_fn != state.listener_fn {
         return adapter_error(
             StatusCode::FORBIDDEN,
@@ -550,5 +560,71 @@ mod tests {
             b["offline_session"]["id"], "55555555555555555555555555555555",
             "offline session id is lowercase-32-hex"
         );
+        // review-r1 (C-Medium-1): pin the wire enum strings — a NodeMode /
+        // ShiftState rename must break THIS surface's contract, not slip
+        // through (status_reflects_node_state covers ONLINE/CLOSED).
+        assert_eq!(b["node_mode"], "OFFLINE");
+        assert_eq!(b["shift_state"], "OPENED");
+    }
+
+    /// Seed a terminal `ACK` doc with a given `server_fiscal_no` at `lnd`.
+    async fn seed_ack(pool: &SqlitePool, lnd: i64, server_fiscal_no: &str) {
+        use crate::db::models::enums::DocType;
+        use crate::db::models::ids::{DocumentId, RequestId};
+        let new = fiscal_documents::NewDocument {
+            document_id: DocumentId::new(),
+            request_id: RequestId::new(),
+            fiscal_number: FN.to_string(),
+            shift_id: None,
+            offline_session_id: None,
+            lnd,
+            doc_type: DocType::Sell,
+            backend_profile_id: "b".to_string(),
+            transport_profile_id: "t".to_string(),
+            fs_mode: "ONLINE",
+            business_ts: "2026-06-07T00:00:00Z".to_string(),
+            total_sum_kop: Some(15000),
+            payload_json: "{}".to_string(),
+            payload_sha256_canonical: [0u8; 32],
+            unsigned_xml_sha256: None,
+            previous_hash: None,
+            signed_by_cashier_id: None,
+            signing_config_snapshot_id: None,
+        };
+        fiscal_documents::insert_prepared(pool, &new).await.unwrap();
+        sqlx::query(
+            "UPDATE fiscal_documents SET state = 'ACK', server_fiscal_no = ? \
+             WHERE fiscal_number = ? AND lnd = ?",
+        )
+        .bind(server_fiscal_no)
+        .bind(FN)
+        .bind(lnd)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// review-r1 (Low): the status endpoint surfaces a REAL `last_server_fiscal_no`
+    /// (not just the null case) — the HTTP projection of an acked receipt.
+    #[tokio::test]
+    async fn status_surfaces_last_server_fiscal_no() {
+        let (_d, state) = fresh_state().await;
+        node_state::upsert_initial(
+            &state.main_pool,
+            FN,
+            NodeMode::Online,
+            ShiftState::Closed,
+            9,
+        )
+        .await
+        .unwrap();
+        seed_ack(&state.main_pool, 8, "777042").await;
+        let resp = router(state)
+            .oneshot(get(&format!("/v1/status/{FN}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let b = body_json(resp).await;
+        assert_eq!(b["last_server_fiscal_no"], "777042");
     }
 }

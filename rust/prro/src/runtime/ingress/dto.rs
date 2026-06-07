@@ -174,6 +174,20 @@ pub struct CanonicalErrorResponse {
 /// envelope, so it carries `schema_version` (#7).  A pure projection of
 /// `node_state` + the last server `ACK` + the active offline session — ZERO
 /// write-path side effects.
+///
+/// **Wire enum contract** (the consumer branches on these exact strings; a
+/// rename is a breaking wire change — guarded by the status tests):
+///   - `node_mode` ∈ `ONLINE` | `GOING_OFFLINE` | `OFFLINE` | `GOING_ONLINE`
+///     | `BLOCKED` | `STOP_MODE` | `CRYPTO_DEGRADED`.
+///   - `shift_state` ∈ `CREATED` | `OPENING` | `OPENED_LOCAL_PENDING_DRAIN`
+///     | `OPENED` | `CLOSING_LOCAL_PENDING_DRAIN` | `CLOSING` | `CLOSED`
+///     | `REQUIRES_MANUAL_RECONCILIATION` | `ERROR`.
+///   - `offline_session.state` ∈ `OPEN` | `DRAINING` (only the active set is
+///     ever surfaced).
+///
+/// **Null policy:** every optional field serializes as explicit `null`, NEVER
+/// omitted — the GetCurrentStatus consumer switches on field presence, so do
+/// NOT add `#[serde(skip_serializing_if)]` here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StatusResponse {
     pub schema_version: String,
