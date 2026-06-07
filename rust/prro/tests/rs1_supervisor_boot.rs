@@ -429,11 +429,10 @@ async fn supervise_task_set_handles_n_named_tasks_gracefully() {
     let tasks = vec![
         SupervisedTask::runs_until_shutdown("drain", winds_down_on_flip(&shutdown_rx)),
         SupervisedTask::runs_until_shutdown("probe", winds_down_on_flip(&shutdown_rx)),
-        SupervisedTask {
-            name: "ingress:webcheck:4000000001".to_string(),
-            handle: winds_down_on_flip(&shutdown_rx),
-            expected: ExpectedTerminal::GracefulOkAfterShutdown,
-        },
+        SupervisedTask::graceful(
+            "ingress:webcheck:4000000001",
+            winds_down_on_flip(&shutdown_rx),
+        ),
     ];
 
     let res = tokio::time::timeout(
@@ -472,11 +471,7 @@ async fn axum_like_ok_after_shutdown_flip_is_not_loop_death() {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let tasks = vec![
         SupervisedTask::runs_until_shutdown("probe", winds_down_on_flip(&shutdown_rx)),
-        SupervisedTask {
-            name: "ingress:webcheck".to_string(),
-            handle: winds_down_on_flip(&shutdown_rx),
-            expected: ExpectedTerminal::GracefulOkAfterShutdown,
-        },
+        SupervisedTask::graceful("ingress:webcheck", winds_down_on_flip(&shutdown_rx)),
     ];
 
     let res = tokio::time::timeout(
@@ -514,11 +509,7 @@ async fn axum_like_ok_before_flip_is_loop_death() {
     // Completes Ok immediately, before any shutdown.
     let axum_handle = tokio::spawn(async { anyhow::Ok(()) });
     let tasks = vec![
-        SupervisedTask {
-            name: "ingress:webcheck".to_string(),
-            handle: axum_handle,
-            expected: ExpectedTerminal::GracefulOkAfterShutdown,
-        },
+        SupervisedTask::graceful("ingress:webcheck", axum_handle),
         SupervisedTask::runs_until_shutdown("probe", winds_down_on_flip(&shutdown_rx)),
     ];
     // Long shutdown so the early Ok wins the biased select.
@@ -568,11 +559,7 @@ async fn axum_like_panic_before_flip_is_loop_death() {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let axum_handle = tokio::spawn(async { panic!("injected axum serve panic") });
     let tasks = vec![
-        SupervisedTask {
-            name: "ingress:webcheck".to_string(),
-            handle: axum_handle,
-            expected: ExpectedTerminal::GracefulOkAfterShutdown,
-        },
+        SupervisedTask::graceful("ingress:webcheck", axum_handle),
         SupervisedTask::runs_until_shutdown("probe", winds_down_on_flip(&shutdown_rx)),
     ];
     let shutdown = async {
@@ -625,11 +612,7 @@ async fn axum_like_err_before_flip_audits_the_serve_error() {
     let axum_handle =
         tokio::spawn(async { Err::<(), anyhow::Error>(anyhow::anyhow!("address already in use")) });
     let tasks = vec![
-        SupervisedTask {
-            name: "ingress:webcheck".to_string(),
-            handle: axum_handle,
-            expected: ExpectedTerminal::GracefulOkAfterShutdown,
-        },
+        SupervisedTask::graceful("ingress:webcheck", axum_handle),
         SupervisedTask::runs_until_shutdown("probe", winds_down_on_flip(&shutdown_rx)),
     ];
     let shutdown = async {
@@ -711,5 +694,93 @@ async fn shutdown_uses_one_shared_grace_not_per_task_sequential() {
     assert!(
         elapsed < Duration::from_millis(3500),
         "shutdown must be bounded by ONE shared grace (~2s), not 2× sequential (~4s); took {elapsed:?}"
+    );
+}
+
+/// An EMPTY supervised set awaits the external shutdown and returns Ok — it
+/// must NOT short-circuit (the defensive guard; a 0-RestHttp-listener config
+/// in 5b-ii must still wait for shutdown, not exit immediately).
+#[tokio::test]
+async fn supervise_task_set_empty_set_awaits_shutdown() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = AppConfig::from_toml(&cfg_toml(dir.path())).expect("parse cfg");
+    let app = App::boot(cfg).await.expect("boot");
+    let (shutdown_tx, _rx) = watch::channel(false);
+
+    let start = std::time::Instant::now();
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        supervisor::supervise_task_set(
+            app,
+            async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            },
+            shutdown_tx,
+            vec![],
+        ),
+    )
+    .await
+    .expect("supervise must not hang");
+    assert!(
+        res.is_ok(),
+        "empty set must return Ok after shutdown: {res:?}"
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(100),
+        "empty set must AWAIT shutdown, not short-circuit; returned in {:?}",
+        start.elapsed()
+    );
+}
+
+/// Two tasks BOTH dying before the flip → the supervisor fails (Err), but
+/// EXACTLY ONE `SUPERVISOR_LOOP_DIED` is audited (the first the set surfaces;
+/// the second is a post-flip wind-down — logged, not audited).  Which one is
+/// "first" is `FuturesUnordered`-nondeterministic, so assert the COUNT.
+#[tokio::test]
+async fn two_pre_flip_deaths_audit_exactly_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = AppConfig::from_toml(&cfg_toml(dir.path())).expect("parse cfg");
+    let app = App::boot(cfg).await.expect("boot");
+    let app_q = app.clone();
+
+    let (shutdown_tx, _rx) = watch::channel(false);
+    let t1 = tokio::spawn(async { panic!("injected panic A") });
+    let t2 = tokio::spawn(async { panic!("injected panic B") });
+    let shutdown = async {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    };
+
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        supervisor::supervise_task_set(
+            app,
+            shutdown,
+            shutdown_tx,
+            vec![
+                SupervisedTask::runs_until_shutdown("loop-a", t1),
+                SupervisedTask::runs_until_shutdown("loop-b", t2),
+            ],
+        ),
+    )
+    .await
+    .expect("supervise must not hang");
+    assert!(
+        res.is_err(),
+        "a pre-flip death must fail the supervisor: {res:?}"
+    );
+
+    let mut count = 0usize;
+    for entity in ["loop-a", "loop-b"] {
+        let audits = audit_log::list_for_entity(app_q.db(), "supervisor", entity, 10)
+            .await
+            .expect("query audits");
+        count += audits
+            .iter()
+            .filter(|a| a.event_type == "SUPERVISOR_LOOP_DIED")
+            .count();
+    }
+    assert_eq!(
+        count, 1,
+        "exactly ONE pre-flip death is the audited restart cause (got {count})"
     );
 }

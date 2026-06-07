@@ -98,10 +98,11 @@ where
 ///      `fn_sign` FRESH per tick (signingTime freshness) and iterates the
 ///      registry's FNs; a tick bails between FNs on shutdown (F2), and per-FN
 ///      tick failures are logged, never fatal;
-///   3. (5e/F1) hand off to [`supervise_until_shutdown`], which waits on the
-///      `shutdown` future AND both loop handles: a normal shutdown flips the
-///      watch and JOINs both loops within the configured grace before dropping
-///      the [`App`]; a loop dying first (panic) → CRITICAL audit + `Err` for an
+///   3. (5e/F1) hand off to [`supervise_task_set`] (via the two-task
+///      [`supervise_until_shutdown`] wrapper), which waits on the `shutdown`
+///      future AND every supervised task: a normal shutdown flips the watch
+///      and JOINs ALL tasks within ONE shared grace before dropping the
+///      [`App`]; a task dying before the flip → CRITICAL audit + `Err` for an
 ///      orchestrator restart.
 pub async fn run_with_registry<F>(
     app: App,
@@ -228,15 +229,21 @@ pub enum ExpectedTerminal {
 /// `serve().await` failure (RS-2 piece-5b-ii) — and audit the actual cause
 /// instead of a generic "returned unexpectedly".  drain/probe loops return
 /// `Ok(())` on watch-exit.
+///
+/// Fields are private — build via [`runs_until_shutdown`](Self::runs_until_shutdown)
+/// or [`graceful`](Self::graceful) so a future precondition (e.g. name
+/// validation for the audit entity_id) can be enforced in one place without a
+/// breaking API change.
 pub struct SupervisedTask {
-    pub name: String,
-    pub handle: JoinHandle<anyhow::Result<()>>,
-    pub expected: ExpectedTerminal,
+    name: String,
+    handle: JoinHandle<anyhow::Result<()>>,
+    expected: ExpectedTerminal,
 }
 
 impl SupervisedTask {
     /// A [`RunsUntilShutdown`](ExpectedTerminal::RunsUntilShutdown) task — the
-    /// drain / probe loops.
+    /// drain / probe loops (any completion before the shutdown flip is a
+    /// loop-death).
     pub fn runs_until_shutdown(
         name: impl Into<String>,
         handle: JoinHandle<anyhow::Result<()>>,
@@ -245,6 +252,21 @@ impl SupervisedTask {
             name: name.into(),
             handle,
             expected: ExpectedTerminal::RunsUntilShutdown,
+        }
+    }
+
+    /// A [`GracefulOkAfterShutdown`](ExpectedTerminal::GracefulOkAfterShutdown)
+    /// task — an axum ingress server (RS-2 piece-5b-ii) whose
+    /// `with_graceful_shutdown` returns `Ok(())` once the watch flips.  An
+    /// `Ok`-after-flip is the normal exit; `Ok`-before-flip / `Err` / panic
+    /// are loop-death.  The handle must yield the server result
+    /// (`axum::serve(...).await.map_err(Into::into)`), NOT swallow it, so a
+    /// `serve()` failure is captured in the F1 audit.
+    pub fn graceful(name: impl Into<String>, handle: JoinHandle<anyhow::Result<()>>) -> Self {
+        Self {
+            name: name.into(),
+            handle,
+            expected: ExpectedTerminal::GracefulOkAfterShutdown,
         }
     }
 }
@@ -308,13 +330,15 @@ enum Disposition {
 ///     logged by the caller, never a NEW restart — operator: post-shutdown
 ///     join results don't change F1 restart semantics).
 ///
-/// `expected` is threaded for audit context + future task classes; today the
-/// two policies coincide on the `watch_flipped` axis.
+/// `_expected` is part of the signature for audit context + future task
+/// classes; today the two policies coincide on the `watch_flipped` axis, so it
+/// is intentionally unused here.  When RS-2 piece-5b-ii adds a policy that
+/// genuinely diverges, branch on it HERE (and add a variant-distinguishing
+/// test).
 ///
 /// [`LoopDeath`]: Disposition::LoopDeath
 /// [`Normal`]: Disposition::Normal
-fn classify_completion(expected: ExpectedTerminal, watch_flipped: bool) -> Disposition {
-    let _ = expected;
+fn classify_completion(_expected: ExpectedTerminal, watch_flipped: bool) -> Disposition {
     if watch_flipped {
         Disposition::Normal
     } else {
@@ -451,6 +475,13 @@ where
         );
     }
 
+    // On grace-elapse the still-running tasks are DETACHED (not aborted —
+    // crash-safe per the per-doc drain).  A detached task that captured an
+    // `app.clone()` keeps the `Arc<App::Inner>` (PidLock + DB pools) alive
+    // until IT ends; under the current single-supervisor-then-exit topology
+    // that is bounded by process exit, so this `drop(app)` only releases the
+    // supervisor's own clone.  (If a future caller runs `supervise_task_set`
+    // and keeps the process alive afterwards, abort the survivors here first.)
     drop(app);
     match loop_death {
         Some(which) => Err(anyhow::anyhow!(
@@ -573,6 +604,10 @@ fn spawn_drain_loop(
         let tick_shutdown = shutdown_rx.clone();
         let mut iv = tokio::time::interval(interval);
         iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // F1 INVARIANT: this loop must return `Ok(())` ONLY (on watch-exit).
+        // A `?`/`return Err(_)` added here would surface as a pre-flip
+        // loop-death → CRITICAL audit + process restart.  Per-FN errors are
+        // logged-and-skipped INSIDE `drain_tick`, never propagated.
         loop {
             tokio::select! {
                 biased;
@@ -666,6 +701,10 @@ fn spawn_probe_loop(
         let tick_shutdown = shutdown_rx.clone();
         let mut iv = tokio::time::interval(interval);
         iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // F1 INVARIANT: this loop must return `Ok(())` ONLY (on watch-exit).
+        // A `?`/`return Err(_)` added here would surface as a pre-flip
+        // loop-death → CRITICAL audit + process restart.  Per-FN errors are
+        // logged-and-skipped INSIDE `probe_tick`, never propagated.
         loop {
             tokio::select! {
                 biased;
