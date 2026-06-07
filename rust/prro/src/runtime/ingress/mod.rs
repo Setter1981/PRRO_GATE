@@ -1,28 +1,22 @@
-//! M4 HTTP ingress shell.
+//! HTTP ingress shell (M4 W1/W3 + RS-2).
 //!
-//! Built across the M4 worklets:
-//!
-//!   - **W1** (PR #96) established the module namespace + axum/tower
-//!     deps; [`IngressServer`] is still a no-op stub at this layer.
-//!   - **W3** (PR #99) lands [`dto`] — the crate-local copy of the
-//!     `maria304_driver::bridge::dto` wire DTOs, plus
-//!     `to_canonical_fiscal_command` mapping helper to the write-path's
-//!     `CanonicalFiscalCommand`.
-//!   - **W5** (TBD) wires the actual axum router + handler that
-//!     deserialises [`dto::CanonicalCommand`] and calls the mapping
-//!     helper.  `IngressServer::serve` gets a real body then.
-//!   - **W7** (TBD) plumbs the per-FN supervisor channel that
-//!     receives mapped commands from the handler.
+//! Layers, bottom-up:
+//!   - [`dto`] — crate-local copy of the `maria304_driver::bridge::dto` wire
+//!     DTOs + the `to_canonical_fiscal_command*` mapping helpers.
+//!   - [`convert`] — wire→signer payload conversion (RS-2 piece-2).
+//!   - [`policy`] — command-class classification (RS-2 piece-1b).
+//!   - [`seam`] — the write-path `WritePathEntry` seam (RS-2 piece-3).
+//!   - [`replay`] — the idempotency replay/conflict resolver (RS-2 piece-4b).
+//!   - [`handler`] — the axum-free `handle_command` core (RS-2 piece-5a).
+//!   - [`server`] — the per-listener axum HTTP server wrapping `handle_command`
+//!     (RS-2 piece-5b-ii).
+//!   - [`preflight`] — D1 frozen-slot startup validation (RS-2 piece-5b-ii).
 
 pub mod convert;
 pub mod dto;
 pub mod handler;
 pub mod policy;
+pub mod preflight;
 pub mod replay;
 pub mod seam;
-
-pub struct IngressServer;
-
-impl IngressServer {
-    pub async fn serve() {}
-}
+pub mod server;
