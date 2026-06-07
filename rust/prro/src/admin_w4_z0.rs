@@ -28,6 +28,7 @@
 //! reaffirms three-event-where-applicable.
 
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
 use thiserror::Error;
@@ -96,6 +97,19 @@ pub enum CfgAdminError {
     #[error("admin(w4-z0): outgress_profile not found: fn={0}")]
     OutgressProfileNotFound(String),
 
+    #[error(
+        "admin(w4-z0): pay_index {1} is a protected D1 slot for RS-2-enabled fn {0:?} — \
+         removing/inactivating it would break the frozen-slot policy a running RestHttp \
+         listener depends on (CF2)"
+    )]
+    ProtectedSlotImmutable(String, i64),
+
+    #[error(
+        "admin(w4-z0): pay_index {1} on RS-2-enabled fn {0:?} must have iscash={2} (D1 \
+         frozen-slot kind) — refusing to set iscash={3} (CF2)"
+    )]
+    ProtectedSlotKind(String, i64, bool, bool),
+
     #[error("admin(w4-z0): infrastructure: {0}")]
     Infrastructure(String),
 }
@@ -123,6 +137,56 @@ async fn ensure_fn_in_config(pool_main: &SqlitePool, fn_id: &str) -> Result<(), 
         return Err(CfgAdminError::FiscalNumberNotInConfig(fn_id.to_string()));
     }
     Ok(())
+}
+
+/// CF2 — what an admin mutation does to a payment slot, for the
+/// protected-slot guard.
+enum SlotMutation {
+    /// Add the slot, or set its kind — the PROPOSED `iscash`.
+    SetKind(bool),
+    /// Remove (soft-delete / inactivate) the slot.
+    Remove,
+}
+
+/// CF2 (RS-2 D1 admin-guard at the MUTATION surface, not startup-only).
+///
+/// For an FN that has a live RS-2 `RestHttp` listener (`rs2_fns`, derived
+/// from `config.listeners` in [`open_pools_from_config`]), a protected D1
+/// slot (1..=4) is FROZEN: it may not be removed/inactivated, and its
+/// `iscash` kind is fixed (slot 1 = cash, slots 2..=4 = cashless).  A
+/// non-RS-2 FN, or a free slot (≥5), is unconstrained — the admin is free.
+///
+/// The slot→kind map is `preflight::protected_slot_required_iscash`, shared
+/// with the startup [`preflight_d1_slots`](crate::runtime::ingress::preflight::preflight_d1_slots)
+/// so boot and admin can never disagree.  This closes the "payment_methods
+/// is mutable while RS-2 serves" hole: a running listener + convert path
+/// depend on the frozen slot semantics, so the admin CLI must not be able to
+/// flip slot 1 to non-cash, mislabel a cashless slot, or drop a protected
+/// slot out from under live ingress.
+fn enforce_protected_slot(
+    rs2_fns: &HashSet<String>,
+    fn_id: &str,
+    pay_index: i64,
+    mutation: SlotMutation,
+) -> Result<(), CfgAdminError> {
+    if !rs2_fns.contains(fn_id) {
+        return Ok(());
+    }
+    let Some(required_cash) =
+        crate::runtime::ingress::preflight::protected_slot_required_iscash(pay_index)
+    else {
+        return Ok(());
+    };
+    match mutation {
+        SlotMutation::Remove => Err(CfgAdminError::ProtectedSlotImmutable(
+            fn_id.to_string(),
+            pay_index,
+        )),
+        SlotMutation::SetKind(got) if got != required_cash => Err(
+            CfgAdminError::ProtectedSlotKind(fn_id.to_string(), pay_index, required_cash, got),
+        ),
+        SlotMutation::SetKind(_) => Ok(()),
+    }
 }
 
 /// Best-effort audit emission.  Audit Round-1 fix (2026-05-27):
@@ -346,6 +410,7 @@ pub async fn list_tax_groups(
 pub async fn add_payment_method(
     pool_main: &SqlitePool,
     pool_secure: &SqlitePool,
+    rs2_fns: &HashSet<String>,
     fn_id: &str,
     pay_index: i64,
     name: &str,
@@ -364,6 +429,9 @@ pub async fn add_payment_method(
         return Err(CfgAdminError::InvalidPayIndex(pay_index));
     }
     ensure_fn_in_config(pool_main, fn_id).await?;
+    // CF2 — on an RS-2-enabled FN, adding a protected slot (1..=4) is allowed
+    // ONLY if its kind matches the D1 frozen-slot policy.
+    enforce_protected_slot(rs2_fns, fn_id, pay_index, SlotMutation::SetKind(iscash))?;
 
     match pm_repo::insert(
         pool_secure,
@@ -405,6 +473,7 @@ pub async fn add_payment_method(
 pub async fn update_payment_method(
     pool_main: &SqlitePool,
     pool_secure: &SqlitePool,
+    rs2_fns: &HashSet<String>,
     fn_id: &str,
     pay_index: i64,
     name: Option<&str>,
@@ -417,6 +486,12 @@ pub async fn update_payment_method(
 
     let new_name = name.unwrap_or(&current.name).to_string();
     let new_iscash = iscash.unwrap_or(current.iscash);
+
+    // CF2 — on an RS-2-enabled FN, a protected slot's `iscash` kind is frozen;
+    // refuse a mutation whose RESULT would violate the D1 policy.  A name-only
+    // update on a correctly-kinded protected slot keeps `new_iscash` == the
+    // required kind and passes.
+    enforce_protected_slot(rs2_fns, fn_id, pay_index, SlotMutation::SetKind(new_iscash))?;
 
     pm_repo::update(pool_secure, fn_id, pay_index, &new_name, new_iscash)
         .await
@@ -449,9 +524,13 @@ pub async fn update_payment_method(
 pub async fn remove_payment_method(
     pool_main: &SqlitePool,
     pool_secure: &SqlitePool,
+    rs2_fns: &HashSet<String>,
     fn_id: &str,
     pay_index: i64,
 ) -> Result<(), CfgAdminError> {
+    // CF2 — a protected D1 slot (1..=4) cannot be removed/inactivated on an
+    // FN with a live RS-2 RestHttp listener (the listener depends on it).
+    enforce_protected_slot(rs2_fns, fn_id, pay_index, SlotMutation::Remove)?;
     pm_repo::soft_delete(pool_secure, fn_id, pay_index)
         .await
         .map_err(|e| match e {
@@ -768,11 +847,28 @@ pub async fn show_outgress_profile(
 /// returned `SingletonGuard` alive for the duration of the command.
 async fn open_pools_from_config(
     config_path: &Path,
-) -> Result<(crate::runtime::singleton::PidLock, SqlitePool, SqlitePool), CfgAdminError> {
+) -> Result<
+    (
+        crate::runtime::singleton::PidLock,
+        SqlitePool,
+        SqlitePool,
+        HashSet<String>,
+    ),
+    CfgAdminError,
+> {
     let cfg_text = std::fs::read_to_string(config_path)
         .map_err(|e| CfgAdminError::Infrastructure(format!("read config: {e}")))?;
     let cfg = crate::config::AppConfig::from_toml(&cfg_text)
         .map_err(|e| CfgAdminError::Infrastructure(format!("parse config: {e}")))?;
+    // CF2 — derive the RS-2-enabled FN set (FNs with a RestHttp listener) so
+    // the payment-method mutation guard is config-aware.  The full AppConfig
+    // (incl. `listeners`) was already parsed here and previously dropped.
+    let rs2_fns: HashSet<String> = cfg
+        .listeners
+        .iter()
+        .filter(|l| l.kind == crate::config::ListenerKind::RestHttp)
+        .map(|l| l.fiscal_number.clone())
+        .collect();
     let guard = crate::runtime::singleton::acquire(&cfg.database.db_path)
         .map_err(|e| CfgAdminError::Infrastructure(format!("singleton lock: {e}")))?;
     let pool_main = crate::db::open_pool(&cfg.database.db_path)
@@ -781,7 +877,7 @@ async fn open_pools_from_config(
     let pool_secure = crate::db::open_secure_pool(&cfg.database.secure_db_path)
         .await
         .map_err(|e| CfgAdminError::Infrastructure(format!("open secure pool: {e}")))?;
-    Ok((guard, pool_main, pool_secure))
+    Ok((guard, pool_main, pool_secure, rs2_fns))
 }
 
 /// Open pools + call body + close pools.  Inline form (closures + async
@@ -794,8 +890,20 @@ async fn open_pools_from_config(
 /// Drop order: result async block (mutation + audit) → pools close
 /// → guard drop releases the lock file.
 macro_rules! with_pools {
+    // 3-arg — callers that do not need the RS-2-enabled FN set (the set is
+    // bound and dropped).
     ($cfg:expr, $main:ident, $secure:ident, $body:block) => {{
-        let (_guard, $main, $secure) = open_pools_from_config($cfg).await?;
+        let (_guard, $main, $secure, _rs2_fns) = open_pools_from_config($cfg).await?;
+        let result = async $body.await;
+        $secure.close().await;
+        $main.close().await;
+        drop(_guard);
+        result
+    }};
+    // 4-arg (CF2) — exposes the RS-2-enabled FN set (`$rs2`) to the body for
+    // the payment-method mutation guard.
+    ($cfg:expr, $main:ident, $secure:ident, $rs2:ident, $body:block) => {{
+        let (_guard, $main, $secure, $rs2) = open_pools_from_config($cfg).await?;
         let result = async $body.await;
         $secure.close().await;
         $main.close().await;
@@ -867,8 +975,8 @@ pub async fn run_add_payment_method(
     name: String,
     iscash: bool,
 ) -> Result<(), CfgAdminError> {
-    with_pools!(cfg, pm, ps, {
-        add_payment_method(&pm, &ps, &fn_id, pay_index, &name, iscash).await
+    with_pools!(cfg, pm, ps, rs2, {
+        add_payment_method(&pm, &ps, &rs2, &fn_id, pay_index, &name, iscash).await
     })
 }
 
@@ -879,8 +987,8 @@ pub async fn run_update_payment_method(
     name: Option<String>,
     iscash: Option<bool>,
 ) -> Result<(), CfgAdminError> {
-    with_pools!(cfg, pm, ps, {
-        update_payment_method(&pm, &ps, &fn_id, pay_index, name.as_deref(), iscash).await
+    with_pools!(cfg, pm, ps, rs2, {
+        update_payment_method(&pm, &ps, &rs2, &fn_id, pay_index, name.as_deref(), iscash).await
     })
 }
 
@@ -889,8 +997,8 @@ pub async fn run_remove_payment_method(
     fn_id: String,
     pay_index: i64,
 ) -> Result<(), CfgAdminError> {
-    with_pools!(cfg, pm, ps, {
-        remove_payment_method(&pm, &ps, &fn_id, pay_index).await
+    with_pools!(cfg, pm, ps, rs2, {
+        remove_payment_method(&pm, &ps, &rs2, &fn_id, pay_index).await
     })
 }
 

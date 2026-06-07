@@ -95,6 +95,25 @@ pub async fn preflight_d1_slots(
     Ok(())
 }
 
+/// CF2 — the D1 protected pay-slots and their REQUIRED `iscash` kind, as the
+/// SINGLE source of truth shared by [`preflight_d1_slots`] (startup) and the
+/// admin-layer mutation guard (`admin_w4_z0::enforce_protected_slot`), so boot
+/// and admin can never disagree on the slot→kind map.
+///
+/// Returns:
+///   - `Some(true)`  — slot 1 (CASH): MUST be cash;
+///   - `Some(false)` — slots 2..=4 (CASHLESS_1..3): MUST be cashless;
+///   - `None`        — a free slot (≥5) with no D1 kind constraint.
+pub fn protected_slot_required_iscash(pay_index: i64) -> Option<bool> {
+    if pay_index == CASH_SLOT {
+        Some(true)
+    } else if CASHLESS_SLOTS.contains(&pay_index) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
