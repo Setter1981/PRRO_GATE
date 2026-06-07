@@ -353,6 +353,7 @@ async fn supervisor_fails_and_audits_when_a_loop_dies_before_shutdown() {
         let mut rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let _ = rx.changed().await;
+            Ok(())
         })
     };
 
@@ -406,11 +407,12 @@ async fn supervisor_fails_and_audits_when_a_loop_dies_before_shutdown() {
 
 use prro::runtime::supervisor::{ExpectedTerminal, SupervisedTask};
 
-/// A handle that winds down (returns Ok) when the shutdown watch flips.
-fn winds_down_on_flip(rx: &watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
+/// A handle that winds down (returns `Ok(())`) when the shutdown watch flips.
+fn winds_down_on_flip(rx: &watch::Receiver<bool>) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     let mut rx = rx.clone();
     tokio::spawn(async move {
         let _ = rx.changed().await;
+        Ok(())
     })
 }
 
@@ -510,7 +512,7 @@ async fn axum_like_ok_before_flip_is_loop_death() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     // Completes Ok immediately, before any shutdown.
-    let axum_handle = tokio::spawn(async {});
+    let axum_handle = tokio::spawn(async { anyhow::Ok(()) });
     let tasks = vec![
         SupervisedTask {
             name: "ingress:webcheck".to_string(),
@@ -605,6 +607,66 @@ async fn axum_like_panic_before_flip_is_loop_death() {
     );
 }
 
+/// An axum-like task that returns a real `Err` before the flip (e.g. a
+/// `serve().await` bind/serve failure) is a loop-death — and the typed task
+/// result means the audit captures the ACTUAL error, not a generic
+/// "returned unexpectedly".  This is the contract that lets piece-5b-ii
+/// surface a serve failure instead of swallowing it.
+#[tokio::test]
+async fn axum_like_err_before_flip_audits_the_serve_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = AppConfig::from_toml(&cfg_toml(dir.path())).expect("parse cfg");
+    let app = App::boot(cfg).await.expect("boot");
+    let app_q = app.clone();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Returns Err immediately, before any shutdown — the stand-in for a real
+    // `axum::serve(...).await` failure.
+    let axum_handle =
+        tokio::spawn(async { Err::<(), anyhow::Error>(anyhow::anyhow!("address already in use")) });
+    let tasks = vec![
+        SupervisedTask {
+            name: "ingress:webcheck".to_string(),
+            handle: axum_handle,
+            expected: ExpectedTerminal::GracefulOkAfterShutdown,
+        },
+        SupervisedTask::runs_until_shutdown("probe", winds_down_on_flip(&shutdown_rx)),
+    ];
+    let shutdown = async {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    };
+
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        supervisor::supervise_task_set(app, shutdown, shutdown_tx, tasks),
+    )
+    .await
+    .expect("supervise must not hang");
+    assert!(
+        res.is_err(),
+        "axum Err-before-flip must fail the supervisor: {res:?}"
+    );
+
+    let audits = audit_log::list_for_entity(app_q.db(), "supervisor", "ingress:webcheck", 10)
+        .await
+        .expect("query audits");
+    let died = audits
+        .iter()
+        .find(|a| a.event_type == "SUPERVISOR_LOOP_DIED")
+        .expect("loop-death audit for the erroring axum task");
+    assert_eq!(died.severity, Severity::Critical);
+    let payload = died.event_payload_json.as_deref().unwrap_or("");
+    // NOT a panic, and the ACTUAL serve error is captured in `detail`.
+    assert!(
+        payload.contains("\"panicked\":false"),
+        "Err, not panic: {payload}"
+    );
+    assert!(
+        payload.contains("address already in use"),
+        "the audit detail must carry the actual serve error, got {payload}"
+    );
+}
+
 /// Shutdown joins ALL remaining tasks under ONE shared grace, not a per-task
 /// sequential grace.  Two tasks that ignore the watch and outlast the grace
 /// must detach in ≈1× grace (~2s), NOT 2× (~4s).
@@ -620,8 +682,14 @@ async fn shutdown_uses_one_shared_grace_not_per_task_sequential() {
 
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     // Both ignore the watch and outlast the grace.
-    let t1 = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
-    let t2 = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
+    let t1 = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        anyhow::Ok(())
+    });
+    let t2 = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        anyhow::Ok(())
+    });
     let tasks = vec![
         SupervisedTask::runs_until_shutdown("t1", t1),
         SupervisedTask::runs_until_shutdown("t2", t2),

@@ -264,7 +264,7 @@ The `SUPERVISOR_LOOP_DIED` audit is **best-effort**: if the failure is itself a 
 
 | Event | Severity | Meaning |
 |-------|----------|---------|
-| `SUPERVISOR_LOOP_DIED` | Critical | A drain/probe tick loop exited before shutdown (panic). Payload: `{ loop, panicked, detail }`. The supervisor then exits non-zero for an orchestrator restart. Investigate the `detail` — it is an invariant bug, not a routine failure. |
+| `SUPERVISOR_LOOP_DIED` | Critical | A supervised task (drain/probe tick loop, or — RS-2 — an ingress server) exited BEFORE the shutdown flip. Payload: `{ loop, expected, panicked, detail }` where `expected` is the task's terminal policy (`RunsUntilShutdown` / `GracefulOkAfterShutdown`), `panicked` is true only for a genuine panic, and `detail` carries the cause (a panic message OR a real task error such as an axum `serve()` failure). The supervisor then exits non-zero for an orchestrator restart. Investigate the `detail` — it is an invariant bug, not a routine failure. |
 
 ---
 

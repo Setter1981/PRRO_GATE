@@ -222,20 +222,69 @@ pub enum ExpectedTerminal {
 
 /// A supervised background task: a spawned handle + the name used in
 /// logs/audits + its terminal-completion contract.
+///
+/// The handle yields `anyhow::Result<()>` (NOT bare `()`) so the F1 seam can
+/// distinguish a graceful `Ok(())` from a real task `Err` — e.g. an axum
+/// `serve().await` failure (RS-2 piece-5b-ii) — and audit the actual cause
+/// instead of a generic "returned unexpectedly".  drain/probe loops return
+/// `Ok(())` on watch-exit.
 pub struct SupervisedTask {
     pub name: String,
-    pub handle: JoinHandle<()>,
+    pub handle: JoinHandle<anyhow::Result<()>>,
     pub expected: ExpectedTerminal,
 }
 
 impl SupervisedTask {
     /// A [`RunsUntilShutdown`](ExpectedTerminal::RunsUntilShutdown) task — the
     /// drain / probe loops.
-    pub fn runs_until_shutdown(name: impl Into<String>, handle: JoinHandle<()>) -> Self {
+    pub fn runs_until_shutdown(
+        name: impl Into<String>,
+        handle: JoinHandle<anyhow::Result<()>>,
+    ) -> Self {
         Self {
             name: name.into(),
             handle,
             expected: ExpectedTerminal::RunsUntilShutdown,
+        }
+    }
+}
+
+/// What a supervised task's run produced once joined — lets the F1 seam tell a
+/// graceful `Ok(())` from a real task `Err` (e.g. an axum `serve()` failure)
+/// from a panic, so a pre-flip `Err` is audited WITH its cause rather than a
+/// generic "returned unexpectedly".
+enum TaskOutcome {
+    /// `Ok(())` — graceful exit (axum) / watch-exit (drain/probe).
+    ReturnedOk,
+    /// `Err(_)` — e.g. an axum `serve()` error; carries the cause.
+    ReturnedErr(anyhow::Error),
+    /// Panicked (or cancelled — we never abort, so in practice a panic).
+    Panicked(tokio::task::JoinError),
+}
+
+impl TaskOutcome {
+    fn from_join(res: Result<anyhow::Result<()>, tokio::task::JoinError>) -> Self {
+        match res {
+            Ok(Ok(())) => TaskOutcome::ReturnedOk,
+            Ok(Err(e)) => TaskOutcome::ReturnedErr(e),
+            Err(je) => TaskOutcome::Panicked(je),
+        }
+    }
+
+    /// `true` ONLY for a genuine panic (`JoinError::is_panic`) — the audit
+    /// payload's `panicked` field.
+    fn panicked(&self) -> bool {
+        matches!(self, TaskOutcome::Panicked(je) if je.is_panic())
+    }
+
+    /// Audit / log detail.  For `ReturnedErr` this is the task's own error
+    /// (the load-bearing improvement: a swallowed axum serve error is now
+    /// surfaced).
+    fn detail(&self) -> String {
+        match self {
+            TaskOutcome::ReturnedOk => "task returned Ok before the shutdown flip".to_string(),
+            TaskOutcome::ReturnedErr(e) => format!("task returned Err: {e:#}"),
+            TaskOutcome::Panicked(je) => format!("{je}"),
         }
     }
 }
@@ -273,16 +322,25 @@ fn classify_completion(expected: ExpectedTerminal, watch_flipped: bool) -> Dispo
     }
 }
 
-/// Log a join failure (a panicked task) WITHOUT triggering a restart — used
-/// for completions AFTER the watch flip (normal wind-down).
-fn log_join_failure(name: &str, res: &Result<(), tokio::task::JoinError>) {
-    if let Err(e) = res {
-        tracing::error!(
+/// Log an abnormal task exit WITHOUT triggering a restart — used for
+/// completions AFTER the watch flip (normal wind-down).  A graceful `Ok`
+/// exit is silent; a panic or a real `Err` (e.g. an axum serve error during
+/// graceful shutdown) is logged with its cause.
+fn log_join_failure(name: &str, outcome: &TaskOutcome) {
+    match outcome {
+        TaskOutcome::ReturnedOk => {}
+        TaskOutcome::ReturnedErr(e) => tracing::error!(
             target: "prro::runtime::supervisor",
-            task = name,
+            loop_name = name,
             error = %e,
-            "supervised task join failed (panicked during wind-down)"
-        );
+            "supervised task returned Err during wind-down"
+        ),
+        TaskOutcome::Panicked(je) => tracing::error!(
+            target: "prro::runtime::supervisor",
+            loop_name = name,
+            error = %je,
+            "supervised task panicked during wind-down"
+        ),
     }
 }
 
@@ -334,12 +392,12 @@ where
     }
 
     // Move each handle into a tagged future so a completion tells us WHICH
-    // task ended + under which policy.
+    // task ended, under which policy, and HOW (Ok / Err / panic).
     let mut pending: FuturesUnordered<_> = tasks
         .into_iter()
         .map(|t| async move {
-            let res = t.handle.await;
-            (t.name, t.expected, res)
+            let outcome = TaskOutcome::from_join(t.handle.await);
+            (t.name, t.expected, outcome)
         })
         .collect();
 
@@ -357,15 +415,15 @@ where
 
     // A pre-flip completion (Phase 1 won over shutdown) is a loop-death.
     let mut loop_death: Option<String> = None;
-    if let Some((name, expected, res)) = first {
+    if let Some((name, expected, outcome)) = first {
         match classify_completion(expected, /* watch_flipped = */ false) {
             Disposition::LoopDeath => {
-                audit_loop_died(&app, &name, expected, res).await;
+                audit_loop_died(&app, &name, expected, outcome).await;
                 loop_death = Some(name);
             }
             // Unreachable today (pre-flip ⇒ LoopDeath); defensive for a future
             // "completes-early-Ok" task class.
-            Disposition::Normal => log_join_failure(&name, &res),
+            Disposition::Normal => log_join_failure(&name, &outcome),
         }
     } else {
         tracing::info!(
@@ -381,8 +439,8 @@ where
     // NEW restart (operator: post-shutdown join results don't change F1
     // restart semantics).
     let join_rest = async {
-        while let Some((name, _expected, res)) = pending.next().await {
-            log_join_failure(&name, &res);
+        while let Some((name, _expected, outcome)) = pending.next().await {
+            log_join_failure(&name, &outcome);
         }
     };
     if tokio::time::timeout(grace, join_rest).await.is_err() {
@@ -412,8 +470,8 @@ pub async fn supervise_until_shutdown<F>(
     app: App,
     shutdown: F,
     shutdown_tx: watch::Sender<bool>,
-    drain_handle: JoinHandle<()>,
-    probe_handle: JoinHandle<()>,
+    drain_handle: JoinHandle<anyhow::Result<()>>,
+    probe_handle: JoinHandle<anyhow::Result<()>>,
 ) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send,
@@ -433,17 +491,9 @@ where
 /// Emit the durable CRITICAL `SUPERVISOR_LOOP_DIED` audit when a supervised
 /// task exits before shutdown.  Panic-guarded (best-effort) like the probe-tick
 /// audit contract — if the audit insert itself fails we fall back to tracing.
-async fn audit_loop_died(
-    app: &App,
-    which: &str,
-    expected: ExpectedTerminal,
-    res: Result<(), tokio::task::JoinError>,
-) {
-    let panicked = res.as_ref().err().map(|e| e.is_panic()).unwrap_or(false);
-    let detail = match &res {
-        Ok(()) => "task returned unexpectedly before the shutdown flip".to_string(),
-        Err(e) => format!("{e}"),
-    };
+async fn audit_loop_died(app: &App, which: &str, expected: ExpectedTerminal, outcome: TaskOutcome) {
+    let panicked = outcome.panicked();
+    let detail = outcome.detail();
     tracing::error!(
         target: "prro::runtime::supervisor",
         loop_name = which,
@@ -515,7 +565,7 @@ fn spawn_drain_loop(
     fn_ids: Vec<String>,
     interval: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
-) -> JoinHandle<()> {
+) -> JoinHandle<anyhow::Result<()>> {
     tokio::spawn(async move {
         // A second receiver for the between-FN check inside drain_tick — the
         // select! below holds `&mut shutdown_rx` for its `changed()` arm, so
@@ -529,7 +579,7 @@ fn spawn_drain_loop(
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
                         tracing::info!(target: "prro::runtime::supervisor", "drain loop: shutdown; exiting");
-                        return;
+                        return Ok(());
                     }
                 }
                 _ = iv.tick() => {
@@ -609,7 +659,7 @@ fn spawn_probe_loop(
     fn_ids: Vec<String>,
     interval: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
-) -> JoinHandle<()> {
+) -> JoinHandle<anyhow::Result<()>> {
     tokio::spawn(async move {
         // Second receiver for the between-FN check inside probe_tick (see
         // spawn_drain_loop).
@@ -622,7 +672,7 @@ fn spawn_probe_loop(
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
                         tracing::info!(target: "prro::runtime::supervisor", "probe loop: shutdown; exiting");
-                        return;
+                        return Ok(());
                     }
                 }
                 _ = iv.tick() => {
