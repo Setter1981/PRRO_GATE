@@ -1252,11 +1252,22 @@ mod tests {
             "NO_OPEN_SHIFT",
             "LEDGER_READ_FAILED",
             "INTERNAL",
+            // adapter-shell codes now in the map (review-polish B-low).
+            "UNKNOWN_SOURCE",
+            "NO_NODE_STATE",
+            "FN_FORBIDDEN",
+            "MALFORMED_JSON",
             "SOME_UNKNOWN_CODE",
         ] {
             let s = http_status_for_error_code(code);
             assert!(s >= 400, "{code} mapped to non-error {s}");
         }
+        // the adapter-shell codes' map status must equal their hard-coded
+        // `server.rs::adapter_error` status (coherence; review-r2 LOW-1).
+        assert_eq!(http_status_for_error_code("UNKNOWN_SOURCE"), 404);
+        assert_eq!(http_status_for_error_code("NO_NODE_STATE"), 404);
+        assert_eq!(http_status_for_error_code("FN_FORBIDDEN"), 403);
+        assert_eq!(http_status_for_error_code("MALFORMED_JSON"), 400);
         assert_eq!(http_status_for_error_code("IN_PROGRESS"), 202);
         assert_eq!(http_status_for_error_code("IDEMPOTENCY_CONFLICT"), 409);
         assert_eq!(http_status_for_error_code("NOT_IMPLEMENTED"), 501);

@@ -311,7 +311,10 @@ fn default_drain_interval_seconds() -> u64 {
 }
 
 fn default_shutdown_grace_seconds() -> u64 {
-    25
+    // Aligned with the default DPS request timeout (30s) so the out-of-box
+    // config does NOT trip the startup "grace < dps timeout" WARN — an
+    // in-flight drain DPS call can finish within grace on the default config.
+    30
 }
 
 /// Inclusive clamp bounds for the drain-ticker cadence.

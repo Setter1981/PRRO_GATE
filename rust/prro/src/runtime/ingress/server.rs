@@ -7,8 +7,9 @@
 //! shutdown driven by the supervisor's shutdown `watch` (RS-2 piece-5b-i task
 //! set).
 //!
-//! **Router A** (`/v1/ingress/:source`): both front-ends POST the identical
-//! [`CanonicalCommand`] JSON; `:source` (`webcheck` / `maria304`) is an
+//! **Router A** (`/v1/ingress/:source`): the front-end POSTs the
+//! [`CanonicalCommand`] JSON; `:source` (`webcheck`; `maria304` gated off until
+//! its consumer mirror is `Option<fiscal_id>` — see [`source_allowed`]) is an
 //! audit/protocol LABEL only — it does NOT participate in routing or identity.
 //! The `(driver_id, fiscal_number)` are stamped EXCLUSIVELY from the listener's
 //! [`IngressState`] (via `handle_command`), never the wire — so a `:source`
@@ -85,15 +86,16 @@ pub struct IngressState {
 /// Allowed `:source` path segments (router A).  NOT identity/routing — purely
 /// an audit/protocol label; the FN + driver_id come ONLY from [`IngressState`].
 ///
-/// OBLIGATION (RS-3 re-point): `maria304` is on the whitelist but the
-/// `maria304_driver` response mirror declares `fiscal_id: String` (required),
-/// so an `OFFLINE_LOCAL_ACK` success (`fiscal_id: null`) would FAIL-decode on
-/// that consumer.  Pre-RS-3 every POST is 501 (an error envelope it decodes
-/// fine), so the trap is latent — but the maria304 mirror MUST be made
-/// `Option<fiscal_id>` before a maria304 listener is configured against the
-/// live (post-RS-3) write-path.  See the `dto.rs` maria304-parity note.
+/// GATED to `webcheck` only (the pilot front-end).  `maria304` is deliberately
+/// NOT accepted yet: its `maria304_driver` response mirror declares
+/// `fiscal_id: String` (required), so a (post-RS-3) `OFFLINE_LOCAL_ACK` success
+/// with `fiscal_id: null` would FAIL-decode on that consumer.  Rejecting the
+/// source now (→ 404 `UNKNOWN_SOURCE`) turns a latent post-RS-3 decode break on
+/// the critical path into an explicit boundary error.  RE-ADD `"maria304"` here
+/// once the `maria304_driver` mirror is made `Option<fiscal_id>` (RS-3
+/// obligation; see the `dto.rs` maria304-parity note).
 fn source_allowed(source: &str) -> bool {
-    matches!(source, "webcheck" | "maria304")
+    matches!(source, "webcheck")
 }
 
 /// Build the per-listener router: `POST /v1/ingress/:source` + body limit +
@@ -155,7 +157,7 @@ async fn ingress_post(
         return adapter_error(
             StatusCode::NOT_FOUND,
             "UNKNOWN_SOURCE",
-            format!("unknown ingress source {source:?} (expected webcheck or maria304)"),
+            format!("unknown ingress source {source:?} (expected webcheck)"),
         );
     }
 
@@ -406,15 +408,21 @@ mod tests {
         assert_eq!(body["error_code"], "NOT_IMPLEMENTED");
     }
 
-    /// `maria304` is also an allowed source (whitelist has both).
+    /// `maria304` is GATED OFF until its consumer mirror is `Option<fiscal_id>`
+    /// (else a post-RS-3 `OFFLINE_LOCAL_ACK` null fiscal_id would fail-decode on
+    /// that driver) — so the source is rejected 404 `UNKNOWN_SOURCE`, never
+    /// reaching the handler.  Re-enable the whitelist entry + flip this test
+    /// when the maria304 mirror is fixed.
     #[tokio::test]
-    async fn maria304_source_is_allowed() {
+    async fn maria304_source_is_gated_off() {
         let (_d, state) = fresh_state().await;
         let resp = router(state)
             .oneshot(post("/v1/ingress/maria304", shift_open_json()))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_json(resp).await;
+        assert_eq!(body["error_code"], "UNKNOWN_SOURCE");
     }
 
     /// An unknown `:source` is 404 with the typed envelope; the handler is

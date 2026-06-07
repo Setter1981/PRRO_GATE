@@ -258,7 +258,7 @@ The runtime supervisor (`prro serve` with `[supervisor] enabled = true`) drives 
 
 The `SUPERVISOR_LOOP_DIED` audit is **best-effort**: if the failure is itself a DB problem, the audit insert can also fail, in which case the panic is recorded via `tracing` only (the non-zero exit + the OS supervisor's restart log remain the durable signal).
 
-**Why `TimeoutStopSec` / `stop_grace_period` must exceed `shutdown_grace_seconds`:** on SIGTERM the supervisor flips a shutdown watch and joins both loops within `shutdown_grace_seconds` (default 25s, clamp `[1, 80]`). If the orchestrator's stop timeout is shorter, it SIGKILLs mid-join. A SIGKILL is *safe* (the per-doc drain is crash-equivalent and re-drained next boot) but non-graceful; sizing the stop timeout above the grace lets the clean path run.
+**Why `TimeoutStopSec` / `stop_grace_period` must exceed `shutdown_grace_seconds`:** on SIGTERM the supervisor flips a shutdown watch and joins all tasks within `shutdown_grace_seconds` (default 30s — aligned with the default DPS request timeout so an in-flight drain call finishes within grace; clamp `[1, 80]`). If the orchestrator's stop timeout is shorter, it SIGKILLs mid-join. A SIGKILL is *safe* (the per-doc drain is crash-equivalent and re-drained next boot) but non-graceful; sizing the stop timeout above the grace lets the clean path run.
 
 ### New audit event
 
