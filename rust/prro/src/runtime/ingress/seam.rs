@@ -26,6 +26,16 @@
 //! pre-signed payload) preserves that option; the seam is the
 //! single-writer entrypoint where the "finalize/drain pending shift docs
 //! before the Z aggregates" obligation becomes enforceable.
+//!
+//! **Identity comes FROM THE PERSISTED ROW (A-H1).** The real RS-3 impl
+//! MUST read the write-path identity — `driver_id` (for `driver_tax_mapping`
+//! tax-group translation + outgress routing) and `signed_by_cashier_id`
+//! (fiscal attribution) — from [`InboxRow`] itself (migration 021), NOT from
+//! the listener/runtime context.  This makes the inline first-pass and a
+//! crash-recovery reaper that re-drives a stuck `PROCESSING` row use the
+//! SAME source.  RS-3 MUST fail closed on a missing `driver_id` (a pre-021
+//! legacy row): a missing driver silently identity-maps tax groups (the
+//! W4-Z2a non-identity hazard), so it must NOT be defaulted.
 
 use crate::db::models::enums::DocState;
 use crate::db::models::ids::DocumentId;
@@ -115,6 +125,8 @@ mod tests {
             payload_sha256_canonical: [0u8; 32],
             correlation_id: None,
             received_at: "2026-06-06T00:00:00Z".to_string(),
+            signed_by_cashier_id: Some("csh-007".to_string()),
+            driver_id: Some("drv-1".to_string()),
         }
     }
 

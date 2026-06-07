@@ -328,7 +328,12 @@ pub async fn handle_command(
         }
     };
 
-    // Step 3 — idempotent inbox insert.
+    // Step 3 — idempotent inbox insert.  A-H1: persist the recovery
+    // identity so the row is self-contained for the seam + a crash-recovery
+    // reaper — `driver_id` from the listener-stamped config (the mapper
+    // stored it into `canonical.driver_id`; always `Some` here), and
+    // `signed_by_cashier_id` from the VALIDATED command (not raw wire;
+    // legitimately `None` when the command has no cashier).
     let entry = NewInboxEntry {
         request_id,
         fiscal_number: listener_fn.to_string(),
@@ -338,6 +343,11 @@ pub async fn handle_command(
         payload_json,
         payload_sha256_canonical,
         correlation_id: None,
+        signed_by_cashier_id: canonical
+            .signed_by_cashier_id
+            .as_ref()
+            .map(|c| c.as_str().to_string()),
+        driver_id: canonical.driver_id.as_ref().map(|d| d.as_str().to_string()),
     };
 
     let outcome = match ingress_inbox::insert(main_pool, &entry).await {
@@ -687,6 +697,64 @@ mod tests {
         }
     }
 
+    /// RS-2 A-H1 — the inbox row handed to the seam is a SELF-CONTAINED
+    /// recovery record: `driver_id` from the listener-stamped config and
+    /// `signed_by_cashier_id` from the VALIDATED command (not the raw wire).
+    /// Captured at the seam boundary (a `RecordingOk` returns Ok so the NEW
+    /// row is not released), which is exactly what RS-3 / a crash-recovery
+    /// reaper will read.
+    #[tokio::test]
+    async fn handler_created_row_carries_listener_driver_and_validated_cashier() {
+        let (_d, main, secure) = fresh_pools().await;
+        // Seed the CASH slot so the SELL converts to a signer-ready payload.
+        payment_methods::insert(
+            &secure,
+            &NewPaymentMethod {
+                fn_id: FN.to_string(),
+                pay_index: 1,
+                name: "Готівка".to_string(),
+                iscash: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let seam = RecordingOk {
+            captured: Mutex::new(None),
+            out: ack_outcome(),
+        };
+        // A SELL carrying an explicit cashier "K-7".
+        let cmd = parse(format!(
+            r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"SELL",
+                "idempotency_key":"idem-id","cashier_id":"K-7","department":null,
+                "return_check_number":null,
+                "payload":{{"direction":"SALE",
+                  "goods":[{{"name":"Bread","quantity_milli":1000,"price_kopecks":10000,
+                            "tax_group_1":0,"tax_group_2":0,"article_code":42}}],
+                  "payments":[{{"type":"CASH","amount_kopecks":10000}}],
+                  "totals":{{"sale_kopecks":10000,"return_kopecks":0}}}}}}"#
+        ));
+        let r = handle_command(&cmd, FN, drv(), Protocol::Rest, &main, &secure, &seam).await;
+        assert_eq!(r.http_status, 200, "Created → Ok seam → success");
+
+        let row = seam
+            .captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the seam must have received the persisted inbox row");
+        assert_eq!(
+            row.driver_id.as_deref(),
+            Some("drv-1"),
+            "driver_id MUST be the listener-stamped value (drv())"
+        );
+        assert_eq!(
+            row.signed_by_cashier_id.as_deref(),
+            Some("K-7"),
+            "signed_by_cashier_id MUST be the VALIDATED command's cashier"
+        );
+    }
+
     /// ACCEPTANCE #1 — a `NotImplemented` seam failure RELEASES the NEW
     /// inbox row so a retry RE-ATTEMPTS (Created→seam again), instead of
     /// the row sticking and every retry resolving to a `202 IN_PROGRESS`
@@ -735,6 +803,8 @@ mod tests {
                 payload_json: "{}".to_string(),
                 payload_sha256_canonical: [0xAAu8; 32],
                 correlation_id: None,
+                signed_by_cashier_id: None,
+                driver_id: Some("drv-test".to_string()),
             },
         )
         .await

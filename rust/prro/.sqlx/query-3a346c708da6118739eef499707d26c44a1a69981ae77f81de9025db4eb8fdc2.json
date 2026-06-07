@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT request_id      as \"request_id: Vec<u8>\",\n                          fiscal_number,\n                          protocol         as \"protocol: Protocol\",\n                          operation_type,\n                          idempotency_key,\n                          status,\n                          payload_json,\n                          payload_sha256_canonical as \"payload_sha256_canonical: Vec<u8>\",\n                          correlation_id,\n                          received_at\n                   FROM ingress_inbox\n                   WHERE fiscal_number = ? AND idempotency_key = ?",
+  "query": "SELECT request_id      as \"request_id: Vec<u8>\",\n                          fiscal_number,\n                          protocol         as \"protocol: Protocol\",\n                          operation_type,\n                          idempotency_key,\n                          status,\n                          payload_json,\n                          payload_sha256_canonical as \"payload_sha256_canonical: Vec<u8>\",\n                          correlation_id,\n                          received_at,\n                          signed_by_cashier_id,\n                          driver_id\n                   FROM ingress_inbox\n                   WHERE fiscal_number = ? AND idempotency_key = ?",
   "describe": {
     "columns": [
       {
@@ -52,6 +52,16 @@
         "name": "received_at",
         "ordinal": 9,
         "type_info": "Text"
+      },
+      {
+        "name": "signed_by_cashier_id",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "driver_id",
+        "ordinal": 11,
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -67,8 +77,10 @@
       false,
       false,
       true,
-      false
+      false,
+      true,
+      true
     ]
   },
-  "hash": "b4c1f7afd0461be5230550a279898b1f87eda586adbe63a9058d853ff44327e2"
+  "hash": "3a346c708da6118739eef499707d26c44a1a69981ae77f81de9025db4eb8fdc2"
 }

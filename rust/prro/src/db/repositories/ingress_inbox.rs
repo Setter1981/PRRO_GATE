@@ -38,6 +38,15 @@ pub struct InboxRow {
     pub payload_sha256_canonical: [u8; 32],
     pub correlation_id: Option<String>,
     pub received_at: String,
+    /// RS-2 A-H1 — recovery identity (migration 021).  The persisted row
+    /// is the ONLY input the write-path SEAM (and a crash-recovery reaper)
+    /// gets, so it carries the fiscal cashier attribution + the
+    /// listener-stamped `driver_id` that drives tax-group translation.
+    /// `signed_by_cashier_id` is legitimately `None` (no cashier on the
+    /// command); `driver_id` is `None` only for pre-021 legacy rows — RS-3
+    /// MUST fail closed on a missing `driver_id` for a row it processes.
+    pub signed_by_cashier_id: Option<String>,
+    pub driver_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +59,11 @@ pub struct NewInboxEntry {
     pub payload_json: String,
     pub payload_sha256_canonical: [u8; 32],
     pub correlation_id: Option<String>,
+    /// RS-2 A-H1 — see [`InboxRow::driver_id`] / [`InboxRow::signed_by_cashier_id`].
+    /// The handler populates `driver_id` from the listener-stamped config
+    /// and `signed_by_cashier_id` from the VALIDATED command.
+    pub signed_by_cashier_id: Option<String>,
+    pub driver_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +116,9 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
                           payload_json,
                           payload_sha256_canonical as "payload_sha256_canonical: Vec<u8>",
                           correlation_id,
-                          received_at
+                          received_at,
+                          signed_by_cashier_id,
+                          driver_id
                    FROM ingress_inbox
                    WHERE fiscal_number = ? AND idempotency_key = ?"#,
                 n.fiscal_number,
@@ -134,6 +150,8 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
                         payload_sha256_canonical: existing_hash,
                         correlation_id: r.correlation_id,
                         received_at: r.received_at,
+                        signed_by_cashier_id: r.signed_by_cashier_id,
+                        driver_id: r.driver_id,
                     }));
                 } else {
                     return Ok(InboxInsertOutcome::Conflict {
@@ -148,8 +166,9 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
             sqlx::query(
                 "INSERT INTO ingress_inbox (
                      request_id, fiscal_number, protocol, operation_type,
-                     idempotency_key, payload_json, payload_sha256_canonical, correlation_id
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     idempotency_key, payload_json, payload_sha256_canonical, correlation_id,
+                     signed_by_cashier_id, driver_id
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&n.request_id[..])
             .bind(&n.fiscal_number)
@@ -159,6 +178,8 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
             .bind(&n.payload_json)
             .bind(&n.payload_sha256_canonical[..])
             .bind(n.correlation_id.as_deref())
+            .bind(n.signed_by_cashier_id.as_deref())
+            .bind(n.driver_id.as_deref())
             .execute(&mut **conn)
             .await?;
 
@@ -183,6 +204,8 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
                 payload_sha256_canonical: n.payload_sha256_canonical,
                 correlation_id: n.correlation_id.clone(),
                 received_at,
+                signed_by_cashier_id: n.signed_by_cashier_id.clone(),
+                driver_id: n.driver_id.clone(),
             }))
         })
     })
@@ -254,7 +277,9 @@ pub async fn acquire_lease(
                      payload_json,
                      payload_sha256_canonical as "payload_sha256_canonical: Vec<u8>",
                      correlation_id,
-                     received_at"#,
+                     received_at,
+                     signed_by_cashier_id,
+                     driver_id"#,
         req_slice
     )
     .fetch_optional(&mut **tx)
@@ -281,6 +306,8 @@ pub async fn acquire_lease(
         payload_sha256_canonical: sha_array,
         correlation_id: r.correlation_id,
         received_at: r.received_at,
+        signed_by_cashier_id: r.signed_by_cashier_id,
+        driver_id: r.driver_id,
     }))
 }
 

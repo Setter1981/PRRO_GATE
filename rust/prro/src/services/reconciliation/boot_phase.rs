@@ -2264,7 +2264,8 @@ async fn dispatch_prepared_via_chain(
             let inbox_row_db = sqlx::query(
                 "SELECT request_id, fiscal_number, protocol, operation_type, \
                         idempotency_key, status, payload_json, \
-                        payload_sha256_canonical, correlation_id, received_at \
+                        payload_sha256_canonical, correlation_id, received_at, \
+                        signed_by_cashier_id, driver_id \
                  FROM ingress_inbox WHERE request_id = ?",
             )
             .bind(req_slice)
@@ -2292,6 +2293,8 @@ async fn dispatch_prepared_via_chain(
                 payload_sha256_canonical: inbox_sha,
                 correlation_id: inbox_row_db.try_get("correlation_id")?,
                 received_at: inbox_row_db.try_get("received_at")?,
+                signed_by_cashier_id: inbox_row_db.try_get("signed_by_cashier_id")?,
+                driver_id: inbox_row_db.try_get("driver_id")?,
             };
 
             // M3a hardening pass 1 — Patch 3 (drift cross-check).

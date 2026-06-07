@@ -234,6 +234,8 @@ mod tests {
             payload_sha256_canonical: [0u8; 32],
             correlation_id: None,
             received_at: "2026-06-06T00:00:00Z".to_string(),
+            signed_by_cashier_id: None,
+            driver_id: Some("drv-test".to_string()),
         }
     }
 

@@ -45,6 +45,8 @@ fn entry(fn_id: &str, idem: &str, hash: [u8; 32], payload: &str) -> NewInboxEntr
         payload_json: payload.into(),
         payload_sha256_canonical: hash,
         correlation_id: None,
+        signed_by_cashier_id: None,
+        driver_id: Some("drv-test".into()),
     }
 }
 
@@ -180,6 +182,83 @@ async fn different_idempotency_keys_create_separate_rows() {
             .await
             .unwrap();
     assert_eq!(count, 2);
+}
+
+/// RS-2 A-H1 (migration 021) — the recovery identity (`driver_id`,
+/// `signed_by_cashier_id`) round-trips through BOTH the Created insert and
+/// the Replay read, so the persisted row is self-contained for the seam +
+/// a crash-recovery reaper.  Replay returns the PERSISTED identity (not the
+/// resubmission's).  A NULL cashier is preserved, and a legacy pre-021
+/// row (columns absent at insert) reads back NULL — additive/backward-safe.
+#[tokio::test]
+async fn recovery_identity_round_trips_created_replay_and_legacy_null() {
+    let (pool, fn_id) = fresh_with_fn().await;
+
+    // Created carries both (driver + cashier).
+    let mut e = entry(&fn_id, "k-id", [1u8; 32], r#"{"x":1}"#);
+    e.driver_id = Some("DRV-9".into());
+    e.signed_by_cashier_id = Some("K-7".into());
+    let created = match insert(&pool, &e).await.unwrap() {
+        InboxInsertOutcome::Created(r) => r,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    assert_eq!(created.driver_id.as_deref(), Some("DRV-9"));
+    assert_eq!(created.signed_by_cashier_id.as_deref(), Some("K-7"));
+
+    // Replay (same key+hash) returns the PERSISTED identity, ignoring the
+    // resubmission's `entry()` defaults (driver "drv-test" / cashier None).
+    let replay = match insert(&pool, &entry(&fn_id, "k-id", [1u8; 32], r#"{"x":1}"#))
+        .await
+        .unwrap()
+    {
+        InboxInsertOutcome::Replay(r) => r,
+        other => panic!("expected Replay, got {other:?}"),
+    };
+    assert_eq!(
+        replay.driver_id.as_deref(),
+        Some("DRV-9"),
+        "Replay must return the durable driver_id, not the resubmitter's"
+    );
+    assert_eq!(replay.signed_by_cashier_id.as_deref(), Some("K-7"));
+
+    // NULL cashier preserved (a command with no cashier).
+    let mut e2 = entry(&fn_id, "k-nocsh", [2u8; 32], r#"{"x":2}"#);
+    e2.signed_by_cashier_id = None;
+    e2.driver_id = Some("DRV-9".into());
+    let created2 = match insert(&pool, &e2).await.unwrap() {
+        InboxInsertOutcome::Created(r) => r,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    assert_eq!(created2.signed_by_cashier_id, None, "NULL cashier preserved");
+    assert_eq!(created2.driver_id.as_deref(), Some("DRV-9"));
+
+    // Legacy pre-021 row: raw INSERT omitting the new columns → both read
+    // back NULL through the Replay probe (additive migration is read-safe).
+    let legacy_rid = uuid::Uuid::now_v7().into_bytes();
+    sqlx::query(
+        "INSERT INTO ingress_inbox \
+         (request_id, fiscal_number, protocol, operation_type, idempotency_key, \
+          payload_json, payload_sha256_canonical) \
+         VALUES (?, ?, 'REST', 'SELL', 'k-legacy', '{}', ?)",
+    )
+    .bind(&legacy_rid[..])
+    .bind(&fn_id)
+    .bind(&[3u8; 32][..])
+    .execute(&pool)
+    .await
+    .unwrap();
+    let legacy = match insert(&pool, &entry(&fn_id, "k-legacy", [3u8; 32], "{}"))
+        .await
+        .unwrap()
+    {
+        InboxInsertOutcome::Replay(r) => r,
+        other => panic!("expected Replay of legacy row, got {other:?}"),
+    };
+    assert_eq!(legacy.driver_id, None, "legacy row reads NULL driver_id");
+    assert_eq!(
+        legacy.signed_by_cashier_id, None,
+        "legacy row reads NULL cashier"
+    );
 }
 
 /// RS-2 piece-5a — `delete_new_by_request_id` releases exactly the NEW

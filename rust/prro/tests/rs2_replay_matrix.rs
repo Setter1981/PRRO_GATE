@@ -120,6 +120,8 @@ fn inbox(request_id: [u8; 16], status: &str) -> InboxRow {
         payload_sha256_canonical: [0u8; 32],
         correlation_id: None,
         received_at: "2026-06-06T12:00:00Z".to_string(),
+        signed_by_cashier_id: None,
+        driver_id: Some("drv-test".to_string()),
     }
 }
 
