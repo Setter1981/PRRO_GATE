@@ -176,7 +176,8 @@ pub struct CanonicalErrorResponse {
 /// write-path side effects.
 ///
 /// **Wire enum contract** (the consumer branches on these exact strings; a
-/// rename is a breaking wire change — guarded by the status tests):
+/// rename is a breaking wire change — guarded exhaustively by
+/// `status_wire_enum_contract` below):
 ///   - `node_mode` ∈ `ONLINE` | `GOING_OFFLINE` | `OFFLINE` | `GOING_ONLINE`
 ///     | `BLOCKED` | `STOP_MODE` | `CRYPTO_DEGRADED`.
 ///   - `shift_state` ∈ `CREATED` | `OPENING` | `OPENED_LOCAL_PENDING_DRAIN`
@@ -202,9 +203,10 @@ pub struct StatusResponse {
     pub next_local_number: i64,
     /// Next Z-report number (`node_state.next_z_report_number`).
     pub next_z_report_number: i64,
-    /// The FN's most recent REAL DPS fiscal number (an online `ACK` with a
-    /// non-null `server_fiscal_no`); `null` if none yet.  An
-    /// `OFFLINE_LOCAL_ACK` is NOT a candidate (it has no DPS number).
+    /// The FN's most recent REAL DPS fiscal number — a terminal `ACK` with a
+    /// non-empty `server_fiscal_no` (INCLUDING an offline-drained doc once DPS
+    /// confirms it; the `ACK` filter is terminal-state, not `fs_mode`); `null`
+    /// if none yet.  An `OFFLINE_LOCAL_ACK` is NOT a candidate (no DPS number).
     pub last_server_fiscal_no: Option<String>,
     /// The active offline session (`OPEN` / `DRAINING`), or `null` when online.
     pub offline_session: Option<OfflineSessionInfo>,
@@ -664,5 +666,66 @@ mod response_tests {
             json.contains(r#""config_drift":true"#),
             "MED-2 config-drift label must serialize: {json}"
         );
+    }
+
+    /// piece-6 review-r3 (Low): the `StatusResponse` wire enum contract —
+    /// `node_mode` / `shift_state` / `offline_session.state` strings the
+    /// WebCheck shim branches on.  EXHAUSTIVE: a NEW `NodeMode`/`ShiftState`
+    /// variant breaks the match below (compile error → forces a wire-contract
+    /// decision); a renamed `as_str()` string breaks the assert.  Makes the
+    /// `StatusResponse` doc's "guarded exhaustively" claim true.
+    #[test]
+    fn status_wire_enum_contract() {
+        use crate::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
+
+        let node_wire = |m: NodeMode| match m {
+            NodeMode::Online => "ONLINE",
+            NodeMode::GoingOffline => "GOING_OFFLINE",
+            NodeMode::Offline => "OFFLINE",
+            NodeMode::GoingOnline => "GOING_ONLINE",
+            NodeMode::Blocked => "BLOCKED",
+            NodeMode::StopMode => "STOP_MODE",
+            NodeMode::CryptoDegraded => "CRYPTO_DEGRADED",
+        };
+        for m in [
+            NodeMode::Online,
+            NodeMode::GoingOffline,
+            NodeMode::Offline,
+            NodeMode::GoingOnline,
+            NodeMode::Blocked,
+            NodeMode::StopMode,
+            NodeMode::CryptoDegraded,
+        ] {
+            assert_eq!(m.as_str(), node_wire(m), "node_mode wire-string drift");
+        }
+
+        let shift_wire = |s: ShiftState| match s {
+            ShiftState::Created => "CREATED",
+            ShiftState::Opening => "OPENING",
+            ShiftState::OpenedLocalPendingDrain => "OPENED_LOCAL_PENDING_DRAIN",
+            ShiftState::Opened => "OPENED",
+            ShiftState::ClosingLocalPendingDrain => "CLOSING_LOCAL_PENDING_DRAIN",
+            ShiftState::Closing => "CLOSING",
+            ShiftState::Closed => "CLOSED",
+            ShiftState::RequiresManualReconciliation => "REQUIRES_MANUAL_RECONCILIATION",
+            ShiftState::Error => "ERROR",
+        };
+        for s in [
+            ShiftState::Created,
+            ShiftState::Opening,
+            ShiftState::OpenedLocalPendingDrain,
+            ShiftState::Opened,
+            ShiftState::ClosingLocalPendingDrain,
+            ShiftState::Closing,
+            ShiftState::Closed,
+            ShiftState::RequiresManualReconciliation,
+            ShiftState::Error,
+        ] {
+            assert_eq!(s.as_str(), shift_wire(s), "shift_state wire-string drift");
+        }
+
+        // Only the active set is ever surfaced by the status endpoint.
+        assert_eq!(OfflineSessionState::Open.as_str(), "OPEN");
+        assert_eq!(OfflineSessionState::Draining.as_str(), "DRAINING");
     }
 }
