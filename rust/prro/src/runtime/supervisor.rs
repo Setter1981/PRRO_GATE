@@ -8,11 +8,16 @@
 //!   4. (5d) spawns the drain + return-online tick loops, each rebuilding
 //!      `fn_sign` FRESH per tick (signingTime freshness — see
 //!      [`crate::runtime::key_loader::build_fn_sign`]);
-//!   5. (5e) on the shutdown signal, flips a watch + joins all tasks before
+//!   5. (RS-2 piece-5b-ii) runs the ingress startup preflight + binds one axum
+//!      HTTP server per `RestHttp` listener ([`bind_rest_ingress`]), supervised
+//!      alongside the loops;
+//!   6. (5e) on the shutdown signal, flips a watch + joins all tasks before
 //!      dropping the [`App`] (graceful-shutdown invariant #9).
 //!
-//! It does NOT run an ingress server or a live write-path worker — those are
-//! RS-2 / RS-3.  With `enabled = false` the binary stays byte-identical M1-idle.
+//! It runs the ingress servers (RS-2) but NOT the live write-path worker — that
+//! is RS-3 (pre-RS-3 the ingress seam is `UnimplementedWritePath` → every
+//! receipt 501s).  With `enabled = false` the binary stays byte-identical
+//! M1-idle.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -240,8 +245,11 @@ where
 /// Preflight order (fail-closed):
 ///   1. D2 loopback-only guard over ALL listeners (a non-loopback `RestHttp`
 ///      bind refuses to boot until the LAN token-resolver lands);
-///   2. per-`RestHttp`-FN D1 frozen-slot preflight (cash baseline + kind drift);
-///   3. `driver_id` validation + `TcpListener::bind`.
+///   2. main-DB FN existence — every `RestHttp` listener FN MUST be in
+///      `fiscal_number_config` (the `ListenerCfg` startup contract; the
+///      secure-DB D1 preflight alone cannot vouch for an unconfigured FN);
+///   3. per-`RestHttp`-FN D1 frozen-slot preflight (cash baseline + kind drift);
+///   4. `driver_id` validation + `TcpListener::bind`.
 async fn bind_rest_ingress(
     app: &App,
     write_path: &Arc<dyn WritePathEntry>,
@@ -252,19 +260,42 @@ async fn bind_rest_ingress(
     crate::config::validate_rs2_loopback_binds(&listeners)
         .map_err(|e| anyhow::anyhow!("RS-2 ingress loopback guard: {e}"))?;
 
+    // (2) Load the MAIN-DB configured FNs ONCE.  The `ListenerCfg` contract is
+    // that `fn` MUST exist in `fiscal_number_config`, validated at supervisor
+    // startup — so a RestHttp listener for an FN absent from main is a BOOT
+    // failure (the secure-DB D1 preflight alone is NOT sufficient: a stray
+    // `payment_methods` slot for an unconfigured FN must not let a bogus
+    // listener bind + accept POSTs).  Checked per-listener BEFORE D1.
+    let configured_fns: std::collections::HashSet<String> =
+        crate::db::repositories::fiscal_number_config::list_all(app.db())
+            .await
+            .map_err(|e| anyhow::anyhow!("RS-2 ingress: read fiscal_number_config: {e}"))?
+            .into_iter()
+            .map(|c| c.fiscal_number)
+            .collect();
+
     let mut bound = Vec::new();
     for l in listeners
         .iter()
         .filter(|l| l.kind == ListenerKind::RestHttp)
     {
-        // (2) D1 frozen-slot preflight per RestHttp FN.
+        // (3) main-DB FN existence (documented startup contract).
+        if !configured_fns.contains(&l.fiscal_number) {
+            anyhow::bail!(
+                "RS-2 ingress listener fn {} is not configured in fiscal_number_config \
+                 (a RestHttp listener requires a known FN)",
+                l.fiscal_number
+            );
+        }
+
+        // (4) D1 frozen-slot preflight per RestHttp FN (secure DB).
         preflight_d1_slots(app.db_secure(), &l.fiscal_number)
             .await
             .map_err(|e| {
                 anyhow::anyhow!("RS-2 ingress D1 preflight (fn {}): {e}", l.fiscal_number)
             })?;
 
-        // (3) validate driver_id + bind (bind error = boot failure).
+        // (5) validate driver_id + bind (bind error = boot failure).
         let driver_id = DriverId::new(&l.driver_id).map_err(|e| {
             anyhow::anyhow!(
                 "RS-2 ingress listener (fn {}) invalid driver_id: {e}",
@@ -286,10 +317,13 @@ async fn bind_rest_ingress(
             protocol: Protocol::Rest,
             write_path: Arc::clone(write_path),
         };
-        let name = format!("ingress:rest:{}:{}", l.fiscal_number, l.port);
+        // Name keys the supervised-task / audit entity_id — include the bind IP
+        // so the same fn+port on `127.0.0.1` vs `::1` cannot collide.
+        let name = format!("ingress:rest:{}:{}:{}", l.fiscal_number, ip, l.port);
         tracing::info!(
             target: "prro::runtime::supervisor",
             fiscal_number = %l.fiscal_number,
+            bind_ip = %ip,
             port = l.port,
             "RS-2 ingress listener bound"
         );

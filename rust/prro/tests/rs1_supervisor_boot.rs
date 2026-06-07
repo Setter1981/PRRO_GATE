@@ -823,6 +823,9 @@ async fn rest_http_listener_boots_and_shuts_down() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = AppConfig::from_toml(&cfg_toml_rest(dir.path(), "127.0.0.1", 0)).expect("parse cfg");
     let app = App::boot(cfg).await.expect("boot");
+    fn_cfg::insert(app.db(), &fn_config(REST_FN))
+        .await
+        .expect("seed listener FN in fiscal_number_config");
     payment_methods::insert(app.db_secure(), &cash_slot())
         .await
         .expect("seed D1 cash slot");
@@ -869,7 +872,11 @@ async fn rest_listener_missing_cash_slot_fails_boot() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = AppConfig::from_toml(&cfg_toml_rest(dir.path(), "127.0.0.1", 0)).expect("parse cfg");
     let app = App::boot(cfg).await.expect("boot");
-    // Seed only a cashless slot — no active CASH baseline → D1 preflight fails.
+    // FN is configured (passes the main-FN check) but has only a cashless slot
+    // — no active CASH baseline → the D1 preflight fails.
+    fn_cfg::insert(app.db(), &fn_config(REST_FN))
+        .await
+        .expect("seed listener FN in fiscal_number_config");
     payment_methods::insert(
         app.db_secure(),
         &payment_methods::NewPaymentMethod {
@@ -888,5 +895,28 @@ async fn rest_listener_missing_cash_slot_fails_boot() {
     assert!(
         format!("{err:#}").contains("D1"),
         "boot error must name the D1 preflight: {err:#}"
+    );
+}
+
+/// A `RestHttp` listener for an FN ABSENT from `fiscal_number_config` refuses
+/// to boot — even when the secure-DB `payment_methods` has a valid cash slot
+/// (the secure D1 preflight alone must NOT let a bogus listener bind).
+#[tokio::test]
+async fn rest_listener_unknown_fn_fails_boot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = AppConfig::from_toml(&cfg_toml_rest(dir.path(), "127.0.0.1", 0)).expect("parse cfg");
+    let app = App::boot(cfg).await.expect("boot");
+    // Secure DB HAS a valid cash slot for the FN, but main fiscal_number_config
+    // does NOT have the FN → boot must fail before D1/bind.
+    payment_methods::insert(app.db_secure(), &cash_slot())
+        .await
+        .expect("seed D1 cash slot");
+    let registry = empty_registry(&app).await;
+
+    let res = supervisor::run_with_registry(app, registry, async {}).await;
+    let err = res.expect_err("a listener FN absent from fiscal_number_config must fail boot");
+    assert!(
+        format!("{err:#}").contains("fiscal_number_config"),
+        "boot error must name the main-DB FN check: {err:#}"
     );
 }
