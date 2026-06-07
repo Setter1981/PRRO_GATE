@@ -104,6 +104,9 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         // client/control errors → 422 (unprocessable) / 400 (malformed).
         "READ_ONLY_COMMAND"
         | "UNSUPPORTED_COMMAND"
+        // UNSUPPORTED_COMMAND_TYPE is policy-shadowed in-band (classify_command
+        // rejects PeriodicReport as UNSUPPORTED_COMMAND before the mapper runs);
+        // retained here for the out-of-band `to_canonical_fiscal_command` caller.
         | "UNSUPPORTED_COMMAND_TYPE"
         | "FN_MISMATCH"
         | "SCHEMA_VERSION_MISMATCH"
@@ -121,7 +124,13 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         | "PAYMENT_SLOT_KIND_MISMATCH"
         | "ACQUIRER_SLIP_DEFERRED"
         | "NO_OPEN_SHIFT" => 422,
-        "INVALID_CASHIER_ID" => 400,
+        "INVALID_CASHIER_ID" | "MALFORMED_JSON" => 400,
+        // Adapter-shell codes (server.rs `adapter_error`) carry their own
+        // hard-coded status; listed here so the map stays TOTAL over the
+        // taxonomy — a future path that ever routes them through `err()`
+        // gets the right status instead of the `_ => 500` fall-through.
+        "UNKNOWN_SOURCE" | "NO_NODE_STATE" => 404,
+        "FN_FORBIDDEN" => 403,
         // ledger/internal faults → 500.
         "INBOX_LEDGER_DRIFT"
         | "LEDGER_CORRUPTION"

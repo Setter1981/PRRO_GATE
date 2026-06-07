@@ -55,16 +55,18 @@ use thiserror::Error;
 /// `payload_sha256_canonical` that `to_canonical_fiscal_command`
 /// produced, before the inbox insert.
 ///
-/// **Idempotency note (review MEDIUM-2, decision-owed before RS-3 wires
-/// convert → `ingress_inbox::insert`):** because the hash is over the
-/// converted payload and `CheckPaymentJson.name` is sourced from the
-/// editable `payment_methods` row, the inbox replay/conflict key now
-/// depends on that name.  An operator renaming a payment slot between a
-/// POS submit and its retry would flip a legitimate retry from `Replay`
-/// to `Conflict`.  The hash MUST be over `payload_json` (the drift
-/// checks in `stage_acquire`/`boot_phase` require it), so this is not a
-/// pure code fix — resolve by either accepting + auditing the narrow
-/// race, or extending the D1 admin-guard to freeze the slot *name* too.
+/// **Idempotency note (review MEDIUM-2, DECIDED — convert→insert is wired
+/// at piece-5a `handler.rs`):** the hash is over the CONVERTED payload, and
+/// `CheckPaymentJson.name` is sourced from the editable `payment_methods`
+/// row, so the inbox replay/conflict key depends on that name.  An operator
+/// renaming a payment slot between a POS submit and its retry flips a
+/// legitimate retry from `Replay` to `Conflict`.  Accepted decision: keep
+/// the honest converted-payload hash (the drift checks in
+/// `stage_acquire`/`boot_phase` require the hash to be over what was
+/// persisted), label such a conflict `config_drift: true`, and audit it —
+/// the client re-submits under a fresh idempotency_key.  Freezing the slot
+/// *name* under the D1 admin-guard was NOT chosen (the D1 guard freezes slot
+/// KIND, not name — name churn is benign for the pilot).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConvertedPayload {
     pub payload_json: String,

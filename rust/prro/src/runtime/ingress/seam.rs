@@ -80,12 +80,33 @@ pub enum FiscalError {
     NotImplemented { request_id: [u8; 16] },
     // RS-3 will add real failure variants (ShiftNotOpen, SignFailure,
     // DpsRejected, OfflineRefused, …), each likewise carrying request_id.
+    //
+    // CONTRACT for RS-3 (the highest-consequence decision): `FiscalError` is
+    // the DETERMINISTIC-refusal channel only.  A transport / ambiguous DPS
+    // failure that auto-offlines is a SUCCESS, not an error — it returns
+    // `Ok(FiscalOutcome { document_state: OfflineLocalAck, fiscal_id: None, … })`
+    // (200 + OFFLINE_LOCAL_ACK), NEVER `Err`.  Only a hard DPS reject /
+    // guard refusal (shift-not-open, sign failure) is `Err`.  `replay.rs`
+    // already encodes this asymmetry (OfflineLocalAck is an ACCEPTED replay
+    // state; OfflineRefusal is Failed) — keep the two in lock-step.
 }
 
 /// The inline-synchronous write-path entrypoint.  RS-2's handler calls
 /// [`fiscalize`](Self::fiscalize) with the persisted inbox row; RS-3's
 /// real impl drives the write-path (`stage_acquire → sign →
 /// dispatch/send` or offline-local-ack) behind the single-writer lease.
+///
+/// CONCURRENCY (RS-3 caller obligation): the inline handler does NOT
+/// serialize per-FN — `fiscalize` MAY be invoked concurrently for distinct
+/// receipts of the SAME `fiscal_number` (axum runs each POST in its own
+/// task; the inbox `insert` only serializes the same idempotency key).  The
+/// implementation MUST establish the per-FN single-writer lease itself
+/// (invariant #2; `acquire_lease` CAS NEW→PROCESSING).  It also owns the
+/// stale-`PROCESSING` reaper that re-drives a row leased-then-crashed (which
+/// reads its identity from the row — see [`InboxRow`] A-H1).  The
+/// `operation_type` on the row is the Z-vs-non-Z discriminator: for
+/// `Z_REPORT` / `SHIFT_CLOSE` the `payload_json` is WIRE intent (aggregate
+/// behind the drain barrier); for all others it is signer-ready.
 #[async_trait]
 pub trait WritePathEntry: Send + Sync {
     /// Fiscalize an inbox-accepted receipt.  Returns the outcome the

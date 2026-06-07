@@ -79,6 +79,22 @@ where
         );
     }
 
+    // Deployment-invariant WARN: a DPS request timeout longer than the
+    // shutdown grace means an in-flight drain DPS call can be cut at shutdown
+    // before its own deadline (crash-safe — the per-doc drain is idempotent —
+    // but it defeats the graceful-drain intent, #9).  Flag it; don't fail.
+    let (grace_secs, _) = cfg.clamped_shutdown_grace_seconds();
+    if timeout_secs > grace_secs {
+        tracing::warn!(
+            target: "prro::runtime::supervisor",
+            dps_request_timeout_secs = timeout_secs,
+            shutdown_grace_secs = grace_secs,
+            "DPS request timeout exceeds the shutdown grace — set \
+             supervisor.shutdown_grace_seconds >= supervisor.dps.request_timeout_seconds \
+             so an in-flight drain call can finish within grace"
+        );
+    }
+
     // Open the live DPS channel — eager connect, hard-fail on a bad endpoint.
     let dps: Arc<dyn DpsChannel> = Arc::new(
         GrpcDpsChannel::connect(&endpoint, Duration::from_secs(timeout_secs))
@@ -274,6 +290,25 @@ async fn bind_rest_ingress(
             .map(|c| c.fiscal_number)
             .collect();
 
+    // (2b) one ingress front per FN — PRE-PASS (fail fast before binding).
+    // Two RestHttp listeners for the same fiscal_number (e.g. on `127.0.0.1`
+    // and `::1`) would stand up two inline write-path entrypoints for one FN,
+    // leaning entirely on the RS-3 single-writer lease (invariant #2).  Reject
+    // at config instead.
+    let mut seen_fns: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for l in listeners
+        .iter()
+        .filter(|l| l.kind == ListenerKind::RestHttp)
+    {
+        if !seen_fns.insert(l.fiscal_number.as_str()) {
+            anyhow::bail!(
+                "RS-2 ingress: duplicate RestHttp listener for fn {} — exactly one \
+                 ingress front per fiscal_number is allowed (single-writer invariant)",
+                l.fiscal_number
+            );
+        }
+    }
+
     let mut bound = Vec::new();
     for l in listeners
         .iter()
@@ -305,9 +340,26 @@ async fn bind_rest_ingress(
         let ip = l
             .bind_ip()
             .map_err(|e| anyhow::anyhow!("RS-2 ingress bind: {e}"))?;
-        let listener = TcpListener::bind((ip, l.port))
-            .await
-            .map_err(|e| anyhow::anyhow!("RS-2 ingress bind {ip}:{}: {e}", l.port))?;
+        // SO_REUSEADDR — the supervisor is fail-stop-and-restart by design, so a
+        // restart that races an ingress connection in TIME_WAIT must still be
+        // able to re-bind the loopback port instead of boot-looping on
+        // EADDRINUSE.  (tokio's `TcpListener::bind` does not set it.)
+        let addr = std::net::SocketAddr::new(ip, l.port);
+        let socket = if ip.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()
+        } else {
+            tokio::net::TcpSocket::new_v6()
+        }
+        .map_err(|e| anyhow::anyhow!("RS-2 ingress socket {addr}: {e}"))?;
+        socket
+            .set_reuseaddr(true)
+            .map_err(|e| anyhow::anyhow!("RS-2 ingress set_reuseaddr {addr}: {e}"))?;
+        socket
+            .bind(addr)
+            .map_err(|e| anyhow::anyhow!("RS-2 ingress bind {addr}: {e}"))?;
+        let listener = socket
+            .listen(1024)
+            .map_err(|e| anyhow::anyhow!("RS-2 ingress listen {addr}: {e}"))?;
 
         let state = IngressState {
             main_pool: app.db().clone(),

@@ -920,3 +920,28 @@ async fn rest_listener_unknown_fn_fails_boot() {
         "boot error must name the main-DB FN check: {err:#}"
     );
 }
+
+/// Two `RestHttp` listeners for the SAME fiscal_number → boot fails in the
+/// dedup pre-pass (one ingress front per FN, invariant #2), before any bind —
+/// so no FN-config / D1 seeding is needed to reach it.
+#[tokio::test]
+async fn duplicate_rest_fn_fails_boot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // cfg_toml_rest adds one RestHttp listener for REST_FN; append a SECOND for
+    // the same FN on a different port (a 127.0.0.1/::1 split would be the same).
+    let toml = format!(
+        "{}\n[[listeners]]\ntype = \"rest_http\"\nport = 0\n\
+         driver_id = \"drv-rest-2\"\nfn = \"{REST_FN}\"\nlisten_addr = \"127.0.0.1\"\n",
+        cfg_toml_rest(dir.path(), "127.0.0.1", 0)
+    );
+    let cfg = AppConfig::from_toml(&toml).expect("parse cfg");
+    let app = App::boot(cfg).await.expect("boot");
+    let registry = empty_registry(&app).await;
+
+    let res = supervisor::run_with_registry(app, registry, async {}).await;
+    let err = res.expect_err("two RestHttp listeners for one FN must fail boot");
+    assert!(
+        format!("{err:#}").contains("duplicate RestHttp listener"),
+        "boot error must name the duplicate-FN guard: {err:#}"
+    );
+}

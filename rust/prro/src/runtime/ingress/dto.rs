@@ -143,6 +143,14 @@ pub struct CanonicalErrorResponse {
     pub schema_version: String,
     /// Stable machine code (e.g. `PAYLOAD_SCHEMA`, `FN_MISMATCH`,
     /// `NOT_IMPLEMENTED`, `IDEMPOTENCY_CONFLICT`).
+    ///
+    /// CONSUMER NOTE — `error_code == "IN_PROGRESS"` (HTTP 202) is the ONE
+    /// non-terminal value: the receipt is still being fiscalized (a replay of
+    /// an in-flight key), NOT rejected.  A blocking client (the WebCheck COM
+    /// shim) MUST re-poll (`GET /v1/status/:fn` or a bounded re-POST) rather
+    /// than surface it to the cashier as a failure — it switches on the HTTP
+    /// status (202 = retry), not just `ok:false`.  Every OTHER `error_code`
+    /// here is terminal for this submission.
     pub error_code: String,
     pub error_message: String,
     /// MED-2 — `true` when an idempotency `Conflict` stems from an

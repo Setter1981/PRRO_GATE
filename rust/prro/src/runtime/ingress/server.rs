@@ -84,6 +84,14 @@ pub struct IngressState {
 
 /// Allowed `:source` path segments (router A).  NOT identity/routing — purely
 /// an audit/protocol label; the FN + driver_id come ONLY from [`IngressState`].
+///
+/// OBLIGATION (RS-3 re-point): `maria304` is on the whitelist but the
+/// `maria304_driver` response mirror declares `fiscal_id: String` (required),
+/// so an `OFFLINE_LOCAL_ACK` success (`fiscal_id: null`) would FAIL-decode on
+/// that consumer.  Pre-RS-3 every POST is 501 (an error envelope it decodes
+/// fine), so the trap is latent — but the maria304 mirror MUST be made
+/// `Option<fiscal_id>` before a maria304 listener is configured against the
+/// live (post-RS-3) write-path.  See the `dto.rs` maria304-parity note.
 fn source_allowed(source: &str) -> bool {
     matches!(source, "webcheck" | "maria304")
 }
