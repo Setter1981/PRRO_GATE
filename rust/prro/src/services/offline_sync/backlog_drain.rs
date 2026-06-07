@@ -2717,7 +2717,13 @@ fn failure_class_for_retry(retry: RetryClass) -> FailureClass {
 /// sibling continues per spec §2.5 try-and-audit shim.
 fn failure_class_for_send_err(err: &StageSendError) -> FailureClass {
     match err {
-        StageSendError::OfflineFiscalNoMissing { .. } => FailureClass::OfflineFiscalNoMissing,
+        // Both producer-side offline_fiscal_no defects (NULL vs <= 0) are the
+        // same DRAIN disposition; the forensic split lives at the
+        // StageSendError + audit layer (m3b W9a Round-2 LOW #1).
+        StageSendError::OfflineFiscalNoMissing { .. }
+        | StageSendError::OfflineFiscalNoNonPositive { .. } => {
+            FailureClass::OfflineFiscalNoMissing
+        }
         StageSendError::DocumentMissingForRecovery { .. } => FailureClass::NotFound,
         StageSendError::UnsupportedDocType { .. }
         | StageSendError::LndOutOfRangeI32 { .. }
