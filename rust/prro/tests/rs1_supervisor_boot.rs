@@ -16,7 +16,7 @@ use prro::config::AppConfig;
 use prro::crypto::session::SigningSession;
 use prro::db::models::enums::{FiscalMode, NodeMode, Severity, ShiftState};
 use prro::db::repositories::{
-    audit_log, fiscal_number_config as fn_cfg, node_state, operators as ops_repo,
+    audit_log, fiscal_number_config as fn_cfg, node_state, operators as ops_repo, payment_methods,
 };
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
@@ -782,5 +782,111 @@ async fn two_pre_flip_deaths_audit_exactly_once() {
     assert_eq!(
         count, 1,
         "exactly ONE pre-flip death is the audited restart cause (got {count})"
+    );
+}
+
+// ─── RS-2 piece-5b-ii — ingress listener boot wiring ─────────────────────
+
+const REST_FN: &str = "4000000001";
+
+/// `cfg_toml` + one `RestHttp` ingress listener (port 0 = ephemeral bind).
+fn cfg_toml_rest(dir: &Path, listen_addr: &str, port: u16) -> String {
+    format!(
+        "{}\n[[listeners]]\ntype = \"rest_http\"\nport = {port}\n\
+         driver_id = \"drv-rest\"\nfn = \"{REST_FN}\"\nlisten_addr = \"{listen_addr}\"\n",
+        cfg_toml(dir)
+    )
+}
+
+async fn empty_registry(app: &App) -> Arc<BindingsRegistry> {
+    let dps: Arc<dyn DpsChannel> = Arc::new(common::StubDpsChannel::new(Ok(common::ack("t"))));
+    Arc::new(
+        BindingsRegistry::build_from_db(app.db_secure(), app.db(), dps, &NoLoader)
+            .await
+            .expect("build_from_db"),
+    )
+}
+
+fn cash_slot() -> payment_methods::NewPaymentMethod {
+    payment_methods::NewPaymentMethod {
+        fn_id: REST_FN.to_string(),
+        pay_index: 1,
+        name: "Готівка".to_string(),
+        iscash: true,
+    }
+}
+
+/// A loopback `RestHttp` listener with a valid D1 cash baseline boots through
+/// the full preflight → bind → spawn → supervise path and shuts down cleanly.
+#[tokio::test]
+async fn rest_http_listener_boots_and_shuts_down() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = AppConfig::from_toml(&cfg_toml_rest(dir.path(), "127.0.0.1", 0)).expect("parse cfg");
+    let app = App::boot(cfg).await.expect("boot");
+    payment_methods::insert(app.db_secure(), &cash_slot())
+        .await
+        .expect("seed D1 cash slot");
+    let registry = empty_registry(&app).await;
+
+    let shutdown = async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    };
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        supervisor::run_with_registry(app, registry, shutdown),
+    )
+    .await
+    .expect("supervisor must not hang");
+    assert!(
+        res.is_ok(),
+        "a loopback RestHttp listener must boot + supervise + shut down cleanly: {res:?}"
+    );
+}
+
+/// A NON-loopback `RestHttp` bind refuses to boot (D2 loopback-only pilot) —
+/// before any task is spawned.
+#[tokio::test]
+async fn non_loopback_rest_listener_fails_boot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = AppConfig::from_toml(&cfg_toml_rest(dir.path(), "0.0.0.0", 0)).expect("parse cfg");
+    let app = App::boot(cfg).await.expect("boot");
+    payment_methods::insert(app.db_secure(), &cash_slot())
+        .await
+        .expect("seed D1 cash slot");
+    let registry = empty_registry(&app).await;
+
+    let res = supervisor::run_with_registry(app, registry, async {}).await;
+    let err = res.expect_err("non-loopback RestHttp must fail boot");
+    assert!(
+        format!("{err:#}").contains("loopback"),
+        "boot error must name the loopback guard: {err:#}"
+    );
+}
+
+/// A `RestHttp` FN whose D1 cash slot is missing refuses to boot (D1 preflight).
+#[tokio::test]
+async fn rest_listener_missing_cash_slot_fails_boot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = AppConfig::from_toml(&cfg_toml_rest(dir.path(), "127.0.0.1", 0)).expect("parse cfg");
+    let app = App::boot(cfg).await.expect("boot");
+    // Seed only a cashless slot — no active CASH baseline → D1 preflight fails.
+    payment_methods::insert(
+        app.db_secure(),
+        &payment_methods::NewPaymentMethod {
+            fn_id: REST_FN.to_string(),
+            pay_index: 2,
+            name: "Картка".to_string(),
+            iscash: false,
+        },
+    )
+    .await
+    .expect("seed cashless slot");
+    let registry = empty_registry(&app).await;
+
+    let res = supervisor::run_with_registry(app, registry, async {}).await;
+    let err = res.expect_err("missing D1 cash slot must fail boot");
+    assert!(
+        format!("{err:#}").contains("D1"),
+        "boot error must name the D1 preflight: {err:#}"
     );
 }

@@ -24,10 +24,17 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
+use tokio::net::TcpListener;
+
 use crate::app::App;
-use crate::db::models::enums::Severity;
+use crate::config::ListenerKind;
+use crate::db::models::enums::{Protocol, Severity};
+use crate::db::models::ids::DriverId;
 use crate::db::repositories::audit_log;
 use crate::runtime::bindings::BindingsRegistry;
+use crate::runtime::ingress::preflight::preflight_d1_slots;
+use crate::runtime::ingress::seam::{UnimplementedWritePath, WritePathEntry};
+use crate::runtime::ingress::server::{self, IngressState};
 use crate::runtime::key_loader::{build_fn_sign, JksOperatorKeyLoader};
 use crate::services::offline_sync::return_online_probe::run_tick_for_fn;
 use crate::services::reconciliation::{ReconciliationRuntime, RuntimeView};
@@ -144,6 +151,14 @@ where
         );
     }
 
+    // ── RS-2 piece-5b-ii: ingress startup preflight + bind (BEFORE any spawn) ──
+    // A loopback-guard (D2) / D1-preflight / bind failure here is a BOOT
+    // failure — it returns Err before ANY task is spawned, so a misconfigured
+    // ingress never half-starts the spine.  Binding before spawn also makes a
+    // bind error a boot failure, NOT a runtime loop-death.
+    let write_path: Arc<dyn WritePathEntry> = Arc::new(UnimplementedWritePath);
+    let bound_ingress = bind_rest_ingress(&app, &write_path).await?;
+
     // ── 5d: spawn the drain + return-online tick loops ──
     // The FN set is fixed at registry build time (read-only post-boot), so
     // collect the keys ONCE and hand each loop an owned copy — sidesteps the
@@ -185,19 +200,102 @@ where
         Arc::clone(&registry),
         fn_ids,
         Duration::from_secs(probe_secs),
-        shutdown_rx,
+        shutdown_rx.clone(),
     );
+
+    // ── 5b-ii: spawn one axum ingress server per pre-bound RestHttp listener ──
+    // Each is a `GracefulOkAfterShutdown` supervised task: its
+    // `with_graceful_shutdown` returns `Ok(())` once the watch flips; a serve
+    // error / panic before the flip is a loop-death (F1).
+    let ingress_count = bound_ingress.len();
+    let mut tasks = vec![
+        SupervisedTask::runs_until_shutdown("drain", drain_handle),
+        SupervisedTask::runs_until_shutdown("probe", probe_handle),
+    ];
+    for (listener, state, name) in bound_ingress {
+        let handle = tokio::spawn(server::serve(listener, state, shutdown_rx.clone()));
+        tasks.push(SupervisedTask::graceful(name, handle));
+    }
 
     tracing::info!(
         target: "prro::runtime::supervisor",
         drain_interval_secs = drain_secs,
         probe_interval_secs = probe_secs,
-        "supervisor: drain + return-online loops running"
+        ingress_listeners = ingress_count,
+        "supervisor: drain + return-online + ingress tasks running"
     );
 
-    // F1 + F2: hand the wait/teardown lifecycle to the (test-injectable)
-    // supervise core.
-    supervise_until_shutdown(app, shutdown, shutdown_tx, drain_handle, probe_handle).await
+    // F1 + F2: hand the wait/teardown lifecycle to the generalized (test-
+    // injectable) supervise core over the full named task set.
+    supervise_task_set(app, shutdown, shutdown_tx, tasks).await
+}
+
+/// RS-2 piece-5b-ii — run the ingress startup preflight, then BIND every
+/// `RestHttp` listener.  Done BEFORE any task is spawned so a preflight/bind
+/// failure cleanly fails the boot (returns `Err` → process exits non-zero →
+/// orchestrator restart), and so a bind error is a BOOT failure rather than a
+/// runtime loop-death.  Returns the bound listeners + their per-listener axum
+/// [`IngressState`] + supervised-task names, ready to spawn.
+///
+/// Preflight order (fail-closed):
+///   1. D2 loopback-only guard over ALL listeners (a non-loopback `RestHttp`
+///      bind refuses to boot until the LAN token-resolver lands);
+///   2. per-`RestHttp`-FN D1 frozen-slot preflight (cash baseline + kind drift);
+///   3. `driver_id` validation + `TcpListener::bind`.
+async fn bind_rest_ingress(
+    app: &App,
+    write_path: &Arc<dyn WritePathEntry>,
+) -> anyhow::Result<Vec<(TcpListener, IngressState, String)>> {
+    let listeners = app.config().listeners.clone();
+
+    // (1) D2 loopback-only pilot — refuse a non-loopback RestHttp bind.
+    crate::config::validate_rs2_loopback_binds(&listeners)
+        .map_err(|e| anyhow::anyhow!("RS-2 ingress loopback guard: {e}"))?;
+
+    let mut bound = Vec::new();
+    for l in listeners
+        .iter()
+        .filter(|l| l.kind == ListenerKind::RestHttp)
+    {
+        // (2) D1 frozen-slot preflight per RestHttp FN.
+        preflight_d1_slots(app.db_secure(), &l.fiscal_number)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("RS-2 ingress D1 preflight (fn {}): {e}", l.fiscal_number)
+            })?;
+
+        // (3) validate driver_id + bind (bind error = boot failure).
+        let driver_id = DriverId::new(&l.driver_id).map_err(|e| {
+            anyhow::anyhow!(
+                "RS-2 ingress listener (fn {}) invalid driver_id: {e}",
+                l.fiscal_number
+            )
+        })?;
+        let ip = l
+            .bind_ip()
+            .map_err(|e| anyhow::anyhow!("RS-2 ingress bind: {e}"))?;
+        let listener = TcpListener::bind((ip, l.port))
+            .await
+            .map_err(|e| anyhow::anyhow!("RS-2 ingress bind {ip}:{}: {e}", l.port))?;
+
+        let state = IngressState {
+            main_pool: app.db().clone(),
+            secure_pool: app.db_secure().clone(),
+            listener_fn: l.fiscal_number.clone(),
+            driver_id,
+            protocol: Protocol::Rest,
+            write_path: Arc::clone(write_path),
+        };
+        let name = format!("ingress:rest:{}:{}", l.fiscal_number, l.port);
+        tracing::info!(
+            target: "prro::runtime::supervisor",
+            fiscal_number = %l.fiscal_number,
+            port = l.port,
+            "RS-2 ingress listener bound"
+        );
+        bound.push((listener, state, name));
+    }
+    Ok(bound)
 }
 
 /// The terminal-completion contract for a supervised task — how to read a
