@@ -2372,18 +2372,21 @@ async fn dispatch_prepared_via_chain(
                 total_sum_kop,
                 payload_json,
                 payload_sha256_canonical: payload_sha,
-                // W14a-2b Commit 2: boot-phase snapshot reconstruction
-                // path — `signed_by_cashier_id` is NOT persisted on the
-                // ingress_inbox row (only on `fiscal_documents` post-
-                // INSERT PREPARED).  Boot snapshot is used for resume-
-                // detect / canonical-hash verification, not as the
-                // authoritative signer surface — the doc row itself
-                // carries the persisted `signed_by_cashier_id` and
-                // signer_guard reads it from `SendInputs` (Commits 3 +
-                // 5).  Boot-context surface stays `None` here.
+                // W14a-2b Commit 2 (updated post-021): signer attribution
+                // IS now persisted on the ingress_inbox row (migration 021),
+                // but this is the PREPARED-doc REPLAY path — a
+                // `fiscal_documents` row already exists and is the
+                // AUTHORITATIVE signer surface: it carries the persisted
+                // `signed_by_cashier_id` and `signer_guard` reads it from
+                // `SendInputs` (Commits 3 + 5).  This boot snapshot command
+                // is for resume-detect / canonical-hash verification only, so
+                // it intentionally stays `None` here.  (The RS-3
+                // stale-PROCESSING reaper — a row WITHOUT a doc yet — is the
+                // path that rebuilds identity FROM the inbox; see seam.rs.)
                 signed_by_cashier_id: None,
-                // W4-Z0 piece 9 — boot reconcile is system context;
-                // no listener stamped this command.
+                // W4-Z0 piece 9: `driver_id` is likewise persisted on the
+                // inbox now (021) but unused on this PREPARED-replay path
+                // (system context; the doc is authoritative).
                 driver_id: None,
             };
 
