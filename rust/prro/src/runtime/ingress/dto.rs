@@ -8,52 +8,35 @@
 //! fixtures in `tests/ingress_dto_parity.rs` — rename in either side
 //! breaks the test.
 //!
-//! # Known scope gap — `payload_json` is wire-shape, NOT stage_sign-ready
+//! # Mapper emits WIRE shape; the SIGNER shape is produced by `convert`
 //!
-//! `to_canonical_fiscal_command` populates `CanonicalFiscalCommand.
-//! payload_json` with the **driver-wire-shape canonical JSON of
-//! `cmd.payload`** (i.e. the `ReceiptPayload` struct as serialised by
-//! serde with BTreeMap-sorted keys).  But `services/write_path/
-//! stage_sign.rs::parse_payload` (the consumer at signing time)
-//! uses `#[serde(deny_unknown_fields)]` and expects a DIFFERENT
-//! internal canonical shape:
+//! [`to_canonical_fiscal_command`] still populates
+//! `CanonicalFiscalCommand.payload_json` with the **driver-wire-shape
+//! canonical JSON of `cmd.payload`** (the `ReceiptPayload` struct, BTreeMap-
+//! sorted).  That is intentionally NOT the shape `services/write_path/
+//! stage_sign.rs::parse_payload` consumes (`#[serde(deny_unknown_fields)]`
+//! over `CheckJson` / `ZReportJson` / `ShiftOpenJson`, whose fields differ by
+//! name AND data — `price_kop` vs `price_kopecks`, `quantity_thousandths` vs
+//! `quantity_milli`, `ZReportJson.sell_count` derived from the ledger, etc.).
 //!
-//!   - `CheckJson  { items[]: { code, name, price_kop,
-//!     quantity_thousandths, sum_kop }, payments[]: { name, sum_kop,
-//!     type_code } }`        — for SELL / RETURN.
-//!   - `ZReportJson { payments[]: { name, sum_in_kop, sum_out_kop,
-//!     type_code }, sell_count, return_count }`
-//!     — for SHIFT_CLOSE / Z_REPORT.
-//!   - `ShiftOpenJson { opening_sum_kop }`
-//!     — for SHIFT_OPEN.
+//! The W3 "gap" between these shapes is **CLOSED** (RS-2):
+//!   - [`runtime::ingress::convert::convert_to_signer_payload`] (piece-2a)
+//!     converts a non-Z signable command's wire payload to the signer-ready
+//!     shape (and recomputes `payload_sha256_canonical` over the CONVERTED
+//!     JSON) — the RS-2 handler does this BEFORE the inbox write.
+//!   - `ZReport` / `ShiftClose` keep their WIRE intent in the inbox (NOT
+//!     pre-aggregated) so RS-3 can run the ledger Z-aggregation behind its
+//!     single-writer quiescence/drain barrier (the aggregation reads
+//!     `fiscal_documents` + `node_state`, which a mapper must not).
+//!   - The parity tests in `tests/ingress_dto_parity.rs` now carry POSITIVE
+//!     assertions: a SELL (with `article_code`) converts to a `CheckJson` that
+//!     PARSES THROUGH `stage_sign`'s validator
+//!     (`sell_fixture_converts_to_stage_sign_ready_payload`), and the
+//!     unsupported / read-only command types are rejected at the ingress
+//!     boundary by `classify_command` BEFORE convert/sign.
 //!
-//! The W3 DTO emits `payload.goods[].price_kopecks /
-//! quantity_milli / tax_group_1 / ...` + `payments[].type:
-//! PaymentKind enum`.  Fields do not align by name OR by data —
-//! e.g. `ZReportJson.sell_count` does not exist anywhere in the W3
-//! DTO (the driver does not emit shift counters; they are derived
-//! from the ledger).
-//!
-//! Consequence — until a conversion layer lands, the first real
-//! receipt flowing through `to_canonical_fiscal_command` →
-//! `ingress_inbox::insert` → `stage_acquire` → `stage_sign` will
-//! fail with `SignError::PayloadSchema` at the parse_payload step.
-//! The fixture parity tests in `tests/ingress_dto_parity.rs` do
-//! NOT exercise this signing-time consumption — they assert the
-//! DTO→CanonicalFiscalCommand mapping shape only.
-//!
-//! Resolution: the conversion is deferred to W4 (per-FN supervisor)
-//! or a new conversion-stage worklet between mapper and stage_acquire
-//! — see plan §3 W3 acceptance note + W4 Algorithm step 0
-//! addendum.  The DTO→CheckJson/ZReportJson/ShiftOpenJson conversion
-//! requires ledger lookups for ZReport (sell_count, return_count
-//! derived from rows since `shift_open_at_business_ts`) — that is
-//! repository-touching code, not pure DTO transformation, so it
-//! does not belong in W3.
-//!
-//! See [`tests/ingress_dto_parity.rs::
-//! mapped_payload_json_is_wire_shape_not_stage_sign_ready`]
-//! (`#[ignore]`'d to document the gap loudly without breaking CI).
+//! [`to_canonical_fiscal_command`]: crate::runtime::ingress::dto::to_canonical_fiscal_command
+//! [`runtime::ingress::convert::convert_to_signer_payload`]: crate::runtime::ingress::convert::convert_to_signer_payload
 
 use crate::db::models::enums::DocType;
 use crate::db::models::ids::{CashierId, CashierIdError};

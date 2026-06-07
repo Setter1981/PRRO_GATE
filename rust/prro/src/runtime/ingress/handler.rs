@@ -610,6 +610,15 @@ mod tests {
         ))
     }
 
+    fn service_in_cmd(idem: &str) -> CanonicalCommand {
+        parse(format!(
+            r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"SERVICE_IN",
+                "idempotency_key":"{idem}","cashier_id":null,"department":null,
+                "return_check_number":null,
+                "payload":{{"direction":"SALE","totals":{{"sale_kopecks":0,"return_kopecks":0}}}}}}"#
+        ))
+    }
+
     /// A SELL with one CASH payment (drives the `payment_methods`-backed
     /// convert path, so the converted hash includes the slot `name`).
     fn sell_cash_cmd(idem: &str) -> CanonicalCommand {
@@ -1040,6 +1049,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(c, 0, "read-only command must not enter the inbox");
+    }
+
+    /// An unsupported cash-movement command (`SERVICE_IN`) is rejected 422
+    /// UNSUPPORTED_COMMAND at the boundary and NEVER enters the inbox (the
+    /// "before any inbox write" claim, asserted at the HANDLER level — piece-7
+    /// review Low; complements the policy-level classify test).
+    #[tokio::test]
+    async fn unsupported_command_is_rejected_422_without_inbox_row() {
+        let (_d, main, secure) = fresh_pools().await;
+        let wp = UnimplementedWritePath;
+        let r = handle_command(
+            &service_in_cmd("idem-svc"),
+            FN,
+            drv(),
+            Protocol::Rest,
+            &main,
+            &secure,
+            &wp,
+        )
+        .await;
+        assert_eq!(r.http_status, 422);
+        match r.body {
+            IngressBody::Error(e) => assert_eq!(e.error_code, "UNSUPPORTED_COMMAND"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let c: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingress_inbox")
+            .fetch_one(&main)
+            .await
+            .unwrap();
+        assert_eq!(c, 0, "an unsupported command must not enter the inbox");
     }
 
     /// A convert failure (SELL with empty goods → `EMPTY_GOODS`) is rejected

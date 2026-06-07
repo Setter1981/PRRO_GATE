@@ -472,17 +472,23 @@ fn cashier_id_empty_string_returns_typed_invalid_error() {
 /// RS-2 piece-7 (M5 inversion of the former `#[ignore]`'d
 /// `mapped_payload_json_is_wire_shape_not_stage_sign_ready`): the W3 DTO↔
 /// stage_sign payload-shape gap is CLOSED by `convert::convert_to_signer_payload`
-/// (RS-2 piece-2a).  POSITIVE parse-through: the wire SELL fixture →
-/// `to_canonical_fiscal_command` (wire shape) → `convert_to_signer_payload`
-/// (signer-ready `CheckJson`) PARSES through `stage_sign`'s
-/// `deny_unknown_fields` validator, instead of being rejected.
+/// (RS-2 piece-2a).  POSITIVE parse-through: a SELL → `to_canonical_fiscal_command`
+/// (wire shape) → `convert_to_signer_payload` (signer-ready `CheckJson`) PARSES
+/// through `stage_sign`'s `deny_unknown_fields` validator, instead of being
+/// rejected.
+///
+/// NOTE: uses a SYNTHETIC SELL carrying `article_code` — NOT the shared
+/// `FIXTURE_SELL`, which omits it (`article_code` is `Option` in the wire
+/// contract, but `convert` is fail-closed on a missing item code; the negative
+/// `..._without_article_code_is_rejected_by_convert` test below pins exactly
+/// that, so this is not read as "the parity fixture is convert-ready").
 ///
 /// Gated on `test-support` (the validator is a test-support seam); the rest of
 /// this file's parity tests compile without it.  Run with
 /// `cargo test -p prro --features test-support`.
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn sell_fixture_converts_to_stage_sign_ready_payload() {
+async fn sell_with_article_code_converts_to_stage_sign_ready_payload() {
     use prro::db::models::enums::FiscalMode;
     use prro::db::repositories::fiscal_number_config::{self as fn_repo, NewFnConfig};
     use prro::db::repositories::payment_methods::{self, NewPaymentMethod};
@@ -564,6 +570,40 @@ async fn sell_fixture_converts_to_stage_sign_ready_payload() {
     validate_signer_payload_shape_for_testing(kind, &converted.payload_json, Some(2500)).expect(
         "the converted SELL CheckJson must parse through stage_sign \
          (deny_unknown_fields) — the W3 gap is closed",
+    );
+}
+
+/// review (M2): the SHARED `FIXTURE_SELL` omits `article_code` — it is `Option`
+/// in the wire contract, so the MAPPER accepts it, but RS-2 `convert` is
+/// FAIL-CLOSED on a missing item code (no line-index fallback, operator-pinned)
+/// → a maria304 SELL without `article_code` gets a typed `MissingItemCode`
+/// reject, NOT a silent fabricated code.  Pinning this here means the positive
+/// test above is never misread as "the parity fixture is convert-ready", and
+/// makes the driver's article_code obligation a CI-visible fact.
+#[tokio::test]
+async fn sell_fixture_without_article_code_is_rejected_by_convert() {
+    use prro::db::{open_pool, open_secure_pool};
+    use prro::runtime::ingress::convert::{convert_to_signer_payload, ConvertError};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let main = open_pool(&dir.path().join("m.db"))
+        .await
+        .expect("open_pool");
+    let secure = open_secure_pool(&dir.path().join("s.db"))
+        .await
+        .expect("open_secure_pool");
+
+    let cmd: CanonicalCommand = serde_json::from_str(FIXTURE_SELL).unwrap();
+    // The mapper accepts it (article_code is Option in the wire DTO) …
+    dto::to_canonical_fiscal_command(&cmd).expect("mapper accepts; article_code is Option");
+    // … but convert fails closed on the missing item code (no fallback), before
+    // any payment lookup.
+    let err = convert_to_signer_payload(&cmd, "3001234567", &main, &secure)
+        .await
+        .expect_err("FIXTURE_SELL has no article_code → convert must reject");
+    assert!(
+        matches!(err, ConvertError::MissingItemCode { .. }),
+        "expected MissingItemCode, got {err:?}"
     );
 }
 
