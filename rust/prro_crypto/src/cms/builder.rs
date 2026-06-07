@@ -313,6 +313,13 @@ pub fn sign_detached_with_content_digest(
     assemble_signed_data(profile, cert_der, &attrs_der, &signature_value)
 }
 
+// NOTE: the gateway's ATTACHED-with-signingTime signing path goes through the
+// high-level `CmsSigner::sign_with(content, CmsBuildOptions { attached: true,
+// signing_time: Some(now) })` (see rust/prro crypto/in_process.rs), which
+// matches the official ЦЗО CAdES-BES reference profile.  An earlier
+// `sign_attached_with_content_digest` low-level helper was removed: it omitted
+// `signingTime`, which diverges from that reference.
+
 // ─── Hash dispatch ──────────────────────────────────────────────────────────
 
 /// Compute the digest matching the profile's hash algorithm.

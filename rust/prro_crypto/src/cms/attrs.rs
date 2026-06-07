@@ -184,7 +184,7 @@ fn encode_signing_time_utc(t: std::time::SystemTime) -> Result<Vec<u8>, AttrsErr
 
 /// Convert UNIX seconds-since-epoch into broken-down UTC components.
 /// Hand-rolled to avoid pulling in `chrono` for one tiny use case.
-fn unix_secs_to_utc(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+fn unix_secs_to_utc(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     // Seconds-of-day.
     let days = secs / 86_400;
     let sod = (secs % 86_400) as u32;
@@ -201,8 +201,16 @@ fn unix_secs_to_utc(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = (mp + if mp < 10 { 3 } else { -9i64 as u64 }) as u32;
-    let year = (y + if month <= 2 { 1 } else { 0 }) as u32;
+    // Hinnant month: mp∈[0,11] → month = mp<10 ? mp+3 : mp-9 (Jan=mp10, Feb=mp11).
+    // MUST use signed arithmetic: the old `mp + (-9i64 as u64)` form overflowed
+    // for mp≥10 under overflow-checks (cargo test debug default) → panic on every
+    // Jan/Feb signingTime, and relied on wraparound otherwise.  mp is tiny (<12).
+    let month = (mp as i64 + if mp < 10 { 3 } else { -9 }) as u32;
+    // Keep `year` as i64 (do NOT truncate to u32): the UTCTIME 1950..=2049 range
+    // check in encode_signing_time_utc must see the TRUE year.  A u32 cast could
+    // wrap an astronomically-far-future SystemTime (year ≥ 2^32) back into the
+    // valid range and silently encode a bogus UTCTIME instead of failing fast.
+    let year = y + if month <= 2 { 1 } else { 0 };
     (year, month, day, hour, minute, second)
 }
 
@@ -254,6 +262,10 @@ fn encode_length(n: usize, out: &mut Vec<u8>) {
         out.push((n >> 8) as u8);
         out.push(n as u8);
     } else {
+        // 4-byte long form caps at 4 GiB-1; DER lengths here are KB-scale signed
+        // attributes, so this is unreachable — assert it rather than silently
+        // truncating the high bits of an oversized `n`.
+        debug_assert!(n <= 0xFFFF_FFFF, "DER length {n} exceeds 4-byte long-form");
         out.push(0x84);
         out.push((n >> 24) as u8);
         out.push((n >> 16) as u8);

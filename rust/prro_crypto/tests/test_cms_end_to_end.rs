@@ -9,7 +9,7 @@
 //! pass since real production uses random rand_e per call.
 
 use prro_crypto::{
-    cms::{CmsProfile, CmsSigner, DstuInProcessSigner},
+    cms::{CmsBuildOptions, CmsProfile, CmsSigner, DstuInProcessSigner},
     interop::prro::{der, jks},
 };
 
@@ -141,5 +141,87 @@ fn test_cms_round_trip_via_x509_parser() {
         header_size,
         claimed_inner_len,
         result.cms_der.len()
+    );
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// W4-Z3 attached-CMS proof: the high-level `CmsSigner::sign_with(.., attached:
+/// true ..)` embeds the content as `eContent` (the form DPS `sendChkV2`
+/// requires — the gateway's `InProcessProvider` drives the same API with
+/// `signing_time: Some(now)`), whereas the detached form does NOT carry the
+/// content.  `signing_time` is `None` here ONLY to isolate the eContent
+/// variable for the comparison; the signature value differs per call anyway
+/// (DSTU draws a fresh random nonce), so we assert structure, not bytes.
+#[test]
+fn test_attached_embeds_econtent_detached_does_not() {
+    let (cert_der, key_d_bytes) = match load_signing_material() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: production JKS not available");
+            return;
+        }
+    };
+    let curve = prro_crypto::Curve::dstu_pb_257();
+    let d = bytes_le_to_field(&key_d_bytes, curve.mod_words);
+    let signer = DstuInProcessSigner::new(d);
+
+    // Distinctive content so we can byte-search for it in the CMS DER.
+    let content = b"<RQ V=\"1\">PRRO-W4Z3-ATTACHED-ECONTENT-PROOF</RQ>";
+    let cms_signer = CmsSigner {
+        cert_der: &cert_der,
+        signer: &signer,
+        profile: CmsProfile::default(), // Dstu4145WithGost34311Pb
+    };
+
+    let detached = cms_signer
+        .sign_with(content, CmsBuildOptions { attached: false, signing_time: None })
+        .expect("detached sign failed")
+        .cms_der;
+    let attached = cms_signer
+        .sign_with(content, CmsBuildOptions { attached: true, signing_time: None })
+        .expect("attached sign failed")
+        .cms_der;
+
+    // Both are well-formed ContentInfo DER (outer SEQUENCE).
+    assert_eq!(detached[0], 0x30, "detached not SEQUENCE");
+    assert_eq!(attached[0], 0x30, "attached not SEQUENCE");
+
+    // ATTACHED embeds the content (eContent); DETACHED does not.
+    assert!(
+        contains_subslice(&attached, content),
+        "attached CMS must embed the content bytes as eContent"
+    );
+    // Structural strengthening (not just a coincidental byte match): the
+    // content must be wrapped in a primitive DER OCTET STRING — i.e. preceded
+    // by `04 <len>` (single-byte length for our <128-byte content) — which is
+    // exactly the eContent encoding `[0] EXPLICIT OCTET STRING(content)`.
+    assert!(content.len() < 0x80, "test content must be < 128 bytes for the framing check");
+    let mut octet_framed = vec![0x04u8, content.len() as u8];
+    octet_framed.extend_from_slice(content);
+    assert!(
+        contains_subslice(&attached, &octet_framed),
+        "attached eContent must be a primitive OCTET STRING (04 {:02X}) wrapping the content",
+        content.len()
+    );
+    assert!(
+        !contains_subslice(&detached, content),
+        "detached CMS must NOT carry the content bytes"
+    );
+    // Attached exceeds detached by at least the embedded content length.
+    assert!(
+        attached.len() >= detached.len() + content.len(),
+        "attached ({}) must exceed detached ({}) by >= content ({})",
+        attached.len(),
+        detached.len(),
+        content.len()
+    );
+    eprintln!(
+        "✓ attached={} bytes (eContent embedded) vs detached={} bytes; content={} bytes",
+        attached.len(),
+        detached.len(),
+        content.len()
     );
 }
