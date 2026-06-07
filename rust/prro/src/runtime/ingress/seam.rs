@@ -27,15 +27,30 @@
 //! single-writer entrypoint where the "finalize/drain pending shift docs
 //! before the Z aggregates" obligation becomes enforceable.
 //!
-//! **Identity comes FROM THE PERSISTED ROW (A-H1).** The real RS-3 impl
-//! MUST read the write-path identity — `driver_id` (for `driver_tax_mapping`
-//! tax-group translation + outgress routing) and `signed_by_cashier_id`
-//! (fiscal attribution) — from [`InboxRow`] itself (migration 021), NOT from
-//! the listener/runtime context.  This makes the inline first-pass and a
-//! crash-recovery reaper that re-drives a stuck `PROCESSING` row use the
-//! SAME source.  RS-3 MUST fail closed on a missing `driver_id` (a pre-021
-//! legacy row): a missing driver silently identity-maps tax groups (the
-//! W4-Z2a non-identity hazard), so it must NOT be defaulted.
+//! **Identity + amounts come FROM THE PERSISTED ROW (A-H1 / migrations
+//! 021+022).** The real RS-3 impl MUST build its `CanonicalFiscalCommand`
+//! from [`InboxRow`] ALONE — never the listener/runtime context — so the
+//! inline first-pass and a crash-recovery reaper that re-drives a stuck
+//! `PROCESSING` row use the SAME source.  The row carries every field
+//! `stage_acquire`/`stage_sign` consume: `doc_type` (← `operation_type`),
+//! `payload_json` + `payload_sha256_canonical`, `driver_id`,
+//! `signed_by_cashier_id`, `business_ts`, `total_sum_kop`.
+//!
+//! **Null-handling contract (RS-3 MUST enforce BEFORE `stage_acquire`, so a
+//! malformed row is rejected/audited, NOT driven into a `PREPARED`
+//! `fiscal_documents` row that fails late at signing):**
+//!   - `driver_id` — REQUIRED for every processed row.  Missing (a pre-021
+//!     legacy row) → a missing driver silently identity-maps tax groups (the
+//!     W4-Z2a non-identity hazard); MUST NOT be defaulted.
+//!   - `business_ts` — REQUIRED for every processed row.  It is the receipt
+//!     timestamp (→ DPS Kyiv-local epoch); missing (a pre-022 legacy row) →
+//!     reject, do NOT re-mint a fresh `now()` (that stamps the recovery time,
+//!     not the sale time).
+//!   - `total_sum_kop` — REQUIRED for SELL / RETURN (the stage_sign sum
+//!     cross-check); NULL is valid ONLY for no-total doc types (SHIFT_OPEN /
+//!     Z).  A SELL/RETURN row with NULL `total_sum_kop` → reject.
+//!   - `signed_by_cashier_id` — optional (a command legitimately has no
+//!     cashier); `None` is accepted as-is.
 
 use crate::db::models::enums::DocState;
 use crate::db::models::ids::DocumentId;

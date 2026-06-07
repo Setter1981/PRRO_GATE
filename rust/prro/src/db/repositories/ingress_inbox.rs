@@ -50,8 +50,13 @@ pub struct InboxRow {
     /// RS-2 A-H1 follow-up (migration 022).  The receipt/document timestamp
     /// (`Utc::now()` at ingest) + the wire's declared total — the two further
     /// `CanonicalFiscalCommand` fields the write-path consumes (DPS TS + the
-    /// stage_sign sum cross-check).  `business_ts` is `None` only for pre-022
-    /// legacy rows; `total_sum_kop` is `None` for SHIFT_OPEN / Z (no total).
+    /// stage_sign sum cross-check).  These columns are NULLABLE for storage
+    /// (additive migration), but RS-3 has a stricter PROCESSING contract —
+    /// `business_ts` required for every row, `total_sum_kop` required for
+    /// SELL/RETURN, rejected/audited before `stage_acquire`; see the
+    /// null-handling contract in [`crate::runtime::ingress::seam`].
+    /// `business_ts` is `None` only for pre-022 legacy rows; `total_sum_kop`
+    /// is `None` for SHIFT_OPEN / Z (no total).
     pub business_ts: Option<String>,
     pub total_sum_kop: Option<i64>,
 }
