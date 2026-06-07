@@ -405,7 +405,7 @@ async fn supervisor_fails_and_audits_when_a_loop_dies_before_shutdown() {
 // death; after → normal wind-down).  These tests drive each path with
 // injected handles, exactly as the drain-panic test above.
 
-use prro::runtime::supervisor::{ExpectedTerminal, SupervisedTask};
+use prro::runtime::supervisor::SupervisedTask;
 
 /// A handle that winds down (returns `Ok(())`) when the shutdown watch flips.
 fn winds_down_on_flip(rx: &watch::Receiver<bool>) -> tokio::task::JoinHandle<anyhow::Result<()>> {

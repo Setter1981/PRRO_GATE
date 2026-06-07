@@ -22,6 +22,15 @@
 //! This module is the axum SHELL only: it deserialises the wire DTO, calls the
 //! piece-5a core, and renders [`IngressResponse`] as an HTTP response.  All
 //! fiscal logic lives behind the `handle_command` seam.
+//!
+//! **Pilot-hardening gap (review M-1, TRACKED — not wired here):** there is no
+//! per-request / per-connection timeout or connection cap (the `tower-http`
+//! `timeout` feature is a declared dep but unused).  Under D2 loopback-only the
+//! blast radius is a local buggy/wedged shim holding connections (bounded at
+//! shutdown by the supervisor's shared grace), NOT a remote attacker.  Before
+//! the bind boundary moves off loopback, wire a
+//! `tower_http::timeout::TimeoutLayer` (aligned to the DPS deadline once RS-3
+//! adds wire calls) + a hyper header-read timeout + a connection cap.
 
 use std::sync::Arc;
 
@@ -119,6 +128,15 @@ async fn ingress_post(
     body: Bytes,
 ) -> Response {
     if !source_allowed(&source) {
+        // review L-2: shell-level rejections are pre-fiscal (no ledger
+        // effect) so they are NOT audited, but a burst (a misconfigured
+        // front-end / a probe) must be operator-visible — trace it.
+        tracing::warn!(
+            target: "prro::runtime::ingress",
+            fiscal_number = %state.listener_fn,
+            source = %source,
+            "ingress: rejected unknown source"
+        );
         return adapter_error(
             StatusCode::NOT_FOUND,
             "UNKNOWN_SOURCE",
@@ -129,10 +147,20 @@ async fn ingress_post(
     let cmd: CanonicalCommand = match serde_json::from_slice(&body) {
         Ok(c) => c,
         Err(e) => {
+            // review L-1/L-2: log the parse detail SERVER-SIDE; return a
+            // GENERIC message to the wire (do NOT forward a third-party
+            // error's Display to the client).
+            tracing::warn!(
+                target: "prro::runtime::ingress",
+                fiscal_number = %state.listener_fn,
+                source = %source,
+                error = %e,
+                "ingress: rejected malformed CanonicalCommand JSON"
+            );
             return adapter_error(
                 StatusCode::BAD_REQUEST,
                 "MALFORMED_JSON",
-                format!("invalid CanonicalCommand JSON: {e}"),
+                "request body is not a valid CanonicalCommand".to_string(),
             );
         }
     };
