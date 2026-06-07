@@ -1,0 +1,98 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT request_id      as \"request_id: Vec<u8>\",\n                          fiscal_number,\n                          protocol         as \"protocol: Protocol\",\n                          operation_type,\n                          idempotency_key,\n                          status,\n                          payload_json,\n                          payload_sha256_canonical as \"payload_sha256_canonical: Vec<u8>\",\n                          correlation_id,\n                          received_at,\n                          signed_by_cashier_id,\n                          driver_id,\n                          business_ts,\n                          total_sum_kop\n                   FROM ingress_inbox\n                   WHERE fiscal_number = ? AND idempotency_key = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "request_id: Vec<u8>",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "fiscal_number",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "protocol: Protocol",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "operation_type",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "idempotency_key",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "status",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "payload_json",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "payload_sha256_canonical: Vec<u8>",
+        "ordinal": 7,
+        "type_info": "Blob"
+      },
+      {
+        "name": "correlation_id",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "received_at",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "signed_by_cashier_id",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "driver_id",
+        "ordinal": 11,
+        "type_info": "Text"
+      },
+      {
+        "name": "business_ts",
+        "ordinal": 12,
+        "type_info": "Text"
+      },
+      {
+        "name": "total_sum_kop",
+        "ordinal": 13,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "c722f279b0ae52495fd11d049bfafc0b0a68577ac74edac422cc96719847e706"
+}

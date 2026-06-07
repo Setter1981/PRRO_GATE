@@ -1,19 +1,25 @@
-//! M4 W1 acceptance — the `runtime::ingress` module skeleton compiles
-//! and the `IngressServer` type is reachable from the public API.
+//! RS-2 — the `runtime::ingress` public surface is reachable + compiles.
 //!
-//! This test deliberately does **not** wire anything up.  W1 is a pure
-//! skeleton; HTTP routing arrives in W3, boot wiring in W7.  Per
-//! `docs/superpowers/plans/2026-05-25-m4-ingress-plan.md` §3 W1
-//! Acceptance: "binary functionally identical to HEAD".  We assert
-//! that property structurally by referencing the type without
-//! constructing the server task.
+//! Supersedes the M4 W1 `IngressServer` skeleton smoke test: RS-2 replaced the
+//! no-op `IngressServer` stub with the real axum server (`server`) + the
+//! axum-free handler core + the D1 startup preflight.  This fixture asserts the
+//! public surface other crates / the supervisor wire against is reachable;
+//! reaching the paths IS the assertion (a missing/`pub`-less item fails to
+//! compile here).
 
-use prro::runtime::ingress::IngressServer;
+use prro::runtime::ingress::preflight::{preflight_d1_slots, D1PreflightError};
+use prro::runtime::ingress::server::{router, serve, IngressState, MAX_BODY_BYTES};
 
 #[test]
-fn ingress_server_type_reachable() {
-    // Reaching the path is the assertion.  If `runtime::ingress` were
-    // not declared, or `IngressServer` not pub, this fixture would
-    // fail to compile.
-    let _marker: Option<IngressServer> = None;
+fn ingress_public_surface_reachable() {
+    // Function items referenced as values — no need to name their axum return
+    // types in this (non-axum-dep) test crate.
+    let _ = router;
+    let _ = serve;
+    let _ = preflight_d1_slots;
+    let _ = MAX_BODY_BYTES;
+
+    // Public types are nameable.
+    fn _takes_state(_s: IngressState) {}
+    fn _takes_err(_e: D1PreflightError) {}
 }

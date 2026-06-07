@@ -13,6 +13,22 @@ use prro::db::repositories::fn_outgress_profile::OutgressProfile;
 use prro::db::repositories::{fiscal_number_config as fn_cfg, fn_integration_flags};
 use prro::db::{open_pool, open_secure_pool};
 use sqlx::SqlitePool;
+use std::collections::HashSet;
+
+/// CF2 — an EMPTY RS-2-enabled-FN set.  The existing direct-call tests use
+/// non-RS-2 FNs / free slots, so the protected-slot guard is a no-op for them
+/// (behaviour unchanged).  The dedicated `protected_slot_*` tests build a
+/// populated set to exercise the guard.
+fn rs2_none() -> HashSet<String> {
+    HashSet::new()
+}
+
+/// CF2 — an RS-2-enabled-FN set containing exactly `fn_id`.
+fn rs2_with(fn_id: &str) -> HashSet<String> {
+    let mut s = HashSet::new();
+    s.insert(fn_id.to_string());
+    s
+}
 
 async fn fresh_main_pool() -> (tempfile::TempDir, SqlitePool) {
     let dir = tempfile::tempdir().unwrap();
@@ -209,7 +225,7 @@ async fn add_payment_method_rejects_pay_index_zero() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    let err = cli::add_payment_method(&pool_main, &pool_secure, "4000000001", 0, "Bogus", false)
+    let err = cli::add_payment_method(&pool_main, &pool_secure, &rs2_none(), "4000000001", 0, "Bogus", false)
         .await
         .expect_err("must reject pay_index=0");
     assert!(matches!(err, CfgAdminError::InvalidPayIndex(0)));
@@ -221,7 +237,7 @@ async fn add_payment_method_rejects_pay_index_out_of_range() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    let err = cli::add_payment_method(&pool_main, &pool_secure, "4000000001", 100, "Bogus", false)
+    let err = cli::add_payment_method(&pool_main, &pool_secure, &rs2_none(), "4000000001", 100, "Bogus", false)
         .await
         .expect_err("must reject pay_index=100");
     assert!(matches!(err, CfgAdminError::InvalidPayIndex(100)));
@@ -358,7 +374,7 @@ async fn add_payment_method_happy_path() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    cli::add_payment_method(&pool_main, &pool_secure, "4000000001", 5, "Visa", false)
+    cli::add_payment_method(&pool_main, &pool_secure, &rs2_none(), "4000000001", 5, "Visa", false)
         .await
         .expect("add");
 
@@ -379,11 +395,11 @@ async fn add_payment_method_rejects_duplicate_name() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    cli::add_payment_method(&pool_main, &pool_secure, "4000000001", 5, "Visa", false)
+    cli::add_payment_method(&pool_main, &pool_secure, &rs2_none(), "4000000001", 5, "Visa", false)
         .await
         .unwrap();
 
-    let err = cli::add_payment_method(&pool_main, &pool_secure, "4000000001", 6, "Visa", false)
+    let err = cli::add_payment_method(&pool_main, &pool_secure, &rs2_none(), "4000000001", 6, "Visa", false)
         .await
         .expect_err("must reject duplicate name");
     assert!(matches!(err, CfgAdminError::DuplicatePaymentName(..)));
@@ -395,10 +411,10 @@ async fn update_payment_method_changes_iscash() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    cli::add_payment_method(&pool_main, &pool_secure, "4000000001", 5, "Visa", false)
+    cli::add_payment_method(&pool_main, &pool_secure, &rs2_none(), "4000000001", 5, "Visa", false)
         .await
         .unwrap();
-    cli::update_payment_method(&pool_main, &pool_secure, "4000000001", 5, None, Some(true))
+    cli::update_payment_method(&pool_main, &pool_secure, &rs2_none(), "4000000001", 5, None, Some(true))
         .await
         .expect("update");
 
@@ -418,10 +434,10 @@ async fn remove_payment_method_soft_deletes() {
     let (_sd, pool_secure) = fresh_secure_pool().await;
     seed_fn(&pool_main, "4000000001").await;
 
-    cli::add_payment_method(&pool_main, &pool_secure, "4000000001", 5, "Visa", false)
+    cli::add_payment_method(&pool_main, &pool_secure, &rs2_none(), "4000000001", 5, "Visa", false)
         .await
         .unwrap();
-    cli::remove_payment_method(&pool_main, &pool_secure, "4000000001", 5)
+    cli::remove_payment_method(&pool_main, &pool_secure, &rs2_none(), "4000000001", 5)
         .await
         .expect("remove");
 
@@ -677,7 +693,7 @@ async fn all_mutation_events_are_info_severity() {
     )
     .await
     .unwrap();
-    cli::add_payment_method(&pool_main, &pool_secure, "4000000001", 5, "Visa", false)
+    cli::add_payment_method(&pool_main, &pool_secure, &rs2_none(), "4000000001", 5, "Visa", false)
         .await
         .unwrap();
     cli::set_flag(
@@ -707,4 +723,119 @@ async fn all_mutation_events_are_info_severity() {
         );
     }
     let _ = audit_log::append;
+}
+
+// ─── CF2 — D1 frozen-slot admin guard (RS-2-enabled FNs) ────────────
+//
+// On an FN with a live RS-2 RestHttp listener, the D1 protected slots (1..=4)
+// are frozen: not removable/inactivatable, kind fixed (slot 1 cash, 2..=4
+// cashless).  Non-RS-2 FNs + free slots (≥5) are unconstrained.
+
+const RS2_FN: &str = "4000000001";
+
+/// CF2 — removing a protected slot (1..=4) on an RS-2-enabled FN is blocked.
+#[tokio::test]
+async fn protected_slot_remove_blocked_on_rs2_fn() {
+    let (_dm, pool_main) = fresh_main_pool().await;
+    let (_ds, pool_secure) = fresh_secure_pool().await;
+    seed_fn(&pool_main, RS2_FN).await;
+    // Seed slot 1 (cash) with the guard OFF (empty RS-2 set).
+    cli::add_payment_method(&pool_main, &pool_secure, &rs2_none(), RS2_FN, 1, "Готівка", true)
+        .await
+        .expect("seed cash slot");
+
+    let err =
+        cli::remove_payment_method(&pool_main, &pool_secure, &rs2_with(RS2_FN), RS2_FN, 1)
+            .await
+            .expect_err("protected slot removal on an RS-2 FN must be blocked");
+    assert!(
+        matches!(err, CfgAdminError::ProtectedSlotImmutable(_, 1)),
+        "got {err:?}"
+    );
+}
+
+/// CF2 — a free slot (≥5) is removable even on an RS-2-enabled FN.
+#[tokio::test]
+async fn free_slot_remove_allowed_on_rs2_fn() {
+    let (_dm, pool_main) = fresh_main_pool().await;
+    let (_ds, pool_secure) = fresh_secure_pool().await;
+    seed_fn(&pool_main, RS2_FN).await;
+    cli::add_payment_method(&pool_main, &pool_secure, &rs2_none(), RS2_FN, 5, "Visa", false)
+        .await
+        .expect("seed free slot");
+    cli::remove_payment_method(&pool_main, &pool_secure, &rs2_with(RS2_FN), RS2_FN, 5)
+        .await
+        .expect("a free slot (>=5) is removable even on an RS-2 FN");
+}
+
+/// CF2 — flipping slot 1 to non-cash on an RS-2 FN is blocked (kind frozen).
+#[tokio::test]
+async fn protected_slot_iscash_flip_blocked_on_rs2_fn() {
+    let (_dm, pool_main) = fresh_main_pool().await;
+    let (_ds, pool_secure) = fresh_secure_pool().await;
+    seed_fn(&pool_main, RS2_FN).await;
+    cli::add_payment_method(&pool_main, &pool_secure, &rs2_none(), RS2_FN, 1, "Готівка", true)
+        .await
+        .expect("seed cash slot");
+
+    let err = cli::update_payment_method(
+        &pool_main,
+        &pool_secure,
+        &rs2_with(RS2_FN),
+        RS2_FN,
+        1,
+        None,
+        Some(false),
+    )
+    .await
+    .expect_err("flipping slot 1 to non-cash on an RS-2 FN must be blocked");
+    assert!(
+        matches!(err, CfgAdminError::ProtectedSlotKind(_, 1, true, false)),
+        "got {err:?}"
+    );
+}
+
+/// CF2 — a name-only update of a correctly-kinded protected slot is allowed
+/// (the slot `name` still comes from payment_methods per D1).
+#[tokio::test]
+async fn protected_slot_name_only_update_allowed_on_rs2_fn() {
+    let (_dm, pool_main) = fresh_main_pool().await;
+    let (_ds, pool_secure) = fresh_secure_pool().await;
+    seed_fn(&pool_main, RS2_FN).await;
+    cli::add_payment_method(&pool_main, &pool_secure, &rs2_none(), RS2_FN, 1, "Готівка", true)
+        .await
+        .expect("seed cash slot");
+    cli::update_payment_method(
+        &pool_main,
+        &pool_secure,
+        &rs2_with(RS2_FN),
+        RS2_FN,
+        1,
+        Some("Готівка UAH"),
+        None,
+    )
+    .await
+    .expect("a name-only update of a correctly-kinded protected slot is allowed");
+}
+
+/// CF2 — adding a protected slot with the WRONG kind on an RS-2 FN is blocked;
+/// adding it with the CORRECT kind is allowed.
+#[tokio::test]
+async fn protected_slot_add_wrong_kind_blocked_but_correct_allowed_on_rs2_fn() {
+    let (_dm, pool_main) = fresh_main_pool().await;
+    let (_ds, pool_secure) = fresh_secure_pool().await;
+    seed_fn(&pool_main, RS2_FN).await;
+    // Slot 2 must be cashless — adding it as cash is blocked.
+    let err =
+        cli::add_payment_method(&pool_main, &pool_secure, &rs2_with(RS2_FN), RS2_FN, 2, "Bad", true)
+            .await
+            .expect_err("adding cashless slot 2 as cash on an RS-2 FN must be blocked");
+    assert!(
+        matches!(err, CfgAdminError::ProtectedSlotKind(_, 2, false, true)),
+        "got {err:?}"
+    );
+    // The correct kind (cashless) is allowed.
+    cli::add_payment_method(&pool_main, &pool_secure, &rs2_with(RS2_FN), RS2_FN, 2, "Картка", false)
+        .await
+        .expect("adding slot 2 with the correct cashless kind is allowed");
 }

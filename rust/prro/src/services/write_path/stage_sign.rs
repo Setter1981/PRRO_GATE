@@ -1110,6 +1110,27 @@ pub fn check_payload_from_json_for_testing(
     check_payload_from(header, local_number, body, total_sum_kop, tax_resolution)
 }
 
+/// RS-2 Med-6 — test-support validator covering ALL THREE signer payload
+/// shapes (`ShiftOpen` / `Check` / `ZReport`).  Confirms a produced
+/// `payload_json` parses through the SAME private `parse_payload` the
+/// signer uses (`deny_unknown_fields`), so `convert.rs` (RS-2 piece-2)
+/// can prove its output is signer-ready WITHOUT the private payload
+/// structs being exposed.  Returns the parse error string on mismatch.
+///
+/// **Use**: tests / `test-support` only.  `parse_payload` stays private;
+/// this is the narrow seam the round-2 review (Med-6) called for instead
+/// of asserting against `stage_sign` internals.
+#[cfg(any(test, feature = "test-support"))]
+pub fn validate_signer_payload_shape_for_testing(
+    kind: WireArtifactKind,
+    payload_json: &str,
+    total_sum_kop: Option<i64>,
+) -> Result<(), String> {
+    parse_payload(kind, payload_json, total_sum_kop)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 fn check_payload_from(
     header: DocumentHeader,
     local_number: u32,

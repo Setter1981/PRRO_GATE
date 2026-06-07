@@ -63,6 +63,10 @@ async fn seed_inbox_new(pool: &sqlx::SqlitePool, request_id: [u8; 16]) {
         payload_json: r#"{"items":[]}"#.into(),
         payload_sha256_canonical: [0u8; 32],
         correlation_id: None,
+        signed_by_cashier_id: None,
+        driver_id: Some("drv-test".into()),
+        business_ts: None,
+        total_sum_kop: None,
     };
     match ingress_inbox::insert(pool, &entry).await.unwrap() {
         InboxInsertOutcome::Created(_) => {}
@@ -115,10 +119,19 @@ async fn mark_processing_returns_false_state_untouched() {
     let pool = fresh_pool().await;
     let request_id = [2u8; 16];
     seed_inbox_new(&pool, request_id).await;
-    // Simulate another worker taking the lease.
+    // Simulate another worker taking the lease.  A-H1: the leased InboxRow
+    // (acquire_lease RETURNING) carries the recovery identity, so the worker
+    // / a crash-recovery reaper gets `driver_id` from the row, not context.
     with_immediate(&pool, move |tx| {
         Box::pin(async move {
-            ingress_inbox::acquire_lease(tx, &request_id).await?;
+            let leased = ingress_inbox::acquire_lease(tx, &request_id).await?;
+            let row = leased.expect("acquire_lease must return the NEW row");
+            assert_eq!(
+                row.driver_id.as_deref(),
+                Some("drv-test"),
+                "leased row must carry the persisted driver_id (RETURNING)"
+            );
+            assert_eq!(row.signed_by_cashier_id, None, "no cashier on this seed");
             Ok::<_, anyhow::Error>(())
         })
     })

@@ -38,6 +38,27 @@ pub struct InboxRow {
     pub payload_sha256_canonical: [u8; 32],
     pub correlation_id: Option<String>,
     pub received_at: String,
+    /// RS-2 A-H1 — recovery identity (migration 021).  The persisted row
+    /// is the ONLY input the write-path SEAM (and a crash-recovery reaper)
+    /// gets, so it carries the fiscal cashier attribution + the
+    /// listener-stamped `driver_id` that drives tax-group translation.
+    /// `signed_by_cashier_id` is legitimately `None` (no cashier on the
+    /// command); `driver_id` is `None` only for pre-021 legacy rows — RS-3
+    /// MUST fail closed on a missing `driver_id` for a row it processes.
+    pub signed_by_cashier_id: Option<String>,
+    pub driver_id: Option<String>,
+    /// RS-2 A-H1 follow-up (migration 022).  The receipt/document timestamp
+    /// (`Utc::now()` at ingest) + the wire's declared total — the two further
+    /// `CanonicalFiscalCommand` fields the write-path consumes (DPS TS + the
+    /// stage_sign sum cross-check).  These columns are NULLABLE for storage
+    /// (additive migration), but RS-3 has a stricter PROCESSING contract —
+    /// `business_ts` required for every row, `total_sum_kop` required for
+    /// SELL/RETURN, rejected/audited before `stage_acquire`; see the
+    /// null-handling contract in [`crate::runtime::ingress::seam`].
+    /// `business_ts` is `None` only for pre-022 legacy rows; `total_sum_kop`
+    /// is `None` for SHIFT_OPEN / Z (no total).
+    pub business_ts: Option<String>,
+    pub total_sum_kop: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +71,16 @@ pub struct NewInboxEntry {
     pub payload_json: String,
     pub payload_sha256_canonical: [u8; 32],
     pub correlation_id: Option<String>,
+    /// RS-2 A-H1 — see [`InboxRow::driver_id`] / [`InboxRow::signed_by_cashier_id`].
+    /// The handler populates `driver_id` from the listener-stamped config
+    /// and `signed_by_cashier_id` from the VALIDATED command.
+    pub signed_by_cashier_id: Option<String>,
+    pub driver_id: Option<String>,
+    /// RS-2 A-H1 follow-up (migration 022) — see [`InboxRow::business_ts`] /
+    /// [`InboxRow::total_sum_kop`].  The handler populates `business_ts` for
+    /// every new row; `total_sum_kop` from the validated command (SELL/RETURN).
+    pub business_ts: Option<String>,
+    pub total_sum_kop: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,9 +88,34 @@ pub enum InboxInsertOutcome {
     Created(InboxRow),
     Replay(InboxRow),
     Conflict {
+        /// The PERSISTED row's `request_id` (the original submission's id).
+        /// The conflict response references THIS id (not the rejected
+        /// submission's freshly-minted one), and the audit records both
+        /// identities + both hashes (RS-2 piece-4b/5a).
+        existing_request_id: [u8; 16],
         existing_payload_hash: [u8; 32],
         submitted_payload_hash: [u8; 32],
     },
+}
+
+/// RS-2 piece-5a — release a NOT-yet-durable inbox row after a seam
+/// fiscalization FAILURE (currently only `FiscalError::NotImplemented`,
+/// pre-RS-3).  **GUARDED `WHERE status = 'NEW'`:** it can NEVER delete a
+/// `PROCESSING` / `DONE` / terminal row — a future RS-3 error that fires
+/// AFTER the row advances must NOT reach this and must NOT remove a
+/// durable row.  Releasing the NEW gate lets a retry of a failed-pre-
+/// durable request re-attempt (`Created → seam` again) deterministically
+/// instead of becoming a stuck `IN_PROGRESS` replay.  Returns the rows
+/// deleted (0 if the row already advanced — benign).
+pub async fn delete_new_by_request_id(
+    pool: &SqlitePool,
+    request_id: &[u8; 16],
+) -> sqlx::Result<u64> {
+    let res = sqlx::query("DELETE FROM ingress_inbox WHERE request_id = ? AND status = 'NEW'")
+        .bind(&request_id[..])
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
 }
 
 pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<InboxInsertOutcome> {
@@ -77,7 +133,11 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
                           payload_json,
                           payload_sha256_canonical as "payload_sha256_canonical: Vec<u8>",
                           correlation_id,
-                          received_at
+                          received_at,
+                          signed_by_cashier_id,
+                          driver_id,
+                          business_ts,
+                          total_sum_kop
                    FROM ingress_inbox
                    WHERE fiscal_number = ? AND idempotency_key = ?"#,
                 n.fiscal_number,
@@ -109,9 +169,14 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
                         payload_sha256_canonical: existing_hash,
                         correlation_id: r.correlation_id,
                         received_at: r.received_at,
+                        signed_by_cashier_id: r.signed_by_cashier_id,
+                        driver_id: r.driver_id,
+                        business_ts: r.business_ts,
+                        total_sum_kop: r.total_sum_kop,
                     }));
                 } else {
                     return Ok(InboxInsertOutcome::Conflict {
+                        existing_request_id: request_id,
                         existing_payload_hash: existing_hash,
                         submitted_payload_hash: n.payload_sha256_canonical,
                     });
@@ -122,8 +187,9 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
             sqlx::query(
                 "INSERT INTO ingress_inbox (
                      request_id, fiscal_number, protocol, operation_type,
-                     idempotency_key, payload_json, payload_sha256_canonical, correlation_id
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     idempotency_key, payload_json, payload_sha256_canonical, correlation_id,
+                     signed_by_cashier_id, driver_id, business_ts, total_sum_kop
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&n.request_id[..])
             .bind(&n.fiscal_number)
@@ -133,6 +199,10 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
             .bind(&n.payload_json)
             .bind(&n.payload_sha256_canonical[..])
             .bind(n.correlation_id.as_deref())
+            .bind(n.signed_by_cashier_id.as_deref())
+            .bind(n.driver_id.as_deref())
+            .bind(n.business_ts.as_deref())
+            .bind(n.total_sum_kop)
             .execute(&mut **conn)
             .await?;
 
@@ -157,6 +227,10 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
                 payload_sha256_canonical: n.payload_sha256_canonical,
                 correlation_id: n.correlation_id.clone(),
                 received_at,
+                signed_by_cashier_id: n.signed_by_cashier_id.clone(),
+                driver_id: n.driver_id.clone(),
+                business_ts: n.business_ts.clone(),
+                total_sum_kop: n.total_sum_kop,
             }))
         })
     })
@@ -228,7 +302,11 @@ pub async fn acquire_lease(
                      payload_json,
                      payload_sha256_canonical as "payload_sha256_canonical: Vec<u8>",
                      correlation_id,
-                     received_at"#,
+                     received_at,
+                     signed_by_cashier_id,
+                     driver_id,
+                     business_ts,
+                     total_sum_kop"#,
         req_slice
     )
     .fetch_optional(&mut **tx)
@@ -255,6 +333,10 @@ pub async fn acquire_lease(
         payload_sha256_canonical: sha_array,
         correlation_id: r.correlation_id,
         received_at: r.received_at,
+        signed_by_cashier_id: r.signed_by_cashier_id,
+        driver_id: r.driver_id,
+        business_ts: r.business_ts,
+        total_sum_kop: r.total_sum_kop,
     }))
 }
 

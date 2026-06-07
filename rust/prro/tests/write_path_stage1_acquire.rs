@@ -178,6 +178,10 @@ async fn seed_inbox_with_overrides(
             payload_json: r#"{"goods":[]}"#.into(),
             payload_sha256_canonical,
             correlation_id: None,
+            signed_by_cashier_id: None,
+            driver_id: Some("drv-test".into()),
+            business_ts: None,
+            total_sum_kop: None,
         },
     )
     .await

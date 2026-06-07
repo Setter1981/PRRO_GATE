@@ -132,6 +132,12 @@ wiremock = "0.6"
 # tonic's serve_with_incoming can accept connections.
 tokio-stream = { version = "0.1", features = ["net"] }
 
+# RS-2 piece-5b-ii — `tower::ServiceExt::oneshot` drives the ingress axum
+# router in unit tests without a real socket.  `util` (not in tower's default
+# features) provides `ServiceExt`; feature-unification enables it for test
+# builds only, so the production `tower = "0.5"` dep is unchanged.
+tower = { version = "0.5", features = ["util"] }
+
 # M2 W5 ADR-M2-6 static check — syn-based scan of crypto:: + transports::
 # public API for forbidden sqlx types.  `visit` enables the syn::visit::Visit
 # trait the scanner walks; `extra-traits` gives Debug/Clone for diagnostics.

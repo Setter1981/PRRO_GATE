@@ -63,6 +63,95 @@ pub struct ListenerCfg {
     pub driver_id: String,
     #[serde(rename = "fn")]
     pub fiscal_number: String,
+
+    /// RS-2 D2 (loopback-only pilot) — **host** the ingress listener
+    /// binds to (the `port` is the field above; this is host-only).
+    /// Defaults to `127.0.0.1`.  For a `RestHttp` listener this is
+    /// validated fail-closed at supervisor startup
+    /// ([`validate_rs2_loopback_binds`]): it must parse as a
+    /// [`std::net::IpAddr`] (hostnames like `localhost` are rejected)
+    /// and be a loopback address.  `0.0.0.0` / `::` are
+    /// `UNSPECIFIED` (all-interfaces), NOT loopback, and are refused
+    /// until the LAN bearer/token-resolver lands (RS-2 §0.4 D2).
+    #[serde(default = "default_listen_addr")]
+    pub listen_addr: String,
+}
+
+fn default_listen_addr() -> String {
+    "127.0.0.1".to_string()
+}
+
+/// RS-2 D2 — error from binding-address validation of a `RestHttp`
+/// listener under the loopback-only pilot policy.
+#[derive(Debug, thiserror::Error)]
+pub enum ListenerBindError {
+    /// `listen_addr` does not parse as an `IpAddr` — hostnames
+    /// (`localhost`) and garbage are rejected fail-closed so the
+    /// loopback classification can never be fooled by a name that
+    /// resolves off-host.
+    #[error(
+        "RS-2 RestHttp listener for fn {fiscal_number}: listen_addr {listen_addr:?} is not a \
+         valid IP address (hostnames are rejected fail-closed — use 127.0.0.1)"
+    )]
+    UnparseableAddr {
+        fiscal_number: String,
+        listen_addr: String,
+    },
+
+    /// The bind address parses but is not loopback (`0.0.0.0`, `::`,
+    /// or any routable IP).  The loopback-only pilot refuses it until
+    /// the LAN token-resolver lands.
+    #[error(
+        "RS-2 RestHttp listener for fn {fiscal_number}: bind {ip} is non-loopback; the \
+         loopback-only pilot refuses it until the LAN token-resolver lands (RS-2 §0.4 D2)"
+    )]
+    NonLoopbackBind {
+        fiscal_number: String,
+        ip: std::net::IpAddr,
+    },
+}
+
+impl ListenerCfg {
+    /// Parse [`listen_addr`](Self::listen_addr) as an [`IpAddr`].
+    /// Fail-closed: a hostname (`localhost`) or garbage does NOT parse
+    /// and surfaces as [`ListenerBindError::UnparseableAddr`] — we never
+    /// fall back to a string compare that could mis-classify `::1` /
+    /// `localhost` / `0.0.0.0`.
+    ///
+    /// [`IpAddr`]: std::net::IpAddr
+    pub fn bind_ip(&self) -> Result<std::net::IpAddr, ListenerBindError> {
+        self.listen_addr.parse::<std::net::IpAddr>().map_err(|_| {
+            ListenerBindError::UnparseableAddr {
+                fiscal_number: self.fiscal_number.clone(),
+                listen_addr: self.listen_addr.clone(),
+            }
+        })
+    }
+}
+
+/// RS-2 D2 (loopback-only pilot) fail-closed guard — every `RestHttp`
+/// listener MUST bind a loopback address.  Run at supervisor startup
+/// (alongside `BindingsRegistry::build_from_db`, §0.4 CF3) BEFORE any
+/// listener binds.  Non-`RestHttp` listeners (the legacy Maria/XML-RPC
+/// TCP shells) are out of RS-2 scope and not checked here.
+///
+/// `IpAddr::is_loopback()` is the classifier: true for `127.0.0.0/8` +
+/// `::1`; false for `0.0.0.0` / `::` (`UNSPECIFIED`, all-interfaces) —
+/// the footgun is correctly refused.
+pub fn validate_rs2_loopback_binds(listeners: &[ListenerCfg]) -> Result<(), ListenerBindError> {
+    for l in listeners {
+        if l.kind != ListenerKind::RestHttp {
+            continue;
+        }
+        let ip = l.bind_ip()?;
+        if !ip.is_loopback() {
+            return Err(ListenerBindError::NonLoopbackBind {
+                fiscal_number: l.fiscal_number.clone(),
+                ip,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Listener protocol shell selector.  `#[serde(rename_all = "snake_case")]`
@@ -222,7 +311,10 @@ fn default_drain_interval_seconds() -> u64 {
 }
 
 fn default_shutdown_grace_seconds() -> u64 {
-    25
+    // Aligned with the default DPS request timeout (30s) so the out-of-box
+    // config does NOT trip the startup "grace < dps timeout" WARN — an
+    // in-flight drain DPS call can finish within grace on the default config.
+    30
 }
 
 /// Inclusive clamp bounds for the drain-ticker cadence.
@@ -352,6 +444,90 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── RS-2 D2 — loopback-only bind guard (piece-1) ─────────────
+
+    fn rest_listener(fn_id: &str, addr: &str) -> ListenerCfg {
+        ListenerCfg {
+            kind: ListenerKind::RestHttp,
+            port: 8080,
+            driver_id: "drv".to_string(),
+            fiscal_number: fn_id.to_string(),
+            listen_addr: addr.to_string(),
+        }
+    }
+
+    /// `listen_addr` is optional in TOML and defaults to loopback.
+    #[test]
+    fn listen_addr_defaults_to_loopback() {
+        let toml = r#"
+            app_name = "prro"
+            version = "0.1.0"
+            [database]
+            db_path = "var/prro.db"
+            secure_db_path = "var/secure.db"
+            [admin_ui]
+            enabled = false
+            listen = "127.0.0.1:8081"
+            [[listeners]]
+            type = "rest_http"
+            port = 8080
+            driver_id = "drv"
+            fn = "4000000001"
+        "#;
+        let cfg = AppConfig::from_toml(toml).expect("parse must succeed");
+        assert_eq!(cfg.listeners[0].listen_addr, "127.0.0.1");
+    }
+
+    /// Loopback v4 (`127.0.0.0/8`) and v6 (`::1`) pass the D2 guard.
+    #[test]
+    fn rs2_loopback_guard_accepts_ipv4_and_ipv6_loopback() {
+        for addr in ["127.0.0.1", "127.0.0.5", "::1"] {
+            let ls = [rest_listener("4000000001", addr)];
+            validate_rs2_loopback_binds(&ls)
+                .unwrap_or_else(|e| panic!("loopback {addr} must pass: {e}"));
+        }
+    }
+
+    /// `0.0.0.0` / `::` (UNSPECIFIED, all-interfaces) and routable IPs
+    /// are refused — the all-interfaces footgun is correctly closed.
+    #[test]
+    fn rs2_loopback_guard_refuses_unspecified_and_routable() {
+        for addr in ["0.0.0.0", "::", "192.168.1.5", "10.0.0.1"] {
+            let ls = [rest_listener("4000000001", addr)];
+            let err = validate_rs2_loopback_binds(&ls).expect_err("non-loopback must be refused");
+            assert!(
+                matches!(err, ListenerBindError::NonLoopbackBind { .. }),
+                "addr {addr}: expected NonLoopbackBind, got {err:?}"
+            );
+        }
+    }
+
+    /// A hostname does not parse as `IpAddr` → fail-closed (never a
+    /// string compare that could mis-classify `localhost`).
+    #[test]
+    fn rs2_loopback_guard_rejects_hostname_fail_closed() {
+        let ls = [rest_listener("4000000001", "localhost")];
+        let err = validate_rs2_loopback_binds(&ls).expect_err("hostname must fail-closed");
+        assert!(
+            matches!(err, ListenerBindError::UnparseableAddr { .. }),
+            "expected UnparseableAddr, got {err:?}"
+        );
+    }
+
+    /// Non-`RestHttp` listeners (legacy Maria/XML-RPC TCP shells) are
+    /// out of RS-2 scope and not subject to the D2 loopback guard.
+    #[test]
+    fn rs2_loopback_guard_ignores_non_rest_http_listeners() {
+        let ls = [ListenerCfg {
+            kind: ListenerKind::Maria304Tcp,
+            port: 9000,
+            driver_id: "drv".to_string(),
+            fiscal_number: "4000000001".to_string(),
+            listen_addr: "0.0.0.0".to_string(),
+        }];
+        validate_rs2_loopback_binds(&ls).expect("non-RestHttp must be ignored by the D2 guard");
+    }
 
     /// PR-A iter 1 — parses `[database].secure_db_path` field
     /// (HIGH-AUDIT-01 secure-db hard isolation; W2 plan §3 W2).

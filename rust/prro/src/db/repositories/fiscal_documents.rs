@@ -511,6 +511,125 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
         .collect()
 }
 
+/// Raw `(doc_type, payload_json)` row for [`list_shift_issued_receipts`].
+#[derive(sqlx::FromRow)]
+struct ShiftReceiptRow {
+    doc_type: DocType,
+    payload_json: String,
+}
+
+/// RS-2 piece-2b — the issued `SELL` / `RETURN` receipts of a shift, for
+/// Z-report aggregation.  Returns `(doc_type, payload_json)` for docs in
+/// the given `shift_id` whose state is a terminal **issued receipt**
+/// (`ACK` or `OFFLINE_LOCAL_ACK` — the `fiscal_documents`=issued-ledger
+/// set; in-flight `SENDING`/`KVT*`/`ERROR_RETRYABLE` and `REJECTED` are
+/// intentionally excluded, matching the W4-Z1 `<NC>` spec + the Python
+/// `shift_aggregation` parity).  `payload_json` is the **converted**
+/// signer-ready `CheckJson` (RS-2 §0.4 H5), so callers aggregate its
+/// `payments[]` directly.
+///
+/// Runtime-bound `query_as` (NOT the `query!` macro) so it needs no
+/// `.sqlx` offline-cache entry — mirrors the secure-pool repos.
+pub async fn list_shift_issued_receipts(
+    pool: &SqlitePool,
+    fn_id: &str,
+    shift_id: ShiftId,
+) -> sqlx::Result<Vec<(DocType, String)>> {
+    let rows = sqlx::query_as::<_, ShiftReceiptRow>(
+        "SELECT doc_type, payload_json \
+         FROM fiscal_documents \
+         WHERE fiscal_number = ? AND shift_id = ? \
+           AND doc_type IN ('SELL','RETURN') \
+           AND state IN ('ACK','OFFLINE_LOCAL_ACK') \
+         ORDER BY lnd",
+    )
+    .bind(fn_id)
+    .bind(shift_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.doc_type, r.payload_json))
+        .collect())
+}
+
+/// RS-2 piece-4b — the current outcome of the receipt for a `request_id`,
+/// for the ingress replay resolver.  `document_id` is rendered as
+/// lowercase 32-char hex (`lower(hex(...))`) to match
+/// `runtime::ingress::dto::request_id_to_string`.  Read-only
+/// (`fetch_optional`), runtime `query_as` (no `.sqlx` cache), NO write-tx.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TerminalOutcome {
+    pub document_id: String,
+    pub state: DocState,
+    pub doc_type: DocType,
+    pub server_fiscal_no: Option<String>,
+    /// The gateway's "DPS-confirmed-at" stamp (`first_kvt1_at`, set at the
+    /// `Sent → Kvt1` CAS, preserved to `Ack`).  `None` until a KVT1 lands
+    /// — so it is `None` for an offline-local-ack (which never reaches
+    /// KVT1).  This is the truthful fiscalization timestamp; `business_ts`
+    /// (the client receipt time) and `server_fiscal_date` (never written)
+    /// are NOT used.
+    pub first_kvt1_at: Option<String>,
+    pub total_sum_kop: Option<i64>,
+}
+
+pub async fn terminal_outcome_by_request_id(
+    pool: &SqlitePool,
+    request_id: &[u8; 16],
+) -> sqlx::Result<Option<TerminalOutcome>> {
+    sqlx::query_as::<_, TerminalOutcome>(
+        "SELECT lower(hex(document_id)) AS document_id, \
+                state, doc_type, server_fiscal_no, first_kvt1_at, total_sum_kop \
+         FROM fiscal_documents \
+         WHERE request_id = ? \
+         LIMIT 1",
+    )
+    .bind(&request_id[..])
+    .fetch_optional(pool)
+    .await
+}
+
+/// RS-2 piece-6 — the FN's most recent REAL server fiscal number, for the
+/// read-only status endpoint.  Candidate = ANY terminal `ACK` whose
+/// `server_fiscal_no` is present AND non-empty — this includes an
+/// offline-drained doc once DPS confirms it to terminal `ACK` (the filter is
+/// the terminal `state='ACK'`, NOT `fs_mode='ONLINE'`).  Excluded: an
+/// `OFFLINE_LOCAL_ACK` (a TERMINAL local-accepted state, but excluded here
+/// because it has no DPS `server_fiscal_no` yet), and an empty
+/// `server_fiscal_no` on an ACK (corrupt — `replay::build_accepted` treats it
+/// as ledger drift, so this helper must not surface it as a real number).
+///
+/// **Ranked by `lnd` DESC** — the strictly-monotonic per-FN local fiscal
+/// sequence, i.e. true issuance recency.  We deliberately do NOT rank by
+/// `first_kvt1_at`: it is stamped ONLY at the `Sent → Kvt1` CAS, so a real
+/// later ACK can have `first_kvt1_at = NULL` — both for a legacy pre-014
+/// `KVT2`/`ACK` row (migration 014 backfilled only `state='KVT1'`) AND for any
+/// offline-drain ACK that reached terminal ACK without a KVT1 stamp.  SQLite
+/// sorts NULL LAST under `DESC`, so ranking by `first_kvt1_at` would let an
+/// OLDER stamped ACK shadow a NEWER NULL one and surface a STALE fiscal number
+/// (review HIGH).  `lnd` has no NULL hazard and is co-monotonic with issuance.
+///
+/// Note: an in-flight `KVT1`/`KVT2` row already carries a `server_fiscal_no`
+/// (stamped at the `Sending → Sent` CAS) but is intentionally EXCLUDED until
+/// it reaches terminal `ACK` — the status shows the last CONFIRMED number,
+/// not one still finalizing.  Pool-bound read, NO write-tx.
+pub async fn last_server_fiscal_no(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT server_fiscal_no FROM fiscal_documents \
+         WHERE fiscal_number = ? AND state = 'ACK' \
+               AND server_fiscal_no IS NOT NULL AND length(server_fiscal_no) > 0 \
+         ORDER BY lnd DESC \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await
+}
+
 /// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 / HIGH-C4-8
 /// resolution; HIGH-C5-1 session scoping; MED-C5-4 KVT2 deferral
 /// reversed by **M3b W12 Commit 3**) — strict `lnd ASC` walker for
