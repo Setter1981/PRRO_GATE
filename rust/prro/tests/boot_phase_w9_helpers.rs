@@ -720,6 +720,20 @@ async fn migration_014_backfill_populates_first_kvt1_at_for_pre_w3_kvt1_rows() {
             .unwrap();
     assert!(cleared.is_none(), "precondition: first_kvt1_at NULL");
 
+    // Capture updated_at BEFORE the backfill.  The backfill sets
+    // `first_kvt1_at = updated_at`, but the `fd_updated_at` AFTER-UPDATE
+    // trigger (migrations/002) then BUMPS `updated_at = CURRENT_TIMESTAMP` —
+    // so the POST-backfill `updated_at` no longer equals the value the
+    // backfill copied.  Comparing the backfilled value to the post-backfill
+    // `updated_at` flaked across a one-second boundary under load; snapshot
+    // the pre-backfill value and compare to THAT.
+    let updated_at_before: String =
+        sqlx::query_scalar("SELECT updated_at FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
     // Re-run the migration backfill statement (matches
     // migrations/014_first_kvt1_at.sql).
     sqlx::query(
@@ -736,16 +750,11 @@ async fn migration_014_backfill_populates_first_kvt1_at_for_pre_w3_kvt1_rows() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    let updated_at: String =
-        sqlx::query_scalar("SELECT updated_at FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
     assert_eq!(
         backfilled.as_deref(),
-        Some(updated_at.as_str()),
-        "backfill must equal updated_at for pre-W3 Kvt1 rows"
+        Some(updated_at_before.as_str()),
+        "backfill must copy the updated_at value present at backfill time \
+         (the fd_updated_at trigger bumps updated_at afterward)"
     );
 }
 
