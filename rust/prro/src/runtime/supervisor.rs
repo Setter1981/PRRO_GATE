@@ -19,6 +19,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -198,50 +199,119 @@ where
     supervise_until_shutdown(app, shutdown, shutdown_tx, drain_handle, probe_handle).await
 }
 
-/// The supervisor's wait + teardown lifecycle (F1), factored out as a test
-/// seam.  Watches the external `shutdown` future AND both loop handles:
-///   - normal shutdown → flip the watch, join both loops within the configured
-///     grace, drop the App, `Ok`;
-///   - a loop completing BEFORE shutdown → an invariant-bug PANIC (operational
-///     errors are caught inside the tick bodies), so emit a CRITICAL
-///     `SUPERVISOR_LOOP_DIED` audit, wind down the sibling, drop the App, and
-///     return `Err` — `Cmd::Serve` propagates it, the process exits non-zero,
-///     and the process supervisor (systemd `Restart=on-failure` / docker
-///     `restart: on-failure`) re-launches.  Boot reconcile + the crash-safe
-///     W9b drain make the restart safe.
+/// The terminal-completion contract for a supervised task — how to read a
+/// task that has stopped running.
 ///
-/// `biased` keeps a normal shutdown from being misread as a task death when
-/// both are ready.  Integration tests inject a panicking handle here to drive
-/// the loop-death path without a real tick panic.
-pub async fn supervise_until_shutdown<F>(
+/// The live discriminator is whether the shutdown watch was already flipped
+/// when the task completed (see [`classify_completion`]); the tag is carried
+/// for audit context and so a future task class with different semantics
+/// (e.g. a one-shot that is SUPPOSED to finish early) slots in without
+/// re-touching this RS-1 F1 seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedTerminal {
+    /// drain / probe tick loops: run until the shutdown watch flips.  ANY
+    /// completion BEFORE the flip (`Ok`, `Err`, or panic) is an invariant-bug
+    /// loop-death.
+    RunsUntilShutdown,
+    /// axum ingress servers (RS-2 piece-5b-ii): `with_graceful_shutdown`
+    /// returns `Ok(())` NORMALLY once the watch flips.  `Ok`-AFTER-flip is the
+    /// normal graceful exit; `Ok`-BEFORE-flip (e.g. a swallowed bind/serve
+    /// error) and any `Err`/panic are loop-death.
+    GracefulOkAfterShutdown,
+}
+
+/// A supervised background task: a spawned handle + the name used in
+/// logs/audits + its terminal-completion contract.
+pub struct SupervisedTask {
+    pub name: String,
+    pub handle: JoinHandle<()>,
+    pub expected: ExpectedTerminal,
+}
+
+impl SupervisedTask {
+    /// A [`RunsUntilShutdown`](ExpectedTerminal::RunsUntilShutdown) task — the
+    /// drain / probe loops.
+    pub fn runs_until_shutdown(name: impl Into<String>, handle: JoinHandle<()>) -> Self {
+        Self {
+            name: name.into(),
+            handle,
+            expected: ExpectedTerminal::RunsUntilShutdown,
+        }
+    }
+}
+
+/// How a completed supervised task is treated.
+enum Disposition {
+    /// Expected wind-down — a panic is logged but does NOT trigger a restart.
+    Normal,
+    /// Invariant-bug loop death — CRITICAL audit + fail the supervisor for an
+    /// orchestrator restart.
+    LoopDeath,
+}
+
+/// Classify a task that stopped running, given its policy + whether the
+/// shutdown watch had already been flipped at completion time.
+///
+/// The live axis is `watch_flipped`:
+///   - BEFORE the flip nothing should stop — every policy ⇒ [`LoopDeath`]
+///     (drain/probe early exit; axum `Ok`-before-flip / `Err` / panic);
+///   - AFTER the flip every task is winding down ⇒ [`Normal`] (a panic is
+///     logged by the caller, never a NEW restart — operator: post-shutdown
+///     join results don't change F1 restart semantics).
+///
+/// `expected` is threaded for audit context + future task classes; today the
+/// two policies coincide on the `watch_flipped` axis.
+///
+/// [`LoopDeath`]: Disposition::LoopDeath
+/// [`Normal`]: Disposition::Normal
+fn classify_completion(expected: ExpectedTerminal, watch_flipped: bool) -> Disposition {
+    let _ = expected;
+    if watch_flipped {
+        Disposition::Normal
+    } else {
+        Disposition::LoopDeath
+    }
+}
+
+/// Log a join failure (a panicked task) WITHOUT triggering a restart — used
+/// for completions AFTER the watch flip (normal wind-down).
+fn log_join_failure(name: &str, res: &Result<(), tokio::task::JoinError>) {
+    if let Err(e) = res {
+        tracing::error!(
+            target: "prro::runtime::supervisor",
+            task = name,
+            error = %e,
+            "supervised task join failed (panicked during wind-down)"
+        );
+    }
+}
+
+/// The supervisor's wait + teardown lifecycle (F1), generalized to a NAMED
+/// SET of supervised tasks (RS-2 piece-5b-i — drain/probe today, + per-listener
+/// axum servers in 5b-ii).  Preserves the RS-1 F1 invariants:
+///   - **biased** shutdown priority: the external `shutdown` is polled FIRST,
+///     so a normal shutdown is never misread as a task death (and a task dying
+///     at the SAME poll as shutdown is benignly suppressed — the process is
+///     already going down, crash-equivalent / re-drained next boot);
+///   - **one shared grace** bounds the join of ALL remaining tasks (never a
+///     per-task sequential grace), matching the runbook's `TimeoutStopSec >
+///     grace` (1×) contract;
+///   - a task completing BEFORE the flip → CRITICAL `SUPERVISOR_LOOP_DIED`
+///     audit + `Err` for an orchestrator restart; AFTER the flip → normal
+///     wind-down (panics logged, no new restart).
+///
+/// Only the FIRST pre-flip loop-death is the audited restart cause; flipping
+/// the watch then winds the siblings down under the shared grace.  Integration
+/// tests inject handles here to drive each path without a real tick panic.
+pub async fn supervise_task_set<F>(
     app: App,
     shutdown: F,
     shutdown_tx: watch::Sender<bool>,
-    mut drain_handle: JoinHandle<()>,
-    mut probe_handle: JoinHandle<()>,
+    tasks: Vec<SupervisedTask>,
 ) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send,
 {
-    let wake = {
-        tokio::pin!(shutdown);
-        tokio::select! {
-            // `biased`: shutdown is polled first, so a normal shutdown is never
-            // misread as a loop death.  In the rare poll where a loop panics AT
-            // THE SAME TIME as shutdown resolves, Shutdown wins and the
-            // SUPERVISOR_LOOP_DIED audit is suppressed — benign: the process is
-            // already going down on operator request, and the panic's effects
-            // are crash-equivalent (re-drained next boot).
-            biased;
-            () = &mut shutdown => Wake::Shutdown,
-            res = &mut drain_handle => Wake::LoopDied { which: "drain", res },
-            res = &mut probe_handle => Wake::LoopDied { which: "probe", res },
-        }
-    };
-
-    // Flip the watch → the still-running loop(s) exit at their next biased
-    // select poll, and the in-flight tick bails between FNs (F2).
-    let _ = shutdown_tx.send(true);
     let (grace_secs, grace_clamped) = app.config().supervisor.clamped_shutdown_grace_seconds();
     if grace_clamped {
         tracing::warn!(
@@ -253,111 +323,138 @@ where
     }
     let grace = Duration::from_secs(grace_secs);
 
-    let result = match wake {
-        Wake::Shutdown => {
-            tracing::info!(target: "prro::runtime::supervisor", "supervisor: shutdown signal received; stopping loops");
-            // Join BOTH loops concurrently under ONE shared deadline (not two
-            // sequential graces) so total shutdown wall-clock is bounded by a
-            // single `grace` — matching the runbook's `TimeoutStopSec > grace`
-            // contract (1×, not 2×).
-            join_both_with_grace(drain_handle, probe_handle, grace).await;
+    tokio::pin!(shutdown);
+
+    // Defensive: an empty set has nothing to supervise — just await shutdown.
+    if tasks.is_empty() {
+        shutdown.await;
+        let _ = shutdown_tx.send(true);
+        drop(app);
+        return Ok(());
+    }
+
+    // Move each handle into a tagged future so a completion tells us WHICH
+    // task ended + under which policy.
+    let mut pending: FuturesUnordered<_> = tasks
+        .into_iter()
+        .map(|t| async move {
+            let res = t.handle.await;
+            (t.name, t.expected, res)
+        })
+        .collect();
+
+    // ── Phase 1: WAIT — biased shutdown priority (F1 invariant). ──
+    let first = tokio::select! {
+        biased;
+        () = &mut shutdown => None,
+        completed = pending.next() => completed,
+    };
+
+    // Flip the watch → the still-running loops exit at their next biased select
+    // poll (the in-flight tick bails between FNs, F2); axum servers begin
+    // graceful shutdown.
+    let _ = shutdown_tx.send(true);
+
+    // A pre-flip completion (Phase 1 won over shutdown) is a loop-death.
+    let mut loop_death: Option<String> = None;
+    if let Some((name, expected, res)) = first {
+        match classify_completion(expected, /* watch_flipped = */ false) {
+            Disposition::LoopDeath => {
+                audit_loop_died(&app, &name, expected, res).await;
+                loop_death = Some(name);
+            }
+            // Unreachable today (pre-flip ⇒ LoopDeath); defensive for a future
+            // "completes-early-Ok" task class.
+            Disposition::Normal => log_join_failure(&name, &res),
+        }
+    } else {
+        tracing::info!(
+            target: "prro::runtime::supervisor",
+            "supervisor: shutdown signal received; stopping tasks"
+        );
+    }
+
+    // ── Phase 2: JOIN the rest under ONE shared grace (F1 invariant). ──
+    // The watch is now flipped, so every remaining completion is expected
+    // wind-down — `classify_completion(_, watch_flipped = true)` is `Normal`
+    // for every policy by construction, so we log a panic but never trigger a
+    // NEW restart (operator: post-shutdown join results don't change F1
+    // restart semantics).
+    let join_rest = async {
+        while let Some((name, _expected, res)) = pending.next().await {
+            log_join_failure(&name, &res);
+        }
+    };
+    if tokio::time::timeout(grace, join_rest).await.is_err() {
+        tracing::warn!(
+            target: "prro::runtime::supervisor",
+            grace_secs = grace.as_secs(),
+            "supervised tasks did not finish within the shutdown grace; proceeding (per-doc drain is crash-safe)"
+        );
+    }
+
+    drop(app);
+    match loop_death {
+        Some(which) => Err(anyhow::anyhow!(
+            "supervisor: {which} task exited before shutdown — failing for orchestrator restart (see SUPERVISOR_LOOP_DIED audit)"
+        )),
+        None => {
             tracing::info!(target: "prro::runtime::supervisor", "supervisor: shut down");
             Ok(())
         }
-        Wake::LoopDied { which, res } => {
-            audit_loop_died(&app, which, res).await;
-            // Wind down + join the SIBLING (the dead one is already consumed).
-            let sibling = if which == "drain" {
-                probe_handle
-            } else {
-                drain_handle
-            };
-            let sibling_name = if which == "drain" { "probe" } else { "drain" };
-            join_with_grace(sibling, sibling_name, grace).await;
-            Err(anyhow::anyhow!(
-                "supervisor: {which} loop exited before shutdown — failing for orchestrator restart (see SUPERVISOR_LOOP_DIED audit)"
-            ))
-        }
-    };
-
-    drop(app);
-    result
-}
-
-/// Discriminates why [`supervise_until_shutdown`] woke from its wait: a normal
-/// external shutdown, or a tick loop dying first (an invariant-bug panic).
-enum Wake {
-    Shutdown,
-    LoopDied {
-        which: &'static str,
-        res: Result<(), tokio::task::JoinError>,
-    },
-}
-
-/// Join one loop handle, bounded by the shutdown grace.  On grace-elapse we
-/// log + proceed (the handle is detached, not aborted): the per-doc W9b drain
-/// is crash-safe, so an in-flight tick cut at process exit is crash-equivalent
-/// and re-drained on next boot.  Used on the loop-death path (join the one
-/// surviving sibling).
-async fn join_with_grace(handle: JoinHandle<()>, name: &str, grace: Duration) {
-    match tokio::time::timeout(grace, handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::error!(
-            target: "prro::runtime::supervisor",
-            loop_name = name,
-            error = %e,
-            "loop join failed (task panicked)"
-        ),
-        Err(_elapsed) => tracing::warn!(
-            target: "prro::runtime::supervisor",
-            loop_name = name,
-            grace_secs = grace.as_secs(),
-            "loop did not finish within the shutdown grace; proceeding (per-doc drain is crash-safe)"
-        ),
     }
 }
 
-/// Join BOTH loops concurrently under a SINGLE shared `grace` deadline (used on
-/// the normal-shutdown path).  Sequential per-loop graces would make worst-case
-/// shutdown `2 × grace`, breaking the runbook's `TimeoutStopSec > grace` (1×)
-/// contract; one shared deadline keeps total shutdown bounded by one grace.  On
-/// elapse both handles detach (crash-safe — see [`join_with_grace`]).
-async fn join_both_with_grace(drain: JoinHandle<()>, probe: JoinHandle<()>, grace: Duration) {
-    match tokio::time::timeout(grace, async { tokio::join!(drain, probe) }).await {
-        Ok((d, p)) => {
-            if let Err(e) = d {
-                tracing::error!(target: "prro::runtime::supervisor", loop_name = "drain", error = %e, "loop join failed (task panicked)");
-            }
-            if let Err(e) = p {
-                tracing::error!(target: "prro::runtime::supervisor", loop_name = "probe", error = %e, "loop join failed (task panicked)");
-            }
-        }
-        Err(_elapsed) => tracing::warn!(
-            target: "prro::runtime::supervisor",
-            grace_secs = grace.as_secs(),
-            "loops did not finish within the shutdown grace; proceeding (per-doc drain is crash-safe)"
-        ),
-    }
+/// RS-1 F1 compatibility wrapper — the drain + probe pair as a two-task
+/// supervised set.  Preserved so existing call sites/tests stay byte-stable;
+/// new call sites (RS-2 piece-5b-ii) build the [`SupervisedTask`] set directly.
+pub async fn supervise_until_shutdown<F>(
+    app: App,
+    shutdown: F,
+    shutdown_tx: watch::Sender<bool>,
+    drain_handle: JoinHandle<()>,
+    probe_handle: JoinHandle<()>,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send,
+{
+    supervise_task_set(
+        app,
+        shutdown,
+        shutdown_tx,
+        vec![
+            SupervisedTask::runs_until_shutdown("drain", drain_handle),
+            SupervisedTask::runs_until_shutdown("probe", probe_handle),
+        ],
+    )
+    .await
 }
 
-/// Emit the durable CRITICAL `SUPERVISOR_LOOP_DIED` audit when a tick loop
-/// exits before shutdown.  Panic-guarded (best-effort) like the probe-tick
+/// Emit the durable CRITICAL `SUPERVISOR_LOOP_DIED` audit when a supervised
+/// task exits before shutdown.  Panic-guarded (best-effort) like the probe-tick
 /// audit contract — if the audit insert itself fails we fall back to tracing.
-async fn audit_loop_died(app: &App, which: &str, res: Result<(), tokio::task::JoinError>) {
+async fn audit_loop_died(
+    app: &App,
+    which: &str,
+    expected: ExpectedTerminal,
+    res: Result<(), tokio::task::JoinError>,
+) {
     let panicked = res.as_ref().err().map(|e| e.is_panic()).unwrap_or(false);
     let detail = match &res {
-        Ok(()) => "task returned unexpectedly (loops run until shutdown)".to_string(),
+        Ok(()) => "task returned unexpectedly before the shutdown flip".to_string(),
         Err(e) => format!("{e}"),
     };
     tracing::error!(
         target: "prro::runtime::supervisor",
         loop_name = which,
+        expected = ?expected,
         panicked,
         detail = %detail,
-        "supervisor: loop died before shutdown — failing the supervisor for orchestrator restart"
+        "supervisor: task died before shutdown — failing the supervisor for orchestrator restart"
     );
     let payload = serde_json::json!({
         "loop": which,
+        "expected": format!("{expected:?}"),
         "panicked": panicked,
         "detail": detail,
     });
