@@ -469,132 +469,148 @@ fn cashier_id_empty_string_returns_typed_invalid_error() {
     );
 }
 
-#[test]
-#[ignore = "documents known DTO↔stage_sign payload-shape gap; see \
-            module-level 'Known scope gap' docs; conversion stage \
-            deferred to W4 / W5 supervisor wiring"]
-fn mapped_payload_json_is_wire_shape_not_stage_sign_ready() {
-    // External audit Round-1 finding HIGH-1 (2026-05-26):
-    //
-    // `to_canonical_fiscal_command` populates `payload_json` with the
-    // driver-wire-shape canonical JSON of `cmd.payload`.  But
-    // `services/write_path/stage_sign::parse_payload` uses
-    // `deny_unknown_fields` and expects a DIFFERENT internal canonical
-    // shape (`CheckJson { items[].code/price_kop/quantity_thousandths/
-    // sum_kop, payments[].type_code, ... }` for SELL/RETURN;
-    // `ZReportJson { sell_count, return_count, payments[].sum_in_kop /
-    // sum_out_kop }` for Z_REPORT; `ShiftOpenJson { opening_sum_kop }`
-    // for SHIFT_OPEN).
-    //
-    // Fields do not align by name OR by data — `ZReportJson.sell_count`
-    // and `ZReportJson.return_count` are not in the W3 DTO at all
-    // (derived from ledger rows since shift_open_at_business_ts, which
-    // is repository-touching code — not pure DTO transformation, so
-    // it does not belong in W3).
-    //
-    // This test exists to:
-    //   (a) document the gap in CI-visible form (so a future
-    //       worklet review sees it explicitly);
-    //   (b) act as the failing precondition test for W4/W5 — when the
-    //       conversion stage lands, this test gets unignored and
-    //       inverted (assert that mapped + converted payload DOES
-    //       parse through stage_sign::parse_payload).
-    //
-    // Until W4/W5: `#[ignore]`'d so CI stays green but anyone running
-    // `cargo test -- --include-ignored` sees the gap.  Acceptance
-    // criterion in plan §3 W3 ("payload_sha256_canonical matches the
-    // one that ingress_inbox::insert would compute") IS satisfied
-    // (DTO→hash is byte-stable); the OTHER half of the original
-    // §3 W3 implicit expectation ("payload_json passes through
-    // stage_sign") is the explicit W4/W5 surface.
+/// RS-2 piece-7 (M5 inversion of the former `#[ignore]`'d
+/// `mapped_payload_json_is_wire_shape_not_stage_sign_ready`): the W3 DTO↔
+/// stage_sign payload-shape gap is CLOSED by `convert::convert_to_signer_payload`
+/// (RS-2 piece-2a).  POSITIVE parse-through: the wire SELL fixture →
+/// `to_canonical_fiscal_command` (wire shape) → `convert_to_signer_payload`
+/// (signer-ready `CheckJson`) PARSES through `stage_sign`'s
+/// `deny_unknown_fields` validator, instead of being rejected.
+///
+/// Gated on `test-support` (the validator is a test-support seam); the rest of
+/// this file's parity tests compile without it.  Run with
+/// `cargo test -p prro --features test-support`.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn sell_fixture_converts_to_stage_sign_ready_payload() {
+    use prro::db::models::enums::FiscalMode;
+    use prro::db::repositories::fiscal_number_config::{self as fn_repo, NewFnConfig};
+    use prro::db::repositories::payment_methods::{self, NewPaymentMethod};
+    use prro::db::{open_pool, open_secure_pool};
+    use prro::runtime::ingress::convert::convert_to_signer_payload;
+    use prro::services::write_path::stage_sign::{
+        derive_wire_artifact_kind, validate_signer_payload_shape_for_testing,
+    };
 
-    let cmd: CanonicalCommand = serde_json::from_str(FIXTURE_SELL).unwrap();
-    let mapped =
-        dto::to_canonical_fiscal_command(&cmd).expect("DTO mapping is fine; the GAP is downstream");
+    const FN: &str = "3001234567"; // the SELL fixture's FN
 
-    // Demonstrate the gap structurally — the wire-shape payload_json
-    // contains DTO field names that stage_sign's CheckJson would
-    // reject with deny_unknown_fields.  We do NOT import stage_sign
-    // here (private internal types); the structural string check is
-    // sufficient to make the gap a CI-grep-able fact rather than
-    // tribal knowledge.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let main = open_pool(&dir.path().join("m.db"))
+        .await
+        .expect("open_pool");
+    let secure = open_secure_pool(&dir.path().join("s.db"))
+        .await
+        .expect("open_secure_pool");
+    fn_repo::insert(
+        &main,
+        &NewFnConfig {
+            fiscal_number: FN.to_string(),
+            tax_number: "12345678".to_string(),
+            vat_payer_inn: None,
+            fiscal_mode: FiscalMode::Test,
+            org_name: None,
+            point_name: None,
+            org_address: None,
+            tsp_enabled: false,
+            offline_enabled: true,
+            national_check_enabled: false,
+            min_offline_codes: 0,
+            max_offline_codes: 0,
+        },
+    )
+    .await
+    .expect("seed fn_config");
+    // The SELL fixture pays CASH → convert needs the D1 slot-1 payment method.
+    payment_methods::insert(
+        &secure,
+        &NewPaymentMethod {
+            fn_id: FN.to_string(),
+            pay_index: 1,
+            name: "Готівка".to_string(),
+            iscash: true,
+        },
+    )
+    .await
+    .expect("seed cash slot");
+
+    // A SELL with `article_code` (convert is fail-closed on a missing item
+    // code — no line-index fallback; the shared FIXTURE_SELL omits it on
+    // purpose for the mapper-level parity tests).
+    let sell = r#"{
+        "schema_version": "1.0", "fiscal_number": "3001234567",
+        "command_type": "SELL", "idempotency_key": "k", "cashier_id": "csh-007",
+        "department": "1", "return_check_number": null,
+        "payload": {
+            "direction": "SALE",
+            "goods": [{"name":"Паляниця","quantity_milli":1000,"price_kopecks":2500,
+                       "tax_group_1":1,"tax_group_2":0,"article_code":42}],
+            "payments": [{"type":"CASH","amount_kopecks":2500}],
+            "totals": {"sale_kopecks":2500,"return_kopecks":0}
+        }
+    }"#;
+    let cmd: CanonicalCommand = serde_json::from_str(sell).unwrap();
+    // The mapper still emits the WIRE shape (price_kopecks / quantity_milli) …
+    let mapped = dto::to_canonical_fiscal_command(&cmd).expect("map");
     assert!(
         mapped.payload_json.contains("price_kopecks"),
-        "wire DTO field 'price_kopecks' present — stage_sign \
-         CheckItemJson expects 'price_kop' (and would reject \
-         'price_kopecks' under deny_unknown_fields)"
+        "to_canonical_fiscal_command still emits the wire shape"
     );
-    assert!(
-        mapped.payload_json.contains("quantity_milli"),
-        "wire DTO field 'quantity_milli' present — stage_sign \
-         CheckItemJson expects 'quantity_thousandths' (and would \
-         reject 'quantity_milli' under deny_unknown_fields)"
-    );
-
-    // This negative assertion is the inversion target for W4/W5: once
-    // the conversion lands, replace it with a positive parse-through
-    // assertion using stage_sign's payload parser.
-    panic!(
-        "DTO→CheckJson conversion not yet implemented; deferred to \
-         W4/W5 supervisor wiring per plan §3 W3 acceptance note + \
-         W4 Algorithm step 0 addendum"
+    // … and the converter turns it into the signer-ready shape that PARSES
+    // through stage_sign's deny_unknown_fields validator (gap closed).
+    let converted = convert_to_signer_payload(&cmd, FN, &main, &secure)
+        .await
+        .expect("convert SELL to signer-ready payload");
+    let kind = derive_wire_artifact_kind(DocType::Sell).expect("wire artifact kind");
+    validate_signer_payload_shape_for_testing(kind, &converted.payload_json, Some(2500)).expect(
+        "the converted SELL CheckJson must parse through stage_sign \
+         (deny_unknown_fields) — the W3 gap is closed",
     );
 }
 
+/// RS-2 piece-7 (M5 inversion of the former `#[ignore]`'d
+/// `xreport_servicein_serviceout_cashwithdrawal_map_but_signer_will_reject`):
+/// the W3 audit MED-2 defer is CLOSED.  These CommandTypes are now rejected at
+/// the INGRESS BOUNDARY by `classify_command` (RS-2 piece-1b) — BEFORE convert
+/// / sign — instead of being accepted by the mapper and failing late at the
+/// signer.  X_REPORT is read-only; the cash-movement ops + PERIODIC_REPORT are
+/// unsupported.  Boundary rejection, single source of truth (the policy), no
+/// late-typed-error drift.
 #[test]
-#[ignore = "documents coupled-defer for XReport/ServiceIn/ServiceOut/\
-            CashWithdrawal — these CommandTypes map cleanly through \
-            to_canonical_fiscal_command but stage_sign::\
-            derive_wire_artifact_kind rejects them with typed \
-            UnsupportedDocType; reject-at-mapper-boundary deferred \
-            to coupled W4/W5 work"]
-fn xreport_servicein_serviceout_cashwithdrawal_map_but_signer_will_reject() {
-    // External audit Round-1 finding MED-2 (2026-05-26):
-    //
-    // Stage 3 (stage_sign::derive_wire_artifact_kind) returns
-    // `SignError::UnsupportedDocType { doc_type }` for X_REPORT,
-    // SERVICE_IN, SERVICE_OUT, CASH_WITHDRAWAL.  The W3 mapper
-    // accepts all 9 fiscal CommandTypes (only PERIODIC_REPORT is
-    // rejected at boundary — that one is non-fiscal driver-only).
-    //
-    // The defect surface is typed-error-shifted-late: an accepted
-    // ingress command can be persisted into the write path and fail
-    // later at signing instead of returning a typed boundary error
-    // upfront.  But (a) the late error IS typed (UnsupportedDocType
-    // not a panic / silent drop) and (b) reject-at-mapper-boundary
-    // means duplicating the unsupported set across two layers (DTO
-    // boundary + signer boundary) which drifts.
-    //
-    // Coupled-defer with HIGH-1: the same W4/W5 conversion-stage
-    // worklet that decides DTO→CheckJson conversion will also decide
-    // whether ServiceIn/ServiceOut/CashWithdrawal/XReport (a) gain
-    // conversion support (write-path implements their wire artifacts)
-    // OR (b) get rejected at boundary (single source of truth for
-    // unsupported set is `derive_wire_artifact_kind`'s match).
+fn read_only_and_unsupported_command_types_rejected_at_ingress_boundary() {
+    use prro::runtime::ingress::policy::{classify_command, CommandClass};
 
-    for (label, fixture, expected_doc_type) in [
-        ("X_REPORT", FIXTURE_X_REPORT, DocType::XReport),
-        ("SERVICE_IN", FIXTURE_SERVICE_IN, DocType::ServiceIn),
-        ("SERVICE_OUT", FIXTURE_SERVICE_OUT, DocType::ServiceOut),
-        (
-            "CASH_WITHDRAWAL",
-            FIXTURE_CASH_WITHDRAWAL,
-            DocType::CashWithdrawal,
-        ),
+    // X_REPORT — read-only (LEGAL X_REPORT): never fiscalized; served (if at
+    // all) by the read-only status surface, not the fiscal POST.
+    assert_eq!(
+        classify_command(CommandType::XReport),
+        CommandClass::ReadOnly
+    );
+
+    // Cash-movement ops + the driver-only PERIODIC_REPORT — typed-unsupported
+    // BEFORE any inbox write (the signer's old `UnsupportedDocType` is no
+    // longer the first line of defence).
+    for ct in [
+        CommandType::ServiceIn,
+        CommandType::ServiceOut,
+        CommandType::CashWithdrawal,
+        CommandType::PeriodicReport,
     ] {
-        let cmd: CanonicalCommand = serde_json::from_str(fixture).unwrap();
-        let mapped = dto::to_canonical_fiscal_command(&cmd)
-            .unwrap_or_else(|e| panic!("{label}: mapper currently accepts, got error: {e:?}"));
-        assert_eq!(mapped.doc_type, expected_doc_type, "{label}");
+        assert_eq!(classify_command(ct), CommandClass::Unsupported, "{ct:?}");
     }
 
-    // Inversion target for W4/W5: replace the above accept-loop with
-    // an expect_err loop asserting `MappingError::UnsupportedCommandType`
-    // at the boundary OR with an expect_ok loop that verifies the
-    // signer-side accepts the converted payload, depending on the
-    // chosen direction.
-    panic!(
-        "Coupled-defer with HIGH-1 (DTO↔stage_sign conversion); \
-         see plan §3 W3 + W4 addendum"
-    );
+    // The signable set still maps cleanly (the boundary lets these through).
+    for (label, fixture) in [
+        ("SELL", FIXTURE_SELL),
+        ("RETURN", FIXTURE_RETURN),
+        ("SHIFT_OPEN", FIXTURE_SHIFT_OPEN),
+        ("SHIFT_CLOSE", FIXTURE_SHIFT_CLOSE),
+        ("Z_REPORT", FIXTURE_Z_REPORT),
+    ] {
+        let cmd: CanonicalCommand = serde_json::from_str(fixture).unwrap();
+        assert_eq!(
+            classify_command(cmd.command_type),
+            CommandClass::Signable,
+            "{label} must be signable at the boundary"
+        );
+    }
 }
