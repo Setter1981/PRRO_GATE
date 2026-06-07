@@ -590,6 +590,28 @@ pub async fn terminal_outcome_by_request_id(
     .await
 }
 
+/// RS-2 piece-6 — the FN's most recent REAL server fiscal number, for the
+/// read-only status endpoint.  Considers ONLY a true online `ACK` with a
+/// non-null `server_fiscal_no` (operator: an `OFFLINE_LOCAL_ACK` has no DPS
+/// fiscal number and is NOT a candidate).  Ranked by `first_kvt1_at` DESC
+/// (the truthful DPS-confirmed-at stamp, consistent with the replay path —
+/// `server_fiscal_date` is never written), with `lnd` DESC as a same-stamp
+/// tiebreaker.  Pool-bound read, NO write-tx.
+pub async fn last_server_fiscal_no(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT server_fiscal_no FROM fiscal_documents \
+         WHERE fiscal_number = ? AND state = 'ACK' AND server_fiscal_no IS NOT NULL \
+         ORDER BY first_kvt1_at DESC, lnd DESC \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await
+}
+
 /// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 / HIGH-C4-8
 /// resolution; HIGH-C5-1 session scoping; MED-C5-4 KVT2 deferral
 /// reversed by **M3b W12 Commit 3**) — strict `lnd ASC` walker for

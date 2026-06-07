@@ -38,7 +38,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use sqlx::SqlitePool;
 use tokio::net::TcpListener;
@@ -46,8 +46,12 @@ use tokio::sync::watch;
 
 use crate::db::models::enums::Protocol;
 use crate::db::models::ids::{DriverId, RequestId};
+use crate::db::repositories::{fiscal_documents, node_state, offline_sessions};
 
-use super::dto::{request_id_to_string, CanonicalCommand, CanonicalErrorResponse, SCHEMA_VERSION};
+use super::dto::{
+    request_id_to_string, CanonicalCommand, CanonicalErrorResponse, OfflineSessionInfo,
+    StatusResponse, SCHEMA_VERSION,
+};
 use super::handler::{handle_command, IngressBody, IngressResponse};
 use super::seam::WritePathEntry;
 
@@ -88,6 +92,7 @@ fn source_allowed(source: &str) -> bool {
 pub fn router(state: IngressState) -> Router {
     Router::new()
         .route("/v1/ingress/:source", post(ingress_post))
+        .route("/v1/status/:fn", get(status_get))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
@@ -177,6 +182,96 @@ async fn ingress_post(
     .await;
 
     into_axum_response(resp)
+}
+
+/// `GET /v1/status/:fn` (RS-2 piece-6) — read-only status for the WebCheck
+/// shim's Initialization / GetCurrentStatus.  A pure projection of
+/// `node_state` + the last server `ACK` + the active offline session: NO
+/// write-path side effects, all reads pool-bound outside any tx.
+///
+/// **CF1 FN-enforce:** this listener serves ONE `(driver_id, fn)`; reading a
+/// DIFFERENT `:fn` through it is cross-FN data access (acute under D2
+/// loopback / no-token) → `403`.  A configured FN with no `node_state` row
+/// yet → `404` (no runtime state).
+async fn status_get(
+    State(state): State<IngressState>,
+    Path(requested_fn): Path<String>,
+) -> Response {
+    // CF1 — only the listener's own FN is readable here.
+    if requested_fn != state.listener_fn {
+        return adapter_error(
+            StatusCode::FORBIDDEN,
+            "FN_FORBIDDEN",
+            format!(
+                "this listener serves fn {:?}, not {requested_fn:?}",
+                state.listener_fn
+            ),
+        );
+    }
+
+    let ns = match node_state::get(&state.main_pool, &state.listener_fn).await {
+        Ok(Some(ns)) => ns,
+        Ok(None) => {
+            return adapter_error(
+                StatusCode::NOT_FOUND,
+                "NO_NODE_STATE",
+                format!("fn {:?} has no runtime state yet", state.listener_fn),
+            )
+        }
+        Err(e) => return status_read_error(&state.listener_fn, "node_state", &e),
+    };
+
+    let last_server_fiscal_no =
+        match fiscal_documents::last_server_fiscal_no(&state.main_pool, &state.listener_fn).await {
+            Ok(v) => v,
+            Err(e) => return status_read_error(&state.listener_fn, "last_server_fiscal_no", &e),
+        };
+
+    let offline_session = match offline_sessions::current_open_or_draining_session(
+        &state.main_pool,
+        &state.listener_fn,
+    )
+    .await
+    {
+        Ok(Some((id, st))) => Some(OfflineSessionInfo {
+            id: request_id_to_string(id.as_bytes()),
+            state: st.as_str().to_string(),
+        }),
+        Ok(None) => None,
+        Err(e) => return status_read_error(&state.listener_fn, "offline_session", &e),
+    };
+
+    let body = StatusResponse {
+        schema_version: SCHEMA_VERSION.to_string(),
+        fiscal_number: state.listener_fn.clone(),
+        node_mode: ns.mode.as_str().to_string(),
+        shift_state: ns.shift_state.as_str().to_string(),
+        current_shift_id: ns
+            .current_shift_id
+            .map(|s| request_id_to_string(s.as_bytes())),
+        next_local_number: ns.next_lnd,
+        next_z_report_number: ns.next_z_report_number,
+        last_server_fiscal_no,
+        offline_session,
+    };
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// A status-read DB error → traced (server-side) + a generic `500` (no
+/// internal detail to the wire).
+fn status_read_error(fiscal_number: &str, what: &str, err: &sqlx::Error) -> Response {
+    tracing::error!(
+        target: "prro::runtime::ingress",
+        fiscal_number = %fiscal_number,
+        read = what,
+        error = %err,
+        "status: read failed"
+    );
+    adapter_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "INTERNAL",
+        "status read failed".to_string(),
+    )
 }
 
 /// Render the core's [`IngressResponse`] as an axum response (status + JSON
@@ -342,5 +437,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // ─── piece-6 — GET /v1/status/:fn ────────────────────────────────────
+
+    use crate::db::models::enums::{NodeMode, ShiftState};
+
+    fn get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Status projects `node_state` (mode / shift / next_lnd) + carries
+    /// `schema_version`; with no acked doc + no offline session both are null.
+    #[tokio::test]
+    async fn status_reflects_node_state() {
+        let (_d, state) = fresh_state().await;
+        node_state::upsert_initial(
+            &state.main_pool,
+            FN,
+            NodeMode::Online,
+            ShiftState::Closed,
+            5,
+        )
+        .await
+        .unwrap();
+        let resp = router(state)
+            .oneshot(get(&format!("/v1/status/{FN}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let b = body_json(resp).await;
+        assert_eq!(b["schema_version"], "1.0");
+        assert_eq!(b["fiscal_number"], FN);
+        assert_eq!(b["node_mode"], "ONLINE");
+        assert_eq!(b["shift_state"], "CLOSED");
+        assert_eq!(b["next_local_number"], 5);
+        assert!(b["last_server_fiscal_no"].is_null());
+        assert!(b["offline_session"].is_null());
+    }
+
+    /// CF1 — reading a DIFFERENT FN through this listener is forbidden (403).
+    #[tokio::test]
+    async fn status_cross_fn_is_403() {
+        let (_d, state) = fresh_state().await;
+        node_state::upsert_initial(
+            &state.main_pool,
+            FN,
+            NodeMode::Online,
+            ShiftState::Closed,
+            1,
+        )
+        .await
+        .unwrap();
+        let resp = router(state)
+            .oneshot(get("/v1/status/4000000999"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let b = body_json(resp).await;
+        assert_eq!(b["error_code"], "FN_FORBIDDEN");
+    }
+
+    /// A configured FN with no `node_state` row yet → 404 (no runtime state).
+    #[tokio::test]
+    async fn status_no_node_state_is_404() {
+        let (_d, state) = fresh_state().await;
+        let resp = router(state)
+            .oneshot(get(&format!("/v1/status/{FN}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let b = body_json(resp).await;
+        assert_eq!(b["error_code"], "NO_NODE_STATE");
+    }
+
+    /// An active offline session surfaces as `offline_session: {id, state}`.
+    #[tokio::test]
+    async fn status_surfaces_active_offline_session() {
+        let (_d, state) = fresh_state().await;
+        node_state::upsert_initial(
+            &state.main_pool,
+            FN,
+            NodeMode::Offline,
+            ShiftState::Opened,
+            1,
+        )
+        .await
+        .unwrap();
+        let sid = [0x55u8; 16];
+        sqlx::query(
+            "INSERT INTO offline_sessions (offline_session_id, fiscal_number, state, opened_at) \
+             VALUES (?, ?, 'OPEN', ?)",
+        )
+        .bind(sid.as_slice())
+        .bind(FN)
+        .bind("2026-06-07T00:00:00Z")
+        .execute(&state.main_pool)
+        .await
+        .unwrap();
+        let resp = router(state)
+            .oneshot(get(&format!("/v1/status/{FN}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let b = body_json(resp).await;
+        assert_eq!(b["offline_session"]["state"], "OPEN");
+        assert_eq!(
+            b["offline_session"]["id"], "55555555555555555555555555555555",
+            "offline session id is lowercase-32-hex"
+        );
     }
 }

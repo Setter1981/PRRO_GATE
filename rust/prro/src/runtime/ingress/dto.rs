@@ -169,6 +169,45 @@ pub struct CanonicalErrorResponse {
     pub config_drift: bool,
 }
 
+/// RS-2 piece-6 — read-only status envelope for `GET /v1/status/:fn` (the
+/// WebCheck shim's Initialization / GetCurrentStatus).  An outbound canonical
+/// envelope, so it carries `schema_version` (#7).  A pure projection of
+/// `node_state` + the last server `ACK` + the active offline session — ZERO
+/// write-path side effects.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StatusResponse {
+    pub schema_version: String,
+    pub fiscal_number: String,
+    /// `node_state.mode` ([`NodeMode`](crate::db::models::enums::NodeMode)).
+    pub node_mode: String,
+    /// `node_state.shift_state` ([`ShiftState`](crate::db::models::enums::ShiftState)).
+    pub shift_state: String,
+    /// The open shift's id (lowercase-32-hex); `null` when no shift is open.
+    pub current_shift_id: Option<String>,
+    /// Next local document number (`node_state.next_lnd`).
+    pub next_local_number: i64,
+    /// Next Z-report number (`node_state.next_z_report_number`).
+    pub next_z_report_number: i64,
+    /// The FN's most recent REAL DPS fiscal number (an online `ACK` with a
+    /// non-null `server_fiscal_no`); `null` if none yet.  An
+    /// `OFFLINE_LOCAL_ACK` is NOT a candidate (it has no DPS number).
+    pub last_server_fiscal_no: Option<String>,
+    /// The active offline session (`OPEN` / `DRAINING`), or `null` when online.
+    pub offline_session: Option<OfflineSessionInfo>,
+}
+
+/// The active offline session indicator on [`StatusResponse`].  Read-only
+/// id + state; the remaining-code COUNT is intentionally NOT here (a separate
+/// follow-up — its semantics, code-state set, and HB5 correlation need
+/// pinning).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OfflineSessionInfo {
+    /// Offline session id (lowercase-32-hex).
+    pub id: String,
+    /// `offline_sessions.state` (`OPEN` / `DRAINING`).
+    pub state: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandType {

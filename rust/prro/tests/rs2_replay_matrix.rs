@@ -52,13 +52,37 @@ async fn seed_doc(
     server_fiscal_no: Option<&str>,
     total_sum_kop: Option<i64>,
 ) {
+    // lnd=1 by default; multi-doc tests use `seed_doc_lnd` (ux_fd_fn_lnd is
+    // UNIQUE on (fiscal_number, lnd)).
+    seed_doc_lnd(
+        pool,
+        request_id,
+        1,
+        doc_type,
+        state,
+        server_fiscal_no,
+        total_sum_kop,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn seed_doc_lnd(
+    pool: &SqlitePool,
+    request_id: [u8; 16],
+    lnd: i64,
+    doc_type: DocType,
+    state: DocState,
+    server_fiscal_no: Option<&str>,
+    total_sum_kop: Option<i64>,
+) {
     let new = fd::NewDocument {
         document_id: DocumentId::new(),
         request_id: RequestId::from_bytes(request_id),
         fiscal_number: FN.to_string(),
         shift_id: None,
         offline_session_id: None,
-        lnd: 1,
+        lnd,
         doc_type,
         backend_profile_id: "b".to_string(),
         transport_profile_id: "t".to_string(),
@@ -295,4 +319,64 @@ async fn processing_with_cancelled_doc_is_failed() {
         ReplayResolution::Failed(e) => assert_eq!(e.error_code, "FISCAL_REJECTED"),
         other => panic!("expected Failed, got {other:?}"),
     }
+}
+
+/// piece-6 — `last_server_fiscal_no` returns ONLY a real online `ACK` with a
+/// non-null `server_fiscal_no`.  An `OFFLINE_LOCAL_ACK` (no DPS number) is NOT
+/// a candidate even at a higher lnd; the most recent qualifying ACK wins.
+#[tokio::test]
+async fn last_server_fiscal_no_only_real_acks() {
+    let (_d, pool) = fresh_main_pool().await;
+    // No acked docs yet → None.
+    assert_eq!(fd::last_server_fiscal_no(&pool, FN).await.unwrap(), None);
+
+    // An online ACK with a DPS fiscal number.
+    seed_doc_lnd(
+        &pool,
+        [21u8; 16],
+        1,
+        DocType::Sell,
+        DocState::Ack,
+        Some("777001"),
+        Some(15000),
+    )
+    .await;
+    // An OFFLINE_LOCAL_ACK (no DPS number) at a HIGHER lnd — NOT a candidate.
+    seed_doc_lnd(
+        &pool,
+        [22u8; 16],
+        2,
+        DocType::Sell,
+        DocState::OfflineLocalAck,
+        None,
+        Some(9000),
+    )
+    .await;
+    assert_eq!(
+        fd::last_server_fiscal_no(&pool, FN)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("777001"),
+        "offline-local-ack must not shadow a real ACK"
+    );
+
+    // A newer online ACK wins (most recent).
+    seed_doc_lnd(
+        &pool,
+        [23u8; 16],
+        3,
+        DocType::Sell,
+        DocState::Ack,
+        Some("888002"),
+        Some(20000),
+    )
+    .await;
+    assert_eq!(
+        fd::last_server_fiscal_no(&pool, FN)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("888002")
+    );
 }
