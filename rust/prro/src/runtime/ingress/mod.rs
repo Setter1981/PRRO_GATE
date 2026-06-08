@@ -21,3 +21,4 @@ pub mod preflight;
 pub mod replay;
 pub mod seam;
 pub mod server;
+pub mod z_builder;
