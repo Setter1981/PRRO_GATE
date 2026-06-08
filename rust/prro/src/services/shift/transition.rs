@@ -44,6 +44,14 @@ use crate::services::write_path::types::hex_encode_lower as hex_lower;
 /// is wired (RS-3 A-pieces); C1's callers all transition the already-
 /// active shift, so the symmetric mirror suffices.
 ///
+/// POINTER LIFECYCLE: this mirror updates `shift_state` ONLY. On a
+/// terminal close (`Closing → Closed`) it therefore leaves
+/// `current_shift_id` pointing at the now-`Closed` shift — same as before
+/// C1. Orphan resolution clears the pointer ([`clear_active_shift_projection`]),
+/// but whether a *normal* close should also clear it is an RS-3 A-piece
+/// decision (the next `stage_acquire` open will overwrite it regardless).
+/// `terminal_close_pins_current_shift_id_behavior` locks the status quo.
+///
 /// Returns the shift CAS outcome. The mirror itself failing
 /// (`rows_affected != 1` on an `Applied` shift) is structural drift →
 /// `Err`, rolling back the caller's envelope.

@@ -134,9 +134,15 @@ async fn forbidden_edge_touches_neither_table() {
         .unwrap();
 
     assert!(matches!(outcome, TransitionOutcome::Forbidden { .. }));
-    // Projection must NOT be touched when the shift did not move.
+    // Projection must NOT be touched when the shift did not move — neither
+    // shift_state nor the current_shift_id pointer.
     assert_eq!(read_shift_state(&pool, shift_id).await, ShiftState::Opened);
     assert_eq!(read_node_shift_state(&pool).await, ShiftState::Opened);
+    assert_eq!(
+        read_current_shift_id(&pool).await,
+        Some(shift_id.as_bytes().to_vec()),
+        "Forbidden must leave the current_shift_id pointer intact"
+    );
 }
 
 #[tokio::test]
@@ -153,10 +159,33 @@ async fn projection_drift_rolls_back_the_whole_envelope() {
     let res = apply(&pool, shift_id, ShiftState::Opened, ShiftState::Closing).await;
     assert!(res.is_err(), "mirror drift must surface as Err");
 
-    // The primary CAS that succeeded inside the envelope MUST be rolled
-    // back — the shift stays Opened, no half-applied dual-write.
+    // The primary CAS that ran inside the envelope MUST be rolled back —
+    // the shift stays Opened, no half-applied dual-write.
     assert_eq!(read_shift_state(&pool, shift_id).await, ShiftState::Opened);
     assert_eq!(read_node_shift_state(&pool).await, ShiftState::Opened);
+
+    // Distinguish a genuine rollback from a partial commit (the dangerous
+    // failure mode the mirror guards against): repair the projection pointer
+    // and retry the SAME edge. It can only succeed if the shift is still
+    // Opened — had the failed call left a half-applied `Closing`, this retry
+    // would CAS-miss (Conflict), not Applied.
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
+        .bind(shift_id)
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let retry = apply(&pool, shift_id, ShiftState::Opened, ShiftState::Closing)
+        .await
+        .unwrap();
+    assert_eq!(
+        retry,
+        TransitionOutcome::Applied,
+        "retry after repair must succeed — proving the drifted call left the shift in Opened, \
+         not a half-applied Closing"
+    );
+    assert_eq!(read_shift_state(&pool, shift_id).await, ShiftState::Closing);
+    assert_eq!(read_node_shift_state(&pool).await, ShiftState::Closing);
 }
 
 #[tokio::test]
@@ -221,5 +250,127 @@ async fn clear_projection_is_noop_outside_opening_closing() {
         read_current_shift_id(&pool).await,
         Some(shift_id.as_bytes().to_vec()),
         "non-orphan projection + pointer must be left intact"
+    );
+}
+
+#[tokio::test]
+async fn conflict_outcome_leaves_both_tables_untouched() {
+    // The shift row has drifted to Closing (e.g. a concurrent admin path),
+    // but the caller still asks for the whitelisted Opened → Closing edge.
+    // The primary CAS (WHERE state = 'OPENED') matches 0 rows; the row
+    // exists → Conflict. apply_shift_transition returns Ok(Conflict) — NOT an
+    // Err — so the envelope does NOT roll back; the projection must stay put.
+    let pool = fresh_pool_with_fn().await;
+    let shift_id = ShiftId::new();
+    seed_shift(&pool, shift_id, ShiftState::Closing).await;
+    seed_node_state(&pool, ShiftState::Opened, Some(shift_id)).await;
+
+    let outcome = apply(&pool, shift_id, ShiftState::Opened, ShiftState::Closing)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        TransitionOutcome::Conflict {
+            observed: ShiftState::Closing
+        }
+    );
+    // Mirror is skipped on non-Applied — projection untouched.
+    assert_eq!(read_shift_state(&pool, shift_id).await, ShiftState::Closing);
+    assert_eq!(read_node_shift_state(&pool).await, ShiftState::Opened);
+}
+
+#[tokio::test]
+async fn not_found_outcome_is_ok_not_err() {
+    // A stale / never-seeded shift_id: the CAS matches 0 rows AND the row
+    // does not exist → NotFound. Returned as Ok(NotFound), no rollback,
+    // projection untouched.
+    let pool = fresh_pool_with_fn().await;
+    let stale = ShiftId::new();
+    seed_node_state(&pool, ShiftState::Opened, None).await;
+
+    let outcome = apply(&pool, stale, ShiftState::Opened, ShiftState::Closing)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, TransitionOutcome::NotFound);
+    assert_eq!(read_node_shift_state(&pool).await, ShiftState::Opened);
+}
+
+#[tokio::test]
+async fn second_distinct_edge_also_dual_writes() {
+    // A second, distinct whitelisted edge (Opened → ClosingLocalPendingDrain)
+    // to confirm the mirror's from/to binding is generic, not hardcoded to
+    // the Opened→Closing pair the happy-path test uses.
+    let pool = fresh_pool_with_fn().await;
+    let shift_id = ShiftId::new();
+    seed_shift(&pool, shift_id, ShiftState::Opened).await;
+    seed_node_state(&pool, ShiftState::Opened, Some(shift_id)).await;
+
+    let outcome = apply(
+        &pool,
+        shift_id,
+        ShiftState::Opened,
+        ShiftState::ClosingLocalPendingDrain,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome, TransitionOutcome::Applied);
+    assert_eq!(
+        read_shift_state(&pool, shift_id).await,
+        ShiftState::ClosingLocalPendingDrain
+    );
+    assert_eq!(
+        read_node_shift_state(&pool).await,
+        ShiftState::ClosingLocalPendingDrain
+    );
+}
+
+#[tokio::test]
+async fn mirror_shift_state_arm_drift_also_rolls_back() {
+    // The mirror CAS guards on BOTH current_shift_id AND shift_state = from.
+    // Here the pointer is correct but the projection's shift_state has drifted
+    // away from `from` (concurrent writer smuggled a different projection
+    // state). The mirror must still find 0 rows → Err → rollback. Complements
+    // projection_drift_rolls_back_the_whole_envelope (which breaks the
+    // current_shift_id arm).
+    let pool = fresh_pool_with_fn().await;
+    let shift_id = ShiftId::new();
+    seed_shift(&pool, shift_id, ShiftState::Opened).await;
+    // Pointer matches, but projection shift_state is Closing, not Opened.
+    seed_node_state(&pool, ShiftState::Closing, Some(shift_id)).await;
+
+    let res = apply(&pool, shift_id, ShiftState::Opened, ShiftState::Closing).await;
+    assert!(res.is_err(), "shift_state-arm drift must surface as Err");
+    // Primary CAS rolled back — shift still Opened.
+    assert_eq!(read_shift_state(&pool, shift_id).await, ShiftState::Opened);
+}
+
+#[tokio::test]
+async fn terminal_close_pins_current_shift_id_behavior() {
+    // PIN the CURRENT C1 behavior on a terminal close (Closing → Closed): the
+    // mirror updates shift_state ONLY, so current_shift_id is left pointing at
+    // the now-Closed shift. Whether a normal close should ALSO clear the
+    // pointer (as orphan resolution does) is deferred to the RS-3 A-pieces
+    // (stage_acquire intent-edge / ACK-edge wiring) — this test locks the
+    // status quo so that decision is made deliberately, not by drift.
+    let pool = fresh_pool_with_fn().await;
+    let shift_id = ShiftId::new();
+    seed_shift(&pool, shift_id, ShiftState::Closing).await;
+    seed_node_state(&pool, ShiftState::Closing, Some(shift_id)).await;
+
+    let outcome = apply(&pool, shift_id, ShiftState::Closing, ShiftState::Closed)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, TransitionOutcome::Applied);
+    assert_eq!(read_shift_state(&pool, shift_id).await, ShiftState::Closed);
+    assert_eq!(read_node_shift_state(&pool).await, ShiftState::Closed);
+    assert_eq!(
+        read_current_shift_id(&pool).await,
+        Some(shift_id.as_bytes().to_vec()),
+        "C1 leaves current_shift_id at the closed shift on a normal close \
+         (pointer lifecycle on close is an RS-3 A-piece decision)"
     );
 }
