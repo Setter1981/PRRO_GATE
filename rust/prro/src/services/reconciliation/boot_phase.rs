@@ -47,6 +47,7 @@ use crate::services::write_path::signer_guard::SignerCashierMismatch as Scm;
 use crate::services::write_path::stage_send;
 use crate::services::write_path::types::hex_encode_lower as hex_lower;
 use crate::transports::dps::dto::CheckAck;
+use sha2::{Digest, Sha256};
 
 /// M3b W1 — service-layer transition + audit composition helper.
 ///
@@ -2239,7 +2240,7 @@ async fn dispatch_prepared_via_chain(
             // for the drift cross-check against inbox row).
             let fd_row = sqlx::query(
                 "SELECT request_id, fiscal_number, business_ts, total_sum_kop, payload_json, \
-                        payload_sha256_canonical \
+                        payload_sha256_canonical, source_sha256 \
                  FROM fiscal_documents WHERE document_id = ?",
             )
             .bind(doc_id)
@@ -2259,6 +2260,20 @@ async fn dispatch_prepared_via_chain(
                     "fiscal_documents.payload_sha256_canonical length != 32 for doc {doc_id:?}"
                 )
             })?;
+            // RS-3 A1Z (migration 024): the SOURCE/wire hash, NULL on pre-024
+            // legacy docs. `Some` → drift-check against the inbox wire hash;
+            // `None` → fall back to the legacy payload-hash compare below.
+            let fd_source_sha: Option<[u8; 32]> = {
+                let v: Option<Vec<u8>> = fd_row.try_get("source_sha256")?;
+                match v {
+                    Some(b) => Some(b.as_slice().try_into().map_err(|_| {
+                        anyhow::anyhow!(
+                            "fiscal_documents.source_sha256 length != 32 for doc {doc_id:?}"
+                        )
+                    })?),
+                    None => None,
+                }
+            };
 
             // (1b) Read the matching inbox row.  No `ingress_inbox`
             // pool/tx reader exists today; PR-2b is the sole caller,
@@ -2329,11 +2344,38 @@ async fn dispatch_prepared_via_chain(
             // never a business-level reject.  Fail-closed hold:
             // return `Drift` (no state mutation, no sign/send); caller
             // emits CRITICAL audit.
-            let payload_json_mismatch = payload_json != inbox_row.payload_json;
-            let drift = fd_fiscal_number != inbox_row.fiscal_number
-                || payload_sha != inbox_row.payload_sha256_canonical
-                || doc_type_copy.as_str() != inbox_row.operation_type
-                || payload_json_mismatch;
+            // RS-3 A1Z (D5): a Z doc legitimately carries an AGGREGATED
+            // payload/hash that differs from the inbox WIRE payload/hash, so
+            // the drift check is SOURCE-aware.
+            let (drift, payload_json_mismatch) = match fd_source_sha {
+                // NEW (024+) row: compare the doc's SOURCE/wire hash to the
+                // inbox wire hash. The doc payload may legitimately differ from
+                // the inbox's (Z aggregation), so the payload_json-vs-inbox
+                // compare is REPLACED by a doc-payload INTEGRITY check (the
+                // canonical hash must equal a fresh sha256 over the doc's own
+                // payload_json) — this catches a tampered aggregated body that
+                // the dropped inbox compare would otherwise miss.
+                Some(src) => {
+                    let recomputed: [u8; 32] = Sha256::digest(payload_json.as_bytes()).into();
+                    let d = fd_fiscal_number != inbox_row.fiscal_number
+                        || src != inbox_row.payload_sha256_canonical
+                        || doc_type_copy.as_str() != inbox_row.operation_type
+                        || recomputed != payload_sha;
+                    (d, false)
+                }
+                // LEGACY (<024) row: no source hash persisted — keep the
+                // ORIGINAL compare (doc canonical hash + payload_json vs inbox)
+                // EXACTLY, as the compatibility fallback. (Production legacy
+                // docs always carry a real hash; only pre-024 rows reach here.)
+                None => {
+                    let pjm = payload_json != inbox_row.payload_json;
+                    let d = fd_fiscal_number != inbox_row.fiscal_number
+                        || payload_sha != inbox_row.payload_sha256_canonical
+                        || doc_type_copy.as_str() != inbox_row.operation_type
+                        || pjm;
+                    (d, pjm)
+                }
+            };
             if drift {
                 return Ok::<SnapshotOutcome, anyhow::Error>(SnapshotOutcome::Drift {
                     fd_fiscal_number,
@@ -2376,9 +2418,11 @@ async fn dispatch_prepared_via_chain(
                 total_sum_kop,
                 payload_json,
                 payload_sha256_canonical: payload_sha,
-                // RS-3 D5: boot PREPARED-replay is a non-aggregated snapshot —
-                // source and canonical hashes coincide here.
-                source_sha256: payload_sha,
+                // RS-3 A1Z (D5): reconstruct the SOURCE hash from the doc's
+                // persisted source_sha256 (the wire hash — differs from the
+                // canonical hash for a Z doc). Pre-024 legacy docs have none;
+                // there source == canonical (they are non-aggregated).
+                source_sha256: fd_source_sha.unwrap_or(payload_sha),
                 // W14a-2b Commit 2 (updated post-021): signer attribution
                 // IS now persisted on the ingress_inbox row (migration 021),
                 // but this is the PREPARED-doc REPLAY path — a

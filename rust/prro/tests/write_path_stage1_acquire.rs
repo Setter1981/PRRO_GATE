@@ -1294,7 +1294,8 @@ async fn stage1_command_inbox_hash_mismatch_rejects_no_doc_no_lnd() {
         Some(shift_id),
     )
     .await;
-    // inbox carries a non-zero hash; cmd() carries [0u8; 32].
+    // inbox carries a non-zero hash; cmd() carries [0u8; 32] (source == canonical
+    // for non-Z), so the RS-3 A1Z source-vs-inbox cross-check mismatches.
     let req_id = seed_inbox_with_overrides(&pool, DocType::Sell.as_str(), [0xAAu8; 32]).await;
 
     let result = stage_acquire::run(
@@ -1310,8 +1311,8 @@ async fn stage1_command_inbox_hash_mismatch_rejects_no_doc_no_lnd() {
     match result {
         WorkerProcessResult::Rejected {
             reason: RejectionReason::InvalidPayload { detail },
-        } => assert_eq!(detail, "command_payload_hash_mismatch"),
-        other => panic!("expected InvalidPayload(hash_mismatch), got {other:?}"),
+        } => assert_eq!(detail, "command_source_hash_mismatch"),
+        other => panic!("expected InvalidPayload(source_hash_mismatch), got {other:?}"),
     }
     assert_eq!(doc_count(&pool).await, 0, "no doc on hash mismatch");
     assert_eq!(next_lnd(&pool).await, 1, "lnd not advanced on mismatch");

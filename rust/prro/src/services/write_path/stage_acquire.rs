@@ -236,21 +236,22 @@ pub async fn run(
             // persisted ONLY on the Proceed path.  Resume / Reject /
             // Terminal paths no longer commit forensic orphan rows.
 
-            // [Step 1b] Command-vs-inbox cross-check.  The leased
-            //           inbox row carries `payload_json`,
-            //           `payload_sha256_canonical`, and
-            //           `operation_type` persisted by ingress; the
-            //           in-process `command` argument MUST agree on
-            //           hash and doc_type, otherwise the worker is
-            //           about to PREPARE a doc against payload it did
-            //           not receive.  Reject without lnd advance and
-            //           without INSERT.
-            if command.payload_sha256_canonical != inbox.payload_sha256_canonical {
+            // [Step 1b] Command-vs-inbox cross-check.  The leased inbox row
+            //           carries the WIRE `payload_sha256_canonical` +
+            //           `operation_type` persisted by ingress; the in-process
+            //           `command` MUST have been built FROM this row.  RS-3
+            //           A1Z (D5): compare the command's SOURCE hash (the
+            //           wire-intent hash) — NOT its `payload_sha256_canonical`,
+            //           which for a Z doc is the hash of the AGGREGATED body
+            //           and legitimately differs from the wire hash.  For non-Z
+            //           the two coincide, so this is behavior-preserving.
+            //           Reject without lnd advance and without INSERT.
+            if command.source_sha256 != inbox.payload_sha256_canonical {
                 return reject(
                     tx,
                     &request_id,
                     RejectionReason::InvalidPayload {
-                        detail: "command_payload_hash_mismatch".to_string(),
+                        detail: "command_source_hash_mismatch".to_string(),
                     },
                     "command_inbox_mismatch",
                     Severity::Critical,
@@ -634,6 +635,9 @@ pub async fn run(
                 total_sum_kop: command.total_sum_kop,
                 payload_json: command.payload_json.clone(),
                 payload_sha256_canonical: command.payload_sha256_canonical,
+                // RS-3 A1Z (D5): the source/wire hash, so boot recovery can
+                // tell a Z dual-hash from drift. = canonical for non-Z.
+                source_sha256: command.source_sha256,
                 unsigned_xml_sha256: None,
                 previous_hash: None,
                 // W4-Z2a piece 6b.1 (external mid-review CRIT-2) — FK set

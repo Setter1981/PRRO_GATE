@@ -86,6 +86,7 @@ async fn seed_doc_with_snapshot(pool: &sqlx::SqlitePool, snapshot_id: Option<i64
                     total_sum_kop: Some(1000),
                     payload_json: r#"{"goods":[]}"#.into(),
                     payload_sha256_canonical: [0u8; 32],
+                    source_sha256: [0u8; 32],
                     unsigned_xml_sha256: None,
                     previous_hash: None,
                     signed_by_cashier_id: None,

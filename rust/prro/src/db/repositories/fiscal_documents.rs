@@ -42,6 +42,12 @@ pub struct NewDocument {
     pub total_sum_kop: Option<i64>,
     pub payload_json: String,
     pub payload_sha256_canonical: [u8; 32],
+    /// RS-3 A1Z (migration 024) — the SOURCE hash: the wire-intent hash the
+    /// inbox carries. For non-Z it equals `payload_sha256_canonical`; for a
+    /// Z doc it is the WIRE hash while `payload_sha256_canonical` is the hash
+    /// of the AGGREGATED body (D5). Persisted so boot PREPARED-replay recovery
+    /// can distinguish a legitimate Z dual-hash from real drift.
+    pub source_sha256: [u8; 32],
     pub unsigned_xml_sha256: Option<[u8; 32]>,
     pub previous_hash: Option<[u8; 32]>,
     /// W14a-2b §1.4 — cashier id that will sign this document.  Persisted
@@ -246,9 +252,9 @@ pub async fn insert_prepared(pool: &SqlitePool, n: &NewDocument) -> sqlx::Result
              document_id, request_id, fiscal_number, shift_id, offline_session_id,
              lnd, doc_type, state, backend_profile_id, transport_profile_id,
              fs_mode, business_ts, total_sum_kop, payload_json,
-             payload_sha256_canonical, unsigned_xml_sha256, previous_hash,
+             payload_sha256_canonical, source_sha256, unsigned_xml_sha256, previous_hash,
              signed_by_cashier_id, signing_config_snapshot_id
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(n.document_id)
     .bind(n.request_id)
@@ -264,6 +270,7 @@ pub async fn insert_prepared(pool: &SqlitePool, n: &NewDocument) -> sqlx::Result
     .bind(n.total_sum_kop)
     .bind(&n.payload_json)
     .bind(&n.payload_sha256_canonical[..])
+    .bind(&n.source_sha256[..])
     .bind(n.unsigned_xml_sha256.as_ref().map(|b| &b[..]))
     .bind(n.previous_hash.as_ref().map(|b| &b[..]))
     .bind(n.signed_by_cashier_id.as_ref().map(|c| c.as_str()))
@@ -986,9 +993,9 @@ pub async fn insert_prepared_tx(tx: &mut WriteTxConn<'_>, n: &NewDocument) -> sq
              document_id, request_id, fiscal_number, shift_id, offline_session_id,
              lnd, doc_type, state, backend_profile_id, transport_profile_id,
              fs_mode, business_ts, total_sum_kop, payload_json,
-             payload_sha256_canonical, unsigned_xml_sha256, previous_hash,
+             payload_sha256_canonical, source_sha256, unsigned_xml_sha256, previous_hash,
              signed_by_cashier_id, signing_config_snapshot_id
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(n.document_id)
     .bind(n.request_id)
@@ -1004,6 +1011,7 @@ pub async fn insert_prepared_tx(tx: &mut WriteTxConn<'_>, n: &NewDocument) -> sq
     .bind(n.total_sum_kop)
     .bind(&n.payload_json)
     .bind(&n.payload_sha256_canonical[..])
+    .bind(&n.source_sha256[..])
     .bind(n.unsigned_xml_sha256.as_ref().map(|b| &b[..]))
     .bind(n.previous_hash.as_ref().map(|b| &b[..]))
     .bind(n.signed_by_cashier_id.as_ref().map(|c| c.as_str()))

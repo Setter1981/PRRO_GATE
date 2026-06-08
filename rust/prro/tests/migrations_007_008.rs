@@ -67,6 +67,7 @@ fn doc_with_lnd(fn_id: &str, lnd: i64) -> NewDocument {
         total_sum_kop: Some(15000),
         payload_json: r#"{"goods":[]}"#.into(),
         payload_sha256_canonical: [0u8; 32],
+        source_sha256: [0u8; 32],
         unsigned_xml_sha256: None,
         previous_hash: None,
         signed_by_cashier_id: None,
