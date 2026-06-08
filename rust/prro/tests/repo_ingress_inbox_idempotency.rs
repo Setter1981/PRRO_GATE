@@ -241,7 +241,10 @@ async fn recovery_identity_round_trips_created_replay_and_legacy_null() {
         InboxInsertOutcome::Created(r) => r,
         other => panic!("expected Created, got {other:?}"),
     };
-    assert_eq!(created2.signed_by_cashier_id, None, "NULL cashier preserved");
+    assert_eq!(
+        created2.signed_by_cashier_id, None,
+        "NULL cashier preserved"
+    );
     assert_eq!(created2.driver_id.as_deref(), Some("DRV-9"));
 
     // Legacy pre-021 row: raw INSERT omitting the new columns → both read
@@ -271,7 +274,10 @@ async fn recovery_identity_round_trips_created_replay_and_legacy_null() {
         legacy.signed_by_cashier_id, None,
         "legacy row reads NULL cashier"
     );
-    assert_eq!(legacy.business_ts, None, "legacy row reads NULL business_ts");
+    assert_eq!(
+        legacy.business_ts, None,
+        "legacy row reads NULL business_ts"
+    );
     assert_eq!(
         legacy.total_sum_kop, None,
         "legacy row reads NULL total_sum_kop"
