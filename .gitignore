@@ -62,3 +62,7 @@ czo_test/
 
 # Git worktrees (local workspace isolation)
 .worktrees/
+
+# Local environment configs — dev/local secrets, NEVER commit (ship ops/config.example.yaml only)
+ops/config.local.yaml
+*.local.yaml
