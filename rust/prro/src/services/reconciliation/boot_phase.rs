@@ -42,6 +42,7 @@ use crate::db::models::ids::{DocumentId, ShiftId};
 use crate::db::repositories::fiscal_documents::{self, TransitionOutcome};
 use crate::db::repositories::{audit_log, document_files, transport_trace};
 use crate::db::tx::{with_immediate, WriteTxConn};
+use crate::services::shift::transition as shift_transition;
 use crate::services::write_path::signer_guard::SignerCashierMismatch as Scm;
 use crate::services::write_path::stage_send;
 use crate::services::write_path::types::hex_encode_lower as hex_lower;
@@ -1475,10 +1476,12 @@ pub async fn run_boot_reconciliation(
                     // boot recovery from operator escalation.  I8
                     // preserved (no silent transition; audit emitted with
                     // observed pre-state + branch context).
-                    sqlx::query("UPDATE shifts SET state = 'ERROR' WHERE shift_id = ?")
-                        .bind(shift_id)
-                        .execute(&mut **tx)
-                        .await?;
+                    //
+                    // RS-3 C1: the raw shift→ERROR write lives in the
+                    // transition-service (the sole home for shift+projection
+                    // writes); the projection reset follows once after the
+                    // loop via `clear_active_shift_projection`.
+                    shift_transition::force_orphan_shift_to_error(tx, shift_id).await?;
                     let payload = serde_json::json!({
                         "fiscal_number": fn_owned,
                         "shift_id": hex_lower(shift_id.as_bytes()),
@@ -1497,18 +1500,15 @@ pub async fn run_boot_reconciliation(
                     )
                     .await?;
                 }
-                // Reset node_state.shift_state to Closed (HIGH 10 fix).
-                // RS-3 C2: also clear current_shift_id — a CLOSED shift_state
-                // must not leave a dangling current_shift_id pointing at the
-                // just-closed shift (the chokepoint that left the projection
-                // inconsistent; per Q1-A′ node_state is a read-projection).
-                sqlx::query(
-                    "UPDATE node_state SET shift_state = 'CLOSED', current_shift_id = NULL \
-                     WHERE fiscal_number = ? AND shift_state IN ('OPENING', 'CLOSING')",
-                )
-                .bind(&fn_owned)
-                .execute(&mut **tx)
-                .await?;
+                // Reset node_state.shift_state to Closed (HIGH 10 fix) +
+                // clear current_shift_id (RS-3 C2) so a resolved orphan
+                // leaves no dangling pointer; per Q1-A′ node_state is a
+                // read-projection.  Runs once per FN — including when zero
+                // orphan rows were found — to repair a dangling
+                // OPENING/CLOSING projection with no backing shift.
+                // RS-3 C1: routed through the transition-service so no raw
+                // node_state shift write survives in boot_phase.
+                shift_transition::clear_active_shift_projection(tx, &fn_owned).await?;
                 Ok::<usize, anyhow::Error>(orphans_resolved)
             })
         })
