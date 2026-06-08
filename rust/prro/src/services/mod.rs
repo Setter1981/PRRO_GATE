@@ -9,4 +9,5 @@ pub mod cert_refresher;
 pub mod offline_session;
 pub mod offline_sync;
 pub mod reconciliation;
+pub mod shift;
 pub mod write_path;

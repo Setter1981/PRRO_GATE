@@ -108,10 +108,11 @@ use crate::db::models::enums::{DocState, NodeMode, OfflineSessionState, Severity
 use crate::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
 use crate::db::repositories::fiscal_documents::TransitionOutcome;
 use crate::db::repositories::{audit_log, fiscal_documents, node_state, offline_sessions, shifts};
-use crate::db::tx::{with_immediate, WriteTxConn};
+use crate::db::tx::with_immediate;
 use crate::services::offline_sync::kvt2_confirm;
 use crate::services::reconciliation::guard::ReconcileGuard;
 use crate::services::reconciliation::runtime::RuntimeView;
+use crate::services::shift::transition as shift_transition;
 use crate::services::write_path::error_routing::RetryClass;
 use crate::services::write_path::stage_send::{self, StageSendError, StageSendOutcome};
 use crate::services::write_path::types::hex_encode_lower as hex_lower;
@@ -2166,16 +2167,18 @@ async fn escalate_drain_to_manual(
     let failure_class_owned = failure_class.to_string();
     let outcome = with_immediate(pool, move |tx| {
         Box::pin(async move {
-            let outcome = shifts::transition_state(tx, shift_id, from_state, to_state).await?;
+            // RS-3 C1: shift CAS + node_state projection mirror via the
+            // single transition-service (was: transition_state + the local
+            // mirror_node_state_shift_state_tx pair).
+            let outcome = shift_transition::apply_shift_transition(
+                tx,
+                &fiscal_number_owned,
+                shift_id,
+                from_state,
+                to_state,
+            )
+            .await?;
             if let shifts::TransitionOutcome::Applied = outcome {
-                mirror_node_state_shift_state_tx(
-                    tx,
-                    &fiscal_number_owned,
-                    shift_id,
-                    from_state,
-                    to_state,
-                )
-                .await?;
                 let payload = serde_json::json!({
                     "fiscal_number": fiscal_number_owned,
                     "shift_id": hex_lower(shift_id.as_bytes()),
@@ -2215,42 +2218,10 @@ async fn escalate_drain_to_manual(
     Ok(())
 }
 
-/// `m3b-shift-state-expansion.md` §5 load-bearing mirror invariant:
-/// `node_state.shift_state` MUST equal the active shifts row's state.
-/// CAS-guarded UPDATE on `(fiscal_number, current_shift_id,
-/// from_shift_state)` so a concurrent writer cannot smuggle a
-/// different shift state past the mirror update.  Non-`Applied`
-/// rows_affected surfaces as an anyhow chain inside the closure —
-/// the surrounding `with_immediate` ROLLS BACK the entire escalation
-/// tx (shift CAS, mirror UPDATE, audit emit) atomically.
-async fn mirror_node_state_shift_state_tx(
-    tx: &mut WriteTxConn<'_>,
-    fiscal_number: &str,
-    shift_id: ShiftId,
-    from_state: ShiftState,
-    to_state: ShiftState,
-) -> Result<(), anyhow::Error> {
-    let rows_affected = sqlx::query(
-        "UPDATE node_state SET shift_state = ? \
-         WHERE fiscal_number = ? AND shift_state = ? AND current_shift_id = ?",
-    )
-    .bind(to_state)
-    .bind(fiscal_number)
-    .bind(from_state)
-    .bind(shift_id)
-    .execute(&mut **tx)
-    .await?
-    .rows_affected();
-    if rows_affected != 1 {
-        return Err(anyhow::anyhow!(
-            "backlog_drain({fiscal_number}): node_state.shift_state mirror UPDATE \
-             produced rows_affected={rows_affected} (expected 1; structural drift \
-             between shifts and node_state for shift {shift_hex})",
-            shift_hex = hex_lower(shift_id.as_bytes()),
-        ));
-    }
-    Ok(())
-}
+// RS-3 C1: the `node_state.shift_state` mirror (m3b §5 load-bearing
+// invariant) moved into `services::shift::transition::apply_shift_transition`
+// — the single transition-service now owns the shift CAS + projection
+// mirror pairing for both this drain path and boot reconciliation.
 
 /// W9b C6 finalization branch (spec §2.4 + amendment 2026-05-21).
 ///
@@ -2494,8 +2465,17 @@ async fn commit_finalize_envelope(
             // no shift transition.
             if let Some(target) = shift_finalize_target {
                 let shift_id = shift_id_opt.expect("checked before envelope");
-                let shift_outcome =
-                    shifts::transition_state(tx, shift_id, shift_state_from, target).await?;
+                // RS-3 C1: shift CAS + node_state projection mirror (m3b §5
+                // load-bearing invariant) via the single transition-service
+                // (was: transition_state + the local mirror pair).
+                let shift_outcome = shift_transition::apply_shift_transition(
+                    tx,
+                    &fiscal_number_owned,
+                    shift_id,
+                    shift_state_from,
+                    target,
+                )
+                .await?;
                 if !matches!(shift_outcome, shifts::TransitionOutcome::Applied) {
                     return Err(anyhow::anyhow!(
                         "backlog_drain({fn_id}): finalize CAS shift {from} → \
@@ -2508,17 +2488,6 @@ async fn commit_finalize_envelope(
                         sid = hex_lower(shift_id.as_bytes()),
                     ));
                 }
-                // Mirror node_state.shift_state per
-                // m3b-shift-state-expansion.md §5 load-bearing
-                // invariant.  Reuses C4's mirror helper.
-                mirror_node_state_shift_state_tx(
-                    tx,
-                    &fiscal_number_owned,
-                    shift_id,
-                    shift_state_from,
-                    target,
-                )
-                .await?;
             }
             // (4) Audit OFFLINE_SESSION_CLOSED (W5 session-lifecycle
             // contract — MED-C6-2 2026-05-21).
