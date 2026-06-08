@@ -61,7 +61,14 @@ pub async fn quiesce_shift_before_z(
     fiscal_number: &str,
     shift_id: ShiftId,
 ) -> anyhow::Result<QuiescenceOutcome> {
-    // Pass 1 — inline-finalize ONLY KVT2 docs (Kvt2 → Ack), in lnd order.
+    // Pass 1 — inline-finalize ONLY the LEADING CONTIGUOUS run of KVT2 docs
+    // (in lnd order). The cross-doc MAC chain advances strictly in lnd order:
+    // a KVT2 doc can only finalize once every PRIOR doc is Acked (stage_finalize
+    // chain-seed guard). So the first NON-KVT2 in-flight receipt blocks the
+    // chain — every later receipt is chain-seed-blocked behind it. Stop there
+    // (do NOT attempt to finalize a KVT2 sitting behind an earlier blocker —
+    // that would turn a recoverable "Z not ready yet" into a hard error); the
+    // refetch below then reports Pending.
     let pending = fiscal_documents::list_shift_pending_receipts_for_z_quiescence(
         pool,
         fiscal_number,
@@ -69,15 +76,16 @@ pub async fn quiesce_shift_before_z(
     )
     .await?;
     for (doc_id, state) in &pending {
-        if *state == DocState::Kvt2 {
-            // stage_finalize::run owns its own `with_immediate`; Kvt2 → Ack +
-            // bookkeeping, no network/crypto. A non-`Acked` Ok-outcome (e.g. a
-            // raced StateConflict) is caught by the refetch below; only a true
-            // Err propagates (rolls back that doc's finalize tx).
-            stage_finalize::run(pool, *doc_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("z-quiescence finalize {doc_id:?}: {e}"))?;
+        if *state != DocState::Kvt2 {
+            break;
         }
+        // stage_finalize::run owns its own `with_immediate`; Kvt2 → Ack +
+        // bookkeeping, no network/crypto. A non-`Acked` Ok-outcome (e.g. a
+        // raced StateConflict) is caught by the refetch below; only a true
+        // Err propagates (rolls back that doc's finalize tx).
+        stage_finalize::run(pool, *doc_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("z-quiescence finalize {doc_id:?}: {e}"))?;
     }
     // Pass 2 — re-read. Anything still in-flight blocks aggregation.
     let still = fiscal_documents::list_shift_pending_receipts_for_z_quiescence(

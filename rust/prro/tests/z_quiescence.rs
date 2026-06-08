@@ -234,7 +234,8 @@ async fn kvt2_finalized_but_other_pending_blocks() {
         matches!(outcome, QuiescenceOutcome::Pending { .. }),
         "a co-resident SENT receipt must block, got {outcome:?}"
     );
-    // The KVT2 was still finalized inline (its finalize is unconditional).
+    // The KVT2 was finalized inline (it leads the pending set; the SENT comes
+    // AFTER it in lnd order, so the chain isn't blocked ahead of the KVT2).
     let state: String =
         sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
             .bind(kvt2_doc)
@@ -242,4 +243,34 @@ async fn kvt2_finalized_but_other_pending_blocks() {
             .await
             .unwrap();
     assert_eq!(state, "ACK");
+}
+
+#[tokio::test]
+async fn kvt2_behind_an_earlier_blocker_is_not_finalized() {
+    // review MEDIUM: a KVT2 sitting BEHIND an earlier non-finalizable receipt
+    // (SIGNED at a lower lnd) must NOT be force-finalized — its MAC chain is
+    // blocked behind the SIGNED doc, so stage_finalize would chain-seed-mismatch
+    // and turn a recoverable "Z not ready" into a hard error. Quiescence must
+    // stop at the first non-KVT2 and report Pending, leaving the KVT2 as KVT2.
+    let pool = fresh_pool().await;
+    let shift = seed_open_shift(&pool).await;
+    seed_receipt(&pool, shift, 1, "SIGNED").await; // earlier blocker
+    let kvt2_doc = seed_kvt2_finalizable(&pool, shift, 2).await; // behind it
+
+    let outcome = quiesce(&pool, shift).await;
+    assert!(
+        matches!(outcome, QuiescenceOutcome::Pending { .. }),
+        "an earlier SIGNED blocker must yield Pending, got {outcome:?}"
+    );
+    // The KVT2 was NOT finalized (it sits behind the SIGNED doc in the chain).
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
+            .bind(kvt2_doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        state, "KVT2",
+        "a KVT2 behind an earlier blocker must stay KVT2, not be force-finalized"
+    );
 }
