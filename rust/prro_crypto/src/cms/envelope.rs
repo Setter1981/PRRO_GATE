@@ -452,7 +452,7 @@ mod tests {
     fn e2e_decrypt_jkurwa_enc_message() {
         use crate::core::point::expand_compressed_checked;
 
-        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sidecar/node_modules/jkurwa/test/data/");
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
 
         let key40a0_der = std::fs::read(format!("{base}Key40A0.cer"))
             .expect("read Key40A0.cer");
@@ -947,7 +947,7 @@ mod basic_fields_tests {
     /// File comes from the jkurwa upstream test corpus.
     const CERT_DER: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/node_modules/jkurwa/test/data/SELF_SIGNED_ENC_6929.cer"
+        "/tests/fixtures/SELF_SIGNED_ENC_6929.cer"
     ));
 
     #[test]
