@@ -66,7 +66,7 @@ use super::dto::{
 use super::policy::{classify_command, CommandClass};
 use super::replay::{conflict_response, resolve_replay, ReplayResolution};
 use super::seam::{FiscalError, FiscalOutcome, WritePathEntry};
-use crate::db::models::enums::{Protocol, Severity};
+use crate::db::models::enums::{DocState, Protocol, Severity};
 use crate::db::models::ids::{DriverId, RequestId};
 use crate::db::repositories::audit_log;
 use crate::db::repositories::ingress_inbox::{self, InboxInsertOutcome, NewInboxEntry};
@@ -131,12 +131,19 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         // gets the right status instead of the `_ => 500` fall-through.
         "UNKNOWN_SOURCE" | "NO_NODE_STATE" => 404,
         "FN_FORBIDDEN" => 403,
-        // ledger/internal faults → 500.
+        // RS-3 OFFLINE_REFUSED — the node (BLOCKED / STOP_MODE) cannot
+        // fiscalize even offline; not a client fault, not an internal fault,
+        // so it is a 503 (service unavailable until the node recovers /
+        // operator intervenes), distinct from the 5xx internal-fault bucket.
+        "OFFLINE_REFUSED" => 503,
+        // ledger/internal faults → 500.  SIGN_FAILED is the RS-3 sign-path
+        // fault (a real crypto-operation failure, not a node-mode shift).
         "INBOX_LEDGER_DRIFT"
         | "LEDGER_CORRUPTION"
         | "LEDGER_READ_FAILED"
         | "PAYMENT_LOOKUP_FAILED"
         | "NOT_SIGNABLE"
+        | "SIGN_FAILED"
         | "INTERNAL" => 500,
         _ => 500,
     }
@@ -235,10 +242,51 @@ fn convert_error_code(e: &ConvertError) -> &'static str {
     }
 }
 
-/// Build the first-pass success envelope from the seam outcome.  The
-/// receipt totals come from the wire `Totals` (truthful: it is what was
-/// fiscalized), matching the replay path's ledger-derived totals so
-/// first-pass↔replay responses agree.
+/// Disposition of a *successful* `fiscalize` outcome, keyed on its durable
+/// document state.
+#[derive(Debug, PartialEq, Eq)]
+enum OutcomeDisposition {
+    /// Terminal success (`Ack` / `OfflineLocalAck`) → 200 success envelope
+    /// (offline-ack carries a null `fiscal_id`).
+    Done,
+    /// In-flight (`Prepared`..`Kvt2`, `ErrorRetryable`): the receipt is
+    /// persisted and being driven to DPS → render the SAME `202 IN_PROGRESS`
+    /// `CanonicalErrorResponse` the replay path emits (the `dto.rs`
+    /// IN_PROGRESS contract: a blocking client switches on the 202 status and
+    /// re-polls).  Keeping first-pass and replay on ONE 202 shape is the
+    /// parity the DTO promises.
+    InProgress,
+    /// A terminal FAILURE state via `Ok` — a seam contract breach (failures
+    /// must be `Err(FiscalError)`) → the caller audits + 500s it.
+    Breach,
+}
+
+/// Classify a successful outcome's state.  Exhaustive over `DocState` (no
+/// `_`) so a newly-added state forces a deliberate decision here.
+fn classify_outcome(state: DocState) -> OutcomeDisposition {
+    match state {
+        DocState::Ack | DocState::OfflineLocalAck => OutcomeDisposition::Done,
+        DocState::Prepared
+        | DocState::Signed
+        | DocState::Encrypted
+        | DocState::Sending
+        | DocState::Sent
+        | DocState::Kvt1
+        | DocState::Kvt2
+        | DocState::ErrorRetryable => OutcomeDisposition::InProgress,
+        DocState::Rejected | DocState::Cancelled | DocState::RequiresManualReconciliation => {
+            OutcomeDisposition::Breach
+        }
+    }
+}
+
+/// Build the first-pass success envelope (HTTP 200) from the seam outcome.
+/// Only a TERMINAL-success state reaches here ([`OutcomeDisposition::Done`]);
+/// an in-flight outcome is rendered as the shared `202 IN_PROGRESS` error
+/// envelope (parity with replay), not a success body.  The receipt totals
+/// come from the wire `Totals` (truthful: it is what was fiscalized),
+/// matching the replay path's ledger-derived totals so first-pass↔replay
+/// responses agree.
 fn build_success(
     request_id_hex: &str,
     command_type: CommandType,
@@ -375,9 +423,51 @@ pub async fn handle_command(
     match outcome {
         // First time seen — fiscalize inline through the seam.
         InboxInsertOutcome::Created(row) => match write_path.fiscalize(&row).await {
-            Ok(fo) => build_success(&rid_hex, cmd.command_type, &cmd.payload.totals, &fo),
-            // Exhaustive (no `_`): RS-3 failure variants will break this
-            // on purpose so the delete-on-error policy is re-decided.
+            Ok(fo) => match classify_outcome(fo.document_state) {
+                // Terminal success (Ack / OfflineLocalAck) → 200 success body.
+                OutcomeDisposition::Done => {
+                    build_success(&rid_hex, cmd.command_type, &cmd.payload.totals, &fo)
+                }
+                // In-flight → the SAME `202 IN_PROGRESS` error envelope the
+                // replay path emits (dto.rs IN_PROGRESS contract + first-pass↔
+                // replay parity: ONE 202 shape across the first POST and every
+                // re-poll).  The client correlates by `request_id` (carried in
+                // the envelope) and switches on the 202 status; document_id is
+                // intentionally NOT surfaced here — adding it would be a
+                // deliberate change to the error DTO + replay together.
+                OutcomeDisposition::InProgress => err(
+                    &rid_hex,
+                    "IN_PROGRESS",
+                    "the submission is still being processed; retry".to_string(),
+                ),
+                // A terminal FAILURE state via `Ok` is a seam contract breach
+                // (failures must be `Err(FiscalError)`).  Audit + 500 rather
+                // than mint a phantom 200/202 success.
+                OutcomeDisposition::Breach => {
+                    let _ = audit_log::append(
+                        main_pool,
+                        "ingress_inbox",
+                        &rid_hex,
+                        "SEAM_OK_WITH_FAILURE_STATE",
+                        Severity::Warning,
+                        None,
+                        Some(
+                            &serde_json::json!({
+                                "document_state": fo.document_state.as_str(),
+                            })
+                            .to_string(),
+                        ),
+                    )
+                    .await;
+                    err(
+                        &rid_hex,
+                        "INTERNAL",
+                        "write-path returned a terminal failure state as a success".to_string(),
+                    )
+                }
+            },
+            // Exhaustive (no `_`): each RS-3 failure variant decides its own
+            // delete-vs-persist policy below.
             Err(fe) => match fe {
                 FiscalError::NotImplemented { request_id } => {
                     // Defense-in-depth (operator review): the handler OWNS the
@@ -481,6 +571,37 @@ pub async fn handle_command(
                         "write-path not yet implemented (RS-3 pending)".to_string(),
                     )
                 }
+
+                // RS-3 real fiscal failures.  Unlike `NotImplemented` (where
+                // nothing durable happened, so the NEW row is RELEASED to let
+                // a retry re-attempt), these come back AFTER `fiscalize` has
+                // taken the per-FN lease (the inbox row is already PROCESSING,
+                // not NEW) and written whatever durable state the persistence
+                // pin requires.  The handler therefore does NOT release the
+                // row (a `WHERE status='NEW'` delete would no-op anyway) and
+                // does NOT re-audit (the underlying cause is audited inside
+                // `fiscalize`) — it only translates the typed refusal to its
+                // HTTP envelope.
+                FiscalError::ShiftNotOpen { .. } => err(
+                    &rid_hex,
+                    "NO_OPEN_SHIFT",
+                    "no open shift for this fiscal number".to_string(),
+                ),
+                FiscalError::SignFailure { .. } => err(
+                    &rid_hex,
+                    "SIGN_FAILED",
+                    "signing the receipt failed".to_string(),
+                ),
+                FiscalError::DpsRejected { .. } => err(
+                    &rid_hex,
+                    "FISCAL_REJECTED",
+                    "DPS rejected the receipt".to_string(),
+                ),
+                FiscalError::OfflineRefused { .. } => err(
+                    &rid_hex,
+                    "OFFLINE_REFUSED",
+                    "node cannot fiscalize even offline (blocked / stop-mode)".to_string(),
+                ),
             },
         },
 
@@ -692,6 +813,39 @@ mod tests {
         }
     }
 
+    /// Which RS-3 *real* failure a [`RecordingErr`] seam emits (built from the
+    /// owned `row.request_id`, since `FiscalError` is not `Clone`).
+    #[derive(Clone, Copy)]
+    enum ErrKind {
+        ShiftNotOpen,
+        SignFailure,
+        DpsRejected,
+        OfflineRefused,
+    }
+
+    /// A seam that captures the inbox row and returns a chosen real fiscal
+    /// failure WITHOUT taking the lease (so the row stays NEW) — lets us
+    /// assert the handler maps each variant to its HTTP status AND does NOT
+    /// release the row (unlike `NotImplemented`).
+    struct RecordingErr {
+        captured: Mutex<Option<InboxRow>>,
+        kind: ErrKind,
+    }
+
+    #[async_trait::async_trait]
+    impl WritePathEntry for RecordingErr {
+        async fn fiscalize(&self, row: &InboxRow) -> Result<FiscalOutcome, FiscalError> {
+            *self.captured.lock().unwrap() = Some(row.clone());
+            let request_id = row.request_id;
+            Err(match self.kind {
+                ErrKind::ShiftNotOpen => FiscalError::ShiftNotOpen { request_id },
+                ErrKind::SignFailure => FiscalError::SignFailure { request_id },
+                ErrKind::DpsRejected => FiscalError::DpsRejected { request_id },
+                ErrKind::OfflineRefused => FiscalError::OfflineRefused { request_id },
+            })
+        }
+    }
+
     fn ack_outcome() -> FiscalOutcome {
         FiscalOutcome {
             document_id: DocumentId::new(),
@@ -708,6 +862,18 @@ mod tests {
             fiscal_id: None,
             fiscal_ts: None,
             document_state: DocState::OfflineLocalAck,
+            report_xml: None,
+        }
+    }
+
+    /// An in-flight outcome (the receipt is persisted + being driven to DPS):
+    /// the handler renders `202 IN_PROGRESS`, fiscal_id still unknown.
+    fn sending_outcome() -> FiscalOutcome {
+        FiscalOutcome {
+            document_id: DocumentId::new(),
+            fiscal_id: None,
+            fiscal_ts: None,
+            document_state: DocState::Sending,
             report_xml: None,
         }
     }
@@ -1323,6 +1489,46 @@ mod tests {
         assert_eq!(http_status_for_error_code("NOT_IMPLEMENTED"), 501);
         assert_eq!(http_status_for_error_code("INBOX_LEDGER_DRIFT"), 500);
         assert_eq!(http_status_for_error_code("SOME_UNKNOWN_CODE"), 500);
+        // RS-3 A3 fiscal-failure codes.
+        assert_eq!(http_status_for_error_code("NO_OPEN_SHIFT"), 422);
+        assert_eq!(http_status_for_error_code("FISCAL_REJECTED"), 422);
+        assert_eq!(http_status_for_error_code("SIGN_FAILED"), 500);
+        assert_eq!(http_status_for_error_code("OFFLINE_REFUSED"), 503);
+    }
+
+    /// A3 — `classify_outcome` keys the success disposition on the durable doc
+    /// state: terminal-success → Done (200), in-flight → InProgress (202
+    /// IN_PROGRESS, parity with replay), terminal-FAILURE → Breach (the seam
+    /// contract breach the handler 500s).  Exhaustive over `DocState` so a new
+    /// state forces a decision.
+    #[test]
+    fn classify_outcome_classifies_every_doc_state() {
+        use DocState::*;
+        assert_eq!(classify_outcome(Ack), OutcomeDisposition::Done);
+        assert_eq!(classify_outcome(OfflineLocalAck), OutcomeDisposition::Done);
+        for s in [
+            Prepared,
+            Signed,
+            Encrypted,
+            Sending,
+            Sent,
+            Kvt1,
+            Kvt2,
+            ErrorRetryable,
+        ] {
+            assert_eq!(
+                classify_outcome(s),
+                OutcomeDisposition::InProgress,
+                "{s:?} is in-flight → 202 IN_PROGRESS"
+            );
+        }
+        for s in [Rejected, Cancelled, RequiresManualReconciliation] {
+            assert_eq!(
+                classify_outcome(s),
+                OutcomeDisposition::Breach,
+                "{s:?} is a terminal failure — never an Ok outcome"
+            );
+        }
     }
 
     #[test]
@@ -1337,5 +1543,182 @@ mod tests {
         ] {
             assert!(!is_z_class(ct), "{ct:?}");
         }
+    }
+
+    /// A3 — an `OfflineLocalAck` outcome is a SUCCESS: `200`, with a null
+    /// `fiscal_id` (no DPS id yet) but the durable state surfaced.
+    #[tokio::test]
+    async fn offline_local_ack_maps_200_with_null_fiscal_id() {
+        let (_d, main, secure) = fresh_pools().await;
+        let wp = RecordingOk {
+            captured: Mutex::new(None),
+            out: offline_outcome(),
+        };
+        let r = handle_command(
+            &sell_cmd("idem-off", 10000),
+            FN,
+            drv(),
+            Protocol::Rest,
+            &main,
+            &secure,
+            &wp,
+        )
+        .await;
+        assert_eq!(r.http_status, 200, "offline-local-ack is a 200 success");
+        match r.body {
+            IngressBody::Success(b) => {
+                assert!(b.ok);
+                assert_eq!(b.document_state, "OFFLINE_LOCAL_ACK");
+                assert_eq!(b.fiscal_id, None, "offline-acked receipt has no DPS id yet");
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    /// A3 (review HIGH — first-pass↔replay parity) — an in-flight outcome
+    /// (`Sending`) renders the SAME `202 IN_PROGRESS` ERROR envelope the
+    /// replay path emits (dto.rs IN_PROGRESS contract), NOT a success body.
+    /// So a blocking client sees ONE 202 shape across the first POST and every
+    /// re-poll.
+    #[tokio::test]
+    async fn in_flight_sending_maps_202_in_progress_error_envelope() {
+        let (_d, main, secure) = fresh_pools().await;
+        let wp = RecordingOk {
+            captured: Mutex::new(None),
+            out: sending_outcome(),
+        };
+        let r = handle_command(
+            &sell_cmd("idem-sending", 10000),
+            FN,
+            drv(),
+            Protocol::Rest,
+            &main,
+            &secure,
+            &wp,
+        )
+        .await;
+        assert_eq!(r.http_status, 202, "an in-flight send is 202 IN_PROGRESS");
+        match r.body {
+            IngressBody::Error(e) => {
+                assert!(!e.ok, "IN_PROGRESS is the non-terminal ERROR envelope");
+                assert_eq!(e.error_code, "IN_PROGRESS");
+            }
+            other => panic!("expected the IN_PROGRESS error envelope, got {other:?}"),
+        }
+    }
+
+    /// A3 — every RS-3 real fiscal failure maps to its HTTP status AND, unlike
+    /// `NotImplemented`, does NOT release the (still-present) inbox row: the
+    /// write-path owns the row's durable lifecycle.
+    #[tokio::test]
+    async fn real_fiscal_failures_map_status_and_keep_inbox_row() {
+        for (kind, idem, want_status, want_code) in [
+            (
+                ErrKind::ShiftNotOpen,
+                "idem-noshift",
+                422u16,
+                "NO_OPEN_SHIFT",
+            ),
+            (ErrKind::SignFailure, "idem-sign", 500, "SIGN_FAILED"),
+            (ErrKind::DpsRejected, "idem-rej", 422, "FISCAL_REJECTED"),
+            (
+                ErrKind::OfflineRefused,
+                "idem-refused",
+                503,
+                "OFFLINE_REFUSED",
+            ),
+        ] {
+            let (_d, main, secure) = fresh_pools().await;
+            let wp = RecordingErr {
+                captured: Mutex::new(None),
+                kind,
+            };
+            let r = handle_command(
+                &shift_open_cmd(idem),
+                FN,
+                drv(),
+                Protocol::Rest,
+                &main,
+                &secure,
+                &wp,
+            )
+            .await;
+            assert_eq!(r.http_status, want_status, "{want_code}: status");
+            match r.body {
+                IngressBody::Error(e) => {
+                    assert_eq!(e.error_code, want_code, "{want_code}: error_code")
+                }
+                other => panic!("{want_code}: expected Error, got {other:?}"),
+            }
+            // The inbox row the seam was handed MUST still be present (not
+            // released) — the write-path, not the handler, owns its lifecycle.
+            // `RecordingErr` deliberately does NOT take the lease, so the row
+            // stays NEW: this is the adversarial fixture for the no-release
+            // assertion (a regression that fired `delete_new_by_request_id`
+            // here would drop the count to 0). In production the lease makes
+            // the row PROCESSING, which the `WHERE status='NEW'` guard already
+            // protects — so "handler issues no release at all" is the property
+            // under test.
+            let rid = wp
+                .captured
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("seam must have received the row")
+                .request_id;
+            let rows: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM ingress_inbox WHERE request_id = ?")
+                    .bind(&rid[..])
+                    .fetch_one(&main)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                rows, 1,
+                "{want_code}: a real fiscal failure must NOT release the inbox row"
+            );
+        }
+    }
+
+    /// A3 — defense-in-depth: an `Ok(FiscalOutcome)` carrying a terminal
+    /// FAILURE state (a seam contract breach — failures must be `Err`) is
+    /// turned into a `500 INTERNAL` + audited, NEVER a phantom 200/202.
+    #[tokio::test]
+    async fn ok_with_terminal_failure_state_is_500_and_audited() {
+        let (_d, main, secure) = fresh_pools().await;
+        let wp = RecordingOk {
+            captured: Mutex::new(None),
+            out: FiscalOutcome {
+                document_id: DocumentId::new(),
+                fiscal_id: None,
+                fiscal_ts: None,
+                document_state: DocState::Rejected,
+                report_xml: None,
+            },
+        };
+        let r = handle_command(
+            &shift_open_cmd("idem-breach"),
+            FN,
+            drv(),
+            Protocol::Rest,
+            &main,
+            &secure,
+            &wp,
+        )
+        .await;
+        assert_eq!(
+            r.http_status, 500,
+            "Ok(failure-state) is a contract breach → 500"
+        );
+        match r.body {
+            IngressBody::Error(e) => assert_eq!(e.error_code, "INTERNAL"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let audited: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE event_type = 'SEAM_OK_WITH_FAILURE_STATE'",
+        )
+        .fetch_one(&main)
+        .await
+        .unwrap();
+        assert_eq!(audited, 1, "the contract breach must be audited");
     }
 }
