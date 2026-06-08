@@ -108,8 +108,19 @@ async fn clear_when_only_issued_receipts() {
 }
 
 #[tokio::test]
-async fn pending_for_signed_sent_kvt1() {
-    for blocking_state in ["SIGNED", "SENT", "KVT1"] {
+async fn pending_for_every_non_kvt2_blocking_state() {
+    // All 7 non-KVT2 in-flight states (KVT2 is the only inline-finalizable one)
+    // must block aggregation → Pending. (KVT2-only / KVT2-leading are pinned by
+    // the kvt2_* tests below.)
+    for blocking_state in [
+        "PREPARED",
+        "SIGNED",
+        "ENCRYPTED",
+        "SENDING",
+        "SENT",
+        "KVT1",
+        "ERROR_RETRYABLE",
+    ] {
         let pool = fresh_pool().await;
         let shift = seed_open_shift(&pool).await;
         seed_receipt(&pool, shift, 1, "ACK").await;

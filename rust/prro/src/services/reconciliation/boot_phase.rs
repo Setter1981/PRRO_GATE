@@ -2360,6 +2360,12 @@ async fn dispatch_prepared_via_chain(
                 // aggregated body). The payload_json-vs-inbox compare is
                 // dropped (the divergence is legitimate here).
                 Some(src) if is_z_class => {
+                    // The integrity check is meaningful because the doc's
+                    // payload_sha256_canonical was computed over the EXACT bytes
+                    // now in payload_json (build_z_canonical persists them
+                    // together; the column stores the literal canonical bytes,
+                    // not a re-serialized struct). A future path that repopulated
+                    // payload_json via a serde round-trip would break this.
                     let recomputed: [u8; 32] = Sha256::digest(payload_json.as_bytes()).into();
                     let d = fd_fiscal_number != inbox_row.fiscal_number
                         || src != inbox_row.payload_sha256_canonical

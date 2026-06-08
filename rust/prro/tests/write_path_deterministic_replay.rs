@@ -2187,20 +2187,23 @@ async fn seed_inbox_for_drift(
     .unwrap();
 }
 
-/// Turn the seeded SELL PREPARED doc into a Z-class (Z_REPORT) doc carrying
+/// Turn the seeded SELL PREPARED doc into a Z-class (`doc_type`) doc carrying
 /// `payload` + the explicit `source` / `payload_sha` hashes — to exercise the
 /// boot drift check's Z-class branch (review HIGH: the relaxation is Z-only).
+/// `doc_type` is "Z_REPORT" or "SHIFT_CLOSE" (both Z-class).
 async fn make_doc_z(
     pool: &SqlitePool,
     doc: DocumentId,
+    doc_type: &str,
     payload: &str,
     source: &[u8; 32],
     payload_sha: &[u8; 32],
 ) {
     sqlx::query(
-        "UPDATE fiscal_documents SET doc_type = 'Z_REPORT', payload_json = ?, \
+        "UPDATE fiscal_documents SET doc_type = ?, payload_json = ?, \
             source_sha256 = ?, payload_sha256_canonical = ? WHERE document_id = ?",
     )
+    .bind(doc_type)
     .bind(payload)
     .bind(&source[..])
     .bind(&payload_sha[..])
@@ -2210,11 +2213,11 @@ async fn make_doc_z(
     .unwrap();
 }
 
-#[tokio::test]
-async fn a1z_source_aware_z_payload_difference_is_not_drift() {
-    // A Z doc's AGGREGATED payload_json differs from the inbox WIRE payload, but
-    // source matches + integrity holds → NO drift (the old payload_json compare
-    // would have FALSE-drifted this; the relaxation is Z-CLASS only).
+/// Both Z-class subtypes (Z_REPORT + SHIFT_CLOSE) must take the relaxed
+/// branch: an aggregated payload_json that differs from the inbox WIRE payload,
+/// with source==inbox + integrity holding, is NOT drift (the old payload_json
+/// compare would have FALSE-drifted it).
+async fn assert_z_payload_difference_is_not_drift(doc_type: &str, doc_byte: u8) {
     let (_dir, app) = fresh_app().await;
     let fn_id = "1234567890";
     seed_fn_config(app.db(), fn_id).await;
@@ -2223,29 +2226,29 @@ async fn a1z_source_aware_z_payload_difference_is_not_drift() {
     let aggregated = aggregate_z_payload(app.db(), fn_id)
         .await
         .expect("aggregate Z");
-    let (doc, req_id) = seed_doc_prepared_full(app.db(), fn_id, 0x2A).await;
+    let (doc, req_id) = seed_doc_prepared_full(app.db(), fn_id, doc_byte).await;
 
     let wire_sha = [0xEEu8; 32];
-    // Z doc carries the aggregated body (integrity holds); source = inbox wire.
     make_doc_z(
         app.db(),
         doc,
+        doc_type,
         &aggregated.payload_json,
         &wire_sha,
         &aggregated.payload_sha256_canonical,
     )
     .await;
-    // inbox carries a DIFFERENT (wire-intent) Z payload + the wire hash.
+    // inbox carries a DIFFERENT (wire-intent) payload + the wire hash.
     seed_inbox_for_drift(
         app.db(),
         &req_id,
-        "Z_REPORT",
+        doc_type,
         r#"{"wire":"intent"}"#,
         &wire_sha,
     )
     .await;
 
-    let stub = StubDpsChannel::new(Ok(ack("server-fiscal-a1z-2a")));
+    let stub = StubDpsChannel::new(Ok(ack("server-fiscal-a1z")));
     let signing_ctx = det_signing_ctx();
     let fn_sign = dummy_fn_sign();
     let deps = ReconciliationRuntime::single_fn(RuntimeView {
@@ -2257,9 +2260,77 @@ async fn a1z_source_aware_z_payload_difference_is_not_drift() {
 
     assert_eq!(
         summary.docs_advanced.prepared_replay_drift_deferred, 0,
-        "a Z payload_json difference with matching source must NOT be drift"
+        "{doc_type}: a payload_json difference with matching source must NOT be drift"
     );
-    assert_eq!(count_drift_audits(app.db()).await, 0, "no drift audit");
+    assert_eq!(
+        count_drift_audits(app.db()).await,
+        0,
+        "{doc_type}: no drift audit"
+    );
+}
+
+#[tokio::test]
+async fn a1z_source_aware_z_payload_difference_is_not_drift() {
+    assert_z_payload_difference_is_not_drift("Z_REPORT", 0x2A).await;
+}
+
+#[tokio::test]
+async fn a1z_source_aware_shift_close_payload_difference_is_not_drift() {
+    assert_z_payload_difference_is_not_drift("SHIFT_CLOSE", 0x2D).await;
+}
+
+#[tokio::test]
+async fn a1z_non_z_consistently_corrupted_payload_is_drift() {
+    // review LOW (guards the round-2 HIGH branch): a NON-Z doc whose payload_json
+    // AND its hash were BOTH rewritten consistently (integrity holds), WITH
+    // source_sha256 present, must STILL drift — the relaxed Z branch must NOT
+    // apply to it. The legacy inbox-equality compare catches it (the doc no
+    // longer matches the inbox the worker received).
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    let _shift = seed_open_shift_and_node(app.db(), fn_id).await;
+    let (doc, req_id) = seed_doc_prepared_full(app.db(), fn_id, 0x2E).await;
+
+    // doc stays SELL (non-Z); payload_json + hash internally consistent, source
+    // present (= canonical, as a real non-Z doc has), but DIFFERS from the inbox.
+    let doc_payload = r#"{"x":1}"#;
+    let doc_sha: [u8; 32] = Sha256::digest(doc_payload.as_bytes()).into();
+    sqlx::query(
+        "UPDATE fiscal_documents SET payload_json = ?, payload_sha256_canonical = ?, \
+            source_sha256 = ? WHERE document_id = ?",
+    )
+    .bind(doc_payload)
+    .bind(&doc_sha[..])
+    .bind(&doc_sha[..]) // non-Z: source == canonical
+    .bind(doc)
+    .execute(app.db())
+    .await
+    .unwrap();
+    let inbox_payload = r#"{"x":2}"#;
+    let inbox_sha: [u8; 32] = Sha256::digest(inbox_payload.as_bytes()).into();
+    seed_inbox_for_drift(app.db(), &req_id, "SELL", inbox_payload, &inbox_sha).await;
+
+    let stub = dps_panic_on_any_method("drift hold must NOT touch DPS");
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+    let summary = app.reconcile_pending_with(deps).await.expect("reconcile");
+
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "PREPARED",
+        "non-Z corruption holds"
+    );
+    assert_eq!(
+        summary.docs_advanced.prepared_replay_drift_deferred, 1,
+        "a non-Z doc with source present + payload differing from inbox MUST drift"
+    );
+    assert_eq!(count_drift_audits(app.db()).await, 1);
 }
 
 #[tokio::test]
@@ -2277,6 +2348,7 @@ async fn a1z_tampered_source_hash_is_drift() {
     make_doc_z(
         app.db(),
         doc,
+        "Z_REPORT",
         FIXTURE_1_PAYLOAD_JSON,
         &[0xCCu8; 32],
         &doc_payload_sha,
@@ -2321,6 +2393,7 @@ async fn a1z_tampered_aggregated_payload_is_drift() {
     make_doc_z(
         app.db(),
         doc,
+        "Z_REPORT",
         FIXTURE_1_PAYLOAD_JSON,
         &wire_sha,
         &[0xBBu8; 32],
