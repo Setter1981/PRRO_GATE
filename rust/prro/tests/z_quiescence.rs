@@ -10,6 +10,7 @@
 use prro::db::models::ids::{DocumentId, ShiftId};
 use prro::db::open_pool;
 use prro::db::repositories::fiscal_documents;
+use prro::runtime::ingress::convert::{aggregate_z_payload, aggregate_z_payload_for_shift};
 use prro::runtime::ingress::z_builder::{quiesce_shift_before_z, QuiescenceOutcome};
 
 const FN: &str = "1234567890";
@@ -93,6 +94,35 @@ async fn issued_count(pool: &sqlx::SqlitePool, shift_id: ShiftId) -> usize {
         .await
         .unwrap()
         .len()
+}
+
+#[tokio::test]
+async fn aggregate_for_shift_uses_the_explicit_shift_not_current() {
+    // wide-audit MEDIUM: aggregate_z_payload_for_shift must aggregate the GIVEN
+    // shift, NOT re-read node_state.current_shift_id (so a transition between
+    // quiesce and aggregate can't switch the shift). Proof: clear
+    // current_shift_id → the wrapper (which reads it) fails, but _for_shift with
+    // the explicit shift still succeeds.
+    let pool = fresh_pool().await;
+    let shift = seed_open_shift(&pool).await;
+    sqlx::query("UPDATE node_state SET current_shift_id = NULL WHERE fiscal_number = ?")
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // The wrapper re-reads current_shift_id (now NULL) → no open shift error.
+    assert!(
+        aggregate_z_payload(&pool, FN).await.is_err(),
+        "wrapper must read current_shift_id (NULL → error)"
+    );
+    // _for_shift ignores current_shift_id and aggregates the explicit shift.
+    assert!(
+        aggregate_z_payload_for_shift(&pool, FN, shift)
+            .await
+            .is_ok(),
+        "_for_shift must use the explicit shift_id, not current_shift_id"
+    );
 }
 
 #[tokio::test]

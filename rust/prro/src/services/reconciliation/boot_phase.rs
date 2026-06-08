@@ -2354,23 +2354,27 @@ async fn dispatch_prepared_via_chain(
             // hash both rewritten) would pass and be signed (review HIGH).
             let is_z_class = matches!(doc_type_copy.as_str(), "Z_REPORT" | "SHIFT_CLOSE");
             let (drift, payload_json_mismatch) = match fd_source_sha {
-                // Z-class (024+): source must match the inbox wire hash AND the
-                // doc's OWN payload integrity must hold (canonical hash == a
-                // fresh sha256 over its payload_json — catches a tampered
-                // aggregated body). The payload_json-vs-inbox compare is
-                // dropped (the divergence is legitimate here).
+                // Z-class (024+): source must match the inbox wire hash AND BOTH
+                // payloads' self-integrity must hold — the doc's (canonical hash
+                // == sha256(its payload_json), catches a tampered aggregated
+                // body) AND the inbox WIRE payload's (sha256(inbox.payload_json)
+                // == inbox hash; the inbox bytes are the crash-recovery anchor
+                // `source` is tied to, and the dropped payload_json-vs-inbox
+                // compare no longer guards them — wide-audit MEDIUM). The
+                // payload_json-vs-inbox EQUALITY is dropped (Z divergence is
+                // legitimate); the two self-integrity checks replace it.
                 Some(src) if is_z_class => {
-                    // The integrity check is meaningful because the doc's
-                    // payload_sha256_canonical was computed over the EXACT bytes
-                    // now in payload_json (build_z_canonical persists them
-                    // together; the column stores the literal canonical bytes,
-                    // not a re-serialized struct). A future path that repopulated
-                    // payload_json via a serde round-trip would break this.
+                    // Integrity is meaningful because each hash was computed over
+                    // the EXACT bytes now persisted (build_z_canonical / ingest
+                    // store the literal hashed bytes, not a re-serialized struct).
                     let recomputed: [u8; 32] = Sha256::digest(payload_json.as_bytes()).into();
+                    let inbox_recomputed: [u8; 32] =
+                        Sha256::digest(inbox_row.payload_json.as_bytes()).into();
                     let d = fd_fiscal_number != inbox_row.fiscal_number
                         || src != inbox_row.payload_sha256_canonical
                         || doc_type_copy.as_str() != inbox_row.operation_type
-                        || recomputed != payload_sha;
+                        || recomputed != payload_sha
+                        || inbox_recomputed != inbox_row.payload_sha256_canonical;
                     (d, false)
                 }
                 // Non-Z (any) OR legacy/pre-024: the ORIGINAL compare — the

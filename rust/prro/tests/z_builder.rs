@@ -7,7 +7,9 @@ use prro::db::models::ids::DriverId;
 use prro::db::repositories::ingress_inbox::InboxRow;
 use prro::runtime::ingress::canonical_builder::BuildReject;
 use prro::runtime::ingress::convert::ConvertedPayload;
-use prro::runtime::ingress::z_builder::build_z_canonical;
+use prro::runtime::ingress::z_builder::{
+    build_z_canonical, ensure_full_z_surface_ready, ZSurfaceNotReady,
+};
 use sha2::{Digest, Sha256};
 
 const FN: &str = "1234567890";
@@ -81,6 +83,16 @@ fn rejects_wire_source_hash_mismatch() {
         build_z_canonical(&row, &aggregated()).unwrap_err(),
         BuildReject::PayloadHashMismatch
     );
+}
+
+#[test]
+fn z_live_dispatch_is_gated_until_full_z_surface() {
+    // RS-3 A2 RELEASE GATE (wide-audit HIGH): the Z aggregate is still
+    // summary-only (no TXS/IO/EPZ; W4-Z2 completes it). A2 MUST call this guard
+    // before driving a live Z and fail-closed while it returns Err. This
+    // tripwire fails the moment someone flips FULL_Z_SURFACE_READY to true — so
+    // enabling a live Z is a DELIBERATE change made together with the surface.
+    assert_eq!(ensure_full_z_surface_ready(), Err(ZSurfaceNotReady));
 }
 
 #[test]

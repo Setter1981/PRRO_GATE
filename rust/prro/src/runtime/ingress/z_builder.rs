@@ -30,6 +30,49 @@ use crate::services::write_path::types::CanonicalFiscalCommand;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
+/// RS-3 A2 RELEASE GATE (wide-audit HIGH / AUDIT5-CRIT-2): the Z aggregation
+/// (`convert::aggregate_zreport` → `ZReportJson`) is still SUMMARY-ONLY — it
+/// carries only payment totals + receipt counts and OMITS the full fiscal Z
+/// surface (TXS tax-group sums / IO service in-out / EPZ card-acquiring
+/// aggregates), which `stage_sign` hardcodes empty pending W4-Z2. A1Z only
+/// WIRES the existing (pre-RS-3, deferred-since-AUDIT5) aggregation; it does
+/// NOT make it live.
+///
+/// `false` until W4-Z2 completes the surface. The future A2 dispatcher MUST
+/// call [`ensure_full_z_surface_ready`] BEFORE aggregating/signing a live
+/// `Z_REPORT` / `SHIFT_CLOSE` and FAIL-CLOSED (return the typed error) while it
+/// is `false` — otherwise a live close-shift would sign an under-reporting Z.
+/// Flip this to `true` IN THE SAME CHANGE that completes the surface; the test
+/// `z_live_dispatch_is_gated_until_full_z_surface` is the tripwire that forces
+/// that to be a deliberate decision.
+pub const FULL_Z_SURFACE_READY: bool = false;
+
+/// Typed fail-closed error for a live Z dispatch attempted before the full Z
+/// surface (TXS / IO / EPZ) exists. See [`FULL_Z_SURFACE_READY`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZSurfaceNotReady;
+
+impl std::fmt::Display for ZSurfaceNotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "live Z dispatch refused: the full Z report surface (TXS/IO/EPZ) is not yet \
+             implemented (W4-Z2); the aggregate is summary-only"
+        )
+    }
+}
+
+/// A2 release gate: `Ok(())` once the full Z surface exists, else
+/// `Err(ZSurfaceNotReady)`. The A2 dispatcher MUST call this before driving a
+/// live Z_REPORT / SHIFT_CLOSE through aggregate/sign.
+pub fn ensure_full_z_surface_ready() -> Result<(), ZSurfaceNotReady> {
+    if FULL_Z_SURFACE_READY {
+        Ok(())
+    } else {
+        Err(ZSurfaceNotReady)
+    }
+}
+
 /// Outcome of the pre-aggregation quiescence pass for a shift.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuiescenceOutcome {
