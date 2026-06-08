@@ -242,18 +242,30 @@ fn convert_error_code(e: &ConvertError) -> &'static str {
     }
 }
 
-/// Map a *successful* fiscalize outcome's durable state to its HTTP status,
-/// or `None` if the state is a terminal FAILURE that must never arrive via
-/// `Ok` (failures are `Err(FiscalError)`; an `Ok` carrying one is a seam
-/// contract breach the caller turns into a 500).
-///   - `Ack` / `OfflineLocalAck` → 200 (durably done; offline-ack carries a
-///     null `fiscal_id`).
-///   - any in-flight state (`Prepared`..`Kvt2`, `ErrorRetryable`) → 202: the
-///     receipt is persisted and being driven to DPS; the client polls/replays
-///     for the terminal answer.
-fn success_status_for_state(state: DocState) -> Option<u16> {
+/// Disposition of a *successful* `fiscalize` outcome, keyed on its durable
+/// document state.
+#[derive(Debug, PartialEq, Eq)]
+enum OutcomeDisposition {
+    /// Terminal success (`Ack` / `OfflineLocalAck`) → 200 success envelope
+    /// (offline-ack carries a null `fiscal_id`).
+    Done,
+    /// In-flight (`Prepared`..`Kvt2`, `ErrorRetryable`): the receipt is
+    /// persisted and being driven to DPS → render the SAME `202 IN_PROGRESS`
+    /// `CanonicalErrorResponse` the replay path emits (the `dto.rs`
+    /// IN_PROGRESS contract: a blocking client switches on the 202 status and
+    /// re-polls).  Keeping first-pass and replay on ONE 202 shape is the
+    /// parity the DTO promises.
+    InProgress,
+    /// A terminal FAILURE state via `Ok` — a seam contract breach (failures
+    /// must be `Err(FiscalError)`) → the caller audits + 500s it.
+    Breach,
+}
+
+/// Classify a successful outcome's state.  Exhaustive over `DocState` (no
+/// `_`) so a newly-added state forces a deliberate decision here.
+fn classify_outcome(state: DocState) -> OutcomeDisposition {
     match state {
-        DocState::Ack | DocState::OfflineLocalAck => Some(200),
+        DocState::Ack | DocState::OfflineLocalAck => OutcomeDisposition::Done,
         DocState::Prepared
         | DocState::Signed
         | DocState::Encrypted
@@ -261,25 +273,25 @@ fn success_status_for_state(state: DocState) -> Option<u16> {
         | DocState::Sent
         | DocState::Kvt1
         | DocState::Kvt2
-        | DocState::ErrorRetryable => Some(202),
-        DocState::Rejected | DocState::Cancelled | DocState::RequiresManualReconciliation => None,
+        | DocState::ErrorRetryable => OutcomeDisposition::InProgress,
+        DocState::Rejected | DocState::Cancelled | DocState::RequiresManualReconciliation => {
+            OutcomeDisposition::Breach
+        }
     }
 }
 
-/// Build the first-pass success envelope from the seam outcome.  `http_status`
-/// is 200 for a terminal-success state or 202 for an in-flight one (see
-/// [`success_status_for_state`]); the body shape is identical — it already
-/// carries `document_id` + `document_state`, so a 202 tells the client the
-/// receipt is accepted + progressing and surfaces its id to poll.  The
-/// receipt totals come from the wire `Totals` (truthful: it is what was
-/// fiscalized), matching the replay path's ledger-derived totals so
-/// first-pass↔replay responses agree.
+/// Build the first-pass success envelope (HTTP 200) from the seam outcome.
+/// Only a TERMINAL-success state reaches here ([`OutcomeDisposition::Done`]);
+/// an in-flight outcome is rendered as the shared `202 IN_PROGRESS` error
+/// envelope (parity with replay), not a success body.  The receipt totals
+/// come from the wire `Totals` (truthful: it is what was fiscalized),
+/// matching the replay path's ledger-derived totals so first-pass↔replay
+/// responses agree.
 fn build_success(
     request_id_hex: &str,
     command_type: CommandType,
     totals: &Totals,
     fo: &FiscalOutcome,
-    http_status: u16,
 ) -> IngressResponse {
     let (sale_total_kopecks, return_total_kopecks) = match command_type {
         CommandType::Sell => (totals.sale_kopecks, 0),
@@ -287,7 +299,7 @@ fn build_success(
         _ => (0, 0),
     };
     IngressResponse {
-        http_status,
+        http_status: 200,
         body: IngressBody::Success(CanonicalResponse {
             ok: true,
             request_id: request_id_hex.to_string(),
@@ -411,19 +423,27 @@ pub async fn handle_command(
     match outcome {
         // First time seen — fiscalize inline through the seam.
         InboxInsertOutcome::Created(row) => match write_path.fiscalize(&row).await {
-            Ok(fo) => match success_status_for_state(fo.document_state) {
-                // Terminal success (Ack / OfflineLocalAck) → 200; an in-flight
-                // state → 202 IN_PROGRESS (the receipt is persisted and being
-                // driven to DPS; the client polls/replays for the terminal
-                // answer).  The body shape is the same — it carries the
-                // document id + state regardless.
-                Some(status) => {
-                    build_success(&rid_hex, cmd.command_type, &cmd.payload.totals, &fo, status)
+            Ok(fo) => match classify_outcome(fo.document_state) {
+                // Terminal success (Ack / OfflineLocalAck) → 200 success body.
+                OutcomeDisposition::Done => {
+                    build_success(&rid_hex, cmd.command_type, &cmd.payload.totals, &fo)
                 }
+                // In-flight → the SAME `202 IN_PROGRESS` error envelope the
+                // replay path emits (dto.rs IN_PROGRESS contract + first-pass↔
+                // replay parity: ONE 202 shape across the first POST and every
+                // re-poll).  The client correlates by `request_id` (carried in
+                // the envelope) and switches on the 202 status; document_id is
+                // intentionally NOT surfaced here — adding it would be a
+                // deliberate change to the error DTO + replay together.
+                OutcomeDisposition::InProgress => err(
+                    &rid_hex,
+                    "IN_PROGRESS",
+                    "the submission is still being processed; retry".to_string(),
+                ),
                 // A terminal FAILURE state via `Ok` is a seam contract breach
                 // (failures must be `Err(FiscalError)`).  Audit + 500 rather
                 // than mint a phantom 200/202 success.
-                None => {
+                OutcomeDisposition::Breach => {
                     let _ = audit_log::append(
                         main_pool,
                         "ingress_inbox",
@@ -1476,15 +1496,16 @@ mod tests {
         assert_eq!(http_status_for_error_code("OFFLINE_REFUSED"), 503);
     }
 
-    /// A3 — `success_status_for_state` keys the success envelope's HTTP code
-    /// on the durable doc state: terminal-success → 200, in-flight → 202, and
-    /// a terminal-FAILURE state → `None` (a seam contract breach the handler
-    /// 500s).  Exhaustive over `DocState` so a new state forces a decision.
+    /// A3 — `classify_outcome` keys the success disposition on the durable doc
+    /// state: terminal-success → Done (200), in-flight → InProgress (202
+    /// IN_PROGRESS, parity with replay), terminal-FAILURE → Breach (the seam
+    /// contract breach the handler 500s).  Exhaustive over `DocState` so a new
+    /// state forces a decision.
     #[test]
-    fn success_status_for_state_classifies_every_doc_state() {
+    fn classify_outcome_classifies_every_doc_state() {
         use DocState::*;
-        assert_eq!(success_status_for_state(Ack), Some(200));
-        assert_eq!(success_status_for_state(OfflineLocalAck), Some(200));
+        assert_eq!(classify_outcome(Ack), OutcomeDisposition::Done);
+        assert_eq!(classify_outcome(OfflineLocalAck), OutcomeDisposition::Done);
         for s in [
             Prepared,
             Signed,
@@ -1496,15 +1517,15 @@ mod tests {
             ErrorRetryable,
         ] {
             assert_eq!(
-                success_status_for_state(s),
-                Some(202),
-                "{s:?} is in-flight → 202"
+                classify_outcome(s),
+                OutcomeDisposition::InProgress,
+                "{s:?} is in-flight → 202 IN_PROGRESS"
             );
         }
         for s in [Rejected, Cancelled, RequiresManualReconciliation] {
             assert_eq!(
-                success_status_for_state(s),
-                None,
+                classify_outcome(s),
+                OutcomeDisposition::Breach,
                 "{s:?} is a terminal failure — never an Ok outcome"
             );
         }
@@ -1554,17 +1575,17 @@ mod tests {
         }
     }
 
-    /// A3 — an in-flight outcome (`Sending`) is a SUCCESS-shaped `202`
-    /// IN_PROGRESS that still surfaces the `document_id` + state so the client
-    /// can poll/replay for the terminal answer.
+    /// A3 (review HIGH — first-pass↔replay parity) — an in-flight outcome
+    /// (`Sending`) renders the SAME `202 IN_PROGRESS` ERROR envelope the
+    /// replay path emits (dto.rs IN_PROGRESS contract), NOT a success body.
+    /// So a blocking client sees ONE 202 shape across the first POST and every
+    /// re-poll.
     #[tokio::test]
-    async fn in_flight_sending_maps_202_with_document_id() {
+    async fn in_flight_sending_maps_202_in_progress_error_envelope() {
         let (_d, main, secure) = fresh_pools().await;
-        let out = sending_outcome();
-        let expected_id = request_id_to_string(out.document_id.as_bytes());
         let wp = RecordingOk {
             captured: Mutex::new(None),
-            out,
+            out: sending_outcome(),
         };
         let r = handle_command(
             &sell_cmd("idem-sending", 10000),
@@ -1578,15 +1599,11 @@ mod tests {
         .await;
         assert_eq!(r.http_status, 202, "an in-flight send is 202 IN_PROGRESS");
         match r.body {
-            IngressBody::Success(b) => {
-                assert_eq!(b.document_state, "SENDING");
-                assert_eq!(
-                    b.document_id, expected_id,
-                    "202 must surface the document id"
-                );
-                assert_eq!(b.fiscal_id, None);
+            IngressBody::Error(e) => {
+                assert!(!e.ok, "IN_PROGRESS is the non-terminal ERROR envelope");
+                assert_eq!(e.error_code, "IN_PROGRESS");
             }
-            other => panic!("expected Success, got {other:?}"),
+            other => panic!("expected the IN_PROGRESS error envelope, got {other:?}"),
         }
     }
 

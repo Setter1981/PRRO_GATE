@@ -158,6 +158,19 @@ pub enum FiscalError {
 /// `operation_type` on the row is the Z-vs-non-Z discriminator: for
 /// `Z_REPORT` / `SHIFT_CLOSE` the `payload_json` is WIRE intent (aggregate
 /// behind the drain barrier); for all others it is signer-ready.
+///
+/// INBOX-LIFECYCLE OBLIGATION (the handler relies on this and CANNOT verify
+/// it from its stale `Created(row)` snapshot): returning any of the four
+/// real [`FiscalError`] variants MUST leave the inbox row **non-`NEW` and
+/// terminal/audited** — the lease has moved it `NEW→PROCESSING`, and a
+/// terminal refusal (DPS reject / offline-refused / shift-not-open / sign
+/// failure) MUST drive the row to a terminal inbox status (e.g. `DONE` /
+/// rejected), since the persistence pin forbids a `fiscal_documents` row for
+/// a rejection.  The handler does NOT release the row for these errors (only
+/// `NotImplemented`, where nothing durable happened, is released); if a real
+/// failure ever returns with the row still `NEW`, a retry of that key would
+/// resolve to `202 IN_PROGRESS` **forever** (`replay.rs`).  An A2 gate test
+/// MUST assert this for every real-failure path.
 #[async_trait]
 pub trait WritePathEntry: Send + Sync {
     /// Fiscalize an inbox-accepted receipt.  Returns the outcome the
