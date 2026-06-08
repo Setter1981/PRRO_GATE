@@ -43,6 +43,7 @@ use super::dto::{
     FiscalLine, PaymentKind,
 };
 use crate::db::models::enums::DocType;
+use crate::db::models::ids::ShiftId;
 use crate::db::repositories::{fiscal_documents, node_state, payment_methods};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -580,28 +581,60 @@ pub async fn convert_to_signer_payload(
             }
             finalize(&CheckOut { items, payments })
         }
+        // RS-3 A1Z: the Z-class aggregation lives in `aggregate_z_payload`
+        // (extracted so the write-path Z-builder reuses the SAME ledger
+        // read + aggregation — one Z-conversion owner, no parallel
+        // aggregator). This ingress arm stays the (currently sole, non-Z-only
+        // dispatched) caller for parity until the dispatcher routes Z here.
         CommandType::ShiftClose | CommandType::ZReport => {
-            // The Z closes the FN's open shift — aggregate that shift's
-            // issued (ACK / OFFLINE_LOCAL_ACK) SELL/RETURN receipts from
-            // the ledger.  Reads only (node_state + fiscal_documents),
-            // outside any write-tx (#1). End-to-end this yields 0/0 until
-            // RS-3 populates the ledger + WL-1 maintains current_shift_id
-            // (plan §0.6 dependency) — correct + testable now regardless.
-            let shift_id = node_state::get(main_pool, fiscal_number)
-                .await
-                .map_err(ConvertError::LedgerRead)?
-                .and_then(|ns| ns.current_shift_id)
-                .ok_or_else(|| ConvertError::NoOpenShiftForZReport {
-                    fiscal_number: fiscal_number.to_string(),
-                })?;
-            let receipts =
-                fiscal_documents::list_shift_issued_receipts(main_pool, fiscal_number, shift_id)
-                    .await
-                    .map_err(ConvertError::LedgerRead)?;
-            finalize(&aggregate_zreport(&receipts)?)
+            aggregate_z_payload(main_pool, fiscal_number).await
         }
         other => Err(ConvertError::NotSignable(other)),
     }
+}
+
+/// RS-3 A1Z — aggregate a GIVEN shift into a signer-ready `ZReportJson`
+/// `ConvertedPayload` (payload_json + its sha256).
+///
+/// Aggregates the shift's issued (ACK / OFFLINE_LOCAL_ACK) SELL/RETURN
+/// receipts from the ledger (`fiscal_documents`). Reads ONLY (no write-tx,
+/// invariant #1). The returned `payload_sha256_canonical` is the hash of the
+/// AGGREGATED body — distinct from the wire-intent hash the inbox carries
+/// (D5 dual-hash).
+///
+/// Takes an EXPLICIT `shift_id` (review MEDIUM): the RS-3 write-path (A2) MUST
+/// pass the SAME shift_id it already passed to `quiesce_shift_before_z`, so a
+/// `current_shift_id` mutation between quiesce and aggregate can't make the Z
+/// aggregate a DIFFERENT shift than the one it quiesced. Use this on the
+/// write-path; [`aggregate_z_payload`] (which re-reads `current_shift_id`) is
+/// for the ingest Z arm / utilities only.
+pub async fn aggregate_z_payload_for_shift(
+    main_pool: &SqlitePool,
+    fiscal_number: &str,
+    shift_id: ShiftId,
+) -> Result<ConvertedPayload, ConvertError> {
+    let receipts = fiscal_documents::list_shift_issued_receipts(main_pool, fiscal_number, shift_id)
+        .await
+        .map_err(ConvertError::LedgerRead)?;
+    finalize(&aggregate_zreport(&receipts)?)
+}
+
+/// RS-3 A1Z — resolve the FN's open shift (`node_state.current_shift_id`) then
+/// aggregate it. For the INGEST Z arm (no pre-resolved shift) + tests /
+/// utilities. The write-path (A2) MUST use [`aggregate_z_payload_for_shift`]
+/// with the quiesced shift_id instead, to avoid re-reading `current_shift_id`.
+pub async fn aggregate_z_payload(
+    main_pool: &SqlitePool,
+    fiscal_number: &str,
+) -> Result<ConvertedPayload, ConvertError> {
+    let shift_id = node_state::get(main_pool, fiscal_number)
+        .await
+        .map_err(ConvertError::LedgerRead)?
+        .and_then(|ns| ns.current_shift_id)
+        .ok_or_else(|| ConvertError::NoOpenShiftForZReport {
+            fiscal_number: fiscal_number.to_string(),
+        })?;
+    aggregate_z_payload_for_shift(main_pool, fiscal_number, shift_id).await
 }
 
 #[cfg(test)]

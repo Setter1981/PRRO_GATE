@@ -357,6 +357,7 @@ async fn seed_issued_receipt(
         total_sum_kop: Some(0),
         payload_json: format!(r#"{{"items":[],"payments":[{payments_json}]}}"#),
         payload_sha256_canonical: [0u8; 32],
+        source_sha256: [0u8; 32],
         unsigned_xml_sha256: None,
         previous_hash: None,
         signed_by_cashier_id: None,

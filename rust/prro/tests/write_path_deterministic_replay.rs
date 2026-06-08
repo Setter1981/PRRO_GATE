@@ -35,11 +35,13 @@ use async_trait::async_trait;
 
 use prro::config::AppConfig;
 use prro::db::models::ids::DocumentId;
+use prro::runtime::ingress::convert::aggregate_z_payload;
 use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
 use prro::transports::dps::error::DpsError;
 use prro::App;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 /// Dummy DPS identity blob for fixtures.  The stub channel does not
@@ -2141,6 +2143,346 @@ async fn fixture_1b_prepared_replay_drift_holds_with_critical_audit() {
             .is_none(),
         "stage_sign must NOT run on drift detection"
     );
+}
+
+// ─── RS-3 A1Z — source-aware PREPARED-replay drift (migration 024) ──────
+//
+// A Z doc's persisted canonical payload/hash legitimately DIFFERS from the
+// inbox wire payload/hash, so the source-aware drift check (boot_phase) must:
+//  (a) NOT false-drift a doc whose payload_json differs from the inbox when
+//      its source_sha256 matches the inbox wire hash + its own payload
+//      integrity holds; and STILL drift on
+//  (b) a tampered SOURCE hash (source != inbox), or
+//  (c) a tampered AGGREGATED body (payload_sha256_canonical != sha256(payload_json)).
+
+async fn count_drift_audits(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'BOOT_PREPARED_REPLAY_DRIFT' AND severity = 'CRITICAL'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn seed_inbox_for_drift(
+    pool: &SqlitePool,
+    req_id: &[u8; 16],
+    op: &str,
+    payload: &str,
+    sha: &[u8; 32],
+) {
+    sqlx::query(
+        "INSERT INTO ingress_inbox(request_id, fiscal_number, protocol, operation_type, \
+            idempotency_key, payload_json, payload_sha256_canonical, status) \
+         VALUES (?, '1234567890', 'REST', ?, ?, ?, ?, 'PROCESSING')",
+    )
+    .bind(&req_id[..])
+    .bind(op)
+    .bind(format!("idem-{:02x}", req_id[0]))
+    .bind(payload)
+    .bind(&sha[..])
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Turn the seeded SELL PREPARED doc into a Z-class (`doc_type`) doc carrying
+/// `payload` + the explicit `source` / `payload_sha` hashes — to exercise the
+/// boot drift check's Z-class branch (review HIGH: the relaxation is Z-only).
+/// `doc_type` is "Z_REPORT" or "SHIFT_CLOSE" (both Z-class).
+async fn make_doc_z(
+    pool: &SqlitePool,
+    doc: DocumentId,
+    doc_type: &str,
+    payload: &str,
+    source: &[u8; 32],
+    payload_sha: &[u8; 32],
+) {
+    sqlx::query(
+        "UPDATE fiscal_documents SET doc_type = ?, payload_json = ?, \
+            source_sha256 = ?, payload_sha256_canonical = ? WHERE document_id = ?",
+    )
+    .bind(doc_type)
+    .bind(payload)
+    .bind(&source[..])
+    .bind(&payload_sha[..])
+    .bind(doc)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Both Z-class subtypes (Z_REPORT + SHIFT_CLOSE) must take the relaxed
+/// branch: an aggregated payload_json that differs from the inbox WIRE payload,
+/// with source==inbox + integrity holding, is NOT drift (the old payload_json
+/// compare would have FALSE-drifted it).
+async fn assert_z_payload_difference_is_not_drift(doc_type: &str, doc_byte: u8) {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    let _shift = seed_open_shift_and_node(app.db(), fn_id).await;
+    // A real, signable ZReportJson for the (empty) shift = 0/0 aggregate.
+    let aggregated = aggregate_z_payload(app.db(), fn_id)
+        .await
+        .expect("aggregate Z");
+    let (doc, req_id) = seed_doc_prepared_full(app.db(), fn_id, doc_byte).await;
+
+    let wire_payload = r#"{"wire":"intent"}"#;
+    // wire hash = the REAL sha256 of the wire payload (inbox self-integrity
+    // holds), and source == it. Only the doc payload diverges (the aggregate).
+    let wire_sha: [u8; 32] = Sha256::digest(wire_payload.as_bytes()).into();
+    make_doc_z(
+        app.db(),
+        doc,
+        doc_type,
+        &aggregated.payload_json,
+        &wire_sha,
+        &aggregated.payload_sha256_canonical,
+    )
+    .await;
+    seed_inbox_for_drift(
+        app.db(),
+        &req_id,
+        doc_type,
+        r#"{"wire":"intent"}"#,
+        &wire_sha,
+    )
+    .await;
+
+    let stub = StubDpsChannel::new(Ok(ack("server-fiscal-a1z")));
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+    let summary = app.reconcile_pending_with(deps).await.expect("reconcile");
+
+    assert_eq!(
+        summary.docs_advanced.prepared_replay_drift_deferred, 0,
+        "{doc_type}: a payload_json difference with matching source must NOT be drift"
+    );
+    assert_eq!(
+        count_drift_audits(app.db()).await,
+        0,
+        "{doc_type}: no drift audit"
+    );
+    // Prove the relaxed branch did not just fall through into a LATER non-drift
+    // hold: the doc actually ADVANCED through sign+send (review LOW).
+    assert_eq!(
+        summary.docs_advanced.prepared_dispatched, 1,
+        "{doc_type}: the non-drift Z must dispatch (sign+send), not stall"
+    );
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "SENT",
+        "{doc_type}: the dispatched Z reaches SENT"
+    );
+}
+
+#[tokio::test]
+async fn a1z_source_aware_z_payload_difference_is_not_drift() {
+    assert_z_payload_difference_is_not_drift("Z_REPORT", 0x2A).await;
+}
+
+#[tokio::test]
+async fn a1z_source_aware_shift_close_payload_difference_is_not_drift() {
+    assert_z_payload_difference_is_not_drift("SHIFT_CLOSE", 0x2D).await;
+}
+
+#[tokio::test]
+async fn a1z_non_z_consistently_corrupted_payload_is_drift() {
+    // review LOW (guards the round-2 HIGH branch): a NON-Z doc whose payload_json
+    // AND its hash were BOTH rewritten consistently (integrity holds), WITH
+    // source_sha256 present, must STILL drift — the relaxed Z branch must NOT
+    // apply to it. The legacy inbox-equality compare catches it (the doc no
+    // longer matches the inbox the worker received).
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    let _shift = seed_open_shift_and_node(app.db(), fn_id).await;
+    let (doc, req_id) = seed_doc_prepared_full(app.db(), fn_id, 0x2E).await;
+
+    // doc stays SELL (non-Z); payload_json + hash internally consistent, source
+    // present (= canonical, as a real non-Z doc has), but DIFFERS from the inbox.
+    let doc_payload = r#"{"x":1}"#;
+    let doc_sha: [u8; 32] = Sha256::digest(doc_payload.as_bytes()).into();
+    sqlx::query(
+        "UPDATE fiscal_documents SET payload_json = ?, payload_sha256_canonical = ?, \
+            source_sha256 = ? WHERE document_id = ?",
+    )
+    .bind(doc_payload)
+    .bind(&doc_sha[..])
+    .bind(&doc_sha[..]) // non-Z: source == canonical
+    .bind(doc)
+    .execute(app.db())
+    .await
+    .unwrap();
+    let inbox_payload = r#"{"x":2}"#;
+    let inbox_sha: [u8; 32] = Sha256::digest(inbox_payload.as_bytes()).into();
+    seed_inbox_for_drift(app.db(), &req_id, "SELL", inbox_payload, &inbox_sha).await;
+
+    let stub = dps_panic_on_any_method("drift hold must NOT touch DPS");
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+    let summary = app.reconcile_pending_with(deps).await.expect("reconcile");
+
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "PREPARED",
+        "non-Z corruption holds"
+    );
+    assert_eq!(
+        summary.docs_advanced.prepared_replay_drift_deferred, 1,
+        "a non-Z doc with source present + payload differing from inbox MUST drift"
+    );
+    assert_eq!(count_drift_audits(app.db()).await, 1);
+}
+
+#[tokio::test]
+async fn a1z_tampered_source_hash_is_drift() {
+    // Z doc, source_sha256 != inbox wire hash → drift, even though integrity
+    // holds (exercises the Z-class branch's source check).
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    let _shift = seed_open_shift_and_node(app.db(), fn_id).await;
+    let (doc, req_id) = seed_doc_prepared_full(app.db(), fn_id, 0x2B).await;
+
+    let doc_payload_sha: [u8; 32] = Sha256::digest(FIXTURE_1_PAYLOAD_JSON.as_bytes()).into();
+    // inbox self-integrity holds (hash == sha256(payload)); doc body integrity
+    // holds; only the doc's SOURCE ([0xCC]) fails to match the inbox hash →
+    // drift purely via the source check.
+    make_doc_z(
+        app.db(),
+        doc,
+        "Z_REPORT",
+        FIXTURE_1_PAYLOAD_JSON,
+        &[0xCCu8; 32],
+        &doc_payload_sha,
+    )
+    .await;
+    seed_inbox_for_drift(
+        app.db(),
+        &req_id,
+        "Z_REPORT",
+        FIXTURE_1_PAYLOAD_JSON,
+        &doc_payload_sha,
+    )
+    .await;
+
+    let stub = dps_panic_on_any_method("drift hold must NOT touch DPS");
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+    let summary = app.reconcile_pending_with(deps).await.expect("reconcile");
+
+    assert_eq!(doc_state(app.db(), doc).await, "PREPARED", "drift holds");
+    assert_eq!(summary.docs_advanced.prepared_replay_drift_deferred, 1);
+    assert_eq!(count_drift_audits(app.db()).await, 1);
+}
+
+#[tokio::test]
+async fn a1z_tampered_aggregated_payload_is_drift() {
+    // Z doc, source matches the inbox, but payload_sha256_canonical != sha256(
+    // payload_json) → integrity broken → drift (the Z branch never skips it).
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    let _shift = seed_open_shift_and_node(app.db(), fn_id).await;
+    let (doc, req_id) = seed_doc_prepared_full(app.db(), fn_id, 0x2C).await;
+
+    let wire_payload = r#"{"wire":"intent"}"#;
+    // inbox self-integrity holds; source == inbox hash; only the doc's
+    // payload_sha256_canonical is a LIE ([0xBB] != sha256(payload_json)) →
+    // drift purely via the doc-body integrity check.
+    let wire_sha: [u8; 32] = Sha256::digest(wire_payload.as_bytes()).into();
+    make_doc_z(
+        app.db(),
+        doc,
+        "Z_REPORT",
+        FIXTURE_1_PAYLOAD_JSON,
+        &wire_sha,
+        &[0xBBu8; 32],
+    )
+    .await;
+    seed_inbox_for_drift(app.db(), &req_id, "Z_REPORT", wire_payload, &wire_sha).await;
+
+    let stub = dps_panic_on_any_method("drift hold must NOT touch DPS");
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+    let summary = app.reconcile_pending_with(deps).await.expect("reconcile");
+
+    assert_eq!(doc_state(app.db(), doc).await, "PREPARED", "drift holds");
+    assert_eq!(summary.docs_advanced.prepared_replay_drift_deferred, 1);
+    assert_eq!(count_drift_audits(app.db()).await, 1);
+}
+
+#[tokio::test]
+async fn a1z_z_inbox_wire_payload_tampered_is_drift() {
+    // wide-audit MEDIUM: a Z doc whose source matches the inbox hash AND whose
+    // own aggregated body integrity holds, but whose INBOX WIRE payload was
+    // tampered (payload_json no longer hashes to the unchanged inbox hash that
+    // `source` is anchored to) → drift. The dropped payload_json-vs-inbox
+    // compare no longer guards the wire bytes; the inbox self-integrity check
+    // must.
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    let _shift = seed_open_shift_and_node(app.db(), fn_id).await;
+    let (doc, req_id) = seed_doc_prepared_full(app.db(), fn_id, 0x2F).await;
+
+    let wire_sha = [0xEEu8; 32];
+    let doc_sha: [u8; 32] = Sha256::digest(FIXTURE_1_PAYLOAD_JSON.as_bytes()).into();
+    // source == inbox hash; doc body integrity holds.
+    make_doc_z(
+        app.db(),
+        doc,
+        "Z_REPORT",
+        FIXTURE_1_PAYLOAD_JSON,
+        &wire_sha,
+        &doc_sha,
+    )
+    .await;
+    // inbox payload_json does NOT hash to its (unchanged) wire hash [0xEE].
+    seed_inbox_for_drift(
+        app.db(),
+        &req_id,
+        "Z_REPORT",
+        r#"{"tampered":"wire"}"#,
+        &wire_sha,
+    )
+    .await;
+
+    let stub = dps_panic_on_any_method("drift hold must NOT touch DPS");
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+    let summary = app.reconcile_pending_with(deps).await.expect("reconcile");
+
+    assert_eq!(doc_state(app.db(), doc).await, "PREPARED", "drift holds");
+    assert_eq!(summary.docs_advanced.prepared_replay_drift_deferred, 1);
+    assert_eq!(count_drift_audits(app.db()).await, 1);
 }
 
 // ─── M3a hardening pass 1 — H2 closure: TransientRetry budget cap ──────
