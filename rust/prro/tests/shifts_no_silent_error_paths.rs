@@ -108,6 +108,15 @@ async fn tier_a_error_unreachable_via_whitelist_from_any_source() {
         // State must remain unchanged (no DB write attempted).
         let observed = shifts::get(&pool, shift_id).await.unwrap().unwrap().state;
         assert_eq!(observed, from, "tier (a): Forbidden must not mutate state");
+
+        // RS-3 C2 (migration 023): one active shift per FN — drop the seed
+        // before the next `from` state is seeded.  This scanner isolates the
+        // Error-unreachability contract, not per-FN uniqueness.
+        sqlx::query("DELETE FROM shifts WHERE shift_id = ?")
+            .bind(shift_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }
 
@@ -155,5 +164,14 @@ async fn tier_b_manual_reachable_only_from_4_whitelist_sources() {
             );
             assert_eq!(observed, from, "tier (b): Forbidden must not mutate state");
         }
+
+        // RS-3 C2 (migration 023): one active shift per FN — drop the seed
+        // before the next `from` state is seeded.  This scanner isolates the
+        // Manual-source contract, not per-FN uniqueness.
+        sqlx::query("DELETE FROM shifts WHERE shift_id = ?")
+            .bind(shift_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

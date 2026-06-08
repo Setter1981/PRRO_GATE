@@ -77,8 +77,12 @@ async fn seed_signed_doc_with_xml(
     let (shift_id_bytes, cashier): (Option<Vec<u8>>, Option<&'static str>) = if bypass {
         (None, None)
     } else {
-        let shift_byte = doc_byte ^ 0x80;
-        let shift_bytes = vec![shift_byte; 16];
+        // RS-3 C2 (migration 023): at most ONE active shift per FN.  All
+        // non-bypass docs for this FN share ONE OPENED shift (fixed id) —
+        // INSERT OR IGNORE de-dups, and the uq index forbids a second active
+        // shift per FN.  The per-doc shift identity is irrelevant here (these
+        // tests assert doc-state transitions, not shift linkage).
+        let shift_bytes = vec![0x77u8; 16];
         sqlx::query(
             "INSERT OR IGNORE INTO shifts(shift_id, fiscal_number, serial, state, \
                 open_mode, cash_balance_kop, opened_by_cashier_id) \

@@ -182,6 +182,15 @@ async fn force_to_error_with_audit_source_guard_9_cases() {
                  committed via Ok-return contract per spec §8 + Round 7 §8.1)"
             );
         }
+
+        // RS-3 C2 (migration 023): one active shift per FN — drop the seed
+        // before the next `from` state is seeded for the same FN.  This
+        // matrix isolates the force-seam source guard, not per-FN uniqueness.
+        sqlx::query("DELETE FROM shifts WHERE shift_id = ?")
+            .bind(shift_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }
 
@@ -260,6 +269,15 @@ async fn force_to_manual_reconciliation_with_audit_source_guard_9_cases() {
                  committed via Ok-return contract per spec §8 + Round 7 §8.1)"
             );
         }
+
+        // RS-3 C2 (migration 023): one active shift per FN — drop the seed
+        // before the next `from` state is seeded for the same FN.  This
+        // matrix isolates the force-seam source guard, not per-FN uniqueness.
+        sqlx::query("DELETE FROM shifts WHERE shift_id = ?")
+            .bind(shift_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }
 

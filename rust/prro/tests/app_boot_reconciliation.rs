@@ -547,6 +547,14 @@ async fn branch_e2_resolves_the_single_active_orphan() {
     .execute(&pool)
     .await
     .unwrap();
+    // RS-3 C2: the dangling node_state pointer that the chokepoint
+    // (boot_phase.rs `current_shift_id = NULL`) must clear when it resolves the
+    // orphan. Without this, a reopened shift would inherit a stale pointer.
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = '1234567890'")
+        .bind(&shift_bytes)
+        .execute(&pool)
+        .await
+        .unwrap();
     let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
@@ -567,6 +575,18 @@ async fn branch_e2_resolves_the_single_active_orphan() {
     assert_eq!(
         read_node_state(&pool, "1234567890").await.unwrap().1,
         "CLOSED"
+    );
+    // RS-3 C2 chokepoint coverage: the stale pointer must be cleared so the FN
+    // no longer references the now-ERROR orphan shift.
+    let dangling: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT current_shift_id FROM node_state WHERE fiscal_number = '1234567890'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        dangling.is_none(),
+        "node_state.current_shift_id must be NULL after the orphan is resolved"
     );
 }
 
