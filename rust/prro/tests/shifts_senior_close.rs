@@ -260,6 +260,15 @@ async fn senior_close_refused_not_closable_for_all_7_disallowed_sources() {
             0,
             "({from:?}) refused path must NOT emit success audit"
         );
+
+        // RS-3 C2 (migration 023): one active shift per FN — drop the seed
+        // before the next disallowed `from` state is seeded.  This covers the
+        // senior-close source guard, not per-FN uniqueness.
+        sqlx::query("DELETE FROM shifts WHERE shift_id = ?")
+            .bind(shift_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }
 

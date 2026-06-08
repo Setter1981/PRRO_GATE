@@ -1498,8 +1498,12 @@ pub async fn run_boot_reconciliation(
                     .await?;
                 }
                 // Reset node_state.shift_state to Closed (HIGH 10 fix).
+                // RS-3 C2: also clear current_shift_id — a CLOSED shift_state
+                // must not leave a dangling current_shift_id pointing at the
+                // just-closed shift (the chokepoint that left the projection
+                // inconsistent; per Q1-A′ node_state is a read-projection).
                 sqlx::query(
-                    "UPDATE node_state SET shift_state = 'CLOSED' \
+                    "UPDATE node_state SET shift_state = 'CLOSED', current_shift_id = NULL \
                      WHERE fiscal_number = ? AND shift_state IN ('OPENING', 'CLOSING')",
                 )
                 .bind(&fn_owned)

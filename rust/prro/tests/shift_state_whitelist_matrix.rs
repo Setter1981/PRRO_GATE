@@ -169,6 +169,18 @@ async fn whitelist_matrix_14_allowed_67_forbidden_via_transition_state() {
                 );
                 forbidden_count += 1;
             }
+
+            // RS-3 C2 (migration 023): the active-shift uniqueness index
+            // forbids two ACTIVE shifts for one FN.  This matrix seeds 81
+            // shifts for ONE FN to exhaustively probe `transition_state`, so
+            // each seeded shift must be removed before the next is seeded —
+            // this test isolates the transition whitelist, not per-FN
+            // uniqueness (covered by `repo_shifts.rs`).
+            sqlx::query("DELETE FROM shifts WHERE shift_id = ?")
+                .bind(shift_id)
+                .execute(&pool)
+                .await
+                .unwrap();
         }
     }
 

@@ -182,3 +182,48 @@ async fn allowed_transition_table_matrix() {
         Opening
     ));
 }
+
+/// RS-3 C2 (migration 023) — at most ONE active shift per fiscal_number.
+/// A second active (CREATED) shift for the same FN is rejected by the
+/// `uq_active_shift_per_fiscal` partial-unique index (the WL-1 foundation;
+/// `insert_created` is a raw INSERT with no app guard, so the DB index IS the
+/// enforcer).
+#[tokio::test]
+async fn second_active_shift_per_fiscal_is_rejected() {
+    let (pool, fn_id) = fresh_with_fn().await;
+    shifts::insert_created(&pool, ShiftId::new(), &fn_id, "ONLINE", "csh-1")
+        .await
+        .expect("first active shift OK");
+    let err = shifts::insert_created(&pool, ShiftId::new(), &fn_id, "ONLINE", "csh-2")
+        .await
+        .expect_err("a second active shift for the same FN must be rejected by the uq index");
+    assert!(
+        format!("{err}").to_lowercase().contains("unique"),
+        "expected a UNIQUE-constraint error, got: {err}"
+    );
+}
+
+/// RS-3 C2 — the partial index covers ACTIVE states only: once the prior
+/// shift leaves the active set (CLOSED — terminal, excluded), a new shift for
+/// the same FN is allowed.
+#[tokio::test]
+async fn new_shift_allowed_after_prior_left_active_set() {
+    let (pool, fn_id) = fresh_with_fn().await;
+    let id1 = ShiftId::new();
+    shifts::insert_created(&pool, id1, &fn_id, "ONLINE", "csh-1")
+        .await
+        .unwrap();
+    // Drive id1 OUT of the active set (raw UPDATE to terminal CLOSED — the full
+    // transition path is exercised elsewhere; here we only set the index
+    // precondition).
+    sqlx::query("UPDATE shifts SET state = 'CLOSED' WHERE shift_id = ?")
+        .bind(id1)
+        .execute(&pool)
+        .await
+        .unwrap();
+    shifts::insert_created(&pool, ShiftId::new(), &fn_id, "ONLINE", "csh-2")
+        .await
+        .expect(
+            "a new active shift is allowed once the prior is CLOSED (excluded from the uq index)",
+        );
+}

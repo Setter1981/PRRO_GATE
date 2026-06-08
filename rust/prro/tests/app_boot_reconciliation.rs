@@ -525,54 +525,68 @@ async fn fixture_5_strict_branch_e1_with_opening_shift_and_pending_doc() {
 }
 
 #[tokio::test]
-async fn branch_e2_handles_multiple_orphan_shifts() {
-    // LOW 2 fix: rare but possible — multiple shifts in OPENING/
-    // CLOSING for one FN (prior boots failed at different times).
-    // All MUST transition to ERROR in one envelope + node_state.shift_state
-    // resets to CLOSED + per-shift CRITICAL audit.
+async fn branch_e2_resolves_the_single_active_orphan() {
+    // RS-3 C2 (migration 023): the active-shift uniqueness index + the
+    // fail-closed backfill now GUARANTEE at most ONE active shift per FN, so
+    // the former "multiple orphan shifts for one FN" scenario (this test's
+    // earlier premise) can no longer arise — the index rejects a second active
+    // insert, and a pre-023 DB with duplicates fails the migration LOUD (no
+    // auto-resolve, operator-locked).  Branch E2's multiple-orphan loop is
+    // therefore belt-and-suspenders; this exercises the realistic post-C2
+    // case: ONE orphan (OPENING) → ERROR in one envelope + node_state.shift_state
+    // reset to CLOSED + a CRITICAL audit.
     let (_dir, pool) = fresh_pool().await;
     seed_fn_config(&pool, "1234567890").await;
     seed_node_state(&pool, "1234567890", "ONLINE", "OPENING", 1).await;
-    // Seed 3 orphan shifts: 2 OPENING + 1 CLOSING.
-    for (i, state) in &[
-        (0xA1u8, "OPENING"),
-        (0xA2u8, "OPENING"),
-        (0xA3u8, "CLOSING"),
-    ] {
-        let shift_bytes = vec![*i; 16];
-        sqlx::query(
-            "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at, opened_by_cashier_id) \
-             VALUES (?, '1234567890', ?, 'ONLINE', '2026-05-10T00:00:00Z', 'test-cashier')",
-        )
+    let shift_bytes = vec![0xA1u8; 16];
+    sqlx::query(
+        "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, opened_at, opened_by_cashier_id) \
+         VALUES (?, '1234567890', 'OPENING', 'ONLINE', '2026-05-10T00:00:00Z', 'test-cashier')",
+    )
+    .bind(&shift_bytes)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // RS-3 C2: the dangling node_state pointer that the chokepoint
+    // (boot_phase.rs `current_shift_id = NULL`) must clear when it resolves the
+    // orphan. Without this, a reopened shift would inherit a stale pointer.
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = '1234567890'")
         .bind(&shift_bytes)
-        .bind(*state)
         .execute(&pool)
         .await
         .unwrap();
-    }
     let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &pool, "1234567890", None)
         .await
         .unwrap();
     assert_eq!(
         outcome,
         BranchOutcome::OrphanShiftResolved {
-            orphans_resolved: 3
+            orphans_resolved: 1
         }
     );
-    // All 3 shifts in ERROR.
     let err_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM shifts WHERE fiscal_number = '1234567890' AND state = 'ERROR'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(err_count, 3, "all 3 orphan shifts transitioned to ERROR");
-    // 3 CRITICAL audit rows.
-    assert_eq!(audit_count(&pool, "SHIFT_BOOT_ORPHAN_ERROR").await, 3);
-    // node_state.shift_state reset to CLOSED.
+    assert_eq!(err_count, 1, "the orphan shift transitioned to ERROR");
+    assert_eq!(audit_count(&pool, "SHIFT_BOOT_ORPHAN_ERROR").await, 1);
     assert_eq!(
         read_node_state(&pool, "1234567890").await.unwrap().1,
         "CLOSED"
+    );
+    // RS-3 C2 chokepoint coverage: the stale pointer must be cleared so the FN
+    // no longer references the now-ERROR orphan shift.
+    let dangling: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT current_shift_id FROM node_state WHERE fiscal_number = '1234567890'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        dangling.is_none(),
+        "node_state.current_shift_id must be NULL after the orphan is resolved"
     );
 }
 

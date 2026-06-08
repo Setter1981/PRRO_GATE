@@ -52,7 +52,11 @@ async fn seed_doc(
         if bypass {
             (None, None)
         } else {
-            let shift_byte = doc_byte ^ 0x80;
+            // RS-3 C2 (active-shift uniqueness): one active shift per FN. All
+            // non-bypass docs for this FN share ONE OPENED shift (a FIXED
+            // shift_id, not doc-derived — the uq index rejects a second active
+            // shift for the FN). `INSERT OR IGNORE` de-dups it across docs.
+            let shift_byte = 0x77u8;
             let shift_bytes = vec![shift_byte; 16];
             sqlx::query(
                 "INSERT OR IGNORE INTO shifts(shift_id, fiscal_number, serial, state, \

@@ -1431,18 +1431,20 @@ async fn seed_doc_prepared_full(
 ) -> (DocumentId, [u8; 16]) {
     // W14a-2b Commit 5: SELL needs shift_id + signer attribution so
     // signer_guard at stage_send 4-pre returns Ok.
-    let shift_byte = doc_byte ^ 0x80;
-    let shift_bytes = vec![shift_byte; 16];
-    sqlx::query(
-        "INSERT OR IGNORE INTO shifts(shift_id, fiscal_number, serial, state, open_mode, \
-            cash_balance_kop, opened_by_cashier_id) \
-         VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
+    // RS-3 C2 (migration 023): at most ONE active shift per FN.  Every caller
+    // seeds the FN's OPENED shift (seed_open_shift_and_node) immediately
+    // before this helper, so link the doc to THAT shift rather than inserting
+    // a second active one (the uq index would reject it, and INSERT OR IGNORE
+    // would silently drop it — breaking the doc's shift_id FK).
+    let shift_bytes: Vec<u8> = sqlx::query_scalar(
+        "SELECT shift_id FROM shifts WHERE fiscal_number = ? \
+         AND state IN ('CREATED','OPENING','OPENED_LOCAL_PENDING_DRAIN', \
+            'OPENED','CLOSING_LOCAL_PENDING_DRAIN','CLOSING') LIMIT 1",
     )
-    .bind(&shift_bytes)
     .bind(fn_id)
-    .execute(pool)
+    .fetch_one(pool)
     .await
-    .unwrap();
+    .expect("seed_doc_prepared_full requires a pre-seeded active shift for the FN");
 
     let doc_bytes = vec![doc_byte; 16];
     let req_bytes = vec![doc_byte ^ 0xFF; 16];

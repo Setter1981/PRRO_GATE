@@ -67,6 +67,14 @@ async fn migration_016_accepts_three_new_shift_states() {
         .execute(&pool)
         .await
         .unwrap_or_else(|e| panic!("migration 016 must accept state {state}: {e}"));
+        // RS-3 C2: remove before the next insert — the active-shift uniqueness
+        // index (migration 023) forbids two ACTIVE shifts for one FN; this test
+        // only verifies each state's CHECK acceptance, one at a time.
+        sqlx::query("DELETE FROM shifts WHERE shift_id = ?")
+            .bind(&shift_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }
 
@@ -115,6 +123,14 @@ async fn migration_016_preserves_existing_six_shift_states() {
         .execute(&pool)
         .await
         .unwrap_or_else(|e| panic!("migration 016 must preserve state {state}: {e}"));
+        // RS-3 C2: remove before the next insert — the active-shift uniqueness
+        // index (migration 023) forbids two ACTIVE shifts for one FN; this test
+        // only verifies each state's CHECK acceptance, one at a time.
+        sqlx::query("DELETE FROM shifts WHERE shift_id = ?")
+            .bind(&shift_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }
 
