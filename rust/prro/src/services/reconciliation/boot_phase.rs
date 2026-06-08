@@ -2344,18 +2344,22 @@ async fn dispatch_prepared_via_chain(
             // never a business-level reject.  Fail-closed hold:
             // return `Drift` (no state mutation, no sign/send); caller
             // emits CRITICAL audit.
-            // RS-3 A1Z (D5): a Z doc legitimately carries an AGGREGATED
-            // payload/hash that differs from the inbox WIRE payload/hash, so
-            // the drift check is SOURCE-aware.
+            // RS-3 A1Z (D5): the source-aware RELAXATION (the doc payload may
+            // differ from the inbox WIRE payload) is correct ONLY for Z-CLASS
+            // docs, whose canonical body is an AGGREGATE of the shift ledger
+            // and legitimately differs from the wire intent. For ANY non-Z doc
+            // the canonical payload MUST equal the inbox payload (no
+            // aggregation), so the full inbox-equality compare is retained —
+            // else a consistently-corrupted non-Z payload (payload_json AND its
+            // hash both rewritten) would pass and be signed (review HIGH).
+            let is_z_class = matches!(doc_type_copy.as_str(), "Z_REPORT" | "SHIFT_CLOSE");
             let (drift, payload_json_mismatch) = match fd_source_sha {
-                // NEW (024+) row: compare the doc's SOURCE/wire hash to the
-                // inbox wire hash. The doc payload may legitimately differ from
-                // the inbox's (Z aggregation), so the payload_json-vs-inbox
-                // compare is REPLACED by a doc-payload INTEGRITY check (the
-                // canonical hash must equal a fresh sha256 over the doc's own
-                // payload_json) — this catches a tampered aggregated body that
-                // the dropped inbox compare would otherwise miss.
-                Some(src) => {
+                // Z-class (024+): source must match the inbox wire hash AND the
+                // doc's OWN payload integrity must hold (canonical hash == a
+                // fresh sha256 over its payload_json — catches a tampered
+                // aggregated body). The payload_json-vs-inbox compare is
+                // dropped (the divergence is legitimate here).
+                Some(src) if is_z_class => {
                     let recomputed: [u8; 32] = Sha256::digest(payload_json.as_bytes()).into();
                     let d = fd_fiscal_number != inbox_row.fiscal_number
                         || src != inbox_row.payload_sha256_canonical
@@ -2363,11 +2367,12 @@ async fn dispatch_prepared_via_chain(
                         || recomputed != payload_sha;
                     (d, false)
                 }
-                // LEGACY (<024) row: no source hash persisted — keep the
-                // ORIGINAL compare (doc canonical hash + payload_json vs inbox)
-                // EXACTLY, as the compatibility fallback. (Production legacy
-                // docs always carry a real hash; only pre-024 rows reach here.)
-                None => {
+                // Non-Z (any) OR legacy/pre-024: the ORIGINAL compare — the
+                // doc's canonical hash + payload_json MUST equal the inbox. For
+                // a post-024 non-Z doc source == canonical == inbox, so the
+                // inbox-hash equality already catches drift; no separate source
+                // compare needed.
+                _ => {
                     let pjm = payload_json != inbox_row.payload_json;
                     let d = fd_fiscal_number != inbox_row.fiscal_number
                         || payload_sha != inbox_row.payload_sha256_canonical

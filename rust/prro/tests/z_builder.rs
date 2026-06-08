@@ -84,6 +84,21 @@ fn rejects_wire_source_hash_mismatch() {
 }
 
 #[test]
+fn rejects_mismatched_aggregated_hash() {
+    // The builder must NOT trust the caller's aggregated hash — a
+    // ConvertedPayload whose hash != sha256(its payload) is rejected (review
+    // MEDIUM), so payload_json=A with hash=B can never persist.
+    let bad = ConvertedPayload {
+        payload_json: AGG_PAYLOAD.to_string(),
+        payload_sha256_canonical: [0x11; 32], // != sha256(AGG_PAYLOAD)
+    };
+    assert_eq!(
+        build_z_canonical(&z_row("Z_REPORT"), &bad).unwrap_err(),
+        BuildReject::PayloadHashMismatch
+    );
+}
+
+#[test]
 fn rejects_missing_driver_id() {
     let mut row = z_row("Z_REPORT");
     row.driver_id = None;

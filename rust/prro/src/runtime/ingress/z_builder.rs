@@ -120,10 +120,19 @@ pub fn build_z_canonical(
     };
 
     // Source-integrity gate: the WIRE payload must match the WIRE hash (the
-    // inbox carries both). Distinct from the aggregated-payload integrity,
-    // which `aggregate_z_payload` produces fresh.
+    // inbox carries both).
     let computed_source: [u8; 32] = Sha256::digest(row.payload_json.as_bytes()).into();
     if computed_source != row.payload_sha256_canonical {
+        return Err(BuildReject::PayloadHashMismatch);
+    }
+
+    // Aggregated-body integrity gate (review MEDIUM): the builder is the last
+    // PURE boundary before stage 1 persists the document hash, so do NOT trust
+    // the caller's `aggregated.payload_sha256_canonical` — recompute it over
+    // `aggregated.payload_json` and reject a mismatch, so a bad / stale
+    // ConvertedPayload can never persist payload_json=A with hash=B.
+    let computed_aggregated: [u8; 32] = Sha256::digest(aggregated.payload_json.as_bytes()).into();
+    if computed_aggregated != aggregated.payload_sha256_canonical {
         return Err(BuildReject::PayloadHashMismatch);
     }
 
@@ -155,8 +164,9 @@ pub fn build_z_canonical(
         // computed turnover in its payload).
         total_sum_kop: None,
         payload_json: aggregated.payload_json.clone(),
-        // D5: canonical = hash of the AGGREGATED body; source = wire hash.
-        payload_sha256_canonical: aggregated.payload_sha256_canonical,
+        // D5: canonical = the RECOMPUTED hash of the AGGREGATED body (verified
+        // == the caller's above); source = wire hash.
+        payload_sha256_canonical: computed_aggregated,
         source_sha256: row.payload_sha256_canonical,
         signed_by_cashier_id,
         driver_id: Some(driver_id),

@@ -30,4 +30,7 @@
 -- recovery path falls back to the legacy compare. Not an idempotency
 -- discriminator; does not enter any unique key.
 
-ALTER TABLE fiscal_documents ADD COLUMN source_sha256 BLOB;
+-- 32-byte invariant enforced at the schema (review LOW) — matches every
+-- other hash column. NULL allowed for the additive back-compat default.
+ALTER TABLE fiscal_documents ADD COLUMN source_sha256 BLOB
+    CHECK (source_sha256 IS NULL OR length(source_sha256) = 32);
