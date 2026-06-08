@@ -74,7 +74,12 @@ pub struct FiscalOutcome {
     pub fiscal_id: Option<String>,
     /// Fiscalization timestamp (ISO-8601) once known.
     pub fiscal_ts: Option<String>,
-    /// Terminal/durable document state (e.g. `Ack`, `OfflineLocalAck`).
+    /// Durable document state.  Either a terminal SUCCESS (`Ack` /
+    /// `OfflineLocalAck` → 200) or an in-flight state (`Sending` / `Sent` /
+    /// `Kvt1` / `Kvt2` / `ErrorRetryable` / …) the receipt is persisted at
+    /// while being driven to DPS → the handler renders `202 IN_PROGRESS` and
+    /// the client polls/replays for the terminal answer.  A terminal FAILURE
+    /// state never arrives here — those are `Err(FiscalError)`.
     pub document_state: DocState,
     /// Q4 — raw Z-report XML for WebCheck, produced at RS-3's
     /// sign/build-artifact boundary.  PASSTHROUGH only: RS-2 never builds
@@ -85,6 +90,17 @@ pub struct FiscalOutcome {
 /// Why fiscalization could not complete.  Every variant carries enough
 /// context (at minimum the `request_id`) for the handler to build a
 /// typed, non-2xx error envelope WITHOUT losing the request identity.
+///
+/// CONTRACT (the highest-consequence RS-3 decision): `FiscalError` is the
+/// DETERMINISTIC-refusal channel ONLY.  A transport / ambiguous DPS failure
+/// that auto-offlines is a SUCCESS, not an error — it returns
+/// `Ok(FiscalOutcome { document_state: OfflineLocalAck, fiscal_id: None, … })`
+/// (200 + OFFLINE_LOCAL_ACK), NEVER `Err`.  A still-in-flight send is also a
+/// success (`Ok` with a non-terminal `document_state` → 202 IN_PROGRESS).
+/// Only a hard, TERMINAL refusal (shift-not-open, sign failure, DPS reject,
+/// offline-refused) is `Err`.  `replay.rs` encodes the same asymmetry
+/// (OfflineLocalAck is an ACCEPTED replay state; OfflineRefusal is Failed) —
+/// keep the two in lock-step.
 #[derive(Debug, Error)]
 pub enum FiscalError {
     /// RS-3 is not yet wired — the entrypoint is [`UnimplementedWritePath`].
@@ -93,17 +109,37 @@ pub enum FiscalError {
     /// the submitted command.
     #[error("write-path not yet implemented (RS-3 pending); request_id={request_id:02x?}")]
     NotImplemented { request_id: [u8; 16] },
-    // RS-3 will add real failure variants (ShiftNotOpen, SignFailure,
-    // DpsRejected, OfflineRefused, …), each likewise carrying request_id.
-    //
-    // CONTRACT for RS-3 (the highest-consequence decision): `FiscalError` is
-    // the DETERMINISTIC-refusal channel only.  A transport / ambiguous DPS
-    // failure that auto-offlines is a SUCCESS, not an error — it returns
-    // `Ok(FiscalOutcome { document_state: OfflineLocalAck, fiscal_id: None, … })`
-    // (200 + OFFLINE_LOCAL_ACK), NEVER `Err`.  Only a hard DPS reject /
-    // guard refusal (shift-not-open, sign failure) is `Err`.  `replay.rs`
-    // already encodes this asymmetry (OfflineLocalAck is an ACCEPTED replay
-    // state; OfflineRefusal is Failed) — keep the two in lock-step.
+
+    /// A deterministic GUARD refusal: the receipt needs an open shift and
+    /// the FN has none.  → `422 NO_OPEN_SHIFT`.  No `fiscal_documents` row is
+    /// minted (guard-refused receipts are audited, not ledgered); the inbox
+    /// row is owned by `fiscalize` (already PROCESSING), NOT released by the
+    /// handler.
+    #[error("no open shift for the fiscal number; request_id={request_id:02x?}")]
+    ShiftNotOpen { request_id: [u8; 16] },
+
+    /// Signing the receipt failed at the crypto boundary — an actual
+    /// sign-operation failure, NOT a CRYPTO_DEGRADED node-mode transition.
+    /// A gateway-side fault → `500 SIGN_FAILED`.
+    #[error("signing the receipt failed; request_id={request_id:02x?}")]
+    SignFailure { request_id: [u8; 16] },
+
+    /// DPS TERMINALLY rejected the receipt — a hard reject, NOT a transient
+    /// or ambiguous send (those auto-offline as `Ok(OfflineLocalAck)` or stay
+    /// in-flight as `Ok(202)`).  → `422 FISCAL_REJECTED`.  Whatever durable
+    /// record the reject leaves (audit per the persistence pin, and/or a
+    /// terminal ledger row) is written by `fiscalize`; the handler must NOT
+    /// release the inbox row.
+    #[error("DPS rejected the receipt; request_id={request_id:02x?}")]
+    DpsRejected { request_id: [u8; 16] },
+
+    /// The node cannot serve the receipt even offline (BLOCKED — the 168h
+    /// offline cap is exhausted — or STOP_MODE): a hard, deterministic
+    /// refusal, distinct from a normal auto-offline (which is success).
+    /// → `503 OFFLINE_REFUSED` (the gateway is operationally unable to
+    /// fiscalize until the node recovers / the operator intervenes).
+    #[error("node refused offline fiscalization; request_id={request_id:02x?}")]
+    OfflineRefused { request_id: [u8; 16] },
 }
 
 /// The inline-synchronous write-path entrypoint.  RS-2's handler calls
