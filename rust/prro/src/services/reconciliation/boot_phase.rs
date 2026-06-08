@@ -2376,6 +2376,9 @@ async fn dispatch_prepared_via_chain(
                 total_sum_kop,
                 payload_json,
                 payload_sha256_canonical: payload_sha,
+                // RS-3 D5: boot PREPARED-replay is a non-aggregated snapshot —
+                // source and canonical hashes coincide here.
+                source_sha256: payload_sha,
                 // W14a-2b Commit 2 (updated post-021): signer attribution
                 // IS now persisted on the ingress_inbox row (migration 021),
                 // but this is the PREPARED-doc REPLAY path — a
