@@ -1,0 +1,33 @@
+-- 024 — fiscal_documents.source_sha256 (RS-3 A1Z / Z dual-hash recovery)
+--
+-- A1Z gives Z-class documents (Z_REPORT / SHIFT_CLOSE) TWO distinct
+-- payload/hash surfaces (D5):
+--   - source_sha256              = the WIRE-intent hash (what ingress
+--                                  persisted on `ingress_inbox.payload_sha256_canonical`),
+--   - payload_sha256_canonical   = hash of the AGGREGATED ZReportJson body
+--                                  that the doc actually carries + signs.
+-- For non-Z docs the two COINCIDE (one payload).
+--
+-- Without persisting the SOURCE hash on the doc, boot PREPARED-replay
+-- recovery (boot_phase.rs) cannot tell a legitimate Z dual-hash from real
+-- drift: it compares `fiscal_documents.payload_sha256_canonical` (aggregated)
+-- against `ingress_inbox.payload_sha256_canonical` (wire) and would raise a
+-- FALSE `Critical` drift on every PREPARED Z doc. A crash after stage_acquire
+-- (PREPARED Z doc) but before sign/send is a STANDARD recovery scenario, so a
+-- false-positive there violates frozen invariant #8 (recovery must not
+-- silently violate state transitions).
+--
+-- Contract (operator-locked 2026-06-08):
+--   - stage_acquire persists source_sha256 = command.source_sha256 (= the
+--     canonical hash for non-Z).
+--   - boot PREPARED replay: NEW rows compare doc.source_sha256 ==
+--     inbox.payload_sha256_canonical (the wire hash); pre-024 LEGACY rows
+--     (source_sha256 NULL) keep the existing compare as a compat fallback;
+--     ALWAYS also verify doc.payload_sha256_canonical == sha256(doc.payload_json)
+--     so the aggregated-payload integrity is never skipped.
+--
+-- NULLABLE for additive backward-compat: pre-024 docs read NULL and the
+-- recovery path falls back to the legacy compare. Not an idempotency
+-- discriminator; does not enter any unique key.
+
+ALTER TABLE fiscal_documents ADD COLUMN source_sha256 BLOB;

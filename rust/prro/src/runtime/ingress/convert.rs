@@ -580,28 +580,44 @@ pub async fn convert_to_signer_payload(
             }
             finalize(&CheckOut { items, payments })
         }
+        // RS-3 A1Z: the Z-class aggregation lives in `aggregate_z_payload`
+        // (extracted so the write-path Z-builder reuses the SAME ledger
+        // read + aggregation — one Z-conversion owner, no parallel
+        // aggregator). This ingress arm stays the (currently sole, non-Z-only
+        // dispatched) caller for parity until the dispatcher routes Z here.
         CommandType::ShiftClose | CommandType::ZReport => {
-            // The Z closes the FN's open shift — aggregate that shift's
-            // issued (ACK / OFFLINE_LOCAL_ACK) SELL/RETURN receipts from
-            // the ledger.  Reads only (node_state + fiscal_documents),
-            // outside any write-tx (#1). End-to-end this yields 0/0 until
-            // RS-3 populates the ledger + WL-1 maintains current_shift_id
-            // (plan §0.6 dependency) — correct + testable now regardless.
-            let shift_id = node_state::get(main_pool, fiscal_number)
-                .await
-                .map_err(ConvertError::LedgerRead)?
-                .and_then(|ns| ns.current_shift_id)
-                .ok_or_else(|| ConvertError::NoOpenShiftForZReport {
-                    fiscal_number: fiscal_number.to_string(),
-                })?;
-            let receipts =
-                fiscal_documents::list_shift_issued_receipts(main_pool, fiscal_number, shift_id)
-                    .await
-                    .map_err(ConvertError::LedgerRead)?;
-            finalize(&aggregate_zreport(&receipts)?)
+            aggregate_z_payload(main_pool, fiscal_number).await
         }
         other => Err(ConvertError::NotSignable(other)),
     }
+}
+
+/// RS-3 A1Z — aggregate the FN's open shift into a signer-ready
+/// `ZReportJson` `ConvertedPayload` (payload_json + its sha256).
+///
+/// The Z closes the FN's open shift: aggregate that shift's issued
+/// (ACK / OFFLINE_LOCAL_ACK) SELL/RETURN receipts from the ledger
+/// (`node_state.current_shift_id` → `fiscal_documents`). Reads ONLY
+/// (no write-tx, invariant #1). Reusable by the ingress Z arm above AND
+/// the RS-3 write-path Z-builder, so both produce the identical aggregated
+/// body + hash. The returned `payload_sha256_canonical` is the hash of the
+/// AGGREGATED body — distinct from the wire-intent hash the inbox carries
+/// (D5 dual-hash).
+pub async fn aggregate_z_payload(
+    main_pool: &SqlitePool,
+    fiscal_number: &str,
+) -> Result<ConvertedPayload, ConvertError> {
+    let shift_id = node_state::get(main_pool, fiscal_number)
+        .await
+        .map_err(ConvertError::LedgerRead)?
+        .and_then(|ns| ns.current_shift_id)
+        .ok_or_else(|| ConvertError::NoOpenShiftForZReport {
+            fiscal_number: fiscal_number.to_string(),
+        })?;
+    let receipts = fiscal_documents::list_shift_issued_receipts(main_pool, fiscal_number, shift_id)
+        .await
+        .map_err(ConvertError::LedgerRead)?;
+    finalize(&aggregate_zreport(&receipts)?)
 }
 
 #[cfg(test)]
