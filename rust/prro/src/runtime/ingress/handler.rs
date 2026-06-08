@@ -1635,6 +1635,13 @@ mod tests {
             }
             // The inbox row the seam was handed MUST still be present (not
             // released) — the write-path, not the handler, owns its lifecycle.
+            // `RecordingErr` deliberately does NOT take the lease, so the row
+            // stays NEW: this is the adversarial fixture for the no-release
+            // assertion (a regression that fired `delete_new_by_request_id`
+            // here would drop the count to 0). In production the lease makes
+            // the row PROCESSING, which the `WHERE status='NEW'` guard already
+            // protects — so "handler issues no release at all" is the property
+            // under test.
             let rid = wp
                 .captured
                 .lock()
