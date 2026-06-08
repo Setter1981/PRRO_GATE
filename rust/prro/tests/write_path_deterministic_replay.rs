@@ -40,6 +40,7 @@ use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
 use prro::transports::dps::error::DpsError;
 use prro::App;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 /// Dummy DPS identity blob for fixtures.  The stub channel does not
@@ -2141,6 +2142,155 @@ async fn fixture_1b_prepared_replay_drift_holds_with_critical_audit() {
             .is_none(),
         "stage_sign must NOT run on drift detection"
     );
+}
+
+// ─── RS-3 A1Z — source-aware PREPARED-replay drift (migration 024) ──────
+//
+// A Z doc's persisted canonical payload/hash legitimately DIFFERS from the
+// inbox wire payload/hash, so the source-aware drift check (boot_phase) must:
+//  (a) NOT false-drift a doc whose payload_json differs from the inbox when
+//      its source_sha256 matches the inbox wire hash + its own payload
+//      integrity holds; and STILL drift on
+//  (b) a tampered SOURCE hash (source != inbox), or
+//  (c) a tampered AGGREGATED body (payload_sha256_canonical != sha256(payload_json)).
+
+async fn count_drift_audits(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'BOOT_PREPARED_REPLAY_DRIFT' AND severity = 'CRITICAL'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn seed_inbox_for_drift(pool: &SqlitePool, req_id: &[u8; 16], payload: &str, sha: &[u8; 32]) {
+    sqlx::query(
+        "INSERT INTO ingress_inbox(request_id, fiscal_number, protocol, operation_type, \
+            idempotency_key, payload_json, payload_sha256_canonical, status) \
+         VALUES (?, '1234567890', 'REST', 'SELL', ?, ?, ?, 'PROCESSING')",
+    )
+    .bind(&req_id[..])
+    .bind(format!("idem-{:02x}", req_id[0]))
+    .bind(payload)
+    .bind(&sha[..])
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn set_doc_hashes(
+    pool: &SqlitePool,
+    doc: DocumentId,
+    source: &[u8; 32],
+    payload_sha: &[u8; 32],
+) {
+    sqlx::query(
+        "UPDATE fiscal_documents SET source_sha256 = ?, payload_sha256_canonical = ? \
+         WHERE document_id = ?",
+    )
+    .bind(&source[..])
+    .bind(&payload_sha[..])
+    .bind(doc)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a1z_source_aware_z_payload_difference_is_not_drift() {
+    // The doc's (aggregated) payload_json differs from the inbox WIRE payload,
+    // but source matches + integrity holds → NO drift (the old payload_json
+    // compare would have FALSE-drifted this).
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    let _shift = seed_open_shift_and_node(app.db(), fn_id).await;
+    let (doc, req_id) = seed_doc_prepared_full(app.db(), fn_id, 0x2A).await;
+
+    // doc carries FIXTURE_1 (a signable SELL); integrity = sha256(FIXTURE_1).
+    let doc_payload_sha: [u8; 32] = Sha256::digest(FIXTURE_1_PAYLOAD_JSON.as_bytes()).into();
+    let wire_sha = [0xEEu8; 32];
+    // source == inbox wire hash; doc payload integrity holds.
+    set_doc_hashes(app.db(), doc, &wire_sha, &doc_payload_sha).await;
+    // inbox carries a DIFFERENT (wire-intent) payload + the wire hash.
+    seed_inbox_for_drift(app.db(), &req_id, r#"{"wire":"intent"}"#, &wire_sha).await;
+
+    let stub = StubDpsChannel::new(Ok(ack("server-fiscal-a1z-2a")));
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+    let summary = app.reconcile_pending_with(deps).await.expect("reconcile");
+
+    assert_eq!(
+        summary.docs_advanced.prepared_replay_drift_deferred, 0,
+        "a payload_json difference with matching source must NOT be drift"
+    );
+    assert_eq!(count_drift_audits(app.db()).await, 0, "no drift audit");
+}
+
+#[tokio::test]
+async fn a1z_tampered_source_hash_is_drift() {
+    // source_sha256 != inbox wire hash → drift, even though integrity holds.
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    let _shift = seed_open_shift_and_node(app.db(), fn_id).await;
+    let (doc, req_id) = seed_doc_prepared_full(app.db(), fn_id, 0x2B).await;
+
+    let doc_payload_sha: [u8; 32] = Sha256::digest(FIXTURE_1_PAYLOAD_JSON.as_bytes()).into();
+    // source ([0xCC]) does NOT match the inbox wire hash ([0xEE]).
+    set_doc_hashes(app.db(), doc, &[0xCCu8; 32], &doc_payload_sha).await;
+    seed_inbox_for_drift(app.db(), &req_id, FIXTURE_1_PAYLOAD_JSON, &[0xEEu8; 32]).await;
+
+    let stub = dps_panic_on_any_method("drift hold must NOT touch DPS");
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+    let summary = app.reconcile_pending_with(deps).await.expect("reconcile");
+
+    assert_eq!(doc_state(app.db(), doc).await, "PREPARED", "drift holds");
+    assert_eq!(summary.docs_advanced.prepared_replay_drift_deferred, 1);
+    assert_eq!(count_drift_audits(app.db()).await, 1);
+}
+
+#[tokio::test]
+async fn a1z_tampered_aggregated_payload_is_drift() {
+    // source matches the inbox, but the doc's payload_sha256_canonical does
+    // NOT equal sha256(its payload_json) → integrity broken → drift.
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    let _shift = seed_open_shift_and_node(app.db(), fn_id).await;
+    let (doc, req_id) = seed_doc_prepared_full(app.db(), fn_id, 0x2C).await;
+
+    let wire_sha = [0xEEu8; 32];
+    // source == inbox wire hash (matches), but payload hash is a LIE ([0xBB]
+    // != sha256(FIXTURE_1)).
+    set_doc_hashes(app.db(), doc, &wire_sha, &[0xBBu8; 32]).await;
+    seed_inbox_for_drift(app.db(), &req_id, r#"{"wire":"intent"}"#, &wire_sha).await;
+
+    let stub = dps_panic_on_any_method("drift hold must NOT touch DPS");
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+    let summary = app.reconcile_pending_with(deps).await.expect("reconcile");
+
+    assert_eq!(doc_state(app.db(), doc).await, "PREPARED", "drift holds");
+    assert_eq!(summary.docs_advanced.prepared_replay_drift_deferred, 1);
+    assert_eq!(count_drift_audits(app.db()).await, 1);
 }
 
 // ─── M3a hardening pass 1 — H2 closure: TransientRetry budget cap ──────
