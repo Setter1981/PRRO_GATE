@@ -398,6 +398,34 @@ pub async fn mark_rejected_if_new_tx(
     Ok(res.rows_affected() == 1)
 }
 
+/// RS-3 A1 — source-state-guarded reject for the POST-lease terminalize
+/// path ([`crate::runtime::ingress::canonical_builder::terminalize_rejected_tx`]).
+/// Only flips `status = PROCESSING → REJECTED`; returns `true` iff a
+/// PROCESSING row was marked.
+///
+/// `false` means the row was NOT in PROCESSING — a double-drive, a stale /
+/// wrong `request_id`, or a concurrently-completed row. The caller MUST
+/// treat `false` as an error so a terminal `DONE` row is never clobbered to
+/// `REJECTED` (which would silently disagree with its issued
+/// `fiscal_documents` ledger row). Use this for the build-reject path that
+/// runs AFTER `acquire_lease`; the unguarded [`mark_rejected_tx`] is for the
+/// proven-just-leased same-tx callsite only.
+pub async fn mark_rejected_if_processing_tx(
+    tx: &mut WriteTxConn<'_>,
+    request_id: &[u8; 16],
+) -> sqlx::Result<bool> {
+    let req_slice: &[u8] = request_id;
+    let res = sqlx::query(
+        "UPDATE ingress_inbox \
+         SET status = 'REJECTED', processed_at = CURRENT_TIMESTAMP \
+         WHERE request_id = ? AND status = 'PROCESSING'",
+    )
+    .bind(req_slice)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 /// W8 stage 5 finalize — finalise the inbox row to terminal `DONE`
 /// status **inside** the same `with_immediate` envelope as the CAS
 /// `Kvt2 → Ack` on `fiscal_documents`.  Tx-bound; mirror of
