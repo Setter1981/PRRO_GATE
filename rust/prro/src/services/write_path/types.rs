@@ -24,6 +24,18 @@ pub struct CanonicalFiscalCommand {
     pub total_sum_kop: Option<i64>,
     pub payload_json: String,
     pub payload_sha256_canonical: [u8; 32],
+    /// RS-3 D5 — the SOURCE hash: the sha256 of the inbox payload that
+    /// produced this command, carried so `stage_acquire` can cross-check
+    /// it against `ingress_inbox.payload_sha256_canonical` (the idempotency
+    /// + crash-recovery anchor, invariant #4).
+    ///
+    /// For NON-Z documents this COINCIDES with `payload_sha256_canonical`
+    /// (one payload, one hash). The A1Z Z path makes them DIVERGE:
+    /// `source_sha256` stays the inbox wire-intent hash while
+    /// `payload_sha256_canonical` becomes the hash of the *aggregated* Z
+    /// report body. Keep the two distinct so a future reader never assumes
+    /// the canonical (possibly-aggregated) hash equals the inbox hash.
+    pub source_sha256: [u8; 32],
     /// W14a-2b §1.4 — operator/cashier id that will sign this document.
     /// Carries through stage 1 (PREPARED insert) → stage 3 (sign) →
     /// stage 4 (send envelope) and is consumed by `signer_guard` at

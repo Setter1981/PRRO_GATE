@@ -473,6 +473,9 @@ pub fn to_canonical_fiscal_command(
         total_sum_kop,
         payload_json,
         payload_sha256_canonical,
+        // RS-3 D5: non-Z DTO conversion — source and canonical hashes coincide
+        // (one payload). The A1Z Z path is the only place they diverge.
+        source_sha256: payload_sha256_canonical,
         signed_by_cashier_id,
         driver_id: None, // W4-Z0 piece 9: set via `to_canonical_fiscal_command_with_context`
     })

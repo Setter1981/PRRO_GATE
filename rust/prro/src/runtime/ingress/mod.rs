@@ -12,6 +12,7 @@
 //!     (RS-2 piece-5b-ii).
 //!   - [`preflight`] — D1 frozen-slot startup validation (RS-2 piece-5b-ii).
 
+pub mod canonical_builder;
 pub mod convert;
 pub mod dto;
 pub mod handler;

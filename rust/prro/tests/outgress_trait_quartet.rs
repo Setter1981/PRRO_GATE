@@ -21,6 +21,7 @@ fn dummy_cmd() -> CanonicalFiscalCommand {
         total_sum_kop: Some(2500),
         payload_json: "{}".to_string(),
         payload_sha256_canonical: [0u8; 32],
+        source_sha256: [0u8; 32], // RS-3 D5: non-Z, coincides with canonical
         signed_by_cashier_id: None,
         driver_id: Some(DriverId::new("maria304").unwrap()),
     }
