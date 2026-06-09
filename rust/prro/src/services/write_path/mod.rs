@@ -13,6 +13,7 @@
 pub mod dispatch;
 pub mod error_routing;
 pub(crate) mod inline_map;
+pub mod kvt2_advance;
 pub mod mac_recovery;
 pub mod signer_guard;
 pub mod stage_acquire;

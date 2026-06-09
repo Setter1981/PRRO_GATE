@@ -61,10 +61,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use prro::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
+use prro::db::models::enums::{DocState, NodeMode, OfflineSessionState, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
 use prro::services::offline_sync::backlog_drain;
 use prro::services::reconciliation::runtime::RuntimeView;
+use prro::services::write_path::kvt2_advance;
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
@@ -2854,4 +2855,184 @@ async fn c62_granular_failure_class_data_sign_empty() {
     assert_eq!(read_doc_state(&pool, doc).await, "KVT1");
     // Counter incremented to 1.
     assert_eq!(read_consecutive_holds(&pool, doc).await, 1);
+}
+
+// ─── RS-3 A2.1a — runtime-neutral confirmer extraction guards ────────
+
+/// **RS-3 A2.1a (2026-06-09) — MED-PR70-R11-01 non-identity guard
+/// (the #1 silent-drift guard for the confirmer extraction).**
+///
+/// The `OFFLINE_DRAIN_KVT2_ADVANCED` audit `server_fiscal_no` MUST come
+/// from the value the caller HANDS IN to
+/// [`kvt2_advance::advance_to_ack`] (ultimately
+/// `StageSendOutcome::Sent.server_fiscal_no`, stamped fresh this tick),
+/// NOT from the doc's own persisted `fiscal_documents.server_fiscal_no`
+/// cohort snapshot.  We seed those two to DIFFER and assert the audit
+/// carries the hand-in value — a regression that re-read
+/// `fiscal_documents.server_fiscal_no` (or the cohort snapshot) would
+/// write the seeded-stale value and fail.
+///
+/// Also pins the `from_state` decoupling: the doc is at DB state `Sent`
+/// (so the CAS is Sent→Kvt1→Kvt2), but we pass `doc_state_at_entry =
+/// ErrorRetryable` (the cohort-walker snapshot label).  The audit
+/// `from_state` MUST be the passed label, not the DB CAS state — matching
+/// the pre-extraction LOW-PR70-R12-02 cohort-entry convention.
+#[tokio::test]
+async fn a2_1a_advance_to_ack_audit_server_fiscal_no_is_handin_not_persisted() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+
+    // Persisted value = the WRONG value a regression would read; hand-in
+    // value = the RIGHT (fresh) value.  They MUST differ.
+    const PERSISTED_WRONG: &str = "DPS-FN-PERSISTED-WRONG";
+    const HANDIN_RIGHT: &str = "DPS-FN-HANDIN-RIGHT";
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "SENT",
+        Some(PERSISTED_WRONG),
+    )
+    .await;
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+
+    let kvt1_raw = vec![0xAAu8; 32];
+    let expected_digest_hex = format!("{:x}", Sha256::digest(&kvt1_raw));
+
+    // Direct call into the extracted runtime-neutral confirmer: the
+    // hand-in `server_fiscal_no` DIFFERS from the persisted column; the
+    // entry label is the cohort snapshot (ERROR_RETRYABLE) while the DB
+    // state is SENT (Sent-entry → Envelope 1a, CAS Sent→Kvt1→Kvt2).
+    kvt2_advance::advance_to_ack(
+        &pool,
+        doc,
+        kvt1_raw.clone(),
+        HANDIN_RIGHT,
+        DocState::ErrorRetryable,
+        Some(7),
+    )
+    .await
+    .expect("advance_to_ack drives Sent→Kvt1→Kvt2→Ack");
+
+    // Doc reaches terminal ACK (Envelope 1a + Envelope 2).
+    assert_eq!(read_doc_state(&pool, doc).await, "ACK");
+
+    // Audit chain: KVT2_ADVANCED (Envelope 1a) + STAGE_FINALIZE_ACK
+    // (Envelope 2).
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 1);
+    assert_eq!(audit_count(&pool, "STAGE_FINALIZE_ACK").await, 1);
+
+    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED")
+        .await
+        .unwrap();
+    // THE GUARD — audit server_fiscal_no == hand-in, NOT persisted.
+    assert_eq!(
+        payload["server_fiscal_no"], HANDIN_RIGHT,
+        "audit server_fiscal_no MUST be the hand-in value \
+         (StageSendOutcome::Sent), NOT fiscal_documents.server_fiscal_no \
+         ({PERSISTED_WRONG}); got: {payload:?}"
+    );
+    assert_ne!(
+        payload["server_fiscal_no"], PERSISTED_WRONG,
+        "regression reading the persisted/cohort server_fiscal_no must fail"
+    );
+    // from_state decoupling — the passed cohort-snapshot label, NOT the
+    // DB CAS state (SENT).
+    assert_eq!(payload["from_state"], "ERROR_RETRYABLE");
+    assert_eq!(payload["to_state"], "KVT2");
+    assert_eq!(payload["dispatch_via"], "kvt2_confirm");
+    assert_eq!(payload["evidence_source"], "lastChk");
+    // attempt_no threaded through the Sent-entry envelope.
+    assert_eq!(payload["attempt_no"].as_i64(), Some(7));
+    // Kvt1Raw persisted byte-for-byte + sha256 audit cross-link.
+    let persisted_kvt1_raw: Vec<u8> = sqlx::query_scalar(
+        "SELECT content FROM document_files WHERE document_id = ? AND kind = 'KVT1_RAW'",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .expect("Envelope 1a MUST persist KVT1_RAW row");
+    assert_eq!(persisted_kvt1_raw, kvt1_raw);
+    assert_eq!(payload["kvt1_raw_sha256_hex"], expected_digest_hex);
+}
+
+/// **RS-3 A2.1a (2026-06-09)** — Kvt1-entry path: `advance_to_ack` with
+/// `doc_state_at_entry = Kvt1` drives Envelope 1b (2-CAS, NO Sent→Kvt1)
+/// + finalize to ACK, with the audit `from_state = KVT1` and NO
+/// `attempt_no` field (no fresh wire attempt) — matching the pre-A2.1a
+/// Kvt1Reentry envelope contract.
+#[tokio::test]
+async fn a2_1a_advance_to_ack_kvt1_entry_drives_2cas_to_ack() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "KVT1",
+        Some("DPS-FN-KVT1-ENTRY"),
+    )
+    .await;
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+
+    let kvt1_raw = vec![0xBBu8; 16];
+    kvt2_advance::advance_to_ack(
+        &pool,
+        doc,
+        kvt1_raw.clone(),
+        "DPS-FN-KVT1-ENTRY",
+        DocState::Kvt1,
+        // attempt_no ignored on the Kvt1-entry path; pass Some to prove it
+        // is NOT leaked into the 1b audit payload.
+        Some(9),
+    )
+    .await
+    .expect("advance_to_ack Kvt1-entry drives Kvt1→Kvt2→Ack");
+
+    assert_eq!(read_doc_state(&pool, doc).await, "ACK");
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 1);
+    assert_eq!(audit_count(&pool, "STAGE_FINALIZE_ACK").await, 1);
+
+    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED")
+        .await
+        .unwrap();
+    assert_eq!(payload["from_state"], "KVT1");
+    assert_eq!(payload["to_state"], "KVT2");
+    assert_eq!(payload["server_fiscal_no"], "DPS-FN-KVT1-ENTRY");
+    assert_eq!(payload["dispatch_via"], "kvt2_confirm");
+    // Kvt1-entry envelope omits attempt_no entirely.
+    assert!(
+        payload.get("attempt_no").is_none() || payload["attempt_no"].is_null(),
+        "Kvt1-entry (Envelope 1b) payload MUST NOT carry attempt_no; got: {payload:?}"
+    );
 }

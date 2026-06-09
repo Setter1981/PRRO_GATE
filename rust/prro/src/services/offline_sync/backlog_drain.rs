@@ -581,11 +581,13 @@ const AUDIT_ENTITY_DRAIN_FN: &str = "node_state";
 ///
 /// **W12 Commit 4a hygiene (LOW-W12C4A-02, 2026-05-22)**:
 /// `pub(crate)` so sibling modules in `services::offline_sync` (W12
-/// `kvt2_confirm::commit_sent_fresh_envelope_1a` and follow-ups) can
-/// share the literal instead of duplicating `"fiscal_document"`
-/// strings.  Audit dashboards filter on this exact value; co-locating
-/// the const eliminates rename drift between drain orchestrator and
-/// helper Envelope 1a writes.
+/// `kvt2_confirm`'s SentReplay / Hold / Drift envelopes) can share the
+/// literal instead of duplicating `"fiscal_document"` strings.  Audit
+/// dashboards filter on this exact value; co-locating the const
+/// eliminates rename drift between drain orchestrator and helper writes.
+/// (RS-3 A2.1a moved the Sent/Kvt1-entry Envelope 1a/1b writes to
+/// `write_path::kvt2_advance`, which mirrors this literal locally to stay
+/// runtime-neutral — no backwards dependency on `offline_sync`.)
 pub(crate) const AUDIT_ENTITY_DOC: &str = "fiscal_document";
 
 /// W9b §2.1 entry (b) — pure-function drain entry for the boot
