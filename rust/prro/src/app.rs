@@ -396,8 +396,9 @@ impl App {
     /// gate.  The live write-path worker (A2) and the stale-`PROCESSING`
     /// reaper (B1) call this and hold the returned guard across the ENTIRE
     /// per-FN `fiscalize` (invariant #2); the gate is a `tokio::sync::Mutex`
-    /// held OUTSIDE every `with_immediate` write-tx (invariant #1).  See
-    /// [`crate::runtime::fn_gate::FnWriteGate`].
+    /// held OUTSIDE every `with_immediate` write-tx (invariant #1).  See the
+    /// `runtime::fn_gate` module docs for the design + the A2/B1 forward
+    /// contracts.
     pub async fn acquire_fn_gate(&self, fiscal_number: &str) -> tokio::sync::OwnedMutexGuard<()> {
         self.inner.fn_write_gate.acquire(fiscal_number).await
     }

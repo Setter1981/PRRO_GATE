@@ -54,7 +54,7 @@ async fn app_clones_share_one_per_fn_gate() {
 
     let mut second = Box::pin(app.acquire_fn_gate(FN_A));
     assert!(
-        timeout(Duration::from_millis(50), &mut second)
+        timeout(Duration::from_millis(200), &mut second)
             .await
             .is_err(),
         "an App clone holding FN_A must block the original on the same FN (one shared gate)"
