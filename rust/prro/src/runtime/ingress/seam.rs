@@ -133,13 +133,64 @@ pub enum FiscalError {
     #[error("DPS rejected the receipt; request_id={request_id:02x?}")]
     DpsRejected { request_id: [u8; 16] },
 
-    /// The node cannot serve the receipt even offline (BLOCKED — the 168h
-    /// offline cap is exhausted — or STOP_MODE): a hard, deterministic
-    /// refusal, distinct from a normal auto-offline (which is success).
-    /// → `503 OFFLINE_REFUSED` (the gateway is operationally unable to
-    /// fiscalize until the node recovers / the operator intervenes).
-    #[error("node refused offline fiscalization; request_id={request_id:02x?}")]
-    OfflineRefused { request_id: [u8; 16] },
+    /// The node mode refuses fiscalization (a hard, deterministic refusal,
+    /// distinct from a normal auto-offline which is success).  → `503` carrying
+    /// the PRECISE node-mode `code` (RS-3 A2 M1): `NODE_BLOCKED` / `NODE_STOP_MODE`
+    /// (operator-action required) vs `NODE_GOING_ONLINE` (transient — retry after
+    /// the return-online drain) vs `NODE_CRYPTO_DEGRADED` — these are distinct
+    /// operational states with distinct shim/retry logic, so the external
+    /// `error_code` is precise (not a single `OFFLINE_REFUSED` bucket), while
+    /// the 503 HTTP class is shared.
+    #[error("node refused fiscalization ({code}); request_id={request_id:02x?}")]
+    OfflineRefused {
+        request_id: [u8; 16],
+        code: &'static str,
+    },
+
+    /// RS-3 A2 (A1Z gate): a live Z (`Z_REPORT` / `SHIFT_CLOSE`) was submitted
+    /// while the full Z fiscalization surface is not yet implemented
+    /// (`z_builder::FULL_Z_SURFACE_READY == false`, until W4-Z2 completes the
+    /// TXS/IO/EPZ surface).  A2's Z dispatch calls `ensure_full_z_surface_ready()`
+    /// FIRST and, on `Err`, takes the lease + audits + terminalises the inbox
+    /// row (REJECTED) and returns this — fail-closed, NO `fiscal_documents` row.
+    /// → `501 Z_SURFACE_NOT_READY` (capability-not-yet-implemented, distinct
+    /// from the whole-seam `NOT_IMPLEMENTED`; NOT a transient 503).  CONSEQUENCE
+    /// (operator-pinned): the REJECTED inbox row means the SAME `idempotency_key`
+    /// will NOT auto-fiscalize after W4-Z2 — the client must submit a NEW key.
+    #[error("live Z fiscalization surface not yet ready; request_id={request_id:02x?}")]
+    ZSurfaceNotReady { request_id: [u8; 16] },
+
+    /// RS-3 A2 (T1 + Q-A) — a write-path GUARD refused the op for a
+    /// client/operator-fixable reason DISTINCT from "no open shift": a
+    /// shift-state guard (shift already open, op refused while a
+    /// pending-drain/close is in flight, sale after a local close, offline
+    /// Z-close unsupported, Z blocked on backlog drain) OR the signer guard's
+    /// true cashier mismatch (`SIGNER_CASHIER_MISMATCH`, Q-A — reissue with the
+    /// correct cashier).  → `422` carrying the SPECIFIC stable `code` (e.g.
+    /// `SHIFT_ALREADY_OPEN`) — these states are distinct for the operator + the
+    /// shim/retry logic, so they are NOT collapsed into `ShiftNotOpen`.  The
+    /// guard already terminalised the inbox (REJECTED + audit); this only
+    /// carries the HTTP code.  (Codes are produced ONLY by `inline_map::codes`,
+    /// which round-trip-tests them to this 422 class.)
+    #[error("shift guard refused ({code}); request_id={request_id:02x?}")]
+    ShiftGuardRefused {
+        request_id: [u8; 16],
+        code: &'static str,
+    },
+
+    /// RS-3 A2 (T2/T3) — a structural / runtime breach that is NOT a
+    /// crypto-sign failure (which stays [`SignFailure`]): a `SignError` other
+    /// than `Crypto`, a `StageSendError`, a missing profile binding, a shift
+    /// invariant violation, or `ShiftRequiresOperatorAttention` (manual-recon,
+    /// `code = SHIFT_MANUAL_RECON`).  → `500` carrying the specific stable
+    /// `code` (forensic taxonomy preserved without inventing one variant per
+    /// fault).  The client cannot fix any of these by re-POSTing; the operator
+    /// semantics live in the `code` + the forensic audit.
+    #[error("internal write-path breach ({code}); request_id={request_id:02x?}")]
+    Internal {
+        request_id: [u8; 16],
+        code: &'static str,
+    },
 }
 
 /// The inline-synchronous write-path entrypoint.  RS-2's handler calls
@@ -160,13 +211,14 @@ pub enum FiscalError {
 /// behind the drain barrier); for all others it is signer-ready.
 ///
 /// INBOX-LIFECYCLE OBLIGATION (the handler relies on this and CANNOT verify
-/// it from its stale `Created(row)` snapshot): returning any of the four
-/// real [`FiscalError`] variants MUST leave the inbox row **non-`NEW` and
+/// it from its stale `Created(row)` snapshot): returning ANY non-`NotImplemented`
+/// [`FiscalError`] variant MUST leave the inbox row **non-`NEW` and
 /// terminal/audited** — the lease has moved it `NEW→PROCESSING`, and a
-/// terminal refusal (DPS reject / offline-refused / shift-not-open / sign
-/// failure) MUST drive the row to a terminal inbox status (e.g. `DONE` /
-/// rejected), since the persistence pin forbids a `fiscal_documents` row for
-/// a rejection.  The handler does NOT release the row for these errors (only
+/// terminal refusal (DPS reject / offline-refused / shift-not-open /
+/// shift-guard-refused / sign failure / internal breach / Z-surface-not-ready)
+/// MUST drive the row to a terminal inbox status (e.g. `DONE` / rejected),
+/// since the persistence pin forbids a `fiscal_documents` row for a rejection.
+/// The handler does NOT release the row for these errors (only
 /// `NotImplemented`, where nothing durable happened, is released); if a real
 /// failure ever returns with the row still `NEW`, a retry of that key would
 /// resolve to `202 IN_PROGRESS` **forever** (`replay.rs`).  An A2 gate test

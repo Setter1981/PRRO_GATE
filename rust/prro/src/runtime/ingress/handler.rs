@@ -123,7 +123,19 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         | "INACTIVE_PAYMENT_METHOD"
         | "PAYMENT_SLOT_KIND_MISMATCH"
         | "ACQUIRER_SLIP_DEFERRED"
-        | "NO_OPEN_SHIFT" => 422,
+        | "NO_OPEN_SHIFT"
+        // RS-3 A2 (T1) — ShiftGuardRefused carries one of these specific
+        // shift-state codes; all are client/control 422s, NOT NO_OPEN_SHIFT.
+        | "SHIFT_ALREADY_OPEN"
+        | "SHIFT_OPEN_PENDING_DRAIN"
+        | "POST_LOCAL_CLOSE_SALE_REFUSED"
+        | "OFFLINE_SHIFT_CLOSE_NOT_SUPPORTED"
+        | "SHIFT_CLOSING_IN_FLIGHT"
+        | "Z_REPORT_BACKLOG_DRAIN_PENDING"
+        // RS-3 A2 (Q-A) — the true signer-vs-opening-cashier mismatch is
+        // client/operator-fixable (reissue with the correct cashier), pre-wire,
+        // no fiscal commitment → 422, carried by ShiftGuardRefused.
+        | "SIGNER_CASHIER_MISMATCH" => 422,
         "INVALID_CASHIER_ID" | "MALFORMED_JSON" => 400,
         // Adapter-shell codes (server.rs `adapter_error`) carry their own
         // hard-coded status; listed here so the map stays TOTAL over the
@@ -131,19 +143,36 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         // gets the right status instead of the `_ => 500` fall-through.
         "UNKNOWN_SOURCE" | "NO_NODE_STATE" => 404,
         "FN_FORBIDDEN" => 403,
-        // RS-3 OFFLINE_REFUSED — the node (BLOCKED / STOP_MODE) cannot
-        // fiscalize even offline; not a client fault, not an internal fault,
-        // so it is a 503 (service unavailable until the node recovers /
-        // operator intervenes), distinct from the 5xx internal-fault bucket.
-        "OFFLINE_REFUSED" => 503,
+        // RS-3 A2 — a live Z was submitted while the full Z surface is not yet
+        // implemented (z_builder::FULL_Z_SURFACE_READY == false, until W4-Z2):
+        // capability-not-yet-implemented → 501, like NOT_IMPLEMENTED but
+        // Z-specific (NOT a transient 503).
+        "Z_SURFACE_NOT_READY" => 501,
+        // RS-3 node-mode refusal — the node cannot fiscalize in its current
+        // mode; not a client fault, not an internal fault, so 503 (service
+        // unavailable until the node recovers / operator intervenes), distinct
+        // from the 5xx internal-fault bucket.  M1: OfflineRefused carries the
+        // PRECISE node-mode code (GOING_ONLINE is retryable, BLOCKED/STOP_MODE
+        // need operator action) — all 503; OFFLINE_REFUSED kept as the generic.
+        "OFFLINE_REFUSED"
+        | "NODE_BLOCKED"
+        | "NODE_STOP_MODE"
+        | "NODE_CRYPTO_DEGRADED"
+        | "NODE_GOING_ONLINE" => 503,
         // ledger/internal faults → 500.  SIGN_FAILED is the RS-3 sign-path
         // fault (a real crypto-operation failure, not a node-mode shift).
+        // RS-3 A2 (T2/T3): `Internal{code}` carries a structural/runtime-breach
+        // code — SHIFT_MANUAL_RECON is the operator-named manual-recon one;
+        // every other Internal code (the SignError-non-Crypto / StageSendError /
+        // BuildReject / shift-invariant codes) also resolves to 500 via the
+        // `_ => 500` fallback, so the map stays total over the Internal bucket.
         "INBOX_LEDGER_DRIFT"
         | "LEDGER_CORRUPTION"
         | "LEDGER_READ_FAILED"
         | "PAYMENT_LOOKUP_FAILED"
         | "NOT_SIGNABLE"
         | "SIGN_FAILED"
+        | "SHIFT_MANUAL_RECON"
         | "INTERNAL" => 500,
         _ => 500,
     }
@@ -597,10 +626,30 @@ pub async fn handle_command(
                     "FISCAL_REJECTED",
                     "DPS rejected the receipt".to_string(),
                 ),
-                FiscalError::OfflineRefused { .. } => err(
+                // M1 — the precise node-mode `code` IS the error_code (all → 503).
+                FiscalError::OfflineRefused { code, .. } => err(
                     &rid_hex,
-                    "OFFLINE_REFUSED",
-                    "node cannot fiscalize even offline (blocked / stop-mode)".to_string(),
+                    code,
+                    format!("node refused fiscalization ({code})"),
+                ),
+                FiscalError::ZSurfaceNotReady { .. } => err(
+                    &rid_hex,
+                    "Z_SURFACE_NOT_READY",
+                    "live Z fiscalization is not yet enabled (pending the full Z surface)"
+                        .to_string(),
+                ),
+                // T1/T2 — the specific stable `code` IS the error_code (the
+                // http map routes ShiftGuardRefused codes → 422, Internal codes
+                // → 500).  Keyed off `rid_hex` (the owned id) like every real
+                // failure; the carried `request_id` is unused here per the A3
+                // defense-in-depth.
+                FiscalError::ShiftGuardRefused { code, .. } => {
+                    err(&rid_hex, code, format!("shift guard refused ({code})"))
+                }
+                FiscalError::Internal { code, .. } => err(
+                    &rid_hex,
+                    code,
+                    format!("internal write-path breach ({code})"),
                 ),
             },
         },
@@ -820,7 +869,10 @@ mod tests {
         ShiftNotOpen,
         SignFailure,
         DpsRejected,
-        OfflineRefused,
+        OfflineRefused(&'static str),
+        ZSurfaceNotReady,
+        ShiftGuardRefused(&'static str),
+        Internal(&'static str),
     }
 
     /// A seam that captures the inbox row and returns a chosen real fiscal
@@ -841,7 +893,12 @@ mod tests {
                 ErrKind::ShiftNotOpen => FiscalError::ShiftNotOpen { request_id },
                 ErrKind::SignFailure => FiscalError::SignFailure { request_id },
                 ErrKind::DpsRejected => FiscalError::DpsRejected { request_id },
-                ErrKind::OfflineRefused => FiscalError::OfflineRefused { request_id },
+                ErrKind::OfflineRefused(code) => FiscalError::OfflineRefused { request_id, code },
+                ErrKind::ZSurfaceNotReady => FiscalError::ZSurfaceNotReady { request_id },
+                ErrKind::ShiftGuardRefused(code) => {
+                    FiscalError::ShiftGuardRefused { request_id, code }
+                }
+                ErrKind::Internal(code) => FiscalError::Internal { request_id, code },
             })
         }
     }
@@ -1494,6 +1551,32 @@ mod tests {
         assert_eq!(http_status_for_error_code("FISCAL_REJECTED"), 422);
         assert_eq!(http_status_for_error_code("SIGN_FAILED"), 500);
         assert_eq!(http_status_for_error_code("OFFLINE_REFUSED"), 503);
+        // M1 — every precise node-mode code shares the 503 class.
+        for code in [
+            "NODE_BLOCKED",
+            "NODE_STOP_MODE",
+            "NODE_CRYPTO_DEGRADED",
+            "NODE_GOING_ONLINE",
+        ] {
+            assert_eq!(http_status_for_error_code(code), 503, "{code}");
+        }
+        assert_eq!(http_status_for_error_code("Z_SURFACE_NOT_READY"), 501);
+        // T1 — every ShiftGuardRefused code is a 422 (NOT collapsed to
+        // NO_OPEN_SHIFT); + the Q-A signer-cashier 422 (carried by ShiftGuardRefused).
+        for code in [
+            "SHIFT_ALREADY_OPEN",
+            "SHIFT_OPEN_PENDING_DRAIN",
+            "POST_LOCAL_CLOSE_SALE_REFUSED",
+            "OFFLINE_SHIFT_CLOSE_NOT_SUPPORTED",
+            "SHIFT_CLOSING_IN_FLIGHT",
+            "Z_REPORT_BACKLOG_DRAIN_PENDING",
+            "SIGNER_CASHIER_MISMATCH",
+        ] {
+            assert_eq!(http_status_for_error_code(code), 422, "{code}");
+        }
+        // T2/T3 — Internal codes are 500 (SHIFT_MANUAL_RECON explicit; others via fallback).
+        assert_eq!(http_status_for_error_code("SHIFT_MANUAL_RECON"), 500);
+        assert_eq!(http_status_for_error_code("SOME_INTERNAL_BREACH_CODE"), 500);
     }
 
     /// A3 — `classify_outcome` keys the success disposition on the durable doc
@@ -1622,10 +1705,28 @@ mod tests {
             (ErrKind::SignFailure, "idem-sign", 500, "SIGN_FAILED"),
             (ErrKind::DpsRejected, "idem-rej", 422, "FISCAL_REJECTED"),
             (
-                ErrKind::OfflineRefused,
+                ErrKind::ZSurfaceNotReady,
+                "idem-zsurf",
+                501,
+                "Z_SURFACE_NOT_READY",
+            ),
+            (
+                ErrKind::ShiftGuardRefused("SHIFT_ALREADY_OPEN"),
+                "idem-sg",
+                422,
+                "SHIFT_ALREADY_OPEN",
+            ),
+            (
+                ErrKind::Internal("SHIFT_MANUAL_RECON"),
+                "idem-int",
+                500,
+                "SHIFT_MANUAL_RECON",
+            ),
+            (
+                ErrKind::OfflineRefused("NODE_GOING_ONLINE"),
                 "idem-refused",
                 503,
-                "OFFLINE_REFUSED",
+                "NODE_GOING_ONLINE",
             ),
         ] {
             let (_d, main, secure) = fresh_pools().await;
