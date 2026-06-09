@@ -12,6 +12,7 @@
 
 pub mod dispatch;
 pub mod error_routing;
+pub mod inline;
 pub(crate) mod inline_map;
 pub mod kvt2_advance;
 pub mod mac_recovery;

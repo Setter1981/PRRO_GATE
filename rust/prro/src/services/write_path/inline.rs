@@ -1,0 +1,180 @@
+//! RS-3 A2.1b-core — the inline `fiscalize` orchestrator (SELL/RETURN only).
+//!
+//! Lands DORMANT: the production binding (`UnimplementedWritePath` →
+//! `InlineWritePath`) is flipped in A2.4, so nothing here is reachable from a
+//! live request yet. See `docs/superpowers/plans/2026-06-09-rs3-a2-1b-core-impl.md`.
+//!
+//! ## Online `Sent → ACK` confirm (Q1 = option b, operator-signed)
+//!
+//! `stage_send::run` reaches `Sent { server_fiscal_no, attempt_no }` but
+//! discards the DPS send-response `data_sign`; `kvt2_advance::advance_to_ack`
+//! REQUIRES `kvt1_raw_bytes` (the lastChk `data_sign`).  So after `Sent` the
+//! inline ladder performs an inline lastChk by `server_fiscal_no` via
+//! [`online_confirm`] to recover the evidence, then drives `advance_to_ack`.
+//!
+//! [`online_confirm`] is a thin runtime-neutral wrapper that REUSES the drain's
+//! pure classifier (`classify_check_result`) so the KVT1/hold/drift routing is
+//! NOT duplicated — but it yields a 3-shape [`InlineConfirmOutcome`] (NO
+//! `BootError`, NO drain source-routing leaking into the inline path).
+
+#![allow(dead_code)] // consumed by `inline::run` (A2.1b-core), wired up incrementally.
+
+use crate::services::offline_sync::kvt2_confirm::{
+    classify_check_result, Kvt2ConfirmOutcome, Kvt2ConfirmSource,
+};
+use crate::transports::dps::channel::DpsChannel;
+use crate::transports::dps::dto::CheckSignBlob;
+
+/// Outcome of the inline online `Sent → ACK` confirm step ([`online_confirm`]).
+/// Runtime-neutral 3-shape projection of the drain's `Kvt2ConfirmOutcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InlineConfirmOutcome {
+    /// lastChk matched with non-empty `data_sign` — the KVT1 evidence the
+    /// caller feeds into `advance_to_ack(kvt1_raw_bytes = .0)`.
+    Acked(Vec<u8>),
+    /// Transient / no-KVT1-evidence (DPS transport/server/auth/decode error,
+    /// or matched id with EMPTY `data_sign`).  The caller leaves the doc at
+    /// `Sent` → `Ok(FiscalOutcome{document_state: Sent})` → 202 IN_PROGRESS;
+    /// drain/B1 completes the ACK later.  NEVER a terminal failure.
+    Hold,
+    /// Structural drift — `NotFound` / `ServerFiscalIdMismatch` from a
+    /// Sent-fresh online send (the server does not recognise the id we just
+    /// got from it).  The caller terminalises the inbox + returns
+    /// `FiscalError::Internal` (500).
+    Drift,
+}
+
+/// Inline online confirm: lastChk by `server_fiscal_no` → recover the KVT1
+/// `data_sign` evidence.  Reuses [`classify_check_result`] (`SentFresh`
+/// context) so the KVT1/hold/drift classification is single-sourced.
+///
+/// **I1**: the only IO is `by_server_fiscal_no` (a `last_chk` wire call), which
+/// `assert_not_in_with_immediate`s — it MUST be called OUTSIDE every
+/// `with_immediate` envelope.  No DB writes here.
+pub async fn online_confirm(
+    dps: &dyn DpsChannel,
+    fn_sign: &CheckSignBlob,
+    server_fiscal_no: &str,
+) -> InlineConfirmOutcome {
+    let result = dps.by_server_fiscal_no(fn_sign, server_fiscal_no).await;
+    match classify_check_result(result, Kvt2ConfirmSource::SentFresh, None) {
+        Kvt2ConfirmOutcome::Acked { kvt1_raw_bytes, .. } => {
+            InlineConfirmOutcome::Acked(kvt1_raw_bytes)
+        }
+        Kvt2ConfirmOutcome::Hold { .. } => InlineConfirmOutcome::Hold,
+        Kvt2ConfirmOutcome::StructuralDrift { .. } => InlineConfirmOutcome::Drift,
+        Kvt2ConfirmOutcome::SentNotFoundDowngrade { .. } => {
+            // Structurally unreachable: `classify_check_result` only emits
+            // `SentNotFoundDowngrade` for the `SentReplay` source (the
+            // safe-redrive path); we always pass `SentFresh`.  If this ever
+            // fires, the classifier routing regressed.
+            unreachable!(
+                "online_confirm: SentNotFoundDowngrade is SentReplay-exclusive; \
+                 SentFresh cannot produce it (classify_check_result routing breach)"
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transports::dps::dto::{CheckAck, CheckEnvelope, RroInfo, StatusSnapshot};
+    use crate::transports::dps::error::DpsError;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    const FN_SIGN: &[u8] = &[0xAB, 0xCD];
+    const SERVER_FISCAL_NO: &str = "DPS-FN-ONLINE-1";
+
+    /// Minimal `DpsChannel` stub: a single scripted `last_chk` reply (consumed
+    /// once).  `online_confirm` → `by_server_fiscal_no` (default trait method)
+    /// → `last_chk`.  Other RPCs are unreachable for this seam.
+    struct StubLastChk(Mutex<Option<Result<CheckAck, DpsError>>>);
+
+    impl StubLastChk {
+        fn new(reply: Result<CheckAck, DpsError>) -> Self {
+            Self(Mutex::new(Some(reply)))
+        }
+    }
+
+    #[async_trait]
+    impl DpsChannel for StubLastChk {
+        async fn send_chk(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
+            unreachable!("online_confirm never sends");
+        }
+        async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
+            self.0
+                .lock()
+                .unwrap()
+                .take()
+                .expect("StubLastChk: last_chk called more than once")
+        }
+        async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
+            unreachable!("stub: ping not exercised");
+        }
+        async fn status_rro(&self, _: &CheckSignBlob) -> Result<StatusSnapshot, DpsError> {
+            unreachable!("stub: status_rro not exercised");
+        }
+        async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
+            unreachable!("stub: info_rro not exercised");
+        }
+    }
+
+    fn ack(id: &str, data_sign: Vec<u8>) -> CheckAck {
+        CheckAck {
+            id: id.to_string(),
+            id_sign: vec![],
+            data_sign,
+        }
+    }
+
+    fn fn_sign() -> CheckSignBlob {
+        CheckSignBlob(FN_SIGN.to_vec())
+    }
+
+    /// Match + non-empty data_sign → Acked carrying the exact evidence bytes
+    /// (which the caller feeds into advance_to_ack as kvt1_raw_bytes).
+    #[tokio::test]
+    async fn acked_returns_data_sign_evidence() {
+        let dps = StubLastChk::new(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+        let outcome = online_confirm(&dps, &fn_sign(), SERVER_FISCAL_NO).await;
+        assert_eq!(
+            outcome,
+            InlineConfirmOutcome::Acked(vec![0xDE, 0xAD, 0xBE, 0xEF])
+        );
+    }
+
+    /// Match but EMPTY data_sign → Hold (no KVT1 evidence → 202, NOT a fake ACK).
+    #[tokio::test]
+    async fn empty_data_sign_returns_hold() {
+        let dps = StubLastChk::new(Ok(ack(SERVER_FISCAL_NO, vec![])));
+        let outcome = online_confirm(&dps, &fn_sign(), SERVER_FISCAL_NO).await;
+        assert_eq!(outcome, InlineConfirmOutcome::Hold);
+    }
+
+    /// Transport error → Hold (transient → 202, NOT terminal 500).
+    #[tokio::test]
+    async fn transport_error_returns_hold() {
+        let dps = StubLastChk::new(Err(DpsError::Transport("conn reset".into())));
+        let outcome = online_confirm(&dps, &fn_sign(), SERVER_FISCAL_NO).await;
+        assert_eq!(outcome, InlineConfirmOutcome::Hold);
+    }
+
+    /// Empty id → NotFound → Drift (server does not recognise the id it just
+    /// returned to us → structural breach → caller maps to Internal/500).
+    #[tokio::test]
+    async fn not_found_returns_drift() {
+        let dps = StubLastChk::new(Ok(ack("", vec![0x01])));
+        let outcome = online_confirm(&dps, &fn_sign(), SERVER_FISCAL_NO).await;
+        assert_eq!(outcome, InlineConfirmOutcome::Drift);
+    }
+
+    /// Mismatched id → ServerFiscalIdMismatch → Drift.
+    #[tokio::test]
+    async fn id_mismatch_returns_drift() {
+        let dps = StubLastChk::new(Ok(ack("DPS-FN-OTHER", vec![0x01])));
+        let outcome = online_confirm(&dps, &fn_sign(), SERVER_FISCAL_NO).await;
+        assert_eq!(outcome, InlineConfirmOutcome::Drift);
+    }
+}
