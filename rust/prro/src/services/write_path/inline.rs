@@ -17,11 +17,25 @@
 //! NOT duplicated — but it yields a 3-shape [`InlineConfirmOutcome`] (NO
 //! `BootError`, NO drain source-routing leaking into the inline path).
 
-#![allow(dead_code)] // consumed by `inline::run` (A2.1b-core), wired up incrementally.
+#![allow(dead_code)] // consumed by the A2.4 binding; wired up incrementally.
 
+use sqlx::SqlitePool;
+use tokio::sync::OwnedMutexGuard;
+
+use crate::db::models::enums::DocState;
+use crate::db::repositories::ingress_inbox::InboxRow;
+use crate::runtime::ingress::canonical_builder::build_canonical;
+use crate::runtime::ingress::seam::{FiscalError, FiscalOutcome};
 use crate::services::offline_sync::kvt2_confirm::{
     classify_check_result, Kvt2ConfirmOutcome, Kvt2ConfirmSource,
 };
+use crate::services::write_path::dispatch::{dispatch_post_sign, PostSignRoute};
+use crate::services::write_path::inline_map::{classify_send_outcome, SendDisposition};
+use crate::services::write_path::kvt2_advance::{advance_to_ack, ConfirmError};
+use crate::services::write_path::stage_acquire;
+use crate::services::write_path::stage_send::{self, StageSendOutcome};
+use crate::services::write_path::stage_sign::{self, SigningContext};
+use crate::services::write_path::types::WorkerProcessResult;
 use crate::transports::dps::channel::DpsChannel;
 use crate::transports::dps::dto::CheckSignBlob;
 
@@ -72,6 +86,142 @@ pub async fn online_confirm(
                 "online_confirm: SentNotFoundDowngrade is SentReplay-exclusive; \
                  SentFresh cannot produce it (classify_check_result routing breach)"
             )
+        }
+    }
+}
+
+/// Inline `fiscalize` orchestrator (A2.1b-core, SELL/RETURN only) — chains
+/// `build_canonical → stage_acquire → stage_sign → dispatch → (Online) send →
+/// online_confirm → advance_to_ack → finalize` into a `FiscalOutcome`.
+///
+/// **DORMANT**: no production caller yet (the binding flip is A2.4). `fn_gate`
+/// is the A4 per-FN gate proof — the A2.4 binding MUST hold
+/// `App::acquire_fn_gate(&row.fiscal_number)` across this call (invariant #2 at
+/// the runtime level; the DB lease CAS in `stage_acquire` is the durable
+/// backstop). `run` opens NO `with_immediate` itself; every envelope is owned
+/// by a reused stage, and the only IO (crypto sign, DPS send, inline lastChk)
+/// sits strictly BETWEEN envelopes (invariant #1).
+///
+/// Non-happy arms are wired incrementally (see the TDD increments in the impl
+/// spec); each lands with its own pinning test.
+#[allow(clippy::too_many_arguments)] // individual deps keep `run` unit-testable
+                                     // without `&App` (the binding bundles them).
+pub async fn run(
+    pool: &SqlitePool,
+    pool_secure: &SqlitePool,
+    dps: &dyn DpsChannel,
+    sign_ctx: &SigningContext,
+    fn_sign: &CheckSignBlob,
+    _fn_gate: &OwnedMutexGuard<()>,
+    row: &InboxRow,
+) -> Result<FiscalOutcome, FiscalError> {
+    let request_id = row.request_id;
+
+    // A2.1b-core is SELL/RETURN only. Z_REPORT/SHIFT_CLOSE (Z-class) and
+    // SHIFT_OPEN are fail-closed (incr.5), handled before build/acquire.
+    // TODO(incr.5): is_z_class → ZSurfaceNotReady (lease+terminalise);
+    //               SHIFT_OPEN → ShiftGuardRefused{SHIFT_OPEN_NOT_SUPPORTED}.
+
+    let command = match build_canonical(row) {
+        Ok(c) => c,
+        Err(_reject) => {
+            todo!("A2.1b-core incr.5: BuildReject arm (terminalise + map_build_reject)")
+        }
+    };
+    // build_canonical validated driver_id is present + well-formed.
+    let driver_id = row
+        .driver_id
+        .as_deref()
+        .expect("build_canonical guarantees driver_id present");
+
+    let acq = match stage_acquire::run(pool, pool_secure, driver_id, request_id, command).await {
+        Ok(r) => r,
+        Err(_e) => todo!("A2.1b-core incr.5: stage_acquire anyhow-error arm"),
+    };
+    let ctx = match acq {
+        WorkerProcessResult::Proceed(ctx) | WorkerProcessResult::Resumed(ctx) => ctx,
+        WorkerProcessResult::Noop => todo!("A2.1b-core incr.3: Noop replay-resolve"),
+        WorkerProcessResult::Rejected { .. } => todo!("A2.1b-core incr.5: Rejected arm"),
+    };
+    let doc_id = ctx.document.document_id;
+    let fiscal_number = ctx.document.fiscal_number.clone();
+
+    match stage_sign::run(pool, sign_ctx, ctx).await {
+        Ok(_signing) => {}
+        Err(_e) => todo!("A2.1b-core incr.5: SignError arm"),
+    }
+
+    let route = match dispatch_post_sign(pool, doc_id, &fiscal_number).await {
+        Ok(r) => r,
+        Err(_e) => todo!("A2.1b-core incr.5: dispatch anyhow-error arm"),
+    };
+    match route {
+        PostSignRoute::Refused(_reason) => {
+            todo!("A2.1b-core incr.5: dispatcher Refused arm")
+        }
+        PostSignRoute::Offline { .. } => todo!("A2.1b-core incr.4: offline-ack arm"),
+        PostSignRoute::Online { .. } => {
+            let send = match stage_send::run(pool, dps, doc_id, Some(sign_ctx)).await {
+                Ok(o) => o,
+                Err(_e) => todo!("A2.1b-core incr.5: StageSendError arm"),
+            };
+            // GOTCHA (arch-planner): `classify_send_outcome` drops `attempt_no`
+            // on the Proceed arm — capture it from `Sent` BEFORE classifying,
+            // since `advance_to_ack`'s audit payload needs it.
+            let sent_attempt_no = match &send {
+                StageSendOutcome::Sent { attempt_no, .. } => Some(*attempt_no),
+                _ => None,
+            };
+            match classify_send_outcome(send, request_id) {
+                SendDisposition::Reject(_fe) => todo!("A2.1b-core incr.5: send Reject arm"),
+                SendDisposition::InProgress => {
+                    todo!("A2.1b-core incr.3: send InProgress (202) arm")
+                }
+                SendDisposition::ResolveReplay { .. } => {
+                    todo!("A2.1b-core incr.3: send ResolveReplay arm")
+                }
+                SendDisposition::Proceed { server_fiscal_no } => {
+                    let attempt_no = sent_attempt_no
+                        .expect("Sent disposition implies a captured Sent attempt_no");
+                    // Online Sent→ACK confirm (Q1 = b): inline lastChk recovers
+                    // the KVT1 evidence stage_send discarded, then advance_to_ack.
+                    match online_confirm(dps, fn_sign, &server_fiscal_no).await {
+                        InlineConfirmOutcome::Acked(kvt1_raw_bytes) => {
+                            match advance_to_ack(
+                                pool,
+                                doc_id,
+                                kvt1_raw_bytes,
+                                &server_fiscal_no,
+                                DocState::Sent,
+                                Some(i64::from(attempt_no)),
+                            )
+                            .await
+                            {
+                                Ok(()) => Ok(FiscalOutcome {
+                                    document_id: doc_id,
+                                    fiscal_id: Some(server_fiscal_no),
+                                    fiscal_ts: None,
+                                    document_state: DocState::Ack,
+                                    report_xml: None,
+                                }),
+                                Err(ConfirmError::StructuralDrift { .. }) => {
+                                    todo!("A2.1b-core incr.5: advance StructuralDrift arm")
+                                }
+                                Err(ConfirmError::Database { .. })
+                                | Err(ConfirmError::Infrastructure { .. }) => {
+                                    todo!("A2.1b-core incr.3: advance Database/Infra → ledger-resolve")
+                                }
+                            }
+                        }
+                        InlineConfirmOutcome::Hold => {
+                            todo!("A2.1b-core incr.3: confirm Hold (202 Sent) arm")
+                        }
+                        InlineConfirmOutcome::Drift => {
+                            todo!("A2.1b-core incr.5: confirm Drift arm")
+                        }
+                    }
+                }
+            }
         }
     }
 }
