@@ -1,8 +1,18 @@
 # Sprint 11–14: Detailed Implementation Plan
 
-**Версія:** 1.0, 2026-04-15  
+> **Python-era plan; superseded by Rust gateway M3b (2026-05-16).**
+>
+> This document plans Sprint 11–14 for the **Python gateway**.  Several rules below — including step 11.2's "`GO_ONLINE` blocked by existing `OFFLINE_LOCAL_ACK` backlog", step 11.4 Z_REPORT blanket blocker, and other offline-shift rules — reflect the Python implementation and conflict with the Rust gateway M3b return-online + Pattern C drain design (`Offline → GoingOnline → drain in lnd ASC → Online`).
+>
+> The Rust gateway uses:
+> - `node_state.mode` transitions `Offline → GoingOnline` are driven by the W8 return-online probe; `GoingOnline → Online` lands after the W9b backlog drain plus W12 KVT2 confirmation deliver every offline doc to final DPS `ACK`.  There is no blanket "GO_ONLINE refused while backlog exists" — the drain *is* what closes the backlog.
+> - W10 offline shift close/open policy guard distinguishes **ONLINE** Z_REPORT (blocked over pending backlog) from **OFFLINE-mode local** Z_REPORT close-of-day (allowed as Pattern C `OFFLINE_LOCAL_ACK` document).  See `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0 + `docs/superpowers/plans/2026-05-14-m3b-implementation.md` §Task 10.
+>
+> The Python-era plan below remains accurate for the Python gateway scope; do not back-port its rules to the Rust gateway without consulting the M3b plan first.
+
+**Версія:** 1.0, 2026-04-15 (Python gateway)  
 **На основі:** `ACCEPTANCE_COVERAGE_SNAPSHOT.md` §10, аудиту коду  
-**Стан коду:** Sprint 10 wave 2, 586 passed
+**Стан коду:** Sprint 10 wave 2, 586 passed (Python gateway)
 
 ---
 
@@ -108,13 +118,18 @@ test_offline_range_exhaustion_raises_on_next_alloc  # no active range → Lookup
 
 **Файл:** `tests/test_sprint11_offline_e2e.py`
 
+> **Python-era blanket-blocker; superseded by Rust M3b W10 (2026-05-16).**  Step 5 below treats every Z_REPORT attempt during offline backlog as blocked, without distinguishing online vs offline-mode close-of-day.  The Rust gateway M3b W10 redesign distinguishes **ONLINE Z_REPORT** (blocked over pending backlog — `ONLINE_Z_REPORT_BLOCKED_BACKLOG`) from **OFFLINE-mode local Z_REPORT** (allowed as Pattern C `OFFLINE_LOCAL_ACK` document — `OFFLINE_Z_REPORT_LOCAL_CLOSE_ACCEPTED`).  See `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0 + `docs/superpowers/plans/2026-05-14-m3b-implementation.md` §Task 10 for the corrected policy.  The Python sequence below remains accurate for the Python-era gateway scope.
+
 **Послідовність:**
 ```
 1. ASK_OFFLINE_CODES  → range зареєстрований
 2. GO_OFFLINE         → node.mode = OFFLINE, session created
 3. SELL (offline)     → OFFLINE_LOCAL_ACK, offline_fiscal_no assigned
 4. SELL (offline)     → OFFLINE_LOCAL_ACK, наступний номер
-5. Z_REPORT attempt   → OFFLINE_BACKLOG_NOT_SYNCED (blocked)
+5. Z_REPORT attempt   → OFFLINE_BACKLOG_NOT_SYNCED (blocked) — Python-era
+                        blanket rule; Rust M3b W10 distinguishes ONLINE Z
+                        (blocked) from OFFLINE-mode local Z_REPORT close
+                        (allowed as Pattern C OFFLINE_LOCAL_ACK).
 6. /admin/offline-sync POST → два документи → ACK
 7. GO_ONLINE          → session closed, node.mode = ONLINE
 8. Z_REPORT           → ACK

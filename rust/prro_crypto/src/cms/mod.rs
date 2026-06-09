@@ -34,6 +34,7 @@
 pub mod asn1_util;
 pub mod attrs;
 pub mod builder;
+pub mod calendar;
 pub mod cmp;
 pub mod der_writer;
 pub mod envelope;
@@ -44,11 +45,13 @@ pub mod envelope;
 pub mod oids;
 pub mod profile;
 pub mod revocation;
+pub mod signed_data;
 pub mod signer;
 pub mod tsp;
 
 pub use builder::{
-    sign_detached_with_content_digest, CmsError, CmsSigner, DetachedSignature,
+    sign_detached_with_content_digest, CmsBuildOptions, CmsError, CmsSigner, DetachedSignature,
 };
 pub use profile::CmsProfile;
+pub use signed_data::extract_econtent;
 pub use signer::{DstuInProcessSigner, RawSigner, SignerError};

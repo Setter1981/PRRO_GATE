@@ -4,6 +4,7 @@ Multi-Protocol PRRO Gateway
 Локальный шлюз ПРРО с поддержкой нескольких протоколов,
 offline-режима, локального архива, канонической модели,
 совместимости с Checkbox/WebCheck/Maria и транспортных профилей ДПС.
+> **Обновление M3b 2026-05-17 (PR #63 merged at `e04031b`):** §9 (Shift, channel lock and offline) + §11 (State machines) описывают M3a 6-state ShiftState baseline. M3b расширяет до 9 states (добавлены `OpenedLocalPendingDrain`, `ClosingLocalPendingDrain`, `RequiresManualReconciliation`) per `docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md`. Authoritative state-machine + recovery contract на момент M3b — той spec’е §3.1 (9-state table) + §16 (Round 8 operational reality alignment). Original ТЗ остаётся valid как architectural baseline; для runtime контрактов M3b consult spec freeze.
 
 Статус	Готово к передаче в разработку
 Основной контур	Phase 1.0 / MVP

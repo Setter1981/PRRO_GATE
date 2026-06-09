@@ -1,0 +1,171 @@
+[package]
+name = "prro"
+version = "0.1.0"
+edition = "2021"
+description = "PRRO Gateway — single Rust binary for Ukrainian fiscal endpoint"
+
+[[bin]]
+name = "prro"
+path = "src/main.rs"
+
+[lib]
+name = "prro"
+path = "src/lib.rs"
+
+[features]
+# Default feature set — production / release builds use this; the
+# test-support seam is intentionally EXCLUDED so production callers
+# cannot mint a `ReconcileGuard` without acquiring the App mutex
+# (M3b W2 structural enforcement of ADR-M3-A10).
+default = []
+
+# Exposes integration-test seams that production code MUST NOT call.
+# Currently gates:
+#   - `services::reconciliation::guard::ReconcileGuard::for_integration_test_only`
+#     (W2 lock-token; production path mints via `from_app_mutex` after
+#     acquiring the App recon mutex)
+#   - `services::write_path::stage_sign::check_payload_from_json_for_testing`
+#     (W4-Z2a piece 16 + 17; conversion-boundary seam for
+#     `tests/w4_z2a_emit_integration.rs` — production callers drive
+#     `check_payload_from` via `build_canonical_and_sign_no_tx`)
+#
+# CI test invocations and local `cargo test` for tests that touch
+# `boot_phase::run_boot_reconciliation` directly MUST pass
+# `--features test-support`.  Without it, those test targets fail to
+# compile — by design.
+test-support = []
+
+# W4-Z3 live-DPS smoke gate.  Gates the `tests/live_dps_extended_smoke.rs`
+# target (whole file is `#![cfg(feature = "live-dps")]`), so it does NOT
+# compile — and cannot be run — unless explicitly built with
+# `--features live-dps`.  These tests hit the REAL DPS test server
+# (cabinet.tax.gov.ua:9443) with a REAL key + native prro_crypto signing,
+# so they are additionally `#[ignore]`'d AND guarded by a `PRRO_LIVE_DPS=1`
+# in-body env kill-switch (triple gate: feature + ignore + env).  NEVER run
+# in CI.  See the test file header for the env contract + rate-limit caveat.
+live-dps = []
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# DB — bundled SQLite per spec decision #36
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "sqlite", "chrono", "uuid", "macros"] }
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# IDs + dates
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+# W6 — Kyiv-local timestamp formatting for the canonical XML <TS>
+# attribute.  Europe/Kiev DST is non-trivial; chrono-tz gives the
+# correct offset table.
+chrono-tz = "0.10"
+
+# CLI + logging
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Errors
+anyhow = "1"
+thiserror = "1"
+
+# Crypto wrapper (M2 W1) — secret-material discipline per ADR-M2-5.
+async-trait = "0.1"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+
+# W2 PR-B — no-echo TTY password prompting for `prro admin add-operator`.
+# Eliminates the shoulder-surfing / terminal-scrollback leak surface that
+# raw stdin read created (external audit finding 2026-05-26).
+rpassword = "7"
+
+# Cert refresher (M2 W2) — fingerprinting helper.
+sha2 = "0.10"
+
+# DPS gRPC transport (M2 W3).
+prost = "0.13"
+prost-types = "0.13"
+# **TLS fix 2026-05-25 (smoke A/B failure root cause)**: bare `tonic = "0.12"`
+# does NOT enable TLS — `https://` endpoints silently fail з
+# "transport error" because tonic falls through TLS layer without
+# rustls/native-tls.  Verified via Python smoke (server-only TLS suffices;
+# Rust pre-fix produced gRPC Unknown: transport error).  `tls` feature enables
+# tonic's TLS surface; `tls-native-roots` provides system trust store (matches
+# Python's `grpc.ssl_channel_credentials(root_certificates=None)` behaviour).
+tonic = { version = "0.12", features = ["tls", "tls-native-roots"] }
+
+# OS / fs
+fs4 = "0.9"
+
+# RNG (M1 needs it for nothing user-facing, but lock in version for later modules)
+rand_core = { version = "0.6", features = ["std"] }
+
+# Async helpers — needed for `db::tx::with_immediate` higher-ranked closures
+futures = "0.3"
+
+# M4 W1 — HTTP ingress shell skeleton.  Axum gives the routing + handler
+# layer; tower-http supplies the trace + timeout middleware envisioned
+# for the per-request body envelope.  hyper-util is the connector
+# Axum builds on once we wire `serve(...)` in W3.
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
+hyper-util = "0.1"
+
+# Crate cross-deps (will be wired in M2+)
+prro_crypto = { path = "../prro_crypto" }
+prro_escpos = { path = "../prro_escpos" }
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"
+
+# M3a W2 — `WriteTxConn<'_>` sealed-newtype seal proof.  Five compile-fail
+# fixtures (raw `&mut SqliteConnection` rejected, `WriteTxConn::new` private,
+# struct-literal `_seal: ()` private, `new_for_test` not visible outside
+# `db::tx`) live under `tests/write_tx_conn_compile_fail/` and are driven
+# by `tests/write_tx_conn_compile_fail.rs` per W0-2 §9.2.
+trybuild = "1"
+
+# M2 W2 cert_refresher smoke tests use wiremock as a byte-replay HTTP
+# server in place of a live CMP endpoint.
+wiremock = "0.6"
+
+# M2 W3 dps_channel_smoke uses a tonic-based in-process mock server;
+# tokio-stream::TcpListenerStream wraps an ephemeral-port listener so
+# tonic's serve_with_incoming can accept connections.
+tokio-stream = { version = "0.1", features = ["net"] }
+
+# RS-2 piece-5b-ii — `tower::ServiceExt::oneshot` drives the ingress axum
+# router in unit tests without a real socket.  `util` (not in tower's default
+# features) provides `ServiceExt`; feature-unification enables it for test
+# builds only, so the production `tower = "0.5"` dep is unchanged.
+tower = { version = "0.5", features = ["util"] }
+
+# M2 W5 ADR-M2-6 static check — syn-based scan of crypto:: + transports::
+# public API for forbidden sqlx types.  `visit` enables the syn::visit::Visit
+# trait the scanner walks; `extra-traits` gives Debug/Clone for diagnostics.
+# `quote::ToTokens` stringifies type expressions.
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+quote = "1"
+
+# M2 W6 secret-material flow tracing test — self-managed CaptureBuf
+# `MakeWriter` + `tracing::subscriber::set_global_default` installed
+# once per test-binary process via `OnceLock` (so spawn_blocking
+# emissions on tokio's blocking thread pool are captured, not just
+# the current_thread runtime).  No `tracing-test` dep (private API).
+# Std + fmt only.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
+
+[build-dependencies]
+# M2 W3 compiles the production DPS proto into a client + test mock server.
+tonic-build = "0.12"
+
+# Keep CI independent from a system-level `protoc` installation.
+protoc-bin-vendored = "3"

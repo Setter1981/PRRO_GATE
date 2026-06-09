@@ -1,0 +1,32 @@
+# Line-ending normalization.
+#
+# Source, SQL, config and golden/fixture text MUST be checked out with LF on
+# every platform.  Without this, GitHub's Windows runners (core.autocrlf=true)
+# check out CRLF, which (a) breaks byte-identical DDL comparisons such as
+# `migration_016_triggers_preserved_post_rebuild` (sqlite stores the trigger
+# text verbatim, CRLF and all), (b) would change migration checksum
+# verification, and (c) would corrupt byte-exact golden comparisons.
+#
+# Scoped on purpose: the decompiled WebCheck artifacts under docs/ (.resx,
+# .manifest, .md) are intentionally left as-is to preserve byte fidelity to
+# the decompiler output, and prro_escpos/assets/*.xml are out of the prro
+# CI scope — none of those participate in byte-comparison tests.
+
+*.sql   text eol=lf
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.json  text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.sh    text eol=lf
+
+# Binary fixtures — never apply EOL (or any) conversion.
+*.bin   binary
+*.cer   binary
+*.der   binary
+*.p7s   binary
+*.p12   binary
+*.pfx   binary
+*.jks   binary
+*.dat   binary
+*.png   binary

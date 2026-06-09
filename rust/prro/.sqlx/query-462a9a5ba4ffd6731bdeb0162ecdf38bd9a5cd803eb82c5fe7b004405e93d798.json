@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT fiscal_number\n           FROM ingress_inbox\n           WHERE request_id = ? AND status = 'NEW'",
+  "describe": {
+    "columns": [
+      {
+        "name": "fiscal_number",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "462a9a5ba4ffd6731bdeb0162ecdf38bd9a5cd803eb82c5fe7b004405e93d798"
+}

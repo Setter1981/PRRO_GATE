@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/write_tx_conn_compile_fail/raw_sqlite_connection.rs:11:30
+   |
+11 |     let _ = transition_state(&mut *conn, id, DocState::Prepared, DocState::Signed).await;
+   |             ---------------- ^^^^^^^^^^ expected `&mut WriteTxConn<'_>`, found `&mut SqliteConnection`
+   |             |
+   |             arguments to this function are incorrect
+   |
+   = note: expected mutable reference `&mut WriteTxConn<'_>`
+              found mutable reference `&mut SqliteConnection`
+note: function defined here
+  --> src/db/repositories/fiscal_documents.rs
+   |
+   | pub async fn transition_state(
+   |              ^^^^^^^^^^^^^^^^

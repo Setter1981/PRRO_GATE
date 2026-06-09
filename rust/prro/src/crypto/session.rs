@@ -1,0 +1,376 @@
+//! Secret-material boundary.
+//!
+//! `unseal_jks` is the only function that turns sealed bytes into
+//! plaintext.  The plaintext private key lives in `Zeroizing<[u8; 32]>`
+//! and is exposed to the rest of the crate ONLY through `SigningSession`'s
+//! crate-internal accessor; external callers never see plaintext key bytes.
+//!
+//! ADR-M2-5 §4d demands no secret substring leak through `Debug`.  Both
+//! `SealedMaterial` and `SigningSession` provide manual redacted `Debug`
+//! impls — `#[derive(Debug)]` is forbidden on these types and is enforced
+//! by absence (the W6 tracing test additionally proves no substring escapes
+//! through any `tracing` event).
+
+use std::sync::Arc;
+
+use zeroize::Zeroizing;
+
+use crate::crypto::errors::{CryptoError, SealKind};
+
+/// Sealed-on-disk material handed to `unseal_jks`.  Held by the caller
+/// (typically a storage repository).  Borrows everything to avoid owning
+/// any secret bytes longer than the unseal call itself.
+pub struct SealedMaterial<'a> {
+    pub operator_id: &'a str,
+    pub jks_bytes: &'a [u8],
+    /// Hex-encoded XOR-soft-sealed JKS password.
+    pub jks_password_hex: &'a str,
+    /// Per-operator credential salt; XORed against the decoded sealed
+    /// password (cycled if the password is longer than the salt) to
+    /// recover the plaintext.
+    pub cred_salt: &'a [u8],
+}
+
+impl std::fmt::Debug for SealedMaterial<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedMaterial")
+            // operator_id is the cashier INN (PII) — redact, uniform with
+            // SigningSession + CryptoError (ADR-M2-5 §4d).
+            .field("operator_id", &"<redacted>")
+            .field("jks_bytes", &"<redacted>")
+            .field("jks_password_hex", &"<redacted>")
+            .field("cred_salt", &"<redacted>")
+            .finish()
+    }
+}
+
+/// In-memory signing session.  The `Arc<Inner>` shape lets the in-process
+/// provider clone the session into a `spawn_blocking` closure without
+/// copying the 32-byte private scalar — only the strong-count is bumped.
+/// `Zeroizing<[u8; 32]>` zeroes the array when the last `Arc` holder
+/// drops.
+#[derive(Clone)]
+pub struct SigningSession {
+    inner: Arc<SigningSessionInner>,
+}
+
+struct SigningSessionInner {
+    operator_id: String,
+    /// DSTU 4145 private scalar `d`, 32 LE bytes.  Zeroed on drop.
+    param_d: Zeroizing<[u8; 32]>,
+    /// Operator's signing certificate, DER-encoded.
+    cert_der: Vec<u8>,
+}
+
+impl std::fmt::Debug for SigningSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SigningSession")
+            // operator_id is the cashier INN (PII, ADR-M2-5 §4d).  Redact:
+            // post-RS-1 the REAL INN is threaded into production sessions
+            // (the operator key loader), so `?session` in any tracing event
+            // would otherwise leak it to process logs.
+            .field("operator_id", &"<redacted>")
+            .field("param_d", &"<redacted>")
+            .field(
+                "cert_der",
+                &format_args!("<{} bytes>", self.inner.cert_der.len()),
+            )
+            .finish()
+    }
+}
+
+impl SigningSession {
+    pub fn operator_id(&self) -> &str {
+        &self.inner.operator_id
+    }
+
+    /// DER-encoded operator certificate.  Public bytes — no redaction.
+    pub fn cert_der(&self) -> &[u8] {
+        &self.inner.cert_der
+    }
+
+    /// Crate-internal accessor; the in-process provider reads this when
+    /// constructing a `DstuInProcessSigner`.  External callers MUST NOT
+    /// see plaintext key bytes — `pub(crate)` is the wall.
+    pub(crate) fn param_d(&self) -> &Zeroizing<[u8; 32]> {
+        &self.inner.param_d
+    }
+
+    /// Test-only constructor.
+    ///
+    /// **Production must not call this.**  The only production path to
+    /// a `SigningSession` is `unseal_jks`.  This constructor is exposed
+    /// (un-feature-gated) because integration tests in `tests/` are
+    /// separate crates and cannot see `cfg(test)`-only items in the
+    /// lib; the function name carries the warning instead.  The
+    /// architectural risk is bounded: a caller who does invoke this
+    /// from production code already had the plaintext private scalar
+    /// in hand, so this constructor neither weakens the seal boundary
+    /// nor leaks anything.
+    pub fn new_for_test(operator_id: String, param_d: [u8; 32], cert_der: Vec<u8>) -> Self {
+        Self {
+            inner: Arc::new(SigningSessionInner {
+                operator_id,
+                param_d: Zeroizing::new(param_d),
+                cert_der,
+            }),
+        }
+    }
+
+    /// Production constructor — assemble a `SigningSession` from a key the
+    /// caller already obtained via
+    /// [`prro_crypto::interop::prro::containers::extract_private_key`].
+    ///
+    /// This is the M5 crypto-wiring path used by the runtime
+    /// `OperatorKeyLoader` (RS-1 Piece 3).  It sits alongside
+    /// [`unseal_jks`] but takes the extracted key directly — sealing the
+    /// JKS password at-rest is a separate hardening task (tracked
+    /// follow-up), deliberately NOT done here.
+    ///
+    /// Embeds the SIGNING cert (`KeyUsage=digitalSignature`) via
+    /// [`ExtractedKey::signing_cert`] — NEVER `certs[0]`, which is often
+    /// the key-agreement (encryption) cert and would make DPS reject the
+    /// signature `CryptBadSign` (live-confirmed 2026-05-29).  Moves the
+    /// `Zeroizing<[u8; 32]>` scalar into the session inner (no clone of the
+    /// 32 secret bytes).  `operator_id` (the cashier INN) is stored
+    /// verbatim — no placeholder, no fallback.
+    pub fn from_extracted(
+        operator_id: String,
+        extracted: prro_crypto::interop::prro::containers::ExtractedKey,
+    ) -> Result<Self, CryptoError> {
+        let cert_der = extracted
+            .signing_cert()
+            .ok_or_else(|| CryptoError::JksUnseal {
+                operator_id: operator_id.clone(),
+                reason: SealKind::MissingSigningCert,
+            })?
+            .to_vec();
+        // Move the still-`Zeroizing<[u8; 32]>` scalar into the session
+        // inner — no clone of the 32 secret bytes (mirrors `unseal_jks`).
+        let param_d: Zeroizing<[u8; 32]> = extracted.param_d;
+        Ok(Self {
+            inner: Arc::new(SigningSessionInner {
+                operator_id,
+                param_d,
+                cert_der,
+            }),
+        })
+    }
+}
+
+/// Unseal a JKS keystore + extract the DSTU private scalar.
+///
+/// Pipeline:
+///   1. Hex-decode the sealed `jks_password_hex`.
+///   2. XOR-undo the soft seal with `cred_salt` (cycled to match length).
+///   3. Decode plaintext as UTF-8 (rejects non-UTF-8 with a typed error).
+///   4. Call `prro_crypto::interop::prro::containers::extract_private_key`
+///      which routes to the JKS parser based on the file's magic bytes.
+///   5. Select the operator's SIGNING cert (KeyUsage=digitalSignature) via
+///      `ExtractedKey::signing_cert` — NOT `certs[0]`, which is often the
+///      key-agreement (encryption) cert and would make DPS reject the
+///      signature `CryptBadSign`.
+///
+/// All intermediate plaintext (the unsealed password) is held in
+/// `Zeroizing` and dropped before this function returns.
+pub fn unseal_jks(sealed: SealedMaterial<'_>) -> Result<SigningSession, CryptoError> {
+    let operator_id = sealed.operator_id.to_string();
+    let make_err = |reason: SealKind| CryptoError::JksUnseal {
+        operator_id: operator_id.clone(),
+        reason,
+    };
+
+    // 1. hex → bytes.  Sealed password is hex-encoded so it survives
+    //    serialisation as plain text (TOML/SQL/YAML config files).
+    if !sealed.jks_password_hex.len().is_multiple_of(2) {
+        return Err(make_err(SealKind::BadPassword));
+    }
+    let mut sealed_bytes: Zeroizing<Vec<u8>> =
+        Zeroizing::new(Vec::with_capacity(sealed.jks_password_hex.len() / 2));
+    let bytes = sealed.jks_password_hex.as_bytes();
+    for i in 0..bytes.len() / 2 {
+        let hi = match hex_digit(bytes[i * 2]) {
+            Some(v) => v,
+            None => return Err(make_err(SealKind::BadPassword)),
+        };
+        let lo = match hex_digit(bytes[i * 2 + 1]) {
+            Some(v) => v,
+            None => return Err(make_err(SealKind::BadPassword)),
+        };
+        sealed_bytes.push((hi << 4) | lo);
+    }
+
+    // 2. XOR-unseal with cred_salt.  Empty salt would be a no-op (and
+    //    means the seal scheme was misconfigured); reject explicitly.
+    if sealed.cred_salt.is_empty() {
+        return Err(make_err(SealKind::BadSalt));
+    }
+    let mut password_plain: Zeroizing<Vec<u8>> = Zeroizing::new(sealed_bytes.to_vec());
+    for (i, b) in password_plain.iter_mut().enumerate() {
+        *b ^= sealed.cred_salt[i % sealed.cred_salt.len()];
+    }
+
+    // 3. UTF-8 decode the unsealed password.  prro_crypto's JKS reader
+    //    expects a `&str`.  We re-wrap the resulting String in a
+    //    drop-on-end closure-scope so the plaintext doesn't outlive the
+    //    extract_private_key call.
+    let password_str: Zeroizing<String> = match std::str::from_utf8(&password_plain) {
+        Ok(s) => Zeroizing::new(s.to_string()),
+        Err(_) => return Err(make_err(SealKind::BadPassword)),
+    };
+
+    // 4. Extract.  prro_crypto routes JKS / Key-6 / PFX automatically
+    //    based on the file's magic bytes.  M2 only commits to JKS in
+    //    production (per ADR-M2-1 + the audit doc) but we don't reject
+    //    other formats here — the call will surface a typed error if
+    //    the bytes don't match the JKS magic and a different format
+    //    parser isn't shipped yet.
+    let extracted = prro_crypto::interop::prro::containers::extract_private_key(
+        sealed.jks_bytes,
+        password_str.as_str(),
+    )
+    .map_err(|e| {
+        use prro_crypto::interop::prro::containers::ContainerError;
+        let kind = match e {
+            ContainerError::Jks(jks_err) => match jks_err {
+                prro_crypto::interop::prro::jks::JksError::BadPassword => SealKind::BadPassword,
+                prro_crypto::interop::prro::jks::JksError::BadMagic
+                | prro_crypto::interop::prro::jks::JksError::NotPrivateKey(_)
+                | prro_crypto::interop::prro::jks::JksError::Truncated(_) => SealKind::MalformedJks,
+            },
+            ContainerError::UnknownFormat | ContainerError::ParserNotImplemented(_) => {
+                SealKind::MalformedJks
+            }
+            ContainerError::Der(_) | ContainerError::BadKeyWidth(_) => {
+                SealKind::KeyExtractionFailed
+            }
+            ContainerError::Key6(_) | ContainerError::Pfx(_) => SealKind::KeyExtractionFailed,
+        };
+        make_err(kind)
+    })?;
+
+    // 5. Embed the SIGNING cert (KeyUsage=digitalSignature), NOT certs[0].
+    //    A UA EDS keystore ships BOTH a signing cert and a key-agreement
+    //    (encryption) cert plus the CA chain; certs[0] is frequently the
+    //    encryption cert.  Embedding it makes a real DPS verifier check the
+    //    signature against the WRONG public key and reject it `CryptBadSign`
+    //    (confirmed live 2026-05-29 against the ДПС ЄВПЗ verifier; the old
+    //    "first cert is the signing cert" assumption was wrong).
+    let cert_der = extracted
+        .signing_cert()
+        // Same no-signing-cert classification as `from_extracted`: the
+        // container decrypted/parsed fine, it just carries no signing cert.
+        .ok_or_else(|| make_err(SealKind::MissingSigningCert))?
+        .to_vec();
+
+    // Move the still-Zeroizing<[u8; 32]> into the session inner.  No
+    // clone of the 32 bytes — the Zeroizing<...> is moved.
+    let param_d_zeroizing: Zeroizing<[u8; 32]> = extracted.param_d;
+    Ok(SigningSession {
+        inner: Arc::new(SigningSessionInner {
+            operator_id,
+            param_d: param_d_zeroizing,
+            cert_der,
+        }),
+    })
+}
+
+fn hex_digit(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod from_extracted_tests {
+    use super::*;
+    use prro_crypto::interop::prro::containers::{ContainerFormat, ExtractedKey};
+
+    /// RS-1 Piece 2 — the operator_id (cashier INN) and the selected
+    /// signing cert are threaded verbatim into the session.  Operator
+    /// requirement: a test must prove operator_id reaches the
+    /// SigningSession (no placeholder / no fallback).
+    /// A minimal DER blob carrying a KeyUsage extension (OID 2.5.29.15)
+    /// asserting `digitalSignature` (BIT STRING `03 02 06 C0` =
+    /// digitalSignature+nonRepudiation) — enough for the STRICT
+    /// `signing_cert()` scanner to select it.  Mirrors the
+    /// `cert_with_keyusage` helper in
+    /// prro_crypto/tests/signing_cert_selection.rs.
+    fn sig_cert_der() -> Vec<u8> {
+        vec![
+            0x30, 0x00, // dummy outer SEQUENCE header (scanner ignores)
+            0x06, 0x03, 0x55, 0x1D, 0x0F, // OID 2.5.29.15 (KeyUsage)
+            0x04, 0x04, // extnValue OCTET STRING, len 4
+            0x03, 0x02, 0x06, 0xC0, // BIT STRING: digitalSignature + nonRepudiation
+        ]
+    }
+
+    #[test]
+    fn from_extracted_threads_operator_id_and_cert() {
+        let cert = sig_cert_der();
+        let ek = ExtractedKey {
+            format: ContainerFormat::Jks,
+            param_d: Zeroizing::new([7u8; 32]),
+            // Carries a digitalSignature KeyUsage so the STRICT signing_cert()
+            // selects it (RS-1 F1: there is no certs[0] fallback).
+            certs: vec![cert.clone()],
+        };
+        let s = SigningSession::from_extracted("INN-1234567890".to_string(), ek)
+            .expect("from_extracted must succeed with a signing cert present");
+        assert_eq!(
+            s.operator_id(),
+            "INN-1234567890",
+            "operator_id must reach the SigningSession verbatim",
+        );
+        assert_eq!(s.cert_der(), cert.as_slice());
+    }
+
+    /// RS-1 Piece 2 — an extracted key with NO certificate fails closed
+    /// (no signing cert to embed → never silently sign with nothing).
+    #[test]
+    fn from_extracted_no_cert_fails_closed() {
+        let ek = ExtractedKey {
+            format: ContainerFormat::Jks,
+            param_d: Zeroizing::new([0u8; 32]),
+            certs: vec![],
+        };
+        let err = SigningSession::from_extracted("INN-x".to_string(), ek)
+            .expect_err("no cert must fail closed");
+        assert!(matches!(
+            err,
+            CryptoError::JksUnseal {
+                reason: SealKind::MissingSigningCert,
+                ..
+            }
+        ));
+    }
+
+    /// RS-1 F1 (2026-05-30) — certs PRESENT but none declares
+    /// `digitalSignature` → fail closed (`MissingSigningCert`), NOT a
+    /// certs[0] fallback that would embed an encryption cert and re-open the
+    /// `CryptBadSign` DPS-rejection class.
+    #[test]
+    fn from_extracted_non_signing_cert_fails_closed() {
+        // KeyUsage = keyAgreement (encryption), BIT STRING `03 02 03 08`.
+        let enc_cert = vec![
+            0x30, 0x00, 0x06, 0x03, 0x55, 0x1D, 0x0F, 0x04, 0x04, 0x03, 0x02, 0x03, 0x08,
+        ];
+        let ek = ExtractedKey {
+            format: ContainerFormat::Jks,
+            param_d: Zeroizing::new([0u8; 32]),
+            certs: vec![enc_cert],
+        };
+        let err = SigningSession::from_extracted("INN-y".to_string(), ek)
+            .expect_err("a non-signing (encryption) cert must fail closed, not embed certs[0]");
+        assert!(matches!(
+            err,
+            CryptoError::JksUnseal {
+                reason: SealKind::MissingSigningCert,
+                ..
+            }
+        ));
+    }
+}

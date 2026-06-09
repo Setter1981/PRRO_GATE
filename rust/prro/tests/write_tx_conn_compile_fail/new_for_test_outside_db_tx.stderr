@@ -1,0 +1,5 @@
+error[E0599]: no function or associated item named `new_for_test` found for struct `WriteTxConn<'_>` in the current scope
+  --> tests/write_tx_conn_compile_fail/new_for_test_outside_db_tx.rs:13:26
+   |
+13 |     let _ = WriteTxConn::new_for_test(conn);
+   |                          ^^^^^^^^^^^^ function or associated item not found in `WriteTxConn<'_>`

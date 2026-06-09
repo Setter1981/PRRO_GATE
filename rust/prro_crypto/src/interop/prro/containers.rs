@@ -92,6 +92,58 @@ impl std::fmt::Debug for ExtractedKey {
     }
 }
 
+impl ExtractedKey {
+    /// The certificate to embed in a CMS **signature** — the one whose
+    /// KeyUsage asserts `digitalSignature`.
+    ///
+    /// A UA EDS container ships BOTH a signing cert AND a key-agreement
+    /// (encryption) cert, plus the CA chain. Blindly taking `certs[0]` can
+    /// embed the *encryption* cert (KeyUsage `keyAgreement`); a real verifier
+    /// (incl. DPS) then checks the signature against the wrong public key and
+    /// returns `CryptBadSign`. Selects strictly by the `digitalSignature` bit.
+    ///
+    /// **No `certs[0]` fallback (RS-1 F1, 2026-05-30):** returns `None` when no
+    /// cert declares `digitalSignature`, so the caller fails closed
+    /// (`MissingSigningCert`) instead of silently embedding the wrong cert and
+    /// re-opening the `CryptBadSign` class. A fallback here would defeat the
+    /// whole point of selecting by KeyUsage.
+    pub fn signing_cert(&self) -> Option<&[u8]> {
+        self.certs
+            .iter()
+            .find(|c| cert_has_digital_signature(c))
+            .map(Vec::as_slice)
+    }
+}
+
+/// True if the cert's KeyUsage extension (OID 2.5.29.15) asserts the
+/// `digitalSignature` bit (the most-significant bit of the first content
+/// byte of the KeyUsage BIT STRING).
+fn cert_has_digital_signature(der: &[u8]) -> bool {
+    const KU_OID: &[u8] = &[0x55, 0x1D, 0x0F];
+    let mut i = 0usize;
+    while i + 2 + KU_OID.len() < der.len() {
+        if der[i] == 0x06
+            && der[i + 1] as usize == KU_OID.len()
+            && &der[i + 2..i + 2 + KU_OID.len()] == KU_OID
+        {
+            let mut j = i + 2 + KU_OID.len();
+            // optional `critical` BOOLEAN before the extnValue OCTET STRING
+            if der.get(j) == Some(&0x01) {
+                j += 2 + der.get(j + 1).copied().unwrap_or(0) as usize;
+            }
+            if der.get(j) == Some(&0x04) {
+                // extnValue OCTET STRING wraps a BIT STRING { unused, bits… }
+                let inner = j + 2;
+                if der.get(inner) == Some(&0x03) {
+                    return der.get(inner + 3).map(|b| b & 0x80 != 0).unwrap_or(false);
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ContainerError {
     #[error("unrecognised container format (no known magic / structure match)")]

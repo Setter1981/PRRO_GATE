@@ -1,0 +1,74 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT state                as \"state: DocState\",\n                  fiscal_number,\n                  lnd,\n                  doc_type             as \"doc_type: DocType\",\n                  business_ts,\n                  backend_profile_id,\n                  transport_profile_id,\n                  offline_fiscal_no,\n                  shift_id             as \"shift_id: ShiftId\",\n                  signed_by_cashier_id as \"signed_by_cashier_id: CashierId\"\n           FROM fiscal_documents WHERE document_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "state: DocState",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "fiscal_number",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "lnd",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "doc_type: DocType",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "business_ts",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "backend_profile_id",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "transport_profile_id",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "offline_fiscal_no",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "shift_id: ShiftId",
+        "ordinal": 8,
+        "type_info": "Blob"
+      },
+      {
+        "name": "signed_by_cashier_id: CashierId",
+        "ordinal": 9,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "f668a7fba1fefec171df79d0e5455c30f8428865dabc86f008714e0fd26f3f64"
+}
