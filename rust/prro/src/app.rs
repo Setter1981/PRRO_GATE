@@ -196,6 +196,16 @@ struct Inner {
     backoff_state: tokio::sync::Mutex<
         std::collections::HashMap<String, crate::services::offline_sync::backoff::BackoffState>,
     >,
+    /// **RS-3 A4 (2026-06-08)** — the per-`fiscal_number` runtime
+    /// serialization gate.  The live write-path worker (A2) and the
+    /// stale-`PROCESSING` reaper (B1) hold this across the WHOLE per-FN
+    /// `fiscalize` future (invariant #2 at the runtime level), while each
+    /// nested `with_immediate` write-tx stays short and IO-free (invariant
+    /// #1).  Lives inside the shared `Arc<Inner>` so every `App` clone (the
+    /// axum per-request `IngressState`, the supervisor loops) gates against
+    /// ONE instance.  Distinct from `reconcile_mutex` (App-wide drain/reconcile
+    /// gate) — see [`crate::runtime::fn_gate::FnWriteGate`].
+    fn_write_gate: crate::runtime::fn_gate::FnWriteGate,
 }
 
 impl App {
@@ -377,8 +387,20 @@ impl App {
                 singleton,
                 reconcile_mutex: tokio::sync::Mutex::new(()),
                 backoff_state: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                fn_write_gate: crate::runtime::fn_gate::FnWriteGate::new(),
             }),
         })
+    }
+
+    /// RS-3 A4 — acquire the per-`fiscal_number` write-path serialization
+    /// gate.  The live write-path worker (A2) and the stale-`PROCESSING`
+    /// reaper (B1) call this and hold the returned guard across the ENTIRE
+    /// per-FN `fiscalize` (invariant #2); the gate is a `tokio::sync::Mutex`
+    /// held OUTSIDE every `with_immediate` write-tx (invariant #1).  See the
+    /// `runtime::fn_gate` module docs for the design + the A2/B1 forward
+    /// contracts.
+    pub async fn acquire_fn_gate(&self, fiscal_number: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        self.inner.fn_write_gate.acquire(fiscal_number).await
     }
 
     /// Per-FN decision tree (W0-3 §4.3, 6 branches).

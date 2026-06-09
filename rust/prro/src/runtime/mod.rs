@@ -1,6 +1,7 @@
 pub mod bindings;
 pub mod bootstrap;
 pub mod coding;
+pub mod fn_gate;
 pub mod ingress;
 pub mod key_loader;
 pub mod outgress;
