@@ -160,14 +160,18 @@ pub enum FiscalError {
     #[error("live Z fiscalization surface not yet ready; request_id={request_id:02x?}")]
     ZSurfaceNotReady { request_id: [u8; 16] },
 
-    /// RS-3 A2 (T1) — a shift-state guard refused the op for a reason DISTINCT
-    /// from "no open shift" (e.g. shift already open, op refused while a
+    /// RS-3 A2 (T1 + Q-A) — a write-path GUARD refused the op for a
+    /// client/operator-fixable reason DISTINCT from "no open shift": a
+    /// shift-state guard (shift already open, op refused while a
     /// pending-drain/close is in flight, sale after a local close, offline
-    /// Z-close unsupported, Z blocked on backlog drain).  → `422` carrying the
-    /// SPECIFIC stable `code` (e.g. `SHIFT_ALREADY_OPEN`) — these states are
-    /// distinct for the operator + the shim/retry logic, so they are NOT
-    /// collapsed into `ShiftNotOpen`.  The guard already terminalised the inbox
-    /// (REJECTED + audit) at `stage_acquire`; this only carries the HTTP code.
+    /// Z-close unsupported, Z blocked on backlog drain) OR the signer guard's
+    /// true cashier mismatch (`SIGNER_CASHIER_MISMATCH`, Q-A — reissue with the
+    /// correct cashier).  → `422` carrying the SPECIFIC stable `code` (e.g.
+    /// `SHIFT_ALREADY_OPEN`) — these states are distinct for the operator + the
+    /// shim/retry logic, so they are NOT collapsed into `ShiftNotOpen`.  The
+    /// guard already terminalised the inbox (REJECTED + audit); this only
+    /// carries the HTTP code.  (Codes are produced ONLY by `inline_map::codes`,
+    /// which round-trip-tests them to this 422 class.)
     #[error("shift guard refused ({code}); request_id={request_id:02x?}")]
     ShiftGuardRefused {
         request_id: [u8; 16],

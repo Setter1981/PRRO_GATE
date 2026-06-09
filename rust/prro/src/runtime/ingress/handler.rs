@@ -131,7 +131,11 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         | "POST_LOCAL_CLOSE_SALE_REFUSED"
         | "OFFLINE_SHIFT_CLOSE_NOT_SUPPORTED"
         | "SHIFT_CLOSING_IN_FLIGHT"
-        | "Z_REPORT_BACKLOG_DRAIN_PENDING" => 422,
+        | "Z_REPORT_BACKLOG_DRAIN_PENDING"
+        // RS-3 A2 (Q-A) — the true signer-vs-opening-cashier mismatch is
+        // client/operator-fixable (reissue with the correct cashier), pre-wire,
+        // no fiscal commitment → 422, carried by ShiftGuardRefused.
+        | "SIGNER_CASHIER_MISMATCH" => 422,
         "INVALID_CASHIER_ID" | "MALFORMED_JSON" => 400,
         // Adapter-shell codes (server.rs `adapter_error`) carry their own
         // hard-coded status; listed here so the map stays TOTAL over the
@@ -1557,7 +1561,8 @@ mod tests {
             assert_eq!(http_status_for_error_code(code), 503, "{code}");
         }
         assert_eq!(http_status_for_error_code("Z_SURFACE_NOT_READY"), 501);
-        // T1 — every ShiftGuardRefused code is a 422 (NOT collapsed to NO_OPEN_SHIFT).
+        // T1 — every ShiftGuardRefused code is a 422 (NOT collapsed to
+        // NO_OPEN_SHIFT); + the Q-A signer-cashier 422 (carried by ShiftGuardRefused).
         for code in [
             "SHIFT_ALREADY_OPEN",
             "SHIFT_OPEN_PENDING_DRAIN",
@@ -1565,6 +1570,7 @@ mod tests {
             "OFFLINE_SHIFT_CLOSE_NOT_SUPPORTED",
             "SHIFT_CLOSING_IN_FLIGHT",
             "Z_REPORT_BACKLOG_DRAIN_PENDING",
+            "SIGNER_CASHIER_MISMATCH",
         ] {
             assert_eq!(http_status_for_error_code(code), 422, "{code}");
         }
