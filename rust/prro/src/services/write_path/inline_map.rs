@@ -199,11 +199,22 @@ pub(crate) enum SendDisposition {
     /// receipt is persisted and the ledger retries via drain/B1.  The
     /// orchestrator returns `Ok(FiscalOutcome{non-terminal})` → 202 IN_PROGRESS.
     InProgress,
+    /// IDEMPOTENT RE-ENTRY / RACE — `stage_send` did NOT call the wire: the doc
+    /// was already advanced past `Sending` by a prior worker / reconciliation
+    /// (`StateConflict`, `observed` carries the state it found) or its row was
+    /// concurrently deleted (`DocumentMissing`, `observed = None`).  This is the
+    /// send-stage analog of `WorkerProcessResult::Noop` — NOT a send failure.
+    /// The orchestrator MUST resolve against the ledger (return the durable
+    /// accepted / in-flight truth, or `Internal`/500 ONLY if no durable
+    /// evidence exists), NEVER render a phantom terminal 500 (review HIGH).
+    ResolveReplay { observed: Option<DocState> },
 }
 
 /// `StageSendOutcome` → [`SendDisposition`].  Terminal DPS reject → `DpsRejected`;
-/// transient → `InProgress` (202, NOT a terminal Err); everything else is a
-/// structural breach → `Internal`.
+/// transient (`ErrorRetryable`) → `InProgress` (202, NOT a terminal Err);
+/// idempotent/race no-wire outcomes (`StateConflict`/`DocumentMissing`) →
+/// `ResolveReplay` (resolve from the ledger, NOT a phantom 500); a signer-guard
+/// refusal → the Q-A split; an (unreachable) other target → structural breach.
 pub(crate) fn classify_send_outcome(
     outcome: StageSendOutcome,
     request_id: [u8; 16],
@@ -219,9 +230,11 @@ pub(crate) fn classify_send_outcome(
             // (error_routing.rs); any other target is a structural breach.
             _ => SendDisposition::Reject(internal(request_id, codes::SEND_INTERNAL)),
         },
-        StageSendOutcome::StateConflict { .. } | StageSendOutcome::DocumentMissing => {
-            SendDisposition::Reject(internal(request_id, codes::SEND_INTERNAL))
-        }
+        // No-wire idempotent re-entry / race — NOT a failure (review HIGH).
+        StageSendOutcome::StateConflict { observed } => SendDisposition::ResolveReplay {
+            observed: Some(observed),
+        },
+        StageSendOutcome::DocumentMissing => SendDisposition::ResolveReplay { observed: None },
         StageSendOutcome::SignerRefused(m) => {
             SendDisposition::Reject(map_signer_refused(&m, request_id))
         }
@@ -415,7 +428,28 @@ mod tests {
     }
 
     #[test]
-    fn send_outcome_routes_sent_reject_retry() {
+    fn send_outcome_routes_every_disposition() {
+        use crate::db::models::enums::Severity;
+        use crate::services::write_path::error_routing::{AuditEvent, RetryClass, RoutingDecision};
+
+        // classify_send_outcome only reads `target_state`; the rest are filler.
+        fn routed(target_state: DocState) -> StageSendOutcome {
+            StageSendOutcome::Routed {
+                decision: RoutingDecision {
+                    target_state,
+                    retry_class: RetryClass::TerminalReject,
+                    audit_event: AuditEvent::StageSendRejected,
+                    audit_severity: Severity::Error,
+                    node_mode_flip: None,
+                    probe_hint: None,
+                    mac_recovery_hint: None,
+                },
+                attempt_no: 1,
+                wire_status_code: None,
+                wire_error_message: None,
+            }
+        }
+
         // Sent → Proceed.
         assert!(matches!(
             classify_send_outcome(
@@ -426,6 +460,32 @@ mod tests {
                 RID
             ),
             SendDisposition::Proceed { .. }
+        ));
+        // Terminal DPS reject → Reject(DpsRejected) → 422.
+        match classify_send_outcome(routed(DocState::Rejected), RID) {
+            SendDisposition::Reject(fe) => assert_eq!(http(code_of(&fe)), 422),
+            d => panic!("Rejected must be a terminal reject, got {d:?}"),
+        }
+        // Transient → InProgress (Ok/202, NOT a terminal Err).
+        assert!(matches!(
+            classify_send_outcome(routed(DocState::ErrorRetryable), RID),
+            SendDisposition::InProgress
+        ));
+        // No-wire idempotent re-entry / race → ResolveReplay (NOT a phantom 500).
+        assert!(matches!(
+            classify_send_outcome(
+                StageSendOutcome::StateConflict {
+                    observed: DocState::Sent
+                },
+                RID
+            ),
+            SendDisposition::ResolveReplay {
+                observed: Some(DocState::Sent)
+            }
+        ));
+        assert!(matches!(
+            classify_send_outcome(StageSendOutcome::DocumentMissing, RID),
+            SendDisposition::ResolveReplay { observed: None }
         ));
     }
 }
