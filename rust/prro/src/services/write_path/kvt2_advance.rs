@@ -152,6 +152,34 @@ pub async fn advance_to_ack(
         });
     }
 
+    // **SM-6 (A2.1a follow-up)**: fail-loud on an unsupported entry state.
+    // The two CAS paths only make sense for a doc whose real DB state is
+    // `Sent` (→ Envelope 1a, audit-labelled by the cohort snapshot
+    // `OfflineLocalAck` / `ErrorRetryable` on the drain path, or `Sent` on
+    // the online ladder) or `Kvt1` (→ Envelope 1b).  A label outside this
+    // set means caller miswiring (e.g. the future A2.1b online worker
+    // threading a `Kvt2` / `Ack` / terminal state): reject it loudly at the
+    // dispatch boundary as a StructuralDrift instead of letting it take the
+    // 1a path and surface as an opaque CAS-miss `Database` error.  The W12
+    // drain caller only ever passes {OfflineLocalAck, ErrorRetryable, Kvt1},
+    // so this guard is inert for it (behaviour-preserving).
+    if !matches!(
+        doc_state_at_entry,
+        DocState::Sent | DocState::Kvt1 | DocState::OfflineLocalAck | DocState::ErrorRetryable
+    ) {
+        return Err(ConfirmError::StructuralDrift {
+            detail: format!(
+                "advance_to_ack: unsupported doc_state_at_entry {state} for doc \
+                 {id_hex} — expected one of {{Sent, Kvt1, OfflineLocalAck, \
+                 ErrorRetryable}} (online ladder passes Sent|Kvt1; drain passes \
+                 the cohort snapshot).  A value outside this set is caller \
+                 miswiring; failing loud at the dispatch boundary rather than as \
+                 an opaque CAS-miss.",
+                state = doc_state_at_entry.as_str(),
+            ),
+        });
+    }
+
     // Envelope 1: source-selected atomic CAS chain to Kvt2.
     match doc_state_at_entry {
         DocState::Kvt1 => {
