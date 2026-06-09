@@ -3036,3 +3036,176 @@ async fn a2_1a_advance_to_ack_kvt1_entry_drives_2cas_to_ack() {
         "Kvt1-entry (Envelope 1b) payload MUST NOT carry attempt_no; got: {payload:?}"
     );
 }
+
+/// **RS-3 A2.1a follow-up (TEST-3)** — Envelope 1a CAS-miss maps to
+/// `ConfirmError::Database` (which the drain boundary maps to
+/// `BootError::ReconciliationFailed`).  Pins the variant taxonomy the
+/// future A2.1b online mapper depends on (Database = transient/recoverable
+/// vs StructuralDrift = terminal breach).  Drives the 1a path
+/// (`doc_state_at_entry=ErrorRetryable`, an allowed non-Kvt1 label) against
+/// a doc whose real DB state is KVT2, so the `Sent→Kvt1` CAS produces a
+/// non-Applied outcome → `ConfirmError::Database`; the envelope rolls back
+/// atomically (no Kvt1Raw row, doc unchanged).
+#[tokio::test]
+async fn a2_1a_advance_to_ack_cas_miss_yields_database_error() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    // Doc is at KVT2 in the DB, but we drive the 1a (Sent-entry) path —
+    // the hardcoded CAS Sent→Kvt1 cannot apply → non-Applied → Database.
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "KVT2",
+        Some("DPS-FN-CASMISS"),
+    )
+    .await;
+
+    let result = kvt2_advance::advance_to_ack(
+        &pool,
+        doc,
+        vec![0xCCu8; 8],
+        "DPS-FN-CASMISS",
+        DocState::ErrorRetryable, // allowed label → 1a path; not the real DB state
+        Some(1),
+    )
+    .await;
+
+    match result {
+        Err(kvt2_advance::ConfirmError::Database { source }) => {
+            let chain = format!("{source:#}");
+            assert!(
+                chain.contains("CAS Sent") && chain.contains("produced"),
+                "Database source should describe the Sent→Kvt1 CAS-miss; got: {chain}"
+            );
+        }
+        other => panic!("expected ConfirmError::Database, got {other:?}"),
+    }
+    // Envelope 1a rolled back atomically: doc unchanged, no Kvt1Raw, no advance audit.
+    assert_eq!(read_doc_state(&pool, doc).await, "KVT2");
+    let kvt1_raw_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM document_files WHERE document_id = ? AND kind = 'KVT1_RAW'",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        kvt1_raw_rows, 0,
+        "CAS-miss rollback must leave no Kvt1Raw row"
+    );
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 0);
+}
+
+/// **RS-3 A2.1a follow-up (TEST-4)** — `advance_to_ack`'s own empty-bytes
+/// guard returns `ConfirmError::StructuralDrift` before any DB write.  This
+/// is the runtime-neutral backstop the module docs treat as load-bearing
+/// for A2.1b (the outer `confirm_drain_doc` guard is the drain backstop;
+/// the online caller has only this one).
+#[tokio::test]
+async fn a2_1a_advance_to_ack_empty_bytes_yields_structural_drift() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "SENT",
+        Some("DPS-FN-EMPTY"),
+    )
+    .await;
+
+    let result = kvt2_advance::advance_to_ack(
+        &pool,
+        doc,
+        vec![], // empty evidence → StructuralDrift, no DB write
+        "DPS-FN-EMPTY",
+        DocState::Sent,
+        Some(1),
+    )
+    .await;
+
+    match result {
+        Err(kvt2_advance::ConfirmError::StructuralDrift { detail }) => {
+            assert!(
+                detail.contains("empty kvt1_raw_bytes"),
+                "detail should name the empty-bytes invariant; got: {detail}"
+            );
+        }
+        other => panic!("expected ConfirmError::StructuralDrift, got {other:?}"),
+    }
+    // No state mutation, no Kvt1Raw row, no advance audit.
+    assert_eq!(read_doc_state(&pool, doc).await, "SENT");
+    let kvt1_raw_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM document_files WHERE document_id = ? AND kind = 'KVT1_RAW'",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(kvt1_raw_rows, 0);
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 0);
+}
+
+/// **RS-3 A2.1a follow-up (TEST-5)** — a `stage_finalize::run` typed error
+/// reached THROUGH `advance_to_ack` maps to `ConfirmError::Infrastructure`
+/// (distinct from the `process_via_w12_kvt2_advance` path the existing
+/// `w12_kvt2_stage_finalize_typed_error_*` test covers).  Drives the 1b
+/// (Kvt1-entry) path so the Kvt1→Kvt2 CAS commits, then `stage_finalize`
+/// errors on a NULL `unsigned_xml_sha256` (no finalize prereqs seeded) →
+/// `UnsignedXmlShaMissing` → Infrastructure; the finalize envelope rolls
+/// back so the doc rests at KVT2 (the 1b advance is already committed).
+#[tokio::test]
+async fn a2_1a_advance_to_ack_finalize_error_yields_infrastructure() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    // KVT1 doc, but DELIBERATELY no seed_w12_finalize_prereqs → unsigned_xml_sha256 is NULL.
+    let doc = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "KVT1",
+        Some("DPS-FN-FINERR"),
+    )
+    .await;
+
+    let result = kvt2_advance::advance_to_ack(
+        &pool,
+        doc,
+        vec![0xAAu8; 16],
+        "DPS-FN-FINERR",
+        DocState::Kvt1, // 1b path: Kvt1→Kvt2 commits, then finalize errors
+        None,
+    )
+    .await;
+
+    match result {
+        Err(kvt2_advance::ConfirmError::Infrastructure { source }) => {
+            let chain = format!("{source:#}");
+            assert!(
+                chain.contains("unsigned_xml_sha256"),
+                "Infrastructure source should be the stage_finalize UnsignedXmlShaMissing; got: {chain}"
+            );
+        }
+        other => panic!("expected ConfirmError::Infrastructure, got {other:?}"),
+    }
+    // Envelope 1b committed (Kvt1→Kvt2); the finalize envelope rolled back,
+    // so the doc rests at KVT2 (not Ack, not back to Kvt1).
+    assert_eq!(read_doc_state(&pool, doc).await, "KVT2");
+    // The 1b advance audit DID land (separate committed envelope); the
+    // finalize ACK audit did NOT.
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 1);
+    assert_eq!(audit_count(&pool, "STAGE_FINALIZE_ACK").await, 0);
+}
