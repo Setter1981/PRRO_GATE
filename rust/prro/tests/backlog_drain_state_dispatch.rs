@@ -3030,10 +3030,12 @@ async fn a2_1a_advance_to_ack_kvt1_entry_drives_2cas_to_ack() {
     assert_eq!(payload["to_state"], "KVT2");
     assert_eq!(payload["server_fiscal_no"], "DPS-FN-KVT1-ENTRY");
     assert_eq!(payload["dispatch_via"], "kvt2_confirm");
-    // Kvt1-entry envelope omits attempt_no entirely.
+    // Kvt1-entry envelope OMITS the attempt_no key entirely (the signed
+    // contract is key-absence, distinct from present-as-JSON-null — a
+    // future regression emitting attempt_no:null must fail this).
     assert!(
-        payload.get("attempt_no").is_none() || payload["attempt_no"].is_null(),
-        "Kvt1-entry (Envelope 1b) payload MUST NOT carry attempt_no; got: {payload:?}"
+        payload.get("attempt_no").is_none(),
+        "Kvt1-entry (Envelope 1b) payload MUST OMIT the attempt_no key (not null); got: {payload:?}"
     );
 }
 
