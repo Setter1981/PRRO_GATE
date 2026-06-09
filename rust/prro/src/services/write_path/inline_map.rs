@@ -167,7 +167,9 @@ pub(crate) fn map_build_reject(reject: &BuildReject, request_id: [u8; 16]) -> Fi
 
 /// `SignerCashierMismatch` → `FiscalError` (Q-A split): the TRUE cashier
 /// mismatch is client/operator-fixable → 422; every structural caller-bug
-/// variant → 500.  `#[non_exhaustive]` → a future variant defaults to 500.
+/// variant → 500.  The match is exhaustive (no `_`): although the enum is
+/// `#[non_exhaustive]`, a future variant compile-breaks here until it is
+/// deliberately classified (no silent 500 default).
 pub(crate) fn map_signer_refused(m: &SignerCashierMismatch, request_id: [u8; 16]) -> FiscalError {
     use SignerCashierMismatch as M;
     match m {
