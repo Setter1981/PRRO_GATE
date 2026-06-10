@@ -20,17 +20,15 @@
 //! 503 (M1 node modes) · SignFailure 500 (crypto-sign ONLY) · Internal 500
 //! (every other structural/runtime breach) · ZSurfaceNotReady 501.
 //!
-//! NOTE: these mappers are CONSUMED by the A2.1b orchestrator (`inline::run`),
-//! which does not exist yet — until then they are reachable only from the unit
-//! tests below, hence the module-level `dead_code` allow.
+//! These mappers are CONSUMED by the A2.1b orchestrator
+//! (`super::inline::run`) and fence-tested below.
 
-#![allow(dead_code)]
-
-use crate::db::models::enums::DocState;
+use crate::db::models::enums::{DocState, NodeMode};
 use crate::runtime::ingress::canonical_builder::BuildReject;
 use crate::runtime::ingress::seam::FiscalError;
 use crate::services::write_path::dispatch::DispatcherRefusalReason;
 use crate::services::write_path::signer_guard::SignerCashierMismatch;
+use crate::services::write_path::stage_offline_ack::RefusalReason as OfflineRefusalReason;
 use crate::services::write_path::stage_send::{StageSendError, StageSendOutcome};
 use crate::services::write_path::stage_sign::SignError;
 use crate::services::write_path::types::RejectionReason;
@@ -45,6 +43,10 @@ pub(crate) mod codes {
     pub const OFFLINE_SHIFT_CLOSE_NOT_SUPPORTED: &str = "OFFLINE_SHIFT_CLOSE_NOT_SUPPORTED";
     pub const SHIFT_CLOSING_IN_FLIGHT: &str = "SHIFT_CLOSING_IN_FLIGHT";
     pub const Z_REPORT_BACKLOG_DRAIN_PENDING: &str = "Z_REPORT_BACKLOG_DRAIN_PENDING";
+    /// RS-3 A2.1b-core incr.5 — SHIFT_OPEN is out of the SELL/RETURN inline
+    /// core (handled by A2.2); fail-closed 422 until then (the wire contract
+    /// must NOT leak the internal slicing — no `*_IN_CORE` literal).
+    pub const SHIFT_OPEN_NOT_SUPPORTED: &str = "SHIFT_OPEN_NOT_SUPPORTED";
     /// Q-A — the true signer-vs-opening-cashier mismatch (operator reissues
     /// with the correct cashier); pre-wire, no fiscal commitment → 422.
     pub const SIGNER_CASHIER_MISMATCH: &str = "SIGNER_CASHIER_MISMATCH";
@@ -71,6 +73,39 @@ pub(crate) mod codes {
     /// the HTTP class.
     pub const SIGN_INTERNAL: &str = "SIGN_INTERNAL";
     pub const SEND_INTERNAL: &str = "SEND_INTERNAL";
+    /// A2.1b-core incr.5b — a structural (anyhow) error from `stage_acquire` /
+    /// `dispatch_post_sign` (no typed mapper); the specific cause is in the
+    /// audit + error message, the code routes the 500 class.
+    pub const ACQUIRE_INTERNAL: &str = "ACQUIRE_INTERNAL";
+    pub const DISPATCH_INTERNAL: &str = "DISPATCH_INTERNAL";
+    /// RS-3 A2.1b-core incr.3b — a replay-resolve (Noop / ResolveReplay /
+    /// post-Sent advance failure) found no ledger doc, a malformed
+    /// `document_id`, or a DB error: a structural breach → 500.
+    pub const REPLAY_LEDGER_DRIFT: &str = "REPLAY_LEDGER_DRIFT";
+    /// RS-3 A2.1b-core review fix (OCF-2/F3): the inbox-terminalise
+    /// `with_immediate` itself failed (DB fault, or a `!marked` row-state
+    /// surprise) — the refusal could NOT be durably recorded.  Distinct from
+    /// `REPLAY_LEDGER_DRIFT` so the 500 class is forensically separable; the
+    /// cause is logged via `tracing::error!` at the failure site.
+    pub const INBOX_TERMINALISE_FAILED: &str = "INBOX_TERMINALISE_FAILED";
+
+    // ── A2.1b-core incr.5b — offline-ack STRUCTURAL refusals → 500 ──
+    // (the dispatcher chose the offline path, then stage_offline_ack refused
+    //  for a race/structural reason — distinct from the node-mode refusals,
+    //  which keep their precise NODE_* 503 codes; NOT collapsed into 503).
+    /// `stage_offline_ack` saw node mode `Online` (or unreachable
+    /// `GoingOffline`/`Offline`) after dispatch chose offline — a race.
+    pub const OFFLINE_NODE_ONLINE_RACE: &str = "OFFLINE_NODE_ONLINE_RACE";
+    /// No OPEN offline session at offline-ack time (race vs drain/close).
+    pub const OFFLINE_NO_ACTIVE_SESSION: &str = "OFFLINE_NO_ACTIVE_SESSION";
+    /// Shift not `Opened` at offline-ack time.
+    pub const OFFLINE_SHIFT_NOT_OPENED: &str = "OFFLINE_SHIFT_NOT_OPENED";
+    /// Doc not `Signed` at offline-ack pre-check (concurrent state change).
+    pub const OFFLINE_DOC_STATE_CONFLICT: &str = "OFFLINE_DOC_STATE_CONFLICT";
+    /// Doc found with a different `fiscal_number` (fiscal-integrity breach).
+    pub const OFFLINE_CROSS_FN_MISMATCH: &str = "OFFLINE_CROSS_FN_MISMATCH";
+    /// Doc row absent at offline-ack pre-check (should exist post-sign).
+    pub const OFFLINE_DOC_NOT_FOUND: &str = "OFFLINE_DOC_NOT_FOUND";
 }
 
 fn shift_guard(request_id: [u8; 16], code: &'static str) -> FiscalError {
@@ -81,6 +116,25 @@ fn node_refused(request_id: [u8; 16], code: &'static str) -> FiscalError {
 }
 fn internal(request_id: [u8; 16], code: &'static str) -> FiscalError {
     FiscalError::Internal { request_id, code }
+}
+
+/// The stable machine code a `FiscalError` carries — the code-bearing variants
+/// return their `code`; the fixed variants return their canonical literal.
+/// Used by the A2.1b orchestrator to stamp a failure arm's audit row with the
+/// SAME code it returns (audit ↔ error agree by construction), and by the
+/// round-trip fence tests.  The handler's `http_status_for_error_code` maps
+/// each of these to its HTTP class.
+pub(crate) fn code_of(e: &FiscalError) -> &'static str {
+    match e {
+        FiscalError::ShiftGuardRefused { code, .. }
+        | FiscalError::OfflineRefused { code, .. }
+        | FiscalError::Internal { code, .. } => code,
+        FiscalError::ShiftNotOpen { .. } => "NO_OPEN_SHIFT",
+        FiscalError::DpsRejected { .. } => "FISCAL_REJECTED",
+        FiscalError::SignFailure { .. } => "SIGN_FAILED",
+        FiscalError::ZSurfaceNotReady { .. } => "Z_SURFACE_NOT_READY",
+        FiscalError::NotImplemented { .. } => "NOT_IMPLEMENTED",
+    }
 }
 
 /// `WorkerProcessResult::Rejected{reason}` → typed `FiscalError`.  stage_acquire
@@ -189,6 +243,42 @@ pub(crate) fn map_signer_refused(m: &SignerCashierMismatch, request_id: [u8; 16]
     }
 }
 
+/// `OfflineAckOutcome::Refused(RefusalReason)` → `FiscalError` (A2.1b-core
+/// incr.5b, operator CORRECTION 4 — NOT collapsed into a generic 503).  A
+/// genuine node-mode refusal keeps its PRECISE node code → `OfflineRefused`/503;
+/// every other reason is a race / structural breach AFTER the dispatcher chose
+/// the offline path → `Internal`/500 with a distinct fenced code.  Exhaustive
+/// (no `_`): a future `RefusalReason` (or `NodeMode`) compile-breaks here until
+/// it is deliberately classified (no silent 503/500 default).
+pub(crate) fn map_offline_refusal(
+    reason: &OfflineRefusalReason,
+    request_id: [u8; 16],
+) -> FiscalError {
+    use OfflineRefusalReason as R;
+    match reason {
+        R::NodeNotOffline { mode } => match mode {
+            // Genuine node-mode refusals — precise 503 code (NOT generic).
+            NodeMode::GoingOnline => node_refused(request_id, codes::NODE_GOING_ONLINE),
+            NodeMode::Blocked => node_refused(request_id, codes::NODE_BLOCKED),
+            NodeMode::StopMode => node_refused(request_id, codes::NODE_STOP_MODE),
+            NodeMode::CryptoDegraded => node_refused(request_id, codes::NODE_CRYPTO_DEGRADED),
+            // `Online` is a genuine race (dispatch chose offline, node flipped
+            // Online before offline-ack).  `GoingOffline`/`Offline` are
+            // unreachable here (they ROUTE to offline-ack, never refuse it) —
+            // if they ever appear it is a structural breach, NOT a 503.
+            NodeMode::Online | NodeMode::GoingOffline | NodeMode::Offline => {
+                internal(request_id, codes::OFFLINE_NODE_ONLINE_RACE)
+            }
+        },
+        // Race / structural breach after the dispatcher chose offline → 500.
+        R::NoActiveSession => internal(request_id, codes::OFFLINE_NO_ACTIVE_SESSION),
+        R::ShiftNotOpened { .. } => internal(request_id, codes::OFFLINE_SHIFT_NOT_OPENED),
+        R::DocStateConflict { .. } => internal(request_id, codes::OFFLINE_DOC_STATE_CONFLICT),
+        R::CrossFnMismatch { .. } => internal(request_id, codes::OFFLINE_CROSS_FN_MISMATCH),
+        R::DocNotFound => internal(request_id, codes::OFFLINE_DOC_NOT_FOUND),
+    }
+}
+
 /// How the orchestrator continues after `stage_send::run`.
 #[derive(Debug)]
 pub(crate) enum SendDisposition {
@@ -250,19 +340,6 @@ mod tests {
 
     const RID: [u8; 16] = [0xAB; 16];
 
-    fn code_of(e: &FiscalError) -> &'static str {
-        match e {
-            FiscalError::ShiftGuardRefused { code, .. }
-            | FiscalError::OfflineRefused { code, .. }
-            | FiscalError::Internal { code, .. } => code,
-            FiscalError::ShiftNotOpen { .. } => "NO_OPEN_SHIFT",
-            FiscalError::DpsRejected { .. } => "FISCAL_REJECTED",
-            FiscalError::SignFailure { .. } => "SIGN_FAILED",
-            FiscalError::ZSurfaceNotReady { .. } => "Z_SURFACE_NOT_READY",
-            FiscalError::NotImplemented { .. } => "NOT_IMPLEMENTED",
-        }
-    }
-
     /// THE FENCE: every code this module can produce round-trips to its
     /// intended HTTP class through the handler's map — so a typo cannot
     /// silently degrade a 422/503 to the `_ => 500` fallback.
@@ -276,6 +353,7 @@ mod tests {
             codes::SHIFT_CLOSING_IN_FLIGHT,
             codes::Z_REPORT_BACKLOG_DRAIN_PENDING,
             codes::SIGNER_CASHIER_MISMATCH,
+            codes::SHIFT_OPEN_NOT_SUPPORTED,
         ] {
             assert_eq!(http(c), 422, "{c} must route to 422 (ShiftGuardRefused)");
         }
@@ -299,9 +377,32 @@ mod tests {
             codes::CROSS_FN_MISMATCH,
             codes::SIGN_INTERNAL,
             codes::SEND_INTERNAL,
+            codes::ACQUIRE_INTERNAL,
+            codes::DISPATCH_INTERNAL,
+            codes::REPLAY_LEDGER_DRIFT,
+            codes::INBOX_TERMINALISE_FAILED,
+            codes::OFFLINE_NODE_ONLINE_RACE,
+            codes::OFFLINE_NO_ACTIVE_SESSION,
+            codes::OFFLINE_SHIFT_NOT_OPENED,
+            codes::OFFLINE_DOC_STATE_CONFLICT,
+            codes::OFFLINE_CROSS_FN_MISMATCH,
+            codes::OFFLINE_DOC_NOT_FOUND,
         ] {
             assert_eq!(http(c), 500, "{c} must route to 500 (Internal)");
         }
+    }
+
+    /// FENCE EXTENSION (review HTTP-1): the FIXED-variant literals `code_of`
+    /// can emit (not in `codes::` — they belong to non-code-bearing
+    /// `FiscalError` variants) must also round-trip to their HTTP class, so a
+    /// handler-map regression cannot silently reroute them.
+    #[test]
+    fn fixed_variant_literals_round_trip_to_expected_http_class() {
+        assert_eq!(http("NO_OPEN_SHIFT"), 422);
+        assert_eq!(http("FISCAL_REJECTED"), 422);
+        assert_eq!(http("SIGN_FAILED"), 500);
+        assert_eq!(http("Z_SURFACE_NOT_READY"), 501);
+        assert_eq!(http("NOT_IMPLEMENTED"), 501);
     }
 
     /// FENCE EXTENSION (review MEDIUM): `map_build_reject` forwards
@@ -489,5 +590,48 @@ mod tests {
             classify_send_outcome(StageSendOutcome::DocumentMissing, RID),
             SendDisposition::ResolveReplay { observed: None }
         ));
+    }
+
+    /// CORRECTION 4: offline-ack refusal must NOT collapse into a generic 503 —
+    /// node-mode refusals keep precise NODE_* 503 codes; every other reason is a
+    /// structural breach → 500 with a distinct fenced code.
+    #[test]
+    fn offline_refusal_splits_node_503_vs_structural_500() {
+        use crate::db::models::enums::{NodeMode, ShiftState};
+        use OfflineRefusalReason as R;
+        // Genuine node-mode refusals → 503, precise code.
+        for (mode, expect) in [
+            (NodeMode::GoingOnline, codes::NODE_GOING_ONLINE),
+            (NodeMode::Blocked, codes::NODE_BLOCKED),
+            (NodeMode::StopMode, codes::NODE_STOP_MODE),
+            (NodeMode::CryptoDegraded, codes::NODE_CRYPTO_DEGRADED),
+        ] {
+            let fe = map_offline_refusal(&R::NodeNotOffline { mode }, RID);
+            assert!(matches!(fe, FiscalError::OfflineRefused { .. }));
+            assert_eq!(code_of(&fe), expect);
+            assert_eq!(http(code_of(&fe)), 503);
+        }
+        // Online race + structural reasons → 500 (Internal), NOT 503.
+        let structural = [
+            R::NodeNotOffline {
+                mode: NodeMode::Online,
+            },
+            R::NoActiveSession,
+            R::ShiftNotOpened {
+                current: ShiftState::Closed,
+            },
+            R::DocStateConflict {
+                observed_state: "PREPARED".into(),
+            },
+            R::CrossFnMismatch {
+                observed_fiscal_number: "9999".into(),
+            },
+            R::DocNotFound,
+        ];
+        for reason in structural {
+            let fe = map_offline_refusal(&reason, RID);
+            assert!(matches!(fe, FiscalError::Internal { .. }), "got {fe:?}");
+            assert_eq!(http(code_of(&fe)), 500);
+        }
     }
 }
