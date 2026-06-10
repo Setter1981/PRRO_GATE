@@ -35,7 +35,10 @@ use crate::services::offline_sync::kvt2_confirm::{
     classify_check_result, Kvt2ConfirmOutcome, Kvt2ConfirmSource,
 };
 use crate::services::write_path::dispatch::{dispatch_post_sign, PostSignRoute};
-use crate::services::write_path::inline_map::{classify_send_outcome, codes, SendDisposition};
+use crate::services::write_path::inline_map::{
+    classify_send_outcome, code_of, codes, map_build_reject, map_dispatcher_refusal,
+    map_offline_refusal, map_rejection, map_send_error, map_sign_error, SendDisposition,
+};
 use crate::services::write_path::kvt2_advance::{advance_to_ack, ConfirmError};
 use crate::services::write_path::stage_acquire;
 use crate::services::write_path::stage_offline_ack::OfflineAckOutcome;
@@ -381,8 +384,21 @@ pub async fn run(
 
     let command = match build_canonical(row) {
         Ok(c) => c,
-        Err(_reject) => {
-            todo!("A2.1b-core incr.5: BuildReject arm (terminalise + map_build_reject)")
+        Err(reject) => {
+            // Pre-acquire (inbox still NEW): atomic lease+REJECT; on a race
+            // (row not NEW) resolve against the ledger.
+            let fe = map_build_reject(&reject, request_id);
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_BUILD_REJECT",
+                code_of(&fe),
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => Err(fe),
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
         }
     };
     // build_canonical validated driver_id is present + well-formed.
@@ -393,7 +409,25 @@ pub async fn run(
 
     let acq = match stage_acquire::run(pool, pool_secure, driver_id, request_id, command).await {
         Ok(r) => r,
-        Err(_e) => todo!("A2.1b-core incr.5: stage_acquire anyhow-error arm"),
+        Err(_e) => {
+            // stage_acquire's lease+PREPARED is one tx that rolls back on
+            // error → the inbox is still NEW → pre-acquire terminalise (atomic).
+            let fe = FiscalError::Internal {
+                request_id,
+                code: codes::ACQUIRE_INTERNAL,
+            };
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_ACQUIRE_ERROR",
+                code_of(&fe),
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => Err(fe),
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
+        }
     };
     let ctx = match acq {
         WorkerProcessResult::Proceed(ctx) | WorkerProcessResult::Resumed(ctx) => ctx,
@@ -415,23 +449,40 @@ pub async fn run(
             .await;
             return resolve_against_ledger(pool, request_id).await;
         }
-        WorkerProcessResult::Rejected { .. } => todo!("A2.1b-core incr.5: Rejected arm"),
+        WorkerProcessResult::Rejected { reason } => {
+            // stage_acquire ALREADY terminalised the inbox (REJECTED + audit);
+            // map ONLY — do NOT re-terminalise (CORRECTION 5).
+            return Err(map_rejection(&reason, request_id));
+        }
     };
     let doc_id = ctx.document.document_id;
     let fiscal_number = ctx.document.fiscal_number.clone();
 
     match stage_sign::run(pool, sign_ctx, ctx).await {
         Ok(_signing) => {}
-        Err(_e) => todo!("A2.1b-core incr.5: SignError arm"),
+        Err(e) => {
+            let fe = map_sign_error(&e, request_id);
+            terminalise_inbox(pool, row, "INLINE_SIGN_FAIL", code_of(&fe)).await?;
+            return Err(fe);
+        }
     }
 
     let route = match dispatch_post_sign(pool, doc_id, &fiscal_number).await {
         Ok(r) => r,
-        Err(_e) => todo!("A2.1b-core incr.5: dispatch anyhow-error arm"),
+        Err(_e) => {
+            let fe = FiscalError::Internal {
+                request_id,
+                code: codes::DISPATCH_INTERNAL,
+            };
+            terminalise_inbox(pool, row, "INLINE_DISPATCH_ERROR", code_of(&fe)).await?;
+            return Err(fe);
+        }
     };
     match route {
-        PostSignRoute::Refused(_reason) => {
-            todo!("A2.1b-core incr.5: dispatcher Refused arm")
+        PostSignRoute::Refused(reason) => {
+            let fe = map_dispatcher_refusal(&reason, request_id);
+            terminalise_inbox(pool, row, "INLINE_DISPATCH_REFUSED", code_of(&fe)).await?;
+            Err(fe)
         }
         PostSignRoute::Offline { outcome, .. } => {
             match outcome {
@@ -444,15 +495,24 @@ pub async fn run(
                     document_state: DocState::OfflineLocalAck,
                     report_xml: None,
                 }),
-                OfflineAckOutcome::Refused(_reason) => {
-                    todo!("A2.1b-core incr.5: offline-ack Refused arm (terminalise + OfflineRefused/503)")
+                OfflineAckOutcome::Refused(reason) => {
+                    // CORRECTION 4: granular — node-mode → OfflineRefused/503
+                    // with precise code; race/structural → Internal/500 (NOT a
+                    // blanket 503).
+                    let fe = map_offline_refusal(&reason, request_id);
+                    terminalise_inbox(pool, row, "INLINE_OFFLINE_REFUSED", code_of(&fe)).await?;
+                    Err(fe)
                 }
             }
         }
         PostSignRoute::Online { .. } => {
             let send = match stage_send::run(pool, dps, doc_id, Some(sign_ctx)).await {
                 Ok(o) => o,
-                Err(_e) => todo!("A2.1b-core incr.5: StageSendError arm"),
+                Err(e) => {
+                    let fe = map_send_error(&e, request_id);
+                    terminalise_inbox(pool, row, "INLINE_SEND_ERROR", code_of(&fe)).await?;
+                    return Err(fe);
+                }
             };
             // GOTCHA (arch-planner): `classify_send_outcome` drops `attempt_no`
             // on the Proceed arm — capture it from `Sent` BEFORE classifying,
@@ -462,7 +522,13 @@ pub async fn run(
                 _ => None,
             };
             match classify_send_outcome(send, request_id) {
-                SendDisposition::Reject(_fe) => todo!("A2.1b-core incr.5: send Reject arm"),
+                SendDisposition::Reject(fe) => {
+                    // `fe` is ALREADY mapped by classify_send_outcome (terminal
+                    // DPS reject / signer mismatch / structural) — terminalise
+                    // with its own code, then return it; no re-mapping.
+                    terminalise_inbox(pool, row, "INLINE_SEND_REJECT", code_of(&fe)).await?;
+                    Err(fe)
+                }
                 SendDisposition::InProgress => Ok(FiscalOutcome {
                     // Transient wire failure: the doc is persisted at
                     // `ErrorRetryable`; the ledger re-drives it via drain/B1.
@@ -504,7 +570,24 @@ pub async fn run(
                                     report_xml: None,
                                 }),
                                 Err(ConfirmError::StructuralDrift { .. }) => {
-                                    todo!("A2.1b-core incr.5: advance StructuralDrift arm")
+                                    // The doc stays durably at `Sent` (the
+                                    // advance envelopes rolled back). Terminalise
+                                    // the inbox REJECTED + audit — an INTENTIONAL,
+                                    // AUDITED divergence (Sent doc + REJECTED
+                                    // inbox = the breach surface for B1/recon,
+                                    // invariant #8, not silent) — and 500.
+                                    let fe = FiscalError::Internal {
+                                        request_id,
+                                        code: codes::REPLAY_LEDGER_DRIFT,
+                                    };
+                                    terminalise_inbox(
+                                        pool,
+                                        row,
+                                        "INLINE_ADVANCE_DRIFT",
+                                        code_of(&fe),
+                                    )
+                                    .await?;
+                                    Err(fe)
                                 }
                                 Err(ConfirmError::Database { .. })
                                 | Err(ConfirmError::Infrastructure { .. }) => {
@@ -528,7 +611,16 @@ pub async fn run(
                             report_xml: None,
                         }),
                         InlineConfirmOutcome::Drift => {
-                            todo!("A2.1b-core incr.5: confirm Drift arm")
+                            // Server does not recognise the id it just gave us;
+                            // the doc stays `Sent`. Terminalise inbox + 500
+                            // (audited divergence — same as the advance-drift arm).
+                            let fe = FiscalError::Internal {
+                                request_id,
+                                code: codes::REPLAY_LEDGER_DRIFT,
+                            };
+                            terminalise_inbox(pool, row, "INLINE_CONFIRM_DRIFT", code_of(&fe))
+                                .await?;
+                            Err(fe)
                         }
                     }
                 }

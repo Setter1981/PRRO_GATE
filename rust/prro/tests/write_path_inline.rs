@@ -230,6 +230,30 @@ async fn audit_count(pool: &SqlitePool, event_type: &str) -> i64 {
         .unwrap()
 }
 
+/// Count audit rows whose event_type starts with `INLINE_` (the inline
+/// orchestrator's own terminalise/fail-closed audits).
+async fn inline_audit_count(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE event_type LIKE 'INLINE_%'")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// node_state with an arbitrary mode + shift_state (for the refusal fixtures).
+async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift_state: ShiftState) {
+    sqlx::query(
+        "INSERT INTO node_state \
+         (fiscal_number, mode, shift_state, next_lnd, backend_profile_id, transport_profile_id) \
+         VALUES (?, ?, ?, 1, 'b', 't')",
+    )
+    .bind(FN)
+    .bind(mode)
+    .bind(shift_state)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn seed_node_state_offline(pool: &SqlitePool, shift_id: ShiftId) {
     sqlx::query(
         "INSERT INTO node_state \
@@ -501,4 +525,86 @@ async fn shift_open_is_fail_closed_and_terminalises_inbox() {
         audit_count(&pool, "INLINE_SHIFT_OPEN_NOT_SUPPORTED").await,
         1
     );
+}
+
+/// **A2.1b-core incr.5b — stage_acquire Rejected: map ONLY, NO double-terminalise
+/// (CORRECTION 5).** A SELL with no open shift → stage_acquire guard →
+/// `Rejected(ShiftNotOpen)`. stage_acquire ALREADY terminalised the inbox
+/// (REJECTED + its own audit); the inline arm maps to `ShiftNotOpen` (422) and
+/// must NOT emit a second terminalise/audit. Also a four-variant gate row
+/// (ShiftNotOpen → inbox non-NEW + audited).
+#[tokio::test]
+async fn acquire_rejected_maps_only_no_double_terminalise() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    // Node Online but shift CLOSED → a SELL has no open shift → Rejected.
+    seed_node_state(&pool, NodeMode::Online, ShiftState::Closed).await;
+    let row = seed_inbox_sell(&pool).await;
+
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect_err("a SELL with no open shift is refused");
+    assert!(matches!(err, FiscalError::ShiftNotOpen { .. }));
+    // Inbox terminal (by stage_acquire). No fiscal_documents (guard-refused).
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
+    let docs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ?")
+            .bind(FN)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(docs, 0);
+    // CORRECTION 5: the inline arm did NOT re-terminalise — NO INLINE_* audit
+    // (stage_acquire owns the single REJECTED + audit).
+    assert_eq!(
+        inline_audit_count(&pool).await,
+        0,
+        "stage_acquire Rejected must NOT trigger a second (inline) terminalise/audit"
+    );
+}
+
+/// **A2.1b-core incr.5b — offline refusal is granular (CORRECTION 4): a
+/// NoActiveSession is a STRUCTURAL breach → Internal/500, NOT a blanket 503,
+/// and terminalises the inbox.** Node Offline (dispatch routes offline) but no
+/// open offline session → stage_offline_ack `Refused(NoActiveSession)` →
+/// `map_offline_refusal` → Internal/OFFLINE_NO_ACTIVE_SESSION. Exercises the
+/// post-acquire `terminalise_inbox`.
+#[tokio::test]
+async fn offline_no_session_is_internal_500_and_terminalises_inbox() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_offline(&pool, shift_id).await; // node Offline → dispatch offline
+                                                    // NO open offline session seeded → stage_offline_ack refuses NoActiveSession.
+    let row = seed_inbox_sell(&pool).await;
+
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect_err("offline-ack with no session is a structural refusal");
+    match err {
+        FiscalError::Internal { code, .. } => assert_eq!(code, "OFFLINE_NO_ACTIVE_SESSION"),
+        other => panic!("expected Internal{{OFFLINE_NO_ACTIVE_SESSION}}, got {other:?}"),
+    }
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
+    assert_eq!(audit_count(&pool, "INLINE_OFFLINE_REFUSED").await, 1);
 }
