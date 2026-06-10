@@ -174,9 +174,16 @@ pub async fn run(
             };
             match classify_send_outcome(send, request_id) {
                 SendDisposition::Reject(_fe) => todo!("A2.1b-core incr.5: send Reject arm"),
-                SendDisposition::InProgress => {
-                    todo!("A2.1b-core incr.3: send InProgress (202) arm")
-                }
+                SendDisposition::InProgress => Ok(FiscalOutcome {
+                    // Transient wire failure: the doc is persisted at
+                    // `ErrorRetryable`; the ledger re-drives it via drain/B1.
+                    // 202 IN_PROGRESS — NOT a terminal failure. No DPS id yet.
+                    document_id: doc_id,
+                    fiscal_id: None,
+                    fiscal_ts: None,
+                    document_state: DocState::ErrorRetryable,
+                    report_xml: None,
+                }),
                 SendDisposition::ResolveReplay { .. } => {
                     todo!("A2.1b-core incr.3: send ResolveReplay arm")
                 }
@@ -213,9 +220,18 @@ pub async fn run(
                                 }
                             }
                         }
-                        InlineConfirmOutcome::Hold => {
-                            todo!("A2.1b-core incr.3: confirm Hold (202 Sent) arm")
-                        }
+                        InlineConfirmOutcome::Hold => Ok(FiscalOutcome {
+                            // Inline lastChk had no KVT1 evidence (transient /
+                            // empty data_sign): leave the doc at `Sent` → 202
+                            // IN_PROGRESS; drain/B1 completes the KVT2 confirm.
+                            // NOT a terminal failure, NOT a fake ACK. The DPS
+                            // id IS known (stamped by stage_send) — informational.
+                            document_id: doc_id,
+                            fiscal_id: Some(server_fiscal_no),
+                            fiscal_ts: None,
+                            document_state: DocState::Sent,
+                            report_xml: None,
+                        }),
                         InlineConfirmOutcome::Drift => {
                             todo!("A2.1b-core incr.5: confirm Drift arm")
                         }

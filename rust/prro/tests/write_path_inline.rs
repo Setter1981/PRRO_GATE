@@ -246,3 +246,76 @@ async fn online_sell_reaches_ack() {
     assert_eq!(outcome.fiscal_id.as_deref(), Some(SERVER_FISCAL_NO));
     assert_eq!(read_doc_state(&pool, FN).await, "ACK");
 }
+
+/// **A2.1b-core incr.3 — transient send → 202.** A transient wire failure
+/// routes the doc to `ErrorRetryable`; the orchestrator returns
+/// `Ok(FiscalOutcome{document_state: ErrorRetryable, fiscal_id: None})` → 202
+/// IN_PROGRESS (NOT a terminal `Err`/500). Drain/B1 re-drives later.
+#[tokio::test]
+async fn online_sell_transient_send_returns_in_progress() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_sell(&pool).await;
+
+    // send_chk transient failure → stage_send routes to ErrorRetryable.
+    let dps = DualStub::new(
+        Err(DpsError::Transport("net blip".into())),
+        Ok(ack(SERVER_FISCAL_NO, vec![0x01])), // unused on this path
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect("transient send is IN_PROGRESS (202), never a terminal Err");
+
+    assert_eq!(
+        outcome.document_state,
+        prro::db::models::enums::DocState::ErrorRetryable
+    );
+    assert_eq!(outcome.fiscal_id, None);
+    assert_eq!(read_doc_state(&pool, FN).await, "ERROR_RETRYABLE");
+}
+
+/// **A2.1b-core incr.3 — inline lastChk Hold → 202 Sent.** The wire send
+/// succeeded (doc at `Sent`), but the inline lastChk is transient (no KVT1
+/// evidence yet) → `online_confirm` Hold → `Ok(FiscalOutcome{document_state:
+/// Sent})` → 202 IN_PROGRESS. The doc is NOT advanced and NOT fake-ACK'd; the
+/// drain/B1 completes the KVT2 confirm later.
+#[tokio::test]
+async fn online_sell_lastchk_hold_returns_sent_in_progress() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_sell(&pool).await;
+
+    // send_chk succeeds (→ Sent), but last_chk is transient → online_confirm Hold.
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Err(DpsError::Transport("lastChk blip".into())),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect("Hold leaves the doc at Sent → 202, never a terminal Err");
+
+    assert_eq!(
+        outcome.document_state,
+        prro::db::models::enums::DocState::Sent
+    );
+    // server_fiscal_no IS known (stage_send stamped it) — informational on 202.
+    assert_eq!(outcome.fiscal_id.as_deref(), Some(SERVER_FISCAL_NO));
+    // Doc stays Sent — NOT advanced, NOT fake-ACK'd.
+    assert_eq!(read_doc_state(&pool, FN).await, "SENT");
+}
