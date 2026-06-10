@@ -132,6 +132,9 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         | "OFFLINE_SHIFT_CLOSE_NOT_SUPPORTED"
         | "SHIFT_CLOSING_IN_FLIGHT"
         | "Z_REPORT_BACKLOG_DRAIN_PENDING"
+        // RS-3 A2.1b-core — SHIFT_OPEN is out of the SELL/RETURN inline core
+        // (A2.2 owns it); fail-closed 422 (ShiftGuardRefused) until then.
+        | "SHIFT_OPEN_NOT_SUPPORTED"
         // RS-3 A2 (Q-A) — the true signer-vs-opening-cashier mismatch is
         // client/operator-fixable (reissue with the correct cashier), pre-wire,
         // no fiscal commitment → 422, carried by ShiftGuardRefused.

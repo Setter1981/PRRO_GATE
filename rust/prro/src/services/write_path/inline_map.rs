@@ -45,6 +45,10 @@ pub(crate) mod codes {
     pub const OFFLINE_SHIFT_CLOSE_NOT_SUPPORTED: &str = "OFFLINE_SHIFT_CLOSE_NOT_SUPPORTED";
     pub const SHIFT_CLOSING_IN_FLIGHT: &str = "SHIFT_CLOSING_IN_FLIGHT";
     pub const Z_REPORT_BACKLOG_DRAIN_PENDING: &str = "Z_REPORT_BACKLOG_DRAIN_PENDING";
+    /// RS-3 A2.1b-core incr.5 — SHIFT_OPEN is out of the SELL/RETURN inline
+    /// core (handled by A2.2); fail-closed 422 until then (the wire contract
+    /// must NOT leak the internal slicing — no `*_IN_CORE` literal).
+    pub const SHIFT_OPEN_NOT_SUPPORTED: &str = "SHIFT_OPEN_NOT_SUPPORTED";
     /// Q-A — the true signer-vs-opening-cashier mismatch (operator reissues
     /// with the correct cashier); pre-wire, no fiscal commitment → 422.
     pub const SIGNER_CASHIER_MISMATCH: &str = "SIGNER_CASHIER_MISMATCH";
@@ -280,6 +284,7 @@ mod tests {
             codes::SHIFT_CLOSING_IN_FLIGHT,
             codes::Z_REPORT_BACKLOG_DRAIN_PENDING,
             codes::SIGNER_CASHIER_MISMATCH,
+            codes::SHIFT_OPEN_NOT_SUPPORTED,
         ] {
             assert_eq!(http(c), 422, "{c} must route to 422 (ShiftGuardRefused)");
         }

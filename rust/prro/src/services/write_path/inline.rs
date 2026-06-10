@@ -24,10 +24,13 @@ use tokio::sync::OwnedMutexGuard;
 
 use crate::db::models::enums::{DocState, Severity};
 use crate::db::models::ids::DocumentId;
+use crate::db::repositories::audit_log;
 use crate::db::repositories::fiscal_documents::{self, TerminalOutcome};
-use crate::db::repositories::{audit_log, ingress_inbox::InboxRow};
+use crate::db::repositories::ingress_inbox::{self, InboxRow};
+use crate::db::tx::with_immediate;
 use crate::runtime::ingress::canonical_builder::build_canonical;
 use crate::runtime::ingress::seam::{FiscalError, FiscalOutcome};
+use crate::runtime::ingress::z_builder::ensure_full_z_surface_ready;
 use crate::services::offline_sync::kvt2_confirm::{
     classify_check_result, Kvt2ConfirmOutcome, Kvt2ConfirmSource,
 };
@@ -172,6 +175,128 @@ async fn resolve_against_ledger(
     }
 }
 
+/// Outcome of the pre-acquire terminalise (the Z/SHIFT_OPEN / BuildReject
+/// arms, which run BEFORE `stage_acquire` while the inbox is still `NEW`).
+enum PreAcquireTerminalise {
+    /// The inbox was `NEW`: leased + REJECTED + audited ATOMICALLY (one tx).
+    /// Caller returns the fail-closed `FiscalError`.
+    Terminalised,
+    /// The inbox was NOT `NEW` (already PROCESSING/DONE/REJECTED — a race or
+    /// replay): nothing was mutated.  Caller MUST resolve against the ledger.
+    NotNew,
+}
+
+/// Terminalise the inbox for a real-failure arm whose row is already
+/// `PROCESSING` (stage_acquire leased it): CAS `PROCESSING → REJECTED` +
+/// audit, in ONE `with_immediate` (no foreign IO → invariant #1).  REJECTED
+/// is the terminal status for a refusal (the persistence pin forbids a
+/// `fiscal_documents` ledger row for one; replay reads REJECTED as failure).
+/// A `!marked` (row not PROCESSING) or DB fault is itself a structural breach
+/// → `Internal`/500 (NEVER swallowed — the reaper re-drives a stuck row).
+async fn terminalise_inbox(
+    pool: &SqlitePool,
+    row: &InboxRow,
+    event_type: &'static str,
+    code: &'static str,
+) -> Result<(), FiscalError> {
+    let request_id = row.request_id;
+    let payload = serde_json::json!({
+        "request_id": hex_encode_lower(&request_id),
+        "fiscal_number": row.fiscal_number,
+        "operation_type": row.operation_type,
+        "code": code,
+    })
+    .to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            let id_hex = hex_encode_lower(&request_id);
+            let marked = ingress_inbox::mark_rejected_if_processing_tx(tx, &request_id).await?;
+            if !marked {
+                return Err(anyhow::anyhow!(
+                    "terminalise_inbox: inbox row {id_hex} was not PROCESSING — cannot \
+                     terminalise a non-leased / already-terminal row"
+                ));
+            }
+            audit_log::append_tx(
+                tx,
+                "ingress_inbox",
+                &id_hex,
+                event_type,
+                Severity::Warning,
+                None,
+                Some(&payload),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(|_| FiscalError::Internal {
+        request_id,
+        code: codes::REPLAY_LEDGER_DRIFT,
+    })?;
+    Ok(())
+}
+
+/// Terminalise the inbox for a pre-acquire fail-closed arm (Z / SHIFT_OPEN /
+/// BuildReject), where the row is still `NEW`.  ONE `with_immediate`: on
+/// `acquire_lease` (NEW→PROCESSING) returning `Some`, run
+/// `mark_rejected_if_processing_tx` then the audit append IN THE SAME tx
+/// (atomic — a crash between the lease and the reject cannot leave an eternal
+/// PROCESSING, invariant #4); on `None` (the row was NOT NEW — race/replay) no
+/// mutation happens and we signal [`PreAcquireTerminalise::NotNew`] so the
+/// caller resolves against the ledger.
+async fn terminalise_inbox_pre_acquire(
+    pool: &SqlitePool,
+    row: &InboxRow,
+    event_type: &'static str,
+    code: &'static str,
+) -> Result<PreAcquireTerminalise, FiscalError> {
+    let request_id = row.request_id;
+    let payload = serde_json::json!({
+        "request_id": hex_encode_lower(&request_id),
+        "fiscal_number": row.fiscal_number,
+        "operation_type": row.operation_type,
+        "code": code,
+    })
+    .to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            let id_hex = hex_encode_lower(&request_id);
+            match ingress_inbox::acquire_lease(tx, &request_id).await? {
+                Some(_leased) => {
+                    let marked =
+                        ingress_inbox::mark_rejected_if_processing_tx(tx, &request_id).await?;
+                    if !marked {
+                        return Err(anyhow::anyhow!(
+                            "terminalise_inbox_pre_acquire: just-leased inbox row {id_hex} \
+                             was not PROCESSING (single-writer invariant breach)"
+                        ));
+                    }
+                    audit_log::append_tx(
+                        tx,
+                        "ingress_inbox",
+                        &id_hex,
+                        event_type,
+                        Severity::Warning,
+                        None,
+                        Some(&payload),
+                    )
+                    .await?;
+                    Ok::<PreAcquireTerminalise, anyhow::Error>(PreAcquireTerminalise::Terminalised)
+                }
+                // Row was not NEW — a race/replay; do NOT terminalise.
+                None => Ok(PreAcquireTerminalise::NotNew),
+            }
+        })
+    })
+    .await
+    .map_err(|_| FiscalError::Internal {
+        request_id,
+        code: codes::REPLAY_LEDGER_DRIFT,
+    })
+}
+
 /// Inline `fiscalize` orchestrator (A2.1b-core, SELL/RETURN only) — chains
 /// `build_canonical → stage_acquire → stage_sign → dispatch → (Online) send →
 /// online_confirm → advance_to_ack → finalize` into a `FiscalOutcome`.
@@ -199,10 +324,60 @@ pub async fn run(
 ) -> Result<FiscalOutcome, FiscalError> {
     let request_id = row.request_id;
 
-    // A2.1b-core is SELL/RETURN only. Z_REPORT/SHIFT_CLOSE (Z-class) and
-    // SHIFT_OPEN are fail-closed (incr.5), handled before build/acquire.
-    // TODO(incr.5): is_z_class → ZSurfaceNotReady (lease+terminalise);
-    //               SHIFT_OPEN → ShiftGuardRefused{SHIFT_OPEN_NOT_SUPPORTED}.
+    // A2.1b-core is SELL/RETURN only. Z-class (Z_REPORT/SHIFT_CLOSE) and
+    // SHIFT_OPEN are fail-closed BEFORE build/acquire — the inbox is still
+    // NEW, so the pre-acquire terminalise leases+REJECTs atomically (no
+    // fiscal_documents minted); on a race (row not NEW) it resolves against
+    // the ledger.
+    match row.operation_type.as_str() {
+        "Z_REPORT" | "SHIFT_CLOSE" => {
+            // Bound to the real live-Z surface gate (not theatrical): it is
+            // Err today → 501 ZSurfaceNotReady. A2.1b-core (SELL/RETURN-only)
+            // does NOT handle live-Z even if the gate flips — the debug_assert
+            // makes a future gate-flip break tests (a deliberate revisit),
+            // never a silent fall-through to build_canonical (a later A2.4-Z
+            // piece owns the live-Z path).
+            let surface = ensure_full_z_surface_ready();
+            debug_assert!(
+                surface.is_err(),
+                "A2.1b-core predates the live-Z surface; the gate must be Err \
+                 (if it flipped, live-Z is a LATER piece — revisit this branch)"
+            );
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_Z_SURFACE_NOT_READY",
+                // `ZSurfaceNotReady` is a standalone FiscalError variant (not
+                // code-bearing); the audit-payload code is the established
+                // wire string (handler maps it → 501).
+                "Z_SURFACE_NOT_READY",
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => {
+                    Err(FiscalError::ZSurfaceNotReady { request_id })
+                }
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
+        }
+        "SHIFT_OPEN" => {
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_SHIFT_OPEN_NOT_SUPPORTED",
+                codes::SHIFT_OPEN_NOT_SUPPORTED,
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => Err(FiscalError::ShiftGuardRefused {
+                    request_id,
+                    code: codes::SHIFT_OPEN_NOT_SUPPORTED,
+                }),
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
+        }
+        _ => {}
+    }
 
     let command = match build_canonical(row) {
         Ok(c) => c,

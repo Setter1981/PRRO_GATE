@@ -19,6 +19,7 @@ use prro::db::models::ids::{OfflineSessionId, RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::{open_pool, open_secure_pool};
+use prro::runtime::ingress::seam::FiscalError;
 use prro::services::write_path::inline;
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
@@ -163,17 +164,25 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
 /// both `build_canonical`'s integrity gate and `stage_acquire`'s cross-check
 /// pass.
 async fn seed_inbox_sell(pool: &SqlitePool) -> InboxRow {
+    seed_inbox_op(pool, DocType::Sell.as_str()).await
+}
+
+/// Seed a NEW inbox row with the given `operation_type` + return the matching
+/// `InboxRow`. The SELL payload is reused verbatim — it is never parsed on the
+/// fail-closed Z/SHIFT_OPEN paths (they return before build_canonical), and
+/// `payload_sha256_canonical = sha256(payload)` keeps the SELL path's gates happy.
+async fn seed_inbox_op(pool: &SqlitePool, operation_type: &str) -> InboxRow {
     let req_id = RequestId::new();
     let request_id: [u8; 16] = *req_id.as_bytes();
     let payload_sha256_canonical: [u8; 32] = Sha256::digest(SELL_PAYLOAD.as_bytes()).into();
-    let idempotency_key = "idem-a2-1b-online-sell".to_string();
+    let idempotency_key = format!("idem-a2-1b-{operation_type}");
     inbox::insert(
         pool,
         &NewInboxEntry {
             request_id,
             fiscal_number: FN.into(),
             protocol: Protocol::Rest,
-            operation_type: DocType::Sell.as_str().into(),
+            operation_type: operation_type.into(),
             idempotency_key: idempotency_key.clone(),
             payload_json: SELL_PAYLOAD.into(),
             payload_sha256_canonical,
@@ -190,7 +199,7 @@ async fn seed_inbox_sell(pool: &SqlitePool) -> InboxRow {
         request_id,
         fiscal_number: FN.into(),
         protocol: Protocol::Rest,
-        operation_type: DocType::Sell.as_str().into(),
+        operation_type: operation_type.into(),
         idempotency_key,
         status: "NEW".into(),
         payload_json: SELL_PAYLOAD.into(),
@@ -202,6 +211,23 @@ async fn seed_inbox_sell(pool: &SqlitePool) -> InboxRow {
         business_ts: Some("2026-06-09T12:00:00Z".into()),
         total_sum_kop: Some(TOTAL_KOP),
     }
+}
+
+/// Read the inbox row's status for the seeded FN (one row per test pool).
+async fn read_inbox_status(pool: &SqlitePool, request_id: &[u8; 16]) -> String {
+    sqlx::query_scalar("SELECT status FROM ingress_inbox WHERE request_id = ?")
+        .bind(&request_id[..])
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn audit_count(pool: &SqlitePool, event_type: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE event_type = ?")
+        .bind(event_type)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 async fn seed_node_state_offline(pool: &SqlitePool, shift_id: ShiftId) {
@@ -401,4 +427,78 @@ async fn offline_sell_is_offline_local_ack_success() {
     );
     assert_eq!(outcome.fiscal_id, None);
     assert_eq!(read_doc_state(&pool, FN).await, "OFFLINE_LOCAL_ACK");
+}
+
+/// **A2.1b-core incr.5 — Z-class is fail-closed (501) + terminalises the inbox,
+/// NO fiscal_documents.** A Z_REPORT is out of the SELL/RETURN core: the
+/// orchestrator fail-closes BEFORE build/acquire with `ZSurfaceNotReady`,
+/// leasing+REJECTing the inbox atomically (so replay reads it as failure, not
+/// 202-forever) and minting no ledger row.
+#[tokio::test]
+async fn z_report_is_fail_closed_and_terminalises_inbox() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let row = seed_inbox_op(&pool, "Z_REPORT").await;
+
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect_err("Z-class is fail-closed (501), not a success");
+    assert!(matches!(err, FiscalError::ZSurfaceNotReady { .. }));
+    // Inbox terminal + audited (replay reads REJECTED as failure, not 202).
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
+    assert_eq!(audit_count(&pool, "INLINE_Z_SURFACE_NOT_READY").await, 1);
+    // NO fiscal_documents minted for a refusal (Q2).
+    let docs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ?")
+            .bind(FN)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(docs, 0, "fail-closed must mint NO fiscal_documents");
+}
+
+/// **A2.1b-core incr.5 — SHIFT_OPEN is fail-closed (422) + terminalises the
+/// inbox.** SHIFT_OPEN is out of the SELL/RETURN core (A2.2 owns it):
+/// `ShiftGuardRefused{SHIFT_OPEN_NOT_SUPPORTED}` (422), inbox REJECTED+audited,
+/// no fiscal_documents. The 422 mapping is pinned by inline_map's round-trip test.
+#[tokio::test]
+async fn shift_open_is_fail_closed_and_terminalises_inbox() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let row = seed_inbox_op(&pool, "SHIFT_OPEN").await;
+
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect_err("SHIFT_OPEN is fail-closed (422) in the SELL/RETURN core");
+    match err {
+        FiscalError::ShiftGuardRefused { code, .. } => {
+            assert_eq!(code, "SHIFT_OPEN_NOT_SUPPORTED");
+        }
+        other => panic!("expected ShiftGuardRefused{{SHIFT_OPEN_NOT_SUPPORTED}}, got {other:?}"),
+    }
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
+    assert_eq!(
+        audit_count(&pool, "INLINE_SHIFT_OPEN_NOT_SUPPORTED").await,
+        1
+    );
 }
