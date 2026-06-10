@@ -21,7 +21,7 @@ use std::str::FromStr;
 ///      Windows has no equivalent mode bit; the chmod is a no-op via
 ///      `cfg(unix)` and the platform's ACL story applies separately.
 ///   3. The pool has the same PRAGMA tuning as [`open_pool`] (WAL,
-///      foreign_keys ON, NORMAL synchronous, busy_timeout 5s) so the
+///      foreign_keys ON, FULL synchronous, busy_timeout 5s) so the
 ///      secure file behaves identically under concurrent access.
 ///
 /// Failure modes:
@@ -36,7 +36,7 @@ pub async fn open_secure_pool(path: &Path) -> anyhow::Result<SqlitePool> {
         .create_if_missing(true)
         .foreign_keys(true)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Full)
         .busy_timeout(std::time::Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
@@ -89,15 +89,29 @@ pub async fn open_secure_pool(path: &Path) -> anyhow::Result<SqlitePool> {
 
 /// Open a connection pool against the given SQLite file.
 ///
-/// Sets WAL journal mode, busy_timeout 5s, foreign_keys ON, NORMAL synchronous.
+/// Sets WAL journal mode, busy_timeout 5s, foreign_keys ON, FULL synchronous.
 /// Migrations are applied via `sqlx::migrate!()`.
+///
+/// **Why FULL, not NORMAL (durability audit 2026-06-10, operator-signed).**
+/// Under WAL+NORMAL a commit reaches the OS page cache but is fsync'd only
+/// at checkpoint time: an app crash is safe, but a POWER CUT (or kernel
+/// panic) can drop the tail of COMMITTED transactions.  For this ledger
+/// that is not a routine data loss: an `OFFLINE_LOCAL_ACK` receipt already
+/// handed to the customer would vanish together with its consumed offline
+/// code (→ the code could be CONSUMED TWICE), and `node_state.next_lnd` /
+/// the MAC chain seed would roll back (→ lnd reuse against DPS, chain
+/// break).  Pilot hardware is heterogeneous and mostly WITHOUT a UPS, and
+/// grid outages make power cuts the EXPECTED failure mode — so every
+/// commit pays one WAL fsync (~1–30ms depending on storage).  At receipt
+/// rates (a few per minute per FN) this is negligible; do NOT relax back
+/// to NORMAL for performance without re-running the durability analysis.
 pub async fn open_pool(path: &Path) -> anyhow::Result<SqlitePool> {
     let url = format!("sqlite:{}", path.display());
     let opts = SqliteConnectOptions::from_str(&url)?
         .create_if_missing(true)
         .foreign_keys(true)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Full)
         .busy_timeout(std::time::Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
@@ -140,7 +154,7 @@ pub async fn open_pool_no_migrate(path: &Path) -> anyhow::Result<SqlitePool> {
         .create_if_missing(false)
         .foreign_keys(true)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Full)
         .busy_timeout(std::time::Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
