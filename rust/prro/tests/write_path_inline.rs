@@ -12,6 +12,11 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
+use prro::crypto::errors::{CryptoError, SignKind};
+use prro::crypto::provider::{
+    CertDer, CryptoProvider, DstuVerifyResult, SignCmsRequest, SignedCmsBytes,
+};
+use prro::crypto::session::SigningSession;
 use prro::db::models::enums::{
     DocType, FiscalMode, NodeMode, OfflineSessionState, Protocol, ShiftState,
 };
@@ -21,9 +26,10 @@ use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_conf
 use prro::db::{open_pool, open_secure_pool};
 use prro::runtime::ingress::seam::FiscalError;
 use prro::services::write_path::inline;
+use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
-use prro::transports::dps::error::DpsError;
+use prro::transports::dps::error::{AuthorizationKind, DpsError};
 use sqlx::SqlitePool;
 
 use common::det_signing_ctx;
@@ -86,6 +92,58 @@ fn ack(id: &str, data_sign: Vec<u8>) -> CheckAck {
         id: id.to_string(),
         id_sign: vec![],
         data_sign,
+    }
+}
+
+// ─── Failing crypto provider (the SignFailure gate fixture) ─────────────
+
+/// `sign_cms_detached` always errors with a crypto-class failure — drives the
+/// `SignError::Crypto` → `FiscalError::SignFailure` gate arm.
+struct FailingCrypto;
+
+#[async_trait]
+impl CryptoProvider for FailingCrypto {
+    async fn sign_cms_detached(
+        &self,
+        _: SignCmsRequest<'_>,
+    ) -> Result<SignedCmsBytes, CryptoError> {
+        Err(CryptoError::CmsSign {
+            reason: SignKind::BackendError,
+        })
+    }
+    async fn verify_dstu(
+        &self,
+        _: &[u8],
+        _: &[u8],
+        _: &[u8],
+    ) -> Result<DstuVerifyResult, CryptoError> {
+        unreachable!("stub: verify_dstu not exercised");
+    }
+    async fn unwrap_envelope(
+        &self,
+        _: &[u8],
+        _: &[u8],
+        _: &SigningSession,
+    ) -> Result<Vec<u8>, CryptoError> {
+        unreachable!("stub: unwrap_envelope not exercised");
+    }
+    async fn fetch_cert_by_ski(
+        &self,
+        _: &[String],
+        _: &[u8; 32],
+        _: std::time::Duration,
+    ) -> Result<CertDer, CryptoError> {
+        unreachable!("stub: fetch_cert_by_ski not exercised");
+    }
+}
+
+/// `SigningContext` over [`FailingCrypto`] — mirrors `common::det_signing_ctx`
+/// but every sign attempt fails at the crypto boundary.
+fn failing_signing_ctx() -> SigningContext {
+    SigningContext {
+        provider: Arc::new(FailingCrypto) as Arc<dyn CryptoProvider>,
+        session: SigningSession::new_for_test("operator-1".into(), [0u8; 32], vec![]),
+        profile: prro_crypto::cms::profile::CmsProfile::Dstu4145WithGost34311Pb,
     }
 }
 
@@ -607,4 +665,130 @@ async fn offline_no_session_is_internal_500_and_terminalises_inbox() {
     }
     assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
     assert_eq!(audit_count(&pool, "INLINE_OFFLINE_REFUSED").await, 1);
+}
+
+/// **A2.1b-core incr.5b — four-variant gate: SignFailure.** A crypto-class
+/// sign failure (`SignError::Crypto`) → `FiscalError::SignFailure` (500); the
+/// inline arm terminalises the inbox (REJECTED + `INLINE_SIGN_FAIL` audit).
+/// The doc row stays at its pre-sign state (no SIGNED commit) — a write-path
+/// artifact, not an issued receipt.
+#[tokio::test]
+async fn sign_crypto_failure_is_sign_failure_and_terminalises_inbox() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_sell(&pool).await;
+
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = failing_signing_ctx(); // crypto always errors
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect_err("a crypto sign failure is a terminal refusal");
+    assert!(matches!(err, FiscalError::SignFailure { .. }));
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
+    assert_eq!(audit_count(&pool, "INLINE_SIGN_FAIL").await, 1);
+}
+
+/// **A2.1b-core incr.5b — four-variant gate: DpsRejected.** DPS hard-rejects
+/// the receipt (`Authorization{DocumentReject}` → stage_send routes the doc to
+/// terminal `Rejected`) → `FiscalError::DpsRejected` (422); the inline arm
+/// terminalises the inbox (REJECTED + `INLINE_SEND_REJECT` audit). The
+/// existing `fiscal_documents` row lands at REJECTED — an existing write-path
+/// artifact (Q2), which replay reads as failure.
+#[tokio::test]
+async fn dps_hard_reject_is_dps_rejected_and_terminalises_inbox() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_sell(&pool).await;
+
+    // send_chk → DocumentReject (terminal); last_chk is never reached.
+    let dps = DualStub::new(
+        Err(DpsError::Authorization {
+            code: -1,
+            kind: AuthorizationKind::DocumentReject,
+            message: "document rejected by DPS".into(),
+        }),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect_err("a DPS hard reject is a terminal refusal");
+    assert!(matches!(err, FiscalError::DpsRejected { .. }));
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
+    assert_eq!(audit_count(&pool, "INLINE_SEND_REJECT").await, 1);
+    // Q2: the doc row exists (acquire+sign+send ran) and rests at terminal
+    // REJECTED — a failure artifact, never an issued receipt.
+    assert_eq!(read_doc_state(&pool, FN).await, "REJECTED");
+}
+
+/// **A2.1b-core incr.5b — four-variant gate: OfflineRefused (503).** A
+/// `Blocked` node refuses fiscalization at the acquire guard →
+/// `Rejected(NodeBlocked)` → `map_rejection` → `OfflineRefused{NODE_BLOCKED}`
+/// (503). stage_acquire owns the terminalise (inbox REJECTED + its own audit;
+/// no inline re-terminalise), and no fiscal_documents row is minted.
+#[tokio::test]
+async fn blocked_node_is_offline_refused_and_inbox_terminal() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    // Node BLOCKED (operator action required) — shift open is irrelevant.
+    sqlx::query(
+        "INSERT INTO node_state \
+         (fiscal_number, mode, shift_state, current_shift_id, next_lnd, \
+          backend_profile_id, transport_profile_id) \
+         VALUES (?, ?, ?, ?, 1, 'b', 't')",
+    )
+    .bind(FN)
+    .bind(NodeMode::Blocked)
+    .bind(ShiftState::Opened)
+    .bind(shift_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let row = seed_inbox_sell(&pool).await;
+
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect_err("a BLOCKED node refuses fiscalization");
+    match err {
+        FiscalError::OfflineRefused { code, .. } => assert_eq!(code, "NODE_BLOCKED"),
+        other => panic!("expected OfflineRefused{{NODE_BLOCKED}}, got {other:?}"),
+    }
+    // Terminalised by stage_acquire (no inline re-terminalise), no doc row.
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
+    assert_eq!(inline_audit_count(&pool).await, 0);
+    let docs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ?")
+            .bind(FN)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(docs, 0);
 }
