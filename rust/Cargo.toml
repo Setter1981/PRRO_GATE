@@ -9,3 +9,20 @@ members = [
     "prro_escpos_daemon",
     "prro",
 ]
+
+# Profiles apply ONLY from the workspace root — the [profile.release]
+# sections that lived in prro_crypto/Cargo.toml and prro_sidecar/Cargo.toml
+# were silently IGNORED by cargo (audit CRY-2, 2026-06-10). Moved here to
+# enact the original intent (max-optimized release crypto/sidecar).
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# LOAD-BEARING (audit CRY-2): parser panics on semi-hostile network bytes
+# (DPS envelopes via `unwrap_envelope`, CA CMP responses via
+# `fetch_cert_by_ski`) are CONTAINED by `tokio::task::spawn_blocking` +
+# JoinError→CryptoError mapping (prro/src/crypto/in_process.rs) — a panic
+# becomes a typed per-request error, NOT process death. That containment
+# requires unwinding. Do NOT set panic = "abort" (e.g. for binary size):
+# it would turn malformed network input into a gateway crash mid-shift.
+panic = "unwind"
