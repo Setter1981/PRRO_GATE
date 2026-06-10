@@ -186,6 +186,25 @@ async fn resolve_against_ledger(
     }
 }
 
+/// Is a ledger-resolve `Err` a TERMINAL VERDICT (the ledger POSITIVELY says
+/// the receipt terminally failed / needs manual recon) — vs an UNKNOWN-truth
+/// drift (no doc row / DB read error / malformed id / Cancelled-lumped)?
+///
+/// Only a terminal verdict may terminalise our inbox lease: marking REJECTED
+/// on unknown truth would let a doc that is durably `Sent` (and later
+/// converges to ACK via the boot SENT-probe) replay as `Failed` — the
+/// REJECTED inbox short-circuits `replay::resolve_replay` BEFORE the ledger
+/// join (replay.rs), i.e. the gateway would lie about a fiscalized receipt.
+/// On unknown truth the lease stays PROCESSING: replay answers from the
+/// ledger (202 / Failed honestly), and B1/boot recovery owns convergence.
+fn is_terminal_ledger_verdict(fe: &FiscalError) -> bool {
+    match fe {
+        FiscalError::DpsRejected { .. } => true,
+        FiscalError::Internal { code, .. } => *code == codes::SHIFT_MANUAL_RECON,
+        _ => false,
+    }
+}
+
 /// Outcome of the pre-acquire terminalise (the Z/SHIFT_OPEN / BuildReject
 /// arms, which run BEFORE `stage_acquire` while the inbox is still `NEW`).
 enum PreAcquireTerminalise {
@@ -595,8 +614,25 @@ pub async fn run(
                     match resolve_against_ledger(pool, request_id).await {
                         Ok(outcome) => Ok(outcome),
                         Err(fe) => {
-                            terminalise_inbox(pool, row, "INLINE_RESOLVE_TERMINAL", code_of(&fe))
+                            if is_terminal_ledger_verdict(&fe) {
+                                terminalise_inbox(
+                                    pool,
+                                    row,
+                                    "INLINE_RESOLVE_TERMINAL",
+                                    code_of(&fe),
+                                )
                                 .await?;
+                            } else {
+                                // Unknown truth — leave OUR lease PROCESSING
+                                // so recovery converges; replay answers from
+                                // the ledger (never a false REJECTED).
+                                tracing::warn!(
+                                    request_id = %hex_encode_lower(&request_id),
+                                    code = code_of(&fe),
+                                    "ledger resolve was inconclusive; lease left \
+                                     PROCESSING for recovery"
+                                );
+                            }
                             Err(fe)
                         }
                     }
@@ -672,13 +708,23 @@ pub async fn run(
                                     match resolve_against_ledger(pool, request_id).await {
                                         Ok(outcome) => Ok(outcome),
                                         Err(fe) => {
-                                            terminalise_inbox(
-                                                pool,
-                                                row,
-                                                "INLINE_RESOLVE_TERMINAL",
-                                                code_of(&fe),
-                                            )
-                                            .await?;
+                                            if is_terminal_ledger_verdict(&fe) {
+                                                terminalise_inbox(
+                                                    pool,
+                                                    row,
+                                                    "INLINE_RESOLVE_TERMINAL",
+                                                    code_of(&fe),
+                                                )
+                                                .await?;
+                                            } else {
+                                                tracing::warn!(
+                                                    request_id =
+                                                        %hex_encode_lower(&request_id),
+                                                    code = code_of(&fe),
+                                                    "ledger resolve was inconclusive; \
+                                                     lease left PROCESSING for recovery"
+                                                );
+                                            }
                                             Err(fe)
                                         }
                                     }
@@ -876,6 +922,31 @@ mod tests {
         assert!(
             matches!(e, FiscalError::Internal { code, .. } if code == codes::SHIFT_MANUAL_RECON)
         );
+    }
+
+    /// The terminalise-on-resolver-Err discriminator: ONLY a positive
+    /// terminal verdict (DpsRejected / manual-recon) may terminalise our
+    /// lease; unknown-truth drift must NOT (a doc still converging to ACK
+    /// via boot recovery would otherwise replay as a false `Failed`).
+    #[test]
+    fn terminal_ledger_verdict_discriminates_known_terminal_from_unknown_drift() {
+        const RID2: [u8; 16] = [0x22; 16];
+        assert!(is_terminal_ledger_verdict(&FiscalError::DpsRejected {
+            request_id: RID2
+        }));
+        assert!(is_terminal_ledger_verdict(&FiscalError::Internal {
+            request_id: RID2,
+            code: codes::SHIFT_MANUAL_RECON,
+        }));
+        // Unknown truth — never terminalise.
+        assert!(!is_terminal_ledger_verdict(&FiscalError::Internal {
+            request_id: RID2,
+            code: codes::REPLAY_LEDGER_DRIFT,
+        }));
+        assert!(!is_terminal_ledger_verdict(&FiscalError::Internal {
+            request_id: RID2,
+            code: codes::INBOX_TERMINALISE_FAILED,
+        }));
     }
 
     /// A malformed `document_id` is ledger drift → Internal(REPLAY_LEDGER_DRIFT).
