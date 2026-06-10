@@ -71,6 +71,10 @@ pub(crate) mod codes {
     /// the HTTP class.
     pub const SIGN_INTERNAL: &str = "SIGN_INTERNAL";
     pub const SEND_INTERNAL: &str = "SEND_INTERNAL";
+    /// RS-3 A2.1b-core incr.3b — a replay-resolve (Noop / ResolveReplay /
+    /// post-Sent advance failure) found no ledger doc, a malformed
+    /// `document_id`, or a DB error: a structural breach → 500.
+    pub const REPLAY_LEDGER_DRIFT: &str = "REPLAY_LEDGER_DRIFT";
 }
 
 fn shift_guard(request_id: [u8; 16], code: &'static str) -> FiscalError {
@@ -299,6 +303,7 @@ mod tests {
             codes::CROSS_FN_MISMATCH,
             codes::SIGN_INTERNAL,
             codes::SEND_INTERNAL,
+            codes::REPLAY_LEDGER_DRIFT,
         ] {
             assert_eq!(http(c), 500, "{c} must route to 500 (Internal)");
         }

@@ -22,20 +22,22 @@
 use sqlx::SqlitePool;
 use tokio::sync::OwnedMutexGuard;
 
-use crate::db::models::enums::DocState;
-use crate::db::repositories::ingress_inbox::InboxRow;
+use crate::db::models::enums::{DocState, Severity};
+use crate::db::models::ids::DocumentId;
+use crate::db::repositories::fiscal_documents::{self, TerminalOutcome};
+use crate::db::repositories::{audit_log, ingress_inbox::InboxRow};
 use crate::runtime::ingress::canonical_builder::build_canonical;
 use crate::runtime::ingress::seam::{FiscalError, FiscalOutcome};
 use crate::services::offline_sync::kvt2_confirm::{
     classify_check_result, Kvt2ConfirmOutcome, Kvt2ConfirmSource,
 };
 use crate::services::write_path::dispatch::{dispatch_post_sign, PostSignRoute};
-use crate::services::write_path::inline_map::{classify_send_outcome, SendDisposition};
+use crate::services::write_path::inline_map::{classify_send_outcome, codes, SendDisposition};
 use crate::services::write_path::kvt2_advance::{advance_to_ack, ConfirmError};
 use crate::services::write_path::stage_acquire;
 use crate::services::write_path::stage_send::{self, StageSendOutcome};
 use crate::services::write_path::stage_sign::{self, SigningContext};
-use crate::services::write_path::types::WorkerProcessResult;
+use crate::services::write_path::types::{hex_encode_lower, WorkerProcessResult};
 use crate::transports::dps::channel::DpsChannel;
 use crate::transports::dps::dto::CheckSignBlob;
 
@@ -90,6 +92,85 @@ pub async fn online_confirm(
     }
 }
 
+/// Decode a `lower(hex(document_id))` (32 lowercase hex chars — the shape
+/// `terminal_outcome_by_request_id` produces) back to a typed `DocumentId`.
+/// `DocumentId` has no `FromStr`, so decode the 16 bytes explicitly.
+fn hex32_to_document_id(s: &str) -> Option<DocumentId> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(DocumentId::from_bytes(bytes))
+}
+
+/// Pure ledger-state → `FiscalOutcome`/`FiscalError` projection (no IO).
+///
+/// Used by the replay-resolve arms (Noop / ResolveReplay / a post-`Sent`
+/// advance failure): the durable ledger row is the truth, mapped per the seam
+/// `document_state` contract —
+///   - `Ack` / `OfflineLocalAck` (terminal SUCCESS) → `FiscalOutcome` (200);
+///   - `Rejected` (terminal FAILURE) → `DpsRejected` (422);
+///   - `RequiresManualReconciliation` → `Internal` (`SHIFT_MANUAL_RECON`, 500);
+///   - `Cancelled` / a malformed `document_id` → `Internal`
+///     (`REPLAY_LEDGER_DRIFT`, 500);
+///   - anything else (in-flight: Prepared/Signed/…/Sent/Kvt1/Kvt2/
+///     ErrorRetryable) → `FiscalOutcome` (202 IN_PROGRESS).
+fn terminal_to_outcome(
+    o: TerminalOutcome,
+    request_id: [u8; 16],
+) -> Result<FiscalOutcome, FiscalError> {
+    let document_id = hex32_to_document_id(&o.document_id).ok_or(FiscalError::Internal {
+        request_id,
+        code: codes::REPLAY_LEDGER_DRIFT,
+    })?;
+    match o.state {
+        DocState::Ack | DocState::OfflineLocalAck => Ok(FiscalOutcome {
+            document_id,
+            fiscal_id: o.server_fiscal_no,
+            fiscal_ts: o.first_kvt1_at,
+            document_state: o.state,
+            report_xml: None,
+        }),
+        DocState::Rejected => Err(FiscalError::DpsRejected { request_id }),
+        DocState::RequiresManualReconciliation => Err(FiscalError::Internal {
+            request_id,
+            code: codes::SHIFT_MANUAL_RECON,
+        }),
+        DocState::Cancelled => Err(FiscalError::Internal {
+            request_id,
+            code: codes::REPLAY_LEDGER_DRIFT,
+        }),
+        // In-flight states → 202 IN_PROGRESS (deterministic replay/poll).
+        _ => Ok(FiscalOutcome {
+            document_id,
+            fiscal_id: o.server_fiscal_no,
+            fiscal_ts: o.first_kvt1_at,
+            document_state: o.state,
+            report_xml: None,
+        }),
+    }
+}
+
+/// Resolve a no-wire / replay / post-`Sent` outcome against the durable
+/// ledger (read-only; NOT inside a `with_immediate`).  An absent ledger doc,
+/// a malformed id, or a DB error is a structural breach → `Internal`/500
+/// (decision e: NEVER blind-terminalise — the ledger is the truth).
+async fn resolve_against_ledger(
+    pool: &SqlitePool,
+    request_id: [u8; 16],
+) -> Result<FiscalOutcome, FiscalError> {
+    match fiscal_documents::terminal_outcome_by_request_id(pool, &request_id).await {
+        Ok(Some(o)) => terminal_to_outcome(o, request_id),
+        Ok(None) | Err(_) => Err(FiscalError::Internal {
+            request_id,
+            code: codes::REPLAY_LEDGER_DRIFT,
+        }),
+    }
+}
+
 /// Inline `fiscalize` orchestrator (A2.1b-core, SELL/RETURN only) — chains
 /// `build_canonical → stage_acquire → stage_sign → dispatch → (Online) send →
 /// online_confirm → advance_to_ack → finalize` into a `FiscalOutcome`.
@@ -140,7 +221,24 @@ pub async fn run(
     };
     let ctx = match acq {
         WorkerProcessResult::Proceed(ctx) | WorkerProcessResult::Resumed(ctx) => ctx,
-        WorkerProcessResult::Noop => todo!("A2.1b-core incr.3: Noop replay-resolve"),
+        WorkerProcessResult::Noop => {
+            // decision e: an inline Noop is UNEXPECTED under A4 (the handler
+            // hands a freshly-Created NEW row) → audit Critical for
+            // observability; NEVER blind-terminalise — resolve the truth from
+            // the ledger (terminal/in-flight → return it; empty → Internal/500).
+            let id_hex = hex_encode_lower(&request_id);
+            let _ = audit_log::append(
+                pool,
+                "ingress_inbox",
+                &id_hex,
+                "INLINE_NOOP_UNEXPECTED",
+                Severity::Critical,
+                None,
+                None,
+            )
+            .await;
+            return resolve_against_ledger(pool, request_id).await;
+        }
         WorkerProcessResult::Rejected { .. } => todo!("A2.1b-core incr.5: Rejected arm"),
     };
     let doc_id = ctx.document.document_id;
@@ -185,7 +283,10 @@ pub async fn run(
                     report_xml: None,
                 }),
                 SendDisposition::ResolveReplay { .. } => {
-                    todo!("A2.1b-core incr.3: send ResolveReplay arm")
+                    // No-wire idempotent re-entry / race (stage_send StateConflict
+                    // / DocumentMissing): resolve the durable truth from the
+                    // ledger, never a phantom terminal 500.
+                    resolve_against_ledger(pool, request_id).await
                 }
                 SendDisposition::Proceed { server_fiscal_no } => {
                     let attempt_no = sent_attempt_no
@@ -216,7 +317,10 @@ pub async fn run(
                                 }
                                 Err(ConfirmError::Database { .. })
                                 | Err(ConfirmError::Infrastructure { .. }) => {
-                                    todo!("A2.1b-core incr.3: advance Database/Infra → ledger-resolve")
+                                    // The advance envelope rolled back: the doc is
+                                    // still durably `Sent`.  Resolve against the
+                                    // ledger (→ 202), NEVER a blind terminal 500.
+                                    resolve_against_ledger(pool, request_id).await
                                 }
                             }
                         }
@@ -342,5 +446,76 @@ mod tests {
         let dps = StubLastChk::new(Ok(ack("DPS-FN-OTHER", vec![0x01])));
         let outcome = online_confirm(&dps, &fn_sign(), SERVER_FISCAL_NO).await;
         assert_eq!(outcome, InlineConfirmOutcome::Drift);
+    }
+
+    // ─── terminal_to_outcome (replay-resolve ledger projection) ─────────
+
+    use crate::db::models::enums::DocType;
+
+    const RID: [u8; 16] = [0x11; 16];
+
+    fn term(state: DocState, server_fiscal_no: Option<&str>) -> TerminalOutcome {
+        TerminalOutcome {
+            document_id: hex_encode_lower(DocumentId::new().as_bytes()),
+            state,
+            doc_type: DocType::Sell,
+            server_fiscal_no: server_fiscal_no.map(str::to_string),
+            first_kvt1_at: None,
+            total_sum_kop: Some(15000),
+        }
+    }
+
+    /// Terminal-accepted Ack → success outcome carrying the DPS id (→ 200).
+    #[test]
+    fn terminal_ack_is_success_with_fiscal_id() {
+        let r = terminal_to_outcome(term(DocState::Ack, Some("DPS-FN-9")), RID)
+            .expect("Ack resolves to a success outcome");
+        assert_eq!(r.document_state, DocState::Ack);
+        assert_eq!(r.fiscal_id.as_deref(), Some("DPS-FN-9"));
+    }
+
+    /// OfflineLocalAck → success, no DPS id (→ 200).
+    #[test]
+    fn terminal_offline_local_ack_is_success_no_id() {
+        let r = terminal_to_outcome(term(DocState::OfflineLocalAck, None), RID)
+            .expect("offline-local-ack resolves to a success outcome");
+        assert_eq!(r.document_state, DocState::OfflineLocalAck);
+        assert_eq!(r.fiscal_id, None);
+    }
+
+    /// In-flight Sent → 202 IN_PROGRESS (a success-shape, not an Err).
+    #[test]
+    fn terminal_sent_is_in_flight_in_progress() {
+        let r = terminal_to_outcome(term(DocState::Sent, Some("DPS-FN-9")), RID)
+            .expect("Sent resolves to an in-flight outcome");
+        assert_eq!(r.document_state, DocState::Sent);
+    }
+
+    /// Terminal-failed Rejected → DpsRejected (422).
+    #[test]
+    fn terminal_rejected_is_dps_rejected() {
+        let e = terminal_to_outcome(term(DocState::Rejected, None), RID).unwrap_err();
+        assert!(matches!(e, FiscalError::DpsRejected { .. }));
+    }
+
+    /// RequiresManualReconciliation → Internal(SHIFT_MANUAL_RECON) (500).
+    #[test]
+    fn terminal_manual_recon_is_internal_manual_recon() {
+        let e = terminal_to_outcome(term(DocState::RequiresManualReconciliation, None), RID)
+            .unwrap_err();
+        assert!(
+            matches!(e, FiscalError::Internal { code, .. } if code == codes::SHIFT_MANUAL_RECON)
+        );
+    }
+
+    /// A malformed `document_id` is ledger drift → Internal(REPLAY_LEDGER_DRIFT).
+    #[test]
+    fn terminal_malformed_document_id_is_internal_drift() {
+        let mut o = term(DocState::Ack, Some("DPS-FN-9"));
+        o.document_id = "not-a-valid-document-id".to_string();
+        let e = terminal_to_outcome(o, RID).unwrap_err();
+        assert!(
+            matches!(e, FiscalError::Internal { code, .. } if code == codes::REPLAY_LEDGER_DRIFT)
+        );
     }
 }
