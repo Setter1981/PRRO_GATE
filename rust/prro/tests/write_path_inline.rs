@@ -12,8 +12,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-use prro::db::models::enums::{DocType, FiscalMode, NodeMode, Protocol, ShiftState};
-use prro::db::models::ids::{RequestId, ShiftId};
+use prro::db::models::enums::{
+    DocType, FiscalMode, NodeMode, OfflineSessionState, Protocol, ShiftState,
+};
+use prro::db::models::ids::{OfflineSessionId, RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::{open_pool, open_secure_pool};
@@ -202,6 +204,47 @@ async fn seed_inbox_sell(pool: &SqlitePool) -> InboxRow {
     }
 }
 
+async fn seed_node_state_offline(pool: &SqlitePool, shift_id: ShiftId) {
+    sqlx::query(
+        "INSERT INTO node_state \
+         (fiscal_number, mode, shift_state, current_shift_id, next_lnd, \
+          backend_profile_id, transport_profile_id) \
+         VALUES (?, ?, ?, ?, 1, 'b', 't')",
+    )
+    .bind(FN)
+    .bind(NodeMode::Offline)
+    .bind(ShiftState::Opened)
+    .bind(shift_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn seed_open_offline_session(pool: &SqlitePool) -> OfflineSessionId {
+    let session_id = OfflineSessionId::new();
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, ?, '2026-06-09T00:00:00Z')",
+    )
+    .bind(session_id)
+    .bind(FN)
+    .bind(OfflineSessionState::Open.as_str())
+    .execute(pool)
+    .await
+    .unwrap();
+    session_id
+}
+
+/// Seed one AVAILABLE offline code (consumed_at NULL by default).
+async fn seed_offline_code(pool: &SqlitePool, code_lnd: i64) {
+    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_lnd) VALUES (?, ?)")
+        .bind(FN)
+        .bind(code_lnd)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 async fn read_doc_state(pool: &SqlitePool, fiscal_number: &str) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE fiscal_number = ?")
         .bind(fiscal_number)
@@ -318,4 +361,44 @@ async fn online_sell_lastchk_hold_returns_sent_in_progress() {
     assert_eq!(outcome.fiscal_id.as_deref(), Some(SERVER_FISCAL_NO));
     // Doc stays Sent — NOT advanced, NOT fake-ACK'd.
     assert_eq!(read_doc_state(&pool, FN).await, "SENT");
+}
+
+/// **A2.1b-core incr.4 — offline-local-ack is a SUCCESS (200, not Err).** With
+/// the node Offline + an open session + an available code, dispatch routes the
+/// signed doc to `stage_offline_ack`, which acquires a code and lands it at
+/// `OFFLINE_LOCAL_ACK`. The orchestrator returns
+/// `Ok(FiscalOutcome{document_state: OfflineLocalAck, fiscal_id: None})` — NOT
+/// a `FiscalError` (a transport/ambiguous-DPS auto-offline is success, per the
+/// seam contract).
+#[tokio::test]
+async fn offline_sell_is_offline_local_ack_success() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_offline(&pool, shift_id).await;
+    seed_open_offline_session(&pool).await;
+    seed_offline_code(&pool, 1).await;
+    let row = seed_inbox_sell(&pool).await;
+
+    // DPS is never called on the offline path (dispatch terminates at offline-ack).
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect("offline auto-ack is a SUCCESS (200), never a FiscalError");
+
+    assert_eq!(
+        outcome.document_state,
+        prro::db::models::enums::DocState::OfflineLocalAck
+    );
+    assert_eq!(outcome.fiscal_id, None);
+    assert_eq!(read_doc_state(&pool, FN).await, "OFFLINE_LOCAL_ACK");
 }

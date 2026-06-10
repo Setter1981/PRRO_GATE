@@ -35,6 +35,7 @@ use crate::services::write_path::dispatch::{dispatch_post_sign, PostSignRoute};
 use crate::services::write_path::inline_map::{classify_send_outcome, codes, SendDisposition};
 use crate::services::write_path::kvt2_advance::{advance_to_ack, ConfirmError};
 use crate::services::write_path::stage_acquire;
+use crate::services::write_path::stage_offline_ack::OfflineAckOutcome;
 use crate::services::write_path::stage_send::{self, StageSendOutcome};
 use crate::services::write_path::stage_sign::{self, SigningContext};
 use crate::services::write_path::types::{hex_encode_lower, WorkerProcessResult};
@@ -257,7 +258,22 @@ pub async fn run(
         PostSignRoute::Refused(_reason) => {
             todo!("A2.1b-core incr.5: dispatcher Refused arm")
         }
-        PostSignRoute::Offline { .. } => todo!("A2.1b-core incr.4: offline-ack arm"),
+        PostSignRoute::Offline { outcome, .. } => {
+            match outcome {
+                // A transient/ambiguous DPS auto-offline is a SUCCESS, not an Err:
+                // the doc is durably at OFFLINE_LOCAL_ACK (200). No DPS id yet.
+                OfflineAckOutcome::Applied { document_id, .. } => Ok(FiscalOutcome {
+                    document_id,
+                    fiscal_id: None,
+                    fiscal_ts: None,
+                    document_state: DocState::OfflineLocalAck,
+                    report_xml: None,
+                }),
+                OfflineAckOutcome::Refused(_reason) => {
+                    todo!("A2.1b-core incr.5: offline-ack Refused arm (terminalise + OfflineRefused/503)")
+                }
+            }
+        }
         PostSignRoute::Online { .. } => {
             let send = match stage_send::run(pool, dps, doc_id, Some(sign_ctx)).await {
                 Ok(o) => o,
