@@ -20,11 +20,8 @@
 //! 503 (M1 node modes) · SignFailure 500 (crypto-sign ONLY) · Internal 500
 //! (every other structural/runtime breach) · ZSurfaceNotReady 501.
 //!
-//! NOTE: these mappers are CONSUMED by the A2.1b orchestrator (`inline::run`),
-//! which does not exist yet — until then they are reachable only from the unit
-//! tests below, hence the module-level `dead_code` allow.
-
-#![allow(dead_code)]
+//! These mappers are CONSUMED by the A2.1b orchestrator
+//! (`super::inline::run`) and fence-tested below.
 
 use crate::db::models::enums::{DocState, NodeMode};
 use crate::runtime::ingress::canonical_builder::BuildReject;
@@ -85,6 +82,12 @@ pub(crate) mod codes {
     /// post-Sent advance failure) found no ledger doc, a malformed
     /// `document_id`, or a DB error: a structural breach → 500.
     pub const REPLAY_LEDGER_DRIFT: &str = "REPLAY_LEDGER_DRIFT";
+    /// RS-3 A2.1b-core review fix (OCF-2/F3): the inbox-terminalise
+    /// `with_immediate` itself failed (DB fault, or a `!marked` row-state
+    /// surprise) — the refusal could NOT be durably recorded.  Distinct from
+    /// `REPLAY_LEDGER_DRIFT` so the 500 class is forensically separable; the
+    /// cause is logged via `tracing::error!` at the failure site.
+    pub const INBOX_TERMINALISE_FAILED: &str = "INBOX_TERMINALISE_FAILED";
 
     // ── A2.1b-core incr.5b — offline-ack STRUCTURAL refusals → 500 ──
     // (the dispatcher chose the offline path, then stage_offline_ack refused
@@ -377,6 +380,7 @@ mod tests {
             codes::ACQUIRE_INTERNAL,
             codes::DISPATCH_INTERNAL,
             codes::REPLAY_LEDGER_DRIFT,
+            codes::INBOX_TERMINALISE_FAILED,
             codes::OFFLINE_NODE_ONLINE_RACE,
             codes::OFFLINE_NO_ACTIVE_SESSION,
             codes::OFFLINE_SHIFT_NOT_OPENED,
@@ -386,6 +390,19 @@ mod tests {
         ] {
             assert_eq!(http(c), 500, "{c} must route to 500 (Internal)");
         }
+    }
+
+    /// FENCE EXTENSION (review HTTP-1): the FIXED-variant literals `code_of`
+    /// can emit (not in `codes::` — they belong to non-code-bearing
+    /// `FiscalError` variants) must also round-trip to their HTTP class, so a
+    /// handler-map regression cannot silently reroute them.
+    #[test]
+    fn fixed_variant_literals_round_trip_to_expected_http_class() {
+        assert_eq!(http("NO_OPEN_SHIFT"), 422);
+        assert_eq!(http("FISCAL_REJECTED"), 422);
+        assert_eq!(http("SIGN_FAILED"), 500);
+        assert_eq!(http("Z_SURFACE_NOT_READY"), 501);
+        assert_eq!(http("NOT_IMPLEMENTED"), 501);
     }
 
     /// FENCE EXTENSION (review MEDIUM): `map_build_reject` forwards

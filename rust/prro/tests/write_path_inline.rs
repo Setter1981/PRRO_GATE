@@ -297,6 +297,19 @@ async fn inline_audit_count(pool: &SqlitePool) -> i64 {
         .unwrap()
 }
 
+/// Latest audit payload for an event type (None if absent / not JSON).
+async fn audit_latest_payload(pool: &SqlitePool, event_type: &str) -> Option<serde_json::Value> {
+    let raw: Option<String> = sqlx::query_scalar(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE event_type = ? ORDER BY audit_id DESC LIMIT 1",
+    )
+    .bind(event_type)
+    .fetch_optional(pool)
+    .await
+    .unwrap();
+    raw.and_then(|s| serde_json::from_str(&s).ok())
+}
+
 /// node_state with an arbitrary mode + shift_state (for the refusal fixtures).
 async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift_state: ShiftState) {
     sqlx::query(
@@ -395,7 +408,23 @@ async fn online_sell_reaches_ack() {
         prro::db::models::enums::DocState::Ack
     );
     assert_eq!(outcome.fiscal_id.as_deref(), Some(SERVER_FISCAL_NO));
+    // Review OCF-1 pin: first-pass↔replay parity — the inline ACK carries the
+    // first_kvt1_at stamp (the Sent→Kvt1 CAS wrote it during the advance).
+    assert!(
+        outcome.fiscal_ts.is_some(),
+        "inline ACK must carry fiscal_ts (first_kvt1_at) for replay parity"
+    );
     assert_eq!(read_doc_state(&pool, FN).await, "ACK");
+    // Review TA-7 pin: stage_finalize marked the inbox DONE in its envelope.
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "DONE");
+    // Review TA-4 pin: the attempt_no GOTCHA capture (taken from
+    // StageSendOutcome::Sent BEFORE classify_send_outcome drops it) reaches
+    // the advance audit payload.
+    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED")
+        .await
+        .expect("the advance emits its audit");
+    assert_eq!(payload["attempt_no"].as_i64(), Some(1));
+    assert_eq!(payload["server_fiscal_no"], SERVER_FISCAL_NO);
 }
 
 /// **A2.1b-core incr.3 — transient send → 202.** A transient wire failure
@@ -469,6 +498,12 @@ async fn online_sell_lastchk_hold_returns_sent_in_progress() {
     assert_eq!(outcome.fiscal_id.as_deref(), Some(SERVER_FISCAL_NO));
     // Doc stays Sent — NOT advanced, NOT fake-ACK'd.
     assert_eq!(read_doc_state(&pool, FN).await, "SENT");
+    // Review TA-7 pin: the inbox stays PROCESSING (the in-flight intermediate
+    // owned by drain/B1; replay resolves 202 via the ledger).
+    assert_eq!(
+        read_inbox_status(&pool, &row.request_id).await,
+        "PROCESSING"
+    );
 }
 
 /// **A2.1b-core incr.4 — offline-local-ack is a SUCCESS (200, not Err).** With
@@ -509,6 +544,12 @@ async fn offline_sell_is_offline_local_ack_success() {
     );
     assert_eq!(outcome.fiscal_id, None);
     assert_eq!(read_doc_state(&pool, FN).await, "OFFLINE_LOCAL_ACK");
+    // Review TA-7 pin: the inbox stays PROCESSING until the drain later
+    // finalizes the doc to ACK (replay reads OfflineLocalAck as ACCEPTED).
+    assert_eq!(
+        read_inbox_status(&pool, &row.request_id).await,
+        "PROCESSING"
+    );
 }
 
 /// **A2.1b-core incr.5 — Z-class is fail-closed (501) + terminalises the inbox,
@@ -583,6 +624,13 @@ async fn shift_open_is_fail_closed_and_terminalises_inbox() {
         audit_count(&pool, "INLINE_SHIFT_OPEN_NOT_SUPPORTED").await,
         1
     );
+    // Review TA-4 pin: the audit payload's code == the returned error's code
+    // (audit ↔ error agree by construction via code_of).
+    let payload = audit_latest_payload(&pool, "INLINE_SHIFT_OPEN_NOT_SUPPORTED")
+        .await
+        .expect("terminalise audit carries a payload");
+    assert_eq!(payload["code"], "SHIFT_OPEN_NOT_SUPPORTED");
+    assert_eq!(payload["operation_type"], "SHIFT_OPEN");
 }
 
 /// **A2.1b-core incr.5b — stage_acquire Rejected: map ONLY, NO double-terminalise
@@ -791,4 +839,213 @@ async fn blocked_node_is_offline_refused_and_inbox_terminal() {
             .await
             .unwrap();
     assert_eq!(docs, 0);
+}
+
+/// **Review TA-1 — confirm-Drift arm + the #8 audited divergence.** The send
+/// succeeds (doc at `Sent`), but the inline lastChk says NotFound (empty id) —
+/// the server does not recognise the id it just issued. `online_confirm` →
+/// Drift → terminalise + `Internal{REPLAY_LEDGER_DRIFT}` (500). The doc STAYS
+/// at `Sent` while the inbox is REJECTED — the intentional, AUDITED divergence
+/// surface for B1/recon (invariant #8, not silent).
+#[tokio::test]
+async fn lastchk_drift_terminalises_inbox_and_leaves_doc_sent() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_sell(&pool).await;
+
+    // send OK; lastChk returns an EMPTY id → by_server_fiscal_no → NotFound → Drift.
+    let dps = DualStub::new(Ok(ack(SERVER_FISCAL_NO, vec![])), Ok(ack("", vec![0x01])));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect_err("a Sent-fresh NotFound is structural drift (500)");
+    match err {
+        FiscalError::Internal { code, .. } => assert_eq!(code, "REPLAY_LEDGER_DRIFT"),
+        other => panic!("expected Internal{{REPLAY_LEDGER_DRIFT}}, got {other:?}"),
+    }
+    // The audited divergence: inbox REJECTED, doc still SENT (NOT rolled back,
+    // NOT fake-ACKed) — B1/recon owns the convergence.
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
+    assert_eq!(audit_count(&pool, "INLINE_CONFIRM_DRIFT").await, 1);
+    assert_eq!(read_doc_state(&pool, FN).await, "SENT");
+}
+
+/// **Review TA-2 — the Noop arm resolves from the ledger (decision e),
+/// end-to-end.** The inbox row is already terminal (DONE — processed by a
+/// prior pass) and the ledger holds the ACK doc: stage_acquire's peek finds no
+/// NEW row → Noop → audit Critical (unexpected under A4) → the ledger truth is
+/// returned, NEVER a blind terminalise or a 501.
+#[tokio::test]
+async fn noop_resolves_accepted_truth_from_ledger() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_sell(&pool).await;
+    // Simulate "already processed": inbox DONE + a terminal ACK ledger doc
+    // for the SAME request_id.
+    sqlx::query("UPDATE ingress_inbox SET status = 'DONE' WHERE request_id = ?")
+        .bind(&row.request_id[..])
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO fiscal_documents( \
+            document_id, request_id, fiscal_number, shift_id, lnd, doc_type, state, \
+            backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical, server_fiscal_no, first_kvt1_at, \
+            total_sum_kop \
+         ) VALUES (?, ?, ?, ?, 1, 'SELL', 'ACK', 'b', 't', 'ONLINE', \
+            '2026-06-09T12:00:00Z', '{}', ?, ?, '2026-06-09T12:00:05Z', ?)",
+    )
+    .bind(prro::db::models::ids::DocumentId::new())
+    .bind(&row.request_id[..])
+    .bind(FN)
+    .bind(shift_id)
+    .bind(vec![0u8; 32])
+    .bind(SERVER_FISCAL_NO)
+    .bind(TOTAL_KOP)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect("Noop must resolve the accepted ledger truth, not fail");
+    assert_eq!(
+        outcome.document_state,
+        prro::db::models::enums::DocState::Ack
+    );
+    assert_eq!(outcome.fiscal_id.as_deref(), Some(SERVER_FISCAL_NO));
+    assert!(
+        outcome.fiscal_ts.is_some(),
+        "ledger first_kvt1_at threads through"
+    );
+    // The unexpected-Noop observability pin (decision e).
+    assert_eq!(audit_count(&pool, "INLINE_NOOP_UNEXPECTED").await, 1);
+    // The DONE row is untouched (never blind-terminalise a foreign row).
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "DONE");
+}
+
+/// **Review TA-6 — BuildReject arm (pre-acquire).** A corrupted row (payload
+/// hash mismatch) fails `build_canonical` BEFORE any stage: atomic pre-acquire
+/// terminalise (lease+REJECT+audit, one tx) + `Internal{PAYLOAD_HASH_MISMATCH}`
+/// (500); NO fiscal_documents row.
+#[tokio::test]
+async fn build_reject_terminalises_pre_acquire() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    // Row with a WRONG payload_sha256_canonical ([0u8;32] != sha256(payload)).
+    let req_id = RequestId::new();
+    let request_id: [u8; 16] = *req_id.as_bytes();
+    inbox::insert(
+        &pool,
+        &NewInboxEntry {
+            request_id,
+            fiscal_number: FN.into(),
+            protocol: Protocol::Rest,
+            operation_type: DocType::Sell.as_str().into(),
+            idempotency_key: "idem-a2-1b-bad-sha".into(),
+            payload_json: SELL_PAYLOAD.into(),
+            payload_sha256_canonical: [0u8; 32],
+            correlation_id: None,
+            signed_by_cashier_id: Some(CASHIER.into()),
+            driver_id: Some(DRIVER.into()),
+            business_ts: Some("2026-06-09T12:00:00Z".into()),
+            total_sum_kop: Some(TOTAL_KOP),
+        },
+    )
+    .await
+    .unwrap();
+    let row = InboxRow {
+        request_id,
+        fiscal_number: FN.into(),
+        protocol: Protocol::Rest,
+        operation_type: DocType::Sell.as_str().into(),
+        idempotency_key: "idem-a2-1b-bad-sha".into(),
+        status: "NEW".into(),
+        payload_json: SELL_PAYLOAD.into(),
+        payload_sha256_canonical: [0u8; 32],
+        correlation_id: None,
+        received_at: "2026-06-09T12:00:00Z".into(),
+        signed_by_cashier_id: Some(CASHIER.into()),
+        driver_id: Some(DRIVER.into()),
+        business_ts: Some("2026-06-09T12:00:00Z".into()),
+        total_sum_kop: Some(TOTAL_KOP),
+    };
+
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect_err("a hash-mismatched row is a structural reject");
+    match err {
+        FiscalError::Internal { code, .. } => assert_eq!(code, "PAYLOAD_HASH_MISMATCH"),
+        other => panic!("expected Internal{{PAYLOAD_HASH_MISMATCH}}, got {other:?}"),
+    }
+    assert_eq!(read_inbox_status(&pool, &request_id).await, "REJECTED");
+    assert_eq!(audit_count(&pool, "INLINE_BUILD_REJECT").await, 1);
+    let docs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ?")
+            .bind(FN)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(docs, 0);
+}
+
+/// **Review A24-4 — RETURN is in the signed scope and flows to ACK** exactly
+/// like SELL (same CheckJson shape, total required).
+#[tokio::test]
+async fn online_return_reaches_ack() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_op(&pool, DocType::Return.as_str()).await;
+
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect("online RETURN must reach a terminal ACK");
+    assert_eq!(
+        outcome.document_state,
+        prro::db::models::enums::DocState::Ack
+    );
+    assert_eq!(outcome.fiscal_id.as_deref(), Some(SERVER_FISCAL_NO));
+    assert_eq!(read_doc_state(&pool, FN).await, "ACK");
 }

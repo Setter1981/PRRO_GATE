@@ -17,8 +17,6 @@
 //! NOT duplicated — but it yields a 3-shape [`InlineConfirmOutcome`] (NO
 //! `BootError`, NO drain source-routing leaking into the inline path).
 
-#![allow(dead_code)] // consumed by the A2.4 binding; wired up incrementally.
-
 use sqlx::SqlitePool;
 use tokio::sync::OwnedMutexGuard;
 
@@ -151,7 +149,17 @@ fn terminal_to_outcome(
             code: codes::REPLAY_LEDGER_DRIFT,
         }),
         // In-flight states → 202 IN_PROGRESS (deterministic replay/poll).
-        _ => Ok(FiscalOutcome {
+        // EXPLICITLY enumerated (review OCF-4): a future DocState variant
+        // must be deliberately classified here — a new TERMINAL state
+        // silently mapping to 202-in-flight would be a fiscal-truth bug.
+        DocState::Prepared
+        | DocState::Signed
+        | DocState::Encrypted
+        | DocState::Sending
+        | DocState::Sent
+        | DocState::Kvt1
+        | DocState::Kvt2
+        | DocState::ErrorRetryable => Ok(FiscalOutcome {
             document_id,
             fiscal_id: o.server_fiscal_no,
             fiscal_ts: o.first_kvt1_at,
@@ -234,9 +242,20 @@ async fn terminalise_inbox(
         })
     })
     .await
-    .map_err(|_| FiscalError::Internal {
-        request_id,
-        code: codes::REPLAY_LEDGER_DRIFT,
+    .map_err(|err| {
+        // The refusal could not be durably recorded (DB fault, or a !marked
+        // row-state surprise).  Log the cause — the audit row rolled back
+        // with the tx, so this trace is the only forensic record.
+        tracing::error!(
+            request_id = %hex_encode_lower(&request_id),
+            event_type,
+            error = %format!("{err:#}"),
+            "terminalise_inbox failed — inbox row NOT terminalised"
+        );
+        FiscalError::Internal {
+            request_id,
+            code: codes::INBOX_TERMINALISE_FAILED,
+        }
     })?;
     Ok(())
 }
@@ -294,9 +313,23 @@ async fn terminalise_inbox_pre_acquire(
         })
     })
     .await
-    .map_err(|_| FiscalError::Internal {
-        request_id,
-        code: codes::REPLAY_LEDGER_DRIFT,
+    .map_err(|err| {
+        // KNOWN letter-gap (review F1): on a DB fault here the row stays NEW
+        // and we still return a FiscalError — the obligation is unsatisfiable
+        // at fault time (a failing DB cannot record the terminalisation
+        // either).  The key then resolves to 202 on replay until re-driven;
+        // B1's reaper scope must include NEW rows with no fiscal_documents.
+        // This trace is the only forensic record.
+        tracing::error!(
+            request_id = %hex_encode_lower(&request_id),
+            event_type,
+            error = %format!("{err:#}"),
+            "terminalise_inbox_pre_acquire failed — inbox row left NEW"
+        );
+        FiscalError::Internal {
+            request_id,
+            code: codes::INBOX_TERMINALISE_FAILED,
+        }
     })
 }
 
@@ -346,20 +379,19 @@ pub async fn run(
                 "A2.1b-core predates the live-Z surface; the gate must be Err \
                  (if it flipped, live-Z is a LATER piece — revisit this branch)"
             );
+            // Build the error FIRST so the audit code comes from code_of —
+            // audit ↔ returned error agree by construction (review HTTP-1;
+            // the literal lives in one place, fence-tested → 501).
+            let fe = FiscalError::ZSurfaceNotReady { request_id };
             return match terminalise_inbox_pre_acquire(
                 pool,
                 row,
                 "INLINE_Z_SURFACE_NOT_READY",
-                // `ZSurfaceNotReady` is a standalone FiscalError variant (not
-                // code-bearing); the audit-payload code is the established
-                // wire string (handler maps it → 501).
-                "Z_SURFACE_NOT_READY",
+                code_of(&fe),
             )
             .await?
             {
-                PreAcquireTerminalise::Terminalised => {
-                    Err(FiscalError::ZSurfaceNotReady { request_id })
-                }
+                PreAcquireTerminalise::Terminalised => Err(fe),
                 PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
             };
         }
@@ -437,7 +469,7 @@ pub async fn run(
             // observability; NEVER blind-terminalise — resolve the truth from
             // the ledger (terminal/in-flight → return it; empty → Internal/500).
             let id_hex = hex_encode_lower(&request_id);
-            let _ = audit_log::append(
+            if let Err(err) = audit_log::append(
                 pool,
                 "ingress_inbox",
                 &id_hex,
@@ -446,7 +478,16 @@ pub async fn run(
                 None,
                 None,
             )
-            .await;
+            .await
+            {
+                // Best-effort by design (the ledger answer must still go
+                // out), but a failed CRITICAL audit is never silent.
+                tracing::error!(
+                    request_id = %id_hex,
+                    error = %err,
+                    "INLINE_NOOP_UNEXPECTED critical audit append failed"
+                );
+            }
             return resolve_against_ledger(pool, request_id).await;
         }
         WorkerProcessResult::Rejected { reason } => {
@@ -539,11 +580,26 @@ pub async fn run(
                     document_state: DocState::ErrorRetryable,
                     report_xml: None,
                 }),
-                SendDisposition::ResolveReplay { .. } => {
+                SendDisposition::ResolveReplay { observed } => {
                     // No-wire idempotent re-entry / race (stage_send StateConflict
                     // / DocumentMissing): resolve the durable truth from the
-                    // ledger, never a phantom terminal 500.
-                    resolve_against_ledger(pool, request_id).await
+                    // ledger, never a phantom terminal 500.  On a TERMINAL
+                    // resolver verdict, also terminalise OUR lease (review
+                    // OCF-3/F2 — this arm owns the PROCESSING row, unlike the
+                    // Noop/NotNew arms which must not touch a foreign lease).
+                    tracing::warn!(
+                        request_id = %hex_encode_lower(&request_id),
+                        observed = ?observed,
+                        "inline send hit a no-wire replay/race; resolving from the ledger"
+                    );
+                    match resolve_against_ledger(pool, request_id).await {
+                        Ok(outcome) => Ok(outcome),
+                        Err(fe) => {
+                            terminalise_inbox(pool, row, "INLINE_RESOLVE_TERMINAL", code_of(&fe))
+                                .await?;
+                            Err(fe)
+                        }
+                    }
                 }
                 SendDisposition::Proceed { server_fiscal_no } => {
                     let attempt_no = sent_attempt_no
@@ -562,13 +618,30 @@ pub async fn run(
                             )
                             .await
                             {
-                                Ok(()) => Ok(FiscalOutcome {
-                                    document_id: doc_id,
-                                    fiscal_id: Some(server_fiscal_no),
-                                    fiscal_ts: None,
-                                    document_state: DocState::Ack,
-                                    report_xml: None,
-                                }),
+                                Ok(()) => {
+                                    // First-pass↔replay parity (review OCF-1):
+                                    // surface the `first_kvt1_at` stamp the
+                                    // advance just wrote (the Sent→Kvt1 CAS
+                                    // stamps it).  Best-effort read-only — a
+                                    // failed read degrades to fiscal_ts=None
+                                    // rather than failing an ACKed receipt.
+                                    let fiscal_ts =
+                                        fiscal_documents::terminal_outcome_by_request_id(
+                                            pool,
+                                            &request_id,
+                                        )
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|o| o.first_kvt1_at);
+                                    Ok(FiscalOutcome {
+                                        document_id: doc_id,
+                                        fiscal_id: Some(server_fiscal_no),
+                                        fiscal_ts,
+                                        document_state: DocState::Ack,
+                                        report_xml: None,
+                                    })
+                                }
                                 Err(ConfirmError::StructuralDrift { .. }) => {
                                     // The doc stays durably at `Sent` (the
                                     // advance envelopes rolled back). Terminalise
@@ -594,7 +667,21 @@ pub async fn run(
                                     // The advance envelope rolled back: the doc is
                                     // still durably `Sent`.  Resolve against the
                                     // ledger (→ 202), NEVER a blind terminal 500.
-                                    resolve_against_ledger(pool, request_id).await
+                                    // On a TERMINAL resolver verdict, terminalise
+                                    // OUR lease too (review OCF-3/F2).
+                                    match resolve_against_ledger(pool, request_id).await {
+                                        Ok(outcome) => Ok(outcome),
+                                        Err(fe) => {
+                                            terminalise_inbox(
+                                                pool,
+                                                row,
+                                                "INLINE_RESOLVE_TERMINAL",
+                                                code_of(&fe),
+                                            )
+                                            .await?;
+                                            Err(fe)
+                                        }
+                                    }
                                 }
                             }
                         }
