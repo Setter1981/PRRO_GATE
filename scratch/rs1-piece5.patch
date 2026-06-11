@@ -1,0 +1,1539 @@
+﻿diff --git a/rust/prro/src/config/mod.rs b/rust/prro/src/config/mod.rs
+index 9796a31..8e6672f 100644
+--- a/rust/prro/src/config/mod.rs
++++ b/rust/prro/src/config/mod.rs
+@@ -27,6 +27,15 @@ pub struct AppConfig {
+     /// HTTP ingress yet; live wiring lands in W4 supervisor.
+     #[serde(default)]
+     pub listeners: Vec<ListenerCfg>,
++
++    /// RS-1 (2026-05-30) тАФ runtime supervisor (composition root + boot
++    /// reconcile + drain/probe loops).  Optional + default-disabled:
++    /// existing M1-M3b configs with no `[supervisor]` section parse
++    /// unchanged and the binary stays M1-idle.  Turning it on is an
++    /// explicit config flip; rollback is the reverse flip, never a code
++    /// revert.
++    #[serde(default)]
++    pub supervisor: SupervisorCfg,
+ }
+ 
+ /// Per-listener ingress config.  W4-Z0 piece 9 architectural pin тАФ
+@@ -148,6 +157,158 @@ impl OfflineCfg {
+     }
+ }
+ 
++/// RS-1 тАФ runtime supervisor configuration.  The supervisor (Serve path)
++/// builds the composition root (per-FN `DpsChannel` + `SigningContext` via
++/// the operator key loader), runs boot reconciliation under the global
++/// reconcile mutex, then spawns the drain + return-online loops.
++///
++/// Gated by `enabled` (default **false**) so the binary ships M1-idle
++/// until the pilot DB + live DPS channel are validated.  This is the
++/// rollback seam: turning the supervisor on/off is a config flip, never a
++/// code revert.
++#[derive(Debug, Clone, Deserialize)]
++pub struct SupervisorCfg {
++    /// Master on/off for the runtime spine.  Default **false** = the
++    /// binary boots and idles (M1 behaviour) regardless of the other
++    /// fields.  Only when `true` does Serve construct the channel +
++    /// bindings + supervisor and spawn the loops.
++    #[serde(default)]
++    pub enabled: bool,
++
++    /// DPS fiscal-service wire config.  Validated at supervisor startup
++    /// (NOT at parse time) so a default-off binary with no `endpoint`
++    /// still boots unchanged.
++    #[serde(default)]
++    pub dps: DpsCfg,
++
++    /// Offline-backlog drain-ticker cadence (seconds).  **Raw value** тАФ
++    /// route boot callers through
++    /// [`SupervisorCfg::clamped_drain_interval_seconds`].  The per-FN
++    /// exponential-backoff gating lives inside
++    /// `drain_offline_backlog_scheduled`, so this is just the wake cadence.
++    #[serde(default = "default_drain_interval_seconds")]
++    pub drain_interval_seconds: u64,
++}
++
++impl Default for SupervisorCfg {
++    /// Hand-written (NOT derived) so a missing `[supervisor]` table yields
++    /// the same `drain_interval_seconds` as a present table with the field
++    /// omitted (a derived `Default` would give `0` тЖТ clamped to the floor).
++    fn default() -> Self {
++        Self {
++            enabled: false,
++            dps: DpsCfg::default(),
++            drain_interval_seconds: default_drain_interval_seconds(),
++        }
++    }
++}
++
++fn default_drain_interval_seconds() -> u64 {
++    60
++}
++
++/// Inclusive clamp bounds for the drain-ticker cadence.
++pub const DRAIN_INTERVAL_MIN_SECONDS: u64 = 5;
++pub const DRAIN_INTERVAL_MAX_SECONDS: u64 = 3600;
++
++impl SupervisorCfg {
++    /// Validate + clamp `drain_interval_seconds` to
++    /// `[DRAIN_INTERVAL_MIN_SECONDS, DRAIN_INTERVAL_MAX_SECONDS]`.  Returns
++    /// `(clamped_value, was_clamped)` for the WARN-audit pattern.
++    pub fn clamped_drain_interval_seconds(&self) -> (u64, bool) {
++        let raw = self.drain_interval_seconds;
++        let clamped = raw.clamp(DRAIN_INTERVAL_MIN_SECONDS, DRAIN_INTERVAL_MAX_SECONDS);
++        (clamped, clamped != raw)
++    }
++}
++
++/// DPS fiscal-service connection config.  RS-1 is **wire-only**:
++/// server-trust TLS (no client certificate) because DPS authentication is
++/// application-layer CMS, not mTLS.
++#[derive(Debug, Clone, Deserialize)]
++pub struct DpsCfg {
++    /// Endpoint URL, e.g. `https://cabinet.tax.gov.ua:9443`.
++    ///
++    /// **`Option`, not a required field.**  Absence is a parse-time
++    /// no-op so an `enabled = false` binary boots without it (operator
++    /// refinement 2026-05-30).  It is **fail-closed at supervisor
++    /// startup** via [`SupervisorCfg::require_dps_endpoint`], which errors
++    /// when `enabled = true` and the endpoint is missing/blank тАФ unlike
++    /// `secure_db_path`, which fails at parse time for ALL configs.
++    #[serde(default)]
++    pub endpoint: Option<String>,
++
++    /// Per-request gRPC deadline (seconds).  **Raw value** тАФ route boot
++    /// callers through [`DpsCfg::clamped_request_timeout_seconds`].
++    #[serde(default = "default_dps_request_timeout_seconds")]
++    pub request_timeout_seconds: u64,
++}
++
++fn default_dps_request_timeout_seconds() -> u64 {
++    30
++}
++
++impl Default for DpsCfg {
++    /// Hand-written (NOT derived) so that a missing `[supervisor.dps]`
++    /// table yields the SAME `request_timeout_seconds` as a present table
++    /// with the field omitted.  A derived `Default` would give `0`
++    /// (тЖТ clamped to the 1s floor), making the effective timeout depend
++    /// on whether the operator wrote the `[supervisor.dps]` header тАФ a
++    /// silent inconsistency.  Keep this in sync with the
++    /// `#[serde(default = ...)]` on `request_timeout_seconds`.
++    fn default() -> Self {
++        Self {
++            endpoint: None,
++            request_timeout_seconds: default_dps_request_timeout_seconds(),
++        }
++    }
++}
++
++/// Inclusive clamp bounds for the DPS per-request timeout.  Public so
++/// boot callers read the same source of truth.
++pub const DPS_REQUEST_TIMEOUT_MIN_SECONDS: u64 = 1;
++pub const DPS_REQUEST_TIMEOUT_MAX_SECONDS: u64 = 120;
++
++impl DpsCfg {
++    /// Validate + clamp `request_timeout_seconds` to
++    /// `[DPS_REQUEST_TIMEOUT_MIN_SECONDS, DPS_REQUEST_TIMEOUT_MAX_SECONDS]`.
++    /// Returns `(clamped_value, was_clamped)` so callers can emit a WARN
++    /// audit if the operator-supplied value was outside bounds.
++    pub fn clamped_request_timeout_seconds(&self) -> (u64, bool) {
++        let raw = self.request_timeout_seconds;
++        let clamped = raw.clamp(
++            DPS_REQUEST_TIMEOUT_MIN_SECONDS,
++            DPS_REQUEST_TIMEOUT_MAX_SECONDS,
++        );
++        (clamped, clamped != raw)
++    }
++}
++
++impl SupervisorCfg {
++    /// Fail-closed DPS endpoint resolution тАФ invoked **at supervisor
++    /// startup**, not at config parse time.  Returns:
++    /// - `Ok(None)` when the supervisor is disabled (binary stays M1-idle);
++    /// - `Ok(Some(endpoint))` when enabled with a non-blank endpoint;
++    /// - `Err` when `enabled = true` but the endpoint is missing/blank.
++    ///
++    /// The parse-vs-startup split is deliberate (operator refinement
++    /// 2026-05-30): a default-off binary must boot without a
++    /// `[supervisor.dps] endpoint`, while an *enabled* supervisor must
++    /// fail-closed rather than silently dial nothing.
++    pub fn require_dps_endpoint(&self) -> anyhow::Result<Option<String>> {
++        if !self.enabled {
++            return Ok(None);
++        }
++        match self.dps.endpoint.as_deref().map(str::trim) {
++            Some(ep) if !ep.is_empty() => Ok(Some(ep.to_string())),
++            _ => anyhow::bail!(
++                "supervisor.enabled = true but supervisor.dps.endpoint is missing or blank \
++                 (fail-closed: an enabled supervisor must have an explicit DPS endpoint)"
++            ),
++        }
++    }
++}
++
+ impl AppConfig {
+     pub fn from_toml(s: &str) -> anyhow::Result<Self> {
+         Ok(toml::from_str(s)?)
+@@ -203,4 +364,119 @@ mod tests {
+             "expected error mentioning secure_db_path, got: {msg}"
+         );
+     }
++
++    const BASE_CFG: &str = r#"
++        app_name = "prro"
++        version = "0.1.0"
++
++        [database]
++        db_path = "var/prro.db"
++        secure_db_path = "var/secure.db"
++
++        [admin_ui]
++        enabled = false
++        listen = "127.0.0.1:8081"
++    "#;
++
++    /// RS-1 Piece 1 тАФ a config with no `[supervisor]` section parses and
++    /// the supervisor is disabled by default; `require_dps_endpoint`
++    /// returns `Ok(None)` so the M1-idle binary boots without a DPS
++    /// endpoint (operator refinement: fail-closed ONLY when enabled).
++    #[test]
++    fn supervisor_absent_defaults_disabled_and_boots() {
++        let cfg = AppConfig::from_toml(BASE_CFG).expect("parse must succeed");
++        assert!(!cfg.supervisor.enabled, "supervisor disabled by default");
++        assert!(cfg.supervisor.dps.endpoint.is_none());
++        assert_eq!(
++            cfg.supervisor.require_dps_endpoint().expect("disabled = Ok"),
++            None,
++            "disabled supervisor needs no endpoint",
++        );
++    }
++
++    /// RS-1 Piece 1 тАФ an ENABLED supervisor with no DPS endpoint PARSES
++    /// (no parse-time failure, unlike secure_db_path) but fails closed at
++    /// supervisor startup.  This is the operator's parse-vs-startup split.
++    #[test]
++    fn supervisor_enabled_without_endpoint_parses_but_startup_fails() {
++        let toml = format!("{BASE_CFG}\n[supervisor]\nenabled = true\n");
++        let cfg = AppConfig::from_toml(&toml).expect("parse must succeed (no parse-time fail)");
++        assert!(cfg.supervisor.enabled);
++        let err = cfg
++            .supervisor
++            .require_dps_endpoint()
++            .expect_err("enabled + no endpoint must fail closed at startup");
++        assert!(
++            err.to_string().contains("endpoint"),
++            "expected endpoint error, got: {err}"
++        );
++    }
++
++    /// RS-1 Piece 1 тАФ an enabled supervisor with a (whitespace-padded)
++    /// endpoint resolves to the trimmed value.
++    #[test]
++    fn supervisor_enabled_with_endpoint_resolves() {
++        let toml = format!(
++            "{BASE_CFG}\n[supervisor]\nenabled = true\n[supervisor.dps]\nendpoint = \"  https://cabinet.tax.gov.ua:9443  \"\n"
++        );
++        let cfg = AppConfig::from_toml(&toml).expect("parse must succeed");
++        assert_eq!(
++            cfg.supervisor.require_dps_endpoint().expect("Ok"),
++            Some("https://cabinet.tax.gov.ua:9443".to_string()),
++        );
++    }
++
++    /// RS-1 Piece 1 (self-review LOW) тАФ a DISABLED supervisor ignores a
++    /// set endpoint: `require_dps_endpoint` short-circuits to `Ok(None)`
++    /// so the binary stays M1-idle regardless of `[supervisor.dps]`.
++    #[test]
++    fn supervisor_disabled_ignores_set_endpoint() {
++        let toml = format!(
++            "{BASE_CFG}\n[supervisor]\nenabled = false\n[supervisor.dps]\nendpoint = \"https://cabinet.tax.gov.ua:9443\"\n"
++        );
++        let cfg = AppConfig::from_toml(&toml).expect("parse must succeed");
++        assert!(!cfg.supervisor.enabled);
++        assert_eq!(
++            cfg.supervisor
++                .require_dps_endpoint()
++                .expect("disabled = Ok(None)"),
++            None,
++            "disabled supervisor ignores a set endpoint",
++        );
++    }
++
++    /// RS-1 Piece 1 тАФ DPS request timeout clamps to bounds + reports it.
++    #[test]
++    fn dps_request_timeout_clamps_out_of_range() {
++        let dps = DpsCfg {
++            endpoint: None,
++            request_timeout_seconds: 99_999,
++        };
++        let (clamped, was_clamped) = dps.clamped_request_timeout_seconds();
++        assert_eq!(clamped, DPS_REQUEST_TIMEOUT_MAX_SECONDS);
++        assert!(was_clamped);
++        // Default is in-range and not clamped.
++        let (def, def_clamped) = DpsCfg::default().clamped_request_timeout_seconds();
++        assert_eq!(def, default_dps_request_timeout_seconds());
++        assert!(!def_clamped);
++    }
++
++    /// RS-1 Piece 5a тАФ drain-ticker cadence clamps to bounds; the
++    /// hand-written Default keeps it in-range whether or not the table is
++    /// present.
++    #[test]
++    fn drain_interval_clamps_and_defaults_in_range() {
++        let sup = SupervisorCfg {
++            enabled: true,
++            dps: DpsCfg::default(),
++            drain_interval_seconds: 0,
++        };
++        let (clamped, was_clamped) = sup.clamped_drain_interval_seconds();
++        assert_eq!(clamped, DRAIN_INTERVAL_MIN_SECONDS);
++        assert!(was_clamped);
++
++        let (def, def_clamped) = SupervisorCfg::default().clamped_drain_interval_seconds();
++        assert_eq!(def, default_drain_interval_seconds());
++        assert!(!def_clamped);
++    }
+ }
+diff --git a/rust/prro/src/crypto/errors.rs b/rust/prro/src/crypto/errors.rs
+index 89b46fa..9f9ef78 100644
+--- a/rust/prro/src/crypto/errors.rs
++++ b/rust/prro/src/crypto/errors.rs
+@@ -10,7 +10,11 @@ use std::fmt;
+ 
+ #[derive(thiserror::Error)]
+ pub enum CryptoError {
+-    #[error("JKS unseal failed for operator {operator_id}: {reason:?}")]
++    // `operator_id` (the cashier INN) is PII (ADR-M2-5 ┬з4d) тАФ it is kept in
++    // the struct for audit enrichment but OMITTED from the Display message
++    // and redacted in the manual Debug below, so neither `%err` nor `?err`
++    // leaks it into process logs.
++    #[error("JKS unseal/extract failed: {reason:?}")]
+     JksUnseal {
+         operator_id: String,
+         reason: SealKind,
+@@ -29,11 +33,12 @@ impl fmt::Debug for CryptoError {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         match self {
+             Self::JksUnseal {
+-                operator_id,
++                operator_id: _,
+                 reason,
+             } => f
+                 .debug_struct("JksUnseal")
+-                .field("operator_id", operator_id)
++                // operator_id (INN) is PII тАФ redact from Debug too.
++                .field("operator_id", &"<redacted>")
+                 .field("reason", reason)
+                 .finish(),
+             Self::CmsSign { reason } => f.debug_struct("CmsSign").field("reason", reason).finish(),
+@@ -58,6 +63,12 @@ pub enum SealKind {
+     BadSalt,
+     MalformedJks,
+     KeyExtractionFailed,
++    /// The container decrypted/parsed successfully but carries NO signing
++    /// certificate (`KeyUsage=digitalSignature`) to embed.  Distinct from a
++    /// cryptographic failure тАФ the bytes were fine, the payload is just
++    /// unusable for signing.  Raised by `SigningSession::from_extracted`
++    /// and `unseal_jks` (both share the `signing_cert()` selection).
++    MissingSigningCert,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+diff --git a/rust/prro/src/crypto/session.rs b/rust/prro/src/crypto/session.rs
+index 7becba0..20c03d2 100644
+--- a/rust/prro/src/crypto/session.rs
++++ b/rust/prro/src/crypto/session.rs
+@@ -34,7 +34,9 @@ pub struct SealedMaterial<'a> {
+ impl std::fmt::Debug for SealedMaterial<'_> {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         f.debug_struct("SealedMaterial")
+-            .field("operator_id", &self.operator_id)
++            // operator_id is the cashier INN (PII) тАФ redact, uniform with
++            // SigningSession + CryptoError (ADR-M2-5 ┬з4d).
++            .field("operator_id", &"<redacted>")
+             .field("jks_bytes", &"<redacted>")
+             .field("jks_password_hex", &"<redacted>")
+             .field("cred_salt", &"<redacted>")
+@@ -63,7 +65,11 @@ struct SigningSessionInner {
+ impl std::fmt::Debug for SigningSession {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         f.debug_struct("SigningSession")
+-            .field("operator_id", &self.inner.operator_id)
++            // operator_id is the cashier INN (PII, ADR-M2-5 ┬з4d).  Redact:
++            // post-RS-1 the REAL INN is threaded into production sessions
++            // (the operator key loader), so `?session` in any tracing event
++            // would otherwise leak it to process logs.
++            .field("operator_id", &"<redacted>")
+             .field("param_d", &"<redacted>")
+             .field(
+                 "cert_der",
+@@ -110,6 +116,46 @@ impl SigningSession {
+             }),
+         }
+     }
++
++    /// Production constructor тАФ assemble a `SigningSession` from a key the
++    /// caller already obtained via
++    /// [`prro_crypto::interop::prro::containers::extract_private_key`].
++    ///
++    /// This is the M5 crypto-wiring path used by the runtime
++    /// `OperatorKeyLoader` (RS-1 Piece 3).  It sits alongside
++    /// [`unseal_jks`] but takes the extracted key directly тАФ sealing the
++    /// JKS password at-rest is a separate hardening task (tracked
++    /// follow-up), deliberately NOT done here.
++    ///
++    /// Embeds the SIGNING cert (`KeyUsage=digitalSignature`) via
++    /// [`ExtractedKey::signing_cert`] тАФ NEVER `certs[0]`, which is often
++    /// the key-agreement (encryption) cert and would make DPS reject the
++    /// signature `CryptBadSign` (live-confirmed 2026-05-29).  Moves the
++    /// `Zeroizing<[u8; 32]>` scalar into the session inner (no clone of the
++    /// 32 secret bytes).  `operator_id` (the cashier INN) is stored
++    /// verbatim тАФ no placeholder, no fallback.
++    pub fn from_extracted(
++        operator_id: String,
++        extracted: prro_crypto::interop::prro::containers::ExtractedKey,
++    ) -> Result<Self, CryptoError> {
++        let cert_der = extracted
++            .signing_cert()
++            .ok_or_else(|| CryptoError::JksUnseal {
++                operator_id: operator_id.clone(),
++                reason: SealKind::MissingSigningCert,
++            })?
++            .to_vec();
++        // Move the still-`Zeroizing<[u8; 32]>` scalar into the session
++        // inner тАФ no clone of the 32 secret bytes (mirrors `unseal_jks`).
++        let param_d: Zeroizing<[u8; 32]> = extracted.param_d;
++        Ok(Self {
++            inner: Arc::new(SigningSessionInner {
++                operator_id,
++                param_d,
++                cert_der,
++            }),
++        })
++    }
+ }
+ 
+ /// Unseal a JKS keystore + extract the DSTU private scalar.
+@@ -212,7 +258,9 @@ pub fn unseal_jks(sealed: SealedMaterial<'_>) -> Result<SigningSession, CryptoEr
+     //    "first cert is the signing cert" assumption was wrong).
+     let cert_der = extracted
+         .signing_cert()
+-        .ok_or_else(|| make_err(SealKind::KeyExtractionFailed))?
++        // Same no-signing-cert classification as `from_extracted`: the
++        // container decrypted/parsed fine, it just carries no signing cert.
++        .ok_or_else(|| make_err(SealKind::MissingSigningCert))?
+         .to_vec();
+ 
+     // Move the still-Zeroizing<[u8; 32]> into the session inner.  No
+@@ -235,3 +283,54 @@ fn hex_digit(c: u8) -> Option<u8> {
+         _ => None,
+     }
+ }
++
++#[cfg(test)]
++mod from_extracted_tests {
++    use super::*;
++    use prro_crypto::interop::prro::containers::{ContainerFormat, ExtractedKey};
++
++    /// RS-1 Piece 2 тАФ the operator_id (cashier INN) and the selected
++    /// signing cert are threaded verbatim into the session.  Operator
++    /// requirement: a test must prove operator_id reaches the
++    /// SigningSession (no placeholder / no fallback).
++    #[test]
++    fn from_extracted_threads_operator_id_and_cert() {
++        let ek = ExtractedKey {
++            format: ContainerFormat::Jks,
++            param_d: Zeroizing::new([7u8; 32]),
++            // Non-empty certs тЖТ signing_cert() falls back to certs[0]
++            // (no DER with a digitalSignature KeyUsage here, which is
++            // fine for this assembly test тАФ cert content is opaque to
++            // from_extracted).
++            certs: vec![vec![0x30, 0x03, 0x01, 0x02, 0x03]],
++        };
++        let s = SigningSession::from_extracted("INN-1234567890".to_string(), ek)
++            .expect("from_extracted must succeed with a cert present");
++        assert_eq!(
++            s.operator_id(),
++            "INN-1234567890",
++            "operator_id must reach the SigningSession verbatim",
++        );
++        assert_eq!(s.cert_der(), &[0x30, 0x03, 0x01, 0x02, 0x03]);
++    }
++
++    /// RS-1 Piece 2 тАФ an extracted key with NO certificate fails closed
++    /// (no signing cert to embed тЖТ never silently sign with nothing).
++    #[test]
++    fn from_extracted_no_cert_fails_closed() {
++        let ek = ExtractedKey {
++            format: ContainerFormat::Jks,
++            param_d: Zeroizing::new([0u8; 32]),
++            certs: vec![],
++        };
++        let err = SigningSession::from_extracted("INN-x".to_string(), ek)
++            .expect_err("no cert must fail closed");
++        assert!(matches!(
++            err,
++            CryptoError::JksUnseal {
++                reason: SealKind::MissingSigningCert,
++                ..
++            }
++        ));
++    }
++}
+diff --git a/rust/prro/src/main.rs b/rust/prro/src/main.rs
+index 60e3fc0..b8e5d59 100644
+--- a/rust/prro/src/main.rs
++++ b/rust/prro/src/main.rs
+@@ -358,15 +358,33 @@ async fn main() -> anyhow::Result<()> {
+         Cmd::Doctor { config } => prro::doctor::run(&config).await,
+         Cmd::Serve { config } => {
+             let app = boot_from_path_or_exit(&config).await;
+-            tracing::info!(
+-                version = env!("CARGO_PKG_VERSION"),
+-                "prro listening (M1 тАФ idle)"
+-            );
+-            // M3+ adds the supervisor + ingress shells.  M1 just idles.
+-            let signal_name = await_shutdown_signal().await?;
+-            tracing::info!(signal = signal_name, "shutting down");
+-            drop(app);
+-            Ok(())
++            if app.config().supervisor.enabled {
++                // RS-1 M3 тАФ runtime supervisor (composition root + boot
++                // recovery + drain/probe loops).  Gated by config; default
++                // off тЖТ the M1-idle branch below, byte-identical to before.
++                tracing::info!(
++                    version = env!("CARGO_PKG_VERSION"),
++                    "prro starting (M3 тАФ supervisor enabled)"
++                );
++                let shutdown = async {
++                    match await_shutdown_signal().await {
++                        Ok(sig) => tracing::info!(signal = sig, "shutting down"),
++                        Err(e) => {
++                            tracing::error!(error = %e, "signal wait failed; shutting down")
++                        }
++                    }
++                };
++                prro::runtime::supervisor::run(app, shutdown).await
++            } else {
++                tracing::info!(
++                    version = env!("CARGO_PKG_VERSION"),
++                    "prro listening (M1 тАФ idle; supervisor disabled)"
++                );
++                let signal_name = await_shutdown_signal().await?;
++                tracing::info!(signal = signal_name, "shutting down");
++                drop(app);
++                Ok(())
++            }
+         }
+         Cmd::Admin { cmd } => match cmd {
+             AdminCmd::ResetStopMode {
+diff --git a/rust/prro/src/runtime/bindings.rs b/rust/prro/src/runtime/bindings.rs
+index d994795..beb5aa7 100644
+--- a/rust/prro/src/runtime/bindings.rs
++++ b/rust/prro/src/runtime/bindings.rs
+@@ -138,10 +138,20 @@ impl KeyLoadFailure {
+ /// External audit Round 2 R2-4 explicitly flagged the trait boundary
+ /// as the weakest link in the password chain; this doc-block is the
+ /// load-bearing reminder for the M5 implementor.
++///
++/// # `operator_id`
++///
++/// `operator_id` is the authoritative cashier identity (the cashier's INN
++/// / ╨Ж╨Я╨Э) from the secure `operators` row.  It is **PII** тАФ the impl MUST
++/// NOT log it to process logs (journald/Loki); it may land only in the
++/// `audit_log`.  The production loader threads it verbatim into the
++/// returned `SigningContext`'s `SigningSession` (no placeholder/fallback)
++/// so a downstream consumer never gets a silently-wrong value.
+ #[async_trait]
+ pub trait OperatorKeyLoader: Send + Sync {
+     async fn load(
+         &self,
++        operator_id: &str,
+         key_path: &Path,
+         password: &[u8],
+     ) -> Result<SigningContext, KeyLoadFailure>;
+@@ -165,7 +175,7 @@ impl BindingsRegistry {
+     ///      b. Decode `key_pass_enc` via [`Coding::decode`]; on empty
+     ///      тЖТ emit `OPERATOR_KEY_LOAD_FAILED` Critical with
+     ///      `reason="EmptyEncoded"` + skip.
+-    ///      c. Call `loader.load(&key_path, &password)`.  On
++    ///      c. Call `loader.load(&operator_id, &key_path, &password)`.  On
+     ///      [`KeyLoadFailure`] тЖТ emit `OPERATOR_KEY_LOAD_FAILED`
+     ///      Critical with `reason=<variant>` + skip.
+     ///      d. On success тЖТ insert into registry.
+@@ -273,8 +283,13 @@ impl BindingsRegistry {
+                 }
+             };
+ 
+-            // Step 3c тАФ call loader.
+-            match loader.load(Path::new(&row.key_path), &password).await {
++            // Step 3c тАФ call loader.  Pass the authoritative cashier
++            // `operator_id` (INN) from the row so it is threaded verbatim
++            // into the SigningSession (never a placeholder).
++            match loader
++                .load(&row.operator_id, Path::new(&row.key_path), &password)
++                .await
++            {
+                 Ok(sign_ctx) => {
+                     inner.insert(
+                         row.fiscal_number.clone(),
+diff --git a/rust/prro/src/runtime/key_loader.rs b/rust/prro/src/runtime/key_loader.rs
+new file mode 100644
+index 0000000..45e2804
+--- /dev/null
++++ b/rust/prro/src/runtime/key_loader.rs
+@@ -0,0 +1,155 @@
++//! Production [`OperatorKeyLoader`] тАФ reads a per-FN JKS container +
++//! plaintext password and assembles a [`SigningContext`] backed by the
++//! in-process DSTU signer.  RS-1 Pieces 3 + 3b (the "M5 crypto wiring"
++//! the [`crate::runtime::bindings::OperatorKeyLoader`] stub anticipated).
++//!
++//! Ports the live-proven W4-Z3 path
++//! (`extract_private_key` тЖТ [`SigningSession::from_extracted`] тЖТ
++//! [`build_fn_sign`]), DPS-╨Д╨Т╨Я╨Ч-accepted 2026-05-29.
++//!
++//! **Hardening boundary:** the JKS password is handled FLAT (unsealed)
++//! here тАФ sealing it at-rest (a `cred_salt` column + seal/unseal
++//! pipeline) is a deliberate, separately-tracked follow-up, NOT done in
++//! this piece.
++
++use std::path::Path;
++use std::sync::Arc;
++use std::time::SystemTime;
++
++use async_trait::async_trait;
++use prro_crypto::cms::builder::{CmsBuildOptions, CmsError, CmsSigner};
++use prro_crypto::cms::profile::CmsProfile;
++use prro_crypto::cms::signer::DstuInProcessSigner;
++use prro_crypto::core::curve::Curve;
++use prro_crypto::core::field::FieldEl;
++use prro_crypto::interop::prro::containers::{extract_private_key, ContainerError};
++use prro_crypto::interop::prro::jks::JksError;
++
++use crate::crypto::in_process::InProcessProvider;
++use crate::crypto::provider::CryptoProvider;
++use crate::crypto::session::SigningSession;
++use crate::runtime::bindings::{KeyLoadFailure, OperatorKeyLoader};
++use crate::services::write_path::stage_sign::SigningContext;
++use crate::transports::dps::dto::CheckSignBlob;
++// NOTE: no `Zeroizing` import тАФ the loader borrows the caller's already-
++// zeroized password slice without making an owned copy.
++
++/// The DPS-proven CMS profile for the FN-sign blob + the operator
++/// signing context (DSTU-4145 sig + GOST-34.311 hash, curve PB-257).
++const FN_SIGN_PROFILE: CmsProfile = CmsProfile::Dstu4145WithGost34311Pb;
++
++/// Production cashier-key loader.  Stateless тАФ a single instance serves
++/// every FN (the per-FN identity arrives as `operator_id` + `key_path`
++/// per call).
++pub struct JksOperatorKeyLoader;
++
++#[async_trait]
++impl OperatorKeyLoader for JksOperatorKeyLoader {
++    async fn load(
++        &self,
++        operator_id: &str,
++        key_path: &Path,
++        password: &[u8],
++    ) -> Result<SigningContext, KeyLoadFailure> {
++        // Read the container bytes.  ENOENT / unreadable тЖТ FileNotFound.
++        let data = std::fs::read(key_path)
++            .map_err(|_| KeyLoadFailure::FileNotFound(key_path.to_path_buf()))?;
++
++        // `extract_private_key` wants `&str`.  The password is already a
++        // borrowed `&[u8]` into the caller's `Zeroizing` buffer (wiped on
++        // drop), so borrow a `&str` VIEW directly тАФ do NOT allocate an
++        // owned copy (`to_string()`/`Zeroizing<String>` would be an
++        // unnecessary SECOND copy of secret material; external review
++        // 2026-05-30).
++        let password_str = std::str::from_utf8(password)
++            .map_err(|_| KeyLoadFailure::Other("key password is not valid UTF-8".to_string()))?;
++
++        let extracted = extract_private_key(&data, password_str)
++            .map_err(|e| map_container_err(e, key_path))?;
++
++        // `from_extracted` selects the SIGNING cert (KeyUsage=
++        // digitalSignature тАФ NOT certs[0], the -14 `CryptBadSign` trap)
++        // and stores the real `operator_id` (cashier INN) verbatim.
++        // `from_extracted`'s only failure is a missing signing certificate.
++        // Use a FIXED, PII-free message: the `CryptoError` Debug embeds the
++        // `operator_id` (cashier INN), which must not land in a
++        // `KeyLoadFailure` string a future consumer might log/Display.
++        let session = SigningSession::from_extracted(operator_id.to_string(), extracted)
++            .map_err(|_| {
++                KeyLoadFailure::Other("no signing certificate in key container".to_string())
++            })?;
++
++        Ok(SigningContext {
++            provider: Arc::new(InProcessProvider::new()) as Arc<dyn CryptoProvider>,
++            session,
++            profile: FN_SIGN_PROFILE,
++        })
++    }
++}
++
++/// Map a `prro_crypto` container error to the loader's audit-friendly
++/// [`KeyLoadFailure`].  Only a bad JKS password is distinguishable as
++/// `WrongPassword`; every other parse/extract failure is `Other` (with a
++/// `Debug` rendering for the audit payload тАФ no secret bytes leak, the
++/// container errors carry only structural reasons).
++fn map_container_err(e: ContainerError, key_path: &Path) -> KeyLoadFailure {
++    match e {
++        ContainerError::Jks(JksError::BadPassword) => {
++            KeyLoadFailure::WrongPassword(key_path.to_path_buf())
++        }
++        other => KeyLoadFailure::Other(format!("{other:?}")),
++    }
++}
++
++/// Build the per-FN `CheckSignBlob` (the `rro_fn_sign` blob attached to
++/// `lastChk`/`statusRro`/`infoRro` read RPCs) тАФ a native ATTACHED
++/// CAdES-BES CMS over the **fiscal-number string**, signed with the
++/// session's key.  Ported verbatim from the live-proven W4-Z3
++/// `sign_fn_blob` (DPS ╨Д╨Т╨Я╨Ч-accepted 2026-05-29).
++///
++/// Reuses the already-loaded [`SigningSession`] (its `param_d` +
++/// embedded signing `cert_der`) тАФ no second JKS read.  The supervisor
++/// `attached: true` is load-bearing (the blob embeds the eContent, the
++/// ╨ж╨Ч╨Ю CAdES-BES sample shape); `signing_cert()` selection already
++/// happened inside `from_extracted`, so `session.cert_der()` is the
++/// correct signing cert.
++///
++/// # FRESHNESS тАФ do NOT cache the result across RPCs
++///
++/// `signing_time` is stamped `SystemTime::now()` at CALL time, so the
++/// returned `CheckSignBlob` is TIME-SENSITIVE.  The ╨д╨б╨Ъ╨Ю protocol requires
++/// `rro_fn_sign` to carry a time mark INSIDE the signed blob ("╨┐╤Ц╨┤╨┐╨╕╤Б╨░╨╜╨╕╨╣
++/// ╨╡╨╗╨╡╨║╤В╤А╨╛╨╜╨╜╨╕╨╝ ╨┐╤Ц╨┤╨┐╨╕╤Б╨╛╨╝ ╨╖ ╨┐╨╛╨╖╨╜╨░╤З╨║╨╛╤О ╤З╨░╤Б╤Г"; the read RPCs have NO separate
++/// timestamp field), and BOTH reference clients re-sign it FRESH on every
++/// read RPC (WebCheck deletes + re-signs `FN.xml.p7s` per `lastChk`;
++/// PRRODPS signs per call with a `now`-nonce) тАФ confirmed 2026-05-30.  A
++/// stale (boot-cached) `signingTime` is therefore non-conformant and risks
++/// DPS rejection.  The supervisor (RS-1 Piece 5) MUST build `fn_sign`
++/// fresh **per read-RPC / per probe-tick тАФ NOT once at boot into a
++/// long-lived map**.  Per-tick rebuild (the ~60s return-online probe /
++/// keepalive cadence) is sufficient тАФ uniqueness per individual RPC is not
++/// required.  Reconcile this with the existing
++/// `RuntimeView.fn_sign: &CheckSignBlob` (a cached blob) when wiring the
++/// loops in Piece 5.
++pub fn build_fn_sign(
++    session: &SigningSession,
++    fiscal_number: &str,
++) -> Result<CheckSignBlob, CmsError> {
++    let curve = Curve::dstu_pb_257();
++    let d = FieldEl::from_le_bytes(&session.param_d()[..], curve.mod_words);
++    let signer = DstuInProcessSigner::new(d);
++    let der = CmsSigner {
++        cert_der: session.cert_der(),
++        signer: &signer,
++        profile: FN_SIGN_PROFILE,
++    }
++    .sign_with(
++        fiscal_number.as_bytes(),
++        CmsBuildOptions {
++            attached: true,
++            signing_time: Some(SystemTime::now()),
++        },
++    )?
++    .cms_der;
++    Ok(CheckSignBlob(der))
++}
+diff --git a/rust/prro/src/runtime/mod.rs b/rust/prro/src/runtime/mod.rs
+index 4d3066c..7c53409 100644
+--- a/rust/prro/src/runtime/mod.rs
++++ b/rust/prro/src/runtime/mod.rs
+@@ -2,6 +2,8 @@ pub mod bindings;
+ pub mod bootstrap;
+ pub mod coding;
+ pub mod ingress;
++pub mod key_loader;
+ pub mod outgress;
+ pub mod singleton;
++pub mod supervisor;
+ pub mod tax_snapshot;
+diff --git a/rust/prro/src/runtime/supervisor.rs b/rust/prro/src/runtime/supervisor.rs
+new file mode 100644
+index 0000000..5dee24c
+--- /dev/null
++++ b/rust/prro/src/runtime/supervisor.rs
+@@ -0,0 +1,410 @@
++//! RS-1 Piece 5 тАФ the runtime supervisor / composition root.
++//!
++//! `Cmd::Serve` calls [`run`] ONLY when `config.supervisor.enabled` (default
++//! false тАФ the M1-idle rollback seam).  The supervisor:
++//!   1. validates the DPS endpoint (fail-closed) + opens the live channel;
++//!   2. builds the per-FN [`BindingsRegistry`] (operator EDS keys);
++//!   3. (5c) runs boot crash-recovery once under the global reconcile mutex;
++//!   4. (5d) spawns the drain + return-online tick loops, each rebuilding
++//!      `fn_sign` FRESH per tick (signingTime freshness тАФ see
++//!      [`crate::runtime::key_loader::build_fn_sign`]);
++//!   5. (5e) on the shutdown signal, flips a watch + joins all tasks before
++//!      dropping the [`App`] (graceful-shutdown invariant #9).
++//!
++//! It does NOT run an ingress server or a live write-path worker тАФ those are
++//! RS-2 / RS-3.  With `enabled = false` the binary stays byte-identical M1-idle.
++
++use std::collections::HashMap;
++use std::future::Future;
++use std::sync::Arc;
++use std::time::Duration;
++
++use tokio::sync::watch;
++use tokio::task::JoinHandle;
++use tokio::time::MissedTickBehavior;
++
++use crate::app::App;
++use crate::db::models::enums::Severity;
++use crate::db::repositories::audit_log;
++use crate::runtime::bindings::BindingsRegistry;
++use crate::runtime::key_loader::{build_fn_sign, JksOperatorKeyLoader};
++use crate::services::offline_sync::return_online_probe::run_tick_for_fn;
++use crate::services::reconciliation::{ReconciliationRuntime, RuntimeView};
++use crate::transports::dps::channel::DpsChannel;
++use crate::transports::dps::dto::CheckSignBlob;
++use crate::transports::dps::grpc::GrpcDpsChannel;
++
++/// Production entry тАФ build the live deps, then run the supervised loops.
++/// Called from `Cmd::Serve` when `app.config().supervisor.enabled` is true.
++///
++/// `shutdown` is awaited by the supervisor; when it resolves the loops are
++/// flipped off and joined before this returns (`Cmd::Serve` passes the
++/// SIGINT/SIGTERM future).  Connect failure is a HARD boot failure (operator
++/// decision: an enabled supervisor must reach DPS; this is the online wire
++/// path, not an offline fallback).
++pub async fn run<F>(app: App, shutdown: F) -> anyhow::Result<()>
++where
++    F: Future<Output = ()> + Send,
++{
++    let cfg = app.config().supervisor.clone();
++
++    // Fail-closed: an enabled supervisor MUST have an explicit DPS endpoint.
++    let endpoint = match cfg.require_dps_endpoint()? {
++        Some(ep) => ep,
++        // Defensive тАФ `Cmd::Serve` only calls `run` when enabled, but never
++        // panic on a production path.
++        None => anyhow::bail!("supervisor::run called with supervisor.enabled = false"),
++    };
++
++    let (timeout_secs, was_clamped) = cfg.dps.clamped_request_timeout_seconds();
++    if was_clamped {
++        tracing::warn!(
++            target: "prro::runtime::supervisor",
++            raw = cfg.dps.request_timeout_seconds,
++            clamped = timeout_secs,
++            "supervisor.dps.request_timeout_seconds out of bounds; clamped"
++        );
++    }
++
++    // Open the live DPS channel тАФ eager connect, hard-fail on a bad endpoint.
++    let dps: Arc<dyn DpsChannel> = Arc::new(
++        GrpcDpsChannel::connect(&endpoint, Duration::from_secs(timeout_secs))
++            .await
++            .map_err(|e| {
++                anyhow::anyhow!("supervisor: DPS connect to {endpoint} failed: {e:?}")
++            })?,
++    );
++
++    // Build the per-FN bindings (operator EDS keys) from the secure DB.
++    let registry = Arc::new(
++        BindingsRegistry::build_from_db(
++            app.db_secure(),
++            app.db(),
++            Arc::clone(&dps),
++            &JksOperatorKeyLoader,
++        )
++        .await?,
++    );
++
++    run_with_registry(app, registry, shutdown).await
++}
++
++/// Injectable seam тАФ run the supervised loops over a PRE-BUILT registry.
++/// Tests construct a stub-channel registry + a controllable `shutdown`,
++/// bypassing the live `GrpcDpsChannel::connect`.
++///
++/// Lifecycle:
++///   1. (5c) boot crash-recovery ONCE under the global reconcile mutex;
++///   2. (5d) spawn the drain + return-online tick loops тАФ each rebuilds
++///      `fn_sign` FRESH per tick (signingTime freshness) and iterates the
++///      registry's FNs; per-FN tick failures are logged, never fatal;
++///   3. (5e) await `shutdown`, flip the watch, then JOIN both loops before
++///      dropping the [`App`] тАФ no in-flight tick is cut (graceful-shutdown
++///      invariant #9; bounded by the DPS `request_timeout` the channel
++///      enforces on each wire call).
++pub async fn run_with_registry<F>(
++    app: App,
++    registry: Arc<BindingsRegistry>,
++    shutdown: F,
++) -> anyhow::Result<()>
++where
++    F: Future<Output = ()> + Send,
++{
++    tracing::info!(
++        target: "prro::runtime::supervisor",
++        operators = registry.len(),
++        "supervisor: running"
++    );
++
++    // тФАтФА 5c: boot crash-recovery ONCE, before any live loop тФАтФА
++    // A FRESH per-FN fn_sign for this one-shot pass (build_fn_sign stamps
++    // signingTime = now()).  Held in a LOCAL that outlives the reconcile
++    // call so the resolver can borrow from it тАФ a fn_sign built INSIDE the
++    // closure would dangle (the RuntimeView<'a> borrows it).
++    let fn_signs = build_fn_signs(&registry, "reconcile");
++    {
++        let resolver = |fn_id: &str| -> Option<RuntimeView<'_>> {
++            let b = registry.get(fn_id)?;
++            let s = fn_signs.get(fn_id)?;
++            Some(RuntimeView {
++                dps: b.dps.as_ref(),
++                signing_ctx: &b.sign_ctx,
++                fn_sign: s,
++            })
++        };
++        let summary = app
++            .reconcile_pending_with(ReconciliationRuntime::with_resolver(resolver))
++            .await?;
++        tracing::info!(
++            target: "prro::runtime::supervisor",
++            ?summary,
++            "supervisor: boot reconciliation complete"
++        );
++    }
++
++    // тФАтФА 5d: spawn the drain + return-online tick loops тФАтФА
++    // The FN set is fixed at registry build time (read-only post-boot), so
++    // collect the keys ONCE and hand each loop an owned copy тАФ sidesteps the
++    // `fns()` borrow vs per-iteration `get()` borrow dance inside the task.
++    let fn_ids: Vec<String> = registry.fns().map(|s| s.to_string()).collect();
++
++    let (drain_secs, drain_clamped) = app.config().supervisor.clamped_drain_interval_seconds();
++    if drain_clamped {
++        tracing::warn!(
++            target: "prro::runtime::supervisor",
++            raw = app.config().supervisor.drain_interval_seconds,
++            clamped = drain_secs,
++            "supervisor.drain_interval_seconds out of bounds; clamped"
++        );
++    }
++    let (probe_secs, probe_clamped) = app.config().offline.clamped_probe_interval_seconds();
++    if probe_clamped {
++        tracing::warn!(
++            target: "prro::runtime::supervisor",
++            raw = app.config().offline.return_online_probe_interval_seconds,
++            clamped = probe_secs,
++            "offline.return_online_probe_interval_seconds out of bounds; clamped"
++        );
++    }
++
++    // One watch channel fans the shutdown signal to BOTH loops; `biased`
++    // select makes the shutdown branch win even when a tick is ready.
++    let (shutdown_tx, shutdown_rx) = watch::channel(false);
++
++    let drain_handle = spawn_drain_loop(
++        app.clone(),
++        Arc::clone(&registry),
++        fn_ids.clone(),
++        Duration::from_secs(drain_secs),
++        shutdown_rx.clone(),
++    );
++    let probe_handle = spawn_probe_loop(
++        app.clone(),
++        Arc::clone(&registry),
++        fn_ids,
++        Duration::from_secs(probe_secs),
++        shutdown_rx,
++    );
++
++    tracing::info!(
++        target: "prro::runtime::supervisor",
++        drain_interval_secs = drain_secs,
++        probe_interval_secs = probe_secs,
++        "supervisor: drain + return-online loops running"
++    );
++
++    // 5e: await the external shutdown signal, then stop the loops.
++    shutdown.await;
++    tracing::info!(target: "prro::runtime::supervisor", "supervisor: shutdown signal received; stopping loops");
++
++    // Flip the watch тЖТ each loop exits at its next biased select poll.  We do
++    // NOT abort: a loop finishes its in-flight tick (bounded by the DPS
++    // request_timeout) so a drain is never cut mid-flight (invariant #9).
++    let _ = shutdown_tx.send(true);
++    if let Err(e) = drain_handle.await {
++        tracing::error!(target: "prro::runtime::supervisor", error = %e, "drain loop join failed (task panicked)");
++    }
++    if let Err(e) = probe_handle.await {
++        tracing::error!(target: "prro::runtime::supervisor", error = %e, "probe loop join failed (task panicked)");
++    }
++
++    tracing::info!(target: "prro::runtime::supervisor", "supervisor: shut down");
++    drop(app);
++    Ok(())
++}
++
++/// Build a fresh per-FN `fn_sign` map.  `build_fn_sign` stamps
++/// `signingTime = now()`, so this is rebuilt for EACH consuming pass (the
++/// one-shot reconcile here; per-tick by the loops in 5d) тАФ NEVER cached for
++/// the process lifetime.  An FN whose `fn_sign` build fails is skipped
++/// (logged) so one bad key defers that FN rather than killing the pass.
++fn build_fn_signs(registry: &BindingsRegistry, ctx: &str) -> HashMap<String, CheckSignBlob> {
++    let mut map = HashMap::new();
++    for fn_id in registry.fns() {
++        if let Some(b) = registry.get(fn_id) {
++            match build_fn_sign(&b.sign_ctx.session, fn_id) {
++                Ok(blob) => {
++                    map.insert(fn_id.to_string(), blob);
++                }
++                Err(e) => {
++                    tracing::warn!(
++                        target: "prro::runtime::supervisor",
++                        fiscal_number = fn_id,
++                        ctx,
++                        error = ?e,
++                        "fn_sign build failed; FN skipped this pass"
++                    );
++                }
++            }
++        }
++    }
++    map
++}
++
++/// Spawn the offline-backlog drain ticker тАФ one tokio task iterating every
++/// registered FN each `interval`.  `MissedTickBehavior::Skip` keeps a slow
++/// drain from queueing missed ticks; `biased` select makes shutdown win.
++fn spawn_drain_loop(
++    app: App,
++    registry: Arc<BindingsRegistry>,
++    fn_ids: Vec<String>,
++    interval: Duration,
++    mut shutdown_rx: watch::Receiver<bool>,
++) -> JoinHandle<()> {
++    tokio::spawn(async move {
++        let mut iv = tokio::time::interval(interval);
++        iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
++        loop {
++            tokio::select! {
++                biased;
++                changed = shutdown_rx.changed() => {
++                    if changed.is_err() || *shutdown_rx.borrow() {
++                        tracing::info!(target: "prro::runtime::supervisor", "drain loop: shutdown; exiting");
++                        return;
++                    }
++                }
++                _ = iv.tick() => {
++                    drain_tick(&app, &registry, &fn_ids).await;
++                }
++            }
++        }
++    })
++}
++
++/// One drain pass over all FNs.  Rebuilds `fn_sign` FRESH per FN (signingTime
++/// must be current at the wire call тАФ NEVER boot-cached) and routes through
++/// the backoff-gated [`App::drain_offline_backlog_scheduled`].  A per-FN
++/// `fn_sign` build failure or drain error is logged and skipped тАФ one bad FN
++/// never stops the others or kills the loop.
++async fn drain_tick(app: &App, registry: &BindingsRegistry, fn_ids: &[String]) {
++    for fn_id in fn_ids {
++        let Some(b) = registry.get(fn_id) else {
++            continue;
++        };
++        let fn_sign = match build_fn_sign(&b.sign_ctx.session, fn_id) {
++            Ok(s) => s,
++            Err(e) => {
++                tracing::warn!(
++                    target: "prro::runtime::supervisor",
++                    fiscal_number = fn_id,
++                    error = ?e,
++                    "drain tick: fn_sign build failed; FN skipped this tick"
++                );
++                continue;
++            }
++        };
++        let view = RuntimeView {
++            dps: b.dps.as_ref(),
++            signing_ctx: &b.sign_ctx,
++            fn_sign: &fn_sign,
++        };
++        match app.drain_offline_backlog_scheduled(fn_id, &view).await {
++            Ok(outcome) => {
++                tracing::debug!(
++                    target: "prro::runtime::supervisor",
++                    fiscal_number = fn_id,
++                    ?outcome,
++                    "drain tick complete"
++                );
++            }
++            Err(e) => {
++                tracing::error!(
++                    target: "prro::runtime::supervisor",
++                    fiscal_number = fn_id,
++                    error = ?e,
++                    "drain tick failed"
++                );
++            }
++        }
++    }
++}
++
++/// Spawn the return-online probe ticker тАФ one tokio task iterating every
++/// registered FN each `interval`.  Same skip/biased discipline as the drain
++/// loop.
++fn spawn_probe_loop(
++    app: App,
++    registry: Arc<BindingsRegistry>,
++    fn_ids: Vec<String>,
++    interval: Duration,
++    mut shutdown_rx: watch::Receiver<bool>,
++) -> JoinHandle<()> {
++    tokio::spawn(async move {
++        let mut iv = tokio::time::interval(interval);
++        iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
++        loop {
++            tokio::select! {
++                biased;
++                changed = shutdown_rx.changed() => {
++                    if changed.is_err() || *shutdown_rx.borrow() {
++                        tracing::info!(target: "prro::runtime::supervisor", "probe loop: shutdown; exiting");
++                        return;
++                    }
++                }
++                _ = iv.tick() => {
++                    probe_tick(&app, &registry, &fn_ids).await;
++                }
++            }
++        }
++    })
++}
++
++/// One return-online probe pass over all FNs.  Rebuilds `fn_sign` FRESH per FN
++/// then delegates to [`run_tick_for_fn`] (read-only over the wire тАФ flips
++/// `Offline тЖТ GoingOnline` on a reachable DPS; the W9b drain does the backlog
++/// flush + final `GoingOnline тЖТ Online`).  Mirrors the W8 return-online probe
++/// loop's CRITICAL-audit-on-infra-error contract (see
++/// [`crate::services::offline_sync::return_online_probe`]) so a DB/audit
++/// failure is durably visible, not merely traced.
++async fn probe_tick(app: &App, registry: &BindingsRegistry, fn_ids: &[String]) {
++    for fn_id in fn_ids {
++        let Some(b) = registry.get(fn_id) else {
++            continue;
++        };
++        let fn_sign = match build_fn_sign(&b.sign_ctx.session, fn_id) {
++            Ok(s) => s,
++            Err(e) => {
++                tracing::warn!(
++                    target: "prro::runtime::supervisor",
++                    fiscal_number = fn_id,
++                    error = ?e,
++                    "probe tick: fn_sign build failed; FN skipped this tick"
++                );
++                continue;
++            }
++        };
++        match run_tick_for_fn(app.db(), b.dps.as_ref(), fn_id, &fn_sign).await {
++            Ok(_) => {}
++            Err(e) => {
++                tracing::error!(
++                    target: "prro::runtime::supervisor",
++                    fiscal_number = fn_id,
++                    error = %e,
++                    "probe tick error (DB or audit insert failure)"
++                );
++                let payload = serde_json::json!({
++                    "fiscal_number": fn_id,
++                    "error": format!("{e:#}"),
++                });
++                if let Err(audit_err) = audit_log::append(
++                    app.db(),
++                    "return_online_probe",
++                    fn_id,
++                    "RETURN_ONLINE_PROBE_LOOP_ERROR",
++                    Severity::Critical,
++                    None,
++                    Some(&payload.to_string()),
++                )
++                .await
++                {
++                    tracing::error!(
++                        target: "prro::runtime::supervisor",
++                        audit_error = %audit_err,
++                        fiscal_number = fn_id,
++                        "probe tick: CRITICAL audit insert failed; loop continues"
++                    );
++                }
++            }
++        }
++    }
++}
+diff --git a/rust/prro/tests/bindings_registry_build.rs b/rust/prro/tests/bindings_registry_build.rs
+index f97d1e6..733ee38 100644
+--- a/rust/prro/tests/bindings_registry_build.rs
++++ b/rust/prro/tests/bindings_registry_build.rs
+@@ -38,10 +38,13 @@ struct AlwaysOkLoader;
+ impl OperatorKeyLoader for AlwaysOkLoader {
+     async fn load(
+         &self,
++        operator_id: &str,
+         _key_path: &Path,
+         _password: &[u8],
+     ) -> Result<SigningContext, KeyLoadFailure> {
+-        Ok(common::det_signing_ctx())
++        // Thread the operator_id through so the registry test can assert
++        // it reaches the SigningSession (RS-1 trait extension).
++        Ok(common::det_signing_ctx_for(operator_id))
+     }
+ }
+ 
+@@ -118,6 +121,21 @@ async fn happy_single_operator_lands_in_registry() {
+     assert_eq!(registry.len(), 1);
+     assert!(registry.get("4000000001").is_some());
+     assert!(registry.get("9999999999").is_none());
++
++    // RS-1 тАФ the authoritative operator_id (cashier INN) from the
++    // operators row threads through the loader into the SigningSession
++    // verbatim (no placeholder).  Guards against a future consumer
++    // silently reading a wrong/empty operator_id.
++    assert_eq!(
++        registry
++            .get("4000000001")
++            .unwrap()
++            .sign_ctx
++            .session
++            .operator_id(),
++        "OP-1",
++        "operator_id must reach the SigningSession verbatim",
++    );
+ }
+ 
+ #[tokio::test]
+diff --git a/rust/prro/tests/common/mod.rs b/rust/prro/tests/common/mod.rs
+index 4e915c4..7468e92 100644
+--- a/rust/prro/tests/common/mod.rs
++++ b/rust/prro/tests/common/mod.rs
+@@ -257,6 +257,17 @@ pub fn det_signing_ctx() -> SigningContext {
+     }
+ }
+ 
++/// Like [`det_signing_ctx`] but with a caller-supplied `operator_id`, so
++/// a loader/registry test can assert the id threads through into the
++/// `SigningSession` (RS-1 `OperatorKeyLoader` trait extension).
++pub fn det_signing_ctx_for(operator_id: &str) -> SigningContext {
++    SigningContext {
++        provider: Arc::new(DetCrypto) as Arc<dyn CryptoProvider>,
++        session: SigningSession::new_for_test(operator_id.to_string(), [0u8; 32], vec![]),
++        profile: prro_crypto::cms::profile::CmsProfile::Dstu4145WithGost34311Pb,
++    }
++}
++
+ /// Minimal `CheckAck` builder used by happy-path fixtures.
+ pub fn ack(id: &str) -> CheckAck {
+     CheckAck {
+diff --git a/rust/prro/tests/crypto_provider_smoke.rs b/rust/prro/tests/crypto_provider_smoke.rs
+index 1b39854..4c20bb0 100644
+--- a/rust/prro/tests/crypto_provider_smoke.rs
++++ b/rust/prro/tests/crypto_provider_smoke.rs
+@@ -28,13 +28,18 @@ fn signing_session_debug_is_redacted() {
+     // 32-byte ASCII canary so a successful redaction assertion below
+     // is unambiguous (no UTF-8 lossy mapping).
+     let secret: [u8; 32] = *b"super-secret-canary-32bytes-aaaa";
++    // "operator-1" stands in for the cashier INN (PII) that the RS-1 key
++    // loader now threads into PRODUCTION sessions тАФ Debug must NOT reveal it.
+     let session = SigningSession::new_for_test("operator-1".into(), secret, b"<cert-der>".to_vec());
+     let s = format!("{session:?}");
+     assert!(
+-        s.contains("operator-1"),
+-        "operator id should be visible: {s}"
++        !s.contains("operator-1"),
++        "operator_id (cashier INN / PII) must be redacted from Debug: {s}"
++    );
++    assert!(
++        s.contains("<redacted>"),
++        "operator_id + param_d should be redacted: {s}"
+     );
+-    assert!(s.contains("<redacted>"), "param_d should be redacted: {s}");
+     // No contiguous prefix of the canary may leak through Debug.
+     assert!(
+         !s.contains("super-secret-canary"),
+@@ -52,7 +57,12 @@ fn sealed_material_debug_is_redacted() {
+         cred_salt: &salt,
+     };
+     let s = format!("{mat:?}");
+-    assert!(s.contains("op-2"));
++    // operator_id is the cashier INN (PII) тАФ must be redacted, uniform
++    // with SigningSession.
++    assert!(
++        !s.contains("op-2"),
++        "operator_id (INN/PII) must be redacted: {s}"
++    );
+     assert!(s.contains("<redacted>"));
+     // No password / salt / jks-bytes substring may leak.
+     assert!(!s.contains("deadbeef"), "password leaked: {s}");
+diff --git a/rust/prro/tests/handler_503_on_missing_operator.rs b/rust/prro/tests/handler_503_on_missing_operator.rs
+index c04c77e..bdb0f07 100644
+--- a/rust/prro/tests/handler_503_on_missing_operator.rs
++++ b/rust/prro/tests/handler_503_on_missing_operator.rs
+@@ -52,6 +52,7 @@ struct UnreachableLoader;
+ impl OperatorKeyLoader for UnreachableLoader {
+     async fn load(
+         &self,
++        _operator_id: &str,
+         _key_path: &Path,
+         _password: &[u8],
+     ) -> Result<SigningContext, KeyLoadFailure> {
+diff --git a/rust/prro/tests/operator_key_load_failure_audits.rs b/rust/prro/tests/operator_key_load_failure_audits.rs
+index dbfc58b..5951785 100644
+--- a/rust/prro/tests/operator_key_load_failure_audits.rs
++++ b/rust/prro/tests/operator_key_load_failure_audits.rs
+@@ -42,6 +42,7 @@ struct FileNotFoundLoader;
+ impl OperatorKeyLoader for FileNotFoundLoader {
+     async fn load(
+         &self,
++        _operator_id: &str,
+         key_path: &Path,
+         _password: &[u8],
+     ) -> Result<SigningContext, KeyLoadFailure> {
+@@ -56,6 +57,7 @@ struct WrongPasswordLoader;
+ impl OperatorKeyLoader for WrongPasswordLoader {
+     async fn load(
+         &self,
++        _operator_id: &str,
+         key_path: &Path,
+         _password: &[u8],
+     ) -> Result<SigningContext, KeyLoadFailure> {
+diff --git a/rust/prro/tests/rs1_build_fn_sign.rs b/rust/prro/tests/rs1_build_fn_sign.rs
+new file mode 100644
+index 0000000..4f0fa10
+--- /dev/null
++++ b/rust/prro/tests/rs1_build_fn_sign.rs
+@@ -0,0 +1,41 @@
++//! RS-1 Piece 3b тАФ `build_fn_sign` produces a well-formed ATTACHED CMS.
++//!
++//! Closes the crypto-seam review LOW: in the pieces-2/3/3b commit
++//! `build_fn_sign` had no caller and no test (its only consumer is the
++//! not-yet-landed Piece-5 supervisor).  This locks the structural
++//! contract (attached CAdES-BES over the FN string, no panic, non-trivial
++//! DER) against a future regression (e.g. an edit flipping `attached`).
++//!
++//! Uses a real DER DSTU-4145 cert fixture so the CMS `SignerInfo`
++//! issuer/serial parse exercises the real path.  The private scalar is
++//! arbitrary тАФ this proves WELL-FORMEDNESS, not on-wire DPS acceptance
++//! (that is the live-DPS smoke's job, owed to WL-2).
++
++use prro::crypto::session::SigningSession;
++use prro::runtime::key_loader::build_fn_sign;
++
++const FIXTURE_CERT_DER: &[u8] = include_bytes!("fixtures/SELF_SIGNED_ENC_6929.cer");
++
++#[test]
++fn build_fn_sign_produces_wellformed_attached_cms() {
++    let session =
++        SigningSession::new_for_test("OP-1".to_string(), [7u8; 32], FIXTURE_CERT_DER.to_vec());
++
++    let blob = build_fn_sign(&session, "4000000001")
++        .expect("build_fn_sign must produce a CMS over a valid cert");
++
++    // Attached CAdES-BES CMS is a top-level ASN.1 SEQUENCE (DER tag 0x30).
++    assert_eq!(
++        blob.0.first(),
++        Some(&0x30),
++        "CMS DER must start with a SEQUENCE tag"
++    );
++    // `attached: true` embeds the FN eContent + the 525-byte cert + signed
++    // attrs + signature, so the blob must exceed the embedded cert alone.
++    assert!(
++        blob.0.len() > FIXTURE_CERT_DER.len(),
++        "attached CMS must exceed the embedded cert ({} bytes), got {}",
++        FIXTURE_CERT_DER.len(),
++        blob.0.len(),
++    );
++}
+diff --git a/rust/prro/tests/rs1_supervisor_boot.rs b/rust/prro/tests/rs1_supervisor_boot.rs
+new file mode 100644
+index 0000000..285b633
+--- /dev/null
++++ b/rust/prro/tests/rs1_supervisor_boot.rs
+@@ -0,0 +1,179 @@
++//! RS-1 Piece 5 тАФ supervisor boot-to-shutdown integration test.
++//!
++//! 5a: the `run_with_registry` seam builds over a (here empty) registry,
++//! awaits the shutdown future, and returns cleanly (dropping the App).
++//! This file GROWS with reconcile-once (5c) + the drain/probe loops (5d) +
++//! the watch-flip-and-join graceful shutdown (5e).
++
++mod common;
++
++use std::path::Path;
++use std::sync::Arc;
++use std::time::Duration;
++
++use async_trait::async_trait;
++use prro::config::AppConfig;
++use prro::crypto::session::SigningSession;
++use prro::db::models::enums::FiscalMode;
++use prro::db::repositories::{fiscal_number_config as fn_cfg, operators as ops_repo};
++use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
++use prro::runtime::coding::Coding;
++use prro::runtime::supervisor;
++use prro::services::write_path::stage_sign::SigningContext;
++use prro::transports::dps::channel::DpsChannel;
++use prro::App;
++
++/// Real DER DSTU-4145 cert so per-tick `build_fn_sign` produces a well-formed
++/// CMS (the scalar is arbitrary тАФ well-formedness, not on-wire acceptance).
++const FIXTURE_CERT_DER: &[u8] = include_bytes!("fixtures/SELF_SIGNED_ENC_6929.cer");
++
++fn cfg_toml(dir: &Path) -> String {
++    let db = dir.join("main.db");
++    let secure = dir.join("secure.db");
++    format!(
++        r#"
++app_name = "prro"
++version = "0.1.0"
++
++[database]
++db_path = "{}"
++secure_db_path = "{}"
++
++[admin_ui]
++enabled = false
++listen = "127.0.0.1:8081"
++"#,
++        db.display(),
++        secure.display()
++    )
++}
++
++/// A loader that panics if ever called тАФ the empty-registry test asserts
++/// it is NOT reached (no operators rows тЖТ no key load).
++struct NoLoader;
++
++#[async_trait]
++impl OperatorKeyLoader for NoLoader {
++    async fn load(
++        &self,
++        _operator_id: &str,
++        _key_path: &Path,
++        _password: &[u8],
++    ) -> Result<SigningContext, KeyLoadFailure> {
++        panic!("NoLoader: build_from_db reached key load with no operators row");
++    }
++}
++
++#[tokio::test]
++async fn supervisor_run_with_empty_registry_awaits_shutdown_and_returns() {
++    let dir = tempfile::tempdir().expect("tempdir");
++    let cfg = AppConfig::from_toml(&cfg_toml(dir.path())).expect("parse cfg");
++    let app = App::boot(cfg).await.expect("boot");
++
++    let dps: Arc<dyn DpsChannel> = Arc::new(common::StubDpsChannel::new(Ok(common::ack("t"))));
++    let registry = Arc::new(
++        BindingsRegistry::build_from_db(app.db_secure(), app.db(), dps, &NoLoader)
++            .await
++            .expect("build_from_db"),
++    );
++    assert_eq!(registry.len(), 0, "no operators seeded тЖТ empty registry");
++
++    // Immediate shutdown тЖТ run_with_registry must return cleanly (drops App).
++    let res = supervisor::run_with_registry(app, registry, async {}).await;
++    assert!(res.is_ok(), "supervisor must shut down cleanly: {res:?}");
++}
++
++/// A loader that returns a SigningContext whose session carries the REAL cert
++/// fixture, so the supervisor's per-tick `build_fn_sign` succeeds and the
++/// drain/probe tick bodies are actually exercised (the empty-cert
++/// `det_signing_ctx_for` would make `build_fn_sign` fail тЖТ FN skipped).
++struct FixtureLoader;
++
++#[async_trait]
++impl OperatorKeyLoader for FixtureLoader {
++    async fn load(
++        &self,
++        operator_id: &str,
++        _key_path: &Path,
++        _password: &[u8],
++    ) -> Result<SigningContext, KeyLoadFailure> {
++        let mut ctx = common::det_signing_ctx_for(operator_id);
++        ctx.session =
++            SigningSession::new_for_test(operator_id.to_string(), [7u8; 32], FIXTURE_CERT_DER.to_vec());
++        Ok(ctx)
++    }
++}
++
++fn fn_config(fn_id: &str) -> fn_cfg::NewFnConfig {
++    fn_cfg::NewFnConfig {
++        fiscal_number: fn_id.into(),
++        tax_number: "12345678".into(),
++        vat_payer_inn: None,
++        fiscal_mode: FiscalMode::Test,
++        org_name: None,
++        point_name: None,
++        org_address: None,
++        tsp_enabled: false,
++        offline_enabled: true,
++        national_check_enabled: true,
++        min_offline_codes: 0,
++        max_offline_codes: 0,
++    }
++}
++
++fn new_op(operator_id: &str, fn_id: &str, key_path: &str, password: &[u8]) -> ops_repo::NewOperator {
++    ops_repo::NewOperator {
++        operator_id: operator_id.into(),
++        fiscal_number: fn_id.into(),
++        name: "Cashier".into(),
++        key_path: key_path.into(),
++        key_pass_enc: Coding::encode(password).expect("encode test password"),
++    }
++}
++
++/// 1-FN happy path: boot reconcile-once + spawn the drain + probe loops over a
++/// single registered FN (real cert тЖТ `build_fn_sign` succeeds), let the
++/// immediate first tick of each loop run, then signal shutdown.  Asserts the
++/// supervisor joins both loops and returns cleanly тАФ no hang, no panic.
++///
++/// The node defaults to `Online` (reconcile seeds it), so the probe tick skips
++/// before any wire call and the empty backlog makes the drain tick a no-op;
++/// this test exercises the supervisor WIRING (resolver/fn_sign freshness +
++/// watch-flip-join lifecycle), not the primitives (covered by W8/W9b tests).
++#[tokio::test]
++async fn supervisor_runs_loops_over_one_fn_and_shuts_down_cleanly() {
++    let dir = tempfile::tempdir().expect("tempdir");
++    let cfg = AppConfig::from_toml(&cfg_toml(dir.path())).expect("parse cfg");
++    let app = App::boot(cfg).await.expect("boot");
++
++    fn_cfg::insert(app.db(), &fn_config("4000000001"))
++        .await
++        .expect("seed FN config");
++    ops_repo::insert(
++        app.db_secure(),
++        &new_op("OP-1", "4000000001", "/tmp/k1.dat", b"secret1"),
++    )
++    .await
++    .expect("seed operator");
++
++    let dps: Arc<dyn DpsChannel> = Arc::new(common::StubDpsChannel::new(Ok(common::ack("t"))));
++    let registry = Arc::new(
++        BindingsRegistry::build_from_db(app.db_secure(), app.db(), dps, &FixtureLoader)
++            .await
++            .expect("build_from_db"),
++    );
++    assert_eq!(registry.len(), 1, "one operator seeded тЖТ one FN");
++
++    // Delayed shutdown lets the immediate first drain+probe tick run (each
++    // rebuilds fn_sign FRESH over the real cert) before the loops stop.
++    let shutdown = async {
++        tokio::time::sleep(Duration::from_millis(200)).await;
++    };
++    let res = tokio::time::timeout(
++        Duration::from_secs(5),
++        supervisor::run_with_registry(app, registry, shutdown),
++    )
++    .await
++    .expect("supervisor must not hang on the shutdown join");
++    assert!(res.is_ok(), "supervisor must shut down cleanly: {res:?}");
++}

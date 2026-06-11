@@ -12,10 +12,12 @@ readme = "README.md"
 
 [lib]
 name = "prro_crypto"
-crate-type = ["cdylib", "rlib"]
+# rlib only: the "cdylib" target existed solely for the pyo3 extension
+# module of the dead Python contour (removed 2026-06-11 with the
+# `python` feature — RUSTSEC-2025-0020 root removal).
+crate-type = ["rlib"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 num-bigint = "0.4"
 num-traits = "0.2"
 sha1 = "0.10"
@@ -50,7 +52,6 @@ ureq = { version = "2.10", default-features = false, features = ["tls"], optiona
 
 [features]
 default = ["tsp_http"]
-python = ["pyo3"]
 # Enables `cms::tsp::fetch_timestamp` — a blocking HTTP TSP client.
 # Turn off for no-network embeddings (the ASN.1 encoder/parser stays
 # available either way).

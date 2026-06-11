@@ -1,0 +1,10 @@
+# cargo-audit policy (CI gate: .github/workflows/supply-chain.yml)
+[advisories]
+ignore = [
+    # rsa 0.9 Marvin timing side-channel (no fixed release exists).
+    # Pulled transitively by `cms` for CMS RSA support; this gateway
+    # signs DSTU 4145 exclusively — no RSA key operations are ever
+    # executed, so the decryption-oracle precondition cannot occur.
+    # Re-evaluate when RustCrypto ships a fixed rsa release.
+    "RUSTSEC-2023-0071",
+]

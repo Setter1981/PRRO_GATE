@@ -41,12 +41,12 @@ pub enum SignerError {
 /// Interop adapters (e.g. for consumers that expect the legacy jkurwa
 /// `short_sign` form of `[0x04, len, r, s]`) should wrap the raw bytes
 /// at the adapter layer, not inside the trait.
-/// `Send + Sync` bound lets the builder run inside
-/// `Python::allow_threads(|| ...)` — the pyo3 bindings release the GIL
-/// across full CMS sign and the signer reference has to cross into the
-/// thread-external closure. All in-process signers we ship today
-/// (`DstuInProcessSigner`) are naturally thread-safe; remote/HSM
-/// signers must uphold the same bound.
+/// `Send + Sync` bound lets the builder cross thread boundaries — the
+/// gateway runs full CMS signs inside `tokio::task::spawn_blocking`
+/// (panic containment, see `in_process.rs`), so the signer reference
+/// must travel into the blocking closure. All in-process signers we
+/// ship today (`DstuInProcessSigner`) are naturally thread-safe;
+/// remote/HSM signers must uphold the same bound.
 pub trait RawSigner: Send + Sync {
     /// Sign a pre-hashed digest.
     ///

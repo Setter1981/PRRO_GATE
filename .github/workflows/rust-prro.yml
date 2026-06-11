@@ -104,6 +104,11 @@ jobs:
         with:
           workspaces: rust
 
+      # Parallel per-binary test runner — ~2× wall-clock vs `cargo test`
+      # (measured 300s→150s locally, 2026-06-11).  No crate in the
+      # workspace has doc-tests, so nothing is silently skipped.
+      - uses: taiki-e/install-action@nextest
+
       - name: Build
         working-directory: rust
         run: cargo build -p prro --target ${{ matrix.target }} --locked
@@ -124,7 +129,7 @@ jobs:
         # call `boot_phase::run_boot_reconciliation` via the W2
         # ReconcileGuard test seam (M3b structural enforcement of
         # ADR-M3-A10). Production builds do NOT enable this feature.
-        run: cargo test -p prro --target ${{ matrix.target }} --features test-support --locked
+        run: cargo nextest run -p prro --target ${{ matrix.target }} --features test-support --locked
 
       - name: Test prro_crypto (vectors, dudect CT, backend differential)
         if: matrix.target != 'x86_64-unknown-linux-musl'
@@ -134,7 +139,7 @@ jobs:
         # portable↔pclmul backend differential) previously ran only by hand.
         # Per-target matters here: x86 exercises the PCLMUL backend, aarch64
         # the portable one. ~70s warm on a dev box.
-        run: cargo test -p prro_crypto --target ${{ matrix.target }} --locked
+        run: cargo nextest run -p prro_crypto --target ${{ matrix.target }} --locked
 
       - name: Test (musl built for target, executed on host gnu)
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -143,4 +148,4 @@ jobs:
         # above proves the target compiles; tests run via host gnu because
         # GH ubuntu-latest doesn't ship a musl libc by default.
         # --features test-support: see W2 note on the cross-target step.
-        run: cargo test -p prro --features test-support --locked
+        run: cargo nextest run -p prro --features test-support --locked
