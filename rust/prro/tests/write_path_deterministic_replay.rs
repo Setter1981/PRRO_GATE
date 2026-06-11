@@ -3152,3 +3152,87 @@ async fn fixture_1c_prepared_replay_payload_json_drift_holds() {
         "stage_sign must NOT run on payload_json drift"
     );
 }
+
+// ─── M1-02 fix pin (architect ruling item 2(b), 2026-06-11) ───────────
+//
+// A SENT doc was provably DPS-acked.  With TWO SENT docs A(older) + B(newer)
+// both crashed before KVT1, the boot loop probes each against its OWN
+// server_fiscal_no; DPS's FN-scoped last_chk returns the TIP (B's id), so A
+// gets a Mismatch.  The old arm terminalised A → RequiresManualReconciliation
+// (false-escalation of a healthy acked receipt).  The fix: A's lnd < the FN's
+// max submitted lnd ⇒ SUPERSEDED ⇒ held SENT + TIP_SUPERSEDED audit, NOT
+// Manual.  B is the actual tip ⇒ Match ⇒ KVT1.
+#[tokio::test]
+async fn fixture_5b_sent_mismatch_superseded_is_not_terminalised() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    // A older (lnd=1, sfn SFN-A), B newer (lnd=2, sfn SFN-B) — both acked SENT.
+    // Raw-seed (no shift) so two SENT docs can coexist on ONE FN; the
+    // SENT-recovery probe path needs neither shift nor cashier.
+    async fn seed_sent(pool: &SqlitePool, fn_id: &str, b: u8, lnd: i64, sfn: &str) -> DocumentId {
+        sqlx::query(
+            "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+                state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+                payload_json, payload_sha256_canonical, server_fiscal_no) \
+             VALUES (?, ?, ?, ?, 'SELL', 'SENT', 'b1', 't1', 'ONLINE', '2026-01-01T00:00:00Z', \
+                '{}', ?, ?)",
+        )
+        .bind(vec![b; 16])
+        .bind(vec![b ^ 0xFF; 16])
+        .bind(fn_id)
+        .bind(lnd)
+        .bind(vec![0u8; 32])
+        .bind(sfn)
+        .execute(pool)
+        .await
+        .expect("seed SENT doc");
+        DocumentId::from_bytes([b; 16])
+    }
+    let doc_a = seed_sent(app.db(), fn_id, 0x01, 1, "SFN-A").await;
+    let doc_b = seed_sent(app.db(), fn_id, 0x02, 2, "SFN-B").await;
+
+    // DPS's FN tip is B's id; both probes (A then B, by lnd) read it.
+    let stub = StubDpsChannel::new(Ok(ack("unused-send")))
+        .with_last_chk_queue(vec![Ok(ack("SFN-B")), Ok(ack("SFN-B"))]);
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile_pending_with green");
+
+    // A is superseded (older than the tip) → held SENT, NOT Manual.
+    assert_eq!(
+        doc_state(app.db(), doc_a).await,
+        "SENT",
+        "superseded older SENT doc is held, NOT terminalised to Manual (M1-02)"
+    );
+    // B is the tip → Match → KVT1.
+    assert_eq!(
+        doc_state(app.db(), doc_b).await,
+        "KVT1",
+        "the actual tip doc advances on Match"
+    );
+    assert_eq!(summary.docs_advanced.sent_mismatch_superseded, 1);
+    assert_eq!(summary.docs_advanced.sent_match_to_kvt1, 1);
+    assert_eq!(
+        summary.docs_advanced.sent_mismatch_to_manual, 0,
+        "no false Manual terminalisation of an acked receipt (M1-02 fix)"
+    );
+    assert_eq!(audit_count(app.db(), "TIP_SUPERSEDED").await, 1);
+    let rm: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE state = 'REQUIRES_MANUAL_RECONCILIATION'",
+    )
+    .fetch_one(app.db())
+    .await
+    .unwrap();
+    assert_eq!(rm, 0, "no doc terminalised to Manual (M1-02 fix)");
+}

@@ -1203,6 +1203,8 @@ async fn run_one_attempt(
                     backend_profile_id: inputs.backend_profile_id.clone(),
                     transport_profile_id: inputs.transport_profile_id.clone(),
                     request_envelope_sha256: envelope_hash,
+                    // M1 item 4: a real `send_chk` submit, not a probe.
+                    is_probe: false,
                 },
             )
             .await?;

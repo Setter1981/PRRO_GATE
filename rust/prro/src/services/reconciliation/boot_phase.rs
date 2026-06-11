@@ -162,6 +162,15 @@ pub struct DispatchHistogram {
     /// Doc transitioned Sent → RequiresManualReconciliation via the
     /// W11 prep-PR whitelist edge (operator handoff per W0-3 §6.4-b).
     pub sent_mismatch_to_manual: usize,
+    /// M1-02 fix (architect ruling item 2(b), 2026-06-11) — SENT crash-recovery
+    /// probe `Mismatch` where the probed doc is NOT the FN's newest submitted
+    /// doc (its `lnd` < `max_submitted_lnd`).  It was provably DPS-acked (SENT
+    /// ⇒ `WireDecision::Sent`) and merely SUPERSEDED by a newer submitted doc
+    /// that became DPS's `last_chk` tip — so it is NOT terminalised to Manual.
+    /// No document-state change; probe trace completed + `TIP_SUPERSEDED` audit;
+    /// doc stays SENT for later doc-scoped confirmation (deferred B1-v2 proto).
+    /// Counts as an answered wire exchange (the probe got a Mismatch reply).
+    pub sent_mismatch_superseded: usize,
     /// W11 PR-2b — SENT crash-recovery, `ProbeOutcome::NotFound` arm.
     /// Doc transitioned Sent → ErrorRetryable; tick-2 of two-tick
     /// retry path (ADR-M3-A9 step 3) re-drives via Pattern B.
@@ -261,6 +270,20 @@ pub struct DispatchHistogram {
     /// remediate via reissue.  Engineering-tier signal; spikes here
     /// require ingress / dispatcher investigation.
     pub signer_refused_structural_bug: usize,
+    /// M1-01 fix (architect ruling batch item 1, 2026-06-11) — a stage_send
+    /// dispatch that returned `StageSendOutcome::StateConflict` (4-pre CAS saw
+    /// the doc outside the send allowlist; "Stage 4 did NOT call send_chk").
+    /// **Zero wire** — deliberately EXCLUDED from [`answered_wire_contact`] so
+    /// the boot stale-tip guard still runs (the M1-01 bug was this outcome being
+    /// absorbed into `*_dispatched` via the old `Ok(_)` catch-all, falsely
+    /// suppressing the guard).  Shared across the SIGNED / ERROR_RETRYABLE /
+    /// PREPARED dispatch sites.
+    pub dispatch_state_conflict: usize,
+    /// M1-01 fix — a stage_send dispatch that returned
+    /// `StageSendOutcome::DocumentMissing` (doc row absent at 4-pre; "Stage 4
+    /// did NOT call send_chk").  **Zero wire** — EXCLUDED from
+    /// [`answered_wire_contact`].  Shared across the three dispatch sites.
+    pub dispatch_document_missing: usize,
 }
 
 impl DispatchHistogram {
@@ -278,6 +301,7 @@ impl DispatchHistogram {
             + self.error_retryable_dispatched
             + self.sent_match_to_kvt1
             + self.sent_mismatch_to_manual
+            + self.sent_mismatch_superseded
             + self.sent_not_found_to_error_retryable
             + self.sent_probe_failure_deferred
             + self.prepared_dispatched
@@ -291,6 +315,8 @@ impl DispatchHistogram {
             + self.dispatch_errors
             + self.signer_refused_mismatch
             + self.signer_refused_structural_bug
+            + self.dispatch_state_conflict
+            + self.dispatch_document_missing
     }
 
     /// PR-B (RS-4 audit pass-2, architect ruling on the trigger-scope
@@ -319,10 +345,17 @@ impl DispatchHistogram {
     /// can involve a DPS wire call MUST be classified here (counted iff it
     /// implies an *answered* exchange).
     ///
-    /// **Known approximation (documented residual):** the three `*_dispatched`
-    /// buckets count a `send_chk` regardless of whether it was *answered* or
-    /// *transport-failed* — the histogram does not split the two without a
-    /// hot-path change.  A transport-failed send leaves its doc in
+    /// **M1-01 fix (batch item 1, 2026-06-11):** the three `*_dispatched` buckets
+    /// now count ONLY `StageSendOutcome::{Sent, Routed}` — i.e. a real wire
+    /// exchange (`Sent` ack, or `Routed` = `send_chk` returned a `DpsError`).
+    /// The zero-wire `StateConflict` / `DocumentMissing` outcomes (which the old
+    /// `Ok(_)` catch-all silently absorbed into `*_dispatched`, falsely
+    /// suppressing the guard) are split into `dispatch_state_conflict` /
+    /// `dispatch_document_missing` below and are NOT counted here. See
+    /// [`classify_send_dispatch`] (exhaustive — a new variant is a compile error).
+    ///
+    /// **Residual (documented):** `Routed` still includes a *transport-failed*
+    /// send (no ack), which counts as answered; such a doc lands in
     /// `ErrorRetryable` (NOT the submitted-tip set), so the only residual gap is
     /// "a prior submitted tip + a brand-new transport-failed send this boot",
     /// where the guard is skipped one boot early and the next boot re-covers it.
@@ -334,6 +367,7 @@ impl DispatchHistogram {
             // Answered probes — Match / Mismatch / NotFound.
             || self.sent_match_to_kvt1 > 0
             || self.sent_mismatch_to_manual > 0
+            || self.sent_mismatch_superseded > 0
             || self.sent_not_found_to_error_retryable > 0
         // NOT counted (no answered DPS exchange):
         //   - sent_probe_failure_deferred — TransportRetry/Decode probe (no answer).
@@ -346,6 +380,8 @@ impl DispatchHistogram {
         //     probe_deferred,indeterminate_deferred,budget_exhausted} /
         //     prepared_replay_drift_deferred — durable-class routing, no wire.
         //   - dispatch_errors — helper error; conservatively NOT treated as evidence.
+        //   - dispatch_state_conflict / dispatch_document_missing — zero-wire
+        //     stage_send outcomes (M1-01 fix); NOT an answered exchange.
     }
 
     fn merge(&mut self, other: &DispatchHistogram) {
@@ -362,6 +398,7 @@ impl DispatchHistogram {
         self.error_retryable_dispatched += other.error_retryable_dispatched;
         self.sent_match_to_kvt1 += other.sent_match_to_kvt1;
         self.sent_mismatch_to_manual += other.sent_mismatch_to_manual;
+        self.sent_mismatch_superseded += other.sent_mismatch_superseded;
         self.sent_not_found_to_error_retryable += other.sent_not_found_to_error_retryable;
         self.sent_probe_failure_deferred += other.sent_probe_failure_deferred;
         self.prepared_dispatched += other.prepared_dispatched;
@@ -375,6 +412,42 @@ impl DispatchHistogram {
         self.dispatch_errors += other.dispatch_errors;
         self.signer_refused_mismatch += other.signer_refused_mismatch;
         self.signer_refused_structural_bug += other.signer_refused_structural_bug;
+        self.dispatch_state_conflict += other.dispatch_state_conflict;
+        self.dispatch_document_missing += other.dispatch_document_missing;
+    }
+}
+
+/// M1-01 fix (architect ruling batch item 1, 2026-06-11) — which
+/// [`DispatchHistogram`] bucket CLASS a `stage_send::run` success outcome maps
+/// to.  A pure, `match`-exhaustive classifier shared by all three boot dispatch
+/// sites (SIGNED / ERROR_RETRYABLE / PREPARED), so a NEW `StageSendOutcome`
+/// variant is a COMPILE ERROR here — it can no longer be silently absorbed into
+/// an answered-wire `*_dispatched` bucket (the M1-01 / B1-Mismatch bug class).
+#[derive(Debug, PartialEq, Eq)]
+enum SendDispatchClass {
+    /// `Sent` (DPS ack) or `Routed` (wire `send_chk` returned a `DpsError`,
+    /// re-routed) — a REAL wire exchange → the per-site `*_dispatched`
+    /// answered-wire bucket.
+    Dispatched,
+    /// `StateConflict` — 4-pre CAS saw the doc outside the send allowlist; no wire.
+    StateConflict,
+    /// `DocumentMissing` — doc row absent at 4-pre; no wire.
+    DocumentMissing,
+    /// `SignerRefused(Mismatch)` — operator-actionable signer refusal, pre-wire.
+    SignerRefusedMismatch,
+    /// `SignerRefused(_)` — structural caller-bug signer refusal, pre-wire.
+    SignerRefusedStructural,
+}
+
+/// M1-01 fix — pure, total classifier; see [`SendDispatchClass`].
+fn classify_send_dispatch(outcome: &stage_send::StageSendOutcome) -> SendDispatchClass {
+    use stage_send::StageSendOutcome as O;
+    match outcome {
+        O::Sent { .. } | O::Routed { .. } => SendDispatchClass::Dispatched,
+        O::StateConflict { .. } => SendDispatchClass::StateConflict,
+        O::DocumentMissing => SendDispatchClass::DocumentMissing,
+        O::SignerRefused(Scm::Mismatch { .. }) => SendDispatchClass::SignerRefusedMismatch,
+        O::SignerRefused(_) => SendDispatchClass::SignerRefusedStructural,
     }
 }
 
@@ -503,6 +576,18 @@ impl ReconciliationSummary {
 /// resumed by prior boot tick OR state changed by parallel writer;
 /// under M3a's single-writer-per-FN invariant the latter cannot
 /// occur within boot — see ADR-M3-A10).
+///
+/// **ADR-M3-A10 §4 carry-forward (M1 review item 6, 2026-06-11).** This and the
+/// other per-DocState boot helpers (`advance_sent_to_kvt1_from_probe`,
+/// `cas_sent_*_from_probe`, `passive_hold_kvt1`, `complete_probe_trace_*`,
+/// `dispatch_sent_via_probe`, `cas_error_retryable_*`) are `pub`/`pub(crate)`
+/// and do NOT take the W2 `ReconcileGuard` token — only the two top-level
+/// entries (`run_boot_reconciliation`, `run_boot_tip_guard`) require it.  A
+/// direct in-crate caller could therefore mutate state without the App recon
+/// mutex; this is SAFE today (each helper is one `with_immediate` + per-row CAS,
+/// so a lost race is `Ok(false)`, never corruption — single-process invariant).
+/// Threading the token through every helper is the deferred multi-worker
+/// obligation (NOT done here — churn without a current attacker).
 pub async fn resume_sending_to_error_retryable(
     pool: &SqlitePool,
     doc_id: DocumentId,
@@ -912,6 +997,83 @@ pub async fn complete_probe_trace_no_state_change(
                 "fiscal_document",
                 &hex_lower(doc_id.as_bytes()),
                 "BOOT_SENT_PROBE_DEFERRED",
+                crate::db::models::enums::Severity::Warning,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+}
+
+/// M1-02 fix (architect ruling item 2(b), 2026-06-11) — SENT crash-recovery
+/// probe `Mismatch` on a SUPERSEDED doc (its `lnd` < the FN's newest submitted
+/// `lnd`).  A SENT doc was provably DPS-acked; a Mismatch here means a NEWER
+/// submitted doc is now DPS's `last_chk` tip — NOT that this doc was lost.  So
+/// it is **NOT** terminalised to `RequiresManualReconciliation`: complete the
+/// in-flight probe trace (`RetryableServer`, carrying the DPS tip id for
+/// forensics) + emit a `TIP_SUPERSEDED` audit, and leave the doc in SENT for
+/// later doc-scoped confirmation (the deferred ER-probe / B1-v2 protocol;
+/// monitoring v1's stuck-detector owns visibility).  No document-state CAS.
+/// Single `with_immediate` envelope (the wire probe already ran outside it).
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_probe_trace_tip_superseded(
+    pool: &SqlitePool,
+    doc_id: DocumentId,
+    attempt_no: i32,
+    wire_call_started_at: &str,
+    wire_call_finished_at: &str,
+    actual_id: &str,
+    doc_lnd: i64,
+    max_submitted_lnd: i64,
+) -> anyhow::Result<()> {
+    let wire_started = wire_call_started_at.to_string();
+    let wire_finished = wire_call_finished_at.to_string();
+    let actual_id_owned = actual_id.to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            let n = transport_trace::complete_tx(
+                tx,
+                doc_id,
+                attempt_no,
+                transport_trace::AttemptCompletion {
+                    wire_call_started_at: wire_started,
+                    wire_call_finished_at: wire_finished,
+                    outcome_kind: transport_trace::OutcomeKind::RetryableServer,
+                    server_fiscal_no: Some(actual_id_owned.clone()),
+                    server_status_code: None,
+                    error_kind: Some("LAST_CHK_TIP_SUPERSEDED".to_string()),
+                    error_message: Some(format!(
+                        "last_chk tip id={actual_id_owned} is a newer submitted doc \
+                         (this doc lnd={doc_lnd} < max submitted lnd={max_submitted_lnd}); \
+                         doc was DPS-acked and is superseded, NOT lost — held in SENT"
+                    )),
+                    retry_class: None,
+                },
+            )
+            .await?;
+            if n != 1 {
+                anyhow::bail!(
+                    "transport_trace tip-superseded completion: rows_affected = {n} (expected 1; doc {doc_id:?}, attempt_no = {attempt_no})"
+                );
+            }
+            let payload = serde_json::json!({
+                "document_id": hex_lower(doc_id.as_bytes()),
+                "branch": "c-sent-mismatch-superseded",
+                "attempt_no": attempt_no,
+                "doc_lnd": doc_lnd,
+                "max_submitted_lnd": max_submitted_lnd,
+                "dps_tip_id": actual_id_owned,
+                "rationale":
+                    "SENT doc was DPS-acked; last_chk tip is a NEWER submitted doc — superseded, not lost; held in SENT for deferred doc-scoped confirmation (NOT RequiresManualReconciliation)",
+            });
+            audit_log::append_tx(
+                tx,
+                "fiscal_document",
+                &hex_lower(doc_id.as_bytes()),
+                "TIP_SUPERSEDED",
                 crate::db::models::enums::Severity::Warning,
                 None,
                 Some(&payload.to_string()),
@@ -2045,6 +2207,16 @@ pub(crate) async fn dispatch_sent_via_probe(
     // BEGIN IMMEDIATE serialises the `MAX(attempt_no)+1` read.
     // `request_envelope_sha256` is zero-bytes because a probe is a
     // query, not a wire submit; there is no envelope payload.
+    //
+    // M1-08 (architect ruling item 8, 2026-06-11): this alloc is Envelope 1 of
+    // the only multi-envelope boot window with durable PRE-CAS state — a crash
+    // after this commits but before the CAS below leaves an ORPHAN probe row,
+    // and the next boot re-runs this arm and allocates ANOTHER probe row
+    // (double-allocation).  That is accepted as BENIGN with NO resume mechanics:
+    // the orphan is an inert audit row, the probe never resends, and since
+    // M1-04 `attempts_used` counts `is_probe = 0` rows ONLY the orphaned probes
+    // no longer pollute the ER-redrive budget (the double-alloc's sole prior
+    // harm).  Pinned by `tests/kill_point_matrix.rs::k7_…`.
     let backend_id = doc.backend_profile_id.clone();
     let transport_id = doc.transport_profile_id.clone();
     let attempt_no = with_immediate(pool, move |tx| {
@@ -2056,6 +2228,9 @@ pub(crate) async fn dispatch_sent_via_probe(
                     backend_profile_id: backend_id,
                     transport_profile_id: transport_id,
                     request_envelope_sha256: [0u8; 32],
+                    // M1 item 4: a READ-ONLY last_chk probe — excluded from the
+                    // ER-redrive send budget (`attempts_used`).
+                    is_probe: true,
                 },
             )
             .await
@@ -2085,19 +2260,69 @@ pub(crate) async fn dispatch_sent_via_probe(
                 Err(e) => emit_dispatch_error(pool, doc_id, "c-sent-match", &e, histogram).await?,
             }
         }
-        ProbeOutcome::Mismatch { actual_id } => match cas_sent_to_manual_reconciliation_from_probe(
-            pool,
-            doc_id,
-            attempt_no,
-            &actual_id,
-            &wire_started,
-            &wire_finished,
-        )
-        .await
-        {
-            Ok(_) => histogram.sent_mismatch_to_manual += 1,
-            Err(e) => emit_dispatch_error(pool, doc_id, "c-sent-mismatch", &e, histogram).await?,
-        },
+        ProbeOutcome::Mismatch { actual_id } => {
+            // M1-02 fix (architect ruling item 2(b), 2026-06-11).  A SENT doc was
+            // provably DPS-acked (SENT ⇒ WireDecision::Sent); a Mismatch means
+            // DPS's FN-scoped last_chk tip is a DIFFERENT doc.  If THIS doc is
+            // not the FN's newest submitted doc (its lnd < max submitted lnd) it
+            // was SUPERSEDED by a newer submitted doc that became the tip — NOT
+            // lost — so do NOT terminalise to RequiresManualReconciliation; hold
+            // it SENT (TIP_SUPERSEDED) for later doc-scoped confirmation.
+            // Mismatch on the ACTUAL tip (no newer submitted doc) → genuine
+            // ambiguity → Manual (unchanged).  Shared arm: boot SENT-recovery
+            // AND the online-convergence tick both reach here (one fix point).
+            let max_lnd = crate::db::repositories::fiscal_documents::max_submitted_lnd(
+                pool,
+                &doc.fiscal_number,
+            )
+            .await?;
+            match max_lnd {
+                Some(m) if doc.lnd < m => {
+                    match complete_probe_trace_tip_superseded(
+                        pool,
+                        doc_id,
+                        attempt_no,
+                        &wire_started,
+                        &wire_finished,
+                        &actual_id,
+                        doc.lnd,
+                        m,
+                    )
+                    .await
+                    {
+                        Ok(_) => histogram.sent_mismatch_superseded += 1,
+                        Err(e) => {
+                            emit_dispatch_error(
+                                pool,
+                                doc_id,
+                                "c-sent-mismatch-superseded",
+                                &e,
+                                histogram,
+                            )
+                            .await?
+                        }
+                    }
+                }
+                _ => {
+                    match cas_sent_to_manual_reconciliation_from_probe(
+                        pool,
+                        doc_id,
+                        attempt_no,
+                        &actual_id,
+                        &wire_started,
+                        &wire_finished,
+                    )
+                    .await
+                    {
+                        Ok(_) => histogram.sent_mismatch_to_manual += 1,
+                        Err(e) => {
+                            emit_dispatch_error(pool, doc_id, "c-sent-mismatch", &e, histogram)
+                                .await?
+                        }
+                    }
+                }
+            }
+        }
         ProbeOutcome::NotFound => {
             match cas_sent_to_error_retryable_from_probe(
                 pool,
@@ -2372,13 +2597,18 @@ async fn dispatch_error_retryable_by_class(
                 // SignerRefused off the generic dispatched bucket
                 // AND split Mismatch (operator-actionable) from the
                 // structural caller-bug variants (engineering signal).
-                Ok(stage_send::StageSendOutcome::SignerRefused(Scm::Mismatch { .. })) => {
-                    histogram.signer_refused_mismatch += 1
-                }
-                Ok(stage_send::StageSendOutcome::SignerRefused(_)) => {
-                    histogram.signer_refused_structural_bug += 1
-                }
-                Ok(_) => histogram.error_retryable_dispatched += 1,
+                // M1-01 fix: exhaustive classification (no `Ok(_)` catch-all) so
+                // zero-wire StateConflict/DocumentMissing are NOT counted as an
+                // answered exchange (they'd falsely suppress the boot tip-guard).
+                Ok(outcome) => match classify_send_dispatch(&outcome) {
+                    SendDispatchClass::Dispatched => histogram.error_retryable_dispatched += 1,
+                    SendDispatchClass::StateConflict => histogram.dispatch_state_conflict += 1,
+                    SendDispatchClass::DocumentMissing => histogram.dispatch_document_missing += 1,
+                    SendDispatchClass::SignerRefusedMismatch => histogram.signer_refused_mismatch += 1,
+                    SendDispatchClass::SignerRefusedStructural => {
+                        histogram.signer_refused_structural_bug += 1
+                    }
+                },
                 Err(e) => {
                     emit_dispatch_error(
                         pool,
@@ -2976,7 +3206,22 @@ async fn dispatch_prepared_via_chain(
             // Existing M3a online ladder.  stage_send::run drives
             // SIGNED → SENT (or routed target) via Pattern B.
             match stage_send::run(pool, deps.dps, doc_id, Some(deps.signing_ctx)).await {
-                Ok(_) => histogram.prepared_dispatched += 1,
+                // M1-01 fix: exhaustive classification (no `Ok(_)`).  This also
+                // corrects a latent lump — the prepared site previously folded
+                // SignerRefused into prepared_dispatched (a pre-wire refusal
+                // counted as an answered exchange); it now routes to the
+                // signer_refused_* buckets like the SIGNED/ER sites.
+                Ok(outcome) => match classify_send_dispatch(&outcome) {
+                    SendDispatchClass::Dispatched => histogram.prepared_dispatched += 1,
+                    SendDispatchClass::StateConflict => histogram.dispatch_state_conflict += 1,
+                    SendDispatchClass::DocumentMissing => histogram.dispatch_document_missing += 1,
+                    SendDispatchClass::SignerRefusedMismatch => {
+                        histogram.signer_refused_mismatch += 1
+                    }
+                    SendDispatchClass::SignerRefusedStructural => {
+                        histogram.signer_refused_structural_bug += 1
+                    }
+                },
                 Err(send_err) => {
                     emit_dispatch_error(
                         pool,
@@ -3154,13 +3399,24 @@ async fn dispatch_pending_doc(
                             // signed_dispatched counter; Mismatch =
                             // operator-actionable bucket; structural
                             // bug bucket otherwise.
-                            Ok(stage_send::StageSendOutcome::SignerRefused(Scm::Mismatch {
-                                ..
-                            })) => histogram.signer_refused_mismatch += 1,
-                            Ok(stage_send::StageSendOutcome::SignerRefused(_)) => {
-                                histogram.signer_refused_structural_bug += 1
-                            }
-                            Ok(_) => histogram.signed_dispatched += 1,
+                            // M1-01 fix: exhaustive classification (no `Ok(_)`)
+                            // so zero-wire StateConflict/DocumentMissing don't
+                            // count as an answered exchange (tip-guard suppress).
+                            Ok(outcome) => match classify_send_dispatch(&outcome) {
+                                SendDispatchClass::Dispatched => histogram.signed_dispatched += 1,
+                                SendDispatchClass::StateConflict => {
+                                    histogram.dispatch_state_conflict += 1
+                                }
+                                SendDispatchClass::DocumentMissing => {
+                                    histogram.dispatch_document_missing += 1
+                                }
+                                SendDispatchClass::SignerRefusedMismatch => {
+                                    histogram.signer_refused_mismatch += 1
+                                }
+                                SendDispatchClass::SignerRefusedStructural => {
+                                    histogram.signer_refused_structural_bug += 1
+                                }
+                            },
                             Err(e) => {
                                 emit_dispatch_error(
                                     pool,
@@ -3414,6 +3670,26 @@ mod tests {
             ..Default::default()
         }
         .answered_wire_contact());
+        // M1-01 fix (batch item 1): StateConflict / DocumentMissing are zero-wire
+        // stage_send outcomes ("Stage 4 did NOT call send_chk") — they MUST NOT
+        // count as an answered exchange, else the boot tip-guard is skipped for
+        // an FN that never touched the wire (stale-tip missed).
+        assert!(
+            !DispatchHistogram {
+                dispatch_state_conflict: 1,
+                ..Default::default()
+            }
+            .answered_wire_contact(),
+            "StateConflict is zero-wire — guard must still run (M1-01)"
+        );
+        assert!(
+            !DispatchHistogram {
+                dispatch_document_missing: 1,
+                ..Default::default()
+            }
+            .answered_wire_contact(),
+            "DocumentMissing is zero-wire — guard must still run (M1-01)"
+        );
 
         // BranchOutcome delegation.
         assert!(
@@ -3439,6 +3715,72 @@ mod tests {
             }
             .answered_wire_contact(),
             "passive KVT1 hold in branch c → guard runs (restored in-flight)"
+        );
+    }
+
+    /// M1-01 fix (architect ruling batch item 1, 2026-06-11) — pin the FULL
+    /// `StageSendOutcome → SendDispatchClass` mapping so a future variant cannot
+    /// be silently absorbed into an answered-wire bucket again (the M1-01 /
+    /// B1-Mismatch bug class).  `classify_send_dispatch` is `match`-exhaustive,
+    /// so a new `StageSendOutcome` variant is a compile error there — this test
+    /// pins the *semantic* mapping on top of that compile-time guarantee.
+    #[test]
+    fn classify_send_dispatch_maps_every_variant() {
+        use crate::db::models::enums::DocType;
+        use crate::db::models::ids::{CashierId, DocumentId, ShiftId};
+        use crate::services::write_path::error_routing::route_dps_error;
+        use crate::services::write_path::signer_guard::SignerCashierMismatch as Scm;
+        use crate::services::write_path::stage_send::StageSendOutcome as O;
+        use crate::transports::dps::error::DpsError;
+
+        // Wire exchanges (ack OR DpsError-routed) → answered-wire bucket.
+        assert_eq!(
+            classify_send_dispatch(&O::Sent {
+                server_fiscal_no: "x".into(),
+                attempt_no: 1
+            }),
+            SendDispatchClass::Dispatched
+        );
+        let routed = O::Routed {
+            decision: route_dps_error(&DpsError::Transport("t".into()), DocType::Sell, true),
+            attempt_no: 1,
+            wire_status_code: None,
+            wire_error_message: None,
+        };
+        assert_eq!(
+            classify_send_dispatch(&routed),
+            SendDispatchClass::Dispatched
+        );
+
+        // Zero-wire outcomes → non-answered buckets (the M1-01 fix).
+        assert_eq!(
+            classify_send_dispatch(&O::StateConflict {
+                observed: DocState::Sent
+            }),
+            SendDispatchClass::StateConflict
+        );
+        assert_eq!(
+            classify_send_dispatch(&O::DocumentMissing),
+            SendDispatchClass::DocumentMissing
+        );
+
+        // Pre-wire signer refusals → operator-actionable vs structural buckets.
+        let mismatch = Scm::Mismatch {
+            shift_id: ShiftId::new(),
+            document_id: DocumentId::from_bytes([0x11; 16]),
+            expected_cashier_id: CashierId::new("a").unwrap(),
+            attempted_signer_id: CashierId::new("b").unwrap(),
+            doc_type: DocType::Sell,
+        };
+        assert_eq!(
+            classify_send_dispatch(&O::SignerRefused(mismatch)),
+            SendDispatchClass::SignerRefusedMismatch
+        );
+        assert_eq!(
+            classify_send_dispatch(&O::SignerRefused(Scm::SignerIdMissing {
+                document_id: DocumentId::from_bytes([0x22; 16])
+            })),
+            SendDispatchClass::SignerRefusedStructural
         );
     }
 

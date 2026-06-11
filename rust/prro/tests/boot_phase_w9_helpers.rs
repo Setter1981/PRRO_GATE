@@ -154,6 +154,8 @@ async fn alloc_inflight_trace(pool: &SqlitePool, doc: DocumentId) -> i32 {
                     backend_profile_id: "b1".into(),
                     transport_profile_id: "t1".into(),
                     request_envelope_sha256: [0u8; 32],
+                    // M1 item 4: in-flight SENT-recovery probe trace.
+                    is_probe: true,
                 },
             )
             .await?;

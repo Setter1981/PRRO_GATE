@@ -723,6 +723,16 @@ impl App {
         // requires the token in its signature so direct callers cannot
         // bypass the App-level serialization (symmetric to
         // `boot_phase::run_boot_reconciliation` gating).
+        //
+        // M1 review item 5 (M1-05/M1-H2 ruling, 2026-06-11) — LOAD-BEARING
+        // mode-partition: drain takes `reconcile_mutex`; the online-convergence
+        // tick takes the SEPARATE `fn_write_gate` (see
+        // `online_convergence::converge_one_doc`).  They reuse the SAME
+        // SENT/KVT1 arms (`dispatch_sent_via_probe`, `confirm_drain_doc`) under
+        // NON-overlapping locks; correctness rests on the mode-partition
+        // (drain ⇒ `GoingOnline`, convergence ⇒ `Online`, mutually exclusive)
+        // + per-row CAS, NOT a shared lock.  Unifying both under `fn_gate`
+        // (fn_gate.rs forward-contract #4) is DEFERRED to A2.4 integration.
         let mutex_guard = self.inner.reconcile_mutex.lock().await;
         let recon_guard =
             crate::services::reconciliation::ReconcileGuard::from_app_mutex(mutex_guard);

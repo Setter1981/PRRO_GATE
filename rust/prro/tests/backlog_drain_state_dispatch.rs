@@ -304,9 +304,18 @@ async fn read_doc_state(pool: &SqlitePool, doc_id: DocumentId) -> String {
         .unwrap()
 }
 
-/// W9b ER-class-guard test helper (2026-05-22): seed a COMPLETE
-/// `transport_trace` row for `doc_id` so `last_attempt_retry_class_for`
+/// W9b ER-class-guard test helper (2026-05-22): seed COMPLETE
+/// `transport_trace` SEND rows for `doc_id` so `last_attempt_retry_class_for`
 /// + `attempts_used` return deterministic values during the drain tick.
+///
+/// M1-04 (architect ruling item 4, 2026-06-11): `attempts_used` is now
+/// `COUNT(*) WHERE is_probe = 0`, no longer `MAX(attempt_no)`.  To seed a
+/// budget of N used send attempts we must therefore insert N distinct send
+/// rows (`attempt_no = 1..=attempt_no`), not one row stamped `attempt_no = N`.
+/// All rows are SEND rows — `is_probe` is omitted so the migration-002 DEFAULT
+/// 0 applies, i.e. every row counts toward the ER-redrive budget.  `MAX(attempt_no)`
+/// is still `attempt_no`, so a subsequent `allocate_and_insert_tx` still gets
+/// `attempt_no + 1`.
 ///
 /// `retry_class = None` writes NULL — exercises the `HoldIndeterminate`
 /// arm (alongside the "no row at all" sub-case).  The completion
@@ -319,25 +328,27 @@ async fn seed_transport_trace_attempt(
     retry_class: Option<&str>,
 ) {
     let sha = vec![0x42u8; 32];
-    sqlx::query(
-        "INSERT INTO transport_trace( \
-            document_id, attempt_no, started_at, \
-            backend_profile_id, transport_profile_id, request_envelope_sha256, \
-            completed_at, wire_call_started_at, wire_call_finished_at, \
-            outcome_kind, server_status_code, error_kind, error_message, retry_class \
-         ) VALUES ( \
-            ?, ?, '2026-05-22T00:00:00Z', 'b', 't', ?, \
-            '2026-05-22T00:00:02Z', '2026-05-22T00:00:01Z', '2026-05-22T00:00:02Z', \
-            'RETRYABLE_SERVER', -1, 'Server', 'seed-er-class-guard', ? \
-         )",
-    )
-    .bind(doc_id)
-    .bind(attempt_no)
-    .bind(&sha)
-    .bind(retry_class)
-    .execute(pool)
-    .await
-    .unwrap();
+    for n in 1..=attempt_no {
+        sqlx::query(
+            "INSERT INTO transport_trace( \
+                document_id, attempt_no, started_at, \
+                backend_profile_id, transport_profile_id, request_envelope_sha256, \
+                completed_at, wire_call_started_at, wire_call_finished_at, \
+                outcome_kind, server_status_code, error_kind, error_message, retry_class \
+             ) VALUES ( \
+                ?, ?, '2026-05-22T00:00:00Z', 'b', 't', ?, \
+                '2026-05-22T00:00:02Z', '2026-05-22T00:00:01Z', '2026-05-22T00:00:02Z', \
+                'RETRYABLE_SERVER', -1, 'Server', 'seed-er-class-guard', ? \
+             )",
+        )
+        .bind(doc_id)
+        .bind(n)
+        .bind(&sha)
+        .bind(retry_class)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
 }
 
 async fn audit_count(pool: &SqlitePool, event_type: &str) -> i64 {
@@ -714,7 +725,8 @@ async fn seed_er_with_class(
 #[tokio::test]
 async fn er_guard_budget_exhausted_no_wire_escalates_to_manual() {
     let (_d, pool) = fresh_pool().await;
-    // attempt_no = MAX_BOOT_ATTEMPTS (5) → attempts_used = 5 → exhausted.
+    // 5 SEND rows (is_probe=0) = MAX_BOOT_ATTEMPTS → attempts_used = 5 →
+    // exhausted (M1-04: attempts_used is COUNT of send rows, not MAX(attempt_no)).
     let (doc, _shift, _sess) = seed_er_with_class(&pool, "TransientRetry", 5).await;
 
     let c = carriers(vec![], vec![]);

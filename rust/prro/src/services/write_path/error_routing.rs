@@ -124,8 +124,12 @@ impl RetryClass {
 
     /// Inverse of [`as_str`].  Returns `None` for unknown / NULL /
     /// pre-migration-012 rows.  Callers MUST treat `None` as
-    /// "indeterminate from durable evidence" — typically forwarded
-    /// to W9 reconciliation rather than auto-retried.
+    /// "indeterminate from durable evidence": the doc is HELD in
+    /// `ERROR_RETRYABLE` (not auto-retried, not terminalised) and its
+    /// staleness is surfaced via monitoring v1's stuck-FN detector (M1
+    /// review item 7, 2026-06-11 — the prior "forwarded to manual triage"
+    /// wording was never wired to a state change; held-with-monitoring is
+    /// the ruled, intended behaviour).
     pub fn from_wire_str(s: &str) -> Option<Self> {
         Some(match s {
             "TerminalReject" => Self::TerminalReject,

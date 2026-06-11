@@ -44,6 +44,7 @@ use prro::db::models::ids::{DocumentId, OfflineSessionId, RequestId, ShiftId};
 use prro::db::repositories::document_files::{self, DocumentFileKind};
 use prro::db::repositories::fiscal_documents::{self, TransitionOutcome};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
+use prro::db::repositories::transport_trace::{self, NewAttempt};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::tx::with_immediate;
 use prro::db::{open_pool, open_secure_pool};
@@ -1049,5 +1050,317 @@ async fn k2_signed_boot_redrives_to_sent_exactly_once() {
         1,
         "still exactly one ledger row"
     );
+    prro::db::invariant_scan::assert_clean(&pool).await;
+}
+
+// ─── M1-02 reachability pin (architect ruling item 2(a), 2026-06-11) ─────────
+//
+// Question the dossier left open: is the "≥2 acked SENT docs on one FN"
+// precondition of the M1-02 Mismatch→Manual escalation actually REACHABLE on a
+// live online lane?  Drive two sequential online `inline::run` on ONE FN: the
+// first rests SENT via the online-confirm Hold branch; the second is a fresh
+// SELL on the same FN while doc1 is still SENT.  Record EXACTLY what the second
+// does (acquire? lnd? MAC previous_hash? final state?) plus the `invariant_scan`
+// verdict.  The recorded outcome decides the final severity of M1-02 and is
+// transcribed verbatim into the PR body — whatever it turns out to be.
+async fn seed_inbox_sell_keyed(pool: &SqlitePool, idem: &str) -> InboxRow {
+    let req_id = RequestId::new();
+    let request_id: [u8; 16] = *req_id.as_bytes();
+    let payload_sha256_canonical: [u8; 32] = Sha256::digest(SELL_PAYLOAD.as_bytes()).into();
+    inbox::insert(
+        pool,
+        &NewInboxEntry {
+            request_id,
+            fiscal_number: FN.into(),
+            protocol: Protocol::Rest,
+            operation_type: "SELL".into(),
+            idempotency_key: idem.into(),
+            payload_json: SELL_PAYLOAD.into(),
+            payload_sha256_canonical,
+            correlation_id: None,
+            signed_by_cashier_id: Some(CASHIER.into()),
+            driver_id: Some(DRIVER.into()),
+            business_ts: Some("2026-06-09T12:00:00Z".into()),
+            total_sum_kop: Some(TOTAL_KOP),
+        },
+    )
+    .await
+    .unwrap();
+    InboxRow {
+        request_id,
+        fiscal_number: FN.into(),
+        protocol: Protocol::Rest,
+        operation_type: "SELL".into(),
+        idempotency_key: idem.into(),
+        status: "NEW".into(),
+        payload_json: SELL_PAYLOAD.into(),
+        payload_sha256_canonical,
+        correlation_id: None,
+        received_at: "2026-06-09T12:00:00Z".into(),
+        signed_by_cashier_id: Some(CASHIER.into()),
+        driver_id: Some(DRIVER.into()),
+        business_ts: Some("2026-06-09T12:00:00Z".into()),
+        total_sum_kop: Some(TOTAL_KOP),
+    }
+}
+
+#[tokio::test]
+async fn m1_02_reachability_second_sell_while_first_rests_sent() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+
+    // ── Run #1: online SELL, lastChk Hold (empty data_sign) → doc1 rests SENT.
+    let row1 = seed_inbox_sell(&pool).await;
+    let stub1 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    stub1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    stub1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    let sign_ctx1 = det_signing_ctx();
+    let fn_sign1 = fn_sign_blob();
+    {
+        let guard = gate.clone().lock_owned().await;
+        let o1 = inline::run(
+            &pool,
+            &pool_secure,
+            &stub1,
+            &sign_ctx1,
+            &fn_sign1,
+            &guard,
+            &row1,
+        )
+        .await
+        .expect("run #1: online SELL with Hold lastChk returns Ok(Sent)");
+        assert_eq!(o1.document_state, DocState::Sent, "doc1 rests at SENT");
+    }
+
+    // ── Run #2: a SECOND SELL on the SAME FN while doc1 is still SENT.  Distinct
+    //    server_fiscal_no on the wire so a successful second send would create the
+    //    "two SENT docs with distinct sfn" precondition M1-02 escalates on.
+    let row2 = seed_inbox_sell_keyed(&pool, "idem-kpm-SELL-2").await;
+    let stub2 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    stub2.push_send(Ok(ack("DPS-FN-ONLINE-2", vec![])));
+    stub2.push_last(Ok(ack("DPS-FN-ONLINE-2", vec![])));
+    let sign_ctx2 = det_signing_ctx();
+    let fn_sign2 = fn_sign_blob();
+    let result2 = {
+        let guard = gate.clone().lock_owned().await;
+        inline::run(
+            &pool,
+            &pool_secure,
+            &stub2,
+            &sign_ctx2,
+            &fn_sign2,
+            &guard,
+            &row2,
+        )
+        .await
+    };
+
+    // ── Observe + record (emitted on every run as the PR-body evidence line).
+    let all: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT lnd, state, server_fiscal_no FROM fiscal_documents \
+         WHERE fiscal_number = ? ORDER BY lnd",
+    )
+    .bind(FN)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let violations = prro::db::invariant_scan::scan(&pool).await.unwrap();
+    eprintln!(
+        "M1-02 REACHABILITY: result2_ok={} result2_state={:?} docs={:?} invariant_violations={}",
+        result2.is_ok(),
+        result2.as_ref().map(|o| format!("{:?}", o.document_state)),
+        all,
+        violations.len()
+    );
+    for v in &violations {
+        eprintln!("  violation: {v:?}");
+    }
+
+    // RECORDED OUTCOME (2026-06-11, --nocapture), pinned verbatim:
+    //   result2_ok=true result2_state=Ok("Sent")
+    //   docs=[(1,"SENT","DPS-FN-ONLINE-1"),(2,"SENT","DPS-FN-ONLINE-2")]
+    //   invariant_violations=0
+    // => The M1-02 precondition ("≥2 SENT docs on ONE FN with DISTINCT
+    //    server_fiscal_no") IS reachable on a live online lane against a
+    //    permissive DPS stub, and `invariant_scan` does NOT flag it.  M1-02 is
+    //    therefore a REACHABLE condition, not a theoretical one — the boot/online
+    //    Mismatch arm (and the item-2(b) lnd<max superseded softening) operate on
+    //    a state the system can actually enter.  The escalation severity stands.
+    let result2 = result2.expect("run #2: second SELL on the same FN also reaches SENT");
+    assert_eq!(
+        result2.document_state,
+        DocState::Sent,
+        "doc2 also rests at SENT"
+    );
+    assert_eq!(all.len(), 2, "two SELL docs issued on one FN");
+    assert_eq!(
+        all[0],
+        (1, "SENT".to_string(), Some(SERVER_FISCAL_NO.to_string()))
+    );
+    assert_eq!(
+        all[1],
+        (2, "SENT".to_string(), Some("DPS-FN-ONLINE-2".to_string())),
+        "doc2 carries a DISTINCT server_fiscal_no — the M1-02 precondition is met"
+    );
+    assert!(
+        violations.is_empty(),
+        "invariant_scan does NOT flag two SENT docs with distinct sfn: {violations:?}"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// K7 — boot SENT-probe: trace-alloc committed, CAS not yet run (M1-08).
+//
+// The ONLY multi-envelope boot window with durable PRE-CAS state:
+// `dispatch_sent_via_probe` allocates a transport_trace recovery row in one
+// `with_immediate` (Envelope 1), probes the wire, then CASes Sent→Kvt1 in a
+// SECOND envelope.  A crash between Envelope 1 and the CAS leaves a durable
+// ORPHAN probe row; the next boot re-runs the arm and allocates ANOTHER probe
+// row — the "double-allocation".
+//
+// Build:    online inline::run, lastChk Hold (empty) → doc rests SENT (one
+//           is_probe=0 send row, attempt_no=1).  Then hand-allocate ONE orphan
+//           probe row (is_probe=1, attempt_no=2) via the SAME prod call the arm
+//           uses — this IS the pre-CAS crash residue.
+// Recovery: boot with a Match stub → the arm allocates a SECOND probe row
+//           (is_probe=1, attempt_no=3) and CASes Sent→Kvt1.
+// Locked (M1-08 + M1-04): doc converges to KVT1; ZERO send_chk in recovery
+//           (the probe never resends — exactly one send EVER); the two probe
+//           rows are BENIGN — `attempts_used` (the ER-redrive budget) counts
+//           is_probe=0 rows ONLY, so it stays 1 despite MAX(attempt_no)=3 (the
+//           budget-pollution harm the orphan double-alloc used to cause is gone
+//           post-M1-04); scan clean.  No resume mechanics — the orphan is left
+//           as an inert audit row.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn k7_sent_probe_alloc_orphan_is_benign_after_m1_04() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_sell(&pool).await;
+
+    // ── Phase 1: online SELL, lastChk Hold (empty) → doc rests SENT (one send).
+    let send_calls = Arc::new(AtomicUsize::new(0));
+    let last_calls = Arc::new(AtomicUsize::new(0));
+    let phase1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    phase1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    phase1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → Hold → SENT
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    {
+        let guard = gate.clone().lock_owned().await;
+        inline::run(
+            &pool,
+            &pool_secure,
+            &phase1,
+            &sign_ctx,
+            &fn_sign,
+            &guard,
+            &row,
+        )
+        .await
+        .expect("phase 1 rests at SENT");
+    }
+    assert_eq!(read_doc_state(&pool, FN).await, "SENT", "K7 setup: SENT");
+    assert_eq!(send_calls.load(Ordering::SeqCst), 1, "one send in phase 1");
+
+    let doc_id = read_doc_id(&pool).await;
+    assert_eq!(
+        transport_trace::attempts_used(&pool, doc_id).await.unwrap(),
+        1,
+        "one send row (is_probe=0) so far"
+    );
+
+    // ── Pre-CAS crash residue: hand-allocate ONE orphan probe row (is_probe=1,
+    //    attempt_no=2) via the EXACT prod call `dispatch_sent_via_probe` uses —
+    //    simulating a probe whose trace-alloc envelope committed before a crash.
+    let doc = fiscal_documents::list_pending_for_fn(&pool, FN)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.document_id == doc_id)
+        .expect("SENT doc in pending list");
+    let backend_id = doc.backend_profile_id.clone();
+    let transport_id = doc.transport_profile_id.clone();
+    let orphan_attempt = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            transport_trace::allocate_and_insert_tx(
+                tx,
+                doc_id,
+                NewAttempt {
+                    backend_profile_id: backend_id,
+                    transport_profile_id: transport_id,
+                    request_envelope_sha256: [0u8; 32],
+                    is_probe: true,
+                },
+            )
+            .await
+            .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .expect("orphan probe trace row");
+    assert_eq!(orphan_attempt, 2, "orphan probe takes attempt_no=2");
+    assert_eq!(
+        transport_trace::attempts_used(&pool, doc_id).await.unwrap(),
+        1,
+        "orphan probe row excluded from the ER-redrive budget"
+    );
+
+    // ── Recovery: boot with a Match stub.  No push_send queued → a resend would
+    //    be observable; asserted ZERO below.
+    let phase2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // Match
+    let sign_ctx2 = det_signing_ctx();
+    let fn_sign2 = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &phase2,
+        signing_ctx: &sign_ctx2,
+        fn_sign: &fn_sign2,
+    };
+    boot_phase::run_boot_reconciliation(&recon_guard(), &pool, FN, Some(&view))
+        .await
+        .expect("boot reconciliation must succeed");
+
+    // ── Locked assertions.
+    assert_eq!(
+        read_doc_state(&pool, FN).await,
+        "KVT1",
+        "SENT-probe Match advances to KVT1 despite the orphan probe row"
+    );
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        1,
+        "ZERO send_chk in recovery — exactly one send EVER (the phase-1 original)"
+    );
+    // Two probe rows now exist (orphan attempt_no=2 + boot attempt_no=3): the
+    // accepted-benign double-allocation (M1-08).
+    let probe_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM transport_trace WHERE document_id = ? AND is_probe = 1",
+    )
+    .bind(doc_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        probe_rows, 2,
+        "orphan + boot probe rows (benign double-allocation)"
+    );
+    // THE M1-08/M1-04 PIN: MAX(attempt_no)=3 but the ER-redrive budget counts
+    // is_probe=0 rows ONLY, so it is UNPOLLUTED by the two probe rows.
+    assert_eq!(
+        transport_trace::attempts_used(&pool, doc_id).await.unwrap(),
+        1,
+        "attempts_used counts only the one real send — probe double-alloc is benign"
+    );
+    assert_eq!(count_doc_rows(&pool).await, 1, "exactly one ledger row");
     prro::db::invariant_scan::assert_clean(&pool).await;
 }

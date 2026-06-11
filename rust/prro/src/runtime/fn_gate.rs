@@ -53,6 +53,13 @@
 //!      already serialized by `BEGIN IMMEDIATE` regardless of app-level lock,
 //!      and the drain CONFIRMS-only (never allocates lnd) — coordinating them
 //!      merely closes `SQLITE_BUSY` contention + lnd-ordering jitter.
+//!      NOT IMPLEMENTED YET (M1 review item 5 / M1-05, 2026-06-11): the drain
+//!      currently takes `App::reconcile_mutex`, the online-convergence tick the
+//!      `fn_write_gate` — DISTINCT locks reusing the same SENT/KVT1 arms.  Safe
+//!      today only via the LOAD-BEARING `GoingOnline`(drain)/`Online`(converge)
+//!      mode-partition + per-row CAS; unification under this gate is DEFERRED to
+//!      A2.4 integration (cross-refs: `App::drain_offline_backlog_with`,
+//!      `online_convergence::converge_one_doc`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

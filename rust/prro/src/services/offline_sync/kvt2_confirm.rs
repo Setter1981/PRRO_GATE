@@ -1179,6 +1179,9 @@ async fn commit_sent_replay_envelope_1c_pre(
                     backend_profile_id,
                     transport_profile_id,
                     request_envelope_sha256: [0u8; 32],
+                    // M1 item 4: a READ-ONLY KVT2-confirm last_chk probe —
+                    // excluded from the ER-redrive send budget.
+                    is_probe: true,
                 },
             )
             .await
