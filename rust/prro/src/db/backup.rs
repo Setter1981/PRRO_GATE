@@ -13,9 +13,14 @@
 //!
 //! Retention ([`prune`]) operates purely by filename convention
 //! (`<label>-YYYYMMDD-HHMMSS-<8hex>.db`) — it never touches a file that does
-//! not match the pattern (foreign files in the directory are not ours), and it
-//! deletes a snapshot only when it is BOTH beyond `keep_last` AND older than
-//! `max_age_days`.
+//! not match the pattern (foreign files in the directory are not ours).  A
+//! snapshot is RETAINED only while it is BOTH within the `keep_last`
+//! most-recent AND younger than `max_age_days` (architect review ruling:
+//! `keep_last` is the disk-usage CAP, `max_age_days` an additional expiry —
+//! the original AND-delete reading would retain `interval × max_age` full DB
+//! copies, exhausting edge-hardware disks).  Deleting by age is safe: the
+//! supervisor prunes only AFTER a successful snapshot, so a fresh copy always
+//! survives the pass.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -42,7 +47,7 @@ pub struct SnapshotReport {
 pub struct PruneReport {
     /// Snapshots matching the `<label>-…` pattern found this pass.
     pub scanned: usize,
-    /// Snapshots deleted (beyond `keep_last` AND older than `max_age_days`).
+    /// Snapshots deleted (beyond `keep_last` OR older than `max_age_days`).
     pub deleted: usize,
     /// Snapshots retained.
     pub kept: usize,
@@ -221,10 +226,11 @@ fn parse_snapshot_stamp(name: &str, label: &str) -> Option<chrono::NaiveDateTime
     chrono::NaiveDateTime::parse_from_str(&format!("{date}{time}"), "%Y%m%d%H%M%S").ok()
 }
 
-/// Prune `<label>` snapshots in `backup_dir`: delete those that are BOTH beyond
-/// the `keep_last` most-recent AND older than `max_age_days`.  Never touches a
-/// file that does not match the snapshot name pattern.  A missing directory is
-/// not an error (nothing to prune).
+/// Prune `<label>` snapshots in `backup_dir`: a snapshot is kept only while it
+/// is BOTH within the `keep_last` most-recent AND younger than `max_age_days`
+/// (i.e. deleted when beyond the cap OR expired — see the module doc for the
+/// architect ruling).  Never touches a file that does not match the snapshot
+/// name pattern.  A missing directory is not an error (nothing to prune).
 pub fn prune(
     backup_dir: &Path,
     label: &str,
@@ -255,7 +261,7 @@ pub fn prune(
         let beyond_keep = idx >= keep_last;
         let age_days = (now - *stamp).num_days();
         let too_old = age_days > max_age_days as i64;
-        if beyond_keep && too_old {
+        if beyond_keep || too_old {
             std::fs::remove_file(path)
                 .map_err(|e| anyhow::anyhow!("prune: remove {path:?} failed: {e}"))?;
             deleted += 1;

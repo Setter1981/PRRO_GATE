@@ -147,7 +147,9 @@ async fn snapshot_under_concurrent_writes_is_consistent() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Test 3 — prune: keep_last AND max_age respected; foreign files untouched.
+// Test 3 — prune retention (architect ruling): a snapshot is KEPT only while
+// BOTH within keep_last AND younger than max_age (delete on cap OR expiry).
+// Two isolated calls pin each axis separately; foreign files untouched.
 // ════════════════════════════════════════════════════════════════════════════
 
 fn touch(dir: &Path, name: &str) {
@@ -159,47 +161,59 @@ fn snap_name(label: &str, dt: chrono::NaiveDateTime, hex: &str) -> String {
 }
 
 #[tokio::test]
-async fn prune_respects_keep_last_and_max_age_and_skips_foreign() {
+async fn prune_caps_count_and_expires_age_and_skips_foreign() {
     let dir = tempfile::tempdir().unwrap();
     let now = chrono::Utc::now().naive_utc();
 
-    // 3 recent (0/1/2 days old) + 2 old (~3 years).  Dates are relative to now
-    // so the test is date-independent.
-    let recent: Vec<_> = (0..3).map(|d| now - chrono::Duration::days(d)).collect();
-    let old: Vec<_> = (1000..1002)
-        .map(|d| now - chrono::Duration::days(d))
-        .collect();
-    for (i, dt) in recent.iter().enumerate() {
+    // 4 young (0/1/2/3 days) + 1 expired-but-recent-ish (20 days) + 1 ancient
+    // (1000 days).  Dates are relative to now so the test is date-independent.
+    let days = [0i64, 1, 2, 3, 20, 1000];
+    for (i, d) in days.iter().enumerate() {
         touch(
             dir.path(),
-            &snap_name("main", *dt, &format!("0000000{}", i + 1)),
-        );
-    }
-    for (i, dt) in old.iter().enumerate() {
-        touch(
-            dir.path(),
-            &snap_name("main", *dt, &format!("000000a{}", i + 1)),
+            &snap_name(
+                "main",
+                now - chrono::Duration::days(*d),
+                &format!("0000000{}", i + 1),
+            ),
         );
     }
     // Foreign files prune must NEVER touch: a different label + a non-snapshot.
-    let foreign_secure = snap_name("secure", old[0], "deadbeef");
+    let foreign_secure = snap_name("secure", now - chrono::Duration::days(1000), "deadbeef");
     touch(dir.path(), &foreign_secure);
     touch(dir.path(), "operator-notes.txt");
 
-    let report = prune(
+    // ── Call A: loose cap (10) → ONLY the age axis acts: the 20d and 1000d
+    //    snapshots are expired even though both are within keep_last.
+    let report_a = prune(
         dir.path(),
         "main",
-        /*keep_last*/ 2,
+        /*keep_last*/ 10,
         /*max_age_days*/ 14,
     )
     .unwrap();
+    assert_eq!(report_a.scanned, 6);
+    assert_eq!(
+        report_a.deleted, 2,
+        "age expiry acts WITHIN the cap (20d + 1000d deleted)"
+    );
+    assert_eq!(report_a.kept, 4);
 
-    // 5 "main" snapshots scanned; the 2 old ones (beyond keep_last AND older
-    // than 14 days) deleted; the 3 recent kept — incl. the 2-day-old one that is
-    // beyond keep_last but still young (proves the conditions are ANDed).
-    assert_eq!(report.scanned, 5);
-    assert_eq!(report.deleted, 2);
-    assert_eq!(report.kept, 3);
+    // ── Call B: loose age (10000d) → ONLY the cap axis acts: of the 4 young
+    //    survivors the 3-day-old one is beyond keep_last=3 and goes.
+    let report_b = prune(
+        dir.path(),
+        "main",
+        /*keep_last*/ 3,
+        /*max_age_days*/ 10000,
+    )
+    .unwrap();
+    assert_eq!(report_b.scanned, 4);
+    assert_eq!(
+        report_b.deleted, 1,
+        "the cap deletes a YOUNG snapshot beyond keep_last"
+    );
+    assert_eq!(report_b.kept, 3);
 
     let remaining: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
@@ -208,7 +222,7 @@ async fn prune_respects_keep_last_and_max_age_and_skips_foreign() {
     assert_eq!(
         remaining.iter().filter(|n| n.starts_with("main-")).count(),
         3,
-        "3 recent main snapshots kept"
+        "exactly keep_last young main snapshots survive both passes"
     );
     assert!(
         remaining.contains(&foreign_secure),

@@ -17,13 +17,16 @@ The backup loop snapshots both DB files (`main` + `secure`) every
 
 | Knob | Default | Meaning |
 |------|---------|---------|
-| `[backup] keep_last` | 30 | Always keep at least this many most-recent snapshots **per label**, regardless of age. |
-| `[backup] max_age_days` | 14 | May delete snapshots older than this — **but only those already beyond `keep_last`**. |
+| `[backup] keep_last` | 30 | The disk-usage **cap**: at most this many most-recent snapshots survive **per label**. |
+| `[backup] max_age_days` | 14 | Additional **expiry**: snapshots older than this are deleted even when within the cap. |
 
-The two conditions are **ANDed**: a snapshot is deleted only if it is *both*
-beyond the `keep_last` most-recent *and* older than `max_age_days`. So a node
-that snapshots hourly keeps ≥30 snapshots at all times, and also keeps anything
-from the last 14 days even if that exceeds 30.
+A snapshot is **kept only while it is BOTH within the `keep_last` most-recent
+AND younger than `max_age_days`** (architect review ruling 2026-06-11: the
+earlier AND-delete reading would retain `interval × max_age` full DB copies —
+an hourly node would hold ~336 snapshots per label and exhaust edge-hardware
+disks). Deleting by age is safe: pruning runs only **after** a successful
+snapshot, so a fresh copy always survives the pass — a node that was off for
+months never prunes itself to zero.
 
 **Prune only touches our files.** Pruning matches strictly the
 `<label>-YYYYMMDD-HHMMSS-<8hex>.db` name pattern; any other file in the backup
