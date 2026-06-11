@@ -216,6 +216,16 @@ where
             "supervisor.online_convergence_interval_seconds out of bounds; clamped"
         );
     }
+    let backup_enabled = app.config().backup.enabled;
+    let (backup_secs, backup_clamped) = app.config().backup.clamped_interval_seconds();
+    if backup_enabled && backup_clamped {
+        tracing::warn!(
+            target: "prro::runtime::supervisor",
+            raw = app.config().backup.interval_seconds,
+            clamped = backup_secs,
+            "backup.interval_seconds out of bounds; clamped"
+        );
+    }
 
     // One watch channel fans the shutdown signal to ALL loops; `biased`
     // select makes the shutdown branch win even when a tick is ready.
@@ -242,6 +252,21 @@ where
         Duration::from_secs(converge_secs),
         shutdown_rx.clone(),
     );
+    // RS-4 backup loop — not per-FN (no registry/fn_ids), conditional on the
+    // `[backup] enabled` switch.
+    let backup_handle = if backup_enabled {
+        Some(spawn_backup_loop(
+            app.clone(),
+            Duration::from_secs(backup_secs),
+            shutdown_rx.clone(),
+        ))
+    } else {
+        tracing::info!(
+            target: "prro::runtime::supervisor",
+            "backup disabled (backup.enabled = false); loop not spawned"
+        );
+        None
+    };
 
     // ── 5b-ii: spawn one axum ingress server per pre-bound RestHttp listener ──
     // Each is a `GracefulOkAfterShutdown` supervised task: its
@@ -253,6 +278,9 @@ where
         SupervisedTask::runs_until_shutdown("probe", probe_handle),
         SupervisedTask::runs_until_shutdown("online-convergence", convergence_handle),
     ];
+    if let Some(handle) = backup_handle {
+        tasks.push(SupervisedTask::runs_until_shutdown("backup", handle));
+    }
     for (listener, state, name) in bound_ingress {
         let handle = tokio::spawn(server::serve(listener, state, shutdown_rx.clone()));
         tasks.push(SupervisedTask::graceful(name, handle));
@@ -263,8 +291,10 @@ where
         drain_interval_secs = drain_secs,
         probe_interval_secs = probe_secs,
         online_convergence_interval_secs = converge_secs,
+        backup_enabled,
+        backup_interval_secs = backup_secs,
         ingress_listeners = ingress_count,
-        "supervisor: drain + return-online + online-convergence + ingress tasks running"
+        "supervisor: drain + return-online + online-convergence + backup + ingress tasks running"
     );
 
     // F1 + F2: hand the wait/teardown lifecycle to the generalized (test-
@@ -984,6 +1014,129 @@ async fn convergence_tick(
                 );
             }
         }
+    }
+}
+
+/// Spawn the RS-4 backup ticker — one tokio task that snapshots + prunes BOTH
+/// DB files (`main` + `secure`) every `interval`.  Same F1/F2/biased/Skip
+/// discipline as [`spawn_drain_loop`]; a backup failure is logged-and-swallowed
+/// inside [`crate::db::backup::snapshot_and_prune`] and NEVER fails the loop or
+/// the fiscal path (F1).  Unlike the per-FN loops the FIRST tick is delayed by
+/// one full interval (`interval_at`): an instant-after-boot snapshot only
+/// duplicates the on-disk DB an operator already has, and would make every
+/// short-lived supervised process snapshot needlessly.
+fn spawn_backup_loop(
+    app: App,
+    interval: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<anyhow::Result<()>> {
+    tokio::spawn(async move {
+        // First tick at now + interval (NOT immediate — see fn doc).
+        let mut iv = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut first_tick = true;
+        // F1 INVARIANT: this loop returns `Ok(())` ONLY (on watch-exit); backup
+        // errors are swallowed inside the tick body, never propagated.
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        tracing::info!(target: "prro::runtime::supervisor", "backup loop: shutdown; exiting");
+                        return Ok(());
+                    }
+                }
+                _ = iv.tick() => {
+                    backup_tick(&app, &mut first_tick).await;
+                }
+            }
+        }
+    })
+}
+
+/// One backup pass: ensure the dir exists, then snapshot + prune `main` then
+/// `secure`.  The same-device advisory runs ONCE (first tick).  Every failure
+/// is logged-and-swallowed (F2: a bad backup never stops the supervisor or the
+/// fiscal path).
+async fn backup_tick(app: &App, first_tick: &mut bool) {
+    let dir = app.config().backup.dir.clone();
+    let keep_last = app.config().backup.keep_last;
+    let max_age_days = app.config().backup.max_age_days;
+
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(
+            target: "prro::runtime::supervisor",
+            dir = %dir.display(),
+            error = ?e,
+            "backup tick: cannot create backup dir; skipped this tick"
+        );
+        return;
+    }
+
+    if *first_tick {
+        *first_tick = false;
+        backup_same_device_advisory(app, &dir).await;
+    }
+
+    let main_path = app.config().database.db_path.clone();
+    let secure_path = app.config().database.secure_db_path.clone();
+    let _ = crate::db::backup::snapshot_and_prune(
+        app.db(),
+        &main_path,
+        &dir,
+        "main",
+        keep_last,
+        max_age_days,
+    )
+    .await;
+    let _ = crate::db::backup::snapshot_and_prune(
+        app.db_secure(),
+        &secure_path,
+        &dir,
+        "secure",
+        keep_last,
+        max_age_days,
+    )
+    .await;
+}
+
+/// Emit a WARN advisory (log + `BACKUP_ON_SAME_DEVICE` audit) once if
+/// `backup_dir` shares a physical device with the live main DB — a single disk
+/// failure would then lose BOTH the ledger and its backups.  Best-effort: a
+/// metadata/audit error is logged-and-swallowed, never fails the loop.
+async fn backup_same_device_advisory(app: &App, backup_dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let live = app.config().database.db_path.clone();
+        if let (Ok(d), Ok(l)) = (std::fs::metadata(backup_dir), std::fs::metadata(&live)) {
+            if d.dev() == l.dev() {
+                tracing::warn!(
+                    target: "prro::runtime::supervisor",
+                    backup_dir = %backup_dir.display(),
+                    live_db = %live.display(),
+                    "backup directory is on the SAME device as the live DB — a single disk failure loses both; use a second physical device (see docs/operations/RETENTION_POLICY.md)"
+                );
+                let payload = serde_json::json!({
+                    "backup_dir": backup_dir.display().to_string(),
+                    "live_db": live.display().to_string(),
+                });
+                let _ = crate::db::repositories::audit_log::append(
+                    app.db(),
+                    "backup",
+                    &backup_dir.display().to_string(),
+                    "BACKUP_ON_SAME_DEVICE",
+                    crate::db::models::enums::Severity::Warning,
+                    None,
+                    Some(&payload.to_string()),
+                )
+                .await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, backup_dir);
     }
 }
 
