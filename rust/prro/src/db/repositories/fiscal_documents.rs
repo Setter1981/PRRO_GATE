@@ -721,6 +721,28 @@ pub async fn last_submitted_server_fiscal_no(
     .await
 }
 
+/// M1 review item 2(b), 2026-06-11 — the FN's highest **submitted** `lnd`: the
+/// max `lnd` over docs in `{SENT, KVT1, KVT2, ACK}` carrying a non-empty
+/// `server_fiscal_no` (the same "submitted tip" cohort as
+/// [`last_submitted_server_fiscal_no`], returning the position instead of the
+/// id).  Used by the boot SENT-recovery / online-convergence Mismatch arm to
+/// tell a SUPERSEDED doc (its `lnd` < this max — a newer submitted doc became
+/// DPS's tip) from a genuine tip-Mismatch (operator handoff).  `None` when no
+/// submitted doc exists.  Pool-bound read, no write-tx.
+pub async fn max_submitted_lnd(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MAX(lnd) FROM fiscal_documents \
+         WHERE fiscal_number = ? AND state IN ('SENT', 'KVT1', 'KVT2', 'ACK') \
+               AND server_fiscal_no IS NOT NULL AND length(server_fiscal_no) > 0",
+    )
+    .bind(fiscal_number)
+    .fetch_one(pool)
+    .await
+}
+
 /// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 / HIGH-C4-8
 /// resolution; HIGH-C5-1 session scoping; MED-C5-4 KVT2 deferral
 /// reversed by **M3b W12 Commit 3**) — strict `lnd ASC` walker for

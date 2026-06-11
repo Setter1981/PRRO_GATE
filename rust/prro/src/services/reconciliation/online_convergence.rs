@@ -100,6 +100,14 @@ pub async fn run_tick_for_fn(
 ) -> anyhow::Result<TickSummary> {
     // (b) mode-guard — Online only.  A missing node_state row means the FN was
     // never booted; there is nothing to converge (boot bootstraps it).
+    //
+    // M1 review item 5 (M1-05/M1-H2 ruling, 2026-06-11) — this `Online`-only
+    // guard is LOAD-BEARING for concurrency: the convergence tick holds the
+    // `fn_write_gate`, the offline drain holds the SEPARATE `reconcile_mutex`
+    // (see `App::drain_offline_backlog_with`).  Both reuse the same SENT/KVT1
+    // arms under non-overlapping locks, so mutual exclusion relies on this
+    // mode-partition (drain ⇒ `GoingOnline`; convergence ⇒ `Online`) + per-row
+    // CAS — NOT a shared lock.  Unification under `fn_gate` is deferred to A2.4.
     let Some(ns) = node_state::get(pool, fiscal_number).await? else {
         return Ok(TickSummary::new(fiscal_number));
     };

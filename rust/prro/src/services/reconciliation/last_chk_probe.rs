@@ -21,10 +21,16 @@
 //!    re-send case: DPS doesn't have our doc; Pattern B re-drive
 //!    via `ErrorRetryable → Sending` is correct.
 //!
-//! Plus two error fall-throughs:
+//! Plus three error fall-throughs (M1 review item 3, 2026-06-11 — contract
+//! corrected to match the caller's actual, ruled-intended behaviour):
 //!   - Transport error → keep `Sent` + audit `BOOT_LAST_CHK_TRANSPORT_RETRY`.
-//!   - Decode error → escalate to `RequiresManualReconciliation` per
-//!     §2 main-table Decode rule (no bounded retry on Decode).
+//!   - Decode error → DEFER: keep `Sent` (no state change), re-probe next boot.
+//!     (The earlier "escalate to RequiresManualReconciliation / no bounded
+//!     retry" wording was aspirational; the SENT-recovery caller defers, which
+//!     the architect ruled is the intended safe behaviour — unbounded-defer
+//!     visibility belongs to monitoring v1's stuck-FN detector, not a terminal.)
+//!   - Unexpected `DpsError` (Authorization / Server{code} / Internal — not
+//!     normally surfaced by a query probe) → also DEFER, distinct audit signal.
 //!
 //! This module emits the **classified outcome**; it does NOT mutate
 //! state.  Caller (W9.3 `boot_phase::run_boot_reconciliation`)
@@ -60,8 +66,11 @@ pub enum ProbeOutcome {
     /// `Sent`, emits `BOOT_LAST_CHK_TRANSPORT_RETRY` audit.
     TransportRetry { reason: String },
 
-    /// `DpsError::Decode` — protocol drift, non-bounded-retry per
-    /// §2.  Caller escalates to `RequiresManualReconciliation`.
+    /// `DpsError::Decode` — protocol drift.  Caller DEFERS (keeps `Sent`, no
+    /// state change; re-probed next boot) — M1 review item 3 ruling: defer is
+    /// the intended safe behaviour, NOT a terminal `RequiresManualReconciliation`
+    /// (despite the historical variant name).  Stuck-FN visibility is monitoring
+    /// v1's job.
     DecodeEscalate { reason: String },
 
     /// W9.4 L4 fix: catch-all for unexpected `DpsError` variants that
