@@ -743,6 +743,29 @@ impl App {
         Ok(ScheduledDrainOutcome::Ran(summary))
     }
 
+    /// B1 v1 — run one online-convergence tick for `fiscal_number` UNDER the A4
+    /// per-FN write-path gate.  Holding [`Self::acquire_fn_gate`] across the
+    /// whole tick serialises it against the live inline fiscalize for that FN
+    /// (invariant #2 — executes the A4 forward contract documented on
+    /// `acquire_fn_gate`).  The reused arms' wire calls run under the gate,
+    /// which is fine: the gate is a `tokio::sync::Mutex`, NOT a SQL transaction,
+    /// so invariant #1 (no wire/crypto inside a `with_immediate`) is untouched
+    /// — the arms keep their `last_chk` calls strictly between committed
+    /// envelopes.
+    pub async fn converge_online_for_fn<'a>(
+        &self,
+        fiscal_number: &str,
+        view: &crate::services::reconciliation::RuntimeView<'a>,
+    ) -> anyhow::Result<crate::services::reconciliation::online_convergence::TickSummary> {
+        let _gate = self.acquire_fn_gate(fiscal_number).await;
+        crate::services::reconciliation::online_convergence::run_tick_for_fn(
+            self.db(),
+            view,
+            fiscal_number,
+        )
+        .await
+    }
+
     pub fn config(&self) -> &AppConfig {
         &self.inner.config
     }

@@ -614,10 +614,14 @@ async fn k5_kvt2_committed_finalizes_to_ack() {
 //           test drops the `inline::run` future (drop-injection, spec §2/§4).
 // Recovery: boot with deps whose lastChk now answers Match (id==sfn, non-empty
 //           data_sign) → SENT-probe (:2822) → advance Sent→Kvt1, then the Kvt1
-//           arm is a passive hold (:2676).
-// Locked:   doc rests at KVT1, `send_chk` total == 1, `last_chk` ≥ 1, scan
-//           clean.  The final online-Kvt1 ACK requires the ops-loop / B1
-//           (known OCF-5) — we assert resting KVT1 and do NOT force ACK.
+//           arm is a passive hold (:2676).  After boot the doc rests at KVT1.
+// Phase 3:  the B1 online-convergence tick (audit pass-2, item 3) is now the
+//           runtime owner of resting online KVT1 — it converges KVT1 → ACK via
+//           the reused Kvt1Reentry confirm path WITHOUT resending.  This closes
+//           the OCF-5 hole this matrix originally surfaced ("no forced ACK").
+// Locked:   after boot — doc KVT1, `send_chk` total == 1, `last_chk` ≥ 1, scan
+//           clean.  After the B1 tick — doc ACK, `send_chk` STILL == 1, scan
+//           clean (the tick issues only lastChk, never a resend).
 // ════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -697,6 +701,41 @@ async fn k4_sent_committed_probe_holds_at_kvt1() {
         "at least one lastChk (the recovery probe)"
     );
     assert_eq!(count_doc_rows(&pool).await, 1, "exactly one ledger row");
+    prro::db::invariant_scan::assert_clean(&pool).await;
+
+    // ── Phase 3 (B1): the online-convergence tick OWNS the resting KVT1 and
+    //    converges it to ACK — without resending.  Counters stay SHARED, so the
+    //    "exactly one send_chk EVER" property is proven across crash + boot + tick.
+    let phase3 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    phase3.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // confirm Match
+    let sign_ctx3 = det_signing_ctx();
+    let fn_sign3 = fn_sign_blob();
+    let view3 = RuntimeView {
+        dps: &phase3,
+        signing_ctx: &sign_ctx3,
+        fn_sign: &fn_sign3,
+    };
+    let summary =
+        prro::services::reconciliation::online_convergence::run_tick_for_fn(&pool, &view3, FN)
+            .await
+            .expect("B1 convergence tick must succeed");
+
+    assert_eq!(
+        read_doc_state(&pool, FN).await,
+        "ACK",
+        "B1 tick converges the resting KVT1 → ACK (closes the matrix-found OCF-5 hole)"
+    );
+    assert_eq!(summary.acked_from_kvt1, 1, "tick acked the resting KVT1");
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        1,
+        "send_chk STILL == 1 across crash + boot + B1 tick — the tick never resends"
+    );
+    assert_eq!(
+        count_doc_rows(&pool).await,
+        1,
+        "still exactly one ledger row"
+    );
     prro::db::invariant_scan::assert_clean(&pool).await;
 }
 
