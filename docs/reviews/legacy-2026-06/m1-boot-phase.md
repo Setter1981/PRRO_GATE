@@ -78,3 +78,62 @@ The drain/convergence mode-partition is a read-then-act outside any shared lock.
 
 ## Architect rulings
 _(Fable: append rulings here; re-run M1-01/M1-02/M1-04 repros first.)_
+
+**(Fable 5, 2026-06-11; M1-01/02 re-verified in code; seam-pass §2b folded in below.)**
+
+- **M1-01 (HIGH) — CONFIRMED by architect read** (`Ok(_) => *_dispatched` absorbs the two
+  zero-wire outcomes; same class as the B1 Mismatch-filter bug). FIX (batch item 1, semantic
+  but narrow): match `{Sent,Routed}` explicitly into `*_dispatched`; route
+  `StateConflict|DocumentMissing` into new non-answered buckets; pinning test per the dossier
+  repro + a unit pinning the FULL `StageSendOutcome→bucket` mapping (so a future variant
+  cannot be silently absorbed — the classification-obligation comment gets teeth).
+- **M1-02 (HIGH) — arm defect CONFIRMED; reachability UNRESOLVED.** Seam-pass finding: the
+  MAC-chain seed (`stage_sign.rs:286`, seed = `node_state.last_known_unsigned_xml_sha256`)
+  suggests a second doc signed while the first rests SENT would carry a stale
+  `previous_hash` — DPS would likely reject it, making "≥2 acked SENT" unreachable online.
+  But this is exactly an unverified "likely". FIX (batch item 2): (a) **reachability pin
+  test** — two sequential `inline::run` on one FN, first resting SENT via Hold; record what
+  actually happens to the second (acquire? sign seed? send?) + `invariant_scan`; this decides
+  final severity mechanically. (b) regardless of (a), harden the shared arm (one fix point —
+  boot + B1 tick both use it): on `Mismatch`, if the probed doc is NOT the newest submitted
+  doc (`lnd < max lnd over {SENT,KVT1,KVT2,ACK}` with sfn), do NOT terminalise to Manual —
+  no-state-change + `TIP_SUPERSEDED`-style audit (doc-scoped confirmation is the deferred
+  ER-probe/B1-v2 protocol spec; monitoring v1's stuck-detector owns visibility). Mismatch on
+  the actual tip → Manual stays.
+- **M1-03 (MED) — ruled: defer is the INTENDED semantics** (safe direction; no false
+  terminal). Fix the CONTRACT, not the behaviour: amend `last_chk_probe.rs` docs
+  (DecodeEscalate → "caller defers"; add `Unexpected` as the third fall-through in the
+  header). Unbounded-defer visibility belongs to monitoring v1 (stuck-FN detector) — noted
+  as an input to that spec. Doc-only batch item 3.
+- **M1-04 (MED) — ACCEPTED as mechanical fix** (batch item 4): `attempts_used` counts only
+  send attempts (filter by the column that distinguishes a real envelope from a probe row —
+  if the existing schema cannot distinguish them unambiguously, STOP and escalate; a 002
+  migration adding an explicit kind is acceptable post-squash if needed) + SQL pin test.
+  M4-contract root noted for the M4 dossier.
+- **M1-05 (MED) + M1-H2 — ruled: pin now, unify at A2.4.** The mode-partition
+  (GoingOnline↔drain / Online↔convergence) is declared LOAD-BEARING: batch item 5 adds
+  cross-referenced comments at all three sites (drain entry, convergence entry, fn_gate
+  contract #4 with "deferred to A2.4 integration") + the dossier's partition rationale.
+  Unification under fn_gate goes to the A2.4 checklist (already on the deferred list).
+- **M1-06 (LOW) — ruled: document, don't thread.** ADR-M3-A10 §4 carry-forward comment on
+  the helpers' module header. Token-threading through ~8 helpers is churn without a
+  current attacker (single-process; CAS protects). Batch item 6 (comment only).
+- **M1-07 (LOW) — ruled: accept + amend wording** ("manual triage" → "held; surfaced via
+  monitoring stuck-detector"); input to monitoring v1 spec. Batch item 7 (doc-only).
+- **M1-08 (LOW) — ruled: K7 kill-point test YES** (the only multi-envelope boot window
+  with durable pre-CAS state — belongs in the matrix); orphan double-allocation accepted
+  as benign ONCE M1-04 lands (budget pollution was its only harm) — comment, no resume
+  mechanics. Batch item 8.
+- **M1-H1 — seam-pass verdict:** window (b) closed for first boot today (Opus verified
+  boot-awaited-before-ingress; inline path dormant). Window (a) = the documented PR#141
+  residual, WIDENED by M1-01 — batch item 1 narrows it back; full closure remains the
+  pre-arms ACK-tail check spec (post-legacy-review, unchanged). **A2.4 checklist gains:
+  re-verify health-gate vs boot ordering with the live write path.**
+- **Seam-pass summary (§2b):** gate↔arms (M1-01) and probe↔ledger (M1-02 chain-seed
+  question) were the two live seams; both are now pinned by batch items. drain↔convergence
+  lock seam ruled in M1-05. No additional cross-module finding beyond the dossier.
+
+**Fix batch:** single branch `fix/m1-batch` (Opus, by the B1-era fence rules: reuse, no new
+transitions beyond ruled ones, escalate on divergence), items 1-8 above; gates: full
+nextest + fmt + clippy + the new pins. Items 1, 2 and 4 carry production-semantics changes —
+architect re-reviews the delta before merge.
