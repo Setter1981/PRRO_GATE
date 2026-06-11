@@ -883,3 +883,145 @@ async fn tip_guard_kill_switch_disables_all_wire_and_audit() {
         "kill-switch: zero guard audit rows"
     );
 }
+
+/// Raw-seed one in-flight KVT1 doc with a chosen `server_fiscal_no` and `lnd`
+/// (kill-matrix direct-insert style).  Used by test 13 to place a fresh
+/// in-flight doc NEWER than an earlier ACK, so the guard's "newest submitted"
+/// expected tip is the in-flight doc rather than the last ACK.
+async fn seed_inflight_kvt1(pool: &SqlitePool, lnd: i64, server_fiscal_no: &str) {
+    let doc_bytes = vec![0xC1u8; 16];
+    let req_bytes = vec![0xC2u8; 16];
+    let canonical_sha = vec![0u8; 32];
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical, server_fiscal_no) \
+         VALUES (?, ?, ?, ?, 'SELL', 'KVT1', 'b', 't', 'ONLINE', '2026-01-01T00:00:00Z', '{}', ?, ?)",
+    )
+    .bind(&doc_bytes)
+    .bind(&req_bytes)
+    .bind(FN)
+    .bind(lnd)
+    .bind(&canonical_sha)
+    .bind(server_fiscal_no)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 13 (architect ruling 3) — in-flight tip is CONSISTENT, not stale.
+// The expected tip is the newest SUBMITTED doc (max-lnd in {SENT,KVT1,KVT2,
+// ACK}), so a fresh in-flight KVT1 newer than the last ACK is DPS's legitimate
+// latest check — NOT a stale-ledger BLOCK.  (With the old ACK-only comparison
+// this case false-BLOCKed; this is the regression test for the fix.)
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tip_guard_inflight_tip_is_consistent_not_stale() {
+    let env = setup_online_fn("live.db").await;
+    // ACK#1 (lnd=1, sfn SFN-1) via the proven online path.
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 1, "SFN-1").await;
+    // A FRESH in-flight KVT1#2 (lnd=2, sfn SFN-2) — newer than the ACK; this is
+    // DPS's legitimate latest check (crash mid-finalize / boot Match-advance).
+    seed_inflight_kvt1(&env.pool, 2, "SFN-2").await;
+
+    // DPS's lastChk reports SFN-2 — our newest SUBMITTED doc, not the last ACK.
+    let stub = DpsStub::new();
+    stub.push_last(Ok(ack("SFN-2", vec![])));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let outcome = boot_phase::run_boot_tip_guard(&recon_guard(), &env.pool, FN, &view, true)
+        .await
+        .expect("tip-guard runs");
+
+    assert!(
+        matches!(outcome, boot_phase::TipGuardOutcome::TipConsistent),
+        "a fresh in-flight tip matching DPS must be consistent, got {outcome:?}"
+    );
+    assert_eq!(
+        node_mode(&env.pool).await,
+        "ONLINE",
+        "a legitimate in-flight tip must NOT block a healthy node"
+    );
+    assert_eq!(
+        stub.last_calls(),
+        1,
+        "guard issues exactly one lastChk probe"
+    );
+    let crit: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'TIP_GUARD_STALE_LEDGER'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        crit, 0,
+        "no stale-ledger alarm for a legitimate in-flight tip"
+    );
+    let ok: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE event_type = 'TIP_GUARD_OK'")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(ok, 1, "exactly one INFO TIP_GUARD_OK audit row");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 14 (architect ruling 4(b)) — degraded-mode skip.  A node in STOP_MODE
+// (non-trading) gets NO guard: zero wire, mode unchanged (no BLOCKED overwrite
+// that would clobber the operator-relevant degradation context).
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tip_guard_skips_degraded_mode_node() {
+    let env = setup_online_fn("live.db").await;
+    // Non-empty ACK tail present — proves the skip is mode-driven, not tail-driven.
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 1, "SFN-1").await;
+    sqlx::query("UPDATE node_state SET mode = 'STOP_MODE' WHERE fiscal_number = ?")
+        .bind(FN)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+
+    // Empty queues — any wire call would panic ("…_q empty"): strict zero-wire.
+    let stub = DpsStub::new();
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let outcome = boot_phase::run_boot_tip_guard(&recon_guard(), &env.pool, FN, &view, true)
+        .await
+        .expect("tip-guard runs");
+
+    assert!(
+        matches!(outcome, boot_phase::TipGuardOutcome::SkippedMode { mode } if mode == NodeMode::StopMode),
+        "degraded mode must skip the guard, got {outcome:?}"
+    );
+    assert_eq!(
+        stub.last_calls(),
+        0,
+        "degraded mode: zero lastChk wire calls"
+    );
+    assert_eq!(stub.send_calls(), 0, "degraded mode: zero send wire calls");
+    assert_eq!(
+        node_mode(&env.pool).await,
+        "STOP_MODE",
+        "the guard must NOT overwrite the degraded mode"
+    );
+    assert_eq!(
+        count_audit_like(&env.pool, "TIP_GUARD%").await,
+        0,
+        "degraded mode: zero guard audit rows"
+    );
+}

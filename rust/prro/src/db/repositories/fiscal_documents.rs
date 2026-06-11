@@ -686,6 +686,41 @@ pub async fn last_server_fiscal_no(
     .await
 }
 
+/// PR-B (RS-4 audit pass-2, spec §B ruling 3, 2026-06-11) — the FN's newest
+/// **submitted** server fiscal number: the `server_fiscal_no` of the
+/// max-`lnd` doc in any state that has crossed the `Sending → Sent` CAS and
+/// therefore carries a DPS-stamped wire id — `{SENT, KVT1, KVT2, ACK}`.
+///
+/// This is the boot tip-guard's expected DPS tip (NOT
+/// [`last_server_fiscal_no`], which is ACK-only and is intentionally kept for
+/// its existing read-only-status callers).  The guard's question is "is DPS's
+/// last check the last check WE submitted?", not "…the last we finalized": a
+/// fresh in-flight `KVT1`/`KVT2` doc (crash mid-finalize, or a boot
+/// `Sent → Kvt1` Match-advance) is a *legitimate* DPS tip and must NOT trip a
+/// false stale-ledger BLOCK (the original §B-1 ACK-only comparison did — fixed
+/// here per the architect's locked ruling 3, variant (a)).
+///
+/// `RequiresManualReconciliation` is **deliberately excluded**: a doc that
+/// diverged into manual triage need not be DPS's tip, and that node is already
+/// under operator attention.  Ranked `lnd DESC` (strictly-monotonic issuance
+/// order; no NULL hazard — see [`last_server_fiscal_no`] for why not
+/// `first_kvt1_at`).  Pool-bound read, NO write-tx.
+pub async fn last_submitted_server_fiscal_no(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT server_fiscal_no FROM fiscal_documents \
+         WHERE fiscal_number = ? AND state IN ('SENT', 'KVT1', 'KVT2', 'ACK') \
+               AND server_fiscal_no IS NOT NULL AND length(server_fiscal_no) > 0 \
+         ORDER BY lnd DESC \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await
+}
+
 /// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 / HIGH-C4-8
 /// resolution; HIGH-C5-1 session scoping; MED-C5-4 KVT2 deferral
 /// reversed by **M3b W12 Commit 3**) — strict `lnd ASC` walker for

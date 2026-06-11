@@ -639,28 +639,47 @@ impl App {
             // fail-closed; transient probe failures are deferred INSIDE the
             // guard (offline-first) and surface as `Ok(ProbeDeferred)`.
             if let Some(view) = per_fn_view.as_ref() {
-                let tip_outcome = boot_phase::run_boot_tip_guard(
-                    &_recon_guard,
-                    pool,
-                    &fn_cfg.fiscal_number,
-                    view,
-                    tip_guard_enabled,
-                )
-                .await
-                .map_err(|e| match e.downcast::<sqlx::Error>() {
-                    Ok(sqlx_err) => BootError::Database(sqlx_err),
-                    Err(other) => BootError::ReconciliationFailed {
-                        fiscal_number: fn_cfg.fiscal_number.clone(),
-                        source: other,
-                    },
-                })?;
-                if let boot_phase::TipGuardOutcome::Blocked { expected, observed } = &tip_outcome {
-                    tracing::error!(
+                // Trigger-gate (architect ruling on the trigger-scope escalation,
+                // 2026-06-11).  Run the guard ONLY when this boot made no
+                // answered DPS exchange for the FN: after a `send_chk` re-drive
+                // or a `dispatch_sent_via_probe` arm, a tip-guard `lastChk` is
+                // uninformative by construction (it would return the doc we just
+                // submitted / the arm already ran the same comparison).  The
+                // guard's information is non-zero exactly where the boot did not
+                // touch the wire — an all-ACK restore or a passively-held
+                // restored KVT1/KVT2.  See
+                // `boot_phase::DispatchHistogram::answered_wire_contact`.
+                if outcome.answered_wire_contact() {
+                    tracing::debug!(
                         fiscal_number = %fn_cfg.fiscal_number,
-                        expected_server_fiscal_no = %expected,
-                        dps_last_chk_id = %observed,
-                        "boot tip-guard: STALE LEDGER — node BLOCKED (will not trade until operator resolves)"
+                        "tip guard skipped: boot already exchanged with DPS this pass"
                     );
+                } else {
+                    let tip_outcome = boot_phase::run_boot_tip_guard(
+                        &_recon_guard,
+                        pool,
+                        &fn_cfg.fiscal_number,
+                        view,
+                        tip_guard_enabled,
+                    )
+                    .await
+                    .map_err(|e| match e.downcast::<sqlx::Error>() {
+                        Ok(sqlx_err) => BootError::Database(sqlx_err),
+                        Err(other) => BootError::ReconciliationFailed {
+                            fiscal_number: fn_cfg.fiscal_number.clone(),
+                            source: other,
+                        },
+                    })?;
+                    if let boot_phase::TipGuardOutcome::Blocked { expected, observed } =
+                        &tip_outcome
+                    {
+                        tracing::error!(
+                            fiscal_number = %fn_cfg.fiscal_number,
+                            expected_server_fiscal_no = %expected,
+                            dps_last_chk_id = %observed,
+                            "boot tip-guard: STALE LEDGER — node BLOCKED (will not trade until operator resolves)"
+                        );
+                    }
                 }
             }
         }

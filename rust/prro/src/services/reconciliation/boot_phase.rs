@@ -293,6 +293,61 @@ impl DispatchHistogram {
             + self.signer_refused_structural_bug
     }
 
+    /// PR-B (RS-4 audit pass-2, architect ruling on the trigger-scope
+    /// escalation, 2026-06-11) — did this boot complete at least one
+    /// **answered** DPS wire exchange for the FN?  An "answered" exchange is a
+    /// `send_chk` that returned an ack/reject, or a `lastChk` probe that
+    /// returned `Match` / `Mismatch` / `NotFound`.
+    ///
+    /// The boot stale-tip guard ([`run_boot_tip_guard`]) is gated on the
+    /// NEGATION of this: it runs only when the boot did **not** touch the wire
+    /// for the FN.  Rationale (architect): after an answered exchange the guard
+    /// probe is uninformative *by construction* — a `send_chk` re-drive means a
+    /// post-hoc `lastChk` would return the doc we just submitted (a guaranteed
+    /// `Match`, i.e. the guard is blind), and a `dispatch_sent_via_probe` arm
+    /// already performed the very same `lastChk` comparison seconds earlier.
+    /// The guard carries non-zero information exactly where the boot did not
+    /// touch the wire: an all-`ACK` restore (test 8) and a passively-held
+    /// restored `KVT1`/`KVT2` (test 13).
+    ///
+    /// **`TransportRetry` / `DecodeEscalate` are NOT evidence** (no answer was
+    /// received): `sent_probe_failure_deferred` is deliberately excluded, so a
+    /// boot whose only contact was a deferred probe still runs the guard (whose
+    /// own probe will most likely also defer — consistent and harmless).
+    ///
+    /// **CLASSIFICATION OBLIGATION:** any NEW `DispatchHistogram` bucket that
+    /// can involve a DPS wire call MUST be classified here (counted iff it
+    /// implies an *answered* exchange).
+    ///
+    /// **Known approximation (documented residual):** the three `*_dispatched`
+    /// buckets count a `send_chk` regardless of whether it was *answered* or
+    /// *transport-failed* — the histogram does not split the two without a
+    /// hot-path change.  A transport-failed send leaves its doc in
+    /// `ErrorRetryable` (NOT the submitted-tip set), so the only residual gap is
+    /// "a prior submitted tip + a brand-new transport-failed send this boot",
+    /// where the guard is skipped one boot early and the next boot re-covers it.
+    pub fn answered_wire_contact(&self) -> bool {
+        // Answered sends (the dispatched buckets each issue `send_chk`).
+        self.signed_dispatched > 0
+            || self.error_retryable_dispatched > 0
+            || self.prepared_dispatched > 0
+            // Answered probes — Match / Mismatch / NotFound.
+            || self.sent_match_to_kvt1 > 0
+            || self.sent_mismatch_to_manual > 0
+            || self.sent_not_found_to_error_retryable > 0
+        // NOT counted (no answered DPS exchange):
+        //   - sent_probe_failure_deferred — TransportRetry/Decode probe (no answer).
+        //   - sending_resumed / encrypted_rerouted — Sending/Encrypted→ER, no DPS.
+        //   - kvt1_held / kvt2_finalized / kvt2_failed — passive hold / local
+        //     finalize, no DPS query.
+        //   - offline_local_ack_emitted — offline local ack, no wire.
+        //   - write_path_dispatch_refused / signer_refused_* — refused before any send.
+        //   - *_deferred (ctx-free) / error_retryable_{escalated_to_manual,
+        //     probe_deferred,indeterminate_deferred,budget_exhausted} /
+        //     prepared_replay_drift_deferred — durable-class routing, no wire.
+        //   - dispatch_errors — helper error; conservatively NOT treated as evidence.
+    }
+
     fn merge(&mut self, other: &DispatchHistogram) {
         self.sending_resumed += other.sending_resumed;
         self.kvt1_held += other.kvt1_held;
@@ -1108,6 +1163,22 @@ impl BranchOutcome {
             BranchOutcome::PreservedCryptoDegraded => "f3",
         }
     }
+
+    /// PR-B (RS-4 audit pass-2, architect trigger-scope ruling 2026-06-11) —
+    /// did this FN's boot reconciliation complete an answered DPS wire exchange?
+    /// Only the per-doc dispatch path (branch (c)/(e1) → [`Reconciled`]) can
+    /// touch the wire; every other branch (Bootstrapped / IdempotentNoop /
+    /// OfflineRefusal / OrphanShiftResolved / Preserved*) does no DPS call, so
+    /// it answers `false`.  See [`DispatchHistogram::answered_wire_contact`] for
+    /// the per-bucket classification and the gate rationale.
+    ///
+    /// [`Reconciled`]: BranchOutcome::Reconciled
+    pub fn answered_wire_contact(&self) -> bool {
+        match self {
+            BranchOutcome::Reconciled { histogram, .. } => histogram.answered_wire_contact(),
+            _ => false,
+        }
+    }
 }
 
 /// W9 freeze §3 + §4 — per-FN decision tree.
@@ -1618,8 +1689,13 @@ pub enum TipGuardOutcome {
     /// `tip_guard_enabled = false` (config kill-switch).  Short-circuits
     /// BEFORE any DB read or wire call — zero wire, zero audit.
     Disabled,
-    /// Empty ACK tail (a fresh FN with no confirmed receipt yet) — the guard
-    /// is silently skipped; zero wire.
+    /// Node is in a non-trading degraded mode (`Blocked` / `StopMode` /
+    /// `CryptoDegraded`) — the guard is pointless (the node won't trade) and
+    /// flipping to BLOCKED would clobber operator-relevant degradation context.
+    /// Skipped with an INFO log; zero wire (architect ruling 4(b), 2026-06-11).
+    SkippedMode { mode: NodeMode },
+    /// Empty submitted tail (a fresh FN with no doc past `Sending → Sent`
+    /// yet) — the guard is silently skipped; zero wire.
     SkippedNoAckTail,
     /// `lastChk` matched the ledger's last ACK doc `server_fiscal_no` — the
     /// tip is consistent with DPS.  INFO `TIP_GUARD_OK` audit; node untouched.
@@ -1658,6 +1734,18 @@ pub enum TipGuardOutcome {
 ///     only the BLOCK + audit form a single short `with_immediate` envelope.
 ///   - Offline-first: a transient probe failure DEFERS (does not block); the
 ///     guard re-runs on the next boot once DPS is reachable.
+///
+/// **Residual risk (accepted + documented; architect ruling 2026-06-11).** The
+/// guard does NOT protect against a snapshot that captured a *pre-wire* doc
+/// (`PREPARED` / `SIGNED`) that is then restored: on boot the recovery arm-ups
+/// re-drive that doc through `send_chk` BEFORE the guard, so the
+/// [`answered_wire_contact`](DispatchHistogram::answered_wire_contact) gate
+/// skips the guard for that FN (and a re-used `lnd` is possible before any tip
+/// check).  Placing the guard *before* the arm-ups was rejected — it would
+/// false-block normal crash-recovery.  Mitigation: snapshot frequency vs. the
+/// short pre-wire window.  Full closure (a pre-arms, ACK-tail-only check) is a
+/// separate spec after the legacy review, NOT this PR.  See
+/// `docs/operations/BACKUP_RESTORE_RUNBOOK.md`.
 pub async fn run_boot_tip_guard(
     _guard: &super::ReconcileGuard<'_>,
     pool: &SqlitePool,
@@ -1666,7 +1754,7 @@ pub async fn run_boot_tip_guard(
     tip_guard_enabled: bool,
 ) -> anyhow::Result<TipGuardOutcome> {
     use super::last_chk_probe::{self, ProbeOutcome};
-    use crate::db::repositories::fiscal_documents;
+    use crate::db::repositories::{fiscal_documents, node_state};
 
     // Kill-switch — short-circuit BEFORE any DB read or wire call (spec §B-1.4).
     if !tip_guard_enabled {
@@ -1677,10 +1765,35 @@ pub async fn run_boot_tip_guard(
         return Ok(TipGuardOutcome::Disabled);
     }
 
-    // Step 1 — the last (max-`lnd`) ACK doc's server fiscal number.  `None`
-    // means an empty ACK tail (fresh FN): the guard is silently skipped, zero
-    // wire.  Pool-bound read, no transaction.
-    let Some(expected) = fiscal_documents::last_server_fiscal_no(pool, fiscal_number).await? else {
+    // Mode gate (architect ruling 4(b), 2026-06-11) — a node already in a
+    // non-trading degraded mode (Blocked / StopMode / CryptoDegraded) gets NO
+    // guard: it won't trade, so the tip check is pointless, and a BLOCKED flip
+    // would clobber the operator-relevant degradation context.  GoingOnline is
+    // deliberately NOT skipped (ruling 4(a)) — a snapshot can be taken
+    // mid-drain, so a restore can legitimately boot straight into GoingOnline
+    // and DOES need the guard; ruling 3's in-flight expected-tip set removes
+    // the drain-lag false positive.  Pool-bound read, no wire.
+    if let Some(row) = node_state::get(pool, fiscal_number).await? {
+        if matches!(
+            row.mode,
+            NodeMode::Blocked | NodeMode::StopMode | NodeMode::CryptoDegraded
+        ) {
+            tracing::info!(
+                fiscal_number = %fiscal_number,
+                mode = row.mode.as_str(),
+                "boot tip-guard skipped — node in a non-trading degraded mode"
+            );
+            return Ok(TipGuardOutcome::SkippedMode { mode: row.mode });
+        }
+    }
+
+    // Step 1 — the FN's newest SUBMITTED server fiscal number: the max-`lnd`
+    // doc in {SENT, KVT1, KVT2, ACK} that crossed the `Sending → Sent` CAS
+    // (ruling 3).  `None` = empty submitted tail (fresh FN): guard silently
+    // skipped, zero wire.  Pool-bound read, no transaction.
+    let Some(expected) =
+        fiscal_documents::last_submitted_server_fiscal_no(pool, fiscal_number).await?
+    else {
         return Ok(TipGuardOutcome::SkippedNoAckTail);
     };
 
@@ -3229,6 +3342,105 @@ mod tests {
     use super::*;
     use crate::db::models::ids::DocumentId;
     use sqlx::SqlitePool;
+
+    /// PR-B (architect trigger-scope ruling, 2026-06-11) — pin the per-bucket
+    /// classification of [`DispatchHistogram::answered_wire_contact`], the gate
+    /// the boot stale-tip guard is conditioned on.  Answered sends/probes count
+    /// as wire contact (guard skipped); passive holds, local finalize, offline
+    /// acks, and unanswered (Transport/Decode) probes do NOT (guard runs).
+    #[test]
+    fn answered_wire_contact_classifies_buckets() {
+        // Answered sends → wire contact (guard skipped).
+        assert!(DispatchHistogram {
+            signed_dispatched: 1,
+            ..Default::default()
+        }
+        .answered_wire_contact());
+        assert!(DispatchHistogram {
+            prepared_dispatched: 1,
+            ..Default::default()
+        }
+        .answered_wire_contact());
+        assert!(DispatchHistogram {
+            error_retryable_dispatched: 1,
+            ..Default::default()
+        }
+        .answered_wire_contact());
+        // Answered probes (Match / Mismatch / NotFound) → wire contact.
+        assert!(DispatchHistogram {
+            sent_match_to_kvt1: 1,
+            ..Default::default()
+        }
+        .answered_wire_contact());
+        assert!(DispatchHistogram {
+            sent_mismatch_to_manual: 1,
+            ..Default::default()
+        }
+        .answered_wire_contact());
+        assert!(DispatchHistogram {
+            sent_not_found_to_error_retryable: 1,
+            ..Default::default()
+        }
+        .answered_wire_contact());
+
+        // NOT an answered exchange → guard must still run.
+        assert!(!DispatchHistogram::default().answered_wire_contact());
+        assert!(
+            !DispatchHistogram {
+                kvt1_held: 1,
+                ..Default::default()
+            }
+            .answered_wire_contact(),
+            "passive KVT1 hold has no wire — restored in-flight (ruling 3) must run the guard"
+        );
+        assert!(
+            !DispatchHistogram {
+                kvt2_finalized: 1,
+                ..Default::default()
+            }
+            .answered_wire_contact(),
+            "local Kvt2 finalize does no DPS query"
+        );
+        assert!(
+            !DispatchHistogram {
+                sent_probe_failure_deferred: 1,
+                ..Default::default()
+            }
+            .answered_wire_contact(),
+            "Transport/Decode probe is NOT an answered exchange (ruling: guard runs)"
+        );
+        assert!(!DispatchHistogram {
+            offline_local_ack_emitted: 1,
+            ..Default::default()
+        }
+        .answered_wire_contact());
+
+        // BranchOutcome delegation.
+        assert!(
+            !BranchOutcome::IdempotentNoop.answered_wire_contact(),
+            "branch (b) all-ACK restore: no wire → guard runs"
+        );
+        assert!(!BranchOutcome::Bootstrapped.answered_wire_contact());
+        assert!(BranchOutcome::Reconciled {
+            histogram: DispatchHistogram {
+                signed_dispatched: 1,
+                ..Default::default()
+            },
+            sub_branch: SubBranch::C,
+        }
+        .answered_wire_contact());
+        assert!(
+            !BranchOutcome::Reconciled {
+                histogram: DispatchHistogram {
+                    kvt1_held: 1,
+                    ..Default::default()
+                },
+                sub_branch: SubBranch::C,
+            }
+            .answered_wire_contact(),
+            "passive KVT1 hold in branch c → guard runs (restored in-flight)"
+        );
+    }
 
     async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
         let dir = tempfile::tempdir().expect("tempdir");

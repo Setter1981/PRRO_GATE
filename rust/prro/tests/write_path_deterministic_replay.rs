@@ -665,6 +665,76 @@ async fn fixture_2_signed_crash_replays_to_sent_one_send_chk() {
     );
 }
 
+// ─── Test 15 (PR-B gate-pin) — boot tip-guard skipped after an answered send ─
+//
+// Architect trigger-scope ruling (2026-06-11): the boot stale-tip guard runs in
+// `reconcile_pending_inner` ONLY when this boot made NO answered DPS exchange
+// for the FN.  A SIGNED-crash replay re-drives the tip via `send_chk`
+// (answered) → `signed_dispatched` → `answered_wire_contact()` true → the gate
+// SKIPS the guard.  This pins: zero extra wire (the stub's last_chk queue is
+// empty — a guard probe would panic, so a green run proves the guard never
+// fired), node mode untouched (no BLOCKED flip), zero TIP_GUARD audits.
+#[tokio::test]
+async fn fixture_15_tip_guard_skipped_after_answered_send() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    let doc = seed_doc_with_signed_xml(app.db(), fn_id, 0x15, "SIGNED").await;
+
+    // send_chk is answered (ack); NO last_chk is enqueued — a tip-guard probe
+    // would panic ("last_chk called but no response enqueued"), so a green run
+    // proves the gate skipped the guard.
+    let stub = StubDpsChannel::new(Ok(ack("server-fiscal-sent-15")));
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile_pending_with green");
+
+    // Boot re-drove the tip via an answered send → the gate skips the guard.
+    assert_eq!(
+        doc_state(app.db(), doc).await,
+        "SENT",
+        "SIGNED replays to SENT via the one answered send"
+    );
+    assert_eq!(
+        summary.docs_advanced.signed_dispatched, 1,
+        "the answered send is recorded as signed_dispatched"
+    );
+    assert!(
+        summary.docs_advanced.answered_wire_contact(),
+        "the histogram classifies the answered send as wire contact (gate input)"
+    );
+    assert_eq!(
+        stub.call_count(),
+        1,
+        "exactly one send_chk; the tip-guard added NO extra wire"
+    );
+
+    // Node mode untouched (guard never ran → no BLOCKED flip).
+    let mode: String = sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+        .bind(fn_id)
+        .fetch_one(app.db())
+        .await
+        .unwrap();
+    assert_eq!(mode, "ONLINE", "guard skipped → node mode untouched");
+    // Zero guard audit rows.
+    let guard_audits: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE event_type LIKE 'TIP_GUARD%'")
+            .fetch_one(app.db())
+            .await
+            .unwrap();
+    assert_eq!(guard_audits, 0, "guard skipped → zero TIP_GUARD audit rows");
+}
+
 // ─── Fixture #9 — §6.7 ERROR_RETRYABLE crash-resume (no MAC burn) ──
 //
 // W0-3 §6.7:831-854 mandates: ERROR_RETRYABLE retry drives through
@@ -2968,10 +3038,18 @@ async fn concurrent_reconcile_pending_with_same_app_serializes() {
         1,
         "HP2-3 / ADR-M3-A10: last_chk MUST NOT overlap across concurrent reconcile_pending_with on the same App"
     );
+    // PR-B (architect ruling on the concurrent-fixture escalation, 2026-06-11):
+    // +1 = the tip-guard probe on the second (no-wire) pass, SERIALISED under
+    // the same W2 mutex.  Pass B passively holds the KVT1 doc with no wire
+    // evidence — for the per-pass tip-guard gate this is indistinguishable from
+    // a restored in-flight KVT1 (ruling 3, test 13), so the guard MUST run.
+    // The load-bearing invariant — max_concurrency_observed() == 1 — is
+    // unchanged (the guard's probe runs under pass B's mutex hold, never
+    // overlapping pass A).
     assert_eq!(
         stub.calls_started(),
-        1,
-        "serialised: second boot has nothing pending after first commits"
+        2,
+        "serialised: dispatch probe (pass A) + tip-guard probe (pass B, no-wire) — both under the W2 mutex"
     );
 }
 
