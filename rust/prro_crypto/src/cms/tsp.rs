@@ -30,10 +30,7 @@ pub enum TspError {
     Parse(String),
     #[error("TSA rejected request: PKIStatus={status}{detail}",
             detail = detail.as_deref().map(|d| format!(" ({d})")).unwrap_or_default())]
-    Rejected {
-        status: u64,
-        detail: Option<String>,
-    },
+    Rejected { status: u64, detail: Option<String> },
     #[error("HTTP transport: {0}")]
     Http(String),
     #[error("HTTP {code} {status_text}")]
@@ -92,10 +89,7 @@ pub fn parse_tsp_response(resp_der: &[u8]) -> Result<Vec<u8>, TspError> {
         } else {
             None
         };
-        return Err(TspError::Rejected {
-            status,
-            detail,
-        });
+        return Err(TspError::Rejected { status, detail });
     }
 
     // timeStampToken ContentInfo — reassemble its DER (tag+len+content)
@@ -311,8 +305,7 @@ mod tests {
         assert_eq!(a, b, "encoding must be deterministic");
         assert_eq!(a[0], 0x30, "starts with SEQUENCE");
         // Must contain the GOST 34.311 OID bytes.
-        const GOST_OID_BYTES: &[u8] =
-            &[0x2A, 0x86, 0x24, 0x02, 0x01, 0x01, 0x01, 0x01, 0x02, 0x01];
+        const GOST_OID_BYTES: &[u8] = &[0x2A, 0x86, 0x24, 0x02, 0x01, 0x01, 0x01, 0x01, 0x02, 0x01];
         assert!(a.windows(GOST_OID_BYTES.len()).any(|w| w == GOST_OID_BYTES));
         assert!(a.windows(digest.len()).any(|w| w == digest));
     }
@@ -331,8 +324,7 @@ mod tests {
     fn tsp_response_extracts_token_on_granted() {
         // PKIStatusInfo = SEQUENCE { INTEGER 0 } → 30 03 02 01 00
         // timeStampToken = SEQUENCE { OCTET STRING "tst" } → 30 05 04 03 74 73 74
-        let resp = hex::decode("300C3003020100300504037473 74".replace(' ', ""))
-            .unwrap();
+        let resp = hex::decode("300C3003020100300504037473 74".replace(' ', "")).unwrap();
         let token = parse_tsp_response(&resp).expect("granted");
         // Token must be the SEQUENCE at position 5..12 of input.
         assert_eq!(token, vec![0x30, 0x05, 0x04, 0x03, 0x74, 0x73, 0x74]);

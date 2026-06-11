@@ -273,7 +273,11 @@ mod tests {
             let mut back = [0u8; 8];
             g.encrypt64(&plain, &mut ct);
             g.decrypt64(&ct, &mut back);
-            assert_eq!(plain, back, "encrypt/decrypt roundtrip failed for {:?}", plain);
+            assert_eq!(
+                plain, back,
+                "encrypt/decrypt roundtrip failed for {:?}",
+                plain
+            );
         }
     }
 

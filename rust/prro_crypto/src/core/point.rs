@@ -177,7 +177,7 @@ pub fn compress_point(p: &Point, curve: &Curve) -> Vec<u8> {
     };
 
     // Serialise x as LE bytes (ceil(m/8) bytes wide).
-    let m_bytes = ((curve.m as usize) + 7) / 8;
+    let m_bytes = (curve.m as usize).div_ceil(8);
     let mut out = vec![0u8; m_bytes];
     for i in 0..m_bytes {
         let word_idx = i / 4;
@@ -236,7 +236,7 @@ pub fn expand_compressed_checked(
     compressed: &[u8],
     curve: &Curve,
 ) -> Result<Point, PointDecodeError> {
-    let expected = ((curve.m as usize) + 7) / 8;
+    let expected = (curve.m as usize).div_ceil(8);
     if compressed.len() != expected {
         return Err(PointDecodeError::WrongLength {
             expected,

@@ -42,9 +42,9 @@
 //! packaging, PKI lifecycle (cert issuance, revocation). Those live
 //! in the application (gateway) layer.
 
-pub mod core;
 pub mod cms;
 pub mod containers;
+pub mod core;
 pub mod interop;
 pub mod profiles;
 

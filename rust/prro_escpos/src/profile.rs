@@ -49,7 +49,8 @@ impl PrinterProfile {
                             let mut cmd = Command::default();
                             for attr in e.attributes().flatten() {
                                 let key = attr.key.as_ref().to_ascii_lowercase();
-                                let val = attr.unescape_value()
+                                let val = attr
+                                    .unescape_value()
                                     .map_err(|e| Error::Xml(e.to_string()))?
                                     .into_owned();
                                 match key.as_slice() {
@@ -65,15 +66,17 @@ impl PrinterProfile {
                             let mut value = CommandValue::default();
                             for attr in e.attributes().flatten() {
                                 let key = attr.key.as_ref().to_ascii_lowercase();
-                                let val = attr.unescape_value()
+                                let val = attr
+                                    .unescape_value()
                                     .map_err(|e| Error::Xml(e.to_string()))?
                                     .into_owned();
                                 match key.as_slice() {
                                     b"byte" => value.byte_offset = val.parse().unwrap_or(0),
                                     b"name" => value.name = val,
                                     b"hvalue" => value.hex_value = Some(val),
-                                    b"dvalue" => value.decimal_value =
-                                        Some(val.parse().unwrap_or(0)),
+                                    b"dvalue" => {
+                                        value.decimal_value = Some(val.parse().unwrap_or(0))
+                                    }
                                     _ => {}
                                 }
                             }
@@ -85,7 +88,8 @@ impl PrinterProfile {
                             let mut proc = Procedure::default();
                             for attr in e.attributes().flatten() {
                                 let key = attr.key.as_ref().to_ascii_lowercase();
-                                let val = attr.unescape_value()
+                                let val = attr
+                                    .unescape_value()
                                     .map_err(|e| Error::Xml(e.to_string()))?
                                     .into_owned();
                                 match key.as_slice() {
@@ -100,12 +104,12 @@ impl PrinterProfile {
                             let mut prm = ProcedureParam::default();
                             for attr in e.attributes().flatten() {
                                 let key = attr.key.as_ref().to_ascii_lowercase();
-                                let val = attr.unescape_value()
+                                let val = attr
+                                    .unescape_value()
                                     .map_err(|e| Error::Xml(e.to_string()))?
                                     .into_owned();
                                 match key.as_slice() {
-                                    b"parameter" => prm.parameter_index =
-                                        val.parse().unwrap_or(0),
+                                    b"parameter" => prm.parameter_index = val.parse().unwrap_or(0),
                                     b"command" => prm.command_name = val,
                                     _ => {}
                                 }
@@ -153,7 +157,8 @@ impl PrinterProfile {
                             let mut cmd = Command::default();
                             for attr in e.attributes().flatten() {
                                 let key = attr.key.as_ref().to_ascii_lowercase();
-                                let val = attr.unescape_value()
+                                let val = attr
+                                    .unescape_value()
                                     .map_err(|e| Error::Xml(e.to_string()))?
                                     .into_owned();
                                 match key.as_slice() {
@@ -171,15 +176,17 @@ impl PrinterProfile {
                             let mut value = CommandValue::default();
                             for attr in e.attributes().flatten() {
                                 let key = attr.key.as_ref().to_ascii_lowercase();
-                                let val = attr.unescape_value()
+                                let val = attr
+                                    .unescape_value()
                                     .map_err(|e| Error::Xml(e.to_string()))?
                                     .into_owned();
                                 match key.as_slice() {
                                     b"byte" => value.byte_offset = val.parse().unwrap_or(0),
                                     b"name" => value.name = val,
                                     b"hvalue" => value.hex_value = Some(val),
-                                    b"dvalue" => value.decimal_value =
-                                        Some(val.parse().unwrap_or(0)),
+                                    b"dvalue" => {
+                                        value.decimal_value = Some(val.parse().unwrap_or(0))
+                                    }
                                     _ => {}
                                 }
                             }
@@ -191,12 +198,12 @@ impl PrinterProfile {
                             let mut prm = ProcedureParam::default();
                             for attr in e.attributes().flatten() {
                                 let key = attr.key.as_ref().to_ascii_lowercase();
-                                let val = attr.unescape_value()
+                                let val = attr
+                                    .unescape_value()
                                     .map_err(|e| Error::Xml(e.to_string()))?
                                     .into_owned();
                                 match key.as_slice() {
-                                    b"parameter" => prm.parameter_index =
-                                        val.parse().unwrap_or(0),
+                                    b"parameter" => prm.parameter_index = val.parse().unwrap_or(0),
                                     b"command" => prm.command_name = val,
                                     _ => {}
                                 }
@@ -210,7 +217,8 @@ impl PrinterProfile {
                 }
                 Ok(Event::Text(t)) => {
                     if let Some(target) = text_target.as_mut() {
-                        let text = t.unescape()
+                        let text = t
+                            .unescape()
                             .map_err(|e| Error::Xml(e.to_string()))?
                             .into_owned();
                         target.push_str(&text);
@@ -225,11 +233,15 @@ impl PrinterProfile {
     }
 
     pub fn command(&self, name: &str) -> Option<&Command> {
-        self.commands.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+        self.commands
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
     }
 
     pub fn procedure(&self, name: &str) -> Option<&Procedure> {
-        self.procedures.iter().find(|p| p.name.eq_ignore_ascii_case(name))
+        self.procedures
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
     }
 }
 
@@ -259,7 +271,9 @@ impl Command {
     }
 
     pub fn value_by_name(&self, name: &str) -> Option<&CommandValue> {
-        self.values.iter().find(|v| v.name.eq_ignore_ascii_case(name))
+        self.values
+            .iter()
+            .find(|v| v.name.eq_ignore_ascii_case(name))
     }
 }
 

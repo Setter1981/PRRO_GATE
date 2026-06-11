@@ -74,31 +74,6 @@ pub fn fmul_257(a: &Fe, b: &Fe, out: &mut FeWide) {
     portable::fmul_257(a, b, out);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `warm_up()` must not panic and must leave later `fmul_257` calls
-    /// functional. The real perf claim (first-call CPUID cost folded into
-    /// initialisation) can only be observed on a cold process; here we just
-    /// assert the helper is safe to call unconditionally.
-    #[test]
-    fn warm_up_is_safe_and_idempotent() {
-        warm_up();
-        warm_up();
-        // Verify backend is still usable.
-        let a = Fe::ONE;
-        let b = Fe::ONE;
-        let mut out = FeWide::ZERO;
-        fmul_257(&a, &b, &mut out);
-        // 1 * 1 = 1, unreduced layout: low word == 1, rest zero.
-        assert_eq!(out.0[0], 1);
-        for i in 1..out.0.len() {
-            assert_eq!(out.0[i], 0, "warm_up left backend in bad state at limb {}", i);
-        }
-    }
-}
-
 /// Prime the CPU-feature detection cache and the chosen backend's
 /// instruction cache.
 ///
@@ -122,4 +97,33 @@ pub fn warm_up() {
     }
     // 2. Prime the comb table for fixed-base scalar multiplication.
     crate::core::comb::warm_up(&crate::Curve::dstu_pb_257());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `warm_up()` must not panic and must leave later `fmul_257` calls
+    /// functional. The real perf claim (first-call CPUID cost folded into
+    /// initialisation) can only be observed on a cold process; here we just
+    /// assert the helper is safe to call unconditionally.
+    #[test]
+    fn warm_up_is_safe_and_idempotent() {
+        warm_up();
+        warm_up();
+        // Verify backend is still usable.
+        let a = Fe::ONE;
+        let b = Fe::ONE;
+        let mut out = FeWide::ZERO;
+        fmul_257(&a, &b, &mut out);
+        // 1 * 1 = 1, unreduced layout: low word == 1, rest zero.
+        assert_eq!(out.0[0], 1);
+        for i in 1..out.0.len() {
+            assert_eq!(
+                out.0[i], 0,
+                "warm_up left backend in bad state at limb {}",
+                i
+            );
+        }
+    }
 }

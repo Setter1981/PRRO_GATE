@@ -69,15 +69,19 @@ pub fn build_signed_attrs_with_time(
     let content_type_val = profile.content_type_oid();
     let content_type = Attribute {
         oid: oids::ID_CONTENT_TYPE,
-        value_der: content_type_val.to_der().map_err(|e| AttrsError::Der(e.to_string()))?,
+        value_der: content_type_val
+            .to_der()
+            .map_err(|e| AttrsError::Der(e.to_string()))?,
     };
 
     // 2. message-digest attribute (the content hash)
-    let md_value = OctetString::new(content_digest.to_vec())
-        .map_err(|e| AttrsError::Der(e.to_string()))?;
+    let md_value =
+        OctetString::new(content_digest.to_vec()).map_err(|e| AttrsError::Der(e.to_string()))?;
     let message_digest = Attribute {
         oid: oids::ID_MESSAGE_DIGEST,
-        value_der: md_value.to_der().map_err(|e| AttrsError::Der(e.to_string()))?,
+        value_der: md_value
+            .to_der()
+            .map_err(|e| AttrsError::Der(e.to_string()))?,
     };
 
     // 3. signing-certificate-v2 attribute (real GOST 34.311 cert hash)
@@ -226,7 +230,10 @@ impl Attribute {
     /// Encode as a CMS `Attribute` SEQUENCE.
     fn to_der(&self) -> Result<Vec<u8>, AttrsError> {
         // Attribute ::= SEQUENCE { attrType OID, attrValues SET OF ANY }
-        let oid_der = self.oid.to_der().map_err(|e| AttrsError::Der(e.to_string()))?;
+        let oid_der = self
+            .oid
+            .to_der()
+            .map_err(|e| AttrsError::Der(e.to_string()))?;
 
         // Wrap value in SET OF (single element).
         let mut set_of = Vec::with_capacity(self.value_der.len() + 8);
@@ -277,12 +284,8 @@ fn encode_length(n: usize, out: &mut Vec<u8>) {
 /// Compute certificate hash using the profile's digest algorithm.
 fn compute_cert_hash(profile: CmsProfile, cert_der: &[u8]) -> Vec<u8> {
     match profile {
-        CmsProfile::Dstu4145WithGost34311Pb => {
-            crate::core::hash::gost_34_311_95(cert_der).to_vec()
-        }
-        CmsProfile::Dstu4145WithDstu7564Pb => {
-            crate::core::hash::kupyna_256(cert_der).to_vec()
-        }
+        CmsProfile::Dstu4145WithGost34311Pb => crate::core::hash::gost_34_311_95(cert_der).to_vec(),
+        CmsProfile::Dstu4145WithDstu7564Pb => crate::core::hash::kupyna_256(cert_der).to_vec(),
     }
 }
 
@@ -324,9 +327,11 @@ fn build_signing_cert_v2(
     cert_der: &[u8],
 ) -> Result<Vec<u8>, AttrsError> {
     // certHash OCTET STRING
-    let cert_hash_oct = OctetString::new(cert_hash.to_vec())
+    let cert_hash_oct =
+        OctetString::new(cert_hash.to_vec()).map_err(|e| AttrsError::Der(e.to_string()))?;
+    let cert_hash_der = cert_hash_oct
+        .to_der()
         .map_err(|e| AttrsError::Der(e.to_string()))?;
-    let cert_hash_der = cert_hash_oct.to_der().map_err(|e| AttrsError::Der(e.to_string()))?;
 
     // hashAlgorithm AlgorithmIdentifier — always emitted (see doc above).
     let alg_id_der = encode_algorithm_identifier(hash_algorithm_oid)?;
@@ -410,7 +415,9 @@ fn build_issuer_serial(cert_der: &[u8]) -> Result<Vec<u8>, AttrsError> {
 fn encode_algorithm_identifier(
     alg_oid: const_oid::ObjectIdentifier,
 ) -> Result<Vec<u8>, AttrsError> {
-    let oid_der = alg_oid.to_der().map_err(|e| AttrsError::Der(e.to_string()))?;
+    let oid_der = alg_oid
+        .to_der()
+        .map_err(|e| AttrsError::Der(e.to_string()))?;
     // NULL value: 0x05 0x00
     let null_der = [0x05u8, 0x00];
 
@@ -502,8 +509,7 @@ mod tests {
             None => return,
         };
         let cert_hash = vec![0u8; 32];
-        let scv2 =
-            build_signing_cert_v2(&cert_hash, oids::GOST_34_311_95, &cert).unwrap();
+        let scv2 = build_signing_cert_v2(&cert_hash, oids::GOST_34_311_95, &cert).unwrap();
 
         // Parse back: SigningCertificateV2 -> certs(SEQUENCE OF) -> ESSCertIDv2.
         // We don't need a full parser — just verify issuerSerial contributes

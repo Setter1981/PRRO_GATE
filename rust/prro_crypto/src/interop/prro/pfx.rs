@@ -60,7 +60,9 @@ pub enum PfxError {
     Pbes2(String),
     #[error("salt/IV/sbox sizes wrong: salt={salt}, iv={iv}, sbox={sbox}")]
     BadParamSizes { salt: usize, iv: usize, sbox: usize },
-    #[error("decrypted content failed inner DSTU privkey parse — wrong password or corrupt container")]
+    #[error(
+        "decrypted content failed inner DSTU privkey parse — wrong password or corrupt container"
+    )]
     BadPassword,
 }
 
@@ -95,9 +97,7 @@ impl std::fmt::Debug for PfxParsed {
 // shapes are short and the universe of relevant OIDs is small.
 
 /// `id-data` (1.2.840.113549.1.7.1) — wraps a SafeContents blob.
-const OID_PKCS7_DATA: &[u8] = &[
-    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01,
-];
+const OID_PKCS7_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01];
 /// `pkcs-12-pkcs8ShroudedKeyBag` (1.2.840.113549.1.12.10.1.2) — the
 /// SafeBag kind that carries an EncryptedPrivateKeyInfo.
 const OID_SHROUDED_KEY_BAG: &[u8] = &[
@@ -110,13 +110,9 @@ const OID_CERT_BAG: &[u8] = &[
     0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x0C, 0x0A, 0x01, 0x03,
 ];
 /// `pkcs5-pbes2` (1.2.840.113549.1.5.13).
-const OID_PBES2: &[u8] = &[
-    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x05, 0x0D,
-];
+const OID_PBES2: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x05, 0x0D];
 /// `pkcs5-pbkdf2` (1.2.840.113549.1.5.12).
-const OID_PBKDF2: &[u8] = &[
-    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x05, 0x0C,
-];
+const OID_PBKDF2: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x05, 0x0C];
 
 // ─── Public entry point ────────────────────────────────────────────────────
 
@@ -172,8 +168,7 @@ pub fn parse(data: &[u8], password: &[u8]) -> Result<PfxParsed, PfxError> {
                     continue;
                 }
                 let plain = decrypt_pbes2(bag_value, password)?;
-                let d = der::extract_param_d(&plain)
-                    .map_err(|_| PfxError::BadPassword)?;
+                let d = der::extract_param_d(&plain).map_err(|_| PfxError::BadPassword)?;
                 param_d = Some(d);
             } else if bag_id == OID_CERT_BAG {
                 if let Some(cert_der) = extract_cert_from_certbag(bag_value) {
@@ -317,9 +312,7 @@ fn extract_cert_from_certbag(bag_value: &[u8]) -> Option<Vec<u8>> {
     // Silently accepting any OID would import a non-X.509 blob as if
     // it were a cert — harmless structurally but misleading for the
     // chain consumers downstream.
-    const X509_CERT_OID: &[u8] = &[
-        0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x16, 0x01,
-    ];
+    const X509_CERT_OID: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x16, 0x01];
     let mut r = Reader::new(bag_value);
     let body = r.expect(TAG_SEQUENCE).ok()?;
     let mut s = Reader::new(body);

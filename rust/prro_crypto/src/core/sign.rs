@@ -210,12 +210,7 @@ pub struct Signature {
 ///   - `rand_e`: a uniformly random non-zero scalar < curve order
 ///
 /// All field elements MUST be sized with `mod_words = curve.mod_words`.
-pub fn sign(
-    curve: &Curve,
-    d: &FieldEl,
-    hash: &FieldEl,
-    rand_e: &FieldEl,
-) -> Option<Signature> {
+pub fn sign(curve: &Curve, d: &FieldEl, hash: &FieldEl, rand_e: &FieldEl) -> Option<Signature> {
     use crate::core::scalar::Scalar;
 
     // --- Sprint 2.2 contract enforcement (Expert-2 finding) ---
@@ -332,9 +327,7 @@ pub fn verify(curve: &Curve, pub_q: &Point, hash: &FieldEl, signature: &Signatur
     // These cannot fit in a valid scalar < order. The pre-Sprint-2.2 check
     // only inspected the low 8 words and would have admitted malformed r/s
     // carrying bits at position ≥ 256.
-    if r_words[crate::core::fe::FE_WORDS - 1] != 0
-        || s_words[crate::core::fe::FE_WORDS - 1] != 0
-    {
+    if r_words[crate::core::fe::FE_WORDS - 1] != 0 || s_words[crate::core::fe::FE_WORDS - 1] != 0 {
         return false;
     }
 
@@ -405,7 +398,10 @@ mod tests {
         v[6] = 0x1234_5678;
         let value = FieldEl::from_words(v.clone());
         let out = truncate(&value, &curve.order);
-        assert!(out.equals(&value), "values below the cut must be preserved verbatim");
+        assert!(
+            out.equals(&value),
+            "values below the cut must be preserved verbatim"
+        );
 
         // Case B: bit 255 set → MUST be cleared (jkurwa's loop clears it
         // because `xbit == 256 >= bitl_o == 256`).
@@ -430,7 +426,10 @@ mod tests {
         let value = FieldEl::from_words(v);
         let out = truncate(&value, &curve.order);
         assert_eq!(out.bytes[8], 0, "word 8 (bit 256+) must be zero");
-        assert_eq!(out.bytes[7], 0x7FFF_FFFF, "bit 255 must be cleared, bits 224..254 kept");
+        assert_eq!(
+            out.bytes[7], 0x7FFF_FFFF,
+            "bit 255 must be cleared, bits 224..254 kept"
+        );
         assert_eq!(out.bytes[0], 0xBADD_F00D, "word 0 must be preserved");
 
         // Case D: non-word-aligned cut — synthesize a 5-bit order (cut at
@@ -443,7 +442,10 @@ mod tests {
         assert_eq!(tiny_order.bit_length(), 5);
         let all_ones = FieldEl::from_words(vec![u32::MAX; curve.mod_words]);
         let out = truncate(&all_ones, &tiny_order);
-        assert_eq!(out.bytes[0], 0b1111, "low 4 bits must survive (cut at bit 4)");
+        assert_eq!(
+            out.bytes[0], 0b1111,
+            "low 4 bits must survive (cut at bit 4)"
+        );
         for i in 1..curve.mod_words {
             assert_eq!(out.bytes[i], 0, "word {} must be cleared", i);
         }
@@ -524,6 +526,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // `eG` is the DSTU 4145 math notation (e·G).
     fn test_sign_with_known_zero_eG_returns_none() {
         // Cannot easily contrive eG.x == 0 deterministically without knowing
         // the curve structure deeply. Skip — covered by general round-trip.

@@ -13,6 +13,9 @@
 //! exercises (both operands having the 256-th bit set simultaneously
 //! happens in ~1/4 of pairs only after many thousands of draws).
 
+// Explicit index loops mirror the core's CT style (see core/mod.rs).
+#![allow(clippy::needless_range_loop)]
+
 use prro_crypto::core::backend;
 use prro_crypto::core::fe::{Fe, FeWide, FE_WORDS};
 
@@ -88,7 +91,10 @@ fn test_fmul_portable_vs_pclmul_50k_random() {
                 a.0, b.0, p.0, s.0
             );
         }
-        panic!("{} of 50000 fmul cases diverged between portable and PCLMULQDQ", diverged);
+        panic!(
+            "{} of 50000 fmul cases diverged between portable and PCLMULQDQ",
+            diverged
+        );
     }
 }
 
@@ -118,7 +124,12 @@ fn test_fmul_top_bit_grid_portable_vs_pclmul() {
         [0, 0, 0, 0],
         [1, 0, 0, 0],
         [u64::MAX, u64::MAX, u64::MAX, u64::MAX],
-        [0xCAFE_BABE_DEAD_BEEF, 0x0123_4567_89AB_CDEF, 0, 0xFFFF_FFFF_0000_0000],
+        [
+            0xCAFE_BABE_DEAD_BEEF,
+            0x0123_4567_89AB_CDEF,
+            0,
+            0xFFFF_FFFF_0000_0000,
+        ],
     ];
 
     for &a_low in &interesting_lows {
@@ -198,11 +209,7 @@ fn test_fmul_known_inputs() {
         (one, one, "1 * 1"),
         (one, make_fe(0xCAFE), "1 * x"),
         (make_fe(0xCAFE), one, "x * 1"),
-        (
-            Fe([0xFFFF_FFFF; 9]),
-            one,
-            "all_ones * 1",
-        ),
+        (Fe([0xFFFF_FFFF; 9]), one, "all_ones * 1"),
     ];
 
     for (a, b, name) in cases.iter() {

@@ -20,7 +20,9 @@ impl<'a> Executor<'a> {
     /// Emit bytes for a command that takes no argument (e.g. `Left`,
     /// `Center`, `FONTDEFAULT`).
     pub fn simple(&self, name: &str) -> Result<Vec<u8>> {
-        let cmd = self.profile.command(name)
+        let cmd = self
+            .profile
+            .command(name)
             .ok_or_else(|| Error::UnknownCommand(name.to_string()))?;
         cmd.base_bytes()
     }
@@ -29,10 +31,13 @@ impl<'a> Executor<'a> {
     /// branch by name (e.g. `with_value("CodePage", "866")`).  Replaces
     /// the byte at the value's declared offset with its resolved byte.
     pub fn with_value(&self, command: &str, value_name: &str) -> Result<Vec<u8>> {
-        let cmd = self.profile.command(command)
+        let cmd = self
+            .profile
+            .command(command)
             .ok_or_else(|| Error::UnknownCommand(command.to_string()))?;
         let mut bytes = cmd.base_bytes()?;
-        let val = cmd.value_by_name(value_name)
+        let val = cmd
+            .value_by_name(value_name)
             .ok_or_else(|| Error::UnknownValue {
                 command: command.to_string(),
                 value: value_name.to_string(),
@@ -59,7 +64,9 @@ impl<'a> Executor<'a> {
     /// supplied argument.  Example: `code="1B6400"` emits `ESC d N`,
     /// where we replace byte[2] with `N`.
     pub fn with_byte(&self, command: &str, byte: u8) -> Result<Vec<u8>> {
-        let cmd = self.profile.command(command)
+        let cmd = self
+            .profile
+            .command(command)
             .ok_or_else(|| Error::UnknownCommand(command.to_string()))?;
         let mut bytes = cmd.base_bytes()?;
         // If the command declared a default value byte-offset, honor it.

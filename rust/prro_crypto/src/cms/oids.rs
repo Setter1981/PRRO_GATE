@@ -15,16 +15,14 @@ pub const ID_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.1135
 pub const ID_SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
 
 /// id-contentType signed attribute
-pub const ID_CONTENT_TYPE: ObjectIdentifier =
-    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.3");
+pub const ID_CONTENT_TYPE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.3");
 
 /// id-messageDigest signed attribute
 pub const ID_MESSAGE_DIGEST: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
 
 /// id-signingTime signed attribute (optional for BES)
-pub const ID_SIGNING_TIME: ObjectIdentifier =
-    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.5");
+pub const ID_SIGNING_TIME: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.5");
 
 /// id-aa-signingCertificateV2 — ESS (RFC 5035)
 pub const ID_AA_SIGNING_CERTIFICATE_V2: ObjectIdentifier =
@@ -49,14 +47,12 @@ pub const DSTU_4145_WITH_GOST_34311_PB: ObjectIdentifier =
 
 /// GOST 34.311-95 hash (legacy, default for v1).
 /// 256-bit output, used by majority of current Ukrainian PRRO deployments.
-pub const GOST_34_311_95: ObjectIdentifier =
-    ObjectIdentifier::new_unwrap("1.2.804.2.1.1.1.1.2.1");
+pub const GOST_34_311_95: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.804.2.1.1.1.1.2.1");
 
 /// Kupyna-256 (DSTU 7564:2014, hash length 256 bits).
 /// Ukrainian national hash standard, replacement for GOST 34.311-95.
 /// OID: `1.2.804.2.1.1.1.1.2.2.1` per Ukrainian crypto OID registry.
-pub const KUPYNA_256: ObjectIdentifier =
-    ObjectIdentifier::new_unwrap("1.2.804.2.1.1.1.1.2.2.1");
+pub const KUPYNA_256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.804.2.1.1.1.1.2.2.1");
 
 /// `Dstu4145WithDstu7564-256(pb)` — DSTU 4145 signature using
 /// polynomial-basis curves with Kupyna-256 hash.
@@ -68,7 +64,8 @@ pub const DSTU_4145_WITH_DSTU_7564_PB: ObjectIdentifier =
 // ─── DSTU curve OIDs ────────────────────────────────────────────────────────
 
 /// DSTU_PB_257 — the only curve ДПС uses for fiscal signing.
-pub const DSTU_PB_257: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.804.2.1.1.1.1.3.1.1.2.6");
+pub const DSTU_PB_257: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.804.2.1.1.1.1.3.1.1.2.6");
 
 /// SHA-256 (for SigningCertificateV2 cert hash when using modern profile).
 pub const SHA_256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
@@ -99,8 +96,7 @@ pub const ID_PE_AUTHORITY_INFO_ACCESS: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.1.1");
 
 /// id-ad-ocsp — accessMethod used inside AIA to point at an OCSP responder.
-pub const ID_AD_OCSP: ObjectIdentifier =
-    ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1");
+pub const ID_AD_OCSP: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1");
 
 /// id-ce-cRLDistributionPoints — X.509 extension listing CRL URIs.
 pub const ID_CE_CRL_DISTRIBUTION_POINTS: ObjectIdentifier =

@@ -90,14 +90,11 @@ use crate::{
         builder::CmsBuildOptions,
         cmp,
         envelope::{extract_cert_pubkey_bytes, unwrap_envelope},
-        revocation, tsp,
-        CmsProfile, CmsSigner, DstuInProcessSigner,
+        revocation, tsp, CmsProfile, CmsSigner, DstuInProcessSigner,
     },
     core::sign as sign_mod,
     interop::prro::{
-        containers::{
-            self, ContainerError, ContainerFormat,
-        },
+        containers::{self, ContainerError, ContainerFormat},
         der, jks,
     },
     Curve, FieldEl, Point, Signature,
@@ -179,8 +176,7 @@ fn extract_private_key<'py>(
     data: &[u8],
     password: &str,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let extracted = containers::extract_private_key(data, password)
-        .map_err(container_err_to_py)?;
+    let extracted = containers::extract_private_key(data, password).map_err(container_err_to_py)?;
     let curve = Curve::dstu_pb_257();
     let d_field = bytes_le_to_field(extracted.param_d.as_slice(), curve.mod_words);
 
@@ -236,12 +232,12 @@ fn cms_sign_detached<'py>(
         // Sentinel `Some(-1)` would also be meaningful as "omit"; we keep
         // the API explicit: pass Python `None` to omit, otherwise positive
         // UNIX seconds. Default = use the current wall clock.
-        Some(t) if t < 0 => return Err(PyValueError::new_err(
-            "signing_time_unix must be non-negative; use None to omit the attribute",
-        )),
-        Some(t) => Some(
-            std::time::UNIX_EPOCH + std::time::Duration::from_secs(t as u64),
-        ),
+        Some(t) if t < 0 => {
+            return Err(PyValueError::new_err(
+                "signing_time_unix must be non-negative; use None to omit the attribute",
+            ))
+        }
+        Some(t) => Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(t as u64)),
         None => Some(std::time::SystemTime::now()),
     };
     let opts = CmsBuildOptions {
@@ -303,9 +299,8 @@ fn hex_to_bytes(s: &str) -> PyResult<Vec<u8>> {
     (0..s.len())
         .step_by(2)
         .map(|i| {
-            u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| {
-                PyValueError::new_err(format!("invalid hex at {}: {}", i, e))
-            })
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|e| PyValueError::new_err(format!("invalid hex at {}: {}", i, e)))
         })
         .collect()
 }
@@ -477,14 +472,13 @@ fn fetch_timestamp<'py>(
             "timeout_seconds must be in [0.1, 60]",
         ));
     }
-    let timeout = std::time::Duration::from_millis(
-        (timeout_seconds * 1000.0) as u64,
-    );
+    let timeout = std::time::Duration::from_millis((timeout_seconds * 1000.0) as u64);
     // Release the GIL across the HTTP round-trip — on Ukrainian CAs
     // under 3G/LTE fallback a single timestamp can take 1-15 s. Holding
     // the GIL for that window starves every other Python thread in the
     // gateway (health endpoints, REST ingress, reconciliation).
-    let tst = py.allow_threads(|| tsp::fetch_timestamp(tsa_url, digest, timeout))
+    let tst = py
+        .allow_threads(|| tsp::fetch_timestamp(tsa_url, digest, timeout))
         .map_err(|e| PyRuntimeError::new_err(format!("TSP: {}", e)))?;
     Ok(PyBytes::new_bound(py, &tst))
 }
@@ -526,32 +520,35 @@ fn cms_sign_detached_with_tsp<'py>(
     };
 
     let signing_time = match signing_time_unix {
-        Some(t) if t < 0 => return Err(PyValueError::new_err(
-            "signing_time_unix must be non-negative; use None to omit",
-        )),
+        Some(t) if t < 0 => {
+            return Err(PyValueError::new_err(
+                "signing_time_unix must be non-negative; use None to omit",
+            ))
+        }
         Some(t) => Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(t as u64)),
         None => Some(std::time::SystemTime::now()),
     };
-    let opts = CmsBuildOptions { attached, signing_time };
+    let opts = CmsBuildOptions {
+        attached,
+        signing_time,
+    };
 
     let resolved_url: String = match tsa_url {
         Some(u) if !u.is_empty() => u.to_string(),
-        _ => tsp::tsa_url_from_cert(cert_der)
-            .map_err(|e| PyValueError::new_err(format!(
-                "tsa_url not given and cert has no usable SIA: {}", e
-            )))?,
+        _ => tsp::tsa_url_from_cert(cert_der).map_err(|e| {
+            PyValueError::new_err(format!(
+                "tsa_url not given and cert has no usable SIA: {}",
+                e
+            ))
+        })?,
     };
 
-    let timeout = std::time::Duration::from_millis(
-        (timeout_seconds * 1000.0) as u64,
-    );
+    let timeout = std::time::Duration::from_millis((timeout_seconds * 1000.0) as u64);
     // Sign → hash signature → HTTP round-trip to TSA → re-assemble
     // with TST. The TSA call dominates wall-clock; release the GIL so
     // nothing in the Python side starves while we wait on ca.tax.gov.ua.
     let result = py
-        .allow_threads(|| {
-            cms_signer.sign_with_tsp(content, opts, &resolved_url, timeout)
-        })
+        .allow_threads(|| cms_signer.sign_with_tsp(content, opts, &resolved_url, timeout))
         .map_err(|e| PyRuntimeError::new_err(format!("CMS sign+TSP: {}", e)))?;
     Ok(PyBytes::new_bound(py, &result.cms_der))
 }
@@ -579,13 +576,18 @@ fn cms_sign_detached_with_tst<'py>(
         profile: CmsProfile::from_cert_der(&cert_der),
     };
     let signing_time = match signing_time_unix {
-        Some(t) if t < 0 => return Err(PyValueError::new_err(
-            "signing_time_unix must be non-negative; use None to omit",
-        )),
+        Some(t) if t < 0 => {
+            return Err(PyValueError::new_err(
+                "signing_time_unix must be non-negative; use None to omit",
+            ))
+        }
         Some(t) => Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(t as u64)),
         None => Some(std::time::SystemTime::now()),
     };
-    let opts = CmsBuildOptions { attached, signing_time };
+    let opts = CmsBuildOptions {
+        attached,
+        signing_time,
+    };
 
     let result = py
         .allow_threads(|| cms_signer.sign_with_tst(content, opts, tst_der))
@@ -631,7 +633,9 @@ fn fetch_crl<'py>(
     timeout_seconds: f64,
 ) -> PyResult<Bound<'py, PyBytes>> {
     if !(0.1..=60.0).contains(&timeout_seconds) {
-        return Err(PyValueError::new_err("timeout_seconds must be in [0.1, 60]"));
+        return Err(PyValueError::new_err(
+            "timeout_seconds must be in [0.1, 60]",
+        ));
     }
     let timeout = std::time::Duration::from_millis((timeout_seconds * 1000.0) as u64);
     let crl = py
@@ -659,10 +663,7 @@ fn fetch_crl<'py>(
 ///
 /// See `SECURITY.md` — section "Відомі компроміси".
 #[pyfunction]
-fn parse_ocsp_status<'py>(
-    py: Python<'py>,
-    basic_ocsp_der: &[u8],
-) -> PyResult<Bound<'py, PyDict>> {
+fn parse_ocsp_status<'py>(py: Python<'py>, basic_ocsp_der: &[u8]) -> PyResult<Bound<'py, PyDict>> {
     let parsed = revocation::parse_ocsp_status(basic_ocsp_der)
         .map_err(|e| PyValueError::new_err(format!("parse_ocsp_status: {e}")))?;
     let dict = PyDict::new_bound(py);
@@ -705,7 +706,9 @@ fn fetch_ocsp_response<'py>(
     timeout_seconds: f64,
 ) -> PyResult<Bound<'py, PyBytes>> {
     if !(0.1..=60.0).contains(&timeout_seconds) {
-        return Err(PyValueError::new_err("timeout_seconds must be in [0.1, 60]"));
+        return Err(PyValueError::new_err(
+            "timeout_seconds must be in [0.1, 60]",
+        ));
     }
     let timeout = std::time::Duration::from_millis((timeout_seconds * 1000.0) as u64);
     let basic = py
@@ -753,21 +756,24 @@ fn cms_sign_detached_cades_lt<'py>(
         profile: CmsProfile::from_cert_der(&cert_der),
     };
     let signing_time = match signing_time_unix {
-        Some(t) if t < 0 => return Err(PyValueError::new_err(
-            "signing_time_unix must be non-negative; use None to omit",
-        )),
+        Some(t) if t < 0 => {
+            return Err(PyValueError::new_err(
+                "signing_time_unix must be non-negative; use None to omit",
+            ))
+        }
         Some(t) => Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(t as u64)),
         None => Some(std::time::SystemTime::now()),
     };
-    let opts = CmsBuildOptions { attached, signing_time };
+    let opts = CmsBuildOptions {
+        attached,
+        signing_time,
+    };
 
     let crls = crls.unwrap_or_default();
     let ocsps = ocsp_responses.unwrap_or_default();
 
     let result = py
-        .allow_threads(|| {
-            cms_signer.sign_with_lt(content, opts, tst_der, &crls, &ocsps)
-        })
+        .allow_threads(|| cms_signer.sign_with_lt(content, opts, tst_der, &crls, &ocsps))
         .map_err(|e| PyRuntimeError::new_err(format!("CMS sign+LT: {e}")))?;
     Ok(PyBytes::new_bound(py, &result.cms_der))
 }
@@ -780,10 +786,7 @@ fn cms_sign_detached_cades_lt<'py>(
 /// byte). Used to look up an end-entity cert by SKI in a CA repository
 /// when only the private key + password are known up front.
 #[pyfunction]
-fn compute_ski<'py>(
-    py: Python<'py>,
-    pubkey_compressed: &[u8],
-) -> PyResult<Bound<'py, PyBytes>> {
+fn compute_ski<'py>(py: Python<'py>, pubkey_compressed: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
     let ski = crate::cms::envelope::compute_ski(pubkey_compressed);
     Ok(PyBytes::new_bound(py, &ski))
 }
@@ -810,10 +813,7 @@ fn compress_pubkey<'py>(
 /// Used during provisioning to match a private-key-derived SKI against
 /// every cert embedded in the container.
 #[pyfunction]
-fn extract_cert_pubkey<'py>(
-    py: Python<'py>,
-    cert_der: &[u8],
-) -> PyResult<Bound<'py, PyBytes>> {
+fn extract_cert_pubkey<'py>(py: Python<'py>, cert_der: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
     let pub_bytes = extract_cert_pubkey_bytes(cert_der)
         .map_err(|e| PyValueError::new_err(format!("extract_cert_pubkey: {e}")))?;
     Ok(PyBytes::new_bound(py, &pub_bytes))
@@ -854,8 +854,7 @@ fn fetch_cert_by_ski<'py>(
     if ski.len() != 32 {
         return Err(PyValueError::new_err("SKI must be 32 bytes"));
     }
-    let timeout =
-        std::time::Duration::from_millis((timeout_seconds * 1000.0) as u64);
+    let timeout = std::time::Duration::from_millis((timeout_seconds * 1000.0) as u64);
     let cert = py
         .allow_threads(|| cmp::fetch_cert_by_ski(cmp_url, ski, timeout))
         .map_err(|e| PyRuntimeError::new_err(format!("CMP: {e}")))?;

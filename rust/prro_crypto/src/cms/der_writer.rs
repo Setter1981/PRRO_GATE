@@ -116,7 +116,9 @@ pub fn algorithm_identifier(
     alg_oid: const_oid::ObjectIdentifier,
 ) -> Result<Vec<u8>, DerWriterError> {
     use der::Encode;
-    let oid_der = alg_oid.to_der().map_err(|e| DerWriterError::Der(e.to_string()))?;
+    let oid_der = alg_oid
+        .to_der()
+        .map_err(|e| DerWriterError::Der(e.to_string()))?;
     let null_der = [0x05u8, 0x00];
 
     let mut inner = Vec::with_capacity(oid_der.len() + 2);

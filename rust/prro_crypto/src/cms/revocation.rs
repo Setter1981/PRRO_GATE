@@ -16,8 +16,8 @@
 
 use thiserror::Error;
 
-use crate::cms::der_writer as dw;
 use crate::cms::asn1_util::{self as a1, Asn1Error};
+use crate::cms::der_writer as dw;
 use crate::cms::oids;
 
 #[derive(Debug, Error)]
@@ -73,9 +73,8 @@ pub fn encode_ocsp_request(
 
     // serial_der is already a full INTEGER TLV (tag+len+value) from
     // `x509-cert`'s SerialNumber::to_der; concatenate directly.
-    let mut cert_id_inner = Vec::with_capacity(
-        alg.len() + in_hash.len() + ik_hash.len() + serial_der.len(),
-    );
+    let mut cert_id_inner =
+        Vec::with_capacity(alg.len() + in_hash.len() + ik_hash.len() + serial_der.len());
     cert_id_inner.extend_from_slice(&alg);
     cert_id_inner.extend_from_slice(&in_hash);
     cert_id_inner.extend_from_slice(&ik_hash);
@@ -99,8 +98,7 @@ pub fn encode_ocsp_request(
         ];
         let inner_octet = dw::octet_string(nonce_bytes);
         let wrapped_octet = dw::octet_string(&inner_octet);
-        let mut ext_inner =
-            Vec::with_capacity(OCSP_NONCE_OID_DER.len() + wrapped_octet.len());
+        let mut ext_inner = Vec::with_capacity(OCSP_NONCE_OID_DER.len() + wrapped_octet.len());
         ext_inner.extend_from_slice(OCSP_NONCE_OID_DER);
         ext_inner.extend_from_slice(&wrapped_octet);
         let ext_seq = dw::sequence(&ext_inner);
@@ -135,9 +133,9 @@ pub fn parse_ocsp_response(resp_der: &[u8]) -> Result<Vec<u8>, RevocationError> 
     }
 
     // responseBytes [0] EXPLICIT ResponseBytes OPTIONAL
-    let tag = a1::peek_tag(resp_der, rs_end).map_err(|_| RevocationError::Parse(
-        "successful OCSPResponse has no responseBytes".into(),
-    ))?;
+    let tag = a1::peek_tag(resp_der, rs_end).map_err(|_| {
+        RevocationError::Parse("successful OCSPResponse has no responseBytes".into())
+    })?;
     if tag != 0xa0 {
         return Err(RevocationError::Parse(format!(
             "expected [0] EXPLICIT responseBytes, got tag {tag:#x}",
@@ -145,9 +143,9 @@ pub fn parse_ocsp_response(resp_der: &[u8]) -> Result<Vec<u8>, RevocationError> 
     }
     let (_, rb_ctx_inner) = a1::read_tlv(resp_der, rs_end)?;
     let (_, rb_inner) = a1::read_tlv(resp_der, rb_ctx_inner)?; // ResponseBytes SEQ
-    // responseType OID — must be id-pkix-ocsp-basic (1.3.6.1.5.5.7.48.1.1).
-    // Accepting an arbitrary OID would let us hand back bytes that aren't
-    // a BasicOCSPResponse at all, violating our own contract.
+                                                               // responseType OID — must be id-pkix-ocsp-basic (1.3.6.1.5.5.7.48.1.1).
+                                                               // Accepting an arbitrary OID would let us hand back bytes that aren't
+                                                               // a BasicOCSPResponse at all, violating our own contract.
     let rtype_tag = a1::peek_tag(resp_der, rb_inner)?;
     if rtype_tag != 0x06 {
         return Err(RevocationError::Parse(format!(
@@ -157,9 +155,7 @@ pub fn parse_ocsp_response(resp_der: &[u8]) -> Result<Vec<u8>, RevocationError> 
     let (rtype_end, rtype_inner) = a1::read_tlv(resp_der, rb_inner)?;
     // id-pkix-ocsp-basic = 1.3.6.1.5.5.7.48.1.1
     //   DER: 2B 06 01 05 05 07 30 01 01
-    const BASIC_OCSP_OID: &[u8] = &[
-        0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01,
-    ];
+    const BASIC_OCSP_OID: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
     let rtype_bytes = &resp_der[rtype_inner..rtype_end];
     if rtype_bytes != BASIC_OCSP_OID {
         return Err(RevocationError::Parse(format!(
@@ -179,7 +175,7 @@ pub fn parse_ocsp_response(resp_der: &[u8]) -> Result<Vec<u8>, RevocationError> 
     // BasicOCSPResponse itself must be a SEQUENCE
     if payload.is_empty() || payload[0] != 0x30 {
         return Err(RevocationError::Parse(
-            "response payload is not a SEQUENCE (expected BasicOCSPResponse)".into()
+            "response payload is not a SEQUENCE (expected BasicOCSPResponse)".into(),
         ));
     }
     Ok(payload.to_vec())
@@ -270,10 +266,9 @@ fn first_access_url(
             let tag = a1::peek_tag(list_bytes, am_end)?;
             let (al_end, al_inner) = a1::read_tlv(list_bytes, am_end)?;
             if tag == 0x86 {
-                let raw = std::str::from_utf8(&list_bytes[al_inner..al_end])
-                    .map_err(|e| RevocationError::Parse(format!(
-                        "accessLocation URI not UTF-8: {e}"
-                    )))?;
+                let raw = std::str::from_utf8(&list_bytes[al_inner..al_end]).map_err(|e| {
+                    RevocationError::Parse(format!("accessLocation URI not UTF-8: {e}"))
+                })?;
                 return require_http_scheme(raw, "AIA/SIA accessLocation");
             }
             return Err(RevocationError::Parse(format!(
@@ -313,10 +308,10 @@ fn find_crl_dp_url(ext_list: &[u8]) -> Result<String, RevocationError> {
                         let gtag = a1::peek_tag(&cdp_bytes, gn_pos)?;
                         let (g_end, g_inner) = a1::read_tlv(&cdp_bytes, gn_pos)?;
                         if gtag == 0x86 {
-                            let raw = std::str::from_utf8(&cdp_bytes[g_inner..g_end])
-                                .map_err(|e| RevocationError::Parse(format!(
-                                    "CRL URI not UTF-8: {e}"
-                                )))?;
+                            let raw =
+                                std::str::from_utf8(&cdp_bytes[g_inner..g_end]).map_err(|e| {
+                                    RevocationError::Parse(format!("CRL URI not UTF-8: {e}"))
+                                })?;
                             return require_http_scheme(raw, "CRLDistributionPoints");
                         }
                         gn_pos = g_end;
@@ -332,10 +327,7 @@ fn find_crl_dp_url(ext_list: &[u8]) -> Result<String, RevocationError> {
     ))
 }
 
-fn find_extension_value(
-    ext_list: &[u8],
-    target_oid: &[u8],
-) -> Result<Vec<u8>, RevocationError> {
+fn find_extension_value(ext_list: &[u8], target_oid: &[u8]) -> Result<Vec<u8>, RevocationError> {
     let mut pos = 0;
     while pos < ext_list.len() {
         let (end, inner) = a1::read_tlv(ext_list, pos)?;
@@ -382,9 +374,7 @@ pub fn fetch_ocsp_response(
     nonce: Option<&[u8]>,
     timeout: std::time::Duration,
 ) -> Result<Vec<u8>, RevocationError> {
-    let req_bytes = encode_ocsp_request(
-        issuer_name_hash, issuer_key_hash, serial_der, nonce,
-    )?;
+    let req_bytes = encode_ocsp_request(issuer_name_hash, issuer_key_hash, serial_der, nonce)?;
     // `.redirects(0)` is load-bearing: a 301 redirect on a POST loses the
     // body per HTTP spec + ureq semantics. Without this, an OCSP endpoint
     // that answers HTTP→HTTPS from a misconfigured reverse proxy silently
@@ -422,10 +412,7 @@ pub fn fetch_ocsp_response(
 /// format is a DER SEQUENCE; PEM is not supported here — fiscal CRLs
 /// from Ukrainian CAs ship DER).
 #[cfg(feature = "tsp_http")]
-pub fn fetch_crl(
-    crl_url: &str,
-    timeout: std::time::Duration,
-) -> Result<Vec<u8>, RevocationError> {
+pub fn fetch_crl(crl_url: &str, timeout: std::time::Duration) -> Result<Vec<u8>, RevocationError> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(timeout)
         .timeout_read(timeout)
@@ -530,7 +517,11 @@ pub fn parse_ocsp_status(basic_ocsp_der: &[u8]) -> Result<OcspStatus, Revocation
     if pos >= basic_ocsp_der.len() || basic_ocsp_der[pos] != 0x30 {
         return Err(RevocationError::Parse(format!(
             "expected responses SEQUENCE OF, got tag {:#x}",
-            if pos < basic_ocsp_der.len() { basic_ocsp_der[pos] } else { 0 }
+            if pos < basic_ocsp_der.len() {
+                basic_ocsp_der[pos]
+            } else {
+                0
+            }
         )));
     }
     let (resp_seq_end, resp_seq_inner) = a1::read_tlv(basic_ocsp_der, pos)?;
@@ -549,7 +540,9 @@ pub fn parse_ocsp_status(basic_ocsp_der: &[u8]) -> Result<OcspStatus, Revocation
     //   [1] revoked= SEQUENCE(RevokedInfo) → tag 0xa1 (constructed, since it wraps SEQUENCE)
     //   [2] unknown= NULL   → tag 0x82 len 0
     if sr_pos >= sr_end {
-        return Err(RevocationError::Parse("SingleResponse missing certStatus".into()));
+        return Err(RevocationError::Parse(
+            "SingleResponse missing certStatus".into(),
+        ));
     }
     let status_tag = basic_ocsp_der[sr_pos];
     let (status_end, status_inner) = a1::read_tlv(basic_ocsp_der, sr_pos)?;
@@ -568,9 +561,11 @@ pub fn parse_ocsp_status(basic_ocsp_der: &[u8]) -> Result<OcspStatus, Revocation
             }
         }
         0x82 => ("unknown", None),
-        other => return Err(RevocationError::Parse(format!(
-            "unexpected certStatus tag {other:#x}"
-        ))),
+        other => {
+            return Err(RevocationError::Parse(format!(
+                "unexpected certStatus tag {other:#x}"
+            )))
+        }
     };
     sr_pos = status_end;
     // thisUpdate GeneralizedTime
@@ -615,10 +610,7 @@ fn parse_generalized_time(content: &[u8]) -> Result<u64, String> {
     }
     let last = content[content.len() - 1];
     if last != b'Z' {
-        return Err(format!(
-            "GeneralizedTime must end in 'Z', got {:#x}",
-            last
-        ));
+        return Err(format!("GeneralizedTime must end in 'Z', got {:#x}", last));
     }
     // Validate that any bytes between offset 14 and the final 'Z' look
     // like a fractional-second string (`.<digits>`).
@@ -631,20 +623,18 @@ fn parse_generalized_time(content: &[u8]) -> Result<u64, String> {
         }
         for &b in &content[15..content.len() - 1] {
             if !b.is_ascii_digit() {
-                return Err(format!(
-                    "non-digit inside fractional-second: {:#x}",
-                    b
-                ));
+                return Err(format!("non-digit inside fractional-second: {:#x}", b));
             }
         }
     }
 
-    let s = std::str::from_utf8(&content[..14])
-        .map_err(|e| format!("GeneralizedTime utf8: {e}"))?;
+    let s =
+        std::str::from_utf8(&content[..14]).map_err(|e| format!("GeneralizedTime utf8: {e}"))?;
     let parse = |start: usize, len: usize| -> Result<u32, String> {
-        s[start..start + len]
-            .parse::<u32>()
-            .map_err(|e| { let end = start + len; format!("parse {start}..{end}: {e}") })
+        s[start..start + len].parse::<u32>().map_err(|e| {
+            let end = start + len;
+            format!("parse {start}..{end}: {e}")
+        })
     };
     let year = parse(0, 4)?;
     let month = parse(4, 2)?;
@@ -652,15 +642,23 @@ fn parse_generalized_time(content: &[u8]) -> Result<u64, String> {
     let hour = parse(8, 2)?;
     let minute = parse(10, 2)?;
     let second = parse(12, 2)?;
-    ymd_hms_to_unix(year, month, day, hour, minute, second)
-        .ok_or_else(|| format!("invalid calendar values: {year}-{month}-{day} {hour}:{minute}:{second}"))
+    ymd_hms_to_unix(year, month, day, hour, minute, second).ok_or_else(|| {
+        format!("invalid calendar values: {year}-{month}-{day} {hour}:{minute}:{second}")
+    })
 }
 
 /// Convert a Gregorian UTC date/time to Unix seconds without external
 /// deps. Handles the 1970-2099 range conservatively — good enough for
 /// OCSP validity windows, which never span that long. Returns `None`
 /// for out-of-range calendar values (month 0, day 32, hour 25…).
-pub fn ymd_hms_to_unix(year: u32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> Option<u64> {
+pub fn ymd_hms_to_unix(
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<u64> {
     // Range validation — OCSP responders shouldn't emit nonsense, but
     // a malformed GeneralizedTime on the wire (corrupt by bit-flip or
     // bad encoder) must surface loudly rather than quietly produce a
@@ -685,7 +683,11 @@ pub fn ymd_hms_to_unix(year: u32, month: u32, day: u32, hour: u32, minute: u32, 
         return None;
     }
     // Days-from-epoch via civil calendar algorithm (Howard Hinnant).
-    let y = if month <= 2 { year as i64 - 1 } else { year as i64 };
+    let y = if month <= 2 {
+        year as i64 - 1
+    } else {
+        year as i64
+    };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64;
     let m = month as u64;
@@ -693,10 +695,8 @@ pub fn ymd_hms_to_unix(year: u32, month: u32, day: u32, hour: u32, minute: u32, 
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days_from_epoch = era * 146097 + doe as i64 - 719468;
-    let unix = days_from_epoch * 86400
-        + (hour as i64) * 3600
-        + (minute as i64) * 60
-        + second as i64;
+    let unix =
+        days_from_epoch * 86400 + (hour as i64) * 3600 + (minute as i64) * 60 + second as i64;
     Some(unix.max(0) as u64)
 }
 
@@ -717,10 +717,7 @@ pub fn ymd_hms_to_unix(year: u32, month: u32, day: u32, hour: u32, minute: u32, 
 /// Returns the content bytes ready to wrap in `dw::sequence(...)` to
 /// form the attribute value, OR to pass to the builder's unsigned-attr
 /// embedding helper.
-pub fn encode_revocation_values(
-    crls_der: &[Vec<u8>],
-    ocsp_responses_der: &[Vec<u8>],
-) -> Vec<u8> {
+pub fn encode_revocation_values(crls_der: &[Vec<u8>], ocsp_responses_der: &[Vec<u8>]) -> Vec<u8> {
     let mut inner = Vec::new();
     if !crls_der.is_empty() {
         let mut seq = Vec::new();
@@ -787,8 +784,7 @@ mod tests {
         //           30 09     inner SEQUENCE ("BasicOCSPResponse")
         //             42 41 53 49 43 4F 43 53 50  "BASICOCSP"
         let resp = hex::decode(
-            "301F0A0100A01A3018 06092B0601050507300101 040B300942415349434F435350"
-                .replace(' ', ""),
+            "301F0A0100A01A3018 06092B0601050507300101 040B300942415349434F435350".replace(' ', ""),
         )
         .unwrap();
         let inner = parse_ocsp_response(&resp).expect("granted");
@@ -800,11 +796,9 @@ mod tests {
     #[test]
     fn ocsp_response_rejects_wrong_response_type() {
         // Same structure but responseType = OID 1.2.3.4 (not basic).
-        let resp = hex::decode(
-            "30170A0100A01230100603 2A0304 04094241534943 4F435350"
-                .replace(' ', ""),
-        )
-        .unwrap();
+        let resp =
+            hex::decode("30170A0100A01230100603 2A0304 04094241534943 4F435350".replace(' ', ""))
+                .unwrap();
         match parse_ocsp_response(&resp) {
             Err(RevocationError::Parse(msg)) => {
                 assert!(msg.contains("not id-pkix-ocsp-basic"), "got: {msg}");
@@ -937,13 +931,13 @@ mod tests {
     fn revocation_values_carries_both_crls_and_ocsp() {
         let crl = vec![0x30, 0x04, 0xCA, 0xFE, 0xBA, 0xBE];
         let ocsp = vec![0x30, 0x04, 0xDE, 0xAD, 0xBE, 0xEF];
-        let v = encode_revocation_values(&[crl.clone()], &[ocsp.clone()]);
+        let v = encode_revocation_values(std::slice::from_ref(&crl), std::slice::from_ref(&ocsp));
         // Outer SEQUENCE tag
         assert_eq!(v[0], 0x30);
         assert!(v.windows(crl.len()).any(|w| w == crl));
         assert!(v.windows(ocsp.len()).any(|w| w == ocsp));
         // Must contain [0] EXPLICIT (A0) and [1] EXPLICIT (A1) wrappers
-        assert!(v.iter().any(|&b| b == 0xA0));
-        assert!(v.iter().any(|&b| b == 0xA1));
+        assert!(v.contains(&0xA0));
+        assert!(v.contains(&0xA1));
     }
 }

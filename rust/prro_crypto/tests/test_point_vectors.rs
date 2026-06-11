@@ -31,7 +31,9 @@ enum Vector {
     Twice {
         p: PointObj,
         expected: PointObj,
+        // Mirrors the fixture JSON shape; informational, never read.
         #[serde(default)]
+        #[allow(dead_code)]
         result_label: Option<String>,
     },
     #[serde(rename = "add")]
@@ -39,7 +41,9 @@ enum Vector {
         a: PointObj,
         b: PointObj,
         expected: PointObj,
+        // Mirrors the fixture JSON shape; informational, never read.
         #[serde(default)]
+        #[allow(dead_code)]
         note: Option<String>,
     },
     #[serde(rename = "negate")]
@@ -117,11 +121,7 @@ fn test_against_jkurwa_point_vectors() {
                 (
                     "twice",
                     m,
-                    format!(
-                        "expected x={}, got x={}",
-                        expected.x,
-                        field_to_hex(&got.x)
-                    ),
+                    format!("expected x={}, got x={}", expected.x, field_to_hex(&got.x)),
                 )
             }
             Vector::Add { a, b, expected, .. } => {
@@ -132,11 +132,7 @@ fn test_against_jkurwa_point_vectors() {
                 (
                     "add",
                     m,
-                    format!(
-                        "expected x={}, got x={}",
-                        expected.x,
-                        field_to_hex(&got.x)
-                    ),
+                    format!("expected x={}, got x={}", expected.x, field_to_hex(&got.x)),
                 )
             }
             Vector::Negate { p, expected } => {

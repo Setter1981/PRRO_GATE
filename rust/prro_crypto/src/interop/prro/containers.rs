@@ -197,10 +197,7 @@ pub fn detect_format(data: &[u8]) -> Option<ContainerFormat> {
 /// detector matches but whose parser hasn't shipped yet — the caller
 /// can decide whether to fall back to an external loader (Python
 /// `dstucrypt/agent`, jkurwa shell-out, etc.) until that lands.
-pub fn extract_private_key(
-    data: &[u8],
-    password: &str,
-) -> Result<ExtractedKey, ContainerError> {
+pub fn extract_private_key(data: &[u8], password: &str) -> Result<ExtractedKey, ContainerError> {
     let format = detect_format(data).ok_or(ContainerError::UnknownFormat)?;
     match format {
         ContainerFormat::Jks => extract_from_jks(data, password),
@@ -329,8 +326,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-        let extracted = extract_private_key(&data, "Jrcfyf123")
-            .expect("real JKS must extract");
+        let extracted = extract_private_key(&data, "Jrcfyf123").expect("real JKS must extract");
 
         // Cross-check against the existing direct path used by
         // `tests/test_e2e_jks_sign.rs`.
@@ -351,7 +347,10 @@ mod tests {
             Err(_) => return,
         };
         let r = extract_private_key(&data, "wrong");
-        assert!(matches!(r, Err(ContainerError::Jks(jks::JksError::BadPassword))));
+        assert!(matches!(
+            r,
+            Err(ContainerError::Jks(jks::JksError::BadPassword))
+        ));
     }
 
     /// PFX detector spot check: a synthesised SEQUENCE { INTEGER 3, ... }
@@ -392,8 +391,7 @@ mod tests {
             Err(_) => return,
         };
         assert_eq!(detect_format(&data), Some(ContainerFormat::Pfx));
-        let extracted =
-            extract_private_key(&data, "061082").expect("ZS2 must extract");
+        let extracted = extract_private_key(&data, "061082").expect("ZS2 must extract");
         assert_eq!(extracted.format, ContainerFormat::Pfx);
         assert_eq!(extracted.param_d.len(), 32);
         // ZS2 carries the cert chain alongside the encrypted key.
@@ -419,8 +417,10 @@ mod tests {
         };
         let from_pfx = extract_private_key(&zs2, "061082").unwrap();
         let from_key6 = extract_private_key(&dat, "061082").unwrap();
-        assert_eq!(from_pfx.param_d, from_key6.param_d,
-            "PFX/ZS2 vs Key-6 byte-diff on same private key — one of the parsers is wrong");
+        assert_eq!(
+            from_pfx.param_d, from_key6.param_d,
+            "PFX/ZS2 vs Key-6 byte-diff on same private key — one of the parsers is wrong"
+        );
         assert_eq!(from_pfx.format, ContainerFormat::Pfx);
         assert_eq!(from_key6.format, ContainerFormat::Key6Dat);
     }
@@ -430,16 +430,14 @@ mod tests {
     /// layout but diverge on another".
     #[test]
     fn cross_validation_pfx_vs_key6_director() {
-        let zs2 =
-            match std::fs::read("/mnt/d/PRRO_GATE/39197544_2790008754_DU250703163535.ZS2") {
-                Ok(d) => d,
-                Err(_) => return,
-            };
-        let dat =
-            match std::fs::read("/mnt/d/PRRO_GATE/39197544_2790008754_DU250703163535.dat") {
-                Ok(d) => d,
-                Err(_) => return,
-            };
+        let zs2 = match std::fs::read("/mnt/d/PRRO_GATE/39197544_2790008754_DU250703163535.ZS2") {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let dat = match std::fs::read("/mnt/d/PRRO_GATE/39197544_2790008754_DU250703163535.dat") {
+            Ok(d) => d,
+            Err(_) => return,
+        };
         let from_pfx = extract_private_key(&zs2, "061082").unwrap();
         let from_key6 = extract_private_key(&dat, "061082").unwrap();
         assert_eq!(from_pfx.param_d, from_key6.param_d);
@@ -456,8 +454,7 @@ mod tests {
         };
         // Detector must classify as Key-6 (not PFX, not Unknown).
         assert_eq!(detect_format(&data), Some(ContainerFormat::Key6Dat));
-        let extracted =
-            extract_private_key(&data, "061082").expect("real Key-6 must extract");
+        let extracted = extract_private_key(&data, "061082").expect("real Key-6 must extract");
         assert_eq!(extracted.format, ContainerFormat::Key6Dat);
         assert_eq!(extracted.param_d.len(), 32);
         // Cert chain is empty for bare Key-6 (cert lives alongside in ZS2).

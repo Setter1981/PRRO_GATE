@@ -125,9 +125,7 @@ impl Fe {
         let mut bpos: usize = 0;
         for idx in (0..chars.len()).rev() {
             let chr = chars[idx].to_ascii_uppercase();
-            let code = "0123456789ABCDEF"
-                .find(chr)
-                .expect("invalid hex character");
+            let code = "0123456789ABCDEF".find(chr).expect("invalid hex character");
             let local_bpos = bpos % 8;
             if vidx >= FE_WORDS {
                 break;
@@ -359,7 +357,10 @@ mod tests {
         let fe = Fe::from_hex(hex);
         let legacy = FieldEl::from_hex(hex, FE_WORDS);
         let from_legacy: Fe = (&legacy).into();
-        assert!(fe.ct_eq(&from_legacy), "Fe::from_hex differs from FieldEl::from_hex");
+        assert!(
+            fe.ct_eq(&from_legacy),
+            "Fe::from_hex differs from FieldEl::from_hex"
+        );
     }
 
     #[test]

@@ -37,7 +37,7 @@ pub struct DetachedSignature {
 /// Build-time options for the CMS signature: encapsulation mode and
 /// optional signed attributes. Defaults match the most common ДПС
 /// fiscal-receipt configuration: detached, current-time `signingTime`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct CmsBuildOptions {
     /// Encapsulation mode: `false` (default) emits `EncapsulatedContentInfo`
     /// without an `eContent`, requiring the verifier to bring the content
@@ -50,21 +50,14 @@ pub struct CmsBuildOptions {
     /// attribute is omitted. The high-level [`CmsSigner::sign_detached`]
     /// constructs `Some(SystemTime::now())` by default — matching every
     /// official ЦЗО CAdES-BES sample we examined.
+    ///
+    /// The derived `Default` is `None` DELIBERATELY: `None` means "ask the
+    /// signer to stamp at signing time" — `sign_detached` materialises
+    /// `SystemTime::now()` right before the digest is taken. Baking `now()`
+    /// into the default would freeze the timestamp to whenever
+    /// `::default()` was first evaluated, producing stale `signingTime` on
+    /// batched signing.
     pub signing_time: Option<std::time::SystemTime>,
-}
-
-impl Default for CmsBuildOptions {
-    fn default() -> Self {
-        // `signing_time: None` means "ask the signer to stamp at signing
-        // time" — `sign_detached` materialises `SystemTime::now()` right
-        // before the digest is taken. Baking `now()` into the default
-        // would freeze the timestamp to whenever `::default()` was first
-        // evaluated, producing stale `signingTime` on batched signing.
-        Self {
-            attached: false,
-            signing_time: None,
-        }
-    }
 }
 
 /// High-level signer: takes content, produces a CMS/CAdES-BES envelope.
@@ -254,17 +247,13 @@ impl<'a> CmsSigner<'a> {
 
         // Stage 2: hash the signature bytes and round-trip to the TSA.
         let signature_imprint = compute_digest(self.profile, &signature_value)?;
-        let tst_der = crate::cms::tsp::fetch_timestamp(
-            tsa_url,
-            &signature_imprint,
-            tsa_timeout,
-        )
-        // Preserve the typed TSP error — callers downstream want to
-        // distinguish `TspError::Rejected { status, … }` from
-        // `TspError::Http` for retry-vs-surface-to-operator decisions.
-        // Wrapping as `CmsError::Der("TSP: …")` (old behaviour) flattens
-        // both to a stringly-typed DER error.
-        .map_err(CmsError::Tsp)?;
+        let tst_der = crate::cms::tsp::fetch_timestamp(tsa_url, &signature_imprint, tsa_timeout)
+            // Preserve the typed TSP error — callers downstream want to
+            // distinguish `TspError::Rejected { status, … }` from
+            // `TspError::Http` for retry-vs-surface-to-operator decisions.
+            // Wrapping as `CmsError::Der("TSP: …")` (old behaviour) flattens
+            // both to a stringly-typed DER error.
+            .map_err(CmsError::Tsp)?;
 
         // Stage 3: reassemble with the TST bolted on as an unsigned attr.
         let cms_der = assemble_signed_data_inner(
@@ -325,12 +314,8 @@ pub fn sign_detached_with_content_digest(
 /// Compute the digest matching the profile's hash algorithm.
 fn compute_digest(profile: CmsProfile, data: &[u8]) -> Result<Vec<u8>, CmsError> {
     match profile {
-        CmsProfile::Dstu4145WithGost34311Pb => {
-            Ok(crate::core::hash::gost_34_311_95(data).to_vec())
-        }
-        CmsProfile::Dstu4145WithDstu7564Pb => {
-            Ok(crate::core::hash::kupyna_256(data).to_vec())
-        }
+        CmsProfile::Dstu4145WithGost34311Pb => Ok(crate::core::hash::gost_34_311_95(data).to_vec()),
+        CmsProfile::Dstu4145WithDstu7564Pb => Ok(crate::core::hash::kupyna_256(data).to_vec()),
     }
 }
 
@@ -366,7 +351,13 @@ fn assemble_signed_data(
     signed_attrs_set_der: &[u8],
     signature_value: &[u8],
 ) -> Result<Vec<u8>, CmsError> {
-    assemble_signed_data_with_opts(profile, cert_der, signed_attrs_set_der, signature_value, None)
+    assemble_signed_data_with_opts(
+        profile,
+        cert_der,
+        signed_attrs_set_der,
+        signature_value,
+        None,
+    )
 }
 
 /// Variant of [`assemble_signed_data`] that optionally embeds the
@@ -381,8 +372,13 @@ fn assemble_signed_data_with_opts(
     content_for_encap: Option<&[u8]>,
 ) -> Result<Vec<u8>, CmsError> {
     assemble_signed_data_inner(
-        profile, cert_der, signed_attrs_set_der, signature_value,
-        content_for_encap, None, None,
+        profile,
+        cert_der,
+        signed_attrs_set_der,
+        signature_value,
+        content_for_encap,
+        None,
+        None,
     )
 }
 
@@ -644,7 +640,8 @@ mod tests {
             0x06, 0x0B, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x0E,
         ];
         assert!(
-            t.windows(ID_AA_SIG_TST_OID.len()).any(|w| w == ID_AA_SIG_TST_OID),
+            t.windows(ID_AA_SIG_TST_OID.len())
+                .any(|w| w == ID_AA_SIG_TST_OID),
             "CAdES-T CMS must contain id-aa-signatureTimeStampToken OID"
         );
         assert!(
@@ -672,7 +669,10 @@ mod tests {
             signer: &signer,
             profile: CmsProfile::default(),
         };
-        let opts = CmsBuildOptions { attached: false, signing_time: None };
+        let opts = CmsBuildOptions {
+            attached: false,
+            signing_time: None,
+        };
 
         // Synthetic TST + CRL + OCSP. Real ones have SignedData inside;
         // the embedder passes them through verbatim so byte-pattern
@@ -687,7 +687,9 @@ mod tests {
 
         let lt = cms_signer
             .sign_with_lt(
-                b"LT payload", opts, Some(&fake_tst),
+                b"LT payload",
+                opts,
+                Some(&fake_tst),
                 std::slice::from_ref(&fake_crl),
                 std::slice::from_ref(&fake_ocsp),
             )
@@ -700,7 +702,8 @@ mod tests {
             0x06, 0x0B, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x18,
         ];
         assert!(
-            lt.windows(ID_AA_ETS_RV_OID.len()).any(|w| w == ID_AA_ETS_RV_OID),
+            lt.windows(ID_AA_ETS_RV_OID.len())
+                .any(|w| w == ID_AA_ETS_RV_OID),
             "CAdES-LT must carry id-aa-ets-revocationValues"
         );
         assert!(lt.windows(fake_tst.len()).any(|w| w == fake_tst));
@@ -716,13 +719,8 @@ mod tests {
         };
         let signer = StubSigner;
         let digest = vec![0u8; 32];
-        let r = sign_detached_with_content_digest(
-            CmsProfile::default(),
-            &cert,
-            &digest,
-            &signer,
-        )
-        .unwrap();
+        let r = sign_detached_with_content_digest(CmsProfile::default(), &cert, &digest, &signer)
+            .unwrap();
         assert!(!r.is_empty());
         assert_eq!(r[0], 0x30); // SEQUENCE
     }
@@ -814,7 +812,9 @@ mod tests {
         let cms = cms_signer.sign_with(b"x", opts).unwrap().cms_der;
 
         // signingTime OID DER: 06 09 2A 86 48 86 F7 0D 01 09 05
-        let oid = [0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x05];
+        let oid = [
+            0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x05,
+        ];
         assert!(
             cms.windows(oid.len()).any(|w| w == oid),
             "signingTime OID must be present in signedAttrs"
@@ -852,7 +852,7 @@ mod tests {
     #[test]
     fn default_build_options_are_unstamped() {
         let opts = CmsBuildOptions::default();
-        assert_eq!(opts.attached, false);
+        assert!(!opts.attached);
         assert!(opts.signing_time.is_none());
     }
 
@@ -880,32 +880,28 @@ mod tests {
         // Kupyna-256 digest OID: 1.2.804.2.1.1.1.1.2.2.1
         // DER: 06 0B 2A 86 24 02 01 01 01 01 02 02 01
         let kupyna_digest_oid = [
-            0x06, 0x0B, 0x2A, 0x86, 0x24, 0x02, 0x01, 0x01,
-            0x01, 0x01, 0x02, 0x02, 0x01,
+            0x06, 0x0B, 0x2A, 0x86, 0x24, 0x02, 0x01, 0x01, 0x01, 0x01, 0x02, 0x02, 0x01,
         ];
         assert!(
-            cms.windows(kupyna_digest_oid.len()).any(|w| w == kupyna_digest_oid),
+            cms.windows(kupyna_digest_oid.len())
+                .any(|w| w == kupyna_digest_oid),
             "CMS must contain Kupyna-256 digest OID"
         );
 
         // Kupyna signature OID: 1.2.804.2.1.1.1.1.3.6.1.1
         // DER: 06 0C 2A 86 24 02 01 01 01 01 03 06 01 01
         let kupyna_sig_oid = [
-            0x06, 0x0C, 0x2A, 0x86, 0x24, 0x02, 0x01, 0x01,
-            0x01, 0x01, 0x03, 0x06, 0x01, 0x01,
+            0x06, 0x0C, 0x2A, 0x86, 0x24, 0x02, 0x01, 0x01, 0x01, 0x01, 0x03, 0x06, 0x01, 0x01,
         ];
         assert!(
-            cms.windows(kupyna_sig_oid.len()).any(|w| w == kupyna_sig_oid),
+            cms.windows(kupyna_sig_oid.len())
+                .any(|w| w == kupyna_sig_oid),
             "CMS must contain Dstu4145WithDstu7564(pb) signature OID"
         );
 
-        // GOST digest OID must NOT appear
-        let gost_digest_oid = [
-            0x06, 0x09, 0x2A, 0x86, 0x24, 0x02, 0x01, 0x01,
-            0x01, 0x01, 0x02, 0x01,
-        ];
-        // Note: GOST OID might appear inside the cert itself (which is embedded),
-        // so we only check that the Kupyna OID IS present, not that GOST is absent.
+        // DELIBERATELY no "GOST digest OID must NOT appear" assertion: the
+        // GOST OID may legitimately appear inside the embedded certificate
+        // itself, so we only check that the Kupyna OIDs ARE present.
     }
 
     /// `sign_detached()` stamps the `signingTime` attribute at call
@@ -929,7 +925,10 @@ mod tests {
             0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x05,
         ];
         assert!(
-            result.cms_der.windows(SIGNING_TIME_OID.len()).any(|w| w == SIGNING_TIME_OID),
+            result
+                .cms_der
+                .windows(SIGNING_TIME_OID.len())
+                .any(|w| w == SIGNING_TIME_OID),
             "sign_detached must embed a signingTime attribute"
         );
     }
