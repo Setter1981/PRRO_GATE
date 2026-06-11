@@ -137,3 +137,65 @@ _(Fable: append rulings here; re-run M1-01/M1-02/M1-04 repros first.)_
 transitions beyond ruled ones, escalate on divergence), items 1-8 above; gates: full
 nextest + fmt + clippy + the new pins. Items 1, 2 and 4 carry production-semantics changes —
 architect re-reviews the delta before merge.
+
+## External critic (GPT, different lab) — adjudicated by architect (Fable, 2026-06-11)
+
+Independent second-lab critic pass over the dossier (esp. the "Suspects cleared" section).
+Every candidate re-verified in code by the architect before ruling. **Two of our seven
+CLEAN verdicts were BROKEN — the uncorrelated contour earned its keep.**
+
+- **NC-03 | FT | CONFIRMED — breaks "run_boot_reconciliation partition CLEAN".**
+  `run_boot_reconciliation` branch (a) (`boot_phase.rs:1386`): a missing `node_state` row
+  bootstraps `upsert_initial(Online, Closed, next_lnd=1)` with **ZERO cross-check of existing
+  `fiscal_documents`/`shifts`** for the FN (verified: the `let Some(row) = row else {…}` resets
+  the LND allocator + MAC-seed projection unconditionally). If a restore/corruption/rebaseline
+  loses only `node_state` while the ledger survives, boot silently resets the allocator → next
+  write either fail-closes on `ux_fd_fn_lnd` OR (sparse/imported history) allocates BELOW the
+  existing tail and signs with `previous_hash=None` → duplicate lnd / broken MAC chain.
+  Reachability is low under whole-file snapshot restore (node_state + docs travel together),
+  but the **defensive gap is real and FT-class** — an allocator/seed reset with no ledger
+  guard is a latent landmine, and it composes with the tip-guard restore-safety story.
+  FIX (batch, FT — architect re-review): branch (a) must query the ledger first; if ANY
+  `fiscal_documents` row exists for the FN → do NOT reset to 1 — derive `next_lnd` from
+  `MAX(lnd)+1`, project the MAC seed from the last ACK, and **BLOCK + CRITICAL** rather than
+  silently bootstrap (a node whose node_state vanished under it is not healthy). Pin: SQL repro
+  from the candidate + `invariant_scan` post-condition.
+- **NC-02 | MED (downgraded from GPT's HIGH) | CONFIRMED — breaks "MAX_BOOT_ATTEMPTS CLEAN"
+  at the DOMAIN level.** Arithmetic is clean (dossier holds), but the budget is `doc_type`- and
+  wall-clock-blind: 5 TransientRetry attempts → Manual contradicts §16 (transport-class for
+  shift open/close is unbounded; `-3` ERROR_SAVE needs ≥30 attempts over ≥60 min). Downgraded
+  because the affected paths aren't live: SHIFT_OPEN/Z_REPORT are fail-closed until A2.2, and
+  `-3 ERROR_SAVE→retryable` is a known M5 backlog item. NOT a fix-now in the M1 batch.
+  Ruling: PIN a test (shift-doc TransientRetry → premature Manual) marked `#[ignore]` with a
+  comment, and route the doc_type/wall-clock policy decision to **A2.2 (shift goes live) + M5
+  (ERROR_SAVE)**. The dossier's "MAX_BOOT_ATTEMPTS CLEAN" is amended to "arithmetic clean;
+  domain policy deferred to A2.2/M5".
+- **NC-01 | HIGH→MED (reachability) | CONFIRMED structural inconsistency.** `last_chk_probe::probe`
+  (`:85`) Matches on `ack.id == expected` **ignoring `data_sign` emptiness**, and
+  `advance_sent_to_kvt1_from_probe` persists `ack.data_sign` into `Kvt1Raw` with **no
+  `is_empty` guard** — verified. This diverges from (a) the W12 classify contract (empty
+  data_sign → Hold, never advance) and (b) `kvt2_advance::advance_to_ack`'s own
+  `StructuralDrift`-on-empty guard. So the probe path can advance SENT→KVT1 persisting EMPTY
+  forensic KVT1 bytes. Downgraded to MED on reachability (DPS returning a matching id with
+  empty `data_sign` is abnormal), but the fix is cheap and the inconsistency is exactly the
+  L3 class. FIX (batch): mirror the empty-guard — `probe` routes empty `data_sign` to a
+  Hold-equivalent (no advance), OR `advance_sent_to_kvt1_from_probe` fail-louds on empty like
+  `advance_to_ack`. Pin: K4-variant with matching id + `vec![]` → assert NO advance / non-empty
+  KVT1_RAW invariant.
+- **NC-04 | MED | CONFIRMED defensive gap — composes with NC-03.** `last_submitted_server_fiscal_no`
+  filters `sfn IS NOT NULL AND length>0` (verified `:713`), so a malformed newer SENT/KVT1 row
+  with NULL/'' sfn is excluded → tip-guard can validate an OLDER tail as `TIP_GUARD_OK` while
+  the real max-lnd submitted row is unrecoverable+pending. SENT-with-NULL-sfn is unreachable in
+  healthy code (SENT ⇐ WireDecision::Sent stamps sfn), but malformed rows are exactly what a
+  restored/corrupted DB carries — the same domain the tip-guard exists for. FIX (batch, with
+  M1-02 arm work): if the newest `{SENT,KVT1,KVT2}` row by lnd has NULL/empty sfn (i.e.
+  `last_submitted` skipped a higher-lnd pending row) → tip-guard treats it as a block-worthy
+  anomaly, not silent OK.
+
+**Cleared-section verdict after adjudication:** 5/7 hold; 2 BROKEN (partition→NC-03,
+MAX_BOOT_ATTEMPTS→NC-02). GPT raised no hard disagreement with our 8 CONFIRMED; concurs M1-02
+stays HIGH until the reachability pin exists.
+
+**Fix-batch scope grows by 3** (NC-01, NC-03, NC-04 join items 1-8); NC-02 is pin-only
+(deferred A2.2/M5). NC-03 is FT → architect re-reviews its delta with the same scrutiny as
+the 002 migration.
