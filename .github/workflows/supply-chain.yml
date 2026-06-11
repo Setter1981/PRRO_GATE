@@ -1,0 +1,32 @@
+# Supply-chain audit — RUSTSEC advisories over rust/Cargo.lock.
+#
+# Policy lives in rust/.cargo/audit.toml (each ignore carries a written
+# justification — currently only RUSTSEC-2023-0071: rsa Marvin, pulled
+# transitively by `cms`, no RSA operation is ever executed in this
+# DSTU-only gateway and no fixed rsa release exists).
+#
+# Runs on every PR touching dependencies AND weekly — new advisories
+# are published against EXISTING lockfiles, so a quiet repo still needs
+# the scheduled pass.
+name: supply-chain
+
+on:
+  pull_request:
+    paths:
+      - "rust/Cargo.lock"
+      - "rust/**/Cargo.toml"
+      - "rust/.cargo/audit.toml"
+      - ".github/workflows/supply-chain.yml"
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+  workflow_dispatch:
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-audit
+      - name: cargo audit
+        working-directory: rust
+        run: cargo audit

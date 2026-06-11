@@ -48,9 +48,6 @@ pub mod core;
 pub mod interop;
 pub mod profiles;
 
-#[cfg(feature = "python")]
-mod python;
-
 // ─── Top-level re-exports for convenient downstream `use`. ──────────────────
 //
 // These are the headline types an integrator imports. They do not
