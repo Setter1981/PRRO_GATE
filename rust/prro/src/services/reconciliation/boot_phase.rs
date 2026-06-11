@@ -2056,6 +2056,9 @@ pub(crate) async fn dispatch_sent_via_probe(
                     backend_profile_id: backend_id,
                     transport_profile_id: transport_id,
                     request_envelope_sha256: [0u8; 32],
+                    // M1 item 4: a READ-ONLY last_chk probe — excluded from the
+                    // ER-redrive send budget (`attempts_used`).
+                    is_probe: true,
                 },
             )
             .await

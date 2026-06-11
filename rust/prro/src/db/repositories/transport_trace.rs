@@ -89,6 +89,13 @@ pub struct NewAttempt {
     pub backend_profile_id: String,
     pub transport_profile_id: String,
     pub request_envelope_sha256: [u8; 32],
+    /// M1 review item 4 (migration 002) — `true` for a READ-ONLY `last_chk`
+    /// probe attempt (boot SENT-recovery / drain KVT2-confirm), `false` for a
+    /// real `send_chk` submit.  This is the AUTHORITATIVE probe/send
+    /// discriminator for [`attempts_used`] budget accounting; the
+    /// `request_envelope_sha256 == [0u8; 32]` convention is NOT load-bearing for
+    /// the budget anymore.
+    pub is_probe: bool,
 }
 
 /// Inputs needed at 4-b time.  `wire_call_started_at` and
@@ -148,14 +155,15 @@ pub async fn allocate_and_insert_tx(
         "INSERT INTO transport_trace ( \
             document_id, attempt_no, \
             backend_profile_id, transport_profile_id, \
-            request_envelope_sha256 \
-         ) VALUES (?, ?, ?, ?, ?)",
+            request_envelope_sha256, is_probe \
+         ) VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(doc_id)
     .bind(next_i32)
     .bind(&init.backend_profile_id)
     .bind(&init.transport_profile_id)
     .bind(&init.request_envelope_sha256[..])
+    .bind(init.is_probe as i64)
     .execute(&mut **tx)
     .await?;
     Ok(next_i32)
@@ -381,22 +389,30 @@ pub async fn last_attempt_retry_class_for(
 /// W9.2 (per freeze §4.0, HIGH 2 fix) — durable per-doc wire-attempt
 /// counter for boot-recovery budget decisions.
 ///
-/// Returns `COALESCE(MAX(attempt_no), 0)` across all `transport_trace`
-/// rows for `doc_id` (no `completed_at` filter — both in-flight and
-/// completed attempts count toward the budget; a crash mid-send still
-/// "burned" a slot per Pattern B safety contract).  Always non-NULL
-/// `i64` because `COALESCE` guarantees a fallback `0`.
+/// Returns the count of real `send_chk` attempts (`is_probe = 0`) for
+/// `doc_id` — the durable ER-redrive send budget.
 ///
-/// Used by `services::reconciliation::boot_phase::run_boot_reconciliation`
-/// (W9.3) for the §4.8 ERROR_RETRYABLE pre-check:
-///   `attempts_used(doc_id) >= MAX_BOOT_ATTEMPTS  →  escalate to
-///    RequiresManualReconciliation`.
+/// **M1 review item 4 (architect ruling variant B, 2026-06-11).** Was
+/// `COALESCE(MAX(attempt_no), 0)` over ALL rows; that counted READ-ONLY
+/// `last_chk` probe rows (M1-04), prematurely exhausting `MAX_BOOT_ATTEMPTS`.
+/// Now `COUNT(*) WHERE is_probe = 0` — **COUNT, not MAX**: `MAX(attempt_no)`
+/// over send rows would still count probes interleaved at lower `attempt_no`
+/// (the attempt_no namespace is shared), so only a COUNT of send rows is the
+/// true send budget.  No `completed_at` filter — an in-flight send (crash
+/// mid-`send_chk`) still "burned" a slot per the Pattern-B safety contract;
+/// only probes are excluded.  Always non-NULL (`COUNT` returns `0` on no rows).
+///
+/// Used by `er_redrive_policy::evaluate_er_redrive` (the §4.8 ERROR_RETRYABLE
+/// pre-check): `attempts_used(doc_id) >= MAX_BOOT_ATTEMPTS  →  escalate to
+/// RequiresManualReconciliation`.  This is its ONLY consumer; `attempt_no`
+/// allocation uses its own `MAX(attempt_no)+1` (see [`allocate_and_insert_tx`]),
+/// independent of this COUNT.
 ///
 /// Pool-bound (read-only); safe to call from boot or operational loops
 /// without entering a write lock.
 pub async fn attempts_used(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> sqlx::Result<i64> {
     let n: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(attempt_no), 0) FROM transport_trace WHERE document_id = ?",
+        "SELECT COUNT(*) FROM transport_trace WHERE document_id = ? AND is_probe = 0",
     )
     .bind(doc_id)
     .fetch_one(pool)

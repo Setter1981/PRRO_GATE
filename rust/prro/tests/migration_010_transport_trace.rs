@@ -71,6 +71,8 @@ async fn alloc(pool: &SqlitePool, doc: DocumentId, sha: [u8; 32]) -> i32 {
                     backend_profile_id: "b1".into(),
                     transport_profile_id: "t1".into(),
                     request_envelope_sha256: sha,
+                    // M1 item 4: these helpers seed real send attempts.
+                    is_probe: false,
                 },
             )
             .await?;
@@ -491,6 +493,59 @@ async fn attempts_used_multi_doc_returns_target_max_only() {
     assert_eq!(
         transport_trace::attempts_used(&pool, doc_b).await.unwrap(),
         4
+    );
+}
+
+async fn alloc_probe(pool: &SqlitePool, doc: DocumentId, sha: [u8; 32]) -> i32 {
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            let n = transport_trace::allocate_and_insert_tx(
+                tx,
+                doc,
+                NewAttempt {
+                    backend_profile_id: "b1".into(),
+                    transport_profile_id: "t1".into(),
+                    request_envelope_sha256: sha,
+                    is_probe: true,
+                },
+            )
+            .await?;
+            Ok::<i32, anyhow::Error>(n)
+        })
+    })
+    .await
+    .expect("allocate probe")
+}
+
+/// M1-04 fix pin (architect ruling item 4 variant B, 2026-06-11): `attempts_used`
+/// is the ER-redrive SEND budget — it counts only real `send_chk` attempts
+/// (`is_probe = 0`), NOT read-only `last_chk` probe rows.  Before the fix the
+/// shared `attempt_no` namespace let interleaved probe rows inflate the count
+/// (`MAX(attempt_no)`), prematurely exhausting `MAX_BOOT_ATTEMPTS`.
+#[tokio::test]
+async fn attempts_used_counts_sends_only_not_probes() {
+    let (_dir, pool) = fresh_pool().await;
+    let doc = seed_doc(&pool, 0x30).await;
+    // Interleave send / probe → attempt_no 1..=5, but only 3 real sends.
+    let _ = alloc(&pool, doc, [1u8; 32]).await; // send  (is_probe=0)
+    let _ = alloc_probe(&pool, doc, [0u8; 32]).await; // probe (is_probe=1)
+    let _ = alloc(&pool, doc, [2u8; 32]).await; // send
+    let _ = alloc_probe(&pool, doc, [0u8; 32]).await; // probe
+    let _ = alloc(&pool, doc, [3u8; 32]).await; // send
+    assert_eq!(
+        transport_trace::attempts_used(&pool, doc).await.unwrap(),
+        3,
+        "only the 3 real sends count; the 2 interleaved probes are excluded (M1-04)"
+    );
+    // Five probes and nothing else → ZERO send budget consumed.
+    let doc2 = seed_doc(&pool, 0x31).await;
+    for _ in 0..5 {
+        let _ = alloc_probe(&pool, doc2, [0u8; 32]).await;
+    }
+    assert_eq!(
+        transport_trace::attempts_used(&pool, doc2).await.unwrap(),
+        0,
+        "five read-only probes burn ZERO send budget (M1-04 repro)"
     );
 }
 
