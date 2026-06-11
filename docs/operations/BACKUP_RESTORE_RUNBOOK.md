@@ -53,8 +53,11 @@ for restore.
 5. **Start the service.**
 
 6. **The boot tip-guard runs (PR-B).** On boot, per FN, after the normal
-   recovery arms, the node takes the `server_fiscal_no` of its last `ACK`
-   receipt and asks the DPS (`last_chk`) whether that is still the tail:
+   recovery arms, the node takes the `server_fiscal_no` of its **newest
+   submitted** receipt (its last doc in `SENT`/`KVT1`/`KVT2`/`ACK`) and asks the
+   DPS (`last_chk`) whether that is still the tail. (The guard is skipped for an
+   FN whose boot already exchanged with the DPS this pass — a fresh re-send or a
+   recovery probe — since that contact already verified the tip.)
    - **OK** → `TIP_GUARD_OK` (INFO) → the node trades normally.
    - **STALE** (`TIP_GUARD_STALE_LEDGER`, CRITICAL) → `node_state.mode` is set to
      `BLOCKED` and the node **refuses fiscal commands** — see §3. This is the
@@ -94,3 +97,15 @@ would corrupt the fiscal sequence irreversibly.
   `docs/operations/RETENTION_POLICY.md`). Treat snapshots as sensitive.
 - `[backup] enabled = false` disables automatic snapshots — then restore depends
   on whatever external backup the operator arranged.
+- **Known limitation (residual).** The tip-guard verifies the *submitted* tail
+  (the newest `SENT`/`KVT1`/`KVT2`/`ACK` doc). It does **not** cover a snapshot
+  that captured a *pre-wire* doc (`PREPARED`/`SIGNED`) which is then restored: on
+  boot the recovery arms re-drive that doc to the DPS *before* the guard, so an
+  `lnd` re-use is possible before any tip check. Placing the guard before the
+  recovery arms was rejected (it would false-block normal crash recovery).
+  Mitigation: keep `[backup] interval_seconds` short relative to the (brief)
+  pre-wire window. Full closure (a pre-arms, ACK-tail-only check) is tracked
+  separately, after the legacy review.
+- `[backup] tip_guard_enabled = false` is a kill-switch for the boot tip-guard
+  (for false positives in the field): the node then trades after restore without
+  the DPS tip check — use only under support guidance.
