@@ -47,12 +47,12 @@
 //!   `|t|` up without any actual secret leak.
 //! - `|t| ≥ 10` consistently: highly likely real leak. Investigate.
 
+// Explicit index loops mirror the core's CT style (see core/mod.rs).
+#![allow(clippy::needless_range_loop)]
+
 use std::time::Instant;
 
-use prro_crypto::{
-    core::sign::sign,
-    Curve, FieldEl,
-};
+use prro_crypto::{core::sign::sign, Curve, FieldEl};
 
 const WARMUP_ITERS: usize = 2_000;
 const MEASUREMENT_ITERS: usize = 80_000;
@@ -71,7 +71,11 @@ struct Xorshift(u64);
 impl Xorshift {
     fn new(seed: u64) -> Self {
         // Avoid the fixed-point at zero.
-        Xorshift(if seed == 0 { 0xDEAD_BEEF_CAFE_BABE } else { seed })
+        Xorshift(if seed == 0 {
+            0xDEAD_BEEF_CAFE_BABE
+        } else {
+            seed
+        })
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -102,11 +106,7 @@ impl Xorshift {
 ///
 /// `builder` is called once per sample and returns `(class_tag, inputs)`.
 /// Class tag is 0 or 1; the sign path is measured, timing sorted by class.
-fn collect_timings<F>(
-    curve: &Curve,
-    mut builder: F,
-    iters: usize,
-) -> (Vec<u128>, Vec<u128>)
+fn collect_timings<F>(curve: &Curve, mut builder: F, iters: usize) -> (Vec<u128>, Vec<u128>)
 where
     F: FnMut(&mut Xorshift) -> (u8, FieldEl, FieldEl, FieldEl),
 {

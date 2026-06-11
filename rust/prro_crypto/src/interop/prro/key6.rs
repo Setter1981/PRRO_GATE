@@ -38,9 +38,7 @@
 //! parse is one half of the cross-validation against the PFX/ZS2 path.
 
 use crate::core::hash::{gost28147::Gost, gost_34_311_95};
-use crate::interop::prro::der::{
-    self, DerError, Reader, TAG_OCTET_STRING, TAG_OID, TAG_SEQUENCE,
-};
+use crate::interop::prro::der::{self, DerError, Reader, TAG_OCTET_STRING, TAG_OID, TAG_SEQUENCE};
 
 /// IIT cryptType OID (`1.3.6.1.4.1.19398.1.1.1.2`) in DER bytes.
 /// We compare bytes-for-bytes rather than parsing the OID into arcs.
@@ -193,8 +191,7 @@ pub fn parse(data: &[u8], password: &[u8]) -> Result<Key6Parsed, Key6Error> {
     //      A failure here is treated as the equivalent of "bad password" —
     //      because the only realistic way the inner DER fails to parse is
     //      that the decryption produced garbage from a wrong key.
-    let param_d = der::extract_param_d(&plain)
-        .map_err(|_| Key6Error::BadPassword)?;
+    let param_d = der::extract_param_d(&plain).map_err(|_| Key6Error::BadPassword)?;
     Ok(Key6Parsed {
         param_d: zeroize::Zeroizing::new(param_d),
     })
@@ -275,13 +272,20 @@ mod tests {
     #[test]
     fn e2e_phase1_jks_ski_round_trip() {
         let jks_path = "/mnt/d/PRRO_GATE/key_13667753_13667753 (2).jks";
-        let data = match std::fs::read(jks_path) { Ok(d) => d, Err(_) => return };
-        let entry = crate::interop::prro::jks::read_jks(&data, "Jrcfyf123")
-            .expect("JKS must decrypt");
+        let data = match std::fs::read(jks_path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let entry =
+            crate::interop::prro::jks::read_jks(&data, "Jrcfyf123").expect("JKS must decrypt");
         let d_bytes = crate::interop::prro::der::extract_param_d(&entry.key_der)
             .expect("must extract param_d");
 
-        use crate::core::{curve::Curve, field::FieldEl, point::{compress_point, Point}};
+        use crate::core::{
+            curve::Curve,
+            field::FieldEl,
+            point::{compress_point, Point},
+        };
         let curve = Curve::dstu_pb_257();
         let d = FieldEl::from_le_bytes(&d_bytes, curve.mod_words);
         let g = Point::new(curve.base_x.clone(), curve.base_y.clone());
@@ -305,12 +309,15 @@ mod tests {
                 eprintln!("  cert[{}] SKI: (non-DSTU pubkey, skipped)", i);
             }
         }
-        let idx = matching_idx.expect(
-            "one of the JKS certs must have pubkey matching the decrypted private key",
-        );
+        let idx = matching_idx
+            .expect("one of the JKS certs must have pubkey matching the decrypted private key");
         eprintln!("end-entity is cert[{}]", idx);
 
-        let hex = ski_from_key.iter().map(|b| format!("{:02x}", b)).collect::<String>().to_uppercase();
+        let hex = ski_from_key
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+            .to_uppercase();
         eprintln!("JKS (Privat) end-entity SKI: {}", hex);
         assert_eq!(ski_from_key.len(), 32);
     }
@@ -324,15 +331,26 @@ mod tests {
     #[test]
     fn e2e_phase1_zs2_to_ski_matches_cert_extension() {
         let zs2_path = "/mnt/d/PRRO_GATE/39197544_2790008754_DU250703163535.ZS2";
-        let cert_path = "/mnt/c/ProgramData/WebCheck/Keys/CA-0882240800000000000000000000000000000001.cer";
-        let zs2 = match std::fs::read(zs2_path) { Ok(d) => d, Err(_) => return };
-        let cert = match std::fs::read(cert_path) { Ok(d) => d, Err(_) => return };
+        let cert_path =
+            "/mnt/c/ProgramData/WebCheck/Keys/CA-0882240800000000000000000000000000000001.cer";
+        let zs2 = match std::fs::read(zs2_path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let cert = match std::fs::read(cert_path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
 
         // 1. Decrypt → param_d
         let parsed = crate::interop::prro::pfx::parse(&zs2, b"061082").expect("ZS2 must parse");
 
         // 2. Derive pubkey: Q = -d·G
-        use crate::core::{curve::Curve, field::FieldEl, point::{compress_point, Point}};
+        use crate::core::{
+            curve::Curve,
+            field::FieldEl,
+            point::{compress_point, Point},
+        };
         let curve = Curve::dstu_pb_257();
         let d = FieldEl::from_le_bytes(&parsed.param_d, curve.mod_words);
         let g = Point::new(curve.base_x.clone(), curve.base_y.clone());
@@ -340,26 +358,37 @@ mod tests {
 
         // 3. Compress Q
         let compressed = compress_point(&q, &curve);
-        assert_eq!(compressed.len(), 33, "DSTU PB-257 compressed point is 33 bytes");
+        assert_eq!(
+            compressed.len(),
+            33,
+            "DSTU PB-257 compressed point is 33 bytes"
+        );
 
         // 4. Compute SKI from compressed Q
         let derived_ski = crate::cms::envelope::compute_ski(&compressed);
-        let derived_hex = derived_ski.iter().map(|b| format!("{:02x}", b)).collect::<String>().to_uppercase();
+        let derived_hex = derived_ski
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+            .to_uppercase();
 
         // 5. Read SKI from cert extension (via re-running compute_ski on
         // the cert's own pubkey bytes — a chain we already verified separately).
         let cert_pubkey = crate::cms::envelope::extract_cert_pubkey_bytes(&cert)
             .expect("cert must have a DSTU pubkey");
         let cert_ski = crate::cms::envelope::compute_ski(&cert_pubkey);
-        let cert_hex = cert_ski.iter().map(|b| format!("{:02x}", b)).collect::<String>().to_uppercase();
+        let cert_hex = cert_ski
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+            .to_uppercase();
 
         assert_eq!(
             derived_hex, cert_hex,
             "SKI derived from ZS2 must equal SKI computed from the matching cert"
         );
         assert_eq!(
-            derived_hex,
-            "FDC59901EBA8CC051173D29896A0ECEE90454F12908F275580E4551C679AD13B",
+            derived_hex, "FDC59901EBA8CC051173D29896A0ECEE90454F12908F275580E4551C679AD13B",
             "SKI must match the known-good value for this director key"
         );
     }
@@ -370,7 +399,8 @@ mod tests {
     /// WebCheck local store. Skipped if the file is absent.
     #[test]
     fn compute_ski_matches_real_ukrainian_cert() {
-        let cert_path = "/mnt/c/ProgramData/WebCheck/Keys/CA-0882240800000000000000000000000000000001.cer";
+        let cert_path =
+            "/mnt/c/ProgramData/WebCheck/Keys/CA-0882240800000000000000000000000000000001.cer";
         let cert = match std::fs::read(cert_path) {
             Ok(d) => d,
             Err(_) => return,
@@ -378,10 +408,13 @@ mod tests {
         let pubkey_bytes = crate::cms::envelope::extract_cert_pubkey_bytes(&cert)
             .expect("cert must have a DSTU pubkey");
         let ski = crate::cms::envelope::compute_ski(&pubkey_bytes);
-        let ski_hex = ski.iter().map(|b| format!("{:02x}", b)).collect::<String>().to_uppercase();
+        let ski_hex = ski
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+            .to_uppercase();
         assert_eq!(
-            ski_hex,
-            "FDC59901EBA8CC051173D29896A0ECEE90454F12908F275580E4551C679AD13B",
+            ski_hex, "FDC59901EBA8CC051173D29896A0ECEE90454F12908F275580E4551C679AD13B",
             "SKI must match the value in cert's 2.5.29.14 extension"
         );
     }

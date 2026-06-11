@@ -23,25 +23,25 @@
 //! ```
 //!
 //! The library exposes:
-//! - [`PrinterProfile`]      — parsed XML profile
-//! - [`CommandValue`]        — parameter for a named enum-style command
-//! - [`ReceiptCompiler`]     — builds an ESC/POS byte stream from a
-//!                             sequence of semantic instructions
-//! - [`Error`]               — typed errors for unknown commands, bad
-//!                             profile XML, codepage issues.
+//! - [`PrinterProfile`] — parsed XML profile
+//! - [`CommandValue`] — parameter for a named enum-style command
+//! - [`ReceiptCompiler`] — builds an ESC/POS byte stream from a sequence
+//!   of semantic instructions
+//! - [`Error`] — typed errors for unknown commands, bad profile XML,
+//!   codepage issues.
 //!
 //! The compiler never performs I/O — it returns `Vec<u8>` that the
 //! caller writes to TCP:9100 / Serial / USB.  That separation keeps
 //! the library unit-testable with pure golden bytes.
-pub mod error;
-pub mod profile;
-pub mod executor;
 pub mod compiler;
+pub mod error;
+pub mod executor;
+pub mod profile;
 
+pub use compiler::{Alignment, CodePage, Instruction, ReceiptCompiler};
 pub use error::{Error, Result};
-pub use profile::{PrinterProfile, Command, Procedure, CommandValue};
 pub use executor::Executor;
-pub use compiler::{ReceiptCompiler, Instruction, Alignment, CodePage};
+pub use profile::{Command, CommandValue, PrinterProfile, Procedure};
 
 /// Bundled vendor profiles distributed with the crate.  Operators can
 /// load their own XML via [`PrinterProfile::from_xml_str`] instead.

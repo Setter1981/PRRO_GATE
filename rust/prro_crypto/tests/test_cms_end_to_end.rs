@@ -177,11 +177,23 @@ fn test_attached_embeds_econtent_detached_does_not() {
     };
 
     let detached = cms_signer
-        .sign_with(content, CmsBuildOptions { attached: false, signing_time: None })
+        .sign_with(
+            content,
+            CmsBuildOptions {
+                attached: false,
+                signing_time: None,
+            },
+        )
         .expect("detached sign failed")
         .cms_der;
     let attached = cms_signer
-        .sign_with(content, CmsBuildOptions { attached: true, signing_time: None })
+        .sign_with(
+            content,
+            CmsBuildOptions {
+                attached: true,
+                signing_time: None,
+            },
+        )
         .expect("attached sign failed")
         .cms_der;
 
@@ -198,7 +210,10 @@ fn test_attached_embeds_econtent_detached_does_not() {
     // content must be wrapped in a primitive DER OCTET STRING — i.e. preceded
     // by `04 <len>` (single-byte length for our <128-byte content) — which is
     // exactly the eContent encoding `[0] EXPLICIT OCTET STRING(content)`.
-    assert!(content.len() < 0x80, "test content must be < 128 bytes for the framing check");
+    assert!(
+        content.len() < 0x80,
+        "test content must be < 128 bytes for the framing check"
+    );
     let mut octet_framed = vec![0x04u8, content.len() as u8];
     octet_framed.extend_from_slice(content);
     assert!(

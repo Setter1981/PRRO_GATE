@@ -49,15 +49,22 @@ jobs:
           workspaces: rust
       - name: cargo fmt --check
         working-directory: rust
-        run: cargo fmt -p prro -- --check
+        # prro_crypto/prro_escpos joined the fmt gate in the CRY-4 lint-debt
+        # pass (2026-06-11) — both crates were fmt-standardized then.
+        run: cargo fmt -p prro -p prro_crypto -p prro_escpos -- --check
       - name: cargo clippy (-D warnings, crate-scoped)
         working-directory: rust
-        # Crate-scoped on purpose: workspace-wide clippy is not a T16 gate
-        # until prro_crypto / prro_escpos get their own hardening pass.
         # --features test-support: builds the integration test targets
         # that consume the W2 ReconcileGuard test seam. Production
         # builds never enable this feature.
         run: cargo clippy -p prro --all-targets --no-deps --features test-support -- -D warnings
+      - name: cargo clippy prro_crypto + prro_escpos (-D warnings)
+        working-directory: rust
+        # Lint-debt pass CRY-4 (2026-06-11) zeroed both crates; this gate
+        # keeps them clean. Deliberate allows live at the source (core/mod.rs
+        # explicit-index CT loops; fixture-mirror fields) — do not silence
+        # new lints here, fix or justify them in code.
+        run: cargo clippy -p prro_crypto -p prro_escpos --all-targets --no-deps -- -D warnings
 
   build:
     name: ${{ matrix.target }}

@@ -35,7 +35,7 @@ impl Curve {
     /// Construct DSTU_PB_257 (curve 6) — the standard Ukrainian fiscal curve.
     pub fn dstu_pb_257() -> Self {
         let m: u32 = 257;
-        let mod_words = ((m as usize) + 31) / 32;
+        let mod_words = (m as usize).div_ceil(32);
         // Polynomial: x^257 + x^12 + 1
         let p_exp = vec![257u32, 12, 0];
         // Word form: word 0 has bit 0 (x^0) and bit 12 (x^12); word 8 has bit 1 (x^257)

@@ -101,7 +101,10 @@ impl std::fmt::Debug for DstuInProcessSigner {
 impl DstuInProcessSigner {
     /// Production constructor: `rand_e` is drawn from `OsRng` per call.
     pub fn new(d: crate::core::field::FieldEl) -> Self {
-        Self { d, rand_e: RandESource::Os }
+        Self {
+            d,
+            rand_e: RandESource::Os,
+        }
     }
 
     /// Test-only constructor. `rand_e` is derived deterministically from
@@ -112,7 +115,10 @@ impl DstuInProcessSigner {
     /// compile this constructor under the explicit test feature.
     #[cfg(feature = "dangerous_deterministic_k_for_tests")]
     pub fn with_deterministic_seed_for_tests(d: crate::core::field::FieldEl, seed: u64) -> Self {
-        Self { d, rand_e: RandESource::Deterministic(seed) }
+        Self {
+            d,
+            rand_e: RandESource::Deterministic(seed),
+        }
     }
 }
 
@@ -177,9 +183,7 @@ impl RawSigner for DstuInProcessSigner {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| {
-            SignerError::SignFailed("exhausted rand_e attempts".into())
-        }))
+        Err(last_err.unwrap_or_else(|| SignerError::SignFailed("exhausted rand_e attempts".into())))
     }
 }
 
@@ -226,10 +230,18 @@ fn draw_rand_e_os(mod_words: usize) -> Result<crate::core::field::FieldEl, Signe
         // Build raw u256 from LE bytes WITHOUT canonicalization.
         // `Scalar::from_limbs` is a direct wrap — it does not reduce.
         let limbs = [
-            u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]),
-            u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]),
-            u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]),
-            u64::from_le_bytes([buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]]),
+            u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]),
+            u64::from_le_bytes([
+                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+            ]),
+            u64::from_le_bytes([
+                buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+            ]),
+            u64::from_le_bytes([
+                buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
+            ]),
         ];
         let candidate = Scalar::from_limbs(limbs);
 
@@ -349,8 +361,7 @@ mod tests {
     #[test]
     fn deterministic_seed_reproduces_signature() {
         let d = FieldEl::from_hex("DEADBEEFCAFE12345678", 9);
-        let signer_a =
-            DstuInProcessSigner::with_deterministic_seed_for_tests(d.clone(), 7);
+        let signer_a = DstuInProcessSigner::with_deterministic_seed_for_tests(d.clone(), 7);
         let signer_b = DstuInProcessSigner::with_deterministic_seed_for_tests(d, 7);
         let digest = [0x42u8; 32];
 

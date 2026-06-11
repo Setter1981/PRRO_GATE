@@ -37,7 +37,8 @@ fn hmac_gost34311(key: &[u8], chunks: &[&[u8]]) -> [u8; 32] {
     }
 
     // inner = H(ipad || data)
-    let mut inner_buf: Vec<u8> = Vec::with_capacity(32 + chunks.iter().map(|c| c.len()).sum::<usize>());
+    let mut inner_buf: Vec<u8> =
+        Vec::with_capacity(32 + chunks.iter().map(|c| c.len()).sum::<usize>());
     inner_buf.extend_from_slice(&ipad);
     for c in chunks {
         inner_buf.extend_from_slice(c);
@@ -92,7 +93,7 @@ pub fn gost28147_cfb_decrypt(
     ciphertext: &[u8],
 ) -> Vec<u8> {
     debug_assert!(
-        ciphertext.len() % 8 == 0,
+        ciphertext.len().is_multiple_of(8),
         "CFB stream length {} not a multiple of GOST 28147 block size 8",
         ciphertext.len()
     );
@@ -181,7 +182,7 @@ pub fn gost28147_mac(
     mac_bits: usize,
 ) -> Vec<u8> {
     assert!(
-        mac_bits > 0 && mac_bits <= 64 && mac_bits % 8 == 0,
+        mac_bits > 0 && mac_bits <= 64 && mac_bits.is_multiple_of(8),
         "gost28147_mac: mac_bits must be in (0, 64] and multiple of 8, got {mac_bits}"
     );
     let mut cipher = Gost::with_packed_sbox(dku_packed);
@@ -326,11 +327,10 @@ fn default_dku_packed() -> [u8; 64] {
     // exported. Easiest reproducible source: use the canonical packed
     // form that gost89/lib/dstu.js exports verbatim.
     [
-        0xa9, 0xd6, 0xeb, 0x45, 0xf1, 0x3c, 0x70, 0x82, 0x80, 0xc4, 0x96, 0x7b,
-        0x23, 0x1f, 0x5e, 0xad, 0xf6, 0x58, 0xeb, 0xa4, 0xc0, 0x37, 0x29, 0x1d,
-        0x38, 0xd9, 0x6b, 0xf0, 0x25, 0xca, 0x4e, 0x17, 0xf8, 0xe9, 0x72, 0x0d,
-        0xc6, 0x15, 0xb4, 0x3a, 0x28, 0x97, 0x5f, 0x0b, 0xc1, 0xde, 0xa3, 0x64,
-        0x38, 0xb5, 0x64, 0xea, 0x2c, 0x17, 0x9f, 0xd0, 0x12, 0x3e, 0x6d, 0xb8,
+        0xa9, 0xd6, 0xeb, 0x45, 0xf1, 0x3c, 0x70, 0x82, 0x80, 0xc4, 0x96, 0x7b, 0x23, 0x1f, 0x5e,
+        0xad, 0xf6, 0x58, 0xeb, 0xa4, 0xc0, 0x37, 0x29, 0x1d, 0x38, 0xd9, 0x6b, 0xf0, 0x25, 0xca,
+        0x4e, 0x17, 0xf8, 0xe9, 0x72, 0x0d, 0xc6, 0x15, 0xb4, 0x3a, 0x28, 0x97, 0x5f, 0x0b, 0xc1,
+        0xde, 0xa3, 0x64, 0x38, 0xb5, 0x64, 0xea, 0x2c, 0x17, 0x9f, 0xd0, 0x12, 0x3e, 0x6d, 0xb8,
         0xfa, 0xc5, 0x79, 0x04,
     ]
 }
@@ -446,7 +446,10 @@ mod tests {
             cur_iv.copy_from_slice(&manual_ct[off..off + 8]);
         }
         let recovered = gost28147_cfb_decrypt(&key, &iv, &sbox, &manual_ct);
-        assert_eq!(recovered, plain, "CFB encrypt → decrypt must recover plaintext");
+        assert_eq!(
+            recovered, plain,
+            "CFB encrypt → decrypt must recover plaintext"
+        );
     }
 
     /// HMAC of the empty message under the empty key — sanity check that
@@ -466,9 +469,7 @@ mod tests {
     /// and a broken ICV computation.
     #[test]
     fn keywrap_unwrap_vector_1() {
-        let kek = hex32(
-            "9c6e6852023b46f499f25b9b0eb7027387fdd5650f5d638ee5f99eb8dc781fde",
-        );
+        let kek = hex32("9c6e6852023b46f499f25b9b0eb7027387fdd5650f5d638ee5f99eb8dc781fde");
         let wcek = hex44(
             "e90fe95628e715f4d6f3d1151ded367250f7006648ffffde574a4ea38250c1c5a0fdff11f36d9186d3b27c60",
         );
@@ -481,9 +482,7 @@ mod tests {
 
     #[test]
     fn keywrap_unwrap_vector_2() {
-        let kek = hex32(
-            "1de57ae661b7e142727170dd5066d04bd63231d5a207778075d17a831e853902",
-        );
+        let kek = hex32("1de57ae661b7e142727170dd5066d04bd63231d5a207778075d17a831e853902");
         let wcek = hex44(
             "359a37cf972520b590ef109b7c454c991d95da782e30ac9fe917fbb52e9402a4d236fd030f49627ec63c2684",
         );
@@ -497,9 +496,7 @@ mod tests {
     /// A 1-bit flip in the wrapped CEK must trip the ICV check.
     #[test]
     fn keywrap_unwrap_rejects_tampered_blob() {
-        let kek = hex32(
-            "9c6e6852023b46f499f25b9b0eb7027387fdd5650f5d638ee5f99eb8dc781fde",
-        );
+        let kek = hex32("9c6e6852023b46f499f25b9b0eb7027387fdd5650f5d638ee5f99eb8dc781fde");
         let mut wcek = hex44(
             "e90fe95628e715f4d6f3d1151ded367250f7006648ffffde574a4ea38250c1c5a0fdff11f36d9186d3b27c60",
         );

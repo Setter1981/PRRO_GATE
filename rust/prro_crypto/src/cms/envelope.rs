@@ -58,11 +58,7 @@ pub struct EnvelopeParams {
 /// Compute the ECDH shared secret ZZ = (Q · (d·h)).x as a variable-length
 /// big-endian byte array (leading zero stripped if present). Port of
 /// jkurwa `Priv.prototype.derive` + `sharedKey` ZZ handling.
-pub fn ecdh_zz(
-    d: &FieldEl,
-    pub_q: &Point,
-    curve: &Curve,
-) -> Result<Vec<u8>, EnvelopeError> {
+pub fn ecdh_zz(d: &FieldEl, pub_q: &Point, curve: &Curve) -> Result<Vec<u8>, EnvelopeError> {
     // Full public-point validation BEFORE any secret-scalar arithmetic.
     // An invalid-curve / small-subgroup / identity Q must be rejected
     // here, not discovered after the ladder has already leaked scalar
@@ -76,7 +72,7 @@ pub fn ecdh_zz(
     let d_words = d
         .try_as_fe_words()
         .ok_or(EnvelopeError::BadScalarWidth(d.bytes.len()))?;
-    let mut d_scalar = Scalar::from_fe_truncated(&d_words);
+    let mut d_scalar = Scalar::from_fe_truncated(d_words);
     let h_scalar = Scalar::from_limbs([curve.kofactor as u64, 0, 0, 0]);
     let mut s_scalar = d_scalar.mul_mod(&h_scalar);
 
@@ -107,13 +103,17 @@ pub fn ecdh_zz(
         .ok_or_else(|| EnvelopeError::Asn1("ECDH produced point at infinity".into()))?;
 
     // x-coordinate → big-endian bytes, trim to ceil(m/8)
-    let m_bytes = ((curve.m as usize) + 7) / 8; // 33 for m=257
+    let m_bytes = (curve.m as usize).div_ceil(8); // 33 for m=257
     let total_bytes = curve.mod_words * 4; // 36 for mod_words=9
 
     // Build big-endian output (high word first, high byte first within word)
     let mut be = Vec::with_capacity(total_bytes);
     for wi in (0..curve.mod_words).rev() {
-        let w = if wi < z_x.bytes.len() { z_x.bytes[wi] } else { 0 };
+        let w = if wi < z_x.bytes.len() {
+            z_x.bytes[wi]
+        } else {
+            0
+        };
         be.push((w >> 24) as u8);
         be.push((w >> 16) as u8);
         be.push((w >> 8) as u8);
@@ -176,7 +176,7 @@ pub fn encode_shared_info(ukm: &[u8]) -> Vec<u8> {
     out.extend_from_slice(OID_GOST28147_CFB_WRAP);
     out.push(0x05);
     out.push(0x00); // NULL
-    // entityInfo [0] EXPLICIT
+                    // entityInfo [0] EXPLICIT
     out.push(0xa0);
     push_der_len(&mut out, ukm_octet_len);
     out.push(0x04);
@@ -192,7 +192,13 @@ pub fn encode_shared_info(ukm: &[u8]) -> Vec<u8> {
 }
 
 fn der_len_size(len: usize) -> usize {
-    if len < 0x80 { 1 } else if len < 0x100 { 2 } else { 3 }
+    if len < 0x80 {
+        1
+    } else if len < 0x100 {
+        2
+    } else {
+        3
+    }
 }
 
 fn push_der_len(out: &mut Vec<u8>, len: usize) {
@@ -242,7 +248,8 @@ pub fn decrypt_with_params(
     // explicit error.
     if params.wcek.len() != 44 {
         return Err(EnvelopeError::BadCipherParams(format!(
-            "wcek length {} != 44", params.wcek.len()
+            "wcek length {} != 44",
+            params.wcek.len()
         )));
     }
     // Ukrainian EnvelopedData puts a 32-byte OCTET STRING as the "IV"
@@ -254,12 +261,14 @@ pub fn decrypt_with_params(
     // break every real Ukrainian envelope.
     if params.iv.len() < 8 {
         return Err(EnvelopeError::BadCipherParams(format!(
-            "iv too short: {} < 8", params.iv.len()
+            "iv too short: {} < 8",
+            params.iv.len()
         )));
     }
     if params.sbox.len() != 64 {
         return Err(EnvelopeError::BadCipherParams(format!(
-            "sbox length {} != 64 (DSTU packed DKU)", params.sbox.len()
+            "sbox length {} != 64 (DSTU packed DKU)",
+            params.sbox.len()
         )));
     }
 
@@ -270,8 +279,7 @@ pub fn decrypt_with_params(
     zz.zeroize();
     let mut wcek_arr = [0u8; 44];
     wcek_arr.copy_from_slice(&params.wcek);
-    let mut cek = gost28147_keywrap_unwrap(&kek, &wcek_arr)
-        .map_err(EnvelopeError::KeyUnwrap)?;
+    let mut cek = gost28147_keywrap_unwrap(&kek, &wcek_arr).map_err(EnvelopeError::KeyUnwrap)?;
     kek.zeroize();
     wcek_arr.zeroize();
 
@@ -289,9 +297,7 @@ pub fn decrypt_with_params(
     // Content may not be block-aligned (jkurwa uses ceil-blocks CFB).
     // `gost28147_cfb_decrypt_any_len` already returns exactly `ct.len()`
     // bytes; no further slicing needed.
-    let plaintext = crate::interop::prro::pbe::gost28147_cfb_decrypt_any_len(
-        &cek, &iv, &sbox, ct,
-    );
+    let plaintext = crate::interop::prro::pbe::gost28147_cfb_decrypt_any_len(&cek, &iv, &sbox, ct);
     cek.zeroize();
     Ok(plaintext)
 }
@@ -454,26 +460,23 @@ mod tests {
 
         let base = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
 
-        let key40a0_der = std::fs::read(format!("{base}Key40A0.cer"))
-            .expect("read Key40A0.cer");
+        let key40a0_der = std::fs::read(format!("{base}Key40A0.cer")).expect("read Key40A0.cer");
         let d_bytes = crate::interop::prro::der::extract_param_d(&key40a0_der)
             .expect("extract param_d from Key40A0");
 
         let curve = Curve::dstu_pb_257();
         let d = FieldEl::from_le_bytes(&d_bytes, curve.mod_words);
 
-        let cert6929_der = std::fs::read(format!("{base}SELF_SIGNED_ENC_6929.cer"))
-            .expect("read cert6929");
-        let pub_compressed = extract_cert_pubkey_bytes(&cert6929_der)
-            .expect("extract pubkey from cert6929");
+        let cert6929_der =
+            std::fs::read(format!("{base}SELF_SIGNED_ENC_6929.cer")).expect("read cert6929");
+        let pub_compressed =
+            extract_cert_pubkey_bytes(&cert6929_der).expect("extract pubkey from cert6929");
         let pub_q = expand_compressed_checked(&pub_compressed, &curve)
             .expect("cert6929 pubkey must decompress + validate");
 
-        let envelope = std::fs::read(format!("{base}enc_message.p7"))
-            .expect("read enc_message.p7");
+        let envelope = std::fs::read(format!("{base}enc_message.p7")).expect("read enc_message.p7");
 
-        let plaintext = unwrap_envelope(&envelope, &d, &pub_q, &curve)
-            .expect("unwrap envelope");
+        let plaintext = unwrap_envelope(&envelope, &d, &pub_q, &curve).expect("unwrap envelope");
         assert_eq!(plaintext, b"123");
     }
 
@@ -572,7 +575,8 @@ pub fn extract_cert_pubkey_bytes(cert_der: &[u8]) -> Result<Vec<u8>, EnvelopeErr
     let oid_bytes = &cert_der[oid_inner..oid_end];
     if oid_bytes != DSTU_4145_LE_OID_DER {
         return Err(EnvelopeError::Asn1(format!(
-            "SPKI algorithm OID {:02x?} is not DSTU 4145 LE", oid_bytes
+            "SPKI algorithm OID {:02x?} is not DSTU 4145 LE",
+            oid_bytes
         )));
     }
 

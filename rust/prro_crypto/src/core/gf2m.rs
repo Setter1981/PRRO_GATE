@@ -339,7 +339,7 @@ pub fn fmul(a: &[u32], b: &[u32], s: &mut [u32]) {
             let x1 = if i + 1 == a_len { 0 } else { a[i + 1] };
 
             let x22 = mul_2x2(x1, x0, y1, y0);
-            s[j + i + 0] ^= x22[0];
+            s[j + i] ^= x22[0];
             s[j + i + 1] ^= x22[1];
             s[j + i + 2] ^= x22[2];
             s[j + i + 3] ^= x22[3];
@@ -367,9 +367,7 @@ pub fn fmod(a: &[u32], p: &[u32], ret: &mut [u32]) {
 
     // Copy input into ret (the reference lets the caller pre-populate, but
     // we require explicit initialization here).
-    for k in 0..ret_len {
-        ret[k] = a[k];
-    }
+    ret[..ret_len].copy_from_slice(&a[..ret_len]);
 
     let dn = (p[0] / BITS) as usize;
 
@@ -545,9 +543,7 @@ pub fn finv(a_in: &[u32], p: &[u32], ret: &mut [u32]) {
         }
     }
 
-    for idx in 0..n {
-        ret[idx] = b[idx];
-    }
+    ret[..n].copy_from_slice(&b[..n]);
 }
 
 // ============================================================================
@@ -642,9 +638,7 @@ mod tests {
     #[test]
     fn test_fmod_no_reduction_needed() {
         // Polynomial x^2 + 1, modulus x^257 + x^12 + 1. No reduction since degree is small.
-        let a = vec![5u32; 9]; // 288 bits / 32 = 9 words
-        let mut ret = vec![0u32; 9];
-        // But we need a to fit the expected size; let's make a properly:
+        let mut ret = vec![0u32; 9]; // 288 bits / 32 = 9 words
         let a = {
             let mut v = vec![0u32; 9];
             v[0] = 5;
@@ -705,7 +699,10 @@ mod tests {
         let mut reduced = vec![0u32; 20];
         fmod(&product, &p_exp, &mut reduced);
 
-        assert_eq!(reduced[0], 1, "inverse verification failed: a * inv(a) should be 1");
+        assert_eq!(
+            reduced[0], 1,
+            "inverse verification failed: a * inv(a) should be 1"
+        );
         for i in 1..reduced.len() {
             assert_eq!(reduced[i], 0, "word {} should be zero after reduction", i);
         }

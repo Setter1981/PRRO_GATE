@@ -2,8 +2,7 @@
 //! using the bundled vendor profiles shipped with the crate.
 
 use prro_escpos::{
-    bundled, Alignment, CodePage, Executor, Instruction, PrinterProfile,
-    ReceiptCompiler,
+    bundled, Alignment, CodePage, Executor, Instruction, PrinterProfile, ReceiptCompiler,
 };
 
 fn load_epson() -> PrinterProfile {
@@ -25,8 +24,11 @@ fn load_citizen() -> PrinterProfile {
 fn parses_epson_profile_metadata() {
     let p = load_epson();
     assert_eq!(p.name, "TM-T88II");
-    assert!(p.full_name.to_ascii_lowercase().contains("tm-t88"),
-        "fullname should mention the model; got {:?}", p.full_name);
+    assert!(
+        p.full_name.to_ascii_lowercase().contains("tm-t88"),
+        "fullname should mention the model; got {:?}",
+        p.full_name
+    );
     assert_eq!(p.version, "0.2.10");
     assert!(p.interfaces.contains("LAN"));
     assert!(!p.commands.is_empty(), "expected at least one command");
@@ -95,14 +97,15 @@ fn compiler_simple_receipt_bytes() {
     let bytes = c.compile().unwrap();
     // Golden: init + codepage + align + text + LF + feed + cut.
     let expected: Vec<u8> = [
-        &[0x1B, 0x40][..],                       // ESC @
-        &[0x1B, 0x74, 0x11][..],                 // codepage 866
-        &[0x1B, 0x61, 0x01][..],                 // center
-        b"HELLO",                                // text
-        &[b'\n'][..],                            // newline
-        &[0x1B, 0x64, 0x02][..],                 // feed 2
-        &[0x1D, 0x56, 0x01][..],                 // cut
-    ].concat();
+        &[0x1B, 0x40][..],       // ESC @
+        &[0x1B, 0x74, 0x11][..], // codepage 866
+        &[0x1B, 0x61, 0x01][..], // center
+        b"HELLO",                // text
+        &[b'\n'][..],            // newline
+        &[0x1B, 0x64, 0x02][..], // feed 2
+        &[0x1D, 0x56, 0x01][..], // cut
+    ]
+    .concat();
     assert_eq!(bytes, expected);
 }
 
@@ -120,8 +123,11 @@ fn compiler_cyrillic_text_encodes_cp866() {
     assert_eq!(&bytes[0..3], &[0x1B, 0x74, 0x11]);
     let tail = &bytes[3..];
     // At least one byte > 0x7F — Cyrillic encoded via cp866.
-    assert!(tail.iter().any(|b| *b > 0x7F),
-        "expected non-ASCII bytes after codepage switch, got {:02X?}", tail);
+    assert!(
+        tail.iter().any(|b| *b > 0x7F),
+        "expected non-ASCII bytes after codepage switch, got {:02X?}",
+        tail
+    );
 }
 
 #[test]
@@ -136,14 +142,18 @@ fn compiler_rejects_non_encodable_char_in_ascii() {
     // was silently dropped by the swallow-at-push policy).  Document:
     // callers SHOULD set a codepage before emitting non-ASCII.
     let bytes = c.compile().unwrap();
-    assert!(bytes.iter().all(|b| *b < 0x80 || *b == b'\n'),
-        "Ascii mode must not emit non-ASCII bytes; got {:02X?}", bytes);
+    assert!(
+        bytes.iter().all(|b| *b < 0x80 || *b == b'\n'),
+        "Ascii mode must not emit non-ASCII bytes; got {:02X?}",
+        bytes
+    );
 }
 
 #[test]
 fn barcode_procedure_is_parsed() {
     let p = load_epson();
-    let proc = p.procedure("PrintBarCode")
+    let proc = p
+        .procedure("PrintBarCode")
         .expect("PrintBarCode procedure must be present in Epson profile");
     assert_eq!(proc.name, "PrintBarCode");
     assert!(!proc.params.is_empty(), "procedure must bind params");
@@ -155,13 +165,18 @@ fn posiflex_and_citizen_have_cut_command() {
     // Cross-vendor sanity: every bundled profile can emit a Cut.
     for (name, profile) in [
         ("Posiflex PP-8000 LAN", load_posiflex()),
-        ("Citizen CT-S310II",    load_citizen()),
+        ("Citizen CT-S310II", load_citizen()),
     ] {
         let ex = Executor::new(&profile);
-        let bytes = ex.with_value("Cut", "DEFAULT")
+        let bytes = ex
+            .with_value("Cut", "DEFAULT")
             .unwrap_or_else(|e| panic!("{name}: Cut DEFAULT resolves: {e}"));
         assert!(!bytes.is_empty(), "{name}: Cut must emit at least one byte");
         // ESC/POS Cut family starts with GS (0x1D).
-        assert_eq!(bytes[0], 0x1D, "{name}: Cut must start with GS; got {:02X?}", bytes);
+        assert_eq!(
+            bytes[0], 0x1D,
+            "{name}: Cut must start with GS; got {:02X?}",
+            bytes
+        );
     }
 }
