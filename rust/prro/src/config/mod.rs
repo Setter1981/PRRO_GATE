@@ -36,6 +36,12 @@ pub struct AppConfig {
     /// revert.
     #[serde(default)]
     pub supervisor: SupervisorCfg,
+
+    /// RS-4 (audit pass-2, item 4) — production backup / retention.  Optional +
+    /// default-enabled: existing configs with no `[backup]` section get hourly
+    /// snapshots of both DB files with sane retention once the supervisor runs.
+    #[serde(default)]
+    pub backup: BackupCfg,
 }
 
 /// Per-listener ingress config.  W4-Z0 piece 9 architectural pin —
@@ -379,6 +385,81 @@ impl SupervisorCfg {
             ONLINE_CONVERGENCE_INTERVAL_MIN_SECONDS,
             ONLINE_CONVERGENCE_INTERVAL_MAX_SECONDS,
         );
+        (clamped, clamped != raw)
+    }
+}
+
+/// RS-4 (audit pass-2, item 4) — production backup / retention config.  Mirror
+/// of the `[supervisor]` clamp/default pattern.  The `[backup]` section is
+/// optional and default-ENABLED (a config with no section still gets hourly
+/// snapshots of both DB files with sane retention).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BackupCfg {
+    /// Master switch.  `false` → the supervisor never spawns the backup loop.
+    #[serde(default = "default_backup_enabled")]
+    pub enabled: bool,
+    /// Directory snapshots are written to (created if missing).  A path on a
+    /// SECOND physical device is strongly recommended — see
+    /// `docs/operations/RETENTION_POLICY.md`.
+    #[serde(default = "default_backup_dir")]
+    pub dir: PathBuf,
+    /// Snapshot cadence (seconds).  **Raw value** — route callers through
+    /// [`BackupCfg::clamped_interval_seconds`].
+    #[serde(default = "default_backup_interval_seconds")]
+    pub interval_seconds: u64,
+    /// Retain at least this many most-recent snapshots per label, regardless of
+    /// age.
+    #[serde(default = "default_backup_keep_last")]
+    pub keep_last: usize,
+    /// Prune snapshots older than this many days — but only those ALSO beyond
+    /// `keep_last` (the two conditions are ANDed: a snapshot survives if it is
+    /// within the keep_last window OR younger than `max_age_days`).
+    #[serde(default = "default_backup_max_age_days")]
+    pub max_age_days: u64,
+}
+
+impl Default for BackupCfg {
+    /// Hand-written (NOT derived) so a missing `[backup]` table yields the same
+    /// field values as a present table with the fields omitted.
+    fn default() -> Self {
+        Self {
+            enabled: default_backup_enabled(),
+            dir: default_backup_dir(),
+            interval_seconds: default_backup_interval_seconds(),
+            keep_last: default_backup_keep_last(),
+            max_age_days: default_backup_max_age_days(),
+        }
+    }
+}
+
+fn default_backup_enabled() -> bool {
+    true
+}
+fn default_backup_dir() -> PathBuf {
+    PathBuf::from("var/backups")
+}
+fn default_backup_interval_seconds() -> u64 {
+    3600
+}
+fn default_backup_keep_last() -> usize {
+    30
+}
+fn default_backup_max_age_days() -> u64 {
+    14
+}
+
+/// Inclusive clamp bounds for the backup snapshot cadence (5 min … 1 day).
+pub const BACKUP_INTERVAL_MIN_SECONDS: u64 = 300;
+pub const BACKUP_INTERVAL_MAX_SECONDS: u64 = 86_400;
+
+impl BackupCfg {
+    /// Validate + clamp `interval_seconds` to
+    /// `[BACKUP_INTERVAL_MIN_SECONDS, BACKUP_INTERVAL_MAX_SECONDS]`.  Returns
+    /// `(clamped_value, was_clamped)` for the WARN pattern — mirror of
+    /// [`SupervisorCfg::clamped_drain_interval_seconds`].
+    pub fn clamped_interval_seconds(&self) -> (u64, bool) {
+        let raw = self.interval_seconds;
+        let clamped = raw.clamp(BACKUP_INTERVAL_MIN_SECONDS, BACKUP_INTERVAL_MAX_SECONDS);
         (clamped, clamped != raw)
     }
 }
@@ -797,5 +878,41 @@ mod tests {
         assert_eq!(def, default_online_convergence_interval_seconds());
         assert_eq!(def, 60);
         assert!(!def_clamped);
+    }
+
+    /// RS-4 — backup snapshot cadence clamps to bounds; the hand-written
+    /// Default keeps it in range whether or not the `[backup]` table is present
+    /// (spec test 7).
+    #[test]
+    fn backup_interval_clamps_and_defaults_in_range() {
+        let too_small = BackupCfg {
+            interval_seconds: 1,
+            ..BackupCfg::default()
+        };
+        let (clamped, was_clamped) = too_small.clamped_interval_seconds();
+        assert_eq!(clamped, BACKUP_INTERVAL_MIN_SECONDS);
+        assert_eq!(clamped, 300);
+        assert!(was_clamped);
+
+        let too_big = BackupCfg {
+            interval_seconds: 999_999,
+            ..BackupCfg::default()
+        };
+        let (clamped, was_clamped) = too_big.clamped_interval_seconds();
+        assert_eq!(clamped, BACKUP_INTERVAL_MAX_SECONDS);
+        assert_eq!(clamped, 86_400);
+        assert!(was_clamped);
+
+        let def = BackupCfg::default();
+        let (clamped, def_clamped) = def.clamped_interval_seconds();
+        assert_eq!(clamped, default_backup_interval_seconds());
+        assert_eq!(clamped, 3600);
+        assert!(!def_clamped);
+
+        // Section-absent defaults: enabled + sane retention.
+        assert!(def.enabled, "backup is default-enabled");
+        assert_eq!(def.dir, std::path::PathBuf::from("var/backups"));
+        assert_eq!(def.keep_last, 30);
+        assert_eq!(def.max_age_days, 14);
     }
 }

@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod invariant_scan;
 pub mod models;
 pub mod repositories;
@@ -45,23 +46,32 @@ pub async fn open_secure_pool(path: &Path) -> anyhow::Result<SqlitePool> {
         .await?;
     sqlx::migrate!("./migrations_secure").run(&pool).await?;
 
-    // HIGH-AUDIT-01: enforce owner-only mode on the secure file AND
-    // its WAL sidecars.  SQLite in WAL journal mode produces three
-    // physical files: `<path>` (the main DB), `<path>-wal` (the
-    // un-checkpointed write-ahead log), and `<path>-shm` (the shared
-    // memory mapping).  Newly written rows — including the cashier
-    // `key_pass_enc` BLOBs that motivate this whole isolation —
-    // land in `-wal` before the next checkpoint flushes them to the
-    // main file.  If only the main file is chmod'd to 0o600 then
-    // `-wal` retains the process umask (typically 0o644 / 0o666),
-    // leaving the un-checkpointed write log world-readable on disk
-    // and defeating the HIGH-AUDIT-01 isolation guarantee.
-    //
-    // We chmod each sidecar to 0o600 if it exists.  Existence is
-    // checked because `-wal` and `-shm` are created lazily by SQLite
-    // on first write; the migration apply above performed writes so
-    // they are normally present, but we tolerate their absence (e.g.,
-    // pristine open then close without writes never creates them).
+    // HIGH-AUDIT-01: enforce owner-only mode on the secure file AND its WAL
+    // sidecars.  Extracted to [`set_owner_only_perms`] (RS-4) so the backup
+    // module applies the IDENTICAL posture to snapshot artifacts (not a copy).
+    set_owner_only_perms(path)?;
+
+    Ok(pool)
+}
+
+/// HIGH-AUDIT-01 / RS-4 — enforce owner-only (`0o600`) mode on a SQLite file
+/// AND its WAL sidecars (`-wal`, `-shm`), tolerating sidecar absence.
+///
+/// SQLite in WAL journal mode produces up to three physical files: `<path>`
+/// (the main DB), `<path>-wal` (the un-checkpointed write-ahead log), and
+/// `<path>-shm` (the shared memory mapping).  Newly written rows — including the
+/// cashier `key_pass_enc` BLOBs that motivate the secure-DB isolation — land in
+/// `-wal` before the next checkpoint flushes them to the main file.  If only the
+/// main file were chmod'd, `-wal` would retain the process umask (typically
+/// `0o644`/`0o666`), leaving the un-checkpointed write log world-readable and
+/// defeating the isolation guarantee.
+///
+/// Existence is checked per-sidecar (no TOCTOU: fetch metadata directly and
+/// tolerate `NotFound`, since `-wal`/`-shm` are created lazily and SQLite may
+/// delete `-wal` during a concurrent checkpoint); other IO errors propagate
+/// fail-closed.  Unix-only — Windows has no equivalent mode bit (no-op; the
+/// platform ACL story applies separately).
+pub(crate) fn set_owner_only_perms(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -70,10 +80,6 @@ pub async fn open_secure_pool(path: &Path) -> anyhow::Result<SqlitePool> {
             let mut sidecar = main_path.clone();
             sidecar.push(suffix);
             let sidecar = std::path::PathBuf::from(sidecar);
-            // No TOCTOU: fetch metadata directly and tolerate NotFound
-            // (sidecars are lazy; SQLite may delete `-wal` between an
-            // existence check and the metadata call during a concurrent
-            // checkpoint).  Other IO errors propagate fail-closed.
             let meta = match std::fs::metadata(&sidecar) {
                 Ok(m) => m,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -84,8 +90,11 @@ pub async fn open_secure_pool(path: &Path) -> anyhow::Result<SqlitePool> {
             std::fs::set_permissions(&sidecar, perms)?;
         }
     }
-
-    Ok(pool)
+    #[cfg(not(unix))]
+    {
+        let _ = path; // no mode bit on non-unix; best-effort no-op
+    }
+    Ok(())
 }
 
 /// Open a connection pool against the given SQLite file.
