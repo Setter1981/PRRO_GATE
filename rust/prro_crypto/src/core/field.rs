@@ -187,10 +187,7 @@ impl FieldEl {
     /// a recoverable failure.
     #[inline]
     pub fn try_as_fe_words(&self) -> Option<&[u32; crate::core::fe::FE_WORDS]> {
-        self.bytes
-            .get(..crate::core::fe::FE_WORDS)?
-            .try_into()
-            .ok()
+        self.bytes.get(..crate::core::fe::FE_WORDS)?.try_into().ok()
     }
 
     /// Infallible sibling of [`try_as_fe_words`]. Panics when the FieldEl

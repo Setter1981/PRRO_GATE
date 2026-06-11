@@ -113,8 +113,8 @@ pub fn read_integer_be_small(data: &[u8], start: usize, end: usize) -> Result<u6
         )));
     }
     let mut v: u64 = 0;
-    for i in start..end {
-        v = (v << 8) | (data[i] as u64);
+    for &byte in &data[start..end] {
+        v = (v << 8) | (byte as u64);
     }
     Ok(v)
 }
@@ -153,7 +153,7 @@ mod tests {
     fn read_tlv_long_form_2_bytes() {
         // SEQUENCE length = 0x0100 (256)
         let mut data = vec![0x30, 0x82, 0x01, 0x00];
-        data.extend(std::iter::repeat(0xAA).take(256));
+        data.extend(std::iter::repeat_n(0xAA, 256));
         let (end, content) = read_tlv(&data, 0).unwrap();
         assert_eq!(end, 260);
         assert_eq!(content, 4);
@@ -227,10 +227,7 @@ mod tests {
     #[test]
     fn read_integer_be_small_basic() {
         // INTEGER 0x1234 (big-endian 2 bytes)
-        assert_eq!(
-            read_integer_be_small(&[0x12, 0x34], 0, 2).unwrap(),
-            0x1234
-        );
+        assert_eq!(read_integer_be_small(&[0x12, 0x34], 0, 2).unwrap(), 0x1234);
         // 8-byte integer still fits
         let data = &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         assert_eq!(

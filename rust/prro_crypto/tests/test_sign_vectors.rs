@@ -33,6 +33,9 @@ enum Vector {
     },
     #[serde(rename = "verify")]
     Verify {
+        // Mirrors the fixture JSON shape (the generating key); verify
+        // itself consumes only the public point — never read here.
+        #[allow(dead_code)]
         d: String,
         hash: String,
         r: String,
@@ -114,10 +117,7 @@ fn run_vectors(vectors: Vec<Vector>, label: &str) {
                 let hash_field = FieldEl::from_hex(hash, mw);
                 let r_field = FieldEl::from_hex(r, mw);
                 let s_field = FieldEl::from_hex(s, mw);
-                let pub_q = Point::new(
-                    FieldEl::from_hex(pub_x, mw),
-                    FieldEl::from_hex(pub_y, mw),
-                );
+                let pub_q = Point::new(FieldEl::from_hex(pub_x, mw), FieldEl::from_hex(pub_y, mw));
                 let sig = Signature {
                     r: r_field,
                     s: s_field,
@@ -193,8 +193,7 @@ fn test_sign_byte_identical_with_jkurwa_10k() {
             return;
         }
     };
-    let vectors: Vec<Vector> =
-        serde_json::from_str(&data).expect("malformed 10k json");
+    let vectors: Vec<Vector> = serde_json::from_str(&data).expect("malformed 10k json");
     assert!(!vectors.is_empty(), "no vectors loaded");
     run_vectors(vectors, "sign_jkurwa_10k.json");
 }

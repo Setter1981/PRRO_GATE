@@ -144,11 +144,15 @@ impl<'a> ReceiptCompiler<'a> {
             Instruction::Bold(on) => {
                 if on {
                     // ESC ! 0x08 — bold-only font mode.
-                    let bytes = self.exec.simple("FONTBOLD")
+                    let bytes = self
+                        .exec
+                        .simple("FONTBOLD")
                         .unwrap_or_else(|_| vec![0x1B, 0x21, 0x08]);
                     self.buf.extend(bytes);
                 } else {
-                    let bytes = self.exec.simple("FONTDEFAULT")
+                    let bytes = self
+                        .exec
+                        .simple("FONTDEFAULT")
                         .unwrap_or_else(|_| vec![0x1B, 0x21, 0x00]);
                     self.buf.extend(bytes);
                 }
@@ -160,12 +164,16 @@ impl<'a> ReceiptCompiler<'a> {
             }
             Instruction::Newline => self.buf.push(b'\n'),
             Instruction::Feed(n) => {
-                let bytes = self.exec.with_byte("FeedingThePaperByNLines", n)
+                let bytes = self
+                    .exec
+                    .with_byte("FeedingThePaperByNLines", n)
                     .unwrap_or_else(|_| vec![0x1B, 0x64, n]);
                 self.buf.extend(bytes);
             }
             Instruction::Cut => {
-                let bytes = self.exec.with_value("Cut", "DEFAULT")
+                let bytes = self
+                    .exec
+                    .with_value("Cut", "DEFAULT")
                     .unwrap_or_else(|_| vec![0x1D, 0x56, 0x00, 0x01]);
                 self.buf.extend(bytes);
             }

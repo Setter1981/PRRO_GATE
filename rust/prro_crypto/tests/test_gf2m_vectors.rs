@@ -7,6 +7,9 @@
 //! If any vector fails, the implementation has diverged from jkurwa — this
 //! is the authoritative correctness check for GF(2^m) arithmetic.
 
+// Explicit index loops mirror the core's CT style (see core/mod.rs).
+#![allow(clippy::needless_range_loop)]
+
 use serde::Deserialize;
 
 use prro_crypto::core::gf2m::{blength, finv, fmod, fmul, mul_2x2};
@@ -61,7 +64,7 @@ fn hex_to_words(hex: &str, words: usize) -> Vec<u32> {
     let mut padded = String::new();
     let needed = words * 8;
     if hex.len() < needed {
-        padded.extend(std::iter::repeat('0').take(needed - hex.len()));
+        padded.extend(std::iter::repeat_n('0', needed - hex.len()));
         padded.push_str(hex);
     } else {
         padded.push_str(hex);
@@ -96,7 +99,8 @@ fn test_against_jkurwa_vectors() {
     let vectors = load_vectors();
     assert!(!vectors.is_empty(), "no vectors loaded");
 
-    let mut counts: std::collections::HashMap<&str, (usize, usize)> = std::collections::HashMap::new();
+    let mut counts: std::collections::HashMap<&str, (usize, usize)> =
+        std::collections::HashMap::new();
     let mut failures: Vec<String> = Vec::new();
 
     for (idx, v) in vectors.iter().enumerate() {

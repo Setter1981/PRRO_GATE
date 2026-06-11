@@ -112,7 +112,7 @@ pub unsafe fn fmul_packed(a: &Fe64, b: &Fe64) -> Wide64 {
     // Three 128-bit Karatsuba products
     let p_ll = clmul128(a_lo, b_lo); // contributes to limbs 0..3 (bits 0..255)
     let p_hh = clmul128(a_hi, b_hi); // contributes to limbs 4..7 (bits 256..511)
-    // Karatsuba middle on the 128-bit halves:
+                                     // Karatsuba middle on the 128-bit halves:
     let a_mid = [a_lo[0] ^ a_hi[0], a_lo[1] ^ a_hi[1]];
     let b_mid = [b_lo[0] ^ b_hi[0], b_lo[1] ^ b_hi[1]];
     let p_mid = clmul128(a_mid, b_mid);
@@ -283,6 +283,15 @@ unsafe fn vclmul128(a: [u64; 2], b: [u64; 2]) -> [u64; 4] {
 /// Same Karatsuba structure as `fmul_packed` but uses `vclmul128` for
 /// the three 128×128 sub-products. Total: 3×2=6 VPCLMULQDQ + 3 PCLMULQDQ
 /// = 9 carry-less multiplies in 6 instructions (vs 9 in the PCLMULQDQ path).
+///
+/// # Safety
+///
+/// The caller MUST have verified at runtime that the CPU supports
+/// `vpclmulqdq`, `avx2`, `pclmulqdq` and `sse2` (e.g. via
+/// `is_x86_feature_detected!`) before calling — the `#[target_feature]`
+/// attribute makes calling this on a CPU without those features
+/// undefined behavior (illegal instruction). The dispatcher in
+/// `backend::fmul_257` is the only sanctioned call path.
 #[target_feature(enable = "vpclmulqdq,avx2,pclmulqdq,sse2")]
 #[inline]
 pub unsafe fn fmul_packed_vpclmul(a: &Fe64, b: &Fe64) -> Wide64 {
@@ -328,6 +337,13 @@ pub unsafe fn fmul_packed_vpclmul(a: &Fe64, b: &Fe64) -> Wide64 {
 }
 
 /// Public VPCLMULQDQ entry point: Fe × Fe → FeWide.
+///
+/// # Safety
+///
+/// Same contract as [`fmul_packed_vpclmul`]: the caller MUST have
+/// runtime-verified `vpclmulqdq`/`avx2`/`pclmulqdq`/`sse2` support
+/// (`is_x86_feature_detected!`) — calling without them is UB. Use the
+/// `backend::fmul_257` dispatcher instead of calling this directly.
 #[target_feature(enable = "vpclmulqdq,avx2,pclmulqdq,sse2")]
 pub unsafe fn fmul_257_vpclmul(a: &Fe, b: &Fe, out: &mut FeWide) {
     let a_packed = pack_fe(a);
@@ -480,7 +496,9 @@ mod tests {
             let mut pclmul_out = FeWide::ZERO;
             let mut portable_out = FeWide::ZERO;
 
-            unsafe { fsqr_257(&a, &mut pclmul_out); }
+            unsafe {
+                fsqr_257(&a, &mut pclmul_out);
+            }
             crate::core::backend::portable::fsqr_257(&a, &mut portable_out);
 
             assert_eq!(
@@ -538,11 +556,15 @@ mod tests {
         }
         // Zero squares to zero
         let mut out = FeWide::ZERO;
-        unsafe { fsqr_257(&Fe::ZERO, &mut out); }
+        unsafe {
+            fsqr_257(&Fe::ZERO, &mut out);
+        }
         assert_eq!(out, FeWide::ZERO);
 
         // One squares to one (unreduced: word 0 = 1, rest zero)
-        unsafe { fsqr_257(&Fe::ONE, &mut out); }
+        unsafe {
+            fsqr_257(&Fe::ONE, &mut out);
+        }
         assert_eq!(out.0[0], 1);
         for i in 1..out.0.len() {
             assert_eq!(out.0[i], 0, "ONE² nonzero at limb {}", i);
@@ -551,7 +573,9 @@ mod tests {
         // Element with only bit 256 set: (x^256)² = x^512
         let mut top_only = Fe::ZERO;
         top_only.0[8] = 1;
-        unsafe { fsqr_257(&top_only, &mut out); }
+        unsafe {
+            fsqr_257(&top_only, &mut out);
+        }
         // x^512 lives at bit 512 = wide word 16, bit 0
         // In our FeWide(u32×20), word 16 = out.0[16]
         assert_eq!(out.0[16], 1);

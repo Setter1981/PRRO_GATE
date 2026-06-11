@@ -121,6 +121,8 @@ pub fn mul_base(k: &FieldEl, curve: &Curve) -> Point {
 
 /// Force-initialize the table. Useful for warm-up benchmarking; not
 /// required for correctness (table is initialized lazily on first call).
+#[allow(dead_code)] // bench warm-up helper; benches live OUTSIDE the crate
+                    // today and cannot reach pub(crate) (core/mod.rs TODO).
 pub fn warm_up(curve: &Curve) {
     let _ = TABLE.get_or_init(|| build_table(curve));
 }
@@ -169,6 +171,9 @@ mod tests {
     fn test_mul_base_order_is_infinity() {
         let curve = Curve::dstu_pb_257();
         let result = mul_base(&curve.order, &curve);
-        assert!(result.is_zero(), "order * G via fixed_base should be infinity");
+        assert!(
+            result.is_zero(),
+            "order * G via fixed_base should be infinity"
+        );
     }
 }

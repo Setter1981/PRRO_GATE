@@ -130,10 +130,7 @@ pub fn encode_iit_cert_lookup(ski: &[u8]) -> Result<Vec<u8>, CmpError> {
 /// Certificate SEQUENCE whose SKI matches `expected_ski`. Returns
 /// `NotFound` if no matching cert is in the reply, `ServerError` if
 /// the IIT status word is not 1, `Parse` on structural issues.
-pub fn parse_iit_cert_response(
-    body: &[u8],
-    expected_ski: &[u8],
-) -> Result<Vec<u8>, CmpError> {
+pub fn parse_iit_cert_response(body: &[u8], expected_ski: &[u8]) -> Result<Vec<u8>, CmpError> {
     // Outer: ContentInfo SEQUENCE { OID id-data, [0] EXPLICIT OCTET STRING }
     let (_, ci_inner) = a1::read_tlv(body, 0)?;
     let (oid_end, _) = a1::read_tlv(body, ci_inner)?;
@@ -201,7 +198,11 @@ fn find_cert_with_ski_iterative(
         depth: u32,
     }
     let mut stack = Vec::<Frame>::with_capacity(16);
-    stack.push(Frame { start: 0, end: data.len(), depth: 0 });
+    stack.push(Frame {
+        start: 0,
+        end: data.len(),
+        depth: 0,
+    });
 
     let mut visits = 0u32;
     // Track whether any frame encountered a malformed TLV. If the
@@ -222,11 +223,17 @@ fn find_cert_with_ski_iterative(
             }
             let tag = match a1::peek_tag(data, pos) {
                 Ok(t) => t,
-                Err(_) => { had_parse_error = true; break; }
+                Err(_) => {
+                    had_parse_error = true;
+                    break;
+                }
             };
             let (tlv_end, content_start) = match a1::read_tlv(data, pos) {
                 Ok(v) => v,
-                Err(_) => { had_parse_error = true; break; }
+                Err(_) => {
+                    had_parse_error = true;
+                    break;
+                }
             };
 
             if tag == 0x30 {
@@ -264,7 +271,8 @@ fn find_cert_with_ski_iterative(
         Err(CmpError::Parse(
             "response contains malformed TLV — cannot determine whether \
              the requested cert is present; treating as corrupt, not as \
-             NotFound".into(),
+             NotFound"
+                .into(),
         ))
     } else {
         Ok(None)
@@ -355,9 +363,9 @@ mod tests {
     use super::*;
 
     const SAMPLE_SKI: [u8; 32] = [
-        0xFD, 0xC5, 0x99, 0x01, 0xEB, 0xA8, 0xCC, 0x05, 0x11, 0x73, 0xD2, 0x98, 0x96, 0xA0,
-        0xEC, 0xEE, 0x90, 0x45, 0x4F, 0x12, 0x90, 0x8F, 0x27, 0x55, 0x80, 0xE4, 0x55, 0x1C,
-        0x67, 0x9A, 0xD1, 0x3B,
+        0xFD, 0xC5, 0x99, 0x01, 0xEB, 0xA8, 0xCC, 0x05, 0x11, 0x73, 0xD2, 0x98, 0x96, 0xA0, 0xEC,
+        0xEE, 0x90, 0x45, 0x4F, 0x12, 0x90, 0x8F, 0x27, 0x55, 0x80, 0xE4, 0x55, 0x1C, 0x67, 0x9A,
+        0xD1, 0x3B,
     ];
 
     #[test]
@@ -365,7 +373,9 @@ mod tests {
         let msg = encode_iit_cert_lookup(&SAMPLE_SKI).unwrap();
         assert_eq!(msg[0], 0x30, "outer SEQUENCE");
         // OID id-data must appear.
-        assert!(msg.windows(ID_DATA_OID_DER.len()).any(|w| w == ID_DATA_OID_DER));
+        assert!(msg
+            .windows(ID_DATA_OID_DER.len())
+            .any(|w| w == ID_DATA_OID_DER));
         // SKI must appear at least once.
         assert!(msg.windows(SAMPLE_SKI.len()).any(|w| w == SAMPLE_SKI));
         // Final byte (or near final) of the octet string must carry the
@@ -419,7 +429,7 @@ mod tests {
     fn parse_success_without_cert_returns_not_found() {
         let mut iit = vec![0u8; 20];
         iit[4] = 0x01; // status = 1
-        // bytes 8..20: junk SEQUENCE that's not a Certificate
+                       // bytes 8..20: junk SEQUENCE that's not a Certificate
         iit[8] = 0x30;
         iit[9] = 0x0a;
         // 10 bytes of garbage — not enough to look like a cert
@@ -443,8 +453,12 @@ mod tests {
     /// the cert DER verbatim.
     #[test]
     fn parse_returns_matching_cert_from_real_dstu_response() {
-        let cert_path = "/mnt/c/ProgramData/WebCheck/Keys/CA-0882240800000000000000000000000000000001.cer";
-        let cert = match std::fs::read(cert_path) { Ok(d) => d, Err(_) => return };
+        let cert_path =
+            "/mnt/c/ProgramData/WebCheck/Keys/CA-0882240800000000000000000000000000000001.cer";
+        let cert = match std::fs::read(cert_path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
 
         // Build the IIT payload: 8-byte header + a fake SignedData-shell
         // (a SEQUENCE that contains the cert). find_cert_with_ski's
@@ -520,9 +534,9 @@ mod tests {
         // wire protocol work at all?" test that doesn't depend on
         // cross-CA routing.
         const DPS_OWN_SKI: [u8; 32] = [
-            0x14, 0xED, 0xC2, 0x06, 0x97, 0xBD, 0x37, 0x23, 0x93, 0xCA, 0x35, 0xA0,
-            0x1E, 0x12, 0x4E, 0x9E, 0xC0, 0xA2, 0xCA, 0x01, 0x39, 0xFB, 0x7F, 0xB2,
-            0xBC, 0x5C, 0x81, 0xC9, 0x2E, 0x13, 0xB0, 0x37,
+            0x14, 0xED, 0xC2, 0x06, 0x97, 0xBD, 0x37, 0x23, 0x93, 0xCA, 0x35, 0xA0, 0x1E, 0x12,
+            0x4E, 0x9E, 0xC0, 0xA2, 0xCA, 0x01, 0x39, 0xFB, 0x7F, 0xB2, 0xBC, 0x5C, 0x81, 0xC9,
+            0x2E, 0x13, 0xB0, 0x37,
         ];
         let cert = fetch_cert_by_ski(
             "http://acskidd.gov.ua/services/cmp/",
@@ -550,9 +564,9 @@ mod tests {
     #[cfg(feature = "tsp_http")]
     fn live_privatbank_lookup_roundtrips_jks_ski() {
         const JKS_DIRECTOR_SKI: [u8; 32] = [
-            0x22, 0x6B, 0xC6, 0x89, 0x9C, 0x05, 0x58, 0x33, 0x12, 0xD1, 0x5B, 0x8F,
-            0x2C, 0x64, 0xF1, 0xE5, 0x84, 0x2F, 0x21, 0x98, 0x62, 0xC0, 0xF2, 0xF1,
-            0x5E, 0x96, 0x9B, 0x93, 0x49, 0xA7, 0x74, 0x9E,
+            0x22, 0x6B, 0xC6, 0x89, 0x9C, 0x05, 0x58, 0x33, 0x12, 0xD1, 0x5B, 0x8F, 0x2C, 0x64,
+            0xF1, 0xE5, 0x84, 0x2F, 0x21, 0x98, 0x62, 0xC0, 0xF2, 0xF1, 0x5E, 0x96, 0x9B, 0x93,
+            0x49, 0xA7, 0x74, 0x9E,
         ];
         let cert = fetch_cert_by_ski(
             "http://acsk.privatbank.ua/services/cmp/",
@@ -562,8 +576,8 @@ mod tests {
         .expect("live PrivatBank lookup");
         assert!(!cert.is_empty());
         assert_eq!(cert[0], 0x30);
-        let pub_bytes = crate::cms::envelope::extract_cert_pubkey_bytes(&cert)
-            .expect("extract pubkey");
+        let pub_bytes =
+            crate::cms::envelope::extract_cert_pubkey_bytes(&cert).expect("extract pubkey");
         let roundtrip = crate::cms::envelope::compute_ski(&pub_bytes);
         assert_eq!(roundtrip.as_slice(), JKS_DIRECTOR_SKI.as_slice());
     }
@@ -583,8 +597,8 @@ mod tests {
         .expect("live uakey lookup");
         assert!(!cert.is_empty());
         assert_eq!(cert[0], 0x30);
-        let pub_bytes = crate::cms::envelope::extract_cert_pubkey_bytes(&cert)
-            .expect("extract pubkey");
+        let pub_bytes =
+            crate::cms::envelope::extract_cert_pubkey_bytes(&cert).expect("extract pubkey");
         let roundtrip = crate::cms::envelope::compute_ski(&pub_bytes);
         assert_eq!(roundtrip.as_slice(), SAMPLE_SKI.as_slice());
     }

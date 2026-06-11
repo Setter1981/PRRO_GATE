@@ -22,13 +22,14 @@ use const_oid::ObjectIdentifier;
 /// baseline B-B) — the builder can then uplift to T (timestamp) or
 /// LT (revocation-values) depending on the caller's options.
 /// See `SECURITY.md` for the full threat model and scope rationale.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CmsProfile {
     /// DSTU 4145-LE with GOST 34.311-95 digest, `pb` (polynomial basis) form.
     /// Corresponds to the Ukrainian OID `Dstu4145WithGost34311(pb)`
     /// (`1.2.804.2.1.1.1.1.3.1.1`). Default profile — maps to how existing
     /// Ukrainian PRRO/ДПС deployments sign fiscal documents today.
+    #[default]
     Dstu4145WithGost34311Pb,
 
     /// DSTU 4145-LE with Kupyna-256 (DSTU 7564) digest, `pb` form.
@@ -128,12 +129,6 @@ fn extract_sig_alg_oid(cert_der: &[u8]) -> Option<&[u8]> {
     Some(&cert_der[oid_inner..oid_end])
 }
 
-impl Default for CmsProfile {
-    fn default() -> Self {
-        Self::Dstu4145WithGost34311Pb
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,10 +147,7 @@ mod tests {
     fn test_signature_oid_is_composite_not_generic() {
         let p = CmsProfile::Dstu4145WithGost34311Pb;
         assert_eq!(p.signature_oid(), oids::DSTU_4145_WITH_GOST_34311_PB);
-        assert_eq!(
-            p.signature_oid().to_string(),
-            "1.2.804.2.1.1.1.1.3.1.1",
-        );
+        assert_eq!(p.signature_oid().to_string(), "1.2.804.2.1.1.1.1.3.1.1",);
     }
 
     #[test]
@@ -164,10 +156,7 @@ mod tests {
         assert_eq!(p.digest_oid(), oids::KUPYNA_256);
         assert_eq!(p.digest_len(), 32);
         assert_eq!(p.signature_oid(), oids::DSTU_4145_WITH_DSTU_7564_PB);
-        assert_eq!(
-            p.signature_oid().to_string(),
-            "1.2.804.2.1.1.1.1.3.6.1.1",
-        );
+        assert_eq!(p.signature_oid().to_string(), "1.2.804.2.1.1.1.1.3.6.1.1",);
     }
 
     /// Build a minimal X.509 DER cert with a given signatureAlgorithm OID.

@@ -42,7 +42,7 @@ pub fn fmul_257(a: &Fe, b: &Fe, out: &mut FeWide) {
             let x1 = if i + 1 == FE_WORDS { 0 } else { a_words[i + 1] };
 
             let x22 = mul_2x2(x1, x0, y1, y0);
-            out.0[j + i + 0] ^= x22[0];
+            out.0[j + i] ^= x22[0];
             out.0[j + i + 1] ^= x22[1];
             out.0[j + i + 2] ^= x22[2];
             out.0[j + i + 3] ^= x22[3];

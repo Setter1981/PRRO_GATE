@@ -261,7 +261,7 @@ mod tests {
         let via_ladder = mul_base_x_ct(k, curve);
 
         match (via_wnaf.is_zero(), via_ladder.is_none()) {
-            (true, true) => return,
+            (true, true) => {}
             (false, true) => panic!(
                 "{}: wnaf returned non-infinity x = {:?} but ladder returned None",
                 label, via_wnaf.x.bytes
@@ -319,8 +319,7 @@ mod tests {
             FieldEl::from_words(b)
         };
         assert_ladder_matches_wnaf(&n_minus_1, &curve, "k=n-1");
-        let ladder_x_nm1 = mul_base_x_ct(&n_minus_1, &curve)
-            .expect("(n-1)·G is not the identity");
+        let ladder_x_nm1 = mul_base_x_ct(&n_minus_1, &curve).expect("(n-1)·G is not the identity");
         assert!(
             ladder_x_nm1.equals(&curve.base_x),
             "x((n-1)·G) must equal x(G) on binary curves — got {:?}",
@@ -347,8 +346,8 @@ mod tests {
             FieldEl::from_words(b)
         };
         assert_ladder_matches_wnaf(&n_plus_1, &curve, "k=n+1");
-        let ladder_x_np1 = mul_base_x_ct(&n_plus_1, &curve)
-            .expect("(n+1)·G = G is not the identity");
+        let ladder_x_np1 =
+            mul_base_x_ct(&n_plus_1, &curve).expect("(n+1)·G = G is not the identity");
         assert!(
             ladder_x_np1.equals(&curve.base_x),
             "x((n+1)·G) must equal x(G) — got {:?}",
@@ -423,11 +422,7 @@ mod tests {
             if k.is_zero() {
                 continue;
             }
-            assert_ladder_matches_wnaf(
-                &k,
-                &curve,
-                &format!("full-width trial {}", trial),
-            );
+            assert_ladder_matches_wnaf(&k, &curve, &format!("full-width trial {}", trial));
         }
     }
 
@@ -479,8 +474,7 @@ mod tests {
         };
 
         let via_narrow = mul_base_x_ct(&narrow, &curve).expect("non-identity");
-        let via_canonical =
-            mul_base_x_ct(&canonical, &curve).expect("non-identity");
+        let via_canonical = mul_base_x_ct(&canonical, &curve).expect("non-identity");
 
         assert!(
             via_narrow.equals(&via_canonical),
@@ -527,7 +521,7 @@ mod tests {
         // Deterministic "random" sequence — we want a diff harness,
         // not a probabilistic pass/fail. Use an xorshift64 seeded from
         // a fixed value so a regression shows up in the same slot.
-        let mut state: u64 = 0x4DC51_E1C0_DE_BA5Eu64;
+        let mut state: u64 = 0x04DC_51E1_C0DE_BA5Eu64;
         let mut next_u32 = || -> u32 {
             state ^= state << 13;
             state ^= state >> 7;
@@ -628,7 +622,10 @@ mod tests {
         let k = FieldEl::from_words(oversized);
         let err = mul_point_x_ct(&curve.base_x, &k, &curve).unwrap_err();
         match err {
-            LadderError::ScalarTooWide { provided_words, max_words } => {
+            LadderError::ScalarTooWide {
+                provided_words,
+                max_words,
+            } => {
                 assert_eq!(provided_words, curve.mod_words + 1);
                 assert_eq!(max_words, curve.mod_words);
             }

@@ -86,10 +86,10 @@ pub fn freduce_257(wide: &[u32; FE_WIDE], out: &mut [u32; FE_WORDS]) {
     const D0_T12_FINAL: u32 = 12;
     const D1_T12_FINAL: u32 = 20;
 
-    let zz = r[DN] >> D0_T0;                // bits 1+ of word DN
-    r[DN] = (r[DN] << D1_T0) >> D1_T0;      // keep only bit 0
-    r[0] ^= zz;                              // fold via t^0
-    r[N_T12_FINAL] ^= zz << D0_T12_FINAL;    // fold via t^12, low half
+    let zz = r[DN] >> D0_T0; // bits 1+ of word DN
+    r[DN] = (r[DN] << D1_T0) >> D1_T0; // keep only bit 0
+    r[0] ^= zz; // fold via t^0
+    r[N_T12_FINAL] ^= zz << D0_T12_FINAL; // fold via t^12, low half
     r[N_T12_FINAL + 1] ^= zz >> D1_T12_FINAL; // fold via t^12, high half (XOR-0 when zz small)
 
     out.copy_from_slice(&r[..FE_WORDS]);

@@ -128,8 +128,8 @@ pub fn extract_param_d_from_pkcs8(pkcs8: &[u8]) -> Result<Vec<u8>, DerError> {
     let mut r = Reader::new(pkcs8);
     let outer = r.expect(TAG_SEQUENCE)?;
     let mut inner = Reader::new(outer);
-    inner.expect(TAG_INTEGER)?;   // skip version
-    inner.expect(TAG_SEQUENCE)?;  // skip algId
+    inner.expect(TAG_INTEGER)?; // skip version
+    inner.expect(TAG_SEQUENCE)?; // skip algId
     let privkey_der = inner.expect(TAG_OCTET_STRING)?;
     extract_param_d(privkey_der)
 }
@@ -213,8 +213,8 @@ mod tests {
             Err(_) => return, // skip if no test JKS
         };
         let entry = read_jks(&data, "Jrcfyf123").unwrap();
-        let d_bytes = extract_param_d(&entry.key_der)
-            .expect("DSTU key wrapper must parse from real JKS");
+        let d_bytes =
+            extract_param_d(&entry.key_der).expect("DSTU key wrapper must parse from real JKS");
         // DSTU_PB_257 private key is 32 bytes (256 bits) plus possibly leading zero
         assert!(
             d_bytes.len() >= 32 && d_bytes.len() <= 34,

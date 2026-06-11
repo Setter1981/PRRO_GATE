@@ -2,6 +2,9 @@
 //!
 //! Run with: `cargo bench --bench crypto`
 
+// Explicit index loops mirror the core's CT style (see core/mod.rs).
+#![allow(clippy::needless_range_loop)]
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 use prro_crypto::{
@@ -9,7 +12,7 @@ use prro_crypto::{
         fe::Fe,
         field::FieldEl,
         gf2m::{blength, finv, fmod, fmul},
-        hash::{kupyna_256, kupyna_512, gost_34_311_95},
+        hash::{gost_34_311_95, kupyna_256, kupyna_512},
         point::Point,
         proj::ProjPoint,
         sign::{sign, verify},
@@ -236,10 +239,7 @@ fn bench_pclmul_primitives(c: &mut Criterion) {
 
     g.bench_function("clmul64", |bench| {
         bench.iter(|| unsafe {
-            black_box(backend::x86_pclmul::clmul64(
-                black_box(a64),
-                black_box(b64),
-            ));
+            black_box(backend::x86_pclmul::clmul64(black_box(a64), black_box(b64)));
         });
     });
 
