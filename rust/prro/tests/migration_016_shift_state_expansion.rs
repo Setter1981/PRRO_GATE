@@ -1,6 +1,14 @@
 //! Targeted verification for migration 016 (M3b shift state expansion,
 //! W14a-1 scope).
 //!
+//! NOTE (2026-06 baseline squash): the incremental-step test
+//! `migration_016_preserves_fd_updated_at_during_w4_dance` (it replayed
+//! versions ≤15 then 016 via `Migrator::iter()` to prove the W4 trigger dance)
+//! was removed — after the squash that incremental step is unreachable by
+//! construction.  The pre-squash chain AND its tests live at git ref
+//! 5c6b00a3a9895fd634c322d02dc6c3d925dfcc4b (recover via `git show`).  The
+//! surviving tests below assert the resulting (baseline) schema/behaviour.
+//!
 //! Covers the contracts the migration installs per spec §9.2 + §16.17:
 //!
 //!   1. shifts.state CHECK extended to 9 values (3 new: OPENED_LOCAL_PENDING_DRAIN,
@@ -376,175 +384,4 @@ async fn migration_016_triggers_preserved_post_rebuild() {
             "trigger {name} DDL must be byte-identical post-rebuild (W4 lesson per 015:96-104)"
         );
     }
-}
-
-// ─── (8) fd_updated_at SUPPRESSION during W4 dance on populated DB ───
-//
-// LOAD-BEARING: applies migrations 001-015 only via raw_sql, seeds shifts +
-// fiscal_documents rows with KNOWN updated_at + non-NULL shift_id, then runs
-// ONLY migration 016 manually.  Asserts that fiscal_documents.updated_at is
-// byte-identical post-migration (proving the trigger drop+recreate dance
-// at steps 1 + 11 worked).  Mirrors pattern from migrations_007_008.rs
-// `migration_008_preserves_fiscal_documents_and_document_files`.
-#[tokio::test]
-async fn migration_016_preserves_fd_updated_at_during_w4_dance() {
-    use sqlx::migrate::Migrator;
-    static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
-
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("fd_preserve.db");
-    std::mem::forget(dir);
-    let url = format!("sqlite://{}?mode=rwc", path.display());
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect(&url)
-        .await
-        .unwrap();
-
-    sqlx::query("PRAGMA foreign_keys = ON")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("PRAGMA journal_mode = WAL")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    // Apply migrations 1..=15 only (pre-016 base).  Each migration in its
-    // own tx mirrors what `sqlx::migrate::Migrator` does in production
-    // (PRAGMA defer_foreign_keys is per-tx).
-    for m in MIGRATOR.iter() {
-        if m.version <= 15 {
-            let mut tx = pool.begin().await.unwrap();
-            sqlx::raw_sql(&m.sql).execute(&mut *tx).await.unwrap();
-            tx.commit().await.unwrap();
-        }
-    }
-
-    // Seed FN config.
-    sqlx::query(
-        "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
-         VALUES ('9000099001', '12345678', 'test')",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Seed shift row in pre-016 6-state schema (state='OPENED').  Pre-016
-    // schema has no opened_by_cashier_id column — migration 016 back-fills
-    // the sentinel '__pre_w14a1__' per spec §16.17.
-    let shift_id: Vec<u8> = vec![0xE0u8; 16];
-    sqlx::query(
-        "INSERT INTO shifts(shift_id, fiscal_number, state, open_mode, opened_at) \
-         VALUES (?, '9000099001', 'OPENED', 'ONLINE', '2026-05-17T10:00:00Z')",
-    )
-    .bind(&shift_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Seed fiscal_documents row with shift_id reference + KNOWN updated_at
-    // BEFORE the W4 dance.  We use UPDATE post-INSERT to bypass the
-    // DEFAULT CURRENT_TIMESTAMP — explicit known value so we can detect any
-    // drift.
-    let doc_id: Vec<u8> = vec![0xF0u8; 16];
-    let req_id: Vec<u8> = vec![0xF1u8; 16];
-    let sha: Vec<u8> = vec![0u8; 32];
-    let known_updated_at = "2024-01-01T00:00:00Z";
-
-    sqlx::query(
-        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
-            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
-            payload_sha256_canonical, shift_id, updated_at) \
-         VALUES (?, ?, '9000099001', 1, 'SELL', 'ACK', 'b', 't', 'ONLINE', \
-                 '2026-05-17T10:00:00Z', '{}', ?, ?, ?)",
-    )
-    .bind(&doc_id)
-    .bind(&req_id)
-    .bind(&sha)
-    .bind(&shift_id)
-    .bind(known_updated_at)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Snapshot pre-migration value (should be the bound value above).
-    let pre: String =
-        sqlx::query_scalar("SELECT updated_at FROM fiscal_documents WHERE document_id = ?")
-            .bind(&doc_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        pre, known_updated_at,
-        "test pre-condition: seeded updated_at must match"
-    );
-
-    // Apply migration 016 ONLY (in its own tx — the production pattern).
-    for m in MIGRATOR.iter() {
-        if m.version == 16 {
-            let mut tx = pool.begin().await.unwrap();
-            sqlx::raw_sql(&m.sql).execute(&mut *tx).await.unwrap();
-            tx.commit().await.unwrap();
-            break;
-        }
-    }
-
-    // Post-migration: updated_at MUST be byte-identical.  If the
-    // fd_updated_at trigger had not been suppressed during the W4 dance
-    // (steps 3 + 9 UPDATE on shift_id), this assertion would fail with
-    // the migration's wall-clock CURRENT_TIMESTAMP instead.
-    let post: String =
-        sqlx::query_scalar("SELECT updated_at FROM fiscal_documents WHERE document_id = ?")
-            .bind(&doc_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        post, known_updated_at,
-        "fd_updated_at trigger MUST be suppressed during the W4 NULL-FK dance \
-         (load-bearing W4 lesson per migration 015:96-104 + spec §9.2 step 11). \
-         Drift indicates the trigger DROP at step 1 OR the recreate at step 11 \
-         is missing or incorrectly ordered."
-    );
-
-    // Also assert shift_id was restored correctly (W4 step 9).
-    let restored_shift_id: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT shift_id FROM fiscal_documents WHERE document_id = ?")
-            .bind(&doc_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        restored_shift_id.as_ref(),
-        Some(&shift_id),
-        "fiscal_documents.shift_id must be restored from stash column post-W4-dance"
-    );
-
-    // And confirm the temp stash column was dropped (W4 step 10).
-    let stash_present: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pragma_table_info('fiscal_documents') \
-         WHERE name = '_w14a1_shift_id_tmp'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        stash_present, 0,
-        "_w14a1_shift_id_tmp column must be dropped after W4 dance completes"
-    );
-
-    // PR #65 R1 H1: confirm the pre-W14a-1 sentinel back-fill populated
-    // opened_by_cashier_id for the legacy row (spec §16.17 NOT NULL).
-    let back_filled: String =
-        sqlx::query_scalar("SELECT opened_by_cashier_id FROM shifts WHERE shift_id = ?")
-            .bind(&shift_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        back_filled, "__pre_w14a1__",
-        "migration 016 must back-fill opened_by_cashier_id with sentinel for pre-W14a-1 rows \
-         (operator IT can later UPDATE to real cashier identity via remediation script)"
-    );
 }
