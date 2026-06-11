@@ -87,7 +87,5 @@ path = "src/bin/prro_license_verify.rs"
 name = "prro_sidecar_preflight"
 path = "src/bin/prro_sidecar_preflight.rs"
 
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
+# [profile.release] moved to the WORKSPACE ROOT Cargo.toml (audit CRY-2,
+# 2026-06-10): member-package profiles are silently ignored by cargo.

@@ -119,6 +119,16 @@ jobs:
         # ADR-M3-A10). Production builds do NOT enable this feature.
         run: cargo test -p prro --target ${{ matrix.target }} --features test-support --locked
 
+      - name: Test prro_crypto (vectors, dudect CT, backend differential)
+        if: matrix.target != 'x86_64-unknown-linux-musl'
+        working-directory: rust
+        # Audit CRY-3 (2026-06-10): the crypto crate's OWN suite (DSTU/GOST
+        # vectors, the dudect constant-time statistical tests, the
+        # portable↔pclmul backend differential) previously ran only by hand.
+        # Per-target matters here: x86 exercises the PCLMUL backend, aarch64
+        # the portable one. ~70s warm on a dev box.
+        run: cargo test -p prro_crypto --target ${{ matrix.target }} --locked
+
       - name: Test (musl built for target, executed on host gnu)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         working-directory: rust
