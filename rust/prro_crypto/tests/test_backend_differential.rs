@@ -13,6 +13,13 @@
 //! exercises (both operands having the 256-th bit set simultaneously
 //! happens in ~1/4 of pairs only after many thousands of draws).
 
+// x86-only by definition: the differential needs BOTH backends, and
+// `backend::x86_pclmul` exists only on x86_64. On other arches (aarch64
+// CI arm) this file compiles to an empty test binary. (CRY-3 follow-up:
+// the first per-target CI run of this suite caught the unconditional
+// x86_pclmul references here.)
+#![cfg(target_arch = "x86_64")]
+
 use prro_crypto::core::backend;
 use prro_crypto::core::fe::{Fe, FeWide, FE_WORDS};
 

@@ -351,9 +351,11 @@ mod tests {
 
     #[test]
     fn sia_extraction_on_real_cert_gracefully_fails_when_absent() {
+        // Vendored from jkurwa's test data (CRY-3 follow-up: the old path
+        // reached into sidecar/node_modules, which does not exist in CI).
         let cert_der = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../sidecar/node_modules/jkurwa/test/data/SELF_SIGNED1.cer"
+            "/tests/fixtures/SELF_SIGNED1.cer"
         ))
         .expect("read test cert");
         // Self-signed test cert has no SIA. The parser must return a
