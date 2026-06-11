@@ -1,1 +1,0 @@
-- [RS-3 A4 per-FN gate](project_rs3_a4_fn_gate.md) — FnWriteGate concurrency review MERGE; forward contracts (gate-outer/tx-inner ordering, validated-FN key, no crash cleanup) the A2/B1 wiring review must enforce
