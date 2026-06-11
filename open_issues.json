@@ -1,0 +1,511 @@
+[
+  {
+    "id": "PRRO_GATE-9qd.2",
+    "title": "M3b: Phase-6-min offline subsystem (Rust)",
+    "description": "M3b — second phase of M3, gated on M3a completion.\n\nScope: minimum Rust offline subsystem required to pass\nPILOT_ACCEPTANCE_TEST_PLAN Phase 6 (offline lifecycle: enter offline,\nissue receipts under OFFLINE_LOCAL_ACK, block Z-report on backlog,\nreturn online, sync, finalize).\n\nThis is NOT full WebCheck parity. 36h/168h offline-limit enforcement\nand the 24h shift guard are NOT part of Phase-6-min unless promoted\ninto M3b; omitting them from a live pilot requires explicit owner\nrisk acceptance before Go.\n\nIn scope (per handoff §3.1):\n  - Offline session lifecycle: open / drain / close OFFLINE_LOCAL_ACK pool\n  - OFFLINE_LOCAL_ACK whitelist extension to 6 targets + retry self-loop\n  - ix_offline_active UNIQUE migration\n  - Pattern C \"stage and flip\" envelope-then-finalize\n  - Auto-flip OFFLINE -\u003e ONLINE via ping(fn_sign)\n  - Offline-code availability and offline-code-pool bounds (without\n    these Phase 6 has no meaning)\n\nOut of scope for M3b (canonically owned elsewhere):\n  - Generic SENDING-state reconciler (last_chk cooldown for operator-\n    stuck docs) — owned by M5, NOT M3b\n  - Operator manual-reconciliation hooks — owned by M5/M6 (CLI per ADR D2)\n  - Web admin UI — out of pilot scope per ADR D2\n  - Backup/restore, key/CA rotation, rollback rehearsal — parallel\n    docs+ops track per ADR D3, NOT part of M3b\n  - 36h/168h offline limits, 24h shift guard — owner risk acceptance,\n    not promoted into M3b unless explicitly decided\n\nAnchored on:\n  - ADR docs/superpowers/specs/2026-05-07-pilot-runtime-decision.md\n    (Status: ACCEPTED, commit 45aa6f9)\n  - docs/M3-W0-handoff.md §3.1 (commit 1cc5ce5)\n\nBlocked by M3a completion (PRRO_GATE-9qd.1).",
+    "acceptance_criteria": "PILOT_ACCEPTANCE_TEST_PLAN Phase 6 passes against Rust-only stack:\noffline session lifecycle (open/drain/close OFFLINE_LOCAL_ACK pool),\nOFFLINE_LOCAL_ACK whitelist transitions, Z-report guard while backlog\nnon-empty, sync-back to final ACK after return-online.\n\nGeneric SENDING-state reconciler is NOT required by this acceptance\n(owned by M5, not M3b).\n\nOmission of 36h/168h offline-limit enforcement and 24h shift guard\nfrom this milestone requires explicit owner risk acceptance recorded\nin the repo before live pilot Go.\n\nBackup/restore, key/CA rotation, rollback rehearsal are NOT part of\nthis acceptance; they are the parallel docs+ops track per handoff §3.5.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "epic",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-07T13:20:11Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-14T16:07:27Z",
+    "dependencies": [
+      {
+        "issue_id": "PRRO_GATE-9qd.2",
+        "depends_on_id": "PRRO_GATE-9qd",
+        "type": "parent-child",
+        "created_at": "2026-05-07T13:20:10Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "PRRO_GATE-9qd.2",
+        "depends_on_id": "PRRO_GATE-9qd.1",
+        "type": "blocks",
+        "created_at": "2026-05-07T16:30:05Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 1,
+    "comment_count": 3,
+    "parent": "PRRO_GATE-9qd"
+  },
+  {
+    "id": "PRRO_GATE-9qd",
+    "title": "M-series: Rust-only pilot path (M3a-M6)",
+    "description": "Scope envelope: Rust-only pilot path — five-milestone sequence\nM3a → M3b → M4 → M5 → M6.\n\nPer ADR docs/superpowers/specs/2026-05-07-pilot-runtime-decision.md\n(Status: ACCEPTED, commit 45aa6f9), the path from a working Rust\nwrite-path to a live pilot is a Rust-only sequence in which Python is\nremoved from the pilot runtime entirely.  This epic is the umbrella;\neach phase is a child epic with its own scope and acceptance:\n\n  - 9qd.1 M3a — ONLINE happy-path 5-stage write-path\n    (acquire+validate -\u003e guard -\u003e sign -\u003e send -\u003e finalize).  ONLINE\n    node only; no offline writes, no operator recovery flows, no\n    full reconciliation.\n  - 9qd.2 M3b — Phase-6-min offline subsystem (minimum Rust offline\n    lifecycle to pass PILOT_ACCEPTANCE_TEST_PLAN Phase 6).  NOT full\n    WebCheck parity.  Generic SENDING reconciler is M5, not M3b.\n    Operator manual-reconciliation flows are M5/M6, not M3b.\n  - 9qd.3 M4 — Rust ingress + transport bridges (REST, XML-RPC,\n    Maria-shell, maria304_driver re-bridge to in-process gateway,\n    optional 1С OLE per ADR open item O1 closure).\n  - 9qd.4 M5 — services tail (ingress writer, generic SENDING\n    reconciler, post-boot reconciliation hooks, manual-reconcile\n    CLI surface, optional cert_provisioning / retention /\n    shift_aggregation per ADR open items O2 / O3).  Backup/restore\n    is NOT in M5; see handoff §3.5 parallel docs+ops track.\n  - 9qd.5 M6 — admin surface; prro_admin CLI only for pilot.  Web\n    admin UI is post-pilot.\n\nAll phases bind to M2 substrate (prro::crypto, prro::transports::dps,\nprro::xml, services::cert_refresher; see docs/M2-handoff.md §2 for\nfrozen contracts).\n\nInputs (frozen):\n  - docs/M2-handoff.md (§4 names the 10 inviolable invariants and\n    5 M3-entry decisions).\n  - docs/superpowers/plans/2026-05-06-m3-w0-research.md\n    (M3-W0 research mini-plan).\n  - docs/superpowers/specs/2026-05-04-m2-pre-plan-adr.md\n    (M2 ADRs M2-1..M2-6 approved 2026-05-04; M3 ADR amendments\n    A1..A9 added in commit 8c72a14).\n  - docs/superpowers/specs/2026-05-07-pilot-runtime-decision.md\n    (Pilot Runtime ADR, Status: ACCEPTED, commit 45aa6f9).\n  - docs/M3-W0-handoff.md §3.1-§3.5 (post-M3a deferrals updated\n    per pilot runtime ADR, commit 1cc5ce5).\n  - docs/Multi-Protocol_PRRO_Gateway.md (technical spec).\n\nDecomposition order: M3a -\u003e M3b -\u003e M4 -\u003e M5 -\u003e M6, enforced by bd\ndep chain (9qd.1 -\u003e 9qd.2 -\u003e 9qd.3 -\u003e 9qd.4 -\u003e 9qd.5).  Each phase\nopens ready in bd only after its predecessor closes.\n\nCross-links (set at epic creation):\n  parent-child to phase children:\n    - PRRO_GATE-9qd.1 (M3a)\n    - PRRO_GATE-9qd.2 (M3b)\n    - PRRO_GATE-9qd.3 (M4)\n    - PRRO_GATE-9qd.4 (M5)\n    - PRRO_GATE-9qd.5 (M6)\n  parent-child to M3a-supporting bd issues (carried at the M3a\n  level via 9qd.1, listed here for tree visibility):\n    - PRRO_GATE-ddn (lnd monotonicity) — M3a W1 + W5\n    - PRRO_GATE-zti (CloseShift -\u003e Z_REPORT) — M3a W6 (ADR-M3-A2)\n    - PRRO_GATE-k99 (transition_state lock discipline) — M3a W2 + W3\n    - PRRO_GATE-6bj (retry/recovery policy) — M3a W7 minimal, W10 full\n    - PRRO_GATE-ah8 (App::boot upsert behaviour) — M3a W10\n  superseded under the pilot runtime ADR (closed):\n    - PRRO_GATE-gx2 (pilot offline decision; resolved in ADR;\n      canonical work tracked under 9qd.2)\n    - PRRO_GATE-er6 (Python-era OfflineSyncService selector spec\n      source; canonical work under 9qd.2)\n  discovered-from edge to PRRO_GATE-82j (M2 epic, closed).",
+    "acceptance_criteria": "All five phase children closed: 9qd.1 (M3a), 9qd.2 (M3b),\n9qd.3 (M4), 9qd.4 (M5), 9qd.5 (M6).  Pilot runtime ADR open items\nO1 / O2 / O3 closed before M4 / M5 plan writing.  10 inviolable\ninvariants from M2 handoff §4.1 hold across all phases.\nBackup/restore, key/CA rotation, rollback rehearsal — parallel\ndocs+ops pilot prerequisite, NOT a code-milestone acceptance line;\ntracked separately per handoff §3.5.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "epic",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-06T20:24:03Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-07T16:45:47Z",
+    "dependencies": [
+      {
+        "issue_id": "PRRO_GATE-9qd",
+        "depends_on_id": "PRRO_GATE-82j",
+        "type": "discovered-from",
+        "created_at": "2026-05-06T20:24:49Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "PRRO_GATE-6bj",
+    "title": "M3 write_path: WebCheck-derived submit retry/recovery policy",
+    "description": "WebCheck SubmitPtr.cs:50 implements a non-trivial policy on top of\nthe typed-error mapping our M2 transport ships:\n\n  - status -3 (ERROR_SAVE on the wire today; WebCheck's marker for\n    \"transient persist failure server-side\") → retry with backoff.\n  - status -15 (ERROR_NOT_OPEN_SHIFT) → recovery via lastChk; the\n    write-path consults lastChk to reconcile the FN's current\n    server state before the next submit.\n  - status 0 (UNKNOWN / missing field) → treated as decode + retry\n    with reconciliation, NOT as a hard failure.\n  - status -16 (ERROR_OFFLINE_ID) → offline-technical path: the\n    document was rejected because of an offline-id mismatch, which\n    triggers WebCheck's offline-pool reconciliation rather than a\n    plain retry.\n\nOur M2 W3 transport currently TYPES these errors (Server { code,\nmessage } / Decode / Authorization / Transport per W0-1 review) but\ndoes NOT implement the routing policy.  The routing belongs in\nM3's services::write_path, NOT in the transport — but it MUST land\nbefore pilot.\n\nWithout this policy, M3 write_path will treat every non-OK status\nas \"fail the document and stop\", which would be brittle in\nproduction where transient -3 / -15 / -16 outcomes are expected\nparts of the lifecycle.\n\nAcceptance (M3-targeted):\n  - status -3 retry/backoff policy implemented in services::write_path\n    with bounded attempts + exponential backoff + audit_log entry per\n    retry.\n  - status -15 / status 0 lastChk reconciliation path: on these\n    statuses, write_path calls last_chk to learn the FN's current\n    server-side state, then decides retry vs hard-fail vs offline.\n  - status -16 offline-id / technical offline path decision: either\n    (a) implement offline-pool reconciliation in M3, or (b)\n    explicitly defer offline lifecycle to a separate milestone (see\n    PRRO_GATE-er6 + the offline-lifecycle parity follow-up).\n  - All policy state changes happen OUTSIDE network/crypto calls\n    (invariant #1: no network/crypto inside a tx).\n  - Targeted tests cover each branch (retry, reconciliation,\n    offline-technical) using a mock DpsChannel.\n\nEvidence: docs/webcheck_reverse/WebCheckMain/WebCheck/SubmitPtr.cs:50\n",
+    "acceptance_criteria": "M3 services::write_path implements: status -3 bounded retry+backoff with audit; status -15/0 lastChk reconciliation; status -16 offline-id decision (implement OR explicit defer); no network/crypto inside any tx; targeted tests cover each branch with a mock DpsChannel.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "task",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-05T22:18:51Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-05T22:18:51Z",
+    "labels": [
+      "architecture",
+      "m3",
+      "policy",
+      "rust"
+    ],
+    "dependencies": [
+      {
+        "issue_id": "PRRO_GATE-6bj",
+        "depends_on_id": "PRRO_GATE-9qd.4",
+        "type": "parent-child",
+        "created_at": "2026-05-13T13:39:03Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 1,
+    "parent": "PRRO_GATE-9qd.4"
+  },
+  {
+    "id": "PRRO_GATE-k54",
+    "title": "DPS TLS CA bundle support for GrpcDpsChannel",
+    "description": "WebCheck loads a CA bundle PEM file and constructs an SSL credential\nexplicitly:\n\n  TaxGrpc/Client.cs:34 — reads\n  C:\\ProgramData\\WebCheck\\prro-tax-gov-ua-chain.pem\n  and creates a tonic-equivalent `SslCredentials(rootCerts: pem)`.\n\nOur M2 W3 `GrpcDpsChannel::connect(endpoint, request_timeout)`\ncurrently passes the URI through `tonic::transport::Endpoint`, which\nrelies on the system TLS root store.  Production DPS endpoints may\nrequire:\n\n  - explicit CA-bundle pinning (the chain WebCheck ships, or its\n    successor) so the gateway works on hosts without the relevant\n    Ukrainian CA roots in /etc/ssl/certs;\n  - test-vs-prod CA isolation (separate bundles per environment so a\n    test-CA can never accidentally validate a prod cert);\n  - SNI / hostname-verify rules for the cabinet.tax.gov.ua endpoint.\n\nWithout this, the gateway can fail TLS handshake at first prod call —\nexactly the kind of failure that would manifest only in pilot.\n\nAcceptance:\n  - GrpcDpsChannel exposes a typed config for an optional CA bundle\n    path (PEM file).\n  - test-vs-prod separation preserved; mock/test path still works\n    without a CA bundle (wiremock / tonic mock are plain HTTP/2).\n  - Documented in W3 plan + a small ops note (CA bundle location +\n    rotation procedure).\n  - Pilot smoke test verifies a real prod TLS handshake succeeds.\n\nEvidence: docs/webcheck_reverse/TaxGrpc/TaxGrpc/Client.cs:34\n",
+    "acceptance_criteria": "GrpcDpsChannel takes optional CA-bundle PEM path; test/prod CA isolation preserved; mock path still works; ops doc covers rotation; pilot smoke test verifies real-prod TLS handshake.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "task",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-05T22:18:27Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-05T22:18:27Z",
+    "labels": [
+      "architecture",
+      "m2",
+      "rust",
+      "tls"
+    ],
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "PRRO_GATE-0ps",
+    "title": "DPS proto drift vs WebCheck TaxGrpc decompilation",
+    "description": "WebCheck TaxGrpc generated service surface (decompilation) carries\nEIGHT unary RPCs; our M2 W3 proto + DpsChannel implements only FIVE:\n\n  Implemented (M2 W3 in scope):\n    - sendChkV2\n    - lastChk\n    - ping\n    - statusRro\n    - infoRro\n\n  Generated by WebCheck but NOT in our proto (drift):\n    - sendChk        (legacy API v1 submit; WebCheck routes API v1 → sendChk\n                      and API v2 → sendChkV2 in TaxGrpc/Client.cs:57,114.\n                      Default verAPIdefault = 2 in WebCheck/All.cs:20, so\n                      new pilots can default to v2.)\n    - delLastChk     (last-receipt destructive cancel; not exposed in the\n                      public WebCheck IClient.cs:7 surface, only generated.\n                      Recovery / admin op; MUST NOT fold into the normal\n                      DpsChannel without a separate ADR + audit gate.)\n    - delLastChkId   (id-targeted destructive cancel using\n                      CheckRequestId { id, rro_fn_sign }; same recovery /\n                      admin classification.)\n\nDecision points to surface BEFORE M2 → pilot scope review:\n\n  1. sendChk v1 — defer or implement?\n     Recommendation: defer.  Rationale: WebCheck default is v2; new\n     pilots can be configured for v2 from day one.  Migration path\n     for legacy WebCheck configs that hard-code apiver=1 needs an\n     explicit \"auto-migrate or refuse\" decision.\n\n  2. delLastChk / delLastChkId — defer or implement?\n     Recommendation: defer to a separate \"DpsAdminOps / manual\n     recovery\" ADR.  Rationale: these are destructive/admin\n     operations.  Mixing them into DpsChannel risks accidental\n     cancellation; they need:\n       - typed admin-only API surface (e.g. DpsAdminChannel trait)\n       - audit_log entry on every call\n       - hard gate (CLI flag / admin role / ops-only feature flag)\n       - reconciliation rules with services::write_path\n\n  3. CheckRequestId proto message — same defer (only delLastChkId\n     consumes it).\n\n  4. WebCheck COM/1C public TaxGrpc IClient exposes only Open /\n     Check / Ping / CheckLast (IClient.cs:7), so the delLast* surface\n     is generated-but-private even in WebCheck.  Pilot-level scope\n     therefore looks like:\n       - 5 RPC are mandatory for production parity.\n       - sendChk v1 is mandatory IF a pilot config requires apiver=1.\n       - delLast* are admin/recovery and stay deferred unless an\n         operator workflow explicitly requires them.\n\nW3 sign-off gate for M2: this issue MUST be resolved (with documented\ndecisions) before M2 → pilot scope review.\n\nAcceptance:\n  - Decision recorded in ADR + W3 plan.\n  - sendChk v1 either implemented OR explicitly deferred with\n    migration plan for apiver=1 configs.\n  - delLastChk / delLastChkId either implemented behind a separate\n    DpsAdminChannel trait + audit gate OR explicitly deferred to a\n    follow-up ADR.\n  - W3 sign-off references this decision.\n\nEvidence:\n  - docs/webcheck_reverse/TaxGrpc/Com.Programika.Rro.Ws.Chk/ChkIncomeService.cs:15,257\n  - docs/webcheck_reverse/TaxGrpc/Com.Programika.Rro.Ws.Chk/CheckRequestId.cs:14\n  - docs/webcheck_reverse/TaxGrpc/TaxGrpc/IClient.cs:7\n  - docs/webcheck_reverse/TaxGrpc/TaxGrpc/Client.cs:57,114\n  - docs/webcheck_reverse/WebCheckMain/WebCheck/All.cs:20\n  - rust/prro/proto/fiscal_server.proto:8\n\nDiscovered during W3-C3 review (commit 42f02ba); body refreshed during\ndocs-only pilot-parity review (2026-05-05).\n",
+    "acceptance_criteria": "Decision recorded in ADR + W3 plan; sendChk v1 either implemented OR explicitly deferred with apiver=1 migration plan; delLastChk/delLastChkId either implemented behind a separate DpsAdminChannel trait + audit gate OR explicitly deferred to a follow-up ADR; W3 sign-off references this decision.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "task",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-05T22:07:15Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-05T22:18:06Z",
+    "labels": [
+      "architecture",
+      "m2",
+      "protocol-gap",
+      "rust"
+    ],
+    "dependencies": [
+      {
+        "issue_id": "PRRO_GATE-0ps",
+        "depends_on_id": "PRRO_GATE-82j",
+        "type": "discovered-from",
+        "created_at": "2026-05-05T22:07:19Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "PRRO_GATE-5js",
+    "title": "M2 W1+: ByServerFiscalNo gRPC channel = lastChk(fn_sign) + response.id match, not direct server-id lookup",
+    "description": "W0-1 review note: lastChk RPC is not a true wire-level 'lookup by server_fiscal_no' — the request carries the signed FN, and the client compares response.id against the expected fiscal id.  Acceptable under single-writer / recovery preconditions (M1 invariant #2), but the M2 W1+ DpsChannel implementation and tonic mock must encode this explicitly: the ByServerFiscalNo path is lastChk(fn_sign) + response.id match, not a direct server-id query.  Tests must cover: (a) match path -\u003e Ok(record), (b) mismatch path -\u003e typed error (server returned a different fiscal id than expected), (c) absent path -\u003e NotFound.  Source: M2-W0-1 findings doc docs/superpowers/specs/2026-05-04-m2-w0-1-dps-wire.md sections covering lastChk semantics, plus the user review note on 2026-05-04.",
+    "acceptance_criteria": "DpsChannel impl in M2 W1+ documents the semantic; tonic mock supports the match/mismatch/absent triple; integration test covers all three branches; findings doc cited from the M2 W1+ implementation plan.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "task",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-04T21:09:16Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-04T21:09:16Z",
+    "dependencies": [
+      {
+        "issue_id": "PRRO_GATE-5js",
+        "depends_on_id": "PRRO_GATE-31i",
+        "type": "discovered-from",
+        "created_at": "2026-05-04T21:09:15Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "PRRO_GATE-5js",
+        "depends_on_id": "PRRO_GATE-82j",
+        "type": "discovered-from",
+        "created_at": "2026-05-05T16:43:13Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 2
+  },
+  {
+    "id": "PRRO_GATE-9qd.5",
+    "title": "M6: admin surface (CLI only for pilot)",
+    "description": "M6 — fifth phase of post-M3a Rust-only pilot path. Pilot delivers\nCLI only per ADR D2.\n\nScope (per handoff §3.4): admin surface for pilot operations.\n\nIn scope:\n  - prro_admin CLI subcommands at minimum: status, set-config,\n    cert show / rotate, node-state show / set,\n    manual-reconcile \u003cdoc-id\u003e\n\nOut of scope for M6 (post-pilot):\n  - Web admin UI (port of admin_ui/routes.py + Jinja templates) —\n    explicitly NOT in M6 pilot delivery; reconsidered post-pilot once\n    real operator workflow needs are observed.\n\nAnchored on ADR 2026-05-07-pilot-runtime-decision.md §3.4\n(commit 45aa6f9) and docs/M3-W0-handoff.md §3.4 (commit 1cc5ce5).\n\nBlocked by M5 completion (the prior-created epic in this batch).",
+    "acceptance_criteria": "prro_admin CLI binary delivered with status, set-config, cert\nshow/rotate, node-state show/set, manual-reconcile subcommands\noperational against the pilot deployment.\n\nNo web UI required for pilot acceptance.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "epic",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-07T16:29:46Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-07T16:29:46Z",
+    "dependencies": [
+      {
+        "issue_id": "PRRO_GATE-9qd.5",
+        "depends_on_id": "PRRO_GATE-9qd",
+        "type": "parent-child",
+        "created_at": "2026-05-07T16:29:46Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "PRRO_GATE-9qd.5",
+        "depends_on_id": "PRRO_GATE-9qd.4",
+        "type": "blocks",
+        "created_at": "2026-05-07T16:30:10Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 0,
+    "comment_count": 0,
+    "parent": "PRRO_GATE-9qd"
+  },
+  {
+    "id": "PRRO_GATE-9qd.4",
+    "title": "M5: services tail",
+    "description": "M5 — fourth phase of post-M3a Rust-only pilot path.\n\nScope (per handoff §3.3): complete Python eradication for the pilot.\n\nIn scope:\n  - Ingress writer (replaces services/ingress.py)\n  - Generic SENDING-state reconciliation worker (last_chk with\n    cooldown / rate-limiting for operator-stuck SENDING docs).\n    Owned by M5, NOT M3b: M3b carries only the offline-recovery\n    surface required by Phase 6; the general-purpose SENDING\n    reconciler lives here because it is not gated by Phase 6\n    acceptance.\n  - Post-boot reconciliation surface points (the App::boot\n    reconciliation phase itself is in M3a §2; M5 adds long-running\n    post-boot reconciliation hooks)\n  - Operator manual-reconciliation hooks exposed through the CLI\n    surface per ADR D2\n  - cert_provisioning subsystem — gated by ADR open item O2; only\n    if automated key/cert provisioning is required for pilot\n  - retention and shift_aggregation — gated by ADR open item O3;\n    depth depends on pilot duration and reporting requirements\n\nOut of scope for M5 (canonically owned elsewhere):\n  - Backup/restore, key/CA-bundle rotation, rollback rehearsal —\n    parallel docs+ops track per ADR D3; pilot prerequisite, NOT M5\n    implementation acceptance\n  - Web admin UI — out of pilot scope per ADR D2\n\nOpen items blocking M5 sizing:\n  - O2: pilot-scale key/cert provisioning model (automated vs manual)\n  - O3: pilot duration estimate + reporting requirements\n\nAnchored on ADR 2026-05-07-pilot-runtime-decision.md §3.3\n(commit 45aa6f9) and docs/M3-W0-handoff.md §3.3 (commit 1cc5ce5).\n\nBlocked by M4 completion (the next-created epic in this batch).",
+    "acceptance_criteria": "No Python service running in pilot supervisor scope. Generic\nSENDING-state reconciler operational against operator-stuck docs.\nManual-reconcile CLI hook callable end-to-end. cert_provisioning,\nretention, shift_aggregation each either implemented (per O2/O3\nclosure) or explicitly deferred with operator sign-off recorded.\n\nBackup/restore is NOT a component of this acceptance; it is the\nparallel docs+ops track gate per handoff §3.5.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "epic",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-07T16:29:44Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-07T16:29:44Z",
+    "dependencies": [
+      {
+        "issue_id": "PRRO_GATE-9qd.4",
+        "depends_on_id": "PRRO_GATE-9qd",
+        "type": "parent-child",
+        "created_at": "2026-05-07T16:29:43Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "PRRO_GATE-9qd.4",
+        "depends_on_id": "PRRO_GATE-9qd.3",
+        "type": "blocks",
+        "created_at": "2026-05-07T16:30:08Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 1,
+    "comment_count": 0,
+    "parent": "PRRO_GATE-9qd"
+  },
+  {
+    "id": "PRRO_GATE-9qd.3",
+    "title": "M4: Rust ingress + transport bridges",
+    "description": "M4 — third phase of post-M3a Rust-only pilot path.\n\nScope (per handoff §3.2): remove Python ingress shells from the pilot\npath by porting them to Rust.\n\nIn scope:\n  - Rust ingress shells: REST, XML-RPC, Maria-shell (replace\n    scripts/run_rest.py, scripts/run_xmlrpc.py, scripts/run_maria.py)\n  - maria304_driver bridge re-target: from Python REST\n    (reqwest::blocking in spawn_blocking) to in-process Rust gateway\n  - 1С OLE bridge subsystem (sized after operator profile inventory;\n    ADR open item O1)\n\nOpen items blocking M4 sizing (must close before plan writing):\n  - O1: 1С OLE scope on the pilot — operator profile inventory +\n    method whitelist\n\nAnchored on ADR 2026-05-07-pilot-runtime-decision.md §3.2\n(commit 45aa6f9) and docs/M3-W0-handoff.md §3.2 (commit 1cc5ce5).\n\nBlocked by M3b completion (PRRO_GATE-9qd.2).",
+    "acceptance_criteria": "Python ingress shells (run_rest.py, run_xmlrpc.py, run_maria.py) no\nlonger required on pilot host. maria304_driver bridges to in-process\nRust gateway. 1С OLE method whitelist (per O1 closure) implemented in\nRust, OR explicit owner sign-off that 1С is not on the pilot path.\n\nNo Python ingress process in pilot supervisor scope.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "epic",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-07T16:29:15Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-07T16:29:15Z",
+    "dependencies": [
+      {
+        "issue_id": "PRRO_GATE-9qd.3",
+        "depends_on_id": "PRRO_GATE-9qd",
+        "type": "parent-child",
+        "created_at": "2026-05-07T16:29:14Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "PRRO_GATE-9qd.3",
+        "depends_on_id": "PRRO_GATE-9qd.2",
+        "type": "blocks",
+        "created_at": "2026-05-07T16:30:07Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 1,
+    "comment_count": 0,
+    "parent": "PRRO_GATE-9qd"
+  },
+  {
+    "id": "PRRO_GATE-3a8",
+    "title": "Pilot decision: print/export/check URL parity",
+    "description": "WebCheck PrintExportCheck.cs:121 builds receipt URLs (cabinet\nverification links), drives print/export, and exposes the operator-\nfacing rendering surface.  Our M2/M3 has none of this — rendering\nlives in the M5 milestone per the project's CLAUDE.md architecture\nnote.\n\nThis is a pilot-readiness checkpoint:\n\n  - Pilot operators expect printed receipts with the official\n    `https://cabinet.tax.gov.ua/cabinet/faces/login.xhtml#... ` URL\n    (or current equivalent) so the customer can verify the receipt.\n  - Operators may also need PDF / HTML export of the day's receipt\n    set for accounting reconciliation.\n  - WebCheck integrates this into its own print pipeline; we'll\n    need to either match its URL/format conventions or document\n    the divergence to operators.\n\nAcceptance:\n  - Pilot survey: which print/export formats does each pilot\n    operator need?  (ESC-POS thermal, A4 PDF, HTML, none?)\n  - Decision recorded: priority for M5 print/export work.\n  - If \"blocker for pilot\": bumps priority to P1 + lands in M5\n    (or a pilot-only print shim earlier).\n  - If \"deferred\": pilot operators sign off on no-print or use\n    their existing WebCheck-style printer.\n\nEvidence: docs/webcheck_reverse/WebCheckMain/WebCheck/PrintExportCheck.cs:121\n",
+    "acceptance_criteria": "Pilot survey identifies print/export needs per operator; decision recorded; priority bumps to P1 if blocker; M5 print/export milestone scope adjusted accordingly.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-05T22:19:47Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-05T22:19:47Z",
+    "labels": [
+      "architecture",
+      "pilot",
+      "rendering"
+    ],
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "PRRO_GATE-iap",
+    "title": "Pilot decision: WebCheck COM/1C 19-method compatibility",
+    "description": "WebCheckServer exposes a 19-method COM/OLE surface to 1C and other\nWindows clients (vk_WebCheckServer.cs:20-, GetNMethods = 19 at\nvk_WebCheckServer.cs:245).  If a pilot client is still running on\nWebCheck's COM/1C integration, our Rust gateway needs either:\n\n  (a) a compatibility shim — a Windows-side process that exposes the\n      same 19-method COM surface and proxies to the gateway over\n      gRPC / HTTP / IPC, OR\n  (b) a print-only / out-of-band integration where 1C drives the\n      gateway via a different protocol (REST, signed-doc file\n      drop, etc.) and bypasses COM entirely.\n\nToday neither is in M2 scope.  This is a pilot decision, not an\nM2/M3 implementation task.\n\nAcceptance:\n  - Pilot survey: which pilot operators rely on WebCheck COM/1C?\n    (priority bumps to P1 if any do; stays P2 if all pilots can\n    skip COM.)\n  - Decision recorded: shim vs out-of-band.\n  - If shim: separate ADR + scope estimate before commit.\n  - If out-of-band: 1C integration path documented for pilot\n    operators.\n\nEvidence:\n  - docs/webcheck_reverse/WebCheckServer/WebCheckServer/vk_WebCheckServer.cs:20\n  - docs/webcheck_reverse/WebCheckServer/WebCheckServer/vk_WebCheckServer.cs:245\n",
+    "acceptance_criteria": "Pilot survey identifies whether any operator depends on WebCheck COM/1C; decision recorded (shim vs out-of-band); if shim, separate ADR + scope estimate; priority bumps to P1 if any pilot needs it.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-05T22:19:09Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-05T22:19:09Z",
+    "labels": [
+      "architecture",
+      "com",
+      "pilot"
+    ],
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "PRRO_GATE-6r7",
+    "title": "Concurrent race test for IngressInboxRepo idempotency",
+    "description": "Existing tests in rust/prro/tests/repo_ingress_inbox_idempotency.rs prove sequential branches (Created/Replay/Conflict).  Code + with_immediate + UNIQUE(fn, idem_key) make the concurrent claim 'loser sees winner and returns Replay/Conflict' true by construction, but no test exercises the race directly.  Add a tokio multi-thread test that fires N concurrent insert() calls with the same (fn, idem_key) and asserts exactly one Created and N-1 Replays (or Conflicts if hashes differ).",
+    "acceptance_criteria": "tokio multi_thread test fires \u003e=8 concurrent inserts with same (fn, idem_key); exactly one returns Created, the rest Replay; SELECT COUNT(*) = 1 in ingress_inbox",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-04T14:55:31Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-04T14:55:31Z",
+    "dependencies": [
+      {
+        "issue_id": "PRRO_GATE-6r7",
+        "depends_on_id": "PRRO_GATE-82j",
+        "type": "discovered-from",
+        "created_at": "2026-05-05T16:43:16Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "PRRO_GATE-6r7",
+        "depends_on_id": "PRRO_GATE-83s",
+        "type": "discovered-from",
+        "created_at": "2026-05-04T14:55:31Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "PRRO_GATE-1n9",
+    "title": "Type-safe wrappers in IngressInboxRepo (RequestId, InboxStatus)",
+    "description": "rust/prro/src/db/repositories/ingress_inbox.rs uses raw [u8; 16] for request_id and String for status, but T7 already provides RequestId newtype and InboxStatus enum.  Behaviour is correct, but the public API exposes loose primitives.  Convert before any external call site lands (M3 ingress shell).",
+    "acceptance_criteria": "InboxRow.request_id: RequestId, InboxRow.status: InboxStatus, NewInboxEntry.request_id: RequestId; tests updated to typed values; no functional change",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-04T14:55:28Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-04T14:55:28Z",
+    "dependencies": [
+      {
+        "issue_id": "PRRO_GATE-1n9",
+        "depends_on_id": "PRRO_GATE-82j",
+        "type": "discovered-from",
+        "created_at": "2026-05-05T16:43:17Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "PRRO_GATE-1n9",
+        "depends_on_id": "PRRO_GATE-83s",
+        "type": "discovered-from",
+        "created_at": "2026-05-04T14:55:27Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "PRRO_GATE-9qd.6",
+    "title": "M3a tail cleanup — code-hygiene chores carried forward from M3a",
+    "description": "Code-hygiene chores discovered during M3a implementation that are non-functional and explicitly carry-forward.  Created at M3a close (handoff: 79ca2d6) to host the two W6 follow-up items previously parented under PRRO_GATE-9qd.1.\n\nChildren expected at creation: PRRO_GATE-9qd.1.1 (query!/query_scalar! migration for document_files), PRRO_GATE-9qd.1.2 (feature-gate test_hook).\n\nScope intent: discrete code-hygiene PRs, no behavioural change.  Closure happens when each child is completed and merged via its dedicated cleanup PR.  Per docs/M3a-handoff.md §6.2.2 carry-forward sub-rule.",
+    "status": "open",
+    "priority": 3,
+    "issue_type": "epic",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-13T13:37:16Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-13T13:37:16Z",
+    "dependencies": [
+      {
+        "issue_id": "PRRO_GATE-9qd.6",
+        "depends_on_id": "PRRO_GATE-9qd",
+        "type": "parent-child",
+        "created_at": "2026-05-13T13:37:15Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0,
+    "parent": "PRRO_GATE-9qd"
+  },
+  {
+    "id": "PRRO_GATE-9qd.1.2",
+    "title": "W6 follow-up: feature-gate pub mod test_hook + production call site",
+    "description": "Senior Rust review §9 LOW + 3rd-party reviewer LOW/optional: rust/prro/src/services/write_path/stage_sign.rs:139 declares 'pub mod test_hook' unconditionally; rust/prro/src/services/write_path/stage_sign.rs:372 calls 'test_hook::record_persist_first()' on the production hot path. Drifts from frozen W6 spec language 'debug/test-only hook' but is not a functional bug — atomic fetch_add overhead per signed doc is negligible. Cleaner fix: add Cargo feature 'test-hooks', wrap module + call site behind #[cfg(any(test, feature = \"test-hooks\"))]; keep no-op stub when feature absent. Update CI to enable feature for 'cargo test' invocations. Not blocking PR #25.",
+    "status": "open",
+    "priority": 3,
+    "issue_type": "chore",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-09T10:57:59Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-09T10:57:59Z",
+    "dependencies": [
+      {
+        "issue_id": "PRRO_GATE-9qd.1.2",
+        "depends_on_id": "PRRO_GATE-9qd.6",
+        "type": "parent-child",
+        "created_at": "2026-05-13T13:37:48Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0,
+    "parent": "PRRO_GATE-9qd.6"
+  },
+  {
+    "id": "PRRO_GATE-9qd.1.1",
+    "title": "W6 follow-up: convert document_files runtime queries to query!/query_scalar! macros",
+    "description": "Senior Rust review §4 LOW: rust/prro/src/db/repositories/document_files.rs uses sqlx::query / query_scalar (runtime) for insert_tx and get_tx; convert to query!/query_as!/query_scalar! macros for compile-time column-type checks. Requires sqlx prepare regen against the W6 schema (post-migration 009). Not blocking PR #25.",
+    "status": "open",
+    "priority": 3,
+    "issue_type": "chore",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-09T10:57:23Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-09T10:57:23Z",
+    "dependencies": [
+      {
+        "issue_id": "PRRO_GATE-9qd.1.1",
+        "depends_on_id": "PRRO_GATE-9qd.6",
+        "type": "parent-child",
+        "created_at": "2026-05-13T13:37:46Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0,
+    "parent": "PRRO_GATE-9qd.6"
+  },
+  {
+    "id": "PRRO_GATE-u8z",
+    "title": "Workspace hardening: move non-root Cargo profiles to workspace root or remove them",
+    "description": "cargo build/test -p prro emits warnings: profiles for non root package will be ignored for rust/prro_crypto/Cargo.toml and rust/prro_sidecar/Cargo.toml. M1 self-review says cargo build should be clean with zero warnings; current build passes but is not warning-clean. Decide whether those profiles should be moved to rust/Cargo.toml [profile.*] / [profile.*.package.*] or removed from member crates.",
+    "acceptance_criteria": "cargo build -p prro --locked and cargo test -p prro --locked no longer print Cargo warnings about ignored profiles; intended release/profile settings are preserved at workspace root if still needed.",
+    "status": "open",
+    "priority": 3,
+    "issue_type": "task",
+    "owner": "t0673616519@gmail.com",
+    "created_at": "2026-05-04T19:52:58Z",
+    "created_by": "Setter1981",
+    "updated_at": "2026-05-04T19:52:58Z",
+    "dependencies": [
+      {
+        "issue_id": "PRRO_GATE-u8z",
+        "depends_on_id": "PRRO_GATE-82j",
+        "type": "discovered-from",
+        "created_at": "2026-05-05T16:43:15Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "PRRO_GATE-u8z",
+        "depends_on_id": "PRRO_GATE-orl",
+        "type": "discovered-from",
+        "created_at": "2026-05-04T19:52:58Z",
+        "created_by": "Setter1981",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  }
+]

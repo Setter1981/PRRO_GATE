@@ -1,0 +1,65 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-22-rust-hardening.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: S1 — License pubkeys (32 → 33 bytes)",
+      "status": "completed",
+      "description": "**Goal:** Заменить 32-байтовые `.der`-заглушки на реальную тестовую 33-байтовую точку DSTU PB-257; добавить startup-assertion.\n\n**Files:**\n- Modify (binary): `rust/prro_sidecar/src/license_pubkey_current.der`\n- Modify (binary): `rust/prro_sidecar/src/license_pubkey_next.der`\n- Modify: `rust/prro_sidecar/src/license.rs`\n- Modify: `rust/prro_sidecar/src/bin/prro_sidecar.rs`\n\n**Acceptance Criteria:**\n- [ ] Оба `.der`-файла ровно 33 байта, первый байт 0x02 или 0x03\n- [ ] `check_embedded_pubkeys()` паникует при 32-байтовом файле\n- [ ] Тест `pubkey_files_are_33_bytes` проходит\n\n**Verify:** `cargo test -p prro_sidecar pubkey_files_are_33_bytes 2>&1 | tail -10`\n\n```json:metadata\n{\"files\": [\"rust/prro_sidecar/src/license_pubkey_current.der\", \"rust/prro_sidecar/src/license_pubkey_next.der\", \"rust/prro_sidecar/src/license.rs\", \"rust/prro_sidecar/src/bin/prro_sidecar.rs\"], \"verifyCommand\": \"cargo test -p prro_sidecar pubkey_files_are_33_bytes 2>&1 | tail -10\", \"acceptanceCriteria\": [\"both .der files are exactly 33 bytes\", \"first byte is 0x02 or 0x03\", \"check_embedded_pubkeys() panics on 32-byte file\", \"test pubkey_files_are_33_bytes passes\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: S2 — Envelope integrity (schema_version allowlist + payload_sha256)",
+      "status": "completed",
+      "blockedBy": [1],
+      "description": "**Goal:** Добавить `validate_envelope()` с проверкой `schema_version` и `payload_sha256`; вызвать из `fiscal_send_inner`.\n\n**Files:**\n- Modify: `rust/prro_sidecar/src/lib.rs`\n- Modify: `rust/prro_sidecar/src/errors.rs`\n- Modify: `rust/prro_sidecar/src/bin/prro_sidecar.rs`\n- Modify: `rust/prro_sidecar/tests/wiring_date_time.rs`\n\n**Acceptance Criteria:**\n- [ ] `schema_version` не из `[\"1.0\"]` → HTTP 400\n- [ ] `payload_sha256` непустой + несовпадающий → rejected\n- [ ] Правильный SHA-256 проходит\n- [ ] 4 теста `envelope_integrity` проходят\n\n**Verify:** `cargo test -p prro_sidecar envelope_integrity 2>&1 | tail -15`\n\n```json:metadata\n{\"files\": [\"rust/prro_sidecar/src/lib.rs\", \"rust/prro_sidecar/src/errors.rs\", \"rust/prro_sidecar/src/bin/prro_sidecar.rs\", \"rust/prro_sidecar/tests/wiring_date_time.rs\"], \"verifyCommand\": \"cargo test -p prro_sidecar envelope_integrity 2>&1 | tail -15\", \"acceptanceCriteria\": [\"unknown schema_version rejected with 400\", \"mismatched payload_sha256 rejected\", \"correct sha256 passes\", \"4 tests pass\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: S3 — DPS status classifier wire-up в fiscal_send_inner",
+      "status": "completed",
+      "blockedBy": [2],
+      "description": "**Goal:** Вызвать `classify_dps_status()` после gRPC-ответа; добавить `dps_error_category` в `FiscalSendResponse`.\n\n**Files:**\n- Modify: `rust/prro_sidecar/src/bin/prro_sidecar.rs`\n- Modify: `rust/prro_sidecar/tests/wiring_date_time.rs`\n\n**Acceptance Criteria:**\n- [ ] `FiscalSendResponse` содержит `dps_error_category: Option<String>`\n- [ ] status=1 → null, status=-3 → \"transient\", status=-1 → \"permanent\"\n- [ ] 5 тестов `dps_classifier_wire` проходят\n\n**Verify:** `cargo test -p prro_sidecar dps_classifier_wire 2>&1 | tail -10`\n\n```json:metadata\n{\"files\": [\"rust/prro_sidecar/src/bin/prro_sidecar.rs\", \"rust/prro_sidecar/tests/wiring_date_time.rs\"], \"verifyCommand\": \"cargo test -p prro_sidecar dps_classifier_wire 2>&1 | tail -10\", \"acceptanceCriteria\": [\"FiscalSendResponse has dps_error_category field\", \"status=1 → null\", \"status=-3 → transient\", \"status=-1 → permanent\", \"5 tests pass\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: S4 — Idempotency journal (sidecar_requests table)",
+      "status": "completed",
+      "blockedBy": [3],
+      "description": "**Goal:** Создать таблицу `sidecar_requests` в SQLite; проверять idempotency_key в `fiscal_send_inner` до выделения local_number.\n\n**Files:**\n- Modify: `rust/prro_sidecar/src/repo.rs`\n- Modify: `rust/prro_sidecar/src/bin/prro_sidecar.rs`\n- Modify: `rust/prro_sidecar/tests/wiring_date_time.rs`\n\n**Acceptance Criteria:**\n- [ ] Таблица `sidecar_requests(idempotency_key PK, fiscal_number, response_json, created_at)` создаётся\n- [ ] `find_idempotent_response(key)` → `Some(json)` при дубликате\n- [ ] `fiscal_send_inner` возвращает кэш без DPS при дубликате\n- [ ] 3 repo-теста + source-level guard проходят\n\n**Verify:** `cargo test -p prro_sidecar idempotency 2>&1 | tail -15`\n\n```json:metadata\n{\"files\": [\"rust/prro_sidecar/src/repo.rs\", \"rust/prro_sidecar/src/bin/prro_sidecar.rs\", \"rust/prro_sidecar/tests/wiring_date_time.rs\"], \"verifyCommand\": \"cargo test -p prro_sidecar idempotency 2>&1 | tail -15\", \"acceptanceCriteria\": [\"sidecar_requests table created in Repo::open()\", \"find_idempotent_response returns cached json\", \"fiscal_send_inner skips DPS on duplicate key\", \"3 repo tests pass\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: M1 — submit_report() resp.ok check",
+      "status": "completed",
+      "description": "**Goal:** В `dispatcher.rs::submit_report()` проверять `resp.ok`; вернуть mapped error при `ok=false`.\n\n**Files:**\n- Modify: `rust/maria304_driver/src/session/dispatcher.rs`\n- Modify: `rust/maria304_driver/src/bridge/mock.rs`\n- Modify: `rust/maria304_driver/src/bridge/mod.rs`\n- Modify: `rust/maria304_driver/tests/bridge_acceptance.rs`\n\n**Acceptance Criteria:**\n- [ ] `submit_report()` при `Ok(resp)` где `resp.ok=false` возвращает `err(...)`\n- [ ] При `ok=true` поведение не изменилось\n- [ ] Тест `submit_report_bridge_ok_false_returns_bridge_error` проходит\n\n**Verify:** `cargo test -p maria304_driver submit_report 2>&1 | tail -10`\n\n```json:metadata\n{\"files\": [\"rust/maria304_driver/src/session/dispatcher.rs\", \"rust/maria304_driver/src/bridge/mock.rs\", \"rust/maria304_driver/src/bridge/mod.rs\", \"rust/maria304_driver/tests/bridge_acceptance.rs\"], \"verifyCommand\": \"cargo test -p maria304_driver submit_report 2>&1 | tail -10\", \"acceptanceCriteria\": [\"submit_report returns error on ok=false\", \"ok=true behaviour unchanged\", \"test passes\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: M2 — Startup duplicate FN/bind validation",
+      "status": "completed",
+      "description": "**Goal:** Добавить `check_no_duplicates()` в `maria304_driver.rs`; вызвать до первого `tokio::spawn`.\n\n**Files:**\n- Modify: `rust/maria304_driver/src/bin/maria304_driver.rs`\n\n**Acceptance Criteria:**\n- [ ] Дубликат `fiscal_number` → `exit(1)` с описанием\n- [ ] Дубликат `bind` → `exit(1)` с описанием\n- [ ] Уникальные конфиги проходят\n- [ ] 3 теста `startup_validation_tests` проходят\n\n**Verify:** `cargo test -p maria304_driver duplicate 2>&1 | tail -10`\n\n```json:metadata\n{\"files\": [\"rust/maria304_driver/src/bin/maria304_driver.rs\"], \"verifyCommand\": \"cargo test -p maria304_driver duplicate 2>&1 | tail -10\", \"acceptanceCriteria\": [\"duplicate fiscal_number causes exit(1)\", \"duplicate bind causes exit(1)\", \"unique configs pass\", \"3 unit tests pass\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: M3 — Graceful shutdown с CancellationToken",
+      "status": "completed",
+      "description": "**Goal:** Заменить `ctrl_c().await; Ok(())` на shutdown через `CancellationToken` + `graceful_shutdown_timeout_s`.\n\n**Files:**\n- Modify: `rust/maria304_driver/Cargo.toml`\n- Modify: `rust/maria304_driver/src/bin/maria304_driver.rs`\n- Modify: `rust/maria304_driver/src/listener/server.rs`\n- Modify: `rust/maria304_driver/src/listener/session_loop.rs`\n- Create: `rust/maria304_driver/tests/graceful_shutdown.rs`\n\n**Acceptance Criteria:**\n- [ ] `tokio-util` добавлен в Cargo.toml\n- [ ] `serve(token: CancellationToken)` принимает токен\n- [ ] `run_connection` завершается при cancel\n- [ ] `graceful_shutdown_timeout_s` используется\n- [ ] Тест `cancellation_token_stops_waiting_task` проходит\n\n**Verify:** `cargo test -p maria304_driver cancellation 2>&1 | tail -10`\n\n```json:metadata\n{\"files\": [\"rust/maria304_driver/Cargo.toml\", \"rust/maria304_driver/src/bin/maria304_driver.rs\", \"rust/maria304_driver/src/listener/server.rs\", \"rust/maria304_driver/src/listener/session_loop.rs\", \"rust/maria304_driver/tests/graceful_shutdown.rs\"], \"verifyCommand\": \"cargo test -p maria304_driver cancellation 2>&1 | tail -10\", \"acceptanceCriteria\": [\"tokio-util added to Cargo.toml\", \"serve() accepts CancellationToken\", \"run_connection terminates on cancel\", \"graceful_shutdown_timeout_s used\", \"test passes\"]}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 8: M4 — Metrics wiring через FnListener → session_loop",
+      "status": "completed",
+      "blockedBy": [7],
+      "description": "**Goal:** Передать `Arc<SessionMetrics>` через `FnListener::new` → `run_connection`; вызывать `record_*` методы.\n\n**Files:**\n- Modify: `rust/maria304_driver/src/listener/server.rs`\n- Modify: `rust/maria304_driver/src/listener/session_loop.rs`\n- Modify: `rust/maria304_driver/src/bin/maria304_driver.rs`\n\n**Acceptance Criteria:**\n- [ ] `FnListener::new(cfg, bridge, clock, metrics)` принимает metrics\n- [ ] `run_connection` вызывает `record_inbound_frame()` и `record_outbound_frame()`\n- [ ] `main()` передаёт `Arc::clone(&metrics)` в `FnListener::new`\n- [ ] Тест проходит\n\n**Verify:** `cargo test -p maria304_driver metrics_counted 2>&1 | tail -10`\n\n```json:metadata\n{\"files\": [\"rust/maria304_driver/src/listener/server.rs\", \"rust/maria304_driver/src/listener/session_loop.rs\", \"rust/maria304_driver/src/bin/maria304_driver.rs\"], \"verifyCommand\": \"cargo test -p maria304_driver metrics_counted 2>&1 | tail -10\", \"acceptanceCriteria\": [\"FnListener::new accepts Arc<SessionMetrics>\", \"run_connection calls record_inbound_frame and record_outbound_frame\", \"main() passes metrics to FnListener\", \"test passes\"]}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 9: M5 — spawn_blocking для синхронных bridge-вызовов",
+      "status": "completed",
+      "blockedBy": [8],
+      "description": "**Goal:** Вынести блокирующий `bridge.submit()` из async `run_connection` в `tokio::task::spawn_blocking`.\n\n**Files:**\n- Modify: `rust/maria304_driver/src/session/dispatcher.rs`\n- Modify: `rust/maria304_driver/src/listener/session_loop.rs`\n- Create: `rust/maria304_driver/tests/spawn_blocking.rs`\n\n**Acceptance Criteria:**\n- [ ] `dispatch_prepare()` строит конверт без вызова bridge\n- [ ] `dispatch_with_result()` обрабатывает результат\n- [ ] `bridge.submit()` вызывается в `spawn_blocking`\n- [ ] Все существующие тесты проходят\n\n**Verify:** `cargo test -p maria304_driver spawn_blocking 2>&1 | tail -10`\n\n```json:metadata\n{\"files\": [\"rust/maria304_driver/src/session/dispatcher.rs\", \"rust/maria304_driver/src/listener/session_loop.rs\", \"rust/maria304_driver/tests/spawn_blocking.rs\"], \"verifyCommand\": \"cargo test -p maria304_driver spawn_blocking 2>&1 | tail -10\", \"acceptanceCriteria\": [\"dispatch_prepare() returns envelope without calling bridge\", \"dispatch_with_result() handles bridge result\", \"bridge.submit() wrapped in spawn_blocking\", \"all existing tests pass\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-04-22T23:59:00Z"
+}

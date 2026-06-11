@@ -66,3 +66,10 @@ czo_test/
 # Local environment configs — dev/local secrets, NEVER commit (ship ops/config.example.yaml only)
 ops/config.local.yaml
 *.local.yaml
+
+# Local Claude agent state at any depth (the anchored patterns above only
+# match the repo root) + local scratch / alt-tool build dirs.
+**/.claude/agent-memory/
+**/.claude/settings.local.json
+scratch/
+rust/target-codex/

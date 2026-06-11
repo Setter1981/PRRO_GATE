@@ -1,0 +1,74 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-25-submission-channel.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: SubmissionChannel enum + canonical model + AdapterContext",
+      "status": "pending",
+      "description": "**Goal:** Introduce SubmissionChannel enum and add it as a required field to CanonicalFiscalCommand and AdapterContext. Make channel_owner non-nullable.\n\n**Files:**\n- Modify: src/prro_gateway/models/canonical.py\n- Modify: src/prro_gateway/adapters/base.py:23-31\n- Test: tests/test_submission_channel_required.py (new)\n\n**Verify:** pytest tests/test_submission_channel_required.py -v\n\n```json:metadata\n{\"files\":[\"src/prro_gateway/models/canonical.py\",\"src/prro_gateway/adapters/base.py\",\"tests/test_submission_channel_required.py\"],\"verifyCommand\":\"pytest tests/test_submission_channel_required.py -v\",\"acceptanceCriteria\":[\"SubmissionChannel enum has exactly two values\",\"CanonicalFiscalCommand requires submission_channel\",\"CanonicalFiscalCommand rejects empty channel_owner\",\"AdapterContext requires submission_channel\",\"AdapterContext rejects None channel_owner\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Configuration changes",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Make defaults.submission_channel required in config schema; drop the runtime default for channel_owner.\n\n**Files:**\n- Modify: src/prro_gateway/config.py\n- Modify: ops/config.example.yaml\n- Test: tests/test_config.py\n\n**Verify:** pytest tests/test_config.py -v\n\n```json:metadata\n{\"files\":[\"src/prro_gateway/config.py\",\"ops/config.example.yaml\",\"tests/test_config.py\"],\"verifyCommand\":\"pytest tests/test_config.py -v\",\"acceptanceCriteria\":[\"DefaultsConfig.submission_channel required\",\"DefaultsConfig.channel_owner has no default\",\"Loading YAML without submission_channel fails ValidationError\",\"ops/config.example.yaml contains submission_channel\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Migration runner post-step convention",
+      "status": "pending",
+      "description": "**Goal:** Extend migration runner to discover and run post_<NNN>_<name>.py via runpy.run_path() after SQL applies. Combined checksum recorded.\n\n**Files:**\n- Modify: src/prro_gateway/migrations/runner.py\n- Test: tests/test_migration_runner.py\n\n**Verify:** pytest tests/test_migration_runner.py -v\n\n```json:metadata\n{\"files\":[\"src/prro_gateway/migrations/runner.py\",\"tests/test_migration_runner.py\"],\"verifyCommand\":\"pytest tests/test_migration_runner.py -v\",\"acceptanceCriteria\":[\"Runner discovers post_<NNN>_<name>.py files\",\"Post-step loaded via runpy.run_path()\",\"Aborts when app_config is None\",\"Combined checksum recorded\",\"Migration without post-step works unchanged\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Migration 025 + ChannelLock + shifts repository",
+      "status": "pending",
+      "blockedBy": [1, 2, 3],
+      "description": "**Goal:** Land schema migration (FK-aware rebuild + post-step), update ChannelLock to single field, rewrite get_channel_lock and open_shift to use opened_via_submission_channel.\n\n**Files:**\n- Create: sql/025_submission_channel.sql\n- Create: src/prro_gateway/migrations/post_025_submission_channel.py\n- Modify: src/prro_gateway/models/storage.py\n- Modify: src/prro_gateway/repositories/shifts.py\n- Modify: src/prro_gateway/repositories/inbox.py\n- Test: tests/test_migration_025_submission_channel.py\n\n**Verify:** pytest tests/test_migration_025_submission_channel.py tests/test_repository.py -v\n\n```json:metadata\n{\"files\":[\"sql/025_submission_channel.sql\",\"src/prro_gateway/migrations/post_025_submission_channel.py\",\"src/prro_gateway/models/storage.py\",\"src/prro_gateway/repositories/shifts.py\",\"src/prro_gateway/repositories/inbox.py\",\"tests/test_migration_025_submission_channel.py\"],\"verifyCommand\":\"pytest tests/test_migration_025_submission_channel.py tests/test_repository.py -v\",\"acceptanceCriteria\":[\"Migration applies cleanly to fresh schema\",\"All 5 pre-flight asserts fire\",\"NOT NULL submission_channel on transport_profiles, shifts, ingress_inbox\",\"CHECKBOX_CLOUD_COMPAT removed from backend_type CHECK\",\"ChannelLock has only submission_channel + acquired_at\",\"get_channel_lock reads opened_via_submission_channel\",\"inbox.py drops runtime fallback\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Write_path shift guard + pre-sign mismatch check",
+      "status": "pending",
+      "blockedBy": [4],
+      "description": "**Goal:** Replace 4-field _channel_matches with single-field; delete _resolve_channel_lock_dimensions; add channel-vs-transport mismatch guard at validate stage (before sign); update _handle_shift_open.\n\n**Files:**\n- Modify: src/prro_gateway/services/write_path.py\n- Modify: src/prro_gateway/services/reconciliation.py\n- Modify: src/prro_gateway/enums.py\n- Test: tests/test_submission_channel_lock.py\n- Test: tests/test_shift_open_writes_submission_channel.py\n- Test: tests/test_shift_audit_fields_immutable.py\n\n**Verify:** pytest tests/test_submission_channel_lock.py tests/test_shift_open_writes_submission_channel.py tests/test_shift_audit_fields_immutable.py -v\n\n```json:metadata\n{\"files\":[\"src/prro_gateway/services/write_path.py\",\"src/prro_gateway/services/reconciliation.py\",\"src/prro_gateway/enums.py\",\"tests/test_submission_channel_lock.py\",\"tests/test_shift_open_writes_submission_channel.py\",\"tests/test_shift_audit_fields_immutable.py\"],\"verifyCommand\":\"pytest tests/test_submission_channel_lock.py tests/test_shift_open_writes_submission_channel.py tests/test_shift_audit_fields_immutable.py -v\",\"acceptanceCriteria\":[\"_channel_matches and _resolve_channel_lock_dimensions deleted\",\"Shift guard rejects channel mismatch\",\"Same channel different profile mid-shift succeeds\",\"Pre-sign mismatch returns SUBMISSION_CHANNEL_TRANSPORT_MISMATCH\",\"_handle_shift_open writes opened_via_submission_channel\",\"Reconciliation NULL handling marks REQUIRES_MANUAL_RECONCILIATION\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: Router defense-in-depth + delete outbound checkbox",
+      "status": "pending",
+      "blockedBy": [5],
+      "description": "**Goal:** Add channel mismatch check to router as defense-in-depth. Delete outbound Checkbox transport. Remove all CHECKBOX_REST_TRANSPORT / CHECKBOX_CLOUD_COMPAT registrations.\n\n**Files:**\n- Modify: src/prro_gateway/transports/router.py\n- Delete: src/prro_gateway/transports/checkbox_rest.py\n- Delete: tests/test_checkbox_transport.py (if exists)\n- Modify: src/prro_gateway/runtime/container.py\n- Test: tests/test_router_channel_mismatch.py\n\n**Verify:** pytest tests/test_router_channel_mismatch.py -v\n\n```json:metadata\n{\"files\":[\"src/prro_gateway/transports/router.py\",\"src/prro_gateway/transports/checkbox_rest.py\",\"tests/test_checkbox_transport.py\",\"src/prro_gateway/runtime/container.py\",\"tests/test_router_channel_mismatch.py\"],\"verifyCommand\":\"pytest tests/test_router_channel_mismatch.py -v\",\"acceptanceCriteria\":[\"Router raises SubmissionChannelTransportMismatch on mismatch\",\"transports/checkbox_rest.py deleted\",\"tests/test_checkbox_transport.py deleted\",\"No CHECKBOX_REST_TRANSPORT or CHECKBOX_CLOUD_COMPAT in src/\",\"grep verification passes\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: channel_policy boot validators + RuntimeContainer wiring",
+      "status": "pending",
+      "blockedBy": [5, 6],
+      "description": "**Goal:** Create runtime/channel_policy.py with endpoint whitelist and binding-consistency validators. Wire both into RuntimeContainer.initialize() before health.ready. Provide shared assert_command_transport_channel_match helper.\n\n**Files:**\n- Create: src/prro_gateway/runtime/channel_policy.py\n- Modify: src/prro_gateway/runtime/container.py\n- Modify: src/prro_gateway/services/write_path.py\n- Modify: src/prro_gateway/transports/router.py\n- Test: tests/test_boot_endpoint_whitelist.py\n- Test: tests/test_boot_binding_consistency.py\n\n**Verify:** pytest tests/test_boot_endpoint_whitelist.py tests/test_boot_binding_consistency.py -v\n\n```json:metadata\n{\"files\":[\"src/prro_gateway/runtime/channel_policy.py\",\"src/prro_gateway/runtime/container.py\",\"src/prro_gateway/services/write_path.py\",\"src/prro_gateway/transports/router.py\",\"tests/test_boot_endpoint_whitelist.py\",\"tests/test_boot_binding_consistency.py\"],\"verifyCommand\":\"pytest tests/test_boot_endpoint_whitelist.py tests/test_boot_binding_consistency.py -v\",\"acceptanceCriteria\":[\"validate_transport_profiles accepts canonical hosts\",\"Rejects unknown hosts and IP literals\",\"validate_bindings_consistency rejects multi-channel fiscal_number\",\"Both validators run before health.ready\",\"Shared helper used by write_path + router\"]}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 8: Adapter / shell wiring",
+      "status": "pending",
+      "blockedBy": [1, 2],
+      "description": "**Goal:** Update IngressService.build_context() to require submission_channel. Update each ingress shell to pass it from config. Update maria304_native.py.\n\n**Files:**\n- Modify: src/prro_gateway/services/ingress.py:85-107\n- Modify: src/prro_gateway/runtime/rest_app.py\n- Modify: src/prro_gateway/runtime/xmlrpc_shell.py\n- Modify: src/prro_gateway/runtime/maria_shell.py\n- Modify: src/prro_gateway/adapters/maria304_native.py:154-159\n- Test: tests/test_channel_owner_required.py\n\n**Verify:** pytest tests/test_channel_owner_required.py tests/test_runtime_*.py -v\n\n```json:metadata\n{\"files\":[\"src/prro_gateway/services/ingress.py\",\"src/prro_gateway/runtime/rest_app.py\",\"src/prro_gateway/runtime/xmlrpc_shell.py\",\"src/prro_gateway/runtime/maria_shell.py\",\"src/prro_gateway/adapters/maria304_native.py\",\"tests/test_channel_owner_required.py\"],\"verifyCommand\":\"pytest tests/test_channel_owner_required.py tests/test_runtime_*.py -v\",\"acceptanceCriteria\":[\"build_context requires submission_channel\",\"All 3 shells pass submission_channel from config\",\"maria304_native receives submission_channel via constructor\",\"Adapter rejects empty channel_owner before inbox write\"]}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 9: Test fixture mass update + remaining test files",
+      "status": "pending",
+      "blockedBy": [7, 8],
+      "description": "**Goal:** Update all test fixtures and helpers to include submission_channel and a real channel_owner. ~50 test files; most need only fixture-keyword additions; tests/test_gate1f_channel_lock.py and tests/test_gate1u_channel_lock_persistence.py need behavioral rewrites.\n\n**Files:**\n- Modify: tests/conftest.py\n- Modify: ~48 other test files\n- Modify: tests/test_gate1f_channel_lock.py\n- Modify: tests/test_gate1u_channel_lock_persistence.py\n- Modify: tests/test_pilot_smoke.py\n\n**Verify:** pytest tests/ --tb=no -q\n\n```json:metadata\n{\"files\":[\"tests/conftest.py\",\"tests/test_gate1f_channel_lock.py\",\"tests/test_gate1u_channel_lock_persistence.py\",\"tests/test_pilot_smoke.py\"],\"verifyCommand\":\"pytest tests/ --tb=no -q\",\"acceptanceCriteria\":[\"pytest tests/ returns 0 failed\",\"No test passes channel_owner=None\",\"No test omits submission_channel keyword\",\"Channel-lock tests rewritten to single-field semantics\"]}\n```"
+    },
+    {
+      "id": 10,
+      "subject": "Task 10: Documentation + CLAUDE.md FI-10 update",
+      "status": "pending",
+      "blockedBy": [9],
+      "description": "**Goal:** Update CLAUDE.md (project root + .claude/) FI-10 wording. Remove outbound-Checkbox references from current-state docs. Add changelog/roadmap note about mid-shift backend_profile_id swap.\n\n**Files:**\n- Modify: CLAUDE.md\n- Modify: .claude/CLAUDE.md\n- Modify: docs/Multi-Protocol_PRRO_Gateway.md\n- Modify: docs/PROJECT_DOCUMENTATION_AND_SPRINT_PLAN.md\n- Modify: docs/ROADMAP_v3_PILOT.md\n- Modify: docs/OPERATIONS.md\n\n**Verify:** Manual review + grep\n\n```json:metadata\n{\"files\":[\"CLAUDE.md\",\".claude/CLAUDE.md\",\"docs/Multi-Protocol_PRRO_Gateway.md\",\"docs/PROJECT_DOCUMENTATION_AND_SPRINT_PLAN.md\",\"docs/ROADMAP_v3_PILOT.md\",\"docs/OPERATIONS.md\"],\"verifyCommand\":\"grep -rn 'CHECKBOX_CLOUD_COMPAT\\\\|CHECKBOX_REST_TRANSPORT' docs/Multi-Protocol_PRRO_Gateway.md docs/PROJECT_DOCUMENTATION_AND_SPRINT_PLAN.md docs/ROADMAP_v3_PILOT.md\",\"acceptanceCriteria\":[\"FI-10 updated in both CLAUDE.md files\",\"docs grep returns 0 hits\",\"OPERATIONS.md notes mid-shift profile swap behavior change\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-04-25T12:00:00Z"
+}
