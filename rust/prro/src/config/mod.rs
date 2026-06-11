@@ -416,6 +416,14 @@ pub struct BackupCfg {
     /// within the keep_last window OR younger than `max_age_days`).
     #[serde(default = "default_backup_max_age_days")]
     pub max_age_days: u64,
+    /// PR-B (RS-4) — boot stale-tip guard master switch.  `true` (default):
+    /// on each boot, per FN with runtime deps and a non-empty ACK tail, the
+    /// node verifies its last ACK doc's `server_fiscal_no` against DPS
+    /// (`lastChk`) and BLOCKS itself on divergence (stale restore / foreign
+    /// fiscalisation).  `false`: kill-switch for false positives in the
+    /// field — guard short-circuits with an INFO log, zero wire, zero audit.
+    #[serde(default = "default_backup_tip_guard_enabled")]
+    pub tip_guard_enabled: bool,
 }
 
 impl Default for BackupCfg {
@@ -428,6 +436,7 @@ impl Default for BackupCfg {
             interval_seconds: default_backup_interval_seconds(),
             keep_last: default_backup_keep_last(),
             max_age_days: default_backup_max_age_days(),
+            tip_guard_enabled: default_backup_tip_guard_enabled(),
         }
     }
 }
@@ -446,6 +455,9 @@ fn default_backup_keep_last() -> usize {
 }
 fn default_backup_max_age_days() -> u64 {
     14
+}
+fn default_backup_tip_guard_enabled() -> bool {
+    true
 }
 
 /// Inclusive clamp bounds for the backup snapshot cadence (5 min … 1 day).

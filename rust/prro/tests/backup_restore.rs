@@ -8,6 +8,7 @@ mod common;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -19,7 +20,7 @@ use prro::db::models::ids::{RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::{open_pool, open_secure_pool};
-use prro::services::reconciliation::{boot_phase, ReconcileGuard};
+use prro::services::reconciliation::{boot_phase, ReconcileGuard, RuntimeView};
 use prro::services::write_path::inline;
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
@@ -269,6 +270,11 @@ async fn verify_rejects_corrupt_snapshot() {
 struct DpsStub {
     send_q: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
     last_q: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
+    /// PR-B (tip-guard) — wire-call counters so the guard tests can assert
+    /// "send == 0 on boot" (nothing re-sent) and "zero wire" (guard skipped /
+    /// kill-switched) without relying on the empty-queue panic alone.
+    send_calls: AtomicUsize,
+    last_calls: AtomicUsize,
 }
 
 impl DpsStub {
@@ -276,6 +282,8 @@ impl DpsStub {
         Self {
             send_q: Mutex::new(VecDeque::new()),
             last_q: Mutex::new(VecDeque::new()),
+            send_calls: AtomicUsize::new(0),
+            last_calls: AtomicUsize::new(0),
         }
     }
     fn push_send(&self, r: Result<CheckAck, DpsError>) {
@@ -284,11 +292,18 @@ impl DpsStub {
     fn push_last(&self, r: Result<CheckAck, DpsError>) {
         self.last_q.lock().unwrap().push_back(r);
     }
+    fn send_calls(&self) -> usize {
+        self.send_calls.load(Ordering::SeqCst)
+    }
+    fn last_calls(&self) -> usize {
+        self.last_calls.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
 impl DpsChannel for DpsStub {
     async fn send_chk(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        self.send_calls.fetch_add(1, Ordering::SeqCst);
         self.send_q
             .lock()
             .unwrap()
@@ -296,6 +311,7 @@ impl DpsChannel for DpsStub {
             .expect("send_q empty")
     }
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
+        self.last_calls.fetch_add(1, Ordering::SeqCst);
         self.last_q
             .lock()
             .unwrap()
@@ -527,4 +543,343 @@ async fn backup_pass_swallows_failure_and_continues() {
     let good = tempfile::tempdir().unwrap();
     let ok = backup::snapshot_and_prune(&pool, &db_path, good.path(), "main", 30, 14).await;
     assert!(ok.is_some(), "a healthy pass produces a snapshot");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PR-B — boot stale-tip guard (spec §B-3, tests 8-12).
+//
+// The guard runs per FN, AFTER `run_boot_reconciliation` (arm-ups), when
+// runtime deps are present and the FN has a non-empty ACK tail.  It takes the
+// last (max-lnd) ACK doc's `server_fiscal_no`, reuses `last_chk_probe::probe`
+// against DPS, and on divergence flips `node_state.mode → BLOCKED` (existing
+// W10.3 setter) + a CRITICAL `TIP_GUARD_STALE_LEDGER` audit.  It NEVER mutates
+// document state and NEVER re-sends — detect + block + audit only.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Like [`issue_receipt_to_ack`] but with a caller-chosen DPS server fiscal
+/// number, so a test can mint two ACK docs with DISTINCT `server_fiscal_no`
+/// (needed to drive a tip-guard Mismatch after a stale restore).
+async fn issue_receipt_to_ack_sfn(
+    pool: &SqlitePool,
+    pool_secure: &SqlitePool,
+    n: i64,
+    server_fiscal_no: &str,
+) {
+    let row = seed_inbox_sell(pool, n).await;
+    let stub = DpsStub::new();
+    // send + online-confirm lastChk both carry the same wire id, so the
+    // online write-path advances the doc to terminal ACK with this sfn.
+    stub.push_send(Ok(ack(server_fiscal_no, vec![])));
+    stub.push_last(Ok(ack(server_fiscal_no, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+    let outcome = inline::run(pool, pool_secure, &stub, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .unwrap_or_else(|e| panic!("receipt {n} (sfn {server_fiscal_no}) must reach ACK: {e:?}"));
+    assert_eq!(outcome.document_state, DocState::Ack, "receipt {n} → ACK");
+}
+
+/// One online FN with an open shift, ready to issue receipts.  Keeps the
+/// `TempDir` guards alive (drop = cleanup) for the test's lifetime.
+struct GuardEnv {
+    _dir: tempfile::TempDir,
+    _sec_dir: tempfile::TempDir,
+    db_path: PathBuf,
+    pool: SqlitePool,
+    pool_secure: SqlitePool,
+}
+
+async fn setup_online_fn(name: &str) -> GuardEnv {
+    let (dir, db_path, pool) = fresh_db(name).await;
+    let sec_dir = tempfile::tempdir().unwrap();
+    let pool_secure = open_secure_pool(&sec_dir.path().join("secure.db"))
+        .await
+        .unwrap();
+    seed_fn_config_full(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_online(&pool, shift_id).await;
+    GuardEnv {
+        _dir: dir,
+        _sec_dir: sec_dir,
+        db_path,
+        pool,
+        pool_secure,
+    }
+}
+
+async fn node_mode(pool: &SqlitePool) -> String {
+    sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+        .bind(FN)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn count_audit_like(pool: &SqlitePool, event_like: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE event_type LIKE ?")
+        .bind(event_like)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 8 (KEY) — stale-restore detect e2e: ACK#1 → snapshot → ACK#2 → restore
+// (ledger knows only #1) → boot with lastChk = sfn#2 → Mismatch → BLOCKED,
+// CRITICAL audit present, send == 0 (nothing re-sent).
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tip_guard_stale_restore_blocks_node_e2e() {
+    let env = setup_online_fn("live.db").await;
+
+    // ACK#1 (sfn SFN-1) → snapshot (backup knows only #1).
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 1, "SFN-1").await;
+    let backup_dir = tempfile::tempdir().unwrap();
+    let report = snapshot(&env.pool, &env.db_path, backup_dir.path(), "main")
+        .await
+        .expect("snapshot after receipt #1");
+
+    // ACK#2 (sfn SFN-2) on the LIVE DB — DPS has now moved on to SFN-2.
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 2, "SFN-2").await;
+
+    // "Disk death" → restore the snapshot to a NEW path (knows only SFN-1).
+    let restore_dir = tempfile::tempdir().unwrap();
+    let restored_db = restore_dir.path().join("restored.db");
+    std::fs::copy(&report.path, &restored_db).expect("copy snapshot into place");
+    let restored = open_pool(&restored_db).await.expect("open restored DB");
+
+    // Boot: arm-ups first (the restored DB has no pending docs → branch (b),
+    // zero wire), then the tip-guard with a stub whose lastChk reports SFN-2
+    // (DPS is ahead of our restored tip SFN-1).
+    let stub = DpsStub::new();
+    stub.push_last(Ok(ack("SFN-2", vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    boot_phase::run_boot_reconciliation(&recon_guard(), &restored, FN, Some(&view))
+        .await
+        .expect("arm-ups succeed on the restored DB");
+    let outcome = boot_phase::run_boot_tip_guard(&recon_guard(), &restored, FN, &view, true)
+        .await
+        .expect("tip-guard runs");
+
+    assert!(
+        matches!(outcome, boot_phase::TipGuardOutcome::Blocked { .. }),
+        "stale restore must classify as Blocked, got {outcome:?}"
+    );
+    assert_eq!(
+        node_mode(&restored).await,
+        "BLOCKED",
+        "stale-restore detection must flip the node to BLOCKED"
+    );
+    assert_eq!(
+        stub.send_calls(),
+        0,
+        "guard must NOT re-send anything on boot"
+    );
+    assert_eq!(
+        stub.last_calls(),
+        1,
+        "guard issues exactly one lastChk probe"
+    );
+    let crit: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'TIP_GUARD_STALE_LEDGER' AND severity = 'CRITICAL'",
+    )
+    .fetch_one(&restored)
+    .await
+    .unwrap();
+    assert_eq!(
+        crit, 1,
+        "exactly one CRITICAL TIP_GUARD_STALE_LEDGER audit row"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 9 — happy tip: tail ACK#2 + lastChk = sfn#2 → Match → mode untouched,
+// INFO audit.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tip_guard_happy_tip_match_leaves_node_untouched() {
+    let env = setup_online_fn("live.db").await;
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 1, "SFN-1").await;
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 2, "SFN-2").await;
+
+    // DPS agrees: its latest check is SFN-2, matching our last (max-lnd) ACK.
+    let stub = DpsStub::new();
+    stub.push_last(Ok(ack("SFN-2", vec![])));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let outcome = boot_phase::run_boot_tip_guard(&recon_guard(), &env.pool, FN, &view, true)
+        .await
+        .expect("tip-guard runs");
+
+    assert!(
+        matches!(outcome, boot_phase::TipGuardOutcome::TipConsistent),
+        "matching tip must classify as TipConsistent, got {outcome:?}"
+    );
+    assert_eq!(
+        node_mode(&env.pool).await,
+        "ONLINE",
+        "a consistent tip must leave node mode untouched"
+    );
+    assert_eq!(stub.send_calls(), 0, "guard never sends");
+    assert_eq!(
+        stub.last_calls(),
+        1,
+        "guard issues exactly one lastChk probe"
+    );
+    let ok_info: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'TIP_GUARD_OK' AND severity = 'INFO'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(ok_info, 1, "exactly one INFO TIP_GUARD_OK audit row");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 10 — DPS unavailable: lastChk → Transport error → node NOT blocked, WARN
+// (offline-first: a boot without network must not block the till).
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tip_guard_dps_unavailable_does_not_block() {
+    let env = setup_online_fn("live.db").await;
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 1, "SFN-1").await;
+
+    let stub = DpsStub::new();
+    stub.push_last(Err(DpsError::Transport("connection refused".into())));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let outcome = boot_phase::run_boot_tip_guard(&recon_guard(), &env.pool, FN, &view, true)
+        .await
+        .expect("tip-guard runs even when DPS is down");
+
+    assert!(
+        matches!(outcome, boot_phase::TipGuardOutcome::ProbeDeferred { .. }),
+        "DPS transport error must defer (not block), got {outcome:?}"
+    );
+    assert_eq!(
+        node_mode(&env.pool).await,
+        "ONLINE",
+        "DPS-down on boot must NOT block the node (offline-first)"
+    );
+    assert_eq!(
+        stub.last_calls(),
+        1,
+        "guard attempted exactly one lastChk probe"
+    );
+    let stale: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'TIP_GUARD_STALE_LEDGER'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stale, 0,
+        "transport failure must NOT raise a stale-ledger alarm"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 11 — fresh FN: zero ACK docs → zero wire (guard silently skipped).
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tip_guard_fresh_fn_skips_with_zero_wire() {
+    let env = setup_online_fn("live.db").await;
+    // No receipts issued → no ACK tail.
+
+    // Empty queues: any wire call would panic ("…_q empty") — a strict
+    // zero-wire assertion.
+    let stub = DpsStub::new();
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let outcome = boot_phase::run_boot_tip_guard(&recon_guard(), &env.pool, FN, &view, true)
+        .await
+        .expect("tip-guard runs on a fresh FN");
+
+    assert!(
+        matches!(outcome, boot_phase::TipGuardOutcome::SkippedNoAckTail),
+        "fresh FN must skip the guard, got {outcome:?}"
+    );
+    assert_eq!(stub.last_calls(), 0, "fresh FN: zero lastChk wire calls");
+    assert_eq!(stub.send_calls(), 0, "fresh FN: zero send wire calls");
+    assert_eq!(
+        count_audit_like(&env.pool, "TIP_GUARD%").await,
+        0,
+        "fresh FN: no guard audit rows"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 12 — kill-switch: tip_guard_enabled = false → zero wire, zero guard
+// audits, even with a non-empty ACK tail present.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tip_guard_kill_switch_disables_all_wire_and_audit() {
+    let env = setup_online_fn("live.db").await;
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 1, "SFN-1").await;
+
+    // Non-empty ACK tail exists, but the kill-switch must short-circuit BEFORE
+    // any DB tail read or wire call.  Empty queues = strict zero-wire assertion.
+    let stub = DpsStub::new();
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let outcome = boot_phase::run_boot_tip_guard(&recon_guard(), &env.pool, FN, &view, false)
+        .await
+        .expect("tip-guard short-circuits when disabled");
+
+    assert!(
+        matches!(outcome, boot_phase::TipGuardOutcome::Disabled),
+        "kill-switch must classify as Disabled, got {outcome:?}"
+    );
+    assert_eq!(stub.last_calls(), 0, "kill-switch: zero lastChk wire calls");
+    assert_eq!(stub.send_calls(), 0, "kill-switch: zero send wire calls");
+    assert_eq!(
+        node_mode(&env.pool).await,
+        "ONLINE",
+        "kill-switch leaves node mode untouched"
+    );
+    assert_eq!(
+        count_audit_like(&env.pool, "TIP_GUARD%").await,
+        0,
+        "kill-switch: zero guard audit rows"
+    );
 }

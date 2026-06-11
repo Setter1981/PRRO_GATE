@@ -1609,6 +1609,268 @@ pub async fn run_boot_reconciliation(
     })
 }
 
+/// PR-B (RS-4 audit pass-2, spec §B-1) — boot stale-tip guard classification.
+///
+/// Mutually exclusive per FN per boot tick.  Carries enough context for the
+/// caller / tests to assert the path taken without re-reading `audit_log`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TipGuardOutcome {
+    /// `tip_guard_enabled = false` (config kill-switch).  Short-circuits
+    /// BEFORE any DB read or wire call — zero wire, zero audit.
+    Disabled,
+    /// Empty ACK tail (a fresh FN with no confirmed receipt yet) — the guard
+    /// is silently skipped; zero wire.
+    SkippedNoAckTail,
+    /// `lastChk` matched the ledger's last ACK doc `server_fiscal_no` — the
+    /// tip is consistent with DPS.  INFO `TIP_GUARD_OK` audit; node untouched.
+    TipConsistent,
+    /// `lastChk` Mismatch, or NotFound against a non-empty ACK tail — we are
+    /// behind DPS (stale restore) OR a foreign party fiscalised on our FN.
+    /// `node_state.mode → BLOCKED` (existing W10.3 setter) + CRITICAL
+    /// `TIP_GUARD_STALE_LEDGER` audit carrying both ids.
+    Blocked { expected: String, observed: String },
+    /// `lastChk` failed transiently (`TransportRetry` / `DecodeEscalate` /
+    /// `Unexpected`).  The node is NOT blocked (offline-first: a boot without
+    /// network must not block the till); the guard re-runs on the next boot.
+    ProbeDeferred { reason: String },
+}
+
+/// PR-B (RS-4 audit pass-2, spec §B) — boot stale-tip guard.
+///
+/// Runs per FN AFTER [`run_boot_reconciliation`] (the recovery arm-ups have
+/// already driven the tail to its final state), when runtime deps are present
+/// (the `reconcile_pending_with` path; `deps == None` boots never reach here).
+/// It re-uses the W9 [`last_chk_probe::probe`](super::last_chk_probe::probe)
+/// to compare the ledger's last (max-`lnd`) ACK doc's `server_fiscal_no`
+/// against DPS's latest check (`lastChk`), and on divergence flips
+/// `node_state.mode → BLOCKED` via the existing W10.3
+/// [`node_state::set_mode_blocked_tx`] setter + a CRITICAL audit.  Why this is
+/// production-critical lives in spec §0: a node restored from an old snapshot
+/// is "behind" DPS and would re-use `lnd` / break the MAC chain / double
+/// fiscal numbers if it traded — so it must block, not trade.
+///
+/// **Fence (spec §B-2 — boot-recon hot zone):**
+///   - NO document-state transition — the guard touches ONLY
+///     `node_state.mode`, through the existing setter (no new edge, no new
+///     SQL envelope shape).
+///   - NO auto-resend and NO ledger repair — detect + BLOCK + audit only.
+///   - The wire call (`lastChk`) runs OUTSIDE any transaction (invariant #1);
+///     only the BLOCK + audit form a single short `with_immediate` envelope.
+///   - Offline-first: a transient probe failure DEFERS (does not block); the
+///     guard re-runs on the next boot once DPS is reachable.
+pub async fn run_boot_tip_guard(
+    _guard: &super::ReconcileGuard<'_>,
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    deps: &super::RuntimeView<'_>,
+    tip_guard_enabled: bool,
+) -> anyhow::Result<TipGuardOutcome> {
+    use super::last_chk_probe::{self, ProbeOutcome};
+    use crate::db::repositories::fiscal_documents;
+
+    // Kill-switch — short-circuit BEFORE any DB read or wire call (spec §B-1.4).
+    if !tip_guard_enabled {
+        tracing::info!(
+            fiscal_number = %fiscal_number,
+            "boot tip-guard disabled by config (tip_guard_enabled = false)"
+        );
+        return Ok(TipGuardOutcome::Disabled);
+    }
+
+    // Step 1 — the last (max-`lnd`) ACK doc's server fiscal number.  `None`
+    // means an empty ACK tail (fresh FN): the guard is silently skipped, zero
+    // wire.  Pool-bound read, no transaction.
+    let Some(expected) = fiscal_documents::last_server_fiscal_no(pool, fiscal_number).await? else {
+        return Ok(TipGuardOutcome::SkippedNoAckTail);
+    };
+
+    // Step 2 — reuse the W9 probe.  Wire call, OUTSIDE any transaction
+    // (invariant #1).
+    let outcome = last_chk_probe::probe(deps.dps, deps.fn_sign, &expected).await;
+
+    match outcome {
+        ProbeOutcome::Match { ack } => {
+            // Tip consistent with DPS — INFO audit, node untouched.
+            let payload = serde_json::json!({
+                "fiscal_number": fiscal_number,
+                "expected_server_fiscal_no": expected,
+                "dps_last_chk_id": ack.id,
+            });
+            audit_log::append(
+                pool,
+                "node_state",
+                fiscal_number,
+                "TIP_GUARD_OK",
+                Severity::Info,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await?;
+            Ok(TipGuardOutcome::TipConsistent)
+        }
+        ProbeOutcome::Mismatch { actual_id } => {
+            block_on_stale_tip(pool, fiscal_number, &expected, &actual_id, "MISMATCH").await?;
+            Ok(TipGuardOutcome::Blocked {
+                expected,
+                observed: actual_id,
+            })
+        }
+        ProbeOutcome::NotFound => {
+            // Non-empty ACK tail but DPS has no record for our FN_sign — same
+            // anomaly class as Mismatch (we hold a confirmed ACK that DPS does
+            // not know about).  BLOCK + CRITICAL.
+            block_on_stale_tip(pool, fiscal_number, &expected, "NotFound", "NOT_FOUND").await?;
+            Ok(TipGuardOutcome::Blocked {
+                expected,
+                observed: "NotFound".to_string(),
+            })
+        }
+        ProbeOutcome::TransportRetry { reason } => {
+            // DPS unreachable — offline-first: do NOT block; defer to next boot.
+            defer_probe(
+                pool,
+                fiscal_number,
+                &expected,
+                "TRANSPORT_RETRY",
+                &reason,
+                Severity::Warning,
+            )
+            .await?;
+            tracing::warn!(
+                fiscal_number = %fiscal_number,
+                reason = %reason,
+                "boot tip-guard: DPS transport error — deferring (offline-first), guard re-runs next boot"
+            );
+            Ok(TipGuardOutcome::ProbeDeferred { reason })
+        }
+        ProbeOutcome::DecodeEscalate { reason } => {
+            // Per spec §B-1: "as TransportRetry but ERROR-log".  Same
+            // non-blocking defer; ERROR severity + log.
+            defer_probe(
+                pool,
+                fiscal_number,
+                &expected,
+                "DECODE_ESCALATE",
+                &reason,
+                Severity::Error,
+            )
+            .await?;
+            tracing::error!(
+                fiscal_number = %fiscal_number,
+                reason = %reason,
+                "boot tip-guard: lastChk decode error — deferring (offline-first), guard re-runs next boot"
+            );
+            Ok(TipGuardOutcome::ProbeDeferred { reason })
+        }
+        ProbeOutcome::Unexpected { dps_error } => {
+            // FINDING (architect): spec §B-1 enumerates 5 ProbeOutcomes and
+            // does NOT mention the W9.4-L4 `Unexpected` variant (Authorization
+            // / Server{code} / Internal — wire faults that "shouldn't" surface
+            // from a query probe).  We fail-OPEN (defer, do NOT block) to honour
+            // offline-first — blocking the till on a boot-time auth/wire fault
+            // would be worse than letting the guard re-run next boot — with an
+            // ERROR log so operator alerting fires on the right signal.
+            defer_probe(
+                pool,
+                fiscal_number,
+                &expected,
+                "UNEXPECTED",
+                &dps_error,
+                Severity::Error,
+            )
+            .await?;
+            tracing::error!(
+                fiscal_number = %fiscal_number,
+                dps_error = %dps_error,
+                "boot tip-guard: unexpected lastChk error — deferring (offline-first), guard re-runs next boot"
+            );
+            Ok(TipGuardOutcome::ProbeDeferred { reason: dps_error })
+        }
+    }
+}
+
+/// PR-B helper — flip the node to BLOCKED + write the CRITICAL
+/// `TIP_GUARD_STALE_LEDGER` audit in ONE `with_immediate` envelope (the wire
+/// probe already ran outside any tx).  No document-state transition; only
+/// `node_state.mode` via the existing W10.3 setter.
+async fn block_on_stale_tip(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    expected: &str,
+    observed: &str,
+    divergence: &str,
+) -> anyhow::Result<()> {
+    use crate::db::repositories::node_state;
+    let fn_owned = fiscal_number.to_string();
+    let expected_owned = expected.to_string();
+    let observed_owned = observed.to_string();
+    let divergence_owned = divergence.to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            let updated = node_state::set_mode_blocked_tx(tx, &fn_owned).await?;
+            // `false` = missing node_state row — a structural breach (the FN
+            // just yielded an ACK doc, so its node_state row MUST exist).
+            // Surface as an error so the envelope rolls back and the caller
+            // observes the failure rather than silently "blocking" a ghost FN.
+            anyhow::ensure!(
+                updated,
+                "tip-guard BLOCK: node_state row missing for FN {fn_owned} despite a non-empty ACK tail"
+            );
+            let payload = serde_json::json!({
+                "fiscal_number": fn_owned,
+                "divergence": divergence_owned,
+                "expected_server_fiscal_no": expected_owned,
+                "dps_last_chk_id": observed_owned,
+                "rationale":
+                    "boot tip-guard: our last ACK doc's server_fiscal_no diverges from DPS lastChk — the node is behind DPS (stale restore) OR a foreign party fiscalised on this FN; node BLOCKED, no resend, no ledger repair",
+            });
+            audit_log::append_tx(
+                tx,
+                "node_state",
+                &fn_owned,
+                "TIP_GUARD_STALE_LEDGER",
+                Severity::Critical,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+}
+
+/// PR-B helper — record a deferred (non-blocking) tip-guard probe failure as a
+/// single audit row.  No state change; the guard re-runs on the next boot.
+async fn defer_probe(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    expected: &str,
+    failure_label: &str,
+    reason: &str,
+    severity: Severity,
+) -> anyhow::Result<()> {
+    let payload = serde_json::json!({
+        "fiscal_number": fiscal_number,
+        "expected_server_fiscal_no": expected,
+        "failure_label": failure_label,
+        "failure_reason": reason,
+        "rationale":
+            "boot tip-guard: lastChk probe failed; node NOT blocked (offline-first); guard re-runs on next boot",
+    });
+    audit_log::append(
+        pool,
+        "node_state",
+        fiscal_number,
+        "TIP_GUARD_PROBE_DEFERRED",
+        severity,
+        None,
+        Some(&payload.to_string()),
+    )
+    .await?;
+    Ok(())
+}
+
 /// W11 PR-2b — SENT crash-recovery orchestrator.  Allocates a fresh
 /// `transport_trace` row, runs `last_chk_probe::probe` (network,
 /// OUTSIDE any `with_immediate`), then dispatches on `ProbeOutcome`:

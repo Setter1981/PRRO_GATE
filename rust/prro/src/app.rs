@@ -561,6 +561,8 @@ impl App {
         let fns = fiscal_number_config::list_all(pool)
             .await
             .map_err(BootError::Database)?;
+        // PR-B (RS-4, spec §B-1.4) — boot stale-tip guard master switch.
+        let tip_guard_enabled = self.inner.config.backup.tip_guard_enabled;
         let mut summary = ReconciliationSummary::default();
         for fn_cfg in &fns {
             // M3a hardening pass 1: resolve per-FN RuntimeView BEFORE
@@ -623,6 +625,44 @@ impl App {
                 );
             }
             summary.record(&outcome);
+
+            // PR-B (RS-4, spec §B) — boot stale-tip guard.  Runs per FN AFTER
+            // `run_boot_reconciliation` (the arm-ups have driven the tail to
+            // its final state), ONLY on the runtime path (`deps == Some` →
+            // `per_fn_view == Some`; the ctx-free `App::boot` gate never blocks
+            // here).  It verifies the ledger's last ACK tip against DPS and
+            // BLOCKS the node on divergence (stale restore / foreign
+            // fiscalisation) — see spec §0.  Touches ONLY `node_state.mode`
+            // (existing W10.3 setter); NO document-state transition, NO resend;
+            // the `lastChk` wire call is outside any transaction (invariant #1).
+            // A genuine guard failure (DB / structural breach) aborts boot
+            // fail-closed; transient probe failures are deferred INSIDE the
+            // guard (offline-first) and surface as `Ok(ProbeDeferred)`.
+            if let Some(view) = per_fn_view.as_ref() {
+                let tip_outcome = boot_phase::run_boot_tip_guard(
+                    &_recon_guard,
+                    pool,
+                    &fn_cfg.fiscal_number,
+                    view,
+                    tip_guard_enabled,
+                )
+                .await
+                .map_err(|e| match e.downcast::<sqlx::Error>() {
+                    Ok(sqlx_err) => BootError::Database(sqlx_err),
+                    Err(other) => BootError::ReconciliationFailed {
+                        fiscal_number: fn_cfg.fiscal_number.clone(),
+                        source: other,
+                    },
+                })?;
+                if let boot_phase::TipGuardOutcome::Blocked { expected, observed } = &tip_outcome {
+                    tracing::error!(
+                        fiscal_number = %fn_cfg.fiscal_number,
+                        expected_server_fiscal_no = %expected,
+                        dps_last_chk_id = %observed,
+                        "boot tip-guard: STALE LEDGER — node BLOCKED (will not trade until operator resolves)"
+                    );
+                }
+            }
         }
         Ok(summary)
     }
