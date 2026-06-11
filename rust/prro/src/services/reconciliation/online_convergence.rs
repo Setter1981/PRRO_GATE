@@ -156,16 +156,21 @@ async fn converge_one_doc(
     if doc.state == DocState::Sent {
         let mut hist = DispatchHistogram::default();
         boot_phase::dispatch_sent_via_probe(pool, view, &doc, &mut hist).await?;
-        // Re-read to observe the committed advance (Sent → Kvt1 on Match).  Reuse
-        // the read-only pending list (no new query): a post-SENT-arm doc is always
-        // non-terminal — Kvt1 (Match) / Manual (Mismatch) / ER (NotFound) / SENT
-        // (transport hold) — so it is still returned by `list_pending_for_fn`.
+        // Re-read to observe the committed advance (Sent → Kvt1 on Match) via
+        // the read-only pending list.  NB (architect review fix): Mismatch CASes
+        // the doc to `REQUIRES_MANUAL_RECONCILIATION`, which is NOT in the
+        // pending-list state filter — so a vanished doc here is the EXPECTED
+        // Mismatch outcome (the arm already audited the escalation), not just a
+        // defensive race branch.  Count it as not-converged for the tick log.
         let Some(reread) = fiscal_documents::list_pending_for_fn(pool, &fiscal_number)
             .await?
             .into_iter()
             .find(|d| d.document_id == doc_id)
         else {
-            // Cohort race with a delete — defensive; nothing more to do.
+            // Mismatch → REQUIRES_MANUAL_RECONCILIATION left the pending cohort
+            // (or, defensively, a concurrent delete).  The arm owns the audit
+            // trail; the tick only records the non-convergence.
+            summary.sent_not_converged += 1;
             return Ok(());
         };
         doc = reread;

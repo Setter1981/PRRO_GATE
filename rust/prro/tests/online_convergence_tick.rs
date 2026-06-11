@@ -652,3 +652,62 @@ async fn tick_serialises_on_fn_gate() {
         "no node_state for this FN → nothing scanned"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Test 10 (architect review fix) — probe Mismatch escalates to manual recon
+// and the tick COUNTS the non-convergence.
+//
+// `dispatch_sent_via_probe` on `ProbeOutcome::Mismatch` CASes the doc to
+// `REQUIRES_MANUAL_RECONCILIATION` — a state OUTSIDE `list_pending_for_fn`'s
+// filter, so the post-arm re-read finds nothing.  The original else-branch
+// treated that as a defensive race and returned WITHOUT counting: the operator
+// log would show `scanned=1` with every outcome counter at zero.  Pins the
+// fix: the vanished-from-pending doc is recorded as `sent_not_converged`.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn tick_counts_mismatch_escalation_as_not_converged() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(&pool, NodeMode::Online, shift_id).await;
+
+    let (send_calls, last_calls) = seed_counters();
+    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    // Construction: send Ok (→SENT) + lastChk Hold (empty → rests at SENT).
+    stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold
+                                                       // Tick: probe answers a DIFFERENT id → Mismatch → manual escalation.
+    stub.push_last(Ok(ack("DPS-FN-SOMEONE-ELSE", vec![0xDE, 0xAD])));
+
+    build_resting_sent(&pool, &pool_secure, &stub).await;
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    let summary = run_tick_for_fn(&pool, &view, FN).await.expect("tick ok");
+
+    assert_eq!(
+        read_doc_state(&pool, FN).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "Mismatch escalates via the reused boot arm"
+    );
+    assert_eq!(
+        summary.sent_not_converged, 1,
+        "the escalated doc must be COUNTED, not silently dropped from the summary"
+    );
+    assert_eq!(summary.advanced_sent_to_kvt1, 0);
+    assert_eq!(summary.acked_from_kvt1, 0);
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        1,
+        "exactly one send_chk total — Mismatch never resends"
+    );
+    assert_eq!(count_doc_rows(&pool).await, 1);
+    prro::db::invariant_scan::assert_clean(&pool).await;
+}
