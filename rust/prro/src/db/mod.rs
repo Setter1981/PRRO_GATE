@@ -1,3 +1,4 @@
+pub mod invariant_scan;
 pub mod models;
 pub mod repositories;
 pub mod tx;

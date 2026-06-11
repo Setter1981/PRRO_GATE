@@ -425,6 +425,9 @@ async fn online_sell_reaches_ack() {
         .expect("the advance emits its audit");
     assert_eq!(payload["attempt_no"].as_i64(), Some(1));
     assert_eq!(payload["server_fiscal_no"], SERVER_FISCAL_NO);
+    // Audit pass-2: the full ledger-invariant scan over a REAL post-ACK
+    // ledger — pins zero false positives on the happy path.
+    prro::db::invariant_scan::assert_clean(&pool).await;
 }
 
 /// **A2.1b-core incr.3 — transient send → 202.** A transient wire failure
@@ -544,6 +547,9 @@ async fn offline_sell_is_offline_local_ack_success() {
     );
     assert_eq!(outcome.fiscal_id, None);
     assert_eq!(read_doc_state(&pool, FN).await, "OFFLINE_LOCAL_ACK");
+    // Audit pass-2: the scan over a REAL offline-acked ledger (consumed
+    // code backing offline_fiscal_no etc.) — zero false positives.
+    prro::db::invariant_scan::assert_clean(&pool).await;
     // Review TA-7 pin: the inbox stays PROCESSING until the drain later
     // finalizes the doc to ACK (replay reads OfflineLocalAck as ACCEPTED).
     assert_eq!(
