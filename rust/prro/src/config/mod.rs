@@ -290,6 +290,15 @@ pub struct SupervisorCfg {
     /// GREATER than this value so the grace path runs before SIGKILL.
     #[serde(default = "default_shutdown_grace_seconds")]
     pub shutdown_grace_seconds: u64,
+
+    /// B1 online-convergence tick cadence (seconds).  **Raw value** — route
+    /// boot callers through
+    /// [`SupervisorCfg::clamped_online_convergence_interval_seconds`].  Like
+    /// the drain ticker this is just the wake cadence; the convergence tick is
+    /// SELECT-first (an empty tick issues zero wire calls), so it carries no
+    /// per-FN backoff gating.
+    #[serde(default = "default_online_convergence_interval_seconds")]
+    pub online_convergence_interval_seconds: u64,
 }
 
 impl Default for SupervisorCfg {
@@ -302,6 +311,7 @@ impl Default for SupervisorCfg {
             dps: DpsCfg::default(),
             drain_interval_seconds: default_drain_interval_seconds(),
             shutdown_grace_seconds: default_shutdown_grace_seconds(),
+            online_convergence_interval_seconds: default_online_convergence_interval_seconds(),
         }
     }
 }
@@ -328,6 +338,17 @@ pub const DRAIN_INTERVAL_MAX_SECONDS: u64 = 3600;
 pub const SHUTDOWN_GRACE_MIN_SECONDS: u64 = 1;
 pub const SHUTDOWN_GRACE_MAX_SECONDS: u64 = 80;
 
+fn default_online_convergence_interval_seconds() -> u64 {
+    60
+}
+
+/// Inclusive clamp bounds for the online-convergence tick cadence.  Floor is
+/// higher than the drain floor (5s) — convergence is a slow OCF-5 backstop for
+/// resting `SENT`/`KVT1`, not a latency-sensitive path, so 15s avoids needless
+/// wire chatter while still bounding the worst-case KVT1-hang dwell.
+pub const ONLINE_CONVERGENCE_INTERVAL_MIN_SECONDS: u64 = 15;
+pub const ONLINE_CONVERGENCE_INTERVAL_MAX_SECONDS: u64 = 3600;
+
 impl SupervisorCfg {
     /// Validate + clamp `drain_interval_seconds` to
     /// `[DRAIN_INTERVAL_MIN_SECONDS, DRAIN_INTERVAL_MAX_SECONDS]`.  Returns
@@ -344,6 +365,20 @@ impl SupervisorCfg {
     pub fn clamped_shutdown_grace_seconds(&self) -> (u64, bool) {
         let raw = self.shutdown_grace_seconds;
         let clamped = raw.clamp(SHUTDOWN_GRACE_MIN_SECONDS, SHUTDOWN_GRACE_MAX_SECONDS);
+        (clamped, clamped != raw)
+    }
+
+    /// Validate + clamp `online_convergence_interval_seconds` to
+    /// `[ONLINE_CONVERGENCE_INTERVAL_MIN_SECONDS,
+    /// ONLINE_CONVERGENCE_INTERVAL_MAX_SECONDS]`.  Returns
+    /// `(clamped_value, was_clamped)` for the WARN-audit pattern — mirror of
+    /// [`SupervisorCfg::clamped_drain_interval_seconds`].
+    pub fn clamped_online_convergence_interval_seconds(&self) -> (u64, bool) {
+        let raw = self.online_convergence_interval_seconds;
+        let clamped = raw.clamp(
+            ONLINE_CONVERGENCE_INTERVAL_MIN_SECONDS,
+            ONLINE_CONVERGENCE_INTERVAL_MAX_SECONDS,
+        );
         (clamped, clamped != raw)
     }
 }
@@ -683,6 +718,7 @@ mod tests {
             dps: DpsCfg::default(),
             drain_interval_seconds: 0,
             shutdown_grace_seconds: default_shutdown_grace_seconds(),
+            online_convergence_interval_seconds: default_online_convergence_interval_seconds(),
         };
         let (clamped, was_clamped) = sup.clamped_drain_interval_seconds();
         assert_eq!(clamped, DRAIN_INTERVAL_MIN_SECONDS);
@@ -702,6 +738,7 @@ mod tests {
             dps: DpsCfg::default(),
             drain_interval_seconds: default_drain_interval_seconds(),
             shutdown_grace_seconds: 0,
+            online_convergence_interval_seconds: default_online_convergence_interval_seconds(),
         };
         let (clamped, was_clamped) = sup.clamped_shutdown_grace_seconds();
         assert_eq!(clamped, SHUTDOWN_GRACE_MIN_SECONDS);
@@ -712,6 +749,7 @@ mod tests {
             dps: DpsCfg::default(),
             drain_interval_seconds: default_drain_interval_seconds(),
             shutdown_grace_seconds: 99_999,
+            online_convergence_interval_seconds: default_online_convergence_interval_seconds(),
         };
         let (clamped, was_clamped) = too_big.clamped_shutdown_grace_seconds();
         assert_eq!(clamped, SHUTDOWN_GRACE_MAX_SECONDS);
@@ -719,6 +757,45 @@ mod tests {
 
         let (def, def_clamped) = SupervisorCfg::default().clamped_shutdown_grace_seconds();
         assert_eq!(def, default_shutdown_grace_seconds());
+        assert!(!def_clamped);
+    }
+
+    /// B1 — online-convergence tick cadence clamps to bounds; the hand-written
+    /// Default keeps it in-range whether or not the table is present.  Mirror
+    /// of [`drain_interval_clamps_and_defaults_in_range`] (spec §5 test 9).
+    #[test]
+    fn online_convergence_interval_clamps_and_defaults_in_range() {
+        // Below floor → clamped up to MIN.
+        let too_small = SupervisorCfg {
+            enabled: true,
+            dps: DpsCfg::default(),
+            drain_interval_seconds: default_drain_interval_seconds(),
+            shutdown_grace_seconds: default_shutdown_grace_seconds(),
+            online_convergence_interval_seconds: 1,
+        };
+        let (clamped, was_clamped) = too_small.clamped_online_convergence_interval_seconds();
+        assert_eq!(clamped, ONLINE_CONVERGENCE_INTERVAL_MIN_SECONDS);
+        assert_eq!(clamped, 15);
+        assert!(was_clamped);
+
+        // Above ceiling → clamped down to MAX.
+        let too_big = SupervisorCfg {
+            enabled: true,
+            dps: DpsCfg::default(),
+            drain_interval_seconds: default_drain_interval_seconds(),
+            shutdown_grace_seconds: default_shutdown_grace_seconds(),
+            online_convergence_interval_seconds: 9999,
+        };
+        let (clamped, was_clamped) = too_big.clamped_online_convergence_interval_seconds();
+        assert_eq!(clamped, ONLINE_CONVERGENCE_INTERVAL_MAX_SECONDS);
+        assert_eq!(clamped, 3600);
+        assert!(was_clamped);
+
+        // Default (missing or omitted table) → 60, in range, not clamped.
+        let (def, def_clamped) =
+            SupervisorCfg::default().clamped_online_convergence_interval_seconds();
+        assert_eq!(def, default_online_convergence_interval_seconds());
+        assert_eq!(def, 60);
         assert!(!def_clamped);
     }
 }

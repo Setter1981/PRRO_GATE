@@ -25,6 +25,7 @@ pub mod boot_phase;
 pub mod er_redrive_policy;
 pub mod guard;
 pub mod last_chk_probe;
+pub mod online_convergence;
 pub mod runtime;
 
 pub use guard::ReconcileGuard;

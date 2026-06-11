@@ -525,7 +525,14 @@ pub enum ConfirmDrainOutcome {
 /// to sibling modules under `offline_sync`.  Kvt1Reentry / SentReplay
 /// scope-guarded at entry until Commits 5 / 5b land their source-
 /// specific envelope chains (Envelope 1b / 1c-pre).
-pub(in crate::services::offline_sync) async fn confirm_drain_doc(
+// **B1 reuse (audit pass-2, 2026-06-11):** visibility raised
+// `pub(in crate::services::offline_sync) → pub(crate)` so the runtime
+// online-convergence tick (`services::reconciliation::online_convergence`)
+// re-drives a *resting* online `KVT1` doc through THE SAME `Kvt1Reentry`
+// confirm path — lastChk → `advance_to_ack(doc.state = Kvt1)` (runtime-neutral,
+// see the RS-3 A2.1a note below) → ACK + inbox DONE; Hold → stays KVT1.  No
+// copy, no behaviour change (mirrors spec §2).
+pub(crate) async fn confirm_drain_doc(
     pool: &SqlitePool,
     dps: &dyn DpsChannel,
     doc: &fiscal_documents::DocumentRow,

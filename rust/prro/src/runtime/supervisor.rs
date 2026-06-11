@@ -204,8 +204,20 @@ where
             "offline.return_online_probe_interval_seconds out of bounds; clamped"
         );
     }
+    let (converge_secs, converge_clamped) = app
+        .config()
+        .supervisor
+        .clamped_online_convergence_interval_seconds();
+    if converge_clamped {
+        tracing::warn!(
+            target: "prro::runtime::supervisor",
+            raw = app.config().supervisor.online_convergence_interval_seconds,
+            clamped = converge_secs,
+            "supervisor.online_convergence_interval_seconds out of bounds; clamped"
+        );
+    }
 
-    // One watch channel fans the shutdown signal to BOTH loops; `biased`
+    // One watch channel fans the shutdown signal to ALL loops; `biased`
     // select makes the shutdown branch win even when a tick is ready.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -219,8 +231,15 @@ where
     let probe_handle = spawn_probe_loop(
         app.clone(),
         Arc::clone(&registry),
-        fn_ids,
+        fn_ids.clone(),
         Duration::from_secs(probe_secs),
+        shutdown_rx.clone(),
+    );
+    let convergence_handle = spawn_convergence_loop(
+        app.clone(),
+        Arc::clone(&registry),
+        fn_ids,
+        Duration::from_secs(converge_secs),
         shutdown_rx.clone(),
     );
 
@@ -232,6 +251,7 @@ where
     let mut tasks = vec![
         SupervisedTask::runs_until_shutdown("drain", drain_handle),
         SupervisedTask::runs_until_shutdown("probe", probe_handle),
+        SupervisedTask::runs_until_shutdown("online-convergence", convergence_handle),
     ];
     for (listener, state, name) in bound_ingress {
         let handle = tokio::spawn(server::serve(listener, state, shutdown_rx.clone()));
@@ -242,8 +262,9 @@ where
         target: "prro::runtime::supervisor",
         drain_interval_secs = drain_secs,
         probe_interval_secs = probe_secs,
+        online_convergence_interval_secs = converge_secs,
         ingress_listeners = ingress_count,
-        "supervisor: drain + return-online + ingress tasks running"
+        "supervisor: drain + return-online + online-convergence + ingress tasks running"
     );
 
     // F1 + F2: hand the wait/teardown lifecycle to the generalized (test-
@@ -863,6 +884,103 @@ async fn drain_tick(
                     fiscal_number = fn_id,
                     error = ?e,
                     "drain tick failed"
+                );
+            }
+        }
+    }
+}
+
+/// Spawn the B1 online-convergence ticker — one tokio task iterating every
+/// registered FN each `interval`, driving resting online `SENT`/`KVT1` docs to
+/// `ACK` via the reused recovery arms (OCF-5 runtime owner).  Exact structural
+/// copy of [`spawn_drain_loop`]: `MissedTickBehavior::Skip` + `biased` select
+/// makes shutdown win, and the loop returns `Ok(())` only (F1).
+fn spawn_convergence_loop(
+    app: App,
+    registry: Arc<BindingsRegistry>,
+    fn_ids: Vec<String>,
+    interval: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<anyhow::Result<()>> {
+    tokio::spawn(async move {
+        // Second receiver for the between-FN check inside convergence_tick (see
+        // spawn_drain_loop).
+        let tick_shutdown = shutdown_rx.clone();
+        let mut iv = tokio::time::interval(interval);
+        iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // F1 INVARIANT: this loop must return `Ok(())` ONLY (on watch-exit).
+        // A `?`/`return Err(_)` here would surface as a pre-flip loop-death →
+        // CRITICAL audit + process restart.  Per-FN errors are
+        // logged-and-skipped INSIDE `convergence_tick`, never propagated.
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        tracing::info!(target: "prro::runtime::supervisor", "online-convergence loop: shutdown; exiting");
+                        return Ok(());
+                    }
+                }
+                _ = iv.tick() => {
+                    convergence_tick(&app, &registry, &fn_ids, &tick_shutdown).await;
+                }
+            }
+        }
+    })
+}
+
+/// One online-convergence pass over all FNs.  Rebuilds `fn_sign` FRESH per FN
+/// (signingTime must be current at the wire call — NEVER cached) and routes
+/// through the A4-gated [`App::converge_online_for_fn`].  A per-FN `fn_sign`
+/// build failure or tick error is logged and skipped — one bad FN never stops
+/// the others or kills the loop.  Mirror of [`drain_tick`].
+async fn convergence_tick(
+    app: &App,
+    registry: &BindingsRegistry,
+    fn_ids: &[String],
+    shutdown: &watch::Receiver<bool>,
+) {
+    for fn_id in fn_ids {
+        // F2: bail BETWEEN FNs so a shutdown during a long multi-FN pass is
+        // honored promptly instead of only after the whole pass returns.
+        if *shutdown.borrow() {
+            return;
+        }
+        let Some(b) = registry.get(fn_id) else {
+            continue;
+        };
+        let fn_sign = match build_fn_sign(&b.sign_ctx.session, fn_id) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target: "prro::runtime::supervisor",
+                    fiscal_number = fn_id,
+                    error = ?e,
+                    "online-convergence tick: fn_sign build failed; FN skipped this tick"
+                );
+                continue;
+            }
+        };
+        let view = RuntimeView {
+            dps: b.dps.as_ref(),
+            signing_ctx: &b.sign_ctx,
+            fn_sign: &fn_sign,
+        };
+        match app.converge_online_for_fn(fn_id, &view).await {
+            Ok(summary) => {
+                tracing::debug!(
+                    target: "prro::runtime::supervisor",
+                    fiscal_number = fn_id,
+                    ?summary,
+                    "online-convergence tick complete"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "prro::runtime::supervisor",
+                    fiscal_number = fn_id,
+                    error = ?e,
+                    "online-convergence tick failed"
                 );
             }
         }

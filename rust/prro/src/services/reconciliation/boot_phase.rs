@@ -1631,7 +1631,15 @@ pub async fn run_boot_reconciliation(
 /// Doc with `server_fiscal_no = None` is a structural breach (SENT
 /// requires the transport_request_id to have been recorded); we emit
 /// `BOOT_DISPATCH_ERROR` + return without further dispatch.
-async fn dispatch_sent_via_probe(
+///
+/// **B1 reuse (audit pass-2, 2026-06-11):** visibility raised
+/// `private → pub(crate)` so the runtime online-convergence tick
+/// (`services::reconciliation::online_convergence`) re-drives a *resting*
+/// online `SENT` doc through THE SAME arm — same probe → {Match→Kvt1 /
+/// Mismatch→Manual / NotFound→ER / TransportRetry/DecodeEscalate→hold}
+/// dispatch, not a copy.  No behaviour change; the tick simply invokes the
+/// identical recovery arm outside the boot path (mirrors spec §2).
+pub(crate) async fn dispatch_sent_via_probe(
     pool: &SqlitePool,
     deps: &super::RuntimeView<'_>,
     doc: &crate::db::repositories::fiscal_documents::DocumentRow,
