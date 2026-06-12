@@ -102,6 +102,16 @@ pub enum MacRecoveryOutcome {
     /// re-attempted; caller routes to `TerminalReject` and emits
     /// `MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH`.
     CounterExhausted,
+    /// M2-X1 (external-critic HIGH, 2026-06-12): the doc is OFFLINE-ORIGIN
+    /// (`offline_fiscal_no` NOT NULL) — its MAC chain was built LOCALLY and the
+    /// seed already advanced at offline-ack (M2-01).  Re-signing it under a DPS
+    /// `-12` hash would desync the local offline chain (ChainBreak).  Counter
+    /// NOT claimed, NO re-sign; `MAC_RECOVERY_OFFLINE_ORIGIN_REFUSED` audit
+    /// emitted.  Caller (`stage_send::run`) returns the original
+    /// `Routed{MacRecovery}` outcome unchanged, which the drain routes to
+    /// manual-recon escalation (mirror the M2-04 seam).  Unreachable for
+    /// online-origin docs (`offline_fiscal_no` NULL → not this arm).
+    OfflineOriginRefused,
 }
 
 // ─── Hash extraction (pure-fn) ───────────────────────────────────────
@@ -187,6 +197,12 @@ struct RecoveryInputs {
     /// config.  `None` for pre-W4-Z2a docs (migration-window
     /// back-compat — fall back to empty map = unchanged behaviour).
     signing_config_snapshot_id: Option<i64>,
+    /// M2-X1 (external-critic HIGH, 2026-06-12) — `Some` ⟺ offline-origin doc
+    /// (fiscalised at offline-ack, where M2-01 advanced the chain seed).  Such a
+    /// doc must NOT be re-signed under a DPS hash (it would desync the locally
+    /// built offline MAC chain → `invariant_scan` ChainBreak).  `run_mac_recovery`
+    /// refuses it before MR-CLAIM.  `None` = online-origin (unchanged behaviour).
+    offline_fiscal_no: Option<i64>,
 }
 
 async fn read_recovery_inputs(
@@ -205,11 +221,12 @@ async fn read_recovery_inputs(
         Option<i64>,     // z_report_number
         Option<Vec<u8>>, // previous_hash
         Option<i64>,     // signing_config_snapshot_id (W4-Z2a piece 9)
+        Option<i64>,     // offline_fiscal_no (M2-X1 offline-origin guard)
     );
     let row: Option<Row> = sqlx::query_as(
         r#"SELECT fiscal_number, doc_type, business_ts, payload_json,
                   lnd, total_sum_kop, z_report_number, previous_hash,
-                  signing_config_snapshot_id
+                  signing_config_snapshot_id, offline_fiscal_no
            FROM fiscal_documents WHERE document_id = ?"#,
     )
     .bind(doc_id)
@@ -229,6 +246,7 @@ async fn read_recovery_inputs(
         z_report_number,
         previous_hash_bytes,
         signing_config_snapshot_id,
+        offline_fiscal_no,
     ) = row;
 
     let tax_number = match fiscal_number_config::get(pool, &fn_id)
@@ -273,6 +291,7 @@ async fn read_recovery_inputs(
         z_report_number,
         old_previous_hash,
         signing_config_snapshot_id,
+        offline_fiscal_no,
     })
 }
 
@@ -363,6 +382,21 @@ pub async fn run_mac_recovery(
     // BEGIN IMMEDIATE guarantees no other writer can mutate these
     // inputs between this read and the MR-CLAIM CAS.
     let inputs = read_recovery_inputs(pool, doc).await?;
+
+    // ── M2-X1 guard (external-critic HIGH, 2026-06-12): REFUSE offline-origin
+    //    docs BEFORE MR-CLAIM.  An offline doc fiscalised at offline-ack, where
+    //    M2-01 already advanced the chain seed; re-signing it under a DPS `-12`
+    //    hash would desync the locally built offline MAC chain (doc#2.prev goes
+    //    stale → invariant_scan ChainBreak).  W10.4 mac-recovery was designed for
+    //    ONLINE docs (finalize advances the seed AFTER); offline chains are built
+    //    locally and must NEVER be re-signed under a DPS hash on the fly.  Counter
+    //    NOT claimed, NO re-sign — return OfflineOriginRefused, which the caller
+    //    routes to manual-recon escalation (mirror M2-04).
+    if inputs.offline_fiscal_no.is_some() {
+        emit_offline_origin_refused_audit(pool, doc, inputs.offline_fiscal_no).await?;
+        return Ok(MacRecoveryOutcome::OfflineOriginRefused);
+    }
+
     let wire_artifact_kind = derive_wire_artifact_kind(inputs.doc_type)
         .map_err(StageSendError::MacRecoverySignFailed)?;
 
@@ -524,6 +558,46 @@ pub async fn run_mac_recovery(
 /// Emit the `MAC_RECOVERY_HASH_NOT_EXTRACTABLE` audit row in its own
 /// `with_immediate` envelope (no other writes — the doc state is
 /// untouched on this path; counter NOT claimed).
+/// M2-X1 — forensic audit when mac-recovery refuses an offline-origin doc.
+/// Distinct event_type + `manual_recon_class: true` + the offline ordinal, so an
+/// operator dashboard sees exactly why the FN drain escalated (the drain also
+/// emits its own `OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL`).
+async fn emit_offline_origin_refused_audit(
+    pool: &SqlitePool,
+    doc: DocumentId,
+    offline_fiscal_no: Option<i64>,
+) -> Result<(), StageSendError> {
+    let payload = serde_json::json!({
+        "failure_class": "mac_recovery_offline_origin",
+        "manual_recon_class": true,
+        "offline_fiscal_no": offline_fiscal_no,
+        "rationale":
+            "mac-recovery refuses offline-origin docs — the offline MAC chain is built locally \
+             and the seed already advanced at offline-ack (M2-01); re-signing under a DPS hash \
+             would desync the chain. Escalated to manual reconciliation, no re-sign.",
+    })
+    .to_string();
+    with_immediate(pool, move |tx| {
+        let payload = payload.clone();
+        Box::pin(async move {
+            audit_log::append_tx(
+                tx,
+                "fiscal_document",
+                &format!("{doc:?}"),
+                "MAC_RECOVERY_OFFLINE_ORIGIN_REFUSED",
+                Severity::Error,
+                None,
+                Some(&payload),
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(bridge_anyhow)?;
+    Ok(())
+}
+
 async fn emit_hash_not_extractable_audit(
     pool: &SqlitePool,
     doc: DocumentId,
