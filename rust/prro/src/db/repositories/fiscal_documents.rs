@@ -743,6 +743,34 @@ pub async fn max_submitted_lnd(
     .await
 }
 
+/// NC-04 (external-critic finding, adjudicated 2026-06-11) — the FN's NEWEST
+/// pending-submitted row by `lnd`, REGARDLESS of `server_fiscal_no` validity:
+/// the max-`lnd` doc in `{SENT, KVT1, KVT2}` (the in-flight submitted cohort —
+/// ACK is excluded, a confirmed terminal always carries its sfn).  Returns
+/// `(lnd, server_fiscal_no)` with `server_fiscal_no = None` for a NULL column;
+/// `None` when no pending-submitted doc exists.
+///
+/// Unlike [`last_submitted_server_fiscal_no`] / [`max_submitted_lnd`], this does
+/// NOT filter `sfn IS NOT NULL`, so the boot tip-guard can SEE a malformed newer
+/// tail (NULL/empty sfn — unreachable in healthy code where `SENT ⇐
+/// WireDecision::Sent` stamps sfn, but exactly what a restored/corrupted DB
+/// carries) that the sfn-filtered queries would silently skip.  Pool-bound read,
+/// no write-tx.
+pub async fn newest_pending_submittable(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<(i64, Option<String>)>> {
+    sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT lnd, server_fiscal_no FROM fiscal_documents \
+         WHERE fiscal_number = ? AND state IN ('SENT', 'KVT1', 'KVT2') \
+         ORDER BY lnd DESC \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await
+}
+
 /// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 / HIGH-C4-8
 /// resolution; HIGH-C5-1 session scoping; MED-C5-4 KVT2 deferral
 /// reversed by **M3b W12 Commit 3**) — strict `lnd ASC` walker for

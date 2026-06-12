@@ -1968,6 +1968,32 @@ pub async fn run_boot_tip_guard(
         }
     }
 
+    // NC-04 (external-critic, adjudicated 2026-06-11): Step 1's
+    // `last_submitted_server_fiscal_no` filters NULL/'' sfn, so a malformed NEWER
+    // {SENT,KVT1,KVT2} row (NULL/empty sfn) is SKIPPED — the guard would then
+    // validate an OLDER tail as OK while the real max-`lnd` submitted doc is
+    // unrecoverable+pending.  SENT-with-NULL-sfn is unreachable in healthy code
+    // (`SENT ⇐ WireDecision::Sent` stamps sfn), but a restored/corrupted DB
+    // carries exactly such rows — the domain this guard exists for.  If the
+    // NEWEST pending-submitted row by `lnd` has NULL/empty sfn → block-worthy
+    // anomaly.  Reuse the existing BLOCK + CRITICAL machinery (`block_on_stale_tip`
+    // — same `TIP_GUARD_STALE_LEDGER` audit, only the divergence label differs);
+    // NO new doc transition, and NO probe (the tip is provably unrecoverable, so
+    // a Match on an older id would be a false OK).  Runs BEFORE the Step-1 None
+    // skip so a no-ACK-but-malformed-SENT tail is not missed.
+    if let Some((lnd, sfn)) =
+        fiscal_documents::newest_pending_submittable(pool, fiscal_number).await?
+    {
+        if sfn.as_deref().unwrap_or("").is_empty() {
+            let observed = format!("malformed-tail lnd={lnd} (NULL/empty server_fiscal_no)");
+            block_on_stale_tip(pool, fiscal_number, "(none)", &observed, "MALFORMED_TAIL").await?;
+            return Ok(TipGuardOutcome::Blocked {
+                expected: "(none)".to_string(),
+                observed,
+            });
+        }
+    }
+
     // Step 1 — the FN's newest SUBMITTED server fiscal number: the max-`lnd`
     // doc in {SENT, KVT1, KVT2, ACK} that crossed the `Sending → Sent` CAS
     // (ruling 3).  `None` = empty submitted tail (fresh FN): guard silently
