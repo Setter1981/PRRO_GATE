@@ -24,7 +24,6 @@ use prro::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
 use prro::db::repositories::offline_sessions;
 use prro::services::write_path::stage_offline_ack::{self, OfflineAckOutcome, RefusalReason};
-use std::sync::Arc;
 use uuid::Uuid;
 
 const FN: &str = "1234567890";
@@ -109,18 +108,25 @@ async fn insert_signed_doc(pool: &sqlx::SqlitePool, fn_id: &str, lnd: i64) -> Do
     let doc_id = DocumentId::new();
     let req_id = Uuid::now_v7();
     let sha = vec![0u8; 32];
+    // M2-01: a SIGNED doc carries `unsigned_xml_sha256` (set at stage_sign);
+    // stage_offline_ack now reads it to advance the MAC chain seed.  `previous_hash`
+    // is left NULL (genesis) to match the test's genesis node seed, so the
+    // step-7b drift-assert (`ns_seed == previous_hash`) passes.  A distinct
+    // per-lnd unsigned hash keeps multi-doc seeds non-colliding.
+    let unsigned = vec![0xA0u8.wrapping_add(lnd as u8); 32];
     sqlx::query(
         "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
             state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
-            payload_sha256_canonical) \
+            payload_sha256_canonical, unsigned_xml_sha256) \
          VALUES (?, ?, ?, ?, 'SELL', 'SIGNED', 'b', 't', 'OFFLINE', \
-            '2026-05-15T00:00:00Z', '{}', ?)",
+            '2026-05-15T00:00:00Z', '{}', ?, ?)",
     )
     .bind(doc_id)
     .bind(req_id.as_bytes().to_vec())
     .bind(fn_id)
     .bind(lnd)
     .bind(&sha)
+    .bind(&unsigned)
     .execute(pool)
     .await
     .unwrap();
@@ -583,16 +589,21 @@ async fn cross_fn_doc_and_code_attribution_is_rejected() {
     assert_eq!(row.2, None, "offline_session_id must stay NULL");
 }
 
-// ─── Concurrent stage_offline_ack on different docs same FN ─────────
-
+// ─── Sequential stage_offline_ack on two docs, same FN ─────────────
+//
+// M2-01 (Fable-locked, 2026-06-12): stage_offline_ack now ADVANCES the MAC
+// chain seed per issued offline doc + asserts `ns_seed == doc.previous_hash`.
+// Two SAME-FN offline-acks therefore MUST be serialised in sign-order (doc#2
+// signs `prev = doc#1.unsigned` off the advanced seed) — which the per-FN write
+// gate (A4 `FnWriteGate`) already guarantees in production.  The pre-M2-01
+// version of this test raced two pre-signed docs (gate-bypassing) to stress the
+// W5 code-pool CAS; post-M2-01 that race is invalid (the loser would hit the
+// drift-assert).  Reworked to the real sequential chain; still verifies the W5
+// atomic-acquire returns DISTINCT codes from one pool.  (Flagged for Fable: this
+// is a test-semantics consequence of the locked seed-advance, not new behaviour.)
 #[tokio::test]
-async fn concurrent_two_docs_acquire_distinct_codes() {
-    // BEGIN IMMEDIATE serialises the two envelopes via SQLite
-    // RESERVED lock; each tx gets its own code.  Verifies the W7
-    // stage threads through the W5 atomic-acquire semantics
-    // without bypass.
+async fn sequential_two_docs_acquire_distinct_codes() {
     let (_d, pool) = fresh_pool().await;
-    let pool = Arc::new(pool);
     seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::Opened).await;
     let session_id = OfflineSessionId::new();
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
@@ -600,13 +611,17 @@ async fn concurrent_two_docs_acquire_distinct_codes() {
     seed_code(&pool, FN, 2).await;
     let doc_a = insert_signed_doc(&pool, FN, 1).await;
     let doc_b = insert_signed_doc(&pool, FN, 2).await;
+    // doc#2 chains off doc#1 (its previous_hash = doc#1's unsigned hash =
+    // 0xA0+1), matching the seed doc#1's offline-ack advances the chain to.
+    sqlx::query("UPDATE fiscal_documents SET previous_hash = ? WHERE document_id = ?")
+        .bind(vec![0xA1u8; 32])
+        .bind(doc_b)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-    let p1 = Arc::clone(&pool);
-    let p2 = Arc::clone(&pool);
-    let t1 = tokio::spawn(async move { stage_offline_ack::run(&p1, doc_a, FN).await });
-    let t2 = tokio::spawn(async move { stage_offline_ack::run(&p2, doc_b, FN).await });
-    let r1 = t1.await.unwrap().unwrap();
-    let r2 = t2.await.unwrap().unwrap();
+    let r1 = stage_offline_ack::run(&pool, doc_a, FN).await.unwrap();
+    let r2 = stage_offline_ack::run(&pool, doc_b, FN).await.unwrap();
 
     let lnd1 = match r1 {
         OfflineAckOutcome::Applied { code_lnd, .. } => code_lnd,
@@ -618,7 +633,7 @@ async fn concurrent_two_docs_acquire_distinct_codes() {
     };
     assert_ne!(
         lnd1, lnd2,
-        "concurrent acquisition must return distinct codes"
+        "sequential acquisition must return distinct codes"
     );
     let codes = {
         let mut v = vec![lnd1, lnd2];
@@ -711,12 +726,16 @@ async fn insert_signed_doc_with_type(
     let doc_id = DocumentId::new();
     let req_id = Uuid::now_v7();
     let sha = vec![0u8; 32];
+    // M2-01: SIGNED docs carry unsigned_xml_sha256 (stage_offline_ack advances
+    // the chain seed from it); previous_hash NULL (genesis) matches the genesis
+    // node seed for the step-7b drift-assert.
+    let unsigned = vec![0xA0u8.wrapping_add(lnd as u8); 32];
     sqlx::query(
         "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
             state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
-            payload_sha256_canonical) \
+            payload_sha256_canonical, unsigned_xml_sha256) \
          VALUES (?, ?, ?, ?, ?, 'SIGNED', 'b', 't', 'OFFLINE', \
-            '2026-05-20T00:00:00Z', '{}', ?)",
+            '2026-05-20T00:00:00Z', '{}', ?, ?)",
     )
     .bind(doc_id)
     .bind(req_id.as_bytes().to_vec())
@@ -724,6 +743,7 @@ async fn insert_signed_doc_with_type(
     .bind(lnd)
     .bind(doc_type)
     .bind(&sha)
+    .bind(&unsigned)
     .execute(pool)
     .await
     .unwrap();

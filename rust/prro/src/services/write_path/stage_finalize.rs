@@ -276,34 +276,57 @@ pub async fn run(
                 anyhow::Error::new(StageFinalizeError::UnsignedXmlShaMissing { document_id: doc })
             })?;
 
-            // 3. Chain-continuity guard (W8 review F2 close).  Read
-            //    the FN's current chain seed inside the same tx and
-            //    assert it equals this doc's `previous_hash` — i.e.
-            //    this doc extends the existing chain, not jumps over
-            //    it.  Genesis case: both `None`.  Out-of-order
-            //    finalize (W9 boot recovery in wrong lnd order) is
-            //    structurally rejected here.
-            let ns_row = node_state::get_tx(tx, &inputs.fiscal_number)
-                .await?
-                .ok_or_else(|| {
-                    anyhow::Error::new(StageFinalizeError::SeedUpdateMissing {
-                        fn_id: inputs.fiscal_number.clone(),
-                    })
-                })?;
-            if ns_row.last_known_unsigned_xml_sha256 != inputs.previous_hash {
-                return Err(anyhow::Error::new(StageFinalizeError::ChainSeedMismatch {
-                    document_id: doc,
-                    expected: inputs.previous_hash,
-                    actual: ns_row.last_known_unsigned_xml_sha256,
-                }));
-            }
+            // M2-01 (Fable-locked, 2026-06-12): is this an OFFLINE-ORIGIN doc?
+            // An `offline_fiscal_no` was stamped at `stage_offline_ack`, where
+            // the chain seed ALREADY advanced past this doc (M2-01 step 2).  For
+            // such docs the drain's finalize must NOT re-validate the chain
+            // (the seed is now further along — the §3 guard would false-fail)
+            // and must NOT re-advance it (double-move).  Online-origin docs are
+            // unchanged: they fiscalise at ACK, so finalize owns the guard +
+            // advance.  (Sibling runtime read — same envelope; kept out of the
+            // `fetch_finalize_inputs_tx` query! macro to avoid `.sqlx`
+            // regeneration; same semantics as the locked design.)
+            let offline_origin: Option<i64> = sqlx::query_scalar(
+                "SELECT offline_fiscal_no FROM fiscal_documents WHERE document_id = ?",
+            )
+            .bind(doc)
+            .fetch_one(&mut **tx)
+            .await?;
 
-            // 4. Cross-doc MAC chain seed advance.  fiscal_number is
-            //    sourced from the doc row (W8 review F1 close).
-            if !node_state::update_last_known_xml_sha_tx(tx, &inputs.fiscal_number, &seed).await? {
-                return Err(anyhow::Error::new(StageFinalizeError::SeedUpdateMissing {
-                    fn_id: inputs.fiscal_number.clone(),
-                }));
+            if offline_origin.is_none() {
+                // 3. Chain-continuity guard (W8 review F2 close).  Read
+                //    the FN's current chain seed inside the same tx and
+                //    assert it equals this doc's `previous_hash` — i.e.
+                //    this doc extends the existing chain, not jumps over
+                //    it.  Genesis case: both `None`.  Out-of-order
+                //    finalize (W9 boot recovery in wrong lnd order) is
+                //    structurally rejected here.  (Online-origin only —
+                //    offline-origin docs guarded at offline-ack, M2-01.)
+                let ns_row = node_state::get_tx(tx, &inputs.fiscal_number)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::Error::new(StageFinalizeError::SeedUpdateMissing {
+                            fn_id: inputs.fiscal_number.clone(),
+                        })
+                    })?;
+                if ns_row.last_known_unsigned_xml_sha256 != inputs.previous_hash {
+                    return Err(anyhow::Error::new(StageFinalizeError::ChainSeedMismatch {
+                        document_id: doc,
+                        expected: inputs.previous_hash,
+                        actual: ns_row.last_known_unsigned_xml_sha256,
+                    }));
+                }
+
+                // 4. Cross-doc MAC chain seed advance.  fiscal_number is
+                //    sourced from the doc row (W8 review F1 close).
+                //    (Online-origin only — offline seed advanced at offline-ack.)
+                if !node_state::update_last_known_xml_sha_tx(tx, &inputs.fiscal_number, &seed)
+                    .await?
+                {
+                    return Err(anyhow::Error::new(StageFinalizeError::SeedUpdateMissing {
+                        fn_id: inputs.fiscal_number.clone(),
+                    }));
+                }
             }
 
             // 5. Inbox DONE.  request_id is sourced from the doc row

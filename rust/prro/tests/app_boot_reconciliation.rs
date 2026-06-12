@@ -982,6 +982,16 @@ async fn boot_with_deps_routes_offline_signed_doc_to_offline_local_ack() {
         .await
         .unwrap();
     let doc = seed_doc_in_state(&pool, "1234567890", 0x77, "SIGNED").await;
+    // M2-01: stage_offline_ack now advances the MAC chain seed, so the SIGNED
+    // doc must carry unsigned_xml_sha256 (the real stage_sign output).
+    // previous_hash stays NULL (genesis) to match the genesis node seed, so the
+    // step-7b drift-assert passes.
+    sqlx::query("UPDATE fiscal_documents SET unsigned_xml_sha256 = ? WHERE document_id = ?")
+        .bind(vec![0xA7u8; 32])
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // StubDpsChannel: empty response queue + spy panicking on any
     // call — proves stage_send is NEVER invoked on offline branch

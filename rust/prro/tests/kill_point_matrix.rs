@@ -1460,3 +1460,236 @@ async fn k4b_sent_probe_matching_id_empty_data_sign_holds_at_sent() {
     assert_eq!(count_doc_rows(&pool).await, 1, "exactly one ledger row");
     prro::db::invariant_scan::assert_clean(&pool).await;
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// M2-01 (FT) pin — two REAL-path offline receipts in one session drain to ACK
+// with a VALID per-doc MAC chain.  Pre-fix this was the FT: both receipts signed
+// the same previous_hash, doc#2 hit ChainSeedMismatch and stuck at KVT2, drain
+// hard-aborted.  Post-fix: offline-ack advances the seed per issued doc, so
+// doc#2 chains off doc#1; drain's finalize skips the guard/advance for
+// offline-origin docs; both reach ACK; invariant_scan is clean BEFORE and AFTER.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_offline(&pool, shift_id).await;
+    seed_open_offline_session(&pool).await;
+    seed_offline_code(&pool, 1).await;
+    seed_offline_code(&pool, 2).await;
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+
+    // ── Two REAL offline receipts (inline::run on an offline node).
+    let row1 = seed_inbox_sell(&pool).await;
+    let stub1 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    {
+        let g = gate.clone().lock_owned().await;
+        let o = inline::run(&pool, &pool_secure, &stub1, &sign_ctx, &fn_sign, &g, &row1)
+            .await
+            .expect("offline receipt 1 → OFFLINE_LOCAL_ACK");
+        assert_eq!(o.document_state, DocState::OfflineLocalAck);
+    }
+    let row2 = seed_inbox_sell_keyed(&pool, "idem-m2-pin-2").await;
+    let stub2 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    {
+        let g = gate.clone().lock_owned().await;
+        let o = inline::run(&pool, &pool_secure, &stub2, &sign_ctx, &fn_sign, &g, &row2)
+            .await
+            .expect("offline receipt 2 → OFFLINE_LOCAL_ACK");
+        assert_eq!(o.document_state, DocState::OfflineLocalAck);
+    }
+
+    // ── The chain is now REAL: doc#1.prev = genesis (None), doc#2.prev =
+    //    doc#1.unsigned (distinct), and the node seed = doc#2.unsigned.
+    async fn chain_col(pool: &SqlitePool, lnd: i64, col: &str) -> Option<Vec<u8>> {
+        let q = format!("SELECT {col} FROM fiscal_documents WHERE fiscal_number = ? AND lnd = ?");
+        sqlx::query_scalar(&q)
+            .bind(FN)
+            .bind(lnd)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+    let prev1 = chain_col(&pool, 1, "previous_hash").await;
+    let prev2 = chain_col(&pool, 2, "previous_hash").await;
+    let uns1 = chain_col(&pool, 1, "unsigned_xml_sha256").await;
+    let uns2 = chain_col(&pool, 2, "unsigned_xml_sha256").await;
+    assert!(prev1.is_none(), "doc#1 chains off genesis");
+    assert_ne!(
+        prev1, prev2,
+        "M2-01: the two offline docs have DISTINCT previous_hash"
+    );
+    assert_eq!(prev2, uns1, "doc#2 chains off doc#1's unsigned_xml_sha256");
+    let seed: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        seed, uns2,
+        "node seed advanced to the last issued offline doc"
+    );
+
+    // ── invariant_scan is CLEAN during the offline window (closes M2-03).
+    prro::db::invariant_scan::assert_clean(&pool).await;
+
+    // ── Go online + drain.  Two send + two lastChk (one per doc).
+    set_node_mode(&pool, NodeMode::GoingOnline).await;
+    let send_calls = Arc::new(AtomicUsize::new(0));
+    let last_calls = Arc::new(AtomicUsize::new(0));
+    let phase = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    phase.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    phase.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    phase.push_send(Ok(ack("DPS-FN-ONLINE-2", vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    phase.push_last(Ok(ack("DPS-FN-ONLINE-2", vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    let sc2 = det_signing_ctx();
+    let fs2 = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &phase,
+        signing_ctx: &sc2,
+        fn_sign: &fs2,
+    };
+    let summary = backlog_drain::drain(&recon_guard(), &pool, &view, FN)
+        .await
+        .expect("drain must succeed (no ChainSeedMismatch post-fix)");
+    assert_eq!(summary.backlog_size_before(), 2);
+
+    // ── Both ACK, exactly two send_chk, scan clean AFTER drain.
+    let states: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT lnd, state FROM fiscal_documents WHERE fiscal_number = ? ORDER BY lnd",
+    )
+    .bind(FN)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        states,
+        vec![(1, "ACK".to_string()), (2, "ACK".to_string())],
+        "both offline receipts drain to ACK"
+    );
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        2,
+        "exactly two send_chk (one per doc)"
+    );
+    prro::db::invariant_scan::assert_clean(&pool).await;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// M2-01 boundary pin — the online↔offline MAC chain is CONTINUOUS.  An online
+// doc fiscalises at ACK (seed advances there); the first offline doc of the next
+// session must chain off that last online ACK (the seed pointer is shared).
+// Proves the online→offline boundary + scan-clean across it.  (The offline→online
+// direction is symmetric — m2_two_offline_… leaves the seed at the last offline
+// doc, which a subsequent online doc reads at sign.)
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn m2_online_offline_boundary_chain_continuous() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+
+    async fn doc_id_by_req(pool: &SqlitePool, req: &[u8; 16]) -> DocumentId {
+        sqlx::query_scalar("SELECT document_id FROM fiscal_documents WHERE request_id = ?")
+            .bind(&req[..])
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+    async fn state_by_id(pool: &SqlitePool, id: DocumentId) -> String {
+        sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+    async fn col_by_id(pool: &SqlitePool, id: DocumentId, col: &str) -> Option<Vec<u8>> {
+        let q = format!("SELECT {col} FROM fiscal_documents WHERE document_id = ?");
+        sqlx::query_scalar(&q)
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    // ── doc#0 ONLINE → ACK (inline Hold→SENT, manual Kvt1/Kvt2, boot finalize).
+    let row0 = seed_inbox_sell(&pool).await;
+    let stub0 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    stub0.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    stub0.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → online Hold → SENT
+    {
+        let g = gate.clone().lock_owned().await;
+        let o = inline::run(&pool, &pool_secure, &stub0, &sign_ctx, &fn_sign, &g, &row0)
+            .await
+            .unwrap();
+        assert_eq!(o.document_state, DocState::Sent);
+    }
+    let doc0 = doc_id_by_req(&pool, &row0.request_id).await;
+    let kvt1 = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            fiscal_documents::transition_state(tx, doc0, DocState::Sent, DocState::Kvt1)
+                .await
+                .map_err(anyhow::Error::from)?;
+            fiscal_documents::transition_state(tx, doc0, DocState::Kvt1, DocState::Kvt2)
+                .await
+                .map_err(anyhow::Error::from)?;
+            document_files::replace_tx(tx, doc0, DocumentFileKind::Kvt1Raw, &kvt1).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .unwrap();
+    boot_phase::run_boot_reconciliation(&recon_guard(), &pool, FN, None)
+        .await
+        .unwrap();
+    assert_eq!(state_by_id(&pool, doc0).await, "ACK", "doc#0 online → ACK");
+    let uns0 = col_by_id(&pool, doc0, "unsigned_xml_sha256").await;
+    let seed0: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        seed0, uns0,
+        "online ACK advanced the seed to doc#0.unsigned"
+    );
+
+    // ── Flip OFFLINE, emit doc#1 → OFFLINE_LOCAL_ACK; it must chain off doc#0.
+    set_node_mode(&pool, NodeMode::Offline).await;
+    seed_open_offline_session(&pool).await;
+    seed_offline_code(&pool, 1).await;
+    let row1 = seed_inbox_sell_keyed(&pool, "idem-m2-boundary-1").await;
+    let stub1 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    {
+        let g = gate.clone().lock_owned().await;
+        let o = inline::run(&pool, &pool_secure, &stub1, &sign_ctx, &fn_sign, &g, &row1)
+            .await
+            .unwrap();
+        assert_eq!(o.document_state, DocState::OfflineLocalAck);
+    }
+    let doc1 = doc_id_by_req(&pool, &row1.request_id).await;
+    let prev1 = col_by_id(&pool, doc1, "previous_hash").await;
+    assert_eq!(
+        prev1, uns0,
+        "online→offline boundary: the first offline doc chains off the last online ACK"
+    );
+    // Chain continuous across the boundary.
+    prro::db::invariant_scan::assert_clean(&pool).await;
+}
