@@ -244,3 +244,68 @@ M2-PROBE invariant_scan AFTER drain: 1 violations
 Mechanism is general (not genesis-specific): with a prior online ACK leaving seed=X, both
 offline docs sign `prev=X`; drain ACKs doc#1 (seed→doc#1.unsigned), doc#2 (`prev=X`) then
 mismatches. The experiment instance starts from genesis (seed=None).
+
+---
+
+## Migration-grade re-review (Fable, 2026-06-12) — PR #150 verdict
+
+**Verdict: design implemented faithfully; APPROVED with a fixup (landed on the PR branch).**
+Gates re-verified locally on the PR head (nextest 1394 passed / 5 skipped; clippy clean).
+9-angle adversarial review + per-candidate verification; tx-routing of every new read confirmed
+inside the owning `with_immediate` envelope (`&mut **tx`), seed-advance atomic with the
+Signed→OfflineLocalAck CAS.
+
+### F1 — DESIGN AMENDMENT (the locked §step-4 formula was incomplete)
+
+The locked walk rule omitted `ERROR_RETRYABLE` from the offline-origin issued set.  The drain
+cohort (fiscal_documents.rs) re-selects
+`('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE','KVT2')`; a TransientRetry parks an
+ISSUED offline doc in ERROR_RETRYABLE, where the as-designed walk stopped advancing `expected`
+→ false ChainBreak on the next doc + false tail ChainSeedMismatch.  The implementer transcribed
+the design exactly — the gap is the design's.  Fixed in the fixup commit: set extended, the
+redundant `"ACK"` literal dropped from the inner set, clean fixture
+`clean_error_retryable_offline_doc_mid_drain_scans_clean` (proven RED against the pre-fix walk).
+Rule of record: **the walk's drain-state set mirrors the drain cohort IN-set — keep in lockstep.**
+
+### F2 — M2-05 detection test gap (closed in fixup)
+
+`Violation::OfflineLocalAckWithoutSession` was the only variant of 11 without a `detects_*`
+fixture; `detects_offline_local_ack_without_session` added per house norm.
+
+### Ruling — M2-04 contract (supersedes the PR-escalation wording)
+
+The escalation's premises were partially wrong: `ChainSeedMismatch` is a `StageFinalizeError`
+(the drain *wraps* it into `BootError::ReconciliationFailed` at backlog_drain.rs:~1879); there
+is no ricochet into online_convergence (the error is absorbed at the kvt2_advance / kvt2_confirm
+boundary as `ConfirmError::Infrastructure`); the real surfacing sites are 2, not 3-4.  The only
+looping surface is the drain's per-tick cohort re-select.  CONTRACT: intercept at the drain's
+per-doc finalize error handler (`process_via_w12_kvt2_advance`) — pattern-match
+`StageFinalizeError::ChainSeedMismatch` → `DocVerdict::Failed { manual_recon: true }` +
+forensics audit payload (expected/actual seed hex); all other finalize errors stay hard
+`ReconciliationFailed`.  A dedicated `FailureClass::ChainSeedMismatch` string is approved
+(distinct operator surface).  Reference implementation exists (parallel branch
+`fix/m2-01-offline-chain-seed`, commit 4271dfa) — cherry-pick + a path test = the follow-up PR.
+Residual (documented, not fixed now): the online ladder logs-and-continues per tick on a
+hypothetical mismatch — structurally unreachable for online-origin docs in normal flow;
+revisit in A2.2.
+
+### Ruling — sibling runtime reads (mechanism): blessed for the FT branch
+
+Same tx / same row / same Option semantics verified.  The ".sqlx full-cache regen" justification
+is overstated (per-query hash files; extending a macro = ~2-file diff).  Follow-up mandate
+(rides the M2-04 PR): fold the three sibling reads into the `fetch_*_inputs_tx` `query!` macros
+and collapse stage_offline_ack's two scalars into one read.
+
+### Ruling — `concurrent_…` → `sequential_two_docs_acquire_distinct_codes`: blessed
+
+The same-FN race is specification-invalid post-M2-01 (the loser fails the step-7b drift-assert);
+production is unreachable (FnWriteGate + PK(fiscal_number, code_lnd)); true-concurrency W5 CAS
+coverage survives in
+`offline_session_code_pool.rs::concurrent_acquire_on_same_fn_returns_distinct_codes`.
+No cross-FN test needed — isolation is by table design.
+
+### Refuted candidates (for the record)
+
+M2-05 scan-query index (test-only scale), per-file test-helper duplication (house norm),
+DB-column chain pins (the ledger is the legal source of truth), all envelope-routing candidates
+(clean).
