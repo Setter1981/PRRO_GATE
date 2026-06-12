@@ -409,3 +409,94 @@ it; §3(b) shows the gate forbids that state live.)
   noted only for completeness, severity LOW/theoretical.
 - The offline ordinal not being in the signed bytes (§2) is a property worth a one-line note in
   the crypto/wire review, not an H1 finding.
+
+---
+
+## External GPT critic — adjudication (Fable, 2026-06-12)
+
+Second-contour adversarial pass (other lab, repo access, static analysis). Same model as the
+M1 external critic that broke two of our CLEAN verdicts. Result: **one real HIGH our contour
+missed entirely (M2-X1), one re-discovery of a known A2.4-deferred item (M2-X2), one LOW
+defense-in-depth (M2-X3). M2-H1 survived the attack** (the critic's own "could not break"
+section matches our personal REFUTED). Each finding re-verified by independent code read +
+the two load-bearing guards traced personally.
+
+### M2-X1 — CONFIRMED, HIGH (potential FT) — NEW surface, not in this dossier
+
+`mac_recovery` (W10.4, DPS `-12 ERROR_BAD_HASH_PREV` handler) re-signs a document's
+`previous_hash` + `unsigned_xml_sha256` (`mac_recovery.rs:477-487`) and **never checks
+`offline_fiscal_no`** — it does not know about M2-01's offline-issuance seed semantics.
+
+Reachability (traced personally): drain offline-backlog → `backlog_drain` →
+`stage_send::run` → on `-12`, `error_routing.rs:471-489` routes `MacRecovery` with NO
+offline guard → `stage_send.rs:953-987` invokes `run_mac_recovery` for ANY doc. The
+orchestrator rewrites doc#1's chain fields but does **NOT** advance `node_state` seed (it
+writes only `fiscal_documents` + `document_files` + audit — grep-confirmed). For an
+offline-origin doc the seed was ALREADY advanced at offline-ack (M2-01), so:
+- doc#1's `unsigned_xml_sha256` changes; doc#2's `previous_hash` still points at the OLD
+  doc#1 hash → `invariant_scan` ChainBreak on doc#2;
+- the seed is now out of step with the rewritten doc → tail ChainSeedMismatch.
+
+Root: W10.4 mac-recovery was designed for ONLINE docs (where finalize advances the seed
+AFTER), and is structurally incompatible with M2-01's offline-origin seed-at-issuance. The
+`-12` on an offline-backlog doc is a degraded/recovery path (local↔DPS chain divergence),
+not the happy path — but reachable.
+
+Severity HIGH, not an unconditional silent FT: drain escalates to manual-recon on
+`MacRecovery` (manual_recon class) and `invariant_scan` catches the break — forensically
+visible. FT-potential only if an operator force-finalizes ignoring the scan. Still: it
+corrupts the local offline chain and mandates manual intervention.
+
+**Locked fix contract:** `mac_recovery` must REFUSE offline-origin docs. Read
+`offline_fiscal_no` (it already reads the doc row at `read_recovery_inputs`,
+`mac_recovery.rs:209`); when NOT NULL, do not claim the counter / re-sign — return an
+outcome that `stage_send`/drain route to manual-recon escalation (mirror the M2-04 seam:
+`ChainSeedMismatch`→`DocVerdict::Failed{manual_recon}`). The offline MAC chain is built
+locally and must never be re-signed under a DPS hash on the fly. TDD: two-offline-receipt
+drain + `-12` stub → RED (ChainBreak/ChainSeedMismatch) → guard → GREEN (escalate, no
+re-sign, chain intact). Hot-zone; Opus implements the locked contract, Fable reviews the delta.
+
+### M2-X2 — re-discovery of M1-05, latent, NOT a current pilot blocker
+
+The critic's "Offline→GoingOnline race → double-fiscalization, CRITICAL" overstates severity.
+`fn_gate.rs:50-64` already documents the DRAIN⇄FISCALIZE shared gate as "NOT IMPLEMENTED YET
+(M1-05)", "DEFERRED to A2.4", and argues correctness explicitly: *"a LIVENESS/ordering
+refinement, NOT a correctness fix — the only lnd/MAC allocator is serialized by BEGIN
+IMMEDIATE regardless of app-level lock, and the drain CONFIRMS-only (never allocates lnd)."*
+Furthermore `inline::run` is NOT wired into the production runtime (grep: zero non-test
+callers) — the inline orchestrator is dormant until A2.4. So the double-fiscalization path is
+not on the pilot path today.
+
+`return_online_probe` does flip Offline→GoingOnline with no backlog guard
+(`return_online_probe.rs:361-363`, `WHERE mode='OFFLINE'`), but GoingOnline is the normal
+prelude to drain; the genuine new angle is the inline(sign→dispatch)⇄probe window, which is
+dormant. **Ruling:** fold into the A2.4 gate-unification scope as an explicit requirement —
+when inline is activated, the per-FN gate must cover inline⇄probe⇄drain AND inbox-reject must
+be atomic with doc-disposition (no orphan SIGNED doc whose inbox is REJECTED) AND boot must
+check inbox status before re-dispatching a SIGNED doc. Recorded, not fixed now.
+
+### M2-X3 — LOW, defense-in-depth (fold into the M2-X1 fix batch)
+
+M2-05 scan flags NULL `offline_session_id` only for `OFFLINE_LOCAL_ACK`
+(`invariant_scan.rs:286-291`); the drain cohort spans
+`OFFLINE_LOCAL_ACK/SENT/KVT1/ERROR_RETRYABLE/KVT2` (`fiscal_documents.rs:876-901`). A
+NULL-session offline-origin doc in SENT/KVT1/KVT2/ERROR_RETRYABLE would be invisible to drain
+yet unflagged. BUT: not reachable live — the single writer
+(`transition_to_offline_local_ack_tx`) stamps non-NULL and nothing nulls it; only raw-SQL /
+corruption reaches it → severity LOW. Cheap fix with no false positives: widen the M2-05
+WHERE to the drain-cohort state set `AND offline_fiscal_no IS NOT NULL`. Online docs
+(offline_fiscal_no NULL) and post-drain ACK docs are excluded; no legitimate row trips it.
+
+### Survived the attack
+
+- **M2-H1** — the critic could not break it; its reasoning matches our personal REFUTED
+  (gate + drift-assert force code_lnd order = lnd order; genesis None==None not exploitable
+  without a synthetic two-prev-NULL state the live path forbids).
+- M2-01 chain walk, M2-04 drain seam — held.
+
+### Disposition
+
+- M2-X1 (HIGH) + M2-X3 (LOW) → one fix batch (locked contracts above; Opus implements, Fable
+  reviews; M2-X1 carries the TDD repro-pin).
+- M2-X2 → A2.4 gate-unification scope (hard requirement, recorded); not a pilot blocker while
+  inline is dormant.
