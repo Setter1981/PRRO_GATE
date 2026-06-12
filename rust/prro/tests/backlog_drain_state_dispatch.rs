@@ -239,6 +239,33 @@ async fn seed_doc_in_state(
     state: &str,
     server_fiscal_no: Option<&str>,
 ) -> DocumentId {
+    seed_doc_in_state_typed(
+        pool,
+        lnd,
+        code_lnd,
+        session_id,
+        shift_id,
+        state,
+        server_fiscal_no,
+        "SELL",
+    )
+    .await
+}
+
+/// As [`seed_doc_in_state`] but with a caller-chosen `doc_type` — added for the
+/// NC-02 pin (a `SHIFT_OPEN` doc).  `seed_doc_in_state` delegates here with
+/// `"SELL"`, so existing callers are unchanged.
+#[allow(clippy::too_many_arguments)]
+async fn seed_doc_in_state_typed(
+    pool: &SqlitePool,
+    lnd: i64,
+    code_lnd: i64,
+    session_id: OfflineSessionId,
+    shift_id: ShiftId,
+    state: &str,
+    server_fiscal_no: Option<&str>,
+    doc_type: &str,
+) -> DocumentId {
     let doc_id = DocumentId::new();
     let req_id = Uuid::now_v7();
     let sha = vec![0u8; 32];
@@ -250,7 +277,7 @@ async fn seed_doc_in_state(
             offline_session_id, offline_fiscal_no, offline_fiscal_date, \
             server_fiscal_no \
          ) VALUES ( \
-            ?, ?, ?, ?, ?, 'SELL', ?, \
+            ?, ?, ?, ?, ?, ?, ?, \
             'b', 't', 'OFFLINE', '2026-05-21T00:00:00Z', \
             '{}', ?, ?, \
             ?, ?, '2026-05-21T00:00:00Z', \
@@ -262,6 +289,7 @@ async fn seed_doc_in_state(
     .bind(FN)
     .bind(shift_id)
     .bind(lnd)
+    .bind(doc_type)
     .bind(state)
     .bind(&sha)
     .bind(CASHIER_OK)
@@ -3222,4 +3250,53 @@ async fn a2_1a_advance_to_ack_finalize_error_yields_infrastructure() {
     // finalize ACK audit did NOT.
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 1);
     assert_eq!(audit_count(&pool, "STAGE_FINALIZE_ACK").await, 0);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// NC-02 (pin-only, #[ignore]) — the ER-redrive budget is doc_type- and
+// wall-clock-BLIND: 5 TransientRetry attempts on a SHIFT_OPEN doc escalate to
+// RequiresManualReconciliation, contradicting §16 (transport-class for shift
+// open/close is UNBOUNDED).  This pins the FUTURE contract (a shift-doc
+// TransientRetry must NOT prematurely go Manual) and FAILS today — the
+// doc_type/wall-clock policy decision is DEFERRED to A2.2 (shift goes live) +
+// M5 (ERROR_SAVE).  Run with `--ignored` to observe the current premature-Manual
+// behaviour.  NO policy code is changed by this commit; see dossier NC-02.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore = "NC-02: doc_type/wall-clock-aware ER budget deferred to A2.2/M5 (see dossier); pins the future unbounded-for-shift contract — RED today"]
+async fn er_guard_shift_doc_transient_retry_must_not_prematurely_manual() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    // A SHIFT_OPEN doc in ERROR_RETRYABLE with 5 TransientRetry SEND attempts.
+    let doc = seed_doc_in_state_typed(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "ERROR_RETRYABLE",
+        None,
+        "SHIFT_OPEN",
+    )
+    .await;
+    seed_transport_trace_attempt(&pool, doc, 5, Some("TransientRetry")).await;
+
+    let c = carriers(vec![], vec![]);
+    let view = view_for(&c);
+    backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    // DESIRED (§16): a shift-doc transport-class retry is UNBOUNDED — it must NOT
+    // terminalise to Manual at the SELL budget.  Today the doc_type-blind budget
+    // DOES escalate, so this assertion FAILS until A2.2/M5 lands the policy.
+    assert_ne!(
+        read_doc_state(&pool, doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "SHIFT_OPEN TransientRetry must not prematurely escalate to Manual \
+         (§16: transport-class for shift open/close is unbounded)"
+    );
 }
