@@ -1025,3 +1025,82 @@ async fn tip_guard_skips_degraded_mode_node() {
         "degraded mode: zero guard audit rows"
     );
 }
+
+/// Raw-seed one in-flight SENT doc with a NULL `server_fiscal_no` (a malformed
+/// tail).  Unreachable in healthy code — `SENT ⇐ WireDecision::Sent` stamps the
+/// sfn — but exactly what a restored/corrupted DB can carry.  NC-04.  The
+/// `server_fiscal_no` column is omitted from the INSERT so it defaults to NULL.
+async fn seed_inflight_sent_null_sfn(pool: &SqlitePool, lnd: i64) {
+    let doc_bytes = vec![0xD1u8; 16];
+    let req_bytes = vec![0xD2u8; 16];
+    let canonical_sha = vec![0u8; 32];
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical) \
+         VALUES (?, ?, ?, ?, 'SELL', 'SENT', 'b', 't', 'ONLINE', '2026-01-01T00:00:00Z', '{}', ?)",
+    )
+    .bind(&doc_bytes)
+    .bind(&req_bytes)
+    .bind(FN)
+    .bind(lnd)
+    .bind(&canonical_sha)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 14 (NC-04) — malformed tail: the newest {SENT,KVT1,KVT2} doc by lnd has a
+// NULL server_fiscal_no.  `last_submitted_server_fiscal_no` filters NULL/'' sfn,
+// so it would skip the malformed lnd=2 row and validate the OLDER ACK (lnd=1) as
+// TIP_GUARD_OK — even though the real max-lnd submitted doc is unrecoverable.
+// The guard must treat this as a block-worthy anomaly (BLOCKED + CRITICAL),
+// BEFORE/regardless of the probe.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tip_guard_malformed_tail_null_sfn_blocks() {
+    let env = setup_online_fn("live.db").await;
+    // ACK#1 (lnd=1, sfn SFN-1) — a valid OLDER tail via the proven online path.
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 1, "SFN-1").await;
+    // A NEWER malformed SENT#2 (lnd=2) with NULL sfn — last_submitted skips it.
+    seed_inflight_sent_null_sfn(&env.pool, 2).await;
+
+    // lastChk would Match the older valid tip (SFN-1) → without NC-04 the guard
+    // returns TIP_GUARD_OK.  The malformed newer tail must block first.
+    let stub = DpsStub::new();
+    stub.push_last(Ok(ack("SFN-1", vec![0xDE, 0xAD])));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let outcome = boot_phase::run_boot_tip_guard(&recon_guard(), &env.pool, FN, &view, true)
+        .await
+        .expect("tip-guard runs");
+
+    assert!(
+        matches!(outcome, boot_phase::TipGuardOutcome::Blocked { .. }),
+        "newest {{SENT,KVT1,KVT2}} doc with NULL sfn is a block-worthy malformed tail, got {outcome:?}"
+    );
+    assert_eq!(
+        node_mode(&env.pool).await,
+        "BLOCKED",
+        "malformed tail must BLOCK the node"
+    );
+    let stale: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'TIP_GUARD_STALE_LEDGER' AND severity = 'CRITICAL'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stale, 1,
+        "exactly one CRITICAL stale-ledger audit for the malformed tail"
+    );
+}

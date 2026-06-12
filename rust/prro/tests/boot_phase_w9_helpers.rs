@@ -229,7 +229,10 @@ async fn advance_sent_to_kvt1_applies_full_envelope() {
 async fn advance_sent_to_kvt1_returns_false_when_doc_not_in_sent() {
     let (_dir, pool) = fresh_pool().await;
     let doc = seed_doc_in_state(&pool, 0xB2, "SIGNED").await;
-    let ack = fake_ack("SRV-X", &[]);
+    // NC-01: non-empty data_sign so the CAS-conflict path is what's exercised
+    // here (the empty-data_sign guard would otherwise short-circuit first — that
+    // case is pinned separately in kill_point_matrix::k4b_…).
+    let ack = fake_ack("SRV-X", &[0xDE, 0xAD]);
     let ok = boot_phase::advance_sent_to_kvt1_from_probe(
         &pool,
         doc,

@@ -666,6 +666,25 @@ pub async fn advance_sent_to_kvt1_from_probe(
     wire_call_started_at: &str,
     wire_call_finished_at: &str,
 ) -> anyhow::Result<bool> {
+    // NC-01 (external-critic finding, adjudicated 2026-06-11): an empty
+    // `ack.data_sign` must NOT advance SENT→KVT1 — persisting empty KVT1_RAW
+    // would write forensic evidence that is no evidence at all.  Mirror
+    // `kvt2_advance::advance_to_ack`'s StructuralDrift-on-empty guard (the
+    // established contract: empty data_sign routes to Hold upstream, never
+    // reaches an advance).  A matching id with empty data_sign is abnormal;
+    // fail-loud BEFORE the CAS so the doc holds at SENT (the Match arm absorbs
+    // this Err via `emit_dispatch_error` → BOOT_DISPATCH_ERROR, "doc stays in
+    // source state") and the next probe tick retries.  No state change, no
+    // empty KVT1_RAW row.
+    if ack.data_sign.is_empty() {
+        anyhow::bail!(
+            "advance_sent_to_kvt1_from_probe: probe Matched on id but ack.data_sign is \
+             EMPTY for doc {doc_id:?} — empty KVT1 evidence must not advance SENT→KVT1 \
+             (mirrors kvt2_advance::advance_to_ack StructuralDrift-on-empty; NC-01). \
+             Doc holds at SENT for re-probe."
+        );
+    }
+
     // NIT 1 fix: single clone layer.  `move |tx|` captures the
     // outer-scope owned strings; the `async move` block then takes
     // them into the future.  No inner re-clone needed under FnOnce.
@@ -1946,6 +1965,32 @@ pub async fn run_boot_tip_guard(
                 "boot tip-guard skipped — node in a non-trading degraded mode"
             );
             return Ok(TipGuardOutcome::SkippedMode { mode: row.mode });
+        }
+    }
+
+    // NC-04 (external-critic, adjudicated 2026-06-11): Step 1's
+    // `last_submitted_server_fiscal_no` filters NULL/'' sfn, so a malformed NEWER
+    // {SENT,KVT1,KVT2} row (NULL/empty sfn) is SKIPPED — the guard would then
+    // validate an OLDER tail as OK while the real max-`lnd` submitted doc is
+    // unrecoverable+pending.  SENT-with-NULL-sfn is unreachable in healthy code
+    // (`SENT ⇐ WireDecision::Sent` stamps sfn), but a restored/corrupted DB
+    // carries exactly such rows — the domain this guard exists for.  If the
+    // NEWEST pending-submitted row by `lnd` has NULL/empty sfn → block-worthy
+    // anomaly.  Reuse the existing BLOCK + CRITICAL machinery (`block_on_stale_tip`
+    // — same `TIP_GUARD_STALE_LEDGER` audit, only the divergence label differs);
+    // NO new doc transition, and NO probe (the tip is provably unrecoverable, so
+    // a Match on an older id would be a false OK).  Runs BEFORE the Step-1 None
+    // skip so a no-ACK-but-malformed-SENT tail is not missed.
+    if let Some((lnd, sfn)) =
+        fiscal_documents::newest_pending_submittable(pool, fiscal_number).await?
+    {
+        if sfn.as_deref().unwrap_or("").is_empty() {
+            let observed = format!("malformed-tail lnd={lnd} (NULL/empty server_fiscal_no)");
+            block_on_stale_tip(pool, fiscal_number, "(none)", &observed, "MALFORMED_TAIL").await?;
+            return Ok(TipGuardOutcome::Blocked {
+                expected: "(none)".to_string(),
+                observed,
+            });
         }
     }
 
