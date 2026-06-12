@@ -3193,9 +3193,18 @@ async fn fixture_5b_sent_mismatch_superseded_is_not_terminalised() {
     let doc_a = seed_sent(app.db(), fn_id, 0x01, 1, "SFN-A").await;
     let doc_b = seed_sent(app.db(), fn_id, 0x02, 2, "SFN-B").await;
 
-    // DPS's FN tip is B's id; both probes (A then B, by lnd) read it.
-    let stub = StubDpsChannel::new(Ok(ack("unused-send")))
-        .with_last_chk_queue(vec![Ok(ack("SFN-B")), Ok(ack("SFN-B"))]);
+    // DPS's FN tip is B's id; both probes (A then B, by lnd) read it.  A's probe
+    // Mismatches (data_sign irrelevant); B's probe Matches and ADVANCES, so B's
+    // ack must carry non-empty data_sign (the KVT1 evidence) — an empty one would
+    // now be held by the NC-01 evidence guard (pinned in kill_point_matrix::k4b_…).
+    let stub = StubDpsChannel::new(Ok(ack("unused-send"))).with_last_chk_queue(vec![
+        Ok(ack("SFN-B")),
+        Ok(CheckAck {
+            id: "SFN-B".into(),
+            id_sign: vec![],
+            data_sign: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        }),
+    ]);
     let signing_ctx = det_signing_ctx();
     let fn_sign = dummy_fn_sign();
     let deps = ReconciliationRuntime::single_fn(RuntimeView {

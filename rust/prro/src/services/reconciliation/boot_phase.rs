@@ -666,6 +666,25 @@ pub async fn advance_sent_to_kvt1_from_probe(
     wire_call_started_at: &str,
     wire_call_finished_at: &str,
 ) -> anyhow::Result<bool> {
+    // NC-01 (external-critic finding, adjudicated 2026-06-11): an empty
+    // `ack.data_sign` must NOT advance SENT→KVT1 — persisting empty KVT1_RAW
+    // would write forensic evidence that is no evidence at all.  Mirror
+    // `kvt2_advance::advance_to_ack`'s StructuralDrift-on-empty guard (the
+    // established contract: empty data_sign routes to Hold upstream, never
+    // reaches an advance).  A matching id with empty data_sign is abnormal;
+    // fail-loud BEFORE the CAS so the doc holds at SENT (the Match arm absorbs
+    // this Err via `emit_dispatch_error` → BOOT_DISPATCH_ERROR, "doc stays in
+    // source state") and the next probe tick retries.  No state change, no
+    // empty KVT1_RAW row.
+    if ack.data_sign.is_empty() {
+        anyhow::bail!(
+            "advance_sent_to_kvt1_from_probe: probe Matched on id but ack.data_sign is \
+             EMPTY for doc {doc_id:?} — empty KVT1 evidence must not advance SENT→KVT1 \
+             (mirrors kvt2_advance::advance_to_ack StructuralDrift-on-empty; NC-01). \
+             Doc holds at SENT for re-probe."
+        );
+    }
+
     // NIT 1 fix: single clone layer.  `move |tx|` captures the
     // outer-scope owned strings; the `async move` block then takes
     // them into the future.  No inner re-clone needed under FnOnce.

@@ -1364,3 +1364,99 @@ async fn k7_sent_probe_alloc_orphan_is_benign_after_m1_04() {
     assert_eq!(count_doc_rows(&pool).await, 1, "exactly one ledger row");
     prro::db::invariant_scan::assert_clean(&pool).await;
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// K4b (NC-01) — SENT-probe Match with a matching id but EMPTY data_sign.
+//
+// External-critic finding NC-01 (adjudicated 2026-06-11): `last_chk_probe::probe`
+// Matches on `ack.id` alone and `advance_sent_to_kvt1_from_probe` persisted
+// `ack.data_sign` into KVT1_RAW with NO `is_empty` guard — so the probe path
+// could advance SENT→KVT1 persisting EMPTY forensic KVT1 bytes, diverging from
+// the W12 classify contract (empty data_sign → Hold) and `advance_to_ack`'s own
+// StructuralDrift-on-empty guard.
+//
+// Build:    online inline::run, lastChk Hold (empty) → doc rests SENT.
+// Recovery: boot with a probe stub returning a MATCHING id + `vec![]` data_sign.
+// Locked (the fix mirrors `advance_to_ack`): the advance fail-louds on empty, so
+//   the doc HOLDS at SENT (no advance), NO KVT1_RAW row is persisted (let alone
+//   an empty one), ZERO send in recovery, scan clean.  Next probe tick retries.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn k4b_sent_probe_matching_id_empty_data_sign_holds_at_sent() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_sell(&pool).await;
+
+    // ── Phase 1: online SELL, lastChk Hold (empty) → doc rests SENT.
+    let send_calls = Arc::new(AtomicUsize::new(0));
+    let last_calls = Arc::new(AtomicUsize::new(0));
+    let phase1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    phase1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    phase1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → online Hold → SENT
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    {
+        let guard = gate.clone().lock_owned().await;
+        inline::run(
+            &pool,
+            &pool_secure,
+            &phase1,
+            &sign_ctx,
+            &fn_sign,
+            &guard,
+            &row,
+        )
+        .await
+        .expect("phase 1 rests at SENT");
+    }
+    assert_eq!(read_doc_state(&pool, FN).await, "SENT", "K4b setup: SENT");
+
+    // ── Recovery: boot probe returns the MATCHING id but EMPTY data_sign.
+    let phase2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // matching id, EMPTY data_sign
+    let sign_ctx2 = det_signing_ctx();
+    let fn_sign2 = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &phase2,
+        signing_ctx: &sign_ctx2,
+        fn_sign: &fn_sign2,
+    };
+    boot_phase::run_boot_reconciliation(&recon_guard(), &pool, FN, Some(&view))
+        .await
+        .expect("boot reconciliation must succeed (empty probe holds, not errors fatally)");
+
+    // ── Locked assertions (NC-01).
+    assert_eq!(
+        read_doc_state(&pool, FN).await,
+        "SENT",
+        "matching id + empty data_sign must NOT advance SENT→KVT1 (mirror advance_to_ack)"
+    );
+    let kvt1_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM document_files WHERE kind = 'KVT1_RAW'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        kvt1_rows, 0,
+        "no KVT1_RAW persisted — empty forensic evidence is never written"
+    );
+    let empty_kvt1: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM document_files WHERE kind = 'KVT1_RAW' AND length(content) = 0",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(empty_kvt1, 0, "non-empty KVT1_RAW invariant holds");
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        1,
+        "ZERO send in recovery — the probe never resends"
+    );
+    assert_eq!(count_doc_rows(&pool).await, 1, "exactly one ledger row");
+    prro::db::invariant_scan::assert_clean(&pool).await;
+}
