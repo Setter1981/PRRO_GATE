@@ -771,6 +771,49 @@ pub async fn newest_pending_submittable(
     .await
 }
 
+/// NC-03 (external-critic FT, adjudicated 2026-06-11) — the FN's highest `lnd`
+/// over ALL doc states (no state / sfn filter).  `None` ⟺ NO `fiscal_documents`
+/// row exists for the FN (a genuinely fresh FN).  Boot branch (a) uses this to
+/// distinguish "fresh FN" (bootstrap next_lnd=1) from "node_state lost but ledger
+/// survived" (reconstruct next_lnd = `MAX(lnd)+1`, since the LND allocator reads
+/// `node_state.next_lnd`).  Pool-bound read, no write-tx.
+pub async fn max_lnd_any_state(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MAX(lnd) FROM fiscal_documents WHERE fiscal_number = ?",
+    )
+    .bind(fiscal_number)
+    .fetch_one(pool)
+    .await
+}
+
+/// NC-03 — the `unsigned_xml_sha256` of the FN's last ACKed doc (max `lnd` in
+/// state `ACK`).  This is exactly the value the normal flow leaves in
+/// `node_state.last_known_unsigned_xml_sha256`: `stage_finalize` advances the
+/// chain seed to the just-ACKed doc's `unsigned_xml_sha256` (finalize §4), so
+/// projecting the seed from the last ACK is unambiguous.  `None` ⟺ the FN has no
+/// ACKed doc (genesis seed — also the correct projection, since the seed only
+/// advances at ACK).  Boot branch (a) uses this to PROJECT the MAC seed when
+/// reconstructing a node_state row whose row was lost while the ledger survived.
+/// Pool-bound read, no write-tx.
+pub async fn last_ack_unsigned_xml_sha256(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<Vec<u8>>> {
+    let row: Option<Option<Vec<u8>>> = sqlx::query_scalar::<_, Option<Vec<u8>>>(
+        "SELECT unsigned_xml_sha256 FROM fiscal_documents \
+         WHERE fiscal_number = ? AND state = 'ACK' \
+         ORDER BY lnd DESC \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.flatten())
+}
+
 /// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 / HIGH-C4-8
 /// resolution; HIGH-C5-1 session scoping; MED-C5-4 KVT2 deferral
 /// reversed by **M3b W12 Commit 3**) — strict `lnd ASC` walker for

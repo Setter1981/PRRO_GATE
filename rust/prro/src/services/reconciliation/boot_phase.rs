@@ -480,6 +480,10 @@ impl SubBranch {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconciliationSummary {
     pub branch_a: usize,
+    /// (a-block) NC-03: FNs whose `node_state` row was lost while the ledger
+    /// survived — allocator + MAC seed reconstructed, node BLOCKED + CRITICAL
+    /// (NOT silently bootstrapped).
+    pub branch_a_blocked_ledger_survived: usize,
     pub branch_b: usize,
     pub branch_c: usize,
     /// W9.4 cycle-2 LOW-5 fix: symmetric field for branch (d).
@@ -541,6 +545,9 @@ impl ReconciliationSummary {
             BranchOutcome::PreservedBlocked => self.branch_f_blocked += 1,
             BranchOutcome::PreservedStopMode => self.branch_f_stop_mode += 1,
             BranchOutcome::PreservedCryptoDegraded => self.branch_f_crypto_degraded += 1,
+            BranchOutcome::BlockedLedgerWithoutNodeState => {
+                self.branch_a_blocked_ledger_survived += 1
+            }
         }
     }
 }
@@ -1324,6 +1331,13 @@ pub enum BranchOutcome {
     PreservedBlocked,
     PreservedStopMode,
     PreservedCryptoDegraded,
+    /// (a-block) NC-03 (external-critic FT, adjudicated 2026-06-11): the FN's
+    /// `node_state` row was absent BUT the `fiscal_documents` ledger survived
+    /// (partial restore / corruption / rebaseline).  Branch (a) did NOT silently
+    /// bootstrap a fresh FN — it reconstructed the LND allocator
+    /// (`next_lnd = MAX(lnd)+1`), projected the MAC seed from the last ACK, and
+    /// BLOCKED the node with a CRITICAL audit.  No wire, no doc-state transition.
+    BlockedLedgerWithoutNodeState,
 }
 
 impl BranchOutcome {
@@ -1342,6 +1356,7 @@ impl BranchOutcome {
             BranchOutcome::PreservedBlocked => "f1",
             BranchOutcome::PreservedStopMode => "f2",
             BranchOutcome::PreservedCryptoDegraded => "f3",
+            BranchOutcome::BlockedLedgerWithoutNodeState => "a-block",
         }
     }
 
@@ -1565,6 +1580,83 @@ pub async fn run_boot_reconciliation(
 
     // ── Branch (a) — FN row absent ───────────────────────────────
     let Some(row) = row else {
+        // NC-03 (external-critic FT, adjudicated 2026-06-11): the `node_state`
+        // row is absent.  Before bootstrapping a FRESH FN (next_lnd=1, genesis
+        // seed), cross-check the ledger.  If ANY `fiscal_documents` row exists,
+        // node_state was LOST while the ledger SURVIVED (partial restore /
+        // corruption / rebaseline) — NOT a fresh FN.  A silent bootstrap would
+        // reset the LND allocator to 1 (the allocator reads `node_state.next_lnd`)
+        // → the next write either fail-closes on `ux_fd_fn_lnd` OR (sparse
+        // history) allocates BELOW the tail and signs with `previous_hash=None`
+        // → duplicate lnd / forked MAC chain.  Reconstruct the allocator
+        // (`next_lnd = MAX(lnd)+1`) + project the MAC seed from the last ACK
+        // (finalize leaves the seed = the ACKed doc's `unsigned_xml_sha256`, so
+        // this is unambiguous; `None` when no ACK = genesis), then BLOCK +
+        // CRITICAL: a node whose node_state vanished under it is NOT healthy and
+        // must not silently resume trading.
+        if let Some(max_lnd) = fiscal_documents::max_lnd_any_state(pool, fiscal_number).await? {
+            let next_lnd = max_lnd + 1;
+            let projected_seed: Option<[u8; 32]> =
+                match fiscal_documents::last_ack_unsigned_xml_sha256(pool, fiscal_number).await? {
+                    Some(bytes) => Some(<[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                        anyhow::anyhow!(
+                            "NC-03: last ACK unsigned_xml_sha256 for FN {fiscal_number} is not \
+                             32 bytes — corrupted MAC seed, refusing to project"
+                        )
+                    })?),
+                    None => None,
+                };
+            let fn_owned = fiscal_number.to_string();
+            let payload = serde_json::json!({
+                "fiscal_number": fiscal_number,
+                "branch": "a-block",
+                "recovered_next_lnd": next_lnd,
+                "max_ledger_lnd": max_lnd,
+                "mac_seed_projected": projected_seed.is_some(),
+                "rationale":
+                    "node_state row LOST while the fiscal_documents ledger SURVIVED — LND allocator + MAC seed reconstructed from the ledger; node BLOCKED (no silent bootstrap, no trading until an operator clears the block)",
+            });
+            // One envelope: create the row with the reconstructed allocator,
+            // project the seed, then flip to BLOCKED via the existing W10.3
+            // setter (the row now exists), + CRITICAL audit.  The transient
+            // Online is never observable — boot runs before ingress is accepted
+            // and the flip commits atomically.
+            with_immediate(pool, move |tx| {
+                Box::pin(async move {
+                    node_state::upsert_initial_tx(
+                        tx,
+                        &fn_owned,
+                        NodeMode::Online,
+                        ShiftState::Closed,
+                        next_lnd,
+                    )
+                    .await?;
+                    if let Some(seed) = projected_seed {
+                        node_state::update_last_known_xml_sha_tx(tx, &fn_owned, &seed).await?;
+                    }
+                    let blocked = node_state::set_mode_blocked_tx(tx, &fn_owned).await?;
+                    anyhow::ensure!(
+                        blocked,
+                        "NC-03: node_state row vanished mid-bootstrap for FN {fn_owned}"
+                    );
+                    audit_log::append_tx(
+                        tx,
+                        "node_state",
+                        &fn_owned,
+                        "BOOT_LEDGER_WITHOUT_NODE_STATE_BLOCKED",
+                        crate::db::models::enums::Severity::Critical,
+                        None,
+                        Some(&payload.to_string()),
+                    )
+                    .await?;
+                    Ok::<(), anyhow::Error>(())
+                })
+            })
+            .await?;
+            return Ok(BranchOutcome::BlockedLedgerWithoutNodeState);
+        }
+
+        // Empty ledger → genuinely fresh FN → original bootstrap (UNCHANGED).
         node_state::upsert_initial(pool, fiscal_number, NodeMode::Online, ShiftState::Closed, 1)
             .await?;
         let payload = serde_json::json!({

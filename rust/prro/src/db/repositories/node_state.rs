@@ -101,6 +101,33 @@ pub async fn upsert_initial(
     Ok(())
 }
 
+/// Tx-bound variant of [`upsert_initial`] — identical INSERT/ON-CONFLICT,
+/// composable inside a `with_immediate` envelope.  Added for NC-03 (2026-06-11):
+/// boot branch (a) must create the `node_state` row with a RECONSTRUCTED
+/// `next_lnd`, project the MAC seed, and flip to BLOCKED (via the W10.3 setter)
+/// ATOMICALLY in one envelope when the ledger survived but the row was lost.
+pub async fn upsert_initial_tx(
+    tx: &mut WriteTxConn<'_>,
+    fn_id: &str,
+    mode: NodeMode,
+    shift_state: ShiftState,
+    next_lnd: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO node_state (fiscal_number, mode, shift_state, next_lnd) \
+         VALUES (?, ?, ?, ?) \
+         ON CONFLICT(fiscal_number) DO UPDATE SET \
+            mode = excluded.mode, shift_state = excluded.shift_state",
+    )
+    .bind(fn_id)
+    .bind(mode)
+    .bind(shift_state)
+    .bind(next_lnd)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Set `last_known_unsigned_xml_sha256` on an existing FN row.  Returns
 /// `true` if the FN row existed and was updated, `false` if no such row.
 /// Caller decides whether to bootstrap via `upsert_initial` first.
