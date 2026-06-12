@@ -112,6 +112,89 @@ FT 1 · HIGH 1 · MED 2 · LOW 1 · NIT 0 · HYPOTHESIS 1. (RT-2/RT-5 known-gaps
 
 ---
 
+## Architect rulings (Fable, 2026-06-12)
+
+**Repro re-run independently (migration-grade, FT requires it).** I re-appended the
+Appendix-A probe to `kill_point_matrix.rs`, ran it on `2320d4d`, reverted. Output matches
+the dossier **verbatim**: `prev1==prev2` (both `None`), `node_seed_after_offline_emit_is_some=false`,
+`invariant_scan BEFORE drain: 0`, drain `ReconciliationFailed{… stage 5 chain seed mismatch …
+expected None, actual Some([7,192,24,37…])}` (= doc#1.unsigned `07c0…`), docs after drain
+`[(1,"ACK"),(2,"KVT2")]`, `invariant_scan AFTER drain: 1 ChainBreak{lnd:2}`. Mechanism also
+confirmed by reading: `emit_check` writes `MAC = &h.previous_hash` into the signed XML
+(`xml/mod.rs:321`), and drain's `stage_send::run` sends the **already-signed bytes** —
+`signing_ctx` is consumed only on the `-12` MAC-recovery re-sign arm, NOT the happy path. So
+the baked-in `previous_hash` reaches the wire as-is. **Wire-corruption claim (a) holds.**
+
+- **M2-01 — ruled FT, CONFIRMED.** The MAC chain must advance once per **issued** document.
+  Online issuance = ACK (current). Offline issuance = `OfflineLocalAck` (the receipt is legally
+  fiscalised at offline-ack time — drain is deferred *transmission*, not re-fiscalisation).
+  Today the seed advances only at ACK-finalize, so every offline receipt in a session signs the
+  same `previous_hash` → broken legal chain on the wire AND an undrainable 2+ receipt session.
+- **M2-02 — ruled HIGH, CONFIRMED, and it is the ROOT of why M2-01 shipped.** `c4` +
+  `seed_w12_finalize_prereqs` hand-seed a per-doc chain (`doc_b.prev = doc_a.unsigned`) the real
+  path cannot produce. **Fix-order mandate: rebuild the fixtures FIRST** (emit via the real
+  sign→offline-ack path, or seed all offline docs `prev=<current seed>`), watch them go RED,
+  THEN implement M2-01. The fixtures are the TDD anchor — a fix landed against the lying
+  fixtures would re-bless the bug.
+- **M2-03 — ruled MED, CONFIRMED.** Folds into the M2-01 fix (scan-walk change below makes each
+  offline `prev` distinct and validated during the offline window).
+- **M2-04 — ruled MED, CONFIRMED; disappears with M2-01 BUT keep a defense-in-depth item.**
+  Even after M2-01, a future chain-seed mismatch should not silent-loop: add a
+  `ChainSeedMismatch → manual-recon-class` mapping (it is NOT in `is_manual_recon_retry_class`
+  today) so any such doc escalates the shift to `RequiresManualReconciliation` (§16.7) with an
+  operator surface instead of aborting the FN drain tick every cycle. SEPARATE small item,
+  lands with the fix-batch.
+- **M2-05 — ruled LOW, accept.** Fold into `invariant_scan`: "no `OfflineLocalAck` doc with NULL
+  `offline_session_id`" — machine-enforce the `backlog_drain.rs:706` "always stamps" comment.
+- **M2-H1 — DIG (short, separate pass).** `code_lnd` (offline code pool) vs `lnd` (next_lnd
+  allocator) are independent monotonic sequences; drain orders by `lnd`, the legal offline
+  ordinal derives from `code_lnd`. If a session can interleave them out of order, drain's
+  `ORDER BY lnd` could transmit in an order that disagrees with the legal code order. Bounded
+  pass; not a fix-now.
+
+### M2-01 fix DESIGN (Fable-locked — the hunter's one-liner is INSUFFICIENT)
+
+The dossier's candidate ("advance the seed at `OfflineLocalAck`") is directionally right for the
+**sign** side but **breaks the drain side**: if offline-ack advances the seed to the *last*
+offline doc, then draining doc#1 (lnd-ASC) hits `stage_finalize.rs:293` immediately
+(`ns_seed = doc#N.unsigned ≠ doc#1.prev`) — fails on doc#1 instead of doc#2, i.e. WORSE. The
+seed is a single pointer = "hash of the last **issued** doc"; drain must not re-touch it. Full
+seam (TDD order, all under the per-FN gate / single-writer invariant):
+
+1. **Fixtures first (M2-02).** Rebuild the multi-doc W12 drain fixtures to the real chain
+   (`doc_a.prev == doc_b.prev` for same-session offline, or emit through the real path). RED.
+2. **`stage_offline_ack` — advance the seed in the SAME `with_immediate` as the
+   `Signed→OfflineLocalAck` transition**, AFTER reading the doc's `unsigned_xml_sha256`:
+   first assert `ns_seed == doc.previous_hash` (symmetry with finalize §3 — under the FN gate
+   nothing advanced it since sign; a mismatch is a real drift → fail-closed), then
+   `update_last_known_xml_sha_tx(seed = doc.unsigned_xml_sha256)`. Now offline doc#2 signs
+   `prev = doc#1.unsigned`. The online↔offline boundary stays continuous (a later online doc
+   signs off the last offline doc; its finalize advances normally).
+3. **`stage_finalize` — skip BOTH the chain-continuity guard (§3) and the seed-advance (§4)
+   for offline-origin docs.** Add `offline_fiscal_no` (or `offline_session_id`) to
+   `fetch_finalize_inputs_tx`; when non-NULL the doc fiscalised at offline-ack — the seed
+   already moved past it, so re-validating/re-advancing is wrong. Still do CAS Kvt2→Ack,
+   inbox-DONE, outbox, audit. (Online-origin docs: unchanged.)
+4. **`invariant_scan` walk — advance `expected` for ISSUED docs, with the offline rule.**
+   Online doc issues at `ACK`; offline-origin doc (offline_fiscal_no non-NULL) issues at
+   `OfflineLocalAck` AND stays "issued" through its drain states `SENT/KVT1/KVT2/ACK`. Precise
+   rule: advance `expected = unsigned_sha` when `state=='ACK' OR (offline_fiscal_no IS NOT NULL
+   AND state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','KVT2','ACK'))`. This validates the offline
+   chain DURING the offline window (closes M2-03) and stays correct mid-drain (no false
+   ChainBreak when doc#1 is at KVT2 and doc#2 chains off it).
+5. **M2-04 defense item** (separate, small): `ChainSeedMismatch` → manual-recon class.
+6. **M2-05**: scan check "no OfflineLocalAck with NULL offline_session_id".
+
+Pins: a real-path two-offline-receipt drain → both ACK, distinct `previous_hash`,
+`send_chk==2`, scan clean before AND after drain; the online→offline→online boundary
+continuity; single-receipt K6 still green. This is hot-zone (write_path + offline + persistence
++ invariant_scan) — Opus implements the locked design, Fable reviews the delta B1-style.
+**Not a fence-batch.** Class: the same "fixture encodes aspirational, unreachable state" L3
+family as B1-Mismatch / the M1 cleared-then-broken verdicts — the test lie is the load-bearing
+finding.
+
+---
+
 ## Appendix A — M2-01/02/03/04 repro (throwaway test, run on 2320d4d, NOT committed)
 
 Appended to `tests/kill_point_matrix.rs` (reuses its offline helpers), run, then reverted.
