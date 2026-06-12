@@ -106,18 +106,23 @@ async fn insert_signed_doc(pool: &sqlx::SqlitePool, fn_id: &str, lnd: i64) -> Do
     let doc_id = DocumentId::new();
     let req_id = Uuid::now_v7();
     let sha = vec![0u8; 32];
+    // M2-01: a SIGNED doc carries `unsigned_xml_sha256`; stage_offline_ack reads
+    // it to advance the MAC chain seed.  `previous_hash` stays NULL (genesis) to
+    // match the genesis node seed so the step-7b drift-assert passes.
+    let unsigned = vec![0xA0u8.wrapping_add(lnd as u8); 32];
     sqlx::query(
         "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
             state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
-            payload_sha256_canonical) \
+            payload_sha256_canonical, unsigned_xml_sha256) \
          VALUES (?, ?, ?, ?, 'SELL', 'SIGNED', 'b', 't', 'OFFLINE', \
-            '2026-05-16T00:00:00Z', '{}', ?)",
+            '2026-05-16T00:00:00Z', '{}', ?, ?)",
     )
     .bind(doc_id)
     .bind(req_id.as_bytes().to_vec())
     .bind(fn_id)
     .bind(lnd)
     .bind(&sha)
+    .bind(&unsigned)
     .execute(pool)
     .await
     .unwrap();

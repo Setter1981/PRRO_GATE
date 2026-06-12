@@ -89,6 +89,11 @@ pub enum Violation {
         offline_fiscal_no: i64,
         count: i64,
     },
+    /// M2-05: an `OFFLINE_LOCAL_ACK` doc with NULL `offline_session_id` —
+    /// machine-enforces `backlog_drain.rs`'s "W7 always stamps
+    /// offline_session_id" assumption; such a doc is invisible to the
+    /// session-scoped drain cohort (silent backlog leak).
+    OfflineLocalAckWithoutSession { document_id_hex: String },
 }
 
 fn hex32_opt(b: &Option<Vec<u8>>) -> String {
@@ -98,8 +103,11 @@ fn hex32_opt(b: &Option<Vec<u8>>) -> String {
     }
 }
 
-/// Chain-walk row: `(lnd, state, previous_hash, unsigned_xml_sha256)`.
-type ChainRow = (i64, String, Option<Vec<u8>>, Option<Vec<u8>>);
+/// Chain-walk row: `(lnd, state, previous_hash, unsigned_xml_sha256,
+/// offline_fiscal_no)`.  `offline_fiscal_no` (M2-01) marks an offline-origin
+/// doc, which issues at `OfflineLocalAck` (not ACK) and so advances the seed
+/// from that state onward.
+type ChainRow = (i64, String, Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>);
 
 /// Run every check; return ALL violations found (empty = clean).
 pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
@@ -163,7 +171,7 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             .await?;
     for (fiscal_number, node_seed) in fns {
         let docs: Vec<ChainRow> = sqlx::query_as(
-            "SELECT lnd, state, previous_hash, unsigned_xml_sha256 \
+            "SELECT lnd, state, previous_hash, unsigned_xml_sha256, offline_fiscal_no \
              FROM fiscal_documents \
              WHERE fiscal_number = ? AND unsigned_xml_sha256 IS NOT NULL \
              ORDER BY lnd ASC",
@@ -172,7 +180,7 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
         .fetch_all(pool)
         .await?;
         let mut expected: Option<Vec<u8>> = None;
-        for (lnd, state, previous_hash, unsigned_sha) in docs {
+        for (lnd, state, previous_hash, unsigned_sha, offline_fiscal_no) in docs {
             if previous_hash != expected {
                 out.push(Violation::ChainBreak {
                     fiscal_number: fiscal_number.clone(),
@@ -181,7 +189,20 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
                     found_hex: hex32_opt(&previous_hash),
                 });
             }
-            if state == "ACK" {
+            // M2-01 (Fable-locked): the seed advances once per ISSUED doc.
+            // Online docs issue at ACK; offline-origin docs (offline_fiscal_no
+            // NOT NULL) issue at OfflineLocalAck and stay "issued" through their
+            // drain states — so they advance `expected` from OFFLINE_LOCAL_ACK
+            // onward.  This validates the offline chain DURING the offline window
+            // (closes M2-03) and stays correct mid-drain (no false ChainBreak
+            // when doc#1 is at KVT2 and doc#2 chains off it).
+            let issued = state == "ACK"
+                || (offline_fiscal_no.is_some()
+                    && matches!(
+                        state.as_str(),
+                        "OFFLINE_LOCAL_ACK" | "SENT" | "KVT1" | "KVT2" | "ACK"
+                    ));
+            if issued {
                 expected = unsigned_sha;
             }
         }
@@ -256,6 +277,19 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             offline_fiscal_no,
             count,
         });
+    }
+
+    // 6d. M2-05: no OFFLINE_LOCAL_ACK doc with NULL offline_session_id —
+    //     machine-enforce the drain's "W7 always stamps offline_session_id"
+    //     assumption (such a doc is invisible to the session-scoped cohort).
+    let no_session: Vec<(String,)> = sqlx::query_as(
+        "SELECT lower(hex(document_id)) FROM fiscal_documents \
+         WHERE state = 'OFFLINE_LOCAL_ACK' AND offline_session_id IS NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (document_id_hex,) in no_session {
+        out.push(Violation::OfflineLocalAckWithoutSession { document_id_hex });
     }
 
     Ok(out)

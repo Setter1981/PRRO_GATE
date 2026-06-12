@@ -336,6 +336,68 @@ pub async fn run(
 
             match outcome {
                 TransitionOutcome::Applied => {
+                    // ─── Step 7b: advance the MAC chain seed (M2-01) ───────
+                    //
+                    // M2-01 (Fable-locked, 2026-06-12): an `OfflineLocalAck` IS
+                    // a local fiscalisation — the receipt is legally issued now;
+                    // drain is deferred *transmission*, not re-fiscalisation.
+                    // So the chain seed must advance HERE (the ONLY seed-advance
+                    // for offline-origin docs — `stage_finalize` skips it for
+                    // them).  In the SAME envelope as the CAS: read the doc's
+                    // signed-chain fields, assert the seed has not drifted since
+                    // sign (under the per-FN write gate nothing moves it between
+                    // sign and offline-ack; a mismatch is a real drift →
+                    // fail-closed, symmetric with `stage_finalize` §3), then
+                    // advance the seed to this doc's `unsigned_xml_sha256` so the
+                    // NEXT offline receipt of the session chains off it.  Without
+                    // this every offline receipt signs the same `previous_hash`
+                    // → broken legal chain on the wire + an undrainable 2+ doc
+                    // session.  (Sibling runtime read — kept out of the
+                    // compile-checked `fetch_offline_ack_inputs_tx` query! macro
+                    // to avoid regenerating the whole `.sqlx` cache; same tx,
+                    // same semantics as the locked design's "read in fetch
+                    // inputs".)
+                    // Doc was just transitioned to OfflineLocalAck in THIS tx, so
+                    // it exists; read its two chain fields (separate scalars to
+                    // keep the type simple).
+                    let prev: Option<Vec<u8>> = sqlx::query_scalar(
+                        "SELECT previous_hash FROM fiscal_documents WHERE document_id = ?",
+                    )
+                    .bind(doc_id)
+                    .fetch_one(&mut **tx)
+                    .await?;
+                    let unsigned: Option<Vec<u8>> = sqlx::query_scalar(
+                        "SELECT unsigned_xml_sha256 FROM fiscal_documents WHERE document_id = ?",
+                    )
+                    .bind(doc_id)
+                    .fetch_one(&mut **tx)
+                    .await?;
+                    anyhow::ensure!(
+                        ns.last_known_unsigned_xml_sha256.as_ref().map(|h| h.as_slice())
+                            == prev.as_deref(),
+                        "stage_offline_ack: chain-seed drift for doc {doc_id:?} — node_state seed \
+                         != doc.previous_hash (offline issuance must extend the chain from the last \
+                         issued doc); refusing to advance"
+                    );
+                    let unsigned_arr: [u8; 32] = unsigned
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "stage_offline_ack: SIGNED doc {doc_id:?} missing unsigned_xml_sha256"
+                            )
+                        })?
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "stage_offline_ack: doc {doc_id:?} unsigned_xml_sha256 is not 32 bytes"
+                            )
+                        })?;
+                    if !node_state::update_last_known_xml_sha_tx(tx, &fn_id, &unsigned_arr).await? {
+                        anyhow::bail!(
+                            "stage_offline_ack: node_state row vanished mid-envelope for FN {fn_id}"
+                        );
+                    }
+
                     // ─── Step 8: emit Applied audit ─────────────────
                     let payload = json!({
                         "document_id": hex_lower(doc_id.as_bytes()),

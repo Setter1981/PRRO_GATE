@@ -367,9 +367,15 @@ async fn c4_happy_path_two_docs_advance_to_ack_via_w12() {
         seed_complete_offline_local_ack(&pool, 1, 100, session_id, shift_id, CASHIER_OK).await;
     let doc_b =
         seed_complete_offline_local_ack(&pool, 2, 101, session_id, shift_id, CASHIER_OK).await;
-    // W12 chain bootstrap: anchor + per-doc finalize prereqs.  Doc A
-    // (lnd=1) processed first; its unsigned_xml_sha256 becomes the
-    // chain anchor for doc B's previous_hash.
+    // M2-01 (Fable-locked fix-order): seed the REAL same-session offline
+    // chain.  The real sign→offline-ack path does NOT advance the MAC seed
+    // until M2-01 lands, so BOTH offline docs of one session sign the SAME
+    // `previous_hash` (the session-entry seed) — NOT a per-doc chain.  Both
+    // docs therefore carry `prev = chain_anchor(0x00)`; their
+    // `unsigned_xml_sha256` differ (0x01, 0x02).  Against pre-M2-01 code this
+    // is RED (doc B fails `stage_finalize` ChainSeedMismatch once doc A's
+    // finalize advances the seed); post-fix `stage_finalize` skips the
+    // chain-continuity guard for offline-origin docs, so both reach ACK.
     common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
         .await
         .unwrap();
@@ -386,7 +392,7 @@ async fn c4_happy_path_two_docs_advance_to_ack_via_w12() {
         &pool,
         FN,
         doc_b,
-        common::chain_anchor(0x01),
+        common::chain_anchor(0x00),
         common::chain_anchor(0x02),
     )
     .await
