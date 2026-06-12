@@ -89,11 +89,13 @@ pub enum Violation {
         offline_fiscal_no: i64,
         count: i64,
     },
-    /// M2-05: an `OFFLINE_LOCAL_ACK` doc with NULL `offline_session_id` —
-    /// machine-enforces `backlog_drain.rs`'s "W7 always stamps
-    /// offline_session_id" assumption; such a doc is invisible to the
-    /// session-scoped drain cohort (silent backlog leak).
-    OfflineLocalAckWithoutSession { document_id_hex: String },
+    /// M2-05 / M2-X3: an offline-origin doc (`offline_fiscal_no` NOT NULL) in any
+    /// DRAIN-COHORT state with NULL `offline_session_id` — machine-enforces
+    /// `backlog_drain.rs`'s "W7 always stamps offline_session_id" assumption;
+    /// such a doc is invisible to the session-scoped drain cohort (silent backlog
+    /// leak).  Widened (M2-X3, 2026-06-12) from `OFFLINE_LOCAL_ACK`-only to the
+    /// full cohort state set, hence the rename from `…OfflineLocalAckWithout…`.
+    OfflineOriginWithoutSession { document_id_hex: String },
 }
 
 fn hex32_opt(b: &Option<Vec<u8>>) -> String {
@@ -283,17 +285,22 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
         });
     }
 
-    // 6d. M2-05: no OFFLINE_LOCAL_ACK doc with NULL offline_session_id —
-    //     machine-enforce the drain's "W7 always stamps offline_session_id"
-    //     assumption (such a doc is invisible to the session-scoped cohort).
+    // 6d. M2-05 / M2-X3: no offline-origin doc in the DRAIN-COHORT state set with
+    //     NULL offline_session_id — machine-enforce the drain's "W7 always stamps
+    //     offline_session_id" assumption (such a doc is invisible to the
+    //     session-scoped cohort).  Widened (M2-X3) from OFFLINE_LOCAL_ACK-only to
+    //     the cohort set (mirrors `list_drain_candidates_for_fn_ordered_by_lnd`);
+    //     `offline_fiscal_no IS NOT NULL` excludes online docs (which never carry
+    //     a session) so no legitimate row trips it.
     let no_session: Vec<(String,)> = sqlx::query_as(
         "SELECT lower(hex(document_id)) FROM fiscal_documents \
-         WHERE state = 'OFFLINE_LOCAL_ACK' AND offline_session_id IS NULL",
+         WHERE state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE','KVT2') \
+           AND offline_session_id IS NULL AND offline_fiscal_no IS NOT NULL",
     )
     .fetch_all(pool)
     .await?;
     for (document_id_hex,) in no_session {
-        out.push(Violation::OfflineLocalAckWithoutSession { document_id_hex });
+        out.push(Violation::OfflineOriginWithoutSession { document_id_hex });
     }
 
     Ok(out)

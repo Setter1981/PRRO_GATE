@@ -558,10 +558,13 @@ async fn clean_error_retryable_offline_doc_mid_drain_scans_clean() {
 /// invisible to the session-scoped drain cohort (silent backlog leak) —
 /// the scan must flag it.
 #[tokio::test]
-async fn detects_offline_local_ack_without_session() {
+async fn detects_offline_origin_without_session() {
     let pool = fresh_pool().await;
     let shift = seed_fn(&pool).await;
     seed_node_state(&pool, shift, None).await;
+    // seed_doc never sets offline_session_id (always NULL).  Offline-origin docs
+    // (offline_fiscal_no Some) in a DRAIN-COHORT state → flagged (M2-05 + the
+    // M2-X3 widening to SENT/KVT1/ERROR_RETRYABLE/KVT2).
     seed_doc(
         &pool,
         shift,
@@ -570,14 +573,56 @@ async fn detects_offline_local_ack_without_session() {
         None,
         None,
         Some(h(1)),
+        Some(11),
+        false,
+    )
+    .await;
+    seed_doc(
+        &pool,
+        shift,
+        2,
+        "SENT",
+        Some("SFN-2"),
+        None,
+        Some(h(2)),
+        Some(12),
+        false,
+    )
+    .await;
+    // Clean — must NOT trip: (a) an online doc (offline_fiscal_no NULL),
+    // (b) a fully-drained ACK (state outside the drain cohort).
+    seed_doc(
+        &pool,
+        shift,
+        3,
+        "SENT",
+        Some("SFN-3"),
+        None,
+        Some(h(3)),
         None,
         false,
     )
     .await;
+    seed_doc(
+        &pool,
+        shift,
+        4,
+        "ACK",
+        Some("SFN-4"),
+        None,
+        Some(h(4)),
+        Some(14),
+        true,
+    )
+    .await;
     let v = scan(&pool).await.unwrap();
-    assert!(
-        v.iter()
-            .any(|x| matches!(x, Violation::OfflineLocalAckWithoutSession { .. })),
-        "got: {v:#?}"
+    let flagged = v
+        .iter()
+        .filter(|x| matches!(x, Violation::OfflineOriginWithoutSession { .. }))
+        .count();
+    assert_eq!(
+        flagged, 2,
+        "offline-origin NULL-session cohort docs (OFFLINE_LOCAL_ACK + SENT) flagged; \
+         online + drained-ACK excluded: {v:#?}"
     );
 }
