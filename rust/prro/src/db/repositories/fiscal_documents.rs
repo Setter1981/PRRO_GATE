@@ -1421,6 +1421,13 @@ pub struct OfflineAckInputs {
     pub state: DocState,
     pub doc_type: DocType,
     pub fiscal_number: String,
+    /// M2-01 (review fold, 2026-06-12): the doc's signed-chain fields, read in
+    /// the SAME input fetch (write-once at `stage_sign`; unchanged between SIGNED
+    /// and the offline-ack CAS — so a pre-CAS read is equivalent to the prior
+    /// post-CAS sibling reads).  `stage_offline_ack` step 7b asserts
+    /// `ns_seed == previous_hash` then advances the seed to `unsigned_xml_sha256`.
+    pub previous_hash: Option<Vec<u8>>,
+    pub unsigned_xml_sha256: Option<Vec<u8>>,
 }
 
 /// W14a-2b Commit 6 §3.7 — single-SELECT inputs reader for
@@ -1431,9 +1438,11 @@ pub async fn fetch_offline_ack_inputs_tx(
     doc_id: DocumentId,
 ) -> sqlx::Result<Option<OfflineAckInputs>> {
     let row = sqlx::query!(
-        r#"SELECT state        as "state: DocState",
-                  doc_type     as "doc_type: DocType",
-                  fiscal_number
+        r#"SELECT state              as "state: DocState",
+                  doc_type           as "doc_type: DocType",
+                  fiscal_number,
+                  previous_hash      as "previous_hash: Vec<u8>",
+                  unsigned_xml_sha256 as "unsigned_xml_sha256: Vec<u8>"
            FROM fiscal_documents WHERE document_id = ?"#,
         doc_id
     )
@@ -1444,6 +1453,8 @@ pub async fn fetch_offline_ack_inputs_tx(
         state: r.state,
         doc_type: r.doc_type,
         fiscal_number: r.fiscal_number,
+        previous_hash: r.previous_hash,
+        unsigned_xml_sha256: r.unsigned_xml_sha256,
     }))
 }
 
@@ -1488,6 +1499,12 @@ pub struct FinalizeInputs {
     /// post-M3a publisher worker can cross-correlate the queue row
     /// with the canonical payload archive.
     pub payload_sha256_canonical: [u8; 32],
+    /// M2-01/M2-04 (review fold, 2026-06-12): non-NULL ⟺ the doc fiscalised at
+    /// `stage_offline_ack` (offline-origin), where the MAC chain seed already
+    /// advanced past it.  `stage_finalize` uses this to SKIP the chain-continuity
+    /// guard + seed-advance for offline-origin docs.  Read here (in the same
+    /// envelope's input fetch) instead of a sibling runtime query.
+    pub offline_fiscal_no: Option<i64>,
 }
 
 /// W8 stage 5 finalize — read the minimal field set required for
@@ -1507,7 +1524,8 @@ pub async fn fetch_finalize_inputs_tx(
                   lnd,
                   unsigned_xml_sha256       as "unsigned_xml_sha256: Vec<u8>",
                   previous_hash             as "previous_hash: Vec<u8>",
-                  payload_sha256_canonical  as "payload_sha256_canonical!: Vec<u8>"
+                  payload_sha256_canonical  as "payload_sha256_canonical!: Vec<u8>",
+                  offline_fiscal_no
            FROM fiscal_documents WHERE document_id = ?"#,
         doc_id
     )
@@ -1543,6 +1561,7 @@ pub async fn fetch_finalize_inputs_tx(
         unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
         previous_hash: decode_blob32(r.previous_hash, "previous_hash")?,
         payload_sha256_canonical: payload_sha256,
+        offline_fiscal_no: r.offline_fiscal_no,
     }))
 }
 

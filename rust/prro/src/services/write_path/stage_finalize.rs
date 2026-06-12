@@ -283,17 +283,9 @@ pub async fn run(
             // (the seed is now further along — the §3 guard would false-fail)
             // and must NOT re-advance it (double-move).  Online-origin docs are
             // unchanged: they fiscalise at ACK, so finalize owns the guard +
-            // advance.  (Sibling runtime read — same envelope; kept out of the
-            // `fetch_finalize_inputs_tx` query! macro to avoid `.sqlx`
-            // regeneration; same semantics as the locked design.)
-            let offline_origin: Option<i64> = sqlx::query_scalar(
-                "SELECT offline_fiscal_no FROM fiscal_documents WHERE document_id = ?",
-            )
-            .bind(doc)
-            .fetch_one(&mut **tx)
-            .await?;
-
-            if offline_origin.is_none() {
+            // advance.  (Review fold 2026-06-12: read from the same envelope's
+            // input fetch — `offline_fiscal_no` now in `fetch_finalize_inputs_tx`.)
+            if inputs.offline_fiscal_no.is_none() {
                 // 3. Chain-continuity guard (W8 review F2 close).  Read
                 //    the FN's current chain seed inside the same tx and
                 //    assert it equals this doc's `previous_hash` — i.e.

@@ -352,26 +352,14 @@ pub async fn run(
                     // NEXT offline receipt of the session chains off it.  Without
                     // this every offline receipt signs the same `previous_hash`
                     // → broken legal chain on the wire + an undrainable 2+ doc
-                    // session.  (Sibling runtime read — kept out of the
-                    // compile-checked `fetch_offline_ack_inputs_tx` query! macro
-                    // to avoid regenerating the whole `.sqlx` cache; same tx,
-                    // same semantics as the locked design's "read in fetch
-                    // inputs".)
-                    // Doc was just transitioned to OfflineLocalAck in THIS tx, so
-                    // it exists; read its two chain fields (separate scalars to
-                    // keep the type simple).
-                    let prev: Option<Vec<u8>> = sqlx::query_scalar(
-                        "SELECT previous_hash FROM fiscal_documents WHERE document_id = ?",
-                    )
-                    .bind(doc_id)
-                    .fetch_one(&mut **tx)
-                    .await?;
-                    let unsigned: Option<Vec<u8>> = sqlx::query_scalar(
-                        "SELECT unsigned_xml_sha256 FROM fiscal_documents WHERE document_id = ?",
-                    )
-                    .bind(doc_id)
-                    .fetch_one(&mut **tx)
-                    .await?;
+                    // session.  (Review fold 2026-06-12: the chain fields come
+                    // from the same envelope's input fetch
+                    // `fetch_offline_ack_inputs_tx`, read pre-CAS while the doc is
+                    // SIGNED.  They are write-once at stage_sign and unchanged by
+                    // the Signed→OfflineLocalAck CAS, so this is byte-for-byte
+                    // equivalent to the prior post-CAS sibling reads.)
+                    let prev = inputs.previous_hash;
+                    let unsigned = inputs.unsigned_xml_sha256;
                     anyhow::ensure!(
                         ns.last_known_unsigned_xml_sha256.as_ref().map(|h| h.as_slice())
                             == prev.as_deref(),
