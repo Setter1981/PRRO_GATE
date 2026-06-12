@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT fiscal_number,\n                  request_id                as \"request_id!: Vec<u8>\",\n                  lnd,\n                  unsigned_xml_sha256       as \"unsigned_xml_sha256: Vec<u8>\",\n                  previous_hash             as \"previous_hash: Vec<u8>\",\n                  payload_sha256_canonical  as \"payload_sha256_canonical!: Vec<u8>\"\n           FROM fiscal_documents WHERE document_id = ?",
+  "query": "SELECT fiscal_number,\n                  request_id                as \"request_id!: Vec<u8>\",\n                  lnd,\n                  unsigned_xml_sha256       as \"unsigned_xml_sha256: Vec<u8>\",\n                  previous_hash             as \"previous_hash: Vec<u8>\",\n                  payload_sha256_canonical  as \"payload_sha256_canonical!: Vec<u8>\",\n                  offline_fiscal_no\n           FROM fiscal_documents WHERE document_id = ?",
   "describe": {
     "columns": [
       {
@@ -32,6 +32,11 @@
         "name": "payload_sha256_canonical!: Vec<u8>",
         "ordinal": 5,
         "type_info": "Blob"
+      },
+      {
+        "name": "offline_fiscal_no",
+        "ordinal": 6,
+        "type_info": "Integer"
       }
     ],
     "parameters": {
@@ -43,8 +48,9 @@
       false,
       true,
       true,
-      false
+      false,
+      true
     ]
   },
-  "hash": "29ba8f0ff831025cec83f971b7fe0b20796127f01de15a69b889773a6e86d30e"
+  "hash": "9a79970d610344f450109e314b0cc89364405a298ab48a419950d95443fb325a"
 }

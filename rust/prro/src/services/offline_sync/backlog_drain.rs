@@ -534,6 +534,13 @@ pub fn failure_class_for(class: FailureClass) -> &'static str {
         // arm.  Reclassification to manual-class halt is a separate spec
         // decision (operator-confirmed 2026-05-22 scope).
         FailureClass::RetryClassIndeterminate => "retry_class_indeterminate",
+        // M2-04 defense-in-depth (2026-06-12): stage_finalize returned
+        // ChainSeedMismatch — the doc's previous_hash does not match the
+        // FN's current chain seed.  After the M2-01 fix this should be
+        // unreachable for offline-origin docs (finalize skips the guard),
+        // but any future drift must NOT silent-loop the FN drain tick:
+        // escalate the shift to RequiresManualReconciliation (spec §16.7).
+        FailureClass::ChainSeedMismatch => "chain_seed_mismatch",
     }
 }
 
@@ -562,6 +569,12 @@ pub enum FailureClass {
     /// M3b W9b ER-class-guard — no durable `retry_class` recorded for
     /// the ER doc; sibling-continue hold (non-manual).
     RetryClassIndeterminate,
+    /// M2-04 defense (2026-06-12) — `stage_finalize::run` returned
+    /// `ChainSeedMismatch` (doc `previous_hash` ≠ FN chain seed).
+    /// Manual-recon class: escalates the shift to
+    /// `RequiresManualReconciliation` instead of aborting the FN drain
+    /// tick every cycle (the M2-04 silent-loop).
+    ChainSeedMismatch,
 }
 
 // ─── C3 + C4: orchestrator section ───────────────────────────────────
@@ -1873,15 +1886,49 @@ async fn process_via_w12_kvt2_advance(
     doc: &fiscal_documents::DocumentRow,
     summary: &mut DrainSummary,
 ) -> Result<DocVerdict, BootError> {
-    use crate::services::write_path::stage_finalize::{self, StageFinalizeOutcome};
+    use crate::services::write_path::stage_finalize::{
+        self, StageFinalizeError, StageFinalizeOutcome,
+    };
 
     let id_hex = hex_lower(doc.document_id.as_bytes());
-    let outcome = stage_finalize::run(pool, doc.document_id)
-        .await
-        .map_err(|source| BootError::ReconciliationFailed {
-            fiscal_number: fiscal_number.to_string(),
-            source: anyhow::Error::new(source),
-        })?;
+    let outcome = match stage_finalize::run(pool, doc.document_id).await {
+        Ok(o) => o,
+        // M2-04 defense (2026-06-12): a ChainSeedMismatch must NOT abort
+        // the whole FN drain tick and recur every cycle (the silent
+        // fail-loop — doc stays KVT2, re-selected by the KVT2 cohort
+        // filter). Route it to a manual-recon-class per-doc Failed so the
+        // pending-drain loop escalates the shift to
+        // RequiresManualReconciliation (spec §16.7) with an operator
+        // surface. After the M2-01 fix this arm is unreachable for
+        // offline-origin docs (finalize skips the guard); it is
+        // defense-in-depth for any future online-chain drift.
+        Err(StageFinalizeError::ChainSeedMismatch {
+            expected, actual, ..
+        }) => {
+            let class = FailureClass::ChainSeedMismatch;
+            let class_str = failure_class_for(class);
+            summary.record_doc_failure(doc.document_id, class_str.to_string());
+            let payload = serde_json::json!({
+                "document_id": id_hex,
+                "failure_class": class_str,
+                "dispatch_via": "w12_kvt2_recovery",
+                "manual_recon_class": true,
+                "expected_seed_hex": expected.map(|h| hex_lower(&h)),
+                "actual_seed_hex": actual.map(|h| hex_lower(&h)),
+            });
+            emit_doc_failed(pool, &id_hex, &payload).await?;
+            return Ok(DocVerdict::Failed {
+                class,
+                manual_recon: true,
+            });
+        }
+        Err(source) => {
+            return Err(BootError::ReconciliationFailed {
+                fiscal_number: fiscal_number.to_string(),
+                source: anyhow::Error::new(source),
+            });
+        }
+    };
 
     // Acked + AlreadyAcked share the "doc reached Ack" forensic
     // shape; pre-compute the success payload once, then dispatch on

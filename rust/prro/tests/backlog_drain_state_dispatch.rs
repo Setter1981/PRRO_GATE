@@ -3300,3 +3300,127 @@ async fn er_guard_shift_doc_transient_retry_must_not_prematurely_manual() {
          (§16: transport-class for shift open/close is unbounded)"
     );
 }
+
+// ─── M2-04 (Fable contract, 2026-06-12): ChainSeedMismatch → manual-recon ──
+//
+// Before M2-04, a stage_finalize ChainSeedMismatch in the KVT2 cohort arm
+// (`process_via_w12_kvt2_advance`) mapped to a hard BootError::ReconciliationFailed
+// → aborted the whole FN drain tick AND recurred every tick (doc stays KVT2,
+// re-selected by the cohort) — a silent fail-loop that never escalated the shift.
+// Contract: pattern-match ChainSeedMismatch → DocVerdict::Failed { manual_recon }
+// + forensic audit; on a pending-drain shift the loop escalates the shift to
+// RequiresManualReconciliation (§16.7).  All OTHER finalize errors stay hard
+// ReconciliationFailed (pinned by
+// w12_kvt2_stage_finalize_typed_error_routes_to_boot_error_reconciliation_failed).
+//
+// Reachability note: after M2-01 this arm is unreachable for offline-origin docs
+// (finalize skips the chain guard); this test FORCES it by NULLing the cohort
+// doc's offline_fiscal_no so finalize runs the online-origin guard, with the
+// doc's previous_hash ([0xCD;32]) diverging from the genesis node seed (NULL).
+#[tokio::test]
+async fn w12_kvt2_chain_seed_mismatch_escalates_manual_recon_not_hard_abort() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(
+        &pool,
+        NodeMode::GoingOnline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
+    // Shift directly in OPENED_LOCAL_PENDING_DRAIN (escalation precondition).
+    let shift_id = ShiftId::new();
+    sqlx::query(
+        "INSERT INTO shifts(shift_id, fiscal_number, serial, state, \
+            open_mode, cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, ?, 1, 'OPENED_LOCAL_PENDING_DRAIN', 'ONLINE', 0, ?)",
+    )
+    .bind(shift_id)
+    .bind(FN)
+    .bind(CASHIER_OK)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
+        .bind(shift_id)
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+
+    // KVT2 cohort doc (previous_hash = [0xCD;32]); NULL offline_fiscal_no so
+    // stage_finalize runs the online-origin chain guard → ChainSeedMismatch vs
+    // the genesis node seed (NULL).
+    let (doc, _req) =
+        seed_kvt2_doc_for_stage_finalize(&pool, 1, 100, session_id, shift_id, "DPS-FN-KVT2-CSM")
+            .await;
+    sqlx::query("UPDATE fiscal_documents SET offline_fiscal_no = NULL WHERE document_id = ?")
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Force the divergence: reset the FN chain seed to genesis (NULL) so the
+    // doc's previous_hash ([0xCD;32], set by the helper) no longer matches →
+    // stage_finalize's online-origin guard raises ChainSeedMismatch{ expected:
+    // Some([0xCD;32]), actual: None }.  (The helper had aligned the seed for the
+    // happy-path ACK test.)
+    sqlx::query(
+        "UPDATE node_state SET last_known_unsigned_xml_sha256 = NULL WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // No DPS calls expected on the KVT2 finalize arm.
+    let c = carriers(vec![], vec![]);
+    let view = view_for(&c);
+
+    // M2-04: the drain must NOT hard-abort — it returns Ok and escalates.
+    backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .expect("M2-04: ChainSeedMismatch must NOT surface as BootError::ReconciliationFailed");
+
+    // Shift escalated to RequiresManualReconciliation (§16.7, pending-drain ladder).
+    let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(shift_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
+    let node_shift: String =
+        sqlx::query_scalar("SELECT shift_state FROM node_state WHERE fiscal_number = ?")
+            .bind(FN)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(node_shift, "REQUIRES_MANUAL_RECONCILIATION");
+
+    // The doc's KVT2→Ack CAS rolled back with the failed finalize envelope.
+    assert_eq!(read_doc_state(&pool, doc).await, "KVT2");
+
+    // Per-doc forensic audit carries the manual-recon class + seed hexes.
+    let failed = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_FAILED")
+        .await
+        .unwrap();
+    assert_eq!(failed["failure_class"], "chain_seed_mismatch");
+    assert_eq!(failed["dispatch_via"], "w12_kvt2_recovery");
+    assert_eq!(failed["manual_recon_class"], true);
+    assert!(
+        failed["expected_seed_hex"].is_string(),
+        "expected_seed_hex present: {failed:?}"
+    );
+    assert!(
+        failed["actual_seed_hex"].is_null() || failed["actual_seed_hex"].is_string(),
+        "actual_seed_hex present-or-null (genesis): {failed:?}"
+    );
+
+    // Halt audit with the chain_seed_mismatch failure_class.
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1
+    );
+    let halt = audit_latest_payload(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL")
+        .await
+        .unwrap();
+    assert_eq!(halt["failure_class"], "chain_seed_mismatch");
+}
