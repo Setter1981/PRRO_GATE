@@ -1104,3 +1104,146 @@ async fn tip_guard_malformed_tail_null_sfn_blocks() {
         "exactly one CRITICAL stale-ledger audit for the malformed tail"
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 15 (NC-03, FT) — node_state row LOST while the fiscal_documents ledger
+// SURVIVED (partial restore / corruption / rebaseline).  Boot branch (a) must
+// NOT silently bootstrap a fresh FN (next_lnd=1, genesis seed) — that resets the
+// LND allocator (which reads node_state.next_lnd) → duplicate lnd / forked MAC
+// chain.  Instead: reconstruct next_lnd = MAX(lnd)+1, project the MAC seed from
+// the last ACK, and BLOCK + CRITICAL (a node whose node_state vanished is not
+// healthy).  Pin = the candidate SQL repro + invariant_scan post-condition.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn boot_branch_a_ledger_survived_node_state_lost_blocks_and_reconstructs() {
+    let env = setup_online_fn("live.db").await;
+    // Two ACKed receipts via the proven online path → ledger has lnd 1,2 with
+    // real unsigned_xml_sha256; node_state.next_lnd advanced to 3, seed = doc2's
+    // unsigned hash.
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 1, "SFN-1").await;
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 2, "SFN-2").await;
+
+    // Capture the ledger truth BEFORE deleting node_state.
+    let max_lnd: i64 =
+        sqlx::query_scalar("SELECT MAX(lnd) FROM fiscal_documents WHERE fiscal_number = ?")
+            .bind(FN)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    let last_ack_seed: Vec<u8> = sqlx::query_scalar(
+        "SELECT unsigned_xml_sha256 FROM fiscal_documents \
+         WHERE fiscal_number = ? AND state = 'ACK' ORDER BY lnd DESC LIMIT 1",
+    )
+    .bind(FN)
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+
+    // SIMULATE the candidate: node_state row LOST, ledger survives.
+    sqlx::query("DELETE FROM node_state WHERE fiscal_number = ?")
+        .bind(FN)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    assert!(
+        prro::db::repositories::node_state::get(&env.pool, FN)
+            .await
+            .unwrap()
+            .is_none(),
+        "precondition: node_state row deleted"
+    );
+
+    // Boot reconciliation (ctx-free — branch (a) needs no deps).
+    let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &env.pool, FN, None)
+        .await
+        .expect("boot reconciliation must succeed");
+
+    // (1) NOT a silent bootstrap — reconstructed + BLOCKED.
+    assert!(
+        matches!(
+            outcome,
+            boot_phase::BranchOutcome::BlockedLedgerWithoutNodeState
+        ),
+        "ledger-survived-node_state-lost must BLOCK, not Bootstrap; got {outcome:?}"
+    );
+    let ns = prro::db::repositories::node_state::get(&env.pool, FN)
+        .await
+        .unwrap()
+        .expect("node_state row recreated");
+    assert_eq!(
+        ns.mode,
+        NodeMode::Blocked,
+        "node BLOCKED — must not silently resume trading"
+    );
+    // (2) Allocator reconstructed, NOT reset to 1.
+    assert_eq!(
+        ns.next_lnd,
+        max_lnd + 1,
+        "next_lnd = MAX(lnd)+1 (the allocator reads node_state.next_lnd; a reset to 1 would dup lnd)"
+    );
+    // (3) MAC seed projected from the last ACK (not left NULL → no forked chain).
+    assert_eq!(
+        ns.last_known_unsigned_xml_sha256
+            .as_ref()
+            .map(|h| h.to_vec()),
+        Some(last_ack_seed.clone()),
+        "MAC seed projected from the last ACK's unsigned_xml_sha256"
+    );
+    // (4) CRITICAL audit.
+    let crit: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'BOOT_LEDGER_WITHOUT_NODE_STATE_BLOCKED' AND severity = 'CRITICAL'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        crit, 1,
+        "exactly one CRITICAL ledger-without-node_state audit"
+    );
+    // (5) invariant_scan post-condition.
+    prro::db::invariant_scan::assert_clean(&env.pool).await;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 16 (NC-03) — genuinely fresh FN (empty ledger): branch (a) behaviour is
+// UNCHANGED — bootstrap Online, next_lnd=1, INFO audit (no false BLOCK).
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn boot_branch_a_fresh_fn_empty_ledger_bootstraps_unchanged() {
+    let env = setup_online_fn("live.db").await;
+    // No receipts → empty ledger.  Delete the node_state seeded by setup so
+    // branch (a) fires on a truly fresh FN.
+    sqlx::query("DELETE FROM node_state WHERE fiscal_number = ?")
+        .bind(FN)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+
+    let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &env.pool, FN, None)
+        .await
+        .expect("boot reconciliation must succeed");
+
+    assert!(
+        matches!(outcome, boot_phase::BranchOutcome::Bootstrapped),
+        "empty ledger → fresh-FN bootstrap (unchanged); got {outcome:?}"
+    );
+    let ns = prro::db::repositories::node_state::get(&env.pool, FN)
+        .await
+        .unwrap()
+        .expect("node_state bootstrapped");
+    assert_eq!(ns.mode, NodeMode::Online, "fresh FN bootstraps Online");
+    assert_eq!(ns.next_lnd, 1, "fresh FN allocator starts at 1");
+    let blocked: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'BOOT_LEDGER_WITHOUT_NODE_STATE_BLOCKED'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        blocked, 0,
+        "fresh FN: no false ledger-without-node_state BLOCK"
+    );
+}
