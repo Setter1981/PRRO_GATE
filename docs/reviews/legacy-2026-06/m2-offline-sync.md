@@ -309,3 +309,103 @@ No cross-FN test needed — isolation is by table design.
 M2-05 scan-query index (test-only scale), per-file test-helper duplication (house norm),
 DB-column chain pins (the ledger is the legal source of truth), all envelope-routing candidates
 (clean).
+
+## M2-H1 dig (Opus, 2026-06-12)
+
+**Hypothesis:** `code_lnd` (offline pool) and `lnd` (next_lnd) are independent monotonic
+sequences; drain sends `ORDER BY lnd` while the legal offline ordinal = `code_lnd`; a session
+that issues them out of step would put receipts on the wire in an order contradicting the
+legal code order. Flagged BEFORE the M2-01 fix existed; this dig is the post-PR#150 landscape.
+
+**Verdict: REFUTED.** `code_lnd` order is FORCED to equal `lnd` order for every offline doc
+that reaches the wire, by two independent guards — the per-FN write gate (precondition
+unreachable) and the M2-01 drift-assert (fail-closes any out-of-order issuance). The original
+flag was valid pre-M2-01; PR#150 closed it as a side effect.
+
+### 1. Allocator map
+- `lnd`: `node_state::allocate_next_lnd` (`node_state.rs:324` — `UPDATE node_state SET next_lnd
+  = next_lnd + 1 … RETURNING next_lnd - 1`), called at **stage 1** `stage_acquire::run`
+  (`stage_acquire.rs:600`), in stage 1's `with_immediate`.
+- `code_lnd`: `offline_sessions::acquire_code_tx` (`offline_sessions.rs:385-395`) — picks
+  `… ORDER BY code_lnd ASC LIMIT 1` (lowest unconsumed), called at **stage_offline_ack step 6**
+  (`stage_offline_ack.rs:318`), POST-sign, in the offline-ack `with_immediate`.
+- Both run under ONE `FnWriteGate` hold per request — the whole inline pipeline
+  (acquire→sign→offline-ack) is gated as a unit (`fn_gate.rs:1-10`). Distinct `with_immediate`
+  envelopes, but no other request for the FN interleaves between them.
+
+### 2. Wire map — the offline ordinal is NOT in the signed bytes
+- `offline_fiscal_no` is stamped at offline-ack (post-sign): the ONLY writer is
+  `transition_to_offline_local_ack_tx` (`fiscal_documents.rs:396` — `UPDATE … SET state=
+  'OFFLINE_LOCAL_ACK', offline_fiscal_no=? … WHERE … state='SIGNED'`). The signed bytes are
+  produced at `stage_sign` (earlier stage); `xml/mod.rs` has ZERO references to
+  `offline_fiscal_no`. So the code is added AFTER signing → it is NOT cryptographically bound
+  to the receipt; it travels as a wire field (`CheckEnvelope` / `stage_send.rs:143` id_offline)
+  + local bookkeeping. **Consequence:** the offline-ordinal integrity rests on the gateway's
+  serialization (below), not on the signature. (Noted for Fable — not an H1 defect, but the
+  ordering guarantee is operational, not crypto.)
+
+### 3. Divergence paths — each refuted
+A divergence (doc_A lnd<doc_B lnd but code_A>code_B) requires `offline-ack(doc_B)` to precede
+`offline-ack(doc_A)` (codes are handed out lowest-first at ack time). That requires doc_B to be
+SIGNED (prev read) before doc_A's offline-ack advanced the seed — i.e. two SIGNED-without-ack
+docs sharing a seed. Both layers below block it.
+
+- **(a) refusal/retry.** A per-doc offline-ack refusal that lets a sibling succeed needs an
+  abnormal refusal (`DocStateConflict`/`DocNotFound`/`CrossFnMismatch`,
+  `stage_offline_ack.rs:117-146`); the FN-wide refusals (`NodeNotOffline`/`ShiftNotOpened`/
+  `NoActiveSession`) hit every doc equally. Even granting it: the lapped lower-lnd doc's retry
+  hits the drift-assert (`stage_offline_ack.rs:363-369`, `ns_seed != previous_hash`) and is
+  REFUSED a code — it never gets an out-of-order `offline_fiscal_no`. Proven by the probe below.
+- **(b) boot re-drive.** Boot routes SIGNED offline docs to `stage_offline_ack::run` via
+  `dispatch.rs:156` (drift-assert applies); the pending list is `ORDER BY lnd`
+  (`fiscal_documents.rs:473`, `list_pending_for_fn`). AND ≤1 SIGNED-without-ack doc can exist
+  per FN: the gate holds acquire→sign→offline-ack as a unit, so a crash strands at most the one
+  in-flight doc (the next never acquired `lnd`). One doc ⇒ no reordering.
+- **(c) mixed online→offline.** Online docs consume NO codes (the pool is offline-only,
+  `acquire_code_tx` is offline-ack-only); `lnd` growth on online docs does not perturb
+  `code_lnd` ordering among offline docs. The online→offline seed boundary is continuous and
+  drift-asserted (pinned: `kill_point_matrix::m2_online_offline_boundary_chain_continuous`).
+- **(d) idempotent replay / double POST.** A replay of an issued doc is refused
+  `DocStateConflict` (doc no longer SIGNED) BEFORE `acquire_code_tx` (`stage_offline_ack.rs:244-255`
+  precedes step 6) → I5 code-pool-untouched → no new code, no new `lnd`.
+- **(e) exhaustiveness.** Only writer of `offline_fiscal_no` = `transition_to_offline_local_ack_tx`
+  (grep, §2) → the drift-assert in `stage_offline_ack` guards EVERY code stamp. No
+  admin/recovery/migration bypass. The only `ORDER BY code_lnd` is the lowest-unconsumed pick
+  (§1); no reader sends/orders the wire by `code_lnd` — drain + boot + scan all `ORDER BY lnd`.
+
+### 4. M2-01 linkage (the post-fix lens)
+Post-PR#150 the MAC chain links in ISSUANCE order: `stage_sign` reads the seed
+(`stage_sign.rs:286`) into `previous_hash`; the seed advances ONLY at offline-ack
+(`stage_offline_ack.rs:383`) for offline docs and at finalize (`stage_finalize.rs:315`) for
+online. The drift-assert requires `ns_seed == previous_hash` at ack, so a doc can ONLY be issued
+when the seed equals what it read at sign — i.e. offline-ack order is forced to equal sign order,
+and sign order equals `lnd`-acquire order (both under one gate hold). Therefore issuance order =
+`lnd` order, and since `acquire_code_tx` hands codes out lowest-first at ack time,
+**`code_lnd` order = issuance order = `lnd` order**. (i) The "out-of-order" precondition is
+unreachable by construction (gate nesting), and (ii) if synthetically created it is
+fail-closed (probe). `invariant_scan` walks `ORDER BY lnd` and validates the chain by
+`unsigned_xml_sha256`/`previous_hash` (`invariant_scan.rs:173-212`); it does NOT inspect
+`code_lnd` ordering at all — it does not need to, because the write-time drift-assert prevents
+any out-of-order code from being persisted.
+
+### Repro (throwaway, run on 62f6b54, reverted — NOT committed)
+Seeded the worst case (two SIGNED docs, both `prev=NULL` genesis, codes 1+2), offline-acked the
+HIGHER `lnd` first:
+```
+M2H1 r_b(lnd=2)_ok=true r_a(lnd=1)=Err(stage_offline_ack: chain-seed drift for doc … —
+  node_state seed != doc.previous_hash (offline issuance must extend the chain from the last
+  issued doc); refusing to advance)
+M2H1 doc_b(lnd=2): state=OFFLINE_LOCAL_ACK offline_fiscal_no=Some(1)
+M2H1 doc_a(lnd=1): state=SIGNED                offline_fiscal_no=None
+M2H1 codes: [(1, Some(<doc_b>)), (2, None)]
+```
+The lower-`lnd` doc is REFUSED a code (drift-assert) rather than handed code 2 — the divergence
+never reaches the wire. (The probe even had to seed an unreachable two-prev-NULL state to attempt
+it; §3(b) shows the gate forbids that state live.)
+
+### Out-of-scope observations (one line each, no dig)
+- A SIGNED doc "lapped" by a sibling would be STRANDED by the drift-assert (liveness, not
+  wire-ordering) — but the lapping precondition is itself unreachable (§3(b) gate nesting);
+  noted only for completeness, severity LOW/theoretical.
+- The offline ordinal not being in the signed bytes (§2) is a property worth a one-line note in
+  the crypto/wire review, not an H1 finding.
