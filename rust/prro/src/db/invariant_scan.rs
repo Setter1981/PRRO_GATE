@@ -195,12 +195,16 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             // drain states — so they advance `expected` from OFFLINE_LOCAL_ACK
             // onward.  This validates the offline chain DURING the offline window
             // (closes M2-03) and stays correct mid-drain (no false ChainBreak
-            // when doc#1 is at KVT2 and doc#2 chains off it).
+            // when doc#1 is at KVT2 and doc#2 chains off it).  The drain-state
+            // set mirrors the drain cohort IN-set (fiscal_documents.rs) —
+            // including ERROR_RETRYABLE: a transient send failure parks the doc
+            // but it stays issued (M2-01 review F1; keep the two sets in
+            // lockstep).
             let issued = state == "ACK"
                 || (offline_fiscal_no.is_some()
                     && matches!(
                         state.as_str(),
-                        "OFFLINE_LOCAL_ACK" | "SENT" | "KVT1" | "KVT2" | "ACK"
+                        "OFFLINE_LOCAL_ACK" | "SENT" | "KVT1" | "ERROR_RETRYABLE" | "KVT2"
                     ));
             if issued {
                 expected = unsigned_sha;

@@ -487,3 +487,97 @@ async fn detects_duplicate_offline_fiscal_no() {
         "got: {v:#?}"
     );
 }
+
+/// M2-01 review F1: an offline-origin doc parked in ERROR_RETRYABLE
+/// mid-drain (RetryClass::TransientRetry re-drive) is still ISSUED — the
+/// walk must advance `expected` through it, exactly as the drain cohort
+/// keeps re-selecting it.  Pre-fix this fixture read as a false
+/// ChainBreak on doc#2 plus a false ChainSeedMismatch at the tail.
+#[tokio::test]
+async fn clean_error_retryable_offline_doc_mid_drain_scans_clean() {
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await;
+    seed_node_state(&pool, shift, Some(h(2))).await;
+    let session = OfflineSessionId::new();
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, 'OPEN', '2026-06-12T00:00:00Z')",
+    )
+    .bind(session)
+    .bind(FN)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (doc_a, _) = seed_doc(
+        &pool,
+        shift,
+        1,
+        "ERROR_RETRYABLE",
+        None,
+        None,
+        Some(h(1)),
+        Some(1),
+        false,
+    )
+    .await;
+    let (doc_b, _) = seed_doc(
+        &pool,
+        shift,
+        2,
+        "OFFLINE_LOCAL_ACK",
+        None,
+        Some(h(1)),
+        Some(h(2)),
+        Some(2),
+        false,
+    )
+    .await;
+    for (code_lnd, doc) in [(1i64, doc_a), (2, doc_b)] {
+        sqlx::query(
+            "INSERT INTO offline_codes(fiscal_number, code_lnd, consumed_at, \
+                consumed_by_document_id) \
+             VALUES (?, ?, '2026-06-12T00:00:01Z', ?)",
+        )
+        .bind(FN)
+        .bind(code_lnd)
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE fiscal_documents SET offline_session_id = ? WHERE document_id = ?")
+            .bind(session)
+            .bind(doc)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    assert_eq!(scan(&pool).await.unwrap(), vec![]);
+}
+
+/// M2-05: an OFFLINE_LOCAL_ACK doc with NULL offline_session_id is
+/// invisible to the session-scoped drain cohort (silent backlog leak) —
+/// the scan must flag it.
+#[tokio::test]
+async fn detects_offline_local_ack_without_session() {
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await;
+    seed_node_state(&pool, shift, None).await;
+    seed_doc(
+        &pool,
+        shift,
+        1,
+        "OFFLINE_LOCAL_ACK",
+        None,
+        None,
+        Some(h(1)),
+        None,
+        false,
+    )
+    .await;
+    let v = scan(&pool).await.unwrap();
+    assert!(
+        v.iter()
+            .any(|x| matches!(x, Violation::OfflineLocalAckWithoutSession { .. })),
+        "got: {v:#?}"
+    );
+}
