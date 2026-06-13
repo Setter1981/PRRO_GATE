@@ -421,13 +421,26 @@ pub async fn evaluate_lastchk(
     expected_server_fiscal_no: &str,
     source: Kvt2ConfirmSource,
     sent_replay_trace_attempt_no: Option<i64>,
-    // **SEAM-B-3 (2026-06-13)** — caller-computed M1-02 superseded verdict
-    // (see [`classify_check_result`]); threaded through unchanged.
-    superseded: bool,
+    // **M2-N4 (architect ruling, 2026-06-13)** — the `server_fiscal_no`s of the
+    // FN's submitted docs with `lnd > doc.lnd` (caller-fetched; see
+    // `confirm_drain_doc`).  A `ServerFiscalIdMismatch` is "superseded" (NOT
+    // structural drift) ONLY if the DPS tip `actual_id` is one of these — i.e.
+    // a NEWER submitted doc of OURS became the tip.  A foreign/garbage tip is
+    // genuine drift.  This subsumes the lnd-only SEAM-B-3 check (a non-empty
+    // set ⟺ `doc.lnd < max_submitted_lnd`).  The membership test is done HERE
+    // (post-DPS, where `actual_id` is known) so `classify_check_result` stays a
+    // PURE `bool` consumer.  Empty for non-SentReplay sources.
+    newer_submitted_sfns: &[String],
 ) -> Kvt2ConfirmOutcome {
     let result = dps
         .by_server_fiscal_no(fn_sign, expected_server_fiscal_no)
         .await;
+    let superseded = match &result {
+        Err(DpsError::ServerFiscalIdMismatch { actual_id, .. }) => {
+            newer_submitted_sfns.iter().any(|sfn| sfn == actual_id)
+        }
+        _ => false,
+    };
     classify_check_result(result, source, sent_replay_trace_attempt_no, superseded)
 }
 
@@ -654,34 +667,35 @@ pub(crate) async fn confirm_drain_doc(
             }
             _ => (None, None),
         };
-    // **SEAM-B-3 (2026-06-13)**: compute the M1-02 superseded verdict
-    // BEFORE the classifier call so `classify_check_result` stays pure.
-    // A SentReplay `ServerFiscalIdMismatch` is "superseded" (NOT drift)
-    // when this SENT doc is NOT the FN's newest submitted doc — its `lnd`
-    // is less than `max_submitted_lnd(fn)` over `{SENT,KVT1,KVT2,ACK}`
-    // (reuse the existing M1-02 repo fn; do NOT add a new query).  Only
-    // the SentReplay path carries this exception (boot-parity scope);
-    // every other source passes `false`.  `superseded_max_lnd` retains
-    // the max value for the TIP_SUPERSEDED audit payload below.
-    let superseded_max_lnd: Option<i64> = match source {
+    // **M2-N4 (architect ruling, 2026-06-13; refines SEAM-B-3)**: fetch the
+    // FN's submitted docs with `lnd > doc.lnd` (the only legitimate
+    // supersession candidates) BEFORE the DPS call.  A SentReplay
+    // `ServerFiscalIdMismatch` is "superseded" (NOT structural drift) ONLY if
+    // the DPS tip `actual_id` equals the `server_fiscal_no` of one of these
+    // newer submitted docs — checked inside `evaluate_lastchk` (post-DPS) so
+    // `classify_check_result` stays a pure `bool` consumer.  A foreign/garbage
+    // tip → drift.  `superseded_max_lnd` retains the max `lnd` of the newer set
+    // for the TIP_SUPERSEDED audit payload (it is `Some` whenever superseded is
+    // true, since a match implies a non-empty set).  Non-SentReplay sources
+    // pass an empty set (boot-parity scope).
+    let newer_submitted: Vec<(i64, String)> = match source {
         Kvt2ConfirmSource::SentReplay => {
-            match fiscal_documents::max_submitted_lnd(pool, &fiscal_number)
+            fiscal_documents::submitted_above_lnd(pool, &fiscal_number, doc.lnd)
                 .await
                 .map_err(BootError::Database)?
-            {
-                Some(max_lnd) if doc.lnd < max_lnd => Some(max_lnd),
-                _ => None,
-            }
         }
-        _ => None,
+        _ => Vec::new(),
     };
+    let superseded_max_lnd: Option<i64> = newer_submitted.iter().map(|(lnd, _)| *lnd).max();
+    let newer_submitted_sfns: Vec<String> =
+        newer_submitted.into_iter().map(|(_, sfn)| sfn).collect();
     let outcome = evaluate_lastchk(
         dps,
         fn_sign,
         expected_server_fiscal_no,
         source,
         sent_replay_trace_attempt_no.map(i64::from),
-        superseded_max_lnd.is_some(),
+        &newer_submitted_sfns,
     )
     .await;
     // Capture wire-finish timestamp AFTER DPS call returns (only

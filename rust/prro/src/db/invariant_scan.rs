@@ -202,11 +202,27 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             // including ERROR_RETRYABLE: a transient send failure parks the doc
             // but it stays issued (M2-01 review F1; keep the two sets in
             // lockstep).
+            //
+            // **M2-N2b (architect-locked, 2026-06-13)**: REJECTED and
+            // REQUIRES_MANUAL_RECONCILIATION are ALSO "issued" for offline-origin
+            // docs.  Such a doc ALREADY advanced the local seed at OfflineLocalAck
+            // (M2-01) and a successor chained off it (prev = hash(it)) BEFORE the
+            // drain rejected / manual-escalated it.  Excluding these from the
+            // walk's issued-set would NOT advance `expected` over the rejected
+            // predecessor → a FALSE `ChainBreak` at the successor.  Ever-reached-
+            // OfflineLocalAck ⇒ seed advanced, regardless of later drain outcome.
+            // Online-origin docs are unchanged (they only ever issue at ACK).
             let issued = state == "ACK"
                 || (offline_fiscal_no.is_some()
                     && matches!(
                         state.as_str(),
-                        "OFFLINE_LOCAL_ACK" | "SENT" | "KVT1" | "ERROR_RETRYABLE" | "KVT2"
+                        "OFFLINE_LOCAL_ACK"
+                            | "SENT"
+                            | "KVT1"
+                            | "ERROR_RETRYABLE"
+                            | "KVT2"
+                            | "REJECTED"
+                            | "REQUIRES_MANUAL_RECONCILIATION"
                     ));
             if issued {
                 expected = unsigned_sha;

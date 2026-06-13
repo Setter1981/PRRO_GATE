@@ -2422,64 +2422,75 @@ pub(crate) async fn dispatch_sent_via_probe(
             }
         }
         ProbeOutcome::Mismatch { actual_id } => {
-            // M1-02 fix (architect ruling item 2(b), 2026-06-11).  A SENT doc was
-            // provably DPS-acked (SENT ⇒ WireDecision::Sent); a Mismatch means
-            // DPS's FN-scoped last_chk tip is a DIFFERENT doc.  If THIS doc is
-            // not the FN's newest submitted doc (its lnd < max submitted lnd) it
-            // was SUPERSEDED by a newer submitted doc that became the tip — NOT
-            // lost — so do NOT terminalise to RequiresManualReconciliation; hold
-            // it SENT (TIP_SUPERSEDED) for later doc-scoped confirmation.
-            // Mismatch on the ACTUAL tip (no newer submitted doc) → genuine
-            // ambiguity → Manual (unchanged).  Shared arm: boot SENT-recovery
+            // M1-02 fix (architect ruling item 2(b), 2026-06-11) + M2-N4
+            // (architect ruling, 2026-06-13).  A SENT doc was provably DPS-acked
+            // (SENT ⇒ WireDecision::Sent); a Mismatch means DPS's FN-scoped
+            // last_chk tip is a DIFFERENT doc.  It is a benign SUPERSESSION
+            // (hold SENT, TIP_SUPERSEDED, defer to doc-scoped confirmation)
+            // ONLY if the DPS tip `actual_id` is the `server_fiscal_no` of one
+            // of OUR newer submitted docs (lnd > this doc's).  A FOREIGN/garbage
+            // tip (someone else fiscalised on the FN, or DPS-state divergence)
+            // — even when a newer submitted doc of ours exists — is NOT benign:
+            // it is genuine structural drift → terminalise to
+            // RequiresManualReconciliation.  M2-N4 closes the prior gap where
+            // superseded was decided on local `max_lnd` alone (actual_id only
+            // forensic), which masked real drift.  Shared arm: boot SENT-recovery
             // AND the online-convergence tick both reach here (one fix point).
-            let max_lnd = crate::db::repositories::fiscal_documents::max_submitted_lnd(
-                pool,
-                &doc.fiscal_number,
-            )
-            .await?;
-            match max_lnd {
-                Some(m) if doc.lnd < m => {
-                    match complete_probe_trace_tip_superseded(
-                        pool,
-                        doc_id,
-                        attempt_no,
-                        &wire_started,
-                        &wire_finished,
-                        &actual_id,
-                        doc.lnd,
-                        m,
-                    )
-                    .await
-                    {
-                        Ok(_) => histogram.sent_mismatch_superseded += 1,
-                        Err(e) => {
-                            emit_dispatch_error(
-                                pool,
-                                doc_id,
-                                "c-sent-mismatch-superseded",
-                                &e,
-                                histogram,
-                            )
-                            .await?
-                        }
+            let newer_submitted =
+                crate::db::repositories::fiscal_documents::submitted_above_lnd(
+                    pool,
+                    &doc.fiscal_number,
+                    doc.lnd,
+                )
+                .await?;
+            let tip_is_ours = newer_submitted.iter().any(|(_, sfn)| sfn == &actual_id);
+            if tip_is_ours {
+                // `m` = max lnd of our newer submitted set = max_submitted_lnd
+                // (this doc's lnd is below all of them) — for the audit payload.
+                let m = newer_submitted
+                    .iter()
+                    .map(|(lnd, _)| *lnd)
+                    .max()
+                    .expect("tip_is_ours implies newer_submitted is non-empty");
+                match complete_probe_trace_tip_superseded(
+                    pool,
+                    doc_id,
+                    attempt_no,
+                    &wire_started,
+                    &wire_finished,
+                    &actual_id,
+                    doc.lnd,
+                    m,
+                )
+                .await
+                {
+                    Ok(_) => histogram.sent_mismatch_superseded += 1,
+                    Err(e) => {
+                        emit_dispatch_error(
+                            pool,
+                            doc_id,
+                            "c-sent-mismatch-superseded",
+                            &e,
+                            histogram,
+                        )
+                        .await?
                     }
                 }
-                _ => {
-                    match cas_sent_to_manual_reconciliation_from_probe(
-                        pool,
-                        doc_id,
-                        attempt_no,
-                        &actual_id,
-                        &wire_started,
-                        &wire_finished,
-                    )
-                    .await
-                    {
-                        Ok(_) => histogram.sent_mismatch_to_manual += 1,
-                        Err(e) => {
-                            emit_dispatch_error(pool, doc_id, "c-sent-mismatch", &e, histogram)
-                                .await?
-                        }
+            } else {
+                match cas_sent_to_manual_reconciliation_from_probe(
+                    pool,
+                    doc_id,
+                    attempt_no,
+                    &actual_id,
+                    &wire_started,
+                    &wire_finished,
+                )
+                .await
+                {
+                    Ok(_) => histogram.sent_mismatch_to_manual += 1,
+                    Err(e) => {
+                        emit_dispatch_error(pool, doc_id, "c-sent-mismatch", &e, histogram)
+                            .await?
                     }
                 }
             }

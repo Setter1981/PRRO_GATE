@@ -30,11 +30,11 @@
 //!
 //!   1. `c4_happy_path_two_docs_advance_to_ack_via_w12` (renamed)
 //!   2. `c4_routed_terminal_reject_records_wire_routing_failure_class`
-//!   3. `c4_signer_refused_records_signer_refused_class_and_sibling_continues`
+//!   3. `c4_signer_refused_records_signer_refused_class_and_escalates_manual`
 //!   4. `c4_processes_backlog_in_lnd_asc_order`
 //!   5. `c4_accounting_advanced_plus_failures_equals_backlog`
 //!   6. `c4_pending_drain_shift_reject_halts_and_transitions_shift_to_manual`
-//!   7. `c4_pending_drain_shift_transient_retry_sibling_continues_no_halt`
+//!   7. `c4_pending_drain_shift_transient_retry_halts_chain_this_tick_no_manual`
 //!   8. `w12_sent_fresh_not_found_emits_drift_audit_and_halts_via_boot_error`
 //!   9. `w12_sent_fresh_mismatch_emits_drift_audit_and_halts_via_boot_error`
 //!  10. `w12_sent_fresh_dps_transport_holds_drain_and_projects_held_at_sent`
@@ -485,6 +485,11 @@ async fn c4_routed_terminal_reject_records_wire_routing_failure_class() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool, CASHIER_OK).await;
+    // Strict-sequential offline drain (architect ruling B, 2026-06-13): a
+    // terminal reject now HALTS + escalates Manual even on a PLAIN Opened shift
+    // (whitelist edge 15).  escalate_drain_to_manual reads
+    // node_state.current_shift_id, so backfill it after seeding the shift.
+    set_node_current_shift(&pool, shift_id).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
     let _doc =
         seed_complete_offline_local_ack(&pool, 1, 100, session_id, shift_id, CASHIER_OK).await;
@@ -498,6 +503,7 @@ async fn c4_routed_terminal_reject_records_wire_routing_failure_class() {
     })]);
     let view = view_for(&carriers);
 
+    // drain() STILL returns Ok(summary): escalate_drain_to_manual is Ok.
     let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
         .await
         .unwrap();
@@ -520,23 +526,46 @@ async fn c4_routed_terminal_reject_records_wire_routing_failure_class() {
         "wire_routing_terminal_reject"
     );
     assert_eq!(failed_payloads[0]["retry_class"], "TerminalReject");
+
+    // Strict-sequential: terminal reject HALTS + escalates the FN shift to
+    // RequiresManualReconciliation even on a plain Opened shift (edge 15), and
+    // emits the Critical halt audit exactly once.
+    assert_eq!(
+        read_shift_state(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "terminal reject MUST escalate even a plain Opened shift → Manual"
+    );
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1,
+        "the halt emits the Critical escalation audit"
+    );
 }
 
-// ─── Test 3: signer refused; sibling continues ───────────────────────
+// ─── Test 3: signer refused; terminal HALT + escalate Manual ─────────
 
 #[tokio::test]
-async fn c4_signer_refused_records_signer_refused_class_and_sibling_continues() {
+async fn c4_signer_refused_records_signer_refused_class_and_escalates_manual() {
+    // Strict-sequential offline drain (architect ruling B, 2026-06-13):
+    // SignerRefused is a TERMINAL (manual_recon:true) failure.  The old
+    // "sibling_continues" behavior is now WRONG — doc A's terminal failure
+    // HALTS the chain (doc B with higher lnd is NOT processed) and escalates
+    // the FN shift to RequiresManualReconciliation even on a plain Opened shift
+    // (whitelist edge 15).
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool, CASHIER_OK).await;
+    // escalate_drain_to_manual reads node_state.current_shift_id; backfill it.
+    set_node_current_shift(&pool, shift_id).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
-    // Doc A: cashier mismatch → SignerRefused.  Doc B: cashier matches.
+    // Doc A: cashier mismatch → SignerRefused (terminal).  Doc B: cashier
+    // matches but is NOT processed — the chain halts at doc A.
     let doc_a =
         seed_complete_offline_local_ack(&pool, 1, 100, session_id, shift_id, CASHIER_OTHER).await;
     let doc_b =
         seed_complete_offline_local_ack(&pool, 2, 101, session_id, shift_id, CASHIER_OK).await;
-    // M3b W12 Commit 4b.3: chain seed for doc B only (doc A blocked
-    // pre-Sent so never reaches finalize).
+    // M3b W12 Commit 4b.3 chain seed for doc B is retained but unused: doc A's
+    // terminal halt means doc B never reaches the wire / finalize.
     common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
         .await
         .unwrap();
@@ -550,17 +579,20 @@ async fn c4_signer_refused_records_signer_refused_class_and_sibling_continues() 
     .await
     .unwrap();
 
-    // Only doc B reaches the wire (signer guard rejects doc A
-    // BEFORE any 4-pre side effect) → 1 send_chk + 1 last_chk.
+    // Doc A is rejected by the signer guard BEFORE any wire call, then the
+    // chain HALTS — so NO wire response is consumed (doc B never reaches the
+    // wire).  Spare responses are queued only to keep the stub from
+    // underflowing if the loop unexpectedly continues.
     let carriers = carriers_with_responses_and_last_chk(
-        vec![Ok(ack("DPS-FN-B-ONLY"))],
+        vec![Ok(ack("DPS-FN-B-UNREACHED"))],
         vec![Ok(last_chk_ack(
-            "DPS-FN-B-ONLY",
+            "DPS-FN-B-UNREACHED",
             kvt1_raw_bytes_for("DPS-FN-B"),
         ))],
     );
     let view = view_for(&carriers);
 
+    // drain() STILL returns Ok(summary): escalate_drain_to_manual is Ok.
     let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
         .await
         .unwrap();
@@ -568,8 +600,8 @@ async fn c4_signer_refused_records_signer_refused_class_and_sibling_continues() 
     assert_eq!(summary.backlog_size_before(), 2);
     assert_eq!(
         summary.advanced_to_ack(),
-        1,
-        "only doc B reaches Ack via SentFresh chain"
+        0,
+        "doc A terminal-halts the chain; doc B is NOT processed"
     );
     assert_eq!(summary.per_doc_failures().len(), 1, "doc A in failures");
     assert_eq!(summary.per_doc_failures()[0].0, doc_a);
@@ -577,11 +609,16 @@ async fn c4_signer_refused_records_signer_refused_class_and_sibling_continues() 
 
     // Doc A stays at OFFLINE_LOCAL_ACK (signer_guard runs BEFORE CAS).
     assert_eq!(read_doc_state(&pool, doc_a).await, "OFFLINE_LOCAL_ACK");
-    // Doc B reached ACK via W12 SentFresh chain.
-    assert_eq!(read_doc_state(&pool, doc_b).await, "ACK");
+    // Doc B is NOT processed — stays durable OFFLINE_LOCAL_ACK (chain halted).
+    assert_eq!(
+        read_doc_state(&pool, doc_b).await,
+        "OFFLINE_LOCAL_ACK",
+        "doc B MUST NOT be processed — chain halted at doc A's terminal failure"
+    );
 
-    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 1);
-    assert_eq!(audit_count(&pool, "STAGE_FINALIZE_ACK").await, 1);
+    // No doc advanced: the chain halted at doc A before any wire send.
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 0);
+    assert_eq!(audit_count(&pool, "STAGE_FINALIZE_ACK").await, 0);
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_FAILED").await, 1);
 
     let failed_payloads = audit_payloads_for(&pool, "OFFLINE_DRAIN_DOC_FAILED").await;
@@ -595,6 +632,20 @@ async fn c4_signer_refused_records_signer_refused_class_and_sibling_continues() 
     assert!(
         !detail.is_empty(),
         "mismatch_detail must carry the signer guard's Display string (got empty)"
+    );
+
+    // Strict-sequential: terminal SignerRefused HALTS + escalates the FN shift
+    // to RequiresManualReconciliation even on a plain Opened shift (edge 15),
+    // emitting the Critical halt audit exactly once.
+    assert_eq!(
+        read_shift_state(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "terminal SignerRefused MUST escalate even a plain Opened shift → Manual"
+    );
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1,
+        "the halt emits the Critical escalation audit"
     );
 }
 
@@ -697,23 +748,39 @@ async fn c4_processes_backlog_in_lnd_asc_order() {
 
 // ─── Test 5: accounting invariant ────────────────────────────────────
 
+/// **M2-N1 / M2-N2a (architect ruling B, 2026-06-13)** — strict-sequential
+/// offline-origin drain.  REBUILT from the pre-M2-01 sibling-continue pin
+/// (`c4_accounting_advanced_plus_failures_equals_backlog`).  M2-01 made
+/// offline-origin docs a STRICT predecessor chain (each signs
+/// `previous_hash = unsigned(prior issued doc)`), so the drain MUST NOT send
+/// `lnd+1` past a non-ACK predecessor.  A TERMINAL reject of doc B
+/// (non-self-resolving) HALTS the chain — doc C (whose predecessor is B) is
+/// NOT sent and stays `OFFLINE_LOCAL_ACK` (durable) — and escalates the FN
+/// to `RequiresManualReconciliation` even on a PLAIN `Opened` shift
+/// (whitelist edge 15), so there is an operator surface (no silent
+/// GoingOnline/Draining wedge).  Pins the FT (M2-N1) + the escalation
+/// (M2-N2a) + scan-clean over a REJECTED offline-origin predecessor (M2-N2b).
 #[tokio::test]
-async fn c4_accounting_advanced_plus_failures_equals_backlog() {
+async fn strict_sequential_terminal_reject_halts_chain_and_escalates_manual() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool, CASHIER_OK).await;
+    // Drain reads node_state.current_shift_id to identify the shift to
+    // escalate (M2-N2a edge 15 for plain Opened).
+    set_node_current_shift(&pool, shift_id).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
-    // 3 docs total: 2 successes (Ok responses) + 1 failure
-    // (Authorization{DocumentReject}).  Accounting must add up to 3.
+    // 3 offline-origin docs forming a strict M2-01 chain A→B→C.
     let doc_a =
         seed_complete_offline_local_ack(&pool, 1, 100, session_id, shift_id, CASHIER_OK).await;
     let doc_b =
         seed_complete_offline_local_ack(&pool, 2, 101, session_id, shift_id, CASHIER_OK).await;
     let doc_c =
         seed_complete_offline_local_ack(&pool, 3, 102, session_id, shift_id, CASHIER_OK).await;
-    // M3b W12 Commit 4b.3: chain seed for A + C (B never reaches
-    // finalize → no chain step).
-    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+    // Real strict chain: A(prev=G,unsigned=H_A) → B(prev=H_A,unsigned=H_B)
+    // → C(prev=H_B,unsigned=H_C).  node seed = H_C — all 3 reached
+    // OFFLINE_LOCAL_ACK (issued offline ⇒ seed advanced past them at
+    // offline-ack; finalize does NOT re-advance offline-origin docs, M2-01).
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x03))
         .await
         .unwrap();
     common::seed_w12_finalize_prereqs(
@@ -725,16 +792,37 @@ async fn c4_accounting_advanced_plus_failures_equals_backlog() {
     )
     .await
     .unwrap();
+    // doc_a is the chain HEAD — reset previous_hash to NULL (genesis) so the
+    // invariant_scan walk's first row matches its `None` start (the inbox row +
+    // unsigned hash from seed_w12_finalize_prereqs are kept for the ACK advance).
+    sqlx::query("UPDATE fiscal_documents SET previous_hash = NULL WHERE document_id = ?")
+        .bind(doc_a)
+        .execute(&pool)
+        .await
+        .unwrap();
     common::seed_w12_finalize_prereqs(
         &pool,
         FN,
-        doc_c,
+        doc_b,
         common::chain_anchor(0x01),
         common::chain_anchor(0x02),
     )
     .await
     .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc_c,
+        common::chain_anchor(0x02),
+        common::chain_anchor(0x03),
+    )
+    .await
+    .unwrap();
 
+    // A → send OK + lastChk ACK → ACK.  B → DocumentReject (terminal,
+    // non-self-resolving).  A 3rd send response for C is provided so the
+    // stub never underflows — under strict-sequential C is NOT sent, so the
+    // `call_count == 2` assertion is the load-bearing pin.
     let carriers = carriers_with_responses_and_last_chk(
         vec![
             Ok(ack("OK-A")),
@@ -745,6 +833,11 @@ async fn c4_accounting_advanced_plus_failures_equals_backlog() {
             }),
             Ok(ack("OK-C")),
         ],
+        // A's lastChk + a spare C lastChk so the CURRENT (buggy) sibling-
+        // continue code reaches the assertions (sends C → lastChk C) instead
+        // of panicking on stub underflow — RED then fails cleanly on the
+        // `doc_c == OFFLINE_LOCAL_ACK` / `call_count == 2` pins.  Under the
+        // GREEN strict-sequential code C is never sent, so the spare is unused.
         vec![
             Ok(last_chk_ack("OK-A", kvt1_raw_bytes_for("OK-A"))),
             Ok(last_chk_ack("OK-C", kvt1_raw_bytes_for("OK-C"))),
@@ -756,48 +849,47 @@ async fn c4_accounting_advanced_plus_failures_equals_backlog() {
         .await
         .unwrap();
 
-    assert_eq!(summary.backlog_size_before(), 3);
-    assert_eq!(summary.advanced_to_ack(), 2, "doc A + doc C reach Ack");
-    assert_eq!(summary.advanced_to_kvt1(), 0, "no DeferredKvt1 post-W12");
-    assert_eq!(summary.per_doc_failures().len(), 1);
-
-    // Accounting invariant — advanced + failures = backlog (no doc
-    // silently dropped).
-    let advanced = summary.advanced_to_ack() + summary.advanced_to_kvt1();
-    let failures = summary.per_doc_failures().len();
-    assert_eq!(
-        advanced + failures,
-        summary.backlog_size_before(),
-        "every backlog doc must be accounted for in summary"
-    );
-
-    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 2);
-    assert_eq!(audit_count(&pool, "STAGE_FINALIZE_ACK").await, 2);
-    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_FAILED").await, 1);
-
-    // Sibling-continue contract: every doc was visited even though
-    // the middle one failed.
-    assert_eq!(carriers.dps.call_count(), 3, "all 3 docs reached the wire");
-    assert_eq!(
-        carriers.dps.last_chk_call_count(),
-        2,
-        "lastChk only for A + C (B never reaches Sent)"
-    );
-
-    // DB-state pinning: shift_state=Opened (non-pending-drain), so
-    // sibling-continue applies.  Doc A + C reach ACK via W12 SentFresh
-    // chain.  Doc B: Authorization{DocumentReject} → TerminalReject
-    // → stage_send 4-b CAS Sending → Rejected.
+    // Strict-sequential: A acked, B rejected (terminal) → HALT, C NOT sent.
     assert_eq!(read_doc_state(&pool, doc_a).await, "ACK");
     assert_eq!(read_doc_state(&pool, doc_b).await, "REJECTED");
-    assert_eq!(read_doc_state(&pool, doc_c).await, "ACK");
+    assert_eq!(
+        read_doc_state(&pool, doc_c).await,
+        "OFFLINE_LOCAL_ACK",
+        "C's predecessor B was rejected → C MUST NOT be sent (strict chain)"
+    );
 
-    // No manual-escalation audit fires on a non-pending-drain shift.
+    // Wire: only A + B reached send_chk; C never did.
+    assert_eq!(
+        carriers.dps.call_count(),
+        2,
+        "doc C must NOT be sent (strict halt at rejected predecessor)"
+    );
+    assert_eq!(
+        carriers.dps.last_chk_call_count(),
+        1,
+        "lastChk only for A (B rejected at send; C never sent)"
+    );
+
+    // Summary accounting: A advanced, B failed; C neither advanced nor failed
+    // (held back, still OFFLINE_LOCAL_ACK).
+    assert_eq!(summary.advanced_to_ack(), 1, "only A reaches Ack");
+    assert_eq!(summary.per_doc_failures().len(), 1, "only B failed");
+
+    // FN escalated to durable manual-recon on a PLAIN Opened shift (edge 15).
+    assert_eq!(
+        read_shift_state(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "terminal reject MUST escalate even a plain Opened shift → Manual"
+    );
     assert_eq!(
         audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
-        0,
-        "OFFLINE_LOCAL_ACK on plain Opened shift must NOT escalate to Manual"
+        1,
+        "the halt emits the Critical escalation audit"
     );
+
+    // Ledger invariant clean: a REJECTED offline-origin predecessor in the
+    // chain must NOT trip a false ChainBreak at its successor (M2-N2b).
+    prro::db::invariant_scan::assert_clean(&pool).await;
 }
 
 // ─── Test 6: pending-drain shift reject halts drain + escalates ──────
@@ -944,15 +1036,17 @@ async fn c4_pending_drain_shift_reject_halts_and_transitions_shift_to_manual() {
     );
 }
 
-// ─── Test 7: transient retry on pending-drain shift — NO halt ────────
+// ─── Test 7: transient retry — chain HALTS this tick, NO Manual ──────
 
-/// MED-C4-6 fix: TransientRetry (Transport / Server-3) on a pending-
-/// drain shift must NOT trigger Manual escalation.  Sibling continues;
-/// shift stays in `OpenedLocalPendingDrain` for the next-tick retry
-/// (spec §3.5: Manual is last resort; transient outcomes retain retry
-/// budget).
+/// Strict-sequential offline drain (architect ruling B, 2026-06-13):
+/// TransientRetry (Transport / Server-3) is a `manual_recon:false` failure.
+/// The chain HALTS THIS TICK at the transient doc — there is NO sibling-
+/// continue, so higher-lnd docs are NOT processed this tick — but there is
+/// NO Manual escalation and NO escalation audit; the held docs retry on the
+/// next tick.  The shift stays in `OpenedLocalPendingDrain` (spec §3.5:
+/// transient outcomes retain retry budget).
 #[tokio::test]
-async fn c4_pending_drain_shift_transient_retry_sibling_continues_no_halt() {
+async fn c4_pending_drain_shift_transient_retry_halts_chain_this_tick_no_manual() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(
         &pool,
@@ -970,8 +1064,9 @@ async fn c4_pending_drain_shift_transient_retry_sibling_continues_no_halt() {
         seed_complete_offline_local_ack(&pool, 2, 101, session_id, shift_id, CASHIER_OK).await;
     let doc_c =
         seed_complete_offline_local_ack(&pool, 3, 102, session_id, shift_id, CASHIER_OK).await;
-    // M3b W12 Commit 4b.3: chain seed for A + C (B never reaches
-    // finalize → no chain step; sibling-continue brings C in).
+    // M3b W12 Commit 4b.3 chain seed for A only is load-bearing; the C seed is
+    // retained but unused: doc B's transient halt means doc C is not processed
+    // this tick.
     common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
         .await
         .unwrap();
@@ -995,20 +1090,16 @@ async fn c4_pending_drain_shift_transient_retry_sibling_continues_no_halt() {
     .unwrap();
 
     // Doc A: Ok wire reply → W12 SentFresh → ACK.  Doc B: Transport
-    // error → RetryClass::TransientRetry → doc → ErrorRetryable
-    // (never reaches Sent so no lastChk).  Doc C: Ok wire reply →
-    // W12 SentFresh → ACK.  Sibling-continue MUST apply; no halt; no
-    // shift escalation.
+    // error → RetryClass::TransientRetry → doc → ErrorRetryable, and the
+    // chain HALTS this tick.  Doc C's wire response is queued but NOT
+    // consumed (loop halts at B).
     let carriers = carriers_with_responses_and_last_chk(
         vec![
             Ok(ack("OK-A")),
             Err(DpsError::Transport("simulated link flap".into())),
-            Ok(ack("OK-C")),
+            Ok(ack("UNREACHED-C")),
         ],
-        vec![
-            Ok(last_chk_ack("OK-A", kvt1_raw_bytes_for("OK-A"))),
-            Ok(last_chk_ack("OK-C", kvt1_raw_bytes_for("OK-C"))),
-        ],
+        vec![Ok(last_chk_ack("OK-A", kvt1_raw_bytes_for("OK-A")))],
     );
     let view = view_for(&carriers);
 
@@ -1019,8 +1110,8 @@ async fn c4_pending_drain_shift_transient_retry_sibling_continues_no_halt() {
     assert_eq!(summary.backlog_size_before(), 3);
     assert_eq!(
         summary.advanced_to_ack(),
-        2,
-        "doc A and doc C both reached Ack via W12; doc B was transient retry (NOT halt)"
+        1,
+        "only doc A reached Ack; doc B transient HALTS the chain this tick (no sibling-continue)"
     );
     assert_eq!(summary.advanced_to_kvt1(), 0, "no DeferredKvt1 post-W12");
     assert_eq!(summary.per_doc_failures().len(), 1);
@@ -1028,19 +1119,27 @@ async fn c4_pending_drain_shift_transient_retry_sibling_continues_no_halt() {
         summary.per_doc_failures()[0].1,
         "wire_routing_transient_retry"
     );
-    // All 3 docs visited the wire — sibling-continue contract holds
-    // even on pending-drain shift, because Transport is non-manual.
-    assert_eq!(carriers.dps.call_count(), 3);
+    // Only A + B visited the wire; doc C was NOT processed this tick (chain
+    // halted at the transient doc B).
+    assert_eq!(
+        carriers.dps.call_count(),
+        2,
+        "doc C must NOT be sent — chain halted at transient doc B this tick"
+    );
     assert_eq!(
         carriers.dps.last_chk_call_count(),
-        2,
-        "lastChk only for A + C (B never reaches Sent)"
+        1,
+        "lastChk only for A (B never reaches Sent; C never processed)"
     );
 
     // DB states.
     assert_eq!(read_doc_state(&pool, doc_a).await, "ACK");
     assert_eq!(read_doc_state(&pool, doc_b).await, "ERROR_RETRYABLE");
-    assert_eq!(read_doc_state(&pool, doc_c).await, "ACK");
+    assert_eq!(
+        read_doc_state(&pool, doc_c).await,
+        "OFFLINE_LOCAL_ACK",
+        "doc C MUST NOT be processed this tick — held behind transient doc B"
+    );
 
     // Shift + node_state mirror MUST stay in OPENED_LOCAL_PENDING_DRAIN
     // — transient retry does NOT escalate per spec §3.5.
@@ -1311,4 +1410,201 @@ async fn w12_sent_fresh_dps_transport_holds_drain_and_projects_held_at_sent() {
     // No advance / drift audit on Hold path.
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED").await, 0);
     assert_eq!(audit_count(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await, 0);
+}
+
+/// **M2-N1 / ruling B (architect, 2026-06-13)** — a TRANSIENT failure on an
+/// offline-origin predecessor HALTS the chain for THIS tick (does NOT escalate
+/// Manual, does NOT send the successor), and the NEXT tick RETRIES it and drains
+/// the chain.  The ruling-B pin distinguishing transient (retry-budget
+/// preserved, no premature Manual) from terminal (escalate).  Two-tick test:
+///   - tick 1: doc_a send → Transport error → ERROR_RETRYABLE → HALT; doc_b NOT
+///     sent; shift stays Opened; NO escalation audit.
+///   - tick 2: doc_a re-drives (ER class-guard) → ACK; doc_b then → ACK.
+#[tokio::test]
+async fn strict_sequential_transient_halts_this_tick_then_retries_next_tick() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool, CASHIER_OK).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    let doc_a =
+        seed_complete_offline_local_ack(&pool, 1, 100, session_id, shift_id, CASHIER_OK).await;
+    let doc_b =
+        seed_complete_offline_local_ack(&pool, 2, 101, session_id, shift_id, CASHIER_OK).await;
+    // Strict chain A→B (A genesis head, prev NULL) so both can reach ACK on tick 2.
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x02))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc_a,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE fiscal_documents SET previous_hash = NULL WHERE document_id = ?")
+        .bind(doc_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc_b,
+        common::chain_anchor(0x01),
+        common::chain_anchor(0x02),
+    )
+    .await
+    .unwrap();
+
+    // ── Tick 1: doc_a send → Transport error → ERROR_RETRYABLE → HALT. ──
+    let c1 = carriers_with_responses_and_last_chk(
+        vec![Err(DpsError::Transport("tick1 link flap".into()))],
+        vec![],
+    );
+    let v1 = view_for(&c1);
+    let _ = backlog_drain::drain(&common::drain_test_guard(), &pool, &v1, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        read_doc_state(&pool, doc_a).await,
+        "ERROR_RETRYABLE",
+        "transient send failure parks doc_a in ERROR_RETRYABLE"
+    );
+    assert_eq!(
+        read_doc_state(&pool, doc_b).await,
+        "OFFLINE_LOCAL_ACK",
+        "doc_b NOT sent — chain halts at the transient predecessor"
+    );
+    assert_eq!(c1.dps.call_count(), 1, "only doc_a reached the wire on tick 1");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        0,
+        "transient halt does NOT escalate to Manual"
+    );
+    assert_eq!(
+        read_shift_state(&pool, shift_id).await,
+        "OPENED",
+        "shift stays Opened on a transient halt (no escalation)"
+    );
+
+    // ── Tick 2: doc_a re-drives → ACK, then doc_b → ACK. ──
+    let c2 = carriers_with_responses_and_last_chk(
+        vec![Ok(ack("OK-A")), Ok(ack("OK-B"))],
+        vec![
+            Ok(last_chk_ack("OK-A", kvt1_raw_bytes_for("OK-A"))),
+            Ok(last_chk_ack("OK-B", kvt1_raw_bytes_for("OK-B"))),
+        ],
+    );
+    let v2 = view_for(&c2);
+    let _ = backlog_drain::drain(&common::drain_test_guard(), &pool, &v2, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        read_doc_state(&pool, doc_a).await,
+        "ACK",
+        "next tick retries doc_a → ACK"
+    );
+    assert_eq!(
+        read_doc_state(&pool, doc_b).await,
+        "ACK",
+        "the chain drains past the now-acked predecessor on the retry tick"
+    );
+}
+
+/// **H-M2-1 (architect ruling, 2026-06-13) — DPS ERROR_BAD_HASH_PREV cascade
+/// contract pin (does NOT gate the fix).**  Whether DPS cascade-rejects the
+/// SUCCESSORS of a rejected predecessor (ERROR_BAD_HASH_PREV) is DPS-behaviour-
+/// dependent and UNKNOWN from our corpus (zero rejected-offline-backlog
+/// empirics).  The strict-sequential stop (M2-N1) makes the question MOOT for
+/// the gateway: a successor `B` (whose `previous_hash = hash(A)`) is NEVER wired
+/// after predecessor `A` is rejected, so DPS never evaluates B's prev-hash —
+/// the fix is safe under BOTH possible DPS behaviours (cascade-reject OR
+/// accept-broken-chain).  This test pins that invariant (B is never sent).
+///
+/// **LIVE TEST-CAMPAIGN NOTE:** confirm the real ДПС's ERROR_BAD_HASH_PREV
+/// cascade behaviour against a live ПРРО (issue A+B offline, force-reject A on
+/// drain, observe whether DPS would have rejected B) — to validate the
+/// stop-on-non-ACK assumption empirically.  Until then the gateway never
+/// exposes the cascade surface.
+#[tokio::test]
+async fn h_m2_1_rejected_predecessor_never_wires_successor_bad_hash_prev_moot() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool, CASHIER_OK).await;
+    set_node_current_shift(&pool, shift_id).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    // Strict chain A→B: B.previous_hash = hash(A).  A genesis head (prev NULL).
+    let doc_a =
+        seed_complete_offline_local_ack(&pool, 1, 100, session_id, shift_id, CASHIER_OK).await;
+    let doc_b =
+        seed_complete_offline_local_ack(&pool, 2, 101, session_id, shift_id, CASHIER_OK).await;
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x02))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc_a,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE fiscal_documents SET previous_hash = NULL WHERE document_id = ?")
+        .bind(doc_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc_b,
+        common::chain_anchor(0x01),
+        common::chain_anchor(0x02),
+    )
+    .await
+    .unwrap();
+
+    // A → DocumentReject (terminal).  A spare B send response is provided so the
+    // stub never underflows — under strict-sequential B is NEVER wired.
+    let carriers = carriers_with_responses_and_last_chk(
+        vec![
+            Err(DpsError::Authorization {
+                code: -1,
+                kind: AuthorizationKind::DocumentReject,
+                message: "reject_A".into(),
+            }),
+            Ok(ack("UNREACHED-B")),
+        ],
+        vec![],
+    );
+    let view = view_for(&carriers);
+
+    let _ = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(read_doc_state(&pool, doc_a).await, "REJECTED");
+    // The load-bearing H-M2-1 pin: B (successor of the rejected predecessor) is
+    // NEVER wired, so DPS never sees a bad-hash-prev chain.
+    assert_eq!(
+        read_doc_state(&pool, doc_b).await,
+        "OFFLINE_LOCAL_ACK",
+        "successor of a rejected predecessor MUST NOT be wired (ERROR_BAD_HASH_PREV moot)"
+    );
+    assert_eq!(
+        carriers.dps.call_count(),
+        1,
+        "only the rejected predecessor reached the wire; the successor never did"
+    );
+    // FN escalated (terminal reject); ledger clean.
+    assert_eq!(
+        read_shift_state(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
+    prro::db::invariant_scan::assert_clean(&pool).await;
 }

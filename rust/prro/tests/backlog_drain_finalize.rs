@@ -387,13 +387,15 @@ async fn c6_partial_when_per_doc_failures_present() {
     )
     .await;
 
-    // TerminalReject → per-doc failure on plain Opened shift (sibling
-    // continues; no halt because shift is NOT pending-drain).
-    let c = carriers(vec![Err(DpsError::Authorization {
-        code: -1,
-        kind: AuthorizationKind::DocumentReject,
-        message: "reject".into(),
-    })]);
+    // Strict-sequential (architect ruling B, 2026-06-13): a TERMINAL
+    // failure now ESCALATES to Manual (NOT PARTIAL).  To preserve this
+    // test's intent (PARTIAL on a held/failed doc), use a TRANSIENT
+    // send failure — `DpsError::Transport` → `RetryClass::TransientRetry`
+    // → `DocVerdict::Failed { manual_recon: false }` (ERROR_RETRYABLE).
+    // The chain HALTS this tick (NO Manual, NO escalation audit), the
+    // per-doc failure is recorded, and finalize emits OFFLINE_DRAIN_PARTIAL
+    // with `PerDocFailuresPresent`.  No current_shift_id needed (no escalation).
+    let c = carriers(vec![Err(DpsError::Transport("conn reset".into()))]);
     let view = view_for(&c);
 
     let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
@@ -401,6 +403,11 @@ async fn c6_partial_when_per_doc_failures_present() {
         .unwrap();
 
     assert_eq!(summary.per_doc_failures().len(), 1);
+    // Transient halt → NO escalation audit fires.
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        0
+    );
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_PARTIAL").await, 1);
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_COMPLETED").await, 0);
     let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_PARTIAL")

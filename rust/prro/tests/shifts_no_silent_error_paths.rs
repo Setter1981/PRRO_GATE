@@ -34,11 +34,12 @@ const ALL_STATES: [ShiftState; 9] = [
 
 /// Spec §11 acceptance #3 tier (b): exactly these 4 source states are
 /// allowed to whitelist-transition into RequiresManualReconciliation.
-const MANUAL_ALLOWED_SOURCES: [ShiftState; 4] = [
+const MANUAL_ALLOWED_SOURCES: [ShiftState; 5] = [
     ShiftState::Opening,                  // edge 4
     ShiftState::OpenedLocalPendingDrain,  // edge 6
     ShiftState::Closing,                  // edge 12
     ShiftState::ClosingLocalPendingDrain, // edge 14
+    ShiftState::Opened,                   // edge 15 (M2-N2a: strict-sequential drain-reject)
 ];
 
 async fn fresh_with_fn() -> (sqlx::SqlitePool, String) {
@@ -160,7 +161,7 @@ async fn tier_b_manual_reachable_only_from_4_whitelist_sources() {
                 matches!(outcome, TransitionOutcome::Forbidden { .. }),
                 "tier (b) violation: ({from:?} → Manual) is NOT whitelisted; \
                  got {outcome:?}.  Spec §11 acceptance #3b: Manual reachable \
-                 via transition_state ONLY from edges 4/6/12/14 sources."
+                 via transition_state ONLY from edges 4/6/12/14/15 sources."
             );
             assert_eq!(observed, from, "tier (b): Forbidden must not mutate state");
         }

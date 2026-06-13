@@ -901,100 +901,135 @@ pub async fn drain<'a>(
     // Only infrastructure failures (audit_log append fails with sqlx
     // error, post-stage_send Sent→Kvt1 CAS produces non-Applied)
     // propagate as `BootError::*` to the caller.
-    let shift_in_pending_drain = matches!(
-        ns.shift_state,
-        ShiftState::OpenedLocalPendingDrain | ShiftState::ClosingLocalPendingDrain
-    );
-
     let mut summary = DrainSummary::new(fiscal_number.to_string(), backlog.len());
     for (position, doc) in backlog.iter().enumerate() {
         let verdict = process_one_doc(pool, deps, fiscal_number, doc, &mut summary).await?;
-        // M3b W12 Commit 2 — `HoldFnDrain` stops FN drain at the held
-        // doc regardless of shift state.  Records summary via the
-        // projection-specific method; loop breaks so the subsequent
-        // `finalize_drain` step sees the nonzero W12 counter and
-        // emits `OFFLINE_DRAIN_PARTIAL` with projection-correct
-        // reason (`DocsHeldAtKvt1` / `DocsHeldAtSent` /
-        // `DocsErRedriveQueued`).  Per W9b §3.5 + W0b state-unchanged
-        // contract: pending-drain shifts do NOT escalate on
-        // HoldFnDrain (only manual-recon-class `Failed` escalates).
-        if let DocVerdict::HoldFnDrain {
-            class,
-            projection,
-            consecutive_holds,
-        } = &verdict
-        {
-            let class_str = failure_class_for(*class).to_string();
-            match projection {
-                HoldFnDrainProjection::HeldAtKvt1 => {
-                    summary.record_doc_held_at_kvt1(doc.document_id, class_str);
-                }
-                HoldFnDrainProjection::HeldAtSent => {
-                    summary.record_doc_held_at_sent(doc.document_id, class_str);
-                }
-                HoldFnDrainProjection::ErRedriveQueued => {
-                    summary.record_doc_er_redrive_queued(doc.document_id, class_str);
-                }
+        // ── M2-N1 / M2-N2a (architect ruling B, 2026-06-13) ── STRICT-
+        // SEQUENTIAL offline-origin drain.  The whole drain cohort is
+        // `fs_mode='OFFLINE'` (a strict M2-01 predecessor chain: each doc
+        // signs `previous_hash = unsigned(prior issued doc)`), so we MUST
+        // NOT process/send a doc whose predecessor did not reach ACK
+        // (cascade-reject / broken wire-chain).  The chain therefore STOPS
+        // at the FIRST non-ACK doc; higher-`lnd` successors are NOT
+        // processed this tick.  Online-origin docs are NOT in this cohort —
+        // they converge via the separate `online_convergence` tick, behaviour
+        // untouched.  Escalation policy (ruling B):
+        //   - terminal / non-self-resolving (REJECTED, doc-level manual,
+        //     SupersededHeld-without-B1-v2) → halt + escalate the FN to
+        //     `RequiresManualReconciliation` REGARDLESS of shift_state (plain
+        //     `Opened` via whitelist edge 15; pending-drain via edges 6/14) —
+        //     a durable operator surface, never a silent GoingOnline/Draining
+        //     wedge (the REJECTED doc leaves the cohort, so without this it
+        //     would wedge forever per M2-N2a).
+        //   - transient / retryable (HoldFnDrain, ERROR_RETRYABLE,
+        //     probe-required `Failed{manual_recon:false}`) → halt the chain
+        //     for THIS tick only, NO Manual; the doc stays in the cohort and
+        //     retries next tick — preserving the §6.5 retry budget + REC-1
+        //     tier degradation (a transient blip must NOT escalate to Manual
+        //     on the first hold).
+        match verdict {
+            DocVerdict::Advanced => {
+                // ACK predecessor — the strict chain may advance to lnd+1.
             }
-            // **REC-1 Phase 2a.1 Commit 6.1.2 (2026-05-24)** — Tier 1+2
-            // degradation triggers per plan §REC-1.  ErRedriveQueued
-            // (consecutive_holds=0 by 1c-post reset) bypasses both tiers;
-            // only HeldAtSent/HeldAtKvt1 carry accumulated counter.
-            //
-            // Tier order: check Tier 2 FIRST (more severe), then Tier 1
-            // (Tier 2 implies Tier 1 was already triggered last cycle).
-            let counter = *consecutive_holds;
-            if counter >= 50
-                && matches!(
-                    projection,
-                    HoldFnDrainProjection::HeldAtSent | HoldFnDrainProjection::HeldAtKvt1
-                )
-            {
-                trigger_tier_2_stop_mode(pool, fiscal_number, doc.document_id, counter).await?;
-            } else if counter >= 10
-                && matches!(
-                    projection,
-                    HoldFnDrainProjection::HeldAtSent | HoldFnDrainProjection::HeldAtKvt1
-                )
-            {
-                trigger_tier_1_prolonged_hold(pool, doc.document_id, *projection, counter).await?;
+            DocVerdict::HoldFnDrain {
+                class,
+                projection,
+                consecutive_holds,
+            } => {
+                // Transient hold: halt the chain THIS tick, NO Manual, keep
+                // the REC-1 tier budget alive (doc stays in cohort, retries
+                // next tick).  Record via the projection-specific method so
+                // `finalize_drain` emits `OFFLINE_DRAIN_PARTIAL` with the
+                // correct reason.
+                let class_str = failure_class_for(class).to_string();
+                match projection {
+                    HoldFnDrainProjection::HeldAtKvt1 => {
+                        summary.record_doc_held_at_kvt1(doc.document_id, class_str);
+                    }
+                    HoldFnDrainProjection::HeldAtSent => {
+                        summary.record_doc_held_at_sent(doc.document_id, class_str);
+                    }
+                    HoldFnDrainProjection::ErRedriveQueued => {
+                        summary.record_doc_er_redrive_queued(doc.document_id, class_str);
+                    }
+                }
+                // **REC-1 Phase 2a.1 (2026-05-24)** — Tier 1+2 degradation
+                // triggers for a persistently-held predecessor (the strict
+                // chain stays blocked behind it across ticks).  ErRedriveQueued
+                // (consecutive_holds=0 by 1c-post reset) bypasses both tiers.
+                // Tier 2 checked first (more severe; implies Tier 1 last cycle).
+                if consecutive_holds >= 50
+                    && matches!(
+                        projection,
+                        HoldFnDrainProjection::HeldAtSent | HoldFnDrainProjection::HeldAtKvt1
+                    )
+                {
+                    trigger_tier_2_stop_mode(
+                        pool,
+                        fiscal_number,
+                        doc.document_id,
+                        consecutive_holds,
+                    )
+                    .await?;
+                } else if consecutive_holds >= 10
+                    && matches!(
+                        projection,
+                        HoldFnDrainProjection::HeldAtSent | HoldFnDrainProjection::HeldAtKvt1
+                    )
+                {
+                    trigger_tier_1_prolonged_hold(
+                        pool,
+                        doc.document_id,
+                        projection,
+                        consecutive_holds,
+                    )
+                    .await?;
+                }
+                break;
             }
-            break;
-        }
-        // **SEAM-B-3 (architect-locked contract, 2026-06-13)** — a
-        // superseded SENT doc (NOT the FN's newest submitted doc; its ACK
-        // status is UNKNOWN from lastChk) is held in SENT and the drain
-        // CONTINUES past it.  Unlike HoldFnDrain above (which `break`s),
-        // this does NOT stop the FN drain: the superseded doc has the LOWER
-        // `lnd` and is processed FIRST in the `lnd ASC` cohort, so breaking
-        // here would strand the higher-`lnd` tip (wedge).  Record
-        // held-at-sent (blocks finalize — conservative; the doc is NOT
-        // confirmable via lastChk while a newer doc is the tip, so it stays
-        // pending until B1-v2 doc-scoped confirmation) and continue.
-        // No tier (REC-1) accounting: superseded is NOT a transient
-        // retry-hold (consecutive_holds was not incremented by the 1c-
-        // superseded envelope).  `confirm_drain_doc` already emitted the
-        // TIP_SUPERSEDED audit + completed the recovery trace.
-        if matches!(verdict, DocVerdict::SupersededHeld) {
-            summary.record_doc_held_at_sent(doc.document_id, "superseded".to_string());
-            continue;
-        }
-        // Halt ONLY on manual-recon-class failures on pending-drain
-        // shifts.  TransientRetry / ProbeRequired stay in
-        // sibling-continue per spec §3.5 (Manual is last resort;
-        // transient outcomes retain retry budget).
-        if shift_in_pending_drain {
-            if let DocVerdict::Failed {
+            DocVerdict::Failed {
+                class,
+                manual_recon: false,
+            } => {
+                // Transient/retryable (ERROR_RETRYABLE / probe-required):
+                // halt the chain THIS tick, NO Manual; the doc stays in the
+                // cohort and retries next tick (ER class-guard / re-probe).
+                // Already recorded as a per-doc failure by `process_one_doc`.
+                let _ = class;
+                break;
+            }
+            DocVerdict::Failed {
                 class,
                 manual_recon: true,
-            } = verdict
-            {
+            } => {
+                // Terminal / non-self-resolving (REJECTED / doc-level manual):
+                // halt + escalate the FN to RequiresManualReconciliation.
                 escalate_drain_to_manual(
                     pool,
                     fiscal_number,
                     &ns,
                     doc.document_id,
                     failure_class_for(class),
+                    position,
+                )
+                .await?;
+                return Ok(summary);
+            }
+            DocVerdict::SupersededHeld => {
+                // Non-self-resolving while B1-v2 doc-scoped confirmation does
+                // not exist: a superseded predecessor is non-ACK from the
+                // successor's chain view AND would wedge if merely held
+                // (re-superseded every tick).  So halt + escalate Manual.
+                // (Reverses SEAM-B-3's sibling-continue per the M2-N1 contract
+                // note + ruling B.)  `confirm_drain_doc` already emitted the
+                // TIP_SUPERSEDED audit + completed the recovery trace.
+                summary.record_doc_held_at_sent(doc.document_id, "superseded".to_string());
+                escalate_drain_to_manual(
+                    pool,
+                    fiscal_number,
+                    &ns,
+                    doc.document_id,
+                    "superseded",
                     position,
                 )
                 .await?;
@@ -2274,7 +2309,7 @@ async fn escalate_drain_to_manual(
 ) -> Result<(), BootError> {
     let shift_id: ShiftId = ns.current_shift_id.ok_or_else(|| {
         BootError::Internal(format!(
-            "backlog_drain({fiscal_number}): shift_state={state} indicates pending-drain \
+            "backlog_drain({fiscal_number}): drain-reject escalation on shift_state={state} \
              but node_state.current_shift_id is NULL — structural drift",
             state = ns.shift_state.as_str(),
         ))

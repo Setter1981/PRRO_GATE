@@ -554,6 +554,73 @@ async fn clean_error_retryable_offline_doc_mid_drain_scans_clean() {
     assert_eq!(scan(&pool).await.unwrap(), vec![]);
 }
 
+/// **M2-N2b (architect ruling, 2026-06-13)** — an offline-origin doc that
+/// reached OFFLINE_LOCAL_ACK (advancing the local seed, M2-01) and was THEN
+/// REJECTED at drain is STILL "issued": a successor chained off it
+/// (`prev = hash(it)`) before the reject.  The MAC-walk issued-set must advance
+/// `expected` over the REJECTED predecessor, else a FALSE `ChainBreak` fires at
+/// the successor.  Pre-fix this fixture read as `ChainBreak{lnd:2}`.
+///   - lnd1: offline-origin REJECTED, chain HEAD (prev NULL), unsigned=H1, ofn=1
+///   - lnd2: offline-origin OFFLINE_LOCAL_ACK, prev=H1, unsigned=H2, ofn=2
+///   - node seed = H2  →  scan CLEAN.
+#[tokio::test]
+async fn m2_n2b_rejected_offline_origin_predecessor_scans_clean() {
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await;
+    seed_node_state(&pool, shift, Some(h(2))).await;
+    let session = OfflineSessionId::new();
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, 'OPEN', '2026-06-13T00:00:00Z')",
+    )
+    .bind(session)
+    .bind(FN)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // lnd1 — REJECTED at drain, but it reached OFFLINE_LOCAL_ACK earlier and
+    // advanced the seed (chain HEAD: previous_hash NULL, unsigned = H1).
+    let (doc_a, _) =
+        seed_doc(&pool, shift, 1, "REJECTED", None, None, Some(h(1)), Some(1), false).await;
+    // lnd2 — the successor that chained off the now-rejected predecessor.
+    let (doc_b, _) = seed_doc(
+        &pool,
+        shift,
+        2,
+        "OFFLINE_LOCAL_ACK",
+        None,
+        Some(h(1)),
+        Some(h(2)),
+        Some(2),
+        false,
+    )
+    .await;
+    for (code_lnd, doc) in [(1i64, doc_a), (2, doc_b)] {
+        sqlx::query(
+            "INSERT INTO offline_codes(fiscal_number, code_lnd, consumed_at, \
+                consumed_by_document_id) \
+             VALUES (?, ?, '2026-06-13T00:00:01Z', ?)",
+        )
+        .bind(FN)
+        .bind(code_lnd)
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE fiscal_documents SET offline_session_id = ? WHERE document_id = ?")
+            .bind(session)
+            .bind(doc)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        scan(&pool).await.unwrap(),
+        vec![],
+        "REJECTED offline-origin predecessor must NOT trip a false ChainBreak at its successor"
+    );
+}
+
 /// M2-05: an OFFLINE_LOCAL_ACK doc with NULL offline_session_id is
 /// invisible to the session-scoped drain cohort (silent backlog leak) —
 /// the scan must flag it.
