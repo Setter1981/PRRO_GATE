@@ -1606,6 +1606,27 @@ pub async fn run_boot_reconciliation(
                     })?),
                     None => None,
                 };
+            // SEAM-D-1 (functional seam-pass, 2026-06-12): `node_state.shift_state`
+            // is a MIRROR of the `shifts` table.  NC-03 reconstructs it as `Closed`
+            // (current_shift_id NULL), but NC-03's domain (node_state lost, ledger
+            // survived) lives in the SAME DB file, so a surviving OPEN `shifts` row
+            // can coexist — and boot shift-recovery keys on
+            // `node_state.shift_state == Opened`, so a `Closed` reconstruction would
+            // MASK it (the hazard node_state.rs's caller-contract warns about).  We do
+            // NOT auto-resume the shift here (a node whose node_state vanished is
+            // operator-led, and Branch (f) freezes a Blocked node anyway) — instead we
+            // SURFACE the surviving active shift in the CRITICAL audit so the operator
+            // reconciles it BEFORE clearing the block (RUNBOOK step).
+            let surviving_open_shift =
+                match crate::db::repositories::shifts::active_shift_for_fn(pool, fiscal_number)
+                    .await?
+                {
+                    Some((id_bytes, state)) => serde_json::json!({
+                        "shift_id": hex_lower(&id_bytes),
+                        "state": state,
+                    }),
+                    None => serde_json::Value::Null,
+                };
             let fn_owned = fiscal_number.to_string();
             let payload = serde_json::json!({
                 "fiscal_number": fiscal_number,
@@ -1613,8 +1634,11 @@ pub async fn run_boot_reconciliation(
                 "recovered_next_lnd": next_lnd,
                 "max_ledger_lnd": max_lnd,
                 "mac_seed_projected": projected_seed.is_some(),
+                // SEAM-D-1: non-null ⇒ a surviving OPEN shift the operator MUST
+                // reconcile before unblocking (it is NOT auto-recovered here).
+                "surviving_open_shift": surviving_open_shift,
                 "rationale":
-                    "node_state row LOST while the fiscal_documents ledger SURVIVED — LND allocator + MAC seed reconstructed from the ledger; node BLOCKED (no silent bootstrap, no trading until an operator clears the block)",
+                    "node_state row LOST while the fiscal_documents ledger SURVIVED — LND allocator + MAC seed reconstructed from the ledger; node BLOCKED (no silent bootstrap, no trading until an operator clears the block). If surviving_open_shift is non-null, the operator MUST reconcile that shift before clearing the block — it is surfaced here, NOT auto-recovered.",
             });
             // One envelope: create the row with the reconstructed allocator,
             // project the seed, then flip to BLOCKED via the existing W10.3
