@@ -1003,6 +1003,20 @@ pub async fn run(
                 )
                 .await;
             }
+            MacRecoveryOutcome::OfflineOriginRefused => {
+                // M2-X1 (external-critic HIGH, 2026-06-12): the orchestrator
+                // refused to re-sign an offline-origin doc (it already emitted
+                // MAC_RECOVERY_OFFLINE_ORIGIN_REFUSED; counter NOT claimed, chain
+                // untouched).  Return the original `Routed{MacRecovery}` outcome
+                // unchanged — `RetryClass::MacRecovery` is a manual-recon class
+                // (`is_manual_recon_retry_class`), so the drain's
+                // `process_via_stage_send` maps it to `DocVerdict::Failed{
+                // manual_recon: true}` and a pending-drain shift escalates to
+                // RequiresManualReconciliation (§16.7), mirroring the M2-04 seam.
+                // No online-path change: online docs have NULL offline_fiscal_no
+                // and never reach this arm.
+                return Ok(outcome);
+            }
         }
     }
 }

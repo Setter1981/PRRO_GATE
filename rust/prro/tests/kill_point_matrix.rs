@@ -1693,3 +1693,148 @@ async fn m2_online_offline_boundary_chain_continuous() {
     // Chain continuous across the boundary.
     prro::db::invariant_scan::assert_clean(&pool).await;
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// M2-X1 (external-critic HIGH, adjudicated 2026-06-12): mac_recovery must REFUSE
+// offline-origin docs.  W10.4 mac-recovery (DPS -12 ERROR_BAD_HASH_PREV) re-signs
+// previous_hash + unsigned_xml_sha256 but does NOT advance node_state seed — it
+// was designed for online docs (finalize advances after).  For an offline-origin
+// doc the seed already advanced at offline-ack (M2-01), so a re-sign breaks the
+// local chain (doc#2.prev goes stale; seed desyncs → invariant_scan ChainBreak).
+//
+// Pre-fix RED: drain doc#1 with -12 → mac_recovery re-signs → ChainBreak.
+// Post-fix GREEN: mac_recovery refuses (no re-sign), the pending-drain shift
+// escalates to RequiresManualReconciliation, the chain stays intact, scan clean,
+// distinct MAC_RECOVERY_OFFLINE_ORIGIN_REFUSED audit.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_offline(&pool, shift_id).await;
+    seed_open_offline_session(&pool).await;
+    seed_offline_code(&pool, 1).await;
+    seed_offline_code(&pool, 2).await;
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+
+    // Two REAL offline receipts (distinct previous_hash via M2-01).
+    let row1 = seed_inbox_sell(&pool).await;
+    {
+        let g = gate.clone().lock_owned().await;
+        let stub = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let o = inline::run(&pool, &pool_secure, &stub, &sign_ctx, &fn_sign, &g, &row1)
+            .await
+            .unwrap();
+        assert_eq!(o.document_state, DocState::OfflineLocalAck);
+    }
+    let row2 = seed_inbox_sell_keyed(&pool, "idem-m2x1-2").await;
+    {
+        let g = gate.clone().lock_owned().await;
+        let stub = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let o = inline::run(&pool, &pool_secure, &stub, &sign_ctx, &fn_sign, &g, &row2)
+            .await
+            .unwrap();
+        assert_eq!(o.document_state, DocState::OfflineLocalAck);
+    }
+
+    async fn col1(pool: &SqlitePool, c: &str) -> Option<Vec<u8>> {
+        let q = format!("SELECT {c} FROM fiscal_documents WHERE fiscal_number = ? AND lnd = 1");
+        sqlx::query_scalar(&q)
+            .bind(FN)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+    let doc1_unsigned_before = col1(&pool, "unsigned_xml_sha256").await;
+    let doc1_prev_before = col1(&pool, "previous_hash").await;
+    prro::db::invariant_scan::assert_clean(&pool).await; // chain clean pre-drain
+
+    // Go online; flip the shift into pending-drain so a manual-recon failure
+    // escalates (the §16.7 ladder).
+    set_node_mode(&pool, NodeMode::GoingOnline).await;
+    sqlx::query(
+        "UPDATE node_state SET shift_state = 'OPENED_LOCAL_PENDING_DRAIN' WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE shifts SET state = 'OPENED_LOCAL_PENDING_DRAIN' WHERE shift_id = ?")
+        .bind(shift_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Drain: doc#1 (lnd=1) hits Server -12 ERROR_BAD_HASH_PREV (store <64 hex>).
+    let msg = "ERROR_BAD_HASH_PREV: store \
+               deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567"
+        .to_string();
+    let phase = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    phase.push_send(Err(DpsError::Server {
+        code: -12,
+        message: msg.clone(),
+    }));
+    phase.push_send(Err(DpsError::Server {
+        code: -12,
+        message: msg,
+    }));
+    let sc2 = det_signing_ctx();
+    let fs2 = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &phase,
+        signing_ctx: &sc2,
+        fn_sign: &fs2,
+    };
+    let _ = backlog_drain::drain(&recon_guard(), &pool, &view, FN).await;
+
+    // ── (RED witness) chain must stay intact — pre-fix mac_recovery re-signs
+    //    doc#1 → ChainBreak.
+    let v = prro::db::invariant_scan::scan(&pool).await.unwrap();
+    assert!(
+        v.is_empty(),
+        "M2-X1: invariant_scan must be clean after refusal (mac_recovery must NOT re-sign \
+         an offline-origin doc): {v:?}"
+    );
+    // doc#1 NOT re-signed.
+    assert_eq!(
+        col1(&pool, "unsigned_xml_sha256").await,
+        doc1_unsigned_before,
+        "doc#1 unsigned_xml_sha256 unchanged (no re-sign)"
+    );
+    assert_eq!(
+        col1(&pool, "previous_hash").await,
+        doc1_prev_before,
+        "doc#1 previous_hash unchanged (no re-sign)"
+    );
+    // No re-sign audit; one distinct refusal audit.
+    let resigned: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'MAC_RECOVERY_RESIGNED'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        resigned, 0,
+        "mac_recovery must NOT re-sign an offline-origin doc"
+    );
+    let refused: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'MAC_RECOVERY_OFFLINE_ORIGIN_REFUSED'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(refused, 1, "one MAC_RECOVERY_OFFLINE_ORIGIN_REFUSED audit");
+    // Shift escalated to manual-recon.
+    let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(shift_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
+}
