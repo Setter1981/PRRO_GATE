@@ -1098,6 +1098,167 @@ async fn c5b2_sent_replay_lastchk_mismatch_halts_drain_with_structural_drift_aud
     );
 }
 
+// ─── Test 4b (SEAM-B-3): SentReplay Mismatch on a SUPERSEDED SENT doc ─
+//     → held (no halt), drain CONTINUES to the tip, TIP_SUPERSEDED audit.
+
+/// **SEAM-B-3 (architect-locked contract, 2026-06-13)** — give the
+/// offline-drain SentReplay lastChk classifier the M1-02 superseded
+/// exception that boot's `dispatch_sent_via_probe` already has.  A
+/// `ServerFiscalIdMismatch` on a SENT doc that is NOT the FN's newest
+/// submitted doc (`doc.lnd < max_submitted_lnd`) means a NEWER submitted
+/// doc became the DPS lastChk tip — the older doc's ACK status is UNKNOWN
+/// from lastChk (acked-then-superseded OR never acked), so it must be
+/// HELD, not concluded, and must NOT hard-abort the whole FN drain (the
+/// pre-SEAM-B-3 behaviour routed UNCONDITIONALLY to `StructuralDrift` →
+/// `BootError::Internal`).
+///
+/// Cohort = two SENT docs in `lnd ASC` order:
+///   - `doc_a` (lnd=1, sfn="DPS-FN-A")  — SUPERSEDED (lnd < max=2)
+///   - `doc_b` (lnd=2, sfn="DPS-FN-B")  — the actual DPS lastChk tip
+/// DPS lastChk returns the tip id "DPS-FN-B" for BOTH probes:
+///   - doc_a probe → Mismatch(expected A, actual tip B) + superseded →
+///     `SupersededHold` → held in SENT, drain CONTINUES
+///   - doc_b probe → Match → Acked → advance to ACK
+///
+/// **WEDGE-AVOIDANCE PIN.**  `doc_a` has the LOWER `lnd` and is processed
+/// FIRST.  If the superseded outcome mapped to `HoldFnDrain` (which
+/// `break`s the per-doc loop) the higher-`lnd` tip `doc_b` would never
+/// drain.  Asserting `doc_b` reaches ACK pins that the drain did NOT stop
+/// at the superseded sibling — it sibling-continued past it.
+#[tokio::test]
+async fn seam_b3_sent_replay_superseded_holds_doc_and_continues_drain() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+
+    // doc_a: lnd=1 — the superseded SENT doc (lnd < max_submitted_lnd).
+    let doc_a = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "SENT",
+        Some("DPS-FN-A"),
+    )
+    .await;
+    // doc_b: lnd=2 — the FN's newest submitted doc (the DPS lastChk tip).
+    let doc_b = seed_doc_in_state(
+        &pool,
+        2,
+        101,
+        session_id,
+        shift_id,
+        "SENT",
+        Some("DPS-FN-B"),
+    )
+    .await;
+
+    // MAC-chain bootstrap so `invariant_scan::assert_clean` holds across BOTH
+    // docs (the contract pin), modelling a genesis-consistent 2-doc chain:
+    //   doc_a (lnd=1, held): chain HEAD — `previous_hash = NULL` (genesis
+    //         start of the walk), `unsigned_xml_sha256 = H_a`.
+    //   doc_b (lnd=2, →ACK): `previous_hash = H_a`, `unsigned_xml_sha256 = H_b`.
+    //   node_state seed = H_b — both docs are OFFLINE-ORIGIN, so the chain seed
+    //   already advanced PAST both at offline-ack (M2-01 Fable-locked).
+    //   `stage_finalize` SKIPS the guard + seed-advance for offline-origin docs,
+    //   so node_state stays at H_b and the scan walk (doc_a issued→H_a,
+    //   doc_b issued→H_b) ends at H_b, matching node_state.
+    let h_a = common::chain_anchor(0x01);
+    let h_b = common::chain_anchor(0x02);
+    // doc_a: set unsigned_xml_sha256 only; leave previous_hash NULL so the chain
+    // walk's first row matches the genesis `None` start.
+    sqlx::query("UPDATE fiscal_documents SET unsigned_xml_sha256 = ? WHERE document_id = ?")
+        .bind(&h_a[..])
+        .bind(doc_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // doc_b: previous_hash = H_a, unsigned_xml_sha256 = H_b (+ the inbox row the
+    // stage_finalize 5-write envelope marks DONE on ACK).
+    common::seed_w12_finalize_prereqs(&pool, FN, doc_b, h_a, h_b)
+        .await
+        .unwrap();
+    // node_state seed = H_b (offline issuance already advanced past both docs;
+    // finalize does not re-advance offline-origin docs per M2-01).
+    common::init_chain_seed(&pool, FN, h_b).await.unwrap();
+
+    // lastChk returns the tip id "DPS-FN-B" for BOTH probes (FIFO, lnd ASC):
+    //   [0] doc_a probe (expected "DPS-FN-A") → ack.id="DPS-FN-B" → Mismatch.
+    //   [1] doc_b probe (expected "DPS-FN-B") → ack.id="DPS-FN-B" → Match.
+    let c = carriers(
+        vec![],
+        vec![
+            Ok(ack("DPS-FN-B", vec![0xAA, 0xBB, 0xCC])),
+            Ok(ack("DPS-FN-B", vec![0xAA, 0xBB, 0xCC])),
+        ],
+    );
+    let view = view_for(&c);
+
+    let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .expect("superseded SENT doc MUST NOT halt the FN drain (SEAM-B-3)");
+
+    // Superseded doc held in SENT (no state change); tip advanced to ACK.
+    assert_eq!(
+        read_doc_state(&pool, doc_a).await,
+        "SENT",
+        "superseded doc is held in SENT (no state change)"
+    );
+    assert_eq!(
+        read_doc_state(&pool, doc_b).await,
+        "ACK",
+        "the tip drains past the superseded sibling (wedge-avoidance)"
+    );
+
+    // No structural-drift halt audit (the Mismatch was superseded, not drift).
+    assert_eq!(
+        audit_count(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await,
+        0,
+        "superseded Mismatch is NOT structural drift"
+    );
+    // TIP_SUPERSEDED audit emitted for the held doc (boot-parity event/label).
+    assert_eq!(
+        audit_count(&pool, "TIP_SUPERSEDED").await,
+        1,
+        "superseded SENT doc emits the boot-parity TIP_SUPERSEDED audit"
+    );
+    let sup = audit_latest_payload(&pool, "TIP_SUPERSEDED").await.unwrap();
+    assert_eq!(sup["source"], "sent_replay");
+    assert_eq!(sup["dps_tip_id"], "DPS-FN-B");
+    assert_eq!(sup["doc_lnd"], 1);
+    assert_eq!(sup["max_submitted_lnd"], 2);
+
+    // doc_b advanced to ACK via the SentReplay chain; doc_a held at sent.
+    assert_eq!(summary.advanced_to_ack(), 1, "tip advances to Ack");
+    assert_eq!(
+        summary.held_at_sent(),
+        1,
+        "superseded doc recorded as held-at-sent (blocks finalize, conservative)"
+    );
+    assert!(
+        summary.per_doc_failures().is_empty(),
+        "superseded hold is NOT a per-doc failure"
+    );
+
+    // Wire send NOT invoked; lastChk probed once per doc.
+    assert_eq!(
+        c.dps.send_chk_count(),
+        0,
+        "no wire-resend on superseded hold"
+    );
+    assert_eq!(
+        c.dps.last_chk_count(),
+        2,
+        "both SENT docs probed via lastChk"
+    );
+
+    // Invariant scan stays clean (contract pin) — two SENT docs with
+    // distinct sfn is benign (mirrors kill_point_matrix M1-02 pin).
+    prro::db::invariant_scan::assert_clean(&pool).await;
+}
+
 // ─── Test 5: empty-skip when only terminal-state docs exist ──────────
 
 #[tokio::test]

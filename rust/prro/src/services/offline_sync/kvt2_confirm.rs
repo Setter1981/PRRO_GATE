@@ -141,6 +141,31 @@ pub enum Kvt2ConfirmOutcome {
     /// Next tick: doc enters ER cohort → W9b ER class guard
     /// bounded-redrive via `stage_send::run`.
     SentNotFoundDowngrade { trace_attempt_no: i64 },
+    /// **SEAM-B-3 (architect-locked contract, 2026-06-13)** —
+    /// SentReplay-exclusive non-fatal outcome.  A `ServerFiscalIdMismatch`
+    /// on a SENT doc that is NOT the FN's newest submitted doc
+    /// (`doc.lnd < max_submitted_lnd`): a NEWER submitted doc became the
+    /// DPS `last_chk` tip.  The ACK status of THIS doc is UNKNOWN from
+    /// `last_chk` — the probe only reports that a newer submitted doc is
+    /// now the FN tip; this SENT doc may be acked-then-superseded OR never
+    /// acked.  So we HOLD in SENT and do NOT conclude (mirrors boot's
+    /// `dispatch_sent_via_probe` M1-02 arm, which holds rather than
+    /// terminalises); resolution is deferred to B1-v2 doc-scoped
+    /// confirmation.
+    /// Caller (`confirm_drain_doc`) completes the recovery trace
+    /// (`RetryableServer` / `LAST_CHK_TIP_SUPERSEDED`) + emits a
+    /// `TIP_SUPERSEDED` audit, leaves the doc in SENT (NO state change),
+    /// and projects to `ConfirmDrainOutcome::SupersededHeld` so the drain
+    /// CONTINUES past it (does NOT `BootError::Internal`-halt the FN).
+    /// `dps_tip_id` is the DPS tip's `server_fiscal_no` (the newer doc),
+    /// threaded into the trace + audit for forensics.  The `superseded`
+    /// verdict is computed by the caller BEFORE the classifier call (it
+    /// reads `max_submitted_lnd` + `doc.lnd`), so the classifier stays
+    /// pure.
+    SupersededHold {
+        dps_tip_id: String,
+        sent_replay_trace_attempt_no: Option<i64>,
+    },
 }
 
 /// Hold-class reasons aligned with the actual `DpsChannel::last_chk
@@ -260,10 +285,21 @@ impl Kvt2ConfirmStructuralReason {
 /// allocated in Envelope 1c-pre.  Panics if SentReplay + NotFound
 /// arrives with `None` — that violates the MED-PR70-R5-02 +
 /// MED-PR70-R6-01 lifecycle contract.
+///
+/// **SEAM-B-3 (2026-06-13)** — `superseded` is the caller-computed
+/// M1-02 verdict for the `ServerFiscalIdMismatch` arm: `true` when the
+/// probed SENT doc is NOT the FN's newest submitted doc
+/// (`doc.lnd < max_submitted_lnd`).  The caller reads the repo +
+/// `doc.lnd` BEFORE calling this function so the classifier stays PURE.
+/// Only the `ServerFiscalIdMismatch` arm reads it (all other arms ignore
+/// it).  It is `true` only on the SentReplay path; every other source /
+/// outcome passes `false` (boot-parity scope: superseded is a
+/// SentReplay-exclusive exception).
 pub fn classify_check_result(
     result: Result<CheckAck, DpsError>,
     source: Kvt2ConfirmSource,
     sent_replay_trace_attempt_no: Option<i64>,
+    superseded: bool,
 ) -> Kvt2ConfirmOutcome {
     match result {
         Ok(ack) => {
@@ -300,13 +336,33 @@ pub fn classify_check_result(
         Err(DpsError::ServerFiscalIdMismatch {
             expected_id,
             actual_id,
-        }) => Kvt2ConfirmOutcome::StructuralDrift {
-            reason: Kvt2ConfirmStructuralReason::LastChkIdMismatch {
-                observed: actual_id,
-                expected: expected_id,
-            },
-            sent_replay_trace_attempt_no,
-        },
+        }) => {
+            if superseded {
+                // **SEAM-B-3**: the probed SENT doc is NOT the FN's newest
+                // submitted doc — a newer submitted doc became the DPS
+                // last_chk tip.  The ACK status of THIS doc is UNKNOWN from
+                // last_chk (it may be acked-then-superseded OR never acked);
+                // last_chk only tells us a newer doc is now the tip.  So we
+                // do NOT conclude — non-fatal: caller HOLDS it in SENT, emits
+                // TIP_SUPERSEDED, and the drain continues (M1-02 parity:
+                // boot holds, does not terminalise).
+                Kvt2ConfirmOutcome::SupersededHold {
+                    dps_tip_id: actual_id,
+                    sent_replay_trace_attempt_no,
+                }
+            } else {
+                // Mismatch on the ACTUAL newest doc (no newer submitted
+                // doc) → genuine state-machine drift → fatal/escalates
+                // (UNCHANGED pre-SEAM-B-3 behaviour).
+                Kvt2ConfirmOutcome::StructuralDrift {
+                    reason: Kvt2ConfirmStructuralReason::LastChkIdMismatch {
+                        observed: actual_id,
+                        expected: expected_id,
+                    },
+                    sent_replay_trace_attempt_no,
+                }
+            }
+        }
         Err(DpsError::Transport(msg)) => Kvt2ConfirmOutcome::Hold {
             reason: Kvt2ConfirmHoldReason::DpsTransport(msg),
             sent_replay_trace_attempt_no,
@@ -365,11 +421,14 @@ pub async fn evaluate_lastchk(
     expected_server_fiscal_no: &str,
     source: Kvt2ConfirmSource,
     sent_replay_trace_attempt_no: Option<i64>,
+    // **SEAM-B-3 (2026-06-13)** — caller-computed M1-02 superseded verdict
+    // (see [`classify_check_result`]); threaded through unchanged.
+    superseded: bool,
 ) -> Kvt2ConfirmOutcome {
     let result = dps
         .by_server_fiscal_no(fn_sign, expected_server_fiscal_no)
         .await;
-    classify_check_result(result, source, sent_replay_trace_attempt_no)
+    classify_check_result(result, source, sent_replay_trace_attempt_no, superseded)
 }
 
 // ─── M3b W12 Commit 4 — confirm_drain_doc + Envelope 1a ─────────────
@@ -457,6 +516,26 @@ pub enum ConfirmDrainOutcome {
     /// now in terminal `Ack` state.  Caller updates `DrainSummary`
     /// with the Acked outcome.
     Advanced,
+    /// **SEAM-B-3 (architect-locked contract, 2026-06-13)** —
+    /// SentReplay-exclusive: the probed SENT doc is NOT the FN's newest
+    /// submitted doc, so it is SUPERSEDED as the `last_chk` tip.  Its ACK
+    /// status is UNKNOWN from `last_chk` (it may be acked-then-superseded
+    /// OR never acked) — we HOLD, we do NOT conclude (M1-02 parity with
+    /// boot's `dispatch_sent_via_probe`, which holds rather than
+    /// terminalises).  `confirm_drain_doc` has already completed the
+    /// recovery trace (`RetryableServer` / `LAST_CHK_TIP_SUPERSEDED`) +
+    /// emitted a `TIP_SUPERSEDED` audit; the doc stays in SENT (NO state
+    /// change, NO `consecutive_holds` increment).
+    ///
+    /// **Caller MUST sibling-continue, NOT stop.**  Unlike `HoldFnDrain`
+    /// (which halts the FN drain at the held doc), the superseded doc has
+    /// a LOWER `lnd` than the tip and is processed FIRST in the `lnd ASC`
+    /// cohort — stopping here would strand the higher-`lnd` tip.  The
+    /// drain consumer maps this to a continue-verdict that records the doc
+    /// as held-at-sent (blocks finalize, conservative) and proceeds to the
+    /// next doc.  Resolution of the superseded doc is deferred to the
+    /// B1-v2 doc-scoped confirmation / monitoring (same as boot).
+    SupersededHeld,
 }
 
 /// W12 high-level helper — orchestrates the full Sent-source W12
@@ -575,12 +654,34 @@ pub(crate) async fn confirm_drain_doc(
             }
             _ => (None, None),
         };
+    // **SEAM-B-3 (2026-06-13)**: compute the M1-02 superseded verdict
+    // BEFORE the classifier call so `classify_check_result` stays pure.
+    // A SentReplay `ServerFiscalIdMismatch` is "superseded" (NOT drift)
+    // when this SENT doc is NOT the FN's newest submitted doc — its `lnd`
+    // is less than `max_submitted_lnd(fn)` over `{SENT,KVT1,KVT2,ACK}`
+    // (reuse the existing M1-02 repo fn; do NOT add a new query).  Only
+    // the SentReplay path carries this exception (boot-parity scope);
+    // every other source passes `false`.  `superseded_max_lnd` retains
+    // the max value for the TIP_SUPERSEDED audit payload below.
+    let superseded_max_lnd: Option<i64> = match source {
+        Kvt2ConfirmSource::SentReplay => {
+            match fiscal_documents::max_submitted_lnd(pool, &fiscal_number)
+                .await
+                .map_err(BootError::Database)?
+            {
+                Some(max_lnd) if doc.lnd < max_lnd => Some(max_lnd),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
     let outcome = evaluate_lastchk(
         dps,
         fn_sign,
         expected_server_fiscal_no,
         source,
         sent_replay_trace_attempt_no.map(i64::from),
+        superseded_max_lnd.is_some(),
     )
     .await;
     // Capture wire-finish timestamp AFTER DPS call returns (only
@@ -881,6 +982,54 @@ pub(crate) async fn confirm_drain_doc(
                 consecutive_holds: 0,
                 class: FailureClass::NotFound,
             })
+        }
+        Kvt2ConfirmOutcome::SupersededHold { dps_tip_id, .. } => {
+            // **SEAM-B-3 (architect-locked contract, 2026-06-13)**:
+            // SentReplay-exclusive non-fatal outcome.  A SENT doc that is
+            // NOT the FN's newest submitted doc — a newer submitted doc
+            // became the last_chk tip, so this doc is SUPERSEDED as the
+            // tip.  Its ACK status is UNKNOWN from last_chk (acked-then-
+            // superseded OR never acked); we HOLD, we do NOT conclude
+            // (M1-02 parity with boot's `complete_probe_trace_tip_
+            // superseded`, which holds rather than terminalises).  Complete
+            // the recovery trace (RetryableServer / LAST_CHK_TIP_SUPERSEDED,
+            // carrying the DPS tip id) + emit a TIP_SUPERSEDED audit; NO
+            // doc-state change; NO consecutive_holds increment.  Return
+            // `SupersededHeld` so the drain CONTINUES past this doc
+            // (caller maps to a sibling-continue verdict) — do NOT
+            // BootError-halt the FN drain.
+            if !matches!(source, Kvt2ConfirmSource::SentReplay) {
+                return Err(BootError::Internal(format!(
+                    "confirm_drain_doc({source:?}): SupersededHold is structurally \
+                     unreachable for non-SentReplay — `superseded` is computed true \
+                     only on the SentReplay path (SEAM-B-3 verdict).  If this surfaces, \
+                     classifier routing has regressed."
+                )));
+            }
+            let trace_attempt_no = sent_replay_trace_attempt_no
+                .expect("SentReplay implies 1c-pre allocated trace_attempt_no");
+            let wire_started = sent_replay_wire_started
+                .clone()
+                .expect("SentReplay implies wire_started captured");
+            let wire_finished = sent_replay_wire_finished
+                .clone()
+                .expect("SentReplay implies wire_finished captured");
+            let max_submitted_lnd = superseded_max_lnd
+                .expect("SupersededHold implies superseded verdict computed Some(max)");
+            commit_sent_replay_envelope_1c_superseded(
+                pool,
+                &fiscal_number,
+                doc_id,
+                &id_hex,
+                trace_attempt_no,
+                wire_started,
+                wire_finished,
+                &dps_tip_id,
+                doc.lnd,
+                max_submitted_lnd,
+            )
+            .await?;
+            Ok(ConfirmDrainOutcome::SupersededHeld)
         }
     }
 }
@@ -1636,6 +1785,109 @@ async fn commit_sent_replay_envelope_1c_drift(
     Ok(())
 }
 
+/// **SEAM-B-3 (architect-locked contract, 2026-06-13)** — SentReplay
+/// superseded path: 2-write atomic envelope mirroring boot's
+/// `complete_probe_trace_tip_superseded` for the offline-drain context.
+/// Bundles `transport_trace::complete_tx` (`OutcomeKind::RetryableServer`,
+/// carrying the DPS tip id + `LAST_CHK_TIP_SUPERSEDED` marker) + a
+/// `TIP_SUPERSEDED` audit (`Severity::Warning`, boot-parity event/label).
+/// NO doc-state CAS; NO `consecutive_holds` increment — the doc's ACK
+/// status is UNKNOWN from last_chk (acked-then-superseded OR never acked),
+/// so this is a HOLD (not a transient retry-hold, and NOT a conclusion).
+/// The emitted `rationale` / `error_message` strings below are kept
+/// verbatim from boot M1-02 for forensic parity across the boot + drain
+/// `TIP_SUPERSEDED` surfaces (a maintainer should read the doc-comments,
+/// not the legacy payload wording, as the authoritative semantics).
+/// Caller returns `ConfirmDrainOutcome::SupersededHeld`; the drain
+/// CONTINUES.
+#[allow(clippy::too_many_arguments)] // 10 args — bundled envelope shape
+async fn commit_sent_replay_envelope_1c_superseded(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    doc_id: DocumentId,
+    id_hex: &str,
+    trace_attempt_no: i32,
+    wire_started: String,
+    wire_finished: String,
+    dps_tip_id: &str,
+    doc_lnd: i64,
+    max_submitted_lnd: i64,
+) -> Result<(), BootError> {
+    let payload = serde_json::json!({
+        "document_id": id_hex,
+        "source": Kvt2ConfirmSource::SentReplay.audit_label(),
+        "branch": "c-sent-mismatch-superseded",
+        "dps_tip_id": dps_tip_id,
+        "doc_lnd": doc_lnd,
+        "max_submitted_lnd": max_submitted_lnd,
+        "dispatch_via": "kvt2_confirm",
+        "trace_attempt_no": trace_attempt_no,
+        "rationale":
+            "SENT doc was DPS-acked; last_chk tip is a NEWER submitted doc — superseded, \
+             not lost; held in SENT for deferred doc-scoped confirmation (NOT structural \
+             drift, NOT RequiresManualReconciliation)",
+    });
+    let payload_owned = payload.to_string();
+    let id_hex_owned = id_hex.to_string();
+    let fn_owned = fiscal_number.to_string();
+    let tip_owned = dps_tip_id.to_string();
+    let error_message = format!(
+        "last_chk tip id={tip_owned} is a newer submitted doc (this doc lnd={doc_lnd} \
+         < max submitted lnd={max_submitted_lnd}); doc was DPS-acked and is superseded, \
+         NOT lost — held in SENT"
+    );
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // (a) Complete recovery trace row carrying the DPS tip id.
+            let trace_rows = transport_trace::complete_tx(
+                tx,
+                doc_id,
+                trace_attempt_no,
+                transport_trace::AttemptCompletion {
+                    wire_call_started_at: wire_started,
+                    wire_call_finished_at: wire_finished,
+                    outcome_kind: transport_trace::OutcomeKind::RetryableServer,
+                    server_fiscal_no: Some(tip_owned),
+                    server_status_code: None,
+                    error_kind: Some("LAST_CHK_TIP_SUPERSEDED".to_string()),
+                    error_message: Some(error_message),
+                    // retry_class None: doc stays Sent (not ER); resolution
+                    // is deferred to B1-v2 doc-scoped confirmation.
+                    retry_class: None,
+                },
+            )
+            .await?;
+            if trace_rows != 1 {
+                return Err(anyhow::anyhow!(
+                    "backlog_drain({fn_id}): Envelope 1c-superseded trace.complete \
+                     produced rows_affected={trace_rows} for doc {doc_hex} \
+                     attempt_no={trace_attempt_no}",
+                    fn_id = fn_owned,
+                    doc_hex = id_hex_owned,
+                ));
+            }
+            // (b) Forensic TIP_SUPERSEDED audit (boot-parity event/label).
+            audit_log::append_tx(
+                tx,
+                AUDIT_ENTITY_DOC,
+                &id_hex_owned,
+                "TIP_SUPERSEDED",
+                Severity::Warning,
+                None,
+                Some(&payload_owned),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(|err| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source: err,
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1654,7 +1906,7 @@ mod tests {
     #[test]
     fn ok_with_data_sign_returns_acked_sent_fresh() {
         let result = Ok(ack("FN-001", vec![0xAA, 0xBB, 0xCC]));
-        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentFresh, None);
+        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentFresh, None, false);
         match outcome {
             Kvt2ConfirmOutcome::Acked {
                 kvt1_raw_bytes,
@@ -1670,7 +1922,7 @@ mod tests {
     #[test]
     fn ok_with_data_sign_returns_acked_sent_replay_threads_trace_attempt_no() {
         let result = Ok(ack("FN-001", vec![0xDE, 0xAD]));
-        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentReplay, Some(7));
+        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentReplay, Some(7), false);
         match outcome {
             Kvt2ConfirmOutcome::Acked {
                 kvt1_raw_bytes,
@@ -1686,7 +1938,7 @@ mod tests {
     #[test]
     fn ok_with_data_sign_returns_acked_kvt1_reentry() {
         let result = Ok(ack("FN-001", vec![0xFF]));
-        let outcome = classify_check_result(result, Kvt2ConfirmSource::Kvt1Reentry, None);
+        let outcome = classify_check_result(result, Kvt2ConfirmSource::Kvt1Reentry, None, false);
         assert!(matches!(
             outcome,
             Kvt2ConfirmOutcome::Acked {
@@ -1701,7 +1953,7 @@ mod tests {
     #[test]
     fn ok_with_empty_data_sign_returns_hold_data_sign_empty() {
         let result = Ok(ack("FN-001", vec![]));
-        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentReplay, Some(3));
+        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentReplay, Some(3), false);
         assert!(matches!(
             outcome,
             Kvt2ConfirmOutcome::Hold {
@@ -1714,7 +1966,7 @@ mod tests {
     #[test]
     fn err_transport_returns_hold_dps_transport() {
         let result = Err(DpsError::Transport("conn reset".into()));
-        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentFresh, None);
+        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentFresh, None, false);
         match outcome {
             Kvt2ConfirmOutcome::Hold {
                 reason: Kvt2ConfirmHoldReason::DpsTransport(msg),
@@ -1730,7 +1982,7 @@ mod tests {
             code: -42,
             message: "internal".into(),
         });
-        let outcome = classify_check_result(result, Kvt2ConfirmSource::Kvt1Reentry, None);
+        let outcome = classify_check_result(result, Kvt2ConfirmSource::Kvt1Reentry, None, false);
         match outcome {
             Kvt2ConfirmOutcome::Hold {
                 reason: Kvt2ConfirmHoldReason::DpsServer(msg),
@@ -1750,7 +2002,7 @@ mod tests {
             kind: AuthorizationKind::FiscalNumberNotRegistered,
             message: "FN not registered".into(),
         });
-        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentReplay, Some(1));
+        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentReplay, Some(1), false);
         assert!(matches!(
             outcome,
             Kvt2ConfirmOutcome::Hold {
@@ -1763,7 +2015,7 @@ mod tests {
     #[test]
     fn err_decode_returns_hold_dps_decode() {
         let result = Err(DpsError::Decode("invalid proto".into()));
-        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentFresh, None);
+        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentFresh, None, false);
         match outcome {
             Kvt2ConfirmOutcome::Hold {
                 reason: Kvt2ConfirmHoldReason::DpsDecode(msg),
@@ -1776,7 +2028,7 @@ mod tests {
     #[test]
     fn err_other_variant_falls_back_to_hold_dps_server_defensively() {
         let result = Err(DpsError::QueryNotSupported("byLocalIdentity"));
-        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentFresh, None);
+        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentFresh, None, false);
         assert!(matches!(
             outcome,
             Kvt2ConfirmOutcome::Hold {
@@ -1794,7 +2046,7 @@ mod tests {
             expected_id: "FN-A".into(),
             actual_id: "FN-B".into(),
         });
-        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentFresh, None);
+        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentFresh, None, false);
         match outcome {
             Kvt2ConfirmOutcome::StructuralDrift {
                 reason: Kvt2ConfirmStructuralReason::LastChkIdMismatch { observed, expected },
@@ -1813,7 +2065,7 @@ mod tests {
             expected_id: "FN-A".into(),
             actual_id: "FN-B".into(),
         });
-        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentReplay, Some(9));
+        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentReplay, Some(9), false);
         assert!(matches!(
             outcome,
             Kvt2ConfirmOutcome::StructuralDrift {
@@ -1829,7 +2081,7 @@ mod tests {
             expected_id: "FN-A".into(),
             actual_id: "FN-B".into(),
         });
-        let outcome = classify_check_result(result, Kvt2ConfirmSource::Kvt1Reentry, None);
+        let outcome = classify_check_result(result, Kvt2ConfirmSource::Kvt1Reentry, None, false);
         assert!(matches!(
             outcome,
             Kvt2ConfirmOutcome::StructuralDrift {
@@ -1844,7 +2096,7 @@ mod tests {
     #[test]
     fn err_not_found_sent_replay_returns_sent_not_found_downgrade() {
         let result = Err(DpsError::NotFound);
-        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentReplay, Some(5));
+        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentReplay, Some(5), false);
         assert!(matches!(
             outcome,
             Kvt2ConfirmOutcome::SentNotFoundDowngrade {
@@ -1856,7 +2108,7 @@ mod tests {
     #[test]
     fn err_not_found_sent_fresh_returns_structural_drift() {
         let result = Err(DpsError::NotFound);
-        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentFresh, None);
+        let outcome = classify_check_result(result, Kvt2ConfirmSource::SentFresh, None, false);
         match outcome {
             Kvt2ConfirmOutcome::StructuralDrift {
                 reason:
@@ -1874,7 +2126,7 @@ mod tests {
     #[test]
     fn err_not_found_kvt1_reentry_returns_structural_drift() {
         let result = Err(DpsError::NotFound);
-        let outcome = classify_check_result(result, Kvt2ConfirmSource::Kvt1Reentry, None);
+        let outcome = classify_check_result(result, Kvt2ConfirmSource::Kvt1Reentry, None, false);
         assert!(matches!(
             outcome,
             Kvt2ConfirmOutcome::StructuralDrift {
@@ -1895,7 +2147,7 @@ mod tests {
         // but the panic guards against a future implementation bug
         // that bypasses Envelope 1c-pre.
         let result = Err(DpsError::NotFound);
-        let _ = classify_check_result(result, Kvt2ConfirmSource::SentReplay, None);
+        let _ = classify_check_result(result, Kvt2ConfirmSource::SentReplay, None, false);
     }
 
     // ─── REC-6 Phase 2b helper unit test ────────────────────────────

@@ -217,6 +217,20 @@ async fn converge_one_doc(
         {
             ConfirmDrainOutcome::Advanced => summary.acked_from_kvt1 += 1,
             ConfirmDrainOutcome::HoldFnDrain { .. } => summary.held_kvt1 += 1,
+            ConfirmDrainOutcome::SupersededHeld => {
+                // **SEAM-B-3 (2026-06-13)**: structurally unreachable here.
+                // The superseded exception is SentReplay-exclusive
+                // (`superseded` is computed `true` only on the SentReplay
+                // path); this online-convergence tick uses `Kvt1Reentry`
+                // (always `superseded == false`), so `confirm_drain_doc`
+                // can never return `SupersededHeld`.  Fail-loud if the
+                // classifier routing ever regresses.
+                anyhow::bail!(
+                    "online_convergence: ConfirmDrainOutcome::SupersededHeld is \
+                     SentReplay-exclusive; Kvt1Reentry (superseded=false) cannot \
+                     produce it (kvt2_confirm routing regression)"
+                );
+            }
         }
     }
     Ok(())

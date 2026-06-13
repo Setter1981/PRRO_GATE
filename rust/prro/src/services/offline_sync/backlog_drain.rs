@@ -961,6 +961,24 @@ pub async fn drain<'a>(
             }
             break;
         }
+        // **SEAM-B-3 (architect-locked contract, 2026-06-13)** — a
+        // superseded SENT doc (NOT the FN's newest submitted doc; its ACK
+        // status is UNKNOWN from lastChk) is held in SENT and the drain
+        // CONTINUES past it.  Unlike HoldFnDrain above (which `break`s),
+        // this does NOT stop the FN drain: the superseded doc has the LOWER
+        // `lnd` and is processed FIRST in the `lnd ASC` cohort, so breaking
+        // here would strand the higher-`lnd` tip (wedge).  Record
+        // held-at-sent (blocks finalize — conservative; the doc is NOT
+        // confirmable via lastChk while a newer doc is the tip, so it stays
+        // pending until B1-v2 doc-scoped confirmation) and continue.
+        // No tier (REC-1) accounting: superseded is NOT a transient
+        // retry-hold (consecutive_holds was not incremented by the 1c-
+        // superseded envelope).  `confirm_drain_doc` already emitted the
+        // TIP_SUPERSEDED audit + completed the recovery trace.
+        if matches!(verdict, DocVerdict::SupersededHeld) {
+            summary.record_doc_held_at_sent(doc.document_id, "superseded".to_string());
+            continue;
+        }
         // Halt ONLY on manual-recon-class failures on pending-drain
         // shifts.  TransientRetry / ProbeRequired stay in
         // sibling-continue per spec §3.5 (Manual is last resort;
@@ -1066,6 +1084,24 @@ enum DocVerdict {
         projection: HoldFnDrainProjection,
         consecutive_holds: i64,
     },
+    /// **SEAM-B-3 (architect-locked contract, 2026-06-13)** — the
+    /// SentReplay-exclusive superseded outcome
+    /// (`ConfirmDrainOutcome::SupersededHeld`).  A SENT doc that is NOT the
+    /// FN's newest submitted doc: its `last_chk` Mismatch is non-fatal (a
+    /// newer submitted doc became the tip).  The doc's ACK status is UNKNOWN
+    /// from `last_chk` (acked-then-superseded OR never acked), so it is
+    /// HELD in SENT (no state change; NOT concluded; `confirm_drain_doc`
+    /// already emitted the `TIP_SUPERSEDED` audit + completed the recovery
+    /// trace).
+    ///
+    /// **Sibling-continue, NOT stop.**  Unlike [`DocVerdict::HoldFnDrain`]
+    /// (which `break`s the per-doc loop), the superseded doc has the LOWER
+    /// `lnd` and is processed FIRST in the `lnd ASC` cohort — stopping here
+    /// would strand the higher-`lnd` tip.  The drain loop records it as
+    /// held-at-sent (blocks finalize, conservative) and `continue`s to the
+    /// next doc.  No tier (REC-1) accounting: superseded is NOT a transient
+    /// retry-hold, so `consecutive_holds` is neither carried nor checked.
+    SupersededHeld,
 }
 
 /// **M3b W12 Commit 2** — projection for [`DocVerdict::HoldFnDrain`]
@@ -1265,6 +1301,18 @@ async fn process_via_stage_send(
                     projection,
                     consecutive_holds,
                 }),
+                kvt2_confirm::ConfirmDrainOutcome::SupersededHeld => {
+                    // **SEAM-B-3 (2026-06-13)**: structurally unreachable.
+                    // This is the SentFresh confirm path (doc just sent
+                    // this tick); the superseded exception is SentReplay-
+                    // exclusive (superseded=false here), so confirm_drain_doc
+                    // cannot return SupersededHeld.  Fail-loud on regression.
+                    Err(BootError::Internal(format!(
+                        "process_via_stage_send({id_hex}): SupersededHeld is \
+                         SentReplay-exclusive; SentFresh cannot produce it \
+                         (kvt2_confirm routing regression)"
+                    )))
+                }
             }
         }
         Ok(StageSendOutcome::Routed {
@@ -1752,6 +1800,16 @@ async fn process_via_lastchk_replay(
                 consecutive_holds,
             })
         }
+        kvt2_confirm::ConfirmDrainOutcome::SupersededHeld => {
+            // **SEAM-B-3 (2026-06-13)**: the probed SENT doc is superseded
+            // by a newer submitted doc (now the tip); its ACK status is
+            // UNKNOWN from lastChk, so we HOLD, not conclude (M1-02 parity).
+            // `confirm_drain_doc` already completed the recovery trace +
+            // emitted the TIP_SUPERSEDED audit and left the doc in SENT.
+            // Map to the sibling-continue verdict — the drain loop records
+            // held-at-sent and CONTINUES past this doc (does NOT halt).
+            Ok(DocVerdict::SupersededHeld)
+        }
     }
 }
 
@@ -1842,6 +1900,18 @@ async fn process_via_w12_only(
             projection,
             consecutive_holds,
         }),
+        kvt2_confirm::ConfirmDrainOutcome::SupersededHeld => {
+            // **SEAM-B-3 (2026-06-13)**: structurally unreachable.  This is
+            // the Kvt1Reentry confirm path; the superseded exception is
+            // SentReplay-exclusive (superseded=false here), so
+            // confirm_drain_doc cannot return SupersededHeld.  Fail-loud on
+            // regression.
+            Err(BootError::Internal(format!(
+                "process_via_w12_only({id_hex}): SupersededHeld is \
+                 SentReplay-exclusive; Kvt1Reentry cannot produce it \
+                 (kvt2_confirm routing regression)"
+            )))
+        }
     }
 }
 
@@ -3360,7 +3430,7 @@ mod w12_control_surface_tests {
                 DocVerdict::HoldFnDrain { projection, .. } => {
                     let _ = projection; // exhaustive arm reachable
                 }
-                DocVerdict::Advanced | DocVerdict::Failed { .. } => {
+                DocVerdict::Advanced | DocVerdict::Failed { .. } | DocVerdict::SupersededHeld => {
                     panic!("unexpected non-HoldFnDrain variant")
                 }
             }
