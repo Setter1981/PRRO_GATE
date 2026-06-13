@@ -145,8 +145,13 @@ pub enum Kvt2ConfirmOutcome {
     /// SentReplay-exclusive non-fatal outcome.  A `ServerFiscalIdMismatch`
     /// on a SENT doc that is NOT the FN's newest submitted doc
     /// (`doc.lnd < max_submitted_lnd`): a NEWER submitted doc became the
-    /// DPS `last_chk` tip, so this doc was DPS-acked but is **superseded**,
-    /// NOT lost.  Mirrors boot's `dispatch_sent_via_probe` M1-02 arm.
+    /// DPS `last_chk` tip.  The ACK status of THIS doc is UNKNOWN from
+    /// `last_chk` — the probe only reports that a newer submitted doc is
+    /// now the FN tip; this SENT doc may be acked-then-superseded OR never
+    /// acked.  So we HOLD in SENT and do NOT conclude (mirrors boot's
+    /// `dispatch_sent_via_probe` M1-02 arm, which holds rather than
+    /// terminalises); resolution is deferred to B1-v2 doc-scoped
+    /// confirmation.
     /// Caller (`confirm_drain_doc`) completes the recovery trace
     /// (`RetryableServer` / `LAST_CHK_TIP_SUPERSEDED`) + emits a
     /// `TIP_SUPERSEDED` audit, leaves the doc in SENT (NO state change),
@@ -335,9 +340,12 @@ pub fn classify_check_result(
             if superseded {
                 // **SEAM-B-3**: the probed SENT doc is NOT the FN's newest
                 // submitted doc — a newer submitted doc became the DPS
-                // last_chk tip.  The doc was DPS-acked but superseded, NOT
-                // lost (M1-02 parity).  Non-fatal: caller holds it in SENT,
-                // emits TIP_SUPERSEDED, and the drain continues.
+                // last_chk tip.  The ACK status of THIS doc is UNKNOWN from
+                // last_chk (it may be acked-then-superseded OR never acked);
+                // last_chk only tells us a newer doc is now the tip.  So we
+                // do NOT conclude — non-fatal: caller HOLDS it in SENT, emits
+                // TIP_SUPERSEDED, and the drain continues (M1-02 parity:
+                // boot holds, does not terminalise).
                 Kvt2ConfirmOutcome::SupersededHold {
                     dps_tip_id: actual_id,
                     sent_replay_trace_attempt_no,
@@ -509,13 +517,15 @@ pub enum ConfirmDrainOutcome {
     /// with the Acked outcome.
     Advanced,
     /// **SEAM-B-3 (architect-locked contract, 2026-06-13)** —
-    /// SentReplay-exclusive: the probed SENT doc was DPS-acked but is NOT
-    /// the FN's newest submitted doc, so it is SUPERSEDED, NOT lost (M1-02
-    /// parity with boot's `dispatch_sent_via_probe`).  `confirm_drain_doc`
-    /// has already completed the recovery trace
-    /// (`RetryableServer` / `LAST_CHK_TIP_SUPERSEDED`) + emitted a
-    /// `TIP_SUPERSEDED` audit; the doc stays in SENT (NO state change, NO
-    /// `consecutive_holds` increment).
+    /// SentReplay-exclusive: the probed SENT doc is NOT the FN's newest
+    /// submitted doc, so it is SUPERSEDED as the `last_chk` tip.  Its ACK
+    /// status is UNKNOWN from `last_chk` (it may be acked-then-superseded
+    /// OR never acked) — we HOLD, we do NOT conclude (M1-02 parity with
+    /// boot's `dispatch_sent_via_probe`, which holds rather than
+    /// terminalises).  `confirm_drain_doc` has already completed the
+    /// recovery trace (`RetryableServer` / `LAST_CHK_TIP_SUPERSEDED`) +
+    /// emitted a `TIP_SUPERSEDED` audit; the doc stays in SENT (NO state
+    /// change, NO `consecutive_holds` increment).
     ///
     /// **Caller MUST sibling-continue, NOT stop.**  Unlike `HoldFnDrain`
     /// (which halts the FN drain at the held doc), the superseded doc has
@@ -975,12 +985,14 @@ pub(crate) async fn confirm_drain_doc(
         }
         Kvt2ConfirmOutcome::SupersededHold { dps_tip_id, .. } => {
             // **SEAM-B-3 (architect-locked contract, 2026-06-13)**:
-            // SentReplay-exclusive non-fatal outcome.  A SENT doc that
-            // was DPS-acked but is NOT the FN's newest submitted doc — a
-            // newer submitted doc became the last_chk tip, so this doc is
-            // SUPERSEDED, NOT lost (M1-02 parity with boot's
-            // `complete_probe_trace_tip_superseded`).  Complete the
-            // recovery trace (RetryableServer / LAST_CHK_TIP_SUPERSEDED,
+            // SentReplay-exclusive non-fatal outcome.  A SENT doc that is
+            // NOT the FN's newest submitted doc — a newer submitted doc
+            // became the last_chk tip, so this doc is SUPERSEDED as the
+            // tip.  Its ACK status is UNKNOWN from last_chk (acked-then-
+            // superseded OR never acked); we HOLD, we do NOT conclude
+            // (M1-02 parity with boot's `complete_probe_trace_tip_
+            // superseded`, which holds rather than terminalises).  Complete
+            // the recovery trace (RetryableServer / LAST_CHK_TIP_SUPERSEDED,
             // carrying the DPS tip id) + emit a TIP_SUPERSEDED audit; NO
             // doc-state change; NO consecutive_holds increment.  Return
             // `SupersededHeld` so the drain CONTINUES past this doc
@@ -1779,9 +1791,15 @@ async fn commit_sent_replay_envelope_1c_drift(
 /// Bundles `transport_trace::complete_tx` (`OutcomeKind::RetryableServer`,
 /// carrying the DPS tip id + `LAST_CHK_TIP_SUPERSEDED` marker) + a
 /// `TIP_SUPERSEDED` audit (`Severity::Warning`, boot-parity event/label).
-/// NO doc-state CAS; NO `consecutive_holds` increment (the doc was
-/// DPS-acked — it is superseded, not a transient retry-hold).  Caller
-/// returns `ConfirmDrainOutcome::SupersededHeld`; the drain CONTINUES.
+/// NO doc-state CAS; NO `consecutive_holds` increment — the doc's ACK
+/// status is UNKNOWN from last_chk (acked-then-superseded OR never acked),
+/// so this is a HOLD (not a transient retry-hold, and NOT a conclusion).
+/// The emitted `rationale` / `error_message` strings below are kept
+/// verbatim from boot M1-02 for forensic parity across the boot + drain
+/// `TIP_SUPERSEDED` surfaces (a maintainer should read the doc-comments,
+/// not the legacy payload wording, as the authoritative semantics).
+/// Caller returns `ConfirmDrainOutcome::SupersededHeld`; the drain
+/// CONTINUES.
 #[allow(clippy::too_many_arguments)] // 10 args — bundled envelope shape
 async fn commit_sent_replay_envelope_1c_superseded(
     pool: &SqlitePool,

@@ -77,10 +77,13 @@ the doc. Rationale: conservative (does not finalize a session while a doc is loc
 unconfirmable via `lastChk`), and minimal-diff (reuses the existing held-at-sent gate). The
 forensic distinction lives in the `TIP_SUPERSEDED` audit + the `transport_trace` row, not a
 new summary bucket.
-**Alternative for your decision:** a superseded SENT doc IS DPS-acked (fiscalised at DPS,
-just not the `lastChk` tip), so one could argue it should NOT block finalize (a distinct
-"superseded / fiscalised-at-DPS" bucket). I chose the conservative reuse; this is the one
-place I'd most welcome a migration-grade ruling.
+**Architect ruling (Fable, 2026-06-13 — PASS):** the conservative `held_at_sent` soft-block
+is ACCEPTED. The alternative ("a superseded SENT doc IS DPS-acked / fiscalised, so don't
+block finalize") is **REJECTED**: `lastChk`-superseded does NOT prove the older doc was
+ACKed — it only reports that a newer submitted doc is now the FN tip; the older doc may be
+acked-then-superseded OR never acked. Concluding "acked" and finalizing an unconfirmed
+receipt would be unsafe. Therefore the doc is HELD (not concluded), exactly as boot M1-02
+holds. See the [Known residual](#known-residual-architect-accepted-2026-06-13) below.
 
 ### C) Defensive fail-loud on non-SentReplay
 `superseded` is computed `true` only on the SentReplay path, so `SupersededHold` /
@@ -106,12 +109,16 @@ BootError::Internal), `process_via_w12_only` (Kvt1Reentry, BootError::Internal),
 
 ## 5. Gate
 
-- `cargo fmt --check -p prro` → clean.
+Final gate (post review-fold, architect's exact invocation):
+- `cargo fmt -p prro -- --check` → clean. *(Correction: the initial-commit gate reported
+  "fmt clean" via a buggy `fmt_exit=$?`-after-a-pipe that captured `tail`'s exit, not
+  `cargo fmt`'s. The architect's exact re-gate caught that the SEAM-B-3 test +
+  exhaustiveness arm were not rustfmt-clean; applied `cargo fmt` — token-preserving line
+  wrapping only, no logic change — and re-gated clean.)*
 - `cargo clippy -p prro --all-targets --features test-support -- -D warnings` → zero warnings.
-- `cargo nextest run -p prro --features test-support` → 1399 passed, 5 skipped, **1 known
-  flake** (`reconcile_guard_enforcement_compile_fail` — trybuild-under-nextest-parallelism
-  shared-workspace race; **PASSES isolated**, untouched by this change; same flake observed
-  during the #154 merge).
+- `cargo nextest run -p prro --features test-support` → 1400 passed, 5 skipped (this run the
+  `reconcile_guard_enforcement_compile_fail` trybuild-under-nextest-parallelism flake came up
+  green; it is known-flaky and passes isolated — unrelated to this change).
 
 ---
 
@@ -129,10 +136,36 @@ BootError::Internal), `process_via_w12_only` (Kvt1Reentry, BootError::Internal),
 
 ---
 
-## 7. Known risks / not done
+## 7. Known residual (architect-accepted, 2026-06-13)
 
-- **Finalize blocking (§3B)** is the open design question for your ruling.
-- Resolution of a superseded SENT doc is deferred to **B1-v2** doc-scoped confirmation /
-  monitoring (same as boot) — not in scope here.
+Until **B1-v2** doc-scoped confirmation lands, a superseded SENT doc remains `held_at_sent`,
+so its **shift stays in pending-drain** (offline session `Draining` / shift
+`OpenedLocalPendingDrain`). This is a **soft-block**, identical to boot M1-02's position
+(hold, don't terminalise), and **strictly better than the prior hard-abort** (which raised
+`BootError` and halted the *entire* FN drain). It does NOT lose, mis-state, or conclude the
+doc: its ACK status stays UNKNOWN and recorded as such (`TIP_SUPERSEDED` audit + recovery
+trace). Resolution of the superseded doc is owned by **B1-v2** doc-scoped confirmation /
+monitoring — out of scope here. Accepted by the architect as part of the PASS verdict.
+
+### Review fold (Fable PASS + mandatory fix, 2026-06-13)
+
+- **Mandatory comment fix applied.** The over-claim "the doc was DPS-acked but superseded,
+  NOT lost" is removed from all explanatory comments (the three named locations in
+  `kvt2_confirm.rs` plus the analogous comments in `confirm_drain_doc`, the
+  `commit_sent_replay_envelope_1c_superseded` doc-comment, and `backlog_drain.rs` /
+  the test). All now state: **ACK status is UNKNOWN from `lastChk`; HOLD, do not conclude;
+  resolution deferred to B1-v2** (boot M1-02 parity). No behaviour changed.
+- **Runtime audit strings kept boot-verbatim (flagged).** The emitted `TIP_SUPERSEDED`
+  `rationale` / `error_message` payload strings in
+  `commit_sent_replay_envelope_1c_superseded` still carry boot M1-02's exact wording
+  (incl. "DPS-acked") — kept verbatim for **forensic parity** across the boot + drain
+  `TIP_SUPERSEDED` surfaces, and because the mandatory fix was scoped to comments /
+  no-behaviour-change. The helper doc-comment now flags this and directs maintainers to the
+  doc-comments (not the legacy payload wording) for authoritative semantics. If you want the
+  payload strings reworded too (and boot's alongside, to keep parity), that's a trivial
+  follow-up.
+
+## 8. Not done
+
 - The drain `StructuralDrift` re-audit (seam-pass item 3) remains a deferred follow-up,
   untouched.

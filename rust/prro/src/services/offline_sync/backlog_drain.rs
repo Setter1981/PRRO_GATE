@@ -962,14 +962,15 @@ pub async fn drain<'a>(
             break;
         }
         // **SEAM-B-3 (architect-locked contract, 2026-06-13)** — a
-        // superseded SENT doc (DPS-acked but not the FN's newest submitted
-        // doc) is held in SENT and the drain CONTINUES past it.  Unlike
-        // HoldFnDrain above (which `break`s), this does NOT stop the FN
-        // drain: the superseded doc has the LOWER `lnd` and is processed
-        // FIRST in the `lnd ASC` cohort, so breaking here would strand the
-        // higher-`lnd` tip (wedge).  Record held-at-sent (blocks finalize
-        // — conservative; the doc is DPS-acked but locally unconfirmable
-        // via lastChk until B1-v2 doc-scoped confirmation) and continue.
+        // superseded SENT doc (NOT the FN's newest submitted doc; its ACK
+        // status is UNKNOWN from lastChk) is held in SENT and the drain
+        // CONTINUES past it.  Unlike HoldFnDrain above (which `break`s),
+        // this does NOT stop the FN drain: the superseded doc has the LOWER
+        // `lnd` and is processed FIRST in the `lnd ASC` cohort, so breaking
+        // here would strand the higher-`lnd` tip (wedge).  Record
+        // held-at-sent (blocks finalize — conservative; the doc is NOT
+        // confirmable via lastChk while a newer doc is the tip, so it stays
+        // pending until B1-v2 doc-scoped confirmation) and continue.
         // No tier (REC-1) accounting: superseded is NOT a transient
         // retry-hold (consecutive_holds was not incremented by the 1c-
         // superseded envelope).  `confirm_drain_doc` already emitted the
@@ -1085,11 +1086,13 @@ enum DocVerdict {
     },
     /// **SEAM-B-3 (architect-locked contract, 2026-06-13)** — the
     /// SentReplay-exclusive superseded outcome
-    /// (`ConfirmDrainOutcome::SupersededHeld`).  A SENT doc that was
-    /// DPS-acked but is NOT the FN's newest submitted doc: its `last_chk`
-    /// Mismatch is benign (a newer submitted doc became the tip), so it is
-    /// held in SENT (no state change; `confirm_drain_doc` already emitted
-    /// the `TIP_SUPERSEDED` audit + completed the recovery trace).
+    /// (`ConfirmDrainOutcome::SupersededHeld`).  A SENT doc that is NOT the
+    /// FN's newest submitted doc: its `last_chk` Mismatch is non-fatal (a
+    /// newer submitted doc became the tip).  The doc's ACK status is UNKNOWN
+    /// from `last_chk` (acked-then-superseded OR never acked), so it is
+    /// HELD in SENT (no state change; NOT concluded; `confirm_drain_doc`
+    /// already emitted the `TIP_SUPERSEDED` audit + completed the recovery
+    /// trace).
     ///
     /// **Sibling-continue, NOT stop.**  Unlike [`DocVerdict::HoldFnDrain`]
     /// (which `break`s the per-doc loop), the superseded doc has the LOWER
@@ -1798,8 +1801,9 @@ async fn process_via_lastchk_replay(
             })
         }
         kvt2_confirm::ConfirmDrainOutcome::SupersededHeld => {
-            // **SEAM-B-3 (2026-06-13)**: the probed SENT doc was DPS-acked
-            // but superseded by a newer submitted doc (M1-02 parity).
+            // **SEAM-B-3 (2026-06-13)**: the probed SENT doc is superseded
+            // by a newer submitted doc (now the tip); its ACK status is
+            // UNKNOWN from lastChk, so we HOLD, not conclude (M1-02 parity).
             // `confirm_drain_doc` already completed the recovery trace +
             // emitted the TIP_SUPERSEDED audit and left the doc in SENT.
             // Map to the sibling-continue verdict — the drain loop records
@@ -3426,9 +3430,7 @@ mod w12_control_surface_tests {
                 DocVerdict::HoldFnDrain { projection, .. } => {
                     let _ = projection; // exhaustive arm reachable
                 }
-                DocVerdict::Advanced
-                | DocVerdict::Failed { .. }
-                | DocVerdict::SupersededHeld => {
+                DocVerdict::Advanced | DocVerdict::Failed { .. } | DocVerdict::SupersededHeld => {
                     panic!("unexpected non-HoldFnDrain variant")
                 }
             }

@@ -1106,9 +1106,11 @@ async fn c5b2_sent_replay_lastchk_mismatch_halts_drain_with_structural_drift_aud
 /// exception that boot's `dispatch_sent_via_probe` already has.  A
 /// `ServerFiscalIdMismatch` on a SENT doc that is NOT the FN's newest
 /// submitted doc (`doc.lnd < max_submitted_lnd`) means a NEWER submitted
-/// doc became the DPS lastChk tip — the doc was DPS-acked, NOT lost — so
-/// it must NOT hard-abort the whole FN drain (the pre-SEAM-B-3 behaviour
-/// routed UNCONDITIONALLY to `StructuralDrift` → `BootError::Internal`).
+/// doc became the DPS lastChk tip — the older doc's ACK status is UNKNOWN
+/// from lastChk (acked-then-superseded OR never acked), so it must be
+/// HELD, not concluded, and must NOT hard-abort the whole FN drain (the
+/// pre-SEAM-B-3 behaviour routed UNCONDITIONALLY to `StructuralDrift` →
+/// `BootError::Internal`).
 ///
 /// Cohort = two SENT docs in `lnd ASC` order:
 ///   - `doc_a` (lnd=1, sfn="DPS-FN-A")  — SUPERSEDED (lnd < max=2)
@@ -1131,11 +1133,27 @@ async fn seam_b3_sent_replay_superseded_holds_doc_and_continues_drain() {
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
 
     // doc_a: lnd=1 — the superseded SENT doc (lnd < max_submitted_lnd).
-    let doc_a =
-        seed_doc_in_state(&pool, 1, 100, session_id, shift_id, "SENT", Some("DPS-FN-A")).await;
+    let doc_a = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "SENT",
+        Some("DPS-FN-A"),
+    )
+    .await;
     // doc_b: lnd=2 — the FN's newest submitted doc (the DPS lastChk tip).
-    let doc_b =
-        seed_doc_in_state(&pool, 2, 101, session_id, shift_id, "SENT", Some("DPS-FN-B")).await;
+    let doc_b = seed_doc_in_state(
+        &pool,
+        2,
+        101,
+        session_id,
+        shift_id,
+        "SENT",
+        Some("DPS-FN-B"),
+    )
+    .await;
 
     // MAC-chain bootstrap so `invariant_scan::assert_clean` holds across BOTH
     // docs (the contract pin), modelling a genesis-consistent 2-doc chain:
@@ -1225,8 +1243,16 @@ async fn seam_b3_sent_replay_superseded_holds_doc_and_continues_drain() {
     );
 
     // Wire send NOT invoked; lastChk probed once per doc.
-    assert_eq!(c.dps.send_chk_count(), 0, "no wire-resend on superseded hold");
-    assert_eq!(c.dps.last_chk_count(), 2, "both SENT docs probed via lastChk");
+    assert_eq!(
+        c.dps.send_chk_count(),
+        0,
+        "no wire-resend on superseded hold"
+    );
+    assert_eq!(
+        c.dps.last_chk_count(),
+        2,
+        "both SENT docs probed via lastChk"
+    );
 
     // Invariant scan stays clean (contract pin) — two SENT docs with
     // distinct sfn is benign (mirrors kill_point_matrix M1-02 pin).
