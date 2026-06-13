@@ -1823,8 +1823,9 @@ async fn commit_sent_replay_envelope_1c_superseded(
         "dispatch_via": "kvt2_confirm",
         "trace_attempt_no": trace_attempt_no,
         "rationale":
-            "SENT doc was DPS-acked; last_chk tip is a NEWER submitted doc — superseded, \
-             not lost; held in SENT for deferred doc-scoped confirmation (NOT structural \
+            "SENT doc's DPS ACK status is UNKNOWN from last_chk — a NEWER submitted doc is the \
+             tip, so this doc may have been acked-then-superseded OR never acked; held in SENT, \
+             NOT concluded; resolution deferred to B1-v2 doc-scoped confirmation (NOT structural \
              drift, NOT RequiresManualReconciliation)",
     });
     let payload_owned = payload.to_string();
@@ -1833,8 +1834,9 @@ async fn commit_sent_replay_envelope_1c_superseded(
     let tip_owned = dps_tip_id.to_string();
     let error_message = format!(
         "last_chk tip id={tip_owned} is a newer submitted doc (this doc lnd={doc_lnd} \
-         < max submitted lnd={max_submitted_lnd}); doc was DPS-acked and is superseded, \
-         NOT lost — held in SENT"
+         < max submitted lnd={max_submitted_lnd}); this doc's DPS ACK status is UNKNOWN from \
+         last_chk (may be acked-then-superseded OR never acked) — held in SENT, deferred to \
+         B1-v2, NOT lost"
     );
     with_immediate(pool, move |tx| {
         Box::pin(async move {
