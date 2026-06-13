@@ -160,6 +160,38 @@ pub async fn get(pool: &SqlitePool, id: ShiftId) -> sqlx::Result<Option<ShiftRow
     }))
 }
 
+/// SEAM-D-1 (functional seam-pass, 2026-06-12) — the FN's ACTIVE
+/// (non-terminal) shift, if any: a `shifts` row whose `state` is NOT in
+/// the terminal set {`CLOSED`, `REQUIRES_MANUAL_RECONCILIATION`, `ERROR`}.
+/// Returns `(shift_id_bytes, state_string)` for the most-recent such row
+/// (`serial DESC`); `None` when the FN has no active shift.  Pool-bound
+/// read, no write-tx.
+///
+/// Used by boot branch (a) NC-03 recovery (`reconciliation::boot_phase`):
+/// when `node_state` was lost but the `fiscal_documents` ledger survived,
+/// a surviving OPEN `shifts` row would otherwise be MASKED from boot
+/// shift-recovery (which keys on `node_state.shift_state == Opened`).  The
+/// recovery surfaces the active-shift id+state in its CRITICAL audit so the
+/// operator reconciles it before clearing the block — it does NOT
+/// auto-resume the shift (a node whose node_state vanished is operator-led,
+/// not auto-recovered).  Returns raw id bytes + state string because the
+/// sole caller only needs them for the audit payload (hex id + label).
+pub async fn active_shift_for_fn(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<(Vec<u8>, String)>> {
+    sqlx::query_as::<_, (Vec<u8>, String)>(
+        "SELECT shift_id, state FROM shifts \
+         WHERE fiscal_number = ? \
+           AND state NOT IN ('CLOSED', 'REQUIRES_MANUAL_RECONCILIATION', 'ERROR') \
+         ORDER BY serial DESC \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await
+}
+
 /// W5 — same as [`get`] but takes `&mut WriteTxConn<'_>` so stage 1
 /// reads the shift row inside its `with_immediate` envelope alongside
 /// `node_state.current_shift_id`.  No CAS, no UPDATE — strictly read.

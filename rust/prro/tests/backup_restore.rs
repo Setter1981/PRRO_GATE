@@ -1202,7 +1202,89 @@ async fn boot_branch_a_ledger_survived_node_state_lost_blocks_and_reconstructs()
         crit, 1,
         "exactly one CRITICAL ledger-without-node_state audit"
     );
-    // (5) invariant_scan post-condition.
+    // (5) SEAM-D-1: the surviving OPEN shift (seeded OPENED by setup_online_fn,
+    // survived the node_state delete) must be SURFACED in the audit payload so the
+    // operator reconciles it before unblocking — NOT silently masked by the
+    // Closed reconstruction.
+    let payload_json: String = sqlx::query_scalar(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE event_type = 'BOOT_LEDGER_WITHOUT_NODE_STATE_BLOCKED' LIMIT 1",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
+    let sos = &payload["surviving_open_shift"];
+    assert!(
+        !sos.is_null(),
+        "surviving OPEN shift must be surfaced (not masked); payload={payload}"
+    );
+    assert_eq!(
+        sos["state"].as_str(),
+        Some("OPENED"),
+        "surviving shift state surfaced"
+    );
+    let surviving_id_hex: String = sqlx::query_scalar(
+        "SELECT lower(hex(shift_id)) FROM shifts WHERE fiscal_number = ? AND state = 'OPENED'",
+    )
+    .bind(FN)
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        sos["shift_id"].as_str(),
+        Some(surviving_id_hex.as_str()),
+        "surfaced shift_id matches the surviving OPENED shifts row"
+    );
+    // (6) invariant_scan post-condition.
+    prro::db::invariant_scan::assert_clean(&env.pool).await;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 15b (SEAM-D-1) — ledger survived but the shift was already CLOSED before
+// the node_state loss: branch (a) still BLOCKs/reconstructs, and the audit
+// payload's `surviving_open_shift` is NULL (nothing to reconcile — no false
+// positive that would send the operator chasing a closed shift).
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn boot_branch_a_ledger_survived_no_open_shift_surfaces_null() {
+    let env = setup_online_fn("live.db").await;
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 1, "SFN-1").await;
+    // The shift was closed before the crash → no active shift survives.
+    sqlx::query("UPDATE shifts SET state = 'CLOSED' WHERE fiscal_number = ?")
+        .bind(FN)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM node_state WHERE fiscal_number = ?")
+        .bind(FN)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+
+    let outcome = boot_phase::run_boot_reconciliation(&recon_guard(), &env.pool, FN, None)
+        .await
+        .expect("boot reconciliation must succeed");
+    assert!(
+        matches!(
+            outcome,
+            boot_phase::BranchOutcome::BlockedLedgerWithoutNodeState
+        ),
+        "ledger survived → still BLOCK; got {outcome:?}"
+    );
+    let payload_json: String = sqlx::query_scalar(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE event_type = 'BOOT_LEDGER_WITHOUT_NODE_STATE_BLOCKED' LIMIT 1",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
+    assert!(
+        payload["surviving_open_shift"].is_null(),
+        "no active shift → surviving_open_shift must be null; payload={payload}"
+    );
     prro::db::invariant_scan::assert_clean(&env.pool).await;
 }
 

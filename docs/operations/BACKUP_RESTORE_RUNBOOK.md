@@ -88,6 +88,27 @@ double-fiscalisation. **Do not** force it online or hand-edit the ledger.
 The node staying `BLOCKED` is the **safe** outcome — a stale node that traded
 would corrupt the fiscal sequence irreversibly.
 
+## 3b. If the node comes up `BLOCKED` (`BOOT_LEDGER_WITHOUT_NODE_STATE_BLOCKED`)
+
+This is a **different** block: the `node_state` row was lost (partial restore /
+corruption) while the `fiscal_documents` ledger **survived**. Boot reconstructed
+the `lnd` allocator (`next_lnd = MAX(lnd)+1`) and the MAC seed from the ledger,
+then BLOCKED rather than silently bootstrapping a fresh FN (which would reset the
+allocator and fork the chain). **Do not** force it online.
+
+- Capture the CRITICAL audit row. Its `event_payload_json` records
+  `recovered_next_lnd`, `mac_seed_projected`, and **`surviving_open_shift`**.
+- **`surviving_open_shift` (SEAM-D-1):** if non-null, a shift was still OPEN when
+  the `node_state` row was lost. The reconstruction set `shift_state = Closed`
+  (it does **not** auto-resume the shift), so that open shift is **surfaced here,
+  not auto-recovered**. Before returning the FN to service you MUST reconcile that
+  shift (its `shift_id` and `state` are in the payload) against the DPS-side
+  record — close or recover it per the support procedure. If `surviving_open_shift`
+  is null, there was no open shift to reconcile.
+- Escalate to support with the audit row; return to service only after the
+  allocator/seed reconstruction AND any surviving shift are confirmed against the
+  DPS record.
+
 ---
 
 ## 4. Notes
