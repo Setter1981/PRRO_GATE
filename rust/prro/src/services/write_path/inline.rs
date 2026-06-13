@@ -78,7 +78,11 @@ pub async fn online_confirm(
     server_fiscal_no: &str,
 ) -> InlineConfirmOutcome {
     let result = dps.by_server_fiscal_no(fn_sign, server_fiscal_no).await;
-    match classify_check_result(result, Kvt2ConfirmSource::SentFresh, None) {
+    // `superseded: false` — SEAM-B-3's superseded exception is
+    // SentReplay-exclusive; the inline online-confirm path is always
+    // SentFresh (the doc was just sent this call), so it can never be
+    // superseded by a newer submitted doc.
+    match classify_check_result(result, Kvt2ConfirmSource::SentFresh, None, false) {
         Kvt2ConfirmOutcome::Acked { kvt1_raw_bytes, .. } => {
             InlineConfirmOutcome::Acked(kvt1_raw_bytes)
         }
@@ -92,6 +96,16 @@ pub async fn online_confirm(
             unreachable!(
                 "online_confirm: SentNotFoundDowngrade is SentReplay-exclusive; \
                  SentFresh cannot produce it (classify_check_result routing breach)"
+            )
+        }
+        Kvt2ConfirmOutcome::SupersededHold { .. } => {
+            // Structurally unreachable: SEAM-B-3's `SupersededHold` only
+            // fires when the caller passes `superseded == true`, which is
+            // SentReplay-exclusive; this path always passes `false`
+            // (SentFresh).  If this fires, classifier routing regressed.
+            unreachable!(
+                "online_confirm: SupersededHold is SentReplay-exclusive; \
+                 SentFresh + superseded=false cannot produce it (routing breach)"
             )
         }
     }
