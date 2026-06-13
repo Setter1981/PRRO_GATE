@@ -154,14 +154,17 @@ pub enum Kvt2ConfirmOutcome {
     /// confirmation.
     /// Caller (`confirm_drain_doc`) completes the recovery trace
     /// (`RetryableServer` / `LAST_CHK_TIP_SUPERSEDED`) + emits a
-    /// `TIP_SUPERSEDED` audit, leaves the doc in SENT (NO state change),
-    /// and projects to `ConfirmDrainOutcome::SupersededHeld` so the drain
-    /// CONTINUES past it (does NOT `BootError::Internal`-halt the FN).
-    /// `dps_tip_id` is the DPS tip's `server_fiscal_no` (the newer doc),
-    /// threaded into the trace + audit for forensics.  The `superseded`
-    /// verdict is computed by the caller BEFORE the classifier call (it
-    /// reads `max_submitted_lnd` + `doc.lnd`), so the classifier stays
-    /// pure.
+    /// `TIP_SUPERSEDED` audit, leaves the doc in SENT (NO state change), and
+    /// projects to `ConfirmDrainOutcome::SupersededHeld`.  `confirm_drain_doc`
+    /// itself does NOT `BootError::Internal`-halt — but under **M2-N1 ruling B**
+    /// the DRAIN consumer then HALTS the chain + escalates the FN to Manual
+    /// (a superseded predecessor is non-self-resolving; see
+    /// `ConfirmDrainOutcome::SupersededHeld`).  `dps_tip_id` is the DPS tip's
+    /// `server_fiscal_no`, threaded into the trace + audit for forensics.
+    /// **M2-N4**: the `superseded` verdict is computed by the caller from the
+    /// DPS `actual_id` (it must equal the `server_fiscal_no` of a submitted
+    /// doc with `lnd > doc.lnd`; a foreign tip → `StructuralDrift`), threaded
+    /// as a pure `bool` so `classify_check_result` stays pure.
     SupersededHold {
         dps_tip_id: String,
         sent_replay_trace_attempt_no: Option<i64>,
@@ -540,14 +543,15 @@ pub enum ConfirmDrainOutcome {
     /// emitted a `TIP_SUPERSEDED` audit; the doc stays in SENT (NO state
     /// change, NO `consecutive_holds` increment).
     ///
-    /// **Caller MUST sibling-continue, NOT stop.**  Unlike `HoldFnDrain`
-    /// (which halts the FN drain at the held doc), the superseded doc has
-    /// a LOWER `lnd` than the tip and is processed FIRST in the `lnd ASC`
-    /// cohort — stopping here would strand the higher-`lnd` tip.  The
-    /// drain consumer maps this to a continue-verdict that records the doc
-    /// as held-at-sent (blocks finalize, conservative) and proceeds to the
-    /// next doc.  Resolution of the superseded doc is deferred to the
-    /// B1-v2 doc-scoped confirmation / monitoring (same as boot).
+    /// **Caller HALTS + escalates Manual (M2-N1 ruling B — reverses
+    /// SEAM-B-3).**  Under strict-sequential drain a superseded predecessor is
+    /// non-ACK from the successor's chain view AND non-self-resolving without
+    /// B1-v2 (re-superseded every tick → would wedge if merely held).  So the
+    /// drain consumer records the doc as held-at-sent and escalates the FN to
+    /// `RequiresManualReconciliation` (durable operator surface), then returns
+    /// — it does NOT continue past it (sending a successor off an unconfirmed
+    /// predecessor is unsafe in the strict M2-01 chain).  Resolution of the
+    /// superseded doc is owned by B1-v2 doc-scoped confirmation (future).
     SupersededHeld,
 }
 
@@ -1009,9 +1013,10 @@ pub(crate) async fn confirm_drain_doc(
             // the recovery trace (RetryableServer / LAST_CHK_TIP_SUPERSEDED,
             // carrying the DPS tip id) + emit a TIP_SUPERSEDED audit; NO
             // doc-state change; NO consecutive_holds increment.  Return
-            // `SupersededHeld` so the drain CONTINUES past this doc
-            // (caller maps to a sibling-continue verdict) — do NOT
-            // BootError-halt the FN drain.
+            // `SupersededHeld` — confirm_drain_doc itself does NOT BootError-
+            // halt, but under M2-N1 ruling B the drain consumer then HALTS the
+            // chain + escalates the FN to Manual (reverses SEAM-B-3: a
+            // superseded predecessor is non-self-resolving without B1-v2).
             if !matches!(source, Kvt2ConfirmSource::SentReplay) {
                 return Err(BootError::Internal(format!(
                     "confirm_drain_doc({source:?}): SupersededHold is structurally \

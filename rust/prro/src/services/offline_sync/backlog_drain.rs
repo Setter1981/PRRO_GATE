@@ -1129,13 +1129,15 @@ enum DocVerdict {
     /// already emitted the `TIP_SUPERSEDED` audit + completed the recovery
     /// trace).
     ///
-    /// **Sibling-continue, NOT stop.**  Unlike [`DocVerdict::HoldFnDrain`]
-    /// (which `break`s the per-doc loop), the superseded doc has the LOWER
-    /// `lnd` and is processed FIRST in the `lnd ASC` cohort — stopping here
-    /// would strand the higher-`lnd` tip.  The drain loop records it as
-    /// held-at-sent (blocks finalize, conservative) and `continue`s to the
-    /// next doc.  No tier (REC-1) accounting: superseded is NOT a transient
-    /// retry-hold, so `consecutive_holds` is neither carried nor checked.
+    /// **M2-N1 ruling B (2026-06-13) — HALT + escalate Manual (REVERSES
+    /// SEAM-B-3's sibling-continue).**  Under strict-sequential drain a
+    /// superseded predecessor is non-ACK from the successor's chain view, and
+    /// it is non-self-resolving without B1-v2 (re-superseded every tick →
+    /// would wedge if merely held).  So the drain loop records it as
+    /// held-at-sent and escalates the FN to `RequiresManualReconciliation`
+    /// (operator surface), then returns — it does NOT continue past it (the
+    /// successor must not be sent off an unconfirmed predecessor).  No tier
+    /// (REC-1) accounting: superseded is NOT a transient retry-hold.
     SupersededHeld,
 }
 
@@ -1836,13 +1838,15 @@ async fn process_via_lastchk_replay(
             })
         }
         kvt2_confirm::ConfirmDrainOutcome::SupersededHeld => {
-            // **SEAM-B-3 (2026-06-13)**: the probed SENT doc is superseded
-            // by a newer submitted doc (now the tip); its ACK status is
-            // UNKNOWN from lastChk, so we HOLD, not conclude (M1-02 parity).
-            // `confirm_drain_doc` already completed the recovery trace +
-            // emitted the TIP_SUPERSEDED audit and left the doc in SENT.
-            // Map to the sibling-continue verdict — the drain loop records
-            // held-at-sent and CONTINUES past this doc (does NOT halt).
+            // **M2-N1 ruling B (2026-06-13)**: the probed SENT doc is superseded
+            // by a newer submitted doc (now the tip); its ACK status is UNKNOWN
+            // from lastChk.  `confirm_drain_doc` already completed the recovery
+            // trace + emitted the TIP_SUPERSEDED audit and left the doc in SENT.
+            // Map to the SupersededHeld verdict — per strict-sequential the
+            // drain loop HALTS the chain and escalates the FN to Manual
+            // (reverses SEAM-B-3's sibling-continue): a superseded predecessor
+            // is non-ACK + non-self-resolving, so continuing would send a
+            // successor off an unconfirmed predecessor / wedge.
             Ok(DocVerdict::SupersededHeld)
         }
     }
