@@ -1,0 +1,58 @@
+name: fmt-clippy
+
+# The `fmt + clippy (gnu)` job is the REQUIRED merge gate on `main` (branch
+# protection). It lives in its OWN workflow with NO path filter so it runs on
+# EVERY pull request — including docs-only / .claude-only PRs that don't touch
+# rust/. A path-filtered required check would otherwise stay "Expected — waiting"
+# on non-rust PRs (the workflow never triggers) and block them forever. The
+# fmt+clippy job is fast (~30-60s); the EXPENSIVE cross-target build matrix stays
+# path-filtered in rust-prro.yml (it is NOT a required check). Keep the job name
+# EXACTLY "fmt + clippy (gnu)" — branch protection matches the required status
+# check by this name.
+on:
+  push:
+    branches: [main, rust-gateway]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fmt-clippy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+
+jobs:
+  fmt-and-clippy:
+    name: fmt + clippy (gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: cargo fmt --check
+        working-directory: rust
+        # prro_crypto/prro_escpos joined the fmt gate in the CRY-4 lint-debt
+        # pass (2026-06-11) — both crates were fmt-standardized then.
+        run: cargo fmt -p prro -p prro_crypto -p prro_escpos -- --check
+      - name: cargo clippy (-D warnings, crate-scoped)
+        working-directory: rust
+        # --features test-support: builds the integration test targets
+        # that consume the W2 ReconcileGuard test seam. Production
+        # builds never enable this feature.
+        run: cargo clippy -p prro --all-targets --no-deps --features test-support -- -D warnings
+      - name: cargo clippy prro_crypto + prro_escpos (-D warnings)
+        working-directory: rust
+        # Lint-debt pass CRY-4 (2026-06-11) zeroed both crates; this gate
+        # keeps them clean. Deliberate allows live at the source (core/mod.rs
+        # explicit-index CT loops; fixture-mirror fields) — do not silence
+        # new lints here, fix or justify them in code.
+        run: cargo clippy -p prro_crypto -p prro_escpos --all-targets --no-deps -- -D warnings
