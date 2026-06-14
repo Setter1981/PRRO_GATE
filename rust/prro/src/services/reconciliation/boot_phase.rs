@@ -2436,13 +2436,12 @@ pub(crate) async fn dispatch_sent_via_probe(
             // superseded was decided on local `max_lnd` alone (actual_id only
             // forensic), which masked real drift.  Shared arm: boot SENT-recovery
             // AND the online-convergence tick both reach here (one fix point).
-            let newer_submitted =
-                crate::db::repositories::fiscal_documents::submitted_above_lnd(
-                    pool,
-                    &doc.fiscal_number,
-                    doc.lnd,
-                )
-                .await?;
+            let newer_submitted = crate::db::repositories::fiscal_documents::submitted_above_lnd(
+                pool,
+                &doc.fiscal_number,
+                doc.lnd,
+            )
+            .await?;
             let tip_is_ours = newer_submitted.iter().any(|(_, sfn)| sfn == &actual_id);
             if tip_is_ours {
                 // `m` = max lnd of our newer submitted set = max_submitted_lnd
@@ -2489,8 +2488,7 @@ pub(crate) async fn dispatch_sent_via_probe(
                 {
                     Ok(_) => histogram.sent_mismatch_to_manual += 1,
                     Err(e) => {
-                        emit_dispatch_error(pool, doc_id, "c-sent-mismatch", &e, histogram)
-                            .await?
+                        emit_dispatch_error(pool, doc_id, "c-sent-mismatch", &e, histogram).await?
                     }
                 }
             }

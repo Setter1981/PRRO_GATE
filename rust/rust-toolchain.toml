@@ -1,9 +1,15 @@
 [toolchain]
-channel = "1.94.1"
+channel = "1.95.0"
 # Pin the components/targets to the SAME toolchain CI actually builds under.
 # CI installs them via `dtolnay/rust-toolchain@stable`, but every `cargo`
-# invocation under `rust/` is overridden to 1.94.1 by this file — so rustfmt,
-# clippy and the musl std must be present for 1.94.1, not just for stable,
+# invocation under `rust/` is overridden to this channel by this file — so rustfmt,
+# clippy and the musl std must be present for it, not just for stable,
 # or the `fmt + clippy` and `*-musl` CI jobs fail before doing any work.
+# Bumped 1.94.1 → 1.95.0 (2026-06-14): the dev environment ships rustc/rustfmt
+# 1.95.0 and rustup is absent, so the 1.94.1 pin could not be honoured locally —
+# every local `cargo fmt` produced 1.95.0 output that the 1.94.1 CI gate rejected
+# (perpetual fmt drift + a red `fmt + clippy` job). Aligning the pin to the
+# installed toolchain makes local == CI; the tree is reformatted under 1.95.0 in
+# the same change.
 components = ["rustfmt", "clippy"]
 targets = ["x86_64-unknown-linux-musl"]

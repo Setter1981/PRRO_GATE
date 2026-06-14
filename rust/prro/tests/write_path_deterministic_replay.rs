@@ -3316,7 +3316,11 @@ async fn m2_n4_boot_foreign_tip_is_manual_not_superseded() {
         "REQUIRES_MANUAL_RECONCILIATION",
         "foreign DPS tip → structural drift → Manual (M2-N4), NOT superseded"
     );
-    assert_eq!(doc_state(app.db(), doc_b).await, "KVT1", "the tip doc still advances");
+    assert_eq!(
+        doc_state(app.db(), doc_b).await,
+        "KVT1",
+        "the tip doc still advances"
+    );
     assert_eq!(
         summary.docs_advanced.sent_mismatch_to_manual, 1,
         "A terminalises to Manual (foreign tip)"
