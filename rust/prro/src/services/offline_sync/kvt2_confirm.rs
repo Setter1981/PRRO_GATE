@@ -680,10 +680,18 @@ pub(crate) async fn confirm_drain_doc(
     // `classify_check_result` stays a pure `bool` consumer.  A foreign/garbage
     // tip → drift.  `superseded_max_lnd` retains the max `lnd` of the newer set
     // for the TIP_SUPERSEDED audit payload (it is `Some` whenever superseded is
-    // true, since a match implies a non-empty set).  Non-SentReplay sources
-    // pass an empty set (boot-parity scope).
+    // true, since a match implies a non-empty set).  SentFresh passes an empty
+    // set (it has no submitted predecessors that could supersede it).
+    //
+    // **AUD-L5-1 (2026-06-14)**: Kvt1Reentry now ALSO fetches the newer-
+    // submitted set (was SentReplay-only).  A resting KVT1 doc whose DPS tip
+    // was superseded by a newer submitted doc was previously misclassified as
+    // StructuralDrift (empty set → superseded=false → fatal); widening the
+    // fetch lets it reach the benign SupersededHold path.  M2-N4 tip-id-match
+    // is preserved unchanged: a foreign/garbage tip (actual_id ∉ our newer
+    // set) still yields StructuralDrift.
     let newer_submitted: Vec<(i64, String)> = match source {
-        Kvt2ConfirmSource::SentReplay => {
+        Kvt2ConfirmSource::SentReplay | Kvt2ConfirmSource::Kvt1Reentry => {
             fiscal_documents::submitted_above_lnd(pool, &fiscal_number, doc.lnd)
                 .await
                 .map_err(BootError::Database)?
@@ -1017,12 +1025,41 @@ pub(crate) async fn confirm_drain_doc(
             // halt, but under M2-N1 ruling B the drain consumer then HALTS the
             // chain + escalates the FN to Manual (reverses SEAM-B-3: a
             // superseded predecessor is non-self-resolving without B1-v2).
+            //
+            // **AUD-L5-1 (2026-06-14)**: Kvt1Reentry is now superseded-capable
+            // (the fetch-gate above widened to it).  It allocates NO
+            // transport_trace (no fresh wire attempt this tick), so it cannot
+            // run the SentReplay bundled trace.complete path below — emit an
+            // audit-only light TIP_SUPERSEDED (Severity::Warning, NO doc-state
+            // CAS, doc stays KVT1) and return SupersededHeld.  Consumer policy
+            // then diverges by call-site over the SAME outcome: the online-
+            // convergence tick HOLDS (no chain-head), the offline drain
+            // escalates Manual (ruling B, mirroring SentReplay).
+            if matches!(source, Kvt2ConfirmSource::Kvt1Reentry) {
+                let max_submitted_lnd = superseded_max_lnd
+                    .expect("SupersededHold implies superseded verdict computed Some(max)");
+                commit_kvt1_reentry_superseded_light(
+                    pool,
+                    &fiscal_number,
+                    &id_hex,
+                    &dps_tip_id,
+                    doc.lnd,
+                    max_submitted_lnd,
+                )
+                .await?;
+                return Ok(ConfirmDrainOutcome::SupersededHeld);
+            }
+            // Only SentFresh can reach here now (Kvt1Reentry handled above,
+            // SentReplay falls through to the bundled path).  SentFresh keeps an
+            // empty newer-submitted set (fetch-gate), so `superseded` is never
+            // true for it — a SupersededHold on SentFresh is a classifier
+            // routing regression.  Fail-loud.
             if !matches!(source, Kvt2ConfirmSource::SentReplay) {
                 return Err(BootError::Internal(format!(
-                    "confirm_drain_doc({source:?}): SupersededHold is structurally \
-                     unreachable for non-SentReplay — `superseded` is computed true \
-                     only on the SentReplay path (SEAM-B-3 verdict).  If this surfaces, \
-                     classifier routing has regressed."
+                    "confirm_drain_doc({source:?}): SupersededHold reached the \
+                     SentReplay bundled path for a source that is neither SentReplay \
+                     nor Kvt1Reentry — SentFresh is superseded-incapable (empty newer \
+                     set per fetch-gate).  Classifier routing has regressed."
                 )));
             }
             let trace_attempt_no = sent_replay_trace_attempt_no
@@ -1237,6 +1274,62 @@ pub(in crate::services::offline_sync) async fn commit_drift_envelope_1c_drift_li
                 &id_hex_owned,
                 "KVT2_CONFIRM_STRUCTURAL_DRIFT",
                 Severity::Error,
+                None,
+                Some(&payload_owned),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(|err| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source: err,
+    })?;
+    Ok(())
+}
+
+/// **AUD-L5-1 (2026-06-14)** — audit-only `TIP_SUPERSEDED` envelope for the
+/// Kvt1Reentry superseded-hold path.
+///
+/// Unlike the SentReplay superseded envelope
+/// (`commit_sent_replay_envelope_1c_superseded`), Kvt1Reentry has NO in-flight
+/// `transport_trace` row (no fresh wire attempt this tick), so this light
+/// variant emits ONLY the forensic audit — **NO doc-state CAS, NO trace
+/// completion**.  The doc remains `KVT1`.  Severity + payload keys mirror
+/// boot's `complete_probe_trace_tip_superseded` (Severity::Warning;
+/// `doc_lnd` / `max_submitted_lnd` / `dps_tip_id`) for online / offline /
+/// boot parity.  Consumer policy (HOLD vs Manual escalate) is the caller's
+/// concern (online tick holds; offline drain escalates per ruling B).
+pub(in crate::services::offline_sync) async fn commit_kvt1_reentry_superseded_light(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    id_hex: &str,
+    dps_tip_id: &str,
+    doc_lnd: i64,
+    max_submitted_lnd: i64,
+) -> Result<(), BootError> {
+    let payload = serde_json::json!({
+        "document_id": id_hex,
+        "branch": "kvt1-reentry-superseded",
+        "source": Kvt2ConfirmSource::Kvt1Reentry.audit_label(),
+        "doc_lnd": doc_lnd,
+        "max_submitted_lnd": max_submitted_lnd,
+        "dps_tip_id": dps_tip_id,
+        "rationale": "resting KVT1 last_chk tip superseded by a newer submitted \
+                      doc; held at KVT1 (no CAS) per AUD-L5-1",
+        "dispatch_via": "kvt2_confirm",
+    });
+    let payload_owned = payload.to_string();
+    let id_hex_owned = id_hex.to_string();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            audit_log::append_tx(
+                tx,
+                AUDIT_ENTITY_DOC,
+                &id_hex_owned,
+                "TIP_SUPERSEDED",
+                Severity::Warning,
                 None,
                 Some(&payload_owned),
             )

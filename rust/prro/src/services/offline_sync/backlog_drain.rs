@@ -1963,16 +1963,19 @@ async fn process_via_w12_only(
             consecutive_holds,
         }),
         kvt2_confirm::ConfirmDrainOutcome::SupersededHeld => {
-            // **SEAM-B-3 (2026-06-13)**: structurally unreachable.  This is
-            // the Kvt1Reentry confirm path; the superseded exception is
-            // SentReplay-exclusive (superseded=false here), so
-            // confirm_drain_doc cannot return SupersededHeld.  Fail-loud on
-            // regression.
-            Err(BootError::Internal(format!(
-                "process_via_w12_only({id_hex}): SupersededHeld is \
-                 SentReplay-exclusive; Kvt1Reentry cannot produce it \
-                 (kvt2_confirm routing regression)"
-            )))
+            // **AUD-L5-1 (2026-06-14)**: Kvt1Reentry is now superseded-capable
+            // (kvt2_confirm fetch-gate widened) — a resting KVT1 head whose DPS
+            // last_chk tip was superseded by a newer submitted doc.
+            // confirm_drain_doc already emitted the light TIP_SUPERSEDED
+            // (Warning) audit + left the doc at KVT1 (no CAS).  In the OFFLINE
+            // drain a superseded head is non-self-resolving (a strict M2-01
+            // chain successor chained off it, so a mere hold would re-supersede
+            // every tick), so map it to the SupersededHeld verdict and let the
+            // strict-sequential loop HALT + escalate the FN to Manual (ruling B,
+            // mirroring the SentReplay consumer at the dispatch_sent_via_probe
+            // site).  Distinct from the online-convergence tick, which has no
+            // chain-head and HOLDS the same outcome (AUD-L5-1 EDIT-D).
+            Ok(DocVerdict::SupersededHeld)
         }
     }
 }

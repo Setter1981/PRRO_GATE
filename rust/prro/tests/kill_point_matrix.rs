@@ -2289,3 +2289,226 @@ async fn k9_offline_seed_survives_restart_chain_not_forked() {
     );
     prro::db::invariant_scan::assert_clean(&pool).await;
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// AUD-L5-1 (offline-drain consumer policy) — a resting KVT1 offline-cohort head
+// whose DPS last_chk tip was SUPERSEDED by a newer submitted doc HALTS + escalates
+// the FN to RequiresManualReconciliation (ruling B), mirroring SentReplay.
+//
+// This is the OFFLINE counterpart to the online-tick HOLD test
+// (tests/online_convergence_tick.rs::tick_holds_superseded_resting_kvt1_…): the
+// SAME SupersededHeld outcome, a DIFFERENT consumer policy — the offline drain
+// has a chain-head (strict M2-01 predecessor chain), so a superseded head is
+// non-self-resolving → escalate; the online tick has no chain-head → hold.
+//
+// RED (this commit, EDIT-A/B landed, EDIT-E not): confirm_drain_doc now returns
+// SupersededHeld for Kvt1Reentry, but process_via_w12_only still fail-louds
+// ("SupersededHeld is SentReplay-exclusive … cannot produce it") → drain returns
+// Err.  GREEN (EDIT-E): the arm maps it to DocVerdict::SupersededHeld → the
+// drain-loop ruling-B arm escalates Manual.
+// ════════════════════════════════════════════════════════════════════════════
+
+async fn read_doc_state_by_lnd(pool: &SqlitePool, lnd: i64) -> String {
+    sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE fiscal_number = ? AND lnd = ?")
+        .bind(FN)
+        .bind(lnd)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn doc_id_by_lnd(pool: &SqlitePool, lnd: i64) -> DocumentId {
+    sqlx::query_scalar(
+        "SELECT document_id FROM fiscal_documents WHERE fiscal_number = ? AND lnd = ?",
+    )
+    .bind(FN)
+    .bind(lnd)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn read_shift_state_by_id(pool: &SqlitePool, shift_id: ShiftId) -> String {
+    sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(shift_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn read_node_shift_state(pool: &SqlitePool) -> String {
+    sqlx::query_scalar("SELECT shift_state FROM node_state WHERE fiscal_number = ?")
+        .bind(FN)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn count_audit_event(pool: &SqlitePool, event_type: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE event_type = ?")
+        .bind(event_type)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn stamp_server_fiscal_no(pool: &SqlitePool, lnd: i64, sfn: &str) {
+    sqlx::query(
+        "UPDATE fiscal_documents SET server_fiscal_no = ? WHERE fiscal_number = ? AND lnd = ?",
+    )
+    .bind(sfn)
+    .bind(FN)
+    .bind(lnd)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn drain_kvt1_reentry_superseded_escalates_manual() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_offline(&pool, shift_id).await;
+    seed_open_offline_session(&pool).await;
+    seed_offline_code(&pool, 1).await;
+    seed_offline_code(&pool, 2).await;
+
+    let send_calls = Arc::new(AtomicUsize::new(0));
+    let last_calls = Arc::new(AtomicUsize::new(0));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+
+    // ── Phase 1: two offline SELLs via the REAL inline path → OFFLINE_LOCAL_ACK
+    //    (lnd 1 + 2, same OPEN session, codes 1 + 2 consumed; no wire).
+    for (idem, n) in [("idem-l5-1-doc1", 1u8), ("idem-l5-1-doc2", 2)] {
+        let row = seed_inbox_sell_keyed(&pool, idem).await;
+        let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = gate.lock_owned().await;
+        let outcome = inline::run(
+            &pool,
+            &pool_secure,
+            &stub,
+            &sign_ctx,
+            &fn_sign,
+            &guard,
+            &row,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("offline SELL {n} must land OFFLINE_LOCAL_ACK: {e:?}"));
+        assert_eq!(outcome.document_state, DocState::OfflineLocalAck);
+        drop(guard);
+    }
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        0,
+        "offline branch issues no wire"
+    );
+
+    // ── Stage the cohort via the transition whitelist (mirror K5): doc1 (lnd=1)
+    //    → KVT1, doc2 (lnd=2) → SENT.  doc2's server_fiscal_no is the DPS tip
+    //    that supersedes doc1.
+    let doc1_id = doc_id_by_lnd(&pool, 1).await;
+    let doc2_id = doc_id_by_lnd(&pool, 2).await;
+    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            let o1 = fiscal_documents::transition_state(
+                tx,
+                doc1_id,
+                DocState::OfflineLocalAck,
+                DocState::Sent,
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+            assert!(matches!(o1, TransitionOutcome::Applied), "doc1 OLA→Sent");
+            let o2 =
+                fiscal_documents::transition_state(tx, doc1_id, DocState::Sent, DocState::Kvt1)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+            assert!(matches!(o2, TransitionOutcome::Applied), "doc1 Sent→Kvt1");
+            document_files::replace_tx(tx, doc1_id, DocumentFileKind::Kvt1Raw, &kvt1_bytes).await?;
+            let o3 = fiscal_documents::transition_state(
+                tx,
+                doc2_id,
+                DocState::OfflineLocalAck,
+                DocState::Sent,
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+            assert!(matches!(o3, TransitionOutcome::Applied), "doc2 OLA→Sent");
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .expect("stage doc1→KVT1 + doc2→SENT");
+    stamp_server_fiscal_no(&pool, 1, SERVER_FISCAL_NO).await; // DPS-FN-ONLINE-1
+    stamp_server_fiscal_no(&pool, 2, "DPS-FN-ONLINE-2").await;
+    assert_eq!(read_doc_state_by_lnd(&pool, 1).await, "KVT1");
+    assert_eq!(read_doc_state_by_lnd(&pool, 2).await, "SENT");
+
+    // ── Go-online: the drain owns reconciliation (session stays OPEN).
+    set_node_mode(&pool, NodeMode::GoingOnline).await;
+
+    // ── Phase 2: drain.  Head = doc1 (KVT1) → Kvt1Reentry confirm → lastChk
+    //    reports a DIFFERENT tip (doc2's sfn) → ServerFiscalIdMismatch.  doc2
+    //    (lnd=2, SENT, sfn=DPS-FN-ONLINE-2) is the supersession candidate
+    //    `submitted_above_lnd` returns.  Exactly one last_chk (drain halts at
+    //    the head — doc2 is never processed).
+    let phase2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    phase2.push_last(Err(DpsError::ServerFiscalIdMismatch {
+        expected_id: SERVER_FISCAL_NO.to_string(),
+        actual_id: "DPS-FN-ONLINE-2".to_string(),
+    }));
+    let sign_ctx2 = det_signing_ctx();
+    let fn_sign2 = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &phase2,
+        signing_ctx: &sign_ctx2,
+        fn_sign: &fn_sign2,
+    };
+
+    backlog_drain::drain(&recon_guard(), &pool, &view, FN)
+        .await
+        .expect("drain escalates Manual (ruling B) and returns Ok — not a fail-loud Err");
+
+    // ── GREEN assertions: ruling-B escalate over the SupersededHeld outcome.
+    assert_eq!(
+        read_doc_state_by_lnd(&pool, 1).await,
+        "KVT1",
+        "doc1 held at KVT1 (no CAS)"
+    );
+    assert_eq!(
+        read_doc_state_by_lnd(&pool, 2).await,
+        "SENT",
+        "doc2 not processed (halt at the cohort head)"
+    );
+    assert_eq!(
+        read_shift_state_by_id(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "FN shift escalated to Manual (ruling B)"
+    );
+    assert_eq!(
+        read_node_shift_state(&pool).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "node_state.shift_state mirror"
+    );
+    assert_eq!(
+        count_audit_event(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1,
+        "exactly one escalation audit (Critical)"
+    );
+    assert_eq!(
+        count_audit_event(&pool, "TIP_SUPERSEDED").await,
+        1,
+        "the Kvt1Reentry superseded-light audit (Warning)"
+    );
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        0,
+        "Kvt1Reentry issues no send"
+    );
+    prro::db::invariant_scan::assert_clean(&pool).await;
+}
