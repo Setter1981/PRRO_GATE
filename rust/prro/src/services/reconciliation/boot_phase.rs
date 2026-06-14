@@ -3578,6 +3578,65 @@ async fn dispatch_pending_doc(
             // BOOT_KVT2_DISPATCH_FAILED audit).
             match crate::services::write_path::stage_finalize::run(pool, doc_id).await {
                 Ok(_) => histogram.kvt2_finalized += 1,
+                // **AUD-L2-1b**: a typed ChainSeedMismatch (chain-integrity breach)
+                // gets a manual-reconciliation operator surface, instead of being
+                // flattened into the generic Warning-only BOOT_KVT2_DISPATCH_FAILED.
+                // ChainSeedMismatch is produced ONLY for online-origin docs
+                // (stage_finalize's seed guard is gated `offline_fiscal_no.is_none()`),
+                // so reaching it here implies an online-origin Kvt2.  `matches!(&e,..)`
+                // borrows — `e` stays available for the Warning/no-shift `format!`.
+                Err(e)
+                    if matches!(
+                        &e,
+                        crate::services::write_path::stage_finalize::StageFinalizeError::ChainSeedMismatch { .. }
+                    ) =>
+                {
+                    let ns = crate::db::repositories::node_state::get(pool, &doc.fiscal_number)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "boot-KVT2 ChainSeedMismatch escalation: node_state row \
+                                 missing for {}",
+                                doc.fiscal_number
+                            )
+                        })?;
+                    if ns.current_shift_id.is_some() {
+                        crate::services::offline_sync::backlog_drain::escalate_fn_to_manual_recon(
+                            pool,
+                            &doc.fiscal_number,
+                            &ns,
+                            doc_id,
+                            "chain_seed_mismatch",
+                            0,
+                            "BOOT_KVT2_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL",
+                        )
+                        .await?;
+                    } else {
+                        // NULL-shift edge — a stray Kvt2 on a Closed shift (no active
+                        // shift to CAS).  Emit a distinct Critical operator surface
+                        // WITHOUT a shift transition (the doc stays Kvt2 for manual
+                        // reconciliation); never panic on the Option.
+                        let payload = serde_json::json!({
+                            "document_id": hex_lower(doc_id.as_bytes()),
+                            "branch": "c-kvt2-chain-seed-mismatch-no-shift",
+                            "stage_finalize_error": format!("{e}"),
+                            "rationale":
+                                "Kvt2 chain-seed mismatch with NULL current_shift_id \
+                                 (stray Kvt2 on a closed shift); operator must reconcile",
+                        });
+                        audit_log::append(
+                            pool,
+                            "fiscal_document",
+                            &hex_lower(doc_id.as_bytes()),
+                            "BOOT_KVT2_CHAIN_SEED_MISMATCH_NO_SHIFT",
+                            crate::db::models::enums::Severity::Critical,
+                            None,
+                            Some(&payload.to_string()),
+                        )
+                        .await?;
+                    }
+                    histogram.kvt2_failed += 1;
+                }
                 Err(e) => {
                     let payload = serde_json::json!({
                         "document_id": hex_lower(doc_id.as_bytes()),
