@@ -109,20 +109,78 @@ semantic/sequencing class — that is the adversarial-pass's job; do not over-in
 
 ---
 
-## Batch C — A2.4 online-lane pre-flight gate (AUD-L2-1 HIGH; NOT a now-blocker, A2.4-gated)
+## Batch C — AUD-L2-1 (HIGH) — SCOPE-SPLIT by reachability (architect ruling 2026-06-14, vs `93904a7`)
 
-Pair with M2-X2. Must land BEFORE the inline write-path is vivified (A2.4).
-- **Online seed-fork:** the online lane must either advance the seed per-issued-doc OR gate a new
-  acquire/sign on the prior doc being terminal — eliminate the genesis fork where two online SENT docs
-  share one `previous_hash` (proven reachable by `kill_point_matrix.rs:1107`).
-- **Convergence + boot manual-escalation:** the online convergence tick (`online_convergence.rs`, maps
-  to Infrastructure log-and-skip; filters Sent|Kvt1) and the boot KVT2 arm (`boot_phase.rs:3508-3537`,
-  Warning-only) must escalate a `ChainSeedMismatch` (a KVT2-wedged online doc) to
-  `RequiresManualReconciliation` — mirror the drain's M2-04 seam — so a locally+DPS-fiscalized receipt
-  cannot wedge at KVT2 with no operator surface.
-- **Pins:** two online SELLs resting at SENT (online_confirm Hold) → assert NO shared `previous_hash`
-  (fork eliminated) OR the second acquire is gated; a forced ChainSeedMismatch at KVT2 → manual-recon
-  via BOTH convergence and boot (not log-and-skip/Warning-only).
+**Verified by the 4-agent adversarial+design pass 2026-06-14.** AUD-L2-1 has THREE parts with
+different reachability; the architect ruling (operator-approved, 2026-06-14) is to **fix the
+reachable-today parts NOW** and **defer the dormant-lane seed-fork REDESIGN to A2.4** (the online lane
+is `UnimplementedWritePath` in production — `supervisor.rs:180`; redesigning hot fiscal MAC-chain
+semantics for dormant code without runtime feedback is premature; A2.4 is where the lane activates and
+re-integrates). Done now as **PR C-1 (AUD-L5-1)** + **PR C-2 (AUD-L2-1b escalation + AUD-L2-1a RED-pin)**.
+
+### Done now — AUD-L2-1b: ChainSeedMismatch → manual-recon surface (convergence + boot)
+Reachable TODAY (boot-KVT2 arm via NC-03-class restore; convergence today-but-rare, broadens at A2.4).
+The drain escalates `ChainSeedMismatch`→manual (M2-04, `backlog_drain.rs:2031-2056` → `escalate_drain_to_manual`),
+but the online convergence tick log-and-skips it (`online_convergence.rs:131-141`, via
+`advance_to_ack`→`ConfirmError::Infrastructure` `kvt2_advance.rs:207-211`) and the boot KVT2 arm is
+Warning-only (`boot_phase.rs:3574-3603`). **RULING: SHIFT-level escalation, mirror drain M2-04**
+(doc stays KVT2; same error-class → same surface across all three owners). Extract a shared
+`escalate_fn_to_manual_recon` (edge 15 for plain Opened — confirmed working: K8 #168; edges 6/14 for
+pending-drain), idempotent (skip if already RMR). Add `ConfirmError::ChainSeedMismatch` (typed downcast
+before the generic Infrastructure map) + non-fatal `ConfirmDrainOutcome::ChainSeedMismatch`. Boot
+NULL-shift edge → Critical `BOOT_KVT2_CHAIN_SEED_MISMATCH_NO_SHIFT` (no crash).
+
+### Done now — AUD-L5-1 (folded from A3): KVT1-reentry superseded → HOLD
+See A3. **RULING: HOLD-parity with boot** (`complete_probe_trace_tip_superseded`, Warning, no CAS) —
+NOT Manual (online tick has no chain-head like the offline drain). Three coordinated changes in
+`kvt2_confirm` (fetch widen `:685-692` to `Kvt1Reentry`, SupersededHold handler Kvt1 branch `:1004-1057`,
+light `TIP_SUPERSEDED` Warning) + convergence arm (`online_convergence.rs:220-232` bail → counted hold).
+SentFresh stays excluded; M2-N4 tip-id-match preserved.
+
+### DEFERRED to A2.4 — AUD-L2-1a: online-lane MAC-seed-fork REDESIGN (A2.4 ACTIVATION PREREQUISITE)
+**Do NOT activate `InlineWritePath` (flip `supervisor.rs:180` `UnimplementedWritePath`) until this is
+resolved.** Tracked by the `#[ignore]` RED-pin `m1_02_online_seed_fork_a24_prerequisite`
+(`tests/kill_point_matrix.rs`) + a barrier-comment at the binding site, both landed in PR C-2.
+
+**The defect (verified `93904a7`):** the online lane reads the seed at sign (`stage_sign.rs:279-302`,
+per-doc `previous_hash`) but advances it ONLY at terminal ACK/finalize (`stage_finalize.rs:285-321`,
+gated `offline_fiscal_no.is_none()`), NEVER at SENT/issuance (`stage_send` has no seed write). When an
+online receipt rests at SENT via `online_confirm` Hold (`inline.rs:748-758`, transient lastChk OR empty
+data_sign), the seed is untouched, so a SECOND receipt signs the SAME un-advanced seed → two SENT docs
+with identical `previous_hash` (genesis fork). On convergence doc#1 ACKs (seed advances), doc#2 hits
+`stage_finalize` ChainSeedMismatch → durably wedges at KVT2.
+
+**The A2.4 fix design (architect-preferred = A; mirror M2-01 STRUCTURE, advance per-issued-doc at local
+commit — NOT the rejected 'advance-at-finalize-of-last' candidate):**
+- **(A)** Advance `node_state.last_known_unsigned_xml_sha256` to the doc's `unsigned_xml_sha256` INSIDE
+  the `Sending→Sent` `with_immediate` envelope in `stage_send` (the online 'issuance' moment, symmetric
+  to offline-ack), guarded by the same pre-advance drift assert as `stage_offline_ack.rs:361-368`
+  (read ns seed in-tx, assert `== doc.previous_hash`, else fail-closed). Advance ONLY on the fresh
+  `Sending→Sent` `Applied` CAS (never on SentReplay re-entry — mirror `stage_offline_ack` `Applied` gate).
+- Then **generalize** the `stage_finalize.rs:285` `offline_fiscal_no.is_none()` gate into a unified
+  'already-advanced-at-issuance' predicate so finalize skips BOTH offline-ack AND online-Sent docs
+  (advance once-per-issued-doc, lane-agnostic).
+- **(B) fallback** only if (A) proves unsafe: gate acquire/sign of doc#2 on prior-doc terminality
+  (hurts liveness under the Hold path — head-of-line stall — so (A) is preferred).
+
+**LOAD-BEARING open questions for the A2.4 architect (ruled at A2.4, not now):**
+1. **Issuance moment = SENT vs KVT1?** Recommend SENT (matches offline-ack 'local commit = chain
+   commit'); KVT1 reopens the SENT-SENT fork window (two docs rest at SENT before either reaches KVT1),
+   forcing design (B) acquire-gating.
+2. **REJECTED-after-SENT policy:** a doc whose seed advanced at SENT but is later DPS-rejected at
+   lastChk/KVT must escalate **manual-recon (NO seed rollback)** — mirror offline (offline-ack advances,
+   a later drain reject escalates, never un-advances; M3b crossed-local-commit-threshold pin). Confirm
+   no compensating rollback (which reintroduces the rollback-semantics §6.3 deliberately avoids).
+3. **Landing:** as an A2.4 prerequisite (RED-pin un-ignored + fix) — the lane must not go live forked.
+
+**Anchors (`93904a7`):** seed read `stage_sign.rs:279-302`; online advance `stage_finalize.rs:285-321`;
+M2-01 offline ref `stage_offline_ack.rs:339-385`; Hold-at-SENT `inline.rs:748-758`; no-advance
+`stage_send.rs:1352-1360`; `advance_to_ack` collapse `kvt2_advance.rs:206-211`; drain wedge endpoint
+`backlog_drain.rs:2037-2055`; prod binding `supervisor.rs:180` + `inline.rs:3-4`.
+
+**Pins (now, Batch C):** AUD-L2-1b — a forced ChainSeedMismatch at KVT2 → manual-recon via BOTH
+convergence and boot (not log-and-skip / Warning-only). AUD-L2-1a — RED-pin asserts the FIXED chaining
+(`doc2.previous_hash == doc1.unsigned_xml_sha256`) so it FAILS today, `#[ignore]`'d as the A2.4 gate.
 
 ---
 
@@ -150,15 +208,20 @@ Pair with M2-X2. Must land BEFORE the inline write-path is vivified (A2.4).
    A3 — can proceed in parallel after A1; both are reachable-today blockers.
 3. **A3** (superseded tip-id match + KVT1) — independent; pairs naturally with A2's review.
 4. **A4** (K8/K9 durability companions) — NON-blocking; ride the A1/AUD-L6-1 + Batch B review cycle.
-5. **C** — deferred to the A2.4 vivification scope (gate, not now).
+5. **C** — SCOPE-SPLIT (2026-06-14, architect ruling): L2-1b escalation + L5-1 (KVT1 superseded, from A3)
+   done NOW (PR C-1/C-2, reachable-today); **L2-1a online seed-fork REDESIGN deferred to A2.4** (dormant
+   lane — see §Batch C "DEFERRED to A2.4"). RED-pin + binding-site barrier land in C-2.
 6. **D** — cosmetic, fold into whichever batch touches the file.
 
-**STATUS (2026-06-14):** #162 merged **A2 (M2-N1/N2a) + A3 (M2-N4) + A1.1 (M2-N2b scan-half)**. Remaining
-to lift NO-GO: **A1.2 (AUD-L6-1 boot seed projection) + Batch B** (both reachable-today; A4 K8/K9 ride
-along). A1.2 reuses the issued-predicate #162 established in `invariant_scan`.
+**STATUS (2026-06-14):** NO-GO **LIFTED**. Merged: #162 (A2 M2-N1/N2a + A3 M2-N4 + A1.1 M2-N2b scan-half);
+#164 (A1.2 AUD-L6-1 boot seed projection + Batch B AUD-L4-1); #167 (Batch D D1/D2/D3 + A4 K8/K9 — K8 was a
+`#[ignore]` RED-pin that surfaced **AUD-K8-1**); #168 (AUD-K8-1 fix — drain re-entry RMR guard). In
+progress: **Batch C** — PR C-1 (AUD-L5-1) + PR C-2 (AUD-L2-1b escalation + AUD-L2-1a RED-pin), architect
+contract locked 2026-06-14.
 
-**NO-GO lifts when A1.2 (AUD-L6-1) + B are merged + architect-reviewed** (A2/A3/N2b already in via #162).
-C remains a hard A2.4 pre-flight gate.
+**NO-GO is LIFTED (A1+A2+A3+B in via #162/#164).** C is now a hard **A2.4 pre-flight gate** only — its
+reachable-today parts (L2-1b, L5-1) land now; the L2-1a seed-fork redesign is an A2.4 activation
+prerequisite (do not flip `InlineWritePath` until the RED-pin is resolved).
 
 ## Per-batch Opus prompts
 Each batch's contract above IS the spec. Hand Opus: "Implement Batch <X> per
