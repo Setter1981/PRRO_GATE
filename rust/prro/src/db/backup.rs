@@ -253,7 +253,7 @@ pub fn prune(
             ours.push((entry.path(), stamp));
         }
     }
-    ours.sort_by(|a, b| b.1.cmp(&a.1));
+    ours.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     let now = chrono::Utc::now().naive_utc();
     let mut deleted = 0usize;
