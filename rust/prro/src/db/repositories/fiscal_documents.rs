@@ -897,26 +897,29 @@ pub async fn last_issued_unsigned_xml_sha256(
     pool: &SqlitePool,
     fiscal_number: &str,
 ) -> sqlx::Result<Option<Vec<u8>>> {
-    // Build the offline-issued IN-list from the single-source-of-truth const
-    // (literal, our own state names — no injection surface) so the SQL set and
+    // Build a PARAMETERISED `IN (?, ?, …)` from the single-source-of-truth
+    // const, then BIND each state — the SQL string carries only `?` placeholders
+    // (no interpolated data), matching the codebase's parameterised style, while
+    // the set still comes solely from `OFFLINE_ISSUED_STATES` so the SQL set and
     // the invariant_scan walk set cannot drift.
-    let in_list = OFFLINE_ISSUED_STATES
+    let placeholders = OFFLINE_ISSUED_STATES
         .iter()
-        .map(|s| format!("'{s}'"))
+        .map(|_| "?")
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
         "SELECT unsigned_xml_sha256 FROM fiscal_documents \
          WHERE fiscal_number = ? AND unsigned_xml_sha256 IS NOT NULL \
            AND (state = 'ACK' \
-                OR (offline_fiscal_no IS NOT NULL AND state IN ({in_list}))) \
+                OR (offline_fiscal_no IS NOT NULL AND state IN ({placeholders}))) \
          ORDER BY lnd DESC \
          LIMIT 1"
     );
-    let row: Option<Option<Vec<u8>>> = sqlx::query_scalar::<_, Option<Vec<u8>>>(&sql)
-        .bind(fiscal_number)
-        .fetch_optional(pool)
-        .await?;
+    let mut query = sqlx::query_scalar::<_, Option<Vec<u8>>>(&sql).bind(fiscal_number);
+    for state in OFFLINE_ISSUED_STATES {
+        query = query.bind(state);
+    }
+    let row: Option<Option<Vec<u8>>> = query.fetch_optional(pool).await?;
     Ok(row.flatten())
 }
 

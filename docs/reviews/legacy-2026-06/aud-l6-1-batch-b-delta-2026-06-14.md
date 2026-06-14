@@ -26,8 +26,10 @@ TODAY on a restored/recovered DB.
 - **Single source of truth:** new `pub const fiscal_documents::OFFLINE_ISSUED_STATES: [&str;7]`
   (`OFFLINE_LOCAL_ACK,SENT,KVT1,ERROR_RETRYABLE,KVT2,REJECTED,REQUIRES_MANUAL_RECONCILIATION`).
   The `invariant_scan` MAC-walk issued-set (M2-N2b, #162) now uses `OFFLINE_ISSUED_STATES.contains(..)`
-  (was an inline `matches!`), and `last_issued_…` builds its SQL `IN`-list from the SAME const — so
-  the boot projection **equals** the walk's final `expected` by construction (same predicate + max-lnd).
+  (was an inline `matches!`), and `last_issued_…` builds a **parameterised** `state IN (?, …)` whose
+  placeholders + binds derive from the SAME const (review fold: no value interpolation — the SQL
+  string carries only `?`, matching the codebase's parameterised style) — so the boot projection
+  **equals** the walk's final `expected` by construction (same predicate + max-lnd).
 - boot branch (a) swaps `last_ack_…` → `last_issued_…`. `last_ack_unsigned_xml_sha256` is KEPT
   (no ACK-only caller today; retained per the architect, docstring corrected — the old "projecting
   from last ACK is unambiguous" is false post-M2-01). Boot comment (`boot_phase.rs:1592`) corrected.
@@ -64,14 +66,22 @@ then skips the FN → permanent wedge + ingress refused. Hits TODAY on a restore
   ("last ACK / confirmed ACK" → "newest SUBMITTED tip, which may be a non-ACK in-flight SENT").
 
 **Pins (extend `backup_restore.rs`):**
-- `tip_guard_inflight_sent_notfound_defers_to_drain`: GoingOnline FN + active offline session +
-  in-flight offline-origin SENT tip + `lastChk` NotFound → `DeferredInFlightSent`, node stays ONLINE
-  (NOT BLOCKED), `TIP_GUARD_DEFERRED_INFLIGHT` audit, NO `TIP_GUARD_STALE_LEDGER`.
+- `tip_guard_inflight_sent_notfound_defers_to_drain` (END-TO-END, review fold): **GoingOnline** FN
+  (the only mode the drain runs in) + active offline session + in-flight offline-origin SENT tip +
+  `lastChk` NotFound → **Phase 1**: tip-guard returns `DeferredInFlightSent`, node stays
+  `GoingOnline` (NOT BLOCKED), `TIP_GUARD_DEFERRED_INFLIGHT` audit, NO `TIP_GUARD_STALE_LEDGER`.
+  **Phase 2**: `backlog_drain::drain` then runs (NOT skipped — no `OFFLINE_DRAIN_SKIPPED_NOT_GOING_ONLINE`)
+  and the deferred SENT doc safe-redrives `Sent → ERROR_RETRYABLE` (HIGH-C5-3). This proves the defer
+  enables recovery end-to-end — **no permanent wedge** (closes the adversarial-review blocker: the
+  prior pin used `Online` mode, in which the drain never runs, so it never proved the redrive).
 - `tip_guard_ack_tail_notfound_still_blocks`: ACK tail (no in-flight SENT) + NotFound → still
   `Blocked` + CRITICAL (preserves the real stale-ledger guard — proves the fix did not over-defer).
+- `tip_guard_kvt1_tail_notfound_still_blocks` (NEW, review fold): a KVT1 in-flight tip (confirmed once
+  by DPS; the drain's Kvt1Reentry path treats NotFound as fatal `StructuralDrift`, NOT the safe-redrive)
+  + NotFound → still `Blocked` + CRITICAL, NO defer. Locks the boundary that **the defer is SENT-only**.
 - (Note: the defer pin references the NEW `DeferredInFlightSent` variant, so a literal pre-fix RED
-  is a compile error; the behavioural RED is "current code BLOCKs the SENT tip". The ACK-tail pin is
-  green both pre- and post-fix and locks the no-over-defer boundary.)
+  is a compile error; the behavioural RED is "current code BLOCKs the SENT tip". The ACK/KVT1-tail pins
+  are green both pre- and post-fix and lock the no-over-defer boundary.)
 
 ---
 
@@ -81,6 +91,32 @@ then skips the FN → permanent wedge + ingress refused. Hits TODAY on a restore
   per the spec's "in-flight SENT"); KVT1/KVT2/ACK tails on NotFound BLOCK (genuine divergence). The
   Mismatch arm stays BLOCK (consistent with the drain). The shared `OFFLINE_ISSUED_STATES` const
   satisfies the spec's "single source of truth so scan-walk and projection don't diverge".
+
+## Review-response delta (2026-06-14, ultracode adversarial pass — 2 confirmed findings folded)
+
+- **[blocker, confirmed real → fixed]** The Batch-B defer pin originally seeded `Online` mode, but the
+  drain runs ONLY in `GoingOnline` (`backlog_drain.rs:687`) — so the pin proved "tip-guard defers" but
+  NOT "the drain then redrives", and would have masked a wedge. **Fix:** the pin is now end-to-end
+  (GoingOnline → tip-guard defers → `backlog_drain::drain` safe-redrives `Sent → ERROR_RETRYABLE`).
+  This empirically confirms the production path is NOT wedged: the defer removes a BLOCK and the
+  normal recovering-FN drain owns the doc. **No production change needed — test-adequacy fix.**
+- **[major, confirmed real → fixed]** `last_issued_unsigned_xml_sha256` built its `IN`-list by
+  interpolating the const's quoted literals (safe — own state names — but inconsistent with the
+  parameterised style). **Fix:** parameterised `state IN (?, …)` + bind each `OFFLINE_ISSUED_STATES`
+  member; the SQL string now carries only `?` placeholders. Single-source-of-truth preserved.
+
+## ⚠️ Environmental finding (NOT this PR's delta) — base-tree rustfmt drift
+
+Under the pinned `1.94.1` rustfmt (`1.8.0-stable`, no `rustfmt.toml`), `cargo fmt -p prro -- --check`
+reports diffs in **~9 committed files this PR does not touch** (e.g. `boot_phase.rs:2493` around the
+`submitted_above_lnd` M2-N4 code, `kill_point_matrix.rs`, `backlog_drain_*` tests, `shifts.rs`). These
+are wrap/combine differences — i.e. recent commits on `main` landed formatted by a NON-1.94.1 rustfmt
+(exactly the hazard `rust-toolchain.toml` warns about: "CI installs via `dtolnay/rust-toolchain@stable`
+but every cargo invocation under `rust/` is overridden to 1.94.1"). **This PR's two files are
+fmt-clean under 1.94.1**; the ~9 base-tree files were left untouched on purpose (repo-wide `cargo fmt`
+would be cross-cutting churn + collide with the parallel track). Recommend a SEPARATE coordinated
+`cargo fmt` hygiene commit owned by whoever holds the formatting baseline. The literal
+`cargo fmt --check` gate will read red until then — due to pre-existing drift, not this delta.
 
 ## Files changed
 
@@ -94,12 +130,17 @@ then skips the FN → permanent wedge + ingress refused. Hits TODAY on a restore
 
 ## Gate
 
-- `cargo fmt -p prro -- --check` → clean.
-- `cargo clippy -p prro --all-targets --features test-support -- -D warnings` → zero warnings.
+- `cargo fmt` — **this PR's two files are clean** under 1.94.1 rustfmt. The package-wide
+  `cargo fmt -p prro -- --check` reads red ONLY due to the pre-existing base-tree drift documented in
+  the ⚠️ Environmental finding above (~9 files this PR never touched).
+- `cargo clippy -p prro --all-targets --features test-support -- -D warnings` → zero warnings (exit 0).
 - Targeted `cargo nextest` (architect's instruction — not the full suite for a small add): the
-  affected binaries (`app_boot_reconciliation`, `backup_restore`, `invariant_scan`,
-  `write_path_deterministic_replay`, `kill_point_matrix`, `backlog_drain_*`) → all pass. (Full suite
-  was green on #162's base: 1405 passed.)
+  affected binaries → all pass:
+  - `backup_restore` (incl. the 11 tip-guard pins, the new end-to-end defer + KVT1-tail),
+    `app_boot_reconciliation` (incl. the AUD-L6-1 boot-projection pin), `invariant_scan`
+    (incl. `m2_n2b_…` — const refactor preserves the #162 walk) → 65 passed.
+  - `kill_point_matrix` + `backlog_drain_finalize` + `backlog_drain_prerequisites` → 26 passed.
+  (Full suite was green on #162's base: 1405 passed.)
 
 ## Invariant check
 
