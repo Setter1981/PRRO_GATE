@@ -177,6 +177,14 @@ where
     // failure — it returns Err before ANY task is spawned, so a misconfigured
     // ingress never half-starts the spine.  Binding before spawn also makes a
     // bind error a boot failure, NOT a runtime loop-death.
+    // ── A2.4 ACTIVATION PREREQUISITE (AUD-L2-1a) ──────────────────────────────
+    // Before flipping this binding from `UnimplementedWritePath` to the inline
+    // write-path, RESOLVE the online-lane chain seed-fork: the inline lane
+    // advances the chain seed only at `stage_finalize` (ACK), so two online
+    // SELLs resting at `SENT` fork the chain (doc2 signs against the stale
+    // pre-doc1 seed).  Gate: un-#[ignore]
+    // `tests/kill_point_matrix.rs::m1_02_online_seed_fork_a24_prerequisite`
+    // (currently a RED pin).  See REMEDIATION-PLAN §Batch C / AUD-L2-1a.
     let write_path: Arc<dyn WritePathEntry> = Arc::new(UnimplementedWritePath);
     let bound_ingress = bind_rest_ingress(&app, &write_path).await?;
 

@@ -2617,3 +2617,108 @@ async fn boot_kvt2_chain_seed_mismatch_escalates_manual() {
         "exactly one Critical boot-KVT2 escalation audit"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// AUD-L2-1a — RED pin + A2.4 ACTIVATION PREREQUISITE (NOT fixed here).
+//
+// **STATUS — RED pin, #[ignore]'d; fix deferred to A2.4.**  The online inline
+// lane has a chain SEED-FORK: the chain seed
+// (`node_state.last_known_unsigned_xml_sha256`) is read as a doc's
+// `previous_hash` at sign time (stage_sign) but ADVANCED only inside
+// `stage_finalize` at the ACK transition (gated online-origin,
+// `offline_fiscal_no.is_none()`).  Two online SELLs can BOTH rest at `SENT`
+// (empty-data_sign lastChk Hold), so `stage_finalize` never runs for doc1 → the
+// seed is never advanced → doc2 is signed against the SAME stale (pre-doc1)
+// seed.  Result: `doc2.previous_hash == doc1.previous_hash` (both = the pre-doc1
+// genesis seed), NOT `doc1.unsigned_xml_sha256` — a FORK, not a chain.  (The
+// OFFLINE lane is correct — M2-01 advances the seed per-doc at offline-ack;
+// cf. the M2-01 chain test which asserts `prev2 == uns1`.)
+//
+// This test asserts the DESIRED (fixed) chained property and therefore FAILS
+// today.  The fix (move the seed advance to `stage_send`, or generalise the
+// finalize-gate / handle rejected-after-SENT) is deferred to A2.4.  The inline
+// lane is DORMANT in prod (`UnimplementedWritePath` is bound, NOT
+// `InlineWritePath`), so the fork is NOT reachable from a live request yet —
+// un-#[ignore]-ing this test is the GATE for flipping the prod binding (see the
+// A2.4 ACTIVATION PREREQUISITE barrier at `runtime::supervisor` + `inline.rs`).
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+#[ignore = "RED pin AUD-L2-1a: online-lane seed-fork; fix is an A2.4 prerequisite (do NOT activate InlineWritePath until resolved)"]
+async fn m1_02_online_seed_fork_a24_prerequisite() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+
+    // Two online SELLs on the SAME FN, both resting at SENT via empty-data_sign
+    // Hold (mirror m1_02_reachability_second_sell_while_first_rests_sent).
+    let row1 = seed_inbox_sell(&pool).await;
+    let stub1 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    stub1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    stub1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → Hold → SENT
+    {
+        let guard = gate.clone().lock_owned().await;
+        inline::run(
+            &pool,
+            &pool_secure,
+            &stub1,
+            &sign_ctx,
+            &fn_sign,
+            &guard,
+            &row1,
+        )
+        .await
+        .expect("doc1 rests at SENT");
+    }
+    let row2 = seed_inbox_sell_keyed(&pool, "idem-l2-1a-2").await;
+    let stub2 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    stub2.push_send(Ok(ack("DPS-FN-ONLINE-2", vec![])));
+    stub2.push_last(Ok(ack("DPS-FN-ONLINE-2", vec![]))); // empty → Hold → SENT
+    {
+        let guard = gate.clone().lock_owned().await;
+        inline::run(
+            &pool,
+            &pool_secure,
+            &stub2,
+            &sign_ctx,
+            &fn_sign,
+            &guard,
+            &row2,
+        )
+        .await
+        .expect("doc2 rests at SENT");
+    }
+
+    let doc1_unsigned: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT unsigned_xml_sha256 FROM fiscal_documents WHERE fiscal_number = ? AND lnd = 1",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let doc2_previous_hash: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT previous_hash FROM fiscal_documents WHERE fiscal_number = ? AND lnd = 2",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // DESIRED (A2.4 fixed): doc2 chains off doc1's unsigned hash.  FAILS today —
+    // the seed never advanced (doc1 rests at SENT), so doc2.previous_hash is the
+    // pre-doc1 genesis seed, not doc1.unsigned_xml_sha256.
+    assert!(
+        doc1_unsigned.is_some(),
+        "doc1 must carry unsigned_xml_sha256"
+    );
+    assert_eq!(
+        doc2_previous_hash, doc1_unsigned,
+        "AUD-L2-1a: doc2.previous_hash must chain off doc1.unsigned_xml_sha256 \
+         (online-lane seed-fork — fix is an A2.4 prerequisite)"
+    );
+}
