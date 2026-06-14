@@ -42,6 +42,7 @@ const FN: &str = "4000000001";
 const CASHIER: &str = "test-cashier";
 const DRIVER: &str = "drv-test";
 const SERVER_FISCAL_NO: &str = "DPS-FN-ONLINE-1";
+const NEWER_SERVER_FISCAL_NO: &str = "DPS-FN-ONLINE-2";
 const SELL_PAYLOAD: &str = r#"{"items":[{"code":"item-1","name":"Test item","price_kop":15000,"quantity_thousandths":1000,"sum_kop":15000}],"payments":[{"name":"Cash","sum_kop":15000,"type_code":"0"}]}"#;
 const TOTAL_KOP: i64 = 15000;
 
@@ -265,6 +266,55 @@ async fn count_doc_rows(pool: &SqlitePool) -> i64 {
         .unwrap()
 }
 
+/// Read a specific doc's state by `lnd` — needed once a test seeds MORE than
+/// one row for the FN (`read_doc_state` does an unqualified `fetch_one`).
+async fn read_doc_state_by_lnd(pool: &SqlitePool, lnd: i64) -> String {
+    sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE fiscal_number = ? AND lnd = ?")
+        .bind(FN)
+        .bind(lnd)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn count_audit_events(pool: &SqlitePool, event_type: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE event_type = ?")
+        .bind(event_type)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Seed a NEWER submitted doc (`lnd` > the resting head) in terminal `ACK`
+/// with a distinct `server_fiscal_no` — the supersession candidate that
+/// `submitted_above_lnd` returns.  Raw INSERT (not a pipeline run): the test
+/// only needs a row satisfying the supersession query (lnd > head, state IN
+/// SENT/KVT1/KVT2/ACK, non-empty sfn).  Well-formed (real shift_id) so the
+/// `assert_clean` invariant scan tolerates it.
+async fn seed_newer_submitted_ack(pool: &SqlitePool, shift_id: ShiftId, lnd: i64, sfn: &str) {
+    let doc_id = DocumentId::new();
+    let req_id = RequestId::new();
+    let payload_sha: [u8; 32] = Sha256::digest(b"newer-submitted-doc").into();
+    sqlx::query(
+        "INSERT INTO fiscal_documents \
+            (document_id, request_id, fiscal_number, shift_id, lnd, doc_type, state, \
+             backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+             payload_json, payload_sha256_canonical, server_fiscal_no, server_fiscal_date) \
+         VALUES (?, ?, ?, ?, ?, 'SELL', 'ACK', 'b', 't', 'ONLINE', \
+             '2026-06-09T12:00:01Z', '{}', ?, ?, '2026-06-09T12:00:01Z')",
+    )
+    .bind(&doc_id.as_bytes()[..])
+    .bind(&req_id.as_bytes()[..])
+    .bind(FN)
+    .bind(&shift_id.as_bytes()[..])
+    .bind(lnd)
+    .bind(&payload_sha[..])
+    .bind(sfn)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 /// Build a resting `SENT` doc via the real stage chain: `inline::run` with a
 /// lastChk-Hold (empty data_sign) rests the doc at `SENT` (a 202).  Consumes
 /// `send_q[0]` (send Ok → one send) + `last_q[0]` (empty → Hold).
@@ -409,6 +459,84 @@ async fn tick_converges_resting_kvt1_to_ack() {
         "no SENT step (already KVT1)"
     );
     assert_eq!(summary.acked_from_kvt1, 1);
+    assert_eq!(send_calls.load(Ordering::SeqCst), 1, "tick does NOT send");
+    prro::db::invariant_scan::assert_clean(&pool).await;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Test 2b — AUD-L5-1: a resting KVT1 whose DPS `last_chk` tip was SUPERSEDED by
+// a NEWER submitted doc is HELD (benign), NOT falsely terminalised as
+// StructuralDrift.  Online-tick consumer policy = HOLD (no chain-head, unlike
+// the offline drain which escalates Manual — see kill_point_matrix).
+//
+// On main this FAILS: the superseded exception is fetched ONLY for SentReplay
+// (kvt2_confirm fetch-gate), so the Kvt1Reentry tick gets an empty newer-set →
+// superseded=false → StructuralDrift (Severity::Error) + summary.errors==1.
+// AUD-L5-1 widens the fetch to Kvt1Reentry and routes it to a benign hold.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn tick_holds_superseded_resting_kvt1_not_structural_drift() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(&pool, NodeMode::Online, shift_id).await;
+
+    let (send_calls, last_calls) = seed_counters();
+    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold → SENT
+                                                       // KVT1 confirm: DPS reports a DIFFERENT tip — a newer submitted doc
+                                                       // became the last_chk tip → ServerFiscalIdMismatch (actual = newer sfn).
+    stub.push_last(Err(DpsError::ServerFiscalIdMismatch {
+        expected_id: SERVER_FISCAL_NO.to_string(),
+        actual_id: NEWER_SERVER_FISCAL_NO.to_string(),
+    }));
+
+    // Resting head: lnd=1, sfn=SERVER_FISCAL_NO.
+    build_resting_sent(&pool, &pool_secure, &stub).await;
+    manual_advance_sent_to_kvt1(&pool).await;
+    // Newer submitted doc (lnd=2) whose sfn is the DPS tip → the resting KVT1's
+    // mismatch is a benign SUPERSESSION, not structural drift.
+    seed_newer_submitted_ack(&pool, shift_id, 2, NEWER_SERVER_FISCAL_NO).await;
+    assert_eq!(send_calls.load(Ordering::SeqCst), 1);
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    let summary = run_tick_for_fn(&pool, &view, FN)
+        .await
+        .expect("tick ok — supersession is a benign hold, not an error");
+
+    // Desired (AUD-L5-1): benign HOLD — doc stays KVT1, counted as a superseded
+    // hold, NO per-doc error, NO structural-drift audit, exactly one
+    // TIP_SUPERSEDED (Warning) audit.
+    assert_eq!(
+        read_doc_state_by_lnd(&pool, 1).await,
+        "KVT1",
+        "superseded KVT1 stays KVT1 (held, no CAS)"
+    );
+    assert_eq!(summary.acked_from_kvt1, 0, "not advanced");
+    assert_eq!(summary.errors, 0, "supersession is benign — not a per-doc error");
+    assert_eq!(
+        summary.superseded_held_kvt1, 1,
+        "counted as a distinct superseded hold"
+    );
+    assert_eq!(
+        count_audit_events(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await,
+        0,
+        "superseded tip must NOT be falsely terminalised as structural drift"
+    );
+    assert_eq!(
+        count_audit_events(&pool, "TIP_SUPERSEDED").await,
+        1,
+        "exactly one benign-supersession audit"
+    );
     assert_eq!(send_calls.load(Ordering::SeqCst), 1, "tick does NOT send");
     prro::db::invariant_scan::assert_clean(&pool).await;
 }

@@ -66,6 +66,11 @@ pub struct TickSummary {
     pub sent_not_converged: usize,
     /// `KVT1` confirm held (empty / transient `last_chk`) — doc stays `KVT1`.
     pub held_kvt1: usize,
+    /// `KVT1` confirm held because its DPS `last_chk` tip was SUPERSEDED by a
+    /// newer submitted doc (benign supersession per AUD-L5-1 / SEAM-B-3 /
+    /// M2-N4) — doc stays `KVT1`, no error.  Distinct dashboard signal from
+    /// `held_kvt1` (transient/empty hold) and from `errors` (structural drift).
+    pub superseded_held_kvt1: usize,
     /// Per-doc errors that were logged-and-skipped (isolation).
     pub errors: usize,
 }
