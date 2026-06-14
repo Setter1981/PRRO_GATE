@@ -1564,3 +1564,134 @@ async fn rec8_drain_reads_node_state_snapshot_per_tick_not_mid_tick() {
         "tick 2 payload MUST carry fresh GOING_ONLINE mode, NOT stale ONLINE from tick 1"
     );
 }
+
+// ─── AUD-L6-1 (FT) — boot seed projection from the EVER-ISSUED tip ───────────
+//
+// NC-03 branch (a) projected node_state.last_known_unsigned_xml_sha256 from the
+// last ACK only.  M2-01 advances the seed at OFFLINE_LOCAL_ACK for offline-origin
+// docs (and stage_finalize SKIPS the advance for them).  So when the FN tail is an
+// offline-origin doc with lnd > the last online ACK, boot must project the OFFLINE
+// tip's unsigned (h3), NOT the stale last-ACK (h1).  Pre-fix it wrote h1 → a forked
+// MAC chain at the next write.
+
+fn h32(b: u8) -> [u8; 32] {
+    [b; 32]
+}
+
+/// Seed one fiscal_documents row with full chain + offline columns.
+#[allow(clippy::too_many_arguments)]
+async fn seed_chain_doc(
+    pool: &SqlitePool,
+    fn_id: &str,
+    lnd: i64,
+    state: &str,
+    sfn: Option<&str>,
+    prev: Option<[u8; 32]>,
+    unsigned: [u8; 32],
+    offline_fiscal_no: Option<i64>,
+    offline_session_id: Option<&[u8]>,
+) -> DocumentId {
+    let doc_bytes = vec![lnd as u8; 16];
+    let req_bytes = vec![(lnd as u8) ^ 0xFF; 16];
+    let fs_mode = if offline_fiscal_no.is_some() {
+        "OFFLINE"
+    } else {
+        "ONLINE"
+    };
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical, server_fiscal_no, previous_hash, unsigned_xml_sha256, \
+            offline_fiscal_no, offline_session_id) \
+         VALUES (?, ?, ?, ?, 'SELL', ?, 'b1', 't1', ?, '2026-01-01T00:00:00Z', '{}', ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&doc_bytes)
+    .bind(&req_bytes)
+    .bind(fn_id)
+    .bind(lnd)
+    .bind(state)
+    .bind(fs_mode)
+    .bind(vec![0u8; 32])
+    .bind(sfn)
+    .bind(prev.map(|p| p.to_vec()))
+    .bind(unsigned.to_vec())
+    .bind(offline_fiscal_no)
+    .bind(offline_session_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    DocumentId::from_bytes(<[u8; 16]>::try_from(doc_bytes.as_slice()).unwrap())
+}
+
+async fn read_node_seed(pool: &SqlitePool, fn_id: &str) -> Option<Vec<u8>> {
+    let row: Option<Option<Vec<u8>>> = sqlx::query_scalar(
+        "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = ?",
+    )
+    .bind(fn_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap();
+    row.flatten()
+}
+
+#[tokio::test]
+async fn aud_l6_1_boot_projects_seed_from_offline_origin_tip_not_last_ack() {
+    let (_d, pool) = fresh_pool().await;
+    let fn_id = "1234567890";
+    seed_fn_config(&pool, fn_id).await;
+    let (h1, h2, h3) = (h32(0xA1), h32(0xA2), h32(0xA3));
+    // offline session + codes for the two offline-origin docs (invariant_scan 6b/6d).
+    let session = vec![0x5e; 16];
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, 'OPEN', '2026-01-01T00:00:00Z')",
+    )
+    .bind(&session)
+    .bind(fn_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // lnd1: online ACK, chain head (prev NULL), unsigned=h1.  ACK needs sfn + KVT1_RAW.
+    let doc1 = seed_chain_doc(&pool, fn_id, 1, "ACK", Some("SFN-1"), None, h1, None, None).await;
+    sqlx::query("INSERT INTO document_files(document_id, kind, content) VALUES (?, 'KVT1_RAW', ?)")
+        .bind(doc1)
+        .bind(vec![0xAAu8; 8])
+        .execute(&pool)
+        .await
+        .unwrap();
+    // lnd2 + lnd3: offline-origin OFFLINE_LOCAL_ACK, chained off the prior (REAL M2-01 chain).
+    seed_chain_doc(&pool, fn_id, 2, "OFFLINE_LOCAL_ACK", None, Some(h1), h2, Some(1), Some(&session))
+        .await;
+    seed_chain_doc(&pool, fn_id, 3, "OFFLINE_LOCAL_ACK", None, Some(h2), h3, Some(2), Some(&session))
+        .await;
+    for (code_lnd, doc_byte) in [(1i64, 2u8), (2, 3)] {
+        sqlx::query(
+            "INSERT INTO offline_codes(fiscal_number, code_lnd, consumed_at, consumed_by_document_id) \
+             VALUES (?, ?, '2026-01-01T00:00:01Z', ?)",
+        )
+        .bind(fn_id)
+        .bind(code_lnd)
+        .bind(vec![doc_byte; 16])
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    // node_state ABSENT (branch a — lost while ledger survived).
+
+    boot_phase::run_boot_reconciliation(&recon_guard(), &pool, fn_id, None)
+        .await
+        .expect("boot branch (a) reconstructs node_state");
+
+    // FT pin: the projected seed is the OFFLINE-origin tip (h3), NOT the last ACK (h1).
+    let seed = read_node_seed(&pool, fn_id).await.expect("node_state seed projected");
+    assert_eq!(
+        seed,
+        h3.to_vec(),
+        "boot must project the EVER-ISSUED tip (offline lnd3 = h3), not the last ACK (h1)"
+    );
+    // next_lnd reconstructed = max_lnd + 1 = 4 (NC-03, unchanged).
+    let (_, _, next_lnd) = read_node_state(&pool, fn_id).await.expect("node_state row");
+    assert_eq!(next_lnd, 4);
+    // Ledger consistent: node seed == the MAC-walk's final expected (h3).
+    prro::db::invariant_scan::assert_clean(&pool).await;
+}

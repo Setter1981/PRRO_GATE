@@ -212,18 +212,14 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             // predecessor → a FALSE `ChainBreak` at the successor.  Ever-reached-
             // OfflineLocalAck ⇒ seed advanced, regardless of later drain outcome.
             // Online-origin docs are unchanged (they only ever issue at ACK).
+            // AUD-L6-1 (2026-06-14): the offline-issued state set is now the
+            // single-source-of-truth const `OFFLINE_ISSUED_STATES` (shared with
+            // `last_issued_unsigned_xml_sha256`, the boot seed projection) so the
+            // walk's final `expected` and the boot projection CANNOT diverge.
             let issued = state == "ACK"
                 || (offline_fiscal_no.is_some()
-                    && matches!(
-                        state.as_str(),
-                        "OFFLINE_LOCAL_ACK"
-                            | "SENT"
-                            | "KVT1"
-                            | "ERROR_RETRYABLE"
-                            | "KVT2"
-                            | "REJECTED"
-                            | "REQUIRES_MANUAL_RECONCILIATION"
-                    ));
+                    && crate::db::repositories::fiscal_documents::OFFLINE_ISSUED_STATES
+                        .contains(&state.as_str()));
             if issued {
                 expected = unsigned_sha;
             }

@@ -1329,3 +1329,128 @@ async fn boot_branch_a_fresh_fn_empty_ledger_bootstraps_unchanged() {
         "fresh FN: no false ledger-without-node_state BLOCK"
     );
 }
+
+// ─── Batch B (AUD-L4-1) — tip-guard NotFound on a non-ACK in-flight SENT tip ──
+//     must DEFER to the drain's safe-redrive, not BLOCK the FN.
+
+/// Seed an in-flight offline-origin SENT doc (sfn set) — the AUD-L4-1 scenario:
+/// the FN's newest SUBMITTED tip is a non-ACK in-flight SENT doc.
+async fn seed_inflight_sent_offline_sfn(pool: &SqlitePool, lnd: i64, sfn: &str, session: &[u8]) {
+    let doc_bytes = vec![(lnd as u8) ^ 0x70; 16];
+    let req_bytes = vec![(lnd as u8) ^ 0x71; 16];
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical, server_fiscal_no, offline_fiscal_no, offline_session_id) \
+         VALUES (?, ?, ?, ?, 'SELL', 'SENT', 'b', 't', 'OFFLINE', '2026-01-01T00:00:00Z', '{}', \
+            ?, ?, ?, ?)",
+    )
+    .bind(&doc_bytes)
+    .bind(&req_bytes)
+    .bind(FN)
+    .bind(lnd)
+    .bind(vec![0u8; 32])
+    .bind(sfn)
+    .bind(lnd)
+    .bind(session)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn tip_guard_inflight_sent_notfound_defers_to_drain() {
+    let env = setup_online_fn("live.db").await;
+    // ACK#1 (lnd=1, sfn SFN-1) via the proven online path.
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 1, "SFN-1").await;
+    // Active offline session + a NON-ACK in-flight offline-origin SENT tip
+    // (lnd=2, sfn SFN-2) — the FN's newest SUBMITTED doc.
+    let session = vec![0x5eu8; 16];
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, 'OPEN', '2026-01-01T00:00:00Z')",
+    )
+    .bind(&session)
+    .bind(FN)
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    seed_inflight_sent_offline_sfn(&env.pool, 2, "SFN-2", &session).await;
+
+    // DPS lastChk(SFN-2) → NotFound: the in-flight SENT doc never landed at DPS.
+    let stub = DpsStub::new();
+    stub.push_last(Err(DpsError::NotFound));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let outcome = boot_phase::run_boot_tip_guard(&recon_guard(), &env.pool, FN, &view, true)
+        .await
+        .expect("tip-guard runs");
+
+    // AUD-L4-1: a NotFound on a non-ACK in-flight SENT tip DEFERS to the drain's
+    // safe-redrive — it must NOT BLOCK the FN.
+    assert!(
+        matches!(outcome, boot_phase::TipGuardOutcome::DeferredInFlightSent { .. }),
+        "NotFound on an in-flight SENT tip MUST defer, got {outcome:?}"
+    );
+    assert_eq!(
+        node_mode(&env.pool).await,
+        "ONLINE",
+        "an in-flight SENT tip NotFound must NOT block (defer to drain safe-redrive)"
+    );
+    let crit: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'TIP_GUARD_STALE_LEDGER'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(crit, 0, "no stale-ledger BLOCK for an in-flight SENT tip");
+    let deferred: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'TIP_GUARD_DEFERRED_INFLIGHT'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(deferred, 1, "one TIP_GUARD_DEFERRED_INFLIGHT audit");
+}
+
+#[tokio::test]
+async fn tip_guard_ack_tail_notfound_still_blocks() {
+    // Preserve the real stale-ledger guard: an ACK tail (no in-flight SENT) +
+    // NotFound is a genuine divergence (DPS lost a doc we confirmed) → BLOCK.
+    let env = setup_online_fn("live.db").await;
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 1, "SFN-1").await;
+
+    let stub = DpsStub::new();
+    stub.push_last(Err(DpsError::NotFound));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let outcome = boot_phase::run_boot_tip_guard(&recon_guard(), &env.pool, FN, &view, true)
+        .await
+        .expect("tip-guard runs");
+
+    assert!(
+        matches!(outcome, boot_phase::TipGuardOutcome::Blocked { .. }),
+        "NotFound on an ACK tail (no in-flight SENT) MUST still BLOCK, got {outcome:?}"
+    );
+    assert_eq!(node_mode(&env.pool).await, "BLOCKED");
+    let crit: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'TIP_GUARD_STALE_LEDGER' AND severity = 'CRITICAL'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(crit, 1, "genuine ACK-tail NotFound still raises the stale-ledger block");
+}
