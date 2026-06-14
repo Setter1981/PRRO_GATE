@@ -1964,3 +1964,329 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
     // predecessor (M2-N2b).
     prro::db::invariant_scan::assert_clean(&pool).await;
 }
+
+/// **K8 durability pin — idempotent re-tick of a halted strict drain.**
+/// Companion to M2-N1 (strict-sequential drain).  A drain that halts +
+/// escalates on a terminal reject must be a SAFE NO-OP when re-entered:
+/// crash-recovery (boot / the next supervisor tick) re-runs
+/// `backlog_drain::drain`, so a crash between the escalate-commit of doc2
+/// and the loop's `return` must NOT, on the re-tick, re-send doc3, double-
+/// escalate, or fork the ledger.
+///
+/// Tick 1 reproduces the M2-N1 precondition (doc1 ACK, doc2 REJECTED, doc3
+/// held, FN escalated Manual via edge 15).  Tick 2 re-runs drain with an
+/// EMPTY stub: if the halt is truly idempotent nothing reaches the wire
+/// (the empty queue is never popped); if doc3 were wrongly re-sent the
+/// empty `send_chk` queue panics — a loud RED that the re-tick is not
+/// crash-safe.
+///
+/// **STATUS — RED pin AUD-K8-1 (HIGH), architect-confirmed 2026-06-14;
+/// cross-tick companion to M2-N1.**  This test currently FAILS: it panics
+/// on tick 2 at `KpStub.send_chk: empty queue` because the re-tick re-sends
+/// doc3.  Root cause — `escalate_drain_to_manual` leaves
+/// `node_state.mode = GoingOnline` and the offline session `DRAINING` (it
+/// mutates only the shift + the `node_state.shift_state` mirror), while
+/// `drain()`'s entry gate (`backlog_drain.rs` step 1) checks ONLY
+/// `mode == GoingOnline` — there is no
+/// `shift_state == RequiresManualReconciliation` re-entry guard, and
+/// `list_drain_candidates_for_fn_ordered_by_lnd` does not filter on shift
+/// state.  The REJECTED doc2 has left the drain cohort, so the orphaned
+/// successor doc3 becomes the cohort head and is re-sent.  Reachable in
+/// prod via the supervisor `drain_tick` / boot re-drain of the
+/// still-`GoingOnline` FN, NOT only crash-recovery.  The escalation's
+/// documented "durable operator surface, halts FN drain" contract is thus
+/// not actually enforced.  Fix is a SEPARATE hot-zone PR (a
+/// `RequiresManualReconciliation` re-entry guard next to the mode-gate);
+/// un-`#[ignore]`-ing this test is that fix's regression pin.
+#[tokio::test]
+#[ignore = "RED pin AUD-K8-1: drain re-entry after escalate-Manual re-sends orphaned successor; fix pending"]
+async fn k8_halted_strict_drain_is_idempotent_under_retick() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_offline(&pool, shift_id).await;
+    seed_open_offline_session(&pool).await;
+    seed_offline_code(&pool, 1).await;
+    seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await;
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let send_calls = Arc::new(AtomicUsize::new(0));
+    let last_calls = Arc::new(AtomicUsize::new(0));
+
+    // ── Phase 1: 3 offline SELLs via the REAL inline path → OFFLINE_LOCAL_ACK.
+    for (i, idem) in [(1u8, "idem-k8-1"), (2, "idem-k8-2"), (3, "idem-k8-3")] {
+        let row = seed_inbox_sell_keyed(&pool, idem).await;
+        let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = gate.lock_owned().await;
+        let outcome = inline::run(
+            &pool,
+            &pool_secure,
+            &stub,
+            &sign_ctx,
+            &fn_sign,
+            &guard,
+            &row,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("offline SELL {i} must land OFFLINE_LOCAL_ACK: {e:?}"));
+        assert_eq!(
+            outcome.document_state,
+            DocState::OfflineLocalAck,
+            "SELL {i}"
+        );
+    }
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        0,
+        "offline issuance must NOT touch the wire"
+    );
+    prro::db::invariant_scan::assert_clean(&pool).await;
+
+    set_node_mode(&pool, NodeMode::GoingOnline).await;
+
+    let state_at = |lnd: i64| {
+        let pool = &pool;
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM fiscal_documents WHERE fiscal_number = ? AND lnd = ?",
+            )
+            .bind(FN)
+            .bind(lnd)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+    };
+    let shift_state = || {
+        let pool = &pool;
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT state FROM shifts WHERE shift_id = ?")
+                .bind(shift_id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+    };
+    let halted_count = || {
+        let pool = &pool;
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM audit_log \
+                 WHERE event_type = 'OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    // ── Tick 1: doc1 send OK + lastChk ACK; doc2 send → DocumentReject →
+    //    strict-sequential HALT + escalate Manual; doc3 never sent.
+    let tick1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    tick1.push_send(Ok(ack("SFN-1", vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    tick1.push_send(Err(DpsError::Authorization {
+        code: -1,
+        kind: AuthorizationKind::DocumentReject,
+        message: "reject_doc2".into(),
+    }));
+    tick1.push_last(Ok(ack("SFN-1", vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    let sc1 = det_signing_ctx();
+    let fs1 = fn_sign_blob();
+    let view1 = RuntimeView {
+        dps: &tick1,
+        signing_ctx: &sc1,
+        fn_sign: &fs1,
+    };
+    backlog_drain::drain(&recon_guard(), &pool, &view1, FN)
+        .await
+        .expect("tick 1 strict drain returns Ok (escalates Manual)");
+
+    assert_eq!(state_at(1).await, "ACK", "tick 1: doc1 → ACK");
+    assert_eq!(state_at(2).await, "REJECTED", "tick 1: doc2 → REJECTED");
+    assert_eq!(state_at(3).await, "OFFLINE_LOCAL_ACK", "tick 1: doc3 held");
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        2,
+        "tick 1: only doc1 + doc2 reached the wire"
+    );
+    assert_eq!(
+        shift_state().await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "tick 1: FN escalated Manual (edge 15)"
+    );
+    assert_eq!(
+        halted_count().await,
+        1,
+        "tick 1: exactly one escalation audit"
+    );
+    prro::db::invariant_scan::assert_clean(&pool).await;
+
+    // ── Tick 2 (post-crash re-tick): drain AGAIN.  The escalate-commit left
+    //    node mode = GoingOnline and the session = DRAINING (it touches only
+    //    the shift + node_state.shift_state mirror), exactly the state a crash
+    //    between escalate-commit and loop-return would leave.  An EMPTY stub
+    //    guarantees any wrongful re-send of doc3 surfaces as a loud panic.
+    let tick2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let sc2 = det_signing_ctx();
+    let fs2 = fn_sign_blob();
+    let view2 = RuntimeView {
+        dps: &tick2,
+        signing_ctx: &sc2,
+        fn_sign: &fs2,
+    };
+    backlog_drain::drain(&recon_guard(), &pool, &view2, FN)
+        .await
+        .expect("tick 2 re-tick drain returns Ok (idempotent no-op)");
+
+    assert_eq!(state_at(1).await, "ACK", "re-tick: doc1 stable");
+    assert_eq!(state_at(2).await, "REJECTED", "re-tick: doc2 stable");
+    assert_eq!(
+        state_at(3).await,
+        "OFFLINE_LOCAL_ACK",
+        "re-tick: doc3 must NOT be sent (strict halt persists)"
+    );
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        2,
+        "re-tick: no new wire send (still 2 total)"
+    );
+    assert_eq!(
+        shift_state().await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "re-tick: shift stable"
+    );
+    assert_eq!(
+        halted_count().await,
+        1,
+        "re-tick: NO double escalation (still exactly one audit)"
+    );
+    prro::db::invariant_scan::assert_clean(&pool).await;
+}
+
+/// **K9 durability pin — offline seed survives a restart; chain doesn't fork.**
+/// Companion to M2-01 / AUD-L6-1 (offline seed-advance at OfflineLocalAck).
+/// The seed-advance MAC commit on offline-ack runs under `synchronous=FULL`,
+/// so a crash AFTER doc1's offline-ack but BEFORE doc2 is signed must leave
+/// doc2 chaining off doc1's unsigned hash (the SURVIVING seed) — a real,
+/// non-forked MAC chain across a process restart.  Models the restart by
+/// closing and re-opening the pool on the same DB file.
+#[tokio::test]
+async fn k9_offline_seed_survives_restart_chain_not_forked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("k9.db");
+    std::mem::forget(dir);
+    let pool = open_pool(&path).await.unwrap();
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_offline(&pool, shift_id).await;
+    seed_open_offline_session(&pool).await;
+    seed_offline_code(&pool, 1).await;
+    seed_offline_code(&pool, 2).await;
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+
+    async fn chain_col(pool: &SqlitePool, lnd: i64, col: &str) -> Option<Vec<u8>> {
+        let q = format!("SELECT {col} FROM fiscal_documents WHERE fiscal_number = ? AND lnd = ?");
+        sqlx::query_scalar(&q)
+            .bind(FN)
+            .bind(lnd)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+    async fn node_seed(pool: &SqlitePool) -> Option<Vec<u8>> {
+        sqlx::query_scalar(
+            "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = ?",
+        )
+        .bind(FN)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    // ── doc1 through the REAL inline path → OFFLINE_LOCAL_ACK.
+    let row1 = seed_inbox_sell_keyed(&pool, "idem-k9-1").await;
+    {
+        let stub = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = gate.lock_owned().await;
+        let o = inline::run(
+            &pool,
+            &pool_secure,
+            &stub,
+            &sign_ctx,
+            &fn_sign,
+            &guard,
+            &row1,
+        )
+        .await
+        .expect("doc1 → OFFLINE_LOCAL_ACK");
+        assert_eq!(o.document_state, DocState::OfflineLocalAck);
+    }
+
+    // unsigned(doc1) == h1; the node seed advanced to it (M2-01).
+    let h1 = chain_col(&pool, 1, "unsigned_xml_sha256").await;
+    assert!(h1.is_some(), "doc1 carries an unsigned hash");
+    assert_eq!(
+        node_seed(&pool).await,
+        h1,
+        "seed advanced to unsigned(doc1) (M2-01)"
+    );
+    prro::db::invariant_scan::assert_clean(&pool).await;
+
+    // ── "Crash + reboot": close and re-open the pool on the SAME DB file.
+    //    Nothing is re-derived in memory; the committed seed must survive.
+    pool.close().await;
+    let pool = open_pool(&path).await.unwrap();
+    assert_eq!(
+        node_seed(&pool).await,
+        h1,
+        "seed durable across restart (synchronous=FULL commit)"
+    );
+
+    // ── doc2 through inline::run (its inbox row is still NEW).  It must chain
+    //    off the SURVIVING seed = unsigned(doc1).
+    let row2 = seed_inbox_sell_keyed(&pool, "idem-k9-2").await;
+    {
+        let stub = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = gate.lock_owned().await;
+        let o = inline::run(
+            &pool,
+            &pool_secure,
+            &stub,
+            &sign_ctx,
+            &fn_sign,
+            &guard,
+            &row2,
+        )
+        .await
+        .expect("doc2 → OFFLINE_LOCAL_ACK");
+        assert_eq!(o.document_state, DocState::OfflineLocalAck);
+    }
+
+    let prev1 = chain_col(&pool, 1, "previous_hash").await;
+    let prev2 = chain_col(&pool, 2, "previous_hash").await;
+    let uns2 = chain_col(&pool, 2, "unsigned_xml_sha256").await;
+    assert!(prev1.is_none(), "doc1 is genesis (prev NULL)");
+    assert_eq!(
+        prev2, h1,
+        "doc2 chains off the surviving unsigned(doc1) seed"
+    );
+    assert_ne!(
+        prev1, prev2,
+        "distinct previous_hash — a real chain, not a pre-M2-01 fork"
+    );
+    assert_eq!(
+        node_seed(&pool).await,
+        uns2,
+        "seed advanced to unsigned(doc2)"
+    );
+    prro::db::invariant_scan::assert_clean(&pool).await;
+}

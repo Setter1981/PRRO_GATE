@@ -207,6 +207,20 @@ pub fn allowed_transition(from: DocState, to: DocState) -> bool {
             // The legacy M3a `(OfflineLocalAck, Sent)` placeholder
             // immediately above is preserved (W6 scope: add-only,
             // no removals; runtime wiring of the new edges is W7).
+            //
+            // AUD-L1-2 (2026-06-14) auto-invoker audit of this cluster
+            // (grep of `transition_state` call sites + stage_send 4-pre
+            // dynamic source set `{Signed,ErrorRetryable,OfflineLocalAck}`):
+            //   (OfflineLocalAck, Sending)  — WIRED: W7 drain via
+            //     `stage_send.rs` 4-pre (the only OfflineLocalAck invoker).
+            //   (OfflineLocalAck, Sent)     — no auto-invoker; legacy M3a
+            //     placeholder superseded by the Sending ladder.
+            //   (OfflineLocalAck, Cancelled) — no auto-invoker;
+            //     operator/force-seam only (runtime wiring deferred).
+            //   (OfflineLocalAck, Kvt2)     — no auto-invoker; the W9b
+            //     lastChk short-circuit below is SPEC'd but NOT wired —
+            //     drain converges via Sending → Sent → Kvt1 → Kvt2
+            //     (`kvt2_confirm.rs`), never this direct hop.
             | (OfflineLocalAck, Sending)
             | (OfflineLocalAck, Cancelled)
             // M3b W9b §5.1 — lastChk replay short-circuit edge.

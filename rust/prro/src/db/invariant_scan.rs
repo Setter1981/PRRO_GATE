@@ -14,9 +14,10 @@
 //!   4. The MAC chain holds: walking signed docs by `lnd`, each doc's
 //!      `previous_hash` equals the seed left by the previous ACK; the
 //!      final seed equals `node_state.last_known_unsigned_xml_sha256`.
-//!   5. A `REJECTED` inbox row never coexists with an ACCEPTED ledger doc
-//!      for the same `request_id` (replay would short-circuit `Failed`
-//!      for a fiscalized receipt — the AUD-1 hazard).
+//!   5. A terminally-failed inbox row (`REJECTED` or `ERROR`) never
+//!      coexists with an ACCEPTED ledger doc for the same `request_id`
+//!      (replay would short-circuit `Failed` for a fiscalized receipt —
+//!      the AUD-1 hazard).
 //!   6. Offline codes are consistent: consumption is all-or-nothing
 //!      (`consumed_at` ⇔ `consumed_by_document_id`), every doc-side
 //!      `offline_fiscal_no` is backed by a code row consumed by THAT
@@ -66,9 +67,13 @@ pub enum Violation {
         walk_hex: String,
         node_state_hex: String,
     },
-    /// `REJECTED` inbox row + ACCEPTED (`ACK`/`OFFLINE_LOCAL_ACK`) ledger
-    /// doc for the same `request_id` — replay would lie `Failed` about a
-    /// fiscalized receipt.
+    /// Terminally-failed inbox row (`REJECTED` or `ERROR`) + ACCEPTED
+    /// (`ACK`/`OFFLINE_LOCAL_ACK`) ledger doc for the same `request_id` —
+    /// replay would lie `Failed` about a fiscalized receipt.  The status
+    /// set mirrors `runtime/ingress/replay.rs:153`'s short-circuit set
+    /// (`"REJECTED" | "ERROR"`) — AUD-L8-2 widened this check from
+    /// `REJECTED`-only so the scan is not blind to the `ERROR` half of the
+    /// replay-lie hazard.
     RejectedInboxWithAcceptedDoc {
         request_id_hex: String,
         doc_state: String,
@@ -233,13 +238,17 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
         }
     }
 
-    // 5. REJECTED inbox must not coexist with an accepted ledger doc
-    //    (replay would short-circuit `Failed` for a fiscalized receipt).
+    // 5. A terminally-failed inbox row (REJECTED or ERROR) must not coexist
+    //    with an accepted ledger doc — replay would short-circuit `Failed`
+    //    for a fiscalized receipt (the AUD-1 hazard).  The inbox-status set
+    //    mirrors `runtime/ingress/replay.rs:153`'s short-circuit set
+    //    (`"REJECTED" | "ERROR"`); keep the two in lockstep (AUD-L8-2 —
+    //    same single-source discipline as OFFLINE_ISSUED_STATES / M2-N2b).
     let lie: Vec<(String, String)> = sqlx::query_as(
         "SELECT lower(hex(i.request_id)), fd.state \
          FROM ingress_inbox i \
          JOIN fiscal_documents fd ON fd.request_id = i.request_id \
-         WHERE i.status = 'REJECTED' AND fd.state IN ('ACK', 'OFFLINE_LOCAL_ACK')",
+         WHERE i.status IN ('REJECTED', 'ERROR') AND fd.state IN ('ACK', 'OFFLINE_LOCAL_ACK')",
     )
     .fetch_all(pool)
     .await?;

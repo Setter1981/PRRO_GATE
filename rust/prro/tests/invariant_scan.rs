@@ -385,6 +385,78 @@ async fn detects_rejected_inbox_with_accepted_doc() {
     );
 }
 
+/// ERROR inbox + accepted doc for the same request — the SAME replay-lie
+/// hazard (AUD-1) as REJECTED: `runtime/ingress/replay.rs:153` short-circuits
+/// `Failed` on `"REJECTED" | "ERROR"`, so an ERROR inbox row beside an
+/// ACK ledger doc is the same lie about fiscal truth.  AUD-L8-2 widened
+/// check-5 to that full terminal-fail set; the scan must not be blind to
+/// the ERROR half.  Mirror of `detects_rejected_inbox_with_accepted_doc`.
+#[tokio::test]
+async fn detects_error_inbox_with_accepted_doc() {
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await;
+    seed_node_state(&pool, shift, Some(h(1))).await;
+    let (_, request_id) = seed_doc(
+        &pool,
+        shift,
+        1,
+        "ACK",
+        Some("D-1"),
+        None,
+        Some(h(1)),
+        None,
+        true,
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO ingress_inbox(request_id, fiscal_number, protocol, operation_type, \
+            idempotency_key, payload_json, payload_sha256_canonical, status) \
+         VALUES (?, ?, 'REST', 'SELL', 'k-1', '{}', ?, 'ERROR')",
+    )
+    .bind(&request_id[..])
+    .bind(FN)
+    .bind(vec![0u8; 32])
+    .execute(&pool)
+    .await
+    .unwrap();
+    let v = scan(&pool).await.unwrap();
+    assert!(
+        v.iter()
+            .any(|x| matches!(x, Violation::RejectedInboxWithAcceptedDoc { .. })),
+        "got: {v:#?}"
+    );
+}
+
+/// AUD-L8-2 over-fire guard: an ERROR inbox row beside a NON-accepted
+/// (`REJECTED`) ledger doc for the same request is the legitimate,
+/// consistent terminal pair — both sides failed, no fiscalized receipt is
+/// being short-circuited.  The widen to `('REJECTED','ERROR')` must NOT
+/// turn this clean case into a false positive.
+#[tokio::test]
+async fn clean_error_inbox_with_non_accepted_doc() {
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await;
+    seed_node_state(&pool, shift, None).await;
+    let (_, request_id) =
+        seed_doc(&pool, shift, 1, "REJECTED", None, None, None, None, false).await;
+    sqlx::query(
+        "INSERT INTO ingress_inbox(request_id, fiscal_number, protocol, operation_type, \
+            idempotency_key, payload_json, payload_sha256_canonical, status) \
+         VALUES (?, ?, 'REST', 'SELL', 'k-1', '{}', ?, 'ERROR')",
+    )
+    .bind(&request_id[..])
+    .bind(FN)
+    .bind(vec![0u8; 32])
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        scan(&pool).await.unwrap(),
+        vec![],
+        "ERROR inbox + non-accepted doc is the consistent terminal pair — no over-fire"
+    );
+}
+
 #[tokio::test]
 async fn detects_half_consumed_offline_code() {
     let pool = fresh_pool().await;
