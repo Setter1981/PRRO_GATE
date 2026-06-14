@@ -1980,26 +1980,25 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
 /// empty `send_chk` queue panics — a loud RED that the re-tick is not
 /// crash-safe.
 ///
-/// **STATUS — RED pin AUD-K8-1 (HIGH), architect-confirmed 2026-06-14;
-/// cross-tick companion to M2-N1.**  This test currently FAILS: it panics
-/// on tick 2 at `KpStub.send_chk: empty queue` because the re-tick re-sends
-/// doc3.  Root cause — `escalate_drain_to_manual` leaves
+/// **STATUS — regression pin AUD-K8-1 (HIGH), architect-confirmed
+/// 2026-06-14; green since the manual-reconciliation re-entry guard landed
+/// (#168, fix/aud-k8-1).**  Cross-tick companion to M2-N1.  Before the fix this
+/// panicked on tick 2 at `KpStub.send_chk: empty queue` because the re-tick
+/// re-sent doc3.  Root cause was that `escalate_drain_to_manual` leaves
 /// `node_state.mode = GoingOnline` and the offline session `DRAINING` (it
 /// mutates only the shift + the `node_state.shift_state` mirror), while
-/// `drain()`'s entry gate (`backlog_drain.rs` step 1) checks ONLY
-/// `mode == GoingOnline` — there is no
-/// `shift_state == RequiresManualReconciliation` re-entry guard, and
+/// `drain()`'s entry gate (`backlog_drain.rs` step 1) checked ONLY
+/// `mode == GoingOnline` and
 /// `list_drain_candidates_for_fn_ordered_by_lnd` does not filter on shift
-/// state.  The REJECTED doc2 has left the drain cohort, so the orphaned
-/// successor doc3 becomes the cohort head and is re-sent.  Reachable in
+/// state.  The REJECTED doc2 had left the drain cohort, so the orphaned
+/// successor doc3 became the cohort head and was re-sent.  Reachable in
 /// prod via the supervisor `drain_tick` / boot re-drain of the
-/// still-`GoingOnline` FN, NOT only crash-recovery.  The escalation's
-/// documented "durable operator surface, halts FN drain" contract is thus
-/// not actually enforced.  Fix is a SEPARATE hot-zone PR (a
-/// `RequiresManualReconciliation` re-entry guard next to the mode-gate);
-/// un-`#[ignore]`-ing this test is that fix's regression pin.
+/// still-`GoingOnline` FN, NOT only crash-recovery — the escalation's
+/// documented "durable operator surface, halts FN drain" contract was thus
+/// not enforced.  The fix is the step-1b
+/// `shift_state == RequiresManualReconciliation` re-entry guard next to the
+/// mode-gate (`backlog_drain.rs`); this test is its regression pin.
 #[tokio::test]
-#[ignore = "RED pin AUD-K8-1: drain re-entry after escalate-Manual re-sends orphaned successor; fix pending"]
 async fn k8_halted_strict_drain_is_idempotent_under_retick() {
     let pool = fresh_pool().await;
     let pool_secure = fresh_secure_pool().await;

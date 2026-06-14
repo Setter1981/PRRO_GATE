@@ -703,6 +703,29 @@ pub async fn drain<'a>(
         return Ok(DrainSummary::new(fiscal_number.to_string(), 0));
     }
 
+    // ─── Step 1b: manual-reconciliation re-entry guard (AUD-K8-1) ────
+    // escalate_drain_to_manual halts the cohort by CAS-ing the shift to
+    // RequiresManualReconciliation (+ node_state.shift_state mirror) but
+    // leaves mode == GoingOnline and the session DRAINING. Without this
+    // guard the next supervisor/boot drain tick re-enters: the REJECTED
+    // predecessor has left the candidate cohort, so the orphaned successor
+    // becomes the head and is re-sent — defeating the escalation's
+    // "durable operator surface, halts FN drain" contract. Exit requires
+    // an operator-driven resolution of the manual-recon shift.
+    //
+    // No per-tick audit row here: the RMR-FN surface persists until an
+    // operator resolves it (hours), backoff is reset so drain re-enters
+    // every tick — a row per re-entry would flood the durable ledger.
+    // The durable record already exists: the CRITICAL
+    // OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL emitted at escalation time.
+    //
+    // The shift_state mirror is authoritative here — escalate writes the
+    // shift CAS + mirror atomically (apply_shift_transition, RS-3 C1); the
+    // SEAM-D-1 mirror-desync concern is a boot-reconstruction path, not this.
+    if ns.shift_state == ShiftState::RequiresManualReconciliation {
+        return Ok(DrainSummary::new(fiscal_number.to_string(), 0));
+    }
+
     // ─── Step 2: read active offline session (OPEN|DRAINING) ─────────
     //
     // Reordered to run BEFORE the backlog scan (HIGH-C5-1 fix
