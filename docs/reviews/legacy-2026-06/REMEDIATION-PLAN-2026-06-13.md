@@ -69,6 +69,26 @@ the CANCELLED-label dup (AUD-L8-3/L6-2).
   drain; a genuine newer-tip match → superseded-hold; a KVT1 resting doc displaced by a newer tip →
   held, not fatal.
 
+### A4 — durability companions K8/K9 (kill-matrix, added 2026-06-14)
+**Rationale (calibrated — do NOT broadly expand the kill-matrix):** the recent FT/HIGH findings were
+SEMANTIC / sequencing / cross-fix regressions, NOT crash-window bugs — the L2 (crash/durability) lens
+returned mostly DEFENCES VERIFIED (single-envelope offline-ack, atomic lnd-alloc, idempotent finalize,
+benign SentReplay orphan). So crash-durability is sound; the kill-matrix needs ONLY the two NEW durable
+paths this fix-cycle introduces. (The bigger oracle win is the scan hardening in A1 — every existing
+kill-point's `assert_clean` strengthens for free. The kill-matrix does NOT and cannot catch the
+semantic/sequencing class — that is the adversarial-pass's job; do not over-invest here.)
+- **K8 — crash mid strict-sequential drain (companions A2/M2-N1).** Crash AFTER doc#1→ACK + doc#2 →
+  escalate-Manual committed, BEFORE `drain` returns. Next tick/boot MUST be idempotent: doc#2 stays
+  RequiresManualReconciliation, doc#3 stays OFFLINE_LOCAL_ACK (NOT re-sent), zero double-escalation,
+  `invariant_scan::assert_clean`.
+- **K9 — crash mid offline-session chain (companion to A1/AUD-L6-1).** Crash AFTER offline-ack of doc#1
+  advanced the seed, BEFORE doc#2 signs. Reboot MUST sign doc#2 with `previous_hash =
+  unsigned(doc#1)` (seed survives under `synchronous=FULL`); chain unforked, scan clean. Durability
+  companion to the AUD-L6-1 boot seed reconstruction.
+- **Timing:** NON-blocking for NO-GO (blockers are the semantic FTs). Fold into the A1/AUD-L6-1 + Batch B
+  review cycle (they already touch boot/drain durability), NOT a separate pass. Online-lane convergence
+  crash-points deferred to A2.4 (online path dormant).
+
 ---
 
 ## Batch B — boot tip-guard NotFound must not false-BLOCK (AUD-L4-1 HIGH + AUD-L4-2 LOW; reachable TODAY)
@@ -129,10 +149,16 @@ Pair with M2-X2. Must land BEFORE the inline write-path is vivified (A2.4).
 2. **A2** (strict-sequential drain) and **B** (tip-guard NotFound) are independent of each other and of
    A3 — can proceed in parallel after A1; both are reachable-today blockers.
 3. **A3** (superseded tip-id match + KVT1) — independent; pairs naturally with A2's review.
-4. **C** — deferred to the A2.4 vivification scope (gate, not now).
-5. **D** — cosmetic, fold into whichever batch touches the file.
+4. **A4** (K8/K9 durability companions) — NON-blocking; ride the A1/AUD-L6-1 + Batch B review cycle.
+5. **C** — deferred to the A2.4 vivification scope (gate, not now).
+6. **D** — cosmetic, fold into whichever batch touches the file.
 
-**NO-GO lifts when A1+A2+A3+B are merged + architect-reviewed.** C remains a hard A2.4 pre-flight gate.
+**STATUS (2026-06-14):** #162 merged **A2 (M2-N1/N2a) + A3 (M2-N4) + A1.1 (M2-N2b scan-half)**. Remaining
+to lift NO-GO: **A1.2 (AUD-L6-1 boot seed projection) + Batch B** (both reachable-today; A4 K8/K9 ride
+along). A1.2 reuses the issued-predicate #162 established in `invariant_scan`.
+
+**NO-GO lifts when A1.2 (AUD-L6-1) + B are merged + architect-reviewed** (A2/A3/N2b already in via #162).
+C remains a hard A2.4 pre-flight gate.
 
 ## Per-batch Opus prompts
 Each batch's contract above IS the spec. Hand Opus: "Implement Batch <X> per
