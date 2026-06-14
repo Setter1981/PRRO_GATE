@@ -580,8 +580,18 @@ async fn m2_n2b_rejected_offline_origin_predecessor_scans_clean() {
     .unwrap();
     // lnd1 — REJECTED at drain, but it reached OFFLINE_LOCAL_ACK earlier and
     // advanced the seed (chain HEAD: previous_hash NULL, unsigned = H1).
-    let (doc_a, _) =
-        seed_doc(&pool, shift, 1, "REJECTED", None, None, Some(h(1)), Some(1), false).await;
+    let (doc_a, _) = seed_doc(
+        &pool,
+        shift,
+        1,
+        "REJECTED",
+        None,
+        None,
+        Some(h(1)),
+        Some(1),
+        false,
+    )
+    .await;
     // lnd2 — the successor that chained off the now-rejected predecessor.
     let (doc_b, _) = seed_doc(
         &pool,

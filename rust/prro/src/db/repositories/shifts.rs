@@ -88,7 +88,7 @@ pub fn allowed_transition(from: ShiftState, to: ShiftState) -> bool {
             | (Closing, RequiresManualReconciliation)       // 12
             | (ClosingLocalPendingDrain, Closed)            // 13
             | (ClosingLocalPendingDrain, RequiresManualReconciliation) // 14
-            | (Opened, RequiresManualReconciliation)        // 15 (M2-N2a)
+            | (Opened, RequiresManualReconciliation) // 15 (M2-N2a)
     )
 }
 
