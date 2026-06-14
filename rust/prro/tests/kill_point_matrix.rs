@@ -2512,3 +2512,108 @@ async fn drain_kvt1_reentry_superseded_escalates_manual() {
     );
     prro::db::invariant_scan::assert_clean(&pool).await;
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// AUD-L2-1b (boot-KVT2 consumer) — a stray online-origin KVT2 doc whose boot
+// finalize hits a ChainSeedMismatch (tampered chain seed) ESCALATES the FN to
+// Manual, instead of the Warning-only BOOT_KVT2_DISPATCH_FAILED (doc wedged at
+// KVT2, shift untouched, no operator surface).
+//
+// On main this FAILS: the boot-KVT2 Err(e) arm stringifies EVERY stage_finalize
+// error into one BOOT_KVT2_DISPATCH_FAILED (Severity::Warning) — a
+// ChainSeedMismatch is indistinguishable and gets no escalation; the shift stays
+// OPENED.  GREEN matches the typed StageFinalizeError::ChainSeedMismatch and
+// escalates via escalate_fn_to_manual_recon
+// (BOOT_KVT2_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL).
+//
+// NB: no assert_clean — the tampered seed is a deliberate chain breach (exactly
+// the escalation condition); invariant_scan rightly flags it.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn boot_kvt2_chain_seed_mismatch_escalates_manual() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_sell(&pool).await;
+
+    // ── Build an online-origin KVT2 doc (offline_fiscal_no NULL → stage_finalize's
+    //    online-origin seed guard applies): inline::run Hold → SENT, then manual
+    //    Sent→Kvt1→Kvt2 + Kvt1Raw (mirror K5's crash-point construction).
+    let send_calls = Arc::new(AtomicUsize::new(0));
+    let last_calls = Arc::new(AtomicUsize::new(0));
+    let phase1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    phase1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    phase1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → Hold → SENT
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+    inline::run(
+        &pool,
+        &pool_secure,
+        &phase1,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+    )
+    .await
+    .expect("online SELL Hold rests at SENT");
+    drop(guard);
+
+    let doc_id = read_doc_id(&pool).await;
+    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            let o1 = fiscal_documents::transition_state(tx, doc_id, DocState::Sent, DocState::Kvt1)
+                .await
+                .map_err(anyhow::Error::from)?;
+            assert!(matches!(o1, TransitionOutcome::Applied), "Sent→Kvt1");
+            let o2 = fiscal_documents::transition_state(tx, doc_id, DocState::Kvt1, DocState::Kvt2)
+                .await
+                .map_err(anyhow::Error::from)?;
+            assert!(matches!(o2, TransitionOutcome::Applied), "Kvt1→Kvt2");
+            document_files::replace_tx(tx, doc_id, DocumentFileKind::Kvt1Raw, &kvt1_bytes).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .expect("manual Sent→Kvt1→Kvt2 + Kvt1Raw");
+    assert_eq!(read_doc_state(&pool, FN).await, "KVT2");
+
+    // Tamper the chain seed → the boot-KVT2 stage_finalize online-origin guard
+    // breaks (ns.last_known_unsigned_xml_sha256 != doc.previous_hash).
+    prro::db::repositories::node_state::seed_prevhash(&pool, FN, &[0xFF; 32])
+        .await
+        .expect("seed tamper");
+
+    // ── Boot recovery — the Kvt2 dispatch arm runs stage_finalize → ChainSeedMismatch.
+    boot_phase::run_boot_reconciliation(&recon_guard(), &pool, FN, None)
+        .await
+        .expect("boot returns Ok (escalates the FN, does not abort the boot)");
+
+    // ── GREEN: the chain breach ESCALATES the FN to Manual with a Critical audit.
+    assert_eq!(
+        read_doc_state(&pool, FN).await,
+        "KVT2",
+        "doc stays KVT2 (finalize rolled back)"
+    );
+    assert_eq!(
+        read_shift_state_by_id(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "boot-KVT2 ChainSeedMismatch escalates the FN shift to Manual"
+    );
+    assert_eq!(
+        read_node_shift_state(&pool).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "node_state.shift_state mirror"
+    );
+    assert_eq!(
+        count_audit_event(&pool, "BOOT_KVT2_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL").await,
+        1,
+        "exactly one Critical boot-KVT2 escalation audit"
+    );
+}
