@@ -313,6 +313,16 @@ async fn seed_newer_submitted_ack(pool: &SqlitePool, shift_id: ShiftId, lnd: i64
     .execute(pool)
     .await
     .unwrap();
+    // ACK ⇒ persisted KVT1_RAW evidence (invariant_scan 3b / HIGH-C5-2) —
+    // make the fixture well-formed so `assert_clean` tolerates it.
+    sqlx::query(
+        "INSERT INTO document_files (document_id, kind, content) VALUES (?, 'KVT1_RAW', ?)",
+    )
+    .bind(&doc_id.as_bytes()[..])
+    .bind(&b"kvt1-raw-fixture"[..])
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 /// Build a resting `SENT` doc via the real stage chain: `inline::run` with a
@@ -522,7 +532,10 @@ async fn tick_holds_superseded_resting_kvt1_not_structural_drift() {
         "superseded KVT1 stays KVT1 (held, no CAS)"
     );
     assert_eq!(summary.acked_from_kvt1, 0, "not advanced");
-    assert_eq!(summary.errors, 0, "supersession is benign — not a per-doc error");
+    assert_eq!(
+        summary.errors, 0,
+        "supersession is benign — not a per-doc error"
+    );
     assert_eq!(
         summary.superseded_held_kvt1, 1,
         "counted as a distinct superseded hold"

@@ -223,18 +223,16 @@ async fn converge_one_doc(
             ConfirmDrainOutcome::Advanced => summary.acked_from_kvt1 += 1,
             ConfirmDrainOutcome::HoldFnDrain { .. } => summary.held_kvt1 += 1,
             ConfirmDrainOutcome::SupersededHeld => {
-                // **SEAM-B-3 (2026-06-13)**: structurally unreachable here.
-                // The superseded exception is SentReplay-exclusive
-                // (`superseded` is computed `true` only on the SentReplay
-                // path); this online-convergence tick uses `Kvt1Reentry`
-                // (always `superseded == false`), so `confirm_drain_doc`
-                // can never return `SupersededHeld`.  Fail-loud if the
-                // classifier routing ever regresses.
-                anyhow::bail!(
-                    "online_convergence: ConfirmDrainOutcome::SupersededHeld is \
-                     SentReplay-exclusive; Kvt1Reentry (superseded=false) cannot \
-                     produce it (kvt2_confirm routing regression)"
-                );
+                // **AUD-L5-1 (2026-06-14)**: a resting KVT1 whose DPS last_chk
+                // tip was superseded by a newer submitted doc is a BENIGN hold,
+                // NOT an error.  Kvt1Reentry is now superseded-capable
+                // (kvt2_confirm fetch-gate widened); confirm_drain_doc already
+                // emitted the TIP_SUPERSEDED (Warning) audit + left the doc at
+                // KVT1 (no CAS).  The online tick has NO chain-head (unlike the
+                // offline drain, which escalates Manual per ruling B over the
+                // same outcome), so we simply HOLD and count a distinct
+                // dashboard signal.  No doc-state change here.
+                summary.superseded_held_kvt1 += 1;
             }
         }
     }
