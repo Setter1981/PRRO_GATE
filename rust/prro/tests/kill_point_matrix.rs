@@ -2722,3 +2722,113 @@ async fn m1_02_online_seed_fork_a24_prerequisite() {
          (online-lane seed-fork — fix is an A2.4 prerequisite)"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// AUD-L2-1b (boot-KVT2 escalation robustness — review MEDIUM follow-up).  A
+// boot-KVT2 ChainSeedMismatch on an FN whose shift is CLOSED but whose
+// node_state.current_shift_id still DANGLES (the locked post-close status quo —
+// terminal_close_pins_current_shift_id_behavior: Closing→Closed leaves the
+// pointer set) MUST NOT abort the boot.
+//
+// (Closed → RMR) is NOT a whitelisted shift edge, so a guard that checks ONLY
+// current_shift_id.is_some() would call apply_shift_transition(Closed → RMR) →
+// Forbidden → non-Applied → BootError::Internal, which `?`-propagates and ABORTS
+// the whole-FN boot doc-loop (violating the W9.4 per-doc failure-containment
+// invariant at boot_phase.rs).  The escalation must route a NON-escalatable
+// from-state (NULL current_shift_id OR a non-whitelisted state like
+// Closed/Created/Error) to the no-shift operator audit WITHOUT a CAS.
+//
+// On the pre-fix branch this FAILS (boot returns Err → .expect panics).
+// NB: no assert_clean — the tampered seed is a deliberate chain breach.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn boot_kvt2_chain_seed_mismatch_closed_shift_no_abort() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_sell(&pool).await;
+
+    // Online-origin KVT2 doc (mirror K5).
+    let send_calls = Arc::new(AtomicUsize::new(0));
+    let last_calls = Arc::new(AtomicUsize::new(0));
+    let phase1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    phase1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    phase1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    inline::run(
+        &pool,
+        &pool_secure,
+        &phase1,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+    )
+    .await
+    .expect("online SELL Hold rests at SENT");
+    drop(guard);
+    let doc_id = read_doc_id(&pool).await;
+    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            fiscal_documents::transition_state(tx, doc_id, DocState::Sent, DocState::Kvt1)
+                .await
+                .map_err(anyhow::Error::from)?;
+            fiscal_documents::transition_state(tx, doc_id, DocState::Kvt1, DocState::Kvt2)
+                .await
+                .map_err(anyhow::Error::from)?;
+            document_files::replace_tx(tx, doc_id, DocumentFileKind::Kvt1Raw, &kvt1_bytes).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .expect("manual Sent→Kvt1→Kvt2 + Kvt1Raw");
+
+    // Pin the dangling-pointer status quo: shift CLOSED, current_shift_id still set.
+    sqlx::query("UPDATE shifts SET state = 'CLOSED' WHERE shift_id = ?")
+        .bind(shift_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE node_state SET shift_state = 'CLOSED' WHERE fiscal_number = ?")
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    prro::db::repositories::node_state::seed_prevhash(&pool, FN, &[0xFF; 32])
+        .await
+        .expect("seed tamper");
+
+    // Boot MUST NOT abort — a non-escalatable (Closed) shift routes to the
+    // no-shift operator surface, not a Forbidden CAS → Internal → boot abort.
+    boot_phase::run_boot_reconciliation(&recon_guard(), &pool, FN, None)
+        .await
+        .expect("boot must NOT abort on a closed-shift ChainSeedMismatch (W9.4 isolation)");
+
+    assert_eq!(
+        read_doc_state(&pool, FN).await,
+        "KVT2",
+        "doc stays KVT2 (no CAS)"
+    );
+    assert_eq!(
+        read_shift_state_by_id(&pool, shift_id).await,
+        "CLOSED",
+        "no illegal Closed→RMR CAS"
+    );
+    assert_eq!(
+        count_audit_event(&pool, "BOOT_KVT2_CHAIN_SEED_MISMATCH_NO_SHIFT").await,
+        1,
+        "non-escalatable shift → one no-shift operator audit (no CAS, no boot abort)"
+    );
+    assert_eq!(
+        count_audit_event(&pool, "BOOT_KVT2_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL").await,
+        0,
+        "no escalation audit — the shift is not RMR-escalatable"
+    );
+}
