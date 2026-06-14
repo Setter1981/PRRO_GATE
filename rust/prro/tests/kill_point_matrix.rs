@@ -57,7 +57,7 @@ use prro::services::write_path::types::WorkerProcessResult;
 use prro::services::write_path::{stage_acquire, stage_sign};
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
-use prro::transports::dps::error::DpsError;
+use prro::transports::dps::error::{AuthorizationKind, DpsError};
 use sqlx::SqlitePool;
 
 use common::det_signing_ctx;
@@ -1837,4 +1837,123 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
         .await
         .unwrap();
     assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
+}
+
+/// **M2-N1 FT pin — LITERAL real-inline path (architect ruling a, 2026-06-14).**
+/// Three offline SELLs through the REAL `inline::run` path (NOT a hand-seeded
+/// chain — the M2-02 class): each lands at OFFLINE_LOCAL_ACK with
+/// `previous_hash = unsigned(prior issued doc)` built REALLY by M2-01's
+/// seed-advance at offline-ack.  Then go-online (plain `Opened`) + drain with a
+/// stub that ACKs doc1 and REJECTs doc2.  Under strict-sequential (M2-N1):
+/// doc1 → ACK, doc2 → REJECTED (terminal), doc3 is NEVER sent (its predecessor
+/// is non-ACK), the FN escalates to RequiresManualReconciliation via edge 15
+/// (plain Opened, NOT a wedge), and `invariant_scan` is clean over the REAL
+/// chain incl. the REJECTED offline-origin predecessor (M2-N2b).  This pins the
+/// FT against a genuinely-reachable chain, not an aspirational hand-seed.
+#[tokio::test]
+async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_offline(&pool, shift_id).await; // current_shift_id set; shift_state Opened
+    seed_open_offline_session(&pool).await;
+    seed_offline_code(&pool, 1).await;
+    seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await;
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let send_calls = Arc::new(AtomicUsize::new(0));
+    let last_calls = Arc::new(AtomicUsize::new(0));
+
+    // ── Phase 1: 3 offline SELLs via the REAL inline path → OFFLINE_LOCAL_ACK.
+    //    Distinct idempotency keys (the cross-harness fix); the chain is built
+    //    really (no manual prev).  DPS is never touched on the offline branch.
+    for (i, idem) in [(1u8, "idem-m2n1-1"), (2, "idem-m2n1-2"), (3, "idem-m2n1-3")] {
+        let row = seed_inbox_sell_keyed(&pool, idem).await;
+        let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = gate.lock_owned().await;
+        let outcome = inline::run(&pool, &pool_secure, &stub, &sign_ctx, &fn_sign, &guard, &row)
+            .await
+            .unwrap_or_else(|e| panic!("offline SELL {i} must land OFFLINE_LOCAL_ACK: {e:?}"));
+        assert_eq!(
+            outcome.document_state,
+            DocState::OfflineLocalAck,
+            "SELL {i} → OFFLINE_LOCAL_ACK"
+        );
+    }
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        0,
+        "offline issuance must NOT touch the wire"
+    );
+    // The REAL chain is clean DURING the offline window (M2-01 seed-advance).
+    prro::db::invariant_scan::assert_clean(&pool).await;
+
+    // ── Restart + go-online: the drain owns this FN.  Shift stays plain Opened.
+    set_node_mode(&pool, NodeMode::GoingOnline).await;
+
+    // ── Phase 2: drain.  doc1 send OK + lastChk ACK → ACK; doc2 send →
+    //    DocumentReject (terminal) → strict-sequential HALT + escalate Manual;
+    //    doc3 is NEVER sent (no stub response provided for it).
+    let phase2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    phase2.push_send(Ok(ack("SFN-1", vec![0xDE, 0xAD, 0xBE, 0xEF]))); // doc1 send
+    phase2.push_send(Err(DpsError::Authorization {
+        code: -1,
+        kind: AuthorizationKind::DocumentReject,
+        message: "reject_doc2".into(),
+    })); // doc2 send
+    phase2.push_last(Ok(ack("SFN-1", vec![0xDE, 0xAD, 0xBE, 0xEF]))); // doc1 lastChk Match
+    let sign_ctx2 = det_signing_ctx();
+    let fn_sign2 = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &phase2,
+        signing_ctx: &sign_ctx2,
+        fn_sign: &fn_sign2,
+    };
+    backlog_drain::drain(&recon_guard(), &pool, &view, FN)
+        .await
+        .expect("strict drain returns Ok (escalates Manual, not BootError)");
+
+    // ── FT pin (strict-sequential):
+    let state_at = |lnd: i64| {
+        let pool = &pool;
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM fiscal_documents WHERE fiscal_number = ? AND lnd = ?",
+            )
+            .bind(FN)
+            .bind(lnd)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(state_at(1).await, "ACK", "doc1 → ACK");
+    assert_eq!(state_at(2).await, "REJECTED", "doc2 → REJECTED (terminal)");
+    assert_eq!(
+        state_at(3).await,
+        "OFFLINE_LOCAL_ACK",
+        "doc3 NOT sent — strict halt at the rejected predecessor"
+    );
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        2,
+        "only doc1 + doc2 reached the wire; doc3 never did"
+    );
+
+    // FN escalated to durable manual-recon via edge 15 (plain Opened, NOT wedged).
+    let shift_state: String =
+        sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+            .bind(shift_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
+
+    // Ledger clean over the REAL chain incl. the REJECTED offline-origin
+    // predecessor (M2-N2b).
+    prro::db::invariant_scan::assert_clean(&pool).await;
 }

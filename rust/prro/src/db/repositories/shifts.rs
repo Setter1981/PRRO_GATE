@@ -45,9 +45,11 @@ pub struct ShiftRow {
 ///   OR `boot_phase` branch e2 system-context recovery (audit shape
 ///   `SHIFT_BOOT_ORPHAN_ERROR`, distinct from `SHIFT_FORCE_TO_ERROR`).**  No
 ///   whitelist edge ever lands on `Error`.
-/// - **`RequiresManualReconciliation` is reachable via edges 4 / 6 / 12 / 14
+/// - **`RequiresManualReconciliation` is reachable via edges 4 / 6 / 12 / 14 / 15
 ///   OR via `force_to_manual_reconciliation_with_audit` seam.**  Nothing
-///   else.
+///   else.  (Edge 15 — `Opened → RequiresManualReconciliation` — added M2-N2a
+///   for the strict-sequential drain-reject of an offline-origin predecessor on
+///   a plain `Opened` shift; same class as 6 / 14.)
 ///
 /// The 14 edges (#N matches spec §4.1 numbering):
 ///   1.  Created → Opening                      (online SHIFT_OPEN ingress)
@@ -64,6 +66,10 @@ pub struct ShiftRow {
 ///   12. Closing → RequiresManualReconciliation (hard reject)
 ///   13. ClosingLocalPendingDrain → Closed      (drain reached final Ack on all backlog)
 ///   14. ClosingLocalPendingDrain → RequiresManualReconciliation (drain reject)
+///   15. Opened → RequiresManualReconciliation  (M2-N2a: strict-sequential drain
+///       reject of an offline-origin predecessor on an online-opened shift that
+///       went OFFLINE mid-shift — a normal state-machine branch, NOT an operator
+///       override.  Same drain-reject class as 6 / 14, from a plain `Opened` shift.)
 pub fn allowed_transition(from: ShiftState, to: ShiftState) -> bool {
     use ShiftState::*;
     matches!(
@@ -82,6 +88,7 @@ pub fn allowed_transition(from: ShiftState, to: ShiftState) -> bool {
             | (Closing, RequiresManualReconciliation)       // 12
             | (ClosingLocalPendingDrain, Closed)            // 13
             | (ClosingLocalPendingDrain, RequiresManualReconciliation) // 14
+            | (Opened, RequiresManualReconciliation)        // 15 (M2-N2a)
     )
 }
 

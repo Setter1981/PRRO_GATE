@@ -743,6 +743,33 @@ pub async fn max_submitted_lnd(
     .await
 }
 
+/// **M2-N4 (architect ruling, 2026-06-13)** — the `(lnd, server_fiscal_no)` of
+/// every SUBMITTED doc on `fiscal_number` with `lnd > min_lnd_exclusive`.
+/// "Submitted" is the same cohort as [`max_submitted_lnd`]
+/// (`state IN {SENT,KVT1,KVT2,ACK}` with a non-empty `server_fiscal_no`).
+///
+/// Used by the superseded decision (boot M1-02 SENT-probe + drain SentReplay):
+/// a `last_chk` tip id is a LEGITIMATE supersession ONLY if it equals the
+/// `server_fiscal_no` of one of OUR newer submitted docs.  A foreign / garbage
+/// tip (someone else fiscalised on the FN, or DPS-state divergence) is NOT a
+/// benign supersession — it is genuine structural drift, and trusting local
+/// `max_lnd` alone would mask it.  Pool-bound read, no write-tx.
+pub async fn submitted_above_lnd(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    min_lnd_exclusive: i64,
+) -> sqlx::Result<Vec<(i64, String)>> {
+    sqlx::query_as::<_, (i64, String)>(
+        "SELECT lnd, server_fiscal_no FROM fiscal_documents \
+         WHERE fiscal_number = ? AND lnd > ? AND state IN ('SENT', 'KVT1', 'KVT2', 'ACK') \
+               AND server_fiscal_no IS NOT NULL AND length(server_fiscal_no) > 0",
+    )
+    .bind(fiscal_number)
+    .bind(min_lnd_exclusive)
+    .fetch_all(pool)
+    .await
+}
+
 /// NC-04 (external-critic finding, adjudicated 2026-06-11) — the FN's NEWEST
 /// pending-submitted row by `lnd`, REGARDLESS of `server_fiscal_no` validity:
 /// the max-`lnd` doc in `{SENT, KVT1, KVT2}` (the in-flight submitted cohort —

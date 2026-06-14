@@ -154,14 +154,17 @@ pub enum Kvt2ConfirmOutcome {
     /// confirmation.
     /// Caller (`confirm_drain_doc`) completes the recovery trace
     /// (`RetryableServer` / `LAST_CHK_TIP_SUPERSEDED`) + emits a
-    /// `TIP_SUPERSEDED` audit, leaves the doc in SENT (NO state change),
-    /// and projects to `ConfirmDrainOutcome::SupersededHeld` so the drain
-    /// CONTINUES past it (does NOT `BootError::Internal`-halt the FN).
-    /// `dps_tip_id` is the DPS tip's `server_fiscal_no` (the newer doc),
-    /// threaded into the trace + audit for forensics.  The `superseded`
-    /// verdict is computed by the caller BEFORE the classifier call (it
-    /// reads `max_submitted_lnd` + `doc.lnd`), so the classifier stays
-    /// pure.
+    /// `TIP_SUPERSEDED` audit, leaves the doc in SENT (NO state change), and
+    /// projects to `ConfirmDrainOutcome::SupersededHeld`.  `confirm_drain_doc`
+    /// itself does NOT `BootError::Internal`-halt — but under **M2-N1 ruling B**
+    /// the DRAIN consumer then HALTS the chain + escalates the FN to Manual
+    /// (a superseded predecessor is non-self-resolving; see
+    /// `ConfirmDrainOutcome::SupersededHeld`).  `dps_tip_id` is the DPS tip's
+    /// `server_fiscal_no`, threaded into the trace + audit for forensics.
+    /// **M2-N4**: the `superseded` verdict is computed by the caller from the
+    /// DPS `actual_id` (it must equal the `server_fiscal_no` of a submitted
+    /// doc with `lnd > doc.lnd`; a foreign tip → `StructuralDrift`), threaded
+    /// as a pure `bool` so `classify_check_result` stays pure.
     SupersededHold {
         dps_tip_id: String,
         sent_replay_trace_attempt_no: Option<i64>,
@@ -421,13 +424,26 @@ pub async fn evaluate_lastchk(
     expected_server_fiscal_no: &str,
     source: Kvt2ConfirmSource,
     sent_replay_trace_attempt_no: Option<i64>,
-    // **SEAM-B-3 (2026-06-13)** — caller-computed M1-02 superseded verdict
-    // (see [`classify_check_result`]); threaded through unchanged.
-    superseded: bool,
+    // **M2-N4 (architect ruling, 2026-06-13)** — the `server_fiscal_no`s of the
+    // FN's submitted docs with `lnd > doc.lnd` (caller-fetched; see
+    // `confirm_drain_doc`).  A `ServerFiscalIdMismatch` is "superseded" (NOT
+    // structural drift) ONLY if the DPS tip `actual_id` is one of these — i.e.
+    // a NEWER submitted doc of OURS became the tip.  A foreign/garbage tip is
+    // genuine drift.  This subsumes the lnd-only SEAM-B-3 check (a non-empty
+    // set ⟺ `doc.lnd < max_submitted_lnd`).  The membership test is done HERE
+    // (post-DPS, where `actual_id` is known) so `classify_check_result` stays a
+    // PURE `bool` consumer.  Empty for non-SentReplay sources.
+    newer_submitted_sfns: &[String],
 ) -> Kvt2ConfirmOutcome {
     let result = dps
         .by_server_fiscal_no(fn_sign, expected_server_fiscal_no)
         .await;
+    let superseded = match &result {
+        Err(DpsError::ServerFiscalIdMismatch { actual_id, .. }) => {
+            newer_submitted_sfns.iter().any(|sfn| sfn == actual_id)
+        }
+        _ => false,
+    };
     classify_check_result(result, source, sent_replay_trace_attempt_no, superseded)
 }
 
@@ -527,14 +543,15 @@ pub enum ConfirmDrainOutcome {
     /// emitted a `TIP_SUPERSEDED` audit; the doc stays in SENT (NO state
     /// change, NO `consecutive_holds` increment).
     ///
-    /// **Caller MUST sibling-continue, NOT stop.**  Unlike `HoldFnDrain`
-    /// (which halts the FN drain at the held doc), the superseded doc has
-    /// a LOWER `lnd` than the tip and is processed FIRST in the `lnd ASC`
-    /// cohort — stopping here would strand the higher-`lnd` tip.  The
-    /// drain consumer maps this to a continue-verdict that records the doc
-    /// as held-at-sent (blocks finalize, conservative) and proceeds to the
-    /// next doc.  Resolution of the superseded doc is deferred to the
-    /// B1-v2 doc-scoped confirmation / monitoring (same as boot).
+    /// **Caller HALTS + escalates Manual (M2-N1 ruling B — reverses
+    /// SEAM-B-3).**  Under strict-sequential drain a superseded predecessor is
+    /// non-ACK from the successor's chain view AND non-self-resolving without
+    /// B1-v2 (re-superseded every tick → would wedge if merely held).  So the
+    /// drain consumer records the doc as held-at-sent and escalates the FN to
+    /// `RequiresManualReconciliation` (durable operator surface), then returns
+    /// — it does NOT continue past it (sending a successor off an unconfirmed
+    /// predecessor is unsafe in the strict M2-01 chain).  Resolution of the
+    /// superseded doc is owned by B1-v2 doc-scoped confirmation (future).
     SupersededHeld,
 }
 
@@ -654,34 +671,35 @@ pub(crate) async fn confirm_drain_doc(
             }
             _ => (None, None),
         };
-    // **SEAM-B-3 (2026-06-13)**: compute the M1-02 superseded verdict
-    // BEFORE the classifier call so `classify_check_result` stays pure.
-    // A SentReplay `ServerFiscalIdMismatch` is "superseded" (NOT drift)
-    // when this SENT doc is NOT the FN's newest submitted doc — its `lnd`
-    // is less than `max_submitted_lnd(fn)` over `{SENT,KVT1,KVT2,ACK}`
-    // (reuse the existing M1-02 repo fn; do NOT add a new query).  Only
-    // the SentReplay path carries this exception (boot-parity scope);
-    // every other source passes `false`.  `superseded_max_lnd` retains
-    // the max value for the TIP_SUPERSEDED audit payload below.
-    let superseded_max_lnd: Option<i64> = match source {
+    // **M2-N4 (architect ruling, 2026-06-13; refines SEAM-B-3)**: fetch the
+    // FN's submitted docs with `lnd > doc.lnd` (the only legitimate
+    // supersession candidates) BEFORE the DPS call.  A SentReplay
+    // `ServerFiscalIdMismatch` is "superseded" (NOT structural drift) ONLY if
+    // the DPS tip `actual_id` equals the `server_fiscal_no` of one of these
+    // newer submitted docs — checked inside `evaluate_lastchk` (post-DPS) so
+    // `classify_check_result` stays a pure `bool` consumer.  A foreign/garbage
+    // tip → drift.  `superseded_max_lnd` retains the max `lnd` of the newer set
+    // for the TIP_SUPERSEDED audit payload (it is `Some` whenever superseded is
+    // true, since a match implies a non-empty set).  Non-SentReplay sources
+    // pass an empty set (boot-parity scope).
+    let newer_submitted: Vec<(i64, String)> = match source {
         Kvt2ConfirmSource::SentReplay => {
-            match fiscal_documents::max_submitted_lnd(pool, &fiscal_number)
+            fiscal_documents::submitted_above_lnd(pool, &fiscal_number, doc.lnd)
                 .await
                 .map_err(BootError::Database)?
-            {
-                Some(max_lnd) if doc.lnd < max_lnd => Some(max_lnd),
-                _ => None,
-            }
         }
-        _ => None,
+        _ => Vec::new(),
     };
+    let superseded_max_lnd: Option<i64> = newer_submitted.iter().map(|(lnd, _)| *lnd).max();
+    let newer_submitted_sfns: Vec<String> =
+        newer_submitted.into_iter().map(|(_, sfn)| sfn).collect();
     let outcome = evaluate_lastchk(
         dps,
         fn_sign,
         expected_server_fiscal_no,
         source,
         sent_replay_trace_attempt_no.map(i64::from),
-        superseded_max_lnd.is_some(),
+        &newer_submitted_sfns,
     )
     .await;
     // Capture wire-finish timestamp AFTER DPS call returns (only
@@ -995,9 +1013,10 @@ pub(crate) async fn confirm_drain_doc(
             // the recovery trace (RetryableServer / LAST_CHK_TIP_SUPERSEDED,
             // carrying the DPS tip id) + emit a TIP_SUPERSEDED audit; NO
             // doc-state change; NO consecutive_holds increment.  Return
-            // `SupersededHeld` so the drain CONTINUES past this doc
-            // (caller maps to a sibling-continue verdict) — do NOT
-            // BootError-halt the FN drain.
+            // `SupersededHeld` — confirm_drain_doc itself does NOT BootError-
+            // halt, but under M2-N1 ruling B the drain consumer then HALTS the
+            // chain + escalates the FN to Manual (reverses SEAM-B-3: a
+            // superseded predecessor is non-self-resolving without B1-v2).
             if !matches!(source, Kvt2ConfirmSource::SentReplay) {
                 return Err(BootError::Internal(format!(
                     "confirm_drain_doc({source:?}): SupersededHold is structurally \

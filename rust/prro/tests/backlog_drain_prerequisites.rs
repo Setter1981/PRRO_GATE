@@ -23,7 +23,7 @@ mod common;
 use std::sync::Arc;
 
 use prro::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
-use prro::db::models::ids::{DocumentId, OfflineSessionId};
+use prro::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
 use prro::services::offline_sync::backlog_drain;
 use prro::services::reconciliation::runtime::RuntimeView;
 use prro::services::write_path::stage_sign::SigningContext;
@@ -68,6 +68,47 @@ async fn seed_node_state(pool: &SqlitePool, fn_id: &str, mode: NodeMode, shift: 
     .execute(pool)
     .await
     .unwrap();
+}
+
+/// Seed an `OPENED` shifts row.  The strict-sequential drain (architect
+/// ruling B, 2026-06-13) escalates the FN shift to
+/// `RequiresManualReconciliation` on a terminal per-doc failure even on a
+/// plain `Opened` shift (whitelist edge 15), so the C3 prerequisite tests —
+/// whose seeded `{}`-payload doc now hits a terminal failure in the per-doc
+/// loop — need a real shift row to CAS against.
+async fn seed_open_shift(pool: &SqlitePool, fn_id: &str) -> ShiftId {
+    let shift_id = ShiftId::new();
+    sqlx::query(
+        "INSERT INTO shifts(shift_id, fiscal_number, serial, state, \
+            open_mode, cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, ?, 1, 'OPENED', 'OFFLINE', 0, 'cashier-c3')",
+    )
+    .bind(shift_id)
+    .bind(fn_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    shift_id
+}
+
+/// Drain reads `node_state.current_shift_id` to identify the shift to
+/// escalate on a terminal drain reject.  Backfill it after seeding the
+/// shift (the C3 `seed_node_state` helper leaves it NULL).
+async fn set_node_current_shift(pool: &SqlitePool, fn_id: &str, shift_id: ShiftId) {
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
+        .bind(shift_id)
+        .bind(fn_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn read_shift_state(pool: &SqlitePool, shift_id: ShiftId) -> String {
+    sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(shift_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 async fn seed_offline_session(
@@ -286,6 +327,13 @@ async fn c3_skips_when_backlog_empty() {
 async fn c3_transitions_session_open_to_draining_and_emits_started() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, FN, NodeMode::GoingOnline, ShiftState::Opened).await;
+    // Strict-sequential drain (ruling B): the seeded `{}`-payload doc_a now
+    // produces a TERMINAL per-doc failure, which escalates the FN shift to
+    // RequiresManualReconciliation even on a plain Opened shift (edge 15).
+    // Escalation reads node_state.current_shift_id, so seed a shift + backfill
+    // the column; otherwise escalate_drain_to_manual panics on a NULL id.
+    let shift_id = seed_open_shift(&pool, FN).await;
+    set_node_current_shift(&pool, FN, shift_id).await;
     let session_id = OfflineSessionId::new();
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
     let _doc_a = seed_offline_local_ack_doc(&pool, FN, 1, 100, session_id).await;
@@ -311,9 +359,29 @@ async fn c3_transitions_session_open_to_draining_and_emits_started() {
         "Open → Draining CAS must have applied"
     );
 
-    // Both audit events emitted, exactly once each.
+    // Both audit events emitted, exactly once each.  These are the
+    // PREREQUISITE events (session Open→Draining CAS + drain entry), emitted
+    // at drain START before the per-doc loop — so they fire regardless of the
+    // strict-sequential per-doc outcome.
     assert_eq!(audit_count(&pool, "OFFLINE_SESSION_DRAIN_STARTED").await, 1);
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_STARTED").await, 1);
+
+    // Strict-sequential consequence (ruling B): doc_a hits a terminal per-doc
+    // failure → drain halts at the first non-ACK doc and escalates the FN
+    // shift to RequiresManualReconciliation (plain Opened via edge 15),
+    // emitting exactly one Critical OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL.
+    // drain() still returns Ok(summary) (escalation returns Ok).  doc_b
+    // (higher lnd) is NOT processed — the chain stopped at doc_a.
+    assert_eq!(
+        read_shift_state(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "terminal drain reject must escalate the plain Opened shift to Manual"
+    );
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1,
+        "exactly one halt+escalate audit on the terminal per-doc failure"
+    );
 
     let session_hex_expected: String = session_id
         .as_bytes()
@@ -356,6 +424,12 @@ async fn c3_transitions_session_open_to_draining_and_emits_started() {
 async fn c3_idempotent_when_session_already_draining() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, FN, NodeMode::GoingOnline, ShiftState::Opened).await;
+    // Strict-sequential drain (ruling B): the seeded `{}`-payload doc now
+    // produces a TERMINAL per-doc failure → the shift escalates to Manual,
+    // which reads node_state.current_shift_id.  Seed a shift + backfill the
+    // column so escalation succeeds (else it panics on a NULL id).
+    let shift_id = seed_open_shift(&pool, FN).await;
+    set_node_current_shift(&pool, FN, shift_id).await;
     let session_id = OfflineSessionId::new();
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Draining).await;
     let _doc = seed_offline_local_ack_doc(&pool, FN, 1, 200, session_id).await;
@@ -381,6 +455,23 @@ async fn c3_idempotent_when_session_already_draining() {
     // But the drain itself still emits OFFLINE_DRAIN_STARTED — that
     // event signals the orchestrator entry, not the session transition.
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_STARTED").await, 1);
+
+    // Strict-sequential consequence (ruling B): the single seeded doc hits a
+    // terminal per-doc failure → drain halts + escalates the plain Opened
+    // shift to RequiresManualReconciliation (edge 15) with one Critical
+    // OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL audit.  drain() still returns
+    // Ok(summary).  The re-entry prerequisite (no second Open→Draining CAS)
+    // is unaffected — the session was already DRAINING.
+    assert_eq!(
+        read_shift_state(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "terminal drain reject escalates the plain Opened shift to Manual"
+    );
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1,
+        "exactly one halt+escalate audit on the terminal per-doc failure"
+    );
 }
 
 // ─── Test 5: no active session → drain skips with empty-backlog ──────

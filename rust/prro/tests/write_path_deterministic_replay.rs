@@ -3245,3 +3245,89 @@ async fn fixture_5b_sent_mismatch_superseded_is_not_terminalised() {
     .unwrap();
     assert_eq!(rm, 0, "no doc terminalised to Manual (M1-02 fix)");
 }
+
+// ─── M2-N4 fix pin (architect ruling, 2026-06-13) ─────────────────────
+//
+// M1-02 decided "superseded" on local `lnd < max_submitted_lnd` ALONE — the
+// DPS-returned `actual_id` was only forensic.  A FOREIGN/garbage DPS tip (not
+// the sfn of any of OUR newer submitted docs) was therefore mislabelled benign
+// SupersededHold, MASKING real structural drift.  M2-N4: superseded requires
+// `actual_id` to equal the sfn of one of our newer submitted docs; else the
+// Mismatch terminalises to RequiresManualReconciliation (genuine drift).
+//
+// Setup: A(lnd=1, SFN-A) + B(lnd=2, SFN-B) both SENT.  A newer submitted doc (B)
+// EXISTS, so the lnd-only check would call A superseded — but the DPS tip for
+// A's probe is "SFN-FOREIGN" (NOT B's sfn) → genuine drift → A → Manual.
+#[tokio::test]
+async fn m2_n4_boot_foreign_tip_is_manual_not_superseded() {
+    let (_dir, app) = fresh_app().await;
+    let fn_id = "1234567890";
+    seed_fn_config(app.db(), fn_id).await;
+    seed_node_state(app.db(), fn_id, "ONLINE", "CLOSED", 1).await;
+    async fn seed_sent(pool: &SqlitePool, fn_id: &str, b: u8, lnd: i64, sfn: &str) -> DocumentId {
+        sqlx::query(
+            "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+                state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+                payload_json, payload_sha256_canonical, server_fiscal_no) \
+             VALUES (?, ?, ?, ?, 'SELL', 'SENT', 'b1', 't1', 'ONLINE', '2026-01-01T00:00:00Z', \
+                '{}', ?, ?)",
+        )
+        .bind(vec![b; 16])
+        .bind(vec![b ^ 0xFF; 16])
+        .bind(fn_id)
+        .bind(lnd)
+        .bind(vec![0u8; 32])
+        .bind(sfn)
+        .execute(pool)
+        .await
+        .expect("seed SENT doc");
+        DocumentId::from_bytes([b; 16])
+    }
+    let doc_a = seed_sent(app.db(), fn_id, 0x01, 1, "SFN-A").await;
+    let doc_b = seed_sent(app.db(), fn_id, 0x02, 2, "SFN-B").await;
+
+    // A's probe → DPS tip "SFN-FOREIGN" (NOT our doc_b's sfn) → genuine drift.
+    // B's probe → "SFN-B" Match → KVT1 (data_sign non-empty for the evidence).
+    let stub = StubDpsChannel::new(Ok(ack("unused-send"))).with_last_chk_queue(vec![
+        Ok(ack("SFN-FOREIGN")),
+        Ok(CheckAck {
+            id: "SFN-B".into(),
+            id_sign: vec![],
+            data_sign: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        }),
+    ]);
+    let signing_ctx = det_signing_ctx();
+    let fn_sign = dummy_fn_sign();
+    let deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub,
+        signing_ctx: &signing_ctx,
+        fn_sign: &fn_sign,
+    });
+
+    let summary = app
+        .reconcile_pending_with(deps)
+        .await
+        .expect("reconcile_pending_with green");
+
+    // A's tip is FOREIGN (not our newer doc's sfn) → genuine drift → Manual,
+    // NOT a benign supersession.
+    assert_eq!(
+        doc_state(app.db(), doc_a).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "foreign DPS tip → structural drift → Manual (M2-N4), NOT superseded"
+    );
+    assert_eq!(doc_state(app.db(), doc_b).await, "KVT1", "the tip doc still advances");
+    assert_eq!(
+        summary.docs_advanced.sent_mismatch_to_manual, 1,
+        "A terminalises to Manual (foreign tip)"
+    );
+    assert_eq!(
+        summary.docs_advanced.sent_mismatch_superseded, 0,
+        "A is NOT counted superseded — the tip is foreign (M2-N4)"
+    );
+    assert_eq!(
+        audit_count(app.db(), "TIP_SUPERSEDED").await,
+        0,
+        "no TIP_SUPERSEDED audit for a foreign tip"
+    );
+}

@@ -755,7 +755,16 @@ async fn er_guard_budget_exhausted_no_wire_escalates_to_manual() {
     let (_d, pool) = fresh_pool().await;
     // 5 SEND rows (is_probe=0) = MAX_BOOT_ATTEMPTS → attempts_used = 5 →
     // exhausted (M1-04: attempts_used is COUNT of send rows, not MAX(attempt_no)).
-    let (doc, _shift, _sess) = seed_er_with_class(&pool, "TransientRetry", 5).await;
+    let (doc, shift_id, _sess) = seed_er_with_class(&pool, "TransientRetry", 5).await;
+    // Strict-sequential (architect ruling B, 2026-06-13): a terminal failure on a
+    // plain Opened shift now escalates the FN shift to Manual via whitelist edge 15;
+    // escalate_drain_to_manual reads node_state.current_shift_id, so backfill it.
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
+        .bind(shift_id)
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let c = carriers(vec![], vec![]);
     let view = view_for(&c);
@@ -792,12 +801,33 @@ async fn er_guard_budget_exhausted_no_wire_escalates_to_manual() {
     assert_eq!(p["max_boot_attempts"], 5);
     assert_eq!(p["manual_recon_class"], true);
     assert_eq!(p["dispatch_via"], "er_class_guard");
+
+    // Strict-sequential: terminal failure HALTS + escalates the FN shift to
+    // Manual (plain Opened → whitelist edge 15) + Critical halt audit.
+    let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(shift_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1
+    );
 }
 
 #[tokio::test]
 async fn er_guard_fn_config_error_no_wire_escalates_to_manual() {
     let (_d, pool) = fresh_pool().await;
-    let (doc, _shift, _sess) = seed_er_with_class(&pool, "FnConfigError", 1).await;
+    let (doc, shift_id, _sess) = seed_er_with_class(&pool, "FnConfigError", 1).await;
+    // Strict-sequential: terminal failure escalates the FN shift to Manual
+    // (edge 15) which reads node_state.current_shift_id; backfill it.
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
+        .bind(shift_id)
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let c = carriers(vec![], vec![]);
     let view = view_for(&c);
@@ -821,12 +851,33 @@ async fn er_guard_fn_config_error_no_wire_escalates_to_manual() {
     assert_eq!(p["retry_class"], "FnConfigError");
     assert_eq!(p["manual_recon_class"], true);
     assert_eq!(p["dispatch_via"], "er_class_guard");
+
+    // Strict-sequential: terminal failure HALTS + escalates the FN shift to
+    // Manual (plain Opened → whitelist edge 15) + Critical halt audit.
+    let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(shift_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1
+    );
 }
 
 #[tokio::test]
 async fn er_guard_wrapper_bug_no_wire_escalates_to_manual() {
     let (_d, pool) = fresh_pool().await;
-    let (doc, _shift, _sess) = seed_er_with_class(&pool, "WrapperBug", 1).await;
+    let (doc, shift_id, _sess) = seed_er_with_class(&pool, "WrapperBug", 1).await;
+    // Strict-sequential: terminal failure escalates the FN shift to Manual
+    // (edge 15) which reads node_state.current_shift_id; backfill it.
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
+        .bind(shift_id)
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let c = carriers(vec![], vec![]);
     let view = view_for(&c);
@@ -845,12 +896,33 @@ async fn er_guard_wrapper_bug_no_wire_escalates_to_manual() {
     assert_eq!(p["failure_class"], "internal");
     assert_eq!(p["retry_class"], "WrapperBug");
     assert_eq!(p["manual_recon_class"], true);
+
+    // Strict-sequential: terminal failure HALTS + escalates the FN shift to
+    // Manual (plain Opened → whitelist edge 15) + Critical halt audit.
+    let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(shift_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1
+    );
 }
 
 #[tokio::test]
 async fn er_guard_operator_escalation_no_wire_escalates_to_manual() {
     let (_d, pool) = fresh_pool().await;
-    let (doc, _shift, _sess) = seed_er_with_class(&pool, "OperatorEscalation", 1).await;
+    let (doc, shift_id, _sess) = seed_er_with_class(&pool, "OperatorEscalation", 1).await;
+    // Strict-sequential: terminal failure escalates the FN shift to Manual
+    // (edge 15) which reads node_state.current_shift_id; backfill it.
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
+        .bind(shift_id)
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let c = carriers(vec![], vec![]);
     let view = view_for(&c);
@@ -873,12 +945,33 @@ async fn er_guard_operator_escalation_no_wire_escalates_to_manual() {
     assert_eq!(p["failure_class"], "server");
     assert_eq!(p["retry_class"], "OperatorEscalation");
     assert_eq!(p["manual_recon_class"], true);
+
+    // Strict-sequential: terminal failure HALTS + escalates the FN shift to
+    // Manual (plain Opened → whitelist edge 15) + Critical halt audit.
+    let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(shift_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1
+    );
 }
 
 #[tokio::test]
 async fn er_guard_mac_recovery_no_wire_escalates_to_manual() {
     let (_d, pool) = fresh_pool().await;
-    let (doc, _shift, _sess) = seed_er_with_class(&pool, "MacRecovery", 1).await;
+    let (doc, shift_id, _sess) = seed_er_with_class(&pool, "MacRecovery", 1).await;
+    // Strict-sequential: terminal failure escalates the FN shift to Manual
+    // (edge 15) which reads node_state.current_shift_id; backfill it.
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
+        .bind(shift_id)
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let c = carriers(vec![], vec![]);
     let view = view_for(&c);
@@ -897,12 +990,33 @@ async fn er_guard_mac_recovery_no_wire_escalates_to_manual() {
     assert_eq!(p["failure_class"], "internal");
     assert_eq!(p["retry_class"], "MacRecovery");
     assert_eq!(p["manual_recon_class"], true);
+
+    // Strict-sequential: terminal failure HALTS + escalates the FN shift to
+    // Manual (plain Opened → whitelist edge 15) + Critical halt audit.
+    let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(shift_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1
+    );
 }
 
 #[tokio::test]
 async fn er_guard_terminal_reject_no_wire_escalates_critical_inconsistent() {
     let (_d, pool) = fresh_pool().await;
-    let (doc, _shift, _sess) = seed_er_with_class(&pool, "TerminalReject", 1).await;
+    let (doc, shift_id, _sess) = seed_er_with_class(&pool, "TerminalReject", 1).await;
+    // Strict-sequential: terminal failure escalates the FN shift to Manual
+    // (edge 15) which reads node_state.current_shift_id; backfill it.
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
+        .bind(shift_id)
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let c = carriers(vec![], vec![]);
     let view = view_for(&c);
@@ -938,6 +1052,20 @@ async fn er_guard_terminal_reject_no_wire_escalates_critical_inconsistent() {
     .await
     .unwrap();
     assert_eq!(sev, "CRITICAL");
+
+    // Strict-sequential: terminal failure ALSO HALTS + escalates the FN shift to
+    // Manual (plain Opened → whitelist edge 15) + Critical halt audit (in addition
+    // to the structural-inconsistency / Critical ER-escalation envelope above).
+    let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(shift_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1
+    );
 }
 
 #[tokio::test]
@@ -1101,161 +1229,125 @@ async fn c5b2_sent_replay_lastchk_mismatch_halts_drain_with_structural_drift_aud
 // ─── Test 4b (SEAM-B-3): SentReplay Mismatch on a SUPERSEDED SENT doc ─
 //     → held (no halt), drain CONTINUES to the tip, TIP_SUPERSEDED audit.
 
-/// **SEAM-B-3 (architect-locked contract, 2026-06-13)** — give the
-/// offline-drain SentReplay lastChk classifier the M1-02 superseded
-/// exception that boot's `dispatch_sent_via_probe` already has.  A
-/// `ServerFiscalIdMismatch` on a SENT doc that is NOT the FN's newest
-/// submitted doc (`doc.lnd < max_submitted_lnd`) means a NEWER submitted
-/// doc became the DPS lastChk tip — the older doc's ACK status is UNKNOWN
-/// from lastChk (acked-then-superseded OR never acked), so it must be
-/// HELD, not concluded, and must NOT hard-abort the whole FN drain (the
-/// pre-SEAM-B-3 behaviour routed UNCONDITIONALLY to `StructuralDrift` →
-/// `BootError::Internal`).
+/// **M2-N1 reversal of SEAM-B-3 (architect ruling B, 2026-06-13)** — under
+/// strict-sequential drain a SUPERSEDED predecessor STOPS the chain.  SEAM-B-3
+/// originally let the drain sibling-continue past a superseded SENT doc to
+/// drain the higher-`lnd` tip.  But M2-01 made offline-origin docs a STRICT
+/// predecessor chain, so the tip's `previous_hash = hash(superseded doc)` —
+/// sending it while the predecessor's ACK status is UNKNOWN is unsafe.  And a
+/// superseded doc is non-self-resolving without B1-v2 doc-scoped confirmation,
+/// so merely holding it would wedge.  Therefore: halt + escalate the FN to
+/// `RequiresManualReconciliation` (plain `Opened` → whitelist edge 15).  The
+/// `TIP_SUPERSEDED` audit is still emitted (forensic record of WHY).
 ///
-/// Cohort = two SENT docs in `lnd ASC` order:
-///   - `doc_a` (lnd=1, sfn="DPS-FN-A")  — SUPERSEDED (lnd < max=2)
-///   - `doc_b` (lnd=2, sfn="DPS-FN-B")  — the actual DPS lastChk tip
-/// DPS lastChk returns the tip id "DPS-FN-B" for BOTH probes:
-///   - doc_a probe → Mismatch(expected A, actual tip B) + superseded →
-///     `SupersededHold` → held in SENT, drain CONTINUES
-///   - doc_b probe → Match → Acked → advance to ACK
-///
-/// **WEDGE-AVOIDANCE PIN.**  `doc_a` has the LOWER `lnd` and is processed
-/// FIRST.  If the superseded outcome mapped to `HoldFnDrain` (which
-/// `break`s the per-doc loop) the higher-`lnd` tip `doc_b` would never
-/// drain.  Asserting `doc_b` reaches ACK pins that the drain did NOT stop
-/// at the superseded sibling — it sibling-continued past it.
+/// Cohort = two SENT offline-origin docs in `lnd ASC` order:
+///   - `doc_a` (lnd=1, sfn="DPS-FN-A")  — superseded (M2-N4: DPS tip "DPS-FN-B"
+///     IS our newer submitted doc_b's sfn, so genuine supersession, not drift)
+///   - `doc_b` (lnd=2, sfn="DPS-FN-B")  — the DPS lastChk tip
+/// `doc_a` is processed FIRST → SupersededHeld → halt + Manual; `doc_b` is
+/// NOT processed (stays SENT), proving the strict chain stops at the superseded
+/// predecessor (the reverse of SEAM-B-3's old continue).
 #[tokio::test]
-async fn seam_b3_sent_replay_superseded_holds_doc_and_continues_drain() {
+async fn seam_b3_superseded_predecessor_halts_chain_and_escalates_manual() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool).await;
+    // Drain reads node_state.current_shift_id to identify the shift to escalate
+    // (M2-N2a edge 15 for plain Opened).
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
+        .bind(shift_id)
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
 
-    // doc_a: lnd=1 — the superseded SENT doc (lnd < max_submitted_lnd).
-    let doc_a = seed_doc_in_state(
-        &pool,
-        1,
-        100,
-        session_id,
-        shift_id,
-        "SENT",
-        Some("DPS-FN-A"),
-    )
-    .await;
+    // doc_a: lnd=1 — the superseded SENT doc.
+    let doc_a =
+        seed_doc_in_state(&pool, 1, 100, session_id, shift_id, "SENT", Some("DPS-FN-A")).await;
     // doc_b: lnd=2 — the FN's newest submitted doc (the DPS lastChk tip).
-    let doc_b = seed_doc_in_state(
-        &pool,
-        2,
-        101,
-        session_id,
-        shift_id,
-        "SENT",
-        Some("DPS-FN-B"),
-    )
-    .await;
+    let doc_b =
+        seed_doc_in_state(&pool, 2, 101, session_id, shift_id, "SENT", Some("DPS-FN-B")).await;
 
-    // MAC-chain bootstrap so `invariant_scan::assert_clean` holds across BOTH
-    // docs (the contract pin), modelling a genesis-consistent 2-doc chain:
-    //   doc_a (lnd=1, held): chain HEAD — `previous_hash = NULL` (genesis
-    //         start of the walk), `unsigned_xml_sha256 = H_a`.
-    //   doc_b (lnd=2, →ACK): `previous_hash = H_a`, `unsigned_xml_sha256 = H_b`.
-    //   node_state seed = H_b — both docs are OFFLINE-ORIGIN, so the chain seed
-    //   already advanced PAST both at offline-ack (M2-01 Fable-locked).
-    //   `stage_finalize` SKIPS the guard + seed-advance for offline-origin docs,
-    //   so node_state stays at H_b and the scan walk (doc_a issued→H_a,
-    //   doc_b issued→H_b) ends at H_b, matching node_state.
+    // Genesis-consistent 2-doc chain so `invariant_scan::assert_clean` holds:
+    //   doc_a (chain HEAD): previous_hash NULL, unsigned = H_a.
+    //   doc_b: previous_hash = H_a, unsigned = H_b.
+    //   node seed = H_b (both OFFLINE-origin ⇒ seed advanced past both at
+    //   offline-ack, M2-01).  Both stay SENT after the halt — both still
+    //   "issued" in the scan walk → ends at H_b, matching node seed.
     let h_a = common::chain_anchor(0x01);
     let h_b = common::chain_anchor(0x02);
-    // doc_a: set unsigned_xml_sha256 only; leave previous_hash NULL so the chain
-    // walk's first row matches the genesis `None` start.
     sqlx::query("UPDATE fiscal_documents SET unsigned_xml_sha256 = ? WHERE document_id = ?")
         .bind(&h_a[..])
         .bind(doc_a)
         .execute(&pool)
         .await
         .unwrap();
-    // doc_b: previous_hash = H_a, unsigned_xml_sha256 = H_b (+ the inbox row the
-    // stage_finalize 5-write envelope marks DONE on ACK).
     common::seed_w12_finalize_prereqs(&pool, FN, doc_b, h_a, h_b)
         .await
         .unwrap();
-    // node_state seed = H_b (offline issuance already advanced past both docs;
-    // finalize does not re-advance offline-origin docs per M2-01).
     common::init_chain_seed(&pool, FN, h_b).await.unwrap();
 
-    // lastChk returns the tip id "DPS-FN-B" for BOTH probes (FIFO, lnd ASC):
-    //   [0] doc_a probe (expected "DPS-FN-A") → ack.id="DPS-FN-B" → Mismatch.
-    //   [1] doc_b probe (expected "DPS-FN-B") → ack.id="DPS-FN-B" → Match.
-    let c = carriers(
-        vec![],
-        vec![
-            Ok(ack("DPS-FN-B", vec![0xAA, 0xBB, 0xCC])),
-            Ok(ack("DPS-FN-B", vec![0xAA, 0xBB, 0xCC])),
-        ],
-    );
+    // lastChk for doc_a returns the tip id "DPS-FN-B" → Mismatch.  M2-N4:
+    // "DPS-FN-B" IS doc_b's sfn (a newer submitted doc of ours) → genuine
+    // supersession.  doc_b is NOT probed (drain halts at doc_a) — only one
+    // lastChk response is supplied.
+    let c = carriers(vec![], vec![Ok(ack("DPS-FN-B", vec![0xAA, 0xBB, 0xCC]))]);
     let view = view_for(&c);
 
     let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
         .await
-        .expect("superseded SENT doc MUST NOT halt the FN drain (SEAM-B-3)");
+        .expect("superseded predecessor halts + escalates Manual (no BootError)");
 
-    // Superseded doc held in SENT (no state change); tip advanced to ACK.
+    // Strict-sequential: doc_a held in SENT; doc_b NOT processed (stays SENT).
     assert_eq!(
         read_doc_state(&pool, doc_a).await,
         "SENT",
-        "superseded doc is held in SENT (no state change)"
+        "superseded predecessor is held in SENT (no state change)"
     );
     assert_eq!(
         read_doc_state(&pool, doc_b).await,
-        "ACK",
-        "the tip drains past the superseded sibling (wedge-avoidance)"
+        "SENT",
+        "tip is NOT drained — the strict chain stops at the superseded predecessor"
     );
 
-    // No structural-drift halt audit (the Mismatch was superseded, not drift).
-    assert_eq!(
-        audit_count(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await,
-        0,
-        "superseded Mismatch is NOT structural drift"
-    );
-    // TIP_SUPERSEDED audit emitted for the held doc (boot-parity event/label).
-    assert_eq!(
-        audit_count(&pool, "TIP_SUPERSEDED").await,
-        1,
-        "superseded SENT doc emits the boot-parity TIP_SUPERSEDED audit"
-    );
+    // Mismatch was a genuine supersession, NOT structural drift.
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await, 0);
+    // TIP_SUPERSEDED forensic audit still emitted (records WHY the FN halted).
+    assert_eq!(audit_count(&pool, "TIP_SUPERSEDED").await, 1);
     let sup = audit_latest_payload(&pool, "TIP_SUPERSEDED").await.unwrap();
     assert_eq!(sup["source"], "sent_replay");
     assert_eq!(sup["dps_tip_id"], "DPS-FN-B");
     assert_eq!(sup["doc_lnd"], 1);
     assert_eq!(sup["max_submitted_lnd"], 2);
 
-    // doc_b advanced to ACK via the SentReplay chain; doc_a held at sent.
-    assert_eq!(summary.advanced_to_ack(), 1, "tip advances to Ack");
+    // FN escalated to durable manual-recon on a plain Opened shift (edge 15).
+    let shift_state: String =
+        sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+            .bind(shift_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
-        summary.held_at_sent(),
-        1,
-        "superseded doc recorded as held-at-sent (blocks finalize, conservative)"
+        shift_state, "REQUIRES_MANUAL_RECONCILIATION",
+        "superseded predecessor (non-self-resolving) escalates plain Opened → Manual"
     );
-    assert!(
-        summary.per_doc_failures().is_empty(),
-        "superseded hold is NOT a per-doc failure"
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1
     );
 
-    // Wire send NOT invoked; lastChk probed once per doc.
-    assert_eq!(
-        c.dps.send_chk_count(),
-        0,
-        "no wire-resend on superseded hold"
-    );
+    // No advance; doc_a recorded held-at-sent; only doc_a probed.
+    assert_eq!(summary.advanced_to_ack(), 0, "nothing reaches Ack");
+    assert_eq!(summary.held_at_sent(), 1, "superseded doc recorded held-at-sent");
+    assert_eq!(c.dps.send_chk_count(), 0, "no wire-resend");
     assert_eq!(
         c.dps.last_chk_count(),
-        2,
-        "both SENT docs probed via lastChk"
+        1,
+        "only doc_a probed; doc_b NOT reached (strict halt)"
     );
 
-    // Invariant scan stays clean (contract pin) — two SENT docs with
-    // distinct sfn is benign (mirrors kill_point_matrix M1-02 pin).
+    // Ledger invariant clean (both SENT offline-origin docs are issued).
     prro::db::invariant_scan::assert_clean(&pool).await;
 }
 
@@ -3584,4 +3676,52 @@ async fn w12_kvt2_chain_seed_mismatch_escalates_manual_recon_not_hard_abort() {
         .await
         .unwrap();
     assert_eq!(halt["failure_class"], "chain_seed_mismatch");
+}
+
+/// **M2-N4 (architect ruling, 2026-06-13) — DRAIN side** — a SentReplay
+/// `ServerFiscalIdMismatch` is "superseded" (benign) ONLY if the DPS tip
+/// `actual_id` is the `server_fiscal_no` of one of OUR newer submitted docs.
+/// A FOREIGN/garbage tip — even when a newer submitted doc EXISTS (so the
+/// lnd-only check would call it superseded) — is genuine structural drift →
+/// `BootError::Internal` (NOT a benign SupersededHold).  Mirror of the boot-side
+/// pin `m2_n4_boot_foreign_tip_is_manual_not_superseded`.
+#[tokio::test]
+async fn c5b2_sent_replay_foreign_tip_is_structural_drift_not_superseded() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    // doc_a (lnd=1) + a NEWER submitted doc_b (lnd=2) so the lnd-only check
+    // would mislabel doc_a superseded.  DPS tip for doc_a's probe is FOREIGN.
+    let doc_a =
+        seed_doc_in_state(&pool, 1, 100, session_id, shift_id, "SENT", Some("DPS-FN-A")).await;
+    let _doc_b =
+        seed_doc_in_state(&pool, 2, 101, session_id, shift_id, "SENT", Some("DPS-FN-B")).await;
+
+    // doc_a probe → "DPS-FN-FOREIGN" (NOT our doc_b's sfn) → genuine drift.
+    // (doc_b is never probed — the drift halts the drain at doc_a.)
+    let c = carriers(vec![], vec![Ok(ack("DPS-FN-FOREIGN", vec![0xFF]))]);
+    let view = view_for(&c);
+
+    let err = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .expect_err("foreign tip → structural drift → BootError (M2-N4)");
+    match err {
+        BootError::Internal(msg) => assert!(
+            msg.contains("structural drift")
+                || msg.contains("StructuralDrift")
+                || msg.contains("LastChkIdMismatch"),
+            "BootError MUST reference structural drift; got: {msg}"
+        ),
+        other => panic!("expected BootError::Internal (structural drift); got: {other:?}"),
+    }
+
+    // doc_a held in SENT (drift envelope does not CAS state); NOT superseded.
+    assert_eq!(read_doc_state(&pool, doc_a).await, "SENT");
+    assert_eq!(audit_count(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await, 1);
+    assert_eq!(
+        audit_count(&pool, "TIP_SUPERSEDED").await,
+        0,
+        "a foreign tip is NOT a benign supersession (M2-N4)"
+    );
 }
