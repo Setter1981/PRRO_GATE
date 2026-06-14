@@ -263,6 +263,7 @@ async fn converge_one_doc(
                     "chain_seed_mismatch",
                     0,
                     "CONVERGE_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL",
+                    "CONVERGE_CHAIN_SEED_MISMATCH_NO_SHIFT",
                 )
                 .await?;
                 summary.chain_seed_mismatch_escalated += 1;

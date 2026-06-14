@@ -2378,6 +2378,7 @@ async fn trigger_tier_2_stop_mode(
 /// set without a current_shift_id) → `BootError::Internal`.  The boot-KVT2
 /// NULL-shift edge (a stray KVT2 on a Closed shift) is handled by the caller
 /// (a distinct no-shift audit) BEFORE calling this helper.
+#[allow(clippy::too_many_arguments)] // 8 args — forensic escalation seam (doc/class/position) + the escalate/no-shift event pair
 pub(crate) async fn escalate_fn_to_manual_recon(
     pool: &SqlitePool,
     fiscal_number: &str,
@@ -2386,20 +2387,51 @@ pub(crate) async fn escalate_fn_to_manual_recon(
     failure_class: &str,
     halt_position: usize,
     event_name: &'static str,
+    no_shift_event: &'static str,
 ) -> Result<(), BootError> {
     let from_state = ns.shift_state;
     // Idempotent no-op: already escalated (re-ticking convergence / re-boot).
     if from_state == ShiftState::RequiresManualReconciliation {
         return Ok(());
     }
-    let shift_id: ShiftId = ns.current_shift_id.ok_or_else(|| {
-        BootError::Internal(format!(
-            "escalate_fn_to_manual_recon({fiscal_number}): escalation on \
-             shift_state={state} but node_state.current_shift_id is NULL — \
-             structural drift",
-            state = from_state.as_str(),
-        ))
-    })?;
+    // Non-escalatable shift → operator surface WITHOUT a CAS (NEVER a Forbidden
+    // CAS that would crash the caller).  Two cases collapse here:
+    //   - NULL current_shift_id (freshly-bootstrapped FN / cleared projection); OR
+    //   - a from-state with NO whitelisted RMR edge — notably a STALE
+    //     current_shift_id left dangling on a Closed/Created/Error shift after a
+    //     terminal close (`terminal_close_pins_current_shift_id_behavior`).  A
+    //     Closed→RMR CAS is Forbidden, which would otherwise become a
+    //     BootError::Internal and ABORT the boot doc-loop (W9.4 violation).
+    // Emit a distinct Critical no-shift audit keyed on the doc; doc stays put.
+    let escalatable = ns.current_shift_id.is_some()
+        && shifts::allowed_transition(from_state, ShiftState::RequiresManualReconciliation);
+    if !escalatable {
+        let payload = serde_json::json!({
+            "fiscal_number": fiscal_number,
+            "document_id": hex_lower(failed_doc_id.as_bytes()),
+            "failure_class": failure_class,
+            "current_shift_state": from_state.as_str(),
+            "current_shift_id": ns.current_shift_id.map(|s| hex_lower(s.as_bytes())),
+            "rationale": "no RMR-escalatable shift (NULL or non-whitelisted \
+                          from-state, e.g. a stale pointer on a closed shift); \
+                          doc left in place, operator must reconcile",
+        });
+        audit_log::append(
+            pool,
+            AUDIT_ENTITY_DOC,
+            &hex_lower(failed_doc_id.as_bytes()),
+            no_shift_event,
+            Severity::Critical,
+            None,
+            Some(&payload.to_string()),
+        )
+        .await
+        .map_err(BootError::Database)?;
+        return Ok(());
+    }
+    let shift_id: ShiftId = ns
+        .current_shift_id
+        .expect("escalatable implies current_shift_id is Some");
     let to_state = ShiftState::RequiresManualReconciliation;
 
     let fiscal_number_owned = fiscal_number.to_string();
@@ -2477,6 +2509,9 @@ async fn escalate_drain_to_manual(
         failure_class,
         halt_position,
         "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL",
+        // The drain only escalates active (Opened / pending-drain) shifts, so the
+        // no-shift surface is unreachable here; pass a coherent event for safety.
+        "OFFLINE_DRAIN_HALTED_NO_ESCALATABLE_SHIFT",
     )
     .await
 }
