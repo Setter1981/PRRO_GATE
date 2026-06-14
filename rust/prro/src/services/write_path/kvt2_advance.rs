@@ -103,6 +103,18 @@ pub enum ConfirmError {
         #[source]
         source: anyhow::Error,
     },
+
+    /// `stage_finalize::run` returned a typed
+    /// [`stage_finalize::StageFinalizeError::ChainSeedMismatch`]: the FN chain
+    /// seed (`node_state.last_known_unsigned_xml_sha256`) does not equal this
+    /// online-origin doc's `previous_hash` — a chain-integrity breach
+    /// (AUD-L2-1b).  Kept DISTINCT from `Infrastructure` so the caller can route
+    /// it to a manual-reconciliation operator surface (escalate the FN to
+    /// `RequiresManualReconciliation`) instead of a generic recon-failed that
+    /// aborts the tick / per-doc-isolation-skips silently.  Envelope 1
+    /// (`Kvt1 → Kvt2`) already committed, so the doc rests at `Kvt2`.
+    #[error("kvt2 advance chain seed mismatch for doc {document_id:?}")]
+    ChainSeedMismatch { document_id: DocumentId },
 }
 
 /// Advance a doc through `Kvt2` to terminal `Ack`, driven by the canonical
@@ -203,12 +215,20 @@ pub async fn advance_to_ack(
     // Envelope 2: M3a `stage_finalize::run` owns its 5-write atomic
     // envelope (Kvt2→Ack + chain seed advance + inbox DONE + outbox +
     // STAGE_FINALIZE_ACK).  Acked / AlreadyAcked are both success-shapes.
-    let finalize_outcome =
-        stage_finalize::run(pool, doc_id)
-            .await
-            .map_err(|err| ConfirmError::Infrastructure {
-                source: anyhow::Error::new(err),
-            })?;
+    let finalize_outcome = stage_finalize::run(pool, doc_id)
+        .await
+        .map_err(|err| match err {
+            // AUD-L2-1b: surface the typed chain-seed breach so confirm_drain_doc /
+            // the online worker can escalate to Manual, instead of folding it into a
+            // generic Infrastructure recon-failed.  (`run` returns the typed
+            // StageFinalizeError — same-crate match, no downcast needed.)
+            stage_finalize::StageFinalizeError::ChainSeedMismatch { document_id, .. } => {
+                ConfirmError::ChainSeedMismatch { document_id }
+            }
+            other => ConfirmError::Infrastructure {
+                source: anyhow::Error::new(other),
+            },
+        })?;
     match finalize_outcome {
         stage_finalize::StageFinalizeOutcome::Acked { .. }
         | stage_finalize::StageFinalizeOutcome::AlreadyAcked => Ok(()),

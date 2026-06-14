@@ -692,8 +692,16 @@ pub async fn run(
                                         report_xml: None,
                                     })
                                 }
-                                Err(ConfirmError::StructuralDrift { .. }) => {
-                                    // The doc stays durably at `Sent` (the
+                                Err(ConfirmError::StructuralDrift { .. })
+                                | Err(ConfirmError::ChainSeedMismatch { .. }) => {
+                                    // ChainSeedMismatch (AUD-L2-1b): the online-lane
+                                    // chain-seed breach (the A2.1a seed-fork, deferred
+                                    // to A2.4) — a structural breach like StructuralDrift.
+                                    // This inline lane is DORMANT (UnimplementedWritePath
+                                    // bound in prod), so this is compile-completeness for
+                                    // the new ConfirmError variant; treat as a structural
+                                    // drift (terminalise + 500).
+                                    // The doc stays durably at `Sent`/`Kvt2` (the
                                     // advance envelopes rolled back). Terminalise
                                     // the inbox REJECTED + audit — an INTENTIONAL,
                                     // AUDITED divergence (Sent doc + REJECTED

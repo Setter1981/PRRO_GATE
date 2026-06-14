@@ -1373,6 +1373,19 @@ async fn process_via_stage_send(
                          (kvt2_confirm routing regression)"
                     )))
                 }
+                kvt2_confirm::ConfirmDrainOutcome::ChainSeedMismatch { .. } => {
+                    // **AUD-L2-1b defense-in-depth**: structurally unreachable in
+                    // the offline drain — offline-origin docs skip stage_finalize's
+                    // online-origin seed guard (`offline_fiscal_no.is_none()`), so
+                    // confirm_drain_doc cannot surface ChainSeedMismatch here.  The
+                    // shared ConfirmDrainOutcome forces an arm; route to a manual-
+                    // recon Failed so the drain loop escalates (mirrors the M2-04
+                    // stage_finalize ChainSeedMismatch downcast).
+                    Ok(DocVerdict::Failed {
+                        class: FailureClass::ChainSeedMismatch,
+                        manual_recon: true,
+                    })
+                }
             }
         }
         Ok(StageSendOutcome::Routed {
@@ -1872,6 +1885,17 @@ async fn process_via_lastchk_replay(
             // successor off an unconfirmed predecessor / wedge.
             Ok(DocVerdict::SupersededHeld)
         }
+        kvt2_confirm::ConfirmDrainOutcome::ChainSeedMismatch { .. } => {
+            // **AUD-L2-1b defense-in-depth**: structurally unreachable — SentReplay
+            // uses the bundled envelope path (NOT advance_to_ack), so it never
+            // produces ChainSeedMismatch; and offline-origin docs skip the online-
+            // origin seed guard regardless.  The shared ConfirmDrainOutcome forces
+            // an arm; route to a manual-recon Failed so the drain loop escalates.
+            Ok(DocVerdict::Failed {
+                class: FailureClass::ChainSeedMismatch,
+                manual_recon: true,
+            })
+        }
     }
 }
 
@@ -1976,6 +2000,18 @@ async fn process_via_w12_only(
             // site).  Distinct from the online-convergence tick, which has no
             // chain-head and HOLDS the same outcome (AUD-L5-1 EDIT-D).
             Ok(DocVerdict::SupersededHeld)
+        }
+        kvt2_confirm::ConfirmDrainOutcome::ChainSeedMismatch { .. } => {
+            // **AUD-L2-1b defense-in-depth**: structurally unreachable in the
+            // offline drain — offline-origin docs skip stage_finalize's online-
+            // origin seed guard (`offline_fiscal_no.is_none()`), so
+            // confirm_drain_doc cannot surface ChainSeedMismatch on the
+            // Kvt1Reentry path here.  The shared ConfirmDrainOutcome forces an
+            // arm; route to a manual-recon Failed so the drain loop escalates.
+            Ok(DocVerdict::Failed {
+                class: FailureClass::ChainSeedMismatch,
+                manual_recon: true,
+            })
         }
     }
 }
@@ -2314,42 +2350,56 @@ async fn trigger_tier_2_stop_mode(
     Ok(())
 }
 
-/// W9b C4 manual-escalation seam (spec amendment 2026-05-21 +
+/// Shared FN → Manual-reconciliation escalation seam (AUD-L2-1b; generalised
+/// from the W9b C4 drain seam — spec amendment 2026-05-21 +
 /// `LEGAL_INVARIANTS.md` §INV-19 + spec §6.3).
 ///
 /// In ONE `with_immediate` envelope:
-///   1. CAS `shifts.state: {OpenedLocalPendingDrain |
-///      ClosingLocalPendingDrain} → RequiresManualReconciliation`
-///      (whitelisted edges 6 / 14).
-///   2. UPDATE `node_state.shift_state` for the same FN to mirror the
-///      new shifts row (m3b-shift-state-expansion.md §5 load-bearing
-///      invariant: node_state.shift_state MUST equal the active shift
-///      row's state).
-///   3. Emit `OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL` Critical audit
-///      with full forensic payload.
+///   1. CAS `shifts.state → RequiresManualReconciliation` via
+///      `apply_shift_transition` (whitelisted edges 6 / 14 for pending-drain
+///      shifts, edge 15 for plain `Opened`).
+///   2. mirror `node_state.shift_state` — RS-3 C1: `apply_shift_transition`
+///      owns the shift CAS + projection mirror atomically (m3b §5 invariant).
+///   3. Emit a Critical `event_name` audit with the forensic payload.
 ///
-/// Caller (drain loop) returns the current summary IMMEDIATELY after —
-/// subsequent backlog docs are NOT processed.
+/// Callers: the offline drain (`escalate_drain_to_manual` wrapper, event
+/// `OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL`), the online-convergence tick
+/// (`CONVERGE_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL`), and boot-KVT2
+/// (`BOOT_KVT2_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL`).
 ///
-/// `current_shift_id` is read from the prereqs `NodeStateRow`; if
-/// `None` (structural drift — pending-drain shift_state without a
-/// current_shift_id), surfaces as `BootError::Internal`.
-async fn escalate_drain_to_manual(
+/// **Idempotent**: if `ns.shift_state` is ALREADY
+/// `RequiresManualReconciliation`, returns `Ok(())` with NO re-CAS and NO
+/// re-audit — a re-ticking convergence / re-boot MUST NOT flood the durable
+/// ledger.  The no-op is NARROW (`from == RMR` only); any OTHER non-`Applied`
+/// CAS outcome still surfaces as `BootError::Internal` (the structural-drift
+/// detector is preserved).
+///
+/// `current_shift_id` is read from `ns`; `None` (structural drift — shift_state
+/// set without a current_shift_id) → `BootError::Internal`.  The boot-KVT2
+/// NULL-shift edge (a stray KVT2 on a Closed shift) is handled by the caller
+/// (a distinct no-shift audit) BEFORE calling this helper.
+pub(crate) async fn escalate_fn_to_manual_recon(
     pool: &SqlitePool,
     fiscal_number: &str,
     ns: &crate::db::repositories::node_state::NodeStateRow,
     failed_doc_id: DocumentId,
     failure_class: &str,
     halt_position: usize,
+    event_name: &'static str,
 ) -> Result<(), BootError> {
+    let from_state = ns.shift_state;
+    // Idempotent no-op: already escalated (re-ticking convergence / re-boot).
+    if from_state == ShiftState::RequiresManualReconciliation {
+        return Ok(());
+    }
     let shift_id: ShiftId = ns.current_shift_id.ok_or_else(|| {
         BootError::Internal(format!(
-            "backlog_drain({fiscal_number}): drain-reject escalation on shift_state={state} \
-             but node_state.current_shift_id is NULL — structural drift",
-            state = ns.shift_state.as_str(),
+            "escalate_fn_to_manual_recon({fiscal_number}): escalation on \
+             shift_state={state} but node_state.current_shift_id is NULL — \
+             structural drift",
+            state = from_state.as_str(),
         ))
     })?;
-    let from_state = ns.shift_state;
     let to_state = ShiftState::RequiresManualReconciliation;
 
     let fiscal_number_owned = fiscal_number.to_string();
@@ -2357,8 +2407,7 @@ async fn escalate_drain_to_manual(
     let outcome = with_immediate(pool, move |tx| {
         Box::pin(async move {
             // RS-3 C1: shift CAS + node_state projection mirror via the
-            // single transition-service (was: transition_state + the local
-            // mirror_node_state_shift_state_tx pair).
+            // single transition-service.
             let outcome = shift_transition::apply_shift_transition(
                 tx,
                 &fiscal_number_owned,
@@ -2380,7 +2429,7 @@ async fn escalate_drain_to_manual(
                     tx,
                     "shift",
                     &hex_lower(shift_id.as_bytes()),
-                    "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL",
+                    event_name,
                     Severity::Critical,
                     None,
                     Some(&payload.to_string()),
@@ -2398,13 +2447,38 @@ async fn escalate_drain_to_manual(
 
     if !matches!(outcome, shifts::TransitionOutcome::Applied) {
         return Err(BootError::Internal(format!(
-            "backlog_drain({fiscal_number}): shift {shift_hex} CAS {from:?}→RequiresManualReconciliation \
-             produced {outcome:?} (App reconcile mutex should prevent races)",
+            "escalate_fn_to_manual_recon({fiscal_number}): shift {shift_hex} CAS \
+             {from:?}→RequiresManualReconciliation produced {outcome:?} (App \
+             reconcile mutex should prevent races)",
             shift_hex = hex_lower(shift_id.as_bytes()),
             from = from_state,
         )));
     }
     Ok(())
+}
+
+/// W9b C4 drain manual-escalation wrapper — preserves the
+/// `OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL` event.  Caller (drain loop) returns
+/// the current summary IMMEDIATELY after (subsequent backlog docs are NOT
+/// processed this tick).  See [`escalate_fn_to_manual_recon`].
+async fn escalate_drain_to_manual(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    ns: &crate::db::repositories::node_state::NodeStateRow,
+    failed_doc_id: DocumentId,
+    failure_class: &str,
+    halt_position: usize,
+) -> Result<(), BootError> {
+    escalate_fn_to_manual_recon(
+        pool,
+        fiscal_number,
+        ns,
+        failed_doc_id,
+        failure_class,
+        halt_position,
+        "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL",
+    )
+    .await
 }
 
 // RS-3 C1: the `node_state.shift_state` mirror (m3b §5 load-bearing
