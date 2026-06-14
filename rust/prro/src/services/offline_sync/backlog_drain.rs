@@ -2217,12 +2217,17 @@ async fn trigger_tier_1_prolonged_hold(
 /// `with_immediate` envelope.
 ///
 /// **Effect**: new чек ingress на цю FN rejected at adapter layer
-/// (existing STOP_MODE contract per app.rs:373 + return_online_probe);
-/// existing held docs remain в Sent/Kvt1 з накопиченим counter для
-/// auto-drain post-recovery.  Per operator memory `feedback_manual_
-/// recon_catastrophe`: STOP_MODE is intermediate tier, NOT эскалація
-/// в Manual.  Operator має 36h offline-cap window (до
-/// cert.NotAfter-2160min) для intervention.
+/// (existing STOP_MODE contract).  Existing held docs remain в Sent/Kvt1
+/// з накопиченим counter, але вони **НЕ** auto-drained post-recovery:
+/// `return_online_probe` explicitly SKIPS a STOP_MODE node
+/// (`SkipReason::NodeNotOfflineOrTransition` — the probe only auto-flips
+/// an `Offline` node to `GoingOnline`, never STOP_MODE/Blocked/etc.).
+/// So nothing re-arms the W9 drain on its own.  Per operator memory
+/// `feedback_manual_recon_catastrophe`: STOP_MODE is an intermediate tier
+/// (NOT эскалація в Manual) that REQUIRES operator intervention — the
+/// operator must drive the node back to return-online within the 36h
+/// offline-cap window (до cert.NotAfter-2160min); only then does the W8
+/// probe / W9 drain machinery resume and the held docs drain.
 ///
 /// **Atomicity (I4)**: bundled з audit row.  If CAS fails (missing FN
 /// row — structural breach), tx rolls back → no half-state.
