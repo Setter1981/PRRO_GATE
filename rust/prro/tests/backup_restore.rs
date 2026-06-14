@@ -20,6 +20,7 @@ use prro::db::models::ids::{RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::{open_pool, open_secure_pool};
+use prro::services::offline_sync::backlog_drain;
 use prro::services::reconciliation::{boot_phase, ReconcileGuard, RuntimeView};
 use prro::services::write_path::inline;
 use prro::transports::dps::channel::DpsChannel;
@@ -612,6 +613,27 @@ async fn setup_online_fn(name: &str) -> GuardEnv {
 async fn node_mode(pool: &SqlitePool) -> String {
     sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
         .bind(FN)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Flip the FN to `GoingOnline` — the AUD-L4-1 scenario is an FN recovering
+/// from offline, the ONLY mode in which the offline drain runs
+/// (`backlog_drain.rs:687`).
+async fn set_node_going_online(pool: &SqlitePool) {
+    sqlx::query("UPDATE node_state SET mode = ? WHERE fiscal_number = ?")
+        .bind(NodeMode::GoingOnline)
+        .bind(FN)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn read_doc_state(pool: &SqlitePool, lnd: i64) -> String {
+    sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE fiscal_number = ? AND lnd = ?")
+        .bind(FN)
+        .bind(lnd)
         .fetch_one(pool)
         .await
         .unwrap()
@@ -1328,4 +1350,235 @@ async fn boot_branch_a_fresh_fn_empty_ledger_bootstraps_unchanged() {
         blocked, 0,
         "fresh FN: no false ledger-without-node_state BLOCK"
     );
+}
+
+// ─── Batch B (AUD-L4-1) — tip-guard NotFound on a non-ACK in-flight SENT tip ──
+//     must DEFER to the drain's safe-redrive, not BLOCK the FN.
+
+/// Seed an in-flight offline-origin doc (sfn set) at `state` — the AUD-L4-1
+/// scenario: the FN's newest SUBMITTED tip is a non-ACK in-flight doc.
+async fn seed_inflight_offline_tip(
+    pool: &SqlitePool,
+    lnd: i64,
+    sfn: &str,
+    session: &[u8],
+    state: &str,
+) {
+    let doc_bytes = vec![(lnd as u8) ^ 0x70; 16];
+    let req_bytes = vec![(lnd as u8) ^ 0x71; 16];
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical, server_fiscal_no, offline_fiscal_no, offline_session_id) \
+         VALUES (?, ?, ?, ?, 'SELL', ?, 'b', 't', 'OFFLINE', '2026-01-01T00:00:00Z', '{}', \
+            ?, ?, ?, ?)",
+    )
+    .bind(&doc_bytes)
+    .bind(&req_bytes)
+    .bind(FN)
+    .bind(lnd)
+    .bind(state)
+    .bind(vec![0u8; 32])
+    .bind(sfn)
+    .bind(lnd)
+    .bind(session)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Seed an active OPEN offline session for `FN`.
+async fn seed_open_offline_session(pool: &SqlitePool, session: &[u8]) {
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, 'OPEN', '2026-01-01T00:00:00Z')",
+    )
+    .bind(session)
+    .bind(FN)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn tip_guard_inflight_sent_notfound_defers_to_drain() {
+    let env = setup_online_fn("live.db").await;
+    // ACK#1 (lnd=1, sfn SFN-1) via the proven online path.
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 1, "SFN-1").await;
+    // The AUD-L4-1 scenario: an FN RECOVERING from offline (GoingOnline — the
+    // ONLY mode in which the drain runs) with an active offline session and a
+    // NON-ACK in-flight offline-origin SENT tip (lnd=2, sfn SFN-2), the FN's
+    // newest SUBMITTED doc.
+    set_node_going_online(&env.pool).await;
+    let session = vec![0x5eu8; 16];
+    seed_open_offline_session(&env.pool, &session).await;
+    seed_inflight_offline_tip(&env.pool, 2, "SFN-2", &session, "SENT").await;
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+
+    // ── Phase 1: boot tip-guard. lastChk(SFN-2) → NotFound (the in-flight SENT
+    //    doc never landed at DPS). AUD-L4-1: this MUST DEFER, not BLOCK. ──
+    let stub_tg = DpsStub::new();
+    stub_tg.push_last(Err(DpsError::NotFound));
+    let view_tg = RuntimeView {
+        dps: &stub_tg,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    let outcome = boot_phase::run_boot_tip_guard(&recon_guard(), &env.pool, FN, &view_tg, true)
+        .await
+        .expect("tip-guard runs");
+
+    assert!(
+        matches!(
+            outcome,
+            boot_phase::TipGuardOutcome::DeferredInFlightSent { .. }
+        ),
+        "NotFound on an in-flight SENT tip MUST defer, got {outcome:?}"
+    );
+    // Crucially the node stays GoingOnline (NOT BLOCKED) — so the drain that
+    // owns the safe-redrive is NOT gated out.  (The AUD-L4-1 wedge was: tip-guard
+    // BLOCKs first → the drain's GoingOnline mode-gate then skips the FN forever.)
+    assert_eq!(
+        node_mode(&env.pool).await,
+        "GOING_ONLINE",
+        "an in-flight SENT tip NotFound must NOT block (defer to drain safe-redrive)"
+    );
+    let stale: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'TIP_GUARD_STALE_LEDGER'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(stale, 0, "no stale-ledger BLOCK for an in-flight SENT tip");
+    let deferred: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'TIP_GUARD_DEFERRED_INFLIGHT'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(deferred, 1, "one TIP_GUARD_DEFERRED_INFLIGHT audit");
+
+    // ── Phase 2: the drain now OWNS the deferred SENT doc.  lastChk(SFN-2) →
+    //    NotFound → HIGH-C5-3 safe-redrive (Sent → ER).  This proves the defer
+    //    enables recovery END-TO-END — no permanent wedge (spec §B pin). ──
+    let stub_drain = DpsStub::new();
+    stub_drain.push_last(Err(DpsError::NotFound));
+    let view_drain = RuntimeView {
+        dps: &stub_drain,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    backlog_drain::drain(&recon_guard(), &env.pool, &view_drain, FN)
+        .await
+        .expect("drain runs");
+
+    // The drain was NOT skipped (mode stayed GoingOnline after the defer) ...
+    let skipped: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'OFFLINE_DRAIN_SKIPPED_NOT_GOING_ONLINE'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(skipped, 0, "drain must NOT be gated out after the defer");
+    // ... and safe-redrove the deferred SENT doc to ERROR_RETRYABLE (next tick
+    // re-sends it via Pattern-B) — the SENT doc is no longer stranded.
+    assert_eq!(
+        read_doc_state(&env.pool, 2).await,
+        "ERROR_RETRYABLE",
+        "the deferred SENT doc safe-redrives (Sent → ER), proving no wedge"
+    );
+}
+
+#[tokio::test]
+async fn tip_guard_ack_tail_notfound_still_blocks() {
+    // Preserve the real stale-ledger guard: an ACK tail (no in-flight SENT) +
+    // NotFound is a genuine divergence (DPS lost a doc we confirmed) → BLOCK.
+    let env = setup_online_fn("live.db").await;
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 1, "SFN-1").await;
+
+    let stub = DpsStub::new();
+    stub.push_last(Err(DpsError::NotFound));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let outcome = boot_phase::run_boot_tip_guard(&recon_guard(), &env.pool, FN, &view, true)
+        .await
+        .expect("tip-guard runs");
+
+    assert!(
+        matches!(outcome, boot_phase::TipGuardOutcome::Blocked { .. }),
+        "NotFound on an ACK tail (no in-flight SENT) MUST still BLOCK, got {outcome:?}"
+    );
+    assert_eq!(node_mode(&env.pool).await, "BLOCKED");
+    let crit: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'TIP_GUARD_STALE_LEDGER' AND severity = 'CRITICAL'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        crit, 1,
+        "genuine ACK-tail NotFound still raises the stale-ledger block"
+    );
+}
+
+#[tokio::test]
+async fn tip_guard_kvt1_tail_notfound_still_blocks() {
+    // The defer is SENT-only.  A KVT1 in-flight tip was ALREADY confirmed once by
+    // DPS, so a later lastChk NotFound is a genuine divergence — the drain's
+    // Kvt1Reentry path treats it as fatal StructuralDrift (NOT the safe-redrive),
+    // so the tip-guard must BLOCK, not defer.  Locks the no-over-defer boundary.
+    let env = setup_online_fn("live.db").await;
+    issue_receipt_to_ack_sfn(&env.pool, &env.pool_secure, 1, "SFN-1").await;
+    set_node_going_online(&env.pool).await;
+    let session = vec![0x5eu8; 16];
+    seed_open_offline_session(&env.pool, &session).await;
+    seed_inflight_offline_tip(&env.pool, 2, "SFN-2", &session, "KVT1").await;
+
+    let stub = DpsStub::new();
+    stub.push_last(Err(DpsError::NotFound));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    let outcome = boot_phase::run_boot_tip_guard(&recon_guard(), &env.pool, FN, &view, true)
+        .await
+        .expect("tip-guard runs");
+
+    assert!(
+        matches!(outcome, boot_phase::TipGuardOutcome::Blocked { .. }),
+        "NotFound on a KVT1 (confirmed-once) tip MUST still BLOCK, got {outcome:?}"
+    );
+    assert_eq!(node_mode(&env.pool).await, "BLOCKED");
+    let crit: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'TIP_GUARD_STALE_LEDGER' AND severity = 'CRITICAL'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        crit, 1,
+        "a KVT1-tail NotFound still raises the stale-ledger block"
+    );
+    let deferred: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'TIP_GUARD_DEFERRED_INFLIGHT'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(deferred, 0, "KVT1 is NOT deferred (defer is SENT-only)");
 }

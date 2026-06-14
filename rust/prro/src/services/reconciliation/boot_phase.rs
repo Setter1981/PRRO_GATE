@@ -1589,18 +1589,25 @@ pub async fn run_boot_reconciliation(
         // → the next write either fail-closes on `ux_fd_fn_lnd` OR (sparse
         // history) allocates BELOW the tail and signs with `previous_hash=None`
         // → duplicate lnd / forked MAC chain.  Reconstruct the allocator
-        // (`next_lnd = MAX(lnd)+1`) + project the MAC seed from the last ACK
-        // (finalize leaves the seed = the ACKed doc's `unsigned_xml_sha256`, so
-        // this is unambiguous; `None` when no ACK = genesis), then BLOCK +
-        // CRITICAL: a node whose node_state vanished under it is NOT healthy and
-        // must not silently resume trading.
+        // (`next_lnd = MAX(lnd)+1`) + project the MAC seed from the highest-lnd
+        // EVER-ISSUED doc.  **AUD-L6-1 (FT, 2026-06-14):** project from
+        // `last_issued_unsigned_xml_sha256` (online ACK OR offline-origin that
+        // reached OFFLINE_LOCAL_ACK), NOT the ACK-only `last_ack_…`.  Since M2-01
+        // the seed advances at OFFLINE_LOCAL_ACK for offline-origin docs (and
+        // `stage_finalize` skips the advance for them), so when the FN tail is an
+        // offline-origin doc with lnd > the last online ACK, projecting from the
+        // last ACK is a STALE seed → the next write forks the legal MAC chain.
+        // Shares `OFFLINE_ISSUED_STATES` with the M2-N2b invariant_scan walk, so
+        // the projected seed equals the walk's final `expected`.  `None` when no
+        // issued doc = genesis.  Then BLOCK + CRITICAL: a node whose node_state
+        // vanished under it is NOT healthy and must not silently resume trading.
         if let Some(max_lnd) = fiscal_documents::max_lnd_any_state(pool, fiscal_number).await? {
             let next_lnd = max_lnd + 1;
             let projected_seed: Option<[u8; 32]> =
-                match fiscal_documents::last_ack_unsigned_xml_sha256(pool, fiscal_number).await? {
+                match fiscal_documents::last_issued_unsigned_xml_sha256(pool, fiscal_number).await? {
                     Some(bytes) => Some(<[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
                         anyhow::anyhow!(
-                            "NC-03: last ACK unsigned_xml_sha256 for FN {fiscal_number} is not \
+                            "AUD-L6-1: last issued unsigned_xml_sha256 for FN {fiscal_number} is not \
                              32 bytes — corrupted MAC seed, refusing to project"
                         )
                     })?),
@@ -2006,6 +2013,13 @@ pub enum TipGuardOutcome {
     /// `Unexpected`).  The node is NOT blocked (offline-first: a boot without
     /// network must not block the till); the guard re-runs on the next boot.
     ProbeDeferred { reason: String },
+    /// **AUD-L4-1 (2026-06-14)** — `lastChk` NotFound on a non-ACK in-flight
+    /// `SENT` tip.  This is NOT a stale-ledger divergence: the tip doc was sent
+    /// but never confirmed, and the drain's documented HIGH-C5-3 path safely
+    /// re-sends it (Sent→ER→Pattern-B).  The node is NOT blocked — the guard
+    /// DEFERS to the drain.  BLOCKing here (the pre-fix behaviour) wedged the
+    /// whole FN (the BLOCKED mode-gate then skips the drain) + refused ingress.
+    DeferredInFlightSent { expected: String },
 }
 
 /// PR-B (RS-4 audit pass-2, spec §B) — boot stale-tip guard.
@@ -2145,6 +2159,12 @@ pub async fn run_boot_tip_guard(
             Ok(TipGuardOutcome::TipConsistent)
         }
         ProbeOutcome::Mismatch { actual_id } => {
+            // **AUD-L4-1 re-examined (2026-06-14):** Mismatch STAYS a BLOCK.
+            // `expected` is the FN's NEWEST submitted doc (max lnd), so there is
+            // no NEWER submitted doc of ours — a different DPS tip id is a
+            // genuine divergence (foreign fiscalisation / stale restore), which
+            // the drain itself also treats as fatal `StructuralDrift` (NOT the
+            // safe-redrive).  So BLOCK + CRITICAL is correct and consistent.
             block_on_stale_tip(pool, fiscal_number, &expected, &actual_id, "MISMATCH").await?;
             Ok(TipGuardOutcome::Blocked {
                 expected,
@@ -2152,14 +2172,51 @@ pub async fn run_boot_tip_guard(
             })
         }
         ProbeOutcome::NotFound => {
-            // Non-empty ACK tail but DPS has no record for our FN_sign — same
-            // anomaly class as Mismatch (we hold a confirmed ACK that DPS does
-            // not know about).  BLOCK + CRITICAL.
-            block_on_stale_tip(pool, fiscal_number, &expected, "NotFound", "NOT_FOUND").await?;
-            Ok(TipGuardOutcome::Blocked {
-                expected,
-                observed: "NotFound".to_string(),
-            })
+            // **AUD-L4-1 (2026-06-14):** `expected` is the newest SUBMITTED tip,
+            // which post-ruling-3 may be a non-ACK in-flight `SENT` doc — NOT a
+            // confirmed ACK.  A `lastChk` NotFound on a SENT in-flight tip is the
+            // drain's documented HIGH-C5-3 SAFE re-send (Sent→ER→Pattern-B), NOT
+            // a stale-ledger BLOCK.  The tip-guard runs BEFORE the drain, so
+            // BLOCKing here would wedge the whole FN (the BLOCKED mode-gate then
+            // skips the drain) + refuse ingress.  So DEFER to the drain for a
+            // SENT tip; BLOCK only on a genuine ACK/KVT-tail divergence (DPS lost
+            // a doc it confirmed past the send stage — a real stale ledger).
+            match fiscal_documents::newest_submitted_state(pool, fiscal_number)
+                .await?
+                .as_deref()
+            {
+                Some("SENT") => {
+                    let payload = serde_json::json!({
+                        "fiscal_number": fiscal_number,
+                        "expected_server_fiscal_no": expected,
+                        "rationale":
+                            "boot tip-guard: lastChk NotFound on a non-ACK in-flight SENT tip — \
+                             deferring to the drain's HIGH-C5-3 safe re-send (Sent→ER→Pattern-B), \
+                             NOT a stale-ledger block (AUD-L4-1)",
+                    });
+                    audit_log::append(
+                        pool,
+                        "node_state",
+                        fiscal_number,
+                        "TIP_GUARD_DEFERRED_INFLIGHT",
+                        Severity::Info,
+                        None,
+                        Some(&payload.to_string()),
+                    )
+                    .await?;
+                    Ok(TipGuardOutcome::DeferredInFlightSent { expected })
+                }
+                _ => {
+                    // Genuine ACK/KVT-tail divergence — DPS has no record of a
+                    // doc we confirmed past the send stage.  BLOCK + CRITICAL.
+                    block_on_stale_tip(pool, fiscal_number, &expected, "NotFound", "NOT_FOUND")
+                        .await?;
+                    Ok(TipGuardOutcome::Blocked {
+                        expected,
+                        observed: "NotFound".to_string(),
+                    })
+                }
+            }
         }
         ProbeOutcome::TransportRetry { reason } => {
             // DPS unreachable — offline-first: do NOT block; defer to next boot.
@@ -2258,7 +2315,7 @@ async fn block_on_stale_tip(
                 "expected_server_fiscal_no": expected_owned,
                 "dps_last_chk_id": observed_owned,
                 "rationale":
-                    "boot tip-guard: our last ACK doc's server_fiscal_no diverges from DPS lastChk — the node is behind DPS (stale restore) OR a foreign party fiscalised on this FN; node BLOCKED, no resend, no ledger repair",
+                    "boot tip-guard: our newest SUBMITTED tip's server_fiscal_no diverges from DPS lastChk (AUD-L4-2: the tip is the max-lnd submitted doc, which may be a non-ACK in-flight SENT — but a NotFound on a SENT tip defers to the drain and does NOT reach this block) — the node is behind DPS (stale restore) OR a foreign party fiscalised on this FN; node BLOCKED, no resend, no ledger repair",
             });
             audit_log::append_tx(
                 tx,

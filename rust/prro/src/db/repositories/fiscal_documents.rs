@@ -721,6 +721,30 @@ pub async fn last_submitted_server_fiscal_no(
     .await
 }
 
+/// **AUD-L4-1 (2026-06-14)** — the `state` of the FN's newest SUBMITTED doc: the
+/// SAME max-`lnd` cohort (`{SENT,KVT1,KVT2,ACK}` + non-empty `server_fiscal_no`,
+/// `ORDER BY lnd DESC LIMIT 1`) as [`last_submitted_server_fiscal_no`], so the two
+/// return the (state, sfn) of the SAME tip doc.  The boot tip-guard uses it on a
+/// `lastChk` NotFound to distinguish a non-ACK in-flight `SENT` tip (the drain's
+/// HIGH-C5-3 safe re-send — Sent→ER→Pattern-B — must NOT BLOCK) from a genuine
+/// ACK/KVT-tail divergence (stale ledger — must BLOCK).  `None` ⟺ empty
+/// submitted tail.  Pool-bound read, no write-tx.
+pub async fn newest_submitted_state(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT state FROM fiscal_documents \
+         WHERE fiscal_number = ? AND state IN ('SENT', 'KVT1', 'KVT2', 'ACK') \
+               AND server_fiscal_no IS NOT NULL AND length(server_fiscal_no) > 0 \
+         ORDER BY lnd DESC \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await
+}
+
 /// M1 review item 2(b), 2026-06-11 — the FN's highest **submitted** `lnd`: the
 /// max `lnd` over docs in `{SENT, KVT1, KVT2, ACK}` carrying a non-empty
 /// `server_fiscal_no` (the same "submitted tip" cohort as
@@ -817,14 +841,15 @@ pub async fn max_lnd_any_state(
 }
 
 /// NC-03 — the `unsigned_xml_sha256` of the FN's last ACKed doc (max `lnd` in
-/// state `ACK`).  This is exactly the value the normal flow leaves in
-/// `node_state.last_known_unsigned_xml_sha256`: `stage_finalize` advances the
-/// chain seed to the just-ACKed doc's `unsigned_xml_sha256` (finalize §4), so
-/// projecting the seed from the last ACK is unambiguous.  `None` ⟺ the FN has no
-/// ACKed doc (genesis seed — also the correct projection, since the seed only
-/// advances at ACK).  Boot branch (a) uses this to PROJECT the MAC seed when
-/// reconstructing a node_state row whose row was lost while the ledger survived.
-/// Pool-bound read, no write-tx.
+/// state `ACK`).  ACK-ONLY: it does NOT see an offline-origin tail.
+///
+/// **AUD-L6-1 (2026-06-14): do NOT use this for the boot MAC-seed projection.**
+/// Since M2-01, the seed also advances at `OFFLINE_LOCAL_ACK` for offline-origin
+/// docs (and `stage_finalize` SKIPS the advance for them), so when an FN's true
+/// tip is an offline-origin doc with `lnd` > the last online ACK, the last ACK
+/// is a STALE seed.  Boot branch (a) now uses
+/// [`last_issued_unsigned_xml_sha256`] (the ever-issued tip).  This helper is
+/// retained for any ACK-only consumer; `None` ⟺ no ACKed doc.  Pool-bound read.
 pub async fn last_ack_unsigned_xml_sha256(
     pool: &SqlitePool,
     fiscal_number: &str,
@@ -838,6 +863,63 @@ pub async fn last_ack_unsigned_xml_sha256(
     .bind(fiscal_number)
     .fetch_optional(pool)
     .await?;
+    Ok(row.flatten())
+}
+
+/// **M2-N2b / AUD-L6-1 (architect-locked) — SINGLE SOURCE OF TRUTH** for the
+/// offline-origin states that count as "issued": an offline-origin doc
+/// (`offline_fiscal_no IS NOT NULL`) that EVER reached `OFFLINE_LOCAL_ACK`
+/// advanced the local MAC seed (M2-01), regardless of its later drain outcome.
+/// Shared by the `invariant_scan` MAC-walk issued-set (M2-N2b) AND
+/// [`last_issued_unsigned_xml_sha256`] (AUD-L6-1 boot seed projection) so the two
+/// CANNOT diverge — the boot projection must equal the walk's final `expected`.
+/// Online-origin docs issue ONLY at `ACK` (handled separately, NOT in this set).
+pub const OFFLINE_ISSUED_STATES: [&str; 7] = [
+    "OFFLINE_LOCAL_ACK",
+    "SENT",
+    "KVT1",
+    "ERROR_RETRYABLE",
+    "KVT2",
+    "REJECTED",
+    "REQUIRES_MANUAL_RECONCILIATION",
+];
+
+/// **AUD-L6-1 (FT, 2026-06-14)** — the `unsigned_xml_sha256` of the FN's
+/// highest-`lnd` EVER-ISSUED doc: online `ACK` OR offline-origin in any
+/// [`OFFLINE_ISSUED_STATES`] state (`offline_fiscal_no IS NOT NULL`).  This is
+/// the value the live flow leaves in `node_state.last_known_unsigned_xml_sha256`
+/// once M2-01 advances the seed at OFFLINE_LOCAL_ACK — so boot branch (a) must
+/// project the MAC seed from THIS (not the ACK-only [`last_ack_unsigned_xml_sha256`],
+/// which is stale when the tail is offline-origin).  Result equals the
+/// `invariant_scan` MAC-walk's final `expected` by construction (same issued
+/// predicate + max-lnd).  `None` ⟺ no issued doc (genesis).  Pool-bound read.
+pub async fn last_issued_unsigned_xml_sha256(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<Vec<u8>>> {
+    // Build a PARAMETERISED `IN (?, ?, …)` from the single-source-of-truth
+    // const, then BIND each state — the SQL string carries only `?` placeholders
+    // (no interpolated data), matching the codebase's parameterised style, while
+    // the set still comes solely from `OFFLINE_ISSUED_STATES` so the SQL set and
+    // the invariant_scan walk set cannot drift.
+    let placeholders = OFFLINE_ISSUED_STATES
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT unsigned_xml_sha256 FROM fiscal_documents \
+         WHERE fiscal_number = ? AND unsigned_xml_sha256 IS NOT NULL \
+           AND (state = 'ACK' \
+                OR (offline_fiscal_no IS NOT NULL AND state IN ({placeholders}))) \
+         ORDER BY lnd DESC \
+         LIMIT 1"
+    );
+    let mut query = sqlx::query_scalar::<_, Option<Vec<u8>>>(&sql).bind(fiscal_number);
+    for state in OFFLINE_ISSUED_STATES {
+        query = query.bind(state);
+    }
+    let row: Option<Option<Vec<u8>>> = query.fetch_optional(pool).await?;
     Ok(row.flatten())
 }
 
