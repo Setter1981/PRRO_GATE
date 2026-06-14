@@ -1982,7 +1982,7 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
 ///
 /// **STATUS — regression pin AUD-K8-1 (HIGH), architect-confirmed
 /// 2026-06-14; green since the manual-reconciliation re-entry guard landed
-/// (fix/aud-k8-1).**  Cross-tick companion to M2-N1.  Before the fix this
+/// (#168, fix/aud-k8-1).**  Cross-tick companion to M2-N1.  Before the fix this
 /// panicked on tick 2 at `KpStub.send_chk: empty queue` because the re-tick
 /// re-sent doc3.  Root cause was that `escalate_drain_to_manual` leaves
 /// `node_state.mode = GoingOnline` and the offline session `DRAINING` (it
