@@ -64,10 +64,7 @@ const ALLOWED_EDGES: [(ShiftState, ShiftState); 15] = [
         ShiftState::ClosingLocalPendingDrain,
         ShiftState::RequiresManualReconciliation,
     ), // 14
-    (
-        ShiftState::Opened,
-        ShiftState::RequiresManualReconciliation,
-    ), // 15 (M2-N2a: strict-sequential drain-reject on a plain Opened shift)
+    (ShiftState::Opened, ShiftState::RequiresManualReconciliation), // 15 (M2-N2a: strict-sequential drain-reject on a plain Opened shift)
 ];
 
 /// Drift-guard: spec §11 acceptance #1 locks the edge count.  Any
@@ -189,7 +186,10 @@ async fn whitelist_matrix_15_allowed_66_forbidden_via_transition_state() {
         }
     }
 
-    assert_eq!(applied_count, 15, "spec §4.1: 15 whitelist edges (M2-N2a added 15)");
+    assert_eq!(
+        applied_count, 15,
+        "spec §4.1: 15 whitelist edges (M2-N2a added 15)"
+    );
     assert_eq!(forbidden_count, 9 * 9 - 15, "9*9 - 15 = 66 forbidden pairs");
 }
 

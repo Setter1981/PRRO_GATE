@@ -1660,10 +1660,30 @@ async fn aud_l6_1_boot_projects_seed_from_offline_origin_tip_not_last_ack() {
         .await
         .unwrap();
     // lnd2 + lnd3: offline-origin OFFLINE_LOCAL_ACK, chained off the prior (REAL M2-01 chain).
-    seed_chain_doc(&pool, fn_id, 2, "OFFLINE_LOCAL_ACK", None, Some(h1), h2, Some(1), Some(&session))
-        .await;
-    seed_chain_doc(&pool, fn_id, 3, "OFFLINE_LOCAL_ACK", None, Some(h2), h3, Some(2), Some(&session))
-        .await;
+    seed_chain_doc(
+        &pool,
+        fn_id,
+        2,
+        "OFFLINE_LOCAL_ACK",
+        None,
+        Some(h1),
+        h2,
+        Some(1),
+        Some(&session),
+    )
+    .await;
+    seed_chain_doc(
+        &pool,
+        fn_id,
+        3,
+        "OFFLINE_LOCAL_ACK",
+        None,
+        Some(h2),
+        h3,
+        Some(2),
+        Some(&session),
+    )
+    .await;
     for (code_lnd, doc_byte) in [(1i64, 2u8), (2, 3)] {
         sqlx::query(
             "INSERT INTO offline_codes(fiscal_number, code_lnd, consumed_at, consumed_by_document_id) \
@@ -1683,7 +1703,9 @@ async fn aud_l6_1_boot_projects_seed_from_offline_origin_tip_not_last_ack() {
         .expect("boot branch (a) reconstructs node_state");
 
     // FT pin: the projected seed is the OFFLINE-origin tip (h3), NOT the last ACK (h1).
-    let seed = read_node_seed(&pool, fn_id).await.expect("node_state seed projected");
+    let seed = read_node_seed(&pool, fn_id)
+        .await
+        .expect("node_state seed projected");
     assert_eq!(
         seed,
         h3.to_vec(),

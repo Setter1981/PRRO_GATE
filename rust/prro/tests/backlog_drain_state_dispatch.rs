@@ -1263,11 +1263,27 @@ async fn seam_b3_superseded_predecessor_halts_chain_and_escalates_manual() {
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
 
     // doc_a: lnd=1 — the superseded SENT doc.
-    let doc_a =
-        seed_doc_in_state(&pool, 1, 100, session_id, shift_id, "SENT", Some("DPS-FN-A")).await;
+    let doc_a = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "SENT",
+        Some("DPS-FN-A"),
+    )
+    .await;
     // doc_b: lnd=2 — the FN's newest submitted doc (the DPS lastChk tip).
-    let doc_b =
-        seed_doc_in_state(&pool, 2, 101, session_id, shift_id, "SENT", Some("DPS-FN-B")).await;
+    let doc_b = seed_doc_in_state(
+        &pool,
+        2,
+        101,
+        session_id,
+        shift_id,
+        "SENT",
+        Some("DPS-FN-B"),
+    )
+    .await;
 
     // Genesis-consistent 2-doc chain so `invariant_scan::assert_clean` holds:
     //   doc_a (chain HEAD): previous_hash NULL, unsigned = H_a.
@@ -1322,12 +1338,11 @@ async fn seam_b3_superseded_predecessor_halts_chain_and_escalates_manual() {
     assert_eq!(sup["max_submitted_lnd"], 2);
 
     // FN escalated to durable manual-recon on a plain Opened shift (edge 15).
-    let shift_state: String =
-        sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-            .bind(shift_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(shift_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         shift_state, "REQUIRES_MANUAL_RECONCILIATION",
         "superseded predecessor (non-self-resolving) escalates plain Opened → Manual"
@@ -1339,7 +1354,11 @@ async fn seam_b3_superseded_predecessor_halts_chain_and_escalates_manual() {
 
     // No advance; doc_a recorded held-at-sent; only doc_a probed.
     assert_eq!(summary.advanced_to_ack(), 0, "nothing reaches Ack");
-    assert_eq!(summary.held_at_sent(), 1, "superseded doc recorded held-at-sent");
+    assert_eq!(
+        summary.held_at_sent(),
+        1,
+        "superseded doc recorded held-at-sent"
+    );
     assert_eq!(c.dps.send_chk_count(), 0, "no wire-resend");
     assert_eq!(
         c.dps.last_chk_count(),
@@ -3693,10 +3712,26 @@ async fn c5b2_sent_replay_foreign_tip_is_structural_drift_not_superseded() {
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
     // doc_a (lnd=1) + a NEWER submitted doc_b (lnd=2) so the lnd-only check
     // would mislabel doc_a superseded.  DPS tip for doc_a's probe is FOREIGN.
-    let doc_a =
-        seed_doc_in_state(&pool, 1, 100, session_id, shift_id, "SENT", Some("DPS-FN-A")).await;
-    let _doc_b =
-        seed_doc_in_state(&pool, 2, 101, session_id, shift_id, "SENT", Some("DPS-FN-B")).await;
+    let doc_a = seed_doc_in_state(
+        &pool,
+        1,
+        100,
+        session_id,
+        shift_id,
+        "SENT",
+        Some("DPS-FN-A"),
+    )
+    .await;
+    let _doc_b = seed_doc_in_state(
+        &pool,
+        2,
+        101,
+        session_id,
+        shift_id,
+        "SENT",
+        Some("DPS-FN-B"),
+    )
+    .await;
 
     // doc_a probe → "DPS-FN-FOREIGN" (NOT our doc_b's sfn) → genuine drift.
     // (doc_b is never probed — the drift halts the drain at doc_a.)

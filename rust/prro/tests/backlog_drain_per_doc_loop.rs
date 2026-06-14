@@ -1478,7 +1478,11 @@ async fn strict_sequential_transient_halts_this_tick_then_retries_next_tick() {
         "OFFLINE_LOCAL_ACK",
         "doc_b NOT sent — chain halts at the transient predecessor"
     );
-    assert_eq!(c1.dps.call_count(), 1, "only doc_a reached the wire on tick 1");
+    assert_eq!(
+        c1.dps.call_count(),
+        1,
+        "only doc_a reached the wire on tick 1"
+    );
     assert_eq!(
         audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
         0,

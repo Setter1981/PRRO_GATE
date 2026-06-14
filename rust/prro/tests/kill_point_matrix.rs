@@ -1875,9 +1875,17 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
         let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
         let gate = Arc::new(tokio::sync::Mutex::new(()));
         let guard = gate.lock_owned().await;
-        let outcome = inline::run(&pool, &pool_secure, &stub, &sign_ctx, &fn_sign, &guard, &row)
-            .await
-            .unwrap_or_else(|e| panic!("offline SELL {i} must land OFFLINE_LOCAL_ACK: {e:?}"));
+        let outcome = inline::run(
+            &pool,
+            &pool_secure,
+            &stub,
+            &sign_ctx,
+            &fn_sign,
+            &guard,
+            &row,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("offline SELL {i} must land OFFLINE_LOCAL_ACK: {e:?}"));
         assert_eq!(
             outcome.document_state,
             DocState::OfflineLocalAck,
@@ -1945,12 +1953,11 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
     );
 
     // FN escalated to durable manual-recon via edge 15 (plain Opened, NOT wedged).
-    let shift_state: String =
-        sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-            .bind(shift_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(shift_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
 
     // Ledger clean over the REAL chain incl. the REJECTED offline-origin
