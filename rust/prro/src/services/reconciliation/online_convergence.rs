@@ -38,7 +38,7 @@
 
 use sqlx::SqlitePool;
 
-use crate::db::models::enums::{DocState, NodeMode};
+use crate::db::models::enums::{DocState, NodeMode, ShiftState};
 use crate::db::repositories::fiscal_documents::{self, DocumentRow};
 use crate::db::repositories::node_state;
 use crate::services::offline_sync::kvt2_confirm::{self, ConfirmDrainOutcome, Kvt2ConfirmSource};
@@ -122,6 +122,15 @@ pub async fn run_tick_for_fn(
     };
     if ns.mode != NodeMode::Online {
         return Ok(TickSummary::skipped_mode(fiscal_number));
+    }
+
+    // sweep SW-2 — RMR re-entry guard (AUD-K8-1 parity).  A FN escalated to
+    // shift_state==RMR while mode stayed Online (Batch-C convergence / boot-KVT2
+    // escalation leaves mode) is HALTED until operator resolution — it must NOT
+    // re-probe its resting SENT/KVT1 siblings (wire-traffic on a halted FN).
+    // SELECT-first: return an empty skip BEFORE the pending SELECT (zero wire).
+    if ns.shift_state == ShiftState::RequiresManualReconciliation {
+        return Ok(TickSummary::new(fiscal_number));
     }
 
     // (a) SELECT-first — reuse the read-only pending list and filter to the two
