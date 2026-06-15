@@ -84,10 +84,11 @@ pub enum Op {
     // ── valid ──
     OnlineSell(DpsScript),
     GoOnline(DpsScript),
-    /// Offline issuance is LOCAL (no wire call at issuance); the carried script
-    /// is reserved for the offline doc's later drain interaction and is unused
-    /// at `OFFLINE_LOCAL_ACK` (spec §5: offline_sell consumes a code locally).
-    OfflineSell(DpsScript),
+    /// Offline issuance is LOCAL — no wire call at issuance (spec §5:
+    /// offline_sell consumes a code locally).  The offline doc's later wire
+    /// interaction is driven by the `Drain` op's own `DpsScript`, so this
+    /// variant carries no script.
+    OfflineSell,
     Drain(DpsScript),
     Crash(Stage),
     Reboot,

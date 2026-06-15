@@ -125,7 +125,7 @@ impl RefModel {
     pub fn apply(&mut self, op: &Op) -> ExpectedOutcome {
         match op {
             Op::OnlineSell(script) => self.apply_online_sell(script),
-            Op::OfflineSell(_script) => self.apply_offline_sell(),
+            Op::OfflineSell => self.apply_offline_sell(),
             // Valid transition / drain ops: deterministic prediction is enriched
             // in Task 4 (classified PredictableMutating there); Task 1 defers
             // them to the fault / re-sync oracle.

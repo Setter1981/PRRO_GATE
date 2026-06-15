@@ -80,7 +80,7 @@ fn offline_sell_advances_seed_at_offline_local_ack_and_consumes_code() {
     let mut m = RefModel::new_offline_open_shift(3);
     let seed_before = m.seed;
 
-    let out = m.apply(&Op::OfflineSell(DpsScript::ack_path()));
+    let out = m.apply(&Op::OfflineSell);
 
     let mu = mutation(&out);
     assert_eq!(mu.lnd, 1);
