@@ -19,6 +19,12 @@ mod model;
 #[path = "invariant_fuzzer/op.rs"]
 mod op;
 
+// Task 2: the interpreter reuses the shared `ScriptedDps` + `det_signing_ctx`
+// from `tests/common/` and drives the real seams.
+mod common;
+#[path = "invariant_fuzzer/interp.rs"]
+mod interp;
+
 use prro::db::models::enums::DocState;
 use prro::db::repositories::fiscal_documents::OFFLINE_ISSUED_STATES;
 
