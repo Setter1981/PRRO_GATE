@@ -24,9 +24,14 @@ mod op;
 mod common;
 #[path = "invariant_fuzzer/interp.rs"]
 mod interp;
+// Task 3: the shrink-first op-sequence generator.
+#[path = "invariant_fuzzer/strategy.rs"]
+mod strategy;
 
 use prro::db::models::enums::DocState;
 use prro::db::repositories::fiscal_documents::OFFLINE_ISSUED_STATES;
+
+use proptest::prelude::*;
 
 use model::{ExpectedOutcome, RefModel};
 use op::{DpsScript, Op, Stage};
@@ -227,5 +232,72 @@ fn fault_and_deferred_ops_are_fault_without_mutation() {
             before,
             "{op:?} must not mutate the pure model"
         );
+    }
+}
+
+// ── Task 3 Part B — generator smoke + shrink demonstration ──────────────────
+
+/// Drive one generated `Op` sequence through the interpreter on a fresh DB.
+/// No op may panic or hit `unimplemented!`; out-of-precondition intents degrade
+/// to no-ops (the interpreter classifies admissibility at runtime).
+fn drive_sequence(ops: &[Op]) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+        for op in ops {
+            let _ = interp::run_op(&mut ctx, op).await;
+        }
+    });
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+    /// Acceptance #2: 64 generated sequences over the WHOLE alphabet run through
+    /// the interpreter without a precondition-panic or a reachable
+    /// `unimplemented!` (out-of-precondition intents degrade to no-ops).
+    #[test]
+    fn op_sequences_run_without_panic(ops in strategy::op_sequence()) {
+        drive_sequence(&ops);
+    }
+}
+
+/// Acceptance #3: shrinking demonstrably reduces a forced failure to the
+/// minimal triggering sequence (a single `OnlineSell`).
+#[test]
+fn shrinking_reduces_a_forced_failure_to_minimal() {
+    use proptest::test_runner::{Config, TestError, TestRunner};
+
+    let mut runner = TestRunner::new(Config {
+        cases: 256,
+        ..Config::default()
+    });
+    let result = runner.run(&strategy::op_sequence(), |ops| {
+        // Forced failure: any sequence containing an OnlineSell "fails".
+        prop_assert!(
+            !ops.iter().any(|op| matches!(op, Op::OnlineSell(_))),
+            "forced failure: sequence contains an OnlineSell"
+        );
+        Ok(())
+    });
+
+    match result {
+        Err(TestError::Fail(_, minimal)) => {
+            assert_eq!(
+                minimal.len(),
+                1,
+                "shrinking reduced the counterexample to one op, got {}: {minimal:?}",
+                minimal.len()
+            );
+            assert!(
+                matches!(minimal[0], Op::OnlineSell(_)),
+                "the minimal repro is the single trigger op, got {:?}",
+                minimal[0]
+            );
+        }
+        other => panic!("expected a shrunk TestError::Fail, got {other:?}"),
     }
 }
