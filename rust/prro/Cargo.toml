@@ -163,6 +163,12 @@ quote = "1"
 # Std + fmt only.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
 
+# Invariant fuzzer (Phase 0) — model-based stateful property testing of the
+# write-path.  Added in Task 0 as the prerequisite dev-dep; first consumed in
+# Task 1 (the `Op`-sequence generator / shrinker).  See
+# `docs/superpowers/plans/2026-06-15-invariant-fuzzer-phase0.md`.
+proptest = "1"
+
 [build-dependencies]
 # M2 W3 compiles the production DPS proto into a client + test mock server.
 tonic-build = "0.12"
