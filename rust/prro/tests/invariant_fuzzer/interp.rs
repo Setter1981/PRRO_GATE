@@ -299,8 +299,8 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
         Op::Drain(script) => drain_op(ctx, script).await,
         Op::Reboot => reboot(ctx).await,
         // ── crash (wire stages only — drop-injection) ──
-        Op::Crash(Stage::Send) => crash_at_send(ctx).await,
-        Op::Crash(Stage::Kvt1) => crash_at_kvt1(ctx).await,
+        Op::Crash(Stage::Send) => crash_via_drop(ctx, Stage::Send).await,
+        Op::Crash(Stage::Kvt1) => crash_via_drop(ctx, Stage::Kvt1).await,
         // non-wire crash stages need stage-composition; deferred — see plan §4
         // follow-up.  The generator never emits these (Crash drawn from
         // {Send, Kvt1} only), so this arm is NOT reachable from op_sequence().
@@ -342,19 +342,34 @@ async fn online_sell(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
     }
 }
 
-/// `Crash(Send)` → drop-injection: hang `ScriptedDps` on the `send_chk` await
-/// (SENDING already committed), then drop the `inline::run` future — the
-/// "crash" mid-wire (kill-matrix K3, spec §4).  No timing hooks inside a
-/// `with_immediate`.
-async fn crash_at_send(ctx: &mut FuzzCtx) -> RealOutcome {
+/// Drop-injection crash on a wire stage (kill-matrix K3/K4, spec §4): hang
+/// `ScriptedDps` on the wire await, then drop the `inline::run` future — the
+/// "crash" mid-wire.  No timing hooks inside a `with_immediate`.
+///
+/// `Stage::Send` hangs `send_chk` (SENDING committed when reached).  `Stage::Kvt1`
+/// pushes a successful send first (so Sending→Sent commits), then hangs the
+/// `last_chk` confirm (SENT committed when reached).
+///
+/// Robust to out-of-precondition: if the wire is never reached (e.g. the shift
+/// was closed earlier in the sequence so `inline::run` refuses before any wire
+/// call), the future COMPLETES instead of hanging — that is a refusal / no-op,
+/// not a crash, and is reported as such (no panic).
+async fn crash_via_drop(ctx: &mut FuzzCtx, stage: Stage) -> RealOutcome {
     let row = ctx.seed_inbox_sell().await;
     let dps = ctx.new_dps();
     let (reached_tx, reached_rx) = oneshot::channel::<()>();
     let (block_tx, block_rx) = oneshot::channel::<()>();
-    dps.hang_send(reached_tx, block_rx);
+    match stage {
+        Stage::Send => dps.hang_send(reached_tx, block_rx),
+        Stage::Kvt1 => {
+            dps.push_send(Ok(ack(SERVER_FISCAL_NO, Vec::new()))); // send Ok → Sending→Sent
+            dps.hang_last(reached_tx, block_rx);
+        }
+        other => unreachable!("crash_via_drop handles only wire stages; got {other:?}"),
+    }
 
     let guard = ctx.gate.clone().lock_owned().await;
-    {
+    let completed = {
         let mut fut = Box::pin(inline::run(
             &ctx.pool,
             &ctx.pool_secure,
@@ -365,17 +380,20 @@ async fn crash_at_send(ctx: &mut FuzzCtx) -> RealOutcome {
             &row,
         ));
         tokio::select! {
-            _ = &mut fut => panic!("Crash(Send): inline::run must hang on send_chk, not complete"),
-            _ = reached_rx => { /* send_chk await reached ⇒ SENDING already committed */ }
+            res = &mut fut => Some(res),          // wire never reached → not a crash
+            _ = reached_rx => { drop(fut); None } // wire await reached → crash (drop the future)
         }
-        drop(fut); // cancel the parked send_chk await — the "crash" mid-wire
-    }
-    let _keep_block_tx = block_tx; // keep the block sender alive until after the drop
+    };
+    let _keep_block_tx = block_tx; // keep the block sender alive past the drop
     drop(guard);
 
-    RealOutcome::Crashed {
-        stage: Stage::Send,
-        committed_state: ctx.observe_doc_state_by_request_id(&row.request_id).await,
+    match completed {
+        None => RealOutcome::Crashed {
+            stage,
+            committed_state: ctx.observe_doc_state_by_request_id(&row.request_id).await,
+        },
+        Some(Ok(_)) => RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await),
+        Some(Err(e)) => RealOutcome::Refused(format!("{e:?}")),
     }
 }
 
@@ -383,8 +401,15 @@ async fn crash_at_send(ctx: &mut FuzzCtx) -> RealOutcome {
 /// (`deps = None`, no wire call), matching kill-matrix K3; deps-bearing reboot
 /// (SENT-probe arms) is added when Task 3 sequences it.
 async fn reboot(ctx: &mut FuzzCtx) -> RealOutcome {
+    // Pass deps so probe-requiring recovery arms (e.g. a SENT doc from a prior
+    // Crash(Kvt1)) can run.  The probe dps has empty queues: a SENDING-arm
+    // recovery makes no wire call (ctx-free → ERROR_RETRYABLE), while a Sent
+    // probe's last_chk on the empty queue returns a typed Err the boot path
+    // handles — never a panic.
+    let dps = ctx.new_dps();
     let guard = drain_test_guard();
-    match boot_phase::run_boot_reconciliation(&guard, &ctx.pool, &ctx.fn_id, None).await {
+    let view = ctx.view(&dps);
+    match boot_phase::run_boot_reconciliation(&guard, &ctx.pool, &ctx.fn_id, Some(&view)).await {
         Ok(branch) => RealOutcome::Recovered {
             branch: format!("{branch:?}"),
         },
@@ -460,44 +485,6 @@ async fn drain_op(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
             ),
         },
         Err(e) => RealOutcome::Refused(format!("drain: {e:?}")),
-    }
-}
-
-/// `Crash(Kvt1)` → drop-injection on the `last_chk` await (the online_confirm
-/// step).  `push_send` first lets the send commit `Sending → Sent`; `hang_last`
-/// then parks the confirm — so SENT is durably committed when `reached` fires
-/// (kill-matrix K4, spec §4).
-async fn crash_at_kvt1(ctx: &mut FuzzCtx) -> RealOutcome {
-    let row = ctx.seed_inbox_sell().await;
-    let dps = ctx.new_dps();
-    dps.push_send(Ok(ack(SERVER_FISCAL_NO, Vec::new()))); // send Ok → Sending → Sent committed
-    let (reached_tx, reached_rx) = oneshot::channel::<()>();
-    let (block_tx, block_rx) = oneshot::channel::<()>();
-    dps.hang_last(reached_tx, block_rx);
-
-    let guard = ctx.gate.clone().lock_owned().await;
-    {
-        let mut fut = Box::pin(inline::run(
-            &ctx.pool,
-            &ctx.pool_secure,
-            &dps,
-            &ctx.sign_ctx,
-            &ctx.fn_sign,
-            &guard,
-            &row,
-        ));
-        tokio::select! {
-            _ = &mut fut => panic!("Crash(Kvt1): inline::run must hang on last_chk, not complete"),
-            _ = reached_rx => { /* lastChk await reached ⇒ Sending→Sent already committed */ }
-        }
-        drop(fut);
-    }
-    let _keep_block_tx = block_tx;
-    drop(guard);
-
-    RealOutcome::Crashed {
-        stage: Stage::Kvt1,
-        committed_state: ctx.observe_doc_state_by_request_id(&row.request_id).await,
     }
 }
 
