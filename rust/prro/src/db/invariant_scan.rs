@@ -101,6 +101,18 @@ pub enum Violation {
     /// leak).  Widened (M2-X3, 2026-06-12) from `OFFLINE_LOCAL_ACK`-only to the
     /// full cohort state set, hence the rename from `…OfflineLocalAckWithout…`.
     OfflineOriginWithoutSession { document_id_hex: String },
+    /// **SW-5b (M1-M2 cross-class re-pass, 2026-06-15)** — Mirror-1 desync:
+    /// `node_state.shift_state` != the active `shifts.state` for
+    /// `current_shift_id`.  The m3b §5 load-bearing mirror invariant
+    /// (`node_state.shift_state` MUST equal the active shift row's state) — this
+    /// closes the only uncovered load-bearing mirror (Mirror-2 = check 6d,
+    /// Mirror-3 = check 5).  Defense-in-depth + forward-compat: catches a desync
+    /// when the §16.7 operator-force seam (SW-5a) is wired.
+    ShiftStateMirrorDrift {
+        fiscal_number: String,
+        node_state_shift_state: String,
+        shifts_state: String,
+    },
 }
 
 fn hex32_opt(b: &Option<Vec<u8>>) -> String {
