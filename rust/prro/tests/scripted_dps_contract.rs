@@ -81,7 +81,9 @@ async fn call_log_records_calls_in_wire_order_with_envelope_metadata() {
     stub.push_send(Ok(ack("SFN-2")));
 
     stub.send_chk(envelope(7)).await.expect("send 1");
-    stub.last_chk(&CheckSignBlob(vec![0xAB])).await.expect("last");
+    stub.last_chk(&CheckSignBlob(vec![0xAB]))
+        .await
+        .expect("last");
     stub.send_chk(envelope(8)).await.expect("send 2");
 
     let log = stub.calls();
@@ -122,7 +124,9 @@ async fn hang_on_send_is_reached_and_released_controllably() {
 
     // Controlled release: resolving the block oneshot lets the parked await
     // proceed and return the queued response.
-    block_tx.send(()).expect("block receiver still alive (call is parked)");
+    block_tx
+        .send(())
+        .expect("block receiver still alive (call is parked)");
 
     let res = handle.await.expect("spawned send_chk task joins");
     assert!(
