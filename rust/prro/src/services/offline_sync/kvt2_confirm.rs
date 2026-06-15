@@ -553,6 +553,17 @@ pub enum ConfirmDrainOutcome {
     /// predecessor is unsafe in the strict M2-01 chain).  Resolution of the
     /// superseded doc is owned by B1-v2 doc-scoped confirmation (future).
     SupersededHeld,
+    /// **AUD-L2-1b (2026-06-14)** — the Envelope 2 (`stage_finalize::run`,
+    /// `Kvt2 → Ack`) step returned `ChainSeedMismatch`: the FN chain seed does
+    /// not equal this online-origin doc's `previous_hash` (chain-integrity
+    /// breach).  Envelope 1 (`Kvt1 → Kvt2`) already committed, so the doc rests
+    /// at `Kvt2`.  NON-fatal outcome (NOT a `BootError`) so the caller routes it
+    /// to a manual-reconciliation match-arm instead of per-doc isolation:
+    /// convergence + boot escalate the FN to Manual; the offline-drain consumers
+    /// map it to a manual-recon `DocVerdict::Failed` (defense-in-depth — offline-
+    /// origin docs skip stage_finalize's online-origin seed guard, so this is
+    /// structurally unreachable in the drain).
+    ChainSeedMismatch { document_id: DocumentId },
 }
 
 /// W12 high-level helper — orchestrates the full Sent-source W12
@@ -750,7 +761,7 @@ pub(crate) async fn confirm_drain_doc(
             // (drain-specific lifecycle — plan §412; not runtime-neutral).
             match source {
                 Kvt2ConfirmSource::SentFresh | Kvt2ConfirmSource::Kvt1Reentry => {
-                    kvt2_advance::advance_to_ack(
+                    match kvt2_advance::advance_to_ack(
                         pool,
                         doc_id,
                         kvt1_raw_bytes,
@@ -759,8 +770,17 @@ pub(crate) async fn confirm_drain_doc(
                         attempt_no,
                     )
                     .await
-                    .map_err(|err| map_confirm_error(err, &fiscal_number))?;
-                    Ok(ConfirmDrainOutcome::Advanced)
+                    {
+                        Ok(()) => Ok(ConfirmDrainOutcome::Advanced),
+                        // **AUD-L2-1b**: a chain-seed breach is a NON-fatal
+                        // escalation outcome, not a per-doc-isolation Err — route
+                        // it to the caller's manual-recon match-arm (the doc rests
+                        // at Kvt2; Envelope 1 committed before the finalize guard).
+                        Err(kvt2_advance::ConfirmError::ChainSeedMismatch { document_id }) => {
+                            Ok(ConfirmDrainOutcome::ChainSeedMismatch { document_id })
+                        }
+                        Err(other) => Err(map_confirm_error(other, &fiscal_number)),
+                    }
                 }
                 Kvt2ConfirmSource::SentReplay => {
                     let trace_attempt_no = sent_replay_trace_attempt_no
@@ -1107,6 +1127,16 @@ pub(crate) async fn confirm_drain_doc(
 fn map_confirm_error(err: kvt2_advance::ConfirmError, fiscal_number: &str) -> BootError {
     match err {
         kvt2_advance::ConfirmError::StructuralDrift { detail } => BootError::Internal(detail),
+        // **AUD-L2-1b**: ChainSeedMismatch is intercepted as a non-fatal
+        // `ConfirmDrainOutcome::ChainSeedMismatch` in `confirm_drain_doc` BEFORE
+        // this map is reached; arriving here is a routing regression — fail-loud.
+        kvt2_advance::ConfirmError::ChainSeedMismatch { document_id } => {
+            BootError::Internal(format!(
+                "map_confirm_error({fiscal_number}): ChainSeedMismatch for doc \
+                 {document_id:?} reached the error map — must be intercepted as \
+                 ConfirmDrainOutcome::ChainSeedMismatch by confirm_drain_doc"
+            ))
+        }
         kvt2_advance::ConfirmError::Database { source }
         | kvt2_advance::ConfirmError::Infrastructure { source } => {
             BootError::ReconciliationFailed {

@@ -24,6 +24,7 @@ use prro::db::models::ids::{DocumentId, RequestId, ShiftId};
 use prro::db::repositories::document_files::{self, DocumentFileKind};
 use prro::db::repositories::fiscal_documents::{self, TransitionOutcome};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
+use prro::db::repositories::node_state;
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::tx::with_immediate;
 use prro::db::{open_pool, open_secure_pool};
@@ -280,6 +281,14 @@ async fn read_doc_state_by_lnd(pool: &SqlitePool, lnd: i64) -> String {
 async fn count_audit_events(pool: &SqlitePool, event_type: &str) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE event_type = ?")
         .bind(event_type)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn read_shift_state(pool: &SqlitePool, shift_id: ShiftId) -> String {
+    sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(shift_id)
         .fetch_one(pool)
         .await
         .unwrap()
@@ -851,4 +860,75 @@ async fn tick_counts_mismatch_escalation_as_not_converged() {
     );
     assert_eq!(count_doc_rows(&pool).await, 1);
     prro::db::invariant_scan::assert_clean(&pool).await;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// AUD-L2-1b (convergence consumer) — a resting online KVT1 whose stage_finalize
+// hits a ChainSeedMismatch (tampered node_state seed) ESCALATES the FN to Manual,
+// instead of being lost as a generic Infrastructure error + a silent per-doc
+// isolation skip (summary.errors++, shift untouched).
+//
+// On main this FAILS: advance_to_ack blanket-maps EVERY StageFinalizeError into
+// ConfirmError::Infrastructure → map_confirm_error → BootError::ReconciliationFailed
+// → online_convergence per-doc isolation (summary.errors += 1), so a chain-integrity
+// breach gets NO operator surface and the shift stays Opened.  AUD-L2-1b threads a
+// typed ConfirmError::ChainSeedMismatch → ConfirmDrainOutcome::ChainSeedMismatch →
+// the convergence arm escalates via the shared escalate_fn_to_manual_recon.
+//
+// NB: no assert_clean — the tampered seed is a deliberate chain-integrity breach
+// (exactly the condition under escalation); invariant_scan rightly flags it.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn tick_chain_seed_mismatch_escalates_manual() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(&pool, NodeMode::Online, shift_id).await;
+
+    let (send_calls, last_calls) = seed_counters();
+    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold → SENT
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // KVT1 confirm Match
+
+    build_resting_sent(&pool, &pool_secure, &stub).await;
+    manual_advance_sent_to_kvt1(&pool).await; // online-origin KVT1 (offline_fiscal_no NULL)
+
+    // Tamper the chain seed AFTER the doc was signed (its previous_hash is the
+    // pre-doc genesis seed) so stage_finalize's online-origin seed guard breaks
+    // (ns.last_known_unsigned_xml_sha256 != doc.previous_hash) on the ACK step.
+    node_state::seed_prevhash(&pool, FN, &[0xFF; 32])
+        .await
+        .expect("seed tamper");
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    let summary = run_tick_for_fn(&pool, &view, FN)
+        .await
+        .expect("tick returns Ok (per-doc isolation does not abort the tick)");
+
+    // Desired (AUD-L2-1b): the chain-seed breach ESCALATES the FN to Manual with a
+    // Critical operator audit — NOT a silent per-doc-isolation skip.
+    assert_eq!(
+        read_shift_state(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "ChainSeedMismatch escalates the FN shift to Manual"
+    );
+    assert_eq!(
+        count_audit_events(&pool, "CONVERGE_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL").await,
+        1,
+        "exactly one Critical convergence-escalation audit"
+    );
+    assert_eq!(
+        summary.errors, 0,
+        "ChainSeedMismatch is an escalation outcome, not a per-doc isolation error"
+    );
+    assert_eq!(send_calls.load(Ordering::SeqCst), 1, "tick does NOT send");
 }

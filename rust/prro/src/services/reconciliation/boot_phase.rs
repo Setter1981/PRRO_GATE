@@ -3578,6 +3578,45 @@ async fn dispatch_pending_doc(
             // BOOT_KVT2_DISPATCH_FAILED audit).
             match crate::services::write_path::stage_finalize::run(pool, doc_id).await {
                 Ok(_) => histogram.kvt2_finalized += 1,
+                // **AUD-L2-1b**: a typed ChainSeedMismatch (chain-integrity breach)
+                // gets a manual-reconciliation operator surface, instead of the
+                // generic Warning-only BOOT_KVT2_DISPATCH_FAILED.  ChainSeedMismatch
+                // is produced ONLY for online-origin docs (stage_finalize's seed
+                // guard is gated `offline_fiscal_no.is_none()`), so reaching it here
+                // implies an online-origin Kvt2.  escalate_fn_to_manual_recon owns
+                // the shift / no-shift split internally — incl. a STALE
+                // current_shift_id dangling on a Closed/Created/Error shift (a
+                // non-whitelisted RMR source).  It NEVER attempts a Forbidden CAS,
+                // so it cannot abort the boot doc-loop (W9.4 per-doc isolation).
+                // `e` is used by the guard; the body delegates fully to the helper.
+                Err(e)
+                    if matches!(
+                        &e,
+                        crate::services::write_path::stage_finalize::StageFinalizeError::ChainSeedMismatch { .. }
+                    ) =>
+                {
+                    let ns = crate::db::repositories::node_state::get(pool, &doc.fiscal_number)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "boot-KVT2 ChainSeedMismatch escalation: node_state row \
+                                 missing for {}",
+                                doc.fiscal_number
+                            )
+                        })?;
+                    crate::services::offline_sync::backlog_drain::escalate_fn_to_manual_recon(
+                        pool,
+                        &doc.fiscal_number,
+                        &ns,
+                        doc_id,
+                        "chain_seed_mismatch",
+                        0,
+                        "BOOT_KVT2_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL",
+                        "BOOT_KVT2_CHAIN_SEED_MISMATCH_NO_SHIFT",
+                    )
+                    .await?;
+                    histogram.kvt2_failed += 1;
+                }
                 Err(e) => {
                     let payload = serde_json::json!({
                         "document_id": hex_lower(doc_id.as_bytes()),

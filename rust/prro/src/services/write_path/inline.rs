@@ -4,6 +4,13 @@
 //! `InlineWritePath`) is flipped in A2.4, so nothing here is reachable from a
 //! live request yet. See `docs/superpowers/plans/2026-06-09-rs3-a2-1b-core-impl.md`.
 //!
+//! **A2.4 ACTIVATION PREREQUISITE (AUD-L2-1a)**: before that binding flip,
+//! resolve the online-lane chain SEED-FORK — the seed advances only at
+//! `stage_finalize` (ACK), so two online SELLs resting at `SENT` fork the chain
+//! (doc2 signs against the stale pre-doc1 seed).  Gate: un-#[ignore]
+//! `tests/kill_point_matrix.rs::m1_02_online_seed_fork_a24_prerequisite` (a RED
+//! pin today).  Barrier mirrored at `runtime::supervisor` (the binding site).
+//!
 //! ## Online `Sent → ACK` confirm (Q1 = option b, operator-signed)
 //!
 //! `stage_send::run` reaches `Sent { server_fiscal_no, attempt_no }` but
@@ -692,8 +699,16 @@ pub async fn run(
                                         report_xml: None,
                                     })
                                 }
-                                Err(ConfirmError::StructuralDrift { .. }) => {
-                                    // The doc stays durably at `Sent` (the
+                                Err(ConfirmError::StructuralDrift { .. })
+                                | Err(ConfirmError::ChainSeedMismatch { .. }) => {
+                                    // ChainSeedMismatch (AUD-L2-1b): the online-lane
+                                    // chain-seed breach (the A2.1a seed-fork, deferred
+                                    // to A2.4) — a structural breach like StructuralDrift.
+                                    // This inline lane is DORMANT (UnimplementedWritePath
+                                    // bound in prod), so this is compile-completeness for
+                                    // the new ConfirmError variant; treat as a structural
+                                    // drift (terminalise + 500).
+                                    // The doc stays durably at `Sent`/`Kvt2` (the
                                     // advance envelopes rolled back). Terminalise
                                     // the inbox REJECTED + audit — an INTENTIONAL,
                                     // AUDITED divergence (Sent doc + REJECTED

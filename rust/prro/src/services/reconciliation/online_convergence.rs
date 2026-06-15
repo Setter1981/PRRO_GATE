@@ -73,6 +73,10 @@ pub struct TickSummary {
     pub superseded_held_kvt1: usize,
     /// Per-doc errors that were logged-and-skipped (isolation).
     pub errors: usize,
+    /// `KVT1`/`SENT` confirm hit a `ChainSeedMismatch` (chain-integrity breach)
+    /// and the FN was escalated to `RequiresManualReconciliation` (AUD-L2-1b) —
+    /// a distinct operator signal vs `errors` (per-doc isolation skips).
+    pub chain_seed_mismatch_escalated: usize,
 }
 
 impl TickSummary {
@@ -233,6 +237,36 @@ async fn converge_one_doc(
                 // same outcome), so we simply HOLD and count a distinct
                 // dashboard signal.  No doc-state change here.
                 summary.superseded_held_kvt1 += 1;
+            }
+            ConfirmDrainOutcome::ChainSeedMismatch { document_id } => {
+                // **AUD-L2-1b (2026-06-14)**: the Kvt2→Ack step hit a chain-seed
+                // breach (node_state seed != doc.previous_hash, online-origin).
+                // confirm_drain_doc committed Envelope 1 (Kvt1→Kvt2) and rolled
+                // back the finalize, so the doc rests at KVT2.  Escalate the FN to
+                // Manual (durable operator surface) instead of a silent per-doc
+                // isolation skip.  Re-read node_state for the shift context (the
+                // tick's `ns` is not threaded down here); escalate is idempotent
+                // so a re-ticking FN already at RMR is a clean no-op.
+                let ns = node_state::get(pool, &fiscal_number)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "online-convergence: node_state row vanished for \
+                         {fiscal_number} during ChainSeedMismatch escalation"
+                        )
+                    })?;
+                crate::services::offline_sync::backlog_drain::escalate_fn_to_manual_recon(
+                    pool,
+                    &fiscal_number,
+                    &ns,
+                    document_id,
+                    "chain_seed_mismatch",
+                    0,
+                    "CONVERGE_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL",
+                    "CONVERGE_CHAIN_SEED_MISMATCH_NO_SHIFT",
+                )
+                .await?;
+                summary.chain_seed_mismatch_escalated += 1;
             }
         }
     }
