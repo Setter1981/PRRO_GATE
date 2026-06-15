@@ -2910,7 +2910,8 @@ async fn boot_skips_rmr_but_online_fn_no_redrive() {
         .await
         .expect("boot reconciliation returns Ok (RMR FN skipped, not re-driven)");
 
-    // GREEN: a halted (RMR) FN is NOT re-driven by boot — 0 wire, doc untouched.
+    // GREEN: a halted (RMR) FN is NOT re-driven by boot — doc untouched, no
+    // ADDITIONAL wire beyond construction.
     assert_eq!(
         read_doc_state(&pool, FN).await,
         "SENT",
@@ -2918,8 +2919,8 @@ async fn boot_skips_rmr_but_online_fn_no_redrive() {
     );
     assert_eq!(
         last_calls.load(Ordering::SeqCst),
-        0,
-        "no last_chk probe on a halted (RMR) FN"
+        1,
+        "only the construction Hold lastChk — boot does NOT re-probe a halted (RMR) FN"
     );
     assert_eq!(
         send_calls.load(Ordering::SeqCst),
