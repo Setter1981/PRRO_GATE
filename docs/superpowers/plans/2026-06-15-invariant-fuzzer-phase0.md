@@ -49,8 +49,12 @@ two `KpStub`s have today (the K-tests + convergence tests are the regression net
 - [ ] `ScriptedDps` lives in `tests/common/`; both old `KpStub` definitions deleted.
 - [ ] `kill_point_matrix.rs` + `online_convergence_tick.rs` use it; all their tests pass unchanged.
 - [ ] `proptest` in `[dev-dependencies]`.
+- [ ] **Direct `ScriptedDps` contract tests (audit, not just reliance on K/convergence tests):**
+  (a) an unexpected/over-call returns the deterministic typed error (NOT a panic);
+  (b) the call log preserves wire order + envelope metadata (the spy records calls in sequence);
+  (c) hang-on-call is actually reached and is released controllably (the cancellation-injection hook works).
 
-**Verify:** `cargo nextest run -p prro --features test-support` → same pass count as pre-change (regression net), fmt+clippy clean.
+**Verify:** `cargo nextest run -p prro --features test-support` → same pass count as pre-change (regression net) + the 3 new `ScriptedDps` tests green, fmt+clippy clean.
 
 **TDD note:** this is a refactor — the EXISTING K/convergence tests ARE the RED/GREEN net (they must stay
 green across the swap). Commit the `ScriptedDps` extract + both call-site swaps together; if any K-test
@@ -69,10 +73,18 @@ ledger, reusing the gateway's issued-set predicate.
 
 **Interface:**
 - `enum Op` — valid: `OnlineSell`, `GoOnline`, `OfflineSell`, `Drain`, `Crash(Stage)`, `Reboot`; a
-  `DpsResp` axis (Ack/Reject/Timeout/Superseded/BadHashPrev/NotFound) carried on the ops that hit the
-  wire; invalid/re-entry: `RepeatDrain`, `RepeatReboot`, `DuplicateIdemKey`, `GoOnlineWithoutBacklog`,
-  `OfflineSellDuringGoingOnline`, `SellWithClosedShift`. (NO `GoOffline` op — offline is fixture-seeded,
-  per spec §5.)
+  **`DpsScript`** carried on the wire-hitting ops; invalid/re-entry: `RepeatDrain`, `RepeatReboot`,
+  `DuplicateIdemKey`, `GoOnlineWithoutBacklog`, `OfflineSellDuringGoingOnline`, `SellWithClosedShift`.
+  (NO `GoOffline` op — offline is fixture-seeded, per spec §5.)
+- **`DpsScript` — NOT a single `DpsResp` (audit, MED).** A real path makes MULTIPLE wire calls
+  (`send`, then `last_chk`, then drain retries/probes), so one response per op is too weak — that is
+  exactly where convergence/drain defects live. Model it as `DpsScript(Vec<WireResponse>)` (an ordered
+  queue the `ScriptedDps` plays per call), where `WireResponse` is the per-call response enum — the
+  former `DpsResp` variants: `Ack`, `Reject`, `Timeout`, `Superseded`, `BadHashPrev`, `NotFound`. Add a
+  small builder of the common shapes:
+  `AckPath` (send→Ack, last→Ack), `SendAckThenLastNotFound`, `SendThenReject`, `TimeoutAtCall(n)`,
+  `SupersededTip`, `BadHashPrev`. The generator picks a `DpsScript` per wire op; the interpreter feeds it
+  into `ScriptedDps`'s queue.
 - `struct RefModel { seed: Option<[u8;32]>, next_lnd: i64, shift_state: ShiftState, mode: NodeMode,
   session: Option<SessionState>, codes_issued/consumed, docs: BTreeMap<lnd, DocState> }` with
   `apply(&mut self, op) -> ExpectedOutcome`. The **issued** predicate MUST call/mirror
@@ -98,7 +110,8 @@ ledger, reusing the gateway's issued-set predicate.
 **Files:** Create `rust/prro/tests/invariant_fuzzer/interp.rs`.
 
 **Interface:** `async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome`, mapping:
-- `OnlineSell` → `inline::run` (Online node) with a `ScriptedDps` programmed by the op's `DpsResp`.
+- `OnlineSell` → `inline::run` (Online node) with a `ScriptedDps` whose queue is loaded from the op's
+  `DpsScript` (the full per-call wire-response sequence, Task 1).
 - `GoOnline` → `return_online_probe::run_tick_for_fn` (Offline→GoingOnline) then `drain`
   (GoingOnline→Online) — the **real transition seam, NOT a setter** (spec §5).
 - `OfflineSell` → `inline::run` on an Offline node (offline-ack path).
@@ -130,14 +143,18 @@ the invalid/re-entry ops), with shrinking.
 
 **Files:** Create `rust/prro/tests/invariant_fuzzer/strategy.rs`.
 
-**Interface:** `fn op_sequence() -> impl Strategy<Value = Vec<Op>>` — a stateful/`prop_flat_map`
-generator that tracks a lightweight precondition view (shift open? mode? session? backlog?) so valid ops
-are reachable, and injects invalid/re-entry ops at random positions (they are *meant* to be illegal). DPS
-responses chosen per wire op.
+**Interface (shrink-first — audit, LOW/MED):** `fn op_sequence() -> impl Strategy<Value = Vec<Op>>`
+generating an **intent-stream** — a flat `Vec<Op>` of *intents* (each op + its `DpsScript`) with **NO
+heavy `prop_filter` / precondition-gating in the generator**. Admissibility is classified by the
+interpreter/model **at run time**: an intent whose precondition does not hold becomes an
+`ExpectedNoMutation` op (Task 4), NOT a filtered-out sample. This keeps shrinking clean (proptest can drop
+any element to minimize). A filter-heavy or deeply stateful `prop_flat_map` generator gives poor shrink
+paths and is **forbidden as the primary path**. Invalid/re-entry ops are first-class intents in the
+stream; `DpsScript` chosen per wire op.
 
 **Acceptance:**
-- [ ] Generated sequences are precondition-coherent for valid ops; invalid ops appear with non-trivial frequency.
-- [ ] A `proptest!` smoke test runs N (e.g. 64) generated sequences through the interpreter without a precondition-panic (illegal ops are *handled*, not crashing the harness).
+- [ ] Generator is **intent-stream / shrink-first** — no `prop_filter` as the primary admissibility mechanism (admissibility classified at run time, not by filtering the sample space).
+- [ ] A `proptest!` smoke test runs N (e.g. 64) generated sequences through the interpreter without a precondition-panic (out-of-precondition intents become no-ops, not crashes).
 - [ ] Shrinking demonstrably reduces a forced failure to a shorter sequence.
 
 **Verify:** `cargo nextest run … -E 'test(invariant_fuzzer)'` → the strategy smoke proptest passes.
@@ -148,14 +165,24 @@ responses chosen per wire op.
 
 ### Task 4: Oracle layer 1 — differential (non-fault ops) + invalid-op oracle
 
-**Goal:** After each non-fault op, assert `real == model`; after each invalid op, assert typed-refusal /
-no-op with NO fiscal mutation.
+**Goal:** Assert each op against its **classification** — `PredictableMutating` ops differential-match
+the model; `ExpectedNoMutation` ops mutate nothing; `FaultOrRecovery` ops defer to Task 5. The
+differential lnd/seed/doc-state expectation applies to `PredictableMutating` ONLY.
 
-**Files:** Create `rust/prro/tests/invariant_fuzzer/oracle.rs` (`fn check_differential(real, model, op)`).
+**Files:** Create `rust/prro/tests/invariant_fuzzer/oracle.rs` (`fn classify(op) -> OpClass` + `fn check_differential(real, model, op)`).
 
-**Interface:** compare lnd advance, the new doc's `previous_hash` vs the prior tip, the seed advance at
-the lane-correct moment (§6), code consumption, and the document state. For invalid ops: assert no
-`lnd`/seed/code mutation and an illegal-transition did NOT occur (typed refusal or no-op).
+**Interface (op classification — audit, MED — non-fault is NOT one bucket):** classify each `Op` into
+exactly one of:
+- **`PredictableMutating`** (`OnlineSell→ACK`, `OfflineSell`, a `Drain` that advances, `GoOnline`) →
+  `check_differential`: lnd advance, new doc's `previous_hash` vs prior tip, lane-correct seed advance
+  (§6), code consumption, doc state.
+- **`ExpectedNoMutation`** (the invalid/re-entry ops `SellWithClosedShift` / `RepeatDrain` /
+  `RepeatReboot` / `DuplicateIdemKey` / `GoOnlineWithoutBacklog` / `OfflineSellDuringGoingOnline`, AND any
+  valid intent whose precondition did NOT hold at run time) → assert a typed refusal or a no-op with NO
+  `lnd`/seed/code mutation and NO illegal transition.
+- **`FaultOrRecovery`** (`Crash` / `Reboot`) → handled by Task 5 (bounded postcond + re-sync), NOT here.
+The split is explicit so the differential never applies `lnd+1` to a `SellWithClosedShift` or
+`RepeatDrain` (the easy-to-get-wrong case the audit flagged).
 
 **Acceptance:**
 - [ ] A clean valid sequence passes the differential.
@@ -221,26 +248,32 @@ now includes Mirror-1 and Mirror-3, `check_mirrors` largely = `assert_clean` + t
 **Goal:** The end-to-end fuzzer — generator → interpreter → all oracle layers + mirror checks over N
 cases — plus the reproducible teeth-test proving the oracle has teeth.
 
-**Files:** Modify `rust/prro/tests/invariant_fuzzer.rs` (the `proptest!` harness wiring Tasks 1-6).
+**Files:** Modify `rust/prro/tests/invariant_fuzzer.rs` (the `proptest!` harness wiring Tasks 1-6);
+Create `rust/prro/tests/invariant_fuzzer/TEETH_TEST.md` (the durable teeth-test artifact).
 
 **Interface:** `proptest!` test: for each generated `Vec<Op>`, fresh DB + fixture (open shift), run each
 op via the interpreter, after each step run the oracle (differential for non-fault / bounded-postcond +
 re-sync for fault) + `assert_clean` + `check_mirrors` at quiescent boundaries. Config N (PR-time small,
 e.g. 256; nightly large is Phase 3).
 
-**Teeth-test (spec §14, hard gate, reproducible):** a documented procedure (a `#[ignore]`-d test or a
-README step in `tests/invariant_fuzzer/`): on current `main`, revert the AUD-K8-1 drain-entry RMR guard
-(`backlog_drain.rs:725` — the `if ns.shift_state == RequiresManualReconciliation { return Ok(...) }`
-block, fix `a171f18`/#168), run the fuzzer, confirm it finds the re-tick re-drive / busy-loop and shrinks
-to a minimal `[…, escalate, re-tick]` sequence; restore the guard → fuzzer green. Document the exact
-revert + run command + expected finding.
+**Teeth-test (spec §14, hard gate) — a DURABLE checked-in artifact, NOT a PR-description procedure
+(audit, LOW — else it becomes tribal knowledge):** ship `tests/invariant_fuzzer/TEETH_TEST.md` next to
+the fuzzer, pinning EXACTLY: the **revert target** (the AUD-K8-1 drain-entry RMR guard at
+`backlog_drain.rs:725` — the `if ns.shift_state == RequiresManualReconciliation { return
+Ok(DrainSummary::new(fn, 0)) }` block; fix `a171f18` / #168); the **run command**
+(`cargo nextest run -p prro --features test-support -E 'test(invariant_fuzzer)'`); the **expected
+finding** (a manual-recon FN re-driven by the next drain tick — re-drive / busy-loop); and the
+**expected minimal repro** shape (`[…, escalate, re-tick]`). Prefer also a
+`#[ignore = "teeth-test: run after reverting the AUD-K8-1 guard per TEETH_TEST.md"]` test so it lives in
+the suite, not memory. Procedure: revert → run → confirm finding + shrink → restore → green.
 
 **Acceptance:**
 - [ ] The `proptest!` harness runs N cases green on current `main`.
-- [ ] The teeth-test procedure (revert AUD-K8-1 guard → fuzzer finds + shrinks the busy-loop) is documented and demonstrated once.
+- [ ] **The teeth-test is a checked-in artifact** — `tests/invariant_fuzzer/TEETH_TEST.md` (+ an `#[ignore]`-d test) with the exact revert target, run command, and expected minimal repro pinned — NOT only a PR description.
+- [ ] Demonstrated once: reverting the AUD-K8-1 guard → the fuzzer finds + shrinks the busy-loop; restore → green.
 - [ ] A failing seed replays deterministically and yields a minimal repro.
 
-**Verify:** `cargo nextest run -p prro --features test-support -E 'test(invariant_fuzzer)'` → green; the teeth-test (manual revert) demonstrated in the PR description.
+**Verify:** `cargo nextest run -p prro --features test-support -E 'test(invariant_fuzzer)'` → green; `TEETH_TEST.md` + the `#[ignore]`-d test committed; the revert→finding→restore cycle demonstrated once.
 
 **TDD:** the harness composes Tasks 1-6 (already TDD'd); the teeth-test IS the RED proof that the whole pipeline has teeth (it must FIND the reverted-guard bug).
 

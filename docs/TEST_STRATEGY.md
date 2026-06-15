@@ -37,12 +37,15 @@ recovery / cross-fix** bug, **never a happy-path bug**:
 | AUD-K8-1 (drain re-entry after escalate re-sends) | drain-reentry |
 | AUD-L5-1 (KVT1 superseded false-fatal) | chain / shared-fn |
 | EDIT-E (widened fetch breaks a consumer's premise) | shared-fn-caller |
+| SEAM-D-1 / SW-5 (shifts ↔ node_state.shift_state mirror desync) | projection/mirror |
 
-**Four recurring classes** (the taxonomy): **seed** (MAC-seed advance/read), **chain**
+**Five recurring classes** (the taxonomy): **seed** (MAC-seed advance/read), **chain**
 (`previous_hash` continuity + `ChainSeedMismatch` handling), **drain-reentry** (idempotency of
 recovery loops under re-entry), **shared-fn-caller** (a widened shared predicate cuts a caller that
 assumed the old narrow behavior — the spine: "a widened invariant invalidates old code", same root
-as M2-01).
+as M2-01), and **projection/mirror drift** (two persisted representations of one fact diverging —
+`shifts ↔ node_state.shift_state`, `offline_session ↔ drain_cohort`, `inbox ↔ ledger`; added by the
+2026-06-15 cross-class re-pass, seen as SEAM-D-1).
 
 The happy path (`open shift → sell → ACK → close`) is a *single* deterministic sequence, already
 covered by integration tests and proven against the real DPS. **All the risk lives in the unhappy
@@ -113,6 +116,18 @@ improves on WebCheck; production DBs = real merchant data → anonymize / keep l
 ---
 
 ## 4. The invariant-fuzzer (O3) — design
+
+> **⚠ SUPERSEDED — this O3 section is the historical umbrella sketch.** The AUTHORITATIVE Phase-0
+> design is **`docs/superpowers/specs/2026-06-15-invariant-fuzzer-design.md`** + the plan
+> **`docs/superpowers/plans/2026-06-15-invariant-fuzzer-phase0.md`** (externally audited, 3 rounds).
+> Where this sketch differs, the spec/plan win: the generator includes **invalid/re-entry ops** (not
+> valid-only); Phase 0 ships a **hand-built reference model + differential** (not scan-only);
+> `invariant_scan` runs only at **quiescent boundaries** (not after every step — a mid-crash `SENDING`
+> transient is legal); the alphabet is **pre-seeded-shift SELL/offline/drain/recovery** (no
+> SHIFT_OPEN/Z/`go_offline` — `inline::run` is SELL/RETURN-only; no `clock` in Phase 0); **RETURN is
+> live but Phase-0-excluded** (not unbuilt); fault handling adds **bounded kill-point postconditions +
+> re-sync**; and the **5th class (mirror drift)** is checked. Read the sketch below for the *why*; read
+> the spec/plan for *what to build*.
 
 A **model-based stateful property test**: a generator emits random *valid* fiscal-operation
 sequences → drives them through the REAL system → asserts the invariants after EVERY step;
@@ -186,8 +201,9 @@ live**. Interop and fuzzer coverage must span **both** channels (each is its own
 ## 7. What this does NOT cover (honest bounds)
 
 - **Operational / human / hardware envelope** — deployment, hardware variety, cashier error, support.
-- **Unbuilt features** — the fuzzer can't test what doesn't exist (RETURN, UI, monitoring, printing,
-  Maria 301). Pilot-readiness needs those built first.
+- **Unbuilt features** — the fuzzer can't test what doesn't exist (SHIFT_OPEN/Z/EVPZ, UI, monitoring,
+  printing, Maria 301). Pilot-readiness needs those built first. (RETURN *is* live — SELL/RETURN inline
+  path — but is Phase-0-excluded for MVP narrowness.)
 - **Performance / load** — only partially (soak); see `PERFORMANCE_PLAN.md`.
 - **Legal / IP / privacy** — production DBs (O5) are real merchant data; handle per the
   security/secrets discipline.
