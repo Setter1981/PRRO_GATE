@@ -29,11 +29,9 @@
 
 mod common;
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
@@ -55,12 +53,12 @@ use prro::services::reconciliation::{ReconcileGuard, RuntimeView};
 use prro::services::write_path::inline;
 use prro::services::write_path::types::WorkerProcessResult;
 use prro::services::write_path::{stage_acquire, stage_sign};
-use prro::transports::dps::channel::DpsChannel;
-use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
+use prro::transports::dps::dto::{CheckAck, CheckSignBlob};
 use prro::transports::dps::error::{AuthorizationKind, DpsError};
 use sqlx::SqlitePool;
 
 use common::det_signing_ctx;
+use common::scripted_dps::ScriptedDps;
 
 // ─── Constants (mirror tests/write_path_inline.rs base fixture) ─────────────
 
@@ -70,112 +68,6 @@ const DRIVER: &str = "drv-test";
 const SERVER_FISCAL_NO: &str = "DPS-FN-ONLINE-1";
 const SELL_PAYLOAD: &str = r#"{"items":[{"code":"item-1","name":"Test item","price_kop":15000,"quantity_thousandths":1000,"sum_kop":15000}],"payments":[{"name":"Cash","sum_kop":15000,"type_code":"0"}]}"#;
 const TOTAL_KOP: i64 = 15000;
-
-// ─── DPS stub: dual-queue + shared AtomicUsize counters + oneshot hang ───────
-
-/// Kill-point DPS stub.  Two scripted response queues (`send_chk` /
-/// `last_chk`), call counters held behind `Arc<AtomicUsize>` so they survive
-/// the simulated restart (shared between the phase-1 and phase-2 stubs), and
-/// an optional per-method "hang" mode for drop-injection (K3/K4): when armed,
-/// the method increments its counter, fires `reached` (so the test knows the
-/// wire await was entered AND the prior committed envelope is durable), then
-/// awaits `block` — which the test never resolves, so the await parks until
-/// the surrounding future is dropped (the "crash").
-struct KpStub {
-    send_q: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
-    last_q: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
-    send_calls: Arc<AtomicUsize>,
-    last_calls: Arc<AtomicUsize>,
-    send_reached: Mutex<Option<oneshot::Sender<()>>>,
-    send_block: Mutex<Option<oneshot::Receiver<()>>>,
-    last_reached: Mutex<Option<oneshot::Sender<()>>>,
-    last_block: Mutex<Option<oneshot::Receiver<()>>>,
-}
-
-impl KpStub {
-    fn new(send_calls: Arc<AtomicUsize>, last_calls: Arc<AtomicUsize>) -> Self {
-        Self {
-            send_q: Mutex::new(VecDeque::new()),
-            last_q: Mutex::new(VecDeque::new()),
-            send_calls,
-            last_calls,
-            send_reached: Mutex::new(None),
-            send_block: Mutex::new(None),
-            last_reached: Mutex::new(None),
-            last_block: Mutex::new(None),
-        }
-    }
-
-    fn push_send(&self, r: Result<CheckAck, DpsError>) {
-        self.send_q.lock().unwrap().push_back(r);
-    }
-
-    fn push_last(&self, r: Result<CheckAck, DpsError>) {
-        self.last_q.lock().unwrap().push_back(r);
-    }
-
-    /// Arm the `send_chk` await to hang.  `reached` fires when the await is
-    /// entered (Sending already committed by the 4-pre envelope); `block`
-    /// never resolves, so the await parks until the future is dropped.
-    fn hang_send(&self, reached: oneshot::Sender<()>, block: oneshot::Receiver<()>) {
-        *self.send_reached.lock().unwrap() = Some(reached);
-        *self.send_block.lock().unwrap() = Some(block);
-    }
-
-    /// Arm the `last_chk` await to hang (Sent already committed when reached).
-    fn hang_last(&self, reached: oneshot::Sender<()>, block: oneshot::Receiver<()>) {
-        *self.last_reached.lock().unwrap() = Some(reached);
-        *self.last_block.lock().unwrap() = Some(block);
-    }
-}
-
-#[async_trait]
-impl DpsChannel for KpStub {
-    async fn send_chk(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
-        self.send_calls.fetch_add(1, Ordering::SeqCst);
-        let block = self.send_block.lock().unwrap().take();
-        if let Some(block) = block {
-            if let Some(reached) = self.send_reached.lock().unwrap().take() {
-                let _ = reached.send(());
-            }
-            // Park until the surrounding future is dropped (the "crash").
-            let _ = block.await;
-        }
-        self.send_q
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("KpStub.send_chk: empty queue")
-    }
-
-    async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
-        self.last_calls.fetch_add(1, Ordering::SeqCst);
-        let block = self.last_block.lock().unwrap().take();
-        if let Some(block) = block {
-            if let Some(reached) = self.last_reached.lock().unwrap().take() {
-                let _ = reached.send(());
-            }
-            let _ = block.await;
-        }
-        self.last_q
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("KpStub.last_chk: empty queue")
-    }
-
-    async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
-        unreachable!("stub: ping not exercised");
-    }
-
-    async fn status_rro(&self, _: &CheckSignBlob) -> Result<StatusSnapshot, DpsError> {
-        unreachable!("stub: status_rro not exercised");
-    }
-
-    async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
-        unreachable!("stub: info_rro not exercised");
-    }
-}
 
 fn ack(id: &str, data_sign: Vec<u8>) -> CheckAck {
     CheckAck {
@@ -417,7 +309,7 @@ async fn k6_offline_local_ack_drains_to_ack() {
     //    OFFLINE_LOCAL_ACK.  DPS is never called on the offline branch.
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
-    let phase1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase1 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
     let gate = Arc::new(tokio::sync::Mutex::new(()));
@@ -453,7 +345,7 @@ async fn k6_offline_local_ack_drains_to_ack() {
 
     // ── Phase 2: drain with a mock DPS — send Ok (carries KVT1 data_sign) +
     //    lastChk Match.  Counters are SHARED with phase 1.
-    let phase2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase2.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
     phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
     let sign_ctx2 = det_signing_ctx();
@@ -528,7 +420,7 @@ async fn k5_kvt2_committed_finalizes_to_ack() {
     //    rests at SENT, send_chk fires exactly once.
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
-    let phase1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase1 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![]))); // data_sign discarded by stage_send
     phase1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → online_confirm Hold → SENT
     let sign_ctx = det_signing_ctx();
@@ -638,7 +530,7 @@ async fn k4_sent_committed_probe_holds_at_kvt1() {
     let last_calls = Arc::new(AtomicUsize::new(0));
 
     // ── Phase 1: send_chk Ok → Sent committed; lastChk hangs → drop.
-    let phase1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase1 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     let (reached_tx, reached_rx) = oneshot::channel::<()>();
     let (block_tx, block_rx) = oneshot::channel::<()>();
@@ -673,7 +565,7 @@ async fn k4_sent_committed_probe_holds_at_kvt1() {
     assert_eq!(send_calls.load(Ordering::SeqCst), 1, "one send in phase 1");
 
     // ── Phase 2: boot with deps; lastChk now answers Match.
-    let phase2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
@@ -707,7 +599,7 @@ async fn k4_sent_committed_probe_holds_at_kvt1() {
     // ── Phase 3 (B1): the online-convergence tick OWNS the resting KVT1 and
     //    converges it to ACK — without resending.  Counters stay SHARED, so the
     //    "exactly one send_chk EVER" property is proven across crash + boot + tick.
-    let phase3 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase3 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase3.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // confirm Match
     let sign_ctx3 = det_signing_ctx();
     let fn_sign3 = fn_sign_blob();
@@ -773,7 +665,7 @@ async fn k3_sending_committed_resumes_to_error_retryable_without_resend() {
     let last_calls = Arc::new(AtomicUsize::new(0));
 
     // ── Phase 1: send_chk parks after Sending is committed → drop.
-    let phase1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase1 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     let (reached_tx, reached_rx) = oneshot::channel::<()>();
     let (block_tx, block_rx) = oneshot::channel::<()>();
     phase1.hang_send(reached_tx, block_rx);
@@ -882,7 +774,7 @@ async fn k1_prepared_boot_redrives_to_sent_exactly_once() {
     // ── Phase 2: boot with deps Some on the Online node.
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
-    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -912,7 +804,7 @@ async fn k1_prepared_boot_redrives_to_sent_exactly_once() {
     //    pool — deps Some, lastChk → Match.  The Sent arm PROBES (no resend)
     //    and advances Sent→KVT1 (as K4).  send_chk MUST stay == 1: this turns
     //    "one send so far" into "exactly one send EVER".  Counters are shared.
-    let stub2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let stub2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
@@ -987,7 +879,7 @@ async fn k2_signed_boot_redrives_to_sent_exactly_once() {
     // ── Phase 2: boot with deps Some on the Online node.
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
-    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -1017,7 +909,7 @@ async fn k2_signed_boot_redrives_to_sent_exactly_once() {
     //    pool — deps Some, lastChk → Match.  The Sent arm PROBES (no resend)
     //    and advances Sent→KVT1 (as K4).  send_chk MUST stay == 1: this turns
     //    "one send so far" into "exactly one send EVER".  Counters are shared.
-    let stub2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let stub2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
@@ -1115,7 +1007,7 @@ async fn m1_02_reachability_second_sell_while_first_rests_sent() {
 
     // ── Run #1: online SELL, lastChk Hold (empty data_sign) → doc1 rests SENT.
     let row1 = seed_inbox_sell(&pool).await;
-    let stub1 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let stub1 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     stub1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![])));
     let sign_ctx1 = det_signing_ctx();
@@ -1140,7 +1032,7 @@ async fn m1_02_reachability_second_sell_while_first_rests_sent() {
     //    server_fiscal_no on the wire so a successful second send would create the
     //    "two SENT docs with distinct sfn" precondition M1-02 escalates on.
     let row2 = seed_inbox_sell_keyed(&pool, "idem-kpm-SELL-2").await;
-    let stub2 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let stub2 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     stub2.push_send(Ok(ack("DPS-FN-ONLINE-2", vec![])));
     stub2.push_last(Ok(ack("DPS-FN-ONLINE-2", vec![])));
     let sign_ctx2 = det_signing_ctx();
@@ -1249,7 +1141,7 @@ async fn k7_sent_probe_alloc_orphan_is_benign_after_m1_04() {
     // ── Phase 1: online SELL, lastChk Hold (empty) → doc rests SENT (one send).
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
-    let phase1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase1 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     phase1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → Hold → SENT
     let sign_ctx = det_signing_ctx();
@@ -1317,7 +1209,7 @@ async fn k7_sent_probe_alloc_orphan_is_benign_after_m1_04() {
 
     // ── Recovery: boot with a Match stub.  No push_send queued → a resend would
     //    be observable; asserted ZERO below.
-    let phase2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // Match
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
@@ -1394,7 +1286,7 @@ async fn k4b_sent_probe_matching_id_empty_data_sign_holds_at_sent() {
     // ── Phase 1: online SELL, lastChk Hold (empty) → doc rests SENT.
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
-    let phase1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase1 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     phase1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → online Hold → SENT
     let sign_ctx = det_signing_ctx();
@@ -1417,7 +1309,7 @@ async fn k4b_sent_probe_matching_id_empty_data_sign_holds_at_sent() {
     assert_eq!(read_doc_state(&pool, FN).await, "SENT", "K4b setup: SENT");
 
     // ── Recovery: boot probe returns the MATCHING id but EMPTY data_sign.
-    let phase2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // matching id, EMPTY data_sign
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
@@ -1487,7 +1379,7 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
 
     // ── Two REAL offline receipts (inline::run on an offline node).
     let row1 = seed_inbox_sell(&pool).await;
-    let stub1 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let stub1 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     {
         let g = gate.clone().lock_owned().await;
         let o = inline::run(&pool, &pool_secure, &stub1, &sign_ctx, &fn_sign, &g, &row1)
@@ -1496,7 +1388,7 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
     let row2 = seed_inbox_sell_keyed(&pool, "idem-m2-pin-2").await;
-    let stub2 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let stub2 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     {
         let g = gate.clone().lock_owned().await;
         let o = inline::run(&pool, &pool_secure, &stub2, &sign_ctx, &fn_sign, &g, &row2)
@@ -1545,7 +1437,7 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
     set_node_mode(&pool, NodeMode::GoingOnline).await;
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
-    let phase = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
     phase.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
     phase.push_send(Ok(ack("DPS-FN-ONLINE-2", vec![0xDE, 0xAD, 0xBE, 0xEF])));
@@ -1628,7 +1520,7 @@ async fn m2_online_offline_boundary_chain_continuous() {
 
     // ── doc#0 ONLINE → ACK (inline Hold→SENT, manual Kvt1/Kvt2, boot finalize).
     let row0 = seed_inbox_sell(&pool).await;
-    let stub0 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let stub0 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     stub0.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub0.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → online Hold → SENT
     {
@@ -1676,7 +1568,7 @@ async fn m2_online_offline_boundary_chain_continuous() {
     seed_open_offline_session(&pool).await;
     seed_offline_code(&pool, 1).await;
     let row1 = seed_inbox_sell_keyed(&pool, "idem-m2-boundary-1").await;
-    let stub1 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let stub1 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     {
         let g = gate.clone().lock_owned().await;
         let o = inline::run(&pool, &pool_secure, &stub1, &sign_ctx, &fn_sign, &g, &row1)
@@ -1727,7 +1619,7 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
     let row1 = seed_inbox_sell(&pool).await;
     {
         let g = gate.clone().lock_owned().await;
-        let stub = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let stub = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let o = inline::run(&pool, &pool_secure, &stub, &sign_ctx, &fn_sign, &g, &row1)
             .await
             .unwrap();
@@ -1736,7 +1628,7 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
     let row2 = seed_inbox_sell_keyed(&pool, "idem-m2x1-2").await;
     {
         let g = gate.clone().lock_owned().await;
-        let stub = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let stub = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let o = inline::run(&pool, &pool_secure, &stub, &sign_ctx, &fn_sign, &g, &row2)
             .await
             .unwrap();
@@ -1775,7 +1667,7 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
     let msg = "ERROR_BAD_HASH_PREV: store \
                deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567"
         .to_string();
-    let phase = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let phase = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     phase.push_send(Err(DpsError::Server {
         code: -12,
         message: msg.clone(),
@@ -1872,7 +1764,7 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
     //    really (no manual prev).  DPS is never touched on the offline branch.
     for (i, idem) in [(1u8, "idem-m2n1-1"), (2, "idem-m2n1-2"), (3, "idem-m2n1-3")] {
         let row = seed_inbox_sell_keyed(&pool, idem).await;
-        let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+        let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
         let gate = Arc::new(tokio::sync::Mutex::new(()));
         let guard = gate.lock_owned().await;
         let outcome = inline::run(
@@ -1906,7 +1798,7 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
     // ── Phase 2: drain.  doc1 send OK + lastChk ACK → ACK; doc2 send →
     //    DocumentReject (terminal) → strict-sequential HALT + escalate Manual;
     //    doc3 is NEVER sent (no stub response provided for it).
-    let phase2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase2.push_send(Ok(ack("SFN-1", vec![0xDE, 0xAD, 0xBE, 0xEF]))); // doc1 send
     phase2.push_send(Err(DpsError::Authorization {
         code: -1,
@@ -1977,14 +1869,15 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
 /// held, FN escalated Manual via edge 15).  Tick 2 re-runs drain with an
 /// EMPTY stub: if the halt is truly idempotent nothing reaches the wire
 /// (the empty queue is never popped); if doc3 were wrongly re-sent the
-/// empty `send_chk` queue panics — a loud RED that the re-tick is not
-/// crash-safe.
+/// over-call is a loud RED — `send_calls` exceeds 2 (the assertion below) and
+/// the empty `ScriptedDps` queue returns a typed `DpsError::Internal` (no
+/// panic) — proving the re-tick is not crash-safe.
 ///
 /// **STATUS — regression pin AUD-K8-1 (HIGH), architect-confirmed
 /// 2026-06-14; green since the manual-reconciliation re-entry guard landed
-/// (#168, fix/aud-k8-1).**  Cross-tick companion to M2-N1.  Before the fix this
-/// panicked on tick 2 at `KpStub.send_chk: empty queue` because the re-tick
-/// re-sent doc3.  Root cause was that `escalate_drain_to_manual` leaves
+/// (#168, fix/aud-k8-1).**  Cross-tick companion to M2-N1.  Before the fix the
+/// re-tick re-sent doc3 on tick 2 (the over-call the empty stub flags).  Root
+/// cause was that `escalate_drain_to_manual` leaves
 /// `node_state.mode = GoingOnline` and the offline session `DRAINING` (it
 /// mutates only the shift + the `node_state.shift_state` mirror), while
 /// `drain()`'s entry gate (`backlog_drain.rs` step 1) checked ONLY
@@ -2018,7 +1911,7 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
     // ── Phase 1: 3 offline SELLs via the REAL inline path → OFFLINE_LOCAL_ACK.
     for (i, idem) in [(1u8, "idem-k8-1"), (2, "idem-k8-2"), (3, "idem-k8-3")] {
         let row = seed_inbox_sell_keyed(&pool, idem).await;
-        let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+        let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
         let gate = Arc::new(tokio::sync::Mutex::new(()));
         let guard = gate.lock_owned().await;
         let outcome = inline::run(
@@ -2085,7 +1978,7 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
 
     // ── Tick 1: doc1 send OK + lastChk ACK; doc2 send → DocumentReject →
     //    strict-sequential HALT + escalate Manual; doc3 never sent.
-    let tick1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let tick1 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     tick1.push_send(Ok(ack("SFN-1", vec![0xDE, 0xAD, 0xBE, 0xEF])));
     tick1.push_send(Err(DpsError::Authorization {
         code: -1,
@@ -2128,8 +2021,10 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
     //    node mode = GoingOnline and the session = DRAINING (it touches only
     //    the shift + node_state.shift_state mirror), exactly the state a crash
     //    between escalate-commit and loop-return would leave.  An EMPTY stub
-    //    guarantees any wrongful re-send of doc3 surfaces as a loud panic.
-    let tick2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    //    catches any wrongful re-send of doc3: the over-call bumps `send_calls`
+    //    past 2 (the assertion below) and the empty `ScriptedDps` queue returns
+    //    a typed `DpsError::Internal` (no panic).
+    let tick2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     let sc2 = det_signing_ctx();
     let fs2 = fn_sign_blob();
     let view2 = RuntimeView {
@@ -2212,7 +2107,7 @@ async fn k9_offline_seed_survives_restart_chain_not_forked() {
     // ── doc1 through the REAL inline path → OFFLINE_LOCAL_ACK.
     let row1 = seed_inbox_sell_keyed(&pool, "idem-k9-1").await;
     {
-        let stub = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let stub = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let gate = Arc::new(tokio::sync::Mutex::new(()));
         let guard = gate.lock_owned().await;
         let o = inline::run(
@@ -2253,7 +2148,7 @@ async fn k9_offline_seed_survives_restart_chain_not_forked() {
     //    off the SURVIVING seed = unsigned(doc1).
     let row2 = seed_inbox_sell_keyed(&pool, "idem-k9-2").await;
     {
-        let stub = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let stub = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let gate = Arc::new(tokio::sync::Mutex::new(()));
         let guard = gate.lock_owned().await;
         let o = inline::run(
@@ -2384,7 +2279,7 @@ async fn drain_kvt1_reentry_superseded_escalates_manual() {
     //    (lnd 1 + 2, same OPEN session, codes 1 + 2 consumed; no wire).
     for (idem, n) in [("idem-l5-1-doc1", 1u8), ("idem-l5-1-doc2", 2)] {
         let row = seed_inbox_sell_keyed(&pool, idem).await;
-        let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+        let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
         let gate = Arc::new(tokio::sync::Mutex::new(()));
         let guard = gate.lock_owned().await;
         let outcome = inline::run(
@@ -2457,7 +2352,7 @@ async fn drain_kvt1_reentry_superseded_escalates_manual() {
     //    (lnd=2, SENT, sfn=DPS-FN-ONLINE-2) is the supersession candidate
     //    `submitted_above_lnd` returns.  Exactly one last_chk (drain halts at
     //    the head — doc2 is never processed).
-    let phase2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase2.push_last(Err(DpsError::ServerFiscalIdMismatch {
         expected_id: SERVER_FISCAL_NO.to_string(),
         actual_id: "DPS-FN-ONLINE-2".to_string(),
@@ -2544,7 +2439,7 @@ async fn boot_kvt2_chain_seed_mismatch_escalates_manual() {
     //    Sent→Kvt1→Kvt2 + Kvt1Raw (mirror K5's crash-point construction).
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
-    let phase1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase1 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     phase1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → Hold → SENT
     let sign_ctx = det_signing_ctx();
@@ -2658,7 +2553,7 @@ async fn m1_02_online_seed_fork_a24_prerequisite() {
     // Two online SELLs on the SAME FN, both resting at SENT via empty-data_sign
     // Hold (mirror m1_02_reachability_second_sell_while_first_rests_sent).
     let row1 = seed_inbox_sell(&pool).await;
-    let stub1 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let stub1 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     stub1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → Hold → SENT
     {
@@ -2676,7 +2571,7 @@ async fn m1_02_online_seed_fork_a24_prerequisite() {
         .expect("doc1 rests at SENT");
     }
     let row2 = seed_inbox_sell_keyed(&pool, "idem-l2-1a-2").await;
-    let stub2 = KpStub::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let stub2 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     stub2.push_send(Ok(ack("DPS-FN-ONLINE-2", vec![])));
     stub2.push_last(Ok(ack("DPS-FN-ONLINE-2", vec![]))); // empty → Hold → SENT
     {
@@ -2754,7 +2649,7 @@ async fn boot_kvt2_chain_seed_mismatch_closed_shift_no_abort() {
     // Online-origin KVT2 doc (mirror K5).
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
-    let phase1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase1 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     phase1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![])));
     let sign_ctx = det_signing_ctx();
@@ -2862,7 +2757,7 @@ async fn boot_skips_rmr_but_online_fn_no_redrive() {
     let last_calls = Arc::new(AtomicUsize::new(0));
 
     // Build a resting SENT doc (inline::run lastChk-Hold).
-    let phase1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase1 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     phase1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → Hold → SENT
     let sign_ctx = det_signing_ctx();
@@ -2897,7 +2792,7 @@ async fn boot_skips_rmr_but_online_fn_no_redrive() {
     .unwrap();
 
     // Boot WITH deps + a stub that WOULD answer the SENT probe (Match → advance).
-    let phase2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
@@ -2968,7 +2863,7 @@ async fn drain_superseded_on_nonescalatable_shift_fails_loud_not_busyloop() {
     // Two offline SELLs → OFFLINE_LOCAL_ACK (mirror drain_kvt1_reentry_superseded).
     for (idem, n) in [("idem-sw3-doc1", 1u8), ("idem-sw3-doc2", 2)] {
         let row = seed_inbox_sell_keyed(&pool, idem).await;
-        let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+        let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
         let gate = Arc::new(tokio::sync::Mutex::new(()));
         let guard = gate.lock_owned().await;
         let outcome = inline::run(
@@ -3035,7 +2930,7 @@ async fn drain_superseded_on_nonescalatable_shift_fails_loud_not_busyloop() {
         .await
         .unwrap();
 
-    let phase2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     phase2.push_last(Err(DpsError::ServerFiscalIdMismatch {
         expected_id: SERVER_FISCAL_NO.to_string(),
         actual_id: "DPS-FN-ONLINE-2".to_string(),

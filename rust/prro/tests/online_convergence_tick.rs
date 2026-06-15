@@ -11,11 +11,9 @@
 
 mod common;
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
 use prro::config::AppConfig;
@@ -31,13 +29,13 @@ use prro::db::{open_pool, open_secure_pool};
 use prro::services::reconciliation::online_convergence::run_tick_for_fn;
 use prro::services::reconciliation::RuntimeView;
 use prro::services::write_path::inline;
-use prro::transports::dps::channel::DpsChannel;
-use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
+use prro::transports::dps::dto::{CheckAck, CheckSignBlob};
 use prro::transports::dps::error::DpsError;
 use prro::App;
 use sqlx::SqlitePool;
 
 use common::det_signing_ctx;
+use common::scripted_dps::ScriptedDps;
 
 const FN: &str = "4000000001";
 const CASHIER: &str = "test-cashier";
@@ -46,61 +44,6 @@ const SERVER_FISCAL_NO: &str = "DPS-FN-ONLINE-1";
 const NEWER_SERVER_FISCAL_NO: &str = "DPS-FN-ONLINE-2";
 const SELL_PAYLOAD: &str = r#"{"items":[{"code":"item-1","name":"Test item","price_kop":15000,"quantity_thousandths":1000,"sum_kop":15000}],"payments":[{"name":"Cash","sum_kop":15000,"type_code":"0"}]}"#;
 const TOTAL_KOP: i64 = 15000;
-
-// ─── DPS stub: dual-queue + shared AtomicUsize counters (no hang needed) ─────
-
-struct KpStub {
-    send_q: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
-    last_q: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
-    send_calls: Arc<AtomicUsize>,
-    last_calls: Arc<AtomicUsize>,
-}
-
-impl KpStub {
-    fn new(send_calls: Arc<AtomicUsize>, last_calls: Arc<AtomicUsize>) -> Self {
-        Self {
-            send_q: Mutex::new(VecDeque::new()),
-            last_q: Mutex::new(VecDeque::new()),
-            send_calls,
-            last_calls,
-        }
-    }
-    fn push_send(&self, r: Result<CheckAck, DpsError>) {
-        self.send_q.lock().unwrap().push_back(r);
-    }
-    fn push_last(&self, r: Result<CheckAck, DpsError>) {
-        self.last_q.lock().unwrap().push_back(r);
-    }
-}
-
-#[async_trait]
-impl DpsChannel for KpStub {
-    async fn send_chk(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
-        self.send_calls.fetch_add(1, Ordering::SeqCst);
-        self.send_q
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("KpStub.send_chk: empty queue (tick must NOT send)")
-    }
-    async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
-        self.last_calls.fetch_add(1, Ordering::SeqCst);
-        self.last_q
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("KpStub.last_chk: empty queue")
-    }
-    async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
-        unreachable!("stub: ping not exercised");
-    }
-    async fn status_rro(&self, _: &CheckSignBlob) -> Result<StatusSnapshot, DpsError> {
-        unreachable!("stub: status_rro not exercised");
-    }
-    async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
-        unreachable!("stub: info_rro not exercised");
-    }
-}
 
 fn ack(id: &str, data_sign: Vec<u8>) -> CheckAck {
     CheckAck {
@@ -337,7 +280,7 @@ async fn seed_newer_submitted_ack(pool: &SqlitePool, shift_id: ShiftId, lnd: i64
 /// Build a resting `SENT` doc via the real stage chain: `inline::run` with a
 /// lastChk-Hold (empty data_sign) rests the doc at `SENT` (a 202).  Consumes
 /// `send_q[0]` (send Ok → one send) + `last_q[0]` (empty → Hold).
-async fn build_resting_sent(pool: &SqlitePool, pool_secure: &SqlitePool, stub: &KpStub) {
+async fn build_resting_sent(pool: &SqlitePool, pool_secure: &SqlitePool, stub: &ScriptedDps) {
     let row = seed_inbox_sell(pool).await;
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -387,7 +330,7 @@ async fn tick_converges_resting_sent_to_ack() {
     seed_node_state(&pool, NodeMode::Online, shift_id).await;
 
     let (send_calls, last_calls) = seed_counters();
-    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     // Construction: send Ok (→SENT) + lastChk Hold (empty → rests at SENT).
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold
@@ -454,7 +397,7 @@ async fn tick_converges_resting_kvt1_to_ack() {
     seed_node_state(&pool, NodeMode::Online, shift_id).await;
 
     let (send_calls, last_calls) = seed_counters();
-    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold → SENT
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // KVT1 confirm Match
@@ -503,7 +446,7 @@ async fn tick_holds_superseded_resting_kvt1_not_structural_drift() {
     seed_node_state(&pool, NodeMode::Online, shift_id).await;
 
     let (send_calls, last_calls) = seed_counters();
-    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold → SENT
                                                        // KVT1 confirm: DPS reports a DIFFERENT tip — a newer submitted doc
@@ -575,7 +518,7 @@ async fn tick_zero_wire_when_nothing_resting() {
     seed_node_state(&pool, NodeMode::Online, shift_id).await;
 
     let (send_calls, last_calls) = seed_counters();
-    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
     let view = RuntimeView {
@@ -611,7 +554,7 @@ async fn tick_skips_non_online_mode() {
     seed_node_state(&pool, NodeMode::Online, shift_id).await;
 
     let (send_calls, last_calls) = seed_counters();
-    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![])));
     build_resting_sent(&pool, &pool_secure, &stub).await;
@@ -652,7 +595,7 @@ async fn tick_hold_on_empty_data_sign() {
     seed_node_state(&pool, NodeMode::Online, shift_id).await;
 
     let (send_calls, last_calls) = seed_counters();
-    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // construction Hold → SENT
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // tick confirm: EMPTY → Hold
@@ -692,7 +635,7 @@ async fn tick_idempotent_after_convergence() {
     seed_node_state(&pool, NodeMode::Online, shift_id).await;
 
     let (send_calls, last_calls) = seed_counters();
-    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
@@ -771,7 +714,7 @@ async fn tick_serialises_on_fn_gate() {
     // Stub + view are never touched — with no node_state row for this FN the
     // tick returns early (the point of the test is the gate, not convergence).
     let (send_calls, last_calls) = seed_counters();
-    let stub = KpStub::new(send_calls, last_calls);
+    let stub = ScriptedDps::new(send_calls, last_calls);
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
     let view = RuntimeView {
@@ -824,7 +767,7 @@ async fn tick_counts_mismatch_escalation_as_not_converged() {
     seed_node_state(&pool, NodeMode::Online, shift_id).await;
 
     let (send_calls, last_calls) = seed_counters();
-    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     // Construction: send Ok (→SENT) + lastChk Hold (empty → rests at SENT).
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold
@@ -888,7 +831,7 @@ async fn tick_chain_seed_mismatch_escalates_manual() {
     seed_node_state(&pool, NodeMode::Online, shift_id).await;
 
     let (send_calls, last_calls) = seed_counters();
-    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold → SENT
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // KVT1 confirm Match
@@ -954,7 +897,7 @@ async fn tick_skips_rmr_but_online_fn_no_reprobe() {
     seed_node_state(&pool, NodeMode::Online, shift_id).await;
 
     let (send_calls, last_calls) = seed_counters();
-    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![]))); // construction send
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // construction Hold → SENT
                                                        // probe responses the tick WOULD consume if it (wrongly) ran —

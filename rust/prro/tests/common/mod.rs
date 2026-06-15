@@ -42,6 +42,10 @@
 
 #![allow(dead_code)]
 
+// Reusable scripted `DpsChannel` stub (de-dups the two former `KpStub`
+// copies). See `scripted_dps.rs`.
+pub mod scripted_dps;
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
