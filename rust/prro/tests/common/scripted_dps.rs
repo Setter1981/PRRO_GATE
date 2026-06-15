@@ -69,6 +69,12 @@ pub struct ScriptedDps {
     send_block: Mutex<Option<oneshot::Receiver<()>>>,
     last_reached: Mutex<Option<oneshot::Sender<()>>>,
     last_block: Mutex<Option<oneshot::Receiver<()>>>,
+    /// `status_rro` response queue (the return-online probe's connectivity
+    /// check).  Empty → a typed error, never a panic (same discipline as the
+    /// send/last queues).  Added for the Task 2/3 `GoOnline` interpreter arm
+    /// (`return_online_probe::run_tick_for_fn` calls `status_rro`).  Existing
+    /// consumers never call `status_rro`, so this is behaviorally inert for them.
+    status_q: Mutex<VecDeque<Result<StatusSnapshot, DpsError>>>,
     calls: Mutex<Vec<DpsCall>>,
 }
 
@@ -85,6 +91,7 @@ impl ScriptedDps {
             send_block: Mutex::new(None),
             last_reached: Mutex::new(None),
             last_block: Mutex::new(None),
+            status_q: Mutex::new(VecDeque::new()),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -95,6 +102,11 @@ impl ScriptedDps {
 
     pub fn push_last(&self, r: Result<CheckAck, DpsError>) {
         self.last_q.lock().unwrap().push_back(r);
+    }
+
+    /// Enqueue a `status_rro` response (the return-online probe).
+    pub fn push_status(&self, r: Result<StatusSnapshot, DpsError>) {
+        self.status_q.lock().unwrap().push_back(r);
     }
 
     /// Arm the `send_chk` await to hang.  `reached` fires when the await is
@@ -168,7 +180,13 @@ impl DpsChannel for ScriptedDps {
     }
 
     async fn status_rro(&self, _: &CheckSignBlob) -> Result<StatusSnapshot, DpsError> {
-        unreachable!("stub: status_rro not exercised");
+        let popped = self.status_q.lock().unwrap().pop_front();
+        popped.unwrap_or_else(|| {
+            Err(DpsError::Internal(
+                "ScriptedDps.status_rro: response queue empty (over-call / caller forgot to enqueue)"
+                    .to_string(),
+            ))
+        })
     }
 
     async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {

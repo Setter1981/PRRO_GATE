@@ -5,11 +5,13 @@
 //! `proptest` generator (Task 3) and no model differential (Task 4) here — just
 //! drive each `Op` through its real seam and read the observed ledger back.
 //!
-//! Per the plan, Task 2 GREEN is scoped to the acceptance: `OnlineSell`,
-//! `Crash(Send)` (drop-injection), and `Reboot`.  The remaining alphabet
-//! (`OfflineSell` / `GoOnline` / `Drain` / invalid-re-entry / the non-wire
-//! `Crash` stages) is wired when the Task 3 generator starts emitting it — each
-//! mapping is pinned in the plan §5 / spec §4.
+//! Task 2 wired `OnlineSell` / `Crash(Send)` / `Reboot`.  Task 3 completes the
+//! rest of the generator-reachable alphabet: `OfflineSell`, `GoOnline` (probe +
+//! drain), `Drain`, `Crash(Kvt1)` (drop-injection via hang_last), and the
+//! invalid / re-entry intents (run the same seam, expect refusal / no-op).  Only
+//! the NON-wire `Crash` stages (stage-composition) remain deferred — and the
+//! generator never emits them (Crash drawn from {Send, Kvt1}), so no
+//! generator-reachable op hits `unimplemented!`.
 //!
 //! Fixtures (`fresh_pool`, `seed_*`) are re-created here rather than imported:
 //! the kill-point matrix keeps them file-local (not in `tests/common/`), and
@@ -23,16 +25,20 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::sync::oneshot;
 
-use prro::db::models::enums::{DocState, FiscalMode, NodeMode, Protocol, ShiftState};
-use prro::db::models::ids::{RequestId, ShiftId};
+use prro::db::models::enums::{
+    DocState, FiscalMode, NodeMode, OfflineSessionState, Protocol, ShiftState,
+};
+use prro::db::models::ids::{OfflineSessionId, RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::{open_pool, open_secure_pool};
-use prro::services::reconciliation::boot_phase;
+use prro::services::offline_sync::{backlog_drain, return_online_probe};
+use prro::services::reconciliation::{boot_phase, RuntimeView};
 use prro::services::write_path::inline;
 use prro::services::write_path::stage_sign::SigningContext;
-use prro::transports::dps::dto::{CheckAck, CheckSignBlob};
-use prro::transports::dps::error::DpsError;
+use prro::transports::dps::channel::DpsChannel;
+use prro::transports::dps::dto::{CheckAck, CheckSignBlob, StatusSnapshot};
+use prro::transports::dps::error::{AuthorizationKind, DpsError};
 
 use crate::common::scripted_dps::ScriptedDps;
 use crate::common::{det_signing_ctx, drain_test_guard};
@@ -118,6 +124,67 @@ impl FuzzCtx {
             send_calls: Arc::new(AtomicUsize::new(0)),
             last_calls: Arc::new(AtomicUsize::new(0)),
             seq: 0,
+        }
+    }
+
+    /// Fixture: a fresh DB with an OFFLINE node + open shift + an OPEN offline
+    /// session carrying `codes` offline codes (the offline lane is fixture-
+    /// seeded — there is no go_offline op, spec §5).
+    pub async fn new_offline_open_shift(codes: i64) -> Self {
+        let pool = fresh_pool().await;
+        let pool_secure = fresh_secure_pool().await;
+        seed_fn_config(&pool).await;
+        let shift_id = seed_open_shift(&pool).await;
+        seed_node_state(&pool, NodeMode::Offline, shift_id).await;
+        seed_open_offline_session(&pool).await;
+        for code_lnd in 1..=codes {
+            seed_offline_code(&pool, code_lnd).await;
+        }
+        Self {
+            pool,
+            pool_secure,
+            sign_ctx: det_signing_ctx(),
+            fn_sign: fn_sign_blob(),
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            fn_id: FN.to_string(),
+            send_calls: Arc::new(AtomicUsize::new(0)),
+            last_calls: Arc::new(AtomicUsize::new(0)),
+            seq: 0,
+        }
+    }
+
+    /// Fixture-level setter: force the node mode (used by test setup and by the
+    /// deliberately-adverse `OfflineSellDuringGoingOnline` intent).
+    pub async fn force_node_mode(&self, mode: NodeMode) {
+        sqlx::query("UPDATE node_state SET mode = ? WHERE fiscal_number = ?")
+            .bind(mode)
+            .bind(self.fn_id.as_str())
+            .execute(&self.pool)
+            .await
+            .unwrap();
+    }
+
+    /// Fixture-level setter: close the shift (both `shifts.state` and the
+    /// `node_state.shift_state` mirror) — realizes the `SellWithClosedShift`
+    /// adverse precondition.
+    async fn force_shift_closed(&self) {
+        sqlx::query("UPDATE shifts SET state = 'CLOSED' WHERE fiscal_number = ?")
+            .bind(self.fn_id.as_str())
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE node_state SET shift_state = 'CLOSED' WHERE fiscal_number = ?")
+            .bind(self.fn_id.as_str())
+            .execute(&self.pool)
+            .await
+            .unwrap();
+    }
+
+    fn view<'a>(&'a self, dps: &'a dyn DpsChannel) -> RuntimeView<'a> {
+        RuntimeView {
+            dps,
+            signing_ctx: &self.sign_ctx,
+            fn_sign: &self.fn_sign,
         }
     }
 
@@ -225,18 +292,29 @@ impl FuzzCtx {
 /// observed ledger effect.
 pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
     match op {
+        // ── valid ──
         Op::OnlineSell(script) => online_sell(ctx, script).await,
+        Op::OfflineSell => offline_sell(ctx).await,
+        Op::GoOnline(script) => go_online(ctx, script).await,
+        Op::Drain(script) => drain_op(ctx, script).await,
         Op::Reboot => reboot(ctx).await,
+        // ── crash (wire stages only — drop-injection) ──
         Op::Crash(Stage::Send) => crash_at_send(ctx).await,
+        Op::Crash(Stage::Kvt1) => crash_at_kvt1(ctx).await,
+        // non-wire crash stages need stage-composition; deferred — see plan §4
+        // follow-up.  The generator never emits these (Crash drawn from
+        // {Send, Kvt1} only), so this arm is NOT reachable from op_sequence().
         Op::Crash(stage) => unimplemented!(
-            "Crash({stage:?}): Task 2 wires only the Send wire-stage drop-injection; \
-             the other stages (drop-injection for Kvt1, stage-composition for the \
-             non-wire boundaries) land when the Task 3 generator drives them"
+            "Crash({stage:?}) (non-wire stage-composition) is a documented follow-up; \
+             the generator only emits Crash(Send) / Crash(Kvt1)"
         ),
-        other => unimplemented!(
-            "run_op: {other:?} is wired when the Task 3 generator emits it; Task 2 \
-             covers OnlineSell / Crash(Send) / Reboot (the plan acceptance)"
-        ),
+        // ── invalid / re-entry / replay (run the same seam; expect refusal/no-op) ──
+        Op::RepeatDrain => drain_op(ctx, &DpsScript(Vec::new())).await,
+        Op::RepeatReboot => reboot(ctx).await,
+        Op::DuplicateIdemKey => duplicate_idem_key(ctx).await,
+        Op::GoOnlineWithoutBacklog => go_online(ctx, &DpsScript(Vec::new())).await,
+        Op::OfflineSellDuringGoingOnline => offline_sell_during_going_online(ctx).await,
+        Op::SellWithClosedShift => sell_with_closed_shift(ctx).await,
     }
 }
 
@@ -314,6 +392,205 @@ async fn reboot(ctx: &mut FuzzCtx) -> RealOutcome {
     }
 }
 
+/// `OfflineSell` → `inline::run` on an Offline node — the offline-ack path lands
+/// `OFFLINE_LOCAL_ACK` and makes NO wire call (spec §5).
+async fn offline_sell(ctx: &mut FuzzCtx) -> RealOutcome {
+    let row = ctx.seed_inbox_sell().await;
+    let dps = ctx.new_dps(); // offline branch never touches the wire
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_) => RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await),
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// `GoOnline` → the REAL transition seam: `return_online_probe::run_tick_for_fn`
+/// (Offline → GoingOnline via `status_rro`) THEN `backlog_drain::drain`
+/// (GoingOnline → Online, draining the backlog).  NOT a setter.
+async fn go_online(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
+    let dps = ctx.new_dps();
+    dps.push_status(Ok(online_status())); // probe sees DPS online → flip
+    load_script(&dps, script); // drain wire responses (send/last per backlog doc)
+
+    let tick =
+        return_online_probe::run_tick_for_fn(&ctx.pool, &dps, &ctx.fn_id, &ctx.fn_sign).await;
+
+    let guard = drain_test_guard();
+    let view = ctx.view(&dps);
+    let drain = backlog_drain::drain(&guard, &ctx.pool, &view, &ctx.fn_id).await;
+    RealOutcome::Recovered {
+        branch: format!(
+            "tick={tick:?} drain={}",
+            match &drain {
+                Ok(s) => format!(
+                    "ok(backlog={},acked={})",
+                    s.backlog_size_before(),
+                    s.advanced_to_ack()
+                ),
+                Err(e) => format!("err({e:?})"),
+            }
+        ),
+    }
+}
+
+/// `Drain` → `backlog_drain::drain` (requires GoingOnline; otherwise a logged
+/// no-op with `backlog_size_before = 0`).
+async fn drain_op(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
+    let dps = ctx.new_dps();
+    load_script(&dps, script);
+    let guard = drain_test_guard();
+    let view = ctx.view(&dps);
+    match backlog_drain::drain(&guard, &ctx.pool, &view, &ctx.fn_id).await {
+        Ok(s) => RealOutcome::Recovered {
+            branch: format!(
+                "drain ok(backlog={},acked={})",
+                s.backlog_size_before(),
+                s.advanced_to_ack()
+            ),
+        },
+        Err(e) => RealOutcome::Refused(format!("drain: {e:?}")),
+    }
+}
+
+/// `Crash(Kvt1)` → drop-injection on the `last_chk` await (the online_confirm
+/// step).  `push_send` first lets the send commit `Sending → Sent`; `hang_last`
+/// then parks the confirm — so SENT is durably committed when `reached` fires
+/// (kill-matrix K4, spec §4).
+async fn crash_at_kvt1(ctx: &mut FuzzCtx) -> RealOutcome {
+    let row = ctx.seed_inbox_sell().await;
+    let dps = ctx.new_dps();
+    dps.push_send(Ok(ack(SERVER_FISCAL_NO, Vec::new()))); // send Ok → Sending → Sent committed
+    let (reached_tx, reached_rx) = oneshot::channel::<()>();
+    let (block_tx, block_rx) = oneshot::channel::<()>();
+    dps.hang_last(reached_tx, block_rx);
+
+    let guard = ctx.gate.clone().lock_owned().await;
+    {
+        let mut fut = Box::pin(inline::run(
+            &ctx.pool,
+            &ctx.pool_secure,
+            &dps,
+            &ctx.sign_ctx,
+            &ctx.fn_sign,
+            &guard,
+            &row,
+        ));
+        tokio::select! {
+            _ = &mut fut => panic!("Crash(Kvt1): inline::run must hang on last_chk, not complete"),
+            _ = reached_rx => { /* lastChk await reached ⇒ Sending→Sent already committed */ }
+        }
+        drop(fut);
+    }
+    let _keep_block_tx = block_tx;
+    drop(guard);
+
+    RealOutcome::Crashed {
+        stage: Stage::Kvt1,
+        committed_state: ctx.observe_doc_state_by_request_id(&row.request_id).await,
+    }
+}
+
+/// `SellWithClosedShift` (invalid intent): close the shift, then attempt a SELL
+/// — the dispatcher refuses (ShiftNotOpen / ShiftGuardRefused).  No assertion of
+/// no-mutation here (that is Task 4); the bar is a typed refusal, no panic.
+async fn sell_with_closed_shift(ctx: &mut FuzzCtx) -> RealOutcome {
+    ctx.force_shift_closed().await;
+    let row = ctx.seed_inbox_sell().await;
+    let dps = ctx.new_dps();
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_) => RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await),
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// `OfflineSellDuringGoingOnline` (invalid intent): force GoingOnline, then
+/// attempt a SELL — the dispatcher refuses (mode is mid-transition).
+async fn offline_sell_during_going_online(ctx: &mut FuzzCtx) -> RealOutcome {
+    ctx.force_node_mode(NodeMode::GoingOnline).await;
+    let row = ctx.seed_inbox_sell().await;
+    let dps = ctx.new_dps();
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_) => RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await),
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// `DuplicateIdemKey` (replay): process a SELL, then re-run `inline::run` on the
+/// SAME inbox row — the second pass finds the row no longer NEW, takes the
+/// idempotent Noop → resolve-against-ledger path, and mints no new doc.
+async fn duplicate_idem_key(ctx: &mut FuzzCtx) -> RealOutcome {
+    let row = ctx.seed_inbox_sell().await;
+    let dps = ctx.new_dps();
+    load_script(&dps, &DpsScript::ack_path()); // for the first pass if it hits the wire
+    let guard = ctx.gate.clone().lock_owned().await;
+    let first = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+    )
+    .await;
+    if let Err(e) = first {
+        // The first pass was refused (out-of-precondition) — no doc to replay
+        // against; report the refusal without the (panic-prone) ledger resolve.
+        drop(guard);
+        return RealOutcome::Refused(format!("{e:?}"));
+    }
+    let second = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+    )
+    .await;
+    drop(guard);
+    match second {
+        Ok(_) => RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await),
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
 // ─── DpsScript → ScriptedDps queue routing ──────────────────────────────────
 
 /// Lay a `DpsScript` into the stub's queues: position 0 is the `send_chk`
@@ -337,11 +614,34 @@ fn load_script(dps: &ScriptedDps, script: &DpsScript) {
 /// (`Timeout` is realized via `Crash` drop-injection, not a queued result.)
 fn wire_to_result(wr: WireResponse) -> Result<CheckAck, DpsError> {
     match wr {
+        // Full ack: send → Sent; lastChk Match → ACK.
         WireResponse::Ack => Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])),
-        other => unimplemented!(
-            "WireResponse::{other:?} → Result mapping is defined + verified in Task 4 \
-             (differential); Task 2 exercises the AckPath only"
-        ),
+        // Empty data_sign on a lastChk → the K4 Hold form (doc rests at SENT).
+        WireResponse::NotFound => Ok(ack(SERVER_FISCAL_NO, Vec::new())),
+        // Per-document reject → Sending → Rejected (DPS code -1, ERROR_VEREFY).
+        WireResponse::Reject => Err(DpsError::Authorization {
+            code: -1,
+            kind: AuthorizationKind::DocumentReject,
+            message: "fuzz: document reject".to_string(),
+        }),
+        // Server tip superseded → ServerFiscalIdMismatch → ErrorRetryable.
+        WireResponse::Superseded => Err(DpsError::ServerFiscalIdMismatch {
+            expected_id: SERVER_FISCAL_NO.to_string(),
+            actual_id: "DPS-FN-SUPERSEDED".to_string(),
+        }),
+        // Bad previous-hash chain link → Server(-12) ERROR_BAD_HASH_PREV → MAC
+        // recovery / ErrorRetryable.
+        WireResponse::BadHashPrev => Err(DpsError::Server {
+            code: -12,
+            message: "ERROR_BAD_HASH_PREV".to_string(),
+        }),
+        // The timeout SCENARIO is realized via Crash(Send|Kvt1) drop-injection,
+        // not a queued result — the generator never puts Timeout in a loaded
+        // script.  This defensive mapping keeps wire_to_result total + panic-free
+        // (a Transport error is the real seam's back-off-and-retry signal).
+        WireResponse::Timeout => Err(DpsError::Transport(
+            "fuzz: simulated timeout (normally realized via Crash drop-injection)".to_string(),
+        )),
     }
 }
 
@@ -352,6 +652,16 @@ fn ack(id: &str, data_sign: Vec<u8>) -> CheckAck {
         id: id.to_string(),
         id_sign: vec![],
         data_sign,
+    }
+}
+
+/// The `status_rro` snapshot the return-online probe needs to flip
+/// Offline → GoingOnline (DPS reports the FN online with an open shift).
+fn online_status() -> StatusSnapshot {
+    StatusSnapshot {
+        open_shift: true,
+        online: true,
+        last_signer: String::new(),
     }
 }
 
@@ -444,6 +754,29 @@ async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift_id: ShiftId) {
     .execute(pool)
     .await
     .unwrap();
+}
+
+async fn seed_open_offline_session(pool: &SqlitePool) {
+    let session_id = OfflineSessionId::new();
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, ?, '2026-06-09T00:00:00Z')",
+    )
+    .bind(session_id)
+    .bind(FN)
+    .bind(OfflineSessionState::Open.as_str())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn seed_offline_code(pool: &SqlitePool, code_lnd: i64) {
+    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_lnd) VALUES (?, ?)")
+        .bind(FN)
+        .bind(code_lnd)
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 async fn seed_inbox_sell_keyed(pool: &SqlitePool, idem: &str) -> InboxRow {
@@ -554,12 +887,20 @@ async fn offline_sell_lands_offline_local_ack() {
     let out = run_op(&mut ctx, &Op::OfflineSell).await;
     match out {
         RealOutcome::Doc(d) => {
-            assert_eq!(d.doc_state, DocState::OfflineLocalAck, "offline issuance is local");
+            assert_eq!(
+                d.doc_state,
+                DocState::OfflineLocalAck,
+                "offline issuance is local"
+            );
             assert_eq!(d.code_consumed, Some(1), "one offline code consumed");
         }
         other => panic!("expected Doc(OfflineLocalAck), got {other:?}"),
     }
-    assert_eq!(ctx.send_calls(), 0, "offline issuance must NOT touch the wire");
+    assert_eq!(
+        ctx.send_calls(),
+        0,
+        "offline issuance must NOT touch the wire"
+    );
 }
 
 #[tokio::test]
@@ -580,7 +921,11 @@ async fn drain_after_going_online_advances_backlog_to_ack() {
     let _ = run_op(&mut ctx, &Op::OfflineSell).await;
     ctx.force_node_mode(NodeMode::GoingOnline).await; // fixture setter (test setup)
     let _ = run_op(&mut ctx, &Op::Drain(DpsScript::ack_path())).await;
-    assert_eq!(ctx.only_doc_state().await, DocState::Ack, "drain advances the backlog doc to ACK");
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Ack,
+        "drain advances the backlog doc to ACK"
+    );
 }
 
 #[tokio::test]
