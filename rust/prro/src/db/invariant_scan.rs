@@ -336,6 +336,30 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
         out.push(Violation::OfflineOriginWithoutSession { document_id_hex });
     }
 
+    // Mirror-1 (SW-5b — m3b §5 load-bearing): node_state.shift_state MUST equal
+    // the active shifts.state for current_shift_id.  Closes the only uncovered
+    // load-bearing mirror (Mirror-2 = check 6d, Mirror-3 = check 5).
+    // `current_shift_id IS NOT NULL` excludes the NC-03 / bootstrap NULL-pointer
+    // case (no legitimate at-rest row trips it); the scan runs on a quiescent
+    // boundary where apply_shift_transition (RS-3 C1) has already synced both
+    // sides atomically.
+    let mirror_drift: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT ns.fiscal_number, ns.shift_state, s.state \
+         FROM node_state ns \
+         JOIN shifts s ON s.shift_id = ns.current_shift_id \
+         WHERE ns.current_shift_id IS NOT NULL \
+           AND ns.shift_state != s.state",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (fiscal_number, node_state_shift_state, shifts_state) in mirror_drift {
+        out.push(Violation::ShiftStateMirrorDrift {
+            fiscal_number,
+            node_state_shift_state,
+            shifts_state,
+        });
+    }
+
     Ok(out)
 }
 
