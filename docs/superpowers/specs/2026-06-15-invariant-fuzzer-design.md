@@ -51,33 +51,46 @@ invalid/re-entry/replay ops; the reference model + the three-layer oracle; mirro
 **Explicit non-goals (Phase 0):** SHIFT_OPEN / SHIFT_CLOSE / Z_REPORT as fuzzer ops — `inline::run` is
 **SELL/RETURN-only and fail-closes SHIFT_OPEN + Z-class before acquire** (`inline.rs:392`), so they are
 not a live seam; the shift is pre-seeded as a fixture, never opened via direct SQL in the interpreter.
-RETURN, national-cashback, the second (EVPZ) egress channel — not yet built in the gateway. A model that
-*predicts* arbitrary recovery (Phase 2). A byte-differential vs. the predecessor product (Phase 1b). CI
-integration (Phase 3).
+national-cashback and the second (EVPZ) egress channel — not yet built in the gateway. **RETURN is
+*live*** in the inline path (`inline.rs:1` — "SELL/RETURN only"; green ACK test
+`write_path_inline.rs:1029` `online_return_reaches_ack`) but is excluded from Phase 0 for MVP narrowness;
+it is high-value to add **early in Phase 2** (RT-3: zero RETURN goldens today). A model that *predicts*
+arbitrary recovery (Phase 2). A byte-differential vs. the predecessor product (Phase 1b). CI integration
+(Phase 3).
 
 ## 4. Architecture (five independently-testable units)
 
 1. **Operation generator** (`proptest`). Emits `Vec<Op>` mixing valid and invalid/re-entry ops (§5).
    Owns shrinking.
 2. **Interpreter / driver.** Maps each `Op` to a real seam against a live test SQLite DB. Reuses
-   `inline::run`, `backlog_drain::drain`, `run_boot_reconciliation` (W2 `ReconcileGuard` test seam),
-   node-mode setters, and the DPS adversary.
+   `inline::run`, `backlog_drain::drain`, `run_boot_reconciliation` (W2 `ReconcileGuard` test seam), the
+   **return-online probe** (`return_online_probe::run_tick_for_fn`), and the DPS adversary. **Raw
+   node-mode setters are fixture / state-construction ONLY** (e.g. pre-seeding `Offline`); a transition OP
+   MUST drive its real seam, never a setter (see §5) — a setter bypasses the seam's idempotent-no-op,
+   audit, and refusal behaviour, which is where the bugs live.
 3. **`ScriptedDps`** (extracted from today's two `KpStub` copies — see §10). A reusable `DpsChannel`
    stub: response queue, call log, envelope spy, hang-on-call (for crash injection), deterministic
    unexpected-call error.
 4. **Reference model.** In-memory predictor of the expected ledger (§6).
 5. **Oracle.** The three-layer assertion engine (§7) + mirror-drift checks (§8).
 
-Determinism: `synchronous=FULL` + cancellation-injection (the DPS stub hangs and the test drops the
-in-flight future at a chosen stage — "committed survives, in-flight rolls back"). Fixed `proptest`
-seed ⇒ deterministic replay; shrinking ⇒ minimal repro.
+Determinism: `synchronous=FULL`. Crash injection uses the **two mechanisms the kill-point matrix already
+uses** — implementers must NOT invent timing hooks inside a DB transaction: (a) **drop-injection** for a
+crash at a **wire await** (the DPS stub hangs on the send / lastChk call and the test drops the in-flight
+future — "committed survives, in-flight rolls back"); (b) **stage-composition / manual CAS** for a crash
+at a **committed-envelope boundary** (no future to drop mid-`with_immediate`; the test runs the stages up
+to the boundary, stops, then reboots). Fixed `proptest` seed ⇒ deterministic replay; shrinking ⇒ minimal
+repro.
 
 ## 5. Operation alphabet
 
-**Valid:** `online_sell` (`inline::run`, Online node) · `go_offline` / `go_online` · `offline_sell`
-(consumes an offline code) · `drain` · `crash@{acquire, sign, send, kvt1, kvt2, finalize, offline_ack,
-drain}` → `reboot` · per-wire-call DPS response (ack / reject / timeout / superseded-tip /
-`ERROR_BAD_HASH_PREV` / not-found).
+**Valid:** `online_sell` (`inline::run`, Online node) · `go_online` / `go_offline` (**real transition
+seams, NOT raw setters**: `go_online` drives `return_online_probe::run_tick_for_fn` for
+`Offline→GoingOnline`, then `drain` for `GoingOnline→Online` — exercising the probe's idempotent-no-op /
+audit / mode-refusal logic; `go_offline` via its offline-fallback trigger) · `offline_sell` (consumes an
+offline code) · `drain` · `crash@{acquire, sign, send, kvt1, kvt2, finalize, offline_ack, drain}` →
+`reboot` · per-wire-call DPS response (ack / reject / timeout / superseded-tip / `ERROR_BAD_HASH_PREV` /
+not-found).
 
 **Invalid / re-entry / replay (load-bearing for the drain-reentry + shared-fn-caller classes):**
 `repeat_drain` · `repeat_reboot` · `duplicate_idempotency_key` (replay) · `go_online_without_backlog` ·
@@ -121,7 +134,11 @@ deterministically.
 
 After every quiescent boundary, assert the load-bearing mirrors are consistent:
 - `shifts.state` ↔ `node_state.shift_state` (the m3b §5 mirror, owned by `apply_shift_transition`).
-- active `offline_session` ↔ the `drain_cohort` selected by `list_drain_candidates_for_fn_ordered_by_lnd`.
+- `offline_session` ↔ `drain_cohort` — **exact predicates** (an active/open session with an *empty*
+  cohort is LEGAL — do NOT false-positive on it): (a) every drain-cohort doc has a non-null
+  `offline_session_id` equal to the selected active/draining session; (b) no *eligible* offline-origin doc
+  is invisible to the cohort; (c) an empty active session is allowed. (`list_drain_candidates_for_fn_ordered_by_lnd`;
+  `invariant_scan` check-6d `OfflineOriginWithoutSession` partially covers this.)
 - `ingress_inbox` status ↔ `fiscal_documents` ledger (the replay-resolver consistency, `replay.rs`).
 
 Where `invariant_scan` already covers a mirror, reuse it; where it does not, the fuzzer adds the
@@ -174,7 +191,8 @@ absent).
   assertions (§9) close this for the known crash points; the full closure is Phase 2.
 - **Detection + reproduction, not diagnosis.** Finds and minimizes failing sequences automatically;
   root-causing and fixing remain manual.
-- **Feature coverage = built features.** Cannot test SHIFT_OPEN/Z/RETURN/EVPZ until they are live seams.
+- **Feature coverage = built features.** Cannot test SHIFT_OPEN / Z / EVPZ until they are live seams.
+  (RETURN *is* live — see §3 — and is excluded only for Phase-0 narrowness.)
 
 ## 13. Audit trail
 
@@ -185,6 +203,14 @@ pre-seeded open shift (no SHIFT_OPEN/Z via `inline::run`); (5) `ScriptedDps` ext
 test-support; (6) `invariant_scan` only at quiescent boundaries; (+) fifth class — projection/mirror
 drift — added.
 
+**Second audit (spec review, 2026-06-15), all folded:** (1) reproducible teeth-test with an exact
+revert-target (AUD-K8-1, `backlog_drain.rs:725`) + command; (2) RETURN corrected — it is *live*
+(`inline.rs` SELL/RETURN, green test), excluded only for Phase-0 narrowness; (3) transition ops drive
+real seams (`go_online` → `return_online_probe::run_tick_for_fn` + drain), raw setters are fixture-only;
+(4) mirror-2 exact predicates (an empty active session is legal — no false positive); (5) crash injection
+split into wire-await drop-injection vs. committed-envelope stage-composition (no timing hooks inside a
+DB tx).
+
 ## 14. Acceptance criteria (MVP done)
 
 - `proptest` strategy generates valid + invalid/re-entry sequences over the §5 alphabet, honoring
@@ -192,6 +218,15 @@ drift — added.
 - Interpreter drives every op through the real seams; `ScriptedDps` is the shared stub.
 - Reference model + differential pass on a known-good corpus; the three-layer oracle + mirror checks run
   at quiescent boundaries.
-- The fuzzer **re-discovers at least one historical defect** when run against the pre-fix commit (e.g.
-  M2-N1 or AUD-K8-1) and shrinks it to a minimal sequence — proving the oracle has teeth.
+- **Teeth test (hard gate, reproducible).** The fuzzer must re-discover a known historical defect via a
+  *revert-on-current-main* procedure — the fuzzer is new code, so it cannot run at the historical commit
+  where it did not exist; instead revert the specific fix on current `main`, run the fuzzer, confirm the
+  finding + shrink, then restore. **Concrete target — AUD-K8-1:** revert the drain-entry RMR re-entry
+  guard (`backlog_drain.rs:725` — the `if ns.shift_state == RequiresManualReconciliation { return
+  Ok(DrainSummary::new(fn, 0)) }` block; landed in fix `a171f18`, PR #168); run `cargo nextest run -p prro
+  --features test-support <fuzzer_test>`; confirm the fuzzer finds the re-tick **re-drive / busy-loop** (a
+  manual-recon FN re-driven by the next drain tick — no idempotent halt) and **shrinks** it to a minimal
+  `[…, escalate, re-tick]` sequence; restoring the guard returns the fuzzer to green. A second target —
+  **M2-N1** (revert the strict-sequential halt → fuzzer finds the orphaned-successor send) — is
+  recommended once the alphabet covers it.
 - A failing seed replays deterministically and produces a minimal repro.
