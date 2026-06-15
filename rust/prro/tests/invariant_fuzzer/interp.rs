@@ -545,3 +545,72 @@ async fn crash_send_then_reboot_recovers_without_panic_or_resend() {
         "send_chk total stays 1 across crash + reboot — auto-resend is forbidden"
     );
 }
+
+// ── Task 3 Part A — directed per-arm tests for the completed run_op arms ─────
+
+#[tokio::test]
+async fn offline_sell_lands_offline_local_ack() {
+    let mut ctx = FuzzCtx::new_offline_open_shift(1).await;
+    let out = run_op(&mut ctx, &Op::OfflineSell).await;
+    match out {
+        RealOutcome::Doc(d) => {
+            assert_eq!(d.doc_state, DocState::OfflineLocalAck, "offline issuance is local");
+            assert_eq!(d.code_consumed, Some(1), "one offline code consumed");
+        }
+        other => panic!("expected Doc(OfflineLocalAck), got {other:?}"),
+    }
+    assert_eq!(ctx.send_calls(), 0, "offline issuance must NOT touch the wire");
+}
+
+#[tokio::test]
+async fn go_online_after_backlog_drains_to_ack() {
+    let mut ctx = FuzzCtx::new_offline_open_shift(1).await;
+    let _ = run_op(&mut ctx, &Op::OfflineSell).await; // backlog: one OFFLINE_LOCAL_ACK doc
+    let _ = run_op(&mut ctx, &Op::GoOnline(DpsScript::ack_path())).await;
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Ack,
+        "GoOnline probes (status_rro) Offline→GoingOnline, then drains the backlog to ACK"
+    );
+}
+
+#[tokio::test]
+async fn drain_after_going_online_advances_backlog_to_ack() {
+    let mut ctx = FuzzCtx::new_offline_open_shift(1).await;
+    let _ = run_op(&mut ctx, &Op::OfflineSell).await;
+    ctx.force_node_mode(NodeMode::GoingOnline).await; // fixture setter (test setup)
+    let _ = run_op(&mut ctx, &Op::Drain(DpsScript::ack_path())).await;
+    assert_eq!(ctx.only_doc_state().await, DocState::Ack, "drain advances the backlog doc to ACK");
+}
+
+#[tokio::test]
+async fn sell_with_closed_shift_is_refused() {
+    let mut ctx = FuzzCtx::new_online_open_shift().await;
+    let out = run_op(&mut ctx, &Op::SellWithClosedShift).await;
+    assert!(
+        matches!(out, RealOutcome::Refused(_)),
+        "a sell against a closed shift must be a typed refusal; got {out:?}"
+    );
+}
+
+#[tokio::test]
+async fn crash_kvt1_leaves_sent_committed() {
+    let mut ctx = FuzzCtx::new_online_open_shift().await;
+    let out = run_op(&mut ctx, &Op::Crash(Stage::Kvt1)).await;
+    match out {
+        RealOutcome::Crashed {
+            stage,
+            committed_state,
+        } => {
+            assert_eq!(stage, Stage::Kvt1);
+            // hang_last parks on the lastChk await AFTER Sending→Sent committed.
+            assert_eq!(
+                committed_state,
+                Some(DocState::Sent),
+                "crash@kvt1 (hang_last) leaves SENT durably committed"
+            );
+        }
+        other => panic!("expected Crashed{{Kvt1}}, got {other:?}"),
+    }
+    assert_eq!(ctx.send_calls(), 1, "one send_chk before the lastChk crash");
+}
