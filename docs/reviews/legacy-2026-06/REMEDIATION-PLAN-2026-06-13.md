@@ -185,6 +185,19 @@ split `ChainSeedMismatch` out of the `StructuralDrift` arm in inline and route i
 is `UnimplementedWritePath` until the flip). The `m1_02_online_seed_fork_a24_prerequisite` RED-pin + the
 `supervisor.rs:180` barrier already gate the flip — SW-4 rides the same gate.
 
+**SW-5a (cross-class re-pass 2026-06-15, LOW/latent — prerequisite for the §16.7 operator-force runtime
+wiring, NOT A2.4):** the operator force seams `force_to_manual_reconciliation_with_audit` /
+`force_to_error_with_audit` (`shifts.rs`) raw-write `UPDATE shifts SET state=…` **without** the
+`node_state.shift_state` mirror update — they bypass `apply_shift_transition` entirely. Verified **ZERO
+runtime callers today** (only the pub-fn defs + tests), so this is latent. **Before wiring these seams to
+a runtime path (§16.7 operator-driven force / manual-recon), route them through
+`shift_transition::apply_shift_transition`** (shift CAS + `node_state.shift_state` mirror in ONE
+`with_immediate`, fails-loud on `rows_affected != 1`) — OR have the seam additionally CAS the mirror in
+the same tx — so `shifts.state ↔ node_state.shift_state` stay lock-step. Post-condition:
+`node_state.shift_state == active shifts.state` after the force. The SW-5b `invariant_scan` check
+(`Violation::ShiftStateMirrorDrift`, merged #177) now machine-detects any residual desync. (Companion:
+SW-5b closed the *detector*; SW-5a closes the *writer* when it goes live.)
+
 **Anchors (`93904a7`):** seed read `stage_sign.rs:279-302`; online advance `stage_finalize.rs:285-321`;
 M2-01 offline ref `stage_offline_ack.rs:339-385`; Hold-at-SENT `inline.rs:748-758`; no-advance
 `stage_send.rs:1352-1360`; `advance_to_ack` collapse `kvt2_advance.rs:206-211`; drain wedge endpoint
