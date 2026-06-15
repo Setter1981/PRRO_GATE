@@ -2350,6 +2350,23 @@ async fn trigger_tier_2_stop_mode(
     Ok(())
 }
 
+/// Outcome of [`escalate_fn_to_manual_recon`] (sweep SW-3).  The escalation must
+/// NOT silently no-op: callers MUST distinguish a real shift→RMR escalation from
+/// a non-escalatable shift, else a drain that "halts" on an un-CAS'd shift
+/// busy-loops (shift never RMR → AUD-K8-1 guard never fires → re-drain).
+#[must_use]
+pub(crate) enum EscalationOutcome {
+    /// The shift was CAS'd to RequiresManualReconciliation (or was already RMR —
+    /// the idempotent no-op).  A durable operator surface now exists.
+    Escalated,
+    /// No RMR-escalatable shift: NULL current_shift_id OR a non-whitelisted
+    /// from-state (e.g. a stale pointer dangling on a Closed shift).  NO CAS
+    /// happened; only the no-shift audit was emitted.  The caller decides
+    /// fatality — the drain treats it as a structural drift (fail-loud); boot /
+    /// convergence treat it as a legitimate operator surface (proceed).
+    NoEscalatableShift,
+}
+
 /// Shared FN → Manual-reconciliation escalation seam (AUD-L2-1b; generalised
 /// from the W9b C4 drain seam — spec amendment 2026-05-21 +
 /// `LEGAL_INVARIANTS.md` §INV-19 + spec §6.3).
@@ -2388,11 +2405,11 @@ pub(crate) async fn escalate_fn_to_manual_recon(
     halt_position: usize,
     event_name: &'static str,
     no_shift_event: &'static str,
-) -> Result<(), BootError> {
+) -> Result<EscalationOutcome, BootError> {
     let from_state = ns.shift_state;
     // Idempotent no-op: already escalated (re-ticking convergence / re-boot).
     if from_state == ShiftState::RequiresManualReconciliation {
-        return Ok(());
+        return Ok(EscalationOutcome::Escalated);
     }
     // Non-escalatable shift → operator surface WITHOUT a CAS (NEVER a Forbidden
     // CAS that would crash the caller).  Two cases collapse here:
@@ -2427,7 +2444,7 @@ pub(crate) async fn escalate_fn_to_manual_recon(
         )
         .await
         .map_err(BootError::Database)?;
-        return Ok(());
+        return Ok(EscalationOutcome::NoEscalatableShift);
     }
     let shift_id: ShiftId = ns
         .current_shift_id
@@ -2486,7 +2503,7 @@ pub(crate) async fn escalate_fn_to_manual_recon(
             from = from_state,
         )));
     }
-    Ok(())
+    Ok(EscalationOutcome::Escalated)
 }
 
 /// W9b C4 drain manual-escalation wrapper — preserves the
@@ -2501,7 +2518,7 @@ async fn escalate_drain_to_manual(
     failure_class: &str,
     halt_position: usize,
 ) -> Result<(), BootError> {
-    escalate_fn_to_manual_recon(
+    match escalate_fn_to_manual_recon(
         pool,
         fiscal_number,
         ns,
@@ -2509,11 +2526,24 @@ async fn escalate_drain_to_manual(
         failure_class,
         halt_position,
         "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL",
-        // The drain only escalates active (Opened / pending-drain) shifts, so the
-        // no-shift surface is unreachable here; pass a coherent event for safety.
         "OFFLINE_DRAIN_HALTED_NO_ESCALATABLE_SHIFT",
     )
-    .await
+    .await?
+    {
+        EscalationOutcome::Escalated => Ok(()),
+        // **sweep SW-3**: the drain only escalates ACTIVE (Opened / pending-drain)
+        // shifts, so a non-escalatable shift in the escalate path is a structural
+        // drift (e.g. a SEAM-D-1 mirror desync) — FAIL LOUD, never silent-halt.
+        // Silent-Ok would busy-loop: the drain "halts" but the shift never reached
+        // RMR → the AUD-K8-1 entry guard never fires next tick → re-drain →
+        // re-SupersededHeld forever.
+        EscalationOutcome::NoEscalatableShift => Err(BootError::Internal(format!(
+            "escalate_drain_to_manual({fiscal_number}): drain escalation found NO \
+             RMR-escalatable shift (shift_state={state}) — structural drift; the \
+             drain only runs on active Opened/pending-drain shifts",
+            state = ns.shift_state.as_str(),
+        ))),
+    }
 }
 
 // RS-3 C1: the `node_state.shift_state` mirror (m3b §5 load-bearing

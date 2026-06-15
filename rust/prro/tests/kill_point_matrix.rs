@@ -2832,3 +2832,235 @@ async fn boot_kvt2_chain_seed_mismatch_closed_shift_no_abort() {
         "no escalation audit — the shift is not RMR-escalatable"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// SW-1 (M1-M2 sweep) — boot must NOT re-drive a RMR-but-Online FN.
+//
+// AUD-K8-1's RMR re-entry guard lives only in the drain (backlog_drain.rs).
+// run_boot_reconciliation has no equivalent, so an FN escalated to
+// shift_state==RMR while mode stays ONLINE (exactly the state Batch C's
+// convergence / boot-KVT2 escalate_fn_to_manual_recon creates — it CAS's the
+// shift to RMR but leaves mode) falls past the mode-gates (branch (d) only
+// catches GoingOnline; branch (f) only Blocked/StopMode/CryptoDegraded) into the
+// per-doc dispatch → a halted FN's resting doc is RE-DRIVEN (real DPS wire).
+//
+// On main this FAILS: the SENT doc is probed (last_chk fired) + advanced.
+// GREEN: a RMR short-circuit (mirror of AUD-K8-1) skips the FN — 0 wire, doc
+// untouched.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn boot_skips_rmr_but_online_fn_no_redrive() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await; // mode=Online, shift_state=Opened
+    let row = seed_inbox_sell(&pool).await;
+
+    let send_calls = Arc::new(AtomicUsize::new(0));
+    let last_calls = Arc::new(AtomicUsize::new(0));
+
+    // Build a resting SENT doc (inline::run lastChk-Hold).
+    let phase1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    phase1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    phase1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → Hold → SENT
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    inline::run(
+        &pool,
+        &pool_secure,
+        &phase1,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+    )
+    .await
+    .expect("online SELL Hold rests at SENT");
+    drop(guard);
+    assert_eq!(read_doc_state(&pool, FN).await, "SENT");
+
+    // The Batch-C escalation state: shift CAS'd to RMR, mode LEFT at Online.
+    sqlx::query("UPDATE shifts SET state = 'REQUIRES_MANUAL_RECONCILIATION' WHERE shift_id = ?")
+        .bind(shift_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE node_state SET shift_state = 'REQUIRES_MANUAL_RECONCILIATION' WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Boot WITH deps + a stub that WOULD answer the SENT probe (Match → advance).
+    let phase2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    let sign_ctx2 = det_signing_ctx();
+    let fn_sign2 = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &phase2,
+        signing_ctx: &sign_ctx2,
+        fn_sign: &fn_sign2,
+    };
+    boot_phase::run_boot_reconciliation(&recon_guard(), &pool, FN, Some(&view))
+        .await
+        .expect("boot reconciliation returns Ok (RMR FN skipped, not re-driven)");
+
+    // GREEN: a halted (RMR) FN is NOT re-driven by boot — doc untouched, no
+    // ADDITIONAL wire beyond construction.
+    assert_eq!(
+        read_doc_state(&pool, FN).await,
+        "SENT",
+        "RMR FN's resting doc must NOT be re-driven by boot"
+    );
+    assert_eq!(
+        last_calls.load(Ordering::SeqCst),
+        1,
+        "only the construction Hold lastChk — boot does NOT re-probe a halted (RMR) FN"
+    );
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        1,
+        "only the construction send — boot does NOT resend a halted FN"
+    );
+    prro::db::invariant_scan::assert_clean(&pool).await;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SW-3 (M1-M2 sweep) — drain SupersededHeld × escalate silent-Ok = busy-loop.
+//
+// Cross-edit hazard (Batch C, EDIT-E class).  C-2 (11fa4b7) made
+// escalate_fn_to_manual_recon return silent-Ok on a NON-escalatable shift (the
+// no-shift audit path); C-1 (ae3f832) made DocVerdict::SupersededHeld reachable
+// on the drain's Kvt1Reentry path.  Combined — a superseded drain head on an FN
+// whose shift mirror is non-escalatable (SEAM-D-1 desync: a stale
+// current_shift_id dangling on a Closed shift) — the drain-loop calls
+// escalate_drain_to_manual, which (pre-fix) silently returns Ok WITHOUT a
+// CAS→RMR.  The drain "halts", but the shift is NOT RMR, so the AUD-K8-1 drain
+// entry guard never fires next tick → re-drain → re-SupersededHeld (the doc
+// stays KVT1, no state change) → BUSY-LOOP / never-durably-halted FN.
+//
+// On main this FAILS: drain returns silent-Ok (not Err).  GREEN: the drain
+// wrapper fails LOUD on a non-escalatable shift (for the drain, which only runs
+// on active Opened/pending-drain shifts, this is a structural drift).
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn drain_superseded_on_nonescalatable_shift_fails_loud_not_busyloop() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_offline(&pool, shift_id).await;
+    seed_open_offline_session(&pool).await;
+    seed_offline_code(&pool, 1).await;
+    seed_offline_code(&pool, 2).await;
+
+    let send_calls = Arc::new(AtomicUsize::new(0));
+    let last_calls = Arc::new(AtomicUsize::new(0));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+
+    // Two offline SELLs → OFFLINE_LOCAL_ACK (mirror drain_kvt1_reentry_superseded).
+    for (idem, n) in [("idem-sw3-doc1", 1u8), ("idem-sw3-doc2", 2)] {
+        let row = seed_inbox_sell_keyed(&pool, idem).await;
+        let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = gate.lock_owned().await;
+        let outcome = inline::run(
+            &pool,
+            &pool_secure,
+            &stub,
+            &sign_ctx,
+            &fn_sign,
+            &guard,
+            &row,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("offline SELL {n} must land OFFLINE_LOCAL_ACK: {e:?}"));
+        assert_eq!(outcome.document_state, DocState::OfflineLocalAck);
+        drop(guard);
+    }
+
+    // doc1 (lnd=1) → KVT1, doc2 (lnd=2) → SENT; doc2.sfn supersedes doc1.
+    let doc1_id = doc_id_by_lnd(&pool, 1).await;
+    let doc2_id = doc_id_by_lnd(&pool, 2).await;
+    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            fiscal_documents::transition_state(
+                tx,
+                doc1_id,
+                DocState::OfflineLocalAck,
+                DocState::Sent,
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+            fiscal_documents::transition_state(tx, doc1_id, DocState::Sent, DocState::Kvt1)
+                .await
+                .map_err(anyhow::Error::from)?;
+            document_files::replace_tx(tx, doc1_id, DocumentFileKind::Kvt1Raw, &kvt1_bytes).await?;
+            fiscal_documents::transition_state(
+                tx,
+                doc2_id,
+                DocState::OfflineLocalAck,
+                DocState::Sent,
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .expect("stage doc1→KVT1 + doc2→SENT");
+    stamp_server_fiscal_no(&pool, 1, SERVER_FISCAL_NO).await;
+    stamp_server_fiscal_no(&pool, 2, "DPS-FN-ONLINE-2").await;
+
+    set_node_mode(&pool, NodeMode::GoingOnline).await;
+
+    // Make the shift NON-escalatable: a stale current_shift_id dangling on a
+    // CLOSED shift (SEAM-D-1 mirror-desync).  (Closed → RMR) is not whitelisted.
+    sqlx::query("UPDATE shifts SET state = 'CLOSED' WHERE shift_id = ?")
+        .bind(shift_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE node_state SET shift_state = 'CLOSED' WHERE fiscal_number = ?")
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let phase2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    phase2.push_last(Err(DpsError::ServerFiscalIdMismatch {
+        expected_id: SERVER_FISCAL_NO.to_string(),
+        actual_id: "DPS-FN-ONLINE-2".to_string(),
+    }));
+    let sign_ctx2 = det_signing_ctx();
+    let fn_sign2 = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &phase2,
+        signing_ctx: &sign_ctx2,
+        fn_sign: &fn_sign2,
+    };
+
+    let result = backlog_drain::drain(&recon_guard(), &pool, &view, FN).await;
+
+    // GREEN: a non-escalatable shift in the escalate path is a structural drift —
+    // fail LOUD, NOT silent-Ok (which would busy-loop: drain "halts" but shift≠RMR
+    // → AUD-K8-1 guard never fires → re-drain → re-SupersededHeld forever).
+    assert!(
+        result.is_err(),
+        "drain on a non-escalatable (Closed) shift must fail-loud, not silent-halt → busy-loop"
+    );
+    // Busy-loop premise: the non-escalatable path took no CAS — shift is not RMR.
+    assert_ne!(
+        read_shift_state_by_id(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "non-escalatable path took no CAS — shift never reached RMR"
+    );
+}

@@ -500,6 +500,9 @@ pub struct ReconciliationSummary {
     pub branch_f_blocked: usize,
     pub branch_f_stop_mode: usize,
     pub branch_f_crypto_degraded: usize,
+    /// (f4) sweep SW-1 — FNs preserved at boot because shift_state==RMR
+    /// (manual-recon-halted) — counted so operators see halted FNs at boot.
+    pub branch_f_manual_recon: usize,
     /// Aggregated per-DocState dispatch outcomes across all FNs
     /// processed in this `reconcile_pending` call.  Tied to L1
     /// histogram payload — same shape, multi-FN union.
@@ -545,6 +548,7 @@ impl ReconciliationSummary {
             BranchOutcome::PreservedBlocked => self.branch_f_blocked += 1,
             BranchOutcome::PreservedStopMode => self.branch_f_stop_mode += 1,
             BranchOutcome::PreservedCryptoDegraded => self.branch_f_crypto_degraded += 1,
+            BranchOutcome::PreservedManualRecon => self.branch_f_manual_recon += 1,
             BranchOutcome::BlockedLedgerWithoutNodeState => {
                 self.branch_a_blocked_ledger_survived += 1
             }
@@ -1331,6 +1335,12 @@ pub enum BranchOutcome {
     PreservedBlocked,
     PreservedStopMode,
     PreservedCryptoDegraded,
+    /// (f4) sweep SW-1 — shift_state==RMR (a manual-reconciliation-halted FN)
+    /// while mode ∈ {Online, Offline, GoingOffline} (the Batch-C convergence /
+    /// boot-KVT2 escalation leaves mode; GoingOnline+RMR is branch (d)).  Boot
+    /// PRESERVES it — no per-doc dispatch — until operator resolution.  No wire,
+    /// no doc-state transition.  Mirrors the drain's AUD-K8-1 re-entry guard.
+    PreservedManualRecon,
     /// (a-block) NC-03 (external-critic FT, adjudicated 2026-06-11): the FN's
     /// `node_state` row was absent BUT the `fiscal_documents` ledger survived
     /// (partial restore / corruption / rebaseline).  Branch (a) did NOT silently
@@ -1356,6 +1366,7 @@ impl BranchOutcome {
             BranchOutcome::PreservedBlocked => "f1",
             BranchOutcome::PreservedStopMode => "f2",
             BranchOutcome::PreservedCryptoDegraded => "f3",
+            BranchOutcome::PreservedManualRecon => "f4",
             BranchOutcome::BlockedLedgerWithoutNodeState => "a-block",
         }
     }
@@ -1791,6 +1802,34 @@ pub async fn run_boot_reconciliation(
         )
         .await?;
         return Ok(outcome);
+    }
+
+    // ── sweep SW-1 — RMR re-entry guard (AUD-K8-1 parity) ─────────
+    // A FN escalated to shift_state==RMR while mode stayed
+    // {Online, Offline, GoingOffline} (the Batch-C convergence / boot-KVT2
+    // escalate_fn_to_manual_recon CAS's the shift to RMR but leaves mode;
+    // GoingOnline+RMR drain-escalation already returns at branch (d)) is
+    // HALTED until operator resolution.  Boot must NOT re-drive its pending
+    // docs (per-doc dispatch → real DPS wire on a halted FN).  Mirror the
+    // drain() entry guard (backlog_drain.rs): preserve + one Info audit, no
+    // dispatch.  Placed BEFORE the pending SELECT + per-doc loop.
+    if row.shift_state == ShiftState::RequiresManualReconciliation {
+        let payload = serde_json::json!({
+            "fiscal_number": fiscal_number,
+            "branch": BranchOutcome::PreservedManualRecon.branch_tag(),
+            "observed_mode": row.mode.as_str(),
+        });
+        audit_log::append(
+            pool,
+            "node_state",
+            fiscal_number,
+            "NODE_STATE_BOOT_MANUAL_RECON_PRESERVED",
+            crate::db::models::enums::Severity::Info,
+            None,
+            Some(&payload.to_string()),
+        )
+        .await?;
+        return Ok(BranchOutcome::PreservedManualRecon);
     }
 
     // From here: row.mode is one of {Online, Offline, GoingOffline}.
@@ -3604,7 +3643,11 @@ async fn dispatch_pending_doc(
                                 doc.fiscal_number
                             )
                         })?;
-                    crate::services::offline_sync::backlog_drain::escalate_fn_to_manual_recon(
+                    // sweep SW-3: both EscalationOutcome arms proceed here —
+                    // Escalated emitted the ESCALATE_MANUAL audit; NoEscalatableShift
+                    // (a stray Kvt2 on a closed / non-active shift) emitted the
+                    // NO_SHIFT audit.  Either way the doc stays Kvt2 + boot continues.
+                    let _ = crate::services::offline_sync::backlog_drain::escalate_fn_to_manual_recon(
                         pool,
                         &doc.fiscal_number,
                         &ns,
