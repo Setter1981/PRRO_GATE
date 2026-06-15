@@ -775,3 +775,71 @@ async fn detects_offline_origin_without_session() {
          online + drained-ACK excluded: {v:#?}"
     );
 }
+
+// ─── SW-5b: Mirror-1 (shifts.state ↔ node_state.shift_state) ──────────────────
+
+/// RED→GREEN: `node_state.shift_state` != the active `shifts.state` for
+/// `current_shift_id` is the m3b §5 load-bearing mirror desync (Mirror-1).
+#[tokio::test]
+async fn detects_shift_state_mirror_drift() {
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await; // shifts.state = OPENED
+    seed_node_state(&pool, shift, None).await; // node_state.shift_state = OPENED, current_shift_id = shift
+                                               // Desync Mirror-1: drive the shifts row to RMR while node_state stays OPENED.
+    sqlx::query("UPDATE shifts SET state = 'REQUIRES_MANUAL_RECONCILIATION' WHERE shift_id = ?")
+        .bind(shift)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let v = scan(&pool).await.unwrap();
+    assert!(
+        v.iter().any(|x| matches!(
+            x,
+            Violation::ShiftStateMirrorDrift {
+                fiscal_number,
+                node_state_shift_state,
+                shifts_state,
+            } if fiscal_number == FN
+                && node_state_shift_state == "OPENED"
+                && shifts_state == "REQUIRES_MANUAL_RECONCILIATION"
+        )),
+        "expected ShiftStateMirrorDrift, got: {v:#?}"
+    );
+}
+
+/// Benign (over-fire guard): a consistent mirror (node_state.shift_state ==
+/// shifts.state) must NOT trip the check.
+#[tokio::test]
+async fn clean_consistent_shift_state_mirror() {
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await; // shifts.state = OPENED
+    seed_node_state(&pool, shift, None).await; // node_state.shift_state = OPENED (consistent)
+    let v = scan(&pool).await.unwrap();
+    assert!(
+        !v.iter()
+            .any(|x| matches!(x, Violation::ShiftStateMirrorDrift { .. })),
+        "consistent mirror must NOT flag ShiftStateMirrorDrift: {v:#?}"
+    );
+}
+
+/// Benign (over-fire guard): a NULL `current_shift_id` (NC-03 / bootstrap class)
+/// must NOT trip the check even when shift_state differs from any shifts row —
+/// the `current_shift_id IS NOT NULL` predicate excludes it.
+#[tokio::test]
+async fn clean_null_current_shift_id_no_mirror_drift() {
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await; // a shifts row exists (OPENED), but unpointed
+    seed_node_state(&pool, shift, None).await;
+    // NULL the pointer + diverge shift_state — the check must still skip it.
+    sqlx::query("UPDATE node_state SET current_shift_id = NULL, shift_state = 'CLOSED' WHERE fiscal_number = ?")
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let v = scan(&pool).await.unwrap();
+    assert!(
+        !v.iter()
+            .any(|x| matches!(x, Violation::ShiftStateMirrorDrift { .. })),
+        "NULL current_shift_id must NOT flag ShiftStateMirrorDrift: {v:#?}"
+    );
+}
