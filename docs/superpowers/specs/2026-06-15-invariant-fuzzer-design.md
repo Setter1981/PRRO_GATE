@@ -84,13 +84,20 @@ repro.
 
 ## 5. Operation alphabet
 
-**Valid:** `online_sell` (`inline::run`, Online node) · `go_online` / `go_offline` (**real transition
-seams, NOT raw setters**: `go_online` drives `return_online_probe::run_tick_for_fn` for
-`Offline→GoingOnline`, then `drain` for `GoingOnline→Online` — exercising the probe's idempotent-no-op /
-audit / mode-refusal logic; `go_offline` via its offline-fallback trigger) · `offline_sell` (consumes an
-offline code) · `drain` · `crash@{acquire, sign, send, kvt1, kvt2, finalize, offline_ack, drain}` →
-`reboot` · per-wire-call DPS response (ack / reject / timeout / superseded-tip / `ERROR_BAD_HASH_PREV` /
+**Valid:** `online_sell` (`inline::run`, Online node) · `go_online` (**the one real transition op**:
+drives `return_online_probe::run_tick_for_fn` for `Offline→GoingOnline`, then `drain` for
+`GoingOnline→Online` — exercising the probe's idempotent-no-op / audit / mode-refusal logic) ·
+`offline_sell` (consumes an offline code) · `drain` · `crash@{acquire, sign, send, kvt1, kvt2, finalize,
+offline_ack, drain}` → `reboot` · per-wire-call DPS response (ack / reject / timeout / superseded-tip /
+`ERROR_BAD_HASH_PREV` /
 not-found).
+
+**No `go_offline` op (audit).** There is no live, callable `Online→GoingOffline/Offline` transition seam
+today (auto-offline lives in comments/specs, not a service entry point), so a `go_offline` op would
+violate this design's own rule ("a transition op MUST drive its real seam, never a setter"). **Phase 0
+therefore enters the offline lane by fixture / state-construction** (pre-seed `Offline`); `go_online` is
+the one real transition op. The organic auto-offline path (`online_sell` × DPS-failure → fallback) is
+deferred to Phase 2, contingent on a test-drivable seam.
 
 **Invalid / re-entry / replay (load-bearing for the drain-reentry + shared-fn-caller classes):**
 `repeat_drain` · `repeat_reboot` · `duplicate_idempotency_key` (replay) · `go_online_without_backlog` ·
@@ -160,8 +167,8 @@ them inside random *sequences*, not just the isolated K-tests.
 
 **Reused (~60% scaffolded):** `invariant_scan` (`invariant_scan.rs`); the cancellation-injection crash
 model and kill-point assertions (`kill_point_matrix.rs`); the determinism seams (`synchronous=FULL`,
-`inline::run`, `backlog_drain::drain`, `run_boot_reconciliation`, node-mode setters); the
-`OFFLINE_ISSUED_STATES` SSOT predicate.
+`inline::run`, `backlog_drain::drain`, `run_boot_reconciliation`, `return_online_probe::run_tick_for_fn`,
+**fixture** node-mode setters); the `OFFLINE_ISSUED_STATES` SSOT predicate.
 
 **New:** the operation generator (alphabet + `proptest` strategy + preconditions + invalid/re-entry ops);
 the reference model; the differential oracle layer; the bounded kill-point assertion reuse inside
