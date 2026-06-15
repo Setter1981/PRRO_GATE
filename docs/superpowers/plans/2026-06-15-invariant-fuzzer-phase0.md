@@ -73,7 +73,9 @@ ledger, reusing the gateway's issued-set predicate.
 
 **Interface:**
 - `enum Op` — valid: `OnlineSell`, `GoOnline`, `OfflineSell`, `Drain`, `Crash(Stage)`, `Reboot`; a
-  **`DpsScript`** carried on the wire-hitting ops; invalid/re-entry: `RepeatDrain`, `RepeatReboot`,
+  **`DpsScript`** carried on the wire-hitting ops (`OnlineSell` / `GoOnline` / `Drain`);
+  **`OfflineSell` issues LOCALLY — NO `DpsScript`** (offline issuance hits no wire; the offline doc's
+  later drain wire-responses come from the `Drain` op). Invalid/re-entry: `RepeatDrain`, `RepeatReboot`,
   `DuplicateIdemKey`, `GoOnlineWithoutBacklog`, `OfflineSellDuringGoingOnline`, `SellWithClosedShift`.
   (NO `GoOffline` op — offline is fixture-seeded, per spec §5.)
 - **`DpsScript` — NOT a single `DpsResp` (audit, MED).** A real path makes MULTIPLE wire calls
@@ -97,7 +99,7 @@ ledger, reusing the gateway's issued-set predicate.
 - [ ] `RefModel::apply(OnlineSell→ACK)` advances `next_lnd` by 1 and sets `seed` to that doc's unsigned hash; `apply(OfflineSell)` advances seed at `OFFLINE_LOCAL_ACK`.
 - [ ] The model's issued-set is `OFFLINE_ISSUED_STATES` (assert by referencing the const, not a literal).
 
-**Verify:** `cargo nextest run -p prro --features test-support -E 'test(invariant_fuzzer)'` → the model unit tests pass.
+**Verify:** `cargo nextest run -p prro --features test-support -E 'binary(invariant_fuzzer)'` → the model unit tests pass.
 
 **TDD:** RED — a unit test asserting `RefModel::apply` produces the expected lnd/seed for SELL/offline (fails: model not built) → GREEN — implement `apply`.
 
@@ -130,7 +132,7 @@ ledger, reusing the gateway's issued-set predicate.
 - [ ] A hand-written valid sequence (fixture open-shift → `OnlineSell`(ACK) → ...) runs end-to-end and lands the doc at `ACK`.
 - [ ] A `Crash(send)` then `Reboot` runs without the interpreter panicking (drop-injection + boot-recon).
 
-**Verify:** `cargo nextest run … -E 'test(invariant_fuzzer)'` → interpreter unit test on a fixed 3-op sequence passes.
+**Verify:** `cargo nextest run … -E 'binary(invariant_fuzzer)'` → interpreter unit test on a fixed 3-op sequence passes.
 
 **TDD:** RED — a test driving `[OnlineSell(ACK)]` asserting `RealOutcome` reaches ACK (fails: interp not built) → GREEN.
 
@@ -157,7 +159,7 @@ stream; `DpsScript` chosen per wire op.
 - [ ] A `proptest!` smoke test runs N (e.g. 64) generated sequences through the interpreter without a precondition-panic (out-of-precondition intents become no-ops, not crashes).
 - [ ] Shrinking demonstrably reduces a forced failure to a shorter sequence.
 
-**Verify:** `cargo nextest run … -E 'test(invariant_fuzzer)'` → the strategy smoke proptest passes.
+**Verify:** `cargo nextest run … -E 'binary(invariant_fuzzer)'` → the strategy smoke proptest passes.
 
 **TDD:** RED — a `proptest!` asserting "every generated valid op has its precondition satisfied" (fails before the precondition-aware generator) → GREEN.
 
@@ -184,12 +186,23 @@ exactly one of:
 The split is explicit so the differential never applies `lnd+1` to a `SellWithClosedShift` or
 `RepeatDrain` (the easy-to-get-wrong case the audit flagged).
 
+**Two constraints surfaced by the Task 1 model — do NOT skip:**
+1. **`GoOnline` / advancing-`Drain` must MOVE OUT of `ExpectedOutcome::Fault`.** Task 1 deferred them to
+   `Fault` (skeleton placeholder); here they become `PredictableMutating` with a real `Mutated`
+   prediction. `classify` must NOT route them to `FaultOrRecovery` (only `Crash` / `Reboot` are that).
+   This task enriches `RefModel::apply` for drain (cohort advance / strict-sequential halt-on-reject /
+   K8 reject→manual) and go-online.
+2. **The seed differential is STRUCTURAL, not byte-equal.** The pure model's seed is a synthetic
+   per-`lnd` value (no XML/crypto in the model), so assert (a) the seed ADVANCED iff the model says it
+   did, at the lane-correct point (§6), and (b) the real doc's `previous_hash` chains to the prior
+   issued tip — NOT `model.seed_after == real.seed` byte-for-byte.
+
 **Acceptance:**
 - [ ] A clean valid sequence passes the differential.
 - [ ] An injected model/real divergence (e.g. a deliberately wrong expected lnd in a test fixture) is caught.
 - [ ] An invalid op (`SellWithClosedShift`) asserts no fiscal mutation.
 
-**Verify:** `cargo nextest run … -E 'test(invariant_fuzzer)'` → differential unit tests pass.
+**Verify:** `cargo nextest run … -E 'binary(invariant_fuzzer)'` → differential unit tests pass.
 
 **TDD:** RED — a test where the model expects lnd+1 but a stubbed real-outcome returns lnd+2 → `check_differential` must flag (fails before the check exists) → GREEN.
 
@@ -214,7 +227,7 @@ assert the bounded kill-point postconditions then re-sync the model from the rea
 - [ ] Scan runs at boundaries only; a `Crash(send)` sequence does NOT scan the in-flight transient.
 - [ ] `Crash(send)` → bounded postcondition (`ERROR_RETRYABLE`, no resend) asserted; model re-synced; subsequent ops differential-clean.
 
-**Verify:** `cargo nextest run … -E 'test(invariant_fuzzer)'` → fault-oracle unit tests pass.
+**Verify:** `cargo nextest run … -E 'binary(invariant_fuzzer)'` → fault-oracle unit tests pass.
 
 **TDD:** RED — a `Crash(send)`+`Reboot` test asserting no second `send_chk` (fails before the bounded-postcond layer) → GREEN.
 
@@ -237,7 +250,7 @@ now includes Mirror-1 and Mirror-3, `check_mirrors` largely = `assert_clean` + t
 - [ ] A seeded Mirror-2 violation (a cohort-state offline doc with a mismatched/NULL session) is caught.
 - [ ] A legal **empty active session** passes (no false-positive).
 
-**Verify:** `cargo nextest run … -E 'test(invariant_fuzzer)'` → mirror-check unit tests pass.
+**Verify:** `cargo nextest run … -E 'binary(invariant_fuzzer)'` → mirror-check unit tests pass.
 
 **TDD:** RED — seed an empty active session → `check_mirrors` must NOT fire (fails if the predicate is naive) AND seed a real Mirror-2 desync → must fire → GREEN.
 
@@ -261,7 +274,7 @@ e.g. 256; nightly large is Phase 3).
 the fuzzer, pinning EXACTLY: the **revert target** (the AUD-K8-1 drain-entry RMR guard at
 `backlog_drain.rs:725` — the `if ns.shift_state == RequiresManualReconciliation { return
 Ok(DrainSummary::new(fn, 0)) }` block; fix `a171f18` / #168); the **run command**
-(`cargo nextest run -p prro --features test-support -E 'test(invariant_fuzzer)'`); the **expected
+(`cargo nextest run -p prro --features test-support -E 'binary(invariant_fuzzer)'`); the **expected
 finding** (a manual-recon FN re-driven by the next drain tick — re-drive / busy-loop); and the
 **expected minimal repro** shape (`[…, escalate, re-tick]`). Prefer also a
 `#[ignore = "teeth-test: run after reverting the AUD-K8-1 guard per TEETH_TEST.md"]` test so it lives in
@@ -273,7 +286,7 @@ the suite, not memory. Procedure: revert → run → confirm finding + shrink �
 - [ ] Demonstrated once: reverting the AUD-K8-1 guard → the fuzzer finds + shrinks the busy-loop; restore → green.
 - [ ] A failing seed replays deterministically and yields a minimal repro.
 
-**Verify:** `cargo nextest run -p prro --features test-support -E 'test(invariant_fuzzer)'` → green; `TEETH_TEST.md` + the `#[ignore]`-d test committed; the revert→finding→restore cycle demonstrated once.
+**Verify:** `cargo nextest run -p prro --features test-support -E 'binary(invariant_fuzzer)'` → green; `TEETH_TEST.md` + the `#[ignore]`-d test committed; the revert→finding→restore cycle demonstrated once.
 
 **TDD:** the harness composes Tasks 1-6 (already TDD'd); the teeth-test IS the RED proof that the whole pipeline has teeth (it must FIND the reverted-guard bug).
 
