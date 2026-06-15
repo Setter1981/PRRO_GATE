@@ -173,6 +173,18 @@ commit — NOT the rejected 'advance-at-finalize-of-last' candidate):**
    no compensating rollback (which reintroduces the rollback-semantics §6.3 deliberately avoids).
 3. **Landing:** as an A2.4 prerequisite (RED-pin un-ignored + fix) — the lane must not go live forked.
 
+**SW-4 (sweep 2026-06-15, LOW/a2.4-only — fold into this A2.4 prerequisite):** the inline lane's
+ChainSeedMismatch handler (`inline.rs:703-728`) folds `ConfirmError::ChainSeedMismatch` into the same arm
+as `ConfirmError::StructuralDrift` — it terminalises the inbox to `REJECTED` + returns
+`FiscalError::Internal`/500, leaving the doc durably at Sent/Kvt2 with **NO escalation to
+`RequiresManualReconciliation`**. Every LIVE owner (convergence `online_convergence.rs:251`, boot-KVT2
+`boot_phase.rs:3595`, drain `:2067`) routes ChainSeedMismatch to `escalate_fn_to_manual_recon`; the
+dormant inline lane does not (its own comment concedes the gap). **As part of the A2.4 binding flip:**
+split `ChainSeedMismatch` out of the `StructuralDrift` arm in inline and route it to
+`escalate_fn_to_manual_recon` (mirror `online_convergence.rs:251`). Reachability: A2.4-only (inline lane
+is `UnimplementedWritePath` until the flip). The `m1_02_online_seed_fork_a24_prerequisite` RED-pin + the
+`supervisor.rs:180` barrier already gate the flip — SW-4 rides the same gate.
+
 **Anchors (`93904a7`):** seed read `stage_sign.rs:279-302`; online advance `stage_finalize.rs:285-321`;
 M2-01 offline ref `stage_offline_ack.rs:339-385`; Hold-at-SENT `inline.rs:748-758`; no-advance
 `stage_send.rs:1352-1360`; `advance_to_ack` collapse `kvt2_advance.rs:206-211`; drain wedge endpoint
