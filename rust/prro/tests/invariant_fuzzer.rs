@@ -91,7 +91,9 @@ fn offline_sell_advances_seed_at_offline_local_ack_and_consumes_code() {
     assert_eq!(m.codes_consumed, 1, "exactly one code consumed");
     assert_eq!(mu.code_consumed, Some(1));
     // OFFLINE_LOCAL_ACK is in the SSOT issued set — the doc is issued at issuance.
-    assert!(RefModel::is_offline_origin_issued(DocState::OfflineLocalAck));
+    assert!(RefModel::is_offline_origin_issued(
+        DocState::OfflineLocalAck
+    ));
 }
 
 /// The model's offline-origin issued set IS `fiscal_documents::OFFLINE_ISSUED_STATES`
