@@ -23,7 +23,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre_tool_guard.py"
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre_tool_guard.py"
           }
         ]
       }
@@ -34,7 +34,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post_edit_note.py",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post_edit_note.py",
             "timeout": 30,
             "async": true
           }
