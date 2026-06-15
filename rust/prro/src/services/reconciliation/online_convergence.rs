@@ -41,6 +41,7 @@ use sqlx::SqlitePool;
 use crate::db::models::enums::{DocState, NodeMode, ShiftState};
 use crate::db::repositories::fiscal_documents::{self, DocumentRow};
 use crate::db::repositories::node_state;
+use crate::services::offline_sync::backlog_drain::EscalationOutcome;
 use crate::services::offline_sync::kvt2_confirm::{self, ConfirmDrainOutcome, Kvt2ConfirmSource};
 
 use super::boot_phase::{self, DispatchHistogram};
@@ -264,7 +265,7 @@ async fn converge_one_doc(
                          {fiscal_number} during ChainSeedMismatch escalation"
                         )
                     })?;
-                crate::services::offline_sync::backlog_drain::escalate_fn_to_manual_recon(
+                match crate::services::offline_sync::backlog_drain::escalate_fn_to_manual_recon(
                     pool,
                     &fiscal_number,
                     &ns,
@@ -274,8 +275,15 @@ async fn converge_one_doc(
                     "CONVERGE_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL",
                     "CONVERGE_CHAIN_SEED_MISMATCH_NO_SHIFT",
                 )
-                .await?;
-                summary.chain_seed_mismatch_escalated += 1;
+                .await?
+                {
+                    EscalationOutcome::Escalated => summary.chain_seed_mismatch_escalated += 1,
+                    // sweep SW-3: residual SEAM-D-1 mirror-desync (the tick's shift
+                    // is normally Opened/escalatable).  The no-shift audit is the
+                    // operator surface; the FN was NOT CAS'd to RMR → NOT counted as
+                    // an escalation.  Proceed (per-doc isolation).
+                    EscalationOutcome::NoEscalatableShift => {}
+                }
             }
         }
     }

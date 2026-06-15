@@ -3643,7 +3643,11 @@ async fn dispatch_pending_doc(
                                 doc.fiscal_number
                             )
                         })?;
-                    crate::services::offline_sync::backlog_drain::escalate_fn_to_manual_recon(
+                    // sweep SW-3: both EscalationOutcome arms proceed here —
+                    // Escalated emitted the ESCALATE_MANUAL audit; NoEscalatableShift
+                    // (a stray Kvt2 on a closed / non-active shift) emitted the
+                    // NO_SHIFT audit.  Either way the doc stays Kvt2 + boot continues.
+                    let _ = crate::services::offline_sync::backlog_drain::escalate_fn_to_manual_recon(
                         pool,
                         &doc.fiscal_number,
                         &ns,
