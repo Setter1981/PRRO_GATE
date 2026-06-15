@@ -2832,3 +2832,99 @@ async fn boot_kvt2_chain_seed_mismatch_closed_shift_no_abort() {
         "no escalation audit — the shift is not RMR-escalatable"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// SW-1 (M1-M2 sweep) — boot must NOT re-drive a RMR-but-Online FN.
+//
+// AUD-K8-1's RMR re-entry guard lives only in the drain (backlog_drain.rs).
+// run_boot_reconciliation has no equivalent, so an FN escalated to
+// shift_state==RMR while mode stays ONLINE (exactly the state Batch C's
+// convergence / boot-KVT2 escalate_fn_to_manual_recon creates — it CAS's the
+// shift to RMR but leaves mode) falls past the mode-gates (branch (d) only
+// catches GoingOnline; branch (f) only Blocked/StopMode/CryptoDegraded) into the
+// per-doc dispatch → a halted FN's resting doc is RE-DRIVEN (real DPS wire).
+//
+// On main this FAILS: the SENT doc is probed (last_chk fired) + advanced.
+// GREEN: a RMR short-circuit (mirror of AUD-K8-1) skips the FN — 0 wire, doc
+// untouched.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn boot_skips_rmr_but_online_fn_no_redrive() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await; // mode=Online, shift_state=Opened
+    let row = seed_inbox_sell(&pool).await;
+
+    let send_calls = Arc::new(AtomicUsize::new(0));
+    let last_calls = Arc::new(AtomicUsize::new(0));
+
+    // Build a resting SENT doc (inline::run lastChk-Hold).
+    let phase1 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    phase1.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    phase1.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → Hold → SENT
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    inline::run(
+        &pool,
+        &pool_secure,
+        &phase1,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+    )
+    .await
+    .expect("online SELL Hold rests at SENT");
+    drop(guard);
+    assert_eq!(read_doc_state(&pool, FN).await, "SENT");
+
+    // The Batch-C escalation state: shift CAS'd to RMR, mode LEFT at Online.
+    sqlx::query("UPDATE shifts SET state = 'REQUIRES_MANUAL_RECONCILIATION' WHERE shift_id = ?")
+        .bind(shift_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE node_state SET shift_state = 'REQUIRES_MANUAL_RECONCILIATION' WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Boot WITH deps + a stub that WOULD answer the SENT probe (Match → advance).
+    let phase2 = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    let sign_ctx2 = det_signing_ctx();
+    let fn_sign2 = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &phase2,
+        signing_ctx: &sign_ctx2,
+        fn_sign: &fn_sign2,
+    };
+    boot_phase::run_boot_reconciliation(&recon_guard(), &pool, FN, Some(&view))
+        .await
+        .expect("boot reconciliation returns Ok (RMR FN skipped, not re-driven)");
+
+    // GREEN: a halted (RMR) FN is NOT re-driven by boot — 0 wire, doc untouched.
+    assert_eq!(
+        read_doc_state(&pool, FN).await,
+        "SENT",
+        "RMR FN's resting doc must NOT be re-driven by boot"
+    );
+    assert_eq!(
+        last_calls.load(Ordering::SeqCst),
+        0,
+        "no last_chk probe on a halted (RMR) FN"
+    );
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        1,
+        "only the construction send — boot does NOT resend a halted FN"
+    );
+    prro::db::invariant_scan::assert_clean(&pool).await;
+}
