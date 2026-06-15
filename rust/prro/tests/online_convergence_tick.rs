@@ -932,3 +932,80 @@ async fn tick_chain_seed_mismatch_escalates_manual() {
     );
     assert_eq!(send_calls.load(Ordering::SeqCst), 1, "tick does NOT send");
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// SW-2 (M1-M2 sweep) — the convergence tick must NOT re-probe a RMR-but-Online FN.
+//
+// run_tick_for_fn has no RMR guard (AUD-K8-1 lives only in the drain), so an FN
+// escalated to shift_state==RMR while mode stays ONLINE (the Batch-C convergence
+// / boot-KVT2 escalation state) passes the mode-gate and re-probes its resting
+// SENT/KVT1 siblings every tick — wire-traffic on a halted FN.
+//
+// On main this FAILS: the resting SENT doc is probed (extra last_chk) + advanced.
+// GREEN: a RMR short-circuit after the mode-gate skips the FN — 0 re-probe.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn tick_skips_rmr_but_online_fn_no_reprobe() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(&pool, NodeMode::Online, shift_id).await;
+
+    let (send_calls, last_calls) = seed_counters();
+    let stub = KpStub::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![]))); // construction send
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // construction Hold → SENT
+                                                       // probe responses the tick WOULD consume if it (wrongly) ran —
+                                                       // enough for the SENT→KVT1→ACK cascade so main fails on the
+                                                       // assertion below, NOT on an empty-queue stub panic.
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // SENT-probe Match
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // KVT1-confirm Match
+
+    build_resting_sent(&pool, &pool_secure, &stub).await; // doc rests SENT
+    assert_eq!(
+        last_calls.load(Ordering::SeqCst),
+        1,
+        "one construction Hold probe"
+    );
+
+    // The Batch-C escalation state: shift CAS'd to RMR, mode LEFT at Online.
+    sqlx::query("UPDATE shifts SET state = 'REQUIRES_MANUAL_RECONCILIATION' WHERE shift_id = ?")
+        .bind(shift_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE node_state SET shift_state = 'REQUIRES_MANUAL_RECONCILIATION' WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    run_tick_for_fn(&pool, &view, FN)
+        .await
+        .expect("tick returns Ok (RMR FN skipped)");
+
+    // GREEN: a halted (RMR) FN is NOT re-probed — the doc stays SENT, last_chk
+    // count stays at the single construction Hold (no tick re-probe).
+    assert_eq!(
+        read_doc_state(&pool, FN).await,
+        "SENT",
+        "RMR FN's resting doc must NOT be re-probed/advanced by the tick"
+    );
+    assert_eq!(
+        last_calls.load(Ordering::SeqCst),
+        1,
+        "no re-probe on a halted (RMR) FN — only the construction Hold probe"
+    );
+    assert_eq!(send_calls.load(Ordering::SeqCst), 1, "tick does NOT send");
+}
