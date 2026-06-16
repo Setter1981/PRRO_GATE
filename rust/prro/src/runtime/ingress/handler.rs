@@ -306,9 +306,13 @@ fn classify_outcome(state: DocState) -> OutcomeDisposition {
         | DocState::Kvt1
         | DocState::Kvt2
         | DocState::ErrorRetryable => OutcomeDisposition::InProgress,
-        DocState::Rejected | DocState::Cancelled | DocState::RequiresManualReconciliation => {
-            OutcomeDisposition::Breach
-        }
+        DocState::Rejected
+        | DocState::Cancelled
+        | DocState::RequiresManualReconciliation
+        // Aborted is a non-issued terminal FAILURE — a refusal always returns
+        // Err(FiscalError), so an Aborted document_state on an Ok outcome is a
+        // seam-contract breach (same class as Rejected/Cancelled).
+        | DocState::Aborted => OutcomeDisposition::Breach,
     }
 }
 

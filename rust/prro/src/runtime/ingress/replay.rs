@@ -53,7 +53,12 @@ fn is_accepted(state: DocState) -> bool {
 fn is_terminally_failed(state: DocState) -> bool {
     matches!(
         state,
-        DocState::Rejected | DocState::Cancelled | DocState::RequiresManualReconciliation
+        DocState::Rejected
+            | DocState::Cancelled
+            | DocState::RequiresManualReconciliation
+            // Aborted is a non-issued terminal (refused before issuance) — a
+            // replay of an aborted request is a terminal FAILURE, never 202.
+            | DocState::Aborted
     )
 }
 

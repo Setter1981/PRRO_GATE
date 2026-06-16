@@ -169,6 +169,13 @@ fn terminal_to_outcome(
             request_id,
             code: codes::REPLAY_LEDGER_DRIFT,
         }),
+        // Non-issued terminal: an operation refused before issuance.  A re-submit
+        // resolving against this row gets a typed refusal (the original reason is
+        // not stored on the row) — never a false 202-in-flight or 200-success.
+        DocState::Aborted => Err(FiscalError::OfflineRefused {
+            request_id,
+            code: codes::DOC_ABORTED,
+        }),
         // In-flight states → 202 IN_PROGRESS (deterministic replay/poll).
         // EXPLICITLY enumerated (review OCF-4): a future DocState variant
         // must be deliberately classified here — a new TERMINAL state
@@ -267,6 +274,51 @@ async fn terminalise_inbox(
                     "terminalise_inbox: inbox row {id_hex} was not PROCESSING — cannot \
                      terminalise a non-leased / already-terminal row"
                 ));
+            }
+            // Ledger-only pin (post-sign refusal orphan fix): a refused-before-
+            // issuance op must NOT leave a non-terminal doc orphaned.  In the SAME
+            // envelope as the inbox CAS (a crash between would re-orphan), abort any
+            // dangling {PREPARED, SIGNED} doc for this request_id → the non-issued
+            // terminal `Aborted`.  Online in-flight states (SENDING/SENT/…) and
+            // already-terminal rows are EXCLUDED by the WHERE, so the send-path
+            // arms (INLINE_SEND_*) no-op here; this fires for the post-sign refusal
+            // arms (dispatch-internal / dispatch-refused / offline-refused) and a
+            // pre-sign sign-failure (PREPARED) alike — one place fixes the class.
+            let dangling: Option<(Vec<u8>, DocState)> = sqlx::query_as(
+                "SELECT document_id, state FROM fiscal_documents \
+                 WHERE request_id = ? AND state IN ('PREPARED','SIGNED') LIMIT 1",
+            )
+            .bind(&request_id[..])
+            .fetch_optional(&mut **tx)
+            .await?;
+            if let Some((doc_bytes, from_state)) = dangling {
+                let doc_id = <[u8; 16]>::try_from(doc_bytes.as_slice())
+                    .map(DocumentId::from_bytes)
+                    .map_err(|_| {
+                        anyhow::anyhow!("terminalise_inbox: malformed document_id for {id_hex}")
+                    })?;
+                match fiscal_documents::transition_state(tx, doc_id, from_state, DocState::Aborted)
+                    .await?
+                {
+                    fiscal_documents::TransitionOutcome::Applied => {}
+                    other => {
+                        return Err(anyhow::anyhow!(
+                            "terminalise_inbox: {from_state:?}→Aborted CAS not Applied \
+                             ({other:?}) for the doc of {id_hex}"
+                        ))
+                    }
+                }
+                // Distinct audit for the doc-abort (NOT the generic inbox event).
+                audit_log::append_tx(
+                    tx,
+                    "fiscal_document",
+                    &hex_encode_lower(doc_id.as_bytes()),
+                    "INLINE_REFUSED_DOC_ABORTED",
+                    Severity::Warning,
+                    None,
+                    Some(&payload),
+                )
+                .await?;
             }
             audit_log::append_tx(
                 tx,

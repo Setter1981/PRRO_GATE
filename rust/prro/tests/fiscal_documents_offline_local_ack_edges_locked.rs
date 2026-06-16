@@ -58,6 +58,10 @@ const ALL_STATES: &[DocState] = &[
     DocState::Cancelled,
     DocState::ErrorRetryable,
     DocState::RequiresManualReconciliation,
+    // Post-sign refusal orphan fix: a non-issued terminal.  Neither inbound nor
+    // outbound of OfflineLocalAck (refused docs never reach the offline lane), so
+    // the EXPECTED_INBOUND / EXPECTED_OUTBOUND sets below are unchanged.
+    DocState::Aborted,
 ];
 
 /// The exact set of edges where `to == OfflineLocalAck`.
@@ -81,7 +85,7 @@ fn doc_state_enum_total_count_is_locked() {
     // in any `OfflineLocalAck`-touching edge.
     assert_eq!(
         ALL_STATES.len(),
-        13,
+        14,
         "DocState variant count changed; update ALL_STATES in this test \
          AND verify the new variant against the OfflineLocalAck edge sets"
     );

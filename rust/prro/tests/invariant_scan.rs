@@ -243,6 +243,51 @@ async fn detects_stuck_sending() {
     );
 }
 
+/// Part 3 — durable ledger-only enforcement: a PRE-SEND non-terminal
+/// {PREPARED, SIGNED, ENCRYPTED} doc resting at a quiescent boundary is a leaked
+/// write-path artifact (the inline pass must flow it to SENDING / a terminal in
+/// one pass; the Aborted seam closes the refusal path).  `scan()` is a
+/// quiescent-only post-condition gate (no production / pre-recovery caller — see
+/// the module docstring), so the check is unconditional, mirroring StuckSending.
+#[tokio::test]
+async fn detects_stuck_non_terminal_pre_send_doc() {
+    for state in ["PREPARED", "SIGNED", "ENCRYPTED"] {
+        let pool = fresh_pool().await;
+        let shift = seed_fn(&pool).await;
+        seed_node_state(&pool, shift, None).await; // no issued tip
+                                                   // A resting pre-send doc: unsigned set, genesis prev, never issued.
+        seed_doc(&pool, shift, 1, state, None, None, Some(h(1)), None, false).await;
+        let v = scan(&pool).await.unwrap();
+        assert!(
+            v.iter().any(|x| matches!(
+                x,
+                Violation::StuckNonTerminalDoc { state: s, .. } if s == state
+            )),
+            "a resting {state} doc must be flagged StuckNonTerminalDoc; got: {v:#?}"
+        );
+    }
+}
+
+/// Part 3 NEGATIVE (no false positive): the legitimately-RESTING states
+/// (`ERROR_RETRYABLE` retry-parked, `SENT` awaiting DPS) are NOT pre-send and
+/// must NOT be flagged StuckNonTerminalDoc — only the {PREPARED,SIGNED,ENCRYPTED}
+/// pipeline pre-send states are.
+#[tokio::test]
+async fn stuck_non_terminal_excludes_legit_resting_states() {
+    for (state, sfn) in [("ERROR_RETRYABLE", None), ("SENT", Some("D-1"))] {
+        let pool = fresh_pool().await;
+        let shift = seed_fn(&pool).await;
+        seed_node_state(&pool, shift, None).await;
+        seed_doc(&pool, shift, 1, state, sfn, None, Some(h(1)), None, false).await;
+        let v = scan(&pool).await.unwrap();
+        assert!(
+            !v.iter()
+                .any(|x| matches!(x, Violation::StuckNonTerminalDoc { .. })),
+            "a legitimately-resting {state} doc must NOT be flagged StuckNonTerminalDoc; got: {v:#?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn detects_ack_without_server_fiscal_no() {
     let pool = fresh_pool().await;
@@ -344,6 +389,76 @@ async fn detects_chain_seed_mismatch() {
         v.iter()
             .any(|x| matches!(x, Violation::ChainSeedMismatch { .. })),
         "got: {v:#?}"
+    );
+}
+
+/// MAC-walk fence (post-sign refusal orphan fix): a refused `SIGNED → Aborted`
+/// doc carries `unsigned_xml_sha256` (set at sign) but is NON-issued
+/// (`offline_fiscal_no IS NULL`, state ABORTED ∉ OFFLINE_ISSUED_STATES, never
+/// ACK).  The chain walk MUST NOT (a) advance the seed over it nor (b) flag it
+/// as a `ChainBreak`: under single-writer its `previous_hash` equals the tip it
+/// was signed against (= the prior issued tip), and the issued-predicate leaves
+/// `expected` unchanged so the node seed still equals the last ISSUED tip.
+#[tokio::test]
+async fn aborted_doc_does_not_trip_chain_walk() {
+    // Case 1 — Aborted FOLLOWS an issued ACK: it chains to the ACK's tip but
+    // must NOT advance the seed (the node seed stays at the ACK tip).
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await;
+    seed_node_state(&pool, shift, Some(h(1))).await; // last ISSUED tip = ACK's
+    seed_doc(
+        &pool,
+        shift,
+        1,
+        "ACK",
+        Some("D-1"),
+        None,
+        Some(h(1)),
+        None,
+        true,
+    )
+    .await;
+    // Aborted: previous_hash = the ACK tip (signed against it), unsigned set,
+    // offline_fiscal_no NULL (never issued).
+    seed_doc(
+        &pool,
+        shift,
+        2,
+        "ABORTED",
+        None,
+        Some(h(1)),
+        Some(h(2)),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(
+        scan(&pool).await.unwrap(),
+        vec![],
+        "an Aborted doc after an ACK must not trip ChainBreak / ChainSeedMismatch"
+    );
+
+    // Case 2 — Aborted is the GENESIS doc (the fuzzer's no-code-first-sell case):
+    // no prior issued tip, node seed stays None.
+    let pool2 = fresh_pool().await;
+    let shift2 = seed_fn(&pool2).await;
+    seed_node_state(&pool2, shift2, None).await; // no issued doc yet
+    seed_doc(
+        &pool2,
+        shift2,
+        1,
+        "ABORTED",
+        None,
+        None,
+        Some(h(1)),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(
+        scan(&pool2).await.unwrap(),
+        vec![],
+        "a genesis Aborted doc must not trip the chain walk (no false ChainBreak)"
     );
 }
 

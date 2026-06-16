@@ -45,6 +45,13 @@ str_enum!(DocState {
     Cancelled                    => "CANCELLED",
     ErrorRetryable               => "ERROR_RETRYABLE",
     RequiresManualReconciliation => "REQUIRES_MANUAL_RECONCILIATION",
+    // Non-issued TERMINAL for an operation refused AFTER stage_sign (the doc
+    // reached PREPARED/SIGNED but DPS/precondition refused issuance before any
+    // fiscal number was assigned).  Restores the ledger-only pin: a post-sign
+    // refusal lands here instead of orphaning a non-terminal SIGNED row.
+    // offline_fiscal_no stays NULL (never issued).  Migration 025 adds it to the
+    // fiscal_documents.state CHECK.
+    Aborted                      => "ABORTED",
 });
 
 // M3b W5 — OfflineSession state machine vocabulary, aligned with
