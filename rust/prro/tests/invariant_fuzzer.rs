@@ -612,3 +612,45 @@ async fn fault_crash_kvt1_reboot_probe_no_resend() {
     )
     .expect("Crash(Kvt1)+Reboot: probe path, no resend");
 }
+
+// ── Task 6 — Mirror-2 drift (offline_session ↔ drain_cohort), the 5th class ──
+
+/// An empty active offline session is LEGAL — the Mirror-2 predicate is over
+/// DOCS (each cohort doc points at the active session), NOT "every session has
+/// docs".  A naive "session must have docs" predicate would false-positive here.
+#[tokio::test]
+async fn mirrors_legal_empty_active_session_passes() {
+    // OPEN offline session, offline codes, but ZERO cohort docs.
+    let ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
+    oracle::check_mirrors(&ctx.pool)
+        .await
+        .expect("an empty active offline session is legal (no false-positive)");
+}
+
+/// A seeded Mirror-2 desync — a drain-cohort doc repointed at a FOREIGN
+/// (non-active) session — is caught.  The foreign session is non-null, so
+/// invariant_scan's check-6d (NULL-only) misses it; Mirror-2 is the predicate
+/// that catches the mismatch.
+#[tokio::test]
+async fn mirrors_catch_seeded_mirror2_desync() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
+
+    // A real offline sell stamps the cohort doc with the ACTIVE session.
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
+    oracle::check_mirrors(&ctx.pool)
+        .await
+        .expect("a correctly-stamped cohort is Mirror-2-clean");
+
+    // Corrupt Mirror-2: repoint the cohort doc at a foreign CLOSED session.
+    ctx.corrupt_cohort_session_to_foreign().await;
+
+    let res = oracle::check_mirrors(&ctx.pool).await;
+    assert!(
+        res.is_err(),
+        "a cohort doc pointing at a non-active session must be caught; got {res:?}"
+    );
+    assert!(
+        format!("{res:?}").contains("Mirror-2"),
+        "the mismatch is a Mirror-2 violation (not check-6d's NULL case), got {res:?}"
+    );
+}
