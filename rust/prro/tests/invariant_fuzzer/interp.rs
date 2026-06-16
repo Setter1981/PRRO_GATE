@@ -620,6 +620,38 @@ async fn drain_op(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
     }
 }
 
+/// Terminal-recovery drain-tick (A4 settle): drive a REAL backlog drain with Ack
+/// responses sized to the REAL cohort (`list_drain_candidates_for_fn_ordered_by_lnd`
+/// via `drain_cohort_len`, NOT the M1-undercounting `count_offline_local_ack`),
+/// simulating DPS coming back so the WHOLE offline cohort — including re-driven
+/// `ERROR_RETRYABLE` / `SENT` docs left by a prior exotic drain — drains to ACK
+/// and finalize CAS's `GoingOnline → Online`.  One Ack send/last per cohort doc
+/// is ample (a re-driven doc needs at most a send + a last; a probe needs fewer,
+/// and unused queue entries are ignored).
+pub async fn settle_drain_tick(ctx: &mut FuzzCtx) -> RealOutcome {
+    let cohort = match ctx.active_offline_session().await {
+        Some(sid) => ctx.drain_cohort_len(sid).await,
+        None => 0,
+    };
+    let dps = ctx.new_dps();
+    for _ in 0..cohort {
+        dps.push_send(wire_to_result(WireResponse::Ack));
+        dps.push_last(wire_to_result(WireResponse::Ack));
+    }
+    let guard = drain_test_guard();
+    let view = ctx.view(&dps);
+    match backlog_drain::drain(&guard, &ctx.pool, &view, &ctx.fn_id).await {
+        Ok(s) => RealOutcome::Recovered {
+            branch: format!(
+                "settle_drain ok(backlog={},acked={})",
+                s.backlog_size_before(),
+                s.advanced_to_ack()
+            ),
+        },
+        Err(e) => RealOutcome::Refused(format!("settle_drain: {e:?}")),
+    }
+}
+
 /// `SellWithClosedShift` (invalid intent): close the shift, then attempt a SELL
 /// — the dispatcher refuses (ShiftNotOpen / ShiftGuardRefused).  No assertion of
 /// no-mutation here (that is Task 4); the bar is a typed refusal, no panic.
