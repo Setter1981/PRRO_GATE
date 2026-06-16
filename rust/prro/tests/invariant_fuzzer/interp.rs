@@ -31,6 +31,7 @@ use prro::db::models::enums::{
 };
 use prro::db::models::ids::{OfflineSessionId, RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
+use prro::db::repositories::{fiscal_documents, offline_sessions};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::{open_pool, open_secure_pool};
 use prro::services::offline_sync::{backlog_drain, return_online_probe};
@@ -376,6 +377,35 @@ impl FuzzCtx {
         .unwrap();
         n as usize
     }
+
+    /// The active OPEN/DRAINING offline session id via the REAL predicate the
+    /// drain uses (`current_open_or_draining_session`) — the structural
+    /// settle-capability test for the terminal liveness gate (A4).  A GoingOnline
+    /// node is only legitimately settle-able by a drain when an active session
+    /// exists (the real drain skips with `no_active_offline_session` otherwise,
+    /// `backlog_drain.rs:741`).
+    pub async fn active_offline_session(&self) -> Option<OfflineSessionId> {
+        offline_sessions::current_open_or_draining_session(&self.pool, &self.fn_id)
+            .await
+            .expect("active-session query")
+            .map(|(id, _state)| id)
+    }
+
+    /// The real drain cohort size for `session_id` (the same predicate the drain
+    /// scans, `list_drain_candidates_for_fn_ordered_by_lnd`) — non-empty ⟺ there
+    /// is offline backlog a real drain would still own.  The terminal liveness
+    /// gate panics only on a NON-empty cohort: an empty-cohort GoingOnline is a
+    /// forced-mode artifact with nothing to drain, not a liveness failure.
+    pub async fn drain_cohort_len(&self, session_id: OfflineSessionId) -> usize {
+        fiscal_documents::list_drain_candidates_for_fn_ordered_by_lnd(
+            &self.pool,
+            &self.fn_id,
+            session_id,
+        )
+        .await
+        .expect("drain candidates query")
+        .len()
+    }
 }
 
 // ─── The interpreter ────────────────────────────────────────────────────────
@@ -590,6 +620,38 @@ async fn drain_op(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
     }
 }
 
+/// Terminal-recovery drain-tick (A4 settle): drive a REAL backlog drain with Ack
+/// responses sized to the REAL cohort (`list_drain_candidates_for_fn_ordered_by_lnd`
+/// via `drain_cohort_len`, NOT the M1-undercounting `count_offline_local_ack`),
+/// simulating DPS coming back so the WHOLE offline cohort — including re-driven
+/// `ERROR_RETRYABLE` / `SENT` docs left by a prior exotic drain — drains to ACK
+/// and finalize CAS's `GoingOnline → Online`.  One Ack send/last per cohort doc
+/// is ample (a re-driven doc needs at most a send + a last; a probe needs fewer,
+/// and unused queue entries are ignored).
+pub async fn settle_drain_tick(ctx: &mut FuzzCtx) -> RealOutcome {
+    let cohort = match ctx.active_offline_session().await {
+        Some(sid) => ctx.drain_cohort_len(sid).await,
+        None => 0,
+    };
+    let dps = ctx.new_dps();
+    for _ in 0..cohort {
+        dps.push_send(wire_to_result(WireResponse::Ack));
+        dps.push_last(wire_to_result(WireResponse::Ack));
+    }
+    let guard = drain_test_guard();
+    let view = ctx.view(&dps);
+    match backlog_drain::drain(&guard, &ctx.pool, &view, &ctx.fn_id).await {
+        Ok(s) => RealOutcome::Recovered {
+            branch: format!(
+                "settle_drain ok(backlog={},acked={})",
+                s.backlog_size_before(),
+                s.advanced_to_ack()
+            ),
+        },
+        Err(e) => RealOutcome::Refused(format!("settle_drain: {e:?}")),
+    }
+}
+
 /// `SellWithClosedShift` (invalid intent): close the shift, then attempt a SELL
 /// — the dispatcher refuses (ShiftNotOpen / ShiftGuardRefused).  No assertion of
 /// no-mutation here (that is Task 4); the bar is a typed refusal, no panic.
@@ -786,6 +848,7 @@ fn doc_state_from_str(s: &str) -> DocState {
         "CANCELLED" => DocState::Cancelled,
         "ERROR_RETRYABLE" => DocState::ErrorRetryable,
         "REQUIRES_MANUAL_RECONCILIATION" => DocState::RequiresManualReconciliation,
+        "ABORTED" => DocState::Aborted,
         other => panic!("unknown DocState string from ledger: {other:?}"),
     }
 }

@@ -203,6 +203,10 @@ fn chain_continuity_previous_hash_equals_prior_tip() {
 fn invalid_and_reentry_ops_do_not_mutate() {
     // RepeatReboot now defers as Fault (it drives the boot seam); the rest are
     // NoMutation no-ops (some force mode/shift — not a fiscal mutation).
+    // OfflineSellDuringGoingOnline stays here: its GoingOnline-mode sell is refused
+    // by the post-sign DISPATCHER (NodeGoingOnline), which leaves NO committed doc
+    // (the offline-ack CodePoolExhausted refusal — a DIFFERENT path — is the one
+    // that mints a non-issued Aborted row).
     let invalid = [
         Op::RepeatDrain,
         Op::DuplicateIdemKey,
@@ -741,15 +745,179 @@ async fn mirrors_catch_seeded_mirror2_desync() {
 
 // ── Task 7 — the end-to-end harness (generator → interpreter → all oracles) ──
 
+/// SETTLED predicate (A2/A4): a node is settled-for-scan when its mode is a
+/// resting `{Online, Offline}` OR the shift is `RequiresManualReconciliation` —
+/// a LEGITIMATE durable operator terminal (AUD-K8-1), scanned IN PLACE, never
+/// forced out.  Reject-halt legitimately rests at `GoingOnline + RMR`; the
+/// system must NOT auto-settle from there, so RMR is settled-for-scan.  Used by
+/// BOTH the per-op scan gate and the terminal settle.
+fn is_settled(mode: NodeMode, shift: ShiftState) -> bool {
+    matches!(mode, NodeMode::Online | NodeMode::Offline)
+        || shift == ShiftState::RequiresManualReconciliation
+}
+
+/// The shift states a real drain can make progress on (`backlog_drain.rs`
+/// finalize transitions + SW-3 fail-loud).  A drain over a non-eligible shift
+/// (e.g. a force-closed shift) cannot finalize `GoingOnline → Online`, so a
+/// GoingOnline left over a non-eligible shift is a forced-mode artifact, not a
+/// liveness failure.  `RequiresManualReconciliation` is excluded here (it is
+/// already SETTLED via `is_settled`).
+fn shift_drain_eligible(shift: ShiftState) -> bool {
+    matches!(
+        shift,
+        ShiftState::Opened
+            | ShiftState::OpenedLocalPendingDrain
+            | ShiftState::ClosingLocalPendingDrain
+    )
+}
+
+/// The terminal disposition for a node that has run its bounded real recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalVerdict {
+    /// Settled (`{Online, Offline}` or RMR) → run the quiescent scan + mirrors.
+    Scan,
+    /// Still un-settled with a REAL settle path that a drain should have taken
+    /// (GoingOnline + active session + non-empty cohort + drain-eligible shift)
+    /// → a genuine liveness failure.
+    Liveness,
+    /// A forced-mode GoingOnline artifact a real drain cannot progress (no
+    /// session — an impossible real GoingOnline; OR empty cohort — nothing to
+    /// drain; OR ineligible shift — force-closed).  Do NOT scan (a deferred
+    /// online-origin SENDING would false-flag) and do NOT liveness-panic
+    /// (no real settle path exists) — assert bounded no-resend instead.
+    ArtifactNoResend,
+}
+
+/// Decide the terminal disposition (PURE — unit-tested on the decision table).
+/// Inputs are read from the REAL DB / real drain predicates by the caller
+/// (`is_settled`, `active_offline_session`, `drain_cohort_len`,
+/// `shift_drain_eligible`), so the structural settle-capability test matches
+/// exactly what a real drain would see.
+fn terminal_verdict(
+    mode: NodeMode,
+    shift: ShiftState,
+    has_active_session: bool,
+    cohort_nonempty: bool,
+    shift_eligible: bool,
+) -> TerminalVerdict {
+    if is_settled(mode, shift) {
+        return TerminalVerdict::Scan;
+    }
+    if mode == NodeMode::GoingOnline {
+        if has_active_session && cohort_nonempty && shift_eligible {
+            TerminalVerdict::Liveness
+        } else {
+            TerminalVerdict::ArtifactNoResend
+        }
+    } else {
+        // Any other non-settled mode is unexpected in the fuzzer alphabet
+        // (the generator only reaches Online / Offline / GoingOnline) — treat a
+        // surprise un-settled mode as a liveness failure (fail loud).
+        TerminalVerdict::Liveness
+    }
+}
+
+/// Terminal liveness + scan (A2/A4): after the op-loop the node must SETTLE on
+/// its own.  Drives BOUNDED REAL recovery ops — a drain-tick WITH Ack responses
+/// (simulating DPS coming back) at GoingOnline, and a Reboot to resolve a
+/// committed crash transient — up to `SETTLE_BUDGET` rounds, NEVER `force_node_mode`.
+/// Then dispatches on [`terminal_verdict`]:
+///   - `Scan` → `assert_clean` + `check_mirrors` (RMR scanned in place);
+///   - `Liveness` → panic (a real drain should have settled this but didn't);
+///   - `ArtifactNoResend` → a forced-mode GoingOnline artifact: assert the
+///     bounded no-resend invariant (the recovery ops re-drove nothing).
+async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
+    // A legitimate settle takes 1–2 real recovery ops (a drain-tick that
+    // finalizes GoingOnline → Online, OR a reboot that resolves a crash
+    // transient, OR a reject that lands RMR).  `3` is a small bound above that;
+    // exceeding it with a real settle path open is the liveness signal.
+    const SETTLE_BUDGET: usize = 3;
+
+    let sends_before = ctx.send_calls();
+    let mut crash_pending = pending_crash;
+    for _ in 0..SETTLE_BUDGET {
+        let mode = ctx.read_node_mode().await;
+        let shift = ctx.read_shift_state().await;
+        if is_settled(mode, shift) && !crash_pending {
+            break;
+        }
+        if mode == NodeMode::GoingOnline {
+            // Drive a real cohort-sized Ack drain ONLY when it can finalize
+            // (settle-CAPABLE: active session + non-empty drain cohort +
+            // drain-eligible shift).  Otherwise a drain would either no-op (no
+            // session / empty cohort) or send pointlessly then fail at finalize
+            // (ineligible / force-closed shift) — so we skip it, leaving those
+            // forced-mode artifacts for the no-resend branch below.
+            if let Some(sid) = ctx.active_offline_session().await {
+                if shift_drain_eligible(shift) && ctx.drain_cohort_len(sid).await > 0 {
+                    let _ = interp::settle_drain_tick(ctx).await;
+                }
+            }
+        }
+        // Reboot resolves a committed crash transient (SENDING → ERROR_RETRYABLE,
+        // SENT → probe) at a settled mode; at GoingOnline it DEFERS (no wire call).
+        let _ = interp::run_op(ctx, &Op::Reboot).await;
+        crash_pending = false;
+    }
+
+    let mode = ctx.read_node_mode().await;
+    let shift = ctx.read_shift_state().await;
+    let session = ctx.active_offline_session().await;
+    let cohort_nonempty = match session {
+        Some(sid) => ctx.drain_cohort_len(sid).await > 0,
+        None => false,
+    };
+    match terminal_verdict(
+        mode,
+        shift,
+        session.is_some(),
+        cohort_nonempty,
+        shift_drain_eligible(shift),
+    ) {
+        TerminalVerdict::Scan => {
+            oracle::assert_clean(&ctx.pool).await;
+            if let Err(d) = oracle::check_mirrors(&ctx.pool).await {
+                panic!("terminal mirror drift (mode={mode:?} shift={shift:?}): {d:?}");
+            }
+        }
+        TerminalVerdict::Liveness => {
+            panic!(
+                "LIVENESS: node did not settle to {{Online, Offline, RMR}} within \
+                 {SETTLE_BUDGET} real recovery ops despite a real settle path (active \
+                 session + non-empty drain cohort + drain-eligible shift) — \
+                 mode={mode:?} shift={shift:?}"
+            );
+        }
+        TerminalVerdict::ArtifactNoResend => {
+            // A forced-mode GoingOnline a real drain cannot progress (no session —
+            // an impossible real GoingOnline, which is only entered via the
+            // return-online probe FROM Offline, i.e. with a session; OR empty
+            // cohort; OR ineligible/force-closed shift).  Do NOT scan (a deferred
+            // online-origin SENDING would false-flag StuckSending) and do NOT
+            // liveness-panic (no real settle path).  Assert the bounded invariant
+            // that the recovery ops re-drove nothing.
+            assert_eq!(
+                ctx.send_calls(),
+                sends_before,
+                "terminal GoingOnline artifact (mode={mode:?} shift={shift:?}): the bounded \
+                 real recovery ops made a NEW wire send — deferred docs must not be re-driven"
+            );
+        }
+    }
+}
+
 /// Per-op dispatch gluing T1-T6: model.apply + run_op, then assert per the op's
 /// classification, with the T5 scan-timing rule (never mid-crash) and re-sync
 /// after a fault.
 async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) {
+    // A crash transient opened but not yet resolved by a reboot (A1 scan-gate
+    // suppresses the scan while set; A3 asserts the no-resend postcond on the
+    // resolving reboot).
     let mut pending_crash = false;
     for op in ops {
         let prior_tip = ctx.read_seed().await; // real MAC tip BEFORE the op
         let codes_before = ctx.consumed_codes_count().await;
-        let sends_before = ctx.send_calls(); // wire send count BEFORE the op
+        let sends_before = ctx.send_calls(); // wire send count BEFORE the op (A3 no-resend)
         let shift_before = ctx.read_shift_state().await; // real shift_state BEFORE the op
 
         let expected = model.apply(op);
@@ -830,16 +998,38 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         // A genuinely-stuck doc is still caught at the post-settle Online boundary
         // (once the node settles, drain/convergence resolves it and the scan is
         // either clean or flags a REAL violation).
-        match op {
-            Op::Crash(_) => pending_crash = true,
-            Op::Reboot => pending_crash = false,
-            _ => {}
+        // A1 (HIGH): track the crash-transient from the REAL outcome, not the op
+        // NAME.  A `Crash(stage)` only opens a committed in-flight transient when
+        // it actually reached the wire and was dropped (`RealOutcome::Crashed`);
+        // on an Offline node it never reaches the wire and COMPLETES as a real
+        // offline sell (`RealOutcome::Doc`), leaving the node SETTLED with nothing
+        // to defer — so the settled scan must NOT be suppressed there.
+        // A1: a Crash opens a committed in-flight transient (the SETTLED scan is
+        // suppressed until a reboot resolves it).
+        if matches!(real, interp::RealOutcome::Crashed { .. }) {
+            pending_crash = true;
         }
-        let settled = matches!(
-            ctx.read_node_mode().await,
-            NodeMode::Online | NodeMode::Offline
-        );
-        if !pending_crash && settled {
+        // A3: a reboot that RESOLVES a pending crash must NOT re-send (DPS does
+        // not dedup → a blind resend double-fiscalises) — assert the UNIVERSAL
+        // no-resend bounded postcond IN the property harness (was: faults only
+        // resync, silently adopting a resend).  Only no-resend is asserted here:
+        // the exact terminal AND the Kvt1 PROBE vary under composition (a SENT
+        // doc at GoingOnline is DEFERRED to the W9 drain → no probe THIS reboot),
+        // so those stay pinned in the directed K3/K4 tests; no-resend is the
+        // invariant that holds in ALL compositions.
+        if matches!(op, Op::Reboot | Op::RepeatReboot) && pending_crash {
+            if let Err(d) = oracle::assert_no_resend(sends_before, ctx.send_calls()) {
+                panic!("crash-recovery resend on {op:?}: {d:?}");
+            }
+            pending_crash = false;
+        }
+        //   - RMR: `is_settled` also admits `RequiresManualReconciliation` (a
+        //     legitimate durable operator terminal, AUD-K8-1) even at mode
+        //     GoingOnline — a reject-halt rests there and MUST be scanned in
+        //     place (a violation there is a REAL finding, not suppressed).
+        let mode_now = ctx.read_node_mode().await;
+        let shift_now = ctx.read_shift_state().await;
+        if !pending_crash && is_settled(mode_now, shift_now) {
             oracle::assert_clean(&ctx.pool).await;
             if let Err(d) = oracle::check_mirrors(&ctx.pool).await {
                 panic!("mirror drift on {op:?}: {d:?}");
@@ -857,6 +1047,13 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
             model.resync_preconditions_from_db(&ctx.pool).await;
         }
     }
+
+    // A2/A4: terminal liveness + scan.  The per-op scan is suppressed mid-crash
+    // and mid-transition; without a terminal pass an unpaired crash or a
+    // GoingOnline terminal would NEVER be recovered/scanned.  This drives bounded
+    // REAL recovery until the node settles, then scans (or fails liveness on a
+    // genuine non-settling settle-path; a forced-mode artifact asserts no-resend).
+    settle_and_scan(&mut ctx, pending_crash).await;
 }
 
 fn drive(ops: &[Op], offline: bool) {
@@ -898,6 +1095,27 @@ proptest! {
     fn harness_offline_seeded(ops in strategy::op_sequence()) {
         drive(&ops, true);
     }
+}
+
+/// Post-sign refusal MIRROR (deterministic pin for the seed-rare divergence the
+/// `Aborted` prod fix introduced).  After the fix a no-code offline sell mints a
+/// non-issued `Aborted` row (the lnd is consumed, reaching SIGNED, then the
+/// offline-ack refuses → the terminalise_inbox seam aborts it).  The model MUST
+/// mirror it: else a later `GoOnline` ledger-delta diverges by the extra
+/// `Aborted` doc the model omitted.  Sequence: 3 codes → 3 OFFLINE_LOCAL_ACK,
+/// the 4th sell is no-code → Aborted, then GoOnline drains the backlog.
+#[test]
+fn harness_offline_no_code_sell_mirrors_aborted_row() {
+    drive(
+        &[
+            Op::OfflineSell,
+            Op::OfflineSell,
+            Op::OfflineSell,
+            Op::OfflineSell, // no code left → reality mints a non-issued Aborted row
+            Op::GoOnline(DpsScript::ack_path()),
+        ],
+        true,
+    );
 }
 
 /// AUD-K8-1 TEETH CANARY (deterministic; see `tests/invariant_fuzzer/TEETH_TEST.md`).
@@ -953,4 +1171,260 @@ async fn teeth_aud_k8_1_rmr_redrive_makes_no_new_wire_call() {
          fails, the backlog_drain.rs:725 re-entry guard is missing — the fuzzer's \
          teeth bite (this counts wire calls, not a scan, so it is mode-independent)."
     );
+}
+
+// ── Hardening (CI conditions) — Cluster A: crash/scan correctness ────────────
+
+/// A1 (HIGH): `pending_crash` must reflect the REAL outcome, not the op name.
+///
+/// On an OFFLINE node a `Crash(Send)` never reaches the wire — `inline::run`
+/// takes the offline-ack branch and COMPLETES, so `run_op` returns
+/// `RealOutcome::Doc` (a real offline sell), NOT `RealOutcome::Crashed`
+/// (interp.rs `crash_via_drop`: the `res = &mut fut` select arm wins).  There is
+/// therefore NO in-flight transient and the node rests in a SETTLED `Offline`
+/// state, where the harness MUST run its quiescent scan / mirror check.
+///
+/// The current harness sets `pending_crash = true` from the op NAME
+/// (`Op::Crash(_)`), wrongly suppressing the settled scan — a false-negative
+/// window.  This is made observable with a planted Mirror-2 violation: a settled
+/// scan would catch it (panic); a suppressed scan returns cleanly.
+#[test]
+fn a1_offline_crash_send_completes_as_doc_so_settled_scan_runs() {
+    // Build a ctx with a planted Mirror-2 corruption, drive [Crash(Send)] through
+    // the harness, and assert the harness panicked (caught the planted violation).
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+            // Plant a cohort doc, then repoint it at a FOREIGN session → Mirror-2 desync.
+            let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
+            ctx.corrupt_cohort_session_to_foreign().await;
+            // sanity: the corruption really is present before the harness runs.
+            assert!(
+                oracle::check_mirrors(&ctx.pool).await.is_err(),
+                "setup: a Mirror-2 violation must be planted"
+            );
+            // [Crash(Send)] on OFFLINE completes as a real offline sell (Doc),
+            // leaving the node SETTLED (Offline) — the harness must scan here.
+            run_harness(
+                &[Op::Crash(Stage::Send)],
+                ctx,
+                RefModel::new_offline_open_shift(3),
+            )
+            .await;
+        });
+    }))
+    .is_err();
+    std::panic::set_hook(prev);
+
+    assert!(
+        panicked,
+        "the harness must scan at the SETTLED Offline boundary after a Crash(Send) that \
+         completed as a real offline sell (RealOutcome::Doc, not Crashed) and catch the \
+         planted Mirror-2 violation. It returned cleanly → the settled scan was wrongly \
+         suppressed because pending_crash was set from the op name instead of the real outcome."
+    );
+}
+
+/// A2 (HIGH): an UNPAIRED crash must be recovered + scanned at the terminal.
+///
+/// A `Crash(Send)` with no following `Reboot` leaves a committed `SENDING`
+/// transient and `pending_crash` set to sequence end — the per-op scan is
+/// suppressed for the rest of the run, and today there is NO final recovery /
+/// scan, so the transient is never resolved or checked.  The terminal
+/// `settle_and_scan` must drive a real `Reboot` to resolve the unpaired crash
+/// (`SENDING → ERROR_RETRYABLE`, no resend) and then scan the settled boundary.
+#[tokio::test]
+async fn a2_terminal_settle_resolves_unpaired_crash_and_scans() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+
+    let crashed = interp::run_op(&mut ctx, &Op::Crash(Stage::Send)).await;
+    assert!(matches!(crashed, interp::RealOutcome::Crashed { .. }));
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Sending,
+        "an unpaired crash leaves a committed SENDING transient"
+    );
+    let sends_before = ctx.send_calls();
+
+    // Terminal procedure: must reboot the unpaired crash → ERROR_RETRYABLE (no
+    // resend) AND scan the now-settled boundary.
+    settle_and_scan(&mut ctx, true).await;
+
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::ErrorRetryable,
+        "A2: the terminal settle must reboot an unpaired crash transient to ERROR_RETRYABLE"
+    );
+    assert_eq!(
+        ctx.send_calls(),
+        sends_before,
+        "A2: the terminal recovery must NOT resend across the reboot"
+    );
+    assert!(matches!(ctx.read_node_mode().await, NodeMode::Online));
+}
+
+/// A4 (HIGH): a LEGITIMATE GoingOnline terminal (active session + drainable
+/// cohort) must be settled + scanned — closing the indefinite no-scan zone.
+///
+/// The terminal `settle_and_scan` drives a real drain-tick WITH Ack responses
+/// (simulating DPS coming back) → the OFFLINE_LOCAL_ACK backlog drains to ACK →
+/// finalize CAS's `GoingOnline → Online` → the settled boundary scans clean.
+#[tokio::test]
+async fn a4_terminal_settle_drains_legit_going_online_to_online() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await; // OFFLINE_LOCAL_ACK backlog
+    ctx.force_node_mode(NodeMode::GoingOnline).await; // legit GoingOnline (active session + cohort)
+    assert!(
+        ctx.active_offline_session().await.is_some(),
+        "the offline fixture has an active session — this is the settle-able GoingOnline"
+    );
+
+    settle_and_scan(&mut ctx, false).await;
+
+    assert_eq!(
+        ctx.read_node_mode().await,
+        NodeMode::Online,
+        "A4: the terminal settle must drain a legit GoingOnline cohort to Online"
+    );
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Ack,
+        "the backlog drained to ACK at the terminal settle"
+    );
+}
+
+/// A4 (HIGH) — DURABLE PIN: the no-session GoingOnline ARTIFACT must NOT
+/// liveness-panic and must NOT be scanned.
+///
+/// WHY this is an artifact, not a real liveness failure: a real PRRO node only
+/// enters `GoingOnline` via the return-online probe FROM `Offline`, which always
+/// has an active offline session.  The adverse `OfflineSellDuringGoingOnline`
+/// seam reaches `GoingOnline` via a `force_node_mode` setter on an ONLINE node
+/// with NO session — an impossible real state.  Real recovery seams cannot
+/// settle it (drain skips with `no_active_offline_session`, `backlog_drain.rs:741`;
+/// reboot DEFERS a GoingOnline FN to the W9 drain, branch d `boot_phase.rs:1739`),
+/// and it cannot be scanned (the deferred online-origin `SENDING` would
+/// false-flag `StuckSending` — the exact false positive the SETTLED gate exists
+/// to suppress).  So the terminal asserts the bounded no-resend invariant
+/// (recovery re-drove nothing) instead of liveness-panicking or scanning.
+/// This test makes that decision AUDITABLE (an external reviewer asking "why is
+/// this GoingOnline neither settled nor scanned" is answered here).
+#[tokio::test]
+async fn a4_terminal_no_session_going_online_artifact_does_not_liveness_panic() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let _ = interp::run_op(&mut ctx, &Op::Crash(Stage::Send)).await; // online-origin SENDING
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSellDuringGoingOnline).await; // force GoingOnline
+    assert_eq!(ctx.read_node_mode().await, NodeMode::GoingOnline);
+    assert!(
+        ctx.active_offline_session().await.is_none(),
+        "online fixture has NO offline session — GoingOnline here is the impossible-state artifact"
+    );
+    let sends_before = ctx.send_calls();
+
+    // Must return WITHOUT a liveness panic (the no-session artifact branch) and
+    // assert bounded no-resend internally.
+    settle_and_scan(&mut ctx, true).await;
+
+    assert_eq!(
+        ctx.send_calls(),
+        sends_before,
+        "artifact recovery must not re-drive the deferred doc (no new wire send)"
+    );
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Sending,
+        "the deferred online-origin SENDING is left in place (not re-driven, not scanned)"
+    );
+}
+
+/// A4 (HIGH): the terminal decision table (PURE) — proves liveness BITES on a
+/// genuine settle-path GoingOnline, RMR is settled-in-place, and every forced-
+/// mode artifact (no session / empty cohort / ineligible shift) routes to the
+/// bounded no-resend branch (never a liveness false positive).
+#[test]
+fn a4_terminal_verdict_decision_table() {
+    use TerminalVerdict::{ArtifactNoResend, Liveness, Scan};
+
+    // Settled → Scan.
+    assert_eq!(
+        terminal_verdict(NodeMode::Online, ShiftState::Opened, false, false, true),
+        Scan
+    );
+    assert_eq!(
+        terminal_verdict(NodeMode::Offline, ShiftState::Opened, true, true, true),
+        Scan
+    );
+    // RMR is SETTLED even at mode GoingOnline (reject-halt durable terminal).
+    assert_eq!(
+        terminal_verdict(
+            NodeMode::GoingOnline,
+            ShiftState::RequiresManualReconciliation,
+            true,
+            true,
+            false
+        ),
+        Scan
+    );
+    // GoingOnline with a REAL settle path (active session + non-empty cohort +
+    // drain-eligible shift) that did not settle → LIVENESS (a genuine failure).
+    assert_eq!(
+        terminal_verdict(NodeMode::GoingOnline, ShiftState::Opened, true, true, true),
+        Liveness
+    );
+    // Artifacts → ArtifactNoResend (no liveness false positive):
+    assert_eq!(
+        terminal_verdict(
+            NodeMode::GoingOnline,
+            ShiftState::Opened,
+            false,
+            false,
+            true
+        ),
+        ArtifactNoResend,
+        "no active session — impossible real GoingOnline"
+    );
+    assert_eq!(
+        terminal_verdict(NodeMode::GoingOnline, ShiftState::Opened, true, false, true),
+        ArtifactNoResend,
+        "empty cohort — nothing to drain"
+    );
+    assert_eq!(
+        terminal_verdict(NodeMode::GoingOnline, ShiftState::Closed, true, true, false),
+        ArtifactNoResend,
+        "ineligible (force-closed) shift — a drain cannot finalize"
+    );
+}
+
+/// A3 — the no-resend predicate (the bounded crash-recovery postcond wired into
+/// run_harness on a resolving reboot) catches a resend.
+#[test]
+fn a3_assert_no_resend_catches_a_resend() {
+    assert!(
+        oracle::assert_no_resend(1, 2).is_err(),
+        "a resend (send_chk 1 -> 2) across a crash-recovery reboot must be flagged"
+    );
+    assert!(
+        oracle::assert_no_resend(1, 1).is_ok(),
+        "no resend (send_chk unchanged) is clean"
+    );
+}
+
+/// A3 — the property harness ENFORCES the bounded no-resend postcond on the
+/// resolving reboot (was: faults only resync).  Driving [Crash(Send), Reboot]
+/// and [Crash(Kvt1), Reboot] through `run_harness` exercises the wired no-resend
+/// check for BOTH crash stages; both resolve cleanly with NO resend, so the
+/// harness does not panic — proving the check is exercised AND does not
+/// false-fire.  (A genuine resend would now panic here, not be silently adopted.
+/// The exact terminal + the Kvt1 PROBE stay in the directed K3/K4 tests — they
+/// vary under composition, unlike no-resend.)
+#[test]
+fn harness_crash_reboot_enforces_no_resend_postcond() {
+    drive(&[Op::Crash(Stage::Send), Op::Reboot], false);
+    drive(&[Op::Crash(Stage::Kvt1), Op::Reboot], false);
 }

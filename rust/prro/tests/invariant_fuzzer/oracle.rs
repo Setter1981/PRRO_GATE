@@ -225,6 +225,26 @@ pub fn assert_probe_recovery_no_resend(
     Ok(())
 }
 
+/// A3 — the UNIVERSAL crash-recovery postcondition (no exact terminal): a reboot
+/// that resolves a committed crash transient must NOT re-send — `send_chk`
+/// unchanged across the reboot (DPS does not dedup; a blind resend would
+/// double-fiscalise).  This is the property-harness bounded postcond: under
+/// composition the exact terminal (ERROR_RETRYABLE / probe → KVT1 / ACK /
+/// manual) varies, but no-resend is invariant.  The exact terminals stay pinned
+/// in the directed K3/K4 tests (`assert_crash_send_recovery` /
+/// `assert_probe_recovery_no_resend`).
+pub fn assert_no_resend(
+    send_calls_before: usize,
+    send_calls_after: usize,
+) -> Result<(), Divergence> {
+    if send_calls_after != send_calls_before {
+        return Err(Divergence(format!(
+            "crash recovery RESENT: send_chk {send_calls_before} -> {send_calls_after}"
+        )));
+    }
+    Ok(())
+}
+
 // ── The 5th class — mirror-drift checks (Task 6) ────────────────────────────
 
 /// Assert the load-bearing mirrors at a quiescent boundary.
