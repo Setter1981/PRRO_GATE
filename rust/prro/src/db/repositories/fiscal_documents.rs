@@ -174,6 +174,12 @@ pub fn allowed_transition(from: DocState, to: DocState) -> bool {
         (from, to),
         (Prepared, Signed)
             | (Prepared, Rejected)
+            // Post-sign refusal orphan fix: a doc refused before issuance lands
+            // in the non-issued TERMINAL `Aborted` (from PREPARED if refused
+            // before sign, or from SIGNED if refused at dispatch/offline-ack),
+            // restoring the ledger-only pin (no stuck non-terminal row).
+            | (Prepared, Aborted)
+            | (Signed, Aborted)
             | (Signed, Encrypted)
             | (Signed, ErrorRetryable)
             | (Signed, OfflineLocalAck)
@@ -1222,7 +1228,7 @@ pub async fn exists_terminal_by_request_id_tx(
     let row: Option<i64> = sqlx::query_scalar(
         r#"SELECT 1 FROM fiscal_documents
             WHERE request_id = ?
-              AND state IN ('ACK','REJECTED','CANCELLED','OFFLINE_LOCAL_ACK','REQUIRES_MANUAL_RECONCILIATION')
+              AND state IN ('ACK','REJECTED','CANCELLED','OFFLINE_LOCAL_ACK','REQUIRES_MANUAL_RECONCILIATION','ABORTED')
             LIMIT 1"#,
     )
     .bind(request_id)

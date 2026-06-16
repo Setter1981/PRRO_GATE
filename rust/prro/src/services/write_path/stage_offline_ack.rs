@@ -143,6 +143,14 @@ pub enum RefusalReason {
     /// bug or DB corruption — the doc should exist because stage 3
     /// just signed it.
     DocNotFound,
+    /// Step 6 `acquire_code_tx` found NO available offline code for
+    /// the FN (the pool is exhausted).  A LEGITIMATE operational
+    /// refusal (not a race/structural bug) — surfaced as a TYPED
+    /// `Refused` instead of the former raw-anyhow Err so the caller
+    /// aborts the doc + maps a precise `OFFLINE_CODE_POOL_EXHAUSTED`
+    /// refusal rather than the catch-all `DISPATCH_INTERNAL`.  The
+    /// code pool is left untouched (the CAS acquired nothing).
+    CodePoolExhausted,
 }
 
 /// Public entry point for the offline ack branch.
@@ -312,10 +320,28 @@ pub async fn run(
             // Validations + pre-check all passed.  This is the first
             // point a write touches `offline_codes` — any earlier
             // refusal returned BEFORE this call, so code pool stays
-            // intact on refusal.  `CodePoolExhausted` propagates as
-            // typed-via-anyhow Err (W5 contract) — caller's
-            // responsibility to enter STOP_MODE.
-            let acquired = offline_sessions::acquire_code_tx(tx, &fn_id, doc_id).await?;
+            // intact on refusal.  An EXHAUSTED pool is a LEGITIMATE
+            // operational refusal: surface it as a TYPED
+            // `Refused(CodePoolExhausted)` (committing the refusal
+            // audit, code pool untouched) so the inline orchestrator
+            // ABORTS the SIGNED doc + maps a precise
+            // `OFFLINE_CODE_POOL_EXHAUSTED` refusal — NOT the former
+            // raw-anyhow Err that rolled back into the catch-all
+            // `DISPATCH_INTERNAL` and orphaned the SIGNED doc.  Any
+            // OTHER (structural) error still propagates as `Err`.
+            let acquired = match offline_sessions::acquire_code_tx(tx, &fn_id, doc_id).await {
+                Ok(a) => a,
+                Err(offline_sessions::OfflineSessionError::CodePoolExhausted { .. }) => {
+                    return audit_and_return_refused(
+                        tx,
+                        doc_id,
+                        &fn_id,
+                        RefusalReason::CodePoolExhausted,
+                    )
+                    .await;
+                }
+                Err(e) => return Err(e.into()),
+            };
 
             // ─── Step 7: transition Signed → OfflineLocalAck ────────
             //

@@ -558,6 +558,54 @@ async fn offline_sell_is_offline_local_ack_success() {
     );
 }
 
+/// **Post-sign refusal orphan fix (ledger-only pin).** An offline SELL with NO
+/// available offline code reaches `SIGNED` (acquire+sign) and is then refused at
+/// `stage_offline_ack` (`acquire_code_tx` → CodePoolExhausted).  The refusal MUST
+/// leave the doc in the non-issued TERMINAL `Aborted` (NOT a stuck `SIGNED`
+/// orphan — that violates the ledger-only pin) and return a TYPED refusal
+/// (`OfflineRefused` with `OFFLINE_CODE_POOL_EXHAUSTED`), NOT a catch-all
+/// `DISPATCH_INTERNAL`.
+#[tokio::test]
+async fn offline_no_code_aborts_doc_and_returns_typed_refusal() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_offline(&pool, shift_id).await;
+    seed_open_offline_session(&pool).await;
+    // NO offline code seeded → acquire_code_tx returns CodePoolExhausted POST-sign.
+    let row = seed_inbox_sell(&pool).await;
+
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect_err("a no-code offline sell must be refused, not issued");
+
+    // (1) ledger-only pin: the doc is the non-issued TERMINAL `Aborted`, NOT a
+    // stuck `SIGNED` orphan and NOT issued (`OFFLINE_LOCAL_ACK`).
+    assert_eq!(
+        read_doc_state(&pool, FN).await,
+        "ABORTED",
+        "a refused-before-issuance doc must reach the Aborted terminal, not stay SIGNED"
+    );
+    // (2) typed refusal (not the catch-all DISPATCH_INTERNAL).
+    match err {
+        FiscalError::OfflineRefused { code, .. } => assert_eq!(
+            code, "OFFLINE_CODE_POOL_EXHAUSTED",
+            "code-pool exhaustion must carry its precise typed code"
+        ),
+        other => panic!("expected OfflineRefused(OFFLINE_CODE_POOL_EXHAUSTED), got {other:?}"),
+    }
+}
+
 /// **A2.1b-core incr.5 — Z-class is fail-closed (501) + terminalises the inbox,
 /// NO fiscal_documents.** A Z_REPORT is out of the SELL/RETURN core: the
 /// orchestrator fail-closes BEFORE build/acquire with `ZSurfaceNotReady`,
@@ -719,13 +767,18 @@ async fn offline_no_session_is_internal_500_and_terminalises_inbox() {
     }
     assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
     assert_eq!(audit_count(&pool, "INLINE_OFFLINE_REFUSED").await, 1);
+    // Ledger-only pin (broad fix): the post-sign refusal aborts the SIGNED doc to
+    // the non-issued terminal `Aborted` (not a stuck SIGNED orphan).
+    assert_eq!(read_doc_state(&pool, FN).await, "ABORTED");
+    assert_eq!(audit_count(&pool, "INLINE_REFUSED_DOC_ABORTED").await, 1);
 }
 
 /// **A2.1b-core incr.5b — four-variant gate: SignFailure.** A crypto-class
 /// sign failure (`SignError::Crypto`) → `FiscalError::SignFailure` (500); the
 /// inline arm terminalises the inbox (REJECTED + `INLINE_SIGN_FAIL` audit).
-/// The doc row stays at its pre-sign state (no SIGNED commit) — a write-path
-/// artifact, not an issued receipt.
+/// Ledger-only pin (broad fix): the dangling PREPARED doc is aborted to the
+/// non-issued terminal `Aborted` in the same envelope (was: left orphaned at
+/// PREPARED — a write-path artifact the pin forbids).
 #[tokio::test]
 async fn sign_crypto_failure_is_sign_failure_and_terminalises_inbox() {
     let pool = fresh_pool().await;
@@ -750,6 +803,9 @@ async fn sign_crypto_failure_is_sign_failure_and_terminalises_inbox() {
     assert!(matches!(err, FiscalError::SignFailure { .. }));
     assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
     assert_eq!(audit_count(&pool, "INLINE_SIGN_FAIL").await, 1);
+    // Ledger-only pin (broad fix): the dangling PREPARED doc is aborted, not
+    // left as a non-terminal orphan.
+    assert_eq!(read_doc_state(&pool, FN).await, "ABORTED");
 }
 
 /// **A2.1b-core incr.5b — four-variant gate: DpsRejected.** DPS hard-rejects

@@ -22,7 +22,6 @@
 
 use prro::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
-use prro::db::repositories::offline_sessions;
 use prro::services::write_path::stage_offline_ack::{self, OfflineAckOutcome, RefusalReason};
 use uuid::Uuid;
 
@@ -398,29 +397,31 @@ async fn refusal_draining_session_returns_no_active_session() {
 // ─── Code-pool exhaustion ───────────────────────────────────────────
 
 #[tokio::test]
-async fn empty_code_pool_propagates_typed_err() {
-    // No code seeded — `acquire_code_tx` returns CodePoolExhausted.
-    // Per W5/W7 contract this propagates as Err (typed via anyhow);
-    // caller (dispatcher / write-path orchestrator) is responsible
-    // for entering STOP_MODE.  Doc state stays SIGNED (envelope
-    // rolled back).
+async fn empty_code_pool_returns_typed_code_pool_exhausted_refusal() {
+    // No code seeded — `acquire_code_tx` finds the pool exhausted.  Post-fix this
+    // is a TYPED `Refused(CodePoolExhausted)` (the stage commits the refusal
+    // audit, code pool untouched) — NOT the former raw-anyhow Err that rolled
+    // back into the inline catch-all `DISPATCH_INTERNAL`.  At the STAGE level the
+    // doc stays SIGNED (the stage does not own doc cleanup); the inline
+    // orchestrator's terminalise_inbox seam aborts it → ABORTED (asserted
+    // end-to-end in `write_path_inline.rs::offline_no_code_aborts_doc_...`).
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::Opened).await;
     let session_id = OfflineSessionId::new();
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
     let doc_id = insert_signed_doc(&pool, FN, 1).await;
 
-    let err = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap_err();
-    // Downcast through anyhow to the W5 typed error.
-    let typed = err.downcast_ref::<offline_sessions::OfflineSessionError>();
+    let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
     assert!(
         matches!(
-            typed,
-            Some(offline_sessions::OfflineSessionError::CodePoolExhausted { .. })
+            outcome,
+            OfflineAckOutcome::Refused(RefusalReason::CodePoolExhausted)
         ),
-        "expected typed CodePoolExhausted; got: {err:?}"
+        "expected typed Refused(CodePoolExhausted); got: {outcome:?}"
     );
-    // Envelope rolled back — doc stays SIGNED.
+    // Code pool untouched (the CAS acquired nothing).
+    assert_eq!(fetch_consumed_count(&pool, FN).await, 0);
+    // Stage level: the doc is unchanged (SIGNED); the inline seam aborts it.
     assert_eq!(fetch_doc_state(&pool, doc_id).await, "SIGNED");
 }
 

@@ -3801,7 +3801,10 @@ async fn dispatch_pending_doc(
         | DocState::Rejected
         | DocState::Cancelled
         | DocState::OfflineLocalAck
-        | DocState::RequiresManualReconciliation => {
+        | DocState::RequiresManualReconciliation
+        // Aborted is a non-issued TERMINAL — like the others it must never be
+        // returned by list_pending_for_fn (its WHERE excludes terminals).
+        | DocState::Aborted => {
             anyhow::bail!(
                 "dispatch_pending_doc: terminal DocState {:?} returned by list_pending_for_fn — \
                  contract violation",

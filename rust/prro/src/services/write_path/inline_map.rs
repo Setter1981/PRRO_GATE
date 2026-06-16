@@ -106,6 +106,15 @@ pub(crate) mod codes {
     pub const OFFLINE_CROSS_FN_MISMATCH: &str = "OFFLINE_CROSS_FN_MISMATCH";
     /// Doc row absent at offline-ack pre-check (should exist post-sign).
     pub const OFFLINE_DOC_NOT_FOUND: &str = "OFFLINE_DOC_NOT_FOUND";
+    /// Offline code pool exhausted at offline-ack (`acquire_code_tx`).  Unlike
+    /// the race/structural codes above (→ 500), this is a LEGITIMATE operational
+    /// refusal (no codes left) → `OfflineRefused`/503 (node_refused), the typed
+    /// replacement for the former raw-anyhow → DISPATCH_INTERNAL.
+    pub const OFFLINE_CODE_POOL_EXHAUSTED: &str = "OFFLINE_CODE_POOL_EXHAUSTED";
+    /// Replay-resolve of a doc in the non-issued terminal `Aborted` (a refusal
+    /// landed there).  The original refusal reason is not stored on the row, so
+    /// the replay surfaces a generic refusal (`OfflineRefused`/503).
+    pub const DOC_ABORTED: &str = "DOC_ABORTED";
 }
 
 fn shift_guard(request_id: [u8; 16], code: &'static str) -> FiscalError {
@@ -276,6 +285,10 @@ pub(crate) fn map_offline_refusal(
         R::DocStateConflict { .. } => internal(request_id, codes::OFFLINE_DOC_STATE_CONFLICT),
         R::CrossFnMismatch { .. } => internal(request_id, codes::OFFLINE_CROSS_FN_MISMATCH),
         R::DocNotFound => internal(request_id, codes::OFFLINE_DOC_NOT_FOUND),
+        // Code pool exhausted is a LEGITIMATE operational refusal (no codes
+        // left), NOT a race/structural breach → OfflineRefused/503 (precise
+        // code), the typed replacement for the former raw-anyhow DISPATCH_INTERNAL.
+        R::CodePoolExhausted => node_refused(request_id, codes::OFFLINE_CODE_POOL_EXHAUSTED),
     }
 }
 

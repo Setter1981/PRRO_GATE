@@ -347,6 +347,76 @@ async fn detects_chain_seed_mismatch() {
     );
 }
 
+/// MAC-walk fence (post-sign refusal orphan fix): a refused `SIGNED → Aborted`
+/// doc carries `unsigned_xml_sha256` (set at sign) but is NON-issued
+/// (`offline_fiscal_no IS NULL`, state ABORTED ∉ OFFLINE_ISSUED_STATES, never
+/// ACK).  The chain walk MUST NOT (a) advance the seed over it nor (b) flag it
+/// as a `ChainBreak`: under single-writer its `previous_hash` equals the tip it
+/// was signed against (= the prior issued tip), and the issued-predicate leaves
+/// `expected` unchanged so the node seed still equals the last ISSUED tip.
+#[tokio::test]
+async fn aborted_doc_does_not_trip_chain_walk() {
+    // Case 1 — Aborted FOLLOWS an issued ACK: it chains to the ACK's tip but
+    // must NOT advance the seed (the node seed stays at the ACK tip).
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await;
+    seed_node_state(&pool, shift, Some(h(1))).await; // last ISSUED tip = ACK's
+    seed_doc(
+        &pool,
+        shift,
+        1,
+        "ACK",
+        Some("D-1"),
+        None,
+        Some(h(1)),
+        None,
+        true,
+    )
+    .await;
+    // Aborted: previous_hash = the ACK tip (signed against it), unsigned set,
+    // offline_fiscal_no NULL (never issued).
+    seed_doc(
+        &pool,
+        shift,
+        2,
+        "ABORTED",
+        None,
+        Some(h(1)),
+        Some(h(2)),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(
+        scan(&pool).await.unwrap(),
+        vec![],
+        "an Aborted doc after an ACK must not trip ChainBreak / ChainSeedMismatch"
+    );
+
+    // Case 2 — Aborted is the GENESIS doc (the fuzzer's no-code-first-sell case):
+    // no prior issued tip, node seed stays None.
+    let pool2 = fresh_pool().await;
+    let shift2 = seed_fn(&pool2).await;
+    seed_node_state(&pool2, shift2, None).await; // no issued doc yet
+    seed_doc(
+        &pool2,
+        shift2,
+        1,
+        "ABORTED",
+        None,
+        None,
+        Some(h(1)),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(
+        scan(&pool2).await.unwrap(),
+        vec![],
+        "a genesis Aborted doc must not trip the chain walk (no false ChainBreak)"
+    );
+}
+
 /// REJECTED inbox + accepted doc for the same request — the replay-lie
 /// hazard (AUD-1) must be visible to the scan.
 #[tokio::test]
