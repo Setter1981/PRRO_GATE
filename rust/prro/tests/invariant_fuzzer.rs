@@ -830,9 +830,15 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         // A genuinely-stuck doc is still caught at the post-settle Online boundary
         // (once the node settles, drain/convergence resolves it and the scan is
         // either clean or flags a REAL violation).
-        match op {
-            Op::Crash(_) => pending_crash = true,
-            Op::Reboot => pending_crash = false,
+        // A1 (HIGH): track the crash-transient from the REAL outcome, not the op
+        // NAME.  A `Crash(stage)` only opens a committed in-flight transient when
+        // it actually reached the wire and was dropped (`RealOutcome::Crashed`);
+        // on an Offline node it never reaches the wire and COMPLETES as a real
+        // offline sell (`RealOutcome::Doc`), leaving the node SETTLED with nothing
+        // to defer — so the settled scan must NOT be suppressed there.
+        match &real {
+            interp::RealOutcome::Crashed { .. } => pending_crash = true,
+            _ if matches!(op, Op::Reboot) => pending_crash = false,
             _ => {}
         }
         let settled = matches!(
