@@ -364,18 +364,35 @@ impl FuzzCtx {
         .unwrap()
     }
 
-    /// Count of OFFLINE_LOCAL_ACK offline-origin docs — the drain backlog size,
-    /// so the interpreter can lay one send/last per cohort doc.
-    async fn count_offline_local_ack(&self) -> usize {
+    /// B1/M1 — the FULL offline drain-cohort size: offline-origin docs in ANY
+    /// drain-candidate state (the same set the real drain re-drives,
+    /// `list_drain_candidates_for_fn_ordered_by_lnd`), NOT just OFFLINE_LOCAL_ACK.
+    /// A prior partial / exotic drain can leave SENT / KVT1 / ERROR_RETRYABLE /
+    /// KVT2 cohort docs; the AckPath drain must provision the wire for ALL of
+    /// them (ample send/last per doc — a probe consumes fewer; unused entries are
+    /// ignored), else it under-provisions and strands the non-OLA docs.
+    pub async fn full_drain_cohort_count(&self) -> usize {
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM fiscal_documents \
-             WHERE fiscal_number = ? AND fs_mode = 'OFFLINE' AND state = 'OFFLINE_LOCAL_ACK'",
+             WHERE fiscal_number = ? AND fs_mode = 'OFFLINE' \
+               AND state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE','KVT2')",
         )
         .bind(self.fn_id.as_str())
         .fetch_one(&self.pool)
         .await
         .unwrap();
         n as usize
+    }
+
+    /// `node_state.next_lnd` — the local fiscal numerator.  A drain allocates NO
+    /// new lnd (it re-drives existing cohort docs), so the MH bounded postcond
+    /// asserts this is unchanged across a Fault-deferred exotic drain.
+    pub async fn read_next_lnd(&self) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT next_lnd FROM node_state WHERE fiscal_number = ?")
+            .bind(self.fn_id.as_str())
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
     }
 
     /// The active OPEN/DRAINING offline session id via the REAL predicate the
@@ -576,7 +593,7 @@ async fn offline_sell(ctx: &mut FuzzCtx) -> RealOutcome {
 async fn go_online(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
     let dps = ctx.new_dps();
     dps.push_status(Ok(online_status())); // probe sees DPS online → flip
-    let backlog = ctx.count_offline_local_ack().await;
+    let backlog = ctx.full_drain_cohort_count().await; // M1: full cohort, not OLA-only
     load_drain_script(&dps, script, backlog); // one send/last per cohort doc
 
     let tick =
@@ -604,7 +621,7 @@ async fn go_online(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
 /// no-op with `backlog_size_before = 0`).
 async fn drain_op(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
     let dps = ctx.new_dps();
-    let backlog = ctx.count_offline_local_ack().await;
+    let backlog = ctx.full_drain_cohort_count().await; // M1: full cohort, not OLA-only
     load_drain_script(&dps, script, backlog); // one send/last per cohort doc
     let guard = drain_test_guard();
     let view = ctx.view(&dps);
@@ -622,7 +639,7 @@ async fn drain_op(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
 
 /// Terminal-recovery drain-tick (A4 settle): drive a REAL backlog drain with Ack
 /// responses sized to the REAL cohort (`list_drain_candidates_for_fn_ordered_by_lnd`
-/// via `drain_cohort_len`, NOT the M1-undercounting `count_offline_local_ack`),
+/// via `drain_cohort_len`, NOT an OFFLINE_LOCAL_ACK-only undercount),
 /// simulating DPS coming back so the WHOLE offline cohort — including re-driven
 /// `ERROR_RETRYABLE` / `SENT` docs left by a prior exotic drain — drains to ACK
 /// and finalize CAS's `GoingOnline → Online`.  One Ack send/last per cohort doc
@@ -1090,6 +1107,39 @@ async fn drain_after_going_online_advances_backlog_to_ack() {
         ctx.only_doc_state().await,
         DocState::Ack,
         "drain advances the backlog doc to ACK"
+    );
+}
+
+/// B1/M1 — the drain must provision the wire per the REAL drain cohort
+/// (OFFLINE_LOCAL_ACK / SENT / KVT1 / ERROR_RETRYABLE / KVT2), not just
+/// OFFLINE_LOCAL_ACK.  A prior partial drain leaves a SENT cohort doc; a
+/// follow-up AckPath drain must re-drive it to ACK.  With the OLA-only undercount
+/// (an OFFLINE_LOCAL_ACK-only count = 0 for a SENT doc) the AckPath drain
+/// under-provisions and the doc is stranded; provisioning per the full cohort
+/// re-drives it.
+#[tokio::test]
+async fn drain_provisions_full_cohort_not_just_offline_local_ack() {
+    let mut ctx = FuzzCtx::new_offline_open_shift(1).await;
+    let _ = run_op(&mut ctx, &Op::OfflineSell).await; // doc1 OFFLINE_LOCAL_ACK
+    ctx.force_node_mode(NodeMode::GoingOnline).await;
+    // Partial drain: send→Ack (OLA→Sent), last→NotFound (K4 hold) → doc1 SENT.
+    let _ = run_op(
+        &mut ctx,
+        &Op::Drain(DpsScript::send_ack_then_last_not_found()),
+    )
+    .await;
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Sent,
+        "the partial drain holds doc1 at SENT (K4 hold)"
+    );
+    // Follow-up AckPath drain — must re-drive the SENT cohort doc to ACK (M1:
+    // provisioned per the full cohort, not the OFFLINE_LOCAL_ACK-only undercount).
+    let _ = run_op(&mut ctx, &Op::Drain(DpsScript::ack_path())).await;
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Ack,
+        "M1: the SENT cohort doc is re-driven to ACK (full-cohort provisioning)"
     );
 }
 

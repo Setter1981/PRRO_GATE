@@ -45,9 +45,18 @@ pub struct Mutation {
 pub enum ExpectedOutcome {
     /// A deterministic fiscal mutation (differential-checked in Task 4).
     Mutated(Mutation),
-    /// A typed refusal or idempotent no-op: NO fiscal mutation (spec §5 invalid
-    /// / re-entry ops, or a valid op whose precondition did not hold).
+    /// A TRUE no-op: a typed refusal / idempotent replay that leaves the ledger
+    /// entirely unchanged — NO row, NO lnd, NO seed, NO code (spec §5 invalid /
+    /// re-entry ops, or a valid op refused BEFORE any row is written).
     NoMutation,
+    /// B2 — a refusal that is NOT issuance but DOES mint a legal NON-ISSUED row:
+    /// an online DPS-reject (Sending→Rejected, `inline::run` Err) and an
+    /// offline-ack refusal that aborted a signed doc (no code / no session →
+    /// Aborted).  The lnd IS consumed (the row exists) but NO receipt issued —
+    /// the seed does NOT advance and no code is consumed.  Distinct from
+    /// `NoMutation` so the harness asserts the RIGHT thing per class (≤1 new
+    /// non-issued row here vs zero rows for `NoMutation`).
+    NoIssuanceRow,
     /// A fault / not-yet-deterministically-modelled op (crash, reboot, and —
     /// for Task 1 — drain / go_online): the fault oracle (Task 5) owns these
     /// (re-sync from the real DB).  Task 4 enriches drain / go_online into
@@ -199,7 +208,7 @@ impl RefModel {
         let lnd = self.next_lnd;
         self.docs.insert(lnd, DocState::Aborted);
         self.next_lnd += 1;
-        ExpectedOutcome::NoMutation
+        ExpectedOutcome::NoIssuanceRow
     }
 
     /// A sell — the lane is the NODE MODE (the interpreter's `inline::run`
@@ -236,7 +245,7 @@ impl RefModel {
                 // the model reports NoMutation (the lnd was still consumed, so
                 // next_lnd / docs stay in sync with reality).
                 if doc_state == DocState::Rejected {
-                    return ExpectedOutcome::NoMutation;
+                    return ExpectedOutcome::NoIssuanceRow;
                 }
                 ExpectedOutcome::Mutated(Mutation {
                     lnd,
