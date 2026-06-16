@@ -919,6 +919,8 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         let codes_before = ctx.consumed_codes_count().await;
         let sends_before = ctx.send_calls(); // wire send count BEFORE the op (A3 no-resend)
         let shift_before = ctx.read_shift_state().await; // real shift_state BEFORE the op
+        let cohort_before = ctx.full_drain_cohort_count().await; // MH: drain re-drives ≤ cohort
+        let next_lnd_before = ctx.read_next_lnd().await; // MH: a drain allocates no new lnd
 
         let expected = model.apply(op);
         let real = interp::run_op(&mut ctx, op).await;
@@ -927,6 +929,57 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         match class {
             // Fault / recovery — we do NOT predict recovery; adopt the real DB.
             oracle::OpClass::FaultOrRecovery => {
+                // MH (B1): a Fault-DEFERRED DRAIN (exotic wire script / mid-wire
+                // cohort the model cannot cleanly predict) was previously BLINDLY
+                // resync'd, leaving the exotic-drain path UNVERIFIED.  Assert the
+                // bounded SAFETY postconds FIRST, so an erroneous exotic drain is
+                // CAUGHT, not adopted.  (Crash / Reboot Faults are NOT drains —
+                // they are covered by A3's no-resend below.)
+                if matches!(
+                    op,
+                    Op::Drain(_) | Op::RepeatDrain | Op::GoOnline(_) | Op::GoOnlineWithoutBacklog
+                ) {
+                    // 1. No offline code consumed — codes are consumed at ISSUANCE,
+                    //    never by a drain (which re-drives already-issued docs).
+                    assert_eq!(
+                        ctx.consumed_codes_count().await,
+                        codes_before,
+                        "MH: exotic drain {op:?} consumed an offline code"
+                    );
+                    // 2. next_lnd unchanged — a drain allocates NO new lnd.
+                    assert_eq!(
+                        ctx.read_next_lnd().await,
+                        next_lnd_before,
+                        "MH: exotic drain {op:?} allocated a new lnd"
+                    );
+                    // 3. Seed unchanged — offline-origin advanced the MAC seed at
+                    //    issuance (OFFLINE_LOCAL_ACK); a drain re-drives, never
+                    //    re-advances it.
+                    assert_eq!(
+                        ctx.read_seed().await,
+                        prior_tip,
+                        "MH: exotic drain {op:?} advanced the MAC seed"
+                    );
+                    // 4. Send-delta bounded by the cohort — the drain re-drives
+                    //    each cohort doc a BOUNDED number of times (no unbounded
+                    //    resend loop); 2×+1 allows one MAC-recovery retry per doc.
+                    let send_delta = ctx.send_calls() - sends_before;
+                    assert!(
+                        send_delta <= 2 * cohort_before + 1,
+                        "MH: exotic drain {op:?} send-delta {send_delta} exceeds \
+                         2×cohort({cohort_before})+1 — unbounded re-drive"
+                    );
+                    // 5. Shift unchanged OR escalated to RMR — a drain either makes
+                    //    progress (shift unchanged) or halts-manual (RMR); never
+                    //    some other shift transition.
+                    let shift_after = ctx.read_shift_state().await;
+                    assert!(
+                        shift_after == shift_before
+                            || shift_after == ShiftState::RequiresManualReconciliation,
+                        "MH: exotic drain {op:?} moved shift {shift_before:?} -> {shift_after:?} \
+                         (neither unchanged nor RMR)"
+                    );
+                }
                 model.resync_from_db(&ctx.pool).await;
             }
             // Predictable mutation — differential-match the model.
@@ -1113,6 +1166,27 @@ fn harness_offline_no_code_sell_mirrors_aborted_row() {
             Op::OfflineSell,
             Op::OfflineSell, // no code left → reality mints a non-issued Aborted row
             Op::GoOnline(DpsScript::ack_path()),
+        ],
+        true,
+    );
+}
+
+/// B1/MH — a Fault-deferred EXOTIC drain (the model cannot cleanly predict it) is
+/// now VERIFIED by the bounded safety postconds in run_harness, not blindly
+/// resync'd.  Driving [OfflineSell x2, GoOnline([Superseded])] exercises the MH
+/// postconds (no code consumed / no new lnd / seed unmoved / send bounded by the
+/// cohort / shift unchanged-or-RMR); they HOLD, so the harness does not panic —
+/// proving the exotic-drain path is now ASSERTED, not silently adopted.  (A
+/// genuine bound violation would panic here.  Like A3, the bounds are
+/// defense-in-depth: the real drain does not violate them, so the value is the
+/// VERIFICATION coverage this closes — the exotic-drain false-negative zone.)
+#[test]
+fn harness_exotic_drain_is_bounded_postcond_verified() {
+    drive(
+        &[
+            Op::OfflineSell,
+            Op::OfflineSell,
+            Op::GoOnline(DpsScript::superseded_tip()),
         ],
         true,
     );
