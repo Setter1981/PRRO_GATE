@@ -243,6 +243,51 @@ async fn detects_stuck_sending() {
     );
 }
 
+/// Part 3 — durable ledger-only enforcement: a PRE-SEND non-terminal
+/// {PREPARED, SIGNED, ENCRYPTED} doc resting at a quiescent boundary is a leaked
+/// write-path artifact (the inline pass must flow it to SENDING / a terminal in
+/// one pass; the Aborted seam closes the refusal path).  `scan()` is a
+/// quiescent-only post-condition gate (no production / pre-recovery caller — see
+/// the module docstring), so the check is unconditional, mirroring StuckSending.
+#[tokio::test]
+async fn detects_stuck_non_terminal_pre_send_doc() {
+    for state in ["PREPARED", "SIGNED", "ENCRYPTED"] {
+        let pool = fresh_pool().await;
+        let shift = seed_fn(&pool).await;
+        seed_node_state(&pool, shift, None).await; // no issued tip
+                                                   // A resting pre-send doc: unsigned set, genesis prev, never issued.
+        seed_doc(&pool, shift, 1, state, None, None, Some(h(1)), None, false).await;
+        let v = scan(&pool).await.unwrap();
+        assert!(
+            v.iter().any(|x| matches!(
+                x,
+                Violation::StuckNonTerminalDoc { state: s, .. } if s == state
+            )),
+            "a resting {state} doc must be flagged StuckNonTerminalDoc; got: {v:#?}"
+        );
+    }
+}
+
+/// Part 3 NEGATIVE (no false positive): the legitimately-RESTING states
+/// (`ERROR_RETRYABLE` retry-parked, `SENT` awaiting DPS) are NOT pre-send and
+/// must NOT be flagged StuckNonTerminalDoc — only the {PREPARED,SIGNED,ENCRYPTED}
+/// pipeline pre-send states are.
+#[tokio::test]
+async fn stuck_non_terminal_excludes_legit_resting_states() {
+    for (state, sfn) in [("ERROR_RETRYABLE", None), ("SENT", Some("D-1"))] {
+        let pool = fresh_pool().await;
+        let shift = seed_fn(&pool).await;
+        seed_node_state(&pool, shift, None).await;
+        seed_doc(&pool, shift, 1, state, sfn, None, Some(h(1)), None, false).await;
+        let v = scan(&pool).await.unwrap();
+        assert!(
+            !v.iter()
+                .any(|x| matches!(x, Violation::StuckNonTerminalDoc { .. })),
+            "a legitimately-resting {state} doc must NOT be flagged StuckNonTerminalDoc; got: {v:#?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn detects_ack_without_server_fiscal_no() {
     let pool = fresh_pool().await;

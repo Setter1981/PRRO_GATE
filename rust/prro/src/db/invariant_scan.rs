@@ -48,6 +48,19 @@ pub enum Violation {
     /// A doc rests in `SENDING` — the Pattern B intent marker leaked
     /// into quiescence (boot recovery must downgrade it).
     StuckSending { document_id_hex: String },
+    /// A doc rests in a PRE-SEND pipeline state {`PREPARED`, `SIGNED`,
+    /// `ENCRYPTED`} at a QUIESCENT boundary — a leaked write-path artifact.
+    /// The inline pass must flow such a doc to SENDING / OFFLINE_LOCAL_ACK, or
+    /// (on a pre-issuance refusal) to the `Aborted` terminal, within ONE
+    /// transaction-bounded pass; it must NEVER rest here.  Durable enforcement
+    /// of the ledger-only pin — the pre-send extension of [`StuckSending`].
+    /// (`ERROR_RETRYABLE` / `SENT` / `KVT1` / `KVT2` / `OFFLINE_LOCAL_ACK` are
+    /// EXCLUDED — they legitimately rest: retry-parked / awaiting DPS /
+    /// offline-issued.)
+    StuckNonTerminalDoc {
+        document_id_hex: String,
+        state: String,
+    },
     /// Terminal `ACK` without a non-empty DPS `server_fiscal_no`.
     AckWithoutServerFiscalNo { document_id_hex: String },
     /// Terminal `ACK` without a persisted `KVT1_RAW` evidence blob.
@@ -155,6 +168,25 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
     .await?;
     for (document_id_hex,) in sending {
         out.push(Violation::StuckSending { document_id_hex });
+    }
+
+    // 2b. No quiescent PRE-SEND non-terminal {PREPARED, SIGNED, ENCRYPTED}.
+    // Like StuckSending (2 above), these are legitimate ONLY while the inline
+    // write-path is mid-pass; at this quiescent boundary a resting one is a
+    // leaked write-path artifact (the Aborted terminal closes the refusal path).
+    // ERROR_RETRYABLE / SENT / KVT1 / KVT2 / OFFLINE_LOCAL_ACK legitimately rest
+    // (retry-parked / awaiting DPS / offline-issued) and are EXCLUDED.
+    let pre_send: Vec<(String, String)> = sqlx::query_as(
+        "SELECT lower(hex(document_id)), state FROM fiscal_documents \
+         WHERE state IN ('PREPARED','SIGNED','ENCRYPTED')",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (document_id_hex, state) in pre_send {
+        out.push(Violation::StuckNonTerminalDoc {
+            document_id_hex,
+            state,
+        });
     }
 
     // 3a. ACK ⇒ non-empty server_fiscal_no.
