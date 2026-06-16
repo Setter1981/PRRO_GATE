@@ -16,6 +16,8 @@
 
 use std::collections::BTreeMap;
 
+use sqlx::SqlitePool;
+
 use prro::db::models::enums::{DocState, NodeMode, OfflineSessionState, ShiftState};
 use prro::db::repositories::fiscal_documents::OFFLINE_ISSUED_STATES;
 
@@ -271,6 +273,60 @@ impl RefModel {
             // Exotic drain scripts are deferred (agreed follow-up).
             _ => ExpectedOutcome::Fault,
         }
+    }
+
+    /// **Re-sync (L3, Task 5).**  After a fault + recovery we do NOT predict the
+    /// recovered state — recovery is a Phase-1 wildcard — we ADOPT the real DB
+    /// state, so subsequent ops are differential-clean again from there.
+    ///
+    /// The fuzzer uses ONE fiscal_number per DB, so the reads are unfiltered
+    /// (they adopt that FN's real state).  The seed is adopted STRUCTURALLY:
+    /// `Some` iff the real `node_state` has a seed, else `None` — a synthetic
+    /// per-tip-lnd placeholder, since the exact bytes are never compared (the
+    /// differential is structural — advance-iff + chain-continuity vs the real
+    /// tip, never `model.seed == real.seed` byte-for-byte).
+    pub async fn resync_from_db(&mut self, pool: &SqlitePool) {
+        // docs ← the real ledger (lnd → state).
+        let docs: Vec<(i64, DocState)> =
+            sqlx::query_as("SELECT lnd, state FROM fiscal_documents ORDER BY lnd")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        self.docs = docs.into_iter().collect();
+        let tip_lnd = self.docs.keys().copied().max().unwrap_or(0);
+
+        // mode / shift_state / next_lnd / seed-presence ← node_state.
+        let (mode, shift_state, next_lnd, real_seed): (NodeMode, ShiftState, i64, Option<Vec<u8>>) =
+            sqlx::query_as(
+                "SELECT mode, shift_state, next_lnd, last_known_unsigned_xml_sha256 \
+                 FROM node_state LIMIT 1",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        self.mode = mode;
+        self.shift_state = shift_state;
+        self.next_lnd = next_lnd;
+        // STRUCTURAL seed: Some iff real Some (synthetic placeholder bytes).
+        self.seed = real_seed.is_some().then(|| synth_unsigned_hash(tip_lnd));
+
+        // offline session + codes ← real.
+        self.session = sqlx::query_scalar::<_, OfflineSessionState>(
+            "SELECT state FROM offline_sessions ORDER BY opened_at DESC LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        self.codes_issued = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM offline_codes")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        self.codes_consumed = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM offline_codes WHERE consumed_at IS NOT NULL",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
     }
 }
 

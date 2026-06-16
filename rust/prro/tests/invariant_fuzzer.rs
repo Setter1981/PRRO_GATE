@@ -537,7 +537,8 @@ async fn fault_resync_then_next_op_is_differential_clean() {
     // Adopt the real recovered state.
     model.resync_from_db(&ctx.pool).await;
     assert_eq!(
-        model.docs, ctx.read_ledger().await,
+        model.docs,
+        ctx.read_ledger().await,
         "resync adopts the real ledger"
     );
 
@@ -576,8 +577,13 @@ async fn scan_skips_mid_crash_sending_transient() {
 
     // Resolve with Reboot, THEN scan: clean at the quiescent boundary.
     let _ = interp::run_op(&mut ctx, &Op::Reboot).await;
-    let post = prro::db::invariant_scan::scan(&ctx.pool).await.expect("scan query");
-    assert!(post.is_empty(), "post-recovery quiescent scan is clean, got {post:?}");
+    let post = prro::db::invariant_scan::scan(&ctx.pool)
+        .await
+        .expect("scan query");
+    assert!(
+        post.is_empty(),
+        "post-recovery quiescent scan is clean, got {post:?}"
+    );
     oracle::assert_clean(&ctx.pool).await;
 }
 
@@ -589,7 +595,11 @@ async fn fault_crash_kvt1_reboot_probe_no_resend() {
 
     let crashed = interp::run_op(&mut ctx, &Op::Crash(Stage::Kvt1)).await;
     assert!(matches!(crashed, interp::RealOutcome::Crashed { .. }));
-    assert_eq!(ctx.only_doc_state().await, DocState::Sent, "Crash(Kvt1) committed SENT");
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Sent,
+        "Crash(Kvt1) committed SENT"
+    );
     let (sends_before, lasts_before) = (ctx.send_calls(), ctx.last_calls());
 
     let _ = interp::run_op(&mut ctx, &Op::Reboot).await;

@@ -25,6 +25,8 @@
 
 use std::collections::BTreeMap;
 
+use sqlx::SqlitePool;
+
 use prro::db::models::enums::DocState;
 
 use crate::interp::{ObservedDoc, RealOutcome};
@@ -161,6 +163,63 @@ pub fn check_ledger_delta(
     if model_docs != real_ledger {
         return Err(Divergence(format!(
             "ledger mismatch: model {model_docs:?} != real {real_ledger:?}"
+        )));
+    }
+    Ok(())
+}
+
+// ── Layer 2 — quiescent-boundary scan ───────────────────────────────────────
+
+/// Run the REAL ledger invariant scanner at a QUIESCENT boundary — after a
+/// completed op or after `Reboot` / recovery, NEVER mid-crash (a committed
+/// `SENDING` wire-in-flight is a legal transient that the scanner would
+/// false-positive on as `StuckSending`, spec §7.2).  Wraps
+/// `prro::db::invariant_scan::assert_clean` (panics on a real violation) so the
+/// fuzzer does NOT re-implement the invariants (chain / Mirror-1 / Mirror-3).
+pub async fn assert_clean(pool: &SqlitePool) {
+    prro::db::invariant_scan::assert_clean(pool).await;
+}
+
+// ── Layer 3 — bounded kill-point postconditions (spec §9) ───────────────────
+
+/// `Crash(Send)` + `Reboot` (kill-matrix K3): recovery routes the committed
+/// `SENDING` doc to `ERROR_RETRYABLE` with NO second `send_chk` — DPS does not
+/// deduplicate, so a blind resend would double-fiscalise.
+pub fn assert_crash_send_recovery(
+    recovered_state: DocState,
+    send_calls_before_reboot: usize,
+    send_calls_after_reboot: usize,
+) -> Result<(), Divergence> {
+    if recovered_state != DocState::ErrorRetryable {
+        return Err(Divergence(format!(
+            "Crash(Send) recovery: expected ERROR_RETRYABLE, got {recovered_state:?}"
+        )));
+    }
+    if send_calls_after_reboot != send_calls_before_reboot {
+        return Err(Divergence(format!(
+            "Crash(Send) recovery RESENT: send_chk {send_calls_before_reboot} -> {send_calls_after_reboot}"
+        )));
+    }
+    Ok(())
+}
+
+/// `Crash(Kvt1)` + `Reboot` (kill-matrix K4): SENT-before-confirm recovery takes
+/// the PROBE path (a `last_chk`) and does NOT resend — `send_chk` unchanged AND
+/// `last_chk` advanced.
+pub fn assert_probe_recovery_no_resend(
+    send_calls_before: usize,
+    send_calls_after: usize,
+    last_calls_before: usize,
+    last_calls_after: usize,
+) -> Result<(), Divergence> {
+    if send_calls_after != send_calls_before {
+        return Err(Divergence(format!(
+            "probe recovery RESENT: send_chk {send_calls_before} -> {send_calls_after}"
+        )));
+    }
+    if last_calls_after <= last_calls_before {
+        return Err(Divergence(format!(
+            "probe recovery did not probe: last_chk {last_calls_before} -> {last_calls_after}"
         )));
     }
     Ok(())
