@@ -58,7 +58,7 @@ Cancellation/drop-injection at **wire points** (the K3/K4 kill points): the inte
 
 The authoritative invariant set is `docs/LEGAL_INVARIANTS.md` (INV-01 … INV-20). The fuzzer's `invariant_scan` enforces a *subset* at the SQL level. The ones most relevant to you:
 
-- **Chain integrity** — `prev_hash` linkage across the issued-receipt sequence is unbroken and correctly ordered.
+- **Chain integrity** — `prev_hash` linkage across the issued-receipt sequence is unbroken and correctly ordered. **Caveat (honest):** the fuzzer's chain check is *referential* — it asserts `previous_hash == prior doc's stored hash`; it does **not** recompute `sha256(canonical_xml)`, so a corrupt-but-self-consistently-threaded hash would pass. "Chain linkage" here means referential linkage, not cryptographic.
 - **Ledger-only pin (M3b)** — `fiscal_documents` is a **ledger of ISSUED receipts only**. Failed DPS rejections and invalid ingress payloads go to `audit_log` only, **never** to `fiscal_documents`. (This is the invariant #192 violated — an orphaned SIGNED row is a non-issued doc sitting in the ledger.)
 - **Single-writer** — one `fiscal_number` = one logical write-path; no concurrent mutation.
 - **Mirror consistency** — offline session state and the drain cohort agree (no foreign/stale/null session pointers on cohort docs).
@@ -189,7 +189,7 @@ Paths are relative to the repo root (`/home/setter/prro_gate`). Line counts are 
 **`Op` alphabet** (`op.rs`) — 6 core + 6 exotic:
 `OnlineSell(DpsScript)`, `GoOnline(DpsScript)`, `OfflineSell`, `Drain(DpsScript)`, `Crash(Stage)`, `Reboot` · `RepeatDrain`, `RepeatReboot`, `DuplicateIdemKey`, `GoOnlineWithoutBacklog`, `OfflineSellDuringGoingOnline`, `SellWithClosedShift`.
 
-**`Stage`** (crash injection points): `Acquire`, `Sign`, `Send`, `Kvt1`, `Kvt2`, `Finalize`, `OfflineAck`, `Drain`.
+**`Stage`** (crash injection points, *as declared*): `Acquire`, `Sign`, `Send`, `Kvt1`, `Kvt2`, `Finalize`, `OfflineAck`, `Drain`. **Caveat (honest):** the generator currently emits **only `Crash(Send)` and `Crash(Kvt1)`** (`strategy.rs:41`); the other six are `unimplemented!()` in the interpreter (`interp.rs:446-449`). So the crash model is effectively **wire-only**, and the `Finalize` (ACK-commit↔audit-write) and `OfflineAck` (local-commit↔drain-threshold — the #192 birth site) windows are **unreachable**. Treat §5.D as a live attack surface, not a covered one.
 
 **`WireResponse`** (DPS adversary alphabet): `Ack`, `Reject`, `Timeout`, `Superseded`, `BadHashPrev`, `NotFound`.
 
