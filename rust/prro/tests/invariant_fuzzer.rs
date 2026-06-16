@@ -214,15 +214,12 @@ fn invalid_and_reentry_ops_do_not_mutate() {
 
 /// Fault / not-yet-modelled-deterministic ops (crash, reboot, drain, go_online)
 /// defer to the fault/re-sync oracle (Task 5) and do NOT mutate the pure model.
+/// Only crash / reboot remain `Fault` (Task 4 moved Drain / GoOnline out of
+/// Fault into real predictions — plan constraint #1).
 #[test]
-fn fault_and_deferred_ops_are_fault_without_mutation() {
-    let deferred = [
-        Op::Crash(Stage::Send),
-        Op::Reboot,
-        Op::Drain(DpsScript::ack_path()),
-        Op::GoOnline(DpsScript::ack_path()),
-    ];
-    for op in deferred {
+fn crash_and_reboot_are_fault_without_mutation() {
+    let faults = [Op::Crash(Stage::Send), Op::Reboot];
+    for op in faults {
         let mut m = RefModel::new_online_open_shift();
         let before = (m.next_lnd, m.seed, m.codes_consumed, m.docs.len());
         let out = m.apply(&op);
@@ -231,6 +228,24 @@ fn fault_and_deferred_ops_are_fault_without_mutation() {
             (m.next_lnd, m.seed, m.codes_consumed, m.docs.len()),
             before,
             "{op:?} must not mutate the pure model"
+        );
+    }
+}
+
+/// Drain / GoOnline are no longer `Fault`: out of their precondition (an Online
+/// node, no GoingOnline / no offline backlog) they predict a no-op, NOT a fault.
+#[test]
+fn drain_and_go_online_out_of_precondition_are_no_mutation() {
+    for op in [
+        Op::Drain(DpsScript::ack_path()),
+        Op::GoOnline(DpsScript::ack_path()),
+    ] {
+        let mut m = RefModel::new_online_open_shift(); // mode Online: not GoingOnline / not Offline
+        let out = m.apply(&op);
+        assert_eq!(
+            out,
+            ExpectedOutcome::NoMutation,
+            "{op:?} out of precondition must be NoMutation, not Fault"
         );
     }
 }
@@ -318,12 +333,20 @@ fn model_drain_ackpath_advances_backlog_to_ack() {
         matches!(out, ExpectedOutcome::Mutated(_)),
         "an advancing drain is PredictableMutating, got {out:?}"
     );
-    assert_eq!(m.docs.get(&1), Some(&DocState::Ack), "backlog doc drained to ACK");
+    assert_eq!(
+        m.docs.get(&1),
+        Some(&DocState::Ack),
+        "backlog doc drained to ACK"
+    );
     assert_eq!(
         m.seed, seed_before,
         "drain does NOT re-advance the seed (offline-origin advanced at issuance)"
     );
-    assert_eq!(m.mode, NodeMode::Online, "a full drain flips GoingOnline → Online");
+    assert_eq!(
+        m.mode,
+        NodeMode::Online,
+        "a full drain flips GoingOnline → Online"
+    );
 }
 
 #[test]
@@ -336,7 +359,11 @@ fn model_drain_reject_halts_and_escalates_manual() {
     let out = m.apply(&Op::Drain(DpsScript::send_then_reject()));
 
     assert!(matches!(out, ExpectedOutcome::Mutated(_)));
-    assert_eq!(m.docs.get(&1), Some(&DocState::Rejected), "first backlog doc → REJECTED");
+    assert_eq!(
+        m.docs.get(&1),
+        Some(&DocState::Rejected),
+        "first backlog doc → REJECTED"
+    );
     assert_eq!(
         m.docs.get(&2),
         Some(&DocState::OfflineLocalAck),
@@ -357,6 +384,14 @@ fn model_go_online_transitions_and_drains() {
     let out = m.apply(&Op::GoOnline(DpsScript::ack_path()));
 
     assert!(matches!(out, ExpectedOutcome::Mutated(_)));
-    assert_eq!(m.mode, NodeMode::Online, "go_online: Offline → (GoingOnline) → Online");
-    assert_eq!(m.docs.get(&1), Some(&DocState::Ack), "the backlog drained to ACK");
+    assert_eq!(
+        m.mode,
+        NodeMode::Online,
+        "go_online: Offline → (GoingOnline) → Online"
+    );
+    assert_eq!(
+        m.docs.get(&1),
+        Some(&DocState::Ack),
+        "the backlog drained to ACK"
+    );
 }

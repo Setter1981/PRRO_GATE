@@ -126,10 +126,10 @@ impl RefModel {
         match op {
             Op::OnlineSell(script) => self.apply_online_sell(script),
             Op::OfflineSell => self.apply_offline_sell(),
-            // Valid transition / drain ops: deterministic prediction is enriched
-            // in Task 4 (classified PredictableMutating there); Task 1 defers
-            // them to the fault / re-sync oracle.
-            Op::GoOnline(_) | Op::Drain(_) => ExpectedOutcome::Fault,
+            // Task 4: the advancing transition / drain ops predict a real
+            // ledger mutation (classified PredictableMutating, NOT Fault).
+            Op::GoOnline(script) => self.apply_go_online(script),
+            Op::Drain(script) => self.apply_drain(script),
             // Faults: the pure model does not mutate; recovery is ground-truth
             // re-synced by the Task 5 fault oracle.
             Op::Crash(_) | Op::Reboot => ExpectedOutcome::Fault,
@@ -193,6 +193,84 @@ impl RefModel {
             previous_hash,
             code_consumed: Some(self.codes_consumed),
         })
+    }
+
+    /// `Drain` runs only in `GoingOnline` (else a no-op refusal); it advances
+    /// the OFFLINE_LOCAL_ACK backlog per the wire script.
+    fn apply_drain(&mut self, script: &DpsScript) -> ExpectedOutcome {
+        if self.mode != NodeMode::GoingOnline {
+            return ExpectedOutcome::NoMutation;
+        }
+        self.drain_backlog(script)
+    }
+
+    /// `GoOnline` is the one real transition op: the probe flips
+    /// `Offline → GoingOnline` (skipped — no-op — if not Offline), then the
+    /// drain advances the backlog (`GoingOnline → Online`).
+    fn apply_go_online(&mut self, script: &DpsScript) -> ExpectedOutcome {
+        if self.mode != NodeMode::Offline {
+            return ExpectedOutcome::NoMutation;
+        }
+        self.mode = NodeMode::GoingOnline;
+        self.drain_backlog(script)
+    }
+
+    /// Predict the drain of the OFFLINE_LOCAL_ACK backlog (ordered by lnd) per
+    /// the script's leading send response:
+    ///   - leading `Ack` → every backlog doc OFFLINE_LOCAL_ACK → ACK; a full
+    ///     drain CAS's `GoingOnline → Online`.  The seed does NOT re-advance —
+    ///     offline-origin docs advanced it at issuance (spec §6).
+    ///   - leading `Reject` → strict-sequential halt-on-reject (K8): the first
+    ///     backlog doc → REJECTED, the shift → RequiresManualReconciliation, the
+    ///     rest are held (stay OFFLINE_LOCAL_ACK).
+    ///   - empty backlog → eligible-empty: `GoingOnline → Online`, no mutation.
+    ///   - other leading responses (timeout / superseded / bad-hash / not-found)
+    ///     → Fault (deferred; the full per-response drain semantics are an agreed
+    ///     follow-up — see plan §4 / Task 4 scope note).
+    fn drain_backlog(&mut self, script: &DpsScript) -> ExpectedOutcome {
+        let backlog: Vec<i64> = self
+            .docs
+            .iter()
+            .filter(|(_, st)| **st == DocState::OfflineLocalAck)
+            .map(|(lnd, _)| *lnd)
+            .collect();
+        if backlog.is_empty() {
+            // Nothing to drain: the drain CAS's GoingOnline → Online (eligible).
+            self.mode = NodeMode::Online;
+            return ExpectedOutcome::NoMutation;
+        }
+        let previous_hash = self.seed; // unchanged by drain (offline already advanced)
+        match script.0.first() {
+            Some(WireResponse::Ack) => {
+                for lnd in &backlog {
+                    self.docs.insert(*lnd, DocState::Ack);
+                }
+                self.mode = NodeMode::Online; // full drain → GoingOnline → Online
+                let tip = *backlog.last().expect("backlog is non-empty");
+                ExpectedOutcome::Mutated(Mutation {
+                    lnd: tip,
+                    doc_state: DocState::Ack,
+                    seed_after: self.seed,
+                    previous_hash,
+                    code_consumed: None,
+                })
+            }
+            Some(WireResponse::Reject) => {
+                let first = backlog[0];
+                self.docs.insert(first, DocState::Rejected);
+                self.shift_state = ShiftState::RequiresManualReconciliation;
+                // mode stays GoingOnline (drain halted); seed unchanged.
+                ExpectedOutcome::Mutated(Mutation {
+                    lnd: first,
+                    doc_state: DocState::Rejected,
+                    seed_after: self.seed,
+                    previous_hash,
+                    code_consumed: None,
+                })
+            }
+            // Exotic drain scripts are deferred (agreed follow-up).
+            _ => ExpectedOutcome::Fault,
+        }
     }
 }
 
