@@ -123,78 +123,141 @@ impl RefModel {
         )
     }
 
+    /// The OBSERVABLE consumed-code count — the CUMULATIVE `COUNT(*) WHERE
+    /// consumed_at IS NOT NULL`, `None` when zero — matching
+    /// `FuzzCtx::read_codes_consumed` (the value the real `ObservedDoc` carries).
+    /// The real side reports this for EVERY doc, online or offline, so an online
+    /// sell that FOLLOWS an offline sell still observes the earlier consumption;
+    /// the model must report the same cumulative number, not a per-op `None`.
+    fn code_consumed_observable(&self) -> Option<i64> {
+        (self.codes_consumed > 0).then_some(self.codes_consumed)
+    }
+
+    /// The shift states the REAL drain runs on (`backlog_drain.rs` SW-3 fail-loud
+    /// at the escalate seam: "the drain only runs on active Opened/pending-drain
+    /// shifts").  On any OTHER state (e.g. a `SellWithClosedShift`-closed shift)
+    /// a drain that hits a reject FAILS LOUD (`BootError::Internal` structural
+    /// drift) — outside the model's clean predictive scope, so the model defers
+    /// to Fault there.  `RequiresManualReconciliation` is handled separately (the
+    /// AUD-K8-1 NoMutation teeth guard), so it is intentionally NOT eligible here.
+    fn shift_is_drain_eligible(&self) -> bool {
+        matches!(
+            self.shift_state,
+            ShiftState::Opened
+                | ShiftState::OpenedLocalPendingDrain
+                | ShiftState::ClosingLocalPendingDrain
+        )
+    }
+
     /// Apply one op, mutating the model and returning the predicted outcome.
     pub fn apply(&mut self, op: &Op) -> ExpectedOutcome {
         match op {
-            Op::OnlineSell(script) => self.apply_online_sell(script),
-            Op::OfflineSell => self.apply_offline_sell(),
-            // Task 4: the advancing transition / drain ops predict a real
-            // ledger mutation (classified PredictableMutating, NOT Fault).
+            // A "sell" outcome is determined by the NODE MODE, not the op name —
+            // the interpreter runs `inline::run`, which dispatches by mode
+            // (OnlineSell on an Offline node issues offline; OfflineSell on an
+            // Online node is a mis-targeted online sell).  Both route through
+            // `apply_sell`; OfflineSell carries no wire script.
+            Op::OnlineSell(script) => self.apply_sell(script),
+            Op::OfflineSell => self.apply_sell(&DpsScript(Vec::new())),
+            // The advancing transition / drain ops predict a real ledger
+            // mutation (PredictableMutating, NOT Fault).
             Op::GoOnline(script) => self.apply_go_online(script),
             Op::Drain(script) => self.apply_drain(script),
-            // Faults: the pure model does not mutate; recovery is ground-truth
-            // re-synced by the Task 5 fault oracle.
-            Op::Crash(_) | Op::Reboot => ExpectedOutcome::Fault,
-            // Invalid / re-entry / replay: a typed refusal or idempotent no-op —
-            // NO fiscal mutation (spec §5).
-            Op::RepeatDrain
-            | Op::RepeatReboot
-            | Op::DuplicateIdemKey
-            | Op::GoOnlineWithoutBacklog
-            | Op::OfflineSellDuringGoingOnline
-            | Op::SellWithClosedShift => ExpectedOutcome::NoMutation,
+            // Faults / recovery: ground-truth re-synced by the Task 5 oracle.
+            // RepeatReboot drives the boot seam too → also Fault (re-sync).
+            Op::Crash(_) | Op::Reboot | Op::RepeatReboot => ExpectedOutcome::Fault,
+            // Re-entry ops that drive a REAL transition seam — mirror the seam:
+            Op::RepeatDrain => self.apply_drain(&DpsScript(Vec::new())),
+            Op::GoOnlineWithoutBacklog => self.apply_go_online(&DpsScript(Vec::new())),
+            // Deliberately-adverse intents whose interpreter arm FORCES a state
+            // before a refused sell — mirror the forced state (no fiscal
+            // mutation), so the model stays in sync with reality:
+            Op::OfflineSellDuringGoingOnline => {
+                self.mode = NodeMode::GoingOnline;
+                ExpectedOutcome::NoMutation
+            }
+            Op::SellWithClosedShift => {
+                self.shift_state = ShiftState::Closed;
+                ExpectedOutcome::NoMutation
+            }
+            // A true replay (re-runs an already-DONE row) — no fiscal mutation.
+            Op::DuplicateIdemKey => ExpectedOutcome::NoMutation,
         }
     }
 
-    fn apply_online_sell(&mut self, script: &DpsScript) -> ExpectedOutcome {
-        if !self.shift_is_open() || self.mode != NodeMode::Online {
+    /// A sell — the lane is the NODE MODE (the interpreter's `inline::run`
+    /// dispatches by mode), not the op name.  Online → per-script outcome;
+    /// Offline → OFFLINE_LOCAL_ACK (consuming a code); any other mode → refused.
+    fn apply_sell(&mut self, script: &DpsScript) -> ExpectedOutcome {
+        if !self.shift_is_open() {
             return ExpectedOutcome::NoMutation;
         }
-        let lnd = self.next_lnd;
-        let previous_hash = self.seed;
-        let unsigned_hash = synth_unsigned_hash(lnd);
-        let doc_state = online_outcome_state(script);
-        self.docs.insert(lnd, doc_state);
-        self.next_lnd += 1;
-        // Online-origin advances the seed ONLY at ACK (spec §6).
-        if doc_state == DocState::Ack {
-            self.seed = Some(unsigned_hash);
+        match self.mode {
+            NodeMode::Online => {
+                // Server{-12} ERROR_BAD_HASH_PREV routes to the bounded MAC-
+                // recovery path (error_routing.rs `RetryClass::MacRecovery`): one
+                // auto re-sign + retry.  With the fuzzer's single-shot stub the
+                // retry hits an empty queue → terminal DpsRejected — a fault-class
+                // outcome the pure model does not cleanly predict.  Defer to Fault
+                // (the harness re-syncs); the scan / mirror checks still run on the
+                // real DB afterwards, so invariant coverage is NOT lost.
+                if matches!(script.0.as_slice(), [WireResponse::BadHashPrev, ..]) {
+                    return ExpectedOutcome::Fault;
+                }
+                let lnd = self.next_lnd;
+                let previous_hash = self.seed;
+                let unsigned_hash = synth_unsigned_hash(lnd);
+                let doc_state = online_outcome_state(script);
+                self.docs.insert(lnd, doc_state); // the row IS minted (lnd allocated)
+                self.next_lnd += 1;
+                if doc_state == DocState::Ack {
+                    self.seed = Some(unsigned_hash); // online-origin issues at ACK
+                }
+                // A DPS document-reject CAS's the row Sending→Rejected but
+                // `inline::run` returns Err(DpsRejected) → the interpreter reports
+                // Refused.  The row is a NON-ISSUED artifact (no seed advance), so
+                // the model reports NoMutation (the lnd was still consumed, so
+                // next_lnd / docs stay in sync with reality).
+                if doc_state == DocState::Rejected {
+                    return ExpectedOutcome::NoMutation;
+                }
+                ExpectedOutcome::Mutated(Mutation {
+                    lnd,
+                    doc_state,
+                    seed_after: self.seed,
+                    previous_hash,
+                    // Cumulative observable: an online sell consumes NO code, but
+                    // the real doc still reports the codes a PRIOR offline sell
+                    // consumed (read-back is `COUNT(*) consumed`, not per-op).
+                    code_consumed: self.code_consumed_observable(),
+                })
+            }
+            NodeMode::Offline => {
+                let code_available = self.codes_consumed < self.codes_issued;
+                if self.session != Some(OfflineSessionState::Open) || !code_available {
+                    return ExpectedOutcome::NoMutation;
+                }
+                let lnd = self.next_lnd;
+                let previous_hash = self.seed;
+                let unsigned_hash = synth_unsigned_hash(lnd);
+                // Offline issuance → OFFLINE_LOCAL_ACK, advances the seed THERE
+                // (spec §6 offline lane); stays issued through later drain states.
+                self.docs.insert(lnd, DocState::OfflineLocalAck);
+                self.next_lnd += 1;
+                self.codes_consumed += 1;
+                self.seed = Some(unsigned_hash);
+                ExpectedOutcome::Mutated(Mutation {
+                    lnd,
+                    doc_state: DocState::OfflineLocalAck,
+                    seed_after: self.seed,
+                    previous_hash,
+                    // Cumulative observable (this op's consume is now counted).
+                    code_consumed: self.code_consumed_observable(),
+                })
+            }
+            // GoingOnline / Blocked / etc — a sell is refused (no mutation).
+            _ => ExpectedOutcome::NoMutation,
         }
-        ExpectedOutcome::Mutated(Mutation {
-            lnd,
-            doc_state,
-            seed_after: self.seed,
-            previous_hash,
-            code_consumed: None,
-        })
-    }
-
-    fn apply_offline_sell(&mut self) -> ExpectedOutcome {
-        let code_available = self.codes_consumed < self.codes_issued;
-        if !self.shift_is_open()
-            || self.mode != NodeMode::Offline
-            || self.session != Some(OfflineSessionState::Open)
-            || !code_available
-        {
-            return ExpectedOutcome::NoMutation;
-        }
-        let lnd = self.next_lnd;
-        let previous_hash = self.seed;
-        let unsigned_hash = synth_unsigned_hash(lnd);
-        // Offline issuance lands at OFFLINE_LOCAL_ACK and advances the seed
-        // THERE (spec §6 offline lane); it stays issued through later drain
-        // states.
-        self.docs.insert(lnd, DocState::OfflineLocalAck);
-        self.next_lnd += 1;
-        self.codes_consumed += 1;
-        self.seed = Some(unsigned_hash);
-        ExpectedOutcome::Mutated(Mutation {
-            lnd,
-            doc_state: DocState::OfflineLocalAck,
-            seed_after: self.seed,
-            previous_hash,
-            code_consumed: Some(self.codes_consumed),
-        })
     }
 
     /// `Drain` runs only in `GoingOnline` (else a no-op refusal); it advances
@@ -202,6 +265,18 @@ impl RefModel {
     fn apply_drain(&mut self, script: &DpsScript) -> ExpectedOutcome {
         if self.mode != NodeMode::GoingOnline {
             return ExpectedOutcome::NoMutation;
+        }
+        // AUD-K8-1 guard (backlog_drain.rs:725): a drain re-tick on a
+        // manual-recon FN is a NO-OP — the model encodes the guard so the
+        // differential CATCHES a reverted re-drive (the teeth-test mechanism).
+        // MUST precede the eligibility check (RMR is NOT drain-eligible).
+        if self.shift_state == ShiftState::RequiresManualReconciliation {
+            return ExpectedOutcome::NoMutation;
+        }
+        // A drain on a NON-eligible shift (e.g. a force-closed shift) FAILS LOUD
+        // in the real seam on a reject — outside the clean predictive scope.
+        if !self.shift_is_drain_eligible() {
+            return ExpectedOutcome::Fault;
         }
         self.drain_backlog(script)
     }
@@ -214,6 +289,11 @@ impl RefModel {
             return ExpectedOutcome::NoMutation;
         }
         self.mode = NodeMode::GoingOnline;
+        // Same eligibility deferral as `apply_drain` — a drain over a
+        // non-eligible shift is outside the clean predictive scope.
+        if !self.shift_is_drain_eligible() {
+            return ExpectedOutcome::Fault;
+        }
         self.drain_backlog(script)
     }
 
@@ -230,6 +310,25 @@ impl RefModel {
     ///     → Fault (deferred; the full per-response drain semantics are an agreed
     ///     follow-up — see plan §4 / Task 4 scope note).
     fn drain_backlog(&mut self, script: &DpsScript) -> ExpectedOutcome {
+        // The REAL drain re-drives the WHOLE cohort — offline-origin docs in
+        // OFFLINE_LOCAL_ACK / SENT / KVT1 / ERROR_RETRYABLE / KVT2 (see
+        // `list_drain_candidates_for_fn_ordered_by_lnd`).  The pure model
+        // predicts ONLY the CLEAN case where the cohort is entirely
+        // OFFLINE_LOCAL_ACK.  If a PRIOR (exotic / partial) drain left a doc
+        // mid-wire (SENT / KVT1 / ERROR_RETRYABLE / KVT2), re-driving it is the
+        // deferred per-response drain follow-up (plan §4) → defer to Fault (the
+        // harness re-syncs and does NOT differential-check it).  This NEVER
+        // masks the K8 teeth: the RMR guard in `apply_drain` runs FIRST, and the
+        // K8 backlog rests at OFFLINE_LOCAL_ACK / REJECTED (neither is mid-wire).
+        let cohort_has_midwire = self.docs.values().any(|st| {
+            matches!(
+                st,
+                DocState::Sent | DocState::Kvt1 | DocState::ErrorRetryable | DocState::Kvt2
+            )
+        });
+        if cohort_has_midwire {
+            return ExpectedOutcome::Fault;
+        }
         let backlog: Vec<i64> = self
             .docs
             .iter()
@@ -242,8 +341,10 @@ impl RefModel {
             return ExpectedOutcome::NoMutation;
         }
         let previous_hash = self.seed; // unchanged by drain (offline already advanced)
-        match script.0.first() {
-            Some(WireResponse::Ack) => {
+        match script.0.as_slice() {
+            // Pure AckPath ([Ack, Ack]) only — [Ack, NotFound] is NOT an
+            // all-ACK drain (it holds at SENT), so it falls through to Fault.
+            [WireResponse::Ack, WireResponse::Ack, ..] => {
                 for lnd in &backlog {
                     self.docs.insert(*lnd, DocState::Ack);
                 }
@@ -257,7 +358,7 @@ impl RefModel {
                     code_consumed: None,
                 })
             }
-            Some(WireResponse::Reject) => {
+            [WireResponse::Reject, ..] => {
                 let first = backlog[0];
                 self.docs.insert(first, DocState::Rejected);
                 self.shift_state = ShiftState::RequiresManualReconciliation;
@@ -325,6 +426,31 @@ impl RefModel {
             "SELECT COUNT(*) FROM offline_codes WHERE consumed_at IS NOT NULL",
         )
         .fetch_one(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Adopt ONLY the precondition state (mode / shift_state / active session)
+    /// from the real DB after a NON-fault op — keeping the PREDICTED ledger
+    /// (docs / seed / next_lnd / codes) for the differential.  Transition seams
+    /// (go_online / drain / the force-ops) set mode/shift/session in ways the
+    /// pure model need not perfectly predict; the LEDGER is what the differential
+    /// checks, and the mode/shift mirror integrity is checked by the scan.  This
+    /// keeps the NEXT op dispatching from the real precondition state.
+    pub async fn resync_preconditions_from_db(&mut self, pool: &SqlitePool) {
+        let (mode, shift_state): (NodeMode, ShiftState) =
+            sqlx::query_as("SELECT mode, shift_state FROM node_state LIMIT 1")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        self.mode = mode;
+        self.shift_state = shift_state;
+        // The ACTIVE (OPEN / DRAINING) session — the one a sell / drain
+        // dispatches on (matches `current_open_or_draining_session`).
+        self.session = sqlx::query_scalar::<_, OfflineSessionState>(
+            "SELECT state FROM offline_sessions WHERE state IN ('OPEN', 'DRAINING') LIMIT 1",
+        )
+        .fetch_optional(pool)
         .await
         .unwrap();
     }

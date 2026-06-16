@@ -105,6 +105,9 @@ pub struct FuzzCtx {
     send_calls: Arc<AtomicUsize>,
     last_calls: Arc<AtomicUsize>,
     seq: u64,
+    /// The last successfully-issued inbox row — replayed (idempotent no-op) by
+    /// `DuplicateIdemKey` so a replay mints no NEW doc.
+    last_row: Option<InboxRow>,
 }
 
 impl FuzzCtx {
@@ -125,6 +128,7 @@ impl FuzzCtx {
             send_calls: Arc::new(AtomicUsize::new(0)),
             last_calls: Arc::new(AtomicUsize::new(0)),
             seq: 0,
+            last_row: None,
         }
     }
 
@@ -151,6 +155,7 @@ impl FuzzCtx {
             send_calls: Arc::new(AtomicUsize::new(0)),
             last_calls: Arc::new(AtomicUsize::new(0)),
             seq: 0,
+            last_row: None,
         }
     }
 
@@ -329,6 +334,48 @@ impl FuzzCtx {
         .unwrap();
         (n > 0).then_some(n)
     }
+
+    /// Consumed offline-code count (the harness no-issuance check).
+    pub async fn consumed_codes_count(&self) -> i64 {
+        self.read_codes_consumed().await.unwrap_or(0)
+    }
+
+    /// The real `node_state.mode` — the harness scan-timing gate reads this to
+    /// scan ONLY in a SETTLED mode `{Online, Offline}` (never mid-transition).
+    pub async fn read_node_mode(&self) -> NodeMode {
+        sqlx::query_scalar::<_, NodeMode>("SELECT mode FROM node_state WHERE fiscal_number = ?")
+            .bind(self.fn_id.as_str())
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+
+    /// The real `node_state.shift_state` — the harness reads this BEFORE an op for
+    /// the mode-independent AUD-K8-1 teeth (a drain re-tick on an RMR FN must make
+    /// no new wire call).
+    pub async fn read_shift_state(&self) -> ShiftState {
+        sqlx::query_scalar::<_, ShiftState>(
+            "SELECT shift_state FROM node_state WHERE fiscal_number = ?",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    /// Count of OFFLINE_LOCAL_ACK offline-origin docs — the drain backlog size,
+    /// so the interpreter can lay one send/last per cohort doc.
+    async fn count_offline_local_ack(&self) -> usize {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fiscal_documents \
+             WHERE fiscal_number = ? AND fs_mode = 'OFFLINE' AND state = 'OFFLINE_LOCAL_ACK'",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        n as usize
+    }
 }
 
 // ─── The interpreter ────────────────────────────────────────────────────────
@@ -382,7 +429,11 @@ async fn online_sell(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
     .await;
     drop(guard);
     match result {
-        Ok(_outcome) => RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await),
+        Ok(_outcome) => {
+            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
+            ctx.last_row = Some(row); // remember for DuplicateIdemKey replay
+            RealOutcome::Doc(observed)
+        }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }
 }
@@ -480,7 +531,11 @@ async fn offline_sell(ctx: &mut FuzzCtx) -> RealOutcome {
     .await;
     drop(guard);
     match result {
-        Ok(_) => RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await),
+        Ok(_) => {
+            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
+            ctx.last_row = Some(row); // remember for DuplicateIdemKey replay
+            RealOutcome::Doc(observed)
+        }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }
 }
@@ -491,7 +546,8 @@ async fn offline_sell(ctx: &mut FuzzCtx) -> RealOutcome {
 async fn go_online(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
     let dps = ctx.new_dps();
     dps.push_status(Ok(online_status())); // probe sees DPS online → flip
-    load_script(&dps, script); // drain wire responses (send/last per backlog doc)
+    let backlog = ctx.count_offline_local_ack().await;
+    load_drain_script(&dps, script, backlog); // one send/last per cohort doc
 
     let tick =
         return_online_probe::run_tick_for_fn(&ctx.pool, &dps, &ctx.fn_id, &ctx.fn_sign).await;
@@ -518,7 +574,8 @@ async fn go_online(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
 /// no-op with `backlog_size_before = 0`).
 async fn drain_op(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
     let dps = ctx.new_dps();
-    load_script(&dps, script);
+    let backlog = ctx.count_offline_local_ack().await;
+    load_drain_script(&dps, script, backlog); // one send/last per cohort doc
     let guard = drain_test_guard();
     let view = ctx.view(&dps);
     match backlog_drain::drain(&guard, &ctx.pool, &view, &ctx.fn_id).await {
@@ -586,27 +643,18 @@ async fn offline_sell_during_going_online(ctx: &mut FuzzCtx) -> RealOutcome {
 /// SAME inbox row — the second pass finds the row no longer NEW, takes the
 /// idempotent Noop → resolve-against-ledger path, and mints no new doc.
 async fn duplicate_idem_key(ctx: &mut FuzzCtx) -> RealOutcome {
-    let row = ctx.seed_inbox_sell().await;
-    let dps = ctx.new_dps();
-    load_script(&dps, &DpsScript::ack_path()); // for the first pass if it hits the wire
+    // Replay the LAST successfully-issued row.  It is already DONE, so
+    // `inline::run` takes the idempotent Noop → resolve-against-ledger path and
+    // mints NO new doc (no issuance, no seed/code advance) — a true replay.
+    let Some(row) = ctx.last_row.clone() else {
+        // Nothing issued yet to replay — a no-op refusal.
+        return RealOutcome::Refused(
+            "duplicate_idem_key: no prior issued request to replay".to_string(),
+        );
+    };
+    let dps = ctx.new_dps(); // a replay resolves from the ledger — no fresh wire
     let guard = ctx.gate.clone().lock_owned().await;
-    let first = inline::run(
-        &ctx.pool,
-        &ctx.pool_secure,
-        &dps,
-        &ctx.sign_ctx,
-        &ctx.fn_sign,
-        &guard,
-        &row,
-    )
-    .await;
-    if let Err(e) = first {
-        // The first pass was refused (out-of-precondition) — no doc to replay
-        // against; report the refusal without the (panic-prone) ledger resolve.
-        drop(guard);
-        return RealOutcome::Refused(format!("{e:?}"));
-    }
-    let second = inline::run(
+    let result = inline::run(
         &ctx.pool,
         &ctx.pool_secure,
         &dps,
@@ -617,7 +665,7 @@ async fn duplicate_idem_key(ctx: &mut FuzzCtx) -> RealOutcome {
     )
     .await;
     drop(guard);
-    match second {
+    match result {
         Ok(_) => RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await),
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }
@@ -636,6 +684,28 @@ fn load_script(dps: &ScriptedDps, script: &DpsScript) {
         } else {
             dps.push_last(result);
         }
+    }
+}
+
+/// Lay a drain's wire responses PER cohort doc (a drain submits + confirms each
+/// backlog doc in turn, so one `send` + one `last` per doc).  Mirrors the model:
+///   - AckPath  → each doc: send→Ack, last→Ack (the whole backlog → ACK);
+///   - Reject   → the first doc's send rejects → strict-sequential halt (no
+///     further sends), so a single send response suffices;
+///   - otherwise → exotic; the model defers to Fault (the harness re-syncs and
+///     does NOT differential-check it), so a best-effort lay is fine.
+fn load_drain_script(dps: &ScriptedDps, script: &DpsScript, backlog: usize) {
+    match script.0.as_slice() {
+        [WireResponse::Ack, WireResponse::Ack, ..] => {
+            for _ in 0..backlog {
+                dps.push_send(wire_to_result(WireResponse::Ack));
+                dps.push_last(wire_to_result(WireResponse::Ack));
+            }
+        }
+        [WireResponse::Reject, ..] => {
+            dps.push_send(wire_to_result(WireResponse::Reject));
+        }
+        _ => load_script(dps, script),
     }
 }
 

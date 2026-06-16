@@ -133,15 +133,22 @@ fn model_offline_issued_set_is_the_ssot_const() {
 
 // ── Lane-correctness reinforcements (pure model behaviours) ─────────────────
 
-/// A DPS reject of an online doc lands REJECTED and does NOT advance the seed
-/// (online-origin issues only at ACK).
+/// A DPS reject of an online doc → `inline::run` returns Err(DpsRejected) → the
+/// interpreter reports Refused, so the model reports NoMutation (no issuance).
+/// The lnd is still consumed + a NON-ISSUED rejected row is minted; the seed
+/// does not advance.
 #[test]
-fn online_sell_reject_lands_rejected_without_advancing_seed() {
+fn online_sell_reject_is_no_mutation_with_non_issued_rejected_row() {
     let mut m = RefModel::new_online_open_shift();
     let out = m.apply(&Op::OnlineSell(DpsScript::send_then_reject()));
-    assert_eq!(mutation(&out).doc_state, DocState::Rejected);
+    assert_eq!(out, ExpectedOutcome::NoMutation);
+    assert_eq!(
+        m.docs.get(&1),
+        Some(&DocState::Rejected),
+        "a non-issued rejected row is still minted"
+    );
     assert_eq!(m.seed, None, "reject must not advance the seed");
-    assert_eq!(m.next_lnd, 2, "lnd is still allocated for the rejected doc");
+    assert_eq!(m.next_lnd, 2, "the lnd is still consumed");
 }
 
 /// A timed-out online send does NOT reach ACK and does NOT advance the seed
@@ -194,9 +201,10 @@ fn chain_continuity_previous_hash_equals_prior_tip() {
 /// mutation (no lnd, no seed, no code consumption) — spec §5.
 #[test]
 fn invalid_and_reentry_ops_do_not_mutate() {
+    // RepeatReboot now defers as Fault (it drives the boot seam); the rest are
+    // NoMutation no-ops (some force mode/shift — not a fiscal mutation).
     let invalid = [
         Op::RepeatDrain,
-        Op::RepeatReboot,
         Op::DuplicateIdemKey,
         Op::GoOnlineWithoutBacklog,
         Op::OfflineSellDuringGoingOnline,
@@ -221,7 +229,7 @@ fn invalid_and_reentry_ops_do_not_mutate() {
 /// Fault into real predictions — plan constraint #1).
 #[test]
 fn crash_and_reboot_are_fault_without_mutation() {
-    let faults = [Op::Crash(Stage::Send), Op::Reboot];
+    let faults = [Op::Crash(Stage::Send), Op::Reboot, Op::RepeatReboot];
     for op in faults {
         let mut m = RefModel::new_online_open_shift();
         let before = (m.next_lnd, m.seed, m.codes_consumed, m.docs.len());
@@ -587,6 +595,82 @@ async fn scan_skips_mid_crash_sending_transient() {
     oracle::assert_clean(&ctx.pool).await;
 }
 
+/// SETTLED-mode scan gate (architect decision, 2026-06-16) — DURABLE pin.
+///
+/// `GoingOnline` is the SECOND class of legitimate in-flight transient (the
+/// generalisation of spec §7.2's mid-crash rule): a `Crash(Send)` →
+/// force-`GoingOnline` → `Reboot` sequence leaves an online-origin `SENDING` doc
+/// that boot reconciliation DEFERS to the W9 drain loop (branch d,
+/// `boot_phase.rs:1739` — "FN in GOING_ONLINE mode, W9 backlog drain owns this
+/// FN's reconciliation").  The doc is NOT resolved by the reboot, and being
+/// online-origin it is NOT in the drain cohort either — it rests `SENDING`
+/// LEGITIMATELY until the node settles back to `Online` and a reboot resolves it.
+///
+/// So the harness must scan ONLY in a SETTLED mode `{Online, Offline}` — NOT
+/// mid-transition.  This test makes the suppression AUDITABLE: it proves the
+/// scan WOULD flag the resting `SENDING` (the suppression is load-bearing, not
+/// vacuous), that the gate's predicate skips it in `GoingOnline`, and that a
+/// genuinely-stuck doc is still caught post-settle (Online reboot resolves
+/// `SENDING → ERROR_RETRYABLE`, then the scan runs clean).
+#[tokio::test]
+async fn scan_gate_suppresses_going_online_transient_then_clean_on_settle() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+
+    // 1) Crash(Send) → doc1 committed SENDING (legal mid-crash transient).
+    let crashed = interp::run_op(&mut ctx, &Op::Crash(Stage::Send)).await;
+    assert!(matches!(crashed, interp::RealOutcome::Crashed { .. }));
+
+    // 2) Force GoingOnline (the adverse OfflineSellDuringGoingOnline seam).
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSellDuringGoingOnline).await;
+    assert_eq!(ctx.read_node_mode().await, NodeMode::GoingOnline);
+
+    // 3) Reboot → branch-d defer (boot_phase.rs:1739): the SENDING doc STAYS put.
+    let _ = interp::run_op(&mut ctx, &Op::Reboot).await;
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Sending,
+        "boot reconciliation DEFERS a GoingOnline FN to the W9 drain — the SENDING \
+         doc is NOT resolved (and online-origin, it is not in the drain cohort)"
+    );
+    assert_eq!(ctx.read_node_mode().await, NodeMode::GoingOnline);
+
+    // The scan WOULD flag this resting SENDING — the suppression is load-bearing.
+    let in_transition = prro::db::invariant_scan::scan(&ctx.pool)
+        .await
+        .expect("scan query");
+    assert!(
+        in_transition
+            .iter()
+            .any(|v| matches!(v, prro::db::invariant_scan::Violation::StuckSending { .. })),
+        "the scan DOES flag resting SENDING — the SETTLED-mode gate is exactly what \
+         suppresses this false positive in the GoingOnline transition; got {in_transition:?}"
+    );
+    // The gate's predicate: GoingOnline is NOT settled → the harness skips the scan.
+    assert!(
+        !matches!(
+            ctx.read_node_mode().await,
+            NodeMode::Online | NodeMode::Offline
+        ),
+        "GoingOnline is mid-transition (not SETTLED) — the harness scan gate skips here"
+    );
+
+    // 4) Settle: return to Online, Reboot → per-doc dispatch resolves SENDING →
+    // ERROR_RETRYABLE (no resend).  Now SETTLED → the scan runs and is clean.
+    ctx.force_node_mode(NodeMode::Online).await;
+    let _ = interp::run_op(&mut ctx, &Op::Reboot).await;
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::ErrorRetryable,
+        "post-settle Online reboot resolves SENDING → ERROR_RETRYABLE — a genuinely \
+         stuck doc IS caught at the settled boundary"
+    );
+    assert!(matches!(
+        ctx.read_node_mode().await,
+        NodeMode::Online | NodeMode::Offline
+    ));
+    oracle::assert_clean(&ctx.pool).await; // SETTLED → scan runs → clean
+}
+
 /// Bounded postcond for Crash(Kvt1) + Reboot (kill-matrix K4): SENT-before-confirm
 /// → recovery takes the PROBE path (a lastChk), NOT a resend.
 #[tokio::test]
@@ -652,5 +736,221 @@ async fn mirrors_catch_seeded_mirror2_desync() {
     assert!(
         format!("{res:?}").contains("Mirror-2"),
         "the mismatch is a Mirror-2 violation (not check-6d's NULL case), got {res:?}"
+    );
+}
+
+// ── Task 7 — the end-to-end harness (generator → interpreter → all oracles) ──
+
+/// Per-op dispatch gluing T1-T6: model.apply + run_op, then assert per the op's
+/// classification, with the T5 scan-timing rule (never mid-crash) and re-sync
+/// after a fault.
+async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) {
+    let mut pending_crash = false;
+    for op in ops {
+        let prior_tip = ctx.read_seed().await; // real MAC tip BEFORE the op
+        let codes_before = ctx.consumed_codes_count().await;
+        let sends_before = ctx.send_calls(); // wire send count BEFORE the op
+        let shift_before = ctx.read_shift_state().await; // real shift_state BEFORE the op
+
+        let expected = model.apply(op);
+        let real = interp::run_op(&mut ctx, op).await;
+
+        let class = oracle::classify(&expected);
+        match class {
+            // Fault / recovery — we do NOT predict recovery; adopt the real DB.
+            oracle::OpClass::FaultOrRecovery => {
+                model.resync_from_db(&ctx.pool).await;
+            }
+            // Predictable mutation — differential-match the model.
+            oracle::OpClass::PredictableMutating => {
+                if let Err(d) = oracle::check_differential(&real, &expected, prior_tip.as_deref()) {
+                    panic!("differential divergence on {op:?}: {d:?}");
+                }
+                // drain / go-online carry no per-doc detail → ledger-delta.
+                if matches!(real, interp::RealOutcome::Recovered { .. }) {
+                    let real_ledger = ctx.read_ledger().await;
+                    if let Err(d) = oracle::check_ledger_delta(&model.docs, &real_ledger) {
+                        panic!("ledger-delta divergence on {op:?}: {d:?}");
+                    }
+                }
+            }
+            // No mutation — the differential is permissive here, so the harness
+            // independently asserts NO ISSUANCE (else an erroneously-mutating
+            // invalid op slips through).
+            oracle::OpClass::ExpectedNoMutation => {
+                if let Err(d) = oracle::check_differential(&real, &expected, prior_tip.as_deref()) {
+                    panic!("no-mutation differential on {op:?}: {d:?}");
+                }
+                assert_eq!(
+                    ctx.read_seed().await,
+                    prior_tip,
+                    "ExpectedNoMutation {op:?} advanced the seed (issuance leaked)"
+                );
+                assert_eq!(
+                    ctx.consumed_codes_count().await,
+                    codes_before,
+                    "ExpectedNoMutation {op:?} consumed an offline code (issuance leaked)"
+                );
+            }
+        }
+
+        // Mode-INDEPENDENT AUD-K8-1 teeth (bounded-postcond on wire calls).
+        // A drain re-tick on a `RequiresManualReconciliation` FN must make NO new
+        // wire send — the re-entry guard (`backlog_drain.rs:725`) halts the drain;
+        // WITHOUT it the drain re-drives the orphaned backlog → a fresh `send_chk`.
+        // Conditioned on the RMR state BEFORE the op (so the op that ITSELF
+        // escalates to RMR — which legitimately sent the rejecting wire call — is
+        // excluded), and counts wire calls rather than running a scan, so it bites
+        // regardless of mode — including the `GoingOnline` window where the
+        // SETTLED-mode scan gate suppresses `assert_clean`.  This is the
+        // mode-independent home of the teeth the SETTLED gate must NOT blunt.
+        if shift_before == ShiftState::RequiresManualReconciliation {
+            assert_eq!(
+                ctx.send_calls(),
+                sends_before,
+                "AUD-K8-1: op {op:?} on an RMR FN made a NEW wire send — the drain \
+                 re-entry guard (backlog_drain.rs:725) must halt a re-tick on a \
+                 manual-reconciliation FN"
+            );
+        }
+
+        // Scan-timing (T5, generalised): scan ONLY in a SETTLED state — NOT
+        // mid-crash AND NOT mid-transition.  This is the principled reading of
+        // spec §7.2 ("a committed-in-flight transient is legal — do not scan
+        // there"): mid-crash and mid-transition are the TWO classes of legitimate
+        // in-flight transient.
+        //   - mid-crash: a Crash opens a committed `SENDING` transient; tracked
+        //     by `pending_crash`.  A Reboot does NOT always resolve it — if the
+        //     node is in `GoingOnline`, boot reconciliation DEFERS the doc to the
+        //     W9 drain loop (branch d, `boot_phase.rs:1739`), so the transient
+        //     persists until a later drain/settle.
+        //   - mid-transition: `GoingOnline` is a transitional mode whose pending
+        //     docs belong to the W9 drain / subsequent online-settle, NOT to a
+        //     quiescent ledger.  SETTLED ⟺ `mode ∈ {Online, Offline}`.
+        // A genuinely-stuck doc is still caught at the post-settle Online boundary
+        // (once the node settles, drain/convergence resolves it and the scan is
+        // either clean or flags a REAL violation).
+        match op {
+            Op::Crash(_) => pending_crash = true,
+            Op::Reboot => pending_crash = false,
+            _ => {}
+        }
+        let settled = matches!(
+            ctx.read_node_mode().await,
+            NodeMode::Online | NodeMode::Offline
+        );
+        if !pending_crash && settled {
+            oracle::assert_clean(&ctx.pool).await;
+            if let Err(d) = oracle::check_mirrors(&ctx.pool).await {
+                panic!("mirror drift on {op:?}: {d:?}");
+            }
+        }
+
+        // After a NON-fault op, adopt ONLY the precondition state (mode /
+        // shift_state / active session) from the real DB so the NEXT op
+        // dispatches from reality.  The transition seams (go_online / drain /
+        // the force-ops) move mode/shift/session in ways the pure model need
+        // not perfectly mirror; the LEDGER (which the differential just checked)
+        // and the mirrors (which the scan just checked) are what we hold the
+        // model to.  Fault ops already did a FULL resync above.
+        if !matches!(class, oracle::OpClass::FaultOrRecovery) {
+            model.resync_preconditions_from_db(&ctx.pool).await;
+        }
+    }
+}
+
+fn drive(ops: &[Op], offline: bool) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        if offline {
+            run_harness(
+                ops,
+                interp::FuzzCtx::new_offline_open_shift(3).await,
+                RefModel::new_offline_open_shift(3),
+            )
+            .await;
+        } else {
+            run_harness(
+                ops,
+                interp::FuzzCtx::new_online_open_shift().await,
+                RefModel::new_online_open_shift(),
+            )
+            .await;
+        }
+    });
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+    /// The fuzzer from an ONLINE-seeded fixture.
+    #[test]
+    fn harness_online_seeded(ops in strategy::op_sequence()) {
+        drive(&ops, false);
+    }
+
+    /// The fuzzer from an OFFLINE-seeded fixture — REQUIRED: the AUD-K8-1 /
+    /// drain / manual-recon lane only exists offline (the teeth live here).
+    #[test]
+    fn harness_offline_seeded(ops in strategy::op_sequence()) {
+        drive(&ops, true);
+    }
+}
+
+/// AUD-K8-1 TEETH CANARY (deterministic; see `tests/invariant_fuzzer/TEETH_TEST.md`).
+///
+/// Constructs the exact AUD-K8-1 scenario the fuzzer hunts: an offline backlog
+/// is drained with a leading reject, which REJECTS the head doc and escalates the
+/// shift to `RequiresManualReconciliation` (halting the drain, leaving the
+/// successor held).  A drain RE-TICK must then be a no-op — the re-entry guard at
+/// `backlog_drain.rs:725` halts a drain on an RMR FN.  WITHOUT that guard the
+/// drain re-enters and re-sends the orphaned successor (a fresh `send_chk`),
+/// defeating the escalation's "durable operator surface, halts FN drain" contract.
+///
+/// `#[ignore]` because it asserts a property of the PRESENT guard: it PASSES on
+/// main and FAILS only when the guard is reverted — a manual canary, not a CI
+/// gate.  Detection is MODE-INDEPENDENT (counts wire calls, not a scan), so it
+/// bites even though the reverted re-drive rests in `GoingOnline`, where the
+/// harness's SETTLED-mode scan gate suppresses `assert_clean`.
+#[tokio::test]
+#[ignore = "AUD-K8-1 teeth canary: PASSES with the backlog_drain.rs:725 guard, \
+            FAILS when it is reverted. See tests/invariant_fuzzer/TEETH_TEST.md."]
+async fn teeth_aud_k8_1_rmr_redrive_makes_no_new_wire_call() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(2).await;
+
+    // Backlog: two OFFLINE_LOCAL_ACK docs.
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
+
+    // Drain (via GoOnline) with a leading reject → head doc REJECTED, shift →
+    // RequiresManualReconciliation, drain halts (the successor stays held).
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::send_then_reject())).await;
+    let ledger = ctx.read_ledger().await;
+    assert_eq!(
+        ledger.get(&1),
+        Some(&DocState::Rejected),
+        "head backlog doc is REJECTED by the leading reject"
+    );
+    assert_eq!(
+        ledger.get(&2),
+        Some(&DocState::OfflineLocalAck),
+        "the successor is HELD (strict-sequential halt-on-reject)"
+    );
+
+    let sends_after_escalate = ctx.send_calls();
+
+    // Re-tick the drain.  WITH the AUD-K8-1 guard this is a no-op (the RMR shift
+    // halts the drain — no wire call).  WITHOUT it the drain re-enters and
+    // re-sends the orphaned successor → a fresh send_chk.
+    let _ = interp::run_op(&mut ctx, &Op::RepeatDrain).await;
+    assert_eq!(
+        ctx.send_calls(),
+        sends_after_escalate,
+        "AUD-K8-1: a drain re-tick on an RMR FN must make NO new wire call. If this \
+         fails, the backlog_drain.rs:725 re-entry guard is missing — the fuzzer's \
+         teeth bite (this counts wire calls, not a scan, so it is mode-independent)."
     );
 }
