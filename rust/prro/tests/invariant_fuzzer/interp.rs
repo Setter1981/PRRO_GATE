@@ -31,6 +31,7 @@ use prro::db::models::enums::{
 };
 use prro::db::models::ids::{OfflineSessionId, RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
+use prro::db::repositories::{fiscal_documents, offline_sessions};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::{open_pool, open_secure_pool};
 use prro::services::offline_sync::{backlog_drain, return_online_probe};
@@ -375,6 +376,35 @@ impl FuzzCtx {
         .await
         .unwrap();
         n as usize
+    }
+
+    /// The active OPEN/DRAINING offline session id via the REAL predicate the
+    /// drain uses (`current_open_or_draining_session`) — the structural
+    /// settle-capability test for the terminal liveness gate (A4).  A GoingOnline
+    /// node is only legitimately settle-able by a drain when an active session
+    /// exists (the real drain skips with `no_active_offline_session` otherwise,
+    /// `backlog_drain.rs:741`).
+    pub async fn active_offline_session(&self) -> Option<OfflineSessionId> {
+        offline_sessions::current_open_or_draining_session(&self.pool, &self.fn_id)
+            .await
+            .expect("active-session query")
+            .map(|(id, _state)| id)
+    }
+
+    /// The real drain cohort size for `session_id` (the same predicate the drain
+    /// scans, `list_drain_candidates_for_fn_ordered_by_lnd`) — non-empty ⟺ there
+    /// is offline backlog a real drain would still own.  The terminal liveness
+    /// gate panics only on a NON-empty cohort: an empty-cohort GoingOnline is a
+    /// forced-mode artifact with nothing to drain, not a liveness failure.
+    pub async fn drain_cohort_len(&self, session_id: OfflineSessionId) -> usize {
+        fiscal_documents::list_drain_candidates_for_fn_ordered_by_lnd(
+            &self.pool,
+            &self.fn_id,
+            session_id,
+        )
+        .await
+        .expect("drain candidates query")
+        .len()
     }
 }
 

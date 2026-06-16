@@ -741,6 +741,21 @@ async fn mirrors_catch_seeded_mirror2_desync() {
 
 // ── Task 7 — the end-to-end harness (generator → interpreter → all oracles) ──
 
+/// SETTLED predicate (A2/A4): a node is settled-for-scan when its mode is a
+/// resting `{Online, Offline}` OR the shift is `RequiresManualReconciliation` —
+/// a LEGITIMATE durable operator terminal (AUD-K8-1), scanned IN PLACE, never
+/// forced out.  Reject-halt legitimately rests at `GoingOnline + RMR`; the
+/// system must NOT auto-settle from there, so RMR is settled-for-scan.  Used by
+/// BOTH the per-op scan gate and the terminal settle.
+fn is_settled(mode: NodeMode, shift: ShiftState) -> bool {
+    matches!(mode, NodeMode::Online | NodeMode::Offline)
+        || shift == ShiftState::RequiresManualReconciliation
+}
+
+/// Terminal liveness + scan (A2/A4) — STUB (RED).  The GREEN commit implements
+/// the bounded real-seam settle.
+async fn settle_and_scan(_ctx: &mut interp::FuzzCtx, _pending_crash: bool) {}
+
 /// Per-op dispatch gluing T1-T6: model.apply + run_op, then assert per the op's
 /// classification, with the T5 scan-timing rule (never mid-crash) and re-sync
 /// after a fault.
@@ -1016,5 +1031,73 @@ fn a1_offline_crash_send_completes_as_doc_so_settled_scan_runs() {
          completed as a real offline sell (RealOutcome::Doc, not Crashed) and catch the \
          planted Mirror-2 violation. It returned cleanly → the settled scan was wrongly \
          suppressed because pending_crash was set from the op name instead of the real outcome."
+    );
+}
+
+/// A2 (HIGH): an UNPAIRED crash must be recovered + scanned at the terminal.
+///
+/// A `Crash(Send)` with no following `Reboot` leaves a committed `SENDING`
+/// transient and `pending_crash` set to sequence end — the per-op scan is
+/// suppressed for the rest of the run, and today there is NO final recovery /
+/// scan, so the transient is never resolved or checked.  The terminal
+/// `settle_and_scan` must drive a real `Reboot` to resolve the unpaired crash
+/// (`SENDING → ERROR_RETRYABLE`, no resend) and then scan the settled boundary.
+#[tokio::test]
+async fn a2_terminal_settle_resolves_unpaired_crash_and_scans() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+
+    let crashed = interp::run_op(&mut ctx, &Op::Crash(Stage::Send)).await;
+    assert!(matches!(crashed, interp::RealOutcome::Crashed { .. }));
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Sending,
+        "an unpaired crash leaves a committed SENDING transient"
+    );
+    let sends_before = ctx.send_calls();
+
+    // Terminal procedure: must reboot the unpaired crash → ERROR_RETRYABLE (no
+    // resend) AND scan the now-settled boundary.
+    settle_and_scan(&mut ctx, true).await;
+
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::ErrorRetryable,
+        "A2: the terminal settle must reboot an unpaired crash transient to ERROR_RETRYABLE"
+    );
+    assert_eq!(
+        ctx.send_calls(),
+        sends_before,
+        "A2: the terminal recovery must NOT resend across the reboot"
+    );
+    assert!(matches!(ctx.read_node_mode().await, NodeMode::Online));
+}
+
+/// A4 (HIGH): a LEGITIMATE GoingOnline terminal (active session + drainable
+/// cohort) must be settled + scanned — closing the indefinite no-scan zone.
+///
+/// The terminal `settle_and_scan` drives a real drain-tick WITH Ack responses
+/// (simulating DPS coming back) → the OFFLINE_LOCAL_ACK backlog drains to ACK →
+/// finalize CAS's `GoingOnline → Online` → the settled boundary scans clean.
+#[tokio::test]
+async fn a4_terminal_settle_drains_legit_going_online_to_online() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await; // OFFLINE_LOCAL_ACK backlog
+    ctx.force_node_mode(NodeMode::GoingOnline).await; // legit GoingOnline (active session + cohort)
+    assert!(
+        ctx.active_offline_session().await.is_some(),
+        "the offline fixture has an active session — this is the settle-able GoingOnline"
+    );
+
+    settle_and_scan(&mut ctx, false).await;
+
+    assert_eq!(
+        ctx.read_node_mode().await,
+        NodeMode::Online,
+        "A4: the terminal settle must drain a legit GoingOnline cohort to Online"
+    );
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Ack,
+        "the backlog drained to ACK at the terminal settle"
     );
 }
