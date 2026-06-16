@@ -910,11 +910,14 @@ async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
 /// classification, with the T5 scan-timing rule (never mid-crash) and re-sync
 /// after a fault.
 async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) {
+    // A crash transient opened but not yet resolved by a reboot (A1 scan-gate
+    // suppresses the scan while set; A3 asserts the no-resend postcond on the
+    // resolving reboot).
     let mut pending_crash = false;
     for op in ops {
         let prior_tip = ctx.read_seed().await; // real MAC tip BEFORE the op
         let codes_before = ctx.consumed_codes_count().await;
-        let sends_before = ctx.send_calls(); // wire send count BEFORE the op
+        let sends_before = ctx.send_calls(); // wire send count BEFORE the op (A3 no-resend)
         let shift_before = ctx.read_shift_state().await; // real shift_state BEFORE the op
 
         let expected = model.apply(op);
@@ -1001,10 +1004,24 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         // on an Offline node it never reaches the wire and COMPLETES as a real
         // offline sell (`RealOutcome::Doc`), leaving the node SETTLED with nothing
         // to defer — so the settled scan must NOT be suppressed there.
-        match &real {
-            interp::RealOutcome::Crashed { .. } => pending_crash = true,
-            _ if matches!(op, Op::Reboot) => pending_crash = false,
-            _ => {}
+        // A1: a Crash opens a committed in-flight transient (the SETTLED scan is
+        // suppressed until a reboot resolves it).
+        if matches!(real, interp::RealOutcome::Crashed { .. }) {
+            pending_crash = true;
+        }
+        // A3: a reboot that RESOLVES a pending crash must NOT re-send (DPS does
+        // not dedup → a blind resend double-fiscalises) — assert the UNIVERSAL
+        // no-resend bounded postcond IN the property harness (was: faults only
+        // resync, silently adopting a resend).  Only no-resend is asserted here:
+        // the exact terminal AND the Kvt1 PROBE vary under composition (a SENT
+        // doc at GoingOnline is DEFERRED to the W9 drain → no probe THIS reboot),
+        // so those stay pinned in the directed K3/K4 tests; no-resend is the
+        // invariant that holds in ALL compositions.
+        if matches!(op, Op::Reboot | Op::RepeatReboot) && pending_crash {
+            if let Err(d) = oracle::assert_no_resend(sends_before, ctx.send_calls()) {
+                panic!("crash-recovery resend on {op:?}: {d:?}");
+            }
+            pending_crash = false;
         }
         //   - RMR: `is_settled` also admits `RequiresManualReconciliation` (a
         //     legitimate durable operator terminal, AUD-K8-1) even at mode
@@ -1382,4 +1399,32 @@ fn a4_terminal_verdict_decision_table() {
         ArtifactNoResend,
         "ineligible (force-closed) shift — a drain cannot finalize"
     );
+}
+
+/// A3 — the no-resend predicate (the bounded crash-recovery postcond wired into
+/// run_harness on a resolving reboot) catches a resend.
+#[test]
+fn a3_assert_no_resend_catches_a_resend() {
+    assert!(
+        oracle::assert_no_resend(1, 2).is_err(),
+        "a resend (send_chk 1 -> 2) across a crash-recovery reboot must be flagged"
+    );
+    assert!(
+        oracle::assert_no_resend(1, 1).is_ok(),
+        "no resend (send_chk unchanged) is clean"
+    );
+}
+
+/// A3 — the property harness ENFORCES the bounded no-resend postcond on the
+/// resolving reboot (was: faults only resync).  Driving [Crash(Send), Reboot]
+/// and [Crash(Kvt1), Reboot] through `run_harness` exercises the wired no-resend
+/// check for BOTH crash stages; both resolve cleanly with NO resend, so the
+/// harness does not panic — proving the check is exercised AND does not
+/// false-fire.  (A genuine resend would now panic here, not be silently adopted.
+/// The exact terminal + the Kvt1 PROBE stay in the directed K3/K4 tests — they
+/// vary under composition, unlike no-resend.)
+#[test]
+fn harness_crash_reboot_enforces_no_resend_postcond() {
+    drive(&[Op::Crash(Stage::Send), Op::Reboot], false);
+    drive(&[Op::Crash(Stage::Kvt1), Op::Reboot], false);
 }
