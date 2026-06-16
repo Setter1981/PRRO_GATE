@@ -224,3 +224,82 @@ pub fn assert_probe_recovery_no_resend(
     }
     Ok(())
 }
+
+// ── The 5th class — mirror-drift checks (Task 6) ────────────────────────────
+
+/// Assert the load-bearing mirrors at a quiescent boundary.
+///
+/// Mirror-1 (`shifts.state` ↔ `node_state.shift_state`, #177), Mirror-3
+/// (`inbox` ↔ ledger, check-5), the chain, and check-6d (cohort doc with a NULL
+/// session) are already in the REAL scanner — we SURFACE any of its violations
+/// as a `Divergence` (we do NOT re-implement them).
+///
+/// Mirror-2 (`offline_session` ↔ `drain_cohort`) is the EXACT predicate the
+/// scanner does NOT contain: every drain-cohort doc must point at the ACTIVE
+/// (OPEN / DRAINING) session.  check-6d only catches a NULL session; this also
+/// catches a non-null but MISMATCHED (stale / foreign) session.  The predicate
+/// is over DOCS — an empty active session is LEGAL (it is NOT "every session
+/// must have docs"), so a session with zero cohort docs never false-positives.
+pub async fn check_mirrors(pool: &SqlitePool) -> Result<(), Divergence> {
+    // Mirror-1 / Mirror-3 / chain / check-6d — surface the real scanner.
+    let violations = prro::db::invariant_scan::scan(pool)
+        .await
+        .map_err(|e| Divergence(format!("invariant_scan query failed: {e}")))?;
+    if !violations.is_empty() {
+        return Err(Divergence(format!(
+            "invariant_scan (Mirror-1 / Mirror-3 / chain / check-6d): {violations:?}"
+        )));
+    }
+
+    // Mirror-2 — the active (OPEN / DRAINING) session for this FN (the cohort the
+    // drain scopes to; mirrors `current_open_or_draining_session`).
+    let active: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT lower(hex(offline_session_id)) FROM offline_sessions \
+         WHERE state IN ('OPEN', 'DRAINING') LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| Divergence(format!("active-session query failed: {e}")))?;
+
+    // Every drain-cohort doc (offline-origin, in a non-terminal cohort state —
+    // mirrors `list_drain_candidates_for_fn_ordered_by_lnd`).
+    let cohort: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT lower(hex(document_id)), \
+                CASE WHEN offline_session_id IS NULL THEN NULL \
+                     ELSE lower(hex(offline_session_id)) END \
+         FROM fiscal_documents \
+         WHERE offline_fiscal_no IS NOT NULL \
+           AND state IN ('OFFLINE_LOCAL_ACK', 'SENT', 'KVT1', 'ERROR_RETRYABLE', 'KVT2')",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Divergence(format!("cohort query failed: {e}")))?;
+
+    for (doc_hex, doc_session) in cohort {
+        match (doc_session, &active) {
+            // NULL session — invisible to the session-scoped cohort.
+            (None, _) => {
+                return Err(Divergence(format!(
+                    "Mirror-2: drain-cohort doc {doc_hex} has a NULL offline_session_id \
+                     (invisible to the cohort)"
+                )));
+            }
+            // Points at the active session — clean.
+            (Some(d), Some(a)) if &d == a => {}
+            // Non-null but MISMATCHED (the gap check-6d misses).
+            (Some(d), Some(a)) => {
+                return Err(Divergence(format!(
+                    "Mirror-2: drain-cohort doc {doc_hex} session {d} != active session {a}"
+                )));
+            }
+            // A cohort doc with no active OPEN/DRAINING session — orphaned cohort.
+            (Some(d), None) => {
+                return Err(Divergence(format!(
+                    "Mirror-2: drain-cohort doc {doc_hex} references session {d} \
+                     but no OPEN/DRAINING session is active"
+                )));
+            }
+        }
+    }
+    Ok(())
+}

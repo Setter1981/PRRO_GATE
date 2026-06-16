@@ -181,6 +181,32 @@ impl FuzzCtx {
             .unwrap();
     }
 
+    /// Test corruption (Mirror-2): repoint the FN's offline drain-cohort doc(s)
+    /// at a fresh FOREIGN (CLOSED) session — a non-null but stale session id
+    /// that invariant_scan's check-6d (NULL-only) does NOT catch, so it isolates
+    /// the Mirror-2 mismatch predicate.
+    pub async fn corrupt_cohort_session_to_foreign(&self) {
+        let foreign = OfflineSessionId::new();
+        sqlx::query(
+            "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+             VALUES (?, ?, 'CLOSED', '2026-06-08T00:00:00Z')",
+        )
+        .bind(foreign)
+        .bind(self.fn_id.as_str())
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE fiscal_documents SET offline_session_id = ? \
+             WHERE fiscal_number = ? AND offline_fiscal_no IS NOT NULL",
+        )
+        .bind(foreign)
+        .bind(self.fn_id.as_str())
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
     fn view<'a>(&'a self, dps: &'a dyn DpsChannel) -> RuntimeView<'a> {
         RuntimeView {
             dps,
