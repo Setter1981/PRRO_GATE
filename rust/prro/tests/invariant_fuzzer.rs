@@ -496,3 +496,109 @@ async fn differential_go_online_ledger_matches_model() {
         "backlog doc reached ACK"
     );
 }
+
+// ── Task 5 — fault oracle: quiescent scan (L2) + bounded postcond + resync (L3)
+
+/// Acceptance: Crash(Send) + Reboot → recovery routes the committed-SENDING doc
+/// to ERROR_RETRYABLE with NO second send_chk (no blind resend, kill-matrix K3),
+/// and the post-recovery quiescent boundary scans clean.
+#[tokio::test]
+async fn fault_crash_send_reboot_bounded_postcond_and_clean() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+
+    let crashed = interp::run_op(&mut ctx, &Op::Crash(Stage::Send)).await;
+    assert!(
+        matches!(crashed, interp::RealOutcome::Crashed { .. }),
+        "Crash(Send) committed SENDING and dropped the wire future"
+    );
+    let sends_before = ctx.send_calls();
+
+    let _ = interp::run_op(&mut ctx, &Op::Reboot).await;
+
+    oracle::assert_crash_send_recovery(ctx.only_doc_state().await, sends_before, ctx.send_calls())
+        .expect("Crash(Send)+Reboot bounded postcondition");
+    // Quiescent boundary: AFTER recovery the scan is clean.
+    oracle::assert_clean(&ctx.pool).await;
+}
+
+/// Acceptance: after Crash(Send)+Reboot, re-syncing the model from the real DB
+/// makes the NEXT op differential-clean again (we adopt recovery, not predict it).
+#[tokio::test]
+async fn fault_resync_then_next_op_is_differential_clean() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let mut model = RefModel::new_online_open_shift();
+
+    // Fault + recovery (model leaves these as Fault — no prediction).
+    let _ = interp::run_op(&mut ctx, &Op::Crash(Stage::Send)).await;
+    let _ = model.apply(&Op::Crash(Stage::Send));
+    let _ = interp::run_op(&mut ctx, &Op::Reboot).await;
+    let _ = model.apply(&Op::Reboot);
+
+    // Adopt the real recovered state.
+    model.resync_from_db(&ctx.pool).await;
+    assert_eq!(
+        model.docs, ctx.read_ledger().await,
+        "resync adopts the real ledger"
+    );
+
+    // The next op is differential-clean from the re-synced state.
+    let prior_tip = ctx.read_seed().await;
+    let op = Op::OnlineSell(DpsScript::ack_path());
+    let expected = model.apply(&op);
+    let real = interp::run_op(&mut ctx, &op).await;
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .expect("after resync the next op must be differential-clean");
+}
+
+/// Quiescent-boundary timing (spec §7.2): a committed-SENDING is a LEGAL
+/// in-flight transient — scanning mid-crash false-positives on it.  The scan
+/// belongs AFTER recovery, where it is clean.
+#[tokio::test]
+async fn scan_skips_mid_crash_sending_transient() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+
+    let _ = interp::run_op(&mut ctx, &Op::Crash(Stage::Send)).await;
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Sending,
+        "committed SENDING is a legal in-flight transient"
+    );
+
+    // A scan HERE would FALSE-POSITIVE (StuckSending) — so the harness does NOT
+    // scan mid-crash.
+    let mid_crash = prro::db::invariant_scan::scan(&ctx.pool)
+        .await
+        .expect("scan query");
+    assert!(
+        !mid_crash.is_empty(),
+        "mid-crash SENDING would be flagged (StuckSending) — proving the scan must NOT run here"
+    );
+
+    // Resolve with Reboot, THEN scan: clean at the quiescent boundary.
+    let _ = interp::run_op(&mut ctx, &Op::Reboot).await;
+    let post = prro::db::invariant_scan::scan(&ctx.pool).await.expect("scan query");
+    assert!(post.is_empty(), "post-recovery quiescent scan is clean, got {post:?}");
+    oracle::assert_clean(&ctx.pool).await;
+}
+
+/// Bounded postcond for Crash(Kvt1) + Reboot (kill-matrix K4): SENT-before-confirm
+/// → recovery takes the PROBE path (a lastChk), NOT a resend.
+#[tokio::test]
+async fn fault_crash_kvt1_reboot_probe_no_resend() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+
+    let crashed = interp::run_op(&mut ctx, &Op::Crash(Stage::Kvt1)).await;
+    assert!(matches!(crashed, interp::RealOutcome::Crashed { .. }));
+    assert_eq!(ctx.only_doc_state().await, DocState::Sent, "Crash(Kvt1) committed SENT");
+    let (sends_before, lasts_before) = (ctx.send_calls(), ctx.last_calls());
+
+    let _ = interp::run_op(&mut ctx, &Op::Reboot).await;
+
+    oracle::assert_probe_recovery_no_resend(
+        sends_before,
+        ctx.send_calls(),
+        lasts_before,
+        ctx.last_calls(),
+    )
+    .expect("Crash(Kvt1)+Reboot: probe path, no resend");
+}
