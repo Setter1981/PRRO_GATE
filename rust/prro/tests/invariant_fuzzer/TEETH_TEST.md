@@ -1,0 +1,116 @@
+# Teeth test — proving the invariant fuzzer bites (AUD-K8-1)
+
+A fuzzer that never fails is indistinguishable from one that does nothing. This
+file is the durable, repeatable proof that the Phase-0 invariant fuzzer actually
+**catches a real, planted regression** — and the record of the run that did.
+
+The planted defect is the **AUD-K8-1 re-entry guard**: a drain re-tick on a
+`RequiresManualReconciliation` (RMR) fiscal number must be a **no-op**. The guard
+halts it; without the guard the drain re-enters, the REJECTED predecessor has
+left the candidate cohort, and the orphaned successor becomes the head and is
+**re-sent** — defeating the escalation's "durable operator surface, halts FN
+drain" contract (double-fiscalisation risk).
+
+## Revert target
+
+`prro/src/services/offline_sync/backlog_drain.rs` — Step 1b, the re-entry guard
+(currently at **lines 725-727**):
+
+```rust
+if ns.shift_state == ShiftState::RequiresManualReconciliation {
+    return Ok(DrainSummary::new(fiscal_number.to_string(), 0));
+}
+```
+
+To demonstrate the teeth, **delete (or comment out) those three lines** — and
+restore them afterwards. The repository must ship with the guard PRESENT; this
+is a manual demonstration, never a committed state.
+
+> Line numbers drift. Confirm with:
+> `grep -n "manual-reconciliation re-entry guard (AUD-K8-1)" prro/src/services/offline_sync/backlog_drain.rs`
+
+## How the teeth bite — and why it is MODE-INDEPENDENT
+
+Detection counts **wire calls**, not a scan:
+
+> A drain re-tick on an RMR FN must make **no new `send_chk`**. With the guard it
+> is a no-op (zero wire calls); without it the drain re-drives the orphaned
+> backlog → a fresh `send_chk`.
+
+This matters because of the harness's **SETTLED-mode scan gate** (architect
+decision, 2026-06-16): the ledger `assert_clean` / mirror scan runs ONLY in a
+SETTLED mode `{Online, Offline}`, never mid-transition. A reverted re-drive rests
+in `GoingOnline`, where the scan is *suppressed* — so a scan-based teeth would be
+blunted by the gate. The wire-call (bounded-postcond) teeth is **independent of
+mode**, so it bites regardless. (See
+`scan_gate_suppresses_going_online_transient_then_clean_on_settle` for the
+companion proof that the gate suppression is load-bearing, not vacuous, and that
+a genuinely-stuck doc is still caught post-settle.)
+
+The teeth live in **two** places, both mode-independent:
+
+1. **Deterministic canary** — `teeth_aud_k8_1_rmr_redrive_makes_no_new_wire_call`
+   (`#[ignore]`-d; PASSES on main, FAILS on revert).
+2. **Property harness** — `harness_offline_seeded` carries the same
+   wire-call invariant (`shift_before == RMR ⇒ send_calls unchanged`), so the
+   random search finds the same class of defect and **shrinks** it.
+
+## Run it
+
+```bash
+# 1) Baseline (guard PRESENT): both must be GREEN.
+cargo nextest run -p prro --features test-support --run-ignored all \
+  -E 'binary(invariant_fuzzer) and test(teeth_aud_k8_1)'
+cargo nextest run -p prro --features test-support \
+  -E 'binary(invariant_fuzzer) and test(harness_offline_seeded)'
+
+# 2) Revert the three guard lines above, then re-run BOTH — they must FAIL.
+# 3) Restore the guard, re-run — GREEN again.
+```
+
+> Note: the harness fixtures leak per-case temp DBs (`std::mem::forget` in
+> `interp.rs`). On a RAM-backed `/tmp`, point `TMPDIR` at a disk path for the
+> 256-case harness runs, e.g. `TMPDIR=$PWD/.fuzz_tmp cargo nextest ...`, and
+> remove it afterwards. (Tracked as a follow-up; see the Task 7 report.)
+
+## Expected finding
+
+**Deterministic canary** — with the guard reverted:
+
+```
+thread 'teeth_aud_k8_1_rmr_redrive_makes_no_new_wire_call' panicked:
+assertion `left == right` failed: AUD-K8-1: a drain re-tick on an RMR FN must
+make NO new wire call. ... the backlog_drain.rs:725 re-entry guard is missing.
+  left: 2
+ right: 1
+```
+
+**Property harness** — with the guard reverted, the run below found the defect
+and shrank it to a minimal 4-op repro:
+
+```
+thread 'harness_offline_seeded' panicked:
+assertion `left == right` failed: AUD-K8-1: op GoOnline(DpsScript([Ack, Ack]))
+on an RMR FN made a NEW wire send — the drain re-entry guard
+(backlog_drain.rs:725) must halt a re-tick on a manual-reconciliation FN
+  left: 2
+ right: 1
+
+minimal failing input: ops = [
+    OnlineSell(DpsScript([Ack, Ack])),   // offline-origin (node is Offline) → OFFLINE_LOCAL_ACK backlog doc 1
+    Crash(Send),                         // offline node: no wire reached → completes as offline sell → backlog doc 2
+    GoOnline(DpsScript([BadHashPrev])),  // probe → GoingOnline; drain head hits -12 → escalates shift → RMR (drain halts)
+    GoOnline(DpsScript([Ack, Ack])),     // shift_before == RMR: WITH guard a no-op; WITHOUT it the orphaned successor is re-sent
+]
+```
+
+The shrink is faithful to the AUD-K8-1 mechanism: build an offline backlog →
+escalate the FN to RMR via a rejecting/MAC-failing drain → re-tick the drain. The
+guard's job is to make that final re-tick inert; the fuzzer proves it does.
+
+## Scope (Phase 0)
+
+- `N = 256` per harness (PR-time; documented small). Larger `N` / nightly is a
+  Phase-1 follow-up.
+- Out of scope (Phase 1+): RETURN/Z/EVPZ/clock op alphabet, model-predicts-
+  recovery, WebCheck, the temp-DB-leak fix.
