@@ -237,3 +237,64 @@ DB tx).
   **M2-N1** (revert the strict-sequential halt → fuzzer finds the orphaned-successor send) — is
   recommended once the alphabet covers it.
 - A failing seed replays deterministically and produces a minimal repro.
+
+## 15. Phase-0 hardening (post-T7, CI-grade harness oracle)
+
+T0–T7 landed (PRs #181–#189); the external review confirmed the fuzzer **bites** as a regression signal
+(the AUD-K8-1 teeth cycle reproduces) but flagged **false-negative zones** where the harness accepts an
+incomplete/erroneous state as admissible — or never scans it. This section is the LOCKED contract for the
+hardening pass that closes those zones (one task, `tests/`-only, no `src/` changes, strict test-first;
+each finding its own RED→GREEN; **STOP for architect review after Cluster A**).
+
+**Locked — do NOT revisit (hardening ADDS to these, never weakens them):**
+- The **SETTLED-mode scan gate** (`assert_clean` / `check_mirrors` run only when `mode ∈ {Online, Offline}`)
+  is correct — it is the principled reading of §7.2 (mid-crash and `GoingOnline` mid-transition are the two
+  classes of legitimate in-flight transient). Hardening adds a **liveness bound**, it does not lift the gate.
+- The **AUD-K8-1 teeth stays MODE-INDEPENDENT** — a bounded-postcondition on wire calls
+  (`shift_before == RMR ⇒ send_calls unchanged`), never a scan, so the SETTLED gate cannot blunt it. No new
+  check may depend on scanning in `GoingOnline`.
+
+### Cluster A — crash/scan correctness
+- **A1 — `pending_crash` from the REAL outcome, not the op name.** A `Crash(Send)` on an Offline node never
+  reaches the wire and completes as a real offline-sell (`crash_via_drop`'s `res = &mut fut => Some(res)`
+  arm); keying `pending_crash` off `Op::Crash(_)` then wrongly suppresses the settled-boundary scan. Set it
+  from `RealOutcome::Crashed{..}`.
+- **A2 + A4 — terminal `settle_and_scan` (closes the unpaired-crash gap AND the `GoingOnline` liveness
+  bound).** A sequence may end after a real crash (dirty DB never scanned) or in `GoingOnline` (an unbounded
+  no-scan zone). At end of the harness run, if not settled, drive a **bounded** settle and then a mandatory
+  `assert_clean` + `check_mirrors`. Two architect refinements are part of this contract:
+  - **Settle via REAL recovery seams (`Reboot`; a real drain tick if `GoingOnline` + backlog), NEVER
+    `force_node_mode`.** A4 asks "does the system settle on its own?" — forcing the mode answers it
+    artificially and masks a real liveness bug. `force_node_mode` stays confined to adverse-intent setup.
+  - **`RequiresManualReconciliation` is a LEGITIMATE durable terminal, not a liveness violation.** A
+    `[offline sells, GoOnline([Reject])]` sequence legitimately ends in `GoingOnline` + RMR (the operator
+    surface; the system must NOT auto-settle from it). Define `settled ⟺ mode ∈ {Online, Offline} OR
+    shift_state == RequiresManualReconciliation`. Do not force-settle or liveness-panic on RMR; the scan
+    must pass on a legitimate RMR state (if it flags there, that is a REAL finding — do not suppress).
+- **A3 — bounded crash-postconditions wired into the property harness.** Faults currently only
+  `resync_from_db`; the random search never asserts the no-resend invariant. On the resolving `Reboot`,
+  assert the bounded postcondition IN the harness. **Universal invariant under composition = NO-RESEND**
+  (`send_calls` unchanged through the reboot for the crashed doc; `last_calls` advances for `Crash(Kvt1)`);
+  do NOT assert an exact terminal state in the harness (a SENT doc may legitimately probe → KVT1 / ACK /
+  manual) — exact terminals stay in the directed K3/K4 tests.
+
+### Cluster B — oracle completeness (after Cluster-A review)
+- **B1 — faithful mid-wire cohort loading (prerequisite) + bounded postconditions for deferred exotic
+  drain.** The interpreter loads the drain stub from the `OFFLINE_LOCAL_ACK` count only; the real cohort is
+  wider (`SENT`/`KVT1`/`ERROR_RETRYABLE`/`KVT2` — `list_drain_candidates_*`). First load send/last responses
+  per the real per-doc state (else the stub under-loads and you test an empty-queue error, not re-entry);
+  then, for drain ops the model defers to `Fault`, assert bounded postconditions instead of a silent resync
+  (send-delta ≤ |cohort|; no code consumed; `next_lnd` monotonic; seed moves only if the class expects it;
+  RMR-halt vs not per the class).
+- **B2 — `ExpectedNoMutation` asserts no row / `next_lnd` mutation, via a model-tagged split.** A blanket
+  "no new row" is WRONG — an online reject legitimately mints a non-issued `Rejected` row and bumps
+  `next_lnd`. Split the model outcome: `TrueNoMutation` (refusal-before-wire → assert doc-count / ledger /
+  `next_lnd` / seed / codes all unchanged) vs `NoIssuanceRowAllowed` (online reject → ≤1 new row, it is
+  `Rejected`/non-issued, seed unchanged).
+- **B3 — Recovered (drain / go-online) ledger-delta checks seed / codes / `next_lnd`, not just states.**
+  `check_ledger_delta` compares only `lnd → state`; take a full before/after snapshot for Recovered ops —
+  a drain must not consume extra codes, bump `next_lnd`, or move the seed unexpectedly.
+
+**Out of scope (Phase 1+):** `src/` changes; the per-case temp-DB leak (`std::mem::forget`, a separate
+follow-up); RETURN/Z/EVPZ/clock alphabet; model-predicts-recovery; WebCheck; nightly large-N; narrowing the
+SETTLED suppression to a per-violation filter (A4 uses a final force-settle, not a redesign).
