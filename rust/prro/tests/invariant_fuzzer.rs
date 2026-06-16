@@ -994,6 +994,25 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                     if let Err(d) = oracle::check_ledger_delta(&model.docs, &real_ledger) {
                         panic!("ledger-delta divergence on {op:?}: {d:?}");
                     }
+                    // B3 — FULL snapshot beyond lnd→state: a recovered drain /
+                    // go-online RE-DRIVES already-issued docs; it must NOT consume
+                    // an offline code, allocate a new lnd, or re-advance the MAC
+                    // seed (offline-origin advanced it at issuance, online at ACK).
+                    assert_eq!(
+                        ctx.consumed_codes_count().await,
+                        codes_before,
+                        "B3: recovered drain/go-online {op:?} consumed an offline code"
+                    );
+                    assert_eq!(
+                        ctx.read_next_lnd().await,
+                        next_lnd_before,
+                        "B3: recovered drain/go-online {op:?} allocated a new lnd"
+                    );
+                    assert_eq!(
+                        ctx.read_seed().await,
+                        prior_tip,
+                        "B3: recovered drain/go-online {op:?} re-advanced the MAC seed"
+                    );
                 }
             }
             // No mutation — the differential is permissive here, so the harness
@@ -1242,6 +1261,21 @@ fn harness_exotic_drain_is_bounded_postcond_verified() {
 fn harness_no_mutation_split_both_classes() {
     drive(&[Op::OnlineSell(DpsScript::send_then_reject())], false); // NoIssuanceRow
     drive(&[Op::SellWithClosedShift], false); // TrueNoMutation
+}
+
+/// B3 — a recovered drain / go-online is FULLY snapshot-verified (ledger + seed +
+/// next_lnd + consumed-codes), not just lnd→state.  [OfflineSell, GoOnline(Ack)]
+/// drains the backlog to ACK; the full snapshot holds (the drain consumes no
+/// code, allocates no lnd, and does NOT re-advance the seed the offline sell
+/// advanced at issuance), so the harness does not panic — proving the B3
+/// snapshot postcond is exercised.  (A drain that consumed a code / bumped
+/// next_lnd / moved the seed would now panic here.)
+#[test]
+fn harness_recovered_go_online_full_snapshot_verified() {
+    drive(
+        &[Op::OfflineSell, Op::GoOnline(DpsScript::ack_path())],
+        true,
+    );
 }
 
 /// AUD-K8-1 TEETH CANARY (deterministic; see `tests/invariant_fuzzer/TEETH_TEST.md`).
