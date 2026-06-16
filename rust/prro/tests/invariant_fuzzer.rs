@@ -27,6 +27,9 @@ mod interp;
 // Task 3: the shrink-first op-sequence generator.
 #[path = "invariant_fuzzer/strategy.rs"]
 mod strategy;
+// Task 4: the differential oracle (layer 1).
+#[path = "invariant_fuzzer/oracle.rs"]
+mod oracle;
 
 use prro::db::models::enums::{DocState, NodeMode, ShiftState};
 use prro::db::repositories::fiscal_documents::OFFLINE_ISSUED_STATES;
@@ -394,4 +397,94 @@ fn model_go_online_transitions_and_drains() {
         Some(&DocState::Ack),
         "the backlog drained to ACK"
     );
+}
+
+// ── Task 4 Part B — differential oracle (model vs interpreter) ──────────────
+
+/// Acceptance [1]: a clean valid sequence differential-matches the model at
+/// every step (Doc case + structural seed).
+#[tokio::test]
+async fn differential_clean_online_sell_sequence_matches_model() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let mut model = RefModel::new_online_open_shift();
+
+    for i in 1..=3 {
+        let prior_tip = ctx.read_seed().await; // real tip BEFORE the op
+        let op = Op::OnlineSell(DpsScript::ack_path());
+        let expected = model.apply(&op);
+        let real = interp::run_op(&mut ctx, &op).await;
+        oracle::check_differential(&real, &expected, prior_tip.as_deref())
+            .unwrap_or_else(|d| panic!("op {i}: clean sell must match the model: {d:?}"));
+    }
+}
+
+/// Acceptance [2]: an injected model/real divergence (real lnd != model lnd) is
+/// caught — `check_differential` returns `Err(Divergence)`, not a pass.
+#[test]
+fn differential_catches_lnd_divergence() {
+    let expected = ExpectedOutcome::Mutated(model::Mutation {
+        lnd: 2,
+        doc_state: DocState::Ack,
+        seed_after: Some([2u8; 32]),
+        previous_hash: Some([1u8; 32]),
+        code_consumed: None,
+    });
+    let real = interp::RealOutcome::Doc(interp::ObservedDoc {
+        lnd: 3, // ← divergence: model expected lnd 2
+        doc_state: DocState::Ack,
+        previous_hash: Some(vec![1u8; 32]),
+        seed_after: Some(vec![9u8; 32]),
+        code_consumed: None,
+    });
+    let res = oracle::check_differential(&real, &expected, Some(&[1u8; 32]));
+    assert!(
+        res.is_err(),
+        "real lnd 3 != model lnd 2 must be flagged; got {res:?}"
+    );
+}
+
+/// Acceptance [3]: an invalid op (`SellWithClosedShift`) is `ExpectedNoMutation`
+/// — the differential accepts the real refusal and asserts no fiscal issuance
+/// (the seed does not advance).  It NEVER applies an lnd+1 expectation here.
+#[tokio::test]
+async fn differential_invalid_sell_with_closed_shift_is_no_mutation() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let mut model = RefModel::new_online_open_shift();
+
+    let seed_before = ctx.read_seed().await;
+    let op = Op::SellWithClosedShift;
+    let expected = model.apply(&op);
+    assert_eq!(
+        oracle::classify(&expected),
+        oracle::OpClass::ExpectedNoMutation,
+        "an invalid op classifies as ExpectedNoMutation"
+    );
+
+    let real = interp::run_op(&mut ctx, &op).await;
+    oracle::check_differential(&real, &expected, seed_before.as_deref())
+        .expect("ExpectedNoMutation must accept the real refusal");
+
+    // No fiscal issuance: the MAC seed must not advance (a refused sell issues
+    // no receipt).  (A non-issued PREPARED shell may exist; the seed is the
+    // load-bearing no-issuance signal.)
+    assert_eq!(ctx.read_seed().await, seed_before, "refused sell must not advance the seed");
+}
+
+/// Drain / GoOnline differential: after `GoOnline` (probe + drain) the real
+/// ledger matches the model's predicted ledger (the Recovered ledger-delta).
+#[tokio::test]
+async fn differential_go_online_ledger_matches_model() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
+    let mut model = RefModel::new_offline_open_shift(1);
+
+    let _ = model.apply(&Op::OfflineSell);
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
+
+    let _ = model.apply(&Op::GoOnline(DpsScript::ack_path()));
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::ack_path())).await;
+
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("after go_online the real ledger must match the model's predicted ledger");
+    assert_eq!(real_ledger.get(&1), Some(&DocState::Ack), "backlog doc reached ACK");
 }
