@@ -172,6 +172,10 @@ impl RefModel {
             // Deliberately-adverse intents whose interpreter arm FORCES a state
             // before a refused sell — mirror the forced state (no fiscal
             // mutation), so the model stays in sync with reality:
+            // Force GoingOnline; the sell is refused by the POST-SIGN dispatcher
+            // (NodeGoingOnline), which leaves NO committed doc (verified via the
+            // interpreter: the ledger is unchanged) — so mirror only the forced
+            // mode, no fiscal mutation / no row.
             Op::OfflineSellDuringGoingOnline => {
                 self.mode = NodeMode::GoingOnline;
                 ExpectedOutcome::NoMutation
@@ -183,6 +187,19 @@ impl RefModel {
             // A true replay (re-runs an already-DONE row) — no fiscal mutation.
             Op::DuplicateIdemKey => ExpectedOutcome::NoMutation,
         }
+    }
+
+    /// A POST-SIGN refusal: reality reaches `SIGNED` (the lnd IS allocated), then
+    /// a dispatcher / offline-ack refusal aborts it → a non-issued `Aborted` row
+    /// (mirrors the prod `terminalise_inbox` seam, migration 025).  Like the
+    /// online-reject non-issued row, the lnd is consumed (`next_lnd` advances) but
+    /// the seed does NOT advance and no code is consumed.  Classified `NoMutation`
+    /// (no issuance) — a row exists but no receipt was issued.
+    fn mint_aborted_refusal(&mut self) -> ExpectedOutcome {
+        let lnd = self.next_lnd;
+        self.docs.insert(lnd, DocState::Aborted);
+        self.next_lnd += 1;
+        ExpectedOutcome::NoMutation
     }
 
     /// A sell — the lane is the NODE MODE (the interpreter's `inline::run`
@@ -235,7 +252,10 @@ impl RefModel {
             NodeMode::Offline => {
                 let code_available = self.codes_consumed < self.codes_issued;
                 if self.session != Some(OfflineSessionState::Open) || !code_available {
-                    return ExpectedOutcome::NoMutation;
+                    // No active session / no code: reality reaches SIGNED, then the
+                    // offline-ack refuses (NoActiveSession / CodePoolExhausted,
+                    // post-sign) → the seam aborts it → a non-issued Aborted row.
+                    return self.mint_aborted_refusal();
                 }
                 let lnd = self.next_lnd;
                 let previous_hash = self.seed;
@@ -255,7 +275,12 @@ impl RefModel {
                     code_consumed: self.code_consumed_observable(),
                 })
             }
-            // GoingOnline / Blocked / etc — a sell is refused (no mutation).
+            // GoingOnline / Blocked / etc — a sell is refused by the POST-SIGN
+            // DISPATCHER (PostSignRoute::Refused, e.g. NodeGoingOnline).  Unlike
+            // the OFFLINE-ack refusals above (which abort a COMMITTED SIGNED doc →
+            // Aborted), the dispatcher-mode refusal leaves NO committed doc
+            // (verified via the interpreter: ledger unchanged) — so no mutation,
+            // no row.
             _ => ExpectedOutcome::NoMutation,
         }
     }

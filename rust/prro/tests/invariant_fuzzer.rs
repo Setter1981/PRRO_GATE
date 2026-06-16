@@ -203,6 +203,10 @@ fn chain_continuity_previous_hash_equals_prior_tip() {
 fn invalid_and_reentry_ops_do_not_mutate() {
     // RepeatReboot now defers as Fault (it drives the boot seam); the rest are
     // NoMutation no-ops (some force mode/shift — not a fiscal mutation).
+    // OfflineSellDuringGoingOnline stays here: its GoingOnline-mode sell is refused
+    // by the post-sign DISPATCHER (NodeGoingOnline), which leaves NO committed doc
+    // (the offline-ack CodePoolExhausted refusal — a DIFFERENT path — is the one
+    // that mints a non-issued Aborted row).
     let invalid = [
         Op::RepeatDrain,
         Op::DuplicateIdemKey,
@@ -1074,6 +1078,27 @@ proptest! {
     fn harness_offline_seeded(ops in strategy::op_sequence()) {
         drive(&ops, true);
     }
+}
+
+/// Post-sign refusal MIRROR (deterministic pin for the seed-rare divergence the
+/// `Aborted` prod fix introduced).  After the fix a no-code offline sell mints a
+/// non-issued `Aborted` row (the lnd is consumed, reaching SIGNED, then the
+/// offline-ack refuses → the terminalise_inbox seam aborts it).  The model MUST
+/// mirror it: else a later `GoOnline` ledger-delta diverges by the extra
+/// `Aborted` doc the model omitted.  Sequence: 3 codes → 3 OFFLINE_LOCAL_ACK,
+/// the 4th sell is no-code → Aborted, then GoOnline drains the backlog.
+#[test]
+fn harness_offline_no_code_sell_mirrors_aborted_row() {
+    drive(
+        &[
+            Op::OfflineSell,
+            Op::OfflineSell,
+            Op::OfflineSell,
+            Op::OfflineSell, // no code left → reality mints a non-issued Aborted row
+            Op::GoOnline(DpsScript::ack_path()),
+        ],
+        true,
+    );
 }
 
 /// AUD-K8-1 TEETH CANARY (deterministic; see `tests/invariant_fuzzer/TEETH_TEST.md`).

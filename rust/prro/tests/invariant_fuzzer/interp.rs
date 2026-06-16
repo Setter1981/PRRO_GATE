@@ -848,6 +848,7 @@ fn doc_state_from_str(s: &str) -> DocState {
         "CANCELLED" => DocState::Cancelled,
         "ERROR_RETRYABLE" => DocState::ErrorRetryable,
         "REQUIRES_MANUAL_RECONCILIATION" => DocState::RequiresManualReconciliation,
+        "ABORTED" => DocState::Aborted,
         other => panic!("unknown DocState string from ledger: {other:?}"),
     }
 }
