@@ -954,3 +954,61 @@ async fn teeth_aud_k8_1_rmr_redrive_makes_no_new_wire_call() {
          teeth bite (this counts wire calls, not a scan, so it is mode-independent)."
     );
 }
+
+// ── Hardening (CI conditions) — Cluster A: crash/scan correctness ────────────
+
+/// A1 (HIGH): `pending_crash` must reflect the REAL outcome, not the op name.
+///
+/// On an OFFLINE node a `Crash(Send)` never reaches the wire — `inline::run`
+/// takes the offline-ack branch and COMPLETES, so `run_op` returns
+/// `RealOutcome::Doc` (a real offline sell), NOT `RealOutcome::Crashed`
+/// (interp.rs `crash_via_drop`: the `res = &mut fut` select arm wins).  There is
+/// therefore NO in-flight transient and the node rests in a SETTLED `Offline`
+/// state, where the harness MUST run its quiescent scan / mirror check.
+///
+/// The current harness sets `pending_crash = true` from the op NAME
+/// (`Op::Crash(_)`), wrongly suppressing the settled scan — a false-negative
+/// window.  This is made observable with a planted Mirror-2 violation: a settled
+/// scan would catch it (panic); a suppressed scan returns cleanly.
+#[test]
+fn a1_offline_crash_send_completes_as_doc_so_settled_scan_runs() {
+    // Build a ctx with a planted Mirror-2 corruption, drive [Crash(Send)] through
+    // the harness, and assert the harness panicked (caught the planted violation).
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+            // Plant a cohort doc, then repoint it at a FOREIGN session → Mirror-2 desync.
+            let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
+            ctx.corrupt_cohort_session_to_foreign().await;
+            // sanity: the corruption really is present before the harness runs.
+            assert!(
+                oracle::check_mirrors(&ctx.pool).await.is_err(),
+                "setup: a Mirror-2 violation must be planted"
+            );
+            // [Crash(Send)] on OFFLINE completes as a real offline sell (Doc),
+            // leaving the node SETTLED (Offline) — the harness must scan here.
+            run_harness(
+                &[Op::Crash(Stage::Send)],
+                ctx,
+                RefModel::new_offline_open_shift(3),
+            )
+            .await;
+        });
+    }))
+    .is_err();
+    std::panic::set_hook(prev);
+
+    assert!(
+        panicked,
+        "the harness must scan at the SETTLED Offline boundary after a Crash(Send) that \
+         completed as a real offline sell (RealOutcome::Doc, not Crashed) and catch the \
+         planted Mirror-2 violation. It returned cleanly → the settled scan was wrongly \
+         suppressed because pending_crash was set from the op name instead of the real outcome."
+    );
+}
