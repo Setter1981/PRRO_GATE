@@ -262,7 +262,7 @@ each finding its own RED→GREEN; **STOP for architect review after Cluster A**)
 - **A2 + A4 — terminal `settle_and_scan` (closes the unpaired-crash gap AND the `GoingOnline` liveness
   bound).** A sequence may end after a real crash (dirty DB never scanned) or in `GoingOnline` (an unbounded
   no-scan zone). At end of the harness run, if not settled, drive a **bounded** settle and then a mandatory
-  `assert_clean` + `check_mirrors`. Two architect refinements are part of this contract:
+  `assert_clean` + `check_mirrors`. Three architect refinements are part of this contract:
   - **Settle via REAL recovery seams (`Reboot`; a real drain tick if `GoingOnline` + backlog), NEVER
     `force_node_mode`.** A4 asks "does the system settle on its own?" — forcing the mode answers it
     artificially and masks a real liveness bug. `force_node_mode` stays confined to adverse-intent setup.
@@ -271,6 +271,21 @@ each finding its own RED→GREEN; **STOP for architect review after Cluster A**)
     surface; the system must NOT auto-settle from it). Define `settled ⟺ mode ∈ {Online, Offline} OR
     shift_state == RequiresManualReconciliation`. Do not force-settle or liveness-panic on RMR; the scan
     must pass on a legitimate RMR state (if it flags there, that is a REAL finding — do not suppress).
+  - **`GoingOnline` without an active offline session is an IMPOSSIBLE real-system state — a test-setter
+    artifact, NOT a liveness bug (refinement found in implementation, 2026-06-16; verified by 3 facts +
+    a spike).** Real `GoingOnline` is only ever entered via `return_online_probe` from Offline, i.e. WITH a
+    session; the adverse `OfflineSellDuringGoingOnline` op force-sets it on an Online node with no session +
+    an online-origin `SENDING` doc. That state cannot be settled by real seams (drain with no session is a
+    no-op — `backlog_drain.rs` `no_active_offline_session`; reboot defers, branch d) and must not be scanned
+    (the deferred `SENDING` false-flags as `StuckSending` — the very thing the SETTLED gate exists for). So
+    the liveness check is **gated structurally on settle-ability** (NOT an allowlist of violation types),
+    using the seam's own `current_open_or_draining_session` predicate:
+    - `GoingOnline` **with** an active OPEN/DRAINING session → legitimate, must settle in bounded N → else
+      **liveness panic** (a real bug). This is where the liveness check has teeth (the offline harness, via
+      a real `GoOnline` probe, reaches it).
+    - `GoingOnline` **without** an active session → the artifact → do NOT panic, do NOT scan; assert only the
+      universal **bounded no-resend** (the real recovery ops did not re-send — `send_calls` unchanged). A
+      durable directed pin documents WHY (the impossible-state reasoning), keeping the skip auditable.
 - **A3 — bounded crash-postconditions wired into the property harness.** Faults currently only
   `resync_from_db`; the random search never asserts the no-resend invariant. On the resolving `Reboot`,
   assert the bounded postcondition IN the harness. **Universal invariant under composition = NO-RESEND**
