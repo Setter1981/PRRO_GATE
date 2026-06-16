@@ -134,14 +134,14 @@ fn model_offline_issued_set_is_the_ssot_const() {
 // ── Lane-correctness reinforcements (pure model behaviours) ─────────────────
 
 /// A DPS reject of an online doc → `inline::run` returns Err(DpsRejected) → the
-/// interpreter reports Refused, so the model reports NoMutation (no issuance).
-/// The lnd is still consumed + a NON-ISSUED rejected row is minted; the seed
-/// does not advance.
+/// interpreter reports Refused.  B2: the model reports `NoIssuanceRow` (NOT
+/// `NoMutation`) — a NON-ISSUED Rejected row IS minted + the lnd consumed, but
+/// no receipt is issued (the seed does not advance).
 #[test]
-fn online_sell_reject_is_no_mutation_with_non_issued_rejected_row() {
+fn online_sell_reject_is_no_issuance_row_with_non_issued_rejected_row() {
     let mut m = RefModel::new_online_open_shift();
     let out = m.apply(&Op::OnlineSell(DpsScript::send_then_reject()));
-    assert_eq!(out, ExpectedOutcome::NoMutation);
+    assert_eq!(out, ExpectedOutcome::NoIssuanceRow);
     assert_eq!(
         m.docs.get(&1),
         Some(&DocState::Rejected),
@@ -920,7 +920,8 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         let sends_before = ctx.send_calls(); // wire send count BEFORE the op (A3 no-resend)
         let shift_before = ctx.read_shift_state().await; // real shift_state BEFORE the op
         let cohort_before = ctx.full_drain_cohort_count().await; // MH: drain re-drives ≤ cohort
-        let next_lnd_before = ctx.read_next_lnd().await; // MH: a drain allocates no new lnd
+        let next_lnd_before = ctx.read_next_lnd().await; // MH/B2: a drain/no-op allocates no lnd
+        let doc_count_before = ctx.observed_doc_count().await; // B2: TrueNoMutation mints no row
 
         let expected = model.apply(op);
         let real = interp::run_op(&mut ctx, op).await;
@@ -998,10 +999,24 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
             // No mutation — the differential is permissive here, so the harness
             // independently asserts NO ISSUANCE (else an erroneously-mutating
             // invalid op slips through).
+            // B2 — TrueNoMutation: a refusal / replay refused BEFORE any row is
+            // written.  STRICT: the ledger is ENTIRELY unchanged (no row, no lnd,
+            // no seed, no code) — a leaked row is caught HERE, not at a later
+            // ledger-delta.
             oracle::OpClass::ExpectedNoMutation => {
                 if let Err(d) = oracle::check_differential(&real, &expected, prior_tip.as_deref()) {
                     panic!("no-mutation differential on {op:?}: {d:?}");
                 }
+                assert_eq!(
+                    ctx.observed_doc_count().await,
+                    doc_count_before,
+                    "ExpectedNoMutation {op:?} minted a fiscal_documents row (a true no-op must not)"
+                );
+                assert_eq!(
+                    ctx.read_next_lnd().await,
+                    next_lnd_before,
+                    "ExpectedNoMutation {op:?} allocated an lnd (a true no-op must not)"
+                );
                 assert_eq!(
                     ctx.read_seed().await,
                     prior_tip,
@@ -1011,6 +1026,30 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                     ctx.consumed_codes_count().await,
                     codes_before,
                     "ExpectedNoMutation {op:?} consumed an offline code (issuance leaked)"
+                );
+            }
+            // B2 — NoIssuanceRowAllowed: a refusal that mints a LEGAL non-issued
+            // row (online-reject Rejected / offline-ack Aborted).  The row IS
+            // allowed (the lnd is consumed → next_lnd may bump), but it is NOT
+            // issued: the row matches the model's predicted non-issued state
+            // (ledger-delta) AND the seed + codes do NOT move.
+            oracle::OpClass::ExpectedNoIssuanceRow => {
+                if let Err(d) = oracle::check_differential(&real, &expected, prior_tip.as_deref()) {
+                    panic!("no-issuance-row differential on {op:?}: {d:?}");
+                }
+                let real_ledger = ctx.read_ledger().await;
+                if let Err(d) = oracle::check_ledger_delta(&model.docs, &real_ledger) {
+                    panic!("no-issuance-row ledger-delta on {op:?}: {d:?}");
+                }
+                assert_eq!(
+                    ctx.read_seed().await,
+                    prior_tip,
+                    "ExpectedNoIssuanceRow {op:?} advanced the seed (a refused row is NOT issued)"
+                );
+                assert_eq!(
+                    ctx.consumed_codes_count().await,
+                    codes_before,
+                    "ExpectedNoIssuanceRow {op:?} consumed a code (a refused row is NOT issued)"
                 );
             }
         }
@@ -1190,6 +1229,19 @@ fn harness_exotic_drain_is_bounded_postcond_verified() {
         ],
         true,
     );
+}
+
+/// B2 — the ExpectedNoMutation split is exercised through run_harness for BOTH
+/// classes: a NoIssuanceRow op (online DPS-reject → a legal non-issued Rejected
+/// row, verified by the ledger-delta) and a TrueNoMutation op (closed-shift sell
+/// → refused before any row, asserted strictly zero new row / lnd).  Both
+/// resolve cleanly, so the harness does not panic — proving each arm is
+/// exercised AND does not false-fire (a leaked row in the TrueNoMutation op
+/// would now panic at the op, not slip to a later ledger-delta).
+#[test]
+fn harness_no_mutation_split_both_classes() {
+    drive(&[Op::OnlineSell(DpsScript::send_then_reject())], false); // NoIssuanceRow
+    drive(&[Op::SellWithClosedShift], false); // TrueNoMutation
 }
 
 /// AUD-K8-1 TEETH CANARY (deterministic; see `tests/invariant_fuzzer/TEETH_TEST.md`).

@@ -37,8 +37,14 @@ use crate::model::{ExpectedOutcome, Mutation};
 pub enum OpClass {
     /// A deterministic fiscal mutation — differential-matched against the model.
     PredictableMutating,
-    /// A typed refusal / idempotent no-op — assert NO fiscal issuance.
+    /// A TRUE no-op — assert the ledger is ENTIRELY unchanged (no row, no lnd).
     ExpectedNoMutation,
+    /// B2 — a refusal that mints a legal NON-ISSUED row (online-reject Rejected /
+    /// offline-ack Aborted): assert ≤1 new non-issued row, no issuance (seed +
+    /// codes unchanged).  Distinct from `ExpectedNoMutation` (which forbids ANY
+    /// new row), so a non-issued row is ACCEPTED here but a leaked row is caught
+    /// there.
+    ExpectedNoIssuanceRow,
     /// A fault / recovery op — deferred to Task 5 (bounded postcond + re-sync).
     FaultOrRecovery,
 }
@@ -55,6 +61,7 @@ pub fn classify(expected: &ExpectedOutcome) -> OpClass {
     match expected {
         ExpectedOutcome::Mutated(_) => OpClass::PredictableMutating,
         ExpectedOutcome::NoMutation => OpClass::ExpectedNoMutation,
+        ExpectedOutcome::NoIssuanceRow => OpClass::ExpectedNoIssuanceRow,
         ExpectedOutcome::Fault => OpClass::FaultOrRecovery,
     }
 }
@@ -90,8 +97,11 @@ pub fn check_differential(
                 ))),
             }
         }
-        OpClass::ExpectedNoMutation => match real {
-            // A typed refusal is the expected shape.
+        // Both no-issuance classes share the permissive differential shape; the
+        // ledger assertions (zero rows vs ≤1 non-issued row, no seed/code) are the
+        // harness's, split by class.
+        OpClass::ExpectedNoMutation | OpClass::ExpectedNoIssuanceRow => match real {
+            // A typed refusal is the expected shape (online-reject / offline-ack).
             RealOutcome::Refused(_) => Ok(()),
             // An idempotent recovery no-op (e.g. GoOnlineWithoutBacklog) — the
             // ledger-unchanged assertion is the test's (via ctx).
@@ -100,7 +110,7 @@ pub fn check_differential(
             // "no NEW issuance" assertion (no seed/code advance) is the test's.
             RealOutcome::Doc(_) => Ok(()),
             RealOutcome::Crashed { .. } => Err(Divergence(
-                "ExpectedNoMutation but the real op crashed".to_string(),
+                "ExpectedNoMutation/NoIssuanceRow but the real op crashed".to_string(),
             )),
         },
     }
