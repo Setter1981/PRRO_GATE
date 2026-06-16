@@ -467,7 +467,11 @@ async fn differential_invalid_sell_with_closed_shift_is_no_mutation() {
     // No fiscal issuance: the MAC seed must not advance (a refused sell issues
     // no receipt).  (A non-issued PREPARED shell may exist; the seed is the
     // load-bearing no-issuance signal.)
-    assert_eq!(ctx.read_seed().await, seed_before, "refused sell must not advance the seed");
+    assert_eq!(
+        ctx.read_seed().await,
+        seed_before,
+        "refused sell must not advance the seed"
+    );
 }
 
 /// Drain / GoOnline differential: after `GoOnline` (probe + drain) the real
@@ -486,5 +490,9 @@ async fn differential_go_online_ledger_matches_model() {
     let real_ledger = ctx.read_ledger().await;
     oracle::check_ledger_delta(&model.docs, &real_ledger)
         .expect("after go_online the real ledger must match the model's predicted ledger");
-    assert_eq!(real_ledger.get(&1), Some(&DocState::Ack), "backlog doc reached ACK");
+    assert_eq!(
+        real_ledger.get(&1),
+        Some(&DocState::Ack),
+        "backlog doc reached ACK"
+    );
 }

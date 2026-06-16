@@ -18,6 +18,7 @@
 //! Task 2's scope is `interp.rs` only.  `ScriptedDps` + `det_signing_ctx` +
 //! `drain_test_guard` ARE shared from `tests/common/`.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -262,7 +263,9 @@ impl FuzzCtx {
         state.map(|s| doc_state_from_str(&s))
     }
 
-    async fn read_seed(&self) -> Option<Vec<u8>> {
+    /// The MAC tip (`node_state.last_known_unsigned_xml_sha256`) — the real
+    /// seed.  Public for the Task 4 differential's structural seed comparison.
+    pub async fn read_seed(&self) -> Option<Vec<u8>> {
         let v: Option<Vec<u8>> = sqlx::query_scalar(
             "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = ?",
         )
@@ -271,6 +274,22 @@ impl FuzzCtx {
         .await
         .unwrap();
         v
+    }
+
+    /// The full ledger (lnd → state) for the FN — for the Task 4 differential's
+    /// drain / go-online ledger-delta (`RealOutcome::Recovered` carries no
+    /// per-doc detail).
+    pub async fn read_ledger(&self) -> BTreeMap<i64, DocState> {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT lnd, state FROM fiscal_documents WHERE fiscal_number = ? ORDER BY lnd",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|(lnd, s)| (lnd, doc_state_from_str(&s)))
+            .collect()
     }
 
     async fn read_codes_consumed(&self) -> Option<i64> {
