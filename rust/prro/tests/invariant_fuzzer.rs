@@ -28,7 +28,7 @@ mod interp;
 #[path = "invariant_fuzzer/strategy.rs"]
 mod strategy;
 
-use prro::db::models::enums::DocState;
+use prro::db::models::enums::{DocState, NodeMode, ShiftState};
 use prro::db::repositories::fiscal_documents::OFFLINE_ISSUED_STATES;
 
 use proptest::prelude::*;
@@ -300,4 +300,63 @@ fn shrinking_reduces_a_forced_failure_to_minimal() {
         }
         other => panic!("expected a shrunk TestError::Fail, got {other:?}"),
     }
+}
+
+// ── Task 4 Part A — RefModel Drain / GoOnline prediction (Fault → Mutated) ───
+
+#[test]
+fn model_drain_ackpath_advances_backlog_to_ack() {
+    let mut m = RefModel::new_offline_open_shift(1);
+    let _ = m.apply(&Op::OfflineSell); // backlog: docs[1] = OFFLINE_LOCAL_ACK
+    assert_eq!(m.docs.get(&1), Some(&DocState::OfflineLocalAck));
+    let seed_before = m.seed;
+    m.mode = NodeMode::GoingOnline; // fixture: the probe already flipped (test setup)
+
+    let out = m.apply(&Op::Drain(DpsScript::ack_path()));
+
+    assert!(
+        matches!(out, ExpectedOutcome::Mutated(_)),
+        "an advancing drain is PredictableMutating, got {out:?}"
+    );
+    assert_eq!(m.docs.get(&1), Some(&DocState::Ack), "backlog doc drained to ACK");
+    assert_eq!(
+        m.seed, seed_before,
+        "drain does NOT re-advance the seed (offline-origin advanced at issuance)"
+    );
+    assert_eq!(m.mode, NodeMode::Online, "a full drain flips GoingOnline → Online");
+}
+
+#[test]
+fn model_drain_reject_halts_and_escalates_manual() {
+    let mut m = RefModel::new_offline_open_shift(2);
+    let _ = m.apply(&Op::OfflineSell); // docs[1]
+    let _ = m.apply(&Op::OfflineSell); // docs[2]
+    m.mode = NodeMode::GoingOnline;
+
+    let out = m.apply(&Op::Drain(DpsScript::send_then_reject()));
+
+    assert!(matches!(out, ExpectedOutcome::Mutated(_)));
+    assert_eq!(m.docs.get(&1), Some(&DocState::Rejected), "first backlog doc → REJECTED");
+    assert_eq!(
+        m.docs.get(&2),
+        Some(&DocState::OfflineLocalAck),
+        "the rest are held (strict-sequential halt-on-reject)"
+    );
+    assert_eq!(
+        m.shift_state,
+        ShiftState::RequiresManualReconciliation,
+        "K8: a drain reject of an OFFLINE_LOCAL_ACK backlog doc escalates manual"
+    );
+}
+
+#[test]
+fn model_go_online_transitions_and_drains() {
+    let mut m = RefModel::new_offline_open_shift(1);
+    let _ = m.apply(&Op::OfflineSell);
+
+    let out = m.apply(&Op::GoOnline(DpsScript::ack_path()));
+
+    assert!(matches!(out, ExpectedOutcome::Mutated(_)));
+    assert_eq!(m.mode, NodeMode::Online, "go_online: Offline → (GoingOnline) → Online");
+    assert_eq!(m.docs.get(&1), Some(&DocState::Ack), "the backlog drained to ACK");
 }
