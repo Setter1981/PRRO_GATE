@@ -1333,6 +1333,59 @@ async fn teeth_aud_k8_1_rmr_redrive_makes_no_new_wire_call() {
     );
 }
 
+/// P1 TEETH CANARY (deterministic; see `tests/invariant_fuzzer/TEETH_TEST.md`).
+///
+/// Boot-resume twin of fix #192.  `Crash(Sign)` commits a `SIGNED` doc and stops
+/// before dispatch (the crash-after-sign window); on `Reboot`, boot
+/// reconciliation drives that SIGNED doc on an Offline node with an EXHAUSTED
+/// code pool → `OfflineAckOutcome::Refused(CodePoolExhausted)` at
+/// `boot_phase.rs` arc 3745 → the doc MUST be aborted (`SIGNED → Aborted`).
+/// WITHOUT the boot abort the doc rests non-terminal in `SIGNED`, a ledger-only
+/// pin breach that `invariant_scan` flags as `StuckNonTerminalDoc`.
+///
+/// `#[ignore]` because it asserts a property of the PRESENT fix: it PASSES on
+/// main and FAILS only when the boot abort is reverted (the fuzzer's teeth bite).
+/// The detection here is the settled-mode `assert_clean` scan AFTER the reboot
+/// resolves the crash transient (mode rests Offline → SETTLED → scanned).
+#[tokio::test]
+#[ignore = "P1 teeth canary: PASSES with the boot-resume CodePoolExhausted abort \
+            (boot_phase.rs arc 3745/3514), FAILS when it is reverted. \
+            See tests/invariant_fuzzer/TEETH_TEST.md."]
+async fn teeth_p1_boot_resume_codepool_aborts() {
+    // Offline node, OPEN shift + session, EMPTY code pool (0 codes seeded).
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(0).await;
+
+    // Crash AFTER sign → a committed SIGNED doc (lnd 1); no code consumed (the
+    // offline-ack never ran), no dispatch.
+    let crashed = interp::run_op(&mut ctx, &Op::Crash(Stage::Sign)).await;
+    assert!(
+        matches!(
+            crashed,
+            interp::RealOutcome::Crashed {
+                stage: Stage::Sign,
+                committed_state: Some(DocState::Signed),
+            }
+        ),
+        "Crash(Sign) must commit a SIGNED doc, got {crashed:?}"
+    );
+
+    // Reboot → boot reconciliation drives the SIGNED doc → offline-ack →
+    // CodePoolExhausted (empty pool) → the P1 abort.
+    let _ = interp::run_op(&mut ctx, &Op::Reboot).await;
+
+    let ledger = ctx.read_ledger().await;
+    assert_eq!(
+        ledger.get(&1),
+        Some(&DocState::Aborted),
+        "P1: boot recovery MUST abort the post-sign-refused SIGNED doc \
+         (CodePoolExhausted). If this is SIGNED, the boot abort \
+         (boot_phase.rs arc 3745) is missing/reverted — the fuzzer's teeth bite."
+    );
+    // FULL invariant_scan clean — the same gate the property harness's
+    // post-reboot settled scan runs (no StuckNonTerminalDoc, no chain break).
+    oracle::assert_clean(&ctx.pool).await;
+}
+
 // ── Hardening (CI conditions) — Cluster A: crash/scan correctness ────────────
 
 /// A1 (HIGH): `pending_crash` must reflect the REAL outcome, not the op name.

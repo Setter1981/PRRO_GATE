@@ -108,6 +108,81 @@ The shrink is faithful to the AUD-K8-1 mechanism: build an offline backlog →
 escalate the FN to RMR via a rejecting/MAC-failing drain → re-tick the drain. The
 guard's job is to make that final re-tick inert; the fuzzer proves it does.
 
+---
+
+# Teeth test #2 — P1 boot-resume `CodePoolExhausted` abort
+
+The second planted-regression proof, for the **P1 boot-resume abort** (the boot
+twin of fix #192). On boot, a post-sign offline-ack refusal with the TERMINAL
+`CodePoolExhausted` cause must abort a dangling `SIGNED` doc (`SIGNED → Aborted`);
+without it the doc rests non-terminal and a later online resurrection would
+wrongly ISSUE a check refused at offline-ack time (ledger-only pin + Frozen
+Invariant #8).
+
+## Revert target
+
+`prro/src/services/reconciliation/boot_phase.rs` — the two `OfflineAckOutcome::
+Refused` arms (PREPARED-resume arc ~3514 + SIGNED-resume arc ~3745):
+
+```rust
+if matches!(reason, RefusalReason::CodePoolExhausted) {
+    if let Err(e) = abort_signed_on_offline_code_exhaustion(pool, doc_id).await { … }
+}
+```
+
+To demonstrate the teeth, **disable both arms** (e.g. `if false && matches!(…)`)
+— and restore afterwards. The repository must ship with the abort PRESENT.
+
+> Confirm with:
+> `grep -n "RefusalReason::CodePoolExhausted" prro/src/services/reconciliation/boot_phase.rs`
+
+## How the teeth bite
+
+A `Crash(Sign)` commits a `SIGNED` doc and stops before dispatch (the
+crash-after-sign window); the next `Reboot` drives boot reconciliation on an
+Offline node with an EXHAUSTED code pool → `CodePoolExhausted` → the abort.
+Detection is the **settled-mode `assert_clean` scan** AFTER the reboot resolves
+the crash transient (the node rests `Offline` → SETTLED → scanned): with the
+abort the doc is `Aborted` (clean); without it the doc rests `SIGNED` →
+`invariant_scan` flags `StuckNonTerminalDoc`.
+
+The teeth here live in **one** place — the deterministic canary
+`teeth_p1_boot_resume_codepool_aborts` (`#[ignore]`-d; PASSES on main, FAILS on
+revert). Unlike AUD-K8-1, this class is NOT wired into the random property
+harness: `Crash(Sign)` is implemented (`interp::crash_after_sign`) but is
+**directed-only**, not generatively emitted. A context-free generator produces
+crash-after-sign sequences FOLLOWED by further issuance before a reboot (e.g.
+`[Crash(Sign), OnlineSell, …]`), which buries the SIGNED doc under a later-issued
+doc — an UNREACHABLE production state (single-writer + boot-recon-before-serve:
+a crashed process serves no new request before recovery). Surfacing that artifact
+in the generative net is a separate harness-realism follow-up (model "no new op
+until reboot while a crash is pending). See `strategy.rs::op` for the rationale.
+
+## Run it
+
+```bash
+# 1) Baseline (abort PRESENT): canary must be GREEN.
+cargo test -p prro --features test-support --test invariant_fuzzer \
+  -- --ignored teeth_p1_boot_resume_codepool_aborts
+
+# 2) Disable both abort arms (above), re-run — it must FAIL.
+# 3) Restore, re-run — GREEN again.
+```
+
+## Expected finding (abort reverted)
+
+```
+thread 'teeth_p1_boot_resume_codepool_aborts' panicked:
+assertion `left == right` failed: P1: boot recovery MUST abort the
+post-sign-refused SIGNED doc (CodePoolExhausted). ... the fuzzer's teeth bite.
+  left: Some(Signed)
+ right: Some(Aborted)
+```
+
+This was demonstrated on 2026-06-17: revert → FAIL (above) → restore → GREEN.
+
+---
+
 ## Scope (Phase 0)
 
 - `N = 256` per harness (PR-time; documented small). Larger `N` / nightly is a
