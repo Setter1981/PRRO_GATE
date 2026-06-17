@@ -1288,14 +1288,16 @@ fn harness_recovered_go_online_full_snapshot_verified() {
 /// drain re-enters and re-sends the orphaned successor (a fresh `send_chk`),
 /// defeating the escalation's "durable operator surface, halts FN drain" contract.
 ///
-/// `#[ignore]` because it asserts a property of the PRESENT guard: it PASSES on
-/// main and FAILS only when the guard is reverted — a manual canary, not a CI
-/// gate.  Detection is MODE-INDEPENDENT (counts wire calls, not a scan), so it
-/// bites even though the reverted re-drive rests in `GoingOnline`, where the
-/// harness's SETTLED-mode scan gate suppresses `assert_clean`.
+/// A deterministic CI regression gate (un-`#[ignore]`d 2026-06-17): it PASSES on
+/// main and FAILS only when the `backlog_drain.rs:725` guard is reverted — that
+/// pass-on-main / fail-on-revert shape IS a regression gate, so it runs in CI
+/// (not a manual-only canary).  Detection is MODE-INDEPENDENT (counts wire calls,
+/// not a scan), so it bites even though the reverted re-drive rests in
+/// `GoingOnline`, where the harness's SETTLED-mode scan gate suppresses
+/// `assert_clean`.  (The capstone `drive()` loop also carries this as a
+/// generative bounded-postcond; this directed test makes the coverage
+/// deterministic rather than probabilistic.)
 #[tokio::test]
-#[ignore = "AUD-K8-1 teeth canary: PASSES with the backlog_drain.rs:725 guard, \
-            FAILS when it is reverted. See tests/invariant_fuzzer/TEETH_TEST.md."]
 async fn teeth_aud_k8_1_rmr_redrive_makes_no_new_wire_call() {
     let mut ctx = interp::FuzzCtx::new_offline_open_shift(2).await;
 
@@ -1343,14 +1345,13 @@ async fn teeth_aud_k8_1_rmr_redrive_makes_no_new_wire_call() {
 /// WITHOUT the boot abort the doc rests non-terminal in `SIGNED`, a ledger-only
 /// pin breach that `invariant_scan` flags as `StuckNonTerminalDoc`.
 ///
-/// `#[ignore]` because it asserts a property of the PRESENT fix: it PASSES on
-/// main and FAILS only when the boot abort is reverted (the fuzzer's teeth bite).
-/// The detection here is the settled-mode `assert_clean` scan AFTER the reboot
-/// resolves the crash transient (mode rests Offline → SETTLED → scanned).
+/// A deterministic CI regression gate (un-`#[ignore]`d 2026-06-17): it PASSES on
+/// main and FAILS only when the boot abort is reverted (the fuzzer's teeth bite) —
+/// that pass-on-main / fail-on-revert shape IS a regression gate, so it runs in CI
+/// (not a manual-only canary).  The detection here is the settled-mode
+/// `assert_clean` scan AFTER the reboot resolves the crash transient (mode rests
+/// Offline → SETTLED → scanned).
 #[tokio::test]
-#[ignore = "P1 teeth canary: PASSES with the boot-resume CodePoolExhausted abort \
-            (boot_phase.rs arc 3745/3514), FAILS when it is reverted. \
-            See tests/invariant_fuzzer/TEETH_TEST.md."]
 async fn teeth_p1_boot_resume_codepool_aborts() {
     // Offline node, OPEN shift + session, EMPTY code pool (0 codes seeded).
     let mut ctx = interp::FuzzCtx::new_offline_open_shift(0).await;
