@@ -83,7 +83,13 @@ async fn seed_fn_config(pool: &SqlitePool, fn_id: &str) {
     .unwrap();
 }
 
-async fn seed_node_state(pool: &SqlitePool, fn_id: &str, mode: &str, shift_state: &str, next_lnd: i64) {
+async fn seed_node_state(
+    pool: &SqlitePool,
+    fn_id: &str,
+    mode: &str,
+    shift_state: &str,
+    next_lnd: i64,
+) {
     sqlx::query(
         "INSERT INTO node_state (fiscal_number, mode, shift_state, next_lnd) VALUES (?, ?, ?, ?)",
     )
@@ -146,7 +152,10 @@ fn deps_view<'a>(
     })
 }
 
-fn stuck_signed_violation<'a>(violations: &'a [Violation], doc: DocumentId) -> Option<&'a Violation> {
+fn stuck_signed_violation<'a>(
+    violations: &'a [Violation],
+    doc: DocumentId,
+) -> Option<&'a Violation> {
     let want_hex: String = doc.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
     violations.iter().find(|v| {
         matches!(
@@ -193,7 +202,11 @@ async fn p1_boot_resume_offline_exhausted_leaves_stuck_signed() {
     let doc = seed_signed_sell(&pool, fn_id, 0x77).await;
 
     // Sanity: before boot the doc is SIGNED and there are zero AVAILABLE codes.
-    assert_eq!(doc_state(&pool, doc).await, "SIGNED", "precondition: doc starts SIGNED");
+    assert_eq!(
+        doc_state(&pool, doc).await,
+        "SIGNED",
+        "precondition: doc starts SIGNED"
+    );
     let available: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM offline_codes WHERE fiscal_number = ? AND consumed_at IS NULL",
     )
@@ -259,7 +272,11 @@ async fn p1_boot_resume_blocked_mode_leaves_stuck_signed() {
     seed_node_state(&pool, fn_id, "BLOCKED", "OPENED", 1).await;
     let doc = seed_signed_sell(&pool, fn_id, 0x55).await;
 
-    assert_eq!(doc_state(&pool, doc).await, "SIGNED", "precondition: doc starts SIGNED");
+    assert_eq!(
+        doc_state(&pool, doc).await,
+        "SIGNED",
+        "precondition: doc starts SIGNED"
+    );
 
     let stub = StubDpsChannel::with_spy(
         Ok(ack("MUST-NOT-BE-CALLED")),
