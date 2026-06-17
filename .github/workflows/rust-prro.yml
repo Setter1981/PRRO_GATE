@@ -126,13 +126,24 @@ jobs:
         run: cargo nextest run -p prro --features test-support --locked
 
       # Phase-2 U2 (spec §4 / F2): the fuzzer above writes a regression seed to
-      # the pinned file on a find. If a CI run left that seed uncommitted or
-      # untracked, the find would be lost on this ephemeral runner — fail loudly
-      # so the seed is committed (= a permanent regression). Linux-only (the
-      # find is deterministic, so the Linux legs catch it) and runs regardless
-      # of whether the test step above failed, so a find is surfaced as THIS
-      # guard, not just a raw test failure.
+      # the pinned file on a find. Surface it so a find is never silently dropped:
+      # (1) upload the seed as a PER-TARGET artifact so a find's repro is
+      # preserved before the ephemeral runner is torn down — including a
+      # Windows-specific find (audit HIGH#2: the Windows leg runs the fuzzer
+      # natively on windows-latest); (2) fail loudly if it is uncommitted/
+      # untracked. Runs on EVERY OS leg (bash is available on the windows
+      # runner via Git Bash) and regardless of whether the test step above
+      # failed, so a find is surfaced as THIS guard, not just a raw failure.
+      - name: Upload regression seed (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: invariant-fuzzer-regressions-${{ matrix.target }}
+          path: rust/prro/tests/invariant_fuzzer.regressions
+          if-no-files-found: ignore
+          retention-days: 30
+
       - name: Guard — committed fuzzer regression seed
-        if: runner.os == 'Linux' && always()
+        if: always()
         shell: bash
         run: bash rust/prro/tests/check_seed_committed.sh

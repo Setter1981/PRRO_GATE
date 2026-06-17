@@ -18,12 +18,14 @@ Phase 0 delivered a model-based stateful invariant fuzzer (T0–T7, §15 hardeni
 
 Closing these makes the fuzzer the mechanism the project was built around: every new feature/fix re-validates the core for free, and every find is pinned forever. This is the highest-ROI fuzzer work after the bugs themselves.
 
+> **Honesty note (audit HIGH#1):** Phase 2 delivers the durability *mechanism* (depth, committed seeds, nightly cadence). It does **not** by itself make the fuzzer a merge-**blocking** gate: the fuzzer + seed-guard run in the **non-required** `rust-prro.yml` + the nightly, and branch protection currently requires only `fmt + clippy (gnu)`. Turning the mechanism into an enforced gate is a separate **branch-protection** step (add a fast fuzzer/seed-guard status to required checks) — out of scope here. Read "CI gate" below as "the mechanism for one", not "an enforced gate today".
+
 ## §1 Goals / Non-goals
 
 **Goals**
 - G1 — per-case temp DBs are cleaned; depth is bounded only by time, not disk.
 - G2 — every fuzzer find leaves a committed seed that replays first on the next run (permanent regression), and CI refuses to silently drop a find.
-- G3 — PR-time runs a fast gate; a nightly job runs deep (large-N); nightly finds persist + surface.
+- G3 — PR-time runs a fast (non-required) check; a nightly job runs deep (large-N); nightly finds persist + surface. (Making either a *required* merge gate is a branch-protection step — see the §0 honesty note.)
 
 **Non-goals**
 - N1 — generator-fidelity work (e.g. generative `Crash(Sign)` "no-new-op-until-reboot" realism). That is **Phase 3** (it sits with the Cluster-C oracle/realism family, not durability). See §10.

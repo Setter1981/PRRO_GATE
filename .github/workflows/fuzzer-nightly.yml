@@ -1,7 +1,7 @@
 name: fuzzer-nightly
 
 # Phase-2 U3 (spec §5 / G3): a DEEP, large-N run of the invariant-fuzzer
-# capstone. The PR-time gate (rust-prro.yml) stays fast at the 256-case default;
+# capstone. The PR-time check (rust-prro.yml — a NON-required status) stays fast at the 256-case default;
 # this scheduled job dials the dedicated `FUZZ_CASES` knob up so the fuzzer
 # reaches the depth that finds tail bugs.
 #
@@ -43,6 +43,19 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
+      # Audit MED#2: FUZZ_CASES is the capstone knob, but the `proptest!` macro
+      # runs `contextualize_config()` which lets the global `PROPTEST_CASES`
+      # override it. Fail fast if it is set so a stray value can never silently
+      # skew the capstone N (the "CI sets FUZZ_CASES, never PROPTEST_CASES" rule,
+      # enforced rather than only documented).
+      - name: Guard — PROPTEST_CASES must be unset (use FUZZ_CASES)
+        shell: bash
+        run: |
+          if [ -n "${PROPTEST_CASES:-}" ]; then
+            echo "PROPTEST_CASES is set — it overrides FUZZ_CASES on the proptest macro and would skew the capstone N. Use FUZZ_CASES only." >&2
+            exit 1
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
 
