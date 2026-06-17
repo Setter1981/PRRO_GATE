@@ -1,0 +1,104 @@
+name: fuzzer-nightly
+
+# Phase-2 U3 (spec §5 / G3): a DEEP, large-N run of the invariant-fuzzer
+# capstone. The PR-time check (rust-prro.yml — a NON-required status) stays fast at the 256-case default;
+# this scheduled job dials the dedicated `FUZZ_CASES` knob up so the fuzzer
+# reaches the depth that finds tail bugs.
+#
+# NOT a required PR status check (spec §5 constraint): a scheduled workflow would
+# otherwise sit "expected/pending" on every PR and block merges. Only
+# `fmt + clippy (gnu)` is required (see fmt-clippy.yml). This file is triggered
+# ONLY by the cron schedule and manual dispatch — never by `pull_request`.
+on:
+  schedule:
+    # 02:00 UTC daily.
+    - cron: '0 2 * * *'
+  # Allow on-demand runs (e.g. to reproduce/triage a nightly find).
+  workflow_dispatch:
+
+# Least-privilege: this job only reads the repo. Artifact upload needs no extra
+# scope.
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzzer-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  # Use the committed `.sqlx/` cache so the build does not need a live DB.
+  SQLX_OFFLINE: "true"
+  # Large-N depth. The CAPSTONE reads this dedicated knob (NOT `PROPTEST_CASES`,
+  # which is global and would also inflate the smoke block). CI must set
+  # `FUZZ_CASES`, NEVER `PROPTEST_CASES`.
+  FUZZ_CASES: "4096"
+
+jobs:
+  capstone-deep:
+    name: capstone large-N (FUZZ_CASES=4096)
+    runs-on: ubuntu-latest
+    # A hang fails loudly instead of burning the CI budget.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Audit MED#2: FUZZ_CASES is the capstone knob, but the `proptest!` macro
+      # runs `contextualize_config()` which lets the global `PROPTEST_CASES`
+      # override it. Fail fast if it is set so a stray value can never silently
+      # skew the capstone N (the "CI sets FUZZ_CASES, never PROPTEST_CASES" rule,
+      # enforced rather than only documented).
+      - name: Guard — PROPTEST_CASES must be unset (use FUZZ_CASES)
+        shell: bash
+        run: |
+          if [ -n "${PROPTEST_CASES:-}" ]; then
+            echo "PROPTEST_CASES is set — it overrides FUZZ_CASES on the proptest macro and would skew the capstone N. Use FUZZ_CASES only." >&2
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - uses: taiki-e/install-action@nextest
+
+      # Per-case temp DBs are cleaned by U1's RAII fix, so a large-N run does not
+      # exhaust disk. Keep TMPDIR on the runner's REAL disk (RUNNER_TEMP), NOT a
+      # tmpfs, so the transient per-case SQLite files have room at depth.
+      - name: TMPDIR on disk
+        run: |
+          mkdir -p "${RUNNER_TEMP}/fuzz-tmp"
+          echo "TMPDIR=${RUNNER_TEMP}/fuzz-tmp" >> "$GITHUB_ENV"
+
+      - name: Capstone large-N (both online + offline)
+        working-directory: rust
+        # Only the capstone reads FUZZ_CASES; the smoke + manual-demo blocks keep
+        # their literal counts. --features test-support: required by the W2
+        # ReconcileGuard test seam (see rust-prro.yml). Both capstone tests run —
+        # the offline one carries the AUD-K8-1 / drain / manual-recon lane.
+        run: cargo nextest run -p prro --features test-support --locked -E 'test(/^harness_(online|offline)_seeded$/)'
+
+      # A find writes a regression seed to the pinned file. Surface it as a build
+      # artifact so the find is not lost when the ephemeral runner is torn down
+      # (retention 30d). `always()` so it uploads even though the test step above
+      # failed on the find; `if-no-files-found: ignore` so a CLEAN run (no seed)
+      # uploads nothing and stays quiet.
+      - name: Upload regression seed (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: invariant-fuzzer-regressions
+          path: rust/prro/tests/invariant_fuzzer.regressions
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # Reuse the U2 guard to surface a find as an ACTIONABLE failure: an
+      # uncommitted/untracked seed → exit 1 with the "commit this seed" message,
+      # so a nightly find is never silently dropped. A clean run (no seed) passes.
+      - name: Guard — surface an uncommitted fuzzer find
+        if: always()
+        shell: bash
+        run: bash rust/prro/tests/check_seed_committed.sh

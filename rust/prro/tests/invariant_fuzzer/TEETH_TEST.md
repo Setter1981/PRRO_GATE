@@ -68,10 +68,12 @@ cargo nextest run -p prro --features test-support \
 # 3) Restore the guard, re-run — GREEN again.
 ```
 
-> Note: the harness fixtures leak per-case temp DBs (`std::mem::forget` in
-> `interp.rs`). On a RAM-backed `/tmp`, point `TMPDIR` at a disk path for the
-> 256-case harness runs, e.g. `TMPDIR=$PWD/.fuzz_tmp cargo nextest ...`, and
-> remove it afterwards. (Tracked as a follow-up; see the Task 7 report.)
+> Note (historical): the harness fixtures USED to leak per-case temp DBs
+> (`std::mem::forget` in `interp.rs`). **Fixed by Phase-2 U1** — `FuzzCtx` now
+> owns the `TempDir` guards (declared after the pools, so the pools close first),
+> and per-case DBs are cleaned via RAII; depth is bounded by time, not disk.
+> (Pointing `TMPDIR` at a disk path is still wise for very large-N nightly runs —
+> the nightly does this; see `.github/workflows/fuzzer-nightly.yml`.)
 
 ## Expected finding
 
@@ -213,13 +215,24 @@ file because there is no `lib.rs`/`main.rs` in the walk-up from `tests/`). On a
 find, proptest writes the **minimal** failing seed there and **replays it first**
 on every later run (before any novel case).
 
+> Note (audit MED#1): both capstone tests (`harness_online_seeded` +
+> `harness_offline_seeded`) share this ONE file — proptest keys persistence by
+> *source file*, not test name. A seed found by one lane is therefore also
+> replayed by the other. Intentional and safe: `drive()` handles both modes, so a
+> non-failing input simply passes (no false failure); only provenance is shared
+> (the file does not record which lane found a seed). If per-lane provenance ever
+> matters, split into `_online`/`_offline.regressions`.
+
 **The workflow when the fuzzer finds a bug:**
 
 1. The capstone fails; proptest writes the shrunk seed to
    `rust/prro/tests/invariant_fuzzer.regressions`.
 2. **Commit that file** — `git add rust/prro/tests/invariant_fuzzer.regressions`.
    That single commit makes the case a **permanent regression**: it replays
-   first on every subsequent run, on every machine, forever. (Then fix the bug;
+   first on every subsequent run, on every machine — for as long as the `proptest`
+   version and the `op_sequence()` strategy stay compatible (a `proptest` bump or
+   a strategy change can invalidate the persisted format / replay; re-run the
+   corpus when bumping either). (Then fix the bug;
    the committed seed now guards the fix the way the hand-written teeth above do
    — usually no separate teeth test is needed.)
 
