@@ -50,7 +50,7 @@ a genuinely-stuck doc is still caught post-settle.)
 The teeth live in **two** places, both mode-independent:
 
 1. **Deterministic canary** — `teeth_aud_k8_1_rmr_redrive_makes_no_new_wire_call`
-   (`#[ignore]`-d; PASSES on main, FAILS on revert).
+   (now a CI gate — un-`#[ignore]`d 2026-06-17; PASSES on main, FAILS on revert).
 2. **Property harness** — `harness_offline_seeded` carries the same
    wire-call invariant (`shift_before == RMR ⇒ send_calls unchanged`), so the
    random search finds the same class of defect and **shrinks** it.
@@ -58,8 +58,8 @@ The teeth live in **two** places, both mode-independent:
 ## Run it
 
 ```bash
-# 1) Baseline (guard PRESENT): both must be GREEN.
-cargo nextest run -p prro --features test-support --run-ignored all \
+# 1) Baseline (guard PRESENT): both must be GREEN.  (Canary is now a normal CI test — no --run-ignored.)
+cargo nextest run -p prro --features test-support \
   -E 'binary(invariant_fuzzer) and test(teeth_aud_k8_1)'
 cargo nextest run -p prro --features test-support \
   -E 'binary(invariant_fuzzer) and test(harness_offline_seeded)'
@@ -147,8 +147,8 @@ abort the doc is `Aborted` (clean); without it the doc rests `SIGNED` →
 `invariant_scan` flags `StuckNonTerminalDoc`.
 
 The teeth here live in **one** place — the deterministic canary
-`teeth_p1_boot_resume_codepool_aborts` (`#[ignore]`-d; PASSES on main, FAILS on
-revert). Unlike AUD-K8-1, this class is NOT wired into the random property
+`teeth_p1_boot_resume_codepool_aborts` (now a CI gate — un-`#[ignore]`d
+2026-06-17; PASSES on main, FAILS on revert). Unlike AUD-K8-1, this class is NOT wired into the random property
 harness: `Crash(Sign)` is implemented (`interp::crash_after_sign`) but is
 **directed-only**, not generatively emitted. A context-free generator produces
 crash-after-sign sequences FOLLOWED by further issuance before a reboot (e.g.
@@ -161,9 +161,9 @@ until reboot while a crash is pending). See `strategy.rs::op` for the rationale.
 ## Run it
 
 ```bash
-# 1) Baseline (abort PRESENT): canary must be GREEN.
+# 1) Baseline (abort PRESENT): canary must be GREEN.  (Now a normal CI test — no --ignored.)
 cargo test -p prro --features test-support --test invariant_fuzzer \
-  -- --ignored teeth_p1_boot_resume_codepool_aborts
+  -- teeth_p1_boot_resume_codepool_aborts
 
 # 2) Disable both abort arms (above), re-run — it must FAIL.
 # 3) Restore, re-run — GREEN again.
