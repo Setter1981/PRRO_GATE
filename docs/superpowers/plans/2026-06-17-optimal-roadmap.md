@@ -5,6 +5,8 @@
 
 > **⚠ STATUS UPDATE (2026-06-17, post-merge):** **Phase 1 below (the P1 fix tranche) is DONE — P1 is FIXED + MERGED** (PR #196, merge `b858d75`; fix `c927d47`, teeth `440f335`). The shipped fix targets **2 arms** (the `OfflineAckOutcome::Refused` arms, on `CodePoolExhausted`), **not** "all four arms" — the two `PostSignRoute::Refused(_)` dispatcher arms are **deferred by design**. The current frontier is **Phase 2** (fuzzer durability, PR #197). Read the Phase-1 section and the "Fix P1 first" thesis below as a **historical record**, not a live to-do.
 
+> **⚠ STATUS UPDATE (2026-06-17, later — supersedes the frontier above):** Phase 2 (fuzzer durability) is now **MERGED** (#200/#201/#202) and the fuzzer is an **ENFORCED merge gate** (`x86_64-unknown-linux-gnu` required + `rust-prro-skip.yml` companion). **The Phase-3 section below is superseded by the authoritative spec `docs/superpowers/specs/2026-06-17-fuzzer-phase3-oracle-honesty-design.md` (PR #204)**, which redefines the D/C boundary after an external audit: **D1–D5 → WebCheck** (NOT Phase 3 — only O2's *narrow* deterministic crash-prediction slice is carved in); **O3 retargeted** to DB-integrity (canonical-truth → WebCheck); **C1 PROMOTED** to a minimal Phase-3 unit (a legal-cap blind spot an enforced gate must not silently certify); **O1 split** (scripted-convergence only, `ERROR_RETRYABLE` out, paired negative teeth). Read the Phase-3 bullets below as the *initial sketch* — the spec is authoritative.
+
 ---
 
 ## Thesis
