@@ -56,7 +56,8 @@ const BOOT_PHASE_SRC: &str = include_str!("../src/services/reconciliation/boot_p
 ///   - `cas_error_retryable_to_manual_reconciliation`  (ERROR_RETRYABLE → REQUIRES_MANUAL_RECONCILIATION) — helper
 ///   - `cas_error_retryable_budget_exhausted`          (ERROR_RETRYABLE → REQUIRES_MANUAL_RECONCILIATION) — helper
 ///   - branch (c) `Encrypted` reroute (inline)          (ENCRYPTED      → ERROR_RETRYABLE)              — helper
-const EXPECTED_HELPER_CALL_SITES: usize = 7;
+///   - `abort_signed_on_offline_code_exhaustion`        (SIGNED         → ABORTED)                      — helper (P1 boot twin of #192)
+const EXPECTED_HELPER_CALL_SITES: usize = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 struct CasCallSite {
@@ -104,6 +105,7 @@ fn parse_variant(variant: &str) -> DocState {
         "Cancelled" => DocState::Cancelled,
         "ErrorRetryable" => DocState::ErrorRetryable,
         "RequiresManualReconciliation" => DocState::RequiresManualReconciliation,
+        "Aborted" => DocState::Aborted,
         other => panic!(
             "boot_phase.rs CAS call site references an unknown `DocState::{other}`. \
              Either add the variant to DocState (and to this parser) or fix the typo."

@@ -27,7 +27,7 @@ use sqlx::SqlitePool;
 use tokio::sync::oneshot;
 
 use prro::db::models::enums::{
-    DocState, FiscalMode, NodeMode, OfflineSessionState, Protocol, ShiftState,
+    DocState, DocType, FiscalMode, NodeMode, OfflineSessionState, Protocol, ShiftState,
 };
 use prro::db::models::ids::{OfflineSessionId, RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
@@ -38,6 +38,8 @@ use prro::services::offline_sync::{backlog_drain, return_online_probe};
 use prro::services::reconciliation::{boot_phase, RuntimeView};
 use prro::services::write_path::inline;
 use prro::services::write_path::stage_sign::SigningContext;
+use prro::services::write_path::types::{CanonicalFiscalCommand, WorkerProcessResult};
+use prro::services::write_path::{stage_acquire, stage_sign};
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckSignBlob, StatusSnapshot};
 use prro::transports::dps::error::{AuthorizationKind, DpsError};
@@ -440,9 +442,16 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
         // ── crash (wire stages only — drop-injection) ──
         Op::Crash(Stage::Send) => crash_via_drop(ctx, Stage::Send).await,
         Op::Crash(Stage::Kvt1) => crash_via_drop(ctx, Stage::Kvt1).await,
-        // non-wire crash stages need stage-composition; deferred — see plan §4
-        // follow-up.  The generator never emits these (Crash drawn from
-        // {Send, Kvt1} only), so this arm is NOT reachable from op_sequence().
+        // P1: `Crash(Sign)` is the NON-wire crash (stage-composition, no DPS
+        // hang) — it commits a SIGNED doc then stops before dispatch, opening
+        // the boot-resume window the P1 abort closes.  DIRECTED-ONLY: the
+        // generator does NOT emit it (see strategy.rs — generative emission
+        // buries the SIGNED doc under later issuance, an unreachable production
+        // state); it is exercised by `teeth_p1_boot_resume_codepool_aborts`.
+        Op::Crash(Stage::Sign) => crash_after_sign(ctx).await,
+        // Remaining non-wire crash stages (OfflineAck) stay a documented
+        // follow-up; the generator never emits them, so this arm is NOT
+        // reachable from op_sequence().
         Op::Crash(stage) => unimplemented!(
             "Crash({stage:?}) (non-wire stage-composition) is a documented follow-up; \
              the generator only emits Crash(Send) / Crash(Kvt1)"
@@ -537,6 +546,78 @@ async fn crash_via_drop(ctx: &mut FuzzCtx, stage: Stage) -> RealOutcome {
         },
         Some(Ok(_)) => RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await),
         Some(Err(e)) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// `Crash(Sign)` — the NON-wire crash that opens the P1 boot-resume window.
+/// Unlike the wire crashes (`crash_via_drop`), there is no DPS await to hang;
+/// instead we drive the REAL pre-dispatch stages (`stage_acquire` →
+/// `stage_sign`) to COMMIT a `SIGNED` doc (real `stage_sign` advances the MAC
+/// tip correctly — no hand-seeded chain), then STOP — simulating a crash AFTER
+/// the sign commit but BEFORE post-sign dispatch.  The committed `SIGNED` doc
+/// survives to the next `Reboot`; on an Offline node with an EXHAUSTED code
+/// pool, boot reconciliation's offline-ack refuses
+/// `CodePoolExhausted` → the P1 abort (boot twin of #192).
+///
+/// Returns `Crashed{Sign}` so the harness treats it as a committed in-flight
+/// transient (suppresses the settled scan until the resolving Reboot), exactly
+/// like the wire crashes.  No code is consumed (the offline-ack never runs), so
+/// this works whether or not the pool is empty.
+async fn crash_after_sign(ctx: &mut FuzzCtx) -> RealOutcome {
+    let row = ctx.seed_inbox_sell().await;
+    // Build the canonical command from the seeded inbox row (mirrors
+    // inline's build_canonical for a SELL; source_sha == canonical for non-Z).
+    let command = CanonicalFiscalCommand {
+        doc_type: DocType::Sell,
+        business_ts: row
+            .business_ts
+            .clone()
+            .unwrap_or_else(|| "2026-06-09T12:00:00Z".into()),
+        total_sum_kop: row.total_sum_kop,
+        payload_json: row.payload_json.clone(),
+        payload_sha256_canonical: row.payload_sha256_canonical,
+        source_sha256: row.payload_sha256_canonical,
+        // Operator attribution is carried separately via the `driver_id` &str
+        // arg to stage_acquire; the command-level newtype fields are None (no
+        // signer-guard path runs in crash_after_sign — acquire + sign only).
+        signed_by_cashier_id: None,
+        driver_id: None,
+    };
+    let driver_id = row
+        .driver_id
+        .as_deref()
+        .expect("seed_inbox_sell sets driver_id");
+    let _guard = ctx.gate.clone().lock_owned().await;
+    // Stage 1: acquire (lease the inbox to PROCESSING + insert PREPARED).
+    let acq = match stage_acquire::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        driver_id,
+        row.request_id,
+        command,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return RealOutcome::Refused(format!("crash_after_sign acquire: {e:?}")),
+    };
+    let wctx = match acq {
+        WorkerProcessResult::Proceed(c) | WorkerProcessResult::Resumed(c) => c,
+        WorkerProcessResult::Noop => {
+            return RealOutcome::Refused("crash_after_sign acquire: unexpected Noop".into())
+        }
+        WorkerProcessResult::Rejected { reason } => {
+            return RealOutcome::Refused(format!("crash_after_sign acquire rejected: {reason:?}"))
+        }
+    };
+    // Stage 3: sign (commits SIGNED, advances the MAC tip).  Then STOP — the
+    // simulated crash lands HERE, before dispatch_post_sign.
+    match stage_sign::run(&ctx.pool, &ctx.sign_ctx, wctx).await {
+        Ok(_) => RealOutcome::Crashed {
+            stage: Stage::Sign,
+            committed_state: ctx.observe_doc_state_by_request_id(&row.request_id).await,
+        },
+        Err(e) => RealOutcome::Refused(format!("crash_after_sign sign: {e:?}")),
     }
 }
 

@@ -118,6 +118,62 @@ where
     Ok(outcome)
 }
 
+/// P1 — boot twin of fix #192.  A post-sign offline refusal with the
+/// TERMINAL `CodePoolExhausted` cause (the offline code pool is exhausted, so
+/// the offline ack can NEVER acquire a code for this doc) must Abort the
+/// dangling `SIGNED` doc.  Without this the doc rests non-terminal in `SIGNED`
+/// and a later online resurrection would wrongly ISSUE a check that was
+/// refused at offline-ack time — violating the ledger-only pin + Frozen
+/// Invariant #8 (recovery must not change the terminal outcome).  Mirrors the
+/// live path's `inline::terminalise_inbox` abort.
+///
+/// Standalone short `with_immediate` (CAS `SIGNED → Aborted` + audit), run as
+/// a follow-up AFTER `dispatch_post_sign` returns the refusal — NOT folded
+/// into the dispatcher's envelope.  Atomic by itself; a crash between the
+/// refusal commit and this abort tx re-aborts idempotently on the next boot.
+/// `from == SIGNED` on BOTH arcs (the PREPARED-resume chain has already
+/// signed the doc via `stage_sign` before the refusal — see arc 3514).
+///
+/// CAS-not-Applied is a BENIGN no-op (unlike the live `inline.rs` path, which
+/// errors): on a re-boot the doc is already `Aborted`/terminal, or a
+/// concurrent admin override moved it — `transition_with_audit` writes the
+/// audit ONLY on `Applied`, so the no-op is silent (the first boot already
+/// emitted `BOOT_DOC_ABORTED`).  No network / crypto (Frozen #1); boot is
+/// single-writer per FN (Frozen #2).
+///
+/// Returns whether the CAS Applied (`true` on the first, real abort).
+async fn abort_signed_on_offline_code_exhaustion(
+    pool: &SqlitePool,
+    doc_id: DocumentId,
+) -> anyhow::Result<bool> {
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            let outcome = transition_with_audit(
+                tx,
+                doc_id,
+                DocState::Signed,
+                DocState::Aborted,
+                "BOOT_DOC_ABORTED",
+                Severity::Warning,
+                || {
+                    serde_json::json!({
+                        "document_id": hex_lower(doc_id.as_bytes()),
+                        "from": "SIGNED",
+                        "reason": "CodePoolExhausted",
+                        "rationale":
+                            "boot post-sign offline refusal (terminal): offline ack \
+                             cannot acquire a code; resurrecting online later would \
+                             wrongly issue a refused check — mirrors live #192 abort",
+                    })
+                },
+            )
+            .await?;
+            Ok::<bool, anyhow::Error>(matches!(outcome, TransitionOutcome::Applied))
+        })
+    })
+    .await
+}
+
 /// Per W9 freeze §4.0: budget cap for `attempts_used(doc_id)` →
 /// `RequiresManualReconciliation` escalation in §4.8 ERROR_RETRYABLE
 /// pre-check.  Mirrors W0-3 §2 policy "retry up to
@@ -3466,7 +3522,7 @@ async fn dispatch_prepared_via_chain(
     // GoingOnline) → typed dispatcher refusal + audit; doc stays
     // in SIGNED.  See `services::write_path::dispatch`.
     use crate::services::write_path::dispatch::{self, PostSignRoute};
-    use crate::services::write_path::stage_offline_ack::OfflineAckOutcome;
+    use crate::services::write_path::stage_offline_ack::{OfflineAckOutcome, RefusalReason};
     match dispatch::dispatch_post_sign(pool, doc_id, &doc.fiscal_number).await {
         Ok(PostSignRoute::Online { .. }) => {
             // Existing M3a online ladder.  stage_send::run drives
@@ -3506,19 +3562,46 @@ async fn dispatch_prepared_via_chain(
                 OfflineAckOutcome::Applied { .. } => {
                     histogram.offline_local_ack_emitted += 1;
                 }
-                OfflineAckOutcome::Refused(_) => {
-                    // stage_offline_ack already emitted
-                    // OFFLINE_ACK_REFUSED audit; histogram bumps
+                OfflineAckOutcome::Refused(reason) => {
+                    // stage_offline_ack already emitted the
+                    // OFFLINE_ACK_REFUSED (WARN) audit; histogram bumps
                     // the same bucket as dispatcher-level refusal
                     // (both represent "doc not advanced").
                     histogram.write_path_dispatch_refused += 1;
+                    // P1 (boot twin of #192): a TERMINAL CodePoolExhausted
+                    // refusal must Abort the doc the chain just signed
+                    // (PREPARED→SIGNED, so from == SIGNED), else a later
+                    // online resurrection would wrongly ISSUE a check that was
+                    // refused at offline-ack time (ledger-only pin + Frozen
+                    // Invariant #8).  Other RefusalReasons (ShiftNotOpened /
+                    // NoActiveSession / …) are precondition-not-yet-met /
+                    // transient → left deferred (still SIGNED, audited above).
+                    if matches!(reason, RefusalReason::CodePoolExhausted) {
+                        if let Err(e) = abort_signed_on_offline_code_exhaustion(pool, doc_id).await
+                        {
+                            emit_dispatch_error(
+                                pool,
+                                doc_id,
+                                "c-prepared-offline-abort",
+                                &e,
+                                histogram,
+                            )
+                            .await?;
+                        }
+                    }
                 }
             }
         }
         Ok(PostSignRoute::Refused(_)) => {
-            // Dispatcher-level refusal (Blocked / StopMode /
-            // CryptoDegraded / GoingOnline).  WRITE_PATH_DISPATCH_REFUSED
-            // audit already emitted by dispatch_post_sign.
+            // Dispatcher-level refusal.  This arm is intentionally NOT given
+            // the P1 abort: on boot the node-wide modes that produce it are
+            // short-circuited BEFORE the per-doc loop — Blocked / StopMode /
+            // CryptoDegraded at branch_f, GoingOnline at branch_d.  The only
+            // cause that can surface here mid-pass is NodeBlocked (a sibling
+            // online doc tripping stage_send's W10.3 set_mode_blocked flip),
+            // which is operator-recoverable → defer (aborting would lose a
+            // legitimate in-flight doc).  WRITE_PATH_DISPATCH_REFUSED audit
+            // already emitted by dispatch_post_sign.
             histogram.write_path_dispatch_refused += 1;
         }
         Err(e) => {
@@ -3699,7 +3782,7 @@ async fn dispatch_pending_doc(
             // happens after any path that produces a SIGNED doc).
             Some(d) => {
                 use crate::services::write_path::dispatch::{self, PostSignRoute};
-                use crate::services::write_path::stage_offline_ack::OfflineAckOutcome;
+                use crate::services::write_path::stage_offline_ack::{OfflineAckOutcome, RefusalReason};
                 match dispatch::dispatch_post_sign(pool, doc_id, &doc.fiscal_number).await {
                     Ok(PostSignRoute::Online { .. }) => {
                         match stage_send::run(pool, d.dps, doc_id, Some(d.signing_ctx)).await {
@@ -3742,11 +3825,45 @@ async fn dispatch_pending_doc(
                         OfflineAckOutcome::Applied { .. } => {
                             histogram.offline_local_ack_emitted += 1;
                         }
-                        OfflineAckOutcome::Refused(_) => {
+                        OfflineAckOutcome::Refused(reason) => {
+                            // stage_offline_ack already emitted the
+                            // OFFLINE_ACK_REFUSED (WARN) audit.
                             histogram.write_path_dispatch_refused += 1;
+                            // P1 (boot twin of #192): a TERMINAL
+                            // CodePoolExhausted refusal must Abort the dangling
+                            // SIGNED doc, else a later online resurrection
+                            // would wrongly ISSUE a check refused at offline-ack
+                            // time (ledger-only pin + Frozen Invariant #8).
+                            // Other RefusalReasons (ShiftNotOpened /
+                            // NoActiveSession / …) are precondition-not-yet-met
+                            // / transient → left deferred (still SIGNED, audited
+                            // above).
+                            if matches!(reason, RefusalReason::CodePoolExhausted) {
+                                if let Err(e) =
+                                    abort_signed_on_offline_code_exhaustion(pool, doc_id).await
+                                {
+                                    emit_dispatch_error(
+                                        pool,
+                                        doc_id,
+                                        "c-signed-offline-abort",
+                                        &e,
+                                        histogram,
+                                    )
+                                    .await?;
+                                }
+                            }
                         }
                     },
                     Ok(PostSignRoute::Refused(_)) => {
+                        // Dispatcher-level refusal — intentionally NOT given the
+                        // P1 abort.  On boot the node-wide modes that produce it
+                        // are short-circuited BEFORE the per-doc loop (Blocked /
+                        // StopMode / CryptoDegraded at branch_f, GoingOnline at
+                        // branch_d); the only cause reachable here mid-pass is
+                        // NodeBlocked (a sibling online doc tripping stage_send's
+                        // W10.3 set_mode_blocked flip), operator-recoverable →
+                        // defer.  WRITE_PATH_DISPATCH_REFUSED audit already
+                        // emitted by dispatch_post_sign.
                         histogram.write_path_dispatch_refused += 1;
                     }
                     Err(e) => {

@@ -26,9 +26,19 @@ fn dps_script() -> impl Strategy<Value = DpsScript> {
     ]
 }
 
-/// One `Op` intent.  `Crash` is drawn ONLY from the implemented wire stages
-/// {Send, Kvt1}; the non-wire crash stages are NOT emitted (stage-composition
-/// follow-up, plan §4), so no generated op can hit `unimplemented!`.
+/// One `Op` intent.  `Crash` is drawn ONLY from the wire stages {Send, Kvt1}
+/// (drop-injection).  `Crash(Sign)` IS implemented (commit SIGNED, stop before
+/// dispatch — see `interp::crash_after_sign`) and is exercised by the directed
+/// P1 teeth canary `teeth_p1_boot_resume_codepool_aborts`, but it is NOT emitted
+/// generatively: a crash-after-sign that is FOLLOWED by further issuance before
+/// a reboot (which the context-free generator produces, e.g. `[Crash(Sign),
+/// OnlineSell, …]`) buries the SIGNED doc under a later-issued doc — an
+/// UNREACHABLE production state (single-writer + boot-recon-before-serve means a
+/// crashed process serves no new request before recovery).  Surfacing that
+/// artifact in the generative net is a separate harness-realism follow-up (model
+/// "no new op until reboot" while a crash is pending).  The non-wire stage
+/// {OfflineAck} stays unimplemented; neither is generated, so no generated op
+/// can hit `unimplemented!`.
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         // ── valid (wire ops carry a DpsScript) ──
@@ -37,7 +47,8 @@ fn op() -> impl Strategy<Value = Op> {
         dps_script().prop_map(Op::GoOnline),
         dps_script().prop_map(Op::Drain),
         Just(Op::Reboot),
-        // ── crash — wire stages only (drop-injection implemented) ──
+        // ── crash — wire stages only (drop-injection); Crash(Sign) is directed-
+        //    only (see fn doc), not generated, to avoid the buried-SIGNED artifact ──
         prop_oneof![Just(Stage::Send), Just(Stage::Kvt1)].prop_map(Op::Crash),
         // ── invalid / re-entry / replay (first-class intents) ──
         Just(Op::RepeatDrain),
