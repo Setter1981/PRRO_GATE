@@ -101,6 +101,12 @@ pub enum RealOutcome {
 pub struct FuzzCtx {
     pub pool: SqlitePool,
     pub pool_secure: SqlitePool,
+    /// RAII guards for the two per-case temp-DB directories. Declared **after**
+    /// the pools so Rust's declaration-order drop closes the pools first, then
+    /// these remove the directories — cleanup never races a live connection.
+    /// Held only for their `Drop`; never read.
+    _tempdir: tempfile::TempDir,
+    _tempdir_secure: tempfile::TempDir,
     sign_ctx: SigningContext,
     fn_sign: CheckSignBlob,
     gate: Arc<tokio::sync::Mutex<()>>,
@@ -116,14 +122,16 @@ pub struct FuzzCtx {
 impl FuzzCtx {
     /// Fixture: a fresh DB with an ONLINE node + open shift.
     pub async fn new_online_open_shift() -> Self {
-        let pool = fresh_pool().await;
-        let pool_secure = fresh_secure_pool().await;
+        let (pool, _tempdir) = fresh_pool().await;
+        let (pool_secure, _tempdir_secure) = fresh_secure_pool().await;
         seed_fn_config(&pool).await;
         let shift_id = seed_open_shift(&pool).await;
         seed_node_state(&pool, NodeMode::Online, shift_id).await;
         Self {
             pool,
             pool_secure,
+            _tempdir,
+            _tempdir_secure,
             sign_ctx: det_signing_ctx(),
             fn_sign: fn_sign_blob(),
             gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -139,8 +147,8 @@ impl FuzzCtx {
     /// session carrying `codes` offline codes (the offline lane is fixture-
     /// seeded — there is no go_offline op, spec §5).
     pub async fn new_offline_open_shift(codes: i64) -> Self {
-        let pool = fresh_pool().await;
-        let pool_secure = fresh_secure_pool().await;
+        let (pool, _tempdir) = fresh_pool().await;
+        let (pool_secure, _tempdir_secure) = fresh_secure_pool().await;
         seed_fn_config(&pool).await;
         let shift_id = seed_open_shift(&pool).await;
         seed_node_state(&pool, NodeMode::Offline, shift_id).await;
@@ -151,6 +159,8 @@ impl FuzzCtx {
         Self {
             pool,
             pool_secure,
+            _tempdir,
+            _tempdir_secure,
             sign_ctx: det_signing_ctx(),
             fn_sign: fn_sign_blob(),
             gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -951,18 +961,21 @@ fn doc_state_from_str(s: &str) -> DocState {
     }
 }
 
-async fn fresh_pool() -> SqlitePool {
+/// Returns the pool **and** its backing `TempDir` guard. The caller (`FuzzCtx`)
+/// must hold the guard for the pool's lifetime: dropping it removes the per-case
+/// DB directory (RAII), replacing the old `std::mem::forget` leak.
+async fn fresh_pool() -> (SqlitePool, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fuzz.db");
-    std::mem::forget(dir);
-    open_pool(&path).await.unwrap()
+    let pool = open_pool(&path).await.unwrap();
+    (pool, dir)
 }
 
-async fn fresh_secure_pool() -> SqlitePool {
+async fn fresh_secure_pool() -> (SqlitePool, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fuzz-secure.db");
-    std::mem::forget(dir);
-    open_secure_pool(&path).await.unwrap()
+    let pool = open_secure_pool(&path).await.unwrap();
+    (pool, dir)
 }
 
 async fn seed_fn_config(pool: &SqlitePool) {
@@ -1084,6 +1097,47 @@ async fn seed_inbox_sell_keyed(pool: &SqlitePool, idem: &str) -> InboxRow {
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
+
+/// Phase-2 U1 (spec §3 / acceptance A1): per-case temp DBs are cleaned when
+/// their owning `FuzzCtx` drops — no `std::mem::forget` leak. Measured in an
+/// isolated `TMPDIR` so the count reflects only this harness, not global /tmp
+/// noise. `nextest` runs each test in its own process, so mutating the
+/// process-global `TMPDIR` here does not race other tests.
+#[tokio::test]
+async fn fuzz_ctx_drop_cleans_per_case_temp_dbs() {
+    // `base` is created under the original temp dir, then becomes the isolated
+    // `TMPDIR` into which every subsequent `tempfile::tempdir()` (inside
+    // `fresh_pool` / `fresh_secure_pool`) is created.
+    let base = tempfile::tempdir().unwrap();
+    let prior_tmpdir = std::env::var_os("TMPDIR");
+    std::env::set_var("TMPDIR", base.path());
+
+    let count = || std::fs::read_dir(base.path()).unwrap().count();
+    assert_eq!(count(), 0, "isolated TMPDIR must start empty");
+
+    // Create + drop many ctxs. With the `mem::forget` leak each iteration
+    // forgets two `TempDir`s (pool + pool_secure) → the dir count grows
+    // monotonically (32 leaked dirs after 16 iterations). Under RAII the count
+    // returns to zero after every drop.
+    for _ in 0..16 {
+        let ctx = FuzzCtx::new_online_open_shift().await;
+        drop(ctx);
+    }
+
+    let leaked = count();
+
+    // Restore TMPDIR before asserting so a RED failure does not leave the
+    // process env pointing at a since-deleted dir.
+    match prior_tmpdir {
+        Some(v) => std::env::set_var("TMPDIR", v),
+        None => std::env::remove_var("TMPDIR"),
+    }
+
+    assert_eq!(
+        leaked, 0,
+        "FuzzCtx drop must remove every per-case temp DB dir (no mem::forget)"
+    );
+}
 
 #[tokio::test]
 async fn valid_three_op_online_sell_sequence_all_reach_ack() {
