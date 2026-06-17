@@ -3577,8 +3577,7 @@ async fn dispatch_prepared_via_chain(
                     // NoActiveSession / …) are precondition-not-yet-met /
                     // transient → left deferred (still SIGNED, audited above).
                     if matches!(reason, RefusalReason::CodePoolExhausted) {
-                        if let Err(e) =
-                            abort_signed_on_offline_code_exhaustion(pool, doc_id).await
+                        if let Err(e) = abort_signed_on_offline_code_exhaustion(pool, doc_id).await
                         {
                             emit_dispatch_error(
                                 pool,
