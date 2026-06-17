@@ -8,13 +8,19 @@
 
 ---
 
-## P1 — REAL PRODUCTION GAP (architect-verified, HIGH): boot SIGNED-resume on a post-sign refusal does not abort the dangling doc — the boot-path twin of #192
+## P1 — REAL PRODUCTION GAP (PROVEN end-to-end, HIGH): boot post-sign-refusal resume does not abort the dangling doc — the boot-path twin of #192
 
-**Class:** FALSE-NEGATIVE (fuzzer cannot reach it) **over a real production durability hole.** · **Lens:** C/E (Auditor 3 F2). · **Confidence:** HIGH on the asymmetry (every fact below is code-confirmed); the open question is the terminal-vs-deferral semantics, a triage call.
+**Class:** FALSE-NEGATIVE (fuzzer cannot reach it) **over a real production durability hole.** · **Lens:** C/E (Auditor 3 F2). · **Confidence:** PROVEN — upgraded from "HIGH/static read" to **dynamic end-to-end repro** (2026-06-17). A `#[tokio::test]` boots the full `App`, seeds the crash-recovery shape, runs the production boot driver `App::reconcile_pending_with → run_boot_reconciliation`, and observes the doc left stuck in `SIGNED`. See **VERIFICATION VERDICT** below. The terminal-vs-deferral semantics is no longer "open" — the live path already settled it (it aborts), so the boot asymmetry is the bug.
 
-**The gap.** The #192 fix aborts a dangling `{PREPARED,SIGNED}` doc → `Aborted` **only inside the live `inline::run` path** (`inline.rs:254-311` `terminalise_inbox`, the `PostSignRoute::Refused` arm). The **boot-resume path was not given the same fix**:
-- `boot_phase.rs:3745` — boot `DocState::Signed` resume, `Ok(PostSignRoute::Offline { outcome: OfflineAckOutcome::Refused(_) })` → **only** `histogram.write_path_dispatch_refused += 1`. No transition, no abort.
-- `boot_phase.rs:3749` — `Ok(PostSignRoute::Refused(_))` → **only** the histogram bump. The doc stays in `SIGNED`.
+**The gap.** The #192 fix aborts a dangling `{PREPARED,SIGNED}` doc → `Aborted` **only inside the live `inline::run` path** (`inline.rs:254-311` `terminalise_inbox`; the live `PostSignRoute::Refused` arm at `inline.rs:615-617` and `OfflineAckOutcome::Refused` arm at `inline.rs:631-636` both terminalise → `Aborted`). The **boot-resume path was not given the same fix — and the defect spans BOTH boot resume entry points** (blast radius wider than first recorded; verified by direct read):
+- **SIGNED-resume** (`dispatch_pending_doc`, `DocState::Signed` arm — a doc that crashed *after* the SIGN commit):
+  - `boot_phase.rs:3745` — `Ok(PostSignRoute::Offline { outcome: OfflineAckOutcome::Refused(_) })` → **only** `histogram.write_path_dispatch_refused += 1`. No transition, no abort.
+  - `boot_phase.rs:3750` — `Ok(PostSignRoute::Refused(_))` → **only** the histogram bump.
+- **PREPARED-resume** (`dispatch_prepared_via_chain` — a doc that crashed in `PREPARED`; boot drives `stage_sign::run` PREPARED→SIGNED, then dispatches post-sign):
+  - `boot_phase.rs:3514` — `Ok(PostSignRoute::Offline { outcome: OfflineAckOutcome::Refused(_) })` → **only** the histogram bump.
+  - `boot_phase.rs:3522` — `Ok(PostSignRoute::Refused(_))` → **only** the histogram bump.
+
+  In every one of the four arms the doc is left resting in `SIGNED`. A fix that patches only the `DocState::Signed` arm would leave `PREPARED → SIGNED → refused` orphans on the chain path — the fix contract must cover both entry points.
 
 **Why it is reachable (verified):**
 - A SIGNED doc *does* enter the boot pending-dispatch set: `list_pending_for_fn` (`fiscal_documents.rs:493`) selects `state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')`, and boot has a live `DocState::Signed` dispatch arm.
@@ -23,14 +29,25 @@
 
 **Consequence.** A stuck non-terminal `SIGNED` row resting in `fiscal_documents` = a ledger-only-pin violation (the ledger is issued-receipts + transport-class `Sending`/`ErrorRetryable` only). It is the precise invariant #192 closed, re-opened on the boot branch. Compounding (X1 below): the `StuckNonTerminalDoc` scan that *would* catch it is **test-only** — never run in production — so nothing surfaces it at runtime.
 
-**Severity nuance (do not oversell).** Leaving a SIGNED doc resting at boot is *defensible deferral* for a **transient-mode** refusal (`GoingOnline`/`Blocked` that later clears → the doc dispatches on a subsequent boot). It is a genuine **orphan** only for a **terminal** refusal — primarily `CodePoolExhausted`, which will not clear. The fix must distinguish the two, exactly as the live path's #192 design already does.
+**Severity nuance (do not oversell).** Leaving a SIGNED doc resting at boot is *defensible deferral* for a **transient-mode** refusal (`GoingOnline`/`Blocked`/`StopMode`/`CryptoDegraded` that later clears → the doc dispatches on a subsequent boot). It is a genuine **orphan** only for a **terminal** refusal — primarily `CodePoolExhausted`, which will not clear while the FN stays offline. The fix must distinguish the two, exactly as the live path's #192 design already does — and the asymmetry is the bug: a crash-then-reboot must not change a doc's terminal outcome (Frozen Invariant #8). On reboot in the *terminal* subset the live path would have produced `Aborted`; boot produces a resting `SIGNED` that the next online boot will **resurrect and send** → a refused operation becomes an issued receipt (the exact #192 blast radius).
 
 **Why the fuzzer cannot reach it.** The alphabet has no `Crash(Sign)` stage (only `Crash(Send|Kvt1)` — see O4) and no op that sets a refusing node mode at boot. So the fuzzer can never seed "a SIGNED doc + a refusing mode at reboot." This is a fixture/alphabet blind spot sitting directly over the #192 fix's incomplete edge.
 
+**VERIFICATION VERDICT (2026-06-17) — REPRODUCED, terminal subset reachable.**
+An ignored `#[tokio::test]` repro (`p1_boot_resume_signed_refused_repro.rs`, run under `--features test-support --run-ignored`) booted the full `App`, seeded a committed `SIGNED` SELL doc on an **OFFLINE** node with an **empty `offline_codes` pool** (→ `acquire_code_tx` returns `Ok(None)` → `OfflineAckOutcome::Refused(CodePoolExhausted)`, `offline_sessions.rs:408`), and ran the production driver `App::reconcile_pending_with`. Observed runtime evidence:
+- `doc state after boot = SIGNED` (the live path would have `Aborted` it).
+- boot summary counters: `write_path_dispatch_refused: 1`, `branch_d_offline_refusal: 0`, `signed_deferred: 0`, `signed_dispatched: 0`, `offline_local_ack_emitted: 0` — i.e. the doc **reached the per-doc dispatcher and traversed exactly the `boot_phase.rs:3745` arm** (not short-circuited, not deferred, not advanced).
+- `invariant_scan::scan` returns `StuckNonTerminalDoc { state: "SIGNED" }` for the doc.
+
+This is the precise terminal subset the verification was asked to confirm: a real SIGNED-survivor crash + reboot into offline-without-codes leaves a durable ledger-only-pin violation. **Confidence is now dynamic, not inferred.**
+
+*Distinction worth recording (the fallback case is NOT the same arm):* the companion `BLOCKED`-mode variant also leaves the doc `SIGNED`, but its counters were `branch_f_blocked: 1`, `write_path_dispatch_refused: 0` — it is short-circuited by the node-wide **`branch_f`** mode skip and **never reaches the `3745`/`3750` dispatcher arms**. That variant therefore demonstrates a *separate* concern — `invariant_scan` over-flagging a **transient-mode** resting doc (a scan-gate issue in the O-series family), not the P1 abort-asymmetry. Do not cite the BLOCKED case as evidence of the dispatcher-Refused arm; the OFFLINE+exhausted case is the load-bearing proof.
+
 **Recommended action (triage contract, NOT a unilateral fix — hot-zone boot reconciliation):**
-1. Decide the semantics: at boot, a `PostSignRoute::Refused` / `OfflineAckOutcome::Refused` that is **terminal** (`CodePoolExhausted`, and any other non-clearing reason) must abort the dangling SIGNED doc → `Aborted` in the same envelope, reusing the live path's `terminalise_inbox` abort; a **transient-mode** refusal stays deferred (current behaviour, correct).
-2. Close the fuzzer blind spot in the same tranche: add a `Crash(Sign)` stage + a mode-forcing op so `Crash(Sign) → boot-in-refusing-mode` is expressible; then the harness `StuckNonTerminalDoc` scan bites it as a regression gate.
-3. Separately consider X1 (wire a cheap `StuckNonTerminalDoc` subset into `run_boot_reconciliation`'s tail so this class is a *runtime* guard, not only a test oracle).
+1. Decide the semantics: at boot, a `PostSignRoute::Refused` / `OfflineAckOutcome::Refused` that is **terminal** (`CodePoolExhausted`, and any other non-clearing reason) must abort the dangling SIGNED doc → `Aborted` in the same envelope, reusing the live path's `terminalise_inbox` abort; a **transient-mode** refusal stays deferred (current behaviour, correct). **Apply symmetrically to all four arms** (SIGNED-resume `3745`/`3750` + PREPARED-resume `3514`/`3522`).
+2. RED pin: the implementer lands the verified offline-exhausted repro (source preserved in the appendix below) as a kept regression test — RED against current code, GREEN once the symmetric abort lands. Per role split this is the implementer's test-first starting point.
+3. Close the fuzzer blind spot in the same tranche: add a `Crash(Sign)` stage + a mode-forcing op so `Crash(Sign) → boot-in-refusing-mode` is expressible; then the harness `StuckNonTerminalDoc` scan bites it as a regression gate.
+4. Separately consider X1 (wire a cheap `StuckNonTerminalDoc` subset into `run_boot_reconciliation`'s tail so this class is a *runtime* guard, not only a test oracle). Note: a runtime scan would also flag the *transient* BLOCKED case above, so it must be mode-gated (the same SETTLED scan-gate the O-series flags).
 
 ---
 
@@ -92,7 +109,7 @@
 
 ## Recommended next actions (ranked)
 
-1. **P1 triage contract** — the only confirmed real bug. Decide terminal-vs-deferral semantics for boot post-sign refusal; abort the terminal subset; add `Crash(Sign)`+mode-forcing op to make it a fuzzer regression gate. *(Hot-zone — plan-first + implementer, per role split.)*
+1. **P1 fix contract** — the only confirmed real bug, now **PROVEN end-to-end** (terminal subset reachable; see VERIFICATION VERDICT). Lock the fix contract: abort the terminal-refusal subset (`CodePoolExhausted` + any non-clearing reason) → `Aborted` reusing `terminalise_inbox`, applied **symmetrically to all four boot arms** (SIGNED-resume `3745`/`3750` + PREPARED-resume `3514`/`3522`); leave transient-mode refusals deferred. Implementer lands the verified repro (`rust/prro/tests/p1_boot_resume_signed_refused_repro.rs`, currently `#[ignore]`d, GREEN = bug present) as the fixture, plus a RED pin asserting `Aborted`; then closes the fuzzer blind spot (`Crash(Sign)` + mode-forcing op) so `StuckNonTerminalDoc` gates it. *(Hot-zone — plan-first + implementer, per role split.)*
 2. **Brief honesty corrections** — crash model is 2/8 stages (O4); chain linkage is referential-only (O3). *(Applied in this pass.)*
 3. **Oracle teeth tranche** — O1 (drive online convergence at settle), O2 (differential/bound the Crash/Reboot faults), O5 (filtered ArtifactNoResend scan). These three are the highest-leverage false-negative closures.
 4. **Model vacuity tranche** — D1 (derive next_lnd), D2 (predict+assert mode/shift) — convert silent adoption into independent cross-checks.
