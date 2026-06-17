@@ -74,7 +74,7 @@ arbitrary recovery (Phase 2). A byte-differential vs. the predecessor product (P
 4. **Reference model.** In-memory predictor of the expected ledger (§6).
 5. **Oracle.** The three-layer assertion engine (§7) + mirror-drift checks (§8).
 
-Determinism: `synchronous=FULL`. Crash injection uses the **two mechanisms the kill-point matrix already
+Determinism (corrected 2026-06-17): replay comes from the persisted `proptest` seed + the single-threaded current-thread runtime — **not** from `synchronous=FULL`, which is a SQLite durability/fsync PRAGMA unrelated to RNG or generation order. (Persistence is on by default — `SourceParallel("proptest-regressions")` — but today the seed file is uncommitted and `RngSeed::Random` is used, so a find only reproduces via that file; see the Phase-2 durability spec.) Crash injection uses the **two mechanisms the kill-point matrix already
 uses** — implementers must NOT invent timing hooks inside a DB transaction: (a) **drop-injection** for a
 crash at a **wire await** (the DPS stub hangs on the send / lastChk call and the test drops the in-flight
 future — "committed survives, in-flight rolls back"); (b) **stage-composition / manual CAS** for a crash
@@ -166,7 +166,7 @@ them inside random *sequences*, not just the isolated K-tests.
 ## 10. Reused vs. new (build scope)
 
 **Reused (~60% scaffolded):** `invariant_scan` (`invariant_scan.rs`); the cancellation-injection crash
-model and kill-point assertions (`kill_point_matrix.rs`); the determinism seams (`synchronous=FULL`,
+model and kill-point assertions (`kill_point_matrix.rs`); the reused seams (`synchronous=FULL` [durability PRAGMA, not a determinism seam],
 `inline::run`, `backlog_drain::drain`, `run_boot_reconciliation`, `return_online_probe::run_tick_for_fn`,
 **fixture** node-mode setters); the `OFFLINE_ISSUED_STATES` SSOT predicate.
 

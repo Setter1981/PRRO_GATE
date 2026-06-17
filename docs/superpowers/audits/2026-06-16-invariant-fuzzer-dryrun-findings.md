@@ -6,6 +6,13 @@
 
 **Headline:** the dry-run surfaced **one likely-real production durability gap** (P1, the boot-resume twin of bug #192), plus a coherent set of oracle false-negative / model-drift / coverage findings. Several were convergent across lenses. This is the intended ROI: the internal pass found a probable real bug *before* external handoff.
 
+> **⚠ ERRATA (2026-06-17, post-merge — read before acting on this doc):**
+> 1. **P1 is FIXED + MERGED** (PR #196, merge `b858d75`). The "P1 fix contract" next-action below (L112) is **DONE** — do not re-commission it.
+> 2. **The shipped fix = 2 arms, not 4.** The "fix must cover both entry points / apply symmetrically to **all four arms**" contract (L23, L47, L112) was **revised during implementation**: only the two `OfflineAckOutcome::Refused` arms abort (on `CodePoolExhausted`); the two `PostSignRoute::Refused(_)` dispatcher arms (`3522`/`3750`) are **deferred by design** (node-wide modes short-circuit before the per-doc loop). See `[[project_fuzzer_finding_p1_boot_resume_refusal]]`.
+> 3. **X3's mechanism is wrong** (L95): proptest persistence is **ON by default** (`SourceParallel("proptest-regressions")`), not absent. The real gap is the **uncommitted** seed file + `RngSeed::Random`, **not** a missing `failure_persistence`. See the corrected Phase-2 durability spec.
+> 4. **Crash(Sign) is now implemented** (directed-only, the P1 teeth canary) — O4's "no `Crash(Sign)` stage / OfflineAck-window unreachable" is partially stale (`OfflineAck` stage remains unimplemented).
+> 5. Specific `boot_phase.rs` line numbers (`3745`/`3750`/`3514`/`3522`) drifted post-merge — use the arm descriptions as anchors.
+
 ---
 
 ## P1 — REAL PRODUCTION GAP (PROVEN end-to-end, HIGH): boot post-sign-refusal resume does not abort the dangling doc — the boot-path twin of #192
