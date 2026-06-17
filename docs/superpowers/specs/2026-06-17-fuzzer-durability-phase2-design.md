@@ -36,7 +36,7 @@ Architect-verified by direct read (the implementer's ШАГ-0 re-confirms before
 
 - **Leak:** `std::mem::forget(dir)` at `rust/prro/tests/invariant_fuzzer/interp.rs:957` and `:964` (two sites). The `dir` is a `tempfile::TempDir`; it is forgotten so it is not dropped (and thus does not delete the SQLite file) at the end of the fixture-setup fn while the `SqlitePool` still references it.
 - **Case counts are hard-coded:** `ProptestConfig { cases: 64, .. }` (`invariant_fuzzer.rs:287`), `cases: 256` (`:305`, `:1195`). An explicit `cases:` literal **overrides** the `PROPTEST_CASES` env var, so today depth cannot be raised from the environment.
-- **Persistence is already ON (dry-run X3 was imprecise):** none of those `ProptestConfig` literals set `failure_persistence`, so `ProptestConfig::default()` applies → `Some(FileFailurePersistence::SourceParallel)` → proptest *does* write `prro/.proptest-regressions/<module>.txt` on a find. `.proptest-regressions/` is **not** gitignored. The real gap is therefore **discipline** (seeds are not committed, CI does not enforce), **not** "persistence is off". The implementer re-confirms empirically (§4 ШАГ-0).
+- **Persistence is already ON (dry-run X3 was imprecise):** none of those `ProptestConfig` literals set `failure_persistence`, so `ProptestConfig::default()` applies → `Some(FileFailurePersistence::SourceParallel("proptest-regressions"))` → proptest *does* write a seed file on a find. ⚠ **Path correction (review F1):** the default dir is **`proptest-regressions` (NO leading dot)**, written *source-parallel* — for an integration test at `rust/prro/tests/invariant_fuzzer.rs` the actual file is something like `rust/prro/tests/proptest-regressions/invariant_fuzzer.txt`, **not** `.proptest-regressions`. The earlier `.proptest-regressions` claim (and the `git check-ignore` on it) was a wrong-path false-positive — DO NOT rely on it. The exact write path for THIS integration-test target must be confirmed empirically (§4 ШАГ-0) or pinned by explicit config. The real gap is **discipline** (seeds not committed, CI does not enforce), **not** "persistence is off".
 - **Historical finds already have directed teeth:** AUD-K8-1, the #192 model-mirror, and P1 (`teeth_p1_boot_resume_codepool_aborts` + 2 kept pins) — do **not** duplicate; reference them.
 
 ## §3 Unit 1 — temp-DB-leak fix (foundation)
@@ -56,33 +56,34 @@ Architect-verified by direct read (the implementer's ШАГ-0 re-confirms before
 
 **Goal (G2).** Every find leaves a committed seed → permanent regression; CI refuses to drop a find silently.
 
-**ШАГ-0 (verify the baseline — dry-run was imprecise).** Confirm empirically that persistence is on by default: temporarily break an invariant so a `proptest!` block fails, confirm `prro/.proptest-regressions/<module>.txt` is written with the shrunk seed, confirm a re-run replays that seed **first**, then restore. If persistence is in fact disabled anywhere (an explicit `failure_persistence: None`) or `SourceParallel` does not write from an integration-test target, report (§9) — it changes the approach.
+**ШАГ-0 (verify the baseline AND pin the path — review F1).** Temporarily break an invariant so a `proptest!` block fails; observe **where proptest actually writes the seed** (expect `…/proptest-regressions/<file>.txt`, NO leading dot, source-parallel — confirm the exact path for this integration-test target), confirm a re-run replays that seed **first**, then restore. If persistence is disabled anywhere (explicit `failure_persistence: None`) or `SourceParallel` does not write from an integration-test target, report (§9).
+**Path decision (F1, locked):** prefer **explicit, deterministic config** over the quirky default — set `failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("regressions")))` (or `Direct(<committed path>)`) so the seed lands at a single known, committed location regardless of proptest's integration-test path resolution. Track + guard **that** path. Do NOT track/guard `.proptest-regressions` (wrong path).
 
 **Approach (the real gap = commit + enforce, not "turn on").**
-1. Put `prro/.proptest-regressions/` under git (track the directory; `.gitkeep` if empty). It is already not gitignored.
+1. Pin the regression dir via explicit `failure_persistence` (above), put **that exact dir** under git (`.gitkeep` if empty). Confirm it is not gitignored.
 2. Document the workflow — "a find → commit its seed file = a permanent regression" — in the fuzzer's `TEETH_TEST.md` (or a fuzzer CONTRIBUTING section).
-3. Add a CI guard: a PR fails if a fuzzer run left an **uncommitted** `.proptest-regressions/*` change (i.e. a find that wasn't pinned). This makes pinning mandatory, closing the silent-drop hole.
+3. CI guard (F2 — must catch UNTRACKED, not just modified): a PR/CI run fails if a fuzzer run left an **uncommitted OR untracked** seed under the regression dir. Use `git status --porcelain -- <regressions-path>` (non-empty ⇒ fail) or `git ls-files --modified --others --exclude-standard -- <regressions-path>` (non-empty ⇒ fail). **Do NOT use `git diff --exit-code`** — it misses newly-created (untracked) seed files, which is exactly the silent-drop case this guard must close.
 4. Do **not** re-pin historical finds — AUD-K8-1 / #192 / P1 already have directed teeth; reference them.
 
 **Acceptance (A2).**
-- A planted-bug seed is written + replays-first on re-run.
-- `.proptest-regressions/` is tracked.
-- The CI guard fails on an uncommitted seed and passes on a clean tree.
+- A planted-bug seed is written to the **pinned** path + replays-first on re-run.
+- The pinned regression dir is tracked.
+- The CI guard fails on an **untracked** seed (verify with a freshly-created file), fails on a modified one, and passes on a clean tree.
 
 ## §5 Unit 3 — CI integration (PR-time small N + nightly large-N)
 
 **Goal (G3).** Fast PR gate; deep nightly; finds persist + surface. **Depends on U1 (no leak at depth) + U2 (persistence mechanism).**
 
-**ШАГ-0.** The hard-coded `cases` literals override `PROPTEST_CASES`. Decide: read `PROPTEST_CASES` (env-driven default) or drop the literal so `ProptestConfig::default()` reads the env. Keep the PR-time default **small** (today's 64/256).
+**ШАГ-0 (scope the target — review F3).** There are **multiple** hard-coded `cases` sites (`invariant_fuzzer.rs:287` =64, `:305` =256, `:1195` =256), and they are NOT all equal: some are smoke/demo-style runners, (at least) one is the real capstone harness. **Classify each** `proptest!` block as *capstone* (the genuine generative fuzzer — the only one worth running deep) vs *helper/smoke* (fixed, cheap; inflating it nightly is pure waste). Env-N must target **only the capstone harness(es)**; helper runners keep their small fixed counts. An explicit `cases:` literal overrides `PROPTEST_CASES`, so the capstone block must read the env (or drop its literal); helper blocks must KEEP their literal so the env does not touch them.
 
 **Approach.**
-1. Make the case count **env-overridable** — PR-time keeps the small default; nightly sets `PROPTEST_CASES` high.
-2. Add a **nightly** workflow (`.github/workflows`, `schedule:` cron) that runs the fuzzer at large-N, `--features test-support`, with **`TMPDIR` on disk** (relies on U1).
-3. A nightly find must **persist** its seed (U2) **and surface** — upload `.proptest-regressions/` as a build artifact and fail loudly (optionally open an issue). PR-time behavior unchanged.
+1. Make **only the capstone** case count env-overridable — read `PROPTEST_CASES` (or a dedicated knob, e.g. `FUZZ_CASES`, to avoid coupling to proptest's global env) for the capstone; PR-time default stays small; nightly raises it. Helper/smoke blocks stay fixed. State in code-comment which block is which and why.
+2. Add a **nightly** workflow (`.github/workflows`, `schedule:` cron) that runs the **capstone** fuzzer at large-N, `--features test-support`, with **`TMPDIR` on disk** (relies on U1).
+3. A nightly find must **persist** its seed (U2) **and surface** — upload the pinned regressions dir as a build artifact and fail loudly (optionally open an issue). PR-time behavior unchanged.
 
 **Acceptance (A3).**
-- `PROPTEST_CASES` drives N (verified locally).
-- A nightly workflow exists and runs the fuzzer at large-N.
+- The env knob drives N for the **capstone only** (verify: setting it high does NOT inflate helper/smoke runners — confirm their case count is unchanged).
+- A nightly workflow exists and runs the capstone fuzzer at large-N.
 - A planted find in the nightly path produces a persisted + surfaced seed.
 
 **Constraint.** The nightly job must **not** become a required PR status check (branch protection) — it would sit "pending/expected" on every PR and block merges. Keep it off the required-checks list (see the `fmt-clippy.yml` vs `rust-prro.yml` precedent: only `fmt + clippy (gnu)` is required).
