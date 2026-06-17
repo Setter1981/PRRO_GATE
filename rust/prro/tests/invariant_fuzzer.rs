@@ -1192,6 +1192,43 @@ fn drive(ops: &[Op], offline: bool) {
     });
 }
 
+/// Phase-2 U3 (spec §5): the capstone case count, driven by a DEDICATED
+/// `FUZZ_CASES` env knob (NOT the global `PROPTEST_CASES`, which would also
+/// inflate the `:288` smoke). Defaults to 256 (the PR-time count) when unset or
+/// unparseable. CI sets `FUZZ_CASES`, NEVER `PROPTEST_CASES`.
+fn fuzz_cases() -> u32 {
+    std::env::var("FUZZ_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+}
+
+/// Phase-2 U3 (spec §5 / A3): `FUZZ_CASES` selects the capstone N; unset or
+/// garbage falls back to 256. `nextest` runs each test in its own process, so
+/// mutating the process-global env here does not race other tests.
+#[test]
+fn fuzz_cases_reads_env_with_256_default() {
+    let prior = std::env::var_os("FUZZ_CASES");
+
+    std::env::set_var("FUZZ_CASES", "4096");
+    assert_eq!(fuzz_cases(), 4096, "an explicit FUZZ_CASES is honored");
+
+    std::env::set_var("FUZZ_CASES", "not_a_number");
+    assert_eq!(
+        fuzz_cases(),
+        256,
+        "unparseable FUZZ_CASES falls back to 256"
+    );
+
+    std::env::remove_var("FUZZ_CASES");
+    assert_eq!(fuzz_cases(), 256, "unset FUZZ_CASES defaults to 256");
+
+    match prior {
+        Some(v) => std::env::set_var("FUZZ_CASES", v),
+        None => std::env::remove_var("FUZZ_CASES"),
+    }
+}
+
 proptest! {
     // CAPSTONE block (the durability surface): pin the regression corpus to ONE
     // exact, committed FILE via an absolute `Direct(...)` path built from
@@ -1204,7 +1241,11 @@ proptest! {
     // Scope: capstone only — the `:288` smoke and the `:305` manual demo are not
     // durability surfaces and stay on the proptest default.
     #![proptest_config(ProptestConfig {
-        cases: 256,
+        // Capstone N: PR-time default 256, scaled UP for the nightly large-N run
+        // via the dedicated `FUZZ_CASES` knob (see `fuzz_cases()`). CI sets
+        // `FUZZ_CASES`, NEVER `PROPTEST_CASES` — the latter is global and would
+        // also inflate the `:288` smoke. U3 / spec §5.
+        cases: fuzz_cases(),
         failure_persistence: Some(Box::new(FileFailurePersistence::Direct(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/invariant_fuzzer.regressions"
