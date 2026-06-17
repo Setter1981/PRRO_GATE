@@ -35,6 +35,7 @@ use prro::db::models::enums::{DocState, NodeMode, ShiftState};
 use prro::db::repositories::fiscal_documents::OFFLINE_ISSUED_STATES;
 
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
 
 use model::{ExpectedOutcome, RefModel};
 use op::{DpsScript, Op, Stage};
@@ -1192,7 +1193,24 @@ fn drive(ops: &[Op], offline: bool) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+    // CAPSTONE block (the durability surface): pin the regression corpus to ONE
+    // exact, committed FILE via an absolute `Direct(...)` path built from
+    // `CARGO_MANIFEST_DIR` (= rust/prro). We do NOT rely on proptest's default
+    // resolution: for an integration-test target it falls back to a
+    // `WithSource`-renamed FILE (no `lib.rs`/`main.rs` in the walk-up from
+    // `tests/`), which is fragile and cwd-independent only by accident. On a
+    // find, proptest writes the minimal seed to this file; committing it pins
+    // the case as a PERMANENT regression that replays first (spec §4 / G2).
+    // Scope: capstone only — the `:288` smoke and the `:305` manual demo are not
+    // durability surfaces and stay on the proptest default.
+    #![proptest_config(ProptestConfig {
+        cases: 256,
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/invariant_fuzzer.regressions"
+        )))),
+        ..ProptestConfig::default()
+    })]
 
     /// The fuzzer from an ONLINE-seeded fixture.
     #[test]
