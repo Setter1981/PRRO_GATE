@@ -154,6 +154,8 @@ Then:
 
 Paths are relative to the repo root (`/home/setter/prro_gate`). Line counts are as of 2026-06-16. Read in this order.
 
+> **⚠ ERRATA (2026-06-17): the line numbers in §8 and §9 DRIFTED after the P1 fix merged (PR #196) — everything later in those files moved DOWN. Use the function/symbol names as the stable anchors, not the line numbers.** Corrected load-bearing refs: `run_boot_reconciliation` ≈ `boot_phase.rs:1638` (not 1582); `interp.rs` ≈ 1257 lines (drain calls ≈ L685/709/741, not 587/611/643); `invariant_fuzzer.rs` ≈ 1643 lines (capstone `harness_*_seeded` block ≈ L1194); `error_routing.rs` `DocumentReject` CAS ≈ L296 (not 295); `inline.rs` fail-close arms ≈ L455-491 (L392 is a different helper). Also (§9 caveat partially stale): **`Crash(Sign)` is now implemented** (`interp.rs` `crash_after_sign`, drives real `stage_acquire`+`stage_sign`, directed-only via the P1 teeth canary) — only the *generative* alphabet is still wire-only; the `OfflineAck` stage remains `unimplemented!()`.
+
 **The design intent (read first):**
 - `docs/superpowers/specs/2026-06-15-invariant-fuzzer-design.md` (315 lines) — the authoritative design. **§9 "Known kill-point bounded postconditions"** at L154; **§15 "Phase-0 hardening (post-T7, CI-grade harness oracle)"** at L241–315 (the contract you are auditing the implementation of).
 - `docs/LEGAL_INVARIANTS.md` — INV-01 … INV-20, the legal invariant set the scan enforces a subset of.

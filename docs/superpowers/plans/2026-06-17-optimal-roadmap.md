@@ -3,6 +3,8 @@
 **Author:** architect session (locks contracts / reviews / merges). Implementer writes code, strict RED-first TDD.
 **Scope:** all currently-open correctness/fuzzer threads, sequenced by dependency + ROI + risk. Pilot-track backlog positioned but not on the critical path.
 
+> **⚠ STATUS UPDATE (2026-06-17, post-merge):** **Phase 1 below (the P1 fix tranche) is DONE — P1 is FIXED + MERGED** (PR #196, merge `b858d75`; fix `c927d47`, teeth `440f335`). The shipped fix targets **2 arms** (the `OfflineAckOutcome::Refused` arms, on `CodePoolExhausted`), **not** "all four arms" — the two `PostSignRoute::Refused(_)` dispatcher arms are **deferred by design**. The current frontier is **Phase 2** (fuzzer durability, PR #197). Read the Phase-1 section and the "Fix P1 first" thesis below as a **historical record**, not a live to-do.
+
 ---
 
 ## Thesis
