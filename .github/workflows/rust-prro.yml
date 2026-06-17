@@ -124,3 +124,15 @@ jobs:
         # GH ubuntu-latest doesn't ship a musl libc by default.
         # --features test-support: see W2 note on the cross-target step.
         run: cargo nextest run -p prro --features test-support --locked
+
+      # Phase-2 U2 (spec §4 / F2): the fuzzer above writes a regression seed to
+      # the pinned file on a find. If a CI run left that seed uncommitted or
+      # untracked, the find would be lost on this ephemeral runner — fail loudly
+      # so the seed is committed (= a permanent regression). Linux-only (the
+      # find is deterministic, so the Linux legs catch it) and runs regardless
+      # of whether the test step above failed, so a find is surfaced as THIS
+      # guard, not just a raw test failure.
+      - name: Guard — committed fuzzer regression seed
+        if: runner.os == 'Linux' && always()
+        shell: bash
+        run: bash rust/prro/tests/check_seed_committed.sh

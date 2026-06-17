@@ -189,3 +189,56 @@ This was demonstrated on 2026-06-17: revert → FAIL (above) → restore → GRE
   Phase-1 follow-up.
 - Out of scope (Phase 1+): RETURN/Z/EVPZ/clock op alphabet, model-predicts-
   recovery, WebCheck, the temp-DB-leak fix.
+
+---
+
+## Seed-corpus persistence (Phase-2 U2) — every find becomes a permanent regression
+
+The historical teeth above (AUD-K8-1, P1) are **hand-written** directed pins.
+Going forward, a fuzzer find pins **itself**, for free.
+
+**How it works.** The capstone `proptest!` block (`harness_online_seeded` +
+`harness_offline_seeded` in `invariant_fuzzer.rs`) pins its regression corpus to
+ONE committed file via an explicit absolute path:
+
+```rust
+failure_persistence: Some(Box::new(FileFailurePersistence::Direct(concat!(
+    env!("CARGO_MANIFEST_DIR"), "/tests/invariant_fuzzer.regressions"))))
+```
+
+so the seed always lands at the committed file
+`rust/prro/tests/invariant_fuzzer.regressions` — NOT proptest's fragile default
+(which, for an integration-test target, falls back to a `WithSource`-renamed
+file because there is no `lib.rs`/`main.rs` in the walk-up from `tests/`). On a
+find, proptest writes the **minimal** failing seed there and **replays it first**
+on every later run (before any novel case).
+
+**The workflow when the fuzzer finds a bug:**
+
+1. The capstone fails; proptest writes the shrunk seed to
+   `rust/prro/tests/invariant_fuzzer.regressions`.
+2. **Commit that file** — `git add rust/prro/tests/invariant_fuzzer.regressions`.
+   That single commit makes the case a **permanent regression**: it replays
+   first on every subsequent run, on every machine, forever. (Then fix the bug;
+   the committed seed now guards the fix the way the hand-written teeth above do
+   — usually no separate teeth test is needed.)
+
+There is **no** `proptest-regressions/` directory and **no** `.gitkeep`; the file
+exists only once a find has occurred.
+
+**The CI guard (refuse to silently drop a find).** A find on an ephemeral CI
+runner writes the seed into the runner's checkout — and it would vanish when the
+runner is torn down. `rust/prro/tests/check_seed_committed.sh` (wired into
+`.github/workflows/rust-prro.yml`) fails the job whenever a fuzzer run leaves an
+**uncommitted or untracked** seed at the pinned path. It uses
+`git status --porcelain` (NOT `git diff --exit-code`, which is blind to a
+newly-created untracked file — exactly the first-find silent-drop case). Run it
+locally any time:
+
+```bash
+bash rust/prro/tests/check_seed_committed.sh   # exit 0 = clean, exit 1 = commit the seed
+```
+
+Do **not** commit a planted / experimental seed (e.g. one produced while
+deliberately breaking an invariant to test this mechanism): delete it before
+committing, or the capstone will replay a fake regression forever.
