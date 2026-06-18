@@ -24,7 +24,7 @@ Phase 3 makes the gate's green **honest where it claims to be** — closing the 
 - **G1 (oracle honesty)** — close O1/O2/O3/O5 so the fuzzer catches the bug classes it currently blesses.
 - **G2 (prod guard)** — the `StuckNonTerminalDoc` ledger-pin (#192/P1) enforced at RUNTIME in production, not only in tests (X1).
 - **G3 (crash reach)** — the generator reaches the crash windows where the #192-class orphan is born (O4; generative `Crash(Sign)`; adjacent durable-`SIGNED` probe).
-- **G4 (legal cap)** — the offline time/code-limit (Frozen Invariant #5) is modeled, so an enforced gate does not silently certify a legal-limit breach (minimal C1).
+- **G4 (legal cap)** — Frozen Invariant #5: the **code-limit is already enforced/scanned/modeled** (the offline-code pool, NOT `max_offline_codes` — ШАГ-0/CP-C1 verified, §3/U4); the **time-limit (168h DPS-reject) is the only remaining gap**, an explicit deferred follow-on. (No fictional/duplicate code-count variant.)
 
 **Non-goals**
 - **N1 — BROAD model-fidelity (D1–D5).** Do NOT hand-build full independent prediction for `next_lnd` / mode / shift / Fault-deferral. WebCheck solves this at the root; hand-polishing a model WebCheck will replace = paying twice. **Exception (carved in):** O2 requires a *narrow, deterministic* prediction slice (the crash-completed offline sell) — see U2/O2. That single slice is IN; the rest of D stays OUT (§9). A trivially-cheap D3 (fork-the-const + `debug_assert`) may ride along.
@@ -70,11 +70,9 @@ Enforce the #192/P1 ledger-pin at **runtime in production**.
 
 ### U4 — Minimal C1: offline legal-cap modeled (audit #6) — Goal G4 — tests-only
 
-The offline time/code-limit (Frozen Invariant #5) is a **hard legal limit**, presently unmodeled, while the gate is enforced. Minimal closure:
-- Add an `OfflineCapExceeded` scan variant (a sell that consumes beyond `max_offline_codes` or past the time window).
-- Add a fixture seeding a **real** `max_offline_codes` (current fixture seeds `0`).
-- Note: the fuzzer calls `drain` directly, bypassing the caller-side time-window gate — model the cap at the *issuance* point the cap actually binds.
-- Scoped minimal (the variant + fixture + one directed pin); full offline-cap coverage can extend later.
+**RESOLVED by ШАГ-0 (CP-C1, verified on `3cced64`): the code-count gap does NOT exist — U4 code-count is a verified no-op.** Frozen Invariant #5 splits into a code-limit and a time-limit:
+- **Code-count = the offline-code POOL, NOT `max_offline_codes`.** `max_offline_codes` is **config-only** — verified never read into any logic (only `fiscal_number_config.rs` struct/SQL + ingress `:0` defaults; grep over `src/` is otherwise empty). The real code-limit is pool exhaustion: `stage_offline_ack.rs:332` `acquire_code_tx` → `CodePoolExhausted` (no cap-check). Already **enforced** (the #192/P1 abort), **scanned** (`invariant_scan` 6b `OfflineFiscalNoUnbacked` + 6c `DuplicateOfflineFiscalNo`), and **modeled** (`mint_aborted_refusal` + `harness_offline_no_code_sell_mirrors_aborted_row`). The allocator deliberately allows over-provisioning past `max_offline_codes` (PR #54 Round-1 HIGH pin, `offline_sessions.rs:312-313`: a pool-bound shape was REJECTED as discipline-weakening). So a code-count `OfflineCapExceeded` variant would be **fictional** (asserting an enforcement that provably does not exist — forbidden by the contract) or **duplicate**. **Nothing honest to add.** `max_offline_codes` is vestigial config (separate design Q; removing it = schema churn, not worth it).
+- **Time-limit = DPS-side, the ONLY genuine remaining gap → explicit follow-on.** The 168h cumulative-offline limit is a DPS reject (server code `-11` `ERROR_OFFLINE_168` → `BLOCKED`, `error_routing.rs:460`), reacted to at drain/online — NOT an offline-issuance gate. Modeling it (a new `WireResponse` for `-11` + the `BLOCKED` reaction + a pin) is a different shape (DPS-reject, not an issuance-cap) and lower-leverage than U1/U3 → deferred (a small "C1-time" tranche, or folded into U3's generative DPS-reject modeling).
 
 ## §4 Sequencing & risk
 
@@ -91,7 +89,7 @@ The offline time/code-limit (Frozen Invariant #5) is a **hard legal limit**, pre
 - **A1 (U1):** a stuck `{PREPARED,SIGNED,ENCRYPTED}` doc at the post-reconciliation boundary is detected **at runtime in a prod build (no `test-support`)** and surfaced with a **verifiable effect** (audit `CRITICAL` + the readiness effect resolved in CP1), mode-gated (no false-flag on transient `BLOCKED`). Teeth: revert guard → directed test misses it.
 - **A2 (U2):** each of O1/O2/O3/O5 has BOTH a positive teeth (reintroduced blind-spot FAILS) AND a **negative teeth** (legitimate scenario PASSES); O2's narrow prediction is independent of the post-crash DB read; full harness green (no capstone false-positive).
 - **A3 (U3):** `Crash(Finalize)`+`Crash(OfflineAck)` reachable generatively; generative `Crash(Sign)` no buried-`SIGNED` false-flag; adjacent-`SIGNED` probe runs (clean or triaged finding).
-- **A4 (U4):** an offline sell beyond `max_offline_codes` / past the window is flagged by the `OfflineCapExceeded` variant against a real-cap fixture; teeth: a within-cap sell PASSES.
+- **A4 (U4): VACATED for code-count** — ШАГ-0 (CP-C1) proved the code-limit is the pool (already enforced/scanned/modeled), so there is no honest code-count variant to add. The remaining time-limit (168h DPS-reject) is a deferred follow-on with its own acceptance when scheduled.
 
 ## §6 Cross-cutting invariants & discipline
 
@@ -101,7 +99,7 @@ The offline time/code-limit (Frozen Invariant #5) is a **hard legal limit**, pre
 
 ## §7 Sequencing summary
 
-U2 (O1/O2/O3/O5 + X2, paired teeth) ∥ U4 (C1) → U1 (X1 prod guard, SRC) → U3 (generative). Done when A1∧A2∧A3∧A4, full gate green, determinism intact.
+U2 (O1/O2/O3/O5 + X2, paired teeth) [U4 code-count = no-op, CP-C1 resolved] → U1 (X1 prod guard, SRC) → U3 (generative). Done when A1∧A2∧A3, full gate green, determinism intact. (A4 code-count vacated; time-limit C1 = deferred follow-on.)
 
 ## §8 Risks & checkpoints (stop-and-ask)
 
