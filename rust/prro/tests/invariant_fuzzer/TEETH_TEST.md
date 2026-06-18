@@ -185,6 +185,85 @@ This was demonstrated on 2026-06-17: revert → FAIL (above) → restore → GRE
 
 ---
 
+# Phase 3 — U2 oracle-honesty teeth (O1/O2/O3/O5 + X2)
+
+Phase 3 closes oracle FALSE-NEGATIVES — the enforced gate stayed green while a
+bug class slipped past. Each unit ships a PAIR: a POSITIVE tooth (the closed
+blind spot FAILS when the fix is reverted) and a NEGATIVE tooth (a legitimate
+scenario still PASSES, so the fix is not over-strict — a false positive is now a
+merge-blocker on the enforced gnu gate). All are deterministic CI tests; SCOPE is
+tests-only (`tests/invariant_fuzzer/*`), no `src/` change.
+
+## X2 — single-active-session guard (`check_mirrors` / `resync_preconditions_from_db`)
+
+- Positive: `teeth_x2_multiple_active_sessions_flagged`.
+- Negative: `teeth_x2_single_active_session_not_flagged`.
+- Revert target: the `> 1` count guard in `oracle::check_mirrors` (restore the
+  bare `LIMIT 1` and it silently picks one session, masking the breach).
+- NUANCE (verified): a >1-active state is normally SCHEMA-PREVENTED by the partial
+  unique index `ux_offline_active ... WHERE state IN ('OPENING','OPEN','DRAINING')`
+  (the query's `OPEN/DRAINING` filter is a subset). X2 is therefore
+  defense-in-depth + determinism-hardening (a regression sentinel if that index is
+  ever weakened), not closure of a currently-reachable false-negative — so the
+  positive tooth DROPS the index to construct the breach.
+
+## O5 — `ArtifactNoResend` variant-specific scan filter (`settle_and_scan`)
+
+- Positive: `teeth_o5_artifact_flags_non_stuck_sending`.
+- Negative: `teeth_o5_artifact_excuses_deferred_sending`.
+- Revert target: the `scan()` + `oracle::filter_artifact_violations` call in
+  `settle_and_scan`'s `ArtifactNoResend` arm (restoring the scan-skip lets a
+  non-`StuckSending` breach pass silently). Only the deferred online-origin
+  `StuckSending` is excused; every other violation stays fatal (the filter is
+  variant-specific — chain/LND/session violations carry no `document_id`).
+
+## O3 — DB-integrity persisted-payload-vs-stored-hash (`check_payload_hash_integrity`)
+
+- Positive: `teeth_o3_corrupted_stored_hash_flagged`.
+- Negative: `teeth_o3_clean_payload_hash_matches`.
+- Revert target: the body of `oracle::check_payload_hash_integrity` (restoring the
+  `Ok(())` stub — the pre-O3 referential-only blind spot that trusts the stored
+  hash). Wired into the SETTLED scans (per-op + terminal). SCOPE: the achievable
+  DB-integrity subset; canonical-truth recompute is deferred to WebCheck (no
+  callable seam canonicaliser).
+
+## O1 — online-convergence canary (DIRECTED-ONLY, CP2 re-scope)
+
+- Positive: `teeth_o1_online_convergence_drives_sent_to_ack` (GREEN on main; RED
+  if the production `SENT→KVT1` / `KVT1→ACK` advancement in `online_convergence.rs`
+  + its reused boot/drain arms is reverted/broken).
+- Negative: `teeth_o1_legit_sent_hold_not_flagged`.
+- Decision table: `o1_convergence_assert_decision` (both directions of
+  `oracle::assert_online_convergence`).
+- NOT wired into the random property harness (CP2). Driving convergence in the
+  random net converges GENERATIVELY-STACKED SENT docs — multiple sells that each
+  rest at SENT were signed against the SAME un-advanced seed, so acking them all
+  chain-breaks (the lnd-2+ docs never chained onto lnd-1's post-ACK tip). That
+  stacked-then-all-converge state is an artifact the generator reaches (the SAME
+  "directed-only, generatively-unreachable" situation as the P1 teeth above) and
+  a potential separate finding for production analysis (architect note).
+
+## O2 — crash-completed offline-sell differential (`run_harness`)
+
+- Positive: `teeth_o2_run_harness_catches_crash_completed_sell_divergence`.
+- Negative: `teeth_o2_crash_completed_sell_matches_prediction`.
+- Revert target: the `(Op::Crash(_), RealOutcome::Doc(_)) =>
+  model.predict_crash_completed_sell()` routing in `run_harness` (restoring
+  `model.apply(op)` → `Crash → Fault → resync` adopts the divergence silently). An
+  Offline-node crash never reaches the wire → it completes as a real offline sell,
+  which is DETERMINISTIC and DB-read-INDEPENDENT (reuses the offline-sell
+  prediction from `self.next_lnd` / `self.seed`). Genuinely-nondeterministic crash
+  recoveries (wire-reached `Crashed`, MAC-recovery) stay `Fault`.
+
+## Run them
+
+```bash
+cargo nextest run -p prro --features test-support \
+  -E 'binary(invariant_fuzzer) and (test(teeth_x2) or test(teeth_o3) or test(teeth_o5) or test(teeth_o1) or test(teeth_o2) or test(o1_convergence))'
+```
+
+---
+
 ## Scope (Phase 0)
 
 - `N = 256` per harness (PR-time; documented small). Larger `N` / nightly is a

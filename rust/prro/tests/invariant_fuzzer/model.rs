@@ -211,6 +211,22 @@ impl RefModel {
         ExpectedOutcome::NoIssuanceRow
     }
 
+    /// O2 — predict a SELL that COMPLETED under a crash.  An Offline-node
+    /// `Crash(Send)` / `Crash(Kvt1)` never reaches the wire (the offline-ack path
+    /// makes no wire call), so `inline::run` COMPLETES as a real offline sell
+    /// (`RealOutcome::Doc`).  That outcome is DETERMINISTIC — reuse the plain
+    /// offline-sell prediction (`OFFLINE_LOCAL_ACK` consuming a code, or
+    /// `mint_aborted_refusal` when no code / no session).  Computed purely from
+    /// `self.next_lnd` / `self.seed` / codes — **DB-READ-INDEPENDENT**, so routing
+    /// it through the `PredictableMutating` differential is NOT vacuous (pre-O2:
+    /// `Op::Crash → ExpectedOutcome::Fault` → `check_differential` `Ok(())`
+    /// unconditional → the real DB was adopted blindly).  The genuinely-
+    /// nondeterministic crash recoveries (wire-reached `Crashed`, MAC-recovery)
+    /// stay `Fault`; this is the ONE narrow predictable slice (spec §9 / U2/O2).
+    pub fn predict_crash_completed_sell(&mut self) -> ExpectedOutcome {
+        self.apply_sell(&DpsScript(Vec::new()))
+    }
+
     /// A sell — the lane is the NODE MODE (the interpreter's `inline::run`
     /// dispatches by mode), not the op name.  Online → per-script outcome;
     /// Offline → OFFLINE_LOCAL_ACK (consuming a code); any other mode → refused.
@@ -481,12 +497,25 @@ impl RefModel {
         self.shift_state = shift_state;
         // The ACTIVE (OPEN / DRAINING) session — the one a sell / drain
         // dispatches on (matches `current_open_or_draining_session`).
-        self.session = sqlx::query_scalar::<_, OfflineSessionState>(
-            "SELECT state FROM offline_sessions WHERE state IN ('OPEN', 'DRAINING') LIMIT 1",
+        //
+        // X2: deterministic `ORDER BY` + single-active-session guard.
+        // `ux_offline_active` guarantees ≤1 active session, so this assert never
+        // fires on a clean DB — it is a defense-in-depth sentinel (a >1-active
+        // breach would otherwise be silently masked by the bare `LIMIT 1` picking
+        // an arbitrary row).
+        let active_states: Vec<OfflineSessionState> = sqlx::query_scalar::<_, OfflineSessionState>(
+            "SELECT state FROM offline_sessions WHERE state IN ('OPEN', 'DRAINING') \
+             ORDER BY opened_at DESC, offline_session_id",
         )
-        .fetch_optional(pool)
+        .fetch_all(pool)
         .await
         .unwrap();
+        assert!(
+            active_states.len() <= 1,
+            "X2: multiple active OPEN/DRAINING offline sessions during precondition \
+             resync (single-active-session invariant breach): {active_states:?}"
+        );
+        self.session = active_states.into_iter().next();
     }
 }
 

@@ -876,9 +876,24 @@ async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
         shift_drain_eligible(shift),
     ) {
         TerminalVerdict::Scan => {
+            // O1 (CP2 re-scope): the online-convergence drive+assert is DIRECTED-ONLY
+            // (`teeth_o1_*`), NOT wired here.  Driving it in the random net converges
+            // GENERATIVELY-STACKED SENT docs — multiple sells that each rest at SENT
+            // were signed against the SAME (un-advanced) seed, so acking them all
+            // chain-breaks (the lnd-2+ docs never chained onto lnd-1's post-ACK tip).
+            // That stacked-then-all-converge state is an artifact the generator
+            // reaches but real single-writer convergence escalates on (ChainSeedMismatch)
+            // — exactly the P1 "directed-only, generatively-unreachable" precedent.
+            // See TEETH_TEST.md + the architect note.
             oracle::assert_clean(&ctx.pool).await;
             if let Err(d) = oracle::check_mirrors(&ctx.pool).await {
                 panic!("terminal mirror drift (mode={mode:?} shift={shift:?}): {d:?}");
+            }
+            // O3: catch a stored-hash/payload divergence the referential oracle misses.
+            if let Err(d) = oracle::check_payload_hash_integrity(&ctx.pool).await {
+                panic!(
+                    "terminal payload-hash integrity (O3) (mode={mode:?} shift={shift:?}): {d:?}"
+                );
             }
         }
         TerminalVerdict::Liveness => {
@@ -903,6 +918,17 @@ async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
                 "terminal GoingOnline artifact (mode={mode:?} shift={shift:?}): the bounded \
                  real recovery ops made a NEW wire send — deferred docs must not be re-driven"
             );
+            // O5: previously this branch SKIPPED the scan entirely (a deferred
+            // online-origin SENDING would false-flag StuckSending).  Run the scan
+            // but EXCUSE only that StuckSending variant — every OTHER violation
+            // (chain break / leaked pre-send doc / duplicate lnd / …) stays fatal,
+            // closing the blind spot where this terminal was never scanned.
+            let violations = prro::db::invariant_scan::scan(&ctx.pool)
+                .await
+                .expect("invariant_scan query");
+            if let Err(d) = oracle::filter_artifact_violations(violations) {
+                panic!("terminal ArtifactNoResend scan (mode={mode:?} shift={shift:?}): {d:?}");
+            }
         }
     }
 }
@@ -924,8 +950,17 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         let next_lnd_before = ctx.read_next_lnd().await; // MH/B2: a drain/no-op allocates no lnd
         let doc_count_before = ctx.observed_doc_count().await; // B2: TrueNoMutation mints no row
 
-        let expected = model.apply(op);
         let real = interp::run_op(&mut ctx, op).await;
+        // O2: an Offline-node Crash that never reached the wire COMPLETES as a real
+        // offline sell (RealOutcome::Doc) — a DETERMINISTIC mutation, not a fault.
+        // Predict it (DB-read-independent) so the crash differential is NOT vacuous
+        // (pre-O2: Op::Crash → Fault → check_differential Ok(()) → the FaultOrRecovery
+        // arm resync'd, silently adopting the real DB).  A wire-reached Crash
+        // (RealOutcome::Crashed) and every Reboot stay Fault.
+        let expected = match (op, &real) {
+            (Op::Crash(_), interp::RealOutcome::Doc(_)) => model.predict_crash_completed_sell(),
+            _ => model.apply(op),
+        };
 
         let class = oracle::classify(&expected);
         match class {
@@ -1145,6 +1180,11 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
             oracle::assert_clean(&ctx.pool).await;
             if let Err(d) = oracle::check_mirrors(&ctx.pool).await {
                 panic!("mirror drift on {op:?}: {d:?}");
+            }
+            // O3: the referential chain oracle trusts the stored hash; recompute
+            // sha256(PAYLOAD_XML) and catch a stored-hash/payload divergence.
+            if let Err(d) = oracle::check_payload_hash_integrity(&ctx.pool).await {
+                panic!("payload-hash integrity (O3) on {op:?}: {d:?}");
             }
         }
 
@@ -1444,6 +1484,370 @@ async fn teeth_p1_boot_resume_codepool_aborts() {
     // FULL invariant_scan clean — the same gate the property harness's
     // post-reboot settled scan runs (no StuckNonTerminalDoc, no chain break).
     oracle::assert_clean(&ctx.pool).await;
+}
+
+// ── Phase 3 — oracle-honesty teeth (U2) ──────────────────────────────────────
+// Each O/X tooth comes in a PAIR: a POSITIVE tooth (the closed blind-spot now
+// FAILS when the oracle fix is reverted) and a NEGATIVE tooth (a legitimate
+// scenario still PASSES — proving the fix is not over-strict).  A false-positive
+// is a merge-blocker on the enforced gate, so the negative tooth is mandatory.
+// Revert targets are recorded in `tests/invariant_fuzzer/TEETH_TEST.md`.
+
+/// X2 NEGATIVE tooth: a SINGLE active offline session with a consistent cohort
+/// doc must NOT be flagged by `check_mirrors` (the X2 guard is not over-strict).
+#[tokio::test]
+async fn teeth_x2_single_active_session_not_flagged() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
+    // One offline sell → an OFFLINE_LOCAL_ACK cohort doc pointing at THE one
+    // active OPEN session (so the Mirror-2 loop actually runs and must pass).
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
+    assert!(
+        oracle::check_mirrors(&ctx.pool).await.is_ok(),
+        "X2: a single active OPEN/DRAINING session with a consistent cohort must \
+         NOT be flagged — the guard must not false-positive on the legal one-session case"
+    );
+}
+
+/// X2 POSITIVE tooth: TWO active OPEN sessions (the single-active-session
+/// invariant breach) MUST be flagged by `check_mirrors`.
+///
+/// NUANCE (verified): the >1-active state is normally SCHEMA-PREVENTED by the
+/// partial unique index `ux_offline_active ON offline_sessions(fiscal_number)
+/// WHERE state IN ('OPENING','OPEN','DRAINING')` — the `check_mirrors` /
+/// `resync_preconditions_from_db` `OPEN/DRAINING` filter is a subset, so a clean
+/// DB never returns >1.  X2 is therefore DEFENSE-IN-DEPTH + determinism-hardening
+/// (a regression sentinel if that index is ever weakened), not closure of a
+/// currently-reachable false-negative.  This tooth drops the index to construct
+/// the breach the guard is meant to catch.
+///
+/// WITH the X2 fix (`ORDER BY` + `> 1` count guard) `check_mirrors` returns the
+/// "multiple active … sessions" `Divergence`.  Revert target: the `> 1` guard in
+/// `oracle::check_mirrors` — restoring the bare `LIMIT 1` silently picks ONE
+/// session and (with an empty cohort) returns `Ok`, masking the breach → this
+/// tooth then FAILS.  Detection is independent of `invariant_scan` (no
+/// session-count check there).
+#[tokio::test]
+async fn teeth_x2_multiple_active_sessions_flagged() {
+    // Offline fixture seeds ONE OPEN session; no sells → empty cohort (so the
+    // bare LIMIT 1 path would return Ok regardless of which session it picks).
+    let ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
+    // Drop ux_offline_active + plant a 2nd OPEN session (the schema-prevented breach).
+    ctx.plant_second_active_session_dropping_guard_index().await;
+
+    let result = oracle::check_mirrors(&ctx.pool).await;
+    let err = result.expect_err(
+        "X2: two active OPEN offline sessions violate the single-active-session \
+         invariant and MUST be flagged. If this is Ok, the bare LIMIT 1 lookup \
+         silently picked one (the masked false-negative) — the X2 guard is missing.",
+    );
+    assert!(
+        err.0.contains("multiple active"),
+        "X2: the flag must name the multiple-active-session breach, got: {err:?}"
+    );
+}
+
+/// O5 NEGATIVE tooth: the lone deferred online-origin `SENDING` (a `StuckSending`)
+/// in the `ArtifactNoResend` terminal must be EXCUSED — `settle_and_scan` runs the
+/// scan there now but must NOT panic on it (the exact false-positive the SETTLED
+/// gate originally skipped the scan to avoid).
+#[tokio::test]
+async fn teeth_o5_artifact_excuses_deferred_sending() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let _ = interp::run_op(&mut ctx, &Op::Crash(Stage::Send)).await; // online-origin SENDING (deferred)
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSellDuringGoingOnline).await; // force GoingOnline, no session
+    assert_eq!(ctx.read_node_mode().await, NodeMode::GoingOnline);
+    assert!(
+        ctx.active_offline_session().await.is_none(),
+        "online fixture has NO session — this is the no-session ArtifactNoResend terminal"
+    );
+    // The deferred SENDING is exactly the StuckSending the O5 filter must EXCUSE.
+    let v = prro::db::invariant_scan::scan(&ctx.pool).await.unwrap();
+    assert!(
+        v.iter()
+            .any(|x| matches!(x, prro::db::invariant_scan::Violation::StuckSending { .. })),
+        "setup: a deferred SENDING (StuckSending) must be present to exercise the O5 excuse, got {v:?}"
+    );
+
+    // Runs the ArtifactNoResend scan but EXCUSES the lone StuckSending → no panic.
+    settle_and_scan(&mut ctx, true).await;
+
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Sending,
+        "the deferred SENDING is left in place (excused, not re-driven)"
+    );
+}
+
+/// O5 POSITIVE tooth: a NON-`StuckSending` violation in the `ArtifactNoResend`
+/// terminal MUST be flagged — the scan is variant-specific (only the deferred
+/// `StuckSending` is excused), so a planted `AckWithoutServerFiscalNo` is fatal
+/// even though a deferred `StuckSending` is also present and excused.
+///
+/// WITH the O5 fix the `ArtifactNoResend` arm runs `scan()` + `filter_artifact_
+/// violations` and panics on the fatal breach.  Revert target: that scan+filter
+/// in `settle_and_scan`'s `ArtifactNoResend` arm — restoring the scan-skip lets
+/// the breach pass silently (the closed blind spot) → this tooth then FAILS.
+#[test]
+fn teeth_o5_artifact_flags_non_stuck_sending() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+            // An ACK doc, then drop its server_fiscal_no → AckWithoutServerFiscalNo
+            // (a NON-StuckSending scan violation; terminal ACK so reboot won't touch it).
+            let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+            ctx.corrupt_ack_drop_server_fiscal_no().await;
+            // A deferred online-origin SENDING (the StuckSending that IS excused) +
+            // force GoingOnline → the no-session ArtifactNoResend terminal.
+            let _ = interp::run_op(&mut ctx, &Op::Crash(Stage::Send)).await;
+            let _ = interp::run_op(&mut ctx, &Op::OfflineSellDuringGoingOnline).await;
+            assert_eq!(ctx.read_node_mode().await, NodeMode::GoingOnline);
+            // The ArtifactNoResend arm must scan and FLAG the non-StuckSending breach.
+            settle_and_scan(&mut ctx, true).await;
+        });
+    }))
+    .is_err();
+    std::panic::set_hook(prev);
+
+    assert!(
+        panicked,
+        "O5: the ArtifactNoResend terminal must scan and FLAG a non-StuckSending violation \
+         (AckWithoutServerFiscalNo) even though a deferred StuckSending is also present and \
+         excused. It returned cleanly → the branch skipped the scan (the blind spot); revert \
+         target: the scan+filter in settle_and_scan's ArtifactNoResend arm."
+    );
+}
+
+/// O3 NEGATIVE tooth: a clean signed doc's stored `unsigned_xml_sha256` matches
+/// `sha256(PAYLOAD_XML)` → `check_payload_hash_integrity` is `Ok` (the integrity
+/// oracle must not false-positive on a correctly-persisted doc).
+#[tokio::test]
+async fn teeth_o3_clean_payload_hash_matches() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    // A real online sell → ACK runs stage_sign, persisting PAYLOAD_XML + the
+    // sha256(PAYLOAD_XML) into unsigned_xml_sha256.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Ack,
+        "setup: doc must reach ACK"
+    );
+
+    assert!(
+        oracle::check_payload_hash_integrity(&ctx.pool)
+            .await
+            .is_ok(),
+        "O3: a correctly-persisted doc (stored hash == sha256(PAYLOAD_XML)) must NOT be flagged"
+    );
+}
+
+/// O3 POSITIVE tooth: a stored `unsigned_xml_sha256` that no longer matches its
+/// persisted `PAYLOAD_XML` MUST be flagged by `check_payload_hash_integrity`.
+///
+/// WITH the O3 fix the integrity check recomputes `sha256(PAYLOAD_XML)` and
+/// flags the divergence.  Revert target: the real body of
+/// `oracle::check_payload_hash_integrity` — restoring the `Ok(())` stub (the
+/// pre-O3 referential-only blind spot, which trusts the stored hash) lets the
+/// corrupted hash pass → this tooth then FAILS.
+#[tokio::test]
+async fn teeth_o3_corrupted_stored_hash_flagged() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Ack,
+        "setup: doc must reach ACK"
+    );
+
+    // Corrupt the stored hash so it no longer matches the persisted PAYLOAD_XML.
+    ctx.corrupt_stored_unsigned_hash().await;
+
+    let err = oracle::check_payload_hash_integrity(&ctx.pool)
+        .await
+        .expect_err(
+            "O3: a stored unsigned_xml_sha256 that does not match sha256(PAYLOAD_XML) MUST be \
+             flagged. If this is Ok, the integrity check is the no-op stub — the referential \
+             chain oracle trusts the stored hash and is blind to this corruption.",
+        );
+    assert!(
+        err.0.contains("unsigned_xml_sha256") || err.0.contains("PAYLOAD_XML"),
+        "O3: the flag must name the payload/hash divergence, got: {err:?}"
+    );
+}
+
+/// O1 — convergence-assert decision table (PURE): a deterministic (no-hold) tick
+/// that LEFT a doc resting is FLAGGED; a converged tick / a legitimate hold / an
+/// empty tick is NOT.  Proves BOTH directions of `assert_online_convergence`
+/// without a seam (mirrors `a4_terminal_verdict_decision_table`).
+#[test]
+fn o1_convergence_assert_decision() {
+    use prro::services::reconciliation::online_convergence::TickSummary;
+    let summary = |scanned: usize, held: usize| TickSummary {
+        scanned,
+        held_kvt1: held,
+        ..Default::default()
+    };
+    // Deterministic tick (no holds) that LEFT a doc resting → FLAG.
+    assert!(oracle::assert_online_convergence(&summary(1, 0), 1).is_err());
+    // Same but fully converged (resting_after == 0) → OK.
+    assert!(oracle::assert_online_convergence(&summary(1, 0), 0).is_ok());
+    // Scanned WITH a legitimate hold + still resting → OK (excused).
+    assert!(oracle::assert_online_convergence(&summary(1, 1), 1).is_ok());
+    // Empty tick (nothing scanned / resting) → OK.
+    assert!(oracle::assert_online_convergence(&summary(0, 0), 0).is_ok());
+}
+
+/// O1 NEGATIVE tooth: a legitimate SENT transport-hold (the tick REPORTS the
+/// non-convergence) must NOT be flagged — the convergence assert is not
+/// over-strict (CP2: the negative tooth must pass first).
+#[tokio::test]
+async fn teeth_o1_legit_sent_hold_not_flagged() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let _ = interp::run_op(
+        &mut ctx,
+        &Op::OnlineSell(DpsScript::send_ack_then_last_not_found()),
+    )
+    .await;
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Sent,
+        "setup: doc rests at SENT"
+    );
+
+    // A convergence tick whose probe returns the K4 Hold form → the doc
+    // legitimately stays SENT (no Match evidence yet).
+    let summary = interp::convergence_tick_holds(&ctx)
+        .await
+        .expect("convergence tick ok");
+    let resting_after = ctx.resting_online_doc_count().await;
+
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Sent,
+        "the SENT doc legitimately holds (no Match evidence)"
+    );
+    assert!(
+        oracle::assert_online_convergence(&summary, resting_after).is_ok(),
+        "O1: a legitimate SENT transport-hold (summary reports the non-convergence) must NOT \
+         be flagged — the convergence assert must not be over-strict (got {summary:?})"
+    );
+}
+
+/// O1 POSITIVE tooth (DIRECTED canary; CP2 re-scope — not random-net-wired):
+/// an Ack/Match-loaded convergence tick must drive a resting SENT doc to ACK, and
+/// the convergence postcondition must AGREE (fully converged, nothing left
+/// resting).  Online docs converge only on boot / this tick, and the referential
+/// scan never flags SENT/KVT1 — so a convergence-seam regression that leaves a
+/// Match-able doc stuck was a fuzzer false-negative; this canary catches it.
+///
+/// GREEN on main (production convergence advances the doc).  Revert target: the
+/// production `SENT → KVT1` / `KVT1 → ACK` advancement in
+/// `online_convergence.rs` (+ its reused boot Sent-arm / drain Kvt1Reentry
+/// confirm arms) — break it and the doc stays SENT → `assert_online_convergence`
+/// flags it → this tooth FAILS (the fuzzer's teeth bite).
+#[tokio::test]
+async fn teeth_o1_online_convergence_drives_sent_to_ack() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    // A single online sell that holds at SENT ([Ack, NotFound]) — a doc the
+    // referential scan blesses clean (SENT is neither StuckSending nor
+    // StuckNonTerminalDoc), so a never-converged SENT was a false-negative.
+    let _ = interp::run_op(
+        &mut ctx,
+        &Op::OnlineSell(DpsScript::send_ack_then_last_not_found()),
+    )
+    .await;
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Sent,
+        "setup: doc rests at SENT"
+    );
+
+    // Drive the REAL online-convergence seam (Ack/Match-loaded).
+    let summary = interp::settle_convergence_tick(&ctx)
+        .await
+        .expect("convergence tick ok");
+    let resting_after = ctx.resting_online_doc_count().await;
+
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Ack,
+        "O1: an Ack/Match convergence tick must drive a resting SENT doc SENT→KVT1→ACK. If \
+         this is SENT, the production convergence advancement (online_convergence.rs + reused \
+         arms) is reverted/broken — the fuzzer's teeth bite."
+    );
+    assert!(
+        oracle::assert_online_convergence(&summary, resting_after).is_ok(),
+        "O1: a fully-converged tick (no doc left resting) must NOT be flagged (got {summary:?})"
+    );
+}
+
+/// O2 NEGATIVE tooth: a crash-completed offline sell AGREES with the
+/// deterministic, DB-read-independent prediction (the slice is non-vacuous AND
+/// not over-strict).  An Offline-node `Crash(Send)` never reaches the wire → it
+/// completes as a real `OFFLINE_LOCAL_ACK` sell.
+#[tokio::test]
+async fn teeth_o2_crash_completed_sell_matches_prediction() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
+    let mut model = RefModel::new_offline_open_shift(1);
+    let prior = ctx.read_seed().await;
+
+    let real = interp::run_op(&mut ctx, &Op::Crash(Stage::Send)).await;
+    assert!(
+        matches!(&real, interp::RealOutcome::Doc(d) if d.doc_state == DocState::OfflineLocalAck),
+        "setup: an offline Crash(Send) completes as an OFFLINE_LOCAL_ACK sell, got {real:?}"
+    );
+
+    let expected = model.predict_crash_completed_sell();
+    assert!(
+        oracle::check_differential(&real, &expected, prior.as_deref()).is_ok(),
+        "O2: the crash-completed offline sell must AGREE with the deterministic prediction \
+         (got real {real:?}, expected {expected:?})"
+    );
+}
+
+/// O2 POSITIVE tooth: `run_harness` must DIFFERENTIAL-CHECK a crash-completed
+/// offline sell — closing the vacuum where `Op::Crash → ExpectedOutcome::Fault`
+/// routed to `check_differential` `Ok(())` and the real DB was adopted blindly.
+///
+/// We prove the routing BITES by passing a model whose `next_lnd` is pre-desynced
+/// so the deterministic prediction (lnd 99) cannot match the real sell (lnd 1) →
+/// `run_harness`'s differential PANICS.  Revert target: the
+/// `(Op::Crash(_), RealOutcome::Doc(_)) => predict_crash_completed_sell` routing
+/// in `run_harness` — restoring `model.apply(op)` (Fault → resync) adopts the
+/// divergence silently → no panic → this tooth FAILS.
+#[test]
+fn teeth_o2_run_harness_catches_crash_completed_sell_divergence() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
+            let mut model = RefModel::new_offline_open_shift(1);
+            // Desync the prediction: the crash-completed sell will be lnd 1, the
+            // model now predicts lnd 99 → the differential must catch the divergence.
+            model.next_lnd = 99;
+            run_harness(&[Op::Crash(Stage::Send)], ctx, model).await;
+        });
+    }))
+    .is_err();
+    std::panic::set_hook(prev);
+
+    assert!(
+        panicked,
+        "O2: run_harness must differential-check a crash-completed offline sell (pre-O2: \
+         Crash → Fault → check_differential Ok(()) — vacuous, adopting the real DB). With a \
+         desynced prediction it must PANIC; it returned cleanly → the (Crash, Doc) routing is \
+         missing and the divergence was silently adopted."
+    );
 }
 
 // ── Hardening (CI conditions) — Cluster A: crash/scan correctness ────────────

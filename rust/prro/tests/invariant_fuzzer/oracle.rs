@@ -25,9 +25,12 @@
 
 use std::collections::BTreeMap;
 
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
+use prro::db::invariant_scan::Violation;
 use prro::db::models::enums::DocState;
+use prro::services::reconciliation::online_convergence::TickSummary;
 
 use crate::interp::{ObservedDoc, RealOutcome};
 use crate::model::{ExpectedOutcome, Mutation};
@@ -190,6 +193,103 @@ pub async fn assert_clean(pool: &SqlitePool) {
     prro::db::invariant_scan::assert_clean(pool).await;
 }
 
+/// O5 — the `ArtifactNoResend` terminal scan filter.
+///
+/// A forced-mode no-session `GoingOnline` artifact legitimately carries a
+/// DEFERRED online-origin `SENDING` doc (boot reconciliation defers it to the W9
+/// drain) — which is WHY the harness previously SKIPPED the scan there: a full
+/// `assert_clean` would false-flag that `SENDING` as `StuckSending`.  Skipping
+/// the WHOLE scan was a false-negative (a chain break / leaked pre-send doc /
+/// duplicate lnd in that terminal slipped past).  This closes it: run `scan()`
+/// but EXCUSE only the `StuckSending` variant; EVERY other violation stays
+/// fatal.  The filter is VARIANT-SPECIFIC by design — `ChainBreak` /
+/// `ChainSeedMismatch` / `DuplicateLnd` / session-desync carry no `document_id`,
+/// so a bare id-filter would wrongly suppress them; matching the variant does not.
+pub fn filter_artifact_violations(violations: Vec<Violation>) -> Result<(), Divergence> {
+    let fatal: Vec<Violation> = violations
+        .into_iter()
+        .filter(|v| !matches!(v, Violation::StuckSending { .. }))
+        .collect();
+    if fatal.is_empty() {
+        Ok(())
+    } else {
+        Err(Divergence(format!(
+            "O5: ArtifactNoResend terminal has non-StuckSending violation(s) (only a \
+             deferred online-origin SENDING transient is excused here): {fatal:?}"
+        )))
+    }
+}
+
+/// O3 — DB-integrity: every signed doc's stored MAC hash must equal the sha256
+/// of its OWN persisted `PAYLOAD_XML`.  `stage_sign` computes
+/// `unsigned_xml_sha256 = sha256(unsigned_xml)` and persists the SAME bytes as
+/// `document_files(PAYLOAD_XML)` (`stage_sign.rs:431-441/709`), so for a clean
+/// doc they match exactly.  The chain oracle is only REFERENTIAL (it trusts the
+/// stored hash and checks chain-continuity); this catches a stored hash that
+/// does NOT match its own stored payload — corruption / a mis-wired persist the
+/// referential oracle is blind to.
+///
+/// SCOPE: this is the achievable DB-integrity SUBSET.  CANONICAL-TRUTH (recompute
+/// the canonical XML from the doc and compare) needs a callable seam
+/// canonicaliser (`stage_sign`'s builder is private) → deferred to WebCheck.
+pub async fn check_payload_hash_integrity(pool: &SqlitePool) -> Result<(), Divergence> {
+    let rows: Vec<(String, Vec<u8>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT lower(hex(df.document_id)), df.content, fd.unsigned_xml_sha256 \
+         FROM document_files df \
+         JOIN fiscal_documents fd ON fd.document_id = df.document_id \
+         WHERE df.kind = 'PAYLOAD_XML'",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Divergence(format!("O3 payload-hash query failed: {e}")))?;
+    for (doc_hex, payload, stored_hash) in rows {
+        let Some(stored) = stored_hash else {
+            return Err(Divergence(format!(
+                "O3: doc {doc_hex} has a persisted PAYLOAD_XML but a NULL unsigned_xml_sha256"
+            )));
+        };
+        let computed = Sha256::digest(&payload);
+        if computed.as_slice() != stored.as_slice() {
+            return Err(Divergence(format!(
+                "O3: doc {doc_hex} stored unsigned_xml_sha256 {stored:02x?} != \
+                 sha256(PAYLOAD_XML) {:02x?}",
+                computed.as_slice()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// O1 — the online-convergence postcondition (PURE; unit-tested on its decision
+/// table).  After an Ack/Match-loaded `settle_convergence_tick`, a doc that the
+/// tick neither held, superseded, errored, nor escalated MUST have converged
+/// (left no doc resting at `SENT`/`KVT1`).  Online docs converge only on boot /
+/// this tick, and the referential scan never flags `SENT`/`KVT1` — so a
+/// Match-able doc left stuck after a deterministic tick is the false-negative
+/// this closes.  A LEGITIMATE non-convergence (KVT1 hold / SENT transport-hold /
+/// supersession / per-doc error / RMR escalation) is EXCUSED — the tick reports
+/// it, so this never false-positives on a doc that legitimately stays put (CP2).
+pub fn assert_online_convergence(
+    summary: &TickSummary,
+    resting_after: usize,
+) -> Result<(), Divergence> {
+    let legit_nonconverge = summary.sent_not_converged
+        + summary.held_kvt1
+        + summary.superseded_held_kvt1
+        + summary.errors
+        + summary.chain_seed_mismatch_escalated;
+    if summary.scanned > 0 && legit_nonconverge == 0 && resting_after > 0 {
+        return Err(Divergence(format!(
+            "O1: an Ack/Match-loaded convergence tick scanned {} doc(s) with no hold / \
+             supersession / error / escalation, yet left {resting_after} resting at \
+             SENT/KVT1 — a Match-able doc failed to converge (the blind spot the \
+             referential scan never caught)",
+            summary.scanned
+        )));
+    }
+    Ok(())
+}
+
 // ── Layer 3 — bounded kill-point postconditions (spec §9) ───────────────────
 
 /// `Crash(Send)` + `Reboot` (kill-matrix K3): recovery routes the committed
@@ -283,13 +383,27 @@ pub async fn check_mirrors(pool: &SqlitePool) -> Result<(), Divergence> {
 
     // Mirror-2 — the active (OPEN / DRAINING) session for this FN (the cohort the
     // drain scopes to; mirrors `current_open_or_draining_session`).
-    let active: Option<String> = sqlx::query_scalar::<_, String>(
+    //
+    // X2: fetch ALL active sessions with a deterministic `ORDER BY` and guard the
+    // single-active-session invariant.  `ux_offline_active` (partial unique index
+    // on OPENING/OPEN/DRAINING) guarantees ≤1 on a clean DB, so this never fires
+    // in a normal run — it is a defense-in-depth sentinel surfacing a >1-active
+    // breach (e.g. a schema-guard regression) the bare `LIMIT 1` would have
+    // silently MASKED by picking an arbitrary row.
+    let active_ids: Vec<String> = sqlx::query_scalar::<_, String>(
         "SELECT lower(hex(offline_session_id)) FROM offline_sessions \
-         WHERE state IN ('OPEN', 'DRAINING') LIMIT 1",
+         WHERE state IN ('OPEN', 'DRAINING') ORDER BY opened_at, offline_session_id",
     )
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await
     .map_err(|e| Divergence(format!("active-session query failed: {e}")))?;
+    if active_ids.len() > 1 {
+        return Err(Divergence(format!(
+            "X2: multiple active OPEN/DRAINING offline sessions (single-active-session \
+             invariant breach): {active_ids:?}"
+        )));
+    }
+    let active: Option<String> = active_ids.into_iter().next();
 
     // Every drain-cohort doc (offline-origin, in a non-terminal cohort state —
     // mirrors `list_drain_candidates_for_fn_ordered_by_lnd`).

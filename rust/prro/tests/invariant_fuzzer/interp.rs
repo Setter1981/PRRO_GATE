@@ -35,7 +35,7 @@ use prro::db::repositories::{fiscal_documents, offline_sessions};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::{open_pool, open_secure_pool};
 use prro::services::offline_sync::{backlog_drain, return_online_probe};
-use prro::services::reconciliation::{boot_phase, RuntimeView};
+use prro::services::reconciliation::{boot_phase, online_convergence, RuntimeView};
 use prro::services::write_path::inline;
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::services::write_path::types::{CanonicalFiscalCommand, WorkerProcessResult};
@@ -225,6 +225,65 @@ impl FuzzCtx {
         .unwrap();
     }
 
+    /// Test corruption (O3): overwrite an ACK doc's stored `unsigned_xml_sha256`
+    /// with a value that no longer matches its persisted `PAYLOAD_XML` — a
+    /// stored-hash / stored-payload divergence the REFERENTIAL chain oracle
+    /// (which trusts the stored hash) is blind to.
+    pub async fn corrupt_stored_unsigned_hash(&self) {
+        sqlx::query(
+            "UPDATE fiscal_documents SET unsigned_xml_sha256 = ? \
+             WHERE fiscal_number = ? AND state = 'ACK'",
+        )
+        .bind(vec![0u8; 32])
+        .bind(self.fn_id.as_str())
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Test corruption (O5): drop an ACK doc's `server_fiscal_no` → an
+    /// `AckWithoutServerFiscalNo` scan violation (a NON-`StuckSending` breach the
+    /// `ArtifactNoResend` filter must keep FATAL).  `ACK` is terminal, so boot
+    /// reconciliation never touches it — the planted violation survives the
+    /// settle loop's reboots, unlike a non-terminal doc which a reboot may
+    /// resolve.
+    pub async fn corrupt_ack_drop_server_fiscal_no(&self) {
+        sqlx::query(
+            "UPDATE fiscal_documents SET server_fiscal_no = NULL \
+             WHERE fiscal_number = ? AND state = 'ACK'",
+        )
+        .bind(self.fn_id.as_str())
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Test corruption (X2): simulate a LOST `ux_offline_active` partial-unique
+    /// index (a schema regression) and plant a SECOND active `OPEN` session — the
+    /// multi-active-session state the DB normally PREVENTS.  Today the index
+    /// `ux_offline_active ON offline_sessions(fiscal_number) WHERE state IN
+    /// ('OPENING','OPEN','DRAINING')` makes two active sessions unreachable (the
+    /// `check_mirrors` / `resync_preconditions_from_db` `OPEN/DRAINING` filter is
+    /// a subset), so the X2 `ORDER BY` + count guard is a DEFENSE-IN-DEPTH
+    /// regression sentinel: this drops the index to construct the breach the
+    /// guard is meant to catch if the schema protection is ever weakened.
+    pub async fn plant_second_active_session_dropping_guard_index(&self) {
+        sqlx::query("DROP INDEX IF EXISTS ux_offline_active")
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        let extra = OfflineSessionId::new();
+        sqlx::query(
+            "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+             VALUES (?, ?, 'OPEN', '2026-06-09T00:00:00Z')",
+        )
+        .bind(extra)
+        .bind(self.fn_id.as_str())
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
     fn view<'a>(&'a self, dps: &'a dyn DpsChannel) -> RuntimeView<'a> {
         RuntimeView {
             dps,
@@ -388,6 +447,21 @@ impl FuzzCtx {
             "SELECT COUNT(*) FROM fiscal_documents \
              WHERE fiscal_number = ? AND fs_mode = 'OFFLINE' \
                AND state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE','KVT2')",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        n as usize
+    }
+
+    /// O1 — count of docs resting in the two online-convergence states
+    /// (`SENT`/`KVT1`) for this FN: the set the online-convergence tick targets,
+    /// and the set the referential scan never flags as stuck.
+    pub async fn resting_online_doc_count(&self) -> usize {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fiscal_documents \
+             WHERE fiscal_number = ? AND state IN ('SENT','KVT1')",
         )
         .bind(self.fn_id.as_str())
         .fetch_one(&self.pool)
@@ -758,6 +832,45 @@ pub async fn settle_drain_tick(ctx: &mut FuzzCtx) -> RealOutcome {
         },
         Err(e) => RealOutcome::Refused(format!("settle_drain: {e:?}")),
     }
+}
+
+/// O1 — drive an online-convergence tick (`online_convergence::run_tick_for_fn`)
+/// with the given ordered `last_chk` responses.  The seam is `Online`-only
+/// (mode-guarded internally) and issues only `last_chk` (no fresh send): a
+/// resting `SENT` doc cascades `SENT → (probe Match) → KVT1 → (confirm Match) →
+/// ACK` within one tick (2 `last_chk` per doc).  Mirrors the offline
+/// `settle_drain_tick`, for the online lane.
+pub async fn run_convergence_tick_with(
+    ctx: &FuzzCtx,
+    last_responses: &[WireResponse],
+) -> anyhow::Result<online_convergence::TickSummary> {
+    let dps = ctx.new_dps();
+    for wr in last_responses {
+        dps.push_last(wire_to_result(*wr));
+    }
+    let view = ctx.view(&dps);
+    online_convergence::run_tick_for_fn(&ctx.pool, &view, &ctx.fn_id).await
+}
+
+/// O1 — Ack/Match-loaded convergence tick sized to the resting `SENT`/`KVT1`
+/// cohort (one probe + one confirm `last_chk` per resting doc, + slack).  The
+/// settle-time analogue of `settle_drain_tick`: simulates DPS confirming, so
+/// every Match-able resting online doc converges to ACK.
+pub async fn settle_convergence_tick(
+    ctx: &FuzzCtx,
+) -> anyhow::Result<online_convergence::TickSummary> {
+    let resting = ctx.resting_online_doc_count().await;
+    let acks = vec![WireResponse::Ack; 2 * resting + 2];
+    run_convergence_tick_with(ctx, &acks).await
+}
+
+/// O1 negative-tooth helper — a convergence tick whose `last_chk` returns the K4
+/// Hold form (empty `data_sign`): a resting `SENT` doc legitimately HOLDS (no
+/// Match evidence yet).  The convergence assert must NOT flag this.
+pub async fn convergence_tick_holds(
+    ctx: &FuzzCtx,
+) -> anyhow::Result<online_convergence::TickSummary> {
+    run_convergence_tick_with(ctx, &[WireResponse::NotFound]).await
 }
 
 /// `SellWithClosedShift` (invalid intent): close the shift, then attempt a SELL
