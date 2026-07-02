@@ -148,17 +148,23 @@ the crash transient (the node rests `Offline` → SETTLED → scanned): with the
 abort the doc is `Aborted` (clean); without it the doc rests `SIGNED` →
 `invariant_scan` flags `StuckNonTerminalDoc`.
 
-The teeth here live in **one** place — the deterministic canary
-`teeth_p1_boot_resume_codepool_aborts` (now a CI gate — un-`#[ignore]`d
-2026-06-17; PASSES on main, FAILS on revert). Unlike AUD-K8-1, this class is NOT wired into the random property
-harness: `Crash(Sign)` is implemented (`interp::crash_after_sign`) but is
-**directed-only**, not generatively emitted. A context-free generator produces
-crash-after-sign sequences FOLLOWED by further issuance before a reboot (e.g.
-`[Crash(Sign), OnlineSell, …]`), which buries the SIGNED doc under a later-issued
-doc — an UNREACHABLE production state (single-writer + boot-recon-before-serve:
-a crashed process serves no new request before recovery). Surfacing that artifact
-in the generative net is a separate harness-realism follow-up (model "no new op
-until reboot while a crash is pending). See `strategy.rs::op` for the rationale.
+The teeth here live in **two** places since U3:
+
+1. The deterministic canary `teeth_p1_boot_resume_codepool_aborts` (a CI gate —
+   un-`#[ignore]`d 2026-06-17; PASSES on main, FAILS on revert).
+2. **Generative coverage (Phase-3 U3):** `Crash(Sign)` and `Crash(OfflineAck)`
+   (the #192 birth-site window) ARE now emitted by the generator.  The
+   historical blocker — a context-free `[Crash(Sign), OnlineSell, …]` burying
+   the SIGNED doc under later issuance, an unreachable production state — is
+   removed by the **dead-until-reboot** realism in `run_harness`: a
+   stage-composition crash is a PROCESS death, so every op until the resolving
+   `Reboot` is skipped (wire crashes Send/Kvt1 stay continue-semantics —
+   transport collapse with a live process).  `interp::reboot` provisions the
+   boot wire (ample Acks per pending doc, the `settle_drain_tick` philosophy)
+   so an Online-lane resume can make its legitimate FIRST send; the A3
+   no-resend postcond is accordingly scoped to wire-crash resolutions only.
+   Adjacent durable-`SIGNED` probe (CP3): clean at `FUZZ_CASES=2048` ×2 lanes;
+   the nightly re-probes at 4096 every night.
 
 ## Run it
 
