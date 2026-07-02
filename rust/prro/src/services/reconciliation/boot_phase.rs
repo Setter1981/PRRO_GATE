@@ -567,6 +567,14 @@ pub struct ReconciliationSummary {
     /// to `ERROR` across all FNs.  One FN may contribute multiple
     /// orphans (rare; verified by `branch_e2_handles_multiple_orphan_shifts`).
     pub shift_orphans_to_error: usize,
+    /// X1 (Phase-3 U1) — docs found resting in a NON-terminal pipeline state
+    /// (`PREPARED`/`SIGNED`/`ENCRYPTED`/`SENDING`) on a SETTLED
+    /// (Online/Offline) FN at the post-recovery quiescent boundary — the
+    /// runtime detector for the #192/P1 ledger-only pin.  Each counted doc
+    /// also emitted a `BOOT_STUCK_NON_TERMINAL_DOC` CRITICAL audit row.
+    /// 0 under the ctx-free boot gate (`deps == None`): ctx-needy docs are
+    /// legitimately deferred to the runtime pass there — deferred, not stuck.
+    pub stuck_non_terminal_docs: usize,
 }
 
 impl ReconciliationSummary {
@@ -1633,6 +1641,75 @@ pub async fn close_orphan_transport_traces(
         closed_count += 1;
     }
     Ok(closed_count)
+}
+
+/// X1 (Phase-3 U1) — production runtime DETECTOR for the #192/P1 ledger-only
+/// pin: after the runtime reconciliation pass, no doc may rest in a
+/// non-terminal pipeline state (`PREPARED`/`SIGNED`/`ENCRYPTED`/`SENDING`) on
+/// a SETTLED FN.  Until now that invariant was enforced only by the
+/// test-gated `invariant_scan` (zero prod callers); this is its cheap
+/// prod-compilable subset.
+///
+/// - **Mode-gated**: only FNs settled in `Online`/`Offline` are scanned.
+///   `GoingOnline` docs are deferred to the W9 drain loop (branch d) and
+///   `Blocked`/`StopMode`/`CryptoDegraded` are operator-recoverable
+///   short-circuits (branch f) — resting docs there are TRANSIENT, and
+///   flagging them would be a false alarm (the same SETTLED gate the fuzzer's
+///   scan uses).
+/// - **Detector, not repairer**: no state transition, no abort (that is
+///   #192/P1 fix territory), no boot failure (Frozen #9 — one stuck doc must
+///   not take the node down).  Surfaces each stuck doc as a CRITICAL
+///   `BOOT_STUCK_NON_TERMINAL_DOC` audit row + `tracing::error` and returns
+///   the count for [`ReconciliationSummary::stuck_non_terminal_docs`].
+/// - Reuses [`fiscal_documents::list_pending_for_fn`] (the boot enumerator)
+///   and filters to the pre-send states — no new SQL surface.
+///
+/// **Returns**: number of stuck docs found (0 on a healthy FN).
+pub async fn run_stuck_doc_guard(pool: &SqlitePool, fiscal_number: &str) -> anyhow::Result<usize> {
+    let Some(ns) = crate::db::repositories::node_state::get(pool, fiscal_number).await? else {
+        return Ok(0);
+    };
+    if !matches!(ns.mode, NodeMode::Online | NodeMode::Offline) {
+        return Ok(0);
+    }
+    let stuck: Vec<_> = fiscal_documents::list_pending_for_fn(pool, fiscal_number)
+        .await?
+        .into_iter()
+        .filter(|d| {
+            matches!(
+                d.state,
+                DocState::Prepared | DocState::Signed | DocState::Encrypted | DocState::Sending
+            )
+        })
+        .collect();
+    for doc in &stuck {
+        let doc_hex = hex_lower(doc.document_id.as_bytes());
+        tracing::error!(
+            fiscal_number,
+            document_id = %doc_hex,
+            state = doc.state.as_str(),
+            lnd = doc.lnd,
+            "X1 ledger-pin guard: doc rests NON-TERMINAL on a settled FN after \
+             reconciliation — a leaked write-path artifact (the #192/P1 class); \
+             operator resolution required"
+        );
+        let payload = format!(
+            r#"{{"fiscal_number":"{fiscal_number}","state":"{}","lnd":{}}}"#,
+            doc.state.as_str(),
+            doc.lnd
+        );
+        audit_log::append(
+            pool,
+            "fiscal_document",
+            &doc_hex,
+            "BOOT_STUCK_NON_TERMINAL_DOC",
+            Severity::Critical,
+            None,
+            Some(&payload),
+        )
+        .await?;
+    }
+    Ok(stuck.len())
 }
 
 pub async fn run_boot_reconciliation(
