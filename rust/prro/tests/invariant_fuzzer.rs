@@ -38,7 +38,7 @@ use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
 
 use model::{ExpectedOutcome, RefModel};
-use op::{DpsScript, Op, Stage};
+use op::{DpsScript, Op, Stage, WireResponse};
 
 /// Every `DocState` variant — the test enumerates the domain to prove the
 /// model's issued predicate mirrors the SSOT const for ALL states (the
@@ -936,12 +936,29 @@ async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
 /// Per-op dispatch gluing T1-T6: model.apply + run_op, then assert per the op's
 /// classification, with the T5 scan-timing rule (never mid-crash) and re-sync
 /// after a fault.
-async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) {
+async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) -> interp::FuzzCtx {
     // A crash transient opened but not yet resolved by a reboot (A1 scan-gate
     // suppresses the scan while set; A3 asserts the no-resend postcond on the
     // resolving reboot).
     let mut pending_crash = false;
+    // U3 realism: a STAGE-COMPOSITION crash (Sign/Finalize/OfflineAck) models
+    // PROCESS death — single-writer + boot-recon-before-serve means a crashed
+    // gateway serves no new request before recovery, so every op until the
+    // resolving Reboot is SKIPPED (pre-U3 a `[Crash(Sign), OnlineSell, …]`
+    // buried the crashed SIGNED doc under later issuance — an unreachable
+    // production state that confuses recovery into a FALSE StuckNonTerminalDoc,
+    // see `dead_until_reboot_skips_ops_after_composition_crash`).  Wire crashes
+    // (Send/Kvt1) are TRANSPORT collapse — the process may live on, later ops
+    // legitimately run (the nightly-find 0627 class) — so they do NOT set this.
+    let mut dead_until_reboot = false;
+    // U3: a WIRE crash (Send/Kvt1 — the doc already hit the wire) is pending;
+    // gates the A3 no-resend assert (composition-crash resumes legitimately
+    // perform a FIRST send — see the A3 comment below).
+    let mut pending_wire_crash = false;
     for op in ops {
+        if dead_until_reboot && !matches!(op, Op::Reboot | Op::RepeatReboot) {
+            continue; // process is dead — no op reaches the gateway before reboot
+        }
         let prior_tip = ctx.read_seed().await; // real MAC tip BEFORE the op
         let codes_before = ctx.consumed_codes_count().await;
         let sends_before = ctx.send_calls(); // wire send count BEFORE the op (A3 no-resend)
@@ -1155,20 +1172,43 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         // suppressed until a reboot resolves it).
         if matches!(real, interp::RealOutcome::Crashed { .. }) {
             pending_crash = true;
+            // U3: a stage-composition crash is a PROCESS death — hold every op
+            // until the resolving Reboot (see `dead_until_reboot` above).
+            if matches!(
+                real,
+                interp::RealOutcome::Crashed {
+                    stage: Stage::Sign | Stage::Finalize | Stage::OfflineAck,
+                    ..
+                }
+            ) {
+                dead_until_reboot = true;
+            } else {
+                pending_wire_crash = true;
+            }
         }
-        // A3: a reboot that RESOLVES a pending crash must NOT re-send (DPS does
-        // not dedup → a blind resend double-fiscalises) — assert the UNIVERSAL
+        // A3: a reboot that RESOLVES a pending WIRE crash must NOT re-send (DPS
+        // does not dedup → a blind resend double-fiscalises) — assert the
         // no-resend bounded postcond IN the property harness (was: faults only
         // resync, silently adopting a resend).  Only no-resend is asserted here:
         // the exact terminal AND the Kvt1 PROBE vary under composition (a SENT
         // doc at GoingOnline is DEFERRED to the W9 drain → no probe THIS reboot),
-        // so those stay pinned in the directed K3/K4 tests; no-resend is the
-        // invariant that holds in ALL compositions.
+        // so those stay pinned in the directed K3/K4 tests.
+        // U3 scope: WIRE crashes only, and only when NO composition crash is
+        // also pending — a composition-crash doc (SIGNED/OFFLINE_LOCAL_ACK)
+        // was never sent, so its resume legitimately performs a FIRST send
+        // (not a re-send); asserting no-resend there would be a false alarm.
         if matches!(op, Op::Reboot | Op::RepeatReboot) && pending_crash {
-            if let Err(d) = oracle::assert_no_resend(sends_before, ctx.send_calls()) {
-                panic!("crash-recovery resend on {op:?}: {d:?}");
+            if pending_wire_crash && !dead_until_reboot {
+                if let Err(d) = oracle::assert_no_resend(sends_before, ctx.send_calls()) {
+                    panic!("crash-recovery resend on {op:?}: {d:?}");
+                }
             }
             pending_crash = false;
+            pending_wire_crash = false;
+        }
+        // U3: the Reboot ran boot reconciliation — the process is alive again.
+        if matches!(op, Op::Reboot | Op::RepeatReboot) {
+            dead_until_reboot = false;
         }
         //   - RMR: `is_settled` also admits `RequiresManualReconciliation` (a
         //     legitimate durable operator terminal, AUD-K8-1) even at mode
@@ -1206,6 +1246,9 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
     // REAL recovery until the node settles, then scans (or fails liveness on a
     // genuine non-settling settle-path; a forced-mode artifact asserts no-resend).
     settle_and_scan(&mut ctx, pending_crash).await;
+    // U3: hand the ctx back so directed pins can inspect the settled ledger
+    // (e.g. the dead-until-reboot doc-count pin) — the capstones ignore it.
+    ctx
 }
 
 fn drive(ops: &[Op], offline: bool) {
@@ -1230,6 +1273,97 @@ fn drive(ops: &[Op], offline: bool) {
             .await;
         }
     });
+}
+
+/// U3 — `drive` variant returning the SETTLED ledger doc count, for directed
+/// pins that assert HOW MANY docs a sequence minted (the full harness — model,
+/// differential, scans — still runs; this only adds the final count read).
+fn drive_counting(ops: &[Op], offline: bool) -> i64 {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let ctx = if offline {
+            run_harness(
+                ops,
+                interp::FuzzCtx::new_offline_open_shift(3).await,
+                RefModel::new_offline_open_shift(3),
+            )
+            .await
+        } else {
+            run_harness(
+                ops,
+                interp::FuzzCtx::new_online_open_shift().await,
+                RefModel::new_online_open_shift(),
+            )
+            .await
+        };
+        ctx.observed_doc_count().await
+    })
+}
+
+// ─── U3 directed pins ───────────────────────────────────────────────────────
+
+/// Nightly find 2026-06-27 — LITERAL pin (strategy-independent).  The committed
+/// corpus seed (`cc e7d4ce…`) regenerates its sequence through the CURRENT
+/// strategy, so U3's widened crash pool re-maps that seed to a different
+/// sequence — the seed alone no longer covers the `apply_go_online`
+/// GoingOnline-start fix.  This pins the exact shrunk sequence literally,
+/// immune to strategy/proptest changes.
+#[test]
+fn nightly_find_0627_go_online_from_going_online_literal_pin() {
+    let ops = vec![
+        Op::Crash(Stage::Send),
+        Op::OfflineSellDuringGoingOnline,
+        Op::GoOnline(DpsScript(vec![WireResponse::Ack, WireResponse::Ack])),
+        Op::OnlineSell(DpsScript(vec![WireResponse::Reject])),
+    ];
+    // The offline-seeded lane is where the find fired (model kept the
+    // crash-completed offline sell at OfflineLocalAck while the real GoOnline
+    // drained it to Ack).  `drive` runs the full differential — a regression
+    // re-fails here deterministically.
+    drive(&ops, true);
+}
+
+/// U3 realism pin — a stage-composition crash (`Sign`/`OfflineAck`) is a
+/// PROCESS death: no op may reach the gateway until the resolving `Reboot`
+/// (single-writer + boot-recon-before-serve).  Pre-U3 the harness ran the ops
+/// anyway, so `[Crash(Sign), OnlineSell, …]` minted a second doc BURYING the
+/// crashed SIGNED one — an unreachable production state (the reason
+/// `Crash(Sign)` was directed-only).  With dead-until-reboot the `OnlineSell`
+/// is SKIPPED: exactly ONE doc exists after settle (the crashed one, resumed
+/// by boot).  RED pre-realism: the buried sequence mints 2 docs.
+#[test]
+fn dead_until_reboot_skips_ops_after_composition_crash() {
+    let ops = vec![
+        Op::Crash(Stage::Sign),
+        Op::OnlineSell(DpsScript::ack_path()),
+        Op::Reboot,
+    ];
+    let docs = drive_counting(&ops, true);
+    assert_eq!(
+        docs, 1,
+        "dead-until-reboot: an op after a stage-composition crash must be \
+         SKIPPED (process dead) — got {docs} docs (2 = the buried-SIGNED \
+         artifact the realism removes)"
+    );
+}
+
+/// U3 / O4 — `Crash(OfflineAck)` (the #192 birth-site window) is reachable and
+/// recoverable: the offline-ack envelope committed OFFLINE_LOCAL_ACK (code
+/// consumed, seed advanced at issuance), the process died before the inbox
+/// finalize, and the resolving Reboot converges WITHOUT double-issuance —
+/// exactly one issued doc, full settled scan clean (run by the harness).
+#[test]
+fn crash_after_offline_ack_reboot_converges_single_issue() {
+    let ops = vec![Op::Crash(Stage::OfflineAck), Op::Reboot];
+    let docs = drive_counting(&ops, true);
+    assert_eq!(
+        docs, 1,
+        "Crash(OfflineAck)+Reboot must converge to exactly ONE issued doc \
+         (no loss, no double-issuance) — got {docs}"
+    );
 }
 
 /// Phase-2 U3 (spec §5): the capstone case count, driven by a DEDICATED

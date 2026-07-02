@@ -26,19 +26,21 @@ fn dps_script() -> impl Strategy<Value = DpsScript> {
     ]
 }
 
-/// One `Op` intent.  `Crash` is drawn ONLY from the wire stages {Send, Kvt1}
-/// (drop-injection).  `Crash(Sign)` IS implemented (commit SIGNED, stop before
-/// dispatch — see `interp::crash_after_sign`) and is exercised by the directed
-/// P1 teeth canary `teeth_p1_boot_resume_codepool_aborts`, but it is NOT emitted
-/// generatively: a crash-after-sign that is FOLLOWED by further issuance before
-/// a reboot (which the context-free generator produces, e.g. `[Crash(Sign),
-/// OnlineSell, …]`) buries the SIGNED doc under a later-issued doc — an
-/// UNREACHABLE production state (single-writer + boot-recon-before-serve means a
-/// crashed process serves no new request before recovery).  Surfacing that
-/// artifact in the generative net is a separate harness-realism follow-up (model
-/// "no new op until reboot" while a crash is pending).  The non-wire stage
-/// {OfflineAck} stays unimplemented; neither is generated, so no generated op
-/// can hit `unimplemented!`.
+/// One `Op` intent.  `Crash` is drawn from the wire stages {Send, Kvt1}
+/// (drop-injection: the in-flight wire future drops — TRANSPORT collapse; the
+/// process may live on, so later ops legitimately run) and, since U3, the
+/// stage-composition stages {Sign, OfflineAck} (the pipeline runs to a
+/// committed-envelope boundary and STOPS — PROCESS death, so the harness
+/// enforces "no new op until the resolving Reboot": dead-until-reboot in
+/// `run_harness`).  That realism is what makes generative emission safe —
+/// pre-U3 a `[Crash(Sign), OnlineSell, …]` buried the SIGNED doc under later
+/// issuance, an unreachable production state (single-writer +
+/// boot-recon-before-serve), so Crash(Sign) was directed-only.
+/// `Crash(OfflineAck)` reaches the #192 birth-site window generatively.
+/// {Finalize} is DEFERRED (its true window sits inside `inline::run`'s private
+/// ladder — see the interp dispatch comment); {Acquire, Kvt2, Drain} stay
+/// unimplemented; none of those is generated, so no generated op can hit
+/// `unimplemented!`.
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         // ── valid (wire ops carry a DpsScript) ──
@@ -47,9 +49,15 @@ fn op() -> impl Strategy<Value = Op> {
         dps_script().prop_map(Op::GoOnline),
         dps_script().prop_map(Op::Drain),
         Just(Op::Reboot),
-        // ── crash — wire stages only (drop-injection); Crash(Sign) is directed-
-        //    only (see fn doc), not generated, to avoid the buried-SIGNED artifact ──
-        prop_oneof![Just(Stage::Send), Just(Stage::Kvt1)].prop_map(Op::Crash),
+        // ── crash — wire drop-injection {Send, Kvt1} + stage-composition
+        //    process-death {Sign, OfflineAck} (dead-until-reboot realism) ──
+        prop_oneof![
+            Just(Stage::Send),
+            Just(Stage::Kvt1),
+            Just(Stage::Sign),
+            Just(Stage::OfflineAck)
+        ]
+        .prop_map(Op::Crash),
         // ── invalid / re-entry / replay (first-class intents) ──
         Just(Op::RepeatDrain),
         Just(Op::RepeatReboot),

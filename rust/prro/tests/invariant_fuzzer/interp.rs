@@ -29,7 +29,7 @@ use tokio::sync::oneshot;
 use prro::db::models::enums::{
     DocState, DocType, FiscalMode, NodeMode, OfflineSessionState, Protocol, ShiftState,
 };
-use prro::db::models::ids::{OfflineSessionId, RequestId, ShiftId};
+use prro::db::models::ids::{CashierId, OfflineSessionId, RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
 use prro::db::repositories::{fiscal_documents, offline_sessions};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
@@ -526,19 +526,26 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
         // ── crash (wire stages only — drop-injection) ──
         Op::Crash(Stage::Send) => crash_via_drop(ctx, Stage::Send).await,
         Op::Crash(Stage::Kvt1) => crash_via_drop(ctx, Stage::Kvt1).await,
-        // P1: `Crash(Sign)` is the NON-wire crash (stage-composition, no DPS
-        // hang) — it commits a SIGNED doc then stops before dispatch, opening
-        // the boot-resume window the P1 abort closes.  DIRECTED-ONLY: the
-        // generator does NOT emit it (see strategy.rs — generative emission
-        // buries the SIGNED doc under later issuance, an unreachable production
-        // state); it is exercised by `teeth_p1_boot_resume_codepool_aborts`.
+        // U3: the stage-composition crashes (no DPS hang — the pipeline is run
+        // up to a committed-envelope boundary, then STOPPED).  They model
+        // PROCESS death, so the harness holds "no new op until the resolving
+        // Reboot" (dead-until-reboot in `run_harness`) — that realism is what
+        // makes generative emission safe (pre-U3 a `[Crash(Sign), OnlineSell]`
+        // buried the SIGNED doc under later issuance, an unreachable prod
+        // state, so Crash(Sign) was directed-only).
         Op::Crash(Stage::Sign) => crash_after_sign(ctx).await,
-        // Remaining non-wire crash stages (OfflineAck) stay a documented
-        // follow-up; the generator never emits them, so this arm is NOT
-        // reachable from op_sequence().
+        // The #192 birth-site window: the offline-ack envelope committed (or
+        // typed-refused) and the process died BEFORE the post-ack inbox
+        // finalize / refusal terminalisation.
+        Op::Crash(Stage::OfflineAck) => crash_after_offline_ack(ctx).await,
+        // Crash(Finalize) is DEFERRED (CP5): its true window (KVT2↔Ack commit ↔
+        // inbox/audit write) sits INSIDE `inline::run`'s private ladder — an
+        // honest tests-only composition cannot reach it without reimplementing
+        // inline logic, and a kill-point hook there is a `src/` change.
+        // Acquire/Kvt2/Drain likewise stay ungenerated.
         Op::Crash(stage) => unimplemented!(
-            "Crash({stage:?}) (non-wire stage-composition) is a documented follow-up; \
-             the generator only emits Crash(Send) / Crash(Kvt1)"
+            "Crash({stage:?}) (non-wire stage-composition) is not implemented; \
+             the generator emits Crash(Send/Kvt1/Sign/OfflineAck) only"
         ),
         // ── invalid / re-entry / replay (run the same seam; expect refusal/no-op) ──
         Op::RepeatDrain => drain_op(ctx, &DpsScript(Vec::new())).await,
@@ -661,10 +668,12 @@ async fn crash_after_sign(ctx: &mut FuzzCtx) -> RealOutcome {
         payload_json: row.payload_json.clone(),
         payload_sha256_canonical: row.payload_sha256_canonical,
         source_sha256: row.payload_sha256_canonical,
-        // Operator attribution is carried separately via the `driver_id` &str
-        // arg to stage_acquire; the command-level newtype fields are None (no
-        // signer-guard path runs in crash_after_sign — acquire + sign only).
-        signed_by_cashier_id: None,
+        // U3: the signer MUST be attributed like the real inline path
+        // (`Some(CASHIER)` matching the fixture shift's opened_by_cashier_id) —
+        // the BOOT resume of this crashed doc runs the stage_send signer guard
+        // on the Online lane, and a NULL signer is a structural refusal
+        // (`SignerIdMissing`) that would false-strand the doc at SIGNED.
+        signed_by_cashier_id: Some(CashierId::new(CASHIER).expect("fixture cashier id")),
         driver_id: None,
     };
     let driver_id = row
@@ -705,16 +714,109 @@ async fn crash_after_sign(ctx: &mut FuzzCtx) -> RealOutcome {
     }
 }
 
+/// U3 / O4 — `Crash(OfflineAck)`: run the pipeline THROUGH the offline-ack
+/// envelope, then STOP — the crash lands AFTER `stage_offline_ack`'s atomic
+/// commit (or typed refusal) and BEFORE the post-ack inbox finalize / refusal
+/// terminalisation.  This is the **#192 birth-site window**:
+///   - ack COMMITTED → the doc is durably `OFFLINE_LOCAL_ACK` (issued, code
+///     consumed) but the inbox row is still PROCESSING — boot must converge it
+///     without double-issuance;
+///   - ack REFUSED (e.g. `CodePoolExhausted` on a drained pool, or a mode
+///     guard) → the SIGNED doc rests with the refusal never terminalised —
+///     exactly the orphan #192/P1 closes on resume.
+///
+/// Both windows are handled by EXISTING recovery; this makes them reachable
+/// generatively.  Returns `Crashed{OfflineAck}` with the observed committed
+/// state, so the harness treats it as a process death (dead-until-reboot).
+async fn crash_after_offline_ack(ctx: &mut FuzzCtx) -> RealOutcome {
+    use prro::services::write_path::stage_offline_ack;
+    let row = ctx.seed_inbox_sell().await;
+    let command = CanonicalFiscalCommand {
+        doc_type: DocType::Sell,
+        business_ts: row
+            .business_ts
+            .clone()
+            .unwrap_or_else(|| "2026-06-09T12:00:00Z".into()),
+        total_sum_kop: row.total_sum_kop,
+        payload_json: row.payload_json.clone(),
+        payload_sha256_canonical: row.payload_sha256_canonical,
+        source_sha256: row.payload_sha256_canonical,
+        // Signer attributed like the real inline path (see crash_after_sign).
+        signed_by_cashier_id: Some(CashierId::new(CASHIER).expect("fixture cashier id")),
+        driver_id: None,
+    };
+    let driver_id = row
+        .driver_id
+        .as_deref()
+        .expect("seed_inbox_sell sets driver_id");
+    let _guard = ctx.gate.clone().lock_owned().await;
+    let acq = match stage_acquire::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        driver_id,
+        row.request_id,
+        command,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return RealOutcome::Refused(format!("crash_after_offline_ack acquire: {e:?}")),
+    };
+    let wctx = match acq {
+        WorkerProcessResult::Proceed(c) | WorkerProcessResult::Resumed(c) => c,
+        WorkerProcessResult::Noop => {
+            return RealOutcome::Refused("crash_after_offline_ack acquire: unexpected Noop".into())
+        }
+        WorkerProcessResult::Rejected { reason } => {
+            return RealOutcome::Refused(format!(
+                "crash_after_offline_ack acquire rejected: {reason:?}"
+            ))
+        }
+    };
+    let signed = match stage_sign::run(&ctx.pool, &ctx.sign_ctx, wctx).await {
+        Ok(s) => s,
+        Err(e) => return RealOutcome::Refused(format!("crash_after_offline_ack sign: {e:?}")),
+    };
+    // Stage 4-offline: the offline-ack envelope itself (atomic single-tx —
+    // commits OFFLINE_LOCAL_ACK + consumes a code, or returns a typed
+    // refusal).  Then STOP: the crash lands before the post-ack handling
+    // (inbox finalize on ack / `terminalise_inbox` on refusal).
+    match stage_offline_ack::run(&ctx.pool, signed.document.document_id, &ctx.fn_id).await {
+        Ok(_outcome) => RealOutcome::Crashed {
+            stage: Stage::OfflineAck,
+            committed_state: ctx.observe_doc_state_by_request_id(&row.request_id).await,
+        },
+        Err(e) => RealOutcome::Refused(format!("crash_after_offline_ack ack: {e:?}")),
+    }
+}
+
 /// `Reboot` → `run_boot_reconciliation`.  The Sending arm is ctx-free
-/// (`deps = None`, no wire call), matching kill-matrix K3; deps-bearing reboot
-/// (SENT-probe arms) is added when Task 3 sequences it.
+/// (no wire call regardless of queue depth), matching kill-matrix K3.
+///
+/// U3: the boot dps is PROVISIONED (ample Ack send/last per pending doc, the
+/// same philosophy as `load_drain_script` / `settle_drain_tick`) — it models
+/// "DPS reachable at recovery".  Without it a composition-crash SIGNED doc on
+/// the Online lane could never make its FIRST send at resume and rested
+/// SIGNED at the settled boundary — a false StuckNonTerminalDoc (production
+/// boot has a live channel; transport-down recovery is separately covered by
+/// the K3 ctx-free SENDING arm + the ER retry class).  Unused entries are
+/// ignored; arms that make no wire call (K3) still make none.
 async fn reboot(ctx: &mut FuzzCtx) -> RealOutcome {
-    // Pass deps so probe-requiring recovery arms (e.g. a SENT doc from a prior
-    // Crash(Kvt1)) can run.  The probe dps has empty queues: a SENDING-arm
-    // recovery makes no wire call (ctx-free → ERROR_RETRYABLE), while a Sent
-    // probe's last_chk on the empty queue returns a typed Err the boot path
-    // handles — never a panic.
     let dps = ctx.new_dps();
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents \
+         WHERE fiscal_number = ? \
+           AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')",
+    )
+    .bind(ctx.fn_id.as_str())
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    for _ in 0..pending {
+        dps.push_send(wire_to_result(WireResponse::Ack));
+        dps.push_last(wire_to_result(WireResponse::Ack));
+        dps.push_last(wire_to_result(WireResponse::Ack));
+    }
     let guard = drain_test_guard();
     let view = ctx.view(&dps);
     match boot_phase::run_boot_reconciliation(&guard, &ctx.pool, &ctx.fn_id, Some(&view)).await {
