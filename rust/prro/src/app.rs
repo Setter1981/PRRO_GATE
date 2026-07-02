@@ -683,6 +683,29 @@ impl App {
                 }
             }
         }
+
+        // X1 (Phase-3 U1) — ledger-pin runtime guard, ONCE after the per-FN
+        // loop: the post-recovery quiescent boundary (the recon mutex is still
+        // held, so no writer can race the scan).  Runtime path only
+        // (`deps == Some`): under the ctx-free boot gate ctx-needy docs are
+        // legitimately deferred to the runtime pass (`BOOT_DISPATCH_DEFERRED`)
+        // — deferred is not stuck, and flagging them would be a false alarm.
+        // The guard is a DETECTOR (audit CRITICAL + summary count) — it never
+        // transitions a doc and never fails the boot (Frozen #9).
+        if deps.is_some() {
+            for fn_cfg in &fns {
+                let stuck = boot_phase::run_stuck_doc_guard(pool, &fn_cfg.fiscal_number)
+                    .await
+                    .map_err(|e| match e.downcast::<sqlx::Error>() {
+                        Ok(sqlx_err) => BootError::Database(sqlx_err),
+                        Err(other) => BootError::ReconciliationFailed {
+                            fiscal_number: fn_cfg.fiscal_number.clone(),
+                            source: other,
+                        },
+                    })?;
+                summary.stuck_non_terminal_docs += stuck;
+            }
+        }
         Ok(summary)
     }
 
