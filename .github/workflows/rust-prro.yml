@@ -116,6 +116,23 @@ jobs:
         # the portable one. ~70s warm on a dev box.
         run: cargo nextest run -p prro_crypto --target ${{ matrix.target }} --locked
 
+      # Disk headroom for the musl leg: it is the ONLY leg that performs TWO
+      # full builds (the musl-target `Build` above + the host-gnu test build
+      # below).  On a cache miss that overflows the runner disk — observed
+      # twice on 2026-07-02 (`rustc-LLVM ERROR: No space left on device`
+      # mid-host-build; the first occurrence killed the runner outright, which
+      # also cancels `if: always()` steps — the same family as the earlier gnu
+      # link-time No-space flake).  The musl target artifacts are dead weight
+      # once `Build` has proven the target compiles — drop them before the
+      # host build.
+      - name: Free musl target artifacts (disk headroom for the host build)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        working-directory: rust
+        run: |
+          du -sh target/x86_64-unknown-linux-musl 2>/dev/null || true
+          rm -rf target/x86_64-unknown-linux-musl
+          df -h / | tail -1
+
       - name: Test (musl built for target, executed on host gnu)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         working-directory: rust
