@@ -335,7 +335,24 @@ impl RefModel {
     /// `Offline → GoingOnline` (skipped — no-op — if not Offline), then the
     /// drain advances the backlog (`GoingOnline → Online`).
     fn apply_go_online(&mut self, script: &DpsScript) -> ExpectedOutcome {
-        if self.mode != NodeMode::Offline {
+        // A GoingOnline start is as real as an Offline one: the REAL seam
+        // (probe + drain) proceeds from the very mid-transition mode it
+        // completes — e.g. `OfflineSellDuringGoingOnline` forces the node
+        // there and does not restore. Restricting the model to an Offline
+        // start left its backlog un-drained while the real drain ACKed it
+        // (nightly find 2026-06-27; the seed replays first from the committed
+        // corpus). Script consumption is identical from either start: the
+        // probe feeds off the separate status queue, the script goes wholly
+        // to the drain (`interp::go_online`).
+        if self.mode != NodeMode::Offline && self.mode != NodeMode::GoingOnline {
+            return ExpectedOutcome::NoMutation;
+        }
+        // AUD-K8-1 mirror (same as `apply_drain`): with a GoingOnline start
+        // modeled, RMR+GoingOnline is reachable (a drain reject escalates to
+        // RMR and leaves the node GoingOnline) — a GoOnline re-tick on a
+        // manual-recon FN must predict NO ledger mutation, because the real
+        // drain's RMR re-entry guard (backlog_drain.rs:725) makes it a no-op.
+        if self.shift_state == ShiftState::RequiresManualReconciliation {
             return ExpectedOutcome::NoMutation;
         }
         self.mode = NodeMode::GoingOnline;
