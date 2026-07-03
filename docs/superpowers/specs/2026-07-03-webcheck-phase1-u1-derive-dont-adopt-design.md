@@ -1,7 +1,7 @@
 # Invariant Fuzzer — Phase 1 U1: Derive-don't-adopt, grounded in OUR pins (design spec)
 
 **Date:** 2026-07-03
-**Status:** **DRAFT — for architect lock.** Drafted by the implementer per hand-off; the architect leads each closure from a RED-pin and locks before code. Open decisions for lock are collected in **§7**.
+**Status:** **LOCKED (architect, 2026-07-03).** Drafted by the implementer; load-bearing pins (D1/D4/D5, scan-host) re-verified by the architect by hand; all five §7 decisions RULED (see §7). Execution: implementer, tests-only, RED-first per closure in the §6 order (D3→D1→D2→D5→D4→funnel), RED evidence per closure in Delivery.
 **Scope:** tests-only (CP4 gates any `src/` need). Convert the fuzzer's five DB-adoption sites (D1–D5) into **derived predictions justified by a cited normative pin of ours**, or a **documented bounded deferral**; make adoption **mechanically exhaustive** via an adoption-lint funnel + static-scan. No corpus, no replay (those are U2/U3).
 **Predecessor:** **U0 MERGED** (`WEBCHECK_GROUND_TRUTH.md`, PR #212 squash `0306ac1`). U1 is fully unblocked in-repo.
 **Authoritative parent:** `docs/superpowers/specs/2026-07-02-webcheck-ground-truth-phase1-design.md` §3/U1 + §5/A1 (LOCKED v2.1).
@@ -129,13 +129,13 @@ Per parent §5/A1. Goal: **FORBIDDEN is empty** — every DB read in `model.rs` 
 
 ---
 
-## §7 Open decisions for architect lock
+## §7 Decisions — RULED at lock (architect, 2026-07-03; load-bearing pins re-verified by hand: D1 `025:181`+ADR-comment exact, D4 `001:332-333` CHECK + `mac_recovery_invoked` `stage_send.rs:951/:970` exact, D5 `classify_check_result` at `kvt2_confirm.rs:301` with arms `SentReplay`+NotFound→`SentNotFoundDowngrade` / `SentFresh|Kvt1Reentry`+NotFound→`StructuralDrift` / superseded→`SupersededHold`, `tests/invariant_scan.rs` exists as grep-scan host)
 
-1. **D5 predicted terminal (CP2):** pin the promoted-script cohort terminal to the **actual** `classify_check_result` arms (`SupersededHold`/`SentNotFoundDowngrade`/`StructuralDrift`) — confirm this over parent §3's looser "Superseded→ERROR_RETRYABLE" shorthand. Decide the exact model-level `Mutated` terminal per script.
-2. **D4 depth:** minimum (no-resend/bounded-dispatch postcond) **or** stronger (predict the single-shot-stub terminal). Recommend **minimum first** (bounded-dispatch), promote to terminal-prediction only if cheap.
-3. **D2 op-coverage:** which ops are "understood enough" to predict-then-assert vs. left as classified `adopt_precondition` deferrals (esp. mid-transition `GoingOnline`/`GoingOffline`).
-4. **Funnel wrapper signatures:** confirm the three names (`read_seed_fixture` / `adopt_fault_deferred` / `adopt_precondition`) and the registry format; confirm the static-scan lands in `invariant_scan.rs` vs a new `tests/` scan file.
-5. **RED-pin authorship:** per strict-TDD dual-session, the architect writes each closure's RED-pin; this draft supplies the pin **targets** (§3), not the pin code.
+1. **D5 predicted terminal — RULED: pin to the REAL `classify_check_result` arms.** The parent §3/dry-run shorthand ("Superseded→all ERROR_RETRYABLE; NotFound-hold→SENT") is **superseded** — it inherited the dry-run's stale wording; the verified arms are `SupersededHold` (doc held in SENT) / `SentNotFoundDowngrade` / `StructuralDrift`. Cohort semantics honor the strict-sequential STOP (`backlog_drain.rs:928-946`) and the RMR halt (`:725`). The precise model-level `Mutated` shape per script is derived during RED from these arms + the drain loop (and reviewed migration-grade) — the RULING fixes the source of truth (real arms), not a guessed table.
+2. **D4 depth — RULED: minimum now** (bounded-dispatch / no-resend postcond per the `IN (0,1)` budget + W10.4 one-shot flag). Terminal-prediction: the implementer MAY attempt it once during GREEN if it falls out deterministic; if not, stay bounded — no CP needed, note the outcome in Delivery.
+3. **D2 op-coverage — RULED: predict-then-assert for every op whose `apply()` already models mode/shift deterministically** — `GoOnline` (full-drain→Online / halted→GoingOnline / reject→RMR), `Drain`/`RepeatDrain` (incl. reject→RMR), `GoOnlineWithoutBacklog`, `OfflineSellDuringGoingOnline` (→GoingOnline), `SellWithClosedShift` (→Closed), plain sells (assert **no-change**). Fault-class ops (`Crash*`/`Reboot`/`RepeatReboot`) → `adopt_fault_deferred` (classified). Mid-transition residue the model deliberately does not resolve → `adopt_precondition` (classified). Nothing else adopts.
+4. **Funnel — RULED:** the three names confirmed as drafted (`read_seed_fixture` / `adopt_fault_deferred` / `adopt_precondition`); registry = call-site classification comments + the scan's allowlist; the static-scan lands in the **existing `rust/prro/tests/invariant_scan.rs`** (verified grep-scan host) — no new file.
+5. **RED-pin authorship — RULED (per the established dual-session pattern, P1→Phase-3):** the LOCKED §3 pin-targets ARE the normative RED content — they state exactly what each pin asserts; the implementer authors the test code **test-first**, and each closure's Delivery must include the RED evidence (the failing output before the derivation). The architect reviews migration-grade. This satisfies "контракты ведут с RED-пина" without serializing on architect-authored test code.
 
 ---
 
