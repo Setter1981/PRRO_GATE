@@ -1,0 +1,5 @@
+# offline_session_drain
+
+Synthetic WebCheck corpus fixture (U2). 12 ops; 10 offline code(s) consumed; 0 dropped DocType(s) (10/12, CP1 decision 2 — not in U0 tables).
+
+Provenance-free: no FN, no counts that identify. All content synthetic; every hash recomputed over synthetic bytes.

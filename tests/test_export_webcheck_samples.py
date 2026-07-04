@@ -6,6 +6,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _load_module():
     path = Path(__file__).resolve().parents[1] / "scripts" / "export_webcheck_samples.py"
@@ -212,3 +214,26 @@ def test_curated_classification_distinguishes_plain_and_excise() -> None:
     assert "sell_with_excise" not in module.classify_sample_categories(plain)
     assert "sell_with_excise" in module.classify_sample_categories(excise)
     assert "sell_with_uktzed" in module.classify_sample_categories(excise)
+
+
+# ── WebCheck U2 (re-check F7): --output-dir is REQUIRED + must be outside-tree ──
+
+
+def test_output_dir_is_required_no_in_tree_default():
+    """Omitting --output-dir must be a hard argparse error (exit 2), never a
+    silent in-tree default (var/webcheck_samples) — the never-transit rule."""
+    module = _load_module()
+    with pytest.raises(SystemExit) as excinfo:
+        module.main(["nonexistent.db"])  # no --output-dir
+    assert excinfo.value.code == 2
+
+
+def test_output_dir_rejects_in_tree_path():
+    """An --output-dir inside the repo tree is refused before any export —
+    WebCheck exports carry real fiscal data and must stay outside the tree."""
+    module = _load_module()
+    repo_root = Path(__file__).resolve().parents[1]
+    in_tree = repo_root / "var" / "webcheck_samples" / "run"
+    with pytest.raises(SystemExit) as excinfo:
+        module.main(["nonexistent.db", "--output-dir", str(in_tree)])
+    assert "inside the repo tree" in str(excinfo.value)
