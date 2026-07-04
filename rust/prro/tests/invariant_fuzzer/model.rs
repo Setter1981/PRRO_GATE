@@ -453,7 +453,40 @@ impl RefModel {
                     code_consumed: None,
                 })
             }
-            // Exotic drain scripts are deferred (agreed follow-up).
+            // U1 D5 — Superseded tip: the strict-sequential drain escalates to
+            // manual.  Empirically probe-derived (the `classify_check_result`
+            // Superseded arm, kvt2_confirm.rs:~357): the HEAD backlog doc →
+            // ERROR_RETRYABLE, the shift → RMR (EscalateManual, M3b §16.7); mode
+            // stays GoingOnline (set by `apply_go_online`); successors held at
+            // OFFLINE_LOCAL_ACK; the seed does NOT re-advance (offline-origin
+            // advanced it at issuance).
+            [WireResponse::Superseded, ..] => {
+                let first = backlog[0];
+                self.docs.insert(first, DocState::ErrorRetryable);
+                self.shift_state = ShiftState::RequiresManualReconciliation;
+                ExpectedOutcome::Mutated(Mutation {
+                    lnd: first,
+                    doc_state: DocState::ErrorRetryable,
+                    seed_after: self.seed,
+                    previous_hash,
+                    code_consumed: None,
+                })
+            }
+            // U1 D5 — send Ack'd, last_chk NotFound: the HEAD doc is HELD at SENT
+            // (`SentNotFoundDowngrade`, kvt2_confirm.rs:~330); shift unchanged,
+            // mode stays GoingOnline, successors held, seed unchanged.
+            [WireResponse::Ack, WireResponse::NotFound, ..] => {
+                let first = backlog[0];
+                self.docs.insert(first, DocState::Sent);
+                ExpectedOutcome::Mutated(Mutation {
+                    lnd: first,
+                    doc_state: DocState::Sent,
+                    seed_after: self.seed,
+                    previous_hash,
+                    code_consumed: None,
+                })
+            }
+            // MAC-recovery (BadHashPrev) drain stays genuinely deferred (§7 #1).
             _ => ExpectedOutcome::Fault,
         }
     }

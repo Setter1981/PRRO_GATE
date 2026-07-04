@@ -242,6 +242,70 @@ async fn teeth_d2_mid_transition_deferral_not_flagged() {
     let _ = run_harness(&[Op::Reboot], ctx, model).await;
 }
 
+// ── U1 D5 — promote deterministic exotic-drain scripts to predicted Mutated ──
+
+/// U1 D5 (POS tooth) — a `[Superseded]` drain is now DIFFERENTIAL-CHECKED, not
+/// Fault-adopted.  Empirically probe-derived (the `classify_check_result`
+/// Superseded arm applied by the strict-sequential drain): the HEAD backlog doc
+/// → `ERROR_RETRYABLE` and the shift escalates to RMR (EscalateManual, M3b
+/// §16.7); successors held at OFFLINE_LOCAL_ACK.  With the CORRECT promotion this
+/// completes; a WRONG predicted terminal makes run_harness's ledger-delta PANIC
+/// (the RED-derivation §7 #1).  Note: the parent §3/D5 "held in SENT" shorthand
+/// was inaccurate for Superseded — the real terminal is ERROR_RETRYABLE + RMR.
+#[tokio::test]
+async fn teeth_d5_superseded_drain_predicts_error_retryable_rmr() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let model = RefModel::new_offline_open_shift(3);
+    let _ = run_harness(
+        &[
+            Op::OfflineSell,
+            Op::OfflineSell,
+            Op::GoOnline(DpsScript::superseded_tip()),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
+/// U1 D5 (POS tooth) — a `[Ack, NotFound]` drain is differential-checked: the
+/// head doc → `SENT` (SentNotFoundDowngrade — held pending), shift unchanged,
+/// successors held.  (Pre-D5 both exotic scripts routed to Fault → resync.)
+#[tokio::test]
+async fn teeth_d5_send_ack_notfound_drain_predicts_sent_held() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let model = RefModel::new_offline_open_shift(3);
+    let _ = run_harness(
+        &[
+            Op::OfflineSell,
+            Op::OfflineSell,
+            Op::GoOnline(DpsScript::send_ack_then_last_not_found()),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
+/// U1 D5 (NEG tooth) — a `[BadHashPrev]` (MAC-recovery) drain stays GENUINELY
+/// deferred to Fault (§7 #1) — NOT force-promoted, so run_harness adopts via
+/// resync and completes without a false differential.
+#[tokio::test]
+async fn teeth_d5_mac_recovery_drain_still_deferred_not_flagged() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let model = RefModel::new_offline_open_shift(3);
+    let _ = run_harness(
+        &[
+            Op::OfflineSell,
+            Op::OfflineSell,
+            Op::GoOnline(DpsScript::bad_hash_prev()),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
 // ── Lane-correctness reinforcements (pure model behaviours) ─────────────────
 
 /// A DPS reject of an online doc → `inline::run` returns Err(DpsRejected) → the
