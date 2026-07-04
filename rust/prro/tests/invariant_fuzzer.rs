@@ -238,7 +238,7 @@ async fn teeth_d2_mid_transition_deferral_not_flagged() {
     let ctx = interp::FuzzCtx::new_online_open_shift().await;
     let mut model = RefModel::new_online_open_shift();
     model.shift_state = ShiftState::Closing; // divergent — but a Reboot is fault-class
-    // Must NOT panic — D2 skips fault ops; adopt_fault_deferred re-syncs the residue.
+                                             // Must NOT panic — D2 skips fault ops; adopt_fault_deferred re-syncs the residue.
     let _ = run_harness(&[Op::Reboot], ctx, model).await;
 }
 

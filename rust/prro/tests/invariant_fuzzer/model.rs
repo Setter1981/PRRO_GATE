@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 
 use sqlx::SqlitePool;
 
-use prro::db::models::enums::{DocState, NodeMode, OfflineSessionState, ShiftState};
 use crate::op::{DpsScript, Op, WireResponse};
+use prro::db::models::enums::{DocState, NodeMode, OfflineSessionState, ShiftState};
 
 /// U1 D3 — model-local FORK of the offline-origin "issued" set.  Deliberately a
 /// SEPARATE literal from the prod SSOT const
