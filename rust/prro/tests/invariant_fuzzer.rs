@@ -142,6 +142,56 @@ fn teeth_d3_membership_semantics_unchanged() {
     }
 }
 
+// ── U1 D1 — predict/assert next_lnd (per-FN monotonic allocator) ────────────
+
+/// U1 D1 (POS tooth) — `run_harness` must assert the model's PREDICTED allocator
+/// (`next_lnd`) equals the DB SSOT (`node_state.next_lnd`, the `allocate_next_lnd`
+/// sequencer — ADR-M3-A1).  A `DuplicateIdemKey` is a NoMutation op (mints no
+/// doc), so `check_differential` CANNOT see a desynced allocator — only the D1
+/// assert can.  We pre-desync `model.next_lnd = 99`; with the D1 assert in
+/// `run_harness` this PANICS.  Revert target: the D1
+/// `assert_eq!(model.next_lnd, read_next_lnd())` block — removing it lets the
+/// NoMutation op pass with a stale allocator → no panic → this tooth FAILS.
+#[test]
+fn teeth_d1_next_lnd_predicts_db() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ctx = interp::FuzzCtx::new_online_open_shift().await;
+            let mut model = RefModel::new_online_open_shift();
+            // Desync ONLY the allocator; the op mints no doc, so the doc-lnd
+            // differential is blind to it — the D1 assert is the sole guard.
+            model.next_lnd = 99;
+            run_harness(&[Op::DuplicateIdemKey], ctx, model).await;
+        });
+    }))
+    .is_err();
+    std::panic::set_hook(prev);
+    assert!(
+        panicked,
+        "U1 D1: run_harness must assert model.next_lnd == node_state.next_lnd for a non-fault \
+         op — a NoMutation op with a desynced allocator returned cleanly, so the D1 \
+         predict-then-assert is missing and the stale allocator was adopted silently."
+    );
+}
+
+/// U1 D1 (NEG tooth) — a legitimate gapless lnd consumption is NOT flagged.  An
+/// online reject mints a NON-ISSUED `Rejected` row: the lnd IS consumed (the
+/// allocator bumps) but the doc is not issued.  The model predicts the bump, so
+/// the D1 assert holds — `run_harness` completes without panic.
+#[tokio::test]
+async fn teeth_d1_gapless_reissue_not_flagged() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    // Must NOT panic — a consumed-but-not-issued lnd is a legal gapless bump.
+    let _ = run_harness(&[Op::OnlineSell(DpsScript::send_then_reject())], ctx, model).await;
+}
+
 // ── Lane-correctness reinforcements (pure model behaviours) ─────────────────
 
 /// A DPS reject of an online doc → `inline::run` returns Err(DpsRejected) → the
@@ -1153,6 +1203,23 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                 "AUD-K8-1: op {op:?} on an RMR FN made a NEW wire send — the drain \
                  re-entry guard (backlog_drain.rs:725) must halt a re-tick on a \
                  manual-reconciliation FN"
+            );
+        }
+
+        // U1 D1 — next_lnd is PREDICTED, not adopted, for non-fault ops.  The
+        // model advances its allocator per issuing op (`apply`); assert that
+        // prediction equals the DB SSOT `node_state.next_lnd` (the
+        // `allocate_next_lnd` sequencer, ADR-M3-A1) — per-FN monotonic, no-gap
+        // (`ux_fd_fn_lnd`).  This catches an allocator drift the DOC-lnd
+        // differential CANNOT: a NoMutation op has no doc, and a missed increment
+        // leaves the doc correct but the allocator stale.  Fault ops cannot
+        // predict the crash-window allocation → they adopt via `resync_from_db`
+        // (the classified deferral, §4 funnel), so D1 skips them.
+        if !matches!(class, oracle::OpClass::FaultOrRecovery) {
+            assert_eq!(
+                model.next_lnd,
+                ctx.read_next_lnd().await,
+                "U1 D1: model next_lnd prediction diverged from node_state.next_lnd on {op:?}"
             );
         }
 
