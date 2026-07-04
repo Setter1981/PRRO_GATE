@@ -306,6 +306,34 @@ async fn teeth_d5_mac_recovery_drain_still_deferred_not_flagged() {
     .await;
 }
 
+// ── U1 D4 — BadHashPrev online sell: bounded MAC-recovery (no unbounded resend) ──
+
+/// U1 D4 (NEG tooth) — a BadHashPrev online sell's SINGLE W10.4 MAC-recovery
+/// re-entry is legitimate and NOT flagged: the wire send-count (original send +
+/// at most one re-send) is within the D4 bound, so run_harness completes.  This
+/// is the RED-first test — a too-tight bound makes it PANIC (revealing the real
+/// send-delta); the correct bound passes.  The POS "unbounded resend is caught"
+/// is proven by that RED evidence + the generative gate in the FaultOrRecovery
+/// arm (a reverted src one-shot guard, stage_send.rs:970, would trip it) —
+/// analogous to AUD-K8-1, whose over-budget breach also cannot be triggered from
+/// tests without a forbidden `src/` change (CP4).
+#[tokio::test]
+async fn teeth_d4_single_recovery_reentry_not_flagged() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(&[Op::OnlineSell(DpsScript::bad_hash_prev())], ctx, model).await;
+}
+
+/// U1 D4 (NEG tooth) — the D4 bound is SCOPED to the BadHashPrev MAC-recovery
+/// path: a normal online sell (PredictableMutating, not Fault) is NOT subject to
+/// it and completes unflagged.
+#[tokio::test]
+async fn teeth_d4_normal_online_sell_not_subject_to_bound() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(&[Op::OnlineSell(DpsScript::ack_path())], ctx, model).await;
+}
+
 // ── Lane-correctness reinforcements (pure model behaviours) ─────────────────
 
 /// A DPS reject of an online doc → `inline::run` returns Err(DpsRejected) → the
@@ -1206,6 +1234,30 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                             || shift_after == ShiftState::RequiresManualReconciliation,
                         "MH: exotic drain {op:?} moved shift {shift_before:?} -> {shift_after:?} \
                          (neither unchanged nor RMR)"
+                    );
+                }
+                // U1 D4 — a BadHashPrev online sell routes to the bounded W10.4
+                // MAC-recovery path (DDL `mac_recovery_attempts CHECK IN (0,1)` +
+                // the `mac_recovery_invoked` one-shot flag, stage_send.rs:951/970):
+                // AT MOST ONE re-sign + re-send per `run()`.  The pure model
+                // defers the terminal (Fault), but the WIRE send-count must stay
+                // bounded — no unbounded resend.  A regression that removed the
+                // one-shot guard would resend without limit; this generative gate
+                // catches it (like AUD-K8-1's wire-call bound).
+                if matches!(
+                    op,
+                    Op::OnlineSell(s) if matches!(s.0.as_slice(), [WireResponse::BadHashPrev, ..])
+                ) {
+                    let send_delta = ctx.send_calls() - sends_before;
+                    // Probe-derived: the real send-delta is exactly 1 (the single
+                    // original send; the W10.4 re-sign's re-send hits the stub's
+                    // empty queue → terminal, no second wire call).  Bound at the
+                    // exact threshold, so ANY extra resend (a reverted one-shot
+                    // guard → send-delta ≥ 2) is caught.
+                    assert!(
+                        send_delta <= 1,
+                        "U1 D4: BadHashPrev online sell wire send-delta {send_delta} exceeds the \
+                         bounded MAC-recovery budget (original send + at most one W10.4 re-send)"
                     );
                 }
                 model.resync_from_db(&ctx.pool).await;
