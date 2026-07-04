@@ -192,6 +192,56 @@ async fn teeth_d1_gapless_reissue_not_flagged() {
     let _ = run_harness(&[Op::OnlineSell(DpsScript::send_then_reject())], ctx, model).await;
 }
 
+// ── U1 D2 — predict/assert mode + shift_state (before precondition-resync) ───
+
+/// U1 D2 (POS tooth) — `run_harness` must assert the model's PREDICTED
+/// `mode`/`shift_state` equals the DB BEFORE `resync_preconditions_from_db`
+/// (which otherwise silently ADOPTS them).  A `DuplicateIdemKey` is a NoMutation
+/// op that changes neither, so a pre-desynced `model.shift_state` survives every
+/// other check — only the D2 assert catches it.  Revert target: the D2
+/// `assert_eq!(model.shift_state, read_shift_state())` block — without it the
+/// resync adopts the DB shift, masking the desync → no panic → this tooth FAILS.
+#[test]
+fn teeth_d2_predicted_shift_matches_db() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ctx = interp::FuzzCtx::new_online_open_shift().await;
+            let mut model = RefModel::new_online_open_shift();
+            // Desync ONLY the predicted shift; the NoMutation op won't move it, so
+            // the D2 pre-resync assert is the sole guard.
+            model.shift_state = ShiftState::Closing;
+            run_harness(&[Op::DuplicateIdemKey], ctx, model).await;
+        });
+    }))
+    .is_err();
+    std::panic::set_hook(prev);
+    assert!(
+        panicked,
+        "U1 D2: run_harness must assert model shift_state/mode == DB before \
+         resync_preconditions adopts them — a desynced prediction survived cleanly, so the \
+         D2 predict-then-assert is missing and the divergence was adopted silently."
+    );
+}
+
+/// U1 D2 (NEG tooth) — D2 must NOT assert on a FAULT-class op (the crash-window
+/// residue → adopt_fault_deferred).  A `Reboot` with a deliberately-divergent
+/// model `shift_state` must NOT trip D2 — the fault branch re-syncs via
+/// `resync_from_db`, it does not predict-then-assert.
+#[tokio::test]
+async fn teeth_d2_mid_transition_deferral_not_flagged() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let mut model = RefModel::new_online_open_shift();
+    model.shift_state = ShiftState::Closing; // divergent — but a Reboot is fault-class
+    // Must NOT panic — D2 skips fault ops; resync_from_db re-syncs the residue.
+    let _ = run_harness(&[Op::Reboot], ctx, model).await;
+}
+
 // ── Lane-correctness reinforcements (pure model behaviours) ─────────────────
 
 /// A DPS reject of an online doc → `inline::run` returns Err(DpsRejected) → the
@@ -1221,6 +1271,37 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                 ctx.read_next_lnd().await,
                 "U1 D1: model next_lnd prediction diverged from node_state.next_lnd on {op:?}"
             );
+        }
+
+        // U1 D2 — mode / shift_state are PREDICTED, not adopted, for non-fault
+        // ops.  `apply` sets both from the M3b 9-state shift machine + the
+        // node-mode machine (enums.rs); assert the prediction equals the DB.
+        // Fault ops adopt via `resync_from_db` (adopt_fault_deferred), so D2 skips
+        // them.  §7 #3 RESIDUE SPLIT: the drain / go-online MODE outcome (the
+        // `GoingOnline → Online` CAS in `drain_backlog`) is a MID-TRANSITION
+        // residue the pure model cannot pin — a FORCED `GoingOnline`
+        // (`OfflineSellDuringGoingOnline`) does not complete to `Online` the way a
+        // real go-online does, so `drain_backlog`'s empty-backlog CAS over-predicts
+        // `Online` where reality stays `GoingOnline`.  Those ops therefore DEFER
+        // mode to `resync_preconditions_from_db` (adopt_precondition); their SHIFT
+        // (RMR / unchanged) IS predicted and asserted.
+        if !matches!(class, oracle::OpClass::FaultOrRecovery) {
+            assert_eq!(
+                model.shift_state,
+                ctx.read_shift_state().await,
+                "U1 D2: model shift_state prediction diverged from node_state.shift_state on {op:?}"
+            );
+            let mode_is_transition_residue = matches!(
+                op,
+                Op::GoOnline(_) | Op::GoOnlineWithoutBacklog | Op::Drain(_) | Op::RepeatDrain
+            );
+            if !mode_is_transition_residue {
+                assert_eq!(
+                    model.mode,
+                    ctx.read_node_mode().await,
+                    "U1 D2: model mode prediction diverged from node_state.mode on {op:?}"
+                );
+            }
         }
 
         // Scan-timing (T5, generalised): scan ONLY in a SETTLED state — NOT
