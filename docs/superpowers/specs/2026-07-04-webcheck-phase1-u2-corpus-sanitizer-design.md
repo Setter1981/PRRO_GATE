@@ -239,3 +239,30 @@ by the exporter `--limit`, so the corpus is a handful of short sequences, not a 
 - Exporter: `scripts/export_webcheck_samples.py` (fix target: line 142 in-tree default; `--output-dir`).
 - Fixture precedent: `golden/webcheck_sell_online/`, `golden/webcheck_service_in/`.
 - U3 consumer: parent §3/U3 (golden `CanonicalFiscalCommand` → `inline::run`; abstract DPS classes).
+
+---
+
+## §11 CP1 SIGN-OFF (architect, 2026-07-04) — APPROVED with rulings
+
+Reviewed §2 (allow-list-by-construction — the strongest possible guarantee: the sanitizer emits only synthetic
+fields, no copy-through), §3 (shape features all U0-grounded), §4 (recompute locked), §6 (scanner patterns +
+CP1-on-top), §8 (aggregate-justified, FN-anonymized selection). **Phase-2 is GO.** Rulings on the §5 open items:
+
+1. **Exporter fix timing:** land it as the FIRST commit of the Phase-2 branch (data-free `scripts/` change +
+   its test) — same PR, not a separate one.
+2. **DocType 10/12 — RULED: DROP, never guess-map.** They are absent from U0's tables; per the U0 gate rule
+   nothing may rely on un-cited WebCheck behavior. Each fixture's `SHAPE.md` records "dropped N ops of unmapped
+   DocType 10/12" (honest drop, not silent). If U3 ever needs them → extend U0 first (a follow-up U0 row with
+   C# citations), then map.
+3. **Scanner allow-list — LOCKED synthetic constants:** fiscal_number = **10-digit numeric with reserved prefix
+   `9` (`900000000N`)** — NOT an alphanumeric `FN9…` (our validators/fixtures use numeric 10-digit FNs; real
+   dumps start `4…`, the demo `7…`, so "10-digit FN not starting with 9 = FAIL" is a clean scanner rule and the
+   demo FN fails it too). Synthetic epoch `2026-01-01T00:00:00Z`, bucket 60s; `cashier-NN`; goods
+   `"Synthetic good"` / code `"SYNTH"`; amounts 5000-kop unit. The scanner allow-list is exactly this set.
+4. **Cancel-edge fixture:** INCLUDE as the optional third fixture if it stays small (one short sequence) — it
+   exercises the U0 `-1` class cheaply and widens U3's replay classes.
+5. **Phase-2 base:** branch from current main (`c7b84bf`, post-#215) — already available.
+
+Phase-2 proceeds per §9 (RED-first: planted-leak scanner tooth; perturbed-payload hash tooth). The sanitizer +
+one sample fixture come back to the architect for the §6 "CP1-on-top" review BEFORE the corpus commit lands in
+the PR (i.e. the PR is reviewed with the sample first, corpus after).
