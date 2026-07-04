@@ -1,0 +1,22 @@
+{
+  "lnd_sequence": [
+    1,
+    2,
+    3
+  ],
+  "state_class_sequence": [
+    "online",
+    "online",
+    "online"
+  ],
+  "offline_codes_consumed": 0,
+  "previous_hash_chain": [
+    null,
+    "f3967d21173b31ba5a5415cc415dd478b7d4470878c2a381e3d8f50330f99a54",
+    "9669d935f1b14c96964ad08dce0743ba10aef7b83005ca3ebfec0ac1a401bef6"
+  ],
+  "issued_lnds": [
+    2
+  ],
+  "dropped_doctype_count": 1
+}

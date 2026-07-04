@@ -1,0 +1,653 @@
+{
+  "corpus_schema_version": 1,
+  "shape_name": "cancel_edge",
+  "fiscal_number": "9000000001",
+  "synthetic": true,
+  "replay": true,
+  "sequence": [
+    {
+      "op_index": 0,
+      "operation_type": "SHIFT_OPEN",
+      "lnd": 1,
+      "offline_lifecycle_class": "online",
+      "dps_outcome_class": "Ack",
+      "canonical_command": {
+        "schema_version": "1.0.1",
+        "request_id": "cmd-0000",
+        "idempotency_key": "shift_open:9000000001:0000",
+        "protocol": "WEBCHECK_XMLRPC",
+        "operation_type": "SHIFT_OPEN",
+        "fiscal_number": "9000000001",
+        "business_ts": "2026-01-01T00:00:00Z",
+        "payload": {
+          "method": "SHIFT_OPEN",
+          "cashier_id": "cashier-01"
+        },
+        "payload_json": "{\"cashier_id\":\"cashier-01\",\"method\":\"SHIFT_OPEN\"}",
+        "payload_sha256": "f3967d21173b31ba5a5415cc415dd478b7d4470878c2a381e3d8f50330f99a54"
+      }
+    },
+    {
+      "op_index": 1,
+      "operation_type": "SELL",
+      "lnd": 2,
+      "offline_lifecycle_class": "online",
+      "dps_outcome_class": "Ack",
+      "canonical_command": {
+        "schema_version": "1.0.1",
+        "request_id": "cmd-0001",
+        "idempotency_key": "sell:9000000001:0001",
+        "protocol": "WEBCHECK_XMLRPC",
+        "operation_type": "SELL",
+        "fiscal_number": "9000000001",
+        "business_ts": "2026-01-01T00:01:00Z",
+        "payload": {
+          "method": "SellCheck",
+          "currency": "UAH",
+          "cashier_id": "cashier-01",
+          "goods_count": 1,
+          "payments_count": 1,
+          "receipt": {
+            "type": "SELL",
+            "goods": [
+              {
+                "item_id": "item-2",
+                "item_no": 1,
+                "code": "SYNTH",
+                "name": "Synthetic good",
+                "price": 5000,
+                "quantity": 1000,
+                "sum": 5000
+              }
+            ],
+            "payments": [
+              {
+                "payment_id": "payment-1",
+                "payment_type": "CASH",
+                "label": "CASH",
+                "amount": 5000
+              }
+            ],
+            "totals": {
+              "total_sum": 5000
+            }
+          }
+        },
+        "payload_json": "{\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":1,\"method\":\"SellCheck\",\"payments_count\":1,\"receipt\":{\"goods\":[{\"code\":\"SYNTH\",\"item_id\":\"item-2\",\"item_no\":1,\"name\":\"Synthetic good\",\"price\":5000,\"quantity\":1000,\"sum\":5000}],\"payments\":[{\"amount\":5000,\"label\":\"CASH\",\"payment_id\":\"payment-1\",\"payment_type\":\"CASH\"}],\"totals\":{\"total_sum\":5000},\"type\":\"SELL\"}}",
+        "payload_sha256": "9669d935f1b14c96964ad08dce0743ba10aef7b83005ca3ebfec0ac1a401bef6"
+      }
+    },
+    {
+      "op_index": 2,
+      "operation_type": "SELL",
+      "lnd": 3,
+      "offline_lifecycle_class": "online",
+      "dps_outcome_class": "Ack",
+      "canonical_command": {
+        "schema_version": "1.0.1",
+        "request_id": "cmd-0002",
+        "idempotency_key": "sell:9000000001:0002",
+        "protocol": "WEBCHECK_XMLRPC",
+        "operation_type": "SELL",
+        "fiscal_number": "9000000001",
+        "business_ts": "2026-01-01T00:02:00Z",
+        "payload": {
+          "method": "SellCheck",
+          "currency": "UAH",
+          "cashier_id": "cashier-01",
+          "goods_count": 1,
+          "payments_count": 1,
+          "receipt": {
+            "type": "SELL",
+            "goods": [
+              {
+                "item_id": "item-3",
+                "item_no": 1,
+                "code": "SYNTH",
+                "name": "Synthetic good",
+                "price": 5000,
+                "quantity": 1000,
+                "sum": 5000
+              }
+            ],
+            "payments": [
+              {
+                "payment_id": "payment-1",
+                "payment_type": "CASH",
+                "label": "CASH",
+                "amount": 5000
+              }
+            ],
+            "totals": {
+              "total_sum": 5000
+            }
+          }
+        },
+        "payload_json": "{\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":1,\"method\":\"SellCheck\",\"payments_count\":1,\"receipt\":{\"goods\":[{\"code\":\"SYNTH\",\"item_id\":\"item-3\",\"item_no\":1,\"name\":\"Synthetic good\",\"price\":5000,\"quantity\":1000,\"sum\":5000}],\"payments\":[{\"amount\":5000,\"label\":\"CASH\",\"payment_id\":\"payment-1\",\"payment_type\":\"CASH\"}],\"totals\":{\"total_sum\":5000},\"type\":\"SELL\"}}",
+        "payload_sha256": "1eaf8a8551b26ff5458128c3aecb224a7d48f39bbc54325380779f8f488b8ce2"
+      }
+    },
+    {
+      "op_index": 3,
+      "operation_type": "SELL",
+      "lnd": 4,
+      "offline_lifecycle_class": "online",
+      "dps_outcome_class": "Ack",
+      "canonical_command": {
+        "schema_version": "1.0.1",
+        "request_id": "cmd-0003",
+        "idempotency_key": "sell:9000000001:0003",
+        "protocol": "WEBCHECK_XMLRPC",
+        "operation_type": "SELL",
+        "fiscal_number": "9000000001",
+        "business_ts": "2026-01-01T00:03:00Z",
+        "payload": {
+          "method": "SellCheck",
+          "currency": "UAH",
+          "cashier_id": "cashier-01",
+          "goods_count": 1,
+          "payments_count": 1,
+          "receipt": {
+            "type": "SELL",
+            "goods": [
+              {
+                "item_id": "item-4",
+                "item_no": 1,
+                "code": "SYNTH",
+                "name": "Synthetic good",
+                "price": 5000,
+                "quantity": 1000,
+                "sum": 5000
+              }
+            ],
+            "payments": [
+              {
+                "payment_id": "payment-1",
+                "payment_type": "CASH",
+                "label": "CASH",
+                "amount": 5000
+              }
+            ],
+            "totals": {
+              "total_sum": 5000
+            }
+          }
+        },
+        "payload_json": "{\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":1,\"method\":\"SellCheck\",\"payments_count\":1,\"receipt\":{\"goods\":[{\"code\":\"SYNTH\",\"item_id\":\"item-4\",\"item_no\":1,\"name\":\"Synthetic good\",\"price\":5000,\"quantity\":1000,\"sum\":5000}],\"payments\":[{\"amount\":5000,\"label\":\"CASH\",\"payment_id\":\"payment-1\",\"payment_type\":\"CASH\"}],\"totals\":{\"total_sum\":5000},\"type\":\"SELL\"}}",
+        "payload_sha256": "8ce4b60bccbd7f5b218cf3b5e024818b17b2c64b8339b2f19de283766f19cbe3"
+      }
+    },
+    {
+      "op_index": 4,
+      "operation_type": "SELL",
+      "lnd": 5,
+      "offline_lifecycle_class": "online",
+      "dps_outcome_class": "Ack",
+      "canonical_command": {
+        "schema_version": "1.0.1",
+        "request_id": "cmd-0004",
+        "idempotency_key": "sell:9000000001:0004",
+        "protocol": "WEBCHECK_XMLRPC",
+        "operation_type": "SELL",
+        "fiscal_number": "9000000001",
+        "business_ts": "2026-01-01T00:04:00Z",
+        "payload": {
+          "method": "SellCheck",
+          "currency": "UAH",
+          "cashier_id": "cashier-01",
+          "goods_count": 1,
+          "payments_count": 1,
+          "receipt": {
+            "type": "SELL",
+            "goods": [
+              {
+                "item_id": "item-5",
+                "item_no": 1,
+                "code": "SYNTH",
+                "name": "Synthetic good",
+                "price": 5000,
+                "quantity": 1000,
+                "sum": 5000
+              }
+            ],
+            "payments": [
+              {
+                "payment_id": "payment-1",
+                "payment_type": "CASH",
+                "label": "CASH",
+                "amount": 5000
+              }
+            ],
+            "totals": {
+              "total_sum": 5000
+            }
+          }
+        },
+        "payload_json": "{\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":1,\"method\":\"SellCheck\",\"payments_count\":1,\"receipt\":{\"goods\":[{\"code\":\"SYNTH\",\"item_id\":\"item-5\",\"item_no\":1,\"name\":\"Synthetic good\",\"price\":5000,\"quantity\":1000,\"sum\":5000}],\"payments\":[{\"amount\":5000,\"label\":\"CASH\",\"payment_id\":\"payment-1\",\"payment_type\":\"CASH\"}],\"totals\":{\"total_sum\":5000},\"type\":\"SELL\"}}",
+        "payload_sha256": "3d6d64bca7cc10c5b2063583977a6a2e668037bdbbcbabed6fe542a1fe0acc6b"
+      }
+    },
+    {
+      "op_index": 5,
+      "operation_type": "DRAIN",
+      "lnd": 6,
+      "offline_lifecycle_class": "cancelled",
+      "dps_outcome_class": "OfflineAck",
+      "canonical_command": {
+        "schema_version": "1.0.1",
+        "request_id": "cmd-0005",
+        "idempotency_key": "drain:9000000001:0005",
+        "protocol": "WEBCHECK_XMLRPC",
+        "operation_type": "DRAIN",
+        "fiscal_number": "9000000001",
+        "business_ts": "2026-01-01T00:05:00Z",
+        "payload": {
+          "method": "DRAIN",
+          "cashier_id": "cashier-01"
+        },
+        "payload_json": "{\"cashier_id\":\"cashier-01\",\"method\":\"DRAIN\"}",
+        "payload_sha256": "b0e002add2a93f6f19a22aa4bcc534c70739af8f715ee742c6a46d4a8bea8686"
+      }
+    },
+    {
+      "op_index": 6,
+      "operation_type": "SELL",
+      "lnd": 7,
+      "offline_lifecycle_class": "online",
+      "dps_outcome_class": "Ack",
+      "canonical_command": {
+        "schema_version": "1.0.1",
+        "request_id": "cmd-0006",
+        "idempotency_key": "sell:9000000001:0006",
+        "protocol": "WEBCHECK_XMLRPC",
+        "operation_type": "SELL",
+        "fiscal_number": "9000000001",
+        "business_ts": "2026-01-01T00:06:00Z",
+        "payload": {
+          "method": "SellCheck",
+          "currency": "UAH",
+          "cashier_id": "cashier-01",
+          "goods_count": 1,
+          "payments_count": 1,
+          "receipt": {
+            "type": "SELL",
+            "goods": [
+              {
+                "item_id": "item-7",
+                "item_no": 1,
+                "code": "SYNTH",
+                "name": "Synthetic good",
+                "price": 5000,
+                "quantity": 1000,
+                "sum": 5000
+              }
+            ],
+            "payments": [
+              {
+                "payment_id": "payment-1",
+                "payment_type": "CASH",
+                "label": "CASH",
+                "amount": 5000
+              }
+            ],
+            "totals": {
+              "total_sum": 5000
+            }
+          }
+        },
+        "payload_json": "{\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":1,\"method\":\"SellCheck\",\"payments_count\":1,\"receipt\":{\"goods\":[{\"code\":\"SYNTH\",\"item_id\":\"item-7\",\"item_no\":1,\"name\":\"Synthetic good\",\"price\":5000,\"quantity\":1000,\"sum\":5000}],\"payments\":[{\"amount\":5000,\"label\":\"CASH\",\"payment_id\":\"payment-1\",\"payment_type\":\"CASH\"}],\"totals\":{\"total_sum\":5000},\"type\":\"SELL\"}}",
+        "payload_sha256": "ced258ad4510d86069345b6d88b4eae9386af43f88c072833af7fb3419d0b0c8"
+      }
+    },
+    {
+      "op_index": 7,
+      "operation_type": "SELL",
+      "lnd": 8,
+      "offline_lifecycle_class": "online",
+      "dps_outcome_class": "Ack",
+      "canonical_command": {
+        "schema_version": "1.0.1",
+        "request_id": "cmd-0007",
+        "idempotency_key": "sell:9000000001:0007",
+        "protocol": "WEBCHECK_XMLRPC",
+        "operation_type": "SELL",
+        "fiscal_number": "9000000001",
+        "business_ts": "2026-01-01T00:07:00Z",
+        "payload": {
+          "method": "SellCheck",
+          "currency": "UAH",
+          "cashier_id": "cashier-01",
+          "goods_count": 1,
+          "payments_count": 1,
+          "receipt": {
+            "type": "SELL",
+            "goods": [
+              {
+                "item_id": "item-8",
+                "item_no": 1,
+                "code": "SYNTH",
+                "name": "Synthetic good",
+                "price": 5000,
+                "quantity": 1000,
+                "sum": 5000
+              }
+            ],
+            "payments": [
+              {
+                "payment_id": "payment-1",
+                "payment_type": "CASH",
+                "label": "CASH",
+                "amount": 5000
+              }
+            ],
+            "totals": {
+              "total_sum": 5000
+            }
+          }
+        },
+        "payload_json": "{\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":1,\"method\":\"SellCheck\",\"payments_count\":1,\"receipt\":{\"goods\":[{\"code\":\"SYNTH\",\"item_id\":\"item-8\",\"item_no\":1,\"name\":\"Synthetic good\",\"price\":5000,\"quantity\":1000,\"sum\":5000}],\"payments\":[{\"amount\":5000,\"label\":\"CASH\",\"payment_id\":\"payment-1\",\"payment_type\":\"CASH\"}],\"totals\":{\"total_sum\":5000},\"type\":\"SELL\"}}",
+        "payload_sha256": "6f80cf0a92b02131cfa89b6dcac759c088ddf411798eeaea9227f522b841cec8"
+      }
+    },
+    {
+      "op_index": 8,
+      "operation_type": "SELL",
+      "lnd": 9,
+      "offline_lifecycle_class": "online",
+      "dps_outcome_class": "Ack",
+      "canonical_command": {
+        "schema_version": "1.0.1",
+        "request_id": "cmd-0008",
+        "idempotency_key": "sell:9000000001:0008",
+        "protocol": "WEBCHECK_XMLRPC",
+        "operation_type": "SELL",
+        "fiscal_number": "9000000001",
+        "business_ts": "2026-01-01T00:08:00Z",
+        "payload": {
+          "method": "SellCheck",
+          "currency": "UAH",
+          "cashier_id": "cashier-01",
+          "goods_count": 1,
+          "payments_count": 1,
+          "receipt": {
+            "type": "SELL",
+            "goods": [
+              {
+                "item_id": "item-9",
+                "item_no": 1,
+                "code": "SYNTH",
+                "name": "Synthetic good",
+                "price": 5000,
+                "quantity": 1000,
+                "sum": 5000
+              }
+            ],
+            "payments": [
+              {
+                "payment_id": "payment-1",
+                "payment_type": "CASH",
+                "label": "CASH",
+                "amount": 5000
+              }
+            ],
+            "totals": {
+              "total_sum": 5000
+            }
+          }
+        },
+        "payload_json": "{\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":1,\"method\":\"SellCheck\",\"payments_count\":1,\"receipt\":{\"goods\":[{\"code\":\"SYNTH\",\"item_id\":\"item-9\",\"item_no\":1,\"name\":\"Synthetic good\",\"price\":5000,\"quantity\":1000,\"sum\":5000}],\"payments\":[{\"amount\":5000,\"label\":\"CASH\",\"payment_id\":\"payment-1\",\"payment_type\":\"CASH\"}],\"totals\":{\"total_sum\":5000},\"type\":\"SELL\"}}",
+        "payload_sha256": "eae434a53dc11f2985ba996de42c748c0beb92ad74481a1807a12d1b2480a422"
+      }
+    },
+    {
+      "op_index": 9,
+      "operation_type": "SELL",
+      "lnd": 10,
+      "offline_lifecycle_class": "online",
+      "dps_outcome_class": "Ack",
+      "canonical_command": {
+        "schema_version": "1.0.1",
+        "request_id": "cmd-0009",
+        "idempotency_key": "sell:9000000001:0009",
+        "protocol": "WEBCHECK_XMLRPC",
+        "operation_type": "SELL",
+        "fiscal_number": "9000000001",
+        "business_ts": "2026-01-01T00:09:00Z",
+        "payload": {
+          "method": "SellCheck",
+          "currency": "UAH",
+          "cashier_id": "cashier-01",
+          "goods_count": 1,
+          "payments_count": 1,
+          "receipt": {
+            "type": "SELL",
+            "goods": [
+              {
+                "item_id": "item-10",
+                "item_no": 1,
+                "code": "SYNTH",
+                "name": "Synthetic good",
+                "price": 5000,
+                "quantity": 1000,
+                "sum": 5000
+              }
+            ],
+            "payments": [
+              {
+                "payment_id": "payment-1",
+                "payment_type": "CASH",
+                "label": "CASH",
+                "amount": 5000
+              }
+            ],
+            "totals": {
+              "total_sum": 5000
+            }
+          }
+        },
+        "payload_json": "{\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":1,\"method\":\"SellCheck\",\"payments_count\":1,\"receipt\":{\"goods\":[{\"code\":\"SYNTH\",\"item_id\":\"item-10\",\"item_no\":1,\"name\":\"Synthetic good\",\"price\":5000,\"quantity\":1000,\"sum\":5000}],\"payments\":[{\"amount\":5000,\"label\":\"CASH\",\"payment_id\":\"payment-1\",\"payment_type\":\"CASH\"}],\"totals\":{\"total_sum\":5000},\"type\":\"SELL\"}}",
+        "payload_sha256": "3db2dd8d00be83c7175ce55c0a39a4471be811dcbc602a96b3af80ada9aebefa"
+      }
+    },
+    {
+      "op_index": 10,
+      "operation_type": "SELL",
+      "lnd": 11,
+      "offline_lifecycle_class": "online",
+      "dps_outcome_class": "Ack",
+      "canonical_command": {
+        "schema_version": "1.0.1",
+        "request_id": "cmd-0010",
+        "idempotency_key": "sell:9000000001:0010",
+        "protocol": "WEBCHECK_XMLRPC",
+        "operation_type": "SELL",
+        "fiscal_number": "9000000001",
+        "business_ts": "2026-01-01T00:10:00Z",
+        "payload": {
+          "method": "SellCheck",
+          "currency": "UAH",
+          "cashier_id": "cashier-01",
+          "goods_count": 1,
+          "payments_count": 1,
+          "receipt": {
+            "type": "SELL",
+            "goods": [
+              {
+                "item_id": "item-11",
+                "item_no": 1,
+                "code": "SYNTH",
+                "name": "Synthetic good",
+                "price": 5000,
+                "quantity": 1000,
+                "sum": 5000
+              }
+            ],
+            "payments": [
+              {
+                "payment_id": "payment-1",
+                "payment_type": "CASH",
+                "label": "CASH",
+                "amount": 5000
+              }
+            ],
+            "totals": {
+              "total_sum": 5000
+            }
+          }
+        },
+        "payload_json": "{\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":1,\"method\":\"SellCheck\",\"payments_count\":1,\"receipt\":{\"goods\":[{\"code\":\"SYNTH\",\"item_id\":\"item-11\",\"item_no\":1,\"name\":\"Synthetic good\",\"price\":5000,\"quantity\":1000,\"sum\":5000}],\"payments\":[{\"amount\":5000,\"label\":\"CASH\",\"payment_id\":\"payment-1\",\"payment_type\":\"CASH\"}],\"totals\":{\"total_sum\":5000},\"type\":\"SELL\"}}",
+        "payload_sha256": "662eb7d2cacae31abe5b704883d640b995536ffbe66e68b9fbf03ae0ec890666"
+      }
+    },
+    {
+      "op_index": 11,
+      "operation_type": "SELL",
+      "lnd": 12,
+      "offline_lifecycle_class": "online",
+      "dps_outcome_class": "Ack",
+      "canonical_command": {
+        "schema_version": "1.0.1",
+        "request_id": "cmd-0011",
+        "idempotency_key": "sell:9000000001:0011",
+        "protocol": "WEBCHECK_XMLRPC",
+        "operation_type": "SELL",
+        "fiscal_number": "9000000001",
+        "business_ts": "2026-01-01T00:11:00Z",
+        "payload": {
+          "method": "SellCheck",
+          "currency": "UAH",
+          "cashier_id": "cashier-01",
+          "goods_count": 1,
+          "payments_count": 1,
+          "receipt": {
+            "type": "SELL",
+            "goods": [
+              {
+                "item_id": "item-12",
+                "item_no": 1,
+                "code": "SYNTH",
+                "name": "Synthetic good",
+                "price": 5000,
+                "quantity": 1000,
+                "sum": 5000
+              }
+            ],
+            "payments": [
+              {
+                "payment_id": "payment-1",
+                "payment_type": "CASH",
+                "label": "CASH",
+                "amount": 5000
+              }
+            ],
+            "totals": {
+              "total_sum": 5000
+            }
+          }
+        },
+        "payload_json": "{\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":1,\"method\":\"SellCheck\",\"payments_count\":1,\"receipt\":{\"goods\":[{\"code\":\"SYNTH\",\"item_id\":\"item-12\",\"item_no\":1,\"name\":\"Synthetic good\",\"price\":5000,\"quantity\":1000,\"sum\":5000}],\"payments\":[{\"amount\":5000,\"label\":\"CASH\",\"payment_id\":\"payment-1\",\"payment_type\":\"CASH\"}],\"totals\":{\"total_sum\":5000},\"type\":\"SELL\"}}",
+        "payload_sha256": "081ab8c5fa16714415ef1f820f72d17d7a0a3a2ec7a5154c159b3788a60d6fcc"
+      }
+    },
+    {
+      "op_index": 12,
+      "operation_type": "SELL",
+      "lnd": 13,
+      "offline_lifecycle_class": "online",
+      "dps_outcome_class": "Ack",
+      "canonical_command": {
+        "schema_version": "1.0.1",
+        "request_id": "cmd-0012",
+        "idempotency_key": "sell:9000000001:0012",
+        "protocol": "WEBCHECK_XMLRPC",
+        "operation_type": "SELL",
+        "fiscal_number": "9000000001",
+        "business_ts": "2026-01-01T00:12:00Z",
+        "payload": {
+          "method": "SellCheck",
+          "currency": "UAH",
+          "cashier_id": "cashier-01",
+          "goods_count": 1,
+          "payments_count": 1,
+          "receipt": {
+            "type": "SELL",
+            "goods": [
+              {
+                "item_id": "item-13",
+                "item_no": 1,
+                "code": "SYNTH",
+                "name": "Synthetic good",
+                "price": 5000,
+                "quantity": 1000,
+                "sum": 5000
+              }
+            ],
+            "payments": [
+              {
+                "payment_id": "payment-1",
+                "payment_type": "CASH",
+                "label": "CASH",
+                "amount": 5000
+              }
+            ],
+            "totals": {
+              "total_sum": 5000
+            }
+          }
+        },
+        "payload_json": "{\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":1,\"method\":\"SellCheck\",\"payments_count\":1,\"receipt\":{\"goods\":[{\"code\":\"SYNTH\",\"item_id\":\"item-13\",\"item_no\":1,\"name\":\"Synthetic good\",\"price\":5000,\"quantity\":1000,\"sum\":5000}],\"payments\":[{\"amount\":5000,\"label\":\"CASH\",\"payment_id\":\"payment-1\",\"payment_type\":\"CASH\"}],\"totals\":{\"total_sum\":5000},\"type\":\"SELL\"}}",
+        "payload_sha256": "9095d071dc3504ef05e2b108852bc8c74963c9baf1bbcc2e7a17d2467b724631"
+      }
+    },
+    {
+      "op_index": 13,
+      "operation_type": "SELL",
+      "lnd": 14,
+      "offline_lifecycle_class": "online",
+      "dps_outcome_class": "Ack",
+      "canonical_command": {
+        "schema_version": "1.0.1",
+        "request_id": "cmd-0013",
+        "idempotency_key": "sell:9000000001:0013",
+        "protocol": "WEBCHECK_XMLRPC",
+        "operation_type": "SELL",
+        "fiscal_number": "9000000001",
+        "business_ts": "2026-01-01T00:13:00Z",
+        "payload": {
+          "method": "SellCheck",
+          "currency": "UAH",
+          "cashier_id": "cashier-01",
+          "goods_count": 1,
+          "payments_count": 1,
+          "receipt": {
+            "type": "SELL",
+            "goods": [
+              {
+                "item_id": "item-14",
+                "item_no": 1,
+                "code": "SYNTH",
+                "name": "Synthetic good",
+                "price": 5000,
+                "quantity": 1000,
+                "sum": 5000
+              }
+            ],
+            "payments": [
+              {
+                "payment_id": "payment-1",
+                "payment_type": "CASH",
+                "label": "CASH",
+                "amount": 5000
+              }
+            ],
+            "totals": {
+              "total_sum": 5000
+            }
+          }
+        },
+        "payload_json": "{\"cashier_id\":\"cashier-01\",\"currency\":\"UAH\",\"goods_count\":1,\"method\":\"SellCheck\",\"payments_count\":1,\"receipt\":{\"goods\":[{\"code\":\"SYNTH\",\"item_id\":\"item-14\",\"item_no\":1,\"name\":\"Synthetic good\",\"price\":5000,\"quantity\":1000,\"sum\":5000}],\"payments\":[{\"amount\":5000,\"label\":\"CASH\",\"payment_id\":\"payment-1\",\"payment_type\":\"CASH\"}],\"totals\":{\"total_sum\":5000},\"type\":\"SELL\"}}",
+        "payload_sha256": "98afefa36c53e4d5198b72837b1a17df324d3aafa05b3ad1f3ea758d7af748a3"
+      }
+    }
+  ]
+}

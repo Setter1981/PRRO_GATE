@@ -1,0 +1,34 @@
+{
+  "lnd_sequence": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "state_class_sequence": [
+    "online",
+    "online",
+    "online",
+    "online",
+    "online",
+    "online"
+  ],
+  "offline_codes_consumed": 0,
+  "previous_hash_chain": [
+    null,
+    "f3967d21173b31ba5a5415cc415dd478b7d4470878c2a381e3d8f50330f99a54",
+    "9669d935f1b14c96964ad08dce0743ba10aef7b83005ca3ebfec0ac1a401bef6",
+    "1eaf8a8551b26ff5458128c3aecb224a7d48f39bbc54325380779f8f488b8ce2",
+    "8ce4b60bccbd7f5b218cf3b5e024818b17b2c64b8339b2f19de283766f19cbe3",
+    "3d6d64bca7cc10c5b2063583977a6a2e668037bdbbcbabed6fe542a1fe0acc6b"
+  ],
+  "issued_lnds": [
+    2,
+    3,
+    4,
+    5
+  ],
+  "dropped_doctype_count": 0
+}

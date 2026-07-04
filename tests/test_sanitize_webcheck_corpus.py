@@ -73,3 +73,12 @@ def test_synthesize_offline_codes_consumed():
     shape = [S(8, 0, 1), S(0, 1, 1), S(0, 1, 1), S(9, 1, 1), S(80, 0, 1)]
     fx = m.synthesize_fixture(shape, "offline_session_drain")
     assert fx["expected_observables"]["offline_codes_consumed"] == 2
+
+
+def test_synthesize_replay_flag():
+    """Z shapes are exported-but-NOT-replayed (A2/MED#8): the replay flag defaults
+    True and is False when requested."""
+    m = _load()
+    shape = _online_sell_run_shape(m)
+    assert m.synthesize_fixture(shape, "x")["replay"] is True
+    assert m.synthesize_fixture(shape, "z_report", replay=False)["replay"] is False

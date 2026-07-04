@@ -156,7 +156,7 @@ def synthesize_command(op_type: str, lnd: int, seq_pos: int) -> dict:
     }
 
 
-def synthesize_fixture(shape: list[ShapeRecord], name: str) -> dict:
+def synthesize_fixture(shape: list[ShapeRecord], name: str, replay: bool = True) -> dict:
     """SHAPE (ordered structural codes) -> a synthetic fixture (sequence + observables).
 
     PURE / DATA-FREE. Applies the U0 lnd-translation: dense per-FN lnd = 1,2,3,…
@@ -210,19 +210,24 @@ def synthesize_fixture(shape: list[ShapeRecord], name: str) -> dict:
         "shape_name": name,
         "fiscal_number": SYNTH_FN,
         "synthetic": True,
+        "replay": replay,
         "sequence": sequence,
         "expected_observables": observables,
     }
 
 
-def extract_shape(snapshot_db: Path, limit: int | None = None) -> list[ShapeRecord]:
+def extract_shape(
+    snapshot_db: Path, limit: int | None = None, shift_id: int | None = None
+) -> list[ShapeRecord]:
     """Read a dump SNAPSHOT read-only for the SHAPE ONLY (structural codes, no
-    content), in `ksef.ID ASC` order (U0 §4 lnd-translation ordering key)."""
+    content), in `ksef.ID ASC` order (U0 §4 lnd-translation ordering key).  With
+    `shift_id`, restrict to ONE shift (a clean single-shift slice — CP1 decision)."""
     uri = f"{snapshot_db.resolve().as_uri()}?mode=ro"
+    where = "" if shift_id is None else f" WHERE shiftid = {int(shift_id)}"
     limit_sql = f" LIMIT {int(limit)}" if limit else ""
     with sqlite3.connect(uri, uri=True) as conn:
         rows = conn.execute(
-            f"SELECT DocType, offline, shiftid FROM ksef ORDER BY ID ASC{limit_sql}"
+            f"SELECT DocType, offline, shiftid FROM ksef{where} ORDER BY ID ASC{limit_sql}"
         ).fetchall()
     return [ShapeRecord(int(dt or 0), int(off or 0), int(sh or 0)) for dt, off, sh in rows]
 
@@ -233,7 +238,7 @@ def write_fixture(fixture: dict, out_dir: Path) -> Path:
     fx_dir.mkdir(parents=True, exist_ok=True)
     (fx_dir / "sequence.json").write_text(
         json.dumps(
-            {k: fixture[k] for k in ("corpus_schema_version", "shape_name", "fiscal_number", "synthetic", "sequence")},
+            {k: fixture[k] for k in ("corpus_schema_version", "shape_name", "fiscal_number", "synthetic", "replay", "sequence")},
             ensure_ascii=True,
             indent=2,
         )
@@ -262,15 +267,17 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--snapshot", type=Path, help="Read the SHAPE from this read-only dump snapshot.")
     src.add_argument("--shape-json", type=Path, help="Read a synthetic SHAPE (list of {doc_type,offline,shiftid}) — for tests.")
     parser.add_argument("--limit", type=int, default=None, help="Max ksef rows (slice bound).")
+    parser.add_argument("--shift-id", type=int, default=None, help="Restrict to a single shift (clean single-shift slice).")
+    parser.add_argument("--no-replay", action="store_true", help="Flag the fixture exported-but-NOT-replayed (Z shapes, A2/MED#8).")
     args = parser.parse_args(argv)
 
     if args.snapshot is not None:
-        shape = extract_shape(args.snapshot, args.limit)
+        shape = extract_shape(args.snapshot, args.limit, args.shift_id)
     else:
         raw = json.loads(args.shape_json.read_text())
         shape = [ShapeRecord(r["doc_type"], r["offline"], r["shiftid"]) for r in raw]
 
-    fixture = synthesize_fixture(shape, args.shape_name)
+    fixture = synthesize_fixture(shape, args.shape_name, replay=not args.no_replay)
     fx_dir = write_fixture(fixture, args.out_dir)
     print(json.dumps({"shape_name": fixture["shape_name"], "ops": len(fixture["sequence"]), "out": str(fx_dir)}))
     return 0
