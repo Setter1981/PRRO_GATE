@@ -993,10 +993,7 @@ fn model_db_access_is_funneled_through_tagged_wrappers() {
         // `fn NAME` is the enclosing scope for the DB-access check).
         for prefix in ["pub async fn ", "async fn ", "pub fn ", "fn "] {
             if let Some(rest) = trimmed.strip_prefix(prefix) {
-                current_fn = rest
-                    .split(|c: char| c == '(' || c == '<' || c == ' ')
-                    .next()
-                    .unwrap_or("<anon>");
+                current_fn = rest.split(['(', '<', ' ']).next().unwrap_or("<anon>");
                 break;
             }
         }
