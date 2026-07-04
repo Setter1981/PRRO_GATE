@@ -111,23 +111,33 @@ fn offline_sell_advances_seed_at_offline_local_ack_and_consumes_code() {
     ));
 }
 
-/// The model's offline-origin issued set IS `fiscal_documents::OFFLINE_ISSUED_STATES`
-/// — asserted by REFERENCING the const, never a re-typed literal (spec §6).
+/// U1 D3 (POS tooth) — the model-local fork `MODEL_OFFLINE_ISSUED_STATES` MUST
+/// equal the prod SSOT const `fiscal_documents::OFFLINE_ISSUED_STATES` as a set.
+/// Pass-on-main / fail-on-drift: perturbing either side turns this RED — the
+/// anti-shared-const guarantee (U1 D3), so a prod-side boundary change no longer
+/// silently propagates into the differential model but demands a conscious update.
 #[test]
-fn model_offline_issued_set_is_the_ssot_const() {
-    // The model returns the const itself (by reference), not a private copy.
+fn teeth_d3_forked_set_matches_prod_const() {
+    let model: std::collections::BTreeSet<&str> =
+        model::MODEL_OFFLINE_ISSUED_STATES.iter().copied().collect();
+    let prod: std::collections::BTreeSet<&str> = OFFLINE_ISSUED_STATES.iter().copied().collect();
     assert_eq!(
-        RefModel::offline_issued_states(),
-        &OFFLINE_ISSUED_STATES[..],
-        "model must expose the SSOT const, not a forked set"
+        model, prod,
+        "model fork drifted from prod OFFLINE_ISSUED_STATES — reconcile consciously (U1 D3)"
     );
-    // …and its membership predicate agrees with the const for EVERY DocState,
-    // so a future hand-rolled literal that drifts is caught here.
+}
+
+/// U1 D3 (NEG tooth) — the fork must NOT change issued/non-issued classification
+/// of any known state: `is_offline_origin_issued` (now from the fork) still equals
+/// prod-const membership for EVERY `DocState`.  Proves the fork is a pure
+/// re-grounding of the SSOT, not a behaviour change.
+#[test]
+fn teeth_d3_membership_semantics_unchanged() {
     for state in ALL_DOC_STATES {
         assert_eq!(
             RefModel::is_offline_origin_issued(state),
             OFFLINE_ISSUED_STATES.contains(&state.as_str()),
-            "issued predicate drifted from OFFLINE_ISSUED_STATES for {state:?}"
+            "fork changed issued membership for {state:?} (U1 D3 must be behaviour-preserving)"
         );
     }
 }

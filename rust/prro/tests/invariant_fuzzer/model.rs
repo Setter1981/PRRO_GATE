@@ -10,18 +10,33 @@
 //!   - offline-origin doc advances the seed at **OFFLINE_LOCAL_ACK** (issuance)
 //!     and remains *issued* through every later drain state.
 //!
-//! The "issued" predicate reuses the single-source-of-truth const
-//! `fiscal_documents::OFFLINE_ISSUED_STATES` — never a second hand-rolled set
-//! (spec §6: the shared-fn-caller lesson applied to the test harness).
+//! The "issued" predicate uses a model-local FORK of the issued-set,
+//! `MODEL_OFFLINE_ISSUED_STATES`, guarded by an equality test against the prod
+//! SSOT const `fiscal_documents::OFFLINE_ISSUED_STATES` (U1 D3, anti-shared-
+//! const): a prod-side boundary change turns the differential RED, not silent-inherit.
 
 use std::collections::BTreeMap;
 
 use sqlx::SqlitePool;
 
 use prro::db::models::enums::{DocState, NodeMode, OfflineSessionState, ShiftState};
-use prro::db::repositories::fiscal_documents::OFFLINE_ISSUED_STATES;
-
 use crate::op::{DpsScript, Op, WireResponse};
+
+/// U1 D3 — model-local FORK of the offline-origin "issued" set.  Deliberately a
+/// SEPARATE literal from the prod SSOT const
+/// `fiscal_documents::OFFLINE_ISSUED_STATES`; equality is enforced by
+/// `teeth_d3_forked_set_matches_prod_const`, so a prod-side boundary change turns
+/// the differential RED (a conscious model update) instead of silently
+/// propagating into the oracle (anti-shared-const).
+pub const MODEL_OFFLINE_ISSUED_STATES: [&str; 7] = [
+    "OFFLINE_LOCAL_ACK",
+    "SENT",
+    "KVT1",
+    "ERROR_RETRYABLE",
+    "KVT2",
+    "REJECTED",
+    "REQUIRES_MANUAL_RECONCILIATION",
+];
 
 /// A predicted fiscal mutation for one op (the differential, Task 4, checks
 /// these against the real seam).
@@ -114,15 +129,15 @@ impl RefModel {
         }
     }
 
-    /// The model's offline-origin "issued" set — the SSOT const itself, by
-    /// reference, NOT a forked literal (spec §6).
+    /// The model's offline-origin "issued" set — the model-local FORK
+    /// `MODEL_OFFLINE_ISSUED_STATES`, guarded to equal the prod SSOT const (U1 D3).
     pub fn offline_issued_states() -> &'static [&'static str] {
-        &OFFLINE_ISSUED_STATES[..]
+        &MODEL_OFFLINE_ISSUED_STATES[..]
     }
 
-    /// Offline-origin "issued" membership, derived solely from the SSOT const.
+    /// Offline-origin "issued" membership, from the model-local fork (U1 D3).
     pub fn is_offline_origin_issued(state: DocState) -> bool {
-        OFFLINE_ISSUED_STATES.contains(&state.as_str())
+        MODEL_OFFLINE_ISSUED_STATES.contains(&state.as_str())
     }
 
     fn shift_is_open(&self) -> bool {
