@@ -11,8 +11,10 @@ Typical usage:
     python scripts/export_webcheck_samples.py "D:/WebCheck/Archive" --xml-limit 200
     python scripts/export_webcheck_samples.py "D:/WebCheck" --limit 200 --xml-limit 200
 
-Output defaults to var/webcheck_samples/webcheck_export_<timestamp>/, which is
-ignored by git in this repository.
+Output goes to --output-dir, which is REQUIRED and MUST be OUTSIDE the repo tree
+(e.g. ~/webcheck_dumps/exports/<run>). WebCheck exports contain real fiscal data;
+the never-transit rule (U2 / re-check F7) forbids writing them under the repo, so
+there is no in-tree default and an in-tree --output-dir is refused.
 """
 from __future__ import annotations
 
@@ -88,6 +90,22 @@ class ExportOptions:
     selection_quota: int = 3
 
 
+def _reject_in_tree_output(output_dir: Path) -> None:
+    """Refuse an output dir inside the repo tree (never-transit rule, U2/F7).
+
+    WebCheck exports contain real fiscal data (raw XML, MAC, sums, identifiers);
+    they must never be written under the repo — even transiently. Point
+    --output-dir at an outside-tree location (e.g. ~/webcheck_dumps/exports/<run>).
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    if output_dir == repo_root or output_dir.is_relative_to(repo_root):
+        raise SystemExit(
+            f"--output-dir {output_dir} is inside the repo tree ({repo_root}); "
+            "WebCheck exports must stay OUTSIDE the tree (never-transit rule). "
+            "Use e.g. ~/webcheck_dumps/exports/<run>."
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Export WebCheck receipt examples from SQLite .db files and XML archives.",
@@ -100,8 +118,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=None,
-        help="Output directory. Defaults to var/webcheck_samples/webcheck_export_<timestamp>.",
+        required=True,
+        help=(
+            "REQUIRED. Output directory — MUST be OUTSIDE the repo tree "
+            "(e.g. ~/webcheck_dumps/exports/<run>). WebCheck exports contain real "
+            "fiscal data; the never-transit rule (U2 / re-check F7) forbids an "
+            "in-tree default."
+        ),
     )
     parser.add_argument("--limit", type=int, default=None, help="Maximum ksef rows per database.")
     parser.add_argument("--xml-limit", type=int, default=None, help="Maximum XML files to export.")
@@ -138,8 +161,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    now = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    output_dir = args.output_dir or Path("var") / "webcheck_samples" / f"webcheck_export_{now}"
+    output_dir = args.output_dir.expanduser().resolve()
+    _reject_in_tree_output(output_dir)
     options = ExportOptions(
         output_dir=output_dir,
         limit=args.limit,
