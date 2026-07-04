@@ -501,7 +501,13 @@ impl RefModel {
     /// per-tip-lnd placeholder, since the exact bytes are never compared (the
     /// differential is structural — advance-iff + chain-continuity vs the real
     /// tip, never `model.seed == real.seed` byte-for-byte).
-    pub async fn resync_from_db(&mut self, pool: &SqlitePool) {
+    ///
+    /// **U1 A1 funnel wrapper — `adopt_fault_deferred`** (was `resync_from_db`):
+    /// the tagged home for the post-fault recovery adoption residue (the state
+    /// the model deliberately does NOT predict across a crash-window).  The
+    /// static-scan `model_db_access_is_funneled_through_tagged_wrappers`
+    /// (invariant_scan.rs) forbids any raw DB read outside the tagged wrappers.
+    pub async fn adopt_fault_deferred(&mut self, pool: &SqlitePool) {
         // docs ← the real ledger (lnd → state).
         let docs: Vec<(i64, DocState)> =
             sqlx::query_as("SELECT lnd, state FROM fiscal_documents ORDER BY lnd")
@@ -511,19 +517,18 @@ impl RefModel {
         self.docs = docs.into_iter().collect();
         let tip_lnd = self.docs.keys().copied().max().unwrap_or(0);
 
-        // mode / shift_state / next_lnd / seed-presence ← node_state.
-        let (mode, shift_state, next_lnd, real_seed): (NodeMode, ShiftState, i64, Option<Vec<u8>>) =
-            sqlx::query_as(
-                "SELECT mode, shift_state, next_lnd, last_known_unsigned_xml_sha256 \
-                 FROM node_state LIMIT 1",
-            )
-            .fetch_one(pool)
-            .await
-            .unwrap();
+        // mode / shift_state / next_lnd ← node_state.
+        let (mode, shift_state, next_lnd): (NodeMode, ShiftState, i64) =
+            sqlx::query_as("SELECT mode, shift_state, next_lnd FROM node_state LIMIT 1")
+                .fetch_one(pool)
+                .await
+                .unwrap();
         self.mode = mode;
         self.shift_state = shift_state;
         self.next_lnd = next_lnd;
-        // STRUCTURAL seed: Some iff real Some (synthetic placeholder bytes).
+        // STRUCTURAL seed: Some iff real Some (synthetic placeholder bytes) —
+        // read through the tagged `read_seed_fixture` wrapper.
+        let real_seed = Self::read_seed_fixture(pool).await;
         self.seed = real_seed.is_some().then(|| synth_unsigned_hash(tip_lnd));
 
         // offline session + codes ← real.
@@ -545,6 +550,20 @@ impl RefModel {
         .unwrap();
     }
 
+    /// **U1 A1 funnel wrapper — `read_seed_fixture`.**  The tagged primitive for
+    /// reading the persisted MAC-seed presence
+    /// (`node_state.last_known_unsigned_xml_sha256`) the model grounds on.  The
+    /// value is adopted STRUCTURALLY (`Some`/`None`) — the exact bytes are never
+    /// compared (the differential is structural: advance-iff + chain-continuity).
+    async fn read_seed_fixture(pool: &SqlitePool) -> Option<Vec<u8>> {
+        sqlx::query_scalar::<_, Option<Vec<u8>>>(
+            "SELECT last_known_unsigned_xml_sha256 FROM node_state LIMIT 1",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
     /// Adopt ONLY the precondition state (mode / shift_state / active session)
     /// from the real DB after a NON-fault op — keeping the PREDICTED ledger
     /// (docs / seed / next_lnd / codes) for the differential.  Transition seams
@@ -552,7 +571,7 @@ impl RefModel {
     /// pure model need not perfectly predict; the LEDGER is what the differential
     /// checks, and the mode/shift mirror integrity is checked by the scan.  This
     /// keeps the NEXT op dispatching from the real precondition state.
-    pub async fn resync_preconditions_from_db(&mut self, pool: &SqlitePool) {
+    pub async fn adopt_precondition(&mut self, pool: &SqlitePool) {
         let (mode, shift_state): (NodeMode, ShiftState) =
             sqlx::query_as("SELECT mode, shift_state FROM node_state LIMIT 1")
                 .fetch_one(pool)

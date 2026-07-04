@@ -195,7 +195,7 @@ async fn teeth_d1_gapless_reissue_not_flagged() {
 // ── U1 D2 — predict/assert mode + shift_state (before precondition-resync) ───
 
 /// U1 D2 (POS tooth) — `run_harness` must assert the model's PREDICTED
-/// `mode`/`shift_state` equals the DB BEFORE `resync_preconditions_from_db`
+/// `mode`/`shift_state` equals the DB BEFORE `adopt_precondition`
 /// (which otherwise silently ADOPTS them).  A `DuplicateIdemKey` is a NoMutation
 /// op that changes neither, so a pre-desynced `model.shift_state` survives every
 /// other check — only the D2 assert catches it.  Revert target: the D2
@@ -232,13 +232,13 @@ fn teeth_d2_predicted_shift_matches_db() {
 /// U1 D2 (NEG tooth) — D2 must NOT assert on a FAULT-class op (the crash-window
 /// residue → adopt_fault_deferred).  A `Reboot` with a deliberately-divergent
 /// model `shift_state` must NOT trip D2 — the fault branch re-syncs via
-/// `resync_from_db`, it does not predict-then-assert.
+/// `adopt_fault_deferred`, it does not predict-then-assert.
 #[tokio::test]
 async fn teeth_d2_mid_transition_deferral_not_flagged() {
     let ctx = interp::FuzzCtx::new_online_open_shift().await;
     let mut model = RefModel::new_online_open_shift();
     model.shift_state = ShiftState::Closing; // divergent — but a Reboot is fault-class
-    // Must NOT panic — D2 skips fault ops; resync_from_db re-syncs the residue.
+    // Must NOT panic — D2 skips fault ops; adopt_fault_deferred re-syncs the residue.
     let _ = run_harness(&[Op::Reboot], ctx, model).await;
 }
 
@@ -750,7 +750,7 @@ async fn fault_resync_then_next_op_is_differential_clean() {
     let _ = model.apply(&Op::Reboot);
 
     // Adopt the real recovered state.
-    model.resync_from_db(&ctx.pool).await;
+    model.adopt_fault_deferred(&ctx.pool).await;
     assert_eq!(
         model.docs,
         ctx.read_ledger().await,
@@ -1260,7 +1260,7 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                          bounded MAC-recovery budget (original send + at most one W10.4 re-send)"
                     );
                 }
-                model.resync_from_db(&ctx.pool).await;
+                model.adopt_fault_deferred(&ctx.pool).await;
             }
             // Predictable mutation — differential-match the model.
             oracle::OpClass::PredictableMutating => {
@@ -1379,7 +1379,7 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         // (`ux_fd_fn_lnd`).  This catches an allocator drift the DOC-lnd
         // differential CANNOT: a NoMutation op has no doc, and a missed increment
         // leaves the doc correct but the allocator stale.  Fault ops cannot
-        // predict the crash-window allocation → they adopt via `resync_from_db`
+        // predict the crash-window allocation → they adopt via `adopt_fault_deferred`
         // (the classified deferral, §4 funnel), so D1 skips them.
         if !matches!(class, oracle::OpClass::FaultOrRecovery) {
             assert_eq!(
@@ -1392,14 +1392,14 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         // U1 D2 — mode / shift_state are PREDICTED, not adopted, for non-fault
         // ops.  `apply` sets both from the M3b 9-state shift machine + the
         // node-mode machine (enums.rs); assert the prediction equals the DB.
-        // Fault ops adopt via `resync_from_db` (adopt_fault_deferred), so D2 skips
+        // Fault ops adopt via `adopt_fault_deferred` (adopt_fault_deferred), so D2 skips
         // them.  §7 #3 RESIDUE SPLIT: the drain / go-online MODE outcome (the
         // `GoingOnline → Online` CAS in `drain_backlog`) is a MID-TRANSITION
         // residue the pure model cannot pin — a FORCED `GoingOnline`
         // (`OfflineSellDuringGoingOnline`) does not complete to `Online` the way a
         // real go-online does, so `drain_backlog`'s empty-backlog CAS over-predicts
         // `Online` where reality stays `GoingOnline`.  Those ops therefore DEFER
-        // mode to `resync_preconditions_from_db` (adopt_precondition); their SHIFT
+        // mode to `adopt_precondition` (adopt_precondition); their SHIFT
         // (RMR / unchanged) IS predicted and asserted.
         if !matches!(class, oracle::OpClass::FaultOrRecovery) {
             assert_eq!(
@@ -1510,7 +1510,7 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         // and the mirrors (which the scan just checked) are what we hold the
         // model to.  Fault ops already did a FULL resync above.
         if !matches!(class, oracle::OpClass::FaultOrRecovery) {
-            model.resync_preconditions_from_db(&ctx.pool).await;
+            model.adopt_precondition(&ctx.pool).await;
         }
     }
 
@@ -1922,7 +1922,7 @@ async fn teeth_x2_single_active_session_not_flagged() {
 /// NUANCE (verified): the >1-active state is normally SCHEMA-PREVENTED by the
 /// partial unique index `ux_offline_active ON offline_sessions(fiscal_number)
 /// WHERE state IN ('OPENING','OPEN','DRAINING')` — the `check_mirrors` /
-/// `resync_preconditions_from_db` `OPEN/DRAINING` filter is a subset, so a clean
+/// `adopt_precondition` `OPEN/DRAINING` filter is a subset, so a clean
 /// DB never returns >1.  X2 is therefore DEFENSE-IN-DEPTH + determinism-hardening
 /// (a regression sentinel if that index is ever weakened), not closure of a
 /// currently-reachable false-negative.  This tooth drops the index to construct
