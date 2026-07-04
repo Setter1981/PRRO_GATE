@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc e7d4ce1454598c20e00d80bf23a4d6df8f983229276e0daa263e85047a89f968 # shrinks to ops = [Crash(Send), OfflineSellDuringGoingOnline, GoOnline(DpsScript([Ack, Ack])), OnlineSell(DpsScript([Reject]))]
+cc 294a8dd8622b225ccc3217113e6036fa6c26192e8a8deb988002c6cd041f82ce # shrinks to ops = [GoOnlineWithoutBacklog]
+cc f5c57a30bb57ef49a490df053518e8bd0b5b1bf3860918d10575c37bdbda04fd # shrinks to ops = [OfflineSellDuringGoingOnline, GoOnlineWithoutBacklog]

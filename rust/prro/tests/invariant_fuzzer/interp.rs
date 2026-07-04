@@ -263,7 +263,7 @@ impl FuzzCtx {
     /// multi-active-session state the DB normally PREVENTS.  Today the index
     /// `ux_offline_active ON offline_sessions(fiscal_number) WHERE state IN
     /// ('OPENING','OPEN','DRAINING')` makes two active sessions unreachable (the
-    /// `check_mirrors` / `resync_preconditions_from_db` `OPEN/DRAINING` filter is
+    /// `check_mirrors` / `adopt_precondition` `OPEN/DRAINING` filter is
     /// a subset), so the X2 `ORDER BY` + count guard is a DEFENSE-IN-DEPTH
     /// regression sentinel: this drops the index to construct the breach the
     /// guard is meant to catch if the schema protection is ever weakened.

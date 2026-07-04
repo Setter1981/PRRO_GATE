@@ -958,3 +958,61 @@ async fn clean_null_current_shift_id_no_mirror_drift() {
         "NULL current_shift_id must NOT flag ShiftStateMirrorDrift: {v:#?}"
     );
 }
+
+// ── U1 A1 — adoption-lint funnel: static source-scan of the fuzzer RefModel ──
+
+/// U1 A1 — mechanical exhaustiveness of the derive-don't-adopt funnel: ALL DB
+/// access in the fuzzer's `RefModel` (`invariant_fuzzer/model.rs`) MUST go through
+/// one of the three tagged wrapper fns, so no future raw read can silently
+/// re-open a differential vacuity at the D1–D5 adoption sites.  A raw
+/// `sqlx`/`query_as`/`query_scalar`/`fetch_`/`.execute` outside a wrapper =
+/// FORBIDDEN non-empty = scan failure.  Source-text scan (the model file is a
+/// sibling of this test); the same discipline as the compile-fail/guard scans.
+#[test]
+fn model_db_access_is_funneled_through_tagged_wrappers() {
+    const WRAPPERS: &[&str] = &[
+        "adopt_fault_deferred", // post-fault recovery residue (was resync_from_db)
+        "adopt_precondition",   // mode/shift/session precondition residue
+        "read_seed_fixture",    // seed-fixture grounding
+    ];
+    // The DB-access tokens sqlx exposes; a raw one outside a wrapper is a leak.
+    const MARKERS: &[&str] = &[
+        "sqlx::",
+        ".fetch_",
+        ".execute(",
+        "query_as",
+        "query_scalar",
+        "query!",
+    ];
+    let src = include_str!("invariant_fuzzer/model.rs");
+    let mut current_fn = "<module>";
+    let mut violations: Vec<String> = Vec::new();
+    for (idx, line) in src.lines().enumerate() {
+        let trimmed = line.trim_start();
+        // Track the enclosing fn (methods live in `impl` blocks; the most recent
+        // `fn NAME` is the enclosing scope for the DB-access check).
+        for prefix in ["pub async fn ", "async fn ", "pub fn ", "fn "] {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                current_fn = rest.split(['(', '<', ' ']).next().unwrap_or("<anon>");
+                break;
+            }
+        }
+        // `use` imports (`use sqlx::SqlitePool;`) and comments are not DB access.
+        if trimmed.starts_with("use ") || trimmed.starts_with("//") {
+            continue;
+        }
+        if MARKERS.iter().any(|m| line.contains(m)) && !WRAPPERS.contains(&current_fn) {
+            violations.push(format!(
+                "model.rs:{}: DB access in `{current_fn}` — not a tagged wrapper: {}",
+                idx + 1,
+                trimmed
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "U1 A1 adoption-lint FORBIDDEN non-empty — every DB read in model.rs must go through \
+         {WRAPPERS:?}:\n{}",
+        violations.join("\n")
+    );
+}

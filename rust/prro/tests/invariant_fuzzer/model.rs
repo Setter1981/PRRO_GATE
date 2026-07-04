@@ -10,18 +10,33 @@
 //!   - offline-origin doc advances the seed at **OFFLINE_LOCAL_ACK** (issuance)
 //!     and remains *issued* through every later drain state.
 //!
-//! The "issued" predicate reuses the single-source-of-truth const
-//! `fiscal_documents::OFFLINE_ISSUED_STATES` — never a second hand-rolled set
-//! (spec §6: the shared-fn-caller lesson applied to the test harness).
+//! The "issued" predicate uses a model-local FORK of the issued-set,
+//! `MODEL_OFFLINE_ISSUED_STATES`, guarded by an equality test against the prod
+//! SSOT const `fiscal_documents::OFFLINE_ISSUED_STATES` (U1 D3, anti-shared-
+//! const): a prod-side boundary change turns the differential RED, not silent-inherit.
 
 use std::collections::BTreeMap;
 
 use sqlx::SqlitePool;
 
-use prro::db::models::enums::{DocState, NodeMode, OfflineSessionState, ShiftState};
-use prro::db::repositories::fiscal_documents::OFFLINE_ISSUED_STATES;
-
 use crate::op::{DpsScript, Op, WireResponse};
+use prro::db::models::enums::{DocState, NodeMode, OfflineSessionState, ShiftState};
+
+/// U1 D3 — model-local FORK of the offline-origin "issued" set.  Deliberately a
+/// SEPARATE literal from the prod SSOT const
+/// `fiscal_documents::OFFLINE_ISSUED_STATES`; equality is enforced by
+/// `teeth_d3_forked_set_matches_prod_const`, so a prod-side boundary change turns
+/// the differential RED (a conscious model update) instead of silently
+/// propagating into the oracle (anti-shared-const).
+pub const MODEL_OFFLINE_ISSUED_STATES: [&str; 7] = [
+    "OFFLINE_LOCAL_ACK",
+    "SENT",
+    "KVT1",
+    "ERROR_RETRYABLE",
+    "KVT2",
+    "REJECTED",
+    "REQUIRES_MANUAL_RECONCILIATION",
+];
 
 /// A predicted fiscal mutation for one op (the differential, Task 4, checks
 /// these against the real seam).
@@ -114,15 +129,15 @@ impl RefModel {
         }
     }
 
-    /// The model's offline-origin "issued" set — the SSOT const itself, by
-    /// reference, NOT a forked literal (spec §6).
+    /// The model's offline-origin "issued" set — the model-local FORK
+    /// `MODEL_OFFLINE_ISSUED_STATES`, guarded to equal the prod SSOT const (U1 D3).
     pub fn offline_issued_states() -> &'static [&'static str] {
-        &OFFLINE_ISSUED_STATES[..]
+        &MODEL_OFFLINE_ISSUED_STATES[..]
     }
 
-    /// Offline-origin "issued" membership, derived solely from the SSOT const.
+    /// Offline-origin "issued" membership, from the model-local fork (U1 D3).
     pub fn is_offline_origin_issued(state: DocState) -> bool {
-        OFFLINE_ISSUED_STATES.contains(&state.as_str())
+        MODEL_OFFLINE_ISSUED_STATES.contains(&state.as_str())
     }
 
     fn shift_is_open(&self) -> bool {
@@ -438,7 +453,40 @@ impl RefModel {
                     code_consumed: None,
                 })
             }
-            // Exotic drain scripts are deferred (agreed follow-up).
+            // U1 D5 — Superseded tip: the strict-sequential drain escalates to
+            // manual.  Empirically probe-derived (the `classify_check_result`
+            // Superseded arm, kvt2_confirm.rs:~357): the HEAD backlog doc →
+            // ERROR_RETRYABLE, the shift → RMR (EscalateManual, M3b §16.7); mode
+            // stays GoingOnline (set by `apply_go_online`); successors held at
+            // OFFLINE_LOCAL_ACK; the seed does NOT re-advance (offline-origin
+            // advanced it at issuance).
+            [WireResponse::Superseded, ..] => {
+                let first = backlog[0];
+                self.docs.insert(first, DocState::ErrorRetryable);
+                self.shift_state = ShiftState::RequiresManualReconciliation;
+                ExpectedOutcome::Mutated(Mutation {
+                    lnd: first,
+                    doc_state: DocState::ErrorRetryable,
+                    seed_after: self.seed,
+                    previous_hash,
+                    code_consumed: None,
+                })
+            }
+            // U1 D5 — send Ack'd, last_chk NotFound: the HEAD doc is HELD at SENT
+            // (`SentNotFoundDowngrade`, kvt2_confirm.rs:~330); shift unchanged,
+            // mode stays GoingOnline, successors held, seed unchanged.
+            [WireResponse::Ack, WireResponse::NotFound, ..] => {
+                let first = backlog[0];
+                self.docs.insert(first, DocState::Sent);
+                ExpectedOutcome::Mutated(Mutation {
+                    lnd: first,
+                    doc_state: DocState::Sent,
+                    seed_after: self.seed,
+                    previous_hash,
+                    code_consumed: None,
+                })
+            }
+            // MAC-recovery (BadHashPrev) drain stays genuinely deferred (§7 #1).
             _ => ExpectedOutcome::Fault,
         }
     }
@@ -453,7 +501,13 @@ impl RefModel {
     /// per-tip-lnd placeholder, since the exact bytes are never compared (the
     /// differential is structural — advance-iff + chain-continuity vs the real
     /// tip, never `model.seed == real.seed` byte-for-byte).
-    pub async fn resync_from_db(&mut self, pool: &SqlitePool) {
+    ///
+    /// **U1 A1 funnel wrapper — `adopt_fault_deferred`** (was `resync_from_db`):
+    /// the tagged home for the post-fault recovery adoption residue (the state
+    /// the model deliberately does NOT predict across a crash-window).  The
+    /// static-scan `model_db_access_is_funneled_through_tagged_wrappers`
+    /// (invariant_scan.rs) forbids any raw DB read outside the tagged wrappers.
+    pub async fn adopt_fault_deferred(&mut self, pool: &SqlitePool) {
         // docs ← the real ledger (lnd → state).
         let docs: Vec<(i64, DocState)> =
             sqlx::query_as("SELECT lnd, state FROM fiscal_documents ORDER BY lnd")
@@ -463,19 +517,18 @@ impl RefModel {
         self.docs = docs.into_iter().collect();
         let tip_lnd = self.docs.keys().copied().max().unwrap_or(0);
 
-        // mode / shift_state / next_lnd / seed-presence ← node_state.
-        let (mode, shift_state, next_lnd, real_seed): (NodeMode, ShiftState, i64, Option<Vec<u8>>) =
-            sqlx::query_as(
-                "SELECT mode, shift_state, next_lnd, last_known_unsigned_xml_sha256 \
-                 FROM node_state LIMIT 1",
-            )
-            .fetch_one(pool)
-            .await
-            .unwrap();
+        // mode / shift_state / next_lnd ← node_state.
+        let (mode, shift_state, next_lnd): (NodeMode, ShiftState, i64) =
+            sqlx::query_as("SELECT mode, shift_state, next_lnd FROM node_state LIMIT 1")
+                .fetch_one(pool)
+                .await
+                .unwrap();
         self.mode = mode;
         self.shift_state = shift_state;
         self.next_lnd = next_lnd;
-        // STRUCTURAL seed: Some iff real Some (synthetic placeholder bytes).
+        // STRUCTURAL seed: Some iff real Some (synthetic placeholder bytes) —
+        // read through the tagged `read_seed_fixture` wrapper.
+        let real_seed = Self::read_seed_fixture(pool).await;
         self.seed = real_seed.is_some().then(|| synth_unsigned_hash(tip_lnd));
 
         // offline session + codes ← real.
@@ -497,6 +550,20 @@ impl RefModel {
         .unwrap();
     }
 
+    /// **U1 A1 funnel wrapper — `read_seed_fixture`.**  The tagged primitive for
+    /// reading the persisted MAC-seed presence
+    /// (`node_state.last_known_unsigned_xml_sha256`) the model grounds on.  The
+    /// value is adopted STRUCTURALLY (`Some`/`None`) — the exact bytes are never
+    /// compared (the differential is structural: advance-iff + chain-continuity).
+    async fn read_seed_fixture(pool: &SqlitePool) -> Option<Vec<u8>> {
+        sqlx::query_scalar::<_, Option<Vec<u8>>>(
+            "SELECT last_known_unsigned_xml_sha256 FROM node_state LIMIT 1",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
     /// Adopt ONLY the precondition state (mode / shift_state / active session)
     /// from the real DB after a NON-fault op — keeping the PREDICTED ledger
     /// (docs / seed / next_lnd / codes) for the differential.  Transition seams
@@ -504,7 +571,7 @@ impl RefModel {
     /// pure model need not perfectly predict; the LEDGER is what the differential
     /// checks, and the mode/shift mirror integrity is checked by the scan.  This
     /// keeps the NEXT op dispatching from the real precondition state.
-    pub async fn resync_preconditions_from_db(&mut self, pool: &SqlitePool) {
+    pub async fn adopt_precondition(&mut self, pool: &SqlitePool) {
         let (mode, shift_state): (NodeMode, ShiftState) =
             sqlx::query_as("SELECT mode, shift_state FROM node_state LIMIT 1")
                 .fetch_one(pool)

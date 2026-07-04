@@ -111,25 +111,227 @@ fn offline_sell_advances_seed_at_offline_local_ack_and_consumes_code() {
     ));
 }
 
-/// The model's offline-origin issued set IS `fiscal_documents::OFFLINE_ISSUED_STATES`
-/// — asserted by REFERENCING the const, never a re-typed literal (spec §6).
+/// U1 D3 (POS tooth) — the model-local fork `MODEL_OFFLINE_ISSUED_STATES` MUST
+/// equal the prod SSOT const `fiscal_documents::OFFLINE_ISSUED_STATES` as a set.
+/// Pass-on-main / fail-on-drift: perturbing either side turns this RED — the
+/// anti-shared-const guarantee (U1 D3), so a prod-side boundary change no longer
+/// silently propagates into the differential model but demands a conscious update.
 #[test]
-fn model_offline_issued_set_is_the_ssot_const() {
-    // The model returns the const itself (by reference), not a private copy.
+fn teeth_d3_forked_set_matches_prod_const() {
+    let model: std::collections::BTreeSet<&str> =
+        model::MODEL_OFFLINE_ISSUED_STATES.iter().copied().collect();
+    let prod: std::collections::BTreeSet<&str> = OFFLINE_ISSUED_STATES.iter().copied().collect();
     assert_eq!(
-        RefModel::offline_issued_states(),
-        &OFFLINE_ISSUED_STATES[..],
-        "model must expose the SSOT const, not a forked set"
+        model, prod,
+        "model fork drifted from prod OFFLINE_ISSUED_STATES — reconcile consciously (U1 D3)"
     );
-    // …and its membership predicate agrees with the const for EVERY DocState,
-    // so a future hand-rolled literal that drifts is caught here.
+}
+
+/// U1 D3 (NEG tooth) — the fork must NOT change issued/non-issued classification
+/// of any known state: `is_offline_origin_issued` (now from the fork) still equals
+/// prod-const membership for EVERY `DocState`.  Proves the fork is a pure
+/// re-grounding of the SSOT, not a behaviour change.
+#[test]
+fn teeth_d3_membership_semantics_unchanged() {
     for state in ALL_DOC_STATES {
         assert_eq!(
             RefModel::is_offline_origin_issued(state),
             OFFLINE_ISSUED_STATES.contains(&state.as_str()),
-            "issued predicate drifted from OFFLINE_ISSUED_STATES for {state:?}"
+            "fork changed issued membership for {state:?} (U1 D3 must be behaviour-preserving)"
         );
     }
+}
+
+// ── U1 D1 — predict/assert next_lnd (per-FN monotonic allocator) ────────────
+
+/// U1 D1 (POS tooth) — `run_harness` must assert the model's PREDICTED allocator
+/// (`next_lnd`) equals the DB SSOT (`node_state.next_lnd`, the `allocate_next_lnd`
+/// sequencer — ADR-M3-A1).  A `DuplicateIdemKey` is a NoMutation op (mints no
+/// doc), so `check_differential` CANNOT see a desynced allocator — only the D1
+/// assert can.  We pre-desync `model.next_lnd = 99`; with the D1 assert in
+/// `run_harness` this PANICS.  Revert target: the D1
+/// `assert_eq!(model.next_lnd, read_next_lnd())` block — removing it lets the
+/// NoMutation op pass with a stale allocator → no panic → this tooth FAILS.
+#[test]
+fn teeth_d1_next_lnd_predicts_db() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ctx = interp::FuzzCtx::new_online_open_shift().await;
+            let mut model = RefModel::new_online_open_shift();
+            // Desync ONLY the allocator; the op mints no doc, so the doc-lnd
+            // differential is blind to it — the D1 assert is the sole guard.
+            model.next_lnd = 99;
+            run_harness(&[Op::DuplicateIdemKey], ctx, model).await;
+        });
+    }))
+    .is_err();
+    std::panic::set_hook(prev);
+    assert!(
+        panicked,
+        "U1 D1: run_harness must assert model.next_lnd == node_state.next_lnd for a non-fault \
+         op — a NoMutation op with a desynced allocator returned cleanly, so the D1 \
+         predict-then-assert is missing and the stale allocator was adopted silently."
+    );
+}
+
+/// U1 D1 (NEG tooth) — a legitimate gapless lnd consumption is NOT flagged.  An
+/// online reject mints a NON-ISSUED `Rejected` row: the lnd IS consumed (the
+/// allocator bumps) but the doc is not issued.  The model predicts the bump, so
+/// the D1 assert holds — `run_harness` completes without panic.
+#[tokio::test]
+async fn teeth_d1_gapless_reissue_not_flagged() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    // Must NOT panic — a consumed-but-not-issued lnd is a legal gapless bump.
+    let _ = run_harness(&[Op::OnlineSell(DpsScript::send_then_reject())], ctx, model).await;
+}
+
+// ── U1 D2 — predict/assert mode + shift_state (before precondition-resync) ───
+
+/// U1 D2 (POS tooth) — `run_harness` must assert the model's PREDICTED
+/// `mode`/`shift_state` equals the DB BEFORE `adopt_precondition`
+/// (which otherwise silently ADOPTS them).  A `DuplicateIdemKey` is a NoMutation
+/// op that changes neither, so a pre-desynced `model.shift_state` survives every
+/// other check — only the D2 assert catches it.  Revert target: the D2
+/// `assert_eq!(model.shift_state, read_shift_state())` block — without it the
+/// resync adopts the DB shift, masking the desync → no panic → this tooth FAILS.
+#[test]
+fn teeth_d2_predicted_shift_matches_db() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ctx = interp::FuzzCtx::new_online_open_shift().await;
+            let mut model = RefModel::new_online_open_shift();
+            // Desync ONLY the predicted shift; the NoMutation op won't move it, so
+            // the D2 pre-resync assert is the sole guard.
+            model.shift_state = ShiftState::Closing;
+            run_harness(&[Op::DuplicateIdemKey], ctx, model).await;
+        });
+    }))
+    .is_err();
+    std::panic::set_hook(prev);
+    assert!(
+        panicked,
+        "U1 D2: run_harness must assert model shift_state/mode == DB before \
+         resync_preconditions adopts them — a desynced prediction survived cleanly, so the \
+         D2 predict-then-assert is missing and the divergence was adopted silently."
+    );
+}
+
+/// U1 D2 (NEG tooth) — D2 must NOT assert on a FAULT-class op (the crash-window
+/// residue → adopt_fault_deferred).  A `Reboot` with a deliberately-divergent
+/// model `shift_state` must NOT trip D2 — the fault branch re-syncs via
+/// `adopt_fault_deferred`, it does not predict-then-assert.
+#[tokio::test]
+async fn teeth_d2_mid_transition_deferral_not_flagged() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let mut model = RefModel::new_online_open_shift();
+    model.shift_state = ShiftState::Closing; // divergent — but a Reboot is fault-class
+                                             // Must NOT panic — D2 skips fault ops; adopt_fault_deferred re-syncs the residue.
+    let _ = run_harness(&[Op::Reboot], ctx, model).await;
+}
+
+// ── U1 D5 — promote deterministic exotic-drain scripts to predicted Mutated ──
+
+/// U1 D5 (POS tooth) — a `[Superseded]` drain is now DIFFERENTIAL-CHECKED, not
+/// Fault-adopted.  Empirically probe-derived (the `classify_check_result`
+/// Superseded arm applied by the strict-sequential drain): the HEAD backlog doc
+/// → `ERROR_RETRYABLE` and the shift escalates to RMR (EscalateManual, M3b
+/// §16.7); successors held at OFFLINE_LOCAL_ACK.  With the CORRECT promotion this
+/// completes; a WRONG predicted terminal makes run_harness's ledger-delta PANIC
+/// (the RED-derivation §7 #1).  Note: the parent §3/D5 "held in SENT" shorthand
+/// was inaccurate for Superseded — the real terminal is ERROR_RETRYABLE + RMR.
+#[tokio::test]
+async fn teeth_d5_superseded_drain_predicts_error_retryable_rmr() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let model = RefModel::new_offline_open_shift(3);
+    let _ = run_harness(
+        &[
+            Op::OfflineSell,
+            Op::OfflineSell,
+            Op::GoOnline(DpsScript::superseded_tip()),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
+/// U1 D5 (POS tooth) — a `[Ack, NotFound]` drain is differential-checked: the
+/// head doc → `SENT` (SentNotFoundDowngrade — held pending), shift unchanged,
+/// successors held.  (Pre-D5 both exotic scripts routed to Fault → resync.)
+#[tokio::test]
+async fn teeth_d5_send_ack_notfound_drain_predicts_sent_held() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let model = RefModel::new_offline_open_shift(3);
+    let _ = run_harness(
+        &[
+            Op::OfflineSell,
+            Op::OfflineSell,
+            Op::GoOnline(DpsScript::send_ack_then_last_not_found()),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
+/// U1 D5 (NEG tooth) — a `[BadHashPrev]` (MAC-recovery) drain stays GENUINELY
+/// deferred to Fault (§7 #1) — NOT force-promoted, so run_harness adopts via
+/// resync and completes without a false differential.
+#[tokio::test]
+async fn teeth_d5_mac_recovery_drain_still_deferred_not_flagged() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let model = RefModel::new_offline_open_shift(3);
+    let _ = run_harness(
+        &[
+            Op::OfflineSell,
+            Op::OfflineSell,
+            Op::GoOnline(DpsScript::bad_hash_prev()),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
+// ── U1 D4 — BadHashPrev online sell: bounded MAC-recovery (no unbounded resend) ──
+
+/// U1 D4 (NEG tooth) — a BadHashPrev online sell's SINGLE W10.4 MAC-recovery
+/// re-entry is legitimate and NOT flagged: the wire send-count (original send +
+/// at most one re-send) is within the D4 bound, so run_harness completes.  This
+/// is the RED-first test — a too-tight bound makes it PANIC (revealing the real
+/// send-delta); the correct bound passes.  The POS "unbounded resend is caught"
+/// is proven by that RED evidence + the generative gate in the FaultOrRecovery
+/// arm (a reverted src one-shot guard, stage_send.rs:970, would trip it) —
+/// analogous to AUD-K8-1, whose over-budget breach also cannot be triggered from
+/// tests without a forbidden `src/` change (CP4).
+#[tokio::test]
+async fn teeth_d4_single_recovery_reentry_not_flagged() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(&[Op::OnlineSell(DpsScript::bad_hash_prev())], ctx, model).await;
+}
+
+/// U1 D4 (NEG tooth) — the D4 bound is SCOPED to the BadHashPrev MAC-recovery
+/// path: a normal online sell (PredictableMutating, not Fault) is NOT subject to
+/// it and completes unflagged.
+#[tokio::test]
+async fn teeth_d4_normal_online_sell_not_subject_to_bound() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(&[Op::OnlineSell(DpsScript::ack_path())], ctx, model).await;
 }
 
 // ── Lane-correctness reinforcements (pure model behaviours) ─────────────────
@@ -548,7 +750,7 @@ async fn fault_resync_then_next_op_is_differential_clean() {
     let _ = model.apply(&Op::Reboot);
 
     // Adopt the real recovered state.
-    model.resync_from_db(&ctx.pool).await;
+    model.adopt_fault_deferred(&ctx.pool).await;
     assert_eq!(
         model.docs,
         ctx.read_ledger().await,
@@ -1034,7 +1236,31 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                          (neither unchanged nor RMR)"
                     );
                 }
-                model.resync_from_db(&ctx.pool).await;
+                // U1 D4 — a BadHashPrev online sell routes to the bounded W10.4
+                // MAC-recovery path (DDL `mac_recovery_attempts CHECK IN (0,1)` +
+                // the `mac_recovery_invoked` one-shot flag, stage_send.rs:951/970):
+                // AT MOST ONE re-sign + re-send per `run()`.  The pure model
+                // defers the terminal (Fault), but the WIRE send-count must stay
+                // bounded — no unbounded resend.  A regression that removed the
+                // one-shot guard would resend without limit; this generative gate
+                // catches it (like AUD-K8-1's wire-call bound).
+                if matches!(
+                    op,
+                    Op::OnlineSell(s) if matches!(s.0.as_slice(), [WireResponse::BadHashPrev, ..])
+                ) {
+                    let send_delta = ctx.send_calls() - sends_before;
+                    // Probe-derived: the real send-delta is exactly 1 (the single
+                    // original send; the W10.4 re-sign's re-send hits the stub's
+                    // empty queue → terminal, no second wire call).  Bound at the
+                    // exact threshold, so ANY extra resend (a reverted one-shot
+                    // guard → send-delta ≥ 2) is caught.
+                    assert!(
+                        send_delta <= 1,
+                        "U1 D4: BadHashPrev online sell wire send-delta {send_delta} exceeds the \
+                         bounded MAC-recovery budget (original send + at most one W10.4 re-send)"
+                    );
+                }
+                model.adopt_fault_deferred(&ctx.pool).await;
             }
             // Predictable mutation — differential-match the model.
             oracle::OpClass::PredictableMutating => {
@@ -1146,6 +1372,54 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
             );
         }
 
+        // U1 D1 — next_lnd is PREDICTED, not adopted, for non-fault ops.  The
+        // model advances its allocator per issuing op (`apply`); assert that
+        // prediction equals the DB SSOT `node_state.next_lnd` (the
+        // `allocate_next_lnd` sequencer, ADR-M3-A1) — per-FN monotonic, no-gap
+        // (`ux_fd_fn_lnd`).  This catches an allocator drift the DOC-lnd
+        // differential CANNOT: a NoMutation op has no doc, and a missed increment
+        // leaves the doc correct but the allocator stale.  Fault ops cannot
+        // predict the crash-window allocation → they adopt via `adopt_fault_deferred`
+        // (the classified deferral, §4 funnel), so D1 skips them.
+        if !matches!(class, oracle::OpClass::FaultOrRecovery) {
+            assert_eq!(
+                model.next_lnd,
+                ctx.read_next_lnd().await,
+                "U1 D1: model next_lnd prediction diverged from node_state.next_lnd on {op:?}"
+            );
+        }
+
+        // U1 D2 — mode / shift_state are PREDICTED, not adopted, for non-fault
+        // ops.  `apply` sets both from the M3b 9-state shift machine + the
+        // node-mode machine (enums.rs); assert the prediction equals the DB.
+        // Fault ops adopt via `adopt_fault_deferred` (adopt_fault_deferred), so D2 skips
+        // them.  §7 #3 RESIDUE SPLIT: the drain / go-online MODE outcome (the
+        // `GoingOnline → Online` CAS in `drain_backlog`) is a MID-TRANSITION
+        // residue the pure model cannot pin — a FORCED `GoingOnline`
+        // (`OfflineSellDuringGoingOnline`) does not complete to `Online` the way a
+        // real go-online does, so `drain_backlog`'s empty-backlog CAS over-predicts
+        // `Online` where reality stays `GoingOnline`.  Those ops therefore DEFER
+        // mode to `adopt_precondition` (adopt_precondition); their SHIFT
+        // (RMR / unchanged) IS predicted and asserted.
+        if !matches!(class, oracle::OpClass::FaultOrRecovery) {
+            assert_eq!(
+                model.shift_state,
+                ctx.read_shift_state().await,
+                "U1 D2: model shift_state prediction diverged from node_state.shift_state on {op:?}"
+            );
+            let mode_is_transition_residue = matches!(
+                op,
+                Op::GoOnline(_) | Op::GoOnlineWithoutBacklog | Op::Drain(_) | Op::RepeatDrain
+            );
+            if !mode_is_transition_residue {
+                assert_eq!(
+                    model.mode,
+                    ctx.read_node_mode().await,
+                    "U1 D2: model mode prediction diverged from node_state.mode on {op:?}"
+                );
+            }
+        }
+
         // Scan-timing (T5, generalised): scan ONLY in a SETTLED state — NOT
         // mid-crash AND NOT mid-transition.  This is the principled reading of
         // spec §7.2 ("a committed-in-flight transient is legal — do not scan
@@ -1236,7 +1510,7 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         // and the mirrors (which the scan just checked) are what we hold the
         // model to.  Fault ops already did a FULL resync above.
         if !matches!(class, oracle::OpClass::FaultOrRecovery) {
-            model.resync_preconditions_from_db(&ctx.pool).await;
+            model.adopt_precondition(&ctx.pool).await;
         }
     }
 
@@ -1648,7 +1922,7 @@ async fn teeth_x2_single_active_session_not_flagged() {
 /// NUANCE (verified): the >1-active state is normally SCHEMA-PREVENTED by the
 /// partial unique index `ux_offline_active ON offline_sessions(fiscal_number)
 /// WHERE state IN ('OPENING','OPEN','DRAINING')` — the `check_mirrors` /
-/// `resync_preconditions_from_db` `OPEN/DRAINING` filter is a subset, so a clean
+/// `adopt_precondition` `OPEN/DRAINING` filter is a subset, so a clean
 /// DB never returns >1.  X2 is therefore DEFENSE-IN-DEPTH + determinism-hardening
 /// (a regression sentinel if that index is ever weakened), not closure of a
 /// currently-reachable false-negative.  This tooth drops the index to construct
