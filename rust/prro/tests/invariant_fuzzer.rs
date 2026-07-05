@@ -32,7 +32,7 @@ mod strategy;
 mod oracle;
 
 use prro::db::models::enums::{DocState, NodeMode, ShiftState};
-use prro::db::repositories::fiscal_documents::OFFLINE_ISSUED_STATES;
+use prro::db::repositories::fiscal_documents::{is_issued, OFFLINE_ISSUED_STATES};
 
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
@@ -138,6 +138,37 @@ fn teeth_d3_membership_semantics_unchanged() {
             RefModel::is_offline_origin_issued(state),
             OFFLINE_ISSUED_STATES.contains(&state.as_str()),
             "fork changed issued membership for {state:?} (U1 D3 must be behaviour-preserving)"
+        );
+    }
+}
+
+/// U1 D7 (ONLINE-arm tooth — A.3 advance-at-SEND) — the ONLINE counterpart of the
+/// D3 offline tooth above.  The model's online-origin seed-advance decision
+/// (`RefModel::online_origin_advances_seed`, the SSOT `apply_sell` calls) MUST
+/// equal the prod SSOT `fiscal_documents::is_issued` online arm for EVERY
+/// `DocState`, under the PHYSICAL sfn-coupling: `server_fiscal_no` is stamped at
+/// the `Sending→Sent` CAS (stage_send §6 step 3), so an online-origin doc carries
+/// sfn ⟺ its state crossed SEND.  That coupling set is INDEPENDENT ground truth
+/// about the write-path — consulted from NEITHER the model rule nor prod
+/// `is_issued`, so the three code sites must agree.  Pass-on-main / fail-on-drift:
+/// perturb the model's advance set OR prod's online arm and this turns RED (the
+/// anti-shared-logic guarantee, mirroring D7 spec-lock), instead of the
+/// differential silently blessing a prod/model divergence.
+#[test]
+fn teeth_d7_online_advance_matches_prod_is_issued() {
+    for state in ALL_DOC_STATES {
+        // Physical sfn-coupling (independent of both sides): sfn is present ⟺ the
+        // online doc crossed the Sending→Sent CAS.
+        let crossed_send = matches!(
+            state,
+            DocState::Sent | DocState::Kvt1 | DocState::Kvt2 | DocState::Ack
+        );
+        let sfn = if crossed_send { Some("70000001") } else { None };
+        assert_eq!(
+            RefModel::online_origin_advances_seed(state),
+            is_issued(state.as_str(), None, sfn),
+            "online-arm drift at {state:?}: model seed-advance != prod is_issued \
+             (offline_fiscal_no=None, under the sfn-stamped-at-SEND coupling)"
         );
     }
 }
