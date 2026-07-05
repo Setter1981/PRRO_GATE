@@ -1,7 +1,9 @@
-# A2.4 online-lane seed-fork — DESIGN (v3 — AUDITED, Go-with-amendments applied)
+# A2.4 online-lane seed-fork — DESIGN (v3 — LOCKED)
 
-**Status: v3 — AUDITED (Go-with-amendments applied) — pending architect LOCK; next = LOCK → A.3
-implementation (A.3 starts only after LOCK).** Not a code contract; no implementation is authorized by this
+**Status: v3 — LOCKED (architect, 2026-07-05). A.3 implementation is unblocked by this LOCK** (landing plan
+§6; step 0 pre-LOCK re-confirms are the first A.3 act). Both open ruling-requests resolved: D5 resolver =
+`online_convergence`-tick extension (dossier §9.2b); C10 = CONFIRMED-sets + quiescence blocks on
+issued-unconfirmed (dossier §9.3). Not a code contract; no implementation is authorized by this
 document. D1–D7 were adjudicated (v2), then run through an 8-lens external audit (verdict:
 **Go-after-amendment** — D1/D2/D3/D5/D6/D7 sound, **D4 re-spec'd to fetch-then-filter** since a SQL literal
 cannot host a Rust fn, §4/§5; no new STOP). The audit closures — the MAC-recovery×advance-at-SEND arc, the
@@ -164,7 +166,7 @@ ACK with `ns.seed ≠ H_dps` false-fails the finalize `:304` guard today). Alter
 | **D2** | Rejected-pin | **LOCKED wording:** *"pre-SENT reject → `REJECTED`, lnd consumed, seed NOT advanced (pin survives verbatim); post-SENT reject → manual-recon escalation, seed NOT rolled back (pin expands)."* Citers to update **with the A.3 code**: root `CLAUDE.md` M3b persistence paragraph (**NB — `.claude/CLAUDE.md` does not carry it; do not touch**), barrier prose `kill_point_matrix.rs:2516-2539`, roadmap A.1 constraints. |
 | **D3** | Discriminator | **= `server_fiscal_no` column** (§4). Not a state-set. Plus latent `(Sent,Rejected)` edge removal + D3(ii) verification obligation. |
 | **D4** | Predicate shape | **shared `is_issued(state, offline_fiscal_no, server_fiscal_no)` fn** for in-memory consumers; **no** `ONLINE_ISSUED_STATES` const (§2). **Audit re-spec:** C3 (`fiscal_documents.rs:933`, a SQL string) cannot host the fn → **fetch-then-filter** (candidates `ORDER BY lnd DESC`, first `is_issued()` row in Rust); SQL-mirror + equivalence-tooth = justified fallback only (dossier §9.4). |
-| **D5** | NC-03 ordering + gate | **NC-03 sufficient** — `ORDER BY lnd DESC LIMIT 1`; advances monotonic in `lnd` under single-writer + drift-assert. **Gate re-spec (audit HIGH 1.2, dossier §9.2):** predicate = **`is_issued`-complement** (`∃ doc: non-terminal AND NOT is_issued(...)`), **NOT** a "pre-SENT state-set" (`ERROR_RETRYABLE ∈ OFFLINE_ISSUED_STATES` → a state-set gate stalls the offline lane). It **lands only paired with a runtime resolver** (extend `online_convergence` onto the ER/pre-SENT cohort via `er_redrive_policy`, or in-band resolve) — **a LOCK-condition**, else the gate = FN-wide sign-refusal until reboot. Two-layer enforcement: fail-closed assert **inside the `stage_sign` pin-tx** (boot `dispatch_prepared_via_chain` bypasses acquire) **+** acquire early-refuse. Block-set incl. non-pinned `Prepared` (closes the new lnd-vs-chain-order residual) + an `invariant_scan` "chain order == lnd order over issued" check. |
+| **D5** | NC-03 ordering + gate | **NC-03 sufficient** — `ORDER BY lnd DESC LIMIT 1`; advances monotonic in `lnd` under single-writer + drift-assert. **Gate re-spec (audit HIGH 1.2, dossier §9.2):** predicate = **`is_issued`-complement** (`∃ doc: non-terminal AND NOT is_issued(...)`), **NOT** a "pre-SENT state-set" (`ERROR_RETRYABLE ∈ OFFLINE_ISSUED_STATES` → a state-set gate stalls the offline lane). It **lands only paired with a runtime resolver** — **RULED: extend `online_convergence` onto the ER/pre-SENT cohort via `er_redrive_policy`** (in-band resolve at gate-refusal REJECTED: couples receipt latency to another doc's wire retry, re-entrancy under the FN lease — dossier §9.2b) — **a LOCK-condition**, else the gate = FN-wide sign-refusal until reboot. Two-layer enforcement: fail-closed assert **inside the `stage_sign` pin-tx** (boot `dispatch_prepared_via_chain` bypasses acquire) **+** acquire early-refuse. Block-set incl. non-pinned `Prepared` (closes the new lnd-vs-chain-order residual) + an `invariant_scan` "chain order == lnd order over issued" check. |
 | **D6** | Config surface | **= hardcoded DI-swap, NO config knob.** Runtime write-path switch on a fiscal edge-device = Frozen #10 drift hazard; rollback = gated code revert; off-switch adds nothing over stopping the service. Operator controls = separate Phase-D spec. **Downgrade correction (audit 3.4):** rollback after the first advance-at-SENT doc is safe **only after the FN quiesces to a terminal** (`ACK`/escalated); a bare binary revert clears in-flight-issued docs onto the old finalize-guard and wedges them. |
 | **D7** | Fuzzer tooth | **approved** — pins the model `is_issued` mirror == prod fn (**both** arms, not just the offline const), paired (positive + negative), rides the lockstep consumer commit (landing step 4). |
 
@@ -206,8 +208,8 @@ Ordered so the RED-pin flips green only when the fork is actually closed. **⚠ 
    (`online_convergence` pattern — doc stays Sent/Kvt2, shift → RMR, no rollback).
 7. **[LOCK-condition — gate + resolver together]** Resolve the **D5 gate** (`is_issued`-complement predicate,
    §9.2): fail-closed assert in the `stage_sign` pin-tx + acquire early-refuse; block-set incl. non-pinned
-   `Prepared`; **paired with a runtime resolver** for the ER/pre-SENT cohort (extend `online_convergence` via
-   `er_redrive_policy`, or in-band resolve) — never ship the gate alone. Add the `invariant_scan`
+   `Prepared`; **paired with a runtime resolver** for the ER/pre-SENT cohort — **RULED: extend
+   `online_convergence` via `er_redrive_policy`** (in-band rejected, dossier §9.2b) — never ship the gate alone. Add the `invariant_scan`
    "chain order == lnd order over issued" check (§9.2d) + extend check 3a to the SENT/KVT1/KVT2 sfn-backstop
    (§9.5 3.2).
 8. SW-4: split `ChainSeedMismatch` out of the inline `StructuralDrift` arm (`inline.rs:754-780`) →
