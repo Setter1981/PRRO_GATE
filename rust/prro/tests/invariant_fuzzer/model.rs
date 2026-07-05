@@ -267,8 +267,15 @@ impl RefModel {
                 let doc_state = online_outcome_state(script);
                 self.docs.insert(lnd, doc_state); // the row IS minted (lnd allocated)
                 self.next_lnd += 1;
-                if doc_state == DocState::Ack {
-                    self.seed = Some(unsigned_hash); // online-origin issues at ACK
+                // A.3 / C6 — online-origin advances the seed at the SEND crossing
+                // (`Sent`+, matching prod advance-at-SEND), NOT only at `ACK`.
+                // A pre-SENT outcome (`Rejected` / `ErrorRetryable`, no sfn) does
+                // NOT advance — mirrors `fiscal_documents::is_issued`.
+                if matches!(
+                    doc_state,
+                    DocState::Sent | DocState::Kvt1 | DocState::Kvt2 | DocState::Ack
+                ) {
+                    self.seed = Some(unsigned_hash);
                 }
                 // A DPS document-reject CAS's the row Sending→Rejected but
                 // `inline::run` returns Err(DpsRejected) → the interpreter reports

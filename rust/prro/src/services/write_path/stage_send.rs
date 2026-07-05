@@ -1511,6 +1511,14 @@ async fn run_one_attempt(
 
             // server_fiscal_no UPDATE on success branch (Empty guard
             // ran before this closure; we know it's non-empty here).
+            //
+            // A.3 sfn-lockstep pin (§6 step 3): the ONLY live online
+            // issued-forward edge today is this `WireDecision::Sent` arm, so
+            // `set_server_fiscal_no_tx` + the seed advance below stay in
+            // lockstep (sfn set ⟺ seed advanced — the D3 discriminator). The
+            // dormant sfn-less edges (`(Sending,Kvt1)` inline fast-path,
+            // `(ErrorRetryable,Sent/Kvt1)` re-sends) are removed in PR-B; when
+            // the inline fast-path returns it MUST stamp sfn + advance here too.
             if let WireDecision::Sent { server_fiscal_no } = &decision {
                 if !fd::set_server_fiscal_no_tx(tx, doc, server_fiscal_no).await? {
                     return Err(anyhow::Error::new(

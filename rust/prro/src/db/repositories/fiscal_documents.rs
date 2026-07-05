@@ -925,8 +925,16 @@ pub fn is_issued(
     server_fiscal_no: Option<&str>,
 ) -> bool {
     if offline_fiscal_no.is_some() {
-        OFFLINE_ISSUED_STATES.contains(&state)
+        // Offline-origin: issued once it crossed `OFFLINE_LOCAL_ACK` (M2-01).
+        // `ACK` is the fully-drained terminal — NOT in the const (which lists
+        // the pre-ACK drain states), so it is admitted explicitly (mirrors the
+        // pre-A.3 walk's universal `state == "ACK"` clause; an offline doc that
+        // drained all the way to ACK is still issued).
+        state == "ACK" || OFFLINE_ISSUED_STATES.contains(&state)
     } else {
+        // Online-origin: issued ⟺ `server_fiscal_no` set (D3).  An online `ACK`
+        // always carries sfn, so this subsumes the old ACK-only online rule
+        // AND extends it forward to SENT+ (the A.3 advance-at-SEND change).
         matches!(server_fiscal_no, Some(sfn) if !sfn.is_empty())
     }
 }

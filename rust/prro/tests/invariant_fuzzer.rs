@@ -366,13 +366,17 @@ fn online_sell_timeout_does_not_falsely_issue() {
 }
 
 /// send→Ack then lastChk→NotFound holds at SENT (probe-pending, kill-matrix K4
-/// shape); not yet ACK, so the seed has not advanced.
+/// shape).  A.3: reaching SENT crosses the online issuance threshold, so the
+/// seed ADVANCES here (advance-at-SEND) — no longer deferred to ACK.
 #[test]
 fn online_sell_ack_then_lastchk_not_found_holds_at_sent() {
     let mut m = RefModel::new_online_open_shift();
     let out = m.apply(&Op::OnlineSell(DpsScript::send_ack_then_last_not_found()));
     assert_eq!(mutation(&out).doc_state, DocState::Sent);
-    assert_eq!(m.seed, None, "SENT (pre-confirm) has not advanced the seed");
+    assert!(
+        m.seed.is_some(),
+        "A.3: SENT crosses the issuance threshold → the seed advances at SEND"
+    );
 }
 
 /// Chain continuity: the second doc's `previous_hash` equals the first doc's

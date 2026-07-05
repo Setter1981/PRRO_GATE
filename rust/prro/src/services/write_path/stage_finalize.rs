@@ -76,8 +76,16 @@ pub enum StageFinalizeError {
     /// chain SHOULD point to upon entering finalize), `actual` is
     /// the FN's `last_known_unsigned_xml_sha256` (what the chain
     /// DOES point to).  Both `None` is the genesis case (legitimate;
-    /// no error).  Any other inequality is a structural breach;
-    /// rollback the entire envelope.
+    /// no error).  Any other inequality is a structural breach.
+    ///
+    /// **A.3 (post-advance-at-SEND, design v3 §6):** `stage_finalize` no longer
+    /// PRODUCES this variant — its sole finalize producer (the online ACK-time
+    /// chain guard) was removed when the seed advance moved to `stage_send`
+    /// (advance-at-SEND owns the drift-assert now, earlier in the pipeline).
+    /// The variant is RETAINED as an escalation surface: scan-detected /
+    /// boot-detected chain breaks and the SW-4 inline arm route here; the
+    /// convergence / drain / boot escalation arms are unchanged.  (Removal
+    /// revisit = LOW backlog after A.3.)
     #[error("stage 5 chain seed mismatch for doc {document_id:?}: expected {expected:?}, actual {actual:?}")]
     ChainSeedMismatch {
         document_id: DocumentId,

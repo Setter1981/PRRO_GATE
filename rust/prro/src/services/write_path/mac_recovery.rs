@@ -388,7 +388,9 @@ pub async fn run_mac_recovery(
     //    M2-01 already advanced the chain seed; re-signing it under a DPS `-12`
     //    hash would desync the locally built offline MAC chain (doc#2.prev goes
     //    stale → invariant_scan ChainBreak).  W10.4 mac-recovery was designed for
-    //    ONLINE docs (finalize advances the seed AFTER); offline chains are built
+    //    ONLINE docs (A.3: the seed advances at SEND, and a recovered doc
+    //    re-anchors via the Variant P branch — its re-send skips the equality
+    //    gate and reseeds to the re-signed sha); offline chains are built
     //    locally and must NEVER be re-signed under a DPS hash on the fly.  Counter
     //    NOT claimed, NO re-sign — return OfflineOriginRefused, which the caller
     //    routes to manual-recon escalation (mirror M2-04).
