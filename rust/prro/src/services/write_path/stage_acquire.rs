@@ -10,13 +10,14 @@
 use anyhow::Context;
 
 use crate::db::models::enums::{DocType, NodeMode, Severity, ShiftState};
-use crate::db::models::ids::{DocumentId, RequestId};
+use crate::db::models::ids::{DocumentId, RequestId, ShiftId};
 use crate::db::repositories::{
     audit_log,
     fiscal_documents::{self as fd, NewDocument},
     ingress_inbox, node_state, shifts,
 };
 use crate::db::tx::with_immediate;
+use crate::services::shift::transition;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
@@ -582,6 +583,32 @@ pub async fn run(
                 .await;
             }
 
+            // [Step 6b′] A′.1 piece 3 (P6 ruling A) — fail-closed pre-mint
+            //            refusal of an ONLINE `SHIFT_OPEN` that carries no
+            //            cashier identity.  Edge 1 below opens a shift, and a
+            //            shift MUST record its opening cashier (§16.8
+            //            1-cashier-per-shift); the `__pre_w14a1__` sentinel is
+            //            forbidden (plan §0b).  Placed on the fresh-Proceed
+            //            path AFTER resume/terminal short-circuit but BEFORE
+            //            the tax_snapshot INSERT + lnd alloc + doc mint, so the
+            //            refusal consumes no lnd and writes no row (audit_log
+            //            only — the pre-acquire-refusal persistence class).
+            //            Online-only: offline SHIFT_OPEN create is piece 4.
+            if command.doc_type == DocType::ShiftOpen
+                && channel == Channel::Online
+                && command.signed_by_cashier_id.is_none()
+            {
+                return reject(
+                    tx,
+                    &request_id,
+                    RejectionReason::ShiftOpenMissingCashier,
+                    "shift_open_missing_cashier",
+                    Severity::Warning,
+                    None,
+                )
+                .await;
+            }
+
             // [Step 6c] W4-Z2a piece 6b-self-review Important #1 —
             //           insert tax_snapshot ONLY now that we're
             //           definitively on the Proceed path (Resume and
@@ -620,11 +647,86 @@ pub async fn run(
                 Channel::Online => "ONLINE",
                 Channel::Offline => "OFFLINE",
             };
+
+            // [Step 8′] A′.1 piece 3 — online shift-lifecycle hooks (edges
+            //           1 & 8), inside THIS `with_immediate` envelope so
+            //           create + transition + doc-INSERT commit atomically:
+            //           no `CREATED`/`Opening` shift ever rests without its
+            //           SHIFT_OPEN doc, and any post-create failure rolls the
+            //           shift back with the envelope.  Online channel ONLY —
+            //           offline SHIFT_OPEN create is piece 4
+            //           (`stage_offline_ack`).  Placed AFTER the `document_id`
+            //           mint (edge 1's `shift_id` is derived from it) and
+            //           BEFORE the doc INSERT (the shifts row must exist for
+            //           the `fiscal_documents.shift_id` FK).  The guard matrix
+            //           (`check_shift_guard`) is UNCHANGED — the gap was the
+            //           missing transition driver, not the refusal.
+            let shift_binding: Option<ShiftId> = if channel == Channel::Online {
+                match command.doc_type {
+                    // Edge 1: fresh SHIFT_OPEN accept (guard already proved
+                    // `shift_state == Closed`) → mint the shift `CREATED` and
+                    // drive `Created → Opening`, binding the doc to it.  The
+                    // cashier is `Some` by the Step 6b′ refusal above.
+                    DocType::ShiftOpen => {
+                        let opener = command
+                            .signed_by_cashier_id
+                            .as_ref()
+                            .expect("Step 6b′ refuses ShiftOpen with no cashier")
+                            .as_str();
+                        let shift_id = ShiftId::deterministic_for_shift_open(document_id);
+                        transition::create_shift_tx(tx, &fn_id, shift_id, "ONLINE", opener)
+                            .await?;
+                        expect_applied(
+                            transition::apply_shift_transition(
+                                tx,
+                                &fn_id,
+                                shift_id,
+                                ShiftState::Created,
+                                ShiftState::Opening,
+                            )
+                            .await?,
+                            "edge1 Created→Opening",
+                            shift_id,
+                        )?;
+                        Some(shift_id)
+                    }
+                    // Edge 8: Z_REPORT / SHIFT_CLOSE accept on an `Opened`
+                    // shift (the guard admits these two only when `Opened`) →
+                    // drive `Opened → Closing`.  Edge 10 (`Closing → Closed`)
+                    // is piece 2 (`stage_send`).  The doc binds to the
+                    // existing `current_shift_id` via `active_shift` below.
+                    DocType::ZReport | DocType::ShiftClose
+                        if node_state.shift_state == ShiftState::Opened =>
+                    {
+                        let shift_id = active_shift
+                            .as_ref()
+                            .expect("guard + Step 5 guarantee active_shift when Opened")
+                            .shift_id;
+                        expect_applied(
+                            transition::apply_shift_transition(
+                                tx,
+                                &fn_id,
+                                shift_id,
+                                ShiftState::Opened,
+                                ShiftState::Closing,
+                            )
+                            .await?,
+                            "edge8 Opened→Closing",
+                            shift_id,
+                        )?;
+                        None
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
             let new_doc = NewDocument {
                 document_id,
                 request_id: request_id_typed,
                 fiscal_number: fn_id.clone(),
-                shift_id: active_shift.as_ref().map(|s| s.shift_id),
+                shift_id: shift_binding.or_else(|| active_shift.as_ref().map(|s| s.shift_id)),
                 offline_session_id: None,
                 lnd,
                 doc_type: command.doc_type,
@@ -779,12 +881,33 @@ fn spec_event_for(reason: &RejectionReason) -> Option<&'static str> {
         NodeBlocked => Some("STAGE_ACQUIRE_BLOCKED_REFUSED"),
         NodeStopMode => Some("STAGE_ACQUIRE_STOP_MODE_REFUSED"),
         NodeCryptoDegraded => Some("STAGE_ACQUIRE_CRYPTO_DEGRADED_REFUSED"),
+        ShiftOpenMissingCashier => Some("SHIFT_OPEN_MISSING_CASHIER"),
         ShiftOpenPendingDrainOpRefused => Some("SHIFT_OPEN_PENDING_DRAIN_OP_REFUSED"),
         PostLocalCloseSaleRefused => Some("POST_LOCAL_CLOSE_SALE_REFUSED"),
         OfflineShiftCloseNotSupported => Some("OFFLINE_SHIFT_CLOSE_REFUSED"),
         ShiftClosingInFlight => Some("SHIFT_CLOSING_IN_FLIGHT_OP_REFUSED"),
         ZReportBlockedBacklogDrainPending => Some("OFFLINE_Z_REPORT_BACKLOG_DRAIN_PENDING_REFUSED"),
         _ => None,
+    }
+}
+
+/// A′.1 piece 3 — fail-closed check that a fresh-Proceed shift edge landed
+/// as `Applied`.  Both edges run ONLY on the fresh-Proceed path (a re-drive
+/// short-circuits at resume), on a shift this envelope just created (edge 1)
+/// or the FN's single active shift (edge 8) under the FN single-writer
+/// lease — so `Applied` is guaranteed and any other outcome is structural
+/// drift → roll the whole `with_immediate` envelope back.
+fn expect_applied(
+    outcome: shifts::TransitionOutcome,
+    edge: &str,
+    shift_id: ShiftId,
+) -> anyhow::Result<()> {
+    match outcome {
+        shifts::TransitionOutcome::Applied => Ok(()),
+        other => Err(anyhow::anyhow!(
+            "stage_acquire {edge}: shift transition not Applied ({other:?}) \
+             for shift {shift_id:?}"
+        )),
     }
 }
 

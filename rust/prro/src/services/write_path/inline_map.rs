@@ -38,6 +38,7 @@ use crate::services::write_path::types::RejectionReason;
 pub(crate) mod codes {
     // ── ShiftGuardRefused → 422 (client/operator-fixable stage-guard refusals) ──
     pub const SHIFT_ALREADY_OPEN: &str = "SHIFT_ALREADY_OPEN";
+    pub const SHIFT_OPEN_MISSING_CASHIER: &str = "SHIFT_OPEN_MISSING_CASHIER";
     pub const SHIFT_OPEN_PENDING_DRAIN: &str = "SHIFT_OPEN_PENDING_DRAIN";
     pub const POST_LOCAL_CLOSE_SALE_REFUSED: &str = "POST_LOCAL_CLOSE_SALE_REFUSED";
     pub const OFFLINE_SHIFT_CLOSE_NOT_SUPPORTED: &str = "OFFLINE_SHIFT_CLOSE_NOT_SUPPORTED";
@@ -155,6 +156,9 @@ pub(crate) fn map_rejection(reason: &RejectionReason, request_id: [u8; 16]) -> F
         R::ShiftNotOpen { .. } => FiscalError::ShiftNotOpen { request_id },
         // T1 — precise shift-state codes (422), NOT collapsed to ShiftNotOpen.
         R::ShiftAlreadyOpen => shift_guard(request_id, codes::SHIFT_ALREADY_OPEN),
+        // A′.1 piece 3 — client-input error (missing opening cashier), same
+        // 4xx shift-guard channel as the neighbouring pre-mint refusals.
+        R::ShiftOpenMissingCashier => shift_guard(request_id, codes::SHIFT_OPEN_MISSING_CASHIER),
         R::ShiftOpenPendingDrainOpRefused => {
             shift_guard(request_id, codes::SHIFT_OPEN_PENDING_DRAIN)
         }
