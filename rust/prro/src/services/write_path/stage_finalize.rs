@@ -78,14 +78,19 @@ pub enum StageFinalizeError {
     /// DOES point to).  Both `None` is the genesis case (legitimate;
     /// no error).  Any other inequality is a structural breach.
     ///
-    /// **A.3 (post-advance-at-SEND, design v3 §6):** `stage_finalize` no longer
-    /// PRODUCES this variant — its sole finalize producer (the online ACK-time
-    /// chain guard) was removed when the seed advance moved to `stage_send`
-    /// (advance-at-SEND owns the drift-assert now, earlier in the pipeline).
-    /// The variant is RETAINED as an escalation surface: scan-detected /
-    /// boot-detected chain breaks and the SW-4 inline arm route here; the
-    /// convergence / drain / boot escalation arms are unchanged.  (Removal
-    /// revisit = LOW backlog after A.3.)
+    /// **A.3 (post-advance-at-SEND, design v3 §6) — HONEST producer status:**
+    /// `stage_finalize.rs:305` was the SOLE producer of this variant (the online
+    /// ACK-time chain guard).  It was removed when the seed advance moved to
+    /// `stage_send`.  **As of PR-A there is therefore NO live producer** of
+    /// `ChainSeedMismatch`: the escalation tract it feeds (`kvt2_advance` →
+    /// `kvt2_confirm` → the convergence / drain / boot / inline arms) is RETAINED
+    /// but currently **DORMANT** — a live producer is (re)wired only later
+    /// (PR-B SW-4 = the inline arm; PR-C = scan→escalate + boot NC-04/tip-guard).
+    /// This is a DELIBERATELY-DOCUMENTED dormant surface, explicitly NOT silent
+    /// non-functional safety: the chain check itself is NOT lost — it moved
+    /// EARLIER, to the fail-closed SEND drift-assert (`stage_send`).  Do not read
+    /// the retained arms as a currently-live safety path.  (Removing the
+    /// now-unproduced variant = LOW backlog after A.3.)
     #[error("stage 5 chain seed mismatch for doc {document_id:?}: expected {expected:?}, actual {actual:?}")]
     ChainSeedMismatch {
         document_id: DocumentId,
