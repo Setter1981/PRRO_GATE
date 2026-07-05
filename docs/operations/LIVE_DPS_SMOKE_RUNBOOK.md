@@ -4,31 +4,35 @@ W4-Z4 Pilot Readiness artifact 4 (`docs/architecture/W4_Z4_PILOT_READINESS_STABI
 This runbook is the **operator-run procedure** for executing the live DPS smoke that
 proves the native Rust fiscal cycle against the real DPS **test** cabinet.
 
-> **Provenance / merge state (read first).** This runbook documents the smoke as it
-> exists **on branch `feat/m4-w4-z3-dps-extended-smoke` (PENDING MERGE to `rust-gateway`)**.
-> The harness `rust/prro/tests/live_dps_extended_smoke.rs`, the `live-dps` Cargo feature,
-> and the proven `SHIFT_OPEN → SELL → Z_REPORT` cycle (§4.6) live **only on that unmerged
-> branch — they are NOT present on `rust-gateway` HEAD** (where these pilot-gate caps live).
-> Every command, env var, gate, and result below describes what the harness on
-> `feat/m4-w4-z3` actually does. On `rust-gateway` HEAD the only live harness that EXISTS is
-> `rust/prro/tests/live_smoke_w12_hardening.rs` (`--features test-support`,
-> connect/probe-only, dummy signing, no CMS); the `--features live-dps` static gate and the
-> full native cycle become runnable on HEAD **only after `feat/m4-w4-z3` merges.**
+> **Provenance / merge state (REFRESHED 2026-07-05).** `feat/m4-w4-z3-dps-extended-smoke`
+> **MERGED to `main` via PR #112** — the harness `rust/prro/tests/live_dps_extended_smoke.rs`,
+> the `live-dps` Cargo feature, and the proven `SHIFT_OPEN → SELL → Z_REPORT` cycle (§4.6)
+> are all **present and runnable on `main` HEAD**. The connect/probe-only
+> `live_smoke_w12_hardening.rs` also remains. The original note ("PENDING MERGE") is
+> obsolete; commands/env/gates below apply to `main` as-is.
 
 > **Pilot gate verdict: NO-GO (read first).** This is a **branch/technical wire smoke, NOT
 > a pilot authorization** — the pilot gate verdict on `rust-gateway` HEAD is **NO-GO** (see
 > §4.9 Hard-Blockers). A green run here proves the native crypto+wire profile only; it does
 > **not** clear the gate.
 
-> **Scope honesty (read first).** This smoke proves the **WIRE only**. It seeds a
+> **Scope honesty (REFRESHED 2026-07-05).** This smoke proves the **WIRE only**. It seeds a
 > `PREPARED` document directly and drives it through `reconcile_pending_with` →
 > `dispatch_prepared_via_chain` → `stage_sign` → `stage_send`. It **bypasses
 > `stage_acquire`** (no ingress, no lease, no LND allocation, no canonical-hash
-> idempotency). The gateway's **online shift-lifecycle drivers are UNWIRED** (see §4.8,
-> WL-1): on a live online `SHIFT_OPEN` ACK the local `shifts` / `node_state.shift_state`
-> are **never flipped** — local shift tracking is intentionally out of scope. This smoke
-> shows that the native crypto + DPS wire profile is accepted by the real server. It does
-> **not** prove the online shift state machine, offline limits, or channel-switch guards.
+> idempotency). **UPDATE (A′.1 pieces 2/3, PRs #224/#225): the online shift-lifecycle
+> drivers are now WIRED at stage level** — `stage_acquire` mints the shift + edges 1/8,
+> `stage_send`'s 4-b Sent-block confirms edges 3/10 (`Opening→Opened`, `Closing→Closed`).
+> **Consequence for THIS legacy procedure:** because the seed-`PREPARED` path bypasses
+> `stage_acquire`, a shift doc driven this way carries **no `shift_id` and no `Opening`
+> shift row** — the piece-2 confirm hook will emit `SHIFT_CONFIRM_EDGE_DRIFT` (**CRITICAL**
+> audit) on its SENT commit. The Sent commit **stands** (post-wire no-rollback policy) and
+> the smoke still passes; the CRITICAL entry is an **expected artifact of the acquire
+> bypass**, not a live defect. A refreshed procedure that enters through `stage_acquire`
+> (exercising the real shift wiring end-to-end) is the recommended Tier-1 re-run once A.3
+> PR-A (advance-at-SEND core) merges — that single run then validates BOTH the shift
+> wiring and the new seed semantics against the live cabinet. This smoke still does **not**
+> prove offline limits or channel-switch guards.
 
 ---
 
@@ -395,32 +399,37 @@ authoritative Hard-Blocker list and exit-gate verdict live in the W4-Z4 readines
 exit gate) and the PLAYBOOK exit criteria; the blockers visible from this runbook's scope
 are at minimum:
 
+> **Blocker-status refresh (2026-07-05):** two of the five original blockers are CLOSED;
+> the verdict stays **NO-GO** on the remaining three (seed-fork fix A.3 is in flight;
+> offline reachability and the binding flip are outstanding).
+
+- ~~**Online shift-lifecycle drivers UNWIRED (WL-1)**~~ — **CLOSED 2026-07-05**: A′.1
+  pieces 3+2 (PRs #224/#225) wired create + edges 1/8 in `stage_acquire` and confirm edges
+  3/10 in `stage_send`'s 4-b Sent-block. `shifts` / `node_state.shift_state` now flip on a
+  live SENT-confirm. (Ambiguous-timeout → manual remains a piece-5/A2.5 residual.)
+- ~~**Native ATTACHED crypto unmerged**~~ — **CLOSED**: `feat/m4-w4-z3` merged to `main`
+  via PR #112; the live-accepted ATTACHED CMS signer + `live-dps` harness are on HEAD
+  (see the refreshed Provenance note).
 - **PRRO_FISCAL_MODE not harness-enforced** — manual operator preflight only; a hard harness
-  check is a required pilot fix deferred to `feat/m4-w4-z3` (DF-5, §4.3).
-- **Online shift-lifecycle drivers UNWIRED** — local `shifts` / `node_state.shift_state` are
-  never flipped on a live ACK; ambiguous online timeout → manual is unreachable (WL-1,
-  §4.8).
-- **Offline drain-safety + manual-recon escalation UNWIRED IN PROD (DF-1)** — the
-  drain-reject-of-`OFFLINE_LOCAL_ACK`-backlog → `REQUIRES_MANUAL_RECONCILIATION` +
-  `OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL` path and the edge-5 drain-finalize-opens-shift
-  path are **code-present + test-pinned** (`backlog_drain.rs:2191`) but **unreachable in
-  production**: the prod bootstrap seeds `ShiftState::CLOSED` (`boot_phase.rs:1304`), so the
-  gateway **cannot transact at all today** — online SELL is refused on `Closed`
-  (`(Sell, Closed) → ShiftNotOpen`, `stage_acquire.rs:897`), and the offline path is
-  unreachable **end-to-end** (no `node_state` Offline/GoingOffline mode setter; zero
-  production callers of `OfflineSessionService::open_session`; `stage_offline_ack` requires
-  `Opened` + an active offline session, `stage_offline_ack.rs:268-318`). No mode flip → no
-  offline session → no `OFFLINE_LOCAL_ACK` doc → no backlog → `drain()` early-returns; the
-  escalation (keyed on a pending-drain `shift_state` prod never sets) and the `Opened → None`
-  finalize arm are both dead in prod. This is a **silent non-functional safety**: the
-  drain-safety guard appears present but is unreachable. Matches MATRIX §5 / PLAYBOOK §9
-  (incl. the offline drain-safety silent-absence).
-- **Native ATTACHED crypto unmerged** — the live-accepted ATTACHED CMS signer is on
-  `feat/m4-w4-z3` (PENDING MERGE + external review); `rust-gateway` HEAD's in-process signer
-  is detached and NOT live-DPS-accepted (Provenance note, §4.1).
+  check remains a required pilot fix (DF-5, §4.3). **OPEN.**
+- **Offline drain-safety + manual-recon escalation UNREACHABLE IN PROD (DF-1)** — the
+  drain-reject-of-`OFFLINE_LOCAL_ACK`-backlog → `REQUIRES_MANUAL_RECONCILIATION` escalation
+  and the edge-5 drain-finalize path are code-present + test-pinned but **unreachable
+  end-to-end**: no `node_state` Offline/GoingOffline mode setter, zero production callers of
+  `OfflineSessionService::open_session`, `stage_offline_ack` requires `Opened` + an active
+  session — and W10a/W10b (offline `SHIFT_OPEN` accept + reserve gate) are still absent.
+  No mode flip → no session → no `OFFLINE_LOCAL_ACK` doc → no backlog → `drain()`
+  early-returns. **OPEN — scheduled as A′.1 piece 4 + roadmap A′.3.** (Anchor refresh: prod
+  bootstrap seeds `CLOSED` at `boot_phase.rs:1835` — the online half of the old "cannot
+  transact at all" statement is superseded by the WL-1 closure above; SELL is admitted once
+  a live SHIFT_OPEN confirms.)
 - **INV-05/06 channel guards UNWIRED** and **INV-09/10 offline limits UNWIRED** — risk-accept
   only with an ops freeze / offline descoped + controlled (Appendix; canonical framing in the
-  MATRIX/PLAYBOOK).
+  MATRIX/PLAYBOOK). **OPEN** (offline limits: W10a reserve gate lands with piece 4).
+- **NEW (2026-07-05): online seed-fork fix (A.3, spec v3 LOCKED) not yet landed** — until
+  A.3 PR-A merges, the online seed advances only at ACK; the sequential one-doc-at-a-time
+  discipline of THIS runbook is fork-safe, but any concurrent/pipelined driving of two
+  online docs is forbidden (AUD-L2-1a). After PR-A this line closes.
 
 See the MATRIX §5 / PLAYBOOK exit criteria for the full Hard-Blocker list and the path to GO.
 
