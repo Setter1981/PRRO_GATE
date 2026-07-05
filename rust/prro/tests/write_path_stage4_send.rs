@@ -1732,7 +1732,7 @@ async fn variant_p_mac_recovery_skips_drift_assert_and_advances_seed() {
         .execute(&pool)
         .await
         .unwrap();
-    let drifted = vec![0xD1u8; 32];
+    let drifted = [0xD1u8; 32];
     sqlx::query(
         "UPDATE node_state SET last_known_unsigned_xml_sha256 = ? \
          WHERE fiscal_number = '1234567890'",
@@ -1761,7 +1761,7 @@ async fn variant_p_mac_recovery_skips_drift_assert_and_advances_seed() {
     .unwrap();
     assert_eq!(
         seed.as_deref(),
-        Some(vec![0x5Au8; 32].as_slice()),
+        Some([0x5Au8; 32].as_slice()),
         "Variant P must advance the seed to the recovered doc's own unsigned sha"
     );
 }
@@ -1777,7 +1777,7 @@ async fn non_recovery_send_drift_fails_closed() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_signed_doc_with_xml(&pool, 0x5B, "SELL", 0x5B, "SIGNED").await;
     // attempts stays 0 (gate LIVE); node seed drifted off doc.previous_hash (NULL).
-    let drifted = vec![0xD2u8; 32];
+    let drifted = [0xD2u8; 32];
     sqlx::query(
         "UPDATE node_state SET last_known_unsigned_xml_sha256 = ? \
          WHERE fiscal_number = '1234567890'",

@@ -506,6 +506,9 @@ impl Harness {
 
     /// Read the driven docs back, ordered by `lnd`, plus consumed offline codes.
     async fn observe(&self) -> Observed {
+        // Positional sqlx read, destructured into DocRec immediately below; the
+        // 6-tuple is contained to this one statement (C8 widened it by 2 cols).
+        #[allow(clippy::type_complexity)]
         let rows: Vec<(
             i64,
             String,
