@@ -171,6 +171,104 @@ async fn clean_consistent_ledger_scans_clean() {
     assert_eq!(scan(&pool).await.unwrap(), vec![]);
 }
 
+/// A.3 false-positive guard (walk, online arm): an online-origin chain that
+/// crossed SEND rests at SENT/KVT1 with `server_fiscal_no` stamped and its seed
+/// ADVANCED at SEND (not at ACK). The walk keys `is_issued` on `server_fiscal_no`
+/// (D3), so it advances `expected` over these resting docs and matches the
+/// node_state seed → ZERO breaches. Teeth: if the walk regressed to advancing
+/// only at ACK, `expected` would stay behind the node seed → ChainSeedMismatch
+/// (and ChainBreak at the successor) — this pin catches that.
+#[tokio::test]
+async fn clean_online_issued_resting_at_sent_scans_clean() {
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await;
+    // node seed = last SEND-crossed doc's unsigned sha (advanced at SEND).
+    seed_node_state(&pool, shift, Some(h(2))).await;
+    // doc#1 rests at SENT (issued-unconfirmed), doc#2 chains off it at KVT1.
+    seed_doc(
+        &pool,
+        shift,
+        1,
+        "SENT",
+        Some("D-1"),
+        None,
+        Some(h(1)),
+        None,
+        false,
+    )
+    .await;
+    seed_doc(
+        &pool,
+        shift,
+        2,
+        "KVT1",
+        Some("D-2"),
+        Some(h(1)),
+        Some(h(2)),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(scan(&pool).await.unwrap(), vec![]);
+}
+
+/// A.3 false-positive guard (walk, offline arm at the ACK terminal): an
+/// offline-origin doc issued at OFFLINE_LOCAL_ACK (seed advanced there) then
+/// drained online to ACK with a DPS id + KVT1_RAW. The walk keys `is_issued` on
+/// `offline_fiscal_no` (D3 — set ⟹ offline arm), so the `state == "ACK"` clause
+/// keeps it issued and `expected` matches the node seed → ZERO breaches.
+/// Distinct from `clean_consistent_ledger` (online arm) AND from
+/// `m2_n2b_*` (offline arm at OLA/REJECTED): this pins the offline arm at the
+/// DRAINED ACK terminal, backed by a consumed offline code + session so the
+/// OfflineFiscalNoUnbacked / no-session checks stay silent too.
+#[tokio::test]
+async fn clean_offline_drained_ack_scans_clean() {
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await;
+    seed_node_state(&pool, shift, Some(h(1))).await;
+    let session = OfflineSessionId::new();
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, 'OPEN', '2026-06-13T00:00:00Z')",
+    )
+    .bind(session)
+    .bind(FN)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // offline_fiscal_no set (D3 discriminator) → offline arm; drained to ACK
+    // with a DPS id + KVT1_RAW so checks 3a/3b are satisfied too.
+    let (doc, _) = seed_doc(
+        &pool,
+        shift,
+        1,
+        "ACK",
+        Some("D-1"),
+        None,
+        Some(h(1)),
+        Some(1),
+        true,
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO offline_codes(fiscal_number, code_lnd, consumed_at, \
+            consumed_by_document_id) \
+         VALUES (?, 1, '2026-06-13T00:00:01Z', ?)",
+    )
+    .bind(FN)
+    .bind(doc)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE fiscal_documents SET offline_session_id = ? WHERE document_id = ?")
+        .bind(session)
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(scan(&pool).await.unwrap(), vec![]);
+}
+
 // ─── Detection fixtures: one breach each ────────────────────────────────
 
 /// Drift-guard: if a future migration LOSES the `ux_fd_fn_lnd` unique
