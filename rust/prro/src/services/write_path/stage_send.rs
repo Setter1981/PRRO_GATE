@@ -77,8 +77,8 @@ use prost::Message as _;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
-use crate::db::models::enums::{DocState, DocType, Severity};
-use crate::db::models::ids::DocumentId;
+use crate::db::models::enums::{DocState, DocType, Severity, ShiftState};
+use crate::db::models::ids::{DocumentId, ShiftId};
 use crate::db::repositories::fiscal_documents::SendInputs;
 use crate::db::repositories::transport_trace::OutcomeKind;
 use crate::db::repositories::{
@@ -89,6 +89,7 @@ use crate::db::repositories::{
     transport_trace::{self, AttemptCompletion, NewAttempt},
 };
 use crate::db::tx::with_immediate;
+use crate::services::shift::transition;
 use crate::services::write_path::signer_guard::{self, SignerCashierMismatch};
 use crate::transports::dps::channel::DpsChannel;
 use crate::transports::dps::dto::{CheckEnvelope, DpsCheckType};
@@ -565,6 +566,14 @@ enum PreOutcome {
         attempt_no: i32,
         doc_type: DocType,
         fiscal_number: String,
+        /// A′.1 piece 2 (D-15) — propagated out of the 4-pre closure (like
+        /// `doc_type`/`fiscal_number`) so the 4-b `WireDecision::Sent` block
+        /// can drive the shift confirm edges 3/10 WITHOUT a re-read.
+        /// `shift_id` = the confirm target; `offline_fiscal_no` = the
+        /// online-origin discriminator (`None` ⟺ online-origin; the drain
+        /// owns the offline shift edges).
+        shift_id: Option<ShiftId>,
+        offline_fiscal_no: Option<i64>,
     },
     /// `fetch_send_inputs_tx` returned `None` OR CAS returned
     /// `NotFound`.  No side effects.
@@ -1021,6 +1030,100 @@ pub async fn run(
     }
 }
 
+/// A′.1 piece 2 — POST-WIRE shift confirm edge (3: `Opening → Opened`, 10:
+/// `Closing → Closed`).  DPS already accepted the SENT commit, so this MUST
+/// NOT roll it back: on any non-`Applied` outcome the Sent commit STANDS and
+/// the drift is audited (Info for the benign already-at-target no-op, CRITICAL
+/// for real drift) — repair belongs to boot orphan-resolution / manual-recon.
+/// The shift row + `node_state` projection move atomically via the transition
+/// service (sole-writer discipline).  A projection-mirror failure on an
+/// APPLIED shift is a structural breach unreachable under the FN single-writer
+/// lease and is the ONLY path that propagates an error (fail-closed) — every
+/// reachable non-Applied outcome returns `Ok` (no rollback).
+async fn confirm_shift_edge(
+    tx: &mut crate::db::tx::WriteTxConn<'_>,
+    fiscal_number: &str,
+    shift_id: Option<ShiftId>,
+    doc: DocumentId,
+    from: ShiftState,
+    to: ShiftState,
+    edge: &str,
+) -> anyhow::Result<()> {
+    // `shift_id == None` on an online SHIFT_OPEN / Z / SHIFT_CLOSE is
+    // impossible after piece 3 (edge 1/8 bind it at acquire).  Fail closed —
+    // CRITICAL audit, NO panic, NO rollback (the Sent commit stands).
+    let Some(shift_id) = shift_id else {
+        emit_shift_confirm_audit(
+            tx,
+            doc,
+            "SHIFT_CONFIRM_EDGE_DRIFT",
+            Severity::Critical,
+            edge,
+            "shift_id_none",
+        )
+        .await?;
+        return Ok(());
+    };
+    match transition::apply_shift_transition(tx, fiscal_number, shift_id, from, to).await? {
+        shifts::TransitionOutcome::Applied => Ok(()),
+        shifts::TransitionOutcome::Conflict { observed } if observed == to => {
+            // Benign idempotent no-op — the shift is already at the target.
+            // Unreachable by trace: this block runs on a FRESH `Sending → Sent`
+            // Applied CAS, and a re-drive of a Sent doc short-circuits at the
+            // 4-pre allowlist (`StateConflict`), so 4-b never re-fires the
+            // edge.  Audited Info defensively.
+            emit_shift_confirm_audit(
+                tx,
+                doc,
+                "SHIFT_CONFIRM_EDGE_NOOP",
+                Severity::Info,
+                edge,
+                &format!("already_at_target={observed:?}"),
+            )
+            .await
+        }
+        other => {
+            // Real drift (`Conflict{other}` / `Forbidden` / `NotFound`) — e.g.
+            // a boot-orphan quarantined the shift to `Error` and the doc then
+            // re-sent.  Sent stands; recovery owns the shift row.
+            emit_shift_confirm_audit(
+                tx,
+                doc,
+                "SHIFT_CONFIRM_EDGE_DRIFT",
+                Severity::Critical,
+                edge,
+                &format!("expected_from={from:?} observed={other:?}"),
+            )
+            .await
+        }
+    }
+}
+
+/// A′.1 piece 2 — forensic audit for a post-wire shift-confirm-edge outcome,
+/// inside the 4-b `with_immediate` tx.  Emitting here (not rolling back)
+/// preserves the record while the Sent commit stands.
+async fn emit_shift_confirm_audit(
+    tx: &mut crate::db::tx::WriteTxConn<'_>,
+    doc: DocumentId,
+    event: &str,
+    severity: Severity,
+    edge: &str,
+    detail: &str,
+) -> anyhow::Result<()> {
+    let payload = serde_json::json!({ "edge": edge, "detail": detail }).to_string();
+    audit_log::append_tx(
+        tx,
+        "fiscal_document",
+        &format!("{doc:?}"),
+        event,
+        severity,
+        None,
+        Some(&payload),
+    )
+    .await?;
+    Ok(())
+}
+
 /// One pass of the 4-pre/4a/4b cycle.  Pure body — no MAC recovery
 /// dispatch.  Caller (`run`) loops over this fn at most twice (initial
 /// attempt + one Resigned re-entry) bounded by the `mac_recovery_invoked`
@@ -1246,6 +1349,8 @@ async fn run_one_attempt(
                 envelope,
                 attempt_no,
                 doc_type: inputs.doc_type,
+                shift_id: inputs.shift_id,
+                offline_fiscal_no: inputs.offline_fiscal_no,
                 fiscal_number: inputs.fiscal_number,
             })
         })
@@ -1253,13 +1358,22 @@ async fn run_one_attempt(
     .await
     .map_err(bridge_anyhow)?;
 
-    let (envelope, attempt_no, doc_type, fiscal_number) = match pre {
+    let (envelope, attempt_no, doc_type, fiscal_number, shift_id, offline_fiscal_no) = match pre {
         PreOutcome::Marked {
             envelope,
             attempt_no,
             doc_type,
             fiscal_number,
-        } => (envelope, attempt_no, doc_type, fiscal_number),
+            shift_id,
+            offline_fiscal_no,
+        } => (
+            envelope,
+            attempt_no,
+            doc_type,
+            fiscal_number,
+            shift_id,
+            offline_fiscal_no,
+        ),
         PreOutcome::DocumentMissing => return Ok(StageSendOutcome::DocumentMissing),
         PreOutcome::SignedArtifactMissing => {
             return Err(StageSendError::SignedArtifactMissing { document_id: doc })
@@ -1375,6 +1489,59 @@ async fn run_one_attempt(
                     return Err(anyhow::Error::new(
                         StageSendError::SetServerFiscalNoMissing { document_id: doc },
                     ));
+                }
+
+                // ═══════════════════════════════════════════════════════════
+                // A.3 SEED-ADVANCE SEAM — design v3 LOCKED, landing §6 step 2
+                // (docs/superpowers/specs/2026-07-04-a24-seed-fork-design.md).
+                // The advance-at-SEND seed write lands HERE, BETWEEN the
+                // `set_server_fiscal_no_tx` above and the shift confirm edges
+                // below: a pre-advance drift-assert (mirror stage_offline_ack)
+                // + `update_last_known_xml_sha_tx`, atomic with THIS CAS +
+                // sfn stamp (so `server_fiscal_no` set ⟺ seed advanced — the
+                // D3 discriminator).  A′.1 (this piece) lands first and leaves
+                // the seam; A.3 sews the advance in here.  Do NOT implement it
+                // in A′.1.
+                // ═══════════════════════════════════════════════════════════
+
+                // A′.1 piece 2 — shift confirm edges 3/10.  "DPS Ack" for the
+                // shift ladder = SENT + `server_fiscal_no` (this fresh
+                // `WireDecision::Sent` Applied CAS), NOT terminal Ack — a
+                // finalize hook would stall SELLs for the whole reconciliation
+                // window (plan §2).  Online-origin ONLY (`offline_fiscal_no IS
+                // NULL`): the drain owns the offline pending-drain shift edges
+                // (backlog_drain.rs:2460), so an offline-origin doc must not
+                // double-fire here.  POST-WIRE: a non-Applied shift-CAS does
+                // NOT roll back the Sent commit (wire-truth wins) — see
+                // `confirm_shift_edge`.
+                if offline_fiscal_no.is_none() {
+                    match doc_type {
+                        DocType::ShiftOpen => {
+                            confirm_shift_edge(
+                                tx,
+                                &fiscal_number,
+                                shift_id,
+                                doc,
+                                ShiftState::Opening,
+                                ShiftState::Opened,
+                                "edge3_open",
+                            )
+                            .await?;
+                        }
+                        DocType::ZReport | DocType::ShiftClose => {
+                            confirm_shift_edge(
+                                tx,
+                                &fiscal_number,
+                                shift_id,
+                                doc,
+                                ShiftState::Closing,
+                                ShiftState::Closed,
+                                "edge10_close",
+                            )
+                            .await?;
+                        }
+                        _ => {}
+                    }
                 }
             }
 
