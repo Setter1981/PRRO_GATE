@@ -157,3 +157,69 @@ async fn mirror_projection_tx(
     }
     Ok(())
 }
+
+/// Create a brand-new shift for `fiscal_number` and bind it as the FN's
+/// active shift — A′.1 pieces 0b+1.  The intent-open edge that this
+/// service's `apply_shift_transition` docstring reserves ("edges that OPEN
+/// a *new* shift and SET `current_shift_id` for the first time").
+///
+/// Runs inside the caller's `with_immediate` envelope (`stage_acquire`
+/// fresh-Proceed / `stage_offline_ack`, wired in Phase C).  It:
+///   (i)  INSERTs the `shifts` row `state='CREATED'` via
+///        [`shifts::insert_created_tx`] (`shift_id` deterministic from the
+///        SHIFT_OPEN document → an idempotent re-create collides on the PK;
+///        the partial-unique index `ux_shifts_one_open_per_fn` (migration
+///        026) is the schema-level backstop against a second open shift);
+///   (ii) CASes the `node_state` projection `CLOSED → CREATED` and SETs
+///        `current_shift_id`, keyed on `shift_state='CLOSED'`.  The pointer
+///        is OVERWRITTEN, NOT required-NULL: a normal close leaves
+///        `current_shift_id` dangling at the closed shift
+///        (`terminal_close_pins_current_shift_id_behavior`), so NULL only
+///        occurs on fresh bootstrap / after orphan-clear.
+///
+/// `rows_affected != 1` on the CAS ⇒ the FN was not `CLOSED` (a shift is
+/// already live, or the FN row is missing) → fail-closed `Err`, rolling
+/// back the whole envelope (including the shifts INSERT).  This bare
+/// `node_state` projection write lives HERE (the sole-writer allowlist) by
+/// design — no other module may raw-write the projection.
+pub async fn create_shift_tx(
+    tx: &mut WriteTxConn<'_>,
+    fiscal_number: &str,
+    shift_id: ShiftId,
+    open_mode: &str,
+    opened_by_cashier_id: &str,
+) -> anyhow::Result<()> {
+    // (i) Mint the shifts row as CREATED.  An idempotent re-create of the
+    //     SAME SHIFT_OPEN collides on the PK (deterministic shift_id); the
+    //     partial-unique index `ux_shifts_one_open_per_fn` backstops a
+    //     second open shift for the FN at the schema level.
+    shifts::insert_created_tx(tx, shift_id, fiscal_number, open_mode, opened_by_cashier_id).await?;
+
+    // (ii) CAS the node_state projection CLOSED → CREATED and SET the
+    //      pointer.  Keyed on `shift_state='CLOSED'` with pointer OVERWRITE
+    //      (NOT `current_shift_id IS NULL`): the close-pin leaves the pointer
+    //      dangling at the prior closed shift, so NULL only occurs on fresh
+    //      bootstrap / after orphan-clear.  `rows_affected != 1` ⇒ the FN is
+    //      not CLOSED (a shift is already live) or the row is missing ⇒
+    //      fail-closed Err, rolling back the shifts INSERT in the same
+    //      envelope.  This bare projection write lives HERE (the sole-writer
+    //      allowlist) by design.
+    let rows_affected = sqlx::query(
+        "UPDATE node_state SET current_shift_id = ?, shift_state = 'CREATED' \
+         WHERE fiscal_number = ? AND shift_state = 'CLOSED'",
+    )
+    .bind(shift_id)
+    .bind(fiscal_number)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if rows_affected != 1 {
+        return Err(anyhow::anyhow!(
+            "create_shift_tx({fiscal_number}): node_state CLOSED→CREATED CAS produced \
+             rows_affected={rows_affected} (expected 1; a shift is already live for this FN, \
+             or the node_state row is missing) for shift {shift_hex}",
+            shift_hex = hex_lower(shift_id.as_bytes()),
+        ));
+    }
+    Ok(())
+}

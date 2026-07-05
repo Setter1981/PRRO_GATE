@@ -60,7 +60,7 @@ serde_json = "1"
 toml = "0.8"
 
 # IDs + dates
-uuid = { version = "1", features = ["v7", "serde"] }
+uuid = { version = "1", features = ["v7", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 # W6 — Kyiv-local timestamp formatting for the canonical XML <TS>
 # attribute.  Europe/Kiev DST is non-trivial; chrono-tz gives the
