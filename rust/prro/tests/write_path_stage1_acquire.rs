@@ -356,7 +356,10 @@ async fn stage1_shift_open_happy_path_with_closed_state() {
     // `active_shift` is the Step-5 resolution of a PRE-EXISTING shift — still
     // None here: piece 3's edge 1 creates the shift AFTER Step 5, and the doc
     // binds to it via `new_doc.shift_id`, not this field.
-    assert!(ctx.active_shift.is_none(), "no pre-existing active shift on SHIFT_OPEN");
+    assert!(
+        ctx.active_shift.is_none(),
+        "no pre-existing active shift on SHIFT_OPEN"
+    );
     assert_eq!(doc_count(&pool).await, 1);
     assert_eq!(audit_count_for_event(&pool, "doc_prepared").await, 1);
 }
