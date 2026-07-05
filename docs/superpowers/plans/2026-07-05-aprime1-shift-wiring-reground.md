@@ -88,9 +88,9 @@ directly (as `kill_point_matrix` does).
   `shift_state=Created`. `(Closed, Created)` is **not** a whitelisted edge and `apply_shift_transition` does **not**
   do row-create, so this init is a caller step — **and it must NOT be a bare `UPDATE` from `stage_acquire`/`stage_offline_ack`**
   (the `shift_transition_service_is_sole_node_state_writer` drift-guard restricts bare `UPDATE …shift_state/current_shift_id`
-  to `services/shift/transition.rs`; INSERT/`ON CONFLICT DO UPDATE` is allowed for `node_state.rs`). **Design choice for the
-  architect (§4.2):** house the create-init in `services/shift/transition.rs` (allowlisted) as a new
-  `create_shift_tx`, OR route the pointer set through a `node_state.rs` upsert. Either keeps the drift-guard green.
+  to `services/shift/transition.rs`; INSERT/`ON CONFLICT DO UPDATE` is allowed for `node_state.rs`). **RESOLVED (§4.2):** the
+  create-init is a new **`create_shift_tx` in `services/shift/transition.rs`** (architect ruling); its CAS precondition is
+  `shift_state='CLOSED'` with pointer **overwrite** (the close-pin leaves `current_shift_id` dangling — do NOT require `IS NULL`).
 
 **Piece 2 — `stage_send` confirm edges 3/10** (Phase C, separate contract):
 - Thread `inputs.doc_type` + `inputs.shift_id` INTO the 4-b `with_immediate` closure (D-15: neither is captured today;
@@ -128,12 +128,39 @@ CAS on `node_state`. Precondition (docstring `:41-45`): `shift_id` must ALREADY 
 edge pairs are in `allowed_transition`. **No semantic extension** (STOP-c clear). The only non-covered operation is the
 initial shift-row INSERT (→`Created`) + the first-touch `node_state` pointer init.
 
-### 4.2 The create-init is drift-guard-constrained (new, load-bearing)
+### 4.2 The create-init is drift-guard-constrained — RESOLVED (architect ruling, 2026-07-05)
 The `shift_transition_service_is_sole_node_state_writer` drift-guard restricts a bare
 `UPDATE node_state SET shift_state/current_shift_id` to `services/shift/transition.rs` only (INSERT / `ON CONFLICT DO
 UPDATE` also allowed for `node_state.rs`). `(Closed, Created)` is not a whitelisted edge. **⇒ the create-init cannot be a
-raw `UPDATE` from `stage_acquire`/`stage_offline_ack`.** Piece 0b must house it in the transition-service allowlist (a new
-`create_shift_tx`) or a `node_state.rs` upsert. **Open design decision for the architect** (do not invent): which home.
+raw `UPDATE` from `stage_acquire`/`stage_offline_ack`.**
+
+**RULING — home = `services/shift/transition.rs` (new `create_shift_tx`), NOT a `node_state.rs` upsert.** Grounds:
+1. The transition-service **already reserves** this in its own contract — docstring `transition.rs:41-45`: *"Intent edges
+   that OPEN a new shift and SET `current_shift_id` for the first time are added when `stage_acquire` is wired (RS-3
+   A-pieces)."* This is the designed home, not a workaround.
+2. **Ownership symmetry:** `transition.rs` already owns the CLEAR side (`clear_active_shift_projection`); the create side
+   completes single-service ownership of the `current_shift_id` lifecycle (create sets → mirror CASes → clear removes).
+3. The drift-guard allowlist is **unchanged** — no upsert-gymnastics around the guard's intent.
+4. Fail-closed preconditions centralise in one point.
+
+**Close-pin consequence (architect addition, beyond the original dossier).** The pin
+`terminal_close_pins_current_shift_id_behavior` (`transition.rs:47-53`) locks that a **normal close
+(`Closing→Closed`) LEAVES `current_shift_id` dangling** at the closed shift (status-quo, test-locked; pointer cleanup on
+normal close is a deliberately-deferred RS-3 decision, **NOT** A′.1's). **⇒ `create_shift_tx`'s precondition must CAS on
+`node_state.shift_state='CLOSED'` and OVERWRITE the pointer — it must NOT require `current_shift_id IS NULL`** (NULL only
+occurs on fresh bootstrap / after orphan-clear; requiring it would wedge every open after the first normal close). The
+partial UNIQUE index (0b) is the fail-closed backstop against double-open. **Close semantics are NOT changed in A′.1.**
+
+**`create_shift_tx` contract (Phase B, pieces 0b+1)** — in ONE tx of the caller's envelope (`stage_acquire` fresh-Proceed
+/ `stage_offline_ack`, wired in Phase C):
+- (i) INSERT the `shifts` row `state='CREATED'` via the new tx-bound `insert_created_tx`, `shift_id` **deterministic** from
+  the SHIFT_OPEN `document_id`/`request_id`;
+- (ii) `UPDATE node_state SET current_shift_id=<id>, shift_state='CREATED' WHERE fiscal_number=? AND shift_state='CLOSED'`
+  — CAS; `rows_affected != 1` → fail-closed `Err` (rolls back the whole envelope);
+- (iii) the partial UNIQUE index (migration 026) catches a race / double-open at the schema level.
+- `CREATED` never rests: create + edge 1 (or 2) are the same envelope (tx atomicity); a test must prove the intermediate
+  is crash-unreachable. `opened_by_cashier_id` from the canonical command's signer; FK deferred → flag, never
+  `__pre_w14a1__`.
 
 ### 4.3 `ShiftId::new()` drift is non-blocking
 `ShiftId::new()` (UUIDv7) now exists in prod (D-12). The plan's determinism rationale ("no generator exists") is stale,
