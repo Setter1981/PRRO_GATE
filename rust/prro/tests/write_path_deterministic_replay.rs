@@ -512,11 +512,15 @@ async fn fixture_8_kvt2_crash_no_dps_query() {
         "§6.6 demands KVT2 → ACK on crash-resume"
     );
 
-    // (2) Cross-doc MAC chain seed advanced (§6.6:814).
-    assert_eq!(
-        read_node_seed(app.db(), fn_id).await.as_deref(),
-        Some(unsigned_xml_sha.as_slice()),
-        "§6.6:814 — node_state.last_known_unsigned_xml_sha256 must advance to the finalised doc's seed"
+    // (2) A.3 (advance-at-SEND, design v3 §6): finalize NO LONGER
+    // advances the cross-doc MAC chain seed.  The online seed advance
+    // moved to `stage_send` (Sending → Sent CAS); a KVT2 crash-resume
+    // never re-runs SEND, so finalize is advance-free.  The seed stays
+    // exactly what it was pre-reconcile — genesis NULL here.  (Inverts
+    // the pre-A.3 §6.6:814 assertion that demanded finalize advance it.)
+    assert!(
+        read_node_seed(app.db(), fn_id).await.is_none(),
+        "A.3: finalize does NOT advance the seed — it stays genesis NULL through KVT2 crash-resume finalize"
     );
 
     // (3) Inbox flipped PROCESSING → DONE (stage_finalize step 5).

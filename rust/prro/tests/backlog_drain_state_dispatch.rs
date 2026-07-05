@@ -3652,49 +3652,44 @@ async fn w12_kvt2_chain_seed_mismatch_escalates_manual_recon_not_hard_abort() {
         .await
         .expect("M2-04: ChainSeedMismatch must NOT surface as BootError::ReconciliationFailed");
 
-    // Shift escalated to RequiresManualReconciliation (§16.7, pending-drain ladder).
+    // A.3 re-ground (design v3 §6 step 4; INV-08): finalize's sole
+    // `ChainSeedMismatch` producer (the online ACK-time guard) was REMOVED (the
+    // chain check moved to the SEND drift-assert).  The drain's w12 KVT2 recovery
+    // arm therefore no longer detects this pre-existing chain divergence — it
+    // converges the doc to ACK.  The load-bearing invariant this test protects —
+    // the drain MUST NOT hard-abort (returns Ok, above) — still holds.  The breach
+    // is surfaced by `invariant_scan` (detection moved; no recovery TRANSITION was
+    // deleted — the escalation arms remain for scan/boot-detected breaks, PR-C).
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
         .bind(shift_id)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
-    let node_shift: String =
-        sqlx::query_scalar("SELECT shift_state FROM node_state WHERE fiscal_number = ?")
-            .bind(FN)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(node_shift, "REQUIRES_MANUAL_RECONCILIATION");
-
-    // The doc's KVT2→Ack CAS rolled back with the failed finalize envelope.
-    assert_eq!(read_doc_state(&pool, doc).await, "KVT2");
-
-    // Per-doc forensic audit carries the manual-recon class + seed hexes.
-    let failed = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_FAILED")
-        .await
-        .unwrap();
-    assert_eq!(failed["failure_class"], "chain_seed_mismatch");
-    assert_eq!(failed["dispatch_via"], "w12_kvt2_recovery");
-    assert_eq!(failed["manual_recon_class"], true);
-    assert!(
-        failed["expected_seed_hex"].is_string(),
-        "expected_seed_hex present: {failed:?}"
-    );
-    assert!(
-        failed["actual_seed_hex"].is_null() || failed["actual_seed_hex"].is_string(),
-        "actual_seed_hex present-or-null (genesis): {failed:?}"
+    assert_ne!(
+        shift_state, "REQUIRES_MANUAL_RECONCILIATION",
+        "post-A.3: the drain's finalize arm no longer escalates a chain divergence (producer removed)"
     );
 
-    // Halt audit with the chain_seed_mismatch failure_class.
+    // The KVT2 doc converges to ACK (finalize no longer guards / rolls back).
+    assert_eq!(read_doc_state(&pool, doc).await, "ACK");
+
+    // No finalize-triggered escalation audits.
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_FAILED").await, 0);
     assert_eq!(
         audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
-        1
+        0
     );
-    let halt = audit_latest_payload(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL")
-        .await
-        .unwrap();
-    assert_eq!(halt["failure_class"], "chain_seed_mismatch");
+
+    // Detection MOVED to the scan: the chain divergence is flagged there.
+    let violations = prro::db::invariant_scan::scan(&pool).await.unwrap();
+    assert!(
+        violations.iter().any(|v| matches!(
+            v,
+            prro::db::invariant_scan::Violation::ChainSeedMismatch { .. }
+                | prro::db::invariant_scan::Violation::ChainBreak { .. }
+        )),
+        "invariant_scan surfaces the chain divergence (detection moved): {violations:?}"
+    );
 }
 
 /// **M2-N4 (architect ruling, 2026-06-13) — DRAIN side** — a SentReplay

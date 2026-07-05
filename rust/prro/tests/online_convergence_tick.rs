@@ -857,23 +857,36 @@ async fn tick_chain_seed_mismatch_escalates_manual() {
         .await
         .expect("tick returns Ok (per-doc isolation does not abort the tick)");
 
-    // Desired (AUD-L2-1b): the chain-seed breach ESCALATES the FN to Manual with a
-    // Critical operator audit — NOT a silent per-doc-isolation skip.
-    assert_eq!(
+    // A.3 re-ground (design v3 §6 step 4; INV-08): the sole finalize producer of
+    // `ChainSeedMismatch` (the online ACK-time chain guard) was REMOVED — the
+    // chain check moved EARLIER, to the SEND drift-assert.  This tamper corrupts
+    // `node_state.seed` AFTER the doc already crossed SEND, so it is NOT a
+    // convergence-detectable breach anymore; the convergence tick converges the
+    // doc to ACK WITHOUT firing a ChainSeedMismatch escalation.  The breach is
+    // instead surfaced by the `invariant_scan` detector (PR-C wires
+    // scan/boot-detected breaks → the RETAINED escalation arm; no recovery
+    // TRANSITION was deleted — only the producer narrowed).
+    assert_ne!(
         read_shift_state(&pool, shift_id).await,
         "REQUIRES_MANUAL_RECONCILIATION",
-        "ChainSeedMismatch escalates the FN shift to Manual"
+        "post-A.3: a POST-SEND seed tamper is a scan/boot breach, not a convergence escalation"
     );
     assert_eq!(
         count_audit_events(&pool, "CONVERGE_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL").await,
-        1,
-        "exactly one Critical convergence-escalation audit"
+        0,
+        "finalize no longer produces ChainSeedMismatch → no convergence escalation here"
     );
-    assert_eq!(
-        summary.errors, 0,
-        "ChainSeedMismatch is an escalation outcome, not a per-doc isolation error"
-    );
+    assert_eq!(summary.errors, 0, "per-doc isolation: the tick returns Ok");
     assert_eq!(send_calls.load(Ordering::SeqCst), 1, "tick does NOT send");
+    // Detection MOVED to the scan: the tampered chain breach is flagged there.
+    let violations = prro::db::invariant_scan::scan(&pool).await.unwrap();
+    assert!(
+        violations.iter().any(|v| matches!(
+            v,
+            prro::db::invariant_scan::Violation::ChainSeedMismatch { .. }
+        )),
+        "the invariant_scan detector surfaces the tampered chain-seed breach (detection moved)"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════
