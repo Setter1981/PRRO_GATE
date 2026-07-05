@@ -609,8 +609,20 @@ pub async fn list_shift_pending_receipts_for_z_quiescence(
          FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
            AND doc_type IN ('SELL','RETURN') \
-           AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT', \
-                         'KVT1','KVT2','ERROR_RETRYABLE') \
+           AND ( \
+                 state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT', \
+                           'KVT1','KVT2','ERROR_RETRYABLE') \
+                 OR ( \
+                   /* A.3 / C10 (design v3 §9.3 ruling): a post-SENT online RMR \
+                      doc is ISSUED-BUT-UNCONFIRMED (lnd consumed, sfn set, seed \
+                      advanced) — DPS may still hold it, so Z-quiescence MUST \
+                      BLOCK on it rather than close the shift over it.  Aggregation \
+                      is unchanged (counts only ACK/OFFLINE_LOCAL_ACK = confirmed). */ \
+                   state = 'REQUIRES_MANUAL_RECONCILIATION' \
+                   AND offline_fiscal_no IS NULL \
+                   AND server_fiscal_no IS NOT NULL AND server_fiscal_no != '' \
+                 ) \
+               ) \
          ORDER BY lnd",
     )
     .bind(fn_id)
