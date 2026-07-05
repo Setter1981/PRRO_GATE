@@ -151,6 +151,15 @@ pub enum RejectionReason {
         current: ShiftState,
     },
     ShiftAlreadyOpen,
+    /// A′.1 piece 3 (P6 ruling A) — an ONLINE `SHIFT_OPEN` reached the
+    /// fresh-Proceed path with `command.signed_by_cashier_id == None`.
+    /// A shift cannot be opened without its opening cashier (§16.8
+    /// 1-cashier-per-shift), and the sentinel `__pre_w14a1__` is
+    /// forbidden — so this fail-closes BEFORE any mint (audit-only, no
+    /// lnd, no shift row). Client-input error → 4xx (same channel as
+    /// the neighbouring shift-guard refusals).  Audit shape:
+    /// `SHIFT_OPEN_MISSING_CASHIER`.
+    ShiftOpenMissingCashier,
     ShiftInError,
     /// Shift is in `RequiresManualReconciliation` (M3b §16.7 — drain
     /// rejected an OFFLINE_LOCAL_ACK backlog doc OR ambiguous wire

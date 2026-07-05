@@ -9,7 +9,7 @@
 //! on collision".
 
 use prro::db::models::enums::{DocType, FiscalMode, NodeMode, Severity, ShiftState};
-use prro::db::models::ids::{RequestId, ShiftId};
+use prro::db::models::ids::{CashierId, RequestId, ShiftId};
 use prro::db::repositories::{
     fiscal_documents as fd, fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig,
     ingress_inbox as inbox, ingress_inbox::NewInboxEntry, shifts,
@@ -339,7 +339,12 @@ async fn stage1_shift_open_happy_path_with_closed_state() {
         &pool_secure,
         TEST_DRIVER_ID,
         req_id,
-        cmd(DocType::ShiftOpen),
+        // A′.1 piece 3: an online SHIFT_OPEN now REQUIRES a cashier (edge 1
+        // records it as the shift's opening cashier; §16.8). None → refused.
+        CanonicalFiscalCommand {
+            signed_by_cashier_id: Some(CashierId::new("csh-open").unwrap()),
+            ..cmd(DocType::ShiftOpen)
+        },
     )
     .await
     .unwrap();
@@ -348,7 +353,13 @@ async fn stage1_shift_open_happy_path_with_closed_state() {
         WorkerProcessResult::Proceed(c) => c,
         other => panic!("expected Proceed, got {other:?}"),
     };
-    assert!(ctx.active_shift.is_none(), "no active shift on SHIFT_OPEN");
+    // `active_shift` is the Step-5 resolution of a PRE-EXISTING shift — still
+    // None here: piece 3's edge 1 creates the shift AFTER Step 5, and the doc
+    // binds to it via `new_doc.shift_id`, not this field.
+    assert!(
+        ctx.active_shift.is_none(),
+        "no pre-existing active shift on SHIFT_OPEN"
+    );
     assert_eq!(doc_count(&pool).await, 1);
     assert_eq!(audit_count_for_event(&pool, "doc_prepared").await, 1);
 }
