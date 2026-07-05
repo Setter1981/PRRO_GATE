@@ -144,6 +144,31 @@ pub async fn insert_created(
     Ok(())
 }
 
+/// Tx-bound sibling of [`insert_created`] — A′.1 piece 0b.  Same INSERT,
+/// but enrolled in the caller's `with_immediate` envelope so the shift-row
+/// create commits (or rolls back) atomically with the `create_shift_tx`
+/// node_state projection CAS.
+pub async fn insert_created_tx(
+    tx: &mut WriteTxConn<'_>,
+    id: ShiftId,
+    fiscal_number: &str,
+    open_mode: &str,
+    opened_by_cashier_id: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, cash_balance_kop, \
+            opened_by_cashier_id) \
+         VALUES (?, ?, 'CREATED', ?, 0, ?)",
+    )
+    .bind(id)
+    .bind(fiscal_number)
+    .bind(open_mode)
+    .bind(opened_by_cashier_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn get(pool: &SqlitePool, id: ShiftId) -> sqlx::Result<Option<ShiftRow>> {
     let row = sqlx::query!(
         r#"SELECT shift_id      as "shift_id: ShiftId",

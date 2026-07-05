@@ -72,6 +72,28 @@ id_newtype!(OperatorId);
 id_newtype!(PrinterId);
 id_newtype!(OfflineSessionId);
 
+impl ShiftId {
+    /// Deterministic shift-id for a SHIFT_OPEN document — A′.1 piece 0b.
+    ///
+    /// A namespaced UUIDv5 over the opening `document_id`, so an accidental
+    /// re-create of the SAME SHIFT_OPEN yields the SAME `shift_id` and
+    /// collides on the `shifts` PK (idempotent fail-closed backstop; there
+    /// is no prod random-`ShiftId` generator on the create path). Namespaced
+    /// (not `document_id`'s own bytes) so a shift-id never equals a
+    /// document-id.
+    pub fn deterministic_for_shift_open(document_id: DocumentId) -> Self {
+        // Fixed namespace for PRRO shift-open shift-ids.  NEVER change — it
+        // would re-key every deterministic shift_id and defeat the collision
+        // backstop.  (16 raw bytes; a dedicated namespace, distinct from the
+        // uuid crate's generic NAMESPACE_* so no other v5 use can collide.)
+        const PRRO_SHIFT_OPEN_NS: Uuid = Uuid::from_bytes([
+            0x50, 0x52, 0x52, 0x4f, 0x2d, 0x53, 0x48, 0x46, 0x54, 0x2d, 0x4f, 0x50, 0x45, 0x4e,
+            0x00, 0x01,
+        ]);
+        Self(Uuid::new_v5(&PRRO_SHIFT_OPEN_NS, document_id.as_bytes()))
+    }
+}
+
 // ─── M3b W14a-2a: text-based cashier identity ────────────────────────
 //
 // CashierId is a TEXT-shaped opaque identifier for the cashier-of-record
