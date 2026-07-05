@@ -34,7 +34,7 @@
 //!   10. `inbox_done_missing_typed_error_full_rollback` (W8.4 F7-bis).
 //!   11. `concurrent_finalize_yields_one_acked_and_one_already_acked` (W8.4 N2).
 //!   12. `whitelist_kvt2_ack_regression_guard` (W8.3 F4-bis).
-//!   A.3 seed-pins: `finalize_does_not_advance_seed_from_genesis_null` (pin a,
+//!   13. A.3 seed-pins: `finalize_does_not_advance_seed_from_genesis_null` (pin a,
 //!       genesis), `finalize_skips_when_seed_already_advanced_nongenesis` (pin b,
 //!       Variant P skip), `finalize_skips_seed_guard_at_genesis_boundary` (pin b,
 //!       genesis-boundary) — consolidated from the retired `chain_seed_*` guard tests.
