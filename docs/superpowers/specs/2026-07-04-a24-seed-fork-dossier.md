@@ -1,6 +1,6 @@
 # A.1-prep DOSSIER — online-lane MAC-seed-fork (AUD-L2-1a / m1_02 / A2.4 prerequisite)
 
-**Status:** DOSSIER (evidence + analysis) — **ADJUDICATED: decisions D1–D7 LOCKED** by the architect (see §5.4 / §8). Companion DRAFT→v2 ADJUDICATED spec: [`2026-07-04-a24-seed-fork-design.md`](./2026-07-04-a24-seed-fork-design.md). Next: external audit → LOCK → A.3.
+**Status: v3 — AUDITED (Go-with-amendments applied) — pending architect LOCK.** DOSSIER (evidence + analysis); decisions D1–D7 ADJUDICATED (§5.4 / §8), then run through an 8-lens external audit whose findings are closed in **§9** (Go-after-amendment: D1/D2/D3/D5/D6/D7 sound, D4 re-spec'd — §9.4; no new STOP). Companion spec: [`2026-07-04-a24-seed-fork-design.md`](./2026-07-04-a24-seed-fork-design.md) (v3). Next: **architect LOCK → A.3** (A.3 starts only after LOCK).
 **Role:** this dossier assembles machine-verified evidence + an option matrix for the architect to adjudicate → external audit → lock. It is **not** a code contract. No production code / tests / migrations were touched; the RED-pin was not un-ignored; the binding was not flipped.
 **Adjudication summary:** design (A) / **Option 0 advance-at-SEND accepted**; discriminator **amended to the `server_fiscal_no` column** (not a state-set — RMR is ambiguous both sides of SENT, §5); D3(ii) verification sweep executed read-only (**no STOP** — single sfn writer confirmed, one sharpened A2.4 lockstep requirement, §5.3).
 **Roadmap:** `docs/superpowers/plans/2026-07-04-pilot-path-roadmap.md` (LOCKED v2), step **A.1**.
@@ -41,7 +41,7 @@ The seed is a single 32-byte column `node_state.last_known_unsigned_xml_sha256`
 
 | # | Writer method | Site | Class | Gate / condition |
 |---|---------------|------|-------|------------------|
-| W-a | `seed_prevhash` (pool) | `node_state.rs:134` | **bootstrap only** | **Zero** production `src/` call-sites — CLI `prro fn seed-prevhash <hex>` + tests only. Not a live-flow writer. |
+| W-a | `seed_prevhash` (pool) | `node_state.rs:134` | **bootstrap only** | **Zero** production `src/` call-sites — **tests-only** helper (there is **no** `prro fn seed-prevhash` CLI subcommand: `main.rs` exposes Version/Migrate/Doctor/Serve/Admin only — anchor corrected §9.6). Not a live-flow writer. |
 | W-b | `update_last_known_xml_sha_tx` (tx) | `node_state.rs:163` | live forward-advance | 3 call-sites ↓ |
 | — via W-b #1 | online ACK advance | `stage_finalize.rs:315` | **steady-state advance** | `offline_fiscal_no.is_none()` @ `:288`; seed = this doc's `unsigned_xml_sha256` |
 | — via W-b #2 | offline per-doc advance | `stage_offline_ack.rs:409` | **steady-state advance** | on `Signed→OfflineLocalAck`; seed = this doc's `unsigned_xml_sha256` |
@@ -326,7 +326,7 @@ even REJECTED there *unconditionally* means "seed already advanced". For online 
 
 | Transition | Anchor | Regime | Seed under opt-0 |
 |------------|--------|--------|------------------|
-| `(Sending, Rejected)` | `fiscal_documents.rs:256`; DPS reject at 4-b post-wire CAS `stage_send.rs:1524` (`target_state: Rejected`), CAS `Sending→{Sent\|Rejected\|ErrorRetryable}` (`stage_send.rs:200`) | **pre-SENT** | **NOT advanced** (advance only on `WireDecision::Sent`) |
+| `(Sending, Rejected)` | `fiscal_documents.rs:256`; the **4-b post-wire CAS is `stage_send.rs:1360`** (`Sending → target`), target `Rejected` via the routed decision (`:1522` `synthetic_rejected_decision` builds the `ErrorRetryable→Rejected` override — **not** the 4-b CAS; anchor corrected §9.6) | **pre-SENT** | **NOT advanced** (advance only on `WireDecision::Sent`) |
 | `(Sent, Rejected)` | `fiscal_documents.rs:190` — **legal edge, ZERO prod invokers** (sole citer = table-pin test `repo_fiscal_documents_state_cas.rs:322`) | **post-SENT** | **advanced** — an **open door** a future owner could route into, silently breaking state-decidability |
 | `(ErrorRetryable, Rejected)` | `stage_send.rs:1558,1605` (retry-exhaustion) | **pre-SENT** (ErrorRetryable is a send-failure state, never reached Sent) | **NOT advanced** |
 | `(Sent, RequiresManualReconciliation)` | `fiscal_documents.rs:199` — **live invoker:** boot-probe **W11 PR-2b** (`lastChk` id-mismatch → operator handoff; mismatch surface `kvt2_confirm.rs:231,339,361`) | **post-SENT** | **advanced** |
@@ -344,9 +344,11 @@ the state-set discriminator**:
    SENT — "keep REJECTED purely pre-SENT" does **not** rescue the predicate, because RMR itself is
    reachable from both sides.
 
-The `node_state.rs:186` doc-comment confirms the lnd stamp is *"Atomic with the post-wire CAS
-`Sending → Rejected`"* — a pre-SENT reject consumes the lnd but does **not** advance the seed. The current
-pin *"lnd consumed, seed NOT advanced"* therefore **survives verbatim for the pre-SENT case**.
+The lnd stamp being *"Atomic with the post-wire CAS `Sending → Rejected`"* is pinned by
+`tests/invariant_fuzzer.rs:344-354` (the `node_state.rs:186`/`:204` doc-comment cited earlier is
+`set_mode_blocked_tx`, not the lnd stamp — anchor corrected §9.6) — a pre-SENT reject consumes the lnd but
+does **not** advance the seed. The current pin *"lnd consumed, seed NOT advanced"* therefore **survives
+verbatim for the pre-SENT case**.
 
 ### 5.2 Why the state-set predicate is undecidable — and the `server_fiscal_no` discriminator
 
@@ -508,3 +510,109 @@ D3 amendment). The decision table is in §5.4; the load-bearing wording is captu
 | `supervisor.rs:180` (binding) | `supervisor.rs:188` (binding); `:180-187` comment | |
 | `docs/superpowers/specs/2026-06-09-rs3-a2-*.md §4` | `docs/superpowers/plans/2026-06-09-rs3-a2-implementation.md:207-218` | `specs/` path does not exist |
 | RED-pin fn `2541-2543` | `kill_point_matrix.rs:2543` (fn), `:2541` `#[tokio::test]`, `:2542` `#[ignore]` | consistent |
+
+---
+
+## 9. External-audit amendment (Go-with-amendments) — pending architect LOCK
+
+**Audit verdict:** **Go-after-amendment.** The 8-lens external audit found D1/D2/D3/D5/D6/D7 **sound** and D4 **needs-work** (SQL literal cannot host a Rust fn — §9.4). This section closes every finding: three HIGH design arcs (§9.1 MAC-recovery, §9.2 D5-gate re-spec, §9.3 C10), the D4 re-spec (§9.4), the MED set + A.3 implementation checklist (§9.5), and the LOW/hygiene + anchor-drift (§9.6). All anchors machine-verified against `main` (`909fc05`, the amendment base — the dossier body above was verified against `c9f96f4`; the two differ only cosmetically, noted per-anchor). **No new STOP fires:** the §9.1 STOP-gate (1.1) is CLEAR — Variant P passes every constraint; nothing in §9 invalidates D1–D3 / D5–D7.
+
+### 9.1 HIGH — MAC-recovery (W10.4) × advance-at-SEND drift-assert  **[STOP-gate 1.1: CLEAR]**
+
+**The missed consumer / constraint.** `run_mac_recovery` (`mac_recovery.rs:351`) re-signs an ONLINE doc against the DPS-supplied hash on a `-12` (`ERROR_BAD_HASH_PREV`) and re-sends it. It is an issued-predicate-adjacent **constraint** on Option 0 that fell out of the Batch-C design text and the §1b table — not merely a consumer to reword.
+
+**Mechanics (machine-verified).** attempt#1 → DPS `-12` → `Routed{MacRecovery}` (doc parks `ErrorRetryable`; seed **NOT** advanced — advance is `WireDecision::Sent`-only). The in-run loop (`stage_send.rs:953-987`) invokes the orchestrator: regex-extract `H_dps = store {64hex}` (`:358`); re-sign against `H_dps` (`:438-452`); **MR-PERSIST** (`:511-521`) overwrites `fiscal_documents.previous_hash := H_dps` + `unsigned_xml_sha256 := sha₁` — the **node seed is untouched**. `Resigned → continue` (`:987`) → attempt#2 re-sends **in the same `run()`**, DPS-accepted → the standard 4-b `Sending→Sent` CAS (`:1360`) + `set_server_fiscal_no_tx` (`:1373`).
+
+**The defect (deterministic).** A `-12` means `doc.previous_hash₀ (= seed_sign) ≠ H_dps` **by definition**. Under Option 0 the new pre-advance drift-assert `ns.seed == doc.previous_hash` runs on attempt#2's Sent CAS, where `doc.previous_hash = H_dps` (MR-PERSIST) and `ns.seed = seed_sign` (unmoved — same run, single-writer FN lease). So it reduces to `seed_sign == H_dps` → **guaranteed false on every successful recovery**, firing **after** the wire call (DPS already accepted) → ambiguous local-refuse → the recovered doc wedges. The M2-X1 guard rationale (`:386-398`, *"finalize advances the seed AFTER"*) was written against advance-at-ACK and does not cover this.
+
+**Variant matrix.**
+
+| Variant | Mechanic | Verdict |
+|---|---|---|
+| **P — recovery-aware advance** *(architect prior; ADOPT)* | For `mac_recovery_attempts >= 1`, the SEND advance does **not** gate on `ns.seed == doc.previous_hash` (recovery *deliberately* voided that premise by adopting `H_dps`); it treats the DPS re-sign as a **re-anchor** and advances `ns.seed := doc.unsigned_xml_sha256` (`sha₁`) on the fresh `Sent` `Applied` CAS. Advance **target is identical** to a normal doc (own re-signed sha) → Option 0's advance code is unchanged; only the pre-advance gate takes a recovered-doc branch. | **PASSES all constraints.** |
+| R — resync in MR-PERSIST | MR-PERSIST also reseeds `ns.seed := H_dps` so attempt#2's assert passes verbatim. | **Rejected** — reseeds **pre-issuance** (before attempt#2 is DPS-accepted); a failed/crashed attempt#2 leaves `ns.seed` advanced for a **non-issued** doc → breaks advance-at-issuance, the invariant Option 0 rests on. |
+| E — escalate recovered doc | A recovered doc that would trip the assert escalates to manual-recon. | **Rejected** — defeats W10.4's purpose (auto-recover `-12` without an operator); every `-12` → manual = a liveness regression. Retained only as the fail-closed fallback if P's single-writer premise is ever violated. |
+
+**Why Variant P passes — constraint by constraint.**
+1. **No silent corruption.** The only hazard is `ns.seed` being advanced by a *different* doc between this doc's sign and attempt#2. It cannot: the loop is **in-run** under the single-writer-per-FN lease → no other doc issues in that window → `ns.seed == seed_sign` at attempt#2, and reseeding to `sha₁` clobbers nothing. (Defense-in-depth, if a multi-worker dispatcher ever lands per ADR-M3-A10 §4: assert `ns.seed == old_previous_hash`, the pre-recovery hash already recorded in the `MAC_RECOVERY_RESIGNED` audit payload `old_previous_hash_hex`, `:531`. The spec adopts the **bare recovered-doc skip**; the assert-against-original is the named fallback.)
+2. **Recovery completes.** The assert no longer false-fires; attempt#2 advances + stamps sfn → `Sent` → later `ACK`. Under Option 0's generalized finalize gate ("already-advanced-at-issuance") `stage_finalize` **skips** re-advance/guard for the now-SENT+ doc → the finalize guard (`:304`) does **not** re-fire against `H_dps`. **Bonus:** Option 0 thereby *closes* a latent advance-at-ACK hazard — today a recovered doc reaching ACK with `ns.seed ≠ H_dps` would false-fail the `:304` guard and wedge at KVT2 (the §5.3 "wedges later, at KVT2" family).
+3. **D3(ii) discriminator survives.** attempt#2 is a `WireDecision::Sent` → `set_server_fiscal_no_tx` stamps sfn (`:1373-1379`) atomic with the Sent CAS **and** the seed advance → `sfn set ⟺ seed advanced` holds for the recovered doc, so `is_issued(state, ofn, sfn)` classifies it correctly. attempt#1 (`Routed{MacRecovery}` → `ErrorRetryable`) stamps no sfn and does not advance — clean. Under the inline lane, A2.4's D3(ii) obligation already forces the inline `Sending→Kvt1` fast-path to stamp sfn+advance in lockstep — mac-recovery inherits it, no new hole.
+4. **Frozen #1 / #2.** The reseed is a `node_state` UPDATE inside the existing 4-b `with_immediate` tx (no new I/O); FN single-writer preserved.
+5. **M2-X1 guard.** Its *conclusion* (refuse offline-origin docs) is unchanged and correct; only its rationale **comment** (`:386-398`) drifts under Option 0 → joins the lockstep reword set (online now advances at **SEND**, offline at offline-ack; re-signing an offline doc under a DPS hash still desyncs the local offline chain).
+
+**Consumer/landing addition.** `mac_recovery.rs` is added to §1b as **C14** (see §9.6 table): (i) the pre-advance gate gains a `mac_recovery_attempts >= 1` recovered-doc branch (skip-equality + reseed-to-own-sha); (ii) the M2-X1 rationale comment rewords to advance-at-SEND. Both ride the interim-ordering atomic commit (landing steps 2+4, §9.5). **STOP-gate 1.1 CLEAR.**
+
+### 9.2 HIGH — D5-gate re-specification (two formulation defects + residual)
+
+The §5.3 D5 residual named a "narrow gate: do not sign while a pre-SENT doc rests on the FN." The audit shows that phrasing is doubly wrong and under-specified. **Re-spec (LOCKED unless the architect overrides):**
+
+**(a) Predicate — NOT a "pre-SENT" state-set.** `ERROR_RETRYABLE` is a member of `OFFLINE_ISSUED_STATES` (`fiscal_documents.rs:897-905`, `ERROR_RETRYABLE` @ `:901`): an offline-origin ER doc is **issued** and legitimately rests in the drain backlog. A literal "pre-SENT state-set" gate (`Prepared|Signed|Encrypted|Sending|Sent|ErrorRetryable`) would catch those offline-ER docs and **stall the entire offline lane**. **LOCKED gate-predicate:** `∃ doc on FN: non-terminal AND NOT is_issued(state, offline_fiscal_no, server_fiscal_no)` — the **complement of the D4 SSOT**. It is transparent to every legitimate rest: SENT-Hold (issued via sfn), KVT1/KVT2, OFFLINE_LOCAL_ACK, and offline-ER (issued via `OFFLINE_ISSUED_STATES`). It gates only genuinely non-issued in-flight docs (online Prepared/Signed/Encrypted/Sending, online-ER).
+
+**(b) Co-requisite resolver — a LOCK-condition, not a follow-up.** Online-ER is **not** re-driven in runtime today: `er_redrive_policy` parks its `Hold*` verdicts through boot (`HoldProbeRequired` `:66-70`, `HoldIndeterminate` `:72-77` — "Caller holds; no DB mutation"), and `online_convergence` owns only `SENT`/`KVT1` (`:3-10`), never pre-SENT. So the gate **alone** = an FN-wide sign-refusal that persists **until reboot** on any transient failure that parks a doc non-issued. **LOCKED:** the gate lands **only paired** with a resolver that drives the blocking doc forward at runtime — either (i) extend the `online_convergence` tick onto the ER/pre-SENT cohort via the existing `er_redrive_policy`, or (ii) an in-band resolve attempt when the gate refuses. This pairing is a **LOCK-condition**.
+
+**(c) Coverage + enforcement.** The blocking (non-issued, non-terminal) set includes: **Signed** (dispatcher-refusal rest — `dispatch.rs:50-52` I8: "refused modes leave doc state untouched, still `Signed`"), **Encrypted**, **Sending**, and **both non-pinned and pinned `Prepared`** (resume reuses a stale pin: `stage_sign.rs:301-320`, `PinResult::Reused` returns the previously-pinned `previous_hash`). **Enforcement is two-layer:** (1) a **fail-closed assert inside the `stage_sign` pin-tx** — mandatory because boot's `dispatch_prepared_via_chain` enters `stage_sign` **bypassing `stage_acquire`**, so an acquire-only gate misses the boot path; plus (2) an **acquire-level early-refusal** (pre-mint, audit-only) for the live-request path.
+
+**(d) New residual (audit) — lnd-vs-chain-order inversion.** A non-pinned `Prepared` (`lnd = N`) resumed **after** a later doc (`lnd = N+1`) already issued will pin the *current* seed → the chain stays hash-valid, but **chain-order ≠ lnd-order**. NC-03's `ORDER BY lnd DESC LIMIT 1` (`fiscal_documents.rs:933`) would then project the wrong tip — a counterexample to "monotonic in lnd." **Closed by:** including non-pinned `Prepared` in the block-set (c) **and** adding an `invariant_scan` check "chain order == lnd order over the issued set." Documented as a landing-plan obligation (§9.5).
+
+**(e) SW-4 — unconditional.** The SW-4 split (`ChainSeedMismatch` out of the inline `StructuralDrift` arm → `escalate_fn_to_manual_recon`, §5b) is **independent of the gate choice** and already in the landing plan (design §6 step 8). Formulation **confirmed** — it rides the A2.4 gate regardless of how D5 resolves.
+
+**(f) One-time pre-gate boot-scan (LOW).** A boot-time scan for pre-existing fork-pairs (duplicate `previous_hash` among non-terminal docs of a FN) is recorded in the landing plan as a **LOW** one-shot — it surfaces a fork minted *before* the gate existed (only reachable on a restored/foreign DB, since prod mints zero fiscal_documents today, §9.5/§3.8).
+
+### 9.3 HIGH — C10: Z-report issued/pending sets (third hardcoded literal) — §1b addendum + ruling-request
+
+A **third** hardcoded online-issued literal lives in prod SQL, outside the D4 SSOT (beyond C2 `invariant_scan.rs:268` and C3 `fiscal_documents.rs:933`):
+
+- **`list_shift_issued_receipts`** (`fiscal_documents.rs:560`; `state IN ('ACK','OFFLINE_LOCAL_ACK')` @ `:570`; self-described "issued-ledger set" @ `:551`) — the Z aggregation source (consumer `convert.rs:616`).
+- **`list_shift_pending_receipts_for_z_quiescence`** (`fiscal_documents.rs:602`; blocking set `PREPARED..ERROR_RETRYABLE` @ `:612-613`; `REJECTED`/`CANCELLED`/`RMR` explicitly **non-pending** @ `:598-601`) — the quiescence gate (consumers `z_builder.rs:115`,`:134` → `Clear` / `Pending{blocking}` @ `:80-89`).
+
+**Defect.** Under the new predicate a **post-SENT RMR** doc is issued (lnd consumed, sfn set, seed advanced), but Z **neither counts it** (not `ACK`/`OFFLINE_LOCAL_ACK`) **nor waits on it** (RMR is bucketed non-pending) → the shift's Z totals **diverge from the DPS view**, and the quiescence pass can close a shift **over a doc DPS may still hold**. Dormant today (`FULL_Z_SURFACE_READY = false`, `z_builder.rs:48`), but **dormancy does not exempt a consumer from the §1b lockstep table**.
+
+**Added to §1b as C10** (see §9.6 table). **Ruling-request to the architect** (consume `is_issued` vs. re-label as *confirmed*-sets): the dossier's **prior** is that these are **CONFIRMED**-sets, not raw issued-sets — Z should **count only DPS-confirmed** receipts (`ACK`/`OFFLINE_LOCAL_ACK`), but the **quiescence gate MUST block on any issued-yet-unconfirmed doc** (post-SENT SENT/KVT1/KVT2/RMR with sfn set) rather than treat RMR as non-pending. That keeps totals DPS-faithful while forbidding a shift-close over a doc still in DPS's hands. **The architect must rule** whether Z's aggregation adopts `is_issued` directly or the CONFIRMED/blocking split above; the landing plan carries both the reword and the block-on-issued-unconfirmed change.
+
+### 9.4 D4 re-spec — fetch-then-filter (needs-work → sound)
+
+C3 (`fiscal_documents.rs:927-940`) is a **SQL string** with the literal `state = 'ACK'` @ `:933` — a Rust `is_issued(state, offline_fiscal_no, server_fiscal_no)` fn **cannot run inside SQLite**, so the DRAFT landing-step-5 "collapse both literals into one shared fn" is **unimplementable for the SQL consumer** as written. **Architect ruling — fetch-then-filter:** `last_issued_unsigned_xml_sha256` (and the analogous NC-03 projection) returns **candidate rows** `ORDER BY lnd DESC` and a Rust loop takes the **first `is_issued()` row**. NC-03 is a rare boot path; the scan is cheap; *"by construction"* beats *"by convention."* A **SQL mirror + a SQL≡fn equivalence-tooth** (matrix `state × offline_fiscal_no × server_fiscal_no`) is an **acceptable fallback only** with an explicit justification of why fetch-then-filter did not fit. The shared `is_issued` fn (D4) **still stands** as the single SSOT for the *in-memory* consumers (C2 walk, C6/C8 fuzzer/replay, the D5 gate predicate, C10); C3 is the one consumer that reaches it via fetch-then-filter rather than in-SQL. §5 D4 row and design landing-step 5 are rewritten accordingly (§9.6 / design §2 + §6).
+
+### 9.5 MED closures + A.3 implementation checklist
+
+- **3.1 — Remove five dormant sfn-less edges** in the **same A.3 commit** as `(Sent,Rejected)` `:190`: `(Encrypted,Sent)` `:186`, `(OfflineLocalAck,Sent)` `:203`, `(OfflineLocalAck,Kvt2)` `:241`, `(ErrorRetryable,Sent)` `:242`, `(ErrorRetryable,Kvt1)` `:243` — all machine-verified **zero prod-invokers** (sole citer = the table-pin test `repo_fiscal_documents_state_cas.rs`). The `(Sent,Rejected)`-removal argument applies verbatim. **`(Sending,Kvt1)` `:254` is also removed now but RETURNS with the inline fast-path** when it lands (with its own sfn+advance stamp per D3ii). Update the table-pin test.
+- **3.2 — Scan-backstop.** Extend `invariant_scan` check 3a (`src/db/invariant_scan.rs:192-201`, today `state='ACK'` only) to `state IN ('SENT','KVT1','KVT2','ACK') AND offline_fiscal_no IS NULL AND (server_fiscal_no IS NULL OR = '')`. In the landing plan; the DDL `CHECK` form is **optional**, deferred to the next table-rebuild.
+- **3.3 — INTERIM-ORDERING PIN.** Landing steps **2** (advance-at-SEND) and **4** (generalize the finalize gate + disable the `:315` online advance) **MUST be one atomic commit/PR.** If step 2 lands without step 4, `stage_finalize` still advances at `:315` for online docs, but `ns.seed` already moved at SEND → the `:304` guard (`ns.seed == inputs.previous_hash`) false-fails → **every online doc deterministically wedges at KVT2.** Explicit paragraph added to the landing plan.
+- **3.4 — D6 downgrade correction.** Append to D6: *"rollback after the FIRST advance-at-SENT doc = safe only after the FN quiesces to a terminal (`ACK`/escalated); a bare binary revert clears the in-flight-issued docs onto the old finalize-guard and wedges them."* One sentence into D6 (§5.4 / design §5).
+- **3.5 — Migration-time boundary-assert** in the A.3 migration (~5 lines SQL, fail-closed, **no permanent trace**): hazard = `offline_fiscal_no IS NULL AND server_fiscal_no IS NOT NULL AND server_fiscal_no != '' AND state != 'ACK'` (a pre-deploy SENT/KVT/RMR doc caught with sfn-set-but-not-ACK ⇒ **stop the migration**). **NOT** a permanent check (post-A2.4 it would false-positive on a healthy DB). In the landing plan; closes the restored/foreign-DB vector (§3.8).
+- **3.6 — Option-matrix additions** (§2): (a) **Option 4 "ledger-tail-derive"** — record-and-reject (passes the RED-pin, but: same C1–C9 lockstep with no saving; kills the seed-vs-ledger tripwires — finalize guard, offline `ensure!`, walk-check; the D5 interleave persists; a hybrid against minimal-diff); (b) the **"advance-at-SIGN + compensation"** sub-variant — reject on the **correct** grounds (M3b crossed-local-commit does **not** apply at SIGN): every abort-arc (#192/#196) becomes seed-corrupting; un-advance breaks monotonicity = the D5 premise; scanner self-contradiction (an issued `SIGNED` = a `StuckNonTerminalDoc`); (c) liveness footnote on opt-0's cell — "no tax on SENT-Hold; the D5 gate adds a narrow stall only on non-issued rest (the failure path)."
+- **3.7 — C11/C12/C13 no-edit records** (§1b): **C11** = the prod-ingress accepted/failed family (`replay.rs:49-62` `is_accepted`/`is_terminally_failed`, `handler.rs:300` `classify_outcome`, `inline.rs:156`) — **no-edit** (client-accepted = confirmed; a post-SENT RMR already answers `InProgress` correctly), plus a comment-pin at `replay.rs:59` folded into C9; **C12** = the five submitted-tail predicates (`fiscal_documents.rs:728/752/776/801/830`, the NC-04 feeder) — **no-edit** with rationale, **but the D3 claim "immune to any future terminal routing" is NARROWED to the `is_issued` fn** (submitted-tail predicates key on a `SENT/KVT1/KVT2[/ACK]` state-set and are **not** immune); **C13** = `last_server_fiscal_no` (`:693`, ACK-only status endpoint) — a **do-not-widen** pin, twinned with `last_ack_unsigned_xml_sha256`.
+- **3.8 — Upgrade-boundary / mint reformulation** (§0): in the prod DB of **this binary lineage there are ZERO `fiscal_documents` rows** — the mint (`insert_prepared_tx ← inline.rs:534 ← inline::run`) is unreachable behind `UnimplementedWritePath` (`supervisor.rs:188`). Reframe the §0 dormancy claim from "the lane" to **"the mint"** (a stronger statement). Boot can **park** an online doc at `SENT` (`boot_phase.rs:3607/3865`) but never **mint** one. The 3.5 boundary-assert closes the restored/foreign-DB case.
+
+### 9.6 LOW / hygiene closures + anchor-drift (machine-verified, `909fc05`)
+
+**3.7-related / D2 / D7 / doc_type / W9:**
+- **4.2 (D2):** replace the fixed citers list with a **grep-sweep obligation** in the A.3 checklist: `seed NOT advanced|lnd consumed|issue.*at ACK` across `src/` + docs, updated with the A.3 code.
+- **4.3 (D7):** the RefModel (`tests/invariant_fuzzer/model.rs:265-271`) carries `docs: map<lnd→DocState>`, `seed`, `next_lnd` — **no per-doc `server_fiscal_no`**; the online advance is keyed on `DocState::Ack`. D7 must add: the model gets a **per-doc sfn / issued-bit on the Sent-crossing**; the tooth domain = `DocState × offline_fiscal_no{None,Some} × server_fiscal_no{None,'',non-empty}`.
+- **4.4 (doc_type-independence):** the issued-predicate is doc-type-independent — `stage_sign.rs:137-150` puts `ShiftOpen/Sell/Return/ShiftClose/ZReport` in one chain (`Service*`/`XReport` are refused pre-pin). Add one sentence; and one sentence that **`Z_REPORT`-on-SENT is an issued-but-unconfirmed shift-close artifact** (interplay with the M3b shift ladder — a shift-close whose Z advanced the seed at SEND but is not yet DPS-confirmed).
+- **4.5 (W9):** boot **never** CASes `Sending→Sent` — only `Sending→ErrorRetryable` (`boot_phase.rs:3726` → `resume_sending_to_error_retryable` @ `:666-679`). Recorded as a **positive D3(→) fact** in §5.3: the single live online issued-forward edge is `WireDecision::Sent` in `stage_send` (no boot path forges an issued doc).
+
+**4.1 — broken/imprecise anchors (corrected):**
+
+| Dossier cite | Machine-verified | Fix |
+|---|---|---|
+| §1.1 W-a "CLI `prro fn seed-prevhash <hex>`" | **no `fn` subcommand exists** (`main.rs`: Version/Migrate/Doctor/Serve/Admin only); `seed_prevhash` is a pool helper (`node_state.rs:134`) with **zero prod call-sites — tests-only** | drop the CLI claim; W-a is a tests-only bootstrap helper |
+| §5.1 "4-b post-wire CAS `stage_send.rs:1524` (`target_state: Rejected`)" | `:1522` = `synthetic_rejected_decision` (a W10.4 helper, `ErrorRetryable→Rejected`); `:1524` = its `target_state` field. The **real** 4-b post-wire CAS is `:1360` | correct §5.1 to `:1360` (CAS) + note `:1522` is the synthetic-reject helper |
+| §5.1 "`node_state.rs:186` doc-comment confirms the lnd stamp" | `:186`/`:204` = the `set_mode_blocked_tx` docstring, **not** an lnd-stamp; the lnd-stamp claim is pinned by `tests/invariant_fuzzer.rs:344-354` | re-cite the lnd-stamp to the fuzzer pin |
+| C2 online arm `invariant_scan.rs:269` | `:268` (`state == "ACK"`) | cosmetic |
+| `node_seed` read `invariant_scan.rs:220` | query `:220`; loop-bind `:223` | cosmetic |
+| `last_ack_unsigned_xml_sha256` `fiscal_documents.rs:871` | `:873` | cosmetic |
+| NC-04 `boot_phase.rs:2270` | `:2273` | cosmetic |
+| 32-byte decode guard `node_state.rs:71` | `:68` | cosmetic |
+
+**§1b consumer-table additions (C10–C14).**
+
+| # | Consumer | Anchor | Rule under Option 0 |
+|---|----------|--------|---------------------|
+| C10 | Z issued + quiescence sets | `fiscal_documents.rs:560` (`:570` literal), `:602` (`:598-601`) → `z_builder.rs:115/134`, `convert.rs:616` | **§9.3 ruling** — count CONFIRMED, block quiescence on issued-unconfirmed; dormant (`FULL_Z_SURFACE_READY=false`) ≠ exempt |
+| C11 | ingress accepted/failed family | `replay.rs:49-62`,`:59`; `handler.rs:300`; `inline.rs:156` | **no-edit** (client-accepted = confirmed) + comment-pin `replay.rs:59` in C9 |
+| C12 | submitted-tail predicates | `fiscal_documents.rs:728/752/776/801/830` | **no-edit**; **narrow** the D3 "immune to future terminal routing" claim to the `is_issued` fn only |
+| C13 | `last_server_fiscal_no` | `fiscal_documents.rs:693` (ACK-only) | **do-not-widen** pin (twin of `last_ack_unsigned_xml_sha256`) |
+| C14 | `run_mac_recovery` advance/gate | `mac_recovery.rs:351`,`:386-398`,`:511-521` | §9.1 Variant P — recovered-doc gate branch + M2-X1 rationale reword |
+
+**D-table refinements (fold into §5.4 / §8):** **D4** — shared `is_issued` fn for in-memory consumers; **C3 via fetch-then-filter** (SQL cannot host the fn); SQL-mirror+equivalence-tooth = justified fallback only. **D5** — gate predicate = `is_issued`-complement (not a pre-SENT state-set); **lands only paired with a runtime resolver (LOCK-condition)**; two-layer enforcement (pin-tx assert + acquire early-refuse); +lnd-vs-chain-order scan. **D6** — +downgrade correction (§9.5 3.4).
