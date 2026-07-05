@@ -1,7 +1,8 @@
 # A.1-prep DOSSIER — online-lane MAC-seed-fork (AUD-L2-1a / m1_02 / A2.4 prerequisite)
 
-**Status:** DOSSIER (evidence + analysis). Companion DRAFT spec: [`2026-07-04-a24-seed-fork-design.md`](./2026-07-04-a24-seed-fork-design.md).
+**Status:** DOSSIER (evidence + analysis) — **ADJUDICATED: decisions D1–D7 LOCKED** by the architect (see §5.4 / §8). Companion DRAFT→v2 ADJUDICATED spec: [`2026-07-04-a24-seed-fork-design.md`](./2026-07-04-a24-seed-fork-design.md). Next: external audit → LOCK → A.3.
 **Role:** this dossier assembles machine-verified evidence + an option matrix for the architect to adjudicate → external audit → lock. It is **not** a code contract. No production code / tests / migrations were touched; the RED-pin was not un-ignored; the binding was not flipped.
+**Adjudication summary:** design (A) / **Option 0 advance-at-SEND accepted**; discriminator **amended to the `server_fiscal_no` column** (not a state-set — RMR is ambiguous both sides of SENT, §5); D3(ii) verification sweep executed read-only (**no STOP** — single sfn writer confirmed, one sharpened A2.4 lockstep requirement, §5.3).
 **Roadmap:** `docs/superpowers/plans/2026-07-04-pilot-path-roadmap.md` (LOCKED v2), step **A.1**.
 **Provenance of anchors:** every `file:line` below was machine-verified by `grep`/`Read` against the working tree at `main` (`c9f96f4`). Where the source contract or Batch C cited a different line, the **machine-verified** anchor is used and the drift is noted.
 
@@ -108,12 +109,13 @@ doc-comment says *"do NOT use this for the boot MAC-seed projection"*; sole read
 cross-reference. It is **not** an issued-predicate consumer and must **not** be widened — it is retained
 "for any ACK-only consumer". (Distinct from C3 `last_issued`.)
 
-**Shape recommendation for the architect (not a decision):** today C2 and C3 hardcode the online arm as
-a literal `ACK` *outside* the SSOT const C4. Under option 0 the clean move is either (i) an
-`ONLINE_ISSUED_STATES` const symmetric to `OFFLINE_ISSUED_STATES`, or (ii) a single shared predicate
-function `is_issued(state, offline_fiscal_no)` collapsing both literals into one SSOT. (ii) avoids a
-second namespace const (bias against namespace churn) and closes the "two hardcoded literals" gap. See
-§8 open decisions.
+**Shape — ADJUDICATED (D4):** today C2 and C3 hardcode the online arm as a literal `ACK` *outside* the
+SSOT const C4. The architect **LOCKED** a single shared predicate function
+**`is_issued(state, offline_fiscal_no, server_fiscal_no)`** in `fiscal_documents.rs` (offline arm = the
+existing `OFFLINE_ISSUED_STATES` const; online arm = the D3 `server_fiscal_no` predicate). **No**
+`ONLINE_ISSUED_STATES` const (avoids a second namespace const — bias against namespace churn). Both
+hardcoded literals (C2 `invariant_scan.rs:269`, C3 `fiscal_documents.rs:933`) die; C6/C8 call the fn;
+C7 pins the model mirror against it. See §5.4 (D1–D7) + §5.2 (D3 discriminator).
 
 ---
 
@@ -210,7 +212,7 @@ last issued doc.
 | crash-window | SENT (=offline-symmetric rest) | **SIGNED (forbidden at rest)** | narrow | narrow |
 | Rejected-pin | **reformulated + expanded** (§5) | reformulated, worse | **survives verbatim** | **survives verbatim** |
 | consumers touched | C1–C9 (lockstep) | C1–C9 + `SIGNED` in predicate | none | none + fence read |
-| migration | none (unless §5 terminal) | none | none | none |
+| migration | **none** (D3 = `server_fiscal_no` column reuse, no schema) | none | none | none |
 | liveness | no tax (Hold ok) | no tax | **permanent HoL stall** | **permanent HoL stall** |
 | verdict | **RECOMMEND** | INCOMPATIBLE (M3b + P1) | dispreferred (liveness) | dispreferred (liveness) |
 
@@ -271,7 +273,7 @@ inline and route to `escalate_fn_to_manual_recon` (mirror `online_convergence`).
    holds; the Rejected-pin **expands** (new post-SENT branch), it does not break.
 
 **Verdict:** design (A) is **not invalidated by any constraint** (STOP-point (a) does not fire). It is
-**augmented** by the §1b consumer set and the §5 discriminator open decision.
+**augmented** by the §1b consumer set and the §5 discriminator (adjudicated D3 = `server_fiscal_no` column).
 
 ---
 
@@ -303,62 +305,119 @@ for the seed-fork that gates it**. A.3 of the roadmap = the flip itself + the in
 
 ---
 
-## 5. Discriminator problem (NEW — mandatory per ruling §5)
+## 5. Discriminator problem (NEW — mandatory per ruling §5; **ADJUDICATED D3**)
 
 Extending M2-N2b ("REJECTED / RMR are issued for offline-origin") to the online lane hits a fork the
-offline lane does not have: **online REJECTED is ambiguous as a state.**
+offline lane does not have: the offline state-set trick works because **every** member of
+`OFFLINE_ISSUED_STATES` (`fiscal_documents.rs:897`) entails "this doc crossed `OFFLINE_LOCAL_ACK`" — so
+even REJECTED there *unconditionally* means "seed already advanced". For online under option 0 that is
+**not** true, and — per the architect's D3 verification — it cannot be repaired by state routing.
 
-The offline state-set trick works because **every** member of `OFFLINE_ISSUED_STATES`
-(`fiscal_documents.rs:897`) entails "this doc crossed `OFFLINE_LOCAL_ACK`" — so REJECTED there
-*unconditionally* means "seed already advanced". For online under option 0, that is **not** true:
+> **ADJUDICATION D3 (amended from the DRAFT):** the discriminator is **NOT** a state-set — it is the
+> existing column **`server_fiscal_no`**:
+> `online-issued ⟺ offline_fiscal_no IS NULL AND server_fiscal_no IS NOT NULL AND server_fiscal_no != ''`.
+> Rationale + the verification sweep are in §5.2–§5.3. The DRAFT's "route post-SENT reject to a
+> distinct-from-REJECTED state → decidable" was **wrong on the mechanism**: RMR is ambiguous on *both*
+> sides of SENT (§5.1), so no state-set predicate is decidable for online. The RMR **routing** of a
+> post-SENT reject is still adopted (§5.2) — but decidability comes from `server_fiscal_no`, not from the
+> resting state.
 
 ### 5.1 Machine-verified reachability of online REJECTED / RMR
 
 | Transition | Anchor | Regime | Seed under opt-0 |
 |------------|--------|--------|------------------|
 | `(Sending, Rejected)` | `fiscal_documents.rs:256`; DPS reject at 4-b post-wire CAS `stage_send.rs:1524` (`target_state: Rejected`), CAS `Sending→{Sent\|Rejected\|ErrorRetryable}` (`stage_send.rs:200`) | **pre-SENT** | **NOT advanced** (advance only on `WireDecision::Sent`) |
+| `(Sent, Rejected)` | `fiscal_documents.rs:190` — **legal edge, ZERO prod invokers** (sole citer = table-pin test `repo_fiscal_documents_state_cas.rs:322`) | **post-SENT** | **advanced** — an **open door** a future owner could route into, silently breaking state-decidability |
 | `(ErrorRetryable, Rejected)` | `stage_send.rs:1558,1605` (retry-exhaustion) | **pre-SENT** (ErrorRetryable is a send-failure state, never reached Sent) | **NOT advanced** |
-| `(Sent, RequiresManualReconciliation)` | `fiscal_documents.rs:199` | **post-SENT** | **advanced** |
-| `(ErrorRetryable, RequiresManualReconciliation)` | `fiscal_documents.rs:244` | (transport-parked) | depends |
+| `(Sent, RequiresManualReconciliation)` | `fiscal_documents.rs:199` — **live invoker:** boot-probe **W11 PR-2b** (`lastChk` id-mismatch → operator handoff; mismatch surface `kvt2_confirm.rs:231,339,361`) | **post-SENT** | **advanced** |
+| `(ErrorRetryable, RequiresManualReconciliation)` | `fiscal_documents.rs:244` | **pre-SENT-reachable** (ErrorRetryable is a pre-Sent transport-park state) | NOT advanced |
 | shift-level RMR escalation | `escalate_fn_to_manual_recon` `backlog_drain.rs:2399`, called by `online_convergence.rs:268` on post-Sent `Kvt2→Ack` ChainSeedMismatch (doc **stays at KVT2**, shift → RMR) | **post-SENT** | **advanced** |
 
+Two facts (architect hand-verified, machine-confirmed here) that the DRAFT §5.1 missed and that **kill
+the state-set discriminator**:
+
+1. **`(Sent, Rejected)` @ `:190` is a *legal* edge** with zero production invokers today — harmless now,
+   but an open door: a future owner routing a post-SENT reject there would put an *issued* doc into
+   `REJECTED`, silently breaking any "REJECTED ⇒ non-issued" predicate.
+2. **Doc-level RMR is already ambiguous:** `(Sent, RMR)` @ `:199` **is** invoked post-SENT by the live
+   W11 PR-2b boot-probe, while `(ErrorRetryable, RMR)` @ `:244` is reachable **pre-SENT**. So RMR straddles
+   SENT — "keep REJECTED purely pre-SENT" does **not** rescue the predicate, because RMR itself is
+   reachable from both sides.
+
 The `node_state.rs:186` doc-comment confirms the lnd stamp is *"Atomic with the post-wire CAS
-`Sending → Rejected`"* — i.e. a pre-SENT reject consumes the lnd but does **not** advance the seed. This
-is the current pin *"lnd consumed, seed NOT advanced"*, and under option 0 it **survives verbatim for the
-pre-SENT case**.
+`Sending → Rejected`"* — a pre-SENT reject consumes the lnd but does **not** advance the seed. The current
+pin *"lnd consumed, seed NOT advanced"* therefore **survives verbatim for the pre-SENT case**.
 
-### 5.2 The decidability wrinkle + convergence with Batch C OQ#2
+### 5.2 Why the state-set predicate is undecidable — and the `server_fiscal_no` discriminator
 
-Under option 0, the issued-predicate must become: *online doc is issued iff it reached SENT+*. But
-REJECTED is reachable **both** pre-SENT (non-issued) and — if the design allows a post-SENT doc to fall
-back to REJECTED — post-SENT (issued). If both mapped to the string `REJECTED`, the predicate would stop
-being **state-decidable** (unlike offline, where REJECTED is unambiguously issued).
+Under option 0 the issued-predicate must mean "online doc is issued iff it reached SENT+". No **state
+string** decides that: `REJECTED` (via the latent `:190` edge) and `RMR` (via `:199`) are both reachable
+post-SENT (issued) *and* pre-SENT/side (non-issued). The offline lane escapes this only because its
+issued-set members all entail crossing `OFFLINE_LOCAL_ACK`; online has no such state-closed set.
 
-**Convergence:** the answer to Batch C OQ#2 (post-SENT reject → **manual-recon, NO seed-rollback**)
-*simultaneously* resolves decidability. If a post-SENT DPS reject terminally lands in a state **distinct
-from `REJECTED`** (RMR, or "doc stays at Sent/Kvt2 + shift escalated" as `online_convergence` already
-does), then:
+**Resolution (D3):** use `server_fiscal_no`. `set_server_fiscal_no_tx` (`fiscal_documents.rs:1773`, SQL
+`:1778`) has **exactly one caller** — `stage_send.rs:1374` — and it runs in the **same 4-b
+`with_immediate` tx** as the CAS `Sending→Sent`. Under option 0 the seed advance lands in that same tx, so
+**`server_fiscal_no` set ⟺ seed advanced, by construction, atomically** — a predicate that is
+**state-independent** and immune to any future terminal routing (the `:190`/`:199` doors cannot break it,
+because a rejected/RMR doc that never sent has no sfn, and one that did send has both sfn *and* an advanced
+seed). Post-SENT reject **routing** still follows the `online_convergence` pattern (doc stays Sent/Kvt2,
+shift → RMR, no seed rollback) — the Rejected-pin **expands** with that branch, does not break.
 
-- online `REJECTED` remains **exclusively pre-SENT / non-issued** → the current pin survives verbatim
-  for it;
-- the pin **expands** with a new branch (post-SENT reject → issued, manual-recon, no rollback) — it does
-  **not** break;
-- the online issued-predicate stays state-decidable **without schema churn** (reuse RMR / the existing
-  "leave at Kvt2 + escalate shift" pattern).
+The codebase **already treats this as an invariant**, which is why the discriminator is a promotion, not a
+new rule: `invariant_scan.rs:195` flags `state='ACK' AND (server_fiscal_no IS NULL OR ='')` as a
+violation; `boot_phase.rs:2558` calls a SENT doc with `server_fiscal_no = None` a *"structural breach"*;
+NC-04 (`boot_phase.rs:2270-2290`) states *"SENT-with-NULL-sfn is unreachable in healthy code
+(SENT ⇐ WireDecision::Sent stamps sfn)"* and BLOCKs a malformed tail.
 
-### 5.3 Open decisions this raises (for the architect — §8)
+### 5.3 D3(ii) verification sweep + D5 residual (executed read-only, per ruling action 3)
 
-- **(a) RMR-collision audit.** RMR is heavily overloaded: doc-level `(Sent,RMR)`/`(ErrorRetryable,RMR)`
-  (`fiscal_documents.rs:199,244`), offline drain `ErrorRetryable→RMR` (`backlog_drain.rs:1693`), and
-  shift-level escalation (`escalate_fn_to_manual_recon`, many callers). Is doc-level RMR safe as the
-  post-SENT-reject discriminator given these other uses, or does the design keep the doc at Sent/Kvt2 and
-  escalate only the shift (the `online_convergence` pattern)?
-- **(b) Alternatives with schema cost.** A new terminal doc state, or a marker column
-  (`seed_advanced BOOL`), makes the predicate trivially decidable but is **schema churn** (bias against).
-  Weigh vs reuse.
-- **(c) Predicate shape (ties to §1b).** `ONLINE_ISSUED_STATES` const vs a single
-  `is_issued(state, offline_fiscal_no)` fn. The latter collapses the two hardcoded literals (C2, C3) into
-  one SSOT and avoids a second namespace const.
+**D3(ii) — sfn-invariant sweep result: CONFIRMED (no STOP).**
+
+- **Writer side — single writer confirmed.** The only production writer of
+  `fiscal_documents.server_fiscal_no` is `set_server_fiscal_no_tx` (one caller, `stage_send.rs:1374`). The
+  two other `server_fiscal_no` writes in the tree are **not** it: `server.rs:613` is a `#[cfg(test)]` helper
+  (`seed_ack`, `server.rs:587`), and `transport_trace.rs:206,490` UPDATE the **`transport_trace`** table
+  (a different table's column).
+- **SENT-without-sfn side — no live hole; one sharpened A2.4 requirement.** In the *live* staged lane every
+  online doc reaches `Sent` via `WireDecision::Sent`, which stamps sfn atomically (and the NC-04 /
+  `invariant_scan` guards fail-closed on any malformed SENT). **However**, the legal edges
+  `(Sending, Kvt1)` (inline fast-path, `fiscal_documents.rs:1763`) and `(ErrorRetryable, Sent/Kvt1)`
+  (re-send) reach an issued state, and stage_send stamps sfn **only** on the `WireDecision::Sent` arm — the
+  `Routed` arm (`stage_send.rs:1388`) does not. Today that is harmless (the inline lane is dormant; retries
+  re-enter via `ErrorRetryable→Sending→Sent` which stamps sfn). **For A2.4 this becomes a hard requirement:
+  every online issued-forward edge — including the inline `Sending→Kvt1` fast-path — must stamp
+  `server_fiscal_no` atomic with the seed advance (the same lockstep).** This does **not** refute the
+  invariant (no second writer, no live sfn-less issued doc), so **D3 holds**; it is documented as an
+  implementation obligation, not a STOP.
+- **`''` (empty) semantics — consistent.** The discriminator uses `IS NOT NULL AND != ''`, matching
+  NC-04's malformed-tail handling and `invariant_scan.rs:195`.
+
+**D5 — NC-03 ordering + interleaving residual (named, for the LOCKed spec).** `ORDER BY lnd DESC LIMIT 1`
+(`last_issued_unsigned_xml_sha256`, `fiscal_documents.rs:933`, fn @ `:916`) is **sufficient**: advances are
+monotonic in `lnd` under single-writer + the fail-closed drift-assert. **Residual to carry into the LOCKed
+spec:** the "ER-parked predecessor" interleave — if a worker can sign doc2 while doc1 rests **pre-SENT**
+(`ErrorRetryable`), doc2's `previous_hash` is stale and its SENT drift-assert fails **after** the wire call
+(DPS accepted, local refuse = ambiguous). This hazard **pre-exists** under advance-at-ACK (it wedges later,
+at KVT2); option 0 only surfaces it earlier. The spec must (i) machine-verify interleave reachability (the
+worker's doc-selection order under ER-parking) and (ii) choose: a **narrow gate** "do not sign while a
+pre-SENT doc rests on the FN" (which — unlike option 2 — does *not* tax the SENT+ Hold path; architect's
+prior) **or** a fail-closed route → manual-recon. Not resolved here; it is a spec obligation.
+
+### 5.4 Adjudicated decisions (D1–D7)
+
+All seven DRAFT open decisions are now **LOCKED** by the architect (design accepted with the §5 D3
+amendment). Full text lives in the companion design doc (v2 ADJUDICATED); summary:
+
+| # | Decision | Ruling |
+|---|----------|--------|
+| D1 | Issuance moment | **LOCKED = SENT** (KVT1 reopens the fork window; SENT = local-commit crossing, symmetric to `OFFLINE_LOCAL_ACK`) |
+| D2 | Rejected-pin | **LOCKED** wording (§8.2); citers: root `CLAUDE.md` M3b persistence-para (**NB: `.claude/CLAUDE.md` lacks it — do not touch**), barrier prose `kill_point_matrix.rs:2516-2539`, roadmap A.1 constraints; updates ride A.3 code |
+| D3 | Discriminator | **`server_fiscal_no`** column (not state-set); remove latent `(Sent,Rejected)` edge + table-pin test; D3(ii) verification obligation (§5.3) |
+| D4 | Predicate shape | **shared `is_issued(state, offline_fiscal_no, server_fiscal_no)` fn** in `fiscal_documents.rs`; **no** `ONLINE_ISSUED_STATES` const; both hardcoded literals (C2 `invariant_scan.rs:269`, C3 `fiscal_documents.rs:933`) die |
+| D5 | NC-03 ordering | **sufficient**, with the interleave residual above carried into the spec |
+| D6 | Config surface | **LOCKED = hardcoded DI-swap, NO config knob** (Frozen #10 drift hazard; rollback = gated code revert); operator controls = Phase D |
+| D7 | Fuzzer tooth | **approved** — pins model `is_issued` mirror == prod fn (both arms), paired (pos+neg), rides the lockstep consumer commit |
 
 ---
 
@@ -410,34 +469,31 @@ produces only the **seed-fork design that gates the flip**; the flip + audit is 
   write-path); `AppConfig` (`config/mod.rs:10`) has none. `supervisor.enabled` gates whether the spine
   runs at all, not which impl is bound (both paths yield `UnimplementedWritePath`).
 
-**Open decision (recorded, NOT designed here):** A2.4 introduces a new config surface — should the flip be
-(a) a pure hardcoded DI-swap (no runtime knob, flip = code change + external review), or (b) a
-config/feature-flag with a rollback policy? This is a genuine new decision for the architect; the dossier
-only fixes the question. (Bias against speculative config surface; but "replay-forever risk" per §6 may
-argue for an explicit off-switch.)
+**ADJUDICATED (D6): hardcoded DI-swap, NO config knob.** A runtime write-path switch on a fiscal
+edge-device is a Frozen #10 (accidental-drift) hazard; rollback = revert the flip through the same gated
+external-review process; an off-switch adds nothing over stopping the service (`UnimplementedWritePath`
+already refuses everything). Operator controls, if the pilot needs them, are a separate Phase-D spec.
 
 ---
 
-## 8. Open decisions for the architect (rolled up)
+## 8. Adjudicated decisions (D1–D7) — LOCKED
 
-1. **Issuance moment = SENT (lock OQ#1).** Recommend SENT (lane-uniform predicate; KVT1 reopens the
-   fork window). Confirm/lock.
-2. **Rejected-pin reformulation + expansion (§5).** New wording: *"pre-SENT reject → REJECTED, seed NOT
-   advanced (pin survives); post-SENT reject → manual-recon, seed NOT rolled back (pin expands)."*
-   Consumers to update: the §5 discriminator sites + the pin's citers in `CLAUDE.md` M3b and the RED-pin
-   barrier prose.
-3. **Discriminator terminal (§5.3).** RMR reuse vs new state/marker (schema churn). Decide.
-4. **Predicate shape (§1b / §5.3c).** `ONLINE_ISSUED_STATES` const vs shared `is_issued()` fn (collapses
-   C2+C3 literals).
-5. **NC-03 projection ordering.** `last_issued_unsigned_xml_sha256` uses `ORDER BY lnd DESC LIMIT 1`
-   (`fiscal_documents.rs:933`, fn @ `:916`). When online-SENT enters the issued-set, "highest-lnd issued doc" still
-   identifies the tail **iff** live advances are monotonic in `lnd` — which the pre-advance drift-assert
-   enforces at runtime (advance refused if `seed != doc.previous_hash`). Confirm the drift-assert is
-   preserved at the SENT advance so the projection stays sufficient; else the ordering could pick a
-   later-lnd doc that advanced earlier in real-chain time. (Open — architect to confirm sufficiency.)
-6. **Config surface (§7).** Hardcoded flip vs config-gated + rollback policy.
-7. **Fuzzer online-advance tooth (§1b C7).** Add a tooth pinning model-online-advance-state ==
-   prod-online-advance-state (currently a silent-drift blind spot), symmetric to D3.
+All seven decisions the DRAFT raised were **adjudicated by the architect** (design accepted with the §5
+D3 amendment). The decision table is in §5.4; the load-bearing wording is captured here for citers.
+
+- **D1 issuance moment = SENT** (LOCKED). **D5 NC-03 ordering = sufficient** (with the §5.3 interleave
+  residual carried into the LOCKed spec). **D6 config = hardcoded DI-swap, no knob** (§7). **D7 fuzzer
+  tooth approved** (§1b C7 / §5.4).
+- **D2 Rejected-pin (LOCKED wording):** *"pre-SENT reject → `REJECTED`, lnd consumed, seed NOT advanced
+  (pin survives verbatim); post-SENT reject → manual-recon escalation, seed NOT rolled back (pin
+  expands)."* Citers to update **with the A.3 code, not earlier**: root `CLAUDE.md` M3b persistence
+  paragraph (**NB — `.claude/CLAUDE.md` does *not* carry this paragraph; do not touch it**), barrier prose
+  `kill_point_matrix.rs:2516-2539`, roadmap A.1 constraints.
+- **D3 discriminator = `server_fiscal_no`** (not a state-set), plus removal of the latent
+  `(Sent, Rejected)` edge (`fiscal_documents.rs:190`) + its table-pin test, plus the §5.3 D3(ii)
+  verification obligation. Full ruling in §5.2.
+- **D4 predicate shape = shared `is_issued(state, offline_fiscal_no, server_fiscal_no)` fn**, no
+  `ONLINE_ISSUED_STATES` const (§1b).
 
 ---
 
