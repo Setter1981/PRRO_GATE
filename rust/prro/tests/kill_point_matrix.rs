@@ -2539,7 +2539,6 @@ async fn boot_kvt2_chain_seed_mismatch_escalates_manual() {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "RED pin AUD-L2-1a: online-lane seed-fork; fix is an A2.4 prerequisite (do NOT activate InlineWritePath until resolved)"]
 async fn m1_02_online_seed_fork_a24_prerequisite() {
     let pool = fresh_pool().await;
     let pool_secure = fresh_secure_pool().await;

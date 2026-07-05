@@ -139,7 +139,14 @@ fn hex32_opt(b: &Option<Vec<u8>>) -> String {
 /// offline_fiscal_no)`.  `offline_fiscal_no` (M2-01) marks an offline-origin
 /// doc, which issues at `OfflineLocalAck` (not ACK) and so advances the seed
 /// from that state onward.
-type ChainRow = (i64, String, Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>);
+type ChainRow = (
+    i64,
+    String,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Option<String>,
+);
 
 /// Run every check; return ALL violations found (empty = clean).
 pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
@@ -222,7 +229,8 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             .await?;
     for (fiscal_number, node_seed) in fns {
         let docs: Vec<ChainRow> = sqlx::query_as(
-            "SELECT lnd, state, previous_hash, unsigned_xml_sha256, offline_fiscal_no \
+            "SELECT lnd, state, previous_hash, unsigned_xml_sha256, offline_fiscal_no, \
+                    server_fiscal_no \
              FROM fiscal_documents \
              WHERE fiscal_number = ? AND unsigned_xml_sha256 IS NOT NULL \
              ORDER BY lnd ASC",
@@ -231,7 +239,7 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
         .fetch_all(pool)
         .await?;
         let mut expected: Option<Vec<u8>> = None;
-        for (lnd, state, previous_hash, unsigned_sha, offline_fiscal_no) in docs {
+        for (lnd, state, previous_hash, unsigned_sha, offline_fiscal_no, server_fiscal_no) in docs {
             if previous_hash != expected {
                 out.push(Violation::ChainBreak {
                     fiscal_number: fiscal_number.clone(),
@@ -260,15 +268,19 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             // walk's issued-set would NOT advance `expected` over the rejected
             // predecessor → a FALSE `ChainBreak` at the successor.  Ever-reached-
             // OfflineLocalAck ⇒ seed advanced, regardless of later drain outcome.
-            // Online-origin docs are unchanged (they only ever issue at ACK).
-            // AUD-L6-1 (2026-06-14): the offline-issued state set is now the
-            // single-source-of-truth const `OFFLINE_ISSUED_STATES` (shared with
-            // `last_issued_unsigned_xml_sha256`, the boot seed projection) so the
-            // walk's final `expected` and the boot projection CANNOT diverge.
-            let issued = state == "ACK"
-                || (offline_fiscal_no.is_some()
-                    && crate::db::repositories::fiscal_documents::OFFLINE_ISSUED_STATES
-                        .contains(&state.as_str()));
+            // A.3 / C2 (design v3 §6 step 5): the issued-predicate is now the
+            // shared [`fiscal_documents::is_issued`] fn — online-origin issues
+            // when `server_fiscal_no` is set (advance-at-SEND, D3), NOT only at
+            // `ACK`.  Without this the walk would advance `expected` only over
+            // `ACK` docs while `node_state.seed` advanced at SEND → a FALSE
+            // `ChainSeedMismatch` on any SENT-resting online doc.  Offline arm
+            // unchanged (`OFFLINE_ISSUED_STATES`).  This projection and
+            // `last_issued_unsigned_xml_sha256` share the fn → CANNOT diverge.
+            let issued = crate::db::repositories::fiscal_documents::is_issued(
+                &state,
+                offline_fiscal_no,
+                server_fiscal_no.as_deref(),
+            );
             if issued {
                 expected = unsigned_sha;
             }

@@ -904,6 +904,33 @@ pub const OFFLINE_ISSUED_STATES: [&str; 7] = [
     "REQUIRES_MANUAL_RECONCILIATION",
 ];
 
+/// A.3 / D4 (design v3 §5) — the SINGLE issued-predicate for BOTH lanes,
+/// replacing the hardcoded `state == "ACK"` online literal that used to live
+/// in the walk (C2) and the SQL projections (C3).
+///   - **offline-origin** (`offline_fiscal_no IS NOT NULL`): issued ⟺ the state
+///     is in [`OFFLINE_ISSUED_STATES`] (ever crossed `OFFLINE_LOCAL_ACK`, M2-01).
+///   - **online-origin** (`offline_fiscal_no IS NULL`): issued ⟺ `server_fiscal_no`
+///     is set (non-NULL, non-empty) — the D3 discriminator.  Under A.3 the seed
+///     advances atomic with the `Sending → Sent` CAS + the sfn stamp, so
+///     `sfn set ⟺ seed advanced`, state-independently (immune to later terminal
+///     routing: a post-SENT `RMR` keeps its sfn → stays issued; a pre-SENT
+///     reject never got one → stays non-issued).
+///
+/// Consumers in lockstep: the `invariant_scan` MAC-walk (C2),
+/// [`last_issued_unsigned_xml_sha256`] via fetch-then-filter (C3), the
+/// Z-quiescence set (C10), the fuzzer model mirror (C6/C7), webcheck replay (C8).
+pub fn is_issued(
+    state: &str,
+    offline_fiscal_no: Option<i64>,
+    server_fiscal_no: Option<&str>,
+) -> bool {
+    if offline_fiscal_no.is_some() {
+        OFFLINE_ISSUED_STATES.contains(&state)
+    } else {
+        matches!(server_fiscal_no, Some(sfn) if !sfn.is_empty())
+    }
+}
+
 /// **AUD-L6-1 (FT, 2026-06-14)** — the `unsigned_xml_sha256` of the FN's
 /// highest-`lnd` EVER-ISSUED doc: online `ACK` OR offline-origin in any
 /// [`OFFLINE_ISSUED_STATES`] state (`offline_fiscal_no IS NOT NULL`).  This is
@@ -917,30 +944,34 @@ pub async fn last_issued_unsigned_xml_sha256(
     pool: &SqlitePool,
     fiscal_number: &str,
 ) -> sqlx::Result<Option<Vec<u8>>> {
-    // Build a PARAMETERISED `IN (?, ?, …)` from the single-source-of-truth
-    // const, then BIND each state — the SQL string carries only `?` placeholders
-    // (no interpolated data), matching the codebase's parameterised style, while
-    // the set still comes solely from `OFFLINE_ISSUED_STATES` so the SQL set and
-    // the invariant_scan walk set cannot drift.
-    let placeholders = OFFLINE_ISSUED_STATES
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT unsigned_xml_sha256 FROM fiscal_documents \
-         WHERE fiscal_number = ? AND unsigned_xml_sha256 IS NOT NULL \
-           AND (state = 'ACK' \
-                OR (offline_fiscal_no IS NOT NULL AND state IN ({placeholders}))) \
-         ORDER BY lnd DESC \
-         LIMIT 1"
-    );
-    let mut query = sqlx::query_scalar::<_, Option<Vec<u8>>>(&sql).bind(fiscal_number);
-    for state in OFFLINE_ISSUED_STATES {
-        query = query.bind(state);
+    // A.3 / D4 — FETCH-THEN-FILTER: a SQL string cannot host the Rust
+    // [`is_issued`] predicate (the online arm keys on `server_fiscal_no`, not a
+    // state literal), so fetch candidate rows in descending `lnd` order and
+    // take the FIRST `is_issued` one in Rust — "by construction" beats "by
+    // convention".  The `unsigned_xml_sha256 IS NOT NULL` filter stays in SQL;
+    // the issued decision is the shared fn, so this projection and the
+    // `invariant_scan` walk CANNOT diverge.  (The old hardcoded `'ACK'` literal
+    // + the `OFFLINE_ISSUED_STATES` IN-clause are gone.)
+    #[derive(sqlx::FromRow)]
+    struct Cand {
+        unsigned_xml_sha256: Option<Vec<u8>>,
+        state: String,
+        offline_fiscal_no: Option<i64>,
+        server_fiscal_no: Option<String>,
     }
-    let row: Option<Option<Vec<u8>>> = query.fetch_optional(pool).await?;
-    Ok(row.flatten())
+    let rows: Vec<Cand> = sqlx::query_as(
+        "SELECT unsigned_xml_sha256, state, offline_fiscal_no, server_fiscal_no \
+         FROM fiscal_documents \
+         WHERE fiscal_number = ? AND unsigned_xml_sha256 IS NOT NULL \
+         ORDER BY lnd DESC",
+    )
+    .bind(fiscal_number)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .find(|r| is_issued(&r.state, r.offline_fiscal_no, r.server_fiscal_no.as_deref()))
+        .and_then(|r| r.unsigned_xml_sha256))
 }
 
 /// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 / HIGH-C4-8
@@ -1482,6 +1513,18 @@ pub struct SendInputs {
     /// Consumed by signer_guard 4-pre check.  `None` for pre-W14a-2b
     /// ledger rows (column added in migration 017).
     pub signed_by_cashier_id: Option<CashierId>,
+    /// A.3 (advance-at-SEND, design v3 §6 step 1) — the doc's signed-chain
+    /// fields, read in the SAME pre-CAS input fetch (write-once at stage_sign;
+    /// unchanged between SIGNED and the `Sending → Sent` CAS).  The 4-b
+    /// advance reads `previous_hash` from THIS pre-CAS snapshot (audit F7 — NO
+    /// post-CAS re-read), asserts `ns.seed == previous_hash`, then advances the
+    /// seed to `unsigned_xml_sha256`.  `mac_recovery_attempts` drives the C14
+    /// Variant P branch: for a recovered doc (`>= 1`) the equality gate is
+    /// SKIPPED (recovery deliberately re-anchored `previous_hash` onto the
+    /// DPS-supplied hash) while the advance target is unchanged.
+    pub previous_hash: Option<Vec<u8>>,
+    pub unsigned_xml_sha256: Option<Vec<u8>>,
+    pub mac_recovery_attempts: i64,
 }
 
 /// W7 stage 4-pre — read the minimal field set required by stage 4 in
@@ -1508,7 +1551,10 @@ pub async fn fetch_send_inputs_tx(
                   transport_profile_id,
                   offline_fiscal_no,
                   shift_id             as "shift_id: ShiftId",
-                  signed_by_cashier_id as "signed_by_cashier_id: CashierId"
+                  signed_by_cashier_id as "signed_by_cashier_id: CashierId",
+                  previous_hash        as "previous_hash: Vec<u8>",
+                  unsigned_xml_sha256  as "unsigned_xml_sha256: Vec<u8>",
+                  mac_recovery_attempts
            FROM fiscal_documents WHERE document_id = ?"#,
         doc_id
     )
@@ -1527,6 +1573,9 @@ pub async fn fetch_send_inputs_tx(
         document_id: doc_id,
         shift_id: r.shift_id,
         signed_by_cashier_id: r.signed_by_cashier_id,
+        previous_hash: r.previous_hash,
+        unsigned_xml_sha256: r.unsigned_xml_sha256,
+        mac_recovery_attempts: r.mac_recovery_attempts,
     }))
 }
 

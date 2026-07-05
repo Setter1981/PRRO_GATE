@@ -59,6 +59,10 @@ fn sample_inputs_with_fn(
         document_id: DocumentId::new(),
         shift_id,
         signed_by_cashier_id: signer,
+        // A.3 — chain fields; signer-guard tests don't exercise the advance.
+        previous_hash: None,
+        unsigned_xml_sha256: None,
+        mac_recovery_attempts: 0,
     }
 }
 
