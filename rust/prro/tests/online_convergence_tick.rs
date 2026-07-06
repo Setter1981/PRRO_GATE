@@ -965,3 +965,178 @@ async fn tick_skips_rmr_but_online_fn_no_reprobe() {
     );
     assert_eq!(send_calls.load(Ordering::SeqCst), 1, "tick does NOT send");
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// A.3 PR-C — resolver: extend the tick to the ER (pre-SENT) cohort.
+//
+// An online ErrorRetryable doc is a NON-ISSUED blocker for the D5 gate (it
+// gates every successor on the FN until it converges).  Without a runtime
+// re-driver the gate would be an FN-wide stall until reboot.  The tick now
+// routes the ER cohort through the EXISTING `er_redrive_policy`:
+//   - Redrive (TransientRetry, attempts<MAX) → stage_send::run → Sent (issued)
+//     ⇒ the gate opens;
+//   - HoldIndeterminate (no durable retry_class) → fail-closed HOLD: the FN
+//     stays gated (doc unchanged) + an audit that escalates Warning→CRITICAL
+//     after N ticks (operator surface — ambiguous-wire is a manual-recon
+//     family, NOT a spin).
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Seed a resting online-origin ERROR_RETRYABLE doc with NO transport_trace
+/// (⇒ `evaluate_er_redrive` returns `HoldIndeterminate`).  Raw INSERT.
+async fn seed_online_er_doc(pool: &SqlitePool, lnd: i64) -> DocumentId {
+    let doc_id = DocumentId::new();
+    let req_id = RequestId::new();
+    let sha: [u8; 32] = Sha256::digest(b"er-doc-indeterminate").into();
+    sqlx::query(
+        "INSERT INTO fiscal_documents \
+            (document_id, request_id, fiscal_number, lnd, doc_type, state, \
+             backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+             payload_json, payload_sha256_canonical) \
+         VALUES (?, ?, ?, ?, 'SELL', 'ERROR_RETRYABLE', 'b', 't', 'ONLINE', \
+             '2026-06-09T12:00:00Z', '{}', ?)",
+    )
+    .bind(&doc_id.as_bytes()[..])
+    .bind(&req_id.as_bytes()[..])
+    .bind(FN)
+    .bind(lnd)
+    .bind(&sha[..])
+    .execute(pool)
+    .await
+    .unwrap();
+    doc_id
+}
+
+async fn event_has_severity(pool: &SqlitePool, event_type: &str, severity: &str) -> bool {
+    let n: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE event_type = ? AND severity = ?")
+            .bind(event_type)
+            .bind(severity)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    n > 0
+}
+
+// (g) Redrive: an ER doc (TransientRetry) is driven to Sent by the tick →
+//     the doc becomes issued → the D5 gate opens.
+#[tokio::test]
+async fn tick_er_redrive_advances_to_sent_and_ungates_fn() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(&pool, NodeMode::Online, shift_id).await;
+
+    let (send_calls, last_calls) = seed_counters();
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    // Construction: the sell's send fails transiently → the doc lands in
+    // ErrorRetryable with a completed transport_trace(TransientRetry, 1).
+    stub.push_send(Err(DpsError::Transport("transient-construction".into())));
+    // Tick redrive: stage_send re-sends → Ok → Sent (sfn stamped ⇒ issued).
+    stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+
+    let row = seed_inbox_sell(&pool).await;
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = gate.lock_owned().await;
+        let outcome = inline::run(
+            &pool,
+            &pool_secure,
+            &stub,
+            &sign_ctx,
+            &fn_sign,
+            &guard,
+            &row,
+        )
+        .await
+        .expect("inline::run with a transient send → Ok(InProgress)");
+        assert_eq!(
+            outcome.document_state,
+            DocState::ErrorRetryable,
+            "construction: transient send lands ErrorRetryable"
+        );
+    }
+    assert_eq!(read_doc_state(&pool, FN).await, "ERROR_RETRYABLE");
+
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    run_tick_for_fn(&pool, &view, FN).await.expect("tick ok");
+
+    assert_eq!(
+        read_doc_state(&pool, FN).await,
+        "SENT",
+        "resolver drives ER→Sent (issued) ⇒ the D5 gate opens"
+    );
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        2,
+        "one construction fail + one redrive send"
+    );
+}
+
+// (h) HoldIndeterminate: no durable retry_class → fail-closed HOLD; the FN
+//     stays gated (doc unchanged) and the audit escalates Warning→CRITICAL
+//     after N ticks.
+#[tokio::test]
+async fn tick_er_hold_indeterminate_keeps_fn_gated_and_escalates_after_n_ticks() {
+    let pool = fresh_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(&pool, NodeMode::Online, shift_id).await;
+    // A resting online-ER doc with NO transport_trace → HoldIndeterminate.
+    let _doc = seed_online_er_doc(&pool, 1).await;
+
+    let (send_calls, last_calls) = seed_counters();
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    // Ticks 1..=2 → Warning; the doc stays ErrorRetryable (FN gated), zero wire.
+    for _ in 0..2 {
+        run_tick_for_fn(&pool, &view, FN).await.expect("tick ok");
+    }
+    assert_eq!(
+        read_doc_state(&pool, FN).await,
+        "ERROR_RETRYABLE",
+        "HoldIndeterminate keeps the FN gated (no state change)"
+    );
+    assert_eq!(
+        count_audit_events(&pool, "CONVERGE_ER_HOLD_INDETERMINATE").await,
+        2
+    );
+    assert!(
+        !event_has_severity(&pool, "CONVERGE_ER_HOLD_INDETERMINATE", "CRITICAL").await,
+        "the first 2 ticks are Warning, not CRITICAL"
+    );
+
+    // Tick 3 (N=3) → CRITICAL operator surface; still gated (hold).
+    run_tick_for_fn(&pool, &view, FN).await.expect("tick ok");
+    assert_eq!(
+        read_doc_state(&pool, FN).await,
+        "ERROR_RETRYABLE",
+        "still gated"
+    );
+    assert_eq!(
+        count_audit_events(&pool, "CONVERGE_ER_HOLD_INDETERMINATE").await,
+        3
+    );
+    assert!(
+        event_has_severity(&pool, "CONVERGE_ER_HOLD_INDETERMINATE", "CRITICAL").await,
+        "the Nth (=3) tick escalates to CRITICAL"
+    );
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        0,
+        "HoldIndeterminate issues zero wire"
+    );
+}
