@@ -548,6 +548,19 @@ The §5.3 D5 residual named a "narrow gate: do not sign while a pre-SENT doc res
 
 **(a) Predicate — NOT a "pre-SENT" state-set.** `ERROR_RETRYABLE` is a member of `OFFLINE_ISSUED_STATES` (`fiscal_documents.rs:897-905`, `ERROR_RETRYABLE` @ `:901`): an offline-origin ER doc is **issued** and legitimately rests in the drain backlog. A literal "pre-SENT state-set" gate (`Prepared|Signed|Encrypted|Sending|Sent|ErrorRetryable`) would catch those offline-ER docs and **stall the entire offline lane**. **LOCKED gate-predicate:** `∃ doc on FN: non-terminal AND NOT is_issued(state, offline_fiscal_no, server_fiscal_no)` — the **complement of the D4 SSOT**. It is transparent to every legitimate rest: SENT-Hold (issued via sfn), KVT1/KVT2, OFFLINE_LOCAL_ACK, and offline-ER (issued via `OFFLINE_ISSUED_STATES`). It gates only genuinely non-issued in-flight docs (online Prepared/Signed/Encrypted/Sending, online-ER).
 
+> **AMENDMENT (architect ruling at PR-C, 2026-07-06) — ONLINE-LANE SCOPING.** The fuzzer's
+> differential teeth caught that the unqualified "∃ doc on FN" wording over-reaches: **an
+> OFFLINE-origin mint/sign must NEVER be gated** — offline availability is the legally-mandated
+> mechanism (INV-08) and exists precisely for the connectivity failures that park online-ER docs;
+> gating offline on a parked online sibling would refuse sales during an outage. **Both gate
+> layers are therefore scoped to online-origin** (acquire: `channel == Online`; sign:
+> `fs_mode == 'ONLINE'`). Accepted bounded cost: a parked online non-issued doc can become
+> chain-**superseded** by offline advances during the outage → its later re-drive fail-closes at
+> the SEND drift-assert → manual-recon family (the existing SupersededHeld/W9b shape). Two
+> refinements also landed with the gate: **self-exclusion** (the predicate skips the doc being
+> processed) and **lnd-ordering** (only `lnd < self` blocks — the chain-head passes, so boot's
+> lnd-ASC re-drive cannot deadlock on legacy multi-doc rests).
+
 **(b) Co-requisite resolver — a LOCK-condition, not a follow-up.** Online-ER is **not** re-driven in runtime today: `er_redrive_policy` parks its `Hold*` verdicts through boot (`HoldProbeRequired` `:66-70`, `HoldIndeterminate` `:72-77` — "Caller holds; no DB mutation"), and `online_convergence` owns only `SENT`/`KVT1` (`:3-10`), never pre-SENT. So the gate **alone** = an FN-wide sign-refusal that persists **until reboot** on any transient failure that parks a doc non-issued. **LOCKED:** the gate lands **only paired** with a resolver that drives the blocking doc forward at runtime. **Resolver RULED (architect, 2026-07-05) = (i) extend the `online_convergence` tick onto the ER/pre-SENT cohort via the existing `er_redrive_policy`.** Option (ii) in-band resolve at gate-refusal is **rejected**: it couples a new receipt's latency to another doc's wire retry (the per-receipt latency budget is an operational requirement), creates re-entrancy under the FN single-writer lease (a sign path triggering another doc's send), and splits reconciliation ownership across two homes. Gate refusal returns a typed retryable refusal (audit-only); the tick resolves in the background. This pairing is a **LOCK-condition**.
 
 **(c) Coverage + enforcement.** The blocking (non-issued, non-terminal) set includes: **Signed** (dispatcher-refusal rest — `dispatch.rs:50-52` I8: "refused modes leave doc state untouched, still `Signed`"), **Encrypted**, **Sending**, and **both non-pinned and pinned `Prepared`** (resume reuses a stale pin: `stage_sign.rs:301-320`, `PinResult::Reused` returns the previously-pinned `previous_hash`). **Enforcement is two-layer:** (1) a **fail-closed assert inside the `stage_sign` pin-tx** — mandatory because boot's `dispatch_prepared_via_chain` enters `stage_sign` **bypassing `stage_acquire`**, so an acquire-only gate misses the boot path; plus (2) an **acquire-level early-refusal** (pre-mint, audit-only) for the live-request path.
