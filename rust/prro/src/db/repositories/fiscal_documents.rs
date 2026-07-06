@@ -529,22 +529,28 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
         .collect()
 }
 
-/// Raw `(doc_type, payload_json)` row for [`list_shift_issued_receipts`].
+/// Raw row for [`list_shift_issued_receipts`] — `(doc_type, payload_json,
+/// signing_config_snapshot_id)`.  The snapshot FK (nullable; NULL only for
+/// pre-W4-Z2a docs) lets the Z TXS aggregation resolve each receipt's tax
+/// groups with the SAME config it was signed under.
 #[derive(sqlx::FromRow)]
 struct ShiftReceiptRow {
     doc_type: DocType,
     payload_json: String,
+    signing_config_snapshot_id: Option<i64>,
 }
 
 /// RS-2 piece-2b — the issued `SELL` / `RETURN` receipts of a shift, for
-/// Z-report aggregation.  Returns `(doc_type, payload_json)` for docs in
-/// the given `shift_id` whose state is a terminal **issued receipt**
-/// (`ACK` or `OFFLINE_LOCAL_ACK` — the `fiscal_documents`=issued-ledger
-/// set; in-flight `SENDING`/`KVT*`/`ERROR_RETRYABLE` and `REJECTED` are
-/// intentionally excluded, matching the W4-Z1 `<NC>` spec + the Python
-/// `shift_aggregation` parity).  `payload_json` is the **converted**
-/// signer-ready `CheckJson` (RS-2 §0.4 H5), so callers aggregate its
-/// `payments[]` directly.
+/// Z-report aggregation.  Returns `(doc_type, payload_json,
+/// signing_config_snapshot_id)` for docs in the given `shift_id` whose state
+/// is a terminal **issued receipt** (`ACK` or `OFFLINE_LOCAL_ACK` — the
+/// `fiscal_documents`=issued-ledger set; in-flight `SENDING`/`KVT*`/
+/// `ERROR_RETRYABLE` and `REJECTED` are intentionally excluded, matching the
+/// W4-Z1 `<NC>` spec + the Python `shift_aggregation` parity).  `payload_json`
+/// is the **converted** signer-ready `CheckJson` (RS-2 §0.4 H5), so callers
+/// aggregate its `payments[]` + `items[]` directly; the nullable snapshot FK
+/// (NULL only for pre-W4-Z2a docs) lets the W4-Z2 TXS aggregation resolve each
+/// receipt's tax groups with the config it was signed under.
 ///
 /// Runtime-bound `query_as` (NOT the `query!` macro) so it needs no
 /// `.sqlx` offline-cache entry — mirrors the secure-pool repos.
@@ -552,9 +558,9 @@ pub async fn list_shift_issued_receipts(
     pool: &SqlitePool,
     fn_id: &str,
     shift_id: ShiftId,
-) -> sqlx::Result<Vec<(DocType, String)>> {
+) -> sqlx::Result<Vec<(DocType, String, Option<i64>)>> {
     let rows = sqlx::query_as::<_, ShiftReceiptRow>(
-        "SELECT doc_type, payload_json \
+        "SELECT doc_type, payload_json, signing_config_snapshot_id \
          FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
            AND doc_type IN ('SELL','RETURN') \
@@ -567,7 +573,7 @@ pub async fn list_shift_issued_receipts(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|r| (r.doc_type, r.payload_json))
+        .map(|r| (r.doc_type, r.payload_json, r.signing_config_snapshot_id))
         .collect())
 }
 

@@ -275,6 +275,15 @@ fn convert_error_code(e: &ConvertError) -> &'static str {
         ConvertError::NotSignable(_) => "NOT_SIGNABLE",
         ConvertError::PaymentLookup(_) => "PAYMENT_LOOKUP_FAILED",
         ConvertError::Serialise(_) => "INTERNAL",
+        // W4-Z2 TXS — all 500-class (unknown codes fall through to 500).  A
+        // stored-turnover overflow or an unloadable pinned snapshot is a ledger
+        // integrity fault; a mid-shift tax-config drift is a distinct
+        // fail-closed-to-manual condition (NOT "corruption" — the config
+        // legitimately changed); a calc failure is internal.
+        ConvertError::ZReportTaxSumOverflow { .. } => "LEDGER_CORRUPTION",
+        ConvertError::TaxSnapshotDriftInShift { .. } => "TAX_CONFIG_DRIFT",
+        ConvertError::TaxCalc(_) => "INTERNAL",
+        ConvertError::SnapshotLoad { .. } => "LEDGER_CORRUPTION",
     }
 }
 

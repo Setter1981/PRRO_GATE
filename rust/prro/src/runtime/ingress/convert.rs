@@ -44,11 +44,15 @@ use super::dto::{
 };
 use crate::db::models::enums::DocType;
 use crate::db::models::ids::ShiftId;
-use crate::db::repositories::{fiscal_documents, node_state, payment_methods};
+use crate::db::repositories::{
+    fiscal_documents, node_state, payment_methods, signing_config_snapshots,
+};
+use crate::services::write_path::tax_summary::{ResolvedTaxGroup, TaxResolutionSnapshot};
+use crate::xml::{calc_tax, CalcTaxError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 
 /// The signer-ready payload + its canonical hash (over the CONVERTED
@@ -215,6 +219,30 @@ pub enum ConvertError {
 
     #[error("canonical JSON serialisation failed: {0}")]
     Serialise(#[from] serde_json::Error),
+
+    /// A Z-report per-tax-group turnover sum overflows i64 (W4-Z2 TXS).
+    #[error("ZReport TXS turnover overflow (tax group {tx})")]
+    ZReportTaxSumOverflow { tx: i64 },
+
+    /// The SAME canonical tax group resolved to CONFLICTING rates across the
+    /// shift's receipts (a mid-shift tax-config change) — the Z would mix rate
+    /// regimes.  Fail-closed → manual reconciliation (never auto-emit an
+    /// ambiguous Z).  Rare per operator empirics (config changes between shifts).
+    #[error(
+        "ZReport TXS: canonical tax group {tx} resolved to conflicting rates across shift receipts \
+         (mid-shift tax-config drift) — fail-closed to manual reconciliation"
+    )]
+    TaxSnapshotDriftInShift { tx: i64 },
+
+    /// `calc_tax` failed while computing a Z TXS tax sum (unsupported algorithm
+    /// / non-finite rate).  Fail-closed rather than sign a wrong tax total.
+    #[error("ZReport TXS tax calculation failed: {0}")]
+    TaxCalc(#[source] CalcTaxError),
+
+    /// A receipt's pinned `signing_config_snapshots` row could not be loaded
+    /// (missing / checksum mismatch / unsupported kind) while aggregating TXS.
+    #[error("ZReport TXS: failed to load signing_config_snapshot id={id}: {detail}")]
+    SnapshotLoad { id: i64, detail: String },
 }
 
 // ─── Signer-shape output structs (mirror stage_sign's private types) ──
@@ -273,6 +301,13 @@ struct CheckPaymentOut {
 #[derive(Serialize)]
 struct ZReportOut {
     payments: Vec<ZReportPaymentOut>,
+    // W4-Z2 (PR-Z1) — per-tax-group `<TXS>` turnover.  Empty → OMITTED from
+    // the payload (absent-when-empty is the DPS-accepted, spec-sanctioned form
+    // per `2026-05-26-w4-z1-dps-xml-wire-shape.md:329`); keeps the pre-W4-Z2
+    // payments-only payload byte-identical for the payment-only aggregation
+    // unit tests.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tax_summaries: Vec<ZReportTaxSumOut>,
     sell_count: u32,
     return_count: u32,
 }
@@ -283,6 +318,44 @@ struct ZReportPaymentOut {
     sum_in_kop: i64,
     sum_out_kop: i64,
     type_code: String,
+}
+
+/// W4-Z2 (PR-Z1) — one aggregated `<TXS>` tax-group row in the signer JSON.
+/// Mirrors `xml::ZReportTaxSummary` MINUS `ts_prefix` (the Z's date is a
+/// document property, stamped at `stage_sign::build_canonical_doc` from the
+/// header — not carried in the aggregated body).  `tx_short_form=true` leaves
+/// the rate fields empty (Python `_build_z_report:457-458` fallback).
+#[derive(Serialize)]
+struct ZReportTaxSumOut {
+    tx: i64,
+    tx_short_form: bool,
+    txpr: String,
+    txal: i64,
+    txty: i64,
+    dtpr: String,
+    smi: i64,
+    smo: i64,
+    txi: i64,
+    txo: i64,
+}
+
+/// Minimal view of a stored (converted) `CheckJson` — ONLY the `items` the Z
+/// TXS aggregation sums.  NOT `deny_unknown_fields` (ignores `payments` + the
+/// rest).  `items` is REQUIRED (piece-2a always emits it): a stored receipt
+/// payload that lacks it is corrupt — fail closed rather than silently emit a
+/// TXS-less Z (same posture as `StoredCheckPayments`).
+#[derive(Deserialize)]
+struct StoredCheckItems {
+    items: Vec<StoredItem>,
+}
+
+#[derive(Deserialize)]
+struct StoredItem {
+    /// Raw driver-side tax group (`tax_group_1` on the converted item).
+    /// Absent → the line carries no tax group → no `<TXS>` contribution.
+    #[serde(default)]
+    tax_group_1: Option<i64>,
+    sum_kop: i64,
 }
 
 /// Minimal view of a stored (converted) `CheckJson` — ONLY the payments
@@ -368,9 +441,147 @@ fn aggregate_zreport(receipts: &[(DocType, String)]) -> Result<ZReportOut, Conve
 
     Ok(ZReportOut {
         payments,
+        // TXS is derived separately (`derive_z_report_tax_summaries`) by the
+        // shift-aggregation caller, which has the per-doc tax snapshots; the
+        // pure payments aggregator leaves it empty.
+        tax_summaries: Vec::new(),
         sell_count,
         return_count,
     })
+}
+
+/// PR-Z1 (W4-Z2) — per-tax-group turnover (`<TXS>`) for the Z, aggregated from
+/// each issued receipt's stored `items` + its pinned tax snapshot.  PURE (no
+/// I/O — snapshots are pre-loaded by the caller; invariant #1).  Each item's
+/// `sum_kop` accumulates into its canonical tax group's SMI (SELL) / SMO
+/// (RETURN); the group's rate resolves via the receipt's OWN snapshot
+/// (`resolve_driver_number` → `to_calc_map`), so TXI/TXO use the SAME rate the
+/// receipt was signed with.  Full-form when the rate is known; short-form
+/// fallback (SMI/SMO/TX only) for an unresolved group (Python
+/// `_build_z_report:457-458`).  Mid-shift config drift (the SAME canonical tx
+/// resolving to CONFLICTING rates) is fail-closed → manual reconciliation.
+fn derive_z_report_tax_summaries(
+    receipts: &[(DocType, String, Option<i64>)],
+    snapshots: &HashMap<i64, TaxResolutionSnapshot>,
+) -> Result<Vec<ZReportTaxSumOut>, ConvertError> {
+    struct Accum {
+        smi: i64,
+        smo: i64,
+        /// The group's established resolution: `Some(rate)` = a configured
+        /// group (full-form), `None` = unresolved (short-form).  EVERY item
+        /// mapping to this canonical tx must match it (see the mixing guard).
+        rate: Option<ResolvedTaxGroup>,
+        /// Whether the first item has fixed this group's resolution.
+        established: bool,
+    }
+    let mut groups: BTreeMap<i64, Accum> = BTreeMap::new();
+
+    for (doc_type, payload_json, snap_id) in receipts {
+        let is_sell = match doc_type {
+            DocType::Sell => true,
+            DocType::Return => false,
+            other => return Err(ConvertError::UnexpectedShiftReceiptDocType(*other)),
+        };
+        let parsed: StoredCheckItems =
+            serde_json::from_str(payload_json).map_err(ConvertError::Serialise)?;
+        let snapshot = (*snap_id).and_then(|id| snapshots.get(&id));
+        let calc_map = snapshot.map(|s| s.to_calc_map());
+
+        for item in parsed.items {
+            let Some(driver_tx) = item.tax_group_1 else {
+                // No tax group on the line → no <TXS> contribution (Python skip).
+                continue;
+            };
+            // Resolve driver → canonical tx (identity when there is no snapshot
+            // or no driver mapping); rate is Some only when the group is a
+            // configured member of the receipt's snapshot.
+            let canonical_tx = snapshot
+                .and_then(|s| s.resolve_driver_number(driver_tx))
+                .unwrap_or(driver_tx);
+            let rate = calc_map
+                .as_ref()
+                .and_then(|m| m.get(&canonical_tx).cloned());
+
+            let accum = groups.entry(canonical_tx).or_insert(Accum {
+                smi: 0,
+                smo: 0,
+                rate: None,
+                established: false,
+            });
+            // Every item mapping to this canonical tx MUST resolve to the SAME
+            // rate — including the `None` (unresolved / short-form) vs `Some`
+            // (configured) distinction.  A divergence means the shift's receipts
+            // disagree on this group: a mid-shift tax-config change, OR a
+            // NULL-snapshot (pre-W4-Z2a) receipt mixed with a pinned one.  Either
+            // way the TXS row would be ambiguous — a rate applied to turnover it
+            // was not signed under — so fail-closed to manual reconciliation,
+            // never a silently-wrong Z.
+            if !accum.established {
+                accum.rate = rate;
+                accum.established = true;
+            } else if accum.rate != rate {
+                return Err(ConvertError::TaxSnapshotDriftInShift { tx: canonical_tx });
+            }
+            let target = if is_sell {
+                &mut accum.smi
+            } else {
+                &mut accum.smo
+            };
+            *target = target
+                .checked_add(item.sum_kop)
+                .ok_or(ConvertError::ZReportTaxSumOverflow { tx: canonical_tx })?;
+        }
+    }
+
+    let mut out = Vec::with_capacity(groups.len());
+    for (tx, accum) in groups {
+        match accum.rate {
+            Some(g) => {
+                // Full-form: TXI/TXO via calc_tax (0 when the side is empty —
+                // Python `:450-451`).
+                let txi = if accum.smi != 0 {
+                    calc_tax(accum.smi, g.txpr, g.dtpr, g.txal)
+                        .map_err(ConvertError::TaxCalc)?
+                        .0
+                } else {
+                    0
+                };
+                let txo = if accum.smo != 0 {
+                    calc_tax(accum.smo, g.txpr, g.dtpr, g.txal)
+                        .map_err(ConvertError::TaxCalc)?
+                        .0
+                } else {
+                    0
+                };
+                out.push(ZReportTaxSumOut {
+                    tx,
+                    tx_short_form: false,
+                    txpr: format!("{:.2}", g.txpr),
+                    txal: g.txal,
+                    txty: g.txty,
+                    dtpr: format!("{:.2}", g.dtpr),
+                    smi: accum.smi,
+                    smo: accum.smo,
+                    txi,
+                    txo,
+                });
+            }
+            // Short-form fallback: unconfigured group → SMI/SMO/TX only.
+            None => out.push(ZReportTaxSumOut {
+                tx,
+                tx_short_form: true,
+                txpr: String::new(),
+                txal: 0,
+                txty: 0,
+                dtpr: String::new(),
+                smi: accum.smi,
+                smo: accum.smo,
+                txi: 0,
+                txo: 0,
+            }),
+        }
+    }
+    Ok(out)
 }
 
 fn to_i64(value: u64, context: &'static str) -> Result<i64, ConvertError> {
@@ -616,7 +827,30 @@ pub async fn aggregate_z_payload_for_shift(
     let receipts = fiscal_documents::list_shift_issued_receipts(main_pool, fiscal_number, shift_id)
         .await
         .map_err(ConvertError::LedgerRead)?;
-    finalize(&aggregate_zreport(&receipts)?)
+    // Load each receipt's pinned tax snapshot once (dedup by id).  DB reads are
+    // pool-bound, OUTSIDE any write-tx — the pure aggregators do no I/O
+    // (invariant #1).
+    let mut snapshots: HashMap<i64, TaxResolutionSnapshot> = HashMap::new();
+    for (_, _, snap_id) in &receipts {
+        if let Some(id) = snap_id {
+            if !snapshots.contains_key(id) {
+                let snap = signing_config_snapshots::get_by_id(main_pool, *id)
+                    .await
+                    .map_err(|e| ConvertError::SnapshotLoad {
+                        id: *id,
+                        detail: e.to_string(),
+                    })?;
+                snapshots.insert(*id, snap);
+            }
+        }
+    }
+    let tax_summaries = derive_z_report_tax_summaries(&receipts, &snapshots)?;
+    // Payments reuse the pure payments-only aggregator; MOVE the payloads out
+    // (no clone) now that the snapshot ids are consumed above.
+    let two: Vec<(DocType, String)> = receipts.into_iter().map(|(d, p, _)| (d, p)).collect();
+    let mut out = aggregate_zreport(&two)?;
+    out.tax_summaries = tax_summaries;
+    finalize(&out)
 }
 
 /// RS-3 A1Z — resolve the FN's open shift (`node_state.current_shift_id`) then
