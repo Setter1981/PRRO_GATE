@@ -47,7 +47,7 @@ use crate::db::tx::with_immediate;
 use crate::xml::{
     build_canonical_xml, AdjustmentMode, CanonicalDoc, CheckItem, CheckLevelAdjustment,
     CheckLevelAdjustmentKind, CheckPayload, CheckPayment, DocumentHeader, LineAdjustment,
-    LineAdjustmentKind, ZReportCheckCount, ZReportPayload, ZReportPaymentSum,
+    LineAdjustmentKind, ZReportCheckCount, ZReportPayload, ZReportPaymentSum, ZReportTaxSummary,
 };
 
 use super::tax_summary::{derive_check_tax_summaries, TaxResolutionSnapshot};
@@ -963,6 +963,10 @@ struct CheckPaymentJson {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct ZReportJson {
     payments: Vec<ZReportPaymentSumJson>,
+    /// W4-Z2 (PR-Z1) — aggregated `<TXS>` tax-group turnover.  `#[serde(default)]`
+    /// so a pre-W4-Z2 minimal Z payload (no `tax_summaries` key) still parses.
+    #[serde(default)]
+    tax_summaries: Vec<ZReportTaxSumJson>,
     sell_count: u32,
     return_count: u32,
 }
@@ -974,6 +978,24 @@ struct ZReportPaymentSumJson {
     sum_in_kop: i64,
     sum_out_kop: i64,
     type_code: String,
+}
+
+/// W4-Z2 (PR-Z1) — one aggregated `<TXS>` row from the Z conversion layer.
+/// Mirrors `xml::ZReportTaxSummary` MINUS `ts_prefix` (the Z's date is stamped
+/// from the header at build time, not carried in the aggregated body).
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct ZReportTaxSumJson {
+    tx: i64,
+    tx_short_form: bool,
+    txpr: String,
+    txal: i64,
+    txty: i64,
+    dtpr: String,
+    smi: i64,
+    smo: i64,
+    txi: i64,
+    txo: i64,
 }
 
 enum TypedPayload {
@@ -1055,29 +1077,38 @@ fn build_canonical_doc(
             tax_resolution,
         )?)),
         (WireArtifactKind::ZReport, TypedPayload::ZReport(p)) => {
-            // AUDIT5-CRIT-2 — Z-report aggregation gap (deferred):
-            // `tax_summaries` / `service_sums` / `epz` are hardcoded
-            // empty here.  Adapter pathway does NOT exist yet
-            // (ZReportJson is intentionally minimal — see definition
-            // for the supported subset).  Z-report wire-shape
-            // verification today uses a HAND-BUILT
-            // `z_report_extended_doc()` in goldens_byte_equiv.rs
-            // bypassing this arm.
-            //
-            // W4-Z2 will extend ZReportJson with optional
-            // `tax_sums` / `service_sums` / `epz_totals`,
-            // resolve them through a NEW `derive_z_report_tax_
-            // summaries` helper (Python `:444-458` short-form
-            // fallback semantics, distinct from the check-level
-            // `derive_check_tax_summaries`), and replace these
-            // hardcoded Vec::new() / None bindings with the
-            // resolved aggregations.  Until then the field shape
-            // is byte-identical to the W4 minimal Z-report
-            // golden.
+            // W4-Z2 (PR-Z1) — TXS is now aggregated by the Z conversion layer
+            // (`convert::derive_z_report_tax_summaries`, Python `:444-458`
+            // short/full-form parity) and arrives in `p.tax_summaries`.  The Z's
+            // date (`<TXS TS=>`) is a DOCUMENT property — stamped here from the
+            // header, NOT carried in the aggregated body.  `service_sums` (IO)
+            // and `epz` stay empty: no service-op / card-acquiring ingress
+            // exists, so an ABSENT section is the DPS-accepted, spec-sanctioned
+            // form (`2026-05-26-w4-z1-dps-xml-wire-shape.md:329`; IO source is
+            // M5 work per §270, EPZ mapping deferred per §Q1 — do NOT synthesise
+            // present-but-zero sections here).
+            let ts_prefix = header.ts_str.get(..8).unwrap_or("").to_string();
+            let tax_summaries = p
+                .tax_summaries
+                .into_iter()
+                .map(|t| ZReportTaxSummary {
+                    tx: t.tx,
+                    tx_short_form: t.tx_short_form,
+                    txpr: t.txpr,
+                    txal: t.txal,
+                    txty: t.txty,
+                    dtpr: t.dtpr,
+                    smi: t.smi,
+                    smo: t.smo,
+                    txi: t.txi,
+                    txo: t.txo,
+                    ts_prefix: ts_prefix.clone(),
+                })
+                .collect();
             Ok(CanonicalDoc::ZReport(ZReportPayload {
                 header,
                 local_number,
-                tax_summaries: Vec::new(),
+                tax_summaries,
                 payments: p
                     .payments
                     .into_iter()
@@ -1173,6 +1204,33 @@ pub fn validate_signer_payload_shape_for_testing(
     parse_payload(kind, payload_json, total_sum_kop)
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// W4-Z2 (PR-Z1) — test seam: drive an AGGREGATED Z `payload_json` through the
+/// SAME private `parse_payload` + `build_canonical_doc` the signer uses, then
+/// emit the unsigned canonical XML.  Lets the aggregation-seam pins assert the
+/// full `aggregate → build_z_canonical → build_canonical_doc → XML` path
+/// (`<TXS>` bytes + `TS` stamped from the header + IO/EPZ absent) WITHOUT CMS
+/// signing.  `parse_payload` / `build_canonical_doc` stay private.
+///
+/// **Use**: tests / `test-support` only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn z_report_xml_from_json_for_testing(
+    header: DocumentHeader,
+    local_number: u32,
+    payload_json: &str,
+) -> Result<Vec<u8>, String> {
+    let payload =
+        parse_payload(WireArtifactKind::ZReport, payload_json, None).map_err(|e| e.to_string())?;
+    let doc = build_canonical_doc(
+        WireArtifactKind::ZReport,
+        header,
+        local_number,
+        payload,
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    build_canonical_xml(&doc).map_err(|e| e.to_string())
 }
 
 fn check_payload_from(
