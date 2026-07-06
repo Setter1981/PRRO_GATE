@@ -307,6 +307,44 @@ loop).
 - **clock / cert validity failure** — stale `business_ts` (`-8`-class date reject) or a cert
   outside its validity window. The smoke uses `iso_now()` for a fresh wire time.
 
+### A2.4 stale-`PROCESSING` (202-hang) — reaper NOT yet built (interim: manual re-drive)
+
+**Context (RS-3 A2.4 binding flip).** The write-path binding is now the live
+`InlineWritePath` (`supervisor.rs` DI root — `UnimplementedWritePath` is retired).
+Every real fiscal failure self-terminalises the inbox (REJECTED + audit) — the
+four-variant gate (`tests/a3_final_binding_flip.rs`) proves this. Fiscal safety is
+intact: a replay of a `PROCESSING` row NEVER re-fiscalizes (it resolves from the
+ledger → `202 IN_PROGRESS` or the accepted receipt), and an unknown-truth arm
+NEVER mis-terminalises a durably-`Sent` receipt as failed.
+
+**The gap (AUD-L2 Phase-1 arm-table, ruling 2).** A narrow set of STRUCTURAL-breach
+arms — an A4-unexpected inline `Noop`, a no-wire send race, or an `advance_to_ack`
+fault, EACH combined with an empty ledger — deliberately leave the inbox
+`PROCESSING` and return `500` (`REPLAY_LEDGER_DRIFT`). The design hands these to
+"B1/boot recovery owns convergence", but the **RS-3 stale-`PROCESSING` reaper is not
+yet implemented**. Until it lands, such a row hangs the client at `202 IN_PROGRESS`
+with no auto-convergence. These arms are unreachable on a healthy boot — they need
+a structural anomaly (a doc that vanished from the ledger, or a `Noop` that the
+unique-idempotency-key inbox insert already precludes).
+
+**Operator surface — watch for these CRITICAL audits (each names a stuck row):**
+- `INLINE_NOOP_UNEXPECTED` — an A4-unexpected inline `Noop`;
+- a structural-breach `REPLAY_LEDGER_DRIFT` 500 — inbox `PROCESSING` with no
+  terminal `fiscal_documents` doc.
+
+**Interim recovery (manual re-drive).** For a row stuck `PROCESSING` with no
+terminal doc:
+1. Confirm no accepted/terminal doc exists for the `request_id`
+   (`SELECT state FROM fiscal_documents WHERE request_id = ?`).
+2. ONLY if genuinely absent (a structural breach): under close supervision, an
+   operator may reset that inbox row `PROCESSING → NEW` so the next request
+   re-drives it, OR mark it terminal (REJECTED) so the receipt is re-submitted
+   with a NEW idempotency key. NEVER reset a row whose doc is `Sent`+ (that would
+   risk a double-fiscalize).
+
+**Pilot policy (RULING 2).** Build the reaper BEFORE a WIDE pilot. A
+close-supervision pilot MAY run with this manual surface as the interim.
+
 ### WL-1 — UNWIRED online shift-lifecycle drivers (key scope caveat)
 
 This smoke proves the **WIRE only**. The seeded-`PREPARED` drive **bypasses
