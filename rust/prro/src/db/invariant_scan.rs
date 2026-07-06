@@ -249,7 +249,8 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
                 });
             }
             // M2-01 (Fable-locked): the seed advances once per ISSUED doc.
-            // Online docs issue at ACK; offline-origin docs (offline_fiscal_no
+            // Online-origin docs issue at SEND (A.3 advance-at-SEND — see the
+            // A.3/C2 note below); offline-origin docs (offline_fiscal_no
             // NOT NULL) issue at OfflineLocalAck and stay "issued" through their
             // drain states — so they advance `expected` from OFFLINE_LOCAL_ACK
             // onward.  This validates the offline chain DURING the offline window

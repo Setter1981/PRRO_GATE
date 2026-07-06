@@ -18,7 +18,9 @@ const FN: &str = "5000000001";
 
 async fn migrated_pool() -> (tempfile::TempDir, SqlitePool) {
     let dir = tempfile::tempdir().unwrap();
-    let pool = prro::db::open_pool(&dir.path().join("m027.db")).await.unwrap();
+    let pool = prro::db::open_pool(&dir.path().join("m027.db"))
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
          VALUES (?, '12345678', 'test')",
@@ -88,7 +90,12 @@ async fn hazard_row_aborts_migration_027() {
 /// A KVT2 / RMR hazard variant also aborts (any non-ACK online-issued state).
 #[tokio::test]
 async fn hazard_row_non_ack_states_abort_migration_027() {
-    for state in ["KVT1", "KVT2", "REQUIRES_MANUAL_RECONCILIATION", "ERROR_RETRYABLE"] {
+    for state in [
+        "KVT1",
+        "KVT2",
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "ERROR_RETRYABLE",
+    ] {
         let (_dir, pool) = migrated_pool().await;
         insert_doc(&pool, 1, state, Some("70000002"), None).await;
         assert!(
@@ -120,8 +127,8 @@ async fn clean_db_passes_migration_027() {
 #[tokio::test]
 async fn legit_post_a3_sent_doc_not_reflagged_on_remigrate() {
     let (_dir, pool) = migrated_pool().await; // 027 already applied (clean)
-    // A healthy post-A.3 online-issued doc rests at SENT with sfn set — exactly
-    // the shape a PERMANENT check would false-flag.
+                                              // A healthy post-A.3 online-issued doc rests at SENT with sfn set — exactly
+                                              // the shape a PERMANENT check would false-flag.
     insert_doc(&pool, 1, "SENT", Some("70000005"), None).await;
 
     rerun_full_migrator(&pool)
