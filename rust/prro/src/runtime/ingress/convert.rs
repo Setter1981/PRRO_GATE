@@ -174,6 +174,25 @@ pub enum ConvertError {
         pay_index: i64,
     },
 
+    /// The command carries a non-null `return_check_number` (the original
+    /// receipt a RETURN references).  The compact `<C T=>` wire dialect the
+    /// gateway ships does NOT carry ORDERRETNUM — neither the 4-year Python
+    /// production serializer nor the WebCheck capture emit it (the verbose
+    /// `check01.xsd` has it optional, but that format is not what we send).
+    /// So there is no wire slot to honor the field; we FAIL CLOSED — same
+    /// posture as `raw_frames` / `acquirer_slip` — rather than silently drop
+    /// it (fail-open), which would leave the client falsely believing the
+    /// return is linked to the original until a tax audit.  Emitting it is a
+    /// FUTURE live-verified enhancement (verbose format / cashback class), NOT
+    /// data loss — no deployed client depends on drop semantics, so the typed
+    /// 422 is cleanly reversible into an emit path if DPS/law later requires
+    /// the link.
+    #[error(
+        "command carries a return_check_number; the compact <C T=> dialect does not carry \
+         ORDERRETNUM — fail-closed (a future live-verified enhancement), not silently dropped"
+    )]
+    ReturnCheckNumberNotSupported,
+
     /// `ZReport` / `ShiftClose` with no open shift — a Z closes the open
     /// shift; closing when none is open is a state-machine breach.
     #[error(
@@ -769,6 +788,15 @@ pub async fn convert_to_signer_payload(
         return Err(ConvertError::RawFramesNotSupported {
             count: cmd.payload.raw_frames.len(),
         });
+    }
+    // `return_check_number` (the original-receipt link a RETURN references)
+    // has no slot in the compact `<C T=>` wire dialect we ship (ORDERRETNUM is
+    // never emitted by the Python-prod / WebCheck reference serializers).
+    // Fail closed for EVERY doc-type if present — like `raw_frames`, hoisted
+    // ABOVE the match — rather than accept-and-drop it (fail-open).  See
+    // `ConvertError::ReturnCheckNumberNotSupported` for the full ground-truth.
+    if cmd.return_check_number.is_some() {
+        return Err(ConvertError::ReturnCheckNumberNotSupported);
     }
     match cmd.command_type {
         CommandType::ShiftOpen => finalize(&ShiftOpenOut { opening_sum_kop: 0 }),
