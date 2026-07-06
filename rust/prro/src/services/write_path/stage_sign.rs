@@ -84,6 +84,19 @@ pub enum SignError {
         observed: DocState,
         document_id: DocumentId,
     },
+    /// A.3 PR-C (D5 gate, design v3 §6 step 7) — refused to sign because an
+    /// OLDER non-issued sibling rests on this FN (the ER-parked interleave:
+    /// the blocker later advances the seed, so this doc's chain-`previous_hash`
+    /// would go stale AFTER the wire call → the drift-assert fires too late).
+    /// Fail-closed: the pin-tx rolled back, the doc stays `PREPARED` (no pin,
+    /// no crypto, no files) — no worse than it was.  RETRYABLE — the
+    /// `online_convergence` resolver re-drives the blocker; the client retries
+    /// once the FN un-gates (mapped to 503, NOT the structural 500 default).
+    #[error("stage 3-PRE D5 gate: doc {document_id:?} on fn {fiscal_number} blocked by an older non-issued sibling")]
+    D5GateBlocked {
+        document_id: DocumentId,
+        fiscal_number: String,
+    },
     /// W4-Z2a piece 8a (CRIT-1 close per spec rule #14): caller's
     /// `signing_config_snapshot_id = Some(caller)` differs from
     /// the persisted `Some(existing)`.  Fail-loud drift surface —
@@ -250,6 +263,21 @@ pub async fn run(
                 });
             }
 
+            // A.3 PR-C (D5 gate) — fail-closed refusal to sign while an
+            // OLDER non-issued sibling rests on this FN.  This is the pin-tx
+            // enforcement layer (MANDATORY: boot `dispatch_prepared_via_chain`
+            // enters sign BYPASSING acquire, so the acquire-level refuse alone
+            // is not enough).  Self-excluded; only `lnd < self.lnd` blocks
+            // (chain-head / boot lnd-ASC re-drive passes → no boot deadlock).
+            // Runs BEFORE the pin UPDATE and the 3-NO-TX crypto sign, so a
+            // block rolls the pin-tx back with ZERO side effects (doc stays
+            // PREPARED, unpinned, no crypto).  One SELECT (INV #1).
+            if fd::exists_blocking_non_issued_sibling_tx(tx, &fn_id, Some(doc_id), Some(lnd))
+                .await?
+            {
+                return Ok(PinResult::D5GateBlocked);
+            }
+
             // W4-Z2a piece 8a — fail-loud drift surface.  If the
             // caller passes `Some(caller)` AND existing FK is
             // `Some(existing != caller)`, reject BEFORE the pin
@@ -357,6 +385,12 @@ pub async fn run(
             return Err(SignError::StateConflict {
                 observed,
                 document_id: doc_id,
+            })
+        }
+        PinResult::D5GateBlocked => {
+            return Err(SignError::D5GateBlocked {
+                document_id: doc_id,
+                fiscal_number: fn_id.clone(),
             })
         }
         PinResult::SnapshotIdMismatch { existing, caller } => {
@@ -741,6 +775,9 @@ enum PinResult {
     StateConflict {
         observed: DocState,
     },
+    /// A.3 PR-C (D5 gate) — an older non-issued sibling rests on this FN;
+    /// the pin-tx refuses fail-closed (rollback → doc stays PREPARED).
+    D5GateBlocked,
     /// W4-Z2a piece 8a (CRIT-1 close per spec rule #14): the
     /// caller's `signing_config_snapshot_id` is `Some(caller)` but
     /// the persisted row has `Some(existing)` with `existing != caller`.

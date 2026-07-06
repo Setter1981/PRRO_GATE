@@ -1237,3 +1237,300 @@ async fn stage3_runtime_byte_equiv_zn_zero_for_nonz_artifact() {
             && String::from_utf8_lossy(&xml2).contains(&format!(r#"FN="{FN}""#))
     );
 }
+
+// ════════════════════════════════════════════════════════════════════
+// A.3 PR-C — D5 gate (sign layer): the pin-tx fail-closed assert.
+//
+// The worker must NOT sign doc2 while an OLDER non-issued sibling rests
+// on the FN (its chain-prev would go stale AFTER the wire call → the
+// drift-assert fires too late).  The gate lives INSIDE stage_sign's
+// 3-PRE pin-tx (so the boot `dispatch_prepared_via_chain` path, which
+// enters sign BYPASSING acquire, is covered too): on a block it returns
+// a typed error, the pin-tx rolls back, and the doc stays PREPARED
+// (no pin, no crypto, no files) — "no worse than it was".
+//
+// Blocker cohort (predicate = non-terminal AND NOT is_issued):
+//   {PREPARED, SIGNED, ENCRYPTED, SENDING, ERROR_RETRYABLE} ∩ !is_issued.
+// Transparent (issued OR terminal): SENT-Hold / KVT1 / KVT2 /
+// OFFLINE_LOCAL_ACK backlog / offline-ER.
+// Anti-deadlock: only siblings with `lnd < self.lnd` block (chain-head
+// / boot lnd-ASC re-drive passes); self-excluded (document_id != self).
+// ════════════════════════════════════════════════════════════════════
+
+/// Seed a sibling doc directly in an arbitrary state (bypassing the
+/// write path) to exercise the gate's blocker predicate.  Reuses the
+/// known-good PREPARED insert (incl. the inbox row) then morphs
+/// state / server_fiscal_no / offline_fiscal_no — the three inputs to
+/// `is_issued`.  `offline_fiscal_no = Some(_)` also flips fs_mode to
+/// OFFLINE (offline-origin).
+async fn seed_sibling_doc(
+    pool: &sqlx::SqlitePool,
+    state: &str,
+    lnd: i64,
+    server_fiscal_no: Option<&str>,
+    offline_fiscal_no: Option<i64>,
+) -> DocumentId {
+    let (doc_id, _req) = seed_prepared_doc(
+        pool,
+        DocType::Sell,
+        check_payload_json(),
+        dummy_payload_sha256(),
+        lnd,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE fiscal_documents \
+         SET state = ?, server_fiscal_no = ?, offline_fiscal_no = ?, fs_mode = ? \
+         WHERE document_id = ?",
+    )
+    .bind(state)
+    .bind(server_fiscal_no)
+    .bind(offline_fiscal_no)
+    .bind(if offline_fiscal_no.is_some() {
+        "OFFLINE"
+    } else {
+        "ONLINE"
+    })
+    .bind(doc_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    doc_id
+}
+
+/// Build a WorkerContext for signing a freshly-seeded PREPARED SELL doc
+/// at an arbitrary lnd (the harness `make_worker_context` hardcodes
+/// lnd=1; the gate reads `document.lnd` as self.lnd).
+fn sell_worker_ctx(doc_id: DocumentId, req: [u8; 16], lnd: i64) -> WorkerContext {
+    let mut wc = make_worker_context(
+        doc_id,
+        req,
+        DocType::Sell,
+        DocState::Prepared,
+        check_payload_json(),
+        Some(15000),
+    );
+    wc.document.lnd = lnd;
+    wc
+}
+
+async fn seed_gate_base(pool: &sqlx::SqlitePool) {
+    seed_fn(pool).await;
+    let shift_id = seed_open_shift(pool).await;
+    seed_node_state(pool, Some(shift_id), None).await;
+}
+
+// (a) BLOCK: an older online-ER sibling gates the sign of doc2.
+#[tokio::test]
+async fn d5gate_sign_blocked_by_older_online_er_sibling() {
+    let _guard = serial_lock().await;
+    test_hook::reset();
+    let pool = fresh_pool().await;
+    seed_gate_base(&pool).await;
+    // Blocker: online-origin ERROR_RETRYABLE (no sfn, no ofn) → non-issued.
+    seed_sibling_doc(&pool, "ERROR_RETRYABLE", 1, None, None).await;
+    let (doc2, req2) = seed_prepared_doc(
+        &pool,
+        DocType::Sell,
+        check_payload_json(),
+        dummy_payload_sha256(),
+        2,
+    )
+    .await;
+
+    let spy = SpyCrypto::new();
+    let ctx = signing_ctx(spy.clone());
+    let result = stage_sign::run(&pool, &ctx, sell_worker_ctx(doc2, req2, 2)).await;
+
+    assert!(
+        matches!(result, Err(SignError::D5GateBlocked { .. })),
+        "gate must refuse doc2 with a typed D5GateBlocked; got {result:?}"
+    );
+    // Fail-closed: doc2 stays PREPARED, unpinned, no files, no crypto.
+    assert_eq!(doc_state(&pool, doc2).await, DocState::Prepared);
+    assert_eq!(document_files_count(&pool, doc2).await, 0);
+    let (prev, _z, pinned_at, _uh) = doc_signing_inputs(&pool, doc2).await;
+    assert!(
+        prev.is_none() && pinned_at.is_none(),
+        "no pin on gate block"
+    );
+    assert_eq!(
+        spy.sign_count.load(Ordering::Acquire),
+        0,
+        "crypto MUST NOT run before the gate (pin-tx assert precedes 3-NO-TX sign)"
+    );
+}
+
+// (b) TRANSPARENT ×4: an ISSUED / terminal sibling never gates doc2.
+async fn assert_transparent(state: &str, sfn: Option<&str>, ofn: Option<i64>, label: &str) {
+    let _guard = serial_lock().await;
+    test_hook::reset();
+    let pool = fresh_pool().await;
+    seed_gate_base(&pool).await;
+    seed_sibling_doc(&pool, state, 1, sfn, ofn).await;
+    let (doc2, req2) = seed_prepared_doc(
+        &pool,
+        DocType::Sell,
+        check_payload_json(),
+        dummy_payload_sha256(),
+        2,
+    )
+    .await;
+
+    let spy = SpyCrypto::new();
+    let ctx = signing_ctx(spy.clone());
+    let result = stage_sign::run(&pool, &ctx, sell_worker_ctx(doc2, req2, 2)).await;
+
+    assert!(
+        result.is_ok(),
+        "gate must be transparent for {label}; got {result:?}"
+    );
+    assert_eq!(
+        doc_state(&pool, doc2).await,
+        DocState::Signed,
+        "{label}: doc2 must sign"
+    );
+}
+
+#[tokio::test]
+async fn d5gate_sign_transparent_for_sent_hold() {
+    assert_transparent("SENT", Some("777"), None, "SENT-Hold (online issued)").await;
+}
+#[tokio::test]
+async fn d5gate_sign_transparent_for_kvt1() {
+    assert_transparent("KVT1", Some("778"), None, "KVT1 (online issued)").await;
+}
+#[tokio::test]
+async fn d5gate_sign_transparent_for_offline_local_ack_backlog() {
+    assert_transparent(
+        "OFFLINE_LOCAL_ACK",
+        None,
+        Some(5),
+        "OFFLINE_LOCAL_ACK backlog (offline issued)",
+    )
+    .await;
+}
+#[tokio::test]
+async fn d5gate_sign_transparent_for_offline_er() {
+    // ERROR_RETRYABLE is in the blocking state-set, but offline-origin ER
+    // is issued (crossed OFFLINE_LOCAL_ACK) → is_issued filters it out.
+    // This case specifically pins the is_issued() filter (not the state IN).
+    assert_transparent(
+        "ERROR_RETRYABLE",
+        None,
+        Some(6),
+        "offline-ER (offline issued)",
+    )
+    .await;
+}
+
+// (c) SELF-EXCLUSION: re-driving the blocker itself passes (a doc in a
+//     blocking state does not gate its OWN signing).
+#[tokio::test]
+async fn d5gate_sign_self_exclusion_head_passes() {
+    let _guard = serial_lock().await;
+    test_hook::reset();
+    let pool = fresh_pool().await;
+    seed_gate_base(&pool).await;
+    // The ONLY doc on the FN is a PREPARED (blocking-class) doc at lnd=1.
+    let (doc1, req1) = seed_prepared_doc(
+        &pool,
+        DocType::Sell,
+        check_payload_json(),
+        dummy_payload_sha256(),
+        1,
+    )
+    .await;
+
+    let spy = SpyCrypto::new();
+    let ctx = signing_ctx(spy.clone());
+    let result = stage_sign::run(&pool, &ctx, sell_worker_ctx(doc1, req1, 1)).await;
+
+    assert!(
+        result.is_ok(),
+        "a doc must not gate its own signing; got {result:?}"
+    );
+    assert_eq!(doc_state(&pool, doc1).await, DocState::Signed);
+}
+
+// (d) LND-ORDER: two non-issued docs — head (smaller lnd) passes, tail
+//     (larger lnd) is gated by the head.  This is the boot anti-deadlock
+//     guarantee (boot re-drives lnd-ASC; the head must clear first).
+#[tokio::test]
+async fn d5gate_sign_lnd_order_head_passes_tail_gated() {
+    let _guard = serial_lock().await;
+    test_hook::reset();
+    let pool = fresh_pool().await;
+    seed_gate_base(&pool).await;
+    // Head: PREPARED lnd=1 (non-issued).  Tail: PREPARED lnd=2 (non-issued).
+    let (head, head_req) = seed_prepared_doc(
+        &pool,
+        DocType::Sell,
+        check_payload_json(),
+        dummy_payload_sha256(),
+        1,
+    )
+    .await;
+    let (tail, tail_req) = seed_prepared_doc(
+        &pool,
+        DocType::Sell,
+        check_payload_json(),
+        dummy_payload_sha256(),
+        2,
+    )
+    .await;
+
+    let spy = SpyCrypto::new();
+    let ctx = signing_ctx(spy.clone());
+
+    // Tail is gated by the older head.
+    let tail_res = stage_sign::run(&pool, &ctx, sell_worker_ctx(tail, tail_req, 2)).await;
+    assert!(
+        tail_res.is_err(),
+        "tail must be gated by older non-issued head; got {tail_res:?}"
+    );
+    assert_eq!(doc_state(&pool, tail).await, DocState::Prepared);
+
+    // Head has no older sibling → passes.
+    let head_res = stage_sign::run(&pool, &ctx, sell_worker_ctx(head, head_req, 1)).await;
+    assert!(
+        head_res.is_ok(),
+        "head (smallest lnd) must pass; got {head_res:?}"
+    );
+    assert_eq!(doc_state(&pool, head).await, DocState::Signed);
+}
+
+// (f) BOOT PATH: the gate is in the pin-tx, so a doc re-driven WITHOUT
+//     going through stage_acquire (the boot `dispatch_prepared_via_chain`
+//     entry calls stage_sign::run directly, exactly as this test does)
+//     still hits the assert.
+#[tokio::test]
+async fn d5gate_sign_boot_path_bypassing_acquire_still_gated() {
+    let _guard = serial_lock().await;
+    test_hook::reset();
+    let pool = fresh_pool().await;
+    seed_gate_base(&pool).await;
+    // A crashed-then-rebooted ledger: an older online-ER blocker at lnd=1
+    // and a PREPARED doc at lnd=2 seeded directly (no acquire ran).
+    seed_sibling_doc(&pool, "ERROR_RETRYABLE", 1, None, None).await;
+    let (doc2, req2) = seed_prepared_doc(
+        &pool,
+        DocType::Sell,
+        check_payload_json(),
+        dummy_payload_sha256(),
+        2,
+    )
+    .await;
+
+    let spy = SpyCrypto::new();
+    let ctx = signing_ctx(spy.clone());
+    // stage_sign::run IS the boot dispatch entry point (no acquire).
+    let result = stage_sign::run(&pool, &ctx, sell_worker_ctx(doc2, req2, 2)).await;
+
+    assert!(
+        result.is_err(),
+        "boot re-drive must be gated in the pin-tx; got {result:?}"
+    );
+    assert_eq!(doc_state(&pool, doc2).await, DocState::Prepared);
+    assert_eq!(spy.sign_count.load(Ordering::Acquire), 0);
+}

@@ -942,6 +942,61 @@ pub fn is_issued(
     }
 }
 
+/// **A.3 PR-C (D5 gate, design v3 §6 step 7)** — does an OLDER non-issued
+/// sibling rest on this FN?  The D4-complement predicate:
+///
+///   `∃ other doc on FN` in a non-terminal in-flight state
+///   {`PREPARED`, `SIGNED`, `ENCRYPTED`, `SENDING`, `ERROR_RETRYABLE`}
+///   that is NOT [`is_issued`].
+///
+/// Signing (or minting) a successor while such a doc rests would stale the
+/// successor's chain-`previous_hash` AFTER the wire call — the blocker
+/// later advances the seed, so the drift-assert fires too late (past the
+/// point of fiscal commitment).  The gate refuses fail-closed instead.
+///
+/// Transparent for ISSUED rows (online `SENT`/`KVT1`/`KVT2` carry sfn;
+/// offline `OFFLINE_LOCAL_ACK` and offline-`ERROR_RETRYABLE` are in
+/// [`OFFLINE_ISSUED_STATES`]) and for DEAD-terminal rows
+/// (`REJECTED`/`ABORTED`/`CANCELLED`/`RMR`, not in the state set).  It
+/// reuses the single [`is_issued`] predicate verbatim, so the gate cannot
+/// drift from the MAC-walk / boot-seed projection.
+///
+/// - `self_document_id`: excluded from the scan (`None` at acquire — the
+///   successor is not yet minted, so no self row exists).
+/// - `self_lnd`: only rows with `lnd < self_lnd` block — the anti-deadlock
+///   rule (the chain-head passes; boot re-drive runs lnd-ASC so the head
+///   clears first).  `None` at acquire (no lnd yet) → ANY non-issued
+///   sibling blocks (a brand-new doc is younger than every sibling).
+///
+/// One SELECT (INV #1): the FN / state / self / lnd filter is pushed into
+/// SQL; only the `is_issued` discriminator (offline-vs-online
+/// `ERROR_RETRYABLE`) runs in-Rust over the small candidate set.
+pub async fn exists_blocking_non_issued_sibling_tx(
+    tx: &mut WriteTxConn<'_>,
+    fiscal_number: &str,
+    self_document_id: Option<DocumentId>,
+    self_lnd: Option<i64>,
+) -> sqlx::Result<bool> {
+    let candidates: Vec<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT state, offline_fiscal_no, server_fiscal_no \
+         FROM fiscal_documents \
+         WHERE fiscal_number = ? \
+           AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','ERROR_RETRYABLE') \
+           AND (? IS NULL OR document_id != ?) \
+           AND (? IS NULL OR lnd < ?)",
+    )
+    .bind(fiscal_number)
+    .bind(self_document_id)
+    .bind(self_document_id)
+    .bind(self_lnd)
+    .bind(self_lnd)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(candidates
+        .iter()
+        .any(|(state, ofn, sfn)| !is_issued(state, *ofn, sfn.as_deref())))
+}
+
 /// **AUD-L6-1 (FT, 2026-06-14)** — the `unsigned_xml_sha256` of the FN's
 /// highest-`lnd` EVER-ISSUED doc: online `ACK` OR offline-origin in any
 /// [`OFFLINE_ISSUED_STATES`] state (`offline_fiscal_no IS NOT NULL`).  This is

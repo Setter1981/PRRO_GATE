@@ -57,6 +57,11 @@ pub(crate) mod codes {
     pub const NODE_STOP_MODE: &str = "NODE_STOP_MODE";
     pub const NODE_CRYPTO_DEGRADED: &str = "NODE_CRYPTO_DEGRADED";
     pub const NODE_GOING_ONLINE: &str = "NODE_GOING_ONLINE";
+    /// A.3 PR-C (D5 gate) — an older non-issued sibling rests on the FN, so
+    /// the write path (acquire pre-mint OR sign pin-tx) refused fail-closed.
+    /// RETRYABLE/transient (the `online_convergence` resolver re-drives the
+    /// blocker, then the client retries) → 503, NOT terminal.
+    pub const WRITE_GATE_SIBLING_PENDING: &str = "WRITE_GATE_SIBLING_PENDING";
 
     // ── Internal → 500 (structural/runtime breaches; → 500 via the handler's
     //    `_ => 500` fallback except SHIFT_MANUAL_RECON which is explicit) ──
@@ -194,6 +199,13 @@ pub(crate) fn map_rejection(reason: &RejectionReason, request_id: [u8; 16]) -> F
 pub(crate) fn map_sign_error(err: &SignError, request_id: [u8; 16]) -> FiscalError {
     match err {
         SignError::Crypto(_) => FiscalError::SignFailure { request_id },
+        // A.3 PR-C (D5 gate) — a transient RETRYABLE refusal (an older
+        // non-issued sibling rests; the resolver clears it).  503 via
+        // OfflineRefused (the retryable-transient class), NOT the structural
+        // 500 default — the client should retry, not treat it as a breach.
+        SignError::D5GateBlocked { .. } => {
+            node_refused(request_id, codes::WRITE_GATE_SIBLING_PENDING)
+        }
         _ => internal(request_id, codes::SIGN_INTERNAL),
     }
 }
@@ -379,6 +391,7 @@ mod tests {
             codes::NODE_STOP_MODE,
             codes::NODE_CRYPTO_DEGRADED,
             codes::NODE_GOING_ONLINE,
+            codes::WRITE_GATE_SIBLING_PENDING,
         ] {
             assert_eq!(http(c), 503, "{c} must route to 503 (OfflineRefused)");
         }
