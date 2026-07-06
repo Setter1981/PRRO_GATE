@@ -37,7 +37,7 @@ use crate::db::models::enums::{Protocol, Severity};
 use crate::db::models::ids::DriverId;
 use crate::db::repositories::audit_log;
 use crate::runtime::bindings::BindingsRegistry;
-use crate::runtime::ingress::inline_binding::InlineWritePath;
+use crate::runtime::ingress::inline_binding::production_write_path;
 use crate::runtime::ingress::preflight::preflight_d1_slots;
 use crate::runtime::ingress::seam::WritePathEntry;
 use crate::runtime::ingress::server::{self, IngressState};
@@ -173,6 +173,24 @@ where
         );
     }
 
+    // RS-3 inbox-reaper — BOOT SWEEP (after reconcile, BEFORE bind/serve).  No
+    // live fiscalize can race it here, so it runs with NO age-gate (min_age =
+    // None): every stale NEW/PROCESSING row is converged to a terminal inbox
+    // status (terminalise-only, D-R1) so a replay answers honestly instead of a
+    // 202-forever.  Non-fatal: a sweep error is logged; the runtime tick retries.
+    match crate::services::reconciliation::inbox_reaper::sweep(app.db(), None).await {
+        Ok(reaped) => tracing::info!(
+            target: "prro::runtime::supervisor",
+            ?reaped,
+            "supervisor: boot inbox-reaper sweep complete"
+        ),
+        Err(e) => tracing::error!(
+            target: "prro::runtime::supervisor",
+            error = ?e,
+            "supervisor: boot inbox-reaper sweep failed (non-fatal; runtime tick retries)"
+        ),
+    }
+
     // ── RS-2 piece-5b-ii: ingress startup preflight + bind (BEFORE any spawn) ──
     // A loopback-guard (D2) / D1-preflight / bind failure here is a BOOT
     // failure — it returns Err before ANY task is spawned, so a misconfigured
@@ -194,18 +212,20 @@ where
     // downgrade back to `UnimplementedWritePath` is a code revert, and MUST only
     // be taken after QUIESCING the FN to a terminal state (no doc resting past
     // the first advance-at-SENT) — never mid-flight.
-    // KNOWN GAP (RULING 2, AUD-L2 Phase-1 arm-table): the RS-3 stale-`PROCESSING`
-    // reaper is NOT yet built.  A structural-breach arm (an A4-unexpected inline
-    // Noop / a no-wire race / an `advance_to_ack` fault, each with an empty
-    // ledger) leaves the inbox `PROCESSING` and the client polling `202
-    // IN_PROGRESS` — NEVER a double-fiscalize (replay resolves from the ledger)
-    // and NEVER a mis-terminalised `Sent` receipt (unknown truth is never
-    // rejected).  Operator surface: the `INLINE_NOOP_UNEXPECTED` + structural-
-    // breach CRITICAL audits; interim recovery: the manual re-drive procedure in
-    // the live-DPS runbook.  Build the reaper BEFORE a wide pilot (a
-    // close-supervision pilot's manual surface is acceptable).
+    // CLOSED-BY-REAPER (RULING 2): the RS-3 stale-`PROCESSING`/`NEW` reaper is now
+    // wired — a BOOT sweep above (before this bind) + the `spawn_reaper_loop`
+    // runtime tick converge a structural-breach row (an A4-unexpected inline Noop
+    // / a no-wire race / an `advance_to_ack` fault / a pre-lease binding failure)
+    // to a TERMINAL inbox status, so a replay answers honestly instead of a
+    // `202 IN_PROGRESS`-forever.  TERMINALISE-ONLY (D-R1): the reaper NEVER
+    // re-fiscalizes (an auto re-drive would phantom a second fiscal check for one
+    // physical sale) and NEVER mis-terminalises an in-flight/`Sent` doc (recon
+    // owns it).  See `services::reconciliation::inbox_reaper`.
+    // finding-2 pin: the DI root binds via the SINGLE named production factory
+    // (behaviourally pinned in `tests/a3_final_binding_flip.rs` — a revert to
+    // `UnimplementedWritePath` fails the pin, which a raw `Arc::new` swap did not).
     let write_path: Arc<dyn WritePathEntry> =
-        Arc::new(InlineWritePath::new(app.clone(), Arc::clone(&registry)));
+        production_write_path(app.clone(), Arc::clone(&registry));
     let bound_ingress = bind_rest_ingress(&app, &write_path).await?;
 
     // ── 5d: spawn the drain + return-online tick loops ──
@@ -280,6 +300,13 @@ where
         Duration::from_secs(converge_secs),
         shutdown_rx.clone(),
     );
+    // RS-3 inbox-reaper loop — not per-FN (inbox-global), unconditional, fixed
+    // interval (no config knob, D6).  Complements the boot sweep above.
+    let reaper_handle = spawn_reaper_loop(
+        app.clone(),
+        crate::services::reconciliation::inbox_reaper::REAPER_TICK_INTERVAL,
+        shutdown_rx.clone(),
+    );
     // RS-4 backup loop — not per-FN (no registry/fn_ids), conditional on the
     // `[backup] enabled` switch.
     let backup_handle = if backup_enabled {
@@ -305,6 +332,7 @@ where
         SupervisedTask::runs_until_shutdown("drain", drain_handle),
         SupervisedTask::runs_until_shutdown("probe", probe_handle),
         SupervisedTask::runs_until_shutdown("online-convergence", convergence_handle),
+        SupervisedTask::runs_until_shutdown("inbox-reaper", reaper_handle),
     ];
     if let Some(handle) = backup_handle {
         tasks.push(SupervisedTask::runs_until_shutdown("backup", handle));
@@ -1076,6 +1104,53 @@ fn spawn_backup_loop(
                 }
                 _ = iv.tick() => {
                     backup_tick(&app, &mut first_tick).await;
+                }
+            }
+        }
+    })
+}
+
+/// RS-3 inbox-reaper runtime tick — an age-gated sweep on a fixed interval (NOT
+/// per-FN; the reaper is inbox-global).  Mirrors [`spawn_backup_loop`]: errors
+/// are swallowed inside the tick body (the sweep is idempotent — the next tick
+/// retries), so this loop returns `Ok(())` ONLY on shutdown (F1).  Closes the
+/// runtime-structural 202-hang edges (an A4-unexpected inline Noop / an
+/// `advance_to_ack` fault / a pre-lease binding failure) without a reboot.
+fn spawn_reaper_loop(
+    app: App,
+    interval: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<anyhow::Result<()>> {
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        tracing::info!(target: "prro::runtime::supervisor", "inbox-reaper loop: shutdown; exiting");
+                        return Ok(());
+                    }
+                }
+                _ = iv.tick() => {
+                    match crate::services::reconciliation::inbox_reaper::sweep(
+                        app.db(),
+                        Some(crate::services::reconciliation::inbox_reaper::REAPER_STALE_THRESHOLD),
+                    )
+                    .await
+                    {
+                        Ok(reaped) => tracing::debug!(
+                            target: "prro::runtime::supervisor",
+                            ?reaped,
+                            "inbox-reaper tick complete"
+                        ),
+                        Err(e) => tracing::error!(
+                            target: "prro::runtime::supervisor",
+                            error = ?e,
+                            "inbox-reaper tick failed (swallowed; retries next tick)"
+                        ),
+                    }
                 }
             }
         }

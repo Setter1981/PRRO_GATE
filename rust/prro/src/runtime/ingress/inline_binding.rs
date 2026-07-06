@@ -38,6 +38,16 @@ impl InlineWritePath {
     }
 }
 
+/// RS-3 A2.4 finding-2 pin — the SINGLE production write-path construction site.
+/// The supervisor DI root calls THIS (not an inline `Arc::new(...)`) so the
+/// binding choice is behaviourally testable: `production_write_path(..).fiscalize`
+/// must NEVER return `NotImplemented`.  A revert of the flip (back to
+/// `UnimplementedWritePath`) here fails the DI pin
+/// (`tests/a3_final_binding_flip.rs`).
+pub fn production_write_path(app: App, registry: Arc<BindingsRegistry>) -> Arc<dyn WritePathEntry> {
+    Arc::new(InlineWritePath::new(app, registry))
+}
+
 #[async_trait]
 impl WritePathEntry for InlineWritePath {
     async fn fiscalize(&self, row: &InboxRow) -> Result<FiscalOutcome, FiscalError> {
