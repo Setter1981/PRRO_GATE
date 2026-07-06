@@ -343,10 +343,12 @@ impl FuzzCtx {
         doc_state_from_str(&s)
     }
 
-    /// The raw `doc_type` column of the single doc on the FN (panics if not
-    /// exactly one).  The chain differential cannot distinguish a SELL from a
-    /// RETURN (chain-identical), so PR-R-fuzz pins the wire doc-type directly
-    /// here (raw string — no typed decode needed for a `"SELL"`/`"RETURN"` pin).
+    /// The raw `doc_type` column of the sole doc on the FN — `fetch_one` errors
+    /// if there is no row (and takes the first if there were several); the
+    /// single-op pins that call this leave exactly one row.  The chain
+    /// differential cannot distinguish a SELL from a RETURN (chain-identical),
+    /// so PR-R-fuzz pins the wire doc-type directly here (raw string — no typed
+    /// decode needed for a `"SELL"`/`"RETURN"` pin).
     pub async fn only_doc_type(&self) -> String {
         sqlx::query_scalar("SELECT doc_type FROM fiscal_documents WHERE fiscal_number = ?")
             .bind(self.fn_id.as_str())

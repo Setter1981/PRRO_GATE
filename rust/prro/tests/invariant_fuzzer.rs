@@ -449,6 +449,52 @@ async fn online_return_produces_a_genuine_return_doc() {
     );
 }
 
+/// PR-R-fuzz — the OFFLINE lane also drives a GENUINE `RETURN` doc (symmetry
+/// with the online genuine-return pin; `build_canonical` maps
+/// operation_type→doc_type mode-independently).
+#[tokio::test]
+async fn offline_return_produces_a_genuine_return_doc() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let outcome = interp::run_op(&mut ctx, &Op::OfflineReturn).await;
+    assert!(
+        matches!(outcome, interp::RealOutcome::Doc(_)),
+        "an OFFLINE RETURN must issue a doc, got {outcome:?}"
+    );
+    assert_eq!(
+        ctx.only_doc_type().await,
+        "RETURN",
+        "the offline fuzzer lane must drive a genuine RETURN, not a mislabeled SELL"
+    );
+}
+
+/// PR-R-fuzz — a DPS-rejected online RETURN mints a NON-ISSUED `Rejected` row
+/// (lnd consumed, seed NOT advanced) → the model's `NoIssuanceRow`, the same
+/// `Sending→Rejected` branch a rejected SELL takes.  Exercises the reject
+/// differential arm for a RETURN (the ack-path / D5 pins do not).
+#[tokio::test]
+async fn online_return_reject_matches_model_no_issuance_row() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(
+        &[Op::OnlineReturn(DpsScript::send_then_reject())],
+        ctx,
+        model,
+    )
+    .await;
+}
+
+/// PR-R-fuzz — a BadHashPrev online RETURN routes to the bounded W10.4
+/// MAC-recovery path exactly like its SELL twin (doc-type-agnostic, symmetry
+/// (c)): the model Fault-defers and run_harness's D4 send-delta bound (now
+/// scoped to OnlineSell|OnlineReturn) asserts no unbounded resend.  Exercises
+/// the extended D4 gate for a RETURN.
+#[tokio::test]
+async fn online_return_bad_hash_prev_within_d4_bound() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(&[Op::OnlineReturn(DpsScript::bad_hash_prev())], ctx, model).await;
+}
+
 /// PR-R-fuzz (anti-silent-zero) — the generator ACTUALLY emits both Return ops
 /// over a large deterministic draw, so Return / mixed sequences are really
 /// exercised by the property harness.  A dropped or zero weight makes this RED
@@ -469,15 +515,19 @@ fn generator_emits_online_and_offline_returns() {
             }
         }
     }
+    // Density floor, not just `> 0`: at the Sell-equal weight (1/14) over a
+    // 2000-seq × ~4.5-avg-len draw the expected count is ≈ 643 per variant, so
+    // `>= 100` is astronomically non-flaky yet ALSO catches a future explicit
+    // under-weighting (not only an arm outright dropped to zero).
     assert!(
-        online > 0,
-        "generator never emitted an OnlineReturn over 2000 sequences \
-         (anti-silent-zero: the Return weight is dropped)"
+        online >= 100,
+        "OnlineReturn under-emitted ({online} over 2000 seqs) — the Return weight \
+         is dropped or severely skewed (anti-silent-zero)"
     );
     assert!(
-        offline > 0,
-        "generator never emitted an OfflineReturn over 2000 sequences \
-         (anti-silent-zero: the Return weight is dropped)"
+        offline >= 100,
+        "OfflineReturn under-emitted ({offline} over 2000 seqs) — the Return weight \
+         is dropped or severely skewed (anti-silent-zero)"
     );
 }
 
@@ -1394,10 +1444,13 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                 // defers the terminal (Fault), but the WIRE send-count must stay
                 // bounded — no unbounded resend.  A regression that removed the
                 // one-shot guard would resend without limit; this generative gate
-                // catches it (like AUD-K8-1's wire-call bound).
+                // catches it (like AUD-K8-1's wire-call bound).  PR-R-fuzz — a
+                // BadHashPrev online RETURN takes the SAME doc-type-agnostic
+                // MAC-recovery path (symmetry (c)), so it is bounded identically.
                 if matches!(
                     op,
-                    Op::OnlineSell(s) if matches!(s.0.as_slice(), [WireResponse::BadHashPrev, ..])
+                    Op::OnlineSell(s) | Op::OnlineReturn(s)
+                        if matches!(s.0.as_slice(), [WireResponse::BadHashPrev, ..])
                 ) {
                     let send_delta = ctx.send_calls() - sends_before;
                     // Probe-derived: the real send-delta is exactly 1 (the single
