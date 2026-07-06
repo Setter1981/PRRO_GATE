@@ -63,6 +63,18 @@ pub enum Violation {
     },
     /// Terminal `ACK` without a non-empty DPS `server_fiscal_no`.
     AckWithoutServerFiscalNo { document_id_hex: String },
+    /// **A.3 PR-C (D3 backstop below ACK, AUD-L2-F4)** — an ONLINE-origin doc
+    /// (`offline_fiscal_no IS NULL`) resting in an ISSUED-lane state
+    /// `SENT`/`KVT1`/`KVT2` with a NULL/empty `server_fiscal_no`.  Under
+    /// advance-at-SEND the sfn is stamped at the `Sending → Sent` CAS, so an
+    /// issued-lane online row MUST carry it (D3, [`fiscal_documents::is_issued`]);
+    /// a missing sfn means the row claims an issued state it never reached.  The
+    /// existing `AckWithoutServerFiscalNo` (3a) owns the ACK tip; this extends
+    /// the guard down the SENT/KVT1/KVT2 lane.
+    OnlineIssuedStateWithoutServerFiscalNo {
+        document_id_hex: String,
+        state: String,
+    },
     /// Terminal `ACK` without a persisted `KVT1_RAW` evidence blob.
     AckWithoutKvt1Raw { document_id_hex: String },
     /// A signed doc's `previous_hash` does not extend the chain seed
@@ -205,6 +217,27 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
     .await?;
     for (document_id_hex,) in ack_no_sfn {
         out.push(Violation::AckWithoutServerFiscalNo { document_id_hex });
+    }
+
+    // 3a′. A.3 PR-C (D3 backstop below ACK, AUD-L2-F4) — an ONLINE-origin doc
+    //      in an ISSUED-lane state SENT/KVT1/KVT2 MUST carry a non-empty
+    //      server_fiscal_no (advance-at-SEND stamps it at the Sending→Sent CAS).
+    //      `offline_fiscal_no IS NULL` scopes to online-origin (offline rows
+    //      issue via offline_fiscal_no and legitimately carry NULL sfn).  3a
+    //      above owns the ACK tip; this is the sub-ACK extension of the same
+    //      D3 invariant (issued-lane online ⟺ server_fiscal_no set).
+    let online_issued_no_sfn: Vec<(String, String)> = sqlx::query_as(
+        "SELECT lower(hex(document_id)), state FROM fiscal_documents \
+         WHERE state IN ('SENT','KVT1','KVT2') AND offline_fiscal_no IS NULL \
+           AND (server_fiscal_no IS NULL OR server_fiscal_no = '')",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (document_id_hex, state) in online_issued_no_sfn {
+        out.push(Violation::OnlineIssuedStateWithoutServerFiscalNo {
+            document_id_hex,
+            state,
+        });
     }
 
     // 3b. ACK ⇒ persisted KVT1_RAW evidence (HIGH-C5-2).
