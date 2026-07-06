@@ -177,6 +177,11 @@ pub(crate) fn map_rejection(reason: &RejectionReason, request_id: [u8; 16]) -> F
         R::ZReportBlockedBacklogDrainPending => {
             shift_guard(request_id, codes::Z_REPORT_BACKLOG_DRAIN_PENDING)
         }
+        // A.3 PR-C (D5 gate) — a transient RETRYABLE refusal (an older
+        // non-issued sibling rests; the resolver clears it) → 503 via
+        // OfflineRefused, NOT a client-fixable 422 (the client cannot fix
+        // its input to clear the blocker — it retries after the resolver).
+        R::WriteGateSiblingPending => node_refused(request_id, codes::WRITE_GATE_SIBLING_PENDING),
         // T2/T3 — structural / manual-recon (500).
         R::ShiftInError => internal(request_id, codes::SHIFT_IN_ERROR),
         R::ShiftInvariantViolation => internal(request_id, codes::SHIFT_INVARIANT_VIOLATION),
