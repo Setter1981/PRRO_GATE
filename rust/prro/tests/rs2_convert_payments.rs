@@ -476,6 +476,56 @@ async fn seed_issued_receipt_with_items_opt(
         .expect("set terminal state");
 }
 
+/// Seed one issued SELL/RETURN carrying BOTH `items_json` (for the TXS
+/// tax-group side) and `payments_json` (for the sum_in/sum_out side) plus a
+/// pinned `snapshot_id`.  The PR-R e2e pin needs a single receipt that feeds
+/// both aggregators in one `aggregate_z_payload_for_shift` pass — the existing
+/// `seed_issued_receipt` / `seed_issued_receipt_with_items` helpers zero one
+/// side each.
+#[allow(clippy::too_many_arguments)]
+async fn seed_issued_receipt_full(
+    main: &SqlitePool,
+    shift: ShiftId,
+    lnd: i64,
+    doc_type: DocType,
+    state: DocState,
+    items_json: &str,
+    payments_json: &str,
+    snapshot_id: i64,
+) {
+    let new = fd::NewDocument {
+        document_id: DocumentId::new(),
+        request_id: RequestId::new(),
+        fiscal_number: FN.to_string(),
+        shift_id: Some(shift),
+        offline_session_id: None,
+        lnd,
+        doc_type,
+        backend_profile_id: "b".into(),
+        transport_profile_id: "t".into(),
+        fs_mode: "ONLINE",
+        business_ts: "2026-06-05T12:00:00Z".into(),
+        total_sum_kop: Some(0),
+        payload_json: format!(r#"{{"items":[{items_json}],"payments":[{payments_json}]}}"#),
+        payload_sha256_canonical: [0u8; 32],
+        source_sha256: [0u8; 32],
+        unsigned_xml_sha256: None,
+        previous_hash: None,
+        signed_by_cashier_id: None,
+        signing_config_snapshot_id: Some(snapshot_id),
+    };
+    let id = new.document_id;
+    fd::insert_prepared(main, &new)
+        .await
+        .expect("insert_prepared receipt");
+    sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
+        .bind(state)
+        .bind(id)
+        .execute(main)
+        .await
+        .expect("set terminal state");
+}
+
 fn z_report_cmd(idem: &str) -> CanonicalCommand {
     let json = format!(
         r#"{{"schema_version":"1.0","fiscal_number":"4000000001",
@@ -744,6 +794,65 @@ async fn zreport_txs_routes_sell_to_smi_and_return_to_smo() {
     );
     // TXO = calc_tax(3000, 20, 0, 0) = 500.
     assert!(p.contains(r#""txo":500"#), "TXO on return side wrong: {p}");
+}
+
+/// PR-R e2e (aggregation level) — a shift with a SELL and a RETURN, each
+/// carrying items AND a payment, aggregates in ONE `aggregate_z_payload_for_shift`
+/// pass such that the RETURN lands on BOTH the turnover side (TXS SMO/TXO) AND
+/// the payment side (sum_out_kop), while the SELL lands on SMI/TXI + sum_in_kop.
+/// This is the SELL→RETURN→Z pin the contract reserves: the RETURN direction
+/// routes consistently across both aggregators from the same ledger read.
+#[tokio::test]
+async fn e2e_sell_and_return_shift_routes_return_to_smo_and_sum_out() {
+    let (_dir, main, _secure) = fresh_pools().await;
+    seed_fn_config(&main).await;
+    let snap = seed_tax_snapshot(&main).await;
+    let shift = ShiftId::new();
+    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1")
+        .await
+        .expect("seed shift");
+    // SELL: item 12000 @ tx=1 + cash payment 12000.
+    seed_issued_receipt_full(
+        &main,
+        shift,
+        1,
+        DocType::Sell,
+        DocState::Ack,
+        r#"{"code":"1","name":"A","price_kop":12000,"quantity_thousandths":1000,"sum_kop":12000,"tax_group_1":1}"#,
+        r#"{"name":"CASH","sum_kop":12000,"type_code":"0"}"#,
+        snap,
+    )
+    .await;
+    // RETURN: item 3000 @ tx=1 + cash payment 3000.
+    seed_issued_receipt_full(
+        &main,
+        shift,
+        2,
+        DocType::Return,
+        DocState::Ack,
+        r#"{"code":"1","name":"A","price_kop":3000,"quantity_thousandths":1000,"sum_kop":3000,"tax_group_1":1}"#,
+        r#"{"name":"CASH","sum_kop":3000,"type_code":"0"}"#,
+        snap,
+    )
+    .await;
+
+    let conv = aggregate_z_payload_for_shift(&main, FN, shift)
+        .await
+        .expect("aggregate");
+    let p = &conv.payload_json;
+    // Turnover side: SELL→SMI, RETURN→SMO within tx=1.
+    assert!(
+        p.contains(r#""tx":1"#) && p.contains(r#""smi":12000"#) && p.contains(r#""smo":3000"#),
+        "SELL→SMI / RETURN→SMO wrong: {p}"
+    );
+    // TXI = calc_tax(12000,20,0,0)=2000 ; TXO = calc_tax(3000,20,0,0)=500.
+    assert!(p.contains(r#""txi":2000"#), "SELL TXI wrong: {p}");
+    assert!(p.contains(r#""txo":500"#), "RETURN TXO wrong: {p}");
+    // Payment side (same CASH slot): SELL→sum_in, RETURN→sum_out.
+    assert!(
+        p.contains(r#""sum_in_kop":12000"#) && p.contains(r#""sum_out_kop":3000"#),
+        "SELL→sum_in / RETURN→sum_out wrong: {p}"
+    );
 }
 
 /// PR-Z1: two receipts in one shift whose snapshots resolve the SAME canonical

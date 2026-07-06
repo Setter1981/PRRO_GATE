@@ -123,6 +123,10 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         | "INACTIVE_PAYMENT_METHOD"
         | "PAYMENT_SLOT_KIND_MISMATCH"
         | "ACQUIRER_SLIP_DEFERRED"
+        // PR-R / STOP-R1 — a non-null return_check_number the compact wire
+        // dialect can't carry; fail-closed client-payload fault (like the
+        // raw_frames/acquirer_slip family), not a 5xx.
+        | "RETURN_CHECK_NUMBER_NOT_SUPPORTED"
         | "NO_OPEN_SHIFT"
         // RS-3 A2 (T1) — ShiftGuardRefused carries one of these specific
         // shift-state codes; all are client/control 422s, NOT NO_OPEN_SHIFT.
@@ -267,6 +271,7 @@ fn convert_error_code(e: &ConvertError) -> &'static str {
         ConvertError::InactivePaymentMethod { .. } => "INACTIVE_PAYMENT_METHOD",
         ConvertError::PaymentSlotKindMismatch { .. } => "PAYMENT_SLOT_KIND_MISMATCH",
         ConvertError::AcquirerSlipMappingDeferred { .. } => "ACQUIRER_SLIP_DEFERRED",
+        ConvertError::ReturnCheckNumberNotSupported => "RETURN_CHECK_NUMBER_NOT_SUPPORTED",
         ConvertError::NoOpenShiftForZReport { .. } => "NO_OPEN_SHIFT",
         ConvertError::NegativeStoredPaymentSum { .. } => "LEDGER_CORRUPTION",
         ConvertError::ZReportSumOverflow { .. } => "LEDGER_CORRUPTION",
@@ -1482,6 +1487,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(c, 0, "a raw_frames reject must not write an inbox row");
+    }
+
+    /// PR-R / STOP-R1 ruling — a RETURN carrying a non-null
+    /// `return_check_number` is rejected 422 RETURN_CHECK_NUMBER_NOT_SUPPORTED
+    /// (the convert guard is hoisted ABOVE the doc-type match, same fail-closed
+    /// posture as `raw_frames` / `acquirer_slip`) and leaves NO inbox row —
+    /// strictly pre-mint.  The compact `<C T=>` dialect does not carry
+    /// ORDERRETNUM (Python-prod 4yr + WebCheck never emit it), so the gateway
+    /// refuses the field typed rather than silently dropping it (fail-open,
+    /// which would leave the client falsely believing the return is linked).
+    #[tokio::test]
+    async fn return_with_return_check_number_is_rejected_422_without_inbox_row() {
+        let (_d, main, secure) = fresh_pools().await;
+        let wp = UnimplementedWritePath;
+        let cmd = parse(format!(
+            r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"RETURN",
+                "idempotency_key":"idem-rcn","cashier_id":null,"department":null,
+                "return_check_number":"ORIG-0007",
+                "payload":{{"direction":"RETURN",
+                  "goods":[{{"name":"Bread","quantity_milli":1000,"price_kopecks":10000,
+                            "tax_group_1":0,"tax_group_2":0,"article_code":42}}],
+                  "payments":[],
+                  "totals":{{"sale_kopecks":0,"return_kopecks":10000}}}}}}"#
+        ));
+        let r = handle_command(&cmd, FN, drv(), Protocol::Rest, &main, &secure, &wp).await;
+        assert_eq!(r.http_status, 422);
+        match r.body {
+            IngressBody::Error(e) => assert_eq!(e.error_code, "RETURN_CHECK_NUMBER_NOT_SUPPORTED"),
+            other => panic!("expected Error(RETURN_CHECK_NUMBER_NOT_SUPPORTED), got {other:?}"),
+        }
+        let c: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingress_inbox")
+            .fetch_one(&main)
+            .await
+            .unwrap();
+        assert_eq!(
+            c, 0,
+            "a return_check_number reject must not write an inbox row"
+        );
+    }
+
+    /// The `return_check_number` guard is hoisted ABOVE the doc-type match, so
+    /// it fail-closes on a SELL as well (a SELL must never carry a return
+    /// link).  This payload otherwise converts cleanly (goods + no payments),
+    /// so WITHOUT the guard it would MINT an inbox row — the reject proves the
+    /// guard is what prevents the mint, not an incidental later convert fault.
+    #[tokio::test]
+    async fn sell_with_return_check_number_is_rejected_422_without_inbox_row() {
+        let (_d, main, secure) = fresh_pools().await;
+        let wp = UnimplementedWritePath;
+        let cmd = parse(format!(
+            r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"SELL",
+                "idempotency_key":"idem-rcn-sell","cashier_id":null,"department":null,
+                "return_check_number":"ORIG-0007",
+                "payload":{{"direction":"SALE",
+                  "goods":[{{"name":"Bread","quantity_milli":1000,"price_kopecks":10000,
+                            "tax_group_1":0,"tax_group_2":0,"article_code":42}}],
+                  "payments":[],
+                  "totals":{{"sale_kopecks":10000,"return_kopecks":0}}}}}}"#
+        ));
+        let r = handle_command(&cmd, FN, drv(), Protocol::Rest, &main, &secure, &wp).await;
+        assert_eq!(r.http_status, 422);
+        match r.body {
+            IngressBody::Error(e) => assert_eq!(e.error_code, "RETURN_CHECK_NUMBER_NOT_SUPPORTED"),
+            other => panic!("expected Error(RETURN_CHECK_NUMBER_NOT_SUPPORTED), got {other:?}"),
+        }
+        let c: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingress_inbox")
+            .fetch_one(&main)
+            .await
+            .unwrap();
+        assert_eq!(
+            c, 0,
+            "a return_check_number reject must not write an inbox row"
+        );
+    }
+
+    /// The guard fires ONLY on a non-null `return_check_number`: a null field
+    /// (every client today) flows through convert unchanged and reaches the
+    /// write-path — here the production `UnimplementedWritePath` returns 501
+    /// NOT_IMPLEMENTED, proof the command passed the guard and was dispatched,
+    /// NOT rejected at convert.  (Guard-direction pin: green before the change,
+    /// RED if the guard is inverted or made unconditional.)
+    #[tokio::test]
+    async fn null_return_check_number_flows_past_the_guard() {
+        let (_d, main, secure) = fresh_pools().await;
+        let wp = UnimplementedWritePath;
+        // sell_cmd sets return_check_number:null.
+        let r = handle_command(
+            &sell_cmd("idem-null-rcn", 10000),
+            FN,
+            drv(),
+            Protocol::Rest,
+            &main,
+            &secure,
+            &wp,
+        )
+        .await;
+        assert_eq!(
+            r.http_status, 501,
+            "null return_check_number must flow past convert to the write-path"
+        );
+        match r.body {
+            IngressBody::Error(e) => assert_eq!(e.error_code, "NOT_IMPLEMENTED"),
+            other => panic!("expected Error(NOT_IMPLEMENTED), got {other:?}"),
+        }
     }
 
     /// A `Replay` of the SAME payload while the ledger has no terminal doc

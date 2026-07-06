@@ -413,6 +413,41 @@ fn xml_return_byte_equivalent() {
     assert_xml_golden("xml/return.bin", &return_doc());
 }
 
+/// R-0a — the ONLY wire difference between a SELL and a RETURN built from the
+/// SAME `CheckPayload` is the `<C T=>` marker (T=0 sell / T=1 return): the
+/// items, payments and closing `<E>` block are byte-identical.  The direction
+/// is carried by the `CanonicalDoc` kind, not the payload (`check_payload_from`
+/// is shared and direction-agnostic), so a RETURN can neither silently ship a
+/// SELL-typed wire nor drift its body away from SELL.  The per-doc goldens
+/// (`sell.bin` / `return.bin`) differ in local_number too; this pin isolates
+/// the check-type marker as the sole doc-type-driven byte.
+#[test]
+fn return_shares_sell_body_and_differs_only_in_check_type() {
+    let sell = build_canonical_xml(&CanonicalDoc::Sell(check_payload(42))).expect("sell xml");
+    let ret = build_canonical_xml(&CanonicalDoc::Return(check_payload(42))).expect("return xml");
+    assert_ne!(sell, ret, "SELL and RETURN must not emit identical wire");
+    assert_eq!(
+        sell.len(),
+        ret.len(),
+        "T=0 and T=1 are equal-width; the bodies must be the same length"
+    );
+    let diffs: Vec<usize> = sell
+        .iter()
+        .zip(ret.iter())
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        diffs.len(),
+        1,
+        "exactly one byte (the check-type marker) may differ: {diffs:?}"
+    );
+    let i = diffs[0];
+    assert_eq!(sell[i], b'0', "SELL check-type marker byte is '0'");
+    assert_eq!(ret[i], b'1', "RETURN check-type marker byte is '1'");
+}
+
 /// Z_REPORT IS the close-shift wire artifact (DPS Check.Type::ZREPORT=2;
 /// WebCheck CreateDB.cs:624 doctype='80'; W4-C0 contract).  This test
 /// pins the bytes; no separate xml/shift_close.bin should exist.
