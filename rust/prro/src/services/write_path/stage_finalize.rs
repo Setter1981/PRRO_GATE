@@ -44,9 +44,7 @@ use crate::db::models::enums::{DocState, Severity};
 use crate::db::models::ids::DocumentId;
 use crate::db::repositories::fiscal_documents::TransitionOutcome;
 use crate::db::repositories::outbox::NewOutboxRow;
-use crate::db::repositories::{
-    audit_log, fiscal_documents as fd, ingress_inbox, node_state, outbox,
-};
+use crate::db::repositories::{audit_log, fiscal_documents as fd, ingress_inbox, outbox};
 use crate::db::tx::with_immediate;
 
 // ─── Errors ──────────────────────────────────────────────────────────
@@ -78,8 +76,21 @@ pub enum StageFinalizeError {
     /// chain SHOULD point to upon entering finalize), `actual` is
     /// the FN's `last_known_unsigned_xml_sha256` (what the chain
     /// DOES point to).  Both `None` is the genesis case (legitimate;
-    /// no error).  Any other inequality is a structural breach;
-    /// rollback the entire envelope.
+    /// no error).  Any other inequality is a structural breach.
+    ///
+    /// **A.3 (post-advance-at-SEND, design v3 §6) — HONEST producer status:**
+    /// `stage_finalize.rs:305` was the SOLE producer of this variant (the online
+    /// ACK-time chain guard).  It was removed when the seed advance moved to
+    /// `stage_send`.  **As of PR-A there is therefore NO live producer** of
+    /// `ChainSeedMismatch`: the escalation tract it feeds (`kvt2_advance` →
+    /// `kvt2_confirm` → the convergence / drain / boot / inline arms) is RETAINED
+    /// but currently **DORMANT** — a live producer is (re)wired only later
+    /// (PR-B SW-4 = the inline arm; PR-C = scan→escalate + boot NC-04/tip-guard).
+    /// This is a DELIBERATELY-DOCUMENTED dormant surface, explicitly NOT silent
+    /// non-functional safety: the chain check itself is NOT lost — it moved
+    /// EARLIER, to the fail-closed SEND drift-assert (`stage_send`).  Do not read
+    /// the retained arms as a currently-live safety path.  (Removing the
+    /// now-unproduced variant = LOW backlog after A.3.)
     #[error("stage 5 chain seed mismatch for doc {document_id:?}: expected {expected:?}, actual {actual:?}")]
     ChainSeedMismatch {
         document_id: DocumentId,
@@ -272,54 +283,24 @@ pub async fn run(
                         "doc {doc:?} vanished between CAS Applied and finalize_inputs read"
                     )))
                 })?;
+            // A.3 (design v3 §6 step 4) — the online seed advance MOVED to
+            // `stage_send` (advance-at-SEND, with its own pre-advance
+            // drift-assert, dossier §9.1).  BOTH lanes now advance the chain
+            // seed BEFORE finalize: online-origin at the `Sending → Sent` CAS,
+            // offline-origin at `stage_offline_ack` (M2-01).  So finalize
+            // advances NOTHING and re-runs NO chain guard — re-guarding an
+            // already-advanced doc (including a mac-recovered one whose
+            // `previous_hash` was re-anchored, dossier §9.1.2) would false-fail
+            // the retired §3 ACK-only guard.  (Pre-A.3 this block advanced
+            // online docs at ACK — that ACK-only special case WAS the seed-fork;
+            // it is now closed.)
+            //
+            // `seed` is still read (structural presence assert — every issued
+            // doc carries `unsigned_xml_sha256`) for the STAGE_FINALIZE_ACK audit
+            // payload below; it no longer drives any node_state advance.
             let seed = inputs.unsigned_xml_sha256.ok_or_else(|| {
                 anyhow::Error::new(StageFinalizeError::UnsignedXmlShaMissing { document_id: doc })
             })?;
-
-            // M2-01 (Fable-locked, 2026-06-12): is this an OFFLINE-ORIGIN doc?
-            // An `offline_fiscal_no` was stamped at `stage_offline_ack`, where
-            // the chain seed ALREADY advanced past this doc (M2-01 step 2).  For
-            // such docs the drain's finalize must NOT re-validate the chain
-            // (the seed is now further along — the §3 guard would false-fail)
-            // and must NOT re-advance it (double-move).  Online-origin docs are
-            // unchanged: they fiscalise at ACK, so finalize owns the guard +
-            // advance.  (Review fold 2026-06-12: read from the same envelope's
-            // input fetch — `offline_fiscal_no` now in `fetch_finalize_inputs_tx`.)
-            if inputs.offline_fiscal_no.is_none() {
-                // 3. Chain-continuity guard (W8 review F2 close).  Read
-                //    the FN's current chain seed inside the same tx and
-                //    assert it equals this doc's `previous_hash` — i.e.
-                //    this doc extends the existing chain, not jumps over
-                //    it.  Genesis case: both `None`.  Out-of-order
-                //    finalize (W9 boot recovery in wrong lnd order) is
-                //    structurally rejected here.  (Online-origin only —
-                //    offline-origin docs guarded at offline-ack, M2-01.)
-                let ns_row = node_state::get_tx(tx, &inputs.fiscal_number)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::Error::new(StageFinalizeError::SeedUpdateMissing {
-                            fn_id: inputs.fiscal_number.clone(),
-                        })
-                    })?;
-                if ns_row.last_known_unsigned_xml_sha256 != inputs.previous_hash {
-                    return Err(anyhow::Error::new(StageFinalizeError::ChainSeedMismatch {
-                        document_id: doc,
-                        expected: inputs.previous_hash,
-                        actual: ns_row.last_known_unsigned_xml_sha256,
-                    }));
-                }
-
-                // 4. Cross-doc MAC chain seed advance.  fiscal_number is
-                //    sourced from the doc row (W8 review F1 close).
-                //    (Online-origin only — offline seed advanced at offline-ack.)
-                if !node_state::update_last_known_xml_sha_tx(tx, &inputs.fiscal_number, &seed)
-                    .await?
-                {
-                    return Err(anyhow::Error::new(StageFinalizeError::SeedUpdateMissing {
-                        fn_id: inputs.fiscal_number.clone(),
-                    }));
-                }
-            }
 
             // 5. Inbox DONE.  request_id is sourced from the doc row
             //    (W8 review F1 close).

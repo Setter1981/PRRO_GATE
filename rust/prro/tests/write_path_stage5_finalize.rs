@@ -11,23 +11,33 @@
 //! supporting rows (FN config, node_state, document_files SIGNED_XML,
 //! ingress_inbox PROCESSING) and exercises a single (or, for
 //! Fixture 12, concurrent) `stage_finalize::run` invocation.
-//! Assertions cover state advance, seed advance, inbox status,
-//! outbox row, audit row count + payload contents, and (negative
-//! paths) full rollback completeness.
+//! Assertions cover state advance, inbox status, outbox row, audit row
+//! count + payload contents, (negative paths) full rollback
+//! completeness, and — post-A.3 (advance-at-SEND, design v3 §6) — the
+//! invariant pins that finalize does NOT advance nor guard the cross-doc
+//! MAC chain seed for EITHER lane (the online advance moved to
+//! `stage_send`, the offline advance to `stage_offline_ack`).
 //!
 //! Fixture index:
-//!   1.  `kvt2_to_ack_happy_path` — full 5-write happy + rich audit payload (F6-bis).
-//!   2.  `mac_chain_seed_advances_atomically_with_ack`.
+//!   1.  `kvt2_to_ack_happy_path` — full happy + rich audit payload (F6-bis);
+//!       doubles as A.3 pin (a) online / non-NULL-prior (seed non-advance).
+//!   2.  `finalize_does_not_advance_seed_offline_origin_lane` — A.3 pin (a),
+//!       offline lane (repurposed from `mac_chain_seed_advances_atomically_with_ack`).
 //!   3.  `inbox_status_done_atomic_with_state_transition`.
 //!   4.  `outbox_row_inserted_inside_lock_no_publish_yet`.
 //!   5.  `rerun_on_ack_is_idempotent_no_op`.
 //!   6.  `non_kvt2_state_short_circuits_no_seed_advance`.
 //!   7.  `unsigned_xml_sha_missing_typed_error_full_rollback` (W8.2 F5-bis).
 //!   8.  `document_missing_returns_outcome_not_error`.
-//!   9.  `seed_update_missing_typed_error_full_rollback` (W8.4 F7-bis).
+//!   9.  `finalize_succeeds_with_node_state_absent_no_seed_dependency` — A.3
+//!       pin (a), node_state independence (repurposed from `seed_update_missing…`).
 //!   10. `inbox_done_missing_typed_error_full_rollback` (W8.4 F7-bis).
 //!   11. `concurrent_finalize_yields_one_acked_and_one_already_acked` (W8.4 N2).
 //!   12. `whitelist_kvt2_ack_regression_guard` (W8.3 F4-bis).
+//!   13. A.3 seed-pins: `finalize_does_not_advance_seed_from_genesis_null` (pin a,
+//!       genesis), `finalize_skips_when_seed_already_advanced_nongenesis` (pin b,
+//!       Variant P skip), `finalize_skips_seed_guard_at_genesis_boundary` (pin b,
+//!       genesis-boundary) — consolidated from the retired `chain_seed_*` guard tests.
 
 use prro::db::models::enums::{DocState, NodeMode, ShiftState};
 use prro::db::models::ids::DocumentId;
@@ -268,12 +278,18 @@ async fn kvt2_to_ack_happy_path() {
         other => panic!("expected Acked, got {other:?}"),
     }
 
-    // All five writes landed:
+    // Post-A.3 finalize writes: state→Ack, inbox DONE, outbox row,
+    // audit row.  The cross-doc MAC chain seed is NO LONGER among them
+    // — the online seed advance moved to `stage_send` (advance-at-SEND,
+    // design v3 §6).  This test doubles as the **pin (a) online-lane /
+    // non-NULL-prior** instance: the seed stays at its pre-existing
+    // 0xCD value, NOT the doc's 0xAB hash.
     assert_eq!(read_state(&pool, doc).await, "ACK");
     assert_eq!(
         read_seed(&pool).await.unwrap(),
-        vec![0xAB; 32],
-        "seed advanced from 0xCD prior to doc's unsigned_xml_sha256 0xAB"
+        vec![0xCD; 32],
+        "A.3: finalize does NOT advance the seed — it stays at the \
+         pre-existing 0xCD prior (would have become 0xAB pre-A.3)"
     );
     assert_eq!(read_inbox_status(&pool, &req).await, "DONE");
     assert_eq!(read_outbox_count(&pool).await, 1);
@@ -315,7 +331,8 @@ async fn kvt2_to_ack_happy_path() {
     assert_eq!(
         parsed["unsigned_xml_sha256_hex"].as_str().unwrap(),
         "ab".repeat(32),
-        "unsigned_xml_sha256_hex must mirror the seed advance value"
+        "unsigned_xml_sha256_hex carries the doc's own hash for audit \
+         cross-correlation — post-A.3 it no longer drives a seed advance"
     );
     // doc's previous_hash was 0xCD x 32.
     assert_eq!(
@@ -341,26 +358,45 @@ async fn kvt2_to_ack_happy_path() {
     );
 }
 
-// ─── Fixture 2 — MAC chain seed advances atomically with Ack ─────────
+// ─── Pin (a) [offline lane] — finalize does NOT advance the seed for an
+// OFFLINE-ORIGIN doc ─────────────────────────────────────────────────
+//
+// A.3 (design v3 §6): the online seed advance moved to `stage_send`; the
+// offline-origin seed advance happens at `stage_offline_ack` (M2-01).
+// By the time an offline-origin doc (`offline_fiscal_no` set) reaches
+// finalize its seed is ALREADY advanced upstream, so finalize must be
+// advance-free for this lane too.  (Repurposed from the old
+// `mac_chain_seed_advances_atomically_with_ack`, whose "seed advances at
+// ACK" premise is now false — the SEND-time advance is covered elsewhere.)
 
 #[tokio::test]
-async fn mac_chain_seed_advances_atomically_with_ack() {
+async fn finalize_does_not_advance_seed_offline_origin_lane() {
     let (_d, pool) = fresh_pool().await;
-    seed_fn(&pool, Some([0x55; 32])).await;
+    seed_fn(&pool, Some([0x55; 32])).await; // non-NULL prior (advanced upstream)
     let (doc, _req) = seed_doc(&pool, 0x22, 1, "KVT2", Some([0x77; 32]), Some([0x55; 32])).await;
+
+    // Stamp `offline_fiscal_no` so the row is an OFFLINE-ORIGIN doc —
+    // `seed_doc` seeds online-origin (NULL) by default.
+    sqlx::query("UPDATE fiscal_documents SET offline_fiscal_no = ? WHERE document_id = ?")
+        .bind(4242_i64)
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .expect("stamp offline_fiscal_no (offline-origin)");
 
     let pre_seed = read_seed(&pool).await.unwrap();
     assert_eq!(pre_seed, vec![0x55; 32]);
 
-    stage_finalize::run(&pool, doc).await.expect("finalize");
+    let outcome = stage_finalize::run(&pool, doc).await.expect("finalize");
+    assert!(matches!(outcome, StageFinalizeOutcome::Acked { .. }));
 
-    let post_seed = read_seed(&pool).await.unwrap();
-    assert_eq!(
-        post_seed,
-        vec![0x77; 32],
-        "seed must equal doc's unsigned_xml_sha256 after Ack"
-    );
     assert_eq!(read_state(&pool, doc).await, "ACK");
+    assert_eq!(
+        read_seed(&pool).await.unwrap(),
+        vec![0x55; 32],
+        "A.3: offline-origin finalize does NOT re-advance the seed \
+         (advanced at offline-ack, M2-01) — stays 0x55, not 0x77"
+    );
 }
 
 // ─── Fixture 3 — inbox.status = DONE atomic with state transition ────
@@ -559,50 +595,57 @@ async fn document_missing_returns_outcome_not_error() {
     assert_eq!(read_outbox_count(&pool).await, 0);
 }
 
-// ─── Fixture 9 — SeedUpdateMissing typed error + full rollback ───────
-// (W8.4 review F7-bis: exercise the SeedUpdateMissing typed-error
-// code path even though it's impossible under M3a single-writer +
-// W5 acquire upsert invariant.  Closes the typed-error coverage
-// gap for the variant.)
+// ─── Pin (a) [independence] — finalize succeeds with node_state ABSENT
+// ──────────────────────────────────────────────────────────────────────
+//
+// Pre-A.3 finalize read + UPDATE'd `node_state` to advance the seed, so a
+// missing `node_state` row surfaced `SeedUpdateMissing` + full rollback.
+// Post-A.3 finalize NO LONGER touches `node_state` at all — deleting the
+// row has NO effect: finalize still reaches ACK.  This is the negative
+// pin against re-introducing a node_state read/advance in finalize
+// (which would resurrect the SeedUpdateMissing failure).  (Repurposed
+// from the old `seed_update_missing_typed_error_full_rollback`.)
 
 #[tokio::test]
-async fn seed_update_missing_typed_error_full_rollback() {
+async fn finalize_succeeds_with_node_state_absent_no_seed_dependency() {
     let (_d, pool) = fresh_pool().await;
     seed_fn(&pool, None).await;
     let (doc, req) = seed_doc(&pool, 0x88, 1, "KVT2", Some([0xCC; 32]), None).await;
 
-    // Simulate the impossible-but-typed breach: delete node_state row
-    // BETWEEN seed_fn's upsert and stage_finalize::run.  The CAS
-    // Kvt2 → Ack still applies (fiscal_documents intact), but the
-    // subsequent `update_last_known_xml_sha_tx` returns false →
-    // SeedUpdateMissing typed error → full tx rollback.
+    // Delete the node_state row.  Pre-A.3 this forced SeedUpdateMissing;
+    // post-A.3 finalize never reads it, so the delete is inert.
     sqlx::query("DELETE FROM node_state WHERE fiscal_number = ?")
         .bind(FN_ID)
         .execute(&pool)
         .await
         .expect("delete node_state");
 
-    let err = stage_finalize::run(&pool, doc)
+    let outcome = stage_finalize::run(&pool, doc)
         .await
-        .expect_err("missing node_state must surface as typed error");
+        .expect("finalize must SUCCEED — it no longer depends on node_state");
+    assert!(matches!(outcome, StageFinalizeOutcome::Acked { .. }));
 
-    match err {
-        StageFinalizeError::SeedUpdateMissing { fn_id } => {
-            assert_eq!(fn_id, FN_ID);
-        }
-        other => panic!("expected SeedUpdateMissing, got {other:?}"),
-    }
-
-    // Integrated rollback proof: CAS UPDATE applied in-flight, then
-    // `?`-propagation rolled the entire envelope back.
+    // Doc reaches terminal Ack; downstream writes (inbox, outbox, audit)
+    // land normally — none of them touch node_state.
+    assert_eq!(read_state(&pool, doc).await, "ACK");
+    assert_eq!(read_inbox_status(&pool, &req).await, "DONE");
+    assert_eq!(read_outbox_count(&pool).await, 1);
     assert_eq!(
-        read_state(&pool, doc).await,
-        "KVT2",
-        "doc state must rollback from in-progress Ack to original Kvt2"
+        read_audit_event_types(&pool, doc).await,
+        vec!["STAGE_FINALIZE_ACK"]
     );
-    assert_eq!(read_inbox_status(&pool, &req).await, "PROCESSING");
-    assert_eq!(read_outbox_count(&pool).await, 0);
-    assert!(read_audit_event_types(&pool, doc).await.is_empty());
+
+    // node_state stays absent — finalize never re-creates or advances it.
+    let ns_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM node_state WHERE fiscal_number = ?")
+            .bind(FN_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("count node_state");
+    assert_eq!(
+        ns_count, 0,
+        "node_state row must stay absent — finalize does not touch it"
+    );
 }
 
 // ─── Fixture 10 — InboxDoneMissing typed error + full rollback ──────
@@ -707,115 +750,123 @@ async fn concurrent_finalize_yields_one_acked_and_one_already_acked() {
     assert_eq!(read_state(&pool, doc).await, "ACK");
 }
 
-// ─── Fixtures 12-14 — chain-continuity guard (W8 review F2 close) ────
-// (Out-of-order finalize would silently corrupt the chain seed
-// without this guard.  Three mismatch shapes: Some≠Some, None vs
-// Some, Some vs None.  All return ChainSeedMismatch + full rollback.)
+// ─── Pin (a) [genesis] — finalize does NOT advance the seed from genesis
+// NULL ────────────────────────────────────────────────────────────────
+//
+// Genesis: FN seed NULL, doc previous_hash NULL.  Pre-A.3 finalize
+// advanced the seed to the doc's unsigned_xml_sha256 (0xAA here); the old
+// `chain_seed_genesis_none_to_none_succeeds` asserted exactly that.
+// Post-A.3 finalize is advance-free — the seed stays NULL.  (The SEND
+// stage owns the genesis advance now.)
 
 #[tokio::test]
-async fn chain_seed_mismatch_some_neq_some_typed_error_full_rollback() {
-    let (_d, pool) = fresh_pool().await;
-    seed_fn(&pool, Some([0x11; 32])).await; // FN seed = 0x11
-                                            // Doc's previous_hash = 0x99 ≠ FN seed 0x11 — chain break.
-    let (doc, req) = seed_doc(&pool, 0xC1, 1, "KVT2", Some([0xCC; 32]), Some([0x99; 32])).await;
-
-    let pre_seed = read_seed(&pool).await.unwrap();
-
-    let err = stage_finalize::run(&pool, doc)
-        .await
-        .expect_err("chain mismatch must surface as typed error");
-
-    match err {
-        StageFinalizeError::ChainSeedMismatch {
-            document_id,
-            expected,
-            actual,
-        } => {
-            assert_eq!(document_id, doc);
-            assert_eq!(expected, Some([0x99; 32]));
-            assert_eq!(actual, Some([0x11; 32]));
-        }
-        other => panic!("expected ChainSeedMismatch, got {other:?}"),
-    }
-
-    // Full rollback: doc state, seed, inbox, outbox, audit, KVT2_RAW.
-    assert_eq!(read_state(&pool, doc).await, "KVT2");
-    assert_eq!(read_seed(&pool).await.unwrap(), pre_seed);
-    assert_eq!(read_inbox_status(&pool, &req).await, "PROCESSING");
-    assert_eq!(read_outbox_count(&pool).await, 0);
-    assert!(read_audit_event_types(&pool, doc).await.is_empty());
-    assert_eq!(
-        read_doc_file(&pool, doc, "KVT2_RAW").await.as_deref(),
-        Some(&b"FAKE-KVT2-PROTOBUF"[..]),
-        "KVT2_RAW must remain intact after rollback"
-    );
-}
-
-#[tokio::test]
-async fn chain_seed_mismatch_none_vs_some_typed_error_full_rollback() {
-    // FN seed = None (genesis), but doc's previous_hash = Some(...)
-    // — doc claims to extend a chain that doesn't exist.
-    let (_d, pool) = fresh_pool().await;
-    seed_fn(&pool, None).await;
-    let (doc, _req) = seed_doc(&pool, 0xC2, 1, "KVT2", Some([0xDD; 32]), Some([0x77; 32])).await;
-
-    let err = stage_finalize::run(&pool, doc)
-        .await
-        .expect_err("None vs Some chain mismatch must surface as typed error");
-
-    match err {
-        StageFinalizeError::ChainSeedMismatch {
-            expected, actual, ..
-        } => {
-            assert_eq!(expected, Some([0x77; 32]));
-            assert_eq!(actual, None);
-        }
-        other => panic!("expected ChainSeedMismatch, got {other:?}"),
-    }
-    assert_eq!(read_state(&pool, doc).await, "KVT2");
-    assert!(read_seed(&pool).await.is_none());
-}
-
-#[tokio::test]
-async fn chain_seed_mismatch_some_vs_none_typed_error_full_rollback() {
-    // FN seed = Some(0x44), but doc's previous_hash = None — doc
-    // claims to be genesis when chain already has prior docs.
-    let (_d, pool) = fresh_pool().await;
-    seed_fn(&pool, Some([0x44; 32])).await;
-    let (doc, _req) = seed_doc(&pool, 0xC3, 1, "KVT2", Some([0xEE; 32]), None).await;
-
-    let err = stage_finalize::run(&pool, doc)
-        .await
-        .expect_err("Some vs None chain mismatch must surface as typed error");
-
-    match err {
-        StageFinalizeError::ChainSeedMismatch {
-            expected, actual, ..
-        } => {
-            assert_eq!(expected, None);
-            assert_eq!(actual, Some([0x44; 32]));
-        }
-        other => panic!("expected ChainSeedMismatch, got {other:?}"),
-    }
-    assert_eq!(read_state(&pool, doc).await, "KVT2");
-    assert_eq!(read_seed(&pool).await.unwrap(), vec![0x44; 32]);
-}
-
-#[tokio::test]
-async fn chain_seed_genesis_none_to_none_succeeds() {
-    // Genesis case: FN seed None, doc previous_hash None — chain
-    // boots cleanly.  Positive control for the chain-continuity
-    // guard (None == None must NOT be treated as mismatch).
+async fn finalize_does_not_advance_seed_from_genesis_null() {
     let (_d, pool) = fresh_pool().await;
     seed_fn(&pool, None).await;
     let (doc, _req) = seed_doc(&pool, 0xC4, 1, "KVT2", Some([0xAA; 32]), None).await;
 
     let outcome = stage_finalize::run(&pool, doc)
         .await
-        .expect("genesis (None == None) must finalize cleanly");
+        .expect("genesis finalize must succeed");
     assert!(matches!(outcome, StageFinalizeOutcome::Acked { .. }));
     assert_eq!(read_state(&pool, doc).await, "ACK");
-    assert_eq!(read_seed(&pool).await.unwrap(), vec![0xAA; 32]);
+    assert!(
+        read_seed(&pool).await.is_none(),
+        "A.3: finalize does NOT advance from genesis — seed stays NULL \
+         (would have become 0xAA pre-A.3)"
+    );
+}
+
+// ─── Pin (b) [non-genesis] — seed already advanced past the doc →
+// finalize passes with NO guard-fire and NO re-advance ─────────────────
+//
+// Variant P / advance-at-SEND skip: by the time finalize runs, the seed
+// has ALREADY moved past this doc at SEND (e.g. a successor was issued),
+// so `node_state.last_known != doc.previous_hash`.  Pre-A.3 the §3
+// chain-continuity guard would have FALSE-FIRED `ChainSeedMismatch` here
+// (Some(0x99) expected vs Some(0x11) actual).  Post-A.3 there is no
+// guard: finalize succeeds to ACK and the already-advanced seed is left
+// untouched (no re-advance to the doc's own hash).  (Consolidates the
+// old `chain_seed_mismatch_some_neq_some_typed_error_full_rollback`.)
+
+#[tokio::test]
+async fn finalize_skips_when_seed_already_advanced_nongenesis() {
+    let (_d, pool) = fresh_pool().await;
+    // Seed already advanced to 0x11 (a successor's hash), NOT the doc's
+    // older previous_hash 0x99.
+    seed_fn(&pool, Some([0x11; 32])).await;
+    let (doc, req) = seed_doc(&pool, 0xC1, 1, "KVT2", Some([0xCC; 32]), Some([0x99; 32])).await;
+
+    let outcome = stage_finalize::run(&pool, doc)
+        .await
+        .expect("A.3: no chain guard — finalize must SUCCEED, not ChainSeedMismatch");
+    assert!(matches!(outcome, StageFinalizeOutcome::Acked { .. }));
+
+    // Terminal Ack + downstream writes land; seed is NOT re-advanced.
+    assert_eq!(read_state(&pool, doc).await, "ACK");
+    assert_eq!(
+        read_seed(&pool).await.unwrap(),
+        vec![0x11; 32],
+        "seed stays at the already-advanced 0x11 — finalize neither \
+         guards nor re-advances (0xCC would be a double-move)"
+    );
+    assert_eq!(read_inbox_status(&pool, &req).await, "DONE");
+    assert_eq!(read_outbox_count(&pool).await, 1);
+    // KVT2_RAW untouched (finalize is a state close, not a wire write).
+    assert_eq!(
+        read_doc_file(&pool, doc, "KVT2_RAW").await.as_deref(),
+        Some(&b"FAKE-KVT2-PROTOBUF"[..]),
+        "KVT2_RAW must remain intact through finalize"
+    );
+}
+
+// ─── Pin (b) [genesis boundary] — the two genesis-boundary mismatch
+// shapes ALSO pass post-A.3 (no guard) ─────────────────────────────────
+//
+// Pre-A.3 both shapes tripped the §3 chain-continuity guard:
+//   * None vs Some — seed NULL (genesis) but doc claims a previous_hash.
+//   * Some vs None — seed advanced but doc claims to be genesis.
+// Post-A.3 neither guard exists: finalize succeeds to ACK and leaves the
+// seed exactly as-is (no advance in either direction).  (Consolidates the
+// old `chain_seed_mismatch_none_vs_some` + `..._some_vs_none`.)
+
+#[tokio::test]
+async fn finalize_skips_seed_guard_at_genesis_boundary() {
+    // Shape 1 — None vs Some: genesis seed, doc previous_hash = Some.
+    {
+        let (_d, pool) = fresh_pool().await;
+        seed_fn(&pool, None).await;
+        let (doc, _req) =
+            seed_doc(&pool, 0xC2, 1, "KVT2", Some([0xDD; 32]), Some([0x77; 32])).await;
+
+        let outcome = stage_finalize::run(&pool, doc)
+            .await
+            .expect("A.3: None-vs-Some no longer a guard breach — must SUCCEED");
+        assert!(matches!(outcome, StageFinalizeOutcome::Acked { .. }));
+        assert_eq!(read_state(&pool, doc).await, "ACK");
+        assert!(
+            read_seed(&pool).await.is_none(),
+            "seed stays NULL — finalize does not advance to 0xDD"
+        );
+    }
+
+    // Shape 2 — Some vs None: advanced seed, doc previous_hash = None.
+    {
+        let (_d, pool) = fresh_pool().await;
+        seed_fn(&pool, Some([0x44; 32])).await;
+        let (doc, _req) = seed_doc(&pool, 0xC3, 1, "KVT2", Some([0xEE; 32]), None).await;
+
+        let outcome = stage_finalize::run(&pool, doc)
+            .await
+            .expect("A.3: Some-vs-None no longer a guard breach — must SUCCEED");
+        assert!(matches!(outcome, StageFinalizeOutcome::Acked { .. }));
+        assert_eq!(read_state(&pool, doc).await, "ACK");
+        assert_eq!(
+            read_seed(&pool).await.unwrap(),
+            vec![0x44; 32],
+            "seed stays at 0x44 — finalize does not advance to 0xEE"
+        );
+    }
 }
 
 // ─── Fixture 16 — `(Kvt2, Ack)` whitelist regression guard (F4-bis) ──

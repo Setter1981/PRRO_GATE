@@ -98,12 +98,17 @@ async fn seed_signed_doc_with_xml(
     let doc_bytes = vec![doc_byte; 16];
     let req_bytes = vec![doc_byte ^ 0xFF; 16];
     let sha = vec![0u8; 32];
+    // A.3: online-origin docs advance the chain seed at the Sending→Sent CAS, so
+    // stage_send now reads node_state + this doc's unsigned_xml_sha256.  Seed a
+    // GENESIS node_state (last_known = NULL) so the drift-assert passes
+    // (ns.seed == doc.previous_hash == NULL) and the advance target exists.
+    let unsigned = vec![doc_byte; 32];
     sqlx::query(
         "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
             doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
-            payload_json, payload_sha256_canonical, signed_by_cashier_id) \
+            payload_json, payload_sha256_canonical, unsigned_xml_sha256, signed_by_cashier_id) \
          VALUES (?, ?, '1234567890', ?, ?, ?, ?, 'b1', 't1', 'ONLINE', \
-            '2026-05-09T12:34:56Z', '{}', ?, ?)",
+            '2026-05-09T12:34:56Z', '{}', ?, ?, ?)",
     )
     .bind(&doc_bytes)
     .bind(&req_bytes)
@@ -112,10 +117,21 @@ async fn seed_signed_doc_with_xml(
     .bind(doc_type)
     .bind(state)
     .bind(&sha)
+    .bind(&unsigned)
     .bind(cashier)
     .execute(pool)
     .await
     .expect("seed fiscal_documents");
+    sqlx::query(
+        "INSERT OR IGNORE INTO node_state \
+            (fiscal_number, mode, shift_state, current_shift_id, next_lnd, \
+             backend_profile_id, transport_profile_id, last_known_unsigned_xml_sha256) \
+         VALUES ('1234567890', 'ONLINE', 'OPENED', ?, 1, 'b1', 't1', NULL)",
+    )
+    .bind(shift_id_bytes.as_deref())
+    .execute(pool)
+    .await
+    .expect("seed node_state (genesis seed)");
     sqlx::query(
         "INSERT INTO document_files(document_id, kind, content) \
          VALUES (?, 'SIGNED_XML', ?)",
@@ -653,7 +669,14 @@ async fn server_minus_11_with_missing_node_state_surfaces_typed_error() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_signed_doc_with_xml(&pool, 0xB5, "SELL", 1, "SIGNED").await;
     // **Intentionally NO `node_state::upsert_initial`** — simulate
-    // structural breach (W5 invariant violated upstream).
+    // structural breach (W5 invariant violated upstream).  The shared
+    // seed helper now seeds a genesis node_state (for the A.3 online
+    // advance path); this test's whole point is a MISSING row, so
+    // delete it back out after seeding.
+    sqlx::query("DELETE FROM node_state WHERE fiscal_number = '1234567890'")
+        .execute(&pool)
+        .await
+        .expect("remove node_state to simulate structural breach");
 
     let stub = StubDpsChannel::new(Err(DpsError::Server {
         code: -11,
@@ -1535,6 +1558,22 @@ async fn seed_error_retryable_doc_with_artifacts(pool: &SqlitePool, doc_byte: u8
     .execute(pool)
     .await
     .expect("seed fiscal_documents (ERROR_RETRYABLE)");
+    // A.3: online-origin doc advances the chain seed at Sending→Sent, so
+    // stage_send reads node_state at 4-b.  This is a MAC-recovery doc
+    // (mac_recovery_attempts ends up >= 1 by the time it reaches Sent),
+    // so the pre-advance drift-assert is SKIPPED (Variant P) and the
+    // recovery orchestrator OVERWRITES unsigned_xml_sha256 — node_state
+    // only needs to EXIST.  Seed a genesis row (last_known NULL).
+    sqlx::query(
+        "INSERT OR IGNORE INTO node_state \
+            (fiscal_number, mode, shift_state, current_shift_id, next_lnd, \
+             backend_profile_id, transport_profile_id, last_known_unsigned_xml_sha256) \
+         VALUES ('1234567890', 'ONLINE', 'OPENED', ?, 1, 'b1', 't1', NULL)",
+    )
+    .bind(&shift_bytes)
+    .execute(pool)
+    .await
+    .expect("seed node_state (genesis) for mac-recovery send");
     sqlx::query(
         "INSERT INTO document_files(document_id, kind, content) \
          VALUES (?, 'PAYLOAD_XML', ?), (?, 'SIGNED_XML', ?)",
@@ -1667,5 +1706,113 @@ async fn mac_recovery_resigned_drives_attempt_2_through_loop_to_sent() {
         signed.as_deref(),
         Some(b"RECOVERED-CMS".as_slice()),
         "SIGNED_XML must reflect the orchestrator's re-signed bytes"
+    );
+}
+
+// ─── A.3 Variant P (MAC-recovery) advance-at-SEND characterization ───────────
+
+/// A.3 Variant P (dossier §9.1) — a MAC-recovered doc SKIPS the pre-advance
+/// drift-assert AND still advances the seed. A recovered doc
+/// (`mac_recovery_attempts >= 1`) deliberately re-anchored its `previous_hash`
+/// onto the DPS-supplied tip, voiding the `node_state.seed == previous_hash`
+/// premise BY CONSTRUCTION — so the equality gate is skipped (else it would
+/// false-fail on every successful `-12` recovery). The seed still advances to
+/// THIS doc's own re-signed `unsigned_xml_sha256`, re-syncing the local chain
+/// onto DPS's tip. Isolated: pre-set attempts=1 + a deliberately mismatched node
+/// seed, then a plain OK send. If the `mac_recovery_attempts < 1` guard regressed
+/// (gate always live), this doc's drift would fail-closed → this pin catches it.
+#[tokio::test]
+async fn variant_p_mac_recovery_skips_drift_assert_and_advances_seed() {
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_signed_doc_with_xml(&pool, 0x5A, "SELL", 0x5A, "SIGNED").await;
+    // Recovery already burnt its single-bit budget; the node seed was re-anchored
+    // to a NON-matching DPS tip (doc.previous_hash stayed NULL / genesis).
+    sqlx::query("UPDATE fiscal_documents SET mac_recovery_attempts = 1 WHERE document_id = ?")
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let drifted = [0xD1u8; 32];
+    sqlx::query(
+        "UPDATE node_state SET last_known_unsigned_xml_sha256 = ? \
+         WHERE fiscal_number = '1234567890'",
+    )
+    .bind(&drifted[..])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let stub = StubDpsChannel::new(Ok(ack("DPS-FN-VARIANT-P")));
+    let outcome = stage_send::run(&pool, &stub, doc, None)
+        .await
+        .expect("Variant P must NOT trip the drift-assert (skipped for attempts>=1)");
+    assert!(
+        matches!(outcome, StageSendOutcome::Sent { .. }),
+        "recovered doc must reach Sent, got {outcome:?}"
+    );
+    assert_eq!(read_doc_state(&pool, doc).await, "SENT");
+    // Advance half: seed re-synced to THIS doc's own unsigned sha (0x5A×32),
+    // NOT left at the drifted value.
+    let seed: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = '1234567890'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        seed.as_deref(),
+        Some([0x5Au8; 32].as_slice()),
+        "Variant P must advance the seed to the recovered doc's own unsigned sha"
+    );
+}
+
+/// A.3 non-recovery drift FAILS CLOSED (the paired negative of Variant P): with
+/// `mac_recovery_attempts == 0` the equality gate is LIVE — a node seed that does
+/// NOT equal the doc's `previous_hash` is a chain fork, so the advance fails
+/// closed (`StageSendError::Internal` "chain-seed drift"), rolls the 4-b envelope
+/// back (doc stays `Sending` for reconciliation), and does NOT advance the seed.
+/// If the `ensure!` gate were removed, this drift would reach Sent → pin catches.
+#[tokio::test]
+async fn non_recovery_send_drift_fails_closed() {
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_signed_doc_with_xml(&pool, 0x5B, "SELL", 0x5B, "SIGNED").await;
+    // attempts stays 0 (gate LIVE); node seed drifted off doc.previous_hash (NULL).
+    let drifted = [0xD2u8; 32];
+    sqlx::query(
+        "UPDATE node_state SET last_known_unsigned_xml_sha256 = ? \
+         WHERE fiscal_number = '1234567890'",
+    )
+    .bind(&drifted[..])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let stub = StubDpsChannel::new(Ok(ack("DPS-FN-SHOULD-ROLL-BACK")));
+    let err = stage_send::run(&pool, &stub, doc, None)
+        .await
+        .expect_err("chain-seed drift with attempts=0 must fail closed");
+    match err {
+        stage_send::StageSendError::Internal(e) => assert!(
+            e.to_string().contains("chain-seed drift"),
+            "expected chain-seed drift, got: {e}"
+        ),
+        other => panic!("expected Internal(chain-seed drift), got {other:?}"),
+    }
+    // Fails closed: doc did NOT reach Sent (4-b rolled back), seed NOT advanced.
+    assert_ne!(
+        read_doc_state(&pool, doc).await,
+        "SENT",
+        "a drift fork must NOT commit the Sent CAS"
+    );
+    let seed: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = '1234567890'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        seed.as_deref(),
+        Some(drifted.as_slice()),
+        "seed must NOT advance on a drift fork"
     );
 }

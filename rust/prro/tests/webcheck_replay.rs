@@ -35,7 +35,6 @@ use prro::db::models::enums::{
     DocState, FiscalMode, NodeMode, OfflineSessionState, Protocol, ShiftState,
 };
 use prro::db::models::ids::{OfflineSessionId, RequestId, ShiftId};
-use prro::db::repositories::fiscal_documents::OFFLINE_ISSUED_STATES;
 use prro::db::repositories::ingress_inbox::{
     self as inbox, InboxInsertOutcome, InboxRow, NewInboxEntry,
 };
@@ -225,6 +224,11 @@ struct DocRec {
     state: DocState,
     fs_mode: String,
     previous_hash: Option<Vec<u8>>,
+    /// D3 discriminator inputs for the shared [`is_issued`] SSOT (C8): an
+    /// online-origin doc keys on `server_fiscal_no` (set ⟺ seed advanced at
+    /// SEND), an offline-origin doc keys on `offline_fiscal_no` + state.
+    offline_fiscal_no: Option<i64>,
+    server_fiscal_no: Option<String>,
 }
 
 /// What OUR write-path produced for the driven (SELL) subset.
@@ -502,9 +506,19 @@ impl Harness {
 
     /// Read the driven docs back, ordered by `lnd`, plus consumed offline codes.
     async fn observe(&self) -> Observed {
-        let rows: Vec<(i64, String, String, Option<Vec<u8>>)> = sqlx::query_as(
-            "SELECT lnd, state, fs_mode, previous_hash FROM fiscal_documents \
-             WHERE fiscal_number = ? ORDER BY lnd",
+        // Positional sqlx read, destructured into DocRec immediately below; the
+        // 6-tuple is contained to this one statement (C8 widened it by 2 cols).
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            i64,
+            String,
+            String,
+            Option<Vec<u8>>,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT lnd, state, fs_mode, previous_hash, offline_fiscal_no, server_fiscal_no \
+                 FROM fiscal_documents WHERE fiscal_number = ? ORDER BY lnd",
         )
         .bind(HARNESS_FN)
         .fetch_all(&self.pool)
@@ -512,12 +526,18 @@ impl Harness {
         .unwrap();
         let docs = rows
             .into_iter()
-            .map(|(lnd, state, fs_mode, previous_hash)| DocRec {
-                lnd,
-                state: doc_state_from_str(&state),
-                fs_mode,
-                previous_hash,
-            })
+            .map(
+                |(lnd, state, fs_mode, previous_hash, offline_fiscal_no, server_fiscal_no)| {
+                    DocRec {
+                        lnd,
+                        state: doc_state_from_str(&state),
+                        fs_mode,
+                        previous_hash,
+                        offline_fiscal_no,
+                        server_fiscal_no,
+                    }
+                },
+            )
             .collect();
         let codes_consumed: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM offline_codes \
@@ -749,15 +769,19 @@ fn doc_state_from_str(s: &str) -> DocState {
     }
 }
 
-/// Issued ⟺ the doc reached an issued state: `ACK` universally (both lanes'
-/// terminal issued state — an offline-origin doc drains OLA→ACK), OR an
-/// offline-origin doc in any [`OFFLINE_ISSUED_STATES`] durable/transient state
-/// (the SSOT the boot projection and model reuse). `OFFLINE_ISSUED_STATES`
-/// pointedly excludes `ACK` (online issues at ACK, handled separately), so the
-/// `ACK` arm is required for the drained offline cohort.
+/// Issued ⟺ the shared prod SSOT [`fiscal_documents::is_issued`] says so (C8 —
+/// no bespoke fork of the predicate). D3 discriminator: an **online-origin** doc
+/// (`offline_fiscal_no` NULL) is issued ⟺ its `server_fiscal_no` is set (stamped
+/// atomically with the seed advance at SEND); an **offline-origin** doc
+/// (`offline_fiscal_no` set) is issued at `ACK` or any `OFFLINE_ISSUED_STATES`
+/// durable/transient state. `fs_mode` is NOT consulted — the discriminator is
+/// the fiscal-number pair, exactly as the boot projection and the fuzzer model.
 fn is_issued(rec: &DocRec) -> bool {
-    rec.state == DocState::Ack
-        || (rec.fs_mode != "ONLINE" && OFFLINE_ISSUED_STATES.contains(&doc_state_str(rec.state)))
+    prro::db::repositories::fiscal_documents::is_issued(
+        doc_state_str(rec.state),
+        rec.offline_fiscal_no,
+        rec.server_fiscal_no.as_deref(),
+    )
 }
 
 fn doc_state_str(s: DocState) -> &'static str {
@@ -782,6 +806,43 @@ fn doc_state_str(s: DocState) -> &'static str {
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// C8 (shared-`is_issued` SSOT — online arm kept LIVE): the differential
+/// comparator's issued-set membership delegates to the prod
+/// `fiscal_documents::is_issued`. The happy replay corpus rests every driven doc
+/// at `ACK`/`OFFLINE_LOCAL_ACK`, so without a synthetic case the online arm
+/// (`offline_fiscal_no` NULL ⟹ issued ⟺ `server_fiscal_no` set) is NEVER
+/// exercised distinctly from the universal ACK clause — a dead arm (operator's
+/// C8 note). Post-A.3 an online doc that crossed SEND rests at `SENT` with its
+/// `server_fiscal_no` stamped and its seed advanced, so it MUST count issued;
+/// the same doc pre-SEND (no `server_fiscal_no`, empty treated as unset per D3)
+/// MUST NOT. This pin dies RED against a predicate that keys on `fs_mode`/state.
+#[test]
+fn c8_is_issued_online_sent_arm_keys_on_server_fiscal_no() {
+    let rec = |state, offline_fiscal_no, sfn: Option<&str>| DocRec {
+        lnd: 1,
+        state,
+        fs_mode: "ONLINE".to_string(),
+        previous_hash: None,
+        offline_fiscal_no,
+        server_fiscal_no: sfn.map(str::to_string),
+    };
+    // online-issued rests at SENT with server_fiscal_no stamped → issued
+    assert!(
+        is_issued(&rec(DocState::Sent, None, Some("70000001"))),
+        "online SENT with server_fiscal_no must be issued (seed advanced at SEND)"
+    );
+    // same online doc pre-SEND (no server_fiscal_no) → NOT issued
+    assert!(
+        !is_issued(&rec(DocState::Sent, None, None)),
+        "online SENT without server_fiscal_no must NOT be issued (seed not advanced)"
+    );
+    // empty server_fiscal_no is treated as unset (D3)
+    assert!(
+        !is_issued(&rec(DocState::Sent, None, Some(""))),
+        "empty server_fiscal_no must be treated as unset (D3)"
+    );
+}
 
 /// TEETH (RED-first): an INJECTED divergence (a gap punched into the expected
 /// lnd sequence) MUST be caught by `compare`. With the stage-1 stub `compare`

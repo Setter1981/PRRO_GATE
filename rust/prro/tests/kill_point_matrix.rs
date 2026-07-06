@@ -2490,26 +2490,37 @@ async fn boot_kvt2_chain_seed_mismatch_escalates_manual() {
         .await
         .expect("boot returns Ok (escalates the FN, does not abort the boot)");
 
-    // ── GREEN: the chain breach ESCALATES the FN to Manual with a Critical audit.
+    // A.3 re-ground (design v3 §6 step 4; INV-08): finalize's sole
+    // `ChainSeedMismatch` producer (the online ACK-time guard) was REMOVED — the
+    // chain check moved EARLIER, to the SEND drift-assert.  This POST-SEND seed
+    // tamper (`node_state` corrupted after the doc already crossed SEND) is no
+    // longer caught by the boot-KVT2 finalize path: the doc converges to ACK, the
+    // FN is NOT escalated, and the breach is instead surfaced by `invariant_scan`
+    // (PR-C wires scan/boot-detected breaks → the RETAINED escalation arm; no
+    // recovery TRANSITION was deleted — only the producer narrowed).
     assert_eq!(
         read_doc_state(&pool, FN).await,
-        "KVT2",
-        "doc stays KVT2 (finalize rolled back)"
+        "ACK",
+        "post-A.3: finalize no longer guards → the boot-KVT2 doc converges to ACK"
     );
-    assert_eq!(
+    assert_ne!(
         read_shift_state_by_id(&pool, shift_id).await,
         "REQUIRES_MANUAL_RECONCILIATION",
-        "boot-KVT2 ChainSeedMismatch escalates the FN shift to Manual"
-    );
-    assert_eq!(
-        read_node_shift_state(&pool).await,
-        "REQUIRES_MANUAL_RECONCILIATION",
-        "node_state.shift_state mirror"
+        "no boot-KVT2 finalize escalation post-A.3 (producer removed)"
     );
     assert_eq!(
         count_audit_event(&pool, "BOOT_KVT2_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL").await,
-        1,
-        "exactly one Critical boot-KVT2 escalation audit"
+        0,
+        "no boot-KVT2 escalation audit (finalize ChainSeedMismatch producer removed)"
+    );
+    // Detection MOVED to the scan: the tampered chain breach is flagged there.
+    let violations = prro::db::invariant_scan::scan(&pool).await.unwrap();
+    assert!(
+        violations.iter().any(|v| matches!(
+            v,
+            prro::db::invariant_scan::Violation::ChainSeedMismatch { .. }
+        )),
+        "invariant_scan surfaces the tampered chain-seed breach (detection moved)"
     );
 }
 
@@ -2539,7 +2550,6 @@ async fn boot_kvt2_chain_seed_mismatch_escalates_manual() {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "RED pin AUD-L2-1a: online-lane seed-fork; fix is an A2.4 prerequisite (do NOT activate InlineWritePath until resolved)"]
 async fn m1_02_online_seed_fork_a24_prerequisite() {
     let pool = fresh_pool().await;
     let pool_secure = fresh_secure_pool().await;
@@ -2706,25 +2716,40 @@ async fn boot_kvt2_chain_seed_mismatch_closed_shift_no_abort() {
         .await
         .expect("boot must NOT abort on a closed-shift ChainSeedMismatch (W9.4 isolation)");
 
+    // A.3 re-ground (INV-08): finalize's ChainSeedMismatch producer was removed
+    // (moved to the SEND drift-assert).  The boot-KVT2 path no longer detects this
+    // POST-SEND tamper, so the doc converges to ACK.  The load-bearing invariant
+    // this test protects — **boot MUST NOT abort** on a closed-shift chain
+    // condition — still holds (boot returned Ok above).  The breach is surfaced by
+    // `invariant_scan` (detection moved; no recovery transition deleted).
     assert_eq!(
         read_doc_state(&pool, FN).await,
-        "KVT2",
-        "doc stays KVT2 (no CAS)"
+        "ACK",
+        "post-A.3: finalize no longer guards → the doc converges to ACK (boot did not abort)"
     );
     assert_eq!(
         read_shift_state_by_id(&pool, shift_id).await,
         "CLOSED",
-        "no illegal Closed→RMR CAS"
+        "no illegal Closed→RMR CAS — the closed shift is untouched"
     );
     assert_eq!(
         count_audit_event(&pool, "BOOT_KVT2_CHAIN_SEED_MISMATCH_NO_SHIFT").await,
-        1,
-        "non-escalatable shift → one no-shift operator audit (no CAS, no boot abort)"
+        0,
+        "post-A.3: the boot-KVT2 finalize path no longer detects the mismatch (producer removed)"
     );
     assert_eq!(
         count_audit_event(&pool, "BOOT_KVT2_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL").await,
         0,
-        "no escalation audit — the shift is not RMR-escalatable"
+        "no escalation audit — the shift is not RMR-escalatable (and no producer fires)"
+    );
+    // Detection MOVED to the scan.
+    let violations = prro::db::invariant_scan::scan(&pool).await.unwrap();
+    assert!(
+        violations.iter().any(|v| matches!(
+            v,
+            prro::db::invariant_scan::Violation::ChainSeedMismatch { .. }
+        )),
+        "invariant_scan surfaces the tampered chain-seed breach (detection moved)"
     );
 }
 

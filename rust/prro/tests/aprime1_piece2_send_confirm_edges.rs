@@ -105,11 +105,20 @@ async fn seed_signed_doc(
 ) -> DocumentId {
     let doc = vec![doc_byte; 16];
     let req = vec![doc_byte ^ 0xFF; 16];
+    // A.3 (advance-at-SEND): an online-origin doc (offline_fiscal_no NULL)
+    // that reaches the Sending → Sent CAS advances the chain seed to this
+    // doc's unsigned_xml_sha256, so stage_send reads it (non-NULL 32-byte).
+    // The genesis node_state seeded by `seed_node` (last_known NULL) matches
+    // this doc's NULL previous_hash so the pre-advance drift-assert passes.
+    // (Harmless for the offline-origin negative fixture — its advance is
+    // origin-gated off, so unsigned is simply never read.)
+    let unsigned = vec![doc_byte; 32];
     sqlx::query(
         "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
             doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
-            payload_json, payload_sha256_canonical, offline_fiscal_no, signed_by_cashier_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'b1', 't1', ?, '2026-05-09T12:34:56Z', '{}', ?, ?, ?)",
+            payload_json, payload_sha256_canonical, unsigned_xml_sha256, offline_fiscal_no, \
+            signed_by_cashier_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'b1', 't1', ?, '2026-05-09T12:34:56Z', '{}', ?, ?, ?, ?)",
     )
     .bind(&doc)
     .bind(&req)
@@ -120,6 +129,7 @@ async fn seed_signed_doc(
     .bind(state)
     .bind(fs_mode)
     .bind(vec![0u8; 32])
+    .bind(&unsigned)
     .bind(offline_fiscal_no)
     .bind(cashier)
     .execute(pool)
@@ -328,11 +338,24 @@ async fn c_e2e_open_then_sell_admitted_and_sent() {
     };
 
     // 3. The admitted SELL reaches SENT (promote PREPARED→SIGNED + XML, then send).
-    sqlx::query("UPDATE fiscal_documents SET state = 'SIGNED' WHERE document_id = ?")
-        .bind(sell_doc)
-        .execute(&pool)
-        .await
-        .unwrap();
+    // A.3 chain-continuity: the SHIFT_OPEN send above advanced the seed to
+    // open_doc.unsigned_xml_sha256 = [0x31; 32].  This SELL is the NEXT link,
+    // so its previous_hash must equal that advanced seed (else the pre-advance
+    // drift-assert fails), and it needs its own non-NULL unsigned_xml_sha256
+    // as the next advance target.  stage_acquire minted it with both NULL
+    // (previous_hash/unsigned are populated by later sign-stage wiring), so the
+    // manual sign-promotion sets them here.
+    sqlx::query(
+        "UPDATE fiscal_documents \
+         SET state = 'SIGNED', previous_hash = ?, unsigned_xml_sha256 = ? \
+         WHERE document_id = ?",
+    )
+    .bind(vec![0x31u8; 32])
+    .bind(vec![0x3Fu8; 32])
+    .bind(sell_doc)
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO document_files(document_id, kind, content) VALUES (?, 'SIGNED_XML', ?)",
     )

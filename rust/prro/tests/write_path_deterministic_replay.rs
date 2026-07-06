@@ -134,12 +134,19 @@ async fn seed_doc_in_state(
     let req_bytes = vec![doc_byte ^ 0xFF; 16];
     let sha = vec![0u8; 32];
     let lnd = doc_byte as i64;
+    // A.3 (advance-at-SEND): an online-origin doc (offline_fiscal_no NULL)
+    // that reaches the Sending → Sent CAS now advances the chain seed to
+    // this doc's unsigned_xml_sha256, so stage_send reads it (must be a
+    // non-NULL 32-byte value).  previous_hash is left NULL (genesis) —
+    // callers pair this with a genesis node_state (last_known NULL) so the
+    // pre-advance drift-assert (ns.seed == doc.previous_hash) holds.
+    let unsigned = vec![doc_byte; 32];
     sqlx::query(
         "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
             doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
-            payload_json, payload_sha256_canonical, signed_by_cashier_id) \
+            payload_json, payload_sha256_canonical, unsigned_xml_sha256, signed_by_cashier_id) \
          VALUES (?, ?, ?, ?, ?, 'SELL', ?, 'b1', 't1', 'ONLINE', \
-            '2026-01-01T00:00:00Z', '{}', ?, 'test-cashier')",
+            '2026-01-01T00:00:00Z', '{}', ?, ?, 'test-cashier')",
     )
     .bind(&doc_bytes)
     .bind(&req_bytes)
@@ -148,6 +155,7 @@ async fn seed_doc_in_state(
     .bind(lnd)
     .bind(state)
     .bind(&sha)
+    .bind(&unsigned)
     .execute(pool)
     .await
     .unwrap();
@@ -504,11 +512,15 @@ async fn fixture_8_kvt2_crash_no_dps_query() {
         "§6.6 demands KVT2 → ACK on crash-resume"
     );
 
-    // (2) Cross-doc MAC chain seed advanced (§6.6:814).
-    assert_eq!(
-        read_node_seed(app.db(), fn_id).await.as_deref(),
-        Some(unsigned_xml_sha.as_slice()),
-        "§6.6:814 — node_state.last_known_unsigned_xml_sha256 must advance to the finalised doc's seed"
+    // (2) A.3 (advance-at-SEND, design v3 §6): finalize NO LONGER
+    // advances the cross-doc MAC chain seed.  The online seed advance
+    // moved to `stage_send` (Sending → Sent CAS); a KVT2 crash-resume
+    // never re-runs SEND, so finalize is advance-free.  The seed stays
+    // exactly what it was pre-reconcile — genesis NULL here.  (Inverts
+    // the pre-A.3 §6.6:814 assertion that demanded finalize advance it.)
+    assert!(
+        read_node_seed(app.db(), fn_id).await.is_none(),
+        "A.3: finalize does NOT advance the seed — it stays genesis NULL through KVT2 crash-resume finalize"
     );
 
     // (3) Inbox flipped PROCESSING → DONE (stage_finalize step 5).

@@ -140,6 +140,20 @@ impl RefModel {
         MODEL_OFFLINE_ISSUED_STATES.contains(&state.as_str())
     }
 
+    /// The model's ONLINE-origin seed-advance set (A.3 advance-at-SEND / C6): an
+    /// online doc advances the FN chain seed once it crosses the SEND boundary
+    /// (`Sent`+), NOT only at `ACK`.  This is the ONLINE counterpart of
+    /// `is_offline_origin_issued` (the offline arm, U1 D3).  The single SSOT for
+    /// the model's online advance decision — `apply_sell` calls it, and the D7
+    /// tooth cross-checks it against prod `fiscal_documents::is_issued` under the
+    /// physical sfn-coupling (so a drift on either side turns the tooth RED).
+    pub fn online_origin_advances_seed(state: DocState) -> bool {
+        matches!(
+            state,
+            DocState::Sent | DocState::Kvt1 | DocState::Kvt2 | DocState::Ack
+        )
+    }
+
     fn shift_is_open(&self) -> bool {
         matches!(
             self.shift_state,
@@ -267,8 +281,13 @@ impl RefModel {
                 let doc_state = online_outcome_state(script);
                 self.docs.insert(lnd, doc_state); // the row IS minted (lnd allocated)
                 self.next_lnd += 1;
-                if doc_state == DocState::Ack {
-                    self.seed = Some(unsigned_hash); // online-origin issues at ACK
+                // A.3 / C6 — online-origin advances the seed at the SEND crossing
+                // (`Sent`+, matching prod advance-at-SEND), NOT only at `ACK`.
+                // A pre-SENT outcome (`Rejected` / `ErrorRetryable`, no sfn) does
+                // NOT advance — mirrors `fiscal_documents::is_issued` (SSOT fn
+                // `online_origin_advances_seed`, cross-checked by the D7 tooth).
+                if Self::online_origin_advances_seed(doc_state) {
+                    self.seed = Some(unsigned_hash);
                 }
                 // A DPS document-reject CAS's the row Sending→Rejected but
                 // `inline::run` returns Err(DpsRejected) → the interpreter reports

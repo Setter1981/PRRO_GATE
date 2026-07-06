@@ -76,12 +76,16 @@ async fn seed(
     let doc_bytes = vec![doc_byte; 16];
     let req_bytes = vec![doc_byte ^ 0xFF; 16];
     let sha = vec![0u8; 32];
+    // A.3 (advance-at-SEND): online-origin docs that reach the
+    // Sending → Sent CAS advance the chain seed to this doc's
+    // unsigned_xml_sha256, so stage_send reads it (non-NULL 32-byte).
+    let unsigned = vec![doc_byte; 32];
     sqlx::query(
         "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
             doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
-            payload_json, payload_sha256_canonical, signed_by_cashier_id) \
+            payload_json, payload_sha256_canonical, unsigned_xml_sha256, signed_by_cashier_id) \
          VALUES (?, ?, '1234567890', ?, ?, ?, 'SIGNED', 'b1', 't1', 'ONLINE', \
-            '2026-05-19T12:00:00Z', '{}', ?, ?)",
+            '2026-05-19T12:00:00Z', '{}', ?, ?, ?)",
     )
     .bind(&doc_bytes)
     .bind(&req_bytes)
@@ -89,10 +93,25 @@ async fn seed(
     .bind(doc_byte as i64)
     .bind(doc_type)
     .bind(&sha)
+    .bind(&unsigned)
     .bind(cashier_signer)
     .execute(pool)
     .await
     .expect("seed fiscal_documents");
+    // A.3: genesis node_state so the pre-advance drift-assert passes
+    // (last_known NULL == doc.previous_hash NULL) and the advance target
+    // row exists.  Bypass docs (SHIFT_CLOSE/Z_REPORT) with no shift bind
+    // NULL current_shift_id — that is fine.
+    sqlx::query(
+        "INSERT OR IGNORE INTO node_state \
+            (fiscal_number, mode, shift_state, current_shift_id, next_lnd, \
+             backend_profile_id, transport_profile_id, last_known_unsigned_xml_sha256) \
+         VALUES ('1234567890', 'ONLINE', 'OPENED', ?, 1, 'b1', 't1', NULL)",
+    )
+    .bind(shift_id_bytes_opt.as_deref())
+    .execute(pool)
+    .await
+    .expect("seed node_state (genesis)");
     sqlx::query(
         "INSERT INTO document_files(document_id, kind, content) \
          VALUES (?, 'SIGNED_XML', ?)",

@@ -574,6 +574,14 @@ enum PreOutcome {
         /// owns the offline shift edges).
         shift_id: Option<ShiftId>,
         offline_fiscal_no: Option<i64>,
+        /// A.3 (advance-at-SEND, §6 step 1) — chain fields from the PRE-CAS
+        /// `SendInputs` snapshot, propagated so the 4-b advance reads them
+        /// WITHOUT a post-CAS re-read (audit F7).  `previous_hash` feeds the
+        /// drift-assert; `unsigned_xml_sha256` is the advance target;
+        /// `mac_recovery_attempts` selects the C14 Variant P branch.
+        previous_hash: Option<Vec<u8>>,
+        unsigned_xml_sha256: Option<Vec<u8>>,
+        mac_recovery_attempts: i64,
     },
     /// `fetch_send_inputs_tx` returned `None` OR CAS returned
     /// `NotFound`.  No side effects.
@@ -1351,6 +1359,9 @@ async fn run_one_attempt(
                 doc_type: inputs.doc_type,
                 shift_id: inputs.shift_id,
                 offline_fiscal_no: inputs.offline_fiscal_no,
+                previous_hash: inputs.previous_hash,
+                unsigned_xml_sha256: inputs.unsigned_xml_sha256,
+                mac_recovery_attempts: inputs.mac_recovery_attempts,
                 fiscal_number: inputs.fiscal_number,
             })
         })
@@ -1358,7 +1369,17 @@ async fn run_one_attempt(
     .await
     .map_err(bridge_anyhow)?;
 
-    let (envelope, attempt_no, doc_type, fiscal_number, shift_id, offline_fiscal_no) = match pre {
+    let (
+        envelope,
+        attempt_no,
+        doc_type,
+        fiscal_number,
+        shift_id,
+        offline_fiscal_no,
+        previous_hash,
+        unsigned_xml_sha256,
+        mac_recovery_attempts,
+    ) = match pre {
         PreOutcome::Marked {
             envelope,
             attempt_no,
@@ -1366,6 +1387,9 @@ async fn run_one_attempt(
             fiscal_number,
             shift_id,
             offline_fiscal_no,
+            previous_hash,
+            unsigned_xml_sha256,
+            mac_recovery_attempts,
         } => (
             envelope,
             attempt_no,
@@ -1373,6 +1397,9 @@ async fn run_one_attempt(
             fiscal_number,
             shift_id,
             offline_fiscal_no,
+            previous_hash,
+            unsigned_xml_sha256,
+            mac_recovery_attempts,
         ),
         PreOutcome::DocumentMissing => return Ok(StageSendOutcome::DocumentMissing),
         PreOutcome::SignedArtifactMissing => {
@@ -1484,6 +1511,14 @@ async fn run_one_attempt(
 
             // server_fiscal_no UPDATE on success branch (Empty guard
             // ran before this closure; we know it's non-empty here).
+            //
+            // A.3 sfn-lockstep pin (§6 step 3): the ONLY live online
+            // issued-forward edge today is this `WireDecision::Sent` arm, so
+            // `set_server_fiscal_no_tx` + the seed advance below stay in
+            // lockstep (sfn set ⟺ seed advanced — the D3 discriminator). The
+            // dormant sfn-less edges (`(Sending,Kvt1)` inline fast-path,
+            // `(ErrorRetryable,Sent/Kvt1)` re-sends) are removed in PR-B; when
+            // the inline fast-path returns it MUST stamp sfn + advance here too.
             if let WireDecision::Sent { server_fiscal_no } = &decision {
                 if !fd::set_server_fiscal_no_tx(tx, doc, server_fiscal_no).await? {
                     return Err(anyhow::Error::new(
@@ -1491,18 +1526,67 @@ async fn run_one_attempt(
                     ));
                 }
 
-                // ═══════════════════════════════════════════════════════════
-                // A.3 SEED-ADVANCE SEAM — design v3 LOCKED, landing §6 step 2
-                // (docs/superpowers/specs/2026-07-04-a24-seed-fork-design.md).
-                // The advance-at-SEND seed write lands HERE, BETWEEN the
-                // `set_server_fiscal_no_tx` above and the shift confirm edges
-                // below: a pre-advance drift-assert (mirror stage_offline_ack)
-                // + `update_last_known_xml_sha_tx`, atomic with THIS CAS +
-                // sfn stamp (so `server_fiscal_no` set ⟺ seed advanced — the
-                // D3 discriminator).  A′.1 (this piece) lands first and leaves
-                // the seam; A.3 sews the advance in here.  Do NOT implement it
-                // in A′.1.
-                // ═══════════════════════════════════════════════════════════
+                // ── A.3 ADVANCE-AT-SEND (design v3 §6 step 2; dossier §9.1
+                //    Variant P) — the online issuance moment IS this fresh
+                //    `WireDecision::Sent` Applied CAS.  Advance the FN chain
+                //    seed (`node_state.last_known_unsigned_xml_sha256`) to THIS
+                //    doc's `unsigned_xml_sha256`, atomic with the CAS + sfn
+                //    stamp above (so `server_fiscal_no` set ⟺ seed advanced —
+                //    the D3 discriminator).  Online-origin ONLY (offline
+                //    advances at offline-ack, M2-01).  Chain fields come from
+                //    the PRE-CAS `SendInputs` snapshot (audit F7 — NO post-CAS
+                //    re-read).  The pre-advance drift-assert mirrors
+                //    `stage_offline_ack`: on a chain fork it FAILS CLOSED and
+                //    rolls the whole envelope back (doc stays `Sending` for
+                //    reconciliation); the D5 gate (A.3 PR-C) prevents the
+                //    interleave that could trip it after the wire call.
+                if offline_fiscal_no.is_none() {
+                    let ns = node_state::get_tx(tx, &fiscal_number).await?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "stage_send: node_state row missing for FN {fiscal_number} at online \
+                             seed advance (doc {doc:?})"
+                        )
+                    })?;
+                    let unsigned_arr: [u8; 32] = unsigned_xml_sha256
+                        .as_deref()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "stage_send: online SENT doc {doc:?} missing unsigned_xml_sha256"
+                            )
+                        })?
+                        .try_into()
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "stage_send: doc {doc:?} unsigned_xml_sha256 is not 32 bytes"
+                            )
+                        })?;
+                    // C14 Variant P (dossier §9.1): a recovered doc
+                    // (`mac_recovery_attempts >= 1`) deliberately re-anchored
+                    // `previous_hash` onto the DPS-supplied hash, voiding the
+                    // `local-seed == previous_hash` premise BY CONSTRUCTION — so
+                    // SKIP the equality gate (else it would false-fail on every
+                    // successful `-12` recovery).  The advance target (this
+                    // doc's own re-signed sha) is unchanged, re-syncing the
+                    // local chain onto DPS's tip.  Safe: the mac-recovery loop
+                    // runs in-run under the FN single-writer lease.
+                    if mac_recovery_attempts < 1 {
+                        anyhow::ensure!(
+                            ns.last_known_unsigned_xml_sha256.as_ref().map(|h| h.as_slice())
+                                == previous_hash.as_deref(),
+                            "stage_send: chain-seed drift for doc {doc:?} — node_state seed != \
+                             doc.previous_hash (online issuance must extend the chain from the last \
+                             issued doc); refusing to advance"
+                        );
+                    }
+                    if !node_state::update_last_known_xml_sha_tx(tx, &fiscal_number, &unsigned_arr)
+                        .await?
+                    {
+                        anyhow::bail!(
+                            "stage_send: node_state row vanished mid-envelope for FN \
+                             {fiscal_number} (doc {doc:?}) at online seed advance"
+                        );
+                    }
+                }
 
                 // A′.1 piece 2 — shift confirm edges 3/10.  "DPS Ack" for the
                 // shift ladder = SENT + `server_fiscal_no` (this fresh
@@ -1833,6 +1917,10 @@ mod tests {
             document_id: crate::db::models::ids::DocumentId::new(),
             shift_id: None,
             signed_by_cashier_id: None,
+            // A.3 — chain fields; envelope-build tests don't exercise the advance.
+            previous_hash: None,
+            unsigned_xml_sha256: None,
+            mac_recovery_attempts: 0,
         }
     }
 

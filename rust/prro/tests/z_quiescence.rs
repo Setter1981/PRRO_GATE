@@ -85,6 +85,42 @@ async fn seed_receipt(
     doc_id
 }
 
+/// Seed a SELL doc in `state` with explicit D3 discriminator fields
+/// (`server_fiscal_no` / `offline_fiscal_no`) — needed for the C10 quiescence
+/// disjunct which keys on the online-issued-unconfirmed signature.
+async fn seed_receipt_d3(
+    pool: &sqlx::SqlitePool,
+    shift_id: ShiftId,
+    lnd: i64,
+    state: &str,
+    server_fiscal_no: Option<&str>,
+    offline_fiscal_no: Option<i64>,
+) -> DocumentId {
+    let doc_id = DocumentId::new();
+    let req = vec![lnd as u8; 16];
+    sqlx::query(
+        "INSERT INTO fiscal_documents( \
+            document_id, request_id, fiscal_number, shift_id, lnd, doc_type, state, \
+            backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical, server_fiscal_no, offline_fiscal_no \
+         ) VALUES (?, ?, ?, ?, ?, 'SELL', ?, 'b', 't', 'ONLINE', '2026-06-08T00:00:00Z', \
+            '{}', ?, ?, ?)",
+    )
+    .bind(doc_id)
+    .bind(req)
+    .bind(FN)
+    .bind(shift_id)
+    .bind(lnd)
+    .bind(state)
+    .bind(&[0u8; 32][..])
+    .bind(server_fiscal_no)
+    .bind(offline_fiscal_no)
+    .execute(pool)
+    .await
+    .unwrap();
+    doc_id
+}
+
 async fn quiesce(pool: &sqlx::SqlitePool, shift_id: ShiftId) -> QuiescenceOutcome {
     quiesce_shift_before_z(pool, FN, shift_id).await.unwrap()
 }
@@ -175,6 +211,64 @@ async fn rejected_and_cancelled_do_not_block() {
     assert_eq!(quiesce(&pool, shift).await, QuiescenceOutcome::Clear);
     // Only the issued ACK is aggregated; REJECTED/CANCELLED are excluded.
     assert_eq!(issued_count(&pool, shift).await, 1);
+}
+
+/// C10 (design v3 §9.3 ruling): a POST-SENT online doc that escalated to
+/// REQUIRES_MANUAL_RECONCILIATION is ISSUED-BUT-UNCONFIRMED (lnd consumed,
+/// server_fiscal_no stamped, seed advanced at SEND) — DPS may still be holding
+/// it, so Z-quiescence MUST BLOCK on it (→ Pending) rather than close the shift
+/// over it. RMR is NOT in the coarse in-flight set, so pre-C10 this doc silently
+/// did NOT block; the new disjunct (offline_fiscal_no NULL AND server_fiscal_no
+/// set) admits exactly this cohort.
+#[tokio::test]
+async fn post_sent_online_rmr_blocks_quiescence() {
+    let pool = fresh_pool().await;
+    let shift = seed_open_shift(&pool).await;
+    seed_receipt(&pool, shift, 1, "ACK").await;
+    // online-origin (offline_fiscal_no NULL), issued-unconfirmed (sfn set), RMR.
+    seed_receipt_d3(
+        &pool,
+        shift,
+        2,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        Some("70000002"),
+        None,
+    )
+    .await;
+
+    let outcome = quiesce(&pool, shift).await;
+    assert!(
+        matches!(outcome, QuiescenceOutcome::Pending { .. }),
+        "post-SENT online-issued-unconfirmed RMR must block Z-quiescence, got {outcome:?}"
+    );
+}
+
+/// C10 NARROWNESS (paired control): the disjunct is guarded by
+/// `offline_fiscal_no IS NULL` — an OFFLINE-origin RMR (offline_fiscal_no set)
+/// is NOT online-issued-unconfirmed and must NOT block Z-quiescence via this
+/// disjunct (its manual-recon is owned by the drain path, not the Z boundary).
+/// Proves the C10 widening did not over-block all RMR.
+#[tokio::test]
+async fn offline_origin_rmr_does_not_block_quiescence() {
+    let pool = fresh_pool().await;
+    let shift = seed_open_shift(&pool).await;
+    seed_receipt(&pool, shift, 1, "ACK").await;
+    // offline-origin (offline_fiscal_no set) RMR → excluded by the disjunct guard.
+    seed_receipt_d3(
+        &pool,
+        shift,
+        2,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        Some("70000003"),
+        Some(9001),
+    )
+    .await;
+
+    assert_eq!(
+        quiesce(&pool, shift).await,
+        QuiescenceOutcome::Clear,
+        "offline-origin RMR must NOT block via the online-issued-unconfirmed disjunct"
+    );
 }
 
 #[tokio::test]
