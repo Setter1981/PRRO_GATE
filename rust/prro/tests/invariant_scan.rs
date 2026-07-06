@@ -1114,3 +1114,48 @@ fn model_db_access_is_funneled_through_tagged_wrappers() {
         violations.join("\n")
     );
 }
+
+// ─── A.3 PR-C (j) — D3 backstop below ACK (check 3a extension, AUD-L2-F4) ────
+//
+// An ONLINE-origin doc (offline_fiscal_no IS NULL) resting in an ISSUED-lane
+// state SENT/KVT1/KVT2 MUST carry a non-empty server_fiscal_no (advance-at-SEND
+// stamps it at the Sending→Sent CAS).  A NULL/empty sfn on such a row is a D3
+// breach BELOW ACK (the existing 3a covers the ACK tip).  The clean converse
+// (SENT WITH sfn scans clean) is already pinned by
+// `clean_online_issued_resting_at_sent_scans_clean`.
+#[tokio::test]
+async fn detects_online_sent_without_server_fiscal_no() {
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await;
+    // seed = None; the doc is non-issued (sfn NULL) so it must NOT advance the
+    // walk → keep node_state seed at None to isolate the new check.
+    seed_node_state(&pool, shift, None).await;
+    // online-origin SENT with NULL server_fiscal_no (ofn NULL, prev None,
+    // node seed None → clean under every OTHER check).
+    seed_doc(&pool, shift, 1, "SENT", None, None, Some(h(1)), None, false).await;
+    let v = scan(&pool).await.unwrap();
+    assert!(
+        v.iter()
+            .any(|x| matches!(x, Violation::OnlineIssuedStateWithoutServerFiscalNo { .. })),
+        "an online SENT with NULL server_fiscal_no is a D3 breach and must be flagged; got {v:#?}"
+    );
+}
+
+/// Guard the `offline_fiscal_no IS NULL` scope: an OFFLINE-origin issued-lane
+/// doc (ofn set) legitimately carries NULL `server_fiscal_no` (it issued via
+/// offline_fiscal_no) — the online D3 backstop must NOT flag it.  (It DOES trip
+/// the unrelated OfflineOriginWithoutSession check here; we assert only the
+/// new variant's absence.)
+#[tokio::test]
+async fn d3_backstop_does_not_flag_offline_issued_lane_without_sfn() {
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await;
+    seed_node_state(&pool, shift, None).await;
+    seed_doc(&pool, shift, 1, "SENT", None, None, None, Some(7), false).await;
+    let v = scan(&pool).await.unwrap();
+    assert!(
+        !v.iter()
+            .any(|x| matches!(x, Violation::OnlineIssuedStateWithoutServerFiscalNo { .. })),
+        "offline-origin issued-lane doc (ofn set) must NOT trip the online D3 backstop; got {v:#?}"
+    );
+}

@@ -38,9 +38,10 @@
 
 use sqlx::SqlitePool;
 
-use crate::db::models::enums::{DocState, NodeMode, ShiftState};
+use crate::db::models::enums::{DocState, NodeMode, Severity, ShiftState};
+use crate::db::models::ids::DocumentId;
 use crate::db::repositories::fiscal_documents::{self, DocumentRow};
-use crate::db::repositories::node_state;
+use crate::db::repositories::{audit_log, node_state};
 use crate::services::offline_sync::backlog_drain::EscalationOutcome;
 use crate::services::offline_sync::kvt2_confirm::{self, ConfirmDrainOutcome, Kvt2ConfirmSource};
 
@@ -78,6 +79,15 @@ pub struct TickSummary {
     /// and the FN was escalated to `RequiresManualReconciliation` (AUD-L2-1b) —
     /// a distinct operator signal vs `errors` (per-doc isolation skips).
     pub chain_seed_mismatch_escalated: usize,
+    /// A.3 PR-C — resting `ERROR_RETRYABLE` docs re-driven via `stage_send`
+    /// this tick (policy verdict `Redrive`): ER→Sending→Sent, un-gating the FN.
+    pub er_redriven: usize,
+    /// A.3 PR-C — ER docs escalated to `RequiresManualReconciliation` this tick
+    /// (policy `BudgetExhausted` / `EscalateManual` / `EscalateInconsistent`).
+    pub er_escalated_to_manual: usize,
+    /// A.3 PR-C — ER docs HELD this tick (policy `HoldProbeRequired` /
+    /// `HoldIndeterminate`): the FN stays gated, audit-only (no state change).
+    pub er_held: usize,
 }
 
 impl TickSummary {
@@ -136,10 +146,20 @@ pub async fn run_tick_for_fn(
 
     // (a) SELECT-first — reuse the read-only pending list and filter to the two
     // resting online states.  ZERO wire calls if nothing is resting.
+    // A.3 PR-C — the ER (pre-SENT) cohort joins the resting set: an online
+    // ErrorRetryable doc is a NON-ISSUED D5-gate blocker (it stalls every
+    // successor on the FN), so the tick is its runtime re-driver (via
+    // er_redrive_policy) — otherwise the gate would be an FN-wide stall until
+    // reboot (only boot re-drives ER today).
     let resting: Vec<DocumentRow> = fiscal_documents::list_pending_for_fn(pool, fiscal_number)
         .await?
         .into_iter()
-        .filter(|d| matches!(d.state, DocState::Sent | DocState::Kvt1))
+        .filter(|d| {
+            matches!(
+                d.state,
+                DocState::Sent | DocState::Kvt1 | DocState::ErrorRetryable
+            )
+        })
         .collect();
 
     let mut summary = TickSummary::new(fiscal_number);
@@ -178,6 +198,14 @@ async fn converge_one_doc(
     let doc_id = doc.document_id;
     let fiscal_number = doc.fiscal_number.clone();
     let mut doc = doc;
+
+    // A.3 PR-C — ER resolver branch.  An `ErrorRetryable` doc is a non-issued
+    // D5-gate blocker, NOT part of the SENT→KVT1→ACK convergence cascade; route
+    // it through `er_redrive_policy` and return.  (A `Redrive` that advances the
+    // doc to `Sent` un-gates the FN; the next tick converges Sent→ACK.)
+    if doc.state == DocState::ErrorRetryable {
+        return converge_error_retryable_doc(pool, view, &doc, summary).await;
+    }
 
     // SENT-handler — the boot Sent-arm, invoked outside boot (same function).
     if doc.state == DocState::Sent {
@@ -288,4 +316,184 @@ async fn converge_one_doc(
         }
     }
     Ok(())
+}
+
+// ─── A.3 PR-C — ER (pre-SENT) resolver ───────────────────────────────────────
+
+/// Consecutive `HoldIndeterminate` ticks before the audit escalates
+/// `Warning → Critical`.  `HoldIndeterminate` means the durable `retry_class`
+/// is missing (no `transport_trace` row / NULL / unrecognized) — re-driving is
+/// impossible, but the indeterminacy MAY resolve if a late-arriving trace
+/// lands.  `N = 3` grants two grace ticks (Warning) before surfacing a CRITICAL
+/// operator ticket — ambiguous-wire is a manual-recon family (CLAUDE.md), so a
+/// prompt-but-not-spammy escalation is correct (this is a HOLD, never a spin:
+/// the doc is not re-driven and the FN stays gated regardless of severity).
+const HOLD_INDETERMINATE_CRITICAL_TICKS: i64 = 3;
+
+const CONVERGE_ER_HOLD_INDETERMINATE: &str = "CONVERGE_ER_HOLD_INDETERMINATE";
+const CONVERGE_ER_PROBE_DEFERRED: &str = "CONVERGE_ER_PROBE_DEFERRED";
+const CONVERGE_ER_REDRIVE_ERROR: &str = "CONVERGE_ER_REDRIVE_ERROR";
+
+fn doc_hex(doc_id: DocumentId) -> String {
+    use std::fmt::Write;
+    doc_id.as_bytes().iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Resolve one resting `ErrorRetryable` doc via the EXISTING `er_redrive_policy`
+/// (no policy-semantics change — the tick only ROUTES around its verdicts):
+///   - `Redrive` → `stage_send::run` (the boot re-drive mechanism, now in the
+///     tick): ErrorRetryable→Sending→Sent; the sfn stamp at the Sending→Sent
+///     CAS makes the doc ISSUED ⇒ the D5 gate opens.
+///   - `BudgetExhausted` / `EscalateManual` / `EscalateInconsistent` → escalate
+///     the doc to `RequiresManualReconciliation` (reuse the boot CAS).
+///   - `HoldProbeRequired` → HOLD + Warning audit (submit-time `last_chk`
+///     reconciliation is deferred to M5, same as boot).
+///   - `HoldIndeterminate` → fail-closed HOLD: the FN stays gated (doc
+///     unchanged) + an audit that escalates Warning→Critical after N ticks.
+///
+/// Per-doc isolation: a `Redrive` `stage_send` error audits + counts, never
+/// aborts the FN's cohort (the caller's per-doc guard also catches a bubbled
+/// `Err`).  No wire/crypto inside a write tx (INV #1): `stage_send` and the
+/// escalate CAS own their own envelopes; audit appends are pool-bound.
+async fn converge_error_retryable_doc(
+    pool: &SqlitePool,
+    view: &RuntimeView<'_>,
+    doc: &DocumentRow,
+    summary: &mut TickSummary,
+) -> anyhow::Result<()> {
+    use crate::services::reconciliation::er_redrive_policy::{
+        evaluate_er_redrive, ErRedriveDecision,
+    };
+    use crate::services::write_path::error_routing::RetryClass;
+
+    let doc_id = doc.document_id;
+    let entity = doc_hex(doc_id);
+
+    match evaluate_er_redrive(pool, doc_id).await? {
+        ErRedriveDecision::Redrive => {
+            match crate::services::write_path::stage_send::run(
+                pool,
+                view.dps,
+                doc_id,
+                Some(view.signing_ctx),
+            )
+            .await
+            {
+                Ok(_) => summary.er_redriven += 1,
+                Err(e) => {
+                    // Per-doc isolation: record + count, do NOT abort the cohort.
+                    let payload = serde_json::json!({
+                        "document_id": entity,
+                        "branch": "converge-er-redrive",
+                        "error": e.to_string(),
+                    });
+                    audit_log::append(
+                        pool,
+                        "fiscal_document",
+                        &entity,
+                        CONVERGE_ER_REDRIVE_ERROR,
+                        Severity::Warning,
+                        None,
+                        Some(&payload.to_string()),
+                    )
+                    .await?;
+                    summary.errors += 1;
+                }
+            }
+        }
+        ErRedriveDecision::BudgetExhausted { .. } => {
+            boot_phase::cas_error_retryable_to_manual_reconciliation(
+                pool,
+                doc_id,
+                RetryClass::TransientRetry.as_str(),
+                Severity::Error,
+            )
+            .await?;
+            summary.er_escalated_to_manual += 1;
+        }
+        ErRedriveDecision::EscalateManual { class } => {
+            boot_phase::cas_error_retryable_to_manual_reconciliation(
+                pool,
+                doc_id,
+                class.as_str(),
+                Severity::Error,
+            )
+            .await?;
+            summary.er_escalated_to_manual += 1;
+        }
+        ErRedriveDecision::EscalateInconsistent { class } => {
+            boot_phase::cas_error_retryable_to_manual_reconciliation(
+                pool,
+                doc_id,
+                class.as_str(),
+                Severity::Critical,
+            )
+            .await?;
+            summary.er_escalated_to_manual += 1;
+        }
+        ErRedriveDecision::HoldProbeRequired => {
+            let payload = serde_json::json!({
+                "document_id": entity,
+                "branch": "converge-er-hold",
+                "retry_class": "ProbeRequired",
+            });
+            audit_log::append(
+                pool,
+                "fiscal_document",
+                &entity,
+                CONVERGE_ER_PROBE_DEFERRED,
+                Severity::Warning,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await?;
+            summary.er_held += 1;
+        }
+        ErRedriveDecision::HoldIndeterminate => {
+            // Fail-closed HOLD: the FN stays gated (doc unchanged).  Escalate the
+            // audit Warning→Critical once N consecutive HoldIndeterminate ticks
+            // have accrued (durable evidence missing → operator triage surface).
+            let prior = count_converge_indeterminate_audits(pool, &entity).await?;
+            let severity = if prior + 1 >= HOLD_INDETERMINATE_CRITICAL_TICKS {
+                Severity::Critical
+            } else {
+                Severity::Warning
+            };
+            let payload = serde_json::json!({
+                "document_id": entity,
+                "branch": "converge-er-hold",
+                "retry_class": "indeterminate",
+                "tick_no": prior + 1,
+            });
+            audit_log::append(
+                pool,
+                "fiscal_document",
+                &entity,
+                CONVERGE_ER_HOLD_INDETERMINATE,
+                severity,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await?;
+            summary.er_held += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Count prior `CONVERGE_ER_HOLD_INDETERMINATE` audit rows for a doc — the
+/// durable per-doc tick counter backing the Warning→Critical escalation (no
+/// schema churn: the audit trail IS the counter).
+async fn count_converge_indeterminate_audits(pool: &SqlitePool, entity: &str) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE entity_type = 'fiscal_document' AND entity_id = ? AND event_type = ?",
+    )
+    .bind(entity)
+    .bind(CONVERGE_ER_HOLD_INDETERMINATE)
+    .fetch_one(pool)
+    .await
 }

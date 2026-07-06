@@ -524,6 +524,20 @@ async fn stage1_unique_fn_lnd_collision_fails_closed() {
     .unwrap();
     assert_eq!(next_lnd(&pool).await, 2);
 
+    // A.3 PR-C — advance doc#1 to an ISSUED state (SENT + server_fiscal_no) so
+    // the D5 acquire gate is TRANSPARENT for the second acquire; otherwise its
+    // resting PREPARED state would gate the mint BEFORE the lnd-collision path
+    // is reached.  In production the pipeline drives doc#1 forward before the
+    // next acquire runs; this fixture advances it explicitly.
+    sqlx::query(
+        "UPDATE fiscal_documents SET state = 'SENT', server_fiscal_no = 'D-1' \
+         WHERE fiscal_number = ? AND lnd = 1",
+    )
+    .bind(FN)
+    .execute(&pool)
+    .await
+    .unwrap();
+
     // Force collision: rewind next_lnd backwards.
     sqlx::query("UPDATE node_state SET next_lnd = 1 WHERE fiscal_number = ?")
         .bind(FN)
@@ -597,24 +611,41 @@ async fn stage1_concurrent_writers_lnd_monotonic() {
     let r1 = t1.await.unwrap().unwrap();
     let r2 = t2.await.unwrap().unwrap();
 
-    let lnds: Vec<i64> = [r1, r2]
-        .iter()
-        .map(|r| match r {
-            WorkerProcessResult::Proceed(c) => c.document.lnd,
-            other => panic!("expected Proceed, got {other:?}"),
-        })
-        .collect();
-    let mut sorted = lnds.clone();
-    sorted.sort_unstable();
+    // A.3 PR-C — the two raw concurrent acquires serialise on `BEGIN IMMEDIATE`;
+    // the winner mints (Proceed, lnd 1), then the D5 acquire gate refuses the
+    // loser because the winner's PREPARED doc is a non-issued sibling on the FN.
+    // Exactly one mint + one gated refusal → NO double-mint, NO lnd collision.
+    // (In production the fn_write_gate serialises the WHOLE pipeline per FN, so a
+    // second acquire never observes a resting PREPARED sibling; this unit test
+    // drives raw acquires, so the gate is what serialises the second mint.)
+    let mut proceeds = 0;
+    let mut gated = 0;
+    for r in [&r1, &r2] {
+        match r {
+            WorkerProcessResult::Proceed(c) => {
+                assert_eq!(c.document.lnd, 1, "the sole mint takes lnd 1");
+                proceeds += 1;
+            }
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::WriteGateSiblingPending,
+            } => gated += 1,
+            other => panic!("expected Proceed or WriteGateSiblingPending, got {other:?}"),
+        }
+    }
     assert_eq!(
-        sorted,
-        vec![1, 2],
-        "concurrent writers must allocate {{1,2}}, got {lnds:?}"
+        (proceeds, gated),
+        (1, 1),
+        "exactly one mint + one gated refusal under concurrency"
     );
     assert_eq!(
         next_lnd(&pool).await,
-        3,
-        "next_lnd advanced 1→3 across two writers"
+        2,
+        "only the winner consumed an lnd (1→2), no double-alloc"
+    );
+    assert_eq!(
+        doc_count(&pool).await,
+        1,
+        "no double-mint under concurrency"
     );
 }
 
@@ -1532,4 +1563,96 @@ fn _unused_imports_suppression() {
         opened_by_cashier_id: prro::db::models::ids::CashierId::new("__test_unused_imports__")
             .expect("valid cashier id"),
     };
+}
+
+// ════════════════════════════════════════════════════════════════════
+// A.3 PR-C (e) — D5 gate, acquire layer: pre-mint fail-closed refusal.
+//
+// A non-issued sibling resting on the FN gates a fresh mint: acquire
+// refuses BEFORE the tax_snapshot INSERT + lnd alloc + doc mint, so the
+// refusal consumes NO lnd and writes NO fiscal_documents row (audit_log
+// only — the pre-acquire-refusal persistence class, same shape as
+// ShiftOpenMissingCashier).  At acquire the new doc has no lnd yet →
+// ANY non-issued sibling blocks (self_lnd = None).  RETRYABLE — the
+// online_convergence resolver re-drives the blocker; the client retries.
+// ════════════════════════════════════════════════════════════════════
+
+/// Seed a resting online-origin ERROR_RETRYABLE doc (non-issued) directly.
+async fn seed_online_er_blocker(pool: &sqlx::SqlitePool, lnd: i64) {
+    let doc_id = prro::db::models::ids::DocumentId::new();
+    let req_id = RequestId::new();
+    sqlx::query(
+        "INSERT INTO fiscal_documents (
+             document_id, request_id, fiscal_number, lnd, doc_type, state,
+             backend_profile_id, transport_profile_id, fs_mode, business_ts,
+             total_sum_kop, payload_json, payload_sha256_canonical
+         ) VALUES (?, ?, ?, ?, 'SELL', 'ERROR_RETRYABLE', 'b', 't', 'ONLINE', \
+                   '2026-04-22T12:00:00Z', 15000, '{}', ?)",
+    )
+    .bind(doc_id)
+    .bind(req_id)
+    .bind(FN)
+    .bind(lnd)
+    .bind(&[0u8; 32][..])
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn e_acquire_premint_refused_when_non_issued_sibling_rests() {
+    let pool = fresh_pool().await;
+    let secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(
+        &pool,
+        Some("b"),
+        Some("t"),
+        NodeMode::Online,
+        ShiftState::Opened,
+        Some(shift_id),
+    )
+    .await;
+    // A resting online-ER sibling (non-issued) at lnd=1 → the FN is gated.
+    seed_online_er_blocker(&pool, 1).await;
+    // Advance next_lnd past the blocker so "no NEW lnd consumed" is provable.
+    sqlx::query("UPDATE node_state SET next_lnd = 2 WHERE fiscal_number = ?")
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let req = seed_inbox_new(&pool, DocType::Sell).await;
+    let result = stage_acquire::run(&pool, &secure, TEST_DRIVER_ID, req, cmd(DocType::Sell))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::WriteGateSiblingPending
+            }
+        ),
+        "acquire must refuse a fresh mint while a non-issued sibling rests; got {result:?}"
+    );
+    // Pre-mint / four-negation: no NEW doc, no NEW lnd, inbox terminalised,
+    // audit-only.
+    assert_eq!(
+        doc_count(&pool).await,
+        1,
+        "no new doc minted (only the blocker)"
+    );
+    assert_eq!(next_lnd(&pool).await, 2, "no new lnd consumed");
+    assert_eq!(
+        inbox_status(&pool, &req).await,
+        "REJECTED",
+        "inbox terminalised"
+    );
+    assert_eq!(
+        audit_count_for_event(&pool, "write_gate_sibling_pending").await,
+        1,
+        "audit-only refusal recorded"
+    );
 }

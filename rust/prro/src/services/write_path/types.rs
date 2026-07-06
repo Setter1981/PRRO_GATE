@@ -233,6 +233,15 @@ pub enum RejectionReason {
     /// the window where Z-report can be issued while backlog non-empty.
     /// Audit shape: `OFFLINE_Z_REPORT_BACKLOG_DRAIN_PENDING_REFUSED`.
     ZReportBlockedBacklogDrainPending,
+    /// A.3 PR-C (D5 gate, design v3 §6 step 7) — a NON-ISSUED sibling rests
+    /// on this FN, so minting + signing a successor now would stale its
+    /// chain-`previous_hash` AFTER the wire call (the ER-parked interleave).
+    /// Fail-closed pre-mint (no lnd, no fiscal_documents row; audit-only —
+    /// same persistence class as `ShiftOpenMissingCashier`).  RETRYABLE
+    /// (503, NOT a terminal reject): the `online_convergence` resolver
+    /// re-drives the blocker, then the client retries.  Audit shape:
+    /// `write_gate_sibling_pending`.
+    WriteGateSiblingPending,
 }
 
 /// W14a-2b Commit 4 — channel derived from node mode at stage_acquire

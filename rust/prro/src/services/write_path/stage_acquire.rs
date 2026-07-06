@@ -609,6 +609,48 @@ pub async fn run(
                 .await;
             }
 
+            // [Step 6b″] A.3 PR-C (D5 gate, design v3 §6 step 7) — fail-closed
+            //            PRE-MINT refusal when a NON-ISSUED sibling rests on
+            //            this FN.  Minting + signing a successor now would
+            //            stale its chain-`previous_hash` AFTER the wire call
+            //            (the blocker later advances the seed → the drift-assert
+            //            fires past fiscal commitment): the ER-parked interleave.
+            //            Placed on the fresh-Proceed path AFTER resume/terminal
+            //            short-circuit but BEFORE the tax_snapshot INSERT + lnd
+            //            alloc + doc mint, so it consumes NO lnd and writes NO
+            //            row (audit_log only — the pre-acquire-refusal class).
+            //            At acquire the successor has no lnd yet → ANY non-issued
+            //            sibling blocks (self_lnd = None; a brand-new doc is
+            //            younger than all) and there is no self row yet
+            //            (self_document_id = None).  Channel-agnostic + every
+            //            doc type: any fresh mint chains, and the sign-layer
+            //            pin-tx assert (which cannot see the channel
+            //            pre-issuance) refuses unconditionally too — gating
+            //            here keeps the two layers consistent (no mint slips
+            //            past acquire only to strand PREPARED at sign).
+            //            RETRYABLE (503): the `online_convergence` resolver
+            //            re-drives the blocker; the client retries.
+            //            ONLINE-LANE ONLY: an OFFLINE mint is NEVER gated
+            //            (offline availability is unconditional — offline issues
+            //            locally and the runtime resolver is online-scoped, so
+            //            gating an offline sell would stall it with no re-driver).
+            //            The blocker is the ONLINE seed-fork; the sign-layer
+            //            assert is likewise scoped to online-origin docs, so the
+            //            two layers stay consistent.
+            if channel == Channel::Online
+                && fd::exists_blocking_non_issued_sibling_tx(tx, &fn_id, None, None).await?
+            {
+                return reject(
+                    tx,
+                    &request_id,
+                    RejectionReason::WriteGateSiblingPending,
+                    "write_gate_sibling_pending",
+                    Severity::Warning,
+                    None,
+                )
+                .await;
+            }
+
             // [Step 6c] W4-Z2a piece 6b-self-review Important #1 —
             //           insert tax_snapshot ONLY now that we're
             //           definitively on the Proceed path (Resume and
