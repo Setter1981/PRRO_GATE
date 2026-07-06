@@ -46,6 +46,11 @@ fn op() -> impl Strategy<Value = Op> {
         // ── valid (wire ops carry a DpsScript) ──
         dps_script().prop_map(Op::OnlineSell),
         Just(Op::OfflineSell),
+        // PR-R-fuzz — Return ops carry the same weight as their Sell twins, so
+        // Return / mixed SELL+RETURN sequences really appear in runs (asserted
+        // by `generator_emits_online_and_offline_returns`).
+        dps_script().prop_map(Op::OnlineReturn),
+        Just(Op::OfflineReturn),
         dps_script().prop_map(Op::GoOnline),
         dps_script().prop_map(Op::Drain),
         Just(Op::Reboot),
