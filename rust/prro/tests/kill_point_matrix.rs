@@ -2311,30 +2311,35 @@ async fn drain_kvt1_reentry_superseded_escalates_manual() {
     let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
     with_immediate(&pool, move |tx| {
         Box::pin(async move {
-            let o1 = fiscal_documents::transition_state(
-                tx,
-                doc1_id,
-                DocState::OfflineLocalAck,
-                DocState::Sent,
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-            assert!(matches!(o1, TransitionOutcome::Applied), "doc1 OLA→Sent");
-            let o2 =
-                fiscal_documents::transition_state(tx, doc1_id, DocState::Sent, DocState::Kvt1)
+            // A.3 PR-B step 6 removed the direct (OfflineLocalAck, Sent) M3a
+            // placeholder edge; stage the cohort via the legal drain ladder
+            // OLA → Sending → Sent (→ Kvt1 for doc1).
+            for (from, to) in [
+                (DocState::OfflineLocalAck, DocState::Sending),
+                (DocState::Sending, DocState::Sent),
+                (DocState::Sent, DocState::Kvt1),
+            ] {
+                let o = fiscal_documents::transition_state(tx, doc1_id, from, to)
                     .await
                     .map_err(anyhow::Error::from)?;
-            assert!(matches!(o2, TransitionOutcome::Applied), "doc1 Sent→Kvt1");
+                assert!(
+                    matches!(o, TransitionOutcome::Applied),
+                    "doc1 {from:?}→{to:?}"
+                );
+            }
             document_files::replace_tx(tx, doc1_id, DocumentFileKind::Kvt1Raw, &kvt1_bytes).await?;
-            let o3 = fiscal_documents::transition_state(
-                tx,
-                doc2_id,
-                DocState::OfflineLocalAck,
-                DocState::Sent,
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-            assert!(matches!(o3, TransitionOutcome::Applied), "doc2 OLA→Sent");
+            for (from, to) in [
+                (DocState::OfflineLocalAck, DocState::Sending),
+                (DocState::Sending, DocState::Sent),
+            ] {
+                let o = fiscal_documents::transition_state(tx, doc2_id, from, to)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                assert!(
+                    matches!(o, TransitionOutcome::Applied),
+                    "doc2 {from:?}→{to:?}"
+                );
+            }
             Ok::<(), anyhow::Error>(())
         })
     })
