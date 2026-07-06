@@ -178,7 +178,9 @@ pub enum ConvertError {
     /// receipt a RETURN references).  The compact `<C T=>` wire dialect the
     /// gateway ships does NOT carry ORDERRETNUM — neither the 4-year Python
     /// production serializer nor the WebCheck capture emit it (the verbose
-    /// `check01.xsd` has it optional, but that format is not what we send).
+    /// `check01.xsd` has it optional, but that format is not what we send;
+    /// corroborated by the RT-3 red-team adjudication in
+    /// `docs/reviews/redteam-2026-06-12-adjudication.md`).
     /// So there is no wire slot to honor the field; we FAIL CLOSED — same
     /// posture as `raw_frames` / `acquirer_slip` — rather than silently drop
     /// it (fail-open), which would leave the client falsely believing the
@@ -792,8 +794,13 @@ pub async fn convert_to_signer_payload(
     // `return_check_number` (the original-receipt link a RETURN references)
     // has no slot in the compact `<C T=>` wire dialect we ship (ORDERRETNUM is
     // never emitted by the Python-prod / WebCheck reference serializers).
-    // Fail closed for EVERY doc-type if present — like `raw_frames`, hoisted
-    // ABOVE the match — rather than accept-and-drop it (fail-open).  See
+    // Fail closed for every convert-routed doc-type if present — like
+    // `raw_frames`, hoisted ABOVE the match — rather than accept-and-drop it
+    // (fail-open).  Z-class (ShiftClose/ZReport) is routed AROUND convert at
+    // ingress (`is_z_class`) and is intentionally out of scope: the field is
+    // envelope-only (never serialized into any stored/wire payload — only
+    // `cmd.payload` is) and semantically inapplicable to a Z (no original
+    // receipt), so it cannot leak regardless.  See
     // `ConvertError::ReturnCheckNumberNotSupported` for the full ground-truth.
     if cmd.return_check_number.is_some() {
         return Err(ConvertError::ReturnCheckNumberNotSupported);
