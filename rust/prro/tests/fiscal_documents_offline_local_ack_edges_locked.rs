@@ -9,7 +9,7 @@
 //! break this test loudly.  Future scope expansions require an
 //! explicit operator decision + a corresponding update here.
 //!
-//! ## Locked sets (post-W6 baseline)
+//! ## Locked sets (post-A.3-PR-B baseline)
 //!
 //! ### `to == OfflineLocalAck`
 //!
@@ -19,22 +19,19 @@
 //!
 //! ### `from == OfflineLocalAck`
 //!
-//! Exactly **4** edges:
-//!   - `(OfflineLocalAck, Sent)` — M3a placeholder; preserved per
-//!     W6 add-only scope.
-//!   - `(OfflineLocalAck, Sending)` — Pattern C drain entry
-//!     (NEW in W6).
+//! Exactly **2** edges (A.3 PR-B step 6 dropped the 2 sfn-less dormant ones):
+//!   - `(OfflineLocalAck, Sending)` — Pattern C drain entry (the live drain
+//!     lane; W6).
 //!   - `(OfflineLocalAck, Cancelled)` — manual operator escape
-//!     during drain (NEW in W6).
-//!   - `(OfflineLocalAck, Kvt2)` — W9b lastChk replay short-circuit
-//!     edge.  Drain pre-flight on docs with `server_fiscal_no IS NOT
-//!     NULL` short-circuits Sending/Sent/Kvt1 when DPS confirms via
-//!     lastChk + id match + non-empty data_sign.  W12 PR consumes
-//!     this edge; W9b lands the whitelist only (helper at
-//!     `fiscal_documents::list_drain_candidates_for_fn_ordered_by_lnd`
-//!     — renamed in C5 from the OFFLINE_LOCAL_ACK-only variant).
+//!     during drain (W6).
 //!
-//! **Total `OfflineLocalAck`-touching edges: 5.**
+//! REMOVED (A.3 PR-B step 6 — sfn-less, ZERO producers per AUD-L1-2):
+//!   - `(OfflineLocalAck, Sent)` — legacy M3a placeholder, superseded by the
+//!     OLA → Sending ladder.
+//!   - `(OfflineLocalAck, Kvt2)` — W9b lastChk short-circuit that was SPEC'd but
+//!     NEVER wired; drain converges via Sending → Sent → Kvt1 → Kvt2.
+//!
+//! **Total `OfflineLocalAck`-touching edges: 3.**
 
 use prro::db::models::enums::DocState;
 use prro::db::repositories::fiscal_documents::allowed_transition;
@@ -68,12 +65,10 @@ const ALL_STATES: &[DocState] = &[
 const EXPECTED_INBOUND: &[DocState] = &[DocState::Signed];
 
 /// The exact set of edges where `from == OfflineLocalAck`.
-const EXPECTED_OUTBOUND: &[DocState] = &[
-    DocState::Sent,
-    DocState::Sending,
-    DocState::Cancelled,
-    DocState::Kvt2,
-];
+/// A.3 PR-B step 6: `(OfflineLocalAck, Sent)` (legacy M3a placeholder) and
+/// `(OfflineLocalAck, Kvt2)` (W9b lastChk short-circuit, spec'd-but-never-wired)
+/// REMOVED as sfn-less dormant edges — the live drain lane is OLA → Sending.
+const EXPECTED_OUTBOUND: &[DocState] = &[DocState::Sending, DocState::Cancelled];
 
 #[test]
 fn doc_state_enum_total_count_is_locked() {
@@ -108,7 +103,7 @@ fn offline_local_ack_inbound_edges_are_exactly_signed() {
 }
 
 #[test]
-fn offline_local_ack_outbound_edges_are_exactly_sent_sending_cancelled_kvt2() {
+fn offline_local_ack_outbound_edges_are_exactly_sending_cancelled() {
     for &to in ALL_STATES {
         let actual = allowed_transition(DocState::OfflineLocalAck, to);
         let expected = EXPECTED_OUTBOUND.contains(&to);
@@ -122,11 +117,11 @@ fn offline_local_ack_outbound_edges_are_exactly_sent_sending_cancelled_kvt2() {
 }
 
 #[test]
-fn total_offline_local_ack_touching_edge_count_is_five() {
+fn total_offline_local_ack_touching_edge_count_is_three() {
     // Count every allowed edge where OfflineLocalAck appears as
-    // either endpoint.  Total locked at 5: 1 inbound + 4 outbound
-    // (4th outbound = `(OfflineLocalAck, Kvt2)` W9b lastChk replay
-    // short-circuit edge).
+    // either endpoint.  A.3 PR-B step 6 dropped 2 sfn-less dormant
+    // outbound edges ((OLA, Sent) + (OLA, Kvt2)): total 5 → 3
+    // (1 inbound + 2 outbound = OLA → {Sending, Cancelled}).
     let mut count = 0usize;
     for &x in ALL_STATES {
         if allowed_transition(x, DocState::OfflineLocalAck) {
@@ -139,12 +134,12 @@ fn total_offline_local_ack_touching_edge_count_is_five() {
     // Note: (OfflineLocalAck, OfflineLocalAck) would be counted
     // twice if it were allowed.  It is NOT allowed (idempotent
     // self-loop on a terminal-adjacent state is meaningless), so
-    // the count is exactly 5.  If self-loop ever became allowed,
+    // the count is exactly 3.  If self-loop ever became allowed,
     // the EXPECTED_INBOUND/OUTBOUND assertions above would fail
     // first.
     assert_eq!(
-        count, 5,
-        "OfflineLocalAck-touching edge count drifted from 5; \
+        count, 3,
+        "OfflineLocalAck-touching edge count drifted from 3; \
          see EXPECTED_INBOUND ({EXPECTED_INBOUND:?}) + EXPECTED_OUTBOUND ({EXPECTED_OUTBOUND:?})"
     );
 }
@@ -163,12 +158,7 @@ fn offline_local_ack_self_loop_is_forbidden() {
 /// above.
 #[test]
 fn w6_outbound_edges_named_positive_cases() {
-    // M3a placeholder, preserved.
-    assert!(allowed_transition(
-        DocState::OfflineLocalAck,
-        DocState::Sent
-    ));
-    // W6 new: Pattern C drain entry.
+    // W6 new: Pattern C drain entry (the live OLA outbound lane).
     assert!(allowed_transition(
         DocState::OfflineLocalAck,
         DocState::Sending
@@ -190,19 +180,16 @@ fn w6_inbound_edge_named_positive_case() {
     ));
 }
 
-/// W9b §5.1 focused: lock the lastChk replay short-circuit edge.
-///
-/// Drain orchestrator pre-flight on docs with `server_fiscal_no IS
-/// NOT NULL` may advance directly OfflineLocalAck → Kvt2 (skipping
-/// Sending/Sent/Kvt1) when DPS confirms via lastChk.  W12 PR
-/// consumes this edge for the replay path; W9b lands the whitelist
-/// only.  This positive case + the count/inbound/outbound guards
-/// above are the drift-catch envelope.
+/// A.3 PR-B step 6 (was W9b §5.1) — the lastChk replay short-circuit edge
+/// `(OfflineLocalAck, Kvt2)` was SPEC'd but NEVER wired: the W9b/W12 drain
+/// actually converges via Sending → Sent → Kvt1 → Kvt2 (kvt2_confirm.rs), so
+/// this sfn-less direct hop had ZERO producers (AUD-L1-2 confirmed). Removed as
+/// dormant; now NEGATIVELY pinned (drain must never rely on this direct hop).
 #[test]
-fn w9b_outbound_edge_named_positive_case_offline_local_ack_to_kvt2() {
+fn w9b_outbound_edge_offline_local_ack_to_kvt2_is_forbidden() {
     assert!(
-        allowed_transition(DocState::OfflineLocalAck, DocState::Kvt2),
-        "W9b lastChk replay short-circuit edge (OfflineLocalAck, Kvt2) \
-         MUST be whitelisted; drain pre-flight relies on this"
+        !allowed_transition(DocState::OfflineLocalAck, DocState::Kvt2),
+        "(OfflineLocalAck, Kvt2) is a removed sfn-less dormant edge; drain \
+         converges via the Sending → Sent → Kvt1 → Kvt2 ladder"
     );
 }

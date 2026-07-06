@@ -183,11 +183,15 @@ pub fn allowed_transition(from: DocState, to: DocState) -> bool {
             | (Signed, Encrypted)
             | (Signed, ErrorRetryable)
             | (Signed, OfflineLocalAck)
-            | (Encrypted, Sent)
+            // A.3 PR-B step 6: (Encrypted, Sent) removed — sfn-less dormant edge;
+            // Encrypted → Sending → Sent is the live Pattern B ladder.
             | (Encrypted, ErrorRetryable)
             | (Sent, Kvt1)
             | (Sent, ErrorRetryable)
-            | (Sent, Rejected)
+            // A.3 PR-B step 6: (Sent, Rejected) removed — policy D3: a post-SENT
+            // reject is NEVER routed to Rejected; it escalates to
+            // RequiresManualReconciliation (issued-but-unconfirmed, lnd consumed,
+            // sfn stamped, seed advanced at SEND — must not silently vanish).
             // W11 PR-2b — SENT last_chk mismatch escalation per W0-3 §6.4-b
             // (`docs/superpowers/specs/2026-05-06-m3-w0-3-retry-recovery.md:771-772`).
             // When boot-recovery probe yields `CheckAck { id != transport_request_id }`,
@@ -200,58 +204,45 @@ pub fn allowed_transition(from: DocState, to: DocState) -> bool {
             | (Kvt1, Kvt2)
             | (Kvt1, ErrorRetryable)
             | (Kvt2, Ack)
-            | (OfflineLocalAck, Sent)
-            // M3b W6 — Pattern C edges per spec §5.3 / M3b plan
-            // §Task 6.  The W4/W5 offline subsystem produces docs
-            // in `OfflineLocalAck` while node is offline; on
-            // return-online the W7 drain stage flips them through
-            // `Sending` (Pattern B intent-marker, mirroring the
-            // online ladder) and `Cancelled` is the manual-operator
-            // escape if the drain is abandoned mid-flight.  Locked
-            // edge set + count pinned in
+            // M3b W6 — Pattern C edges per spec §5.3 / M3b plan §Task 6.  The
+            // W4/W5 offline subsystem produces docs in `OfflineLocalAck` while
+            // node is offline; on return-online the W7 drain stage flips them
+            // through `Sending` (Pattern B intent-marker, mirroring the online
+            // ladder) and `Cancelled` is the manual-operator escape if the drain
+            // is abandoned mid-flight.  Locked edge set + count pinned in
             // `tests/fiscal_documents_offline_local_ack_edges_locked.rs`.
-            // The legacy M3a `(OfflineLocalAck, Sent)` placeholder
-            // immediately above is preserved (W6 scope: add-only,
-            // no removals; runtime wiring of the new edges is W7).
             //
-            // AUD-L1-2 (2026-06-14) auto-invoker audit of this cluster
-            // (grep of `transition_state` call sites + stage_send 4-pre
-            // dynamic source set `{Signed,ErrorRetryable,OfflineLocalAck}`):
+            // AUD-L1-2 (2026-06-14) auto-invoker audit of this cluster:
             //   (OfflineLocalAck, Sending)  — WIRED: W7 drain via
             //     `stage_send.rs` 4-pre (the only OfflineLocalAck invoker).
-            //   (OfflineLocalAck, Sent)     — no auto-invoker; legacy M3a
-            //     placeholder superseded by the Sending ladder.
             //   (OfflineLocalAck, Cancelled) — no auto-invoker;
             //     operator/force-seam only (runtime wiring deferred).
-            //   (OfflineLocalAck, Kvt2)     — no auto-invoker; the W9b
-            //     lastChk short-circuit below is SPEC'd but NOT wired —
-            //     drain converges via Sending → Sent → Kvt1 → Kvt2
-            //     (`kvt2_confirm.rs`), never this direct hop.
+            //
+            // A.3 PR-B step 6 (re-verified zero producers on today's main):
+            //   (OfflineLocalAck, Sent) [legacy M3a placeholder superseded by
+            //   the Sending ladder] and (OfflineLocalAck, Kvt2) [W9b lastChk
+            //   short-circuit — SPEC'd but NEVER wired; drain converges via
+            //   Sending → Sent → Kvt1 → Kvt2 in `kvt2_confirm.rs`] REMOVED as
+            //   sfn-less dormant edges.
             | (OfflineLocalAck, Sending)
             | (OfflineLocalAck, Cancelled)
-            // M3b W9b §5.1 — lastChk replay short-circuit edge.
-            // When backlog_drain issues a lastChk pre-flight on a
-            // doc with `server_fiscal_no IS NOT NULL` AND DPS confirms
-            // `status == OK` + id match + non-empty data_sign, the
-            // doc has already been wire-acknowledged by DPS — drain
-            // skips wire send and advances Kvt2 directly (W12 PR
-            // reuses the same lastChk response as KVT2 evidence).
-            // Final hop Kvt2 → Ack is the existing M3a edge below.
-            // Locked-edge count drift-guard: 28 → 29.
-            | (OfflineLocalAck, Kvt2)
-            | (ErrorRetryable, Sent)
-            | (ErrorRetryable, Kvt1)
+            // A.3 PR-B step 6: (ErrorRetryable, Sent) + (ErrorRetryable, Kvt1)
+            // removed — sfn-less dormant; re-sends go ErrorRetryable → Sending →
+            // (fresh wire) → Sent → Kvt1, never a direct issue-forward hop.
             | (ErrorRetryable, RequiresManualReconciliation)
             // Pattern B (ADR-M3-A5 / A9 step 3): Sending is the
-            // intent-marker for stage 4 send.  The 7 additions below
-            // wire it in.  M3a DPS code MUST NOT use the legacy
-            // (ErrorRetryable, Sent) entry for wire send; retries go
-            // through (ErrorRetryable, Sending) and then on through
-            // a fresh wire call.
+            // intent-marker for stage 4 send.  The 6 additions below
+            // wire it in (was 7; A.3 PR-B step 6 removed (Sending, Kvt1)).
+            // Retries go through (ErrorRetryable, Sending) and then on
+            // through a fresh wire call, never a direct issue-forward hop.
             | (Signed, Sending)
             | (Encrypted, Sending)
             | (Sending, Sent)
-            | (Sending, Kvt1)
+            // A.3 PR-B step 6: (Sending, Kvt1) removed — sfn-less.  It RETURNS
+            // when the inline fast-path lands, and ONLY THEN carrying its own
+            // atomic `server_fiscal_no` stamp + seed advance at this CAS (the
+            // A.3 D3 sfn-lockstep pin, mirroring the WireDecision::Sent arm in
+            // `stage_send`).  Re-add here in lockstep with that producer.
             | (Sending, ErrorRetryable)
             | (Sending, Rejected)
             | (ErrorRetryable, Sending)
