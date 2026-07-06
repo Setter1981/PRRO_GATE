@@ -46,11 +46,16 @@ pub enum ReplayResolution {
     Failed(CanonicalErrorResponse),
 }
 
-fn is_accepted(state: DocState) -> bool {
+/// D-R3 SSOT — the doc-state → replay-verdict classifiers.  `pub(crate)` so the
+/// RS-3 inbox-reaper (`services::reconciliation::inbox_reaper`) terminalises a
+/// stuck row against the EXACT SAME truth `resolve_replay` answers with; the two
+/// cannot diverge by construction (a single shared fn).
+pub(crate) fn is_accepted(state: DocState) -> bool {
     matches!(state, DocState::Ack | DocState::OfflineLocalAck)
 }
 
-fn is_terminally_failed(state: DocState) -> bool {
+/// D-R3 SSOT — see [`is_accepted`].
+pub(crate) fn is_terminally_failed(state: DocState) -> bool {
     matches!(
         state,
         DocState::Rejected

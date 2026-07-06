@@ -307,43 +307,48 @@ loop).
 - **clock / cert validity failure** — stale `business_ts` (`-8`-class date reject) or a cert
   outside its validity window. The smoke uses `iso_now()` for a fresh wire time.
 
-### A2.4 stale-`PROCESSING` (202-hang) — reaper NOT yet built (interim: manual re-drive)
+### A2.4 stale-`NEW`/`PROCESSING` (202-hang) — reaper WIRED (terminalise-only)
 
-**Context (RS-3 A2.4 binding flip).** The write-path binding is now the live
-`InlineWritePath` (`supervisor.rs` DI root — `UnimplementedWritePath` is retired).
-Every real fiscal failure self-terminalises the inbox (REJECTED + audit) — the
-four-variant gate (`tests/a3_final_binding_flip.rs`) proves this. Fiscal safety is
-intact: a replay of a `PROCESSING` row NEVER re-fiscalizes (it resolves from the
-ledger → `202 IN_PROGRESS` or the accepted receipt), and an unknown-truth arm
-NEVER mis-terminalises a durably-`Sent` receipt as failed.
+**Context (RS-3 A2.4 flip + reaper).** The write-path binding is the live
+`InlineWritePath` (`supervisor.rs` DI root). Every real fiscal failure
+self-terminalises the inbox (REJECTED + audit) — the four-variant gate
+(`tests/a3_final_binding_flip.rs`) proves this. Fiscal safety is intact: a replay
+of a `PROCESSING` row NEVER re-fiscalizes (it resolves from the ledger →
+`202 IN_PROGRESS` or the accepted receipt), and an unknown-truth arm NEVER
+mis-terminalises a durably-`Sent` receipt as failed.
 
-**The gap (AUD-L2 Phase-1 arm-table, ruling 2).** A narrow set of STRUCTURAL-breach
-arms — an A4-unexpected inline `Noop`, a no-wire send race, or an `advance_to_ack`
-fault, EACH combined with an empty ledger — deliberately leave the inbox
-`PROCESSING` and return `500` (`REPLAY_LEDGER_DRIFT`). The design hands these to
-"B1/boot recovery owns convergence", but the **RS-3 stale-`PROCESSING` reaper is not
-yet implemented**. Until it lands, such a row hangs the client at `202 IN_PROGRESS`
-with no auto-convergence. These arms are unreachable on a healthy boot — they need
-a structural anomaly (a doc that vanished from the ledger, or a `Noop` that the
-unique-idempotency-key inbox insert already precludes).
+**The former 202-hang gap is NOW CLOSED by the RS-3 inbox-reaper**
+(`services::reconciliation::inbox_reaper`, ruling 2). A narrow set of
+STRUCTURAL-breach arms (an A4-unexpected inline `Noop`, a no-wire send race, an
+`advance_to_ack` fault, or a pre-lease binding failure — each with an empty ledger)
+leaves the inbox `NEW`/`PROCESSING` with no terminal doc. The reaper converges
+these to a TERMINAL inbox status so a replay answers honestly instead of a
+`202 IN_PROGRESS`-forever:
+- **BOOT sweep** — after boot reconciliation, BEFORE `serve` (no live fiscalize can
+  race it; no age-gate).
+- **Runtime tick** (`spawn_reaper_loop`) — every ~5 min, age-gated at
+  `REAPER_STALE_THRESHOLD` (15 min) so a live in-flight fiscalize is never reaped
+  mid-flight.
 
-**Operator surface — watch for these CRITICAL audits (each names a stuck row):**
-- `INLINE_NOOP_UNEXPECTED` — an A4-unexpected inline `Noop`;
-- a structural-breach `REPLAY_LEDGER_DRIFT` 500 — inbox `PROCESSING` with no
-  terminal `fiscal_documents` doc.
+**TERMINALISE-ONLY (D-R1).** The reaper NEVER re-fiscalizes a stuck row (an auto
+re-drive would phantom a SECOND fiscal check for ONE physical sale) and NEVER
+touches an in-flight/`Sent` doc (recon owns it). It writes ONLY
+`ingress_inbox.status` + `audit_log`. Per row: no doc → `REJECTED`; accepted doc →
+`DONE`; terminally-failed doc → `REJECTED`; in-flight doc → UNTOUCHED.
 
-**Interim recovery (manual re-drive).** For a row stuck `PROCESSING` with no
-terminal doc:
-1. Confirm no accepted/terminal doc exists for the `request_id`
-   (`SELECT state FROM fiscal_documents WHERE request_id = ?`).
-2. ONLY if genuinely absent (a structural breach): under close supervision, an
-   operator may reset that inbox row `PROCESSING → NEW` so the next request
-   re-drives it, OR mark it terminal (REJECTED) so the receipt is re-submitted
-   with a NEW idempotency key. NEVER reset a row whose doc is `Sent`+ (that would
-   risk a double-fiscalize).
+**Operator surface — reaper audits (each names a converged row):**
+- `INBOX_REAPER_NO_DOC_TERMINALISED` (Critical) — a stuck row with no ledger doc,
+  terminalised `REJECTED` (the ruling-2 / finding-1 core);
+- `INBOX_REAPER_FAILED_DOC_TERMINALISED` / `INBOX_REAPER_ACCEPTED_CONVERGED_DONE`
+  (Warning) — accounting convergence;
+- `INLINE_NOOP_UNEXPECTED` (Critical) still fires at the moment of the anomaly.
 
-**Pilot policy (RULING 2).** Build the reaper BEFORE a WIDE pilot. A
-close-supervision pilot MAY run with this manual surface as the interim.
+**Fallback (manual) — only if the reaper is disabled or a row needs faster action.**
+For a row stuck `PROCESSING`/`NEW` with no terminal doc: confirm no accepted/terminal
+doc exists (`SELECT state FROM fiscal_documents WHERE request_id = ?`); ONLY if
+genuinely absent, mark it terminal `REJECTED` so the receipt is re-submitted with a
+NEW idempotency key. **NEVER reset a row whose doc is `Sent`+** (that would risk a
+double-fiscalize).
 
 ### WL-1 — UNWIRED online shift-lifecycle drivers (key scope caveat)
 

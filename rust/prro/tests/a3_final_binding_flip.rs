@@ -39,7 +39,7 @@ use prro::db::repositories::ingress_inbox::{
 use prro::db::repositories::{fiscal_number_config as fn_cfg, operators as ops_repo};
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
-use prro::runtime::ingress::inline_binding::InlineWritePath;
+use prro::runtime::ingress::inline_binding::{production_write_path, InlineWritePath};
 use prro::runtime::ingress::seam::{FiscalError, WritePathEntry};
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
@@ -503,5 +503,39 @@ async fn binding_sign_failure_terminalises_inbox() {
     assert_eq!(
         read_inbox_status(app.db(), &row.request_id).await,
         "REJECTED"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// finding-2 — DI-site pin: the production factory binds the INLINE path, never
+// UnimplementedWritePath.  A revert of the supervisor swap fails this pin (which
+// a raw `Arc::new(InlineWritePath::new(..))` at the DI root did not catch).
+// ════════════════════════════════════════════════════════════════════════
+#[tokio::test]
+async fn production_write_path_binds_inline_not_notimplemented() {
+    let app = boot_app().await;
+    let registry = build_registry(&app, happy_dps(), &OkLoader).await;
+    let shift_id = seed_shift(app.db(), ShiftState::Opened).await;
+    seed_node_state(
+        app.db(),
+        NodeMode::Online,
+        ShiftState::Opened,
+        Some(shift_id),
+    )
+    .await;
+
+    // Construct the binding the SAME way the supervisor DI root does.
+    let write_path = production_write_path(app.clone(), Arc::new(registry));
+    let row = insert_created_sell(app.db()).await;
+    let result = write_path.fiscalize(&row).await;
+
+    assert!(
+        !matches!(result, Err(FiscalError::NotImplemented { .. })),
+        "production_write_path must bind the INLINE path, never UnimplementedWritePath; got {result:?}"
+    );
+    // Positive: the happy SELL actually fiscalizes to ACK through the factory.
+    assert!(
+        matches!(&result, Ok(o) if o.document_state == DocState::Ack),
+        "got {result:?}"
     );
 }
