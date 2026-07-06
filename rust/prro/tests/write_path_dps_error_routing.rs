@@ -696,9 +696,9 @@ async fn fx20_server_minus_16_m3a_routes_to_rejected_alert() {
 
 #[tokio::test]
 async fn fx21_pattern_b_retry_path_spy_observes_sending_marker_then_error_retryable() {
-    // R-W10.5: prove that M3a NEVER invokes the legacy
-    // `(ErrorRetryable, Sent)` whitelist edge — every wire send must
-    // pass through the `Sending` durable marker.  Spy fires inside
+    // R-W10.5: prove that M3a NEVER takes a direct `(ErrorRetryable, Sent)`
+    // issue-forward hop (the edge is REMOVED entirely as of A.3 PR-B step 6) —
+    // every wire send must pass through the `Sending` durable marker.  Spy fires inside
     // `send_chk` (4a, no lock) and reads the doc state via a fresh
     // pool acquire — must see SENDING (4-pre committed) before the
     // wire response routes to ErrorRetryable.

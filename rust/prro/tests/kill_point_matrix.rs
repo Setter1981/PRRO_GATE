@@ -1477,8 +1477,9 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
 
 // ════════════════════════════════════════════════════════════════════════════
 // M2-01 boundary pin — the online↔offline MAC chain is CONTINUOUS.  An online
-// doc fiscalises at ACK (seed advances there); the first offline doc of the next
-// session must chain off that last online ACK (the seed pointer is shared).
+// doc advances the seed at SEND (A.3 advance-at-SEND; by ACK it is advanced);
+// the first offline doc of the next session must chain off that last online
+// doc's advanced seed (the seed pointer is shared).
 // Proves the online→offline boundary + scan-clean across it.  (The offline→online
 // direction is symmetric — m2_two_offline_… leaves the seed at the last offline
 // doc, which a subsequent online doc reads at sign.)
@@ -2310,30 +2311,35 @@ async fn drain_kvt1_reentry_superseded_escalates_manual() {
     let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
     with_immediate(&pool, move |tx| {
         Box::pin(async move {
-            let o1 = fiscal_documents::transition_state(
-                tx,
-                doc1_id,
-                DocState::OfflineLocalAck,
-                DocState::Sent,
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-            assert!(matches!(o1, TransitionOutcome::Applied), "doc1 OLA→Sent");
-            let o2 =
-                fiscal_documents::transition_state(tx, doc1_id, DocState::Sent, DocState::Kvt1)
+            // A.3 PR-B step 6 removed the direct (OfflineLocalAck, Sent) M3a
+            // placeholder edge; stage the cohort via the legal drain ladder
+            // OLA → Sending → Sent (→ Kvt1 for doc1).
+            for (from, to) in [
+                (DocState::OfflineLocalAck, DocState::Sending),
+                (DocState::Sending, DocState::Sent),
+                (DocState::Sent, DocState::Kvt1),
+            ] {
+                let o = fiscal_documents::transition_state(tx, doc1_id, from, to)
                     .await
                     .map_err(anyhow::Error::from)?;
-            assert!(matches!(o2, TransitionOutcome::Applied), "doc1 Sent→Kvt1");
+                assert!(
+                    matches!(o, TransitionOutcome::Applied),
+                    "doc1 {from:?}→{to:?}"
+                );
+            }
             document_files::replace_tx(tx, doc1_id, DocumentFileKind::Kvt1Raw, &kvt1_bytes).await?;
-            let o3 = fiscal_documents::transition_state(
-                tx,
-                doc2_id,
-                DocState::OfflineLocalAck,
-                DocState::Sent,
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-            assert!(matches!(o3, TransitionOutcome::Applied), "doc2 OLA→Sent");
+            for (from, to) in [
+                (DocState::OfflineLocalAck, DocState::Sending),
+                (DocState::Sending, DocState::Sent),
+            ] {
+                let o = fiscal_documents::transition_state(tx, doc2_id, from, to)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                assert!(
+                    matches!(o, TransitionOutcome::Applied),
+                    "doc2 {from:?}→{to:?}"
+                );
+            }
             Ok::<(), anyhow::Error>(())
         })
     })
@@ -2525,28 +2531,29 @@ async fn boot_kvt2_chain_seed_mismatch_escalates_manual() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// AUD-L2-1a — RED pin + A2.4 ACTIVATION PREREQUISITE (NOT fixed here).
+// AUD-L2-1a — online seed-fork: CLOSED by A.3 PR-A (advance-at-SEND).
 //
-// **STATUS — RED pin, #[ignore]'d; fix deferred to A2.4.**  The online inline
-// lane has a chain SEED-FORK: the chain seed
+// **STATUS — CLOSED; this test is a PERMANENT regression guard (un-#[ignore]'d
+// in PR-A).**  The online inline lane HAD a chain SEED-FORK: the chain seed
 // (`node_state.last_known_unsigned_xml_sha256`) is read as a doc's
-// `previous_hash` at sign time (stage_sign) but ADVANCED only inside
-// `stage_finalize` at the ACK transition (gated online-origin,
-// `offline_fiscal_no.is_none()`).  Two online SELLs can BOTH rest at `SENT`
-// (empty-data_sign lastChk Hold), so `stage_finalize` never runs for doc1 → the
-// seed is never advanced → doc2 is signed against the SAME stale (pre-doc1)
-// seed.  Result: `doc2.previous_hash == doc1.previous_hash` (both = the pre-doc1
-// genesis seed), NOT `doc1.unsigned_xml_sha256` — a FORK, not a chain.  (The
-// OFFLINE lane is correct — M2-01 advances the seed per-doc at offline-ack;
-// cf. the M2-01 chain test which asserts `prev2 == uns1`.)
+// `previous_hash` at sign time (stage_sign) and, pre-A.3, was ADVANCED only in
+// `stage_finalize` at the ACK transition.  Two online SELLs could BOTH rest at
+// `SENT` (empty-data_sign lastChk Hold) → `stage_finalize` never ran for doc1 →
+// the seed never advanced → doc2 signed against the SAME stale (pre-doc1) seed →
+// a FORK, not a chain.  (The OFFLINE lane was always correct — M2-01 advances
+// the seed per-doc at offline-ack.)
 //
-// This test asserts the DESIRED (fixed) chained property and therefore FAILS
-// today.  The fix (move the seed advance to `stage_send`, or generalise the
-// finalize-gate / handle rejected-after-SENT) is deferred to A2.4.  The inline
-// lane is DORMANT in prod (`UnimplementedWritePath` is bound, NOT
-// `InlineWritePath`), so the fork is NOT reachable from a live request yet —
-// un-#[ignore]-ing this test is the GATE for flipping the prod binding (see the
-// A2.4 ACTIVATION PREREQUISITE barrier at `runtime::supervisor` + `inline.rs`).
+// A.3 PR-A moved the advance to the `Sending→Sent` CAS in `stage_send` (atomic
+// with the `server_fiscal_no` stamp — advance-at-SEND), so doc1's seed advances
+// the moment it reaches SENT → doc2 chains off `doc1.unsigned_xml_sha256`.  This
+// test asserts the CHAINED property and now PASSES; it stays un-#[ignore]'d as
+// the standing regression guard against a re-fork.
+//
+// The prod-binding FLIP (`UnimplementedWritePath` → `InlineWritePath`) is STILL
+// gated: the inline lane stays DORMANT in prod until PR-B (edge/arm hygiene) +
+// PR-C (D5 gate + convergence-tick resolver) land AND an external review signs
+// off.  The activation barrier at `runtime::supervisor` (+ `inline.rs`) REMAINS
+// until then — closing the fork is necessary, NOT sufficient, for the flip.
 // ════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]

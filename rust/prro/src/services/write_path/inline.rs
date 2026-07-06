@@ -32,6 +32,7 @@ use crate::db::models::ids::DocumentId;
 use crate::db::repositories::audit_log;
 use crate::db::repositories::fiscal_documents::{self, TerminalOutcome};
 use crate::db::repositories::ingress_inbox::{self, InboxRow};
+use crate::db::repositories::node_state;
 use crate::db::tx::with_immediate;
 use crate::runtime::ingress::canonical_builder::build_canonical;
 use crate::runtime::ingress::seam::{FiscalError, FiscalOutcome};
@@ -251,6 +252,56 @@ enum PreAcquireTerminalise {
 /// `fiscal_documents` ledger row for one; replay reads REJECTED as failure).
 /// A `!marked` (row not PROCESSING) or DB fault is itself a structural breach
 /// → `Internal`/500 (NEVER swallowed — the reaper re-drives a stuck row).
+/// SW-4 (A.3 PR-B step 8): route an inline-confirm `ChainSeedMismatch` to the
+/// shared FN → Manual-reconciliation escalation seam
+/// ([`escalate_fn_to_manual_recon`]), the SAME seam the online-convergence tick
+/// and boot-KVT2 arms use.  Returns the `FiscalError` the confirm arm surfaces:
+/// `SHIFT_MANUAL_RECON` (500) once the FN has a durable operator surface (RMR
+/// shift OR the no-shift audit), or `REPLAY_LEDGER_DRIFT` (500) if the escalate
+/// envelope hits a structural desync (the drift detector is preserved).  Does
+/// NOT terminalise the inbox — the doc is issued-unconfirmed (`Sent`/`Kvt2`),
+/// not rejected; the escalation is the surface.  Extracted so the routing is
+/// unit-pinnable via synthetic injection (the `ConfirmError::ChainSeedMismatch`
+/// producer is DORMANT post-PR-A — the finalize producer was removed — so this
+/// arm cannot be reached through the full inline path until PR-C re-wires it).
+pub(crate) async fn escalate_inline_chain_seed_mismatch(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    doc_id: DocumentId,
+    request_id: [u8; 16],
+) -> FiscalError {
+    let drift = FiscalError::Internal {
+        request_id,
+        code: codes::REPLAY_LEDGER_DRIFT,
+    };
+    let ns = match node_state::get(pool, fiscal_number).await {
+        Ok(Some(ns)) => ns,
+        _ => return drift,
+    };
+    match crate::services::offline_sync::backlog_drain::escalate_fn_to_manual_recon(
+        pool,
+        fiscal_number,
+        &ns,
+        doc_id,
+        "chain_seed_mismatch",
+        0,
+        "INLINE_ADVANCE_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL",
+        "INLINE_ADVANCE_CHAIN_SEED_MISMATCH_NO_SHIFT",
+    )
+    .await
+    {
+        // Escalated (→ RMR) or NoEscalatableShift (no-shift audit is the surface):
+        // both leave a durable operator surface → the manual-recon 500.
+        Ok(_) => FiscalError::Internal {
+            request_id,
+            code: codes::SHIFT_MANUAL_RECON,
+        },
+        // Structural desync inside the escalate envelope (NULL/Forbidden CAS that
+        // is NOT the idempotent already-RMR no-op) → preserve the drift detector.
+        Err(_) => drift,
+    }
+}
+
 async fn terminalise_inbox(
     pool: &SqlitePool,
     row: &InboxRow,
@@ -751,21 +802,48 @@ pub async fn run(
                                         report_xml: None,
                                     })
                                 }
-                                Err(ConfirmError::StructuralDrift { .. })
-                                | Err(ConfirmError::ChainSeedMismatch { .. }) => {
-                                    // ChainSeedMismatch (AUD-L2-1b): the online-lane
-                                    // chain-seed breach (the A2.1a seed-fork, deferred
-                                    // to A2.4) — a structural breach like StructuralDrift.
-                                    // This inline lane is DORMANT (UnimplementedWritePath
-                                    // bound in prod), so this is compile-completeness for
-                                    // the new ConfirmError variant; treat as a structural
-                                    // drift (terminalise + 500).
-                                    // The doc stays durably at `Sent`/`Kvt2` (the
-                                    // advance envelopes rolled back). Terminalise
-                                    // the inbox REJECTED + audit — an INTENTIONAL,
-                                    // AUDITED divergence (Sent doc + REJECTED
-                                    // inbox = the breach surface for B1/recon,
-                                    // invariant #8, not silent) — and 500.
+                                Err(ConfirmError::ChainSeedMismatch { .. }) => {
+                                    // SW-4 (A.3 PR-B step 8): a chain-seed breach is NOT
+                                    // a StructuralDrift — it is the online-lane seed-fork
+                                    // surface (AUD-L2-1b). ESCALATE the FN to Manual
+                                    // reconciliation (durable operator surface), mirroring
+                                    // the online-convergence tick + boot-KVT2 arms, instead
+                                    // of blind-terminalising the receipt REJECTED. The doc
+                                    // rests durably at `Sent`/`Kvt2` (the advance envelope
+                                    // rolled back); the RMR shift IS the operator surface,
+                                    // so we do NOT terminalise the inbox (that would falsely
+                                    // REJECT an issued-unconfirmed receipt) — return the same
+                                    // SHIFT_MANUAL_RECON 500 any RMR-blocked request yields,
+                                    // leaving the lease for operator-driven resolution.
+                                    //
+                                    // DORMANT post-PR-A: no producer reaches this arm today
+                                    // (the inline lane is UnimplementedWritePath-bound in
+                                    // prod, and finalize's ChainSeedMismatch producer was
+                                    // removed in PR-A — see StageFinalizeError::
+                                    // ChainSeedMismatch). This wires the ROUTING so a
+                                    // producer returning here (PR-C scan→escalate) lands on
+                                    // the manual-recon seam, not the drift terminaliser.
+                                    // Escalate is idempotent (already-RMR → clean no-op).
+                                    // Extracted to `escalate_inline_chain_seed_mismatch` so
+                                    // the routing is unit-pinnable via synthetic injection
+                                    // (the producer is DORMANT, so it cannot be reached
+                                    // through the full inline path today).
+                                    Err(escalate_inline_chain_seed_mismatch(
+                                        pool,
+                                        &row.fiscal_number,
+                                        doc_id,
+                                        request_id,
+                                    )
+                                    .await)
+                                }
+                                Err(ConfirmError::StructuralDrift { .. }) => {
+                                    // A routing/structural drift (NOT a chain-seed breach):
+                                    // the doc stays durably at `Sent`/`Kvt2` (the advance
+                                    // envelopes rolled back). Terminalise the inbox REJECTED
+                                    // + audit — an INTENTIONAL, AUDITED divergence (Sent doc
+                                    // + REJECTED inbox = the breach surface for B1/recon,
+                                    // invariant #8, not silent) — and 500. This inline lane
+                                    // is DORMANT (UnimplementedWritePath-bound in prod).
                                     let fe = FiscalError::Internal {
                                         request_id,
                                         code: codes::REPLAY_LEDGER_DRIFT,
@@ -1038,6 +1116,197 @@ mod tests {
         let e = terminal_to_outcome(o, RID).unwrap_err();
         assert!(
             matches!(e, FiscalError::Internal { code, .. } if code == codes::REPLAY_LEDGER_DRIFT)
+        );
+    }
+
+    // ── SW-4 (A.3 PR-B step 8): inline confirm-error arm hygiene ────────────
+    //
+    // The `ConfirmError::ChainSeedMismatch` producer is DORMANT post-PR-A
+    // (finalize's typed producer was removed), so the arm cannot be reached
+    // through the full inline path — pin the ROUTING via synthetic injection:
+    // call the extracted handler directly. `escalate_inline_chain_seed_mismatch`
+    // routes to the shared FN → Manual-recon seam (→ RMR, idempotent); the
+    // paired negative proves the StructuralDrift action (terminalise) leaves the
+    // shift UNTOUCHED (no RMR).
+
+    use crate::db::models::enums::Protocol;
+    use crate::db::models::ids::ShiftId;
+    use crate::db::repositories::ingress_inbox::NewInboxEntry;
+
+    const SW4_FN: &str = "1234567890";
+
+    async fn sw4_pool() -> sqlx::SqlitePool {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sw4.db");
+        std::mem::forget(dir);
+        let pool = crate::db::open_pool(&path).await.unwrap();
+        sqlx::query(
+            "INSERT INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+             VALUES (?, '12345678', 'test')",
+        )
+        .bind(SW4_FN)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    async fn seed_opened_shift_and_node(pool: &sqlx::SqlitePool) -> ShiftId {
+        let shift_id = ShiftId::new();
+        sqlx::query(
+            "INSERT INTO shifts(shift_id, fiscal_number, serial, state, open_mode, \
+                cash_balance_kop, opened_by_cashier_id) \
+             VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
+        )
+        .bind(shift_id)
+        .bind(SW4_FN)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO node_state(fiscal_number, mode, shift_state, current_shift_id, next_lnd, \
+                backend_profile_id, transport_profile_id) \
+             VALUES (?, 'ONLINE', 'OPENED', ?, 1, 'b', 't')",
+        )
+        .bind(SW4_FN)
+        .bind(shift_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        shift_id
+    }
+
+    async fn read_shift_state(pool: &sqlx::SqlitePool, shift_id: ShiftId) -> String {
+        sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+            .bind(shift_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn escalate_audit_count(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE event_type = 'INLINE_ADVANCE_CHAIN_SEED_MISMATCH_ESCALATE_MANUAL'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// SW-4 GREEN: an inline-confirm ChainSeedMismatch ESCALATES the FN shift to
+    /// RequiresManualReconciliation (mirror of the online-convergence/boot arms)
+    /// and returns the `SHIFT_MANUAL_RECON` 500 — NOT a blind REJECTED terminal.
+    /// RED against the pre-SW-4 combined arm (which terminalised without ever
+    /// escalating → the shift would stay OPENED).
+    #[tokio::test]
+    async fn chain_seed_mismatch_escalates_fn_to_manual() {
+        let pool = sw4_pool().await;
+        let shift = seed_opened_shift_and_node(&pool).await;
+        let doc_id = DocumentId::new();
+        let request_id = [0x5Au8; 16];
+
+        let fe = escalate_inline_chain_seed_mismatch(&pool, SW4_FN, doc_id, request_id).await;
+
+        assert!(
+            matches!(fe, FiscalError::Internal { code, .. } if code == codes::SHIFT_MANUAL_RECON),
+            "chain-seed mismatch must surface the manual-recon 500, got {fe:?}"
+        );
+        assert_eq!(
+            read_shift_state(&pool, shift).await,
+            "REQUIRES_MANUAL_RECONCILIATION",
+            "the FN shift must be escalated to Manual (durable operator surface)"
+        );
+        assert_eq!(escalate_audit_count(&pool).await, 1, "one escalate audit");
+    }
+
+    /// SW-4: the escalation is IDEMPOTENT — a second injection (re-tick / retry)
+    /// on an already-RMR shift is a clean no-op: shift stays RMR, NO duplicate
+    /// escalate audit (the ledger is not flooded).
+    #[tokio::test]
+    async fn chain_seed_mismatch_escalation_is_idempotent() {
+        let pool = sw4_pool().await;
+        let shift = seed_opened_shift_and_node(&pool).await;
+        let doc_id = DocumentId::new();
+        let request_id = [0x5Bu8; 16];
+
+        let _ = escalate_inline_chain_seed_mismatch(&pool, SW4_FN, doc_id, request_id).await;
+        let fe2 = escalate_inline_chain_seed_mismatch(&pool, SW4_FN, doc_id, request_id).await;
+
+        assert!(
+            matches!(fe2, FiscalError::Internal { code, .. } if code == codes::SHIFT_MANUAL_RECON),
+            "second injection still surfaces the manual-recon 500"
+        );
+        assert_eq!(
+            read_shift_state(&pool, shift).await,
+            "REQUIRES_MANUAL_RECONCILIATION"
+        );
+        assert_eq!(
+            escalate_audit_count(&pool).await,
+            1,
+            "idempotent: already-RMR re-injection must NOT re-audit"
+        );
+    }
+
+    /// SW-4 paired negative: the StructuralDrift arm behaves the OLD way —
+    /// `terminalise_inbox` marks the inbox REJECTED (+500) and does NOT touch the
+    /// shift (no RMR escalation). Proves the split is real: only ChainSeedMismatch
+    /// escalates.
+    #[tokio::test]
+    async fn structural_drift_terminalises_without_escalation() {
+        let pool = sw4_pool().await;
+        let shift = seed_opened_shift_and_node(&pool).await;
+        let request_id = [0x5Cu8; 16];
+        ingress_inbox::insert(
+            &pool,
+            &NewInboxEntry {
+                request_id,
+                fiscal_number: SW4_FN.into(),
+                protocol: Protocol::Rest,
+                operation_type: "SELL".into(),
+                idempotency_key: "sw4-drift".into(),
+                payload_json: "{}".into(),
+                payload_sha256_canonical: [0u8; 32],
+                correlation_id: None,
+                signed_by_cashier_id: None,
+                driver_id: None,
+                business_ts: Some("2026-07-06T00:00:00Z".into()),
+                total_sum_kop: Some(1500),
+            },
+        )
+        .await
+        .unwrap();
+        // Lease the row (NEW → PROCESSING) — the state terminalise_inbox requires.
+        let row = with_immediate(&pool, move |tx| {
+            Box::pin(async move { Ok(ingress_inbox::acquire_lease(tx, &request_id).await?) })
+        })
+        .await
+        .unwrap()
+        .expect("leased inbox row");
+
+        terminalise_inbox(
+            &pool,
+            &row,
+            "INLINE_ADVANCE_DRIFT",
+            codes::REPLAY_LEDGER_DRIFT,
+        )
+        .await
+        .unwrap();
+
+        let inbox_status: String =
+            sqlx::query_scalar("SELECT status FROM ingress_inbox WHERE request_id = ?")
+                .bind(&request_id[..])
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            inbox_status, "REJECTED",
+            "StructuralDrift terminalises the inbox"
+        );
+        assert_eq!(
+            read_shift_state(&pool, shift).await,
+            "OPENED",
+            "StructuralDrift must NOT escalate the shift (no RMR) — that is the split"
         );
     }
 }

@@ -315,26 +315,32 @@ fn allowed_transition_exhaustive_matrix() {
         (Signed, Encrypted),
         (Signed, ErrorRetryable),
         (Signed, OfflineLocalAck),
-        (Encrypted, Sent),
+        // A.3 PR-B step 6: (Encrypted, Sent) REMOVED — sfn-less dormant edge
+        // (Encrypted → Sending → Sent is the live ladder). Negative pin below.
         (Encrypted, ErrorRetryable),
         (Sent, Kvt1),
         (Sent, ErrorRetryable),
-        (Sent, Rejected),
+        // A.3 PR-B step 6: (Sent, Rejected) REMOVED — policy D3: a post-SENT
+        // reject is NEVER routed to Rejected (it escalates to
+        // RequiresManualReconciliation, the live edge below). Negative pin below.
         // W11 PR-2b addition: SENT last_chk-mismatch escalation
         // (§6.4-b operator-handoff edge).
         (Sent, RequiresManualReconciliation),
         (Kvt1, Kvt2),
         (Kvt1, ErrorRetryable),
         (Kvt2, Ack),
-        (OfflineLocalAck, Sent),
-        (ErrorRetryable, Sent),
-        (ErrorRetryable, Kvt1),
+        // A.3 PR-B step 6: three sfn-less dormant edges REMOVED (negative pins
+        // below): (OfflineLocalAck, Sent) legacy M3a placeholder superseded by
+        // the OLA → Sending ladder; (ErrorRetryable, Sent) + (ErrorRetryable,
+        // Kvt1) — re-sends go ErrorRetryable → Sending → Sent, never direct.
         (ErrorRetryable, RequiresManualReconciliation),
-        // 7 Pattern B additions per ADR-M3-A9 step 3.
+        // 6 Pattern B additions per ADR-M3-A9 step 3 (was 7; A.3 PR-B step 6
+        // removed the sfn-less (Sending, Kvt1) — it RETURNS with the inline
+        // fast-path landing, then WITH its own atomic sfn+advance stamp; see the
+        // negative pin + comment-pin below).
         (Signed, Sending),
         (Encrypted, Sending),
         (Sending, Sent),
-        (Sending, Kvt1),
         (Sending, ErrorRetryable),
         (Sending, Rejected),
         (ErrorRetryable, Sending),
@@ -355,13 +361,10 @@ fn allowed_transition_exhaustive_matrix() {
         // `tests/fiscal_documents_offline_local_ack_edges_locked.rs`.
         (OfflineLocalAck, Sending),
         (OfflineLocalAck, Cancelled),
-        // M3b W9b §5.1 — lastChk replay short-circuit edge.  When
-        // backlog_drain pre-flight on a doc with `server_fiscal_no IS
-        // NOT NULL` confirms via lastChk (status OK + id match +
-        // non-empty data_sign), drain skips wire send and advances
-        // Kvt2 directly.  Final Kvt2 → Ack via existing M3a edge.
-        // Drift-guard count above bumped 28 → 29.
-        (OfflineLocalAck, Kvt2),
+        // A.3 PR-B step 6: (OfflineLocalAck, Kvt2) REMOVED — the M3b W9b lastChk
+        // replay short-circuit was SPEC'd but NEVER wired; drain converges via
+        // Sending → Sent → Kvt1 → Kvt2 (kvt2_confirm.rs), never this sfn-less
+        // direct hop (AUD-L1-2 confirmed zero producers). Negative pin below.
     ]
     .into_iter()
     .collect();
@@ -385,10 +388,62 @@ fn allowed_transition_exhaustive_matrix() {
         }
     }
     assert_eq!(
-        allowed_count, 29,
-        "expected 17 base + 7 Pattern B + 1 MAC recovery dispatch terminal + 1 W11 PR-2b SENT→RM + 2 W6 Pattern C OfflineLocalAck edges + 1 W9b lastChk replay short-circuit edge = 29 allowed pairs"
+        allowed_count, 22,
+        "29 pre-PR-B minus the 7 sfn-less/policy-dead dormant edges removed in \
+         A.3 PR-B step 6: (Encrypted,Sent), (Sent,Rejected), (OfflineLocalAck,Sent), \
+         (OfflineLocalAck,Kvt2), (ErrorRetryable,Sent), (ErrorRetryable,Kvt1), \
+         (Sending,Kvt1) = 22 allowed pairs (each negatively pinned below)"
     );
-    assert_eq!(forbidden_count, 169 - 29);
+    assert_eq!(forbidden_count, 169 - 22);
+}
+
+/// A.3 PR-B step 6 — the seven dormant edges REMOVED from
+/// `allowed_transition` are now NEGATIVELY pinned: each MUST be forbidden, so
+/// `transition_state` returns non-`Applied` (`Forbidden`) by construction (the
+/// CAS gate at `transition_state` short-circuits on `!allowed_transition`).
+/// Six are sfn-less (would issue-forward without stamping `server_fiscal_no` /
+/// advancing the seed — the A.3 D3 discriminator); `(Sent, Rejected)` is
+/// policy-dead (D3: a post-SENT reject escalates to
+/// `RequiresManualReconciliation`, never `Rejected`). Pre-check verified ZERO
+/// production producers of any of these on today's `main`.
+#[test]
+fn dormant_sfn_less_edges_are_forbidden() {
+    use DocState::*;
+    // sfn-less issued-forward edges (no server_fiscal_no stamp / seed advance):
+    assert!(
+        !fd::allowed_transition(Encrypted, Sent),
+        "Encrypted→Sending→Sent is the live ladder"
+    );
+    assert!(
+        !fd::allowed_transition(OfflineLocalAck, Sent),
+        "legacy M3a placeholder; OLA→Sending ladder is live"
+    );
+    assert!(
+        !fd::allowed_transition(OfflineLocalAck, Kvt2),
+        "W9b lastChk short-circuit spec'd but never wired"
+    );
+    assert!(
+        !fd::allowed_transition(ErrorRetryable, Sent),
+        "re-sends go ErrorRetryable→Sending→Sent"
+    );
+    assert!(
+        !fd::allowed_transition(ErrorRetryable, Kvt1),
+        "re-sends go ErrorRetryable→Sending→Sent→Kvt1"
+    );
+    // (Sending, Kvt1) — sfn-less; RETURNS with the inline fast-path landing, and
+    // ONLY then, with its own atomic sfn+advance stamp at the (Sending→Kvt1) CAS
+    // (the A.3 sfn-lockstep pin in stage_send). Until that lands it is forbidden.
+    assert!(
+        !fd::allowed_transition(Sending, Kvt1),
+        "inline fast-path not landed; returns WITH sfn+advance stamp"
+    );
+    // policy-dead: a post-SENT reject is manual-recon, never Rejected (D3):
+    assert!(
+        !fd::allowed_transition(Sent, Rejected),
+        "post-SENT reject escalates to RequiresManualReconciliation"
+    );
+    // The live escalation edge that REPLACES (Sent, Rejected) stays allowed:
+    assert!(fd::allowed_transition(Sent, RequiresManualReconciliation));
 }
 
 /// Negative coverage of intentional whitelist gaps from ADR-M3-A8 / A9.

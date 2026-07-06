@@ -582,12 +582,15 @@ async fn transition_state_stamps_first_kvt1_at_on_sent_to_kvt1() {
 /// `ErrorRetryable → Kvt1` re-entry edge (which exists in
 /// `allowed_transition` for the M3a two-tick retry path).
 ///
-/// Cycle (3 transitions, all whitelisted):
+/// Cycle (all whitelisted):
 ///   1. `Sent → Kvt1`          — stamps first_kvt1_at via COALESCE NULL arm
 ///   2. (manual UPDATE: replace stamp with sentinel `'2020-01-01 00:00:00'`)
 ///   3. `Kvt1 → ErrorRetryable` — non-Kvt1 arm; column untouched
-///   4. `ErrorRetryable → Kvt1` — Kvt1 RE-ENTRY; COALESCE-non-NULL arm
-///                                 fires → ORIGINAL sentinel preserved
+///   4. `ErrorRetryable → Sending → Sent → Kvt1` — re-enter Kvt1 via the LEGAL
+///        path (the direct `ErrorRetryable → Kvt1` re-entry edge was removed as a
+///        sfn-less dormant edge in A.3 PR-B step 6). The Sending/Sent hops are
+///        non-Kvt1 arms (untouched); the final `Sent → Kvt1` is the Kvt1
+///        RE-ENTRY whose COALESCE-non-NULL arm preserves the ORIGINAL sentinel.
 ///
 /// Directly exercises COALESCE with both NULL input (step 1) and
 /// non-NULL input (step 4).  Operator review pin (2026-05-14): this
@@ -664,28 +667,35 @@ async fn transition_state_coalesce_preserves_first_kvt1_at_on_kvt1_re_entry() {
         "non-Kvt1 transition must NOT touch first_kvt1_at"
     );
 
-    // Step 4: ErrorRetryable → Kvt1 — Kvt1 RE-ENTRY.  The
-    // transition_state Kvt1-arm SQL is
+    // Step 4: re-enter Kvt1 via the LEGAL post-A.3-PR-B path
+    // (ErrorRetryable → Sending → Sent → Kvt1). The direct (ErrorRetryable, Kvt1)
+    // and (Sending, Kvt1) re-entry edges were removed as sfn-less dormant edges
+    // in A.3 PR-B step 6, so re-entry now goes through the Pattern B ladder. The
+    // Sending/Sent hops are non-Kvt1 arms (first_kvt1_at untouched); the FINAL
+    // Sent → Kvt1 is the Kvt1 RE-ENTRY whose transition_state Kvt1-arm SQL —
     //   SET state = ?, first_kvt1_at = COALESCE(first_kvt1_at, CURRENT_TIMESTAMP)
-    // COALESCE sees the SENTINEL (non-NULL) and preserves it.  This
-    // is the load-bearing COALESCE-non-NULL test that operator
-    // review pinned.
-    let outcome_4: TransitionOutcome = with_immediate(&pool, move |tx| {
-        Box::pin(async move {
-            let o = fiscal_documents::transition_state(
-                tx,
-                doc,
-                DocState::ErrorRetryable,
-                DocState::Kvt1,
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-            Ok::<_, anyhow::Error>(o)
+    // — sees the SENTINEL (non-NULL) and preserves it. This is the load-bearing
+    // COALESCE-non-NULL test that operator review pinned.
+    for (from, to) in [
+        (DocState::ErrorRetryable, DocState::Sending),
+        (DocState::Sending, DocState::Sent),
+        (DocState::Sent, DocState::Kvt1),
+    ] {
+        let outcome: TransitionOutcome = with_immediate(&pool, move |tx| {
+            Box::pin(async move {
+                let o = fiscal_documents::transition_state(tx, doc, from, to)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                Ok::<_, anyhow::Error>(o)
+            })
         })
-    })
-    .await
-    .expect("ErrorRetryable → Kvt1");
-    assert!(matches!(outcome_4, TransitionOutcome::Applied));
+        .await
+        .unwrap_or_else(|e| panic!("{from:?} → {to:?}: {e}"));
+        assert!(
+            matches!(outcome, TransitionOutcome::Applied),
+            "{from:?} → {to:?} must apply"
+        );
+    }
     let stamp_after_step4: Option<String> =
         sqlx::query_scalar("SELECT first_kvt1_at FROM fiscal_documents WHERE document_id = ?")
             .bind(doc)
@@ -695,7 +705,8 @@ async fn transition_state_coalesce_preserves_first_kvt1_at_on_kvt1_re_entry() {
     assert_eq!(
         stamp_after_step4.as_deref(),
         Some(SENTINEL),
-        "Kvt1 re-entry via ErrorRetryable → Kvt1 must preserve original first_kvt1_at via COALESCE"
+        "Kvt1 re-entry (ErrorRetryable → Sending → Sent → Kvt1) must preserve \
+         original first_kvt1_at via COALESCE"
     );
 }
 

@@ -69,7 +69,8 @@ fn mutation(outcome: &ExpectedOutcome) -> &model::Mutation {
 // ── Required (plan Task 1 acceptance) ───────────────────────────────────────
 
 /// `apply(OnlineSell→ACK)` advances `next_lnd` by one AND advances the seed to
-/// that doc's unsigned hash (online-origin issues only at ACK, spec §6).
+/// that doc's unsigned hash (online-origin issues at SEND — A.3 advance-at-SEND;
+/// an ACK-path sell is past the SEND crossing, so its seed is advanced).
 #[test]
 fn online_sell_ackpath_advances_lnd_and_seed() {
     let mut m = RefModel::new_online_open_shift();

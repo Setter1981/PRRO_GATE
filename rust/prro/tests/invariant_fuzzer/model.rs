@@ -635,10 +635,12 @@ fn synth_unsigned_hash(lnd: i64) -> [u8; 32] {
 
 /// Online-lane outcome state from the wire script.  The happy `AckPath`
 /// (send -> Ack, last -> Ack) finalizes to ACK; a leading reject -> REJECTED;
-/// send-Ack-then-lastChk-NotFound holds at SENT (probe-pending, K4); any other
-/// path does NOT reach ACK and therefore does NOT advance the seed (online
-/// issues only at ACK, spec §6).  The precise non-happy terminal states are
-/// asserted / refined by the Task 4 differential against the real seam.
+/// send-Ack-then-lastChk-NotFound holds at SENT (probe-pending, K4) — which,
+/// post-A.3, DOES advance the seed (SENT crosses the SEND boundary; see
+/// `online_origin_advances_seed`).  Only a pre-SEND terminal (Rejected /
+/// ErrorRetryable, no sfn) does NOT advance (online issues at SEND — advance-at-
+/// SEND, A.3).  The precise non-happy terminal states are asserted / refined by
+/// the Task 4 differential against the real seam.
 fn online_outcome_state(script: &DpsScript) -> DocState {
     match script.0.as_slice() {
         [WireResponse::Ack, WireResponse::Ack, ..] => DocState::Ack,
