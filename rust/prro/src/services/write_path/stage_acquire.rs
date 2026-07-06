@@ -630,7 +630,16 @@ pub async fn run(
             //            past acquire only to strand PREPARED at sign).
             //            RETRYABLE (503): the `online_convergence` resolver
             //            re-drives the blocker; the client retries.
-            if fd::exists_blocking_non_issued_sibling_tx(tx, &fn_id, None, None).await? {
+            //            ONLINE-LANE ONLY: an OFFLINE mint is NEVER gated
+            //            (offline availability is unconditional — offline issues
+            //            locally and the runtime resolver is online-scoped, so
+            //            gating an offline sell would stall it with no re-driver).
+            //            The blocker is the ONLINE seed-fork; the sign-layer
+            //            assert is likewise scoped to online-origin docs, so the
+            //            two layers stay consistent.
+            if channel == Channel::Online
+                && fd::exists_blocking_non_issued_sibling_tx(tx, &fn_id, None, None).await?
+            {
                 return reject(
                     tx,
                     &request_id,

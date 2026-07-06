@@ -1201,6 +1201,20 @@ async fn stage3_runtime_byte_equiv_zn_zero_for_nonz_artifact() {
     );
     let hash1 = outcome.document.unsigned_xml_sha256.unwrap();
 
+    // A.3 PR-C — advance doc#1 to an ISSUED state (SENT + server_fiscal_no) so
+    // the D5 sign-gate is TRANSPARENT for doc#2's sign; doc#1's resting SIGNED
+    // state would otherwise gate the sibling (a non-issued older doc).  In
+    // production the single-writer pipeline drives doc#1 forward before doc#2 is
+    // signed; this fixture signs siblings directly.
+    sqlx::query(
+        "UPDATE fiscal_documents SET state = 'SENT', server_fiscal_no = 'D-1' \
+         WHERE document_id = ?",
+    )
+    .bind(doc_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
     // Second run on a sibling doc (lnd=2) with same payload — assert
     // non-determinism is bounded to lnd-driven `<DAT DI>` only; ZN="0"
     // and the constant fields stay byte-equiv.

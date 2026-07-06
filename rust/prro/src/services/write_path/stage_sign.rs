@@ -272,8 +272,14 @@ pub async fn run(
             // Runs BEFORE the pin UPDATE and the 3-NO-TX crypto sign, so a
             // block rolls the pin-tx back with ZERO side effects (doc stays
             // PREPARED, unpinned, no crypto).  One SELECT (INV #1).
-            if fd::exists_blocking_non_issued_sibling_tx(tx, &fn_id, Some(doc_id), Some(lnd))
-                .await?
+            // ONLINE-LANE ONLY: an OFFLINE-origin doc (`fs_mode = 'OFFLINE'`) is
+            // never gated — offline availability is unconditional and the
+            // runtime resolver is online-scoped.  This mirrors the acquire-layer
+            // `channel == Online` scope (at sign the channel is read back from
+            // the persisted `fs_mode`, since the WorkerContext does not carry it).
+            if fd::is_online_origin_tx(tx, doc_id).await?
+                && fd::exists_blocking_non_issued_sibling_tx(tx, &fn_id, Some(doc_id), Some(lnd))
+                    .await?
             {
                 return Ok(PinResult::D5GateBlocked);
             }

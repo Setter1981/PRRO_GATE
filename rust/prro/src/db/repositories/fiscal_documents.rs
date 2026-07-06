@@ -997,6 +997,26 @@ pub async fn exists_blocking_non_issued_sibling_tx(
         .any(|(state, ofn, sfn)| !is_issued(state, *ofn, sfn.as_deref())))
 }
 
+/// A.3 PR-C — is this doc ONLINE-origin (`fs_mode = 'ONLINE'`)?  The D5 gate is
+/// an ONLINE-lane concern: an offline mint must NEVER be gated (offline
+/// availability is unconditional; the runtime resolver is online-scoped).  At
+/// sign time the origin is read back from the persisted `fs_mode` (the
+/// WorkerContext does not carry it); the acquire layer uses the live `channel`
+/// instead.  A missing row (already-terminalised / raced) reads as NOT online
+/// → the gate does not fire (fail-open on the origin read, never fail-closed on
+/// a phantom).
+pub async fn is_online_origin_tx(
+    tx: &mut WriteTxConn<'_>,
+    document_id: DocumentId,
+) -> sqlx::Result<bool> {
+    let fs_mode: Option<String> =
+        sqlx::query_scalar("SELECT fs_mode FROM fiscal_documents WHERE document_id = ?")
+            .bind(document_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(matches!(fs_mode.as_deref(), Some("ONLINE")))
+}
+
 /// **AUD-L6-1 (FT, 2026-06-14)** — the `unsigned_xml_sha256` of the FN's
 /// highest-`lnd` EVER-ISSUED doc: online `ACK` OR offline-origin in any
 /// [`OFFLINE_ISSUED_STATES`] state (`offline_fiscal_no IS NOT NULL`).  This is

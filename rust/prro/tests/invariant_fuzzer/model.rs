@@ -15,7 +15,7 @@
 //! SSOT const `fiscal_documents::OFFLINE_ISSUED_STATES` (U1 D3, anti-shared-
 //! const): a prod-side boundary change turns the differential RED, not silent-inherit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::SqlitePool;
 
@@ -95,6 +95,11 @@ pub struct RefModel {
     pub codes_consumed: i64,
     /// Per-lnd document state.
     pub docs: BTreeMap<i64, DocState>,
+    /// A.3 PR-C — lnds of OFFLINE-origin docs (`offline_fiscal_no` was
+    /// assigned).  Distinguishes an offline-ER (issued, NOT a D5-gate blocker)
+    /// from an online-ER (non-issued, a blocker) — the `docs` map stores only
+    /// `DocState`, which loses the origin the D5 predicate needs.
+    pub offline_origin_lnds: BTreeSet<i64>,
 }
 
 impl RefModel {
@@ -110,6 +115,7 @@ impl RefModel {
             codes_issued: 0,
             codes_consumed: 0,
             docs: BTreeMap::new(),
+            offline_origin_lnds: BTreeSet::new(),
         }
     }
 
@@ -126,6 +132,7 @@ impl RefModel {
             codes_issued: codes,
             codes_consumed: 0,
             docs: BTreeMap::new(),
+            offline_origin_lnds: BTreeSet::new(),
         }
     }
 
@@ -256,6 +263,23 @@ impl RefModel {
         self.apply_sell(&DpsScript(Vec::new()))
     }
 
+    /// A.3 PR-C — does a NON-ISSUED sibling rest on the FN (the D5-gate blocker
+    /// predicate, mirrored)?  Blocks: any doc in a non-terminal in-flight state
+    /// {`PREPARED`,`SIGNED`,`ENCRYPTED`,`SENDING`} (always non-issued — ofn/sfn
+    /// unset) OR an ONLINE-origin `ERROR_RETRYABLE` (non-issued; an offline-origin
+    /// ER is issued and does NOT block).  Mirrors the prod
+    /// `exists_blocking_non_issued_sibling_tx` predicate (state IN the 5 in-flight
+    /// states AND NOT `is_issued`).  At a fresh mint the new doc is youngest, so
+    /// any blocker (all have `lnd < next_lnd`) gates it — no lnd-ordering needed.
+    fn has_write_gate_blocker(&self) -> bool {
+        self.docs.iter().any(|(lnd, st)| {
+            matches!(
+                st,
+                DocState::Prepared | DocState::Signed | DocState::Encrypted | DocState::Sending
+            ) || (*st == DocState::ErrorRetryable && !self.offline_origin_lnds.contains(lnd))
+        })
+    }
+
     /// A sell — the lane is the NODE MODE (the interpreter's `inline::run`
     /// dispatches by mode), not the op name.  Online → per-script outcome;
     /// Offline → OFFLINE_LOCAL_ACK (consuming a code); any other mode → refused.
@@ -265,6 +289,16 @@ impl RefModel {
         }
         match self.mode {
             NodeMode::Online => {
+                // A.3 PR-C (D5 gate, acquire layer) — an ONLINE mint is refused
+                // PRE-MINT while a non-issued sibling rests on the FN (the
+                // ER-parked interleave).  No lnd, no row, no seed change →
+                // NoMutation (a refused-no-row sell, same class as the
+                // dispatcher-mode refusals below).  This precedes ALL wire-script
+                // handling: the acquire refusal fires before sign/send, so the
+                // script is never consumed.  Offline mints are NOT gated.
+                if self.has_write_gate_blocker() {
+                    return ExpectedOutcome::NoMutation;
+                }
                 // Server{-12} ERROR_BAD_HASH_PREV routes to the bounded MAC-
                 // recovery path (error_routing.rs `RetryClass::MacRecovery`): one
                 // auto re-sign + retry.  With the fuzzer's single-shot stub the
@@ -322,6 +356,10 @@ impl RefModel {
                 // Offline issuance → OFFLINE_LOCAL_ACK, advances the seed THERE
                 // (spec §6 offline lane); stays issued through later drain states.
                 self.docs.insert(lnd, DocState::OfflineLocalAck);
+                // A.3 PR-C — mark offline-origin: a later drain-Superseded may
+                // park this lnd at ErrorRetryable, which stays ISSUED (offline)
+                // and MUST NOT be read as a D5-gate blocker.
+                self.offline_origin_lnds.insert(lnd);
                 self.next_lnd += 1;
                 self.codes_consumed += 1;
                 self.seed = Some(unsigned_hash);
@@ -534,6 +572,15 @@ impl RefModel {
                 .await
                 .unwrap();
         self.docs = docs.into_iter().collect();
+        // A.3 PR-C — re-derive the offline-origin set (offline_fiscal_no set):
+        // needed by the D5-gate blocker predicate to tell an offline-ER (issued)
+        // from an online-ER (blocker) after a fault re-sync.
+        let offline_lnds: Vec<(i64,)> =
+            sqlx::query_as("SELECT lnd FROM fiscal_documents WHERE offline_fiscal_no IS NOT NULL")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        self.offline_origin_lnds = offline_lnds.into_iter().map(|(lnd,)| lnd).collect();
         let tip_lnd = self.docs.keys().copied().max().unwrap_or(0);
 
         // mode / shift_state / next_lnd ← node_state.

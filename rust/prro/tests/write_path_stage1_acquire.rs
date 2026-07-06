@@ -524,6 +524,20 @@ async fn stage1_unique_fn_lnd_collision_fails_closed() {
     .unwrap();
     assert_eq!(next_lnd(&pool).await, 2);
 
+    // A.3 PR-C — advance doc#1 to an ISSUED state (SENT + server_fiscal_no) so
+    // the D5 acquire gate is TRANSPARENT for the second acquire; otherwise its
+    // resting PREPARED state would gate the mint BEFORE the lnd-collision path
+    // is reached.  In production the pipeline drives doc#1 forward before the
+    // next acquire runs; this fixture advances it explicitly.
+    sqlx::query(
+        "UPDATE fiscal_documents SET state = 'SENT', server_fiscal_no = 'D-1' \
+         WHERE fiscal_number = ? AND lnd = 1",
+    )
+    .bind(FN)
+    .execute(&pool)
+    .await
+    .unwrap();
+
     // Force collision: rewind next_lnd backwards.
     sqlx::query("UPDATE node_state SET next_lnd = 1 WHERE fiscal_number = ?")
         .bind(FN)
@@ -597,24 +611,41 @@ async fn stage1_concurrent_writers_lnd_monotonic() {
     let r1 = t1.await.unwrap().unwrap();
     let r2 = t2.await.unwrap().unwrap();
 
-    let lnds: Vec<i64> = [r1, r2]
-        .iter()
-        .map(|r| match r {
-            WorkerProcessResult::Proceed(c) => c.document.lnd,
-            other => panic!("expected Proceed, got {other:?}"),
-        })
-        .collect();
-    let mut sorted = lnds.clone();
-    sorted.sort_unstable();
+    // A.3 PR-C — the two raw concurrent acquires serialise on `BEGIN IMMEDIATE`;
+    // the winner mints (Proceed, lnd 1), then the D5 acquire gate refuses the
+    // loser because the winner's PREPARED doc is a non-issued sibling on the FN.
+    // Exactly one mint + one gated refusal → NO double-mint, NO lnd collision.
+    // (In production the fn_write_gate serialises the WHOLE pipeline per FN, so a
+    // second acquire never observes a resting PREPARED sibling; this unit test
+    // drives raw acquires, so the gate is what serialises the second mint.)
+    let mut proceeds = 0;
+    let mut gated = 0;
+    for r in [&r1, &r2] {
+        match r {
+            WorkerProcessResult::Proceed(c) => {
+                assert_eq!(c.document.lnd, 1, "the sole mint takes lnd 1");
+                proceeds += 1;
+            }
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::WriteGateSiblingPending,
+            } => gated += 1,
+            other => panic!("expected Proceed or WriteGateSiblingPending, got {other:?}"),
+        }
+    }
     assert_eq!(
-        sorted,
-        vec![1, 2],
-        "concurrent writers must allocate {{1,2}}, got {lnds:?}"
+        (proceeds, gated),
+        (1, 1),
+        "exactly one mint + one gated refusal under concurrency"
     );
     assert_eq!(
         next_lnd(&pool).await,
-        3,
-        "next_lnd advanced 1→3 across two writers"
+        2,
+        "only the winner consumed an lnd (1→2), no double-alloc"
+    );
+    assert_eq!(
+        doc_count(&pool).await,
+        1,
+        "no double-mint under concurrency"
     );
 }
 
