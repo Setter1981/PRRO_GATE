@@ -313,7 +313,15 @@ impl FuzzCtx {
 
     async fn seed_inbox_sell(&mut self) -> InboxRow {
         let idem = self.next_idem();
-        seed_inbox_sell_keyed(&self.pool, &idem).await
+        seed_inbox_keyed(&self.pool, &idem, "SELL").await
+    }
+
+    /// PR-R-fuzz — seed a `RETURN` inbox row (the shared converted CheckJson
+    /// body; the direction is carried by `operation_type` → `DocType::Return`,
+    /// not the payload — same shape as a SELL row).
+    async fn seed_inbox_return(&mut self) -> InboxRow {
+        let idem = self.next_idem();
+        seed_inbox_keyed(&self.pool, &idem, "RETURN").await
     }
 
     pub async fn observed_doc_count(&self) -> i64 {
@@ -333,6 +341,18 @@ impl FuzzCtx {
                 .await
                 .unwrap();
         doc_state_from_str(&s)
+    }
+
+    /// The raw `doc_type` column of the single doc on the FN (panics if not
+    /// exactly one).  The chain differential cannot distinguish a SELL from a
+    /// RETURN (chain-identical), so PR-R-fuzz pins the wire doc-type directly
+    /// here (raw string — no typed decode needed for a `"SELL"`/`"RETURN"` pin).
+    pub async fn only_doc_type(&self) -> String {
+        sqlx::query_scalar("SELECT doc_type FROM fiscal_documents WHERE fiscal_number = ?")
+            .bind(self.fn_id.as_str())
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
     }
 
     async fn observe_doc_by_request_id(&self, request_id: &[u8; 16]) -> ObservedDoc {
@@ -520,6 +540,12 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
         // ── valid ──
         Op::OnlineSell(script) => online_sell(ctx, script).await,
         Op::OfflineSell => offline_sell(ctx).await,
+        // PR-R-fuzz — a RETURN drives the SAME write-path seam as a SELL with a
+        // `RETURN` inbox row (operation_type → DocType::Return); the fuzzer
+        // enters at `inline::run`, downstream of the ingress STOP-R1
+        // `return_check_number` guard, so `return_check_number` is never set.
+        Op::OnlineReturn(script) => online_return(ctx, script).await,
+        Op::OfflineReturn => offline_return(ctx).await,
         Op::GoOnline(script) => go_online(ctx, script).await,
         Op::Drain(script) => drain_op(ctx, script).await,
         Op::Reboot => reboot(ctx).await,
@@ -831,6 +857,66 @@ async fn reboot(ctx: &mut FuzzCtx) -> RealOutcome {
 /// `OFFLINE_LOCAL_ACK` and makes NO wire call (spec §5).
 async fn offline_sell(ctx: &mut FuzzCtx) -> RealOutcome {
     let row = ctx.seed_inbox_sell().await;
+    let dps = ctx.new_dps(); // offline branch never touches the wire
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_) => {
+            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
+            ctx.last_row = Some(row); // remember for DuplicateIdemKey replay
+            RealOutcome::Doc(observed)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// `OnlineReturn` → `inline::run` on an Online node with a `RETURN` inbox row.
+/// Byte-for-byte the same seam as [`online_sell`] (the write-path is
+/// doc-type-agnostic post-canonical: stage_sign parses the identical CheckJson,
+/// stage_send maps both to `DpsCheckType::Chk`); only the seeded
+/// `operation_type` differs, which `build_canonical` maps to `DocType::Return`.
+async fn online_return(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
+    let row = ctx.seed_inbox_return().await;
+    let dps = ctx.new_dps();
+    load_script(&dps, script);
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_outcome) => {
+            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
+            ctx.last_row = Some(row); // remember for DuplicateIdemKey replay
+            RealOutcome::Doc(observed)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// `OfflineReturn` → `inline::run` on an Offline node — lands `OFFLINE_LOCAL_ACK`
+/// and consumes an offline code, exactly like [`offline_sell`] (the offline-code
+/// CAS `acquire_code_tx` is doc-type-agnostic); only the seeded `operation_type`
+/// differs.
+async fn offline_return(ctx: &mut FuzzCtx) -> RealOutcome {
+    let row = ctx.seed_inbox_return().await;
     let dps = ctx.new_dps(); // offline branch never touches the wire
     let guard = ctx.gate.clone().lock_owned().await;
     let result = inline::run(
@@ -1270,7 +1356,12 @@ async fn seed_offline_code(pool: &SqlitePool, code_lnd: i64) {
         .unwrap();
 }
 
-async fn seed_inbox_sell_keyed(pool: &SqlitePool, idem: &str) -> InboxRow {
+/// Seed an inbox row for a check-class op (`operation_type` = `"SELL"` or
+/// `"RETURN"`).  The payload body (`SELL_PAYLOAD`) is the shared converted
+/// CheckJson — SELL and RETURN carry the identical `{items,payments}` shape at
+/// the write-path layer; the direction is carried by `operation_type` (→
+/// `DocType::Sell` / `DocType::Return` in `build_canonical`), not the body.
+async fn seed_inbox_keyed(pool: &SqlitePool, idem: &str, operation_type: &str) -> InboxRow {
     let req_id = RequestId::new();
     let request_id: [u8; 16] = *req_id.as_bytes();
     let payload_sha256_canonical: [u8; 32] = Sha256::digest(SELL_PAYLOAD.as_bytes()).into();
@@ -1280,7 +1371,7 @@ async fn seed_inbox_sell_keyed(pool: &SqlitePool, idem: &str) -> InboxRow {
             request_id,
             fiscal_number: FN.into(),
             protocol: Protocol::Rest,
-            operation_type: "SELL".into(),
+            operation_type: operation_type.into(),
             idempotency_key: idem.into(),
             payload_json: SELL_PAYLOAD.into(),
             payload_sha256_canonical,
@@ -1297,7 +1388,7 @@ async fn seed_inbox_sell_keyed(pool: &SqlitePool, idem: &str) -> InboxRow {
         request_id,
         fiscal_number: FN.into(),
         protocol: Protocol::Rest,
-        operation_type: "SELL".into(),
+        operation_type: operation_type.into(),
         idempotency_key: idem.into(),
         status: "NEW".into(),
         payload_json: SELL_PAYLOAD.into(),

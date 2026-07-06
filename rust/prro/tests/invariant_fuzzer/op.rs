@@ -89,6 +89,15 @@ pub enum Op {
     /// interaction is driven by the `Drain` op's own `DpsScript`, so this
     /// variant carries no script.
     OfflineSell,
+    /// PR-R-fuzz — a RETURN is chain-wise IDENTICAL to a SELL (consumes an
+    /// `lnd`, advances the FN seed at the same boundary, participates in the
+    /// D5 gate + offline-code pool identically — all three verified
+    /// doc-type-agnostic in prod).  The SELL vs RETURN delta is purely
+    /// differential-level (sum_out / wire `T=1`), never model state.  Mirrors
+    /// the Sell pair: `OnlineReturn` carries a wire script; offline issuance is
+    /// LOCAL so `OfflineReturn` carries none.
+    OnlineReturn(DpsScript),
+    OfflineReturn,
     Drain(DpsScript),
     Crash(Stage),
     Reboot,

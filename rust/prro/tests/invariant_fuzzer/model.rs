@@ -204,6 +204,10 @@ impl RefModel {
             // `apply_sell`; OfflineSell carries no wire script.
             Op::OnlineSell(script) => self.apply_sell(script),
             Op::OfflineSell => self.apply_sell(&DpsScript(Vec::new())),
+            // PR-R-fuzz — a RETURN is chain-wise identical to a SELL (§ apply_return):
+            // same mode-dispatch, same lnd/seed/code bookkeeping.
+            Op::OnlineReturn(script) => self.apply_return(script),
+            Op::OfflineReturn => self.apply_return(&DpsScript(Vec::new())),
             // The advancing transition / drain ops predict a real ledger
             // mutation (PredictableMutating, NOT Fault).
             Op::GoOnline(script) => self.apply_go_online(script),
@@ -278,6 +282,19 @@ impl RefModel {
                 DocState::Prepared | DocState::Signed | DocState::Encrypted | DocState::Sending
             ) || (*st == DocState::ErrorRetryable && !self.offline_origin_lnds.contains(lnd))
         })
+    }
+
+    /// A RETURN — chain-wise IDENTICAL to a SELL at the model level.  All three
+    /// production symmetries were verified doc-type-agnostic: the offline-code
+    /// CAS (`acquire_code_tx`), the D5 acquire/sign gate predicate
+    /// (`exists_blocking_non_issued_sibling`), and stage_sign/stage_send.  The
+    /// SELL vs RETURN difference is purely differential-level (sum_out / wire
+    /// `T=1`), NOT model state (lnd / seed / codes) — so the model delegates to
+    /// `apply_sell` (a single SSOT, zero two-arm drift).  The interp still drives
+    /// a genuine `DocType::Return` doc through prod, so the differential exercises
+    /// the RETURN write-path against this (SELL-identical) prediction.
+    fn apply_return(&mut self, script: &DpsScript) -> ExpectedOutcome {
+        self.apply_sell(script)
     }
 
     /// A sell — the lane is the NODE MODE (the interpreter's `inline::run`

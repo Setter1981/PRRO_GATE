@@ -35,7 +35,8 @@ use prro::db::models::enums::{DocState, NodeMode, ShiftState};
 use prro::db::repositories::fiscal_documents::{is_issued, OFFLINE_ISSUED_STATES};
 
 use proptest::prelude::*;
-use proptest::test_runner::FileFailurePersistence;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::{FileFailurePersistence, TestRunner};
 
 use model::{ExpectedOutcome, RefModel};
 use op::{DpsScript, Op, Stage, WireResponse};
@@ -364,6 +365,120 @@ async fn teeth_d4_normal_online_sell_not_subject_to_bound() {
     let ctx = interp::FuzzCtx::new_online_open_shift().await;
     let model = RefModel::new_online_open_shift();
     let _ = run_harness(&[Op::OnlineSell(DpsScript::ack_path())], ctx, model).await;
+}
+
+// ── PR-R-fuzz — RETURN in the alphabet (chain-wise identical to SELL) ────────
+
+/// PR-R-fuzz — an ONLINE RETURN issues at the SEND boundary and advances the
+/// seed, matching the model.  RED before `apply_return` is implemented (the
+/// model arm `todo!()`s → `apply` panics inside `run_harness`); GREEN once
+/// `apply_return` delegates to `apply_sell`.
+#[tokio::test]
+async fn online_return_ack_path_matches_model() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(&[Op::OnlineReturn(DpsScript::ack_path())], ctx, model).await;
+}
+
+/// PR-R-fuzz — an OFFLINE RETURN consumes an offline code and issues at
+/// OFFLINE_LOCAL_ACK exactly like an offline SELL (symmetry (a): the offline-
+/// code CAS `acquire_code_tx` is doc-type-agnostic).  RED under the `todo!()`
+/// model arm; GREEN once `apply_return` delegates to `apply_sell`.
+#[tokio::test]
+async fn offline_return_consumes_code_matches_model() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let model = RefModel::new_offline_open_shift(3);
+    let _ = run_harness(&[Op::OfflineReturn], ctx, model).await;
+}
+
+/// PR-R-fuzz — a mixed SELL+RETURN online sequence stays chain-continuous (each
+/// doc chains onto the prior tip; the seed advances once per issued doc),
+/// matching the model across the interleave.
+#[tokio::test]
+async fn mixed_sell_return_sequence_matches_model() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(
+        &[
+            Op::OnlineSell(DpsScript::ack_path()),
+            Op::OnlineReturn(DpsScript::ack_path()),
+            Op::OnlineSell(DpsScript::ack_path()),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
+/// PR-R-fuzz — the D5 acquire gate refuses an ONLINE RETURN while a non-issued
+/// sibling rests (symmetry (b): `exists_blocking_non_issued_sibling` is
+/// doc-type-agnostic).  A `Crash(Send)` leaves a SENDING (non-issued) sibling;
+/// the following RETURN is acquire-refused (NoMutation, no new issued row) — the
+/// model predicts it via the same `has_write_gate_blocker` path a SELL uses.
+#[tokio::test]
+async fn online_return_d5_gated_by_non_issued_sibling() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(
+        &[
+            Op::Crash(Stage::Send),
+            Op::OnlineReturn(DpsScript::ack_path()),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
+/// PR-R-fuzz — the interp drives a GENUINE `RETURN` doc into the ledger.  The
+/// chain differential cannot distinguish a SELL from a RETURN (chain-identical),
+/// so the wire doc-type is pinned directly here.  Teeth (b): revert
+/// `online_return` to seed a SELL row → this RED.
+#[tokio::test]
+async fn online_return_produces_a_genuine_return_doc() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let outcome = interp::run_op(&mut ctx, &Op::OnlineReturn(DpsScript::ack_path())).await;
+    assert!(
+        matches!(outcome, interp::RealOutcome::Doc(_)),
+        "an ACK-path RETURN must issue a doc, got {outcome:?}"
+    );
+    assert_eq!(
+        ctx.only_doc_type().await,
+        "RETURN",
+        "the fuzzer must drive a genuine RETURN, not a mislabeled SELL"
+    );
+}
+
+/// PR-R-fuzz (anti-silent-zero) — the generator ACTUALLY emits both Return ops
+/// over a large deterministic draw, so Return / mixed sequences are really
+/// exercised by the property harness.  A dropped or zero weight makes this RED
+/// loudly instead of silently never testing Returns.
+#[test]
+fn generator_emits_online_and_offline_returns() {
+    let mut runner = TestRunner::deterministic();
+    let strat = strategy::op_sequence();
+    let mut online = 0usize;
+    let mut offline = 0usize;
+    for _ in 0..2000 {
+        let seq = strat.new_tree(&mut runner).unwrap().current();
+        for op in &seq {
+            match op {
+                Op::OnlineReturn(_) => online += 1,
+                Op::OfflineReturn => offline += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        online > 0,
+        "generator never emitted an OnlineReturn over 2000 sequences \
+         (anti-silent-zero: the Return weight is dropped)"
+    );
+    assert!(
+        offline > 0,
+        "generator never emitted an OfflineReturn over 2000 sequences \
+         (anti-silent-zero: the Return weight is dropped)"
+    );
 }
 
 // ── Lane-correctness reinforcements (pure model behaviours) ─────────────────
