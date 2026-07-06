@@ -16,6 +16,7 @@ pub mod canonical_builder;
 pub mod convert;
 pub mod dto;
 pub mod handler;
+pub mod inline_binding;
 pub mod policy;
 pub mod preflight;
 pub mod replay;

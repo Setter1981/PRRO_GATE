@@ -37,8 +37,9 @@ use crate::db::models::enums::{Protocol, Severity};
 use crate::db::models::ids::DriverId;
 use crate::db::repositories::audit_log;
 use crate::runtime::bindings::BindingsRegistry;
+use crate::runtime::ingress::inline_binding::InlineWritePath;
 use crate::runtime::ingress::preflight::preflight_d1_slots;
-use crate::runtime::ingress::seam::{UnimplementedWritePath, WritePathEntry};
+use crate::runtime::ingress::seam::WritePathEntry;
 use crate::runtime::ingress::server::{self, IngressState};
 use crate::runtime::key_loader::{build_fn_sign, JksOperatorKeyLoader};
 use crate::services::offline_sync::return_online_probe::run_tick_for_fn;
@@ -177,15 +178,34 @@ where
     // failure — it returns Err before ANY task is spawned, so a misconfigured
     // ingress never half-starts the spine.  Binding before spawn also makes a
     // bind error a boot failure, NOT a runtime loop-death.
-    // ── A2.4 ACTIVATION PREREQUISITE (AUD-L2-1a) ──────────────────────────────
-    // Before flipping this binding from `UnimplementedWritePath` to the inline
-    // write-path, RESOLVE the online-lane chain seed-fork: the inline lane
-    // advances the chain seed only at `stage_finalize` (ACK), so two online
-    // SELLs resting at `SENT` fork the chain (doc2 signs against the stale
-    // pre-doc1 seed).  Gate: un-#[ignore]
-    // `tests/kill_point_matrix.rs::m1_02_online_seed_fork_a24_prerequisite`
-    // (currently a RED pin).  See REMEDIATION-PLAN §Batch C / AUD-L2-1a.
-    let write_path: Arc<dyn WritePathEntry> = Arc::new(UnimplementedWritePath);
+    // ── A2.4 BINDING FLIPPED (AUD-L2-1a) — the inline write-path is now LIVE ──
+    // All four activation-prerequisite gates are green at this HEAD:
+    //   1. advance-at-SEND — the online chain seed advances ATOMICALLY with the
+    //      `server_fiscal_no` stamp at the `Sending → Sent` CAS (not at ACK),
+    //      closing the seed-fork; the RED-pin
+    //      `tests/kill_point_matrix.rs::m1_02_online_seed_fork_a24_prerequisite`
+    //      is un-#[ignore]'d + GREEN.
+    //   2. D5 gate — the worker will not sign/mint a successor while a non-issued
+    //      sibling rests on the FN (drift-assert would fire post-wire otherwise).
+    //   3. the `online_convergence` ER resolver — re-drives the D5 blocker so the
+    //      FN un-gates at runtime (no FN-wide stall until reboot).
+    //   4. migration 027 — one-shot online-issued boundary assert.
+    // D6 (LOCKED): this DI-swap is a PURE CODE change, NO config knob.  A
+    // downgrade back to `UnimplementedWritePath` is a code revert, and MUST only
+    // be taken after QUIESCING the FN to a terminal state (no doc resting past
+    // the first advance-at-SENT) — never mid-flight.
+    // KNOWN GAP (RULING 2, AUD-L2 Phase-1 arm-table): the RS-3 stale-`PROCESSING`
+    // reaper is NOT yet built.  A structural-breach arm (an A4-unexpected inline
+    // Noop / a no-wire race / an `advance_to_ack` fault, each with an empty
+    // ledger) leaves the inbox `PROCESSING` and the client polling `202
+    // IN_PROGRESS` — NEVER a double-fiscalize (replay resolves from the ledger)
+    // and NEVER a mis-terminalised `Sent` receipt (unknown truth is never
+    // rejected).  Operator surface: the `INLINE_NOOP_UNEXPECTED` + structural-
+    // breach CRITICAL audits; interim recovery: the manual re-drive procedure in
+    // the live-DPS runbook.  Build the reaper BEFORE a wide pilot (a
+    // close-supervision pilot's manual surface is acceptable).
+    let write_path: Arc<dyn WritePathEntry> =
+        Arc::new(InlineWritePath::new(app.clone(), Arc::clone(&registry)));
     let bound_ingress = bind_rest_ingress(&app, &write_path).await?;
 
     // ── 5d: spawn the drain + return-online tick loops ──
