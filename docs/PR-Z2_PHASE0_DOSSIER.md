@@ -200,3 +200,62 @@ GO to a locked contract once STOP-S1..S4 are adjudicated. My defaults: **S1 onli
 **S2 flip-now (TXS complete, IO/EPZ absent-by-design)**, **S3 RMR+audit in PR-Z2, §8.2 alert
 deferred**, **S4 SHIFT_OPEN in**. If S2 is "not yet" (IO/EPZ required), PR-Z2 STOPS — the whole
 live-Z path is blocked on the surface, and that becomes a separate IO/EPZ contract first.
+
+---
+
+## LOCKED RULINGS (architect adjudication, 2026-07-07)
+
+All four STOPs adjudicated; contract locked. Both ingress guards confirmed present on main
+(SERVICE → Unsupported 422 pre-inbox; `acquirer_slip` → fail-closed `convert.rs:514`).
+
+- **S1 — ONLINE-ONLY (confirmed).** PR-Z2 = edges 1/3/8/10 (staged) + 4/12 (→RMR) + 11
+  (rollback). The 8 offline edges (2/5/6/7/9/13/14/15) → **A'.3 offline-enable** (needs the
+  offline lane + drain finalization — a separate increment). **Honesty pin:** the full PILOT
+  GATE formula includes the offline-drill; **PR-Z2 closes only the ONLINE half** of the pilot
+  e2e (boot→OPEN→SELLs→Z-close). State this in the PR: *"PILOT GATE (online-half) closed;
+  offline-drill half → A'.3."*
+
+- **S2 — FLIP-NOW, with a MANDATORY coupling-tripwire (blocking flip condition).** Fiscal
+  rationale: for THIS contour, absent IO/EPZ = *accuracy*, not under-reporting — the gateway
+  structurally cannot accept the ops those sections report (SERVICE → 422 pre-inbox;
+  slip-carrying payment → 422 fail-closed; Python-prod 4yr emitted both sections only on
+  non-empty data = ground truth). BUT surface-completeness is now CONDITIONAL on those two
+  ingress guards. **Flip condition:** next to `FULL_Z_SURFACE_READY = true`, land a
+  **coupling-pin** (test + a doc-comment on the const) asserting SERVICE_IN/OUT stay
+  ingress-rejected AND `acquirer_slip` stays fail-closed, worded: *"enabling either WITHOUT
+  building its Z-half re-opens the under-reporting hazard — flip back or extend the surface IN
+  THE SAME CHANGE."* Anyone who later enables SERVICE docs without the IO-half must break this
+  pin LOUDLY. The `z_live_dispatch_is_gated_until_full_z_surface` tripwire flips deliberately
+  per its own contract.
+
+- **S3 — RMR + §8.1 audit IN PR-Z2; §8.2 operator-alert DEFERRED with an address.** Edges
+  4/12 → `escalate_fn_to_manual_recon` (the idempotent seam already used by
+  convergence/boot/SW-4) + §8.1 forensic audit — in scope. §8.2 operator-alert (≤60s pluggable
+  Telegram/HTTP/SMTP) → **named residual addressed to the monitoring unit**
+  (`project_backlog_monitoring` — itself a must-have-pre-pilot, off-by-default), NOT an open-ended
+  "someday". **§6.5 retry budgets:** assess in the contract/impl phase — if the existing
+  `error_routing` already yields them (transport-class → `ErrorRetryable` + convergence redrive),
+  **REUSE it, do not build a parallel budget machine.**
+
+- **S4 — SHIFT_OPEN IN (confirmed).** Without a live OPEN the e2e is unbuildable (a "clean
+  production config" excludes a seeded shift). Online-lane SHIFT_OPEN dispatch closes HERE; the
+  recon note "A2.2 owns SHIFT_OPEN" is revised — **enumerate the residual A2.2/A2.5 owns AFTER
+  this PR so the roadmap entry isn't dead:** (a) **offline SHIFT_OPEN** (edge 2, → A'.3, not
+  A2.2); (b) **resume × shift-guard interaction** (the A2.5-class item — a boot-resume of a
+  half-open shift crossing the guard matrix); (c) any A2.2 shift-open pieces beyond the online
+  happy-path + edges 1/3/4 (to be confirmed against the A2.2 tracker in the contract phase). PR-Z2
+  claims ONLY the online SHIFT_OPEN happy-path + its edges (1/3 confirm, 4 → RMR).
+
+### Contract frame (locked)
+- Branch `feat/aprime2-z2-live-dispatch` off current main (`e1a7817`). Strict RED-first. Hot-zone
+  (`inline.rs`) — the happy-path template `:560-922` is reused VERBATIM; orchestrator increment,
+  NOT a stage rework.
+- **Delivery order:** (1) SHIFT_OPEN dispatch + pins → (2) Z/SHIFT_CLOSE dispatch (quiescence C10
+  via the existing gate; D5 dual-hash as-is) → (3) edges 4/12 → RMR + 11 rollback → (4) flag flip
+  + coupling-pin + tripwire-flip in ONE commit → (5) PILOT e2e (online-half): boot → SHIFT_OPEN →
+  SELLs → Z-close on a clean prod config via the live binding, `invariant_scan::assert_clean` at
+  the end. Rewrite the Z-arm `debug_assert` per the routing reality.
+- **Delivery gate:** adversarial lenses (hot-zone mandatory: invariants #1/#2/#8/#9, C10-bypass,
+  D5, diff boundaries) + full nextest + fmt/clippy + 7-point report.
+- **STOP-protocol:** the stages are "ready" per recon — on ANY divergence found while wiring them,
+  STOP and triage to the architect; do NOT fix a stage silently.
