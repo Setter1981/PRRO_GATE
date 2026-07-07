@@ -332,3 +332,53 @@ recovery build inside this dispatch PR.
 
 **Execution: NOW, in-session (architect switched to a 1M-context model — the "fresh session"
 recommendation is withdrawn; the budget was granted).**
+
+---
+
+## STEP-1 DONE (2026-07-07, commit `8dbed91`)
+
+SHIFT_OPEN live dispatch: removed the `inline::run` SHIFT_OPEN fail-closed arm → SHIFT_OPEN falls
+through to the doc-type-agnostic happy-path stages (acquire edge1 Created→Opening, sign ShiftOpen,
+send edge3 Opening→Opened, advance→Ack). Confirmed recon B: the stages were built; the gap was pure
+orchestrator routing. Pins: `online_shift_open_reaches_ack` (RED-first: 422 → ACK + shift OPENED) +
+`online_shift_open_while_open_is_shift_already_open` (guard governs live: SHIFT_ALREADY_OPEN 422, no
+mint). Dead `SHIFT_OPEN_NOT_SUPPORTED` code removed; obsolete fail-closed test deleted. Build clean.
+
+## STEP-2 DESIGN (Z/SHIFT_CLOSE) + STOP-S6
+
+**Structure (locked):** extract the happy-path TAIL (`inline.rs` stage_acquire→…→finalize, :585-909)
+into `run_staged(pool, …, row, command)` — a behavior-preserving refactor guarded by the 18 existing
+`write_path_inline` tests. The SELL/RETURN/SHIFT_OPEN path becomes `build_canonical → run_staged`; a
+new `run_z_dispatch(pool, …, row)` does the Z prefix (resolve current_shift_id → `quiesce_shift_before_z`
+→ `aggregate_z_payload_for_shift` → `build_z_canonical` → `run_staged`). Testing `run_z_dispatch`
+DIRECTLY is flag-independent, so step 2 is RED-first-testable BEFORE the step-4 flag flip (the
+`FULL_Z_SURFACE_READY` const can't be flipped at runtime). inline::run's Z arm: `if
+ensure_full_z_surface_ready().is_ok() { run_z_dispatch } else { <501 fail-closed> }` — production stays
+501 until step 4 flips the const. All Z helpers are `pub` + importable (verified). Z advance-at-SEND +
+D5 sibling gate apply unchanged. The Clear path is unambiguous + PILOT-critical.
+
+### ⚠️ STOP-S6 (seam-contract conflict on `QuiescenceOutcome::Pending`) — NEEDS A RULING
+
+`quiesce_shift_before_z` returns `Pending{blocking}` when in-flight receipts remain; its doc-comment
+says the caller "returns IN_PROGRESS / Z_QUIESCENCE_PENDING WITHOUT creating a Z doc; the Z retries once
+the runtime drives them issued." **But this is entirely unbuilt AND it collides with the seam contract**
+(`seam.rs:213-225`): returning ANY non-`NotImplemented` `FiscalError` MUST leave the inbox non-`NEW` +
+terminal (the lease moved NEW→PROCESSING; a terminal refusal drives it terminal). So a true
+retryable-leave-NEW is a **seam-contract exception the handler doesn't support** — and building it means
+touching `handler.rs` / `seam.rs` (the ingress boundary the contract declared off-limits).
+
+Options for the Pending arm:
+- **(A) leave-NEW + handler recognises a pre-lease retryable** — true same-key retry (202 on replay).
+  **Touches ingress/handler → OUT of the PR-Z2 boundary.**
+- **(B) terminalise (respect the seam) + `OfflineRefused{Z_QUIESCENCE_PENDING}` 503** — first POST 503;
+  a same-key replay → 500 (REJECTED-inbox resolve); the operator retries with a NEW request. Fiscally
+  SAFE (no doc minted, no double-Z), boundary-clean (no ingress touch). Cost: the documented "same-key
+  retry" needs a new key. Named residual: true same-key-retry → the recovery/handler increment.
+- **(C) new `FiscalError::QuiescencePending` variant + handler branch** — explicit, but touches seam.rs
+  + handler.rs (ingress boundary).
+
+**Recommendation: (B)** for PR-Z2 — it is the only boundary-clean option, fiscally safe, and the PILOT
+online-half e2e never hits Pending (SELLs Ack before Z → Clear), so it does not gate the deliverable.
+The true same-key-retry (A/C) becomes a named residual co-scoped with the recovery increment (which
+already owns the handler-aware escalation work). **Architect: ratify (B), or ring-fence an ingress
+change for (A)/(C)?** The Clear path proceeds regardless; only the Pending arm awaits this ruling.
