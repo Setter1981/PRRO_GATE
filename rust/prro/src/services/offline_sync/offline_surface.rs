@@ -7,16 +7,26 @@
 //! DIRECT seam calls (`open_session` + mode-set + offline SELL/RETURN via
 //! `inline::run`), NOT through the door.
 //!
-//! ⚠️ SHIP-TOGETHER (A′.3 slicing): the `true` flip lands in O2 TOGETHER
-//! with the drain path (return-online probe + backlog drain) and a
-//! coupling-pin. Opening the door WITHOUT a reachable drain re-opens the
-//! stranded-backlog hazard: an operator could `GO_OFFLINE`, accrue an
-//! `OFFLINE_LOCAL_ACK` backlog, and have no convergence path back to
-//! `ONLINE`. Do NOT flip this to `true` until O2 wires drain + the
-//! coupling-pin. The tripwire `offline_door_gated_until_full_offline_surface`
-//! (`tests/offline_surface.rs`) pins this flip as the deliberate O2 release
-//! decision it is.
-pub const FULL_OFFLINE_SURFACE_READY: bool = false;
+//! ✅ FLIPPED in A′.3 O2 (2026-07-07): the offline operator door is LIVE. The
+//! flip lands TOGETHER with the drain path (return-online probe + backlog
+//! drain, driven by the supervisor loops when `supervisor.enabled = true`) and
+//! the coupling-pin.
+//!
+//! ⚠️ COUPLING (ship-together): this `true` is CONDITIONAL on a reachable
+//! drain. Opening the door WITHOUT a drain path re-opens the stranded-backlog
+//! hazard — an operator could `GO_OFFLINE`, accrue an `OFFLINE_LOCAL_ACK`
+//! backlog, and have no convergence path back to `ONLINE`. If the drain path
+//! is ever removed/broken, flip this back to `false` in the SAME change. The
+//! coupling-pin `offline_door_flip_coupled_to_reachable_drain`
+//! (`tests/offline_door_coupling.rs`) asserts the drain path is reachable,
+//! flag-independent; the flip pin `offline_surface_is_live_after_o2_flip`
+//! (`tests/offline_surface.rs`) REDs on a flag revert.
+//!
+//! SCOPE (honest-dormant, per O2 runbook): the door enables offline SELL/RETURN
+//! and return-online drain on an ONLINE-opened shift (canonical Pattern C).
+//! Shift OPEN/CLOSE performed *under* offline (edges 2/7/9) remain fail-closed
+//! until PR-O3 — an availability limit, not a fiscal hazard.
+pub const FULL_OFFLINE_SURFACE_READY: bool = true;
 
 /// Typed fail-closed error for an operator `GO_OFFLINE` / `GO_ONLINE` command
 /// attempted before the offline surface (drain path) is enabled.

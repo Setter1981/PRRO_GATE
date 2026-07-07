@@ -1508,15 +1508,20 @@ mod tests {
 
     /// RP-O1-8 (gated-pin): the DOOR stays shut while the surface flag is
     /// false — GO_OFFLINE refuses without mutating.
+    ///
+    /// O2 flip: inverted from the O1 gated-pin per its own contract — the
+    /// DOOR is now LIVE.  GO_OFFLINE (public, gated) flips ONLINE→OFFLINE and
+    /// opens an OPEN session.  RED against `FULL_OFFLINE_SURFACE_READY=false`
+    /// (the door refuses) — this is the flip's teeth.
     #[tokio::test]
-    async fn go_offline_gated_refuses_while_surface_false() {
+    async fn go_offline_via_open_door_flips_and_opens_session() {
         let (_d, pool) = fresh_pool().await;
         seed_node_state(&pool, "ONLINE").await;
 
-        let err = go_offline(&pool, "1234567890", "operator net drop")
+        let outcome = go_offline(&pool, "1234567890", "operator net drop")
             .await
-            .expect_err("door must be gated in O1");
-        assert!(matches!(err, AdminError::OfflineSurfaceNotReady));
+            .expect("door is live after the O2 flip");
+        assert_eq!(outcome.fiscal_number, "1234567890");
 
         let mode: String =
             sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
@@ -1524,10 +1529,13 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(mode, "ONLINE");
-        assert!(read_offline_session_state(&pool, "1234567890")
-            .await
-            .is_none());
+        assert_eq!(mode, "OFFLINE");
+        assert_eq!(
+            read_offline_session_state(&pool, "1234567890")
+                .await
+                .as_deref(),
+            Some("OPEN")
+        );
     }
 
     /// RP-O1-1 / RP-O1-2: the gate-free GO_OFFLINE machinery flips
@@ -1616,17 +1624,23 @@ mod tests {
         ));
     }
 
-    /// RP-O1-8 (gated-pin) for the recovery door.
+    /// O2 flip: the recovery DOOR is now LIVE — GO_ONLINE (public, gated)
+    /// flips OFFLINE→GOING_ONLINE.  RED against `FULL_OFFLINE_SURFACE_READY=
+    /// false` (the flip's teeth).
     #[tokio::test]
-    async fn go_online_gated_refuses_while_surface_false() {
+    async fn go_online_via_open_door_flips_to_going_online() {
         let (_d, pool) = fresh_pool().await;
         seed_node_state(&pool, "OFFLINE").await;
-        assert!(matches!(
-            go_online(&pool, "1234567890", "dps back")
+        go_online(&pool, "1234567890", "dps back")
+            .await
+            .expect("recovery door is live after the O2 flip");
+        let mode: String =
+            sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+                .bind("1234567890")
+                .fetch_one(&pool)
                 .await
-                .expect_err("gated"),
-            AdminError::OfflineSurfaceNotReady
-        ));
+                .unwrap();
+        assert_eq!(mode, "GOING_ONLINE");
     }
 
     /// RP-O1-10: GO_ONLINE machinery flips OFFLINE→GOING_ONLINE + audits.

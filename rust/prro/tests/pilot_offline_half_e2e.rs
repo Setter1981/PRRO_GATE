@@ -19,9 +19,10 @@
 //! at OLA-resting docs + an OPEN session (legal durable states); `assert_clean`
 //! MUST be clean.
 //!
-//! DOOR STAYS SHUT (RP-O1-8): the gated `admin::go_offline` command is asserted
-//! to still refuse here (OfflineSurfaceNotReady) — proving the machinery was
-//! reached via direct seams, not the (O2) live door.
+//! DIRECT-SEAM PROOF: this e2e reaches the offline machinery via direct seams
+//! (mode-set + open_session), independent of the operator door. (In A′.3 O2 the
+//! door went live — proven by the admin door tests + the full drill; this test
+//! stays a valid direct-seam reachability proof.)
 //!
 //! TEETH: revert the mode-set seam → the SELL routes online (no DPS ack queued
 //! for it) and the e2e REDs; skip the online SHIFT_OPEN preopen → the offline
@@ -312,12 +313,9 @@ async fn pilot_offline_sell_and_return_reachable_via_live_binding() {
         .expect("seed offline codes");
     assert_eq!(seeded.inserted_count, 6);
 
-    // The gated DOOR is still shut — the machinery above was reached by direct
-    // seams, NOT the operator command (RP-O1-8 in the live e2e context).
-    assert!(matches!(
-        prro::admin::go_offline(app.db(), FN, "should be gated").await,
-        Err(prro::admin::AdminError::OfflineSurfaceNotReady)
-    ));
+    // (A′.3 O2: the operator door is now LIVE — proven by the admin door tests
+    // + the full drill. This e2e still reaches the machinery via DIRECT seams,
+    // so it remains a valid direct-seam reachability proof.)
 
     // ─── 3) OFFLINE SELL + RETURN via the live binding (mode=OFFLINE) ──────
     let sell = drive(

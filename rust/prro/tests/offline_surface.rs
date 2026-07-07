@@ -1,25 +1,23 @@
-//! A′.3 PR-O1 — offline-surface release-gate tripwire (RP-O1-9).
+//! A′.3 — offline-surface release-gate pin.
 //!
-//! Mirrors the Z-surface gate (`z_builder::ensure_full_z_surface_ready`):
-//! `FULL_OFFLINE_SURFACE_READY` gates the operator DOOR (admin
-//! GO_OFFLINE / GO_ONLINE). In O1 the door stays shut; the flip + coupling-pin
-//! land in O2 together with the drain path.
+//! O1 shipped this gated OFF (tripwire asserted the gate returns Err). O2
+//! flips `FULL_OFFLINE_SURFACE_READY = true` TOGETHER with the drain path +
+//! the coupling-pin (`tests/offline_door_coupling.rs`). This pin is the
+//! deliberate, conscious inversion of the O1 tripwire per its own contract,
+//! mirroring `z_builder`'s post-flip state.
 
 use prro::services::offline_sync::offline_surface::{
     ensure_full_offline_surface_ready, OfflineSurfaceNotReady,
 };
 
-/// RP-O1-9 tripwire: the offline door is deliberately gated in O1 — the gate
-/// returns the typed fail-closed error while `FULL_OFFLINE_SURFACE_READY` is
-/// false. Flipping the flag (without O2's drain path + coupling-pin) makes the
-/// gate return `Ok(())` and REDs this pin — opening the door without a
-/// reachable drain re-opens the stranded-backlog hazard. (Asserts on the gate
-/// fn, not the raw const, mirroring `z_live_dispatch_is_gated_until_full_z_surface`.)
+/// O2 flip: the offline operator surface is now ENABLED — the gate returns
+/// `Ok(())`, so the GO_OFFLINE / GO_ONLINE door is live. Reverting the flip
+/// (`FULL_OFFLINE_SURFACE_READY = false`) makes this RED and refuses the door
+/// — the ship-together coupling (no live door without the drain path).
 #[test]
-fn offline_door_gated_until_full_offline_surface() {
+fn offline_surface_is_live_after_o2_flip() {
     assert_eq!(
         ensure_full_offline_surface_ready(),
-        Err(OfflineSurfaceNotReady),
-        "the offline door must stay gated until O2 wires the drain path + coupling-pin"
+        Ok::<(), OfflineSurfaceNotReady>(())
     );
 }
