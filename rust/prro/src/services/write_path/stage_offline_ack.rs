@@ -214,13 +214,15 @@ pub async fn run(
             //
             // Defence-in-depth (operator correction #4): read doc_type
             // + state + fiscal_number BEFORE shift-state validation so
-            // we can scope the widened {Opened | OpenedLocalPendingDrain}
-            // allowlist by doc_type — non-bypass regular fiscal docs
-            // get the widened set; other doc types stay scoped to
-            // Opened only.  Without this, an arbitrary upstream caller
-            // could route a non-fiscal doc through the offline-ack
-            // path on OpenedLocalPendingDrain — defeating the §3.4
-            // matrix contract.
+            // we can scope the shift-state allowlist by doc_type —
+            // regular fiscal docs accept {Opened | OpenedLocalPendingDrain};
+            // since A′.3 PR-O3 the shift-management docs accept exactly the
+            // state their acquire edge leaves the shift in (SHIFT_OPEN →
+            // OpenedLocalPendingDrain, edge 2; SHIFT_CLOSE / Z_REPORT →
+            // ClosingLocalPendingDrain, edges 9/7).  Without this, an
+            // arbitrary upstream caller could route a doc through the
+            // offline-ack path in a state its lifecycle never produces —
+            // defeating the §3.4 matrix contract.
             //
             // Returned `inputs.state` is the pre-CAS observation;
             // surfaces typed `DocStateConflict` if not SIGNED.
@@ -268,11 +270,12 @@ pub async fn run(
             // regular fiscal docs (Sell / Return / ServiceIn /
             // ServiceOut / CashWithdrawal / XReport) accept
             // `Opened | OpenedLocalPendingDrain` per spec §3.3 +
-            // §5.6 — Pattern C resilience surface.  Other doc types
-            // (SHIFT_OPEN — handled here for offline Pattern C open;
-            // others should not reach stage_offline_ack per the §3.4
-            // matrix, but the helper enforces it defensively) stay
-            // scoped to `Opened` only.
+            // §5.6 — Pattern C resilience surface.  A′.3 PR-O3: the
+            // shift-management docs accept exactly the state their
+            // acquire edge leaves the shift in — SHIFT_OPEN →
+            // `OpenedLocalPendingDrain` (edge 2), SHIFT_CLOSE / Z_REPORT
+            // → `ClosingLocalPendingDrain` (edges 9/7) — enforced
+            // defensively here regardless of upstream filtering.
             let shift_state_ok = match inputs.doc_type {
                 DocType::Sell
                 | DocType::Return
