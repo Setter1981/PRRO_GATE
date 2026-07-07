@@ -1,0 +1,63 @@
+-- 028 — add dps_code column to offline_codes (T=112 ASK_OFFLINE_CODES replenish)
+--
+-- WHY
+-- ---
+-- DPS T=112 "ask offline codes" returns opaque string identifiers issued by the
+-- fiscal authority (live ground truth 2026-07-07, smoke-8 probe #240:
+-- e.g. `eYme-jhnkWQ`).  These are the canonical DPS-side identifiers that must
+-- accompany each offline-mode receipt back to DPS during drain.  They are
+-- OPAQUE — no natural numeric order, no structural content assumed by the
+-- gateway.
+--
+-- The existing `code_lnd` column is the internal FIFO ordinal: it governs
+-- acquisition order (`acquire_code_tx` picks `MIN(code_lnd)` for the FN) and
+-- must not be replaced.  `dps_code` is additive alongside it.
+--
+-- drill-seeded rows (from `seed_code_range_tx`) carry no DPS identifier and
+-- keep `dps_code NULL` — the column is nullable so every existing row survives
+-- untouched.  The partial unique index ignores NULL rows (SQLite partial index
+-- semantics: `WHERE dps_code IS NOT NULL`), so two NULL rows for the same FN
+-- do not conflict.
+--
+-- The partial UNIQUE index `ux_offline_codes_fn_dps_code` makes deliberate
+-- re-fetch of the same DPS code batch idempotent (INV-4): a duplicate
+-- `(fiscal_number, dps_code)` pair is silently skipped by `INSERT OR IGNORE`
+-- in `insert_dps_codes_tx`.
+--
+-- STRICT TABLE NOTE
+-- -----------------
+-- `offline_codes` was created STRICT in 001_baseline.sql.  SQLite ALTER TABLE
+-- ADD COLUMN on a STRICT table accepts a nullable TEXT column: nullable columns
+-- default to NULL for existing rows, and TEXT affinity is enforced on new
+-- writes.  No table rebuild required.
+--
+-- BACKWARD COMPATIBILITY
+-- ----------------------
+-- No existing migration file is touched.  All existing rows gain a NULL
+-- `dps_code` column transparently.  The compound PRIMARY KEY `(fiscal_number,
+-- code_lnd)`, all existing indexes (`ix_offline_codes_available`,
+-- `ux_offline_codes_consumed_by_doc`), and the
+-- `offline_codes_consumed_immutable` trigger are untouched.  `acquire_code_tx`
+-- (ORDER BY code_lnd ASC, filters on consumed_at IS NULL) is entirely
+-- unaffected — it ignores the new column.
+--
+-- ROLLBACK REASONING
+-- ------------------
+-- Forward: ALTER TABLE ADD COLUMN + CREATE INDEX (atomic in SQLite).
+-- Reverse: DROP INDEX ux_offline_codes_fn_dps_code; then the column becomes
+-- dead weight (SQLite cannot DROP COLUMN in bundled 3.35-era builds without
+-- a 12-step rebuild), but the nullable column causes no correctness issue.
+-- Given this is a pre-pilot schema, rollback is expected to be a DB reset,
+-- not a live column drop.
+--
+-- LIVE FILE SEQUENCE
+-- ------------------
+-- Migrations 003-024 were squashed into 001_baseline.sql.  025, 026, 027
+-- are live files.  This file is 028; sqlx applies migrations by filename
+-- prefix order, so the sequence is correct.
+
+ALTER TABLE offline_codes ADD COLUMN dps_code TEXT;
+
+CREATE UNIQUE INDEX ux_offline_codes_fn_dps_code
+    ON offline_codes(fiscal_number, dps_code)
+    WHERE dps_code IS NOT NULL;
