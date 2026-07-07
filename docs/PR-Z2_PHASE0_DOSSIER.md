@@ -313,3 +313,22 @@ the failure-path recovery machinery into its own increment (naturally co-scoped 
 escalations). Either way, the §6.5 budget engine is its OWN piece, not smuggled into PR-Z2.
 
 **This STOP re-opens the step-3 line of the delivery order and must be adjudicated before code.**
+
+### STOP-S5 RESOLUTION (2026-07-07) — option (A) minimal-viable
+
+Architect re-locked the contract with edges 4/12 IN step 3 + the standing S3 ruling "§6.5
+budgets — reuse, do NOT build a parallel [budget engine]". Binding interpretation:
+
+**Step 3 = option (A) minimal-viable.** Edges 4/12 escalate to RMR via the existing idempotent
+`escalate_fn_to_manual_recon` seam + the §8.1 forensic audit (IN scope). The **§6.5 per-class
+budget engine (wall-clock / backoff / `first_failure_at` column / ShiftRecoveryClass) is NOT
+built** — that is the "parallel" machine the S3 ruling forbids; it becomes a **named residual →
+the recovery increment (co-scoped with A'.3 offline escalations + `project_backlog_monitoring`
+§8.2 alert)**. Edge 11 (DocumentReject → Closing→Opened rollback) IS in scope (cheap, no budget
+machinery). **STOP-protocol valve:** if wiring 4/12 minimally proves to require the full
+ShiftRecoveryClass layer (a DocumentReject-vs-hard-reject decision that cannot be made at the
+orchestrator level from the existing SendDisposition), STOP and re-triage rather than growing a
+recovery build inside this dispatch PR.
+
+**Execution: NOW, in-session (architect switched to a 1M-context model — the "fresh session"
+recommendation is withdrawn; the budget was granted).**
