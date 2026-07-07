@@ -742,6 +742,20 @@ async fn seed_extended_sell_prepared(
     .await
     .unwrap();
 
+    // `INSERT OR IGNORE` is silently swallowed by `ux_shifts_one_open_per_fn`
+    // (partial UNIQUE on fiscal_number WHERE state IN non-terminal states) when
+    // a caller such as `seed_open_shift_and_node_piece4` has already seeded a
+    // different OPENED shift_id for this FN.  In that case `shift_bytes` never
+    // lands, and the fiscal_documents FK trips with code 787.  Resolve the
+    // actual row present in the DB so the FK is always satisfied.
+    let actual_shift_id: Vec<u8> = sqlx::query_scalar(
+        "SELECT shift_id FROM shifts WHERE fiscal_number = ? AND state = 'OPENED' LIMIT 1",
+    )
+    .bind(fn_id)
+    .fetch_one(pool)
+    .await
+    .expect("seed_extended_sell_prepared: no OPENED shift found after INSERT OR IGNORE");
+
     let doc_bytes = vec![doc_byte; 16];
     let req_bytes = vec![doc_byte ^ 0xFF; 16];
     let sha = vec![0u8; 32];
@@ -757,7 +771,7 @@ async fn seed_extended_sell_prepared(
     .bind(&doc_bytes)
     .bind(&req_bytes)
     .bind(fn_id)
-    .bind(&shift_bytes)
+    .bind(&actual_shift_id)
     .bind(lnd)
     .bind(business_ts)
     .bind(EXTENDED_SELL_TOTAL_SUM_KOP)
@@ -1364,6 +1378,17 @@ async fn seed_z_report_prepared(
     .await
     .unwrap();
 
+    // Same fix as in seed_extended_sell_prepared: resolve the actual shift_id
+    // that landed (or was already present due to a prior seed call) so the
+    // fiscal_documents FK is always satisfied even when OR IGNORE was a no-op.
+    let actual_shift_id: Vec<u8> = sqlx::query_scalar(
+        "SELECT shift_id FROM shifts WHERE fiscal_number = ? AND state = 'OPENED' LIMIT 1",
+    )
+    .bind(fn_id)
+    .fetch_one(pool)
+    .await
+    .expect("seed_z_report_prepared: no OPENED shift found after INSERT OR IGNORE");
+
     let doc_bytes = vec![doc_byte; 16];
     let req_bytes = vec![doc_byte ^ 0xFF; 16];
     let sha = vec![0u8; 32];
@@ -1378,7 +1403,7 @@ async fn seed_z_report_prepared(
     .bind(&doc_bytes)
     .bind(&req_bytes)
     .bind(fn_id)
-    .bind(&shift_bytes)
+    .bind(&actual_shift_id)
     .bind(lnd)
     .bind(business_ts)
     .bind(Z_REPORT_PAYLOAD_JSON)
