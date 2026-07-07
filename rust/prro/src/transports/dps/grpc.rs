@@ -20,8 +20,9 @@ use tonic::Status;
 
 use super::channel::DpsChannel;
 use super::dto::{
-    try_decode_check_response, try_decode_rro_info_response, try_decode_status_response, CheckAck,
-    CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot,
+    decode_offline_codes, try_decode_check_response, try_decode_rro_info_response,
+    try_decode_status_response, CheckAck, CheckEnvelope, CheckSignBlob, OfflineCodesResponse,
+    RroInfo, StatusSnapshot,
 };
 use super::error::DpsError;
 use super::gen::chk_income_service_client::ChkIncomeServiceClient;
@@ -178,5 +179,23 @@ impl DpsChannel for GrpcDpsChannel {
             .await
             .map_err(map_tonic_status)?;
         try_decode_rro_info_response(resp.into_inner())
+    }
+
+    async fn ask_offline_codes(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> Result<OfflineCodesResponse, DpsError> {
+        crate::db::tx::assert_not_in_with_immediate("ask_offline_codes");
+        // T=112 rides the same sendChkV2 RPC as send_chk (live-proven 2026-07-07:
+        // typCheck=3 / ServiceChk on sendChkV2 returned CheckAck with data_sign
+        // containing CMS-wrapped offline-code XML).
+        let req = self.request(envelope.into());
+        let resp = self
+            .client()
+            .send_chk_v2(req)
+            .await
+            .map_err(map_tonic_status)?;
+        let ack = try_decode_check_response(resp.into_inner())?;
+        decode_offline_codes(&ack.data_sign)
     }
 }

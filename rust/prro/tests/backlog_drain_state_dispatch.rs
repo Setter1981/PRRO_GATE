@@ -146,6 +146,15 @@ impl DpsChannel for DualQueueStub {
     async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
         unreachable!("stub: info_rro not exercised");
     }
+    async fn ask_offline_codes(
+        &self,
+        _: prro::transports::dps::dto::CheckEnvelope,
+    ) -> Result<
+        prro::transports::dps::dto::OfflineCodesResponse,
+        prro::transports::dps::error::DpsError,
+    > {
+        unreachable!("stub: ask_offline_codes not exercised");
+    }
 }
 
 fn ack(id: &str, data_sign: Vec<u8>) -> CheckAck {

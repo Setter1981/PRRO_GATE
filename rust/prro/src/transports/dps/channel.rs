@@ -9,7 +9,9 @@
 
 use async_trait::async_trait;
 
-use super::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
+use super::dto::{
+    CheckAck, CheckEnvelope, CheckSignBlob, OfflineCodesResponse, RroInfo, StatusSnapshot,
+};
 use super::error::DpsError;
 
 /// `Send + Sync` so impls can be wrapped in `Arc<dyn DpsChannel>` and
@@ -36,6 +38,26 @@ pub trait DpsChannel: Send + Sync {
     /// `infoRro` — fetch full RRO descriptor (name, address, operators,
     /// tax mode).
     async fn info_rro(&self, fn_sign: &CheckSignBlob) -> Result<RroInfo, DpsError>;
+
+    /// T=112 ASK_OFFLINE_CODES — request offline fiscal-document IDs from DPS.
+    ///
+    /// Sends `envelope` (a CMS-signed T=112 ServiceChk XML) via the same
+    /// `sendChkV2` RPC used by `send_chk` (live-proven: T=112 rides
+    /// `typCheck=3` / `DpsCheckType::ServiceChk`), then CMS-strips the
+    /// `data_sign` field of the successful `CheckAck` and parses the
+    /// `<ID>…</ID>` offline-code elements from the inner XML.
+    ///
+    /// The caller is responsible for building the T=112 envelope (slice C3).
+    /// This method only covers the transport + decode half.
+    ///
+    /// Error mapping is identical to `send_chk` — server-level DPS status
+    /// codes surface as `DpsError::Server { code, message }` with the same
+    /// integer codes; a CMS-strip or XML-parse failure surfaces as
+    /// `DpsError::Decode`.
+    async fn ask_offline_codes(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> Result<OfflineCodesResponse, DpsError>;
 
     /// Server-side fiscal-id lookup (PRRO_GATE-5js).
     ///
