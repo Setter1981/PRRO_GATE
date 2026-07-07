@@ -61,7 +61,9 @@ use prro::crypto::session::SigningSession;
 use prro::db::models::ids::DocumentId;
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
-use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
+use prro::transports::dps::dto::{
+    CheckAck, CheckEnvelope, CheckSignBlob, OfflineCodesResponse, RroInfo, StatusSnapshot,
+};
 use prro::transports::dps::error::DpsError;
 
 // ─── In-memory stub DpsChannel ───────────────────────────────────────
@@ -193,6 +195,10 @@ impl DpsChannel for StubDpsChannel {
 
     async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
         unreachable!("stub: info_rro not exercised");
+    }
+
+    async fn ask_offline_codes(&self, _: CheckEnvelope) -> Result<OfflineCodesResponse, DpsError> {
+        unreachable!("stub: ask_offline_codes not exercised by StubDpsChannel tests");
     }
 }
 

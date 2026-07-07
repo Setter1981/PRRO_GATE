@@ -57,7 +57,7 @@ use prro::db::models::enums::{FiscalMode, NodeMode, ShiftState};
 use prro::db::open_pool;
 use prro::db::repositories::{fiscal_number_config as fn_cfg, node_state};
 use prro::transports::dps::channel::DpsChannel;
-use prro::transports::dps::dto::CheckSignBlob;
+use prro::transports::dps::dto::{CheckSignBlob, DpsCheckType};
 use prro::transports::dps::error::DpsError;
 use prro::transports::dps::grpc::GrpcDpsChannel;
 use prro_crypto::cms::builder::{CmsBuildOptions, CmsSigner};
@@ -68,7 +68,7 @@ use prro_crypto::core::curve::Curve;
 use prro_crypto::core::field::FieldEl;
 use prro_crypto::interop::prro::containers::{extract_private_key, ExtractedKey};
 use sha2::{Digest, Sha256};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ── Piece 4 — production stage_sign drive of an extended SELL (native sign) ──
 use async_trait::async_trait;
@@ -651,6 +651,16 @@ impl DpsChannel for StubAckDps {
     async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
         unreachable!("piece 4 stub: info_rro must not be invoked")
     }
+
+    async fn ask_offline_codes(
+        &self,
+        _: prro::transports::dps::dto::CheckEnvelope,
+    ) -> Result<
+        prro::transports::dps::dto::OfflineCodesResponse,
+        prro::transports::dps::error::DpsError,
+    > {
+        unreachable!("stub: ask_offline_codes not exercised");
+    }
 }
 
 /// Boot a real `App` over a throwaway temp DB (migrated, recovery run on
@@ -742,6 +752,20 @@ async fn seed_extended_sell_prepared(
     .await
     .unwrap();
 
+    // `INSERT OR IGNORE` is silently swallowed by `ux_shifts_one_open_per_fn`
+    // (partial UNIQUE on fiscal_number WHERE state IN non-terminal states) when
+    // a caller such as `seed_open_shift_and_node_piece4` has already seeded a
+    // different OPENED shift_id for this FN.  In that case `shift_bytes` never
+    // lands, and the fiscal_documents FK trips with code 787.  Resolve the
+    // actual row present in the DB so the FK is always satisfied.
+    let actual_shift_id: Vec<u8> = sqlx::query_scalar(
+        "SELECT shift_id FROM shifts WHERE fiscal_number = ? AND state = 'OPENED' LIMIT 1",
+    )
+    .bind(fn_id)
+    .fetch_one(pool)
+    .await
+    .expect("seed_extended_sell_prepared: no OPENED shift found after INSERT OR IGNORE");
+
     let doc_bytes = vec![doc_byte; 16];
     let req_bytes = vec![doc_byte ^ 0xFF; 16];
     let sha = vec![0u8; 32];
@@ -757,7 +781,7 @@ async fn seed_extended_sell_prepared(
     .bind(&doc_bytes)
     .bind(&req_bytes)
     .bind(fn_id)
-    .bind(&shift_bytes)
+    .bind(&actual_shift_id)
     .bind(lnd)
     .bind(business_ts)
     .bind(EXTENDED_SELL_TOTAL_SUM_KOP)
@@ -1364,6 +1388,17 @@ async fn seed_z_report_prepared(
     .await
     .unwrap();
 
+    // Same fix as in seed_extended_sell_prepared: resolve the actual shift_id
+    // that landed (or was already present due to a prior seed call) so the
+    // fiscal_documents FK is always satisfied even when OR IGNORE was a no-op.
+    let actual_shift_id: Vec<u8> = sqlx::query_scalar(
+        "SELECT shift_id FROM shifts WHERE fiscal_number = ? AND state = 'OPENED' LIMIT 1",
+    )
+    .bind(fn_id)
+    .fetch_one(pool)
+    .await
+    .expect("seed_z_report_prepared: no OPENED shift found after INSERT OR IGNORE");
+
     let doc_bytes = vec![doc_byte; 16];
     let req_bytes = vec![doc_byte ^ 0xFF; 16];
     let sha = vec![0u8; 32];
@@ -1378,7 +1413,7 @@ async fn seed_z_report_prepared(
     .bind(&doc_bytes)
     .bind(&req_bytes)
     .bind(fn_id)
-    .bind(&shift_bytes)
+    .bind(&actual_shift_id)
     .bind(lnd)
     .bind(business_ts)
     .bind(Z_REPORT_PAYLOAD_JSON)
@@ -1595,4 +1630,327 @@ async fn live_smoke_7_z_report() {
         "ACK must populate server_fiscal_no"
     );
     println!("Smoke 7 PASS: LIVE Z_REPORT fiscalized — shift closed — server_fiscal_no={server_fiscal_no:?}");
+}
+
+// ─── Piece 8 — T=112 ASK_OFFLINE_CODES ground-truth wire-contract probe ─────
+//
+// **LIVE piece (contacts DPS; capture-only, no local DB write beyond boot).**
+// Submits a raw T=112 (ASK_OFFLINE_CODES) SERVICE document directly via
+// `send_chk(ServiceChk)` to capture the live wire contract.  This is the
+// first live contact for this command; the probe's job is to CAPTURE DPS
+// behaviour (response shape, codes, chain impact), NOT to assert business
+// outcomes.
+//
+// Wire format (WebCheck decompile SendingOfflineChecksRobot.cs:693-704,
+// cross-confirmed Offlin.cs:224-235):
+//   <RQ V = '1'><DAT FN='{fn}' TN='{tn}' ZN='' DI='{di}' V='1'>
+//     <C T='112'><H SIZE='{size}'></H></C><TS>{ts}</TS></DAT><MAC>{mac}</MAC></RQ>
+//   - T='112' (API v2; API v1 used T='12')
+//   - DI: WebCheck uses MaxID("ksef")+1 (local DB counter); default 1 here.
+//   - SIZE: how many codes to request; default 1 (minimal on test cabinet).
+//   - TS: Kyiv-local-as-epoch (wall-clock local time cast to epoch seconds);
+//     we use raw UTC epoch — DPS may reject with -8 (bad date), that is
+//     itself ground-truth.
+//   - MAC: sha256-hex of CMS-stripped previous check (same derivation as
+//     the harness `seed_mac_from_lastchk`); empty string for a genesis FN.
+// Submitted as `typCheck=3` (SERVICECHK proto enum) — the same slot that
+// WebCheck uses (SubmitPtrRobot.SubmitCheck(text4, num4.ToString(), 3, dd)).
+// `DpsCheckType::ServiceChk` maps to `SERVICECHK=3` in fiscal_server.proto.
+//
+// Bracket: pre-lastChk + pre-statusRro → send → post-lastChk + post-statusRro
+// so we learn whether T=112 advances the MAC chain / consumes anything.
+//
+// Pass conditions:
+//   - ANY definitive DPS response (OK or server-level reject) = PASS.
+//     A reject code IS valuable ground truth; printed with GROUND-TRUTH: prefix.
+//   - FAIL only on Transport/connect errors.
+//
+// Env overrides (no recompile needed for iteration):
+//   PRRO_LIVE_DPS_T112_DI   — document index (integer, default 1)
+//   PRRO_LIVE_DPS_T112_SIZE — number of codes to request (integer, default 1)
+
+/// **Smoke 8 — T=112 ASK_OFFLINE_CODES ground-truth wire probe**.
+///
+/// Sends a raw T=112 SERVICE doc to live DPS and captures the response
+/// contract: response code, message, and CMS-stripped inner XML with
+/// parsed `<ID>` offline-code elements.  Pre/post `lastChk` + `statusRro`
+/// bracket reveals whether T=112 advances the MAC chain.
+#[tokio::test]
+#[ignore = "live DPS endpoint required; opt-in via --features live-dps + --ignored + PRRO_LIVE_DPS=1"]
+async fn live_smoke_8_ask_offline_codes() {
+    if !live_armed("Smoke 8 (T=112 ASK_OFFLINE_CODES)") {
+        return;
+    }
+    let Some(ek) = load_signing_key("Smoke 8 (T=112 ASK_OFFLINE_CODES)") else {
+        return;
+    };
+    let host = resolve_host();
+    let fiscal_number = resolve_fn();
+    let tn = LIVE_TN;
+
+    // DI and SIZE can be overridden without recompiling.
+    let di: i64 = std::env::var("PRRO_LIVE_DPS_T112_DI")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let size: u32 = std::env::var("PRRO_LIVE_DPS_T112_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+
+    println!("\n=== Smoke 8: T=112 ASK_OFFLINE_CODES ground-truth wire probe ===");
+    println!("FN: {fiscal_number}  TN: {tn}  DI: {di}  SIZE: {size}");
+    println!("Endpoint: {host}\n");
+
+    let channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        .await
+        .unwrap_or_else(|e| panic!("Smoke 8 FAIL: connect: {e:?}"));
+    let fn_sign = sign_fn_blob(&ek, &fiscal_number);
+
+    // ── PRE-BRACKET: lastChk + statusRro ────────────────────────────────
+    println!("--- PRE-BRACKET ---");
+    let pre_ack = match channel.last_chk(&fn_sign).await {
+        Ok(a) => {
+            println!(
+                "  pre lastChk: id={:?} id_sign={} bytes data_sign={} bytes",
+                a.id,
+                a.id_sign.len(),
+                a.data_sign.len()
+            );
+            a
+        }
+        Err(DpsError::Server { code: -4, message }) => {
+            println!(
+                "Smoke 8 SKIP: DPS rate-limit (-4) on pre-lastChk: {message}. Cool down 5+ min."
+            );
+            return;
+        }
+        Err(DpsError::Transport(msg)) => {
+            panic!("Smoke 8 FAIL: Transport on pre-lastChk: {msg}");
+        }
+        Err(e) => {
+            // Non-transport, non-rate-limit errors on lastChk: log and proceed
+            // with genesis MAC (empty), so the T=112 send still happens.
+            println!("  pre lastChk non-fatal error (will assume genesis MAC): {e:?}");
+            CheckAck {
+                id: String::new(),
+                id_sign: vec![],
+                data_sign: vec![],
+            }
+        }
+    };
+    if let Ok(s) = channel.status_rro(&fn_sign).await {
+        println!(
+            "  pre statusRro: open_shift={} online={} last_signer={:?}",
+            s.open_shift, s.online, s.last_signer
+        );
+    }
+
+    // ── MAC derivation (same model as harness seed_mac_from_lastchk) ────
+    // MAC = sha256-hex of the CMS-stripped previous check bytes.
+    // Empty for a genesis FN (no previous check).
+    let mac_hex: String = if pre_ack.data_sign.is_empty() {
+        println!("  FN genesis (empty data_sign) — T=112 carries empty <MAC>");
+        String::new()
+    } else {
+        let inner = extract_econtent(&pre_ack.data_sign)
+            .unwrap_or_else(|e| panic!("Smoke 8: CMS-strip pre data_sign: {e}"));
+        let mac: [u8; 32] = Sha256::digest(&inner).into();
+        let hex = hex_lower(&mac);
+        println!(
+            "  MAC derived from pre-lastChk: {hex} ({} B data_sign → {} B inner)",
+            pre_ack.data_sign.len(),
+            inner.len()
+        );
+        hex
+    };
+
+    // ── T=112 XML construction (WebCheck-faithful) ───────────────────────
+    // <TS>: NOT epoch. WebCheck's `All.СurrentCompDate()` (All.cs:531-535)
+    // formats local (Kyiv) wall-clock time as the number `yyyyMMddHHmmss`
+    // and that long goes verbatim into <TS>.  GROUND-TRUTH (live probes,
+    // 2026-07-07): raw-UTC epoch and Kyiv-local epoch both drew -8 (bad
+    // date) with chain_changed=false.
+    // The gRPC envelope `date_time` stays Kyiv-local-as-EPOCH — the
+    // production `kyiv_local_epoch` convention proven live by smokes 5b/6/7.
+    let utc_secs: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time must be after UNIX_EPOCH")
+        .as_secs() as i64;
+    let (ts, epoch_kyiv): (i64, i64) = {
+        use chrono::{Datelike, Offset, TimeZone, Timelike};
+        let now = chrono::Utc
+            .timestamp_opt(utc_secs, 0)
+            .single()
+            .expect("valid epoch");
+        let kyiv = now.with_timezone(&chrono_tz::Europe::Kiev);
+        let comp_date: i64 = format!(
+            "{:04}{:02}{:02}{:02}{:02}{:02}",
+            kyiv.year(),
+            kyiv.month(),
+            kyiv.day(),
+            kyiv.hour(),
+            kyiv.minute(),
+            kyiv.second()
+        )
+        .parse()
+        .expect("yyyyMMddHHmmss fits i64");
+        let epoch = utc_secs + i64::from(kyiv.offset().fix().local_minus_utc());
+        (comp_date, epoch)
+    };
+
+    // Note the space in V = '1' on the RQ tag — exact byte order from decompile.
+    // Single-line format string: rustfmt does not break string literals, so the
+    // XML content is byte-exact with no injected whitespace.
+    #[rustfmt::skip]
+    let t112_xml = format!(
+        "<RQ V = '1'><DAT FN='{fn}' TN='{tn}' ZN='' DI='{di}' V='1'><C T='112'><H SIZE='{size}'></H></C><TS>{ts}</TS></DAT><MAC>{mac}</MAC></RQ>",
+        fn = fiscal_number, tn = tn, di = di, size = size, ts = ts, mac = mac_hex,
+    );
+    // XML contains no secrets (FN/TN are public fiscal identifiers).
+    println!("  T=112 XML:\n    {t112_xml}");
+
+    // ── Sign the XML bytes with ATTACHED CAdES-BES ───────────────────────
+    // Same crypto profile as real receipt submission (sign_fn_blob uses
+    // signing_cert() + DstuInProcessSigner + CmsProfile::Dstu4145WithGost34311Pb).
+    // Here we sign the XML bytes instead of the FN string.
+    let cert_der: &[u8] = ek
+        .signing_cert()
+        .expect("JKS must carry a signing certificate (KeyUsage=digitalSignature)");
+    let curve = Curve::dstu_pb_257();
+    let d = FieldEl::from_le_bytes(&ek.param_d[..], curve.mod_words);
+    let signer_inner = DstuInProcessSigner::new(d);
+    let cms_signer = CmsSigner {
+        cert_der,
+        signer: &signer_inner,
+        profile: CmsProfile::Dstu4145WithGost34311Pb,
+    };
+    let signed_der = cms_signer
+        .sign_with(
+            t112_xml.as_bytes(),
+            CmsBuildOptions {
+                attached: true,
+                signing_time: Some(SystemTime::now()),
+            },
+        )
+        .expect("T=112 XML ATTACHED CAdES-BES sign must succeed")
+        .cms_der;
+    println!(
+        "  Signed T=112 blob: {} bytes (ATTACHED CAdES-BES over {} bytes XML)",
+        signed_der.len(),
+        t112_xml.len()
+    );
+
+    // ── Send via send_chk (ServiceChk = SERVICECHK = typCheck=3) ────────
+    // DpsCheckType::ServiceChk → gen::check::Type::Servicechk → proto int 3
+    // — matches SubmitPtrRobot.SubmitCheck(..., typCheck=3, ...) in WebCheck.
+    // Check.date MUST equal the XML <TS> byte-for-byte: WebCheck passes the
+    // SAME `dd` long (yyyyMMddHHmmss, СurrentCompDate) both into <TS> and
+    // into the gRPC submit (SubmitPtrRobot.cs:74/83, no conversion), and the
+    // DPS -8 decode reads "XML дата не відповідає Check.date".
+    let _ = epoch_kyiv; // kyiv-epoch retained for diagnostics only
+    let envelope = CheckEnvelope {
+        rro_fn: fiscal_number.clone(),
+        date_time: ts,
+        check_sign: signed_der,
+        local_number: di as i32,
+        check_type: DpsCheckType::ServiceChk,
+        id_offline: String::new(),
+        id_cancel: String::new(),
+    };
+
+    println!("\n--- SENDING T=112 (DI={di} SIZE={size}) ---");
+    let send_result = channel.send_chk(envelope).await;
+    println!("  send_chk raw result: {send_result:?}");
+
+    // ── Response parsing ─────────────────────────────────────────────────
+    // Parse <ID> offline-code elements from CMS-stripped data_sign if present
+    // (WebCheck SendingOfflineChecksRobot.cs:659-667).
+    let ground_truth_summary = match &send_result {
+        Ok(ack) => {
+            println!(
+                "  T=112 DPS OK: id={:?} id_sign={} bytes data_sign={} bytes",
+                ack.id,
+                ack.id_sign.len(),
+                ack.data_sign.len()
+            );
+            if !ack.data_sign.is_empty() {
+                match extract_econtent(&ack.data_sign) {
+                    Ok(inner_bytes) => {
+                        let inner_xml = String::from_utf8_lossy(&inner_bytes);
+                        println!(
+                            "  response inner XML ({} bytes): {inner_xml}",
+                            inner_bytes.len()
+                        );
+                        let id_count = inner_xml.matches("<ID>").count();
+                        println!("  <ID> offline-code elements: {id_count}");
+                        format!(
+                            "DPS ACCEPTED T=112 id={:?} offline_codes={id_count}",
+                            ack.id
+                        )
+                    }
+                    Err(e) => {
+                        // data_sign present but not valid CMS — log raw bytes (truncated).
+                        let raw_preview: String = ack
+                            .data_sign
+                            .iter()
+                            .take(64)
+                            .map(|b| format!("{b:02x}"))
+                            .collect();
+                        println!(
+                            "  data_sign is not a CMS blob (raw hex first 64B): {raw_preview}  strip-err: {e}"
+                        );
+                        format!(
+                            "DPS ACCEPTED T=112 id={:?} data_sign-not-CMS err={e}",
+                            ack.id
+                        )
+                    }
+                }
+            } else {
+                println!("  data_sign empty — no offline codes in payload");
+                format!("DPS ACCEPTED T=112 id={:?} data_sign=empty", ack.id)
+            }
+        }
+        Err(DpsError::Server { code, message }) => {
+            println!("  T=112 DPS server reject: code={code} message={message:?}");
+            format!("DPS REJECTED T=112 code={code} msg={message:?}")
+        }
+        Err(DpsError::Authorization {
+            code,
+            kind,
+            message,
+        }) => {
+            println!(
+                "  T=112 DPS authorization reject: code={code} kind={kind:?} message={message}"
+            );
+            format!("DPS AUTH-REJECTED T=112 code={code} kind={kind:?}")
+        }
+        Err(DpsError::Transport(msg)) => {
+            panic!("Smoke 8 FAIL: Transport error on T=112 send_chk (wire broken): {msg}");
+        }
+        Err(e) => {
+            panic!("Smoke 8 FAIL: unexpected error kind on T=112 send_chk: {e:?}");
+        }
+    };
+
+    // ── POST-BRACKET: lastChk + statusRro ────────────────────────────────
+    println!("\n--- POST-BRACKET ---");
+    if let Ok(a) = channel.last_chk(&fn_sign).await {
+        let chain_changed = a.data_sign.len() != pre_ack.data_sign.len() || a.id != pre_ack.id;
+        println!(
+            "  post lastChk: id={:?} id_sign={} bytes data_sign={} bytes  chain_changed={chain_changed}",
+            a.id,
+            a.id_sign.len(),
+            a.data_sign.len()
+        );
+    }
+    if let Ok(s) = channel.status_rro(&fn_sign).await {
+        println!(
+            "  post statusRro: open_shift={} online={} last_signer={:?}",
+            s.open_shift, s.online, s.last_signer
+        );
+    }
+
+    println!("\nGROUND-TRUTH: {ground_truth_summary}");
+    println!("Smoke 8 PASS: T=112 wire contract captured — DPS responded definitively.");
 }

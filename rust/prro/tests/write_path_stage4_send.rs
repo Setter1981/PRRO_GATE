@@ -1112,6 +1112,12 @@ impl DpsChannel for EnvelopeRecorder {
     ) -> Result<prro::transports::dps::dto::RroInfo, DpsError> {
         unreachable!("EnvelopeRecorder: info_rro not exercised")
     }
+    async fn ask_offline_codes(
+        &self,
+        _: prro::transports::dps::dto::CheckEnvelope,
+    ) -> Result<prro::transports::dps::dto::OfflineCodesResponse, DpsError> {
+        unreachable!("EnvelopeRecorder: ask_offline_codes not exercised")
+    }
 }
 
 #[tokio::test]

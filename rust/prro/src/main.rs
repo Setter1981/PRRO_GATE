@@ -20,9 +20,21 @@ enum Cmd {
         config: PathBuf,
     },
     /// Run preflight checks (config, DB, lock, listen) and exit.
+    /// With `--live`, also runs FormTest-parity READ-ONLY DPS diagnostics:
+    /// key validity, reachability, server state, ledger sync, offline pool.
     Doctor {
         #[arg(long)]
         config: PathBuf,
+        /// Run live DPS section (requires PRRO_LIVE_DPS_JKS_PATH +
+        /// PRRO_LIVE_DPS_JKS_PASS env vars and --fn).
+        #[arg(long)]
+        live: bool,
+        /// Fiscal number to probe (required when --live is set).
+        #[arg(long = "fn")]
+        fiscal_number: Option<String>,
+        /// DPS endpoint to probe.
+        #[arg(long, default_value = "https://cabinet.tax.gov.ua:9443")]
+        host: String,
     },
     /// Boot the gateway and serve until SIGINT/SIGTERM.
     Serve {
@@ -401,7 +413,24 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("migrations applied");
             Ok(())
         }
-        Cmd::Doctor { config } => prro::doctor::run(&config).await,
+        Cmd::Doctor {
+            config,
+            live,
+            fiscal_number,
+            host,
+        } => {
+            let live_args = if live {
+                let fn_str = fiscal_number
+                    .ok_or_else(|| anyhow::anyhow!("--fn <FN> is required when --live is set"))?;
+                Some(prro::doctor::LiveArgs {
+                    fiscal_number: fn_str,
+                    host,
+                })
+            } else {
+                None
+            };
+            prro::doctor::run(&config, live_args).await
+        }
         Cmd::Serve { config } => {
             let app = boot_from_path_or_exit(&config).await;
             if app.config().supervisor.enabled {

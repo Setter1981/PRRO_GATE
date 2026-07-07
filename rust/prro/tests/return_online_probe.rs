@@ -742,6 +742,12 @@ impl prro::transports::dps::channel::DpsChannel for LocalStatusStub {
     ) -> Result<prro::transports::dps::dto::RroInfo, DpsError> {
         unreachable!("LocalStatusStub: info_rro not exercised");
     }
+    async fn ask_offline_codes(
+        &self,
+        _: prro::transports::dps::dto::CheckEnvelope,
+    ) -> Result<prro::transports::dps::dto::OfflineCodesResponse, DpsError> {
+        unreachable!("LocalStatusStub: ask_offline_codes not exercised");
+    }
 }
 
 // Re-bind `StubDpsChannel` in this test file to the local stub —
