@@ -41,7 +41,7 @@ async fn doctor_refuses_when_lock_is_already_held_and_does_not_touch_db() {
     // Acquire the singleton lock as if a `prro serve` were already running.
     let _holder = singleton::acquire(&db_path).expect("primary lock");
 
-    let err = prro::doctor::run(&cfg_path)
+    let err = prro::doctor::run(&cfg_path, None)
         .await
         .expect_err("doctor must fail while serve holds the lock");
     let msg = err.to_string().to_lowercase();
@@ -65,7 +65,7 @@ async fn doctor_succeeds_when_lock_is_free() {
     let db_path = dir.path().join("a.sqlite3");
     let cfg_path = write_cfg(dir.path(), &db_path);
 
-    prro::doctor::run(&cfg_path)
+    prro::doctor::run(&cfg_path, None)
         .await
         .expect("doctor must pass on a clean dir");
     assert!(
