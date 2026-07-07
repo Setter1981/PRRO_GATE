@@ -574,3 +574,112 @@ fn classify_acquire_error(e: sqlx::Error) -> OfflineSessionError {
     }
     OfflineSessionError::Database(e)
 }
+
+// ─── DPS-issued code replenish (migration 028) ────────────────────────────
+
+/// Summary returned by [`insert_dps_codes_tx`] after processing a batch of
+/// DPS-issued offline codes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertedSummary {
+    /// Number of codes actually written to the DB in this call.
+    pub inserted: u64,
+    /// Number of codes silently skipped because `(fiscal_number, dps_code)`
+    /// already existed (partial UNIQUE `ux_offline_codes_fn_dps_code`).
+    pub deduped: u64,
+}
+
+/// INSERT a batch of DPS-issued offline codes for `fiscal_number`, assigning
+/// `code_lnd` values sequentially from `COALESCE(MAX(code_lnd), 0) + 1`.
+///
+/// ## DPS code semantics
+///
+/// Each element of `codes` is an opaque ASCII string issued by DPS via the
+/// T=112 ASK_OFFLINE_CODES response (live ground truth 2026-07-07:
+/// e.g. `"eYme-jhnkWQ"`).  These strings have no natural order; `code_lnd`
+/// is the internal FIFO ordinal that governs acquisition sequence via
+/// [`acquire_code_tx`].
+///
+/// ## Dedupe / idempotency (INV-4)
+///
+/// `INSERT OR IGNORE` against the partial unique index
+/// `ux_offline_codes_fn_dps_code ON offline_codes(fiscal_number, dps_code)
+/// WHERE dps_code IS NOT NULL` makes a deliberate re-fetch of the same DPS
+/// code batch idempotent: a duplicate `(fiscal_number, dps_code)` pair is
+/// silently skipped without error.  The returned [`InsertedSummary`]
+/// distinguishes inserted-vs-deduped for audit purposes.
+///
+/// ## code_lnd assignment
+///
+/// `MAX(code_lnd)` is queried once at the start (inside the caller's
+/// `with_immediate` envelope); a local counter advances only when a row is
+/// actually inserted.  Deduped paths do NOT consume a `code_lnd` slot.
+/// This is race-free: the caller holds the single-writer lease via
+/// [`WriteTxConn`] (SQLite WAL RESERVED-lock serialises writers; one
+/// `fiscal_number` = one logical writer per frozen invariant #2).
+///
+/// ## Coexistence with drill codes
+///
+/// Rows seeded by [`seed_code_range_tx`] carry `dps_code NULL`.  Both kinds
+/// share the same `offline_codes` table; the partial UNIQUE index ignores
+/// NULL rows (SQLite partial predicate `WHERE dps_code IS NOT NULL`).
+/// [`acquire_code_tx`] consumes codes by `code_lnd ASC` regardless of
+/// whether `dps_code` is set — the pool is kind-agnostic.
+///
+/// ## Tx-bound discipline (W5 review axis 2)
+///
+/// Like [`seed_code_range_tx`], all writes to `offline_codes` must run inside
+/// a `with_immediate` envelope.  This primitive is intentionally tx-bound;
+/// a service-layer ergonomic wrapper is deferred to slice C4.
+///
+/// No callers beyond tests in this slice (C2).  Wiring to the
+/// `ask_offline_codes` response handler is slice C4.
+pub async fn insert_dps_codes_tx(
+    tx: &mut WriteTxConn<'_>,
+    fiscal_number: &str,
+    codes: &[String],
+) -> sqlx::Result<InsertedSummary> {
+    if codes.is_empty() {
+        return Ok(InsertedSummary {
+            inserted: 0,
+            deduped: 0,
+        });
+    }
+
+    // Compute the starting lnd. Single-writer lease guarantees this MAX is
+    // stable for the entire duration of this transaction.
+    let max_lnd: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(code_lnd), 0) FROM offline_codes WHERE fiscal_number = ?",
+    )
+    .bind(fiscal_number)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    let mut next_lnd = max_lnd + 1;
+    let mut inserted = 0u64;
+    let mut deduped = 0u64;
+
+    for code in codes {
+        let res = sqlx::query(
+            "INSERT OR IGNORE INTO offline_codes(fiscal_number, code_lnd, dps_code) \
+             VALUES (?, ?, ?)",
+        )
+        .bind(fiscal_number)
+        .bind(next_lnd)
+        .bind(code.as_str())
+        .execute(&mut **tx)
+        .await?;
+
+        if res.rows_affected() == 1 {
+            // Row was inserted: advance the lnd counter for the next code.
+            next_lnd += 1;
+            inserted += 1;
+        } else {
+            // Row was ignored (dps_code duplicate): the lnd slot is NOT
+            // consumed.  next_lnd stays at the same value for the next
+            // attempted insert.
+            deduped += 1;
+        }
+    }
+
+    Ok(InsertedSummary { inserted, deduped })
+}
