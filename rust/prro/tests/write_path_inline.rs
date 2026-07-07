@@ -44,6 +44,16 @@ const SERVER_FISCAL_NO: &str = "DPS-FN-ONLINE-1";
 const SELL_PAYLOAD: &str = r#"{"items":[{"code":"item-1","name":"Test item","price_kop":15000,"quantity_thousandths":1000,"sum_kop":15000}],"payments":[{"name":"Cash","sum_kop":15000,"type_code":"0"}]}"#;
 const TOTAL_KOP: i64 = 15000;
 
+/// A live SHIFT_OPEN's write-path payload is the converted `ShiftOpenJson`
+/// (`stage_sign.rs`) — `{opening_sum_kop}`, NOT a CheckJson.  `total_sum_kop`
+/// is `None` (build_canonical requires it only for SELL/RETURN).
+const SHIFT_OPEN_PAYLOAD: &str = r#"{"opening_sum_kop":0}"#;
+
+/// A live Z_REPORT's inbox payload is the WIRE-INTENT (disposition 2 — the
+/// client's submitted shape); the write-path REPLACES it with the aggregated
+/// body (D5 dual-hash), so any JSON whose sha256 matches the row hash works.
+const Z_WIRE_INTENT: &str = r#"{}"#;
+
 // ─── Dual-queue DPS stub: send_chk then last_chk ────────────────────────
 
 struct DualStub {
@@ -269,6 +279,103 @@ async fn seed_inbox_op(pool: &SqlitePool, operation_type: &str) -> InboxRow {
         business_ts: Some("2026-06-09T12:00:00Z".into()),
         total_sum_kop: Some(TOTAL_KOP),
     }
+}
+
+/// Seed a NEW SHIFT_OPEN inbox row (the live write-path shape: `ShiftOpenJson`
+/// payload, `total_sum_kop = None`) + return the matching [`InboxRow`].
+async fn seed_inbox_shift_open(pool: &SqlitePool) -> InboxRow {
+    let req_id = RequestId::new();
+    let request_id: [u8; 16] = *req_id.as_bytes();
+    let payload_sha256_canonical: [u8; 32] = Sha256::digest(SHIFT_OPEN_PAYLOAD.as_bytes()).into();
+    let idempotency_key = "idem-a2-z2-shift-open".to_string();
+    inbox::insert(
+        pool,
+        &NewInboxEntry {
+            request_id,
+            fiscal_number: FN.into(),
+            protocol: Protocol::Rest,
+            operation_type: "SHIFT_OPEN".into(),
+            idempotency_key: idempotency_key.clone(),
+            payload_json: SHIFT_OPEN_PAYLOAD.into(),
+            payload_sha256_canonical,
+            correlation_id: None,
+            signed_by_cashier_id: Some(CASHIER.into()),
+            driver_id: Some(DRIVER.into()),
+            business_ts: Some("2026-06-09T12:00:00Z".into()),
+            total_sum_kop: None,
+        },
+    )
+    .await
+    .unwrap();
+    InboxRow {
+        request_id,
+        fiscal_number: FN.into(),
+        protocol: Protocol::Rest,
+        operation_type: "SHIFT_OPEN".into(),
+        idempotency_key,
+        status: "NEW".into(),
+        payload_json: SHIFT_OPEN_PAYLOAD.into(),
+        payload_sha256_canonical,
+        correlation_id: None,
+        received_at: "2026-06-09T12:00:00Z".into(),
+        signed_by_cashier_id: Some(CASHIER.into()),
+        driver_id: Some(DRIVER.into()),
+        business_ts: Some("2026-06-09T12:00:00Z".into()),
+        total_sum_kop: None,
+    }
+}
+
+/// Seed a NEW Z_REPORT inbox row (wire-intent payload, `total_sum_kop = None`)
+/// + return the matching [`InboxRow`].
+async fn seed_inbox_z_report(pool: &SqlitePool) -> InboxRow {
+    let req_id = RequestId::new();
+    let request_id: [u8; 16] = *req_id.as_bytes();
+    let payload_sha256_canonical: [u8; 32] = Sha256::digest(Z_WIRE_INTENT.as_bytes()).into();
+    let idempotency_key = "idem-a2-z2-z-report".to_string();
+    inbox::insert(
+        pool,
+        &NewInboxEntry {
+            request_id,
+            fiscal_number: FN.into(),
+            protocol: Protocol::Rest,
+            operation_type: "Z_REPORT".into(),
+            idempotency_key: idempotency_key.clone(),
+            payload_json: Z_WIRE_INTENT.into(),
+            payload_sha256_canonical,
+            correlation_id: None,
+            signed_by_cashier_id: Some(CASHIER.into()),
+            driver_id: Some(DRIVER.into()),
+            business_ts: Some("2026-06-09T12:00:00Z".into()),
+            total_sum_kop: None,
+        },
+    )
+    .await
+    .unwrap();
+    InboxRow {
+        request_id,
+        fiscal_number: FN.into(),
+        protocol: Protocol::Rest,
+        operation_type: "Z_REPORT".into(),
+        idempotency_key,
+        status: "NEW".into(),
+        payload_json: Z_WIRE_INTENT.into(),
+        payload_sha256_canonical,
+        correlation_id: None,
+        received_at: "2026-06-09T12:00:00Z".into(),
+        signed_by_cashier_id: Some(CASHIER.into()),
+        driver_id: Some(DRIVER.into()),
+        business_ts: Some("2026-06-09T12:00:00Z".into()),
+        total_sum_kop: None,
+    }
+}
+
+/// Read the shift's state for the seeded FN (one shift per SHIFT_OPEN test pool).
+async fn read_shift_state(pool: &SqlitePool, fiscal_number: &str) -> String {
+    sqlx::query_scalar("SELECT state FROM shifts WHERE fiscal_number = ?")
+        .bind(fiscal_number)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 /// Read the inbox row's status for the seeded FN (one row per test pool).
@@ -606,54 +713,57 @@ async fn offline_no_code_aborts_doc_and_returns_typed_refusal() {
     }
 }
 
-/// **A2.1b-core incr.5 — Z-class is fail-closed (501) + terminalises the inbox,
-/// NO fiscal_documents.** A Z_REPORT is out of the SELL/RETURN core: the
-/// orchestrator fail-closes BEFORE build/acquire with `ZSurfaceNotReady`,
-/// leasing+REJECTing the inbox atomically (so replay reads it as failure, not
-/// 202-forever) and minting no ledger row.
+/// **PR-Z2 step 1 — an online SHIFT_OPEN drives the full inline chain to
+/// terminal ACK** (the orchestrator now routes it through the same happy-path
+/// stages as a SELL — edge 1 Created→Opening at acquire, edge 3 Opening→Opened
+/// confirmed at send). The shift lands `OPENED`, the doc lands `ACK`, the inbox
+/// `DONE`. RED before the fail-closed SHIFT_OPEN arm was removed (it returned
+/// 422 SHIFT_OPEN_NOT_SUPPORTED).
 #[tokio::test]
-async fn z_report_is_fail_closed_and_terminalises_inbox() {
+async fn online_shift_open_reaches_ack() {
     let pool = fresh_pool().await;
     let pool_secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
-    let row = seed_inbox_op(&pool, "Z_REPORT").await;
+    // SHIFT_OPEN guard requires no open shift (shift_state Closed).
+    seed_node_state(&pool, NodeMode::Online, ShiftState::Closed).await;
+    let row = seed_inbox_shift_open(&pool).await;
 
     let dps = DualStub::new(
         Ok(ack(SERVER_FISCAL_NO, vec![])),
-        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])),
     );
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
         .await
-        .expect_err("Z-class is fail-closed (501), not a success");
-    assert!(matches!(err, FiscalError::ZSurfaceNotReady { .. }));
-    // Inbox terminal + audited (replay reads REJECTED as failure, not 202).
-    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
-    assert_eq!(audit_count(&pool, "INLINE_Z_SURFACE_NOT_READY").await, 1);
-    // NO fiscal_documents minted for a refusal (Q2).
-    let docs: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ?")
-            .bind(FN)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(docs, 0, "fail-closed must mint NO fiscal_documents");
+        .expect("online SHIFT_OPEN must reach a terminal ACK FiscalOutcome");
+
+    assert_eq!(
+        outcome.document_state,
+        prro::db::models::enums::DocState::Ack
+    );
+    assert_eq!(outcome.fiscal_id.as_deref(), Some(SERVER_FISCAL_NO));
+    assert_eq!(read_doc_state(&pool, FN).await, "ACK");
+    // Edge 1 (Created→Opening at acquire) + edge 3 (Opening→Opened at send).
+    assert_eq!(read_shift_state(&pool, FN).await, "OPENED");
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "DONE");
 }
 
-/// **A2.1b-core incr.5 — SHIFT_OPEN is fail-closed (422) + terminalises the
-/// inbox.** SHIFT_OPEN is out of the SELL/RETURN core (A2.2 owns it):
-/// `ShiftGuardRefused{SHIFT_OPEN_NOT_SUPPORTED}` (422), inbox REJECTED+audited,
-/// no fiscal_documents. The 422 mapping is pinned by inline_map's round-trip test.
+/// **PR-Z2 step 1 — a live SHIFT_OPEN while a shift is already OPENED is refused
+/// by the REAL shift guard** (`SHIFT_ALREADY_OPEN` 422, inbox REJECTED, no
+/// fiscal_documents) — the guard matrix governs SHIFT_OPEN now, not the removed
+/// fail-closed stub. Proves the refusal path routes through the orchestrator.
 #[tokio::test]
-async fn shift_open_is_fail_closed_and_terminalises_inbox() {
+async fn online_shift_open_while_open_is_shift_already_open() {
     let pool = fresh_pool().await;
     let pool_secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
-    let row = seed_inbox_op(&pool, "SHIFT_OPEN").await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await; // shift already OPENED
+    let row = seed_inbox_shift_open(&pool).await;
 
     let dps = DualStub::new(
         Ok(ack(SERVER_FISCAL_NO, vec![])),
@@ -666,25 +776,172 @@ async fn shift_open_is_fail_closed_and_terminalises_inbox() {
 
     let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
         .await
-        .expect_err("SHIFT_OPEN is fail-closed (422) in the SELL/RETURN core");
+        .expect_err("SHIFT_OPEN on an already-open shift must be guard-refused");
     match err {
-        FiscalError::ShiftGuardRefused { code, .. } => {
-            assert_eq!(code, "SHIFT_OPEN_NOT_SUPPORTED");
-        }
-        other => panic!("expected ShiftGuardRefused{{SHIFT_OPEN_NOT_SUPPORTED}}, got {other:?}"),
+        FiscalError::ShiftGuardRefused { code, .. } => assert_eq!(code, "SHIFT_ALREADY_OPEN"),
+        other => panic!("expected ShiftGuardRefused{{SHIFT_ALREADY_OPEN}}, got {other:?}"),
     }
     assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
-    assert_eq!(
-        audit_count(&pool, "INLINE_SHIFT_OPEN_NOT_SUPPORTED").await,
-        1
-    );
-    // Review TA-4 pin: the audit payload's code == the returned error's code
-    // (audit ↔ error agree by construction via code_of).
-    let payload = audit_latest_payload(&pool, "INLINE_SHIFT_OPEN_NOT_SUPPORTED")
+    // No fiscal_documents minted on a pre-acquire guard refusal.
+    let doc_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents")
+        .fetch_one(&pool)
         .await
-        .expect("terminalise audit carries a payload");
-    assert_eq!(payload["code"], "SHIFT_OPEN_NOT_SUPPORTED");
-    assert_eq!(payload["operation_type"], "SHIFT_OPEN");
+        .unwrap();
+    assert_eq!(doc_count, 0, "a guard-refused SHIFT_OPEN mints no doc");
+}
+
+/// **PR-Z2 (steps 2+4) — a live online Z_REPORT closes the shift and reaches
+/// terminal ACK.** The orchestrator resolves the open shift, quiesces it (C10,
+/// Clear on an all-terminal ledger), aggregates, builds the Z canonical (D5),
+/// then runs the shared staged pipeline: acquire edge 8 Opened→Closing, sign the
+/// Z number, send edge 10 Closing→Closed, advance→Ack.  RED before the flag flip
+/// (flag=false → 501 ZSurfaceNotReady); GREEN once FULL_Z_SURFACE_READY is true.
+#[tokio::test]
+async fn online_z_report_closes_shift_reaches_ack() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_z_report(&pool).await;
+
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect("online Z_REPORT must reach a terminal ACK FiscalOutcome");
+    assert_eq!(
+        outcome.document_state,
+        prro::db::models::enums::DocState::Ack
+    );
+    assert_eq!(outcome.fiscal_id.as_deref(), Some(SERVER_FISCAL_NO));
+    assert_eq!(read_doc_state(&pool, FN).await, "ACK");
+    // Edge 8 (Opened→Closing at acquire) + edge 10 (Closing→Closed at send).
+    assert_eq!(read_shift_state(&pool, FN).await, "CLOSED");
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "DONE");
+}
+
+/// **PR-Z2 (STOP-S6 ruling B) — a live Z_REPORT while the shift still has an
+/// in-flight receipt is quiescence-pending: 503 `OfflineRefused{Z_QUIESCENCE_PENDING}`,
+/// inbox REJECTED (seam obligation), a forensic audit naming the blocker, and NO
+/// Z doc minted.** A prior SELL whose send failed transiently rests at
+/// `ErrorRetryable` in the shift → quiesce returns Pending.  RED before the flip
+/// (501); GREEN after.
+#[tokio::test]
+async fn online_z_report_quiescence_pending_is_503_and_rejects_inbox() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+
+    // A SELL whose send fails transiently rests at ErrorRetryable (in-flight).
+    let sell_row = seed_inbox_sell(&pool).await;
+    let sell_dps = DualStub::new(
+        Err(DpsError::Transport("transient send".into())),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = gate.lock_owned().await;
+        let sell = inline::run(
+            &pool,
+            &pool_secure,
+            &sell_dps,
+            &sign_ctx,
+            &fn_sign,
+            &guard,
+            &sell_row,
+        )
+        .await
+        .expect("transient SELL is a 202 in-flight, not an Err");
+        assert_eq!(
+            sell.document_state,
+            prro::db::models::enums::DocState::ErrorRetryable
+        );
+    }
+
+    // Now a Z_REPORT — quiescence is Pending (the ErrorRetryable SELL blocks).
+    let z_row = seed_inbox_z_report(&pool).await;
+    let z_dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+    let err = inline::run(
+        &pool,
+        &pool_secure,
+        &z_dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &z_row,
+    )
+    .await
+    .expect_err("a Z with an in-flight receipt is quiescence-pending (503)");
+    match err {
+        FiscalError::OfflineRefused { code, .. } => assert_eq!(code, "Z_QUIESCENCE_PENDING"),
+        other => panic!("expected OfflineRefused{{Z_QUIESCENCE_PENDING}}, got {other:?}"),
+    }
+    assert_eq!(
+        read_inbox_status(&pool, &z_row.request_id).await,
+        "REJECTED"
+    );
+    // Forensic audit (S6 condition 2) fired at least once.
+    assert!(
+        audit_count(&pool, "INLINE_Z_QUIESCENCE_PENDING").await >= 1,
+        "the quiescence-pending forensic audit must fire"
+    );
+    // No SECOND doc minted (only the prior SELL exists).
+    let doc_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(doc_count, 1, "the quiescence-pending Z mints no doc");
+}
+
+/// **PR-Z2 — a live Z_REPORT with no open shift is refused `ShiftNotOpen` (422)
+/// pre-acquire, inbox REJECTED, no doc.** RED before the flip (501); GREEN after.
+#[tokio::test]
+async fn online_z_report_no_open_shift_is_shift_not_open() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    seed_node_state(&pool, NodeMode::Online, ShiftState::Closed).await; // no current_shift_id
+    let row = seed_inbox_z_report(&pool).await;
+
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect_err("a Z with no open shift must be ShiftNotOpen");
+    assert!(
+        matches!(err, FiscalError::ShiftNotOpen { .. }),
+        "expected ShiftNotOpen, got {err:?}"
+    );
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
+    let doc_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(doc_count, 0, "a no-open-shift Z mints no doc");
 }
 
 /// **A2.1b-core incr.5b — stage_acquire Rejected: map ONLY, NO double-terminalise
@@ -806,6 +1063,101 @@ async fn sign_crypto_failure_is_sign_failure_and_terminalises_inbox() {
     // Ledger-only pin (broad fix): the dangling PREPARED doc is aborted, not
     // left as a non-terminal orphan.
     assert_eq!(read_doc_state(&pool, FN).await, "ABORTED");
+}
+
+/// **PR-Z2 step 3 (S5-A minimal-viable) — a live Z_REPORT whose send DPS-rejects
+/// escalates the FN shift to RequiresManualReconciliation (edge 12 Closing→RMR).**
+/// The doc rests `Rejected` (D2 pre-SENT, verbatim); the shift becomes the durable
+/// operator surface; the request returns `SHIFT_MANUAL_RECON` (500).  RED before
+/// the escalate-hook (a plain DpsRejected + the shift stuck in Closing).
+#[tokio::test]
+async fn z_report_dps_reject_escalates_shift_to_manual_recon() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_z_report(&pool).await;
+
+    // send_chk → DocumentReject (terminal); the Z doc routes to Rejected.
+    let dps = DualStub::new(
+        Err(DpsError::Authorization {
+            code: -1,
+            kind: AuthorizationKind::DocumentReject,
+            message: "z rejected by DPS".into(),
+        }),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect_err("a rejected Z escalates the shift to manual recon");
+    assert!(
+        matches!(err, FiscalError::Internal { code, .. } if code == "SHIFT_MANUAL_RECON"),
+        "a rejected Z must surface SHIFT_MANUAL_RECON, got {err:?}"
+    );
+    // Edge 12: the shift is escalated to RMR (the durable operator surface).
+    assert_eq!(
+        read_shift_state(&pool, FN).await,
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
+    // The doc rests Rejected (D2, pre-SENT — lnd consumed, seed not advanced).
+    assert_eq!(read_doc_state(&pool, FN).await, "REJECTED");
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
+    // §8.1 forensic escalate audit fired (the durable operator surface record).
+    assert_eq!(
+        audit_count(&pool, "INLINE_Z_SHIFT_REJECT_ESCALATE_MANUAL").await,
+        1,
+        "the shift-escalate must emit its forensic audit"
+    );
+}
+
+/// **PR-Z2 step 3 (THE load-bearing NEGATIVE) — a SELL DPS-reject is an ordinary
+/// per-doc terminal and MUST NOT escalate the shift.** One rejected receipt does
+/// NOT kill the whole shift into manual recon: the doc lands Rejected, the shift
+/// stays OPENED, zero escalate audits.  The escalate hook is scoped to
+/// shift-class docs (SHIFT_OPEN/SHIFT_CLOSE/Z_REPORT) ONLY.
+#[tokio::test]
+async fn sell_dps_reject_does_not_escalate_shift() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_sell(&pool).await;
+
+    let dps = DualStub::new(
+        Err(DpsError::Authorization {
+            code: -1,
+            kind: AuthorizationKind::DocumentReject,
+            message: "document rejected by DPS".into(),
+        }),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect_err("a SELL DPS reject is a per-doc terminal");
+    assert!(
+        matches!(err, FiscalError::DpsRejected { .. }),
+        "a SELL reject stays DpsRejected (422), NOT a shift escalation, got {err:?}"
+    );
+    assert_eq!(read_doc_state(&pool, FN).await, "REJECTED");
+    // The shift is UNTOUCHED — a rejected sale must never kill the shift.
+    assert_eq!(read_shift_state(&pool, FN).await, "OPENED");
+    assert_eq!(
+        audit_count(&pool, "INLINE_Z_SHIFT_REJECT_ESCALATE_MANUAL").await,
+        0,
+        "a SELL reject must emit NO shift-escalate audit"
+    );
 }
 
 /// **A2.1b-core incr.5b — four-variant gate: DpsRejected.** DPS hard-rejects

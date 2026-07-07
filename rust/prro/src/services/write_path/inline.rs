@@ -27,7 +27,7 @@
 use sqlx::SqlitePool;
 use tokio::sync::OwnedMutexGuard;
 
-use crate::db::models::enums::{DocState, Severity};
+use crate::db::models::enums::{DocState, DocType, Severity};
 use crate::db::models::ids::DocumentId;
 use crate::db::repositories::audit_log;
 use crate::db::repositories::fiscal_documents::{self, TerminalOutcome};
@@ -35,8 +35,11 @@ use crate::db::repositories::ingress_inbox::{self, InboxRow};
 use crate::db::repositories::node_state;
 use crate::db::tx::with_immediate;
 use crate::runtime::ingress::canonical_builder::build_canonical;
+use crate::runtime::ingress::convert::aggregate_z_payload_for_shift;
 use crate::runtime::ingress::seam::{FiscalError, FiscalOutcome};
-use crate::runtime::ingress::z_builder::ensure_full_z_surface_ready;
+use crate::runtime::ingress::z_builder::{
+    build_z_canonical, ensure_full_z_surface_ready, quiesce_shift_before_z, QuiescenceOutcome,
+};
 use crate::services::offline_sync::kvt2_confirm::{
     classify_check_result, Kvt2ConfirmOutcome, Kvt2ConfirmSource,
 };
@@ -50,7 +53,9 @@ use crate::services::write_path::stage_acquire;
 use crate::services::write_path::stage_offline_ack::OfflineAckOutcome;
 use crate::services::write_path::stage_send::{self, StageSendOutcome};
 use crate::services::write_path::stage_sign::{self, SigningContext};
-use crate::services::write_path::types::{hex_encode_lower, WorkerProcessResult};
+use crate::services::write_path::types::{
+    hex_encode_lower, CanonicalFiscalCommand, WorkerProcessResult,
+};
 use crate::transports::dps::channel::DpsChannel;
 use crate::transports::dps::dto::CheckSignBlob;
 
@@ -302,6 +307,68 @@ pub(crate) async fn escalate_inline_chain_seed_mismatch(
     }
 }
 
+/// The shift-class doc types whose DPS reject escalates the FN shift to RMR
+/// (PR-Z2 step 3, edges 4/12), as opposed to a SELL/RETURN per-doc terminal.
+fn is_shift_class(doc_type: DocType) -> bool {
+    matches!(
+        doc_type,
+        DocType::ShiftOpen | DocType::ShiftClose | DocType::ZReport
+    )
+}
+
+/// PR-Z2 step 3 (S5-A minimal-viable) — a `SHIFT_OPEN` / `Z_REPORT` /
+/// `SHIFT_CLOSE` whose send DPS-REJECTED escalates the FN shift to
+/// `RequiresManualReconciliation` (edge 4 `Opening→RMR` / edge 12
+/// `Closing→RMR`) via the shared idempotent `escalate_fn_to_manual_recon` seam
+/// and its §8.1 forensic audit.  The doc rests `Rejected` (D2, pre-SENT); this
+/// drives ONLY the shift edge.  Mirrors `escalate_inline_chain_seed_mismatch`,
+/// idempotent (already-RMR → clean no-op).  See the reject-arm doc-comment for
+/// the DocumentReject / edge-11 residual.
+async fn escalate_shift_class_reject(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    doc_id: DocumentId,
+    request_id: [u8; 16],
+) -> FiscalError {
+    let drift = FiscalError::Internal {
+        request_id,
+        code: codes::REPLAY_LEDGER_DRIFT,
+    };
+    let ns = match node_state::get(pool, fiscal_number).await {
+        Ok(Some(ns)) => ns,
+        // No node_state → no shift to escalate; the manual-recon surface is the
+        // honest answer (an operator anomaly either way).
+        _ => {
+            return FiscalError::Internal {
+                request_id,
+                code: codes::SHIFT_MANUAL_RECON,
+            }
+        }
+    };
+    match crate::services::offline_sync::backlog_drain::escalate_fn_to_manual_recon(
+        pool,
+        fiscal_number,
+        &ns,
+        doc_id,
+        "z_shift_dps_reject",
+        0,
+        "INLINE_Z_SHIFT_REJECT_ESCALATE_MANUAL",
+        "INLINE_Z_SHIFT_REJECT_NO_SHIFT",
+    )
+    .await
+    {
+        // Escalated (→ RMR) or NoEscalatableShift (the no-shift audit is the
+        // surface): both leave a durable operator surface → the manual-recon 500.
+        Ok(_) => FiscalError::Internal {
+            request_id,
+            code: codes::SHIFT_MANUAL_RECON,
+        },
+        // Structural desync inside the escalate envelope (NOT the idempotent
+        // already-RMR no-op) → preserve the drift detector.
+        Err(_) => drift,
+    }
+}
+
 async fn terminalise_inbox(
     pool: &SqlitePool,
     row: &InboxRow,
@@ -503,25 +570,26 @@ pub async fn run(
 ) -> Result<FiscalOutcome, FiscalError> {
     let request_id = row.request_id;
 
-    // A2.1b-core is SELL/RETURN only. Z-class (Z_REPORT/SHIFT_CLOSE) and
-    // SHIFT_OPEN are fail-closed BEFORE build/acquire — the inbox is still
-    // NEW, so the pre-acquire terminalise leases+REJECTs atomically (no
-    // fiscal_documents minted); on a race (row not NEW) it resolves against
-    // the ledger.
+    // PR-Z2 (online-half): SELL/RETURN **and** SHIFT_OPEN route live through the
+    // happy-path stages below (SHIFT_OPEN reuses the same acquire→sign→send→
+    // confirm→advance chain — the stages are doc-type-aware: acquire fires
+    // edge 1 Created→Opening, send confirms edge 3 Opening→Opened).  Z-class
+    // (Z_REPORT/SHIFT_CLOSE) stays fail-closed BEFORE build/acquire until the
+    // Z-dispatch arm lands (next PR-Z2 step) — the inbox is still NEW, so the
+    // pre-acquire terminalise leases+REJECTs atomically (no fiscal_documents
+    // minted); on a race (row not NEW) it resolves against the ledger.
     match row.operation_type.as_str() {
         "Z_REPORT" | "SHIFT_CLOSE" => {
-            // Bound to the real live-Z surface gate (not theatrical): it is
-            // Err today → 501 ZSurfaceNotReady. A2.1b-core (SELL/RETURN-only)
-            // does NOT handle live-Z even if the gate flips — the debug_assert
-            // makes a future gate-flip break tests (a deliberate revisit),
-            // never a silent fall-through to build_canonical (a later A2.4-Z
-            // piece owns the live-Z path).
-            let surface = ensure_full_z_surface_ready();
-            debug_assert!(
-                surface.is_err(),
-                "A2.1b-core predates the live-Z surface; the gate must be Err \
-                 (if it flipped, live-Z is a LATER piece — revisit this branch)"
-            );
+            // PR-Z2 (online-half): route the live Z dispatcher IFF the release
+            // flag is set.  While `FULL_Z_SURFACE_READY` is false the arm stays
+            // fail-closed (501 ZSurfaceNotReady); `run_z_dispatch` is wired +
+            // tested directly and goes live when the step-4 flip flips the const
+            // (in lock-step with the coupling-pin + the tripwire).  The old
+            // `debug_assert(surface.is_err())` is superseded — the routing IS the
+            // deliberate handling now.
+            if ensure_full_z_surface_ready().is_ok() {
+                return run_z_dispatch(pool, pool_secure, dps, sign_ctx, fn_sign, row).await;
+            }
             // Build the error FIRST so the audit code comes from code_of —
             // audit ↔ returned error agree by construction (review HTTP-1;
             // the literal lives in one place, fence-tested → 501).
@@ -538,22 +606,7 @@ pub async fn run(
                 PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
             };
         }
-        "SHIFT_OPEN" => {
-            return match terminalise_inbox_pre_acquire(
-                pool,
-                row,
-                "INLINE_SHIFT_OPEN_NOT_SUPPORTED",
-                codes::SHIFT_OPEN_NOT_SUPPORTED,
-            )
-            .await?
-            {
-                PreAcquireTerminalise::Terminalised => Err(FiscalError::ShiftGuardRefused {
-                    request_id,
-                    code: codes::SHIFT_OPEN_NOT_SUPPORTED,
-                }),
-                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
-            };
-        }
+        // SHIFT_OPEN falls through to the live happy-path stages below.
         _ => {}
     }
 
@@ -576,11 +629,34 @@ pub async fn run(
             };
         }
     };
-    // build_canonical validated driver_id is present + well-formed.
+    run_staged(pool, pool_secure, dps, sign_ctx, fn_sign, row, command).await
+}
+
+/// The shared staged pipeline (acquire → sign → dispatch → send → confirm →
+/// advance → finalize) for an ALREADY-BUILT `command`.  Both the
+/// SELL/RETURN/SHIFT_OPEN path (via `build_canonical`) and the live Z path
+/// (`run_z_dispatch` → `build_z_canonical`) feed it verbatim — the stages are
+/// doc-type-aware (acquire fires the shift edge, sign allocates the Z number,
+/// send confirms the SENT edge), so the tail is shared, not duplicated.
+#[allow(clippy::too_many_arguments)]
+async fn run_staged(
+    pool: &SqlitePool,
+    pool_secure: &SqlitePool,
+    dps: &dyn DpsChannel,
+    sign_ctx: &SigningContext,
+    fn_sign: &CheckSignBlob,
+    row: &InboxRow,
+    command: CanonicalFiscalCommand,
+) -> Result<FiscalOutcome, FiscalError> {
+    let request_id = row.request_id;
+    // Captured BEFORE `command` is moved into stage_acquire — the reject arm
+    // (PR-Z2 step 3) needs it to scope the shift-class escalate.
+    let doc_type = command.doc_type;
+    // build_canonical / build_z_canonical validated driver_id is present + well-formed.
     let driver_id = row
         .driver_id
         .as_deref()
-        .expect("build_canonical guarantees driver_id present");
+        .expect("build_canonical/build_z_canonical guarantees driver_id present");
 
     let acq = match stage_acquire::run(pool, pool_secure, driver_id, request_id, command).await {
         Ok(r) => r,
@@ -707,11 +783,34 @@ pub async fn run(
             };
             match classify_send_outcome(send, request_id) {
                 SendDisposition::Reject(fe) => {
-                    // `fe` is ALREADY mapped by classify_send_outcome (terminal
-                    // DPS reject / signer mismatch / structural) — terminalise
-                    // with its own code, then return it; no re-mapping.
-                    terminalise_inbox(pool, row, "INLINE_SEND_REJECT", code_of(&fe)).await?;
-                    Err(fe)
+                    // PR-Z2 step 3 (S5-A minimal-viable): a SHIFT-CLASS doc reject
+                    // escalates the FN shift to RMR (edge 4 Opening→RMR / edge 12
+                    // Closing→RMR).  The reject REASON (a pure DocumentReject vs a
+                    // Server hard-reject) is INDISTINGUISHABLE at this layer —
+                    // `RoutingDecision` collapses both to `(Rejected, TerminalReject)`
+                    // and does NOT carry the `AuthorizationKind` — so both
+                    // conservatively escalate to RMR (the designed catch-all
+                    // operator surface for shift/Z anomalies, CLAUDE.md
+                    // trigger-family 2).  Edge 11 (a pure DocumentReject →
+                    // `Closing→Opened` rollback + operator reissue) and the
+                    // reason-surfacing `ShiftRecoveryClass` are a NAMED RESIDUAL
+                    // (the recovery increment, which owns that layer).  A
+                    // SELL/RETURN reject stays a per-doc terminal — it MUST NOT kill
+                    // the shift.  The doc rests `Rejected` (D2, pre-SENT) either way.
+                    if is_shift_class(doc_type) {
+                        let rmr =
+                            escalate_shift_class_reject(pool, &fiscal_number, doc_id, request_id)
+                                .await;
+                        terminalise_inbox(pool, row, "INLINE_Z_SHIFT_REJECT", code_of(&rmr))
+                            .await?;
+                        Err(rmr)
+                    } else {
+                        // `fe` is ALREADY mapped by classify_send_outcome (terminal
+                        // DPS reject / signer mismatch / structural) — terminalise
+                        // with its own code, then return it; no re-mapping.
+                        terminalise_inbox(pool, row, "INLINE_SEND_REJECT", code_of(&fe)).await?;
+                        Err(fe)
+                    }
                 }
                 SendDisposition::InProgress => Ok(FiscalOutcome {
                     // Transient wire failure: the doc is persisted at
@@ -919,6 +1018,186 @@ pub async fn run(
             }
         }
     }
+}
+
+/// Live `Z_REPORT` / `SHIFT_CLOSE` dispatch (PR-Z2 online-half).  Pre-acquire:
+/// resolve the open shift → quiesce it (C10 gate, INV #8) → aggregate the
+/// shift's receipts → build the Z canonical (D5 dual-hash) → feed the shared
+/// staged pipeline `run_staged` (acquire edge 8 Opened→Closing, sign the Z
+/// number, send edge 10 Closing→Closed, advance→Ack).  Gated by
+/// `FULL_Z_SURFACE_READY` at the caller (production stays fail-closed until the
+/// step-4 flip); tested directly (flag-independent).
+async fn run_z_dispatch(
+    pool: &SqlitePool,
+    pool_secure: &SqlitePool,
+    dps: &dyn DpsChannel,
+    sign_ctx: &SigningContext,
+    fn_sign: &CheckSignBlob,
+    row: &InboxRow,
+) -> Result<FiscalOutcome, FiscalError> {
+    let request_id = row.request_id;
+    let fiscal_number = row.fiscal_number.clone();
+
+    // Resolve the FN's open shift (the one to quiesce / aggregate / close).  No
+    // open shift → refuse (ShiftNotOpen 422); stage_acquire's Z@Closed guard
+    // would reach the same verdict, but quiescence needs the shift_id up front.
+    let shift_id = match node_state::get(pool, &fiscal_number).await {
+        Ok(ns) => ns.and_then(|n| n.current_shift_id),
+        Err(_e) => {
+            let fe = FiscalError::Internal {
+                request_id,
+                code: codes::Z_DISPATCH_INTERNAL,
+            };
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_Z_NODE_READ_ERROR",
+                code_of(&fe),
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => Err(fe),
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
+        }
+    };
+    let shift_id = match shift_id {
+        Some(s) => s,
+        None => {
+            let fe = FiscalError::ShiftNotOpen { request_id };
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_Z_NO_OPEN_SHIFT",
+                code_of(&fe),
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => Err(fe),
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
+        }
+    };
+
+    // C10 quiescence gate (INV #8 — Z closes only via the C10 gate).  quiesce +
+    // aggregate are benign PRE-guard: quiesce only inline-finalizes the leading
+    // contiguous KVT2 run (short tx, no IO/crypto), aggregate is read-only — the
+    // shift-state guard (Z@Opened) runs at stage_acquire below.
+    match quiesce_shift_before_z(pool, &fiscal_number, shift_id).await {
+        Ok(QuiescenceOutcome::Clear) => {}
+        Ok(QuiescenceOutcome::Pending { blocking }) => {
+            // STOP-S6 ruling (B): the retryable Z-quiescence-pending is CARRIED
+            // on `OfflineRefused{Z_QUIESCENCE_PENDING}` (503) for boundary
+            // discipline — a dedicated `FiscalError::QuiescencePending` variant +
+            // a handler-aware SAME-KEY retry is a NAMED RESIDUAL (option C,
+            // co-scoped with the recovery increment).  Seam obligation:
+            // terminalise the inbox REJECTED (a same-key replay then resolves to
+            // 500 INBOX_REJECTED — NOT "shift closed with error"; no Z issued).
+            // Client contract: retry the close with a NEW idempotency key after
+            // the runtime drives the blockers issued.
+            let fe = FiscalError::OfflineRefused {
+                request_id,
+                code: codes::Z_QUIESCENCE_PENDING,
+            };
+            // Forensic (best-effort, S6 condition 2): which docs blocked the Z.
+            let blockers: Vec<serde_json::Value> = blocking
+                .iter()
+                .map(|(id, st)| {
+                    serde_json::json!({
+                        "document_id": hex_encode_lower(id.as_bytes()),
+                        "state": st.as_str(),
+                    })
+                })
+                .collect();
+            let payload = serde_json::json!({
+                "blocking": blockers,
+                "code": codes::Z_QUIESCENCE_PENDING,
+            })
+            .to_string();
+            let _ = audit_log::append(
+                pool,
+                "ingress_inbox",
+                &hex_encode_lower(&request_id),
+                "INLINE_Z_QUIESCENCE_PENDING",
+                Severity::Warning,
+                None,
+                Some(&payload),
+            )
+            .await;
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_Z_QUIESCENCE_PENDING",
+                code_of(&fe),
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => Err(fe),
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
+        }
+        Err(_e) => {
+            let fe = FiscalError::Internal {
+                request_id,
+                code: codes::Z_DISPATCH_INTERNAL,
+            };
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_Z_QUIESCENCE_ERROR",
+                code_of(&fe),
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => Err(fe),
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
+        }
+    }
+
+    // Aggregate the quiesced shift's receipts into the signer-ready Z body.
+    let aggregated = match aggregate_z_payload_for_shift(pool, &fiscal_number, shift_id).await {
+        Ok(a) => a,
+        Err(_e) => {
+            let fe = FiscalError::Internal {
+                request_id,
+                code: codes::Z_DISPATCH_INTERNAL,
+            };
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_Z_AGGREGATE_ERROR",
+                code_of(&fe),
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => Err(fe),
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
+        }
+    };
+
+    // Build the Z canonical (D5 dual-hash: source = wire-intent hash, canonical
+    // = the recomputed aggregated-body hash).
+    let command = match build_z_canonical(row, &aggregated) {
+        Ok(c) => c,
+        Err(reject) => {
+            let fe = map_build_reject(&reject, request_id);
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_Z_BUILD_REJECT",
+                code_of(&fe),
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => Err(fe),
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
+        }
+    };
+
+    run_staged(pool, pool_secure, dps, sign_ctx, fn_sign, row, command).await
 }
 
 #[cfg(test)]
@@ -1244,6 +1523,41 @@ mod tests {
         assert_eq!(
             escalate_audit_count(&pool).await,
             1,
+            "idempotent: already-RMR re-injection must NOT re-audit"
+        );
+    }
+
+    /// PR-Z2 step 3 — the shift-class reject escalation is IDEMPOTENT (it reuses
+    /// the shared escalate seam's already-RMR early-return): a second call on an
+    /// already-RMR shift is a clean no-op — the shift stays RMR, NO duplicate
+    /// escalate audit.  Mirrors the chain-seed idempotency proof.
+    #[tokio::test]
+    async fn shift_class_reject_escalation_is_idempotent() {
+        let pool = sw4_pool().await;
+        let shift = seed_opened_shift_and_node(&pool).await;
+        let doc_id = DocumentId::new();
+        let request_id = [0x5Du8; 16];
+
+        let _ = escalate_shift_class_reject(&pool, SW4_FN, doc_id, request_id).await;
+        let fe2 = escalate_shift_class_reject(&pool, SW4_FN, doc_id, request_id).await;
+
+        assert!(
+            matches!(fe2, FiscalError::Internal { code, .. } if code == codes::SHIFT_MANUAL_RECON),
+            "second injection still surfaces the manual-recon 500"
+        );
+        assert_eq!(
+            read_shift_state(&pool, shift).await,
+            "REQUIRES_MANUAL_RECONCILIATION"
+        );
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE event_type = 'INLINE_Z_SHIFT_REJECT_ESCALATE_MANUAL'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            n, 1,
             "idempotent: already-RMR re-injection must NOT re-audit"
         );
     }

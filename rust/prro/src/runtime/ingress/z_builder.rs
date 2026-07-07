@@ -30,22 +30,29 @@ use crate::services::write_path::types::CanonicalFiscalCommand;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
-/// RS-3 A2 RELEASE GATE (wide-audit HIGH / AUDIT5-CRIT-2): the Z aggregation
-/// (`convert::aggregate_zreport` → `ZReportJson`) is still SUMMARY-ONLY — it
-/// carries only payment totals + receipt counts and OMITS the full fiscal Z
-/// surface (TXS tax-group sums / IO service in-out / EPZ card-acquiring
-/// aggregates), which `stage_sign` hardcodes empty pending W4-Z2. A1Z only
-/// WIRES the existing (pre-RS-3, deferred-since-AUDIT5) aggregation; it does
-/// NOT make it live.
+/// RS-3 A2 RELEASE GATE (wide-audit HIGH / AUDIT5-CRIT-2).  The Z surface is now
+/// COMPLETE for this gateway's contour, so live Z dispatch is enabled (PR-Z2):
+///   - **TXS** (tax-group turnover) landed in PR-Z1 — `derive_z_report_tax_summaries`
+///     aggregates the shift's stored items into canonical tax groups.
+///   - **IO** (service in/out) + **EPZ** (card-acquiring) are LEGITIMATELY ABSENT
+///     for this contour, NOT under-reported: the gateway structurally cannot
+///     accept the operations those sections report — `SERVICE_IN`/`SERVICE_OUT`
+///     are classified `Unsupported` at ingress (`policy.rs` → HTTP 422, never
+///     minted) and a slip-carrying payment fail-closes at `convert.rs`
+///     (`AcquirerSlipMappingDeferred`, 422).  A 4-year Python prod emitted both
+///     sections only on NON-EMPTY data → absent == accurate here.
 ///
-/// `false` until W4-Z2 completes the surface. The future A2 dispatcher MUST
-/// call [`ensure_full_z_surface_ready`] BEFORE aggregating/signing a live
-/// `Z_REPORT` / `SHIFT_CLOSE` and FAIL-CLOSED (return the typed error) while it
-/// is `false` — otherwise a live close-shift would sign an under-reporting Z.
-/// Flip this to `true` IN THE SAME CHANGE that completes the surface; the test
-/// `z_live_dispatch_is_gated_until_full_z_surface` is the tripwire that forces
-/// that to be a deliberate decision.
-pub const FULL_Z_SURFACE_READY: bool = false;
+/// ⚠️ COUPLING (STOP-S2): this completeness is CONDITIONAL on those two ingress
+/// guards.  Enabling EITHER `SERVICE_IN/OUT` ingest OR `acquirer_slip` pass-through
+/// WITHOUT building its Z-half (the IO / EPZ aggregation) re-opens the
+/// under-reporting hazard — a live close-shift would then sign a Z that OMITS
+/// real service / card turnover.  If either guard is relaxed, flip this back to
+/// `false` OR extend the surface IN THE SAME CHANGE.  The coupling-pin
+/// `z_surface_flip_is_coupled_to_ingress_guards` asserts both guards still hold;
+/// it MUST break loudly if someone drops one without the IO/EPZ half.  The
+/// tripwire `z_live_dispatch_is_gated_until_full_z_surface` pins this flip as the
+/// deliberate release decision it is.
+pub const FULL_Z_SURFACE_READY: bool = true;
 
 /// Typed fail-closed error for a live Z dispatch attempted before the full Z
 /// surface (TXS / IO / EPZ) exists. See [`FULL_Z_SURFACE_READY`].

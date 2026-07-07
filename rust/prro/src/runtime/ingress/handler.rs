@@ -169,7 +169,11 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         // A.3 PR-C (D5 gate) — an older non-issued sibling rests on the FN;
         // transient RETRYABLE refusal (the online_convergence resolver
         // re-drives the blocker, then the client retries), NOT a 5xx breach.
-        | "WRITE_GATE_SIBLING_PENDING" => 503,
+        | "WRITE_GATE_SIBLING_PENDING"
+        // PR-Z2 (STOP-S6 ruling B) — a live Z hit C10 quiescence-pending: the
+        // shift still has in-flight receipts.  RETRYABLE 503; the operator
+        // retries the close with a NEW idempotency key after the blockers drain.
+        | "Z_QUIESCENCE_PENDING" => 503,
         // ledger/internal faults → 500.  SIGN_FAILED is the RS-3 sign-path
         // fault (a real crypto-operation failure, not a node-mode shift).
         // RS-3 A2 (T2/T3): `Internal{code}` carries a structural/runtime-breach
@@ -1427,6 +1431,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(c, 0, "an unsupported command must not enter the inbox");
+    }
+
+    /// **PR-Z2 (STOP-S2) coupling-pin — the `FULL_Z_SURFACE_READY = true` flip is
+    /// COUPLED to the two ingress guards that make IO/EPZ legitimately absent.**
+    /// If either is relaxed WITHOUT building its IO/EPZ Z-half, a live close-shift
+    /// would sign an UNDER-REPORTING Z — so this pin asserts both still hold and
+    /// MUST break loudly if one is dropped: (1) `SERVICE_IN/OUT` stay
+    /// ingress-rejected (422 `UNSUPPORTED_COMMAND`, never minted → no service/IO
+    /// turnover to report); (2) an `acquirer_slip`-carrying payment stays
+    /// fail-closed (422 `ACQUIRER_SLIP_DEFERRED`, never minted → no card/EPZ
+    /// turnover to report).  Flag-independent (guards, not the flag) — it stays
+    /// GREEN under a flag revert.  See the `FULL_Z_SURFACE_READY` doc-comment.
+    #[tokio::test]
+    async fn z_surface_flip_is_coupled_to_ingress_guards() {
+        let (_d, main, secure) = fresh_pools().await;
+        let wp = UnimplementedWritePath;
+
+        // (1) SERVICE_IN → 422 UNSUPPORTED (the IO-half premise: no service doc
+        // ever mints, so IO turnover is legitimately zero).
+        let r = handle_command(
+            &service_in_cmd("idem-svc-couple"),
+            FN,
+            drv(),
+            Protocol::Rest,
+            &main,
+            &secure,
+            &wp,
+        )
+        .await;
+        assert_eq!(r.http_status, 422, "SERVICE_IN must stay ingress-rejected");
+        match r.body {
+            IngressBody::Error(e) => assert_eq!(e.error_code, "UNSUPPORTED_COMMAND"),
+            other => panic!("expected UNSUPPORTED_COMMAND, got {other:?}"),
+        }
+
+        // (2) An acquirer_slip-carrying CASHLESS payment → 422 ACQUIRER_SLIP_DEFERRED
+        // (the EPZ-half premise: no card-slip doc ever mints, so EPZ turnover is
+        // legitimately zero).  Seed the CASHLESS_1 slot (index 2, non-cash) so
+        // convert reaches the acquirer_slip fail-closed check.
+        payment_methods::insert(
+            &secure,
+            &NewPaymentMethod {
+                fn_id: FN.to_string(),
+                pay_index: 2,
+                name: "Картка".to_string(),
+                iscash: false,
+            },
+        )
+        .await
+        .unwrap();
+        let cmd = parse(format!(
+            r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"SELL",
+                "idempotency_key":"idem-slip-couple","cashier_id":null,"department":null,
+                "return_check_number":null,
+                "payload":{{"direction":"SALE",
+                  "goods":[{{"name":"Bread","quantity_milli":1000,"price_kopecks":10000,
+                            "tax_group_1":0,"tax_group_2":0,"article_code":42}}],
+                  "payments":[{{"type":"CASHLESS_1","amount_kopecks":10000,
+                    "acquirer_slip":{{"payment_form_index":1,"merchant_id":"M","terminal_id":"T",
+                      "operation_type":"SALE","pan":"****1234","approval_code":"OK",
+                      "payment_system":"VISA","transaction_code":"TX","fee_kopecks":0,
+                      "cashier_signature_placeholder":false,
+                      "cardholder_signature_placeholder":false}}}}],
+                  "totals":{{"sale_kopecks":10000,"return_kopecks":0}}}}}}"#
+        ));
+        let r = handle_command(&cmd, FN, drv(), Protocol::Rest, &main, &secure, &wp).await;
+        assert_eq!(
+            r.http_status, 422,
+            "an acquirer_slip payment must stay fail-closed"
+        );
+        match r.body {
+            IngressBody::Error(e) => assert_eq!(e.error_code, "ACQUIRER_SLIP_DEFERRED"),
+            other => panic!("expected ACQUIRER_SLIP_DEFERRED, got {other:?}"),
+        }
+        let c: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingress_inbox")
+            .fetch_one(&main)
+            .await
+            .unwrap();
+        assert_eq!(c, 0, "neither coupled guard may mint an inbox row");
     }
 
     /// A convert failure (SELL with empty goods → `EMPTY_GOODS`) is rejected
