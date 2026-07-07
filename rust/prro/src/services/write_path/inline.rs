@@ -35,8 +35,11 @@ use crate::db::repositories::ingress_inbox::{self, InboxRow};
 use crate::db::repositories::node_state;
 use crate::db::tx::with_immediate;
 use crate::runtime::ingress::canonical_builder::build_canonical;
+use crate::runtime::ingress::convert::aggregate_z_payload_for_shift;
 use crate::runtime::ingress::seam::{FiscalError, FiscalOutcome};
-use crate::runtime::ingress::z_builder::ensure_full_z_surface_ready;
+use crate::runtime::ingress::z_builder::{
+    build_z_canonical, ensure_full_z_surface_ready, quiesce_shift_before_z, QuiescenceOutcome,
+};
 use crate::services::offline_sync::kvt2_confirm::{
     classify_check_result, Kvt2ConfirmOutcome, Kvt2ConfirmSource,
 };
@@ -50,7 +53,9 @@ use crate::services::write_path::stage_acquire;
 use crate::services::write_path::stage_offline_ack::OfflineAckOutcome;
 use crate::services::write_path::stage_send::{self, StageSendOutcome};
 use crate::services::write_path::stage_sign::{self, SigningContext};
-use crate::services::write_path::types::{hex_encode_lower, WorkerProcessResult};
+use crate::services::write_path::types::{
+    hex_encode_lower, CanonicalFiscalCommand, WorkerProcessResult,
+};
 use crate::transports::dps::channel::DpsChannel;
 use crate::transports::dps::dto::CheckSignBlob;
 
@@ -513,18 +518,16 @@ pub async fn run(
     // minted); on a race (row not NEW) it resolves against the ledger.
     match row.operation_type.as_str() {
         "Z_REPORT" | "SHIFT_CLOSE" => {
-            // Bound to the real live-Z surface gate (not theatrical): it is
-            // Err today → 501 ZSurfaceNotReady. A2.1b-core (SELL/RETURN-only)
-            // does NOT handle live-Z even if the gate flips — the debug_assert
-            // makes a future gate-flip break tests (a deliberate revisit),
-            // never a silent fall-through to build_canonical (a later A2.4-Z
-            // piece owns the live-Z path).
-            let surface = ensure_full_z_surface_ready();
-            debug_assert!(
-                surface.is_err(),
-                "A2.1b-core predates the live-Z surface; the gate must be Err \
-                 (if it flipped, live-Z is a LATER piece — revisit this branch)"
-            );
+            // PR-Z2 (online-half): route the live Z dispatcher IFF the release
+            // flag is set.  While `FULL_Z_SURFACE_READY` is false the arm stays
+            // fail-closed (501 ZSurfaceNotReady); `run_z_dispatch` is wired +
+            // tested directly and goes live when the step-4 flip flips the const
+            // (in lock-step with the coupling-pin + the tripwire).  The old
+            // `debug_assert(surface.is_err())` is superseded — the routing IS the
+            // deliberate handling now.
+            if ensure_full_z_surface_ready().is_ok() {
+                return run_z_dispatch(pool, pool_secure, dps, sign_ctx, fn_sign, row).await;
+            }
             // Build the error FIRST so the audit code comes from code_of —
             // audit ↔ returned error agree by construction (review HTTP-1;
             // the literal lives in one place, fence-tested → 501).
@@ -564,11 +567,31 @@ pub async fn run(
             };
         }
     };
-    // build_canonical validated driver_id is present + well-formed.
+    run_staged(pool, pool_secure, dps, sign_ctx, fn_sign, row, command).await
+}
+
+/// The shared staged pipeline (acquire → sign → dispatch → send → confirm →
+/// advance → finalize) for an ALREADY-BUILT `command`.  Both the
+/// SELL/RETURN/SHIFT_OPEN path (via `build_canonical`) and the live Z path
+/// (`run_z_dispatch` → `build_z_canonical`) feed it verbatim — the stages are
+/// doc-type-aware (acquire fires the shift edge, sign allocates the Z number,
+/// send confirms the SENT edge), so the tail is shared, not duplicated.
+#[allow(clippy::too_many_arguments)]
+async fn run_staged(
+    pool: &SqlitePool,
+    pool_secure: &SqlitePool,
+    dps: &dyn DpsChannel,
+    sign_ctx: &SigningContext,
+    fn_sign: &CheckSignBlob,
+    row: &InboxRow,
+    command: CanonicalFiscalCommand,
+) -> Result<FiscalOutcome, FiscalError> {
+    let request_id = row.request_id;
+    // build_canonical / build_z_canonical validated driver_id is present + well-formed.
     let driver_id = row
         .driver_id
         .as_deref()
-        .expect("build_canonical guarantees driver_id present");
+        .expect("build_canonical/build_z_canonical guarantees driver_id present");
 
     let acq = match stage_acquire::run(pool, pool_secure, driver_id, request_id, command).await {
         Ok(r) => r,
@@ -907,6 +930,186 @@ pub async fn run(
             }
         }
     }
+}
+
+/// Live `Z_REPORT` / `SHIFT_CLOSE` dispatch (PR-Z2 online-half).  Pre-acquire:
+/// resolve the open shift → quiesce it (C10 gate, INV #8) → aggregate the
+/// shift's receipts → build the Z canonical (D5 dual-hash) → feed the shared
+/// staged pipeline `run_staged` (acquire edge 8 Opened→Closing, sign the Z
+/// number, send edge 10 Closing→Closed, advance→Ack).  Gated by
+/// `FULL_Z_SURFACE_READY` at the caller (production stays fail-closed until the
+/// step-4 flip); tested directly (flag-independent).
+async fn run_z_dispatch(
+    pool: &SqlitePool,
+    pool_secure: &SqlitePool,
+    dps: &dyn DpsChannel,
+    sign_ctx: &SigningContext,
+    fn_sign: &CheckSignBlob,
+    row: &InboxRow,
+) -> Result<FiscalOutcome, FiscalError> {
+    let request_id = row.request_id;
+    let fiscal_number = row.fiscal_number.clone();
+
+    // Resolve the FN's open shift (the one to quiesce / aggregate / close).  No
+    // open shift → refuse (ShiftNotOpen 422); stage_acquire's Z@Closed guard
+    // would reach the same verdict, but quiescence needs the shift_id up front.
+    let shift_id = match node_state::get(pool, &fiscal_number).await {
+        Ok(ns) => ns.and_then(|n| n.current_shift_id),
+        Err(_e) => {
+            let fe = FiscalError::Internal {
+                request_id,
+                code: codes::Z_DISPATCH_INTERNAL,
+            };
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_Z_NODE_READ_ERROR",
+                code_of(&fe),
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => Err(fe),
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
+        }
+    };
+    let shift_id = match shift_id {
+        Some(s) => s,
+        None => {
+            let fe = FiscalError::ShiftNotOpen { request_id };
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_Z_NO_OPEN_SHIFT",
+                code_of(&fe),
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => Err(fe),
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
+        }
+    };
+
+    // C10 quiescence gate (INV #8 — Z closes only via the C10 gate).  quiesce +
+    // aggregate are benign PRE-guard: quiesce only inline-finalizes the leading
+    // contiguous KVT2 run (short tx, no IO/crypto), aggregate is read-only — the
+    // shift-state guard (Z@Opened) runs at stage_acquire below.
+    match quiesce_shift_before_z(pool, &fiscal_number, shift_id).await {
+        Ok(QuiescenceOutcome::Clear) => {}
+        Ok(QuiescenceOutcome::Pending { blocking }) => {
+            // STOP-S6 ruling (B): the retryable Z-quiescence-pending is CARRIED
+            // on `OfflineRefused{Z_QUIESCENCE_PENDING}` (503) for boundary
+            // discipline — a dedicated `FiscalError::QuiescencePending` variant +
+            // a handler-aware SAME-KEY retry is a NAMED RESIDUAL (option C,
+            // co-scoped with the recovery increment).  Seam obligation:
+            // terminalise the inbox REJECTED (a same-key replay then resolves to
+            // 500 INBOX_REJECTED — NOT "shift closed with error"; no Z issued).
+            // Client contract: retry the close with a NEW idempotency key after
+            // the runtime drives the blockers issued.
+            let fe = FiscalError::OfflineRefused {
+                request_id,
+                code: codes::Z_QUIESCENCE_PENDING,
+            };
+            // Forensic (best-effort, S6 condition 2): which docs blocked the Z.
+            let blockers: Vec<serde_json::Value> = blocking
+                .iter()
+                .map(|(id, st)| {
+                    serde_json::json!({
+                        "document_id": hex_encode_lower(id.as_bytes()),
+                        "state": st.as_str(),
+                    })
+                })
+                .collect();
+            let payload = serde_json::json!({
+                "blocking": blockers,
+                "code": codes::Z_QUIESCENCE_PENDING,
+            })
+            .to_string();
+            let _ = audit_log::append(
+                pool,
+                "ingress_inbox",
+                &hex_encode_lower(&request_id),
+                "INLINE_Z_QUIESCENCE_PENDING",
+                Severity::Warning,
+                None,
+                Some(&payload),
+            )
+            .await;
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_Z_QUIESCENCE_PENDING",
+                code_of(&fe),
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => Err(fe),
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
+        }
+        Err(_e) => {
+            let fe = FiscalError::Internal {
+                request_id,
+                code: codes::Z_DISPATCH_INTERNAL,
+            };
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_Z_QUIESCENCE_ERROR",
+                code_of(&fe),
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => Err(fe),
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
+        }
+    }
+
+    // Aggregate the quiesced shift's receipts into the signer-ready Z body.
+    let aggregated = match aggregate_z_payload_for_shift(pool, &fiscal_number, shift_id).await {
+        Ok(a) => a,
+        Err(_e) => {
+            let fe = FiscalError::Internal {
+                request_id,
+                code: codes::Z_DISPATCH_INTERNAL,
+            };
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_Z_AGGREGATE_ERROR",
+                code_of(&fe),
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => Err(fe),
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
+        }
+    };
+
+    // Build the Z canonical (D5 dual-hash: source = wire-intent hash, canonical
+    // = the recomputed aggregated-body hash).
+    let command = match build_z_canonical(row, &aggregated) {
+        Ok(c) => c,
+        Err(reject) => {
+            let fe = map_build_reject(&reject, request_id);
+            return match terminalise_inbox_pre_acquire(
+                pool,
+                row,
+                "INLINE_Z_BUILD_REJECT",
+                code_of(&fe),
+            )
+            .await?
+            {
+                PreAcquireTerminalise::Terminalised => Err(fe),
+                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
+            };
+        }
+    };
+
+    run_staged(pool, pool_secure, dps, sign_ctx, fn_sign, row, command).await
 }
 
 #[cfg(test)]

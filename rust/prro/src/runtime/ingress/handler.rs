@@ -169,7 +169,11 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         // A.3 PR-C (D5 gate) — an older non-issued sibling rests on the FN;
         // transient RETRYABLE refusal (the online_convergence resolver
         // re-drives the blocker, then the client retries), NOT a 5xx breach.
-        | "WRITE_GATE_SIBLING_PENDING" => 503,
+        | "WRITE_GATE_SIBLING_PENDING"
+        // PR-Z2 (STOP-S6 ruling B) — a live Z hit C10 quiescence-pending: the
+        // shift still has in-flight receipts.  RETRYABLE 503; the operator
+        // retries the close with a NEW idempotency key after the blockers drain.
+        | "Z_QUIESCENCE_PENDING" => 503,
         // ledger/internal faults → 500.  SIGN_FAILED is the RS-3 sign-path
         // fault (a real crypto-operation failure, not a node-mode shift).
         // RS-3 A2 (T2/T3): `Internal{code}` carries a structural/runtime-breach

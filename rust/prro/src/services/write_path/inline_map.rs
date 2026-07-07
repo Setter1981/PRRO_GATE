@@ -58,10 +58,23 @@ pub(crate) mod codes {
     /// RETRYABLE/transient (the `online_convergence` resolver re-drives the
     /// blocker, then the client retries) → 503, NOT terminal.
     pub const WRITE_GATE_SIBLING_PENDING: &str = "WRITE_GATE_SIBLING_PENDING";
+    /// PR-Z2 — a live Z was submitted while the shift still has in-flight
+    /// receipts (C10 quiescence pending).  RETRYABLE → 503.  STOP-S6 ruling (B):
+    /// carried on `OfflineRefused` for boundary discipline (no ingress/seam
+    /// change) — a dedicated `FiscalError::QuiescencePending` variant + a
+    /// handler-aware SAME-KEY retry is a NAMED RESIDUAL (option C, co-scoped with
+    /// the recovery increment).  Client contract: retry the shift-close with a
+    /// NEW idempotency key after the runtime drains the blockers; the SAME key
+    /// then resolves to 500 `INBOX_REJECTED` (NOT "shift closed with error" — no
+    /// Z was ever issued).
+    pub const Z_QUIESCENCE_PENDING: &str = "Z_QUIESCENCE_PENDING";
 
     // ── Internal → 500 (structural/runtime breaches; → 500 via the handler's
     //    `_ => 500` fallback except SHIFT_MANUAL_RECON which is explicit) ──
     pub const SHIFT_MANUAL_RECON: &str = "SHIFT_MANUAL_RECON";
+    /// PR-Z2 — an internal fault in the online Z-dispatch prefix (node_state
+    /// read / quiescence infra / aggregation) → 500 (via the `_ => 500` fallback).
+    pub const Z_DISPATCH_INTERNAL: &str = "Z_DISPATCH_INTERNAL";
     pub const SHIFT_IN_ERROR: &str = "SHIFT_IN_ERROR";
     pub const SHIFT_INVARIANT_VIOLATION: &str = "SHIFT_INVARIANT_VIOLATION";
     pub const MISSING_PROFILE_BINDING: &str = "MISSING_PROFILE_BINDING";
