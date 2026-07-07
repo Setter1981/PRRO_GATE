@@ -174,6 +174,15 @@ fn shift_open_only_dps() -> Arc<dyn DpsChannel> {
     )
 }
 
+/// Registry DPS acking each ONLINE binding doc in `sfns` order (send_chk +
+/// last_chk each) — the combined gate drives SHIFT_OPEN + one online SELL + Z
+/// through the binding.
+fn online_dps(sfns: &[&str]) -> Arc<dyn DpsChannel> {
+    let sends = sfns.iter().map(|s| Ok(ack(s))).collect::<Vec<_>>();
+    let lasts = sfns.iter().map(|s| Ok(kvt1(s))).collect::<Vec<_>>();
+    Arc::new(StubDpsChannel::with_queue(sends).with_last_chk_queue(lasts))
+}
+
 fn entry(op: &str, payload: &str, idem: &str, total: Option<i64>) -> NewInboxEntry {
     let request_id: [u8; 16] = *RequestId::new().as_bytes();
     let payload_sha256_canonical: [u8; 32] = Sha256::digest(payload.as_bytes()).into();
@@ -394,5 +403,160 @@ async fn pilot_offline_full_drill_go_offline_sell_return_go_online_drain_converg
     );
 
     // Everything rests terminal + converged — the ledger scan is CLEAN.
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+}
+
+async fn issued_receipt_count_on_shift(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents \
+         WHERE fiscal_number = ? AND state = 'ACK' AND doc_type IN ('SELL', 'RETURN')",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn z_report_payload(pool: &SqlitePool) -> serde_json::Value {
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload_json FROM fiscal_documents \
+         WHERE fiscal_number = ? AND doc_type = 'Z_REPORT' ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    serde_json::from_str(&payload).unwrap()
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// COMBINED PILOT GATE — the A+A′ phase-exit capstone
+// ════════════════════════════════════════════════════════════════════════
+
+/// The full phase-exit scenario in ONE lifecycle: boot → online SHIFT_OPEN →
+/// online SELL → GO_OFFLINE → offline SELL + RETURN → GO_ONLINE → drain →
+/// Z-close. Load-bearing pin: the Z after the drain aggregates BOTH cohorts —
+/// the online-issued SELL AND the drained-offline SELL — so its `sell_count`
+/// is 2, not 1. (If the drained-offline cohort were missed, sell_count would be
+/// the online-only 1.) Teeth: reverting `FULL_OFFLINE_SURFACE_READY=false` REDs
+/// the offline leg (GO_OFFLINE refuses) while the online-half legs still pass.
+#[tokio::test]
+async fn combined_pilot_gate_online_and_offline_cohorts_in_one_shift() {
+    let app = boot_app().await;
+    // Online binding acks, in drive order: SHIFT_OPEN, online SELL, Z_REPORT.
+    let registry = build_registry(
+        &app,
+        online_dps(&["DPS-CG-OPEN", "DPS-CG-SELL", "DPS-CG-Z"]),
+    )
+    .await;
+    seed_boot_baseline(app.db()).await;
+    let write_path = production_write_path(app.clone(), Arc::new(registry));
+
+    // 1) online SHIFT_OPEN + 2) an ONLINE SELL (issued online → ACK).
+    let open = drive(
+        &*write_path,
+        app.db(),
+        entry("SHIFT_OPEN", SHIFT_OPEN_PAYLOAD, "idem-cg-OPEN", None),
+    )
+    .await
+    .expect("SHIFT_OPEN");
+    assert_eq!(open.document_state, DocState::Ack);
+    let online_sell = drive(
+        &*write_path,
+        app.db(),
+        entry("SELL", SELL_PAYLOAD, "idem-cg-ONLINE-SELL", Some(TOTAL_KOP)),
+    )
+    .await
+    .expect("online SELL");
+    assert_eq!(
+        online_sell.document_state,
+        DocState::Ack,
+        "online SELL issued"
+    );
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+
+    // 3) GO_OFFLINE + offline SELL + RETURN (cohort 2, held at OLA).
+    prro::admin::go_offline(app.db(), FN, "net drop")
+        .await
+        .expect("live GO_OFFLINE");
+    prro::admin::seed_offline_codes(app.db(), FN, 3000, 3005, "cabinet range")
+        .await
+        .expect("seed codes");
+    drive(
+        &*write_path,
+        app.db(),
+        entry("SELL", SELL_PAYLOAD, "idem-cg-OFF-SELL", Some(TOTAL_KOP)),
+    )
+    .await
+    .expect("offline SELL");
+    drive(
+        &*write_path,
+        app.db(),
+        entry(
+            "RETURN",
+            SELL_PAYLOAD,
+            "idem-cg-OFF-RETURN",
+            Some(TOTAL_KOP),
+        ),
+    )
+    .await
+    .expect("offline RETURN");
+
+    // 4) GO_ONLINE + drain → both cohorts now terminal ACK on the shift.
+    prro::admin::go_online(app.db(), FN, "dps restored")
+        .await
+        .expect("live GO_ONLINE");
+    let carriers = drain_carriers();
+    let view = drain_view(&carriers);
+    let summary = match app
+        .drain_offline_backlog_scheduled(FN, &view)
+        .await
+        .expect("drain runs")
+    {
+        ScheduledDrainOutcome::Ran(s) => s,
+        ScheduledDrainOutcome::SkippedBackoff { .. } => panic!("drain must run"),
+    };
+    assert_eq!(summary.advanced_to_ack(), 2, "offline cohort drains to ACK");
+    drop(carriers);
+    assert_eq!(node_row(app.db()).await.0, "ONLINE");
+    assert_eq!(
+        issued_receipt_count_on_shift(app.db()).await,
+        3,
+        "1 online SELL + 1 drained-offline SELL + 1 drained-offline RETURN"
+    );
+
+    // 5) online Z_REPORT closes the shift, aggregating BOTH cohorts.
+    let z = drive(
+        &*write_path,
+        app.db(),
+        entry("Z_REPORT", r#"{}"#, "idem-cg-Z", None),
+    )
+    .await
+    .expect("Z_REPORT closes the shift");
+    assert_eq!(z.document_state, DocState::Ack, "Z issued");
+    assert_eq!(shift_state(app.db()).await, "CLOSED");
+
+    // LOAD-BEARING both-cohort pin: the Z aggregation counted the online SELL
+    // AND the drained-offline SELL + RETURN — not just the online cohort.
+    // (If the drained-offline cohort were missed, sell_count would be 1 and
+    // sum_in_kop would be 15000.)
+    let z_payload = z_report_payload(app.db()).await;
+    assert_eq!(
+        z_payload["sell_count"], 2,
+        "2 sells counted: online + drained-offline"
+    );
+    assert_eq!(
+        z_payload["return_count"], 1,
+        "1 drained-offline return counted"
+    );
+    assert_eq!(
+        z_payload["payments"][0]["sum_in_kop"], 30000,
+        "turnover reflects BOTH sells (2 x 15000)"
+    );
+    assert_eq!(
+        z_payload["payments"][0]["sum_out_kop"], 15000,
+        "turnover reflects the drained-offline return"
+    );
+
     prro::db::invariant_scan::assert_clean(app.db()).await;
 }
