@@ -1,9 +1,19 @@
 //! `prro doctor` — preflight checks for config, DB, lock, listen address.
+//!
+//! Extended with an optional `--live` section (see `live` submodule):
+//! FormTest-parity READ-ONLY diagnostics against the live DPS.  The live
+//! section runs ONLY when `live_args` is `Some`; without it the function
+//! is behaviorally identical to the original single-arg version
+//! (regression-pinned in `tests/doctor_smoke.rs` and
+//! `tests/doctor_live_verdicts.rs`).
+
+pub mod live;
+pub use live::LiveArgs;
 
 use crate::config::AppConfig;
 use std::path::Path;
 
-pub async fn run(config_path: &Path) -> anyhow::Result<()> {
+pub async fn run(config_path: &Path, live_args: Option<LiveArgs>) -> anyhow::Result<()> {
     println!("== prro doctor ==");
 
     // 1. Config file readable + parses.
@@ -62,8 +72,14 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
     println!("[OK]  admin_ui.listen: {}", cfg.admin_ui.listen);
 
     drop(secure_pool);
+    println!("== ALL LOCAL CHECKS PASSED ==");
+
+    // 6. Live DPS section — only when --live is supplied.
+    if let Some(args) = live_args {
+        live::run_live_from_env(&pool, &args).await?;
+    }
+
     drop(pool);
     drop(lock);
-    println!("== ALL CHECKS PASSED ==");
     Ok(())
 }
