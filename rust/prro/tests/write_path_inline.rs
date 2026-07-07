@@ -44,6 +44,11 @@ const SERVER_FISCAL_NO: &str = "DPS-FN-ONLINE-1";
 const SELL_PAYLOAD: &str = r#"{"items":[{"code":"item-1","name":"Test item","price_kop":15000,"quantity_thousandths":1000,"sum_kop":15000}],"payments":[{"name":"Cash","sum_kop":15000,"type_code":"0"}]}"#;
 const TOTAL_KOP: i64 = 15000;
 
+/// A live SHIFT_OPEN's write-path payload is the converted `ShiftOpenJson`
+/// (`stage_sign.rs`) — `{opening_sum_kop}`, NOT a CheckJson.  `total_sum_kop`
+/// is `None` (build_canonical requires it only for SELL/RETURN).
+const SHIFT_OPEN_PAYLOAD: &str = r#"{"opening_sum_kop":0}"#;
+
 // ─── Dual-queue DPS stub: send_chk then last_chk ────────────────────────
 
 struct DualStub {
@@ -269,6 +274,59 @@ async fn seed_inbox_op(pool: &SqlitePool, operation_type: &str) -> InboxRow {
         business_ts: Some("2026-06-09T12:00:00Z".into()),
         total_sum_kop: Some(TOTAL_KOP),
     }
+}
+
+/// Seed a NEW SHIFT_OPEN inbox row (the live write-path shape: `ShiftOpenJson`
+/// payload, `total_sum_kop = None`) + return the matching [`InboxRow`].
+async fn seed_inbox_shift_open(pool: &SqlitePool) -> InboxRow {
+    let req_id = RequestId::new();
+    let request_id: [u8; 16] = *req_id.as_bytes();
+    let payload_sha256_canonical: [u8; 32] = Sha256::digest(SHIFT_OPEN_PAYLOAD.as_bytes()).into();
+    let idempotency_key = "idem-a2-z2-shift-open".to_string();
+    inbox::insert(
+        pool,
+        &NewInboxEntry {
+            request_id,
+            fiscal_number: FN.into(),
+            protocol: Protocol::Rest,
+            operation_type: "SHIFT_OPEN".into(),
+            idempotency_key: idempotency_key.clone(),
+            payload_json: SHIFT_OPEN_PAYLOAD.into(),
+            payload_sha256_canonical,
+            correlation_id: None,
+            signed_by_cashier_id: Some(CASHIER.into()),
+            driver_id: Some(DRIVER.into()),
+            business_ts: Some("2026-06-09T12:00:00Z".into()),
+            total_sum_kop: None,
+        },
+    )
+    .await
+    .unwrap();
+    InboxRow {
+        request_id,
+        fiscal_number: FN.into(),
+        protocol: Protocol::Rest,
+        operation_type: "SHIFT_OPEN".into(),
+        idempotency_key,
+        status: "NEW".into(),
+        payload_json: SHIFT_OPEN_PAYLOAD.into(),
+        payload_sha256_canonical,
+        correlation_id: None,
+        received_at: "2026-06-09T12:00:00Z".into(),
+        signed_by_cashier_id: Some(CASHIER.into()),
+        driver_id: Some(DRIVER.into()),
+        business_ts: Some("2026-06-09T12:00:00Z".into()),
+        total_sum_kop: None,
+    }
+}
+
+/// Read the shift's state for the seeded FN (one shift per SHIFT_OPEN test pool).
+async fn read_shift_state(pool: &SqlitePool, fiscal_number: &str) -> String {
+    sqlx::query_scalar("SELECT state FROM shifts WHERE fiscal_number = ?")
+        .bind(fiscal_number)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 /// Read the inbox row's status for the seeded FN (one row per test pool).
@@ -644,16 +702,57 @@ async fn z_report_is_fail_closed_and_terminalises_inbox() {
     assert_eq!(docs, 0, "fail-closed must mint NO fiscal_documents");
 }
 
-/// **A2.1b-core incr.5 — SHIFT_OPEN is fail-closed (422) + terminalises the
-/// inbox.** SHIFT_OPEN is out of the SELL/RETURN core (A2.2 owns it):
-/// `ShiftGuardRefused{SHIFT_OPEN_NOT_SUPPORTED}` (422), inbox REJECTED+audited,
-/// no fiscal_documents. The 422 mapping is pinned by inline_map's round-trip test.
+/// **PR-Z2 step 1 — an online SHIFT_OPEN drives the full inline chain to
+/// terminal ACK** (the orchestrator now routes it through the same happy-path
+/// stages as a SELL — edge 1 Created→Opening at acquire, edge 3 Opening→Opened
+/// confirmed at send). The shift lands `OPENED`, the doc lands `ACK`, the inbox
+/// `DONE`. RED before the fail-closed SHIFT_OPEN arm was removed (it returned
+/// 422 SHIFT_OPEN_NOT_SUPPORTED).
 #[tokio::test]
-async fn shift_open_is_fail_closed_and_terminalises_inbox() {
+async fn online_shift_open_reaches_ack() {
     let pool = fresh_pool().await;
     let pool_secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
-    let row = seed_inbox_op(&pool, "SHIFT_OPEN").await;
+    // SHIFT_OPEN guard requires no open shift (shift_state Closed).
+    seed_node_state(&pool, NodeMode::Online, ShiftState::Closed).await;
+    let row = seed_inbox_shift_open(&pool).await;
+
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect("online SHIFT_OPEN must reach a terminal ACK FiscalOutcome");
+
+    assert_eq!(
+        outcome.document_state,
+        prro::db::models::enums::DocState::Ack
+    );
+    assert_eq!(outcome.fiscal_id.as_deref(), Some(SERVER_FISCAL_NO));
+    assert_eq!(read_doc_state(&pool, FN).await, "ACK");
+    // Edge 1 (Created→Opening at acquire) + edge 3 (Opening→Opened at send).
+    assert_eq!(read_shift_state(&pool, FN).await, "OPENED");
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "DONE");
+}
+
+/// **PR-Z2 step 1 — a live SHIFT_OPEN while a shift is already OPENED is refused
+/// by the REAL shift guard** (`SHIFT_ALREADY_OPEN` 422, inbox REJECTED, no
+/// fiscal_documents) — the guard matrix governs SHIFT_OPEN now, not the removed
+/// fail-closed stub. Proves the refusal path routes through the orchestrator.
+#[tokio::test]
+async fn online_shift_open_while_open_is_shift_already_open() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await; // shift already OPENED
+    let row = seed_inbox_shift_open(&pool).await;
 
     let dps = DualStub::new(
         Ok(ack(SERVER_FISCAL_NO, vec![])),
@@ -666,25 +765,18 @@ async fn shift_open_is_fail_closed_and_terminalises_inbox() {
 
     let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
         .await
-        .expect_err("SHIFT_OPEN is fail-closed (422) in the SELL/RETURN core");
+        .expect_err("SHIFT_OPEN on an already-open shift must be guard-refused");
     match err {
-        FiscalError::ShiftGuardRefused { code, .. } => {
-            assert_eq!(code, "SHIFT_OPEN_NOT_SUPPORTED");
-        }
-        other => panic!("expected ShiftGuardRefused{{SHIFT_OPEN_NOT_SUPPORTED}}, got {other:?}"),
+        FiscalError::ShiftGuardRefused { code, .. } => assert_eq!(code, "SHIFT_ALREADY_OPEN"),
+        other => panic!("expected ShiftGuardRefused{{SHIFT_ALREADY_OPEN}}, got {other:?}"),
     }
     assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
-    assert_eq!(
-        audit_count(&pool, "INLINE_SHIFT_OPEN_NOT_SUPPORTED").await,
-        1
-    );
-    // Review TA-4 pin: the audit payload's code == the returned error's code
-    // (audit ↔ error agree by construction via code_of).
-    let payload = audit_latest_payload(&pool, "INLINE_SHIFT_OPEN_NOT_SUPPORTED")
+    // No fiscal_documents minted on a pre-acquire guard refusal.
+    let doc_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents")
+        .fetch_one(&pool)
         .await
-        .expect("terminalise audit carries a payload");
-    assert_eq!(payload["code"], "SHIFT_OPEN_NOT_SUPPORTED");
-    assert_eq!(payload["operation_type"], "SHIFT_OPEN");
+        .unwrap();
+    assert_eq!(doc_count, 0, "a guard-refused SHIFT_OPEN mints no doc");
 }
 
 /// **A2.1b-core incr.5b — stage_acquire Rejected: map ONLY, NO double-terminalise

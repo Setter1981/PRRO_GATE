@@ -503,11 +503,14 @@ pub async fn run(
 ) -> Result<FiscalOutcome, FiscalError> {
     let request_id = row.request_id;
 
-    // A2.1b-core is SELL/RETURN only. Z-class (Z_REPORT/SHIFT_CLOSE) and
-    // SHIFT_OPEN are fail-closed BEFORE build/acquire — the inbox is still
-    // NEW, so the pre-acquire terminalise leases+REJECTs atomically (no
-    // fiscal_documents minted); on a race (row not NEW) it resolves against
-    // the ledger.
+    // PR-Z2 (online-half): SELL/RETURN **and** SHIFT_OPEN route live through the
+    // happy-path stages below (SHIFT_OPEN reuses the same acquire→sign→send→
+    // confirm→advance chain — the stages are doc-type-aware: acquire fires
+    // edge 1 Created→Opening, send confirms edge 3 Opening→Opened).  Z-class
+    // (Z_REPORT/SHIFT_CLOSE) stays fail-closed BEFORE build/acquire until the
+    // Z-dispatch arm lands (next PR-Z2 step) — the inbox is still NEW, so the
+    // pre-acquire terminalise leases+REJECTs atomically (no fiscal_documents
+    // minted); on a race (row not NEW) it resolves against the ledger.
     match row.operation_type.as_str() {
         "Z_REPORT" | "SHIFT_CLOSE" => {
             // Bound to the real live-Z surface gate (not theatrical): it is
@@ -538,22 +541,7 @@ pub async fn run(
                 PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
             };
         }
-        "SHIFT_OPEN" => {
-            return match terminalise_inbox_pre_acquire(
-                pool,
-                row,
-                "INLINE_SHIFT_OPEN_NOT_SUPPORTED",
-                codes::SHIFT_OPEN_NOT_SUPPORTED,
-            )
-            .await?
-            {
-                PreAcquireTerminalise::Terminalised => Err(FiscalError::ShiftGuardRefused {
-                    request_id,
-                    code: codes::SHIFT_OPEN_NOT_SUPPORTED,
-                }),
-                PreAcquireTerminalise::NotNew => resolve_against_ledger(pool, request_id).await,
-            };
-        }
+        // SHIFT_OPEN falls through to the live happy-path stages below.
         _ => {}
     }
 
