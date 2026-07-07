@@ -593,9 +593,11 @@ pub async fn run(
             //            the tax_snapshot INSERT + lnd alloc + doc mint, so the
             //            refusal consumes no lnd and writes no row (audit_log
             //            only — the pre-acquire-refusal persistence class).
-            //            Online-only: offline SHIFT_OPEN create is piece 4.
+            //            A′.3 PR-O3: channel-agnostic — §16.8
+            //            1-cashier-per-shift applies to the offline SHIFT_OPEN
+            //            (edge 2) too, so the offline create arm below can
+            //            safely `.expect` a cashier (no write-path panic).
             if command.doc_type == DocType::ShiftOpen
-                && channel == Channel::Online
                 && command.signed_by_cashier_id.is_none()
             {
                 return reject(
@@ -695,9 +697,9 @@ pub async fn run(
             //           create + transition + doc-INSERT commit atomically:
             //           no `CREATED`/`Opening` shift ever rests without its
             //           SHIFT_OPEN doc, and any post-create failure rolls the
-            //           shift back with the envelope.  Online channel ONLY —
-            //           offline SHIFT_OPEN create is piece 4
-            //           (`stage_offline_ack`).  Placed AFTER the `document_id`
+            //           shift back with the envelope.  A′.3 PR-O3 adds the
+            //           OFFLINE arm below (edge 2, Created →
+            //           OpenedLocalPendingDrain).  Placed AFTER the `document_id`
             //           mint (edge 1's `shift_id` is derived from it) and
             //           BEFORE the doc INSERT (the shifts row must exist for
             //           the `fiscal_documents.shift_id` FK).  The guard matrix
@@ -761,7 +763,44 @@ pub async fn run(
                     _ => None,
                 }
             } else {
-                None
+                // A′.3 PR-O3 — OFFLINE shift-lifecycle arm (mirror of the
+                // online block above).  Slice 1 wires edge 2 only; the offline
+                // close edges (7/9) land in slice 2.
+                match command.doc_type {
+                    // Edge 2: fresh offline SHIFT_OPEN accept (guard already
+                    // proved `shift_state == Closed`) → mint the shift
+                    // `CREATED` and drive `Created → OpenedLocalPendingDrain`
+                    // (the Pattern-C offline-open destination, vs edge 1's
+                    // `Opening`).  Cashier is `Some` by the Step 6b′ refusal
+                    // (channel-agnostic since PR-O3).  The doc binds here, then
+                    // local-acks + consumes an offline code in
+                    // `stage_offline_ack` (numbering (ii)); it drains to ACK
+                    // later, driving edge 5 (`OpenedLocalPendingDrain → Opened`).
+                    DocType::ShiftOpen => {
+                        let opener = command
+                            .signed_by_cashier_id
+                            .as_ref()
+                            .expect("Step 6b′ refuses ShiftOpen with no cashier")
+                            .as_str();
+                        let shift_id = ShiftId::deterministic_for_shift_open(document_id);
+                        transition::create_shift_tx(tx, &fn_id, shift_id, "OFFLINE", opener)
+                            .await?;
+                        expect_applied(
+                            transition::apply_shift_transition(
+                                tx,
+                                &fn_id,
+                                shift_id,
+                                ShiftState::Created,
+                                ShiftState::OpenedLocalPendingDrain,
+                            )
+                            .await?,
+                            "edge2 Created→OpenedLocalPendingDrain",
+                            shift_id,
+                        )?;
+                        Some(shift_id)
+                    }
+                    _ => None,
+                }
             };
 
             let new_doc = NewDocument {

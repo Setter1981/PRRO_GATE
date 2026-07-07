@@ -1,6 +1,13 @@
 //! A′.1 Phase C piece 3 — stage_acquire online shift-create (edge 1) +
-//! Opened→Closing (edge 8), plus the P6-ruling fail-closed refusal of an
-//! online SHIFT_OPEN with no cashier identity.
+//! Opened→Closing (edge 8), plus the P6-ruling fail-closed refusal of a
+//! SHIFT_OPEN with no cashier identity.
+//!
+//! A′.3 PR-O3 slice 1 extends this catalog to the OFFLINE channel:
+//!   - (g) INVERTED from the pre-O3 "offline writes no shift" pin to the
+//!     edge-2 create (`Created → OpenedLocalPendingDrain`) — offline
+//!     shift-create is no longer deferred to offline-ack.
+//!   - (j) offline SHIFT_OPEN missing-cashier refusal (mirror of (i)) —
+//!     the Step-6b′ pre-mint refusal is now channel-agnostic (§16.8).
 //!
 //! Drives `stage_acquire::run` directly (same idiom as
 //! `write_path_stage1_acquire.rs`) and asserts BOTH the `WorkerProcessResult`
@@ -8,8 +15,8 @@
 //! binding + lnd + audit), with explicit attention to the pre-mint /
 //! four-negation discipline for the cashier refusal.
 //!
-//! Contract tests (a)-(h) + ruling addition (i). Two hooks only; the
-//! guard matrix (`check_shift_guard`) is untouched.
+//! Contract tests (a)-(h) + ruling addition (i) + PR-O3 (g-inversion, j).
+//! Two hooks only; the guard matrix (`check_shift_guard`) is untouched.
 
 use prro::db::models::enums::{DocType, FiscalMode, NodeMode, ShiftState};
 use prro::db::models::ids::{DocumentId, RequestId, ShiftId};
@@ -480,9 +487,13 @@ async fn f_sell_at_opening_is_refused_inv03() {
     assert_eq!(next_lnd(&pool).await, 1);
 }
 
-// ─── (g) offline-mode SHIFT_OPEN → zero shift-writes (channel negative) ──
+// ─── (g) edge 2 — fresh offline SHIFT_OPEN creates+opens shift at
+//         OpenedLocalPendingDrain atomically.  A′.3 PR-O3 INVERTS the
+//         pre-O3 "offline writes no shift" pin: create is no longer
+//         deferred to offline-ack — the offline channel mirrors edge 1
+//         but drives `Created → OpenedLocalPendingDrain` (Pattern C). ──
 #[tokio::test]
-async fn g_offline_shift_open_writes_no_shift() {
+async fn g_offline_shift_open_creates_opened_local_pending_drain_and_binds_doc() {
     let pool = fresh_pool().await;
     let secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
@@ -498,23 +509,33 @@ async fn g_offline_shift_open_writes_no_shift() {
     )
     .await
     .unwrap();
-    // acquire proceeds on the offline channel (create is piece 4, offline-ack)
-    assert!(
-        matches!(result, WorkerProcessResult::Proceed(_)),
-        "got {result:?}"
-    );
-    // …but NO online shift-create fired
+    let ctx = match result {
+        WorkerProcessResult::Proceed(c) => c,
+        other => panic!("expected Proceed, got {other:?}"),
+    };
+    let doc_id = ctx.document.document_id;
+    let expected = ShiftId::deterministic_for_shift_open(doc_id);
+
+    // one shifts row, CREATED→OPENED_LOCAL_PENDING_DRAIN (edge 2 atomic with create)
+    assert_eq!(shift_count(&pool).await, 1);
     assert_eq!(
-        shift_count(&pool).await,
-        0,
-        "no shifts row on offline channel"
+        shift_state_by_id(&pool, expected).await.as_deref(),
+        Some("OPENED_LOCAL_PENDING_DRAIN")
     );
+    // node_state projection mirrored + pointer set to the deterministic id
+    assert_eq!(node_shift_state(&pool).await, "OPENED_LOCAL_PENDING_DRAIN");
     assert_eq!(
-        node_shift_state(&pool).await,
-        "CLOSED",
-        "projection untouched"
+        node_current_shift_id(&pool).await.as_deref(),
+        Some(expected.as_bytes().as_slice())
     );
-    assert_eq!(node_current_shift_id(&pool).await, None);
+    // doc bound to the new shift
+    assert_eq!(
+        doc_shift_id(&pool, doc_id).await.as_deref(),
+        Some(expected.as_bytes().as_slice())
+    );
+    // §16.8 parity (channel-agnostic): opener == command signer
+    assert_eq!(shift_opener_by_id(&pool, expected).await, CASHIER);
+    assert_eq!(next_lnd(&pool).await, 2, "lnd consumed on the happy path");
 }
 
 // ─── (h) crash-atomicity: post-create failure rolls the shift back ──────
@@ -597,5 +618,51 @@ async fn i_online_shift_open_missing_cashier_is_refused_premint() {
     );
     assert_eq!(next_lnd(&pool).await, 1, "lnd not consumed");
     // audit event present
+    assert_eq!(audit_count(&pool, "SHIFT_OPEN_MISSING_CASHIER").await, 1);
+}
+
+// ─── (j) edge 2 guard — offline SHIFT_OPEN with no cashier →
+//         ShiftOpenMissingCashier (A′.3 PR-O3: §16.8 1-cashier-per-shift
+//         is channel-agnostic, so the Step-6b′ pre-mint refusal now
+//         covers offline too — the offline create arm can safely
+//         `.expect` a cashier without a write-path panic).  Mirror of (i). ─
+#[tokio::test]
+async fn j_offline_shift_open_missing_cashier_is_refused_premint() {
+    let pool = fresh_pool().await;
+    let secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    seed_node_state(&pool, NodeMode::Offline, ShiftState::Closed, None).await;
+    let req = seed_inbox(&pool, DocType::ShiftOpen, None).await;
+
+    let result = stage_acquire::run(&pool, &secure, DRIVER, req, cmd(DocType::ShiftOpen, None))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::ShiftOpenMissingCashier
+            }
+        ),
+        "got {result:?}"
+    );
+    // four negations: no doc / no shift / no node_state change / no lnd
+    assert_eq!(
+        doc_count(&pool).await,
+        0,
+        "no doc minted (pre-mint refusal)"
+    );
+    assert_eq!(shift_count(&pool).await, 0, "no shifts row");
+    assert_eq!(
+        node_shift_state(&pool).await,
+        "CLOSED",
+        "shift_state untouched"
+    );
+    assert_eq!(
+        node_current_shift_id(&pool).await,
+        None,
+        "pointer untouched"
+    );
+    assert_eq!(next_lnd(&pool).await, 1, "lnd not consumed");
     assert_eq!(audit_count(&pool, "SHIFT_OPEN_MISSING_CASHIER").await, 1);
 }

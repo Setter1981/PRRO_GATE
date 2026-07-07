@@ -283,8 +283,13 @@ pub async fn run(
                     ns.shift_state,
                     ShiftState::Opened | ShiftState::OpenedLocalPendingDrain,
                 ),
-                // SHIFT_OPEN / SHIFT_CLOSE / Z_REPORT and any other
-                // doc type stay scoped to Opened only — non-regular
+                // A′.3 PR-O3 edge-2 tail: an offline SHIFT_OPEN doc local-acks
+                // in the state edge 2 leaves the shift in
+                // (`OpenedLocalPendingDrain`), consuming an offline code like a
+                // receipt (numbering (ii)).
+                DocType::ShiftOpen => ns.shift_state == ShiftState::OpenedLocalPendingDrain,
+                // SHIFT_CLOSE / Z_REPORT (edges 7/9 — PR-O3 slice 2) and any
+                // other doc type stay scoped to Opened only here — non-regular
                 // fiscal docs do NOT participate in the §3.7 widening.
                 _ => ns.shift_state == ShiftState::Opened,
             };

@@ -800,13 +800,19 @@ async fn applied_path_works_with_opened_local_pending_drain_for_return() {
     assert_eq!(fetch_doc_state(&pool, doc_id).await, "OFFLINE_LOCAL_ACK");
 }
 
-/// §3.7 defence-in-depth (operator correction #4): non-fiscal doc
-/// types (SHIFT_OPEN here) MUST NOT participate in widening — they
-/// stay scoped to `Opened` only.  Verifies stage_offline_ack reads
-/// doc_type internally and does NOT trust upstream stage_acquire's
-/// filtering.
+/// A′.3 PR-O3 edge-2 tail (numbering (ii)) — INVERTS the pre-O3
+/// negative-pin: the offline SHIFT_OPEN doc, minted + driven to
+/// `OpenedLocalPendingDrain` by stage_acquire (edge 2), reaches
+/// stage_offline_ack and local-acks like a receipt (Signed →
+/// OfflineLocalAck), consuming one offline code.  Step-3 is widened to
+/// admit `ShiftOpen` specifically in `OpenedLocalPendingDrain` (the
+/// state edge 2 leaves the shift in).  Still defence-in-depth:
+/// stage_offline_ack reads doc_type + shift_state internally (a
+/// `ShiftOpen` in any OTHER state falls through the `_` arm and is
+/// still refused; SHIFT_CLOSE / Z_REPORT stay Opened-scoped until
+/// slice 2).
 #[tokio::test]
-async fn refusal_shift_open_on_opened_local_pending_drain_returns_shift_not_opened() {
+async fn applied_path_works_with_opened_local_pending_drain_for_shift_open() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(
         &pool,
@@ -822,14 +828,12 @@ async fn refusal_shift_open_on_opened_local_pending_drain_returns_shift_not_open
 
     let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
     match outcome {
-        OfflineAckOutcome::Refused(RefusalReason::ShiftNotOpened { current }) => {
-            assert_eq!(current, ShiftState::OpenedLocalPendingDrain);
-        }
-        other => panic!("non-regular doc_type MUST NOT get widened path, got {other:?}"),
+        OfflineAckOutcome::Applied { code_lnd, .. } => assert_eq!(code_lnd, 44),
+        other => panic!("offline SHIFT_OPEN in OLPD must local-ack (edge-2 tail), got {other:?}"),
     }
-    // Defence-in-depth verified: doc stays SIGNED, no code consumed.
-    assert_eq!(fetch_doc_state(&pool, doc_id).await, "SIGNED");
-    assert_eq!(fetch_consumed_count(&pool, FN).await, 0);
+    // Local-ack'd like a receipt: doc flips OFFLINE_LOCAL_ACK, one code consumed.
+    assert_eq!(fetch_doc_state(&pool, doc_id).await, "OFFLINE_LOCAL_ACK");
+    assert_eq!(fetch_consumed_count(&pool, FN).await, 1);
 }
 
 /// §3.7 invariant: regular fiscal doc on `ClosingLocalPendingDrain`
