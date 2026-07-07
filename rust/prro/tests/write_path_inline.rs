@@ -1065,6 +1065,101 @@ async fn sign_crypto_failure_is_sign_failure_and_terminalises_inbox() {
     assert_eq!(read_doc_state(&pool, FN).await, "ABORTED");
 }
 
+/// **PR-Z2 step 3 (S5-A minimal-viable) — a live Z_REPORT whose send DPS-rejects
+/// escalates the FN shift to RequiresManualReconciliation (edge 12 Closing→RMR).**
+/// The doc rests `Rejected` (D2 pre-SENT, verbatim); the shift becomes the durable
+/// operator surface; the request returns `SHIFT_MANUAL_RECON` (500).  RED before
+/// the escalate-hook (a plain DpsRejected + the shift stuck in Closing).
+#[tokio::test]
+async fn z_report_dps_reject_escalates_shift_to_manual_recon() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_z_report(&pool).await;
+
+    // send_chk → DocumentReject (terminal); the Z doc routes to Rejected.
+    let dps = DualStub::new(
+        Err(DpsError::Authorization {
+            code: -1,
+            kind: AuthorizationKind::DocumentReject,
+            message: "z rejected by DPS".into(),
+        }),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect_err("a rejected Z escalates the shift to manual recon");
+    assert!(
+        matches!(err, FiscalError::Internal { code, .. } if code == "SHIFT_MANUAL_RECON"),
+        "a rejected Z must surface SHIFT_MANUAL_RECON, got {err:?}"
+    );
+    // Edge 12: the shift is escalated to RMR (the durable operator surface).
+    assert_eq!(
+        read_shift_state(&pool, FN).await,
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
+    // The doc rests Rejected (D2, pre-SENT — lnd consumed, seed not advanced).
+    assert_eq!(read_doc_state(&pool, FN).await, "REJECTED");
+    assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
+    // §8.1 forensic escalate audit fired (the durable operator surface record).
+    assert_eq!(
+        audit_count(&pool, "INLINE_Z_SHIFT_REJECT_ESCALATE_MANUAL").await,
+        1,
+        "the shift-escalate must emit its forensic audit"
+    );
+}
+
+/// **PR-Z2 step 3 (THE load-bearing NEGATIVE) — a SELL DPS-reject is an ordinary
+/// per-doc terminal and MUST NOT escalate the shift.** One rejected receipt does
+/// NOT kill the whole shift into manual recon: the doc lands Rejected, the shift
+/// stays OPENED, zero escalate audits.  The escalate hook is scoped to
+/// shift-class docs (SHIFT_OPEN/SHIFT_CLOSE/Z_REPORT) ONLY.
+#[tokio::test]
+async fn sell_dps_reject_does_not_escalate_shift() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state_online(&pool, shift_id).await;
+    let row = seed_inbox_sell(&pool).await;
+
+    let dps = DualStub::new(
+        Err(DpsError::Authorization {
+            code: -1,
+            kind: AuthorizationKind::DocumentReject,
+            message: "document rejected by DPS".into(),
+        }),
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+    );
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = gate.lock_owned().await;
+
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+        .await
+        .expect_err("a SELL DPS reject is a per-doc terminal");
+    assert!(
+        matches!(err, FiscalError::DpsRejected { .. }),
+        "a SELL reject stays DpsRejected (422), NOT a shift escalation, got {err:?}"
+    );
+    assert_eq!(read_doc_state(&pool, FN).await, "REJECTED");
+    // The shift is UNTOUCHED — a rejected sale must never kill the shift.
+    assert_eq!(read_shift_state(&pool, FN).await, "OPENED");
+    assert_eq!(
+        audit_count(&pool, "INLINE_Z_SHIFT_REJECT_ESCALATE_MANUAL").await,
+        0,
+        "a SELL reject must emit NO shift-escalate audit"
+    );
+}
+
 /// **A2.1b-core incr.5b — four-variant gate: DpsRejected.** DPS hard-rejects
 /// the receipt (`Authorization{DocumentReject}` → stage_send routes the doc to
 /// terminal `Rejected`) → `FiscalError::DpsRejected` (422); the inline arm
