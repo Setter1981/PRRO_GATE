@@ -735,3 +735,82 @@ async fn l_offline_shift_close_at_opened_drives_closing_local_pending_drain() {
         "offline SHIFT_CLOSE doc bound to current_shift_id"
     );
 }
+
+// ─── (m) edge 7 — offline Z_REPORT at OpenedLocalPendingDrain → OLPD→CLPD.
+//         The "full offline day" close: the SHIFT_OPEN itself hasn't drained
+//         yet.  Reachable only after the slice-3 guardrail-lift (the guard
+//         admits offline close of an OLPD shift). ────────────────────────────
+#[tokio::test]
+async fn m_offline_z_report_at_opened_local_pending_drain_drives_closing_local_pending_drain() {
+    let pool = fresh_pool().await;
+    let secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift = ShiftId::new();
+    seed_shift(&pool, shift, ShiftState::OpenedLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        NodeMode::Offline,
+        ShiftState::OpenedLocalPendingDrain,
+        Some(shift),
+    )
+    .await;
+    let req = seed_inbox(&pool, DocType::ZReport, None).await;
+
+    let result = stage_acquire::run(&pool, &secure, DRIVER, req, cmd(DocType::ZReport, None))
+        .await
+        .unwrap();
+    let ctx = match result {
+        WorkerProcessResult::Proceed(c) => c,
+        other => panic!("expected Proceed, got {other:?}"),
+    };
+    assert_eq!(node_shift_state(&pool).await, "CLOSING_LOCAL_PENDING_DRAIN");
+    assert_eq!(
+        shift_state_by_id(&pool, shift).await.as_deref(),
+        Some("CLOSING_LOCAL_PENDING_DRAIN")
+    );
+    assert_eq!(
+        doc_shift_id(&pool, ctx.document.document_id)
+            .await
+            .as_deref(),
+        Some(shift.as_bytes().as_slice()),
+        "offline Z doc bound to current_shift_id"
+    );
+}
+
+// ─── (n) edge 7 — offline SHIFT_CLOSE at OpenedLocalPendingDrain → OLPD→CLPD. ─
+#[tokio::test]
+async fn n_offline_shift_close_at_opened_local_pending_drain_drives_closing_local_pending_drain() {
+    let pool = fresh_pool().await;
+    let secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift = ShiftId::new();
+    seed_shift(&pool, shift, ShiftState::OpenedLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        NodeMode::Offline,
+        ShiftState::OpenedLocalPendingDrain,
+        Some(shift),
+    )
+    .await;
+    let req = seed_inbox(&pool, DocType::ShiftClose, None).await;
+
+    let result = stage_acquire::run(&pool, &secure, DRIVER, req, cmd(DocType::ShiftClose, None))
+        .await
+        .unwrap();
+    let ctx = match result {
+        WorkerProcessResult::Proceed(c) => c,
+        other => panic!("expected Proceed, got {other:?}"),
+    };
+    assert_eq!(node_shift_state(&pool).await, "CLOSING_LOCAL_PENDING_DRAIN");
+    assert_eq!(
+        shift_state_by_id(&pool, shift).await.as_deref(),
+        Some("CLOSING_LOCAL_PENDING_DRAIN")
+    );
+    assert_eq!(
+        doc_shift_id(&pool, ctx.document.document_id)
+            .await
+            .as_deref(),
+        Some(shift.as_bytes().as_slice()),
+        "offline SHIFT_CLOSE doc bound to current_shift_id"
+    );
+}

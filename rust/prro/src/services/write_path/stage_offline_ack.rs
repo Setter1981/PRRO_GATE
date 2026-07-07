@@ -295,8 +295,10 @@ pub async fn run(
                 DocType::ShiftClose | DocType::ZReport => {
                     ns.shift_state == ShiftState::ClosingLocalPendingDrain
                 }
-                // Any other doc type stays scoped to Opened only here.
-                _ => ns.shift_state == ShiftState::Opened,
+                // All 9 DocType variants are now explicitly matched — a NEW
+                // doc type fails to compile here, forcing a deliberate
+                // offline-ack shift-state decision (drift-guard by
+                // exhaustiveness; the pre-O3 `_ => Opened` fallback is gone).
             };
             if !shift_state_ok {
                 return audit_and_return_refused(

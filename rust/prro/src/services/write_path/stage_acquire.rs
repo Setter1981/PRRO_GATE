@@ -801,31 +801,43 @@ pub async fn run(
                         )?;
                         Some(shift_id)
                     }
-                    // Edge 9: offline Z_REPORT / SHIFT_CLOSE accept on an
-                    // `Opened` shift (guard admits these two when Opened) →
-                    // drive `Opened → ClosingLocalPendingDrain` (vs online
-                    // edge 8's `Opened → Closing`).  The local-Z doc binds to
-                    // the existing `current_shift_id` via `active_shift` below,
-                    // local-acks in `stage_offline_ack`, and drains later —
-                    // edge 13 (`ClosingLocalPendingDrain → Closed`) fires in
-                    // the backlog drain.
+                    // Edges 9 + 7: offline Z_REPORT / SHIFT_CLOSE accept →
+                    // drive the shift to `ClosingLocalPendingDrain` (vs online
+                    // edge 8's `Opened → Closing`).  Edge 9 closes an `Opened`
+                    // shift; edge 7 closes an `OpenedLocalPendingDrain` one
+                    // (the "full offline day": the SHIFT_OPEN itself hasn't
+                    // drained yet — admitted by the slice-3 guardrail-lift).
+                    // The local-Z doc binds to the existing `current_shift_id`
+                    // via `active_shift` below, local-acks in
+                    // `stage_offline_ack`, and drains later — edge 13
+                    // (`ClosingLocalPendingDrain → Closed`) fires in the
+                    // backlog drain.
                     DocType::ZReport | DocType::ShiftClose
-                        if node_state.shift_state == ShiftState::Opened =>
+                        if matches!(
+                            node_state.shift_state,
+                            ShiftState::Opened | ShiftState::OpenedLocalPendingDrain
+                        ) =>
                     {
+                        let from = node_state.shift_state;
+                        let edge_label = if from == ShiftState::Opened {
+                            "edge9 Opened→ClosingLocalPendingDrain"
+                        } else {
+                            "edge7 OpenedLocalPendingDrain→ClosingLocalPendingDrain"
+                        };
                         let shift_id = active_shift
                             .as_ref()
-                            .expect("guard + Step 5 guarantee active_shift when Opened")
+                            .expect("guard + Step 5 guarantee active_shift when Opened/OLPD")
                             .shift_id;
                         expect_applied(
                             transition::apply_shift_transition(
                                 tx,
                                 &fn_id,
                                 shift_id,
-                                ShiftState::Opened,
+                                from,
                                 ShiftState::ClosingLocalPendingDrain,
                             )
                             .await?,
-                            "edge9 Opened→ClosingLocalPendingDrain",
+                            edge_label,
                             shift_id,
                         )?;
                         None
@@ -1105,19 +1117,24 @@ fn check_shift_guard(
         (ShiftOpen, ClosingLocalPendingDrain, _) => Some(RejectionReason::ShiftClosingInFlight),
         (ShiftOpen, _, _) => Some(RejectionReason::ShiftAlreadyOpen),
         (ShiftClose, Opened, _) => None,
-        (ShiftClose, OpenedLocalPendingDrain, _) => {
-            // Spec §5.7 L2 — offline shift close not modeled.
-            Some(RejectionReason::OfflineShiftCloseNotSupported)
-        }
         (ShiftClose, ClosingLocalPendingDrain, _) => Some(RejectionReason::ShiftClosingInFlight),
         (ZReport, Opened, _) => None,
-        (ZReport, OpenedLocalPendingDrain, _) => {
-            // Pre-W10 guardrail (both channels).  Spec §3.4 + operator
-            // correction #3 (2026-05-19): W10 later replaces this
-            // refusal with coupled pool/backlog/edge-7 logic.
-            Some(RejectionReason::ZReportBlockedBacklogDrainPending)
-        }
         (ZReport, ClosingLocalPendingDrain, _) => Some(RejectionReason::ShiftClosingInFlight),
+        // ── A′.3 PR-O3 slice 3 — GUARDRAIL-LIFT (deliberate, α ruling).
+        // The pre-O3 blanket refusals `(ShiftClose, OLPD, _) →
+        // OfflineShiftCloseNotSupported` (spec §5.7 L2) and `(ZReport, OLPD, _)
+        // → ZReportBlockedBacklogDrainPending` (pre-W10, operator correction #3
+        // 2026-05-19) are REPLACED by the channel-aware pair below — the
+        // "coupled pool/backlog/edge-7 logic" those guardrails reserved room
+        // for.  Offline channel: close of an OLPD shift is SUPPORTED (edge 7,
+        // OLPD → CLPD — the "full offline day" close; the local-Z aggregates
+        // over the shift's OLA backlog, C10-pinned).  Online channel: the
+        // operator must let the drain converge first (edge 5) — refused with
+        // the same typed shape as the regular-op OLPD arm above.
+        (ShiftClose | ZReport, OpenedLocalPendingDrain, Offline) => None,
+        (ShiftClose | ZReport, OpenedLocalPendingDrain, Online) => {
+            Some(RejectionReason::ShiftOpenPendingDrainOpRefused)
+        }
         // ShiftClose / ZReport against `Closed` — shift is terminal,
         // operator should issue ShiftOpen first.
         (ShiftClose | ZReport, Closed, _) => Some(RejectionReason::ShiftNotOpen {
@@ -1239,19 +1256,16 @@ mod channel_aware_matrix_tests {
             }
             (ShiftOpen, _) => return Some(RejectionReason::ShiftAlreadyOpen),
             (ShiftClose, Opened) => return None,
-            (ShiftClose, OpenedLocalPendingDrain) => {
-                return Some(RejectionReason::OfflineShiftCloseNotSupported)
-            }
             (ShiftClose, ClosingLocalPendingDrain) => {
                 return Some(RejectionReason::ShiftClosingInFlight)
             }
             (ZReport, Opened) => return None,
-            (ZReport, OpenedLocalPendingDrain) => {
-                return Some(RejectionReason::ZReportBlockedBacklogDrainPending)
-            }
             (ZReport, ClosingLocalPendingDrain) => {
                 return Some(RejectionReason::ShiftClosingInFlight)
             }
+            // A′.3 PR-O3 slice 3: (ShiftClose|ZReport, OpenedLocalPendingDrain)
+            // is now CHANNEL-AWARE — handled in the channel section below
+            // (Offline → None / edge 7; Online → refused pending drain).
             (ShiftClose | ZReport, Closed) => {
                 return Some(RejectionReason::ShiftNotOpen { current: state })
             }
@@ -1282,6 +1296,13 @@ mod channel_aware_matrix_tests {
                 ClosingLocalPendingDrain,
                 _,
             ) => Some(RejectionReason::PostLocalCloseSaleRefused),
+            // A′.3 PR-O3 slice 3 (guardrail-lift, edge 7): offline close of an
+            // OpenedLocalPendingDrain shift is SUPPORTED; online stays refused
+            // pending drain (mirror of the regular-op OLPD arms above).
+            (ShiftClose | ZReport, OpenedLocalPendingDrain, Offline) => None,
+            (ShiftClose | ZReport, OpenedLocalPendingDrain, Online) => {
+                Some(RejectionReason::ShiftOpenPendingDrainOpRefused)
+            }
             _ => unreachable!("matrix oracle: unhandled cell ({doc:?}, {state:?}, {ch:?})"),
         }
     }
@@ -1320,9 +1341,17 @@ mod channel_aware_matrix_tests {
         // - (ZReport, Opened, _) → 2
         // - (Sell|Return|ServiceIn|ServiceOut|CashWithdrawal|XReport, Opened, _) → 6×2 = 12
         // - (Sell|Return|ServiceIn|ServiceOut|CashWithdrawal|XReport, OpenedLocalPendingDrain, Offline) → 6×1 = 6
-        // Total None = 24; Some = 162 - 24 = 138.
-        assert_eq!(none_count, 24, "spec §3.4: 24 happy-path None cells");
-        assert_eq!(some_count, 138, "spec §3.4: 138 refusal cells");
+        // - (ShiftClose, OpenedLocalPendingDrain, Offline) → 1  (A′.3 PR-O3 slice 3 edge 7)
+        // - (ZReport, OpenedLocalPendingDrain, Offline) → 1     (A′.3 PR-O3 slice 3 edge 7)
+        // Total None = 26; Some = 162 - 26 = 136.
+        assert_eq!(
+            none_count, 26,
+            "spec §3.4 + PR-O3 edge 7: 26 happy-path None cells"
+        );
+        assert_eq!(
+            some_count, 136,
+            "spec §3.4 + PR-O3 edge 7: 136 refusal cells"
+        );
     }
 
     #[test]
