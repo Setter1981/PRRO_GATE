@@ -61,6 +61,52 @@ enum AdminCmd {
         reason: String,
     },
 
+    /// A′.3 PR-O1 — operator GO_OFFLINE.  Flips node mode ONLINE→OFFLINE and
+    /// opens an OFFLINE session atomically (one envelope).  Gated behind
+    /// `FULL_OFFLINE_SURFACE_READY`: fails closed until A′.3 O2 lands the
+    /// drain path (ship-together — opening the door without drain would
+    /// strand the offline backlog).
+    GoOffline {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long = "fn")]
+        fiscal_number: String,
+        /// Operator-supplied non-empty description for the forensic audit trail.
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// A′.3 PR-O1 — operator GO_ONLINE.  Flips node mode
+    /// OFFLINE|GOING_OFFLINE→GOING_ONLINE; drain convergence to ONLINE follows
+    /// via the supervisor (O2).  Gated like GO_OFFLINE.
+    GoOnline {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long = "fn")]
+        fiscal_number: String,
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// A′.3 PR-O1 (STOP-O1 (b)) — manually seed a range of offline codes for
+    /// the pilot drill.  ⚠️ Seed ONLY real DPS-issued ranges for this FN
+    /// (from the DPS cabinet / prior provisioning); invented codes cascade
+    /// into RMR escalations on drain.  Pilot-drill affordance, not permanent.
+    SeedCodes {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long = "fn")]
+        fiscal_number: String,
+        /// First code_lnd (inclusive), >= 1.
+        #[arg(long)]
+        first: i64,
+        /// Last code_lnd (inclusive), >= first.
+        #[arg(long)]
+        last: i64,
+        #[arg(long)]
+        reason: String,
+    },
+
     /// W2 — register a cashier (operator) and bind their EDS key to a
     /// fiscal number.  Inserts a row into the secure DB's `operators`
     /// table.  Password is acquired interactively: TTY mode requires
@@ -401,6 +447,58 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(err) => {
                     eprintln!("prro admin reset-stop-mode: {err}");
+                    std::process::exit(err.exit_code());
+                }
+            },
+            AdminCmd::GoOffline {
+                config,
+                fiscal_number,
+                reason,
+            } => match prro::admin::run_go_offline(&config, &fiscal_number, &reason).await {
+                Ok(o) => {
+                    println!(
+                        "ADMIN_GO_OFFLINE OK fiscal_number={} offline_session_id={}",
+                        o.fiscal_number, o.offline_session_id
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    eprintln!("prro admin go-offline: {err}");
+                    std::process::exit(err.exit_code());
+                }
+            },
+            AdminCmd::GoOnline {
+                config,
+                fiscal_number,
+                reason,
+            } => match prro::admin::run_go_online(&config, &fiscal_number, &reason).await {
+                Ok(o) => {
+                    println!("ADMIN_GO_ONLINE OK fiscal_number={}", o.fiscal_number);
+                    Ok(())
+                }
+                Err(err) => {
+                    eprintln!("prro admin go-online: {err}");
+                    std::process::exit(err.exit_code());
+                }
+            },
+            AdminCmd::SeedCodes {
+                config,
+                fiscal_number,
+                first,
+                last,
+                reason,
+            } => match prro::admin::run_seed_offline_codes(&config, &fiscal_number, first, last, &reason)
+                .await
+            {
+                Ok(o) => {
+                    println!(
+                        "ADMIN_SEED_OFFLINE_CODES OK fiscal_number={} first={} last={} inserted={}",
+                        o.fiscal_number, o.first_lnd, o.last_lnd, o.inserted_count
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    eprintln!("prro admin seed-codes: {err}");
                     std::process::exit(err.exit_code());
                 }
             },
