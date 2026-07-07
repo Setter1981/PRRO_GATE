@@ -1965,6 +1965,75 @@ pub async fn run_boot_reconciliation(
         return Ok(BranchOutcome::PreservedManualRecon);
     }
 
+    // ── sweep SW-2 — orphaned pending-drain shift (STOP-O3-1 fix (b), boot
+    //    half — the #196 re-run pattern).  A shift resting in
+    //    `OpenedLocalPendingDrain` / `ClosingLocalPendingDrain` whose ANCHOR
+    //    lifecycle doc is dead (offline SHIFT_OPEN for OLPD; offline
+    //    SHIFT_CLOSE / Z_REPORT for CLPD — every one ABORTED / REJECTED /
+    //    CANCELLED, none in flight and none locally issued) can never fire its
+    //    only exit (edge 5 / 13): the runtime half of the fix escalates at
+    //    abort time, and this sweep closes the crash/error gap between the
+    //    committed abort and that escalation, idempotently re-running the same
+    //    `escalate_fn_to_manual_recon` seam (edges 6/14 → RMR, spec §16.7
+    //    family 1).  A LIVE anchor doc (PREPARED/SIGNED — the per-doc loop
+    //    below re-drives it; OFFLINE_LOCAL_ACK — the drain owns it) means the
+    //    shift is NOT orphaned → fall through untouched.
+    if matches!(
+        row.shift_state,
+        ShiftState::OpenedLocalPendingDrain | ShiftState::ClosingLocalPendingDrain
+    ) {
+        let anchor_types: &str = if row.shift_state == ShiftState::OpenedLocalPendingDrain {
+            "('SHIFT_OPEN')"
+        } else {
+            "('SHIFT_CLOSE','Z_REPORT')"
+        };
+        if let Some(shift_id) = row.current_shift_id {
+            let live_anchor_count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM fiscal_documents \
+                 WHERE fiscal_number = ? AND shift_id = ? \
+                   AND doc_type IN {anchor_types} \
+                   AND state NOT IN ('ABORTED','REJECTED','CANCELLED')"
+            ))
+            .bind(fiscal_number)
+            .bind(shift_id)
+            .fetch_one(pool)
+            .await?;
+            if live_anchor_count == 0 {
+                // Forensic anchor: the latest dead lifecycle doc, if any.
+                let dead_anchor: Option<Vec<u8>> = sqlx::query_scalar(&format!(
+                    "SELECT document_id FROM fiscal_documents \
+                     WHERE fiscal_number = ? AND shift_id = ? \
+                       AND doc_type IN {anchor_types} \
+                     ORDER BY lnd DESC LIMIT 1"
+                ))
+                .bind(fiscal_number)
+                .bind(shift_id)
+                .fetch_optional(pool)
+                .await?;
+                let anchor_doc_id = dead_anchor
+                    .and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok())
+                    .map(DocumentId::from_bytes)
+                    .unwrap_or(DocumentId::from_bytes([0u8; 16]));
+                crate::services::offline_sync::backlog_drain::escalate_fn_to_manual_recon(
+                    pool,
+                    fiscal_number,
+                    &row,
+                    anchor_doc_id,
+                    "orphaned_pending_drain_shift",
+                    0,
+                    "BOOT_ORPHANED_PENDING_DRAIN_SHIFT_ESCALATE_MANUAL",
+                    "BOOT_ORPHANED_PENDING_DRAIN_SHIFT_NO_SHIFT",
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("sweep SW-2 escalation failed: {e:?}"))?;
+                return Ok(BranchOutcome::PreservedManualRecon);
+            }
+        }
+        // NULL current_shift_id with a pending-drain shift_state is the
+        // ShiftStateMirrorDrift class — surfaced by the invariant scan; the
+        // per-doc loop below proceeds (nothing to escalate against).
+    }
+
     // From here: row.mode is one of {Online, Offline, GoingOffline}.
     // (M3b W7b: branches d + f already returned for refused modes;
     // Offline / GoingOffline fall through to per-doc dispatch via
