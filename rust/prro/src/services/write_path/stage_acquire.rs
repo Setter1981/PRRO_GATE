@@ -764,8 +764,10 @@ pub async fn run(
                 }
             } else {
                 // A′.3 PR-O3 — OFFLINE shift-lifecycle arm (mirror of the
-                // online block above).  Slice 1 wires edge 2 only; the offline
-                // close edges (7/9) land in slice 2.
+                // online block above).  Slice 1 wires edge 2; slice 2 wires
+                // edge 9 (offline close on an Opened shift); edge 7 (close on
+                // an OpenedLocalPendingDrain shift) lands in slice 3, behind
+                // the guardrail-lift that currently refuses it at the guard.
                 match command.doc_type {
                     // Edge 2: fresh offline SHIFT_OPEN accept (guard already
                     // proved `shift_state == Closed`) → mint the shift
@@ -798,6 +800,35 @@ pub async fn run(
                             shift_id,
                         )?;
                         Some(shift_id)
+                    }
+                    // Edge 9: offline Z_REPORT / SHIFT_CLOSE accept on an
+                    // `Opened` shift (guard admits these two when Opened) →
+                    // drive `Opened → ClosingLocalPendingDrain` (vs online
+                    // edge 8's `Opened → Closing`).  The local-Z doc binds to
+                    // the existing `current_shift_id` via `active_shift` below,
+                    // local-acks in `stage_offline_ack`, and drains later —
+                    // edge 13 (`ClosingLocalPendingDrain → Closed`) fires in
+                    // the backlog drain.
+                    DocType::ZReport | DocType::ShiftClose
+                        if node_state.shift_state == ShiftState::Opened =>
+                    {
+                        let shift_id = active_shift
+                            .as_ref()
+                            .expect("guard + Step 5 guarantee active_shift when Opened")
+                            .shift_id;
+                        expect_applied(
+                            transition::apply_shift_transition(
+                                tx,
+                                &fn_id,
+                                shift_id,
+                                ShiftState::Opened,
+                                ShiftState::ClosingLocalPendingDrain,
+                            )
+                            .await?,
+                            "edge9 Opened→ClosingLocalPendingDrain",
+                            shift_id,
+                        )?;
+                        None
                     }
                     _ => None,
                 }

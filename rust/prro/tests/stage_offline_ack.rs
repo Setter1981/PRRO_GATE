@@ -836,10 +836,43 @@ async fn applied_path_works_with_opened_local_pending_drain_for_shift_open() {
     assert_eq!(fetch_consumed_count(&pool, FN).await, 1);
 }
 
-/// §3.7 invariant: regular fiscal doc on `ClosingLocalPendingDrain`
-/// STILL refused — widening covers only `OpenedLocalPendingDrain`,
-/// not the closing-drain state.  ClosingLocalPendingDrain remains
-/// post-local-close lockout per PR #62 §W10.
+/// A′.3 PR-O3 slice 2 (edge-9 tail, numbering (ii)): the offline local-Z doc
+/// (Z_REPORT / SHIFT_CLOSE), minted + driven to `ClosingLocalPendingDrain` by
+/// stage_acquire (edge 9/7), reaches stage_offline_ack and local-acks like a
+/// receipt (Signed → OfflineLocalAck), consuming one offline code.  Step-3 is
+/// widened to admit ShiftClose | ZReport specifically in
+/// `ClosingLocalPendingDrain` (the state edge 9/7 leaves the shift in).
+#[tokio::test]
+async fn applied_path_works_with_closing_local_pending_drain_for_z_report() {
+    let (_d, pool) = fresh_pool().await;
+    seed_node_state(
+        &pool,
+        FN,
+        NodeMode::Offline,
+        ShiftState::ClosingLocalPendingDrain,
+    )
+    .await;
+    let session_id = OfflineSessionId::new();
+    seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
+    seed_code(&pool, FN, 55).await;
+    let doc_id = insert_signed_doc_with_type(&pool, FN, 7, "Z_REPORT").await;
+
+    let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
+    match outcome {
+        OfflineAckOutcome::Applied { code_lnd, .. } => assert_eq!(code_lnd, 55),
+        other => panic!("offline Z_REPORT in CLPD must local-ack (edge-9 tail), got {other:?}"),
+    }
+    assert_eq!(fetch_doc_state(&pool, doc_id).await, "OFFLINE_LOCAL_ACK");
+    assert_eq!(fetch_consumed_count(&pool, FN).await, 1);
+}
+
+/// §3.7 invariant: a REGULAR fiscal doc (SELL here) on
+/// `ClosingLocalPendingDrain` STILL refused — the §3.7 regular-doc widening
+/// covers only `OpenedLocalPendingDrain`, not the closing-drain state; CLPD
+/// remains the post-local-close sale lockout per PR #62 §W10.  (A′.3 PR-O3
+/// widens ShiftClose / Z_REPORT — the closing doc itself — into CLPD, but
+/// NOT regular sale-flavour docs; see
+/// `applied_path_works_with_closing_local_pending_drain_for_z_report`.)
 #[tokio::test]
 async fn refusal_sell_on_closing_local_pending_drain_returns_shift_not_opened() {
     let (_d, pool) = fresh_pool().await;
