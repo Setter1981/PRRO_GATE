@@ -54,7 +54,7 @@
 **Flag stays `false` in O1. No migration. Online-preopen keeps edge 2 out of O1.**
 
 ### 3.2 Build list (implementer implements test-first to green the RED pins)
-- **B1 — node-mode setters** (`db/repositories/node_state.rs`): `set_mode_going_offline_tx` (`ONLINE→GOING_OFFLINE`, guarded CAS `WHERE mode='ONLINE'`, rows==1 race-loud) and `set_mode_going_online_tx` (`OFFLINE|GOING_OFFLINE→GOING_ONLINE`). Mode-only; never touch `shift_state`. `GOING_OFFLINE` is the operator-initiated transitional mode (dispatch routes `Offline|GoingOffline`→`stage_offline_ack`; `return_online_probe` leaves `GoingOffline` alone → stable resting mode for the drill).
+- **B1 — node-mode setters** (`db/repositories/node_state.rs`): `set_mode_offline_tx` (`ONLINE→OFFLINE`, guarded CAS `WHERE mode='ONLINE'`, rows==1 race-loud) and `set_mode_going_online_tx` (`OFFLINE|GOING_OFFLINE→GOING_ONLINE`). Mode-only; never touch `shift_state`. **Target = `OFFLINE`** (architect: machinery proven at `mode=OFFLINE`): no node-mode `allowed_transition` exists ⇒ `ONLINE→OFFLINE` is a free guarded CAS; `dispatch` routes `Offline`→`stage_offline_ack`, `return_online_probe` recovers `OFFLINE→GOING_ONLINE`. `GOING_OFFLINE` (operator-initiated transient) is available but NOT used by O1; O1's supervisor is off so `OFFLINE` rests undisturbed.
 - **B2 — offline-surface gate** (new small module, e.g. `services/offline_sync/offline_surface.rs`, mirroring `z_builder`): `pub const FULL_OFFLINE_SURFACE_READY: bool = false;` + `struct OfflineSurfaceNotReady` typed error + `ensure_full_offline_surface_ready() -> Result<(), OfflineSurfaceNotReady>`. Coupling-pin lands in O2 with the flip; O1 ships the tripwire.
 - **B3 — admin commands** (`admin.rs`, mirror `reset_stop_mode`): `go_offline(pool, fn, reason)` and `go_online(pool, fn, reason)`. Shape: validate reason → **gate `ensure_full_offline_surface_ready()`** → pre-read mode (actionable error if not the expected mode) → atomic `with_immediate` envelope { guarded mode-CAS + [GO_OFFLINE: open session, see B4] + Critical audit `ADMIN_GO_OFFLINE`/`ADMIN_GO_ONLINE` with mode_before/after payload }. New `AdminError` variants: `OfflineSurfaceNotReady`, `NotInExpectedMode { expected, observed }`.
 - **B4 — atomic session-open on GO_OFFLINE**: wire `OfflineSessionService`/`open_session` so an OPEN session exists **within/adjacent to** the GO_OFFLINE envelope — **no Offline-but-no-session window**. Prefer a tx-bound `open_session` primitive inside the same `with_immediate` (extract one if only the service-level own-tx variant exists, mirroring how `seed_code_range` wraps `seed_code_range_tx`).
@@ -64,9 +64,9 @@
 
 ### 3.3 RED pins (spec anchors — implementer writes each test-first, RED → GREEN)
 Reachability core:
-- **RP-O1-1** GO_OFFLINE on ONLINE node → `mode=GOING_OFFLINE` (guarded CAS); `shift_state` unchanged; Critical audit `ADMIN_GO_OFFLINE` (before/after). Not-ONLINE → typed `NotInExpectedMode`.
+- **RP-O1-1** GO_OFFLINE on ONLINE node → `mode=OFFLINE` (guarded CAS); `shift_state` unchanged; Critical audit `ADMIN_GO_OFFLINE` (before/after). Not-ONLINE → typed `NotInExpectedMode`.
 - **RP-O1-2** After GO_OFFLINE, `current_active_session_id_tx` returns `Some` (OPEN session exists) — no Offline-but-no-session window.
-- **RP-O1-3** Offline SELL via `inline::run` (mode ∈ offline-family, shift `Opened`, OPEN session, seeded codes) → reaches `OFFLINE_LOCAL_ACK`, consumes exactly one code (`offline_codes` row stamped `consumed_by_document_id`). Not refused Na/Shift/CodePool.
+- **RP-O1-3** Offline SELL via `inline::run` (**mode=OFFLINE** via direct mode-set seam, shift `Opened`, OPEN session, seeded codes) → reaches `OFFLINE_LOCAL_ACK`, consumes exactly one code (`offline_codes` row stamped `consumed_by_document_id`). Not refused Na/Shift/CodePool.
 - **RP-O1-4** Offline RETURN (`DocType::Return`, Step-3 allowlist) → `OFFLINE_LOCAL_ACK`, one code consumed.
 - **RP-O1-5** (decoupling pin) e2e opens shift ONLINE (edge 3 → `Opened`) **before** GO_OFFLINE; asserts `shift_state == Opened` throughout (edge 2 **never** driven) — proves O1 doesn't touch offline shift-open.
 
