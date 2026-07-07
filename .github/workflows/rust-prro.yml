@@ -1,12 +1,20 @@
 name: rust-prro
 
+# Per-PR half of the rust CI (operator decision 2026-07-07): ONLY the
+# x86_64-unknown-linux-gnu leg — the REQUIRED branch-protection context that
+# carries the full test signal (prro + prro_crypto suites + live-dps harness
+# compile check). The cross-target legs (musl / msvc / aarch64) moved to
+# .github/workflows/rust-prro-cross-nightly.yml (schedule + manual dispatch):
+# they validate compile/codegen for targets a typical PR cannot break, and
+# cost ~10 min of PR wall-clock (windows runner slowest). Keep the two files'
+# step lists in sync when touching build/test steps.
 on:
   push:
     branches: [rust-gateway]
     paths:
       # `prro` plus its workspace path-dependencies (rust/prro/Cargo.toml
       # references ../prro_crypto and ../prro_escpos), so a change there
-      # also breaks `cargo build -p prro` and must trigger this matrix.
+      # also breaks `cargo build -p prro` and must trigger this workflow.
       - 'rust/prro/**'
       - 'rust/prro_crypto/**'
       - 'rust/prro_escpos/**'
@@ -36,44 +44,23 @@ env:
   SQLX_OFFLINE: "true"
 
 jobs:
-  # `fmt + clippy (gnu)` (the REQUIRED merge gate) moved to
-  # .github/workflows/fmt-clippy.yml — an always-run, NON-path-filtered workflow —
-  # so the required check reports on EVERY PR, including docs-only / .claude-only
-  # ones that never trigger this path-filtered workflow. This workflow keeps the
-  # expensive, path-filtered cross-target build matrix (NOT a required check).
+  # `fmt + clippy (gnu)` (also a REQUIRED merge gate) lives in
+  # .github/workflows/fmt-clippy.yml — an always-run, NON-path-filtered
+  # workflow — so that required check reports on EVERY PR, including
+  # docs-only / .claude-only ones that never trigger this path-filtered one.
   build:
-    name: ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            apt: musl-tools
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            apt: ''
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            apt: ''
-          # Native ARM64 runner (GitHub-hosted, free for public repos).
-          # Validates aarch64 codegen for embedded / edge gateway boxes
-          # without cross-compile overhead.
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            apt: ''
+    # MUST stay exactly `x86_64-unknown-linux-gnu`: this is the REQUIRED
+    # branch-protection context, mirrored by rust-prro-skip.yml on non-rust
+    # PRs (the skip-companion reports the same context name).
+    name: x86_64-unknown-linux-gnu
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install apt deps (Linux musl)
-        if: matrix.apt != ''
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
-
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-gnu
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -86,76 +73,45 @@ jobs:
 
       - name: Build
         working-directory: rust
-        run: cargo build -p prro --target ${{ matrix.target }} --locked
+        run: cargo build -p prro --target x86_64-unknown-linux-gnu --locked
 
       - name: Compile-only check — W4-Z3 live-dps smoke harness (never executed)
-        if: matrix.target != 'x86_64-unknown-linux-musl'
         working-directory: rust
         # The live-dps test target is gated `#![cfg(feature = "live-dps")]` and
         # hits the REAL DPS server, so it is NEVER run in CI.  This step only
         # COMPILES it (--no-run) so the harness cannot bit-rot (API drift in
         # transports/dps, crypto, or env wiring) while normal suites stay green.
-        run: cargo test -p prro --target ${{ matrix.target }} --features live-dps --test live_dps_extended_smoke --no-run --locked
+        run: cargo test -p prro --target x86_64-unknown-linux-gnu --features live-dps --test live_dps_extended_smoke --no-run --locked
 
-      - name: Test (cross-target binary)
-        if: matrix.target != 'x86_64-unknown-linux-musl'
+      - name: Test
         working-directory: rust
         # --features test-support: required by integration tests that
         # call `boot_phase::run_boot_reconciliation` via the W2
         # ReconcileGuard test seam (M3b structural enforcement of
         # ADR-M3-A10). Production builds do NOT enable this feature.
-        run: cargo nextest run -p prro --target ${{ matrix.target }} --features test-support --locked
+        run: cargo nextest run -p prro --target x86_64-unknown-linux-gnu --features test-support --locked
 
       - name: Test prro_crypto (vectors, dudect CT, backend differential)
-        if: matrix.target != 'x86_64-unknown-linux-musl'
         working-directory: rust
         # Audit CRY-3 (2026-06-10): the crypto crate's OWN suite (DSTU/GOST
         # vectors, the dudect constant-time statistical tests, the
         # portable↔pclmul backend differential) previously ran only by hand.
-        # Per-target matters here: x86 exercises the PCLMUL backend, aarch64
-        # the portable one. ~70s warm on a dev box.
-        run: cargo nextest run -p prro_crypto --target ${{ matrix.target }} --locked
-
-      # Disk headroom for the musl leg: it is the ONLY leg that performs TWO
-      # full builds (the musl-target `Build` above + the host-gnu test build
-      # below).  On a cache miss that overflows the runner disk — observed
-      # twice on 2026-07-02 (`rustc-LLVM ERROR: No space left on device`
-      # mid-host-build; the first occurrence killed the runner outright, which
-      # also cancels `if: always()` steps — the same family as the earlier gnu
-      # link-time No-space flake).  The musl target artifacts are dead weight
-      # once `Build` has proven the target compiles — drop them before the
-      # host build.
-      - name: Free musl target artifacts (disk headroom for the host build)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        working-directory: rust
-        run: |
-          du -sh target/x86_64-unknown-linux-musl 2>/dev/null || true
-          rm -rf target/x86_64-unknown-linux-musl
-          df -h / | tail -1
-
-      - name: Test (musl built for target, executed on host gnu)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        working-directory: rust
-        # Native execution on the host gnu runner — the musl `cargo build`
-        # above proves the target compiles; tests run via host gnu because
-        # GH ubuntu-latest doesn't ship a musl libc by default.
-        # --features test-support: see W2 note on the cross-target step.
-        run: cargo nextest run -p prro --features test-support --locked
+        # This x86 leg exercises the PCLMUL backend; the portable backend
+        # (aarch64) is covered by the nightly cross workflow.
+        run: cargo nextest run -p prro_crypto --target x86_64-unknown-linux-gnu --locked
 
       # Phase-2 U2 (spec §4 / F2): the fuzzer above writes a regression seed to
-      # the pinned file on a find. Surface it so a find is never silently dropped:
-      # (1) upload the seed as a PER-TARGET artifact so a find's repro is
-      # preserved before the ephemeral runner is torn down — including a
-      # Windows-specific find (audit HIGH#2: the Windows leg runs the fuzzer
-      # natively on windows-latest); (2) fail loudly if it is uncommitted/
-      # untracked. Runs on EVERY OS leg (bash is available on the windows
-      # runner via Git Bash) and regardless of whether the test step above
-      # failed, so a find is surfaced as THIS guard, not just a raw failure.
+      # the pinned file on a find. Surface it so a find is never silently
+      # dropped: (1) upload the seed as an artifact so a find's repro is
+      # preserved before the ephemeral runner is torn down; (2) fail loudly if
+      # it is uncommitted/untracked. Runs regardless of whether the test step
+      # above failed, so a find is surfaced as THIS guard, not just a raw
+      # failure.
       - name: Upload regression seed (if any)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: invariant-fuzzer-regressions-${{ matrix.target }}
+          name: invariant-fuzzer-regressions-x86_64-unknown-linux-gnu
           path: rust/prro/tests/invariant_fuzzer.regressions
           if-no-files-found: ignore
           retention-days: 30
