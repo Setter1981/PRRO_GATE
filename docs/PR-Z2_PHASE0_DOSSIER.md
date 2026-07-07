@@ -259,3 +259,57 @@ All four STOPs adjudicated; contract locked. Both ingress guards confirmed prese
   D5, diff boundaries) + full nextest + fmt/clippy + 7-point report.
 - **STOP-protocol:** the stages are "ready" per recon — on ANY divergence found while wiring them,
   STOP and triage to the architect; do NOT fix a stage silently.
+
+---
+
+## CONTRACT-PHASE FINDING (S3 assessment) — edges 4/12 are NOT cheap reuse → NEW STOP-S5
+
+Assessing the S3 retry-budget ruling ("reuse `error_routing`+convergence if it already gives the
+§6.5 budgets") surfaced a material gap. **The escalation FOUNDATION is reusable, but three pieces
+are missing for edges 4/12 — and one of them touches a "ready" stage-adjacent file (STOP-protocol
+trigger).**
+
+**Reusable (verified):** transport failure → `RetryClass::TransientRetry` (`error_routing.rs:284`)
+→ `ErrorRetryable`; the online convergence tick (`online_convergence.rs:375`) re-drives ER docs via
+`stage_send::run` and, on `evaluate_er_redrive` (`er_redrive_policy.rs:86`) →
+`BudgetExhausted`/`EscalateManual`, CASes to `RequiresManualReconciliation`. This is the same
+escalate-to-RMR spine PR-Z2 wants.
+
+**Gaps (must be resolved for edges 4/12):**
+1. **SHIFT_OPEN hard-rejects mis-classified.** `is_close_shift()` (`error_routing.rs:547`) matches
+   only `{SHIFT_CLOSE, Z_REPORT}`. A SHIFT_OPEN Server `-1/-11/-15` → `TerminalReject` → `Rejected`,
+   never reaching the manual-escalation layer → **edge 4 never fires.** Fixing this edits
+   `error_routing` — a stage-adjacent file the recon called "ready". **STOP-protocol: surfaced, not
+   silently patched.**
+2. **No per-class §6.5 budgets.** Only a flat `MAX_BOOT_ATTEMPTS = 5` for all `TransientRetry`
+   (`er_redrive_policy.rs` + `transport_trace::attempts_used`). No per-code differentiation
+   (Transport 20/≥30min vs Server-5 3/≥5min vs Server-11 0/immediate), no wall-clock `first_failure_at`,
+   no backoff. Full §6.5 compliance = a budget-engine refactor of `transport_trace` +
+   `er_redrive_policy` (a new column + timer state) — a sizable increment on its own.
+3. **No shift-recovery classifiers.** `ShiftOpenRecoveryClass` / `ShiftCloseRecoveryClass` (spec
+   §6.2/6.4: RetryClass + shift_id + shift.state → shift-edge verdict) do not exist. `error_routing`
+   is a pure doc-state classifier (no shift context by design) — the shift-edge decision is a new layer.
+
+### STOP-S5 — how much of edges 4/12 is in PR-Z2?
+
+The PILOT online-half e2e (boot→OPEN→SELLs→Z-close on a clean config) is the **happy path — all
+Acks — so edges 4/12 (the hard-reject / timeout FAILURE paths) are NOT exercised by it.** So PR-Z2's
+live-dispatch unblock does not strictly depend on 4/12. Three cuts:
+
+- **(A) Minimal-viable 4/12:** fix the SHIFT_OPEN classification (gap 1) + reuse the existing
+  flat-5 convergence→RMR escalation (gap 2/3 deferred). Unblocks edges 4/12 to RMR+§8.1 audit, but
+  the §6.5 timing (20/≥30min etc.) lands as a **named residual → recovery-hardening increment**.
+- **(B) Full §6.5:** build the per-class budget engine + shift-recovery classifiers now. Large;
+  pulls a recovery-machine refactor into a dispatch PR (couples two concerns).
+- **(C) Defer 4/12 entirely:** PR-Z2 ships the live ONLINE happy-path dispatch (steps 1/2/4/5) +
+  edge 11 (Closing→Opened on a pure DocumentReject — cheap, no budget machinery). Edges 4/12
+  (hard-reject/timeout → RMR) + the §6.5 budget engine + shift-recovery classifiers become a
+  SEPARATE recovery increment (they share the offline-drain escalation machinery A'.3 also needs).
+
+**Recommendation: (C), or (A) if you want the RMR safety-net landed with the dispatch.** (B) violates
+the "orchestrator increment, not a recovery build" framing and couples PR-Z2 to a budget refactor.
+(C) keeps PR-Z2 = the live-dispatch happy path (the actual pilot-online-half unblocker) and quarantines
+the failure-path recovery machinery into its own increment (naturally co-scoped with A'.3's offline
+escalations). Either way, the §6.5 budget engine is its OWN piece, not smuggled into PR-Z2.
+
+**This STOP re-opens the step-3 line of the delivery order and must be adjudicated before code.**
