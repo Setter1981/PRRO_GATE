@@ -216,11 +216,13 @@ async fn drive(
 // ─── Probes ─────────────────────────────────────────────────────────────────
 
 async fn shift_state(pool: &SqlitePool) -> String {
-    sqlx::query_scalar("SELECT state FROM shifts WHERE fiscal_number = ? ORDER BY rowid DESC LIMIT 1")
-        .bind(FN)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar(
+        "SELECT state FROM shifts WHERE fiscal_number = ? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 async fn node_row(pool: &SqlitePool) -> (String, String) {
@@ -288,7 +290,9 @@ async fn pilot_offline_sell_and_return_reachable_via_live_binding() {
     // ─── 2) GO OFFLINE via DIRECT SEAMS (not the gated door) ──────────────
     // 2a. mode-set ONLINE → OFFLINE (leaves shift_state=Opened, Frozen #3).
     let flipped = with_immediate(app.db(), |tx| {
-        Box::pin(async move { Ok::<bool, anyhow::Error>(node_state::set_mode_offline_tx(tx, FN).await?) })
+        Box::pin(async move {
+            Ok::<bool, anyhow::Error>(node_state::set_mode_offline_tx(tx, FN).await?)
+        })
     })
     .await
     .unwrap();
@@ -298,7 +302,10 @@ async fn pilot_offline_sell_and_return_reachable_via_live_binding() {
         .open_session(FN)
         .await
         .expect("open offline session");
-    assert_eq!(offline_session_state(app.db()).await.as_deref(), Some("OPEN"));
+    assert_eq!(
+        offline_session_state(app.db()).await.as_deref(),
+        Some("OPEN")
+    );
     // 2c. seed real DPS-issued codes via the admin pilot-drill affordance.
     let seeded = prro::admin::seed_offline_codes(app.db(), FN, 1000, 1005, "cabinet drill range")
         .await
@@ -325,7 +332,11 @@ async fn pilot_offline_sell_and_return_reachable_via_live_binding() {
         DocState::OfflineLocalAck,
         "offline SELL must reach OFFLINE_LOCAL_ACK"
     );
-    assert_eq!(consumed_codes_count(app.db()).await, 1, "SELL consumed one code");
+    assert_eq!(
+        consumed_codes_count(app.db()).await,
+        1,
+        "SELL consumed one code"
+    );
 
     let ret = drive(
         &*write_path,
@@ -339,10 +350,18 @@ async fn pilot_offline_sell_and_return_reachable_via_live_binding() {
         DocState::OfflineLocalAck,
         "offline RETURN must reach OFFLINE_LOCAL_ACK"
     );
-    assert_eq!(consumed_codes_count(app.db()).await, 2, "RETURN consumed a second code");
+    assert_eq!(
+        consumed_codes_count(app.db()).await,
+        2,
+        "RETURN consumed a second code"
+    );
 
     // ─── 4) O1 boundary: OLA-resting docs + OPEN session, shift STILL Opened ─
-    assert_eq!(ola_doc_count(app.db()).await, 2, "SELL + RETURN both rest at OLA");
+    assert_eq!(
+        ola_doc_count(app.db()).await,
+        2,
+        "SELL + RETURN both rest at OLA"
+    );
     let (mode, shift) = node_row(app.db()).await;
     assert_eq!(mode, "OFFLINE");
     assert_eq!(
@@ -350,7 +369,10 @@ async fn pilot_offline_sell_and_return_reachable_via_live_binding() {
         "shift stayed Opened — edge 2 (offline shift-open) is NOT driven in O1 (that is O2)"
     );
     assert_eq!(shift_state(app.db()).await, "OPENED");
-    assert_eq!(offline_session_state(app.db()).await.as_deref(), Some("OPEN"));
+    assert_eq!(
+        offline_session_state(app.db()).await.as_deref(),
+        Some("OPEN")
+    );
 
     // RP-O1-12: OLA + OPEN session are legal durable states — the scan is CLEAN.
     prro::db::invariant_scan::assert_clean(app.db()).await;

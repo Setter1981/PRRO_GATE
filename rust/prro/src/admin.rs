@@ -515,7 +515,8 @@ async fn go_online_inner(
     with_immediate(pool, move |tx| {
         Box::pin(async move {
             let flipped =
-                crate::db::repositories::node_state::set_mode_going_online_tx(tx, &fn_owned).await?;
+                crate::db::repositories::node_state::set_mode_going_online_tx(tx, &fn_owned)
+                    .await?;
             if !flipped {
                 return Err(anyhow::anyhow!(
                     "admin: race detected during go_online for fn={fn_owned} — mode CAS \
@@ -1487,11 +1488,12 @@ mod tests {
             .expect_err("door must be gated in O1");
         assert!(matches!(err, AdminError::OfflineSurfaceNotReady));
 
-        let mode: String = sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
-            .bind("1234567890")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let mode: String =
+            sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+                .bind("1234567890")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(mode, "ONLINE");
         assert!(read_offline_session_state(&pool, "1234567890")
             .await
@@ -1519,7 +1521,10 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(mode, "OFFLINE");
-        assert_eq!(shift, "OPENED", "GO_OFFLINE must not touch shift_state (Frozen #3)");
+        assert_eq!(
+            shift, "OPENED",
+            "GO_OFFLINE must not touch shift_state (Frozen #3)"
+        );
 
         assert_eq!(
             read_offline_session_state(&pool, "1234567890")
@@ -1559,11 +1564,12 @@ mod tests {
             }
             other => panic!("expected NotInExpectedMode, got {other:?}"),
         }
-        let mode: String = sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
-            .bind("1234567890")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let mode: String =
+            sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+                .bind("1234567890")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(mode, "BLOCKED");
     }
 
@@ -1604,11 +1610,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.fiscal_number, "1234567890");
-        let mode: String = sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
-            .bind("1234567890")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let mode: String =
+            sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+                .bind("1234567890")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(mode, "GOING_ONLINE");
         let (sev, payload) = latest_audit(&pool, "ADMIN_GO_ONLINE")
             .await

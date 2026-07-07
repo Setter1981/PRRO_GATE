@@ -487,8 +487,14 @@ async fn main() -> anyhow::Result<()> {
                 first,
                 last,
                 reason,
-            } => match prro::admin::run_seed_offline_codes(&config, &fiscal_number, first, last, &reason)
-                .await
+            } => match prro::admin::run_seed_offline_codes(
+                &config,
+                &fiscal_number,
+                first,
+                last,
+                &reason,
+            )
+            .await
             {
                 Ok(o) => {
                     println!(

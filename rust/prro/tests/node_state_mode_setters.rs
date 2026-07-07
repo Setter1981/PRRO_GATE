@@ -27,13 +27,15 @@ async fn fresh_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
 }
 
 async fn seed_node_state(pool: &sqlx::SqlitePool, mode: NodeMode, shift_state: ShiftState) {
-    sqlx::query("INSERT INTO node_state(fiscal_number, mode, shift_state, next_lnd) VALUES (?, ?, ?, 1)")
-        .bind(FN)
-        .bind(mode)
-        .bind(shift_state)
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO node_state(fiscal_number, mode, shift_state, next_lnd) VALUES (?, ?, ?, 1)",
+    )
+    .bind(FN)
+    .bind(mode)
+    .bind(shift_state)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 async fn read_mode(pool: &sqlx::SqlitePool) -> String {
@@ -60,7 +62,9 @@ async fn set_mode_offline_tx_flips_online_to_offline_leaving_shift_state() {
     seed_node_state(&pool, NodeMode::Online, ShiftState::Opened).await;
 
     let applied = with_immediate(&pool, |tx| {
-        Box::pin(async move { Ok::<bool, anyhow::Error>(node_state::set_mode_offline_tx(tx, FN).await?) })
+        Box::pin(async move {
+            Ok::<bool, anyhow::Error>(node_state::set_mode_offline_tx(tx, FN).await?)
+        })
     })
     .await
     .unwrap();
@@ -81,7 +85,9 @@ async fn set_mode_offline_tx_guard_refuses_non_online() {
     seed_node_state(&pool, NodeMode::Blocked, ShiftState::Opened).await;
 
     let applied = with_immediate(&pool, |tx| {
-        Box::pin(async move { Ok::<bool, anyhow::Error>(node_state::set_mode_offline_tx(tx, FN).await?) })
+        Box::pin(async move {
+            Ok::<bool, anyhow::Error>(node_state::set_mode_offline_tx(tx, FN).await?)
+        })
     })
     .await
     .unwrap();
