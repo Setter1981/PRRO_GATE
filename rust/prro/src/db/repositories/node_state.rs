@@ -240,6 +240,49 @@ pub async fn set_mode_stop_mode_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sql
     Ok(res.rows_affected() == 1)
 }
 
+/// A′.3 PR-O1 — operator GO_OFFLINE seam.  Flip `node_state.mode`
+/// `ONLINE → OFFLINE` for the FN.  Guarded single-statement CAS
+/// (`WHERE mode = 'ONLINE'`) so a concurrent state change is observed as
+/// `rows_affected == 0`; the caller (admin `go_offline`) fails loud on a
+/// non-applied outcome.  **MODE-ONLY** — `shift_state` is deliberately NOT
+/// touched (Frozen invariant #3: GO_OFFLINE is a node-mode flip, not a
+/// channel switch; it is legal across an open shift, which is what keeps the
+/// online-preopen decoupling pin valid).  There is no node-mode
+/// `allowed_transition` whitelist — the CAS guard IS the legality gate.
+///
+/// Carries no `node_state_updated_at` bump (column does not exist); the
+/// change is captured by the paired `ADMIN_GO_OFFLINE` Critical audit row
+/// the caller writes inside the same `with_immediate`.
+pub async fn set_mode_offline_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "UPDATE node_state SET mode = 'OFFLINE' WHERE fiscal_number = ? AND mode = 'ONLINE'",
+    )
+    .bind(fn_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// A′.3 PR-O1 — operator GO_ONLINE recovery seam.  Flip `node_state.mode`
+/// `OFFLINE | GOING_OFFLINE → GOING_ONLINE` for the FN.  Guarded CAS so the
+/// recovery is only initiated from an offline-family mode; other modes
+/// (`ONLINE`, `BLOCKED`, …) observe `rows_affected == 0`.  **MODE-ONLY**.
+/// The subsequent `GOING_ONLINE → ONLINE` finalize is driven by the drain
+/// path (return-online probe + backlog drain) — NOT by this setter (that
+/// convergence is inert until A′.3 O2 enables the supervisor path).
+///
+/// Change captured by the paired `ADMIN_GO_ONLINE` Critical audit row.
+pub async fn set_mode_going_online_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "UPDATE node_state SET mode = 'GOING_ONLINE' \
+         WHERE fiscal_number = ? AND mode IN ('OFFLINE', 'GOING_OFFLINE')",
+    )
+    .bind(fn_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStateRow>> {
     let row = sqlx::query!(
         r#"SELECT fiscal_number,
