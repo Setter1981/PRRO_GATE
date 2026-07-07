@@ -24,6 +24,7 @@ pub mod error;
 #[doc(hidden)]
 pub mod gen;
 pub mod grpc;
+pub mod t112;
 
 pub use channel::DpsChannel;
 pub use dto::{
