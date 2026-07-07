@@ -579,32 +579,51 @@ pub async fn seed_offline_codes(
             last: last_lnd,
         });
     }
-    let overlap: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM offline_codes WHERE fiscal_number = ? AND code_lnd BETWEEN ? AND ?",
-    )
-    .bind(fiscal_number)
-    .bind(first_lnd)
-    .bind(last_lnd)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| AdminError::Infrastructure(format!("overlap pre-check: {e}")))?;
-    if overlap > 0 {
-        return Err(AdminError::CodeRangeOverlapsExistingPool {
-            fiscal_number: fiscal_number.to_string(),
-            first: first_lnd,
-            last: last_lnd,
-            overlap_count: overlap,
-        });
-    }
-
+    let expected: u64 = (last_lnd - first_lnd + 1) as u64;
     let fn_owned = fiscal_number.to_string();
     let reason_owned = reason.to_string();
-    let inserted = with_immediate(pool, move |tx| {
+    // The overlap check + seed run in ONE `with_immediate` envelope so the
+    // RESERVED lock serialises concurrent seeders: the LOUD overlap reject
+    // cannot be raced past.  A pool-bound pre-check would TOCTOU — a concurrent
+    // seed could slip codes into the range between the check and the tx, and
+    // `seed_code_range_tx` (INSERT OR IGNORE) would then silently dedupe,
+    // breaking the "seed exactly once" contract.  The typed AdminError is
+    // carried out through `anyhow` and recovered by downcast (the
+    // offline_session typed-error-preservation idiom).
+    let result: Result<u64, anyhow::Error> = with_immediate(pool, move |tx| {
         Box::pin(async move {
+            let overlap: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM offline_codes \
+                 WHERE fiscal_number = ? AND code_lnd BETWEEN ? AND ?",
+            )
+            .bind(&fn_owned)
+            .bind(first_lnd)
+            .bind(last_lnd)
+            .fetch_one(&mut **tx)
+            .await?;
+            if overlap > 0 {
+                return Err(anyhow::Error::new(
+                    AdminError::CodeRangeOverlapsExistingPool {
+                        fiscal_number: fn_owned.clone(),
+                        first: first_lnd,
+                        last: last_lnd,
+                        overlap_count: overlap,
+                    },
+                ));
+            }
             let n = crate::db::repositories::offline_sessions::seed_code_range_tx(
                 tx, &fn_owned, first_lnd, last_lnd,
             )
             .await?;
+            // Defensive: after a clean (0-overlap) atomic check, INSERT OR IGNORE
+            // must have inserted the WHOLE range.  A mismatch means the pool
+            // moved under us — fail loud rather than silently under-seed.
+            if n != expected {
+                return Err(anyhow::anyhow!(
+                    "seed_offline_codes: inserted {n} codes, expected {expected} for range \
+                     [{first_lnd}..={last_lnd}] on fn={fn_owned} — unexpected pool state"
+                ));
+            }
             let payload = serde_json::json!({
                 "fiscal_number": fn_owned,
                 "reason": reason_owned,
@@ -625,8 +644,19 @@ pub async fn seed_offline_codes(
             Ok::<u64, anyhow::Error>(n)
         })
     })
-    .await
-    .map_err(|e| AdminError::Infrastructure(format!("seed_offline_codes envelope: {e}")))?;
+    .await;
+
+    let inserted = match result {
+        Ok(n) => n,
+        Err(e) => {
+            return Err(match e.downcast::<AdminError>() {
+                Ok(admin_err) => admin_err,
+                Err(other) => {
+                    AdminError::Infrastructure(format!("seed_offline_codes envelope: {other}"))
+                }
+            });
+        }
+    };
 
     Ok(SeedCodesOutcome {
         fiscal_number: fiscal_number.to_string(),
