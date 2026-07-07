@@ -959,6 +959,12 @@ impl DpsChannel for RecoveryDpsStub {
     async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
         unreachable!("RecoveryDpsStub: info_rro not exercised");
     }
+    async fn ask_offline_codes(
+        &self,
+        _: CheckEnvelope,
+    ) -> Result<prro::transports::dps::dto::OfflineCodesResponse, DpsError> {
+        unreachable!("RecoveryDpsStub: ask_offline_codes not exercised");
+    }
 }
 
 // ─── Seed helper for SENT crash-recovery fixtures (#4 / #5 / #6) ───────
@@ -1775,6 +1781,12 @@ impl DpsChannel for PerFnRecordingDpsStub {
     }
     async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
         unreachable!("PerFnRecordingDpsStub: info_rro not exercised");
+    }
+    async fn ask_offline_codes(
+        &self,
+        _: CheckEnvelope,
+    ) -> Result<prro::transports::dps::dto::OfflineCodesResponse, DpsError> {
+        unreachable!("PerFnRecordingDpsStub: ask_offline_codes not exercised");
     }
 }
 
@@ -2961,6 +2973,7 @@ impl SequenceProbingDpsStub {
     fn max_concurrency_observed(&self) -> usize {
         self.max_in_flight.load(Ordering::SeqCst)
     }
+
     fn calls_started(&self) -> usize {
         self.started.load(Ordering::SeqCst)
     }
@@ -2993,6 +3006,12 @@ impl DpsChannel for SequenceProbingDpsStub {
     }
     async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
         unreachable!()
+    }
+    async fn ask_offline_codes(
+        &self,
+        _: CheckEnvelope,
+    ) -> Result<prro::transports::dps::dto::OfflineCodesResponse, DpsError> {
+        unreachable!("SequenceProbingDpsStub: ask_offline_codes not exercised");
     }
 }
 

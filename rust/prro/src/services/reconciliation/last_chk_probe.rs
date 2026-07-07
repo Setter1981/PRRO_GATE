@@ -161,6 +161,12 @@ mod tests {
         async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
             unreachable!("stub: info_rro not exercised");
         }
+        async fn ask_offline_codes(
+            &self,
+            _: CheckEnvelope,
+        ) -> Result<crate::transports::dps::dto::OfflineCodesResponse, DpsError> {
+            unreachable!("stub: ask_offline_codes not exercised");
+        }
     }
 
     fn fn_sign() -> CheckSignBlob {

@@ -93,6 +93,16 @@ impl DpsChannel for ProbeStubChannel {
     async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
         unreachable!("ProbeStubChannel: info_rro not exercised")
     }
+
+    async fn ask_offline_codes(
+        &self,
+        _: prro::transports::dps::dto::CheckEnvelope,
+    ) -> Result<
+        prro::transports::dps::dto::OfflineCodesResponse,
+        prro::transports::dps::error::DpsError,
+    > {
+        unreachable!("stub: ask_offline_codes not exercised");
+    }
 }
 
 // ─── Boot fixture ──────────────────────────────────────────────────

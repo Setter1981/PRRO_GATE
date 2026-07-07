@@ -651,6 +651,16 @@ impl DpsChannel for StubAckDps {
     async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
         unreachable!("piece 4 stub: info_rro must not be invoked")
     }
+
+    async fn ask_offline_codes(
+        &self,
+        _: prro::transports::dps::dto::CheckEnvelope,
+    ) -> Result<
+        prro::transports::dps::dto::OfflineCodesResponse,
+        prro::transports::dps::error::DpsError,
+    > {
+        unreachable!("stub: ask_offline_codes not exercised");
+    }
 }
 
 /// Boot a real `App` over a throwaway temp DB (migrated, recovery run on

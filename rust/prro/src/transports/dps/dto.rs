@@ -88,6 +88,17 @@ pub struct DpsOperator {
     pub isname: String,
 }
 
+/// Successful T=112 ASK_OFFLINE_CODES response: the DPS-assigned offline
+/// code IDs parsed from the `data_sign` CMS payload.
+///
+/// Each element of `codes` is an opaque ASCII string (observed live:
+/// `"eYme-jhnkWQ"`).  DPS may return zero codes if the quota is already
+/// satisfied, or multiple codes when SIZE > 1 is requested.
+#[derive(Debug, Clone)]
+pub struct OfflineCodesResponse {
+    pub codes: Vec<String>,
+}
+
 /// Successful `RroInfoResponse` payload (status == OK).
 #[derive(Debug, Clone)]
 pub struct RroInfo {
@@ -245,6 +256,71 @@ pub(crate) fn try_decode_status_response(
             message: r.error_message,
         }),
     }
+}
+
+// ─── T=112 offline-codes decode ─────────────────────────────────────────────
+
+/// Parse `<ID>…</ID>` elements from the inner XML of a T=112 response.
+///
+/// Called by [`decode_offline_codes`] after the CMS envelope is stripped.
+/// The XML is declared `windows-1251` but the ID payloads are ASCII-safe;
+/// we parse as UTF-8 (a strict superset for ASCII content).
+///
+/// Handles both observed shapes:
+/// - `<RS V="1"><C T="112"><ID>…</ID></C></RS>` (live capture)
+/// - `<C T="112"><ID>…</ID></C>` (no RS wrapper)
+///
+/// Returns `Ok(vec![])` when no `<ID>` elements are present (empty quota or
+/// error path with an empty `<C>` block).  Returns `Err(DpsError::Decode)`
+/// on an unclosed `<ID>` or UTF-8 failure.
+pub fn parse_offline_codes_xml(xml: &[u8]) -> Result<Vec<String>, DpsError> {
+    let s = std::str::from_utf8(xml).map_err(|e| {
+        DpsError::Decode(format!(
+            "offline codes XML is not valid UTF-8 (expected ASCII-safe windows-1251): {e}"
+        ))
+    })?;
+    const OPEN: &str = "<ID>";
+    const CLOSE: &str = "</ID>";
+    let mut codes = Vec::new();
+    let mut rest = s;
+    loop {
+        match rest.find(OPEN) {
+            None => break,
+            Some(start) => {
+                let after_open = &rest[start + OPEN.len()..];
+                match after_open.find(CLOSE) {
+                    None => {
+                        return Err(DpsError::Decode(
+                            "unclosed <ID> element in offline codes XML".into(),
+                        ))
+                    }
+                    Some(end) => {
+                        codes.push(after_open[..end].to_string());
+                        rest = &after_open[end + CLOSE.len()..];
+                    }
+                }
+            }
+        }
+    }
+    Ok(codes)
+}
+
+/// Strip the CMS `SignedData` envelope from a T=112 `data_sign` blob, then
+/// parse the `<ID>` offline-code elements from the inner XML.
+///
+/// Used by [`super::grpc::GrpcDpsChannel::ask_offline_codes`] to convert the
+/// raw gRPC `CheckAck.data_sign` field into a typed [`OfflineCodesResponse`].
+///
+/// Two-stage decode:
+/// 1. `prro_crypto::cms::signed_data::extract_econtent` — strips the outer
+///    CMS `SignedData` DER, returns the raw `eContent` octets.
+/// 2. [`parse_offline_codes_xml`] — scans for `<ID>…</ID>` elements.
+pub(crate) fn decode_offline_codes(data_sign: &[u8]) -> Result<OfflineCodesResponse, DpsError> {
+    let inner = prro_crypto::cms::signed_data::extract_econtent(data_sign).map_err(|e| {
+        DpsError::Decode(format!("T=112 data_sign: CMS eContent strip failed: {e}"))
+    })?;
+    let codes = parse_offline_codes_xml(&inner)?;
+    Ok(OfflineCodesResponse { codes })
 }
 
 /// Same dispatch shape for `RroInfoResponse`.  `RroInfoResponse` does

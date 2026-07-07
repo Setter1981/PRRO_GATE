@@ -43,7 +43,9 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 
 use prro::transports::dps::channel::DpsChannel;
-use prro::transports::dps::dto::{CheckAck, CheckEnvelope, CheckSignBlob, RroInfo, StatusSnapshot};
+use prro::transports::dps::dto::{
+    CheckAck, CheckEnvelope, CheckSignBlob, OfflineCodesResponse, RroInfo, StatusSnapshot,
+};
 use prro::transports::dps::error::DpsError;
 
 /// One recorded wire call — the "envelope spy" entry.  Carries the call kind
@@ -53,6 +55,8 @@ use prro::transports::dps::error::DpsError;
 pub enum DpsCall {
     SendChk(CheckEnvelope),
     LastChk(CheckSignBlob),
+    /// T=112 ASK_OFFLINE_CODES call — carries the envelope sent to DPS.
+    AskCodes(CheckEnvelope),
 }
 
 /// Scripted DPS stub: two response queues (`send_chk` / `last_chk`), call
@@ -75,6 +79,9 @@ pub struct ScriptedDps {
     /// (`return_online_probe::run_tick_for_fn` calls `status_rro`).  Existing
     /// consumers never call `status_rro`, so this is behaviorally inert for them.
     status_q: Mutex<VecDeque<Result<StatusSnapshot, DpsError>>>,
+    /// T=112 ASK_OFFLINE_CODES response queue.  Empty → `DpsError::Internal`
+    /// (same over-call discipline as the other queues).
+    ask_codes_q: Mutex<VecDeque<Result<OfflineCodesResponse, DpsError>>>,
     calls: Mutex<Vec<DpsCall>>,
 }
 
@@ -92,6 +99,7 @@ impl ScriptedDps {
             last_reached: Mutex::new(None),
             last_block: Mutex::new(None),
             status_q: Mutex::new(VecDeque::new()),
+            ask_codes_q: Mutex::new(VecDeque::new()),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -107,6 +115,11 @@ impl ScriptedDps {
     /// Enqueue a `status_rro` response (the return-online probe).
     pub fn push_status(&self, r: Result<StatusSnapshot, DpsError>) {
         self.status_q.lock().unwrap().push_back(r);
+    }
+
+    /// Enqueue an `ask_offline_codes` response (T=112 ASK_OFFLINE_CODES).
+    pub fn push_ask_codes(&self, r: Result<OfflineCodesResponse, DpsError>) {
+        self.ask_codes_q.lock().unwrap().push_back(r);
     }
 
     /// Arm the `send_chk` await to hang.  `reached` fires when the await is
@@ -191,5 +204,19 @@ impl DpsChannel for ScriptedDps {
 
     async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
         unreachable!("stub: info_rro not exercised");
+    }
+
+    async fn ask_offline_codes(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> Result<OfflineCodesResponse, DpsError> {
+        self.calls.lock().unwrap().push(DpsCall::AskCodes(envelope));
+        let popped = self.ask_codes_q.lock().unwrap().pop_front();
+        popped.unwrap_or_else(|| {
+            Err(DpsError::Internal(
+                "ScriptedDps.ask_offline_codes: response queue empty (over-call / caller forgot to enqueue)"
+                    .to_string(),
+            ))
+        })
     }
 }
