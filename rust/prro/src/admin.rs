@@ -117,6 +117,43 @@ pub enum AdminError {
     /// reader (TTY or stdin) returned an IO error before EOF.
     #[error("admin: password input IO error: {0}")]
     PasswordReadIo(String),
+
+    /// A′.3 PR-O1 — the offline operator surface (GO_OFFLINE / GO_ONLINE)
+    /// is gated behind `FULL_OFFLINE_SURFACE_READY` until the drain path
+    /// lands (O2).  The door is deliberately shut in O1.
+    #[error(
+        "admin: offline operator surface is not enabled yet — GO_OFFLINE/GO_ONLINE is gated until the drain path lands (A′.3 O2)"
+    )]
+    OfflineSurfaceNotReady,
+
+    /// A′.3 PR-O1 — GO_OFFLINE / GO_ONLINE mode-guard failed: the FN is not
+    /// in the mode the command requires.  Refuses to mutate to avoid masking
+    /// legitimate state (mirrors `NotInStopMode`).
+    #[error(
+        "admin: fiscal_number {fiscal_number:?} current mode is {observed_mode:?}, expected {expected} — operator command misuse"
+    )]
+    NotInExpectedMode {
+        fiscal_number: String,
+        observed_mode: String,
+        expected: &'static str,
+    },
+
+    /// A′.3 PR-O1 — `seed-codes` range is empty or non-positive.
+    #[error("admin: invalid offline-code range [{first}..={last}] — require 1 <= first <= last")]
+    InvalidCodeRange { first: i64, last: i64 },
+
+    /// A′.3 PR-O1 — `seed-codes` range overlaps codes already in the pool.
+    /// Loud reject (the underlying primitive is INSERT OR IGNORE and would
+    /// silently dedupe) so an operator re-seed with a stale range is caught.
+    #[error(
+        "admin: offline-code range [{first}..={last}] overlaps {overlap_count} code(s) already in the pool for fiscal_number {fiscal_number:?} — codes must be seeded exactly once (only real DPS-issued ranges)"
+    )]
+    CodeRangeOverlapsExistingPool {
+        fiscal_number: String,
+        first: i64,
+        last: i64,
+        overlap_count: i64,
+    },
 }
 
 impl AdminError {
@@ -133,7 +170,12 @@ impl AdminError {
             | AdminError::DuplicateActiveCashier(_)
             | AdminError::EmptyPassword
             | AdminError::EmptyArgument(_)
-            | AdminError::PasswordMismatch => 64,
+            | AdminError::PasswordMismatch
+            | AdminError::NotInExpectedMode { .. }
+            | AdminError::InvalidCodeRange { .. }
+            | AdminError::CodeRangeOverlapsExistingPool { .. } => 64,
+            // EX_UNAVAILABLE (69): the gated offline surface is not enabled yet.
+            AdminError::OfflineSurfaceNotReady => 69,
             // EX_IOERR (74): input device failure.
             AdminError::PasswordReadIo(_) => 74,
         }
@@ -148,6 +190,32 @@ pub struct ResetOutcome {
     /// Number of `fiscal_documents` rows that had `consecutive_holds > 0`
     /// reset to 0.  Reflects scope of admin intervention.
     pub docs_reset_count: i64,
+}
+
+/// A′.3 PR-O1 — outcome of a successful `go_offline` (the mode flip +
+/// atomic offline-session open).
+#[derive(Debug)]
+pub struct GoOfflineOutcome {
+    pub fiscal_number: String,
+    /// Hex-lower id of the OPEN offline session created in the same envelope.
+    pub offline_session_id: String,
+}
+
+/// A′.3 PR-O1 — outcome of a successful `go_online` (mode → GOING_ONLINE).
+#[derive(Debug)]
+pub struct GoOnlineOutcome {
+    pub fiscal_number: String,
+}
+
+/// A′.3 PR-O1 — outcome of a successful `seed-codes` provisioning.
+#[derive(Debug)]
+pub struct SeedCodesOutcome {
+    pub fiscal_number: String,
+    pub first_lnd: i64,
+    pub last_lnd: i64,
+    /// Codes actually inserted (== range size, since the overlap pre-check
+    /// guarantees no pre-existing rows in range).
+    pub inserted_count: u64,
 }
 
 /// **Phase 2a.2 / REC-1 Tier 3 (2026-05-24)** — manual STOP_MODE reset
@@ -264,6 +332,337 @@ pub async fn reset_stop_mode(
     Ok(ResetOutcome {
         fiscal_number: fiscal_number.to_string(),
         docs_reset_count,
+    })
+}
+
+// ─── A′.3 PR-O1 — offline operator surface (mode-seam + open_session + seed-codes) ───
+
+/// Pre-read `node_state.mode` for an actionable wrong-mode diagnostic
+/// (mirrors `reset_stop_mode`'s pre-read; the in-tx CAS guard still enforces
+/// correctness under a concurrent probe).  Missing row → `FiscalNumberNotFound`.
+async fn read_mode(pool: &SqlitePool, fiscal_number: &str) -> Result<String, AdminError> {
+    let observed: Option<String> =
+        sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+            .bind(fiscal_number)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| AdminError::Infrastructure(format!("read node_state.mode: {e}")))?;
+    observed.ok_or_else(|| AdminError::FiscalNumberNotFound(fiscal_number.to_string()))
+}
+
+/// A′.3 PR-O1 — operator **GO_OFFLINE** (the public DOOR).  Gated behind
+/// [`crate::services::offline_sync::offline_surface::FULL_OFFLINE_SURFACE_READY`]:
+/// fail-closed with [`AdminError::OfflineSurfaceNotReady`] while the drain
+/// path is not yet enabled (O1).  The live door lands in O2 with the flag
+/// flip + coupling-pin.  The machinery ([`go_offline_inner`]) is proven in O1
+/// by direct unit tests + the offline reachability e2e (direct seams).
+pub async fn go_offline(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    reason: &str,
+) -> Result<GoOfflineOutcome, AdminError> {
+    crate::services::offline_sync::offline_surface::ensure_full_offline_surface_ready()
+        .map_err(|_| AdminError::OfflineSurfaceNotReady)?;
+    go_offline_inner(pool, fiscal_number, reason).await
+}
+
+/// The GO_OFFLINE machinery, gate-free (so O1 can prove the happy path while
+/// the door stays shut).  Atomic per one `with_immediate` envelope:
+///   1. CAS `node_state.mode` ONLINE → OFFLINE (MODE-ONLY; `shift_state`
+///      untouched — Frozen #3).
+///   2. Open an OFFLINE session (insert OPENING + Opening→Open CAS) so an
+///      OPEN session exists BEFORE any offline doc (closes the
+///      Offline-but-no-session window that `stage_offline_ack` Step-4 would
+///      otherwise reject with `NoActiveSession`).
+///   3. Emit `OFFLINE_SESSION_OPENED` (W5 parity) + `ADMIN_GO_OFFLINE`
+///      Critical audit rows.
+async fn go_offline_inner(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    reason: &str,
+) -> Result<GoOfflineOutcome, AdminError> {
+    if reason.trim().is_empty() {
+        return Err(AdminError::EmptyReason);
+    }
+    let observed = read_mode(pool, fiscal_number).await?;
+    if observed != "ONLINE" {
+        return Err(AdminError::NotInExpectedMode {
+            fiscal_number: fiscal_number.to_string(),
+            observed_mode: observed,
+            expected: "ONLINE",
+        });
+    }
+
+    let fn_owned = fiscal_number.to_string();
+    let reason_owned = reason.to_string();
+    let session_id = crate::db::models::ids::OfflineSessionId::new();
+    let opened_at = chrono::Utc::now().to_rfc3339();
+    let id_hex = crate::services::write_path::types::hex_encode_lower(session_id.as_bytes());
+    let id_hex_ret = id_hex.clone();
+
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // (1) MODE-ONLY CAS ONLINE → OFFLINE.
+            let flipped =
+                crate::db::repositories::node_state::set_mode_offline_tx(tx, &fn_owned).await?;
+            if !flipped {
+                return Err(anyhow::anyhow!(
+                    "admin: race detected during go_offline for fn={fn_owned} — mode CAS \
+                     rows_affected=0 (concurrent state change; re-run command)"
+                ));
+            }
+            // (2) Open the offline session atomically (same envelope).
+            crate::db::repositories::offline_sessions::insert_opening(
+                tx,
+                &crate::db::repositories::offline_sessions::NewOpeningSession {
+                    offline_session_id: session_id,
+                    fiscal_number: &fn_owned,
+                    opened_at: &opened_at,
+                },
+            )
+            .await?;
+            let outcome = crate::db::repositories::offline_sessions::transition_state(
+                tx,
+                session_id,
+                crate::db::models::enums::OfflineSessionState::Opening,
+                crate::db::models::enums::OfflineSessionState::Open,
+                None,
+            )
+            .await?;
+            if outcome != crate::db::repositories::fiscal_documents::TransitionOutcome::Applied {
+                return Err(anyhow::anyhow!(
+                    "admin: go_offline Opening→Open produced unexpected outcome: {outcome:?}"
+                ));
+            }
+            // (3a) OFFLINE_SESSION_OPENED audit (W5 service parity).
+            crate::db::repositories::audit_log::append_tx(
+                tx,
+                "offline_session",
+                &id_hex,
+                "OFFLINE_SESSION_OPENED",
+                crate::db::models::enums::Severity::Info,
+                None,
+                None,
+            )
+            .await?;
+            // (3b) ADMIN_GO_OFFLINE Critical audit with the mode transition.
+            let payload = serde_json::json!({
+                "fiscal_number": fn_owned,
+                "reason": reason_owned,
+                "mode_before": "ONLINE",
+                "mode_after": "OFFLINE",
+                "offline_session_id": id_hex,
+            });
+            crate::db::repositories::audit_log::append_tx(
+                tx,
+                "fn",
+                &fn_owned,
+                "ADMIN_GO_OFFLINE",
+                crate::db::models::enums::Severity::Critical,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(|e| AdminError::Infrastructure(format!("go_offline envelope: {e}")))?;
+
+    Ok(GoOfflineOutcome {
+        fiscal_number: fiscal_number.to_string(),
+        offline_session_id: id_hex_ret,
+    })
+}
+
+/// A′.3 PR-O1 — operator **GO_ONLINE** (the public recovery DOOR).  Gated
+/// like [`go_offline`].
+pub async fn go_online(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    reason: &str,
+) -> Result<GoOnlineOutcome, AdminError> {
+    crate::services::offline_sync::offline_surface::ensure_full_offline_surface_ready()
+        .map_err(|_| AdminError::OfflineSurfaceNotReady)?;
+    go_online_inner(pool, fiscal_number, reason).await
+}
+
+/// The GO_ONLINE machinery, gate-free.  CAS `node_state.mode`
+/// `OFFLINE | GOING_OFFLINE → GOING_ONLINE` (MODE-ONLY) + `ADMIN_GO_ONLINE`
+/// Critical audit.  The subsequent `GOING_ONLINE → ONLINE` convergence is
+/// driven by the drain path — NOT here (inert until O2).
+async fn go_online_inner(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    reason: &str,
+) -> Result<GoOnlineOutcome, AdminError> {
+    if reason.trim().is_empty() {
+        return Err(AdminError::EmptyReason);
+    }
+    let observed = read_mode(pool, fiscal_number).await?;
+    if observed != "OFFLINE" && observed != "GOING_OFFLINE" {
+        return Err(AdminError::NotInExpectedMode {
+            fiscal_number: fiscal_number.to_string(),
+            observed_mode: observed,
+            expected: "OFFLINE or GOING_OFFLINE",
+        });
+    }
+
+    let fn_owned = fiscal_number.to_string();
+    let reason_owned = reason.to_string();
+    let mode_before = observed.clone();
+
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            let flipped =
+                crate::db::repositories::node_state::set_mode_going_online_tx(tx, &fn_owned)
+                    .await?;
+            if !flipped {
+                return Err(anyhow::anyhow!(
+                    "admin: race detected during go_online for fn={fn_owned} — mode CAS \
+                     rows_affected=0 (concurrent state change; re-run command)"
+                ));
+            }
+            let payload = serde_json::json!({
+                "fiscal_number": fn_owned,
+                "reason": reason_owned,
+                "mode_before": mode_before,
+                "mode_after": "GOING_ONLINE",
+            });
+            crate::db::repositories::audit_log::append_tx(
+                tx,
+                "fn",
+                &fn_owned,
+                "ADMIN_GO_ONLINE",
+                crate::db::models::enums::Severity::Critical,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(|e| AdminError::Infrastructure(format!("go_online envelope: {e}")))?;
+
+    Ok(GoOnlineOutcome {
+        fiscal_number: fiscal_number.to_string(),
+    })
+}
+
+/// A′.3 PR-O1 (STOP-O1 ruling (b)) — manual offline-code provisioning for the
+/// pilot drill.  Seeds `[first_lnd ..= last_lnd]` into the FN's `offline_codes`
+/// pool via the tx-bound [`crate::db::repositories::offline_sessions::seed_code_range_tx`].
+///
+/// ⚠️ PILOT-DRILL AFFORDANCE, NOT a permanent mechanism.  The operator MUST
+/// seed ONLY real DPS-issued ranges for this FN (from the DPS cabinet / prior
+/// provisioning).  Invented codes would be sent to DPS on drain, rejected, and
+/// cascade into RMR escalations.  The production code-fetch (a DPS ask-codes
+/// request) is the named follow-up, co-scoped with the live campaign.
+///
+/// Validates the range (positive/ordered) and LOUD-rejects any overlap with the
+/// existing pool (the primitive is INSERT OR IGNORE and would otherwise silently
+/// dedupe a stale re-seed).  Emits `ADMIN_SEED_OFFLINE_CODES` Critical audit.
+pub async fn seed_offline_codes(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    first_lnd: i64,
+    last_lnd: i64,
+    reason: &str,
+) -> Result<SeedCodesOutcome, AdminError> {
+    if reason.trim().is_empty() {
+        return Err(AdminError::EmptyReason);
+    }
+    if first_lnd < 1 || first_lnd > last_lnd {
+        return Err(AdminError::InvalidCodeRange {
+            first: first_lnd,
+            last: last_lnd,
+        });
+    }
+    let expected: u64 = (last_lnd - first_lnd + 1) as u64;
+    let fn_owned = fiscal_number.to_string();
+    let reason_owned = reason.to_string();
+    // The overlap check + seed run in ONE `with_immediate` envelope so the
+    // RESERVED lock serialises concurrent seeders: the LOUD overlap reject
+    // cannot be raced past.  A pool-bound pre-check would TOCTOU — a concurrent
+    // seed could slip codes into the range between the check and the tx, and
+    // `seed_code_range_tx` (INSERT OR IGNORE) would then silently dedupe,
+    // breaking the "seed exactly once" contract.  The typed AdminError is
+    // carried out through `anyhow` and recovered by downcast (the
+    // offline_session typed-error-preservation idiom).
+    let result: Result<u64, anyhow::Error> = with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            let overlap: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM offline_codes \
+                 WHERE fiscal_number = ? AND code_lnd BETWEEN ? AND ?",
+            )
+            .bind(&fn_owned)
+            .bind(first_lnd)
+            .bind(last_lnd)
+            .fetch_one(&mut **tx)
+            .await?;
+            if overlap > 0 {
+                return Err(anyhow::Error::new(
+                    AdminError::CodeRangeOverlapsExistingPool {
+                        fiscal_number: fn_owned.clone(),
+                        first: first_lnd,
+                        last: last_lnd,
+                        overlap_count: overlap,
+                    },
+                ));
+            }
+            let n = crate::db::repositories::offline_sessions::seed_code_range_tx(
+                tx, &fn_owned, first_lnd, last_lnd,
+            )
+            .await?;
+            // Defensive: after a clean (0-overlap) atomic check, INSERT OR IGNORE
+            // must have inserted the WHOLE range.  A mismatch means the pool
+            // moved under us — fail loud rather than silently under-seed.
+            if n != expected {
+                return Err(anyhow::anyhow!(
+                    "seed_offline_codes: inserted {n} codes, expected {expected} for range \
+                     [{first_lnd}..={last_lnd}] on fn={fn_owned} — unexpected pool state"
+                ));
+            }
+            let payload = serde_json::json!({
+                "fiscal_number": fn_owned,
+                "reason": reason_owned,
+                "first_lnd": first_lnd,
+                "last_lnd": last_lnd,
+                "inserted_count": n,
+            });
+            crate::db::repositories::audit_log::append_tx(
+                tx,
+                "fn",
+                &fn_owned,
+                "ADMIN_SEED_OFFLINE_CODES",
+                crate::db::models::enums::Severity::Critical,
+                None,
+                Some(&payload.to_string()),
+            )
+            .await?;
+            Ok::<u64, anyhow::Error>(n)
+        })
+    })
+    .await;
+
+    let inserted = match result {
+        Ok(n) => n,
+        Err(e) => {
+            return Err(match e.downcast::<AdminError>() {
+                Ok(admin_err) => admin_err,
+                Err(other) => {
+                    AdminError::Infrastructure(format!("seed_offline_codes envelope: {other}"))
+                }
+            });
+        }
+    };
+
+    Ok(SeedCodesOutcome {
+        fiscal_number: fiscal_number.to_string(),
+        first_lnd,
+        last_lnd,
+        inserted_count: inserted,
     })
 }
 
@@ -880,6 +1279,62 @@ pub async fn run_reset_stop_mode(
     Ok(outcome)
 }
 
+/// Shared CLI boot for the A′.3 offline admin commands: read config, acquire
+/// the singleton lock (refuses to race `prro serve`), open the pool (runs
+/// migrations).  The returned guard MUST be held for the pool's lifetime.
+async fn open_admin_pool(
+    config_path: &Path,
+) -> Result<(crate::runtime::singleton::PidLock, SqlitePool), AdminError> {
+    let cfg_text = std::fs::read_to_string(config_path)
+        .map_err(|e| AdminError::Infrastructure(format!("read config: {e}")))?;
+    let cfg = crate::config::AppConfig::from_toml(&cfg_text)
+        .map_err(|e| AdminError::Infrastructure(format!("parse config: {e}")))?;
+    let lock = crate::runtime::singleton::acquire(&cfg.database.db_path)
+        .map_err(|e| AdminError::Infrastructure(format!("singleton lock: {e}")))?;
+    let pool = crate::db::open_pool(&cfg.database.db_path)
+        .await
+        .map_err(|e| AdminError::Infrastructure(format!("open db pool: {e}")))?;
+    Ok((lock, pool))
+}
+
+/// CLI entry-point for `prro admin go-offline`.
+pub async fn run_go_offline(
+    config_path: &Path,
+    fiscal_number: &str,
+    reason: &str,
+) -> Result<GoOfflineOutcome, AdminError> {
+    let (_lock, pool) = open_admin_pool(config_path).await?;
+    let outcome = go_offline(&pool, fiscal_number, reason).await?;
+    drop(pool);
+    Ok(outcome)
+}
+
+/// CLI entry-point for `prro admin go-online`.
+pub async fn run_go_online(
+    config_path: &Path,
+    fiscal_number: &str,
+    reason: &str,
+) -> Result<GoOnlineOutcome, AdminError> {
+    let (_lock, pool) = open_admin_pool(config_path).await?;
+    let outcome = go_online(&pool, fiscal_number, reason).await?;
+    drop(pool);
+    Ok(outcome)
+}
+
+/// CLI entry-point for `prro admin seed-codes`.
+pub async fn run_seed_offline_codes(
+    config_path: &Path,
+    fiscal_number: &str,
+    first_lnd: i64,
+    last_lnd: i64,
+    reason: &str,
+) -> Result<SeedCodesOutcome, AdminError> {
+    let (_lock, pool) = open_admin_pool(config_path).await?;
+    let outcome = seed_offline_codes(&pool, fiscal_number, first_lnd, last_lnd, reason).await?;
+    drop(pool);
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1027,6 +1482,246 @@ mod tests {
                 assert_eq!(fn_id, "9999999999");
             }
             other => panic!("expected FiscalNumberNotFound, got: {other:?}"),
+        }
+    }
+
+    // ─── A′.3 PR-O1 — offline operator surface ─────────────────────────
+
+    async fn read_offline_session_state(pool: &SqlitePool, fn_id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT state FROM offline_sessions WHERE fiscal_number = ?")
+            .bind(fn_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn latest_audit(pool: &SqlitePool, event_type: &str) -> Option<(String, String)> {
+        sqlx::query_as(
+            "SELECT severity, event_payload_json FROM audit_log \
+             WHERE event_type = ? ORDER BY audit_id DESC LIMIT 1",
+        )
+        .bind(event_type)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    /// RP-O1-8 (gated-pin): the DOOR stays shut while the surface flag is
+    /// false — GO_OFFLINE refuses without mutating.
+    #[tokio::test]
+    async fn go_offline_gated_refuses_while_surface_false() {
+        let (_d, pool) = fresh_pool().await;
+        seed_node_state(&pool, "ONLINE").await;
+
+        let err = go_offline(&pool, "1234567890", "operator net drop")
+            .await
+            .expect_err("door must be gated in O1");
+        assert!(matches!(err, AdminError::OfflineSurfaceNotReady));
+
+        let mode: String =
+            sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+                .bind("1234567890")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mode, "ONLINE");
+        assert!(read_offline_session_state(&pool, "1234567890")
+            .await
+            .is_none());
+    }
+
+    /// RP-O1-1 / RP-O1-2: the gate-free GO_OFFLINE machinery flips
+    /// ONLINE→OFFLINE (mode-only), opens an OPEN session in the SAME envelope
+    /// (no Offline-but-no-session window), and emits ADMIN_GO_OFFLINE.
+    #[tokio::test]
+    async fn go_offline_inner_flips_offline_opens_session_and_audits() {
+        let (_d, pool) = fresh_pool().await;
+        seed_node_state(&pool, "ONLINE").await;
+
+        let outcome = go_offline_inner(&pool, "1234567890", "operator net drop 2026-07-07")
+            .await
+            .unwrap();
+        assert_eq!(outcome.fiscal_number, "1234567890");
+        assert!(!outcome.offline_session_id.is_empty());
+
+        let (mode, shift): (String, String) =
+            sqlx::query_as("SELECT mode, shift_state FROM node_state WHERE fiscal_number = ?")
+                .bind("1234567890")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mode, "OFFLINE");
+        assert_eq!(
+            shift, "OPENED",
+            "GO_OFFLINE must not touch shift_state (Frozen #3)"
+        );
+
+        assert_eq!(
+            read_offline_session_state(&pool, "1234567890")
+                .await
+                .as_deref(),
+            Some("OPEN"),
+            "an OPEN session must exist before any offline doc"
+        );
+
+        let (sev, payload) = latest_audit(&pool, "ADMIN_GO_OFFLINE")
+            .await
+            .expect("ADMIN_GO_OFFLINE audit row");
+        assert_eq!(sev, "CRITICAL");
+        let p: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(p["mode_before"], "ONLINE");
+        assert_eq!(p["mode_after"], "OFFLINE");
+        assert_eq!(p["reason"], "operator net drop 2026-07-07");
+    }
+
+    /// GO_OFFLINE mode-guard: a non-ONLINE node is refused, unmutated.
+    #[tokio::test]
+    async fn go_offline_inner_refuses_non_online() {
+        let (_d, pool) = fresh_pool().await;
+        seed_node_state(&pool, "BLOCKED").await;
+
+        let err = go_offline_inner(&pool, "1234567890", "reason")
+            .await
+            .expect_err("must refuse non-ONLINE");
+        match err {
+            AdminError::NotInExpectedMode {
+                observed_mode,
+                expected,
+                ..
+            } => {
+                assert_eq!(observed_mode, "BLOCKED");
+                assert_eq!(expected, "ONLINE");
+            }
+            other => panic!("expected NotInExpectedMode, got {other:?}"),
+        }
+        let mode: String =
+            sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+                .bind("1234567890")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mode, "BLOCKED");
+    }
+
+    /// GO_OFFLINE rejects an empty/whitespace reason (forensic trail).
+    #[tokio::test]
+    async fn go_offline_inner_refuses_empty_reason() {
+        let (_d, pool) = fresh_pool().await;
+        seed_node_state(&pool, "ONLINE").await;
+        assert!(matches!(
+            go_offline_inner(&pool, "1234567890", "  ")
+                .await
+                .expect_err("empty reason"),
+            AdminError::EmptyReason
+        ));
+    }
+
+    /// RP-O1-8 (gated-pin) for the recovery door.
+    #[tokio::test]
+    async fn go_online_gated_refuses_while_surface_false() {
+        let (_d, pool) = fresh_pool().await;
+        seed_node_state(&pool, "OFFLINE").await;
+        assert!(matches!(
+            go_online(&pool, "1234567890", "dps back")
+                .await
+                .expect_err("gated"),
+            AdminError::OfflineSurfaceNotReady
+        ));
+    }
+
+    /// RP-O1-10: GO_ONLINE machinery flips OFFLINE→GOING_ONLINE + audits.
+    /// (Convergence drain→ONLINE is NOT asserted here — inert until O2.)
+    #[tokio::test]
+    async fn go_online_inner_flips_offline_to_going_online() {
+        let (_d, pool) = fresh_pool().await;
+        seed_node_state(&pool, "OFFLINE").await;
+
+        let outcome = go_online_inner(&pool, "1234567890", "dps connectivity restored")
+            .await
+            .unwrap();
+        assert_eq!(outcome.fiscal_number, "1234567890");
+        let mode: String =
+            sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+                .bind("1234567890")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mode, "GOING_ONLINE");
+        let (sev, payload) = latest_audit(&pool, "ADMIN_GO_ONLINE")
+            .await
+            .expect("ADMIN_GO_ONLINE audit");
+        assert_eq!(sev, "CRITICAL");
+        let p: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(p["mode_before"], "OFFLINE");
+        assert_eq!(p["mode_after"], "GOING_ONLINE");
+    }
+
+    /// RP-O1-6 / RP-O1-7: seed-codes populates the pool + Critical audit
+    /// with the range in the payload.
+    #[tokio::test]
+    async fn seed_offline_codes_populates_pool_and_audits() {
+        let (_d, pool) = fresh_pool().await;
+
+        let outcome = seed_offline_codes(&pool, "1234567890", 100, 104, "cabinet range 2026-07")
+            .await
+            .unwrap();
+        assert_eq!(outcome.inserted_count, 5);
+        assert_eq!(outcome.first_lnd, 100);
+        assert_eq!(outcome.last_lnd, 104);
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM offline_codes WHERE fiscal_number = ?")
+                .bind("1234567890")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 5);
+
+        let (sev, payload) = latest_audit(&pool, "ADMIN_SEED_OFFLINE_CODES")
+            .await
+            .expect("ADMIN_SEED_OFFLINE_CODES audit");
+        assert_eq!(sev, "CRITICAL");
+        let p: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(p["first_lnd"], 100);
+        assert_eq!(p["last_lnd"], 104);
+        assert_eq!(p["inserted_count"], 5);
+    }
+
+    /// seed-codes rejects a non-positive / inverted range.
+    #[tokio::test]
+    async fn seed_offline_codes_rejects_invalid_range() {
+        let (_d, pool) = fresh_pool().await;
+        assert!(matches!(
+            seed_offline_codes(&pool, "1234567890", 5, 3, "r")
+                .await
+                .expect_err("inverted"),
+            AdminError::InvalidCodeRange { .. }
+        ));
+        assert!(matches!(
+            seed_offline_codes(&pool, "1234567890", 0, 4, "r")
+                .await
+                .expect_err("non-positive"),
+            AdminError::InvalidCodeRange { .. }
+        ));
+    }
+
+    /// RP-O1-6: seed-codes LOUD-rejects an overlap with the existing pool
+    /// (the primitive is INSERT OR IGNORE; the command surfaces the overlap).
+    #[tokio::test]
+    async fn seed_offline_codes_rejects_overlap() {
+        let (_d, pool) = fresh_pool().await;
+        seed_offline_codes(&pool, "1234567890", 100, 104, "first")
+            .await
+            .unwrap();
+
+        let err = seed_offline_codes(&pool, "1234567890", 103, 106, "overlapping")
+            .await
+            .expect_err("overlap must be rejected loudly");
+        match err {
+            AdminError::CodeRangeOverlapsExistingPool { overlap_count, .. } => {
+                assert_eq!(overlap_count, 2, "codes 103, 104 overlap");
+            }
+            other => panic!("expected CodeRangeOverlapsExistingPool, got {other:?}"),
         }
     }
 }
