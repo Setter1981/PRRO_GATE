@@ -2179,6 +2179,85 @@ async fn live_smoke_9_offline_drain_mac_id() {
         None => println!("  FN genesis (empty data_sign) — pre-T112 MAC is empty"),
     }
 
+    // ── Step 2b: open a REAL DPS shift (crux — mirrors live_smoke_5b) ───────
+    // The offline SELL drain needs an OPEN shift ON DPS, else DPS rejects it
+    // with `-15` (no-shift).  The smoke's fresh in-memory DB only holds a LOCAL
+    // shift (seeded above for the SELL's shift_id FK); DPS knows nothing about
+    // it.  So drive a REAL SHIFT_OPEN through the production write-path FIRST:
+    // this (a) OPENS the shift server-side and (b) — via advance-at-SEND —
+    // advances `node_state.last_known_unsigned_xml_sha256` to sha256(the
+    // SHIFT_OPEN's unsigned canonical XML), so the T=112 request that follows
+    // chains off the SHIFT_OPEN hash automatically (its builder reads
+    // node_state; see Step 3's `pre_mac_hex`).  We MUST let the write-path
+    // advance the seed here — NOT hand-seed a hash — so the live chain is real.
+    //
+    // Local shift-state is intentionally NOT wired for an online SHIFT_OPEN
+    // (the M4 gap): a seeded PREPARED SHIFT_OPEN (shift_id NULL) driven through
+    // `reconcile_pending_with` skips `stage_acquire`, so NO local `shifts` row
+    // is created/transitioned — `confirm_shift_edge` no-ops on a NULL shift_id.
+    // Hence the offline SELL keeps referencing its OWN seeded OPENED shift
+    // (above); DPS-side and local shift tracking are decoupled by design.
+    println!("\n--- STEP 2b: LIVE SHIFT_OPEN (open the DPS shift + advance chain) ---");
+    {
+        let shift_business_ts = iso_now();
+        let (shift_doc, shift_req_id) =
+            seed_shift_open_prepared(pool, &fiscal_number, 0x5A, &shift_business_ts).await;
+        seed_inbox_processing_generic(
+            pool,
+            &fiscal_number,
+            &shift_req_id,
+            "SHIFT_OPEN",
+            SHIFT_OPEN_PAYLOAD_JSON,
+        )
+        .await;
+
+        let shift_signing_ctx = live_signing_ctx(&ek);
+        let shift_drive_fn_sign = sign_fn_blob(&ek, &fiscal_number);
+        let shift_deps = ReconciliationRuntime::single_fn(RuntimeView {
+            dps: &channel,
+            signing_ctx: &shift_signing_ctx,
+            fn_sign: &shift_drive_fn_sign,
+        });
+        app.reconcile_pending_with(shift_deps)
+            .await
+            .expect("reconcile_pending_with (LIVE SHIFT_OPEN) must succeed");
+
+        let shift_state = doc_state_piece4(pool, shift_doc).await;
+        let shift_sfn: Option<String> = sqlx::query_scalar(
+            "SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?",
+        )
+        .bind(shift_doc)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        println!("  SHIFT_OPEN post-reconcile: state={shift_state} server_fiscal_no={shift_sfn:?}");
+        print_live_diagnostics(pool, shift_doc).await;
+        assert_eq!(
+            shift_state, "SENT",
+            "LIVE SHIFT_OPEN must reach SENT (DPS ACK) so the DPS shift is OPEN for the offline \
+             drain — else the drain draws `-15` (no open shift). Diagnostics above carry the DPS \
+             code if it did not (e.g. -12 MAC / -8 date / -14 signer)."
+        );
+        assert!(
+            shift_sfn.is_some(),
+            "the LIVE SHIFT_OPEN ACK must populate server_fiscal_no (the DPS-assigned receipt id)"
+        );
+        // advance-at-SEND has moved node_state.last_known_unsigned_xml_sha256 to
+        // sha256(shift_open_xml); the T=112 builder below reads it as its <MAC>
+        // previous-hash, so the chain extends SHIFT_OPEN → T=112 automatically.
+        let after_shift_mac: Option<String> = {
+            let ns = node_state::get(pool, &fiscal_number)
+                .await
+                .expect("node_state row must exist")
+                .expect("node_state row present");
+            ns.last_known_unsigned_xml_sha256.map(|arr| hex_lower(&arr))
+        };
+        println!(
+            "  node_state MAC after SHIFT_OPEN advance-at-SEND: {after_shift_mac:?} \
+             (T=112 chains off this)"
+        );
+    }
+
     // ── Step 3: fetch ONE real T=112 opaque offline code (smoke-8 model) ───
     println!("\n--- T=112 FETCH (1 code) ---");
     let t112_di: i64 = std::env::var("PRRO_LIVE_DPS_T112_DI")
@@ -2340,6 +2419,76 @@ async fn live_smoke_9_offline_drain_mac_id() {
         "  post-T112 MAC seeded into node_state: {}",
         hex_lower(&post_t112_seed)
     );
+
+    // ── Step 4b: settle-poll — wait for DPS to advance its chain tip to the
+    //    T=112 request hash before going offline.  DPS advances its chain tip to
+    //    `sha256(t112_request_xml)` LAZILY (asynchronously) after a T=112
+    //    ASK_OFFLINE_CODES, not synchronously with the T=112 reply.  A back-to-
+    //    back offline drain races that advance and draws `-15
+    //    ERROR_BAD_HASH_PREV`.  Poll `lastChk` until the DPS-reported tip
+    //    (sha256 of the CMS-stripped previous check) equals `post_t112_seed` —
+    //    i.e. DPS now considers the T=112 request the chain tip — so the offline
+    //    SELL (which chains off `post_t112_seed`) is MAC-consistent on the drain.
+    //    Bounded window; on non-settle we SKIP (not FAIL) — a lazy DPS advance
+    //    is an operational timing condition, not a B9 regression.
+    {
+        const SETTLE_MAX_POLLS: usize = 20;
+        const SETTLE_SLEEP_SECS: u64 = 5;
+        println!("\n--- T=112 SETTLE POLL (wait for DPS tip == post_t112_seed) ---");
+        let mut settled = false;
+        for attempt in 1..=SETTLE_MAX_POLLS {
+            match channel.last_chk(&fn_sign).await {
+                Ok(a) if !a.data_sign.is_empty() => match extract_econtent(&a.data_sign) {
+                    Ok(inner) => {
+                        let tip: [u8; 32] = Sha256::digest(&inner).into();
+                        let matched = tip == post_t112_seed;
+                        println!(
+                            "  poll {attempt}/{SETTLE_MAX_POLLS}: DPS tip={} matched={matched}",
+                            hex_lower(&tip)
+                        );
+                        if matched {
+                            settled = true;
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        println!(
+                            "  poll {attempt}/{SETTLE_MAX_POLLS}: lastChk data_sign not CMS ({e}) — retrying"
+                        );
+                    }
+                },
+                Ok(_) => {
+                    println!(
+                        "  poll {attempt}/{SETTLE_MAX_POLLS}: lastChk data_sign empty — DPS tip not yet advanced"
+                    );
+                }
+                Err(DpsError::Server { code: -4, message }) => {
+                    println!(
+                        "Smoke 9 SKIP: DPS rate-limit (-4) during settle poll: {message}. Cool down 5+ min."
+                    );
+                    return;
+                }
+                Err(e) => {
+                    println!("  poll {attempt}/{SETTLE_MAX_POLLS}: lastChk error (non-fatal): {e:?}");
+                }
+            }
+            if attempt < SETTLE_MAX_POLLS {
+                tokio::time::sleep(Duration::from_secs(SETTLE_SLEEP_SECS)).await;
+            }
+        }
+        if !settled {
+            println!(
+                "Smoke 9 SKIP: DPS did not advance its chain tip to sha256(t112_xml)={} within \
+                 {SETTLE_MAX_POLLS} polls (~{}s) — the lazy T=112 chain advance never settled, so \
+                 a back-to-back offline drain would race it (-15 ERROR_BAD_HASH_PREV). This is an \
+                 operational timing condition, not a B9 regression. Re-run when DPS is responsive.",
+                hex_lower(&post_t112_seed),
+                SETTLE_MAX_POLLS as u64 * SETTLE_SLEEP_SECS
+            );
+            return;
+        }
+        println!("  SETTLED: DPS tip == post_t112_seed — safe to go offline + drain");
+    }
 
     // ── Step 5: admin::go_offline → node OFFLINE + OPEN session ────────────
     prro::admin::go_offline(
