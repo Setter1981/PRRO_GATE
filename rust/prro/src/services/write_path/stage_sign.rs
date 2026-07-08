@@ -41,7 +41,7 @@ use crate::db::repositories::{
     audit_log, document_files,
     document_files::DocumentFileKind,
     fiscal_documents::{self as fd, DocumentRow, TransitionOutcome},
-    fiscal_number_config as fn_config, node_state,
+    fiscal_number_config as fn_config, node_state, offline_sessions,
 };
 use crate::db::tx::with_immediate;
 use crate::xml::{
@@ -303,10 +303,17 @@ pub async fn run(
 
             if inputs.is_pinned {
                 // Reuse persisted inputs — do NOT re-read seed,
-                // do NOT re-allocate Z.
+                // do NOT re-allocate Z.  B9: on a re-entry the offline code was
+                // already stamped at the first pin → read it back (no
+                // re-acquire; INV-4 / INV-5).
+                let offline_dps_code = match resolve_offline_dps_code(tx, doc_id, &fn_id).await? {
+                    OfflineResolve::OnlineShaped => None,
+                    OfflineResolve::Stamped(code) => Some(code),
+                };
                 return Ok(PinResult::Reused {
                     previous_hash: inputs.previous_hash,
                     z_report_number: inputs.z_report_number,
+                    offline_dps_code,
                 });
             }
 
@@ -344,10 +351,20 @@ pub async fn run(
                     Some(p) if p.state != DocState::Prepared => {
                         PinResult::StateConflict { observed: p.state }
                     }
-                    Some(p) if p.is_pinned => PinResult::Reused {
-                        previous_hash: p.previous_hash,
-                        z_report_number: p.z_report_number,
-                    },
+                    Some(p) if p.is_pinned => {
+                        // Concurrent re-entry pinned first; reuse.  B9: read back
+                        // the offline stamp (or acquire if still unstamped).
+                        let offline_dps_code =
+                            match resolve_offline_dps_code(tx, doc_id, &fn_id).await? {
+                                OfflineResolve::OnlineShaped => None,
+                                OfflineResolve::Stamped(code) => Some(code),
+                            };
+                        PinResult::Reused {
+                            previous_hash: p.previous_hash,
+                            z_report_number: p.z_report_number,
+                            offline_dps_code,
+                        }
+                    }
                     Some(_) => PinResult::PinLost,
                     None => PinResult::RowMissing,
                 });
@@ -369,24 +386,38 @@ pub async fn run(
             )
             .await?;
 
+            // B9 Slice A — offline acquire+stamp in the SAME pin-tx, AFTER the
+            // pin UPDATE (doc confirmed PREPARED-pinned) and BEFORE the 3-NO-TX
+            // XML build, so the opaque code reaches `<MAC ID>` in the signed
+            // bytes.  Online docs / offline-without-session / offline-pool-
+            // exhausted → None (online-shaped; exhaustion defers to the
+            // offline-ack Abort path — see `resolve_offline_dps_code`).
+            let offline_dps_code = match resolve_offline_dps_code(tx, doc_id, &fn_id).await? {
+                OfflineResolve::OnlineShaped => None,
+                OfflineResolve::Stamped(code) => Some(code),
+            };
+
             Ok(PinResult::Pinned {
                 previous_hash: seed,
                 z_report_number: z,
+                offline_dps_code,
             })
         })
     })
     .await
     .map_err(bridge_anyhow)?;
 
-    let (previous_hash_raw, z_report_number) = match pinned {
+    let (previous_hash_raw, z_report_number, offline_dps_code) = match pinned {
         PinResult::Pinned {
             previous_hash,
             z_report_number,
+            offline_dps_code,
         }
         | PinResult::Reused {
             previous_hash,
             z_report_number,
-        } => (previous_hash, z_report_number),
+            offline_dps_code,
+        } => (previous_hash, z_report_number, offline_dps_code),
         PinResult::StateConflict { observed } => {
             return Err(SignError::StateConflict {
                 observed,
@@ -434,6 +465,10 @@ pub async fn run(
             lnd,
             z_report_number,
             previous_hash: previous_hash_raw.as_ref(),
+            // B9 Slice A — the opaque offline code (acquired+stamped in the
+            // pin-tx above) becomes `<MAC ID='{code}'>` in the SIGNED bytes.
+            // `None` → bare `<MAC>` (online / offline-online-shaped).
+            offline_dps_code: offline_dps_code.clone(),
             // W4-Z2a piece 14 + 15 (CRIT-1 + R1 round-3 fixes) — full
             // snapshot through for driver_mapping translation of BOTH
             // tax_group_1 AND tax_group_2 (`translate_tax_group` invoked
@@ -635,6 +670,9 @@ pub async fn re_sign_after_mac_recovery(
             lnd,
             z_report_number,
             previous_hash: Some(&new_previous_hash),
+            // MAC-recovery re-sign is online-lane (post-DPS-reject re-anchor);
+            // offline docs local-ack + drain, never re-sign here → bare `<MAC>`.
+            offline_dps_code: None,
             tax_resolution,
         })
         .await?;
@@ -663,6 +701,11 @@ struct NoTxBuildSignInputs<'a> {
     /// `Some(_)` for everyday SELL/RETURN/Z_REPORT and for MAC
     /// recovery (where the recovered hash is always known).
     previous_hash: Option<&'a [u8; 32]>,
+    /// B9 Slice A — opaque offline code emitted as `<MAC ID='{code}'>` in the
+    /// SIGNED bytes.  `Some` only for OFFLINE-origin docs stamped at sign;
+    /// `None` → bare `<MAC>` (online path, byte-identical; also the MAC-recovery
+    /// re-sign path, which is online-lane).
+    offline_dps_code: Option<String>,
     /// W4-Z2a piece 14 (external review CRIT-1 close) — full
     /// `TaxResolutionSnapshot` instead of just the canonical-keyed
     /// calc_map.  Drives BOTH:
@@ -722,13 +765,17 @@ async fn build_canonical_and_sign_no_tx(
         .map(|h| hex_encode(h))
         .unwrap_or_default();
 
-    let header = DocumentHeader::with_defaults(
+    let mut header = DocumentHeader::with_defaults(
         inputs.fn_id.to_string(),
         inputs.tax_number.to_string(),
         z_number_u32,
         ts_str,
         previous_hash_hex,
     );
+    // B9 Slice A — offline docs carry `<MAC ID='{offline_dps_code}'>` in the
+    // signed bytes; online docs keep `mac_id = None` (bare `<MAC>`,
+    // byte-identical).
+    header.mac_id = inputs.offline_dps_code.clone();
 
     // W4-Z2a piece 14 (external review CRIT-1 close): pass the
     // full snapshot through to `check_payload_from` so item
@@ -773,10 +820,21 @@ enum PinResult {
     Pinned {
         previous_hash: Option<[u8; 32]>,
         z_report_number: Option<i64>,
+        /// B9 Slice A — the opaque offline code to emit as `<MAC ID>` in the
+        /// SIGNED bytes.  `Some` only for OFFLINE-origin docs whose offline
+        /// preconditions held at sign (fresh Offline/GoingOffline mode + an
+        /// OPEN session): the code was acquired + stamped in THIS pin-tx.
+        /// `None` for online docs AND for offline docs signed online-shaped
+        /// (no OPEN session at sign → `stage_offline_ack` acquires later).
+        offline_dps_code: Option<String>,
     },
     Reused {
         previous_hash: Option<[u8; 32]>,
         z_report_number: Option<i64>,
+        /// B9 Slice A — on a re-entry (already-pinned), the offline code was
+        /// stamped on the first pin; read it back (do NOT re-acquire) so the
+        /// re-signed bytes carry the SAME `<MAC ID>` (INV-4 / INV-5).
+        offline_dps_code: Option<String>,
     },
     StateConflict {
         observed: DocState,
@@ -798,6 +856,132 @@ enum PinResult {
     RowMissing,
     PinLost,
     NodeStateMissing,
+}
+
+/// B9 Slice A — outcome of the offline acquire-OR-readback step inside the
+/// pin-tx.
+enum OfflineResolve {
+    /// Doc is online-origin, OR offline-origin but its offline preconditions
+    /// did not hold at sign (no fresh Offline/GoingOffline mode / no OPEN
+    /// session).  Sign online-shaped (bare `<MAC>`); `stage_offline_ack`
+    /// acquires the code later via the fallback path.  Carries `None`.
+    OnlineShaped,
+    /// Offline-origin doc with an available code: acquired + stamped in this
+    /// pin-tx (or read back from a prior pin).  Carries the opaque code.
+    Stamped(String),
+}
+
+/// B9 Slice A (architect-ratified 2026-07-08) — the sign-time offline
+/// acquire-OR-readback, run INSIDE the pin-tx after the pin/reuse resolves and
+/// BEFORE the canonical XML is built, so the opaque `offline_dps_code` lands in
+/// the SIGNED bytes as `<MAC ID>`.
+///
+/// Conditional stamp-at-sign (the ratified conservative variant): the code is
+/// acquired + stamped here ONLY when ALL hold —
+///
+/// 1. the row is OFFLINE-origin (`fs_mode = 'OFFLINE'`);
+/// 2. node mode ∈ {Offline, GoingOffline} on a FRESH tx-read (not the
+///    possibly-stale `WorkerContext` copy);
+/// 3. an OPEN offline session exists for the FN;
+/// 4. the doc is not already stamped (`offline_dps_code IS NULL` — idempotency
+///    guard, INV-4 / INV-5).
+///
+/// Else it returns `OnlineShaped` and the doc signs online-shaped (bare
+/// `<MAC>`), deferring acquisition to `stage_offline_ack` (the acquire-OR-
+/// readback fallback).  This covers three deferral cases, all preserving the
+/// pre-B9 behaviour: (a) no OPEN session at sign — the STOP-O3-1 soft deferral
+/// for SELL/RETURN (the intentional asymmetry the architect kept); (b) node
+/// flipped Online mid-flight; (c) **the offline code pool is EXHAUSTED at
+/// sign** — a no-code offline sell is never issued, so it signs online-shaped
+/// and `stage_offline_ack` terminates it in `Aborted` (the established #192
+/// terminal-refusal path), NOT a non-terminal PREPARED rest.
+///
+/// Idempotent re-entry: if the doc is already stamped (re-drive / already-pinned
+/// reuse), the persisted code is read back — NO second `acquire_code_tx`, so the
+/// offline code is consumed exactly once (INV-5).
+///
+/// I1: pure SQLite (mode read + session read + one-statement acquire CAS + one
+/// stamp UPDATE) — no crypto / network inside the tx.
+async fn resolve_offline_dps_code(
+    tx: &mut crate::db::tx::WriteTxConn<'_>,
+    doc_id: DocumentId,
+    fn_id: &str,
+) -> Result<OfflineResolve, anyhow::Error> {
+    // (1) OFFLINE-origin? Reuse the negation of the online-origin probe the D5
+    // gate already uses — a single scalar read of `fs_mode`.
+    if fd::is_online_origin_tx(tx, doc_id).await? {
+        return Ok(OfflineResolve::OnlineShaped);
+    }
+
+    // (4) Idempotency: already stamped (re-entry / boot re-drive)? Read back the
+    // code — do NOT acquire a second one.
+    if let Some(stamp) = fd::read_offline_stamp_tx(tx, doc_id).await? {
+        return Ok(OfflineResolve::Stamped(stamp.dps_code));
+    }
+
+    // (2) FRESH node-mode read: only Offline / GoingOffline stamp at sign.  A
+    // node that has since flipped Online (GO_ONLINE race) signs online-shaped.
+    let ns = match node_state::get_tx(tx, fn_id).await? {
+        Some(ns) => ns,
+        None => return Ok(OfflineResolve::OnlineShaped),
+    };
+    if !matches!(
+        ns.mode,
+        crate::db::models::enums::NodeMode::Offline
+            | crate::db::models::enums::NodeMode::GoingOffline
+    ) {
+        return Ok(OfflineResolve::OnlineShaped);
+    }
+
+    // (3) An OPEN offline session must exist to stamp `offline_session_id`.
+    // Absent → sign online-shaped; `stage_offline_ack` handles it (STOP-O3-1
+    // soft-deferral asymmetry preserved for SELL/RETURN).
+    let session_id = match offline_sessions::current_active_session_id_tx(tx, fn_id).await? {
+        Some(sid) => sid,
+        None => return Ok(OfflineResolve::OnlineShaped),
+    };
+
+    // Preconditions hold — try to acquire + stamp atomically in this pin-tx.
+    //
+    // POOL EXHAUSTED AT SIGN → sign ONLINE-SHAPED (bare `<MAC>`), do NOT refuse.
+    // A no-code offline sell was NEVER going to be issued: the established #192
+    // design (invariant_scan.rs:209-226 + the fuzzer's `mint_aborted_refusal`
+    // model) is "reality reaches SIGNED, then `stage_offline_ack` refuses
+    // (CodePoolExhausted) → the doc terminates in `Aborted`".  Deferring the
+    // exhaustion to offline-ack keeps that terminal-Abort path (no doc rests
+    // non-terminal at a quiescent boundary — #192 preserved) and is byte-for-
+    // byte the pre-B9 behaviour for the exhausted case.  The doc's `<MAC ID>`
+    // is irrelevant here — it never reaches the wire (aborted before drain).
+    // (This supersedes the earlier "PREPARED-retryable at sign" shape, which
+    // the fuzzer proved violates #192: a PREPARED doc resting on an empty pool
+    // is a `StuckNonTerminalDoc` because nothing re-drives it before the next
+    // quiescent scan.)
+    let acquired = match offline_sessions::acquire_code_tx(tx, fn_id, doc_id).await {
+        Ok(a) => a,
+        Err(offline_sessions::OfflineSessionError::CodePoolExhausted { .. }) => {
+            return Ok(OfflineResolve::OnlineShaped)
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let rows = fd::stamp_offline_issuance_tx(
+        tx,
+        doc_id,
+        fn_id,
+        acquired.code_lnd,
+        &acquired.consumed_at,
+        session_id,
+        &acquired.dps_code,
+    )
+    .await?;
+    // The `offline_dps_code IS NULL AND state='PREPARED'` guard matched (we are
+    // pre-CAS PREPARED and just confirmed unstamped above under the FN write
+    // lease) → exactly one row stamped.  A 0 here is a real invariant breach.
+    anyhow::ensure!(
+        rows == 1,
+        "stage_sign: stamp_offline_issuance_tx affected {rows} rows for doc {doc_id:?} \
+         (expected 1 — PREPARED + offline_dps_code IS NULL under the FN write lease)"
+    );
+    Ok(OfflineResolve::Stamped(acquired.dps_code))
 }
 
 /// Bridge `anyhow::Error` from `with_immediate` closures to typed

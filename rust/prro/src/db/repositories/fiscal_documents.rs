@@ -460,6 +460,140 @@ pub async fn transition_to_offline_local_ack_tx(
     })
 }
 
+/// B9 Slice A — stamp the offline-issuance columns onto a **PREPARED** doc,
+/// WITHOUT any state transition.  This is the sign-time half of the reorder:
+/// `stage_sign` acquires the offline code inside its pin-tx and stamps
+/// `offline_fiscal_no` / `offline_fiscal_date` / `offline_session_id` /
+/// `offline_dps_code` here, so the opaque code is available to the canonical
+/// XML builder as `<MAC ID='{offline_dps_code}'>` in the SIGNED bytes.
+///
+/// **Idempotency guard (INV-4 / INV-5).**  The WHERE clause requires
+/// `state = 'PREPARED' AND offline_dps_code IS NULL`.  On a re-entry / boot
+/// re-drive the columns are already set, the UPDATE matches 0 rows, and the
+/// caller reads the persisted stamp back instead of acquiring a second code —
+/// the offline code is consumed **exactly once**.  (`offline_dps_code` is
+/// NULL on every fresh PREPARED row and is only ever written here or by the
+/// `stage_offline_ack` fallback, so its NULL-ness is a clean
+/// "not-yet-stamped" signal.)
+///
+/// Returns `rows_affected`: `1` = stamped by this call; `0` = already stamped
+/// (re-entry) OR the row moved off PREPARED (caller re-reads the truth).
+pub async fn stamp_offline_issuance_tx(
+    tx: &mut WriteTxConn<'_>,
+    id: DocumentId,
+    fiscal_number: &str,
+    code_lnd: i64,
+    consumed_at: &str,
+    offline_session_id: OfflineSessionId,
+    dps_code: &str,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE fiscal_documents \
+         SET offline_fiscal_no = ?, \
+             offline_fiscal_date = ?, \
+             offline_session_id = ?, \
+             offline_dps_code = ? \
+         WHERE document_id = ? AND fiscal_number = ? \
+           AND state = 'PREPARED' AND offline_dps_code IS NULL",
+    )
+    .bind(code_lnd)
+    .bind(consumed_at)
+    .bind(offline_session_id)
+    .bind(dps_code)
+    .bind(id)
+    .bind(fiscal_number)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// B9 Slice A — read back the offline-issuance stamp on a doc (the columns
+/// [`stamp_offline_issuance_tx`] wrote at sign).  Used by the re-entry branch
+/// in `stage_sign` (to thread the already-stamped `offline_dps_code` into the
+/// XML builder without re-acquiring) and by the `stage_offline_ack`
+/// acquire-OR-readback branch.  Returns `None` if the row is missing or the
+/// stamp is absent (`offline_dps_code IS NULL`).
+pub async fn read_offline_stamp_tx(
+    tx: &mut WriteTxConn<'_>,
+    id: DocumentId,
+) -> sqlx::Result<Option<OfflineStamp>> {
+    let row = sqlx::query!(
+        r#"SELECT offline_fiscal_no,
+                  offline_fiscal_date,
+                  offline_session_id as "offline_session_id: OfflineSessionId",
+                  offline_dps_code
+           FROM fiscal_documents WHERE document_id = ?"#,
+        id
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(r) = row else { return Ok(None) };
+    match (
+        r.offline_fiscal_no,
+        r.offline_fiscal_date,
+        r.offline_session_id,
+        r.offline_dps_code,
+    ) {
+        (Some(code_lnd), Some(consumed_at), Some(offline_session_id), Some(dps_code)) => {
+            Ok(Some(OfflineStamp {
+                code_lnd,
+                consumed_at,
+                offline_session_id,
+                dps_code,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The offline-issuance stamp read back by [`read_offline_stamp_tx`].
+#[derive(Debug, Clone)]
+pub struct OfflineStamp {
+    pub code_lnd: i64,
+    pub consumed_at: String,
+    pub offline_session_id: OfflineSessionId,
+    pub dps_code: String,
+}
+
+/// B9 Slice A — slim `SIGNED → OFFLINE_LOCAL_ACK` state CAS with **no** column
+/// writes.  Used by `stage_offline_ack` when the offline-issuance columns were
+/// already stamped at sign (the [`stamp_offline_issuance_tx`] path): the
+/// offline_fiscal_no / date / session_id / dps_code are already correct on the
+/// row, so the ack only advances state.  Whitelist-gated + cross-FN guarded
+/// exactly like [`transition_to_offline_local_ack_tx`] (which stays for the
+/// unstamped fallback path that acquires at ack-time).
+pub async fn transition_signed_to_offline_local_ack_tx(
+    tx: &mut WriteTxConn<'_>,
+    id: DocumentId,
+    fiscal_number: &str,
+) -> sqlx::Result<TransitionOutcome> {
+    if !allowed_transition(DocState::Signed, DocState::OfflineLocalAck) {
+        return Ok(TransitionOutcome::Forbidden);
+    }
+    let res = sqlx::query(
+        "UPDATE fiscal_documents \
+         SET state = 'OFFLINE_LOCAL_ACK' \
+         WHERE document_id = ? AND fiscal_number = ? AND state = 'SIGNED'",
+    )
+    .bind(id)
+    .bind(fiscal_number)
+    .execute(&mut **tx)
+    .await?;
+    if res.rows_affected() == 1 {
+        return Ok(TransitionOutcome::Applied);
+    }
+    let exists: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM fiscal_documents WHERE document_id = ? LIMIT 1")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(if exists.is_some() {
+        TransitionOutcome::Conflict
+    } else {
+        TransitionOutcome::NotFound
+    })
+}
+
 /// Returns documents in non-final, non-handed-off states for the given FN,
 /// in deterministic order suitable for fiscal-chain recovery.
 ///

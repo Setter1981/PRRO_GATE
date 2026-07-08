@@ -330,51 +330,78 @@ pub async fn run(
                     }
                 };
 
-            // ─── Step 6: acquire code (atomic single-statement CAS) ─
+            // ─── Step 6: acquire-OR-readback the offline code ───────
             //
-            // Validations + pre-check all passed.  This is the first
-            // point a write touches `offline_codes` — any earlier
-            // refusal returned BEFORE this call, so code pool stays
-            // intact on refusal.  An EXHAUSTED pool is a LEGITIMATE
+            // B9 Slice A (architect-ratified 2026-07-08) — the dual-path.
+            // The offline code may already have been acquired + stamped at
+            // SIGN (`stage_sign` conditional stamp-at-sign, when an OPEN
+            // session existed at sign) so it could land in the SIGNED bytes
+            // as `<MAC ID>`.  In that case the offline columns are ALREADY on
+            // the row: READ THEM BACK and do only the state CAS — do NOT
+            // acquire a second code (INV-5, consumed-once).  Otherwise (the
+            // preserved STOP-O3-1 fallback: no OPEN session at sign, SELL/
+            // RETURN soft-deferral) acquire here as before.
+            //
+            // An EXHAUSTED pool on the ACQUIRE branch is a LEGITIMATE
             // operational refusal: surface it as a TYPED
-            // `Refused(CodePoolExhausted)` (committing the refusal
-            // audit, code pool untouched) so the inline orchestrator
-            // ABORTS the SIGNED doc + maps a precise
-            // `OFFLINE_CODE_POOL_EXHAUSTED` refusal — NOT the former
-            // raw-anyhow Err that rolled back into the catch-all
-            // `DISPATCH_INTERNAL` and orphaned the SIGNED doc.  Any
-            // OTHER (structural) error still propagates as `Err`.
-            let acquired = match offline_sessions::acquire_code_tx(tx, &fn_id, doc_id).await {
-                Ok(a) => a,
-                Err(offline_sessions::OfflineSessionError::CodePoolExhausted { .. }) => {
-                    return audit_and_return_refused(
-                        tx,
-                        doc_id,
-                        &fn_id,
-                        RefusalReason::CodePoolExhausted,
-                    )
-                    .await;
-                }
-                Err(e) => return Err(e.into()),
-            };
-
-            // ─── Step 7: transition Signed → OfflineLocalAck ────────
-            //
-            // Single UPDATE stamps state + offline_fiscal_no +
-            // offline_fiscal_date + offline_session_id + offline_dps_code
-            // atomically (operator W7 criterion 5; B8-2 adds dps_code).
-            // Helper also filters on `fiscal_number` in the WHERE clause
-            // (operator W7 Round 1 HIGH-2 fix).
-            let outcome = fd::transition_to_offline_local_ack_tx(
-                tx,
-                doc_id,
-                &fn_id,
-                acquired.code_lnd,
-                &acquired.consumed_at,
-                session_id,
-                &acquired.dps_code,
-            )
-            .await?;
+            // `Refused(CodePoolExhausted)` (committing the refusal audit, code
+            // pool untouched) so the inline orchestrator ABORTS the SIGNED doc
+            // + maps a precise `OFFLINE_CODE_POOL_EXHAUSTED` refusal.  (The
+            // sign-time exhaustion is a DIFFERENT path — it keeps the doc
+            // PREPARED via `SignError::OfflineCodePoolExhausted`; see the
+            // two-path note in the B9 PR.)  Any OTHER (structural) error still
+            // propagates as `Err`.
+            let (code_lnd, consumed_at, session_id_used, outcome) =
+                match fd::read_offline_stamp_tx(tx, doc_id).await? {
+                    // Readback path — stamped at sign; slim state-only CAS.
+                    Some(stamp) => {
+                        let outcome =
+                            fd::transition_signed_to_offline_local_ack_tx(tx, doc_id, &fn_id)
+                                .await?;
+                        (
+                            stamp.code_lnd,
+                            stamp.consumed_at,
+                            stamp.offline_session_id,
+                            outcome,
+                        )
+                    }
+                    // Fallback path — not stamped at sign; acquire + full stamp.
+                    None => {
+                        let acquired =
+                            match offline_sessions::acquire_code_tx(tx, &fn_id, doc_id).await {
+                                Ok(a) => a,
+                                Err(offline_sessions::OfflineSessionError::CodePoolExhausted {
+                                    ..
+                                }) => {
+                                    return audit_and_return_refused(
+                                        tx,
+                                        doc_id,
+                                        &fn_id,
+                                        RefusalReason::CodePoolExhausted,
+                                    )
+                                    .await;
+                                }
+                                Err(e) => return Err(e.into()),
+                            };
+                        // Single UPDATE stamps state + offline_fiscal_no +
+                        // offline_fiscal_date + offline_session_id +
+                        // offline_dps_code atomically (operator W7 criterion 5;
+                        // B8-2 adds dps_code).  Helper also filters on
+                        // `fiscal_number` in the WHERE clause (W7 Round 1
+                        // HIGH-2 fix).
+                        let outcome = fd::transition_to_offline_local_ack_tx(
+                            tx,
+                            doc_id,
+                            &fn_id,
+                            acquired.code_lnd,
+                            &acquired.consumed_at,
+                            session_id,
+                            &acquired.dps_code,
+                        )
+                        .await?;
+                        (acquired.code_lnd, acquired.consumed_at, session_id, outcome)
+                    }
+                };
 
             match outcome {
                 TransitionOutcome::Applied => {
@@ -429,11 +456,15 @@ pub async fn run(
                     }
 
                     // ─── Step 8: emit Applied audit ─────────────────
+                    // B9: `code_lnd` / `consumed_at` / `session_id_used` come
+                    // from the acquire-OR-readback tuple (readback = stamped
+                    // at sign; acquire = fallback), so the audit + outcome are
+                    // identical regardless of which path issued the code.
                     let payload = json!({
                         "document_id": hex_lower(doc_id.as_bytes()),
-                        "code_lnd": acquired.code_lnd,
-                        "consumed_at": acquired.consumed_at,
-                        "offline_session_id": hex_lower(session_id.as_bytes()),
+                        "code_lnd": code_lnd,
+                        "consumed_at": consumed_at,
+                        "offline_session_id": hex_lower(session_id_used.as_bytes()),
                     });
                     audit_log::append_tx(
                         tx,
@@ -447,9 +478,9 @@ pub async fn run(
                     .await?;
                     Ok::<OfflineAckOutcome, anyhow::Error>(OfflineAckOutcome::Applied {
                         document_id: doc_id,
-                        code_lnd: acquired.code_lnd,
-                        consumed_at: acquired.consumed_at,
-                        offline_session_id: session_id,
+                        code_lnd,
+                        consumed_at,
+                        offline_session_id: session_id_used,
                     })
                 }
                 TransitionOutcome::Forbidden => {
