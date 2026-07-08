@@ -323,6 +323,41 @@ async fn count_doc_type(pool: &SqlitePool, dt: DocType) -> i64 {
     .unwrap()
 }
 
+/// The unsigned canonical XML (PAYLOAD_XML) + stamped offline_dps_code of the
+/// single boundary doc of `dt`.  The `<MAC ID='...'>` lives in the unsigned
+/// canonical XML (the signed CMS is an opaque .p7s blob).
+async fn boundary_payload_xml_and_code(pool: &SqlitePool, dt: DocType) -> (String, Option<String>) {
+    let (doc_id, code): (Vec<u8>, Option<String>) = sqlx::query_as(
+        "SELECT document_id, offline_dps_code FROM fiscal_documents \
+         WHERE fiscal_number = ? AND doc_type = ?",
+    )
+    .bind(FN)
+    .bind(dt)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let xml_bytes: Vec<u8> = sqlx::query_scalar(
+        "SELECT content FROM document_files WHERE document_id = ? AND kind = 'PAYLOAD_XML'",
+    )
+    .bind(&doc_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    // cp1251 payload; the MAC/ID region is ASCII so lossy UTF-8 is fine for the
+    // substring assertion.
+    (String::from_utf8_lossy(&xml_bytes).into_owned(), code)
+}
+
+async fn consumed_code_count(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM offline_codes WHERE fiscal_number = ? AND consumed_at IS NOT NULL",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // #4 (HEADLINE) — drain wire order is [9, SHIFT_OPEN? content…, 10]
 // ══════════════════════════════════════════════════════════════════════════
@@ -655,4 +690,143 @@ async fn b10_crashed_prepared_begin_fails_closed_fresh_sell() {
             .all(|s| s != "OFFLINE_LOCAL_ACK" && s != "SIGNED"),
         "SELL must not have signed against a non-issued BEGIN: {sell_states:?}"
     );
+}
+
+/// Run the full offline cycle (SHIFT_OPEN → go_offline → seed → offline SELL →
+/// go_online → drain) and return the app + drain carriers so callers can probe
+/// the drained ledger.  Panics on any unexpected outcome.
+async fn run_full_offline_drain(n_drain_docs: usize) -> (App, DrainCarriers) {
+    let app = boot_app().await;
+    let registry = build_registry(&app, shift_open_only_dps()).await;
+    seed_boot_baseline(app.db()).await;
+    let write_path = production_write_path(app.clone(), Arc::new(registry));
+
+    drive(
+        &*write_path,
+        app.db(),
+        entry("SHIFT_OPEN", SHIFT_OPEN_PAYLOAD, "idem-OPEN", None),
+    )
+    .await
+    .expect("SHIFT_OPEN");
+    prro::admin::go_offline(app.db(), FN, "net drop")
+        .await
+        .expect("go_offline");
+    let codes: Vec<String> = (0..6).map(|i| format!("CODE-{i}")).collect();
+    prro::admin::seed_dps_offline_codes(app.db(), FN, &codes)
+        .await
+        .expect("seed codes");
+    drive(
+        &*write_path,
+        app.db(),
+        entry("SELL", SELL_PAYLOAD, "idem-SELL", Some(TOTAL_KOP)),
+    )
+    .await
+    .expect("offline SELL");
+    prro::admin::go_online(app.db(), FN, "restored")
+        .await
+        .expect("go_online");
+
+    let carriers = drain_carriers(n_drain_docs);
+    let view = drain_view(&carriers);
+    let outcome = app
+        .drain_offline_backlog_scheduled(FN, &view)
+        .await
+        .expect("drain must run");
+    match outcome {
+        ScheduledDrainOutcome::Ran(s) => {
+            assert!(s.finalized(), "drain must finalize");
+        }
+        ScheduledDrainOutcome::SkippedBackoff { .. } => panic!("first tick must run"),
+    }
+    (app, carriers)
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// #8 (TEETH) — the DocType=10 END, minted UNDER live GoingOnline at drain
+// finalize, MUST sign an OFFLINE-shaped receipt: `<MAC ID='{code}'>` (NOT a
+// bare `<MAC>`) and consume EXACTLY one pool code.  A bare `<MAC>` is the exact
+// naive-`run_staged` bug (gates 2/3 fail under GoingOnline/Draining → -5/-9).
+// ══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn b10_end_signed_offline_shaped_with_mac_id_under_going_online() {
+    let (app, _carriers) = run_full_offline_drain(3).await; // BEGIN + SELL + END
+
+    let (end_xml, end_code) =
+        boundary_payload_xml_and_code(app.db(), DocType::OfflineSessionEnd).await;
+
+    // TEETH: the END carries `<MAC ID='...'>` (offline shape), NOT a bare <MAC>.
+    assert!(
+        end_xml.contains("<MAC ID='"),
+        "END must sign OFFLINE-shaped <MAC ID='...'> (naive path signs bare <MAC>): {end_xml}"
+    );
+    // It carries a real acquired pool code in the MAC ID.
+    let code = end_code.expect("END must have a stamped offline_dps_code");
+    assert!(
+        end_xml.contains(&format!("<MAC ID='{code}'>")),
+        "END <MAC ID> must equal its acquired code {code}: {end_xml}"
+    );
+    // It is a `<C T="110">` service receipt.
+    assert!(
+        end_xml.contains(r#"<C T="110">"#),
+        "END must be <C T=110>: {end_xml}"
+    );
+}
+
+#[tokio::test]
+async fn b10_boundary_docs_consume_exactly_two_codes() {
+    // BEGIN consumes 1 code (minted while Offline), END consumes 1 code (minted
+    // while GoingOnline).  content SELL consumes 1.  So 3 codes total for a
+    // 1-content session; exactly 2 are the boundary docs.
+    let (app, _carriers) = run_full_offline_drain(3).await;
+    assert_eq!(
+        consumed_code_count(app.db()).await,
+        3,
+        "BEGIN + SELL + END each consume exactly one pool code"
+    );
+    assert_eq!(
+        count_doc_type(app.db(), DocType::OfflineSessionBegin).await,
+        1
+    );
+    assert_eq!(
+        count_doc_type(app.db(), DocType::OfflineSessionEnd).await,
+        1
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// #7 — crash-idempotent drain: re-running drain after a converged session does
+// NOT re-mint / re-send / re-consume-code the boundary docs.
+// ══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn b10_redrain_after_convergence_does_not_double_mint_or_double_consume() {
+    let (app, _c1) = run_full_offline_drain(3).await;
+
+    let codes_before = consumed_code_count(app.db()).await;
+    let begin_before = count_doc_type(app.db(), DocType::OfflineSessionBegin).await;
+    let end_before = count_doc_type(app.db(), DocType::OfflineSessionEnd).await;
+
+    // Re-run the drain tick (idempotent re-entry — session already CLOSED /
+    // node ONLINE).  Must not mint a 2nd BEGIN/END or consume a 2nd code.
+    let c2 = drain_carriers(0);
+    let view = drain_view(&c2);
+    let _ = app.drain_offline_backlog_scheduled(FN, &view).await;
+
+    assert_eq!(
+        consumed_code_count(app.db()).await,
+        codes_before,
+        "re-drain must NOT consume additional codes (INV-5)"
+    );
+    assert_eq!(
+        count_doc_type(app.db(), DocType::OfflineSessionBegin).await,
+        begin_before,
+        "re-drain must NOT re-mint the BEGIN"
+    );
+    assert_eq!(
+        count_doc_type(app.db(), DocType::OfflineSessionEnd).await,
+        end_before,
+        "re-drain must NOT re-mint the END"
+    );
+    prro::db::invariant_scan::assert_clean(app.db()).await;
 }

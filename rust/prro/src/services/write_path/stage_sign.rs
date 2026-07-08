@@ -230,6 +230,9 @@ pub async fn run(
     let business_ts = command.business_ts.clone();
     let total_sum_kop = command.total_sum_kop;
     let payload_json = command.payload_json.clone();
+    // B10 — captured `Copy` doc_type for the offline-code resolve dispatch
+    // (the END takes the forced OPEN|DRAINING + no-mode-gate path).
+    let doc_type = command.doc_type;
     let wire_artifact_kind = derive_wire_artifact_kind(command.doc_type)?;
 
     // ─── Stage 3-PRE-READ ─────────────────────────────────────────────
@@ -315,10 +318,11 @@ pub async fn run(
                 // do NOT re-allocate Z.  B9: on a re-entry the offline code was
                 // already stamped at the first pin → read it back (no
                 // re-acquire; INV-4 / INV-5).
-                let offline_dps_code = match resolve_offline_dps_code(tx, doc_id, &fn_id).await? {
-                    OfflineResolve::OnlineShaped => None,
-                    OfflineResolve::Stamped(code) => Some(code),
-                };
+                let offline_dps_code =
+                    match resolve_offline_dps_code(tx, doc_id, &fn_id, doc_type).await? {
+                        OfflineResolve::OnlineShaped => None,
+                        OfflineResolve::Stamped(code) => Some(code),
+                    };
                 return Ok(PinResult::Reused {
                     previous_hash: inputs.previous_hash,
                     z_report_number: inputs.z_report_number,
@@ -364,7 +368,7 @@ pub async fn run(
                         // Concurrent re-entry pinned first; reuse.  B9: read back
                         // the offline stamp (or acquire if still unstamped).
                         let offline_dps_code =
-                            match resolve_offline_dps_code(tx, doc_id, &fn_id).await? {
+                            match resolve_offline_dps_code(tx, doc_id, &fn_id, doc_type).await? {
                                 OfflineResolve::OnlineShaped => None,
                                 OfflineResolve::Stamped(code) => Some(code),
                             };
@@ -401,10 +405,11 @@ pub async fn run(
             // bytes.  Online docs / offline-without-session / offline-pool-
             // exhausted → None (online-shaped; exhaustion defers to the
             // offline-ack Abort path — see `resolve_offline_dps_code`).
-            let offline_dps_code = match resolve_offline_dps_code(tx, doc_id, &fn_id).await? {
-                OfflineResolve::OnlineShaped => None,
-                OfflineResolve::Stamped(code) => Some(code),
-            };
+            let offline_dps_code =
+                match resolve_offline_dps_code(tx, doc_id, &fn_id, doc_type).await? {
+                    OfflineResolve::OnlineShaped => None,
+                    OfflineResolve::Stamped(code) => Some(code),
+                };
 
             Ok(PinResult::Pinned {
                 previous_hash: seed,
@@ -915,6 +920,7 @@ async fn resolve_offline_dps_code(
     tx: &mut crate::db::tx::WriteTxConn<'_>,
     doc_id: DocumentId,
     fn_id: &str,
+    doc_type: DocType,
 ) -> Result<OfflineResolve, anyhow::Error> {
     // (1) OFFLINE-origin? Reuse the negation of the online-origin probe the D5
     // gate already uses — a single scalar read of `fs_mode`.
@@ -923,9 +929,22 @@ async fn resolve_offline_dps_code(
     }
 
     // (4) Idempotency: already stamped (re-entry / boot re-drive)? Read back the
-    // code — do NOT acquire a second one.
+    // code — do NOT acquire a second one.  (Runs BEFORE the doc-type dispatch so
+    // a re-driven END reuses its code without re-acquiring — INV-5.)
     if let Some(stamp) = fd::read_offline_stamp_tx(tx, doc_id).await? {
         return Ok(OfflineResolve::Stamped(stamp.dps_code));
+    }
+
+    // B10 (W10b) — the DocType=10 (OFFLINE_SESSION_END) is minted at DRAIN
+    // finalize, where node mode is `GoingOnline` (gate 2 below rejects) and the
+    // session is `DRAINING` (gate 3's strict-OPEN reader returns None).  Both
+    // standard gates fail → the END would sign a BARE `<MAC>` (the -5/-9 bug).
+    // It takes the FORCED path (dossier §10 STEP B): skip the node-mode gate,
+    // read the OPEN-OR-DRAINING session, acquire+stamp.  SCOPED to the END
+    // doc-type ONLY — SELL/RETURN never reach this branch and keep the strict
+    // gates verbatim (no leak, W7 criterion 6 intact).
+    if doc_type == DocType::OfflineSessionEnd {
+        return resolve_offline_dps_code_forced(tx, doc_id, fn_id).await;
     }
 
     // (2) FRESH node-mode read: only Offline / GoingOffline stamp at sign.  A
@@ -988,6 +1007,60 @@ async fn resolve_offline_dps_code(
     anyhow::ensure!(
         rows == 1,
         "stage_sign: stamp_offline_issuance_tx affected {rows} rows for doc {doc_id:?} \
+         (expected 1 — PREPARED + offline_dps_code IS NULL under the FN write lease)"
+    );
+    Ok(OfflineResolve::Stamped(acquired.dps_code))
+}
+
+/// B10 (W10b) — the FORCED offline-code resolve for the drain-time DocType=10
+/// (OFFLINE_SESSION_END) mint (dossier §10 STEP B).  A doc-type-scoped TWIN of
+/// [`resolve_offline_dps_code`] steps (2)/(3): it does NOT gate on node mode
+/// (the drain runs under `GoingOnline`) and reads the `OPEN|DRAINING` session
+/// (the drain flipped it to `DRAINING`).  Everything else is byte-identical to
+/// the shared fn's acquire+stamp tail — same `acquire_code_tx`, same
+/// `stamp_offline_issuance_tx`, same pool-exhausted → OnlineShaped deferral.
+///
+/// Preconditions the CALLER guarantees before this fires: `doc_type ==
+/// OfflineSessionEnd` (so a SELL/RETURN can never reach here), OFFLINE-origin
+/// (checked in the shared fn step 1), and not-already-stamped (step 4).  The
+/// shared fn dispatches here only after those hold.
+async fn resolve_offline_dps_code_forced(
+    tx: &mut crate::db::tx::WriteTxConn<'_>,
+    doc_id: DocumentId,
+    fn_id: &str,
+) -> Result<OfflineResolve, anyhow::Error> {
+    // Session gate widened to OPEN|DRAINING (the END is minted while DRAINING).
+    // Absent → OnlineShaped (defensive; the drain caller only mints the END
+    // when the session exists — a missing session here is a structural anomaly
+    // the caller's OLA step surfaces, not a silent bare-MAC).
+    let session_id =
+        match offline_sessions::current_open_or_draining_session_id_tx(tx, fn_id).await? {
+            Some(sid) => sid,
+            None => return Ok(OfflineResolve::OnlineShaped),
+        };
+
+    // Acquire + stamp — identical tail to the shared fn (pool-exhausted defers
+    // to the offline-ack Abort path).
+    let acquired = match offline_sessions::acquire_code_tx(tx, fn_id, doc_id).await {
+        Ok(a) => a,
+        Err(offline_sessions::OfflineSessionError::CodePoolExhausted { .. }) => {
+            return Ok(OfflineResolve::OnlineShaped)
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let rows = fd::stamp_offline_issuance_tx(
+        tx,
+        doc_id,
+        fn_id,
+        acquired.code_lnd,
+        &acquired.consumed_at,
+        session_id,
+        &acquired.dps_code,
+    )
+    .await?;
+    anyhow::ensure!(
+        rows == 1,
+        "stage_sign(END): stamp_offline_issuance_tx affected {rows} rows for doc {doc_id:?} \
          (expected 1 — PREPARED + offline_dps_code IS NULL under the FN write lease)"
     );
     Ok(OfflineResolve::Stamped(acquired.dps_code))

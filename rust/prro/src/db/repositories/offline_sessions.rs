@@ -462,6 +462,33 @@ pub async fn current_active_session_id_tx(
     .await
 }
 
+/// B10 (W10b) — tx-bound reader widened to `OPEN|DRAINING`, for the
+/// drain-time DocType=10 (OFFLINE_SESSION_END) mint ONLY.
+///
+/// The END is minted at drain finalize, when the session is `DRAINING` (the
+/// per-doc drain loop already flipped Open→Draining).  The strict-`OPEN`
+/// [`current_active_session_id_tx`] therefore returns `None` at that point — the
+/// exact reason the naive offline-sign path fails to stamp the END (dossier
+/// §10 gate 3).  This widened reader is the sanctioned bypass: it is invoked
+/// only from the boundary-END forced-resolve path (`stage_sign::
+/// resolve_offline_dps_code_forced`), never from the regular SELL/RETURN sign
+/// (which stays strict-OPEN so an in-progress drain does not extend the
+/// backlog — W7 criterion 6).  Schema partial UNIQUE `ux_offline_active` still
+/// guarantees at most one such row.
+pub async fn current_open_or_draining_session_id_tx(
+    tx: &mut WriteTxConn<'_>,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<OfflineSessionId>> {
+    sqlx::query_scalar::<_, OfflineSessionId>(
+        "SELECT offline_session_id FROM offline_sessions \
+         WHERE fiscal_number = ? AND state IN ('OPEN', 'DRAINING') \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
 /// M3b W9b §2.2 step 3 — pool-bound read of the FN's currently-active
 /// session, widened to `OPEN|DRAINING`.
 ///
