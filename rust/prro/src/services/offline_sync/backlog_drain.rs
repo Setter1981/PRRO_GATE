@@ -2609,16 +2609,14 @@ async fn ensure_and_drain_session_end(
 
     let shift_id = match ns.current_shift_id {
         Some(s) => s,
-        // No shift bound → cannot mint a shift-scoped boundary doc; a session
-        // with content docs always has a shift.  Structural anomaly → halt
-        // finalize via a recorded failure (operator surface), do NOT close.
-        None => {
-            summary.record_doc_failure(
-                DocumentId::new(),
-                "offline_session_end_no_shift".to_string(),
-            );
-            return Ok(());
-        }
+        // No shift bound → this is NOT a B10-eligible offline session: the
+        // boundary docs are shift-scoped (a real offline session is always
+        // opened within a shift — boot→SHIFT_OPEN→go_offline→sells).  A
+        // shiftless session at finalize is a synthetic / pre-B10 drain shape;
+        // SKIP the END (do NOT wedge the finalize) — proceed to close normally.
+        // Fail-closing here would strand any such session forever with no
+        // operator remedy.
+        None => return Ok(()),
     };
 
     // ── ADOPT: is there already a boundary END for this (fn, shift)? ──
