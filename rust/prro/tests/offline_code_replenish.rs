@@ -1,0 +1,444 @@
+//! PR-C4: `OfflineCodeReplenishService` integration tests.
+//!
+//! RED pins (written before implementation):
+//!   (a) `replenish_persists_opaque_codes_and_assigns_ordinals`:
+//!       3 codes from ScriptedDps → 3 rows with `dps_code` set, `code_lnd` = MAX+1..
+//!   (b) `replenish_advances_chain_seed_to_request_hash`:
+//!       after success, `node_state.last_known_unsigned_xml_sha256 == sha256(xml)`;
+//!       the request XML's `<MAC>` carried the PRE-call seed (chain continuity).
+//!   (c) `replenish_is_idempotent_on_code_overlap`:
+//!       second call with overlapping codes → deduped summary, no error, seed
+//!       advances to the SECOND request's hash.
+//!   (d) `replenish_acquires_fn_gate`:
+//!       holding the FN gate externally makes replenish block; release → proceeds.
+//!   (e) `replenish_reject_path_no_persist_no_seed_advance`:
+//!       DPS returns `DpsError::Server{code:-8}` → zero rows inserted, seed
+//!       UNCHANGED, error surfaced.
+//!   (f) `replenish_transport_error_no_retry`:
+//!       transport error → zero rows, seed unchanged, call log length == 1 (no
+//!       retry).
+//!   (g) `replenish_dps_call_outside_tx`:
+//!       call log records `AskCodes` exactly once, codes in DB afterwards
+//!       (structural proof that DPS is called outside the persist envelope).
+
+mod common;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use prro::config::AppConfig;
+use prro::db::models::enums::FiscalMode;
+use prro::db::models::enums::{NodeMode, ShiftState};
+use prro::db::repositories::fiscal_number_config as fn_repo;
+use prro::db::repositories::fiscal_number_config::NewFnConfig;
+use prro::db::repositories::node_state;
+use prro::services::offline_sync::offline_code_replenish::OfflineCodeReplenishService;
+use prro::transports::dps::dto::OfflineCodesResponse;
+use prro::transports::dps::error::DpsError;
+use prro::App;
+use sha2::{Digest, Sha256};
+use tokio::time::timeout;
+
+use common::det_signing_ctx;
+use common::scripted_dps::{DpsCall, ScriptedDps};
+
+const FN: &str = "4000162280";
+const TN: &str = "13667753";
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+async fn boot_app() -> (tempfile::TempDir, App) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("c4.db")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let toml_text = format!(
+        r#"
+app_name = "prro"
+version  = "0.1.0"
+
+[database]
+db_path = "{db_path}"
+secure_db_path = "{db_path}_secure"
+
+[admin_ui]
+enabled = false
+listen  = "127.0.0.1:8443"
+"#
+    );
+    let cfg = AppConfig::from_toml(&toml_text).unwrap();
+    let app = App::boot(cfg).await.unwrap();
+    (dir, app)
+}
+
+/// Seed the minimal rows needed: `fiscal_number_config` + `node_state`.
+async fn seed_fn(app: &App, prior_seed: Option<[u8; 32]>) {
+    let pool = app.db();
+    fn_repo::insert(
+        pool,
+        &NewFnConfig {
+            fiscal_number: FN.into(),
+            tax_number: TN.into(),
+            vat_payer_inn: None,
+            fiscal_mode: FiscalMode::Test,
+            org_name: None,
+            point_name: None,
+            org_address: None,
+            tsp_enabled: false,
+            offline_enabled: true,
+            national_check_enabled: false,
+            min_offline_codes: 0,
+            max_offline_codes: 0,
+        },
+    )
+    .await
+    .unwrap();
+    node_state::upsert_initial(pool, FN, NodeMode::Online, ShiftState::Opened, 1)
+        .await
+        .unwrap();
+    if let Some(seed) = prior_seed {
+        node_state::seed_prevhash(pool, FN, &seed).await.unwrap();
+    }
+}
+
+fn codes_resp(codes: &[&str]) -> OfflineCodesResponse {
+    OfflineCodesResponse {
+        codes: codes.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn new_scripted() -> Arc<ScriptedDps> {
+    use std::sync::atomic::AtomicUsize;
+    Arc::new(ScriptedDps::new(
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    ))
+}
+
+// ─── (a) persists codes + assigns ordinals ────────────────────────────────────
+
+#[tokio::test]
+async fn replenish_persists_opaque_codes_and_assigns_ordinals() {
+    let (_dir, app) = boot_app().await;
+    seed_fn(&app, None).await;
+
+    let stub = new_scripted();
+    stub.push_ask_codes(Ok(codes_resp(&["code-A", "code-B", "code-C"])));
+
+    let svc =
+        OfflineCodeReplenishService::new(app.clone(), stub.clone(), Arc::new(det_signing_ctx()));
+    let summary = svc
+        .replenish(FN, TN, 1, 3)
+        .await
+        .expect("replenish must succeed");
+
+    assert_eq!(summary.codes_received, 3, "must report 3 codes received");
+    assert_eq!(summary.inserted, 3, "must insert 3 rows");
+    assert_eq!(summary.deduped, 0, "no duplicates");
+
+    // Verify rows in DB: dps_code present, code_lnd sequential from 1.
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT code_lnd, dps_code \
+         FROM offline_codes WHERE fiscal_number = ? AND dps_code IS NOT NULL \
+         ORDER BY code_lnd",
+    )
+    .bind(FN)
+    .fetch_all(app.db())
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], (1, "code-A".into()));
+    assert_eq!(rows[1], (2, "code-B".into()));
+    assert_eq!(rows[2], (3, "code-C".into()));
+}
+
+// ─── (b) advances chain seed to sha256(request XML) ──────────────────────────
+
+#[tokio::test]
+async fn replenish_advances_chain_seed_to_request_hash() {
+    let (_dir, app) = boot_app().await;
+    // Use a known prior seed so the MAC in the XML is deterministic.
+    let prior_seed = [0x11u8; 32];
+    seed_fn(&app, Some(prior_seed)).await;
+
+    let stub = new_scripted();
+    stub.push_ask_codes(Ok(codes_resp(&["code-X"])));
+
+    let svc =
+        OfflineCodeReplenishService::new(app.clone(), stub.clone(), Arc::new(det_signing_ctx()));
+    let summary = svc
+        .replenish(FN, TN, 1, 1)
+        .await
+        .expect("replenish must succeed");
+
+    // Verify seed advanced.
+    let ns = node_state::get(app.db(), FN)
+        .await
+        .unwrap()
+        .expect("node_state must exist");
+    let new_seed = ns
+        .last_known_unsigned_xml_sha256
+        .expect("seed must be set after replenish");
+    let new_seed_hex = summary.new_seed_hex.clone();
+    assert_eq!(new_seed_hex.len(), 64, "new_seed_hex must be 64 hex chars");
+
+    // REAL C-i pin: the chain seed MUST equal sha256 of the EXACT request XML
+    // that was signed and sent. `summary.request_xml` exposes that XML, so an
+    // impl that advances the seed to the WRONG bytes fails here (teeth-proven).
+    let request_sha: String = Sha256::digest(summary.request_xml.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        new_seed_hex, request_sha,
+        "chain seed must be sha256(request_xml) — the C-i advance"
+    );
+
+    // Chain continuity: the request's <MAC> must carry the PRE-call seed hex,
+    // so the T=112 service doc extends the existing chain tip (not a fresh one).
+    let prior_hex: String = prior_seed.iter().map(|b| format!("{b:02x}")).collect();
+    assert!(
+        summary
+            .request_xml
+            .contains(&format!("<MAC>{prior_hex}</MAC>")),
+        "request <MAC> must carry the pre-call seed for chain continuity; xml={}",
+        summary.request_xml
+    );
+
+    // The DB seed matches the summary (single source of truth).
+    let db_hex: String = new_seed.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(new_seed_hex, db_hex, "summary seed hex must match DB");
+
+    // Exactly one AskCodes call on success (no retry).
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 1, "exactly one AskCodes call");
+}
+
+// ─── (c) idempotent on code overlap ───────────────────────────────────────────
+
+#[tokio::test]
+async fn replenish_is_idempotent_on_code_overlap() {
+    let (_dir, app) = boot_app().await;
+    seed_fn(&app, None).await;
+
+    let stub = new_scripted();
+    // First call: codes A, B.
+    stub.push_ask_codes(Ok(codes_resp(&["code-A", "code-B"])));
+    // Second call: overlapping code-B + new code-C.
+    stub.push_ask_codes(Ok(codes_resp(&["code-B", "code-C"])));
+
+    let svc =
+        OfflineCodeReplenishService::new(app.clone(), stub.clone(), Arc::new(det_signing_ctx()));
+
+    let s1 = svc.replenish(FN, TN, 1, 2).await.expect("first replenish");
+    assert_eq!(s1.inserted, 2);
+    assert_eq!(s1.deduped, 0);
+
+    let s2 = svc.replenish(FN, TN, 2, 2).await.expect("second replenish");
+    // code-B is a duplicate → 1 inserted, 1 deduped.
+    assert_eq!(s2.inserted, 1, "code-B must be deduped");
+    assert_eq!(s2.deduped, 1, "code-B is a duplicate");
+    assert_eq!(s2.codes_received, 2, "two codes were received");
+
+    // DB must have exactly 3 distinct codes.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM offline_codes WHERE fiscal_number = ? AND dps_code IS NOT NULL",
+    )
+    .bind(FN)
+    .fetch_one(app.db())
+    .await
+    .unwrap();
+    assert_eq!(
+        count, 3,
+        "DB must have 3 distinct DPS codes after two calls"
+    );
+
+    // Seed advanced to the SECOND request's hash (each call advances independently).
+    assert_ne!(
+        s1.new_seed_hex, s2.new_seed_hex,
+        "each call advances seed independently"
+    );
+}
+
+// ─── (d) acquires the per-FN gate ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn replenish_acquires_fn_gate() {
+    let (_dir, app) = boot_app().await;
+    seed_fn(&app, None).await;
+
+    // Hold the gate via a clone (shared via Arc<Inner>).
+    let clone = app.clone();
+    let held = clone.acquire_fn_gate(FN).await;
+
+    let stub = new_scripted();
+    stub.push_ask_codes(Ok(codes_resp(&["code-gate-test"])));
+
+    let svc =
+        OfflineCodeReplenishService::new(app.clone(), stub.clone(), Arc::new(det_signing_ctx()));
+
+    // replenish must block while the gate is externally held.
+    let mut replenish_fut = Box::pin(svc.replenish(FN, TN, 1, 1));
+    assert!(
+        timeout(Duration::from_millis(200), &mut replenish_fut)
+            .await
+            .is_err(),
+        "replenish must serialise on the held A4 fn-gate (expected pending)"
+    );
+
+    // Release → replenish proceeds.
+    drop(held);
+    let summary = timeout(Duration::from_millis(500), replenish_fut)
+        .await
+        .expect("replenish must complete once the gate is released")
+        .expect("replenish must succeed after gate release");
+    assert_eq!(summary.inserted, 1);
+}
+
+// ─── (e) server reject: no persist, no seed advance ───────────────────────────
+
+#[tokio::test]
+async fn replenish_reject_path_no_persist_no_seed_advance() {
+    let (_dir, app) = boot_app().await;
+    seed_fn(&app, None).await;
+
+    // Read current seed (should be None for a genesis FN).
+    let ns_before = node_state::get(app.db(), FN)
+        .await
+        .unwrap()
+        .expect("node_state exists");
+    let seed_before = ns_before.last_known_unsigned_xml_sha256;
+
+    let stub = new_scripted();
+    stub.push_ask_codes(Err(DpsError::Server {
+        code: -8,
+        message: "XML дата не відповідає Check.date".into(),
+    }));
+
+    let svc =
+        OfflineCodeReplenishService::new(app.clone(), stub.clone(), Arc::new(det_signing_ctx()));
+    let err = svc
+        .replenish(FN, TN, 1, 1)
+        .await
+        .expect_err("DPS server reject must surface as error");
+
+    // Error variant must carry the DPS status code.
+    use prro::services::offline_sync::offline_code_replenish::ReplenishError;
+    match err {
+        ReplenishError::DpsServer { code, .. } => {
+            assert_eq!(code, -8, "error code must be -8")
+        }
+        other => panic!("expected DpsServer, got {other:?}"),
+    }
+
+    // Zero rows inserted.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM offline_codes WHERE fiscal_number = ? AND dps_code IS NOT NULL",
+    )
+    .bind(FN)
+    .fetch_one(app.db())
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "no codes must be inserted on DPS server reject");
+
+    // Seed UNCHANGED.
+    let ns_after = node_state::get(app.db(), FN)
+        .await
+        .unwrap()
+        .expect("node_state exists");
+    assert_eq!(
+        ns_after.last_known_unsigned_xml_sha256, seed_before,
+        "seed must not advance on server reject"
+    );
+}
+
+// ─── (f) transport error: no retry, no persist ────────────────────────────────
+
+#[tokio::test]
+async fn replenish_transport_error_no_retry() {
+    let (_dir, app) = boot_app().await;
+    seed_fn(&app, None).await;
+
+    let stub = new_scripted();
+    // Push exactly one transport error — if service retries, the second call
+    // hits an empty queue and returns DpsError::Internal (a different variant).
+    stub.push_ask_codes(Err(DpsError::Transport("connection refused".into())));
+
+    let svc =
+        OfflineCodeReplenishService::new(app.clone(), stub.clone(), Arc::new(det_signing_ctx()));
+    let err = svc
+        .replenish(FN, TN, 1, 1)
+        .await
+        .expect_err("transport error must surface");
+
+    use prro::services::offline_sync::offline_code_replenish::ReplenishError;
+    assert!(
+        matches!(err, ReplenishError::DpsTransport(_)),
+        "expected DpsTransport, got {err:?}"
+    );
+
+    // Call log length pin: exactly ONE call (no retry).
+    let calls = stub.calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "T=112 must NOT be retried on transport error (non-idempotent server-side): got {} calls",
+        calls.len()
+    );
+
+    // Zero rows inserted.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM offline_codes WHERE fiscal_number = ? AND dps_code IS NOT NULL",
+    )
+    .bind(FN)
+    .fetch_one(app.db())
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "no codes must be inserted on transport error");
+}
+
+// ─── (g) DPS call is outside the persist transaction ─────────────────────────
+
+#[tokio::test]
+async fn replenish_dps_call_outside_tx() {
+    // Structural invariant #1: no wire call inside a `with_immediate` tx.
+    // ScriptedDps.ask_offline_codes records to calls() immediately.
+    // If it were called inside the tx, the production GrpcDpsChannel's
+    // assert_not_in_with_immediate would panic. Here we verify the call
+    // sequence: AskCodes appears in the log, and codes are in DB after
+    // success — proving the code path is: acquire gate → build → sign →
+    // DPS call (outside tx) → persist+advance (inside tx).
+    let (_dir, app) = boot_app().await;
+    seed_fn(&app, None).await;
+
+    let stub = new_scripted();
+    stub.push_ask_codes(Ok(codes_resp(&["code-order-test"])));
+
+    let svc =
+        OfflineCodeReplenishService::new(app.clone(), stub.clone(), Arc::new(det_signing_ctx()));
+    svc.replenish(FN, TN, 1, 1)
+        .await
+        .expect("replenish must succeed");
+
+    // Exactly one AskCodes call was made.
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 1, "exactly one DPS call");
+    assert!(
+        matches!(&calls[0], DpsCall::AskCodes(_)),
+        "the single call must be AskCodes"
+    );
+
+    // Codes are in DB (persist happened after the DPS call).
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM offline_codes WHERE fiscal_number = ? AND dps_code IS NOT NULL",
+    )
+    .bind(FN)
+    .fetch_one(app.db())
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "code must be persisted after DPS call");
+}

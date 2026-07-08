@@ -4,5 +4,6 @@
 pub mod backlog_drain;
 pub mod backoff;
 pub mod kvt2_confirm;
+pub mod offline_code_replenish;
 pub mod offline_surface;
 pub mod return_online_probe;
