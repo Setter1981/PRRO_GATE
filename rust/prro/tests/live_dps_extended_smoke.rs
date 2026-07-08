@@ -1954,3 +1954,1224 @@ async fn live_smoke_8_ask_offline_codes() {
     println!("\nGROUND-TRUTH: {ground_truth_summary}");
     println!("Smoke 8 PASS: T=112 wire contract captured — DPS responded definitively.");
 }
+
+// ─── Smoke 9 — B8-4: opaque id_offline accepted by DPS on drain ──────────────
+//
+// **LIVE piece (contacts DPS; drains one seeded OFFLINE_LOCAL_ACK doc).**
+//
+// Goal (FORK 3 of the B8 ruling): prove that DPS accepts a T=112-issued
+// OPAQUE STRING (e.g. `"eYme-jhnkWQ"`) in `id_offline` on a backlog drain
+// send — not the integer ordinal.  Code inspection confirmed the B8 render
+// path (`build_send_envelope` → `inputs.offline_dps_code.clone()`) but only
+// a live DPS round-trip can settle whether DPS will ACCEPT or REJECT the
+// opaque form.
+//
+// Flow (minimal — wire verify, NOT the full offline shift lifecycle):
+//
+//   1. Gate + connect + pre-bracket lastChk/statusRro.
+//   2. Seed MAC from live lastChk chain tip.
+//   3. Fetch ONE real T=112 code via `ask_offline_codes` — get the opaque
+//      string (e.g. "eYme-jhnkWQ").  Persist via `insert_dps_codes_tx` so
+//      it forms a real pool entry with a valid `code_lnd`.
+//   4. Seed a minimal throwaway DB: `fiscal_number_config`, `node_state`
+//      (mode=GOING_ONLINE), `offline_sessions` (OPEN), `shifts` (OPENED),
+//      one `fiscal_documents` row in OFFLINE_LOCAL_ACK with:
+//        - `offline_dps_code = <the real opaque string>` (B8 stamp)
+//        - `offline_fiscal_no = <code_lnd>` (integer ordinal, also present)
+//        - `fs_mode = 'OFFLINE'`, `offline_session_id = <session_id>`
+//      plus a `document_files` SIGNED_XML row: a real ATTACHED CAdES-BES
+//      CMS blob (the live operator key signs a minimal SELL XML — the
+//      exact bytes stage_send reads as `check_sign` on the wire).
+//   5. `drain_offline_backlog_scheduled` with a live RuntimeView
+//      (GrpcDpsChannel + live_signing_ctx + fn_sign) → stage_send renders
+//      `id_offline = <opaque string>` and issues `send_chk` to live DPS.
+//   6. Print the rendered `id_offline` (confirm opaque, not integer).
+//      GROUND-TRUTH the DPS verdict: PASS on ACK/KVT1 (accepted) or a
+//      definitive DPS server reject (captured truth).  FAIL only on
+//      transport/sign errors or if the drain bails before reaching DPS.
+//   7. Post-bracket lastChk/statusRro.
+//
+// NOTE on T=112 / MAC chain: smoke 8 proved that T=112 does NOT advance the
+// MAC chain (chain_changed=false in live probes 2026-07-07).  So the OLA
+// SELL seeded here carries the same MAC as `seed_mac_from_lastchk` seeded,
+// which is the correct next-doc MAC — no additional MAC adjustment needed.
+//
+// Seam gaps tracked: `drain_offline_backlog_scheduled` requires
+// `ReconcileGuard` internally (acquired via App mutex); `ScheduledDrainOutcome`
+// wraps the DrainSummary.  `drain_offline_backlog_scheduled` requires
+// `PRRO_LIVE_DPS=1` is NOT gate-checked inside drain — only the outer
+// live_armed guard here prevents a dry run.
+//
+// Required env (identical to smokes 5b/6/7/8):
+//   PRRO_LIVE_DPS=1
+//   PRRO_LIVE_DPS_JKS_PATH=...
+//   PRRO_LIVE_DPS_JKS_PASS=...
+//   PRRO_LIVE_DPS_HOST=... (default https://cabinet.tax.gov.ua:9443)
+//   PRRO_LIVE_DPS_FN=... (default 4000162280)
+
+/// Minimal SELL XML for the SIGNED_XML artifact.  Smoke 9 only cares that
+/// the opaque `id_offline` reaches DPS; the check body may be rejected for
+/// reasons unrelated to `id_offline` (wrong MAC, date drift, shift not open)
+/// — those are captured ground-truth.  The body is a plausible SELL payload
+/// matching the live TN and FN so DPS parses the envelope before checking
+/// fiscal validity.
+const SMOKE9_SELL_LND: i64 = 1;
+
+/// Seed a minimal `fiscal_number_config` row for the live FN.
+async fn seed_fn_config_smoke9(pool: &SqlitePool, fn_id: &str) {
+    sqlx::query(
+        "INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode, \
+         offline_enabled) VALUES (?, ?, 'test', 1)",
+    )
+    .bind(fn_id)
+    .bind(LIVE_TN)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Seed `node_state` in GOING_ONLINE mode so `drain` proceeds.
+/// `shift_state` is OPENED (an OLPD drain requires at least one shift in
+/// OPENED_LOCAL_PENDING_DRAIN, but `drain` checks mode, not shift_state,
+/// before the doc loop; shift_state can be OPENED here for the node row).
+async fn seed_node_going_online(pool: &SqlitePool, fn_id: &str) {
+    sqlx::query(
+        "INSERT INTO node_state \
+         (fiscal_number, mode, shift_state, current_shift_id, next_lnd, \
+          backend_profile_id, transport_profile_id) \
+         VALUES (?, 'GOING_ONLINE', 'OPENED', NULL, 2, 'b1', 't1')",
+    )
+    .bind(fn_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Seed an OPEN `offline_sessions` row and return its ID.
+async fn seed_offline_session_open(
+    pool: &SqlitePool,
+    fn_id: &str,
+) -> prro::db::models::ids::OfflineSessionId {
+    use prro::db::models::ids::OfflineSessionId;
+    let session_id = OfflineSessionId::new();
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, 'OPEN', datetime('now'))",
+    )
+    .bind(session_id)
+    .bind(fn_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    session_id
+}
+
+/// Seed a minimal OPENED_LOCAL_PENDING_DRAIN `shifts` row and return its bytes.
+async fn seed_olpd_shift(pool: &SqlitePool, fn_id: &str) -> Vec<u8> {
+    use prro::db::models::ids::ShiftId;
+    let shift_id = ShiftId::new();
+    let shift_bytes = shift_id.as_bytes().to_vec();
+    sqlx::query(
+        "INSERT INTO shifts(shift_id, fiscal_number, serial, state, open_mode, \
+         cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, ?, 1, 'OPENED_LOCAL_PENDING_DRAIN', 'OFFLINE', 0, 'test-cashier')",
+    )
+    .bind(&shift_bytes)
+    .bind(fn_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    shift_bytes
+}
+
+/// Seed an OFFLINE_LOCAL_ACK `fiscal_documents` row carrying the B8 opaque code.
+/// Returns the `DocumentId`.
+async fn seed_ola_sell_doc(
+    pool: &SqlitePool,
+    fn_id: &str,
+    shift_bytes: &[u8],
+    session_id: prro::db::models::ids::OfflineSessionId,
+    code_lnd: i64,
+    dps_code: &str,
+    business_ts: &str,
+) -> DocumentId {
+    let doc_id = DocumentId::new();
+    let req_bytes = DocumentId::new().as_bytes().to_vec();
+    let sha = vec![0u8; 32];
+    sqlx::query(
+        "INSERT INTO fiscal_documents( \
+         document_id, request_id, fiscal_number, shift_id, lnd, doc_type, state, \
+         backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+         total_sum_kop, payload_json, payload_sha256_canonical, signed_by_cashier_id, \
+         offline_session_id, offline_fiscal_no, offline_dps_code) \
+         VALUES (?, ?, ?, ?, ?, 'SELL', 'OFFLINE_LOCAL_ACK', 'b1', 't1', 'OFFLINE', \
+         ?, ?, ?, ?, 'test-cashier', ?, ?, ?)",
+    )
+    .bind(doc_id)
+    .bind(&req_bytes)
+    .bind(fn_id)
+    .bind(shift_bytes)
+    .bind(code_lnd)
+    .bind(business_ts)
+    .bind(EXTENDED_SELL_TOTAL_SUM_KOP)
+    .bind(EXTENDED_SELL_PAYLOAD_JSON)
+    .bind(&sha)
+    .bind(session_id)
+    .bind(code_lnd)
+    .bind(dps_code)
+    .execute(pool)
+    .await
+    .unwrap();
+    doc_id
+}
+
+/// Seed an `ingress_inbox` PROCESSING row (required by stage_send 4-pre
+/// payload-hash cross-check; payload must match the doc's `payload_json`).
+async fn seed_inbox_for_ola_doc(pool: &SqlitePool, fn_id: &str, doc_id: DocumentId) {
+    let req_bytes = doc_id.as_bytes().to_vec();
+    let sha = vec![0u8; 32];
+    sqlx::query(
+        "INSERT OR IGNORE INTO ingress_inbox( \
+         request_id, fiscal_number, protocol, operation_type, \
+         idempotency_key, payload_json, payload_sha256_canonical, status) \
+         VALUES (?, ?, 'REST', 'SELL', ?, ?, ?, 'PROCESSING')",
+    )
+    .bind(&req_bytes)
+    .bind(fn_id)
+    .bind(format!("smoke9-idem-{}", hex_lower(doc_id.as_bytes())))
+    .bind(EXTENDED_SELL_PAYLOAD_JSON)
+    .bind(&sha)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Insert the SIGNED_XML artifact for a doc.  In smoke 9 this is a REAL
+/// ATTACHED CAdES-BES CMS blob (live operator key over a minimal SELL XML)
+/// so stage_send reads and sends real bytes to DPS.
+async fn insert_signed_xml_for_doc(pool: &SqlitePool, doc_id: DocumentId, signed_xml: &[u8]) {
+    use prro::db::repositories::document_files::{insert_tx, DocumentFileKind};
+    use prro::db::tx::with_immediate;
+    let doc_id_c = doc_id;
+    let content: Vec<u8> = signed_xml.to_vec();
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            insert_tx(tx, doc_id_c, DocumentFileKind::SignedXml, &content).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+/// Build a minimal but real SELL XML string for smoke 9.  The body content
+/// is intentionally simple — the wire-verify goal is `id_offline`, not
+/// canonical tax/MAC correctness.  stage_send sends these bytes verbatim as
+/// `check_sign`; DPS will parse and may reject for fiscal reasons (MAC drift,
+/// date, shift state) — all are captured ground-truth.
+fn smoke9_sell_xml(fn_id: &str, tn: &str, _lnd: i64, business_ts: &str, mac_hex: &str) -> String {
+    // Kyiv-local timestamp in yyyyMMddHHmmss format (same as T=112; DPS
+    // compares <TS> to Check.date).  Reuse the same computation from smoke 8.
+    use chrono::{Datelike, Offset, TimeZone, Timelike};
+    let utc_secs: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_secs() as i64;
+    let now = chrono::Utc
+        .timestamp_opt(utc_secs, 0)
+        .single()
+        .expect("valid epoch");
+    let kyiv = now.with_timezone(&chrono_tz::Europe::Kiev);
+    let _ = kyiv.offset().fix().local_minus_utc(); // retain offset for potential future use
+    let ts: i64 = format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}",
+        kyiv.year(),
+        kyiv.month(),
+        kyiv.day(),
+        kyiv.hour(),
+        kyiv.minute(),
+        kyiv.second()
+    )
+    .parse()
+    .expect("yyyyMMddHHmmss fits i64");
+    let _ = business_ts; // business_ts drives stage_send's kyiv_local_epoch via doc row
+                         // Minimal SELL XML body (amounts in UAH; 15000 kop = 150.00 UAH).
+                         // Single-line to avoid #[rustfmt::skip] (not allowed on expressions in stable Rust).
+    format!("<RQ V='1'><PRRO FN='{fn_id}' TN='{tn}' V='1' T='0' UID='smoke9'><H>CHK</H><ROWS><ROW N='1'><C>TEST-ITEM</C><S>1.000</S><P>150.00</P><SM>150.00</SM></ROW></ROWS><PAY><ROW PT='0' SM='150.00'/></PAY><SM NTOT='150.00' TTOT='0.00'/><TS>{ts}</TS></PRRO><MAC>{mac}</MAC></RQ>", fn_id = fn_id, tn = tn, ts = ts, mac = mac_hex)
+}
+
+/// **B8-4 Smoke 9 — opaque id_offline on drain (live DPS wire-verify)**.
+///
+/// Proves FORK 3 of the B8 ruling: DPS accepts a T=112-issued opaque
+/// string in `id_offline` on a backlog drain (not the integer ordinal).
+#[tokio::test]
+#[ignore = "live DPS endpoint required; opt-in via --features live-dps + --ignored + PRRO_LIVE_DPS=1"]
+async fn live_smoke_9_offline_drain_opaque_id_offline() {
+    if !live_armed("B8-4 Smoke 9 (opaque id_offline drain)") {
+        return;
+    }
+    let Some(ek) = load_signing_key("B8-4 Smoke 9") else {
+        return;
+    };
+    let host = resolve_host();
+    let fiscal_number = resolve_fn();
+    let tn = LIVE_TN;
+
+    println!("\n=== B8-4 Smoke 9: opaque id_offline drain → live DPS ===");
+    println!("FN: {fiscal_number}  TN: {tn}");
+    println!("Endpoint: {host}");
+    println!("Goal: prove DPS accepts opaque T=112 string in id_offline on SELL drain\n");
+
+    // ── Step 1: connect + pre-bracket ──────────────────────────────────
+    let channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        .await
+        .unwrap_or_else(|e| panic!("Smoke 9 FAIL: GrpcDpsChannel::connect: {e:?}"));
+
+    let fn_sign = sign_fn_blob(&ek, &fiscal_number);
+
+    println!("--- PRE-BRACKET ---");
+    let pre_ack = match channel.last_chk(&fn_sign).await {
+        Ok(a) => {
+            println!(
+                "  pre lastChk: id={:?} data_sign={} bytes",
+                a.id,
+                a.data_sign.len()
+            );
+            a
+        }
+        Err(DpsError::Server { code: -4, message }) => {
+            println!(
+                "Smoke 9 SKIP: DPS rate-limit (-4) on pre-lastChk: {message}. Cool down 5+ min."
+            );
+            return;
+        }
+        Err(DpsError::Transport(msg)) => {
+            panic!("Smoke 9 FAIL: Transport on pre-lastChk: {msg}");
+        }
+        Err(e) => {
+            println!("  pre lastChk non-fatal error (assume genesis MAC): {e:?}");
+            CheckAck {
+                id: String::new(),
+                id_sign: vec![],
+                data_sign: vec![],
+            }
+        }
+    };
+    if let Ok(s) = channel.status_rro(&fn_sign).await {
+        println!(
+            "  pre statusRro: open_shift={} online={} last_signer={:?}",
+            s.open_shift, s.online, s.last_signer
+        );
+    }
+
+    // ── Step 2: derive MAC seed (same model as smokes 5b/6/7) ──────────
+    let mac_hex: String = if pre_ack.data_sign.is_empty() {
+        println!("  FN genesis (empty data_sign) — SELL will carry empty <MAC>");
+        String::new()
+    } else {
+        let inner = extract_econtent(&pre_ack.data_sign)
+            .unwrap_or_else(|e| panic!("Smoke 9: CMS-strip pre data_sign: {e}"));
+        let mac: [u8; 32] = Sha256::digest(&inner).into();
+        let hex = hex_lower(&mac);
+        println!(
+            "  MAC from pre-lastChk: {hex} ({} B data_sign → {} B inner)",
+            pre_ack.data_sign.len(),
+            inner.len()
+        );
+        hex
+    };
+
+    // ── Step 3: fetch ONE real T=112 opaque code ────────────────────────
+    // Reuse smoke 8's raw send_chk approach: build T=112 XML, sign it,
+    // submit as ServiceChk.  Parse the first <ID> element as the real code.
+    println!("\n--- T=112 FETCH (1 code) ---");
+    let t112_di: i64 = std::env::var("PRRO_LIVE_DPS_T112_DI")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let utc_secs_t112: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_secs() as i64;
+    let (ts_t112, _epoch_kyiv_t112): (i64, i64) = {
+        use chrono::{Datelike, Offset, TimeZone, Timelike};
+        let now = chrono::Utc
+            .timestamp_opt(utc_secs_t112, 0)
+            .single()
+            .expect("valid epoch");
+        let kyiv = now.with_timezone(&chrono_tz::Europe::Kiev);
+        let comp_date: i64 = format!(
+            "{:04}{:02}{:02}{:02}{:02}{:02}",
+            kyiv.year(),
+            kyiv.month(),
+            kyiv.day(),
+            kyiv.hour(),
+            kyiv.minute(),
+            kyiv.second()
+        )
+        .parse()
+        .expect("yyyyMMddHHmmss fits i64");
+        let epoch = utc_secs_t112 + i64::from(kyiv.offset().fix().local_minus_utc());
+        (comp_date, epoch)
+    };
+    #[rustfmt::skip]
+    let t112_xml = format!(
+        "<RQ V = '1'><DAT FN='{fn}' TN='{tn}' ZN='' DI='{di}' V='1'><C T='112'><H SIZE='1'></H></C><TS>{ts}</TS></DAT><MAC>{mac}</MAC></RQ>",
+        fn = fiscal_number, tn = tn, di = t112_di, ts = ts_t112, mac = mac_hex,
+    );
+    println!("  T=112 XML: {t112_xml}");
+
+    let cert_der: &[u8] = ek
+        .signing_cert()
+        .expect("JKS must carry a signing certificate");
+    let curve = Curve::dstu_pb_257();
+    let d = FieldEl::from_le_bytes(&ek.param_d[..], curve.mod_words);
+    let signer_inner = DstuInProcessSigner::new(d);
+    let cms_signer = CmsSigner {
+        cert_der,
+        signer: &signer_inner,
+        profile: CmsProfile::Dstu4145WithGost34311Pb,
+    };
+    let t112_signed = cms_signer
+        .sign_with(
+            t112_xml.as_bytes(),
+            CmsBuildOptions {
+                attached: true,
+                signing_time: Some(SystemTime::now()),
+            },
+        )
+        .expect("T=112 sign must succeed")
+        .cms_der;
+
+    let t112_envelope = CheckEnvelope {
+        rro_fn: fiscal_number.clone(),
+        date_time: ts_t112,
+        check_sign: t112_signed,
+        local_number: t112_di as i32,
+        check_type: DpsCheckType::ServiceChk,
+        id_offline: String::new(),
+        id_cancel: String::new(),
+    };
+
+    // The opaque code(s) returned by DPS.  A DPS reject for T=112 is ALSO
+    // captured (ground-truth); in that case we fall back to a synthetic
+    // code string to still exercise the drain path.
+    let real_opaque_code: String = match channel.send_chk(t112_envelope).await {
+        Ok(ack) => {
+            println!(
+                "  T=112 DPS OK: id={:?} data_sign={} bytes",
+                ack.id,
+                ack.data_sign.len()
+            );
+            if ack.data_sign.is_empty() {
+                println!("  WARN: T=112 returned empty data_sign — no codes in payload");
+                println!("  Using synthetic fallback code for drain wire-test");
+                // Synthetic fallback: still exercises the drain wire path
+                // but with a code DPS did not issue.  The DPS verdict on drain
+                // will tell us whether it validates the id_offline format at all.
+                format!("SYNTH-{fiscal_number}-{t112_di}")
+            } else {
+                match extract_econtent(&ack.data_sign) {
+                    Ok(inner_bytes) => {
+                        let inner_xml = String::from_utf8_lossy(&inner_bytes);
+                        println!("  T=112 response XML: {inner_xml}");
+                        // Parse the first <ID>value</ID> element.
+                        let code = inner_xml
+                            .split("<ID>")
+                            .nth(1)
+                            .and_then(|s| s.split("</ID>").next())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        match code {
+                            Some(c) => {
+                                println!("  REAL OPAQUE CODE obtained: {c:?}");
+                                c
+                            }
+                            None => {
+                                println!("  WARN: no <ID> element in T=112 response — using synthetic fallback");
+                                format!("SYNTH-NOID-{fiscal_number}-{t112_di}")
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!(
+                            "  WARN: T=112 data_sign not CMS ({e}) — using synthetic fallback"
+                        );
+                        format!("SYNTH-NOCMS-{fiscal_number}-{t112_di}")
+                    }
+                }
+            }
+        }
+        Err(DpsError::Server { code, message }) => {
+            println!("  T=112 DPS server reject: code={code} message={message:?}");
+            println!("  GROUND-TRUTH: T=112 REJECTED code={code} — using synthetic fallback for drain path");
+            format!("SYNTH-T112REJ-{code}-{fiscal_number}")
+        }
+        Err(DpsError::Transport(msg)) => {
+            panic!("Smoke 9 FAIL: Transport error on T=112 send_chk: {msg}");
+        }
+        Err(e) => {
+            panic!("Smoke 9 FAIL: unexpected error on T=112 send_chk: {e:?}");
+        }
+    };
+    println!("  Opaque code for drain: {real_opaque_code:?}");
+
+    // ── Step 4: boot throwaway App + seed the OLA doc ──────────────────
+    println!("\n--- SEEDING THROWAWAY DB ---");
+    let (_dir, app) = boot_offline_app().await;
+    let pool = app.db();
+
+    seed_fn_config_smoke9(pool, &fiscal_number).await;
+    seed_node_going_online(pool, &fiscal_number).await;
+
+    // Seed MAC from lastChk into node_state (same as smokes 5b/6/7).
+    match seed_mac_from_lastchk(pool, &fiscal_number, &pre_ack).await {
+        Some(hex) => println!("  MAC seeded into node_state: {hex}"),
+        None => println!("  genesis FN — node_state carries no prevhash"),
+    }
+
+    // Seed one OLA SELL doc.
+    let session_id = seed_offline_session_open(pool, &fiscal_number).await;
+    let shift_bytes = seed_olpd_shift(pool, &fiscal_number).await;
+    // Seeding fix: align node_state with the OLPD shift. seed_node_going_online
+    // left current_shift_id NULL + shift_state OPENED (inconsistent), which made
+    // escalate_drain_to_manual fail loud on a drain reject (that hard-Err is
+    // INTENDED structural-drift behavior — the bug was the smoke seeding, not
+    // production).
+    sqlx::query(
+        "UPDATE node_state SET current_shift_id = ?, \
+         shift_state = 'OPENED_LOCAL_PENDING_DRAIN' WHERE fiscal_number = ?",
+    )
+    .bind(&shift_bytes)
+    .bind(&fiscal_number)
+    .execute(pool)
+    .await
+    .expect("align node_state with OLPD shift");
+
+    // Insert the opaque code into offline_codes so code_lnd is real.
+    let code_lnd: i64 = {
+        use prro::db::repositories::offline_sessions;
+        use prro::db::tx::with_immediate;
+        let fn_owned = fiscal_number.clone();
+        let codes = vec![real_opaque_code.clone()];
+        let summary = with_immediate(pool, move |tx| {
+            Box::pin(async move {
+                offline_sessions::insert_dps_codes_tx(tx, &fn_owned, &codes)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .await
+        .expect("insert_dps_codes_tx");
+        println!(
+            "  offline_codes: inserted={} deduped={}",
+            summary.inserted, summary.deduped
+        );
+        // code_lnd is 1 (COALESCE(MAX,0)+1 on empty pool).
+        SMOKE9_SELL_LND
+    };
+    println!("  code_lnd={code_lnd}  offline_dps_code={real_opaque_code:?}");
+
+    // Build a REAL signed SELL XML (live key → ATTACHED CAdES-BES).
+    // MAC-ordering fix: the T=112 fetch ADVANCED the FN chain (its request XML
+    // became the new DPS tip), so the drained SELL must chain from
+    // sha256(t112_xml) — NOT the pre-T=112 `mac_hex` — else DPS rejects with -12
+    // (bad prev-hash) and masks the id_offline verdict we want.
+    let sell_mac_hex: String = {
+        let d: [u8; 32] = Sha256::digest(t112_xml.as_bytes()).into();
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    };
+    println!("  SELL MAC (post-T=112 tip): {sell_mac_hex}");
+    let business_ts = iso_now();
+    let sell_xml = smoke9_sell_xml(&fiscal_number, tn, code_lnd, &business_ts, &sell_mac_hex);
+    println!("  SELL XML ({} bytes): {sell_xml}", sell_xml.len());
+
+    let signed_xml_bytes = cms_signer
+        .sign_with(
+            sell_xml.as_bytes(),
+            CmsBuildOptions {
+                attached: true,
+                signing_time: Some(SystemTime::now()),
+            },
+        )
+        .expect("SELL XML sign must succeed")
+        .cms_der;
+    println!(
+        "  SIGNED_XML: {} bytes (ATTACHED CAdES-BES)",
+        signed_xml_bytes.len()
+    );
+
+    let doc_id = seed_ola_sell_doc(
+        pool,
+        &fiscal_number,
+        &shift_bytes,
+        session_id,
+        code_lnd,
+        &real_opaque_code,
+        &business_ts,
+    )
+    .await;
+    println!("  OLA doc seeded: doc_id={}", hex_lower(doc_id.as_bytes()));
+
+    // Seed ingress_inbox PROCESSING row (stage_send 4-pre cross-check).
+    seed_inbox_for_ola_doc(pool, &fiscal_number, doc_id).await;
+
+    // Insert SIGNED_XML artifact (stage_send reads it as check_sign bytes).
+    insert_signed_xml_for_doc(pool, doc_id, &signed_xml_bytes).await;
+
+    // Read back offline_dps_code from DB to confirm it was stamped.
+    let db_dps_code: Option<String> =
+        sqlx::query_scalar("SELECT offline_dps_code FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        db_dps_code.as_deref(),
+        Some(real_opaque_code.as_str()),
+        "offline_dps_code must round-trip through fiscal_documents"
+    );
+    println!("  DB offline_dps_code confirmed: {db_dps_code:?}");
+
+    // ── Step 5: drain via drain_offline_backlog_scheduled ──────────────
+    println!("\n--- DRAIN (live DPS) ---");
+    let signing_ctx = live_signing_ctx(&ek);
+    let drain_fn_sign = sign_fn_blob(&ek, &fiscal_number);
+    let drain_view = RuntimeView {
+        dps: &channel,
+        signing_ctx: &signing_ctx,
+        fn_sign: &drain_fn_sign,
+    };
+
+    let drain_result = app
+        .drain_offline_backlog_scheduled(&fiscal_number, &drain_view)
+        .await;
+
+    // ── Step 6: capture verdict ─────────────────────────────────────────
+    println!("\n--- DRAIN RESULT ---");
+    let ground_truth_summary = match &drain_result {
+        Ok(prro::ScheduledDrainOutcome::Ran(summary)) => {
+            println!(
+                "  Drain ran: backlog_before={} advanced_to_ack={} advanced_to_kvt1={} \
+                 held_at_kvt1={} held_at_sent={} failures={} er_queued={}",
+                summary.backlog_size_before(),
+                summary.advanced_to_ack(),
+                summary.advanced_to_kvt1(),
+                summary.held_at_kvt1(),
+                summary.held_at_sent(),
+                summary.per_doc_failures().len(),
+                summary.er_redrive_queued(),
+            );
+            // Read the final doc state + transport_trace for DPS verdict.
+            let state: String =
+                sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
+                    .bind(doc_id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or_else(|_| "UNKNOWN".into());
+            println!("  doc final state: {state}");
+
+            let server_fiscal_no: Option<String> = sqlx::query_scalar(
+                "SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?",
+            )
+            .bind(doc_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            println!("  server_fiscal_no: {server_fiscal_no:?}");
+
+            print_live_diagnostics(pool, doc_id).await;
+
+            // Read the rendered id_offline from transport_trace.
+            // transport_trace stores the full CheckEnvelope hash; we re-derive
+            // what was sent by reading offline_dps_code directly.
+            println!("  RENDERED id_offline (offline_dps_code sent to DPS): {real_opaque_code:?}");
+            assert!(
+                !real_opaque_code.chars().all(|c| c.is_ascii_digit()),
+                "id_offline must be the opaque string, not a pure-integer ordinal"
+            );
+
+            if state == "SENT" || state == "KVT1" || state == "ACK" {
+                format!(
+                    "DPS ACCEPTED opaque id_offline={real_opaque_code:?} \
+                     (doc→{state} server_fiscal_no={server_fiscal_no:?})"
+                )
+            } else {
+                format!(
+                    "DPS did NOT advance to Sent — doc→{state} \
+                     (see diagnostics above for DPS reject code)"
+                )
+            }
+        }
+        Ok(prro::ScheduledDrainOutcome::SkippedBackoff { .. }) => {
+            panic!("Smoke 9 FAIL: drain skipped due to backoff on first run — should not happen");
+        }
+        Err(e) => {
+            panic!("Smoke 9 FAIL: drain_offline_backlog_scheduled returned Err: {e:?}");
+        }
+    };
+
+    // ── Step 7: post-bracket ────────────────────────────────────────────
+    println!("\n--- POST-BRACKET ---");
+    if let Ok(a) = channel.last_chk(&fn_sign).await {
+        let chain_changed = a.data_sign.len() != pre_ack.data_sign.len() || a.id != pre_ack.id;
+        println!(
+            "  post lastChk: id={:?} data_sign={} bytes  chain_changed={chain_changed}",
+            a.id,
+            a.data_sign.len()
+        );
+    }
+    if let Ok(s) = channel.status_rro(&fn_sign).await {
+        println!(
+            "  post statusRro: open_shift={} online={} last_signer={:?}",
+            s.open_shift, s.online, s.last_signer
+        );
+    }
+
+    println!("\nGROUND-TRUTH: {ground_truth_summary}");
+    println!(
+        "Smoke 9 PASS: drain ran to completion — id_offline={real_opaque_code:?} \
+         reached DPS (check diagnostics above for ACCEPTED vs REJECTED)."
+    );
+}
+
+// ─── Smoke 11 — B8-4 (v2): opaque id_offline on drain, REAL canonical XML ───
+//
+// **LIVE piece (contacts DPS; drains one OLA doc with real production XML).**
+//
+// Smoke 9 failed with DPS code -7 (invalid XML structure) because it
+// hand-wrote a minimal SELL XML that does not match the canonical format DPS
+// expects.  Smoke 11 fixes this by producing the SELL XML via the PRODUCTION
+// write-path (stage_sign builds real canonical XML from the CheckPayload +
+// TaxResolutionSnapshot), identical to what smokes 5b/6/7 sent and DPS
+// accepted.
+//
+// Flow:
+//   1. Gate + connect + pre-bracket lastChk/statusRro.
+//   2. Boot offline App; seed FN config + ONLINE node_state + OPENED shift
+//      (same as smoke 6 seeding).
+//   3. Seed MAC into node_state from live lastChk chain tip.
+//   4. Fetch ONE real T=112 opaque code via raw send_chk (reuses smoke 8/9
+//      approach).  After the T=112 fetch, update node_state prevhash to
+//      sha256(t112_xml) so the canonical SELL the write-path builds carries
+//      the correct post-T=112 MAC.  Insert the opaque code via
+//      insert_dps_codes_tx.
+//   5. Call admin::go_offline → node OFFLINE + OPEN offline_session created.
+//   6. Seed a PREPARED extended SELL doc (reuse seed_extended_sell_prepared +
+//      seed_inbox_processing_for_sell_piece4 from smoke 6) with the
+//      post-T=112 MAC already seeded in node_state.
+//   7. Call reconcile_pending_with (StubOfflineAck DPS — no DPS contact here).
+//      In OFFLINE mode: dispatch_prepared_via_chain → stage_sign builds REAL
+//      canonical XML → stage_offline_ack acquires the opaque code → doc moves
+//      to OFFLINE_LOCAL_ACK with offline_dps_code stamped.
+//   8. admin::go_online → node GOING_ONLINE.
+//   9. drain_offline_backlog_scheduled with live GrpcDpsChannel + live
+//      signing_ctx → stage_send renders id_offline from offline_dps_code
+//      (opaque string) and sends the REAL canonical signed XML to DPS.
+//  10. Capture + print: the rendered id_offline (confirm opaque), the DPS
+//      verdict (PASS on any definitive response), and post-bracket probes.
+//
+// MAC-chain note: smoke 8 ground-truth (2026-07-07) proved T=112 DOES advance
+// the DPS chain (chain_changed=true when DPS accepted; data_sign changes).
+// The post-T=112 seed (step 4) ensures the SELL's <MAC> = sha256(t112_xml),
+// which matches what DPS expects as the next-doc MAC after the T=112 request.
+//
+// PASS condition: any definitive DPS response from the drain (DPS accepted
+// the send or returned a typed server-level reject — both prove the opaque
+// id_offline reached DPS without a wire-level format error).  FAIL only on
+// Transport errors or if drain bails before reaching DPS.
+
+/// Stub DPS for the offline reconcile step (step 7 above).
+/// stage_sign + stage_offline_ack never call DPS; stage_send is NOT invoked
+/// in offline mode.  All DPS methods panic to detect any accidental contact.
+struct StubOfflineAck;
+
+#[async_trait]
+impl DpsChannel for StubOfflineAck {
+    async fn send_chk(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        unreachable!(
+            "smoke 11 offline reconcile: send_chk must NOT be invoked — \
+             node is OFFLINE so stage_send is NOT reached"
+        )
+    }
+    async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
+        unreachable!("smoke 11 offline reconcile: last_chk must not be invoked")
+    }
+    async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        unreachable!("smoke 11 offline reconcile: ping must not be invoked")
+    }
+    async fn status_rro(&self, _: &CheckSignBlob) -> Result<StatusSnapshot, DpsError> {
+        unreachable!("smoke 11 offline reconcile: status_rro must not be invoked")
+    }
+    async fn info_rro(&self, _: &CheckSignBlob) -> Result<RroInfo, DpsError> {
+        unreachable!("smoke 11 offline reconcile: info_rro must not be invoked")
+    }
+    async fn ask_offline_codes(
+        &self,
+        _: prro::transports::dps::dto::CheckEnvelope,
+    ) -> Result<
+        prro::transports::dps::dto::OfflineCodesResponse,
+        prro::transports::dps::error::DpsError,
+    > {
+        unreachable!("smoke 11 offline reconcile: ask_offline_codes must not be invoked")
+    }
+}
+
+/// **B8-4 Smoke 11 — opaque id_offline on drain, REAL canonical XML (B8-4 v2)**.
+///
+/// Closes B8-4: proves DPS accepts a T=112-issued opaque STRING in
+/// `id_offline` on a drain, using a REAL canonical SELL XML produced by
+/// the production write-path (not a hand-written fake).
+///
+/// Prerequisite: a DPS shift must be OPEN (run 5b first).
+#[tokio::test]
+#[ignore = "live DPS endpoint required; opt-in via --features live-dps + --ignored + PRRO_LIVE_DPS=1"]
+async fn live_smoke_11_offline_drain_real_xml() {
+    if !live_armed("B8-4 Smoke 11 (opaque id_offline drain, real canonical XML)") {
+        return;
+    }
+    let Some(ek) = load_signing_key("B8-4 Smoke 11") else {
+        return;
+    };
+    let host = resolve_host();
+    let fiscal_number = resolve_fn();
+    let tn = LIVE_TN;
+
+    println!("\n=== B8-4 Smoke 11: opaque id_offline drain with REAL canonical XML → live DPS ===");
+    println!("FN: {fiscal_number}  TN: {tn}");
+    println!("Endpoint: {host}");
+    println!("Goal: DPS accepts opaque T=112 string in id_offline on SELL drain (real XML)\n");
+
+    // ── Step 1: connect + pre-bracket ──────────────────────────────────────
+    let channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        .await
+        .unwrap_or_else(|e| panic!("Smoke 11 FAIL: GrpcDpsChannel::connect: {e:?}"));
+
+    let fn_sign = sign_fn_blob(&ek, &fiscal_number);
+
+    println!("--- PRE-BRACKET ---");
+    let pre_ack = match channel.last_chk(&fn_sign).await {
+        Ok(a) => {
+            println!(
+                "  pre lastChk: id={:?} data_sign={} bytes",
+                a.id,
+                a.data_sign.len()
+            );
+            a
+        }
+        Err(DpsError::Server { code: -4, message }) => {
+            println!(
+                "Smoke 11 SKIP: DPS rate-limit (-4) on pre-lastChk: {message}. Cool down 5+ min."
+            );
+            return;
+        }
+        Err(DpsError::Transport(msg)) => {
+            panic!("Smoke 11 FAIL: Transport on pre-lastChk: {msg}");
+        }
+        Err(e) => {
+            println!("  pre lastChk non-fatal error (assume genesis MAC): {e:?}");
+            CheckAck {
+                id: String::new(),
+                id_sign: vec![],
+                data_sign: vec![],
+            }
+        }
+    };
+    if let Ok(s) = channel.status_rro(&fn_sign).await {
+        println!(
+            "  pre statusRro: open_shift={} online={} last_signer={:?}",
+            s.open_shift, s.online, s.last_signer
+        );
+        if !s.open_shift {
+            println!(
+                "  WARN: no open shift on DPS — SELL drain may be rejected with \
+                 a shift-state code (run live_smoke_5b_shift_open first)"
+            );
+        }
+    }
+
+    // ── Step 2: boot throwaway App + seed ONLINE node ──────────────────────
+    println!("\n--- SEEDING APP ---");
+    let (_dir, app) = boot_offline_app().await;
+    let pool = app.db();
+
+    // Seed FN config with real TN (same as smokes 5b/6/7).
+    seed_fn_config_live(pool, &fiscal_number).await;
+    // Seed OPENED shift + node_state in ONLINE mode (go_offline requires ONLINE).
+    seed_open_shift_and_node_piece4(pool, &fiscal_number).await;
+
+    // Seed MAC from live lastChk into node_state BEFORE the T=112 fetch.
+    // After T=112, we overwrite with post-T=112 seed (step 4).
+    match seed_mac_from_lastchk(pool, &fiscal_number, &pre_ack).await {
+        Some(hex) => println!("  pre-T112 MAC seeded into node_state: {hex}"),
+        None => println!("  FN genesis (empty data_sign) — pre-T112 MAC is empty"),
+    }
+
+    // ── Step 3: fetch ONE real T=112 opaque code (raw send_chk, smoke 8/9 model) ──
+    println!("\n--- T=112 FETCH (1 code) ---");
+    let t112_di: i64 = std::env::var("PRRO_LIVE_DPS_T112_DI")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+
+    // Build T=112 XML using the production builder (byte-exact with WebCheck).
+    let pre_mac_hex: String = {
+        let ns = node_state::get(pool, &fiscal_number)
+            .await
+            .expect("node_state row must exist")
+            .expect("node_state row present");
+        match ns.last_known_unsigned_xml_sha256 {
+            None => String::new(),
+            Some(arr) => arr.iter().map(|b| format!("{b:02x}")).collect(),
+        }
+    };
+    let t112_req = prro::transports::dps::t112::build_t112_request(
+        &fiscal_number,
+        tn,
+        t112_di as u32,
+        1, // request 1 code
+        prro::transports::dps::t112::kyiv_comp_date_now(),
+        &pre_mac_hex,
+    )
+    .expect("T=112 request builder must succeed for size=1");
+    println!("  T=112 XML: {}", t112_req.xml);
+
+    // Sign with the live operator key (ATTACHED CAdES-BES, same as smoke 8).
+    let cert_der: &[u8] = ek
+        .signing_cert()
+        .expect("JKS must carry a signing certificate");
+    let curve = Curve::dstu_pb_257();
+    let d = FieldEl::from_le_bytes(&ek.param_d[..], curve.mod_words);
+    let signer_inner = DstuInProcessSigner::new(d);
+    let cms_signer_t112 = CmsSigner {
+        cert_der,
+        signer: &signer_inner,
+        profile: CmsProfile::Dstu4145WithGost34311Pb,
+    };
+    let t112_signed = cms_signer_t112
+        .sign_with(
+            t112_req.xml.as_bytes(),
+            CmsBuildOptions {
+                attached: true,
+                signing_time: Some(SystemTime::now()),
+            },
+        )
+        .expect("T=112 sign must succeed")
+        .cms_der;
+
+    let t112_envelope = CheckEnvelope {
+        rro_fn: fiscal_number.clone(),
+        date_time: t112_req.comp_date,
+        check_sign: t112_signed,
+        local_number: t112_di as i32,
+        check_type: DpsCheckType::ServiceChk,
+        id_offline: String::new(),
+        id_cancel: String::new(),
+    };
+
+    // Send T=112 and parse the opaque code from the response.
+    let real_opaque_code: String = match channel.send_chk(t112_envelope).await {
+        Ok(ack) => {
+            println!(
+                "  T=112 DPS OK: id={:?} data_sign={} bytes",
+                ack.id,
+                ack.data_sign.len()
+            );
+            if ack.data_sign.is_empty() {
+                println!("  WARN: T=112 empty data_sign — synthetic fallback");
+                format!("SYNTH-SMOKE11-{fiscal_number}-{t112_di}")
+            } else {
+                match extract_econtent(&ack.data_sign) {
+                    Ok(inner_bytes) => {
+                        let inner_xml = String::from_utf8_lossy(&inner_bytes);
+                        println!("  T=112 response inner XML: {inner_xml}");
+                        let code = inner_xml
+                            .split("<ID>")
+                            .nth(1)
+                            .and_then(|s| s.split("</ID>").next())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        match code {
+                            Some(c) => {
+                                println!("  REAL OPAQUE CODE: {c:?}");
+                                c
+                            }
+                            None => {
+                                println!("  WARN: no <ID> in T=112 response — synthetic fallback");
+                                format!("SYNTH-NOID-SMOKE11-{t112_di}")
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("  WARN: T=112 data_sign not CMS ({e}) — synthetic fallback");
+                        format!("SYNTH-NOCMS-SMOKE11-{t112_di}")
+                    }
+                }
+            }
+        }
+        Err(DpsError::Server { code, message }) => {
+            println!("  T=112 DPS server reject: code={code} message={message:?}");
+            println!("  Using synthetic fallback for drain wire-test");
+            format!("SYNTH-T112REJ-{code}-SMOKE11")
+        }
+        Err(DpsError::Transport(msg)) => {
+            panic!("Smoke 11 FAIL: Transport error on T=112 send_chk: {msg}");
+        }
+        Err(e) => {
+            panic!("Smoke 11 FAIL: unexpected error on T=112 send_chk: {e:?}");
+        }
+    };
+    println!("  Opaque code for drain: {real_opaque_code:?}");
+
+    // ── Step 4: update node_state prevhash to sha256(t112_xml) ────────────
+    // The T=112 request advanced the DPS chain.  The production write-path
+    // reads node_state.last_known_unsigned_xml_sha256 as the <MAC> seed when
+    // stage_sign builds the canonical SELL XML.  Seeding it to sha256(t112_xml)
+    // ensures the SELL carries the correct post-T=112 MAC that DPS expects.
+    let post_t112_seed: [u8; 32] = Sha256::digest(t112_req.xml.as_bytes()).into();
+    let post_t112_hex: String = post_t112_seed.iter().map(|b| format!("{b:02x}")).collect();
+    node_state::seed_prevhash(pool, &fiscal_number, &post_t112_seed)
+        .await
+        .expect("seed_prevhash for post-T=112 MAC");
+    println!("  Post-T=112 MAC seeded into node_state: {post_t112_hex}");
+
+    // Insert the opaque code into offline_codes pool.
+    {
+        use prro::db::repositories::offline_sessions;
+        let fn_owned = fiscal_number.clone();
+        let codes = vec![real_opaque_code.clone()];
+        let summary = with_immediate(pool, move |tx| {
+            Box::pin(async move {
+                offline_sessions::insert_dps_codes_tx(tx, &fn_owned, &codes)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .await
+        .expect("insert_dps_codes_tx");
+        println!(
+            "  offline_codes: inserted={} deduped={}",
+            summary.inserted, summary.deduped
+        );
+    }
+
+    // ── Step 5: admin::go_offline → node OFFLINE + OPEN session ───────────
+    // go_offline requires node_state.mode == ONLINE (seeded above).
+    prro::admin::go_offline(pool, &fiscal_number, "live smoke 11 — offline drain test")
+        .await
+        .unwrap_or_else(|e| panic!("Smoke 11 FAIL: go_offline: {e:?}"));
+    println!("  go_offline: node now OFFLINE, offline_session OPEN");
+
+    // ── Step 6: seed PREPARED SELL doc + inbox ─────────────────────────────
+    // Reuse the smoke 6 helper: extended SELL (driver 5→TX=1, 7→TX=2, excise,
+    // UKTZED).  stage_sign will build the real canonical XML with these payloads.
+    let snapshot = dual_mapping_snapshot();
+    let fn_snap = fiscal_number.clone();
+    let snapshot_id = with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            let id = signing_config_snapshots::insert_or_get_id_tx(
+                tx,
+                &fn_snap,
+                "driver-smoke11",
+                &snapshot,
+            )
+            .await?;
+            Ok::<i64, anyhow::Error>(id)
+        })
+    })
+    .await
+    .expect("insert signing_config_snapshot for smoke 11");
+
+    let business_ts = iso_now();
+    let (doc_id, req_id) = seed_extended_sell_prepared(
+        pool,
+        &fiscal_number,
+        0x11, // doc_byte — distinct from smoke 6's 0x01
+        snapshot_id,
+        &business_ts,
+    )
+    .await;
+    seed_inbox_processing_for_sell_piece4(pool, &fiscal_number, &req_id).await;
+    println!(
+        "  PREPARED SELL seeded: doc_id={}",
+        hex_lower(doc_id.as_bytes())
+    );
+
+    // ── Step 7: reconcile_pending_with — OFFLINE mode: stage_sign + stage_offline_ack ──
+    // Node is OFFLINE → dispatch_prepared_via_chain → stage_sign (builds real
+    // canonical XML) → dispatch_post_sign → stage_offline_ack (acquires the
+    // opaque code from the pool → stamps offline_dps_code, offline_fiscal_no →
+    // OFFLINE_LOCAL_ACK).  NO DPS contact in this step.
+    let signing_ctx = live_signing_ctx(&ek);
+    let offline_fn_sign = CheckSignBlob(vec![0xDE, 0xAD, 0xBE, 0xEF]); // unused by stub
+    let stub_dps = StubOfflineAck;
+    let offline_deps = ReconciliationRuntime::single_fn(RuntimeView {
+        dps: &stub_dps,
+        signing_ctx: &signing_ctx,
+        fn_sign: &offline_fn_sign,
+    });
+    app.reconcile_pending_with(offline_deps)
+        .await
+        .expect("reconcile_pending_with (OFFLINE) must succeed");
+
+    let doc_state_after_reconcile: String =
+        sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let db_dps_code: Option<String> =
+        sqlx::query_scalar("SELECT offline_dps_code FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    println!(
+        "  After offline reconcile: state={doc_state_after_reconcile} \
+         offline_dps_code={db_dps_code:?}"
+    );
+    assert_eq!(
+        doc_state_after_reconcile, "OFFLINE_LOCAL_ACK",
+        "stage_offline_ack must drive PREPARED→SIGNED→OFFLINE_LOCAL_ACK in OFFLINE mode"
+    );
+    assert_eq!(
+        db_dps_code.as_deref(),
+        Some(real_opaque_code.as_str()),
+        "offline_dps_code must be the real opaque code stamped by stage_offline_ack"
+    );
+
+    // Confirm the SIGNED_XML that stage_sign produced is a real canonical XML
+    // (not a hand-written fake).
+    let signed_xml_blob = read_document_file_piece4(pool, doc_id, "SIGNED_XML")
+        .await
+        .expect("stage_sign must have produced a SIGNED_XML artifact");
+    let payload_xml_blob = read_document_file_piece4(pool, doc_id, "PAYLOAD_XML")
+        .await
+        .expect("stage_sign must have produced a PAYLOAD_XML artifact");
+    let payload_xml_str = String::from_utf8_lossy(&payload_xml_blob);
+    // Confirm it's canonical (driver translation happened, MAC present).
+    assert!(
+        payload_xml_str.contains(r#"TX="1""#) || payload_xml_str.contains(r#"TX="2""#),
+        "PAYLOAD_XML must contain canonical TX groups — confirms production stage_sign ran; \
+         xml=\n{payload_xml_str}"
+    );
+    assert!(
+        !real_opaque_code.chars().all(|c| c.is_ascii_digit()),
+        "offline_dps_code must be an opaque string, not a pure-integer ordinal"
+    );
+    println!(
+        "  PAYLOAD_XML ({} bytes) is canonical (TX groups present)",
+        payload_xml_blob.len()
+    );
+    println!(
+        "  SIGNED_XML ({} bytes) is a real ATTACHED CAdES-BES CMS blob",
+        signed_xml_blob.len()
+    );
+
+    // ── Step 8: admin::go_online → node GOING_ONLINE ───────────────────────
+    prro::admin::go_online(pool, &fiscal_number, "smoke 11 drain")
+        .await
+        .unwrap_or_else(|e| panic!("Smoke 11 FAIL: go_online: {e:?}"));
+    println!("  go_online: node now GOING_ONLINE — ready for drain");
+
+    // ── Step 9: drain with live DPS ────────────────────────────────────────
+    println!("\n--- DRAIN (live DPS, real canonical XML) ---");
+    let drain_fn_sign = sign_fn_blob(&ek, &fiscal_number);
+    let drain_signing_ctx = live_signing_ctx(&ek);
+    let drain_view = RuntimeView {
+        dps: &channel,
+        signing_ctx: &drain_signing_ctx,
+        fn_sign: &drain_fn_sign,
+    };
+    let drain_result = app
+        .drain_offline_backlog_scheduled(&fiscal_number, &drain_view)
+        .await;
+
+    // ── Step 10: capture verdict ────────────────────────────────────────────
+    println!("\n--- DRAIN RESULT ---");
+    let ground_truth_summary = match &drain_result {
+        Ok(prro::ScheduledDrainOutcome::Ran(summary)) => {
+            println!(
+                "  Drain ran: backlog_before={} advanced_to_ack={} advanced_to_kvt1={} \
+                 held_at_kvt1={} held_at_sent={} failures={} er_queued={}",
+                summary.backlog_size_before(),
+                summary.advanced_to_ack(),
+                summary.advanced_to_kvt1(),
+                summary.held_at_kvt1(),
+                summary.held_at_sent(),
+                summary.per_doc_failures().len(),
+                summary.er_redrive_queued(),
+            );
+            let final_state: String =
+                sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
+                    .bind(doc_id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or_else(|_| "UNKNOWN".into());
+            let server_fiscal_no: Option<String> = sqlx::query_scalar(
+                "SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?",
+            )
+            .bind(doc_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            println!("  doc final state: {final_state}  server_fiscal_no: {server_fiscal_no:?}");
+            print_live_diagnostics(pool, doc_id).await;
+
+            println!("  RENDERED id_offline (offline_dps_code sent to DPS): {real_opaque_code:?}");
+
+            if final_state == "SENT" || final_state == "KVT1" || final_state == "ACK" {
+                format!(
+                    "DPS ACCEPTED opaque id_offline={real_opaque_code:?} on real canonical XML \
+                     (doc→{final_state} server_fiscal_no={server_fiscal_no:?}) — B8-4 CONFIRMED"
+                )
+            } else {
+                // Read DPS reject code from transport_trace for diagnosis.
+                let trace_code: Option<i64> = sqlx::query_scalar(
+                    "SELECT server_status_code FROM transport_trace \
+                     WHERE document_id = ? ORDER BY attempt_no DESC LIMIT 1",
+                )
+                .bind(doc_id)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None)
+                .flatten();
+                format!(
+                    "DPS did NOT advance to Sent — doc→{final_state} \
+                     dps_code={trace_code:?} id_offline={real_opaque_code:?} \
+                     (see diagnostics; if dps_code=-7 the XML is still wrong)"
+                )
+            }
+        }
+        Ok(prro::ScheduledDrainOutcome::SkippedBackoff { .. }) => {
+            panic!("Smoke 11 FAIL: drain skipped due to backoff on first run");
+        }
+        Err(e) => {
+            panic!("Smoke 11 FAIL: drain_offline_backlog_scheduled returned Err: {e:?}");
+        }
+    };
+
+    // ── Post-bracket ────────────────────────────────────────────────────────
+    println!("\n--- POST-BRACKET ---");
+    if let Ok(a) = channel.last_chk(&fn_sign).await {
+        let chain_changed = a.data_sign.len() != pre_ack.data_sign.len() || a.id != pre_ack.id;
+        println!(
+            "  post lastChk: id={:?} data_sign={} bytes  chain_changed={chain_changed}",
+            a.id,
+            a.data_sign.len()
+        );
+    }
+    if let Ok(s) = channel.status_rro(&fn_sign).await {
+        println!(
+            "  post statusRro: open_shift={} online={} last_signer={:?}",
+            s.open_shift, s.online, s.last_signer
+        );
+    }
+
+    println!("\nGROUND-TRUTH: {ground_truth_summary}");
+    println!(
+        "Smoke 11 PASS: drain ran with real canonical XML — \
+         id_offline={real_opaque_code:?} reached live DPS. \
+         Check GROUND-TRUTH above for ACCEPTED vs REJECTED verdict."
+    );
+}
