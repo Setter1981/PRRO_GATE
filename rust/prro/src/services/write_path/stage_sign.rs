@@ -61,6 +61,10 @@ pub enum WireArtifactKind {
     Sell,
     Return,
     ZReport,
+    /// B10 — offline-session BEGIN (`<C T="109">`) service receipt.
+    OfflineSessionBegin,
+    /// B10 — offline-session END (`<C T="110">`) service receipt.
+    OfflineSessionEnd,
 }
 
 pub struct SigningContext {
@@ -153,6 +157,11 @@ pub fn derive_wire_artifact_kind(doc_type: DocType) -> Result<WireArtifactKind, 
         DocType::Sell => Ok(WireArtifactKind::Sell),
         DocType::Return => Ok(WireArtifactKind::Return),
         DocType::ShiftClose | DocType::ZReport => Ok(WireArtifactKind::ZReport),
+        // B10 — offline-session boundary docs are signable service receipts
+        // (empty `<C T="109">` / `<C T="110">`).  They ride the same offline
+        // sign path (code acquire + `<MAC ID>` stamp) as any offline doc.
+        DocType::OfflineSessionBegin => Ok(WireArtifactKind::OfflineSessionBegin),
+        DocType::OfflineSessionEnd => Ok(WireArtifactKind::OfflineSessionEnd),
         // W4 builder ships ShiftOpen/Sell/Return/ZReport only.  Other
         // op-types are not signable in W6: fail-closed BEFORE any
         // pin / Z allocation / state mutation occurs.
@@ -1186,6 +1195,11 @@ enum TypedPayload {
     ShiftOpen(ShiftOpenJson),
     Check { body: CheckJson, total_sum_kop: i64 },
     ZReport(ZReportJson),
+    /// B10 — offline-session boundary (BEGIN/END).  Carries no body: the
+    /// wire doc is an EMPTY `<C T="109">`/`<C T="110">` service receipt
+    /// (header + `<TS>` + `<MAC>` only).  The payload_json is an inert
+    /// marker (`{}`), so no fields are parsed.
+    OfflineBoundary,
 }
 
 fn parse_payload(
@@ -1217,6 +1231,10 @@ fn parse_payload(
             .map_err(|e| SignError::PayloadSchema {
                 detail: format!("ZReport: {e}"),
             }),
+        // B10 — boundary docs carry no body; the JSON is an inert marker.
+        WireArtifactKind::OfflineSessionBegin | WireArtifactKind::OfflineSessionEnd => {
+            Ok(TypedPayload::OfflineBoundary)
+        }
     }
 }
 
@@ -1233,6 +1251,24 @@ fn build_canonical_doc(
                 header,
                 opening_sum: p.opening_sum_kop,
             }))
+        }
+        // B10 — offline-session boundary docs: empty service receipt, DI =
+        // the doc's local number.  BEGIN → `<C T="109">`, END → `<C T="110">`.
+        (WireArtifactKind::OfflineSessionBegin, TypedPayload::OfflineBoundary) => {
+            Ok(CanonicalDoc::OfflineSessionBegin(
+                crate::xml::OfflineSessionBoundaryPayload {
+                    header,
+                    local_number,
+                },
+            ))
+        }
+        (WireArtifactKind::OfflineSessionEnd, TypedPayload::OfflineBoundary) => {
+            Ok(CanonicalDoc::OfflineSessionEnd(
+                crate::xml::OfflineSessionBoundaryPayload {
+                    header,
+                    local_number,
+                },
+            ))
         }
         (
             WireArtifactKind::Sell,

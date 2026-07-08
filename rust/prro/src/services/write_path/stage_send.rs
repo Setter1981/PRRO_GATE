@@ -394,6 +394,12 @@ fn wire_artifact_to_check_type(k: WireArtifactKind) -> DpsCheckType {
         WireArtifactKind::ShiftOpen => DpsCheckType::ServiceChk,
         WireArtifactKind::Sell | WireArtifactKind::Return => DpsCheckType::Chk,
         WireArtifactKind::ZReport => DpsCheckType::ZReport,
+        // B10 — offline-session boundary docs are service receipts, same
+        // typCheck as SHIFT_OPEN (ground truth: WebCheck `TypToPROTO` maps
+        // typ 9/10 → PROTO 3 = ServiceChk).
+        WireArtifactKind::OfflineSessionBegin | WireArtifactKind::OfflineSessionEnd => {
+            DpsCheckType::ServiceChk
+        }
     }
 }
 
@@ -2076,6 +2082,45 @@ mod tests {
         .expect("SHIFT_CLOSE must build via ZReport route");
         assert_eq!(env.check_type, DpsCheckType::ZReport);
         assert_eq!(env.local_number, 100);
+    }
+
+    // ─── B10: offline-session boundary docs (DocType 9/10) ────────────
+    #[test]
+    fn build_envelope_offline_session_begin_uses_servicechk_and_passes_lnd() {
+        // DocType=9 BEGIN → typCheck ServiceChk(3), same as SHIFT_OPEN;
+        // BUT (unlike SHIFT_OPEN) it does NOT force local_number to 0 —
+        // it is an ordinary lnd-numbered offline doc.  It also carries an
+        // offline code → non-empty id_offline (proven separately).
+        let mut i = inputs(DocType::OfflineSessionBegin, 7, "2026-05-09T12:34:56Z");
+        i.offline_dps_code = Some("BEGIN-CODE".into());
+        let env = build_send_envelope(&i, b"PAY".to_vec()).expect("BEGIN must build");
+        assert_eq!(
+            env.check_type,
+            DpsCheckType::ServiceChk,
+            "OFFLINE_SESSION_BEGIN must map to ServiceChk(3)"
+        );
+        assert_eq!(
+            env.local_number, 7,
+            "BEGIN keeps its lnd (NOT forced to 0 like SHIFT_OPEN)"
+        );
+        assert_eq!(
+            env.id_offline, "BEGIN-CODE",
+            "BEGIN is an offline doc → id_offline carries its DPS code"
+        );
+    }
+
+    #[test]
+    fn build_envelope_offline_session_end_uses_servicechk_and_passes_lnd() {
+        let mut i = inputs(DocType::OfflineSessionEnd, 8, "2026-05-09T12:34:56Z");
+        i.offline_dps_code = Some("END-CODE".into());
+        let env = build_send_envelope(&i, b"PAY".to_vec()).expect("END must build");
+        assert_eq!(
+            env.check_type,
+            DpsCheckType::ServiceChk,
+            "OFFLINE_SESSION_END must map to ServiceChk(3)"
+        );
+        assert_eq!(env.local_number, 8, "END keeps its lnd");
+        assert_eq!(env.id_offline, "END-CODE");
     }
 
     #[test]
