@@ -726,6 +726,44 @@ pub async fn seed_offline_codes(
     })
 }
 
+/// B8 test-support: seed a batch of DPS-issued opaque codes for `fiscal_number`
+/// via [`crate::db::repositories::offline_sessions::insert_dps_codes_tx`].
+///
+/// Unlike [`seed_offline_codes`] (which seeds integer-range drill codes with
+/// `dps_code NULL`), this function accepts explicit string codes and stores them
+/// with `dps_code` set — the shape that `acquire_code_tx` requires after B8-1.
+///
+/// Intended for test helpers and pilot drills that need the realistic code shape.
+/// No CLI exposure — pilot code injection uses the T=112 ask-codes flow in prod.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn seed_dps_offline_codes(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    codes: &[String],
+) -> Result<crate::db::repositories::offline_sessions::InsertedSummary, AdminError> {
+    if codes.is_empty() {
+        return Ok(crate::db::repositories::offline_sessions::InsertedSummary {
+            inserted: 0,
+            deduped: 0,
+        });
+    }
+    let fn_owned = fiscal_number.to_string();
+    let codes_owned: Vec<String> = codes.to_vec();
+    crate::db::tx::with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            crate::db::repositories::offline_sessions::insert_dps_codes_tx(
+                tx,
+                &fn_owned,
+                &codes_owned,
+            )
+            .await
+            .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .map_err(|e| AdminError::Infrastructure(format!("seed_dps_offline_codes: {e}")))
+}
+
 /// W2 / LOW-PR90-01 — abstract password-acquisition seam.  Production
 /// CLI plugs in a [`RpasswordTtyPrompter`] (TTY) или [`StdinLinePrompter`]
 /// (non-TTY pipe, for CI test harnesses); tests inject any

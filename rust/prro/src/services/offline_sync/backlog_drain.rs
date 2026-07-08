@@ -3018,7 +3018,11 @@ fn failure_class_for_send_err(err: &StageSendError) -> FailureClass {
         // same DRAIN disposition; the forensic split lives at the
         // StageSendError + audit layer (m3b W9a Round-2 LOW #1).
         StageSendError::OfflineFiscalNoMissing { .. }
-        | StageSendError::OfflineFiscalNoNonPositive { .. } => FailureClass::OfflineFiscalNoMissing,
+        | StageSendError::OfflineFiscalNoNonPositive { .. }
+        // B8-3: missing opaque DPS code is the same drain disposition as a
+        // missing offline_fiscal_no — doc stays in OfflineLocalAck for
+        // operator inspection; no wire, no orphan.
+        | StageSendError::OfflineDpsCodeMissing { .. } => FailureClass::OfflineFiscalNoMissing,
         StageSendError::DocumentMissingForRecovery { .. } => FailureClass::NotFound,
         StageSendError::UnsupportedDocType { .. }
         | StageSendError::LndOutOfRangeI32 { .. }

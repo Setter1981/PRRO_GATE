@@ -308,10 +308,13 @@ async fn pilot_offline_sell_and_return_reachable_via_live_binding() {
         Some("OPEN")
     );
     // 2c. seed real DPS-issued codes via the admin pilot-drill affordance.
-    let seeded = prro::admin::seed_offline_codes(app.db(), FN, 1000, 1005, "cabinet drill range")
+    // B8-1: switched to seed_dps_offline_codes so codes carry dps_code (non-NULL),
+    // satisfying the acquire_code_tx guard added in B8-1.
+    let codes: Vec<String> = (0..6).map(|i| format!("DRILL-H-{i}")).collect();
+    let seeded = prro::admin::seed_dps_offline_codes(app.db(), FN, &codes)
         .await
         .expect("seed offline codes");
-    assert_eq!(seeded.inserted_count, 6);
+    assert_eq!(seeded.inserted, 6);
 
     // (A′.3 O2: the operator door is now LIVE — proven by the admin door tests
     // + the full drill. This e2e still reaches the machinery via DIRECT seams,

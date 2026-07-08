@@ -411,6 +411,10 @@ pub async fn transition_to_offline_local_ack_tx(
     code_lnd: i64,
     consumed_at: &str,
     offline_session_id: OfflineSessionId,
+    // B8-2: opaque DPS-issued code string from `AcquiredCode.dps_code`.
+    // Stamped into `offline_dps_code` in the SAME CAS UPDATE so the doc
+    // carries the wire-ready id_offline value from the moment of issuance.
+    dps_code: &str,
 ) -> sqlx::Result<TransitionOutcome> {
     // Whitelist gate — RELEASE-effective per operator W7 Round 1
     // HIGH-3 fix (2026-05-15).  Was `debug_assert!` previously;
@@ -425,12 +429,14 @@ pub async fn transition_to_offline_local_ack_tx(
          SET state = 'OFFLINE_LOCAL_ACK', \
              offline_fiscal_no = ?, \
              offline_fiscal_date = ?, \
-             offline_session_id = ? \
+             offline_session_id = ?, \
+             offline_dps_code = ? \
          WHERE document_id = ? AND fiscal_number = ? AND state = 'SIGNED'",
     )
     .bind(code_lnd)
     .bind(consumed_at)
     .bind(offline_session_id)
+    .bind(dps_code)
     .bind(id)
     .bind(fiscal_number)
     .execute(&mut **tx)
@@ -1617,6 +1623,11 @@ pub struct SendInputs {
     pub previous_hash: Option<Vec<u8>>,
     pub unsigned_xml_sha256: Option<Vec<u8>>,
     pub mac_recovery_attempts: i64,
+    /// B8-3: opaque DPS-issued code stamped at OfflineLocalAck (B8-2).
+    /// `Some(s)` for offline-origin docs that went through `stage_offline_ack`.
+    /// `None` for online docs and for offline-origin docs where the stamp is
+    /// missing (a fail-closed invariant breach surfaced by `stage_send`).
+    pub offline_dps_code: Option<String>,
 }
 
 /// W7 stage 4-pre — read the minimal field set required by stage 4 in
@@ -1642,6 +1653,7 @@ pub async fn fetch_send_inputs_tx(
                   backend_profile_id,
                   transport_profile_id,
                   offline_fiscal_no,
+                  offline_dps_code,
                   shift_id             as "shift_id: ShiftId",
                   signed_by_cashier_id as "signed_by_cashier_id: CashierId",
                   previous_hash        as "previous_hash: Vec<u8>",
@@ -1662,6 +1674,7 @@ pub async fn fetch_send_inputs_tx(
         backend_profile_id: r.backend_profile_id,
         transport_profile_id: r.transport_profile_id,
         offline_fiscal_no: r.offline_fiscal_no,
+        offline_dps_code: r.offline_dps_code,
         document_id: doc_id,
         shift_id: r.shift_id,
         signed_by_cashier_id: r.signed_by_cashier_id,

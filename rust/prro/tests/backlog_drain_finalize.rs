@@ -123,19 +123,22 @@ async fn seed_doc(
     let doc_id = DocumentId::new();
     let req_id = Uuid::now_v7();
     let sha = vec![0u8; 32];
+    // B8: offline_dps_code required so fail-closed drain guard passes for
+    // OFFLINE_LOCAL_ACK docs that go through stage_send during drain.
+    let dps_code = format!("DRAIN-FINAL-{code_lnd}");
     sqlx::query(
         "INSERT INTO fiscal_documents( \
             document_id, request_id, fiscal_number, shift_id, lnd, doc_type, state, \
             backend_profile_id, transport_profile_id, fs_mode, business_ts, \
             payload_json, payload_sha256_canonical, signed_by_cashier_id, \
             offline_session_id, offline_fiscal_no, offline_fiscal_date, \
-            server_fiscal_no \
+            offline_dps_code, server_fiscal_no \
          ) VALUES ( \
             ?, ?, ?, ?, ?, 'SELL', ?, \
             'b', 't', 'OFFLINE', '2026-05-21T00:00:00Z', \
             '{}', ?, ?, \
             ?, ?, '2026-05-21T00:00:00Z', \
-            ? \
+            ?, ? \
          )",
     )
     .bind(doc_id)
@@ -148,6 +151,7 @@ async fn seed_doc(
     .bind(CASHIER_OK)
     .bind(session_id)
     .bind(code_lnd)
+    .bind(&dps_code)
     .bind(server_fiscal_no)
     .execute(pool)
     .await

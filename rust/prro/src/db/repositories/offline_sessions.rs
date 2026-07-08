@@ -111,10 +111,18 @@ pub struct NewOpeningSession<'a> {
 /// the chosen `code_lnd` is the `consumed_at` timestamp that the
 /// DB stamped via `CURRENT_TIMESTAMP` so the service layer can
 /// echo it back to the caller without a follow-up SELECT.
+///
+/// B8: `dps_code` is the opaque DPS-issued string that must appear in
+/// `CheckEnvelope.id_offline` during drain (B8-3).  It is guaranteed
+/// non-empty by the `AND dps_code IS NOT NULL` guard in `acquire_code_tx`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcquiredCode {
     pub code_lnd: i64,
     pub consumed_at: String,
+    /// The opaque DPS-issued offline code string (e.g. `"eYme-jhnkWQ"`).
+    /// Always non-empty: `acquire_code_tx` only selects rows where
+    /// `dps_code IS NOT NULL`.
+    pub dps_code: String,
 }
 
 /// Whitelist of legal `offline_sessions.state` transitions.
@@ -382,17 +390,23 @@ pub async fn acquire_code_tx(
     fiscal_number: &str,
     document_id: DocumentId,
 ) -> Result<AcquiredCode, OfflineSessionError> {
-    let row: Result<Option<(i64, String)>, sqlx::Error> = sqlx::query_as(
+    // B8-1: `AND dps_code IS NOT NULL` in both the outer WHERE and the inner
+    // subquery ensures only DPS-issued real codes are acquired.  Drill rows
+    // seeded via `seed_code_range_tx` (dps_code NULL) are deliberately skipped
+    // — a pool containing only drill rows surfaces as `CodePoolExhausted`,
+    // which the caller maps to `Refused(CodePoolExhausted)`.
+    let row: Result<Option<(i64, String, String)>, sqlx::Error> = sqlx::query_as(
         "UPDATE offline_codes \
          SET consumed_at = CURRENT_TIMESTAMP, consumed_by_document_id = ? \
          WHERE fiscal_number = ? \
            AND consumed_at IS NULL \
+           AND dps_code IS NOT NULL \
            AND code_lnd = ( \
                SELECT code_lnd FROM offline_codes \
-               WHERE fiscal_number = ? AND consumed_at IS NULL \
+               WHERE fiscal_number = ? AND consumed_at IS NULL AND dps_code IS NOT NULL \
                ORDER BY code_lnd ASC LIMIT 1 \
            ) \
-         RETURNING code_lnd, consumed_at",
+         RETURNING code_lnd, consumed_at, dps_code",
     )
     .bind(document_id)
     .bind(fiscal_number)
@@ -401,9 +415,10 @@ pub async fn acquire_code_tx(
     .await;
 
     match row {
-        Ok(Some((code_lnd, consumed_at))) => Ok(AcquiredCode {
+        Ok(Some((code_lnd, consumed_at, dps_code))) => Ok(AcquiredCode {
             code_lnd,
             consumed_at,
+            dps_code,
         }),
         Ok(None) => Err(OfflineSessionError::CodePoolExhausted {
             fiscal_number: fiscal_number.to_string(),

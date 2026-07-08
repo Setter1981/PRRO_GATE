@@ -210,11 +210,12 @@ async fn dps_code_empty_slice_is_noop() {
     assert_eq!(total, 0);
 }
 
-// ─── (c) drill seed path unaffected ────────────────────────────────────────
+// ─── (c) drill seed path — acquire skips NULL-dps_code drill rows ──────────
 
 /// Pin (c): `seed_code_range_tx` works exactly as before (integer range,
 /// `dps_code NULL`); `insert_dps_codes_tx` coexists in the same pool;
-/// `acquire_code_tx` picks the lowest `code_lnd` regardless of `dps_code` kind.
+/// `acquire_code_tx` skips drill codes (dps_code IS NULL) and picks only
+/// DPS-issued codes — this is the B8-1 real-first guard.
 #[tokio::test]
 async fn drill_seed_path_unaffected() {
     let (_d, pool) = fresh_pool().await;
@@ -261,7 +262,8 @@ async fn drill_seed_path_unaffected() {
         "DPS code gets code_lnd = MAX(drill codes)+1 = 4"
     );
 
-    // acquire_code_tx must still pick the lowest available code_lnd (= 1, a drill code).
+    // B8-1: acquire_code_tx skips drill codes (dps_code IS NULL) and picks the
+    // DPS-issued code (code_lnd=4) — the lowest code with dps_code IS NOT NULL.
     let doc_id = insert_fiscal_doc(&pool, FN, 1).await;
     let fn_owned2 = FN.to_string();
     let acquired = with_immediate(&pool, move |tx| {
@@ -274,9 +276,12 @@ async fn drill_seed_path_unaffected() {
     .await
     .unwrap();
     assert_eq!(
-        acquired.code_lnd, 1,
-        "acquire_code_tx must consume lowest code_lnd (1 = first drill code), \
-         ignoring dps_code kind"
+        acquired.code_lnd, 4,
+        "acquire_code_tx must skip drill codes (dps_code NULL) and pick the DPS-issued code"
+    );
+    assert_eq!(
+        acquired.dps_code, "dps-X",
+        "acquired dps_code must be the DPS-issued string"
     );
 }
 
