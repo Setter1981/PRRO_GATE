@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 83d339f304bfc41a32baa81a52767d14ccb8af883dc497e5b3c42d78ac93a008 # shrinks to ops = [Crash(OfflineAck), OfflineReturn, Crash(Sign), OnlineSell(DpsScript([Ack, Ack])), OnlineSell(DpsScript([Ack, NotFound])), GoOnlineWithoutBacklog, OfflineSellDuringGoingOnline, OnlineSell(DpsScript([Reject]))]
+cc 0d9f3ead327b7c8824c5d48e18c6edacd24bbbc9cd6586cba6dc376dc97c3a7b # shrinks to ops = [OfflineSell, DuplicateIdemKey]

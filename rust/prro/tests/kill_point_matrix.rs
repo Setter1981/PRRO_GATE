@@ -303,11 +303,16 @@ async fn k6_offline_local_ack_drains_to_ack() {
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_offline(&pool, shift_id).await;
     seed_open_offline_session(&pool).await;
+    // B10: the first offline SELL lazily mints a DocType=9 BEGIN (code#1) before
+    // the SELL (code#2); the drain then mints a DocType=10 END (code#3).
     seed_offline_code(&pool, 1).await;
+    seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await;
     let row = seed_inbox_sell(&pool).await;
 
     // ── Phase 1: full inline::run on the offline node — terminates at
-    //    OFFLINE_LOCAL_ACK.  DPS is never called on the offline branch.
+    //    OFFLINE_LOCAL_ACK.  DPS is never called on the offline branch (neither
+    //    for the SELL nor the lazily-minted BEGIN).
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
     let phase1 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
@@ -328,7 +333,20 @@ async fn k6_offline_local_ack_drains_to_ack() {
     .await
     .expect("offline SELL must land at OFFLINE_LOCAL_ACK (success, not error)");
     assert_eq!(outcome.document_state, DocState::OfflineLocalAck);
-    assert_eq!(read_doc_state(&pool, FN).await, "OFFLINE_LOCAL_ACK");
+    // B10: two OLA docs pre-drain — the lazy BEGIN + the SELL.
+    assert_eq!(
+        count_doc_rows(&pool).await,
+        2,
+        "B10: BEGIN + SELL both minted offline"
+    );
+    let sell_state: String = sqlx::query_scalar(
+        "SELECT state FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'SELL'",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sell_state, "OFFLINE_LOCAL_ACK");
     assert_eq!(
         read_inbox_status(&pool, &row.request_id).await,
         "PROCESSING"
@@ -345,10 +363,12 @@ async fn k6_offline_local_ack_drains_to_ack() {
     set_node_mode(&pool, NodeMode::GoingOnline).await;
 
     // ── Phase 2: drain with a mock DPS — send Ok (carries KVT1 data_sign) +
-    //    lastChk Match.  Counters are SHARED with phase 1.
+    //    lastChk Match, for BEGIN + SELL + the drain-time END.  Counters SHARED.
     let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    phase2.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    for _ in 0..3 {
+        phase2.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+        phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    }
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
     let view = RuntimeView {
@@ -360,13 +380,18 @@ async fn k6_offline_local_ack_drains_to_ack() {
     let summary = backlog_drain::drain(&recon_guard(), &pool, &view, FN)
         .await
         .expect("drain must succeed");
-    assert_eq!(summary.backlog_size_before(), 1, "exactly one backlog doc");
+    assert_eq!(
+        summary.backlog_size_before(),
+        2,
+        "B10: two content backlog docs (BEGIN + SELL); the END is a finalize \
+         precondition, not a cohort member"
+    );
 
     // ── Locked assertions.
     assert_eq!(
-        read_doc_state(&pool, FN).await,
+        sell_state_after(&pool).await,
         "ACK",
-        "drain → terminal ACK"
+        "drain → the SELL reaches terminal ACK"
     );
     assert_eq!(
         read_inbox_status(&pool, &row.request_id).await,
@@ -375,16 +400,32 @@ async fn k6_offline_local_ack_drains_to_ack() {
     );
     assert_eq!(
         count_consumed_offline_codes(&pool).await,
-        1,
-        "offline code consumed exactly once (phase 1)"
+        3,
+        "B10: three codes consumed — BEGIN + SELL + END"
     );
     assert_eq!(
         send_calls.load(Ordering::SeqCst),
-        1,
-        "exactly one send_chk across both phases (drain's wire submit)"
+        3,
+        "three send_chk across both phases: BEGIN + SELL + END (all at drain)"
     );
-    assert_eq!(count_doc_rows(&pool).await, 1, "exactly one ledger row");
+    assert_eq!(
+        count_doc_rows(&pool).await,
+        3,
+        "B10: three ledger rows — BEGIN + SELL + END"
+    );
     prro::db::invariant_scan::assert_clean(&pool).await;
+}
+
+/// Read the SELL doc's state (B10: the ledger now has BEGIN + SELL + END, so the
+/// single-row `read_doc_state` is ambiguous — target the SELL by doc_type).
+async fn sell_state_after(pool: &SqlitePool) -> String {
+    sqlx::query_scalar(
+        "SELECT state FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'SELL'",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 async fn read_doc_id(pool: &SqlitePool) -> DocumentId {

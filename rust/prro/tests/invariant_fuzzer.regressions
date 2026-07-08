@@ -9,3 +9,4 @@ cc 294a8dd8622b225ccc3217113e6036fa6c26192e8a8deb988002c6cd041f82ce # shrinks to
 cc f5c57a30bb57ef49a490df053518e8bd0b5b1bf3860918d10575c37bdbda04fd # shrinks to ops = [OfflineSellDuringGoingOnline, GoOnlineWithoutBacklog]
 cc 1b36f63a26295d348190cbec527c84e5cec8f6efdbb72148d2af85afab333a39 # shrinks to ops = [OfflineSell, OnlineSell(DpsScript([Ack, Ack]))]
 cc 80d45a7391463bedcb095d4efaee703ee16a472643ee9f66295ee98e44b9bf18 # shrinks to ops = [OnlineSell(DpsScript([Ack, Ack])), GoOnline(DpsScript([Ack, Ack])), OnlineSell(DpsScript([Superseded])), OfflineSell]
+cc cb23de01891548d97c6da9cb6662e1da79bcdcee986a0c5c32fe1e972837226c # shrinks to ops = [Crash(Kvt1), OnlineReturn(DpsScript([Ack, Ack])), SellWithClosedShift, Reboot]

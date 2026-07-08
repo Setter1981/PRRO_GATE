@@ -91,7 +91,11 @@ fn online_sell_ackpath_advances_lnd_and_seed() {
 }
 
 /// `apply(OfflineSell)` advances the seed at `OFFLINE_LOCAL_ACK` (issuance), not
-/// later, and consumes exactly one offline code (spec §6 offline lane).
+/// later, and consumes offline codes (spec §6 offline lane).
+///
+/// B10: the FIRST offline sell of a session lazily mints a DocType=9 BEGIN@lnd1
+/// (code#1) BEFORE the SELL, so `apply(OfflineSell)` returns the BUSINESS
+/// Mutation (SELL@lnd2, code#2) and the model has consumed TWO codes.
 #[test]
 fn offline_sell_advances_seed_at_offline_local_ack_and_consumes_code() {
     let mut m = RefModel::new_offline_open_shift(3);
@@ -100,13 +104,14 @@ fn offline_sell_advances_seed_at_offline_local_ack_and_consumes_code() {
     let out = m.apply(&Op::OfflineSell);
 
     let mu = mutation(&out);
-    assert_eq!(mu.lnd, 1);
+    assert_eq!(mu.lnd, 2, "the returned Mutation is the SELL (lnd 2, after BEGIN@1)");
     assert_eq!(mu.doc_state, DocState::OfflineLocalAck);
-    assert_eq!(m.docs.get(&1), Some(&DocState::OfflineLocalAck));
+    assert_eq!(m.docs.get(&1), Some(&DocState::OfflineLocalAck), "BEGIN@1 OLA");
+    assert_eq!(m.docs.get(&2), Some(&DocState::OfflineLocalAck), "SELL@2 OLA");
     assert_ne!(m.seed, seed_before, "seed advanced at OFFLINE_LOCAL_ACK");
     assert_eq!(m.seed, mu.seed_after);
-    assert_eq!(m.codes_consumed, 1, "exactly one code consumed");
-    assert_eq!(mu.code_consumed, Some(1));
+    assert_eq!(m.codes_consumed, 2, "two codes consumed — BEGIN + SELL");
+    assert_eq!(mu.code_consumed, Some(2));
     // OFFLINE_LOCAL_ACK is in the SSOT issued set — the doc is issued at issuance.
     assert!(RefModel::is_offline_origin_issued(
         DocState::OfflineLocalAck
@@ -740,9 +745,12 @@ fn shrinking_reduces_a_forced_failure_to_minimal() {
 
 #[test]
 fn model_drain_ackpath_advances_backlog_to_ack() {
-    let mut m = RefModel::new_offline_open_shift(1);
-    let _ = m.apply(&Op::OfflineSell); // backlog: docs[1] = OFFLINE_LOCAL_ACK
-    assert_eq!(m.docs.get(&1), Some(&DocState::OfflineLocalAck));
+    // B10: the first offline sell mints BEGIN(lnd1) + SELL(lnd2) → seed 3 codes so
+    // both issue AND the drain-time END(lnd3) can too.
+    let mut m = RefModel::new_offline_open_shift(3);
+    let _ = m.apply(&Op::OfflineSell); // BEGIN@1 + SELL@2, both OFFLINE_LOCAL_ACK
+    assert_eq!(m.docs.get(&1), Some(&DocState::OfflineLocalAck), "BEGIN@1 OLA");
+    assert_eq!(m.docs.get(&2), Some(&DocState::OfflineLocalAck), "SELL@2 OLA");
     let seed_before = m.seed;
     m.mode = NodeMode::GoingOnline; // fixture: the probe already flipped (test setup)
 
@@ -752,19 +760,19 @@ fn model_drain_ackpath_advances_backlog_to_ack() {
         matches!(out, ExpectedOutcome::Mutated(_)),
         "an advancing drain is PredictableMutating, got {out:?}"
     );
-    assert_eq!(
-        m.docs.get(&1),
-        Some(&DocState::Ack),
-        "backlog doc drained to ACK"
-    );
+    assert_eq!(m.docs.get(&1), Some(&DocState::Ack), "BEGIN drained to ACK");
+    assert_eq!(m.docs.get(&2), Some(&DocState::Ack), "SELL drained to ACK");
+    // B10: the drain also minted + drained the DocType=10 END (lnd3 → ACK).
+    assert_eq!(m.docs.get(&3), Some(&DocState::Ack), "END minted + drained to ACK");
     assert_eq!(
         m.seed, seed_before,
-        "drain does NOT re-advance the seed (offline-origin advanced at issuance)"
+        "drain does NOT re-advance the seed for the drained backlog (offline-origin \
+         advanced at issuance); the END carries no goods and does not re-seed here"
     );
     assert_eq!(
         m.mode,
         NodeMode::Online,
-        "a full drain flips GoingOnline → Online"
+        "a full drain (with a spare code for the END) flips GoingOnline → Online"
     );
 }
 
@@ -797,7 +805,8 @@ fn model_drain_reject_halts_and_escalates_manual() {
 
 #[test]
 fn model_go_online_transitions_and_drains() {
-    let mut m = RefModel::new_offline_open_shift(1);
+    // B10: BEGIN@1 + SELL@2 at issuance + END@3 at drain → seed 3 codes.
+    let mut m = RefModel::new_offline_open_shift(3);
     let _ = m.apply(&Op::OfflineSell);
 
     let out = m.apply(&Op::GoOnline(DpsScript::ack_path()));
@@ -806,13 +815,11 @@ fn model_go_online_transitions_and_drains() {
     assert_eq!(
         m.mode,
         NodeMode::Online,
-        "go_online: Offline → (GoingOnline) → Online"
+        "go_online: Offline → (GoingOnline) → Online (spare code for the END)"
     );
-    assert_eq!(
-        m.docs.get(&1),
-        Some(&DocState::Ack),
-        "the backlog drained to ACK"
-    );
+    assert_eq!(m.docs.get(&1), Some(&DocState::Ack), "BEGIN drained to ACK");
+    assert_eq!(m.docs.get(&2), Some(&DocState::Ack), "SELL drained to ACK");
+    assert_eq!(m.docs.get(&3), Some(&DocState::Ack), "END drained to ACK");
 }
 
 // ── Task 4 Part B — differential oracle (model vs interpreter) ──────────────
@@ -1472,30 +1479,58 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                     panic!("differential divergence on {op:?}: {d:?}");
                 }
                 // drain / go-online carry no per-doc detail → ledger-delta.
-                if matches!(real, interp::RealOutcome::Recovered { .. }) {
+                if let interp::RealOutcome::Recovered { branch } = &real {
                     let real_ledger = ctx.read_ledger().await;
                     if let Err(d) = oracle::check_ledger_delta(&model.docs, &real_ledger) {
                         panic!("ledger-delta divergence on {op:?}: {d:?}");
                     }
-                    // B3 — FULL snapshot beyond lnd→state: a recovered drain /
-                    // go-online RE-DRIVES already-issued docs; it must NOT consume
-                    // an offline code, allocate a new lnd, or re-advance the MAC
-                    // seed (offline-origin advanced it at issuance, online at ACK).
-                    assert_eq!(
-                        ctx.consumed_codes_count().await,
-                        codes_before,
-                        "B3: recovered drain/go-online {op:?} consumed an offline code"
-                    );
-                    assert_eq!(
-                        ctx.read_next_lnd().await,
-                        next_lnd_before,
-                        "B3: recovered drain/go-online {op:?} allocated a new lnd"
-                    );
-                    assert_eq!(
-                        ctx.read_seed().await,
-                        prior_tip,
-                        "B3: recovered drain/go-online {op:?} re-advanced the MAC seed"
-                    );
+                    if branch == "b10_lazy_begin_interposed" {
+                        // B10 — the FIRST offline doc lazily interposed a DocType=9
+                        // BEGIN.  This op DID consume 2 codes + allocate 2 lnds +
+                        // advance the seed (the B3 no-mutation invariants below do
+                        // NOT apply — they are for drain/go-online RE-DRIVE).  TEETH:
+                        // verify the two-doc chain linkage + code accounting so a
+                        // reverted BEGIN-chain REDs (proven by the canary
+                        // `teeth_b10_reverted_begin_chain_reddens_ledger_delta`).
+                        assert_eq!(
+                            ctx.consumed_codes_count().await,
+                            codes_before + 2,
+                            "B10: first-offline op must consume EXACTLY 2 codes \
+                             (BEGIN + business): {op:?}"
+                        );
+                        assert_eq!(
+                            ctx.read_next_lnd().await,
+                            next_lnd_before + 2,
+                            "B10: first-offline op must allocate EXACTLY 2 lnds \
+                             (BEGIN + business): {op:?}"
+                        );
+                        if let Err(d) = ctx
+                            .assert_b10_boundary_chain_linked(prior_tip.as_deref())
+                            .await
+                        {
+                            panic!("B10 boundary-chain divergence on {op:?}: {d}");
+                        }
+                    } else {
+                        // B3 — FULL snapshot beyond lnd→state: a recovered drain /
+                        // go-online RE-DRIVES already-issued docs; it must NOT
+                        // consume an offline code, allocate a new lnd, or re-advance
+                        // the MAC seed (offline advanced at issuance, online at ACK).
+                        assert_eq!(
+                            ctx.consumed_codes_count().await,
+                            codes_before,
+                            "B3: recovered drain/go-online {op:?} consumed an offline code"
+                        );
+                        assert_eq!(
+                            ctx.read_next_lnd().await,
+                            next_lnd_before,
+                            "B3: recovered drain/go-online {op:?} allocated a new lnd"
+                        );
+                        assert_eq!(
+                            ctx.read_seed().await,
+                            prior_tip,
+                            "B3: recovered drain/go-online {op:?} re-advanced the MAC seed"
+                        );
+                    }
                 }
             }
             // No mutation — the differential is permissive here, so the harness

@@ -100,6 +100,15 @@ pub struct RefModel {
     /// from an online-ER (non-issued, a blocker) — the `docs` map stores only
     /// `DocState`, which loses the origin the D5 predicate needs.
     pub offline_origin_lnds: BTreeSet<i64>,
+    /// B10 — whether this offline session has already minted its DocType=9
+    /// OFFLINE_SESSION_BEGIN.  The model predicts the BEGIN INDEPENDENTLY (from
+    /// first principles, NOT by mirroring the impl) as the FIRST offline doc of a
+    /// session; this flag makes that once-only (mirrors the impl's request_id
+    /// idempotency gate).
+    pub session_has_begin: bool,
+    /// B10 — whether this session has already minted its DocType=10
+    /// OFFLINE_SESSION_END (at drain finalize).  Once-only, like the BEGIN.
+    pub session_has_end: bool,
 }
 
 impl RefModel {
@@ -116,6 +125,8 @@ impl RefModel {
             codes_consumed: 0,
             docs: BTreeMap::new(),
             offline_origin_lnds: BTreeSet::new(),
+            session_has_begin: false,
+            session_has_end: false,
         }
     }
 
@@ -133,6 +144,8 @@ impl RefModel {
             codes_consumed: 0,
             docs: BTreeMap::new(),
             offline_origin_lnds: BTreeSet::new(),
+            session_has_begin: false,
+            session_has_end: false,
         }
     }
 
@@ -360,11 +373,43 @@ impl RefModel {
                 })
             }
             NodeMode::Offline => {
-                let code_available = self.codes_consumed < self.codes_issued;
-                if self.session != Some(OfflineSessionState::Open) || !code_available {
-                    // No active session / no code: reality reaches SIGNED, then the
-                    // offline-ack refuses (NoActiveSession / CodePoolExhausted,
-                    // post-sign) → the seam aborts it → a non-issued Aborted row.
+                if self.session != Some(OfflineSessionState::Open) {
+                    // No active session: reality reaches SIGNED, then offline-ack
+                    // refuses (NoActiveSession, post-sign) → non-issued Aborted row.
+                    return self.mint_aborted_refusal();
+                }
+
+                // B10 — LAZY DocType=9 BEGIN, predicted INDEPENDENTLY (first
+                // principles; NOT read from the impl).  On the FIRST offline doc of
+                // a session (`!session_has_begin`) the impl lazily mints+signs+OLAs
+                // the BEGIN BEFORE the business doc: lowest lnd, consumes code#1,
+                // chains off the pre-op tip, advances the seed to its own unsigned
+                // hash.  Code accounting re-derived vs the impl:
+                //   - 0 codes → BEGIN signs bare → offline-ack ABORTS it, and the
+                //     lazy-BEGIN gate fail-closes the business doc BEFORE it mints
+                //     (503) → the ONLY row is the Aborted BEGIN.
+                //   - 1 code → BEGIN(OLA, code#1); business doc finds empty pool →
+                //     aborts (Aborted).  Two rows.
+                //   - ≥2 codes → BEGIN(OLA, code#1) + business(OLA, code#2).
+                if !self.session_has_begin {
+                    self.session_has_begin = true; // a BEGIN row (OLA or Aborted) now rests
+                    if self.codes_consumed >= self.codes_issued {
+                        // 0 codes → BEGIN aborts; business doc never mints (503).
+                        return self.mint_aborted_refusal();
+                    }
+                    let begin_lnd = self.next_lnd;
+                    let begin_unsigned = synth_unsigned_hash(begin_lnd);
+                    self.docs.insert(begin_lnd, DocState::OfflineLocalAck);
+                    self.offline_origin_lnds.insert(begin_lnd);
+                    self.next_lnd += 1;
+                    self.codes_consumed += 1;
+                    self.seed = Some(begin_unsigned);
+                    // fall through to the business doc (chains off the BEGIN's seed).
+                }
+
+                // The business doc — after any lazy BEGIN above.
+                if self.codes_consumed >= self.codes_issued {
+                    // Pool exhausted for the business doc → offline-ack aborts it.
                     return self.mint_aborted_refusal();
                 }
                 let lnd = self.next_lnd;
@@ -503,6 +548,40 @@ impl RefModel {
             [WireResponse::Ack, WireResponse::Ack, ..] => {
                 for lnd in &backlog {
                     self.docs.insert(*lnd, DocState::Ack);
+                }
+                // B10 — at drain finalize the DocType=10 END is minted + sent LAST
+                // (predicted INDEPENDENTLY).  Only a session that issued a BEGIN
+                // gets an END, and once-only (`session_has_end`).  Code accounting
+                // vs the impl (`ensure_and_drain_session_end` + pool-exhausted
+                // guard): spare code → END issues + drains to ACK + finalize CAS's
+                // GoingOnline → Online; NO spare code → END rests SIGNED (held), the
+                // guard blocks finalize → mode STAYS GoingOnline.
+                if self.session_has_begin && !self.session_has_end {
+                    self.session_has_end = true;
+                    let end_lnd = self.next_lnd;
+                    self.next_lnd += 1;
+                    if self.codes_consumed < self.codes_issued {
+                        self.docs.insert(end_lnd, DocState::Ack);
+                        self.offline_origin_lnds.insert(end_lnd);
+                        self.codes_consumed += 1;
+                        self.mode = NodeMode::Online;
+                        return ExpectedOutcome::Mutated(Mutation {
+                            lnd: end_lnd,
+                            doc_state: DocState::Ack,
+                            seed_after: self.seed,
+                            previous_hash,
+                            code_consumed: None,
+                        });
+                    }
+                    // Pool exhausted → END held SIGNED; finalize blocked; mode stays.
+                    self.docs.insert(end_lnd, DocState::Signed);
+                    return ExpectedOutcome::Mutated(Mutation {
+                        lnd: end_lnd,
+                        doc_state: DocState::Signed,
+                        seed_after: self.seed,
+                        previous_hash,
+                        code_consumed: None,
+                    });
                 }
                 self.mode = NodeMode::Online; // full drain → GoingOnline → Online
                 let tip = *backlog.last().expect("backlog is non-empty");
