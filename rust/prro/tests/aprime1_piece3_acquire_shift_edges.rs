@@ -736,6 +736,173 @@ async fn l_offline_shift_close_at_opened_drives_closing_local_pending_drain() {
     );
 }
 
+// ─── STOP-O3-1 fix (a) helpers: offline session + code-pool seeding ────────
+
+async fn seed_offline_session_open(pool: &sqlx::SqlitePool) {
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, 'OPEN', '2026-07-07T00:00:00Z')",
+    )
+    .bind(prro::db::models::ids::OfflineSessionId::new())
+    .bind(FN)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn seed_offline_code(pool: &sqlx::SqlitePool, code_lnd: i64) {
+    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_lnd) VALUES (?, ?)")
+        .bind(FN)
+        .bind(code_lnd)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+// ─── (o) STOP-O3-1 fix (a) — offline SHIFT_OPEN with NO OPEN session →
+//         PRE-MINT refusal (audit-only): no doc, NO shift transition, no lnd.
+//         The pre-acquire class (6b′/D5): the lifecycle doc must not be born
+//         into an abort that would orphan the shift. ─────────────────────────
+#[tokio::test]
+async fn o_offline_shift_open_without_open_session_refused_premint() {
+    let pool = fresh_pool().await;
+    let secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    seed_node_state(&pool, NodeMode::Offline, ShiftState::Closed, None).await;
+    // A code exists but NO offline session is OPEN.
+    seed_offline_code(&pool, 9000).await;
+    let req = seed_inbox(&pool, DocType::ShiftOpen, Some(CASHIER)).await;
+
+    let result = stage_acquire::run(
+        &pool,
+        &secure,
+        DRIVER,
+        req,
+        cmd(DocType::ShiftOpen, Some(CASHIER)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::OfflineLifecycleNoActiveSession
+            }
+        ),
+        "got {result:?}"
+    );
+    // The DOUBLE ABSENCE pin (ruling): neither a doc nor a shift transition.
+    assert_eq!(
+        doc_count(&pool).await,
+        0,
+        "no doc minted (pre-mint refusal)"
+    );
+    assert_eq!(shift_count(&pool).await, 0, "no shifts row / no edge 2");
+    assert_eq!(
+        node_shift_state(&pool).await,
+        "CLOSED",
+        "projection untouched"
+    );
+    assert_eq!(next_lnd(&pool).await, 1, "lnd not consumed");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_LIFECYCLE_NO_ACTIVE_SESSION_REFUSED").await,
+        1
+    );
+}
+
+// ─── (p) STOP-O3-1 fix (a) — offline SHIFT_OPEN with an EMPTY code pool →
+//         PRE-MINT refusal (the mundane "morning without seeded codes"):
+//         no doc, NO shift transition, no lnd. ───────────────────────────────
+#[tokio::test]
+async fn p_offline_shift_open_with_empty_code_pool_refused_premint() {
+    let pool = fresh_pool().await;
+    let secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    seed_node_state(&pool, NodeMode::Offline, ShiftState::Closed, None).await;
+    // Session is OPEN but the pool has ZERO unconsumed codes.
+    seed_offline_session_open(&pool).await;
+    let req = seed_inbox(&pool, DocType::ShiftOpen, Some(CASHIER)).await;
+
+    let result = stage_acquire::run(
+        &pool,
+        &secure,
+        DRIVER,
+        req,
+        cmd(DocType::ShiftOpen, Some(CASHIER)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::OfflineLifecycleCodePoolEmpty
+            }
+        ),
+        "got {result:?}"
+    );
+    // The DOUBLE ABSENCE pin (ruling): neither a doc nor a shift transition.
+    assert_eq!(
+        doc_count(&pool).await,
+        0,
+        "no doc minted (pre-mint refusal)"
+    );
+    assert_eq!(shift_count(&pool).await, 0, "no shifts row / no edge 2");
+    assert_eq!(
+        node_shift_state(&pool).await,
+        "CLOSED",
+        "projection untouched"
+    );
+    assert_eq!(next_lnd(&pool).await, 1, "lnd not consumed");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_LIFECYCLE_CODE_POOL_EMPTY_REFUSED").await,
+        1
+    );
+}
+
+// ─── (q) STOP-O3-1 fix (a) — offline Z_REPORT on an Opened shift with an
+//         EMPTY pool → PRE-MINT refusal and the shift STAYS Opened (edge 9
+//         NOT driven) — the close is refused honestly instead of being born
+//         into an abort that would orphan the shift at CLPD (the 24h-trap
+//         becomes a typed retryable refusal, not an RMR event). ──────────────
+#[tokio::test]
+async fn q_offline_z_report_with_empty_code_pool_refused_premint_shift_stays_opened() {
+    let pool = fresh_pool().await;
+    let secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift = ShiftId::new();
+    seed_shift(&pool, shift, ShiftState::Opened).await;
+    seed_node_state(&pool, NodeMode::Offline, ShiftState::Opened, Some(shift)).await;
+    seed_offline_session_open(&pool).await;
+    // ZERO unconsumed codes — the close would have nothing to consume.
+    let req = seed_inbox(&pool, DocType::ZReport, None).await;
+
+    let result = stage_acquire::run(&pool, &secure, DRIVER, req, cmd(DocType::ZReport, None))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::OfflineLifecycleCodePoolEmpty
+            }
+        ),
+        "got {result:?}"
+    );
+    assert_eq!(doc_count(&pool).await, 0, "no doc minted");
+    assert_eq!(
+        node_shift_state(&pool).await,
+        "OPENED",
+        "edge 9 NOT driven — the shift stays Opened, retry after re-provisioning"
+    );
+    assert_eq!(
+        shift_state_by_id(&pool, shift).await.as_deref(),
+        Some("OPENED"),
+        "shifts row untouched"
+    );
+    assert_eq!(next_lnd(&pool).await, 1, "lnd not consumed");
+}
+
 // ─── (m) edge 7 — offline Z_REPORT at OpenedLocalPendingDrain → OLPD→CLPD.
 //         The "full offline day" close: the SHIFT_OPEN itself hasn't drained
 //         yet.  Reachable only after the slice-3 guardrail-lift (the guard

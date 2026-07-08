@@ -225,6 +225,20 @@ pub enum RejectionReason {
     /// (Pre-O3 meaning: spec §5.7 L2 — offline shift close not modeled.
     /// Audit shape: `OFFLINE_SHIFT_CLOSE_REFUSED`.)
     OfflineShiftCloseNotSupported,
+    /// STOP-O3-1 fix (a) — an OFFLINE shift-lifecycle op (SHIFT_OPEN /
+    /// SHIFT_CLOSE / Z_REPORT) arrived with NO OPEN offline session.  Fail-
+    /// closed PRE-MINT (audit-only: no lnd, no doc, and — load-bearing — NO
+    /// shift transition), so the lifecycle doc cannot be born into an
+    /// offline-ack refusal that would orphan a pending-drain shift.
+    /// Audit shape: `OFFLINE_LIFECYCLE_NO_ACTIVE_SESSION_REFUSED`.
+    OfflineLifecycleNoActiveSession,
+    /// STOP-O3-1 fix (a) — an OFFLINE shift-lifecycle op arrived with ZERO
+    /// unconsumed offline codes (the mundane "morning without seeded codes" /
+    /// the §0.5 close-of-day exhaustion).  Fail-closed PRE-MINT (audit-only,
+    /// same double-absence class as above); retryable after re-provisioning
+    /// (`seed-codes` / the T=112 ask-codes follow-up).
+    /// Audit shape: `OFFLINE_LIFECYCLE_CODE_POOL_EMPTY_REFUSED`.
+    OfflineLifecycleCodePoolEmpty,
     /// Op attempted while shift is in `ClosingLocalPendingDrain` AND
     /// the doc is a shift-management type (`SHIFT_OPEN` / `SHIFT_CLOSE`).
     /// Transient; operator should retry after drain completion.

@@ -2014,18 +2014,19 @@ pub async fn run_boot_reconciliation(
                     .and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok())
                     .map(DocumentId::from_bytes)
                     .unwrap_or(DocumentId::from_bytes([0u8; 16]));
-                crate::services::offline_sync::backlog_drain::escalate_fn_to_manual_recon(
-                    pool,
-                    fiscal_number,
-                    &row,
-                    anchor_doc_id,
-                    "orphaned_pending_drain_shift",
-                    0,
-                    "BOOT_ORPHANED_PENDING_DRAIN_SHIFT_ESCALATE_MANUAL",
-                    "BOOT_ORPHANED_PENDING_DRAIN_SHIFT_NO_SHIFT",
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("sweep SW-2 escalation failed: {e:?}"))?;
+                let _escalation =
+                    crate::services::offline_sync::backlog_drain::escalate_fn_to_manual_recon(
+                        pool,
+                        fiscal_number,
+                        &row,
+                        anchor_doc_id,
+                        "orphaned_pending_drain_shift",
+                        0,
+                        "BOOT_ORPHANED_PENDING_DRAIN_SHIFT_ESCALATE_MANUAL",
+                        "BOOT_ORPHANED_PENDING_DRAIN_SHIFT_NO_SHIFT",
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("sweep SW-2 escalation failed: {e:?}"))?;
                 return Ok(BranchOutcome::PreservedManualRecon);
             }
         }

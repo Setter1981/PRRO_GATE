@@ -50,8 +50,6 @@ const FN: &str = "4000000037";
 const CASHIER: &str = "test-cashier";
 const DRIVER: &str = "drv-test";
 const SHIFT_OPEN_PAYLOAD: &str = r#"{"opening_sum_kop":0}"#;
-const SELL_PAYLOAD: &str = r#"{"items":[{"code":"item-1","name":"Test item","price_kop":15000,"quantity_thousandths":1000,"sum_kop":15000}],"payments":[{"name":"Cash","sum_kop":15000,"type_code":"0"}]}"#;
-const TOTAL_KOP: i64 = 15000;
 const FIXTURE_CERT_DER: &[u8] = include_bytes!("fixtures/SELF_SIGNED_ENC_6929.cer");
 
 fn cfg_toml(db_path: &str) -> String {
@@ -228,156 +226,75 @@ async fn audit_count(pool: &SqlitePool, event: &str) -> i64 {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Case 1 (runtime half) — OLPD orphan: offline SHIFT_OPEN on an EMPTY pool.
+// Fix (a) composition (e2e) — the mundane "morning without seeded codes":
+// an offline SHIFT_OPEN on an EMPTY pool is refused PRE-MINT through the live
+// binding, so the orphan the runtime-half of fix (b) would otherwise have to
+// escalate is never manufactured (no doc, no shift transition, no RMR event).
+// The runtime half of fix (b) — the terminalise_inbox escalation — is proven
+// directly in `inline.rs` unit tests (its only remaining trigger is the
+// GO_ONLINE mode-race, which fix (a) cannot pre-empt); the boot half is Case 3.
 // ════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn aborted_offline_shift_open_escalates_olpd_orphan_to_rmr() {
-    let app = boot_app("orphan_olpd.db").await;
+async fn fix_a_empty_pool_offline_shift_open_refused_premint_no_orphan() {
+    let app = boot_app("fix_a_empty_pool.db").await;
     let registry = build_registry(&app).await;
     seed_boot_baseline(app.db()).await;
     let write_path = production_write_path(app.clone(), Arc::new(registry));
 
-    // GO_OFFLINE (session OPEN) but NO codes seeded — the mundane trigger.
+    // GO_OFFLINE opens the session, but NO codes are seeded.
     prro::admin::go_offline(app.db(), FN, "morning, forgot to seed")
         .await
         .expect("live door: GO_OFFLINE");
 
-    // Offline SHIFT_OPEN: edge 2 commits at acquire; the offline-ack then
-    // refuses CodePoolExhausted; the doc aborts.  Fix (b): the orphaned OLPD
-    // shift MUST escalate to RequiresManualReconciliation in the same pass.
     let open = drive(
         &*write_path,
         app.db(),
-        entry("SHIFT_OPEN", SHIFT_OPEN_PAYLOAD, "idem-orph-OPEN", None),
+        entry("SHIFT_OPEN", SHIFT_OPEN_PAYLOAD, "idem-fixa-OPEN", None),
     )
     .await;
     assert!(
         open.is_err(),
-        "offline SHIFT_OPEN on an empty pool must be refused, got {open:?}"
+        "offline SHIFT_OPEN on an empty pool must be refused pre-mint, got {open:?}"
     );
+    // The DOUBLE ABSENCE (fix (a)): no doc was minted, no shift transition
+    // committed — so there is no orphan to escalate (fix (b)'s trigger is
+    // never manufactured for this mundane case).
     assert_eq!(
         doc_states(app.db(), "SHIFT_OPEN").await,
-        vec!["ABORTED"],
-        "the lifecycle doc aborted (the #192 mechanics)"
+        Vec::<String>::new(),
+        "pre-mint refusal minted no doc"
     );
-
-    // THE PIN: no OLPD orphan — the shift rests at the canonical operator
-    // surface RequiresManualReconciliation (edge 6), mirrored to node_state.
-    assert_eq!(
-        shift_state(app.db()).await,
-        "REQUIRES_MANUAL_RECONCILIATION",
-        "fix (b): the orphaned OLPD shift escalates to RMR, not a silent wedge"
-    );
+    let shift_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shifts WHERE fiscal_number = ?")
+        .bind(FN)
+        .fetch_one(app.db())
+        .await
+        .unwrap();
+    assert_eq!(shift_rows, 0, "no edge-2 shift row");
     assert_eq!(
         node_row(app.db()).await.1,
-        "REQUIRES_MANUAL_RECONCILIATION",
-        "node_state mirrors the escalation"
+        "CLOSED",
+        "the shift stays Closed — no orphan, no RMR (retry after seed-codes)"
     );
+    assert_eq!(
+        audit_count(app.db(), "OFFLINE_LIFECYCLE_CODE_POOL_EMPTY_REFUSED").await,
+        1,
+        "fix (a) pre-mint refusal audit"
+    );
+    // No fix-(b) escalation happened — there was nothing to escalate.
     assert_eq!(
         audit_count(app.db(), "INLINE_OFFLINE_LIFECYCLE_ABORT_ESCALATE_MANUAL").await,
-        1,
-        "forensic escalation audit emitted"
+        0,
+        "no orphan → no escalation"
     );
-
-    // The wedge is gone: a retry is refused with the OPERATOR surface
-    // (ShiftRequiresOperatorAttention), not the misleading ShiftAlreadyOpen.
-    let retry = drive(
-        &*write_path,
-        app.db(),
-        entry("SHIFT_OPEN", SHIFT_OPEN_PAYLOAD, "idem-orph-OPEN-2", None),
-    )
-    .await;
-    assert!(
-        retry.is_err(),
-        "retry on an RMR shift is operator territory"
-    );
-    assert_eq!(
-        shift_state(app.db()).await,
-        "REQUIRES_MANUAL_RECONCILIATION",
-        "retry did not disturb the RMR terminal"
-    );
+    prro::db::invariant_scan::assert_clean(app.db()).await;
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Case 2 (runtime half) — CLPD orphan: pool exhausts exactly on the local-Z
-// (the §0.5 24h-trap shape).
-// ════════════════════════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn aborted_offline_z_escalates_clpd_orphan_to_rmr() {
-    let app = boot_app("orphan_clpd.db").await;
-    let registry = build_registry(&app).await;
-    seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path(app.clone(), Arc::new(registry));
-
-    prro::admin::go_offline(app.db(), FN, "full offline day")
-        .await
-        .expect("live door: GO_OFFLINE");
-    // Exactly 3 codes: OPEN consumes 1, two SELLs consume 2 → the Z gets none.
-    prro::admin::seed_offline_codes(app.db(), FN, 7000, 7002, "under-provisioned range")
-        .await
-        .expect("seed codes");
-
-    drive(
-        &*write_path,
-        app.db(),
-        entry("SHIFT_OPEN", SHIFT_OPEN_PAYLOAD, "idem-clpd-OPEN", None),
-    )
-    .await
-    .expect("offline SHIFT_OPEN (edge 2) with a code available");
-    for idem in ["idem-clpd-S1", "idem-clpd-S2"] {
-        drive(
-            &*write_path,
-            app.db(),
-            entry("SELL", SELL_PAYLOAD, idem, Some(TOTAL_KOP)),
-        )
-        .await
-        .expect("offline SELL");
-    }
-    assert_eq!(shift_state(app.db()).await, "OPENED_LOCAL_PENDING_DRAIN");
-
-    // The offline Z: edge 7 commits at acquire (OLPD → CLPD); the offline-ack
-    // then refuses CodePoolExhausted; the Z doc aborts.  Fix (b): the orphaned
-    // CLPD shift (its only exit, edge 13, needs the now-dead Z doc) escalates
-    // to RMR instead of resting as the §0.5 24h-trap.
-    let z = drive(
-        &*write_path,
-        app.db(),
-        entry("Z_REPORT", r#"{}"#, "idem-clpd-Z", None),
-    )
-    .await;
-    assert!(
-        z.is_err(),
-        "offline Z on an exhausted pool must be refused, got {z:?}"
-    );
-    assert_eq!(
-        doc_states(app.db(), "Z_REPORT").await,
-        vec!["ABORTED"],
-        "the local-Z doc aborted"
-    );
-    assert_eq!(
-        shift_state(app.db()).await,
-        "REQUIRES_MANUAL_RECONCILIATION",
-        "fix (b): the orphaned CLPD shift escalates to RMR (edge 14), not the 24h-trap"
-    );
-    assert_eq!(
-        node_row(app.db()).await.1,
-        "REQUIRES_MANUAL_RECONCILIATION",
-        "node_state mirrors the escalation"
-    );
-    // The held OLA backlog (OPEN + 2 SELLs) is untouched — drain-side recovery
-    // of an RMR shift is the operator/manual-recon procedure, not this seam.
-    assert_eq!(
-        doc_states(app.db(), "SELL").await,
-        vec!["OFFLINE_LOCAL_ACK", "OFFLINE_LOCAL_ACK"],
-        "held receipts stay at OLA for the manual-recon drain"
-    );
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// Case 3 (boot half, #196 pattern) — the crash gap: the doc was aborted but
-// the process died BEFORE the escalation.  Boot re-runs the compensation.
+// Case 3 (boot half, #196 pattern) — the crash gap: a shift-lifecycle doc was
+// aborted but the process died BEFORE the escalation.  Boot re-runs the
+// compensation (the remaining reachable orphan is the GO_ONLINE race, whose
+// abort commits before its escalation — this closes that gap).
 // ════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]

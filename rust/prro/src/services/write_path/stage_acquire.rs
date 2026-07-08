@@ -14,7 +14,7 @@ use crate::db::models::ids::{DocumentId, RequestId, ShiftId};
 use crate::db::repositories::{
     audit_log,
     fiscal_documents::{self as fd, NewDocument},
-    ingress_inbox, node_state, shifts,
+    ingress_inbox, node_state, offline_sessions, shifts,
 };
 use crate::db::tx::with_immediate;
 use crate::services::shift::transition;
@@ -611,6 +611,66 @@ pub async fn run(
                 .await;
             }
 
+            // [Step 6b‴] STOP-O3-1 fix (a) — fail-closed PRE-MINT gate for an
+            //            OFFLINE shift-lifecycle op (SHIFT_OPEN / SHIFT_CLOSE /
+            //            Z_REPORT).  The lifecycle doc consumes an offline code
+            //            at local-ack (numbering (ii)) and its acquire edge
+            //            (2 / 9 / 7) commits the shift transition in THIS
+            //            envelope — so if the offline-ack preconditions are
+            //            already visibly absent (no OPEN session / an empty
+            //            code pool), minting now would only manufacture the
+            //            abort-then-RMR orphan that fix (b) escalates.  Refuse
+            //            HERE instead, in the pre-acquire persistence class
+            //            (audit_log only: no lnd, no doc, NO shift transition)
+            //            — the same class as the 6b′ cashier / D5 refusals.
+            //            Reads are pure SQLite inside this envelope; the FN
+            //            single-writer lease means no sibling can consume the
+            //            observed code between this gate and the offline-ack
+            //            (the GO_ONLINE mode-race remains — fix (b) is its
+            //            backstop and (v7) its wire-guard).  Regular fiscal
+            //            docs (SELL / RETURN / …) keep their existing typed
+            //            offline-ack refusal path — a receipt refusal never
+            //            orphans a shift.
+            if channel == Channel::Offline
+                && matches!(
+                    command.doc_type,
+                    DocType::ShiftOpen | DocType::ShiftClose | DocType::ZReport
+                )
+            {
+                if offline_sessions::current_active_session_id_tx(tx, &fn_id)
+                    .await?
+                    .is_none()
+                {
+                    return reject(
+                        tx,
+                        &request_id,
+                        RejectionReason::OfflineLifecycleNoActiveSession,
+                        "offline_lifecycle_no_active_session",
+                        Severity::Warning,
+                        None,
+                    )
+                    .await;
+                }
+                let unconsumed: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM offline_codes \
+                     WHERE fiscal_number = ? AND consumed_at IS NULL",
+                )
+                .bind(&fn_id)
+                .fetch_one(&mut **tx)
+                .await?;
+                if unconsumed == 0 {
+                    return reject(
+                        tx,
+                        &request_id,
+                        RejectionReason::OfflineLifecycleCodePoolEmpty,
+                        "offline_lifecycle_code_pool_empty",
+                        Severity::Warning,
+                        None,
+                    )
+                    .await;
+                }
+            }
+
             // [Step 6b″] A.3 PR-C (D5 gate, design v3 §6 step 7) — fail-closed
             //            PRE-MINT refusal when a NON-ISSUED sibling rests on
             //            this FN.  Minting + signing a successor now would
@@ -1011,6 +1071,8 @@ fn spec_event_for(reason: &RejectionReason) -> Option<&'static str> {
         OfflineShiftCloseNotSupported => Some("OFFLINE_SHIFT_CLOSE_REFUSED"),
         ShiftClosingInFlight => Some("SHIFT_CLOSING_IN_FLIGHT_OP_REFUSED"),
         ZReportBlockedBacklogDrainPending => Some("OFFLINE_Z_REPORT_BACKLOG_DRAIN_PENDING_REFUSED"),
+        OfflineLifecycleNoActiveSession => Some("OFFLINE_LIFECYCLE_NO_ACTIVE_SESSION_REFUSED"),
+        OfflineLifecycleCodePoolEmpty => Some("OFFLINE_LIFECYCLE_CODE_POOL_EMPTY_REFUSED"),
         _ => None,
     }
 }

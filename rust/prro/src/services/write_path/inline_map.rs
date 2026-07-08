@@ -126,6 +126,9 @@ pub(crate) mod codes {
     /// refusal (no codes left) → `OfflineRefused`/503 (node_refused), the typed
     /// replacement for the former raw-anyhow → DISPATCH_INTERNAL.
     pub const OFFLINE_CODE_POOL_EXHAUSTED: &str = "OFFLINE_CODE_POOL_EXHAUSTED";
+    // STOP-O3-1 fix (a) — pre-mint offline shift-lifecycle refusals (503).
+    pub const OFFLINE_LIFECYCLE_NO_SESSION: &str = "OFFLINE_LIFECYCLE_NO_SESSION";
+    pub const OFFLINE_LIFECYCLE_POOL_EMPTY: &str = "OFFLINE_LIFECYCLE_POOL_EMPTY";
     /// Replay-resolve of a doc in the non-issued terminal `Aborted` (a refusal
     /// landed there).  The original refusal reason is not stored on the row, so
     /// the replay surfaces a generic refusal (`OfflineRefused`/503).
@@ -185,6 +188,16 @@ pub(crate) fn map_rejection(reason: &RejectionReason, request_id: [u8; 16]) -> F
         R::ShiftClosingInFlight => shift_guard(request_id, codes::SHIFT_CLOSING_IN_FLIGHT),
         R::ZReportBlockedBacklogDrainPending => {
             shift_guard(request_id, codes::Z_REPORT_BACKLOG_DRAIN_PENDING)
+        }
+        // STOP-O3-1 fix (a) — pre-mint infrastructure refusals of an offline
+        // shift-lifecycle op: retryable 503 (NOT a client-fixable 422) — the
+        // operator opens the session (go-offline) / re-provisions codes
+        // (seed-codes / T=112) and retries.
+        R::OfflineLifecycleNoActiveSession => {
+            node_refused(request_id, codes::OFFLINE_LIFECYCLE_NO_SESSION)
+        }
+        R::OfflineLifecycleCodePoolEmpty => {
+            node_refused(request_id, codes::OFFLINE_LIFECYCLE_POOL_EMPTY)
         }
         // A.3 PR-C (D5 gate) — a transient RETRYABLE refusal (an older
         // non-issued sibling rests; the resolver clears it) → 503 via
