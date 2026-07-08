@@ -154,6 +154,13 @@ pub enum AdminError {
         last: i64,
         overlap_count: i64,
     },
+
+    /// T=112 C5 — `request-offline-codes` replenish failed.  Wraps the
+    /// typed `ReplenishError` display so the operator sees a clear message.
+    /// Exit code 75 (EX_TEMPFAIL) — transient network/DPS failure; operator
+    /// can retry.  Server rejects also land here (DPS returned a non-0 code).
+    #[error("admin: request-offline-codes replenish failed: {0}")]
+    ReplenishFailed(String),
 }
 
 impl AdminError {
@@ -178,6 +185,8 @@ impl AdminError {
             AdminError::OfflineSurfaceNotReady => 69,
             // EX_IOERR (74): input device failure.
             AdminError::PasswordReadIo(_) => 74,
+            // EX_TEMPFAIL (75): transient failure (network/DPS); operator can retry.
+            AdminError::ReplenishFailed(_) => 75,
         }
     }
 }
@@ -216,6 +225,57 @@ pub struct SeedCodesOutcome {
     /// Codes actually inserted (== range size, since the overlap pre-check
     /// guarantees no pre-existing rows in range).
     pub inserted_count: u64,
+}
+
+/// T=112 C5 — outcome of a successful `request-offline-codes` replenish.
+#[derive(Debug)]
+pub struct ReplenishOutcome {
+    pub fiscal_number: String,
+    pub tax_number: String,
+    pub codes_received: usize,
+    pub inserted: u64,
+    pub deduped: u64,
+    pub new_seed_hex: String,
+    pub request_xml: String,
+}
+
+/// T=112 C5 — resolve the effective replenish size.
+///
+/// Priority: `explicit_size` if `Some`; else `max_offline_codes` from config
+/// if > 0; else sane default (1).  The C3 builder clamps 0 to error and
+/// >2000 to 2000 — we do NOT duplicate that logic here.
+pub fn resolve_replenish_size(max_offline_codes: i64, explicit_size: Option<u32>) -> u32 {
+    match explicit_size {
+        Some(s) => s,
+        None => {
+            if max_offline_codes > 0 {
+                max_offline_codes.min(u32::MAX as i64) as u32
+            } else {
+                1
+            }
+        }
+    }
+}
+
+/// T=112 C5 — look up the `tax_number` and `max_offline_codes` for a given
+/// `fiscal_number` from `fiscal_number_config`.
+///
+/// Returns `AdminError::FiscalNumberNotInConfig` when no row exists — gives
+/// the CLI a clear typed error before attempting any network call.
+pub async fn lookup_fn_config_for_replenish(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+) -> Result<(String, i64), AdminError> {
+    use crate::db::repositories::fiscal_number_config as fn_repo;
+    let cfg = fn_repo::get(pool, fiscal_number)
+        .await
+        .map_err(|e| AdminError::Infrastructure(format!("fiscal_number_config lookup: {e}")))?;
+    match cfg {
+        Some(c) => Ok((c.tax_number, c.max_offline_codes)),
+        None => Err(AdminError::FiscalNumberNotInConfig(
+            fiscal_number.to_string(),
+        )),
+    }
 }
 
 /// **Phase 2a.2 / REC-1 Tier 3 (2026-05-24)** — manual STOP_MODE reset
@@ -1335,6 +1395,124 @@ pub async fn run_seed_offline_codes(
     Ok(outcome)
 }
 
+/// CLI entry-point for `prro admin request-offline-codes`.
+///
+/// ## Boot model
+///
+/// Calls `App::boot` (same as `prro serve` / `prro migrate`) which acquires
+/// the singleton advisory lock.  **`prro serve` must be stopped before
+/// running this command** — the singleton lock prevents two processes from
+/// holding it simultaneously.  In-process / auto-replenish is a deferred
+/// follow-up; this command is a maintenance-time trigger.
+///
+/// ## Key loading
+///
+/// Mirrors `doctor::live::run_live_from_env` (file:
+/// `src/doctor/live.rs:344`): reads `PRRO_LIVE_DPS_JKS_PATH` +
+/// `PRRO_LIVE_DPS_JKS_PASS`, calls `extract_private_key` +
+/// `SigningSession::from_extracted` + assembles `SigningContext`.
+///
+/// ## Replenish call
+///
+/// Passes the assembled `App` / `Arc<dyn DpsChannel>` / `Arc<SigningContext>`
+/// to `OfflineCodeReplenishService::new` and calls `replenish`.  The service
+/// acquires the per-FN `fn_write_gate` internally (invariant #2).
+pub async fn run_request_offline_codes(
+    config_path: &Path,
+    fiscal_number: &str,
+    explicit_size: Option<u32>,
+    host: &str,
+    di: u32,
+) -> Result<ReplenishOutcome, AdminError> {
+    use crate::config::AppConfig;
+    use crate::crypto::in_process::InProcessProvider;
+    use crate::crypto::provider::CryptoProvider;
+    use crate::crypto::session::SigningSession;
+    use crate::runtime::key_loader::build_fn_sign;
+    use crate::services::offline_sync::offline_code_replenish::OfflineCodeReplenishService;
+    use crate::services::write_path::stage_sign::SigningContext;
+    use crate::transports::dps::channel::DpsChannel;
+    use crate::transports::dps::grpc::GrpcDpsChannel;
+    use prro_crypto::cms::profile::CmsProfile;
+    use prro_crypto::interop::prro::containers::extract_private_key;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // ── 1. Boot App (reads config, acquires singleton lock, migrates DB) ─────
+    // Pattern identical to `boot_from_path_or_exit` in main.rs.
+    let cfg_text = std::fs::read_to_string(config_path)
+        .map_err(|e| AdminError::Infrastructure(format!("read config: {e}")))?;
+    let cfg = AppConfig::from_toml(&cfg_text)
+        .map_err(|e| AdminError::Infrastructure(format!("parse config: {e}")))?;
+    let app = crate::App::boot(cfg)
+        .await
+        .map_err(|e| AdminError::Infrastructure(format!("App::boot failed: {e}")))?;
+
+    // ── 2. Resolve tax_number + effective size from fiscal_number_config ─────
+    let (tax_number, max_offline_codes) =
+        lookup_fn_config_for_replenish(app.db(), fiscal_number).await?;
+    let size = resolve_replenish_size(max_offline_codes, explicit_size);
+
+    // ── 3. Load JKS key (mirrors doctor::live::run_live_from_env) ────────────
+    let jks_path = std::env::var("PRRO_LIVE_DPS_JKS_PATH").map_err(|_| {
+        AdminError::Infrastructure(
+            "PRRO_LIVE_DPS_JKS_PATH not set (required for request-offline-codes)".to_string(),
+        )
+    })?;
+    let jks_pass = std::env::var("PRRO_LIVE_DPS_JKS_PASS").map_err(|_| {
+        AdminError::Infrastructure(
+            "PRRO_LIVE_DPS_JKS_PASS not set (required for request-offline-codes)".to_string(),
+        )
+    })?;
+    let jks_data = std::fs::read(&jks_path)
+        .map_err(|e| AdminError::Infrastructure(format!("cannot read JKS at {jks_path}: {e}")))?;
+    let extracted = extract_private_key(&jks_data, &jks_pass)
+        .map_err(|e| AdminError::Infrastructure(format!("JKS load/decrypt failed: {e:?}")))?;
+
+    // Build SigningContext — same profile as write-path stage_sign and
+    // the production JksOperatorKeyLoader (src/runtime/key_loader.rs:82).
+    let session =
+        SigningSession::from_extracted(fiscal_number.to_string(), extracted).map_err(|_| {
+            AdminError::Infrastructure("no signing certificate found in JKS container".to_string())
+        })?;
+    let sign_ctx = Arc::new(SigningContext {
+        provider: Arc::new(InProcessProvider::new()) as Arc<dyn CryptoProvider>,
+        session,
+        profile: CmsProfile::Dstu4145WithGost34311Pb,
+    });
+
+    // Validate key health early (same check as doctor --live).
+    let _fn_sign = build_fn_sign(&sign_ctx.session, fiscal_number)
+        .map_err(|e| AdminError::Infrastructure(format!("fn_sign build failed: {e:?}")))?;
+
+    // ── 4. Connect DPS gRPC channel ───────────────────────────────────────────
+    // Pattern from doctor::live::run_live_from_env (src/doctor/live.rs:392).
+    let dps = GrpcDpsChannel::connect(host, Duration::from_secs(30))
+        .await
+        .map_err(|e| AdminError::Infrastructure(format!("DPS connect to {host} failed: {e:?}")))?;
+    let dps: Arc<dyn DpsChannel> = Arc::new(dps);
+
+    // ── 5. Run replenish via OfflineCodeReplenishService ──────────────────────
+    // `new(app, dps, sign_ctx)` — same constructor as C4 tests
+    // (tests/offline_code_replenish.rs:132).  The service acquires the
+    // per-FN fn_write_gate internally (invariant #2).
+    let svc = OfflineCodeReplenishService::new(app.clone(), dps, sign_ctx);
+    let summary = svc
+        .replenish(fiscal_number, &tax_number, di, size)
+        .await
+        .map_err(|e| AdminError::ReplenishFailed(e.to_string()))?;
+
+    Ok(ReplenishOutcome {
+        fiscal_number: fiscal_number.to_string(),
+        tax_number,
+        codes_received: summary.codes_received,
+        inserted: summary.inserted,
+        deduped: summary.deduped,
+        new_seed_hex: summary.new_seed_hex,
+        request_xml: summary.request_xml,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1737,5 +1915,54 @@ mod tests {
             }
             other => panic!("expected CodeRangeOverlapsExistingPool, got {other:?}"),
         }
+    }
+
+    // ─── C5: request-offline-codes tests ─────────────────────────────────────
+
+    /// C5 pin (a): `resolve_replenish_size` — when `--size` omitted it falls
+    /// back to `max_offline_codes`; explicit `--size` passes through unchanged.
+    #[test]
+    fn resolve_replenish_size_from_config_when_not_specified() {
+        // None → falls back to max_offline_codes (100).
+        assert_eq!(resolve_replenish_size(100, None), 100);
+    }
+
+    #[test]
+    fn resolve_replenish_size_explicit_overrides_config() {
+        // Some(42) → 42, regardless of config value.
+        assert_eq!(resolve_replenish_size(100, Some(42)), 42);
+    }
+
+    #[test]
+    fn resolve_replenish_size_zero_config_falls_back_to_default() {
+        // Config 0 → sane default (1).
+        assert_eq!(resolve_replenish_size(0, None), 1);
+    }
+
+    /// C5 pin (b): missing FN in `fiscal_number_config` → typed error, not panic.
+    #[tokio::test]
+    async fn request_offline_codes_missing_fn_config_returns_typed_error() {
+        let (_d, pool) = fresh_pool().await;
+        // No fiscal_number_config row for "9999999999".
+        let err = lookup_fn_config_for_replenish(&pool, "9999999999")
+            .await
+            .expect_err("must fail");
+        assert!(
+            matches!(err, AdminError::FiscalNumberNotInConfig(_)),
+            "expected FiscalNumberNotInConfig, got {err:?}"
+        );
+    }
+
+    /// C5 pin (c): `ReplenishError` → `AdminError::ReplenishFailed` maps to
+    /// non-zero exit code, and the message contains the error description.
+    #[test]
+    fn replenish_error_maps_to_nonzero_exit_code() {
+        let err = AdminError::ReplenishFailed("node_state row missing for FN".to_string());
+        assert_ne!(err.exit_code(), 0, "ReplenishFailed must be non-zero exit");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("node_state row missing"),
+            "message must carry detail"
+        );
     }
 }
