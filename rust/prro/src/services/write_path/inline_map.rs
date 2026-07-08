@@ -126,6 +126,13 @@ pub(crate) mod codes {
     /// refusal (no codes left) → `OfflineRefused`/503 (node_refused), the typed
     /// replacement for the former raw-anyhow → DISPATCH_INTERNAL.
     pub const OFFLINE_CODE_POOL_EXHAUSTED: &str = "OFFLINE_CODE_POOL_EXHAUSTED";
+    /// B9 merge-blocker fix — an offline doc reached offline-ack UNSTAMPED
+    /// (signed with a BARE `<MAC>`, no `ID`), so it can never validly drain
+    /// (DPS `-9`).  `stage_offline_ack` aborted it terminally (`SIGNED →
+    /// Aborted`) in-envelope; this is a structural anomaly (a session was
+    /// absent at sign but present at ack — crash/lease-release edge) → 500
+    /// (`internal`), and the operator re-issues a fresh receipt.
+    pub const OFFLINE_UNSTAMPED_BARE_MAC_ABORTED: &str = "OFFLINE_UNSTAMPED_BARE_MAC_ABORTED";
     // STOP-O3-1 fix (a) — pre-mint offline shift-lifecycle refusals (503).
     pub const OFFLINE_LIFECYCLE_NO_SESSION: &str = "OFFLINE_LIFECYCLE_NO_SESSION";
     pub const OFFLINE_LIFECYCLE_POOL_EMPTY: &str = "OFFLINE_LIFECYCLE_POOL_EMPTY";
@@ -332,6 +339,10 @@ pub(crate) fn map_offline_refusal(
         // left), NOT a race/structural breach → OfflineRefused/503 (precise
         // code), the typed replacement for the former raw-anyhow DISPATCH_INTERNAL.
         R::CodePoolExhausted => node_refused(request_id, codes::OFFLINE_CODE_POOL_EXHAUSTED),
+        // B9 — unstamped bare-MAC doc: aborted terminally in-envelope (the doc
+        // is already `Aborted` when this surfaces).  A structural anomaly (no
+        // session at sign, session at ack) → 500; the operator re-issues.
+        R::UnstampedBareMacAbort => internal(request_id, codes::OFFLINE_UNSTAMPED_BARE_MAC_ABORTED),
     }
 }
 

@@ -130,6 +130,49 @@ async fn insert_signed_doc(pool: &sqlx::SqlitePool, fn_id: &str, lnd: i64) -> Do
     doc_id
 }
 
+/// B9: simulate `stage_sign`'s stamp-at-sign on an already-SIGNED offline doc —
+/// the only path that now reaches offline-ack as `Applied` (readback).  Consumes
+/// `code_lnd` by the doc + stamps its offline columns, so `stage_offline_ack`
+/// takes the readback CAS → OFFLINE_LOCAL_ACK.
+async fn stamp_doc_at_sign(
+    pool: &sqlx::SqlitePool,
+    doc_id: DocumentId,
+    fn_id: &str,
+    code_lnd: i64,
+    session_id: OfflineSessionId,
+) {
+    sqlx::query(
+        "UPDATE offline_codes SET consumed_at = CURRENT_TIMESTAMP, consumed_by_document_id = ? \
+         WHERE fiscal_number = ? AND code_lnd = ?",
+    )
+    .bind(doc_id)
+    .bind(fn_id)
+    .bind(code_lnd)
+    .execute(pool)
+    .await
+    .unwrap();
+    let dps_code: String = sqlx::query_scalar(
+        "SELECT dps_code FROM offline_codes WHERE fiscal_number = ? AND code_lnd = ?",
+    )
+    .bind(fn_id)
+    .bind(code_lnd)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE fiscal_documents SET offline_fiscal_no = ?, \
+             offline_fiscal_date = CURRENT_TIMESTAMP, offline_session_id = ?, \
+             offline_dps_code = ? WHERE document_id = ?",
+    )
+    .bind(code_lnd)
+    .bind(session_id)
+    .bind(&dps_code)
+    .bind(doc_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn fetch_doc_state(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
         .bind(doc_id)
@@ -203,6 +246,7 @@ async fn offline_mode_routes_to_stage_offline_ack_applied() {
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
     seed_code(&pool, FN, 1).await;
     let doc_id = insert_signed_doc(&pool, FN, 1).await;
+    stamp_doc_at_sign(&pool, doc_id, FN, 1, session_id).await;
 
     let route = dispatch::dispatch_post_sign(&pool, doc_id, FN)
         .await
@@ -253,6 +297,7 @@ async fn going_offline_mode_routes_to_stage_offline_ack_applied() {
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
     seed_code(&pool, FN, 7).await;
     let doc_id = insert_signed_doc(&pool, FN, 1).await;
+    stamp_doc_at_sign(&pool, doc_id, FN, 7, session_id).await;
 
     let route = dispatch::dispatch_post_sign(&pool, doc_id, FN)
         .await
@@ -405,6 +450,7 @@ async fn offline_branch_does_not_create_transport_trace_or_send_audit() {
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
     seed_code(&pool, FN, 1).await;
     let doc_id = insert_signed_doc(&pool, FN, 1).await;
+    stamp_doc_at_sign(&pool, doc_id, FN, 1, session_id).await;
 
     let route = dispatch::dispatch_post_sign(&pool, doc_id, FN)
         .await

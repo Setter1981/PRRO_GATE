@@ -101,6 +101,18 @@ pub struct DocumentHeader {
     /// `<MAC>` content.  Hex-encoded previous-document hash.  Empty
     /// string for first-after-bootstrap.
     pub previous_hash: String,
+    /// B9 — offline `<MAC ID='...'>` attribute value.  `None` for ONLINE
+    /// docs → bare `<MAC>{previous_hash}</MAC>` (proven live; the goldens
+    /// are all online).  `Some(dps_code)` for OFFLINE docs (`fs_mode =
+    /// 'OFFLINE'`) → `<MAC ID='{dps_code}'>{previous_hash}</MAC>`, where
+    /// `dps_code` is the opaque DPS-issued offline code (== the wire
+    /// `id_offline`).  Live DPS rejects an offline drain whose `<MAC>` is
+    /// bare with `-9 "not ID in MAC"`.  Set by `stage_sign` for the
+    /// offline branch ONLY (branch on `fs_mode`, NOT doc-type) so the ID
+    /// lands in the SIGNED bytes → flows into `unsigned_xml_sha256` → the
+    /// next doc's `previous_hash` (WebCheck parity: the hash covers the
+    /// ID attribute).
+    pub mac_id: Option<String>,
     /// `<RQ NDv=...>`.  Default `"ПРО_каса"` (cp1251-encoded on
     /// output).  Held as `String` so callers can override per-pilot.
     pub device_name: String,
@@ -124,6 +136,9 @@ impl DocumentHeader {
             z_number,
             ts_str: ts_str.into(),
             previous_hash: previous_hash.into(),
+            // B9 — default ONLINE shape (bare `<MAC>`); stage_sign sets
+            // `Some(dps_code)` on the offline branch AFTER `with_defaults`.
+            mac_id: None,
             device_name: "ПРО_каса".into(),
             device_version: "1.1".into(),
         }
@@ -823,7 +838,7 @@ fn emit_shift_open(p: &ShiftOpenPayload, out: &mut String) {
     close(out, "C");
     tag_text(out, "TS", &h.ts_str);
     close(out, "DAT");
-    tag_text(out, "MAC", &h.previous_hash);
+    emit_mac(out, h);
     close(out, "RQ");
 }
 
@@ -1147,7 +1162,7 @@ fn emit_check(p: &CheckPayload, c_type: &str, out: &mut String) -> Result<(), Xm
     close(out, "C");
     tag_text(out, "TS", &h.ts_str);
     close(out, "DAT");
-    tag_text(out, "MAC", &h.previous_hash);
+    emit_mac(out, h);
     close(out, "RQ");
     Ok(())
 }
@@ -1287,7 +1302,7 @@ fn emit_z_report(p: &ZReportPayload, out: &mut String) {
     close(out, "Z");
     tag_text(out, "TS", &h.ts_str);
     close(out, "DAT");
-    tag_text(out, "MAC", &h.previous_hash);
+    emit_mac(out, h);
     close(out, "RQ");
 }
 
@@ -1406,6 +1421,32 @@ fn tag_text(out: &mut String, name: &str, content: &str) {
     out.push_str("</");
     out.push_str(name);
     out.push('>');
+}
+
+/// B9 — emit the closing `<MAC>` element.
+///
+/// - ONLINE (`h.mac_id == None`): bare `<MAC>{previous_hash}</MAC>`,
+///   byte-identical to the pre-B9 `tag_text(out, "MAC", &h.previous_hash)`
+///   (proven live; the goldens are all online).
+/// - OFFLINE (`h.mac_id == Some(dps_code)`): `<MAC ID='{dps_code}'>{previous_hash}</MAC>`.
+///
+/// The single-quoted `ID` attribute mirrors the DPS/WebCheck ground-truth
+/// (`NumbersOfflineUse.cs:97` / `StringXML.cs:1438`).  Content (the hash)
+/// stays RAW — matching `tag_text`'s Python-`_tag` no-escape contract; the
+/// `dps_code` is an opaque base64url-shaped token with no XML-special
+/// chars, so it is emitted verbatim too (WebCheck does the same — the
+/// signed hash must cover the exact bytes DPS reads back).
+fn emit_mac(out: &mut String, h: &DocumentHeader) {
+    match &h.mac_id {
+        None => tag_text(out, "MAC", &h.previous_hash),
+        Some(id) => {
+            out.push_str("<MAC ID='");
+            out.push_str(id);
+            out.push_str("'>");
+            out.push_str(&h.previous_hash);
+            out.push_str("</MAC>");
+        }
+    }
 }
 
 /// Emit `</name>`.
@@ -1552,6 +1593,112 @@ mod tests {
         assert!(
             s.contains("<TS>AB&CD</TS>"),
             "TS content must pass through raw: {s}"
+        );
+    }
+
+    // ─── B9: offline `<MAC ID=...>` (signed-bytes id_offline) ─────
+    //
+    // Live DPS rejects an offline drain whose `<MAC>` carries no `ID`
+    // attribute with `-9 "not ID in MAC"` (proven 2026-07-08,
+    // `live_smoke_11`).  Offline receipts MUST emit
+    // `<MAC ID='{offline_dps_code}'>{hash}</MAC>` in the SIGNED bytes
+    // (WebCheck ground-truth: `NumbersOfflineUse.cs:97` /
+    // `StringXML.cs:1438` — the opaque DPS code, single-quoted).  ONLINE
+    // docs keep the bare `<MAC>` (proven live) — this is the regression
+    // pin.  Branch on `mac_id.is_some()` (which stage_sign sets only for
+    // `fs_mode='OFFLINE'`), NOT on doc-type.
+
+    #[test]
+    fn offline_shift_open_emits_mac_id_attribute() {
+        let mut h = ascii_header();
+        h.previous_hash = "deadbeef".into();
+        h.mac_id = Some("eYme-jhnkWQ".into());
+        let doc = CanonicalDoc::ShiftOpen(ShiftOpenPayload {
+            header: h,
+            opening_sum: 0,
+        });
+        let s = render_ascii(&doc);
+        assert!(
+            s.contains("<MAC ID='eYme-jhnkWQ'>deadbeef</MAC>"),
+            "offline SHIFT_OPEN MAC must carry the opaque id_offline: {s}"
+        );
+    }
+
+    #[test]
+    fn offline_sell_emits_mac_id_attribute() {
+        let mut h = ascii_header();
+        h.previous_hash = "deadbeef".into();
+        h.mac_id = Some("eYme-jhnkWQ".into());
+        let doc = CanonicalDoc::Sell(CheckPayload {
+            header: h,
+            local_number: 1,
+            items: vec![one_check_item()],
+            payments: vec![one_cash_payment()],
+            total_sum: 1500,
+            check_level_adjustments: vec![],
+            header_lines: vec![],
+            footer_lines: vec![],
+            tax_summaries: vec![],
+        });
+        let s = render_ascii(&doc);
+        assert!(
+            s.contains("<MAC ID='eYme-jhnkWQ'>deadbeef</MAC>"),
+            "offline SELL MAC must carry the opaque id_offline: {s}"
+        );
+    }
+
+    #[test]
+    fn offline_z_report_emits_mac_id_attribute() {
+        let mut h = ascii_header();
+        h.previous_hash = "deadbeef".into();
+        h.mac_id = Some("eYme-jhnkWQ".into());
+        let doc = CanonicalDoc::ZReport(ZReportPayload {
+            header: h,
+            local_number: 1,
+            tax_summaries: vec![],
+            payments: vec![],
+            service_sums: vec![],
+            check_count: ZReportCheckCount {
+                sell_count: 0,
+                return_count: 0,
+            },
+            epz: None,
+        });
+        let s = render_ascii(&doc);
+        assert!(
+            s.contains("<MAC ID='eYme-jhnkWQ'>deadbeef</MAC>"),
+            "offline Z_REPORT MAC must carry the opaque id_offline: {s}"
+        );
+    }
+
+    #[test]
+    fn online_mac_stays_bare_regression_pin() {
+        // ONLINE (mac_id == None) MUST render the bare `<MAC>` — proven
+        // live; the goldens are all online.  This is the online-unaffected
+        // regression pin: an accidental attribute here would break every
+        // online receipt's signed bytes.
+        let mut h = ascii_header();
+        h.previous_hash = "deadbeef".into();
+        assert!(h.mac_id.is_none(), "with_defaults MUST leave mac_id None");
+        let doc = CanonicalDoc::Sell(CheckPayload {
+            header: h,
+            local_number: 1,
+            items: vec![one_check_item()],
+            payments: vec![one_cash_payment()],
+            total_sum: 1500,
+            check_level_adjustments: vec![],
+            header_lines: vec![],
+            footer_lines: vec![],
+            tax_summaries: vec![],
+        });
+        let s = render_ascii(&doc);
+        assert!(
+            s.contains("<MAC>deadbeef</MAC>"),
+            "online MAC must stay bare (no ID attribute): {s}"
+        );
+        assert!(
+            !s.contains("<MAC ID="),
+            "online MAC must NOT carry an ID attribute: {s}"
         );
     }
 

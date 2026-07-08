@@ -238,6 +238,30 @@ async fn x1_guard_ignores_doc_recovery_advanced() {
     seed_open_offline_session(&pool, fn_id).await;
     seed_available_offline_code(&pool, fn_id, 1).await;
     let doc = seed_signed_sell(&pool, fn_id, 0x22).await;
+    // B9: the doc must be an OFFLINE-origin doc STAMPED-at-sign (readback path)
+    // to advance to OFFLINE_LOCAL_ACK at offline-ack.  seed_signed_sell mints it
+    // fs_mode='ONLINE' + unstamped; flip it OFFLINE + consume code 1 + stamp its
+    // offline columns (else stage_offline_ack aborts it as a bare-MAC doc — which
+    // is ALSO terminal + not stuck, but this fixture pins the OLA-issued case).
+    sqlx::query(
+        "UPDATE offline_codes SET consumed_at = CURRENT_TIMESTAMP, consumed_by_document_id = ? \
+         WHERE fiscal_number = ? AND code_lnd = 1",
+    )
+    .bind(doc)
+    .bind(fn_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE fiscal_documents SET fs_mode = 'OFFLINE', offline_fiscal_no = 1, \
+             offline_fiscal_date = CURRENT_TIMESTAMP, offline_session_id = ?, \
+             offline_dps_code = 'DRILL-1' WHERE document_id = ?",
+    )
+    .bind(&[0xAAu8; 16][..])
+    .bind(doc)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let stub = wire_panic_stub();
     let signing_ctx = det_signing_ctx();

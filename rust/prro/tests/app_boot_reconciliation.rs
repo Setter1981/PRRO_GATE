@@ -987,12 +987,29 @@ async fn boot_with_deps_routes_offline_signed_doc_to_offline_local_ack() {
     // doc must carry unsigned_xml_sha256 (the real stage_sign output).
     // previous_hash stays NULL (genesis) to match the genesis node seed, so the
     // step-7b drift-assert passes.
-    sqlx::query("UPDATE fiscal_documents SET unsigned_xml_sha256 = ? WHERE document_id = ?")
-        .bind(vec![0xA7u8; 32])
-        .bind(doc)
-        .execute(&pool)
-        .await
-        .unwrap();
+    // B9: the doc must be STAMPED-at-sign (the readback path — the only path that
+    // now reaches offline-ack as Applied).  Consume code 42 by the doc + stamp
+    // its offline columns; else stage_offline_ack aborts it as a bare-MAC doc.
+    sqlx::query(
+        "UPDATE offline_codes SET consumed_at = CURRENT_TIMESTAMP, consumed_by_document_id = ? \
+         WHERE fiscal_number = ? AND code_lnd = 42",
+    )
+    .bind(doc)
+    .bind("1234567890")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE fiscal_documents SET unsigned_xml_sha256 = ?, offline_fiscal_no = 42, \
+             offline_fiscal_date = CURRENT_TIMESTAMP, offline_session_id = ?, \
+             offline_dps_code = 'DRILL-42' WHERE document_id = ?",
+    )
+    .bind(vec![0xA7u8; 32])
+    .bind(&session_id_bytes[..])
+    .bind(doc)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     // StubDpsChannel: empty response queue + spy panicking on any
     // call — proves stage_send is NEVER invoked on offline branch
