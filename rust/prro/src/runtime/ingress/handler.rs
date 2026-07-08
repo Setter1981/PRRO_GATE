@@ -170,6 +170,11 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         // transient RETRYABLE refusal (the online_convergence resolver
         // re-drives the blocker, then the client retries), NOT a 5xx breach.
         | "WRITE_GATE_SIBLING_PENDING"
+        // B10 — an offline business doc arrived while this session's lazy
+        // DocType=9 (OFFLINE_SESSION_BEGIN) is still below OFFLINE_LOCAL_ACK
+        // (crashed mid-sign).  RETRYABLE 503: boot-resume drives the BEGIN to
+        // OLA, then the client retries.
+        | "OFFLINE_SESSION_BEGIN_PENDING"
         // PR-Z2 (STOP-S6 ruling B) — a live Z hit C10 quiescence-pending: the
         // shift still has in-flight receipts.  RETRYABLE 503; the operator
         // retries the close with a NEW idempotency key after the blockers drain.

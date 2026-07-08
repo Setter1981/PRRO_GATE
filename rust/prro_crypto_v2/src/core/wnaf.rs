@@ -231,14 +231,30 @@ mod tests {
     #[test]
     fn test_wnaf_reconstruction_random() {
         // Test that NAF reconstructs back to the original scalar for various values
-        for &val in &[1u64, 2, 3, 7, 15, 16, 17, 100, 12345, 0xDEAD_BEEF, 0x1234_5678_9ABC_DEF0] {
+        for &val in &[
+            1u64,
+            2,
+            3,
+            7,
+            15,
+            16,
+            17,
+            100,
+            12345,
+            0xDEAD_BEEF,
+            0x1234_5678_9ABC_DEF0,
+        ] {
             let mut k = vec![0u32; 9];
             k[0] = (val & 0xFFFF_FFFF) as u32;
             k[1] = (val >> 32) as u32;
             for &w in &[2usize, 3, 4, 5, 6] {
                 let naf = compute_wnaf(&k, w);
                 let recovered = naf_to_u128(&naf);
-                assert_eq!(recovered, val as u128, "wNAF roundtrip failed for {} w={}", val, w);
+                assert_eq!(
+                    recovered, val as u128,
+                    "wNAF roundtrip failed for {} w={}",
+                    val, w
+                );
             }
         }
     }

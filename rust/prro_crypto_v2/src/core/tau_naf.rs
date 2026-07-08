@@ -82,9 +82,9 @@ fn tau_affine(p: &Point, curve: &Curve) -> Point {
 pub(crate) fn wtnaf(k_words: &[u32; crate::core::fe::FE_WORDS], w: u32) -> Vec<i8> {
     debug_assert!(w >= 2 && w <= 8, "window width must be in [2, 8]");
 
-    let pow2w = 1i128 << w;        // 2^w
+    let pow2w = 1i128 << w; // 2^w
     let pow2w1 = 1i128 << (w - 1); // 2^(w-1)
-    let mask = pow2w - 1;           // low w bits mask
+    let mask = pow2w - 1; // low w bits mask
 
     // Load the scalar as a 128-bit unsigned integer.
     // The scalar is at most 257 bits (FE_WORDS=9 u32s = 288 bits but the
@@ -144,11 +144,7 @@ pub(crate) fn wtnaf(k_words: &[u32; crate::core::fe::FE_WORDS], w: u32) -> Vec<i
 ///        if d > 0: R += T[(d-1)/2]
 ///        if d < 0: R -= T[(-d-1)/2]
 ///   4. Return R.
-pub(crate) fn mul_tau_naf_point(
-    k: &FieldEl,
-    p: &Point,
-    curve: &Curve,
-) -> Option<Point> {
+pub(crate) fn mul_tau_naf_point(k: &FieldEl, p: &Point, curve: &Curve) -> Option<Point> {
     // Caller must verify is_koblitz(curve) before calling; returns None safely otherwise.
     if !is_koblitz(curve) {
         return None;
@@ -223,7 +219,11 @@ struct BigInt256 {
 }
 
 impl BigInt256 {
-    const ZERO: BigInt256 = BigInt256 { negative: false, hi: 0, lo: 0 };
+    const ZERO: BigInt256 = BigInt256 {
+        negative: false,
+        hi: 0,
+        lo: 0,
+    };
 
     fn is_zero(&self) -> bool {
         self.hi == 0 && self.lo == 0
@@ -240,14 +240,22 @@ impl BigInt256 {
             | ((words[5] as u128) << 32)
             | ((words[6] as u128) << 64)
             | ((words[7] as u128) << 96);
-        BigInt256 { negative: false, hi, lo }
+        BigInt256 {
+            negative: false,
+            hi,
+            lo,
+        }
     }
 
     /// Return the low 128 bits as i128 (suitable for window digit extraction).
     /// The caller must ensure the result fits in i128 range for the intended use.
     fn low128(&self) -> i128 {
         let unsigned = (self.lo & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF) as i128;
-        if self.negative { -unsigned } else { unsigned }
+        if self.negative {
+            -unsigned
+        } else {
+            unsigned
+        }
     }
 
     /// Subtract a small signed integer from self (in-place).
@@ -363,7 +371,11 @@ impl BigInt256 {
             // Same sign: add magnitudes
             let (new_lo, carry) = self.lo.overflowing_add(other.lo);
             let new_hi = self.hi.wrapping_add(other.hi).wrapping_add(carry as u128);
-            BigInt256 { negative: self.negative, hi: new_hi, lo: new_lo }
+            BigInt256 {
+                negative: self.negative,
+                hi: new_hi,
+                lo: new_lo,
+            }
         } else {
             // Different signs: subtract smaller magnitude from larger
             if mag_ge_u128(self.hi, self.lo, other.hi, other.lo) {
@@ -371,13 +383,21 @@ impl BigInt256 {
                 let (new_lo, borrow) = self.lo.overflowing_sub(other.lo);
                 let new_hi = self.hi.wrapping_sub(other.hi).wrapping_sub(borrow as u128);
                 let negative = self.negative && !(new_hi == 0 && new_lo == 0);
-                BigInt256 { negative, hi: new_hi, lo: new_lo }
+                BigInt256 {
+                    negative,
+                    hi: new_hi,
+                    lo: new_lo,
+                }
             } else {
                 // |other| > |self| → result sign = other.negative
                 let (new_lo, borrow) = other.lo.overflowing_sub(self.lo);
                 let new_hi = other.hi.wrapping_sub(self.hi).wrapping_sub(borrow as u128);
                 let negative = other.negative && !(new_hi == 0 && new_lo == 0);
-                BigInt256 { negative, hi: new_hi, lo: new_lo }
+                BigInt256 {
+                    negative,
+                    hi: new_hi,
+                    lo: new_lo,
+                }
             }
         }
     }
@@ -396,9 +416,9 @@ fn mag_ge_u128(a_hi: u128, a_lo: u128, b_hi: u128, b_lo: u128) -> bool {
 mod tests {
     use super::*;
     use crate::core::curve::Curve;
+    use crate::core::fe::FE_WORDS;
     use crate::core::field::FieldEl;
     use crate::core::point::Point;
-    use crate::core::fe::FE_WORDS;
 
     fn make_scalar(val: u32, mod_words: usize) -> FieldEl {
         let mut v = vec![0u32; mod_words];
@@ -411,7 +431,10 @@ mod tests {
         let curve = Curve::dstu_pb_257();
         // DSTU_PB_257 has a=0 but b is a large 257-bit element (b ∉ GF(2)).
         // τ(P) = (x², y²) is therefore NOT on the same curve, so τ-NAF is invalid.
-        assert!(!is_koblitz(&curve), "DSTU_PB_257 must NOT be Koblitz: b ∉ GF(2)");
+        assert!(
+            !is_koblitz(&curve),
+            "DSTU_PB_257 must NOT be Koblitz: b ∉ GF(2)"
+        );
     }
 
     #[test]
@@ -480,6 +503,9 @@ mod tests {
         let g = Point::new(curve.base_x.clone(), curve.base_y.clone());
         let k = make_scalar(0, curve.mod_words);
         let result = mul_tau_naf_point(&k, &g, &curve);
-        assert!(result.is_none(), "0 * G must return None (point at infinity)");
+        assert!(
+            result.is_none(),
+            "0 * G must return None (point at infinity)"
+        );
     }
 }

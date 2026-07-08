@@ -106,12 +106,21 @@ mod tests {
     // Strong check against accidental early-return or constant-zero bugs.
     #[test]
     fn single_bit_flip_changes_crc() {
-        for cmd in [b"PREP" as &[u8], b"CANC", b"COMP1234567890", b"UPAS1111111111"] {
+        for cmd in [
+            b"PREP" as &[u8],
+            b"CANC",
+            b"COMP1234567890",
+            b"UPAS1111111111",
+        ] {
             let base = crc16(cmd);
             for i in 0..cmd.len() {
                 let mut flipped = cmd.to_vec();
                 flipped[i] ^= 0x01;
-                assert_ne!(crc16(&flipped), base, "bit flip at pos {i} in {cmd:?} did not change CRC");
+                assert_ne!(
+                    crc16(&flipped),
+                    base,
+                    "bit flip at pos {i} in {cmd:?} did not change CRC"
+                );
             }
         }
     }

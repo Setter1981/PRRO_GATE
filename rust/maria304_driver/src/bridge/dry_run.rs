@@ -65,7 +65,9 @@ pub struct DryRunBridge {
 impl DryRunBridge {
     #[must_use]
     pub fn new() -> Self {
-        Self { next_fiscal_id: AtomicU64::new(1) }
+        Self {
+            next_fiscal_id: AtomicU64::new(1),
+        }
     }
 
     /// How many times submit has been invoked since construction.
@@ -73,7 +75,9 @@ impl DryRunBridge {
     pub fn call_count(&self) -> u64 {
         // Sequence starts at 1 and increments before use, so the next
         // ID is (calls + 1).  Fetch current and subtract.
-        self.next_fiscal_id.load(Ordering::Relaxed).saturating_sub(1)
+        self.next_fiscal_id
+            .load(Ordering::Relaxed)
+            .saturating_sub(1)
     }
 }
 
@@ -115,7 +119,10 @@ mod tests {
             department: None,
             return_check_number: None,
             payload: ReceiptPayload {
-                totals: Totals { sale_kopecks: sale, return_kopecks: 0 },
+                totals: Totals {
+                    sale_kopecks: sale,
+                    return_kopecks: 0,
+                },
                 ..Default::default()
             },
         }
@@ -130,10 +137,22 @@ mod tests {
     fn deployment_mode_parse_accepts_case_and_separator_variants() {
         assert_eq!(DeploymentMode::parse("live"), Some(DeploymentMode::Live));
         assert_eq!(DeploymentMode::parse("LIVE"), Some(DeploymentMode::Live));
-        assert_eq!(DeploymentMode::parse("shadow"), Some(DeploymentMode::Shadow));
-        assert_eq!(DeploymentMode::parse("dry-run"), Some(DeploymentMode::DryRun));
-        assert_eq!(DeploymentMode::parse("dry_run"), Some(DeploymentMode::DryRun));
-        assert_eq!(DeploymentMode::parse("DryRun"), Some(DeploymentMode::DryRun));
+        assert_eq!(
+            DeploymentMode::parse("shadow"),
+            Some(DeploymentMode::Shadow)
+        );
+        assert_eq!(
+            DeploymentMode::parse("dry-run"),
+            Some(DeploymentMode::DryRun)
+        );
+        assert_eq!(
+            DeploymentMode::parse("dry_run"),
+            Some(DeploymentMode::DryRun)
+        );
+        assert_eq!(
+            DeploymentMode::parse("DryRun"),
+            Some(DeploymentMode::DryRun)
+        );
     }
 
     #[test]

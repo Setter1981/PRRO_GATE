@@ -17,11 +17,11 @@ pub mod http_client;
 pub mod mock;
 pub mod retry;
 
-pub use dto::{
-    AcquirerSlip, CanonicalCommand, CanonicalPayment, CanonicalResponse, CommandType,
-    DualTaxMode, FiscalLine, PaymentKind, RawFrame, ReceiptDirection, ReceiptPayload, Totals,
-};
 pub use dry_run::{DeploymentMode, DryRunBridge};
+pub use dto::{
+    AcquirerSlip, CanonicalCommand, CanonicalPayment, CanonicalResponse, CommandType, DualTaxMode,
+    FiscalLine, PaymentKind, RawFrame, ReceiptDirection, ReceiptPayload, Totals,
+};
 pub use http_client::HttpBridge;
 pub use mock::MockBridge;
 pub use retry::{RetryBridge, RetryPolicy, Sleeper, ThreadSleeper};

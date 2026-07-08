@@ -30,8 +30,10 @@ async fn main() -> anyhow::Result<()> {
     // Structured logs to stderr — daemons stream logs via journald /
     // file redirect; JSON flag can be added via RUST_LOG_FORMAT later.
     fmt()
-        .with_env_filter(EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("info,tower_http=warn")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,tower_http=warn")),
+        )
         .with_target(false)
         .init();
 

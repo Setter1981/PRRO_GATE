@@ -50,14 +50,14 @@ impl OperationType {
 /// Unknown envelope fields land in `other` for forward-compatibility.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CanonicalCommand {
-    pub schema_version:  String,
-    pub request_id:      String,
+    pub schema_version: String,
+    pub request_id: String,
     pub idempotency_key: String,
-    pub operation_type:  OperationType,
-    pub fiscal_number:   String,
-    pub business_ts:     String,          // ISO-8601 UTC
-    pub payload:         serde_json::Value,
-    pub payload_sha256:  String,
+    pub operation_type: OperationType,
+    pub fiscal_number: String,
+    pub business_ts: String, // ISO-8601 UTC
+    pub payload: serde_json::Value,
+    pub payload_sha256: String,
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
 }
@@ -117,30 +117,30 @@ impl CanonicalCommand {
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Receipt {
-    pub header:   Option<String>,
-    pub footer:   Option<String>,
+    pub header: Option<String>,
+    pub footer: Option<String>,
     #[serde(default)]
-    pub goods:    Vec<Good>,
+    pub goods: Vec<Good>,
     #[serde(default)]
     pub payments: Vec<Payment>,
-    pub totals:   Option<ReceiptTotals>,
+    pub totals: Option<ReceiptTotals>,
     #[serde(default)]
     pub discounts: Vec<Discount>,
-    pub rounding:  Option<i64>,     // kopecks rounding adjustment
+    pub rounding: Option<i64>, // kopecks rounding adjustment
 }
 
 // ── Good (receipt item) ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Good {
-    pub code:     Option<String>,
-    pub name:     String,
-    pub price:    i64,              // kopecks
-    pub quantity: i64,              // thousandths (e.g. 1000 = 1 unit)
-    pub sum:      i64,              // kopecks
-    pub barcode:  Option<String>,
-    pub uktzed:   Option<String>,
-    pub tax_id:   Option<i64>,
+    pub code: Option<String>,
+    pub name: String,
+    pub price: i64,    // kopecks
+    pub quantity: i64, // thousandths (e.g. 1000 = 1 unit)
+    pub sum: i64,      // kopecks
+    pub barcode: Option<String>,
+    pub uktzed: Option<String>,
+    pub tax_id: Option<i64>,
     pub tax_id_2: Option<i64>,
     #[serde(default)]
     pub excise_barcodes: Vec<String>,
@@ -154,16 +154,16 @@ pub struct Good {
 pub struct Payment {
     /// dps_xml.py reads `p.get('type', 'CASH')` — accept both JSON keys.
     #[serde(rename = "type", alias = "payment_type", default = "cash_payment_type")]
-    pub payment_type:   String,
-    pub amount:         i64,       // kopecks, always non-negative
-    pub rrn:            Option<String>,
+    pub payment_type: String,
+    pub amount: i64, // kopecks, always non-negative
+    pub rrn: Option<String>,
     pub payment_system: Option<String>,
-    pub bank_name:      Option<String>,
-    pub terminal:       Option<String>,
-    pub label:          Option<String>,
-    pub card_mask:      Option<String>,
-    pub auth_code:      Option<String>,
-    pub commission:     Option<i64>,
+    pub bank_name: Option<String>,
+    pub terminal: Option<String>,
+    pub label: Option<String>,
+    pub card_mask: Option<String>,
+    pub auth_code: Option<String>,
+    pub commission: Option<i64>,
 }
 
 fn cash_payment_type() -> String {
@@ -175,25 +175,37 @@ fn cash_payment_type() -> String {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Discount {
     pub value: i64,
-    #[serde(rename = "type", alias = "discount_type", default = "discount_type_default")]
-    pub discount_type: String,   // "DISCOUNT" | "EXTRA_CHARGE"
-    #[serde(rename = "mode", alias = "discount_mode", default = "discount_mode_default")]
-    pub discount_mode: String,   // "VALUE" | "PERCENT"
-    pub name:      Option<String>,
+    #[serde(
+        rename = "type",
+        alias = "discount_type",
+        default = "discount_type_default"
+    )]
+    pub discount_type: String, // "DISCOUNT" | "EXTRA_CHARGE"
+    #[serde(
+        rename = "mode",
+        alias = "discount_mode",
+        default = "discount_mode_default"
+    )]
+    pub discount_mode: String, // "VALUE" | "PERCENT"
+    pub name: Option<String>,
     pub privilege: Option<String>,
-    pub tax_code:  Option<String>,
+    pub tax_code: Option<String>,
 }
 
-fn discount_type_default() -> String { "DISCOUNT".to_string() }
-fn discount_mode_default() -> String { "VALUE".to_string() }
+fn discount_type_default() -> String {
+    "DISCOUNT".to_string()
+}
+fn discount_mode_default() -> String {
+    "VALUE".to_string()
+}
 
 // ── Totals ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ReceiptTotals {
-    pub total_sum:        Option<i64>,
-    pub round_sum:        Option<i64>,
-    pub discounts_sum:    Option<i64>,
+    pub total_sum: Option<i64>,
+    pub round_sum: Option<i64>,
+    pub discounts_sum: Option<i64>,
     pub extra_charge_sum: Option<i64>,
 }
 
@@ -204,15 +216,15 @@ pub struct ReceiptTotals {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ZReportData {
     /// dict[tax_id → {smi, smo}] — per-group sales in/out totals
-    pub tax_sums:     Option<serde_json::Value>,
+    pub tax_sums: Option<serde_json::Value>,
     /// dict[payment_type → {smi, smo}] — payment totals
     pub payment_sums: Option<serde_json::Value>,
     /// dict[service_type → {smi, smo}] — service in/out
     pub service_sums: Option<serde_json::Value>,
     /// {ni, no} — sell/return check counts
-    pub check_count:  Option<serde_json::Value>,
+    pub check_count: Option<serde_json::Value>,
     /// {epc, epcs, epsm} — cash withdrawal summaries (optional)
-    pub epz_sums:     Option<serde_json::Value>,
+    pub epz_sums: Option<serde_json::Value>,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -312,8 +324,8 @@ mod tests {
                 "operation_type": op, "fiscal_number":"fn","business_ts":"ts",
                 "payload_sha256":"x","payload":{}
             });
-            let cmd: CanonicalCommand = serde_json::from_value(json)
-                .unwrap_or_else(|e| panic!("{op} should parse: {e}"));
+            let cmd: CanonicalCommand =
+                serde_json::from_value(json).unwrap_or_else(|e| panic!("{op} should parse: {e}"));
             assert!(
                 !cmd.operation_type.is_sidecar_supported(),
                 "{op} must not be sidecar-supported"
@@ -324,14 +336,22 @@ mod tests {
     #[test]
     fn supported_op_types_accepted() {
         // SHIFT_CLOSE / X_REPORT / GO_OFFLINE / GO_ONLINE are not yet implemented (Phase 5)
-        for op in ["SHIFT_OPEN","SELL","RETURN","SERVICE_IN","SERVICE_OUT","CASH_WITHDRAWAL","Z_REPORT"] {
+        for op in [
+            "SHIFT_OPEN",
+            "SELL",
+            "RETURN",
+            "SERVICE_IN",
+            "SERVICE_OUT",
+            "CASH_WITHDRAWAL",
+            "Z_REPORT",
+        ] {
             let json = serde_json::json!({
                 "schema_version":"1.0","request_id":"r","idempotency_key":"k",
                 "operation_type": op, "fiscal_number":"fn","business_ts":"ts",
                 "payload_sha256":"x","payload":{}
             });
-            let cmd: CanonicalCommand = serde_json::from_value(json)
-                .unwrap_or_else(|e| panic!("{op} should parse: {e}"));
+            let cmd: CanonicalCommand =
+                serde_json::from_value(json).unwrap_or_else(|e| panic!("{op} should parse: {e}"));
             assert!(
                 cmd.operation_type.is_sidecar_supported(),
                 "{op} must be sidecar-supported"
@@ -339,22 +359,26 @@ mod tests {
         }
     }
 
-
     #[test]
     fn has_card_rrn_uses_raw_json_no_double_parse() {
-        let base = |rrn: serde_json::Value| serde_json::json!({
-            "schema_version":"1.0","request_id":"r","idempotency_key":"k",
-            "operation_type":"SELL","fiscal_number":"fn","business_ts":"ts",
-            "payload_sha256":"x",
-            "payload":{"receipt":{"payments":[{"type":"CASH","amount":100,"rrn": rrn}]}}
-        });
-        let cmd_empty: CanonicalCommand = serde_json::from_value(base(serde_json::json!(""))).unwrap();
+        let base = |rrn: serde_json::Value| {
+            serde_json::json!({
+                "schema_version":"1.0","request_id":"r","idempotency_key":"k",
+                "operation_type":"SELL","fiscal_number":"fn","business_ts":"ts",
+                "payload_sha256":"x",
+                "payload":{"receipt":{"payments":[{"type":"CASH","amount":100,"rrn": rrn}]}}
+            })
+        };
+        let cmd_empty: CanonicalCommand =
+            serde_json::from_value(base(serde_json::json!(""))).unwrap();
         assert!(!cmd_empty.has_card_rrn(), "empty rrn → false");
 
-        let cmd_null: CanonicalCommand = serde_json::from_value(base(serde_json::json!(null))).unwrap();
+        let cmd_null: CanonicalCommand =
+            serde_json::from_value(base(serde_json::json!(null))).unwrap();
         assert!(!cmd_null.has_card_rrn(), "null rrn → false");
 
-        let cmd_real: CanonicalCommand = serde_json::from_value(base(serde_json::json!("000123456789"))).unwrap();
+        let cmd_real: CanonicalCommand =
+            serde_json::from_value(base(serde_json::json!("000123456789"))).unwrap();
         assert!(cmd_real.has_card_rrn(), "non-empty rrn → true");
     }
 
@@ -520,17 +544,17 @@ mod tests {
     #[test]
     fn operation_type_serializes_screaming_snake() {
         let cases = [
-            (OperationType::ShiftOpen,     "\"SHIFT_OPEN\""),
-            (OperationType::ShiftClose,    "\"SHIFT_CLOSE\""),
-            (OperationType::Sell,          "\"SELL\""),
-            (OperationType::Return,        "\"RETURN\""),
-            (OperationType::ServiceIn,     "\"SERVICE_IN\""),
-            (OperationType::ServiceOut,    "\"SERVICE_OUT\""),
-            (OperationType::CashWithdrawal,"\"CASH_WITHDRAWAL\""),
-            (OperationType::ZReport,       "\"Z_REPORT\""),
-            (OperationType::XReport,       "\"X_REPORT\""),
-            (OperationType::GoOffline,     "\"GO_OFFLINE\""),
-            (OperationType::GoOnline,      "\"GO_ONLINE\""),
+            (OperationType::ShiftOpen, "\"SHIFT_OPEN\""),
+            (OperationType::ShiftClose, "\"SHIFT_CLOSE\""),
+            (OperationType::Sell, "\"SELL\""),
+            (OperationType::Return, "\"RETURN\""),
+            (OperationType::ServiceIn, "\"SERVICE_IN\""),
+            (OperationType::ServiceOut, "\"SERVICE_OUT\""),
+            (OperationType::CashWithdrawal, "\"CASH_WITHDRAWAL\""),
+            (OperationType::ZReport, "\"Z_REPORT\""),
+            (OperationType::XReport, "\"X_REPORT\""),
+            (OperationType::GoOffline, "\"GO_OFFLINE\""),
+            (OperationType::GoOnline, "\"GO_ONLINE\""),
         ];
         for (op, expected) in cases {
             let serialized = serde_json::to_string(&op).unwrap();
@@ -562,7 +586,10 @@ mod tests {
             "payload_sha256":"x","payload":{}
         });
         let result = serde_json::from_value::<CanonicalCommand>(json);
-        assert!(result.is_err(), "unknown operation_type must fail deserialization");
+        assert!(
+            result.is_err(),
+            "unknown operation_type must fail deserialization"
+        );
     }
 
     /// amount=0 is accepted at the deserialization layer (domain validation is downstream).
@@ -574,8 +601,8 @@ mod tests {
             "payload_sha256":"x",
             "payload":{"receipt":{"payments":[{"type":"CASH","amount":0}]}}
         });
-        let cmd: CanonicalCommand = serde_json::from_value(json)
-            .expect("amount=0 must deserialize");
+        let cmd: CanonicalCommand =
+            serde_json::from_value(json).expect("amount=0 must deserialize");
         let receipt = cmd.receipt().unwrap();
         assert_eq!(receipt.payments[0].amount, 0);
     }
@@ -606,7 +633,10 @@ mod tests {
             // no "payload" key
         });
         let result = serde_json::from_value::<CanonicalCommand>(json);
-        assert!(result.is_err(), "missing payload field must fail deserialization");
+        assert!(
+            result.is_err(),
+            "missing payload field must fail deserialization"
+        );
     }
 
     /// Receipt with empty goods/payments/discounts arrays must deserialize correctly.
@@ -618,8 +648,8 @@ mod tests {
             "payload_sha256":"x",
             "payload":{"receipt":{"goods":[],"payments":[],"discounts":[]}}
         });
-        let cmd: CanonicalCommand = serde_json::from_value(json)
-            .expect("empty arrays must deserialize");
+        let cmd: CanonicalCommand =
+            serde_json::from_value(json).expect("empty arrays must deserialize");
         let receipt = cmd.receipt().unwrap();
         assert!(receipt.goods.is_empty(), "goods must be empty");
         assert!(receipt.payments.is_empty(), "payments must be empty");
@@ -655,7 +685,10 @@ mod tests {
             "payload_sha256":"x","payload":{}
         });
         let result = serde_json::from_value::<CanonicalCommand>(json);
-        assert!(result.is_err(), "lowercase operation_type must fail (SCREAMING_SNAKE_CASE required)");
+        assert!(
+            result.is_err(),
+            "lowercase operation_type must fail (SCREAMING_SNAKE_CASE required)"
+        );
     }
 
     /// Good struct: only required fields present → all optional fields are None/empty.
@@ -674,7 +707,10 @@ mod tests {
         assert!(g.uktzed.is_none(), "uktzed must default to None");
         assert!(g.tax_id.is_none(), "tax_id must default to None");
         assert!(g.tax_id_2.is_none(), "tax_id_2 must default to None");
-        assert!(g.excise_barcodes.is_empty(), "excise_barcodes must default to []");
+        assert!(
+            g.excise_barcodes.is_empty(),
+            "excise_barcodes must default to []"
+        );
         assert!(g.discounts.is_empty(), "discounts must default to []");
     }
 
@@ -687,7 +723,10 @@ mod tests {
             "payload_sha256":"x","payload":{}
         });
         let cmd: CanonicalCommand = serde_json::from_value(json).unwrap();
-        assert!(cmd.z_report_data().is_none(), "missing z_report_data → None");
+        assert!(
+            cmd.z_report_data().is_none(),
+            "missing z_report_data → None"
+        );
     }
 
     /// Missing fiscal_number field must fail deserialization.
@@ -700,6 +739,9 @@ mod tests {
             // fiscal_number absent
         });
         let result = serde_json::from_value::<CanonicalCommand>(json);
-        assert!(result.is_err(), "missing fiscal_number must fail deserialization");
+        assert!(
+            result.is_err(),
+            "missing fiscal_number must fail deserialization"
+        );
     }
 }

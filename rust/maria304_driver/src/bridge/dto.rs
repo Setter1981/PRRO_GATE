@@ -218,7 +218,10 @@ mod tests {
                     acquirer_slip: None,
                 }],
                 dual_tax_mode: None,
-                totals: Totals { sale_kopecks: 2500, return_kopecks: 0 },
+                totals: Totals {
+                    sale_kopecks: 2500,
+                    return_kopecks: 0,
+                },
                 raw_frames: Vec::new(),
             },
         };
@@ -334,7 +337,7 @@ pub fn classify_response(resp: &CanonicalResponse) -> DocumentOutcome {
             Ok(id) if id > 0 => DocumentOutcome::Accepted {
                 fiscal_id: id,
                 sale: resp.sale_total_kopecks,
-                ret:  resp.return_total_kopecks,
+                ret: resp.return_total_kopecks,
             },
             // ok=true but fiscal_id zero or unparseable — data-contract violation from
             // the gateway.  Close the receipt (cannot retry this document) and signal
@@ -344,8 +347,9 @@ pub fn classify_response(resp: &CanonicalResponse) -> DocumentOutcome {
     } else {
         match resp.document_state.as_str() {
             // Known permanent rejections — DPS will not accept a re-send.
-            "REJECTED" | "ERROR_SIGN" | "ERROR_FISCAL" =>
-                DocumentOutcome::Terminal(ErrorCode::SoftLocked),
+            "REJECTED" | "ERROR_SIGN" | "ERROR_FISCAL" => {
+                DocumentOutcome::Terminal(ErrorCode::SoftLocked)
+            }
             // ERROR_SEND or unknown state: DPS may not have seen it → retryable.
             // Includes ERROR_SAVE (-3 in native DPS protocol) per backlog ADR.
             _ => DocumentOutcome::Retryable(ErrorCode::SoftBlock),
@@ -360,11 +364,11 @@ mod classify_tests {
     fn resp(ok: bool, fiscal_id: &str, document_state: &str) -> CanonicalResponse {
         CanonicalResponse {
             ok,
-            document_id:         "doc1".into(),
-            fiscal_id:           fiscal_id.into(),
-            fiscal_ts:           "2026-04-22T10:00:00Z".into(),
-            document_state:      document_state.into(),
-            sale_total_kopecks:  1000,
+            document_id: "doc1".into(),
+            fiscal_id: fiscal_id.into(),
+            fiscal_ts: "2026-04-22T10:00:00Z".into(),
+            document_state: document_state.into(),
+            sale_total_kopecks: 1000,
             return_total_kopecks: 0,
         }
     }
@@ -374,7 +378,10 @@ mod classify_tests {
         let r = resp(true, "12345", "SENT");
         assert!(matches!(
             classify_response(&r),
-            DocumentOutcome::Accepted { fiscal_id: 12345, .. }
+            DocumentOutcome::Accepted {
+                fiscal_id: 12345,
+                ..
+            }
         ));
     }
 
@@ -390,42 +397,63 @@ mod classify_tests {
     #[test]
     fn terminal_when_ok_but_fiscal_id_zero() {
         let r = resp(true, "0", "SENT");
-        assert!(matches!(classify_response(&r), DocumentOutcome::Terminal(_)));
+        assert!(matches!(
+            classify_response(&r),
+            DocumentOutcome::Terminal(_)
+        ));
     }
 
     #[test]
     fn terminal_when_ok_but_fiscal_id_empty() {
         let r = resp(true, "", "SENT");
-        assert!(matches!(classify_response(&r), DocumentOutcome::Terminal(_)));
+        assert!(matches!(
+            classify_response(&r),
+            DocumentOutcome::Terminal(_)
+        ));
     }
 
     #[test]
     fn terminal_on_rejected() {
         let r = resp(false, "", "REJECTED");
-        assert!(matches!(classify_response(&r), DocumentOutcome::Terminal(_)));
+        assert!(matches!(
+            classify_response(&r),
+            DocumentOutcome::Terminal(_)
+        ));
     }
 
     #[test]
     fn terminal_on_error_sign() {
         let r = resp(false, "", "ERROR_SIGN");
-        assert!(matches!(classify_response(&r), DocumentOutcome::Terminal(_)));
+        assert!(matches!(
+            classify_response(&r),
+            DocumentOutcome::Terminal(_)
+        ));
     }
 
     #[test]
     fn terminal_on_error_fiscal() {
         let r = resp(false, "", "ERROR_FISCAL");
-        assert!(matches!(classify_response(&r), DocumentOutcome::Terminal(_)));
+        assert!(matches!(
+            classify_response(&r),
+            DocumentOutcome::Terminal(_)
+        ));
     }
 
     #[test]
     fn retryable_on_error_send() {
         let r = resp(false, "", "ERROR_SEND");
-        assert!(matches!(classify_response(&r), DocumentOutcome::Retryable(_)));
+        assert!(matches!(
+            classify_response(&r),
+            DocumentOutcome::Retryable(_)
+        ));
     }
 
     #[test]
     fn retryable_on_empty_document_state() {
         let r = resp(false, "", "");
-        assert!(matches!(classify_response(&r), DocumentOutcome::Retryable(_)));
+        assert!(matches!(
+            classify_response(&r),
+            DocumentOutcome::Retryable(_)
+        ));
     }
 }

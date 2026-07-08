@@ -11,7 +11,10 @@ use maria304_driver::session::dispatcher::Correlation;
 use maria304_driver::session::{dispatch, Clock, Identity, Session, SessionState};
 
 fn clock() -> Clock<'static> {
-    Clock { date: "20260420", time: "101530" }
+    Clock {
+        date: "20260420",
+        time: "101530",
+    }
 }
 
 fn run(s: &mut Session, b: &MockBridge, c: &mut Correlation, cmd: Command) -> Vec<Response> {
@@ -21,7 +24,10 @@ fn run(s: &mut Session, b: &MockBridge, c: &mut Correlation, cmd: Command) -> Ve
 fn logged_in() -> (Session, MockBridge, Correlation) {
     let mut s = Session::new();
     let b = MockBridge::new();
-    let mut c = Correlation { session_uuid: "sess-r".to_string(), receipt_seq: 0 };
+    let mut c = Correlation {
+        session_uuid: "sess-r".to_string(),
+        receipt_seq: 0,
+    };
     run(
         &mut s,
         &b,
@@ -86,7 +92,11 @@ fn z_report_is_rejected_while_a_receipt_is_open() {
 
     let out = run(&mut s, &b, &mut c, Command::Nrep);
     assert_eq!(out, vec![Response::Error(ErrorCode::SoftCheck)]);
-    assert_eq!(b.call_count(), 0, "Z-report must not submit while receipt open");
+    assert_eq!(
+        b.call_count(),
+        0,
+        "Z-report must not submit while receipt open"
+    );
     // Receipt untouched.
     assert!(s.receipt_open());
 }
@@ -104,7 +114,10 @@ fn nrep_lowercase_maps_to_shift_open_command_type() {
 #[test]
 fn firn_periodic_report_carries_znumber_range_in_body() {
     let (mut s, b, mut c) = logged_in();
-    let cmd = Command::Firn { first: 42, last: 1234 };
+    let cmd = Command::Firn {
+        first: 42,
+        last: 1234,
+    };
     let out = run(&mut s, &b, &mut c, cmd);
     assert_eq!(out, vec![Response::Done, Response::Ready]);
     let env = b.last().unwrap();
@@ -208,13 +221,28 @@ fn report_firn_key_is_content_stable_across_tcp_sessions() {
     run(&mut s2, &b2, &mut c2, Command::Firn { first: 1, last: 10 });
     let key2 = b2.submitted().last().unwrap().idempotency_key.clone();
 
-    assert_eq!(key1, key2, "FIRN key must be stable across TCP sessions for same date range");
+    assert_eq!(
+        key1, key2,
+        "FIRN key must be stable across TCP sessions for same date range"
+    );
     assert!(key1.starts_with(&prefix));
-    assert_eq!(key1[prefix.len()..].len(), 64, "hash part must be 64 hex chars");
+    assert_eq!(
+        key1[prefix.len()..].len(),
+        64,
+        "hash part must be 64 hex chars"
+    );
 
     // Different date range → different key.
     let (mut s3, b3, mut c3) = logged_in();
-    run(&mut s3, &b3, &mut c3, Command::Firn { first: 11, last: 20 });
+    run(
+        &mut s3,
+        &b3,
+        &mut c3,
+        Command::Firn {
+            first: 11,
+            last: 20,
+        },
+    );
     let key3 = b3.submitted().last().unwrap().idempotency_key.clone();
 
     assert_ne!(key1, key3, "FIRN key must differ for different date ranges");

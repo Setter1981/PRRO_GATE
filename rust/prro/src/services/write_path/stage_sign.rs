@@ -1193,7 +1193,10 @@ struct ZReportTaxSumJson {
 
 enum TypedPayload {
     ShiftOpen(ShiftOpenJson),
-    Check { body: CheckJson, total_sum_kop: i64 },
+    Check {
+        body: CheckJson,
+        total_sum_kop: i64,
+    },
     ZReport(ZReportJson),
     /// B10 — offline-session boundary (BEGIN/END).  Carries no body: the
     /// wire doc is an EMPTY `<C T="109">`/`<C T="110">` service receipt
@@ -1254,22 +1257,18 @@ fn build_canonical_doc(
         }
         // B10 — offline-session boundary docs: empty service receipt, DI =
         // the doc's local number.  BEGIN → `<C T="109">`, END → `<C T="110">`.
-        (WireArtifactKind::OfflineSessionBegin, TypedPayload::OfflineBoundary) => {
-            Ok(CanonicalDoc::OfflineSessionBegin(
-                crate::xml::OfflineSessionBoundaryPayload {
-                    header,
-                    local_number,
-                },
-            ))
-        }
-        (WireArtifactKind::OfflineSessionEnd, TypedPayload::OfflineBoundary) => {
-            Ok(CanonicalDoc::OfflineSessionEnd(
-                crate::xml::OfflineSessionBoundaryPayload {
-                    header,
-                    local_number,
-                },
-            ))
-        }
+        (WireArtifactKind::OfflineSessionBegin, TypedPayload::OfflineBoundary) => Ok(
+            CanonicalDoc::OfflineSessionBegin(crate::xml::OfflineSessionBoundaryPayload {
+                header,
+                local_number,
+            }),
+        ),
+        (WireArtifactKind::OfflineSessionEnd, TypedPayload::OfflineBoundary) => Ok(
+            CanonicalDoc::OfflineSessionEnd(crate::xml::OfflineSessionBoundaryPayload {
+                header,
+                local_number,
+            }),
+        ),
         (
             WireArtifactKind::Sell,
             TypedPayload::Check {

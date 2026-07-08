@@ -555,6 +555,55 @@ pub struct OfflineStamp {
     pub dps_code: String,
 }
 
+/// B10 — existence probe for the offline-session boundary docs (DocType
+/// `OFFLINE_SESSION_BEGIN` / `OFFLINE_SESSION_END`).  Returns `true` iff an
+/// ACTIVE (non-terminal-failed) boundary doc of `doc_type` already exists for
+/// `(fiscal_number, shift_id)`.
+///
+/// **Keyed on `shift_id`, NOT `offline_session_id`** — the session_id is
+/// stamped only at SIGN (`stamp_offline_issuance_tx`), so a crashed-PREPARED
+/// boundary doc has a NULL `offline_session_id` and would be invisible to a
+/// session-keyed probe → double-mint (the arch-locked idempotency trap).  The
+/// `shift_id` is set at mint and is the stable per-session anchor that survives
+/// the PREPARED-crash window (one offline session per open shift).
+///
+/// **State set**: any state OTHER than the terminal-FAILED ones
+/// (`REJECTED`/`ABORTED`/`CANCELLED`/`REQUIRES_MANUAL_RECONCILIATION`).  A
+/// still-live (PREPARED/SIGNED/OFFLINE_LOCAL_ACK/…) or successfully-issued
+/// (ACK) boundary doc counts as "exists" → do NOT re-mint.  A boundary doc that
+/// terminated in a failed state (a prior aborted attempt) does NOT count → a
+/// fresh mint is allowed.  This mirrors the partial UNIQUE index
+/// `ux_fd_active_offline_boundary` (migration 030) — the DB constraint is the
+/// fail-closed backstop; this read is the idempotency gate.
+pub async fn active_boundary_doc_state_tx(
+    tx: &mut WriteTxConn<'_>,
+    fiscal_number: &str,
+    shift_id: ShiftId,
+    doc_type: DocType,
+) -> sqlx::Result<Option<DocState>> {
+    debug_assert!(
+        matches!(
+            doc_type,
+            DocType::OfflineSessionBegin | DocType::OfflineSessionEnd
+        ),
+        "active_boundary_doc_state_tx is only meaningful for boundary doc types"
+    );
+    let row: Option<DocState> = sqlx::query_scalar(
+        "SELECT state FROM fiscal_documents \
+         WHERE fiscal_number = ? AND shift_id = ? AND doc_type = ? \
+           AND state NOT IN ( \
+               'REJECTED','ABORTED','CANCELLED','REQUIRES_MANUAL_RECONCILIATION' \
+           ) \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .bind(shift_id)
+    .bind(doc_type)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row)
+}
+
 /// B9 Slice A — slim `SIGNED → OFFLINE_LOCAL_ACK` state CAS with **no** column
 /// writes.  Used by `stage_offline_ack` when the offline-issuance columns were
 /// already stamped at sign (the [`stamp_offline_issuance_tx`] path): the

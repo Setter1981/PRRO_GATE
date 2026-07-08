@@ -873,7 +873,11 @@ fn emit_shift_open(p: &ShiftOpenPayload, out: &mut String) {
 /// `<TS>`.  DI = `local_number` (unlike SHIFT_OPEN's forced DI=0 — these
 /// are ordinary lnd-numbered offline docs).  `<MAC>` carries the ID
 /// attribute when `header.mac_id` is set (B9 offline path).
-fn emit_offline_session_boundary(p: &OfflineSessionBoundaryPayload, c_type: &str, out: &mut String) {
+fn emit_offline_session_boundary(
+    p: &OfflineSessionBoundaryPayload,
+    c_type: &str,
+    out: &mut String,
+) {
     let h = &p.header;
     open_rq(out, h);
     let di = p.local_number.to_string();

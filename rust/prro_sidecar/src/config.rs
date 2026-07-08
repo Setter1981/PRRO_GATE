@@ -7,17 +7,17 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SidecarConfig {
-    pub sidecar:  SidecarSection,
-    pub db:       DbSection,
-    pub dps:      DpsProfiles,
+    pub sidecar: SidecarSection,
+    pub db: DbSection,
+    pub dps: DpsProfiles,
     #[serde(default)]
-    pub certs:    CertsSection,
+    pub certs: CertsSection,
     #[serde(default)]
     pub security: SecuritySection,
-    pub tsp:      Option<TspSection>,
+    pub tsp: Option<TspSection>,
     #[serde(default)]
-    pub dev:      DevSection,
-    pub license:  Option<LicenseSection>,
+    pub dev: DevSection,
+    pub license: Option<LicenseSection>,
 }
 
 // ─── Sections ────────────────────────────────────────────────────────────────
@@ -25,16 +25,18 @@ pub struct SidecarConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SidecarSection {
     /// TCP bind address (e.g. "127.0.0.1:8765")
-    pub bind:      String,
+    pub bind: String,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     /// Device name embedded in DPS XML <NDv> tag (default: "ПРО_каса")
-    pub device_name:    Option<String>,
+    pub device_name: Option<String>,
     /// Device version embedded in DPS XML <PrV> tag (default: "1.1")
     pub device_version: Option<String>,
 }
 
-fn default_log_level() -> String { "info".into() }
+fn default_log_level() -> String {
+    "info".into()
+}
 
 // ─── Certs section ───────────────────────────────────────────────────────────
 
@@ -98,7 +100,7 @@ pub struct DpsProfiles {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DpsEndpoint {
     /// gRPC endpoint URI (e.g. "https://cabinet.tax.gov.ua:9443")
-    pub endpoint:  String,
+    pub endpoint: String,
     /// Optional path to PEM CA bundle (for private CA or custom root)
     pub ca_bundle: Option<String>,
 }
@@ -125,13 +127,15 @@ pub struct TspSection {
     pub timeout_ms: u64,
 }
 
-fn default_tsp_timeout_ms() -> u64 { 5_000 }
+fn default_tsp_timeout_ms() -> u64 {
+    5_000
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct DevSection {
     /// Skip CMS signing (return raw cp1251 XML). Requires DEV_MODE env var.
     #[serde(default)]
-    pub skip_sign:  bool,
+    pub skip_sign: bool,
     /// Pretty-print tracing logs instead of JSON
     #[serde(default)]
     pub log_pretty: bool,
@@ -139,7 +143,7 @@ pub struct DevSection {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LicenseSection {
-    pub payload_b64:   String,
+    pub payload_b64: String,
     pub signature_b64: String,
 }
 
@@ -148,7 +152,10 @@ pub struct LicenseSection {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("read {path}: {source}")]
-    Io { path: String, source: std::io::Error },
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("TOML parse: {0}")]
     Toml(#[from] toml::de::Error),
     #[error("validation: {0}")]
@@ -177,9 +184,12 @@ impl SidecarConfig {
 
     fn validate(&self) -> Result<(), ConfigError> {
         // bind must be a valid socket address
-        self.sidecar.bind.parse::<std::net::SocketAddr>().map_err(|e| {
-            ConfigError::Validation(format!("sidecar.bind {:?}: {e}", self.sidecar.bind))
-        })?;
+        self.sidecar
+            .bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| {
+                ConfigError::Validation(format!("sidecar.bind {:?}: {e}", self.sidecar.bind))
+            })?;
 
         // db.path must be non-empty
         if self.db.path.trim().is_empty() {
@@ -188,10 +198,14 @@ impl SidecarConfig {
 
         // dps.prod.endpoint must be non-empty (required even in test-only deploys)
         if self.dps.prod.endpoint.trim().is_empty() {
-            return Err(ConfigError::Validation("dps.prod.endpoint must not be empty".into()));
+            return Err(ConfigError::Validation(
+                "dps.prod.endpoint must not be empty".into(),
+            ));
         }
         if self.dps.test.endpoint.trim().is_empty() {
-            return Err(ConfigError::Validation("dps.test.endpoint must not be empty".into()));
+            return Err(ConfigError::Validation(
+                "dps.test.endpoint must not be empty".into(),
+            ));
         }
 
         // dev.skip_sign bypasses CMS signing, license checks, and idempotency — only
@@ -270,7 +284,10 @@ log_pretty = false
         assert_eq!(cfg1.db.path, cfg2.db.path);
         assert_eq!(cfg1.dps.prod.endpoint, cfg2.dps.prod.endpoint);
         assert_eq!(cfg1.dps.test.endpoint, cfg2.dps.test.endpoint);
-        assert_eq!(cfg1.security.credentials_mode, cfg2.security.credentials_mode);
+        assert_eq!(
+            cfg1.security.credentials_mode,
+            cfg2.security.credentials_mode
+        );
     }
 
     #[test]
@@ -291,8 +308,14 @@ endpoint = "https://test.example.com:9443"
         assert!(cfg.tsp.is_none());
         assert!(!cfg.dev.skip_sign);
         // cert defaults
-        assert_eq!(cfg.certs.tls_chain, "/var/lib/prro_sidecar/certs/prro-tax-gov-ua-chain.pem");
-        assert_eq!(cfg.certs.ca_bundle, "/var/lib/prro_sidecar/certs/CACertificates.p7b");
+        assert_eq!(
+            cfg.certs.tls_chain,
+            "/var/lib/prro_sidecar/certs/prro-tax-gov-ua-chain.pem"
+        );
+        assert_eq!(
+            cfg.certs.ca_bundle,
+            "/var/lib/prro_sidecar/certs/CACertificates.p7b"
+        );
     }
 
     #[test]
@@ -328,7 +351,10 @@ endpoint = "https://prod.example.com:9443"
 endpoint = "https://test.example.com:9443"
 "#;
         let err = SidecarConfig::from_toml_str(bad).unwrap_err();
-        assert!(matches!(err, ConfigError::Validation(_)), "expected Validation error, got {err}");
+        assert!(
+            matches!(err, ConfigError::Validation(_)),
+            "expected Validation error, got {err}"
+        );
     }
 
     #[test]
@@ -410,7 +436,10 @@ skip_sign = true
 "#;
         let result = SidecarConfig::from_toml_str(toml);
         std::env::remove_var("DEV_MODE"); // cleanup
-        assert!(result.is_ok(), "skip_sign=true WITH DEV_MODE must succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "skip_sign=true WITH DEV_MODE must succeed: {result:?}"
+        );
         assert!(result.unwrap().dev.skip_sign);
     }
 
@@ -429,7 +458,10 @@ endpoint = "https://prod.example.com:9443"
 endpoint = "https://test.example.com:9443"
 "#;
         let err = SidecarConfig::from_toml_str(toml).unwrap_err();
-        assert!(matches!(err, ConfigError::Validation(_)), "empty db.path must be rejected: {err}");
+        assert!(
+            matches!(err, ConfigError::Validation(_)),
+            "empty db.path must be rejected: {err}"
+        );
     }
 
     #[test]
@@ -445,7 +477,10 @@ endpoint = "https://prod.example.com:9443"
 endpoint = "https://test.example.com:9443"
 "#;
         let err = SidecarConfig::from_toml_str(toml).unwrap_err();
-        assert!(matches!(err, ConfigError::Validation(_)), "whitespace db.path must be rejected: {err}");
+        assert!(
+            matches!(err, ConfigError::Validation(_)),
+            "whitespace db.path must be rejected: {err}"
+        );
     }
 
     // ── dps endpoint validation ───────────────────────────────────────────────
@@ -463,7 +498,10 @@ endpoint = ""
 endpoint = "https://test.example.com:9443"
 "#;
         let err = SidecarConfig::from_toml_str(toml).unwrap_err();
-        assert!(matches!(err, ConfigError::Validation(_)), "empty prod endpoint must be rejected: {err}");
+        assert!(
+            matches!(err, ConfigError::Validation(_)),
+            "empty prod endpoint must be rejected: {err}"
+        );
     }
 
     #[test]
@@ -479,7 +517,10 @@ endpoint = "https://prod.example.com:9443"
 endpoint = ""
 "#;
         let err = SidecarConfig::from_toml_str(toml).unwrap_err();
-        assert!(matches!(err, ConfigError::Validation(_)), "empty test endpoint must be rejected: {err}");
+        assert!(
+            matches!(err, ConfigError::Validation(_)),
+            "empty test endpoint must be rejected: {err}"
+        );
     }
 
     // ── bind address parsing ──────────────────────────────────────────────────
@@ -497,7 +538,10 @@ endpoint = "https://prod.example.com:9443"
 endpoint = "https://test.example.com:9443"
 "#;
         let err = SidecarConfig::from_toml_str(toml).unwrap_err();
-        assert!(matches!(err, ConfigError::Validation(_)), "bind without port must be rejected: {err}");
+        assert!(
+            matches!(err, ConfigError::Validation(_)),
+            "bind without port must be rejected: {err}"
+        );
     }
 
     #[test]
@@ -514,7 +558,10 @@ endpoint = "https://prod.example.com:9443"
 endpoint = "https://test.example.com:9443"
 "#;
         let err = SidecarConfig::from_toml_str(toml).unwrap_err();
-        assert!(matches!(err, ConfigError::Validation(_)), "port >65535 must be rejected: {err}");
+        assert!(
+            matches!(err, ConfigError::Validation(_)),
+            "port >65535 must be rejected: {err}"
+        );
     }
 
     #[test]
