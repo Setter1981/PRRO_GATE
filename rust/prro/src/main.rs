@@ -119,6 +119,33 @@ enum AdminCmd {
         reason: String,
     },
 
+    /// T=112 C5 — manually trigger one T=112 DPS offline-code replenish.
+    ///
+    /// Boots the App (acquires singleton lock — **stop `prro serve` first**),
+    /// loads the JKS signing key from PRRO_LIVE_DPS_JKS_PATH /
+    /// PRRO_LIVE_DPS_JKS_PASS, connects to DPS, and calls
+    /// OfflineCodeReplenishService::replenish for the given FN.
+    ///
+    /// Prints codes_received / inserted / deduped / new_seed_hex and the
+    /// request_xml (no secrets — FN/TN are public fiscal identifiers).
+    RequestOfflineCodes {
+        #[arg(long)]
+        config: PathBuf,
+        /// Fiscal number (e.g. 4000162280).
+        #[arg(long = "fn")]
+        fiscal_number: String,
+        /// Number of codes to request (default: FN's max_offline_codes from
+        /// fiscal_number_config, fall-back to 1 if unset/0).
+        #[arg(long)]
+        size: Option<u32>,
+        /// DPS endpoint URL.
+        #[arg(long, default_value = "https://cabinet.tax.gov.ua:9443")]
+        host: String,
+        /// Document index (1-based; usually 1 for the first batch).
+        #[arg(long, default_value_t = 1)]
+        di: u32,
+    },
+
     /// W2 — register a cashier (operator) and bind their EDS key to a
     /// fiscal number.  Inserts a row into the secure DB's `operators`
     /// table.  Password is acquired interactively: TTY mode requires
@@ -534,6 +561,43 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(err) => {
                     eprintln!("prro admin seed-codes: {err}");
+                    std::process::exit(err.exit_code());
+                }
+            },
+            AdminCmd::RequestOfflineCodes {
+                config,
+                fiscal_number,
+                size,
+                host,
+                di,
+            } => match prro::admin::run_request_offline_codes(
+                &config,
+                &fiscal_number,
+                size,
+                &host,
+                di,
+            )
+            .await
+            {
+                Ok(o) => {
+                    // Echo request_xml for audit (no secrets; FN/TN are public).
+                    println!("ADMIN_REQUEST_OFFLINE_CODES request_xml={}", o.request_xml);
+                    println!(
+                        "ADMIN_REQUEST_OFFLINE_CODES OK \
+                         fiscal_number={} tax_number={} \
+                         codes_received={} inserted={} deduped={} \
+                         new_seed_hex={}",
+                        o.fiscal_number,
+                        o.tax_number,
+                        o.codes_received,
+                        o.inserted,
+                        o.deduped,
+                        o.new_seed_hex,
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    eprintln!("prro admin request-offline-codes: {err}");
                     std::process::exit(err.exit_code());
                 }
             },
