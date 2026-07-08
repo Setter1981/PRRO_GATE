@@ -1170,13 +1170,10 @@ async fn ensure_offline_session_begin(
         // with precise diagnostics; do not pre-empt them here.
         Ok(None) => return Ok(()),
         Err(e) => {
+            tracing::error!(error=%e, "ensure_offline_session_begin: node_state read failed");
             return Err(FiscalError::Internal {
                 request_id,
                 code: codes::ACQUIRE_INTERNAL,
-            })
-            .map_err(|fe| {
-                tracing::error!(error=%e, "ensure_offline_session_begin: node_state read failed");
-                fe
             });
         }
     };

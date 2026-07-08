@@ -734,7 +734,10 @@ async fn run_full_offline_drain(n_drain_docs: usize) -> (App, DrainCarriers) {
         .expect("drain must run");
     match outcome {
         ScheduledDrainOutcome::Ran(s) => {
-            assert!(s.finalized(), "drain must finalize");
+            assert!(
+                s.finalized(),
+                "drain must finalize (all content Ack + END Ack)"
+            );
         }
         ScheduledDrainOutcome::SkippedBackoff { .. } => panic!("first tick must run"),
     }
