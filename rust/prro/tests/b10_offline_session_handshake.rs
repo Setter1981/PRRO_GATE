@@ -511,3 +511,148 @@ async fn b10_no_begin_for_session_with_zero_offline_business_docs() {
         "no spurious DocType=9 for an empty offline session"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// #6 — the DocType=9 BEGIN is stamped with the session's offline-entry time
+//      (`opened_at`), NOT the first-SELL time (docs-as-canon / 168h fidelity).
+// ══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn b10_begin_stamped_with_session_opened_at() {
+    let app = boot_app().await;
+    let registry = build_registry(&app, shift_open_only_dps()).await;
+    seed_boot_baseline(app.db()).await;
+    let write_path = production_write_path(app.clone(), Arc::new(registry));
+
+    drive(
+        &*write_path,
+        app.db(),
+        entry("SHIFT_OPEN", SHIFT_OPEN_PAYLOAD, "idem-OPEN", None),
+    )
+    .await
+    .expect("SHIFT_OPEN");
+    prro::admin::go_offline(app.db(), FN, "net drop")
+        .await
+        .expect("go_offline");
+    let codes: Vec<String> = (0..6).map(|i| format!("CODE-{i}")).collect();
+    prro::admin::seed_dps_offline_codes(app.db(), FN, &codes)
+        .await
+        .expect("seed codes");
+
+    let session_opened_at: String =
+        sqlx::query_scalar("SELECT opened_at FROM offline_sessions WHERE fiscal_number = ?")
+            .bind(FN)
+            .fetch_one(app.db())
+            .await
+            .unwrap();
+
+    drive(
+        &*write_path,
+        app.db(),
+        entry("SELL", SELL_PAYLOAD, "idem-SELL", Some(TOTAL_KOP)),
+    )
+    .await
+    .expect("offline SELL");
+
+    let begin_ts: String = sqlx::query_scalar(
+        "SELECT business_ts FROM fiscal_documents \
+         WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN'",
+    )
+    .bind(FN)
+    .fetch_one(app.db())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        begin_ts, session_opened_at,
+        "DocType=9 BEGIN business_ts must equal the session opened_at (offline-entry time)"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Decision-5 crash guard — a crashed-mid-sign BEGIN (below OFFLINE_LOCAL_ACK)
+// must fail-close a fresh offline SELL (RETRYABLE 503), NOT let it sign against
+// a non-issued predecessor (offline lane bypasses the D5 sibling gate).
+// ══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn b10_crashed_prepared_begin_fails_closed_fresh_sell() {
+    use prro::runtime::ingress::seam::FiscalError;
+
+    let app = boot_app().await;
+    let registry = build_registry(&app, shift_open_only_dps()).await;
+    seed_boot_baseline(app.db()).await;
+    let write_path = production_write_path(app.clone(), Arc::new(registry));
+
+    drive(
+        &*write_path,
+        app.db(),
+        entry("SHIFT_OPEN", SHIFT_OPEN_PAYLOAD, "idem-OPEN", None),
+    )
+    .await
+    .expect("SHIFT_OPEN");
+    prro::admin::go_offline(app.db(), FN, "net drop")
+        .await
+        .expect("go_offline");
+    let codes: Vec<String> = (0..6).map(|i| format!("CODE-{i}")).collect();
+    prro::admin::seed_dps_offline_codes(app.db(), FN, &codes)
+        .await
+        .expect("seed codes");
+
+    // Inject a crashed-mid-sign BEGIN: a PREPARED boundary doc bound to the
+    // current shift (offline_session_id NULL, exactly as a crash before sign
+    // leaves it).
+    let shift_id: Vec<u8> =
+        sqlx::query_scalar("SELECT current_shift_id FROM node_state WHERE fiscal_number = ?")
+            .bind(FN)
+            .fetch_one(app.db())
+            .await
+            .unwrap();
+    sqlx::query(
+        "INSERT INTO fiscal_documents \
+         (document_id, request_id, fiscal_number, shift_id, offline_session_id, lnd, doc_type, \
+          state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+          payload_sha256_canonical, source_sha256) \
+         VALUES (randomblob(16), randomblob(16), ?, ?, NULL, 999, 'OFFLINE_SESSION_BEGIN', \
+          'PREPARED', 'b', 't', 'OFFLINE', '2026-07-07T00:00:00Z', '{}', \
+          zeroblob(32), zeroblob(32))",
+    )
+    .bind(FN)
+    .bind(&shift_id)
+    .execute(app.db())
+    .await
+    .unwrap();
+
+    // A fresh offline SELL must fail-closed RETRYABLE (503), NOT proceed to sign.
+    let err = drive(
+        &*write_path,
+        app.db(),
+        entry("SELL", SELL_PAYLOAD, "idem-SELL", Some(TOTAL_KOP)),
+    )
+    .await
+    .expect_err("SELL must fail-closed while the BEGIN is stuck below OLA");
+    assert!(
+        matches!(err, FiscalError::OfflineRefused { .. }),
+        "expected a RETRYABLE OfflineRefused, got {err:?}"
+    );
+    // No second BEGIN was minted (idempotency held).
+    assert_eq!(
+        count_doc_type(app.db(), DocType::OfflineSessionBegin).await,
+        1,
+        "the crashed BEGIN must NOT be re-minted"
+    );
+    // The SELL did not sign (no SELL doc row reached SIGNED/OLA).
+    let sell_states: Vec<String> = sqlx::query_scalar(
+        "SELECT state FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'SELL'",
+    )
+    .bind(FN)
+    .fetch_all(app.db())
+    .await
+    .unwrap();
+    assert!(
+        sell_states
+            .iter()
+            .all(|s| s != "OFFLINE_LOCAL_ACK" && s != "SIGNED"),
+        "SELL must not have signed against a non-issued BEGIN: {sell_states:?}"
+    );
+}
