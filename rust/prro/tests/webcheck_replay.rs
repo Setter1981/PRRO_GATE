@@ -579,24 +579,55 @@ fn driven_sells(fx: &Fixture) -> (Vec<&CorpusOp>, bool) {
 
 /// Build the `Expected` from the fixture, restricted to the driven sells.
 fn expected_for(fx: &Fixture, driven: &[&CorpusOp]) -> Expected {
-    let lnds: Vec<i64> = driven.iter().map(|op| op.lnd).collect();
-    let classes: Vec<String> = driven.iter().map(|op| op.offline_class.clone()).collect();
+    let mut lnds: Vec<i64> = driven.iter().map(|op| op.lnd).collect();
+    let mut classes: Vec<String> = driven.iter().map(|op| op.offline_class.clone()).collect();
     // the fixture chain link for each driven op (index by op_index into the full
     // per-op chain).
-    let chain: Vec<Option<String>> = driven
+    let mut chain: Vec<Option<String>> = driven
         .iter()
         .map(|op| fx.expected.previous_hash_chain[op.op_index].clone())
         .collect();
-    let codes_consumed = driven
+    let mut codes_consumed = driven
         .iter()
         .filter(|op| op.offline_class == "offline_drained")
         .count() as i64;
+    let mut issued_count = driven.len();
+
+    // B10: an OFFLINE session that drains is bracketed by two gateway-internal
+    // boundary docs that the (pre-B10) WebCheck corpus fixture does not carry:
+    // a DocType=9 BEGIN (lazily minted as the FIRST offline doc — takes the
+    // LOWEST lnd, prepended) and a DocType=10 END (minted at drain finalize —
+    // takes the HIGHEST lnd, appended).  Both are real issued OFFLINE docs that
+    // reach ACK on drain ("offline_drained" class) and each consumes one code.
+    // The `compare` structural checks (monotonic/gap-free lnds via a single
+    // offset, per-index class, interior chain-link presence) hold for them; we
+    // only need to reflect their presence in the counts + per-index vectors.
+    let offline = driven
+        .iter()
+        .any(|op| op.offline_class == "offline_drained");
+    if offline {
+        let lo = lnds.iter().copied().min().unwrap_or(1);
+        let hi = lnds.iter().copied().max().unwrap_or(0);
+        // BEGIN at lo-1 (prepended, lowest), END at hi+1 (appended, highest) —
+        // keeps the sequence contiguous + strictly monotonic for `compare`.
+        lnds.insert(0, lo - 1);
+        lnds.push(hi + 1);
+        classes.insert(0, "offline_drained".to_string());
+        classes.push("offline_drained".to_string());
+        // Interior chain links must be non-null (a synthetic marker suffices —
+        // `compare` only checks presence for interior links, not hex equality).
+        chain.insert(0, Some("b10-begin".to_string()));
+        chain.push(Some("b10-end".to_string()));
+        codes_consumed += 2;
+        issued_count += 2;
+    }
+
     Expected {
         lnds,
         classes,
         chain,
         codes_consumed,
-        issued_count: driven.len(),
+        issued_count,
     }
 }
 
