@@ -1187,28 +1187,29 @@ async fn ensure_offline_session_begin(
     };
 
     // Existence + state probe, keyed on (fn, shift_id).  One short read tx.
-    let begin_state = crate::db::tx::with_immediate(pool, {
-        let fiscal_number = fiscal_number.to_string();
-        move |tx| {
-            Box::pin(async move {
-                // Require an active OPEN session (the SELL would defer at
-                // offline-ack otherwise; do not mint a BEGIN with no session).
-                if offline_sessions::current_active_session_id_tx(tx, &fiscal_number)
-                    .await?
-                    .is_none()
-                {
-                    return Ok::<Option<Option<DocState>>, anyhow::Error>(None);
-                }
-                let st = fiscal_documents::active_boundary_doc_state_tx(
-                    tx,
-                    &fiscal_number,
-                    shift_id,
-                    DocType::OfflineSessionBegin,
-                )
-                .await?;
-                Ok(Some(st))
-            })
-        }
+    // INV-1 static-scan: the `with_immediate` closure is INLINE (`move |tx|
+    // Box::pin(async move {…})`) with captures hoisted BEFORE the call — the
+    // `with_immediate_no_foreign_io` scanner reads the body directly.
+    let fn_owned = fiscal_number.to_string();
+    let begin_state = crate::db::tx::with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // Require an active OPEN session (the SELL would defer at
+            // offline-ack otherwise; do not mint a BEGIN with no session).
+            if offline_sessions::current_active_session_id_tx(tx, &fn_owned)
+                .await?
+                .is_none()
+            {
+                return Ok::<Option<Option<DocState>>, anyhow::Error>(None);
+            }
+            let st = fiscal_documents::active_boundary_doc_state_tx(
+                tx,
+                &fn_owned,
+                shift_id,
+                DocType::OfflineSessionBegin,
+            )
+            .await?;
+            Ok(Some(st))
+        })
     })
     .await
     .map_err(|_| FiscalError::Internal {

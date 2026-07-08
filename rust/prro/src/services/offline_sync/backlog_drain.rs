@@ -2620,20 +2620,20 @@ async fn ensure_and_drain_session_end(
     };
 
     // ── ADOPT: is there already a boundary END for this (fn, shift)? ──
-    let existing = with_immediate(pool, {
-        let fiscal_number = fiscal_number.to_string();
-        move |tx| {
-            Box::pin(async move {
-                fiscal_documents::active_boundary_doc_state_tx(
-                    tx,
-                    &fiscal_number,
-                    shift_id,
-                    DocType::OfflineSessionEnd,
-                )
-                .await
-                .map_err(anyhow::Error::from)
-            })
-        }
+    // INV-1 static-scan: INLINE closure with the capture hoisted before the
+    // call so `with_immediate_no_foreign_io` reads the body.
+    let fn_owned_adopt = fiscal_number.to_string();
+    let existing = with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            fiscal_documents::active_boundary_doc_state_tx(
+                tx,
+                &fn_owned_adopt,
+                shift_id,
+                DocType::OfflineSessionEnd,
+            )
+            .await
+            .map_err(anyhow::Error::from)
+        })
     })
     .await
     .map_err(|source| BootError::ReconciliationFailed {
@@ -2778,15 +2778,14 @@ async fn drive_session_end_to_ola(
     use crate::services::write_path::types::{CanonicalFiscalCommand, WorkerContext};
 
     // Fetch the PREPARED/SIGNED END row (pending states only).
-    let doc = with_immediate(pool, {
-        let request_id = *request_id;
-        move |tx| {
-            Box::pin(async move {
-                fiscal_documents::get_pending_by_request_id_tx(tx, &request_id)
-                    .await
-                    .map_err(anyhow::Error::from)
-            })
-        }
+    // INV-1 static-scan: INLINE closure, capture hoisted before the call.
+    let request_id_owned = *request_id;
+    let doc = with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            fiscal_documents::get_pending_by_request_id_tx(tx, &request_id_owned)
+                .await
+                .map_err(anyhow::Error::from)
+        })
     })
     .await
     .map_err(|source| BootError::ReconciliationFailed {
