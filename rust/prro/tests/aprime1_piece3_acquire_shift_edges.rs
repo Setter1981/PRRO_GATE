@@ -498,6 +498,11 @@ async fn g_offline_shift_open_creates_opened_local_pending_drain_and_binds_doc()
     let secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
     seed_node_state(&pool, NodeMode::Offline, ShiftState::Closed, None).await;
+    // A′.3 PR-O3 fix (a): offline shift-lifecycle acquire now REQUIRES an OPEN
+    // session + a non-empty code pool (else pre-mint refused) — seed both so
+    // the edge under test is reached.
+    seed_offline_session_open(&pool).await;
+    seed_offline_code(&pool, 9100).await;
     let req = seed_inbox(&pool, DocType::ShiftOpen, Some(CASHIER)).await;
 
     let result = stage_acquire::run(
@@ -680,6 +685,8 @@ async fn k_offline_z_report_at_opened_drives_closing_local_pending_drain() {
     let shift = ShiftId::new();
     seed_shift(&pool, shift, ShiftState::Opened).await;
     seed_node_state(&pool, NodeMode::Offline, ShiftState::Opened, Some(shift)).await;
+    seed_offline_session_open(&pool).await; // fix (a) precondition
+    seed_offline_code(&pool, 9101).await;
     let req = seed_inbox(&pool, DocType::ZReport, None).await;
 
     let result = stage_acquire::run(&pool, &secure, DRIVER, req, cmd(DocType::ZReport, None))
@@ -713,6 +720,8 @@ async fn l_offline_shift_close_at_opened_drives_closing_local_pending_drain() {
     let shift = ShiftId::new();
     seed_shift(&pool, shift, ShiftState::Opened).await;
     seed_node_state(&pool, NodeMode::Offline, ShiftState::Opened, Some(shift)).await;
+    seed_offline_session_open(&pool).await; // fix (a) precondition
+    seed_offline_code(&pool, 9102).await;
     let req = seed_inbox(&pool, DocType::ShiftClose, None).await;
 
     let result = stage_acquire::run(&pool, &secure, DRIVER, req, cmd(DocType::ShiftClose, None))
@@ -921,6 +930,8 @@ async fn m_offline_z_report_at_opened_local_pending_drain_drives_closing_local_p
         Some(shift),
     )
     .await;
+    seed_offline_session_open(&pool).await; // fix (a) precondition
+    seed_offline_code(&pool, 9103).await;
     let req = seed_inbox(&pool, DocType::ZReport, None).await;
 
     let result = stage_acquire::run(&pool, &secure, DRIVER, req, cmd(DocType::ZReport, None))
@@ -959,6 +970,8 @@ async fn n_offline_shift_close_at_opened_local_pending_drain_drives_closing_loca
         Some(shift),
     )
     .await;
+    seed_offline_session_open(&pool).await; // fix (a) precondition
+    seed_offline_code(&pool, 9104).await;
     let req = seed_inbox(&pool, DocType::ShiftClose, None).await;
 
     let result = stage_acquire::run(&pool, &secure, DRIVER, req, cmd(DocType::ShiftClose, None))

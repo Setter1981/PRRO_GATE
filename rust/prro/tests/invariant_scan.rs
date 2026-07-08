@@ -1159,3 +1159,132 @@ async fn d3_backstop_does_not_flag_offline_issued_lane_without_sfn() {
         "offline-origin issued-lane doc (ofn set) must NOT trip the online D3 backstop; got {v:#?}"
     );
 }
+
+// ─── A′.3 PR-O3 fix (c) — orphaned pending-drain shift detector ──────────
+
+/// Seed a shift in `state` + a lifecycle doc of `doc_type` in `doc_state`,
+/// bound to it, plus a consistent node_state projection.  Used to build the
+/// orphaned-pending-drain-shift fixtures for the fix-(c) tripwire.
+async fn seed_shift_with_anchor(
+    pool: &SqlitePool,
+    state: &str,
+    doc_type: &str,
+    doc_state: &str,
+) -> ShiftId {
+    fn_repo::insert(
+        pool,
+        &NewFnConfig {
+            fiscal_number: FN.into(),
+            tax_number: "12345678".into(),
+            vat_payer_inn: None,
+            fiscal_mode: FiscalMode::Test,
+            org_name: None,
+            point_name: None,
+            org_address: None,
+            tsp_enabled: false,
+            offline_enabled: true,
+            national_check_enabled: false,
+            min_offline_codes: 0,
+            max_offline_codes: 0,
+        },
+    )
+    .await
+    .unwrap();
+    let shift_id = ShiftId::new();
+    sqlx::query(
+        "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, \
+            cash_balance_kop, opened_by_cashier_id) \
+         VALUES (?, ?, 1, ?, 'OFFLINE', 0, 'cashier')",
+    )
+    .bind(shift_id)
+    .bind(FN)
+    .bind(state)
+    .execute(pool)
+    .await
+    .unwrap();
+    // Consistent projection (avoids tripping ShiftStateMirrorDrift).
+    sqlx::query(
+        "INSERT INTO node_state \
+         (fiscal_number, mode, shift_state, current_shift_id, next_lnd, \
+          backend_profile_id, transport_profile_id) \
+         VALUES (?, 'OFFLINE', ?, ?, 10, 'b', 't')",
+    )
+    .bind(FN)
+    .bind(state)
+    .bind(shift_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
+            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical) \
+         VALUES (?, ?, ?, ?, 1, ?, ?, 'b', 't', 'OFFLINE', '2026-07-07T00:00:00Z', '{}', ?)",
+    )
+    .bind(DocumentId::new())
+    .bind(&(*RequestId::new().as_bytes())[..])
+    .bind(FN)
+    .bind(shift_id)
+    .bind(doc_type)
+    .bind(doc_state)
+    .bind(vec![0u8; 32])
+    .execute(pool)
+    .await
+    .unwrap();
+    shift_id
+}
+
+#[tokio::test]
+async fn detects_orphaned_olpd_shift_with_aborted_shift_open() {
+    let pool = fresh_pool().await;
+    // OLPD shift whose only SHIFT_OPEN anchor is ABORTED → no live anchor.
+    let _shift =
+        seed_shift_with_anchor(&pool, "OPENED_LOCAL_PENDING_DRAIN", "SHIFT_OPEN", "ABORTED").await;
+    let v = scan(&pool).await.unwrap();
+    assert!(
+        v.iter().any(|x| matches!(
+            x,
+            Violation::OrphanedPendingDrainShift { state, fiscal_number, .. }
+                if *state == "OPENED_LOCAL_PENDING_DRAIN" && fiscal_number == FN
+        )),
+        "an OLPD shift with only an ABORTED SHIFT_OPEN anchor must be flagged: {v:#?}"
+    );
+}
+
+#[tokio::test]
+async fn detects_orphaned_clpd_shift_with_aborted_z_report() {
+    let pool = fresh_pool().await;
+    let _shift =
+        seed_shift_with_anchor(&pool, "CLOSING_LOCAL_PENDING_DRAIN", "Z_REPORT", "ABORTED").await;
+    let v = scan(&pool).await.unwrap();
+    assert!(
+        v.iter().any(|x| matches!(
+            x,
+            Violation::OrphanedPendingDrainShift { state, .. }
+                if *state == "CLOSING_LOCAL_PENDING_DRAIN"
+        )),
+        "a CLPD shift with only an ABORTED Z_REPORT anchor must be flagged: {v:#?}"
+    );
+}
+
+/// Over-fire guard: a HEALTHY OLPD shift — its SHIFT_OPEN anchor is a live
+/// OFFLINE_LOCAL_ACK doc (the normal offline-day mid-state) — must NOT be
+/// flagged.  This is the load-bearing negative that keeps the tripwire from
+/// firing on every offline-opened shift.
+#[tokio::test]
+async fn clean_healthy_olpd_shift_with_ola_anchor_not_flagged() {
+    let pool = fresh_pool().await;
+    let _shift = seed_shift_with_anchor(
+        &pool,
+        "OPENED_LOCAL_PENDING_DRAIN",
+        "SHIFT_OPEN",
+        "OFFLINE_LOCAL_ACK",
+    )
+    .await;
+    let v = scan(&pool).await.unwrap();
+    assert!(
+        !v.iter()
+            .any(|x| matches!(x, Violation::OrphanedPendingDrainShift { .. })),
+        "a healthy OLPD shift with a live OLA anchor must NOT be flagged: {v:#?}"
+    );
+}

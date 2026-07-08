@@ -138,6 +138,23 @@ pub enum Violation {
         node_state_shift_state: String,
         shifts_state: String,
     },
+    /// A′.3 PR-O3 STOP-O3-1 fix (c) — a pending-drain shift
+    /// (`OpenedLocalPendingDrain` / `ClosingLocalPendingDrain`) whose ANCHOR
+    /// lifecycle doc is dead: the offline `SHIFT_OPEN` (for OLPD) or the offline
+    /// `SHIFT_CLOSE` / `Z_REPORT` (for CLPD) is present only in a terminal
+    /// non-issued state (`ABORTED` / `REJECTED` / `CANCELLED`), with NO live
+    /// anchor (a `PREPARED` / `SIGNED` mid-flight doc, or an issued
+    /// `OFFLINE_LOCAL_ACK` / `ACK`).  Such a shift can never fire its only exit
+    /// (edge 5 / 13 needs the anchor to drain) — the orphan wedge fix (b) /
+    /// boot SW-2 escalate to `RequiresManualReconciliation`.  DETECTOR ONLY
+    /// (read-only): the auto-heal lives in the runtime / boot escalation, not
+    /// here; this makes the pre-escalation window (best-effort runtime failure
+    /// before the boot re-run) OBSERVABLE at a quiescent boundary.
+    OrphanedPendingDrainShift {
+        fiscal_number: String,
+        shift_id_hex: String,
+        state: String,
+    },
 }
 
 fn hex32_opt(b: &Option<Vec<u8>>) -> String {
@@ -435,6 +452,39 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             fiscal_number,
             node_state_shift_state,
             shifts_state,
+        });
+    }
+
+    // 15. A′.3 PR-O3 fix (c) — orphaned pending-drain shift.  A shift resting in
+    // OpenedLocalPendingDrain / ClosingLocalPendingDrain whose ANCHOR lifecycle
+    // doc (SHIFT_OPEN for OLPD; SHIFT_CLOSE / Z_REPORT for CLPD) exists only in a
+    // terminal non-issued state (ABORTED / REJECTED / CANCELLED) — i.e. NO live
+    // anchor (PREPARED/SIGNED mid-flight, or issued OFFLINE_LOCAL_ACK/ACK).  Such
+    // a shift can never fire edge 5 / 13; fix (b) / boot SW-2 escalate it to RMR,
+    // so at a quiescent boundary this fires ONLY in the pre-escalation window
+    // (a best-effort runtime failure before the boot re-run).  Detector only.
+    let orphan_shifts: Vec<(String, Vec<u8>, String)> = sqlx::query_as(
+        "SELECT s.fiscal_number, s.shift_id, s.state \
+         FROM shifts s \
+         WHERE s.state IN ('OPENED_LOCAL_PENDING_DRAIN', 'CLOSING_LOCAL_PENDING_DRAIN') \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM fiscal_documents d \
+             WHERE d.shift_id = s.shift_id \
+               AND d.state NOT IN ('ABORTED', 'REJECTED', 'CANCELLED') \
+               AND ( \
+                     (s.state = 'OPENED_LOCAL_PENDING_DRAIN' AND d.doc_type = 'SHIFT_OPEN') \
+                  OR (s.state = 'CLOSING_LOCAL_PENDING_DRAIN' \
+                      AND d.doc_type IN ('SHIFT_CLOSE', 'Z_REPORT')) \
+               ) \
+           )",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (fiscal_number, shift_id, state) in orphan_shifts {
+        out.push(Violation::OrphanedPendingDrainShift {
+            fiscal_number,
+            shift_id_hex: hex_encode_lower(&shift_id),
+            state,
         });
     }
 
