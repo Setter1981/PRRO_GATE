@@ -223,22 +223,22 @@ struct DrainCarriers {
 }
 
 fn drain_carriers() -> DrainCarriers {
+    // B10: a drained offline session now also carries the two boundary docs
+    // (DocType=9 BEGIN minted at the first offline sell + DocType=10 END minted
+    // at drain finalize).  So the drain wire sequence is up to 4 send_chk +
+    // 4 last_chk (BEGIN + content×N + END).  Provide a generous queue.
+    let sends: Vec<_> = (0..4).map(|i| Ok(ack(&format!("DPS-DRAIN-{i}")))).collect();
+    let lasts: Vec<_> = (0..4)
+        .map(|i| {
+            Ok(CheckAck {
+                id: format!("DPS-DRAIN-{i}"),
+                id_sign: vec![],
+                data_sign: vec![(i as u8).wrapping_add(0xA0); 32],
+            })
+        })
+        .collect();
     DrainCarriers {
-        dps: Arc::new(
-            StubDpsChannel::with_queue(vec![Ok(ack("DPS-DRAIN-1")), Ok(ack("DPS-DRAIN-2"))])
-                .with_last_chk_queue(vec![
-                    Ok(CheckAck {
-                        id: "DPS-DRAIN-1".into(),
-                        id_sign: vec![],
-                        data_sign: vec![0xAAu8; 32],
-                    }),
-                    Ok(CheckAck {
-                        id: "DPS-DRAIN-2".into(),
-                        id_sign: vec![],
-                        data_sign: vec![0xBBu8; 32],
-                    }),
-                ]),
-        ),
+        dps: Arc::new(StubDpsChannel::with_queue(sends).with_last_chk_queue(lasts)),
         signing_ctx: det_signing_ctx(),
         fn_sign: CheckSignBlob(vec![0xAB, 0xCD]),
     }
@@ -348,7 +348,9 @@ async fn pilot_offline_full_drill_go_offline_sell_return_go_online_drain_converg
     .await
     .expect("offline RETURN");
     assert_eq!(ret.document_state, DocState::OfflineLocalAck);
-    assert_eq!(doc_count_in_state(app.db(), "OFFLINE_LOCAL_ACK").await, 2);
+    // B10: 3 OLA docs pre-drain — the lazy DocType=9 BEGIN (minted at the first
+    // offline SELL) + the SELL + the RETURN.
+    assert_eq!(doc_count_in_state(app.db(), "OFFLINE_LOCAL_ACK").await, 3);
     prro::db::invariant_scan::assert_clean(app.db()).await;
 
     // ─── 4) GO_ONLINE through the LIVE door (mode → GOING_ONLINE) ─────────
@@ -370,22 +372,26 @@ async fn pilot_offline_full_drill_go_offline_sell_return_go_online_drain_converg
     };
     assert_eq!(
         summary.backlog_size_before(),
-        2,
-        "2 OLA docs in the backlog"
+        3,
+        "B10: 3 OLA docs in the backlog — BEGIN + SELL + RETURN"
     );
     assert_eq!(
         summary.advanced_to_ack(),
-        2,
-        "both offline docs converge to ACK"
+        3,
+        "all 3 content-cohort offline docs converge to ACK (END is a finalize \
+         precondition, not counted in the cohort)"
     );
-    assert!(summary.finalized(), "all docs Acked → finalize Eligible");
+    assert!(
+        summary.finalized(),
+        "all content Acked + END Acked → finalize Eligible"
+    );
     drop(carriers);
 
     // ─── 6) convergence assertions ────────────────────────────────────────
     assert_eq!(
         doc_count_in_state(app.db(), "ACK").await,
-        3,
-        "SHIFT_OPEN + SELL + RETURN all ACK"
+        5,
+        "B10: SHIFT_OPEN + BEGIN + SELL + RETURN + END all ACK"
     );
     assert_eq!(
         doc_count_in_state(app.db(), "OFFLINE_LOCAL_ACK").await,
@@ -521,7 +527,12 @@ async fn combined_pilot_gate_online_and_offline_cohorts_in_one_shift() {
         ScheduledDrainOutcome::Ran(s) => s,
         ScheduledDrainOutcome::SkippedBackoff { .. } => panic!("drain must run"),
     };
-    assert_eq!(summary.advanced_to_ack(), 2, "offline cohort drains to ACK");
+    assert_eq!(
+        summary.advanced_to_ack(),
+        3,
+        "B10: offline cohort (BEGIN + SELL + RETURN) drains to ACK; END is a \
+         finalize precondition (not counted in the cohort)"
+    );
     drop(carriers);
     assert_eq!(node_row(app.db()).await.0, "ONLINE");
     assert_eq!(

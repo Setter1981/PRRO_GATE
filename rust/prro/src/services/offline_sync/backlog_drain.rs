@@ -2859,6 +2859,26 @@ async fn drive_session_end_to_ola(
         stage_sign::run(pool, deps.signing_ctx, ctx)
             .await
             .map_err(|e| BootError::Internal(format!("ensure_end: stage_sign failed: {e}")))?;
+
+        // Pool-exhausted guard: if the forced offline-code resolve found NO code
+        // (empty pool at drain — the [[project_backlog_offline_code_reserve_floor]]
+        // hazard, out of B10 scope per dossier §7), the END signed a BARE `<MAC>`
+        // (offline_dps_code IS NULL).  Shipping it would earn a DPS `-9` (the exact
+        // bug B10 fixes).  Do NOT advance it to OLA / send it — leave it SIGNED so
+        // the caller HOLDs (session stays Draining; a replenished pool + re-drain
+        // adopts the SIGNED END, acquires a code on the readback, and completes).
+        let stamped: Option<String> = sqlx::query_scalar(
+            "SELECT offline_dps_code FROM fiscal_documents WHERE document_id = ?",
+        )
+        .bind(doc.document_id)
+        .fetch_one(pool)
+        .await
+        .map_err(BootError::Database)?;
+        if stamped.is_none() {
+            // SIGNED-but-unstamped → not drainable this tick.  Return; the STEP-C
+            // caller finds no OLA/drainable END → holds → PARTIAL.
+            return Ok(());
+        }
     }
 
     // ── OLA + seed advance (direct; bypasses stage_offline_ack mode gate) ──

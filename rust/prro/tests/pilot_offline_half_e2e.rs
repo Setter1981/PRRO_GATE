@@ -335,8 +335,9 @@ async fn pilot_offline_sell_and_return_reachable_via_live_binding() {
     );
     assert_eq!(
         consumed_codes_count(app.db()).await,
-        1,
-        "SELL consumed one code"
+        2,
+        "B10: the lazy DocType=9 BEGIN (minted at the first offline SELL) + the \
+         SELL consumed two codes"
     );
 
     let ret = drive(
@@ -353,15 +354,15 @@ async fn pilot_offline_sell_and_return_reachable_via_live_binding() {
     );
     assert_eq!(
         consumed_codes_count(app.db()).await,
-        2,
-        "RETURN consumed a second code"
+        3,
+        "B10: RETURN consumed a third code (BEGIN + SELL + RETURN)"
     );
 
     // ─── 4) O1 boundary: OLA-resting docs + OPEN session, shift STILL Opened ─
     assert_eq!(
         ola_doc_count(app.db()).await,
-        2,
-        "SELL + RETURN both rest at OLA"
+        3,
+        "B10: BEGIN + SELL + RETURN all rest at OLA"
     );
     let (mode, shift) = node_row(app.db()).await;
     assert_eq!(mode, "OFFLINE");
