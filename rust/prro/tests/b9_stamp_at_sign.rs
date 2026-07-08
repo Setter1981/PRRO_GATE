@@ -531,18 +531,19 @@ async fn offline_re_sign_reuses_stamped_code_no_double_consume() {
     );
 }
 
-// ─── B9-A5 (#192): exhausted-at-sign SIGNED doc reaches the established ──────
-//     offline-ack refusal (→ Aborted terminal), never a non-terminal rest ────
+// ─── B9-A5 (#192): exhausted-at-sign SIGNED doc reaches offline-ack and ──────
+//     ABORTS terminally (unstamped bare-MAC), never a non-terminal rest ───────
 //
-// The deferral contract: an exhausted-at-sign offline doc signs online-shaped
-// (SIGNED), then `stage_offline_ack::run` refuses `CodePoolExhausted` — the
-// established #192 terminal-refusal path (the inline/boot seam then drives it
-// SIGNED→Aborted; the `teeth_p1_boot_resume_codepool_aborts` fuzzer teeth pin
-// that abort).  This proves B9 did NOT introduce a non-terminal PREPARED rest:
-// the doc flows exactly as pre-B9 (sign → offline-ack refuse → abort).
+// An exhausted-at-sign offline doc signs ONLINE-SHAPED (SIGNED, bare `<MAC>`,
+// unstamped) — it never got a code, so it can never validly drain.  At
+// offline-ack it takes the UNSTAMPED-ABORT branch (SIGNED→Aborted in-envelope)
+// — the #192 terminal-refusal outcome (Aborted end-state matches the pre-B9
+// no-code path + the fuzzer's `mint_aborted_refusal` model).  This proves B9
+// leaves NO non-terminal rest: exhausted-at-sign → SIGNED → offline-ack →
+// Aborted, all terminal-clean.
 
 #[tokio::test]
-async fn exhausted_at_sign_signed_doc_reaches_offline_ack_codepool_refusal() {
+async fn exhausted_at_sign_signed_doc_aborts_at_offline_ack() {
     use prro::services::write_path::stage_offline_ack::{self, OfflineAckOutcome, RefusalReason};
 
     let pool = fresh_pool().await;
@@ -555,30 +556,93 @@ async fn exhausted_at_sign_signed_doc_reaches_offline_ack_codepool_refusal() {
     let spy = SpyCrypto::new();
     let ctx = signing_ctx(spy.clone());
 
-    // Step 1: exhausted-at-sign → signs ONLINE-SHAPED → SIGNED (not PREPARED).
+    // Step 1: exhausted-at-sign → signs ONLINE-SHAPED → SIGNED (bare `<MAC>`,
+    // unstamped).
     let outcome = stage_sign::run(&pool, &ctx, offline_sell_worker_ctx(doc_id, req, 1))
         .await
         .expect("exhausted offline sign signs online-shaped");
     assert_eq!(outcome.document.state, DocState::Signed);
     assert_eq!(fetch_consumed_count(&pool).await, 0);
 
-    // Step 2: stage_offline_ack refuses CodePoolExhausted — the established
-    // pre-B9 terminal-refusal path (inline/boot then aborts SIGNED→Aborted;
-    // pinned by teeth_p1_boot_resume_codepool_aborts).  The doc is NOT left
-    // resting non-terminal by B9.
+    // Step 2: stage_offline_ack sees the doc is UNSTAMPED (bare `<MAC>`) →
+    // aborts it terminally IN-ENVELOPE (SIGNED→Aborted), regardless of pool
+    // state (the unstamped-abort precedes any pool interaction).
     let ack = stage_offline_ack::run(&pool, doc_id, FN)
         .await
         .expect("offline_ack run ok");
     assert!(
         matches!(
             ack,
-            OfflineAckOutcome::Refused(RefusalReason::CodePoolExhausted)
+            OfflineAckOutcome::Refused(RefusalReason::UnstampedBareMacAbort)
         ),
-        "exhausted offline-ack must refuse CodePoolExhausted (→ Abort), got: {ack:?}"
+        "exhausted-at-sign (unstamped) offline-ack must refuse+abort, got: {ack:?}"
     );
-    // Doc still SIGNED here (the Abort is the inline/boot seam's job, not
-    // stage_offline_ack's) — the key #192 point is it is NOT a PREPARED rest and
-    // the established Abort path is reachable.
-    assert_eq!(fetch_state(&pool, doc_id).await, "SIGNED");
+    assert_eq!(fetch_state(&pool, doc_id).await, "ABORTED");
     assert_eq!(fetch_consumed_count(&pool).await, 0);
+}
+
+// ─── B9-A6 (MERGE-BLOCKER FIX, RED-first + TEETH): an UNSTAMPED SIGNED offline ─
+//     doc reaching offline-ack — even WITH a session + codes available — must ──
+//     ABORT (SIGNED→Aborted), NOT become a drainable OFFLINE_LOCAL_ACK ─────────
+//
+// THE BUG (reviewer-found): a doc signed with a BARE `<MAC>` (no OPEN session at
+// sign → not stamped) that later reaches offline-ack when a session+codes DO
+// exist would, on the old acquire-fallback, get a code stamped into the DB
+// column + become a drainable OFFLINE_LOCAL_ACK — but its SIGNED BYTES stay
+// bare (offline-ack does NOT re-sign) → on drain DPS rejects `-9 "not ID in
+// MAC"`.  That re-introduces the exact bug B9 exists to fix.  Invariant:
+// stage_offline_ack produces OLA ONLY from the readback (stamped-at-sign) path;
+// any unstamped SIGNED offline doc ABORTS ⇒ every drained offline doc provably
+// carries `<MAC ID>`.
+//
+// TEETH: revert the None-branch to acquire → this doc becomes OFFLINE_LOCAL_ACK
+// with a bare-MAC → the `state == ABORTED` assert FAILS (RED).
+
+#[tokio::test]
+async fn unstamped_signed_offline_doc_aborts_at_offline_ack_even_with_session_and_codes() {
+    use prro::services::write_path::stage_offline_ack::{self, OfflineAckOutcome, RefusalReason};
+
+    let pool = fresh_pool().await;
+    seed_fn(&pool).await;
+    seed_node_state(&pool, "OFFLINE").await;
+    seed_open_session(&pool).await;
+    // Codes ARE available at offline-ack — the OLD fallback would acquire one.
+    seed_real_code(&pool, 88, "LATE-CODE").await;
+
+    // Insert a SIGNED offline doc that was NOT stamped at sign (bare `<MAC>`):
+    // the crash-resume / lease-released-between-sign-and-ack scenario.
+    let (doc_id, _req) = seed_prepared_offline_sell(&pool, 1).await;
+    sqlx::query(
+        "UPDATE fiscal_documents SET state = 'SIGNED', unsigned_xml_sha256 = ? \
+         WHERE document_id = ?",
+    )
+    .bind(vec![0xA1u8; 32])
+    .bind(doc_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ack = stage_offline_ack::run(&pool, doc_id, FN)
+        .await
+        .expect("offline_ack run ok");
+
+    // Must ABORT — NOT acquire, NOT become OFFLINE_LOCAL_ACK.
+    assert!(
+        matches!(
+            ack,
+            OfflineAckOutcome::Refused(RefusalReason::UnstampedBareMacAbort)
+        ),
+        "unstamped bare-MAC doc must refuse+abort, got: {ack:?}"
+    );
+    assert_eq!(
+        fetch_state(&pool, doc_id).await,
+        "ABORTED",
+        "unstamped bare-MAC doc must be Aborted (never a drainable OLA)"
+    );
+    // Code pool untouched — no code consumed for a doc that can't drain.
+    assert_eq!(
+        fetch_consumed_count(&pool).await,
+        0,
+        "the None-branch must NOT acquire a code (the bug); pool stays intact"
+    );
 }

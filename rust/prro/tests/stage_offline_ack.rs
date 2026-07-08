@@ -138,6 +138,53 @@ async fn insert_signed_doc(pool: &sqlx::SqlitePool, fn_id: &str, lnd: i64) -> Do
     doc_id
 }
 
+/// B9: simulate `stage_sign`'s conditional stamp-at-sign on an already-inserted
+/// SIGNED offline doc — the ONLY path that now legitimately reaches offline-ack
+/// as an `Applied` (readback).  Consumes `code_lnd` by the doc (as acquire_code_tx
+/// would at sign) AND stamps the doc's offline columns (offline_fiscal_no =
+/// code_lnd, offline_dps_code = the code's dps_code, offline_session_id).  After
+/// this, `stage_offline_ack::run` takes the readback branch → OFFLINE_LOCAL_ACK.
+async fn mark_doc_stamped_at_sign(
+    pool: &sqlx::SqlitePool,
+    doc_id: DocumentId,
+    fn_id: &str,
+    code_lnd: i64,
+    session_id: OfflineSessionId,
+) {
+    // Consume the code by the doc (mirrors acquire_code_tx at sign).
+    sqlx::query(
+        "UPDATE offline_codes SET consumed_at = CURRENT_TIMESTAMP, consumed_by_document_id = ? \
+         WHERE fiscal_number = ? AND code_lnd = ?",
+    )
+    .bind(doc_id)
+    .bind(fn_id)
+    .bind(code_lnd)
+    .execute(pool)
+    .await
+    .unwrap();
+    // Stamp the doc's offline columns (mirrors stamp_offline_issuance_tx at sign).
+    let dps_code: String = sqlx::query_scalar(
+        "SELECT dps_code FROM offline_codes WHERE fiscal_number = ? AND code_lnd = ?",
+    )
+    .bind(fn_id)
+    .bind(code_lnd)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE fiscal_documents SET offline_fiscal_no = ?, \
+             offline_fiscal_date = CURRENT_TIMESTAMP, offline_session_id = ?, \
+             offline_dps_code = ? WHERE document_id = ?",
+    )
+    .bind(code_lnd)
+    .bind(session_id)
+    .bind(&dps_code)
+    .bind(doc_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn fetch_doc_state(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
         .bind(doc_id)
@@ -188,6 +235,10 @@ async fn setup_offline_environment(pool: &sqlx::SqlitePool) -> (OfflineSessionId
     seed_offline_session(pool, FN, session_id, OfflineSessionState::Open).await;
     seed_code(pool, FN, 42).await;
     let doc_id = insert_signed_doc(pool, FN, 1).await;
+    // B9: the doc is stamped-at-sign (readback path — the only path that now
+    // reaches offline-ack as Applied).  Consumes code 42 by the doc + stamps
+    // its offline columns, so `stage_offline_ack::run` takes the readback CAS.
+    mark_doc_stamped_at_sign(pool, doc_id, FN, 42, session_id).await;
     (session_id, doc_id)
 }
 
@@ -266,6 +317,7 @@ async fn applied_path_works_with_going_offline_mode() {
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
     seed_code(&pool, FN, 1).await;
     let doc_id = insert_signed_doc(&pool, FN, 1).await;
+    mark_doc_stamped_at_sign(&pool, doc_id, FN, 1, session_id).await;
 
     let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
     assert!(matches!(outcome, OfflineAckOutcome::Applied { .. }));
@@ -400,35 +452,41 @@ async fn refusal_draining_session_returns_no_active_session() {
     assert_eq!(fetch_consumed_count(&pool, FN).await, 0);
 }
 
-// ─── Code-pool exhaustion ───────────────────────────────────────────
+// ─── Unstamped-at-sign → abort (B9 merge-blocker fix) ───────────────
+//
+// B9 replaced the offline-ack acquire fallback with an abort: a SIGNED offline
+// doc that was NOT stamped at sign (`offline_dps_code IS NULL`) carries a BARE
+// `<MAC>` and can never validly drain, so it MUST abort (SIGNED→Aborted) rather
+// than acquire a code and become a drainable OFFLINE_LOCAL_ACK.  This is the
+// successor to the former `empty_code_pool_returns_typed_code_pool_exhausted`
+// test: offline-ack no longer acquires, so an unstamped doc aborts IN-ENVELOPE
+// regardless of pool state (asserted here with an EMPTY pool; the with-codes
+// case is `unstamped_signed_offline_doc_aborts_at_offline_ack_even_with_session
+// _and_codes` in b9_stamp_at_sign.rs).
 
 #[tokio::test]
-async fn empty_code_pool_returns_typed_code_pool_exhausted_refusal() {
-    // No code seeded — `acquire_code_tx` finds the pool exhausted.  Post-fix this
-    // is a TYPED `Refused(CodePoolExhausted)` (the stage commits the refusal
-    // audit, code pool untouched) — NOT the former raw-anyhow Err that rolled
-    // back into the inline catch-all `DISPATCH_INTERNAL`.  At the STAGE level the
-    // doc stays SIGNED (the stage does not own doc cleanup); the inline
-    // orchestrator's terminalise_inbox seam aborts it → ABORTED (asserted
-    // end-to-end in `write_path_inline.rs::offline_no_code_aborts_doc_...`).
+async fn unstamped_signed_offline_doc_aborts_empty_pool() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, FN, NodeMode::Offline, ShiftState::Opened).await;
     let session_id = OfflineSessionId::new();
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
+    // No code seeded — but that no longer matters: an unstamped doc aborts
+    // BEFORE any pool interaction (offline-ack never acquires post-B9).
     let doc_id = insert_signed_doc(&pool, FN, 1).await;
 
     let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
     assert!(
         matches!(
             outcome,
-            OfflineAckOutcome::Refused(RefusalReason::CodePoolExhausted)
+            OfflineAckOutcome::Refused(RefusalReason::UnstampedBareMacAbort)
         ),
-        "expected typed Refused(CodePoolExhausted); got: {outcome:?}"
+        "expected Refused(UnstampedBareMacAbort); got: {outcome:?}"
     );
-    // Code pool untouched (the CAS acquired nothing).
+    // Code pool untouched.
     assert_eq!(fetch_consumed_count(&pool, FN).await, 0);
-    // Stage level: the doc is unchanged (SIGNED); the inline seam aborts it.
-    assert_eq!(fetch_doc_state(&pool, doc_id).await, "SIGNED");
+    // The doc is aborted TERMINALLY in-envelope (#192-safe; never a drainable
+    // bare-MAC OLA).
+    assert_eq!(fetch_doc_state(&pool, doc_id).await, "ABORTED");
 }
 
 // ─── Idempotency / conflict rollback (criterion 4 + I4 + I5) ────────
@@ -442,8 +500,10 @@ async fn second_run_after_applied_returns_err_and_does_not_double_consume() {
     seed_code(&pool, FN, 1).await;
     seed_code(&pool, FN, 2).await;
     let doc_id = insert_signed_doc(&pool, FN, 1).await;
+    // B9: doc stamped-at-sign with code 1 (readback path). code 2 is never used.
+    mark_doc_stamped_at_sign(&pool, doc_id, FN, 1, session_id).await;
 
-    // First run — Applied, consumes code_lnd=1.
+    // First run — Applied via readback, code_lnd=1 (consumed at sign).
     let first = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
     assert!(matches!(
         first,
@@ -618,6 +678,11 @@ async fn sequential_two_docs_acquire_distinct_codes() {
     seed_code(&pool, FN, 2).await;
     let doc_a = insert_signed_doc(&pool, FN, 1).await;
     let doc_b = insert_signed_doc(&pool, FN, 2).await;
+    // B9: both docs stamped-at-sign with DISTINCT codes (readback path).  The
+    // distinct-code guarantee now comes from the acquire-at-SIGN CAS; offline-ack
+    // reads each doc's own stamp back (still verifies distinctness end-to-end).
+    mark_doc_stamped_at_sign(&pool, doc_a, FN, 1, session_id).await;
+    mark_doc_stamped_at_sign(&pool, doc_b, FN, 2, session_id).await;
     // doc#2 chains off doc#1 (its previous_hash = doc#1's unsigned hash =
     // 0xA0+1), matching the seed doc#1's offline-ack advances the chain to.
     sqlx::query("UPDATE fiscal_documents SET previous_hash = ? WHERE document_id = ?")
@@ -775,6 +840,7 @@ async fn applied_path_works_with_opened_local_pending_drain_for_sell() {
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
     seed_code(&pool, FN, 42).await;
     let doc_id = insert_signed_doc_with_type(&pool, FN, 1, "SELL").await;
+    mark_doc_stamped_at_sign(&pool, doc_id, FN, 42, session_id).await;
 
     let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
     match outcome {
@@ -800,6 +866,7 @@ async fn applied_path_works_with_opened_local_pending_drain_for_return() {
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
     seed_code(&pool, FN, 43).await;
     let doc_id = insert_signed_doc_with_type(&pool, FN, 2, "RETURN").await;
+    mark_doc_stamped_at_sign(&pool, doc_id, FN, 43, session_id).await;
 
     let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
     assert!(matches!(outcome, OfflineAckOutcome::Applied { .. }));
@@ -831,6 +898,7 @@ async fn applied_path_works_with_opened_local_pending_drain_for_shift_open() {
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
     seed_code(&pool, FN, 44).await;
     let doc_id = insert_signed_doc_with_type(&pool, FN, 3, "SHIFT_OPEN").await;
+    mark_doc_stamped_at_sign(&pool, doc_id, FN, 44, session_id).await;
 
     let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
     match outcome {
@@ -862,6 +930,7 @@ async fn applied_path_works_with_closing_local_pending_drain_for_z_report() {
     seed_offline_session(&pool, FN, session_id, OfflineSessionState::Open).await;
     seed_code(&pool, FN, 55).await;
     let doc_id = insert_signed_doc_with_type(&pool, FN, 7, "Z_REPORT").await;
+    mark_doc_stamped_at_sign(&pool, doc_id, FN, 55, session_id).await;
 
     let outcome = stage_offline_ack::run(&pool, doc_id, FN).await.unwrap();
     match outcome {

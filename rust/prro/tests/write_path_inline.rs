@@ -691,7 +691,11 @@ async fn offline_no_code_aborts_doc_and_returns_typed_refusal() {
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_offline(&pool, shift_id).await;
     seed_open_offline_session(&pool).await;
-    // NO offline code seeded → acquire_code_tx returns CodePoolExhausted POST-sign.
+    // NO offline code seeded → the sell signs ONLINE-SHAPED (unstamped, bare
+    // `<MAC>` — no code at sign to stamp `<MAC ID>`), then B9's stage_offline_ack
+    // sees the doc is UNSTAMPED and aborts it terminally IN-ENVELOPE (it can never
+    // validly drain a bare-MAC doc).  Same ledger-only ABORTED end-state as the
+    // pre-B9 code-pool path, but the precise reason is now the bare-MAC abort.
     let row = seed_inbox_sell(&pool).await;
 
     let dps = DualStub::new(
@@ -714,13 +718,16 @@ async fn offline_no_code_aborts_doc_and_returns_typed_refusal() {
         "ABORTED",
         "a refused-before-issuance doc must reach the Aborted terminal, not stay SIGNED"
     );
-    // (2) typed refusal (not the catch-all DISPATCH_INTERNAL).
+    // (2) typed refusal (not the catch-all DISPATCH_INTERNAL).  B9: the doc is
+    // unstamped (bare `<MAC>`) so it aborts via the precise unstamped-bare-MAC
+    // code (500 Internal — a structural anomaly the operator re-issues past),
+    // NOT the former code-pool code (exhaustion is now handled at SIGN).
     match err {
-        FiscalError::OfflineRefused { code, .. } => assert_eq!(
-            code, "OFFLINE_CODE_POOL_EXHAUSTED",
-            "code-pool exhaustion must carry its precise typed code"
+        FiscalError::Internal { code, .. } => assert_eq!(
+            code, "OFFLINE_UNSTAMPED_BARE_MAC_ABORTED",
+            "an unstamped bare-MAC offline doc must carry its precise typed abort code"
         ),
-        other => panic!("expected OfflineRefused(OFFLINE_CODE_POOL_EXHAUSTED), got {other:?}"),
+        other => panic!("expected Internal(OFFLINE_UNSTAMPED_BARE_MAC_ABORTED), got {other:?}"),
     }
 }
 

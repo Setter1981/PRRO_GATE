@@ -85,18 +85,47 @@ async fn insert_signed_doc(pool: &sqlx::SqlitePool, lnd: i64) -> DocumentId {
     doc_id
 }
 
-/// B8-2 pin: after stage_offline_ack::run Applied, `offline_dps_code` on the
-/// doc row equals the acquired dps_code string.
-///
-/// Before migration 029 + stamp impl: column absent → RED.
-/// After: column present and stamped → GREEN.
+async fn fetch_state(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> String {
+    sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
+        .bind(doc_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// B8-2 pin (B9-updated): the opaque `offline_dps_code` reaches the doc row and
+/// SURVIVES into OFFLINE_LOCAL_ACK.  Post-B9 the stamp happens at SIGN (so the
+/// code is in the signed bytes as `<MAC ID>`), and offline-ack takes the
+/// READBACK path → OLA carrying the same code.  Here we simulate the
+/// stamp-at-sign (consume code 10 by the doc + stamp its offline columns), then
+/// assert offline-ack readback → Applied with the code preserved.
 #[tokio::test]
 async fn offline_dps_code_stamped_at_offline_local_ack() {
     let (_d, pool) = fresh_pool().await;
     seed_node_offline(&pool).await;
-    seed_open_session(&pool).await;
+    let session_id = seed_open_session(&pool).await;
     seed_real_code(&pool, 10, "STAMP-TEST-CODE").await;
     let doc_id = insert_signed_doc(&pool, 1).await;
+    // Simulate stamp-at-sign: consume the code by the doc + stamp offline columns.
+    sqlx::query(
+        "UPDATE offline_codes SET consumed_at = CURRENT_TIMESTAMP, consumed_by_document_id = ? \
+         WHERE fiscal_number = ? AND code_lnd = 10",
+    )
+    .bind(doc_id)
+    .bind(FN)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE fiscal_documents SET offline_fiscal_no = 10, \
+             offline_fiscal_date = CURRENT_TIMESTAMP, offline_session_id = ?, \
+             offline_dps_code = 'STAMP-TEST-CODE' WHERE document_id = ?",
+    )
+    .bind(session_id)
+    .bind(doc_id)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let outcome = stage_offline_ack::run(&pool, doc_id, FN)
         .await
@@ -104,24 +133,26 @@ async fn offline_dps_code_stamped_at_offline_local_ack() {
 
     assert!(
         matches!(outcome, OfflineAckOutcome::Applied { .. }),
-        "expected Applied, got: {outcome:?}"
+        "expected Applied (readback), got: {outcome:?}"
+    );
+    assert_eq!(
+        fetch_state(&pool, doc_id).await,
+        "OFFLINE_LOCAL_ACK",
+        "readback path advances SIGNED→OFFLINE_LOCAL_ACK"
     );
 
-    // B8-2 core assertion: offline_dps_code must be stamped in the SAME CAS.
+    // B8 core: the opaque dps_code is on the doc row (stamped at sign, survives OLA).
     let offline_dps_code: Option<String> =
         sqlx::query_scalar("SELECT offline_dps_code FROM fiscal_documents WHERE document_id = ?")
             .bind(doc_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-
     assert_eq!(
         offline_dps_code.as_deref(),
         Some("STAMP-TEST-CODE"),
-        "offline_dps_code must be stamped at OfflineLocalAck CAS, got: {offline_dps_code:?}"
+        "offline_dps_code must be present on the OLA doc, got: {offline_dps_code:?}"
     );
-
-    // Also confirm offline_fiscal_no is still correctly set (regression guard).
     let offline_fiscal_no: Option<i64> =
         sqlx::query_scalar("SELECT offline_fiscal_no FROM fiscal_documents WHERE document_id = ?")
             .bind(doc_id)
@@ -131,32 +162,39 @@ async fn offline_dps_code_stamped_at_offline_local_ack() {
     assert_eq!(
         offline_fiscal_no,
         Some(10),
-        "offline_fiscal_no must still be code_lnd=10"
+        "offline_fiscal_no = code_lnd=10"
     );
 }
 
-/// B8-2 exhaustion arc: CodePoolExhausted still fires correctly after B8-1+B8-2
-/// changes (regression guard — the existing exhaustion refusal arc must be
-/// unaffected by adding offline_dps_code to the stamp path).
+/// B9 (was B8-2 exhaustion arc): post-B9 an UNSTAMPED SIGNED offline doc reaching
+/// offline-ack ABORTS (SIGNED→Aborted) — it can never validly drain (bare
+/// `<MAC>`).  Offline-ack no longer acquires, so pool state is irrelevant; the
+/// abort fires regardless.  (The former `CodePoolExhausted` arc is now handled
+/// at SIGN — see tests/b9_stamp_at_sign.rs.)
 #[tokio::test]
-async fn exhaustion_refusal_arc_unaffected_by_b8_2() {
+async fn unstamped_signed_offline_doc_aborts_at_offline_ack() {
     use prro::services::write_path::stage_offline_ack::RefusalReason;
 
     let (_d, pool) = fresh_pool().await;
     seed_node_offline(&pool).await;
     seed_open_session(&pool).await;
-    // No codes seeded → CodePoolExhausted.
+    // No codes seeded — but pool state no longer matters; unstamped → abort.
     let doc_id = insert_signed_doc(&pool, 1).await;
 
     let outcome = stage_offline_ack::run(&pool, doc_id, FN)
         .await
-        .expect("run must not error on exhaustion");
+        .expect("run must not error");
 
     assert!(
         matches!(
             outcome,
-            OfflineAckOutcome::Refused(RefusalReason::CodePoolExhausted)
+            OfflineAckOutcome::Refused(RefusalReason::UnstampedBareMacAbort)
         ),
-        "expected Refused(CodePoolExhausted), got: {outcome:?}"
+        "expected Refused(UnstampedBareMacAbort), got: {outcome:?}"
+    );
+    assert_eq!(
+        fetch_state(&pool, doc_id).await,
+        "ABORTED",
+        "unstamped bare-MAC doc aborts terminally (never a drainable OLA)"
     );
 }

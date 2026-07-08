@@ -151,6 +151,20 @@ pub enum RefusalReason {
     /// refusal rather than the catch-all `DISPATCH_INTERNAL`.  The
     /// code pool is left untouched (the CAS acquired nothing).
     CodePoolExhausted,
+    /// B9 (merge-blocker fix) — the SIGNED offline doc was NOT stamped at
+    /// sign (`offline_dps_code IS NULL`), so its SIGNED BYTES carry a BARE
+    /// `<MAC>` (no `ID` attribute).  Such a doc can NEVER validly drain (DPS
+    /// `-9 "not ID in MAC"`), so it MUST NOT become a drainable
+    /// `OFFLINE_LOCAL_ACK`.  `stage_offline_ack` refuses it AND aborts it
+    /// terminally IN-ENVELOPE (`SIGNED → Aborted`, code pool untouched) — the
+    /// doc is already terminal when this refusal is returned, so neither the
+    /// inline nor the boot caller needs to abort it (both tolerate a `Refused`
+    /// whose doc is already `Aborted`).  This enforces the B9 invariant:
+    /// `stage_offline_ack` produces `OFFLINE_LOCAL_ACK` ONLY from the readback
+    /// (stamped-at-sign) path.  The pre-B9 "offline-ack acquires the code"
+    /// fallback is gone — all offline issuance stamping happens at
+    /// `stage_sign` (so the code is in the signed bytes as `<MAC ID>`).
+    UnstampedBareMacAbort,
 }
 
 /// Public entry point for the offline ack branch.
@@ -315,93 +329,96 @@ pub async fn run(
                 .await;
             }
 
-            // ─── Step 4: read active OPEN session ───────────────────
-            let session_id =
-                match offline_sessions::current_active_session_id_tx(tx, &fn_id).await? {
-                    Some(sid) => sid,
-                    None => {
-                        return audit_and_return_refused(
-                            tx,
-                            doc_id,
-                            &fn_id,
-                            RefusalReason::NoActiveSession,
-                        )
-                        .await;
-                    }
-                };
+            // ─── Step 4: gate on an active OPEN session ─────────────
+            //
+            // B9: this is now purely a GATE (its value is no longer consumed —
+            // the readback path uses the session_id stamped at SIGN).  Kept
+            // because the guard is still correct: no OPEN session at ack →
+            // `NoActiveSession` (a transient defer — the doc rests SIGNED and is
+            // retried; the reviewer-confirmed unchanged case).  It runs BEFORE
+            // the Step 6 unstamped-abort, so "no session at ack" defers, while
+            // "session present at ack but unstamped" aborts.
+            if offline_sessions::current_active_session_id_tx(tx, &fn_id)
+                .await?
+                .is_none()
+            {
+                return audit_and_return_refused(
+                    tx,
+                    doc_id,
+                    &fn_id,
+                    RefusalReason::NoActiveSession,
+                )
+                .await;
+            }
 
-            // ─── Step 6: acquire-OR-readback the offline code ───────
+            // ─── Step 6: readback-OR-abort ─────────────────────────
             //
-            // B9 Slice A (architect-ratified 2026-07-08) — the dual-path.
-            // The offline code may already have been acquired + stamped at
-            // SIGN (`stage_sign` conditional stamp-at-sign, when an OPEN
-            // session existed at sign) so it could land in the SIGNED bytes
-            // as `<MAC ID>`.  In that case the offline columns are ALREADY on
-            // the row: READ THEM BACK and do only the state CAS — do NOT
-            // acquire a second code (INV-5, consumed-once).  Otherwise (the
-            // preserved STOP-O3-1 fallback: no OPEN session at sign, SELL/
-            // RETURN soft-deferral) acquire here as before.
+            // B9 (merge-blocker fix, 2026-07-08).  The offline code+stamp is
+            // acquired at SIGN (`stage_sign` conditional stamp-at-sign, when an
+            // OPEN session existed at sign) so the opaque code is in the SIGNED
+            // BYTES as `<MAC ID>`.
             //
-            // An EXHAUSTED pool on the ACQUIRE branch is a LEGITIMATE
-            // operational refusal: surface it as a TYPED
-            // `Refused(CodePoolExhausted)` (committing the refusal audit, code
-            // pool untouched) so the inline orchestrator ABORTS the SIGNED doc
-            // + maps a precise `OFFLINE_CODE_POOL_EXHAUSTED` refusal.  (The
-            // sign-time exhaustion is a DIFFERENT path — it keeps the doc
-            // PREPARED via `SignError::OfflineCodePoolExhausted`; see the
-            // two-path note in the B9 PR.)  Any OTHER (structural) error still
-            // propagates as `Err`.
-            let (code_lnd, consumed_at, session_id_used, outcome) =
-                match fd::read_offline_stamp_tx(tx, doc_id).await? {
-                    // Readback path — stamped at sign; slim state-only CAS.
-                    Some(stamp) => {
-                        let outcome =
-                            fd::transition_signed_to_offline_local_ack_tx(tx, doc_id, &fn_id)
-                                .await?;
-                        (
-                            stamp.code_lnd,
-                            stamp.consumed_at,
-                            stamp.offline_session_id,
-                            outcome,
-                        )
-                    }
-                    // Fallback path — not stamped at sign; acquire + full stamp.
-                    None => {
-                        let acquired =
-                            match offline_sessions::acquire_code_tx(tx, &fn_id, doc_id).await {
-                                Ok(a) => a,
-                                Err(offline_sessions::OfflineSessionError::CodePoolExhausted {
-                                    ..
-                                }) => {
-                                    return audit_and_return_refused(
-                                        tx,
-                                        doc_id,
-                                        &fn_id,
-                                        RefusalReason::CodePoolExhausted,
-                                    )
-                                    .await;
-                                }
-                                Err(e) => return Err(e.into()),
-                            };
-                        // Single UPDATE stamps state + offline_fiscal_no +
-                        // offline_fiscal_date + offline_session_id +
-                        // offline_dps_code atomically (operator W7 criterion 5;
-                        // B8-2 adds dps_code).  Helper also filters on
-                        // `fiscal_number` in the WHERE clause (W7 Round 1
-                        // HIGH-2 fix).
-                        let outcome = fd::transition_to_offline_local_ack_tx(
-                            tx,
-                            doc_id,
-                            &fn_id,
-                            acquired.code_lnd,
-                            &acquired.consumed_at,
-                            session_id,
-                            &acquired.dps_code,
-                        )
-                        .await?;
-                        (acquired.code_lnd, acquired.consumed_at, session_id, outcome)
-                    }
-                };
+            //   READBACK (stamped at sign, `offline_dps_code` set): the offline
+            //   columns are already on the row — read them back and do ONLY the
+            //   slim state CAS `SIGNED → OFFLINE_LOCAL_ACK`.  Do NOT re-acquire
+            //   (INV-5, consumed-once).  This is the ONLY path that produces an
+            //   `OFFLINE_LOCAL_ACK` ⇒ every drained offline doc provably carries
+            //   `<MAC ID>` in its signed bytes.
+            //
+            //   ABORT (NOT stamped at sign, `offline_dps_code IS NULL`): the
+            //   doc's SIGNED BYTES carry a BARE `<MAC>` (no `ID`) — it can NEVER
+            //   validly drain (DPS `-9 "not ID in MAC"`).  The old fallback
+            //   here ACQUIRED a code + stamped the DB column → a drainable
+            //   `OFFLINE_LOCAL_ACK` whose signed bytes stayed bare (offline-ack
+            //   does NOT re-sign) → `-9` on drain.  That re-introduced the exact
+            //   bug B9 fixes.  So instead we ABORT it TERMINALLY IN-ENVELOPE
+            //   (`SIGNED → Aborted`, code pool untouched — mirrors the
+            //   exhaustion→Abort revision + the non-issued terminal-Abort pin
+            //   at `fiscal_documents.rs:177-182`).  In-envelope (not caller-
+            //   deferred) because the live inline caller does NOT abort refusals
+            //   (`inline.rs:834-841` only terminalises the inbox) — aborting
+            //   here guarantees the doc is terminal on BOTH the inline and boot
+            //   paths (#192: no non-terminal quiescent rest).
+            let stamp = match fd::read_offline_stamp_tx(tx, doc_id).await? {
+                Some(stamp) => stamp,
+                None => {
+                    // Unstamped bare-MAC doc → abort SIGNED→Aborted in-envelope.
+                    let aborted =
+                        fd::transition_state(tx, doc_id, DocState::Signed, DocState::Aborted)
+                            .await?;
+                    // Benign no-op if the doc already moved off SIGNED (e.g. a
+                    // prior boot already aborted it) — idempotent re-entry.
+                    let payload = json!({
+                        "document_id": hex_lower(doc_id.as_bytes()),
+                        "fiscal_number": fn_id,
+                        "from": "SIGNED",
+                        "reason": "UnstampedBareMacAbort",
+                        "rationale":
+                            "offline doc signed without an OPEN session → BARE <MAC> \
+                             (no ID) → can never validly drain (DPS -9); aborted so it \
+                             never becomes a drainable OFFLINE_LOCAL_ACK",
+                        "cas": format!("{aborted:?}"),
+                    });
+                    audit_log::append_tx(
+                        tx,
+                        "fiscal_document",
+                        &hex_lower(doc_id.as_bytes()),
+                        "OFFLINE_ACK_UNSTAMPED_ABORTED",
+                        Severity::Warning,
+                        None,
+                        Some(&payload.to_string()),
+                    )
+                    .await?;
+                    return Ok(OfflineAckOutcome::Refused(
+                        RefusalReason::UnstampedBareMacAbort,
+                    ));
+                }
+            };
+            // Readback path — stamped at sign; slim state-only CAS.
+            let outcome =
+                fd::transition_signed_to_offline_local_ack_tx(tx, doc_id, &fn_id).await?;
+            let (code_lnd, consumed_at, session_id_used) =
+                (stamp.code_lnd, stamp.consumed_at, stamp.offline_session_id);
 
             match outcome {
                 TransitionOutcome::Applied => {
