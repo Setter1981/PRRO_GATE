@@ -603,7 +603,17 @@ fn expected_for(fx: &Fixture, driven: &[&CorpusOp]) -> Expected {
 /// Drive a whole fixture and return (Expected, Observed).
 async fn replay(fx: &Fixture) -> (Expected, Observed) {
     let (driven, offline) = driven_sells(fx);
-    let codes = if offline { driven.len() as i64 } else { 0 };
+    // B10: an offline session lazily mints a DocType=9 BEGIN at the first offline
+    // doc (consumes +1 code) and a DocType=10 END at drain finalize (consumes +1
+    // code, +1 wire send).  So an offline replay needs `driven.len() + 2` codes
+    // (BEGIN + END on top of one per driven sell) and the drain sends
+    // `driven.len() + 2` docs (BEGIN + content + END).
+    let boundary_docs = if offline { 2 } else { 0 };
+    let codes = if offline {
+        driven.len() as i64 + boundary_docs
+    } else {
+        0
+    };
     let mode = if offline {
         NodeMode::Offline
     } else {
@@ -617,8 +627,8 @@ async fn replay(fx: &Fixture) -> (Expected, Observed) {
             .unwrap_or_else(|e| panic!("{}: drive op {} failed: {e}", fx.name, op.op_index));
     }
     if offline {
-        // OLA → ACK via the real drain (WebCheck "drained").
-        h.drain_backlog(driven.len())
+        // OLA → ACK via the real drain (WebCheck "drained").  BEGIN + content + END.
+        h.drain_backlog(driven.len() + boundary_docs as usize)
             .await
             .unwrap_or_else(|e| panic!("{}: drain failed: {e}", fx.name));
     }
