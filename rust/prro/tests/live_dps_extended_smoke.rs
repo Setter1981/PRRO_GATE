@@ -76,7 +76,7 @@ use prro::config::AppConfig;
 use prro::crypto::in_process::InProcessProvider;
 use prro::crypto::provider::CryptoProvider;
 use prro::crypto::session::SigningSession;
-use prro::db::models::ids::DocumentId;
+use prro::db::models::ids::{DocumentId, ShiftId};
 use prro::db::repositories::signing_config_snapshots;
 use prro::db::tx::with_immediate;
 use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
@@ -702,7 +702,6 @@ async fn seed_fn_config_piece4(pool: &SqlitePool, fn_id: &str) {
 /// Seed an OPENED shift + ONLINE node_state (next_lnd=1, b1/t1 profiles).
 /// Mirrors `write_path_deterministic_replay::seed_open_shift_and_node`.
 async fn seed_open_shift_and_node_piece4(pool: &SqlitePool, fn_id: &str) {
-    use prro::db::models::ids::ShiftId;
     let shift_id = ShiftId::new();
     sqlx::query(
         "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, cash_balance_kop, opened_by_cashier_id) \
@@ -1964,40 +1963,50 @@ async fn live_smoke_8_ask_offline_codes() {
 // (INV-11 blocker, proven live + against WebCheck).  This smoke proves the
 // drain is now ACCEPTED.
 //
-// It drives the FULL offline path through the REAL production write-path — no
-// hand-seeding of `fs_mode`/`offline_dps_code` on the doc (that is exactly what
-// B9's `stage_sign` stamp-at-sign is supposed to do itself):
+// This is the REAL M3b Pattern-C offline flow: the shift itself is opened
+// OFFLINE with a reserve code (NOT online) — there is NO online SHIFT_OPEN and
+// no DPS shift-open call before going offline.  Both the offline SHIFT_OPEN and
+// the offline SELL are drained together after coming back online.  No
+// hand-seeding of `offline_dps_code`/`<MAC ID>` on the docs (that is exactly
+// what B9's `stage_sign` stamp-at-sign fills itself):
 //
-//   1. LIVE T=112 ASK_OFFLINE_CODES (smoke-8 model) → extract ONE REAL
-//      DPS-issued opaque `<ID>` offline code.  The `<MAC ID>` MUST be a real
-//      DPS code, so we seed the pool from the wire, not a synthetic value.
-//   2. `offline_sessions::insert_dps_codes_tx` → the real code lands in the
-//      `offline_codes` pool (the T=112 / migration-028 `dps_code` column).
-//   3. `admin::go_offline` → node OFFLINE + an OPEN offline session (the
-//      production surface; requires node ONLINE first).
-//   4. A PREPARED **offline-origin** (`fs_mode='OFFLINE'`) SELL doc is driven
-//      through `reconcile_pending_with`.  Node is OFFLINE + session OPEN +
-//      pool non-empty, so `stage_sign`'s conditional stamp-at-sign
-//      (`resolve_offline_dps_code`) acquires the real code and emits
-//      `<MAC ID='{code}'>` in the SIGNED bytes; `stage_offline_ack` drives the
-//      doc to `OFFLINE_LOCAL_ACK`.  NO DPS contact on this leg (stub channel).
-//   5. `admin::go_online` → the backlog is drainable.
-//   6. `App::drain_offline_backlog_scheduled` re-sends the `<MAC ID>`-stamped
-//      SIGNED doc to LIVE DPS.
-//   7. **ACCEPTANCE ASSERT:** the drained doc reaches an accepted terminal
-//      (`SENT`/`KVT1`/`KVT2`/`ACK`) and is NOT rejected with `-9`
-//      "not ID in MAC" (the pre-B9 failure).  The DPS response / trace is
-//      printed for evidence.
+//   1. Seed the offline-shift SCAFFOLDING edge-2 would leave (an OFFLINE
+//      `OpenedLocalPendingDrain` shift + `node_state` pointing at it) — required
+//      because the seeded-PREPARED reconcile path SKIPS `stage_acquire`.  Both
+//      docs share this ONE `shift_id`.
+//   2. LIVE T=112 ASK_OFFLINE_CODES with SIZE=2 → extract TWO REAL DPS-issued
+//      opaque `<ID>` codes (one for the offline SHIFT_OPEN, one for the SELL).
+//      `insert_dps_codes_tx` lands both in the `offline_codes` pool.
+//   3. `seed_prevhash(sha256(t112_xml))` + a settle-poll (DPS advances its chain
+//      tip lazily after T=112; wait until `lastChk` tip == that hash so a
+//      back-to-back drain doesn't race it into `-15 ERROR_BAD_HASH_PREV`).
+//   4. `admin::go_offline` → node OFFLINE + OPEN session (MODE-ONLY; preserves
+//      the seeded `shift_state`).
+//   5. Two PREPARED `fs_mode='OFFLINE'` docs — SHIFT_OPEN (lnd=1) then SELL
+//      (lnd=2), SAME `shift_id` — are driven through `reconcile_pending_with`.
+//      Node OFFLINE ⇒ `dispatch_post_sign` routes to `stage_offline_ack` (NO
+//      wire); `stage_sign` stamp-at-sign acquires ONE real code per doc and
+//      emits `<MAC ID='{code}'>` in the SIGNED bytes; each reaches
+//      `OFFLINE_LOCAL_ACK` and advances the local MAC chain doc-to-doc.  NO DPS
+//      contact on this leg (stub channel — it panics if any method is touched).
+//   6. `admin::go_online` → `GoingOnline`; the backlog is drainable.
+//   7. `App::drain_offline_backlog_scheduled` drains the backlog in `lnd ASC`
+//      order — SHIFT_OPEN FIRST (opens the DPS shift), then SELL (into the now-
+//      open shift) — re-sending each `<MAC ID>`-stamped SIGNED doc to LIVE DPS.
+//   8. **ACCEPTANCE ASSERT:** BOTH drained docs reach an accepted terminal
+//      (`SENT`/`KVT1`/`KVT2`/`ACK`), NOT `-9` "not ID in MAC" (pre-B9) and NOT
+//      `-15` (bad-hash-prev / no open shift).  DPS trace printed for evidence.
 //
 // Gate: feature `live-dps` + `#[ignore]` + `PRRO_LIVE_DPS=1` + real JKS (this
 // CONTACTS live DPS on the T=112 fetch AND the drain, so the full triple gate
 // applies).
 
-/// Stub `DpsChannel` for the OFFLINE reconcile leg (step 4): node is OFFLINE,
-/// so `send_or_offline` takes the OFFLINE branch and NEVER touches the wire.
-/// Every method panics — proving the offline reconcile consults NO DPS method
-/// (the stamp-at-sign + offline-ack are pure-local).  The LIVE drain (step 6)
-/// uses the real `GrpcDpsChannel`, not this stub.
+/// Stub `DpsChannel` for the OFFLINE reconcile leg (step 5): node is OFFLINE,
+/// so `dispatch_post_sign` routes to `stage_offline_ack` and NEVER touches the
+/// wire.  Every method panics — proving the offline reconcile consults NO DPS
+/// method (the stamp-at-sign + offline-ack are pure-local; both the SHIFT_OPEN
+/// and SELL local-ack without any `send_chk`/`last_chk`).  The LIVE drain
+/// (step 7) uses the real `GrpcDpsChannel`, not this stub.
 struct StubOfflineAckDps;
 
 #[async_trait]
@@ -2031,50 +2040,98 @@ impl DpsChannel for StubOfflineAckDps {
     }
 }
 
-/// Seed a PREPARED **offline-origin** extended-SELL doc.  Identical shape to
-/// `seed_extended_sell_prepared` (driver 5→TX=1, 7→TX=2, excise, UKTZED, the
-/// snapshot FK) EXCEPT `fs_mode='OFFLINE'` is set at insert time — the doc is
-/// legitimately offline-origin, exactly what production `stage_acquire` writes
-/// from the node mode when a doc is minted while OFFLINE.  This is the ONLY
-/// offline fact seeded on the doc: `offline_dps_code` / `offline_session_id` /
-/// `<MAC ID>` are all left for the real B9 `stage_sign` stamp-at-sign to fill
-/// (the whole point of this acceptance test).  Mirrors `seed_extended_sell_
-/// prepared` for the shift-FK resolution.
-async fn seed_extended_sell_prepared_offline(
-    pool: &SqlitePool,
-    fn_id: &str,
-    doc_byte: u8,
-    snapshot_id: i64,
-    business_ts: &str,
-) -> (DocumentId, [u8; 16]) {
-    let shift_byte = doc_byte ^ 0x80;
-    let shift_bytes = vec![shift_byte; 16];
+/// Seed the SCAFFOLDING that the production offline SHIFT_OPEN acquire edge
+/// (edge 2, `stage_acquire`) would leave behind — replicated by hand because
+/// the smoke drives seeded PREPARED docs through `reconcile_pending_with`,
+/// which SKIPS `stage_acquire`.  Mirrors `offline_lifecycle_orphan_recovery.rs`:
+///   - an OFFLINE `OpenedLocalPendingDrain` shift row (`shift_id`),
+///   - a `node_state` row ONLINE (so `go_offline` can flip it; go_offline is
+///     MODE-ONLY and preserves `shift_state`) with `shift_state =
+///     OpenedLocalPendingDrain` + `current_shift_id = shift_id`, `next_lnd = 3`
+///     (docs use lnd 1/2).
+/// Both the offline SHIFT_OPEN and the offline SELL are then seeded with THIS
+/// `shift_id`, so they belong to one shift.  This is shift-state scaffolding
+/// ONLY — the MAC chain is still built by the real write-path doc-to-doc.
+async fn seed_offline_olpd_shift_and_node(pool: &SqlitePool, fn_id: &str, shift_id: ShiftId) {
     sqlx::query(
-        "INSERT OR IGNORE INTO shifts(shift_id, fiscal_number, serial, state, open_mode, \
+        "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, \
             cash_balance_kop, opened_by_cashier_id) \
-         VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
+         VALUES (?, ?, 1, 'OPENED_LOCAL_PENDING_DRAIN', 'OFFLINE', 0, 'test-cashier')",
     )
-    .bind(&shift_bytes)
+    .bind(shift_id)
     .bind(fn_id)
     .execute(pool)
     .await
     .unwrap();
-
-    // Resolve whichever OPENED shift actually landed for this FN (the partial
-    // UNIQUE `ux_shifts_one_open_per_fn` may swallow the INSERT OR IGNORE when a
-    // prior seeder already opened a different shift_id) so the FK is satisfied.
-    let actual_shift_id: Vec<u8> = sqlx::query_scalar(
-        "SELECT shift_id FROM shifts WHERE fiscal_number = ? AND state = 'OPENED' LIMIT 1",
+    sqlx::query(
+        "INSERT INTO node_state (fiscal_number, mode, shift_state, current_shift_id, \
+            next_lnd, backend_profile_id, transport_profile_id) \
+         VALUES (?, 'ONLINE', 'OPENED_LOCAL_PENDING_DRAIN', ?, 3, 'b1', 't1')",
     )
     .bind(fn_id)
-    .fetch_one(pool)
+    .bind(shift_id)
+    .execute(pool)
     .await
-    .expect("seed_extended_sell_prepared_offline: no OPENED shift after INSERT OR IGNORE");
+    .unwrap();
+}
 
+/// Seed a PREPARED **offline** SHIFT_OPEN doc bound to `shift_id` at the given
+/// `lnd`.  `fs_mode='OFFLINE'`; `signed_by_cashier_id='test-cashier'` matches
+/// the seeded shift's `opened_by_cashier_id`.  No snapshot FK (SHIFT_OPEN does
+/// not translate tax).  `offline_dps_code` / `offline_session_id` / `<MAC ID>`
+/// are left for B9 `stage_sign` stamp-at-sign.
+async fn seed_offline_shift_open_prepared(
+    pool: &SqlitePool,
+    fn_id: &str,
+    doc_byte: u8,
+    shift_id: ShiftId,
+    lnd: i64,
+    business_ts: &str,
+) -> (DocumentId, [u8; 16]) {
     let doc_bytes = vec![doc_byte; 16];
     let req_bytes = vec![doc_byte ^ 0xFF; 16];
     let sha = vec![0u8; 32];
-    let lnd = doc_byte as i64;
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
+            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            total_sum_kop, payload_json, payload_sha256_canonical, signed_by_cashier_id) \
+         VALUES (?, ?, ?, ?, ?, 'SHIFT_OPEN', 'PREPARED', 'b1', 't1', 'OFFLINE', \
+            ?, 0, ?, ?, 'test-cashier')",
+    )
+    .bind(&doc_bytes)
+    .bind(&req_bytes)
+    .bind(fn_id)
+    .bind(shift_id)
+    .bind(lnd)
+    .bind(business_ts)
+    .bind(SHIFT_OPEN_PAYLOAD_JSON)
+    .bind(&sha)
+    .execute(pool)
+    .await
+    .unwrap();
+    let doc_id = DocumentId::from_bytes(<[u8; 16]>::try_from(doc_bytes.as_slice()).unwrap());
+    let req_arr: [u8; 16] = <[u8; 16]>::try_from(req_bytes.as_slice()).unwrap();
+    (doc_id, req_arr)
+}
+
+/// Seed a PREPARED **offline** extended-SELL doc bound to `shift_id` (the SAME
+/// shift the offline SHIFT_OPEN opened) at the given `lnd`.  Same extended
+/// surface as `seed_extended_sell_prepared` (driver 5→TX=1, 7→TX=2, excise,
+/// UKTZED, snapshot FK) but `fs_mode='OFFLINE'` and an EXPLICIT shared shift_id
+/// (no OPENED-shift resolution — the shift is the seeded OLPD one).  Offline
+/// stamp columns left for B9 stage_sign stamp-at-sign.
+async fn seed_offline_sell_prepared_in_shift(
+    pool: &SqlitePool,
+    fn_id: &str,
+    doc_byte: u8,
+    shift_id: ShiftId,
+    lnd: i64,
+    snapshot_id: i64,
+    business_ts: &str,
+) -> (DocumentId, [u8; 16]) {
+    let doc_bytes = vec![doc_byte; 16];
+    let req_bytes = vec![doc_byte ^ 0xFF; 16];
+    let sha = vec![0u8; 32];
     sqlx::query(
         "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
             doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
@@ -2086,7 +2143,7 @@ async fn seed_extended_sell_prepared_offline(
     .bind(&doc_bytes)
     .bind(&req_bytes)
     .bind(fn_id)
-    .bind(&actual_shift_id)
+    .bind(shift_id)
     .bind(lnd)
     .bind(business_ts)
     .bind(EXTENDED_SELL_TOTAL_SUM_KOP)
@@ -2167,99 +2224,45 @@ async fn live_smoke_9_offline_drain_mac_id() {
         }
     }
 
-    // ── Step 2: boot throwaway App + seed ONLINE node ──────────────────────
-    println!("\n--- SEEDING APP ---");
+    // ── Step 2: boot throwaway App + seed an OFFLINE OPEN-PENDING-DRAIN shift ──
+    // Pattern C: a shift is opened OFFLINE using reserve/offline codes — NOT
+    // online.  There is NO online SHIFT_OPEN and NO DPS shift-open call here;
+    // the shift is opened LOCALLY by the offline SHIFT_OPEN doc (drained later).
+    //
+    // The production edge-2 (offline SHIFT_OPEN at `stage_acquire`) mints the
+    // shift as CREATED and drives it to `OpenedLocalPendingDrain`, binding the
+    // doc's shift_id + setting `node_state.shift_state`/`current_shift_id`.  But
+    // the smoke drives seeded PREPARED docs through `reconcile_pending_with`,
+    // which SKIPS `stage_acquire` — so we must replicate edge-2's SCAFFOLDING by
+    // hand (exactly as every offline-lifecycle test does; e.g.
+    // `offline_lifecycle_orphan_recovery.rs`): an OFFLINE `OpenedLocalPendingDrain`
+    // shift row + a `node_state` pointing at it in that state.  Both the offline
+    // SHIFT_OPEN and the offline SELL are seeded with THIS SAME `shift_id`, so
+    // they belong to ONE shift (dissolving the earlier separate-shift decoupling).
+    //
+    // We hand-seed only the shift-state SCAFFOLDING (which acquire owns) — NOT
+    // the MAC chain: the offline SHIFT_OPEN chains off the post-T=112 node_state
+    // seed and the SELL chains off the SHIFT_OPEN's hash, all advanced doc-to-doc
+    // by the real write-path (`stage_sign` pins `previous_hash` from node_state;
+    // `stage_offline_ack` advances the seed).  node_state starts ONLINE because
+    // `go_offline` requires mode==ONLINE and is MODE-ONLY (it preserves the
+    // seeded `shift_state`, admin.rs Frozen #3).
+    println!("\n--- SEEDING APP (offline OpenedLocalPendingDrain shift) ---");
     let (_dir, app) = boot_offline_app().await;
     let pool = app.db();
     seed_fn_config_live(pool, &fiscal_number).await;
-    // go_offline requires node_state.mode == ONLINE — seed OPENED shift + ONLINE.
-    seed_open_shift_and_node_piece4(pool, &fiscal_number).await;
+    let offline_shift_id = ShiftId::new();
+    seed_offline_olpd_shift_and_node(pool, &fiscal_number, offline_shift_id).await;
     match seed_mac_from_lastchk(pool, &fiscal_number, &pre_ack).await {
         Some(hex) => println!("  pre-T112 MAC seeded into node_state: {hex}"),
         None => println!("  FN genesis (empty data_sign) — pre-T112 MAC is empty"),
     }
 
-    // ── Step 2b: open a REAL DPS shift (crux — mirrors live_smoke_5b) ───────
-    // The offline SELL drain needs an OPEN shift ON DPS, else DPS rejects it
-    // with `-15` (no-shift).  The smoke's fresh in-memory DB only holds a LOCAL
-    // shift (seeded above for the SELL's shift_id FK); DPS knows nothing about
-    // it.  So drive a REAL SHIFT_OPEN through the production write-path FIRST:
-    // this (a) OPENS the shift server-side and (b) — via advance-at-SEND —
-    // advances `node_state.last_known_unsigned_xml_sha256` to sha256(the
-    // SHIFT_OPEN's unsigned canonical XML), so the T=112 request that follows
-    // chains off the SHIFT_OPEN hash automatically (its builder reads
-    // node_state; see Step 3's `pre_mac_hex`).  We MUST let the write-path
-    // advance the seed here — NOT hand-seed a hash — so the live chain is real.
-    //
-    // Local shift-state is intentionally NOT wired for an online SHIFT_OPEN
-    // (the M4 gap): a seeded PREPARED SHIFT_OPEN (shift_id NULL) driven through
-    // `reconcile_pending_with` skips `stage_acquire`, so NO local `shifts` row
-    // is created/transitioned — `confirm_shift_edge` no-ops on a NULL shift_id.
-    // Hence the offline SELL keeps referencing its OWN seeded OPENED shift
-    // (above); DPS-side and local shift tracking are decoupled by design.
-    println!("\n--- STEP 2b: LIVE SHIFT_OPEN (open the DPS shift + advance chain) ---");
-    {
-        let shift_business_ts = iso_now();
-        let (shift_doc, shift_req_id) =
-            seed_shift_open_prepared(pool, &fiscal_number, 0x5A, &shift_business_ts).await;
-        seed_inbox_processing_generic(
-            pool,
-            &fiscal_number,
-            &shift_req_id,
-            "SHIFT_OPEN",
-            SHIFT_OPEN_PAYLOAD_JSON,
-        )
-        .await;
-
-        let shift_signing_ctx = live_signing_ctx(&ek);
-        let shift_drive_fn_sign = sign_fn_blob(&ek, &fiscal_number);
-        let shift_deps = ReconciliationRuntime::single_fn(RuntimeView {
-            dps: &channel,
-            signing_ctx: &shift_signing_ctx,
-            fn_sign: &shift_drive_fn_sign,
-        });
-        app.reconcile_pending_with(shift_deps)
-            .await
-            .expect("reconcile_pending_with (LIVE SHIFT_OPEN) must succeed");
-
-        let shift_state = doc_state_piece4(pool, shift_doc).await;
-        let shift_sfn: Option<String> = sqlx::query_scalar(
-            "SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?",
-        )
-        .bind(shift_doc)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        println!("  SHIFT_OPEN post-reconcile: state={shift_state} server_fiscal_no={shift_sfn:?}");
-        print_live_diagnostics(pool, shift_doc).await;
-        assert_eq!(
-            shift_state, "SENT",
-            "LIVE SHIFT_OPEN must reach SENT (DPS ACK) so the DPS shift is OPEN for the offline \
-             drain — else the drain draws `-15` (no open shift). Diagnostics above carry the DPS \
-             code if it did not (e.g. -12 MAC / -8 date / -14 signer)."
-        );
-        assert!(
-            shift_sfn.is_some(),
-            "the LIVE SHIFT_OPEN ACK must populate server_fiscal_no (the DPS-assigned receipt id)"
-        );
-        // advance-at-SEND has moved node_state.last_known_unsigned_xml_sha256 to
-        // sha256(shift_open_xml); the T=112 builder below reads it as its <MAC>
-        // previous-hash, so the chain extends SHIFT_OPEN → T=112 automatically.
-        let after_shift_mac: Option<String> = {
-            let ns = node_state::get(pool, &fiscal_number)
-                .await
-                .expect("node_state row must exist")
-                .expect("node_state row present");
-            ns.last_known_unsigned_xml_sha256.map(|arr| hex_lower(&arr))
-        };
-        println!(
-            "  node_state MAC after SHIFT_OPEN advance-at-SEND: {after_shift_mac:?} \
-             (T=112 chains off this)"
-        );
-    }
-
-    // ── Step 3: fetch ONE real T=112 opaque offline code (smoke-8 model) ───
-    println!("\n--- T=112 FETCH (1 code) ---");
+    // ── Step 3: fetch TWO real T=112 opaque offline codes (SHIFT_OPEN + SELL) ──
+    // Pattern C needs TWO codes: one consumed by the offline SHIFT_OPEN's
+    // `<MAC ID>`, one by the offline SELL's.  `stage_sign` acquires exactly ONE
+    // code per doc from the pool (sequential CAS), so both must be in the pool.
+    println!("\n--- T=112 FETCH (2 codes: 1 for SHIFT_OPEN, 1 for SELL) ---");
     let t112_di: i64 = std::env::var("PRRO_LIVE_DPS_T112_DI")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -2279,11 +2282,11 @@ async fn live_smoke_9_offline_drain_mac_id() {
         &fiscal_number,
         tn,
         t112_di as u32,
-        1, // request 1 code
+        2, // request 2 codes: 1 for the offline SHIFT_OPEN, 1 for the offline SELL
         prro::transports::dps::t112::kyiv_comp_date_now(),
         &pre_mac_hex,
     )
-    .expect("T=112 request builder must succeed for size=1");
+    .expect("T=112 request builder must succeed for size=2");
     println!("  T=112 XML: {}", t112_req.xml);
 
     // Sign the T=112 XML with the live operator key (ATTACHED CAdES-BES).
@@ -2319,8 +2322,10 @@ async fn live_smoke_9_offline_drain_mac_id() {
         id_cancel: String::new(),
     };
 
-    // Send T=112 and parse the REAL opaque code from the `<ID>` element.
-    let real_opaque_code: String = match channel.send_chk(t112_envelope).await {
+    // Send T=112 and parse the REAL opaque codes from the `<ID>` elements.
+    // Pattern C needs TWO codes (SHIFT_OPEN + SELL).  Parse ALL `<ID>` children
+    // and require at least 2; DPS returns one `<ID>` per issued reserve code.
+    let real_opaque_codes: Vec<String> = match channel.send_chk(t112_envelope).await {
         Ok(ack) => {
             println!(
                 "  T=112 DPS OK: id={:?} data_sign={} bytes",
@@ -2329,7 +2334,7 @@ async fn live_smoke_9_offline_drain_mac_id() {
             );
             if ack.data_sign.is_empty() {
                 println!(
-                    "Smoke 9 SKIP: T=112 returned an empty data_sign — no offline code \
+                    "Smoke 9 SKIP: T=112 returned an empty data_sign — no offline codes \
                           issued (cannot seed a REAL <MAC ID>). Re-run when DPS issues codes."
                 );
                 return;
@@ -2339,32 +2344,32 @@ async fn live_smoke_9_offline_drain_mac_id() {
                 Err(e) => {
                     println!(
                         "Smoke 9 SKIP: T=112 data_sign is not a CMS blob ({e}) — cannot \
-                              extract a REAL offline code. Re-run when DPS issues codes."
+                              extract REAL offline codes. Re-run when DPS issues codes."
                     );
                     return;
                 }
             };
             let inner_xml = String::from_utf8_lossy(&inner_bytes);
             println!("  T=112 response inner XML: {inner_xml}");
-            match inner_xml
+            // Extract every `<ID>…</ID>` payload in document order.
+            let codes: Vec<String> = inner_xml
                 .split("<ID>")
-                .nth(1)
-                .and_then(|s| s.split("</ID>").next())
+                .skip(1)
+                .filter_map(|s| s.split("</ID>").next())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-            {
-                Some(c) => {
-                    println!("  REAL OPAQUE OFFLINE CODE: {c:?}");
-                    c
-                }
-                None => {
-                    println!(
-                        "Smoke 9 SKIP: no <ID> offline code in the T=112 response — nothing \
-                              to seed as <MAC ID>. Re-run when DPS issues codes."
-                    );
-                    return;
-                }
+                .collect();
+            println!("  REAL OPAQUE OFFLINE CODES ({}): {codes:?}", codes.len());
+            if codes.len() < 2 {
+                println!(
+                    "Smoke 9 SKIP: T=112 issued only {} offline code(s) — Pattern C needs 2 \
+                          (one for the offline SHIFT_OPEN, one for the SELL). Re-run when DPS \
+                          issues at least 2 codes (or raise PRRO_LIVE_DPS_T112_DI).",
+                    codes.len()
+                );
+                return;
             }
+            codes
         }
         Err(DpsError::Server { code: -4, message }) => {
             println!("Smoke 9 SKIP: DPS rate-limit (-4) on T=112: {message}. Cool down 5+ min.");
@@ -2385,14 +2390,16 @@ async fn live_smoke_9_offline_drain_mac_id() {
         }
     };
 
-    // ── Step 4: seed the code pool + advance node_state MAC past the T=112 ──
-    // The T=112 request advanced the DPS chain; the offline SELL's `<MAC>`
+    // ── Step 4: seed the code pool (both codes) + advance node_state MAC ─────
+    // The T=112 request advanced the DPS chain; the offline SHIFT_OPEN's `<MAC>`
     // previous-hash must chain off sha256(t112_xml) so the drained receipt is
-    // MAC-consistent with what DPS expects.
+    // MAC-consistent with what DPS expects.  Both REAL codes go into the pool;
+    // `stage_sign` acquires them one-per-doc (SHIFT_OPEN → code[0], SELL →
+    // code[1]) via sequential CAS.
     {
         use prro::db::repositories::offline_sessions;
         let fn_owned = fiscal_number.clone();
-        let codes = vec![real_opaque_code.clone()];
+        let codes = real_opaque_codes.clone();
         let summary = with_immediate(pool, move |tx| {
             Box::pin(async move {
                 offline_sessions::insert_dps_codes_tx(tx, &fn_owned, &codes)
@@ -2403,12 +2410,15 @@ async fn live_smoke_9_offline_drain_mac_id() {
         .await
         .expect("insert_dps_codes_tx");
         println!(
-            "  offline_codes pool: inserted={} deduped={} (real dps_code)",
+            "  offline_codes pool: inserted={} deduped={} (real dps_codes)",
             summary.inserted, summary.deduped
         );
-        assert_eq!(
-            summary.inserted, 1,
-            "the REAL T=112 offline code must be inserted into the pool"
+        assert!(
+            summary.inserted >= 2,
+            "at least 2 REAL T=112 offline codes must be inserted into the pool (got inserted={}, \
+             deduped={})",
+            summary.inserted,
+            summary.deduped
         );
     }
     let post_t112_seed: [u8; 32] = Sha256::digest(t112_req.xml.as_bytes()).into();
@@ -2500,7 +2510,14 @@ async fn live_smoke_9_offline_drain_mac_id() {
     .unwrap_or_else(|e| panic!("Smoke 9 FAIL: go_offline: {e:?}"));
     println!("  go_offline: node OFFLINE, offline_session OPEN");
 
-    // ── Step 6: seed a PREPARED offline-origin SELL + inbox ────────────────
+    // ── Step 6: seed the PREPARED offline SHIFT_OPEN + SELL, sharing ONE shift ──
+    // Both docs are `fs_mode='OFFLINE'` and carry the SAME `shift_id`
+    // (`offline_shift_id`, the seeded OpenedLocalPendingDrain shift), so they
+    // belong to one shift.  lnd is sequential (SHIFT_OPEN=1 < SELL=2) so the
+    // drain (ORDER BY lnd) sends SHIFT_OPEN first.  The SELL carries the pinned
+    // dual-mapping snapshot (driver 5→TX=1, 7→TX=2).  `offline_dps_code` /
+    // `offline_session_id` / `<MAC ID>` are all left for B9 stage_sign
+    // stamp-at-sign to fill — the point of this acceptance test.
     let snapshot = dual_mapping_snapshot();
     let fn_snap = fiscal_number.clone();
     let snapshot_id = with_immediate(pool, move |tx| {
@@ -2518,21 +2535,57 @@ async fn live_smoke_9_offline_drain_mac_id() {
     .await
     .expect("insert signing_config_snapshot for smoke 9");
 
-    let business_ts = iso_now();
-    let (doc_id, req_id) =
-        seed_extended_sell_prepared_offline(pool, &fiscal_number, 0x19, snapshot_id, &business_ts)
-            .await;
-    seed_inbox_processing_for_sell_piece4(pool, &fiscal_number, &req_id).await;
+    // Offline SHIFT_OPEN (lnd=1) — opens the shift LOCALLY; drains FIRST.
+    let shift_open_ts = iso_now();
+    let (shift_open_doc, shift_open_req) = seed_offline_shift_open_prepared(
+        pool,
+        &fiscal_number,
+        0x18,
+        offline_shift_id,
+        1,
+        &shift_open_ts,
+    )
+    .await;
+    seed_inbox_processing_generic(
+        pool,
+        &fiscal_number,
+        &shift_open_req,
+        "SHIFT_OPEN",
+        SHIFT_OPEN_PAYLOAD_JSON,
+    )
+    .await;
     println!(
-        "  PREPARED offline-origin SELL seeded (fs_mode=OFFLINE): doc_id={}",
-        hex_lower(doc_id.as_bytes())
+        "  PREPARED offline SHIFT_OPEN seeded (fs_mode=OFFLINE, lnd=1, shift={}): doc_id={}",
+        hex_lower(offline_shift_id.as_bytes()),
+        hex_lower(shift_open_doc.as_bytes())
     );
 
-    // ── Step 7: reconcile OFFLINE — stage_sign stamps <MAC ID>, then offline-ack ──
-    // Node OFFLINE + OPEN session + pool non-empty → stage_sign's conditional
-    // stamp-at-sign acquires the REAL code and emits `<MAC ID='{code}'>` in the
-    // SIGNED bytes; stage_offline_ack drives PREPARED→SIGNED→OFFLINE_LOCAL_ACK.
-    // NO DPS contact here (stub panics on every method).
+    // Offline SELL (lnd=2) — into the SAME shift; drains SECOND.
+    let sell_ts = iso_now();
+    let (sell_doc, sell_req) = seed_offline_sell_prepared_in_shift(
+        pool,
+        &fiscal_number,
+        0x19,
+        offline_shift_id,
+        2,
+        snapshot_id,
+        &sell_ts,
+    )
+    .await;
+    seed_inbox_processing_for_sell_piece4(pool, &fiscal_number, &sell_req).await;
+    println!(
+        "  PREPARED offline SELL seeded (fs_mode=OFFLINE, lnd=2, same shift): doc_id={}",
+        hex_lower(sell_doc.as_bytes())
+    );
+
+    // ── Step 7: reconcile OFFLINE — stamp <MAC ID> per doc, then offline-ack ──
+    // Node OFFLINE + shift OpenedLocalPendingDrain + OPEN session + pool has 2
+    // codes → for EACH doc (SHIFT_OPEN first by lnd, then SELL) stage_sign's
+    // stamp-at-sign acquires ONE real code and emits `<MAC ID='{code}'>` in the
+    // SIGNED bytes; stage_offline_ack drives PREPARED→SIGNED→OFFLINE_LOCAL_ACK
+    // and advances the local MAC chain doc-to-doc (SHIFT_OPEN chains off the
+    // post-T112 seed; SELL chains off the SHIFT_OPEN's hash).  NO DPS contact
+    // (stub panics on every method — nothing is SENT/online here).
     let signing_ctx = live_signing_ctx(&ek);
     let offline_fn_sign = CheckSignBlob(vec![0xDE, 0xAD, 0xBE, 0xEF]); // unused by the stub
     let stub_dps = StubOfflineAckDps;
@@ -2545,59 +2598,65 @@ async fn live_smoke_9_offline_drain_mac_id() {
         .await
         .expect("reconcile_pending_with (OFFLINE) must succeed");
 
-    let state_after_reconcile: String =
-        sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
-            .fetch_one(pool)
-            .await
-            .unwrap();
-    let stamped_code: Option<String> =
-        sqlx::query_scalar("SELECT offline_dps_code FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
-            .fetch_one(pool)
-            .await
-            .unwrap();
-    println!(
-        "  after offline reconcile: state={state_after_reconcile} offline_dps_code={stamped_code:?}"
-    );
-    assert_eq!(
-        state_after_reconcile, "OFFLINE_LOCAL_ACK",
-        "OFFLINE reconcile must drive PREPARED→SIGNED→OFFLINE_LOCAL_ACK"
-    );
-    assert_eq!(
-        stamped_code.as_deref(),
-        Some(real_opaque_code.as_str()),
-        "B9 stage_sign stamp-at-sign must stamp the REAL T=112 offline code (not a synthetic one)"
-    );
+    // Both docs must reach OFFLINE_LOCAL_ACK, each stamped with a DISTINCT real
+    // T=112 code, each carrying `<MAC ID='{code}'>` in its signed bytes.
+    let mut stamped_codes: Vec<String> = Vec::new();
+    for (label, doc_id) in [("SHIFT_OPEN", shift_open_doc), ("SELL", sell_doc)] {
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
+                .bind(doc_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let code: Option<String> = sqlx::query_scalar(
+            "SELECT offline_dps_code FROM fiscal_documents WHERE document_id = ?",
+        )
+        .bind(doc_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        println!("  after offline reconcile [{label}]: state={state} offline_dps_code={code:?}");
+        assert_eq!(
+            state, "OFFLINE_LOCAL_ACK",
+            "OFFLINE reconcile must drive the {label} doc PREPARED→SIGNED→OFFLINE_LOCAL_ACK"
+        );
+        let code = code.expect("B9 stamp-at-sign must have stamped a real offline code");
+        assert!(
+            real_opaque_codes.contains(&code),
+            "the {label} doc must be stamped with one of the REAL T=112 codes {real_opaque_codes:?} \
+             (got {code:?})"
+        );
 
-    // Prove the SIGNED bytes carry `<MAC ID='{code}'>` — the B9 fix, in the
-    // exact bytes that will be sent to DPS on the drain.  (Pre-B9 the offline
-    // signed XML carried a bare `<MAC>` and DPS rejected the drain with -9.)
-    let payload_xml_blob = read_document_file_piece4(pool, doc_id, "PAYLOAD_XML")
-        .await
-        .expect("stage_sign must have produced a PAYLOAD_XML artifact");
-    let signed_xml_blob = read_document_file_piece4(pool, doc_id, "SIGNED_XML")
-        .await
-        .expect("stage_sign must have produced a SIGNED_XML artifact");
-    let payload_xml = String::from_utf8_lossy(&payload_xml_blob);
-    let expected_mac_id = format!("<MAC ID='{real_opaque_code}'>");
-    assert!(
-        payload_xml.contains(&expected_mac_id),
-        "B9: the offline SELL PAYLOAD_XML must carry `<MAC ID='{real_opaque_code}'>` (not a bare \
-         <MAC>) — this is the exact fix DPS validates on the drain; xml=\n{payload_xml}"
-    );
-    // The SIGNED bytes are an ATTACHED CMS whose eContent == PAYLOAD_XML, so the
-    // `<MAC ID>` is inside the signature the drain sends.
-    let inner =
-        extract_econtent(&signed_xml_blob).expect("SIGNED_XML must be a parseable ATTACHED CMS");
-    assert_eq!(
-        inner, payload_xml_blob,
-        "the SIGNED offline bytes' eContent must be byte-identical to the <MAC ID>-carrying \
-         PAYLOAD_XML (the drain sends these exact bytes to DPS)"
-    );
-    println!(
-        "  SIGNED offline XML carries `<MAC ID='{real_opaque_code}'>` — {} bytes signed",
-        signed_xml_blob.len()
+        // Prove the SIGNED bytes carry `<MAC ID='{code}'>` (the B9 fix) in the
+        // exact bytes the drain sends.  eContent of SIGNED_XML == PAYLOAD_XML.
+        let payload_blob = read_document_file_piece4(pool, doc_id, "PAYLOAD_XML")
+            .await
+            .expect("stage_sign must have produced a PAYLOAD_XML artifact");
+        let signed_blob = read_document_file_piece4(pool, doc_id, "SIGNED_XML")
+            .await
+            .expect("stage_sign must have produced a SIGNED_XML artifact");
+        let payload_xml = String::from_utf8_lossy(&payload_blob);
+        let expected_mac_id = format!("<MAC ID='{code}'>");
+        assert!(
+            payload_xml.contains(&expected_mac_id),
+            "B9: the {label} offline PAYLOAD_XML must carry `<MAC ID='{code}'>` (not a bare <MAC>); \
+             xml=\n{payload_xml}"
+        );
+        let inner = extract_econtent(&signed_blob)
+            .expect("SIGNED_XML must be a parseable ATTACHED CMS");
+        assert_eq!(
+            inner, payload_blob,
+            "the {label} SIGNED bytes' eContent must be byte-identical to the <MAC ID>-carrying \
+             PAYLOAD_XML (the drain sends these exact bytes)"
+        );
+        println!("  [{label}] SIGNED offline XML carries `<MAC ID='{code}'>` — {} bytes", signed_blob.len());
+        stamped_codes.push(code);
+    }
+    assert_ne!(
+        stamped_codes[0], stamped_codes[1],
+        "the SHIFT_OPEN and SELL must consume DISTINCT offline codes (one code per doc); both got \
+         {:?}",
+        stamped_codes[0]
     );
 
     // ── Step 8: admin::go_online → backlog drainable ───────────────────────
@@ -2606,8 +2665,8 @@ async fn live_smoke_9_offline_drain_mac_id() {
         .unwrap_or_else(|e| panic!("Smoke 9 FAIL: go_online: {e:?}"));
     println!("  go_online: node GOING_ONLINE — ready to drain");
 
-    // ── Step 9: DRAIN the backlog to LIVE DPS ──────────────────────────────
-    println!("\n--- DRAIN (live DPS — offline SELL with <MAC ID>) ---");
+    // ── Step 9: DRAIN the backlog to LIVE DPS (SHIFT_OPEN first, then SELL) ──
+    println!("\n--- DRAIN (live DPS — offline SHIFT_OPEN + SELL, each with <MAC ID>) ---");
     let drain_fn_sign = sign_fn_blob(&ek, &fiscal_number);
     let drain_signing_ctx = live_signing_ctx(&ek);
     let drain_view = RuntimeView {
@@ -2640,54 +2699,70 @@ async fn live_smoke_9_offline_drain_mac_id() {
         summary.er_redrive_queued(),
     );
 
-    let final_state: String =
-        sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
-            .fetch_one(pool)
-            .await
-            .unwrap_or_else(|_| "UNKNOWN".into());
-    let server_fiscal_no: Option<String> =
-        sqlx::query_scalar("SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
-            .fetch_one(pool)
-            .await
-            .unwrap();
-    // The DPS reject code (if any) is recorded in transport_trace.server_status_code.
-    let trace_code: Option<i64> = sqlx::query_scalar(
-        "SELECT server_status_code FROM transport_trace \
-         WHERE document_id = ? ORDER BY attempt_no DESC LIMIT 1",
-    )
-    .bind(doc_id)
-    .fetch_optional(pool)
-    .await
-    .unwrap_or(None)
-    .flatten();
-    println!("  doc final state: {final_state}  server_fiscal_no={server_fiscal_no:?}  dps_code={trace_code:?}");
-    print_live_diagnostics(pool, doc_id).await;
-    println!("  offline_dps_code sent as <MAC ID>: {real_opaque_code:?}");
+    // Both drained docs (SHIFT_OPEN drained first, SELL second) must reach an
+    // accepted terminal with NO -9 and NO -15.  SHIFT_OPEN opening the DPS shift
+    // is exactly what lets the SELL avoid -15 (no open shift) on its own send.
+    let mut all_accepted = true;
+    for (label, doc_id) in [("SHIFT_OPEN", shift_open_doc), ("SELL", sell_doc)] {
+        let final_state: String =
+            sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
+                .bind(doc_id)
+                .fetch_one(pool)
+                .await
+                .unwrap_or_else(|_| "UNKNOWN".into());
+        let server_fiscal_no: Option<String> = sqlx::query_scalar(
+            "SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?",
+        )
+        .bind(doc_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        // The DPS reject code (if any) is in transport_trace.server_status_code.
+        let trace_code: Option<i64> = sqlx::query_scalar(
+            "SELECT server_status_code FROM transport_trace \
+             WHERE document_id = ? ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .bind(doc_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        .flatten();
+        println!(
+            "  [{label}] final state: {final_state}  server_fiscal_no={server_fiscal_no:?}  dps_code={trace_code:?}"
+        );
+        print_live_diagnostics(pool, doc_id).await;
 
-    // ── B9 acceptance assertions ───────────────────────────────────────────
-    // (1) The pre-B9 failure was DPS code -9 "not ID in MAC".  It MUST NOT recur.
-    assert_ne!(
-        trace_code,
-        Some(-9),
-        "B9 REGRESSION: live DPS rejected the offline drain with -9 \"not ID in MAC\" — the \
-         signed `<MAC ID='{real_opaque_code}'>` was not accepted. This is the exact pre-B9 \
-         blocker (INV-11) the fix was supposed to close. Diagnostics above carry the DPS reply."
-    );
-    // (2) The drained doc must reach an accepted terminal (SENT is the DPS-ACK
-    //     CAS moment; KVT1/KVT2/ACK are the confirm ticks).  Anything else means
-    //     DPS did not accept the receipt — the DPS code is printed above.
-    assert!(
-        matches!(final_state.as_str(), "SENT" | "KVT1" | "KVT2" | "ACK"),
-        "Smoke 9 FAIL: the offline drain did NOT reach an accepted terminal \
-         (doc→{final_state}, dps_code={trace_code:?}). If dps_code=-9 the <MAC ID> was rejected; \
-         any other code is a different DPS reject — see diagnostics above."
-    );
-    assert!(
-        server_fiscal_no.is_some(),
-        "an accepted offline drain must populate server_fiscal_no"
-    );
+        // (1) The pre-B9 failure was DPS code -9 "not ID in MAC".  MUST NOT recur.
+        assert_ne!(
+            trace_code,
+            Some(-9),
+            "B9 REGRESSION [{label}]: live DPS rejected the offline drain with -9 \"not ID in \
+             MAC\" — the signed `<MAC ID>` was not accepted. This is the exact pre-B9 blocker \
+             (INV-11) the fix was supposed to close. Diagnostics above carry the DPS reply."
+        );
+        // (2) It must NOT be -15 (bad-hash-prev / no open shift) — the SHIFT_OPEN
+        //     draining first is what opens the DPS shift for the SELL, and the
+        //     settle-poll is what avoids the chain-timing -15.
+        assert_ne!(
+            trace_code,
+            Some(-15),
+            "Smoke 9 FAIL [{label}]: DPS rejected with -15 (ERROR_BAD_HASH_PREV / no open shift). \
+             For the SELL this would mean the SHIFT_OPEN did not open the DPS shift first; for \
+             either it can mean the chain-timing race — see diagnostics above."
+        );
+        // (3) Must reach an accepted terminal (SENT is the DPS-ACK CAS moment;
+        //     KVT1/KVT2/ACK are confirm ticks).  Anything else = DPS did not accept.
+        assert!(
+            matches!(final_state.as_str(), "SENT" | "KVT1" | "KVT2" | "ACK"),
+            "Smoke 9 FAIL [{label}]: the offline drain did NOT reach an accepted terminal \
+             (doc→{final_state}, dps_code={trace_code:?}). See diagnostics above."
+        );
+        assert!(
+            server_fiscal_no.is_some(),
+            "an accepted {label} offline drain must populate server_fiscal_no"
+        );
+        all_accepted &= matches!(final_state.as_str(), "SENT" | "KVT1" | "KVT2" | "ACK");
+    }
 
     // ── Post-bracket ────────────────────────────────────────────────────────
     println!("\n--- POST-BRACKET ---");
@@ -2706,9 +2781,11 @@ async fn live_smoke_9_offline_drain_mac_id() {
         );
     }
 
+    assert!(all_accepted, "both offline docs must have reached an accepted terminal");
     println!(
-        "\nSmoke 9 PASS: B9 offline drain ACCEPTED by live DPS — offline SELL carried \
-         `<MAC ID='{real_opaque_code}'>`, drained to {final_state} \
-         (server_fiscal_no={server_fiscal_no:?}), NO -9 \"not ID in MAC\". INV-11 closed live."
+        "\nSmoke 9 PASS: full Pattern-C offline drain ACCEPTED by live DPS — offline SHIFT_OPEN \
+         (code {:?}) opened the shift, then offline SELL (code {:?}) drained into it, both \
+         carrying `<MAC ID>`, NO -9 \"not ID in MAC\", NO -15. INV-11 closed live.",
+        stamped_codes[0], stamped_codes[1]
     );
 }
