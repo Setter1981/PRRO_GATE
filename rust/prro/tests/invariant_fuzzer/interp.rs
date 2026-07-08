@@ -655,7 +655,15 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
 
 /// `OnlineSell` → `inline::run` on an Online node, ScriptedDps loaded from the
 /// op's `DpsScript`.
+///
+/// B10: `inline::run` dispatches by NODE MODE, not op name — so an `OnlineSell`
+/// op on an OFFLINE-seeded ctx (the `harness_offline_seeded` proptest lane) takes
+/// the offline lane and lazily interposes a BEGIN.  Detect that (BEGIN 0→1) and
+/// report `Recovered` so the differential routes to the two-doc ledger-delta,
+/// exactly like `offline_sell` — otherwise the per-doc chain-continuity check
+/// spuriously REDs (the business doc chains off the BEGIN, not the pre-op tip).
 async fn online_sell(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
+    let begin_before = begin_doc_count(ctx).await;
     let row = ctx.seed_inbox_sell().await;
     let dps = ctx.new_dps();
     load_script(&dps, script);
@@ -673,9 +681,13 @@ async fn online_sell(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
     drop(guard);
     match result {
         Ok(_outcome) => {
-            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
-            ctx.last_row = Some(row); // remember for DuplicateIdemKey replay
-            RealOutcome::Doc(observed)
+            ctx.last_row = Some(row.clone()); // remember for DuplicateIdemKey replay
+            if begin_doc_count(ctx).await > begin_before {
+                return RealOutcome::Recovered {
+                    branch: "b10_lazy_begin_interposed".into(),
+                };
+            }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
         }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }
@@ -908,7 +920,10 @@ async fn reboot(ctx: &mut FuzzCtx) -> RealOutcome {
     .fetch_one(&ctx.pool)
     .await
     .unwrap();
-    for _ in 0..pending {
+    // B10: `+ 1` for the drain-time DocType=10 END (minted during the reboot's
+    // drain, not counted in `pending`) — ample-provision so its wire submit lands
+    // ACK.  Surplus responses are ignored.
+    for _ in 0..pending + 1 {
         dps.push_send(wire_to_result(WireResponse::Ack));
         dps.push_last(wire_to_result(WireResponse::Ack));
         dps.push_last(wire_to_result(WireResponse::Ack));
@@ -985,6 +1000,10 @@ async fn offline_sell(ctx: &mut FuzzCtx) -> RealOutcome {
 /// stage_send maps both to `DpsCheckType::Chk`); only the seeded
 /// `operation_type` differs, which `build_canonical` maps to `DocType::Return`.
 async fn online_return(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
+    // B10: mode-based dispatch — an `OnlineReturn` on an OFFLINE ctx takes the
+    // offline lane + interposes a BEGIN; report `Recovered` so the differential
+    // uses the two-doc ledger-delta (see `online_sell`).
+    let begin_before = begin_doc_count(ctx).await;
     let row = ctx.seed_inbox_return().await;
     let dps = ctx.new_dps();
     load_script(&dps, script);
@@ -1002,9 +1021,13 @@ async fn online_return(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
     drop(guard);
     match result {
         Ok(_outcome) => {
-            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
-            ctx.last_row = Some(row); // remember for DuplicateIdemKey replay
-            RealOutcome::Doc(observed)
+            ctx.last_row = Some(row.clone()); // remember for DuplicateIdemKey replay
+            if begin_doc_count(ctx).await > begin_before {
+                return RealOutcome::Recovered {
+                    branch: "b10_lazy_begin_interposed".into(),
+                };
+            }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
         }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }
@@ -1274,7 +1297,12 @@ fn load_script(dps: &ScriptedDps, script: &DpsScript) {
 fn load_drain_script(dps: &ScriptedDps, script: &DpsScript, backlog: usize) {
     match script.0.as_slice() {
         [WireResponse::Ack, WireResponse::Ack, ..] => {
-            for _ in 0..backlog {
+            // B10: `backlog` counts the pre-drain cohort; a full AckPath drain
+            // ALSO mints + sends the DocType=10 END LAST → push ONE extra
+            // send/last pair so the END's wire submit lands ACK (not
+            // ErrorRetryable from an empty queue).  A surplus pair is harmless
+            // when no END mints (leftover queued responses are ignored).
+            for _ in 0..backlog + 1 {
                 dps.push_send(wire_to_result(WireResponse::Ack));
                 dps.push_last(wire_to_result(WireResponse::Ack));
             }

@@ -559,27 +559,35 @@ impl RefModel {
                 if self.session_has_begin && !self.session_has_end {
                     self.session_has_end = true;
                     let end_lnd = self.next_lnd;
+                    let end_prev = self.seed; // END chains off the last content doc
+                    let end_unsigned = synth_unsigned_hash(end_lnd);
                     self.next_lnd += 1;
                     if self.codes_consumed < self.codes_issued {
+                        // Spare code → END issues (OLA→ACK via drain) + finalize.
+                        // The END goes through offline-ack (M2-01) → it ADVANCES the
+                        // offline seed to its own unsigned hash (mirrors the impl's
+                        // `drive_session_end_to_ola` direct seed advance).
                         self.docs.insert(end_lnd, DocState::Ack);
                         self.offline_origin_lnds.insert(end_lnd);
                         self.codes_consumed += 1;
+                        self.seed = Some(end_unsigned);
                         self.mode = NodeMode::Online;
                         return ExpectedOutcome::Mutated(Mutation {
                             lnd: end_lnd,
                             doc_state: DocState::Ack,
                             seed_after: self.seed,
-                            previous_hash,
+                            previous_hash: end_prev,
                             code_consumed: None,
                         });
                     }
-                    // Pool exhausted → END held SIGNED; finalize blocked; mode stays.
+                    // Pool exhausted → END rests SIGNED (never reaches offline-ack →
+                    // NO seed advance); finalize blocked; mode stays GoingOnline.
                     self.docs.insert(end_lnd, DocState::Signed);
                     return ExpectedOutcome::Mutated(Mutation {
                         lnd: end_lnd,
                         doc_state: DocState::Signed,
                         seed_after: self.seed,
-                        previous_hash,
+                        previous_hash: end_prev,
                         code_consumed: None,
                     });
                 }

@@ -781,10 +781,12 @@ fn model_drain_ackpath_advances_backlog_to_ack() {
     assert_eq!(m.docs.get(&2), Some(&DocState::Ack), "SELL drained to ACK");
     // B10: the drain also minted + drained the DocType=10 END (lnd3 → ACK).
     assert_eq!(m.docs.get(&3), Some(&DocState::Ack), "END minted + drained to ACK");
-    assert_eq!(
+    // The drained backlog (BEGIN + SELL) does NOT re-advance the seed (offline
+    // advanced at issuance); the END, however, is a fresh offline doc issued AT
+    // drain, so it DOES advance the seed to its own unsigned hash (M2-01).
+    assert_ne!(
         m.seed, seed_before,
-        "drain does NOT re-advance the seed for the drained backlog (offline-origin \
-         advanced at issuance); the END carries no goods and does not re-seed here"
+        "the drain-time END advances the seed to its own unsigned hash"
     );
     assert_eq!(
         m.mode,
@@ -1387,6 +1389,7 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
             continue; // process is dead — no op reaches the gateway before reboot
         }
         let prior_tip = ctx.read_seed().await; // real MAC tip BEFORE the op
+        let seed_at_op_start = model.seed; // model MAC tip BEFORE the op (B10 B3 structural seed check)
         let codes_before = ctx.consumed_codes_count().await;
         let sends_before = ctx.send_calls(); // wire send count BEFORE the op (A3 no-resend)
         let shift_before = ctx.read_shift_state().await; // real shift_state BEFORE the op
@@ -1528,24 +1531,57 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                             panic!("B10 boundary-chain divergence on {op:?}: {d}");
                         }
                     } else {
-                        // B3 — FULL snapshot beyond lnd→state: a recovered drain /
-                        // go-online RE-DRIVES already-issued docs; it must NOT
-                        // consume an offline code, allocate a new lnd, or re-advance
-                        // the MAC seed (offline advanced at issuance, online at ACK).
+                        // B3 — FULL snapshot beyond lnd→state.  A recovered drain /
+                        // go-online RE-DRIVES already-issued docs (no code / no lnd /
+                        // no seed change) EXCEPT for the B10 DocType=10 END, which a
+                        // finalizing drain mints LAST (consuming one code + one lnd).
+                        // The MODEL predicts the END independently (`drain_backlog`
+                        // AckPath), so assert the real post-op consumed-codes /
+                        // next-lnd match the MODEL's post-op values — this keeps the
+                        // teeth (a spurious extra code/lnd, or a MISSING END, REDs)
+                        // while admitting the one legit END mint.
+                        //
+                        // `codes_before` / `next_lnd_before` are used as a lower
+                        // bound sanity: the model's values are >= the pre-op values.
+                        let end_minted = model.session_has_end
+                            && model.docs.values().any(|s| {
+                                matches!(s, DocState::Ack | DocState::Signed)
+                            });
+                        let _ = end_minted; // documentation of the delta source
                         assert_eq!(
-                            ctx.consumed_codes_count().await,
-                            codes_before,
-                            "B3: recovered drain/go-online {op:?} consumed an offline code"
+                            ctx.consumed_codes_count().await as i64,
+                            model.codes_consumed,
+                            "B3: recovered drain/go-online {op:?} — real consumed-codes must \
+                             equal the model's (which predicts the END's code)"
+                        );
+                        assert!(
+                            model.codes_consumed >= codes_before as i64,
+                            "B3 sanity: model codes_consumed never decreases"
                         );
                         assert_eq!(
                             ctx.read_next_lnd().await,
-                            next_lnd_before,
-                            "B3: recovered drain/go-online {op:?} allocated a new lnd"
+                            model.next_lnd,
+                            "B3: recovered drain/go-online {op:?} — real next_lnd must equal \
+                             the model's (which predicts the END's lnd)"
                         );
+                        assert!(
+                            model.next_lnd >= next_lnd_before,
+                            "B3 sanity: model next_lnd never decreases"
+                        );
+                        // Seed is compared STRUCTURALLY (model uses synthetic
+                        // hashes, reality real crypto hashes — never value-equal):
+                        // the real seed must CHANGE iff the model's seed changed.
+                        // A pure re-drive leaves both unchanged; a finalizing drain
+                        // that issues the B10 END advances BOTH (the END's M2-01
+                        // OLA).  A spurious real re-advance without a model advance
+                        // (or vice-versa) REDs.
+                        let real_seed_after = ctx.read_seed().await;
+                        let real_advanced = real_seed_after.as_deref() != prior_tip.as_deref();
+                        let model_advanced = model.seed != seed_at_op_start;
                         assert_eq!(
-                            ctx.read_seed().await,
-                            prior_tip,
-                            "B3: recovered drain/go-online {op:?} re-advanced the MAC seed"
+                            real_advanced, model_advanced,
+                            "B3: recovered drain/go-online {op:?} — real seed-advance \
+                             ({real_advanced}) must match the model's ({model_advanced})"
                         );
                     }
                 }

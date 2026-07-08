@@ -11,3 +11,5 @@ cc 1b36f63a26295d348190cbec527c84e5cec8f6efdbb72148d2af85afab333a39 # shrinks to
 cc 80d45a7391463bedcb095d4efaee703ee16a472643ee9f66295ee98e44b9bf18 # shrinks to ops = [OnlineSell(DpsScript([Ack, Ack])), GoOnline(DpsScript([Ack, Ack])), OnlineSell(DpsScript([Superseded])), OfflineSell]
 cc cb23de01891548d97c6da9cb6662e1da79bcdcee986a0c5c32fe1e972837226c # shrinks to ops = [Crash(Kvt1), OnlineReturn(DpsScript([Ack, Ack])), SellWithClosedShift, Reboot]
 cc b671ca9b295c2bce5d0e267bcf5f1105fd9d865e6a9c5c36d7671e8e5cc79f07 # shrinks to ops = [OfflineReturn, OnlineReturn(DpsScript([Superseded])), SellWithClosedShift, RepeatDrain, OfflineReturn, Drain(DpsScript([Ack, NotFound]))]
+cc a081d7f7d5629a94108ecd594b52f1d3d7b4ab050469b53879d8c95a86477ea5 # shrinks to ops = [Reboot, Drain(DpsScript([BadHashPrev])), OfflineSellDuringGoingOnline, Reboot]
+cc 35ec49df237a493280a18003c3abc028168100522ac50f6ff4556c3bedf8c2e2 # shrinks to ops = [GoOnline(DpsScript([Ack, NotFound])), OnlineReturn(DpsScript([Superseded])), RepeatReboot, Reboot, OfflineReturn, OnlineReturn(DpsScript([Ack, NotFound]))]
