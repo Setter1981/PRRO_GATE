@@ -1679,8 +1679,16 @@ async fn offline_sell_lands_offline_local_ack() {
     .await
     .unwrap();
     assert_eq!(ola, 2, "BEGIN + SELL both at OFFLINE_LOCAL_ACK");
-    assert_eq!(ctx.count_doc_type("OFFLINE_SESSION_BEGIN").await, 1, "one lazy BEGIN");
-    assert_eq!(ctx.consumed_codes_count().await, 2, "two offline codes consumed");
+    assert_eq!(
+        ctx.count_doc_type("OFFLINE_SESSION_BEGIN").await,
+        1,
+        "one lazy BEGIN"
+    );
+    assert_eq!(
+        ctx.consumed_codes_count().await,
+        2,
+        "two offline codes consumed"
+    );
     assert_eq!(
         ctx.send_calls(),
         0,

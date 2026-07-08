@@ -104,10 +104,21 @@ fn offline_sell_advances_seed_at_offline_local_ack_and_consumes_code() {
     let out = m.apply(&Op::OfflineSell);
 
     let mu = mutation(&out);
-    assert_eq!(mu.lnd, 2, "the returned Mutation is the SELL (lnd 2, after BEGIN@1)");
+    assert_eq!(
+        mu.lnd, 2,
+        "the returned Mutation is the SELL (lnd 2, after BEGIN@1)"
+    );
     assert_eq!(mu.doc_state, DocState::OfflineLocalAck);
-    assert_eq!(m.docs.get(&1), Some(&DocState::OfflineLocalAck), "BEGIN@1 OLA");
-    assert_eq!(m.docs.get(&2), Some(&DocState::OfflineLocalAck), "SELL@2 OLA");
+    assert_eq!(
+        m.docs.get(&1),
+        Some(&DocState::OfflineLocalAck),
+        "BEGIN@1 OLA"
+    );
+    assert_eq!(
+        m.docs.get(&2),
+        Some(&DocState::OfflineLocalAck),
+        "SELL@2 OLA"
+    );
     assert_ne!(m.seed, seed_before, "seed advanced at OFFLINE_LOCAL_ACK");
     assert_eq!(m.seed, mu.seed_after);
     assert_eq!(m.codes_consumed, 2, "two codes consumed — BEGIN + SELL");
@@ -766,8 +777,16 @@ fn model_drain_ackpath_advances_backlog_to_ack() {
     // both issue AND the drain-time END(lnd3) can too.
     let mut m = RefModel::new_offline_open_shift(3);
     let _ = m.apply(&Op::OfflineSell); // BEGIN@1 + SELL@2, both OFFLINE_LOCAL_ACK
-    assert_eq!(m.docs.get(&1), Some(&DocState::OfflineLocalAck), "BEGIN@1 OLA");
-    assert_eq!(m.docs.get(&2), Some(&DocState::OfflineLocalAck), "SELL@2 OLA");
+    assert_eq!(
+        m.docs.get(&1),
+        Some(&DocState::OfflineLocalAck),
+        "BEGIN@1 OLA"
+    );
+    assert_eq!(
+        m.docs.get(&2),
+        Some(&DocState::OfflineLocalAck),
+        "SELL@2 OLA"
+    );
     let seed_before = m.seed;
     m.mode = NodeMode::GoingOnline; // fixture: the probe already flipped (test setup)
 
@@ -780,7 +799,11 @@ fn model_drain_ackpath_advances_backlog_to_ack() {
     assert_eq!(m.docs.get(&1), Some(&DocState::Ack), "BEGIN drained to ACK");
     assert_eq!(m.docs.get(&2), Some(&DocState::Ack), "SELL drained to ACK");
     // B10: the drain also minted + drained the DocType=10 END (lnd3 → ACK).
-    assert_eq!(m.docs.get(&3), Some(&DocState::Ack), "END minted + drained to ACK");
+    assert_eq!(
+        m.docs.get(&3),
+        Some(&DocState::Ack),
+        "END minted + drained to ACK"
+    );
     // The drained backlog (BEGIN + SELL) does NOT re-advance the seed (offline
     // advanced at issuance); the END, however, is a fresh offline doc issued AT
     // drain, so it DOES advance the seed to its own unsigned hash (M2-01).
@@ -1553,9 +1576,10 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                         // `codes_before` / `next_lnd_before` are used as a lower
                         // bound sanity: the model's values are >= the pre-op values.
                         let end_minted = model.session_has_end
-                            && model.docs.values().any(|s| {
-                                matches!(s, DocState::Ack | DocState::Signed)
-                            });
+                            && model
+                                .docs
+                                .values()
+                                .any(|s| matches!(s, DocState::Ack | DocState::Signed));
                         let _ = end_minted; // documentation of the delta source
                         assert_eq!(
                             ctx.consumed_codes_count().await as i64,

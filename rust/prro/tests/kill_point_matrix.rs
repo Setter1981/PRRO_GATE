@@ -1412,8 +1412,11 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_offline(&pool, shift_id).await;
     seed_open_offline_session(&pool).await;
+    // B10: BEGIN(1) + receipt#1(2) + receipt#2(3) at issuance + END(4) at drain.
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await;
+    seed_offline_code(&pool, 4).await;
 
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -1450,16 +1453,31 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
             .await
             .unwrap()
     }
-    let prev1 = chain_col(&pool, 1, "previous_hash").await;
-    let prev2 = chain_col(&pool, 2, "previous_hash").await;
-    let uns1 = chain_col(&pool, 1, "unsigned_xml_sha256").await;
-    let uns2 = chain_col(&pool, 2, "unsigned_xml_sha256").await;
-    assert!(prev1.is_none(), "doc#1 chains off genesis");
+    // B10: the REAL chain is now BEGIN(lnd1, prev=genesis None) → receipt#1(lnd2,
+    // prev=BEGIN.uns) → receipt#2(lnd3, prev=receipt#1.uns).  The lazy BEGIN is
+    // the lowest-lnd offline doc.
+    let prev_begin = chain_col(&pool, 1, "previous_hash").await;
+    let prev1 = chain_col(&pool, 2, "previous_hash").await; // receipt#1
+    let prev2 = chain_col(&pool, 3, "previous_hash").await; // receipt#2
+    let uns_begin = chain_col(&pool, 1, "unsigned_xml_sha256").await;
+    let uns1 = chain_col(&pool, 2, "unsigned_xml_sha256").await;
+    let uns2 = chain_col(&pool, 3, "unsigned_xml_sha256").await;
+    assert!(
+        prev_begin.is_none(),
+        "the lazy BEGIN (lnd1) chains off genesis"
+    );
+    assert_eq!(
+        prev1, uns_begin,
+        "receipt#1 chains off the BEGIN's unsigned_xml_sha256"
+    );
     assert_ne!(
         prev1, prev2,
-        "M2-01: the two offline docs have DISTINCT previous_hash"
+        "M2-01: the two receipts have DISTINCT previous_hash"
     );
-    assert_eq!(prev2, uns1, "doc#2 chains off doc#1's unsigned_xml_sha256");
+    assert_eq!(
+        prev2, uns1,
+        "receipt#2 chains off receipt#1's unsigned_xml_sha256"
+    );
     let seed: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = ?",
     )
@@ -1469,21 +1487,22 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
     .unwrap();
     assert_eq!(
         seed, uns2,
-        "node seed advanced to the last issued offline doc"
+        "node seed advanced to the last issued offline doc (receipt#2)"
     );
 
     // ── invariant_scan is CLEAN during the offline window (closes M2-03).
     prro::db::invariant_scan::assert_clean(&pool).await;
 
-    // ── Go online + drain.  Two send + two lastChk (one per doc).
+    // ── Go online + drain.  B10: BEGIN + receipt#1 + receipt#2 + the drain-time
+    //    END = 4 send + 4 lastChk.
     set_node_mode(&pool, NodeMode::GoingOnline).await;
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
     let phase = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    phase.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-    phase.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-    phase.push_send(Ok(ack("DPS-FN-ONLINE-2", vec![0xDE, 0xAD, 0xBE, 0xEF])));
-    phase.push_last(Ok(ack("DPS-FN-ONLINE-2", vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    for _ in 0..4 {
+        phase.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+        phase.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    }
     let sc2 = det_signing_ctx();
     let fs2 = fn_sign_blob();
     let view = RuntimeView {
@@ -1494,9 +1513,13 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
     let summary = backlog_drain::drain(&recon_guard(), &pool, &view, FN)
         .await
         .expect("drain must succeed (no ChainSeedMismatch post-fix)");
-    assert_eq!(summary.backlog_size_before(), 2);
+    assert_eq!(
+        summary.backlog_size_before(),
+        3,
+        "B10: BEGIN + 2 receipts in the content backlog (END is a finalize precondition)"
+    );
 
-    // ── Both ACK, exactly two send_chk, scan clean AFTER drain.
+    // ── All ACK (BEGIN + 2 receipts + END), scan clean AFTER drain.
     let states: Vec<(i64, String)> = sqlx::query_as(
         "SELECT lnd, state FROM fiscal_documents WHERE fiscal_number = ? ORDER BY lnd",
     )
@@ -1506,13 +1529,18 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
     .unwrap();
     assert_eq!(
         states,
-        vec![(1, "ACK".to_string()), (2, "ACK".to_string())],
-        "both offline receipts drain to ACK"
+        vec![
+            (1, "ACK".to_string()),
+            (2, "ACK".to_string()),
+            (3, "ACK".to_string()),
+            (4, "ACK".to_string()),
+        ],
+        "BEGIN + both receipts + END all drain to ACK"
     );
     assert_eq!(
         send_calls.load(Ordering::SeqCst),
-        2,
-        "exactly two send_chk (one per doc)"
+        4,
+        "four send_chk — BEGIN + receipt#1 + receipt#2 + END"
     );
     prro::db::invariant_scan::assert_clean(&pool).await;
 }
@@ -1606,10 +1634,15 @@ async fn m2_online_offline_boundary_chain_continuous() {
         "online ACK advanced the seed to doc#0.unsigned"
     );
 
-    // ── Flip OFFLINE, emit doc#1 → OFFLINE_LOCAL_ACK; it must chain off doc#0.
+    // ── Flip OFFLINE, emit the first offline SELL.  B10: it lazily interposes a
+    //    DocType=9 BEGIN as the FIRST offline doc, so it is the BEGIN (not the
+    //    SELL) that chains off the last online ACK; the SELL then chains off the
+    //    BEGIN.  Seed 2 codes (BEGIN + SELL).  The boundary-continuity INTENT is
+    //    preserved AND strengthened: BEGIN.prev == uns0 AND SELL.prev == BEGIN.uns.
     set_node_mode(&pool, NodeMode::Offline).await;
     seed_open_offline_session(&pool).await;
     seed_offline_code(&pool, 1).await;
+    seed_offline_code(&pool, 2).await;
     let row1 = seed_inbox_sell_keyed(&pool, "idem-m2-boundary-1").await;
     let stub1 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     {
@@ -1619,11 +1652,32 @@ async fn m2_online_offline_boundary_chain_continuous() {
             .unwrap();
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
+    // The lazy BEGIN is the lowest-lnd offline doc; it chains off the online ACK.
+    let begin_prev: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT previous_hash FROM fiscal_documents \
+         WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN'",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let begin_uns: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT unsigned_xml_sha256 FROM fiscal_documents \
+         WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN'",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        begin_prev, uns0,
+        "online→offline boundary: the lazy BEGIN (first offline doc) chains off the last online ACK"
+    );
     let doc1 = doc_id_by_req(&pool, &row1.request_id).await;
     let prev1 = col_by_id(&pool, doc1, "previous_hash").await;
     assert_eq!(
-        prev1, uns0,
-        "online→offline boundary: the first offline doc chains off the last online ACK"
+        prev1, begin_uns,
+        "the offline SELL chains off the BEGIN's unsigned_xml_sha256 (chain extends past the boundary)"
     );
     // Chain continuous across the boundary.
     prro::db::invariant_scan::assert_clean(&pool).await;
@@ -1651,8 +1705,14 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_offline(&pool, shift_id).await;
     seed_open_offline_session(&pool).await;
+    // B10: BEGIN(lnd1) + receipt#1(lnd2) + receipt#2(lnd3) → 3 codes.  The drain
+    // below targets lnd=1, which is now the lazy BEGIN — itself an offline-origin
+    // doc, so it is a valid subject for the "mac_recovery refuses offline-origin"
+    // pin (the test's intent is preserved: an offline-origin doc hitting -12 on
+    // drain must NOT be re-signed; the shift escalates to RMR; the chain stays clean).
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await;
 
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -1796,6 +1856,7 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
     seed_offline_code(&pool, 3).await;
+    seed_offline_code(&pool, 4).await; // B10: +1 for the lazy BEGIN
 
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -1945,6 +2006,7 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
     seed_offline_code(&pool, 3).await;
+    seed_offline_code(&pool, 4).await; // B10: +1 for the lazy BEGIN
 
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -2122,8 +2184,11 @@ async fn k9_offline_seed_survives_restart_chain_not_forked() {
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_offline(&pool, shift_id).await;
     seed_open_offline_session(&pool).await;
+    // B10: the FIRST offline sell mints BEGIN(lnd1) + SELL1(lnd2); the second
+    // (post-restart) sell mints SELL2(lnd3).  No drain here → no END.  3 codes.
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await;
 
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -2167,13 +2232,25 @@ async fn k9_offline_seed_survives_restart_chain_not_forked() {
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
 
-    // unsigned(doc1) == h1; the node seed advanced to it (M2-01).
-    let h1 = chain_col(&pool, 1, "unsigned_xml_sha256").await;
-    assert!(h1.is_some(), "doc1 carries an unsigned hash");
+    // B10: the first offline sell minted BEGIN(lnd1) + SELL1(lnd2).  The node
+    // seed advanced to unsigned(SELL1) — the HIGHEST-lnd issued offline doc (M2-01).
+    // `h1` is now SELL1's unsigned hash (lnd2), the surviving-seed subject.
+    let h1 = chain_col(&pool, 2, "unsigned_xml_sha256").await;
+    assert!(h1.is_some(), "SELL1 (lnd2) carries an unsigned hash");
     assert_eq!(
         node_seed(&pool).await,
         h1,
-        "seed advanced to unsigned(doc1) (M2-01)"
+        "seed advanced to unsigned(SELL1) — the highest-lnd issued offline doc (M2-01)"
+    );
+    // The BEGIN (lnd1) chains off genesis; SELL1 (lnd2) chains off the BEGIN.
+    assert!(
+        chain_col(&pool, 1, "previous_hash").await.is_none(),
+        "the lazy BEGIN (lnd1) is genesis"
+    );
+    assert_eq!(
+        chain_col(&pool, 2, "previous_hash").await,
+        chain_col(&pool, 1, "unsigned_xml_sha256").await,
+        "SELL1 chains off the BEGIN's unsigned hash"
     );
     prro::db::invariant_scan::assert_clean(&pool).await;
 
@@ -2208,22 +2285,28 @@ async fn k9_offline_seed_survives_restart_chain_not_forked() {
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
 
-    let prev1 = chain_col(&pool, 1, "previous_hash").await;
-    let prev2 = chain_col(&pool, 2, "previous_hash").await;
-    let uns2 = chain_col(&pool, 2, "unsigned_xml_sha256").await;
-    assert!(prev1.is_none(), "doc1 is genesis (prev NULL)");
+    // B10: doc2 (the post-restart offline sell) is SELL2 at lnd3 — the BEGIN
+    // already exists, so no new BEGIN is interposed.  It chains off the SURVIVING
+    // seed = unsigned(SELL1) = h1, and the seed advances to unsigned(SELL2).
+    let prev_begin = chain_col(&pool, 1, "previous_hash").await;
+    let prev3 = chain_col(&pool, 3, "previous_hash").await; // SELL2
+    let uns3 = chain_col(&pool, 3, "unsigned_xml_sha256").await;
+    assert!(
+        prev_begin.is_none(),
+        "the BEGIN (lnd1) is genesis (prev NULL)"
+    );
     assert_eq!(
-        prev2, h1,
-        "doc2 chains off the surviving unsigned(doc1) seed"
+        prev3, h1,
+        "SELL2 (lnd3) chains off the surviving unsigned(SELL1) seed — chain not forked"
     );
     assert_ne!(
-        prev1, prev2,
+        prev_begin, prev3,
         "distinct previous_hash — a real chain, not a pre-M2-01 fork"
     );
     assert_eq!(
         node_seed(&pool).await,
-        uns2,
-        "seed advanced to unsigned(doc2)"
+        uns3,
+        "seed advanced to unsigned(SELL2)"
     );
     prro::db::invariant_scan::assert_clean(&pool).await;
 }
@@ -2312,6 +2395,7 @@ async fn drain_kvt1_reentry_superseded_escalates_manual() {
     seed_open_offline_session(&pool).await;
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await; // B10: +1 for the lazy BEGIN
 
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
@@ -2928,6 +3012,7 @@ async fn drain_superseded_on_nonescalatable_shift_fails_loud_not_busyloop() {
     seed_open_offline_session(&pool).await;
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await; // B10: +1 for the lazy BEGIN
 
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
