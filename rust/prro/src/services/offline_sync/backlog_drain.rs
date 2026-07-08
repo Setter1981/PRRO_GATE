@@ -2878,9 +2878,13 @@ async fn drive_session_end_to_ola(
         // (empty pool at drain — the [[project_backlog_offline_code_reserve_floor]]
         // hazard, out of B10 scope per dossier §7), the END signed a BARE `<MAC>`
         // (offline_dps_code IS NULL).  Shipping it would earn a DPS `-9` (the exact
-        // bug B10 fixes).  Do NOT advance it to OLA / send it — leave it SIGNED so
-        // the caller HOLDs (session stays Draining; a replenished pool + re-drain
-        // adopts the SIGNED END, acquires a code on the readback, and completes).
+        // bug B10 fixes).  ABORT it terminally (`SIGNED → Aborted`) — NOT leave it
+        // SIGNED: a SIGNED doc resting at a quiescent boundary is the #192 wedge
+        // (the invariant_scan `StuckNonTerminalDoc`).  The Aborted END is #192-clean
+        // AND re-mintable: `active_boundary_doc_state_tx` treats the terminal-failed
+        // END as slot-free, so a replenished pool + re-drain mints a FRESH END next
+        // tick.  The session does NOT finalize this tick (STEP C finds no drainable
+        // END → PARTIAL → stays Draining).
         let stamped: Option<String> = sqlx::query_scalar(
             "SELECT offline_dps_code FROM fiscal_documents WHERE document_id = ?",
         )
@@ -2889,8 +2893,25 @@ async fn drive_session_end_to_ola(
         .await
         .map_err(BootError::Database)?;
         if stamped.is_none() {
-            // SIGNED-but-unstamped → not drainable this tick.  Return; the STEP-C
-            // caller finds no OLA/drainable END → holds → PARTIAL.
+            let end_doc = doc.document_id;
+            with_immediate(pool, move |tx| {
+                Box::pin(async move {
+                    // SIGNED → Aborted (idempotent no-op if already moved off SIGNED).
+                    fiscal_documents::transition_state(
+                        tx,
+                        end_doc,
+                        DocState::Signed,
+                        DocState::Aborted,
+                    )
+                    .await?;
+                    Ok::<(), anyhow::Error>(())
+                })
+            })
+            .await
+            .map_err(|source| BootError::ReconciliationFailed {
+                fiscal_number: fiscal_number.to_string(),
+                source,
+            })?;
             return Ok(());
         }
     }

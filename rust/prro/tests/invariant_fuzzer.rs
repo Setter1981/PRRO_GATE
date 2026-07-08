@@ -1405,7 +1405,16 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         // arm resync'd, silently adopting the real DB).  A wire-reached Crash
         // (RealOutcome::Crashed) and every Reboot stay Fault.
         let expected = match (op, &real) {
-            (Op::Crash(_), interp::RealOutcome::Doc(_)) => model.predict_crash_completed_sell(),
+            // O2: an offline-node crash completes as a real offline sell.  With
+            // B10 it may interpose a BEGIN (→ `Recovered`, two-doc) or not (→
+            // `Doc`, single); either way predict it deterministically via the
+            // two-doc-aware `predict_crash_completed_sell` (→ `apply_sell`) so the
+            // crash differential is NOT vacuous (see the `b10_lazy_begin_interposed`
+            // ledger-delta branch below for the Recovered case).
+            (Op::Crash(_), interp::RealOutcome::Doc(_))
+            | (Op::Crash(_), interp::RealOutcome::Recovered { .. }) => {
+                model.predict_crash_completed_sell()
+            }
             _ => model.apply(op),
         };
 
@@ -2492,14 +2501,22 @@ async fn teeth_o1_online_convergence_drives_sent_to_ack() {
 /// completes as a real `OFFLINE_LOCAL_ACK` sell.
 #[tokio::test]
 async fn teeth_o2_crash_completed_sell_matches_prediction() {
-    let mut ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
-    let mut model = RefModel::new_offline_open_shift(1);
+    // B10: seed 3 codes and issue ONE ordinary offline sell FIRST (which mints the
+    // lazy BEGIN + the sell) so the CRASH-completed sell under test is a SUBSEQUENT
+    // offline doc (no new BEGIN interposed) → it completes as a single `Doc`, the
+    // clean O2 slice.  (A first-offline crash-completed sell would interpose a
+    // BEGIN → a two-doc `Recovered`, covered by the harness ledger-delta branch.)
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let mut model = RefModel::new_offline_open_shift(3);
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await; // BEGIN + sell#1
+    let _ = model.apply(&Op::OfflineSell);
     let prior = ctx.read_seed().await;
 
     let real = interp::run_op(&mut ctx, &Op::Crash(Stage::Send)).await;
     assert!(
         matches!(&real, interp::RealOutcome::Doc(d) if d.doc_state == DocState::OfflineLocalAck),
-        "setup: an offline Crash(Send) completes as an OFFLINE_LOCAL_ACK sell, got {real:?}"
+        "setup: a subsequent offline Crash(Send) completes as an OFFLINE_LOCAL_ACK sell \
+         (no new BEGIN — one already exists), got {real:?}"
     );
 
     let expected = model.predict_crash_completed_sell();
@@ -2530,10 +2547,11 @@ fn teeth_o2_run_harness_catches_crash_completed_sell_divergence() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
-            let mut model = RefModel::new_offline_open_shift(1);
-            // Desync the prediction: the crash-completed sell will be lnd 1, the
-            // model now predicts lnd 99 → the differential must catch the divergence.
+            let ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+            let mut model = RefModel::new_offline_open_shift(3);
+            // Desync the prediction: the crash-completed FIRST offline sell mints
+            // BEGIN@lnd1 + SELL@lnd2 (real), but the model now predicts lnd 99/100
+            // → the differential (ledger-delta / next_lnd) must catch the divergence.
             model.next_lnd = 99;
             run_harness(&[Op::Crash(Stage::Send)], ctx, model).await;
         });
@@ -2654,8 +2672,13 @@ async fn a2_terminal_settle_resolves_unpaired_crash_and_scans() {
 /// finalize CAS's `GoingOnline → Online` → the settled boundary scans clean.
 #[tokio::test]
 async fn a4_terminal_settle_drains_legit_going_online_to_online() {
-    let mut ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
-    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await; // OFFLINE_LOCAL_ACK backlog
+    // B10: seed 3 codes — the offline sell mints the lazy BEGIN (code#1) + the
+    // SELL (code#2), and the terminal settle-drain mints the DocType=10 END
+    // (code#3) so the drain can FINALIZE (GoingOnline → Online).  With too few
+    // codes the END would abort and the drain would not finalize (the legit-settle
+    // intent of this test would be lost).
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await; // BEGIN + SELL → OFFLINE_LOCAL_ACK
     ctx.force_node_mode(NodeMode::GoingOnline).await; // legit GoingOnline (active session + cohort)
     assert!(
         ctx.active_offline_session().await.is_some(),
@@ -2667,12 +2690,13 @@ async fn a4_terminal_settle_drains_legit_going_online_to_online() {
     assert_eq!(
         ctx.read_node_mode().await,
         NodeMode::Online,
-        "A4: the terminal settle must drain a legit GoingOnline cohort to Online"
+        "A4: the terminal settle must drain a legit GoingOnline cohort (BEGIN + SELL + END) to Online"
     );
-    assert_eq!(
-        ctx.only_doc_state().await,
-        DocState::Ack,
-        "the backlog drained to ACK at the terminal settle"
+    // B10: the whole session — BEGIN + SELL + END — is ACK after the settle.
+    let ledger = ctx.read_ledger().await;
+    assert!(
+        ledger.values().all(|s| *s == DocState::Ack),
+        "the whole session (BEGIN + SELL + END) drained to ACK, got {ledger:?}"
     );
 }
 

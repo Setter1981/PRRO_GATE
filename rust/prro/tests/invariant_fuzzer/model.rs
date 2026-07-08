@@ -580,12 +580,14 @@ impl RefModel {
                             code_consumed: None,
                         });
                     }
-                    // Pool exhausted → END rests SIGNED (never reaches offline-ack →
-                    // NO seed advance); finalize blocked; mode stays GoingOnline.
-                    self.docs.insert(end_lnd, DocState::Signed);
+                    // Pool exhausted → the END signs bare → it is ABORTED terminally
+                    // (`SIGNED → Aborted`, #192-clean; NOT left SIGNED) and NO seed
+                    // advance; finalize blocked; mode stays GoingOnline.  The Aborted
+                    // END is re-mintable next tick (slot-free) once the pool refills.
+                    self.docs.insert(end_lnd, DocState::Aborted);
                     return ExpectedOutcome::Mutated(Mutation {
                         lnd: end_lnd,
-                        doc_state: DocState::Signed,
+                        doc_state: DocState::Aborted,
                         seed_after: self.seed,
                         previous_hash: end_prev,
                         code_consumed: None,

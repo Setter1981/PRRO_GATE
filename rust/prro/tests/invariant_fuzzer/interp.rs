@@ -706,6 +706,14 @@ async fn online_sell(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
 /// call), the future COMPLETES instead of hanging — that is a refusal / no-op,
 /// not a crash, and is reported as such (no panic).
 async fn crash_via_drop(ctx: &mut FuzzCtx, stage: Stage) -> RealOutcome {
+    // B10: on an OFFLINE node the offline-ack path makes no wire call, so this
+    // "crash" COMPLETES as a real offline sell — which lazily interposes a BEGIN
+    // when it is the session's first offline doc.  Detect that (BEGIN 0→1 across
+    // the completed run) → report `Recovered` so the O2 differential uses the
+    // two-doc ledger-delta (the model's `predict_crash_completed_sell` →
+    // `apply_sell` predicts both docs; the per-doc chain check would spuriously
+    // RED on the SELL chaining off the BEGIN).
+    let begin_before = begin_doc_count(ctx).await;
     let row = ctx.seed_inbox_sell().await;
     let dps = ctx.new_dps();
     let (reached_tx, reached_rx) = oneshot::channel::<()>();
@@ -743,7 +751,15 @@ async fn crash_via_drop(ctx: &mut FuzzCtx, stage: Stage) -> RealOutcome {
             stage,
             committed_state: ctx.observe_doc_state_by_request_id(&row.request_id).await,
         },
-        Some(Ok(_)) => RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await),
+        Some(Ok(_)) => {
+            if begin_doc_count(ctx).await > begin_before {
+                // Offline crash-completed sell interposed a BEGIN → two-doc delta.
+                return RealOutcome::Recovered {
+                    branch: "b10_lazy_begin_interposed".into(),
+                };
+            }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
+        }
         Some(Err(e)) => RealOutcome::Refused(format!("{e:?}")),
     }
 }
@@ -1133,7 +1149,9 @@ pub async fn settle_drain_tick(ctx: &mut FuzzCtx) -> RealOutcome {
         None => 0,
     };
     let dps = ctx.new_dps();
-    for _ in 0..cohort {
+    // B10: `+ 1` for the drain-time DocType=10 END (minted DURING the drain, not
+    // in `cohort`) so its wire submit lands ACK and the drain can FINALIZE.
+    for _ in 0..cohort + 1 {
         dps.push_send(wire_to_result(WireResponse::Ack));
         dps.push_last(wire_to_result(WireResponse::Ack));
     }

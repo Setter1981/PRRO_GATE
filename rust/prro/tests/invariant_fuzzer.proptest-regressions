@@ -10,3 +10,8 @@ cc b95074298589d179af0bdb045261c6dcd5808fa530624eb38a27c9b0479a0ffc # shrinks to
 cc cd07b550ffa387183a50ab5757b5e0eb7b2aa4f7870397c641c972ab9d716914 # shrinks to ops = [RepeatReboot, RepeatReboot]
 cc a32941717ae61f133168f7bd3afe125217f532ffd042c7327639e1bef16546c6 # shrinks to ops = [SellWithClosedShift, Drain(DpsScript([Ack, NotFound])), Reboot]
 cc ff117ccdcac5903599ebe54beace28b261ee3a2649f98bfa443cb2cd4183c515 # shrinks to ops = [RepeatDrain, SellWithClosedShift, RepeatReboot, RepeatReboot, GoOnlineWithoutBacklog]
+cc ca04bb23103217079445e901edb78f5f5c2dc3af918c298ed162a97fd6b13927 # shrinks to ops = [Reboot, RepeatDrain, OfflineSellDuringGoingOnline, Drain(DpsScript([Superseded]))]
+cc 2a7aa35f5e7b039b9c04932388da19270718dd81928b2e9a86b0f95dd2c68ce4 # shrinks to ops = [Crash(Kvt1), Crash(Send), OnlineSell(DpsScript([Superseded]))]
+cc 3855176e6f0632e20617380d2d9996ef7606b23577b0907ea97703ecdb681abf # shrinks to ops = [Drain(DpsScript([BadHashPrev]))]
+cc bd915c7a02cdc805522af63666cde665829687e593454a486f0c9f1e548cc866 # shrinks to ops = [RepeatDrain, DuplicateIdemKey, DuplicateIdemKey, OnlineReturn(DpsScript([Reject]))]
+cc f393b9e9a7594d1ac832db16f2438f8ae61fe30091831628e5590472f7ac6d15 # shrinks to ops = [GoOnline(DpsScript([Superseded])), OfflineReturn, GoOnline(DpsScript([Ack, NotFound])), OnlineReturn(DpsScript([Ack, NotFound])), RepeatDrain]
