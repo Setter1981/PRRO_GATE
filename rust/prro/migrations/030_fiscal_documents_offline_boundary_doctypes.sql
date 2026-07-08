@@ -207,19 +207,26 @@ CREATE INDEX idx_fiscal_documents_signing_config_snapshot_id
 -- within the same (fiscal_number, shift_id) scope while either is still active
 -- (i.e. not yet in a terminal state).
 --
--- Terminal states excluded from the partial filter:
---   REJECTED, CANCELLED, ERROR_RETRYABLE, REQUIRES_MANUAL_RECONCILIATION, ABORTED
+-- Terminal-FAILED states excluded from the partial filter (a prior boundary-doc
+-- attempt that FAILED terminally frees the slot for a fresh mint):
+--   REJECTED, CANCELLED, REQUIRES_MANUAL_RECONCILIATION, ABORTED
 -- Note: OFFLINE_LOCAL_ACK is NOT terminal — it is the durable offline-commit
 -- state awaiting drain — so a boundary doc at OFFLINE_LOCAL_ACK still holds the
 -- slot and rightly blocks a duplicate mint.
+-- ERROR_RETRYABLE is INCLUDED in the active set (slot HELD): it is a TRANSIENT
+-- send failure that will retry, NOT a terminal failure — a re-mint over it would
+-- duplicate the boundary doc while the first is mid-retry.  This MUST match the
+-- code-side idempotency predicate (`fiscal_documents::active_boundary_doc_state_tx`
+-- + the `doc_state_by_request_id_tx` BEGIN match, which both treat ERROR_RETRYABLE
+-- as below-OLA / still-active → fail-closed) so the DB backstop and the code gate
+-- never disagree (review LOW-3 reconciliation, 2026-07-08).
 -- There is NO bare 'ERROR' state in fiscal_documents (confirmed against the state
--- CHECK above); it was omitted intentionally.
+-- CHECK above).
 CREATE UNIQUE INDEX ux_fd_active_offline_boundary
     ON fiscal_documents (fiscal_number, shift_id, doc_type)
     WHERE doc_type IN ('OFFLINE_SESSION_BEGIN','OFFLINE_SESSION_END')
       AND state NOT IN (
-          'REJECTED','CANCELLED','ERROR_RETRYABLE',
-          'REQUIRES_MANUAL_RECONCILIATION','ABORTED'
+          'REJECTED','CANCELLED','REQUIRES_MANUAL_RECONCILIATION','ABORTED'
       );
 
 -- ── Step 8: recreate the updated_at trigger ───────────────────────────────

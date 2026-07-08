@@ -707,27 +707,10 @@ pub async fn run(
         }
     };
 
-    // B10 (W10a) — LAZY DocType=9 (OFFLINE_SESSION_BEGIN).  When this is the
-    // FIRST offline business doc of the active session, mint+sign+OLA the
-    // BEGIN boundary doc FIRST so it takes the LOWEST offline lnd (drains
-    // first) and its `unsigned_xml_sha256` becomes THIS doc's chain
-    // `previous_hash`.  Runs on the SAME FN gate (`_fn_gate` held by the
-    // caller — sequential sub-drive, never re-locks) and OUTSIDE every write
-    // tx (INV-1: the BEGIN signs in its own `run_staged` sign stage).  On
-    // anything but a clean OFFLINE_LOCAL_ACK the SELL fails-closed (INV-4:
-    // no successor signs against a non-issued BEGIN predecessor).
-    ensure_offline_session_begin(
-        pool,
-        pool_secure,
-        dps,
-        sign_ctx,
-        fn_sign,
-        _fn_gate,
-        row,
-        &command,
-    )
-    .await?;
-
+    // B10 (W10a) — the lazy DocType=9 BEGIN is ensured inside `run_staged` (the
+    // common first-offline-doc seam), so it fires for SHIFT_OPEN / SELL / RETURN
+    // AND the Z path (`run_z_dispatch` → `run_staged`) — regardless of which doc
+    // type is the session's first offline doc.  (Review Finding B + HOLE A.)
     run_staged(pool, pool_secure, dps, sign_ctx, fn_sign, row, command).await
 }
 
@@ -756,6 +739,17 @@ async fn run_staged(
         .driver_id
         .as_deref()
         .expect("build_canonical/build_z_canonical guarantees driver_id present");
+
+    // B10 (W10a) — the COMMON first-offline-doc seam.  BEFORE this doc mints,
+    // ensure the session's DocType=9 BEGIN is issued (or fail-closed if a crashed
+    // BEGIN rests non-terminal) — for SHIFT_OPEN / SELL / RETURN / Z_REPORT /
+    // SHIFT_CLOSE alike (Finding B + HOLE A).  The BEGIN takes the LOWEST offline
+    // lnd (drains first, opens the DPS offline window) and its
+    // `unsigned_xml_sha256` becomes this doc's chain `previous_hash`.  Runs on the
+    // caller's held FN gate (sequential sub-drive) and OUTSIDE every write tx
+    // (INV-1: the BEGIN signs in its own `run_staged` sign stage).  The boundary
+    // docs themselves are excluded inside the helper (no recursion).
+    ensure_offline_session_begin(pool, pool_secure, dps, sign_ctx, fn_sign, row, &command).await?;
 
     let acq = match stage_acquire::run(pool, pool_secure, driver_id, request_id, command).await {
         Ok(r) => r,
@@ -1120,42 +1114,68 @@ async fn run_staged(
 }
 
 /// B10 (W10a) — ensure the active offline session has its DocType=9
-/// (OFFLINE_SESSION_BEGIN) minted+issued BEFORE the FIRST offline business doc
-/// of the session signs.
+/// (OFFLINE_SESSION_BEGIN) minted+issued BEFORE the FIRST offline doc of the
+/// session signs.
 ///
-/// No-op unless: (a) the doc is a business receipt (`Sell`/`Return`), AND
-/// (b) the node is in an offline mode with an active OPEN session bound to the
-/// current shift.  Then, keyed on `(fiscal_number, shift_id)` (NOT the
-/// sign-stamped `offline_session_id`, which is NULL until sign — the crash-safe
-/// anchor), it decides:
+/// **Fires for the FIRST offline doc of ANY type** (SHIFT_OPEN / SELL / RETURN /
+/// Z_REPORT / SHIFT_CLOSE) — hoisted to the common `run_staged` seam (review
+/// Finding B + HOLE A, 2026-07-08).  A Pattern-C shift opens OFFLINE, so the
+/// first offline doc is a SHIFT_OPEN, NOT a SELL; and the offline-Z surface is
+/// live — both must be bracketed by the BEGIN too.  The BEGIN must ALWAYS be
+/// the lowest-lnd offline doc so the drain sends `[9, <first doc>, …, 10]` and
+/// the DPS offline window is opened before ANY offline doc is drained.  Only
+/// the boundary docs themselves (`OfflineSessionBegin`/`End`) are excluded (they
+/// ARE the BEGIN, or the drain-time END — no recursion).
+///
+/// No-op unless: (a) the doc is NOT a boundary doc, AND (b) the node is in an
+/// offline mode with an active OPEN session bound to the current shift.  Then,
+/// keyed on `(fiscal_number, shift_id)` (NOT the sign-stamped
+/// `offline_session_id`, which is NULL until sign — the crash-safe anchor):
 ///   - **BEGIN already issued** (`OFFLINE_LOCAL_ACK`/`SENT`/`KVT1`/`KVT2`/`ACK`)
-///     → proceed (the seed already advanced; the SELL chains off it).
+///     → proceed (the seed already advanced; this doc chains off it).
 ///   - **BEGIN present but BELOW `OFFLINE_LOCAL_ACK`** (a crashed-mid-sign
 ///     PREPARED/SIGNED/… BEGIN) → fail-closed RETRYABLE 503
 ///     (`OFFLINE_SESSION_BEGIN_PENDING`): the offline lane bypasses the D5 gate,
-///     so this DocType-9-scoped guard stops the SELL from signing against a
-///     non-issued predecessor (chain-fork prevention).  Boot-resume drives the
-///     BEGIN to OLA; the client retries.
+///     so this guard stops ANY offline doc (incl. an offline Z — HOLE A) from
+///     signing past a non-issued BEGIN predecessor (chain-fork + #192-wedge
+///     prevention).  Boot-resume drives the BEGIN to OLA; the client retries.
 ///   - **BEGIN absent** → mint+sign+OLA it via [`mint_offline_session_begin`]
 ///     on the SAME FN gate the caller holds (sequential sub-drive), then
 ///     proceed.  It takes the lower lnd (allocated first) → drains first.
 ///
-/// Runs BEFORE the SELL's `run_staged`; INV-1 preserved (the BEGIN signs in its
-/// own `run_staged` sign stage, outside every write tx).
-#[allow(clippy::too_many_arguments)]
+/// Runs BEFORE the doc's `stage_acquire`; INV-1 preserved (the BEGIN signs in
+/// its own `run_staged` sign stage, outside every write tx).  The caller's FN
+/// gate is held across this whole `run_staged` scope (no re-lock).
+///
+/// B10 — the DETERMINISTIC synthetic `request_id` for the session-BEGIN
+/// (`sha256("b10-begin-<fn>")[..16]`).  One per FN, stamped at mint; the
+/// crash-safe idempotency anchor shared by `ensure_offline_session_begin`'s
+/// existence probe and `mint_offline_session_begin`'s inbox/doc insert.
+fn begin_request_id(fiscal_number: &str) -> [u8; 16] {
+    let idem = format!("b10-begin-{fiscal_number}");
+    let h: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(idem.as_bytes()).into();
+    let mut r = [0u8; 16];
+    r.copy_from_slice(&h[..16]);
+    r
+}
+
 async fn ensure_offline_session_begin(
     pool: &SqlitePool,
     pool_secure: &SqlitePool,
     dps: &dyn DpsChannel,
     sign_ctx: &SigningContext,
     fn_sign: &CheckSignBlob,
-    _fn_gate: &OwnedMutexGuard<()>,
     row: &InboxRow,
     command: &CanonicalFiscalCommand,
 ) -> Result<(), FiscalError> {
-    // (a) Only business receipts trigger the lazy BEGIN.  Shift-management and
-    // the boundary docs themselves never recurse here.
-    if !matches!(command.doc_type, DocType::Sell | DocType::Return) {
+    // (a) The boundary docs themselves never recurse here (the BEGIN's own
+    // `run_staged`, and the drain-time END, are excluded).  EVERY other offline
+    // doc type — SHIFT_OPEN, SELL, RETURN, Z_REPORT, SHIFT_CLOSE — triggers the
+    // lazy BEGIN when it is the session's first offline doc.
+    if matches!(
+        command.doc_type,
+        DocType::OfflineSessionBegin | DocType::OfflineSessionEnd
+    ) {
         return Ok(());
     }
     let request_id = row.request_id;
@@ -1180,34 +1200,33 @@ async fn ensure_offline_session_begin(
     if !matches!(ns.mode, NodeMode::Offline | NodeMode::GoingOffline) {
         return Ok(());
     }
-    let Some(shift_id) = ns.current_shift_id else {
-        // Offline with no bound shift → the SELL's acquire guard will refuse it
-        // (ShiftNotOpen); do not mint a BEGIN for a shiftless session.
-        return Ok(());
-    };
 
-    // Existence + state probe, keyed on (fn, shift_id).  One short read tx.
-    // INV-1 static-scan: the `with_immediate` closure is INLINE (`move |tx|
-    // Box::pin(async move {…})`) with captures hoisted BEFORE the call — the
-    // `with_immediate_no_foreign_io` scanner reads the body directly.
+    // Existence + state probe keyed on the BEGIN's DETERMINISTIC `request_id`
+    // (`sha256("b10-begin-<fn>")[..16]`, the same id `mint_offline_session_begin`
+    // stamps).  This is the ONLY crash-safe anchor that works for EVERY first-doc
+    // type (Finding B):
+    //   - `shift_id` fails when the first offline doc is a SHIFT_OPEN (the shift
+    //     does not exist yet — the SHIFT_OPEN creates it), so a shift-keyed probe
+    //     would miss and the SHIFT_OPEN would mint at lnd=1 with no BEGIN.
+    //   - `offline_session_id` fails for a crashed PREPARED BEGIN (the column is
+    //     NULL until sign) → a session-keyed probe would double-mint.
+    // The synthetic `request_id` is stamped at MINT (stage_acquire INSERT) and is
+    // present on a PREPARED / SIGNED / OLA / ACK BEGIN alike → no miss, no
+    // double-mint.  Still gated on an active OPEN session (nothing to bracket
+    // otherwise).  INV-1 static-scan: INLINE closure, captures hoisted.
     let fn_owned = fiscal_number.to_string();
+    let begin_request_id = begin_request_id(fiscal_number);
     let begin_state = crate::db::tx::with_immediate(pool, move |tx| {
         Box::pin(async move {
-            // Require an active OPEN session (the SELL would defer at
-            // offline-ack otherwise; do not mint a BEGIN with no session).
+            // Require an active OPEN session (the doc would defer at offline-ack
+            // otherwise; do not mint a BEGIN with no session).
             if offline_sessions::current_active_session_id_tx(tx, &fn_owned)
                 .await?
                 .is_none()
             {
                 return Ok::<Option<Option<DocState>>, anyhow::Error>(None);
             }
-            let st = fiscal_documents::active_boundary_doc_state_tx(
-                tx,
-                &fn_owned,
-                shift_id,
-                DocType::OfflineSessionBegin,
-            )
-            .await?;
+            let st = fiscal_documents::doc_state_by_request_id_tx(tx, &begin_request_id).await?;
             Ok(Some(st))
         })
     })
@@ -1218,7 +1237,7 @@ async fn ensure_offline_session_begin(
     })?;
 
     let Some(begin_state) = begin_state else {
-        // No active OPEN session → nothing to bracket yet.  The SELL proceeds;
+        // No active OPEN session → nothing to bracket yet.  The doc proceeds;
         // offline-ack defers it (NoActiveSession) per the established asymmetry.
         return Ok(());
     };
@@ -1232,13 +1251,16 @@ async fn ensure_offline_session_begin(
             | DocState::Kvt2
             | DocState::Ack,
         ) => Ok(()),
-        // Crashed mid-sign, below OLA → fail-closed RETRYABLE (Decision 5).
-        Some(_) => Err(FiscalError::OfflineRefused {
-            request_id,
-            code: codes::OFFLINE_SESSION_BEGIN_PENDING,
-        }),
-        // Absent → mint the BEGIN first, then proceed.
-        None => {
+        // Terminal-FAILED (a prior BEGIN attempt aborted / was rejected /
+        // escalated): the slot is free (mirrors the migration-030 partial UNIQUE
+        // `ux_fd_active_offline_boundary` which excludes these) → mint a fresh one.
+        Some(
+            DocState::Aborted
+            | DocState::Rejected
+            | DocState::Cancelled
+            | DocState::RequiresManualReconciliation,
+        )
+        | None => {
             mint_offline_session_begin(
                 pool,
                 pool_secure,
@@ -1251,6 +1273,13 @@ async fn ensure_offline_session_begin(
             )
             .await
         }
+        // Crashed mid-sign, below OLA (PREPARED/SIGNED/ENCRYPTED/SENDING/
+        // ERROR_RETRYABLE) → fail-closed RETRYABLE (Decision 5 / HOLE A): no doc
+        // of any type may sign past a non-issued BEGIN.  Boot-resume drives it.
+        Some(_) => Err(FiscalError::OfflineRefused {
+            request_id,
+            code: codes::OFFLINE_SESSION_BEGIN_PENDING,
+        }),
     }
 }
 
@@ -1299,14 +1328,10 @@ async fn mint_offline_session_begin(
     let payload_sha256_canonical: [u8; 32] =
         <sha2::Sha256 as sha2::Digest>::digest(payload_json.as_bytes()).into();
 
-    // Deterministic synthetic inbox row (idempotent per FN).
+    // Deterministic synthetic inbox row (idempotent per FN) — the SAME
+    // request_id the existence probe keys on (`begin_request_id`).
     let idem = format!("b10-begin-{fiscal_number}");
-    let synth_request_id: [u8; 16] = {
-        let h: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(idem.as_bytes()).into();
-        let mut r = [0u8; 16];
-        r.copy_from_slice(&h[..16]);
-        r
-    };
+    let synth_request_id: [u8; 16] = begin_request_id(fiscal_number);
     let entry = ingress_inbox::NewInboxEntry {
         request_id: synth_request_id,
         fiscal_number: fiscal_number.to_string(),
@@ -1360,7 +1385,13 @@ async fn mint_offline_session_begin(
     // the offline path it lands `OFFLINE_LOCAL_ACK` (seed advanced).  Anything
     // else → fail-closed RETRYABLE so the SELL does not sign off a non-issued
     // BEGIN (INV-4 chain integrity, Decision 5).
-    match run_staged(
+    //
+    // `Box::pin` breaks the async-fn recursion cycle `run_staged →
+    // ensure_offline_session_begin → mint_offline_session_begin → run_staged`.
+    // The recursion is depth-1 by construction: the sub-`run_staged` runs a
+    // boundary doc (`doc_type = OfflineSessionBegin`), which
+    // `ensure_offline_session_begin` excludes → no further nesting.
+    let begin_run = Box::pin(run_staged(
         pool,
         pool_secure,
         dps,
@@ -1368,9 +1399,8 @@ async fn mint_offline_session_begin(
         fn_sign,
         &synth_row,
         command,
-    )
-    .await
-    {
+    ));
+    match begin_run.await {
         Ok(outcome) if outcome.document_state == DocState::OfflineLocalAck => Ok(()),
         _ => Err(FiscalError::OfflineRefused {
             request_id: parent_request_id,

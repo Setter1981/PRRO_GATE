@@ -343,8 +343,10 @@ async fn drill_a_morning_without_network_offline_open_drain_online_z_close() {
     );
     assert_eq!(
         consumed_codes_count(app.db()).await,
-        1,
-        "numbering (ii): the shift-open doc consumed an offline code"
+        2,
+        "B10 numbering (ii): the lazy DocType=9 BEGIN (minted BEFORE the offline \
+         SHIFT_OPEN, as the session's first offline doc) + the SHIFT_OPEN each \
+         consumed a code"
     );
     prro::db::invariant_scan::assert_clean(app.db()).await;
 
@@ -363,8 +365,8 @@ async fn drill_a_morning_without_network_offline_open_drain_online_z_close() {
             "offline SELL {i} rests at OLA"
         );
     }
-    // B10: SHIFT_OPEN + lazy DocType=9 BEGIN (minted at the first offline SELL)
-    // + SELL#1 + SELL#2 = 4 OLA docs pre-drain.
+    // B10: lazy DocType=9 BEGIN (minted BEFORE the offline SHIFT_OPEN, as the
+    // session's FIRST offline doc) + SHIFT_OPEN + SELL#1 + SELL#2 = 4 OLA docs.
     assert_eq!(doc_count_in_state(app.db(), "OFFLINE_LOCAL_ACK").await, 4);
     prro::db::invariant_scan::assert_clean(app.db()).await;
 
@@ -536,21 +538,22 @@ async fn drill_b_full_offline_day_offline_open_sells_offline_z_close_drain_conve
     );
     prro::db::invariant_scan::assert_clean(app.db()).await;
 
-    // ─── 5) ORDER PIN (strict-sequential lnd): the drain will send the
-    //        shift-open doc FIRST and the Z doc LAST ────────────────────────
+    // ─── 5) ORDER PIN (strict-sequential lnd): the drain sends the BEGIN
+    //        FIRST (opens the DPS offline window) and the Z doc LAST ─────────
     let backlog = backlog_lnd_doc_types(app.db()).await;
-    // B10: SHIFT_OPEN(1) + BEGIN(2, lazily minted at the first offline SELL) +
-    // SELL(3) + SELL(4) + Z(5) = 5 backlog docs.
+    // B10: BEGIN(1, lazily minted as the session's FIRST offline doc, BEFORE the
+    // offline SHIFT_OPEN) + SHIFT_OPEN(2) + SELL(3) + SELL(4) + Z(5) = 5 docs.
     assert_eq!(backlog.len(), 5);
     assert_eq!(
         (backlog[0].1.as_str(), backlog[0].2.as_str()),
-        ("SHIFT_OPEN", "OFFLINE_LOCAL_ACK"),
-        "lowest lnd = the shift-open doc → drains FIRST"
+        ("OFFLINE_SESSION_BEGIN", "OFFLINE_LOCAL_ACK"),
+        "B10: the lazy DocType=9 BEGIN is the lowest lnd → drains FIRST (opens \
+         the DPS offline window before the offline SHIFT_OPEN)"
     );
     assert_eq!(
         (backlog[1].1.as_str(), backlog[1].2.as_str()),
-        ("OFFLINE_SESSION_BEGIN", "OFFLINE_LOCAL_ACK"),
-        "B10: the lazy DocType=9 BEGIN sits at lnd 2 (minted at the first SELL)"
+        ("SHIFT_OPEN", "OFFLINE_LOCAL_ACK"),
+        "the offline SHIFT_OPEN sits at lnd 2, right after the BEGIN"
     );
     assert_eq!(
         (backlog[4].1.as_str(), backlog[4].2.as_str()),

@@ -2665,7 +2665,22 @@ async fn ensure_and_drain_session_end(
     let acked =
         drain_session_end_doc(pool, deps, fiscal_number, session_id, &request_id_typed).await?;
     if !acked {
-        summary.record_doc_failure(DocumentId::new(), "offline_session_end_hold".to_string());
+        // LOW-3 (review): attribute the failure to the REAL END document_id (not
+        // a throwaway) for forensic traceability.  Fall back to a fresh id only
+        // if the row is somehow absent (should not happen — STEP A minted it).
+        let end_doc_id: Option<DocumentId> =
+            sqlx::query_scalar("SELECT document_id FROM fiscal_documents WHERE request_id = ?")
+                .bind(request_id_typed.as_bytes().as_slice())
+                .fetch_optional(pool)
+                .await
+                .map_err(BootError::Database)?;
+        // `DocumentId::default()` == `DocumentId::new()` (a fresh random UUIDv7 —
+        // see `id_newtype!`), so the default fallback is a distinct throwaway id,
+        // only reached if the END row is somehow absent (STEP A rules it out).
+        summary.record_doc_failure(
+            end_doc_id.unwrap_or_default(),
+            "offline_session_end_hold".to_string(),
+        );
     }
     Ok(())
 }

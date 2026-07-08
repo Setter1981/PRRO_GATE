@@ -833,3 +833,174 @@ async fn b10_redrain_after_convergence_does_not_double_mint_or_double_consume() 
     );
     prro::db::invariant_scan::assert_clean(app.db()).await;
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// Finding B (Pattern C) — the FIRST offline doc of a session can be an offline
+// SHIFT_OPEN (edge 2), NOT a SELL.  The lazy BEGIN must STILL be the lowest-lnd
+// offline doc, so the drain sends [9, SHIFT_OPEN, …, 10].  RED before the fix
+// (BEGIN was gated to Sell/Return → SHIFT_OPEN minted at lnd=1 with no BEGIN →
+// drain would send SHIFT_OPEN before the DPS offline window opened → DPS -5).
+// ══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn b10_offline_shift_open_first_doc_still_mints_begin_lowest_lnd() {
+    let app = boot_app().await;
+    let registry = build_registry(&app, shift_open_only_dps()).await;
+    seed_boot_baseline(app.db()).await;
+    let write_path = production_write_path(app.clone(), Arc::new(registry));
+
+    // Pattern C: the shift opens OFFLINE (no prior online SHIFT_OPEN).
+    prro::admin::go_offline(app.db(), FN, "morning without network")
+        .await
+        .expect("go_offline");
+    let codes: Vec<String> = (0..6).map(|i| format!("CODE-{i}")).collect();
+    prro::admin::seed_dps_offline_codes(app.db(), FN, &codes)
+        .await
+        .expect("seed codes");
+
+    // The FIRST offline doc is a SHIFT_OPEN (edge 2, Created→OpenedLocalPendingDrain).
+    let open = drive(
+        &*write_path,
+        app.db(),
+        entry("SHIFT_OPEN", SHIFT_OPEN_PAYLOAD, "idem-c-OPEN", None),
+    )
+    .await
+    .expect("offline SHIFT_OPEN must local-ack");
+    assert_eq!(open.document_state, DocState::OfflineLocalAck);
+
+    // The lazy BEGIN must exist AND be the LOWEST lnd (below the SHIFT_OPEN).
+    let docs = doc_types_by_lnd(app.db()).await;
+    let begin = docs
+        .iter()
+        .find(|(_, dt, _)| dt == "OFFLINE_SESSION_BEGIN")
+        .unwrap_or_else(|| {
+            panic!("a DocType=9 BEGIN must be minted for offline SHIFT_OPEN: {docs:?}")
+        });
+    let so = docs
+        .iter()
+        .find(|(_, dt, _)| dt == "SHIFT_OPEN")
+        .expect("the offline SHIFT_OPEN row");
+    assert!(
+        begin.0 < so.0,
+        "BEGIN(lnd={}) must precede the offline SHIFT_OPEN(lnd={}) so it drains FIRST: {docs:?}",
+        begin.0,
+        so.0
+    );
+    assert_eq!(
+        count_doc_type(app.db(), DocType::OfflineSessionBegin).await,
+        1
+    );
+
+    // Drain: wire order must be [9(ServiceChk) FIRST, SHIFT_OPEN, 10 LAST].
+    prro::admin::go_online(app.db(), FN, "restored")
+        .await
+        .expect("go_online");
+    let carriers = drain_carriers(3); // BEGIN + SHIFT_OPEN + END
+    let view = drain_view(&carriers);
+    let outcome = app
+        .drain_offline_backlog_scheduled(FN, &view)
+        .await
+        .expect("drain must run");
+    match outcome {
+        ScheduledDrainOutcome::Ran(s) => assert!(s.finalized(), "drain finalizes"),
+        ScheduledDrainOutcome::SkippedBackoff { .. } => panic!("first tick must run"),
+    }
+    let order = carriers.dps.wire_order();
+    assert!(order.len() >= 3, "expected >= 3 wire sends, got {order:?}");
+    // FIRST is the BEGIN (ServiceChk) — it opens the DPS offline window BEFORE
+    // the SHIFT_OPEN is sent (the whole point: no -5 on the SHIFT_OPEN).
+    assert_eq!(
+        order.first().unwrap().0,
+        DpsCheckType::ServiceChk,
+        "FIRST wire send must be the BEGIN (opens the DPS offline window): {order:?}"
+    );
+    assert_eq!(
+        order.last().unwrap().0,
+        DpsCheckType::ServiceChk,
+        "LAST wire send must be the END: {order:?}"
+    );
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// HOLE A (#192-class wedge) — a crash-stuck SIGNED BEGIN (durably SIGNED, seed
+// NOT advanced: the sign↔OLA crash window) must NOT be signed-past by an
+// incoming offline Z_REPORT (offline-Z surface is live).  If the Z signed past
+// it and advanced the seed, boot-resume driving the BEGIN to OLA would hit the
+// seed-drift assert and bail → BEGIN wedged SIGNED forever = undrainable
+// session (#192 violation).  The first-offline-doc guard must fail-closed
+// REGARDLESS of doc type.  RED before the fix (Z bypassed the BEGIN guard).
+// ══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn b10_offline_z_does_not_sign_past_a_crash_stuck_begin() {
+    use prro::runtime::ingress::seam::FiscalError;
+
+    let app = boot_app().await;
+    let registry = build_registry(&app, shift_open_only_dps()).await;
+    seed_boot_baseline(app.db()).await;
+    let write_path = production_write_path(app.clone(), Arc::new(registry));
+
+    drive(
+        &*write_path,
+        app.db(),
+        entry("SHIFT_OPEN", SHIFT_OPEN_PAYLOAD, "idem-z-OPEN", None),
+    )
+    .await
+    .expect("online SHIFT_OPEN");
+    prro::admin::go_offline(app.db(), FN, "net drop")
+        .await
+        .expect("go_offline");
+    let codes: Vec<String> = (0..6).map(|i| format!("CODE-{i}")).collect();
+    prro::admin::seed_dps_offline_codes(app.db(), FN, &codes)
+        .await
+        .expect("seed codes");
+
+    // Inject a crash-stuck SIGNED BEGIN: a durably-SIGNED boundary doc bound to
+    // the shift with offline_session_id NULL + NO code stamp (exactly what a
+    // crash between sign and offline-ack leaves), FN seed NOT advanced.
+    let shift_id: Vec<u8> =
+        sqlx::query_scalar("SELECT current_shift_id FROM node_state WHERE fiscal_number = ?")
+            .bind(FN)
+            .fetch_one(app.db())
+            .await
+            .unwrap();
+    sqlx::query(
+        "INSERT INTO fiscal_documents \
+         (document_id, request_id, fiscal_number, shift_id, offline_session_id, lnd, doc_type, \
+          state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+          payload_sha256_canonical, source_sha256, unsigned_xml_sha256, previous_hash) \
+         VALUES (randomblob(16), randomblob(16), ?, ?, NULL, 900, 'OFFLINE_SESSION_BEGIN', \
+          'SIGNED', 'b', 't', 'OFFLINE', '2026-07-07T00:00:00Z', '{}', \
+          zeroblob(32), zeroblob(32), zeroblob(32), NULL)",
+    )
+    .bind(FN)
+    .bind(&shift_id)
+    .execute(app.db())
+    .await
+    .unwrap();
+
+    // An incoming offline Z_REPORT must NOT sign past the stuck SIGNED BEGIN.
+    let z_res = drive(
+        &*write_path,
+        app.db(),
+        entry("Z_REPORT", r#"{}"#, "idem-z-Z", None),
+    )
+    .await;
+    assert!(
+        matches!(z_res, Err(FiscalError::OfflineRefused { .. })),
+        "offline Z must fail-closed while a BEGIN is stuck below OLA, got {z_res:?}"
+    );
+    // No Z row minted past the non-issued BEGIN (no wedge).
+    let z_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'Z_REPORT'",
+    )
+    .bind(FN)
+    .fetch_one(app.db())
+    .await
+    .unwrap();
+    assert_eq!(
+        z_rows, 0,
+        "no Z_REPORT row may be signed past a non-issued BEGIN"
+    );
+}

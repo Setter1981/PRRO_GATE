@@ -313,12 +313,16 @@ pub async fn run(
                     ns.shift_state == ShiftState::ClosingLocalPendingDrain
                 }
                 // B10 — offline-session BEGIN is minted lazily as the FIRST
-                // offline business doc of a session, so the shift is in the
-                // same state a regular offline receipt local-acks in
-                // (`Opened | OpenedLocalPendingDrain`).
+                // offline doc of a session, BEFORE that doc.  For a SELL/RETURN
+                // first-doc the shift is `Opened`/`OpenedLocalPendingDrain`; for a
+                // Pattern-C offline SHIFT_OPEN first-doc the shift is still
+                // `Closed` (the SHIFT_OPEN has not opened it yet) — so the BEGIN
+                // local-acks in `Closed` too (review Finding B).
                 DocType::OfflineSessionBegin => matches!(
                     ns.shift_state,
-                    ShiftState::Opened | ShiftState::OpenedLocalPendingDrain,
+                    ShiftState::Closed
+                        | ShiftState::Opened
+                        | ShiftState::OpenedLocalPendingDrain,
                 ),
                 // B10 — offline-session END is minted at drain finalize; the
                 // shift may be any live-offline pending-drain / opened state
