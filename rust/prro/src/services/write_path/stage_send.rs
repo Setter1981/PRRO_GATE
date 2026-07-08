@@ -149,6 +149,27 @@ pub enum StageSendError {
     )]
     OfflineFiscalNoMissing { document_id: DocumentId },
 
+    /// **STOP-O3-1 fix (v7) — wire-correctness fail-closed.**  A doc ACQUIRED
+    /// OFFLINE (`fs_mode = 'OFFLINE'`) that is NOT yet offline-acked
+    /// (`offline_fiscal_no IS NULL`, so state ∈ {Signed, ErrorRetryable}) must
+    /// NEVER be sent to DPS online.  Closes the GO_ONLINE mode-race: an offline
+    /// SHIFT_OPEN / SHIFT_CLOSE / Z_REPORT / SELL committed its acquire edge +
+    /// signed under `mode = Offline`, then the mode flipped to `Online` before
+    /// `dispatch_post_sign` (which routes by NODE mode, not doc `fs_mode`) →
+    /// the doc would otherwise be sent with an empty `id_offline`, wrongly
+    /// issuing to DPS a receipt that was never offline-numbered.  Refused
+    /// BEFORE any CAS / `Sending` marker / wire — the doc stays put for the
+    /// offline lane (offline-ack on return-offline, or the orphan-recovery of
+    /// fix (b) / boot SW-2).  Drain-owned offline docs are EXCLUDED (they are
+    /// `OfflineLocalAck` with `offline_fiscal_no = Some`); online docs are
+    /// `fs_mode = 'ONLINE'`.
+    #[error(
+        "stage 4 (v7): doc {document_id:?} was acquired OFFLINE (fs_mode=OFFLINE) and is not yet \
+         offline-acked (offline_fiscal_no NULL) — refusing the online send (GO_ONLINE mode-race); \
+         the doc stays put for the offline lane / orphan recovery"
+    )]
+    OfflineDocRoutedOnline { document_id: DocumentId },
+
     /// **M3b W9a Round 2 LOW #1 fix (2026-05-16):** the doc is in
     /// `OfflineLocalAck` and `fiscal_documents.offline_fiscal_no` is
     /// present but non-positive (`<= 0`).  W7a writes
@@ -611,6 +632,11 @@ enum PreOutcome {
     /// Round 7 §8.1 Ok-return contract).  No CAS, no trace, no marker,
     /// no wire.
     SignerRefused(SignerCashierMismatch),
+    /// STOP-O3-1 fix (v7) — an OFFLINE-acquired, not-yet-offline-acked doc was
+    /// routed to stage_send by the GO_ONLINE mode-race.  Read-only refusal
+    /// branch (no CAS, no trace, no marker, no wire); surfaced as the typed
+    /// [`StageSendError::OfflineDocRoutedOnline`] after the closure returns.
+    OfflineDocRoutedOnline,
 }
 
 /// SHA-256 over the **full** prost-encoded `gen::Check` proto bytes
@@ -1179,6 +1205,35 @@ async fn run_one_attempt(
                 });
             }
 
+            // ── STOP-O3-1 fix (v7) — wire-correctness fail-closed ────
+            //
+            // Refuse the online send of an OFFLINE-acquired doc that is
+            // NOT yet offline-acked (the GO_ONLINE mode-race).  Only
+            // possible when `offline_fiscal_no IS NULL` — drain-owned
+            // offline docs carry `Some` and are excluded, online docs
+            // are `fs_mode='ONLINE'` — so the extra read is skipped on
+            // the hot path.  Read-only branch: no CAS / marker / wire;
+            // the doc stays put for the offline lane / orphan recovery
+            // (fix (b) / boot SW-2).  Placed AFTER the state-allowlist
+            // and BEFORE the signer guard / envelope build / CAS so the
+            // advance-at-SEND core is untouched.  SCOPED to the online
+            // acquire-then-race states {Signed, ErrorRetryable}: an
+            // `OfflineLocalAck` doc is the DRAIN's territory — its
+            // NULL-offline_fiscal_no breach keeps the existing
+            // `OfflineFiscalNoMissing` disposition below (unchanged).
+            if matches!(inputs.state, DocState::Signed | DocState::ErrorRetryable)
+                && inputs.offline_fiscal_no.is_none()
+            {
+                let fs_mode: Option<String> =
+                    sqlx::query_scalar("SELECT fs_mode FROM fiscal_documents WHERE document_id = ?")
+                        .bind(doc)
+                        .fetch_one(&mut **tx)
+                        .await?;
+                if fs_mode.as_deref() == Some("OFFLINE") {
+                    return Ok(PreOutcome::OfflineDocRoutedOnline);
+                }
+            }
+
             // ── W14a-2b Commit 5: signer-cashier enforcement ─────────
             //
             // Per spec §2.3 + §16.8: validate that
@@ -1406,6 +1461,10 @@ async fn run_one_attempt(
             return Err(StageSendError::SignedArtifactMissing { document_id: doc })
         }
         PreOutcome::EnvelopeBuildFailed(e) => return Err(e),
+        // STOP-O3-1 fix (v7) — fail-closed: no wire, doc left untouched.
+        PreOutcome::OfflineDocRoutedOnline => {
+            return Err(StageSendError::OfflineDocRoutedOnline { document_id: doc })
+        }
         PreOutcome::StateConflict { observed } => {
             return Ok(StageSendOutcome::StateConflict { observed })
         }

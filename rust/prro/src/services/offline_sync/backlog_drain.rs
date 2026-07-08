@@ -3036,6 +3036,12 @@ fn failure_class_for_send_err(err: &StageSendError) -> FailureClass {
         | StageSendError::SetServerFiscalNoMissing { .. }
         | StageSendError::TraceMissingAtComplete { .. }
         | StageSendError::Db(_)
+        // STOP-O3-1 fix (v7): unreachable on the drain path — the drain sends
+        // `OfflineLocalAck` docs (offline_fiscal_no=Some), while (v7) is scoped
+        // to {Signed, ErrorRetryable} with offline_fiscal_no NULL.  Classified
+        // Internal for exhaustiveness (a drain producing it would be a
+        // structural anomaly).
+        | StageSendError::OfflineDocRoutedOnline { .. }
         | StageSendError::Internal(_) => FailureClass::Internal,
     }
 }
