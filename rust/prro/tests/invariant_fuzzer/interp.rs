@@ -357,6 +357,20 @@ impl FuzzCtx {
             .unwrap()
     }
 
+    /// B10 — count of rows of a given `doc_type` on the FN.  Replaces
+    /// `only_doc_type` for offline assertions where the lazy BEGIN adds a second
+    /// row (so a single-row `fetch_one` would panic).
+    pub async fn count_doc_type(&self, doc_type: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = ?",
+        )
+        .bind(self.fn_id.as_str())
+        .bind(doc_type)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
     async fn observe_doc_by_request_id(&self, request_id: &[u8; 16]) -> ObservedDoc {
         let (lnd, state, previous_hash): (i64, String, Option<Vec<u8>>) = sqlx::query_as(
             "SELECT lnd, state, previous_hash FROM fiscal_documents \
@@ -1601,23 +1615,30 @@ async fn crash_send_then_reboot_recovers_without_panic_or_resend() {
 
 #[tokio::test]
 async fn offline_sell_lands_offline_local_ack() {
-    let mut ctx = FuzzCtx::new_offline_open_shift(1).await;
+    // B10: the first offline sell lazily mints a DocType=9 BEGIN (code#1) before
+    // the SELL (code#2) → seed 2 codes; the op reports `Recovered` (two-doc ledger
+    // delta) and BOTH docs rest OFFLINE_LOCAL_ACK.
+    let mut ctx = FuzzCtx::new_offline_open_shift(2).await;
     let out = run_op(&mut ctx, &Op::OfflineSell).await;
-    match out {
-        RealOutcome::Doc(d) => {
-            assert_eq!(
-                d.doc_state,
-                DocState::OfflineLocalAck,
-                "offline issuance is local"
-            );
-            assert_eq!(d.code_consumed, Some(1), "one offline code consumed");
-        }
-        other => panic!("expected Doc(OfflineLocalAck), got {other:?}"),
-    }
+    assert!(
+        matches!(out, RealOutcome::Recovered { .. } | RealOutcome::Doc(_)),
+        "expected a Doc/Recovered (interposed BEGIN) offline-local-ack, got {out:?}"
+    );
+    // Both the lazy BEGIN and the SELL rest OFFLINE_LOCAL_ACK; two codes consumed.
+    let ola: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND state = 'OFFLINE_LOCAL_ACK'",
+    )
+    .bind(ctx.fn_id.as_str())
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(ola, 2, "BEGIN + SELL both at OFFLINE_LOCAL_ACK");
+    assert_eq!(ctx.count_doc_type("OFFLINE_SESSION_BEGIN").await, 1, "one lazy BEGIN");
+    assert_eq!(ctx.consumed_codes_count().await, 2, "two offline codes consumed");
     assert_eq!(
         ctx.send_calls(),
         0,
-        "offline issuance must NOT touch the wire"
+        "offline issuance must NOT touch the wire (neither the BEGIN nor the SELL)"
     );
 }
 

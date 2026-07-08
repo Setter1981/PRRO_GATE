@@ -461,14 +461,31 @@ async fn online_return_produces_a_genuine_return_doc() {
 async fn offline_return_produces_a_genuine_return_doc() {
     let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
     let outcome = interp::run_op(&mut ctx, &Op::OfflineReturn).await;
+    // B10: the first offline doc lazily interposes a DocType=9 BEGIN, so the op is
+    // a two-doc ledger delta → the interp reports `Recovered` (routes to the
+    // ledger-delta oracle), and there are now BEGIN + RETURN rows (so
+    // `only_doc_type` no longer applies).
     assert!(
-        matches!(outcome, interp::RealOutcome::Doc(_)),
-        "an OFFLINE RETURN must issue a doc, got {outcome:?}"
+        matches!(
+            outcome,
+            interp::RealOutcome::Recovered { .. } | interp::RealOutcome::Doc(_)
+        ),
+        "an OFFLINE RETURN must issue a doc (or Recovered w/ interposed BEGIN), got {outcome:?}"
     );
     assert_eq!(
-        ctx.only_doc_type().await,
-        "RETURN",
-        "the offline fuzzer lane must drive a genuine RETURN, not a mislabeled SELL"
+        ctx.count_doc_type("RETURN").await,
+        1,
+        "the offline fuzzer lane must drive exactly one genuine RETURN, not a mislabeled SELL"
+    );
+    assert_eq!(
+        ctx.count_doc_type("OFFLINE_SESSION_BEGIN").await,
+        1,
+        "the lazy BEGIN is interposed before the RETURN"
+    );
+    assert_eq!(
+        ctx.count_doc_type("SELL").await,
+        0,
+        "no SELL row (the RETURN is genuine, and the BEGIN is a service receipt)"
     );
 }
 
