@@ -142,17 +142,20 @@ async fn seed_offline_local_ack(
     let doc_id = DocumentId::new();
     let req_id = Uuid::now_v7();
     let sha = vec![0u8; 32];
+    // B8: offline_dps_code must be set so fetch_send_inputs_tx returns non-NULL
+    // and the fail-closed drain guard in stage_send passes.
+    let dps_code = format!("DRAIN-{code_lnd}");
     sqlx::query(
         "INSERT INTO fiscal_documents( \
             document_id, request_id, fiscal_number, shift_id, lnd, doc_type, state, \
             backend_profile_id, transport_profile_id, fs_mode, business_ts, \
             payload_json, payload_sha256_canonical, signed_by_cashier_id, \
-            offline_session_id, offline_fiscal_no, offline_fiscal_date \
+            offline_session_id, offline_fiscal_no, offline_fiscal_date, offline_dps_code \
          ) VALUES ( \
             ?, ?, ?, ?, ?, 'SELL', 'OFFLINE_LOCAL_ACK', \
             'b', 't', 'OFFLINE', '2026-05-21T00:00:00Z', \
             '{}', ?, ?, \
-            ?, ?, '2026-05-21T00:00:00Z' \
+            ?, ?, '2026-05-21T00:00:00Z', ? \
          )",
     )
     .bind(doc_id)
@@ -164,6 +167,7 @@ async fn seed_offline_local_ack(
     .bind(CASHIER_OK)
     .bind(session_id)
     .bind(code_lnd)
+    .bind(&dps_code)
     .execute(pool)
     .await
     .unwrap();

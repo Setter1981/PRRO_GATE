@@ -113,12 +113,15 @@ async fn seed_signed_doc(
     // (Harmless for the offline-origin negative fixture — its advance is
     // origin-gated off, so unsigned is simply never read.)
     let unsigned = vec![doc_byte; 32];
+    // B8: offline_dps_code must be set whenever offline_fiscal_no is set so that
+    // fetch_send_inputs_tx returns a non-NULL value and the fail-closed drain guard passes.
+    let offline_dps_code: Option<String> = offline_fiscal_no.map(|n| format!("DRILL-P2-{n}"));
     sqlx::query(
         "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
             doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
             payload_json, payload_sha256_canonical, unsigned_xml_sha256, offline_fiscal_no, \
-            signed_by_cashier_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'b1', 't1', ?, '2026-05-09T12:34:56Z', '{}', ?, ?, ?, ?)",
+            offline_dps_code, signed_by_cashier_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'b1', 't1', ?, '2026-05-09T12:34:56Z', '{}', ?, ?, ?, ?, ?)",
     )
     .bind(&doc)
     .bind(&req)
@@ -131,6 +134,7 @@ async fn seed_signed_doc(
     .bind(vec![0u8; 32])
     .bind(&unsigned)
     .bind(offline_fiscal_no)
+    .bind(offline_dps_code)
     .bind(cashier)
     .execute(pool)
     .await

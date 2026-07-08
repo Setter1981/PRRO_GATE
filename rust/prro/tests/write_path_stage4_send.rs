@@ -981,14 +981,18 @@ async fn seed_w7a_offline_local_ack(pool: &SqlitePool, doc_byte: u8, code_lnd: i
     .execute(pool)
     .await
     .expect("seed offline_code (consumed by this doc)");
+    // B8: also stamp offline_dps_code so the fail-closed drain guard passes.
+    let dps_code = format!("DRILL-W9A-{code_lnd}");
     sqlx::query(
         "UPDATE fiscal_documents \
-         SET offline_fiscal_no = ?, offline_fiscal_date = ?, offline_session_id = ? \
+         SET offline_fiscal_no = ?, offline_fiscal_date = ?, offline_session_id = ?, \
+             offline_dps_code = ? \
          WHERE document_id = ?",
     )
     .bind(code_lnd)
     .bind(consumed_at)
     .bind(&session_id)
+    .bind(&dps_code)
     .bind(doc)
     .execute(pool)
     .await
@@ -1147,9 +1151,12 @@ async fn w9a_offline_drain_wire_envelope_carries_id_offline_stringified() {
     );
 
     let env = recorder.first();
+    // B8-3: id_offline now comes from offline_dps_code (the opaque DPS string),
+    // not from offline_fiscal_no.to_string().  seed_w7a_offline_local_ack stamps
+    // dps_code = format!("DRILL-W9A-{code_lnd}") so for code_lnd=42 we expect "DRILL-W9A-42".
     assert_eq!(
-        env.id_offline, "42",
-        "id_offline must equal offline_fiscal_no stringified (DPS wire contract)"
+        env.id_offline, "DRILL-W9A-42",
+        "id_offline must equal offline_dps_code (B8 DPS wire contract)"
     );
     assert_eq!(env.id_cancel, "", "id_cancel stays empty in W9a");
     assert_eq!(env.rro_fn, "1234567890");

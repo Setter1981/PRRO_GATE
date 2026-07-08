@@ -63,6 +63,7 @@ fn sample_inputs_with_fn(
         previous_hash: None,
         unsigned_xml_sha256: None,
         mac_recovery_attempts: 0,
+        offline_dps_code: None,
     }
 }
 

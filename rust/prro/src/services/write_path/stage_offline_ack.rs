@@ -361,9 +361,9 @@ pub async fn run(
             // ─── Step 7: transition Signed → OfflineLocalAck ────────
             //
             // Single UPDATE stamps state + offline_fiscal_no +
-            // offline_fiscal_date + offline_session_id atomically
-            // (operator W7 criterion 5).  Helper now also takes
-            // `fiscal_number` and filters on it in the WHERE clause
+            // offline_fiscal_date + offline_session_id + offline_dps_code
+            // atomically (operator W7 criterion 5; B8-2 adds dps_code).
+            // Helper also filters on `fiscal_number` in the WHERE clause
             // (operator W7 Round 1 HIGH-2 fix).
             let outcome = fd::transition_to_offline_local_ack_tx(
                 tx,
@@ -372,6 +372,7 @@ pub async fn run(
                 acquired.code_lnd,
                 &acquired.consumed_at,
                 session_id,
+                &acquired.dps_code,
             )
             .await?;
 

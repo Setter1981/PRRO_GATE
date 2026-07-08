@@ -1,0 +1,98 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT state                as \"state: DocState\",\n                  fiscal_number,\n                  lnd,\n                  doc_type             as \"doc_type: DocType\",\n                  business_ts,\n                  backend_profile_id,\n                  transport_profile_id,\n                  offline_fiscal_no,\n                  offline_dps_code,\n                  shift_id             as \"shift_id: ShiftId\",\n                  signed_by_cashier_id as \"signed_by_cashier_id: CashierId\",\n                  previous_hash        as \"previous_hash: Vec<u8>\",\n                  unsigned_xml_sha256  as \"unsigned_xml_sha256: Vec<u8>\",\n                  mac_recovery_attempts\n           FROM fiscal_documents WHERE document_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "state: DocState",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "fiscal_number",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "lnd",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "doc_type: DocType",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "business_ts",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "backend_profile_id",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "transport_profile_id",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "offline_fiscal_no",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "offline_dps_code",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "shift_id: ShiftId",
+        "ordinal": 9,
+        "type_info": "Blob"
+      },
+      {
+        "name": "signed_by_cashier_id: CashierId",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "previous_hash: Vec<u8>",
+        "ordinal": 11,
+        "type_info": "Blob"
+      },
+      {
+        "name": "unsigned_xml_sha256: Vec<u8>",
+        "ordinal": 12,
+        "type_info": "Blob"
+      },
+      {
+        "name": "mac_recovery_attempts",
+        "ordinal": 13,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "f1f3f24eef495e4a7cdd83726d8489224ed73bd503314001fa977e02f884cf4f"
+}

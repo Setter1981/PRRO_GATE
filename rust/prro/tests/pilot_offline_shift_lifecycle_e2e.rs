@@ -317,7 +317,9 @@ async fn drill_a_morning_without_network_offline_open_drain_online_z_close() {
         offline_session_state(app.db()).await.as_deref(),
         Some("OPEN")
     );
-    prro::admin::seed_offline_codes(app.db(), FN, 4000, 4005, "cabinet drill range")
+    // B8-1: seed with real dps_code strings (acquire_code_tx requires dps_code IS NOT NULL).
+    let codes_a: Vec<String> = (0..6).map(|i| format!("DRILL-SL-A-{i}")).collect();
+    prro::admin::seed_dps_offline_codes(app.db(), FN, &codes_a)
         .await
         .expect("seed codes");
 
@@ -447,7 +449,9 @@ async fn drill_b_full_offline_day_offline_open_sells_offline_z_close_drain_conve
     prro::admin::go_offline(app.db(), FN, "full offline day")
         .await
         .expect("live door: GO_OFFLINE");
-    prro::admin::seed_offline_codes(app.db(), FN, 5000, 5009, "cabinet drill range")
+    // B8-1: seed with real dps_code strings.
+    let codes_b: Vec<String> = (0..10).map(|i| format!("DRILL-SL-B-{i}")).collect();
+    prro::admin::seed_dps_offline_codes(app.db(), FN, &codes_b)
         .await
         .expect("seed codes");
 

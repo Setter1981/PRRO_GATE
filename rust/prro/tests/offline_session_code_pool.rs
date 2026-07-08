@@ -165,15 +165,40 @@ async fn seed_code_range_empty_range_is_noop() {
     assert_eq!(total, 0);
 }
 
+// ─── B8: helper to seed DPS-issued codes (dps_code NOT NULL) ────────
+// acquire_code_tx (B8-1) only picks codes where dps_code IS NOT NULL,
+// so acquire tests must seed via raw INSERT with dps_code set.
+
+async fn seed_dps_codes_raw(pool: &sqlx::SqlitePool, fiscal_number: &str, codes: &[(&str, i64)]) {
+    for (dps_code, code_lnd) in codes {
+        sqlx::query(
+            "INSERT INTO offline_codes(fiscal_number, code_lnd, dps_code) VALUES (?, ?, ?)",
+        )
+        .bind(fiscal_number)
+        .bind(*code_lnd)
+        .bind(*dps_code)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
 // ─── acquire_code_tx ────────────────────────────────────────────────
 
 #[tokio::test]
 async fn acquire_code_picks_lowest_available_and_stamps_consumed() {
     let (_d, pool) = fresh_pool().await;
-    seed_via_envelope(&pool, FN, 100, 102).await;
+    // B8-1: seed with dps_code so acquire_code_tx can pick them.
+    seed_dps_codes_raw(
+        &pool,
+        FN,
+        &[("DPS-100", 100), ("DPS-101", 101), ("DPS-102", 102)],
+    )
+    .await;
     let doc = insert_fiscal_doc(&pool, FN, 1).await;
     let acquired = acquire_via_envelope(&pool, FN, doc).await.unwrap();
     assert_eq!(acquired.code_lnd, 100, "must pick lowest available code");
+    assert_eq!(acquired.dps_code, "DPS-100", "dps_code must be returned");
     assert!(
         !acquired.consumed_at.is_empty(),
         "consumed_at must be stamped"
@@ -211,7 +236,8 @@ async fn acquire_code_returns_code_pool_exhausted_on_empty_pool() {
 #[tokio::test]
 async fn acquire_code_returns_code_pool_exhausted_after_full_drain() {
     let (_d, pool) = fresh_pool().await;
-    seed_via_envelope(&pool, FN, 1, 2).await;
+    // B8-1: seed with dps_code.
+    seed_dps_codes_raw(&pool, FN, &[("DPS-1", 1), ("DPS-2", 2)]).await;
     let doc1 = insert_fiscal_doc(&pool, FN, 1).await;
     let doc2 = insert_fiscal_doc(&pool, FN, 2).await;
     let _ = acquire_via_envelope(&pool, FN, doc1).await.unwrap();
@@ -231,7 +257,8 @@ async fn acquire_code_returns_code_pool_exhausted_after_full_drain() {
 #[tokio::test]
 async fn acquire_code_classifies_partial_unique_violation_as_offline_code_already_consumed() {
     let (_d, pool) = fresh_pool().await;
-    seed_via_envelope(&pool, FN, 1, 2).await;
+    // B8-1: seed with dps_code so acquire can pick them.
+    seed_dps_codes_raw(&pool, FN, &[("DPS-1", 1), ("DPS-2", 2)]).await;
     let doc_x = insert_fiscal_doc(&pool, FN, 1).await;
 
     // Engineer the W4-compat violation path: manually link code 1
@@ -280,7 +307,19 @@ async fn concurrent_acquire_on_same_fn_returns_distinct_codes() {
     // next.
     let (_d, pool) = fresh_pool().await;
     let pool = Arc::new(pool);
-    seed_via_envelope(&pool, FN, 1, 5).await;
+    // B8-1: seed with dps_code so acquire_code_tx can pick them.
+    seed_dps_codes_raw(
+        &pool,
+        FN,
+        &[
+            ("DPS-1", 1),
+            ("DPS-2", 2),
+            ("DPS-3", 3),
+            ("DPS-4", 4),
+            ("DPS-5", 5),
+        ],
+    )
+    .await;
     let doc_a = insert_fiscal_doc(&pool, FN, 1).await;
     let doc_b = insert_fiscal_doc(&pool, FN, 2).await;
 

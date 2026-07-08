@@ -975,9 +975,10 @@ async fn boot_with_deps_routes_offline_signed_doc_to_offline_local_ack() {
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_lnd) VALUES (?, ?)")
+    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_lnd, dps_code) VALUES (?, ?, ?)")
         .bind("1234567890")
         .bind(42_i64)
+        .bind("DRILL-42")
         .execute(&pool)
         .await
         .unwrap();

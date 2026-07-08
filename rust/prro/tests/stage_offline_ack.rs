@@ -88,14 +88,20 @@ async fn seed_offline_session(
     .unwrap();
 }
 
-/// Seed an unconsumed offline_codes row.
+/// Seed an unconsumed offline_codes row with a synthetic dps_code.
+///
+/// B8-1: `acquire_code_tx` now requires `dps_code IS NOT NULL`.  Drill rows
+/// seeded for tests use synthetic codes of the form `"DRILL-{code_lnd}"` so
+/// they are acquired correctly by the B8-updated path.
 async fn seed_code(pool: &sqlx::SqlitePool, fn_id: &str, code_lnd: i64) {
+    let dps_code = format!("DRILL-{code_lnd}");
     sqlx::query(
-        "INSERT INTO offline_codes(fiscal_number, code_lnd) \
-         VALUES (?, ?)",
+        "INSERT INTO offline_codes(fiscal_number, code_lnd, dps_code) \
+         VALUES (?, ?, ?)",
     )
     .bind(fn_id)
     .bind(code_lnd)
+    .bind(&dps_code)
     .execute(pool)
     .await
     .unwrap();

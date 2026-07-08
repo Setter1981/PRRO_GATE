@@ -195,6 +195,22 @@ pub enum StageSendError {
         observed: i64,
     },
 
+    /// B8-3: `fiscal_documents.offline_dps_code` is NULL for a doc in
+    /// `OfflineLocalAck`.  The stamp is written atomically with the
+    /// `offline_fiscal_no` at the `Signed → OfflineLocalAck` CAS
+    /// (`transition_to_offline_local_ack_tx`); a NULL here is a
+    /// producer-side invariant breach (raw-SQL bypass or a pre-B8 doc
+    /// that was offline-acked before migration 029 landed).  Surfaced
+    /// fail-closed BEFORE any CAS / wire side-effect so the doc stays
+    /// in `OfflineLocalAck` for operator inspection; emitting the
+    /// integer ordinal string silently mis-identifies the receipt to DPS.
+    #[error(
+        "stage 4 W9 drain: doc {document_id:?} is in OfflineLocalAck but offline_dps_code is \
+         NULL; the opaque DPS code must be stamped atomically with offline_fiscal_no at W7a \
+         (transition_to_offline_local_ack_tx)"
+    )]
+    OfflineDpsCodeMissing { document_id: DocumentId },
+
     /// `inputs.business_ts` could not be parsed as UTC ISO-8601, or the
     /// Kyiv-local components could not be re-interpreted as UTC for
     /// the DPS Kyiv-local-as-epoch shape.
@@ -448,10 +464,11 @@ pub fn build_send_envelope(
     // requires `id_offline = offline_fiscal_no.to_string()`.  For
     // M3a online docs this is `NULL` and the empty string maps to
     // DPS-interpreted "online" per the Sprint-7 Python contract.
-    let id_offline = inputs
-        .offline_fiscal_no
-        .map(|n| n.to_string())
-        .unwrap_or_default();
+    // B8-3: render id_offline from the opaque DPS code string, not the integer
+    // ordinal.  For offline-origin docs the guard above guarantees
+    // `offline_dps_code` is `Some`; for online docs it is `None` → empty
+    // string (DPS interprets empty as "online" per Sprint-7 contract).
+    let id_offline = inputs.offline_dps_code.clone().unwrap_or_default();
 
     Ok(CheckEnvelope {
         rro_fn: inputs.fiscal_number.clone(),
@@ -1310,6 +1327,15 @@ async fn run_one_attempt(
                     }
                     Some(_) => {}
                 }
+                // B8-3: fail-closed guard — the opaque DPS code must be
+                // present.  A NULL here is a producer-side breach (pre-B8
+                // doc or raw-SQL bypass); emitting the integer ordinal
+                // string would silently mis-identify the receipt to DPS.
+                if inputs.offline_dps_code.is_none() {
+                    return Ok(PreOutcome::EnvelopeBuildFailed(
+                        StageSendError::OfflineDpsCodeMissing { document_id: doc },
+                    ));
+                }
             }
 
             // Build envelope BEFORE CAS — fail-closed on
@@ -1980,6 +2006,8 @@ mod tests {
             previous_hash: None,
             unsigned_xml_sha256: None,
             mac_recovery_attempts: 0,
+            // B8-3: online test docs have no offline_dps_code.
+            offline_dps_code: None,
         }
     }
 

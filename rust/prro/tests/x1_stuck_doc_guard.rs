@@ -98,9 +98,10 @@ async fn seed_open_offline_session(pool: &SqlitePool, fn_id: &str) {
 }
 
 async fn seed_available_offline_code(pool: &SqlitePool, fn_id: &str, code_lnd: i64) {
-    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_lnd) VALUES (?, ?)")
+    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_lnd, dps_code) VALUES (?, ?, ?)")
         .bind(fn_id)
         .bind(code_lnd)
+        .bind(format!("DRILL-{code_lnd}"))
         .execute(pool)
         .await
         .unwrap();

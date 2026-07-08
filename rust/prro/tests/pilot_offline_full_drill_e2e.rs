@@ -326,7 +326,10 @@ async fn pilot_offline_full_drill_go_offline_sell_return_go_online_drain_converg
     );
 
     // ─── 3) seed real codes + offline SELL + RETURN via the live binding ──
-    prro::admin::seed_offline_codes(app.db(), FN, 2000, 2005, "cabinet drill range")
+    // B8-1: seed with explicit dps_code strings so acquire_code_tx (which now
+    // requires dps_code IS NOT NULL) can drain them.
+    let codes_a: Vec<String> = (0..6).map(|i| format!("DRILL-A-{i}")).collect();
+    prro::admin::seed_dps_offline_codes(app.db(), FN, &codes_a)
         .await
         .expect("seed codes");
     let sell = drive(
@@ -479,7 +482,9 @@ async fn combined_pilot_gate_online_and_offline_cohorts_in_one_shift() {
     prro::admin::go_offline(app.db(), FN, "net drop")
         .await
         .expect("live GO_OFFLINE");
-    prro::admin::seed_offline_codes(app.db(), FN, 3000, 3005, "cabinet range")
+    // B8-1: seed with real dps_code strings.
+    let codes_b: Vec<String> = (0..6).map(|i| format!("DRILL-B-{i}")).collect();
+    prro::admin::seed_dps_offline_codes(app.db(), FN, &codes_b)
         .await
         .expect("seed codes");
     drive(

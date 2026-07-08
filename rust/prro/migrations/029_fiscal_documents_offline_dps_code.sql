@@ -1,0 +1,40 @@
+-- 029 — add offline_dps_code column to fiscal_documents
+--
+-- WHY
+-- ---
+-- B8: DPS-issued opaque offline codes (from T=112 ASK_OFFLINE_CODES, e.g.
+-- `"eYme-jhnkWQ"`) must reach `CheckEnvelope.id_offline` on drain so the
+-- receipt is legally identified at DPS (INV-11).  The code is stamped at the
+-- Signed→OfflineLocalAck CAS (same UPDATE as `offline_fiscal_no`) and read
+-- by `fetch_send_inputs_tx` at drain send-time.
+--
+-- Chain-neutral: `offline_dps_code` is envelope-only (gRPC CheckEnvelope
+-- `id_offline` field), NOT part of the signed XML body.  `previous_hash`,
+-- `unsigned_xml_sha256`, and the MAC chain are untouched.
+--
+-- STRICT TABLE NOTE
+-- -----------------
+-- `fiscal_documents` was created STRICT in 001_baseline.sql.  SQLite ALTER
+-- TABLE ADD COLUMN on a STRICT table accepts a nullable TEXT column: existing
+-- rows receive NULL, and TEXT affinity is enforced on new writes.  No table
+-- rebuild required.  (Mirror of migration 028 reasoning for offline_codes.)
+--
+-- BACKWARD COMPATIBILITY
+-- ----------------------
+-- Additive nullable column.  All existing rows gain NULL `offline_dps_code`
+-- transparently.  No existing indexes or triggers are modified.
+--
+-- ROLLBACK REASONING
+-- ------------------
+-- Forward: ALTER TABLE ADD COLUMN (atomic in SQLite).
+-- Reverse: column becomes dead weight (SQLite cannot DROP COLUMN in older
+-- builds without a 12-step rebuild); the nullable column causes no
+-- correctness issue.  Pre-pilot schema: rollback = DB reset.
+--
+-- LIVE FILE SEQUENCE
+-- ------------------
+-- This file is 029; sqlx applies migrations by filename prefix order.
+-- 028 added dps_code to offline_codes; 029 adds offline_dps_code to
+-- fiscal_documents to close the stamp→render pipeline.
+
+ALTER TABLE fiscal_documents ADD COLUMN offline_dps_code TEXT;
