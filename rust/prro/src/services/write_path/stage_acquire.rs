@@ -14,7 +14,7 @@ use crate::db::models::ids::{DocumentId, RequestId, ShiftId};
 use crate::db::repositories::{
     audit_log,
     fiscal_documents::{self as fd, NewDocument},
-    ingress_inbox, node_state, shifts,
+    ingress_inbox, node_state, offline_sessions, shifts,
 };
 use crate::db::tx::with_immediate;
 use crate::services::shift::transition;
@@ -593,9 +593,11 @@ pub async fn run(
             //            the tax_snapshot INSERT + lnd alloc + doc mint, so the
             //            refusal consumes no lnd and writes no row (audit_log
             //            only — the pre-acquire-refusal persistence class).
-            //            Online-only: offline SHIFT_OPEN create is piece 4.
+            //            A′.3 PR-O3: channel-agnostic — §16.8
+            //            1-cashier-per-shift applies to the offline SHIFT_OPEN
+            //            (edge 2) too, so the offline create arm below can
+            //            safely `.expect` a cashier (no write-path panic).
             if command.doc_type == DocType::ShiftOpen
-                && channel == Channel::Online
                 && command.signed_by_cashier_id.is_none()
             {
                 return reject(
@@ -607,6 +609,66 @@ pub async fn run(
                     None,
                 )
                 .await;
+            }
+
+            // [Step 6b‴] STOP-O3-1 fix (a) — fail-closed PRE-MINT gate for an
+            //            OFFLINE shift-lifecycle op (SHIFT_OPEN / SHIFT_CLOSE /
+            //            Z_REPORT).  The lifecycle doc consumes an offline code
+            //            at local-ack (numbering (ii)) and its acquire edge
+            //            (2 / 9 / 7) commits the shift transition in THIS
+            //            envelope — so if the offline-ack preconditions are
+            //            already visibly absent (no OPEN session / an empty
+            //            code pool), minting now would only manufacture the
+            //            abort-then-RMR orphan that fix (b) escalates.  Refuse
+            //            HERE instead, in the pre-acquire persistence class
+            //            (audit_log only: no lnd, no doc, NO shift transition)
+            //            — the same class as the 6b′ cashier / D5 refusals.
+            //            Reads are pure SQLite inside this envelope; the FN
+            //            single-writer lease means no sibling can consume the
+            //            observed code between this gate and the offline-ack
+            //            (the GO_ONLINE mode-race remains — fix (b) is its
+            //            backstop and (v7) its wire-guard).  Regular fiscal
+            //            docs (SELL / RETURN / …) keep their existing typed
+            //            offline-ack refusal path — a receipt refusal never
+            //            orphans a shift.
+            if channel == Channel::Offline
+                && matches!(
+                    command.doc_type,
+                    DocType::ShiftOpen | DocType::ShiftClose | DocType::ZReport
+                )
+            {
+                if offline_sessions::current_active_session_id_tx(tx, &fn_id)
+                    .await?
+                    .is_none()
+                {
+                    return reject(
+                        tx,
+                        &request_id,
+                        RejectionReason::OfflineLifecycleNoActiveSession,
+                        "offline_lifecycle_no_active_session",
+                        Severity::Warning,
+                        None,
+                    )
+                    .await;
+                }
+                let unconsumed: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM offline_codes \
+                     WHERE fiscal_number = ? AND consumed_at IS NULL",
+                )
+                .bind(&fn_id)
+                .fetch_one(&mut **tx)
+                .await?;
+                if unconsumed == 0 {
+                    return reject(
+                        tx,
+                        &request_id,
+                        RejectionReason::OfflineLifecycleCodePoolEmpty,
+                        "offline_lifecycle_code_pool_empty",
+                        Severity::Warning,
+                        None,
+                    )
+                    .await;
+                }
             }
 
             // [Step 6b″] A.3 PR-C (D5 gate, design v3 §6 step 7) — fail-closed
@@ -695,9 +757,9 @@ pub async fn run(
             //           create + transition + doc-INSERT commit atomically:
             //           no `CREATED`/`Opening` shift ever rests without its
             //           SHIFT_OPEN doc, and any post-create failure rolls the
-            //           shift back with the envelope.  Online channel ONLY —
-            //           offline SHIFT_OPEN create is piece 4
-            //           (`stage_offline_ack`).  Placed AFTER the `document_id`
+            //           shift back with the envelope.  A′.3 PR-O3 adds the
+            //           OFFLINE arm below (edge 2, Created →
+            //           OpenedLocalPendingDrain).  Placed AFTER the `document_id`
             //           mint (edge 1's `shift_id` is derived from it) and
             //           BEFORE the doc INSERT (the shifts row must exist for
             //           the `fiscal_documents.shift_id` FK).  The guard matrix
@@ -761,7 +823,87 @@ pub async fn run(
                     _ => None,
                 }
             } else {
-                None
+                // A′.3 PR-O3 — OFFLINE shift-lifecycle arm (mirror of the
+                // online block above).  Slice 1 wires edge 2; slice 2 wires
+                // edge 9 (offline close on an Opened shift); edge 7 (close on
+                // an OpenedLocalPendingDrain shift) lands in slice 3, behind
+                // the guardrail-lift that currently refuses it at the guard.
+                match command.doc_type {
+                    // Edge 2: fresh offline SHIFT_OPEN accept (guard already
+                    // proved `shift_state == Closed`) → mint the shift
+                    // `CREATED` and drive `Created → OpenedLocalPendingDrain`
+                    // (the Pattern-C offline-open destination, vs edge 1's
+                    // `Opening`).  Cashier is `Some` by the Step 6b′ refusal
+                    // (channel-agnostic since PR-O3).  The doc binds here, then
+                    // local-acks + consumes an offline code in
+                    // `stage_offline_ack` (numbering (ii)); it drains to ACK
+                    // later, driving edge 5 (`OpenedLocalPendingDrain → Opened`).
+                    DocType::ShiftOpen => {
+                        let opener = command
+                            .signed_by_cashier_id
+                            .as_ref()
+                            .expect("Step 6b′ refuses ShiftOpen with no cashier")
+                            .as_str();
+                        let shift_id = ShiftId::deterministic_for_shift_open(document_id);
+                        transition::create_shift_tx(tx, &fn_id, shift_id, "OFFLINE", opener)
+                            .await?;
+                        expect_applied(
+                            transition::apply_shift_transition(
+                                tx,
+                                &fn_id,
+                                shift_id,
+                                ShiftState::Created,
+                                ShiftState::OpenedLocalPendingDrain,
+                            )
+                            .await?,
+                            "edge2 Created→OpenedLocalPendingDrain",
+                            shift_id,
+                        )?;
+                        Some(shift_id)
+                    }
+                    // Edges 9 + 7: offline Z_REPORT / SHIFT_CLOSE accept →
+                    // drive the shift to `ClosingLocalPendingDrain` (vs online
+                    // edge 8's `Opened → Closing`).  Edge 9 closes an `Opened`
+                    // shift; edge 7 closes an `OpenedLocalPendingDrain` one
+                    // (the "full offline day": the SHIFT_OPEN itself hasn't
+                    // drained yet — admitted by the slice-3 guardrail-lift).
+                    // The local-Z doc binds to the existing `current_shift_id`
+                    // via `active_shift` below, local-acks in
+                    // `stage_offline_ack`, and drains later — edge 13
+                    // (`ClosingLocalPendingDrain → Closed`) fires in the
+                    // backlog drain.
+                    DocType::ZReport | DocType::ShiftClose
+                        if matches!(
+                            node_state.shift_state,
+                            ShiftState::Opened | ShiftState::OpenedLocalPendingDrain
+                        ) =>
+                    {
+                        let from = node_state.shift_state;
+                        let edge_label = if from == ShiftState::Opened {
+                            "edge9 Opened→ClosingLocalPendingDrain"
+                        } else {
+                            "edge7 OpenedLocalPendingDrain→ClosingLocalPendingDrain"
+                        };
+                        let shift_id = active_shift
+                            .as_ref()
+                            .expect("guard + Step 5 guarantee active_shift when Opened/OLPD")
+                            .shift_id;
+                        expect_applied(
+                            transition::apply_shift_transition(
+                                tx,
+                                &fn_id,
+                                shift_id,
+                                from,
+                                ShiftState::ClosingLocalPendingDrain,
+                            )
+                            .await?,
+                            edge_label,
+                            shift_id,
+                        )?;
+                        None
+                    }
+                    _ => None,
+                }
             };
 
             let new_doc = NewDocument {
@@ -929,6 +1071,8 @@ fn spec_event_for(reason: &RejectionReason) -> Option<&'static str> {
         OfflineShiftCloseNotSupported => Some("OFFLINE_SHIFT_CLOSE_REFUSED"),
         ShiftClosingInFlight => Some("SHIFT_CLOSING_IN_FLIGHT_OP_REFUSED"),
         ZReportBlockedBacklogDrainPending => Some("OFFLINE_Z_REPORT_BACKLOG_DRAIN_PENDING_REFUSED"),
+        OfflineLifecycleNoActiveSession => Some("OFFLINE_LIFECYCLE_NO_ACTIVE_SESSION_REFUSED"),
+        OfflineLifecycleCodePoolEmpty => Some("OFFLINE_LIFECYCLE_CODE_POOL_EMPTY_REFUSED"),
         _ => None,
     }
 }
@@ -1035,19 +1179,24 @@ fn check_shift_guard(
         (ShiftOpen, ClosingLocalPendingDrain, _) => Some(RejectionReason::ShiftClosingInFlight),
         (ShiftOpen, _, _) => Some(RejectionReason::ShiftAlreadyOpen),
         (ShiftClose, Opened, _) => None,
-        (ShiftClose, OpenedLocalPendingDrain, _) => {
-            // Spec §5.7 L2 — offline shift close not modeled.
-            Some(RejectionReason::OfflineShiftCloseNotSupported)
-        }
         (ShiftClose, ClosingLocalPendingDrain, _) => Some(RejectionReason::ShiftClosingInFlight),
         (ZReport, Opened, _) => None,
-        (ZReport, OpenedLocalPendingDrain, _) => {
-            // Pre-W10 guardrail (both channels).  Spec §3.4 + operator
-            // correction #3 (2026-05-19): W10 later replaces this
-            // refusal with coupled pool/backlog/edge-7 logic.
-            Some(RejectionReason::ZReportBlockedBacklogDrainPending)
-        }
         (ZReport, ClosingLocalPendingDrain, _) => Some(RejectionReason::ShiftClosingInFlight),
+        // ── A′.3 PR-O3 slice 3 — GUARDRAIL-LIFT (deliberate, α ruling).
+        // The pre-O3 blanket refusals `(ShiftClose, OLPD, _) →
+        // OfflineShiftCloseNotSupported` (spec §5.7 L2) and `(ZReport, OLPD, _)
+        // → ZReportBlockedBacklogDrainPending` (pre-W10, operator correction #3
+        // 2026-05-19) are REPLACED by the channel-aware pair below — the
+        // "coupled pool/backlog/edge-7 logic" those guardrails reserved room
+        // for.  Offline channel: close of an OLPD shift is SUPPORTED (edge 7,
+        // OLPD → CLPD — the "full offline day" close; the local-Z aggregates
+        // over the shift's OLA backlog, C10-pinned).  Online channel: the
+        // operator must let the drain converge first (edge 5) — refused with
+        // the same typed shape as the regular-op OLPD arm above.
+        (ShiftClose | ZReport, OpenedLocalPendingDrain, Offline) => None,
+        (ShiftClose | ZReport, OpenedLocalPendingDrain, Online) => {
+            Some(RejectionReason::ShiftOpenPendingDrainOpRefused)
+        }
         // ShiftClose / ZReport against `Closed` — shift is terminal,
         // operator should issue ShiftOpen first.
         (ShiftClose | ZReport, Closed, _) => Some(RejectionReason::ShiftNotOpen {
@@ -1169,19 +1318,16 @@ mod channel_aware_matrix_tests {
             }
             (ShiftOpen, _) => return Some(RejectionReason::ShiftAlreadyOpen),
             (ShiftClose, Opened) => return None,
-            (ShiftClose, OpenedLocalPendingDrain) => {
-                return Some(RejectionReason::OfflineShiftCloseNotSupported)
-            }
             (ShiftClose, ClosingLocalPendingDrain) => {
                 return Some(RejectionReason::ShiftClosingInFlight)
             }
             (ZReport, Opened) => return None,
-            (ZReport, OpenedLocalPendingDrain) => {
-                return Some(RejectionReason::ZReportBlockedBacklogDrainPending)
-            }
             (ZReport, ClosingLocalPendingDrain) => {
                 return Some(RejectionReason::ShiftClosingInFlight)
             }
+            // A′.3 PR-O3 slice 3: (ShiftClose|ZReport, OpenedLocalPendingDrain)
+            // is now CHANNEL-AWARE — handled in the channel section below
+            // (Offline → None / edge 7; Online → refused pending drain).
             (ShiftClose | ZReport, Closed) => {
                 return Some(RejectionReason::ShiftNotOpen { current: state })
             }
@@ -1212,6 +1358,13 @@ mod channel_aware_matrix_tests {
                 ClosingLocalPendingDrain,
                 _,
             ) => Some(RejectionReason::PostLocalCloseSaleRefused),
+            // A′.3 PR-O3 slice 3 (guardrail-lift, edge 7): offline close of an
+            // OpenedLocalPendingDrain shift is SUPPORTED; online stays refused
+            // pending drain (mirror of the regular-op OLPD arms above).
+            (ShiftClose | ZReport, OpenedLocalPendingDrain, Offline) => None,
+            (ShiftClose | ZReport, OpenedLocalPendingDrain, Online) => {
+                Some(RejectionReason::ShiftOpenPendingDrainOpRefused)
+            }
             _ => unreachable!("matrix oracle: unhandled cell ({doc:?}, {state:?}, {ch:?})"),
         }
     }
@@ -1250,9 +1403,17 @@ mod channel_aware_matrix_tests {
         // - (ZReport, Opened, _) → 2
         // - (Sell|Return|ServiceIn|ServiceOut|CashWithdrawal|XReport, Opened, _) → 6×2 = 12
         // - (Sell|Return|ServiceIn|ServiceOut|CashWithdrawal|XReport, OpenedLocalPendingDrain, Offline) → 6×1 = 6
-        // Total None = 24; Some = 162 - 24 = 138.
-        assert_eq!(none_count, 24, "spec §3.4: 24 happy-path None cells");
-        assert_eq!(some_count, 138, "spec §3.4: 138 refusal cells");
+        // - (ShiftClose, OpenedLocalPendingDrain, Offline) → 1  (A′.3 PR-O3 slice 3 edge 7)
+        // - (ZReport, OpenedLocalPendingDrain, Offline) → 1     (A′.3 PR-O3 slice 3 edge 7)
+        // Total None = 26; Some = 162 - 26 = 136.
+        assert_eq!(
+            none_count, 26,
+            "spec §3.4 + PR-O3 edge 7: 26 happy-path None cells"
+        );
+        assert_eq!(
+            some_count, 136,
+            "spec §3.4 + PR-O3 edge 7: 136 refusal cells"
+        );
     }
 
     #[test]

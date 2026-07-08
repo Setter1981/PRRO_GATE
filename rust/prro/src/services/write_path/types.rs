@@ -216,22 +216,42 @@ pub enum RejectionReason {
     /// PR #62 §W10).  Channel-irrelevant.  Audit shape:
     /// `POST_LOCAL_CLOSE_SALE_REFUSED`.
     PostLocalCloseSaleRefused,
-    /// `SHIFT_CLOSE` attempted on `OpenedLocalPendingDrain` shift.
-    /// Per spec §5.7 L2 — offline shift close is not modeled (only
-    /// online close after drain reaches `Opened` OR offline `Z_REPORT`
-    /// → `ClosingLocalPendingDrain`).  Audit shape:
-    /// `OFFLINE_SHIFT_CLOSE_REFUSED`.
+    /// UNREACHABLE since A′.3 PR-O3 slice 3 (guardrail-lift): the
+    /// `(ShiftClose, OpenedLocalPendingDrain, _)` guard arm that produced
+    /// this was replaced by the channel-aware pair — Offline → edge 7
+    /// (supported), Online → `ShiftOpenPendingDrainOpRefused`.  Variant
+    /// retained so historical audit rows / external error-code consumers
+    /// keep a stable meaning; no guard arm constructs it.
+    /// (Pre-O3 meaning: spec §5.7 L2 — offline shift close not modeled.
+    /// Audit shape: `OFFLINE_SHIFT_CLOSE_REFUSED`.)
     OfflineShiftCloseNotSupported,
+    /// STOP-O3-1 fix (a) — an OFFLINE shift-lifecycle op (SHIFT_OPEN /
+    /// SHIFT_CLOSE / Z_REPORT) arrived with NO OPEN offline session.  Fail-
+    /// closed PRE-MINT (audit-only: no lnd, no doc, and — load-bearing — NO
+    /// shift transition), so the lifecycle doc cannot be born into an
+    /// offline-ack refusal that would orphan a pending-drain shift.
+    /// Audit shape: `OFFLINE_LIFECYCLE_NO_ACTIVE_SESSION_REFUSED`.
+    OfflineLifecycleNoActiveSession,
+    /// STOP-O3-1 fix (a) — an OFFLINE shift-lifecycle op arrived with ZERO
+    /// unconsumed offline codes (the mundane "morning without seeded codes" /
+    /// the §0.5 close-of-day exhaustion).  Fail-closed PRE-MINT (audit-only,
+    /// same double-absence class as above); retryable after re-provisioning
+    /// (`seed-codes` / the T=112 ask-codes follow-up).
+    /// Audit shape: `OFFLINE_LIFECYCLE_CODE_POOL_EMPTY_REFUSED`.
+    OfflineLifecycleCodePoolEmpty,
     /// Op attempted while shift is in `ClosingLocalPendingDrain` AND
     /// the doc is a shift-management type (`SHIFT_OPEN` / `SHIFT_CLOSE`).
     /// Transient; operator should retry after drain completion.
     /// Audit shape: `SHIFT_CLOSING_IN_FLIGHT_OP_REFUSED`.
     ShiftClosingInFlight,
-    /// `Z_REPORT` attempted on `OpenedLocalPendingDrain` shift in
-    /// either channel.  Pre-W10 guardrail (coupled pool/backlog/edge-7
-    /// logic lands in W10).  W14a-2b refuses unconditionally to avoid
-    /// the window where Z-report can be issued while backlog non-empty.
-    /// Audit shape: `OFFLINE_Z_REPORT_BACKLOG_DRAIN_PENDING_REFUSED`.
+    /// UNREACHABLE since A′.3 PR-O3 slice 3 (guardrail-lift): the
+    /// `(ZReport, OpenedLocalPendingDrain, _)` guard arm that produced this
+    /// was replaced by the channel-aware pair — Offline → edge 7 (the
+    /// "coupled pool/backlog/edge-7 logic" this pre-W10 guardrail reserved
+    /// room for), Online → `ShiftOpenPendingDrainOpRefused`.  Variant
+    /// retained so historical audit rows / external error-code consumers
+    /// keep a stable meaning; no guard arm constructs it.
+    /// (Pre-O3 audit shape: `OFFLINE_Z_REPORT_BACKLOG_DRAIN_PENDING_REFUSED`.)
     ZReportBlockedBacklogDrainPending,
     /// A.3 PR-C (D5 gate, design v3 §6 step 7) — a NON-ISSUED sibling rests
     /// on this FN, so minting + signing a successor now would stale its

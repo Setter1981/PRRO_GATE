@@ -383,7 +383,7 @@ async fn terminalise_inbox(
         "code": code,
     })
     .to_string();
-    with_immediate(pool, move |tx| {
+    let aborted_shift_class = with_immediate(pool, move |tx| {
         Box::pin(async move {
             let id_hex = hex_encode_lower(&request_id);
             let marked = ingress_inbox::mark_rejected_if_processing_tx(tx, &request_id).await?;
@@ -402,14 +402,20 @@ async fn terminalise_inbox(
             // arms (INLINE_SEND_*) no-op here; this fires for the post-sign refusal
             // arms (dispatch-internal / dispatch-refused / offline-refused) and a
             // pre-sign sign-failure (PREPARED) alike — one place fixes the class.
-            let dangling: Option<(Vec<u8>, DocState)> = sqlx::query_as(
-                "SELECT document_id, state FROM fiscal_documents \
+            let dangling: Option<(Vec<u8>, DocState, DocType)> = sqlx::query_as(
+                "SELECT document_id, state, doc_type FROM fiscal_documents \
                  WHERE request_id = ? AND state IN ('PREPARED','SIGNED') LIMIT 1",
             )
             .bind(&request_id[..])
             .fetch_optional(&mut **tx)
             .await?;
-            if let Some((doc_bytes, from_state)) = dangling {
+            // A′.3 PR-O3 STOP-O3-1 fix (b): report the aborted doc back to the
+            // caller when it is SHIFT-CLASS — the offline lifecycle edges
+            // (2/9/7) commit the shift transition in stage_acquire's envelope,
+            // so aborting the lifecycle doc orphans a pending-drain shift that
+            // then needs the RMR escalation (spec §16.7 family 1).
+            let mut aborted_shift_class: Option<DocumentId> = None;
+            if let Some((doc_bytes, from_state, doc_type)) = dangling {
                 let doc_id = <[u8; 16]>::try_from(doc_bytes.as_slice())
                     .map(DocumentId::from_bytes)
                     .map_err(|_| {
@@ -437,6 +443,9 @@ async fn terminalise_inbox(
                     Some(&payload),
                 )
                 .await?;
+                if is_shift_class(doc_type) {
+                    aborted_shift_class = Some(doc_id);
+                }
             }
             audit_log::append_tx(
                 tx,
@@ -448,7 +457,7 @@ async fn terminalise_inbox(
                 Some(&payload),
             )
             .await?;
-            Ok::<(), anyhow::Error>(())
+            Ok::<Option<DocumentId>, anyhow::Error>(aborted_shift_class)
         })
     })
     .await
@@ -467,7 +476,74 @@ async fn terminalise_inbox(
             code: codes::INBOX_TERMINALISE_FAILED,
         }
     })?;
+    // STOP-O3-1 fix (b), runtime half — OUTSIDE the abort envelope (the
+    // escalation seam owns its own CAS+mirror envelope, RS-3 C1); the
+    // crash/error gap between the committed abort and this escalation is
+    // closed by the boot half (sweep SW-2, the #196 re-run pattern).
+    if let Some(doc_id) = aborted_shift_class {
+        escalate_orphaned_pending_drain_shift(pool, &row.fiscal_number, doc_id, request_id).await;
+    }
     Ok(())
+}
+
+/// STOP-O3-1 fix (b) — after a SHIFT-CLASS doc was aborted by
+/// [`terminalise_inbox`], escalate the pending-drain shift it orphaned
+/// (`OpenedLocalPendingDrain` / `ClosingLocalPendingDrain`, whose only exit —
+/// edge 5/13 — needs the now-dead anchor doc) to
+/// `RequiresManualReconciliation` via the shared idempotent seam (edges 6/14).
+/// Any other shift state is left untouched (online lifecycle rejects own their
+/// paths; a Closed/Opened shift is not orphaned by this abort).
+///
+/// BEST-EFFORT by design: the abort is already durably committed, and the
+/// caller is an error-arm — a failure here must not mask the client's typed
+/// refusal.  On an escalation error we emit the Critical audit and rely on the
+/// boot half (sweep SW-2) to re-run the same compensation idempotently.
+async fn escalate_orphaned_pending_drain_shift(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    doc_id: DocumentId,
+    request_id: [u8; 16],
+) {
+    let ns = match node_state::get(pool, fiscal_number).await {
+        Ok(Some(ns)) => ns,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::error!(
+                request_id = %hex_encode_lower(&request_id),
+                error = %format!("{e:#}"),
+                "fix (b): node_state read failed — boot SW-2 will re-run the escalation"
+            );
+            return;
+        }
+    };
+    use crate::db::models::enums::ShiftState;
+    if !matches!(
+        ns.shift_state,
+        ShiftState::OpenedLocalPendingDrain | ShiftState::ClosingLocalPendingDrain
+    ) {
+        return;
+    }
+    match crate::services::offline_sync::backlog_drain::escalate_fn_to_manual_recon(
+        pool,
+        fiscal_number,
+        &ns,
+        doc_id,
+        "offline_lifecycle_doc_aborted",
+        0,
+        "INLINE_OFFLINE_LIFECYCLE_ABORT_ESCALATE_MANUAL",
+        "INLINE_OFFLINE_LIFECYCLE_ABORT_NO_SHIFT",
+    )
+    .await
+    {
+        Ok(_outcome) => {}
+        // Best-effort: the wedge stays observable (scan tripwire, fix (c)) and
+        // the boot half re-runs the compensation; do NOT mask the client error.
+        Err(e) => tracing::error!(
+            request_id = %hex_encode_lower(&request_id),
+            error = %format!("{e:?}"),
+            "fix (b): orphaned pending-drain shift escalation failed — boot SW-2 re-runs it"
+        ),
+    }
 }
 
 /// Terminalise the inbox for a pre-acquire fail-closed arm (Z / SHIFT_OPEN /
@@ -1627,6 +1703,185 @@ mod tests {
             read_shift_state(&pool, shift).await,
             "OPENED",
             "StructuralDrift must NOT escalate the shift (no RMR) — that is the split"
+        );
+    }
+
+    // ── STOP-O3-1 fix (b) runtime half — terminalise_inbox escalates the
+    //    orphaned pending-drain shift when the ABORTED dangling doc is
+    //    shift-class.  (The only remaining PRODUCTION trigger after fix (a) is
+    //    the GO_ONLINE mode-race: session+pool present at acquire → edge 2/9/7
+    //    commits + doc SIGNED → mode flips GoingOnline → dispatch_post_sign
+    //    returns Refused → this terminalise arm.  Tested directly here.) ──────
+
+    async fn seed_pending_drain_shift(pool: &sqlx::SqlitePool, shift_state: &str) -> ShiftId {
+        let shift_id = ShiftId::new();
+        sqlx::query(
+            "INSERT INTO shifts(shift_id, fiscal_number, serial, state, open_mode, \
+                cash_balance_kop, opened_by_cashier_id) \
+             VALUES (?, ?, 1, ?, 'OFFLINE', 0, 'csh')",
+        )
+        .bind(shift_id)
+        .bind(SW4_FN)
+        .bind(shift_state)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO node_state(fiscal_number, mode, shift_state, current_shift_id, next_lnd, \
+                backend_profile_id, transport_profile_id) \
+             VALUES (?, 'OFFLINE', ?, ?, 2, 'b', 't')",
+        )
+        .bind(SW4_FN)
+        .bind(shift_state)
+        .bind(shift_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        shift_id
+    }
+
+    /// Seed a leased (PROCESSING) inbox row + a dangling SIGNED doc of
+    /// `doc_type` bound to `shift_id`, sharing `request_id` — the exact
+    /// post-acquire/pre-offline-ack shape `terminalise_inbox` compensates.
+    async fn seed_leased_inbox_with_signed_doc(
+        pool: &sqlx::SqlitePool,
+        request_id: [u8; 16],
+        doc_type: &str,
+        shift_id: ShiftId,
+    ) -> InboxRow {
+        ingress_inbox::insert(
+            pool,
+            &NewInboxEntry {
+                request_id,
+                fiscal_number: SW4_FN.into(),
+                protocol: Protocol::Rest,
+                operation_type: doc_type.into(),
+                idempotency_key: format!("k-{}", hex_encode_lower(&request_id)),
+                payload_json: "{}".into(),
+                payload_sha256_canonical: [0u8; 32],
+                correlation_id: None,
+                signed_by_cashier_id: None,
+                driver_id: None,
+                business_ts: Some("2026-07-07T00:00:00Z".into()),
+                total_sum_kop: None,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
+                doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+                payload_json, payload_sha256_canonical, unsigned_xml_sha256) \
+             VALUES (?, ?, ?, ?, 1, ?, 'SIGNED', 'b', 't', 'OFFLINE', '2026-07-07T00:00:00Z', \
+                '{}', ?, ?)",
+        )
+        .bind(DocumentId::new())
+        .bind(&request_id[..])
+        .bind(SW4_FN)
+        .bind(shift_id)
+        .bind(doc_type)
+        .bind(&[0u8; 32][..])
+        .bind(&[0xA1u8; 32][..])
+        .execute(pool)
+        .await
+        .unwrap();
+        with_immediate(pool, move |tx| {
+            Box::pin(async move { Ok(ingress_inbox::acquire_lease(tx, &request_id).await?) })
+        })
+        .await
+        .unwrap()
+        .expect("leased inbox row")
+    }
+
+    async fn doc_state_by_request(pool: &sqlx::SqlitePool, request_id: &[u8; 16]) -> String {
+        sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE request_id = ?")
+            .bind(&request_id[..])
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn terminalise_aborts_shift_open_and_escalates_olpd_orphan_to_rmr() {
+        let pool = sw4_pool().await;
+        let shift = seed_pending_drain_shift(&pool, "OPENED_LOCAL_PENDING_DRAIN").await;
+        let request_id = [0x61u8; 16];
+        let row = seed_leased_inbox_with_signed_doc(&pool, request_id, "SHIFT_OPEN", shift).await;
+
+        terminalise_inbox(
+            &pool,
+            &row,
+            "INLINE_DISPATCH_REFUSED",
+            codes::OFFLINE_CODE_POOL_EXHAUSTED,
+        )
+        .await
+        .unwrap();
+
+        // The dangling doc aborted (#192) AND the orphaned OLPD shift escalated.
+        assert_eq!(doc_state_by_request(&pool, &request_id).await, "ABORTED");
+        assert_eq!(
+            read_shift_state(&pool, shift).await,
+            "REQUIRES_MANUAL_RECONCILIATION",
+            "fix (b): the SHIFT_OPEN abort escalates its orphaned OLPD shift (edge 6)"
+        );
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE event_type = 'INLINE_OFFLINE_LIFECYCLE_ABORT_ESCALATE_MANUAL'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "one forensic escalation audit");
+    }
+
+    #[tokio::test]
+    async fn terminalise_aborts_z_report_and_escalates_clpd_orphan_to_rmr() {
+        let pool = sw4_pool().await;
+        let shift = seed_pending_drain_shift(&pool, "CLOSING_LOCAL_PENDING_DRAIN").await;
+        let request_id = [0x62u8; 16];
+        let row = seed_leased_inbox_with_signed_doc(&pool, request_id, "Z_REPORT", shift).await;
+
+        terminalise_inbox(
+            &pool,
+            &row,
+            "INLINE_DISPATCH_REFUSED",
+            codes::OFFLINE_CODE_POOL_EXHAUSTED,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(doc_state_by_request(&pool, &request_id).await, "ABORTED");
+        assert_eq!(
+            read_shift_state(&pool, shift).await,
+            "REQUIRES_MANUAL_RECONCILIATION",
+            "fix (b): the Z abort escalates its orphaned CLPD shift (edge 14)"
+        );
+    }
+
+    /// Doc-type gate: a REGULAR fiscal doc (SELL) aborted on an OLPD shift does
+    /// NOT escalate — a receipt refusal never orphans the shift (its anchor
+    /// SHIFT_OPEN doc is healthy).  The shift stays OLPD.
+    #[tokio::test]
+    async fn terminalise_aborts_sell_on_olpd_shift_without_escalation() {
+        let pool = sw4_pool().await;
+        let shift = seed_pending_drain_shift(&pool, "OPENED_LOCAL_PENDING_DRAIN").await;
+        let request_id = [0x63u8; 16];
+        let row = seed_leased_inbox_with_signed_doc(&pool, request_id, "SELL", shift).await;
+
+        terminalise_inbox(
+            &pool,
+            &row,
+            "INLINE_DISPATCH_REFUSED",
+            codes::OFFLINE_CODE_POOL_EXHAUSTED,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(doc_state_by_request(&pool, &request_id).await, "ABORTED");
+        assert_eq!(
+            read_shift_state(&pool, shift).await,
+            "OPENED_LOCAL_PENDING_DRAIN",
+            "a SELL abort is NOT shift-class → no escalation (the shift is not orphaned)"
         );
     }
 }

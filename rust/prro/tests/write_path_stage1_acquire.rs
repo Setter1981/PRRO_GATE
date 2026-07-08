@@ -1007,8 +1007,11 @@ async fn stage1_sale_on_closing_local_pending_drain_refused() {
 }
 
 #[tokio::test]
-async fn stage1_shift_close_on_opened_local_pending_drain_refused() {
-    // (ShiftClose, OpenedLocalPendingDrain, _) → OfflineShiftCloseNotSupported.
+async fn stage1_shift_close_on_opened_local_pending_drain_online_refused() {
+    // A′.3 PR-O3 slice 3 guardrail-lift: OFFLINE ShiftClose on OLPD is now
+    // SUPPORTED (edge 7); the ONLINE close of an OLPD shift stays refused
+    // pending drain → ShiftOpenPendingDrainOpRefused (was the pre-O3 blanket
+    // OfflineShiftCloseNotSupported, both-channels).
     let pool = fresh_pool().await;
     let pool_secure = fresh_secure_pool().await;
     seed_for_shift_state_test(
@@ -1032,13 +1035,13 @@ async fn stage1_shift_close_on_opened_local_pending_drain_refused() {
         matches!(
             result,
             WorkerProcessResult::Rejected {
-                reason: RejectionReason::OfflineShiftCloseNotSupported
+                reason: RejectionReason::ShiftOpenPendingDrainOpRefused
             }
         ),
         "got {result:?}"
     );
     assert_eq!(
-        audit_count_for_event(&pool, "OFFLINE_SHIFT_CLOSE_REFUSED").await,
+        audit_count_for_event(&pool, "SHIFT_OPEN_PENDING_DRAIN_OP_REFUSED").await,
         1
     );
 }
@@ -1182,14 +1185,17 @@ async fn stage1_offline_op_on_opened_local_pending_drain_missing_shift_id_is_inv
 }
 
 #[tokio::test]
-async fn stage1_z_report_on_opened_local_pending_drain_offline_blocked() {
-    // (ZReport, OpenedLocalPendingDrain, Offline) → ZReportBlockedBacklogDrainPending.
-    // Pre-W10 guardrail per operator correction #3 (2026-05-19).
+async fn stage1_z_report_on_opened_local_pending_drain_online_refused() {
+    // A′.3 PR-O3 slice 3 guardrail-lift (repurposed from the pre-O3
+    // offline-blocked pin): OFFLINE Z_REPORT on OLPD is now SUPPORTED (edge 7,
+    // catalog (m)); the ONLINE Z on an OLPD shift stays refused pending drain →
+    // ShiftOpenPendingDrainOpRefused (was the pre-O3 blanket
+    // ZReportBlockedBacklogDrainPending, both-channels).
     let pool = fresh_pool().await;
     let pool_secure = fresh_secure_pool().await;
     seed_for_shift_state_test(
         &pool,
-        NodeMode::Offline,
+        NodeMode::Online,
         ShiftState::OpenedLocalPendingDrain,
         "cashier-vasya",
     )
@@ -1208,13 +1214,13 @@ async fn stage1_z_report_on_opened_local_pending_drain_offline_blocked() {
         matches!(
             result,
             WorkerProcessResult::Rejected {
-                reason: RejectionReason::ZReportBlockedBacklogDrainPending
+                reason: RejectionReason::ShiftOpenPendingDrainOpRefused
             }
         ),
         "got {result:?}"
     );
     assert_eq!(
-        audit_count_for_event(&pool, "OFFLINE_Z_REPORT_BACKLOG_DRAIN_PENDING_REFUSED").await,
+        audit_count_for_event(&pool, "SHIFT_OPEN_PENDING_DRAIN_OP_REFUSED").await,
         1
     );
 }

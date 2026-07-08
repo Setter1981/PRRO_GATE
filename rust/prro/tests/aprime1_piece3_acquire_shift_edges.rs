@@ -1,6 +1,13 @@
 //! A′.1 Phase C piece 3 — stage_acquire online shift-create (edge 1) +
-//! Opened→Closing (edge 8), plus the P6-ruling fail-closed refusal of an
-//! online SHIFT_OPEN with no cashier identity.
+//! Opened→Closing (edge 8), plus the P6-ruling fail-closed refusal of a
+//! SHIFT_OPEN with no cashier identity.
+//!
+//! A′.3 PR-O3 slice 1 extends this catalog to the OFFLINE channel:
+//!   - (g) INVERTED from the pre-O3 "offline writes no shift" pin to the
+//!     edge-2 create (`Created → OpenedLocalPendingDrain`) — offline
+//!     shift-create is no longer deferred to offline-ack.
+//!   - (j) offline SHIFT_OPEN missing-cashier refusal (mirror of (i)) —
+//!     the Step-6b′ pre-mint refusal is now channel-agnostic (§16.8).
 //!
 //! Drives `stage_acquire::run` directly (same idiom as
 //! `write_path_stage1_acquire.rs`) and asserts BOTH the `WorkerProcessResult`
@@ -8,8 +15,8 @@
 //! binding + lnd + audit), with explicit attention to the pre-mint /
 //! four-negation discipline for the cashier refusal.
 //!
-//! Contract tests (a)-(h) + ruling addition (i). Two hooks only; the
-//! guard matrix (`check_shift_guard`) is untouched.
+//! Contract tests (a)-(h) + ruling addition (i) + PR-O3 (g-inversion, j).
+//! Two hooks only; the guard matrix (`check_shift_guard`) is untouched.
 
 use prro::db::models::enums::{DocType, FiscalMode, NodeMode, ShiftState};
 use prro::db::models::ids::{DocumentId, RequestId, ShiftId};
@@ -480,13 +487,22 @@ async fn f_sell_at_opening_is_refused_inv03() {
     assert_eq!(next_lnd(&pool).await, 1);
 }
 
-// ─── (g) offline-mode SHIFT_OPEN → zero shift-writes (channel negative) ──
+// ─── (g) edge 2 — fresh offline SHIFT_OPEN creates+opens shift at
+//         OpenedLocalPendingDrain atomically.  A′.3 PR-O3 INVERTS the
+//         pre-O3 "offline writes no shift" pin: create is no longer
+//         deferred to offline-ack — the offline channel mirrors edge 1
+//         but drives `Created → OpenedLocalPendingDrain` (Pattern C). ──
 #[tokio::test]
-async fn g_offline_shift_open_writes_no_shift() {
+async fn g_offline_shift_open_creates_opened_local_pending_drain_and_binds_doc() {
     let pool = fresh_pool().await;
     let secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
     seed_node_state(&pool, NodeMode::Offline, ShiftState::Closed, None).await;
+    // A′.3 PR-O3 fix (a): offline shift-lifecycle acquire now REQUIRES an OPEN
+    // session + a non-empty code pool (else pre-mint refused) — seed both so
+    // the edge under test is reached.
+    seed_offline_session_open(&pool).await;
+    seed_offline_code(&pool, 9100).await;
     let req = seed_inbox(&pool, DocType::ShiftOpen, Some(CASHIER)).await;
 
     let result = stage_acquire::run(
@@ -498,23 +514,33 @@ async fn g_offline_shift_open_writes_no_shift() {
     )
     .await
     .unwrap();
-    // acquire proceeds on the offline channel (create is piece 4, offline-ack)
-    assert!(
-        matches!(result, WorkerProcessResult::Proceed(_)),
-        "got {result:?}"
-    );
-    // …but NO online shift-create fired
+    let ctx = match result {
+        WorkerProcessResult::Proceed(c) => c,
+        other => panic!("expected Proceed, got {other:?}"),
+    };
+    let doc_id = ctx.document.document_id;
+    let expected = ShiftId::deterministic_for_shift_open(doc_id);
+
+    // one shifts row, CREATED→OPENED_LOCAL_PENDING_DRAIN (edge 2 atomic with create)
+    assert_eq!(shift_count(&pool).await, 1);
     assert_eq!(
-        shift_count(&pool).await,
-        0,
-        "no shifts row on offline channel"
+        shift_state_by_id(&pool, expected).await.as_deref(),
+        Some("OPENED_LOCAL_PENDING_DRAIN")
     );
+    // node_state projection mirrored + pointer set to the deterministic id
+    assert_eq!(node_shift_state(&pool).await, "OPENED_LOCAL_PENDING_DRAIN");
     assert_eq!(
-        node_shift_state(&pool).await,
-        "CLOSED",
-        "projection untouched"
+        node_current_shift_id(&pool).await.as_deref(),
+        Some(expected.as_bytes().as_slice())
     );
-    assert_eq!(node_current_shift_id(&pool).await, None);
+    // doc bound to the new shift
+    assert_eq!(
+        doc_shift_id(&pool, doc_id).await.as_deref(),
+        Some(expected.as_bytes().as_slice())
+    );
+    // §16.8 parity (channel-agnostic): opener == command signer
+    assert_eq!(shift_opener_by_id(&pool, expected).await, CASHIER);
+    assert_eq!(next_lnd(&pool).await, 2, "lnd consumed on the happy path");
 }
 
 // ─── (h) crash-atomicity: post-create failure rolls the shift back ──────
@@ -598,4 +624,373 @@ async fn i_online_shift_open_missing_cashier_is_refused_premint() {
     assert_eq!(next_lnd(&pool).await, 1, "lnd not consumed");
     // audit event present
     assert_eq!(audit_count(&pool, "SHIFT_OPEN_MISSING_CASHIER").await, 1);
+}
+
+// ─── (j) edge 2 guard — offline SHIFT_OPEN with no cashier →
+//         ShiftOpenMissingCashier (A′.3 PR-O3: §16.8 1-cashier-per-shift
+//         is channel-agnostic, so the Step-6b′ pre-mint refusal now
+//         covers offline too — the offline create arm can safely
+//         `.expect` a cashier without a write-path panic).  Mirror of (i). ─
+#[tokio::test]
+async fn j_offline_shift_open_missing_cashier_is_refused_premint() {
+    let pool = fresh_pool().await;
+    let secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    seed_node_state(&pool, NodeMode::Offline, ShiftState::Closed, None).await;
+    let req = seed_inbox(&pool, DocType::ShiftOpen, None).await;
+
+    let result = stage_acquire::run(&pool, &secure, DRIVER, req, cmd(DocType::ShiftOpen, None))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::ShiftOpenMissingCashier
+            }
+        ),
+        "got {result:?}"
+    );
+    // four negations: no doc / no shift / no node_state change / no lnd
+    assert_eq!(
+        doc_count(&pool).await,
+        0,
+        "no doc minted (pre-mint refusal)"
+    );
+    assert_eq!(shift_count(&pool).await, 0, "no shifts row");
+    assert_eq!(
+        node_shift_state(&pool).await,
+        "CLOSED",
+        "shift_state untouched"
+    );
+    assert_eq!(
+        node_current_shift_id(&pool).await,
+        None,
+        "pointer untouched"
+    );
+    assert_eq!(next_lnd(&pool).await, 1, "lnd not consumed");
+    assert_eq!(audit_count(&pool, "SHIFT_OPEN_MISSING_CASHIER").await, 1);
+}
+
+// ─── (k) edge 9 — offline Z_REPORT at Opened → Opened→CLPD + doc bound.
+//         A′.3 PR-O3 slice 2: the offline mirror of (d) — instead of edge 8
+//         (Opened→Closing, which the online send-ladder drives to Closed via
+//         edge 10), the offline channel drives Opened→ClosingLocalPendingDrain
+//         (edge 9); the local-Z doc then local-acks + drains later (edge 13). ─
+#[tokio::test]
+async fn k_offline_z_report_at_opened_drives_closing_local_pending_drain() {
+    let pool = fresh_pool().await;
+    let secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift = ShiftId::new();
+    seed_shift(&pool, shift, ShiftState::Opened).await;
+    seed_node_state(&pool, NodeMode::Offline, ShiftState::Opened, Some(shift)).await;
+    seed_offline_session_open(&pool).await; // fix (a) precondition
+    seed_offline_code(&pool, 9101).await;
+    let req = seed_inbox(&pool, DocType::ZReport, None).await;
+
+    let result = stage_acquire::run(&pool, &secure, DRIVER, req, cmd(DocType::ZReport, None))
+        .await
+        .unwrap();
+    let ctx = match result {
+        WorkerProcessResult::Proceed(c) => c,
+        other => panic!("expected Proceed, got {other:?}"),
+    };
+    assert_eq!(node_shift_state(&pool).await, "CLOSING_LOCAL_PENDING_DRAIN");
+    assert_eq!(
+        shift_state_by_id(&pool, shift).await.as_deref(),
+        Some("CLOSING_LOCAL_PENDING_DRAIN")
+    );
+    assert_eq!(
+        doc_shift_id(&pool, ctx.document.document_id)
+            .await
+            .as_deref(),
+        Some(shift.as_bytes().as_slice()),
+        "offline Z doc bound to current_shift_id"
+    );
+}
+
+// ─── (l) edge 9 — offline SHIFT_CLOSE at Opened → Opened→CLPD (edge 9
+//         admits both Z_REPORT and SHIFT_CLOSE on an Opened shift). ─────────
+#[tokio::test]
+async fn l_offline_shift_close_at_opened_drives_closing_local_pending_drain() {
+    let pool = fresh_pool().await;
+    let secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift = ShiftId::new();
+    seed_shift(&pool, shift, ShiftState::Opened).await;
+    seed_node_state(&pool, NodeMode::Offline, ShiftState::Opened, Some(shift)).await;
+    seed_offline_session_open(&pool).await; // fix (a) precondition
+    seed_offline_code(&pool, 9102).await;
+    let req = seed_inbox(&pool, DocType::ShiftClose, None).await;
+
+    let result = stage_acquire::run(&pool, &secure, DRIVER, req, cmd(DocType::ShiftClose, None))
+        .await
+        .unwrap();
+    let ctx = match result {
+        WorkerProcessResult::Proceed(c) => c,
+        other => panic!("expected Proceed, got {other:?}"),
+    };
+    assert_eq!(node_shift_state(&pool).await, "CLOSING_LOCAL_PENDING_DRAIN");
+    assert_eq!(
+        shift_state_by_id(&pool, shift).await.as_deref(),
+        Some("CLOSING_LOCAL_PENDING_DRAIN")
+    );
+    assert_eq!(
+        doc_shift_id(&pool, ctx.document.document_id)
+            .await
+            .as_deref(),
+        Some(shift.as_bytes().as_slice()),
+        "offline SHIFT_CLOSE doc bound to current_shift_id"
+    );
+}
+
+// ─── STOP-O3-1 fix (a) helpers: offline session + code-pool seeding ────────
+
+async fn seed_offline_session_open(pool: &sqlx::SqlitePool) {
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, 'OPEN', '2026-07-07T00:00:00Z')",
+    )
+    .bind(prro::db::models::ids::OfflineSessionId::new())
+    .bind(FN)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn seed_offline_code(pool: &sqlx::SqlitePool, code_lnd: i64) {
+    sqlx::query("INSERT INTO offline_codes(fiscal_number, code_lnd) VALUES (?, ?)")
+        .bind(FN)
+        .bind(code_lnd)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+// ─── (o) STOP-O3-1 fix (a) — offline SHIFT_OPEN with NO OPEN session →
+//         PRE-MINT refusal (audit-only): no doc, NO shift transition, no lnd.
+//         The pre-acquire class (6b′/D5): the lifecycle doc must not be born
+//         into an abort that would orphan the shift. ─────────────────────────
+#[tokio::test]
+async fn o_offline_shift_open_without_open_session_refused_premint() {
+    let pool = fresh_pool().await;
+    let secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    seed_node_state(&pool, NodeMode::Offline, ShiftState::Closed, None).await;
+    // A code exists but NO offline session is OPEN.
+    seed_offline_code(&pool, 9000).await;
+    let req = seed_inbox(&pool, DocType::ShiftOpen, Some(CASHIER)).await;
+
+    let result = stage_acquire::run(
+        &pool,
+        &secure,
+        DRIVER,
+        req,
+        cmd(DocType::ShiftOpen, Some(CASHIER)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::OfflineLifecycleNoActiveSession
+            }
+        ),
+        "got {result:?}"
+    );
+    // The DOUBLE ABSENCE pin (ruling): neither a doc nor a shift transition.
+    assert_eq!(
+        doc_count(&pool).await,
+        0,
+        "no doc minted (pre-mint refusal)"
+    );
+    assert_eq!(shift_count(&pool).await, 0, "no shifts row / no edge 2");
+    assert_eq!(
+        node_shift_state(&pool).await,
+        "CLOSED",
+        "projection untouched"
+    );
+    assert_eq!(next_lnd(&pool).await, 1, "lnd not consumed");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_LIFECYCLE_NO_ACTIVE_SESSION_REFUSED").await,
+        1
+    );
+}
+
+// ─── (p) STOP-O3-1 fix (a) — offline SHIFT_OPEN with an EMPTY code pool →
+//         PRE-MINT refusal (the mundane "morning without seeded codes"):
+//         no doc, NO shift transition, no lnd. ───────────────────────────────
+#[tokio::test]
+async fn p_offline_shift_open_with_empty_code_pool_refused_premint() {
+    let pool = fresh_pool().await;
+    let secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    seed_node_state(&pool, NodeMode::Offline, ShiftState::Closed, None).await;
+    // Session is OPEN but the pool has ZERO unconsumed codes.
+    seed_offline_session_open(&pool).await;
+    let req = seed_inbox(&pool, DocType::ShiftOpen, Some(CASHIER)).await;
+
+    let result = stage_acquire::run(
+        &pool,
+        &secure,
+        DRIVER,
+        req,
+        cmd(DocType::ShiftOpen, Some(CASHIER)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::OfflineLifecycleCodePoolEmpty
+            }
+        ),
+        "got {result:?}"
+    );
+    // The DOUBLE ABSENCE pin (ruling): neither a doc nor a shift transition.
+    assert_eq!(
+        doc_count(&pool).await,
+        0,
+        "no doc minted (pre-mint refusal)"
+    );
+    assert_eq!(shift_count(&pool).await, 0, "no shifts row / no edge 2");
+    assert_eq!(
+        node_shift_state(&pool).await,
+        "CLOSED",
+        "projection untouched"
+    );
+    assert_eq!(next_lnd(&pool).await, 1, "lnd not consumed");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_LIFECYCLE_CODE_POOL_EMPTY_REFUSED").await,
+        1
+    );
+}
+
+// ─── (q) STOP-O3-1 fix (a) — offline Z_REPORT on an Opened shift with an
+//         EMPTY pool → PRE-MINT refusal and the shift STAYS Opened (edge 9
+//         NOT driven) — the close is refused honestly instead of being born
+//         into an abort that would orphan the shift at CLPD (the 24h-trap
+//         becomes a typed retryable refusal, not an RMR event). ──────────────
+#[tokio::test]
+async fn q_offline_z_report_with_empty_code_pool_refused_premint_shift_stays_opened() {
+    let pool = fresh_pool().await;
+    let secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift = ShiftId::new();
+    seed_shift(&pool, shift, ShiftState::Opened).await;
+    seed_node_state(&pool, NodeMode::Offline, ShiftState::Opened, Some(shift)).await;
+    seed_offline_session_open(&pool).await;
+    // ZERO unconsumed codes — the close would have nothing to consume.
+    let req = seed_inbox(&pool, DocType::ZReport, None).await;
+
+    let result = stage_acquire::run(&pool, &secure, DRIVER, req, cmd(DocType::ZReport, None))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            WorkerProcessResult::Rejected {
+                reason: RejectionReason::OfflineLifecycleCodePoolEmpty
+            }
+        ),
+        "got {result:?}"
+    );
+    assert_eq!(doc_count(&pool).await, 0, "no doc minted");
+    assert_eq!(
+        node_shift_state(&pool).await,
+        "OPENED",
+        "edge 9 NOT driven — the shift stays Opened, retry after re-provisioning"
+    );
+    assert_eq!(
+        shift_state_by_id(&pool, shift).await.as_deref(),
+        Some("OPENED"),
+        "shifts row untouched"
+    );
+    assert_eq!(next_lnd(&pool).await, 1, "lnd not consumed");
+}
+
+// ─── (m) edge 7 — offline Z_REPORT at OpenedLocalPendingDrain → OLPD→CLPD.
+//         The "full offline day" close: the SHIFT_OPEN itself hasn't drained
+//         yet.  Reachable only after the slice-3 guardrail-lift (the guard
+//         admits offline close of an OLPD shift). ────────────────────────────
+#[tokio::test]
+async fn m_offline_z_report_at_opened_local_pending_drain_drives_closing_local_pending_drain() {
+    let pool = fresh_pool().await;
+    let secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift = ShiftId::new();
+    seed_shift(&pool, shift, ShiftState::OpenedLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        NodeMode::Offline,
+        ShiftState::OpenedLocalPendingDrain,
+        Some(shift),
+    )
+    .await;
+    seed_offline_session_open(&pool).await; // fix (a) precondition
+    seed_offline_code(&pool, 9103).await;
+    let req = seed_inbox(&pool, DocType::ZReport, None).await;
+
+    let result = stage_acquire::run(&pool, &secure, DRIVER, req, cmd(DocType::ZReport, None))
+        .await
+        .unwrap();
+    let ctx = match result {
+        WorkerProcessResult::Proceed(c) => c,
+        other => panic!("expected Proceed, got {other:?}"),
+    };
+    assert_eq!(node_shift_state(&pool).await, "CLOSING_LOCAL_PENDING_DRAIN");
+    assert_eq!(
+        shift_state_by_id(&pool, shift).await.as_deref(),
+        Some("CLOSING_LOCAL_PENDING_DRAIN")
+    );
+    assert_eq!(
+        doc_shift_id(&pool, ctx.document.document_id)
+            .await
+            .as_deref(),
+        Some(shift.as_bytes().as_slice()),
+        "offline Z doc bound to current_shift_id"
+    );
+}
+
+// ─── (n) edge 7 — offline SHIFT_CLOSE at OpenedLocalPendingDrain → OLPD→CLPD. ─
+#[tokio::test]
+async fn n_offline_shift_close_at_opened_local_pending_drain_drives_closing_local_pending_drain() {
+    let pool = fresh_pool().await;
+    let secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift = ShiftId::new();
+    seed_shift(&pool, shift, ShiftState::OpenedLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        NodeMode::Offline,
+        ShiftState::OpenedLocalPendingDrain,
+        Some(shift),
+    )
+    .await;
+    seed_offline_session_open(&pool).await; // fix (a) precondition
+    seed_offline_code(&pool, 9104).await;
+    let req = seed_inbox(&pool, DocType::ShiftClose, None).await;
+
+    let result = stage_acquire::run(&pool, &secure, DRIVER, req, cmd(DocType::ShiftClose, None))
+        .await
+        .unwrap();
+    let ctx = match result {
+        WorkerProcessResult::Proceed(c) => c,
+        other => panic!("expected Proceed, got {other:?}"),
+    };
+    assert_eq!(node_shift_state(&pool).await, "CLOSING_LOCAL_PENDING_DRAIN");
+    assert_eq!(
+        shift_state_by_id(&pool, shift).await.as_deref(),
+        Some("CLOSING_LOCAL_PENDING_DRAIN")
+    );
+    assert_eq!(
+        doc_shift_id(&pool, ctx.document.document_id)
+            .await
+            .as_deref(),
+        Some(shift.as_bytes().as_slice()),
+        "offline SHIFT_CLOSE doc bound to current_shift_id"
+    );
 }

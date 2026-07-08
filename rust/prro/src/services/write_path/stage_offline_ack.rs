@@ -214,13 +214,15 @@ pub async fn run(
             //
             // Defence-in-depth (operator correction #4): read doc_type
             // + state + fiscal_number BEFORE shift-state validation so
-            // we can scope the widened {Opened | OpenedLocalPendingDrain}
-            // allowlist by doc_type — non-bypass regular fiscal docs
-            // get the widened set; other doc types stay scoped to
-            // Opened only.  Without this, an arbitrary upstream caller
-            // could route a non-fiscal doc through the offline-ack
-            // path on OpenedLocalPendingDrain — defeating the §3.4
-            // matrix contract.
+            // we can scope the shift-state allowlist by doc_type —
+            // regular fiscal docs accept {Opened | OpenedLocalPendingDrain};
+            // since A′.3 PR-O3 the shift-management docs accept exactly the
+            // state their acquire edge leaves the shift in (SHIFT_OPEN →
+            // OpenedLocalPendingDrain, edge 2; SHIFT_CLOSE / Z_REPORT →
+            // ClosingLocalPendingDrain, edges 9/7).  Without this, an
+            // arbitrary upstream caller could route a doc through the
+            // offline-ack path in a state its lifecycle never produces —
+            // defeating the §3.4 matrix contract.
             //
             // Returned `inputs.state` is the pre-CAS observation;
             // surfaces typed `DocStateConflict` if not SIGNED.
@@ -268,11 +270,12 @@ pub async fn run(
             // regular fiscal docs (Sell / Return / ServiceIn /
             // ServiceOut / CashWithdrawal / XReport) accept
             // `Opened | OpenedLocalPendingDrain` per spec §3.3 +
-            // §5.6 — Pattern C resilience surface.  Other doc types
-            // (SHIFT_OPEN — handled here for offline Pattern C open;
-            // others should not reach stage_offline_ack per the §3.4
-            // matrix, but the helper enforces it defensively) stay
-            // scoped to `Opened` only.
+            // §5.6 — Pattern C resilience surface.  A′.3 PR-O3: the
+            // shift-management docs accept exactly the state their
+            // acquire edge leaves the shift in — SHIFT_OPEN →
+            // `OpenedLocalPendingDrain` (edge 2), SHIFT_CLOSE / Z_REPORT
+            // → `ClosingLocalPendingDrain` (edges 9/7) — enforced
+            // defensively here regardless of upstream filtering.
             let shift_state_ok = match inputs.doc_type {
                 DocType::Sell
                 | DocType::Return
@@ -283,10 +286,22 @@ pub async fn run(
                     ns.shift_state,
                     ShiftState::Opened | ShiftState::OpenedLocalPendingDrain,
                 ),
-                // SHIFT_OPEN / SHIFT_CLOSE / Z_REPORT and any other
-                // doc type stay scoped to Opened only — non-regular
-                // fiscal docs do NOT participate in the §3.7 widening.
-                _ => ns.shift_state == ShiftState::Opened,
+                // A′.3 PR-O3 edge-2 tail: an offline SHIFT_OPEN doc local-acks
+                // in the state edge 2 leaves the shift in
+                // (`OpenedLocalPendingDrain`), consuming an offline code like a
+                // receipt (numbering (ii)).
+                DocType::ShiftOpen => ns.shift_state == ShiftState::OpenedLocalPendingDrain,
+                // A′.3 PR-O3 slice 2 edge-9/7 tail: an offline SHIFT_CLOSE /
+                // Z_REPORT doc local-acks in the state edge 9/7 leaves the
+                // shift in (`ClosingLocalPendingDrain`), consuming an offline
+                // code like a receipt (numbering (ii)).
+                DocType::ShiftClose | DocType::ZReport => {
+                    ns.shift_state == ShiftState::ClosingLocalPendingDrain
+                }
+                // All 9 DocType variants are now explicitly matched — a NEW
+                // doc type fails to compile here, forcing a deliberate
+                // offline-ack shift-state decision (drift-guard by
+                // exhaustiveness; the pre-O3 `_ => Opened` fallback is gone).
             };
             if !shift_state_ok {
                 return audit_and_return_refused(

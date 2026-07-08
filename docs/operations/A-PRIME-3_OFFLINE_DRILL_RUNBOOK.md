@@ -1,4 +1,4 @@
-# A′.3 Offline Drill — Operator Runbook (PR-O2)
+# A′.3 Offline Drill — Operator Runbook (PR-O2, extended by PR-O3)
 
 **Scope:** the offline operator surface is **LIVE** as of A′.3 PR-O2
 (`FULL_OFFLINE_SURFACE_READY = true`) — the node mode-seam (`go-offline` /
@@ -41,25 +41,48 @@ contract, after which a transport-PR replaces manual seeding.
 
 ---
 
-## 🚧 Pilot limitation — shift OPEN / CLOSE under offline is NOT yet available
+## ✅ PR-O3 — offline shift OPEN / CLOSE is LIVE (edges 2/7/9)
 
-The canonical Pattern C round-trip is **open the shift ONLINE**, then (net drop)
-sell offline, then reconnect → drain → **close the shift ONLINE**. This is fully
-supported.
+Since A′.3 PR-O3 the full offline shift lifecycle is supported (α ruling,
+WebCheck-parity). Both operator stories now work without waiting for
+connectivity:
 
-**Opening or closing a shift *while the node is offline* is fail-closed** (the
-`stage_acquire` pre-W10 guardrails refuse offline `SHIFT_OPEN` / `Z_REPORT` /
-`SHIFT_CLOSE`). This lands in PR-O3 (offline shift-lifecycle edges 2/7/9). It is
-an **availability limitation, not a fiscal hazard** — nothing incorrect is
-signed; the operation is simply refused.
+- **«Утро без сети»** (the trading day starts with no network): `GO_OFFLINE` →
+  offline `SHIFT_OPEN` (the shift rests `OpenedLocalPendingDrain`) → sell
+  offline → on reconnect `GO_ONLINE` → drain (the shift-open document drains
+  first, strict-sequential) → the shift converges to `Opened` → close online
+  as usual.
+- **«Полный offline-день»**: `GO_OFFLINE` → offline `SHIFT_OPEN` → sell
+  offline → **offline `Z_REPORT` close** (the local-Z aggregates the shift's
+  held receipts; the shift rests `ClosingLocalPendingDrain`) → on reconnect
+  `GO_ONLINE` → drain of everything (shift-open doc first, the Z document
+  last) → the shift converges to `Closed`.
 
-**Operator instructions until O3:**
-- **The trading day starts with no network** → do NOT force an offline open.
-  Wait for connectivity to open the shift online, or escalate per the outage
-  procedure. (A shift cannot be opened offline.)
-- **The network drops while a shift is open, near close time** → keep selling
-  offline; **close the shift only after reconnecting** (GO_ONLINE → drain →
-  online `Z_REPORT`). Do not attempt an offline close.
+**Numbering:** offline shift documents (`SHIFT_OPEN` and the local `Z_REPORT`)
+consume an offline code from the pool exactly like receipts do — budget the
+seeded range accordingly (**+2 codes per full offline shift**).
+
+### ⛔ CLPD blocking — day 2 waits for day 1's drain
+
+After an **offline close**, the shift rests `ClosingLocalPendingDrain` until
+its backlog (including the Z document) drains. **A new shift can NOT be opened
+until that drain completes** — the open is refused (`ShiftClosingInFlight`),
+and the shifts unique-index counts a `ClosingLocalPendingDrain` shift as still
+active. Consequence for the 36h continuous-offline window (INV-09): the window
+spans shifts, but a **second offline day cannot start while day 1 is
+undrained** — an honest operational limit, not a hazard. If the outage
+persists past a closed-but-undrained shift, trading cannot resume until
+connectivity returns and the drain converges (or support escalates).
+
+### ⚠️ WebCheck caveat — offline-Z drain semantics
+
+The offline local-Z drain behaviour (DocType 8/80 offline shift docs consuming
+offline numbers; the Z document replayed to DPS last, after all held receipts)
+is verified against the WebCheck decompile (4 years of production use), NOT yet
+against the live test-DPS. **Live validation of the offline-Z drain is the
+FIRST contact item of the live campaign** — treat any drain reject of a local-Z
+document as a campaign finding (the shift escalates to
+`RequiresManualReconciliation`; collect the DPS response and stop the drill).
 
 ---
 
@@ -86,11 +109,21 @@ has no session). All three write a Critical audit row.
 
 ---
 
-## Drill shape (full round-trip, O2)
+## Drill shapes
 
-`boot → online SHIFT_OPEN → GO_OFFLINE → offline SELL/RETURN (→ OFFLINE_LOCAL_ACK)
-→ GO_ONLINE → drain → ACK → online Z_REPORT (close)`. The return-online drain
-converges each held receipt to `ACK`, closes the offline session, and returns the
-node to `ONLINE`; the closing `Z_REPORT` aggregates **both** the online-issued and
-the drained-offline receipts. The shift stays `Opened` throughout (it was opened
-online); the offline shift-lifecycle states are O3.
+**O2 (online-opened shift):** `boot → online SHIFT_OPEN → GO_OFFLINE → offline
+SELL/RETURN (→ OFFLINE_LOCAL_ACK) → GO_ONLINE → drain → ACK → online Z_REPORT
+(close)`. The return-online drain converges each held receipt to `ACK`, closes
+the offline session, and returns the node to `ONLINE`; the closing `Z_REPORT`
+aggregates **both** the online-issued and the drained-offline receipts. The
+shift stays `Opened` throughout.
+
+**O3 Drill A («утро без сети»):** `boot → GO_OFFLINE → offline SHIFT_OPEN
+(→ OpenedLocalPendingDrain) → offline SELLs → GO_ONLINE → drain (shift-open doc
+first) → shift Opened → online Z_REPORT (close)`. Pinned by
+`pilot_offline_shift_lifecycle_e2e::drill_a_*`.
+
+**O3 Drill B («полный offline-день»):** `boot → GO_OFFLINE → offline SHIFT_OPEN
+→ offline SELLs → offline Z_REPORT (local-Z → ClosingLocalPendingDrain; a new
+shift is refused until drained) → GO_ONLINE → drain of everything (Z doc last)
+→ shift Closed`. Pinned by `pilot_offline_shift_lifecycle_e2e::drill_b_*`.

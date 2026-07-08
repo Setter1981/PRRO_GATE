@@ -22,10 +22,13 @@
 //! flag-independent; the flip pin `offline_surface_is_live_after_o2_flip`
 //! (`tests/offline_surface.rs`) REDs on a flag revert.
 //!
-//! SCOPE (honest-dormant, per O2 runbook): the door enables offline SELL/RETURN
-//! and return-online drain on an ONLINE-opened shift (canonical Pattern C).
-//! Shift OPEN/CLOSE performed *under* offline (edges 2/7/9) remain fail-closed
-//! until PR-O3 — an availability limit, not a fiscal hazard.
+//! SCOPE: the door enables offline SELL/RETURN and return-online drain
+//! (canonical Pattern C), and — since A′.3 PR-O3 — the offline shift
+//! lifecycle itself: offline SHIFT_OPEN (edge 2 → OpenedLocalPendingDrain)
+//! and offline SHIFT_CLOSE / Z (edges 9/7 → ClosingLocalPendingDrain, local-Z
+//! over the OLA backlog), with drain-time convergence via edges 5/13.  The
+//! drills `pilot_offline_shift_lifecycle_e2e` RED at the GO_OFFLINE leg on a
+//! flag revert (same teeth as the O2 full drill).
 pub const FULL_OFFLINE_SURFACE_READY: bool = true;
 
 /// Typed fail-closed error for an operator `GO_OFFLINE` / `GO_ONLINE` command

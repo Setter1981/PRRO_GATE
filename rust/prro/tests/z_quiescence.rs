@@ -281,6 +281,33 @@ async fn offline_local_ack_is_non_blocking_and_counted() {
     assert_eq!(issued_count(&pool, shift).await, 1);
 }
 
+/// A′.3 PR-O3 slice 2 — C10 LOAD-BEARING PIN for the OFFLINE Z-close.
+///
+/// An offline Z-close (edge 9/7) runs the SAME `quiesce_shift_before_z` gate
+/// the online Z does (`run_z_dispatch`, INV #8).  The pin: a shift carrying an
+/// UNDRAINED `OFFLINE_LOCAL_ACK` backlog (the normal offline-day state — SELLs
+/// issued while the node was offline, not yet drained to DPS) quiesces CLEAR —
+/// the local-Z aggregates over its own OLA receipts BY CONSTRUCTION (the
+/// quiescence query excludes OLA from the blocking set; the aggregate counts
+/// it).  If a future change ever made OLA blocking, the whole offline-close
+/// path would dead-lock (a shift could never close while offline), so this pin
+/// is deliberately dedicated.  RETURN behaves identically — the quiescence /
+/// aggregate clauses key on `doc_type IN ('SELL','RETURN')` uniformly.
+#[tokio::test]
+async fn offline_z_close_quiesces_clear_over_own_shift_undrained_ola_backlog() {
+    let pool = fresh_pool().await;
+    let shift = seed_open_shift(&pool).await;
+    // A realistic undrained offline backlog — several OFFLINE_LOCAL_ACK SELLs.
+    seed_receipt(&pool, shift, 1, "OFFLINE_LOCAL_ACK").await;
+    seed_receipt(&pool, shift, 2, "OFFLINE_LOCAL_ACK").await;
+    seed_receipt(&pool, shift, 3, "OFFLINE_LOCAL_ACK").await;
+
+    // The offline Z-close is NOT blocked by its own undrained OLA backlog …
+    assert_eq!(quiesce(&pool, shift).await, QuiescenceOutcome::Clear);
+    // … and every OLA receipt is counted into the local-Z aggregate.
+    assert_eq!(issued_count(&pool, shift).await, 3);
+}
+
 /// Seed a FINALIZABLE KVT2 SELL doc + the node_state chain seed + the inbox
 /// row stage_finalize::run requires (unsigned_xml_sha256 present;
 /// node_state.last_known == this doc's previous_hash; a PROCESSING inbox row
