@@ -1201,6 +1201,32 @@ async fn ensure_offline_session_begin(
         return Ok(());
     }
 
+    // Shift-admissibility gate: only bracket a doc that its OWN shift guard would
+    // ADMIT — otherwise the doc is refused and no BEGIN should be minted for it.
+    //   - SHIFT_OPEN opens the shift → admissible while `Closed`; it is the ONLY
+    //     doc that legitimately mints while `Closed` (Pattern-C offline open).
+    //   - SELL / RETURN (and other business docs) require an OPEN-ish shift
+    //     (`Opened` / `OpenedLocalPendingDrain`); on a `Closed` shift they are
+    //     refused (`ShiftNotOpen`) — so do NOT interpose a BEGIN (the SellWith-
+    //     ClosedShift no-op must mint no row).
+    {
+        use crate::db::models::enums::ShiftState;
+        let admissible = match command.doc_type {
+            DocType::ShiftOpen => matches!(
+                ns.shift_state,
+                ShiftState::Closed | ShiftState::Opened | ShiftState::OpenedLocalPendingDrain
+            ),
+            _ => matches!(
+                ns.shift_state,
+                ShiftState::Opened | ShiftState::OpenedLocalPendingDrain
+            ),
+        };
+        if !admissible {
+            // The doc's own acquire guard will refuse it (no BEGIN, no row).
+            return Ok(());
+        }
+    }
+
     // Existence + state probe keyed on the BEGIN's DETERMINISTIC `request_id`
     // (`sha256("b10-begin-<fn>")[..16]`, the same id `mint_offline_session_begin`
     // stamps).  This is the ONLY crash-safe anchor that works for EVERY first-doc

@@ -1287,6 +1287,13 @@ async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
     const SETTLE_BUDGET: usize = 3;
 
     let sends_before = ctx.send_calls();
+    // B10: track whether a LEGIT settle-drain ran.  A settle-capable state
+    // (active session + non-empty drain cohort + eligible shift) drives a real
+    // recovery drain, which legitimately sends (the backlog + the drain-time
+    // END).  If such a drain ran, the terminal `ArtifactNoResend` no-resend
+    // send-count assertion below does NOT apply — those sends were a real
+    // recovery attempt, not a pointless re-drive of a forced-mode artifact.
+    let mut settle_drain_ran = false;
     let mut crash_pending = pending_crash;
     for _ in 0..SETTLE_BUDGET {
         let mode = ctx.read_node_mode().await;
@@ -1304,6 +1311,7 @@ async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
             if let Some(sid) = ctx.active_offline_session().await {
                 if shift_drain_eligible(shift) && ctx.drain_cohort_len(sid).await > 0 {
                     let _ = interp::settle_drain_tick(ctx).await;
+                    settle_drain_ran = true;
                 }
             }
         }
@@ -1364,12 +1372,24 @@ async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
             // online-origin SENDING would false-flag StuckSending) and do NOT
             // liveness-panic (no real settle path).  Assert the bounded invariant
             // that the recovery ops re-drove nothing.
-            assert_eq!(
-                ctx.send_calls(),
-                sends_before,
-                "terminal GoingOnline artifact (mode={mode:?} shift={shift:?}): the bounded \
-                 real recovery ops made a NEW wire send — deferred docs must not be re-driven"
-            );
+            //
+            // B10: the no-resend send-count assertion applies ONLY when NO LEGIT
+            // settle-drain ran.  A settle-capable state (session + cohort +
+            // eligible) drives a REAL recovery drain that legitimately sends (the
+            // backlog re-drive + the drain-time END); if that drain then leaves the
+            // FN at GoingOnline with a now-drained (empty) cohort — e.g. a
+            // `[Ack, NotFound]` head held at SENT that the settle-drain advanced,
+            // or an END that could not finalize — the terminal is `ArtifactNoResend`
+            // by the empty-cohort branch, but those sends were a genuine recovery
+            // attempt, not a pointless re-drive of a forced-mode artifact.
+            if !settle_drain_ran {
+                assert_eq!(
+                    ctx.send_calls(),
+                    sends_before,
+                    "terminal GoingOnline artifact (mode={mode:?} shift={shift:?}): the bounded \
+                     real recovery ops made a NEW wire send — deferred docs must not be re-driven"
+                );
+            }
             // O5: previously this branch SKIPPED the scan entirely (a deferred
             // online-origin SENDING would false-flag StuckSending).  Run the scan
             // but EXCUSE only that StuckSending variant — every OTHER violation
@@ -1455,27 +1475,39 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                     op,
                     Op::Drain(_) | Op::RepeatDrain | Op::GoOnline(_) | Op::GoOnlineWithoutBacklog
                 ) {
-                    // 1. No offline code consumed — codes are consumed at ISSUANCE,
-                    //    never by a drain (which re-drives already-issued docs).
-                    assert_eq!(
-                        ctx.consumed_codes_count().await,
-                        codes_before,
-                        "MH: exotic drain {op:?} consumed an offline code"
+                    // B10: a drain that FINALIZES mints the DocType=10 END LAST —
+                    // ONE fresh offline doc that consumes ONE code, allocates ONE
+                    // lnd, and advances the MAC seed (its M2-01 OLA).  So the
+                    // strict "drain re-drives, mints nothing" MH postconds relax to
+                    // a BOUNDED tolerance of +1 (the END): a drain still may NOT
+                    // consume/allocate MORE than one (that would be a re-drive
+                    // minting bug), preserving the safety teeth.
+                    let codes_after = ctx.consumed_codes_count().await;
+                    assert!(
+                        codes_after == codes_before || codes_after == codes_before + 1,
+                        "MH: exotic drain {op:?} consumed {} codes (> the one END code)",
+                        codes_after - codes_before
                     );
-                    // 2. next_lnd unchanged — a drain allocates NO new lnd.
-                    assert_eq!(
-                        ctx.read_next_lnd().await,
-                        next_lnd_before,
-                        "MH: exotic drain {op:?} allocated a new lnd"
+                    let next_lnd_after = ctx.read_next_lnd().await;
+                    assert!(
+                        next_lnd_after == next_lnd_before || next_lnd_after == next_lnd_before + 1,
+                        "MH: exotic drain {op:?} allocated {} lnds (> the one END lnd)",
+                        next_lnd_after - next_lnd_before
                     );
-                    // 3. Seed unchanged — offline-origin advanced the MAC seed at
-                    //    issuance (OFFLINE_LOCAL_ACK); a drain re-drives, never
-                    //    re-advances it.
-                    assert_eq!(
-                        ctx.read_seed().await,
-                        prior_tip,
-                        "MH: exotic drain {op:?} advanced the MAC seed"
-                    );
+                    // 3. Seed: unchanged (pure re-drive) OR advanced (the END's OLA
+                    //    M2-01) — never advanced by re-driving the ALREADY-issued
+                    //    backlog (that would be a double-advance bug), but the END
+                    //    is a fresh doc so a single advance is allowed.  A change of
+                    //    the seed is bounded to at most the one END here; the exact
+                    //    value is model-checked in the PredictableMutating path.
+                    let end_minted = codes_after == codes_before + 1;
+                    if !end_minted {
+                        assert_eq!(
+                            ctx.read_seed().await,
+                            prior_tip,
+                            "MH: exotic drain {op:?} advanced the MAC seed without minting an END"
+                        );
+                    }
                     // 4. Send-delta bounded by the cohort — the drain re-drives
                     //    each cohort doc a BOUNDED number of times (no unbounded
                     //    resend loop); 2×+1 allows one MAC-recovery retry per doc.

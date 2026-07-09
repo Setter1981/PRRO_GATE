@@ -387,16 +387,20 @@ impl RefModel {
                 // hash.  Code accounting re-derived vs the impl:
                 //   - 0 codes → BEGIN signs bare → offline-ack ABORTS it, and the
                 //     lazy-BEGIN gate fail-closes the business doc BEFORE it mints
-                //     (503) → the ONLY row is the Aborted BEGIN.
+                //     (503) → NO row at all (the pre-mint pool-empty guard in
+                //     `ensure_offline_session_begin` refuses BEFORE minting a BEGIN).
                 //   - 1 code → BEGIN(OLA, code#1); business doc finds empty pool →
                 //     aborts (Aborted).  Two rows.
                 //   - ≥2 codes → BEGIN(OLA, code#1) + business(OLA, code#2).
                 if !self.session_has_begin {
-                    self.session_has_begin = true; // a BEGIN row (OLA or Aborted) now rests
                     if self.codes_consumed >= self.codes_issued {
-                        // 0 codes → BEGIN aborts; business doc never mints (503).
-                        return self.mint_aborted_refusal();
+                        // 0 codes → the pre-mint pool guard refuses the whole op
+                        // RETRYABLE (503) WITHOUT minting a BEGIN or the business
+                        // doc → NO ledger mutation (NOT an Aborted row).  Do NOT set
+                        // `session_has_begin` — no BEGIN was minted.
+                        return ExpectedOutcome::NoMutation;
                     }
+                    self.session_has_begin = true; // the BEGIN row now rests (OLA)
                     let begin_lnd = self.next_lnd;
                     let begin_unsigned = synth_unsigned_hash(begin_lnd);
                     self.docs.insert(begin_lnd, DocState::OfflineLocalAck);
