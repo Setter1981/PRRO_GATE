@@ -3430,3 +3430,460 @@ async fn live_recover_close_dangling_offline_session() {
         post_online
     );
 }
+
+// ─── Live recovery — close a leftover OPEN SHIFT via an ONLINE Z_REPORT ──────
+//
+// WHY: live smoke 9 (run 3) opened a shift on the DPS cabinet via an OFFLINE
+// SHIFT_OPEN + 1 SELL (both ACK'd on real DPS), then the drain-finalize left the
+// SHIFT itself OPEN (post `statusRro` showed `open_shift=true`).  A leftover open
+// shift makes a FRESH smoke's SHIFT_OPEN draw `-2 "shift is already open"`.  To
+// get a clean integrated run the shift must be closed with a Z_REPORT
+// (DPS DocType=80 / `Check.Type::ZREPORT=2`).  We are ONLINE now, so this is a
+// NORMAL online issuance — a BARE `<MAC>` (no offline code), exactly like the
+// B10 END fix's online drain-close form, only carrying the Z body instead of an
+// empty END.
+//
+// SHAPE: the production T=80 wire form is `<Z NO=...>` (NOT `<C T='80'>`) — the
+// DPS doctype-80 is signalled by the `<Z>` block + `typCheck=ZReport(2)` on the
+// wire.  We drive the REAL production builder (`xml::build_canonical_xml(
+// &CanonicalDoc::ZReport(..))`, the A′.2 Z-surface used live by smoke 7) with a
+// `DocumentHeader { mac_id: None }` → the online bare-`<MAC>` form.  This is a
+// PURE standalone call (no DB / write-path boot), matching the one-shot recovery
+// posture of `live_recover_close_dangling_offline_session` above.
+//
+// Z TOTALS: the shift's only receipt is run-3's SELL (`SMOKE9_SELL_PAYLOAD_JSON`
+// = one CASH item, `sum_kop=15000`, NO `tax_group_1`).  The production
+// `convert::derive_z_report_tax_summaries` would emit NO `<TXS>` for a
+// tax-group-less item, so the DEFAULT Z carries one `<M NM="CASH" SMI={sum} T=0>`
+// payment + `<NC NI=1 NO=0>` check-count + NO `<TXS>`.  Both the sale sum and an
+// optional tax code are ENV-OVERRIDABLE so the operator can adjust on the live
+// run if DPS rejects with a totals mismatch (`-6`/`-10` Z-sequence/XML rejects):
+//   PRRO_LIVE_DPS_Z_SUM_KOP — CASH SMI (default 15000 = run-3 SELL total).
+//   PRRO_LIVE_DPS_Z_TAX     — canonical tax-group number; when set, inject one
+//                             SHORT-FORM `<TXS SMI={sum} SMO=0 TX={tax}>` (the
+//                             same shape `derive_z_report_tax_summaries` emits for
+//                             an UNRESOLVED group — we have no rate snapshot live
+//                             to compute TXI/TXO).  Unset → no `<TXS>`.
+//   PRRO_LIVE_DPS_Z_NO      — `<DAT ZN=...>` / `<Z NO=...>` Z counter (default 1).
+//                             DPS validates the per-RRO Z sequence; bump on a -6.
+//   PRRO_LIVE_DPS_Z_DI      — `<DAT DI=...>` / wire local_number (default 10 —
+//                             next after run-3's [BEGIN,SHIFT_OPEN,SELL] backlog).
+
+/// `PRRO_LIVE_DPS_Z_SUM_KOP` — CASH `<M SMI>` (kopecks).  Default = run-3 SELL.
+const ENV_Z_SUM_KOP: &str = "PRRO_LIVE_DPS_Z_SUM_KOP";
+/// `PRRO_LIVE_DPS_Z_TAX` — canonical tax group for a short-form `<TXS>` (opt).
+const ENV_Z_TAX: &str = "PRRO_LIVE_DPS_Z_TAX";
+/// `PRRO_LIVE_DPS_Z_NO` — the `<Z NO>` / `<DAT ZN>` Z counter.
+const ENV_Z_NO: &str = "PRRO_LIVE_DPS_Z_NO";
+/// `PRRO_LIVE_DPS_Z_DI` — the `<DAT DI>` / wire `local_number` for the Z.
+const ENV_Z_DI: &str = "PRRO_LIVE_DPS_Z_DI";
+
+/// Run-3 SELL total (`SMOKE9_SELL_PAYLOAD_JSON.payments[0].sum_kop`) = the CASH
+/// inflow the closing Z must report by default.
+const DEFAULT_Z_SUM_KOP: i64 = SMOKE9_SELL_TOTAL_KOP; // 15000
+/// Default Z counter — first Z on this FN's per-RRO sequence.  Bump via env on -6.
+const DEFAULT_Z_NO: u32 = 1;
+/// Default Z DI — next local number after run-3's [BEGIN, SHIFT_OPEN, SELL].
+const DEFAULT_Z_DI: u32 = 10;
+
+fn resolve_env_i64(var: &str, default: i64) -> i64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+fn resolve_env_u32(var: &str, default: u32) -> u32 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// **Live recovery — close a leftover OPEN SHIFT via an ONLINE Z_REPORT**.
+///
+/// WHY: run-3's offline SHIFT_OPEN + SELL left the SHIFT open on the DPS cabinet
+/// (`statusRro.open_shift=true`), so a fresh smoke's SHIFT_OPEN draws `-2 "shift
+/// is already open"`.  This routine closes it with an ONLINE Z_REPORT (DPS
+/// DocType=80, `typCheck=ZReport(2)`) off the SETTLED chain tip — a normal online
+/// issuance with a BARE `<MAC>` (NO offline code), the same online form as the
+/// B10 END fix, but carrying the Z body.
+///
+/// FLOW (mirrors `live_recover_close_dangling_offline_session`):
+///   1. `live_armed` gate + `load_signing_key` (skip/return if not armed).
+///   2. Connect; read `status_rro` (print pre `open_shift`/`online`).  If
+///      `open_shift=false` already, the shift is closed — the Z below will
+///      confirm (a Z with no open shift typically draws a shift-state reject,
+///      which this routine surfaces).
+///   3. POLL `last_chk` until the tip is SETTLED (stable across 2 reads) → the
+///      settled tip hash (hex) → the Z's `<MAC>` previous-hash.
+///   4. Build the Z via the PRODUCTION builder
+///      `xml::build_canonical_xml(&CanonicalDoc::ZReport(..))` with
+///      `DocumentHeader { mac_id: None }` (bare-`<MAC>` ONLINE form): one CASH
+///      `<M SMI={PRRO_LIVE_DPS_Z_SUM_KOP}>`, `<NC NI=1 NO=0>`, and an OPTIONAL
+///      short-form `<TXS>` when `PRRO_LIVE_DPS_Z_TAX` is set.  Print the Z XML.
+///   5. Sign with the LIVE key (ATTACHED CAdES-BES, `Dstu4145WithGost34311Pb`).
+///   6. `send_chk` with `typCheck=ZReport(2)`, EMPTY wire `id_offline` (online);
+///      PRINT the FULL DPS response (OK → shift closed / server_fiscal_no;
+///      reject → exact `dps_code` + message).
+///   7. `status_rro` again → print `open_shift`/`online` (should flip
+///      `open_shift=false`).  PASS iff DPS ACCEPTS the Z; on reject, FAIL loudly
+///      with the exact code (esp. a totals mismatch → adjust the env sums).
+///
+/// This is a TARGETED one-shot recovery: it hand-drives the production Z builder
+/// + signs + sends a single Z_REPORT, off the SETTLED tip.  It does NOT boot the
+/// write-path or mutate any gateway DB.
+#[tokio::test]
+#[ignore = "live DPS endpoint required; opt-in via --features live-dps + --ignored + PRRO_LIVE_DPS=1"]
+async fn live_recover_close_open_shift() {
+    // Production Z-surface types — scoped here so the shared top-of-file import
+    // block (which never needed the XML builder) stays untouched (minimal diff).
+    use prro::xml::{
+        build_canonical_xml, CanonicalDoc, DocumentHeader, ZReportCheckCount, ZReportPayload,
+        ZReportPaymentSum, ZReportTaxSummary,
+    };
+
+    const NAME: &str = "Live recovery (close leftover OPEN SHIFT — Z_REPORT DocType=80)";
+    if !live_armed(NAME) {
+        return;
+    }
+    let Some(ek) = load_signing_key(NAME) else {
+        return;
+    };
+    let host = resolve_host();
+    let fiscal_number = resolve_fn();
+    let tn = LIVE_TN;
+
+    let z_sum_kop = resolve_env_i64(ENV_Z_SUM_KOP, DEFAULT_Z_SUM_KOP);
+    let z_no = resolve_env_u32(ENV_Z_NO, DEFAULT_Z_NO);
+    let z_di = resolve_env_u32(ENV_Z_DI, DEFAULT_Z_DI);
+    // Optional short-form <TXS>: only when PRRO_LIVE_DPS_Z_TAX is a valid tax
+    // group number.  None → no <TXS> (matches run-3's tax-group-less SELL).
+    let z_tax: Option<i64> = std::env::var(ENV_Z_TAX)
+        .ok()
+        .and_then(|v| v.trim().parse().ok());
+
+    println!("\n=== RECOVERY: close leftover OPEN SHIFT via ONLINE Z_REPORT (DocType=80) ===");
+    println!("FN: {fiscal_number}  TN: {tn}");
+    println!("Endpoint: {host}");
+    println!(
+        "Z form: production <Z NO> builder (A′.2 Z-surface), ONLINE bare-<MAC> (mac_id=None), \
+         typCheck=ZReport(2), empty wire id_offline."
+    );
+    println!(
+        "Z totals (env-overridable): CASH SMI={z_sum_kop}kop ({}) [{ENV_Z_SUM_KOP}]  \
+         Z_NO={z_no} [{ENV_Z_NO}]  DI={z_di} [{ENV_Z_DI}]  TXS_tax={z_tax:?} [{ENV_Z_TAX}]",
+        if z_sum_kop == DEFAULT_Z_SUM_KOP {
+            "run-3 SELL default"
+        } else {
+            "env override"
+        }
+    );
+    println!(
+        "Goal: DPS ACCEPTS the Z → the leftover shift CLOSES (open_shift should flip false)\n"
+    );
+
+    // ── Step 1: connect + read the CURRENT DPS state ───────────────────────
+    let channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        .await
+        .unwrap_or_else(|e| panic!("RECOVERY FAIL: GrpcDpsChannel::connect: {e:?}"));
+    let fn_sign = sign_fn_blob(&ek, &fiscal_number);
+
+    println!("--- PRE-STATE ---");
+    if let Ok(s) = channel.status_rro(&fn_sign).await {
+        println!(
+            "  pre statusRro: open_shift={} online={} last_signer={:?}",
+            s.open_shift, s.online, s.last_signer
+        );
+        if !s.open_shift {
+            println!(
+                "  NOTE: DPS reports open_shift=false already — the shift may ALREADY be \
+                 closed.  The Z below will confirm (a Z with no open shift typically draws a \
+                 shift-state reject, which this routine surfaces)."
+            );
+        }
+    }
+
+    // ── Step 2: read + SETTLE the current chain tip ────────────────────────
+    // Poll `last_chk` until the tip is STABLE across two consecutive reads so the
+    // Z's `<MAC>` chains off DPS's REAL current tip (identical logic to the END
+    // recovery above; each read decodes `data_sign` (ATTACHED CMS) →
+    // sha256(eContent) = the hash the NEXT doc must carry in `<MAC>`).
+    println!("\n--- SETTLE CHAIN TIP (poll last_chk until stable across 2 reads) ---");
+    let settled_tip_hex: String = {
+        async fn read_tip_hex(
+            channel: &GrpcDpsChannel,
+            fn_sign: &CheckSignBlob,
+        ) -> Result<Option<String>, DpsError> {
+            let ack = channel.last_chk(fn_sign).await?;
+            if ack.data_sign.is_empty() {
+                return Ok(Some(String::new()));
+            }
+            match extract_econtent(&ack.data_sign) {
+                Ok(inner) => {
+                    let tip: [u8; 32] = Sha256::digest(&inner).into();
+                    Ok(Some(hex_lower(&tip)))
+                }
+                Err(_) => Ok(None),
+            }
+        }
+
+        let mut prev: Option<String> = None;
+        let mut settled: Option<String> = None;
+        for attempt in 1..=20u32 {
+            match read_tip_hex(&channel, &fn_sign).await {
+                Ok(Some(tip)) => {
+                    println!(
+                        "  poll {attempt}: DPS tip = {}",
+                        if tip.is_empty() {
+                            "<genesis/empty>"
+                        } else {
+                            &tip
+                        }
+                    );
+                    if prev.as_ref() == Some(&tip) {
+                        println!(
+                            "  DPS tip SETTLED (stable across 2 reads) after {attempt} poll(s)"
+                        );
+                        settled = Some(tip);
+                        break;
+                    }
+                    prev = Some(tip);
+                }
+                Ok(None) => {
+                    println!("  poll {attempt}: tip not yet decodable — retry");
+                }
+                Err(DpsError::Server { code: -4, message }) => {
+                    println!(
+                        "RECOVERY SKIP: DPS rate-limit (-4) on last_chk: {message}. Cool down 5+ min."
+                    );
+                    return;
+                }
+                Err(DpsError::Transport(msg)) => {
+                    panic!("RECOVERY FAIL: Transport on last_chk: {msg}");
+                }
+                Err(e) => {
+                    println!("  poll {attempt}: last_chk non-fatal error (retry): {e:?}");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        match settled {
+            Some(tip) => tip,
+            None => {
+                println!(
+                    "RECOVERY SKIP: DPS chain tip did not stabilise within the poll window \
+                     (~100s) — cannot safely chain the Z off a moving tip.  Re-run later."
+                );
+                return;
+            }
+        }
+    };
+    println!(
+        "  settled previous_hash for the Z: {}",
+        if settled_tip_hex.is_empty() {
+            "<genesis/empty>"
+        } else {
+            &settled_tip_hex
+        }
+    );
+
+    // ── Step 3: build the ONLINE Z_REPORT via the PRODUCTION builder ───────
+    // `DocumentHeader::with_defaults` sets `mac_id = None` → bare `<MAC>` (the
+    // ONLINE form).  One `business_ts` instant drives BOTH the signed `<TS>`
+    // (ts_str) and the wire `date_time` (fake-epoch), exactly as production
+    // stage_sign + stage_send do.  `<TS>` is Kyiv-local `YYYYMMDDHHMMSS`; the
+    // `<TXS TS>` date prefix (when a tax group is injected) is its first 8 chars.
+    println!("\n--- BUILD Z_REPORT (<Z NO>, production builder, ONLINE bare-<MAC>) ---");
+    let business_ts = iso_now();
+    let ts_str = recover_kyiv_ts_str(&business_ts);
+    let date_time = recover_kyiv_local_epoch(&business_ts);
+
+    let header = DocumentHeader::with_defaults(
+        fiscal_number.clone(),
+        tn,
+        z_no,
+        ts_str.clone(),
+        settled_tip_hex.clone(),
+    );
+
+    // Optional short-form <TXS> from the env tax code (SMI/SMO/TX only — the
+    // exact shape `derive_z_report_tax_summaries` emits for an UNRESOLVED group,
+    // which is what run-3's tax-group-less SELL yields; we have no live rate
+    // snapshot to compute TXI/TXO, so short form is the faithful choice).
+    let tax_summaries: Vec<ZReportTaxSummary> = match z_tax {
+        Some(tx) => vec![ZReportTaxSummary {
+            tx,
+            tx_short_form: true,
+            txpr: String::new(),
+            txal: 0,
+            txty: 0,
+            dtpr: String::new(),
+            smi: z_sum_kop,
+            smo: 0,
+            txi: 0,
+            txo: 0,
+            // ts_prefix is IGNORED in short form (only SMI/SMO/TX emit); the
+            // date prefix would be `ts_str[..8]` in full form.
+            ts_prefix: ts_str.chars().take(8).collect(),
+        }],
+        None => Vec::new(),
+    };
+
+    let z_payload = ZReportPayload {
+        header,
+        local_number: z_di,
+        tax_summaries,
+        // The shift's single receipt was a CASH sale — mirror it as one <M>.
+        payments: vec![ZReportPaymentSum {
+            name: "CASH".into(),
+            sum_in: z_sum_kop,
+            sum_out: 0,
+            type_code: "0".into(), // "0" = cash
+        }],
+        service_sums: Vec::new(),
+        // run-3 minted exactly one SELL and zero returns in this shift.
+        check_count: ZReportCheckCount {
+            sell_count: 1,
+            return_count: 0,
+        },
+        epz: None,
+    };
+
+    let z_xml_bytes = build_canonical_xml(&CanonicalDoc::ZReport(z_payload))
+        .expect("production Z builder must succeed (cp1251-encodable content)");
+    // The wire bytes are cp1251; the Z body (<Z>/<M>/<NC>/<TXS>) is ASCII and the
+    // NDv device-name default (`ПРО_каса`) is Cyrillic, so lossy-UTF8 is a
+    // faithful human-readable render of the exact bytes signed + sent.
+    println!(
+        "  Z <Z NO='{z_no}'> XML ({} bytes, cp1251): {}",
+        z_xml_bytes.len(),
+        String::from_utf8_lossy(&z_xml_bytes)
+    );
+    println!("  Z <TS>={ts_str}  wire date_time(fake-epoch)={date_time}");
+    println!(
+        "  Z <MAC>=bare (NO ID=)  wire id_offline=<empty>  typCheck=ZReport(2)  DI={z_di}"
+    );
+
+    // ── Step 4: sign with the LIVE key (ATTACHED CAdES-BES) ────────────────
+    // Same CmsSigner / Dstu4145WithGost34311Pb block as the END / SELL path.
+    println!("\n--- SIGN Z (native ATTACHED CAdES-BES, live key) ---");
+    let cert_der: &[u8] = ek
+        .signing_cert()
+        .expect("JKS must carry a signing certificate");
+    let curve = Curve::dstu_pb_257();
+    let d = FieldEl::from_le_bytes(&ek.param_d[..], curve.mod_words);
+    let signer_inner = DstuInProcessSigner::new(d);
+    let cms_signer_z = CmsSigner {
+        cert_der,
+        signer: &signer_inner,
+        profile: CmsProfile::Dstu4145WithGost34311Pb,
+    };
+    let z_signed = cms_signer_z
+        .sign_with(
+            &z_xml_bytes,
+            CmsBuildOptions {
+                attached: true,
+                signing_time: Some(SystemTime::now()),
+            },
+        )
+        .expect("Z sign must succeed")
+        .cms_der;
+    let econtent_ok = extract_econtent(&z_signed)
+        .map(|inner| inner == z_xml_bytes)
+        .unwrap_or(false);
+    println!(
+        "  Z SIGNED: {} bytes (ATTACHED CMS; eContent==canonical XML: {econtent_ok})",
+        z_signed.len()
+    );
+
+    // ── Step 5: send the Z + capture the FULL DPS response ─────────────────
+    // typCheck = ZReport (proto ZREPORT=2); local_number = DI; id_offline =
+    // EMPTY (ONLINE issuance — no offline code); date_time = fake-epoch.
+    println!("\n--- SEND Z → live DPS ---");
+    let z_envelope = CheckEnvelope {
+        rro_fn: fiscal_number.clone(),
+        date_time,
+        check_sign: z_signed,
+        local_number: z_di as i32,
+        check_type: DpsCheckType::ZReport,
+        // ONLINE issuance: NO offline code on the wire.
+        id_offline: String::new(),
+        id_cancel: String::new(),
+    };
+
+    let mut accepted = false;
+    match channel.send_chk(z_envelope).await {
+        Ok(ack) => {
+            accepted = true;
+            println!(
+                "  Z DPS OK — shift CLOSED.  assigned id (server_fiscal_no)={:?}  \
+                 id_sign={} bytes  data_sign={} bytes",
+                ack.id,
+                ack.id_sign.len(),
+                ack.data_sign.len()
+            );
+        }
+        Err(DpsError::Server { code: -4, message }) => {
+            println!(
+                "RECOVERY SKIP: DPS rate-limit (-4) on Z send_chk: {message}. Cool down 5+ min."
+            );
+            return;
+        }
+        Err(DpsError::Server { code, message }) => {
+            // The Z reject reason — print it loudly for the operator.
+            println!(
+                "  Z DPS REJECT — dps_code={code}  message={message:?}\n  \
+                 (this is the exact DocType=80 Z_REPORT reject reason.  Interpretation: \
+                 -6 (ERROR_NOT_PREV_ZREPORT) → the Z NUMBER is out of the FN's per-RRO \
+                 sequence — bump {ENV_Z_NO}; -10 (ERROR_XML_ZREPORT) → the Z body/totals are \
+                 malformed or mismatch the shift's receipts — adjust {ENV_Z_SUM_KOP} / \
+                 {ENV_Z_TAX} to match run-3's SELL; a shift-state reject → the shift is \
+                 already closed (see pre-state); a MAC/hash reject → the settled-tip fix \
+                 needs revisiting)"
+            );
+        }
+        Err(DpsError::Transport(msg)) => {
+            panic!("RECOVERY FAIL: Transport error on Z send_chk: {msg}");
+        }
+        Err(e) => {
+            panic!("RECOVERY FAIL: unexpected error on Z send_chk: {e:?}");
+        }
+    }
+
+    // ── Step 6: re-read state — did the shift close? ───────────────────────
+    println!("\n--- POST-STATE ---");
+    let mut post_open_shift: Option<bool> = None;
+    if let Ok(s) = channel.status_rro(&fn_sign).await {
+        post_open_shift = Some(s.open_shift);
+        println!(
+            "  post statusRro: open_shift={} online={} last_signer={:?}",
+            s.open_shift, s.online, s.last_signer
+        );
+        if !s.open_shift {
+            println!("  → open_shift flipped FALSE: the leftover shift is CLOSED.");
+        } else {
+            println!(
+                "  → open_shift still TRUE: the shift did NOT close (see the Z reject code above)."
+            );
+        }
+    }
+
+    // ── Step 7: verdict ────────────────────────────────────────────────────
+    // PASS iff DPS ACCEPTED the Z.  On reject we FAIL LOUDLY (the dps_code +
+    // message are printed above) so the operator learns the real reject reason —
+    // most usefully a totals mismatch, which the env sums adjust.
+    assert!(
+        accepted,
+        "RECOVERY FAIL: DPS did NOT accept the Z_REPORT — the leftover shift is STILL OPEN. \
+         The exact dps_code + message are printed above (Step 5).  This Z is the production \
+         ONLINE bare-<MAC> form (typCheck=ZReport(2), empty id_offline).  If -10 / a totals \
+         mismatch, adjust {ENV_Z_SUM_KOP} / {ENV_Z_TAX} to match run-3's SELL; if -6, bump \
+         {ENV_Z_NO}; if a shift-state reject, the shift was already closed."
+    );
+    println!(
+        "\nRECOVERY PASS: DPS ACCEPTED the settled-chain ONLINE Z_REPORT — the leftover shift \
+         is CLOSED (post open_shift={:?}).  A fresh smoke's SHIFT_OPEN should no longer draw -2.",
+        post_open_shift
+    );
+}
