@@ -320,6 +320,72 @@ async fn teeth_d5_send_ack_notfound_drain_predicts_sent_held() {
     .await;
 }
 
+/// U1 D5 (KNOWN-RED tooth, PRRO_GATE-eid) — online shift-management docs with
+/// D5 `Superseded` currently leave production/model without an agreed legal
+/// terminal: the doc is routed to a non-issued retry/error shape after
+/// stage_acquire has already moved the shift into `Opening` / `Closing`.
+///
+/// We do NOT normalize that behavior in the model and we do NOT generate these
+/// scripts yet.  This test proves the fuzzer bites: the directed sequence must
+/// panic until PRRO_GATE-eid resolves the production/model contract and promotes
+/// these scripts into `shift_dps_script()`.
+#[test]
+fn teeth_d5_shift_doc_superseded_known_red() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ctx = interp::FuzzCtx::new_online_open_shift().await;
+            let model = RefModel::new_online_open_shift();
+            run_harness(
+                &[Op::OnlineZReport(DpsScript::superseded_tip())],
+                ctx,
+                model,
+            )
+            .await;
+        });
+    }))
+    .is_err();
+    std::panic::set_hook(prev);
+    assert!(
+        panicked,
+        "PRRO_GATE-eid: OnlineZReport(Superseded) returned cleanly. That means \
+         the D5 shift-doc gap was silently adopted or normalized instead of being \
+         resolved with an explicit production/model contract."
+    );
+
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ctx = interp::FuzzCtx::new_online_closed_shift().await;
+            let model = RefModel::new_online_closed_shift();
+            run_harness(
+                &[Op::OnlineShiftOpen(DpsScript::superseded_tip())],
+                ctx,
+                model,
+            )
+            .await;
+        });
+    }))
+    .is_err();
+    std::panic::set_hook(prev);
+    assert!(
+        panicked,
+        "PRRO_GATE-eid: OnlineShiftOpen(Superseded) returned cleanly. That means \
+         the D5 shift-doc gap was silently adopted or normalized instead of being \
+         resolved with an explicit production/model contract."
+    );
+}
+
 /// U1 D5 (NEG tooth) — a `[BadHashPrev]` (MAC-recovery) drain stays GENUINELY
 /// deferred to Fault (§7 #1) — NOT force-promoted, so run_harness adopts via
 /// resync and completes without a false differential.
