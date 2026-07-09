@@ -3391,6 +3391,100 @@ fn build_webcheck_exact_end_xml(
     out
 }
 
+/// Build a **byte-EXACT WebCheck DocType=80 Z_REPORT (close-shift)** XML,
+/// faithful to the decompiled `Reprt` Z-builder (`StringXML.cs:2186-2401`) plus
+/// the ONLINE `<RQ>` wrapper + bare-`<MAC>` substitution (`SkinXML` at
+/// `StringXML.cs:2978` → `SubstitutePreviousMAC` at `All.cs:1495/1527`, which
+/// replaces the `mmmaaaccc` placeholder with `<MAC>{settled_tip}</MAC>` for the
+/// ONLINE close).  The WebCheck concat chain emits, VERBATIM:
+///
+/// ```text
+/// <RQ V ='1'><DAT FN='{FN}' TN='{TN}' DI='{DI}' ZN='0' V='1'><Z NO='{Z_NO}'><M T='0' NM='CASH' SMI='0' SMO='0'/><NC NI='1' NO='0'/></Z><TS>{TS}</TS></DAT><MAC>{settled_tip}</MAC></RQ>
+/// ```
+///
+/// Line-by-line mirror of `StringXML.cs`:
+///   - `<DAT FN='..' TN='..' DI='{num}' ZN='0' V='1'>` — line 2186 VERBATIM
+///     (attr order FN, TN, DI, ZN, V; `ZN='0'` is the LITERAL "0" the C# string
+///     literal writes, NOT the Z counter; `DI = MaxID("ksef")+1` = our `DI`).
+///   - `<Z NO='{sh}'>` — line 2188, where `sh` is the SHIFT number (NOT a Z
+///     counter).  We pass `z_no` (the caller's `<Z NO>` value) so the probe
+///     mirrors the same knob the production path uses.
+///   - `<M T='{iscash}' NM='{payname}' SMI='{smi}' SMO='{smo}'/>` — line 2365
+///     (the payment-sum loop, `Reprt2`).  For an EMPTY shift with one settled
+///     CASH sale we emit exactly one `<M T='0' NM='CASH' SMI='0' SMO='0'/>`
+///     (`T='0'` = cash per `get_PayISCASH`; totals 0 for the 0-sales close the
+///     recovery targets).  The optional `SMIM/SMIP/SMOM/SMOP` SMB suffix (line
+///     2356) is absent (no split-payment breakdown), matching a plain cash close.
+///   - `<NC NI='1' NO='0'/>` — line 2378 (`Reprt3`; NI = receipts issued, NO =
+///     receipts cancelled).  `NI='1' NO='0'` = one issued receipt, none voided
+///     — the exact `NC NI="1" NO="0"` our production Z also emits for this shift.
+///   - `</Z><TS>{dd}</TS></DAT>` — lines 2401/2403/2404 (`dd =
+///     СurrentCompDate()`; we pass the same Kyiv-local `<TS>` string the
+///     production path signs).
+///   - `<RQ V ='1'>…<MAC>{tip}</MAC></RQ>` — the ONLINE wrapper: `SkinXML`
+///     prepends `<RQ V ='1'>` + appends `mmmaaaccc</RQ>` (line 2978), and
+///     `SubstitutePreviousMAC` rewrites `mmmaaaccc` → `<MAC>{settled_tip}</MAC>`
+///     (`All.cs:1495` then :1527 with the real chained MAC).  Note the WebCheck
+///     `<RQ V ='1'>` SPACE-before-`=` spacing, matching the BEGIN/END helpers.
+///
+/// **DELIBERATELY OMITTED** for this 0-sales close (each absent because its
+/// WebCheck source loop produces NOTHING when the shift has no taxed turnover):
+///   - `<TXS …/>` — the tax-summary loop (lines 2270-2324) runs per NON-EMPTY
+///     `payTax` tax group; a 0-turnover close has none, so no `<TXS>` is emitted.
+///   - `<IO NM='ГОТІВКА' …/>` (line 2389) and `<EPZ …>` (line 2400) — these are
+///     appended by WebCheck's Z but are NOT part of the minimal close the
+///     production probe sends; keeping the probe body identical to the production
+///     Z's `<M>`/`<NC>`-only shape isolates the wrapper/attr FORMAT as the single
+///     variable under test (the whole point of the `-8` bisect).  The `<M>`/`<NC>`
+///     block is byte-for-byte the production shape; only the `<RQ>`/`<DAT>` attr
+///     FORMAT differs — exactly the delta we are bisecting.
+///
+/// Deltas vs the production `<Z NO>` builder (`xml/mod.rs`), each a suspect for
+/// the persistent DocType=80 `-8`:
+///   - NO `NDv="ПРО_каса"` / `PrV="1.1"` on `<RQ>` (production emits both).
+///   - `ZN='0'` LITERAL (production emits `ZN="{z_no}"` — the Z counter).
+///   - attr order FN, TN, DI, ZN, V (production: DI, FN, TN, V, ZN — alphabetical).
+///   - single-quoted attrs + `<RQ V ='1'>` space-before-`=` (production: double-
+///     quoted, `<RQ … V="1">`).
+///   - `<Z NO='{z_no}'>` where NO is the SHIFT number (production `<Z NO>` too,
+///     but the surrounding `<DAT ZN>` differs as above).
+///
+/// The whole document is **pure ASCII** (FN / TN / DI / TS / hash are ASCII, the
+/// `CASH`/`ГОТІВКА`-free body carries no Cyrillic — we intentionally omit the
+/// Cyrillic `<IO>`), so the cp1251 wire bytes == ASCII byte-for-byte; no
+/// byte-splice is needed.  Returns the cp1251 (== ASCII here) wire bytes so the
+/// SIGNED + SUBMITTED bytes match WebCheck's `encoding='windows-1251'` codepage.
+///
+/// NOTE: WebCheck's Z does NOT prepend an `<?xml …?>` prolog for the ONLINE
+/// wrapper (`SkinXML` prepends only `<RQ V ='1'>`), so this helper emits none —
+/// contrast `build_webcheck_exact_end_xml`, whose `text` DID carry the prolog.
+fn build_webcheck_exact_z_xml(
+    fiscal_number: &str,
+    tin: &str,
+    di: u32,
+    z_no: u32,
+    ts_str: &str,
+    settled_tip_hex: &str,
+) -> Vec<u8> {
+    // Pure-ASCII by construction (see doc-comment): no Cyrillic anywhere, so
+    // cp1251 == ASCII and we can build the whole doc as a `String` and take its
+    // bytes directly.  This mirrors WebCheck's ONLINE Z string.Concat chain
+    // (`<DAT>` body from Reprt + `SkinXML`'s `<RQ V ='1'>` wrapper + the
+    // `SubstitutePreviousMAC` `<MAC>` rewrite) byte-for-byte.
+    let xml = format!(
+        "<RQ V ='1'>\
+         <DAT FN='{fiscal_number}' TN='{tin}' DI='{di}' ZN='0' V='1'>\
+         <Z NO='{z_no}'>\
+         <M T='0' NM='CASH' SMI='0' SMO='0'/>\
+         <NC NI='1' NO='0'/>\
+         </Z>\
+         <TS>{ts_str}</TS>\
+         </DAT>\
+         <MAC>{settled_tip_hex}</MAC></RQ>"
+    );
+    xml.into_bytes()
+}
+
 /// **Live recovery — close a DANGLING offline session via DocType=10 END**.
 ///
 /// WHY: live smoke 9 proved `-5` cleared (BEGIN + offline SHIFT_OPEN + SELL all
@@ -3802,6 +3896,18 @@ const ENV_Z_TAX: &str = "PRRO_LIVE_DPS_Z_TAX";
 const ENV_Z_NO: &str = "PRRO_LIVE_DPS_Z_NO";
 /// `PRRO_LIVE_DPS_Z_DI` — the `<DAT DI>` / wire `local_number` for the Z.
 const ENV_Z_DI: &str = "PRRO_LIVE_DPS_Z_DI";
+/// `PRRO_LIVE_DPS_Z_WEBCHECK_EXACT` — swap the signed+sent Z body from the
+/// PRODUCTION `<Z NO>` builder to a **byte-EXACT WebCheck Z_REPORT** form
+/// (`build_webcheck_exact_z_xml`).  Default OFF (`unset`/`"0"`) → the Z is
+/// byte-identical to today's production-builder Z.  Set to `"1"` to send the
+/// WebCheck-EXACT form instead — a FORMAT bisect for the persistent DocType=80
+/// `-8`: the production Z emits `<RQ NDv="ПРО_каса" PrV="1.1" V="1"><DAT DI TN
+/// V ZN="{z_no}">…` (double-quoted, alphabetical attr order, ZN = the Z
+/// counter), whereas WebCheck's PROVEN builder (`StringXML.cs:2186-2188`) emits
+/// `<RQ V ='1'><DAT FN TN DI ZN='0' V='1'><Z NO='{shift}'>…` — NO NDv/PrV, a
+/// LITERAL `ZN='0'`, single-quoted, and `<Z NO>` = the SHIFT number.  ACCEPT
+/// under `=1` while the production Z draws `-8` ⇒ `-8` is a wire-FORMAT issue.
+const ENV_Z_WEBCHECK_EXACT: &str = "PRRO_LIVE_DPS_Z_WEBCHECK_EXACT";
 
 /// Run-3 SELL total (`SMOKE9_SELL_PAYLOAD_JSON.payments[0].sum_kop`) = the CASH
 /// inflow the closing Z must report by default.
@@ -4078,16 +4184,55 @@ async fn live_recover_close_open_shift() {
         epz: None,
     };
 
-    let z_xml_bytes = build_canonical_xml(&CanonicalDoc::ZReport(z_payload))
+    let production_z_xml_bytes = build_canonical_xml(&CanonicalDoc::ZReport(z_payload))
         .expect("production Z builder must succeed (cp1251-encodable content)");
-    // The wire bytes are cp1251; the Z body (<Z>/<M>/<NC>/<TXS>) is ASCII and the
-    // NDv device-name default (`ПРО_каса`) is Cyrillic, so lossy-UTF8 is a
-    // faithful human-readable render of the exact bytes signed + sent.
-    println!(
-        "  Z <Z NO='{z_no}'> XML ({} bytes, cp1251): {}",
-        z_xml_bytes.len(),
-        String::from_utf8_lossy(&z_xml_bytes)
-    );
+
+    // ── Z FORMAT bisect (default OFF) ──────────────────────────────────────
+    // When PRRO_LIVE_DPS_Z_WEBCHECK_EXACT=1, SIGN + SEND a byte-EXACT WebCheck
+    // Z_REPORT (`build_webcheck_exact_z_xml`) INSTEAD of the production-builder
+    // Z — reusing the SAME settled tip, DI, Z_NO, TN, FN, <TS>, sign path, and
+    // send envelope, so the ONLY variable is the wire XML FORMAT.  This isolates
+    // whether the persistent DocType=80 `-8` is a wire-FORMAT issue (production
+    // emits `NDv`/`PrV` + `ZN="{z_no}"` + alphabetical double-quoted attrs;
+    // WebCheck emits none of NDv/PrV, a literal `ZN='0'`, and FN,TN,DI,ZN,V
+    // single-quoted).  When OFF, `z_xml_bytes` == the production bytes, so the
+    // signed + sent bytes are byte-IDENTICAL to today.
+    let webcheck_exact = std::env::var(ENV_Z_WEBCHECK_EXACT).as_deref() == Ok("1");
+    let z_xml_bytes = if webcheck_exact {
+        let wc = build_webcheck_exact_z_xml(&fiscal_number, tn, z_di, z_no, &ts_str, &settled_tip_hex);
+        println!(
+            "  Z FORMAT: WebCheck-EXACT ({ENV_Z_WEBCHECK_EXACT}=1) — NO NDv/PrV, ZN='0' LITERAL, \
+             attr order FN,TN,DI,ZN,V, single-quoted, <RQ V ='1'>, <Z NO='{z_no}'> (shift no.), \
+             bare <MAC>.  Deltas vs production Z: {} production bytes → {} WebCheck bytes.",
+            production_z_xml_bytes.len(),
+            wc.len()
+        );
+        println!(
+            "  Z WebCheck-EXACT bytes ({}, pure-ASCII == cp1251): {}",
+            wc.len(),
+            String::from_utf8_lossy(&wc)
+        );
+        println!(
+            "  Z PRODUCTION bytes (NOT sent this run, for diff) ({}, cp1251): {}",
+            production_z_xml_bytes.len(),
+            String::from_utf8_lossy(&production_z_xml_bytes)
+        );
+        wc
+    } else {
+        // The wire bytes are cp1251; the Z body (<Z>/<M>/<NC>/<TXS>) is ASCII and
+        // the NDv device-name default (`ПРО_каса`) is Cyrillic, so lossy-UTF8 is a
+        // faithful human-readable render of the exact bytes signed + sent.
+        println!(
+            "  Z FORMAT: PRODUCTION <Z NO> builder (default; set {ENV_Z_WEBCHECK_EXACT}=1 for the \
+             WebCheck-exact bisect)"
+        );
+        println!(
+            "  Z <Z NO='{z_no}'> XML ({} bytes, cp1251): {}",
+            production_z_xml_bytes.len(),
+            String::from_utf8_lossy(&production_z_xml_bytes)
+        );
+        production_z_xml_bytes
+    };
     println!("  Z <TS>={ts_str}  wire date_time(fake-epoch)={date_time}");
     println!("  Z <MAC>=bare (NO ID=)  wire id_offline=<empty>  typCheck=ZReport(2)  DI={z_di}");
 
