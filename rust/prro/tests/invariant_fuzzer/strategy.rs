@@ -26,13 +26,14 @@ fn dps_script() -> impl Strategy<Value = DpsScript> {
     ]
 }
 
-/// Tier-1 shift/Z generator slice.  ACK is the happy path; Reject crosses SEND
-/// and exercises the shift RMR lane.  D5 forms (`NotFound`, `Superseded`) are
-/// intentionally held out until the shift-doc D5 production/model contract is
-/// resolved; the directed dossier tracks that as a separate required slice.
+/// Tier-1 shift/Z generator slice.  ACK is the happy path; `Ack, NotFound`
+/// covers the D5 held-at-SENT path; Reject exercises the shift RMR lane.
+/// `Superseded` stays held out as the PRRO_GATE-eid known-red until the
+/// production/model contract is resolved.
 fn shift_dps_script() -> impl Strategy<Value = DpsScript> {
     prop_oneof![
         Just(DpsScript::ack_path()),
+        Just(DpsScript::send_ack_then_last_not_found()),
         Just(DpsScript::send_then_reject()),
     ]
 }

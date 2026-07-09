@@ -954,6 +954,34 @@ async fn differential_online_z_report_closes_shift_matches_model() {
     );
 }
 
+/// D5 shift-doc green pin: online Z_REPORT that crosses SEND but gets no KVT1
+/// evidence (`Ack, NotFound`) must rest at SENT while the shift close is already
+/// committed at the SEND boundary.
+#[tokio::test]
+async fn differential_online_z_report_ack_notfound_holds_sent_and_closes_shift() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let mut model = RefModel::new_online_open_shift();
+
+    let prior_tip = ctx.read_seed().await;
+    let op = Op::OnlineZReport(DpsScript::send_ack_then_last_not_found());
+    let expected = model.apply(&op);
+    let real = interp::run_op(&mut ctx, &op).await;
+
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("online Z_REPORT Ack/NotFound must match model: {d:?}"));
+    assert_eq!(ctx.only_doc_type().await, "Z_REPORT");
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Sent,
+        "Z_REPORT Ack/NotFound must rest as SENT pending later KVT2 confirmation"
+    );
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::Closed,
+        "Z_REPORT Ack/NotFound crosses SEND, so edge 10 closes the shift"
+    );
+}
+
 /// Tier-1 slice 2 seed — offline Z_REPORT local-acks through the production
 /// path and moves the shift into ClosingLocalPendingDrain.
 #[tokio::test]
@@ -1051,6 +1079,33 @@ async fn differential_online_shift_open_opens_shift_matches_model() {
         .unwrap_or_else(|d| panic!("online SHIFT_OPEN must match model: {d:?}"));
     assert_eq!(ctx.only_doc_type().await, "SHIFT_OPEN");
     assert_eq!(ctx.read_shift_state().await, ShiftState::Opened);
+}
+
+/// D5 shift-doc green pin: online SHIFT_OPEN with no KVT1 evidence after SEND
+/// rests at SENT, but the shift is already Opened at the SEND boundary.
+#[tokio::test]
+async fn differential_online_shift_open_ack_notfound_holds_sent_and_opens_shift() {
+    let mut ctx = interp::FuzzCtx::new_online_closed_shift().await;
+    let mut model = RefModel::new_online_closed_shift();
+
+    let prior_tip = ctx.read_seed().await;
+    let op = Op::OnlineShiftOpen(DpsScript::send_ack_then_last_not_found());
+    let expected = model.apply(&op);
+    let real = interp::run_op(&mut ctx, &op).await;
+
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("online SHIFT_OPEN Ack/NotFound must match model: {d:?}"));
+    assert_eq!(ctx.only_doc_type().await, "SHIFT_OPEN");
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Sent,
+        "SHIFT_OPEN Ack/NotFound must rest as SENT pending later KVT2 confirmation"
+    );
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::Opened,
+        "SHIFT_OPEN Ack/NotFound crosses SEND, so edge 3 opens the shift"
+    );
 }
 
 /// Offline SHIFT_OPEN local-acks and leaves the shift in

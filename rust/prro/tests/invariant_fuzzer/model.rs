@@ -98,6 +98,11 @@ pub struct RefModel {
     pub codes_consumed: i64,
     /// Per-lnd document state.
     pub docs: BTreeMap<i64, DocState>,
+    /// LNDs of shift-lifecycle docs (`SHIFT_OPEN` / `SHIFT_CLOSE` /
+    /// `Z_REPORT`).  Z quiescence blocks on in-flight receipts, not on earlier
+    /// lifecycle artifacts that can legally rest at `SENT` while the shift has
+    /// already advanced at the SEND boundary.
+    pub shift_lifecycle_lnds: BTreeSet<i64>,
     /// A.3 PR-C — lnds of OFFLINE-origin docs (`offline_fiscal_no` was
     /// assigned).  Distinguishes an offline-ER (issued, NOT a D5-gate blocker)
     /// from an online-ER (non-issued, a blocker) — the `docs` map stores only
@@ -118,6 +123,7 @@ impl RefModel {
             codes_issued: 0,
             codes_consumed: 0,
             docs: BTreeMap::new(),
+            shift_lifecycle_lnds: BTreeSet::new(),
             offline_origin_lnds: BTreeSet::new(),
         }
     }
@@ -133,6 +139,7 @@ impl RefModel {
             codes_issued: 0,
             codes_consumed: 0,
             docs: BTreeMap::new(),
+            shift_lifecycle_lnds: BTreeSet::new(),
             offline_origin_lnds: BTreeSet::new(),
         }
     }
@@ -150,6 +157,7 @@ impl RefModel {
             codes_issued: codes,
             codes_consumed: 0,
             docs: BTreeMap::new(),
+            shift_lifecycle_lnds: BTreeSet::new(),
             offline_origin_lnds: BTreeSet::new(),
         }
     }
@@ -165,6 +173,7 @@ impl RefModel {
             codes_issued: codes,
             codes_consumed: 0,
             docs: BTreeMap::new(),
+            shift_lifecycle_lnds: BTreeSet::new(),
             offline_origin_lnds: BTreeSet::new(),
         }
     }
@@ -321,23 +330,25 @@ impl RefModel {
         })
     }
 
-    /// Z quiescence is stricter than the ordinary D5 write gate: a Z must not
-    /// aggregate/close the shift while any receipt is still in-flight, including
-    /// retryable or issued-but-not-final `ERROR_RETRYABLE`/`SENT`/`KVT1`/`KVT2`
-    /// docs.
+    /// Z quiescence is stricter than the ordinary D5 write gate for RECEIPTS: a
+    /// Z must not aggregate/close the shift while any receipt is still in-flight,
+    /// including retryable or issued-but-not-final `ERROR_RETRYABLE`/`SENT`/
+    /// `KVT1`/`KVT2` docs.  Shift-lifecycle docs are excluded; they advance the
+    /// shift at SEND and are not part of receipt aggregation.
     fn has_z_quiescence_blocker(&self) -> bool {
-        self.docs.iter().any(|(_lnd, st)| {
-            matches!(
-                st,
-                DocState::Prepared
-                    | DocState::Signed
-                    | DocState::Encrypted
-                    | DocState::Sending
-                    | DocState::ErrorRetryable
-                    | DocState::Sent
-                    | DocState::Kvt1
-                    | DocState::Kvt2
-            )
+        self.docs.iter().any(|(lnd, st)| {
+            !self.shift_lifecycle_lnds.contains(lnd)
+                && matches!(
+                    st,
+                    DocState::Prepared
+                        | DocState::Signed
+                        | DocState::Encrypted
+                        | DocState::Sending
+                        | DocState::ErrorRetryable
+                        | DocState::Sent
+                        | DocState::Kvt1
+                        | DocState::Kvt2
+                )
         })
     }
 
@@ -372,6 +383,7 @@ impl RefModel {
         let unsigned_hash = synth_unsigned_hash(lnd);
         let doc_state = online_outcome_state(script);
         self.docs.insert(lnd, doc_state);
+        self.shift_lifecycle_lnds.insert(lnd);
         self.next_lnd += 1;
 
         if Self::online_origin_advances_seed(doc_state) {
@@ -407,6 +419,7 @@ impl RefModel {
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
         self.docs.insert(lnd, DocState::OfflineLocalAck);
+        self.shift_lifecycle_lnds.insert(lnd);
         self.offline_origin_lnds.insert(lnd);
         self.next_lnd += 1;
         self.codes_consumed += 1;
@@ -443,6 +456,7 @@ impl RefModel {
         let unsigned_hash = synth_unsigned_hash(lnd);
         let doc_state = online_outcome_state(script);
         self.docs.insert(lnd, doc_state);
+        self.shift_lifecycle_lnds.insert(lnd);
         self.next_lnd += 1;
 
         if Self::online_origin_advances_seed(doc_state) {
@@ -486,6 +500,7 @@ impl RefModel {
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
         self.docs.insert(lnd, DocState::OfflineLocalAck);
+        self.shift_lifecycle_lnds.insert(lnd);
         self.offline_origin_lnds.insert(lnd);
         self.next_lnd += 1;
         self.codes_consumed += 1;
@@ -818,6 +833,14 @@ impl RefModel {
                 .await
                 .unwrap();
         self.offline_origin_lnds = offline_lnds.into_iter().map(|(lnd,)| lnd).collect();
+        let shift_lifecycle_lnds: Vec<(i64,)> = sqlx::query_as(
+            "SELECT lnd FROM fiscal_documents \
+             WHERE doc_type IN ('SHIFT_OPEN','SHIFT_CLOSE','Z_REPORT')",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        self.shift_lifecycle_lnds = shift_lifecycle_lnds.into_iter().map(|(lnd,)| lnd).collect();
         let tip_lnd = self.docs.keys().copied().max().unwrap_or(0);
 
         // mode / shift_state / next_lnd ← node_state.

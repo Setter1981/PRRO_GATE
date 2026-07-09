@@ -13,3 +13,4 @@ cc 4a53708f4716652cefd473c39b33742798ac32a4765ee9cd6d1b6563e44c11a2 # shrinks to
 cc e36131cdec23d1f6586453ab2350fec2b9604541ac425b419cde614dd3b8edcf # shrinks to ops = [Crash(Kvt1), OnlineZReport(DpsScript([Ack, Ack]))]
 cc f60c0960bf0807f0ddadea92490773cbb449512a452e3dab82122ce8d0dbccc9 # shrinks to ops = [OnlineSell(DpsScript([Ack, Ack])), OnlineSell(DpsScript([Ack, Ack])), OnlineSell(DpsScript([Ack, Ack])), OfflineZReport]
 cc 7e70f529c08fcc983753eee1bc95803be26cd4853bda5ee2c4dd71387af09055 # shrinks to ops = [OnlineSell(DpsScript([Superseded])), SellWithClosedShift, OnlineShiftOpen(DpsScript([Ack, Ack]))]
+cc 7241b23bbcc525332abeed1e8dbfdbe57e0c4cfa32097b471d7e2f85f864acca # shrinks to ops = [OnlineZReport(DpsScript([Ack, Ack])), OnlineShiftOpen(DpsScript([Ack, NotFound])), OnlineZReport(DpsScript([Ack, Ack]))]
