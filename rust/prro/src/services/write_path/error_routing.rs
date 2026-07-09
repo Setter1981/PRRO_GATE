@@ -1115,13 +1115,105 @@ mod tests {
     #[test]
     fn mac_recovery_class_carries_hint_with_raw_message() {
         let msg = "store ABCDEF0123456789...";
-        let d = route_server_code(-12, msg, DocType::Sell, true);
+        let d = route_server_code(-12, msg, DocType::Sell, false);
         assert_eq!(d.retry_class, RetryClass::MacRecovery);
         assert_eq!(
             d.mac_recovery_hint
                 .as_ref()
                 .map(|h| h.raw_error_message.as_str()),
             Some(msg)
+        );
+    }
+
+    // ─── B10 drain transient `-8` (chain-settle) routing split ──────────
+    //
+    // Root cause (live-verified): the offline backlog drain intermittently
+    // draws DPS `-8` (ERROR_XML_DATE) on a doc that chains off a
+    // just-accepted predecessor.  This is TRANSIENT chain-settle latency
+    // (DPS `lastChk` read-model surfaces a tip BEFORE its write-model will
+    // accept that tip as a valid `previous_hash`), NOT a format error.  Old
+    // routing lumped `-8` into the terminal `-5 | -7 | -8 | -9 | -10` arm →
+    // the shift wedged into RequiresManualReconciliation on a mere settle
+    // latency.  Fix = Seam A1 forward-only: an OFFLINE-ORIGIN `-8` routes to
+    // a retryable class so the doc goes `Sending → ErrorRetryable` and is
+    // re-driven under a bounded budget → RMR only on exhaustion.
+
+    #[test]
+    fn pin1_offline_origin_minus_8_routes_to_error_retryable_not_rejected() {
+        // Core RED: an OFFLINE-ORIGIN `-8` must NOT terminalise to Rejected.
+        // It routes forward to ErrorRetryable with the dedicated
+        // DrainChainSettleRetry class + its own audit event.
+        let d = route_server_code(-8, "ERROR_XML_DATE", DocType::Sell, /* is_offline_origin */ true);
+        assert_eq!(
+            d.target_state,
+            DocState::ErrorRetryable,
+            "offline-origin -8 must go Sending->ErrorRetryable (forward-only), never Rejected"
+        );
+        assert_eq!(d.retry_class, RetryClass::DrainChainSettleRetry);
+        assert_eq!(d.audit_event, AuditEvent::StageSendTransientChainSettle);
+        assert_eq!(d.audit_severity, Severity::Warning);
+        assert!(d.node_mode_flip.is_none());
+        assert!(d.probe_hint.is_none());
+        assert!(d.mac_recovery_hint.is_none());
+    }
+
+    #[test]
+    fn pin2_online_minus_8_still_terminal_no_leakage() {
+        // No leakage: an ONLINE (non-offline-origin) `-8` stays exactly as
+        // before — terminal Rejected, TerminalReject, CRITICAL.  An online
+        // `-8` IS a genuine builder/adapter format bug that must be fixed in
+        // code (there is no offline chain-settle race online).
+        let d = route_server_code(-8, "ERROR_XML_DATE", DocType::Sell, /* is_offline_origin */ false);
+        assert_eq!(d.target_state, DocState::Rejected);
+        assert_eq!(d.retry_class, RetryClass::TerminalReject);
+        assert_eq!(d.audit_event, AuditEvent::StageSendRejected);
+        assert_eq!(d.audit_severity, Severity::Critical);
+    }
+
+    #[test]
+    fn pin3_offline_origin_other_xml_codes_still_terminal() {
+        // Narrow scope: only `-8` is the chain-settle transient.  The
+        // siblings `-5 / -7 / -9 / -10` on an offline-origin doc stay
+        // terminal Rejected — they are true format/type errors, not settle
+        // latency.
+        for code in [-5, -7, -9, -10] {
+            let d = route_server_code(code, "ERROR_XML_*", DocType::Sell, /* is_offline_origin */ true);
+            assert_eq!(
+                d.target_state,
+                DocState::Rejected,
+                "offline-origin {code} must stay terminal Rejected (only -8 is transient)"
+            );
+            assert_eq!(d.retry_class, RetryClass::TerminalReject, "code {code}");
+            assert_eq!(d.audit_event, AuditEvent::StageSendRejected, "code {code}");
+        }
+    }
+
+    #[test]
+    fn pin3b_offline_origin_minus_11_still_terminal_with_node_block() {
+        // Guard against over-broadening: -11 (ERROR_OFFLINE_168) on an
+        // offline-origin doc still terminalises AND flips node to BLOCKED —
+        // the 168h cap is a hard legal stop, never a re-drive.
+        let d = route_server_code(-11, "ERROR_OFFLINE_168", DocType::Sell, /* is_offline_origin */ true);
+        assert_eq!(d.target_state, DocState::Rejected);
+        assert_eq!(d.retry_class, RetryClass::TerminalReject);
+        assert_eq!(d.node_mode_flip, Some(NodeMode::Blocked));
+    }
+
+    #[test]
+    fn drain_chain_settle_retry_class_wire_string_roundtrips() {
+        // The new class is persisted to `transport_trace.retry_class` (TEXT)
+        // and read back on the next drain tick — pin the wire contract.
+        assert_eq!(
+            RetryClass::DrainChainSettleRetry.as_str(),
+            "DrainChainSettleRetry"
+        );
+        assert_eq!(
+            RetryClass::from_wire_str("DrainChainSettleRetry"),
+            Some(RetryClass::DrainChainSettleRetry)
+        );
+        assert_eq!(
+            AuditEvent::StageSendTransientChainSettle.as_str(),
+            "STAGE_SEND_TRANSIENT_CHAIN_SETTLE"
         );
     }
 }
