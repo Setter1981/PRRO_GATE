@@ -2940,19 +2940,24 @@ async fn live_smoke_9_offline_drain_mac_id() {
 // DocType=10 END).  The full triple gate applies.
 //
 // ── Env contract (recovery-specific) ────────────────────────────────────────
-/// OPTIONAL override for the offline `<MAC ID>` code the recovery END carries.
-/// The DEFAULT path fetches a FRESH, unconsumed offline code via a live T=112
-/// ASK_OFFLINE_CODES request (built on the SETTLED DPS tip) — see Step 2b below.
-/// This override exists only for the rare case where the operator already holds
-/// a known-unconsumed code and wants to force it: if `PRRO_LIVE_DPS_RECOVER_CODE`
-/// is SET and NON-EMPTY, that value is used and the T=112 fetch is SKIPPED;
-/// otherwise (unset or empty) the fresh T=112 code is used.
+/// **RETIRED (kept only so `--nocapture` runs surface a clear note).**  The
+/// recovery END no longer carries ANY offline code — see the WebCheck root-cause
+/// below.  This var name is documented here purely so an operator who set it in a
+/// prior run understands it is now IGNORED (the bare-`<MAC>` END needs no code).
 ///
-/// WHY the default changed to fresh-fetch: the original run-3 END code
-/// (`eYme-jhnkWQ`) was likely already CONSUMED by DPS on the run-3 END that was
-/// rejected → reusing it drew `-5 "no id offline"`.  A fresh, never-attempted
-/// T=112 code sidesteps code-reuse so the reject (if any) isolates a genuine
-/// DocType=10 END offline-id bug rather than a spent code.
+/// ROOT CAUSE (why the offline-shaped END drew `-5 "no id offline"`):
+/// the drain-to-online close in WebCheck is `SendingOfflineChecks.cs::
+/// CloseOfflineDoc()` (line 221) — reached via `Dispatch.OfflineToOnline`
+/// (Dispatch.cs:98) — NOT the offline-session `CloseOfflineDocOffline()`
+/// (line 143).  `CloseOfflineDoc()` builds the DocType=10 END as an
+/// **ONLINE-SHAPED** doc: a **bare `<MAC>` (line 238, NO `ID=` attribute, NO
+/// offline code)** submitted via a **4-param `SubmitCheck(pathFile, …, 3, num)`
+/// (line 265) with NO `id_offline`** and persisted via `SaveXMLcheck` (online),
+/// not `SaveXMLcheckOffline`.  At drain you are going BACK ONLINE, so the END
+/// rides as an ordinary ONLINE doc — it needs no code at all.  Our previous
+/// offline-shaped END (`<MAC ID='{code}'>` + wire `id_offline`) is exactly what
+/// DPS rejects with `-5`; the fix is to REMOVE the code, not to source a fresh
+/// one.
 const ENV_RECOVER_CODE: &str = "PRRO_LIVE_DPS_RECOVER_CODE";
 /// The END's `<DAT DI>` / wire `local_number`.  Operator-overridable so a retry
 /// can advance the DI if DPS rejects a duplicate.  Default `9` mirrors the
@@ -2960,16 +2965,6 @@ const ENV_RECOVER_CODE: &str = "PRRO_LIVE_DPS_RECOVER_CODE";
 /// (DI is the boundary doc's local number; smoke 9's END unit-test uses `9`).
 const ENV_RECOVER_DI: &str = "PRRO_LIVE_DPS_RECOVER_DI";
 const DEFAULT_RECOVER_DI: u32 = 9;
-
-/// Resolve the OPTIONAL recovery-code override.  Returns `Some(code)` only when
-/// `PRRO_LIVE_DPS_RECOVER_CODE` is SET and NON-EMPTY (trimmed); otherwise `None`
-/// → the caller fetches a fresh T=112 code (the default path).
-fn resolve_recover_code_override() -> Option<String> {
-    std::env::var(ENV_RECOVER_CODE)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
 
 /// Resolve the recovery DI (env override → default 9).
 fn resolve_recover_di() -> u32 {
@@ -3019,6 +3014,80 @@ fn recover_kyiv_local_epoch(business_ts: &str) -> i64 {
     .timestamp()
 }
 
+/// Build a **WebCheck-EXACT** drain-close DocType=10 OFFLINE_SESSION_END XML,
+/// byte-faithful to `SendingOfflineChecks.cs::EndOfflineXML` (line 297) + the
+/// `mmmaaaccc` → **bare `<MAC>`** replacement in **`CloseOfflineDoc()`**
+/// (line 238) — the ONLINE-shaped drain-close reached via
+/// `Dispatch.OfflineToOnline` (Dispatch.cs:98).  This is the CORRECT close form
+/// for going back online, and it is DELIBERATELY NOT the offline-session
+/// `CloseOfflineDocOffline()` (line 143), which uses `<MAC ID='{OfflineNum}'>` +
+/// a 6-param `SubmitCheck(..., id_offline=OfflineNum)`.  The `EndOfflineXML`
+/// concat chain emits, verbatim:
+///
+/// ```text
+/// <?xml version='1.0' encoding='windows-1251'?><RQ V ='1'><DAT  FN='{FN}' TN='ПН {TIN}' ZN='' DI='{DI}' V='1'><C T='110'></C><TS>{CCD}</TS></DAT>{MAC}</RQ>
+/// ```
+///
+/// with `{MAC}` = **`<MAC>{prev_tip}</MAC>`** (line 238 — a BARE `<MAC>`, NO
+/// `ID=` attribute, NO offline code).  This is the ROOT-CAUSE fix: our previous
+/// offline-shaped END carried `<MAC ID='{code}'>` (+ wire `id_offline`), which
+/// DPS rejects with `-5 "no id offline"` on a drain-close.
+///
+/// The `<DAT>` form still DIVERGES from the production
+/// `emit_offline_session_boundary` builder in the deltas the byte-diff found,
+/// all reproduced here to match WebCheck's PROVEN client:
+///   - `TN='ПН {TIN}'`  (production emits bare `TN="{TIN}"` — no `ПН ` prefix)
+///   - `ZN=''`          (production emits `ZN="0"`)
+///   - NO `NDv=` / `PrV=` attrs on `<RQ>` (production emits both defaults)
+///   - single-quoted attrs + `<RQ V ='1'>` spacing + `<DAT  FN=` double-space,
+///     matching the decompiled C# string literals exactly.
+///
+/// The leading `<?xml …?>` prolog is INCLUDED to mirror WebCheck's `text`
+/// verbatim (WebCheck signs the whole `text`, including the prolog).  `prev_tip`
+/// (the settled tip hash hex) is emitted RAW — a hex string with no XML-special
+/// chars, exactly as WebCheck's `.Replace` inserts it (the signed hash must
+/// cover the exact bytes DPS reads back).
+///
+/// Returns the cp1251-encoded wire bytes (the `ПН ` prefix is Cyrillic, so the
+/// signed + submitted bytes MUST be cp1251, matching the `encoding='windows-1251'`
+/// prolog and WebCheck's `SaveToFileText` codepage).
+fn build_webcheck_exact_end_xml(
+    fiscal_number: &str,
+    tin: &str,
+    di: u32,
+    ts_str: &str,
+    prev_tip_hex: &str,
+) -> Vec<u8> {
+    // Byte-faithful to EndOfflineXML's string.Concat chain + the ONLINE
+    // (`CloseOfflineDoc`) bare-`<MAC>` replace at line 238.  Emit cp1251 bytes
+    // directly: the ENTIRE document is ASCII EXCEPT the `ПН ` (Cyrillic) TN
+    // prefix.  The production `cp1251::encode` is `pub(super)` (not reachable
+    // from this test crate), so we splice the two cp1251 bytes for `П`/`Н`
+    // in-place.  cp1251 uppercase Cyrillic: `А`(U+0410)=0xC0 … so `П`(U+041F)=
+    // 0xCF and `Н`(U+041D)=0xCD (verified against the standard Windows-1251
+    // table used by `xml::cp1251::encode_char`).
+    const CP1251_PE: u8 = 0xCF; // 'П'
+    const CP1251_EN: u8 = 0xCD; // 'Н'
+    let head_ascii = format!(
+        "<?xml version='1.0' encoding='windows-1251'?><RQ V ='1'>\
+         <DAT  FN='{fiscal_number}' TN='"
+    );
+    let tail_ascii = format!(
+        " {tin}' ZN='' DI='{di}' V='1'>\
+         <C T='110'></C><TS>{ts_str}</TS></DAT>\
+         <MAC>{prev_tip_hex}</MAC></RQ>"
+    );
+    // `head_ascii` + cp1251(`ПН`) + `tail_ascii` (the tail leads with the space
+    // that follows `ПН` in `TN='ПН {tin}'`).  All FN / TN / DI / TS / hash
+    // content is ASCII by construction, so byte-splicing is exact.
+    let mut out = Vec::with_capacity(head_ascii.len() + 2 + tail_ascii.len());
+    out.extend_from_slice(head_ascii.as_bytes());
+    out.push(CP1251_PE);
+    out.push(CP1251_EN);
+    out.extend_from_slice(tail_ascii.as_bytes());
+    out
+}
+
 /// **Live recovery — close a DANGLING offline session via DocType=10 END**.
 ///
 /// WHY: live smoke 9 proved `-5` cleared (BEGIN + offline SHIFT_OPEN + SELL all
@@ -3028,40 +3097,40 @@ fn recover_kyiv_local_epoch(business_ts: &str) -> i64 {
 /// session does NOT expire on DPS — it hangs until a valid DocType=10 END
 /// closes it, and it now blocks `T=112` with `-16`.  This routine closes it.
 ///
-/// The top hypothesis for the original reject is a STALE `previous_hash`: the
-/// END was sent immediately after the content docs, before DPS's chain tip had
-/// settled (the SELL leg polls for tip-settle at ~:2508; the END did not).
-/// This routine FIXES that: it polls `last_chk` until the tip is STABLE across
-/// two consecutive reads, then chains the END's `previous_hash` off that
-/// settled tip.
+/// ROOT CAUSE (byte-diff vs WebCheck): our previous END was OFFLINE-shaped
+/// (`<MAC ID='{code}'>` + a wire `id_offline`), mirroring WebCheck's
+/// `CloseOfflineDocOffline()`.  But the drain-to-online close is the DIFFERENT
+/// `CloseOfflineDoc()` (SendingOfflineChecks.cs:221, reached via
+/// `Dispatch.OfflineToOnline`): it builds an ONLINE-shaped END with a **BARE
+/// `<MAC>` (line 238, NO `ID=`, NO offline code)** and a **4-param
+/// `SubmitCheck(pathFile, …, 3, num)` (line 265, NO `id_offline`)**.  DPS
+/// rejects the offline-shaped drain-close with `-5 "no id offline"`.  This
+/// routine now sends the CORRECT bare-`<MAC>` ONLINE form — NO offline code at
+/// all — off the SETTLED chain tip.  (A stale `previous_hash` was the earlier
+/// hypothesis; the tip-settle poll below is retained as belt-and-braces, but the
+/// SHAPE was the real bug.)
 ///
 /// FLOW:
 ///   1. `live_armed` gate + `load_signing_key` (skip/return if not armed).
 ///   2. Connect; read `status_rro` + `last_chk`; POLL `last_chk` until the tip
 ///      is SETTLED (stable across 2 reads) → the settled tip hash (hex).
-///   2b. Obtain a FRESH offline `<MAC ID>` code: unless
-///      `PRRO_LIVE_DPS_RECOVER_CODE` is set+non-empty (override), fetch a fresh,
-///      unconsumed code via a live T=112 ASK_OFFLINE_CODES (size=1) built on the
-///      SETTLED tip (reuses Smoke 9's T=112 block verbatim).  If T=112 itself
-///      rejects, SKIP/return — a doomed END is not sent, and if the reject is
-///      -16 the open-session ⇒ code-mint DEADLOCK is confirmed (operator must
-///      resolve cabinet-side).  WHY fresh: the original END reused a code DPS had
-///      already consumed → `-5 "no id offline"`.
-///   3. Build a DocType=10 `<C T='110'>` END via the PRODUCTION builder
-///      (`CanonicalDoc::OfflineSessionEnd`): `previous_hash` = settled tip hex,
-///      `<MAC ID>` = the fresh T=112 code (or the override), `<TS>` = current
-///      Kyiv time, `DI` = `PRRO_LIVE_DPS_RECOVER_DI`.  Print the `<C T='110'>` XML.
+///   3. Build a DocType=10 `<C T='110'>` END via `build_webcheck_exact_end_xml`
+///      (WebCheck-EXACT ONLINE `CloseOfflineDoc` form): `TN='ПН {TIN}'`, `ZN=''`,
+///      no NDv/PrV, **bare `<MAC>{settled_tip}</MAC>` (NO ID=, NO code)**,
+///      `<TS>` = current Kyiv time, `DI` = `PRRO_LIVE_DPS_RECOVER_DI`.  Print the
+///      `<C T='110'>` XML.
 ///   4. Sign it with the LIVE key (ATTACHED CAdES-BES; same CMS block as
-///      T=112/SELL).
-///   5. `send_chk` it; PRINT the FULL DPS response (OK → assigned id;
-///      Err → exact `dps_code` + `message` — the END reject reason).
+///      the SELL path).
+///   5. `send_chk` it with an EMPTY wire `id_offline` (ONLINE-shaped); PRINT the
+///      FULL DPS response (OK → assigned id; Err → exact `dps_code` + `message`).
 ///   6. `status_rro` again → print `open_shift`/`online` (session closed?).
 ///   7. Assert: PASS if DPS ACCEPTS the END; on reject, fail LOUDLY with the
 ///      code so we learn the real reject reason.
 ///
 /// This is a TARGETED one-shot recovery: it does NOT boot the write-path or
 /// mutate any gateway DB — it hand-builds + signs + sends a single END, exactly
-/// as the drain would, but off the SETTLED tip.
+/// as WebCheck's `CloseOfflineDoc` would, off the SETTLED tip.  It needs NO
+/// offline code (the `PRRO_LIVE_DPS_RECOVER_CODE` var is now IGNORED).
 #[tokio::test]
 #[ignore = "live DPS endpoint required; opt-in via --features live-dps + --ignored + PRRO_LIVE_DPS=1"]
 async fn live_recover_close_dangling_offline_session() {
@@ -3075,22 +3144,23 @@ async fn live_recover_close_dangling_offline_session() {
     let host = resolve_host();
     let fiscal_number = resolve_fn();
     let tn = LIVE_TN;
-    let recover_code_override = resolve_recover_code_override();
     let recover_di = resolve_recover_di();
 
     println!("\n=== RECOVERY: close DANGLING offline session via DocType=10 END ===");
     println!("FN: {fiscal_number}  TN: {tn}");
     println!("Endpoint: {host}");
-    match &recover_code_override {
-        Some(code) => println!(
-            "Recovery <MAC ID> code: {code} (from PRRO_LIVE_DPS_RECOVER_CODE override)   DI: {recover_di}"
-        ),
-        None => println!(
-            "Recovery <MAC ID> code: <fresh — fetched via live T=112 on the settled tip>   DI: {recover_di}"
-        ),
+    println!(
+        "END form: WebCheck-EXACT drain-close (CloseOfflineDoc) — ONLINE-shaped, \
+         BARE <MAC> (NO ID=, NO offline code), empty wire id_offline.   DI: {recover_di}"
+    );
+    if std::env::var(ENV_RECOVER_CODE).is_ok() {
+        println!(
+            "NOTE: {ENV_RECOVER_CODE} is set but IGNORED — the drain-close END carries no \
+             offline code (WebCheck CloseOfflineDoc uses a bare <MAC>)."
+        );
     }
     println!(
-        "Goal: DPS ACCEPTS a settled-chain DocType=10 END → the offline session \
+        "Goal: DPS ACCEPTS a settled-chain BARE-<MAC> DocType=10 END → the offline session \
          CLOSES (online should flip to true)\n"
     );
 
@@ -3206,210 +3276,37 @@ async fn live_recover_close_dangling_offline_session() {
         }
     );
 
-    // ── Step 2b: obtain a FRESH, unconsumed offline `<MAC ID>` code ─────────
-    // The original END drew `-5 "no id offline"` because it REUSED the run-3 END
-    // code, which DPS had already consumed on that (rejected) attempt.  Unless an
-    // explicit override is set, fetch a FRESH code via a live T=112
-    // ASK_OFFLINE_CODES built on the SETTLED tip (reuses Smoke 9's T=112 block
-    // verbatim: build → sign(live key, ATTACHED CAdES-BES) → send_chk → parse
-    // `<ID>`).  size=1 (we need exactly one code for the one END).  If T=112
-    // itself rejects, we SKIP/return (don't send a doomed END): the deadlock
-    // diagnosis IS the result.
-    let recover_code: String = if let Some(code) = recover_code_override.clone() {
-        println!("\n--- T=112 FETCH SKIPPED (PRRO_LIVE_DPS_RECOVER_CODE override in use) ---");
-        println!("  using operator-supplied recovery <MAC ID> code: {code}");
-        code
-    } else {
-        println!("\n--- T=112 FETCH (size=1, on the SETTLED tip) — fresh offline code ---");
-        let t112_di: i64 = std::env::var("PRRO_LIVE_DPS_T112_DI")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
-        // The T=112's `<MAC>` chains off the SETTLED tip (same hash the END will
-        // carry), so the ask-code request is chain-consistent with DPS's current
-        // tip — the prior standalone run-4 T=112 (-16) likely carried a STALE MAC.
-        let t112_req = prro::transports::dps::t112::build_t112_request(
-            &fiscal_number,
-            tn,
-            t112_di as u32,
-            1, // request exactly ONE fresh code for the one recovery END
-            prro::transports::dps::t112::kyiv_comp_date_now(),
-            &settled_tip_hex,
-        )
-        .expect("T=112 request builder must succeed for size=1");
-        println!("  T=112 XML: {}", t112_req.xml);
-
-        // Sign the T=112 XML with the live operator key (ATTACHED CAdES-BES) —
-        // same CmsSigner / Dstu4145WithGost34311Pb block as the SELL / END path.
-        let cert_der: &[u8] = ek
-            .signing_cert()
-            .expect("JKS must carry a signing certificate");
-        let curve = Curve::dstu_pb_257();
-        let d = FieldEl::from_le_bytes(&ek.param_d[..], curve.mod_words);
-        let signer_inner = DstuInProcessSigner::new(d);
-        let cms_signer_t112 = CmsSigner {
-            cert_der,
-            signer: &signer_inner,
-            profile: CmsProfile::Dstu4145WithGost34311Pb,
-        };
-        let t112_signed = cms_signer_t112
-            .sign_with(
-                t112_req.xml.as_bytes(),
-                CmsBuildOptions {
-                    attached: true,
-                    signing_time: Some(SystemTime::now()),
-                },
-            )
-            .expect("T=112 sign must succeed")
-            .cms_der;
-
-        let t112_envelope = CheckEnvelope {
-            rro_fn: fiscal_number.clone(),
-            date_time: t112_req.comp_date,
-            check_sign: t112_signed,
-            local_number: t112_di as i32,
-            check_type: DpsCheckType::ServiceChk,
-            id_offline: String::new(),
-            id_cancel: String::new(),
-        };
-
-        println!("\n--- SEND T=112 → live DPS ---");
-        match channel.send_chk(t112_envelope).await {
-            Ok(ack) => {
-                println!(
-                    "  T=112 DPS OK: id={:?} data_sign={} bytes",
-                    ack.id,
-                    ack.data_sign.len()
-                );
-                if ack.data_sign.is_empty() {
-                    println!(
-                        "RECOVERY SKIP: T=112 returned an empty data_sign — DPS issued NO fresh \
-                         offline code, so there is nothing to carry as the END's <MAC ID>. \
-                         Re-run when DPS issues codes (or set PRRO_LIVE_DPS_RECOVER_CODE)."
-                    );
-                    return;
-                }
-                let inner_bytes = match extract_econtent(&ack.data_sign) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        println!(
-                            "RECOVERY SKIP: T=112 data_sign is not a CMS blob ({e}) — cannot \
-                             extract a fresh offline code. Re-run later."
-                        );
-                        return;
-                    }
-                };
-                let inner_xml = String::from_utf8_lossy(&inner_bytes);
-                println!("  T=112 response inner XML: {inner_xml}");
-                // Harvest the first `<ID>…</ID>` opaque code (WebCheck emits one
-                // per issued code; size=1 → we take the first).
-                let fresh = inner_xml
-                    .split("<ID>")
-                    .nth(1)
-                    .and_then(|s| s.split("</ID>").next())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
-                match fresh {
-                    Some(code) => {
-                        println!("  FRESH OPAQUE OFFLINE CODE: {code}");
-                        code
-                    }
-                    None => {
-                        println!(
-                            "RECOVERY SKIP: no <ID> offline code in the T=112 response — nothing \
-                             to carry as <MAC ID>. Re-run when DPS issues codes."
-                        );
-                        return;
-                    }
-                }
-            }
-            Err(DpsError::Server { code: -4, message }) => {
-                println!(
-                    "RECOVERY SKIP: DPS rate-limit (-4) on T=112: {message}. Cool down 5+ min."
-                );
-                return;
-            }
-            Err(DpsError::Server { code, message }) => {
-                // T=112 rejected → do NOT proceed to a doomed END send.  The
-                // deadlock diagnosis IS the result of this run.
-                if code == -16 {
-                    println!(
-                        "RECOVERY SKIP (DEADLOCK CONFIRMED): T=112 drew -16 message={message:?} — \
-                         T=112 ASK_OFFLINE_CODES is GATED while the offline session is OPEN.  This \
-                         is a real deadlock: closing the session needs a fresh offline code, but the \
-                         open session blocks the ONLY channel that mints one.  The operator must \
-                         resolve this CABINET-SIDE (support/regulator), not from this gateway."
-                    );
-                } else {
-                    println!(
-                        "RECOVERY SKIP: T=112 rejected dps_code={code} message={message:?} — cannot \
-                         obtain a fresh offline code, so the END send is skipped (a doomed END is \
-                         pointless).  Investigate the T=112 reject, then re-run."
-                    );
-                }
-                return;
-            }
-            Err(DpsError::Authorization {
-                code,
-                kind,
-                message,
-            }) => {
-                println!(
-                    "RECOVERY SKIP: T=112 authorization reject dps_code={code} kind={kind:?} \
-                     message={message} — cannot obtain a fresh offline code; END send skipped."
-                );
-                return;
-            }
-            Err(DpsError::Transport(msg)) => {
-                panic!("RECOVERY FAIL: Transport error on T=112 send_chk (wire broken): {msg}");
-            }
-            Err(e) => {
-                panic!("RECOVERY FAIL: unexpected error on T=112 send_chk: {e:?}");
-            }
-        }
-    };
-    println!("  → recovery END will carry <MAC ID='{recover_code}'>");
-
-    // ── Step 3: build the DocType=10 END via the PRODUCTION builder ─────────
-    // One `business_ts` instant drives BOTH the signed `<TS>` (ts_str) and the
-    // wire `date_time` (fake-epoch), exactly as production stage_sign +
-    // stage_send do (both derive from the same `business_ts`).  The header
-    // carries `mac_id = Some(recover_code)` → `<MAC ID='{code}'>{prev_hash}` (B9
-    // offline shape), and `previous_hash` = the SETTLED tip.
-    println!("\n--- BUILD DocType=10 END (<C T='110'>) ---");
+    // ── Step 3: build the WebCheck-EXACT ONLINE (bare-`<MAC>`) DocType=10 END ─
+    // WebCheck's drain-to-online close (`CloseOfflineDoc`, reached via
+    // `Dispatch.OfflineToOnline`) submits an ONLINE-shaped END: a BARE `<MAC>`
+    // (NO `ID=`, NO offline code) via a 4-param `SubmitCheck(..., 3, num)` with
+    // NO `id_offline`.  There is NO offline code to fetch — the drain-close needs
+    // none.  This is the ROOT-CAUSE fix for the `-5 "no id offline"` reject our
+    // OFFLINE-shaped END drew.  One `business_ts` instant drives BOTH the signed
+    // `<TS>` (ts_str) and the wire `date_time` (fake-epoch), exactly as
+    // production stage_sign + stage_send do; `<MAC>` chains off the SETTLED tip.
+    println!("\n--- BUILD DocType=10 END (<C T='110'>, WebCheck-EXACT bare-<MAC> online form) ---");
     let business_ts = iso_now();
     let ts_str = recover_kyiv_ts_str(&business_ts);
     let date_time = recover_kyiv_local_epoch(&business_ts);
 
-    let mut end_header = prro::xml::DocumentHeader::with_defaults(
-        fiscal_number.clone(),
-        tn.to_string(),
-        // Z-report counter is not part of a boundary receipt's identity — the
-        // END is an empty service receipt (no <O>/<E>/<P>); 0 mirrors the
-        // canonical boundary unit tests.
-        0u32,
-        ts_str.clone(),
-        settled_tip_hex.clone(),
+    let end_xml_bytes = build_webcheck_exact_end_xml(
+        &fiscal_number,
+        tn,
+        recover_di,
+        &ts_str,
+        &settled_tip_hex,
     );
-    // B9 offline shape: the boundary doc carries the opaque DPS code as the
-    // `<MAC ID>` attribute (bare `<MAC>` draws -9 "not ID in MAC").
-    end_header.mac_id = Some(recover_code.clone());
-
-    let end_doc =
-        prro::xml::CanonicalDoc::OfflineSessionEnd(prro::xml::OfflineSessionBoundaryPayload {
-            header: end_header,
-            local_number: recover_di,
-        });
-    let end_xml_bytes = prro::xml::build_canonical_xml(&end_doc)
-        .expect("build_canonical_xml for DocType=10 END must succeed");
-    // The wire bytes are cp1251-encoded; the `<C T='110'>` / `<MAC ID>` region
-    // is ASCII so lossy-UTF8 is a faithful human-readable render.
+    // The wire bytes are cp1251-encoded; the `ПН ` TN prefix is Cyrillic (the
+    // rest — `<C T='110'>` / bare `<MAC>` — is ASCII) so lossy-UTF8 is a faithful
+    // human-readable render of the exact bytes signed + sent.
     println!(
         "  END <C T='110'> XML ({} bytes, cp1251): {}",
         end_xml_bytes.len(),
         String::from_utf8_lossy(&end_xml_bytes)
     );
     println!("  END <TS>={ts_str}  wire date_time(fake-epoch)={date_time}");
+    println!("  END <MAC>=bare (NO ID=)  wire id_offline=<empty>  typCheck=ServiceChk(3)");
 
     // ── Step 4: sign with the LIVE key (ATTACHED CAdES-BES) ────────────────
     // Same CmsSigner / Dstu4145WithGost34311Pb block as the T=112 / SELL path.
@@ -3446,8 +3343,10 @@ async fn live_recover_close_dangling_offline_session() {
 
     // ── Step 5: send the END + capture the FULL DPS response ───────────────
     // DocType=110 → DpsCheckType::ServiceChk (typ 9/10 → PROTO 3), local_number
-    // = DI, id_offline = the recovery code (mirrors stage_send::build_send_
-    // envelope for an offline-drained boundary doc), date_time = fake-epoch.
+    // = DI, id_offline = EMPTY (WebCheck's `CloseOfflineDoc` uses a 4-param
+    // `SubmitCheck(..., 3, num)` with NO id_offline — the drain-close is an
+    // ONLINE issuance, so DPS interprets empty id_offline as "online"),
+    // date_time = fake-epoch.
     println!("\n--- SEND END → live DPS ---");
     let end_envelope = CheckEnvelope {
         rro_fn: fiscal_number.clone(),
@@ -3455,7 +3354,8 @@ async fn live_recover_close_dangling_offline_session() {
         check_sign: end_signed,
         local_number: recover_di as i32,
         check_type: DpsCheckType::ServiceChk,
-        id_offline: recover_code.clone(),
+        // ONLINE-shaped drain-close: NO offline code on the wire.
+        id_offline: String::new(),
         id_cancel: String::new(),
     };
 
@@ -3481,11 +3381,13 @@ async fn live_recover_close_dangling_offline_session() {
             // THIS is the END reject reason we've been chasing — print it loudly.
             println!(
                 "  END DPS REJECT — dps_code={code}  message={message:?}\n  \
-                 (this is the exact DocType=10 END reject reason; if code=-16 the session \
-                 is still open; if it names a MAC/hash issue the settled-tip fix needs \
-                 revisiting; if it is -5 \"no id offline\" AND this END carried a FRESH \
-                 T=112 code, this is a FUNDAMENTAL DocType=10 END offline-id BUG — NOT \
-                 code-reuse — since a never-attempted code was still rejected)"
+                 (this is the exact DocType=10 END reject reason.  This END is the \
+                 WebCheck-EXACT ONLINE drain-close form: BARE <MAC> (no ID=), EMPTY wire \
+                 id_offline.  Interpretation: if code=-16 the session is still open; if it \
+                 names a MAC/hash issue the settled-tip fix needs revisiting; if it is STILL \
+                 -5 \"no id offline\" on a BARE-<MAC>/empty-id_offline END, then DPS wants the \
+                 OPPOSITE of what the bare form provides and the WebCheck CloseOfflineDoc \
+                 model does not fit this session state — escalate to cabinet-side)"
             );
         }
         Err(DpsError::Transport(msg)) => {
@@ -3521,13 +3423,15 @@ async fn live_recover_close_dangling_offline_session() {
         accepted,
         "RECOVERY FAIL: DPS did NOT accept the DocType=10 END — the dangling offline \
          session is STILL OPEN.  The exact dps_code + message are printed above (Step 5). \
-         If a MAC/hash reject, the tip had not truly settled; if -5 \"no id offline\" with \
-         the FRESH T=112 code, it is a fundamental DocType=10 END offline-id bug (not \
-         code-reuse), since a never-attempted code was still rejected."
+         This END is the WebCheck-EXACT ONLINE drain-close (bare <MAC>, empty id_offline). \
+         If a MAC/hash reject, the tip had not truly settled; if STILL -5 \"no id offline\" \
+         on this bare-<MAC>/empty-id_offline END, the WebCheck CloseOfflineDoc model does not \
+         fit this session state — escalate cabinet-side."
     );
     println!(
-        "\nRECOVERY PASS: DPS ACCEPTED the settled-chain DocType=10 END — the dangling \
-         offline session is CLOSED (post online={:?}).  T=112 should no longer draw -16.",
+        "\nRECOVERY PASS: DPS ACCEPTED the settled-chain WebCheck-EXACT bare-<MAC> DocType=10 \
+         END — the dangling offline session is CLOSED (post online={:?}).  T=112 should no \
+         longer draw -16.",
         post_online
     );
 }
