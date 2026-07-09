@@ -1019,6 +1019,60 @@ async fn z_aggregation_oracle_checks_taxable_sell_return_turnover() {
         .unwrap_or_else(|d| panic!("taxable Z aggregation oracle must pass: {d:?}"));
 }
 
+/// Z quiescence pin: an online receipt that crossed SEND but has no KVT1/ACK
+/// evidence yet (`SENT`) must block a live Z before the Z row is minted.  This
+/// is stricter than the normal write gate and protects the shift close from
+/// aggregating an incomplete receipt set.
+#[tokio::test]
+async fn online_z_report_is_true_noop_while_receipt_sent_is_in_flight() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let mut model = RefModel::new_online_open_shift();
+
+    let sell_op = Op::OnlineSell(DpsScript::send_ack_then_last_not_found());
+    let prior_tip = ctx.read_seed().await;
+    let expected = model.apply(&sell_op);
+    let real = interp::run_op(&mut ctx, &sell_op).await;
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("online SENT-hold sell must match model: {d:?}"));
+    assert_eq!(ctx.only_doc_state().await, DocState::Sent);
+
+    let doc_count_before = ctx.observed_doc_count().await;
+    let next_lnd_before = ctx.read_next_lnd().await;
+    let seed_before = ctx.read_seed().await;
+    let sends_before = ctx.send_calls();
+    let z_op = Op::OnlineZReport(DpsScript::ack_path());
+    let expected = model.apply(&z_op);
+    assert!(
+        matches!(expected, ExpectedOutcome::NoMutation),
+        "model must classify Z over in-flight receipt as true no-op"
+    );
+    let real = interp::run_op(&mut ctx, &z_op).await;
+    oracle::check_differential(&real, &expected, seed_before.as_deref())
+        .unwrap_or_else(|d| panic!("blocked Z must match model: {d:?}"));
+
+    assert_eq!(
+        ctx.observed_doc_count().await,
+        doc_count_before,
+        "blocked Z must not mint a Z row"
+    );
+    assert_eq!(
+        ctx.read_next_lnd().await,
+        next_lnd_before,
+        "blocked Z must not allocate an lnd"
+    );
+    assert_eq!(
+        ctx.read_seed().await,
+        seed_before,
+        "blocked Z must not advance the seed"
+    );
+    assert_eq!(
+        ctx.send_calls(),
+        sends_before,
+        "blocked Z must fail before any wire send"
+    );
+    assert_eq!(ctx.read_shift_state().await, ShiftState::Opened);
+}
+
 /// Tier-1 slice 2 seed — offline Z_REPORT local-acks through the production
 /// path and moves the shift into ClosingLocalPendingDrain.
 #[tokio::test]
