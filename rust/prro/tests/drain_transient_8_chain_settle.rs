@@ -112,14 +112,6 @@ impl DpsChannel for DualQueueStub {
     }
 }
 
-fn ack(id: &str, data_sign: Vec<u8>) -> CheckAck {
-    CheckAck {
-        id: id.into(),
-        id_sign: vec![],
-        data_sign,
-    }
-}
-
 fn fn_sign() -> CheckSignBlob {
     CheckSignBlob(vec![0xAB, 0xCD])
 }
@@ -408,7 +400,12 @@ async fn audit_count(pool: &SqlitePool, event_type: &str) -> i64 {
 #[tokio::test]
 async fn pin1_offline_drain_minus_8_does_not_escalate_to_manual() {
     let (_d, pool) = fresh_pool().await;
-    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::OpenedLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        NodeMode::GoingOnline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
     let shift_id = seed_pending_drain_shift(&pool).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
     let doc = seed_offline_local_ack_doc(&pool, 1, 100, session_id, shift_id).await;
@@ -450,7 +447,12 @@ async fn pin1_offline_drain_minus_8_does_not_escalate_to_manual() {
 #[tokio::test]
 async fn pin7_offline_drain_minus_8_does_not_advance_seed_or_stamp_sfn() {
     let (_d, pool) = fresh_pool().await;
-    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::OpenedLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        NodeMode::GoingOnline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
     let shift_id = seed_pending_drain_shift(&pool).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
     let doc = seed_offline_local_ack_doc(&pool, 1, 100, session_id, shift_id).await;
@@ -485,7 +487,12 @@ async fn pin7_offline_drain_minus_8_does_not_advance_seed_or_stamp_sfn() {
 #[tokio::test]
 async fn pin4_redrive_after_minus_8_consumes_no_new_offline_code() {
     let (_d, pool) = fresh_pool().await;
-    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::OpenedLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        NodeMode::GoingOnline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
     let shift_id = seed_pending_drain_shift(&pool).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
     let doc = seed_offline_local_ack_doc(&pool, 1, 100, session_id, shift_id).await;
@@ -532,10 +539,15 @@ async fn pin4_redrive_after_minus_8_consumes_no_new_offline_code() {
 #[tokio::test]
 async fn pin5a_drain_chain_settle_under_budget_redrives_no_escalate() {
     let (_d, pool) = fresh_pool().await;
-    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::OpenedLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        NodeMode::GoingOnline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
     let shift_id = seed_pending_drain_shift(&pool).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
-    // 3 prior DrainChainSettleRetry attempts — well under the generous budget.
+    // 3 prior DrainChainSettleRetry attempts — under the WebCheck-scale budget.
     let doc = seed_error_retryable_doc_with_trace(
         &pool,
         session_id,
@@ -576,7 +588,12 @@ async fn pin5a_drain_chain_settle_under_budget_redrives_no_escalate() {
 #[tokio::test]
 async fn pin5b_drain_chain_settle_budget_exhausted_escalates_to_manual() {
     let (_d, pool) = fresh_pool().await;
-    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::OpenedLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        NodeMode::GoingOnline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
     let shift_id = seed_pending_drain_shift(&pool).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
     // Seed AT the budget cap (the dedicated drain-`-8` budget).
@@ -622,7 +639,12 @@ async fn pin5b_drain_chain_settle_budget_exhausted_escalates_to_manual() {
 #[tokio::test]
 async fn pin6_held_minus_8_blocks_successor_this_tick() {
     let (_d, pool) = fresh_pool().await;
-    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::OpenedLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        NodeMode::GoingOnline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
     let shift_id = seed_pending_drain_shift(&pool).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
     let doc1 = seed_offline_local_ack_doc(&pool, 1, 100, session_id, shift_id).await;
@@ -657,7 +679,12 @@ async fn pin6_held_minus_8_blocks_successor_this_tick() {
 #[tokio::test]
 async fn pin3_offline_drain_minus_5_still_escalates_to_manual() {
     let (_d, pool) = fresh_pool().await;
-    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::OpenedLocalPendingDrain).await;
+    seed_node_state(
+        &pool,
+        NodeMode::GoingOnline,
+        ShiftState::OpenedLocalPendingDrain,
+    )
+    .await;
     let shift_id = seed_pending_drain_shift(&pool).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
     let doc = seed_offline_local_ack_doc(&pool, 1, 100, session_id, shift_id).await;

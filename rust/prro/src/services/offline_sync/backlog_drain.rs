@@ -118,6 +118,11 @@ use crate::services::write_path::stage_send::{self, StageSendError, StageSendOut
 use crate::services::write_path::types::hex_encode_lower as hex_lower;
 use sqlx::SqlitePool;
 
+// B10 — re-export the dedicated drain-`-8` chain-settle budget so drain
+// consumers + tests reference it via the drain module (its enforcement lives
+// in the shared ER redrive policy).
+pub use crate::services::reconciliation::er_redrive_policy::MAX_DRAIN_CHAIN_SETTLE_ATTEMPTS;
+
 // ─── Typed W12 seam ──────────────────────────────────────────────────
 
 /// Per-doc confirmation result between W9b drain orchestrator and the
@@ -514,6 +519,8 @@ pub fn failure_class_for(class: FailureClass) -> &'static str {
         FailureClass::WireRoutingTerminalReject => "wire_routing_terminal_reject",
         FailureClass::WireRoutingProbeRequired => "wire_routing_probe_required",
         FailureClass::WireRoutingTransientRetry => "wire_routing_transient_retry",
+        // B10 drain transient `-8` chain-settle — distinct dashboard signal.
+        FailureClass::WireRoutingChainSettleRetry => "wire_routing_chain_settle_retry",
         FailureClass::Transport => "transport",
         FailureClass::Authorization => "authorization",
         FailureClass::Server => "server",
@@ -556,6 +563,10 @@ pub enum FailureClass {
     WireRoutingTerminalReject,
     WireRoutingProbeRequired,
     WireRoutingTransientRetry,
+    /// B10 — offline drain transient `-8` (chain-settle latency).  Non-manual
+    /// re-drivable class (distinct dashboard signal from generic transient
+    /// retry); escalates to Manual only via the ER-guard budget cap.
+    WireRoutingChainSettleRetry,
     Transport,
     Authorization,
     Server,
@@ -1227,7 +1238,13 @@ fn is_manual_recon_retry_class(retry: RetryClass) -> bool {
         | RetryClass::WrapperBug
         | RetryClass::MacRecovery
         | RetryClass::OperatorEscalation => true,
-        RetryClass::TransientRetry | RetryClass::ProbeRequired => false,
+        // B10: a drain transient `-8` (chain-settle) is re-drivable, NOT
+        // manual-recon — halt this tick only, re-drive next tick under the
+        // dedicated budget.  Escalation to Manual happens ONLY on budget
+        // exhaustion, via the ER-class guard's `BudgetExhausted` arm.
+        RetryClass::TransientRetry
+        | RetryClass::ProbeRequired
+        | RetryClass::DrainChainSettleRetry => false,
     }
 }
 
@@ -3427,6 +3444,8 @@ fn failure_class_for_retry(retry: RetryClass) -> FailureClass {
         RetryClass::TerminalReject => FailureClass::WireRoutingTerminalReject,
         RetryClass::TransientRetry => FailureClass::WireRoutingTransientRetry,
         RetryClass::ProbeRequired => FailureClass::WireRoutingProbeRequired,
+        // B10 drain transient `-8` chain-settle — re-drivable, non-manual.
+        RetryClass::DrainChainSettleRetry => FailureClass::WireRoutingChainSettleRetry,
         // `-13` / `-14` ERROR_NOT_REGISTERED_RRO|SIGNER — semantic
         // authorization class.
         RetryClass::FnConfigError => FailureClass::Authorization,

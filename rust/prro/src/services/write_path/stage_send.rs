@@ -835,9 +835,14 @@ fn wire_decision_to_outcome_kind(decision: &WireDecision, wire_kind: &str) -> Ou
             },
             RetryClass::FnConfigError => OutcomeKind::RetryableAuthFn,
             RetryClass::MacRecovery => OutcomeKind::RetryableMacHashMismatch,
-            RetryClass::WrapperBug | RetryClass::ProbeRequired | RetryClass::OperatorEscalation => {
-                OutcomeKind::RetryableServer
-            }
+            RetryClass::WrapperBug
+            | RetryClass::ProbeRequired
+            | RetryClass::OperatorEscalation
+            // B10 drain transient `-8` — server-originated retryable; folds
+            // to the existing RetryableServer outcome_kind (no new CHECK
+            // value / migration).  Its distinct re-drive semantics live in
+            // `retry_class` (persisted separately), not `outcome_kind`.
+            | RetryClass::DrainChainSettleRetry => OutcomeKind::RetryableServer,
         },
     }
 }
@@ -1528,7 +1533,13 @@ async fn run_one_attempt(
         Ok(_) => None,
         Err(e) => Some(extract_wire_forensics(e)),
     };
-    let wire_decision = route_send_result(wire_result, doc_type, true);
+    // B10: thread the offline-origin bit (`offline_fiscal_no.is_some()`, the
+    // same discriminator used at the seed-advance skip below) into the routing
+    // decision.  It flips EXACTLY ONE arm — an offline-origin `-8` becomes a
+    // transient chain-settle retry (`ErrorRetryable`) instead of a terminal
+    // Reject.  Online issuance passes `false`, so the online routing contract
+    // (and every non-`-8` code) is byte-identical to pre-B10.
+    let wire_decision = route_send_result(wire_result, doc_type, offline_fiscal_no.is_some());
 
     // EmptyServerFiscalNo guard (LOW risk close from W7.3 review).
     // The transport_trace OK-CHECK would otherwise reject 4-b commit
