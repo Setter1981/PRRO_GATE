@@ -1216,7 +1216,12 @@ async fn ensure_offline_session_begin(
     // otherwise).  INV-1 static-scan: INLINE closure, captures hoisted.
     let fn_owned = fiscal_number.to_string();
     let begin_request_id = begin_request_id(fiscal_number);
-    let begin_state = crate::db::tx::with_immediate(pool, move |tx| {
+    // Returns `Some((begin_state, pool_has_code))` when an active OPEN session
+    // exists, else `None`.  `pool_has_code` is the pre-mint fail-closed guard: an
+    // empty pool must refuse the BEGIN BEFORE minting one (else we'd mint a bare
+    // BEGIN that immediately aborts — needless doc churn; the pre-B10 offline
+    // shift-lifecycle refusal was clean pre-mint).
+    let probe = crate::db::tx::with_immediate(pool, move |tx| {
         Box::pin(async move {
             // Require an active OPEN session (the doc would defer at offline-ack
             // otherwise; do not mint a BEGIN with no session).
@@ -1224,10 +1229,19 @@ async fn ensure_offline_session_begin(
                 .await?
                 .is_none()
             {
-                return Ok::<Option<Option<DocState>>, anyhow::Error>(None);
+                return Ok::<Option<(Option<DocState>, bool)>, anyhow::Error>(None);
             }
             let st = fiscal_documents::doc_state_by_request_id_tx(tx, &begin_request_id).await?;
-            Ok(Some(st))
+            // A DPS-issued code is available iff a row has `consumed_at IS NULL AND
+            // dps_code IS NOT NULL` (mirrors `acquire_code_tx`'s WHERE).
+            let has_code: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM offline_codes \
+                 WHERE fiscal_number = ? AND consumed_at IS NULL AND dps_code IS NOT NULL LIMIT 1",
+            )
+            .bind(&fn_owned)
+            .fetch_optional(&mut **tx)
+            .await?;
+            Ok(Some((st, has_code.is_some())))
         })
     })
     .await
@@ -1236,7 +1250,7 @@ async fn ensure_offline_session_begin(
         code: codes::ACQUIRE_INTERNAL,
     })?;
 
-    let Some(begin_state) = begin_state else {
+    let Some((begin_state, pool_has_code)) = probe else {
         // No active OPEN session → nothing to bracket yet.  The doc proceeds;
         // offline-ack defers it (NoActiveSession) per the established asymmetry.
         return Ok(());
@@ -1254,6 +1268,25 @@ async fn ensure_offline_session_begin(
         // Terminal-FAILED (a prior BEGIN attempt aborted / was rejected /
         // escalated): the slot is free (mirrors the migration-030 partial UNIQUE
         // `ux_fd_active_offline_boundary` which excludes these) → mint a fresh one.
+        Some(
+            DocState::Aborted
+            | DocState::Rejected
+            | DocState::Cancelled
+            | DocState::RequiresManualReconciliation,
+        )
+        | None
+            if !pool_has_code =>
+        {
+            // Pre-mint fail-closed: an empty code pool refuses the first offline
+            // doc RETRYABLE (503) WITHOUT minting a bare BEGIN that would only
+            // abort — the operator seeds codes (seed-codes / T=112) and retries.
+            // Keeps the empty-pool case clean (no aborted-BEGIN churn), matching
+            // the pre-B10 offline shift-lifecycle pre-mint refusal spirit.
+            Err(FiscalError::OfflineRefused {
+                request_id,
+                code: codes::OFFLINE_SESSION_BEGIN_PENDING,
+            })
+        }
         Some(
             DocState::Aborted
             | DocState::Rejected
