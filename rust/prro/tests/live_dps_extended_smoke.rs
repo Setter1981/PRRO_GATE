@@ -2297,18 +2297,28 @@ async fn live_smoke_9_offline_drain_mac_id() {
     let write_path = production_write_path(app.clone(), Arc::new(registry));
     // Pattern C: the DPS test cabinet has `open_shift=false`, so we do NOT
     // pre-open a shift — the offline SHIFT_OPEN (driven below) creates it.  Seed
-    // ONLY node_state ONLINE + Closed (go_offline requires mode == ONLINE; the
-    // BEGIN is admissible before the SHIFT_OPEN on a Closed shift per
-    // `ensure_offline_session_begin`'s admissibility gate).
-    node_state::upsert_initial(
-        pool,
-        &fiscal_number,
-        NodeMode::Online,
-        ShiftState::Closed,
-        1,
+    // node_state ONLINE + Closed with `current_shift_id=NULL` and the
+    // `backend_profile_id`/`transport_profile_id` BINDINGS set — mirroring the
+    // proven `b10::seed_boot_baseline` raw INSERT.  The profile bindings are
+    // REQUIRED: `stage_acquire`'s Step-3b profile-binding guard rejects any doc
+    // (including the lazily-minted BEGIN) with `MissingProfileBinding` when
+    // either profile column is NULL.  `node_state::upsert_initial` does NOT set
+    // these columns (leaves them NULL) — which is why an earlier revision drove
+    // the BEGIN's acquire into a reject and the SHIFT_OPEN fail-closed with
+    // OFFLINE_SESSION_BEGIN_PENDING.  A raw INSERT (not upsert_initial) is the
+    // minimal fix that matches the working unit test byte-for-byte.
+    sqlx::query(
+        "INSERT INTO node_state \
+         (fiscal_number, mode, shift_state, current_shift_id, next_lnd, \
+          backend_profile_id, transport_profile_id) \
+         VALUES (?, ?, ?, NULL, 1, 'b', 't')",
     )
+    .bind(&fiscal_number)
+    .bind(NodeMode::Online)
+    .bind(ShiftState::Closed)
+    .execute(pool)
     .await
-    .expect("seed node_state ONLINE/Closed (no pre-opened shift — Pattern C)");
+    .expect("seed node_state ONLINE/Closed + profile bindings (no pre-opened shift — Pattern C)");
     match seed_mac_from_lastchk(pool, &fiscal_number, &pre_ack).await {
         Some(hex) => println!("  pre-T112 MAC seeded into node_state: {hex}"),
         None => println!("  FN genesis (empty data_sign) — pre-T112 MAC is empty"),
@@ -2555,7 +2565,7 @@ async fn live_smoke_9_offline_drain_mac_id() {
     // The BEGIN takes the LOWEST offline lnd, so the pre-drain backlog ordered
     // by lnd is [BEGIN(9), SHIFT_OPEN, SELL] — the target Pattern-C shape.
     println!("\n--- OFFLINE DRIVES (production write-path) ---");
-    let open_outcome = smoke9_drive(
+    let open_outcome = match smoke9_drive(
         &*write_path,
         pool,
         smoke9_entry(
@@ -2567,7 +2577,51 @@ async fn live_smoke_9_offline_drain_mac_id() {
         ),
     )
     .await
-    .expect("offline SHIFT_OPEN drive must succeed (lazy BEGIN mints before it)");
+    {
+        Ok(o) => o,
+        Err(e) => {
+            // DIAGNOSTIC: the SHIFT_OPEN drive refuses (typically
+            // OFFLINE_SESSION_BEGIN_PENDING) only when the lazily-minted BEGIN
+            // failed to reach OFFLINE_LOCAL_ACK in one drive.  Surface WHERE the
+            // BEGIN stalled so a live failure is actionable (a NULL profile
+            // binding rejects the BEGIN at acquire; an empty pool refuses pre-mint;
+            // a sign fault leaves it PREPARED/SIGNED).
+            let begin_row: Option<(i64, String, Option<String>)> = sqlx::query_as(
+                "SELECT lnd, state, offline_dps_code FROM fiscal_documents \
+                 WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN' \
+                 ORDER BY lnd ASC LIMIT 1",
+            )
+            .bind(&fiscal_number)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+            println!("  DIAGNOSTIC: SHIFT_OPEN drive refused: {e:?}");
+            match &begin_row {
+                Some((lnd, state, code)) => println!(
+                    "  DIAGNOSTIC: BEGIN row present — lnd={lnd} state={state} offline_dps_code={code:?} \
+                     (if not OFFLINE_LOCAL_ACK the BEGIN stalled here)"
+                ),
+                None => println!(
+                    "  DIAGNOSTIC: NO BEGIN row — it was refused pre-mint (empty code pool) or \
+                     rejected at acquire before any row minted (e.g. NULL profile bindings)"
+                ),
+            }
+            // Tail the audit_log for the reject reason (e.g. profile_binding_missing).
+            let audits: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT event_type, event_payload_json FROM audit_log ORDER BY rowid DESC LIMIT 8",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            for (et, pj) in &audits {
+                println!("  DIAGNOSTIC audit: {et}  {}", pj.as_deref().unwrap_or(""));
+            }
+            panic!(
+                "Smoke 9 FAIL: offline SHIFT_OPEN drive refused ({e:?}) — the lazy DocType=9 BEGIN \
+                 did not reach OFFLINE_LOCAL_ACK in one drive. See DIAGNOSTIC lines above."
+            )
+        }
+    };
     assert_eq!(
         open_outcome.document_state,
         DocState::OfflineLocalAck,
