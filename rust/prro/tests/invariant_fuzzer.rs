@@ -1040,6 +1040,50 @@ async fn differential_offline_z_report_enters_closing_pending_drain() {
     );
 }
 
+/// Offline full-day pin: taxable offline SELL + RETURN are locally issued, an
+/// offline Z local-acks over that backlog, and the same independently-computed
+/// Z aggregation must still hold after return-online drains the whole cohort.
+#[tokio::test]
+async fn offline_full_day_z_aggregation_survives_return_online_drain() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(4).await;
+    ctx.seed_tax_group_20_percent().await;
+    let mut model = RefModel::new_offline_open_shift(4);
+
+    let prior_tip = ctx.read_seed().await;
+    let expected = model.apply(&Op::OfflineSell);
+    let real = ctx.run_taxable_offline_sell().await;
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("taxable offline SELL must match model: {d:?}"));
+
+    let prior_tip = ctx.read_seed().await;
+    let expected = model.apply(&Op::OfflineReturn);
+    let real = ctx.run_taxable_offline_return().await;
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("taxable offline RETURN must match model: {d:?}"));
+
+    let prior_tip = ctx.read_seed().await;
+    let expected = model.apply(&Op::OfflineZReport);
+    let real = interp::run_op(&mut ctx, &Op::OfflineZReport).await;
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("taxable offline Z_REPORT must match model: {d:?}"));
+    oracle::check_latest_z_aggregation(&ctx.pool)
+        .await
+        .unwrap_or_else(|d| panic!("offline local Z aggregation oracle must pass: {d:?}"));
+
+    let _ = model.apply(&Op::GoOnline(DpsScript::ack_path()));
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::ack_path())).await;
+
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("offline full-day drain ledger must match model");
+    oracle::check_shift_state(ctx.read_shift_state().await, Some(model.shift_state))
+        .expect("offline full-day drain shift state must match model");
+    assert_eq!(model.shift_state, ShiftState::Closed);
+    oracle::check_latest_z_aggregation(&ctx.pool)
+        .await
+        .unwrap_or_else(|d| panic!("drained offline Z aggregation oracle must still pass: {d:?}"));
+}
+
 /// Offline Z_REPORT followed by GoOnline(AckPath) drains the Z doc and closes
 /// the shift.  This is the first edge-13/close proof in the model harness.
 #[tokio::test]

@@ -450,6 +450,16 @@ impl FuzzCtx {
         run_inline_row(self, row, Some(script)).await
     }
 
+    pub async fn run_taxable_offline_sell(&mut self) -> RealOutcome {
+        let row = self.seed_inbox_taxable("SELL").await;
+        run_inline_row(self, row, None).await
+    }
+
+    pub async fn run_taxable_offline_return(&mut self) -> RealOutcome {
+        let row = self.seed_inbox_taxable("RETURN").await;
+        run_inline_row(self, row, None).await
+    }
+
     /// Seed a live `SHIFT_OPEN` inbox row (opening payload, no total).
     async fn seed_inbox_shift_open(&mut self) -> InboxRow {
         let idem = self.next_idem();
