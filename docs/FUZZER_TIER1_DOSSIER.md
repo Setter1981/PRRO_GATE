@@ -1,143 +1,370 @@
-# Fuzzer Tier-1 Dossier — Shift / Z / RMR Alphabet Expansion
+# Fuzzer Tier-1 Implementation Contract
 
-**Status:** implementer contract (2026-07-09). To be built by an implementer (possibly a different LLM) and **adversarially reviewed by the architect** against this document. Read the whole thing before writing code.
+**Issue:** `PRRO_GATE-hov` — Extend invariant fuzzer Tier-1 with shift/Z/RMR state machine.
 
-**Tracking:** `PRRO_GATE-hov` — "Extend invariant fuzzer Tier-1 with shift/Z/RMR state machine".
+**Audience:** an implementer working in a separate branch/worktree, with an architect reviewing the result adversarially.
 
----
-
-## 0. The one rule that matters most
-
-This project's moat is **fuzzer-proven correctness**. The invariant fuzzer is a **model-based differential harness**: a hand-written `RefModel` predicts the outcome of each operation INDEPENDENTLY, the real system runs the operation, and an oracle compares the two. It has caught 3 real production bugs before merge (#192, the P1 boot-resume twin, the B10 offline-drift).
-
-**THE RULE:** the `RefModel` must predict from **first principles**, NEVER by reading or mirroring what the implementation produced. A model that adopts the impl's output is **tautological** — it passes every test and proves NOTHING. That is worse than no test, because it looks like coverage while giving none. Every new prediction you add must be accompanied by a **teeth canary** (§7) proving the oracle goes RED when the impl is deliberately broken. This is non-negotiable and is the first thing the review checks.
-
-**RED-first TDD:** write the failing model/oracle assertion first, run it, watch it fail for the RIGHT reason, then implement. No production/model code without a preceding failing test.
+**Status:** binding handoff contract. If implementation reality conflicts with this document, stop and bring back the smallest concrete decision point. Do not silently widen scope.
 
 ---
 
-## 1. Intent & the gap
+## 1. Objective
 
-The fuzzer's `Op` alphabet currently covers: `OnlineSell/OfflineSell/OnlineReturn/OfflineReturn`, `Drain/RepeatDrain`, `GoOnline/GoOnlineWithoutBacklog/OfflineSellDuringGoingOnline`, `Crash/Reboot/RepeatReboot`, `DuplicateIdemKey`, `SellWithClosedShift`. Model: `apply_sell/apply_return/apply_drain/apply_go_online`.
+Extend the Rust invariant fuzzer from "receipt/offline/drain focused" to a real shift/Z/RMR state-machine fuzzer.
 
-**The gap:** the entire **shift / Z / session lifecycle is OUT of the alphabet.** Shift appears only as a static guard (`SellWithClosedShift`), NOT as a driven state machine. There is no `Op::ShiftOpen/ShiftClose/ZReport` and no `apply_shift_*`. So the 9-state shift machine, its 14 edges, RMR escalation, Z tax-surface, and the offline session lifecycle are **unfuzzed** — and this is the most complex and highest-risk machine in the system.
+The current fuzzer already covers:
+- `OnlineSell`, `OfflineSell`, `OnlineReturn`, `OfflineReturn`
+- `Drain`, `RepeatDrain`
+- `GoOnline`, `GoOnlineWithoutBacklog`, `OfflineSellDuringGoingOnline`
+- `Crash`, `Reboot`, `RepeatReboot`
+- `DuplicateIdemKey`
+- `SellWithClosedShift`
 
-**Tier-1 closes this gap.** It is the single highest-ROU fuzzer investment before the pilot campaign.
+The gap is the product's highest-risk machine: shift lifecycle, Z-report close, offline local pending drain, and manual reconciliation. Today shift is mostly a static guard in the fuzzer, not a driven state machine.
 
----
-
-## 2. Files (verify actual structure before editing)
-
-`rust/prro/tests/invariant_fuzzer/`:
-- `op.rs` — the `Op` alphabet enum + any op metadata.
-- `model.rs` — the `RefModel` (`apply_*`, state tracking). **B10 already extended this** with two-doc offline BEGIN/END prediction (`approach-d`: interp emits `RealOutcome::Recovered` → routed to `check_ledger_delta`). Study that pattern — you extend it.
-- `interp.rs` — `FuzzCtx`; drives each `Op` through the REAL system (production write-path / drain / go-online). Note the per-case temp-DB lifecycle (there was a leak — clean up any temp DBs you add).
-- `oracle.rs` — `check_differential`, `check_ledger_delta`, `check_doc_against_mutation`. **Read these carefully** — `check_doc_against_mutation` hard-codes `doc.previous_hash == prior_tip` chain-continuity; a multi-doc op must route through `check_ledger_delta` instead (this exact trap bit B10).
-- `strategy.rs` — proptest generators / `Op` sequence strategy.
-- The harness entry (`run_harness`) + the directed/proptest tests live in `rust/prro/tests/invariant_fuzzer.rs`.
+Tier-1 is complete only when the fuzzer can generate and check shift lifecycle operations composed with existing sell/offline/crash/drain operations.
 
 ---
 
-## 3. Scope — the ops to add
+## 2. Branch And Worktree Contract
 
-Add to the alphabet (confirm exact naming/shape against `op.rs` conventions):
-- `Op::ShiftOpen { online: bool }` — drives a `SHIFT_OPEN`. Online → to DPS (SENT→…→ACK). Offline → `OFFLINE_LOCAL_ACK`, and per B10 the lazy DocType=9 BEGIN mints first.
-- `Op::ShiftClose { online: bool }` (and/or `Op::ZReport { online: bool }`) — drives the shift close. **Confirm the canonical distinction** between `SHIFT_CLOSE` and `Z_REPORT` in the model (`db/models/enums.rs` DocType + the M3b spec) and model whichever the write-path actually uses to close a shift.
+The implementer must work in a new branch and worktree based on `main`.
 
-Drive all shift ops through the **production write-path** (like the B10 tests' `drive()` / `production_write_path`), NOT direct seeding — the point is to fuzz the real state machine.
+Recommended setup:
 
----
+```bash
+git fetch origin
+git worktree add ../prro_gate-fuzzer-tier1 -b fuzzer-tier1-shift-z-rmr origin/main
+cd ../prro_gate-fuzzer-tier1
+bd update PRRO_GATE-hov --claim --json
+```
 
-## 4. The 9-state shift machine (model it in `RefModel`)
+Rules:
+- Do not work on `main`.
+- Do not base this work on the B10 branch or any B10 worktree.
+- Do not commit to this dossier branch unless the task is explicitly to edit the dossier.
+- Do not force-push.
+- If B10 lands before this work finishes, rebase onto the new `origin/main` and re-run the fuzzer gate.
 
-`Created → Opening → OpenedLocalPendingDrain → Opened → ClosingLocalPendingDrain → Closing → Closed / RequiresManualReconciliation / Error`.
-
-Authoritative spec: `docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md` (§16 = the operational-reality alignment that overrides earlier sections on conflict). Edges 1–14 there. The `RefModel` must track the shift state per FN and independently predict the transition on each shift op + each fault. The impl's shift transitions live in `services/write_path/stage_acquire.rs` (guard/edge table) + the shift repository; the model must NOT read those — it re-derives the edge from the spec.
-
----
-
-## 5. RMR as a checked oracle — THE hard, highest-value part
-
-`RequiresManualReconciliation` is "ЧП из ЧП" — extremely rare, and the one place a silent transition-violation would be catastrophic. The oracle must prove RMR fires **EXACTLY by right** and never silently violates a transition (INV-8).
-
-**Confirmed RMR trigger families** (CLAUDE.md persistence model / spec §16.7):
-1. **Any W9b drain reject of an `OFFLINE_LOCAL_ACK` backlog doc on `OpenedLocalPendingDrain` / `ClosingLocalPendingDrain`** (edges 6/14) — drain has crossed the local-commit threshold, rollback semantics don't apply. (FN-deregistered-while-offline is the real-world subtype.)
-2. **Ambiguous wire timeout for online `SHIFT_OPEN` / `Z_REPORT`** (edges 4/12) — cannot determine if DPS accepted.
-3. **Operator-driven force seam.**
-
-The oracle must assert three things, all independently modeled:
-- (a) RMR **fires** when (and only when) a trigger family occurs;
-- (b) RMR does **NOT** fire on any non-trigger reject/fault (no over-escalation);
-- (c) the transition **into** RMR is a **whitelisted edge** (no silent violation of the transition table).
-
-Model the fault ops needed to hit these: an ambiguous-timeout fault on a shift op, and a drain-reject of an OLA doc.
+Reason: B10 changes the offline two-doc model surface. Mixing bases will make model/oracle failures ambiguous.
 
 ---
 
-## 6. advance-at-SEND / D2 / D5 fidelity — extend to shift docs
+## 3. Product Surface To Add
 
-The model (post-B10) already reflects seed-advance for sell/return. Extend the **same** fidelity to `SHIFT_OPEN` / `Z_REPORT`:
-- **advance-at-SEND:** the online chain seed advances atomically with the `server_fiscal_no` stamp at the `Sending→Sent` CAS — **that CAS is the issuance moment, not ACK.**
-- **pre-SENT reject** → `Sending→Rejected` CAS: a non-issued `Rejected` row legitimately rests (lnd consumed, seed **NOT** advanced) — **D2**.
-- **post-SENT reject** → `RequiresManualReconciliation`, **NEVER** `Rejected` (seed NOT rolled back; the `(Sent, Rejected)` edge was removed in A.3 PR-B) — **D2 expanded**.
-The model must predict these for the shift docs too. Getting the pre-SENT/post-SENT split right for shift docs is a core correctness target.
+Add fuzzer operations for:
+- online shift open
+- offline shift open
+- online shift close / Z-report
+- offline shift close / Z-report
 
----
+The implementer must confirm the exact production operation split before coding:
+- whether `ShiftClose` and `ZReport` are distinct `DocType` inputs in the current Rust path;
+- which operation actually closes a shift through the production write path;
+- where wire `Z_REPORT` numbering/allocation happens.
 
-## 7. Teeth (MANDATORY — reviewed first)
+The fuzzer API may choose either explicit variants or a typed enum, but the generated alphabet must be readable in shrunk failures. Acceptable shapes include:
 
-For EVERY new model/oracle assertion, ship a **revert-canary** test proving the differential goes RED when the impl is deliberately broken. Minimum set:
-- **Shift-edge canary:** make the model predict a shift transition; a test that forces an ILLEGAL transition in the impl (or reverts a legal edge) → the shift-state oracle REDs.
-- **RMR canary:** a model that SUPPRESSES an RMR escalation must DIVERGE from the impl that correctly escalates (and vice-versa: a model that spuriously escalates diverges from an impl that correctly does not).
-- **advance-at-SEND canary:** break the seed-advance / pre-vs-post-SENT split for a shift doc → the ledger-delta REDs.
+```rust
+Op::ShiftOpen(DpsScript)
+Op::OfflineShiftOpen
+Op::ZReport(DpsScript)
+Op::OfflineZReport
+```
 
-Each canary states the exact revert and the resulting RED. If you cannot write a canary that REDs, your assertion is vacuous — fix it.
+or:
 
----
+```rust
+Op::ShiftDoc {
+    kind: ShiftDocKind,
+    lane: FiscalLane,
+    script: DpsScript,
+}
+```
 
-## 8. RED-first pins (write these failing first)
-
-1. `Op::ShiftOpen{online:true}` → model predicts `Opening→Opened` on SENT-ACK; oracle matches impl.
-2. `Op::ShiftOpen{online:false}` → model predicts the B10 lazy BEGIN + `OpenedLocalPendingDrain`; drain → `Opened`.
-3. `Op::ZReport{online:true}` → `Opened→Closing→Closed`.
-4. **RMR:** ambiguous-timeout on online `SHIFT_OPEN` (edge 4) → model + impl both → RMR, whitelisted edge.
-5. **RMR:** drain-reject of an OLA doc on `OpenedLocalPendingDrain` (edge 6) → RMR.
-6. **D2:** pre-SENT reject of a `SHIFT_OPEN` → `Rejected`, seed NOT advanced. post-SENT reject → RMR, seed NOT rolled back.
-7. Teeth canaries (§7).
-8. **Proptest:** sequences composing shift ops with sell/offline/crash/drain run with zero divergence (composition, not silos).
-
----
-
-## 9. Invariants to preserve
-
-- The existing full gate (**nextest 1751-pass baseline** on `main`; confirm the current count) stays green + your new tests add coverage.
-- **Model/test-only** — no production `src/` change UNLESS the fuzzer finds a real bug; then fix it RED-first as a separate, clearly-labeled commit (that's the fuzzer doing its job — flag it loudly, don't bury it).
-- Single-writer / idempotency / D2 — the model reflects them; never encodes a violation as "expected".
-- **Determinism:** seeds persist (fix the `FileFailurePersistence` path if it warns); a found failure lands as a checked-in regression seed + a directed test.
+Do not add a generic stringly operation. Fuzzer failures must be self-explaining.
 
 ---
 
-## 10. Coordination (avoid collision — important)
+## 4. Required Model Semantics
 
-- Work on a **SEPARATE branch in a SEPARATE worktree, based off `main`.** Do NOT base off the B10 branch `worktree-agent-a8e9bc72a98df18bc` (it has in-flight offline two-doc-model changes — you'd entangle). Do NOT commit to `main`, the B10 branch, or any other feature branch. The branch/worktree name should make the scope obvious, e.g. `fuzzer-tier1-shift-z-rmr`.
-- If B10 merges to `main` before you finish, **rebase onto the new `main`** (the offline BEGIN/END model lands there). Coordinate the base point with the architect.
-- Never force-push, never push to `main`, never rewrite shared history.
+The `RefModel` must independently model the 9-state shift machine:
+
+```text
+Created
+Opening
+OpenedLocalPendingDrain
+Opened
+ClosingLocalPendingDrain
+Closing
+Closed
+RequiresManualReconciliation
+Error
+```
+
+The authoritative source is:
+
+```text
+docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md
+```
+
+Section 16 is authoritative where it conflicts with earlier wording.
+
+The model must add explicit shift methods or an equivalent clear structure:
+- `apply_shift_open`
+- `apply_shift_close` / `apply_z_report`
+- shift-aware drain handling for `OpenedLocalPendingDrain` and `ClosingLocalPendingDrain`
+- shift-aware crash/fault classification where already represented in the fuzzer
+
+The model must not query the database or reuse production transition helpers to decide expected shift state. It may compare against production after the real op runs, but prediction must come from model state and the spec.
 
 ---
 
-## 11. Review criteria (what the architect verifies — build to pass these)
+## 5. RMR Oracle Contract
 
-1. Full gate green: `cargo nextest run -p prro --features test-support` all-pass + fmt + clippy (verified from OUTPUT, not exit code).
-2. **Every new assertion has a proven teeth canary** (revert → RED). No exceptions.
-3. **RMR oracle fires exactly by right** — no over/under-escalation; every RMR transition is a whitelisted edge; non-triggers never RMR.
-4. The new ops **genuinely exercise** the shift machine — a deliberate-bug canary catches (not no-ops).
-5. **advance-at-SEND / D2** correct for shift docs (pre-SENT→Rejected / post-SENT→RMR split).
-6. **Zero tautology** — the model predicts independently; the oracle can disagree with reality.
-7. Determinism (seed-persist + regression seeds checked in).
-8. Delivery in the 7-item format + a table: `{new Op/fault → model prediction → teeth canary → RED-proof}`.
+`RequiresManualReconciliation` is not just another terminal state. It is an oracle target.
+
+The implementation must prove all three properties:
+- RMR fires when legally required.
+- RMR does not fire on non-trigger outcomes.
+- Every transition into RMR is a whitelisted shift edge.
+
+Required trigger families:
+- edge 4: ambiguous timeout for online shift open, `Opening -> RequiresManualReconciliation`
+- edge 12: ambiguous timeout for online Z-report / shift close, `Closing -> RequiresManualReconciliation`
+- edge 6: drain reject of an offline-local shift-open artifact, `OpenedLocalPendingDrain -> RequiresManualReconciliation`
+- edge 14: drain reject of an offline-local Z-report artifact, `ClosingLocalPendingDrain -> RequiresManualReconciliation`
+
+Non-trigger outcomes must be pinned too. A reject before the online SEND boundary is not the same as an ambiguous post-boundary state. Do not collapse everything into RMR.
+
+The oracle must report a useful failure:
+- operation sequence;
+- model shift state before/after;
+- real shift state before/after;
+- expected RMR trigger class, if any;
+- whether the transition was in the allowed edge set.
 
 ---
 
-## 12. What this unlocks
+## 6. D2 / D5 / Advance-At-SEND Contract
 
-Closes the biggest fuzzer alphabet gap; the moat now covers the most complex/risky machine (9-state shift + RMR). Next: **Tier-2** (B8/B9 sign→persist crash-window, T=112 pool-lifecycle ops, node-mode `BLOCKED/STOP_MODE/CRYPTO_DEGRADED` completeness + INV-3 as oracle); **Tier-3** (multi-FN concurrent interleaving — per-FN single-writer under fuzz, the fleet dimension). And the discipline pin: from here, **any new Op/state/edge enters the fuzzer alphabet in the same PR that adds it**, and the fuzzer becomes a **required** CI gate. See `docs/QUALITY_CHARTER.md` §5/§8.
+The shift docs must follow the same issuance rules as receipt docs.
+
+Online issuance moment:
+- the chain seed advances at the `Sending -> Sent` CAS;
+- the `server_fiscal_no` stamp and seed advance are the issuance boundary;
+- ACK is confirmation, not issuance.
+
+Required split:
+- pre-SENT reject: row may become `Rejected`; lnd consumed; seed not advanced;
+- post-SENT reject or ambiguity: row must not roll back to `Rejected`; route to `RequiresManualReconciliation` where required; seed is not rolled back.
+
+D5 gate:
+- non-issued blocking siblings must still block new online issuance;
+- issued offline-origin docs must not be treated as non-issued blockers after local issuance;
+- extend any model mirror needed for shift docs consciously, with teeth.
+
+---
+
+## 7. Interpreter Contract
+
+New shift ops must run through production seams.
+
+Required:
+- use the real write path entry already used by the fuzzer (`inline::run` or the current production helper);
+- create real inbox rows with the proper `DocType` / operation type;
+- use `ScriptedDps` for online wire responses;
+- use the real offline local ack/drain path for offline shift docs;
+- observe real DB state after each op for differential comparison.
+
+Forbidden:
+- direct seeding of final `fiscal_documents` rows as the implementation of an op;
+- direct mutation of `shifts` to make the model pass;
+- special production-only bypasses under test feature flags;
+- accepting `NoMutation` for a new op unless the op is genuinely out of precondition and the model predicted that refusal.
+
+If a production seam cannot drive a needed state, stop and document the exact missing seam. Do not reimplement the write path inside the fuzzer.
+
+---
+
+## 8. Generator Contract
+
+The generator must compose shift ops with existing ops. It must not build a siloed "shift-only" test lane.
+
+Required:
+- directed tests first;
+- only then add the new ops to `strategy.rs`;
+- generated sequences must include sells/returns, shift ops, drain, go-online, crash/reboot, and invalid/re-entry operations in the same stream;
+- keep shrink quality: prefer flat `Vec<Op>` generation over stateful `prop_filter`-heavy strategies.
+
+Do not overfit the generator to legal-only sequences. Illegal and out-of-precondition intents are useful when the interpreter and model classify them explicitly.
+
+---
+
+## 9. Teeth Protocol
+
+Every new oracle must have teeth. A test that never goes red on a plausible break is not evidence.
+
+Minimum required teeth:
+
+| Area | Required proof |
+| --- | --- |
+| shift edge oracle | A deliberate illegal or missing shift transition makes the oracle fail. |
+| RMR under-escalation | Suppressing a required RMR escalation makes the oracle fail. |
+| RMR over-escalation | Escalating on a non-trigger makes the oracle fail. |
+| advance-at-SEND | Moving seed advance to ACK or treating post-SENT reject as `Rejected` makes the oracle fail. |
+| generated op reachability | A deliberate no-op implementation of a new op is detected by a directed canary. |
+
+Each tooth must name:
+- the bug class;
+- the expected red assertion;
+- the minimal sequence that exposes it;
+- the exact revert or mutation target, if known.
+
+It is acceptable for a tooth to be a deterministic directed test rather than a proptest case. It is not acceptable for a tooth to require manual inspection only.
+
+---
+
+## 10. Phased Landing Plan
+
+Land in small, reviewable slices. Do not deliver a giant rewrite.
+
+### Slice 1: Online Shift Close / Z Skeleton
+
+Goal:
+- prove the fuzzer can drive a shift-closing doc through production online path;
+- model `Opened -> Closing -> Closed`;
+- pin advance-at-SEND for this doc class.
+
+Expected files:
+- `rust/prro/tests/invariant_fuzzer/op.rs`
+- `rust/prro/tests/invariant_fuzzer/interp.rs`
+- `rust/prro/tests/invariant_fuzzer/model.rs`
+- `rust/prro/tests/invariant_fuzzer/oracle.rs` if shift-state checking needs an explicit helper
+- `rust/prro/tests/invariant_fuzzer.rs`
+
+### Slice 2: Offline Shift Close / Edge 14
+
+Goal:
+- drive offline Z-report local ack;
+- model `Opened -> ClosingLocalPendingDrain`;
+- drain ACK reaches `Closed`;
+- drain reject reaches RMR through edge 14.
+
+### Slice 3: Shift Open / Edges 4 And 6
+
+Goal:
+- support online and offline shift open from a closed/created fixture;
+- model `Created/Closed -> Opening -> Opened` and offline `OpenedLocalPendingDrain`;
+- ambiguous timeout reaches edge 4;
+- drain reject reaches edge 6.
+
+### Slice 4: Generator Integration
+
+Goal:
+- add the new ops into `strategy.rs`;
+- prove mixed sequences shrink cleanly;
+- commit any found regression seed;
+- run default fuzzer gate clean.
+
+If any slice finds a production bug, stop and split:
+- first commit/test proves the bug red;
+- second commit fixes production;
+- final commit re-enables/extends generator if needed.
+
+---
+
+## 11. Acceptance Gates
+
+Before review, the implementer must run and report exact output for:
+
+```bash
+cd rust
+cargo fmt -p prro -p prro_crypto -p prro_escpos -- --check
+cargo clippy -p prro --all-targets --no-deps --features test-support -- -D warnings
+cargo nextest run -p prro --features test-support --locked -E 'test(/invariant_fuzzer/)'
+cargo nextest run -p prro --features test-support --locked
+bash prro/tests/check_seed_committed.sh
+```
+
+If `nextest` is unavailable locally, use the repo's accepted fallback and state it. Do not mark the work complete without a full fuzzer run unless a real environment blocker exists.
+
+Large-N is recommended before merge:
+
+```bash
+cd rust
+FUZZ_CASES=4096 cargo nextest run -p prro --features test-support --locked -E 'test(/^harness_(online|offline)_seeded$/)'
+```
+
+---
+
+## 12. Review Checklist
+
+The architect will check:
+- new ops are in the main alphabet and generator, not isolated side tests;
+- each new op reaches production write/drain paths;
+- the model predicts independently from the spec;
+- RMR fires exactly by edge 4/6/12/14 rules;
+- non-trigger rejects/faults do not become RMR by convenience;
+- advance-at-SEND is correct for shift docs;
+- pre-SENT vs post-SENT behavior is split;
+- teeth tests would catch model/impl drift;
+- existing fuzzer invariants still run;
+- no broad production refactor was smuggled in;
+- regression seeds are committed or the seed guard is clean.
+
+---
+
+## 13. Delivery Format
+
+The final handoff must include:
+
+```text
+STEP:
+Fuzzer Tier-1 shift/Z/RMR slice <n>
+
+GOAL:
+<what was closed>
+
+CHANGED FILES:
+<files>
+
+NEW OPS:
+<op list and intended production path>
+
+MODEL PREDICTIONS:
+<state/doc/seed predictions added>
+
+RMR ORACLE:
+<which edges covered and which non-triggers pinned>
+
+TEETH:
+<table: invariant -> canary -> red proof>
+
+TESTS RUN:
+<commands and result summary>
+
+KNOWN GAPS:
+<remaining Tier-1/Tier-2 items>
+
+NEXT STEP:
+<one bounded next slice>
+```
+
+No "done" without the teeth table.
+
+---
+
+## 14. Non-Goals For Tier-1
+
+Do not include unless explicitly approved:
+- multi-FN concurrency fuzzing;
+- byzantine DPS decode fuzzing;
+- differential replay against WebCheck;
+- mutation-testing infrastructure;
+- full node-mode alphabet for `BLOCKED`, `STOP_MODE`, `CRYPTO_DEGRADED`;
+- T=112 offline-code ask/replenish/exhaust lifecycle;
+- broad production rewrite of write path, drain, repositories, or migrations.
+
+These are valuable, but they are Tier-2/Tier-3. Tier-1 is shift/Z/RMR correctness.
+
