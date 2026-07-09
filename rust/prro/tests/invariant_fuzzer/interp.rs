@@ -48,6 +48,11 @@ use crate::common::scripted_dps::ScriptedDps;
 use crate::common::{det_signing_ctx, drain_test_guard};
 use crate::op::{DpsScript, Op, Stage, WireResponse};
 
+/// A `(previous_hash, unsigned_xml_sha256)` chain-hash pair as read from a
+/// `fiscal_documents` row — both columns nullable.  Named to satisfy
+/// `clippy::type_complexity` at the B10 boundary-chain teeth query sites.
+type ChainHashPair = (Option<Vec<u8>>, Option<Vec<u8>>);
+
 // ─── Fixture constants (mirror tests/kill_point_matrix.rs) ──────────────────
 
 const FN: &str = "4000000001";
@@ -429,7 +434,7 @@ impl FuzzCtx {
         &self,
         prior_tip: Option<&[u8]>,
     ) -> Result<(), String> {
-        let begin: Option<(Option<Vec<u8>>, Option<Vec<u8>>)> = sqlx::query_as(
+        let begin: Option<ChainHashPair> = sqlx::query_as(
             "SELECT previous_hash, unsigned_xml_sha256 FROM fiscal_documents \
              WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN' \
              ORDER BY lnd ASC LIMIT 1",
@@ -440,7 +445,7 @@ impl FuzzCtx {
         .unwrap();
         let (begin_prev, begin_unsigned) =
             begin.ok_or_else(|| "B10 teeth: no OFFLINE_SESSION_BEGIN row".to_string())?;
-        let biz: Option<(Option<Vec<u8>>, Option<Vec<u8>>)> = sqlx::query_as(
+        let biz: Option<ChainHashPair> = sqlx::query_as(
             "SELECT previous_hash, unsigned_xml_sha256 FROM fiscal_documents \
              WHERE fiscal_number = ? AND doc_type IN ('SELL','RETURN') AND fs_mode = 'OFFLINE' \
              ORDER BY lnd DESC LIMIT 1",

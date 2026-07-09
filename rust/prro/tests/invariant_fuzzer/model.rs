@@ -554,13 +554,25 @@ impl RefModel {
                     self.docs.insert(*lnd, DocState::Ack);
                 }
                 // B10 — at drain finalize the DocType=10 END is minted + sent LAST
-                // (predicted INDEPENDENTLY).  Only a session that issued a BEGIN
-                // gets an END, and once-only (`session_has_end`).  Code accounting
-                // vs the impl (`ensure_and_drain_session_end` + pool-exhausted
-                // guard): spare code → END issues + drains to ACK + finalize CAS's
-                // GoingOnline → Online; NO spare code → END rests SIGNED (held), the
-                // guard blocks finalize → mode STAYS GoingOnline.
-                if self.session_has_begin && !self.session_has_end {
+                // (predicted INDEPENDENTLY).  The impl
+                // (`ensure_and_drain_session_end`) mints the END at EVERY
+                // content-Eligible drain of a bound-shift offline session, gated
+                // ONLY on shift presence + `!already-END` — NOT on BEGIN presence
+                // (`backlog_drain.rs:2610` skips only on a NULL shift; there is no
+                // BEGIN-existence gate).  In normal production a BEGIN always
+                // precedes the backlog (the `inline::run` hoist mints it for the
+                // first offline doc), so BEGIN presence and END-mint coincide.  The
+                // ONE case where they part is a production-UNREACHABLE fuzzer state:
+                // `crash_after_sign` stages an offline SELL DIRECTLY (bypassing the
+                // `inline::run` BEGIN hoist), so a `Crash(Sign), RepeatReboot,
+                // GoOnline` leaves a drainable offline backlog with NO BEGIN — and
+                // the real drain still mints the END (real `{1:Ack, 2:Ack}`).  So
+                // the model matches the impl: mint the END on any non-empty eligible
+                // drain, once-only (`session_has_end`), independent of BEGIN.  Code
+                // accounting: spare code → END issues + drains to ACK + finalize
+                // CAS's GoingOnline → Online; NO spare code → END signs bare →
+                // ABORTED terminally, finalize blocked → mode STAYS GoingOnline.
+                if !self.session_has_end {
                     self.session_has_end = true;
                     let end_lnd = self.next_lnd;
                     let end_prev = self.seed; // END chains off the last content doc
@@ -724,6 +736,35 @@ impl RefModel {
         .fetch_one(pool)
         .await
         .unwrap();
+
+        // B10 — re-derive the boundary-doc flags from the real ledger.  Without
+        // this a crash+reboot over a session that already minted a DocType=9
+        // BEGIN (e.g. `Crash(Sign), RepeatReboot`) left `session_has_begin` at
+        // its `false` default, so a subsequent all-ACK `GoOnline` drain SKIPPED
+        // the DocType=10 END-mint prediction while the real drain minted it →
+        // `{1: Ack}` (model) vs `{1: Ack, 2: Ack}` (real).  The flags are derived
+        // OBSERVABLY (presence of a boundary row in an ISSUED / non-terminal-
+        // failed state), exactly as `docs` / `codes` are — mirroring the impl's
+        // existence probe (`ensure_offline_session_begin`: OLA/SENT/KVT1/KVT2/ACK
+        // count as present; ABORTED/REJECTED/CANCELLED/RMR free the slot).  A
+        // still-in-flight boundary row (PREPARED/SIGNED/ENCRYPTED/SENDING) is
+        // NOT yet "issued" and does not set the flag — boot-resume drives it and
+        // the next fault re-sync re-reads it.  Inlined (not a helper) so the read
+        // stays inside this tagged funnel wrapper (adoption-lint discipline).
+        let issued_boundaries: Vec<(String,)> = sqlx::query_as(
+            "SELECT doc_type FROM fiscal_documents \
+             WHERE doc_type IN ('OFFLINE_SESSION_BEGIN', 'OFFLINE_SESSION_END') \
+               AND state IN ('OFFLINE_LOCAL_ACK', 'SENT', 'KVT1', 'KVT2', 'ACK')",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        self.session_has_begin = issued_boundaries
+            .iter()
+            .any(|(dt,)| dt == "OFFLINE_SESSION_BEGIN");
+        self.session_has_end = issued_boundaries
+            .iter()
+            .any(|(dt,)| dt == "OFFLINE_SESSION_END");
     }
 
     /// **U1 A1 funnel wrapper — `read_seed_fixture`.**  The tagged primitive for

@@ -2551,6 +2551,87 @@ async fn teeth_o1_online_convergence_drives_sent_to_ack() {
     );
 }
 
+/// B10 TEETH CANARY — the model's DocType=10 END-mint prediction is LOAD-BEARING:
+/// a drain that finalizes a bound-shift offline backlog mints an END (`{…, N:Ack}`)
+/// as the LAST offline doc, and the model MUST predict it or the ledger-delta
+/// differential reddens.
+///
+/// The regression `Crash(Sign), RepeatReboot, GoOnline([Ack,Ack])` builds a
+/// drainable offline backlog with NO preceding BEGIN (the harness `crash_after_sign`
+/// stages an offline SELL DIRECTLY, bypassing the `inline::run` BEGIN hoist — a
+/// production-UNREACHABLE state).  The real drain STILL mints the END
+/// (`ensure_and_drain_session_end` gates only on shift-presence, not BEGIN), so
+/// reality ends `{1:Ack, 2:Ack}`.  This canary proves BOTH directions on that
+/// exact real ledger:
+///   - the CORRECT model (`!session_has_end` END-mint gate) predicts the END →
+///     `check_ledger_delta` is `Ok`;
+///   - a BROKEN model that SUPPRESSES the END mint (as if the `drain_backlog`
+///     END-mint arm were reverted) predicts one fewer doc → `check_ledger_delta`
+///     is `Err`.
+///
+/// Revert target: the `if !self.session_has_end { … mint END … }` arm in
+/// `RefModel::drain_backlog` (model.rs). Restoring the old `session_has_begin &&`
+/// gate (or dropping the END mint) makes the CORRECT-model half predict `{1:Ack}`
+/// against the real `{1:Ack, 2:Ack}` → the harness `check_ledger_delta` at
+/// `invariant_fuzzer.rs:1568` REDs (exactly the divergence this canary re-derives).
+#[tokio::test]
+async fn teeth_b10_reverted_begin_chain_reddens_ledger_delta() {
+    // Drive the exact regression prefix on a REAL offline ctx: a crashed offline
+    // SELL (no BEGIN — direct-stage bypass), then reboot recovers it to OLA.
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let mut model = RefModel::new_offline_open_shift(3);
+
+    let _ = interp::run_op(&mut ctx, &Op::Crash(Stage::Sign)).await;
+    let _ = model.apply(&Op::Crash(Stage::Sign)); // Fault
+    let _ = interp::run_op(&mut ctx, &Op::RepeatReboot).await;
+    let _ = model.apply(&Op::RepeatReboot); // Fault
+
+    // Post-fault re-sync (mirrors the harness FaultOrRecovery arm): adopts the
+    // real ledger + the B10 boundary flags.  No BEGIN / END exists yet here.
+    model.adopt_fault_deferred(&ctx.pool).await;
+    assert!(
+        !model.session_has_end,
+        "canary setup: no END has been minted before the finalizing GoOnline"
+    );
+
+    // The finalizing drain: reality mints the END (`{1:Ack, 2:Ack}`).
+    let mut correct = model.clone();
+    let _ = correct.apply(&Op::GoOnline(DpsScript::ack_path())); // predicts the END
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::ack_path())).await;
+    let real_ledger = ctx.read_ledger().await;
+
+    // (1) The CORRECT model (END predicted) MATCHES reality.
+    assert!(
+        oracle::check_ledger_delta(&correct.docs, &real_ledger).is_ok(),
+        "B10 teeth (positive): the END-predicting model must MATCH the real \
+         end-of-drain ledger {real_ledger:?} — got model {:?}",
+        correct.docs
+    );
+    // Reality really did mint the END (2 docs), not a vacuous 1-doc match.
+    assert_eq!(
+        real_ledger.len(),
+        2,
+        "B10 teeth: the finalizing drain must mint the DocType=10 END as a SECOND \
+         Ack doc (real ledger {real_ledger:?})"
+    );
+
+    // (2) A BROKEN model that SUPPRESSES the END mint (session_has_end forced
+    // true before the drain, as a reverted END-mint arm would leave it) predicts
+    // one fewer doc → the ledger-delta differential REDDENS.  This is the tooth:
+    // without the model's independent END prediction, the divergence is caught.
+    let mut broken = model.clone();
+    broken.session_has_end = true; // suppress the END-mint prediction
+    let _ = broken.apply(&Op::GoOnline(DpsScript::ack_path()));
+    assert!(
+        oracle::check_ledger_delta(&broken.docs, &real_ledger).is_err(),
+        "B10 teeth (negative): a model that does NOT predict the END must DIVERGE \
+         from the real 2-doc ledger — if this is Ok, the END-mint prediction is \
+         vacuous and a reverted production END-mint would slip past the fuzzer \
+         (model {:?} vs real {real_ledger:?})",
+        broken.docs
+    );
+}
+
 /// O2 NEGATIVE tooth: a crash-completed offline sell AGREES with the
 /// deterministic, DB-read-independent prediction (the slice is non-vacuous AND
 /// not over-strict).  An Offline-node `Crash(Send)` never reaches the wire → it

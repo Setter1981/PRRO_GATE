@@ -703,15 +703,16 @@ async fn offline_sell_is_offline_local_ack_success() {
 
 /// **B10 no-code refusal (re-derived).** With NO offline code seeded, the FIRST
 /// offline SELL of the session lazily tries to mint the DocType=9 BEGIN — but the
-/// BEGIN itself needs a code.  So it is the **BEGIN** (not the SELL) that hits the
-/// empty pool: it signs ONLINE-SHAPED (unstamped, bare `<MAC>`), `stage_offline_ack`
-/// aborts it terminally (`SIGNED → Aborted`, B9 bare-MAC abort), and
-/// `ensure_offline_session_begin` fail-closes the SELL with a RETRYABLE 503
-/// (`OFFLINE_SESSION_BEGIN_PENDING`) — the operator replenishes the pool
-/// (seed-codes / T=112) and retries.  Pre-B10 this test saw the SELL abort with
-/// `OFFLINE_UNSTAMPED_BARE_MAC_ABORTED` (500); B10 moves the empty-pool encounter
-/// to the BEGIN and surfaces it as the retryable 503 (chain-fork-safe: no SELL row
-/// is minted against a non-issued BEGIN).
+/// BEGIN itself needs a code.  The `ensure_offline_session_begin` **pre-mint
+/// fail-closed guard** sees the empty pool and refuses the whole op RETRYABLE
+/// (503 `OFFLINE_SESSION_BEGIN_PENDING`) **WITHOUT minting a bare BEGIN** that
+/// would only abort — keeping the empty-pool case clean (no aborted-BEGIN doc
+/// churn, matching the pre-B10 offline shift-lifecycle pre-mint refusal spirit).
+/// The operator replenishes the pool (seed-codes / T=112) and retries.  Pre-B10
+/// this test saw the SELL abort with `OFFLINE_UNSTAMPED_BARE_MAC_ABORTED` (500);
+/// B10 moves the empty-pool encounter to the BEGIN pre-mint guard and surfaces it
+/// as the retryable 503 (chain-fork-safe: NEITHER a BEGIN nor a SELL row is minted
+/// on the empty pool).
 #[tokio::test]
 async fn offline_no_code_aborts_begin_and_returns_retryable_refusal() {
     let pool = fresh_pool().await;
@@ -736,19 +737,20 @@ async fn offline_no_code_aborts_begin_and_returns_retryable_refusal() {
         .await
         .expect_err("a no-code offline sell must be refused, not issued");
 
-    // (1) The ONLY minted row is the BEGIN, and it rests in the non-issued
-    // TERMINAL `Aborted` (bare-MAC abort) — NOT a stuck SIGNED orphan; NO SELL row
-    // was minted (it never reached acquire — the BEGIN gate fail-closed first).
-    let begin_state: String = sqlx::query_scalar(
-        "SELECT state FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN'",
+    // (1) The pre-mint guard refuses BEFORE any row is minted: NO BEGIN doc
+    // (the empty pool never produces a bare BEGIN that would only abort — no
+    // aborted-BEGIN churn) and NO SELL row (it never reached acquire — the BEGIN
+    // gate fail-closed first). Chain-fork-safe on both sides.
+    let begin_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN'",
     )
     .bind(FN)
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(
-        begin_state, "ABORTED",
-        "the no-code BEGIN aborts terminally (bare-MAC)"
+        begin_rows, 0,
+        "no BEGIN row minted on the empty pool — the guard refuses PRE-mint (no aborted-BEGIN churn)"
     );
     let sell_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'SELL'",
