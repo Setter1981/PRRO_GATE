@@ -25,6 +25,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
@@ -200,6 +201,407 @@ pub fn check_ledger_delta(
         )));
     }
     Ok(())
+}
+
+/// Z aggregation oracle — independent from `runtime::ingress::convert`.
+///
+/// Reads the latest Z/close-shift document and the issued SELL/RETURN receipts
+/// in that same shift, then recomputes the signer-ready Z payload shape from
+/// persisted receipt payloads + persisted signing snapshots.  This catches the
+/// fiscally expensive class where the state machine is correct but Z turnover /
+/// tax totals are silently wrong.
+pub async fn check_latest_z_aggregation(pool: &SqlitePool) -> Result<(), Divergence> {
+    let z_payload: Option<String> = sqlx::query_scalar(
+        "SELECT payload_json \
+         FROM fiscal_documents \
+         WHERE doc_type IN ('Z_REPORT','SHIFT_CLOSE') \
+         ORDER BY lnd DESC \
+         LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| Divergence(format!("Z oracle: latest Z query failed: {e}")))?;
+    let z_payload = z_payload.ok_or_else(|| {
+        Divergence("Z oracle: no Z_REPORT/SHIFT_CLOSE document found".to_string())
+    })?;
+
+    let receipt_rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "WITH latest_z AS ( \
+             SELECT shift_id \
+             FROM fiscal_documents \
+             WHERE doc_type IN ('Z_REPORT','SHIFT_CLOSE') \
+             ORDER BY lnd DESC \
+             LIMIT 1 \
+         ) \
+         SELECT d.doc_type, d.payload_json, s.payload_json \
+         FROM fiscal_documents d \
+         JOIN latest_z z ON d.shift_id = z.shift_id \
+         LEFT JOIN signing_config_snapshots s ON s.id = d.signing_config_snapshot_id \
+         WHERE d.doc_type IN ('SELL','RETURN') \
+           AND d.state IN ('ACK','OFFLINE_LOCAL_ACK') \
+         ORDER BY d.lnd",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Divergence(format!("Z oracle: receipt query failed: {e}")))?;
+
+    check_z_payload_against_receipts(&z_payload, &receipt_rows)
+}
+
+#[derive(Debug, Clone)]
+struct ReceiptForZ {
+    doc_type: String,
+    payload_json: String,
+    snapshot_json: Option<String>,
+}
+
+impl From<&(String, String, Option<String>)> for ReceiptForZ {
+    fn from(row: &(String, String, Option<String>)) -> Self {
+        Self {
+            doc_type: row.0.clone(),
+            payload_json: row.1.clone(),
+            snapshot_json: row.2.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct ZPayload {
+    payments: Vec<ZPayment>,
+    #[serde(default)]
+    tax_summaries: Vec<ZTaxSummary>,
+    sell_count: u32,
+    return_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+struct ZPayment {
+    name: String,
+    sum_in_kop: i64,
+    sum_out_kop: i64,
+    type_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+struct ZTaxSummary {
+    tx: i64,
+    tx_short_form: bool,
+    txpr: String,
+    txal: i64,
+    txty: i64,
+    dtpr: String,
+    smi: i64,
+    smo: i64,
+    txi: i64,
+    txo: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredCheckForZ {
+    items: Vec<StoredItemForZ>,
+    payments: Vec<StoredPaymentForZ>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredItemForZ {
+    #[serde(default)]
+    tax_group_1: Option<i64>,
+    sum_kop: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredPaymentForZ {
+    name: String,
+    sum_kop: i64,
+    type_code: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SnapshotForZ {
+    #[serde(default)]
+    driver_mapping: Vec<DriverMappingForZ>,
+    groups: Vec<TaxGroupForZ>,
+    kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DriverMappingForZ {
+    driver_number: i64,
+    canonical_tx_num: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct TaxGroupForZ {
+    tx: i64,
+    txpr_bps: i64,
+    dtpr_bps: i64,
+    txal: i64,
+    txty: i64,
+}
+
+struct TaxAccumForZ {
+    smi: i64,
+    smo: i64,
+    rate: Option<TaxGroupForZ>,
+    established: bool,
+}
+
+fn check_z_payload_against_receipts(
+    z_payload: &str,
+    rows: &[(String, String, Option<String>)],
+) -> Result<(), Divergence> {
+    let receipts: Vec<ReceiptForZ> = rows.iter().map(ReceiptForZ::from).collect();
+    let expected = expected_z_payload(&receipts)?;
+    let real: ZPayload = serde_json::from_str(z_payload)
+        .map_err(|e| Divergence(format!("Z oracle: Z payload JSON parse failed: {e}")))?;
+    if real != expected {
+        return Err(Divergence(format!(
+            "Z oracle: aggregated payload mismatch: real {real:?} != expected {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn expected_z_payload(receipts: &[ReceiptForZ]) -> Result<ZPayload, Divergence> {
+    let mut payments: BTreeMap<(String, String), (i64, i64)> = BTreeMap::new();
+    let mut tax: BTreeMap<i64, TaxAccumForZ> = BTreeMap::new();
+    let mut sell_count = 0_u32;
+    let mut return_count = 0_u32;
+
+    for receipt in receipts {
+        let is_sell = match receipt.doc_type.as_str() {
+            "SELL" => {
+                sell_count += 1;
+                true
+            }
+            "RETURN" => {
+                return_count += 1;
+                false
+            }
+            other => {
+                return Err(Divergence(format!(
+                    "Z oracle: unexpected shift receipt doc_type {other:?}"
+                )))
+            }
+        };
+        let parsed: StoredCheckForZ = serde_json::from_str(&receipt.payload_json).map_err(|e| {
+            Divergence(format!(
+                "Z oracle: stored receipt payload parse failed for {}: {e}",
+                receipt.doc_type
+            ))
+        })?;
+        for payment in parsed.payments {
+            if payment.sum_kop < 0 {
+                return Err(Divergence(format!(
+                    "Z oracle: negative stored payment {} for type_code={} name={:?}",
+                    payment.sum_kop, payment.type_code, payment.name
+                )));
+            }
+            let key = (payment.type_code, payment.name);
+            let entry = payments.entry(key.clone()).or_insert((0, 0));
+            let target = if is_sell { &mut entry.0 } else { &mut entry.1 };
+            *target = target.checked_add(payment.sum_kop).ok_or_else(|| {
+                Divergence(format!(
+                    "Z oracle: payment sum overflow for type_code={} name={:?}",
+                    key.0, key.1
+                ))
+            })?;
+        }
+
+        let snapshot = match &receipt.snapshot_json {
+            Some(raw) => {
+                let snapshot: SnapshotForZ = serde_json::from_str(raw).map_err(|e| {
+                    Divergence(format!("Z oracle: signing snapshot parse failed: {e}"))
+                })?;
+                if snapshot.kind != "check_tax_mapping_v1" {
+                    return Err(Divergence(format!(
+                        "Z oracle: unsupported signing snapshot kind {:?}",
+                        snapshot.kind
+                    )));
+                }
+                Some(snapshot)
+            }
+            None => None,
+        };
+
+        for item in parsed.items {
+            let Some(driver_tx) = item.tax_group_1 else {
+                continue;
+            };
+            let canonical_tx = snapshot
+                .as_ref()
+                .and_then(|s| resolve_driver_tx_for_z(s, driver_tx))
+                .unwrap_or(driver_tx);
+            let rate = snapshot
+                .as_ref()
+                .and_then(|s| s.groups.iter().find(|g| g.tx == canonical_tx).cloned());
+            let accum = tax.entry(canonical_tx).or_insert(TaxAccumForZ {
+                smi: 0,
+                smo: 0,
+                rate: None,
+                established: false,
+            });
+            if !accum.established {
+                accum.rate = rate;
+                accum.established = true;
+            } else if accum.rate != rate {
+                return Err(Divergence(format!(
+                    "Z oracle: tax snapshot drift for tx={canonical_tx}"
+                )));
+            }
+            let target = if is_sell {
+                &mut accum.smi
+            } else {
+                &mut accum.smo
+            };
+            *target = target.checked_add(item.sum_kop).ok_or_else(|| {
+                Divergence(format!("Z oracle: tax sum overflow for tx={canonical_tx}"))
+            })?;
+        }
+    }
+
+    let payments = payments
+        .into_iter()
+        .map(|((type_code, name), (sum_in_kop, sum_out_kop))| ZPayment {
+            name,
+            sum_in_kop,
+            sum_out_kop,
+            type_code,
+        })
+        .collect();
+    let tax_summaries = tax
+        .into_iter()
+        .map(|(tx, accum)| z_tax_summary(tx, accum))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ZPayload {
+        payments,
+        tax_summaries,
+        sell_count,
+        return_count,
+    })
+}
+
+fn resolve_driver_tx_for_z(snapshot: &SnapshotForZ, driver_tx: i64) -> Option<i64> {
+    snapshot
+        .driver_mapping
+        .iter()
+        .find(|m| m.driver_number == driver_tx)
+        .map(|m| m.canonical_tx_num)
+}
+
+fn z_tax_summary(tx: i64, accum: TaxAccumForZ) -> Result<ZTaxSummary, Divergence> {
+    match accum.rate {
+        Some(rate) => {
+            let txi = if accum.smi == 0 {
+                0
+            } else {
+                calc_tax_included_for_z(accum.smi, &rate)?.0
+            };
+            let txo = if accum.smo == 0 {
+                0
+            } else {
+                calc_tax_included_for_z(accum.smo, &rate)?.0
+            };
+            Ok(ZTaxSummary {
+                tx,
+                tx_short_form: false,
+                txpr: format_bps(rate.txpr_bps),
+                txal: rate.txal,
+                txty: rate.txty,
+                dtpr: format_bps(rate.dtpr_bps),
+                smi: accum.smi,
+                smo: accum.smo,
+                txi,
+                txo,
+            })
+        }
+        None => Ok(ZTaxSummary {
+            tx,
+            tx_short_form: true,
+            txpr: String::new(),
+            txal: 0,
+            txty: 0,
+            dtpr: String::new(),
+            smi: accum.smi,
+            smo: accum.smo,
+            txi: 0,
+            txo: 0,
+        }),
+    }
+}
+
+fn calc_tax_included_for_z(sum_kop: i64, rate: &TaxGroupForZ) -> Result<(i64, i64), Divergence> {
+    let txpr = rate.txpr_bps as f64 / 100.0;
+    let dtpr = rate.dtpr_bps as f64 / 100.0;
+    if txpr < 0.0 || dtpr < 0.0 {
+        return Err(Divergence(format!(
+            "Z oracle: negative tax rate txpr_bps={} dtpr_bps={}",
+            rate.txpr_bps, rate.dtpr_bps
+        )));
+    }
+    let g = sum_kop as f64;
+    match rate.txal {
+        0 => {
+            let tx = if txpr > 0.0 {
+                bankers_round_for_z(g * txpr / (100.0 + txpr))
+            } else {
+                0
+            };
+            Ok((tx, 0))
+        }
+        1 => {
+            let dt = if dtpr > 0.0 {
+                bankers_round_for_z(g * dtpr / 100.0)
+            } else {
+                0
+            };
+            let tx = if txpr > 0.0 {
+                bankers_round_for_z((g + dt as f64) * txpr / (100.0 + txpr))
+            } else {
+                0
+            };
+            Ok((tx, dt))
+        }
+        2 => {
+            let dt = if dtpr > 0.0 {
+                bankers_round_for_z(g * dtpr / (100.0 + dtpr))
+            } else {
+                0
+            };
+            let tx = if txpr > 0.0 {
+                bankers_round_for_z((g - dt as f64) * txpr / (100.0 + txpr))
+            } else {
+                0
+            };
+            Ok((tx, dt))
+        }
+        other => Err(Divergence(format!(
+            "Z oracle: unsupported TXAL {other} for tx={}",
+            rate.tx
+        ))),
+    }
+}
+
+fn bankers_round_for_z(x: f64) -> i64 {
+    let floor = x.floor();
+    let diff = x - floor;
+    if diff < 0.5 {
+        floor as i64
+    } else if diff > 0.5 {
+        (floor + 1.0) as i64
+    } else {
+        let f = floor as i64;
+        if f % 2 == 0 {
+            f
+        } else {
+            f + 1
+        }
+    }
+}
+
+fn format_bps(bps: i64) -> String {
+    format!("{}.{:02}", bps / 100, (bps % 100).abs())
 }
 
 // ── Layer 2 — quiescent-boundary scan ───────────────────────────────────────
@@ -467,4 +869,46 @@ pub async fn check_mirrors(pool: &SqlitePool) -> Result<(), Divergence> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn taxable_receipt_rows() -> Vec<(String, String, Option<String>)> {
+        vec![(
+            "SELL".to_string(),
+            r#"{"items":[{"tax_group_1":1,"sum_kop":15000}],"payments":[{"name":"Cash","sum_kop":15000,"type_code":"0"}]}"#
+                .to_string(),
+            Some(
+                r#"{"driver_mapping":[],"groups":[{"dtpr_bps":0,"tx":1,"txal":0,"txpr_bps":2000,"txty":0}],"kind":"check_tax_mapping_v1"}"#
+                    .to_string(),
+            ),
+        )]
+    }
+
+    #[test]
+    fn z_aggregation_oracle_accepts_independently_computed_taxable_payload() {
+        let z = r#"{"payments":[{"name":"Cash","sum_in_kop":15000,"sum_out_kop":0,"type_code":"0"}],"tax_summaries":[{"tx":1,"tx_short_form":false,"txpr":"20.00","txal":0,"txty":0,"dtpr":"0.00","smi":15000,"smo":0,"txi":2500,"txo":0}],"sell_count":1,"return_count":0}"#;
+        check_z_payload_against_receipts(z, &taxable_receipt_rows())
+            .expect("matching taxable Z payload must pass");
+    }
+
+    #[test]
+    fn z_aggregation_oracle_catches_payment_drift() {
+        let z = r#"{"payments":[{"name":"Cash","sum_in_kop":14999,"sum_out_kop":0,"type_code":"0"}],"tax_summaries":[{"tx":1,"tx_short_form":false,"txpr":"20.00","txal":0,"txty":0,"dtpr":"0.00","smi":15000,"smo":0,"txi":2500,"txo":0}],"sell_count":1,"return_count":0}"#;
+        assert!(
+            check_z_payload_against_receipts(z, &taxable_receipt_rows()).is_err(),
+            "wrong Z payment turnover must fail the oracle"
+        );
+    }
+
+    #[test]
+    fn z_aggregation_oracle_catches_tax_drift() {
+        let z = r#"{"payments":[{"name":"Cash","sum_in_kop":15000,"sum_out_kop":0,"type_code":"0"}],"tax_summaries":[{"tx":1,"tx_short_form":false,"txpr":"20.00","txal":0,"txty":0,"dtpr":"0.00","smi":15000,"smo":0,"txi":2499,"txo":0}],"sell_count":1,"return_count":0}"#;
+        assert!(
+            check_z_payload_against_receipts(z, &taxable_receipt_rows()).is_err(),
+            "wrong Z TXS amount must fail the oracle"
+        );
+    }
 }

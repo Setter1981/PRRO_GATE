@@ -32,7 +32,8 @@ use prro::db::models::enums::{
 };
 use prro::db::models::ids::{CashierId, OfflineSessionId, RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
-use prro::db::repositories::{fiscal_documents, offline_sessions};
+use prro::db::repositories::tax_groups::NewTaxGroup;
+use prro::db::repositories::{fiscal_documents, offline_sessions, tax_groups};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::{open_pool, open_secure_pool};
 use prro::services::offline_sync::{backlog_drain, return_online_probe};
@@ -56,6 +57,7 @@ const CASHIER: &str = "test-cashier";
 const DRIVER: &str = "drv-test";
 const SERVER_FISCAL_NO: &str = "DPS-FN-ONLINE-1";
 const SELL_PAYLOAD: &str = r#"{"items":[{"code":"item-1","name":"Test item","price_kop":15000,"quantity_thousandths":1000,"sum_kop":15000}],"payments":[{"name":"Cash","sum_kop":15000,"type_code":"0"}]}"#;
+const TAXABLE_PAYLOAD: &str = r#"{"items":[{"code":"tax-1","name":"Taxed item","price_kop":15000,"quantity_thousandths":1000,"sum_kop":15000,"tax_group_1":1}],"payments":[{"name":"Cash","sum_kop":15000,"type_code":"0"}]}"#;
 const TOTAL_KOP: i64 = 15000;
 /// Live SHIFT_OPEN payload consumed by stage_sign's `ShiftOpenJson`.
 const SHIFT_OPEN_PAYLOAD: &str = r#"{"opening_sum_kop":0}"#;
@@ -407,6 +409,47 @@ impl FuzzCtx {
         seed_inbox_keyed(&self.pool, &idem, "RETURN").await
     }
 
+    async fn seed_inbox_taxable(&mut self, operation_type: &str) -> InboxRow {
+        let idem = self.next_idem();
+        seed_inbox_keyed_payload(
+            &self.pool,
+            &idem,
+            operation_type,
+            TAXABLE_PAYLOAD,
+            Some(TOTAL_KOP),
+        )
+        .await
+    }
+
+    /// Test-only tax fixture for Z aggregation: tax group 1 is 20% VAT-included
+    /// and maps identity from the driver payload into the canonical snapshot.
+    pub async fn seed_tax_group_20_percent(&self) {
+        tax_groups::insert(
+            &self.pool_secure,
+            &NewTaxGroup {
+                fn_id: FN.to_string(),
+                tx_num: 1,
+                letter: "A".to_string(),
+                dtpr: 0.0,
+                txpr: 20.0,
+                txal: 0,
+                txty: 0,
+            },
+        )
+        .await
+        .expect("seed tax group 1");
+    }
+
+    pub async fn run_taxable_online_sell(&mut self, script: &DpsScript) -> RealOutcome {
+        let row = self.seed_inbox_taxable("SELL").await;
+        run_inline_row(self, row, Some(script)).await
+    }
+
+    pub async fn run_taxable_online_return(&mut self, script: &DpsScript) -> RealOutcome {
+        let row = self.seed_inbox_taxable("RETURN").await;
+        run_inline_row(self, row, Some(script)).await
+    }
+
     /// Seed a live `SHIFT_OPEN` inbox row (opening payload, no total).
     async fn seed_inbox_shift_open(&mut self) -> InboxRow {
         let idem = self.next_idem();
@@ -708,6 +751,37 @@ async fn online_sell(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
         Ok(_outcome) => {
             let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
             ctx.last_row = Some(row); // remember for DuplicateIdemKey replay
+            RealOutcome::Doc(observed)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+async fn run_inline_row(
+    ctx: &mut FuzzCtx,
+    row: InboxRow,
+    script: Option<&DpsScript>,
+) -> RealOutcome {
+    let dps = ctx.new_dps();
+    if let Some(script) = script {
+        load_script(&dps, script);
+    }
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_outcome) => {
+            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
+            ctx.last_row = Some(row);
             RealOutcome::Doc(observed)
         }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),

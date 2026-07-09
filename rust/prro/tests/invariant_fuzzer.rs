@@ -982,6 +982,43 @@ async fn differential_online_z_report_ack_notfound_holds_sent_and_closes_shift()
     );
 }
 
+/// Z-tax oracle pin: two taxable receipts in the shift (SELL + RETURN, both
+/// group 1 at 20% VAT-included) must aggregate into the Z payload with matching
+/// payment turnover and TXS totals.  The oracle recomputes from persisted
+/// receipt payloads + signing snapshot JSON, not from the production aggregator.
+#[tokio::test]
+async fn z_aggregation_oracle_checks_taxable_sell_return_turnover() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    ctx.seed_tax_group_20_percent().await;
+    let mut model = RefModel::new_online_open_shift();
+
+    let sell_script = DpsScript::ack_path();
+    let sell_op = Op::OnlineSell(sell_script.clone());
+    let prior_tip = ctx.read_seed().await;
+    let expected = model.apply(&sell_op);
+    let real = ctx.run_taxable_online_sell(&sell_script).await;
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("taxable online SELL must match model: {d:?}"));
+
+    let return_script = DpsScript::ack_path();
+    let return_op = Op::OnlineReturn(return_script.clone());
+    let prior_tip = ctx.read_seed().await;
+    let expected = model.apply(&return_op);
+    let real = ctx.run_taxable_online_return(&return_script).await;
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("taxable online RETURN must match model: {d:?}"));
+
+    let z_op = Op::OnlineZReport(DpsScript::ack_path());
+    let prior_tip = ctx.read_seed().await;
+    let expected = model.apply(&z_op);
+    let real = interp::run_op(&mut ctx, &z_op).await;
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("taxable online Z_REPORT must match model: {d:?}"));
+    oracle::check_latest_z_aggregation(&ctx.pool)
+        .await
+        .unwrap_or_else(|d| panic!("taxable Z aggregation oracle must pass: {d:?}"));
+}
+
 /// Tier-1 slice 2 seed — offline Z_REPORT local-acks through the production
 /// path and moves the shift into ClosingLocalPendingDrain.
 #[tokio::test]
@@ -1808,6 +1845,11 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                         prior_tip,
                         "B3: recovered drain/go-online {op:?} re-advanced the MAC seed"
                     );
+                }
+                if matches!(op, Op::OnlineZReport(_) | Op::OfflineZReport) {
+                    if let Err(d) = oracle::check_latest_z_aggregation(&ctx.pool).await {
+                        panic!("Z aggregation oracle on {op:?}: {d:?}");
+                    }
                 }
             }
             // No mutation — the differential is permissive here, so the harness
