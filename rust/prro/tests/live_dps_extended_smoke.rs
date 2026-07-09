@@ -2932,3 +2932,409 @@ async fn live_smoke_9_offline_drain_mac_id() {
          (server_fiscal_no={server_fiscal_no:?}), NO -9 \"not ID in MAC\". INV-11 closed live."
     );
 }
+
+// ── Live recovery — close a DANGLING offline session (DocType=10 END) ────────
+//
+// Gate: feature `live-dps` (file-level) + `#[ignore]` + `PRRO_LIVE_DPS=1` + a
+// real JKS (this CONTACTS live DPS: reads the chain tip, then SENDS a signed
+// DocType=10 END).  The full triple gate applies.
+//
+// ── Env contract (recovery-specific) ────────────────────────────────────────
+/// The offline `<MAC ID>` code the recovery END carries.  Default is the run-3
+/// END code (`eYme-jhnkWQ`) — the code that WAS acquired for the original END
+/// but is UNCONSUMED at DPS because that END was terminal-rejected (so the code
+/// is still valid to spend on the recovery END).  Operator-overridable: if DPS
+/// rejects `eYme-jhnkWQ` as already-attempted, set this to a fresh T=112 code.
+const ENV_RECOVER_CODE: &str = "PRRO_LIVE_DPS_RECOVER_CODE";
+/// Fallback recovery code (the run-3 END code).
+const DEFAULT_RECOVER_CODE: &str = "eYme-jhnkWQ";
+/// The END's `<DAT DI>` / wire `local_number`.  Operator-overridable so a retry
+/// can advance the DI if DPS rejects a duplicate.  Default `9` mirrors the
+/// canonical END position in the [BEGIN, SHIFT_OPEN, SELL, END] backlog shape
+/// (DI is the boundary doc's local number; smoke 9's END unit-test uses `9`).
+const ENV_RECOVER_DI: &str = "PRRO_LIVE_DPS_RECOVER_DI";
+const DEFAULT_RECOVER_DI: u32 = 9;
+
+/// Resolve the recovery `<MAC ID>` code (env override → run-3 default).
+fn resolve_recover_code() -> String {
+    std::env::var(ENV_RECOVER_CODE).unwrap_or_else(|_| DEFAULT_RECOVER_CODE.to_string())
+}
+
+/// Resolve the recovery DI (env override → default 9).
+fn resolve_recover_di() -> u32 {
+    std::env::var(ENV_RECOVER_DI)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_RECOVER_DI)
+}
+
+/// Convert a UTC ISO-8601 `business_ts` to Kyiv-local `YYYYMMDDHHMMSS` — the
+/// `<TS>` string the signed END carries.  Reproduces production
+/// `stage_sign::format_kyiv_local` verbatim (that fn is private) so the signed
+/// `<TS>` matches what the real drain would emit.
+fn recover_kyiv_ts_str(business_ts: &str) -> String {
+    use chrono::{DateTime, Utc};
+    use chrono_tz::Europe::Kiev;
+    let dt: DateTime<Utc> = business_ts
+        .parse::<DateTime<Utc>>()
+        .expect("recovery business_ts must be a valid RFC-3339 timestamp");
+    dt.with_timezone(&Kiev).format("%Y%m%d%H%M%S").to_string()
+}
+
+/// Convert a UTC ISO-8601 `business_ts` to the DPS "Kyiv-local-as-epoch" wire
+/// value — the `CheckEnvelope.date_time` the END is sent with.  Reproduces
+/// production `stage_send::kyiv_local_epoch` verbatim (that fn is private) so
+/// the wire `date_time` matches what the real drain would send and stays
+/// CONSISTENT with the signed `<TS>` (both derive from the SAME instant).
+fn recover_kyiv_local_epoch(business_ts: &str) -> i64 {
+    use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
+    use chrono_tz::Europe::Kiev;
+    let dt: DateTime<Utc> = business_ts
+        .parse::<DateTime<Utc>>()
+        .expect("recovery business_ts must be a valid RFC-3339 timestamp");
+    let kyiv = dt.with_timezone(&Kiev);
+    // Re-interpret the Kyiv-local digits as if they were UTC → the epoch DPS
+    // expects (matches stage_send::kyiv_local_epoch byte-for-byte).
+    Utc.with_ymd_and_hms(
+        kyiv.year(),
+        kyiv.month(),
+        kyiv.day(),
+        kyiv.hour(),
+        kyiv.minute(),
+        kyiv.second(),
+    )
+    .single()
+    .expect("Kyiv-local components must be an unambiguous instant")
+    .timestamp()
+}
+
+/// **Live recovery — close a DANGLING offline session via DocType=10 END**.
+///
+/// WHY: live smoke 9 proved `-5` cleared (BEGIN + offline SHIFT_OPEN + SELL all
+/// ACK'd on real DPS), but the drain-finalize DocType=10 END was
+/// terminal-rejected → the offline session was left OPEN on the DPS cabinet
+/// (post `statusRro` showed `open_shift=true online=false`).  An open offline
+/// session does NOT expire on DPS — it hangs until a valid DocType=10 END
+/// closes it, and it now blocks `T=112` with `-16`.  This routine closes it.
+///
+/// The top hypothesis for the original reject is a STALE `previous_hash`: the
+/// END was sent immediately after the content docs, before DPS's chain tip had
+/// settled (the SELL leg polls for tip-settle at ~:2508; the END did not).
+/// This routine FIXES that: it polls `last_chk` until the tip is STABLE across
+/// two consecutive reads, then chains the END's `previous_hash` off that
+/// settled tip.
+///
+/// FLOW:
+///   1. `live_armed` gate + `load_signing_key` (skip/return if not armed).
+///   2. Connect; read `status_rro` + `last_chk`; POLL `last_chk` until the tip
+///      is SETTLED (stable across 2 reads) → the settled tip hash (hex).
+///   3. Build a DocType=10 `<C T='110'>` END via the PRODUCTION builder
+///      (`CanonicalDoc::OfflineSessionEnd`): `previous_hash` = settled tip hex,
+///      `<MAC ID>` = `PRRO_LIVE_DPS_RECOVER_CODE`, `<TS>` = current Kyiv time,
+///      `DI` = `PRRO_LIVE_DPS_RECOVER_DI`.  Print the built `<C T='110'>` XML.
+///   4. Sign it with the LIVE key (ATTACHED CAdES-BES; same CMS block as
+///      T=112/SELL).
+///   5. `send_chk` it; PRINT the FULL DPS response (OK → assigned id;
+///      Err → exact `dps_code` + `message` — the END reject reason).
+///   6. `status_rro` again → print `open_shift`/`online` (session closed?).
+///   7. Assert: PASS if DPS ACCEPTS the END; on reject, fail LOUDLY with the
+///      code so we learn the real reject reason.
+///
+/// This is a TARGETED one-shot recovery: it does NOT boot the write-path or
+/// mutate any gateway DB — it hand-builds + signs + sends a single END, exactly
+/// as the drain would, but off the SETTLED tip.
+#[tokio::test]
+#[ignore = "live DPS endpoint required; opt-in via --features live-dps + --ignored + PRRO_LIVE_DPS=1"]
+async fn live_recover_close_dangling_offline_session() {
+    const NAME: &str = "Live recovery (close dangling offline session — DocType=10 END)";
+    if !live_armed(NAME) {
+        return;
+    }
+    let Some(ek) = load_signing_key(NAME) else {
+        return;
+    };
+    let host = resolve_host();
+    let fiscal_number = resolve_fn();
+    let tn = LIVE_TN;
+    let recover_code = resolve_recover_code();
+    let recover_di = resolve_recover_di();
+
+    println!("\n=== RECOVERY: close DANGLING offline session via DocType=10 END ===");
+    println!("FN: {fiscal_number}  TN: {tn}");
+    println!("Endpoint: {host}");
+    println!("Recovery <MAC ID> code: {recover_code}   DI: {recover_di}");
+    println!(
+        "Goal: DPS ACCEPTS a settled-chain DocType=10 END → the offline session \
+         CLOSES (online should flip to true)\n"
+    );
+
+    // ── Step 1: connect + read the CURRENT DPS state ───────────────────────
+    let channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        .await
+        .unwrap_or_else(|e| panic!("RECOVERY FAIL: GrpcDpsChannel::connect: {e:?}"));
+    let fn_sign = sign_fn_blob(&ek, &fiscal_number);
+
+    println!("--- PRE-STATE ---");
+    if let Ok(s) = channel.status_rro(&fn_sign).await {
+        println!(
+            "  pre statusRro: open_shift={} online={} last_signer={:?}",
+            s.open_shift, s.online, s.last_signer
+        );
+        if s.online {
+            println!(
+                "  NOTE: DPS reports online=true already — the session may ALREADY be \
+                 closed.  The END below will confirm (a duplicate END typically draws a \
+                 shift/session-state reject, which this routine will surface)."
+            );
+        }
+    }
+
+    // ── Step 2: read + SETTLE the current chain tip ────────────────────────
+    // Poll `last_chk` until the tip is STABLE across two consecutive reads, so
+    // the END's `previous_hash` chains off DPS's REAL current tip.  This is the
+    // fix for the original END reject (which chained off a not-yet-settled tip).
+    // Each read decodes `data_sign` (ATTACHED CMS) → sha256(eContent) = the hash
+    // the NEXT doc must carry in `<MAC>` (mirrors the SELL settle-poll at :2508).
+    println!("\n--- SETTLE CHAIN TIP (poll last_chk until stable across 2 reads) ---");
+    let settled_tip_hex: String = {
+        // Read the tip hash once; returns Some(hex) for a real tip, None for a
+        // genesis/empty chain, or on a decode miss (treated as "not yet
+        // readable" and retried).
+        async fn read_tip_hex(
+            channel: &GrpcDpsChannel,
+            fn_sign: &CheckSignBlob,
+        ) -> Result<Option<String>, DpsError> {
+            let ack = channel.last_chk(fn_sign).await?;
+            if ack.data_sign.is_empty() {
+                // Genesis / empty chain → the END would chain off an empty MAC.
+                return Ok(Some(String::new()));
+            }
+            match extract_econtent(&ack.data_sign) {
+                Ok(inner) => {
+                    let tip: [u8; 32] = Sha256::digest(&inner).into();
+                    Ok(Some(hex_lower(&tip)))
+                }
+                // data_sign present but not a parseable CMS — transient; retry.
+                Err(_) => Ok(None),
+            }
+        }
+
+        let mut prev: Option<String> = None;
+        let mut settled: Option<String> = None;
+        for attempt in 1..=20u32 {
+            match read_tip_hex(&channel, &fn_sign).await {
+                Ok(Some(tip)) => {
+                    println!(
+                        "  poll {attempt}: DPS tip = {}",
+                        if tip.is_empty() {
+                            "<genesis/empty>"
+                        } else {
+                            &tip
+                        }
+                    );
+                    if prev.as_ref() == Some(&tip) {
+                        // Stable across two consecutive reads → settled.
+                        println!(
+                            "  DPS tip SETTLED (stable across 2 reads) after {attempt} poll(s)"
+                        );
+                        settled = Some(tip);
+                        break;
+                    }
+                    prev = Some(tip);
+                }
+                Ok(None) => {
+                    println!("  poll {attempt}: tip not yet decodable — retry");
+                }
+                Err(DpsError::Server { code: -4, message }) => {
+                    println!(
+                        "RECOVERY SKIP: DPS rate-limit (-4) on last_chk: {message}. Cool down 5+ min."
+                    );
+                    return;
+                }
+                Err(DpsError::Transport(msg)) => {
+                    panic!("RECOVERY FAIL: Transport on last_chk: {msg}");
+                }
+                Err(e) => {
+                    println!("  poll {attempt}: last_chk non-fatal error (retry): {e:?}");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        match settled {
+            Some(tip) => tip,
+            None => {
+                println!(
+                    "RECOVERY SKIP: DPS chain tip did not stabilise within the poll window \
+                     (~100s) — cannot safely chain the END off a moving tip.  Re-run later."
+                );
+                return;
+            }
+        }
+    };
+    println!(
+        "  settled previous_hash for the END: {}",
+        if settled_tip_hex.is_empty() {
+            "<genesis/empty>"
+        } else {
+            &settled_tip_hex
+        }
+    );
+
+    // ── Step 3: build the DocType=10 END via the PRODUCTION builder ─────────
+    // One `business_ts` instant drives BOTH the signed `<TS>` (ts_str) and the
+    // wire `date_time` (fake-epoch), exactly as production stage_sign +
+    // stage_send do (both derive from the same `business_ts`).  The header
+    // carries `mac_id = Some(recover_code)` → `<MAC ID='{code}'>{prev_hash}` (B9
+    // offline shape), and `previous_hash` = the SETTLED tip.
+    println!("\n--- BUILD DocType=10 END (<C T='110'>) ---");
+    let business_ts = iso_now();
+    let ts_str = recover_kyiv_ts_str(&business_ts);
+    let date_time = recover_kyiv_local_epoch(&business_ts);
+
+    let mut end_header = prro::xml::DocumentHeader::with_defaults(
+        fiscal_number.clone(),
+        tn.to_string(),
+        // Z-report counter is not part of a boundary receipt's identity — the
+        // END is an empty service receipt (no <O>/<E>/<P>); 0 mirrors the
+        // canonical boundary unit tests.
+        0u32,
+        ts_str.clone(),
+        settled_tip_hex.clone(),
+    );
+    // B9 offline shape: the boundary doc carries the opaque DPS code as the
+    // `<MAC ID>` attribute (bare `<MAC>` draws -9 "not ID in MAC").
+    end_header.mac_id = Some(recover_code.clone());
+
+    let end_doc =
+        prro::xml::CanonicalDoc::OfflineSessionEnd(prro::xml::OfflineSessionBoundaryPayload {
+            header: end_header,
+            local_number: recover_di,
+        });
+    let end_xml_bytes = prro::xml::build_canonical_xml(&end_doc)
+        .expect("build_canonical_xml for DocType=10 END must succeed");
+    // The wire bytes are cp1251-encoded; the `<C T='110'>` / `<MAC ID>` region
+    // is ASCII so lossy-UTF8 is a faithful human-readable render.
+    println!(
+        "  END <C T='110'> XML ({} bytes, cp1251): {}",
+        end_xml_bytes.len(),
+        String::from_utf8_lossy(&end_xml_bytes)
+    );
+    println!("  END <TS>={ts_str}  wire date_time(fake-epoch)={date_time}");
+
+    // ── Step 4: sign with the LIVE key (ATTACHED CAdES-BES) ────────────────
+    // Same CmsSigner / Dstu4145WithGost34311Pb block as the T=112 / SELL path.
+    println!("\n--- SIGN END (native ATTACHED CAdES-BES, live key) ---");
+    let cert_der: &[u8] = ek
+        .signing_cert()
+        .expect("JKS must carry a signing certificate");
+    let curve = Curve::dstu_pb_257();
+    let d = FieldEl::from_le_bytes(&ek.param_d[..], curve.mod_words);
+    let signer_inner = DstuInProcessSigner::new(d);
+    let cms_signer_end = CmsSigner {
+        cert_der,
+        signer: &signer_inner,
+        profile: CmsProfile::Dstu4145WithGost34311Pb,
+    };
+    let end_signed = cms_signer_end
+        .sign_with(
+            &end_xml_bytes,
+            CmsBuildOptions {
+                attached: true,
+                signing_time: Some(SystemTime::now()),
+            },
+        )
+        .expect("END sign must succeed")
+        .cms_der;
+    // Confirm the ATTACHED CMS eContent == the canonical bytes we're closing on.
+    let econtent_ok = extract_econtent(&end_signed)
+        .map(|inner| inner == end_xml_bytes)
+        .unwrap_or(false);
+    println!(
+        "  END SIGNED: {} bytes (ATTACHED CMS; eContent==canonical XML: {econtent_ok})",
+        end_signed.len()
+    );
+
+    // ── Step 5: send the END + capture the FULL DPS response ───────────────
+    // DocType=110 → DpsCheckType::ServiceChk (typ 9/10 → PROTO 3), local_number
+    // = DI, id_offline = the recovery code (mirrors stage_send::build_send_
+    // envelope for an offline-drained boundary doc), date_time = fake-epoch.
+    println!("\n--- SEND END → live DPS ---");
+    let end_envelope = CheckEnvelope {
+        rro_fn: fiscal_number.clone(),
+        date_time,
+        check_sign: end_signed,
+        local_number: recover_di as i32,
+        check_type: DpsCheckType::ServiceChk,
+        id_offline: recover_code.clone(),
+        id_cancel: String::new(),
+    };
+
+    let mut accepted = false;
+    match channel.send_chk(end_envelope).await {
+        Ok(ack) => {
+            accepted = true;
+            println!(
+                "  END DPS OK — session CLOSED.  assigned id (server_fiscal_no)={:?}  \
+                 id_sign={} bytes  data_sign={} bytes",
+                ack.id,
+                ack.id_sign.len(),
+                ack.data_sign.len()
+            );
+        }
+        Err(DpsError::Server { code: -4, message }) => {
+            println!(
+                "RECOVERY SKIP: DPS rate-limit (-4) on END send_chk: {message}. Cool down 5+ min."
+            );
+            return;
+        }
+        Err(DpsError::Server { code, message }) => {
+            // THIS is the END reject reason we've been chasing — print it loudly.
+            println!(
+                "  END DPS REJECT — dps_code={code}  message={message:?}\n  \
+                 (this is the exact DocType=10 END reject reason; if code=-16 the session \
+                 is still open, if it names a MAC/hash issue the settled-tip fix needs \
+                 revisiting, if it names the offline code try a fresh PRRO_LIVE_DPS_RECOVER_CODE)"
+            );
+        }
+        Err(DpsError::Transport(msg)) => {
+            panic!("RECOVERY FAIL: Transport error on END send_chk: {msg}");
+        }
+        Err(e) => {
+            panic!("RECOVERY FAIL: unexpected error on END send_chk: {e:?}");
+        }
+    }
+
+    // ── Step 6: re-read state — did the session close? ─────────────────────
+    println!("\n--- POST-STATE ---");
+    let mut post_online: Option<bool> = None;
+    if let Ok(s) = channel.status_rro(&fn_sign).await {
+        post_online = Some(s.online);
+        println!(
+            "  post statusRro: open_shift={} online={} last_signer={:?}",
+            s.open_shift, s.online, s.last_signer
+        );
+        if s.online {
+            println!("  → online flipped TRUE: the dangling offline session is CLOSED.");
+        } else {
+            println!(
+                "  → online still FALSE: the session did NOT close (see the END reject code above)."
+            );
+        }
+    }
+
+    // ── Step 7: verdict ────────────────────────────────────────────────────
+    // PASS iff DPS ACCEPTED the END.  On reject we FAIL LOUDLY (the dps_code +
+    // message are printed above) so the operator learns the real reject reason.
+    assert!(
+        accepted,
+        "RECOVERY FAIL: DPS did NOT accept the DocType=10 END — the dangling offline \
+         session is STILL OPEN.  The exact dps_code + message are printed above (Step 5). \
+         If a MAC/hash reject, the tip had not truly settled; if an offline-code reject, \
+         retry with a fresh PRRO_LIVE_DPS_RECOVER_CODE."
+    );
+    println!(
+        "\nRECOVERY PASS: DPS ACCEPTED the settled-chain DocType=10 END — the dangling \
+         offline session is CLOSED (post online={:?}).  T=112 should no longer draw -16.",
+        post_online
+    );
+}
