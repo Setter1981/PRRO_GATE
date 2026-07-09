@@ -134,6 +134,15 @@ const ENV_JKS_PASS: &str = "PRRO_LIVE_DPS_JKS_PASS";
 /// the drain envelope `date_time` still agree — both derive from the same
 /// back-dated `business_ts`).
 const ENV_OFFLINE_BACKDATE_SEC: &str = "PRRO_LIVE_DPS_OFFLINE_BACKDATE_SEC";
+/// Recovery-probe knob (default OFF).  When `="1"`, the recovery tests DROP the
+/// held gRPC channel AFTER the chain-tip settle-poll and open a BRAND-NEW
+/// `GrpcDpsChannel::connect(...)` (fresh HTTP/2 connection) RIGHT BEFORE the
+/// recovery send.  Probes the hypothesis that DPS ties chain-validation state to
+/// the held connection: WebCheck opens a FRESH `Client` per attempt, we REUSE a
+/// single held `Channel` (grpc.rs) — a doc sent on a connection already used for
+/// the settle-poll `last_chk` reads may see a STALE per-connection chain view and
+/// draw `-8`.  When unset/OFF, behavior is byte-identical (single held channel).
+const ENV_RECONNECT_BEFORE_SEND: &str = "PRRO_LIVE_DPS_RECONNECT_BEFORE_SEND";
 
 const DEFAULT_HOST: &str = "https://cabinet.tax.gov.ua:9443";
 const DEFAULT_FN: &str = "4000162280";
@@ -3459,7 +3468,10 @@ async fn live_recover_close_dangling_offline_session() {
     );
 
     // ── Step 1: connect + read the CURRENT DPS state ───────────────────────
-    let channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+    // `mut` so the reconnect-before-send probe (Step 4b) can swap in a fresh
+    // channel; when the knob is OFF this binding is never reassigned, so the
+    // held-channel behavior is byte-identical to before.
+    let mut channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
         .await
         .unwrap_or_else(|e| panic!("RECOVERY FAIL: GrpcDpsChannel::connect: {e:?}"));
     let fn_sign = sign_fn_blob(&ek, &fiscal_number);
@@ -3629,6 +3641,25 @@ async fn live_recover_close_dangling_offline_session() {
         "  END SIGNED: {} bytes (ATTACHED CMS; eContent==canonical XML: {econtent_ok})",
         end_signed.len()
     );
+
+    // ── Step 4b: OPTIONAL reconnect-before-send probe (default OFF) ─────────
+    // When PRRO_LIVE_DPS_RECONNECT_BEFORE_SEND=1, drop the held channel (which
+    // served the settle-poll `last_chk` reads) and open a BRAND-NEW HTTP/2
+    // connection RIGHT BEFORE the send — mirrors WebCheck's fresh-Client-per-
+    // attempt.  The settle-poll above ran on the ORIGINAL held channel (that is
+    // the point: reads on the held connection, send on a fresh one).  Fresh
+    // connect mirrors Step 1 exactly (same host + SMOKE_TIMEOUT_SECS).
+    if std::env::var(ENV_RECONNECT_BEFORE_SEND).as_deref() == Ok("1") {
+        channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+            .await
+            .unwrap_or_else(|e| {
+                panic!("RECOVERY FAIL: reconnect-before-send GrpcDpsChannel::connect: {e:?}")
+            });
+        println!(
+            "RECONNECT-BEFORE-SEND: opened a fresh gRPC channel right before the END send \
+             (WebCheck new-Client-per-attempt parity)"
+        );
+    }
 
     // ── Step 5: send the END + capture the FULL DPS response ───────────────
     // DocType=110 → DpsCheckType::ServiceChk (typ 9/10 → PROTO 3), local_number
@@ -3878,7 +3909,10 @@ async fn live_recover_close_open_shift() {
     );
 
     // ── Step 1: connect + read the CURRENT DPS state ───────────────────────
-    let channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+    // `mut` so the reconnect-before-send probe (Step 4b) can swap in a fresh
+    // channel; when the knob is OFF this binding is never reassigned, so the
+    // held-channel behavior is byte-identical to before.
+    let mut channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
         .await
         .unwrap_or_else(|e| panic!("RECOVERY FAIL: GrpcDpsChannel::connect: {e:?}"));
     let fn_sign = sign_fn_blob(&ek, &fiscal_number);
@@ -4088,6 +4122,25 @@ async fn live_recover_close_open_shift() {
         "  Z SIGNED: {} bytes (ATTACHED CMS; eContent==canonical XML: {econtent_ok})",
         z_signed.len()
     );
+
+    // ── Step 4b: OPTIONAL reconnect-before-send probe (default OFF) ─────────
+    // When PRRO_LIVE_DPS_RECONNECT_BEFORE_SEND=1, drop the held channel (which
+    // served the settle-poll `last_chk` reads) and open a BRAND-NEW HTTP/2
+    // connection RIGHT BEFORE the send — mirrors WebCheck's fresh-Client-per-
+    // attempt.  The settle-poll above ran on the ORIGINAL held channel (that is
+    // the point: reads on the held connection, send on a fresh one).  Fresh
+    // connect mirrors Step 1 exactly (same host + SMOKE_TIMEOUT_SECS).
+    if std::env::var(ENV_RECONNECT_BEFORE_SEND).as_deref() == Ok("1") {
+        channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+            .await
+            .unwrap_or_else(|e| {
+                panic!("RECOVERY FAIL: reconnect-before-send GrpcDpsChannel::connect: {e:?}")
+            });
+        println!(
+            "RECONNECT-BEFORE-SEND: opened a fresh gRPC channel right before the Z send \
+             (WebCheck new-Client-per-attempt parity)"
+        );
+    }
 
     // ── Step 5: send the Z + capture the FULL DPS response ─────────────────
     // typCheck = ZReport (proto ZREPORT=2); local_number = DI; id_offline =
