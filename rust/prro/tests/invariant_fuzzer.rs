@@ -1133,6 +1133,79 @@ async fn differential_offline_z_report_drain_reject_escalates_edge14_rmr() {
     );
 }
 
+async fn assert_rmr_tombstone_no_fiscal_mutation(ctx: &mut interp::FuzzCtx, op: Op) {
+    let docs_before = ctx.observed_doc_count().await;
+    let next_lnd_before = ctx.read_next_lnd().await;
+    let seed_before = ctx.read_seed().await;
+    let codes_before = ctx.consumed_codes_count().await;
+    let sends_before = ctx.send_calls();
+
+    let _ = interp::run_op(ctx, &op).await;
+
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::RequiresManualReconciliation,
+        "RMR tombstone op {op:?} must leave shift in RMR"
+    );
+    assert_eq!(
+        ctx.observed_doc_count().await,
+        docs_before,
+        "RMR tombstone op {op:?} minted a fiscal_documents row"
+    );
+    assert_eq!(
+        ctx.read_next_lnd().await,
+        next_lnd_before,
+        "RMR tombstone op {op:?} allocated an lnd"
+    );
+    assert_eq!(
+        ctx.read_seed().await,
+        seed_before,
+        "RMR tombstone op {op:?} advanced the seed"
+    );
+    assert_eq!(
+        ctx.consumed_codes_count().await,
+        codes_before,
+        "RMR tombstone op {op:?} consumed an offline code"
+    );
+    assert_eq!(
+        ctx.send_calls(),
+        sends_before,
+        "RMR tombstone op {op:?} made a wire send"
+    );
+}
+
+/// RMR tombstone pin: after a legal edge-14 escalation, every fiscal/shift/Z
+/// re-entry must be a true no-op with no row, lnd, seed, code, or wire-send
+/// movement.  This broadens AUD-K8 from "drain re-tick" to the whole alphabet
+/// surface that should remain operator-owned once manual reconciliation is set.
+#[tokio::test]
+async fn rmr_tombstone_blocks_fiscal_shift_z_and_recovery_reentry() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+
+    let _ = interp::run_op(&mut ctx, &Op::OfflineZReport).await;
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::send_then_reject())).await;
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::RequiresManualReconciliation
+    );
+
+    for op in [
+        Op::OnlineSell(DpsScript::ack_path()),
+        Op::OnlineReturn(DpsScript::ack_path()),
+        Op::OnlineZReport(DpsScript::ack_path()),
+        Op::OnlineShiftOpen(DpsScript::ack_path()),
+        Op::OfflineSell,
+        Op::OfflineReturn,
+        Op::OfflineZReport,
+        Op::OfflineShiftOpen,
+        Op::Drain(DpsScript::ack_path()),
+        Op::GoOnline(DpsScript::ack_path()),
+        Op::Reboot,
+    ] {
+        assert_rmr_tombstone_no_fiscal_mutation(&mut ctx, op).await;
+    }
+}
+
 /// Teeth canary: the shift oracle must go RED on a wrong predicted shift state.
 /// If this ever passes, shift/Z predictions are tautological.
 #[test]
