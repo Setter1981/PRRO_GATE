@@ -2940,14 +2940,20 @@ async fn live_smoke_9_offline_drain_mac_id() {
 // DocType=10 END).  The full triple gate applies.
 //
 // ── Env contract (recovery-specific) ────────────────────────────────────────
-/// The offline `<MAC ID>` code the recovery END carries.  Default is the run-3
-/// END code (`eYme-jhnkWQ`) — the code that WAS acquired for the original END
-/// but is UNCONSUMED at DPS because that END was terminal-rejected (so the code
-/// is still valid to spend on the recovery END).  Operator-overridable: if DPS
-/// rejects `eYme-jhnkWQ` as already-attempted, set this to a fresh T=112 code.
+/// OPTIONAL override for the offline `<MAC ID>` code the recovery END carries.
+/// The DEFAULT path fetches a FRESH, unconsumed offline code via a live T=112
+/// ASK_OFFLINE_CODES request (built on the SETTLED DPS tip) — see Step 2b below.
+/// This override exists only for the rare case where the operator already holds
+/// a known-unconsumed code and wants to force it: if `PRRO_LIVE_DPS_RECOVER_CODE`
+/// is SET and NON-EMPTY, that value is used and the T=112 fetch is SKIPPED;
+/// otherwise (unset or empty) the fresh T=112 code is used.
+///
+/// WHY the default changed to fresh-fetch: the original run-3 END code
+/// (`eYme-jhnkWQ`) was likely already CONSUMED by DPS on the run-3 END that was
+/// rejected → reusing it drew `-5 "no id offline"`.  A fresh, never-attempted
+/// T=112 code sidesteps code-reuse so the reject (if any) isolates a genuine
+/// DocType=10 END offline-id bug rather than a spent code.
 const ENV_RECOVER_CODE: &str = "PRRO_LIVE_DPS_RECOVER_CODE";
-/// Fallback recovery code (the run-3 END code).
-const DEFAULT_RECOVER_CODE: &str = "eYme-jhnkWQ";
 /// The END's `<DAT DI>` / wire `local_number`.  Operator-overridable so a retry
 /// can advance the DI if DPS rejects a duplicate.  Default `9` mirrors the
 /// canonical END position in the [BEGIN, SHIFT_OPEN, SELL, END] backlog shape
@@ -2955,9 +2961,14 @@ const DEFAULT_RECOVER_CODE: &str = "eYme-jhnkWQ";
 const ENV_RECOVER_DI: &str = "PRRO_LIVE_DPS_RECOVER_DI";
 const DEFAULT_RECOVER_DI: u32 = 9;
 
-/// Resolve the recovery `<MAC ID>` code (env override → run-3 default).
-fn resolve_recover_code() -> String {
-    std::env::var(ENV_RECOVER_CODE).unwrap_or_else(|_| DEFAULT_RECOVER_CODE.to_string())
+/// Resolve the OPTIONAL recovery-code override.  Returns `Some(code)` only when
+/// `PRRO_LIVE_DPS_RECOVER_CODE` is SET and NON-EMPTY (trimmed); otherwise `None`
+/// → the caller fetches a fresh T=112 code (the default path).
+fn resolve_recover_code_override() -> Option<String> {
+    std::env::var(ENV_RECOVER_CODE)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Resolve the recovery DI (env override → default 9).
@@ -3028,10 +3039,18 @@ fn recover_kyiv_local_epoch(business_ts: &str) -> i64 {
 ///   1. `live_armed` gate + `load_signing_key` (skip/return if not armed).
 ///   2. Connect; read `status_rro` + `last_chk`; POLL `last_chk` until the tip
 ///      is SETTLED (stable across 2 reads) → the settled tip hash (hex).
+///   2b. Obtain a FRESH offline `<MAC ID>` code: unless
+///      `PRRO_LIVE_DPS_RECOVER_CODE` is set+non-empty (override), fetch a fresh,
+///      unconsumed code via a live T=112 ASK_OFFLINE_CODES (size=1) built on the
+///      SETTLED tip (reuses Smoke 9's T=112 block verbatim).  If T=112 itself
+///      rejects, SKIP/return — a doomed END is not sent, and if the reject is
+///      -16 the open-session ⇒ code-mint DEADLOCK is confirmed (operator must
+///      resolve cabinet-side).  WHY fresh: the original END reused a code DPS had
+///      already consumed → `-5 "no id offline"`.
 ///   3. Build a DocType=10 `<C T='110'>` END via the PRODUCTION builder
 ///      (`CanonicalDoc::OfflineSessionEnd`): `previous_hash` = settled tip hex,
-///      `<MAC ID>` = `PRRO_LIVE_DPS_RECOVER_CODE`, `<TS>` = current Kyiv time,
-///      `DI` = `PRRO_LIVE_DPS_RECOVER_DI`.  Print the built `<C T='110'>` XML.
+///      `<MAC ID>` = the fresh T=112 code (or the override), `<TS>` = current
+///      Kyiv time, `DI` = `PRRO_LIVE_DPS_RECOVER_DI`.  Print the `<C T='110'>` XML.
 ///   4. Sign it with the LIVE key (ATTACHED CAdES-BES; same CMS block as
 ///      T=112/SELL).
 ///   5. `send_chk` it; PRINT the FULL DPS response (OK → assigned id;
@@ -3056,13 +3075,20 @@ async fn live_recover_close_dangling_offline_session() {
     let host = resolve_host();
     let fiscal_number = resolve_fn();
     let tn = LIVE_TN;
-    let recover_code = resolve_recover_code();
+    let recover_code_override = resolve_recover_code_override();
     let recover_di = resolve_recover_di();
 
     println!("\n=== RECOVERY: close DANGLING offline session via DocType=10 END ===");
     println!("FN: {fiscal_number}  TN: {tn}");
     println!("Endpoint: {host}");
-    println!("Recovery <MAC ID> code: {recover_code}   DI: {recover_di}");
+    match &recover_code_override {
+        Some(code) => println!(
+            "Recovery <MAC ID> code: {code} (from PRRO_LIVE_DPS_RECOVER_CODE override)   DI: {recover_di}"
+        ),
+        None => println!(
+            "Recovery <MAC ID> code: <fresh — fetched via live T=112 on the settled tip>   DI: {recover_di}"
+        ),
+    }
     println!(
         "Goal: DPS ACCEPTS a settled-chain DocType=10 END → the offline session \
          CLOSES (online should flip to true)\n"
@@ -3180,6 +3206,170 @@ async fn live_recover_close_dangling_offline_session() {
         }
     );
 
+    // ── Step 2b: obtain a FRESH, unconsumed offline `<MAC ID>` code ─────────
+    // The original END drew `-5 "no id offline"` because it REUSED the run-3 END
+    // code, which DPS had already consumed on that (rejected) attempt.  Unless an
+    // explicit override is set, fetch a FRESH code via a live T=112
+    // ASK_OFFLINE_CODES built on the SETTLED tip (reuses Smoke 9's T=112 block
+    // verbatim: build → sign(live key, ATTACHED CAdES-BES) → send_chk → parse
+    // `<ID>`).  size=1 (we need exactly one code for the one END).  If T=112
+    // itself rejects, we SKIP/return (don't send a doomed END): the deadlock
+    // diagnosis IS the result.
+    let recover_code: String = if let Some(code) = recover_code_override.clone() {
+        println!("\n--- T=112 FETCH SKIPPED (PRRO_LIVE_DPS_RECOVER_CODE override in use) ---");
+        println!("  using operator-supplied recovery <MAC ID> code: {code}");
+        code
+    } else {
+        println!("\n--- T=112 FETCH (size=1, on the SETTLED tip) — fresh offline code ---");
+        let t112_di: i64 = std::env::var("PRRO_LIVE_DPS_T112_DI")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        // The T=112's `<MAC>` chains off the SETTLED tip (same hash the END will
+        // carry), so the ask-code request is chain-consistent with DPS's current
+        // tip — the prior standalone run-4 T=112 (-16) likely carried a STALE MAC.
+        let t112_req = prro::transports::dps::t112::build_t112_request(
+            &fiscal_number,
+            tn,
+            t112_di as u32,
+            1, // request exactly ONE fresh code for the one recovery END
+            prro::transports::dps::t112::kyiv_comp_date_now(),
+            &settled_tip_hex,
+        )
+        .expect("T=112 request builder must succeed for size=1");
+        println!("  T=112 XML: {}", t112_req.xml);
+
+        // Sign the T=112 XML with the live operator key (ATTACHED CAdES-BES) —
+        // same CmsSigner / Dstu4145WithGost34311Pb block as the SELL / END path.
+        let cert_der: &[u8] = ek
+            .signing_cert()
+            .expect("JKS must carry a signing certificate");
+        let curve = Curve::dstu_pb_257();
+        let d = FieldEl::from_le_bytes(&ek.param_d[..], curve.mod_words);
+        let signer_inner = DstuInProcessSigner::new(d);
+        let cms_signer_t112 = CmsSigner {
+            cert_der,
+            signer: &signer_inner,
+            profile: CmsProfile::Dstu4145WithGost34311Pb,
+        };
+        let t112_signed = cms_signer_t112
+            .sign_with(
+                t112_req.xml.as_bytes(),
+                CmsBuildOptions {
+                    attached: true,
+                    signing_time: Some(SystemTime::now()),
+                },
+            )
+            .expect("T=112 sign must succeed")
+            .cms_der;
+
+        let t112_envelope = CheckEnvelope {
+            rro_fn: fiscal_number.clone(),
+            date_time: t112_req.comp_date,
+            check_sign: t112_signed,
+            local_number: t112_di as i32,
+            check_type: DpsCheckType::ServiceChk,
+            id_offline: String::new(),
+            id_cancel: String::new(),
+        };
+
+        println!("\n--- SEND T=112 → live DPS ---");
+        match channel.send_chk(t112_envelope).await {
+            Ok(ack) => {
+                println!(
+                    "  T=112 DPS OK: id={:?} data_sign={} bytes",
+                    ack.id,
+                    ack.data_sign.len()
+                );
+                if ack.data_sign.is_empty() {
+                    println!(
+                        "RECOVERY SKIP: T=112 returned an empty data_sign — DPS issued NO fresh \
+                         offline code, so there is nothing to carry as the END's <MAC ID>. \
+                         Re-run when DPS issues codes (or set PRRO_LIVE_DPS_RECOVER_CODE)."
+                    );
+                    return;
+                }
+                let inner_bytes = match extract_econtent(&ack.data_sign) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        println!(
+                            "RECOVERY SKIP: T=112 data_sign is not a CMS blob ({e}) — cannot \
+                             extract a fresh offline code. Re-run later."
+                        );
+                        return;
+                    }
+                };
+                let inner_xml = String::from_utf8_lossy(&inner_bytes);
+                println!("  T=112 response inner XML: {inner_xml}");
+                // Harvest the first `<ID>…</ID>` opaque code (WebCheck emits one
+                // per issued code; size=1 → we take the first).
+                let fresh = inner_xml
+                    .split("<ID>")
+                    .nth(1)
+                    .and_then(|s| s.split("</ID>").next())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                match fresh {
+                    Some(code) => {
+                        println!("  FRESH OPAQUE OFFLINE CODE: {code}");
+                        code
+                    }
+                    None => {
+                        println!(
+                            "RECOVERY SKIP: no <ID> offline code in the T=112 response — nothing \
+                             to carry as <MAC ID>. Re-run when DPS issues codes."
+                        );
+                        return;
+                    }
+                }
+            }
+            Err(DpsError::Server { code: -4, message }) => {
+                println!(
+                    "RECOVERY SKIP: DPS rate-limit (-4) on T=112: {message}. Cool down 5+ min."
+                );
+                return;
+            }
+            Err(DpsError::Server { code, message }) => {
+                // T=112 rejected → do NOT proceed to a doomed END send.  The
+                // deadlock diagnosis IS the result of this run.
+                if code == -16 {
+                    println!(
+                        "RECOVERY SKIP (DEADLOCK CONFIRMED): T=112 drew -16 message={message:?} — \
+                         T=112 ASK_OFFLINE_CODES is GATED while the offline session is OPEN.  This \
+                         is a real deadlock: closing the session needs a fresh offline code, but the \
+                         open session blocks the ONLY channel that mints one.  The operator must \
+                         resolve this CABINET-SIDE (support/regulator), not from this gateway."
+                    );
+                } else {
+                    println!(
+                        "RECOVERY SKIP: T=112 rejected dps_code={code} message={message:?} — cannot \
+                         obtain a fresh offline code, so the END send is skipped (a doomed END is \
+                         pointless).  Investigate the T=112 reject, then re-run."
+                    );
+                }
+                return;
+            }
+            Err(DpsError::Authorization {
+                code,
+                kind,
+                message,
+            }) => {
+                println!(
+                    "RECOVERY SKIP: T=112 authorization reject dps_code={code} kind={kind:?} \
+                     message={message} — cannot obtain a fresh offline code; END send skipped."
+                );
+                return;
+            }
+            Err(DpsError::Transport(msg)) => {
+                panic!("RECOVERY FAIL: Transport error on T=112 send_chk (wire broken): {msg}");
+            }
+            Err(e) => {
+                panic!("RECOVERY FAIL: unexpected error on T=112 send_chk: {e:?}");
+            }
+        }
+    };
+    println!("  → recovery END will carry <MAC ID='{recover_code}'>");
+
     // ── Step 3: build the DocType=10 END via the PRODUCTION builder ─────────
     // One `business_ts` instant drives BOTH the signed `<TS>` (ts_str) and the
     // wire `date_time` (fake-epoch), exactly as production stage_sign +
@@ -3292,8 +3482,10 @@ async fn live_recover_close_dangling_offline_session() {
             println!(
                 "  END DPS REJECT — dps_code={code}  message={message:?}\n  \
                  (this is the exact DocType=10 END reject reason; if code=-16 the session \
-                 is still open, if it names a MAC/hash issue the settled-tip fix needs \
-                 revisiting, if it names the offline code try a fresh PRRO_LIVE_DPS_RECOVER_CODE)"
+                 is still open; if it names a MAC/hash issue the settled-tip fix needs \
+                 revisiting; if it is -5 \"no id offline\" AND this END carried a FRESH \
+                 T=112 code, this is a FUNDAMENTAL DocType=10 END offline-id BUG — NOT \
+                 code-reuse — since a never-attempted code was still rejected)"
             );
         }
         Err(DpsError::Transport(msg)) => {
@@ -3329,8 +3521,9 @@ async fn live_recover_close_dangling_offline_session() {
         accepted,
         "RECOVERY FAIL: DPS did NOT accept the DocType=10 END — the dangling offline \
          session is STILL OPEN.  The exact dps_code + message are printed above (Step 5). \
-         If a MAC/hash reject, the tip had not truly settled; if an offline-code reject, \
-         retry with a fresh PRRO_LIVE_DPS_RECOVER_CODE."
+         If a MAC/hash reject, the tip had not truly settled; if -5 \"no id offline\" with \
+         the FRESH T=112 code, it is a fundamental DocType=10 END offline-id bug (not \
+         code-reuse), since a never-attempted code was still rejected."
     );
     println!(
         "\nRECOVERY PASS: DPS ACCEPTED the settled-chain DocType=10 END — the dangling \
