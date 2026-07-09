@@ -1056,6 +1056,38 @@ fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Extract the `<TS>...</TS>` inner digits from a check's XML bytes — the EXACT
+/// wall-clock string (`yyyyMMddHHmmss`) DPS reads and validates against the wire
+/// `Check.date`.  The `<TS>` region is ASCII even in a cp1251-encoded payload, so
+/// a lossy UTF-8 scan of the raw bytes is byte-faithful for this substring.
+/// Returns `None` if the blob carries no `<TS>` element (e.g. a genesis
+/// `data_sign`).  Used by the smoke-9 `-8` date diagnostics to surface what DPS
+/// actually receives in the signed BEGIN vs the accepted SELL.
+fn extract_ts_digits(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let start = text.find("<TS>")? + "<TS>".len();
+    let rest = &text[start..];
+    let end = rest.find("</TS>")?;
+    Some(rest[..end].to_string())
+}
+
+/// Decode a DPS "Kyiv-local-as-epoch" wire `date_time` (the value
+/// `stage_send::kyiv_local_epoch` emits) into a human-readable
+/// `yyyyMMddHHmmss`-shaped string, both as the RAW UTC decode of the epoch AND as
+/// the Kyiv-local wall clock the operator sees.  Because the wire epoch is Kyiv
+/// wall-clock digits re-interpreted as UTC, the UTC decode of that epoch is what
+/// SHOULD equal the signed `<TS>` byte-for-byte — a mismatch here vs `<TS>` is
+/// exactly what draws DPS `-8`.  Print-only.
+fn decode_epoch_utc_and_kyiv(epoch: i64) -> (String, String) {
+    use chrono::{DateTime, Utc};
+    use chrono_tz::Europe::Kiev;
+    let utc: DateTime<Utc> = DateTime::from_timestamp(epoch, 0)
+        .unwrap_or_else(|| panic!("epoch {epoch} out of range for a DateTime decode"));
+    let as_utc = utc.format("%Y%m%d%H%M%S").to_string();
+    let as_kyiv = utc.with_timezone(&Kiev).format("%Y%m%d%H%M%S").to_string();
+    (as_utc, as_kyiv)
+}
+
 /// Seed `fiscal_number_config` for the LIVE FN with the REAL taxpayer code.
 async fn seed_fn_config_live(pool: &SqlitePool, fn_id: &str) {
     sqlx::query(
@@ -2791,6 +2823,181 @@ async fn live_smoke_9_offline_drain_mac_id() {
     println!("  doc final state: {final_state}  server_fiscal_no={server_fiscal_no:?}  dps_code={trace_code:?}");
     print_live_diagnostics(pool, doc_id).await;
     println!("  offline_dps_code sent as <MAC ID>: {stamped_code:?}");
+
+    // ── Step 10a: DocType=9 BEGIN vs SELL DATE DIAGNOSTICS (-8 investigation) ─
+    //
+    // The drain's FIRST doc is the DocType=9 OFFLINE_SESSION_BEGIN.  Live smoke 9
+    // saw DPS reject that BEGIN with `wire_status_code=-8` on ~6/7 runs (accepted
+    // 1/7).  WebCheck defines `-8` as "the signed XML `<TS>` date does not match
+    // the wire `Check.date`" (SubmitPtr.cs:397).  A prior source trace VERIFIED
+    // that our BEGIN's signed `<TS>` (`stage_sign::format_kyiv_local(business_ts)`)
+    // and its wire `date_time` (`stage_send::kyiv_local_epoch(business_ts)`) BOTH
+    // derive from the SAME stored `fiscal_documents.business_ts` and both truncate
+    // to the same whole second — so they CANNOT diverge in our source.  This block
+    // captures the EXACT wire bytes so the next `-8` run shows what DPS actually
+    // rejects: for BOTH the BEGIN (rejected) and the SELL (accepted), side by side,
+    // it prints (1) the stored `business_ts`, (2) the `<TS>` digits extracted from
+    // the stored SIGNED_XML eContent — the exact wall-clock DPS receives, (3) the
+    // envelope `date_time` computed via the SAME production path the drain uses
+    // (`recover_kyiv_local_epoch`, a byte-verbatim mirror of the private
+    // `stage_send::kyiv_local_epoch`), as raw epoch + UTC/Kyiv decode, (4) the
+    // current wall clock + DPS's own chain clock (the `<TS>` inside the latest
+    // `lastChk` check DPS returns — the closest thing the wire API exposes to
+    // "DPS's clock"), and (5) the BEGIN's chain tip (`previous_hash`) + `lnd`, in
+    // case `-8` correlates with chain state rather than date.  Print-only; no wire
+    // calls beyond the read-only `lastChk` already made above (`pre_ack`).
+    println!("\n--- DocType=9 BEGIN vs SELL DATE DIAGNOSTICS (-8 investigation) ---");
+
+    // A print-only helper: for one doc row, surface (business_ts, signed <TS>,
+    // envelope date_time via the production path).  `label` distinguishes BEGIN
+    // (rejected) from SELL (accepted) in the side-by-side output.
+    async fn print_date_triplet(pool: &SqlitePool, label: &str, doc: DocumentId) {
+        // (1) stored business_ts — the single column BOTH the <TS> and the wire
+        //     date_time derive from.
+        let business_ts: Option<String> =
+            sqlx::query_scalar("SELECT business_ts FROM fiscal_documents WHERE document_id = ?")
+                .bind(doc)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None)
+                .flatten();
+        println!(
+            "  [{label}] document_id={} business_ts(raw column)={business_ts:?}",
+            hex_lower(doc.as_bytes())
+        );
+        // (2) the <TS> DPS actually receives — extracted from the SIGNED_XML's
+        //     eContent (the ATTACHED-CMS inner XML that IS the signed check).  Fall
+        //     back to PAYLOAD_XML if the signed artifact is missing.
+        let signed_ts = match read_document_file_piece4(pool, doc, "SIGNED_XML").await {
+            Some(signed) => match extract_econtent(&signed) {
+                Ok(inner) => extract_ts_digits(&inner),
+                Err(e) => {
+                    println!("  [{label}] SIGNED_XML eContent extract failed: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        let signed_ts = match signed_ts {
+            Some(ts) => Some(ts),
+            None => read_document_file_piece4(pool, doc, "PAYLOAD_XML")
+                .await
+                .and_then(|p| extract_ts_digits(&p)),
+        };
+        println!("  [{label}] signed <TS> (exact digits DPS reads): {signed_ts:?}");
+        // (3) the wire envelope date_time via the SAME production path the drain
+        //     uses (`recover_kyiv_local_epoch` ≡ `stage_send::kyiv_local_epoch`),
+        //     printed as raw epoch + its UTC/Kyiv decode.  On a clean run the UTC
+        //     decode of this epoch equals the signed <TS> above; a divergence here
+        //     is exactly what DPS rejects with -8.
+        match &business_ts {
+            Some(bts) => {
+                let epoch = recover_kyiv_local_epoch(bts);
+                let (as_utc, as_kyiv) = decode_epoch_utc_and_kyiv(epoch);
+                println!(
+                    "  [{label}] wire date_time (kyiv_local_epoch): raw_epoch={epoch} \
+                     decode_utc={as_utc} decode_kyiv={as_kyiv}"
+                );
+                println!(
+                    "  [{label}] MATCH signed<TS>==decode_utc(date_time): {}",
+                    signed_ts.as_deref() == Some(as_utc.as_str())
+                );
+            }
+            None => println!(
+                "  [{label}] no business_ts column — cannot compute envelope date_time"
+            ),
+        }
+    }
+
+    // (a) Locate the single DocType=9 OFFLINE_SESSION_BEGIN row for this FN, and
+    //     print its date triplet + chain state.  The BEGIN is a SEPARATE
+    //     `fiscal_documents` row from the SELL (`doc_id`).
+    let begin_row: Option<(DocumentId, i64, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT document_id, lnd, previous_hash \
+         FROM fiscal_documents \
+         WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN' \
+         ORDER BY lnd DESC LIMIT 1",
+    )
+    .bind(&fiscal_number)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    match &begin_row {
+        None => println!(
+            "  NO OFFLINE_SESSION_BEGIN row — the drain's first doc was never minted \
+             (check the audit lines above)"
+        ),
+        Some((begin_doc, begin_lnd, begin_prev)) => {
+            print_date_triplet(pool, "BEGIN(9)", *begin_doc).await;
+            // (5) chain tip + lnd for the BEGIN — in case -8 correlates with chain
+            //     state rather than date.
+            println!(
+                "  [BEGIN(9)] lnd={begin_lnd} previous_hash(chain tip)={}",
+                begin_prev
+                    .as_deref()
+                    .map(hex_lower)
+                    .unwrap_or_else(|| "<none/genesis>".into())
+            );
+            // The BEGIN's latest transport_trace (its DPS reject code, i.e. the -8).
+            println!("  [BEGIN(9)] transport_trace + audit tail:");
+            print_live_diagnostics(pool, *begin_doc).await;
+        }
+    }
+
+    // (b) The SELL's date triplet, printed RIGHT NEXT TO the BEGIN's — DPS ACCEPTS
+    //     the SELL, so a side-by-side diff shows whether the BEGIN's <TS> /
+    //     date_time actually differ from the accepted SELL's.
+    print_date_triplet(pool, "SELL(accepted)", doc_id).await;
+    let sell_chain: Option<(i64, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT lnd, previous_hash FROM fiscal_documents WHERE document_id = ?",
+    )
+    .bind(doc_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    if let Some((sell_lnd, sell_prev)) = &sell_chain {
+        println!(
+            "  [SELL(accepted)] lnd={sell_lnd} previous_hash(chain tip)={}",
+            sell_prev
+                .as_deref()
+                .map(hex_lower)
+                .unwrap_or_else(|| "<none/genesis>".into())
+        );
+    }
+
+    // (4) Reference clocks: current wall clock (UTC + Kyiv) and DPS's own chain
+    //     clock.  `CheckAck` carries NO scalar timestamp, so the closest wire proxy
+    //     for "DPS's clock" is the `<TS>` inside the previous check DPS returned on
+    //     `lastChk` (`pre_ack.data_sign`, an ATTACHED CMS) — how far the BEGIN's
+    //     <TS> sits from DPS's last-seen check time.  Genesis (empty data_sign)
+    //     has no such check.
+    {
+        use chrono::Utc;
+        use chrono_tz::Europe::Kiev;
+        let now = Utc::now();
+        println!(
+            "  [now] Utc::now() utc={} kyiv={}",
+            now.format("%Y%m%d%H%M%S"),
+            now.with_timezone(&Kiev).format("%Y%m%d%H%M%S")
+        );
+        let dps_chain_ts = if pre_ack.data_sign.is_empty() {
+            None
+        } else {
+            match extract_econtent(&pre_ack.data_sign) {
+                Ok(inner) => extract_ts_digits(&inner),
+                Err(e) => {
+                    println!("  [dps-clock] pre_ack.data_sign eContent extract failed: {e}");
+                    None
+                }
+            }
+        };
+        println!(
+            "  [dps-clock] <TS> of DPS's latest check on lastChk (pre-drain tip): {dps_chain_ts:?} \
+             (id={:?}, data_sign={} bytes)",
+            pre_ack.id,
+            pre_ack.data_sign.len()
+        );
+    }
 
     // ── Step 10b: DocType=10 END (OFFLINE_SESSION_END) reject diagnostics ────
     //
