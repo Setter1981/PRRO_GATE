@@ -2991,9 +2991,9 @@ async fn live_smoke_9_offline_drain_mac_id() {
                     signed_ts.as_deref() == Some(as_utc.as_str())
                 );
             }
-            None => println!(
-                "  [{label}] no business_ts column — cannot compute envelope date_time"
-            ),
+            None => {
+                println!("  [{label}] no business_ts column — cannot compute envelope date_time")
+            }
         }
     }
 
@@ -3036,13 +3036,12 @@ async fn live_smoke_9_offline_drain_mac_id() {
     //     the SELL, so a side-by-side diff shows whether the BEGIN's <TS> /
     //     date_time actually differ from the accepted SELL's.
     print_date_triplet(pool, "SELL(accepted)", doc_id).await;
-    let sell_chain: Option<(i64, Option<Vec<u8>>)> = sqlx::query_as(
-        "SELECT lnd, previous_hash FROM fiscal_documents WHERE document_id = ?",
-    )
-    .bind(doc_id)
-    .fetch_optional(pool)
-    .await
-    .unwrap_or(None);
+    let sell_chain: Option<(i64, Option<Vec<u8>>)> =
+        sqlx::query_as("SELECT lnd, previous_hash FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
     if let Some((sell_lnd, sell_prev)) = &sell_chain {
         println!(
             "  [SELL(accepted)] lnd={sell_lnd} previous_hash(chain tip)={}",
@@ -4056,9 +4055,7 @@ async fn live_recover_close_open_shift() {
         String::from_utf8_lossy(&z_xml_bytes)
     );
     println!("  Z <TS>={ts_str}  wire date_time(fake-epoch)={date_time}");
-    println!(
-        "  Z <MAC>=bare (NO ID=)  wire id_offline=<empty>  typCheck=ZReport(2)  DI={z_di}"
-    );
+    println!("  Z <MAC>=bare (NO ID=)  wire id_offline=<empty>  typCheck=ZReport(2)  DI={z_di}");
 
     // ── Step 4: sign with the LIVE key (ATTACHED CAdES-BES) ────────────────
     // Same CmsSigner / Dstu4145WithGost34311Pb block as the END / SELL path.
@@ -4180,5 +4177,626 @@ async fn live_recover_close_open_shift() {
         "\nRECOVERY PASS: DPS ACCEPTED the settled-chain ONLINE Z_REPORT — the leftover shift \
          is CLOSED (post open_shift={:?}).  A fresh smoke's SHIFT_OPEN should no longer draw -2.",
         post_open_shift
+    );
+}
+
+// ─── Live probe — byte-EXACT WebCheck DocType=9 BEGIN (format bisect for -8) ──
+//
+// WHY: our drain-minted DocType=9 OFFLINE_SESSION_BEGIN draws DPS `-8`
+// INTERMITTENTLY (~7/8 of runs).  Smoke 9 already PROVED it is NOT a
+// `<TS>`-vs-`date_time` mismatch (both derive from one instant) and NOT a
+// now/future-date issue (`PRRO_LIVE_DPS_OFFLINE_BACKDATE_SEC` back-dating did
+// not clear it).  The remaining suspect is the WIRE XML FORMAT: our production
+// `emit_offline_session_boundary` (`xml/mod.rs:876`) emits
+//   <RQ NDv="ПРО_каса" PrV="1.1" V="1"><DAT DI=".." FN=".." TN="{TN}" V="1" ZN="0"><C T='109'></C>…
+// whereas WebCheck's PROVEN `OfflineOnManually` (decompiled
+// `All.cs:1830-1836` + the offline-code `<MAC ID=>` replace at
+// `SendingOfflineChecks.cs:169`) builds, VERBATIM:
+//   <?xml version='1.0' encoding='windows-1251'?><RQ V ='1'><DAT  FN='{FN}' TN='ПН {TN}' ZN='' DI='{DI}' V='1'><C T='109'></C><TS>{TS}</TS></DAT><MAC ID='{code}'>{prev_hash}</MAC></RQ>
+// Deltas (WebCheck vs ours): WebCheck has NO `NDv`/`PrV`; `TN='ПН {TN}'`
+// (Cyrillic "ПН " prefix — ours is bare); `ZN=''` (ours `"0"`); different
+// attribute ORDER; `<RQ V ='1'>` (space before `=`); `<DAT  FN` (double space).
+//
+// This probe sends a BYTE-EXACT WebCheck DocType=9 BEGIN (built by string
+// concatenation, NOT our `emit_offline_session_boundary`) and reports the exact
+// DPS outcome:
+//   • ACCEPT → the FORMAT was the `-8` cause; our boundary builder must be
+//     rewritten to match WebCheck's proven form.
+//   • REJECT → the format is NOT it; we fail LOUDLY with the exact dps_code +
+//     message and print BOTH the WebCheck-form and our-form bytes for the record.
+//
+// The `ПН ` prefix, `ZN` value, and the `NDv`/`PrV` presence are each
+// ENV-TOGGLABLE (defaulting to the full WebCheck-exact form) so a future run can
+// BISECT which single field DPS actually cares about.
+//
+// SHAPE: this is an OFFLINE-shaped BEGIN — `<MAC ID='{code}'>{settled_tip}</MAC>`
+// (offline code in the ID attr) + a NON-empty wire `id_offline={code}` (offline
+// issuance), mirroring WebCheck's `CloseOfflineDocOffline`/offline-code path.
+// (Contrast the DocType=10 END recovery above, which is ONLINE-shaped: bare
+// `<MAC>`, empty `id_offline`.)  It is a PURE standalone one-shot — no DB / boot
+// / write-path — hand-building + signing + sending a single BEGIN off the
+// SETTLED chain tip, exactly the posture of the END recovery routine.
+//
+// NOTE: if DPS ACCEPTS, this OPENS an offline session on the cabinet.  Close it
+// afterward with `live_recover_close_dangling_offline_session` (the END recovery).
+
+/// `PRRO_LIVE_DPS_BEGIN_DI` — the BEGIN's `<DAT DI>` / wire `local_number`.
+/// Operator-overridable so a retry can advance the DI if DPS rejects a
+/// duplicate.  Default `8` = a sensible fresh position, distinct from the END
+/// recovery DI (`9`) and the Z DI (`10`) so a bisect run does not collide with a
+/// prior recovery doc's local number.
+const ENV_BEGIN_DI: &str = "PRRO_LIVE_DPS_BEGIN_DI";
+const DEFAULT_BEGIN_DI: u32 = 8;
+/// `PRRO_LIVE_DPS_BEGIN_TN_PREFIX` — the `TN='{prefix}{TN}'` prefix.  Default
+/// `"ПН "` (Cyrillic, WebCheck-exact).  Set to `""` to bisect a BARE `TN`
+/// (our production form).  Any other non-ASCII than `П`/`Н` is rejected (this
+/// probe only cp1251-encodes the WebCheck Cyrillic letters).
+const ENV_BEGIN_TN_PREFIX: &str = "PRRO_LIVE_DPS_BEGIN_TN_PREFIX";
+const DEFAULT_BEGIN_TN_PREFIX: &str = "ПН ";
+/// `PRRO_LIVE_DPS_BEGIN_ZN` — the `<DAT ZN='{value}'>` value.  Default `""`
+/// (WebCheck-exact).  Set to `"0"` to bisect our production form.
+const ENV_BEGIN_ZN: &str = "PRRO_LIVE_DPS_BEGIN_ZN";
+const DEFAULT_BEGIN_ZN: &str = "";
+/// `PRRO_LIVE_DPS_BEGIN_NDV` — presence of the `NDv="ПРО_каса" PrV="1.1"`
+/// attributes on `<RQ>`.  Default OFF (`"0"`, WebCheck-exact — WebCheck emits
+/// NEITHER).  Set to `"1"` to bisect our production form (RQ carries both).
+const ENV_BEGIN_NDV: &str = "PRRO_LIVE_DPS_BEGIN_NDV";
+
+/// Resolve the BEGIN DI (env override → default 8).
+fn resolve_begin_di() -> u32 {
+    std::env::var(ENV_BEGIN_DI)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_BEGIN_DI)
+}
+
+/// cp1251-encode a TN prefix that is ASCII EXCEPT the WebCheck Cyrillic letters
+/// `П` (U+041F → 0xCF) and `Н` (U+041D → 0xCD).  This mirrors the byte-splice in
+/// `build_webcheck_exact_end_xml` but generalised so an env-supplied prefix
+/// (e.g. `""` for the bare-TN bisect) round-trips too.  Panics on any other
+/// non-ASCII char — this probe only knows the two WebCheck Cyrillic letters, and
+/// a silently-mangled prefix would send unintended bytes to a fiscal endpoint.
+fn cp1251_tn_prefix(prefix: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prefix.len());
+    for ch in prefix.chars() {
+        match ch {
+            'П' => out.push(0xCF),
+            'Н' => out.push(0xCD),
+            c if c.is_ascii() => out.push(c as u8),
+            other => panic!(
+                "{ENV_BEGIN_TN_PREFIX} contains an unsupported non-ASCII char {other:?}; \
+                 this probe only cp1251-encodes the WebCheck letters `П`/`Н`.  Use `\"ПН \"` \
+                 (default) or `\"\"` (bare-TN bisect)."
+            ),
+        }
+    }
+    out
+}
+
+/// Build a **byte-EXACT WebCheck DocType=9 OFFLINE_SESSION_BEGIN** XML, faithful
+/// to `OfflineOnManually` (`All.cs:1830-1836`) + the offline-code `mmmaaaccc` →
+/// `<MAC ID='{OfflineNum}'>` replacement (`SendingOfflineChecks.cs:169`).  The
+/// WebCheck concat chain emits, VERBATIM:
+///
+/// ```text
+/// <?xml version='1.0' encoding='windows-1251'?><RQ{ndv} V ='1'><DAT  FN='{FN}' TN='{tn_prefix}{TN}' ZN='{zn}' DI='{DI}' V='1'><C T='109'></C><TS>{TS}</TS></DAT><MAC ID='{code}'>{prev_hash}</MAC></RQ>
+/// ```
+///
+/// with `{tn_prefix}` = `"ПН "`, `{zn}` = `""`, and NO `{ndv}` in the pure
+/// WebCheck-exact default — each of which is env-togglable for the `-8` bisect.
+///
+/// Deltas vs the production `emit_offline_session_boundary` builder (all
+/// reproduced here to match WebCheck's PROVEN client):
+///   - `TN='ПН {TN}'`  (production emits bare `TN="{TN}"` — no `ПН ` prefix)
+///   - `ZN=''`          (production emits `ZN="0"`)
+///   - NO `NDv=` / `PrV=` attrs on `<RQ>` (production emits both defaults)
+///   - single-quoted attrs + `<RQ V ='1'>` spacing + `<DAT  FN=` double-space,
+///     matching the decompiled C# string literals exactly.
+///   - `<MAC ID='{code}'>` (OFFLINE-shaped, offline code in the ID attr) — the
+///     online drain-close END uses a bare `<MAC>` instead.
+///
+/// The leading `<?xml …?>` prolog is INCLUDED to mirror WebCheck's `text`
+/// verbatim (WebCheck signs the whole `text`, including the prolog).  `prev_hash`
+/// (the settled tip hash hex) is emitted RAW — a hex string with no XML-special
+/// chars, exactly as WebCheck's `.Replace` inserts it.
+///
+/// Returns cp1251-encoded wire bytes (the `ПН ` prefix is Cyrillic, so the
+/// signed + submitted bytes MUST be cp1251, matching the `encoding='windows-1251'`
+/// prolog and WebCheck's `SaveToFileText` codepage).  When the prefix is toggled
+/// to `""` the whole doc is pure-ASCII and cp1251 == ASCII byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+fn build_webcheck_exact_begin_xml(
+    fiscal_number: &str,
+    tn: &str,
+    tn_prefix: &str,
+    zn: &str,
+    ndv: bool,
+    di: u32,
+    ts_str: &str,
+    code: &str,
+    prev_tip_hex: &str,
+) -> Vec<u8> {
+    // The `NDv="ПРО_каса"` attr value carries Cyrillic `ПРО_каса` — if the
+    // operator toggles NDv ON for a bisect, those bytes must also be cp1251.
+    // Rather than encode a long Cyrillic literal, we build the (rare, bisect-only)
+    // NDv chunk via `cp1251_tn_prefix`, which knows `П`/`Н`; the remaining
+    // Cyrillic letters `РО_каса` are NOT in its table, so NDv-ON with the real
+    // `ПРО_каса` value would panic.  For the bisect we therefore emit the NDv
+    // attrs with the production ASCII-safe form used on the wire elsewhere is not
+    // available; keep NDv-ON to the ATTRIBUTE PRESENCE test only and use an
+    // ASCII placeholder value so the probe never sends mojibake.  (The default —
+    // and the WebCheck-exact case — is NDv OFF, so this branch is bisect-only.)
+    let head_ascii = if ndv {
+        // Presence-only NDv: emit the attrs with an ASCII-safe value so the
+        // probe can test "does DPS care that NDv is PRESENT" without needing a
+        // cp1251 Cyrillic attribute value.  This is a BISECT knob, not the
+        // WebCheck-exact default.
+        format!(
+            "<?xml version='1.0' encoding='windows-1251'?>\
+             <RQ NDv='PRO_kasa' PrV='1.1' V ='1'>\
+             <DAT  FN='{fiscal_number}' TN='"
+        )
+    } else {
+        format!(
+            "<?xml version='1.0' encoding='windows-1251'?><RQ V ='1'>\
+             <DAT  FN='{fiscal_number}' TN='"
+        )
+    };
+    let tail_ascii = format!(
+        "{tn}' ZN='{zn}' DI='{di}' V='1'>\
+         <C T='109'></C><TS>{ts_str}</TS></DAT>\
+         <MAC ID='{code}'>{prev_tip_hex}</MAC></RQ>"
+    );
+    // `head_ascii` + cp1251(tn_prefix) + `tail_ascii`.  The tail LEADS with `{tn}`
+    // (no leading space — the space, if any, is the trailing char of the default
+    // `"ПН "` prefix).  All FN / TN / ZN / DI / TS / code / hash content is ASCII
+    // by construction, so byte-splicing the (possibly Cyrillic) prefix is exact.
+    let prefix_bytes = cp1251_tn_prefix(tn_prefix);
+    let mut out = Vec::with_capacity(head_ascii.len() + prefix_bytes.len() + tail_ascii.len());
+    out.extend_from_slice(head_ascii.as_bytes());
+    out.extend_from_slice(&prefix_bytes);
+    out.extend_from_slice(tail_ascii.as_bytes());
+    out
+}
+
+/// **Live probe — byte-EXACT WebCheck DocType=9 BEGIN (format bisect for `-8`)**.
+///
+/// FLOW (mirrors `live_recover_close_dangling_offline_session`):
+///   1. `live_armed` gate + `load_signing_key` (skip/return if not armed).
+///   2. Connect; read `status_rro`; POLL `last_chk` until the tip is SETTLED
+///      (stable across 2 reads) → the settled tip hash hex.
+///   3. Fetch ONE fresh T=112 offline code (size=1) off the SETTLED tip.  Print
+///      the code + T=112 outcome; SKIP the probe if T=112 rejects / issues none.
+///   4. Build a byte-EXACT WebCheck DocType=9 `<C T='109'>` BEGIN via
+///      `build_webcheck_exact_begin_xml` (WebCheck-exact form by default; TN
+///      prefix / ZN / NDv togglable).  Print the exact cp1251 bytes.
+///   5. Sign it with the LIVE key (ATTACHED CAdES-BES; same CMS block as the
+///      SELL / END path).
+///   6. `send_chk` it with `typCheck=ServiceChk(3)` and a NON-empty wire
+///      `id_offline={code}` (OFFLINE issuance).  Print the FULL DPS response
+///      (accept → the BEGIN opened a session, id/server_fiscal_no; reject →
+///      exact dps_code + message).
+///   7. `status_rro` again → print `open_shift`/`online` (session opened?).
+///   8. Assert: PASS iff DPS ACCEPTS (→ FORMAT was the `-8` cause); on reject,
+///      fail LOUDLY with the exact code + message AND print both the
+///      WebCheck-form and our production-form bytes for the record.
+///
+/// This is a TARGETED one-shot probe: it does NOT boot the write-path or mutate
+/// any gateway DB — it hand-builds + signs + sends a single BEGIN off the SETTLED
+/// tip, exactly as WebCheck's `OfflineOnManually` would.
+#[tokio::test]
+#[ignore = "live DPS endpoint required; opt-in via --features live-dps + --ignored + PRRO_LIVE_DPS=1"]
+async fn live_probe_webcheck_exact_begin() {
+    const NAME: &str = "Live probe (byte-exact WebCheck DocType=9 BEGIN — format bisect for -8)";
+    if !live_armed(NAME) {
+        return;
+    }
+    let Some(ek) = load_signing_key(NAME) else {
+        return;
+    };
+    let host = resolve_host();
+    let fiscal_number = resolve_fn();
+    let tn = LIVE_TN;
+    let begin_di = resolve_begin_di();
+    let tn_prefix =
+        std::env::var(ENV_BEGIN_TN_PREFIX).unwrap_or_else(|_| DEFAULT_BEGIN_TN_PREFIX.to_string());
+    let zn = std::env::var(ENV_BEGIN_ZN).unwrap_or_else(|_| DEFAULT_BEGIN_ZN.to_string());
+    let ndv = std::env::var(ENV_BEGIN_NDV).as_deref() == Ok("1");
+
+    println!("\n=== PROBE: byte-EXACT WebCheck DocType=9 BEGIN (format bisect for -8) ===");
+    println!("FN: {fiscal_number}  TN: {tn}");
+    println!("Endpoint: {host}");
+    println!(
+        "BEGIN form: WebCheck-EXACT OfflineOnManually — OFFLINE-shaped \
+         <MAC ID='{{code}}'>, non-empty wire id_offline.  DI: {begin_di}"
+    );
+    println!(
+        "  bisect knobs: {ENV_BEGIN_TN_PREFIX}={tn_prefix:?} (default \"ПН \")  \
+         {ENV_BEGIN_ZN}={zn:?} (default \"\")  {ENV_BEGIN_NDV}={} (default off)",
+        if ndv { "1" } else { "0" }
+    );
+    println!(
+        "Goal: DPS ACCEPTS the byte-exact WebCheck BEGIN → the wire FORMAT was the \
+         -8 cause (our emit_offline_session_boundary must match WebCheck).\n"
+    );
+
+    // ── Step 1: connect + read the CURRENT DPS state ───────────────────────
+    let channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        .await
+        .unwrap_or_else(|e| panic!("PROBE FAIL: GrpcDpsChannel::connect: {e:?}"));
+    let fn_sign = sign_fn_blob(&ek, &fiscal_number);
+
+    println!("--- PRE-STATE ---");
+    if let Ok(s) = channel.status_rro(&fn_sign).await {
+        println!(
+            "  pre statusRro: open_shift={} online={} last_signer={:?}",
+            s.open_shift, s.online, s.last_signer
+        );
+    }
+
+    // ── Step 2: read + SETTLE the current chain tip ────────────────────────
+    // Poll `last_chk` until the tip is STABLE across two consecutive reads, so
+    // BOTH the T=112 request (`pre_mac_hex`) AND the BEGIN's `<MAC ID>` chain off
+    // DPS's REAL current tip.  Identical settle-poll to the END recovery (:3490).
+    println!("\n--- SETTLE CHAIN TIP (poll last_chk until stable across 2 reads) ---");
+    let settled_tip_hex: String = {
+        async fn read_tip_hex(
+            channel: &GrpcDpsChannel,
+            fn_sign: &CheckSignBlob,
+        ) -> Result<Option<String>, DpsError> {
+            let ack = channel.last_chk(fn_sign).await?;
+            if ack.data_sign.is_empty() {
+                return Ok(Some(String::new()));
+            }
+            match extract_econtent(&ack.data_sign) {
+                Ok(inner) => {
+                    let tip: [u8; 32] = Sha256::digest(&inner).into();
+                    Ok(Some(hex_lower(&tip)))
+                }
+                Err(_) => Ok(None),
+            }
+        }
+
+        let mut prev: Option<String> = None;
+        let mut settled: Option<String> = None;
+        for attempt in 1..=20u32 {
+            match read_tip_hex(&channel, &fn_sign).await {
+                Ok(Some(tip)) => {
+                    println!(
+                        "  poll {attempt}: DPS tip = {}",
+                        if tip.is_empty() {
+                            "<genesis/empty>"
+                        } else {
+                            &tip
+                        }
+                    );
+                    if prev.as_ref() == Some(&tip) {
+                        println!(
+                            "  DPS tip SETTLED (stable across 2 reads) after {attempt} poll(s)"
+                        );
+                        settled = Some(tip);
+                        break;
+                    }
+                    prev = Some(tip);
+                }
+                Ok(None) => {
+                    println!("  poll {attempt}: tip not yet decodable — retry");
+                }
+                Err(DpsError::Server { code: -4, message }) => {
+                    println!(
+                        "PROBE SKIP: DPS rate-limit (-4) on last_chk: {message}. Cool down 5+ min."
+                    );
+                    return;
+                }
+                Err(DpsError::Transport(msg)) => {
+                    panic!("PROBE FAIL: Transport on last_chk: {msg}");
+                }
+                Err(e) => {
+                    println!("  poll {attempt}: last_chk non-fatal error (retry): {e:?}");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        match settled {
+            Some(tip) => tip,
+            None => {
+                println!(
+                    "PROBE SKIP: DPS chain tip did not stabilise within the poll window \
+                     (~100s) — cannot safely chain the BEGIN off a moving tip.  Re-run later."
+                );
+                return;
+            }
+        }
+    };
+    println!(
+        "  settled tip for the BEGIN <MAC ID> + T=112 pre-MAC: {}",
+        if settled_tip_hex.is_empty() {
+            "<genesis/empty>"
+        } else {
+            &settled_tip_hex
+        }
+    );
+
+    // ── Step 3: fetch ONE fresh T=112 offline code (size=1) off the settled tip
+    // Reuses Smoke 9's T=112 block (production builder, byte-exact / WebCheck),
+    // requesting size=1 (the probe needs exactly ONE code for the BEGIN's
+    // `<MAC ID>`).  `pre_mac_hex` = the SETTLED tip so the T=112 request chains
+    // off DPS's real current tip.  SKIP the probe if T=112 rejects / issues none.
+    println!("\n--- T=112 FETCH (1 fresh offline code off the settled tip) ---");
+    let t112_di: i64 = std::env::var("PRRO_LIVE_DPS_T112_DI")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let t112_req = prro::transports::dps::t112::build_t112_request(
+        &fiscal_number,
+        tn,
+        t112_di as u32,
+        1, // size=1: exactly one code for the BEGIN's <MAC ID>
+        prro::transports::dps::t112::kyiv_comp_date_now(),
+        &settled_tip_hex,
+    )
+    .expect("T=112 request builder must succeed for size=1");
+    println!("  T=112 XML: {}", t112_req.xml);
+
+    // Sign the T=112 XML with the live operator key (ATTACHED CAdES-BES).
+    let cert_der: &[u8] = ek
+        .signing_cert()
+        .expect("JKS must carry a signing certificate");
+    let curve = Curve::dstu_pb_257();
+    let d = FieldEl::from_le_bytes(&ek.param_d[..], curve.mod_words);
+    let signer_inner = DstuInProcessSigner::new(d);
+    let cms_signer_t112 = CmsSigner {
+        cert_der,
+        signer: &signer_inner,
+        profile: CmsProfile::Dstu4145WithGost34311Pb,
+    };
+    let t112_signed = cms_signer_t112
+        .sign_with(
+            t112_req.xml.as_bytes(),
+            CmsBuildOptions {
+                attached: true,
+                signing_time: Some(SystemTime::now()),
+            },
+        )
+        .expect("T=112 sign must succeed")
+        .cms_der;
+
+    let t112_envelope = CheckEnvelope {
+        rro_fn: fiscal_number.clone(),
+        date_time: t112_req.comp_date,
+        check_sign: t112_signed,
+        local_number: t112_di as i32,
+        check_type: DpsCheckType::ServiceChk,
+        id_offline: String::new(),
+        id_cancel: String::new(),
+    };
+
+    let code: String = match channel.send_chk(t112_envelope).await {
+        Ok(ack) => {
+            println!(
+                "  T=112 DPS OK: id={:?} data_sign={} bytes",
+                ack.id,
+                ack.data_sign.len()
+            );
+            if ack.data_sign.is_empty() {
+                println!(
+                    "PROBE SKIP: T=112 returned an empty data_sign — no offline code issued \
+                     (cannot seed the BEGIN's <MAC ID>). Re-run when DPS issues codes."
+                );
+                return;
+            }
+            let inner_bytes = match extract_econtent(&ack.data_sign) {
+                Ok(b) => b,
+                Err(e) => {
+                    println!(
+                        "PROBE SKIP: T=112 data_sign is not a CMS blob ({e}) — cannot extract \
+                         an offline code. Re-run when DPS issues codes."
+                    );
+                    return;
+                }
+            };
+            let inner_xml = String::from_utf8_lossy(&inner_bytes);
+            println!("  T=112 response inner XML: {inner_xml}");
+            let codes: Vec<String> = inner_xml
+                .split("<ID>")
+                .skip(1)
+                .filter_map(|s| s.split("</ID>").next())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            match codes.into_iter().next() {
+                Some(c) => {
+                    println!("  REAL OPAQUE OFFLINE CODE: {c}");
+                    c
+                }
+                None => {
+                    println!(
+                        "PROBE SKIP: no <ID> offline code in the T=112 response — nothing to \
+                         seed as <MAC ID>. Re-run when DPS issues codes."
+                    );
+                    return;
+                }
+            }
+        }
+        Err(DpsError::Server { code: -4, message }) => {
+            println!("PROBE SKIP: DPS rate-limit (-4) on T=112: {message}. Cool down 5+ min.");
+            return;
+        }
+        Err(DpsError::Server { code, message }) => {
+            println!(
+                "PROBE SKIP: T=112 ASK_OFFLINE_CODES rejected (code={code} msg={message:?}) — \
+                 cannot obtain a fresh offline code for the BEGIN's <MAC ID>. Re-run when T=112 \
+                 issues a code."
+            );
+            return;
+        }
+        Err(DpsError::Transport(msg)) => {
+            panic!("PROBE FAIL: Transport error on T=112 send_chk: {msg}");
+        }
+        Err(e) => {
+            panic!("PROBE FAIL: unexpected error on T=112 send_chk: {e:?}");
+        }
+    };
+
+    // ── Step 4: build the byte-EXACT WebCheck DocType=9 BEGIN ──────────────
+    // The T=112 request itself advanced the DPS chain, so the BEGIN's `<MAC ID>`
+    // previous-hash must chain off sha256(t112_xml) — NOT the pre-T=112 settled
+    // tip (which the T=112 send superseded).  Compute the post-T=112 tip locally
+    // (WebCheck chains the next offline doc off the T=112 request it just sent).
+    let post_t112_tip_hex: String = {
+        let tip: [u8; 32] = Sha256::digest(t112_req.xml.as_bytes()).into();
+        hex_lower(&tip)
+    };
+    println!(
+        "\n--- BUILD DocType=9 BEGIN (<C T='109'>, WebCheck-EXACT OfflineOnManually form) ---"
+    );
+    println!("  BEGIN <MAC ID> previous_hash (post-T=112 tip) = {post_t112_tip_hex}");
+    let business_ts = iso_now();
+    let ts_str = recover_kyiv_ts_str(&business_ts);
+    let date_time = recover_kyiv_local_epoch(&business_ts);
+
+    let begin_xml_bytes = build_webcheck_exact_begin_xml(
+        &fiscal_number,
+        tn,
+        &tn_prefix,
+        &zn,
+        ndv,
+        begin_di,
+        &ts_str,
+        &code,
+        &post_t112_tip_hex,
+    );
+    // The wire bytes are cp1251-encoded; the `ПН ` TN prefix is Cyrillic (the
+    // rest is ASCII), so lossy-UTF8 is a faithful human-readable render of the
+    // exact bytes signed + sent.
+    println!(
+        "  BEGIN <C T='109'> XML ({} bytes, cp1251): {}",
+        begin_xml_bytes.len(),
+        String::from_utf8_lossy(&begin_xml_bytes)
+    );
+    println!("  BEGIN <TS>={ts_str}  wire date_time(fake-epoch)={date_time}");
+    println!("  BEGIN <MAC ID='{code}'>  wire id_offline={code}  typCheck=ServiceChk(3)");
+    // Print OUR production-form BEGIN bytes for the record (the byte-diff target).
+    println!(
+        "  [for the record] OUR emit_offline_session_boundary form (production) looks like: \
+         <RQ NDv=\"ПРО_каса\" PrV=\"1.1\" V=\"1\"><DAT DI=\"{begin_di}\" FN=\"{fiscal_number}\" \
+         TN=\"{tn}\" V=\"1\" ZN=\"0\"><C T='109'></C><TS>{ts_str}</TS></DAT>\
+         <MAC ID='{code}'>{post_t112_tip_hex}</MAC></RQ>  \
+         (bisect deltas vs WebCheck: NDv/PrV present, TN bare, ZN=\"0\", attr order)"
+    );
+
+    // ── Step 5: sign with the LIVE key (ATTACHED CAdES-BES) ────────────────
+    println!("\n--- SIGN BEGIN (native ATTACHED CAdES-BES, live key) ---");
+    let cms_signer_begin = CmsSigner {
+        cert_der,
+        signer: &signer_inner,
+        profile: CmsProfile::Dstu4145WithGost34311Pb,
+    };
+    let begin_signed = cms_signer_begin
+        .sign_with(
+            &begin_xml_bytes,
+            CmsBuildOptions {
+                attached: true,
+                signing_time: Some(SystemTime::now()),
+            },
+        )
+        .expect("BEGIN sign must succeed")
+        .cms_der;
+    let econtent_ok = extract_econtent(&begin_signed)
+        .map(|inner| inner == begin_xml_bytes)
+        .unwrap_or(false);
+    println!(
+        "  BEGIN SIGNED: {} bytes (ATTACHED CMS; eContent==canonical XML: {econtent_ok})",
+        begin_signed.len()
+    );
+
+    // ── Step 6: send the BEGIN + capture the FULL DPS response ─────────────
+    // OFFLINE-shaped BEGIN: typCheck=ServiceChk(3), non-empty wire id_offline
+    // (the offline code), date_time = fake-epoch matching the signed `<TS>`.
+    println!("\n--- SEND BEGIN → live DPS ---");
+    let begin_envelope = CheckEnvelope {
+        rro_fn: fiscal_number.clone(),
+        date_time,
+        check_sign: begin_signed,
+        local_number: begin_di as i32,
+        check_type: DpsCheckType::ServiceChk,
+        // OFFLINE issuance: the offline code rides the wire id_offline.
+        id_offline: code.clone(),
+        id_cancel: String::new(),
+    };
+
+    let mut accepted = false;
+    let mut reject: Option<(i32, String)> = None;
+    match channel.send_chk(begin_envelope).await {
+        Ok(ack) => {
+            accepted = true;
+            println!(
+                "  BEGIN DPS OK — the byte-exact WebCheck BEGIN OPENED an offline session.  \
+                 assigned id (server_fiscal_no)={:?}  id_sign={} bytes  data_sign={} bytes",
+                ack.id,
+                ack.id_sign.len(),
+                ack.data_sign.len()
+            );
+        }
+        Err(DpsError::Server { code: -4, message }) => {
+            println!(
+                "PROBE SKIP: DPS rate-limit (-4) on BEGIN send_chk: {message}. Cool down 5+ min."
+            );
+            return;
+        }
+        Err(DpsError::Server { code, message }) => {
+            reject = Some((code, message.clone()));
+            println!(
+                "  BEGIN DPS REJECT — dps_code={code}  message={message:?}\n  \
+                 (this is the byte-exact WebCheck DocType=9 BEGIN reject.  Interpretation: if \
+                 code=-8, the FORMAT is NOT the cause — even WebCheck's proven wire form draws \
+                 -8, so the -8 is state/clock/chain, not XML shape; if it is a DIFFERENT code \
+                 than our production builder draws, the FORMAT delta matters — bisect with \
+                 {ENV_BEGIN_TN_PREFIX} / {ENV_BEGIN_ZN} / {ENV_BEGIN_NDV})"
+            );
+        }
+        Err(DpsError::Transport(msg)) => {
+            panic!("PROBE FAIL: Transport error on BEGIN send_chk: {msg}");
+        }
+        Err(e) => {
+            panic!("PROBE FAIL: unexpected error on BEGIN send_chk: {e:?}");
+        }
+    }
+
+    // ── Step 7: re-read state — did a session open? ────────────────────────
+    println!("\n--- POST-STATE ---");
+    if let Ok(s) = channel.status_rro(&fn_sign).await {
+        println!(
+            "  post statusRro: open_shift={} online={} last_signer={:?}",
+            s.open_shift, s.online, s.last_signer
+        );
+        if accepted && !s.online {
+            println!(
+                "  → online=false after an accepted BEGIN: an offline session is OPEN on the \
+                 cabinet.  Close it with `live_recover_close_dangling_offline_session`."
+            );
+        }
+    }
+
+    // ── Step 8: verdict ────────────────────────────────────────────────────
+    // PASS iff DPS ACCEPTED the byte-exact WebCheck BEGIN → the wire FORMAT was
+    // the -8 cause and our `emit_offline_session_boundary` must match WebCheck.
+    // On reject we FAIL LOUDLY with the exact code + message (printed above) and
+    // note both forms for the record.
+    assert!(
+        accepted,
+        "PROBE FAIL: DPS did NOT accept the byte-EXACT WebCheck DocType=9 BEGIN — reject \
+         {reject:?}.  The exact dps_code + message + BOTH the WebCheck-form and our \
+         production-form bytes are printed above (Steps 4-6).  If this is STILL -8, the wire \
+         FORMAT is NOT the -8 cause (even WebCheck's proven form draws it) → the -8 is \
+         state/clock/chain-position, not XML shape.  If it is a DIFFERENT code than our \
+         production BEGIN draws, the FORMAT delta matters — bisect via {ENV_BEGIN_TN_PREFIX} \
+         / {ENV_BEGIN_ZN} / {ENV_BEGIN_NDV}."
+    );
+    println!(
+        "\nPROBE PASS: DPS ACCEPTED the byte-exact WebCheck DocType=9 BEGIN — the wire FORMAT \
+         WAS the -8 cause.  Rewrite `emit_offline_session_boundary` to match WebCheck's proven \
+         form (no NDv/PrV, TN='ПН {{TN}}', ZN='').  NOTE: an offline session is now OPEN on the \
+         cabinet — close it with `live_recover_close_dangling_offline_session`."
     );
 }
