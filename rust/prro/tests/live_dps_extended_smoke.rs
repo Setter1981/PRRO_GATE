@@ -2792,6 +2792,100 @@ async fn live_smoke_9_offline_drain_mac_id() {
     print_live_diagnostics(pool, doc_id).await;
     println!("  offline_dps_code sent as <MAC ID>: {stamped_code:?}");
 
+    // ── Step 10b: DocType=10 END (OFFLINE_SESSION_END) reject diagnostics ────
+    //
+    // The B10 drain lazily mints a DocType=10 END boundary (`<C T='110'>`) AFTER
+    // the backlog [BEGIN, SHIFT_OPEN, SELL] drains, to close the offline session
+    // at DPS.  Live smoke 9 saw the backlog reach ACK (`-5`/`-8`/`-9` cleared)
+    // but the drain finalize as `OFFLINE_DRAIN_PARTIAL finalized:false` with a
+    // `per_doc_failures` entry classed `offline_session_end_hold` and a
+    // `STAGE_SEND_REJECTED { retry_class: TerminalReject }` — the END was signed,
+    // sent, and TERMINAL-rejected by DPS, but the smoke never surfaced the END's
+    // DPS reject code.  This block prints WHY: the END row's state /
+    // offline_dps_code / server_fiscal_no, its latest transport_trace
+    // (outcome, dps_code, error_kind, error_message), and its SIGNED `<C T='110'>`
+    // document — so the next live run reveals the reject reason instead of only
+    // the failure CLASS.  The END is a SEPARATE `fiscal_documents` row (NOT
+    // `doc_id`, which is the SELL) — we look it up by doc_type + cross-check the
+    // `per_doc_failures` document_ids.
+    println!("\n--- DocType=10 END (OFFLINE_SESSION_END) REJECT DIAGNOSTICS ---");
+    // (i) Dump every per-doc drain failure `(document_id, failure_class)` — the
+    //     END shows up here as `offline_session_end_hold`.
+    for (fail_doc, fail_class) in summary.per_doc_failures() {
+        println!(
+            "  per_doc_failure: document_id={} failure_class={fail_class}",
+            hex_lower(fail_doc.as_bytes())
+        );
+    }
+    // (ii) Locate the single DocType=10 END row for this FN and print its
+    //      row-level fiscal state.  `fiscal_documents` has NO per-row dps_code
+    //      column (the DPS reject code lives in transport_trace) — so we print
+    //      state / offline_dps_code (the `<MAC ID>` code) / server_fiscal_no here
+    //      and the DPS code via `print_live_diagnostics` below.
+    let end_row: Option<(DocumentId, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT document_id, state, offline_dps_code, server_fiscal_no \
+         FROM fiscal_documents \
+         WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_END' \
+         ORDER BY lnd DESC LIMIT 1",
+    )
+    .bind(&fiscal_number)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    match end_row {
+        None => println!(
+            "  NO OFFLINE_SESSION_END row — the drain never minted a DocType=10 END \
+             (session-end mint refused before any row; check the audit lines above)"
+        ),
+        Some((end_doc_id, end_state, end_offline_code, end_sfn)) => {
+            println!(
+                "  END row: document_id={} state={end_state} \
+                 offline_dps_code(<MAC ID>)={end_offline_code:?} server_fiscal_no={end_sfn:?}",
+                hex_lower(end_doc_id.as_bytes())
+            );
+            // (iii) Latest transport_trace for the END: outcome_kind, the DPS
+            //       reject CODE (server_status_code), error_kind, error_message —
+            //       this is the `-N` reason the END was terminal-rejected.
+            println!("  END transport_trace + audit tail:");
+            print_live_diagnostics(pool, end_doc_id).await;
+            // (iv) The END's SIGNED `<C T='110'>` document — mirror how the SELL's
+            //      signed XML is surfaced above.  PAYLOAD_XML carries the human-
+            //      readable `<C T='110'>` header + `<MAC ID>`; SIGNED_XML is the
+            //      ATTACHED CMS actually sent on the drain (print its length +
+            //      confirm its eContent == PAYLOAD_XML, as smoke 9 does for the
+            //      SELL).  cp1251 payload but the `<C T>`/MAC region is ASCII, so
+            //      lossy UTF-8 is fine for the printed substring.
+            match read_document_file_piece4(pool, end_doc_id, "PAYLOAD_XML").await {
+                Some(end_payload) => {
+                    println!(
+                        "  END PAYLOAD_XML (<C T='110'> boundary): {}",
+                        String::from_utf8_lossy(&end_payload)
+                    );
+                    match read_document_file_piece4(pool, end_doc_id, "SIGNED_XML").await {
+                        Some(end_signed) => {
+                            let econtent_matches = extract_econtent(&end_signed)
+                                .map(|inner| inner == end_payload)
+                                .unwrap_or(false);
+                            println!(
+                                "  END SIGNED_XML: {} bytes (ATTACHED CMS; eContent==PAYLOAD_XML: {econtent_matches}) \
+                                 — these are the exact bytes the drain sent to DPS",
+                                end_signed.len()
+                            );
+                        }
+                        None => println!(
+                            "  END has NO SIGNED_XML artifact — it was rejected before/at sign \
+                             (state={end_state}); nothing was sent to DPS"
+                        ),
+                    }
+                }
+                None => println!(
+                    "  END has NO PAYLOAD_XML artifact — it was refused before stage_sign \
+                     produced canonical bytes (state={end_state})"
+                ),
+            }
+        }
+    }
+
     // ── B9 acceptance assertions ───────────────────────────────────────────
     // (1) The pre-B9 failure was DPS code -9 "not ID in MAC".  It MUST NOT recur.
     assert_ne!(
