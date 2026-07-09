@@ -3656,8 +3656,15 @@ async fn w12_kvt2_chain_seed_mismatch_escalates_manual_recon_not_hard_abort() {
     .await
     .unwrap();
 
-    // No DPS calls expected on the KVT2 finalize arm.
-    let c = carriers(vec![], vec![]);
+    // The KVT2 cohort doc finalizes to ACK (content-eligible), so the drain then
+    // mints + sends the B10 online END LAST (advance-at-SEND: 1 send_chk + 1
+    // last_chk).  The corrupted (NULL) seed matches the END's NULL `previous_hash`
+    // (the END is the first issued doc against a genesis seed here), so the END's
+    // send advances cleanly.  Provide its DPS acks.
+    let c = carriers(
+        vec![Ok(ack("DPS-FN-END", vec![]))],
+        vec![Ok(ack("DPS-FN-END", vec![0xEEu8; 32]))],
+    );
     let view = view_for(&c);
 
     // M2-04: the drain must NOT hard-abort — it returns Ok and escalates.

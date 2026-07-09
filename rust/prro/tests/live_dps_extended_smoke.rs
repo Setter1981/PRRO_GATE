@@ -3290,13 +3290,8 @@ async fn live_recover_close_dangling_offline_session() {
     let ts_str = recover_kyiv_ts_str(&business_ts);
     let date_time = recover_kyiv_local_epoch(&business_ts);
 
-    let end_xml_bytes = build_webcheck_exact_end_xml(
-        &fiscal_number,
-        tn,
-        recover_di,
-        &ts_str,
-        &settled_tip_hex,
-    );
+    let end_xml_bytes =
+        build_webcheck_exact_end_xml(&fiscal_number, tn, recover_di, &ts_str, &settled_tip_hex);
     // The wire bytes are cp1251-encoded; the `ПН ` TN prefix is Cyrillic (the
     // rest — `<C T='110'>` / bare `<MAC>` — is ASCII) so lossy-UTF8 is a faithful
     // human-readable render of the exact bytes signed + sent.

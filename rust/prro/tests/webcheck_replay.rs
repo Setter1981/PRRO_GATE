@@ -597,11 +597,16 @@ fn expected_for(fx: &Fixture, driven: &[&CorpusOp]) -> Expected {
     // boundary docs that the (pre-B10) WebCheck corpus fixture does not carry:
     // a DocType=9 BEGIN (lazily minted as the FIRST offline doc — takes the
     // LOWEST lnd, prepended) and a DocType=10 END (minted at drain finalize —
-    // takes the HIGHEST lnd, appended).  Both are real issued OFFLINE docs that
-    // reach ACK on drain ("offline_drained" class) and each consumes one code.
-    // The `compare` structural checks (monotonic/gap-free lnds via a single
-    // offset, per-index class, interior chain-link presence) hold for them; we
-    // only need to reflect their presence in the counts + per-index vectors.
+    // takes the HIGHEST lnd, appended).
+    //
+    // B10 END-online fix: the BEGIN is a real OFFLINE issued doc (offline-shaped
+    // `<MAC ID>`, consumes ONE code, class "offline_drained").  The END is an
+    // ONLINE issuance (bare `<MAC>`, advance-at-SEND, class "online") that
+    // consumes NO code (WebCheck `CloseOfflineDoc`).  Both are issued docs that
+    // reach ACK on drain.  The `compare` structural checks (monotonic/gap-free
+    // lnds via a single offset, per-index class, interior chain-link presence)
+    // hold for them; we only reflect their presence in the counts + per-index
+    // vectors.
     let offline = driven
         .iter()
         .any(|op| op.offline_class == "offline_drained");
@@ -613,12 +618,13 @@ fn expected_for(fx: &Fixture, driven: &[&CorpusOp]) -> Expected {
         lnds.insert(0, lo - 1);
         lnds.push(hi + 1);
         classes.insert(0, "offline_drained".to_string());
-        classes.push("offline_drained".to_string());
+        classes.push("online".to_string());
         // Interior chain links must be non-null (a synthetic marker suffices —
         // `compare` only checks presence for interior links, not hex equality).
         chain.insert(0, Some("b10-begin".to_string()));
         chain.push(Some("b10-end".to_string()));
-        codes_consumed += 2;
+        // Only the offline BEGIN consumes a code; the online END consumes none.
+        codes_consumed += 1;
         issued_count += 2;
     }
 
@@ -635,10 +641,11 @@ fn expected_for(fx: &Fixture, driven: &[&CorpusOp]) -> Expected {
 async fn replay(fx: &Fixture) -> (Expected, Observed) {
     let (driven, offline) = driven_sells(fx);
     // B10: an offline session lazily mints a DocType=9 BEGIN at the first offline
-    // doc (consumes +1 code) and a DocType=10 END at drain finalize (consumes +1
-    // code, +1 wire send).  So an offline replay needs `driven.len() + 2` codes
-    // (BEGIN + END on top of one per driven sell) and the drain sends
-    // `driven.len() + 2` docs (BEGIN + content + END).
+    // doc (offline-shaped, consumes +1 code) and a DocType=10 END at drain
+    // finalize (ONLINE issuance, bare `<MAC>`, +1 wire send, consumes NO code).
+    // Seed `driven.len() + 2` codes anyway (a harmless upper bound — the END
+    // leaves its slot unused); the drain sends `driven.len() + 2` docs
+    // (BEGIN + content + END).
     let boundary_docs = if offline { 2 } else { 0 };
     let codes = if offline {
         driven.len() as i64 + boundary_docs

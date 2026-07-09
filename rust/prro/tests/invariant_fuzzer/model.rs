@@ -553,13 +553,13 @@ impl RefModel {
                 for lnd in &backlog {
                     self.docs.insert(*lnd, DocState::Ack);
                 }
-                // B10 — at drain finalize the DocType=10 END is minted + sent LAST
-                // (predicted INDEPENDENTLY).  The impl
-                // (`ensure_and_drain_session_end`) mints the END at EVERY
-                // content-Eligible drain of a bound-shift offline session, gated
-                // ONLY on shift presence + `!already-END` — NOT on BEGIN presence
-                // (`backlog_drain.rs:2610` skips only on a NULL shift; there is no
-                // BEGIN-existence gate).  In normal production a BEGIN always
+                // B10 END-online fix — at drain finalize the DocType=10 END is
+                // minted + sent LAST as an ONLINE ISSUANCE (predicted
+                // INDEPENDENTLY).  The impl (`ensure_and_drain_session_end`) mints
+                // the END at EVERY content-Eligible drain of a bound-shift offline
+                // session, gated ONLY on shift presence + `!already-END` — NOT on
+                // BEGIN presence (`backlog_drain` skips only on a NULL shift; there
+                // is no BEGIN-existence gate).  In normal production a BEGIN always
                 // precedes the backlog (the `inline::run` hoist mints it for the
                 // first offline doc), so BEGIN presence and END-mint coincide.  The
                 // ONE case where they part is a production-UNREACHABLE fuzzer state:
@@ -568,42 +568,31 @@ impl RefModel {
                 // GoOnline` leaves a drainable offline backlog with NO BEGIN — and
                 // the real drain still mints the END (real `{1:Ack, 2:Ack}`).  So
                 // the model matches the impl: mint the END on any non-empty eligible
-                // drain, once-only (`session_has_end`), independent of BEGIN.  Code
-                // accounting: spare code → END issues + drains to ACK + finalize
-                // CAS's GoingOnline → Online; NO spare code → END signs bare →
-                // ABORTED terminally, finalize blocked → mode STAYS GoingOnline.
+                // drain, once-only (`session_has_end`), independent of BEGIN.
+                //
+                // ONLINE ISSUANCE semantics: the END is `fs_mode='ONLINE'` (bare
+                // `<MAC>`), so it consumes NO offline code (`codes_consumed`
+                // UNCHANGED — NOT offline-origin) and advances the ONLINE seed at
+                // the `Sending → Sent` CAS (advance-at-SEND), NOT at offline-ack.
+                // Its issuance is independent of the offline pool — it ALWAYS issues
+                // + drains to ACK on the AckPath drain (no pool-exhausted Abort
+                // branch: an online issuance never needs a code).
                 if !self.session_has_end {
                     self.session_has_end = true;
                     let end_lnd = self.next_lnd;
                     let end_prev = self.seed; // END chains off the last content doc
                     let end_unsigned = synth_unsigned_hash(end_lnd);
                     self.next_lnd += 1;
-                    if self.codes_consumed < self.codes_issued {
-                        // Spare code → END issues (OLA→ACK via drain) + finalize.
-                        // The END goes through offline-ack (M2-01) → it ADVANCES the
-                        // offline seed to its own unsigned hash (mirrors the impl's
-                        // `drive_session_end_to_ola` direct seed advance).
-                        self.docs.insert(end_lnd, DocState::Ack);
-                        self.offline_origin_lnds.insert(end_lnd);
-                        self.codes_consumed += 1;
-                        self.seed = Some(end_unsigned);
-                        self.mode = NodeMode::Online;
-                        return ExpectedOutcome::Mutated(Mutation {
-                            lnd: end_lnd,
-                            doc_state: DocState::Ack,
-                            seed_after: self.seed,
-                            previous_hash: end_prev,
-                            code_consumed: None,
-                        });
-                    }
-                    // Pool exhausted → the END signs bare → it is ABORTED terminally
-                    // (`SIGNED → Aborted`, #192-clean; NOT left SIGNED) and NO seed
-                    // advance; finalize blocked; mode stays GoingOnline.  The Aborted
-                    // END is re-mintable next tick (slot-free) once the pool refills.
-                    self.docs.insert(end_lnd, DocState::Aborted);
+                    // Online issuance → ACK via drain (Sent→Kvt2→Ack) + finalize.
+                    // Advance the ONLINE seed to the END's unsigned hash (mirrors
+                    // the impl's advance-at-SEND).  NO code consumed, NOT added to
+                    // `offline_origin_lnds` (it is online-origin).
+                    self.docs.insert(end_lnd, DocState::Ack);
+                    self.seed = Some(end_unsigned);
+                    self.mode = NodeMode::Online;
                     return ExpectedOutcome::Mutated(Mutation {
                         lnd: end_lnd,
-                        doc_state: DocState::Aborted,
+                        doc_state: DocState::Ack,
                         seed_after: self.seed,
                         previous_hash: end_prev,
                         code_consumed: None,

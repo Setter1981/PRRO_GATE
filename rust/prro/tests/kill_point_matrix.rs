@@ -400,8 +400,9 @@ async fn k6_offline_local_ack_drains_to_ack() {
     );
     assert_eq!(
         count_consumed_offline_codes(&pool).await,
-        3,
-        "B10: three codes consumed — BEGIN + SELL + END"
+        2,
+        "B10: two codes consumed — the offline BEGIN + SELL; the ONLINE END \
+         (advance-at-SEND, bare <MAC>) consumes NONE"
     );
     assert_eq!(
         send_calls.load(Ordering::SeqCst),

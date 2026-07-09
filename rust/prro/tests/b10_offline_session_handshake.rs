@@ -358,6 +358,25 @@ async fn consumed_code_count(pool: &SqlitePool) -> i64 {
     .unwrap()
 }
 
+/// Send-shape fields of the single boundary doc of `dt`:
+/// `(fs_mode, offline_fiscal_no, server_fiscal_no)`.  The online-shaped END has
+/// `fs_mode='ONLINE'`, `offline_fiscal_no IS NULL` (→ empty wire `id_offline`),
+/// and a non-empty `server_fiscal_no` (stamped at the advance-at-SEND CAS).
+async fn boundary_send_shape(
+    pool: &SqlitePool,
+    dt: DocType,
+) -> (String, Option<i64>, Option<String>) {
+    sqlx::query_as(
+        "SELECT fs_mode, offline_fiscal_no, server_fiscal_no FROM fiscal_documents \
+         WHERE fiscal_number = ? AND doc_type = ?",
+    )
+    .bind(FN)
+    .bind(dt)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // #4 (HEADLINE) — drain wire order is [9, SHIFT_OPEN? content…, 10]
 // ══════════════════════════════════════════════════════════════════════════
@@ -745,29 +764,37 @@ async fn run_full_offline_drain(n_drain_docs: usize) -> (App, DrainCarriers) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// #8 (TEETH) — the DocType=10 END, minted UNDER live GoingOnline at drain
-// finalize, MUST sign an OFFLINE-shaped receipt: `<MAC ID='{code}'>` (NOT a
-// bare `<MAC>`) and consume EXACTLY one pool code.  A bare `<MAC>` is the exact
-// naive-`run_staged` bug (gates 2/3 fail under GoingOnline/Draining → -5/-9).
+// #8 (TEETH) — the DocType=10 END, minted at drain finalize (node GoingOnline),
+// is an ONLINE issuance: it MUST sign an ONLINE-shaped receipt — a BARE `<MAC>`
+// (NO `ID=`), consume NO pool code, and carry an empty wire `id_offline` +
+// a `server_fiscal_no` stamped at the advance-at-SEND CAS.  This mirrors
+// WebCheck's `CloseOfflineDoc` (proven live: a bare-`<MAC>` online END was
+// ACCEPTED by DPS and closed the session).  The old offline-shaped END
+// (`<MAC ID='{code}'>` + a consumed code) earned DPS `-5 "no id offline"` on
+// a drain-to-online close.  TEETH: revert the END to offline-shaped
+// (`<MAC ID>` + a forced code) → the bare-`<MAC>` / no-`ID=` pins RED.
 // ══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn b10_end_signed_offline_shaped_with_mac_id_under_going_online() {
+async fn b10_end_signed_online_shaped_bare_mac_under_going_online() {
     let (app, _carriers) = run_full_offline_drain(3).await; // BEGIN + SELL + END
 
     let (end_xml, end_code) =
         boundary_payload_xml_and_code(app.db(), DocType::OfflineSessionEnd).await;
 
-    // TEETH: the END carries `<MAC ID='...'>` (offline shape), NOT a bare <MAC>.
+    // TEETH: the END carries a BARE `<MAC>` (online shape), NOT `<MAC ID='...'>`.
     assert!(
-        end_xml.contains("<MAC ID='"),
-        "END must sign OFFLINE-shaped <MAC ID='...'> (naive path signs bare <MAC>): {end_xml}"
+        !end_xml.contains("<MAC ID="),
+        "END must sign ONLINE-shaped bare <MAC> (offline path signs <MAC ID='...'> → DPS -5): {end_xml}"
     );
-    // It carries a real acquired pool code in the MAC ID.
-    let code = end_code.expect("END must have a stamped offline_dps_code");
     assert!(
-        end_xml.contains(&format!("<MAC ID='{code}'>")),
-        "END <MAC ID> must equal its acquired code {code}: {end_xml}"
+        end_xml.contains("<MAC>"),
+        "END must carry a bare <MAC> element: {end_xml}"
+    );
+    // The online END consumes NO pool code → no stamped offline_dps_code.
+    assert!(
+        end_code.is_none(),
+        "END must NOT stamp an offline_dps_code (online issuance consumes no code): {end_code:?}"
     );
     // It is a `<C T="110">` service receipt.
     assert!(
@@ -777,15 +804,16 @@ async fn b10_end_signed_offline_shaped_with_mac_id_under_going_online() {
 }
 
 #[tokio::test]
-async fn b10_boundary_docs_consume_exactly_two_codes() {
-    // BEGIN consumes 1 code (minted while Offline), END consumes 1 code (minted
-    // while GoingOnline).  content SELL consumes 1.  So 3 codes total for a
-    // 1-content session; exactly 2 are the boundary docs.
+async fn b10_offline_boundary_begin_consumes_one_code_end_consumes_none() {
+    // BEGIN consumes 1 code (minted while Offline → offline-shaped `<MAC ID>`).
+    // The content SELL consumes 1.  The END is an ONLINE issuance minted at
+    // drain finalize (bare `<MAC>`) → it consumes NO code.  So 2 codes total for
+    // a 1-content session: the offline BEGIN + the offline SELL.
     let (app, _carriers) = run_full_offline_drain(3).await;
     assert_eq!(
         consumed_code_count(app.db()).await,
-        3,
-        "BEGIN + SELL + END each consume exactly one pool code"
+        2,
+        "BEGIN + SELL each consume one pool code; the online END consumes NONE"
     );
     assert_eq!(
         count_doc_type(app.db(), DocType::OfflineSessionBegin).await,
@@ -794,6 +822,49 @@ async fn b10_boundary_docs_consume_exactly_two_codes() {
     assert_eq!(
         count_doc_type(app.db(), DocType::OfflineSessionEnd).await,
         1
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// RED-first pin #4 — the DocType=10 END is an ONLINE ISSUANCE: the row carries
+// `fs_mode='ONLINE'`, `offline_fiscal_no IS NULL` (→ empty wire `id_offline`),
+// and a non-empty `server_fiscal_no` stamped at the `Sending → Sent` CAS
+// (advance-at-SEND).  The BEGIN stays offline-shaped (`fs_mode='OFFLINE'`,
+// a stamped `offline_fiscal_no`, NO `server_fiscal_no` — an offline-acked doc).
+// This asymmetry mirrors WebCheck (`CloseOfflineDocOffline` vs `CloseOfflineDoc`).
+// ══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn b10_end_is_online_issuance_with_sfn_empty_id_offline() {
+    let (app, _carriers) = run_full_offline_drain(3).await;
+
+    // END: online-shaped issued doc.
+    let (end_fs_mode, end_offline_no, end_sfn) =
+        boundary_send_shape(app.db(), DocType::OfflineSessionEnd).await;
+    assert_eq!(
+        end_fs_mode, "ONLINE",
+        "END must be minted fs_mode=ONLINE (online issuance at drain finalize)"
+    );
+    assert!(
+        end_offline_no.is_none(),
+        "END must have NULL offline_fiscal_no (→ empty wire id_offline): {end_offline_no:?}"
+    );
+    let sfn = end_sfn.expect("END must be stamped a server_fiscal_no at the Sending→Sent CAS");
+    assert!(
+        !sfn.is_empty(),
+        "END server_fiscal_no must be non-empty (advance-at-SEND online issuance)"
+    );
+
+    // BEGIN: still offline-shaped (the asymmetry is intentional).
+    let (begin_fs_mode, begin_offline_no, _begin_sfn) =
+        boundary_send_shape(app.db(), DocType::OfflineSessionBegin).await;
+    assert_eq!(
+        begin_fs_mode, "OFFLINE",
+        "BEGIN stays offline-shaped (minted while OFFLINE, opens the session)"
+    );
+    assert!(
+        begin_offline_no.is_some(),
+        "BEGIN must stamp offline_fiscal_no (offline-shaped <MAC ID>): {begin_offline_no:?}"
     );
 }
 
