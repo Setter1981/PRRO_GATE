@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use prro::db::invariant_scan::Violation;
-use prro::db::models::enums::DocState;
+use prro::db::models::enums::{DocState, ShiftState};
 use prro::services::reconciliation::online_convergence::TickSummary;
 
 use crate::interp::{ObservedDoc, RealOutcome};
@@ -144,6 +144,14 @@ fn check_doc_against_mutation(
             doc.code_consumed, m.code_consumed
         )));
     }
+    if let Some(expected_shift) = m.shift_state_after {
+        if doc.shift_state_after != expected_shift {
+            return Err(Divergence(format!(
+                "shift_state mismatch: real {:?} != model {:?}",
+                doc.shift_state_after, expected_shift
+            )));
+        }
+    }
 
     // Structural seed (constraint #2):
     // (a) the seed ADVANCED this op iff the model says it advanced.  The model
@@ -164,6 +172,19 @@ fn check_doc_against_mutation(
         )));
     }
     Ok(())
+}
+
+/// Teeth helper for shift-aware model predictions.  It is intentionally tiny:
+/// the real fuzzer path checks this through [`check_doc_against_mutation`], and
+/// directed canaries can call it with synthetic states to prove the oracle goes
+/// RED on shift drift without constructing a whole DB.
+pub fn check_shift_state(real: ShiftState, expected: Option<ShiftState>) -> Result<(), Divergence> {
+    match expected {
+        Some(expected) if real != expected => Err(Divergence(format!(
+            "shift_state mismatch: real {real:?} != model {expected:?}"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Ledger-delta for `Recovered` (drain / go-online) ops: the real ledger

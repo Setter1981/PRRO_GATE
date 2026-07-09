@@ -26,6 +26,17 @@ fn dps_script() -> impl Strategy<Value = DpsScript> {
     ]
 }
 
+/// Tier-1 shift/Z generator slice.  ACK is the happy path; Reject crosses SEND
+/// and exercises the shift RMR lane.  D5 forms (`NotFound`, `Superseded`) are
+/// intentionally held out until the shift-doc D5 production/model contract is
+/// resolved; the directed dossier tracks that as a separate required slice.
+fn shift_dps_script() -> impl Strategy<Value = DpsScript> {
+    prop_oneof![
+        Just(DpsScript::ack_path()),
+        Just(DpsScript::send_then_reject()),
+    ]
+}
+
 /// One `Op` intent.  `Crash` is drawn from the wire stages {Send, Kvt1}
 /// (drop-injection: the in-flight wire future drops — TRANSPORT collapse; the
 /// process may live on, so later ops legitimately run) and, since U3, the
@@ -51,6 +62,13 @@ fn op() -> impl Strategy<Value = Op> {
         // by `generator_emits_online_and_offline_returns`).
         dps_script().prop_map(Op::OnlineReturn),
         Just(Op::OfflineReturn),
+        // Tier-1 shift/Z surface.  These stay flat intents too: if the current
+        // node mode/shift precondition is wrong, the interpreter/model classify
+        // the refusal or no-op at runtime instead of filtering the sample space.
+        shift_dps_script().prop_map(Op::OnlineShiftOpen),
+        Just(Op::OfflineShiftOpen),
+        shift_dps_script().prop_map(Op::OnlineZReport),
+        Just(Op::OfflineZReport),
         dps_script().prop_map(Op::GoOnline),
         dps_script().prop_map(Op::Drain),
         Just(Op::Reboot),

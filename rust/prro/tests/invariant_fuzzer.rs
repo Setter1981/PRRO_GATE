@@ -844,6 +844,7 @@ fn differential_catches_lnd_divergence() {
         seed_after: Some([2u8; 32]),
         previous_hash: Some([1u8; 32]),
         code_consumed: None,
+        shift_state_after: None,
     });
     let real = interp::RealOutcome::Doc(interp::ObservedDoc {
         lnd: 3, // ← divergence: model expected lnd 2
@@ -851,12 +852,202 @@ fn differential_catches_lnd_divergence() {
         previous_hash: Some(vec![1u8; 32]),
         seed_after: Some(vec![9u8; 32]),
         code_consumed: None,
+        shift_state_after: ShiftState::Opened,
     });
     let res = oracle::check_differential(&real, &expected, Some(&[1u8; 32]));
     assert!(
         res.is_err(),
         "real lnd 3 != model lnd 2 must be flagged; got {res:?}"
     );
+}
+
+/// Tier-1 slice 1 — online Z_REPORT is a genuine fuzzer op, not a side test:
+/// model predicts the Z doc and the shift transition, interpreter drives the
+/// production inline Z dispatcher, and the differential checks both.
+#[tokio::test]
+async fn differential_online_z_report_closes_shift_matches_model() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let mut model = RefModel::new_online_open_shift();
+
+    let prior_tip = ctx.read_seed().await;
+    let op = Op::OnlineZReport(DpsScript::ack_path());
+    let expected = model.apply(&op);
+    let real = interp::run_op(&mut ctx, &op).await;
+
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("online Z_REPORT must match model: {d:?}"));
+    assert_eq!(
+        ctx.only_doc_type().await,
+        "Z_REPORT",
+        "interpreter must drive a real Z_REPORT doc"
+    );
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::Closed,
+        "online Z_REPORT must close the shift"
+    );
+}
+
+/// Tier-1 slice 2 seed — offline Z_REPORT local-acks through the production
+/// path and moves the shift into ClosingLocalPendingDrain.
+#[tokio::test]
+async fn differential_offline_z_report_enters_closing_pending_drain() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(2).await;
+    let mut model = RefModel::new_offline_open_shift(2);
+
+    let prior_tip = ctx.read_seed().await;
+    let op = Op::OfflineZReport;
+    let expected = model.apply(&op);
+    let real = interp::run_op(&mut ctx, &op).await;
+
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("offline Z_REPORT local ack must match model: {d:?}"));
+    assert_eq!(ctx.only_doc_type().await, "Z_REPORT");
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::ClosingLocalPendingDrain
+    );
+}
+
+/// Offline Z_REPORT followed by GoOnline(AckPath) drains the Z doc and closes
+/// the shift.  This is the first edge-13/close proof in the model harness.
+#[tokio::test]
+async fn differential_offline_z_report_go_online_ack_closes_shift() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(2).await;
+    let mut model = RefModel::new_offline_open_shift(2);
+
+    let _ = model.apply(&Op::OfflineZReport);
+    let _ = interp::run_op(&mut ctx, &Op::OfflineZReport).await;
+
+    let _ = model.apply(&Op::GoOnline(DpsScript::ack_path()));
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::ack_path())).await;
+
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("offline Z drain ledger must match the model");
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::Closed,
+        "drained offline Z_REPORT must close the shift"
+    );
+}
+
+/// Edge 14 RMR pin: an offline Z_REPORT has crossed the local-commit threshold
+/// (`ClosingLocalPendingDrain`).  A drain reject cannot roll the close back; it
+/// must halt the FN in RequiresManualReconciliation.
+#[tokio::test]
+async fn differential_offline_z_report_drain_reject_escalates_edge14_rmr() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(2).await;
+    let mut model = RefModel::new_offline_open_shift(2);
+
+    let _ = model.apply(&Op::OfflineZReport);
+    let _ = interp::run_op(&mut ctx, &Op::OfflineZReport).await;
+
+    let _ = model.apply(&Op::GoOnline(DpsScript::send_then_reject()));
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::send_then_reject())).await;
+
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("edge-14 reject ledger must match the model");
+    oracle::check_shift_state(ctx.read_shift_state().await, Some(model.shift_state))
+        .expect("edge-14 reject must match the model shift state");
+    assert_eq!(
+        model.shift_state,
+        ShiftState::RequiresManualReconciliation,
+        "model must classify drain reject from CLPD as edge-14 RMR"
+    );
+}
+
+/// Teeth canary: the shift oracle must go RED on a wrong predicted shift state.
+/// If this ever passes, shift/Z predictions are tautological.
+#[test]
+fn teeth_shift_state_oracle_catches_drift() {
+    let res = oracle::check_shift_state(ShiftState::Opened, Some(ShiftState::Closed));
+    assert!(
+        res.is_err(),
+        "shift-state oracle must reject Opened when the model predicted Closed"
+    );
+}
+
+/// Tier-1 shift-open slice — online SHIFT_OPEN is driven through production
+/// inline path and opens a closed shift.
+#[tokio::test]
+async fn differential_online_shift_open_opens_shift_matches_model() {
+    let mut ctx = interp::FuzzCtx::new_online_closed_shift().await;
+    let mut model = RefModel::new_online_closed_shift();
+
+    let prior_tip = ctx.read_seed().await;
+    let op = Op::OnlineShiftOpen(DpsScript::ack_path());
+    let expected = model.apply(&op);
+    let real = interp::run_op(&mut ctx, &op).await;
+
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("online SHIFT_OPEN must match model: {d:?}"));
+    assert_eq!(ctx.only_doc_type().await, "SHIFT_OPEN");
+    assert_eq!(ctx.read_shift_state().await, ShiftState::Opened);
+}
+
+/// Offline SHIFT_OPEN local-acks and leaves the shift in
+/// OpenedLocalPendingDrain until the backlog drains.
+#[tokio::test]
+async fn differential_offline_shift_open_enters_opened_pending_drain() {
+    let mut ctx = interp::FuzzCtx::new_offline_closed_shift(2).await;
+    let mut model = RefModel::new_offline_closed_shift(2);
+
+    let prior_tip = ctx.read_seed().await;
+    let op = Op::OfflineShiftOpen;
+    let expected = model.apply(&op);
+    let real = interp::run_op(&mut ctx, &op).await;
+
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("offline SHIFT_OPEN local ack must match model: {d:?}"));
+    assert_eq!(ctx.only_doc_type().await, "SHIFT_OPEN");
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::OpenedLocalPendingDrain
+    );
+}
+
+/// Offline SHIFT_OPEN followed by GoOnline(AckPath) drains the open artifact and
+/// reaches Opened.
+#[tokio::test]
+async fn differential_offline_shift_open_go_online_ack_opens_shift() {
+    let mut ctx = interp::FuzzCtx::new_offline_closed_shift(2).await;
+    let mut model = RefModel::new_offline_closed_shift(2);
+
+    let _ = model.apply(&Op::OfflineShiftOpen);
+    let _ = interp::run_op(&mut ctx, &Op::OfflineShiftOpen).await;
+
+    let _ = model.apply(&Op::GoOnline(DpsScript::ack_path()));
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::ack_path())).await;
+
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("offline SHIFT_OPEN drain ledger must match model");
+    oracle::check_shift_state(ctx.read_shift_state().await, Some(model.shift_state))
+        .expect("offline SHIFT_OPEN drain shift state must match model");
+    assert_eq!(model.shift_state, ShiftState::Opened);
+}
+
+/// Edge 6 RMR pin: an offline SHIFT_OPEN has crossed the local-commit threshold
+/// (`OpenedLocalPendingDrain`).  A drain reject requires manual reconciliation.
+#[tokio::test]
+async fn differential_offline_shift_open_drain_reject_escalates_edge6_rmr() {
+    let mut ctx = interp::FuzzCtx::new_offline_closed_shift(2).await;
+    let mut model = RefModel::new_offline_closed_shift(2);
+
+    let _ = model.apply(&Op::OfflineShiftOpen);
+    let _ = interp::run_op(&mut ctx, &Op::OfflineShiftOpen).await;
+
+    let _ = model.apply(&Op::GoOnline(DpsScript::send_then_reject()));
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::send_then_reject())).await;
+
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("edge-6 reject ledger must match model");
+    oracle::check_shift_state(ctx.read_shift_state().await, Some(model.shift_state))
+        .expect("edge-6 reject shift state must match model");
+    assert_eq!(model.shift_state, ShiftState::RequiresManualReconciliation);
 }
 
 /// Acceptance [3]: an invalid op (`SellWithClosedShift`) is `ExpectedNoMutation`
