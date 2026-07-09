@@ -123,6 +123,17 @@ const ENV_FN: &str = "PRRO_LIVE_DPS_FN";
 const ENV_JKS_PATH: &str = "PRRO_LIVE_DPS_JKS_PATH";
 /// JKS password (NEVER logged).
 const ENV_JKS_PASS: &str = "PRRO_LIVE_DPS_JKS_PASS";
+/// Smoke-9 only: back-date the offline documents (DocType=9 BEGIN + the offline
+/// SHIFT_OPEN + the offline SELL) by this many SECONDS, simulating a REAL
+/// offline period.  Default `0` = docs dated "now" (unchanged behavior).  The
+/// smoke drains near-instantly, so with `0` every offline doc carries the
+/// current second, which DPS intermittently rejects as at/ahead of its clock
+/// (`-8` on the drained BEGIN).  A real offline period dates docs minutes/hours
+/// in the past — set e.g. `600` to date them 10 minutes back and see whether the
+/// `-8` clears.  All three offline docs move together (their frozen `<TS>` and
+/// the drain envelope `date_time` still agree — both derive from the same
+/// back-dated `business_ts`).
+const ENV_OFFLINE_BACKDATE_SEC: &str = "PRRO_LIVE_DPS_OFFLINE_BACKDATE_SEC";
 
 const DEFAULT_HOST: &str = "https://cabinet.tax.gov.ua:9443";
 const DEFAULT_FN: &str = "4000162280";
@@ -1050,6 +1061,33 @@ const SHIFT_OPEN_PAYLOAD_JSON: &str = r#"{"opening_sum_kop":0}"#;
 /// `<TS>` / wire `date_time`, and DPS rejects a stale receipt time.
 fn iso_now() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// Smoke-9 knob: how many SECONDS to back-date the offline documents by, read
+/// from `PRRO_LIVE_DPS_OFFLINE_BACKDATE_SEC`.  `0` (the default, and the value
+/// when unset or unparseable) means "date the offline docs now" — unchanged
+/// behavior.  A positive `N` simulates a real offline period of `N` seconds.
+fn offline_backdate_secs() -> i64 {
+    std::env::var(ENV_OFFLINE_BACKDATE_SEC)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(0)
+}
+
+/// `business_ts` for a smoke-9 OFFLINE document: `iso_now()` back-dated by
+/// `PRRO_LIVE_DPS_OFFLINE_BACKDATE_SEC` seconds (0 ⇒ exactly `iso_now()`).  The
+/// SHIFT_OPEN + SELL offline docs derive their `business_ts` from this so all
+/// three offline docs (including the BEGIN, whose `business_ts` = the session
+/// `opened_at` we back-date in lockstep) land ~N seconds in the past — safely in
+/// DPS's clock past while their `<TS>` and wire `date_time` still agree (both
+/// derive from this same back-dated instant).
+fn offline_business_ts() -> String {
+    let back = offline_backdate_secs();
+    if back == 0 {
+        return iso_now();
+    }
+    (chrono::Utc::now() - chrono::Duration::seconds(back)).to_rfc3339()
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -2180,10 +2218,13 @@ const SMOKE9_SELL_PAYLOAD_JSON: &str = r#"{"items":[{"code":"item-1","name":"Tes
 const SMOKE9_SELL_TOTAL_KOP: i64 = 15000;
 
 /// Build a fresh NEW inbox entry for a production-path drive.  `business_ts` is
-/// stamped with the CURRENT instant (`iso_now`) — this is the -8 fix: the SELL /
-/// SHIFT_OPEN docs must carry a VALID CURRENT Kyiv wire date (`stage_sign`'s
-/// `<TS>` and `stage_send`'s envelope `date_time` both derive from this same
-/// `business_ts`, so a stale value would draw a DPS -8 "invalid XML date").
+/// stamped via `offline_business_ts()` — the CURRENT instant (`iso_now`, the -8
+/// fix) by default, or `now - N s` when `PRRO_LIVE_DPS_OFFLINE_BACKDATE_SEC>0`
+/// (simulate a real offline period).  Either way the SELL / SHIFT_OPEN docs
+/// carry a self-consistent Kyiv wire date (`stage_sign`'s `<TS>` and
+/// `stage_send`'s envelope `date_time` both derive from this same `business_ts`,
+/// so a stale value would draw a DPS -8 "invalid XML date"; back-dating merely
+/// moves the whole triplet consistently into DPS's clock past).
 fn smoke9_entry(
     fn_id: &str,
     op: &str,
@@ -2204,7 +2245,12 @@ fn smoke9_entry(
         correlation_id: None,
         signed_by_cashier_id: Some("test-cashier".into()),
         driver_id: Some("drv-smoke9".into()),
-        business_ts: Some(iso_now()), // CURRENT — the -8 fix
+        // CURRENT (the -8 fix) unless `PRRO_LIVE_DPS_OFFLINE_BACKDATE_SEC>0`, in
+        // which case it is `now - N s` — simulating a real offline period so the
+        // offline SHIFT_OPEN + SELL are dated safely in DPS's clock past (the
+        // BEGIN's `business_ts` = the session `opened_at`, back-dated in lockstep
+        // right after `go_offline`, so all three offline docs agree).
+        business_ts: Some(offline_business_ts()),
         total_sum_kop: total,
     }
 }
@@ -2268,7 +2314,15 @@ async fn live_smoke_9_offline_drain_mac_id() {
     println!("\n=== Smoke 9: B9 acceptance — offline drain carries <MAC ID> → live DPS ===");
     println!("FN: {fiscal_number}  TN: {tn}");
     println!("Endpoint: {host}");
-    println!("Goal: DPS ACCEPTS the offline drain (NOT -9 \"not ID in MAC\") — B9 / INV-11\n");
+    println!("Goal: DPS ACCEPTS the offline drain (NOT -9 \"not ID in MAC\") — B9 / INV-11");
+    // -8 diagnostic knob: how far in the past the offline docs are dated.  0 =
+    // "now" (near-instant drain → docs carry the current second, which DPS
+    // intermittently rejects -8 as at/ahead of its clock); N>0 simulates a real
+    // offline period so the offline docs sit safely in DPS's clock past.
+    let offline_backdate = offline_backdate_secs();
+    println!(
+        "{ENV_OFFLINE_BACKDATE_SEC}={offline_backdate} → offline docs dated {offline_backdate} s in the past\n"
+    );
 
     // ── Step 1: connect + pre-bracket ──────────────────────────────────────
     let channel = GrpcDpsChannel::connect(&host, Duration::from_secs(SMOKE_TIMEOUT_SECS))
@@ -2586,6 +2640,40 @@ async fn live_smoke_9_offline_drain_mac_id() {
     .await
     .unwrap_or_else(|e| panic!("Smoke 9 FAIL: go_offline: {e:?}"));
     println!("  go_offline: node OFFLINE, offline_session OPEN");
+
+    // ── Step 5b: (optional) back-date the OPEN session's `opened_at` ────────
+    // `go_offline` stamps `opened_at = Utc::now()`.  The lazily-minted DocType=9
+    // BEGIN reads THAT value (`mint_offline_session_begin`:
+    //   SELECT opened_at FROM offline_sessions WHERE state='OPEN'`)
+    // and stamps it as its own `business_ts` — so back-dating `opened_at` HERE
+    // (after go_offline, BEFORE the first offline doc is driven/signed) makes the
+    // BEGIN's frozen `<TS>` reflect the back-dated time.  We write an RFC-3339
+    // string (the SAME shape/instant `offline_business_ts()` gives the SHIFT_OPEN
+    // + SELL) so all THREE offline docs land ~N s in the past, consistently — a
+    // SQLite `datetime('now',…)` value would NOT parse as RFC-3339 in
+    // `format_kyiv_local`/`kyiv_local_epoch` and would desync the BEGIN.
+    if offline_backdate > 0 {
+        let backdated_opened_at = offline_business_ts();
+        let updated = sqlx::query(
+            "UPDATE offline_sessions SET opened_at = ? \
+             WHERE fiscal_number = ? AND state = 'OPEN'",
+        )
+        .bind(&backdated_opened_at)
+        .bind(&fiscal_number)
+        .execute(pool)
+        .await
+        .expect("back-date offline_session opened_at")
+        .rows_affected();
+        assert_eq!(
+            updated, 1,
+            "exactly one OPEN offline_session must have its opened_at back-dated \
+             (the BEGIN's business_ts is read from this row)"
+        );
+        println!(
+            "  BEGIN back-date: offline_session.opened_at ← {backdated_opened_at} \
+             (now - {offline_backdate}s; the DocType=9 BEGIN inherits this business_ts)"
+        );
+    }
 
     // ── Step 6: drive an offline SHIFT_OPEN then an offline SELL through the ──
     //            PRODUCTION write-path (Pattern C, full B10 wire sequence) ─────
