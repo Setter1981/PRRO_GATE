@@ -436,3 +436,84 @@ async fn pin7_teeth_auto_z_ignores_enforcement_toggle() {
         "TEETH: a durable Z exists despite the toggle being off"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// PIN 1d — the ONLINE auto-Z leg (RULING 3.4 "online → normal Z dispatch"). A
+//          shift over 24h on an ONLINE node → the auto-Z drives a NORMAL online
+//          Z (quiesce Clear → aggregate → edges 8+10) to terminal ACK. Proves
+//          the auto-Z is not offline-only; it reuses run_z_dispatch's online path
+//          (the same one pilot_online_half_e2e exercises via ingress).
+// ════════════════════════════════════════════════════════════════════════════
+#[tokio::test]
+async fn pin1d_online_auto_z_issues_normal_z_to_ack() {
+    // Default config (enforcement ON — moot; the auto-Z ignores it). ONLINE node.
+    let app = {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t3_autoz_online.db");
+        std::mem::forget(dir);
+        let toml = format!(
+            "app_name=\"prro\"\nversion=\"0.1.0\"\n[database]\ndb_path=\"{}\"\nsecure_db_path=\"{}_secure\"\n[admin_ui]\nenabled=false\nlisten=\"127.0.0.1:8445\"\n",
+            db_path.display().to_string().replace('\\', "/"),
+            db_path.display().to_string().replace('\\', "/"),
+        );
+        App::boot(AppConfig::from_toml(&toml).unwrap())
+            .await
+            .unwrap()
+    };
+    // DPS acks SHIFT_OPEN (via write path) — the online Z is driven by the tick's
+    // OWN RuntimeView DPS below, so this registry DPS only needs the SHIFT_OPEN.
+    let registry = build_registry(&app, shift_open_only_dps()).await;
+    seed_boot_baseline(app.db()).await;
+    let write_path = production_write_path_with_clock(
+        app.clone(),
+        Arc::new(registry),
+        Arc::new(FixedClock::from_rfc3339(CLOCK_FRESH)),
+    );
+    let open = drive(&*write_path, app.db(), shift_open_entry()).await;
+    assert_eq!(open.document_state, DocState::Ack);
+    assert_eq!(shift_state(app.db()).await, "OPENED");
+    // Node stays ONLINE (no go_offline) — the auto-Z takes the online Z leg.
+
+    // The tick's RuntimeView: a DPS that acks the online Z (send_chk + last_chk).
+    let z_dps: Arc<dyn DpsChannel> = Arc::new(
+        StubDpsChannel::with_queue(vec![Ok(ack("DPS-Z"))])
+            .with_last_chk_queue(vec![Ok(kvt1("DPS-Z"))]),
+    );
+    let sign_ctx = det_signing_ctx_for("OP-1");
+    let fn_sign = CheckSignBlob(vec![0xABu8, 0xCD]);
+    let view = RuntimeView {
+        dps: z_dps.as_ref(),
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    let clock = FixedClock::from_rfc3339(CLOCK_OVER_24H);
+
+    let outcome = app
+        .auto_z_close_over_limit_for_fn(FN, &clock, &view)
+        .await
+        .expect("online auto-Z tick must not error");
+    assert_eq!(
+        outcome,
+        AutoZOutcome::Issued,
+        "the ONLINE auto-Z issues a normal Z at the 24h boundary"
+    );
+    // The online Z reached terminal ACK and the shift is CLOSED (edges 8→10).
+    assert_eq!(
+        doc_count_by_type(app.db(), "Z_REPORT").await,
+        1,
+        "one Z minted"
+    );
+    let z_state: String = sqlx::query_scalar(
+        "SELECT state FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'Z_REPORT' LIMIT 1",
+    )
+    .bind(FN)
+    .fetch_one(app.db())
+    .await
+    .unwrap();
+    assert_eq!(z_state, "ACK", "the online Z reached terminal ACK");
+    assert_eq!(
+        shift_state(app.db()).await,
+        "CLOSED",
+        "the shift is CLOSED via the normal online Z (edges 8+10)"
+    );
+}
