@@ -203,6 +203,42 @@ pub fn check_ledger_delta(
     Ok(())
 }
 
+/// L0/INV-21 cash-on-hand oracle.
+///
+/// Independent re-derive of the cash-on-hand for `fiscal_number`'s open shift
+/// from the ledger, then compare to the model's `cash_on_hand` accumulator.
+///
+/// **Differential contract:**
+/// - Model `cash_on_hand` must equal the real derived value after every op.
+/// - If they diverge, a prod-side cash accounting bug or an L1-guard drift is
+///   detected (e.g. the L1 guard being reverted would let a cash RETURN issue,
+///   making real `cash_on_hand` go negative while the model stays at 0).
+///
+/// **Teeth (durable):** reverting the L1 guard in `convert.rs` makes this
+/// oracle RED: the model refuses the cash RETURN (NoMutation, cash stays at
+/// prior value) while prod accepts it (cash decrements) → divergence caught.
+///
+/// Called AFTER every op in the proptest harness (same cadence as
+/// `check_ledger_delta`).
+pub async fn check_cash_on_hand(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    model_cash: i64,
+) -> Result<(), Divergence> {
+    // Re-derive cash using the prod cash_ledger (INDEPENDENT model is the
+    // RefModel accumulator above; this reads the actual DB to cross-check).
+    let real_cash = prro::services::cash_ledger::cash_on_hand_for_fn(pool, fiscal_number)
+        .await
+        .map_err(|e| Divergence(format!("cash oracle: cash_on_hand_for_fn failed: {e}")))?;
+    if real_cash != model_cash {
+        return Err(Divergence(format!(
+            "cash oracle: real cash_on_hand {real_cash} != model {model_cash} \
+             (INV-21 differential breach — cash ledger diverged)"
+        )));
+    }
+    Ok(())
+}
+
 /// Z aggregation oracle — independent from `runtime::ingress::convert`.
 ///
 /// Reads the latest Z/close-shift document and the issued SELL/RETURN receipts

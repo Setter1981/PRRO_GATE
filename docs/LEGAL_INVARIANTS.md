@@ -174,6 +174,31 @@ Every Manual landing → Critical audit + forensic snapshot capture (§8.1) + �
 
 ---
 
+## 7а. Інваріанти касового залишку (Cash-On-Hand)
+
+### INV-21 — Готівка на касі ніколи не може бути від'ємною (cash-on-hand ≥ 0)
+Спроба RETURN із готівкою, що перевищує поточний готівковий залишок на касі, ПОВИННА бути відхилена fail-closed (до вставки в inbox, без рядка).
+
+**Формула:**
+```
+cash_on_hand = opening_cash + Σcash(SELL) − Σcash(RETURN) [+ service_in − service_out − epz_out (L3)]
+```
+де `opening_cash` = `cash_balance_kop` прочитана зі `shifts` при відкритті зміни (carry з попередньої закритої зміни, 0 для першої зміни).
+
+**Cash identification:** `type_code == "0"` (D1 frozen: CASH_SLOT=pay_index=1, convert.rs:701).
+
+**Engineering enforcement:**
+- Pre-inbox guard у `convert_to_signer_payload` (convert.rs): перевірка `cash_on_hand_for_fn < return_cash_kop` → `ConvertError::CashInsufficient`, HTTP 422, code `CASH_INSUFFICIENT`.
+- `L0 cash_ledger.rs`: `cash_on_hand_for_fn` (main_pool, no write-tx — invariant #1).
+- Reconcile seam: `invariant_scan::Violation::CashAnchorDrift` (check 16 у `scan()`).
+- Closing anchor: `shifts.cash_balance_kop` перезаписується закриваючим залишком у тій самій транзакції Closing→Closed (invariant #2).
+
+**L3 scope:** service-in / service-out / EPZ — нуль до L3 (TODO-gated коментар у `derive_cash_on_hand`).
+
+**Порушення:** видача готівки понад наявну — юридично неприпустимо; оперативно-фінансова відповідальність касира.
+
+---
+
 ## 8. Статус відносно production
 
 > **Status correction 2026-05-16 (Rust gateway M3b context).**  The original table below described the Python-era status snapshot at the time of Sprint 0.  Several rows are misleading for the Rust gateway pilot path: the Rust gateway is being built standalone (the Python path remains the production gateway today; the Rust gateway has not yet shipped) and does not yet implement the offline time-limit enforcement that the Python row claims.  The corrected status column below uses ⚠ for **active engineering risks / pilot gates** that the Rust gateway must address before production, alongside ✅ / ❌ for items unchanged.

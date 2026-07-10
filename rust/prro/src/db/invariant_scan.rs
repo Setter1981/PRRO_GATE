@@ -155,6 +155,21 @@ pub enum Violation {
         shift_id_hex: String,
         state: String,
     },
+    /// **L0 INV-21 — cash-anchor drift**.  The opening `cash_balance_kop` stored
+    /// in the current open shift's row diverges from the re-derived carry
+    /// (re-derived by re-walking all prior closed shifts' receipts).  This can
+    /// only happen if the carry was written incorrectly at open-time or if a
+    /// closed shift's `cash_balance_kop` was tampered with.
+    ///
+    /// `stored` = the shift row's `cash_balance_kop`; `re_derived` = the value
+    /// computed from the journal.  DETECTOR ONLY (report + alert; do NOT auto-heal
+    /// — drift here means the journal and the stored anchor disagree, requiring
+    /// human investigation).
+    CashAnchorDrift {
+        fiscal_number: String,
+        stored: i64,
+        re_derived: i64,
+    },
 }
 
 fn hex32_opt(b: &Option<Vec<u8>>) -> String {
@@ -487,6 +502,20 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             state,
         });
     }
+
+    // 16. L0 cash-anchor drift — DEFERRED from invariant_scan::scan().
+    //
+    // `reconcile_opening_anchor` is available as a standalone function for
+    // boot-time use (see `cash_ledger::reconcile_opening_anchor`).  It is NOT
+    // wired into the per-op `scan()` call yet because the closing-cash write
+    // (shift close via Z/ShiftClose → `update_cash_balance_tx`) is only wired
+    // for the online Z-report path.  The fuzzer's `SellWithClosedShift` test
+    // helper calls `force_shift_closed` directly, bypassing the close write —
+    // causing false `CashAnchorDrift` violations in every sequence that includes
+    // that op.  Wire Check 16 here once L3/L4 (offline Z-close cash writes +
+    // force-close seam) lands.  The direct test pin
+    // `l0_l1_cash_ledger::pin_l0_boot_reconcile_detects_drift` exercises the
+    // reconcile seam end-to-end in isolation.
 
     Ok(out)
 }

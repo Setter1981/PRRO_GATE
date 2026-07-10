@@ -2161,3 +2161,125 @@ async fn crash_kvt1_leaves_sent_committed() {
     }
     assert_eq!(ctx.send_calls(), 1, "one send_chk before the lastChk crash");
 }
+
+// ─── L0 cash-ledger differential tests ──────────────────────────────────────
+//
+// (A) `cash_differential_sell_and_return` — after each issued SELL prod cash
+//     increments; after a RETURN with sufficient cash it decrements. The
+//     `check_cash_on_hand` oracle asserts prod == model at every step.
+//
+// (B) `cash_oracle_detects_divergence_and_matches_on_valid_path` — proves the
+//     oracle FIRES on divergence (prod negative, model 0) and stays green on
+//     the matching valid path.  The L1 guard lives in `convert.rs` (ingress);
+//     the dedicated pin `pin_l1_teeth_revert_guard` in `l0_l1_cash_ledger.rs`
+//     tests the guard directly.  These fuzzer tests verify the ORACLE layer.
+
+/// L0 cash-differential — SELL builds cash; RETURN decrements; oracle
+/// confirms prod == model after every issued op.
+///
+/// Sequence:
+///   SELL₁  → prod 15000, model 15000
+///   SELL₂  → prod 30000, model 30000
+///   RETURN  → prod 15000, model 15000 (cash sufficient → admitted)
+#[tokio::test]
+async fn cash_differential_sell_and_return() {
+    use crate::model::CASH_AMOUNT_KOP;
+    use crate::oracle::check_cash_on_hand;
+
+    let mut ctx = FuzzCtx::new_online_open_shift().await;
+
+    // ── SELL₁ ──────────────────────────────────────────────────────────────
+    let out1 = run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out1, RealOutcome::Doc(_)),
+        "SELL₁ must issue; got {out1:?}"
+    );
+    let model_cash_after_sell1 = CASH_AMOUNT_KOP;
+    check_cash_on_hand(&ctx.pool, &ctx.fn_id, model_cash_after_sell1)
+        .await
+        .expect("cash oracle mismatch after SELL₁");
+
+    // ── SELL₂ ──────────────────────────────────────────────────────────────
+    let out2 = run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out2, RealOutcome::Doc(_)),
+        "SELL₂ must issue; got {out2:?}"
+    );
+    let model_cash_after_sell2 = 2 * CASH_AMOUNT_KOP;
+    check_cash_on_hand(&ctx.pool, &ctx.fn_id, model_cash_after_sell2)
+        .await
+        .expect("cash oracle mismatch after SELL₂");
+
+    // ── RETURN (cash sufficient → admitted) ────────────────────────────────
+    let out3 = run_op(&mut ctx, &Op::OnlineReturn(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out3, RealOutcome::Doc(_)),
+        "RETURN with sufficient cash must issue; got {out3:?}"
+    );
+    let model_cash_after_return = CASH_AMOUNT_KOP; // 30000 − 15000
+    check_cash_on_hand(&ctx.pool, &ctx.fn_id, model_cash_after_return)
+        .await
+        .expect("cash oracle mismatch after RETURN");
+}
+
+/// L0 cash-oracle teeth — directly verify that `check_cash_on_hand` detects
+/// divergence when prod cash goes negative while the model predicts 0.
+///
+/// The fuzzer enters at `inline::run`, bypassing `convert.rs`'s L1 guard —
+/// so an `Op::OnlineReturn` on an empty drawer ISSUES the doc (prod cash
+/// drops to −CASH_AMOUNT_KOP).  The RefModel WOULD refuse (NoMutation, cash
+/// stays 0) because `cash_on_hand < CASH_AMOUNT_KOP`.  This divergence is
+/// caught when the harness calls `check_cash_on_hand(prod, model_cash=0)`.
+///
+/// ★TEETH: this test is the durable regression sentinel for the oracle
+/// itself.  It verifies three things:
+///   (a) A RETURN on empty drawer issues in the fuzzer lane (since L1 is
+///       ingress-only; the write-path itself doesn't re-check).
+///   (b) `check_cash_on_hand` correctly reports `Err(Divergence)` when prod
+///       cash ≠ model cash (the oracle actually fires).
+///   (c) After one SELL to build cash, a second RETURN is accepted by both
+///       prod and the expected model value — oracle stays green.
+///
+/// If `check_cash_on_hand` is ever loosened to suppress negatives or skip
+/// the comparison, assertion (b) goes RED.
+#[tokio::test]
+async fn cash_oracle_detects_divergence_and_matches_on_valid_path() {
+    use crate::model::CASH_AMOUNT_KOP;
+    use crate::oracle::check_cash_on_hand;
+
+    let mut ctx = FuzzCtx::new_online_open_shift().await;
+
+    // ── (a): RETURN on empty drawer issues in the fuzzer lane ──────────────
+    // The fuzzer bypasses `convert.rs` L1; inline::run admits the RETURN.
+    let out_return = run_op(&mut ctx, &Op::OnlineReturn(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out_return, RealOutcome::Doc(_)),
+        "fuzzer-lane RETURN on empty drawer should issue (no L1 gate at inline::run); \
+         got {out_return:?}"
+    );
+    // Prod cash is now −CASH_AMOUNT_KOP.
+
+    // ── (b): oracle catches divergence — model=0, prod=−CASH_AMOUNT_KOP ────
+    // ★TEETH: if check_cash_on_hand is weakened to always return Ok(()), this
+    // expect_err fires and the teeth go RED.
+    let divergence_result = check_cash_on_hand(&ctx.pool, &ctx.fn_id, 0).await;
+    assert!(
+        divergence_result.is_err(),
+        "oracle must detect cash divergence: prod={actual}, model=0",
+        actual = prro::services::cash_ledger::cash_on_hand_for_fn(&ctx.pool, &ctx.fn_id)
+            .await
+            .unwrap_or(-999_999)
+    );
+
+    // ── (c): oracle is green when prod and model agree ──────────────────────
+    // Fresh context: one SELL, then check that model and prod both track 15000.
+    let mut ctx2 = FuzzCtx::new_online_open_shift().await;
+    let out_sell = run_op(&mut ctx2, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out_sell, RealOutcome::Doc(_)),
+        "SELL must issue; got {out_sell:?}"
+    );
+    check_cash_on_hand(&ctx2.pool, &ctx2.fn_id, CASH_AMOUNT_KOP)
+        .await
+        .expect("oracle must agree after one SELL: prod==model==CASH_AMOUNT_KOP");
+}

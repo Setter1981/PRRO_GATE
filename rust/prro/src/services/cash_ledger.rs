@@ -26,7 +26,7 @@
 //!     (convert.rs:730), so a stored type_code "0" payment IS a cash payment by
 //!     construction — the D1 invariant makes positional == semantic for cash.
 //!   - Boot preflight verifies D1.
-//! Pure main-pool SQL — no secure_pool cross-dependency on the close/derive path.
+//!     Pure main-pool SQL — no secure_pool cross-dependency on the close/derive path.
 //!
 //! ## Fidelity: mirrors aggregate_zreport grouping
 //! `aggregate_zreport` groups by `(type_code, name)`; this module extracts
@@ -40,8 +40,8 @@
 //! No network/crypto in any derive fn; all DB reads are pool-bound outside
 //! write-tx.
 
-use sqlx::SqlitePool;
 use crate::db::models::ids::ShiftId;
+use sqlx::SqlitePool;
 
 /// Derive cash-on-hand from the opening anchor and per-shift cash totals.
 ///
@@ -128,17 +128,49 @@ pub async fn derive_closing_cash(
 ///
 /// Pure main-pool read, called BEFORE the write-tx (invariant #1).
 pub async fn opening_carry_for_fn(pool: &SqlitePool, fiscal_number: &str) -> sqlx::Result<i64> {
-    Ok(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT cash_balance_kop FROM shifts \
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT cash_balance_kop FROM shifts \
              WHERE fiscal_number = ? AND state = 'CLOSED' \
              ORDER BY serial DESC LIMIT 1",
-        )
-        .bind(fiscal_number)
-        .fetch_optional(pool)
-        .await?
-        .unwrap_or(0),
     )
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(0))
+}
+
+/// Compute current cash-on-hand for `fiscal_number`'s open shift.
+///
+/// Used by the L1 guard in `convert_to_signer_payload` (pre-inbox, row-less).
+/// Returns 0 if there is no open shift (no shift → RETURN is already
+/// rejected upstream by the shift-guard; 0 is safe here because the
+/// `return_cash_kop > 0` gate will not trigger on a 0-amount RETURN).
+///
+/// Pure main-pool reads, outside write-tx (invariant #1).
+pub async fn cash_on_hand_for_fn(pool: &SqlitePool, fiscal_number: &str) -> sqlx::Result<i64> {
+    // Find the current open shift and its opening anchor via node_state join.
+    let row: Option<(Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT s.shift_id, s.cash_balance_kop \
+         FROM shifts s \
+         JOIN node_state ns ON ns.current_shift_id = s.shift_id \
+         WHERE ns.fiscal_number = ? \
+           AND s.state NOT IN ('CLOSED','REQUIRES_MANUAL_RECONCILIATION','ERROR','CREATED') \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some((shift_id_bytes, opening_kop)) = row else {
+        return Ok(0); // no open shift; upstream guard owns that refusal
+    };
+
+    let arr: [u8; 16] = shift_id_bytes
+        .try_into()
+        .map_err(|_| sqlx::Error::Decode("shift_id not 16 bytes".into()))?;
+    let shift_id = ShiftId::from_bytes(arr);
+
+    derive_closing_cash(pool, fiscal_number, shift_id, opening_kop).await
 }
 
 /// Re-derive the opening anchor of the CURRENT open shift from the journal.

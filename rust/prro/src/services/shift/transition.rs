@@ -197,7 +197,15 @@ pub async fn create_shift_tx(
     //     SAME SHIFT_OPEN collides on the PK (deterministic shift_id); the
     //     partial-unique index `ux_shifts_one_open_per_fn` backstops a
     //     second open shift for the FN at the schema level.
-    shifts::insert_created_tx(tx, shift_id, fiscal_number, open_mode, opened_by_cashier_id, opening_cash_kop).await?;
+    shifts::insert_created_tx(
+        tx,
+        shift_id,
+        fiscal_number,
+        open_mode,
+        opened_by_cashier_id,
+        opening_cash_kop,
+    )
+    .await?;
 
     // (ii) CAS the node_state projection CLOSED → CREATED and SET the
     //      pointer.  Keyed on `shift_state='CLOSED'` with pointer OVERWRITE

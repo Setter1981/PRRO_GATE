@@ -1146,6 +1146,7 @@ pub async fn run(
 /// `closing_cash_kop` — when `to == Closed`, the computed closing cash-on-hand
 /// to persist in `shifts.cash_balance_kop` (L0 carry anchor for the next shift).
 /// For all other transitions this value is ignored (`None` is fine; `Some(0)` also safe).
+#[allow(clippy::too_many_arguments)]
 async fn confirm_shift_edge(
     tx: &mut crate::db::tx::WriteTxConn<'_>,
     fiscal_number: &str,
