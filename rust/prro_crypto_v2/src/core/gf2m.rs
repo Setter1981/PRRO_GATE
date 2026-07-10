@@ -705,7 +705,10 @@ mod tests {
         let mut reduced = vec![0u32; 20];
         fmod(&product, &p_exp, &mut reduced);
 
-        assert_eq!(reduced[0], 1, "inverse verification failed: a * inv(a) should be 1");
+        assert_eq!(
+            reduced[0], 1,
+            "inverse verification failed: a * inv(a) should be 1"
+        );
         for i in 1..reduced.len() {
             assert_eq!(reduced[i], 0, "word {} should be zero after reduction", i);
         }

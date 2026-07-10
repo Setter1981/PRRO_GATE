@@ -137,9 +137,7 @@ impl Gost3411 {
             circle_xor8(&u_copy, &mut u);
         }
         // C3 negation pattern (jkurwa lines 123-126):
-        let c3_flips: [usize; 16] = [
-            31, 29, 28, 24, 23, 20, 18, 17, 14, 12, 10, 8, 7, 5, 3, 1,
-        ];
+        let c3_flips: [usize; 16] = [31, 29, 28, 24, 23, 20, 18, 17, 14, 12, 10, 8, 7, 5, 3, 1];
         for &i in &c3_flips {
             u[i] = !u[i];
         }

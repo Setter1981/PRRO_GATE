@@ -61,6 +61,10 @@ pub enum WireArtifactKind {
     Sell,
     Return,
     ZReport,
+    /// B10 — offline-session BEGIN (`<C T="109">`) service receipt.
+    OfflineSessionBegin,
+    /// B10 — offline-session END (`<C T="110">`) service receipt.
+    OfflineSessionEnd,
 }
 
 pub struct SigningContext {
@@ -153,6 +157,11 @@ pub fn derive_wire_artifact_kind(doc_type: DocType) -> Result<WireArtifactKind, 
         DocType::Sell => Ok(WireArtifactKind::Sell),
         DocType::Return => Ok(WireArtifactKind::Return),
         DocType::ShiftClose | DocType::ZReport => Ok(WireArtifactKind::ZReport),
+        // B10 — offline-session boundary docs are signable service receipts
+        // (empty `<C T="109">` / `<C T="110">`).  They ride the same offline
+        // sign path (code acquire + `<MAC ID>` stamp) as any offline doc.
+        DocType::OfflineSessionBegin => Ok(WireArtifactKind::OfflineSessionBegin),
+        DocType::OfflineSessionEnd => Ok(WireArtifactKind::OfflineSessionEnd),
         // W4 builder ships ShiftOpen/Sell/Return/ZReport only.  Other
         // op-types are not signable in W6: fail-closed BEFORE any
         // pin / Z allocation / state mutation occurs.
@@ -914,10 +923,22 @@ async fn resolve_offline_dps_code(
     }
 
     // (4) Idempotency: already stamped (re-entry / boot re-drive)? Read back the
-    // code — do NOT acquire a second one.
+    // code — do NOT acquire a second one.  (Runs BEFORE the doc-type dispatch so
+    // a re-driven END reuses its code without re-acquiring — INV-5.)
     if let Some(stamp) = fd::read_offline_stamp_tx(tx, doc_id).await? {
         return Ok(OfflineResolve::Stamped(stamp.dps_code));
     }
+
+    // B10 END-online fix — the DocType=10 (OFFLINE_SESSION_END) is minted
+    // `fs_mode='ONLINE'` at DRAIN finalize (it is a real online issuance — the
+    // node is GOING online), so step (1) above (`is_online_origin_tx`) already
+    // returned `OnlineShaped` and this fn never reaches here for the END.  It
+    // therefore signs a BARE `<MAC>` (no forced offline code), which is the
+    // DPS-accepted shape for a drain-to-online close (WebCheck `CloseOfflineDoc`;
+    // proven live).  The earlier forced-offline-code path (`resolve_offline_dps_
+    // code_forced`) was built on the WRONG premise that the END needs an offline
+    // code — it does not — and is removed.  SELL/RETURN keep the strict node-mode
+    // + OPEN-session gates below verbatim (no leak, W7 criterion 6 intact).
 
     // (2) FRESH node-mode read: only Offline / GoingOffline stamp at sign.  A
     // node that has since flipped Online (GO_ONLINE race) signs online-shaped.
@@ -1184,8 +1205,16 @@ struct ZReportTaxSumJson {
 
 enum TypedPayload {
     ShiftOpen(ShiftOpenJson),
-    Check { body: CheckJson, total_sum_kop: i64 },
+    Check {
+        body: CheckJson,
+        total_sum_kop: i64,
+    },
     ZReport(ZReportJson),
+    /// B10 — offline-session boundary (BEGIN/END).  Carries no body: the
+    /// wire doc is an EMPTY `<C T="109">`/`<C T="110">` service receipt
+    /// (header + `<TS>` + `<MAC>` only).  The payload_json is an inert
+    /// marker (`{}`), so no fields are parsed.
+    OfflineBoundary,
 }
 
 fn parse_payload(
@@ -1217,6 +1246,10 @@ fn parse_payload(
             .map_err(|e| SignError::PayloadSchema {
                 detail: format!("ZReport: {e}"),
             }),
+        // B10 — boundary docs carry no body; the JSON is an inert marker.
+        WireArtifactKind::OfflineSessionBegin | WireArtifactKind::OfflineSessionEnd => {
+            Ok(TypedPayload::OfflineBoundary)
+        }
     }
 }
 
@@ -1234,6 +1267,20 @@ fn build_canonical_doc(
                 opening_sum: p.opening_sum_kop,
             }))
         }
+        // B10 — offline-session boundary docs: empty service receipt, DI =
+        // the doc's local number.  BEGIN → `<C T="109">`, END → `<C T="110">`.
+        (WireArtifactKind::OfflineSessionBegin, TypedPayload::OfflineBoundary) => Ok(
+            CanonicalDoc::OfflineSessionBegin(crate::xml::OfflineSessionBoundaryPayload {
+                header,
+                local_number,
+            }),
+        ),
+        (WireArtifactKind::OfflineSessionEnd, TypedPayload::OfflineBoundary) => Ok(
+            CanonicalDoc::OfflineSessionEnd(crate::xml::OfflineSessionBoundaryPayload {
+                header,
+                local_number,
+            }),
+        ),
         (
             WireArtifactKind::Sell,
             TypedPayload::Check {

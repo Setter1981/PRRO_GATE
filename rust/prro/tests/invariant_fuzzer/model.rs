@@ -108,6 +108,15 @@ pub struct RefModel {
     /// from an online-ER (non-issued, a blocker) — the `docs` map stores only
     /// `DocState`, which loses the origin the D5 predicate needs.
     pub offline_origin_lnds: BTreeSet<i64>,
+    /// B10 — whether this offline session has already minted its DocType=9
+    /// OFFLINE_SESSION_BEGIN.  The model predicts the BEGIN INDEPENDENTLY (from
+    /// first principles, NOT by mirroring the impl) as the FIRST offline doc of a
+    /// session; this flag makes that once-only (mirrors the impl's request_id
+    /// idempotency gate).
+    pub session_has_begin: bool,
+    /// B10 — whether this session has already minted its DocType=10
+    /// OFFLINE_SESSION_END (at drain finalize).  Once-only, like the BEGIN.
+    pub session_has_end: bool,
 }
 
 impl RefModel {
@@ -125,6 +134,8 @@ impl RefModel {
             docs: BTreeMap::new(),
             shift_lifecycle_lnds: BTreeSet::new(),
             offline_origin_lnds: BTreeSet::new(),
+            session_has_begin: false,
+            session_has_end: false,
         }
     }
 
@@ -141,6 +152,8 @@ impl RefModel {
             docs: BTreeMap::new(),
             shift_lifecycle_lnds: BTreeSet::new(),
             offline_origin_lnds: BTreeSet::new(),
+            session_has_begin: false,
+            session_has_end: false,
         }
     }
 
@@ -159,6 +172,8 @@ impl RefModel {
             docs: BTreeMap::new(),
             shift_lifecycle_lnds: BTreeSet::new(),
             offline_origin_lnds: BTreeSet::new(),
+            session_has_begin: false,
+            session_has_end: false,
         }
     }
 
@@ -175,6 +190,8 @@ impl RefModel {
             docs: BTreeMap::new(),
             shift_lifecycle_lnds: BTreeSet::new(),
             offline_origin_lnds: BTreeSet::new(),
+            session_has_begin: false,
+            session_has_end: false,
         }
     }
 
@@ -407,12 +424,66 @@ impl RefModel {
     /// Offline SHIFT_OPEN local issuance.  It consumes one offline code, advances
     /// the seed at OFFLINE_LOCAL_ACK, and leaves the shift pending drain.
     fn apply_offline_shift_open(&mut self) -> ExpectedOutcome {
-        if self.mode != NodeMode::Offline || self.shift_state != ShiftState::Closed {
+        if self.mode != NodeMode::Offline {
             return ExpectedOutcome::NoMutation;
         }
-        let code_available = self.codes_consumed < self.codes_issued;
-        if self.session != Some(OfflineSessionState::Open) || !code_available {
+        if self.session != Some(OfflineSessionState::Open) {
             return ExpectedOutcome::NoMutation;
+        }
+        // B10 — the `run_staged` hoist mints the lazy DocType=9 BEGIN for ANY
+        // offline doc-type (HOLE-A fix), SHIFT_OPEN included, and it runs
+        // BEFORE the business doc's acquire guards: a SHIFT_OPEN refused for
+        // an already-open shift still leaves the just-minted BEGIN resting
+        // (the op's observable is then the BEGIN mutation alone).  Same
+        // first-principles prediction as the offline sell lane (`apply_sell`):
+        // 0 codes → the pre-mint pool guard refuses the WHOLE op (no rows);
+        // else the BEGIN mints FIRST (lowest lnd, code#1, seed advance); a
+        // post-BEGIN empty pool aborts the business doc at offline-ack
+        // (Aborted row).
+        // Business acquire guard (runs AFTER the hoist in the impl): SHIFT_OPEN
+        // needs a Closed shift.  A duplicate shift-open still mints the session
+        // BEGIN first (+code, +seed) and THEN refuses SHIFT_ALREADY_OPEN — a
+        // composite (issued BEGIN row + Refused outcome) the pure model defers
+        // to the fault-oracle re-sync (which restores `session_has_begin` from
+        // the adopted ledger).  Directed pin:
+        // `offline_shift_open_refused_after_lazy_begin_mints_begin_row`.
+        if self.shift_state != ShiftState::Closed {
+            if !self.session_has_begin {
+                if self.codes_consumed >= self.codes_issued {
+                    // Pre-mint pool guard fires BEFORE the shift guard →
+                    // whole-op 503 refusal, no rows.
+                    return ExpectedOutcome::NoMutation;
+                }
+                return ExpectedOutcome::Fault;
+            }
+            return ExpectedOutcome::NoMutation;
+        }
+        let mut just_minted_begin = false;
+        if !self.session_has_begin {
+            if self.codes_consumed >= self.codes_issued {
+                return ExpectedOutcome::NoMutation;
+            }
+            self.session_has_begin = true;
+            just_minted_begin = true;
+            let begin_lnd = self.next_lnd;
+            let begin_unsigned = synth_unsigned_hash(begin_lnd);
+            self.docs.insert(begin_lnd, DocState::OfflineLocalAck);
+            self.offline_origin_lnds.insert(begin_lnd);
+            self.next_lnd += 1;
+            self.codes_consumed += 1;
+            self.seed = Some(begin_unsigned);
+        }
+        if self.codes_consumed >= self.codes_issued {
+            // Shift-class offline docs are refused ROW-LESS on pool
+            // exhaustion (the lane guard refuses pre-dispatch — unlike the
+            // SELL/RETURN lane, whose exhausted business doc aborts WITH a
+            // row at offline-ack).  The BEGIN-consumed-the-last-code
+            // composite defers to the fault re-sync.
+            return if just_minted_begin {
+                ExpectedOutcome::Fault
+            } else {
+                ExpectedOutcome::NoMutation
+            };
         }
 
         let lnd = self.next_lnd;
@@ -483,17 +554,54 @@ impl RefModel {
     /// advances the seed at OFFLINE_LOCAL_ACK, and moves the shift into
     /// ClosingLocalPendingDrain.  Drain/GoOnline later closes or escalates it.
     fn apply_offline_z_report(&mut self) -> ExpectedOutcome {
-        if self.mode != NodeMode::Offline
-            || !matches!(
-                self.shift_state,
-                ShiftState::Opened | ShiftState::OpenedLocalPendingDrain
-            )
-        {
+        if self.mode != NodeMode::Offline {
             return ExpectedOutcome::NoMutation;
         }
-        let code_available = self.codes_consumed < self.codes_issued;
-        if self.session != Some(OfflineSessionState::Open) || !code_available {
+        if self.session != Some(OfflineSessionState::Open) {
             return ExpectedOutcome::NoMutation;
+        }
+        // B10 — the lazy DocType=9 BEGIN precedes ANY first offline doc of the
+        // session (the `run_staged` hoist), the offline Z included, and it
+        // runs BEFORE the business doc's acquire guards (see
+        // `apply_offline_shift_open`).
+        // Business acquire guard (runs AFTER the hoist in the impl): the
+        // offline Z needs an open(-pending) shift.  The BEGIN-then-refuse
+        // composite defers to the fault-oracle re-sync (see
+        // `apply_offline_shift_open`).
+        if !matches!(
+            self.shift_state,
+            ShiftState::Opened | ShiftState::OpenedLocalPendingDrain
+        ) {
+            if !self.session_has_begin {
+                if self.codes_consumed >= self.codes_issued {
+                    return ExpectedOutcome::NoMutation;
+                }
+                return ExpectedOutcome::Fault;
+            }
+            return ExpectedOutcome::NoMutation;
+        }
+        let mut just_minted_begin = false;
+        if !self.session_has_begin {
+            if self.codes_consumed >= self.codes_issued {
+                return ExpectedOutcome::NoMutation;
+            }
+            self.session_has_begin = true;
+            just_minted_begin = true;
+            let begin_lnd = self.next_lnd;
+            let begin_unsigned = synth_unsigned_hash(begin_lnd);
+            self.docs.insert(begin_lnd, DocState::OfflineLocalAck);
+            self.offline_origin_lnds.insert(begin_lnd);
+            self.next_lnd += 1;
+            self.codes_consumed += 1;
+            self.seed = Some(begin_unsigned);
+        }
+        if self.codes_consumed >= self.codes_issued {
+            // Row-less refusal on exhaustion (see `apply_offline_shift_open`).
+            return if just_minted_begin {
+                ExpectedOutcome::Fault
+            } else {
+                ExpectedOutcome::NoMutation
+            };
         }
 
         let lnd = self.next_lnd;
@@ -581,11 +689,47 @@ impl RefModel {
                 })
             }
             NodeMode::Offline => {
-                let code_available = self.codes_consumed < self.codes_issued;
-                if self.session != Some(OfflineSessionState::Open) || !code_available {
-                    // No active session / no code: reality reaches SIGNED, then the
-                    // offline-ack refuses (NoActiveSession / CodePoolExhausted,
-                    // post-sign) → the seam aborts it → a non-issued Aborted row.
+                if self.session != Some(OfflineSessionState::Open) {
+                    // No active session: reality reaches SIGNED, then offline-ack
+                    // refuses (NoActiveSession, post-sign) → non-issued Aborted row.
+                    return self.mint_aborted_refusal();
+                }
+
+                // B10 — LAZY DocType=9 BEGIN, predicted INDEPENDENTLY (first
+                // principles; NOT read from the impl).  On the FIRST offline doc of
+                // a session (`!session_has_begin`) the impl lazily mints+signs+OLAs
+                // the BEGIN BEFORE the business doc: lowest lnd, consumes code#1,
+                // chains off the pre-op tip, advances the seed to its own unsigned
+                // hash.  Code accounting re-derived vs the impl:
+                //   - 0 codes → BEGIN signs bare → offline-ack ABORTS it, and the
+                //     lazy-BEGIN gate fail-closes the business doc BEFORE it mints
+                //     (503) → NO row at all (the pre-mint pool-empty guard in
+                //     `ensure_offline_session_begin` refuses BEFORE minting a BEGIN).
+                //   - 1 code → BEGIN(OLA, code#1); business doc finds empty pool →
+                //     aborts (Aborted).  Two rows.
+                //   - ≥2 codes → BEGIN(OLA, code#1) + business(OLA, code#2).
+                if !self.session_has_begin {
+                    if self.codes_consumed >= self.codes_issued {
+                        // 0 codes → the pre-mint pool guard refuses the whole op
+                        // RETRYABLE (503) WITHOUT minting a BEGIN or the business
+                        // doc → NO ledger mutation (NOT an Aborted row).  Do NOT set
+                        // `session_has_begin` — no BEGIN was minted.
+                        return ExpectedOutcome::NoMutation;
+                    }
+                    self.session_has_begin = true; // the BEGIN row now rests (OLA)
+                    let begin_lnd = self.next_lnd;
+                    let begin_unsigned = synth_unsigned_hash(begin_lnd);
+                    self.docs.insert(begin_lnd, DocState::OfflineLocalAck);
+                    self.offline_origin_lnds.insert(begin_lnd);
+                    self.next_lnd += 1;
+                    self.codes_consumed += 1;
+                    self.seed = Some(begin_unsigned);
+                    // fall through to the business doc (chains off the BEGIN's seed).
+                }
+
+                // The business doc — after any lazy BEGIN above.
+                if self.codes_consumed >= self.codes_issued {
+                    // Pool exhausted for the business doc → offline-ack aborts it.
                     return self.mint_aborted_refusal();
                 }
                 let lnd = self.next_lnd;
@@ -726,6 +870,11 @@ impl RefModel {
                 for lnd in &backlog {
                     self.docs.insert(*lnd, DocState::Ack);
                 }
+                // Tier-1 shift resolution — a full-ACK drain resolves a
+                // pending-drain shift BEFORE the END mints (the impl confirms
+                // the shift edge on the content backlog, then mints the END at
+                // drain finalize), so the END's Mutation carries the
+                // post-transition shift state.
                 match self.shift_state {
                     ShiftState::OpenedLocalPendingDrain => {
                         self.shift_state = ShiftState::Opened;
@@ -734,6 +883,52 @@ impl RefModel {
                         self.shift_state = ShiftState::Closed;
                     }
                     _ => {}
+                }
+                // B10 END-online fix — at drain finalize the DocType=10 END is
+                // minted + sent LAST as an ONLINE ISSUANCE (predicted
+                // INDEPENDENTLY).  The impl (`ensure_and_drain_session_end`) mints
+                // the END at EVERY content-Eligible drain of a bound-shift offline
+                // session, gated ONLY on shift presence + `!already-END` — NOT on
+                // BEGIN presence (`backlog_drain` skips only on a NULL shift; there
+                // is no BEGIN-existence gate).  In normal production a BEGIN always
+                // precedes the backlog (the `inline::run` hoist mints it for the
+                // first offline doc), so BEGIN presence and END-mint coincide.  The
+                // ONE case where they part is a production-UNREACHABLE fuzzer state:
+                // `crash_after_sign` stages an offline SELL DIRECTLY (bypassing the
+                // `inline::run` BEGIN hoist), so a `Crash(Sign), RepeatReboot,
+                // GoOnline` leaves a drainable offline backlog with NO BEGIN — and
+                // the real drain still mints the END (real `{1:Ack, 2:Ack}`).  So
+                // the model matches the impl: mint the END on any non-empty eligible
+                // drain, once-only (`session_has_end`), independent of BEGIN.
+                //
+                // ONLINE ISSUANCE semantics: the END is `fs_mode='ONLINE'` (bare
+                // `<MAC>`), so it consumes NO offline code (`codes_consumed`
+                // UNCHANGED — NOT offline-origin) and advances the ONLINE seed at
+                // the `Sending → Sent` CAS (advance-at-SEND), NOT at offline-ack.
+                // Its issuance is independent of the offline pool — it ALWAYS issues
+                // + drains to ACK on the AckPath drain (no pool-exhausted Abort
+                // branch: an online issuance never needs a code).
+                if !self.session_has_end {
+                    self.session_has_end = true;
+                    let end_lnd = self.next_lnd;
+                    let end_prev = self.seed; // END chains off the last content doc
+                    let end_unsigned = synth_unsigned_hash(end_lnd);
+                    self.next_lnd += 1;
+                    // Online issuance → ACK via drain (Sent→Kvt2→Ack) + finalize.
+                    // Advance the ONLINE seed to the END's unsigned hash (mirrors
+                    // the impl's advance-at-SEND).  NO code consumed, NOT added to
+                    // `offline_origin_lnds` (it is online-origin).
+                    self.docs.insert(end_lnd, DocState::Ack);
+                    self.seed = Some(end_unsigned);
+                    self.mode = NodeMode::Online;
+                    return ExpectedOutcome::Mutated(Mutation {
+                        lnd: end_lnd,
+                        doc_state: DocState::Ack,
+                        seed_after: self.seed,
+                        previous_hash: end_prev,
+                        code_consumed: None,
+                        shift_state_after: Some(self.shift_state),
+                    });
                 }
                 self.mode = NodeMode::Online; // full drain → GoingOnline → Online
                 let tip = *backlog.last().expect("backlog is non-empty");
@@ -874,6 +1069,35 @@ impl RefModel {
         .fetch_one(pool)
         .await
         .unwrap();
+
+        // B10 — re-derive the boundary-doc flags from the real ledger.  Without
+        // this a crash+reboot over a session that already minted a DocType=9
+        // BEGIN (e.g. `Crash(Sign), RepeatReboot`) left `session_has_begin` at
+        // its `false` default, so a subsequent all-ACK `GoOnline` drain SKIPPED
+        // the DocType=10 END-mint prediction while the real drain minted it →
+        // `{1: Ack}` (model) vs `{1: Ack, 2: Ack}` (real).  The flags are derived
+        // OBSERVABLY (presence of a boundary row in an ISSUED / non-terminal-
+        // failed state), exactly as `docs` / `codes` are — mirroring the impl's
+        // existence probe (`ensure_offline_session_begin`: OLA/SENT/KVT1/KVT2/ACK
+        // count as present; ABORTED/REJECTED/CANCELLED/RMR free the slot).  A
+        // still-in-flight boundary row (PREPARED/SIGNED/ENCRYPTED/SENDING) is
+        // NOT yet "issued" and does not set the flag — boot-resume drives it and
+        // the next fault re-sync re-reads it.  Inlined (not a helper) so the read
+        // stays inside this tagged funnel wrapper (adoption-lint discipline).
+        let issued_boundaries: Vec<(String,)> = sqlx::query_as(
+            "SELECT doc_type FROM fiscal_documents \
+             WHERE doc_type IN ('OFFLINE_SESSION_BEGIN', 'OFFLINE_SESSION_END') \
+               AND state IN ('OFFLINE_LOCAL_ACK', 'SENT', 'KVT1', 'KVT2', 'ACK')",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        self.session_has_begin = issued_boundaries
+            .iter()
+            .any(|(dt,)| dt == "OFFLINE_SESSION_BEGIN");
+        self.session_has_end = issued_boundaries
+            .iter()
+            .any(|(dt,)| dt == "OFFLINE_SESSION_END");
     }
 
     /// **U1 A1 funnel wrapper — `read_seed_fixture`.**  The tagged primitive for

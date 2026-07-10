@@ -45,7 +45,10 @@ async fn spawn_listener(fn_id: &str, cooldown: Duration) -> (String, Arc<MockBri
     let metrics = Arc::new(SessionMetrics::new());
     let listener = FnListener::new(cfg, bridge_trait, clock, metrics);
     tokio::spawn(async move {
-        if let Err(e) = listener.serve(tokio_util::sync::CancellationToken::new()).await {
+        if let Err(e) = listener
+            .serve(tokio_util::sync::CancellationToken::new())
+            .await
+        {
             eprintln!("listener died: {e}");
         }
     });
@@ -66,7 +69,10 @@ struct Reader {
 
 impl Reader {
     fn new() -> Self {
-        Self { buf: Vec::with_capacity(64), scratch: [0u8; 128] }
+        Self {
+            buf: Vec::with_capacity(64),
+            scratch: [0u8; 128],
+        }
     }
 
     async fn next_frame(&mut self, stream: &mut TcpStream) -> String {
@@ -120,7 +126,10 @@ async fn second_concurrent_connect_receives_softblock_and_is_closed() {
     let mut second = TcpStream::connect(&addr).await.unwrap();
     let mut second_reader = Reader::new();
     let rejected = second_reader.next_frame(&mut second).await;
-    assert_eq!(rejected, "SOFTBLOCK", "duplicate connect must see SOFTBLOCK");
+    assert_eq!(
+        rejected, "SOFTBLOCK",
+        "duplicate connect must see SOFTBLOCK"
+    );
 
     // Server closes the second socket after rejecting.
     let mut tail = [0u8; 16];
@@ -170,7 +179,10 @@ async fn csin1_response_is_sent_without_crc_matching_request_mode() {
     let mut client = TcpStream::connect(&addr).await.unwrap();
     let mut reader = Reader::new();
 
-    client.write_all(&encode_frame("CSIN1", false).unwrap()).await.unwrap();
+    client
+        .write_all(&encode_frame("CSIN1", false).unwrap())
+        .await
+        .unwrap();
     assert_eq!(reader.next_frame(&mut client).await, "DONE");
     assert_eq!(reader.next_frame(&mut client).await, "READY");
     // reader.buf must be empty — if the server had sent CRC bytes
@@ -195,8 +207,12 @@ async fn two_fns_on_two_ports_operate_independently() {
     let mut ra = Reader::new();
     let mut rb = Reader::new();
 
-    a.write_all(&encode_frame("SYNC", false).unwrap()).await.unwrap();
-    b.write_all(&encode_frame("SYNC", false).unwrap()).await.unwrap();
+    a.write_all(&encode_frame("SYNC", false).unwrap())
+        .await
+        .unwrap();
+    b.write_all(&encode_frame("SYNC", false).unwrap())
+        .await
+        .unwrap();
 
     assert_eq!(ra.next_frame(&mut a).await, "DONE");
     assert_eq!(rb.next_frame(&mut b).await, "DONE");

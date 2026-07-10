@@ -107,6 +107,12 @@ str_enum!(DocType {
     CashWithdrawal => "CASH_WITHDRAWAL",
     XReport        => "X_REPORT",
     ZReport        => "Z_REPORT",
+    // B10 — offline-session drain-handshake boundary docs.  Gateway-INTERNAL
+    // only (never built from an external ingress protocol; the ingress
+    // string/CommandType gates fail-closed on them).  Wire `<C T="109">`
+    // (BEGIN) / `<C T="110">` (END), typCheck ServiceChk(3), offline docs.
+    OfflineSessionBegin => "OFFLINE_SESSION_BEGIN",
+    OfflineSessionEnd   => "OFFLINE_SESSION_END",
 });
 
 str_enum!(FiscalMode {

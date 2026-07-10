@@ -312,7 +312,30 @@ pub async fn run(
                 DocType::ShiftClose | DocType::ZReport => {
                     ns.shift_state == ShiftState::ClosingLocalPendingDrain
                 }
-                // All 9 DocType variants are now explicitly matched — a NEW
+                // B10 — offline-session BEGIN is minted lazily as the FIRST
+                // offline doc of a session, BEFORE that doc.  For a SELL/RETURN
+                // first-doc the shift is `Opened`/`OpenedLocalPendingDrain`; for a
+                // Pattern-C offline SHIFT_OPEN first-doc the shift is still
+                // `Closed` (the SHIFT_OPEN has not opened it yet) — so the BEGIN
+                // local-acks in `Closed` too (review Finding B).
+                DocType::OfflineSessionBegin => matches!(
+                    ns.shift_state,
+                    ShiftState::Closed
+                        | ShiftState::Opened
+                        | ShiftState::OpenedLocalPendingDrain,
+                ),
+                // B10 — offline-session END is minted at drain finalize; the
+                // shift may be any live-offline pending-drain / opened state
+                // depending on whether it was a mid-day return-online (Opened
+                // / OpenedLocalPendingDrain) or a full offline close
+                // (ClosingLocalPendingDrain).  Accept all three.
+                DocType::OfflineSessionEnd => matches!(
+                    ns.shift_state,
+                    ShiftState::Opened
+                        | ShiftState::OpenedLocalPendingDrain
+                        | ShiftState::ClosingLocalPendingDrain,
+                ),
+                // All DocType variants are now explicitly matched — a NEW
                 // doc type fails to compile here, forcing a deliberate
                 // offline-ack shift-state decision (drift-guard by
                 // exhaustiveness; the pre-O3 `_ => Opened` fallback is gone).

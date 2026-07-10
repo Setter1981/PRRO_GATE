@@ -16,9 +16,9 @@ use maria304_driver::wire::{decode_frame, encode_frame, Frame};
 #[test]
 fn conf_ascii_body_matches_hand_crafted_reference() {
     let builder = ConfBuilder {
-        factory_serial: "MRY304-001",        // 10 chars exactly
-        fiscal_number: "3001234567",         // 10 chars exactly
-        merchant: "ТОВ Приклад",              // short — space-padded to 36
+        factory_serial: "MRY304-001", // 10 chars exactly
+        fiscal_number: "3001234567",  // 10 chars exactly
+        merchant: "ТОВ Приклад",      // short — space-padded to 36
         now: ("20260420", "101530"),
         sys_key: SysKey::Work,
         expected_cmd: ExpectedCmd::Idle,
@@ -30,7 +30,7 @@ fn conf_ascii_body_matches_hand_crafted_reference() {
         last_command_id: "COMP",
         fw_version_id: "4120",
         fw_build_date: "20250115",
-        receipt_info_line: "MARIA 304 VIRTUAL",   // <18 chars → space-padded
+        receipt_info_line: "MARIA 304 VIRTUAL", // <18 chars → space-padded
         currency_date: "20250101",
         decimals: 2,
         currency: "Грн",
@@ -155,7 +155,9 @@ fn response_work_padded_to_min_cmd_len_on_wire() {
 
 #[test]
 fn response_error_softblock_goes_on_wire_with_full_identifier() {
-    let bytes = Response::Error(ErrorCode::SoftBlock).to_wire(false).unwrap();
+    let bytes = Response::Error(ErrorCode::SoftBlock)
+        .to_wire(false)
+        .unwrap();
     // "SOFTBLOCK" — 9 bytes payload, len = 10, + start/end = 12 total.
     assert_eq!(bytes.len(), 12);
     assert_eq!(bytes[0], 0xFD);

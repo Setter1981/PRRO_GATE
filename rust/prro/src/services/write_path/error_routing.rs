@@ -101,6 +101,11 @@ pub enum RetryClass {
     /// not auto-retried.  Routed via ErrorRetryable →
     /// RequiresManualReconciliation chain (W9 step).
     OperatorEscalation,
+    /// Historical B10 tag retained solely to decode rows written by the
+    /// withdrawn `-8` chain-settle experiment.  No current routing emits it.
+    /// Reconciliation treats it as manual-only, never as permission to
+    /// re-send the persisted document.
+    DrainChainSettleRetry,
 }
 
 impl RetryClass {
@@ -119,6 +124,7 @@ impl RetryClass {
             Self::ProbeRequired => "ProbeRequired",
             Self::MacRecovery => "MacRecovery",
             Self::OperatorEscalation => "OperatorEscalation",
+            Self::DrainChainSettleRetry => "DrainChainSettleRetry",
         }
     }
 
@@ -139,6 +145,7 @@ impl RetryClass {
             "ProbeRequired" => Self::ProbeRequired,
             "MacRecovery" => Self::MacRecovery,
             "OperatorEscalation" => Self::OperatorEscalation,
+            "DrainChainSettleRetry" => Self::DrainChainSettleRetry,
             _ => return None,
         })
     }

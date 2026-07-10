@@ -1208,6 +1208,30 @@ fn check_shift_guard(
             current: shift_state,
         }),
 
+        // ── B10 offline-session boundary docs — gateway-INTERNAL, offline
+        //    channel only.  They are minted by the drain-handshake seam, never
+        //    by an operator/ingress request:
+        //      - BEGIN is lazily minted as the FIRST offline doc of a session,
+        //        BEFORE that doc.  When the first offline doc is a SELL/RETURN the
+        //        shift is already `Opened`/`OpenedLocalPendingDrain`; when it is a
+        //        Pattern-C offline SHIFT_OPEN, the shift is still `Closed` (the
+        //        SHIFT_OPEN has not created it yet) — so the BEGIN must be admitted
+        //        in `Closed` too (review Finding B).  `Created`/`Opening`/`Closing`
+        //        stay blocked by the mid-transition arm above.
+        //      - END is minted at drain finalize (shift `Opened` /
+        //        `OpenedLocalPendingDrain` / `ClosingLocalPendingDrain`).
+        //    An online-channel attempt (none in production) or a wrong shift state
+        //    refuses fail-closed with the pending-drain shape.
+        (OfflineSessionBegin, Closed | Opened | OpenedLocalPendingDrain, Offline) => None,
+        (
+            OfflineSessionEnd,
+            Opened | OpenedLocalPendingDrain | ClosingLocalPendingDrain,
+            Offline,
+        ) => None,
+        (OfflineSessionBegin | OfflineSessionEnd, _, _) => {
+            Some(RejectionReason::ShiftOpenPendingDrainOpRefused)
+        }
+
         // ── Regular fiscal ops in Opened — channel-irrelevant happy.
         (Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport, Opened, _) => None,
 

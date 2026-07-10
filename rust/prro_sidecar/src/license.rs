@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const PUBKEY_CURRENT: &[u8] = include_bytes!("license_pubkey_current.der");
-const PUBKEY_NEXT:    &[u8] = include_bytes!("license_pubkey_next.der");
+const PUBKEY_NEXT: &[u8] = include_bytes!("license_pubkey_next.der");
 
 const GRACE_DAYS: i64 = 14;
 
@@ -22,35 +22,49 @@ const GRACE_DAYS: i64 = 14;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LicensePayload {
     pub schema_version: String,
-    pub tin:            String,
-    pub fn_numbers:     Vec<String>,
-    pub issued_at:      String,
-    pub expires_at:     String,
-    pub tier:           LicenseTier,
-    pub org_name:       Option<String>,
-    pub demo_limits:    Option<DemoLimits>,
-    pub issuer:         String,
+    pub tin: String,
+    pub fn_numbers: Vec<String>,
+    pub issued_at: String,
+    pub expires_at: String,
+    pub tier: LicenseTier,
+    pub org_name: Option<String>,
+    pub demo_limits: Option<DemoLimits>,
+    pub issuer: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DemoLimits {
     pub max_payment_sum_kopecks: i64,
-    pub no_offline:              bool,
-    pub require_dps_online:      bool,
+    pub no_offline: bool,
+    pub require_dps_online: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum LicenseTier { Demo, Basic, Pro, Enterprise }
+pub enum LicenseTier {
+    Demo,
+    Basic,
+    Pro,
+    Enterprise,
+}
 
 #[derive(Debug, Clone)]
 pub enum LicenseState {
     Valid,
-    Grace   { days_left: i32 },
+    Grace {
+        days_left: i32,
+    },
     Expired,
-    Demo    { limits: DemoLimits },
-    TinMismatch     { in_license: String, requested: String },
-    FnNotLicensed   { fn_: String },
+    Demo {
+        limits: DemoLimits,
+    },
+    TinMismatch {
+        in_license: String,
+        requested: String,
+    },
+    FnNotLicensed {
+        fn_: String,
+    },
     SignatureInvalid,
 }
 
@@ -67,7 +81,9 @@ pub enum LicenseError {
 }
 
 impl From<base64::DecodeError> for LicenseError {
-    fn from(e: base64::DecodeError) -> Self { Self::Base64(e.to_string()) }
+    fn from(e: base64::DecodeError) -> Self {
+        Self::Base64(e.to_string())
+    }
 }
 
 // ─── JCS (RFC 8785) ───────────────────────────────────────────────────────────
@@ -88,8 +104,7 @@ impl LicensePayload {
 fn jcs_serialize(val: &Value) -> String {
     match val {
         Value::Object(map) => {
-            let mut pairs: Vec<(&str, &Value)> =
-                map.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            let mut pairs: Vec<(&str, &Value)> = map.iter().map(|(k, v)| (k.as_str(), v)).collect();
             pairs.sort_by_key(|(a, _)| *a);
             let items: Vec<String> = pairs
                 .iter()
@@ -155,21 +170,23 @@ fn parse_iso8601(s: &str) -> Result<time::OffsetDateTime, LicenseError> {
 
 /// Internal: accepts injectable pubkey slice for testing.
 fn verify_inner(
-    payload_b64:   &str,
+    payload_b64: &str,
     signature_b64: &str,
-    fn_:           Option<&str>,
-    tin:           Option<&str>,
-    now:           time::OffsetDateTime,
-    pubkeys:       &[&[u8]],
+    fn_: Option<&str>,
+    tin: Option<&str>,
+    now: time::OffsetDateTime,
+    pubkeys: &[&[u8]],
 ) -> Result<LicenseState, LicenseError> {
     let payload_bytes = B64.decode(payload_b64)?;
-    let sig_bytes     = B64.decode(signature_b64)?;
+    let sig_bytes = B64.decode(signature_b64)?;
 
     let payload: LicensePayload = serde_json::from_slice(&payload_bytes)?;
 
     // 1. Signature: try each pubkey (current first, then next for rotation)
     let jcs = payload.to_canonical_bytes();
-    let sig_ok = pubkeys.iter().any(|pk| verify_detached(pk, &jcs, &sig_bytes));
+    let sig_ok = pubkeys
+        .iter()
+        .any(|pk| verify_detached(pk, &jcs, &sig_bytes));
     if !sig_ok {
         return Ok(LicenseState::SignatureInvalid);
     }
@@ -179,7 +196,7 @@ fn verify_inner(
         if payload.tin != tin {
             return Ok(LicenseState::TinMismatch {
                 in_license: payload.tin,
-                requested:  tin.into(),
+                requested: tin.into(),
             });
         }
     }
@@ -192,7 +209,7 @@ fn verify_inner(
     // 3. Expiry / grace — checked for ALL tiers including Demo.
     // F4: demo licenses were previously exempt from expiry (bypass at old line 192).
     // An expired demo license returns Expired, not Demo { limits }.
-    let expires     = parse_iso8601(&payload.expires_at)?;
+    let expires = parse_iso8601(&payload.expires_at)?;
     let grace_start = expires - time::Duration::days(GRACE_DAYS);
 
     if now >= expires {
@@ -225,36 +242,50 @@ pub fn check_embedded_pubkeys() {
     let curve = Curve::dstu_pb_257();
     for (label, key) in [("current", PUBKEY_CURRENT), ("next", PUBKEY_NEXT)] {
         assert_eq!(
-            key.len(), 33,
+            key.len(),
+            33,
             "license_pubkey_{label}.der must be 33 bytes (DSTU PB-257 compressed point); got {}",
             key.len()
         );
-        expand_compressed_checked(key, &curve)
-            .unwrap_or_else(|e| panic!(
-                "license_pubkey_{label}.der is not a valid DSTU PB-257 compressed point: {e}"
-            ));
+        expand_compressed_checked(key, &curve).unwrap_or_else(|e| {
+            panic!("license_pubkey_{label}.der is not a valid DSTU PB-257 compressed point: {e}")
+        });
     }
 }
 
 /// Verify signature + expiry only. Used at startup and during install_license.
 /// Does NOT check TIN or FN membership — those are checked per-request.
 pub fn verify_signature_only(
-    payload_b64:   &str,
+    payload_b64: &str,
     signature_b64: &str,
-    now:           time::OffsetDateTime,
+    now: time::OffsetDateTime,
 ) -> Result<LicenseState, LicenseError> {
-    verify_inner(payload_b64, signature_b64, None, None, now, &[PUBKEY_CURRENT, PUBKEY_NEXT])
+    verify_inner(
+        payload_b64,
+        signature_b64,
+        None,
+        None,
+        now,
+        &[PUBKEY_CURRENT, PUBKEY_NEXT],
+    )
 }
 
 /// Full per-request check: sig + expiry + TIN + FN membership + tier limits.
 pub fn verify(
-    payload_b64:   &str,
+    payload_b64: &str,
     signature_b64: &str,
-    fn_:           &str,
-    tin:           &str,
-    now:           time::OffsetDateTime,
+    fn_: &str,
+    tin: &str,
+    now: time::OffsetDateTime,
 ) -> Result<LicenseState, LicenseError> {
-    verify_inner(payload_b64, signature_b64, Some(fn_), Some(tin), now, &[PUBKEY_CURRENT, PUBKEY_NEXT])
+    verify_inner(
+        payload_b64,
+        signature_b64,
+        Some(fn_),
+        Some(tin),
+        now,
+        &[PUBKEY_CURRENT, PUBKEY_NEXT],
+    )
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -264,9 +295,9 @@ mod tests {
     use super::*;
     use prro_crypto::core::curve::Curve;
     use prro_crypto::core::field::FieldEl;
+    use prro_crypto::core::hash::gost_34_311_95;
     use prro_crypto::core::point::{compress_point, Point};
     use prro_crypto::core::sign::sign;
-    use prro_crypto::core::hash::gost_34_311_95;
     use time::macros::datetime;
 
     // Fixed deterministic test keypair. Well-formed values chosen to be
@@ -277,8 +308,8 @@ mod tests {
     /// Returns (private_key_le_bytes, compressed_pubkey_33bytes).
     fn test_keypair() -> (Vec<u8>, Vec<u8>) {
         let curve = Curve::dstu_pb_257();
-        let d     = FieldEl::from_hex(TEST_D, curve.mod_words);
-        let g     = Point::new(curve.base_x.clone(), curve.base_y.clone());
+        let d = FieldEl::from_hex(TEST_D, curve.mod_words);
+        let g = Point::new(curve.base_x.clone(), curve.base_y.clone());
         let pub_q = g.mul(&d, &curve).negate(); // Q = -d·G (DSTU convention)
         (fe_to_le_bytes(&d, 32), compress_point(&pub_q, &curve))
     }
@@ -288,7 +319,9 @@ mod tests {
         for (wi, &word) in fe.bytes.iter().enumerate() {
             for bi in 0..4 {
                 let idx = wi * 4 + bi;
-                if idx < len { out[idx] = (word >> (bi * 8)) as u8; }
+                if idx < len {
+                    out[idx] = (word >> (bi * 8)) as u8;
+                }
             }
         }
         out
@@ -296,12 +329,12 @@ mod tests {
 
     /// Sign the JCS bytes of `payload` with the given private key bytes.
     fn sign_payload(payload: &LicensePayload, d_bytes: &[u8]) -> String {
-        let curve    = Curve::dstu_pb_257();
-        let d        = FieldEl::from_le_bytes(d_bytes, curve.mod_words);
-        let jcs      = payload.to_canonical_bytes();
+        let curve = Curve::dstu_pb_257();
+        let d = FieldEl::from_le_bytes(d_bytes, curve.mod_words);
+        let jcs = payload.to_canonical_bytes();
         let hash_raw = gost_34_311_95(&jcs);
-        let hash_fe  = FieldEl::from_le_bytes(&hash_raw, curve.mod_words);
-        let e        = FieldEl::from_hex(TEST_E, curve.mod_words);
+        let hash_fe = FieldEl::from_le_bytes(&hash_raw, curve.mod_words);
+        let e = FieldEl::from_hex(TEST_E, curve.mod_words);
 
         let sig = sign(&curve, &d, &hash_fe, &e)
             .expect("test scalar must produce a non-degenerate signature");
@@ -314,30 +347,30 @@ mod tests {
     fn pro_payload(expires_at: &str) -> LicensePayload {
         LicensePayload {
             schema_version: "license.v1".into(),
-            tin:            "1234567890".into(),
-            fn_numbers:     vec!["3001234567".into(), "3001234568".into()],
-            issued_at:      "2026-01-01T00:00:00Z".into(),
-            expires_at:     expires_at.into(),
-            tier:           LicenseTier::Pro,
-            org_name:       Some("ТОВ Тест".into()),
-            demo_limits:    None,
-            issuer:         "PRRO_GATE_ADMIN".into(),
+            tin: "1234567890".into(),
+            fn_numbers: vec!["3001234567".into(), "3001234568".into()],
+            issued_at: "2026-01-01T00:00:00Z".into(),
+            expires_at: expires_at.into(),
+            tier: LicenseTier::Pro,
+            org_name: Some("ТОВ Тест".into()),
+            demo_limits: None,
+            issuer: "PRRO_GATE_ADMIN".into(),
         }
     }
 
     fn demo_payload() -> LicensePayload {
         LicensePayload {
             schema_version: "license.v1".into(),
-            tin:            "1234567890".into(),
-            fn_numbers:     vec!["3001234567".into()],
-            issued_at:      "2026-01-01T00:00:00Z".into(),
-            expires_at:     "2099-01-01T00:00:00Z".into(),
-            tier:           LicenseTier::Demo,
-            org_name:       None,
-            demo_limits:    Some(DemoLimits {
+            tin: "1234567890".into(),
+            fn_numbers: vec!["3001234567".into()],
+            issued_at: "2026-01-01T00:00:00Z".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            tier: LicenseTier::Demo,
+            org_name: None,
+            demo_limits: Some(DemoLimits {
                 max_payment_sum_kopecks: 50_000,
-                no_offline:             true,
-                require_dps_online:     true,
+                no_offline: true,
+                require_dps_online: true,
             }),
             issuer: "PRRO_GATE_ADMIN".into(),
         }
@@ -353,8 +386,8 @@ mod tests {
         tin: Option<&str>,
         now: time::OffsetDateTime,
     ) -> LicenseState {
-        let p_b64  = B64.encode(payload.to_canonical_bytes());
-        let s_b64  = sign_payload(payload, d_bytes);
+        let p_b64 = B64.encode(payload.to_canonical_bytes());
+        let s_b64 = sign_payload(payload, d_bytes);
         verify_inner(&p_b64, &s_b64, fn_, tin, now, &[pub_compressed])
             .expect("verify_inner must not error on well-formed input")
     }
@@ -365,17 +398,34 @@ mod tests {
     fn valid_pro_within_expiry() {
         let (d, pub_k) = test_keypair();
         let payload = pro_payload("2027-04-19T00:00:00Z");
-        let now     = datetime!(2026-04-19 12:00:00 UTC);
-        let state   = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
-        assert!(matches!(state, LicenseState::Valid), "expected Valid, got {state:?}");
+        let now = datetime!(2026-04-19 12:00:00 UTC);
+        let state = do_verify(
+            &payload,
+            &d,
+            &pub_k,
+            Some("3001234567"),
+            Some("1234567890"),
+            now,
+        );
+        assert!(
+            matches!(state, LicenseState::Valid),
+            "expected Valid, got {state:?}"
+        );
     }
 
     #[test]
     fn grace_window_13d() {
         let (d, pub_k) = test_keypair();
-        let payload = pro_payload("2026-05-02T00:00:00Z");   // expires in 13d
-        let now     = datetime!(2026-04-19 12:00:00 UTC);    // 13d before expiry
-        let state   = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
+        let payload = pro_payload("2026-05-02T00:00:00Z"); // expires in 13d
+        let now = datetime!(2026-04-19 12:00:00 UTC); // 13d before expiry
+        let state = do_verify(
+            &payload,
+            &d,
+            &pub_k,
+            Some("3001234567"),
+            Some("1234567890"),
+            now,
+        );
         assert!(
             matches!(state, LicenseState::Grace { days_left } if (12..=13).contains(&days_left)),
             "expected Grace(12..13), got {state:?}"
@@ -385,9 +435,16 @@ mod tests {
     #[test]
     fn grace_window_1d() {
         let (d, pub_k) = test_keypair();
-        let payload = pro_payload("2026-04-20T12:00:00Z");   // expires tomorrow
-        let now     = datetime!(2026-04-19 12:00:00 UTC);
-        let state   = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
+        let payload = pro_payload("2026-04-20T12:00:00Z"); // expires tomorrow
+        let now = datetime!(2026-04-19 12:00:00 UTC);
+        let state = do_verify(
+            &payload,
+            &d,
+            &pub_k,
+            Some("3001234567"),
+            Some("1234567890"),
+            now,
+        );
         assert!(
             matches!(state, LicenseState::Grace { days_left: 1 }),
             "expected Grace(1), got {state:?}"
@@ -398,17 +455,34 @@ mod tests {
     fn expired_1d_ago() {
         let (d, pub_k) = test_keypair();
         let payload = pro_payload("2026-04-18T00:00:00Z");
-        let now     = datetime!(2026-04-19 12:00:00 UTC);
-        let state   = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
-        assert!(matches!(state, LicenseState::Expired), "expected Expired, got {state:?}");
+        let now = datetime!(2026-04-19 12:00:00 UTC);
+        let state = do_verify(
+            &payload,
+            &d,
+            &pub_k,
+            Some("3001234567"),
+            Some("1234567890"),
+            now,
+        );
+        assert!(
+            matches!(state, LicenseState::Expired),
+            "expected Expired, got {state:?}"
+        );
     }
 
     #[test]
     fn tin_mismatch() {
         let (d, pub_k) = test_keypair();
         let payload = pro_payload("2027-04-19T00:00:00Z");
-        let now     = datetime!(2026-04-19 12:00:00 UTC);
-        let state   = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("9999999999"), now);
+        let now = datetime!(2026-04-19 12:00:00 UTC);
+        let state = do_verify(
+            &payload,
+            &d,
+            &pub_k,
+            Some("3001234567"),
+            Some("9999999999"),
+            now,
+        );
         assert!(
             matches!(state, LicenseState::TinMismatch { ref requested, .. } if requested == "9999999999"),
             "expected TinMismatch, got {state:?}"
@@ -419,8 +493,15 @@ mod tests {
     fn fn_not_in_list() {
         let (d, pub_k) = test_keypair();
         let payload = pro_payload("2027-04-19T00:00:00Z");
-        let now     = datetime!(2026-04-19 12:00:00 UTC);
-        let state   = do_verify(&payload, &d, &pub_k, Some("9999999999"), Some("1234567890"), now);
+        let now = datetime!(2026-04-19 12:00:00 UTC);
+        let state = do_verify(
+            &payload,
+            &d,
+            &pub_k,
+            Some("9999999999"),
+            Some("1234567890"),
+            now,
+        );
         assert!(
             matches!(state, LicenseState::FnNotLicensed { ref fn_ } if fn_ == "9999999999"),
             "expected FnNotLicensed, got {state:?}"
@@ -429,27 +510,43 @@ mod tests {
 
     #[test]
     fn signature_tampered() {
-        let (d, pub_k)  = test_keypair();
+        let (d, pub_k) = test_keypair();
         let payload = pro_payload("2027-04-19T00:00:00Z");
-        let p_b64   = B64.encode(payload.to_canonical_bytes());
+        let p_b64 = B64.encode(payload.to_canonical_bytes());
         let mut sig_bytes = B64.decode(sign_payload(&payload, &d)).unwrap();
         sig_bytes[0] ^= 0xFF; // flip first byte of r
         let bad_sig = B64.encode(&sig_bytes);
-        let state = verify_inner(&p_b64, &bad_sig, None, None,
-                                  datetime!(2026-04-19 12:00:00 UTC), &[&pub_k])
-            .unwrap();
-        assert!(matches!(state, LicenseState::SignatureInvalid),
-                "expected SignatureInvalid, got {state:?}");
+        let state = verify_inner(
+            &p_b64,
+            &bad_sig,
+            None,
+            None,
+            datetime!(2026-04-19 12:00:00 UTC),
+            &[&pub_k],
+        )
+        .unwrap();
+        assert!(
+            matches!(state, LicenseState::SignatureInvalid),
+            "expected SignatureInvalid, got {state:?}"
+        );
     }
 
     #[test]
     fn demo_valid() {
         let (d, pub_k) = test_keypair();
         let payload = demo_payload();
-        let now     = datetime!(2026-04-19 12:00:00 UTC);
-        let state   = do_verify(&payload, &d, &pub_k, None, None, now);
+        let now = datetime!(2026-04-19 12:00:00 UTC);
+        let state = do_verify(&payload, &d, &pub_k, None, None, now);
         assert!(
-            matches!(state, LicenseState::Demo { limits: DemoLimits { max_payment_sum_kopecks: 50_000, .. } }),
+            matches!(
+                state,
+                LicenseState::Demo {
+                    limits: DemoLimits {
+                        max_payment_sum_kopecks: 50_000,
+                        ..
+                    }
+                }
+            ),
             "expected Demo, got {state:?}"
         );
     }
@@ -458,11 +555,17 @@ mod tests {
     fn demo_without_limits_errors() {
         let (d, pub_k) = test_keypair();
         let mut payload = demo_payload();
-        payload.demo_limits = None;  // invalid: demo tier but no limits
+        payload.demo_limits = None; // invalid: demo tier but no limits
         let p_b64 = B64.encode(payload.to_canonical_bytes());
         let s_b64 = sign_payload(&payload, &d);
-        let result = verify_inner(&p_b64, &s_b64, None, None,
-                                   datetime!(2026-04-19 12:00:00 UTC), &[&pub_k]);
+        let result = verify_inner(
+            &p_b64,
+            &s_b64,
+            None,
+            None,
+            datetime!(2026-04-19 12:00:00 UTC),
+            &[&pub_k],
+        );
         assert!(
             matches!(result, Err(LicenseError::MissingDemoLimits)),
             "expected MissingDemoLimits error, got {result:?}"
@@ -481,10 +584,18 @@ mod tests {
         // Check actual key ordering — schema_version < expires_at < fn_numbers etc.
         let jcs = String::from_utf8(payload1.to_canonical_bytes()).unwrap();
         let demo_jcs = String::from_utf8(demo_payload().to_canonical_bytes()).unwrap();
-        let first_key = |s: &str| s.chars().skip(1).take_while(|c| *c != '"').collect::<String>();
+        let first_key = |s: &str| {
+            s.chars()
+                .skip(1)
+                .take_while(|c| *c != '"')
+                .collect::<String>()
+        };
         // Keys sorted lex: "demo_limits" < "expires_at" < "fn_numbers" < "issued_at" ...
         // First key must be "demo_limits" in demo payload, "expires_at" alphabetically
-        assert!(demo_jcs.starts_with(r#"{"demo_limits":"#), "demo_limits must sort first: {demo_jcs}");
+        assert!(
+            demo_jcs.starts_with(r#"{"demo_limits":"#),
+            "demo_limits must sort first: {demo_jcs}"
+        );
         let _ = (jcs, first_key); // suppress unused warnings
     }
 
@@ -493,7 +604,10 @@ mod tests {
         let mut payload = pro_payload("2027-04-19T00:00:00Z");
         payload.org_name = Some("ТОВ «Магазин» 商店".into());
         let jcs = String::from_utf8(payload.to_canonical_bytes()).unwrap();
-        assert!(jcs.contains("ТОВ «Магазин» 商店"), "Unicode must not be percent-escaped in JCS");
+        assert!(
+            jcs.contains("ТОВ «Магазин» 商店"),
+            "Unicode must not be percent-escaped in JCS"
+        );
     }
 
     #[test]
@@ -503,8 +617,15 @@ mod tests {
         let (d, pub_k) = test_keypair();
         let expires_at = datetime!(2026-05-03 00:00:00 UTC); // 14 days after 2026-04-19
         let payload = pro_payload("2026-05-03T00:00:00Z");
-        let now      = datetime!(2026-04-19 00:00:00 UTC); // exactly 14d before expiry
-        let state    = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
+        let now = datetime!(2026-04-19 00:00:00 UTC); // exactly 14d before expiry
+        let state = do_verify(
+            &payload,
+            &d,
+            &pub_k,
+            Some("3001234567"),
+            Some("1234567890"),
+            now,
+        );
         assert!(
             matches!(state, LicenseState::Grace { days_left: 14 }),
             "exactly 14 days before expiry must be Grace(14), got {state:?}"
@@ -517,8 +638,15 @@ mod tests {
         // 15 days before expiry is before grace window → Valid
         let (d, pub_k) = test_keypair();
         let payload = pro_payload("2026-05-04T00:00:00Z"); // 15 days after 2026-04-19
-        let now     = datetime!(2026-04-19 00:00:00 UTC);
-        let state   = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
+        let now = datetime!(2026-04-19 00:00:00 UTC);
+        let state = do_verify(
+            &payload,
+            &d,
+            &pub_k,
+            Some("3001234567"),
+            Some("1234567890"),
+            now,
+        );
         assert!(
             matches!(state, LicenseState::Valid),
             "15 days before expiry must be Valid, got {state:?}"
@@ -530,8 +658,15 @@ mod tests {
         // now == expires_at exactly → condition is now >= expires → Expired
         let (d, pub_k) = test_keypair();
         let payload = pro_payload("2026-04-19T12:00:00Z");
-        let now     = datetime!(2026-04-19 12:00:00 UTC); // exactly at expiry
-        let state   = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
+        let now = datetime!(2026-04-19 12:00:00 UTC); // exactly at expiry
+        let state = do_verify(
+            &payload,
+            &d,
+            &pub_k,
+            Some("3001234567"),
+            Some("1234567890"),
+            now,
+        );
         assert!(
             matches!(state, LicenseState::Expired),
             "now == expires_at must be Expired (>= boundary), got {state:?}"
@@ -543,8 +678,15 @@ mod tests {
         // One second before expiry → still Grace (just barely)
         let (d, pub_k) = test_keypair();
         let payload = pro_payload("2026-04-19T12:00:00Z");
-        let now     = datetime!(2026-04-19 11:59:59 UTC);
-        let state   = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
+        let now = datetime!(2026-04-19 11:59:59 UTC);
+        let state = do_verify(
+            &payload,
+            &d,
+            &pub_k,
+            Some("3001234567"),
+            Some("1234567890"),
+            now,
+        );
         assert!(
             matches!(state, LicenseState::Grace { .. }),
             "1 second before expiry must be Grace, got {state:?}"
@@ -560,8 +702,14 @@ mod tests {
 
         let p_b64 = B64.encode(payload.to_canonical_bytes());
         let s_b64 = sign_payload(&payload, &d);
-        let result = verify_inner(&p_b64, &s_b64, None, None,
-                                   datetime!(2026-04-19 00:00:00 UTC), &[&pub_k]);
+        let result = verify_inner(
+            &p_b64,
+            &s_b64,
+            None,
+            None,
+            datetime!(2026-04-19 00:00:00 UTC),
+            &[&pub_k],
+        );
         assert!(
             matches!(result, Err(LicenseError::DateParse(ref s, _)) if s.contains("2026-13-45")),
             "invalid month in expires_at must produce DateParse, got {result:?}"
@@ -575,8 +723,15 @@ mod tests {
         let mut payload = pro_payload("2027-04-19T00:00:00Z");
         payload.fn_numbers = vec![];
 
-        let now   = datetime!(2026-04-19 12:00:00 UTC);
-        let state = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
+        let now = datetime!(2026-04-19 12:00:00 UTC);
+        let state = do_verify(
+            &payload,
+            &d,
+            &pub_k,
+            Some("3001234567"),
+            Some("1234567890"),
+            now,
+        );
         assert!(
             matches!(state, LicenseState::FnNotLicensed { ref fn_ } if fn_ == "3001234567"),
             "empty fn_numbers must return FnNotLicensed, got {state:?}"
@@ -588,10 +743,21 @@ mod tests {
         // FN must be found by .any() — check the LAST element is also matched
         let (d, pub_k) = test_keypair();
         let mut payload = pro_payload("2027-04-19T00:00:00Z");
-        payload.fn_numbers = vec!["3001234567".into(), "3001234568".into(), "9999999999".into()];
+        payload.fn_numbers = vec![
+            "3001234567".into(),
+            "3001234568".into(),
+            "9999999999".into(),
+        ];
 
-        let now   = datetime!(2026-04-19 12:00:00 UTC);
-        let state = do_verify(&payload, &d, &pub_k, Some("9999999999"), Some("1234567890"), now);
+        let now = datetime!(2026-04-19 12:00:00 UTC);
+        let state = do_verify(
+            &payload,
+            &d,
+            &pub_k,
+            Some("9999999999"),
+            Some("1234567890"),
+            now,
+        );
         assert!(
             matches!(state, LicenseState::Valid),
             "last element in fn_numbers must still match, got {state:?}"
@@ -603,12 +769,18 @@ mod tests {
         // sig_bytes.len() != 64 → verify_detached returns false → SignatureInvalid
         let (d, pub_k) = test_keypair();
         let payload = pro_payload("2027-04-19T00:00:00Z");
-        let p_b64   = B64.encode(payload.to_canonical_bytes());
+        let p_b64 = B64.encode(payload.to_canonical_bytes());
         // 32 bytes (half a signature) — wrong length
         let short_sig = B64.encode([0xAB_u8; 32]);
-        let state = verify_inner(&p_b64, &short_sig, None, None,
-                                  datetime!(2026-04-19 12:00:00 UTC), &[&pub_k])
-            .unwrap();
+        let state = verify_inner(
+            &p_b64,
+            &short_sig,
+            None,
+            None,
+            datetime!(2026-04-19 12:00:00 UTC),
+            &[&pub_k],
+        )
+        .unwrap();
         assert!(
             matches!(state, LicenseState::SignatureInvalid),
             "32-byte sig (should be 64) must return SignatureInvalid, got {state:?}"
@@ -623,11 +795,17 @@ mod tests {
         let wrong_pubkey = vec![0x04_u8; 65]; // uncompressed point, not 33-byte compressed
 
         let payload = pro_payload("2027-04-19T00:00:00Z");
-        let p_b64   = B64.encode(payload.to_canonical_bytes());
-        let s_b64   = sign_payload(&payload, &d);
-        let state   = verify_inner(&p_b64, &s_b64, None, None,
-                                    datetime!(2026-04-19 12:00:00 UTC), &[&wrong_pubkey])
-            .unwrap();
+        let p_b64 = B64.encode(payload.to_canonical_bytes());
+        let s_b64 = sign_payload(&payload, &d);
+        let state = verify_inner(
+            &p_b64,
+            &s_b64,
+            None,
+            None,
+            datetime!(2026-04-19 12:00:00 UTC),
+            &[&wrong_pubkey],
+        )
+        .unwrap();
         assert!(
             matches!(state, LicenseState::SignatureInvalid),
             "65-byte pubkey (should be 33) must return SignatureInvalid, got {state:?}"
@@ -637,8 +815,14 @@ mod tests {
     #[test]
     fn payload_invalid_base64_returns_error() {
         // Base64 decode error surfaces as LicenseError::Base64
-        let result = verify_inner("not!!valid!!base64===", "AAAA", None, None,
-                                   datetime!(2026-04-19 12:00:00 UTC), &[&[0u8; 33]]);
+        let result = verify_inner(
+            "not!!valid!!base64===",
+            "AAAA",
+            None,
+            None,
+            datetime!(2026-04-19 12:00:00 UTC),
+            &[&[0u8; 33]],
+        );
         assert!(
             matches!(result, Err(LicenseError::Base64(_))),
             "invalid payload base64 must return Base64 error, got {result:?}"
@@ -650,9 +834,15 @@ mod tests {
         let (_, pub_k) = test_keypair();
         // Valid payload b64 (just needs to decode to valid JSON)
         let payload = pro_payload("2027-04-19T00:00:00Z");
-        let p_b64   = B64.encode(payload.to_canonical_bytes());
-        let result  = verify_inner(&p_b64, "!!!not_base64===", None, None,
-                                    datetime!(2026-04-19 12:00:00 UTC), &[&pub_k]);
+        let p_b64 = B64.encode(payload.to_canonical_bytes());
+        let result = verify_inner(
+            &p_b64,
+            "!!!not_base64===",
+            None,
+            None,
+            datetime!(2026-04-19 12:00:00 UTC),
+            &[&pub_k],
+        );
         assert!(
             matches!(result, Err(LicenseError::Base64(_))),
             "invalid signature base64 must return Base64 error, got {result:?}"
@@ -664,12 +854,28 @@ mod tests {
         // in_license = what the license says; requested = what the caller passed
         let (d, pub_k) = test_keypair();
         let payload = pro_payload("2027-04-19T00:00:00Z"); // tin = "1234567890"
-        let now     = datetime!(2026-04-19 12:00:00 UTC);
-        let state   = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("9999999999"), now);
+        let now = datetime!(2026-04-19 12:00:00 UTC);
+        let state = do_verify(
+            &payload,
+            &d,
+            &pub_k,
+            Some("3001234567"),
+            Some("9999999999"),
+            now,
+        );
         match state {
-            LicenseState::TinMismatch { ref in_license, ref requested } => {
-                assert_eq!(in_license, "1234567890", "in_license must be the payload TIN");
-                assert_eq!(requested,  "9999999999", "requested must be the caller-supplied TIN");
+            LicenseState::TinMismatch {
+                ref in_license,
+                ref requested,
+            } => {
+                assert_eq!(
+                    in_license, "1234567890",
+                    "in_license must be the payload TIN"
+                );
+                assert_eq!(
+                    requested, "9999999999",
+                    "requested must be the caller-supplied TIN"
+                );
             }
             other => panic!("expected TinMismatch, got {other:?}"),
         }
@@ -682,7 +888,14 @@ mod tests {
         for tier in [LicenseTier::Basic, LicenseTier::Enterprise] {
             let mut payload = pro_payload("2027-04-19T00:00:00Z");
             payload.tier = tier;
-            let state = do_verify(&payload, &d, &pub_k, Some("3001234567"), Some("1234567890"), now);
+            let state = do_verify(
+                &payload,
+                &d,
+                &pub_k,
+                Some("3001234567"),
+                Some("1234567890"),
+                now,
+            );
             assert!(
                 matches!(state, LicenseState::Valid),
                 "tier {tier:?} must produce Valid within expiry, got {state:?}"

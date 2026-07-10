@@ -138,7 +138,10 @@ async fn print(
                 .map_err(ApiError::Transport)?;
         }
     }
-    Ok(Json(PrintResponse { ok: true, length: bytes.len() }))
+    Ok(Json(PrintResponse {
+        ok: true,
+        length: bytes.len(),
+    }))
 }
 
 // ─── Instruction JSON mapping ────────────────────────────────────────

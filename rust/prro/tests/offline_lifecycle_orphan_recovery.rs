@@ -276,10 +276,19 @@ async fn fix_a_empty_pool_offline_shift_open_refused_premint_no_orphan() {
         "CLOSED",
         "the shift stays Closed — no orphan, no RMR (retry after seed-codes)"
     );
+    // B10 (Finding B): an offline SHIFT_OPEN is now bracketed by the lazy
+    // DocType=9 BEGIN, which is ensured BEFORE the SHIFT_OPEN mints.  On an EMPTY
+    // pool the `ensure_offline_session_begin` pre-mint guard fail-closes the whole
+    // op RETRYABLE (503 `OFFLINE_SESSION_BEGIN_PENDING`) WITHOUT minting either a
+    // BEGIN or the SHIFT_OPEN — so the DOUBLE ABSENCE (no doc, no shift) is
+    // preserved, but the refusal no longer flows through stage_acquire's
+    // per-op-type `OFFLINE_LIFECYCLE_CODE_POOL_EMPTY_REFUSED` audit (that audit is
+    // for the SHIFT_OPEN's own acquire, which is never reached).  There is no
+    // aborted-BEGIN churn (the guard refuses PRE-mint).
     assert_eq!(
-        audit_count(app.db(), "OFFLINE_LIFECYCLE_CODE_POOL_EMPTY_REFUSED").await,
-        1,
-        "fix (a) pre-mint refusal audit"
+        doc_states(app.db(), "OFFLINE_SESSION_BEGIN").await,
+        Vec::<String>::new(),
+        "B10: no BEGIN doc minted either — the empty-pool guard refuses pre-mint"
     );
     // No fix-(b) escalation happened — there was nothing to escalate.
     assert_eq!(

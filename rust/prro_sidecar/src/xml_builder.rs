@@ -19,32 +19,32 @@ use crate::time_utils::kyiv_local_yyyymmddhhmmss;
 /// Tax group configuration — mirrors Python `TaxGroup` / `tax_groups` dict values.
 #[derive(Debug, Clone)]
 pub struct TaxGroup {
-    pub tax_rate:        f64,
+    pub tax_rate: f64,
     pub additional_rate: f64,
-    pub tax_algorithm:   i32,
-    pub tax_type:        i32,
+    pub tax_algorithm: i32,
+    pub tax_type: i32,
 }
 
 /// Per-request context passed alongside the canonical command.
 pub struct BuildContext<'a> {
-    pub local_number:   i64,
-    pub z_number:       i64,
-    pub previous_hash:  &'a str,
-    pub tax_number:     &'a str,
-    pub tax_groups:     Option<&'a HashMap<String, TaxGroup>>,
-    pub device_name:    &'a str,
+    pub local_number: i64,
+    pub z_number: i64,
+    pub previous_hash: &'a str,
+    pub tax_number: &'a str,
+    pub tax_groups: Option<&'a HashMap<String, TaxGroup>>,
+    pub device_name: &'a str,
     pub device_version: &'a str,
 }
 
 impl Default for BuildContext<'_> {
     fn default() -> Self {
         BuildContext {
-            local_number:   0,
-            z_number:       0,
-            previous_hash:  "",
-            tax_number:     "",
-            tax_groups:     None,
-            device_name:    "ПРО_каса",
+            local_number: 0,
+            z_number: 0,
+            previous_hash: "",
+            tax_number: "",
+            tax_groups: None,
+            device_name: "ПРО_каса",
             device_version: "1.1",
         }
     }
@@ -65,7 +65,7 @@ fn build_xml(cmd: &CanonicalCommand, ctx: &BuildContext) -> Result<String, Sidec
     let rq_attrs = vec![
         ("NDv", ctx.device_name.to_string()),
         ("PrV", ctx.device_version.to_string()),
-        ("V",   "1".to_string()),
+        ("V", "1".to_string()),
     ];
 
     match &cmd.operation_type {
@@ -112,8 +112,15 @@ fn build_shift_open(
     let c_content = tag(
         "C",
         vec![("T", "108".to_string())],
-        &(tag("O", vec![("N", "1".to_string()), ("SM", opening_sum), ("T", "0".to_string())], "")
-            + &tag("E", vec![("N", "2".to_string())], "")),
+        &(tag(
+            "O",
+            vec![
+                ("N", "1".to_string()),
+                ("SM", opening_sum),
+                ("T", "0".to_string()),
+            ],
+            "",
+        ) + &tag("E", vec![("N", "2".to_string())], "")),
     ) + &tag("TS", vec![], ts_str);
 
     let dat_content = tag(
@@ -125,7 +132,7 @@ fn build_shift_open(
             ("DI", "0".to_string()),
             ("FN", cmd.fiscal_number.clone()),
             ("TN", ctx.tax_number.to_string()),
-            ("V",  "1".to_string()),
+            ("V", "1".to_string()),
             ("ZN", ctx.z_number.to_string()),
         ],
         &c_content,
@@ -192,17 +199,25 @@ fn build_check(
                 let sum = g.get("sum").and_then(|v| v.as_i64()).unwrap_or(0);
 
                 let mut p_attrs: Vec<(&str, String)> = vec![
-                    ("C",   code.to_string()),
-                    ("N",   item_no.to_string()),
-                    ("NM",  name.to_string()),
+                    ("C", code.to_string()),
+                    ("N", item_no.to_string()),
+                    ("NM", name.to_string()),
                     ("PRC", price.to_string()),
-                    ("Q",   quantity.to_string()),
-                    ("SM",  sum.to_string()),
+                    ("Q", quantity.to_string()),
+                    ("SM", sum.to_string()),
                 ];
-                if let Some(bc) = g.get("barcode").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                if let Some(bc) = g
+                    .get("barcode")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
                     p_attrs.push(("CD", bc.to_string()));
                 }
-                if let Some(uktzed) = g.get("uktzed").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                if let Some(uktzed) = g
+                    .get("uktzed")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
                     p_attrs.push(("CZD", uktzed.to_string()));
                 }
                 if let Some(tax_id) = g.get("tax_id").and_then(|v| v.as_i64()) {
@@ -241,19 +256,24 @@ fn build_check(
                     for d in disc_arr {
                         let Some(d) = d.as_object() else { continue };
                         let d_value = d.get("value").and_then(|v| v.as_i64()).unwrap_or(0);
-                        if d_value == 0 { continue; }
+                        if d_value == 0 {
+                            continue;
+                        }
                         let d_type = d.get("type").and_then(|v| v.as_str()).unwrap_or("DISCOUNT");
                         let d_mode = d.get("mode").and_then(|v| v.as_str()).unwrap_or("VALUE");
                         let xml_tag = if d_type != "EXTRA_CHARGE" { "D" } else { "S" };
                         let mut d_attrs: Vec<(&str, String)> = vec![
-                            ("N",  item_no.to_string()),
+                            ("N", item_no.to_string()),
                             ("NI", p_item_no.to_string()),
                             ("TR", "0".to_string()),
                         ];
                         if d_mode == "PERCENT" {
                             d_attrs.push(("TY", "1".to_string()));
                             d_attrs.push(("PR", format!("{:.2}", d_value)));
-                            d_attrs.push(("SM", py_round(sum as f64 * d_value as f64 / 100.0).to_string()));
+                            d_attrs.push((
+                                "SM",
+                                py_round(sum as f64 * d_value as f64 / 100.0).to_string(),
+                            ));
                         } else {
                             d_attrs.push(("TY", "0".to_string()));
                             d_attrs.push(("SM", d_value.to_string()));
@@ -293,7 +313,9 @@ fn build_check(
                 for d in check_discounts {
                     let Some(d) = d.as_object() else { continue };
                     let d_value = d.get("value").and_then(|v| v.as_i64()).unwrap_or(0);
-                    if d_value == 0 { continue; }
+                    if d_value == 0 {
+                        continue;
+                    }
                     let d_type = d.get("type").and_then(|v| v.as_str()).unwrap_or("DISCOUNT");
                     let d_mode = d.get("mode").and_then(|v| v.as_str()).unwrap_or("VALUE");
                     let xml_tag = if d_type != "EXTRA_CHARGE" { "D" } else { "S" };
@@ -301,14 +323,15 @@ fn build_check(
                         .iter()
                         .map(|n| tag("NI", vec![("NI", n.to_string())], ""))
                         .collect();
-                    let mut d_attrs: Vec<(&str, String)> = vec![
-                        ("N",  item_no.to_string()),
-                        ("TR", "1".to_string()),
-                    ];
+                    let mut d_attrs: Vec<(&str, String)> =
+                        vec![("N", item_no.to_string()), ("TR", "1".to_string())];
                     if d_mode == "PERCENT" {
                         d_attrs.push(("TY", "1".to_string()));
                         d_attrs.push(("PR", format!("{:.2}", d_value)));
-                        d_attrs.push(("SM", py_round(goods_total as f64 * d_value as f64 / 100.0).to_string()));
+                        d_attrs.push((
+                            "SM",
+                            py_round(goods_total as f64 * d_value as f64 / 100.0).to_string(),
+                        ));
                     } else {
                         d_attrs.push(("TY", "0".to_string()));
                         d_attrs.push(("SM", d_value.to_string()));
@@ -338,8 +361,15 @@ fn build_check(
                 .filter_map(|p| p.as_object())
                 .map(|p| p.get("amount").and_then(|v| v.as_i64()).unwrap_or(0))
                 .sum();
-            let change = if all_payments_sum > total_sum { all_payments_sum - total_sum } else { 0 };
-            let rounding = receipt.get("rounding").and_then(|v| v.as_i64()).unwrap_or(0);
+            let change = if all_payments_sum > total_sum {
+                all_payments_sum - total_sum
+            } else {
+                0
+            };
+            let rounding = receipt
+                .get("rounding")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             let mut rm_assigned = false;
             let mut smp_assigned = false;
 
@@ -359,28 +389,36 @@ fn build_check(
                     .unwrap_or(ptype);
 
                 let mut m_attrs: Vec<(&str, String)> = vec![
-                    ("N",  item_no.to_string()),
+                    ("N", item_no.to_string()),
                     ("NM", m_nm.to_string()),
                     ("SM", amount.to_string()),
-                    ("T",  m_type.to_string()),
+                    ("T", m_type.to_string()),
                 ];
 
                 // Card/EPZ payment detail fields
                 if m_type != "0" {
                     for (src, dst) in &[
-                        ("rrn",            "RRN"),
+                        ("rrn", "RRN"),
                         ("payment_system", "PSNM"),
-                        ("bank_name",      "PA"),
-                        ("terminal",       "PB"),
-                        ("label",          "PC"),
-                        ("card_mask",      "PD"),
-                        ("auth_code",      "PE"),
+                        ("bank_name", "PA"),
+                        ("terminal", "PB"),
+                        ("label", "PC"),
+                        ("card_mask", "PD"),
+                        ("auth_code", "PE"),
                     ] {
-                        if let Some(val) = p.get(*src).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                        if let Some(val) = p
+                            .get(*src)
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
                             m_attrs.push((dst, val.to_string()));
                         }
                     }
-                    if let Some(comm) = p.get("commission").and_then(|v| v.as_i64()).filter(|&c| c > 0) {
+                    if let Some(comm) = p
+                        .get("commission")
+                        .and_then(|v| v.as_i64())
+                        .filter(|&c| c > 0)
+                    {
                         m_attrs.push(("PF", comm.to_string()));
                     }
                 }
@@ -430,7 +468,7 @@ fn build_check(
             ("DI", ctx.local_number.to_string()),
             ("FN", cmd.fiscal_number.clone()),
             ("TN", ctx.tax_number.to_string()),
-            ("V",  "1".to_string()),
+            ("V", "1".to_string()),
             ("ZN", ctx.z_number.to_string()),
         ],
         &c_content,
@@ -485,10 +523,10 @@ fn build_service(
             + &tag(
                 io_tag,
                 vec![
-                    ("N",  io_n.to_string()),
+                    ("N", io_n.to_string()),
                     ("NM", "ГОТІВКА".to_string()),
                     ("SM", service_sum),
-                    ("T",  "0".to_string()),
+                    ("T", "0".to_string()),
                 ],
                 "",
             )
@@ -501,7 +539,7 @@ fn build_service(
             ("DI", ctx.local_number.to_string()),
             ("FN", cmd.fiscal_number.clone()),
             ("TN", ctx.tax_number.to_string()),
-            ("V",  "1".to_string()),
+            ("V", "1".to_string()),
             ("ZN", ctx.z_number.to_string()),
         ],
         &c_content,
@@ -539,20 +577,24 @@ fn build_cash_withdrawal(
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| cash_sum.clone());
                 let mut m_attrs: Vec<(&str, String)> = vec![
-                    ("N",  item_no.to_string()),
+                    ("N", item_no.to_string()),
                     ("SM", amount),
-                    ("T",  "0".to_string()),
+                    ("T", "0".to_string()),
                 ];
                 for (src, dst) in &[
-                    ("bank_name",      "PA"),
-                    ("terminal",       "PB"),
-                    ("label",          "PC"),
-                    ("card_mask",      "PD"),
-                    ("auth_code",      "PE"),
+                    ("bank_name", "PA"),
+                    ("terminal", "PB"),
+                    ("label", "PC"),
+                    ("card_mask", "PD"),
+                    ("auth_code", "PE"),
                     ("payment_system", "PSNM"),
-                    ("rrn",            "RRN"),
+                    ("rrn", "RRN"),
                 ] {
-                    if let Some(val) = p.get(*src).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    if let Some(val) = p
+                        .get(*src)
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
                         m_attrs.push((dst, val.to_string()));
                     }
                 }
@@ -561,7 +603,11 @@ fn build_cash_withdrawal(
                 if !has_pc {
                     m_attrs.push(("PC", "ВИДАЧА КОШТІВ".to_string()));
                 }
-                if let Some(comm) = p.get("commission").and_then(|v| v.as_i64()).filter(|&c| c > 0) {
+                if let Some(comm) = p
+                    .get("commission")
+                    .and_then(|v| v.as_i64())
+                    .filter(|&c| c > 0)
+                {
                     m_attrs.push(("PF", comm.to_string()));
                 }
                 payment_xml += &tag("M", m_attrs, "");
@@ -574,10 +620,10 @@ fn build_cash_withdrawal(
         payment_xml = tag(
             "M",
             vec![
-                ("N",  item_no.to_string()),
+                ("N", item_no.to_string()),
                 ("NM", "ГОТІВКА".to_string()),
                 ("SM", cash_sum.clone()),
-                ("T",  "0".to_string()),
+                ("T", "0".to_string()),
             ],
             "",
         );
@@ -591,8 +637,8 @@ fn build_cash_withdrawal(
         &(tag(
             "P",
             vec![
-                ("C",  "0".to_string()),
-                ("N",  "1".to_string()),
+                ("C", "0".to_string()),
+                ("N", "1".to_string()),
                 ("NM", "Гривня".to_string()),
                 ("SM", cash_sum.clone()),
             ],
@@ -602,7 +648,7 @@ fn build_cash_withdrawal(
                 "E",
                 vec![
                     ("FN", cmd.fiscal_number.clone()),
-                    ("N",  e_no.to_string()),
+                    ("N", e_no.to_string()),
                     ("NO", ctx.local_number.to_string()),
                     ("SM", cash_sum),
                     ("TS", ts_str.to_string()),
@@ -617,7 +663,7 @@ fn build_cash_withdrawal(
             ("DI", ctx.local_number.to_string()),
             ("FN", cmd.fiscal_number.clone()),
             ("TN", ctx.tax_number.to_string()),
-            ("V",  "1".to_string()),
+            ("V", "1".to_string()),
             ("ZN", ctx.z_number.to_string()),
         ],
         &c_content,
@@ -636,10 +682,7 @@ fn build_z_report(
 ) -> String {
     let mut z_content = String::new();
 
-    let z_data = cmd
-        .payload
-        .get("z_report_data")
-        .and_then(|v| v.as_object());
+    let z_data = cmd.payload.get("z_report_data").and_then(|v| v.as_object());
 
     if let Some(z_data) = z_data {
         // Tax sums
@@ -657,12 +700,22 @@ fn build_z_report(
                 if let Some(tax_groups) = ctx.tax_groups {
                     if let Some(group) = tax_groups.get(tax_id.as_str()) {
                         let (txi, _) = if smi != 0 {
-                            calc_tax(smi, group.tax_rate, group.additional_rate, group.tax_algorithm)
+                            calc_tax(
+                                smi,
+                                group.tax_rate,
+                                group.additional_rate,
+                                group.tax_algorithm,
+                            )
                         } else {
                             (0, 0)
                         };
                         let (txo, _) = if smo != 0 {
-                            calc_tax(smo, group.tax_rate, group.additional_rate, group.tax_algorithm)
+                            calc_tax(
+                                smo,
+                                group.tax_rate,
+                                group.additional_rate,
+                                group.tax_algorithm,
+                            )
                         } else {
                             (0, 0)
                         };
@@ -670,13 +723,13 @@ fn build_z_report(
                             "TXS",
                             vec![
                                 ("DTPR", format!("{:.2}", group.additional_rate)),
-                                ("SMI",  smi.to_string()),
-                                ("SMO",  smo.to_string()),
-                                ("TS",   ts_str[..8].to_string()),
-                                ("TX",   tax_id.clone()),
+                                ("SMI", smi.to_string()),
+                                ("SMO", smo.to_string()),
+                                ("TS", ts_str[..8].to_string()),
+                                ("TX", tax_id.clone()),
                                 ("TXAL", group.tax_algorithm.to_string()),
-                                ("TXI",  txi.to_string()),
-                                ("TXO",  txo.to_string()),
+                                ("TXI", txi.to_string()),
+                                ("TXO", txo.to_string()),
                                 ("TXPR", format!("{:.2}", group.tax_rate)),
                                 ("TXTY", group.tax_type.to_string()),
                             ],
@@ -691,7 +744,7 @@ fn build_z_report(
                     vec![
                         ("SMI", smi.to_string()),
                         ("SMO", smo.to_string()),
-                        ("TX",  tax_id.clone()),
+                        ("TX", tax_id.clone()),
                     ],
                     "",
                 );
@@ -711,10 +764,22 @@ fn build_z_report(
                 z_content += &tag(
                     "M",
                     vec![
-                        ("NM",  ptype.clone()),
-                        ("SMI", ps.get("smi").and_then(|v| v.as_i64()).unwrap_or(0).to_string()),
-                        ("SMO", ps.get("smo").and_then(|v| v.as_i64()).unwrap_or(0).to_string()),
-                        ("T",   m_type.to_string()),
+                        ("NM", ptype.clone()),
+                        (
+                            "SMI",
+                            ps.get("smi")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0)
+                                .to_string(),
+                        ),
+                        (
+                            "SMO",
+                            ps.get("smo")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0)
+                                .to_string(),
+                        ),
+                        ("T", m_type.to_string()),
                     ],
                     "",
                 );
@@ -733,10 +798,22 @@ fn build_z_report(
                 z_content += &tag(
                     "IO",
                     vec![
-                        ("NM",  stype.clone()),
-                        ("SMI", ss.get("smi").and_then(|v| v.as_i64()).unwrap_or(0).to_string()),
-                        ("SMO", ss.get("smo").and_then(|v| v.as_i64()).unwrap_or(0).to_string()),
-                        ("T",   "0".to_string()),
+                        ("NM", stype.clone()),
+                        (
+                            "SMI",
+                            ss.get("smi")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0)
+                                .to_string(),
+                        ),
+                        (
+                            "SMO",
+                            ss.get("smo")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0)
+                                .to_string(),
+                        ),
+                        ("T", "0".to_string()),
                     ],
                     "",
                 );
@@ -748,8 +825,22 @@ fn build_z_report(
             z_content += &tag(
                 "NC",
                 vec![
-                    ("NI", check_count.get("ni").and_then(|v| v.as_i64()).unwrap_or(0).to_string()),
-                    ("NO", check_count.get("no").and_then(|v| v.as_i64()).unwrap_or(0).to_string()),
+                    (
+                        "NI",
+                        check_count
+                            .get("ni")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0)
+                            .to_string(),
+                    ),
+                    (
+                        "NO",
+                        check_count
+                            .get("no")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0)
+                            .to_string(),
+                    ),
                 ],
                 "",
             );
@@ -761,9 +852,30 @@ fn build_z_report(
                 z_content += &tag(
                     "EPZ",
                     vec![
-                        ("EPC",  epz_sums.get("epc").and_then(|v| v.as_i64()).unwrap_or(0).to_string()),
-                        ("EPCS", epz_sums.get("epcs").and_then(|v| v.as_i64()).unwrap_or(0).to_string()),
-                        ("EPSM", epz_sums.get("epsm").and_then(|v| v.as_i64()).unwrap_or(0).to_string()),
+                        (
+                            "EPC",
+                            epz_sums
+                                .get("epc")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0)
+                                .to_string(),
+                        ),
+                        (
+                            "EPCS",
+                            epz_sums
+                                .get("epcs")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0)
+                                .to_string(),
+                        ),
+                        (
+                            "EPSM",
+                            epz_sums
+                                .get("epsm")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0)
+                                .to_string(),
+                        ),
                     ],
                     "",
                 );
@@ -771,18 +883,14 @@ fn build_z_report(
         }
     }
 
-    let z_tag = tag(
-        "Z",
-        vec![("NO", ctx.z_number.to_string())],
-        &z_content,
-    );
+    let z_tag = tag("Z", vec![("NO", ctx.z_number.to_string())], &z_content);
     let dat_content = tag(
         "DAT",
         vec![
             ("DI", ctx.local_number.to_string()),
             ("FN", cmd.fiscal_number.clone()),
             ("TN", ctx.tax_number.to_string()),
-            ("V",  "1".to_string()),
+            ("V", "1".to_string()),
             ("ZN", ctx.z_number.to_string()),
         ],
         &(z_tag + &tag("TS", vec![], ts_str)),
@@ -804,7 +912,7 @@ fn build_e_element(
 ) -> String {
     let base_attrs = vec![
         ("FN", fiscal_number.to_string()),
-        ("N",  item_no.to_string()),
+        ("N", item_no.to_string()),
         ("NO", local_number.to_string()),
         ("SM", total_sum.to_string()),
         ("TS", ts_str.to_string()),
@@ -825,13 +933,18 @@ fn build_e_element(
             Some(g) => g,
             None => continue,
         };
-        let (txsm, dtsm) = calc_tax(group_sum, group.tax_rate, group.additional_rate, group.tax_algorithm);
+        let (txsm, dtsm) = calc_tax(
+            group_sum,
+            group.tax_rate,
+            group.additional_rate,
+            group.tax_algorithm,
+        );
         tx_xml += &tag(
             "TX",
             vec![
                 ("DTPR", format!("{:.2}", group.additional_rate)),
                 ("DTSM", dtsm.to_string()),
-                ("TX",   tax_id.clone()),
+                ("TX", tax_id.clone()),
                 ("TXAL", group.tax_algorithm.to_string()),
                 ("TXPR", format!("{:.2}", group.tax_rate)),
                 ("TXSM", txsm.to_string()),
@@ -915,7 +1028,11 @@ fn py_round(x: f64) -> i64 {
     let frac = x - x.floor();
     if (frac - 0.5).abs() < f64::EPSILON {
         // Exact midpoint — round to even
-        if floor % 2 == 0 { floor } else { floor + 1 }
+        if floor % 2 == 0 {
+            floor
+        } else {
+            floor + 1
+        }
     } else {
         x.round() as i64
     }
@@ -946,12 +1063,12 @@ mod tests {
 
     fn default_ctx<'a>() -> BuildContext<'a> {
         BuildContext {
-            local_number:   42,
-            z_number:       7,
-            previous_hash:  "AABBCC",
-            tax_number:     "12345678",
-            tax_groups:     None,
-            device_name:    "ПРО_каса",
+            local_number: 42,
+            z_number: 7,
+            previous_hash: "AABBCC",
+            tax_number: "12345678",
+            tax_groups: None,
+            device_name: "ПРО_каса",
             device_version: "1.1",
         }
     }
@@ -982,19 +1099,27 @@ mod tests {
     #[test]
     fn test_tag_attrs_sorted() {
         // Insert in reverse order; output must be alphabetical
-        let out = tag("X", vec![("ZZZ", "3".to_string()), ("AAA", "1".to_string()), ("MMM", "2".to_string())], "");
+        let out = tag(
+            "X",
+            vec![
+                ("ZZZ", "3".to_string()),
+                ("AAA", "1".to_string()),
+                ("MMM", "2".to_string()),
+            ],
+            "",
+        );
         assert_eq!(out, r#"<X AAA="1" MMM="2" ZZZ="3"></X>"#);
     }
 
     #[test]
     fn test_py_round_banker() {
         // Round half to even
-        assert_eq!(py_round(0.5), 0);   // floor=0 (even) → 0
-        assert_eq!(py_round(1.5), 2);   // floor=1 (odd)  → 2
-        assert_eq!(py_round(2.5), 2);   // floor=2 (even) → 2
-        assert_eq!(py_round(3.5), 4);   // floor=3 (odd)  → 4
-        assert_eq!(py_round(-0.5), 0);  // Python round(-0.5) == 0
-        // Normal rounding
+        assert_eq!(py_round(0.5), 0); // floor=0 (even) → 0
+        assert_eq!(py_round(1.5), 2); // floor=1 (odd)  → 2
+        assert_eq!(py_round(2.5), 2); // floor=2 (even) → 2
+        assert_eq!(py_round(3.5), 4); // floor=3 (odd)  → 4
+        assert_eq!(py_round(-0.5), 0); // Python round(-0.5) == 0
+                                       // Normal rounding
         assert_eq!(py_round(1.4), 1);
         assert_eq!(py_round(1.6), 2);
     }
@@ -1025,7 +1150,10 @@ mod tests {
     #[test]
     fn test_format_ts_invalid_returns_bad_request() {
         let err = format_ts("not-a-date").unwrap_err();
-        assert!(matches!(err, SidecarError::BadRequest(_)), "expected BadRequest, got {err:?}");
+        assert!(
+            matches!(err, SidecarError::BadRequest(_)),
+            "expected BadRequest, got {err:?}"
+        );
     }
 
     #[test]
@@ -1041,13 +1169,16 @@ mod tests {
 
     #[test]
     fn test_sell_structure() {
-        let cmd = make_cmd("SELL", json!({
-            "receipt": {
-                "goods": [{"name":"Кава","price":5000,"quantity":1000,"sum":5000}],
-                "payments": [{"type":"CASH","amount":5000}],
-                "totals": {"total_sum": 5000}
-            }
-        }));
+        let cmd = make_cmd(
+            "SELL",
+            json!({
+                "receipt": {
+                    "goods": [{"name":"Кава","price":5000,"quantity":1000,"sum":5000}],
+                    "payments": [{"type":"CASH","amount":5000}],
+                    "totals": {"total_sum": 5000}
+                }
+            }),
+        );
         let ctx = default_ctx();
         let xml = xml_from(&cmd, &ctx);
         assert!(xml.contains(r#"<C T="0">"#), "missing <C T=\"0\">");
@@ -1086,12 +1217,15 @@ mod tests {
 
     #[test]
     fn test_z_report_structure() {
-        let cmd = make_cmd("Z_REPORT", json!({
-            "z_report_data": {
-                "payment_sums": {"CASH": {"smi": 50000, "smo": 0}},
-                "check_count": {"ni": 5, "no": 1}
-            }
-        }));
+        let cmd = make_cmd(
+            "Z_REPORT",
+            json!({
+                "z_report_data": {
+                    "payment_sums": {"CASH": {"smi": 50000, "smo": 0}},
+                    "check_count": {"ni": 5, "no": 1}
+                }
+            }),
+        );
         let ctx = default_ctx();
         let xml = xml_from(&cmd, &ctx);
         assert!(xml.contains("<Z "), "missing <Z");
@@ -1101,13 +1235,16 @@ mod tests {
 
     #[test]
     fn test_return_uses_type_1() {
-        let cmd = make_cmd("RETURN", json!({
-            "receipt": {
-                "goods": [{"name":"Товар","price":1000,"quantity":1000,"sum":1000}],
-                "payments": [{"type":"CASH","amount":1000}],
-                "totals": {"total_sum": 1000}
-            }
-        }));
+        let cmd = make_cmd(
+            "RETURN",
+            json!({
+                "receipt": {
+                    "goods": [{"name":"Товар","price":1000,"quantity":1000,"sum":1000}],
+                    "payments": [{"type":"CASH","amount":1000}],
+                    "totals": {"total_sum": 1000}
+                }
+            }),
+        );
         let ctx = default_ctx();
         let xml = xml_from(&cmd, &ctx);
         assert!(xml.contains(r#"<C T="1">"#), "RETURN must use T=\"1\"");
@@ -1115,19 +1252,22 @@ mod tests {
 
     #[test]
     fn test_sell_with_discount_item_level() {
-        let cmd = make_cmd("SELL", json!({
-            "receipt": {
-                "goods": [{
-                    "name": "Товар",
-                    "price": 10000,
-                    "quantity": 1000,
-                    "sum": 10000,
-                    "discounts": [{"value": 500, "type": "DISCOUNT", "mode": "VALUE"}]
-                }],
-                "payments": [{"type":"CASH","amount":9500}],
-                "totals": {"total_sum": 9500}
-            }
-        }));
+        let cmd = make_cmd(
+            "SELL",
+            json!({
+                "receipt": {
+                    "goods": [{
+                        "name": "Товар",
+                        "price": 10000,
+                        "quantity": 1000,
+                        "sum": 10000,
+                        "discounts": [{"value": 500, "type": "DISCOUNT", "mode": "VALUE"}]
+                    }],
+                    "payments": [{"type":"CASH","amount":9500}],
+                    "totals": {"total_sum": 9500}
+                }
+            }),
+        );
         let ctx = default_ctx();
         let xml = xml_from(&cmd, &ctx);
         assert!(xml.contains("<D "), "missing per-item discount <D");
@@ -1135,30 +1275,39 @@ mod tests {
 
     #[test]
     fn test_sell_with_discount_check_level() {
-        let cmd = make_cmd("SELL", json!({
-            "receipt": {
-                "goods": [{"name":"T","price":10000,"quantity":1000,"sum":10000}],
-                "payments": [{"type":"CASH","amount":9000}],
-                "totals": {"total_sum": 9000},
-                "discounts": [{"value": 1000, "type": "DISCOUNT", "mode": "VALUE"}]
-            }
-        }));
+        let cmd = make_cmd(
+            "SELL",
+            json!({
+                "receipt": {
+                    "goods": [{"name":"T","price":10000,"quantity":1000,"sum":10000}],
+                    "payments": [{"type":"CASH","amount":9000}],
+                    "totals": {"total_sum": 9000},
+                    "discounts": [{"value": 1000, "type": "DISCOUNT", "mode": "VALUE"}]
+                }
+            }),
+        );
         let ctx = default_ctx();
         let xml = xml_from(&cmd, &ctx);
-        assert!(xml.contains(r#"TR="1""#), "check-level discount must have TR=\"1\"");
+        assert!(
+            xml.contains(r#"TR="1""#),
+            "check-level discount must have TR=\"1\""
+        );
     }
 
     #[test]
     fn test_header_footer_as_l_tags() {
-        let cmd = make_cmd("SELL", json!({
-            "receipt": {
-                "header": "Магазин\nАдреса",
-                "footer": "Дякуємо",
-                "goods": [{"name":"X","price":100,"quantity":1000,"sum":100}],
-                "payments": [{"type":"CASH","amount":100}],
-                "totals": {"total_sum": 100}
-            }
-        }));
+        let cmd = make_cmd(
+            "SELL",
+            json!({
+                "receipt": {
+                    "header": "Магазин\nАдреса",
+                    "footer": "Дякуємо",
+                    "goods": [{"name":"X","price":100,"quantity":1000,"sum":100}],
+                    "payments": [{"type":"CASH","amount":100}],
+                    "totals": {"total_sum": 100}
+                }
+            }),
+        );
         let ctx = default_ctx();
         let xml = xml_from(&cmd, &ctx);
         // Header lines should appear as <L N="..." NM="...">
@@ -1169,18 +1318,21 @@ mod tests {
 
     #[test]
     fn test_card_payment_epz_attrs() {
-        let cmd = make_cmd("SELL", json!({
-            "receipt": {
-                "goods": [{"name":"T","price":5000,"quantity":1000,"sum":5000}],
-                "payments": [{
-                    "type":"CARD","amount":5000,
-                    "rrn":"000123456789",
-                    "resolved_t":"2",
-                    "resolved_nm":"Visa"
-                }],
-                "totals": {"total_sum": 5000}
-            }
-        }));
+        let cmd = make_cmd(
+            "SELL",
+            json!({
+                "receipt": {
+                    "goods": [{"name":"T","price":5000,"quantity":1000,"sum":5000}],
+                    "payments": [{
+                        "type":"CARD","amount":5000,
+                        "rrn":"000123456789",
+                        "resolved_t":"2",
+                        "resolved_nm":"Visa"
+                    }],
+                    "totals": {"total_sum": 5000}
+                }
+            }),
+        );
         let ctx = default_ctx();
         let xml = xml_from(&cmd, &ctx);
         assert!(xml.contains("000123456789"), "RRN must appear in XML");
@@ -1189,19 +1341,26 @@ mod tests {
 
     #[test]
     fn test_z_report_with_payment_sums() {
-        let cmd = make_cmd("Z_REPORT", json!({
-            "z_report_data": {
-                "payment_sums": {
-                    "CASH": {"smi": 100000, "smo": 5000},
-                    "CARD": {"smi": 50000, "smo": 0}
-                },
-                "check_count": {"ni": 10, "no": 2}
-            }
-        }));
+        let cmd = make_cmd(
+            "Z_REPORT",
+            json!({
+                "z_report_data": {
+                    "payment_sums": {
+                        "CASH": {"smi": 100000, "smo": 5000},
+                        "CARD": {"smi": 50000, "smo": 0}
+                    },
+                    "check_count": {"ni": 10, "no": 2}
+                }
+            }),
+        );
         let ctx = default_ctx();
         let xml = xml_from(&cmd, &ctx);
         // Both CASH and CARD payment entries
-        assert_eq!(xml.matches("<M ").count(), 2, "expect 2 payment <M> entries");
+        assert_eq!(
+            xml.matches("<M ").count(),
+            2,
+            "expect 2 payment <M> entries"
+        );
     }
 
     #[test]
@@ -1228,7 +1387,10 @@ mod tests {
     fn calc_tax_al2_additional_rate() {
         let (txsm, dtsm) = calc_tax(10500, 20.0, 5.0, 2);
         assert_eq!(dtsm, 500, "algo2: additional portion dtsm must be 500");
-        assert_eq!(txsm, 1667, "algo2: primary tax txsm on remainder must be 1667");
+        assert_eq!(
+            txsm, 1667,
+            "algo2: primary tax txsm on remainder must be 1667"
+        );
     }
 
     /// algo2 with zero primary rate: only additional rate applies.
@@ -1264,13 +1426,16 @@ mod tests {
     /// SELL with empty goods list must produce no `<P ` tags.
     #[test]
     fn sell_with_empty_goods_list_produces_no_p_tags() {
-        let cmd = make_cmd("SELL", json!({
-            "receipt": {
-                "goods": [],
-                "payments": [{"type": "CASH", "amount": 0}],
-                "totals": {"total_sum": 0}
-            }
-        }));
+        let cmd = make_cmd(
+            "SELL",
+            json!({
+                "receipt": {
+                    "goods": [],
+                    "payments": [{"type": "CASH", "amount": 0}],
+                    "totals": {"total_sum": 0}
+                }
+            }),
+        );
         let ctx = default_ctx();
         let xml = xml_from(&cmd, &ctx);
         assert!(
@@ -1315,7 +1480,10 @@ mod tests {
     #[test]
     fn py_round_large_values_no_overflow() {
         let (txsm, dtsm) = calc_tax(9_999_999_999i64, 20.0, 0.0, 0);
-        assert_eq!(txsm, 1_666_666_666, "large-sum tax must equal 1_666_666_666 (banker round of .5 to even)");
+        assert_eq!(
+            txsm, 1_666_666_666,
+            "large-sum tax must equal 1_666_666_666 (banker round of .5 to even)"
+        );
         assert_eq!(dtsm, 0, "algo=0 must produce dtsm=0");
         assert!(txsm > 0, "tax on large sum must be positive");
         assert!(
@@ -1335,12 +1503,15 @@ mod tests {
     /// Z_REPORT with no payment_sums key must produce no M tags.
     #[test]
     fn z_report_with_no_payments_has_no_m_tags() {
-        let cmd = make_cmd("Z_REPORT", json!({
-            "z_report_data": {
-                "check_count": {"ni": 3, "no": 0}
-                // payment_sums intentionally absent
-            }
-        }));
+        let cmd = make_cmd(
+            "Z_REPORT",
+            json!({
+                "z_report_data": {
+                    "check_count": {"ni": 3, "no": 0}
+                    // payment_sums intentionally absent
+                }
+            }),
+        );
         let ctx = default_ctx();
         let xml = xml_from(&cmd, &ctx);
         assert!(
@@ -1353,12 +1524,15 @@ mod tests {
     /// Z_REPORT with empty payment_sums object must produce no M tags.
     #[test]
     fn z_report_with_empty_payment_sums_has_no_m_tags() {
-        let cmd = make_cmd("Z_REPORT", json!({
-            "z_report_data": {
-                "payment_sums": {},
-                "check_count": {"ni": 0, "no": 0}
-            }
-        }));
+        let cmd = make_cmd(
+            "Z_REPORT",
+            json!({
+                "z_report_data": {
+                    "payment_sums": {},
+                    "check_count": {"ni": 0, "no": 0}
+                }
+            }),
+        );
         let ctx = default_ctx();
         let xml = xml_from(&cmd, &ctx);
         assert!(

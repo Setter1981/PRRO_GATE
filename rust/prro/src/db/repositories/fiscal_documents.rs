@@ -555,6 +555,81 @@ pub struct OfflineStamp {
     pub dps_code: String,
 }
 
+/// B10 — existence probe for the offline-session boundary docs (DocType
+/// `OFFLINE_SESSION_BEGIN` / `OFFLINE_SESSION_END`).  Returns `true` iff an
+/// ACTIVE (non-terminal-failed) boundary doc of `doc_type` already exists for
+/// `(fiscal_number, shift_id)`.
+///
+/// **Keyed on `shift_id`, NOT `offline_session_id`** — the session_id is
+/// stamped only at SIGN (`stamp_offline_issuance_tx`), so a crashed-PREPARED
+/// boundary doc has a NULL `offline_session_id` and would be invisible to a
+/// session-keyed probe → double-mint (the arch-locked idempotency trap).  The
+/// `shift_id` is set at mint and is the stable per-session anchor that survives
+/// the PREPARED-crash window (one offline session per open shift).
+///
+/// **State set**: any state OTHER than the terminal-FAILED ones
+/// (`REJECTED`/`ABORTED`/`CANCELLED`/`REQUIRES_MANUAL_RECONCILIATION`).  A
+/// still-live (PREPARED/SIGNED/OFFLINE_LOCAL_ACK/…) or successfully-issued
+/// (ACK) boundary doc counts as "exists" → do NOT re-mint.  A boundary doc that
+/// terminated in a failed state (a prior aborted attempt) does NOT count → a
+/// fresh mint is allowed.  This mirrors the partial UNIQUE index
+/// `ux_fd_active_offline_boundary` (migration 030) — the DB constraint is the
+/// fail-closed backstop; this read is the idempotency gate.
+pub async fn active_boundary_doc_state_tx(
+    tx: &mut WriteTxConn<'_>,
+    fiscal_number: &str,
+    shift_id: ShiftId,
+    doc_type: DocType,
+) -> sqlx::Result<Option<DocState>> {
+    debug_assert!(
+        matches!(
+            doc_type,
+            DocType::OfflineSessionBegin | DocType::OfflineSessionEnd
+        ),
+        "active_boundary_doc_state_tx is only meaningful for boundary doc types"
+    );
+    let row: Option<DocState> = sqlx::query_scalar(
+        "SELECT state FROM fiscal_documents \
+         WHERE fiscal_number = ? AND shift_id = ? AND doc_type = ? \
+           AND state NOT IN ( \
+               'REJECTED','ABORTED','CANCELLED','REQUIRES_MANUAL_RECONCILIATION' \
+           ) \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .bind(shift_id)
+    .bind(doc_type)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row)
+}
+
+/// B10 (review Finding B fix) — read the `state` of the fiscal_documents row with
+/// the given `request_id`, or `None` if no row exists.
+///
+/// This is the crash-safe idempotency probe for the lazy DocType=9 BEGIN, keyed
+/// on the BEGIN's DETERMINISTIC synthetic `request_id` (`sha256("b10-begin-<fn>")`)
+/// — the ONLY anchor stamped at MINT (stage_acquire INSERT) that survives EVERY
+/// crash window AND works for EVERY first-offline-doc type:
+///   - keying on `shift_id` misses when the first offline doc is a SHIFT_OPEN
+///     (the shift is not created until that SHIFT_OPEN's acquire);
+///   - keying on `offline_session_id` misses a crashed PREPARED BEGIN (the column
+///     is stamped only at sign).
+///
+/// The caller maps the returned state: issued → proceed, terminal-failed / None
+/// → mint, else (below-OLA non-terminal) → fail-closed 503.
+pub async fn doc_state_by_request_id_tx(
+    tx: &mut WriteTxConn<'_>,
+    request_id: &[u8; 16],
+) -> sqlx::Result<Option<DocState>> {
+    let row: Option<DocState> =
+        sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE request_id = ? LIMIT 1")
+            .bind(&request_id[..])
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(row)
+}
+
 /// B9 Slice A — slim `SIGNED → OFFLINE_LOCAL_ACK` state CAS with **no** column
 /// writes.  Used by `stage_offline_ack` when the offline-issuance columns were
 /// already stamped at sign (the [`stamp_offline_issuance_tx`] path): the

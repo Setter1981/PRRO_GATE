@@ -1083,6 +1083,21 @@ pub async fn drain<'a>(
     // is structurally unreachable pre-W12 (drain cannot synthesize
     // real Ack proof).  W12 PR plugs `lastChk` evidence → Acked
     // outcomes → eligibility flips to Eligible.
+
+    // B10 (W10b) — once all CONTENT docs are Ack (Eligible), mint+send the
+    // DocType=10 (OFFLINE_SESSION_END) as the LAST offline doc (dossier §10).
+    // It closes the DPS offline window.  Only when it reaches ACK does the
+    // finalize close the session; if it holds, `finalize_drain` emits PARTIAL
+    // and the session re-enters next tick (the ensure-step adopts the pending
+    // END, no re-mint).  Runs ONLY on content-eligible so a half-drained
+    // backlog never gets a premature END.
+    if matches!(
+        summary.finalize_eligibility(),
+        FinalizeEligibility::Eligible
+    ) {
+        ensure_and_drain_session_end(pool, deps, fiscal_number, &ns, &mut summary).await?;
+    }
+
     finalize_drain(pool, fiscal_number, session_id, &ns, &mut summary).await?;
     Ok(summary)
 }
@@ -1211,7 +1226,8 @@ fn is_manual_recon_retry_class(retry: RetryClass) -> bool {
         | RetryClass::FnConfigError
         | RetryClass::WrapperBug
         | RetryClass::MacRecovery
-        | RetryClass::OperatorEscalation => true,
+        | RetryClass::OperatorEscalation
+        | RetryClass::DrainChainSettleRetry => true,
         RetryClass::TransientRetry | RetryClass::ProbeRequired => false,
     }
 }
@@ -2551,6 +2567,425 @@ async fn escalate_drain_to_manual(
 // — the single transition-service now owns the shift CAS + projection
 // mirror pairing for both this drain path and boot reconciliation.
 
+/// B10 (W10b) — ensure the offline-session DocType=10 (OFFLINE_SESSION_END) is
+/// minted, sent LAST, and ACK'd before the session closes (dossier §10).
+///
+/// Called from `drain` ONLY when all CONTENT docs reached Ack (Eligible).  The
+/// END is a finalize PRECONDITION, not a cohort member — it is NOT counted in
+/// `DrainSummary` (which stays content-only so `advanced_to_ack ==
+/// backlog_size_before` holds).  On END-ACK the summary is untouched → the
+/// downstream `finalize_drain` stays Eligible → closes.  On END-hold this
+/// records a per-doc failure → eligibility flips to `PerDocFailuresPresent` →
+/// `finalize_drain` emits PARTIAL, session stays Draining, next tick re-enters
+/// (the existence-adopt below skips re-mint).
+///
+/// Three envelope-bounded steps + an idempotent adopt:
+///   - **ADOPT** — `active_boundary_doc_state_tx(END)`; ACK → done; a
+///     non-terminal END → route by state (skip mint; sign/OLA/send as needed);
+///     absent → mint (STEP A).
+///   - **STEP A** — direct `insert_prepared_tx` (NOT `stage_acquire`, which
+///     rejects under `GoingOnline`): `fs_mode='OFFLINE'`, `doc_type=END`,
+///     bound to the ClosingLocalPendingDrain/Opened shift, `lnd=next` (highest
+///     ⇒ drains last).  D2: no `server_fiscal_no`, no online seed.
+///   - **STEP B** — `stage_sign::run` (the boundary-END forced offline-code
+///     path stamps the pool code + `<MAC ID>` even under GoingOnline/Draining).
+///   - **OLA + seed advance** — direct `SIGNED → OFFLINE_LOCAL_ACK` CAS + M2-01
+///     seed advance (bypasses `stage_offline_ack`'s node-mode gate, which
+///     refuses under GoingOnline).  Closes the offline chain.
+///   - **STEP C** — `stage_send::run` + `confirm_drain_doc(SentFresh)` → Ack,
+///     sent AFTER the last content doc (highest lnd ⇒ wire-last).
+async fn ensure_and_drain_session_end(
+    pool: &SqlitePool,
+    deps: &RuntimeView<'_>,
+    fiscal_number: &str,
+    // Existence/idempotency is keyed on `(fn, shift_id)` (from
+    // `ns.current_shift_id`).  B10 END-online fix: the END is now an ONLINE
+    // issuance (NOT session-scoped), fetched by its deterministic `request_id` —
+    // no `session_id` cohort fetch is needed.
+    ns: &node_state::NodeStateRow,
+    summary: &mut DrainSummary,
+) -> Result<(), BootError> {
+    use crate::db::models::enums::DocType;
+
+    let shift_id = match ns.current_shift_id {
+        Some(s) => s,
+        // No shift bound → this is NOT a B10-eligible offline session: the
+        // boundary docs are shift-scoped (a real offline session is always
+        // opened within a shift — boot→SHIFT_OPEN→go_offline→sells).  A
+        // shiftless session at finalize is a synthetic / pre-B10 drain shape;
+        // SKIP the END (do NOT wedge the finalize) — proceed to close normally.
+        // Fail-closing here would strand any such session forever with no
+        // operator remedy.
+        None => return Ok(()),
+    };
+
+    // ── ADOPT: is there already a boundary END for this (fn, shift)? ──
+    // INV-1 static-scan: INLINE closure with the capture hoisted before the
+    // call so `with_immediate_no_foreign_io` reads the body.
+    let fn_owned_adopt = fiscal_number.to_string();
+    let existing = with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            fiscal_documents::active_boundary_doc_state_tx(
+                tx,
+                &fn_owned_adopt,
+                shift_id,
+                DocType::OfflineSessionEnd,
+            )
+            .await
+            .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .map_err(|source| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source,
+    })?;
+
+    // Already fully issued (ACK) → nothing to do; finalize proceeds.
+    if matches!(existing, Some(DocState::Ack)) {
+        return Ok(());
+    }
+
+    // Mint if absent (STEP A).  If a non-terminal END already exists (crash
+    // mid-flow), STEP A is skipped and we re-drive it from its current row via
+    // the shared send/confirm tail below (its doc_id is re-read by request_id).
+    let request_id_typed = if existing.is_none() {
+        mint_session_end_prepared(pool, deps, fiscal_number, shift_id).await?
+    } else {
+        // Re-derive the deterministic synthetic request_id to re-fetch the row.
+        session_end_request_id(fiscal_number)
+    };
+
+    // STEP B: drive PREPARED → SIGNED (online-shaped, bare `<MAC>`), unless
+    // already SIGNED-or-past.  No OLA / no seed advance here — the END is an
+    // ONLINE issuance whose seed advances at STEP C's `Sending → Sent` CAS.
+    drive_session_end_to_sign(pool, deps, fiscal_number, &request_id_typed).await?;
+
+    // STEP C: send LAST + confirm → Ack.  On non-Ack → record a per-doc
+    // failure so finalize emits PARTIAL (session stays Draining; retry).
+    let acked = drain_session_end_doc(pool, deps, fiscal_number, &request_id_typed).await?;
+    if !acked {
+        // LOW-3 (review): attribute the failure to the REAL END document_id (not
+        // a throwaway) for forensic traceability.  Fall back to a fresh id only
+        // if the row is somehow absent (should not happen — STEP A minted it).
+        let end_doc_id: Option<DocumentId> =
+            sqlx::query_scalar("SELECT document_id FROM fiscal_documents WHERE request_id = ?")
+                .bind(request_id_typed.as_bytes().as_slice())
+                .fetch_optional(pool)
+                .await
+                .map_err(BootError::Database)?;
+        // `DocumentId::default()` == `DocumentId::new()` (a fresh random UUIDv7 —
+        // see `id_newtype!`), so the default fallback is a distinct throwaway id,
+        // only reached if the END row is somehow absent (STEP A rules it out).
+        summary.record_doc_failure(
+            end_doc_id.unwrap_or_default(),
+            "offline_session_end_hold".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Deterministic synthetic `request_id` for the session-END inbox row
+/// (idempotent per FN: `b10-end-<fn>`), so a re-drive re-fetches the same row.
+fn session_end_request_id(fiscal_number: &str) -> crate::db::models::ids::RequestId {
+    let idem = format!("b10-end-{fiscal_number}");
+    let h: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(idem.as_bytes()).into();
+    let mut r = [0u8; 16];
+    r.copy_from_slice(&h[..16]);
+    crate::db::models::ids::RequestId::from_bytes(r)
+}
+
+/// STEP A — mint the END `PREPARED` row directly (bypassing `stage_acquire`,
+/// which rejects under GoingOnline).  Returns the synthetic `RequestId`.
+async fn mint_session_end_prepared(
+    pool: &SqlitePool,
+    _deps: &RuntimeView<'_>,
+    fiscal_number: &str,
+    shift_id: ShiftId,
+) -> Result<crate::db::models::ids::RequestId, BootError> {
+    use crate::db::models::enums::DocType;
+    use crate::db::repositories::fiscal_documents::NewDocument;
+
+    let request_id = session_end_request_id(fiscal_number);
+    let payload_json = "{}".to_string();
+    let payload_sha256: [u8; 32] =
+        <sha2::Sha256 as sha2::Digest>::digest(payload_json.as_bytes()).into();
+    let business_ts = chrono::Utc::now().to_rfc3339();
+    let fiscal_number_owned = fiscal_number.to_string();
+
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // Synthetic inbox row (status=PROCESSING) so stage_finalize's
+            // `mark_done_tx` (WHERE status='PROCESSING') finds it — the END
+            // bypasses the normal NEW→PROCESSING lease (stage_acquire rejects
+            // under GoingOnline).  INSERT OR IGNORE → idempotent on re-drive.
+            sqlx::query(
+                "INSERT OR IGNORE INTO ingress_inbox \
+                 (request_id, fiscal_number, protocol, operation_type, idempotency_key, \
+                  status, payload_json, payload_sha256_canonical) \
+                 VALUES (?, ?, 'INTERNAL', ?, ?, 'PROCESSING', ?, ?)",
+            )
+            .bind(request_id.as_bytes().as_slice())
+            .bind(&fiscal_number_owned)
+            .bind(DocType::OfflineSessionEnd.as_str())
+            .bind(format!("b10-end-{fiscal_number_owned}"))
+            .bind(&payload_json)
+            .bind(&payload_sha256[..])
+            .execute(&mut **tx)
+            .await?;
+            // Idempotent: if the doc row already exists (crash re-drive), skip INSERT.
+            if fiscal_documents::get_pending_by_request_id_tx(tx, &request_id)
+                .await?
+                .is_some()
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+            let lnd = node_state::allocate_next_lnd(tx, &fiscal_number_owned).await?;
+            let new_doc = NewDocument {
+                document_id: DocumentId::new(),
+                request_id,
+                fiscal_number: fiscal_number_owned.clone(),
+                shift_id: Some(shift_id),
+                offline_session_id: None,
+                lnd,
+                doc_type: DocType::OfflineSessionEnd,
+                backend_profile_id: "b".to_string(),
+                transport_profile_id: "t".to_string(),
+                // B10 END-online fix — the END is minted at DRAIN finalize (node
+                // GoingOnline), where "going online" makes it a real ONLINE
+                // issuance, NOT an offline doc.  `fs_mode='ONLINE'` cascades the
+                // whole shape: `is_online_origin_tx` ⇒ `stage_sign` signs a BARE
+                // `<MAC>` (no forced offline code), and `stage_send` sends with an
+                // EMPTY `id_offline` + advances the online seed / stamps
+                // `server_fiscal_no` at the `Sending → Sent` CAS (advance-at-SEND).
+                // Mirrors WebCheck's `CloseOfflineDoc` (online-shaped END), proven
+                // live (a bare-`<MAC>` online END was ACCEPTED by DPS and closed
+                // the session).  The BEGIN stays `fs_mode='OFFLINE'` (opens the
+                // session while OFFLINE) — the asymmetry is intentional.
+                fs_mode: "ONLINE",
+                business_ts: business_ts.clone(),
+                total_sum_kop: None,
+                payload_json: payload_json.clone(),
+                payload_sha256_canonical: payload_sha256,
+                source_sha256: payload_sha256,
+                unsigned_xml_sha256: None,
+                previous_hash: None,
+                signed_by_cashier_id: None,
+                signing_config_snapshot_id: None,
+            };
+            fiscal_documents::insert_prepared_tx(tx, &new_doc).await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|source| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source,
+    })?;
+    Ok(request_id)
+}
+
+/// STEP B — drive the END `PREPARED → SIGNED` (online-shaped, bare `<MAC>`).
+///
+/// SIGN via `stage_sign::run`.  The END is minted `fs_mode='ONLINE'`, so the
+/// sign path signs ONLINE-shaped (a BARE `<MAC>`, NO offline code — the
+/// DPS-accepted drain-to-online close shape, WebCheck `CloseOfflineDoc`).  It
+/// does NOT go to `OFFLINE_LOCAL_ACK` and does NOT advance the seed here: the
+/// END is an ONLINE issuance whose seed advance + `server_fiscal_no` stamp
+/// happen at the `Sending → Sent` CAS in `stage_send` (advance-at-SEND, STEP C).
+/// Idempotent: a doc already SIGNED-or-past skips the sign.
+async fn drive_session_end_to_sign(
+    pool: &SqlitePool,
+    deps: &RuntimeView<'_>,
+    fiscal_number: &str,
+    request_id: &crate::db::models::ids::RequestId,
+) -> Result<(), BootError> {
+    use crate::db::models::enums::{DocType, Protocol};
+    use crate::db::repositories::ingress_inbox::InboxRow;
+    use crate::services::write_path::stage_sign;
+    use crate::services::write_path::types::{CanonicalFiscalCommand, WorkerContext};
+
+    // Fetch the PREPARED/SIGNED END row (pending states only).
+    // INV-1 static-scan: INLINE closure, capture hoisted before the call.
+    let request_id_owned = *request_id;
+    let doc = with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            fiscal_documents::get_pending_by_request_id_tx(tx, &request_id_owned)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .map_err(|source| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source,
+    })?;
+
+    // If not pending here, it is already OLA-or-past (sign+OLA done) → nothing
+    // to drive; the send step re-reads it.
+    let Some(doc) = doc else {
+        return Ok(());
+    };
+
+    // ── STEP B: sign (only if still PREPARED) ──
+    if doc.state == DocState::Prepared {
+        let ns = node_state::get(pool, fiscal_number)
+            .await
+            .map_err(BootError::Database)?
+            .ok_or_else(|| {
+                BootError::Internal(format!(
+                    "ensure_end: node_state missing for {fiscal_number}"
+                ))
+            })?;
+        // `business_ts` is not on `DocumentRow`; read it from the row (stamped
+        // at STEP-A mint = drain-close time).
+        let business_ts: String =
+            sqlx::query_scalar("SELECT business_ts FROM fiscal_documents WHERE document_id = ?")
+                .bind(doc.document_id)
+                .fetch_one(pool)
+                .await
+                .map_err(BootError::Database)?;
+        // stage_sign::run reads ONLY `command` + `document` + `tax_*` from the
+        // WorkerContext (the `..` destructure ignores inbox/node_state/
+        // active_shift); we supply a throwaway inbox + the real node_state.
+        let throwaway_inbox = InboxRow {
+            request_id: *request_id.as_bytes(),
+            fiscal_number: fiscal_number.to_string(),
+            protocol: Protocol::Internal,
+            operation_type: DocType::OfflineSessionEnd.as_str().to_string(),
+            idempotency_key: format!("b10-end-{fiscal_number}"),
+            status: "PROCESSING".to_string(),
+            payload_json: "{}".to_string(),
+            payload_sha256_canonical: [0u8; 32],
+            correlation_id: None,
+            received_at: business_ts.clone(),
+            signed_by_cashier_id: None,
+            driver_id: None,
+            business_ts: Some(business_ts.clone()),
+            total_sum_kop: None,
+        };
+        let command = CanonicalFiscalCommand {
+            doc_type: DocType::OfflineSessionEnd,
+            business_ts: business_ts.clone(),
+            total_sum_kop: None,
+            payload_json: "{}".to_string(),
+            payload_sha256_canonical: [0u8; 32],
+            source_sha256: [0u8; 32],
+            signed_by_cashier_id: None,
+            driver_id: None,
+        };
+        let ctx = WorkerContext {
+            inbox: throwaway_inbox,
+            command,
+            node_state: ns,
+            active_shift: None,
+            document: doc.clone(),
+            tax_resolution_snapshot: None,
+            tax_resolution_snapshot_id: None,
+        };
+        stage_sign::run(pool, deps.signing_ctx, ctx)
+            .await
+            .map_err(|e| BootError::Internal(format!("ensure_end: stage_sign failed: {e}")))?;
+
+        // B10 END-online fix — the END signed ONLINE-shaped (bare `<MAC>`, NO
+        // offline code, `offline_fiscal_no IS NULL`).  There is NO offline code to
+        // check and NO `SIGNED → OFFLINE_LOCAL_ACK` transition: the END rests at
+        // SIGNED and is issued at STEP C via `stage_send` (advance-at-SEND — the
+        // online seed advances + `server_fiscal_no` is stamped atomically at the
+        // `Sending → Sent` CAS).  A SIGNED END resting between drain ticks is #192-
+        // clean *within* a drain pass (STEP C sends it in the same tick); a crash
+        // between sign and send leaves it SIGNED, which the ADR-M3-A9 boot rule
+        // resolves like any online SIGNED doc (re-driven forward, never re-signed).
+    }
+    Ok(())
+}
+
+/// STEP C — send the END LAST + confirm to Ack.  Mirrors
+/// [`process_via_stage_send`]'s Sent→confirm chain (SentFresh).  Returns `true`
+/// iff the END reached `Ack`; `false` (hold / non-Ack) leaves it for the next
+/// drain tick.  Idempotent: an already-Ack END short-circuits `true`.
+async fn drain_session_end_doc(
+    pool: &SqlitePool,
+    deps: &RuntimeView<'_>,
+    fiscal_number: &str,
+    request_id: &crate::db::models::ids::RequestId,
+) -> Result<bool, BootError> {
+    // Idempotent short-circuit: the END already reached ACK on a prior tick.
+    let is_ack: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM fiscal_documents WHERE request_id = ? AND state = 'ACK' LIMIT 1",
+    )
+    .bind(request_id.as_bytes().as_slice())
+    .fetch_optional(pool)
+    .await
+    .map_err(BootError::Database)?;
+    if is_ack.is_some() {
+        return Ok(true);
+    }
+
+    // B10 END-online fix — the END is now an ONLINE issuance (`fs_mode='ONLINE'`,
+    // NOT session-scoped), resting at SIGNED (or Sent/Kvt/ER on a re-drive) — so
+    // it is NOT in the offline-drain cohort (`list_drain_candidates` filters
+    // `fs_mode='OFFLINE'`).  Fetch it by its deterministic `request_id` via the
+    // PENDING getter (returns SIGNED..KVT2/ERROR_RETRYABLE).
+    let request_id_owned = *request_id;
+    let doc = with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            fiscal_documents::get_pending_by_request_id_tx(tx, &request_id_owned)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .map_err(|source| BootError::ReconciliationFailed {
+        fiscal_number: fiscal_number.to_string(),
+        source,
+    })?;
+    let Some(doc) = doc else {
+        // Not pending (and not ACK, checked above) → hold (structural anomaly /
+        // not yet signed).
+        return Ok(false);
+    };
+
+    // Send ONLINE-shaped: the row has `offline_fiscal_no IS NULL`, so `stage_send`
+    // builds an EMPTY `id_offline` AND takes the advance-at-SEND branch — it
+    // advances the online chain seed + stamps `server_fiscal_no` atomically at the
+    // `Sending → Sent` CAS (D2: pre-SENT reject → Rejected, seed NOT advanced;
+    // post-SENT/ambiguous → RMR, seed NOT rolled back).  Then confirm via the
+    // drain's own kvt2_confirm (SentFresh) → Kvt2 → Ack (`stage_finalize` advances
+    // NOTHING — the online seed already moved at SEND).
+    let outcome = stage_send::run(pool, deps.dps, doc.document_id, Some(deps.signing_ctx)).await;
+    match outcome {
+        Ok(StageSendOutcome::Sent {
+            server_fiscal_no,
+            attempt_no,
+        }) => {
+            // `stage_send` just CAS'd the END `Sending → Sent`; reflect that in the
+            // snapshot handed to `confirm_drain_doc` so `advance_to_ack` selects the
+            // Sent-entry envelope (SentFresh; the fetched snapshot was SIGNED, the
+            // pre-send state).
+            let mut doc = doc;
+            doc.state = DocState::Sent;
+            let confirm = kvt2_confirm::confirm_drain_doc(
+                pool,
+                deps.dps,
+                &doc,
+                &server_fiscal_no,
+                deps.fn_sign,
+                kvt2_confirm::Kvt2ConfirmSource::SentFresh,
+                Some(attempt_no.into()),
+            )
+            .await?;
+            Ok(matches!(
+                confirm,
+                kvt2_confirm::ConfirmDrainOutcome::Advanced
+            ))
+        }
+        // Any non-Sent outcome (transient/route/refuse/error) → hold; the END
+        // is NOT Ack, session stays Draining, next tick re-drives (adopt).
+        _ => Ok(false),
+    }
+}
+
 /// W9b C6 finalization branch (spec §2.4 + amendment 2026-05-21).
 ///
 /// Evaluates [`DrainSummary::finalize_eligibility`] and routes:
@@ -3006,6 +3441,9 @@ fn failure_class_for_retry(retry: RetryClass) -> FailureClass {
         RetryClass::MacRecovery => FailureClass::Internal,
         // -6 operator-recoverable.
         RetryClass::OperatorEscalation => FailureClass::Server,
+        // Legacy-only B10 `-8` retry tag: reconciliation escalates it without
+        // a re-drive, so report it as a server-side manual failure.
+        RetryClass::DrainChainSettleRetry => FailureClass::Server,
     }
 }
 

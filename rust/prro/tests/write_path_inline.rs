@@ -642,7 +642,10 @@ async fn offline_sell_is_offline_local_ack_success() {
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_offline(&pool, shift_id).await;
     seed_open_offline_session(&pool).await;
+    // B10: the FIRST offline SELL lazily mints a DocType=9 BEGIN that consumes
+    // one code BEFORE the SELL — so two codes are needed (BEGIN + SELL).
     seed_offline_code(&pool, 1).await;
+    seed_offline_code(&pool, 2).await;
     let row = seed_inbox_sell(&pool).await;
 
     // DPS is never called on the offline path (dispatch terminates at offline-ack).
@@ -664,7 +667,29 @@ async fn offline_sell_is_offline_local_ack_success() {
         prro::db::models::enums::DocState::OfflineLocalAck
     );
     assert_eq!(outcome.fiscal_id, None);
-    assert_eq!(read_doc_state(&pool, FN).await, "OFFLINE_LOCAL_ACK");
+    // B10: both the lazy BEGIN and the SELL rest at OFFLINE_LOCAL_ACK.
+    let ola_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND state = 'OFFLINE_LOCAL_ACK'",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        ola_count, 2,
+        "B10: BEGIN + SELL both rest at OFFLINE_LOCAL_ACK"
+    );
+    let begin_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN'",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        begin_count, 1,
+        "B10: exactly one lazy DocType=9 BEGIN minted"
+    );
     // Audit pass-2: the scan over a REAL offline-acked ledger (consumed
     // code backing offline_fiscal_no etc.) — zero false positives.
     prro::db::invariant_scan::assert_clean(&pool).await;
@@ -676,26 +701,27 @@ async fn offline_sell_is_offline_local_ack_success() {
     );
 }
 
-/// **Post-sign refusal orphan fix (ledger-only pin).** An offline SELL with NO
-/// available offline code reaches `SIGNED` (acquire+sign) and is then refused at
-/// `stage_offline_ack` (`acquire_code_tx` → CodePoolExhausted).  The refusal MUST
-/// leave the doc in the non-issued TERMINAL `Aborted` (NOT a stuck `SIGNED`
-/// orphan — that violates the ledger-only pin) and return a TYPED refusal
-/// (`OfflineRefused` with `OFFLINE_CODE_POOL_EXHAUSTED`), NOT a catch-all
-/// `DISPATCH_INTERNAL`.
+/// **B10 no-code refusal (re-derived).** With NO offline code seeded, the FIRST
+/// offline SELL of the session lazily tries to mint the DocType=9 BEGIN — but the
+/// BEGIN itself needs a code.  The `ensure_offline_session_begin` **pre-mint
+/// fail-closed guard** sees the empty pool and refuses the whole op RETRYABLE
+/// (503 `OFFLINE_SESSION_BEGIN_PENDING`) **WITHOUT minting a bare BEGIN** that
+/// would only abort — keeping the empty-pool case clean (no aborted-BEGIN doc
+/// churn, matching the pre-B10 offline shift-lifecycle pre-mint refusal spirit).
+/// The operator replenishes the pool (seed-codes / T=112) and retries.  Pre-B10
+/// this test saw the SELL abort with `OFFLINE_UNSTAMPED_BARE_MAC_ABORTED` (500);
+/// B10 moves the empty-pool encounter to the BEGIN pre-mint guard and surfaces it
+/// as the retryable 503 (chain-fork-safe: NEITHER a BEGIN nor a SELL row is minted
+/// on the empty pool).
 #[tokio::test]
-async fn offline_no_code_aborts_doc_and_returns_typed_refusal() {
+async fn offline_no_code_aborts_begin_and_returns_retryable_refusal() {
     let pool = fresh_pool().await;
     let pool_secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_offline(&pool, shift_id).await;
     seed_open_offline_session(&pool).await;
-    // NO offline code seeded → the sell signs ONLINE-SHAPED (unstamped, bare
-    // `<MAC>` — no code at sign to stamp `<MAC ID>`), then B9's stage_offline_ack
-    // sees the doc is UNSTAMPED and aborts it terminally IN-ENVELOPE (it can never
-    // validly drain a bare-MAC doc).  Same ledger-only ABORTED end-state as the
-    // pre-B9 code-pool path, but the precise reason is now the bare-MAC abort.
+    // NO offline code seeded.
     let row = seed_inbox_sell(&pool).await;
 
     let dps = DualStub::new(
@@ -711,23 +737,40 @@ async fn offline_no_code_aborts_doc_and_returns_typed_refusal() {
         .await
         .expect_err("a no-code offline sell must be refused, not issued");
 
-    // (1) ledger-only pin: the doc is the non-issued TERMINAL `Aborted`, NOT a
-    // stuck `SIGNED` orphan and NOT issued (`OFFLINE_LOCAL_ACK`).
+    // (1) The pre-mint guard refuses BEFORE any row is minted: NO BEGIN doc
+    // (the empty pool never produces a bare BEGIN that would only abort — no
+    // aborted-BEGIN churn) and NO SELL row (it never reached acquire — the BEGIN
+    // gate fail-closed first). Chain-fork-safe on both sides.
+    let begin_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN'",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
-        read_doc_state(&pool, FN).await,
-        "ABORTED",
-        "a refused-before-issuance doc must reach the Aborted terminal, not stay SIGNED"
+        begin_rows, 0,
+        "no BEGIN row minted on the empty pool — the guard refuses PRE-mint (no aborted-BEGIN churn)"
     );
-    // (2) typed refusal (not the catch-all DISPATCH_INTERNAL).  B9: the doc is
-    // unstamped (bare `<MAC>`) so it aborts via the precise unstamped-bare-MAC
-    // code (500 Internal — a structural anomaly the operator re-issues past),
-    // NOT the former code-pool code (exhaustion is now handled at SIGN).
+    let sell_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'SELL'",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        sell_rows, 0,
+        "no SELL row minted against a non-issued BEGIN (chain-fork-safe)"
+    );
+    // (2) RETRYABLE 503 refusal (the operator seeds codes + retries), NOT a
+    // terminal 500 — the BEGIN-pending gate.
     match err {
-        FiscalError::Internal { code, .. } => assert_eq!(
-            code, "OFFLINE_UNSTAMPED_BARE_MAC_ABORTED",
-            "an unstamped bare-MAC offline doc must carry its precise typed abort code"
+        FiscalError::OfflineRefused { code, .. } => assert_eq!(
+            code, "OFFLINE_SESSION_BEGIN_PENDING",
+            "no-code first offline doc fail-closes on the lazy BEGIN (retryable 503)"
         ),
-        other => panic!("expected Internal(OFFLINE_UNSTAMPED_BARE_MAC_ABORTED), got {other:?}"),
+        other => panic!("expected OfflineRefused(OFFLINE_SESSION_BEGIN_PENDING), got {other:?}"),
     }
 }
 

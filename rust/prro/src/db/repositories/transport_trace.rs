@@ -359,7 +359,7 @@ pub async fn list_for_document(
 ///     auto-retry".
 ///   - `Ok(Some(rc))` — latest attempt's retry class.  Caller
 ///     filters per the docstring contract: only `TransientRetry` is
-///     auto-retryable; the other six classes need higher-layer
+///     auto-retryable; all other classes need higher-layer
 ///     orchestration.
 ///
 /// Reads outside any tx — pool-bound; safe to call from the dispatcher

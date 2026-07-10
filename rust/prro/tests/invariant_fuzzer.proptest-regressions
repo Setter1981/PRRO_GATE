@@ -1,0 +1,18 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 83d339f304bfc41a32baa81a52767d14ccb8af883dc497e5b3c42d78ac93a008 # shrinks to ops = [Crash(OfflineAck), OfflineReturn, Crash(Sign), OnlineSell(DpsScript([Ack, Ack])), OnlineSell(DpsScript([Ack, NotFound])), GoOnlineWithoutBacklog, OfflineSellDuringGoingOnline, OnlineSell(DpsScript([Reject]))]
+cc 0d9f3ead327b7c8824c5d48e18c6edacd24bbbc9cd6586cba6dc376dc97c3a7b # shrinks to ops = [OfflineSell, DuplicateIdemKey]
+cc b95074298589d179af0bdb045261c6dcd5808fa530624eb38a27c9b0479a0ffc # shrinks to ops = [OnlineSell(DpsScript([Ack, NotFound])), OfflineSell, DuplicateIdemKey, OfflineSell]
+cc cd07b550ffa387183a50ab5757b5e0eb7b2aa4f7870397c641c972ab9d716914 # shrinks to ops = [RepeatReboot, RepeatReboot]
+cc a32941717ae61f133168f7bd3afe125217f532ffd042c7327639e1bef16546c6 # shrinks to ops = [SellWithClosedShift, Drain(DpsScript([Ack, NotFound])), Reboot]
+cc ff117ccdcac5903599ebe54beace28b261ee3a2649f98bfa443cb2cd4183c515 # shrinks to ops = [RepeatDrain, SellWithClosedShift, RepeatReboot, RepeatReboot, GoOnlineWithoutBacklog]
+cc ca04bb23103217079445e901edb78f5f5c2dc3af918c298ed162a97fd6b13927 # shrinks to ops = [Reboot, RepeatDrain, OfflineSellDuringGoingOnline, Drain(DpsScript([Superseded]))]
+cc 2a7aa35f5e7b039b9c04932388da19270718dd81928b2e9a86b0f95dd2c68ce4 # shrinks to ops = [Crash(Kvt1), Crash(Send), OnlineSell(DpsScript([Superseded]))]
+cc 3855176e6f0632e20617380d2d9996ef7606b23577b0907ea97703ecdb681abf # shrinks to ops = [Drain(DpsScript([BadHashPrev]))]
+cc bd915c7a02cdc805522af63666cde665829687e593454a486f0c9f1e548cc866 # shrinks to ops = [RepeatDrain, DuplicateIdemKey, DuplicateIdemKey, OnlineReturn(DpsScript([Reject]))]
+cc f393b9e9a7594d1ac832db16f2438f8ae61fe30091831628e5590472f7ac6d15 # shrinks to ops = [GoOnline(DpsScript([Superseded])), OfflineReturn, GoOnline(DpsScript([Ack, NotFound])), OnlineReturn(DpsScript([Ack, NotFound])), RepeatDrain]
+cc 272f5692a36e8ad67cd1f215899bd29273276fa297293c15f6cebf5c7b6cb36f # shrinks to ops = [OfflineReturn]

@@ -52,10 +52,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct AppState {
-    config:    Arc<SidecarConfig>,
-    repo:      Arc<Repo>,
+    config: Arc<SidecarConfig>,
+    repo: Arc<Repo>,
     grpc_pool: Arc<DpsGrpcPool>,
-    fn_locks:  Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    fn_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -71,9 +71,9 @@ async fn main() {
         std::process::exit(1);
     });
 
-    let subscriber = tracing_subscriber::fmt().with_env_filter(
-        tracing_subscriber::EnvFilter::new(&config.sidecar.log_level),
-    );
+    let subscriber = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::new(
+        &config.sidecar.log_level,
+    ));
     if config.dev.log_pretty {
         subscriber.pretty().init();
     } else {
@@ -109,8 +109,8 @@ async fn main() {
     }
 
     let state = AppState {
-        config:    Arc::new(config),
-        repo:      Arc::new(repo),
+        config: Arc::new(config),
+        repo: Arc::new(repo),
         grpc_pool: Arc::new(grpc_pool),
         fn_locks,
     };
@@ -147,8 +147,8 @@ async fn main() {
     }
 
     let app = Router::new()
-        .route("/fiscal/send",  post(handle_fiscal_send))
-        .route("/health/live",  get(health_live))
+        .route("/fiscal/send", post(handle_fiscal_send))
+        .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
         .with_state(state);
 
@@ -175,14 +175,14 @@ async fn health_ready(State(st): State<AppState>) -> StatusCode {
     // TIN / FN membership is not checked — readiness is per-instance, not
     // per fiscal-number (those are validated in handle_fiscal_send).
     let row = match st.repo.load_active_license() {
-        Ok(r)  => r,
+        Ok(r) => r,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE,
     };
     let now = time::OffsetDateTime::now_utc();
     match prro_sidecar::license::verify_signature_only(&row.payload_b64, &row.signature_b64, now) {
         Ok(prro_sidecar::license::LicenseState::Valid)
         | Ok(prro_sidecar::license::LicenseState::Grace { .. })
-        | Ok(prro_sidecar::license::LicenseState::Demo  { .. }) => StatusCode::OK,
+        | Ok(prro_sidecar::license::LicenseState::Demo { .. }) => StatusCode::OK,
         _ => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
@@ -191,12 +191,12 @@ async fn health_ready(State(st): State<AppState>) -> StatusCode {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct FiscalSendResponse {
-    status:             i32,
-    fiscal_id:          String,
+    status: i32,
+    fiscal_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error_message:      Option<String>,
+    error_message: Option<String>,
     #[serde(default)]
-    chain_broken:       bool,
+    chain_broken: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     dps_error_category: Option<String>,
 }
@@ -219,12 +219,12 @@ async fn handle_fiscal_send(
             (http_status, Json(r)).into_response()
         }
         Ok(Err(e)) => e.into_response(),
-        Err(_)     => SidecarError::Internal("request timeout".into()).into_response(),
+        Err(_) => SidecarError::Internal("request timeout".into()).into_response(),
     }
 }
 
 async fn fiscal_send_inner(
-    st:  &AppState,
+    st: &AppState,
     cmd: CanonicalCommand,
 ) -> Result<FiscalSendResponse, SidecarError> {
     // ── S2: envelope integrity (schema_version allowlist + payload_sha256) ───
@@ -251,18 +251,21 @@ async fn fiscal_send_inner(
         // (step 3 below) would bail before reaching here in non-dev mode.
         let xml_bytes = build_dev_xml(st, fn_id, &cmd)?;
         return Ok(FiscalSendResponse {
-            status:             1, // synthetic OK
-            fiscal_id:          String::new(),
-            error_message:      Some(format!("dev.skip_sign: {} bytes XML, DPS skipped", xml_bytes.len())),
-            chain_broken:       false,
+            status: 1, // synthetic OK
+            fiscal_id: String::new(),
+            error_message: Some(format!(
+                "dev.skip_sign: {} bytes XML, DPS skipped",
+                xml_bytes.len()
+            )),
+            chain_broken: false,
             dps_error_category: None,
         });
     }
 
     // ── 3. Load config, license, operator (short independent DB locks) ─────────
     let fn_config = st.repo.load_fn_config(fn_id)?;
-    let lic_row   = st.repo.load_active_license()?;
-    let operator  = st.repo.load_active_operator(fn_id)?;
+    let lic_row = st.repo.load_active_license()?;
+    let operator = st.repo.load_active_operator(fn_id)?;
 
     // ── 4. Verify license (sig + expiry + TIN + FN membership) ───────────────
     let now = time::OffsetDateTime::now_utc();
@@ -280,7 +283,10 @@ async fn fiscal_send_inner(
         LicenseState::Expired => {
             return Err(SidecarError::License("license expired".into()));
         }
-        LicenseState::TinMismatch { in_license, requested } => {
+        LicenseState::TinMismatch {
+            in_license,
+            requested,
+        } => {
             return Err(SidecarError::License(format!(
                 "TIN mismatch: license={in_license:?} config={requested:?}"
             )));
@@ -312,16 +318,16 @@ async fn fiscal_send_inner(
         CredentialsMode::Plain => operator.jks_password.clone(),
         CredentialsMode::XorSoft => {
             let valid_to = cert_meta.valid_to.as_deref().unwrap_or("");
-            let op_name  = operator.operator_name.as_deref().unwrap_or("");
+            let op_name = operator.operator_name.as_deref().unwrap_or("");
             credentials::decode_password(&operator.jks_password, valid_to, op_name)
                 .map_err(SidecarError::Credentials)?
         }
     };
 
     // ── 7. Load JKS and extract private key (async IO, no DB lock held) ───────
-    let jks_bytes = tokio::fs::read(&operator.jks_path).await.map_err(|e| {
-        SidecarError::Internal(format!("read jks: {e}"))
-    })?;
+    let jks_bytes = tokio::fs::read(&operator.jks_path)
+        .await
+        .map_err(|e| SidecarError::Internal(format!("read jks: {e}")))?;
     let extracted = extract_private_key(&jks_bytes, &raw_pw)
         .map_err(|e| SidecarError::Credentials(e.to_string()))?;
 
@@ -337,7 +343,9 @@ async fn fiscal_send_inner(
     // Hold through steps 9–13 to prevent concurrent requests for the same FN
     // from reading the same previous_hash or submitting out-of-order documents.
     let fn_lock = {
-        let entry = st.fn_locks.entry(fn_id.to_string())
+        let entry = st
+            .fn_locks
+            .entry(fn_id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
         Arc::clone(entry.value())
     };
@@ -360,7 +368,11 @@ async fn fiscal_send_inner(
     let op_type_str = format!("{:?}", cmd.operation_type);
     let pending_key: Option<String> = if !cmd.idempotency_key.is_empty() {
         match st.repo.insert_pending_request(
-            &cmd.idempotency_key, fn_id, &op_type_str, &cmd.payload_sha256, &cmd.business_ts,
+            &cmd.idempotency_key,
+            fn_id,
+            &op_type_str,
+            &cmd.payload_sha256,
+            &cmd.business_ts,
         )? {
             PendingInsertResult::DuplicateAccepted(json) => {
                 let cached: FiscalSendResponse = serde_json::from_str(&json)
@@ -368,9 +380,7 @@ async fn fiscal_send_inner(
                 return Ok(cached);
             }
             PendingInsertResult::DuplicatePending => {
-                return Err(SidecarError::DuplicateInFlight(
-                    cmd.idempotency_key.clone(),
-                ));
+                return Err(SidecarError::DuplicateInFlight(cmd.idempotency_key.clone()));
             }
             // F1: key timed out without confirmed DPS outcome — block new allocation.
             PendingInsertResult::DuplicateAmbiguous => {
@@ -395,18 +405,23 @@ async fn fiscal_send_inner(
     // If either step fails, the counter has already advanced: the gap in the sequence
     // is visible in the audit log. This is an inherent trade-off of SQLite + gRPC
     // without 2PC. DPS does not require a gapless sequence; it only validates monotonicity.
-    let local_num     = st.repo.next_local_number(fn_id)?;
+    let local_num = st.repo.next_local_number(fn_id)?;
     let previous_hash = st.repo.load_previous_hash(fn_id)?;
 
     // ── 10. Build cp1251 XML ──────────────────────────────────────────────────
-    let device_name    = st.config.sidecar.device_name.as_deref().unwrap_or("ПРО_каса");
+    let device_name = st
+        .config
+        .sidecar
+        .device_name
+        .as_deref()
+        .unwrap_or("ПРО_каса");
     let device_version = st.config.sidecar.device_version.as_deref().unwrap_or("1.1");
     let build_ctx = BuildContext {
-        local_number:   local_num as i64,
-        z_number:       0,
-        previous_hash:  &previous_hash,
-        tax_number:     &fn_config.tax_number,
-        tax_groups:     None,
+        local_number: local_num as i64,
+        z_number: 0,
+        previous_hash: &previous_hash,
+        tax_number: &fn_config.tax_number,
+        tax_groups: None,
         device_name,
         device_version,
     };
@@ -417,13 +432,14 @@ async fn fiscal_send_inner(
     // ── 11. CMS sign ──────────────────────────────────────────────────────────
     // Invariant (1): TSP URL resolved in a short separate DB lock BEFORE the
     // HTTP call to the TSP server — never holds the lock during network I/O.
-    let d       = FieldEl::from_le_bytes(&extracted.param_d[..], 9);
+    let d = FieldEl::from_le_bytes(&extracted.param_d[..], 9);
     let profile = CmsProfile::default();
-    let signing_ts = Some(
-        std::time::UNIX_EPOCH
-            + std::time::Duration::from_secs(now.unix_timestamp() as u64),
-    );
-    let opts = CmsBuildOptions { attached: false, signing_time: signing_ts };
+    let signing_ts =
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(now.unix_timestamp() as u64));
+    let opts = CmsBuildOptions {
+        attached: false,
+        signing_time: signing_ts,
+    };
 
     let t_sign_start = std::time::Instant::now();
     // Wrap sign stage so timing metrics are emitted on BOTH success
@@ -435,19 +451,23 @@ async fn fiscal_send_inner(
             .map_err(|e| SidecarError::CmsSign(e.to_string()))?;
         let tsp_url = st.repo.load_tsp_url_by_issuer_dn(&issuer_dn)?;
         let timeout = Duration::from_millis(
-            st.config.tsp.as_ref().map(|t| t.timeout_ms).unwrap_or(5_000),
+            st.config
+                .tsp
+                .as_ref()
+                .map(|t| t.timeout_ms)
+                .unwrap_or(5_000),
         );
         // sign_with_tsp drives a blocking ureq HTTP call to the TSA.
         // Wrap in spawn_blocking so tokio workers are not stalled during
         // the TSA round-trip (typically 200–2000 ms, worst case 5 s).
         // All captured variables are moved into the 'static closure.
-        let cert_der_owned  = cert_der.clone();
+        let cert_der_owned = cert_der.clone();
         let xml_bytes_owned = xml_bytes.clone();
         tokio::task::spawn_blocking(move || {
             let dstu_signer = DstuInProcessSigner::new(d);
-            let cms_signer  = CmsSigner {
+            let cms_signer = CmsSigner {
                 cert_der: &cert_der_owned,
-                signer:   &dstu_signer as &dyn RawSigner,
+                signer: &dstu_signer as &dyn RawSigner,
                 profile,
             };
             cms_signer
@@ -459,9 +479,9 @@ async fn fiscal_send_inner(
         .map_err(|e| SidecarError::Internal(format!("TSP thread join: {e}")))?
     } else {
         let dstu_signer = DstuInProcessSigner::new(d);
-        let cms_signer  = CmsSigner {
+        let cms_signer = CmsSigner {
             cert_der: &cert_der,
-            signer:   &dstu_signer as &dyn RawSigner,
+            signer: &dstu_signer as &dyn RawSigner,
             profile,
         };
         cms_signer
@@ -486,8 +506,8 @@ async fn fiscal_send_inner(
     // ── 12. Send to DPS via gRPC ──────────────────────────────────────────────
     let check_type = match cmd.operation_type {
         OperationType::Sell | OperationType::Return => CheckType::Chk as i32,
-        OperationType::ZReport                      => CheckType::Zreport as i32,
-        _                                           => CheckType::Servicechk as i32,
+        OperationType::ZReport => CheckType::Zreport as i32,
+        _ => CheckType::Servicechk as i32,
     };
     let t_sign_done = std::time::Instant::now();
 
@@ -514,9 +534,9 @@ async fn fiscal_send_inner(
     // (review finding: silent fallback is anti-observability).
     let business_ts_drift_ms: Option<i64> =
         match prro_sidecar::time_utils::parse_business_ts(&cmd.business_ts) {
-            Ok(odt) => Some(
-                ((now.unix_timestamp_nanos() - odt.unix_timestamp_nanos()) / 1_000_000) as i64,
-            ),
+            Ok(odt) => {
+                Some(((now.unix_timestamp_nanos() - odt.unix_timestamp_nanos()) / 1_000_000) as i64)
+            }
             Err(e) => {
                 tracing::warn!(
                     fn_id,
@@ -536,13 +556,13 @@ async fn fiscal_send_inner(
     );
     let t_send_start = std::time::Instant::now();
     let check = Check {
-        rro_fn:       fn_id.clone(),
-        date_time:    kyiv_epoch,
-        check_sign:   cms_der,
+        rro_fn: fn_id.clone(),
+        date_time: kyiv_epoch,
+        check_sign: cms_der,
         local_number: local_num,
         check_type,
-        id_offline:   String::new(),
-        id_cancel:    String::new(),
+        id_offline: String::new(),
+        id_cancel: String::new(),
     };
     let send_result = st
         .grpc_pool
@@ -616,9 +636,9 @@ async fn fiscal_send_inner(
     });
     let is_permanent_reject = dps_error_category.as_deref() == Some("permanent");
     let response = FiscalSendResponse {
-        status:             resp.status,
-        fiscal_id:          resp.id.clone(),
-        error_message:      error_msg,
+        status: resp.status,
+        fiscal_id: resp.id.clone(),
+        error_message: error_msg,
         chain_broken,
         dps_error_category,
     };
@@ -643,7 +663,9 @@ async fn fiscal_send_inner(
             match st.repo.reject_request(key) {
                 Ok(false) => tracing::warn!(%key,
                     "journal reject: row not in pending state — already ambiguous or accepted"),
-                Err(e) => tracing::error!(%key, %e, "journal reject failed after permanent DPS error"),
+                Err(e) => {
+                    tracing::error!(%key, %e, "journal reject failed after permanent DPS error")
+                }
                 Ok(true) => {}
             }
         }
@@ -659,18 +681,18 @@ mod fn_lock_tests {
 
     #[tokio::test]
     async fn fn_lock_serializes_per_fn() {
-        let locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>> =
-            Arc::new(DashMap::new());
+        let locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>> = Arc::new(DashMap::new());
         let counter = Arc::new(AtomicUsize::new(0));
         let mut handles = vec![];
         for _ in 0..10 {
-            let locks_c   = Arc::clone(&locks);
+            let locks_c = Arc::clone(&locks);
             let counter_c = Arc::clone(&counter);
             let h = tokio::spawn(async move {
                 // Clone the Arc outside the DashMap entry scope so the shard
                 // lock is released before lock.lock().await (no deadlock).
                 let lock = {
-                    let entry = locks_c.entry("FN001".to_string())
+                    let entry = locks_c
+                        .entry("FN001".to_string())
                         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
                     Arc::clone(entry.value())
                 };
@@ -681,16 +703,18 @@ mod fn_lock_tests {
             });
             handles.push(h);
         }
-        for h in handles { h.await.unwrap(); }
+        for h in handles {
+            h.await.unwrap();
+        }
         assert_eq!(counter.load(Ordering::SeqCst), 10);
     }
 
     #[tokio::test]
     async fn fn_lock_cleanup_removes_idle_entries() {
-        let locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>> =
-            Arc::new(DashMap::new());
+        let locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>> = Arc::new(DashMap::new());
         {
-            let entry = locks.entry("FN002".to_string())
+            let entry = locks
+                .entry("FN002".to_string())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
             let _lock = Arc::clone(entry.value());
             // strong_count = 2 here (DashMap + _lock)
@@ -709,8 +733,8 @@ mod fn_lock_tests {
 // code still contains the wiring so the two halves stay in sync.
 #[cfg(test)]
 mod degraded_chain_tests {
-    use prro_sidecar::repo::Repo;
     use prro_sidecar::errors::SidecarError;
+    use prro_sidecar::repo::Repo;
 
     /// Helper: open a fresh in-memory repo (same DDL used by repo.rs tests).
     fn make_repo() -> Repo {
@@ -730,9 +754,15 @@ mod degraded_chain_tests {
         // Seed local_sequences so next_local_number works and fn_degraded FK passes.
         repo.next_local_number("FN_TEST").unwrap();
 
-        assert!(!repo.is_degraded("FN_TEST").unwrap(), "should not be degraded initially");
+        assert!(
+            !repo.is_degraded("FN_TEST").unwrap(),
+            "should not be degraded initially"
+        );
         repo.set_degraded("FN_TEST", "deadbeef01").unwrap();
-        assert!(repo.is_degraded("FN_TEST").unwrap(), "should be degraded after set_degraded");
+        assert!(
+            repo.is_degraded("FN_TEST").unwrap(),
+            "should be degraded after set_degraded"
+        );
 
         // Replicate the handler gate: if is_degraded → FnDegraded error → 503
         let result: Result<(), SidecarError> = if repo.is_degraded("FN_TEST").unwrap() {
@@ -856,17 +886,15 @@ credentials_mode = "plain"
 
         // DpsGrpcPool::new uses connect_lazy — no actual TCP handshake on construction.
         // reconcile_degraded_once never calls grpc_pool, so unreachable endpoints are fine.
-        let grpc_pool = prro_sidecar::grpc_client::DpsGrpcPool::new(
-            &config.dps.prod,
-            &config.dps.test,
-        )
-        .expect("grpc pool (lazy connect, no actual connection)");
+        let grpc_pool =
+            prro_sidecar::grpc_client::DpsGrpcPool::new(&config.dps.prod, &config.dps.test)
+                .expect("grpc pool (lazy connect, no actual connection)");
 
         AppState {
-            config:    Arc::new(config),
-            repo:      Arc::new(repo),
+            config: Arc::new(config),
+            repo: Arc::new(repo),
             grpc_pool: Arc::new(grpc_pool),
-            fn_locks:  Arc::new(DashMap::new()),
+            fn_locks: Arc::new(DashMap::new()),
         }
     }
 
@@ -881,7 +909,10 @@ credentials_mode = "plain"
 
         let pending_mac = "aabbccddeeff0011";
         repo.set_degraded("FN_RECTEST", pending_mac).unwrap();
-        assert!(repo.is_degraded("FN_RECTEST").unwrap(), "precondition: FN must be degraded");
+        assert!(
+            repo.is_degraded("FN_RECTEST").unwrap(),
+            "precondition: FN must be degraded"
+        );
 
         let state = make_state_with_repo(repo);
         reconcile_degraded_once(&state).await;
@@ -923,7 +954,9 @@ async fn reconcile_degraded_once(state: &AppState) {
         // Acquire per-FN lock: clone Arc outside DashMap entry scope so the
         // DashMap shard lock is dropped before the async .lock().await call.
         let fn_lock = {
-            let entry = state.fn_locks.entry(fn_id.clone())
+            let entry = state
+                .fn_locks
+                .entry(fn_id.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
             Arc::clone(entry.value())
         };
@@ -942,17 +975,26 @@ async fn reconcile_degraded_once(state: &AppState) {
 
 /// Build XML for dev.skip_sign mode (no signing, no DPS).
 /// local_number=0 is a sentinel — never sent to DPS, does not consume the sequence.
-fn build_dev_xml(st: &AppState, fn_id: &str, cmd: &CanonicalCommand) -> Result<Vec<u8>, SidecarError> {
-    let fn_config     = st.repo.load_fn_config(fn_id)?;
+fn build_dev_xml(
+    st: &AppState,
+    fn_id: &str,
+    cmd: &CanonicalCommand,
+) -> Result<Vec<u8>, SidecarError> {
+    let fn_config = st.repo.load_fn_config(fn_id)?;
     let previous_hash = st.repo.load_previous_hash(fn_id)?;
-    let device_name    = st.config.sidecar.device_name.as_deref().unwrap_or("ПРО_каса");
+    let device_name = st
+        .config
+        .sidecar
+        .device_name
+        .as_deref()
+        .unwrap_or("ПРО_каса");
     let device_version = st.config.sidecar.device_version.as_deref().unwrap_or("1.1");
     let ctx = BuildContext {
-        local_number:   0,
-        z_number:       0,
-        previous_hash:  &previous_hash,
-        tax_number:     &fn_config.tax_number,
-        tax_groups:     None,
+        local_number: 0,
+        z_number: 0,
+        previous_hash: &previous_hash,
+        tax_number: &fn_config.tax_number,
+        tax_groups: None,
         device_name,
         device_version,
     };

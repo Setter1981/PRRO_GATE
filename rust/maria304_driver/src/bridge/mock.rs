@@ -39,7 +39,10 @@ impl MockBridge {
     /// # Panics
     /// If a concurrent submit poisoned the mutex.
     pub fn set_next_response(&self, resp: CanonicalResponse) {
-        *self.forced_response.lock().expect("MockBridge mutex poisoned") = Some(resp);
+        *self
+            .forced_response
+            .lock()
+            .expect("MockBridge mutex poisoned") = Some(resp);
     }
 
     /// Force the next submit to fail with the given error.  Consumed
@@ -103,7 +106,12 @@ impl Bridge for MockBridge {
             .lock()
             .expect("MockBridge mutex poisoned")
             .push(command.clone());
-        if let Some(resp) = self.forced_response.lock().expect("MockBridge mutex poisoned").take() {
+        if let Some(resp) = self
+            .forced_response
+            .lock()
+            .expect("MockBridge mutex poisoned")
+            .take()
+        {
             return Ok(resp);
         }
 

@@ -64,7 +64,11 @@ impl CompBuilder {
     /// the rest.  This is the common case for freshly-ACKed documents.
     #[must_use]
     pub fn new(check_number: u64, sale_total_kopecks: u64, return_total_kopecks: u64) -> Self {
-        Self { check_number, sale_total_kopecks, return_total_kopecks }
+        Self {
+            check_number,
+            sale_total_kopecks,
+            return_total_kopecks,
+        }
     }
 
     /// Produce the 90-char body (without the `COMP` opcode prefix).
@@ -80,7 +84,11 @@ impl CompBuilder {
             self.sale_total_kopecks,   // seg 1 = primary sale group
             0,                         // seg 2 = secondary sale group (zero)
             self.return_total_kopecks, // seg 3 = primary return group
-            0, 0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
+            0,
         ];
         let mut out = String::with_capacity(COMP_BODY_LEN);
         for s in segments {
@@ -178,7 +186,10 @@ mod tests {
         // does not silently regress.
         let over = 10_000_000_000u64; // 11 digits
         let b = CompBuilder::new(over, 0, 0).to_body();
-        assert!(b.len() > COMP_BODY_LEN, "oversized input should surface as longer body");
+        assert!(
+            b.len() > COMP_BODY_LEN,
+            "oversized input should surface as longer body"
+        );
     }
 
     #[test]

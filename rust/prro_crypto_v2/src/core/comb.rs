@@ -159,21 +159,25 @@ pub(crate) struct FeProj {
 /// Cost: 4M + 5S.
 #[inline]
 pub(crate) fn fe_double(p: &FeProj, b: &Fe) -> FeProj {
-    let a = p.z.mod_sqr();               // Z₁²
-    let a_sq = a.mod_sqr();              // Z₁⁴
-    let b_const = b.mod_mul(&a_sq);      // b·Z₁⁴
-    let c = p.x.mod_sqr();               // X₁²
-    let z3 = a.mod_mul(&c);              // Z₃ = Z₁²·X₁²
-    let c_sq = c.mod_sqr();              // X₁⁴
-    let x3 = c_sq.add(&b_const);         // X₃ = X₁⁴ + b·Z₁⁴
+    let a = p.z.mod_sqr(); // Z₁²
+    let a_sq = a.mod_sqr(); // Z₁⁴
+    let b_const = b.mod_mul(&a_sq); // b·Z₁⁴
+    let c = p.x.mod_sqr(); // X₁²
+    let z3 = a.mod_mul(&c); // Z₃ = Z₁²·X₁²
+    let c_sq = c.mod_sqr(); // X₁⁴
+    let x3 = c_sq.add(&b_const); // X₃ = X₁⁴ + b·Z₁⁴
 
-    let y_sq = p.y.mod_sqr();            // Y₁²
-    let y_sq_b = y_sq.add(&b_const);     // Y₁² + b·Z₁⁴
-    let term1 = y_sq_b.mod_mul(&x3);     // (Y₁² + b·Z₁⁴)·X₃
-    let term2 = z3.mod_mul(&b_const);    // Z₃·b·Z₁⁴
-    let y3 = term1.add(&term2);          // Y₃
+    let y_sq = p.y.mod_sqr(); // Y₁²
+    let y_sq_b = y_sq.add(&b_const); // Y₁² + b·Z₁⁴
+    let term1 = y_sq_b.mod_mul(&x3); // (Y₁² + b·Z₁⁴)·X₃
+    let term2 = z3.mod_mul(&b_const); // Z₃·b·Z₁⁴
+    let y3 = term1.add(&term2); // Y₃
 
-    FeProj { x: x3, y: y3, z: z3 }
+    FeProj {
+        x: x3,
+        y: y3,
+        z: z3,
+    }
 }
 
 /// LD mixed addition: projective (X₁,Y₁,Z₁) + affine (x₂,y₂).
@@ -182,31 +186,35 @@ pub(crate) fn fe_double(p: &FeProj, b: &Fe) -> FeProj {
 /// Cost: 8M + 5S.
 #[inline]
 pub(crate) fn fe_madd(p: &FeProj, q: &FeAffine) -> FeProj {
-    let z1_sq = p.z.mod_sqr();                   // Z₁²
-    let x2_z1 = q.x.mod_mul(&p.z);               // x₂·Z₁
-    let b = p.x.add(&x2_z1);                     // B = X₁ + x₂·Z₁
-    let y2_z1sq = q.y.mod_mul(&z1_sq);            // y₂·Z₁²
-    let a = p.y.add(&y2_z1sq);                    // A = Y₁ + y₂·Z₁²
-    let c = b.mod_mul(&p.z);                      // C = B·Z₁
-    let z3 = c.mod_sqr();                         // Z₃ = C²
-    let d = q.x.mod_mul(&z3);                     // D = x₂·Z₃
+    let z1_sq = p.z.mod_sqr(); // Z₁²
+    let x2_z1 = q.x.mod_mul(&p.z); // x₂·Z₁
+    let b = p.x.add(&x2_z1); // B = X₁ + x₂·Z₁
+    let y2_z1sq = q.y.mod_mul(&z1_sq); // y₂·Z₁²
+    let a = p.y.add(&y2_z1sq); // A = Y₁ + y₂·Z₁²
+    let c = b.mod_mul(&p.z); // C = B·Z₁
+    let z3 = c.mod_sqr(); // Z₃ = C²
+    let d = q.x.mod_mul(&z3); // D = x₂·Z₃
 
-    let a_sq = a.mod_sqr();                       // A²
-    let b_sq = b.mod_sqr();                       // B²
-    let inner = a.add(&b_sq);                     // A + B² (a₂=0)
-    let c_inner = c.mod_mul(&inner);              // C·(A + B²)
-    let x3 = a_sq.add(&c_inner);                  // X₃ = A² + C·(A + B²)
+    let a_sq = a.mod_sqr(); // A²
+    let b_sq = b.mod_sqr(); // B²
+    let inner = a.add(&b_sq); // A + B² (a₂=0)
+    let c_inner = c.mod_mul(&inner); // C·(A + B²)
+    let x3 = a_sq.add(&c_inner); // X₃ = A² + C·(A + B²)
 
-    let d_x3 = d.add(&x3);                        // D + X₃
-    let a_c = a.mod_mul(&c);                       // A·C
-    let a_c_z3 = a_c.add(&z3);                    // A·C + Z₃
-    let term1 = d_x3.mod_mul(&a_c_z3);            // (D + X₃)·(A·C + Z₃)
-    let y2_x2 = q.y.add(&q.x);                    // y₂ + x₂
-    let z3_sq = z3.mod_sqr();                      // Z₃²
-    let term2 = y2_x2.mod_mul(&z3_sq);            // (y₂ + x₂)·Z₃²
-    let y3 = term1.add(&term2);                    // Y₃
+    let d_x3 = d.add(&x3); // D + X₃
+    let a_c = a.mod_mul(&c); // A·C
+    let a_c_z3 = a_c.add(&z3); // A·C + Z₃
+    let term1 = d_x3.mod_mul(&a_c_z3); // (D + X₃)·(A·C + Z₃)
+    let y2_x2 = q.y.add(&q.x); // y₂ + x₂
+    let z3_sq = z3.mod_sqr(); // Z₃²
+    let term2 = y2_x2.mod_mul(&z3_sq); // (y₂ + x₂)·Z₃²
+    let y3 = term1.add(&term2); // Y₃
 
-    FeProj { x: x3, y: y3, z: z3 }
+    FeProj {
+        x: x3,
+        y: y3,
+        z: z3,
+    }
 }
 
 // ── CT primitives ──────────────────────────────────────────────────────
@@ -350,7 +358,6 @@ pub fn warm_up(curve: &Curve) {
     let _ = COMB_TABLE.get_or_init(|| build_table(curve));
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,13 +392,12 @@ mod tests {
                     assert!(
                         lx.equals(cx),
                         "comb vs ladder mismatch at k={}: ladder={:?}, comb={:?}",
-                        k_val, lx.bytes, cx.bytes,
+                        k_val,
+                        lx.bytes,
+                        cx.bytes,
                     );
                 }
-                _ => panic!(
-                    "comb vs ladder None/Some mismatch at k={}",
-                    k_val,
-                ),
+                _ => panic!("comb vs ladder None/Some mismatch at k={}", k_val,),
             }
         }
     }
@@ -417,11 +423,7 @@ mod tests {
             match (via_ladder, via_comb) {
                 (None, None) => {}
                 (Some(ref lx), Some(ref cx)) => {
-                    assert!(
-                        lx.equals(cx),
-                        "trial {}: comb vs ladder mismatch",
-                        trial,
-                    );
+                    assert!(lx.equals(cx), "trial {}: comb vs ladder mismatch", trial,);
                 }
                 _ => panic!("trial {}: None/Some mismatch", trial),
             }

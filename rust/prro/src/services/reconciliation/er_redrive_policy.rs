@@ -99,11 +99,15 @@ pub async fn evaluate_er_redrive(
                 Ok(ErRedriveDecision::Redrive)
             }
         }
+        // Legacy-only B10 tag: it was written by a withdrawn `-8` retry
+        // experiment.  Preserve decoding so historical rows cannot become an
+        // indeterminate hold, but never re-send their persisted bytes.
         Some(
             rc @ (RetryClass::FnConfigError
             | RetryClass::WrapperBug
             | RetryClass::OperatorEscalation
-            | RetryClass::MacRecovery),
+            | RetryClass::MacRecovery
+            | RetryClass::DrainChainSettleRetry),
         ) => Ok(ErRedriveDecision::EscalateManual { class: rc }),
         Some(RetryClass::TerminalReject) => Ok(ErRedriveDecision::EscalateInconsistent {
             class: RetryClass::TerminalReject,

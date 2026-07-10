@@ -50,6 +50,11 @@ use crate::common::scripted_dps::ScriptedDps;
 use crate::common::{det_signing_ctx, drain_test_guard};
 use crate::op::{DpsScript, Op, Stage, WireResponse};
 
+/// A `(previous_hash, unsigned_xml_sha256)` chain-hash pair as read from a
+/// `fiscal_documents` row — both columns nullable.  Named to satisfy
+/// `clippy::type_complexity` at the B10 boundary-chain teeth query sites.
+type ChainHashPair = (Option<Vec<u8>>, Option<Vec<u8>>);
+
 // ─── Fixture constants (mirror tests/kill_point_matrix.rs) ──────────────────
 
 const FN: &str = "4000000001";
@@ -506,6 +511,20 @@ impl FuzzCtx {
             .unwrap()
     }
 
+    /// B10 — count of rows of a given `doc_type` on the FN.  Replaces
+    /// `only_doc_type` for offline assertions where the lazy BEGIN adds a second
+    /// row (so a single-row `fetch_one` would panic).
+    pub async fn count_doc_type(&self, doc_type: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = ?",
+        )
+        .bind(self.fn_id.as_str())
+        .bind(doc_type)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
     async fn observe_doc_by_request_id(&self, request_id: &[u8; 16]) -> ObservedDoc {
         let (lnd, state, previous_hash): (i64, String, Option<Vec<u8>>) = sqlx::query_as(
             "SELECT lnd, state, previous_hash FROM fiscal_documents \
@@ -549,6 +568,65 @@ impl FuzzCtx {
         .await
         .unwrap();
         v
+    }
+
+    /// B10 TEETH — verify the lazy-BEGIN two-doc chain is genuinely LINKED after a
+    /// `b10_lazy_begin_interposed` op:
+    ///   (a) BEGIN.previous_hash == the pre-op MAC tip (`prior_tip`);
+    ///   (b) business.previous_hash == BEGIN.unsigned_xml_sha256 (the SELL/RETURN
+    ///       chains OFF the BEGIN, not the pre-op tip);
+    ///   (c) the FN seed == business.unsigned_xml_sha256.
+    /// The BEGIN is the lowest-lnd `OFFLINE_SESSION_BEGIN`; the business doc is the
+    /// highest-lnd offline SELL/RETURN.  A reverted BEGIN-chain (business chaining
+    /// off the pre-op tip, or the BEGIN not advancing the seed) breaks (b)/(c) →
+    /// `Err` — the revert-BEGIN-chain canary depends on this.
+    pub async fn assert_b10_boundary_chain_linked(
+        &self,
+        prior_tip: Option<&[u8]>,
+    ) -> Result<(), String> {
+        let begin: Option<ChainHashPair> = sqlx::query_as(
+            "SELECT previous_hash, unsigned_xml_sha256 FROM fiscal_documents \
+             WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN' \
+             ORDER BY lnd ASC LIMIT 1",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap();
+        let (begin_prev, begin_unsigned) =
+            begin.ok_or_else(|| "B10 teeth: no OFFLINE_SESSION_BEGIN row".to_string())?;
+        let biz: Option<ChainHashPair> = sqlx::query_as(
+            // Tier-1 widened the offline business-doc set: the lazy BEGIN can
+            // interpose before a SHIFT_OPEN / Z_REPORT too, with identical
+            // chain semantics (business chains OFF the BEGIN).
+            "SELECT previous_hash, unsigned_xml_sha256 FROM fiscal_documents \
+             WHERE fiscal_number = ? \
+             AND doc_type IN ('SELL','RETURN','SHIFT_OPEN','Z_REPORT') \
+             AND fs_mode = 'OFFLINE' \
+             ORDER BY lnd DESC LIMIT 1",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap();
+        let (biz_prev, biz_unsigned) =
+            biz.ok_or_else(|| "B10 teeth: no offline business doc".to_string())?;
+
+        if begin_prev.as_deref() != prior_tip {
+            return Err(format!(
+                "B10 teeth (a): BEGIN.previous_hash {begin_prev:?} != pre-op tip {prior_tip:?}"
+            ));
+        }
+        if biz_prev != begin_unsigned {
+            return Err(format!(
+                "B10 teeth (b): business.previous_hash {biz_prev:?} != BEGIN.unsigned \
+                 {begin_unsigned:?} (business must chain OFF the BEGIN)"
+            ));
+        }
+        if self.read_seed().await != biz_unsigned {
+            return Err("B10 teeth (c): FN seed != business.unsigned_xml_sha256".to_string());
+        }
+        Ok(())
     }
 
     /// The full ledger (lnd → state) for the FN — for the Task 4 differential's
@@ -741,7 +819,15 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
 
 /// `OnlineSell` → `inline::run` on an Online node, ScriptedDps loaded from the
 /// op's `DpsScript`.
+///
+/// B10: `inline::run` dispatches by NODE MODE, not op name — so an `OnlineSell`
+/// op on an OFFLINE-seeded ctx (the `harness_offline_seeded` proptest lane) takes
+/// the offline lane and lazily interposes a BEGIN.  Detect that (BEGIN 0→1) and
+/// report `Recovered` so the differential routes to the two-doc ledger-delta,
+/// exactly like `offline_sell` — otherwise the per-doc chain-continuity check
+/// spuriously REDs (the business doc chains off the BEGIN, not the pre-op tip).
 async fn online_sell(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
+    let begin_before = begin_doc_count(ctx).await;
     let row = ctx.seed_inbox_sell().await;
     let dps = ctx.new_dps();
     load_script(&dps, script);
@@ -759,9 +845,13 @@ async fn online_sell(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
     drop(guard);
     match result {
         Ok(_outcome) => {
-            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
-            ctx.last_row = Some(row); // remember for DuplicateIdemKey replay
-            RealOutcome::Doc(observed)
+            ctx.last_row = Some(row.clone()); // remember for DuplicateIdemKey replay
+            if begin_doc_count(ctx).await > begin_before {
+                return RealOutcome::Recovered {
+                    branch: "b10_lazy_begin_interposed".into(),
+                };
+            }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
         }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }
@@ -811,6 +901,14 @@ async fn run_inline_row(
 /// call), the future COMPLETES instead of hanging — that is a refusal / no-op,
 /// not a crash, and is reported as such (no panic).
 async fn crash_via_drop(ctx: &mut FuzzCtx, stage: Stage) -> RealOutcome {
+    // B10: on an OFFLINE node the offline-ack path makes no wire call, so this
+    // "crash" COMPLETES as a real offline sell — which lazily interposes a BEGIN
+    // when it is the session's first offline doc.  Detect that (BEGIN 0→1 across
+    // the completed run) → report `Recovered` so the O2 differential uses the
+    // two-doc ledger-delta (the model's `predict_crash_completed_sell` →
+    // `apply_sell` predicts both docs; the per-doc chain check would spuriously
+    // RED on the SELL chaining off the BEGIN).
+    let begin_before = begin_doc_count(ctx).await;
     let row = ctx.seed_inbox_sell().await;
     let dps = ctx.new_dps();
     let (reached_tx, reached_rx) = oneshot::channel::<()>();
@@ -848,7 +946,15 @@ async fn crash_via_drop(ctx: &mut FuzzCtx, stage: Stage) -> RealOutcome {
             stage,
             committed_state: ctx.observe_doc_state_by_request_id(&row.request_id).await,
         },
-        Some(Ok(_)) => RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await),
+        Some(Ok(_)) => {
+            if begin_doc_count(ctx).await > begin_before {
+                // Offline crash-completed sell interposed a BEGIN → two-doc delta.
+                return RealOutcome::Recovered {
+                    branch: "b10_lazy_begin_interposed".into(),
+                };
+            }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
+        }
         Some(Err(e)) => RealOutcome::Refused(format!("{e:?}")),
     }
 }
@@ -1025,7 +1131,10 @@ async fn reboot(ctx: &mut FuzzCtx) -> RealOutcome {
     .fetch_one(&ctx.pool)
     .await
     .unwrap();
-    for _ in 0..pending {
+    // B10: `+ 1` for the drain-time DocType=10 END (minted during the reboot's
+    // drain, not counted in `pending`) — ample-provision so its wire submit lands
+    // ACK.  Surplus responses are ignored.
+    for _ in 0..pending + 1 {
         dps.push_send(wire_to_result(WireResponse::Ack));
         dps.push_last(wire_to_result(WireResponse::Ack));
         dps.push_last(wire_to_result(WireResponse::Ack));
@@ -1040,9 +1149,34 @@ async fn reboot(ctx: &mut FuzzCtx) -> RealOutcome {
     }
 }
 
+/// B10 — count of committed `OFFLINE_SESSION_BEGIN` rows on the FN.  A 0→1 jump
+/// across an offline op means THAT op lazily interposed the BEGIN → the op's
+/// observable is a TWO-doc ledger delta (BEGIN + business) which the oracle diffs
+/// via `check_ledger_delta` (the per-doc `check_doc_against_mutation` chains the
+/// business doc against the PRE-op tip, but the BEGIN advanced the tip mid-op, so
+/// per-doc chain-continuity would spuriously RED).
+async fn begin_doc_count(ctx: &FuzzCtx) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents \
+         WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN'",
+    )
+    .bind(ctx.fn_id.as_str())
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap()
+}
+
 /// `OfflineSell` → `inline::run` on an Offline node — the offline-ack path lands
 /// `OFFLINE_LOCAL_ACK` and makes NO wire call (spec §5).
+///
+/// B10: on the FIRST offline doc of a session the impl lazily interposes an
+/// `OFFLINE_SESSION_BEGIN` doc BEFORE the business doc.  When that happens (BEGIN
+/// count 0→1) return `Recovered { branch: "b10_lazy_begin_interposed" }` → the
+/// differential routes to the two-doc `check_ledger_delta` + boundary-chain teeth
+/// (not the single-doc `check_doc_against_mutation`, whose chain-continuity check
+/// cannot see the mid-op tip advance).
 async fn offline_sell(ctx: &mut FuzzCtx) -> RealOutcome {
+    let begin_before = begin_doc_count(ctx).await;
     let row = ctx.seed_inbox_sell().await;
     let dps = ctx.new_dps(); // offline branch never touches the wire
     let guard = ctx.gate.clone().lock_owned().await;
@@ -1059,9 +1193,13 @@ async fn offline_sell(ctx: &mut FuzzCtx) -> RealOutcome {
     drop(guard);
     match result {
         Ok(_) => {
-            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
-            ctx.last_row = Some(row); // remember for DuplicateIdemKey replay
-            RealOutcome::Doc(observed)
+            ctx.last_row = Some(row.clone()); // remember for DuplicateIdemKey replay
+            if begin_doc_count(ctx).await > begin_before {
+                return RealOutcome::Recovered {
+                    branch: "b10_lazy_begin_interposed".into(),
+                };
+            }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
         }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }
@@ -1073,6 +1211,10 @@ async fn offline_sell(ctx: &mut FuzzCtx) -> RealOutcome {
 /// stage_send maps both to `DpsCheckType::Chk`); only the seeded
 /// `operation_type` differs, which `build_canonical` maps to `DocType::Return`.
 async fn online_return(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
+    // B10: mode-based dispatch — an `OnlineReturn` on an OFFLINE ctx takes the
+    // offline lane + interposes a BEGIN; report `Recovered` so the differential
+    // uses the two-doc ledger-delta (see `online_sell`).
+    let begin_before = begin_doc_count(ctx).await;
     let row = ctx.seed_inbox_return().await;
     let dps = ctx.new_dps();
     load_script(&dps, script);
@@ -1090,9 +1232,13 @@ async fn online_return(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
     drop(guard);
     match result {
         Ok(_outcome) => {
-            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
-            ctx.last_row = Some(row); // remember for DuplicateIdemKey replay
-            RealOutcome::Doc(observed)
+            ctx.last_row = Some(row.clone()); // remember for DuplicateIdemKey replay
+            if begin_doc_count(ctx).await > begin_before {
+                return RealOutcome::Recovered {
+                    branch: "b10_lazy_begin_interposed".into(),
+                };
+            }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
         }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }
@@ -1103,6 +1249,9 @@ async fn online_return(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
 /// CAS `acquire_code_tx` is doc-type-agnostic); only the seeded `operation_type`
 /// differs.
 async fn offline_return(ctx: &mut FuzzCtx) -> RealOutcome {
+    // B10: same lazy-BEGIN interposition as `offline_sell` — an offline RETURN
+    // that is the session's first offline doc mints the BEGIN first.
+    let begin_before = begin_doc_count(ctx).await;
     let row = ctx.seed_inbox_return().await;
     let dps = ctx.new_dps(); // offline branch never touches the wire
     let guard = ctx.gate.clone().lock_owned().await;
@@ -1119,9 +1268,13 @@ async fn offline_return(ctx: &mut FuzzCtx) -> RealOutcome {
     drop(guard);
     match result {
         Ok(_) => {
-            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
-            ctx.last_row = Some(row); // remember for DuplicateIdemKey replay
-            RealOutcome::Doc(observed)
+            ctx.last_row = Some(row.clone()); // remember for DuplicateIdemKey replay
+            if begin_doc_count(ctx).await > begin_before {
+                return RealOutcome::Recovered {
+                    branch: "b10_lazy_begin_interposed".into(),
+                };
+            }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
         }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }
@@ -1158,10 +1311,13 @@ async fn online_shift_open(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome
 }
 
 /// `OfflineShiftOpen` → live SHIFT_OPEN local-ack through production inline path.
+/// B10: the first offline doc interposes a lazy BEGIN — report `Recovered` so
+/// the differential routes to the two-doc ledger-delta (see `offline_sell`).
 async fn offline_shift_open(ctx: &mut FuzzCtx) -> RealOutcome {
     if ctx.read_node_mode().await != NodeMode::Offline {
         return RealOutcome::Refused("offline SHIFT_OPEN requires an Offline node".into());
     }
+    let begin_before = begin_doc_count(ctx).await;
     let row = ctx.seed_inbox_shift_open().await;
     let dps = ctx.new_dps(); // offline branch never touches the wire
     let guard = ctx.gate.clone().lock_owned().await;
@@ -1178,9 +1334,13 @@ async fn offline_shift_open(ctx: &mut FuzzCtx) -> RealOutcome {
     drop(guard);
     match result {
         Ok(_outcome) => {
-            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
-            ctx.last_row = Some(row);
-            RealOutcome::Doc(observed)
+            ctx.last_row = Some(row.clone());
+            if begin_doc_count(ctx).await > begin_before {
+                return RealOutcome::Recovered {
+                    branch: "b10_lazy_begin_interposed".into(),
+                };
+            }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
         }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }
@@ -1224,6 +1384,9 @@ async fn offline_z_report(ctx: &mut FuzzCtx) -> RealOutcome {
     if ctx.read_node_mode().await != NodeMode::Offline {
         return RealOutcome::Refused("offline Z_REPORT requires an Offline node".into());
     }
+    // B10: the first offline doc interposes a lazy BEGIN — report `Recovered`
+    // so the differential routes to the two-doc ledger-delta (`offline_sell`).
+    let begin_before = begin_doc_count(ctx).await;
     let row = ctx.seed_inbox_z_report().await;
     let dps = ctx.new_dps();
     let guard = ctx.gate.clone().lock_owned().await;
@@ -1240,9 +1403,13 @@ async fn offline_z_report(ctx: &mut FuzzCtx) -> RealOutcome {
     drop(guard);
     match result {
         Ok(_outcome) => {
-            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
-            ctx.last_row = Some(row);
-            RealOutcome::Doc(observed)
+            ctx.last_row = Some(row.clone());
+            if begin_doc_count(ctx).await > begin_before {
+                return RealOutcome::Recovered {
+                    branch: "b10_lazy_begin_interposed".into(),
+                };
+            }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
         }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }
@@ -1312,7 +1479,9 @@ pub async fn settle_drain_tick(ctx: &mut FuzzCtx) -> RealOutcome {
         None => 0,
     };
     let dps = ctx.new_dps();
-    for _ in 0..cohort {
+    // B10: `+ 1` for the drain-time DocType=10 END (minted DURING the drain, not
+    // in `cohort`) so its wire submit lands ACK and the drain can FINALIZE.
+    for _ in 0..cohort + 1 {
         dps.push_send(wire_to_result(WireResponse::Ack));
         dps.push_last(wire_to_result(WireResponse::Ack));
     }
@@ -1476,7 +1645,12 @@ fn load_script(dps: &ScriptedDps, script: &DpsScript) {
 fn load_drain_script(dps: &ScriptedDps, script: &DpsScript, backlog: usize) {
     match script.0.as_slice() {
         [WireResponse::Ack, WireResponse::Ack, ..] => {
-            for _ in 0..backlog {
+            // B10: `backlog` counts the pre-drain cohort; a full AckPath drain
+            // ALSO mints + sends the DocType=10 END LAST → push ONE extra
+            // send/last pair so the END's wire submit lands ACK (not
+            // ErrorRetryable from an empty queue).  A surplus pair is harmless
+            // when no END mints (leftover queued responses are ignored).
+            for _ in 0..backlog + 1 {
                 dps.push_send(wire_to_result(WireResponse::Ack));
                 dps.push_last(wire_to_result(WireResponse::Ack));
             }
@@ -1844,23 +2018,38 @@ async fn crash_send_then_reboot_recovers_without_panic_or_resend() {
 
 #[tokio::test]
 async fn offline_sell_lands_offline_local_ack() {
-    let mut ctx = FuzzCtx::new_offline_open_shift(1).await;
+    // B10: the first offline sell lazily mints a DocType=9 BEGIN (code#1) before
+    // the SELL (code#2) → seed 2 codes; the op reports `Recovered` (two-doc ledger
+    // delta) and BOTH docs rest OFFLINE_LOCAL_ACK.
+    let mut ctx = FuzzCtx::new_offline_open_shift(2).await;
     let out = run_op(&mut ctx, &Op::OfflineSell).await;
-    match out {
-        RealOutcome::Doc(d) => {
-            assert_eq!(
-                d.doc_state,
-                DocState::OfflineLocalAck,
-                "offline issuance is local"
-            );
-            assert_eq!(d.code_consumed, Some(1), "one offline code consumed");
-        }
-        other => panic!("expected Doc(OfflineLocalAck), got {other:?}"),
-    }
+    assert!(
+        matches!(out, RealOutcome::Recovered { .. } | RealOutcome::Doc(_)),
+        "expected a Doc/Recovered (interposed BEGIN) offline-local-ack, got {out:?}"
+    );
+    // Both the lazy BEGIN and the SELL rest OFFLINE_LOCAL_ACK; two codes consumed.
+    let ola: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND state = 'OFFLINE_LOCAL_ACK'",
+    )
+    .bind(ctx.fn_id.as_str())
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(ola, 2, "BEGIN + SELL both at OFFLINE_LOCAL_ACK");
+    assert_eq!(
+        ctx.count_doc_type("OFFLINE_SESSION_BEGIN").await,
+        1,
+        "one lazy BEGIN"
+    );
+    assert_eq!(
+        ctx.consumed_codes_count().await,
+        2,
+        "two offline codes consumed"
+    );
     assert_eq!(
         ctx.send_calls(),
         0,
-        "offline issuance must NOT touch the wire"
+        "offline issuance must NOT touch the wire (neither the BEGIN nor the SELL)"
     );
 }
 

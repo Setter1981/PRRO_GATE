@@ -880,6 +880,56 @@ async fn er_guard_fn_config_error_no_wire_escalates_to_manual() {
 }
 
 #[tokio::test]
+async fn er_guard_legacy_chain_settle_retry_no_wire_escalates_to_manual() {
+    let (_d, pool) = fresh_pool().await;
+    let (doc, shift_id, _sess) = seed_er_with_class(&pool, "DrainChainSettleRetry", 1).await;
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
+        .bind(shift_id)
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let c = carriers(vec![], vec![]);
+    let view = view_for(&c);
+    backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        c.dps.send_chk_count(),
+        0,
+        "legacy chain-settle rows must never re-drive persisted bytes"
+    );
+    assert_eq!(
+        read_doc_state(&pool, doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
+    let p = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_FAILED")
+        .await
+        .unwrap();
+    assert_eq!(p["failure_class"], "server");
+    assert_eq!(p["retry_class"], "DrainChainSettleRetry");
+    assert_eq!(p["manual_recon_class"], true);
+    assert_eq!(p["dispatch_via"], "er_class_guard");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_ER_ESCALATED_TO_MANUAL").await,
+        1
+    );
+    let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(shift_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1,
+        "legacy row must halt the sequential drain at manual reconciliation"
+    );
+}
+
+#[tokio::test]
 async fn er_guard_wrapper_bug_no_wire_escalates_to_manual() {
     let (_d, pool) = fresh_pool().await;
     let (doc, shift_id, _sess) = seed_er_with_class(&pool, "WrapperBug", 1).await;
@@ -3656,8 +3706,15 @@ async fn w12_kvt2_chain_seed_mismatch_escalates_manual_recon_not_hard_abort() {
     .await
     .unwrap();
 
-    // No DPS calls expected on the KVT2 finalize arm.
-    let c = carriers(vec![], vec![]);
+    // The KVT2 cohort doc finalizes to ACK (content-eligible), so the drain then
+    // mints + sends the B10 online END LAST (advance-at-SEND: 1 send_chk + 1
+    // last_chk).  The corrupted (NULL) seed matches the END's NULL `previous_hash`
+    // (the END is the first issued doc against a genesis seed here), so the END's
+    // send advances cleanly.  Provide its DPS acks.
+    let c = carriers(
+        vec![Ok(ack("DPS-FN-END", vec![]))],
+        vec![Ok(ack("DPS-FN-END", vec![0xEEu8; 32]))],
+    );
     let view = view_for(&c);
 
     // M2-04: the drain must NOT hard-abort — it returns Ok and escalates.

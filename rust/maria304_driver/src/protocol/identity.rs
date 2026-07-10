@@ -69,11 +69,11 @@ pub enum ConfMode {
 /// Virtual-device system key position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SysKey {
-    Off,             // '0' / chr(0)
-    Work,            // '1' / chr(1)
-    XReport,         // '2' / chr(2)
-    ZReport,         // '3' / chr(3)
-    Programming,     // '4' / chr(4)
+    Off,         // '0' / chr(0)
+    Work,        // '1' / chr(1)
+    XReport,     // '2' / chr(2)
+    ZReport,     // '3' / chr(3)
+    Programming, // '4' / chr(4)
 }
 
 impl SysKey {

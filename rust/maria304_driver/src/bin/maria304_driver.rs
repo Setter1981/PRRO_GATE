@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::signal;
 
-use maria304_driver::admin::{serve_admin, AdminConfig, Registry, RegisteredFn};
+use maria304_driver::admin::{serve_admin, AdminConfig, RegisteredFn, Registry};
 use maria304_driver::bridge::{
     Bridge, DeploymentMode, DryRunBridge, HttpBridge, RetryBridge, RetryPolicy,
 };
@@ -189,7 +189,10 @@ fn check_no_duplicates(listeners: &[ListenerCfg]) -> Result<(), String> {
     Ok(())
 }
 
-fn build_bridge(cfg: &BridgeCfg, mode: DeploymentMode) -> Result<Arc<dyn Bridge + Send + Sync>, String> {
+fn build_bridge(
+    cfg: &BridgeCfg,
+    mode: DeploymentMode,
+) -> Result<Arc<dyn Bridge + Send + Sync>, String> {
     if mode == DeploymentMode::DryRun {
         return Ok(Arc::new(DryRunBridge::new()));
     }
@@ -223,7 +226,9 @@ fn identity_from_cfg(fiscal_number: &str, cfg: &ListenerCfg) -> Identity {
         .clone()
         .unwrap_or_else(|| "1111111111".to_string());
     Identity {
-        factory_serial: id.serial_number.unwrap_or_else(|| format!("MRY304-{fiscal_number}")),
+        factory_serial: id
+            .serial_number
+            .unwrap_or_else(|| format!("MRY304-{fiscal_number}")),
         fiscal_number: fiscal_number.to_string(),
         merchant: "Virtual Maria 304".to_string(),
         fw_version_id: id.software_version.unwrap_or_else(|| "4120".to_string()),
@@ -247,13 +252,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let raw = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("read config {}: {e}", config_path.display()))?;
-    let cfg: FileConfig = serde_yaml::from_str(&raw)
-        .map_err(|e| format!("parse config: {e}"))?;
+    let cfg: FileConfig = serde_yaml::from_str(&raw).map_err(|e| format!("parse config: {e}"))?;
 
     let mode = match cfg.deployment.mode.as_deref() {
         None => DeploymentMode::default(),
-        Some(raw) => DeploymentMode::parse(raw)
-            .ok_or_else(|| format!("invalid deployment.mode={raw:?}"))?,
+        Some(raw) => {
+            DeploymentMode::parse(raw).ok_or_else(|| format!("invalid deployment.mode={raw:?}"))?
+        }
     };
     tracing::info!(?mode, "deployment mode");
 
@@ -281,7 +286,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         lcfg.idle_timeout = Duration::from_secs(listener_cfg.idle_timeout_s);
         lcfg.cooldown = Duration::from_secs(listener_cfg.post_disconnect_cooldown_s);
 
-        let listener = FnListener::new(lcfg, Arc::clone(&bridge), Arc::clone(&clock), Arc::clone(&metrics));
+        let listener = FnListener::new(
+            lcfg,
+            Arc::clone(&bridge),
+            Arc::clone(&clock),
+            Arc::clone(&metrics),
+        );
         let gate = listener.gate();
         registry
             .register_fn(RegisteredFn {
@@ -305,7 +315,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(admin) = cfg.admin {
         let registry = Arc::clone(&registry);
         tokio::spawn(async move {
-            let acfg = AdminConfig { bind: admin.bind, auth_token: admin.auth_token };
+            let acfg = AdminConfig {
+                bind: admin.bind,
+                auth_token: admin.auth_token,
+            };
             if let Err(e) = serve_admin(acfg, registry).await {
                 tracing::error!("admin server died: {e}");
             }
@@ -318,14 +331,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shutdown.cancel();
 
     let timeout_s = cfg.deployment.graceful_shutdown_timeout_s;
-    let _ = tokio::time::timeout(
-        Duration::from_secs(timeout_s),
-        async {
-            for h in listener_handles {
-                let _ = h.await;
-            }
-        },
-    ).await;
+    let _ = tokio::time::timeout(Duration::from_secs(timeout_s), async {
+        for h in listener_handles {
+            let _ = h.await;
+        }
+    })
+    .await;
     tracing::info!("shutdown complete");
     Ok(())
 }

@@ -26,7 +26,9 @@ impl ProfileRegistry {
                 map.insert(key.to_string(), profile);
             }
         }
-        Self { inner: Arc::new(map) }
+        Self {
+            inner: Arc::new(map),
+        }
     }
 
     /// Load all `*.xml` files from `dir` alongside bundled profiles.

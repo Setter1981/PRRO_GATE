@@ -29,7 +29,11 @@ async fn start_daemon() -> String {
 async fn health_returns_live_json() {
     let base = start_daemon().await;
     let resp: serde_json::Value = reqwest::get(format!("{base}/health"))
-        .await.unwrap().json().await.unwrap();
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(resp["live"], true);
     assert!(resp["profiles_loaded"].as_u64().unwrap() >= 3);
 }
@@ -38,9 +42,14 @@ async fn health_returns_live_json() {
 async fn profiles_lists_bundled() {
     let base = start_daemon().await;
     let resp: serde_json::Value = reqwest::get(format!("{base}/profiles"))
-        .await.unwrap().json().await.unwrap();
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let profiles = resp["profiles"].as_array().unwrap();
-    let keys: Vec<String> = profiles.iter()
+    let keys: Vec<String> = profiles
+        .iter()
         .filter_map(|p| p["key"].as_str().map(str::to_owned))
         .collect();
     assert!(keys.contains(&"tm-t88ii".to_string()));
@@ -65,8 +74,13 @@ async fn compile_simple_receipt_returns_expected_hex() {
     });
     let resp: serde_json::Value = reqwest::Client::new()
         .post(format!("{base}/compile"))
-        .json(&body).send().await.unwrap()
-        .json().await.unwrap();
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let hex_str = resp["bytes_hex"].as_str().unwrap();
     // Known ESC/POS sequence.
     assert_eq!(
@@ -75,7 +89,7 @@ async fn compile_simple_receipt_returns_expected_hex() {
             .to_string() + "48454c4c4f"         // "HELLO"
             + "0a"                              // LF
             + "1b6402"                          // feed 2
-            + "1d5601",                         // cut DEFAULT
+            + "1d5601", // cut DEFAULT
     );
     assert_eq!(resp["length"].as_u64().unwrap(), 20);
 }
@@ -86,7 +100,10 @@ async fn compile_unknown_profile_returns_404() {
     let body = serde_json::json!({"profile": "nope", "instructions": []});
     let resp = reqwest::Client::new()
         .post(format!("{base}/compile"))
-        .json(&body).send().await.unwrap();
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404);
 }
 
@@ -99,7 +116,10 @@ async fn compile_bad_hex_in_raw_returns_400() {
     });
     let resp = reqwest::Client::new()
         .post(format!("{base}/compile"))
-        .json(&body).send().await.unwrap();
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 400);
 }
 
@@ -135,8 +155,13 @@ async fn print_sends_bytes_over_tcp_to_listener() {
     });
     let resp: serde_json::Value = reqwest::Client::new()
         .post(format!("{base}/print"))
-        .json(&body).send().await.unwrap()
-        .json().await.unwrap();
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(resp["ok"], true);
 
     // Give the spawned receiver a tick to finish draining.
@@ -163,6 +188,9 @@ async fn print_tcp_unreachable_returns_502() {
     });
     let resp = reqwest::Client::new()
         .post(format!("{base}/print"))
-        .json(&body).send().await.unwrap();
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 502);
 }

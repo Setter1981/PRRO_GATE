@@ -343,8 +343,10 @@ async fn drill_a_morning_without_network_offline_open_drain_online_z_close() {
     );
     assert_eq!(
         consumed_codes_count(app.db()).await,
-        1,
-        "numbering (ii): the shift-open doc consumed an offline code"
+        2,
+        "B10 numbering (ii): the lazy DocType=9 BEGIN (minted BEFORE the offline \
+         SHIFT_OPEN, as the session's first offline doc) + the SHIFT_OPEN each \
+         consumed a code"
     );
     prro::db::invariant_scan::assert_clean(app.db()).await;
 
@@ -363,14 +365,19 @@ async fn drill_a_morning_without_network_offline_open_drain_online_z_close() {
             "offline SELL {i} rests at OLA"
         );
     }
-    assert_eq!(doc_count_in_state(app.db(), "OFFLINE_LOCAL_ACK").await, 3);
+    // B10: lazy DocType=9 BEGIN (minted BEFORE the offline SHIFT_OPEN, as the
+    // session's FIRST offline doc) + SHIFT_OPEN + SELL#1 + SELL#2 = 4 OLA docs.
+    assert_eq!(doc_count_in_state(app.db(), "OFFLINE_LOCAL_ACK").await, 4);
     prro::db::invariant_scan::assert_clean(app.db()).await;
 
     // ─── 4) reconnect: GO_ONLINE + drain (SHIFT_OPEN doc first, lnd order) ─
     prro::admin::go_online(app.db(), FN, "net restored")
         .await
         .expect("live door: GO_ONLINE");
-    let carriers = drain_carriers_for(&["DPS-A-D1", "DPS-A-D2", "DPS-A-D3"]);
+    // B10: 4 backlog docs (SHIFT_OPEN + BEGIN + 2 SELL) + the DocType=10 END
+    // minted at drain finalize = up to 5 wire sends.
+    let carriers =
+        drain_carriers_for(&["DPS-A-D1", "DPS-A-D2", "DPS-A-D3", "DPS-A-D4", "DPS-A-D5"]);
     let view = drain_view(&carriers);
     let summary = match app
         .drain_offline_backlog_scheduled(FN, &view)
@@ -382,10 +389,15 @@ async fn drill_a_morning_without_network_offline_open_drain_online_z_close() {
     };
     assert_eq!(
         summary.backlog_size_before(),
-        3,
-        "OPEN + 2 SELLs in backlog"
+        4,
+        "B10: SHIFT_OPEN + BEGIN + 2 SELLs in the content backlog"
     );
-    assert_eq!(summary.advanced_to_ack(), 3, "all three drain to ACK");
+    assert_eq!(
+        summary.advanced_to_ack(),
+        4,
+        "all four content docs drain to ACK (END is a finalize precondition, \
+         not counted in the cohort)"
+    );
     drop(carriers);
 
     // ─── 5) edge 5 LIVE: the drained SHIFT_OPEN converges the shift ───────
@@ -500,8 +512,8 @@ async fn drill_b_full_offline_day_offline_open_sells_offline_z_close_drain_conve
     );
     assert_eq!(
         consumed_codes_count(app.db()).await,
-        4,
-        "numbering (ii): OPEN + 2 SELLs + Z each consumed a code"
+        5,
+        "B10 numbering (ii): SHIFT_OPEN + BEGIN + 2 SELLs + Z each consumed a code"
     );
     // The local-Z AGGREGATED the shift's OLA receipts at close time (C10):
     // 2 sells → sell_count 2, turnover 2×15000.
@@ -526,19 +538,27 @@ async fn drill_b_full_offline_day_offline_open_sells_offline_z_close_drain_conve
     );
     prro::db::invariant_scan::assert_clean(app.db()).await;
 
-    // ─── 5) ORDER PIN (strict-sequential lnd): the drain will send the
-    //        shift-open doc FIRST and the Z doc LAST ────────────────────────
+    // ─── 5) ORDER PIN (strict-sequential lnd): the drain sends the BEGIN
+    //        FIRST (opens the DPS offline window) and the Z doc LAST ─────────
     let backlog = backlog_lnd_doc_types(app.db()).await;
-    assert_eq!(backlog.len(), 4);
+    // B10: BEGIN(1, lazily minted as the session's FIRST offline doc, BEFORE the
+    // offline SHIFT_OPEN) + SHIFT_OPEN(2) + SELL(3) + SELL(4) + Z(5) = 5 docs.
+    assert_eq!(backlog.len(), 5);
     assert_eq!(
         (backlog[0].1.as_str(), backlog[0].2.as_str()),
-        ("SHIFT_OPEN", "OFFLINE_LOCAL_ACK"),
-        "lowest lnd = the shift-open doc → drains FIRST"
+        ("OFFLINE_SESSION_BEGIN", "OFFLINE_LOCAL_ACK"),
+        "B10: the lazy DocType=9 BEGIN is the lowest lnd → drains FIRST (opens \
+         the DPS offline window before the offline SHIFT_OPEN)"
     );
     assert_eq!(
-        (backlog[3].1.as_str(), backlog[3].2.as_str()),
+        (backlog[1].1.as_str(), backlog[1].2.as_str()),
+        ("SHIFT_OPEN", "OFFLINE_LOCAL_ACK"),
+        "the offline SHIFT_OPEN sits at lnd 2, right after the BEGIN"
+    );
+    assert_eq!(
+        (backlog[4].1.as_str(), backlog[4].2.as_str()),
         ("Z_REPORT", "OFFLINE_LOCAL_ACK"),
-        "highest lnd = the Z doc → drains LAST"
+        "highest content lnd = the Z doc → drains LAST (before the END boundary)"
     );
 
     // ─── 5b) CLPD-BLOCKING PIN (contract): a NEW shift can NOT open until
@@ -569,7 +589,11 @@ async fn drill_b_full_offline_day_offline_open_sells_offline_z_close_drain_conve
     prro::admin::go_online(app.db(), FN, "evening net restored")
         .await
         .expect("live door: GO_ONLINE");
-    let carriers = drain_carriers_for(&["DPS-B-D1", "DPS-B-D2", "DPS-B-D3", "DPS-B-D4"]);
+    // B10: 5 content docs (SHIFT_OPEN + BEGIN + 2 SELL + Z) + the DocType=10 END
+    // minted at drain finalize = up to 6 wire sends.
+    let carriers = drain_carriers_for(&[
+        "DPS-B-D1", "DPS-B-D2", "DPS-B-D3", "DPS-B-D4", "DPS-B-D5", "DPS-B-D6",
+    ]);
     let view = drain_view(&carriers);
     let summary = match app
         .drain_offline_backlog_scheduled(FN, &view)
@@ -581,10 +605,14 @@ async fn drill_b_full_offline_day_offline_open_sells_offline_z_close_drain_conve
     };
     assert_eq!(
         summary.backlog_size_before(),
-        4,
-        "OPEN + 2 SELLs + Z all in the backlog"
+        5,
+        "B10: SHIFT_OPEN + BEGIN + 2 SELLs + Z all in the content backlog"
     );
-    assert_eq!(summary.advanced_to_ack(), 4, "everything drains to ACK");
+    assert_eq!(
+        summary.advanced_to_ack(),
+        5,
+        "all five content docs drain to ACK (END is a finalize precondition)"
+    );
     drop(carriers);
 
     // ─── 7) edge 13 LIVE: the drained Z converges the shift to Closed ──────
@@ -602,7 +630,8 @@ async fn drill_b_full_offline_day_offline_open_sells_offline_z_close_drain_conve
         "offline session closed by the drain"
     );
     assert_eq!(doc_count_in_state(app.db(), "OFFLINE_LOCAL_ACK").await, 0);
-    assert_eq!(doc_count_in_state(app.db(), "ACK").await, 4);
+    // B10: SHIFT_OPEN + BEGIN + 2 SELL + Z + END = 6 all ACK.
+    assert_eq!(doc_count_in_state(app.db(), "ACK").await, 6);
 
     // The full offline day rests terminal — the quiescent boundary is CLEAN.
     prro::db::invariant_scan::assert_clean(app.db()).await;

@@ -25,8 +25,8 @@ pub mod repo;
 
 // ── Envelope integrity ────────────────────────────────────────────────────────
 
-use sha2::{Digest, Sha256};
 use crate::input::CanonicalCommand;
+use sha2::{Digest, Sha256};
 
 const ALLOWED_SCHEMA_VERSIONS: &[&str] = &["1.0"];
 
@@ -47,7 +47,10 @@ pub fn validate_envelope(cmd: &CanonicalCommand) -> Result<(), String> {
     }
     // F5: payload_sha256 is now mandatory — reject empty or non-hex values.
     if cmd.payload_sha256.len() != 64
-        || !cmd.payload_sha256.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        || !cmd
+            .payload_sha256
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     {
         return Err(format!(
             "payload_sha256 must be a 64-char lowercase hex SHA-256 digest; \
@@ -56,8 +59,8 @@ pub fn validate_envelope(cmd: &CanonicalCommand) -> Result<(), String> {
             cmd.payload_sha256.len()
         ));
     }
-    let payload_bytes = serde_json::to_vec(&cmd.payload)
-        .map_err(|e| format!("payload serialize: {e}"))?;
+    let payload_bytes =
+        serde_json::to_vec(&cmd.payload).map_err(|e| format!("payload serialize: {e}"))?;
     let computed = hex::encode(Sha256::digest(&payload_bytes));
     if computed != cmd.payload_sha256 {
         return Err(format!(

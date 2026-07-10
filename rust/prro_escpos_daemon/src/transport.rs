@@ -42,26 +42,33 @@ pub async fn send_tcp(
     let addr_str = format!("{host}:{port}");
     // Parse the first resolved address.  We do not want
     // happy-eyeballs / DNS loops here — keep it simple.
-    let mut addrs = tokio::net::lookup_host(&addr_str)
-        .await
-        .map_err(|e| TransportError::InvalidAddress { addr: addr_str.clone(), source: e })?;
-    let addr = addrs
-        .next()
-        .ok_or_else(|| TransportError::InvalidAddress {
-            addr: addr_str.clone(),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no addrs"),
-        })?;
+    let mut addrs =
+        tokio::net::lookup_host(&addr_str)
+            .await
+            .map_err(|e| TransportError::InvalidAddress {
+                addr: addr_str.clone(),
+                source: e,
+            })?;
+    let addr = addrs.next().ok_or_else(|| TransportError::InvalidAddress {
+        addr: addr_str.clone(),
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, "no addrs"),
+    })?;
 
     let fut = async {
         let mut stream = TcpStream::connect(addr)
             .await
             .map_err(|e| TransportError::TcpConnect { addr, source: e })?;
-        stream.write_all(bytes).await.map_err(TransportError::TcpWrite)?;
+        stream
+            .write_all(bytes)
+            .await
+            .map_err(TransportError::TcpWrite)?;
         stream.shutdown().await.map_err(TransportError::TcpWrite)?;
         Ok::<(), TransportError>(())
     };
     match tokio::time::timeout(Duration::from_millis(timeout_ms), fut).await {
         Ok(inner) => inner,
-        Err(_) => Err(TransportError::Timeout { elapsed_ms: timeout_ms as u128 }),
+        Err(_) => Err(TransportError::Timeout {
+            elapsed_ms: timeout_ms as u128,
+        }),
     }
 }

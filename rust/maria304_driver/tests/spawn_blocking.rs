@@ -15,7 +15,10 @@ fn identity() -> Identity {
     Identity::default()
 }
 fn corr() -> Correlation {
-    Correlation { session_uuid: "test".to_string(), receipt_seq: 0 }
+    Correlation {
+        session_uuid: "test".to_string(),
+        receipt_seq: 0,
+    }
 }
 
 fn ok_response() -> CanonicalResponse {
@@ -62,7 +65,10 @@ fn dispatch_prepare_comp_returns_needs_bridge_without_calling_bridge() {
     let id = identity();
     let mut corr = corr();
     let (date, time) = clock();
-    let clock = Clock { date: &date, time: &time };
+    let clock = Clock {
+        date: &date,
+        time: &time,
+    };
 
     let result = dispatch_prepare(&mut s, &Command::Comp(String::new()), &id, clock, &mut corr);
 
@@ -82,7 +88,10 @@ fn dispatch_prepare_zrep_returns_needs_bridge_without_calling_bridge() {
     let id = identity();
     let mut corr = corr();
     let (date, time) = clock();
-    let clock = Clock { date: &date, time: &time };
+    let clock = Clock {
+        date: &date,
+        time: &time,
+    };
 
     let result = dispatch_prepare(&mut s, &Command::Zrep, &id, clock, &mut corr);
     assert!(matches!(result, DispatchPrepared::NeedsBridge(_)));
@@ -94,7 +103,10 @@ fn dispatch_prepare_sync_returns_done_without_calling_bridge() {
     let id = identity();
     let mut corr = corr();
     let (date, time) = clock();
-    let clock = Clock { date: &date, time: &time };
+    let clock = Clock {
+        date: &date,
+        time: &time,
+    };
 
     // SYNC is a non-bridge command — should return Done immediately.
     // Using PanicBridge to prove bridge.submit() is never called.
@@ -116,7 +128,9 @@ fn dispatch_with_result_comp_accepted_clears_receipt() {
     );
 
     // Should return DONE + READY after accepted bridge response.
-    assert!(responses.iter().any(|r| matches!(r, maria304_driver::protocol::Response::Done)));
+    assert!(responses
+        .iter()
+        .any(|r| matches!(r, maria304_driver::protocol::Response::Done)));
     // Receipt must be closed.
     assert!(!s.receipt_open());
 }
@@ -133,7 +147,9 @@ fn dispatch_with_result_comp_transport_error_keeps_receipt_open() {
         &mut corr,
     );
 
-    assert!(responses.iter().any(|r| matches!(r, maria304_driver::protocol::Response::Error(_))));
+    assert!(responses
+        .iter()
+        .any(|r| matches!(r, maria304_driver::protocol::Response::Error(_))));
     // Receipt stays open so the caller can retry or CANC.
     assert!(s.receipt_open());
 }
@@ -157,7 +173,10 @@ async fn spawn_blocking_bridge_submit_runs_outside_async_executor() {
     let id = identity();
     let mut corr = corr();
     let (date, time) = clock();
-    let clk = Clock { date: &date, time: &time };
+    let clk = Clock {
+        date: &date,
+        time: &time,
+    };
 
     let prepared = dispatch_prepare(&mut s, &Command::Comp(String::new()), &id, clk, &mut corr);
     if let DispatchPrepared::NeedsBridge(envelope) = prepared {
@@ -170,7 +189,10 @@ async fn spawn_blocking_bridge_submit_runs_outside_async_executor() {
         panic!("expected NeedsBridge");
     }
 
-    assert!(SUBMIT_CALLED.load(Ordering::SeqCst), "bridge.submit must have been called");
+    assert!(
+        SUBMIT_CALLED.load(Ordering::SeqCst),
+        "bridge.submit must have been called"
+    );
 }
 
 #[test]
@@ -180,20 +202,22 @@ fn dispatch_prepare_unauthenticated_zrep_returns_softupas_not_bridge() {
     let id = identity();
     let mut corr = corr();
     let (date, time) = clock();
-    let clk = Clock { date: &date, time: &time };
+    let clk = Clock {
+        date: &date,
+        time: &time,
+    };
 
-    for cmd in [
-        Command::Zrep,
-        Command::Nrep,
-        Command::NrepLowercase,
-    ] {
+    for cmd in [Command::Zrep, Command::Nrep, Command::NrepLowercase] {
         let result = dispatch_prepare(&mut s, &cmd, &id, clk, &mut corr);
         match result {
             DispatchPrepared::Done(responses) => {
                 assert!(
-                    responses.iter().any(|r| matches!(r, maria304_driver::protocol::Response::Error(
-                        maria304_driver::protocol::error_codes::ErrorCode::SoftUpas
-                    ))),
+                    responses.iter().any(|r| matches!(
+                        r,
+                        maria304_driver::protocol::Response::Error(
+                            maria304_driver::protocol::error_codes::ErrorCode::SoftUpas
+                        )
+                    )),
                     "{cmd:?} must return SoftUpas when unauthenticated, got {responses:?}",
                 );
             }
@@ -210,12 +234,20 @@ fn dispatch_prepare_unauthenticated_caioi_returns_softupas_not_bridge() {
     let id = identity();
     let mut corr = corr();
     let (date, time) = clock();
-    let clk = Clock { date: &date, time: &time };
+    let clk = Clock {
+        date: &date,
+        time: &time,
+    };
 
     let result = dispatch_prepare(
         &mut s,
-        &Command::Caioi { sum_kopecks: 100, description: "test".to_string() },
-        &id, clk, &mut corr,
+        &Command::Caioi {
+            sum_kopecks: 100,
+            description: "test".to_string(),
+        },
+        &id,
+        clk,
+        &mut corr,
     );
     assert!(
         matches!(result, DispatchPrepared::Done(_)),

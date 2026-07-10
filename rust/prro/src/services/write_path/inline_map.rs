@@ -58,6 +58,14 @@ pub(crate) mod codes {
     /// RETRYABLE/transient (the `online_convergence` resolver re-drives the
     /// blocker, then the client retries) → 503, NOT terminal.
     pub const WRITE_GATE_SIBLING_PENDING: &str = "WRITE_GATE_SIBLING_PENDING";
+    /// B10 — a fresh offline business doc arrived while this session's lazy
+    /// DocType=9 (OFFLINE_SESSION_BEGIN) predecessor is still BELOW
+    /// `OFFLINE_LOCAL_ACK` (a crashed-mid-sign BEGIN).  The offline lane bypasses
+    /// the D5 sibling-pending gate, so this DocType-9-scoped guard fail-closes
+    /// the business doc RETRYABLE (503) rather than let it sign against a
+    /// non-issued BEGIN → chain fork.  The boot-resume tick drives the crashed
+    /// BEGIN to OFFLINE_LOCAL_ACK; the client retries and then proceeds.
+    pub const OFFLINE_SESSION_BEGIN_PENDING: &str = "OFFLINE_SESSION_BEGIN_PENDING";
     /// PR-Z2 — a live Z was submitted while the shift still has in-flight
     /// receipts (C10 quiescence pending).  RETRYABLE → 503.  STOP-S6 ruling (B):
     /// carried on `OfflineRefused` for boundary discipline (no ingress/seam
@@ -429,6 +437,7 @@ mod tests {
             codes::NODE_CRYPTO_DEGRADED,
             codes::NODE_GOING_ONLINE,
             codes::WRITE_GATE_SIBLING_PENDING,
+            codes::OFFLINE_SESSION_BEGIN_PENDING,
         ] {
             assert_eq!(http(c), 503, "{c} must route to 503 (OfflineRefused)");
         }

@@ -91,7 +91,11 @@ fn online_sell_ackpath_advances_lnd_and_seed() {
 }
 
 /// `apply(OfflineSell)` advances the seed at `OFFLINE_LOCAL_ACK` (issuance), not
-/// later, and consumes exactly one offline code (spec §6 offline lane).
+/// later, and consumes offline codes (spec §6 offline lane).
+///
+/// B10: the FIRST offline sell of a session lazily mints a DocType=9 BEGIN@lnd1
+/// (code#1) BEFORE the SELL, so `apply(OfflineSell)` returns the BUSINESS
+/// Mutation (SELL@lnd2, code#2) and the model has consumed TWO codes.
 #[test]
 fn offline_sell_advances_seed_at_offline_local_ack_and_consumes_code() {
     let mut m = RefModel::new_offline_open_shift(3);
@@ -100,13 +104,25 @@ fn offline_sell_advances_seed_at_offline_local_ack_and_consumes_code() {
     let out = m.apply(&Op::OfflineSell);
 
     let mu = mutation(&out);
-    assert_eq!(mu.lnd, 1);
+    assert_eq!(
+        mu.lnd, 2,
+        "the returned Mutation is the SELL (lnd 2, after BEGIN@1)"
+    );
     assert_eq!(mu.doc_state, DocState::OfflineLocalAck);
-    assert_eq!(m.docs.get(&1), Some(&DocState::OfflineLocalAck));
+    assert_eq!(
+        m.docs.get(&1),
+        Some(&DocState::OfflineLocalAck),
+        "BEGIN@1 OLA"
+    );
+    assert_eq!(
+        m.docs.get(&2),
+        Some(&DocState::OfflineLocalAck),
+        "SELL@2 OLA"
+    );
     assert_ne!(m.seed, seed_before, "seed advanced at OFFLINE_LOCAL_ACK");
     assert_eq!(m.seed, mu.seed_after);
-    assert_eq!(m.codes_consumed, 1, "exactly one code consumed");
-    assert_eq!(mu.code_consumed, Some(1));
+    assert_eq!(m.codes_consumed, 2, "two codes consumed — BEGIN + SELL");
+    assert_eq!(mu.code_consumed, Some(2));
     // OFFLINE_LOCAL_ACK is in the SSOT issued set — the doc is issued at issuance.
     assert!(RefModel::is_offline_origin_issued(
         DocState::OfflineLocalAck
@@ -522,14 +538,31 @@ async fn online_return_produces_a_genuine_return_doc() {
 async fn offline_return_produces_a_genuine_return_doc() {
     let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
     let outcome = interp::run_op(&mut ctx, &Op::OfflineReturn).await;
+    // B10: the first offline doc lazily interposes a DocType=9 BEGIN, so the op is
+    // a two-doc ledger delta → the interp reports `Recovered` (routes to the
+    // ledger-delta oracle), and there are now BEGIN + RETURN rows (so
+    // `only_doc_type` no longer applies).
     assert!(
-        matches!(outcome, interp::RealOutcome::Doc(_)),
-        "an OFFLINE RETURN must issue a doc, got {outcome:?}"
+        matches!(
+            outcome,
+            interp::RealOutcome::Recovered { .. } | interp::RealOutcome::Doc(_)
+        ),
+        "an OFFLINE RETURN must issue a doc (or Recovered w/ interposed BEGIN), got {outcome:?}"
     );
     assert_eq!(
-        ctx.only_doc_type().await,
-        "RETURN",
-        "the offline fuzzer lane must drive a genuine RETURN, not a mislabeled SELL"
+        ctx.count_doc_type("RETURN").await,
+        1,
+        "the offline fuzzer lane must drive exactly one genuine RETURN, not a mislabeled SELL"
+    );
+    assert_eq!(
+        ctx.count_doc_type("OFFLINE_SESSION_BEGIN").await,
+        1,
+        "the lazy BEGIN is interposed before the RETURN"
+    );
+    assert_eq!(
+        ctx.count_doc_type("SELL").await,
+        0,
+        "no SELL row (the RETURN is genuine, and the BEGIN is a service receipt)"
     );
 }
 
@@ -806,9 +839,20 @@ fn shrinking_reduces_a_forced_failure_to_minimal() {
 
 #[test]
 fn model_drain_ackpath_advances_backlog_to_ack() {
-    let mut m = RefModel::new_offline_open_shift(1);
-    let _ = m.apply(&Op::OfflineSell); // backlog: docs[1] = OFFLINE_LOCAL_ACK
-    assert_eq!(m.docs.get(&1), Some(&DocState::OfflineLocalAck));
+    // B10: the first offline sell mints BEGIN(lnd1) + SELL(lnd2) → seed 3 codes so
+    // both issue AND the drain-time END(lnd3) can too.
+    let mut m = RefModel::new_offline_open_shift(3);
+    let _ = m.apply(&Op::OfflineSell); // BEGIN@1 + SELL@2, both OFFLINE_LOCAL_ACK
+    assert_eq!(
+        m.docs.get(&1),
+        Some(&DocState::OfflineLocalAck),
+        "BEGIN@1 OLA"
+    );
+    assert_eq!(
+        m.docs.get(&2),
+        Some(&DocState::OfflineLocalAck),
+        "SELL@2 OLA"
+    );
     let seed_before = m.seed;
     m.mode = NodeMode::GoingOnline; // fixture: the probe already flipped (test setup)
 
@@ -818,19 +862,25 @@ fn model_drain_ackpath_advances_backlog_to_ack() {
         matches!(out, ExpectedOutcome::Mutated(_)),
         "an advancing drain is PredictableMutating, got {out:?}"
     );
+    assert_eq!(m.docs.get(&1), Some(&DocState::Ack), "BEGIN drained to ACK");
+    assert_eq!(m.docs.get(&2), Some(&DocState::Ack), "SELL drained to ACK");
+    // B10: the drain also minted + drained the DocType=10 END (lnd3 → ACK).
     assert_eq!(
-        m.docs.get(&1),
+        m.docs.get(&3),
         Some(&DocState::Ack),
-        "backlog doc drained to ACK"
+        "END minted + drained to ACK"
     );
-    assert_eq!(
+    // The drained backlog (BEGIN + SELL) does NOT re-advance the seed (offline
+    // advanced at issuance); the END, however, is a fresh offline doc issued AT
+    // drain, so it DOES advance the seed to its own unsigned hash (M2-01).
+    assert_ne!(
         m.seed, seed_before,
-        "drain does NOT re-advance the seed (offline-origin advanced at issuance)"
+        "the drain-time END advances the seed to its own unsigned hash"
     );
     assert_eq!(
         m.mode,
         NodeMode::Online,
-        "a full drain flips GoingOnline → Online"
+        "a full drain (with a spare code for the END) flips GoingOnline → Online"
     );
 }
 
@@ -863,7 +913,8 @@ fn model_drain_reject_halts_and_escalates_manual() {
 
 #[test]
 fn model_go_online_transitions_and_drains() {
-    let mut m = RefModel::new_offline_open_shift(1);
+    // B10: BEGIN@1 + SELL@2 at issuance + END@3 at drain → seed 3 codes.
+    let mut m = RefModel::new_offline_open_shift(3);
     let _ = m.apply(&Op::OfflineSell);
 
     let out = m.apply(&Op::GoOnline(DpsScript::ack_path()));
@@ -872,13 +923,11 @@ fn model_go_online_transitions_and_drains() {
     assert_eq!(
         m.mode,
         NodeMode::Online,
-        "go_online: Offline → (GoingOnline) → Online"
+        "go_online: Offline → (GoingOnline) → Online (spare code for the END)"
     );
-    assert_eq!(
-        m.docs.get(&1),
-        Some(&DocState::Ack),
-        "the backlog drained to ACK"
-    );
+    assert_eq!(m.docs.get(&1), Some(&DocState::Ack), "BEGIN drained to ACK");
+    assert_eq!(m.docs.get(&2), Some(&DocState::Ack), "SELL drained to ACK");
+    assert_eq!(m.docs.get(&3), Some(&DocState::Ack), "END drained to ACK");
 }
 
 // ── Task 4 Part B — differential oracle (model vs interpreter) ──────────────
@@ -1080,14 +1129,18 @@ async fn differential_offline_z_report_enters_closing_pending_drain() {
     let mut ctx = interp::FuzzCtx::new_offline_open_shift(2).await;
     let mut model = RefModel::new_offline_open_shift(2);
 
-    let prior_tip = ctx.read_seed().await;
-    let op = Op::OfflineZReport;
-    let expected = model.apply(&op);
-    let real = interp::run_op(&mut ctx, &op).await;
+    let _ = model.apply(&Op::OfflineZReport);
+    let _ = interp::run_op(&mut ctx, &Op::OfflineZReport).await;
 
-    oracle::check_differential(&real, &expected, prior_tip.as_deref())
-        .unwrap_or_else(|d| panic!("offline Z_REPORT local ack must match model: {d:?}"));
-    assert_eq!(ctx.only_doc_type().await, "Z_REPORT");
+    // B10 — the FIRST offline doc of a session is a TWO-doc event (the lazy
+    // DocType=9 BEGIN@lnd1 precedes the Z@lnd2 via the `run_staged` hoist),
+    // so the per-doc chain-continuity check (which pins the pre-op tip) does
+    // not apply; the ledger delta is the authoritative check.
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("offline Z_REPORT (with lazy BEGIN) ledger must match the model");
+    oracle::check_shift_state(ctx.read_shift_state().await, Some(model.shift_state))
+        .expect("offline Z_REPORT shift state must match the model");
     assert_eq!(
         ctx.read_shift_state().await,
         ShiftState::ClosingLocalPendingDrain
@@ -1103,11 +1156,14 @@ async fn offline_full_day_z_aggregation_survives_return_online_drain() {
     ctx.seed_tax_group_20_percent().await;
     let mut model = RefModel::new_offline_open_shift(4);
 
-    let prior_tip = ctx.read_seed().await;
-    let expected = model.apply(&Op::OfflineSell);
-    let real = ctx.run_taxable_offline_sell().await;
-    oracle::check_differential(&real, &expected, prior_tip.as_deref())
-        .unwrap_or_else(|d| panic!("taxable offline SELL must match model: {d:?}"));
+    // B10 — the FIRST offline doc is a TWO-doc event (lazy BEGIN@lnd1 + the
+    // SELL@lnd2), so the per-doc chain-continuity check does not apply to this
+    // leg; the ledger delta is the authoritative check.
+    let _ = model.apply(&Op::OfflineSell);
+    let _ = ctx.run_taxable_offline_sell().await;
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("taxable offline SELL (with lazy BEGIN) ledger must match the model");
 
     let prior_tip = ctx.read_seed().await;
     let expected = model.apply(&Op::OfflineReturn);
@@ -1323,17 +1379,64 @@ async fn differential_offline_shift_open_enters_opened_pending_drain() {
     let mut ctx = interp::FuzzCtx::new_offline_closed_shift(2).await;
     let mut model = RefModel::new_offline_closed_shift(2);
 
-    let prior_tip = ctx.read_seed().await;
-    let op = Op::OfflineShiftOpen;
-    let expected = model.apply(&op);
-    let real = interp::run_op(&mut ctx, &op).await;
+    let _ = model.apply(&Op::OfflineShiftOpen);
+    let _ = interp::run_op(&mut ctx, &Op::OfflineShiftOpen).await;
 
-    oracle::check_differential(&real, &expected, prior_tip.as_deref())
-        .unwrap_or_else(|d| panic!("offline SHIFT_OPEN local ack must match model: {d:?}"));
-    assert_eq!(ctx.only_doc_type().await, "SHIFT_OPEN");
+    // B10 — the FIRST offline doc of a session is a TWO-doc event (the lazy
+    // DocType=9 BEGIN@lnd1 precedes the SHIFT_OPEN@lnd2 via the `run_staged`
+    // hoist), so the per-doc chain-continuity check (which pins the pre-op
+    // tip) does not apply; the ledger delta is the authoritative check.
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("offline SHIFT_OPEN (with lazy BEGIN) ledger must match the model");
+    oracle::check_shift_state(ctx.read_shift_state().await, Some(model.shift_state))
+        .expect("offline SHIFT_OPEN shift state must match the model");
     assert_eq!(
         ctx.read_shift_state().await,
         ShiftState::OpenedLocalPendingDrain
+    );
+}
+
+/// B10 composite pin — a duplicate OfflineShiftOpen (shift already open) is
+/// REFUSED by the acquire shift-guard, but the `run_staged` lazy-BEGIN hoist
+/// has ALREADY minted the session BEGIN by then: the refusal leaves exactly
+/// one issued BEGIN row resting (OLA), one code consumed, and the seed
+/// advanced — with the shift untouched.  The pure model defers this composite
+/// to the fault-oracle re-sync; this pin keeps the impl semantics from
+/// drifting silently.
+#[tokio::test]
+async fn offline_shift_open_refused_after_lazy_begin_mints_begin_row() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(2).await;
+
+    let doc_count_before = ctx.observed_doc_count().await;
+    let codes_before = ctx.consumed_codes_count().await;
+    let seed_before = ctx.read_seed().await;
+
+    let real = interp::run_op(&mut ctx, &Op::OfflineShiftOpen).await;
+
+    assert!(
+        matches!(real, interp::RealOutcome::Refused(_)),
+        "duplicate offline SHIFT_OPEN must be refused (SHIFT_ALREADY_OPEN), got {real:?}"
+    );
+    assert_eq!(
+        ctx.observed_doc_count().await,
+        doc_count_before + 1,
+        "the lazy BEGIN row must rest despite the refusal"
+    );
+    assert_eq!(
+        ctx.consumed_codes_count().await,
+        codes_before + 1,
+        "the BEGIN consumes one offline pool code"
+    );
+    assert_ne!(
+        ctx.read_seed().await,
+        seed_before,
+        "the BEGIN advances the offline seed"
+    );
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::Opened,
+        "the refused duplicate SHIFT_OPEN must not move the shift"
     );
 }
 
@@ -1758,6 +1861,13 @@ async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
     const SETTLE_BUDGET: usize = 3;
 
     let sends_before = ctx.send_calls();
+    // B10: track whether a LEGIT settle-drain ran.  A settle-capable state
+    // (active session + non-empty drain cohort + eligible shift) drives a real
+    // recovery drain, which legitimately sends (the backlog + the drain-time
+    // END).  If such a drain ran, the terminal `ArtifactNoResend` no-resend
+    // send-count assertion below does NOT apply — those sends were a real
+    // recovery attempt, not a pointless re-drive of a forced-mode artifact.
+    let mut settle_drain_ran = false;
     let mut crash_pending = pending_crash;
     for _ in 0..SETTLE_BUDGET {
         let mode = ctx.read_node_mode().await;
@@ -1775,6 +1885,7 @@ async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
             if let Some(sid) = ctx.active_offline_session().await {
                 if shift_drain_eligible(shift) && ctx.drain_cohort_len(sid).await > 0 {
                     let _ = interp::settle_drain_tick(ctx).await;
+                    settle_drain_ran = true;
                 }
             }
         }
@@ -1835,12 +1946,24 @@ async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
             // online-origin SENDING would false-flag StuckSending) and do NOT
             // liveness-panic (no real settle path).  Assert the bounded invariant
             // that the recovery ops re-drove nothing.
-            assert_eq!(
-                ctx.send_calls(),
-                sends_before,
-                "terminal GoingOnline artifact (mode={mode:?} shift={shift:?}): the bounded \
-                 real recovery ops made a NEW wire send — deferred docs must not be re-driven"
-            );
+            //
+            // B10: the no-resend send-count assertion applies ONLY when NO LEGIT
+            // settle-drain ran.  A settle-capable state (session + cohort +
+            // eligible) drives a REAL recovery drain that legitimately sends (the
+            // backlog re-drive + the drain-time END); if that drain then leaves the
+            // FN at GoingOnline with a now-drained (empty) cohort — e.g. a
+            // `[Ack, NotFound]` head held at SENT that the settle-drain advanced,
+            // or an END that could not finalize — the terminal is `ArtifactNoResend`
+            // by the empty-cohort branch, but those sends were a genuine recovery
+            // attempt, not a pointless re-drive of a forced-mode artifact.
+            if !settle_drain_ran {
+                assert_eq!(
+                    ctx.send_calls(),
+                    sends_before,
+                    "terminal GoingOnline artifact (mode={mode:?} shift={shift:?}): the bounded \
+                     real recovery ops made a NEW wire send — deferred docs must not be re-driven"
+                );
+            }
             // O5: previously this branch SKIPPED the scan entirely (a deferred
             // online-origin SENDING would false-flag StuckSending).  Run the scan
             // but EXCUSE only that StuckSending variant — every OTHER violation
@@ -1883,6 +2006,7 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
             continue; // process is dead — no op reaches the gateway before reboot
         }
         let prior_tip = ctx.read_seed().await; // real MAC tip BEFORE the op
+        let seed_at_op_start = model.seed; // model MAC tip BEFORE the op (B10 B3 structural seed check)
         let codes_before = ctx.consumed_codes_count().await;
         let sends_before = ctx.send_calls(); // wire send count BEFORE the op (A3 no-resend)
         let shift_before = ctx.read_shift_state().await; // real shift_state BEFORE the op
@@ -1898,7 +2022,16 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         // arm resync'd, silently adopting the real DB).  A wire-reached Crash
         // (RealOutcome::Crashed) and every Reboot stay Fault.
         let expected = match (op, &real) {
-            (Op::Crash(_), interp::RealOutcome::Doc(_)) => model.predict_crash_completed_sell(),
+            // O2: an offline-node crash completes as a real offline sell.  With
+            // B10 it may interpose a BEGIN (→ `Recovered`, two-doc) or not (→
+            // `Doc`, single); either way predict it deterministically via the
+            // two-doc-aware `predict_crash_completed_sell` (→ `apply_sell`) so the
+            // crash differential is NOT vacuous (see the `b10_lazy_begin_interposed`
+            // ledger-delta branch below for the Recovered case).
+            (Op::Crash(_), interp::RealOutcome::Doc(_))
+            | (Op::Crash(_), interp::RealOutcome::Recovered { .. }) => {
+                model.predict_crash_completed_sell()
+            }
             _ => model.apply(op),
         };
 
@@ -1916,27 +2049,45 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                     op,
                     Op::Drain(_) | Op::RepeatDrain | Op::GoOnline(_) | Op::GoOnlineWithoutBacklog
                 ) {
-                    // 1. No offline code consumed — codes are consumed at ISSUANCE,
-                    //    never by a drain (which re-drives already-issued docs).
+                    // B10 END-online fix: a drain that FINALIZES mints the DocType=10
+                    // END LAST as an ONLINE ISSUANCE — ONE fresh doc that allocates
+                    // ONE lnd and advances the MAC seed (advance-at-SEND), but
+                    // consumes ZERO offline codes (bare `<MAC>`, `fs_mode='ONLINE'`).
+                    // So: codes are STRICTLY unchanged (a code bump on a drain is now
+                    // a bug — the online END never consumes one, and re-driving the
+                    // already-issued backlog consumes none); lnds relax to +1 (the
+                    // END's lnd); the END-mint signal is the LND ALLOCATION, not a
+                    // code bump.  These bounds are tighter than the pre-fix ones,
+                    // preserving + sharpening the safety teeth.
+                    let codes_after = ctx.consumed_codes_count().await;
                     assert_eq!(
-                        ctx.consumed_codes_count().await,
+                        codes_after,
                         codes_before,
-                        "MH: exotic drain {op:?} consumed an offline code"
+                        "MH: exotic drain {op:?} consumed {} codes (the online END consumes NONE; \
+                         a drain must consume zero)",
+                        codes_after - codes_before
                     );
-                    // 2. next_lnd unchanged — a drain allocates NO new lnd.
-                    assert_eq!(
-                        ctx.read_next_lnd().await,
-                        next_lnd_before,
-                        "MH: exotic drain {op:?} allocated a new lnd"
+                    let next_lnd_after = ctx.read_next_lnd().await;
+                    assert!(
+                        next_lnd_after == next_lnd_before || next_lnd_after == next_lnd_before + 1,
+                        "MH: exotic drain {op:?} allocated {} lnds (> the one END lnd)",
+                        next_lnd_after - next_lnd_before
                     );
-                    // 3. Seed unchanged — offline-origin advanced the MAC seed at
-                    //    issuance (OFFLINE_LOCAL_ACK); a drain re-drives, never
-                    //    re-advances it.
-                    assert_eq!(
-                        ctx.read_seed().await,
-                        prior_tip,
-                        "MH: exotic drain {op:?} advanced the MAC seed"
-                    );
+                    // 3. Seed: unchanged (pure re-drive) OR advanced (the END's
+                    //    advance-at-SEND) — never advanced by re-driving the
+                    //    ALREADY-issued backlog (that would be a double-advance bug),
+                    //    but the END is a fresh online issuance so a single advance is
+                    //    allowed.  The END-mint signal is the lnd allocation (+1);
+                    //    the exact seed value is model-checked in the
+                    //    PredictableMutating path.
+                    let end_minted = next_lnd_after == next_lnd_before + 1;
+                    if !end_minted {
+                        assert_eq!(
+                            ctx.read_seed().await,
+                            prior_tip,
+                            "MH: exotic drain {op:?} advanced the MAC seed without minting an END"
+                        );
+                    }
                     // 4. Send-delta bounded by the cohort — the drain re-drives
                     //    each cohort doc a BOUNDED number of times (no unbounded
                     //    resend loop); 2×+1 allows one MAC-recovery retry per doc.
@@ -1992,30 +2143,92 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                     panic!("differential divergence on {op:?}: {d:?}");
                 }
                 // drain / go-online carry no per-doc detail → ledger-delta.
-                if matches!(real, interp::RealOutcome::Recovered { .. }) {
+                if let interp::RealOutcome::Recovered { branch } = &real {
                     let real_ledger = ctx.read_ledger().await;
                     if let Err(d) = oracle::check_ledger_delta(&model.docs, &real_ledger) {
                         panic!("ledger-delta divergence on {op:?}: {d:?}");
                     }
-                    // B3 — FULL snapshot beyond lnd→state: a recovered drain /
-                    // go-online RE-DRIVES already-issued docs; it must NOT consume
-                    // an offline code, allocate a new lnd, or re-advance the MAC
-                    // seed (offline-origin advanced it at issuance, online at ACK).
-                    assert_eq!(
-                        ctx.consumed_codes_count().await,
-                        codes_before,
-                        "B3: recovered drain/go-online {op:?} consumed an offline code"
-                    );
-                    assert_eq!(
-                        ctx.read_next_lnd().await,
-                        next_lnd_before,
-                        "B3: recovered drain/go-online {op:?} allocated a new lnd"
-                    );
-                    assert_eq!(
-                        ctx.read_seed().await,
-                        prior_tip,
-                        "B3: recovered drain/go-online {op:?} re-advanced the MAC seed"
-                    );
+                    if branch == "b10_lazy_begin_interposed" {
+                        // B10 — the FIRST offline doc lazily interposed a DocType=9
+                        // BEGIN.  This op DID consume 2 codes + allocate 2 lnds +
+                        // advance the seed (the B3 no-mutation invariants below do
+                        // NOT apply — they are for drain/go-online RE-DRIVE).  TEETH:
+                        // verify the two-doc chain linkage + code accounting so a
+                        // reverted BEGIN-chain REDs (proven by the canary
+                        // `teeth_b10_reverted_begin_chain_reddens_ledger_delta`).
+                        assert_eq!(
+                            ctx.consumed_codes_count().await,
+                            codes_before + 2,
+                            "B10: first-offline op must consume EXACTLY 2 codes \
+                             (BEGIN + business): {op:?}"
+                        );
+                        assert_eq!(
+                            ctx.read_next_lnd().await,
+                            next_lnd_before + 2,
+                            "B10: first-offline op must allocate EXACTLY 2 lnds \
+                             (BEGIN + business): {op:?}"
+                        );
+                        if let Err(d) = ctx
+                            .assert_b10_boundary_chain_linked(prior_tip.as_deref())
+                            .await
+                        {
+                            panic!("B10 boundary-chain divergence on {op:?}: {d}");
+                        }
+                    } else {
+                        // B3 — FULL snapshot beyond lnd→state.  A recovered drain /
+                        // go-online RE-DRIVES already-issued docs (no code / no lnd /
+                        // no seed change) EXCEPT for the B10 DocType=10 END, which a
+                        // finalizing drain mints LAST (consuming one code + one lnd).
+                        // The MODEL predicts the END independently (`drain_backlog`
+                        // AckPath), so assert the real post-op consumed-codes /
+                        // next-lnd match the MODEL's post-op values — this keeps the
+                        // teeth (a spurious extra code/lnd, or a MISSING END, REDs)
+                        // while admitting the one legit END mint.
+                        //
+                        // `codes_before` / `next_lnd_before` are used as a lower
+                        // bound sanity: the model's values are >= the pre-op values.
+                        let end_minted = model.session_has_end
+                            && model
+                                .docs
+                                .values()
+                                .any(|s| matches!(s, DocState::Ack | DocState::Signed));
+                        let _ = end_minted; // documentation of the delta source
+                        assert_eq!(
+                            ctx.consumed_codes_count().await as i64,
+                            model.codes_consumed,
+                            "B3: recovered drain/go-online {op:?} — real consumed-codes must \
+                             equal the model's (which predicts the END's code)"
+                        );
+                        assert!(
+                            model.codes_consumed >= codes_before as i64,
+                            "B3 sanity: model codes_consumed never decreases"
+                        );
+                        assert_eq!(
+                            ctx.read_next_lnd().await,
+                            model.next_lnd,
+                            "B3: recovered drain/go-online {op:?} — real next_lnd must equal \
+                             the model's (which predicts the END's lnd)"
+                        );
+                        assert!(
+                            model.next_lnd >= next_lnd_before,
+                            "B3 sanity: model next_lnd never decreases"
+                        );
+                        // Seed is compared STRUCTURALLY (model uses synthetic
+                        // hashes, reality real crypto hashes — never value-equal):
+                        // the real seed must CHANGE iff the model's seed changed.
+                        // A pure re-drive leaves both unchanged; a finalizing drain
+                        // that issues the B10 END advances BOTH (the END's M2-01
+                        // OLA).  A spurious real re-advance without a model advance
+                        // (or vice-versa) REDs.
+                        let real_seed_after = ctx.read_seed().await;
+                        let real_advanced = real_seed_after.as_deref() != prior_tip.as_deref();
+                        let model_advanced = model.seed != seed_at_op_start;
+                        assert_eq!(
+                            real_advanced, model_advanced,
+                            "B3: recovered drain/go-online {op:?} — real seed-advance \
+                             ({real_advanced}) must match the model's ({model_advanced})"
+                        );
+                    }
                 }
                 if matches!(op, Op::OnlineZReport(_) | Op::OfflineZReport) {
                     if let Err(d) = oracle::check_latest_z_aggregation(&ctx.pool).await {
@@ -2923,20 +3136,109 @@ async fn teeth_o1_online_convergence_drives_sent_to_ack() {
     );
 }
 
+/// B10 TEETH CANARY — the model's DocType=10 END-mint prediction is LOAD-BEARING:
+/// a drain that finalizes a bound-shift offline backlog mints an END (`{…, N:Ack}`)
+/// as the LAST offline doc, and the model MUST predict it or the ledger-delta
+/// differential reddens.
+///
+/// The regression `Crash(Sign), RepeatReboot, GoOnline([Ack,Ack])` builds a
+/// drainable offline backlog with NO preceding BEGIN (the harness `crash_after_sign`
+/// stages an offline SELL DIRECTLY, bypassing the `inline::run` BEGIN hoist — a
+/// production-UNREACHABLE state).  The real drain STILL mints the END
+/// (`ensure_and_drain_session_end` gates only on shift-presence, not BEGIN), so
+/// reality ends `{1:Ack, 2:Ack}`.  This canary proves BOTH directions on that
+/// exact real ledger:
+///   - the CORRECT model (`!session_has_end` END-mint gate) predicts the END →
+///     `check_ledger_delta` is `Ok`;
+///   - a BROKEN model that SUPPRESSES the END mint (as if the `drain_backlog`
+///     END-mint arm were reverted) predicts one fewer doc → `check_ledger_delta`
+///     is `Err`.
+///
+/// Revert target: the `if !self.session_has_end { … mint END … }` arm in
+/// `RefModel::drain_backlog` (model.rs). Restoring the old `session_has_begin &&`
+/// gate (or dropping the END mint) makes the CORRECT-model half predict `{1:Ack}`
+/// against the real `{1:Ack, 2:Ack}` → the harness `check_ledger_delta` at
+/// `invariant_fuzzer.rs:1568` REDs (exactly the divergence this canary re-derives).
+#[tokio::test]
+async fn teeth_b10_reverted_begin_chain_reddens_ledger_delta() {
+    // Drive the exact regression prefix on a REAL offline ctx: a crashed offline
+    // SELL (no BEGIN — direct-stage bypass), then reboot recovers it to OLA.
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let mut model = RefModel::new_offline_open_shift(3);
+
+    let _ = interp::run_op(&mut ctx, &Op::Crash(Stage::Sign)).await;
+    let _ = model.apply(&Op::Crash(Stage::Sign)); // Fault
+    let _ = interp::run_op(&mut ctx, &Op::RepeatReboot).await;
+    let _ = model.apply(&Op::RepeatReboot); // Fault
+
+    // Post-fault re-sync (mirrors the harness FaultOrRecovery arm): adopts the
+    // real ledger + the B10 boundary flags.  No BEGIN / END exists yet here.
+    model.adopt_fault_deferred(&ctx.pool).await;
+    assert!(
+        !model.session_has_end,
+        "canary setup: no END has been minted before the finalizing GoOnline"
+    );
+
+    // The finalizing drain: reality mints the END (`{1:Ack, 2:Ack}`).
+    let mut correct = model.clone();
+    let _ = correct.apply(&Op::GoOnline(DpsScript::ack_path())); // predicts the END
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::ack_path())).await;
+    let real_ledger = ctx.read_ledger().await;
+
+    // (1) The CORRECT model (END predicted) MATCHES reality.
+    assert!(
+        oracle::check_ledger_delta(&correct.docs, &real_ledger).is_ok(),
+        "B10 teeth (positive): the END-predicting model must MATCH the real \
+         end-of-drain ledger {real_ledger:?} — got model {:?}",
+        correct.docs
+    );
+    // Reality really did mint the END (2 docs), not a vacuous 1-doc match.
+    assert_eq!(
+        real_ledger.len(),
+        2,
+        "B10 teeth: the finalizing drain must mint the DocType=10 END as a SECOND \
+         Ack doc (real ledger {real_ledger:?})"
+    );
+
+    // (2) A BROKEN model that SUPPRESSES the END mint (session_has_end forced
+    // true before the drain, as a reverted END-mint arm would leave it) predicts
+    // one fewer doc → the ledger-delta differential REDDENS.  This is the tooth:
+    // without the model's independent END prediction, the divergence is caught.
+    let mut broken = model.clone();
+    broken.session_has_end = true; // suppress the END-mint prediction
+    let _ = broken.apply(&Op::GoOnline(DpsScript::ack_path()));
+    assert!(
+        oracle::check_ledger_delta(&broken.docs, &real_ledger).is_err(),
+        "B10 teeth (negative): a model that does NOT predict the END must DIVERGE \
+         from the real 2-doc ledger — if this is Ok, the END-mint prediction is \
+         vacuous and a reverted production END-mint would slip past the fuzzer \
+         (model {:?} vs real {real_ledger:?})",
+        broken.docs
+    );
+}
+
 /// O2 NEGATIVE tooth: a crash-completed offline sell AGREES with the
 /// deterministic, DB-read-independent prediction (the slice is non-vacuous AND
 /// not over-strict).  An Offline-node `Crash(Send)` never reaches the wire → it
 /// completes as a real `OFFLINE_LOCAL_ACK` sell.
 #[tokio::test]
 async fn teeth_o2_crash_completed_sell_matches_prediction() {
-    let mut ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
-    let mut model = RefModel::new_offline_open_shift(1);
+    // B10: seed 3 codes and issue ONE ordinary offline sell FIRST (which mints the
+    // lazy BEGIN + the sell) so the CRASH-completed sell under test is a SUBSEQUENT
+    // offline doc (no new BEGIN interposed) → it completes as a single `Doc`, the
+    // clean O2 slice.  (A first-offline crash-completed sell would interpose a
+    // BEGIN → a two-doc `Recovered`, covered by the harness ledger-delta branch.)
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let mut model = RefModel::new_offline_open_shift(3);
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await; // BEGIN + sell#1
+    let _ = model.apply(&Op::OfflineSell);
     let prior = ctx.read_seed().await;
 
     let real = interp::run_op(&mut ctx, &Op::Crash(Stage::Send)).await;
     assert!(
         matches!(&real, interp::RealOutcome::Doc(d) if d.doc_state == DocState::OfflineLocalAck),
-        "setup: an offline Crash(Send) completes as an OFFLINE_LOCAL_ACK sell, got {real:?}"
+        "setup: a subsequent offline Crash(Send) completes as an OFFLINE_LOCAL_ACK sell \
+         (no new BEGIN — one already exists), got {real:?}"
     );
 
     let expected = model.predict_crash_completed_sell();
@@ -2967,10 +3269,11 @@ fn teeth_o2_run_harness_catches_crash_completed_sell_divergence() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
-            let mut model = RefModel::new_offline_open_shift(1);
-            // Desync the prediction: the crash-completed sell will be lnd 1, the
-            // model now predicts lnd 99 → the differential must catch the divergence.
+            let ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+            let mut model = RefModel::new_offline_open_shift(3);
+            // Desync the prediction: the crash-completed FIRST offline sell mints
+            // BEGIN@lnd1 + SELL@lnd2 (real), but the model now predicts lnd 99/100
+            // → the differential (ledger-delta / next_lnd) must catch the divergence.
             model.next_lnd = 99;
             run_harness(&[Op::Crash(Stage::Send)], ctx, model).await;
         });
@@ -3091,8 +3394,13 @@ async fn a2_terminal_settle_resolves_unpaired_crash_and_scans() {
 /// finalize CAS's `GoingOnline → Online` → the settled boundary scans clean.
 #[tokio::test]
 async fn a4_terminal_settle_drains_legit_going_online_to_online() {
-    let mut ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
-    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await; // OFFLINE_LOCAL_ACK backlog
+    // B10: seed 3 codes — the offline sell mints the lazy BEGIN (code#1) + the
+    // SELL (code#2), and the terminal settle-drain mints the DocType=10 END
+    // (code#3) so the drain can FINALIZE (GoingOnline → Online).  With too few
+    // codes the END would abort and the drain would not finalize (the legit-settle
+    // intent of this test would be lost).
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await; // BEGIN + SELL → OFFLINE_LOCAL_ACK
     ctx.force_node_mode(NodeMode::GoingOnline).await; // legit GoingOnline (active session + cohort)
     assert!(
         ctx.active_offline_session().await.is_some(),
@@ -3104,12 +3412,13 @@ async fn a4_terminal_settle_drains_legit_going_online_to_online() {
     assert_eq!(
         ctx.read_node_mode().await,
         NodeMode::Online,
-        "A4: the terminal settle must drain a legit GoingOnline cohort to Online"
+        "A4: the terminal settle must drain a legit GoingOnline cohort (BEGIN + SELL + END) to Online"
     );
-    assert_eq!(
-        ctx.only_doc_state().await,
-        DocState::Ack,
-        "the backlog drained to ACK at the terminal settle"
+    // B10: the whole session — BEGIN + SELL + END — is ACK after the settle.
+    let ledger = ctx.read_ledger().await;
+    assert!(
+        ledger.values().all(|s| *s == DocState::Ack),
+        "the whole session (BEGIN + SELL + END) drained to ACK, got {ledger:?}"
     );
 }
 

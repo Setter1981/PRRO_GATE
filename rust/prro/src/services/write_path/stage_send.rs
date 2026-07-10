@@ -394,6 +394,12 @@ fn wire_artifact_to_check_type(k: WireArtifactKind) -> DpsCheckType {
         WireArtifactKind::ShiftOpen => DpsCheckType::ServiceChk,
         WireArtifactKind::Sell | WireArtifactKind::Return => DpsCheckType::Chk,
         WireArtifactKind::ZReport => DpsCheckType::ZReport,
+        // B10 — offline-session boundary docs are service receipts, same
+        // typCheck as SHIFT_OPEN (ground truth: WebCheck `TypToPROTO` maps
+        // typ 9/10 → PROTO 3 = ServiceChk).
+        WireArtifactKind::OfflineSessionBegin | WireArtifactKind::OfflineSessionEnd => {
+            DpsCheckType::ServiceChk
+        }
     }
 }
 
@@ -454,7 +460,24 @@ pub fn build_send_envelope(
             .map_err(|_| StageSendError::LndOutOfRangeI32 { lnd: inputs.lnd })?,
     };
 
-    let date_time = kyiv_local_epoch(&inputs.business_ts)?;
+    // WebCheck's drain path parses the already-signed XML's `<TS>` and
+    // passes that 14-digit value straight through as `Check.date`. The
+    // ordinary online path instead uses the Kyiv-local-as-epoch convention.
+    // Mixing the two representations makes DPS reject the document with -8
+    // (`ERROR_XML_DATE`) before it can evaluate the MAC chain.
+    //
+    // `offline_fiscal_no.is_some()` is the durable discriminator for an
+    // offline-origin document on the drain. The two boundary doc types use
+    // the same raw-TS rule even when END is minted as an online issuance.
+    let date_time = if inputs.offline_fiscal_no.is_some()
+        || matches!(
+            inputs.doc_type,
+            DocType::OfflineSessionBegin | DocType::OfflineSessionEnd
+        ) {
+        kyiv_comp_date(&inputs.business_ts)?
+    } else {
+        kyiv_local_epoch(&inputs.business_ts)?
+    };
 
     // M3b W9a (2026-05-16): `id_offline` carries the offline-acquired
     // fiscal-no for W9 backlog-drain replays.  W7a writes
@@ -519,6 +542,30 @@ fn kyiv_local_epoch(business_ts: &str) -> Result<i64, StageSendError> {
             ),
         })?;
     Ok(fake.timestamp())
+}
+
+/// Convert UTC ISO-8601 `business_ts` to the signed XML `<TS>` form:
+/// Kyiv-local `YYYYMMDDHHMMSS` parsed as an integer.
+///
+/// WebCheck sends this exact value as `Check.date` while replaying an
+/// offline document and while submitting the offline-session BEGIN/END
+/// service documents. Keep this separate from [`kyiv_local_epoch`]: both
+/// encode the same wall-clock instant, but DPS treats them as distinct wire
+/// representations.
+fn kyiv_comp_date(business_ts: &str) -> Result<i64, StageSendError> {
+    let dt: DateTime<Utc> =
+        business_ts
+            .parse::<DateTime<Utc>>()
+            .map_err(|e| StageSendError::TimestampConversion {
+                detail: format!("parse {business_ts:?}: {e}"),
+            })?;
+    let kyiv = dt.with_timezone(&Kiev);
+    kyiv.format("%Y%m%d%H%M%S")
+        .to_string()
+        .parse::<i64>()
+        .map_err(|e| StageSendError::TimestampConversion {
+            detail: format!("format Kyiv comp-date for {business_ts:?}: {e}"),
+        })
 }
 
 // ─── Stage outcome (worker dispatcher contract) ─────────────────────
@@ -829,7 +876,11 @@ fn wire_decision_to_outcome_kind(decision: &WireDecision, wire_kind: &str) -> Ou
             },
             RetryClass::FnConfigError => OutcomeKind::RetryableAuthFn,
             RetryClass::MacRecovery => OutcomeKind::RetryableMacHashMismatch,
-            RetryClass::WrapperBug | RetryClass::ProbeRequired | RetryClass::OperatorEscalation => {
+            RetryClass::WrapperBug
+            | RetryClass::ProbeRequired
+            | RetryClass::OperatorEscalation
+            // Historical persisted tag only; current routing never emits it.
+            | RetryClass::DrainChainSettleRetry => {
                 OutcomeKind::RetryableServer
             }
         },
@@ -2076,6 +2127,78 @@ mod tests {
         .expect("SHIFT_CLOSE must build via ZReport route");
         assert_eq!(env.check_type, DpsCheckType::ZReport);
         assert_eq!(env.local_number, 100);
+    }
+
+    // ─── B10: offline-session boundary docs (DocType 9/10) ────────────
+    #[test]
+    fn build_envelope_offline_session_begin_uses_servicechk_and_passes_lnd() {
+        // DocType=9 BEGIN → typCheck ServiceChk(3), same as SHIFT_OPEN;
+        // BUT (unlike SHIFT_OPEN) it does NOT force local_number to 0 —
+        // it is an ordinary lnd-numbered offline doc.  It also carries an
+        // offline code → non-empty id_offline (proven separately).
+        let mut i = inputs(DocType::OfflineSessionBegin, 7, "2026-05-09T12:34:56Z");
+        i.offline_dps_code = Some("BEGIN-CODE".into());
+        let env = build_send_envelope(&i, b"PAY".to_vec()).expect("BEGIN must build");
+        assert_eq!(
+            env.check_type,
+            DpsCheckType::ServiceChk,
+            "OFFLINE_SESSION_BEGIN must map to ServiceChk(3)"
+        );
+        assert_eq!(
+            env.local_number, 7,
+            "BEGIN keeps its lnd (NOT forced to 0 like SHIFT_OPEN)"
+        );
+        assert_eq!(
+            env.id_offline, "BEGIN-CODE",
+            "BEGIN is an offline doc → id_offline carries its DPS code"
+        );
+    }
+
+    #[test]
+    fn build_envelope_offline_session_end_uses_servicechk_and_passes_lnd() {
+        let mut i = inputs(DocType::OfflineSessionEnd, 8, "2026-05-09T12:34:56Z");
+        i.offline_dps_code = Some("END-CODE".into());
+        let env = build_send_envelope(&i, b"PAY".to_vec()).expect("END must build");
+        assert_eq!(
+            env.check_type,
+            DpsCheckType::ServiceChk,
+            "OFFLINE_SESSION_END must map to ServiceChk(3)"
+        );
+        assert_eq!(env.local_number, 8, "END keeps its lnd");
+        assert_eq!(env.id_offline, "END-CODE");
+    }
+
+    #[test]
+    fn build_envelope_offline_drain_uses_raw_signed_ts_across_kyiv_dst() {
+        for (business_ts, expected) in [
+            ("2026-07-15T10:00:00Z", 20_260_715_130_000_i64),
+            ("2026-01-15T10:00:00Z", 20_260_115_120_000_i64),
+        ] {
+            let mut i = inputs(DocType::Sell, 9, business_ts);
+            i.offline_fiscal_no = Some(42);
+            i.offline_dps_code = Some("OFFLINE-CODE".into());
+            let env = build_send_envelope(&i, b"PAY".to_vec())
+                .expect("offline drain envelope must build");
+            assert_eq!(
+                env.date_time, expected,
+                "offline {business_ts} must preserve signed XML <TS>"
+            );
+        }
+    }
+
+    #[test]
+    fn build_envelope_offline_boundaries_use_raw_signed_ts_even_when_end_is_online_shaped() {
+        for doc_type in [DocType::OfflineSessionBegin, DocType::OfflineSessionEnd] {
+            let env = build_send_envelope(
+                &inputs(doc_type, 9, "2026-05-09T12:34:56Z"),
+                b"PAY".to_vec(),
+            )
+            .expect("offline boundary envelope must build");
+            assert_eq!(
+                env.date_time, 20_260_509_153_456,
+                "{doc_type:?} must preserve signed XML <TS>"
+            );
+        }
     }
 
     #[test]
